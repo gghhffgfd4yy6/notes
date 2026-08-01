@@ -4842,7 +4842,7 @@ await test('防御: cache.dir 非字符串 → 回退默认不崩（v3.80）', (
     const orig = Config.cache.dir;
     try {
         Config.cache.dir = 123; // 非字符串：path.join 会抛 TypeError 的崩溃点
-        const p = getFilePath('t102_cache.json');
+        const p = getFilePath('test_102_cache.json');
         assertEqual(typeof p, 'string', '应返回字符串路径（回退默认目录）');
         assertEqual(p.includes('xianbaoku_cache'), true, `应回退默认缓存目录: ${p}`);
         try { require('fs').unlinkSync(p); } catch (e) { /* 忽略 */ }

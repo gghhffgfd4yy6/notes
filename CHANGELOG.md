@@ -1,5 +1,18 @@
 # 📋 更新日志
 
+## v3.81（CLI 入口非 Error 兜底）
+> 2026-08-01
+
+### 🔧 require.main 入口 catch 兜底
+
+- **发现**：CLI 入口 `App.run().catch(e => console.error(..., e.message))`——主代码内部已有非 Error 兜底（v3.31），但入口 catch 是漏网（字符串异常 → `e.message` undefined）
+- **修复**：`e && e.message ? e.message : String(e)`（与内部口径一致）
+- 102 章测试文件名改为 `test_` 前缀（双保险：测试内清理 + 套件清理正则）
+
+### 🧪 测试数
+
+**650 个全绿（单元 573 + 集成 57 + 通道 20）**
+
 ## v3.80（配置防御：cache.dir + template 校验）
 > 2026-08-01
 
