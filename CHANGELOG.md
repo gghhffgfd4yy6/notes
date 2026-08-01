@@ -1,5 +1,18 @@
 # 📋 更新日志
 
+## v3.94（domain 尾斜杠防御）
+> 2026-08-01
+
+### 🐛 pushUrl 双斜杠 bug
+
+- **发现**：`Config.api.pushUrl` getter 直接拼接 `${Config.domain}/plus/...`——domain 配尾斜杠（`https://x.com/`）→ `https://x.com//plus/json/push.json` 双斜杠 404
+- **修复**：getter 先去尾斜杠（`replace(/\/+$/, '')`，与 v3.32 urlOf 的 baseUrl 口径一致）
+- 102 章新增测试（单/多尾斜杠、无尾斜杠）
+
+### 🧪 测试数
+
+**655 个全绿（单元 576 + 集成 58 + 通道 21）**
+
 ## v3.93（FILE_INDEX 章节表补全）
 > 2026-08-01
 

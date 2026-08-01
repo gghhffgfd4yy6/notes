@@ -4859,6 +4859,20 @@ await test('实体扩展: ensp/emsp/cent/curren/箭头（v3.83）', () => {
     assertEqual(decodeHtmlEntities('&ensp;'), ' ', '单独 ensp');
 });
 
+await test('防御: domain 尾斜杠 → pushUrl 无双斜杠（v3.94）', () => {
+    const orig = Config.domain;
+    try {
+        Config.domain = 'https://new.ixbk.net/';
+        assertEqual(Config.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json', 'domain 尾斜杠不应导致 pushUrl 双斜杠');
+        Config.domain = 'https://new.ixbk.net///';
+        assertEqual(Config.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json', '多尾斜杠也应去除');
+        Config.domain = 'https://new.ixbk.net';
+        assertEqual(Config.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json', '无尾斜杠不受影响');
+    } finally {
+        Config.domain = orig;
+    }
+});
+
 await test('#链接: {Html内容} href 换行剥离（v3.85）', () => {
     const r = tuisong_replace('{Html内容}', { url: 'http://x.com/a\nb', content_html: '<p>内容</p>', title: 't' });
     assertEqual(r.includes('\n'), false, 'Html内容不应残留换行');
