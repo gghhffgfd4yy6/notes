@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.64 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 ********
+//******** 线报酷推送脚本 v3.65 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1211,6 +1211,14 @@ const App = {
             console.log(`  耗时:     ${elapsed}s`);
             console.log('══════════════════════════════');
             await new Promise(r => setTimeout(r, Config.timing.finalWait));
+
+            // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
+            try {
+                const logPath = path.join(MessageStore.cacheDir, 'run.log');
+                fs.appendFileSync(logPath,
+                    `${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} pushed=${successCount} failed=${items.length - successCount}\n`,
+                    'utf8');
+            } catch (e) { /* 日志写失败静默（磁盘只读/权限等，不中断推送） */ }
 
             // 返回运行摘要（供外部/测试观测，cron 可据此判断）
             return {
