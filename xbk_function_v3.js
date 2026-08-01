@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.67 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 ********
+//******** 线报酷推送脚本 v3.68 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板可配置 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -51,6 +51,13 @@ const Config = {
     push: {
         mode: 'sequential',
         parallelLimit: 0,
+    },
+
+    // 推送模板（v3.68 可配置）：title=标题、content=内容；默认值与历史硬编码完全一致。
+    // 支持占位符：{分类名} {分类ID} {标题} {链接} {日期} {时间} {楼主} {类目} {价格} {商城} {品牌} {图片} {Html内容} {Markdown内容}
+    template: {
+        title: '【{分类名}】{标题}',
+        content: '{Markdown内容}',
     },
 
     cache: {
@@ -1159,6 +1166,10 @@ const App = {
             };
             const pushedKeys = new Set();
 
+            // 推送模板（v3.68 可配置）：非法/缺失回退默认（默认值与历史硬编码完全一致，现有测试锁定）
+            const titleTpl = (typeof Config.template.title === 'string' && Config.template.title) ? Config.template.title : '【{分类名}】{标题}';
+            const contentTpl = (typeof Config.template.content === 'string' && Config.template.content) ? Config.template.content : '{Markdown内容}';
+
             // 单条推送（两种模式共用）：成功返回 {ok:true} 并记录；失败警告且不写缓存(下次重试)
             const pushOne = async (item) => {
                 // 推送内容截断：避免超长标题/内容被推送 API 拒绝（Server酱 title 限 32 字符）
@@ -1169,8 +1180,8 @@ const App = {
                     title: Utils.truncateUtf16(item.title || '(无标题)', 100),
                     content: Utils.truncateUtf16(item.content || '', 3000),
                 };
-                const text = Formatter.tuisong_replace('【{分类名}】{标题}', pushItem);
-                const desp = Formatter.tuisong_replace('{Markdown内容}', pushItem);
+                const text = Formatter.tuisong_replace(titleTpl, pushItem);
+                const desp = Formatter.tuisong_replace(contentTpl, pushItem);
                 try {
                     await Pusher.send(text, desp);
                     pushedKeys.add(keyOf(item));

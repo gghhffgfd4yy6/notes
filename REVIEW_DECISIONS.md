@@ -204,6 +204,7 @@
 - **v3.65**：运行摘要持久化 run.log；文档同步（本文件当前状态 + FILE_INDEX）
 - **v3.66**：run.log 增强——失败 ERROR 记录 + 1MB 大小上限截断（抽 _writeRunLog helper）
 - **v3.67**：whitelistFilter 非法正则 → 放行（原拦截；与 ReDoS 分支/App.run 预编译失败口径统一，宁可多推）
+- **v3.68**：推送模板可配置（Config.template.title/content，默认=历史硬编码，非法回退默认）
 
 ## 七、行为变更记录（语义调整）
 

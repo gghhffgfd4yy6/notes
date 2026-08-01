@@ -945,6 +945,43 @@ await test('运行失败也写 ERROR 日志（v3.66）', async () => {
     try { fs.unlinkSync(logPath); } catch (e) { /* 忽略 */ }
 });
 
+await test('推送模板可配置 + 非法回退默认（v3.68）', async () => {
+    reset();
+    setPushUrl('t48_template');
+    fakeData = [makeItem({ id: 1, title: '模板测试', content: '正文', posttime: Math.floor(Date.now() / 1000) })];
+    const origTitle = Config.template.title;
+    const origContent = Config.template.content;
+    try {
+        Config.template.title = '【{分类名}】{标题} | {日期} {时间}';
+        Config.template.content = '{标题}\n{链接}\n{Markdown内容}';
+        await xbk.run();
+        assert(pushCalls.length === 1, '应推送 1 条');
+        assert(pushCalls[0].text.includes(' | '), '标题模板应含自定义分隔符');
+        assert(!pushCalls[0].text.includes('{日期}') && !pushCalls[0].text.includes('{时间}'),
+            `日期/时间占位符应被替换，实际: ${pushCalls[0].text}`);
+        assert(pushCalls[0].desp.includes('模板测试'), '内容模板应含 {标题}');
+        assert(pushCalls[0].desp.includes('原文链接'), '内容模板应含 {Markdown内容} 全文');
+    } finally {
+        Config.template.title = origTitle;
+        Config.template.content = origContent;
+    }
+    // 非法模板（undefined/非字符串）→ 回退默认，不影响推送
+    reset();
+    setPushUrl('t48b_template_fallback');
+    fakeData = [makeItem({ id: 2, title: '回退测试' })];
+    try {
+        Config.template.title = undefined;
+        Config.template.content = 123;
+        await xbk.run();
+        assert(pushCalls.length === 1, '回退默认仍应推送');
+        assert(pushCalls[0].text.startsWith('【'), '非法模板应回退默认标题格式');
+        assert(pushCalls[0].desp.includes('原文链接'), '非法模板应回退默认内容格式');
+    } finally {
+        Config.template.title = origTitle;
+        Config.template.content = origContent;
+    }
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {
