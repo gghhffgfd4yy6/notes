@@ -208,6 +208,7 @@
 - **v3.69**：推送截断可配置（push.titleMax/contentMax）；desp 兜底截断（{Markdown内容} 原从不截断会撑爆 API）；test_app 清理正则修复（t48b 残留）
 - **v3.70**：text 推送标题兜底截断（分类名+标题拼接超 titleMax 的漏网，与 desp 同口径）
 - **v3.71**：工程化收尾（package.json + README 首次引入）；变异测试验证（7 变异零盲区）；101 章扩展 package.json 版本三方一致
+- **v3.72**：push_config.local.js.example 密钥配置示例模板（新用户配置入口）
 
 ## 七、行为变更记录（语义调整）
 

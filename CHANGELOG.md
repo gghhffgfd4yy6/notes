@@ -1,5 +1,17 @@
 # 📋 更新日志
 
+## v3.72（密钥配置示例模板）
+> 2026-08-01
+
+### 📝 push_config.local.js.example
+
+- **背景**：README 快速开始提到密钥配置但仓库无示例——新用户不知道填哪些字段
+- **新增**：`push_config.local.js.example`（全通道字段占位注释、无真实密钥、可安全入库）；README 快速开始改为 `cp` 示例文件；FILE_INDEX 补 README/package.json/example 条目
+
+### 🧪 测试数
+
+**642 个全绿（单元 569 + 集成 57 + 通道 16）**
+
 ## v3.71（工程化收尾：package.json + README + 变异测试验证）
 > 2026-08-01
 
