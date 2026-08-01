@@ -241,6 +241,7 @@
 - **v3.96**：README 目录结构同步；example 补 TG_PROXY 说明
 - **v3.97**：template/push 新配置默认值契约测试；TG parse_mode 决策记录（待真机验证）
 - **v3.98**：REVIEW_DECISIONS 自主进化记录标题同步（v3.62~v3.97）
+- **v3.99**：example 补 Bark 扩展参数/PUSHME_URL/DEER_URL；变异抽检（saveMessages 容错 2 红）
 
 ## 七、行为变更记录（语义调整）
 

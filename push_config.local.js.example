@@ -13,9 +13,17 @@ module.exports = {
 
     // Bark（iOS 推送，https://github.com/Finb/Bark）
     // BARK_PUSH: 'https://api.day.app/你的设备码',   // 多设备用 # 分隔
+    // Bark 扩展参数（可选）：归档/分组/声音/图标/时效性/跳转URL
+    // BARK_ARCHIVE: '', '1' 存档
+    // BARK_GROUP: '',  '分组名'
+    // BARK_SOUND: '',  '声音名'
+    // BARK_ICON: '',   '图标URL'
+    // BARK_LEVEL: '',  'active|timeSensitive|passive'
+    // BARK_URL: '',    '点击跳转URL'
 
     // PushMe（https://pushme.xyz/）
     // PUSHME_KEY: '你的key',
+    // PUSHME_URL: 'https://push.i-i.me', // 自定义服务器（可选）
 
     // 企业微信机器人 webhook
     // QYWX_KEY: '你的webhook地址最后一段key',
@@ -29,6 +37,7 @@ module.exports = {
 
     // PushDeer（https://www.pushdeer.com/）
     // DEER_KEY: '你的key',
+    // DEER_URL: 'https://api2.pushdeer.com/message/push', // 自定义服务器（可选）
 
     // Telegram Bot（token + chat_id 需齐备才生效）
     // TG_BOT_TOKEN: '123456:ABC-DEF...',

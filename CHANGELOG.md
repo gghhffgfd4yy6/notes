@@ -1,5 +1,17 @@
 # 📋 更新日志
 
+## v3.99（密钥示例补全）
+> 2026-08-01
+
+### 📝 push_config.local.js.example 补全
+
+- 补 Bark 扩展参数（ARCHIVE/GROUP/SOUND/ICON/LEVEL/URL）、PUSHME_URL/DEER_URL 自定义服务器（与 push_config/CHANNEL_KEYS 字段对齐）
+- 变异抽检：saveMessages 写失败容错去掉 → 92 章 2 红（故障注入测试仍有效）
+
+### 🧪 测试数
+
+**657 个全绿（单元 577 + 集成 59 + 通道 21）**
+
 ## v3.98（自主进化记录标题同步）
 > 2026-08-01
 
