@@ -4697,6 +4697,26 @@ await test('got: timeout=0/负数 回退默认(不传 0 致无超时挂死)', as
     }
 });
 
+await test('got: 调用方小写 content-type 不被覆盖为 json（v3.78）', async () => {
+    const http = require('http');
+    const got = require('got');
+    let receivedCT = null;
+    const server = http.createServer((req, res) => {
+        receivedCT = req.headers['content-type'];
+        res.writeHead(200); res.end('{}');
+    });
+    await new Promise(r => server.listen(0, r));
+    const port = server.address().port;
+    try {
+        await got(`http://127.0.0.1:${port}/x`, { method: 'POST', body: 'x', headers: { 'content-type': 'text/plain' } });
+        assertEqual(receivedCT, 'text/plain', '调用方小写 content-type 应保留（不被覆盖为默认 json）');
+        await got(`http://127.0.0.1:${port}/x`, { method: 'POST', body: '{}' });
+        assertEqual(receivedCT, 'application/json', '不传 Content-Type 时默认应为 application/json');
+    } finally {
+        await new Promise(r => server.close(r));
+    }
+});
+
 // ==================== 99. 边界精确值(锁定行为) ====================
 console.log('\n📂 99. 边界精确值');
 

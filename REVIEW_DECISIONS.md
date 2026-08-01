@@ -215,6 +215,7 @@
 - **v3.75**：推送模块密钥泄露修复（严重）——$.post/get 失败传 Error 而非响应体（防回显）；safeErr 摘要统一 5 通道失败日志；脱敏测试扩展 + 变异验证（改回旧行为 2 红）
 - **v3.76**：TG_PROXY_* 一次性警告（防误配静默失效，提示改用 TG_API_HOST）；CHANNEL_KEYS 补 TG_PROXY 字段
 - **v3.77**：失败日志 safeErr 全通道统一（Bark/PushMe/wxpusher/息知 v3.75 漏网收尾）+ 对应脱敏测试
+- **v3.78**：got Content-Type 大小写不敏感；Server酱/PushDeer/Telegram 异常分支日志 safeErr 截断
 
 ## 七、行为变更记录（语义调整）
 

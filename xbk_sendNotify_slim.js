@@ -264,7 +264,7 @@ function serverNotify(text, desp) {
                             // 一分钟内发送相同的内容会触发
                             console.log(`Server 酱发送通知消息异常 ${data.errmsg}\n`);
                         } else {
-                            console.log(`Server 酱发送通知消息异常 ${JSON.stringify(data)}`);
+                            console.log(`Server 酱发送通知消息异常 ${safeErr(data)}`);
                         }
                     }
                 } catch (e) {
@@ -571,7 +571,7 @@ function pushDeerNotify(text, desp) {
                             console.log('PushDeer 发送通知消息成功🎉\n');
                         } else {
                             console.log(
-                                `PushDeer 发送通知消息异常😞 ${JSON.stringify(data)}`,
+                                `PushDeer 发送通知消息异常😞 ${safeErr(data)}`,
                             );
                         }
                     }
@@ -621,7 +621,7 @@ function tgNotify(text, desp) {
                         if (data && data.ok === true) {
                             console.log('Telegram 发送通知消息成功🎉\n');
                         } else {
-                            console.log(`Telegram 发送通知消息异常 ${data && data.description ? data.description : JSON.stringify(data)}\n`);
+                            console.log(`Telegram 发送通知消息异常 ${safeErr(data)}\n`);
                         }
                     }
                 } catch (e) {

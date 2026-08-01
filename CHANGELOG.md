@@ -1,5 +1,22 @@
 # 📋 更新日志
 
+## v3.78（got Content-Type 防御 + 异常日志截断）
+> 2026-08-01
+
+### 🔧 自制 got Content-Type 大小写不敏感
+
+- **发现**：`opts.headers['Content-Type']` 直接访问——调用方传 `content-type`（小写）会被覆盖为默认 `application/json`
+- **修复**：Object.keys 检查大小写不敏感；98 章新增测试（小写 content-type 保留 + 默认 json）
+
+### 🔧 Server酱/PushDeer/Telegram 异常日志截断
+
+- **发现**：3 个通道的业务异常分支 `JSON.stringify(data)` 无截断（超长响应刷屏 + 可能回显；v3.59 只修了 wxpusher/息知）
+- **修复**：统一 safeErr（JSON 序列化截断 200 + 字符串截断）
+
+### 🧪 测试数
+
+**648 个全绿（单元 571 + 集成 57 + 通道 20）**
+
 ## v3.77（失败日志 safeErr 全通道统一——v3.75 收尾）
 > 2026-08-01
 
