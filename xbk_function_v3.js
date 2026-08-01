@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.107 — 低风险防御批次15项+清理+统一测试入口+CI+Fuzz(hasValidId修复) ********
+//******** 线报酷推送脚本 v3.108 — 深度Fuzz+Property测试：13处Symbol崩溃修复(hasValidId/anonKey/_splitLines/hasNestedQuantifier/normUrl/decode/tuisong/truncate/whitelist/parseTime/getFilePath/compileRules/validateConfig)；嵌套Symbol数组全API防御；5组不变量Property Tests；104/105章 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -122,7 +122,8 @@ const Utils = {
      */
     parseTime(time) {
         if (time === undefined || time === null || time === '') return null;
-        const s = String(time);
+        let s;
+        try { s = String(time); } catch (e) { return null; } // v3.108 fuzz：嵌套 Symbol 数组 String() 崩 → 无效
         // 纯数字：8 位日期优先于时间戳（20260731 是日期不是时间戳）
         // 数字类型（含 -1 等负值）也走数字分支——负值/范围外在下方统一判无效，
         // 避免掉进宿主解析被 new Date('-1') 解析成 2001-01-01（审查5-2 锁定）
@@ -178,7 +179,11 @@ const Utils = {
     /** 归一化 URL 用于判重：trim + 去尾部斜杠（/foo 与 foo、foo/ 视为同一资源） */
     normUrl(u) {
         // 归一化用于判重：trim + 去首尾斜杠 + 主机名小写（/foo、foo、foo/、A.com/a vs a.com/a 视为同一资源）
-        let s = String(u === undefined || u === null ? '' : u).trim();
+        // v3.108 fuzz：String(嵌套 Symbol 的数组) 崩——统一兜底视为空
+        if (u === undefined || u === null) return '';
+        let s;
+        try { s = String(u); } catch (e) { return ''; }
+        s = s.trim();
         // 交替去首尾斜杠与 trim 直到稳定（保证幂等：斜杠挡住的尾空格需多轮去除）
         let prev;
         do {
@@ -210,7 +215,12 @@ const Utils = {
     /** 无 id 无 url 数据的稳定合成 id：基于 title+content 哈希，跨运行可去重 */
     anonKey(...parts) {
         // 过滤空值：避免全空字段导致不同数据撞同一个 key
-        const s = parts.filter(p => p !== undefined && p !== null && String(p).trim() !== '').map(p => String(p)).join('|');
+        // v3.108 fuzz 发现：String(Symbol()) 抛 TypeError——Symbol 字段视为无效过滤
+        const str = (p) => {
+            if (typeof p === 'symbol') return '';
+            try { return String(p); } catch (e) { return ''; }
+        };
+        const s = parts.filter(p => p !== undefined && p !== null && str(p).trim() !== '').map(str).join('|');
         let h = 5381;
         for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
         return 'anon:' + h.toString(16);
@@ -228,7 +238,7 @@ const Utils = {
      * 末尾高代理→退一位；末尾低代理且前一位非高代理(孤立)→退一位；配对完整低代理→保留
      */
     truncateUtf16(s, max) {
-        s = String(s === undefined || s === null ? '' : s);
+        try { s = String(s === undefined || s === null ? '' : s); } catch (e) { s = ''; } // v3.108 fuzz：嵌套 Symbol 数组 String() 崩 → 空
         // 防御（R1）：非法 max（undefined/NaN/0/负数）不截断——内部调用均传合法值，零行为变更；
         // 否则 slice(0, undefined) 意外整串返回 / slice(0,0) 空串 / slice(0,-N) 误截尾字符
         if (!Number.isFinite(max) || max <= 0) return s;
@@ -247,7 +257,7 @@ const Utils = {
     /** 解码常见 HTML 实体 */
     decodeHtmlEntities(str) {
         if (str === undefined || str === null) return '';
-        str = String(str);
+        try { str = String(str); } catch (e) { return ''; } // v3.108 fuzz：嵌套 Symbol 数组 String() 崩 → 视为空
         if (!str) return str;
         // 递归解码（v3.105）：真实接口存在双重转义（&amp;amp; → &amp; → &，真机验证发现 2/20 条），
         // 单轮解码会残留 &amp; 破坏 URL 参数（链接 key 参数错乱）；最多 3 轮防死循环，收敛即停
@@ -327,7 +337,8 @@ const Formatter = {
 
     tuisong_replace(text, shuju) {
         // 防御：模板缺失/非字符串时转空串或字符串化，避免 text.includes 崩溃
-        text = text === undefined || text === null ? '' : String(text);
+        // v3.108 fuzz：String(嵌套 Symbol 数组) 崩 → 视为空模板
+        try { text = text === undefined || text === null ? '' : String(text); } catch (e) { text = ''; }
         const data = { ...shuju };
 
         if (data.category_name) data.catename = data.category_name;
@@ -424,7 +435,10 @@ const RuleEngine = {
      * 返回 true = 高风险（编译方应跳过/警告，避免卡死主线程）
      */
     hasNestedQuantifier(pattern) {
-        const s = String(pattern);
+        // v3.108 fuzz：String(Symbol) 抛 TypeError；嵌套 Symbol 的数组 String() 也崩——统一兜底
+        if (pattern === undefined || pattern === null || typeof pattern === 'symbol') return false;
+        let s;
+        try { s = String(pattern); } catch (e) { return false; }
         // 位置 i 起是否为无限量词（+ * {n,}），返回其长度（0=不是）
         const infQuantLen = (i) => {
             const ch = s[i];
@@ -478,6 +492,11 @@ const RuleEngine = {
 
     /** 解析多行配置（<br> / \n\n 分割），返回行数组 */
     _splitLines(configStr) {
+        // v3.108 fuzz：/###/.test(Symbol) 隐式 String() 抛 TypeError——Symbol 视为无配置
+        if (configStr === undefined || configStr === null || typeof configStr === 'symbol') return [];
+        let s;
+        try { s = String(configStr); } catch (e) { return []; } // 嵌套 Symbol 数组 String() 崩 → 无配置
+        configStr = s;
         if (!configStr) return [];
         if (!/###/.test(configStr)) return null; // 简单模式
         return configStr.split(/<br\s*\/?>|\r\n|\r|\n/); // R2：支持 <br/> 自闭合（与 htmlToMarkdown br 口径一致）
@@ -494,7 +513,13 @@ const RuleEngine = {
 
         // 编译简单的正则字段（不含 ### 时）
         for (const field of FILTER_FIELDS) {
-            const val = rawCfg[field];
+            // v3.108 fuzz：String(嵌套 Symbol 数组) 崩 → 该字段置 null（跳过）
+            let val = rawCfg[field];
+            if (val === undefined || val === null || typeof val === 'symbol') {
+                compiled[field] = null;
+                continue;
+            }
+            try { val = String(val); } catch (e) { compiled[field] = null; continue; }
             if (!val) {
                 compiled[field] = null;
                 continue;
@@ -617,13 +642,19 @@ const RuleEngine = {
         cfg = cfg || {};
         const warnings = [];
 
+        // v3.108 fuzz：配置值 String(嵌套 Symbol 数组) 崩 → 跳过该字段
+        const safeStr = (v) => {
+            if (v === undefined || v === null || typeof v === 'symbol') return '';
+            try { return String(v); } catch (e) { return ''; }
+        };
+
         // pingbifenlei 不支持 ### 多行分类语法，给明确警告
-        if (cfg.pingbifenlei && /###/.test(cfg.pingbifenlei)) {
+        if (safeStr(cfg.pingbifenlei) && /###/.test(safeStr(cfg.pingbifenlei))) {
             warnings.push('⚠️ 配置「pingbifenlei」不支持 ### 多行分类语法，该规则将被忽略\n   如需按分类屏蔽，请直接写分类名正则，例如：微博|赚客吧');
         }
 
         for (const field of FILTER_FIELDS) {
-            const val = cfg[field];
+            const val = safeStr(cfg[field]);
             if (!val) continue;
             // 多行模式：逐行验证
             if (/###/.test(val)) {
@@ -824,13 +855,17 @@ const FilterEngine = {
     },
 
     whitelistFilter(item, field, keyword) {
-        if (!keyword || String(keyword).trim() === '') return true; // 空/空白关键词 = 全部通过
+        // 空/空白关键词 = 全部通过（最优先——与历史语义一致；v3.108 安全 String 化）
+        if (keyword === undefined || keyword === null || keyword === '') return true;
+        let kwStr;
+        try { kwStr = String(keyword); } catch (e) { return true; } // 嵌套 Symbol 数组 String() 崩 → 放行
+        if (kwStr.trim() === '') return true;
         if (!item) return false; // 防御：item 缺失 = 不匹配
         const value = item[field];
         if (!value) return false;
-        if (RuleEngine.hasNestedQuantifier(String(keyword))) return true; // ReDoS 防护：风险关键词不执行匹配，全部放行（与非法正则口径一致）
+        if (RuleEngine.hasNestedQuantifier(kwStr)) return true; // ReDoS 防护：风险关键词不执行匹配，全部放行（与非法正则口径一致）
         try {
-            return new RegExp(keyword, 'i').test(value);
+            return new RegExp(kwStr, 'i').test(value);
         } catch (e) {
             // 非法正则：放行（与 App.run 的 zkt_gjc 预编译失败 kwRe=null 不过滤口径一致；宁可多推不可少推）
             return true;
@@ -898,7 +933,10 @@ const MessageStore = {
 
     getFilePath(filename) {
         // 路径安全：只取 basename 并清洗，外部传 ../ 或绝对路径无法逃出缓存目录
-        let safe = path.basename(String(filename || '')).replace(/[\\/:*?"<>|]/g, '');
+        // v3.108 fuzz：String(嵌套 Symbol 数组) 崩 → 视为空文件名
+        let fnStr;
+        try { fnStr = String(filename || ''); } catch (e) { fnStr = ''; }
+        let safe = path.basename(fnStr).replace(/[\\/:*?"<>|]/g, '');
         if (!safe || safe === '.' || safe === '..') safe = 'default.json';
         // 文件名超长截断（避免 >255 字节落盘失败）
         if (Buffer.byteLength(safe, 'utf8') > 200) {

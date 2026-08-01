@@ -5109,6 +5109,229 @@ await test('pushUrl getter: domain 非字符串不崩溃（R2 防御）', () => 
 });
 
 // ================================================
+
+console.log('\n📂 104. 深度 Fuzz（全导出扫描 + 不变量 Property Tests）');
+
+await test('Fuzz-深度: 扩展随机值生成器（Symbol/函数/BigInt/Date/RegExp/循环/Proxy）', () => {
+    // 固定 seed，确定性
+    let seed = 20260801;
+    const rand = () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+    };
+    const deep = (depth) => {
+        if (depth <= 0) return randomScalar();
+        const r = rand();
+        if (r < 0.35) return randomScalar();
+        if (r < 0.6) return { k: deep(depth - 1), k2: deep(depth - 1) };
+        if (r < 0.8) return [deep(depth - 1), deep(depth - 1), deep(depth - 1)];
+        return randomScalar();
+    };
+    const randomScalar = () => {
+        const r = rand();
+        if (r < 0.06) return null;
+        if (r < 0.12) return undefined;
+        if (r < 0.18) return '';
+        if (r < 0.24) return Symbol('sym');
+        if (r < 0.30) return () => 'fn';
+        if (r < 0.36) return 123n;
+        if (r < 0.42) return new Date(rand() * 1e12);
+        if (r < 0.48) return /ab+c?/gi;
+        if (r < 0.54) return rand() * 1e15;
+        if (r < 0.60) return Math.floor(rand() * 1e10);
+        if (r < 0.64) return NaN;
+        if (r < 0.68) return Infinity;
+        if (r < 0.72) return -Infinity;
+        if (r < 0.78) return { a: 1 };
+        if (r < 0.84) return [1, [2, { x: 3 }]];
+        // 字符串：含实体/标签/emoji/代理对/控制字符/超长
+        const chars = 'abcXYZ0123 &<>=#?/\\n\\t\\0\\u00e9\\u00a9\\ud83d\\ude00\\ud800\\udc00;&#amp;lt;&#x41;\\u4e2d\\u6587';
+        let s = '';
+        const len = Math.floor(rand() * 500);
+        for (let i = 0; i < len; i++) s += chars[Math.floor(rand() * chars.length)];
+        return s;
+    };
+    // 循环引用
+    const circular = { name: 'circ' };
+    circular.self = circular;
+    const withGetter = { get boom() { throw new Error('getter 抛错'); } };
+    const withProxy = new Proxy({}, { get: () => { throw new Error('proxy 抛错'); } });
+    const specials = [circular, withGetter, withProxy, new ArrayBuffer(8), new Uint8Array([1, 2, 3])];
+
+    const targets = [
+        ['decodeHtmlEntities', (v) => decodeHtmlEntities(v)],
+        ['normUrl', (v) => normUrl(v)],
+        ['daysComputed', (v) => daysComputed(v)],
+        ['hasValidId', (v) => hasValidId(v)],
+        ['anonKey', (v) => anonKey(v, v, v)],
+        ['tuisong_replace', (v) => tuisong_replace('{标题}|{日期}|{Markdown内容}|{链接}', v)],
+        ['htmlToMarkdown', (v) => htmlToMarkdown(v)],
+        ['truncateUtf16', (v) => truncateUtf16(v, Math.floor(rand() * 200))],
+        ['whitelistFilter', (v) => whitelistFilter(v, 'title', String(v))],
+        ['hasNestedQuantifier', (v) => hasNestedQuantifier(v)],
+        ['_splitLines', (v) => _splitLines(v)],
+        ['getFileName', (v) => getFileName(v)],
+        ['matchesCompiled', (v) => matchesCompiled(v, v, v)],
+        ['checkRegisterTime', (v) => checkRegisterTime(v, null)],
+        ['checkCategory', (v) => checkCategory(v, null)],
+    ];
+    for (let i = 0; i < 300; i++) {
+        for (const [name, fn] of targets) {
+            // 65% 深度随机对象，15% 特殊值，20% 普通随机
+            let input;
+            const r = rand();
+            if (r < 0.65) input = deep(4);
+            else if (r < 0.80) input = specials[Math.floor(rand() * specials.length)];
+            else input = randomScalar();
+            try { fn(input); }
+            catch (e) {
+                // getter/proxy 抛错是输入自身行为，不算被测函数 bug；其余算
+                if (e && e.message === 'getter 抛错') continue;
+                if (e && e.message === 'proxy 抛错') continue;
+                let inStr;
+                try { inStr = JSON.stringify(input); } catch (ee) { inStr = '[不可序列化]'; }
+                if (inStr === undefined) inStr = 'undefined';
+                throw new Error(`${name} 深度fuzz 输入 ${inStr.slice(0, 60)} 抛错: ${e.message}`);
+            }
+        }
+    }
+});
+
+await test('Property: normUrl 幂等（随机输入 normUrl(normUrl(x))===normUrl(x)）', () => {
+    let seed = 7;
+    const rand = () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+    };
+    const urls = ['http://A.com/x', 'https://x.com/a/', '//host/path', '/rel/path', 'http://x.com', 'a?b=1', '///', 'http://x.com//d//', 'ftp://f.com/', 'HTTP://Mixed.COM/U'];
+    for (let i = 0; i < 1000; i++) {
+        const base = urls[Math.floor(rand() * urls.length)];
+        const junk = ' &/?#[]()\\t'.slice(0, Math.floor(rand() * 8));
+        const x = base + junk + Math.floor(rand() * 1000);
+        const once = normUrl(x);
+        assertEqual(normUrl(once), once, `normUrl 应幂等: 输入 "${x.slice(0, 40)}" once="${once}"`);
+    }
+});
+
+await test('Property: decodeHtmlEntities 的 & 计数只减不增（随机输入）', () => {
+    let seed = 99;
+    const rand = () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+    };
+    for (let i = 0; i < 1000; i++) {
+        let s = '';
+        const len = Math.floor(rand() * 100);
+        for (let j = 0; j < len; j++) {
+            s += rand() < 0.3 ? '&amp;' : (rand() < 0.5 ? '&#38;' : '&#x26;');
+            if (rand() < 0.4) s += 'x';
+        }
+        const out = decodeHtmlEntities(s);
+        const inAmp = (s.match(/&/g) || []).length;
+        const outAmp = (out.match(/&/g) || []).length;
+        assertEqual(outAmp <= inAmp, true, `& 计数应只减不增: "${s.slice(0, 40)}" ${inAmp}→${outAmp}`);
+    }
+});
+
+await test('Property: daysComputed 非负（随机时间输入）', () => {
+    let seed = 1234;
+    const rand = () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+    };
+    for (let i = 0; i < 2000; i++) {
+        const t = Math.floor(rand() * 1e14);
+        const d = daysComputed(t);
+        assertEqual(typeof d, 'number', 'daysComputed 应返回数字');
+        assertEqual(d >= 0, true, `daysComputed 非负: ${t} → ${d}`);
+    }
+});
+
+await test('Property: anonKey 确定性（同输入同输出）+ 不抛', () => {
+    let seed = 55;
+    const rand = () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+    };
+    for (let i = 0; i < 500; i++) {
+        const a = Math.floor(rand() * 1e6);
+        const b = rand() < 0.5 ? null : 'x' + Math.floor(rand() * 1e6);
+        const c = rand() < 0.3 ? '' : '内容' + Math.floor(rand() * 100);
+        const k1 = anonKey(a, b, c);
+        const k2 = anonKey(a, b, c);
+        assertEqual(k1, k2, `anonKey 确定性: ${a}|${b}|${c}`);
+        assertEqual(/^anon:[0-9a-f]+$/.test(k1), true, `anonKey 格式: ${k1}`);
+    }
+});
+
+await test('Property: truncateUtf16 长度不超限（随机字符串+emoji）', () => {
+    let seed = 777;
+    const rand = () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+    };
+    for (let i = 0; i < 1000; i++) {
+        let s = '';
+        const len = Math.floor(rand() * 200);
+        for (let j = 0; j < len; j++) {
+            s += rand() < 0.5 ? '😀' : (rand() < 0.8 ? '中' : 'a');
+        }
+        const max = Math.floor(rand() * 150) + 1;
+        const out = truncateUtf16(s, max);
+        assertEqual(out.length <= max, true, `truncateUtf16 长度 ${out.length} 应 ≤ ${max}`);
+        // 不应切断代理对（低代理出现时前一位必须是高代理）
+        for (let j = 0; j < out.length; j++) {
+            const code = out.charCodeAt(j);
+            if (code >= 0xDC00 && code <= 0xDFFF) {
+                const prev = out.charCodeAt(j - 1);
+                assertEqual(prev >= 0xD800 && prev <= 0xDBFF, true, '孤立低代理不应出现');
+            }
+        }
+    }
+});
+
+await test('Fuzz-深度: 超长输入（100KB 字符串）不崩', () => {
+    const huge = '&amp;'.repeat(20000) + 'x'.repeat(10000) + '<b>'.repeat(5000);
+    assertEqual(typeof decodeHtmlEntities(huge), 'string', '100KB 实体串解码不崩');
+    assertEqual(typeof normUrl('http://x.com/' + 'a'.repeat(50000)), 'string', '50KB url 不崩');
+    const emojiHuge = '😀'.repeat(20000);
+    assertEqual(truncateUtf16(emojiHuge, 300).length <= 300, true, '超长 emoji 截断不崩');
+});
+
+
+console.log('\n📂 105. Fuzz 回归锁定（嵌套 Symbol 数组全 API 防御）');
+
+await test('Fuzz 回归: 嵌套 Symbol 数组输入 16 个 API 不崩（v3.108）', () => {
+    const symArr = [Symbol('x')];
+    assertEqual(typeof decodeHtmlEntities(symArr), 'string', 'decodeHtmlEntities');
+    assertEqual(typeof tuisong_replace(symArr, {}), 'string', 'tuisong_replace 模板');
+    assertEqual(typeof tuisong_replace('{标题}', symArr), 'string', 'tuisong_replace 数据');
+    assertEqual(typeof truncateUtf16(symArr, 10), 'string', 'truncateUtf16');
+    assertEqual(typeof whitelistFilter({ title: 'a' }, 'title', symArr), 'boolean', 'whitelistFilter');
+    assertEqual(Array.isArray(_splitLines(symArr)), true, '_splitLines');
+    assertEqual(typeof daysComputed(symArr), 'number', 'daysComputed/parseTime');
+    assertEqual(typeof getFileName(symArr), 'string', 'getFileName');
+    assertEqual(typeof hasNestedQuantifier(symArr), 'boolean', 'hasNestedQuantifier');
+    assertEqual(typeof normUrl(symArr), 'string', 'normUrl');
+    assertEqual(typeof anonKey(symArr, 1), 'string', 'anonKey');
+    assertEqual(typeof hasValidId(symArr), 'boolean', 'hasValidId');
+    assertEqual(typeof htmlToMarkdown(symArr), 'string', 'htmlToMarkdown');
+    assertEqual(!!compileRules({ pingbibiaoti: symArr }).pingbibiaoti === false || compileRules({ pingbibiaoti: symArr }).pingbibiaoti === null, true, 'compileRules');
+    assertEqual(Array.isArray(validateConfig({ pingbibiaoti: symArr })), true, 'validateConfig');
+    assertEqual(typeof getFilePath(symArr), 'string', 'getFilePath');
+});
+
+await test('Fuzz 回归: 其他脏类型（Proxy/循环引用/超长）不崩', () => {
+    const circular = { x: 1 }; circular.self = circular;
+    assertEqual(typeof normUrl(circular), 'string', 'normUrl 循环引用');
+    assertEqual(typeof decodeHtmlEntities(circular), 'string', 'decode 循环引用');
+    assertEqual(typeof truncateUtf16(circular, 5), 'string', 'truncateUtf16 循环引用');
+    assertEqual(typeof daysComputed(circular), 'number', 'daysComputed 循环引用');
+    // 超长 + 特殊字符
+    assertEqual(typeof decodeHtmlEntities('&'.repeat(100000)), 'string', '10 万 & 不崩');
+    assertEqual(typeof hasNestedQuantifier('(a+)+'.repeat(500)), 'boolean', '超长正则模式不崩');
+});
+
 console.log('\n========================================');
 if (failed === 0) {
     console.log(`  🎉 全部通过！${passed}/${passed}  100%`);
@@ -5132,5 +5355,11 @@ try {
     }
 } catch (e) { /* 忽略 */ }
 
+
+
+
+
+
 process.exit(failed > 0 ? 1 : 0);
+
 })();

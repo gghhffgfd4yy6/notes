@@ -1,5 +1,41 @@
 # 📋 更新日志
 
+## v3.108（深度 Fuzz/Property：13 处 Symbol 崩溃修复）
+> 2026-08-01
+
+### 🎲 104 章 深度 Fuzz + 5 组不变量 Property Tests
+
+- **扩展随机生成器**：Symbol/函数/BigInt/Date/RegExp/循环引用/Proxy(getter抛错)/ArrayBuffer/深度嵌套 4 层/500 字符随机串，300 轮 × 15 函数
+- **5 组不变量**（随机输入验证输出契约）：
+  - normUrl 幂等：normUrl(normUrl(x)) === normUrl(x)（1000 轮）
+  - decodeHtmlEntities 的 & 计数只减不增（1000 轮）
+  - daysComputed 非负（2000 轮）
+  - anonKey 确定性 + 格式 anon:[0-9a-f]+（500 轮）
+  - truncateUtf16 长度 ≤ max + 无孤立低代理（1000 轮）
+- 超长输入：100KB 实体串/50KB url/2 万 emoji 不崩
+
+### 🐛 深度 Fuzz 抓到 13 处真实崩溃（Symbol 一族）
+
+| # | 函数 | 崩溃原因 |
+|---|---|---|
+| 1 | hasValidId | m 本身缺失/非对象时 m.id 崩 |
+| 2 | anonKey | String(Symbol()) 抛 TypeError |
+| 3 | _splitLines | /###/.test(Symbol) 隐式转换崩 |
+| 4 | hasNestedQuantifier | String(Symbol) 崩 |
+| 5-13 | normUrl/decodeHtmlEntities/tuisong_replace/truncateUtf16/whitelistFilter/parseTime/getFilePath/compileRules/validateConfig | **嵌套 Symbol 数组** String(数组) 崩（toString 触发元素转换） |
+
+统一修复模式：String() 包 try-catch（失败视为空/无效/放行），validateConfig/compileRules 入口安全字符串化
+- ⚠️ 修复中发现并恢复 2 处既有行为（whitelistFilter 空关键词最优先、_splitLines `<br/>` 分隔符 R2）
+
+### 📄 105 章 回归锁定
+
+- 16 个 API 对嵌套 Symbol 数组不崩 + Proxy/循环引用/超长不崩（显式测试补 fuzz 随机盲区）
+- 修复 test_filter 结构 bug：统计块在 104/105 章前 → 假绿风险，已移到测试后
+
+### 🧪 测试数
+
+**686 个全绿（单元 598 + 集成 67 + 通道 21）**
+
 ## v3.107（统一测试入口 + CI + Fuzz 测试体系）
 > 2026-08-01
 
