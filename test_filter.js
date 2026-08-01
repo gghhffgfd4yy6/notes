@@ -4873,6 +4873,15 @@ await test('防御: domain 尾斜杠 → pushUrl 无双斜杠（v3.94）', () =>
     }
 });
 
+await test('契约: template/push 新配置默认值锁定（v3.97）', () => {
+    assertEqual(Config.template.title, '【{分类名}】{标题}', 'template.title 默认');
+    assertEqual(Config.template.content, '{Markdown内容}', 'template.content 默认');
+    assertEqual(Config.push.titleMax, 100, 'push.titleMax 默认');
+    assertEqual(Config.push.contentMax, 3000, 'push.contentMax 默认');
+    assertEqual(Config.push.mode, 'sequential', 'push.mode 默认');
+    assertEqual(Config.push.parallelLimit, 0, 'push.parallelLimit 默认');
+});
+
 await test('#链接: {Html内容} href 换行剥离（v3.85）', () => {
     const r = tuisong_replace('{Html内容}', { url: 'http://x.com/a\nb', content_html: '<p>内容</p>', title: 't' });
     assertEqual(r.includes('\n'), false, 'Html内容不应残留换行');

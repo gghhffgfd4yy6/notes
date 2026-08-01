@@ -118,6 +118,11 @@
 | whitelistFilter 数组/对象关键词 | 隐式 String 转换，边缘输入 |
 | 批量判重与单条判重分别实现 | 已通过共用逻辑保持口径一致 |
 
+### 12. Telegram parse_mode=Markdown 特殊字符敏感（待真机验证）
+- **问题**：tgNotify 用 `parse_mode: 'Markdown'`——消息文本含 `* _ [ ]` 等 Markdown 特殊字符时渲染异常（真实推送文本常含星号/下划线）
+- **候选**：a) 改 `parse_mode: 'HTML'` + 转义 `& < >`（TG 官方更宽容）；b) 转义 Markdown 特殊字符（繁琐且改变显示）
+- **暂不修**：改 parse_mode 是行为变更（影响测试与渲染）；真实接口文本形态未验证——**留待真机验证后决定**
+
 ---
 
 ## 三、修复意图：为什么这样修
@@ -234,6 +239,7 @@
 - **v3.94**：pushUrl 双斜杠防御（domain 尾斜杠 → 404，getter 去尾斜杠）
 - **v3.95**：配置矩阵防御测试（t51，全部非法值并行模式不崩）
 - **v3.96**：README 目录结构同步；example 补 TG_PROXY 说明
+- **v3.97**：template/push 新配置默认值契约测试；TG parse_mode 决策记录（待真机验证）
 
 ## 七、行为变更记录（语义调整）
 

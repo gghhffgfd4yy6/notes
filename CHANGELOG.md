@@ -1,5 +1,21 @@
 # 📋 更新日志
 
+## v3.97（新配置默认值契约 + TG 决策记录）
+> 2026-08-01
+
+### 🧪 template/push 默认值契约
+
+- 旧默认值契约测试只覆盖 domain/filter；v3.68-70 新增的 template/push 配置默认值无锁定
+- 新增测试：template.title/content、push.titleMax/contentMax/mode/parallelLimit 默认值全锁定（防未来改动破坏默认行为）
+
+### 📝 TG parse_mode 决策记录
+
+- REVIEW_DECISIONS 记录 Telegram Markdown 特殊字符敏感的评估（候选 HTML 模式/转义；**留待真机验证后决定**——改 parse_mode 是行为变更）
+
+### 🧪 测试数
+
+**657 个全绿（单元 577 + 集成 59 + 通道 21）**
+
 ## v3.96（README 目录结构同步 + example 补 TG_PROXY 说明）
 > 2026-08-01
 
