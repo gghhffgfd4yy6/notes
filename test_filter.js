@@ -4900,6 +4900,127 @@ await test('#链接: {Html内容} href 换行剥离（v3.85）', () => {
     assertEqual(r2.includes('http://x.com/ok'), true, '正常 url 不受影响');
 });
 
+// ==================== 103. R1 低风险修复锁定（v3.105 不推版本） ====================
+console.log('\n📂 103. 低风险修复批次锁定（R1-R6/R9：truncate/getFileName/splitLines/domain/maxSize/retry/原型键/url/title）');
+
+await test('truncateUtf16: 非法 max(undefined/NaN/0/负数) 不截断（R1）', () => {
+    assertEqual(truncateUtf16('abc', undefined), 'abc', 'undefined 不截断');
+    assertEqual(truncateUtf16('abc', NaN), 'abc', 'NaN 不截断');
+    assertEqual(truncateUtf16('abc', 0), 'abc', '0 不截断');
+    assertEqual(truncateUtf16('abc', -5), 'abc', '负数不截断');
+    assertEqual(truncateUtf16('abcdef', 3), 'abc', '合法 max 仍截断');
+    assertEqual(truncateUtf16('😀😀', 1), '', '代理对边界仍安全（max=1 → 高代理退位）');
+});
+
+await test('getFileName: 非字符串 url 兜底 default.json（R1）', () => {
+    assertEqual(getFileName({ a: 1 }), 'default.json', '对象兜底');
+    assertEqual(getFileName(123), 'default.json', '数字兜底');
+    assertEqual(getFileName(true), 'default.json', '布尔兜底');
+    assertEqual(getFileName(null), 'default.json', 'null 兜底');
+    assertEqual(getFileName(''), 'default.json', '空串兜底');
+    assertEqual(getFileName('/weibo/123.html'), '123.html.json', '正常路径补 .json 后缀不受影响');
+    assertEqual(getFileName('https://x.com/a/b.json?x=1'), 'b.json', 'query 剥离不受影响');
+});
+
+await test('_splitLines: 支持 <br/> 自闭合标签（R2）', () => {
+    assertEqual(JSON.stringify(_splitLines('分类1###规则1<br/>分类2###规则2')), JSON.stringify(['分类1###规则1', '分类2###规则2']), '<br/> 拆分');
+    assertEqual(JSON.stringify(_splitLines('分类1###规则1<br />分类2###规则2')), JSON.stringify(['分类1###规则1', '分类2###规则2']), '<br /> 空格拆分');
+    assertEqual(JSON.stringify(_splitLines('分类1###规则1<br>分类2###规则2')), JSON.stringify(['分类1###规则1', '分类2###规则2']), '<br> 原行为保持');
+    assertEqual(JSON.stringify(_splitLines('分类1###规则1\n分类2###规则2')), JSON.stringify(['分类1###规则1', '分类2###规则2']), '\\n 原行为保持');
+    assertEqual(JSON.stringify(_splitLines('a###b')), JSON.stringify(['a###b']), '多行模式无分隔符 → 单元素数组');
+    assertEqual(_splitLines('abc'), null, '简单模式仍返回 null（无 ### 不拆分）');
+});
+
+await test('saveMessages: maxSize 小数回退默认、整数裁剪生效（R3-2 整数化）', () => {
+    const saved = Config.cache.maxSize;
+    const fs = require('fs');
+    const p = getFilePath('test_103_maxsize.json');
+    const msgs = Array.from({ length: 100 }, (_, i) => ({ id: i, title: `t${i}` }));
+    try {
+        // 小数 maxSize → 回退默认 100 → 100 条不裁剪
+        Config.cache.maxSize = 2.5;
+        saveMessages(p, msgs);
+        assertEqual(readMessages(p).length, 100, `maxSize=2.5 应回退默认 100 不裁剪: ${readMessages(p).length}`);
+        // 整数 maxSize=3 → 裁剪到 3 条（上限语义为整数条数）
+        Config.cache.maxSize = 3;
+        saveMessages(p, msgs);
+        assertEqual(readMessages(p).length, 3, `整数 maxSize=3 应裁剪到 3 条: ${readMessages(p).length}`);
+        // 0/负值仍回退默认（原行为保持）
+        Config.cache.maxSize = 0;
+        saveMessages(p, msgs);
+        assertEqual(readMessages(p).length, 100, 'maxSize=0 回退默认不裁剪');
+    } finally {
+        Config.cache.maxSize = saved;
+        try { fs.unlinkSync(p); } catch (e) { /* 忽略 */ }
+        try { fs.unlinkSync(p + '.tmp'); } catch (e) { /* 忽略 */ }
+    }
+});
+
+await test('安全: readMessages 原型键 __proto__ 防御（R5-2）', () => {
+    const fs = require('fs');
+    const p = getFilePath('__proto__');
+    try {
+        // 首次读：原型键不走内存直读（hasOwnProperty false）→ 磁盘初始化空数组
+        const r1 = readMessages('__proto__');
+        assert(Array.isArray(r1), `__proto__ 键读取应为数组: ${typeof r1} ${Array.isArray(r1) ? '' : JSON.stringify(r1).slice(0, 60)}`);
+        // 二次读：走内存缓存（defineProperty 写入）→ 仍应为数组
+        const r2 = readMessages('__proto__');
+        assert(Array.isArray(r2), `__proto__ 键二次读取应为数组: ${typeof r2}`);
+        // Object.prototype 不被污染
+        assertEqual(Object.prototype.constructor, Object, 'Object.prototype 不被污染');
+        assertEqual(Object.prototype.polluted, undefined, '无 polluted 残留');
+    } finally {
+        try { fs.unlinkSync(p); } catch (e) { /* 忽略 */ }
+        // readMessages 直接传 '__proto__'（触发原型键分支）时 _ensureFileExists 会在 cwd 创建文件——测试后清理
+        try { fs.unlinkSync(require('path').join(__dirname, '__proto__')); } catch (e) { /* 忽略 */ }
+    }
+});
+
+await test('url 非字符串防御：三处无 [object Object] 泄漏（R6-1）', () => {
+    // htmlToMarkdown：对象/数字 url → 无垃圾文本、无原文链接
+    const md1 = htmlToMarkdown({ content_html: '<p>内容</p>', url: { a: 1 } });
+    assert(!md1.includes('[object Object]'), 'htmlToMarkdown 对象 url 无垃圾文本');
+    assert(!md1.includes('原文链接'), '对象 url → 无原文链接');
+    const md2 = htmlToMarkdown({ content_html: '<p>c</p>', url: 123 });
+    assert(!md2.includes('[object Object]') && !md2.includes('原文链接'), '数字 url 同样无链接');
+    // tuisong_replace：{链接} 与 {Html内容} 占位符
+    const r1 = tuisong_replace('{链接}|{Html内容}', { url: { a: 1 }, content_html: '<p>x</p>' });
+    assert(!r1.includes('[object Object]'), 'tuisong_replace 无垃圾文本');
+    assert(r1.startsWith('|'), `{链接} 应为空: ${JSON.stringify(r1.slice(0, 20))}`);
+    // 正常字符串 url 不受影响
+    const md3 = htmlToMarkdown({ content_html: '<p>c</p>', url: '/a/1.html' });
+    assert(md3.includes('原文链接：'), '字符串 url 仍生成原文链接');
+    const r2 = tuisong_replace('{链接}', { url: '/a/1.html' });
+    assertEqual(r2, '/a/1.html', '字符串 url 占位符正常');
+});
+
+await test('validateConfig: zkt_gjc 非字符串 → 警告（R11-1）', () => {
+    const w1 = validateConfig({ zkt_gjc: { a: 1 } });
+    assert(w1.some(w => w.includes('zkt_gjc') && w.includes('应为字符串')), `对象 zkt_gjc 应警告: ${JSON.stringify(w1)}`);
+    const w2 = validateConfig({ zkt_gjc: 123 });
+    assert(w2.some(w => w.includes('zkt_gjc') && w.includes('应为字符串')), `数字 zkt_gjc 应警告: ${JSON.stringify(w2)}`);
+    const w3 = validateConfig({ zkt_gjc: '京东' });
+    assert(!w3.some(w => w.includes('zkt_gjc')), '合法字符串无警告');
+});
+
+await test('pushUrl getter: domain 非字符串不崩溃（R2 防御）', () => {
+    const saved = Config.domain;
+    try {
+        Config.domain = 123;
+        assertEqual(Config.api.pushUrl, '/plus/json/push.json', '数字 domain → 空前缀');
+        Config.domain = null;
+        assertEqual(Config.api.pushUrl, '/plus/json/push.json', 'null domain → 空前缀');
+        Config.domain = { x: 1 };
+        assertEqual(Config.api.pushUrl, '/plus/json/push.json', '对象 domain → 空前缀');
+        Config.domain = 'https://new.ixbk.net';
+        assertEqual(Config.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json', '正常 domain 不受影响');
+        Config.domain = 'https://new.ixbk.net/';
+        assertEqual(Config.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json', '尾斜杠仍剥离');
+    } finally {
+        Config.domain = saved;
+    }
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {

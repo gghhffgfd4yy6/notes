@@ -9,7 +9,7 @@
 
 ### `xbk_function_v3.js` — 主代码(推送脚本核心)
 
-**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。约 1265 行,9 层职责分层架构。
+**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。约 1390 行,9 层职责分层架构。
 
 **运行流程**(`App.run()` 主流程):
 ```
@@ -55,7 +55,7 @@ Config.template.content    // 推送内容模板(默认{Markdown内容})
 Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.104)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号(v3.106)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
@@ -115,9 +115,9 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ## 二、测试相关
 
-### `test_filter.js` — 单元测试(约 577 个)
+### `test_filter.js` — 单元测试(约 586 个)
 
-**定位**:主测试文件(约 4490 行),涵盖 20+ 种测试手段,按章节组织。
+**定位**:主测试文件(约 5049 行),涵盖 20+ 种测试手段,按章节组织。
 
 **章节结构**(📂 编号):
 
@@ -150,14 +150,15 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 | **100** | **审查项 #56/#65/#7/#链接** | img 空 src/url 换行/maxSize 校验/{链接} Markdown 安全化 |
 | **101** | **版本一致性** | 文件头 ↔ CHANGELOG ↔ package.json ↔ README 四方一致（防版本号过时） |
 | **102** | **配置防御/实体扩展** | cache.dir 非字符串回退/实体扩展(36 个)/href 换行剥离 |
+| **103** | **低风险修复批次** | R1-R6/R9：truncateUtf16 非法max/getFileName 非字符串/_splitLines <br\/\>/domain 防御/maxSize 整数化/retry 有界/原型键/url 三处统一/title 类型/zkt_gjc 对象防御（v3.106 第11轮审查 15 项） |
 
 **运行**:`node test_filter.js`(约 1.6s),退出码 0=全绿。
 
 ---
 
-### `test_app.js` — 集成测试(约 59 个)
+### `test_app.js` — 集成测试(约 67 个)
 
-**定位**:mock got/notify 验证 App.run 完整主流程(约 858 行)。
+**定位**:mock got/notify 验证 App.run 完整主流程(约 1252 行)。
 
 **覆盖场景**:
 - 拉取→推送完整链路、缓存去重、空数据、字段归一化
@@ -232,7 +233,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.104),每轮修复/重构/功能变更的摘要。
+版本演进记录(v3.0 → v3.106),每轮修复/重构/功能变更的摘要。
 
 ---
 

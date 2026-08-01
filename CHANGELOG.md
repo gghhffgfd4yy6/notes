@@ -1,5 +1,33 @@
 # 📋 更新日志
 
+## v3.106（第11轮审查：低风险防御批次15项 + 版本固化）
+> 2026-08-01
+
+### 🛡️ 低风险防御批次（R1-R6/R9/R11，共 15 项，全部测试锁定+变异可检测）
+
+- **R1**（3 项）：`truncateUtf16` 非法 max（undefined/NaN/0/负数）不截断；`getFileName` 非字符串 url 兜底 `default.json`；`pushOne` 推送失败日志非 Error 兜底（notify 抛字符串不再显示 undefined）
+- **R2**（3 项）：`_splitLines` 支持 `<br/>` 自闭合（含 validateConfig 2 处口径同步，96 章一致性保持）；`Config.domain` 非字符串防御（pushUrl getter + App.run baseUrl 两处）；`fetchData` 重试日志非 Error 兜底
+- **R3**（2 项）：test_app `reset()` 恢复 `api.timeout/retry` 默认（修复 t51 污染后续测试的隔离漏洞）；`saveMessages` maxSize 整数化（小数 2.5 回退默认，避免 splice ToInteger 模糊条数）
+- **R4**（2 项）：`fetchData` retry 非法值有界兜底（**Infinity 曾致无限重试死循环**，现兜底 2 次）；`Pusher.send` 参数归一（undefined/null → 空串）
+- **R5**（2 项）：`_memoryCache` 原型键（`__proto__`/constructor/prototype）防御——直写曾修改对象原型（87 章原型污染测试扩展）；`fetchData` 重试日志显示兜底后次数（非 "1/Infinity"）
+- **R6**（1 项）：url 非字符串防御三处统一（htmlToMarkdown urlText / tuisong_replace linkText / escUrl）——对象 url 不再泄漏 `[object Object]`
+- **R9**（1 项）：`pushOne` title/content 非字符串防御——对象标题不再泄漏 `[object Object]`，回退 `(无标题)`/空
+- **R11**（2 项）：`zkt_gjc` 非字符串（对象/数字）配置防御——validateConfig 警告 + App.run 跳过过滤（原来 String 化 `'[object Object]'` 被当合法正则静默过滤）
+
+### 🧹 测试/文档清理
+- R5-2 测试残留清理：`readMessages('__proto__')` 在 cwd 创建 `__proto__` 文件的测试缺陷修复（finally 清理）
+- 103 章标题更新为「低风险修复批次锁定（R1-R6/R9）」
+
+### 🔍 验证
+- 每轮完整闭环：备份 → 改代码 → 写测试 → 全量绿 → **故意破坏（变异）→ 测试变红 → 恢复 → 全量绿**
+- **17/17 变异全部被测试检测**（无假绿）；稳定性双跑 2 轮无 flaky
+- 真实接口运行（沙箱可达）：拉取/转换/推送链路正常（20 条真实数据）
+- 33 导出契约 / 版本四方一致 / git diff 干净（主代码 +65/-21、测试 +230）
+
+### 🧪 测试数
+
+**674 个全绿（单元 586 + 集成 67 + 通道 21）**
+
 ## v3.105（真机验证：接口实测 + 双重转义修复）
 > 2026-08-01
 

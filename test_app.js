@@ -53,10 +53,12 @@ require.cache[gotPath].exports = (url, opts) => {
 let pushCalls = [];
 let notifyFail = false;
 let notifyFailAt = -1; // -1=永不失败，N=第N次调用失败
+let notifyFailString = false; // 抛非 Error(字符串)——R1：验证 pushOne catch 兜底
 let notifyCalls = 0;
 require.cache[notifyPath].exports = {
     sendNotify: async (text, desp) => {
         notifyCalls++;
+        if (notifyFailString) throw 'push boom string'; // 字符串异常（非 Error）
         if (notifyFail) throw new Error('push boom');
         if (notifyFailAt > 0 && notifyCalls === notifyFailAt) throw new Error('push boom');
         pushCalls.push({ text, desp });
@@ -113,6 +115,7 @@ function reset() {
     failNonJson = false;
     notifyFail = false;
     notifyFailAt = -1;
+    notifyFailString = false;
     notifyCalls = 0;
     Config.filter.pingbifenlei = '';
     Config.filter.pingbibiaoti = '';
@@ -127,6 +130,9 @@ function reset() {
     Config.domain = 'https://new.ixbk.net';
     Config.cache.maxSize = 100;
     Config.cache.dir = 'xianbaoku_cache';
+    // R3-1：api 配置也恢复默认（t51 等会改 api.retry/timeout，漏恢复会污染后续测试）
+    Config.api.timeout = 5000;
+    Config.api.retry = 2;
 }
 
 function readCacheFile(suffix) {
@@ -1085,6 +1091,138 @@ await test('配置矩阵: 全部非法值并行模式不崩（v3.95）', async (
         assert(pushCalls[0].desp.includes('原文链接'), '非法配置回退默认后内容应完整');
     } finally {
         reset(); // v3.91 reset 恢复全部默认
+    }
+});
+
+// ==================== 7.20 R1 低风险修复：pushOne 非 Error 兜底 ====================
+await test('推送抛非Error(字符串) → 不崩溃、失败计数、不写缓存（R1 防御）', async () => {
+    reset();
+    setPushUrl('t52_notify_string');
+    fakeData = [makeItem({ id: 1 })];
+    notifyFailString = true; // notify 抛字符串异常
+    const origLog = console.log;
+    const captured = [];
+    console.log = (...args) => captured.push(args.join(' '));
+    try {
+        const r = await xbk.run();
+        assert(r.total === 1, `total=1: ${r.total}`);
+        assert(r.pushed === 0 && r.failed === 1, `失败应计数: pushed=${r.pushed} failed=${r.failed}`);
+        assert(pushCalls.length === 0, '字符串异常时 notify 不应有成功调用');
+        assert(readCacheFile('t52_notify_string').length === 0, '失败不写缓存（下次重试）');
+        // 日志断言：失败原因应显示字符串本身，而非 undefined（R1 兜底核心）
+        const log = captured.join('\n');
+        assert(log.includes('push boom string'), `日志应含字符串原因: ${log.slice(-120)}`);
+        assert(!log.includes('undefined'), `日志不应含 undefined: ${log.slice(-120)}`);
+    } finally {
+        console.log = origLog;
+        notifyFailString = false;
+    }
+});
+
+// ==================== 7.21 R2 低风险修复：domain 防御 + fetchData 日志兜底 ====================
+await test('domain 非字符串(数字) → 不崩溃、正常推送（R2 baseUrl 防御）', async () => {
+    reset();
+    setPushUrl('t53_domain_num');
+    fakeData = [makeItem({ id: 1 })];
+    Config.domain = 123; // 脏配置：数字（v3.73 校验只警告不阻止，baseUrl 需防御）
+    try {
+        const r = await xbk.run();
+        assert(r.total === 1 && r.pushed === 1, `domain=123 应仍能推送: pushed=${r.pushed}`);
+        assert(pushCalls[0].desp.includes('原文链接'), '推送内容正常');
+    } finally {
+        reset();
+    }
+});
+
+await test('fetchData 抛字符串 → 重试日志含原因且无 undefined（R2 日志兜底）', async () => {
+    reset();
+    setPushUrl('t54_fetch_string');
+    fakeData = [makeItem({ id: 1 })];
+    failPlainString = true; // got 抛 'plain string error'
+    const origLog = console.log;
+    const captured = [];
+    console.log = (...args) => captured.push(args.join(' '));
+    try {
+        let rejected = false;
+        try { await xbk.run(); } catch (e) { rejected = true; }
+        assert(rejected, '重试耗尽应失败');
+        const log = captured.join('\n');
+        assert(log.includes('plain string error'), `日志应含字符串原因: ${log.slice(-120)}`);
+        assert(!log.includes('undefined'), `日志不应含 undefined: ${log.slice(-120)}`);
+    } finally {
+        console.log = origLog;
+        failPlainString = false;
+    }
+});
+
+await test('reset() 恢复 api.timeout/retry 默认值（R3-1 测试隔离）', async () => {
+    Config.api.timeout = 9999;
+    Config.api.retry = 7;
+    reset();
+    assert(Config.api.timeout === 5000, `timeout 恢复默认: ${Config.api.timeout}`);
+    assert(Config.api.retry === 2, `retry 恢复默认: ${Config.api.retry}`);
+});
+
+// ==================== 7.22 R4 低风险修复：retry 有界 + Pusher 参数归一 ====================
+await test('fetchData retry=Infinity → 有界兜底不无限重试（R4-1 防死循环）', async () => {
+    reset();
+    setPushUrl('t56_retry_inf');
+    fakeData = [makeItem({ id: 1 })];
+    failCount = 5; // mock got 持续失败
+    Config.api.retry = Infinity; // 非法配置：死循环风险
+    const origLog = console.log;
+    const captured = [];
+    console.log = (...args) => captured.push(args.join(' '));
+    try {
+        let rejected = false;
+        try { await xbk.run(); } catch (e) { rejected = true; }
+        assert(rejected, '持续失败应最终抛错');
+        assert(gotCalls.length <= 3, `retry=Infinity 应兜底为 2 次重试(共3次请求): 实际 ${gotCalls.length}`);
+        // R5-1：日志显示兜底后次数（1/2、2/2），非 "1/Infinity"
+        const log = captured.join('\n');
+        assert(log.includes('1/2'), `日志应显示兜底次数 1/2: ${log.slice(-160)}`);
+        assert(!log.includes('Infinity'), `日志不应含 Infinity: ${log.slice(-160)}`);
+    } finally {
+        console.log = origLog;
+        failCount = 0;
+        reset(); // R3-1 已恢复 api.retry
+    }
+});
+
+await test('Pusher.send 非字符串参数 → 归一为空串（R4-2 防御）', async () => {
+    reset();
+    await xbk.Pusher.send(undefined, null);
+    assert(pushCalls.length === 1, '应调用 sendNotify');
+    assert(pushCalls[0].text === '', `text 归一为空串: ${JSON.stringify(pushCalls[0].text)}`);
+    assert(pushCalls[0].desp === '', `desp 归一为空串: ${JSON.stringify(pushCalls[0].desp)}`);
+});
+
+await test('对象 title 脏数据 → (无标题) 占位、无 [object Object]（R9 防御）', async () => {
+    reset();
+    setPushUrl('t58_obj_title');
+    fakeData = [makeItem({ id: 1, title: { a: 1 } })];
+    const r = await xbk.run();
+    assert(r.pushed === 1, `应推送成功: ${r.pushed}`);
+    const p = pushCalls[0];
+    assert(!p.text.includes('[object Object]'), `标题无泄漏: ${p.text.slice(0, 80)}`);
+    assert(p.text.includes('(无标题)'), `标题应为 (无标题) 占位: ${p.text.slice(0, 80)}`);
+});
+
+await test('zkt_gjc 对象配置 → 警告并全部推送（R11-1 防御）', async () => {
+    reset();
+    setPushUrl('t59_zkt_obj');
+    fakeData = [makeItem({ id: 1, title: '京东神券' }), makeItem({ id: 2, title: '淘宝好价' })];
+    Config.keyword.zkt_gjc = { a: 1 }; // 对象脏配置（String 化会成 '[object Object]' 正则）
+    const origWarn = console.warn;
+    const warns = [];
+    console.warn = (m) => warns.push(String(m));
+    try {
+        const r = await xbk.run();
+        assert(r.pushed === 2, `对象 zkt_gjc 应全部推送: ${r.pushed}`);
+        assert(warns.some(w => w.includes('zkt_gjc') && w.includes('应为字符串')), '应有非字符串警告');
+    } finally {
+        console.warn = origWarn;
+        reset();
     }
 });
 

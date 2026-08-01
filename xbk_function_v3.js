@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.105 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 + 配置防御 + CLI兜底 + UA版本化 + 实体扩展 + 并行组合测试 + href换行剥离 + 一言防御 + runlog耗时 + 文档同步 + md链路锁定 + 测试隔离 + readme同步 + index同步 + domain斜杠防御 + 配置矩阵 + 目录同步 + 默认值契约 + 记录同步 + example补全 + 里程碑 + 状态同步 + readme最终同步 + index行数同步 + 真机验证清单 + 递归解码 ********
+//******** 线报酷推送脚本 v3.106 — 低风险防御批次15项：非法max/非字符串兜底/非Error日志/br闭合/domain防御/maxSize整数化/retry有界防死循环/原型键防御/url三处统一/title类型/zkt_gjc对象防御 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -21,7 +21,8 @@ const Config = {
 
     api: {
         // v3.94：domain 尾斜杠防御——`https://x.com/` + 路径曾拼成 `//plus/...` 双斜杠 404
-        get pushUrl() { return `${Config.domain.replace(/\/+$/, '')}/plus/json/push.json`; },
+        // R2：domain 非字符串（数字/对象脏配置）→ 空串（避免 getter 内 .replace 崩溃）
+        get pushUrl() { return `${(typeof Config.domain === 'string' ? Config.domain.replace(/\/+$/, '') : '')}/plus/json/push.json`; },
         timeout: 5000,
         retry: 2,
     },
@@ -226,6 +227,9 @@ const Utils = {
      */
     truncateUtf16(s, max) {
         s = String(s === undefined || s === null ? '' : s);
+        // 防御（R1）：非法 max（undefined/NaN/0/负数）不截断——内部调用均传合法值，零行为变更；
+        // 否则 slice(0, undefined) 意外整串返回 / slice(0,0) 空串 / slice(0,-N) 误截尾字符
+        if (!Number.isFinite(max) || max <= 0) return s;
         if (s.length <= max) return s;
         let cut = s.slice(0, max);
         const last = cut.charCodeAt(cut.length - 1);
@@ -270,8 +274,8 @@ const Formatter = {
         shuju = shuju || {};
         let html = (typeof shuju.content_html === 'string') ? shuju.content_html
             : (shuju.content_html === undefined || shuju.content_html === null ? '' : ''); // 非字符串内容视为空（避免 [object Object]）
-        // url 文本与链接目标统一：非字符串转字符串、剥离换行（Markdown 链接文本/目标内的裸换行都会破坏链接，#65）
-        const urlText = shuju.url === undefined || shuju.url === null ? '' : String(shuju.url).replace(/[\r\n]+/g, '');
+        // url 文本与链接目标统一：非字符串视为无链接（与 urlOf 口径一致，避免 '[object Object]' 泄漏）、剥离换行（Markdown 链接文本/目标内的裸换行都会破坏链接，#65）
+        const urlText = (typeof shuju.url === 'string') ? shuju.url.replace(/[\r\n]+/g, '') : '';
         // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）
         const mdUrl = urlText && /[\s()\[\]]/.test(urlText) ? `<${urlText}>` : urlText;
         // 无标签内容短路：跳过整个替换链（性能优化）
@@ -348,8 +352,8 @@ const Formatter = {
         // 惰性计算：只有模板里真正用到 {Html内容} / {Markdown内容} 时才跑一遍替换/正则，
         // 避免像 App.run 里那样对同一条数据分别调用 tuisong_replace 生成 text/desp 时，
         // 没用到 Markdown 的那次也白白算一遍 htmlToMarkdown
-        // url 做 HTML 转义，避免特殊字符破坏 <a href="..."> 结构；换行先剥离（v3.85，与 linkText 口径一致）
-        const escUrl = String(data.url === undefined || data.url === null ? '' : data.url)
+        // url 做 HTML 转义，避免特殊字符破坏 <a href="..."> 结构；换行先剥离（v3.85，与 linkText 口径一致）；非字符串视为无链接（R6-1）
+        const escUrl = (typeof data.url === 'string' ? data.url : '')
             .replace(/[\r\n]+/g, '')
             .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         // 与 htmlToMarkdown 口径一致：非字符串 content_html 视为空（避免 [object Object] 泄漏）
@@ -357,7 +361,8 @@ const Formatter = {
         // {链接} 占位符 Markdown 安全化（v3.74）：与 htmlToMarkdown 的 mdUrl 同口径——
         // 含空格/括号/] 用 <> 包裹、剥离换行（原样输出会在 Markdown 链接场景破坏）
         const linkText = (() => {
-            const u = data.url === undefined || data.url === null ? '' : String(data.url).replace(/[\r\n]+/g, '');
+            // R6-1：非字符串视为无链接（与 htmlToMarkdown urlText 同口径）
+            const u = (typeof data.url === 'string') ? data.url.replace(/[\r\n]+/g, '') : '';
             return u && /[\s()\[\]]/.test(u) ? `<${u}>` : u;
         })();
         const getContentHtml = () => `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`;
@@ -473,7 +478,7 @@ const RuleEngine = {
     _splitLines(configStr) {
         if (!configStr) return [];
         if (!/###/.test(configStr)) return null; // 简单模式
-        return configStr.split(/<br>|\r\n|\r|\n/);
+        return configStr.split(/<br\s*\/?>|\r\n|\r|\n/); // R2：支持 <br/> 自闭合（与 htmlToMarkdown br 口径一致）
     },
 
     /**
@@ -620,7 +625,7 @@ const RuleEngine = {
             if (!val) continue;
             // 多行模式：逐行验证
             if (/###/.test(val)) {
-                const lines = val.split(/<br>|\r\n|\r|\n/); // 与 _splitLines 口径一致(含单独 \r)
+                const lines = val.split(/<br\s*\/?>|\r\n|\r|\n/); // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
                 for (const line of lines) {
                     const t = line.trim();
                     if (!t) continue;
@@ -660,7 +665,10 @@ const RuleEngine = {
         }
 
         // 验证 zkt_gjc（只看它关键词，与 App.run 预编译口径一致）
-        if (cfg.zkt_gjc && String(cfg.zkt_gjc).trim() !== '') {
+        // R11-1：非字符串（对象/数字等脏配置）→ 显式警告（String 化会把 '[object Object]' 当合法正则，静默怪行为）
+        if (cfg.zkt_gjc !== undefined && cfg.zkt_gjc !== null && typeof cfg.zkt_gjc !== 'string') {
+            warnings.push(`⚠️ 配置「zkt_gjc」应为字符串，当前为 ${typeof cfg.zkt_gjc}，已忽略只看它过滤`);
+        } else if (cfg.zkt_gjc && String(cfg.zkt_gjc).trim() !== '') {
             if (this.hasNestedQuantifier(cfg.zkt_gjc)) {
                 warnings.push('⚠️ 配置「zkt_gjc」的正则含嵌套量词，可能导致灾难性回溯，已忽略只看它过滤');
             } else {
@@ -672,7 +680,7 @@ const RuleEngine = {
         // 验证 pingbitime
         if (cfg.pingbitime) {
             if (/###/.test(cfg.pingbitime)) {
-                const lines = cfg.pingbitime.split(/<br>|\r\n|\r|\n/); // 与 _splitLines 口径一致(含单独 \r)
+                const lines = cfg.pingbitime.split(/<br\s*\/?>|\r\n|\r|\n/); // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
                 for (const line of lines) {
                     const { cat, val, parts } = this._parseLine(line);
                     if (parts.length >= 2) {
@@ -839,11 +847,17 @@ const MessageStore = {
 
     /** 带上限的内存缓存写入：超限时整体重置（磁盘不受影响），防理论无限增长 */
     _memoSet(filePath, val) {
-        if (!(filePath in this._memoryCache) && Object.keys(this._memoryCache).length >= this._MEMO_MAX) {
+        // R5-2：hasOwnProperty 判断（__proto__ 等原型键不会被 in 误判/直写污染对象原型）
+        if (!Object.prototype.hasOwnProperty.call(this._memoryCache, filePath) && Object.keys(this._memoryCache).length >= this._MEMO_MAX) {
             this._memoryCache = {};
             console.warn(`内存缓存达到上限(${this._MEMO_MAX})，已重置（磁盘缓存不受影响）`);
         }
-        this._memoryCache[filePath] = val;
+        // 原型键（__proto__/constructor/prototype）用 defineProperty 写入，避免 `obj['__proto__']=val` 修改对象原型
+        if (filePath === '__proto__' || filePath === 'constructor' || filePath === 'prototype') {
+            Object.defineProperty(this._memoryCache, filePath, { value: val, enumerable: true, configurable: true, writable: true });
+        } else {
+            this._memoryCache[filePath] = val;
+        }
     },
 
     /** 统一更新/追加：命中则更新(含覆盖提示)，未命中追加 */
@@ -915,7 +929,8 @@ const MessageStore = {
     },
 
     readMessages(filePath) {
-        if (this._memoryCache[filePath]) return this._memoryCache[filePath];
+        // R5-2：hasOwnProperty 读取（'__proto__' 直读会返回 Object.prototype 而非缓存值）
+        if (Object.prototype.hasOwnProperty.call(this._memoryCache, filePath)) return this._memoryCache[filePath];
         this._ensureFileExists(filePath);
         try {
             const data = JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
@@ -939,8 +954,8 @@ const MessageStore = {
     saveMessages(filePath, messages) {
         // 拷贝后再截断：不原地修改调用方传入的数组（外部复用场景）
         const toSave = Array.isArray(messages) ? [...messages] : [];
-        // maxSize 防御：非正数回退默认（避免 0/负值导致缓存被清空）
-        const maxSize = Number.isFinite(Config.cache.maxSize) && Config.cache.maxSize > 0
+        // maxSize 防御：非正整数回退默认（R3-2 整数化——小数 2.5 会让 splice 的 ToInteger 截断产生模糊条数；0/负值避免缓存被清空）
+        const maxSize = Number.isInteger(Config.cache.maxSize) && Config.cache.maxSize > 0
             ? Config.cache.maxSize : DEFAULT_MAX_SIZE;
         if (toSave.length > maxSize) {
             console.warn(`缓存超出上限(${maxSize})，裁剪掉最早 ${toSave.length - maxSize} 条`);
@@ -996,7 +1011,9 @@ const MessageStore = {
     },
 
     getFileName(url) {
-        const parts = String(url || '').split('/');
+        // 防御（R1）：非字符串 url（对象/数字/布尔）→ default.json（避免 '[object Object].json' 怪文件名）
+        if (typeof url !== 'string' || !url) return 'default.json';
+        const parts = url.split('/');
         let name = parts[parts.length - 1].split(/[?#]/)[0]; // 去掉查询参数与 hash
         if (!name || /^\.+$/.test(name)) name = 'default'; // 空/纯点串兜底，避免 '..' → '...json'
         name = name.replace(/[\\/:*"<>|]/g, '_'); // 清洗文件系统保留字符
@@ -1015,7 +1032,10 @@ const Network = {
      */
     async fetchData() {
         let lastErr;
-        for (let attempt = 0; attempt <= Config.api.retry; attempt++) {
+        // R4-1：retry 非法值有界兜底——Infinity 会让 `attempt <= retry` 死循环重试（validateConfig 只警告不阻止）；
+        // NaN → 意外只跑 1 次；小数 → 次数模糊。合法整数（默认 2）行为零变更
+        const maxRetry = Number.isInteger(Config.api.retry) && Config.api.retry >= 0 ? Config.api.retry : 2;
+        for (let attempt = 0; attempt <= maxRetry; attempt++) {
             try {
                 // retry: { limit: 0 } 关闭 got 内置重试，完全交给外层手写逻辑
                 return await got(Config.api.pushUrl, {
@@ -1038,7 +1058,7 @@ const Network = {
                 if (attempt < Config.api.retry) {
                     // 退避等待：1s、2s、3s...（加 0-500ms 随机抖动，避免多实例同时重试）
                     const wait = 1000 * (attempt + 1) + Math.floor(Math.random() * 500);
-                    console.log(`请求失败（${e.code || e.message}），${wait / 1000}s 后重试（第 ${attempt + 1}/${Config.api.retry} 次）...`);
+                    console.log(`请求失败（${(e && (e.code || e.message)) || String(e)}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）...`); // R5-1：显示兜底后次数
                     await new Promise(r => setTimeout(r, wait));
                 }
             }
@@ -1053,6 +1073,9 @@ const Network = {
 // ============================================================
 const Pusher = {
     async send(text, desp) {
+        // R4-2：非字符串归一——undefined/null → 空串（避免模板串输出 'undefined' 文本）；数字等 String() 化
+        text = text === undefined || text === null ? '' : String(text);
+        desp = desp === undefined || desp === null ? '' : String(desp);
         // 抛异常由主流程处理：推送失败的消息不写缓存，下次运行重试（避免永久丢失）
         // 加整体超时：单通道最坏 15s，避免慢通道把整批推送拖到数分钟
         await Promise.race([
@@ -1160,7 +1183,10 @@ const App = {
             // ⑤ 只看它过滤（独立白名单函数，keyword 正则预编译一次）
             const beforeKwd = items.length;
             const kw = Config.keyword.zkt_gjc;
-            if (kw) {
+            // R11-1：非字符串 zkt_gjc（对象/数字脏配置）→ 警告并跳过过滤（String 化会把 '[object Object]' 当正则，静默怪行为）
+            if (kw !== undefined && kw !== null && typeof kw !== 'string') {
+                console.warn(`⚠️ 配置「zkt_gjc」应为字符串，当前为 ${typeof kw}，已忽略只看它过滤`);
+            } else if (kw) {
                 if (String(kw).trim() === '') {
                     // 空白关键词 = 误配置，忽略过滤（避免只推含空格的标题）
                     console.warn('⚠️ 配置「zkt_gjc」为空白字符，已忽略只看它过滤');
@@ -1188,7 +1214,8 @@ const App = {
             const startTime = Date.now();
             const keyOf = (it) => Utils.hasValidId(it) ? `id:${it.id}` : `url:${Utils.normUrl(it.url)}`;
             // domain 去尾斜杠后与相对路径统一拼接（避免 'https://x.com//rel' 双斜杠）
-            const baseUrl = Config.domain.replace(/\/+$/, '');
+            // R2：非字符串 domain（脏配置）→ 空串 baseUrl（相对路径不拼前缀，避免 .replace 崩溃）
+            const baseUrl = (typeof Config.domain === 'string') ? Config.domain.replace(/\/+$/, '') : '';
             // url 类型防御：非字符串(null/undefined/对象/数字)视为无链接——避免 .includes 崩溃或 [object Object]
             // 与 htmlToMarkdown 的 content_html 口径一致（非字符串视为空）
             const urlOf = (it) => {
@@ -1210,11 +1237,12 @@ const App = {
             const pushOne = async (item) => {
                 // 推送内容截断：避免超长标题/内容被推送 API 拒绝（长度可配置，默认 100/3000）
                 // 用 UTF-16 安全截断（不切断 emoji 代理对）
+                // R9：title/content 非字符串（对象等脏数据）→ 空标题占位/空内容（避免 '[object Object]' 泄漏）
                 const pushItem = {
                     ...item,
                     url: urlOf(item),
-                    title: Utils.truncateUtf16(item.title || '(无标题)', titleMax),
-                    content: Utils.truncateUtf16(item.content || '', contentMax),
+                    title: Utils.truncateUtf16((typeof item.title === 'string' && item.title) ? item.title : '(无标题)', titleMax),
+                    content: Utils.truncateUtf16((typeof item.content === 'string') ? item.content : '', contentMax),
                 };
                 // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
                 // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
@@ -1227,7 +1255,8 @@ const App = {
                     pushedKeys.add(keyOf(item));
                     return { item, ok: true };
                 } catch (e) {
-                    console.log(`⚠️ 推送失败（不写入缓存，下次运行重试）: ${item.title}【${item.catename}】 ${e.message}`);
+                    // 非 Error 兜底（R1）：notify 抛字符串等非 Error 时避免 e.message undefined（与 v3.31/73/81 口径一致）
+                    console.log(`⚠️ 推送失败（不写入缓存，下次运行重试）: ${item.title}【${item.catename}】 ${e && e.message ? e.message : String(e)}`);
                     return { item, ok: false };
                 }
             };
