@@ -1,0 +1,40 @@
+// push_config.local.js 示例模板
+// 用法：复制本文件为 push_config.local.js 并填入你的密钥
+//   cp push_config.local.js.example push_config.local.js
+// ⚠️ push_config.local.js 已被 .gitignore 忽略（含真实密钥，绝不提交！）；本示例文件可安全入库
+// 字段说明见 xbk_sendNotify_slim.js 顶部 push_config；未配置的通道保持注释即可
+module.exports = {
+    // Push+（https://www.pushplus.plus/）
+    // PUSH_PLUS_TOKEN: '你的token',
+    // PUSH_PLUS_USER: '',
+
+    // Server酱 Turbo（https://sct.ftqq.com/）
+    // PUSH_KEY: 'SCTxxxxxxxxxxxxxxxxxxxxxxxx',
+
+    // Bark（iOS 推送，https://github.com/Finb/Bark）
+    // BARK_PUSH: 'https://api.day.app/你的设备码',   // 多设备用 # 分隔
+
+    // PushMe（https://pushme.xyz/）
+    // PUSHME_KEY: '你的key',
+
+    // 企业微信机器人 webhook
+    // QYWX_KEY: '你的webhook地址最后一段key',
+
+    // wxpusher（https://wxpusher.zjiecode.com/）
+    // WX_pusher_appToken: '你的appToken',
+    // WX_pusher_topicIds: '主题ID(多个用逗号分隔)',
+
+    // 息知（https://xz.qqoq.net/）
+    // WX_XIZHI_KEY: 'https://xizhi.qqoq.net/你的key',
+
+    // PushDeer（https://www.pushdeer.com/）
+    // DEER_KEY: '你的key',
+
+    // Telegram Bot（token + chat_id 需齐备才生效）
+    // TG_BOT_TOKEN: '123456:ABC-DEF...',
+    // TG_USER_ID: '你的chat_id',
+    // TG_API_HOST: '', // 自定义 API host（可选，默认 api.telegram.org）
+
+    // 一言：推送内容尾部附加随机一句话（'false' 关闭）
+    // HITOKOTO: 'true',
+};

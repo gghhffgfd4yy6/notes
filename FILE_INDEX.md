@@ -93,7 +93,11 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 **安全**:已被 `.gitignore` 忽略,**绝不提交到仓库**。密钥从 git 历史找回后写入此文件(第 6 轮审查发现硬编码密钥的安全问题后改为本方案)。
 
-**注意**:此文件只存在于你的工作区;别人克隆仓库后需自行创建并填自己的 key。
+**注意**:此文件只存在于你的工作区;别人克隆仓库后需自行创建(参考 `push_config.local.js.example` 示例模板)并填自己的 key。
+
+### `push_config.local.js.example` — 密钥配置示例模板(可入库)
+
+**定位**:新用户配置密钥的示例模板(全字段占位注释,无真实密钥)。复制为 `push_config.local.js` 后填入自己的 key。README 快速开始引用。
 
 ---
 
@@ -266,6 +270,14 @@ node test_filter.js && node test_app.js && node test_notify.js
 # 配置推送密钥(编辑 push_config.local.js,不入库)
 # 清缓存(rm xianbaoku_cache/push.json,下次运行重建)
 ```
+
+### `README.md` — 项目首页(快速上手)
+
+**定位**:仓库最外层说明——项目简介、特性、快速开始(含密钥配置)、测试、cron 示例、配置速查、目录结构、安全红线。新人第一入口。
+
+### `package.json` — 工程化入口(v3.71 新增)
+
+**定位**:`npm start`(运行推送)/`npm test`(三套件连跑,退出码 0=全绿)/engines node>=14/零依赖声明。101 章版本一致性测试校验其 version 与文件头一致。
 
 ---
 

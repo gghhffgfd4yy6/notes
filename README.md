@@ -23,7 +23,7 @@
 
 ```bash
 # 1. 配置推送密钥（本地文件，不入库，已 gitignore）
-cp push_config.local.js 手动创建（参考 xbk_sendNotify_slim.js 顶部 push_config 的字段名）
+cp push_config.local.js.example push_config.local.js
 #    编辑填入你的通道 key（PUSH_KEY / BARK_PUSH / TG_BOT_TOKEN 等）
 
 # 2. 运行（真实拉取 + 推送）
