@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.61 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 ********
+//******** 线报酷推送脚本 v3.62 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -92,46 +92,60 @@ const DEC_RE = /&#(\d+);/g;
 const HEX_RE = /&#[xX]([0-9a-fA-F]+);/g;
 
 const Utils = {
-    daysComputed(time) {
-        if (time === undefined || time === null || time === '') return 0;
+    /**
+     * 统一时间解析：返回毫秒时间戳，无效返回 null。
+     * v3.62 统一 daysComputed/tuisong_replace 两份重复逻辑（REVIEW_ROUND10 #26），
+     * 解析口径（与 v3.46/v3.47 对齐后的行为完全一致）：
+     *   空(undefined/null/'') → null
+     *   纯数字：8 位 YYYYMMDD(月份/日期合法性+回读校验) > 秒/毫秒时间戳(0 或 1e8~1e14，TS_BOUND 分界)
+     *           > 范围外(小数字/超大数字) → null（避免 1970-01-01/33658 误导日期）
+     *   YYYY-MM-DD(1~2 位月日，锚定结尾拒绝脏前缀，回读校验拒绝 2026-02-31) > 回读失败 → null
+     *   其他(含 ISO 2026-08-01T00:00:00Z、/ 分隔)：宿主解析，先原生(支持 ISO)失败再试 / 替换 → 失败 null
+     * 注意：返回的 ms 可能为负（1969 年以前），由调用方决定语义。
+     */
+    parseTime(time) {
+        if (time === undefined || time === null || time === '') return null;
         const s = String(time);
-        // 纯数字：按时间戳解析（0 = 1970-01-01 不应被短路；秒/毫秒）
-        if (/^\d+$/.test(s)) {
+        // 纯数字：8 位日期优先于时间戳（20260731 是日期不是时间戳）
+        // 数字类型（含 -1 等负值）也走数字分支——负值/范围外在下方统一判无效，
+        // 避免掉进宿主解析被 new Date('-1') 解析成 2001-01-01（审查5-2 锁定）
+        if (typeof time === 'number' || /^\d+$/.test(s)) {
             const n = Number(s);
+            // 8 位 YYYYMMDD：月份 1~12 / 日期 1~31 预检 + 回读校验（拒绝 20261332 这类非法日期）
+            const m8 = s.match(/^(\d{4})(\d{2})(\d{2})$/);
+            if (m8 && Number(m8[2]) >= 1 && Number(m8[2]) <= 12 && Number(m8[3]) >= 1 && Number(m8[3]) <= 31) {
+                const t = new Date(+m8[1], +m8[2] - 1, +m8[3]);
+                if (t.getFullYear() === +m8[1] && t.getMonth() === +m8[2] - 1 && t.getDate() === +m8[3]) return t.getTime();
+                return null;
+            }
+            // 时间戳：0 = 1970-01-01 不应被短路；秒(1e8~TS_BOUND)/毫秒(TS_BOUND~1e14)按 TS_BOUND 分界
             if (n === 0 || (n >= 1e8 && n < 1e14)) {
                 const ms = n < TS_BOUND ? n * 1000 : n;
-                const oldTime = new Date(ms);
-                if (!isNaN(oldTime.getTime())) {
-                    return Utils.daysFrom(oldTime.getTime());
-                }
+                const t = new Date(ms);
+                if (!isNaN(t.getTime())) return t.getTime();
             }
+            return null;
         }
-        // 8 位 YYYYMMDD 格式（20260731）也支持
-        const m8 = s.match(/^(\d{4})(\d{2})(\d{2})$/);
-        if (m8 && Number(m8[2]) >= 1 && Number(m8[2]) <= 12 && Number(m8[3]) >= 1 && Number(m8[3]) <= 31) {
-            const oldTime = new Date(+m8[1], +m8[2] - 1, +m8[3]);
-            if (oldTime.getFullYear() === +m8[1] && oldTime.getMonth() === +m8[2] - 1 && oldTime.getDate() === +m8[3]) {
-                return Utils.daysFrom(oldTime.getTime());
-            }
-            return 0;
-        }
-        // 严格匹配完整 YYYY-MM-DD（锚定结尾，拒绝 2026-07-31abc 这类脏前缀）
+        // 严格匹配完整 YYYY-MM-DD（1~2 位月日；锚定结尾，拒绝 2026-07-31abc 脏前缀）
         const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
         if (m) {
             const y = +m[1], mo = +m[2], d = +m[3];
-            const oldTime = new Date(y, mo - 1, d);
-            // 校验日期真实性：new Date 会把 2026-02-31 滚动到 03-03，回读对比即拒绝
-            if (oldTime.getFullYear() === y && oldTime.getMonth() === mo - 1 && oldTime.getDate() === d) {
-                return Utils.daysFrom(oldTime.getTime());
-            }
-            return 0;
+            const t = new Date(y, mo - 1, d);
+            // 回读校验：new Date 会把 2026-02-31 滚动到 03-03，回读对比即拒绝
+            if (t.getFullYear() === y && t.getMonth() === mo - 1 && t.getDate() === d) return t.getTime();
+            return null;
         }
-        // 其他格式（含 ISO 2026-08-01T00:00:00Z、/ 分隔等）回退宿主解析
-        // 先试原生 new Date（支持 ISO），失败再试 / 替换
-        let oldTime = new Date(s);
-        if (isNaN(oldTime.getTime())) oldTime = new Date(s.replace(/-/g, '/'));
-        if (isNaN(oldTime.getTime())) return 0;
-        return Utils.daysFrom(oldTime.getTime());
+        // 其他格式（含 ISO 2026-08-01T00:00:00Z、/ 分隔等）回退宿主解析；先原生（支持 ISO），失败再试 / 替换
+        let t = new Date(s);
+        if (isNaN(t.getTime())) t = new Date(s.replace(/-/g, '/'));
+        if (isNaN(t.getTime())) return null;
+        return t.getTime();
+    },
+
+    daysComputed(time) {
+        const ms = Utils.parseTime(time);
+        if (ms === null) return 0;
+        return Utils.daysFrom(ms);
     },
 
     add0(m) {
@@ -290,33 +304,17 @@ const Formatter = {
             ? data.posttime
             : (data.shijianchuo !== undefined && data.shijianchuo !== null && data.shijianchuo !== '' ? data.shijianchuo : undefined);
         if (timeSource !== undefined && !data.datetime) {
-            // 兼容秒(9~11位)/毫秒(12~13位)/ISO/8位日期（与 daysComputed 解析口径一致）
-            let t;
-            if (typeof timeSource === 'number' || /^\d+$/.test(String(timeSource))) {
-                const s = String(timeSource);
-                const n = Number(s);
-                // 8 位 YYYYMMDD 是日期不是时间戳（与 daysComputed 一致）
-                const m8 = s.match(/^(\d{4})(\d{2})(\d{2})$/);
-                if (m8 && Number(m8[2]) >= 1 && Number(m8[2]) <= 12 && Number(m8[3]) >= 1 && Number(m8[3]) <= 31) {
-                    t = new Date(+m8[1], +m8[2] - 1, +m8[3]);
-                    if (!(t.getFullYear() === +m8[1] && t.getMonth() === +m8[2] - 1 && t.getDate() === +m8[3])) t = new Date(''); // 非法 8 位日期(如 20261332)
-                } else if (n === 0 || (n >= 1e8 && n < 1e14)) {
-                    t = new Date(n < TS_BOUND ? n * 1000 : n);
-                } else {
-                    t = new Date(''); // 范围外（小数字/超大数字）→ 无效，避免 1970/33658 误导日期
-                }
-            } else {
-                // 先原生解析（支持 ISO 2026-08-01T00:00:00Z），失败再退 / 分隔格式
-                t = new Date(String(timeSource));
-                if (isNaN(t.getTime())) t = new Date(String(timeSource).replace(/-/g, '/'));
-            }
-            if (isNaN(t.getTime()) || t.getTime() < 0) {
+            // 统一解析（v3.62 与 daysComputed 共用 parseTime，消除重复逻辑）：
+            // 秒/毫秒时间戳、8 位日期、YYYY-MM-DD、ISO 全部同一口径
+            const t = Utils.parseTime(timeSource);
+            if (t === null || t < 0) {
                 // 非法/负时间戳：不生成日期（留空），避免回退当前时间或 1969 误导
                 data.datetime = undefined;
                 data.shorttime = undefined;
             } else {
-                data.datetime = `${t.getFullYear()}-${Utils.add0(t.getMonth() + 1)}-${Utils.add0(t.getDate())}`;
-                data.shorttime = `${t.getHours()}:${Utils.add0(t.getMinutes())}`;
+                const dt = new Date(t);
+                data.datetime = `${dt.getFullYear()}-${Utils.add0(dt.getMonth() + 1)}-${Utils.add0(dt.getDate())}`;
+                data.shorttime = `${dt.getHours()}:${Utils.add0(dt.getMinutes())}`;
             }
         }
 

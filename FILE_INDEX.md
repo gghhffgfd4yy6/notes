@@ -9,7 +9,7 @@
 
 ### `xbk_function_v3.js` — 主代码(推送脚本核心)
 
-**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。约 1203 行,9 层职责分层架构。
+**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。约 1265 行,9 层职责分层架构。
 
 **运行流程**(`App.run()` 主流程):
 ```
@@ -51,7 +51,7 @@ Config.push.parallelLimit  // 并行并发上限(0=不限)
 Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.61)需人工维护;`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号(v3.62)需人工维护;`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
@@ -221,7 +221,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.61),每轮修复/重构/功能变更的摘要。
+版本演进记录(v3.0 → v3.62),每轮修复/重构/功能变更的摘要。
 
 ---
 
