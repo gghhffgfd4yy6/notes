@@ -206,6 +206,7 @@
 - **v3.67**：whitelistFilter 非法正则 → 放行（原拦截；与 ReDoS 分支/App.run 预编译失败口径统一，宁可多推）
 - **v3.68**：推送模板可配置（Config.template.title/content，默认=历史硬编码，非法回退默认）
 - **v3.69**：推送截断可配置（push.titleMax/contentMax）；desp 兜底截断（{Markdown内容} 原从不截断会撑爆 API）；test_app 清理正则修复（t48b 残留）
+- **v3.70**：text 推送标题兜底截断（分类名+标题拼接超 titleMax 的漏网，与 desp 同口径）
 
 ## 七、行为变更记录（语义调整）
 

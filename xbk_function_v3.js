@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.69 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 ********
+//******** 线报酷推送脚本 v3.70 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1186,7 +1186,9 @@ const App = {
                     title: Utils.truncateUtf16(item.title || '(无标题)', titleMax),
                     content: Utils.truncateUtf16(item.content || '', contentMax),
                 };
-                const text = Formatter.tuisong_replace(titleTpl, pushItem);
+                // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
+                // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
+                const text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, pushItem), titleMax);
                 // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
                 // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
                 const desp = Utils.truncateUtf16(Formatter.tuisong_replace(contentTpl, pushItem), contentMax);

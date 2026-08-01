@@ -993,7 +993,7 @@ await test('推送截断长度可配置 + 非法回退默认（v3.69）', async 
         Config.push.contentMax = 4;
         await xbk.run();
         assert(pushCalls.length === 1, '应推送 1 条');
-        assert(pushCalls[0].text.includes('这是一个'), '标题应按 5 截断');
+        assert(pushCalls[0].text.length <= 5, `标题最终长度应 ≤ titleMax(5)，实际: ${pushCalls[0].text}`);
         assert(!pushCalls[0].text.includes('非常长的标题用于测试截断'), '标题不应超过 5 字符');
         assert(pushCalls[0].desp.length <= 4, `内容应按 4 截断（含 Markdown 转换结果），实际: ${pushCalls[0].desp.length}`);
     } finally {
