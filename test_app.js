@@ -1062,6 +1062,32 @@ await test('并行模式 + 自定义模板/截断组合（v3.84）', async () =>
     }
 });
 
+await test('配置矩阵: 全部非法值并行模式不崩（v3.95）', async () => {
+    reset();
+    setPushUrl('t51_cfg_matrix');
+    fakeData = [makeItem({ id: 1 })];
+    try {
+        Config.api.timeout = 'abc';
+        Config.api.retry = 2.5; // 小数合法执行（非法值会导致 fetchData 合理失败，非本测试目标）
+        Config.timing.pushInterval = 'x';
+        Config.timing.finalWait = 'y';
+        Config.push.mode = 'parallel';
+        Config.push.parallelLimit = 'z';
+        Config.push.titleMax = -1;
+        Config.push.contentMax = 'abc';
+        Config.cache.maxSize = 0;
+        Config.cache.dir = 123;
+        Config.template.title = 456;
+        Config.template.content = null;
+        Config.domain = '非法域名';
+        await xbk.run();
+        assert(pushCalls.length === 1, `全部非法配置下仍应推送成功: ${pushCalls.length}`);
+        assert(pushCalls[0].desp.includes('原文链接'), '非法配置回退默认后内容应完整');
+    } finally {
+        reset(); // v3.91 reset 恢复全部默认
+    }
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {

@@ -1,5 +1,17 @@
 # 📋 更新日志
 
+## v3.95（配置矩阵防御测试）
+> 2026-08-01
+
+### 🧪 t51：全部非法值并行模式不崩
+
+- 批量验证 v3.52-94 各配置防御组合生效：timeout='abc'/retry 小数/pushInterval/finalWait/parallelLimit/titleMax/contentMax/maxSize/dir/template/domain 全部非法 → 并行模式仍推送成功、回退默认
+- 结束 reset() 恢复默认（v3.91 增强兜底）
+
+### 🧪 测试数
+
+**656 个全绿（单元 576 + 集成 59 + 通道 21）**
+
 ## v3.94（domain 尾斜杠防御）
 > 2026-08-01
 
