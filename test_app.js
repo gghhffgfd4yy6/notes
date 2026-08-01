@@ -658,6 +658,8 @@ await test('fetchData 带 User-Agent/Accept 请求头（#165/166）', async () =
     assert(gotCalls.length >= 1, '应发请求');
     const headers = gotCalls[0].opts && gotCalls[0].opts.headers;
     assert(headers && headers['User-Agent'], '应带 User-Agent');
+    assert(headers && /^xbk-push-script\/\d+\.\d+\.\d+$/.test(headers['User-Agent']),
+        `UA 应含 semver 版本号: ${headers['User-Agent']}`);
     assert(headers && headers['Accept'] === 'application/json', '应带 Accept');
 });
 

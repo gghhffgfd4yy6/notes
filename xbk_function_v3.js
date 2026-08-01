@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.81 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 + 配置防御 + CLI兜底 ********
+//******** 线报酷推送脚本 v3.82 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 + 配置防御 + CLI兜底 + UA版本化 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -10,6 +10,8 @@ const notify = require('./xbk_sendNotify_slim');
 const fs = require('fs');
 const got = require('got');
 const path = require('path');
+// 版本号单一来源（v3.82）：package.json 与文件头/CHANGELOG/README 四方一致由 101 章测试保证
+const { version: PKG_VERSION } = require('./package.json');
 
 // ============================================================
 // ⚙️ Config — 配置层
@@ -1008,7 +1010,7 @@ const Network = {
                     timeout: Config.api.timeout,
                     retry: { limit: 0 },
                     headers: {
-                        'User-Agent': 'xbk-push-script/3.x',
+                        'User-Agent': `xbk-push-script/${PKG_VERSION}`,
                         'Accept': 'application/json',
                     },
                 }).json();

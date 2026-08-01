@@ -219,6 +219,7 @@
 - **v3.79**：101 章扩展 README 版本一致性（四方：文件头/CHANGELOG/package.json/README）；run.log 文档说明
 - **v3.80**：cache.dir 非字符串崩溃修复（path.join TypeError）；template 配置层校验
 - **v3.81**：CLI 入口 catch 非 Error 兜底（内部已有 v3.31，入口是漏网）
+- **v3.82**：UA 版本化（读 package.json，服务端可区分版本）
 
 ## 七、行为变更记录（语义调整）
 
