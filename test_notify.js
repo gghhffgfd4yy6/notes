@@ -12,13 +12,16 @@ require('/workspace/node_modules/got/index.js');
 
 let gotCalls = [];
 let failHitokoto = false; // 一言接口失败开关（v3.73：验证 sendNotify 兜底跳过不崩）
+let failHitokotoStruct = false; // 一言响应结构异常开关（v3.86：缺 hitokoto 字段）
 let failPost = false;     // got.post 失败开关（v3.75：验证失败日志不泄露密钥）
 require.cache[gotPath].exports = (url, options) => {
     gotCalls.push({ url, options });
     // 一言接口失败模拟：抛 Error（网络异常路径）
     if (failHitokoto && String(url).includes('hitokoto.cn')) throw new Error('一言服务不可用');
     // 一言接口返回对象 body（模拟真实 got 自动 JSON 解析），其余返回字符串
-    const body = String(url).includes('hitokoto.cn') ? { hitokoto: '测试一言', from: '源' } : '{}';
+    const body = String(url).includes('hitokoto.cn')
+        ? (failHitokotoStruct ? {} : { hitokoto: '测试一言', from: '源' })
+        : '{}';
     return { then: (res) => res({ body, statusCode: 200, headers: {} }) };
 };
 require.cache[gotPath].exports.get = require.cache[gotPath].exports;
@@ -209,6 +212,21 @@ await test('一言失败 → 兜底跳过不崩（v3.73）', () => withChannels(
         assert(!desp.includes('测试一言'), '一言失败时内容不应追加一言');
     } finally {
         failHitokoto = false;
+    }
+}));
+
+await test('一言响应结构异常 → 兜底跳过不输出 undefined（v3.86）', () => withChannels(async () => {
+    cfg.PUSH_KEY = 'SCT123456';
+    cfg.HITOKOTO = 'true';
+    failHitokotoStruct = true; // 一言返回 {}（缺 hitokoto 字段）
+    try {
+        await notify.sendNotify('标题', '内容'); // 不应抛错（结构异常被 catch 跳过）
+        assert(gotCalls.length === 2, `应有一言(结构异常)+推送请求，实际${gotCalls.length}`);
+        const desp = decodeURIComponent(gotCalls[1].options.body);
+        assert(!desp.includes('undefined'), '不应输出 undefined 垃圾文本');
+        assert(!desp.includes('测试一言'), '结构异常时不应追加一言');
+    } finally {
+        failHitokotoStruct = false;
     }
 }));
 

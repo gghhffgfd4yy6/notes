@@ -1,5 +1,18 @@
 # 📋 更新日志
 
+## v3.86（一言响应结构防御）
+> 2026-08-01
+
+### 🐛 one() 响应结构异常防御
+
+- **发现**：一言接口返回结构异常（缺 hitokoto 字段）→ `body.hitokoto` undefined → 推送内容追加 `undefined    ----undefined` 垃圾文本
+- **修复**：one() 校验 hitokoto 非空字符串，异常抛错 → sendNotify catch 跳过（不输出垃圾文本）
+- test_notify 新增 failHitokotoStruct 开关 + 测试
+
+### 🧪 测试数
+
+**654 个全绿（单元 575 + 集成 58 + 通道 21）**
+
 ## v3.85（{Html内容} href 换行剥离）
 > 2026-08-01
 

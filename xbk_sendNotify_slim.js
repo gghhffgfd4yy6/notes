@@ -136,6 +136,11 @@ async function one() {
     const res = await got.get(url);
     // body 兼容：自制 got 已自动 JSON 解析为对象；字符串时手动解析
     const body = typeof res.body === 'string' ? JSON.parse(res.body) : res.body;
+    // 防御（v3.86）：响应结构异常（缺 hitokoto/from）→ 抛错走 sendNotify 的 catch 跳过，
+    // 避免输出 'undefined    ----undefined' 垃圾文本
+    if (!body || typeof body.hitokoto !== 'string' || !body.hitokoto) {
+        throw new Error('一言响应结构异常');
+    }
     return `${body.hitokoto}    ----${body.from}`;
 }
 

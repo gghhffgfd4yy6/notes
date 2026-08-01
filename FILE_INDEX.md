@@ -55,7 +55,7 @@ Config.template.content    // 推送内容模板(默认{Markdown内容})
 Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.85)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号(v3.86)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
@@ -174,7 +174,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ---
 
-### `test_notify.js` — 推送通道适配器测试(20 个)
+### `test_notify.js` — 推送通道适配器测试(21 个)
 
 **定位**:mock got 验证各推送通道的**请求构造**(URL/body/headers/编码/设备分割),约 232 行。
 
@@ -229,7 +229,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.85),每轮修复/重构/功能变更的摘要。
+版本演进记录(v3.0 → v3.86),每轮修复/重构/功能变更的摘要。
 
 ---
 
