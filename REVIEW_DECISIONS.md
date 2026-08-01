@@ -228,6 +228,7 @@
 - **v3.88**：run.log 摘要加 elapsed 耗时字段
 - **v3.89**：README run.log 示例补 elapsed 说明
 - **v3.90**：t01 增强——锁定 App.run 真实链路中 htmlToMarkdown 的 Markdown 转换结果（粗体）
+- **v3.91**：test_app reset() 恢复运行配置默认值（防未来测试跨污染）
 
 ## 七、行为变更记录（语义调整）
 

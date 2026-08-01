@@ -1,5 +1,18 @@
 # 📋 更新日志
 
+## v3.91（test_app reset 测试隔离增强）
+> 2026-08-01
+
+### 🧹 reset() 恢复运行配置默认值
+
+- **背景**：reset() 只清 filter/zkt_gjc，template/push/domain/maxSize 靠各测试 try/finally 恢复——未来新测试忘恢复会跨测试污染
+- **增强**：reset() 恢复 template/push/domain/cache 默认值（测试开头统一复位，防污染兜底）
+- 现有测试零回归（t45/t48-50 的 finally 恢复值 = 默认，与 reset 一致）
+
+### 🧪 测试数
+
+**654 个全绿（单元 575 + 集成 58 + 通道 21）**
+
 ## v3.90（集成链路 Markdown 转换锁定）
 > 2026-08-01
 

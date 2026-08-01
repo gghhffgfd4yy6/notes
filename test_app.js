@@ -118,6 +118,15 @@ function reset() {
     Config.filter.pingbibiaoti = '';
     Config.filter.pingbilouzhu = '';
     Config.keyword.zkt_gjc = '';
+    // v3.91：reset 同时恢复运行配置默认值（防未来测试忘恢复导致跨测试污染）
+    Config.template.title = '【{分类名}】{标题}';
+    Config.template.content = '{Markdown内容}';
+    Config.push.mode = 'sequential';
+    Config.push.titleMax = 100;
+    Config.push.contentMax = 3000;
+    Config.domain = 'https://new.ixbk.net';
+    Config.cache.maxSize = 100;
+    Config.cache.dir = 'xianbaoku_cache';
 }
 
 function readCacheFile(suffix) {
