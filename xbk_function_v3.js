@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.65 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志 ********
+//******** 线报酷推送脚本 v3.66 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1035,6 +1035,21 @@ const Pusher = {
 // 🚀 App — 主流程层
 // ============================================================
 const App = {
+    // 运行日志：追加一行到缓存目录 run.log（成功摘要/失败 ERROR 共用），超过 1MB 截断保留尾部（防无限增长；写失败静默不中断）
+    _writeRunLog(line) {
+        try {
+            const logPath = path.join(MessageStore.cacheDir, 'run.log');
+            fs.appendFileSync(logPath, line, 'utf8');
+            const st = fs.statSync(logPath);
+            if (st.size > 1024 * 1024) {
+                const all = fs.readFileSync(logPath, 'utf8');
+                const trimmed = all.slice(-512 * 1024);
+                const nl = trimmed.indexOf('\n');
+                fs.writeFileSync(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed, 'utf8');
+            }
+        } catch (e) { /* 日志写失败静默（磁盘只读/权限等，不中断推送） */ }
+    },
+
     async run() {
         console.debug('开始获取线报酷数据...');
 
@@ -1213,12 +1228,7 @@ const App = {
             await new Promise(r => setTimeout(r, Config.timing.finalWait));
 
             // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
-            try {
-                const logPath = path.join(MessageStore.cacheDir, 'run.log');
-                fs.appendFileSync(logPath,
-                    `${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} pushed=${successCount} failed=${items.length - successCount}\n`,
-                    'utf8');
-            } catch (e) { /* 日志写失败静默（磁盘只读/权限等，不中断推送） */ }
+            this._writeRunLog(`${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} pushed=${successCount} failed=${items.length - successCount}\n`);
 
             // 返回运行摘要（供外部/测试观测，cron 可据此判断）
             return {
@@ -1239,6 +1249,8 @@ const App = {
             } else {
                 console.log('请求错误:', errMsg);
             }
+            // 失败也写运行日志（cron 可回溯失败原因；错误信息去换行避免破坏日志行）
+            this._writeRunLog(`${new Date().toISOString()} ERROR ${String(errMsg).replace(/[\r\n]+/g, ' ')}\n`);
             throw error; // 重新抛出，让外层/调度感知失败（cron 场景 exit code 非 0）
         }
     },

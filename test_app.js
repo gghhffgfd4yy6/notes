@@ -928,6 +928,23 @@ await test('运行摘要持久化到 run.log（v3.65）', async () => {
     try { fs.unlinkSync(logPath); } catch (e) { /* 忽略 */ }
 });
 
+await test('运行失败也写 ERROR 日志（v3.66）', async () => {
+    reset();
+    setPushUrl('t47_runlog_fail');
+    fakeData = [];
+    // 清掉可能残留的 run.log，确保断言的是本测试写入的行
+    try { fs.unlinkSync(path.join(CACHE_DIR, 'run.log')); } catch (e) { /* 忽略 */ }
+    fail4xx = true; // 404 不重试 → run 直接抛错（走 catch 分支）
+    let threw = false;
+    try { await xbk.run(); } catch (e) { threw = true; }
+    assert(threw, '4xx 应使 run 抛错');
+    const logPath = path.join(CACHE_DIR, 'run.log');
+    assert(fs.existsSync(logPath), 'run.log 应已创建');
+    const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop();
+    assert(lastLine.includes('ERROR'), `应记录 ERROR 行，实际: ${lastLine}`);
+    try { fs.unlinkSync(logPath); } catch (e) { /* 忽略 */ }
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {

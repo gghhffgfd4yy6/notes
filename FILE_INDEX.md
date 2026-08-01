@@ -51,7 +51,7 @@ Config.push.parallelLimit  // 并行并发上限(0=不限)
 Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.65)需人工维护,但已有 101 章版本一致性测试自动校验(与 CHANGELOG 顶部一致);`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号(v3.66)需人工维护,但已有 101 章版本一致性测试自动校验(与 CHANGELOG 顶部一致);`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
@@ -221,7 +221,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.65),每轮修复/重构/功能变更的摘要。
+版本演进记录(v3.0 → v3.66),每轮修复/重构/功能变更的摘要。
 
 ---
 
