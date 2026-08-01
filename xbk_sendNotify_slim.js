@@ -332,7 +332,7 @@ function barkNotify(text, desp, params = {}) {
                 $.post(options, (err, resp, data) => {
                     try {
                         if (err) {
-                            console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, err);
+                            console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(err));
                         } else {
                             if (data.code === 200) {
                                 console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`);
@@ -390,7 +390,7 @@ function pushMeNotify(text, desp, params = {}) {
                 $.post(options, (err, resp, data) => {
                     try {
                         if (err) {
-                            console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, err);
+                            console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, safeErr(err));
                         } else {
                             if (data === 'success') {
                                 console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 成功🎉\n`);
@@ -476,7 +476,7 @@ function wxPusherNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
-                        console.log('WxPusher发送通知消息失败😞\n', err);
+                        console.log('WxPusher发送通知消息失败😞\n', safeErr(err));
                     } else {
                         if (data.code === 1000) {
                             // console.log('WxPusher发送通知消息成功🎉。\n');
@@ -520,7 +520,7 @@ function wxXiZhiNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
-                        console.log('息知发送通知消息失败😞\n', err);
+                        console.log('息知发送通知消息失败😞\n', safeErr(err));
                     } else {
                         if (data.code === 200) {
                             console.log('息知发送通知消息成功🎉。\n');

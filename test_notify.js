@@ -331,6 +331,32 @@ await test('日志脱敏: Push+/企微/PushDeer/Telegram/Server酱 失败日志�
         console.log = origLog;
     }
 }));
+
+await test('日志脱敏: Bark/PushMe/wxpusher/息知 失败日志不泄露密钥（v3.77）', () => withChannels(async () => {
+    // v3.75 漏网的 4 个通道失败日志（err 分支曾 console.log(err)，现统一 safeErr）
+    cfg.BARK_PUSH = 'https://api.day.app/BARK_SECRET';
+    cfg.PUSHME_KEY = 'PM_SECRET';
+    cfg.WX_pusher_appToken = 'WXP_SECRET';
+    cfg.WX_XIZHI_KEY = 'https://xizhi.qqoq.net/XIZHI_SECRET.send';
+    const origLog = console.log;
+    const captured = [];
+    console.log = (...args) => captured.push(args.join(' '));
+    try {
+        failPost = true;
+        await notify.sendNotify('标题', '内容');
+        const all = captured.join('\n');
+        assert(!all.includes('BARK_SECRET'), 'Bark 设备码不应泄露');
+        assert(!all.includes('PM_SECRET'), 'PushMe key 不应泄露');
+        assert(!all.includes('WXP_SECRET'), 'wxpusher token 不应泄露');
+        assert(!all.includes('XIZHI_SECRET'), '息知 URL 不应泄露');
+        // 日志前缀的脱敏形式应保留（maskUrl/maskKey）
+        assert(all.includes('api.day.app/BAR***ET') || all.includes('BARK***ET'), 'Bark 应出现脱敏形式');
+        assert(all.includes('PM***ET') || all.includes('***ET'), 'PushMe 应出现脱敏形式');
+    } finally {
+        failPost = false;
+        console.log = origLog;
+    }
+}));
 await test('Bark: 归档/分组/声音/级别/图标/URL 参数传递', () => withChannels(async () => {
     cfg.BARK_PUSH = 'device1';
     cfg.BARK_ARCHIVE = '1';
