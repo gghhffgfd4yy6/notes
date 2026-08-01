@@ -226,6 +226,7 @@
 - **v3.86**：一言响应结构防御（缺 hitokoto → 抛错跳过，不输出 undefined 垃圾文本）
 - **v3.87**：一言 from 缺失防御（----undefined 残尾 → 出处留空）
 - **v3.88**：run.log 摘要加 elapsed 耗时字段
+- **v3.89**：README run.log 示例补 elapsed 说明
 
 ## 七、行为变更记录（语义调整）
 
