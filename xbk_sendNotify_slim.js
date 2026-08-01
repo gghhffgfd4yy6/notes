@@ -141,7 +141,7 @@ async function one() {
     if (!body || typeof body.hitokoto !== 'string' || !body.hitokoto) {
         throw new Error('一言响应结构异常');
     }
-    return `${body.hitokoto}    ----${body.from}`;
+    return `${body.hitokoto}    ----${body.from || ''}`; // v3.87: from 缺失不输出 undefined 残尾
 }
 
 

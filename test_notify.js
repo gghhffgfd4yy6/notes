@@ -20,7 +20,7 @@ require.cache[gotPath].exports = (url, options) => {
     if (failHitokoto && String(url).includes('hitokoto.cn')) throw new Error('一言服务不可用');
     // 一言接口返回对象 body（模拟真实 got 自动 JSON 解析），其余返回字符串
     const body = String(url).includes('hitokoto.cn')
-        ? (failHitokotoStruct ? {} : { hitokoto: '测试一言', from: '源' })
+        ? (failHitokotoStruct ? { hitokoto: 'x' } : { hitokoto: '测试一言', from: '源' }) // 结构异常=缺 from（v3.87）
         : '{}';
     return { then: (res) => res({ body, statusCode: 200, headers: {} }) };
 };
@@ -218,13 +218,14 @@ await test('一言失败 → 兜底跳过不崩（v3.73）', () => withChannels(
 await test('一言响应结构异常 → 兜底跳过不输出 undefined（v3.86）', () => withChannels(async () => {
     cfg.PUSH_KEY = 'SCT123456';
     cfg.HITOKOTO = 'true';
-    failHitokotoStruct = true; // 一言返回 {}（缺 hitokoto 字段）
+    failHitokotoStruct = true; // 一言返回 { hitokoto:'x' }（缺 from 字段）
     try {
         await notify.sendNotify('标题', '内容'); // 不应抛错（结构异常被 catch 跳过）
         assert(gotCalls.length === 2, `应有一言(结构异常)+推送请求，实际${gotCalls.length}`);
         const desp = decodeURIComponent(gotCalls[1].options.body);
         assert(!desp.includes('undefined'), '不应输出 undefined 垃圾文本');
         assert(!desp.includes('测试一言'), '结构异常时不应追加一言');
+        assert(desp.includes('----'), 'from 缺失时出处应留空而非 undefined');
     } finally {
         failHitokotoStruct = false;
     }
