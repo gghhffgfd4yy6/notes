@@ -61,7 +61,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ### `xbk_sendNotify_slim.js` — 推送模块(各通道实现)
 
-**定位**:主代码依赖的推送实现,约 640 行。实现 9 个推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。
+**定位**:主代码依赖的推送实现,约 646 行。实现 9 个推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。
 
 **结构**:
 | 部分 | 内容 |
@@ -115,7 +115,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ## 二、测试相关
 
-### `test_filter.js` — 单元测试(约 568 个)
+### `test_filter.js` — 单元测试(约 569 个)
 
 **定位**:主测试文件(约 4490 行),涵盖 20+ 种测试手段,按章节组织。
 
@@ -152,7 +152,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ---
 
-### `test_app.js` — 集成测试(约 56 个)
+### `test_app.js` — 集成测试(约 57 个)
 
 **定位**:mock got/notify 验证 App.run 完整主流程(约 858 行)。
 

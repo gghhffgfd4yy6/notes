@@ -1,6 +1,6 @@
 # 📡 线报酷推送脚本（xbk-push）
 
-定时拉取线报酷接口数据 → 规则过滤 → 多通道推送的 Node.js 脚本。零第三方依赖（自制精简 HTTP 模块），641 个测试全绿。
+定时拉取线报酷接口数据 → 规则过滤 → 多通道推送的 Node.js 脚本。零第三方依赖（自制精简 HTTP 模块），642 个测试全绿。
 
 > 当前版本：v3.70（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
 
@@ -42,7 +42,7 @@ npm test
 node test_filter.js && node test_app.js && node test_notify.js
 ```
 
-三套件分工：`test_filter.js`（单元 568）→ `test_app.js`（集成 57，mock 完整主流程）→ `test_notify.js`（通道 16）。**101 章会自动校验文件头版本号 / CHANGELOG / package.json 三者一致**。
+三套件分工：`test_filter.js`（单元 569）→ `test_app.js`（集成 57，mock 完整主流程）→ `test_notify.js`（通道 16）。**101 章会自动校验文件头版本号 / CHANGELOG / package.json 三者一致**。
 
 ## ⏰ cron 定时（示例）
 
@@ -76,7 +76,7 @@ xbk_sendNotify_slim.js    推送模块（9 通道实现）
 push_config.local.js      本地密钥（不入库！）
 xianbaoku_cache/          去重缓存 + run.log（不入库）
 node_modules/got/         自制精简 HTTP 模块（唯一依赖，被 git 追踪）
-test_filter.js            单元测试（568）
+test_filter.js            单元测试（569）
 test_app.js               集成测试（57）
 test_notify.js            通道测试（16）
 FILE_INDEX.md             文件索引（最详细）

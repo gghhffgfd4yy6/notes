@@ -11,8 +11,11 @@ const gotPath = require.resolve('/workspace/node_modules/got/index.js');
 require('/workspace/node_modules/got/index.js');
 
 let gotCalls = [];
+let failHitokoto = false; // 一言接口失败开关（v3.73：验证 sendNotify 兜底跳过不崩）
 require.cache[gotPath].exports = (url, options) => {
     gotCalls.push({ url, options });
+    // 一言接口失败模拟：抛 Error（网络异常路径）
+    if (failHitokoto && String(url).includes('hitokoto.cn')) throw new Error('一言服务不可用');
     // 一言接口返回对象 body（模拟真实 got 自动 JSON 解析），其余返回字符串
     const body = String(url).includes('hitokoto.cn') ? { hitokoto: '测试一言', from: '源' } : '{}';
     return { then: (res) => res({ body, statusCode: 200, headers: {} }) };
@@ -184,6 +187,21 @@ await test('HITOKOTO 启用 → 一言内容追加到推送（真实 got 对象 
     const desp = decodeURIComponent(pushCall.options.body);
     assert(desp.includes('测试一言'), `一言内容应追加到 desp: ${desp.slice(0, 80)}`);
     assert(desp.includes('----源'), '一言出处应追加');
+}));
+
+await test('一言失败 → 兜底跳过不崩（v3.73）', () => withChannels(async () => {
+    cfg.PUSH_KEY = 'SCT123456';
+    cfg.HITOKOTO = 'true';
+    failHitokoto = true;
+    try {
+        await notify.sendNotify('标题', '内容'); // 不应抛错（一言失败被 catch 跳过）
+        assert(gotCalls.length === 2, `应有一言(失败)+推送请求，实际${gotCalls.length}`);
+        assert(gotCalls[0].url.includes('hitokoto.cn'), '应请求一言（虽失败）');
+        const desp = decodeURIComponent(gotCalls[1].options.body);
+        assert(!desp.includes('测试一言'), '一言失败时内容不应追加一言');
+    } finally {
+        failHitokoto = false;
+    }
 }));
 
 // 11. 息知通道（曾从未被测试）
