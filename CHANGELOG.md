@@ -1,5 +1,30 @@
 # 📋 更新日志
 
+## v3.71（工程化收尾：package.json + README + 变异测试验证）
+> 2026-08-01
+
+### 📦 package.json（首次引入）
+
+- **背景**：仓库无 package.json——npm start/npm test 入口缺失、engines 未声明、新人入手无标准入口
+- **新增**：`npm start`（运行推送）/ `npm test`（三套件连跑，退出码 0=全绿）；engines node >=14；零依赖（不声明 dependencies，自制 got 已是唯一模块）
+
+### 📖 README.md（首次引入）
+
+- 项目简介 / 特性 / 快速开始 / 测试 / cron 示例 / 配置速查（含 template、titleMax/contentMax 新配置）/ 目录结构 / 安全红线（密钥不入库 + .git 操作先备份）
+
+### 🔍 变异测试验证（7 个变异，零盲区）
+
+- 故意改坏关键行为验证测试有效性：8位日期禁用(2红) / TS_BOUND分界(10红) / normUrl小写(2红) / daysFrom未来归零(6红) / truncateUtf16代理对(1红) / ReDoS检测(1红) / 三级屏蔽blockedBy(14红)——全部有测试锁定，641 个测试无假绿
+- 每次变异后 `git checkout` 恢复（不触碰 .git 内部，符合红线）
+
+### 🔍 101 章扩展：package.json 版本一致性
+
+- 文件头 v3.71 ↔ CHANGELOG 顶部 ↔ package.json 3.71.0 三方强制一致（防升级漏改）
+
+### 🧪 测试数
+
+**642 个全绿（单元 569 + 集成 57 + 通道 16）**
+
 ## v3.70（推送标题兜底截断）
 > 2026-08-01
 

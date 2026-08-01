@@ -1,0 +1,24 @@
+{
+  "name": "xbk-push",
+  "version": "3.71.0",
+  "description": "线报酷推送脚本——规则过滤 + 多通道推送 + 去重缓存 + 运行日志 + 完整测试体系",
+  "main": "xbk_function_v3.js",
+  "scripts": {
+    "start": "node xbk_function_v3.js",
+    "test": "node test_filter.js && node test_app.js && node test_notify.js"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "keywords": [
+    "推送",
+    "线报",
+    "push",
+    "server酱",
+    "bark",
+    "telegram",
+    "pushplus"
+  ],
+  "license": "UNLICENSED",
+  "private": true
+}
