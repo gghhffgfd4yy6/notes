@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.87 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 + 配置防御 + CLI兜底 + UA版本化 + 实体扩展 + 并行组合测试 + href换行剥离 + 一言防御 ********
+//******** 线报酷推送脚本 v3.88 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 + 配置防御 + CLI兜底 + UA版本化 + 实体扩展 + 并行组合测试 + href换行剥离 + 一言防御 + runlog耗时 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1272,7 +1272,7 @@ const App = {
             await new Promise(r => setTimeout(r, Config.timing.finalWait));
 
             // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
-            this._writeRunLog(`${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} pushed=${successCount} failed=${items.length - successCount}\n`);
+            this._writeRunLog(`${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} pushed=${successCount} failed=${items.length - successCount} elapsed=${elapsed}s\n`);
 
             // 返回运行摘要（供外部/测试观测，cron 可据此判断）
             return {

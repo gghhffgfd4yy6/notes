@@ -930,8 +930,8 @@ await test('运行摘要持久化到 run.log（v3.65）', async () => {
     assert(fs.existsSync(logPath), 'run.log 应已创建');
     const content = fs.readFileSync(logPath, 'utf8');
     const lastLine = content.trim().split('\n').pop();
-    assert(/total=\d+ dedup=\d+ filtered=\d+ pushed=\d+ failed=\d+/.test(lastLine),
-        `日志行应含完整摘要字段，实际: ${lastLine}`);
+    assert(/total=\d+ dedup=\d+ filtered=\d+ pushed=\d+ failed=\d+ elapsed=[\d.]+s/.test(lastLine),
+        `日志行应含完整摘要字段（含 elapsed），实际: ${lastLine}`);
     assert(lastLine.includes('pushed=2'), `应记录推送 2 条，实际: ${lastLine}`);
     // 测试产生的日志行不污染真实运行日志（测试专用，删掉）
     try { fs.unlinkSync(logPath); } catch (e) { /* 忽略 */ }
