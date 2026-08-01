@@ -1027,6 +1027,31 @@ await test('推送截断长度可配置 + 非法回退默认（v3.69）', async 
     }
 });
 
+await test('并行模式 + 自定义模板/截断组合（v3.84）', async () => {
+    reset();
+    setPushUrl('t50_parallel_tpl');
+    fakeData = [makeItem({ id: 1 }), makeItem({ id: 2 })];
+    const origMode = Config.push.mode;
+    const origTitleMax = Config.push.titleMax;
+    const origTpl = Config.template.title;
+    try {
+        Config.push.mode = 'parallel';
+        Config.push.titleMax = 20;
+        Config.template.title = '【{分类名}】{标题}|{链接}';
+        await xbk.run();
+        assert(pushCalls.length === 2, `应推 2 条: ${pushCalls.length}`);
+        for (const c of pushCalls) {
+            assert(c.text.length <= 20, `并行模式标题应 ≤ titleMax(20): ${c.text}`);
+            assert(c.text.includes('|'), `模板分隔符应生效: ${c.text}`);
+            assert(!c.text.includes('{'), `占位符应全部替换: ${c.text}`);
+        }
+    } finally {
+        Config.push.mode = origMode;
+        Config.push.titleMax = origTitleMax;
+        Config.template.title = origTpl;
+    }
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {
