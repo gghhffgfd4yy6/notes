@@ -55,13 +55,13 @@ Config.template.content    // 推送内容模板(默认{Markdown内容})
 Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.102)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号(v3.103)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
 ### `xbk_sendNotify_slim.js` — 推送模块(各通道实现)
 
-**定位**:主代码依赖的推送实现,约 646 行。实现 9 个推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。
+**定位**:主代码依赖的推送实现,约 673 行。实现 9 个推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。
 
 **结构**:
 | 部分 | 内容 |
@@ -232,7 +232,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.102),每轮修复/重构/功能变更的摘要。
+版本演进记录(v3.0 → v3.103),每轮修复/重构/功能变更的摘要。
 
 ---
 
