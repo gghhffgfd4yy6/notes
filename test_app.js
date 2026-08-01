@@ -158,6 +158,7 @@ await test('拉取→推送完整链路：新数据全部推送', async () => {
     // desp 为 Markdown 内容（来自 content_html）
     assert(pushCalls[0].desp.includes('原文链接'), 'desp 应含原文链接');
     assert(pushCalls[0].desp.includes('京东神券 100元'), 'desp 应含 content_html 内容');
+    assert(pushCalls[0].desp.includes('**京东神券 100元**'), 'desp 应含 Markdown 粗体转换结果（v3.90 锁定 htmlToMarkdown 真实链路）');
     // 新数据写入缓存
     const cached = readCacheFile('t01_normal');
     assert(cached.length === 3, `缓存应有3条，实际${cached.length}`);
