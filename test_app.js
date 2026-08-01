@@ -877,6 +877,7 @@ await test('运行时配置校验：非法数值配置警告、合法不警告�
         timeout: Config.api.timeout, retry: Config.api.retry,
         pushInterval: Config.timing.pushInterval, finalWait: Config.timing.finalWait,
         parallelLimit: Config.push.parallelLimit, domain: Config.domain,
+        templateTitle: Config.template.title,
     };
     let warns = [];
     const origWarn = console.warn;
@@ -888,6 +889,7 @@ await test('运行时配置校验：非法数值配置警告、合法不警告�
         Config.timing.finalWait = -5;
         Config.push.parallelLimit = -1;
         Config.domain = '非法域名';
+        Config.template.title = 123;
         await xbk.run();
         assert(warns.some(w => w.includes('api.timeout')), 'timeout 应警告');
         assert(warns.some(w => w.includes('api.retry')), 'retry 应警告');
@@ -895,6 +897,7 @@ await test('运行时配置校验：非法数值配置警告、合法不警告�
         assert(warns.some(w => w.includes('finalWait')), 'finalWait 应警告');
         assert(warns.some(w => w.includes('parallelLimit')), 'parallelLimit 应警告');
         assert(warns.some(w => w.includes('domain')), '非法 domain 应警告');
+        assert(warns.some(w => w.includes('template')), '非法 template 应警告');
     } finally {
         Config.api.timeout = orig.timeout;
         Config.api.retry = orig.retry;
@@ -902,6 +905,7 @@ await test('运行时配置校验：非法数值配置警告、合法不警告�
         Config.timing.finalWait = orig.finalWait;
         Config.push.parallelLimit = orig.parallelLimit;
         Config.domain = orig.domain;
+        Config.template.title = orig.templateTitle;
         console.warn = origWarn;
     }
     // 合法值不警告

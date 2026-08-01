@@ -217,6 +217,7 @@
 - **v3.77**：失败日志 safeErr 全通道统一（Bark/PushMe/wxpusher/息知 v3.75 漏网收尾）+ 对应脱敏测试
 - **v3.78**：got Content-Type 大小写不敏感；Server酱/PushDeer/Telegram 异常分支日志 safeErr 截断
 - **v3.79**：101 章扩展 README 版本一致性（四方：文件头/CHANGELOG/package.json/README）；run.log 文档说明
+- **v3.80**：cache.dir 非字符串崩溃修复（path.join TypeError）；template 配置层校验
 
 ## 七、行为变更记录（语义调整）
 

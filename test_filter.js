@@ -4836,6 +4836,21 @@ await test('版本一致性：README 当前版本与文件头一致（v3.79）',
     assertEqual(m[1], r[1], `README 版本(${r[1]})应与文件头(${m[1]})一致`);
 });
 
+console.log('\n📂 102. 配置防御（v3.80）');
+
+await test('防御: cache.dir 非字符串 → 回退默认不崩（v3.80）', () => {
+    const orig = Config.cache.dir;
+    try {
+        Config.cache.dir = 123; // 非字符串：path.join 会抛 TypeError 的崩溃点
+        const p = getFilePath('t102_cache.json');
+        assertEqual(typeof p, 'string', '应返回字符串路径（回退默认目录）');
+        assertEqual(p.includes('xianbaoku_cache'), true, `应回退默认缓存目录: ${p}`);
+        try { require('fs').unlinkSync(p); } catch (e) { /* 忽略 */ }
+    } finally {
+        Config.cache.dir = orig;
+    }
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {

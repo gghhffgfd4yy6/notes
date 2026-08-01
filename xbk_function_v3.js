@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.79 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 ********
+//******** 线报酷推送脚本 v3.80 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 + 配置防御 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -818,7 +818,7 @@ const FilterEngine = {
 // 💾 MessageStore — 缓存管理层
 // ============================================================
 const MessageStore = {
-    get cacheDir() { return path.join(__dirname, Config.cache.dir); },
+    get cacheDir() { return path.join(__dirname, typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : 'xianbaoku_cache'); },
     _memoryCache: {},
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
     _MEMO_MAX: 100,
@@ -1085,6 +1085,11 @@ const App = {
             // 域名校验（v3.73）：非法 URL 会让 fetchData 重试耗尽才报错，配置层提前提示
             if (typeof Config.domain !== 'string' || !/^https?:\/\//.test(Config.domain)) {
                 console.warn(`⚠️ 配置「domain」为「${Config.domain}」不是 http(s):// 开头的合法地址`);
+            }
+
+            // 模板校验（v3.80）：非字符串回退默认（pushOne 已有回退，配置层补提示）
+            if (typeof Config.template.title !== 'string' || typeof Config.template.content !== 'string') {
+                console.warn('⚠️ 配置「template.title/content」应为字符串，已回退默认模板');
             }
 
             // 运行时数值配置校验（函数层已有防御，配置层补提示——#7 同款精神，v3.64）

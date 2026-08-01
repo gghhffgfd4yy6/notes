@@ -1,5 +1,22 @@
 # 📋 更新日志
 
+## v3.80（配置防御：cache.dir + template 校验）
+> 2026-08-01
+
+### 🐛 cache.dir 非字符串崩溃修复
+
+- **发现**：`Config.cache.dir` 非字符串（数字等）→ `path.join(__dirname, 123)` 抛 TypeError → MessageStore.init/getFilePath **崩溃**
+- **修复**：cacheDir getter 防御（非字符串/空 → 回退默认 'xianbaoku_cache'）；102 章新增测试
+
+### 🔧 template 配置层校验
+
+- App.run 启动校验 `template.title/content` 非字符串 → 警告（pushOne 已有回退，配置层补提示）
+- t45 扩展断言非法 template 警告
+
+### 🧪 测试数
+
+**650 个全绿（单元 573 + 集成 57 + 通道 20）**
+
 ## v3.79（README 版本四方一致 + run.log 文档）
 > 2026-08-01
 
