@@ -4769,6 +4769,17 @@ await test('#7: validateConfig maxSize 非正整数 → 警告；合法 → 不�
     assertEqual(validateConfig({ cache: { maxSize: 100 } }).length, 0, '正整数不警告');
 });
 
+await test('#链接: {链接} 占位符 Markdown 安全化（v3.74）', () => {
+    // 含空格/括号 → <> 包裹（与 htmlToMarkdown 的 mdUrl 同口径）
+    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/a b', title: 't' }), '<http://x.com/a b>');
+    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/a(b)', title: 't' }), '<http://x.com/a(b)>');
+    // 含换行 → 剥离
+    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/a\nb', title: 't' }), 'http://x.com/ab');
+    // 正常 url 原样；无 url → 空
+    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/ok', title: 't' }), 'http://x.com/ok');
+    assertEqual(tuisong_replace('{链接}', { title: 't' }), '');
+});
+
 console.log('\n📂 101. 版本一致性（防文件头版本号过时——v3.35 曾出现「v3.8 当前最新」过时误导）');
 
 await test('版本一致性：文件头版本号与 CHANGELOG 顶部一致', () => {

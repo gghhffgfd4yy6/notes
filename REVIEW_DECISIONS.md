@@ -211,6 +211,7 @@
 - **v3.71**：工程化收尾（package.json + README 首次引入）；变异测试验证（7 变异零盲区）；101 章扩展 package.json 版本三方一致
 - **v3.72**：push_config.local.js.example 密钥配置示例模板（新用户配置入口）
 - **v3.73**：domain 配置层校验；推送模块一言日志非 Error 兜底；.git.corrupt_backup 归档 /tmp（fsck 确认后 mv）
+- **v3.74**：{链接} 占位符 Markdown 安全化（<> 包裹+换行剥离，与 htmlToMarkdown 同口径）；一言失败测试；文档测试数统一
 
 ## 七、行为变更记录（语义调整）
 

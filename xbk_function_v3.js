@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.73 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 ********
+//******** 线报酷推送脚本 v3.74 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -340,6 +340,12 @@ const Formatter = {
             .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         // 与 htmlToMarkdown 口径一致：非字符串 content_html 视为空（避免 [object Object] 泄漏）
         const rawHtml = (typeof data.content_html === 'string') ? data.content_html : '';
+        // {链接} 占位符 Markdown 安全化（v3.74）：与 htmlToMarkdown 的 mdUrl 同口径——
+        // 含空格/括号/] 用 <> 包裹、剥离换行（原样输出会在 Markdown 链接场景破坏）
+        const linkText = (() => {
+            const u = data.url === undefined || data.url === null ? '' : String(data.url).replace(/[\r\n]+/g, '');
+            return u && /[\s()\[\]]/.test(u) ? `<${u}>` : u;
+        })();
         const getContentHtml = () => `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`;
 
         const map = {
@@ -349,7 +355,7 @@ const Formatter = {
             '{Markdown内容}': text.includes('{Markdown内容}') ? this.htmlToMarkdown(data) : undefined,
             '{分类名}': data.catename,
             '{分类ID}': data.cateid,
-            '{链接}': data.url,
+            '{链接}': linkText,
             '{日期}': data.datetime,
             '{时间}': data.shorttime,
             '{楼主}': data.louzhu,
