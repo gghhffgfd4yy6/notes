@@ -55,7 +55,7 @@ Config.template.content    // 推送内容模板(默认{Markdown内容})
 Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.92)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号(v3.93)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
@@ -147,6 +147,9 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 | **97** | **自制 got 直测** | 本地 HTTP server：302 重定向/协议相对 `//` 重定向/4xx 带 statusCode/ETIMEDOUT 超时/POST JSON body/UTF-8 跨 chunk 不乱码/响应体超限 EBODYLIMIT |
 | **98** | **异常路径批量** | 未知占位符保留/对象字段不崩/重定向循环停止/连接拒绝 ECONNREFUSED/timeout 归一 |
 | **99** | **边界精确值** | TS_BOUND 精确分界/normUrl 极端/pingbitime 0-极大-负数/编码大小写-超范围-代理区-NUL |
+| **100** | **审查项 #56/#65/#7/#链接** | img 空 src/url 换行/maxSize 校验/{链接} Markdown 安全化 |
+| **101** | **版本一致性** | 文件头 ↔ CHANGELOG ↔ package.json ↔ README 四方一致（防版本号过时） |
+| **102** | **配置防御/实体扩展** | cache.dir 非字符串回退/实体扩展(36 个)/href 换行剥离 |
 
 **运行**:`node test_filter.js`(约 1.6s),退出码 0=全绿。
 
@@ -229,7 +232,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.92),每轮修复/重构/功能变更的摘要。
+版本演进记录(v3.0 → v3.93),每轮修复/重构/功能变更的摘要。
 
 ---
 
