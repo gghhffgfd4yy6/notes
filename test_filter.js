@@ -1652,8 +1652,8 @@ await test('whitelistFilter 字段值缺失 → false', () => {
     assertEqual(whitelistFilter({}, 'title', '京东'), false);
 });
 
-await test('whitelistFilter 无效正则 → false', () => {
-    assertEqual(whitelistFilter({ title: '京东' }, 'title', '[未闭合'), false);
+await test('whitelistFilter 无效正则 → 放行（与 App.run 预编译失败口径一致）', () => {
+    assertEqual(whitelistFilter({ title: '京东' }, 'title', '[未闭合'), true);
 });
 
 // ==================== 29. saveBatch 批量写入 ====================
@@ -3972,7 +3972,7 @@ await test('分支: whitelistFilter 空/有/非法关键词', () => {
     assertEqual(whitelistFilter({ title: 'a' }, 'title', ''), true);       // 空关键词全过
     assertEqual(whitelistFilter({ title: '京东' }, 'title', '京东'), true); // 命中
     assertEqual(whitelistFilter({ title: '淘宝' }, 'title', '京东'), false); // 未命中
-    assertEqual(whitelistFilter({ title: 'a' }, 'title', '('), false);      // 非法正则→不匹配
+    assertEqual(whitelistFilter({ title: 'a' }, 'title', '('), true);      // 非法正则→放行（宁可多推，与 App.run 口径一致）
 });
 
 await test('分支: compileRules 简单/多行/###跳过/非法', () => {

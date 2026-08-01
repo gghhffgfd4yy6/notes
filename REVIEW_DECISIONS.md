@@ -203,5 +203,10 @@
 - **v3.64**：运行时数值配置校验补全（timeout/retry/pushInterval/finalWait/parallelLimit）；101 章版本一致性自检（文件头 vs CHANGELOG 顶部）
 - **v3.65**：运行摘要持久化 run.log；文档同步（本文件当前状态 + FILE_INDEX）
 - **v3.66**：run.log 增强——失败 ERROR 记录 + 1MB 大小上限截断（抽 _writeRunLog helper）
+- **v3.67**：whitelistFilter 非法正则 → 放行（原拦截；与 ReDoS 分支/App.run 预编译失败口径统一，宁可多推）
+
+## 七、行为变更记录（语义调整）
+
+- **v3.67 whitelistFilter 非法正则**：原 `catch → false`（拦截，只看它清空推送）改为 `catch → true`（放行）。理由：①App.run 主路径对非法 zkt_gjc 从来就是放行（v3.16），独立导出不应矛盾；②ReDoS 风险正则已放行，非法正则却拦截——自相矛盾；③配置错误 = 缺信息 = 保守放行（项目哲学）。代价：独立调用场景的"非法正则拦截"语义消失，由调用方自行校验（validateConfig 已负责警告）。
 
 > 一句话哲学：**「宁可多推不可少推」+「处理完的才记，没成功的下次再试」+「缺信息保守放行」+「每个取舍都写下来」**
