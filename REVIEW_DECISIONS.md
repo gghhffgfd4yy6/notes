@@ -213,6 +213,7 @@
 - **v3.73**：domain 配置层校验；推送模块一言日志非 Error 兜底；.git.corrupt_backup 归档 /tmp（fsck 确认后 mv）
 - **v3.74**：{链接} 占位符 Markdown 安全化（<> 包裹+换行剥离，与 htmlToMarkdown 同口径）；一言失败测试；文档测试数统一
 - **v3.75**：推送模块密钥泄露修复（严重）——$.post/get 失败传 Error 而非响应体（防回显）；safeErr 摘要统一 5 通道失败日志；脱敏测试扩展 + 变异验证（改回旧行为 2 红）
+- **v3.76**：TG_PROXY_* 一次性警告（防误配静默失效，提示改用 TG_API_HOST）；CHANNEL_KEYS 补 TG_PROXY 字段
 
 ## 七、行为变更记录（语义调整）
 

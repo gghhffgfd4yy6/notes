@@ -58,7 +58,8 @@ const CHANNEL_KEYS = ['PUSH_PLUS_TOKEN', 'PUSH_PLUS_USER', 'PUSH_KEY',
     'BARK_PUSH', 'BARK_ARCHIVE', 'BARK_GROUP', 'BARK_SOUND', 'BARK_ICON', 'BARK_LEVEL', 'BARK_URL',
     'QYWX_KEY', 'WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_XIZHI_KEY',
     'DEER_KEY', 'DEER_URL', 'PUSHME_KEY', 'PUSHME_URL', 'HITOKOTO',
-    'TG_BOT_TOKEN', 'TG_USER_ID', 'TG_API_HOST'];
+    'TG_BOT_TOKEN', 'TG_USER_ID', 'TG_API_HOST',
+    'TG_PROXY_HOST', 'TG_PROXY_PORT', 'TG_PROXY_AUTH'];
 
 const saved = {};
 for (const k of CHANNEL_KEYS) saved[k] = cfg[k];
@@ -250,6 +251,22 @@ await test('Telegram: 缺 chat_id 不发送(不影响其他通道) + 自定义 h
     await notify.sendNotify('标题', '内容');
     assert(gotCalls.some(c => c.url.includes('proxy.example.com/bottok1/sendMessage')),
         `自定义 host 应生效: ${gotCalls.map(c => c.url).join(', ')}`);
+}));
+
+await test('TG_PROXY 配置 → 一次性警告不生效（v3.76）', () => withChannels(async () => {
+    cfg.TG_BOT_TOKEN = 'BOT';
+    cfg.TG_USER_ID = '123';
+    cfg.TG_PROXY_HOST = '127.0.0.1';
+    const origWarn = console.warn;
+    const warns = [];
+    console.warn = (m) => warns.push(String(m));
+    try {
+        await notify.sendNotify('标题', '内容');
+        assert(warns.some(w => w.includes('TG_PROXY')), '应警告 TG_PROXY 不生效');
+        assert(warns.some(w => w.includes('TG_API_HOST')), '应提示替代方案 TG_API_HOST');
+    } finally {
+        console.warn = origWarn;
+    }
 }));
 
 // 14. 日志脱敏全覆盖：走真实通道异常路径，stub 日志断言不泄露
