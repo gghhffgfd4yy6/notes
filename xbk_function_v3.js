@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.84 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 + 配置防御 + CLI兜底 + UA版本化 + 实体扩展 + 并行组合测试 ********
+//******** 线报酷推送脚本 v3.85 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 + 配置防御 + CLI兜底 + UA版本化 + 实体扩展 + 并行组合测试 + href换行剥离 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -340,8 +340,9 @@ const Formatter = {
         // 惰性计算：只有模板里真正用到 {Html内容} / {Markdown内容} 时才跑一遍替换/正则，
         // 避免像 App.run 里那样对同一条数据分别调用 tuisong_replace 生成 text/desp 时，
         // 没用到 Markdown 的那次也白白算一遍 htmlToMarkdown
-        // url 做 HTML 转义，避免特殊字符破坏 <a href="..."> 结构
+        // url 做 HTML 转义，避免特殊字符破坏 <a href="..."> 结构；换行先剥离（v3.85，与 linkText 口径一致）
         const escUrl = String(data.url === undefined || data.url === null ? '' : data.url)
+            .replace(/[\r\n]+/g, '')
             .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         // 与 htmlToMarkdown 口径一致：非字符串 content_html 视为空（避免 [object Object] 泄漏）
         const rawHtml = (typeof data.content_html === 'string') ? data.content_html : '';

@@ -2,7 +2,7 @@
 
 定时拉取线报酷接口数据 → 规则过滤 → 多通道推送的 Node.js 脚本。零第三方依赖（自制精简 HTTP 模块），642 个测试全绿。
 
-> 当前版本：v3.84（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本：v3.85（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
 
 ---
 

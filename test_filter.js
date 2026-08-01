@@ -4859,6 +4859,14 @@ await test('实体扩展: ensp/emsp/cent/curren/箭头（v3.83）', () => {
     assertEqual(decodeHtmlEntities('&ensp;'), ' ', '单独 ensp');
 });
 
+await test('#链接: {Html内容} href 换行剥离（v3.85）', () => {
+    const r = tuisong_replace('{Html内容}', { url: 'http://x.com/a\nb', content_html: '<p>内容</p>', title: 't' });
+    assertEqual(r.includes('\n'), false, 'Html内容不应残留换行');
+    assertEqual(r.includes('http://x.com/ab'), true, 'href 换行应剥离');
+    const r2 = tuisong_replace('{Html内容}', { url: 'http://x.com/ok', content_html: '<p>内容</p>', title: 't' });
+    assertEqual(r2.includes('http://x.com/ok'), true, '正常 url 不受影响');
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {
