@@ -1,5 +1,36 @@
 # 📋 更新日志
 
+## v3.109（深度 Fuzz 二轮：跨函数不变量 + 正则安全 + IO + 集成层）
+> 2026-08-01
+
+### 🎲 106 章 深度 Fuzz 二轮（8 个测试）
+
+**5 组跨函数不变量**（上一轮是单函数不变量，这轮验证**函数间一致性**）：
+- truncateUtf16 单调性（max 更大 → 输出不更短，500 轮）
+- {分类名} === {类目} 同源一致（500 轮）
+- whitelistFilter === filterByKeyword 一致（500 轮）
+- daysComputed 与 parseTime 一致性（未来时间戳 → 0，1000 轮）
+- decodeHtmlEntities 幂等（递归解码收敛后稳定，500 轮）
+
+**正则安全 fuzz**：
+- 100 个随机正则模式（原子拼接）→ hasNestedQuantifier 不崩 + boolean
+- 显式危险模式 6 种必须标记（(a+)+/(a*)*/(a+)*/嵌套/非捕获组/无界组）——**防漏报**
+- 显式安全模式不误报（含转义括号 `\(a+\)+` 安全——修正了我最初用 includes 误判转义模式的断言）
+
+**IO 类函数 fuzz**：随机文件名（特殊字符/超长/unicode/emoji）+ 随机内容 → getFilePath/saveBatch/readMessages/isMessageInFile 不崩（50 轮，test_ 前缀自动清理）
+
+**深度压力**：8 层嵌套 × 200、1MB 字符串、1000 轮热函数扫描
+
+### 🔄 test_app 集成层 Fuzz（t52）
+
+- **随机数据流**（50 条/轮 × 3 轮：id/catename/title/content_html/louzhu/louzhuregtime/url 全随机脏化）→ mock got 返回 → **完整 run() 不崩**
+- 随机 filter 配置（合法/非法正则混合）→ 摘要字段完整、pushed+failed ≤ total
+- 这轮覆盖了纯函数 fuzz 无法触达的**整链路**（拉取→归一化→去重→过滤→推送→缓存→摘要）
+
+### 🧪 测试数
+
+**695 个全绿（单元 606 + 集成 68 + 通道 21）**
+
 ## v3.108（深度 Fuzz/Property：13 处 Symbol 崩溃修复）
 > 2026-08-01
 

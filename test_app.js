@@ -1228,6 +1228,47 @@ await test('zkt_gjc 对象配置 → 警告并全部推送（R11-1 防御）', a
 
 // ================================================
 console.log('\n========================================');
+
+await test('集成 Fuzz: 随机数据流 + 随机配置 run() 不崩（v3.109）', async () => {
+    // 确定性随机（固定 seed——跨运行一致）
+    let seed = 20260901;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    // 随机数据生成器：id/catename/title/content/content_html/louzhu/louzhuregtime/url 全部随机脏化
+    const randItem = (i) => {
+        const r = rand();
+        return {
+            id: r < 0.2 ? null : (r < 0.4 ? String(i) : i),
+            catename: rand() < 0.15 ? null : (rand() < 0.5 ? '分类' + Math.floor(rand() * 5) : ''),
+            title: rand() < 0.1 ? null : ('标题' + i + (rand() < 0.5 ? ' 京东' : '')),
+            content: rand() < 0.1 ? null : '内容' + i,
+            content_html: rand() < 0.3 ? '<b>' + i + '</b>' + (rand() < 0.5 ? '&amp;amp;' : '') : '<p>html' + i + '</p>',
+            louzhu: rand() < 0.2 ? null : '楼主' + i,
+            louzhuregtime: rand() < 0.3 ? null : (rand() < 0.5 ? '2026-01-01' : String(Math.floor(rand() * 1e9))),
+            url: rand() < 0.15 ? null : (rand() < 0.5 ? '/item/' + i + '.html' : 'http://x.com/' + i),
+        };
+    };
+    for (let round = 0; round < 3; round++) {
+        reset();
+        setPushUrl('t52_fuzz_' + round);
+        fakeData = [];
+        const n = 20 + Math.floor(rand() * 30);
+        for (let i = 0; i < n; i++) fakeData.push(randItem(i));
+        // 随机 filter 配置（合法/非法正则混合）
+        Config.filter.pingbibiaoti = rand() < 0.5 ? '京东' : (rand() < 0.8 ? '(' : '');
+        Config.filter.pingbitime = String(Math.floor(rand() * 20));
+        Config.keyword.zkt_gjc = rand() < 0.3 ? '' : (rand() < 0.5 ? '京东' : '[');
+        try {
+            const summary = await xbk.run();
+            assert(typeof summary.total === 'number' && summary.total === fakeData.length,
+                `第${round}轮 total 应为 ${fakeData.length}，实际 ${summary.total}`);
+            assert(typeof summary.pushed === 'number' && typeof summary.failed === 'number', '摘要字段完整');
+            assert(summary.pushed + summary.failed <= summary.total, 'pushed+failed 不应超 total');
+        } finally {
+            reset();
+        }
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 集成测试全部通过！${passed}/${passed}`);
 } else {

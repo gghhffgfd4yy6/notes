@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.108 — 深度Fuzz+Property测试：13处Symbol崩溃修复(hasValidId/anonKey/_splitLines/hasNestedQuantifier/normUrl/decode/tuisong/truncate/whitelist/parseTime/getFilePath/compileRules/validateConfig)；嵌套Symbol数组全API防御；5组不变量Property Tests；104/105章 ********
+//******** 线报酷推送脚本 v3.109 — 深度Fuzz二轮：跨函数不变量(5组)+正则安全+IO类函数+8层嵌套/1MB/1000轮+集成层Fuzz(t52随机数据流+随机配置run不崩)；正则fuzz修正转义断言；695全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';

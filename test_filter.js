@@ -5333,6 +5333,172 @@ await test('Fuzz 回归: 其他脏类型（Proxy/循环引用/超长）不崩', 
 });
 
 console.log('\n========================================');
+console.log('\n📂 106. 深度 Fuzz 二轮（跨函数不变量 + 正则安全 + IO + 深度压力）');
+
+await test('Property-2: truncateUtf16 单调性（max 更大 → 输出不更短）', () => {
+    let seed = 314159;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    for (let i = 0; i < 500; i++) {
+        let s = '';
+        const len = Math.floor(rand() * 300);
+        for (let j = 0; j < len; j++) s += rand() < 0.5 ? '😀' : (rand() < 0.8 ? '中文' : 'a');
+        const m1 = Math.floor(rand() * 100) + 1;
+        const m2 = m1 + Math.floor(rand() * 100) + 1;
+        const o1 = truncateUtf16(s, m1);
+        const o2 = truncateUtf16(s, m2);
+        assertEqual(o2.length >= o1.length, true, `单调性: max ${m1}→${o1.length}, ${m2}→${o2.length}`);
+    }
+});
+
+await test('Property-2: {分类名} 与 {类目} 同源一致（随机数据）', () => {
+    let seed = 2718;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    for (let i = 0; i < 500; i++) {
+        const catename = rand() < 0.2 ? null : '分类' + Math.floor(rand() * 100);
+        const item = { catename, title: 't', content: 'c', url: '/x' };
+        const r1 = tuisong_replace('{分类名}', item);
+        const r2 = tuisong_replace('{类目}', item);
+        assertEqual(r1, r2, `{分类名} 应等于 {类目}: ${JSON.stringify(item)}`);
+        if (catename) assertEqual(r1, catename, '分类名应等于 catename');
+    }
+});
+
+await test('Property-2: whitelistFilter 与 filterByKeyword 一致（随机数据）', () => {
+    let seed = 1618;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    for (let i = 0; i < 500; i++) {
+        const title = '标题' + Math.floor(rand() * 1000) + (rand() < 0.5 ? '京东' : '') + '神券';
+        const kw = rand() < 0.3 ? '' : (rand() < 0.5 ? '京东' : (rand() < 0.8 ? '[' : '神券'));
+        const item = { title, content: 'x' };
+        const r1 = filterByKeyword(item, kw);
+        const r2 = whitelistFilter(item, 'title', kw);
+        assertEqual(r1, r2, `filterByKeyword 应等于 whitelistFilter: kw="${kw}" title="${title}"`);
+    }
+});
+
+await test('Property-2: daysComputed 与 parseTime 一致性（无效/未来 → 0）', () => {
+    let seed = 4242;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    for (let i = 0; i < 1000; i++) {
+        const x = rand() < 0.3 ? (rand() < 0.5 ? 'abc' : null) : Math.floor(rand() * 1e13);
+        const d = daysComputed(x);
+        // 未来日期 → 0（daysComputed 的非正差归零）
+        const future = typeof x === 'number' && x > Date.now() + 86400000;
+        if (future) assertEqual(d, 0, `未来时间戳应归 0: ${x}`);
+        assertEqual(d >= 0, true, `非负: ${x} → ${d}`);
+    }
+});
+
+await test('Property-2: decodeHtmlEntities 幂等（递归解码收敛后稳定）', () => {
+    let seed = 8888;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    for (let i = 0; i < 500; i++) {
+        let s = '';
+        const len = Math.floor(rand() * 40);
+        for (let j = 0; j < len; j++) {
+            const parts = ['&amp;', '&lt;', '&gt;', '&#38;', '&#x26;', '&amp;amp;', '文本', 'x', '&nbsp;', '&quot;'];
+            s += parts[Math.floor(rand() * parts.length)];
+        }
+        const once = decodeHtmlEntities(s);
+        const twice = decodeHtmlEntities(once);
+        assertEqual(once, twice, `解码幂等: "${s.slice(0, 40)}" once="${once.slice(0, 30)}" twice="${twice.slice(0, 30)}"`);
+    }
+});
+
+await test('Fuzz-正则: 100 个随机正则模式 hasNestedQuantifier 不崩且判定一致', () => {
+    let seed = 999;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const atoms = ['a', 'b', '\\d', '.', '[ab]', '(ab)', '(?:cd)', 'a+', 'b*', 'a?', 'x{1,3}', 'y{2,}', '(a+)+', '(b*)*', '\\', '|', '^', '$'];
+    let checked = 0;
+    for (let i = 0; i < 100; i++) {
+        let pat = '';
+        const len = Math.floor(rand() * 8) + 1;
+        for (let j = 0; j < len; j++) pat += atoms[Math.floor(rand() * atoms.length)];
+        const r = hasNestedQuantifier(pat);
+        // 随机模式（可能含转义干扰）：只断言返回 boolean 不崩——危险判定用下方显式模式验证
+        assertEqual(typeof r, 'boolean', `hasNestedQuantifier 应返回 boolean: "${pat}"`);
+        checked++;
+    }
+    // 已知安全模式不误报
+    assertEqual(hasNestedQuantifier('a+b+c'), false, 'a+b+c 安全');
+    assertEqual(hasNestedQuantifier('(a|b)+'), false, '(a|b)+ 安全(无嵌套)');
+    assertEqual(hasNestedQuantifier('(a+){1,3}'), false, '(a+){1,3} 有界安全');
+    assertEqual(hasNestedQuantifier('a+{2,}'), false, '量词后不嵌套');
+    // 已知危险模式必须被标记（无转义干扰的显式模式——防漏报）
+    assertEqual(hasNestedQuantifier('(a+)+'), true, '(a+)+ 危险');
+    assertEqual(hasNestedQuantifier('(a*)*'), true, '(a*)* 危险');
+    assertEqual(hasNestedQuantifier('(a+)*'), true, '(a+)* 危险');
+    assertEqual(hasNestedQuantifier('((ab)+)+'), true, '嵌套危险');
+    assertEqual(hasNestedQuantifier('(?:a+)+'), true, '非捕获组嵌套危险');
+    assertEqual(hasNestedQuantifier('(a{2,})+'), true, '无界量词组嵌套危险');
+    // 转义模式安全（括号被转义不构成分组）
+    assertEqual(hasNestedQuantifier('\\(a+\\)+'), false, '转义括号安全');
+    assertEqual(hasNestedQuantifier(''), false, '空模式安全');
+});
+
+await test('Fuzz-IO: 随机文件名/内容 → 缓存 API 不崩（临时文件自动清理）', () => {
+    let seed = 12321;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const randName = () => {
+        const chars = 'abcXYZ0123 ../\\\\?*:"<>|&.;\u4e2d\ud83d\ude00';
+        let s = 'test_106_';
+        const len = Math.floor(rand() * 30);
+        for (let i = 0; i < len; i++) s += chars[Math.floor(rand() * chars.length)];
+        return s + '.json';
+    };
+    const randContent = () => {
+        const r = rand();
+        if (r < 0.2) return null;
+        if (r < 0.4) return '不是JSON';
+        if (r < 0.6) return [{ id: Math.floor(rand() * 100), title: 'x' }, null, 'str'];
+        return [];
+    };
+    for (let i = 0; i < 50; i++) {
+        const name = randName();
+        const content = randContent();
+        try {
+            const fp = getFilePath(name);
+            assertEqual(typeof fp, 'string', 'getFilePath 应返回字符串');
+            // saveBatch 只收对象数组（内部有校验）；用合法内容写入
+            const msgs = Array.isArray(content) ? content.filter(x => x && typeof x === 'object') : [];
+            saveBatch(msgs, name);
+            const read = readMessages(fp);
+            assertEqual(Array.isArray(read), true, 'readMessages 应返回数组');
+            assertEqual(isMessageInFile(name, { id: 99999, title: 'n' }), false, 'isMessageInFile 不崩');
+        } catch (e) {
+            throw new Error(`IO fuzz 失败 name="${name.slice(0, 40)}" content=${JSON.stringify(content).slice(0, 40)}: ${e.message}`);
+        }
+    }
+});
+
+await test('Fuzz-深度: 8 层嵌套 + 1MB 字符串 + 1000 轮大扫描', () => {
+    let seed = 55555;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const deep = (d) => {
+        if (d <= 0) return rand() < 0.5 ? Math.floor(rand() * 1e9) : (rand() < 0.7 ? 'str' + Math.floor(rand() * 100) : null);
+        return rand() < 0.5 ? { k: deep(d - 1) } : [deep(d - 1)];
+    };
+    for (let i = 0; i < 200; i++) {
+        const input = deep(8);
+        assertEqual(typeof decodeHtmlEntities(input), 'string', '8 层嵌套 decode');
+        assertEqual(typeof normUrl(input), 'string', '8 层嵌套 normUrl');
+        assertEqual(typeof daysComputed(input), 'number', '8 层嵌套 daysComputed');
+    }
+    // 1MB 字符串
+    const big = 'x'.repeat(1024 * 1024);
+    assertEqual(typeof decodeHtmlEntities(big), 'string', '1MB decode');
+    assertEqual(truncateUtf16(big, 100).length, 100, '1MB 截断');
+    // 1000 轮快速扫描（5 个热函数）
+    for (let i = 0; i < 1000; i++) {
+        const v = rand() < 0.5 ? Math.floor(rand() * 1e10) : '2026-0' + Math.floor(rand() * 9) + '-1' + Math.floor(rand() * 9);
+        daysComputed(v);
+        normUrl('http://x.com/' + Math.floor(rand() * 10000) + '.html');
+        decodeHtmlEntities('&amp;' + Math.floor(rand() * 100));
+        truncateUtf16('标题' + Math.floor(rand() * 1000), 50);
+        anonKey(Math.floor(rand() * 1e9), 't', 'c');
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 全部通过！${passed}/${passed}  100%`);
 } else {
