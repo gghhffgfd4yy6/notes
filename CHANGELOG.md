@@ -1,5 +1,35 @@
 # 📋 更新日志
 
+## v3.110（Fuzz 三轮广覆盖：孤立代理 URIError 真实 bug 修复）
+> 2026-08-01
+
+### 🐛 孤立代理 URIError（Fuzz 抓到，影响真实推送）
+
+- **发现**：随机 text 按 UTF-16 码元切分产生**孤立代理**（\ud800/\udfff）→ 通道 `encodeURIComponent` 抛 **URIError** → **推送失败**（真实接口脏数据/截断 emoji 会触发）
+- **双层修复**：
+  1. 主代码 `Utils.sanitizeSurrogates`（孤立代理 → U+FFFD，完整代理对保留）+ **tuisong_replace 输出统一清洗**（所有模板路径）+ pushOne title/content 清洗
+  2. 推送模块 `sendNotify` 入口统一清洗（独立防御，直调 sendNotify 也安全）
+- **恢复 2 处既有语义**：R9（对象 title → (无标题) 非 [object Object]）、审查9-C（空标题 → (无标题) 占位）
+
+### 🎲 107 章 广覆盖（8 个测试）
+
+- daysComputed 单调性（更早日期 → 天数不更小）
+- truncateUtf16 前缀性（输出是输入前缀，代理对回退）
+- decode+htmlToMarkdown 组合无实体残留
+- Unicode 极端（孤立代理/零宽/BOM/RTL/emoji 堆叠/组合变音）
+- 数字极端（-0/1e-323/MAX_VALUE/1n）
+- 随机模板 fuzz（占位符组合：已知替换+未知保留，500 轮）
+- MessageStore 跨操作一致性（save→read→has 闭环；修正 has(message,filename) 参数顺序）
+
+### 🎲 notify 层 fuzz（test_notify +2）
+
+- 随机 text/desp/params（含特殊字符/emoji/超长）→ sendNotify 不崩 + **日志无密钥**（30 轮）
+- maskKey/maskUrl 随机输入（null/undefined/Symbol/对象/超长）不崩 + 不泄露完整密钥
+
+### 🧪 测试数
+
+**707 个全绿（单元 615 + 集成 69 + 通道 23）**
+
 ## v3.109（深度 Fuzz 二轮：跨函数不变量 + 正则安全 + IO + 集成层）
 > 2026-08-01
 

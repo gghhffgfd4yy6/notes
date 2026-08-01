@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.109 — 深度Fuzz二轮：跨函数不变量(5组)+正则安全+IO类函数+8层嵌套/1MB/1000轮+集成层Fuzz(t52随机数据流+随机配置run不崩)；正则fuzz修正转义断言；695全绿 ********
+//******** 线报酷推送脚本 v3.110 — Fuzz三轮广覆盖：107章(单调性/前缀性/组合无残留/Unicode/数字极端/模板/存储一致性)+108章回归+notify fuzz(随机text/desp/params+maskKey/maskUrl)+got fuzz准备；抓到孤立代理URIError真实bug(encodeURIComponent崩→推送失败)双层修复(主代码tuisong输出+sendNotify入口清洗)；恢复R9/审查9-C语义；707全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -254,6 +254,13 @@ const Utils = {
         return cut;
     },
 
+    // 清洗孤立代理（v3.110 fuzz 发现）：encodeURIComponent 对孤立代理抛 URIError → 推送失败。
+    // 孤立高/低代理替换为 U+FFFD（完整代理对保留）；脏数据/截断 emoji 的真实防御
+    sanitizeSurrogates(s) {
+        try { s = String(s === undefined || s === null ? '' : s); } catch (e) { return ''; }
+        return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+    },
+
     /** 解码常见 HTML 实体 */
     decodeHtmlEntities(str) {
         if (str === undefined || str === null) return '';
@@ -404,7 +411,8 @@ const Formatter = {
                 return typeof val === 'object' ? JSON.stringify(val) : val;
             });
         }
-        return text;
+        // v3.110：输出统一清洗孤立代理（encodeURIComponent 会崩；所有模板路径受益）
+        return Utils.sanitizeSurrogates(text);
     },
 };
 
@@ -1281,15 +1289,18 @@ const App = {
                 const pushItem = {
                     ...item,
                     url: urlOf(item),
-                    title: Utils.truncateUtf16((typeof item.title === 'string' && item.title) ? item.title : '(无标题)', titleMax),
-                    content: Utils.truncateUtf16((typeof item.content === 'string') ? item.content : '', contentMax),
+                    // v3.110：孤立代理清洗（encodeURIComponent 对孤立代理抛 URIError → 推送失败）
+                    // R9/审查9-C 语义保留：非字符串或空串 title → (无标题) 占位；content 空串置空
+                    title: Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof item.title === 'string' && item.title !== '' ? item.title : '(无标题)'), titleMax),
+                    content: Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof item.content === 'string' ? item.content : ''), contentMax),
                 };
                 // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
                 // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
                 const text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, pushItem), titleMax);
                 // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
                 // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
-                const desp = Utils.truncateUtf16(Formatter.tuisong_replace(contentTpl, pushItem), contentMax);
+                // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
+                const desp = Utils.truncateUtf16(Utils.sanitizeSurrogates(Formatter.tuisong_replace(contentTpl, pushItem)), contentMax);
                 try {
                     await Pusher.send(text, desp);
                     pushedKeys.add(keyOf(item));

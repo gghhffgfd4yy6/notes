@@ -641,7 +641,16 @@ function tgNotify(text, desp) {
     });
 }
 
+// 孤立代理清洗（v3.110）：encodeURIComponent 对孤立代理抛 URIError——推送前统一处理
+function cleanSurrogates(s) {
+    try { s = String(s === undefined || s === null ? '' : s); } catch (e) { return ''; }
+    return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+}
+
 async function sendNotify(text, desp, params = {}) {
+    // v3.110：入口统一清洗孤立代理（encodeURIComponent 对孤立代理抛 URIError → 通道发送失败）
+    text = cleanSurrogates(text);
+    desp = cleanSurrogates(desp);
     // 通道配置检查：一个都没配 → 拒绝（避免"静默成功"让主流程以为推送完成并写缓存）
     // 注意：这里必须与下方 Promise.all 实际调用的通道一一对应，漏一个就会让已配置的通道静默失效
     const hasChannel = push_config.PUSH_PLUS_TOKEN || push_config.PUSH_KEY || push_config.BARK_PUSH ||

@@ -1269,6 +1269,22 @@ await test('集成 Fuzz: 随机数据流 + 随机配置 run() 不崩（v3.109）
     }
 });
 
+
+await test('Fuzz 回归: 孤立代理内容 run() 推送成功且无孤立代理（v3.110）', async () => {
+    reset();
+    setPushUrl('t53_surrogate');
+    fakeData = [makeItem({ id: 1, title: '标题\ud800', content_html: '<p>内容\udfff</p>', content: '正文\ud800' })];
+    const summary = await xbk.run();
+    assert(summary.pushed === 1, `应推送成功: ${JSON.stringify(summary)}`);
+    const isolatedRe = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    for (const c of pushCalls) {
+        assert(!isolatedRe.test(c.text), `text 无孤立代理: ${JSON.stringify(c.text)}`);
+        assert(!isolatedRe.test(c.desp), 'desp 无孤立代理');
+        try { encodeURIComponent(c.text); encodeURIComponent(c.desp); }
+        catch (e) { throw new Error('推送内容 encode 崩'); }
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 集成测试全部通过！${passed}/${passed}`);
 } else {

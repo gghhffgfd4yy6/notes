@@ -5499,6 +5499,185 @@ await test('Fuzz-深度: 8 层嵌套 + 1MB 字符串 + 1000 轮大扫描', () =>
     }
 });
 
+console.log('\n📂 107. 深度 Fuzz 三轮（广覆盖：单调性/前缀性/组合/极端/模板/存储一致性）');
+
+await test('Property-3: daysComputed 单调性（更早日期 → 天数不更小）', () => {
+    let seed = 112358;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const mkDate = () => {
+        const y = 2020 + Math.floor(rand() * 10);
+        const mo = 1 + Math.floor(rand() * 12);
+        const d = 1 + Math.floor(rand() * 28);
+        return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    };
+    for (let i = 0; i < 500; i++) {
+        const a = mkDate();
+        const b = mkDate();
+        const da = daysComputed(a);
+        const db = daysComputed(b);
+        assertEqual(da >= 0 && db >= 0, true, '天数非负');
+        // a 早于 b → a 的天数应 >= b 的天数
+        if (a < b) assertEqual(da >= db, true, `单调性: ${a}(${da}) vs ${b}(${db})`);
+        else if (a > b) assertEqual(da <= db, true, `单调性: ${a}(${da}) vs ${b}(${db})`);
+    }
+});
+
+await test('Property-3: truncateUtf16 前缀性（输出是输入前缀，允许代理对回退）', () => {
+    let seed = 131071;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    for (let i = 0; i < 500; i++) {
+        let s = '';
+        const len = Math.floor(rand() * 100);
+        for (let j = 0; j < len; j++) s += rand() < 0.4 ? '😀' : (rand() < 0.7 ? '中' : 'a');
+        const max = Math.floor(rand() * 80) + 1;
+        const out = truncateUtf16(s, max);
+        // 输出必须是输入的前缀（允许末尾代理对回退 1 位）
+        assertEqual(s.startsWith(out), true, `前缀性: "${s.slice(0, 20)}" → "${out.slice(0, 20)}"`);
+    }
+});
+
+await test('Property-3: decode+htmlToMarkdown 组合无实体残留（随机实体 HTML）', () => {
+    let seed = 161803;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    for (let i = 0; i < 500; i++) {
+        let html = '';
+        const len = Math.floor(rand() * 20);
+        for (let j = 0; j < len; j++) {
+            const parts = ['&amp;', '&lt;b&gt;', '&amp;amp;', '&#38;', '&nbsp;', '<p>', '</p>', '文本', '&quot;', '&amp;lt;'];
+            html += parts[Math.floor(rand() * parts.length)];
+        }
+        const md = htmlToMarkdown({ content_html: html, url: 'http://x.com/' + i });
+        // 输出不应含未解码实体（&amp; 等）
+        assertEqual(md.includes('&amp;'), false, `组合无 &amp; 残留: "${html.slice(0, 40)}" → "${md.slice(0, 40)}"`);
+    }
+});
+
+await test('Fuzz-极端: Unicode 边界（孤立代理/零宽/BOM/RTL/emoji 混合）', () => {
+    const cases = [
+        '\ud800', '\udfff', '\ud800\ud800', '\udfff\udfff',           // 孤立代理
+        '\u200b\u200c\u200d',                                           // 零宽
+        '\ufeff',                                                       // BOM
+        '\u202e\u202b',                                                 // RTL
+        '😀🎉💯🔍'.repeat(50),                                          // emoji 堆叠
+        '\u0000\u0001\u001f',                                           // 控制字符
+        '中\u0301\u0302文',                                             // 组合变音符号
+        'a'.repeat(10000) + '\ud800',                                   // 尾随孤立高代理
+        '&'.repeat(5000) + '\udfff',                                    // 实体+孤立代理
+        '\uD83D\uDE00' + 'x'.repeat(1000),                              // 代理对+长串
+    ];
+    for (const c of cases) {
+        assertEqual(typeof decodeHtmlEntities(c), 'string', 'decode 极端 Unicode');
+        assertEqual(typeof normUrl(c), 'string', 'normUrl 极端 Unicode');
+        const out = truncateUtf16(c, 100);
+        assertEqual(out.length <= 100, true, 'truncate 极端 Unicode 长度');
+        assertEqual(typeof htmlToMarkdown({ content_html: c, url: 'x' }), 'string', 'htmlToMarkdown 极端 Unicode');
+        assertEqual(typeof tuisong_replace('{标题}|{内容}', { title: c, content: c }), 'string', 'tuisong 极端 Unicode');
+    }
+});
+
+await test('Fuzz-极端: 数字边界（-0/1e-323/MAX_VALUE/负数/1n）', () => {
+    const nums = [-0, 1e-323, Number.MAX_VALUE, Number.MIN_VALUE, -1e12, -123.456, 1n, -1n, 0.0000001, 999999999999999];
+    for (const n of nums) {
+        assertEqual(typeof daysComputed(n), 'number', `daysComputed(${n})`);
+        assertEqual(typeof anonKey(n, 't'), 'string', `anonKey(${n})`);
+        assertEqual(typeof normUrl(n), 'string', `normUrl(${n})`);
+        assertEqual(typeof truncateUtf16(n, 10), 'string', `truncateUtf16(${n})`);
+        assertEqual(typeof decodeHtmlEntities(n), 'string', `decodeHtmlEntities(${n})`);
+        assertEqual(typeof hasValidId({ id: n }), 'boolean', `hasValidId({id:${n}})`);
+    }
+});
+
+await test('Fuzz-模板: 随机模板（占位符组合）tuisong_replace 不崩且已知占位符被替换', () => {
+    let seed = 271828;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const placeholders = ['{分类名}', '{分类ID}', '{标题}', '{链接}', '{日期}', '{时间}', '{楼主}', '{类目}', '{价格}', '{商城}', '{品牌}', '{图片}', '{Html内容}', '{Markdown内容}', '{不存在}', '{{标题}}', '{标题', '标题}'];
+    const data = {
+        catename: '测试分类', cateid: 42, title: '测试标题', url: '/t/1.html',
+        datetime: '2026-08-01', shorttime: '22:00', louzhu: '楼主A',
+        price: '9.9', mall_name: '京东', brand: '品牌', pic: 'http://img/1.jpg',
+        content_html: '<b>内容</b>', content: '纯文本',
+    };
+    for (let i = 0; i < 500; i++) {
+        let tpl = '';
+        const len = Math.floor(rand() * 8) + 1;
+        for (let j = 0; j < len; j++) {
+            tpl += placeholders[Math.floor(rand() * placeholders.length)];
+            if (rand() < 0.5) tpl += '|';
+        }
+        // 强制追加未知占位符——保证"未知保留"断言对每个模板都有效
+        const withUnknown = tpl + '{不存在}';
+        const out = tuisong_replace(withUnknown, data);
+        assertEqual(typeof out, 'string', `模板输出应为字符串: "${withUnknown}"`);
+        // 已知占位符（标准格式 {X}）应被替换
+        for (const ph of ['{分类名}', '{标题}', '{链接}', '{日期}', '{楼主}', '{类目}']) {
+            if (out.includes(ph)) {
+                throw new Error(`已知占位符 ${ph} 应被替换: 模板="${withUnknown}" 输出="${out.slice(0, 80)}"`);
+            }
+        }
+        // 未知占位符 {不存在} 必须保留（tuisong_replace 只替换已知占位符）
+        assertEqual(out.includes('{不存在}'), true, `未知占位符保留: "${withUnknown}"`);
+    }
+});
+
+await test('Fuzz-存储: MessageStore 跨操作一致性（save→read→has 闭环）', () => {
+    let seed = 3141592;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const file = 'test_107_store.json';
+    const fp = getFilePath(file);
+    try { require('fs').unlinkSync(fp); } catch (e) { /* 忽略 */ }
+    try {
+        // 随机写入 50 条（含重复 id）
+        const msgs = [];
+        for (let i = 0; i < 50; i++) {
+            msgs.push({ id: Math.floor(rand() * 30), title: 'T' + i, url: '/u/' + Math.floor(rand() * 30) + '.html' });
+        }
+        saveBatch(msgs, file);
+        // 读回：数量 ≤ 50（去重）
+        const read = readMessages(fp);
+        assertEqual(Array.isArray(read), true, '读回应为数组');
+        // 每条读回的对象都有 id 或 url
+        for (const m of read) {
+            assertEqual(m && typeof m === 'object', true, '读回元素应为对象');
+            assertEqual(m.id !== undefined || m.url !== undefined, true, '元素应有 id 或 url');
+        }
+        // 随机查询一致性：查询存在的 id → has 应为 true（注意 has(message, filename) 参数顺序）
+        const some = read[Math.floor(rand() * read.length)];
+        if (some && some.id !== undefined) {
+            if (!isMessageInFile({ id: some.id, title: 'x' }, file)) {
+                throw new Error(`已存 id ${some.id} 应查到（title="${some.title}" url="${some.url}"）`);
+            }
+        }
+        // 查询不存在的 id → false（has(message, filename) 参数顺序）
+        assertEqual(isMessageInFile({ id: 99999, title: 'n' }, file), false, '不存在的 id 查不到');
+    } finally {
+        try { require('fs').unlinkSync(fp); } catch (e) { /* 忽略 */ }
+    }
+});
+
+console.log('\n📂 108. Fuzz 回归二（孤立代理清洗）');
+
+await test('Fuzz 回归: 孤立代理 → tuisong_replace 输出 U+FFFD 且 encode 不崩（v3.110）', () => {
+    const cases = ['a\ud800b', 'a\udfff b', '😀\ud800', '\udfff😀', '正常文本😀🎉', '&amp;\ud800&lt;'];
+    const isolatedRe = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    for (const c of cases) {
+        const out = tuisong_replace('{内容}', { title: 't', content: c });
+        assertEqual(isolatedRe.test(out), false, `输出无孤立代理: ${JSON.stringify(c)} → ${JSON.stringify(out)}`);
+        try { encodeURIComponent(out); }
+        catch (e) { throw new Error(`encodeURIComponent 崩: ${JSON.stringify(c)} → ${JSON.stringify(out)}`); }
+        if (c.includes('😀')) assertEqual(out.includes('😀'), true, '完整代理对应保留');
+    }
+    // 完整代理对不受影响
+    const emoji = tuisong_replace('{内容}', { title: 't', content: '完整😀🎉对' });
+    assertEqual(emoji, '完整😀🎉对', '正常 emoji 原样');
+});
+
+await test('Fuzz 回归: sanitize 与 truncate 组合（孤立代理+截断边界）', () => {
+    const s = '标题\ud800' + '😀'.repeat(50) + '\udfff尾部';
+    const out = tuisong_replace('{标题}', { title: s, content: 'c' });
+    assertEqual(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(out), false, '组合输出无孤立代理');
+    assertEqual(out.includes('😀'), true, '完整代理对保留');
+});
+
 if (failed === 0) {
     console.log(`  🎉 全部通过！${passed}/${passed}  100%`);
 } else {

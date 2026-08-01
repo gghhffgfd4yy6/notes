@@ -399,6 +399,71 @@ await test('Bark: 归档/分组/声音/级别/图标/URL 参数传递', () => wi
 for (const k of CHANNEL_KEYS) cfg[k] = saved[k];
 
 console.log('\n========================================');
+
+await test('Fuzz-推送: 随机 text/desp/params → sendNotify 不崩且日志无密钥', () => withChannels(async () => {
+    cfg.PUSH_KEY = 'SCT_SECRET_FUZZ';
+    cfg.BARK_PUSH = 'https://api.day.app/BARK_SECRET_FUZZ';
+    let seed = 20261101;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const randText = () => {
+        const chars = 'abcXYZ0123 *_[].()&#\n\t😀中\u00e9\u00a9|';
+        let s = '';
+        const len = Math.floor(rand() * 300);
+        for (let i = 0; i < len; i++) s += chars[Math.floor(rand() * chars.length)];
+        return s;
+    };
+    const randParams = () => {
+        const keys = ['ARCHIVE', 'GROUP', 'SOUND', 'ICON', 'LEVEL', 'URL'];
+        const p = {};
+        for (const k of keys) {
+            if (rand() < 0.5) p['BARK_' + k] = randText().slice(0, 50);
+        }
+        return p;
+    };
+    const origLog = console.log;
+    const captured = [];
+    console.log = (...args) => captured.push(args.join(' '));
+    try {
+        for (let i = 0; i < 30; i++) {
+            captured.length = 0;
+            await notify.sendNotify(randText(), randText(), randParams());
+            const all = captured.join('\n');
+            assert(!all.includes('SCT_SECRET_FUZZ'), 'Server酱密钥不应泄露');
+            assert(!all.includes('BARK_SECRET_FUZZ'), 'Bark 密钥不应泄露');
+        }
+    } finally {
+        console.log = origLog;
+    }
+}));
+
+await test('Fuzz-推送: maskKey/maskUrl 随机输入不崩', () => {
+    const { maskKey, maskUrl } = notify;
+    let seed = 777777;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const randVal = () => {
+        const r = rand();
+        if (r < 0.1) return null;
+        if (r < 0.2) return undefined;
+        if (r < 0.3) return 12345;
+        if (r < 0.4) return Symbol('s');
+        if (r < 0.5) return { a: 1 };
+        const chars = 'abcXYZ09 /?#:=&.😀中';
+        let s = '';
+        const len = Math.floor(rand() * 200);
+        for (let i = 0; i < len; i++) s += chars[Math.floor(rand() * chars.length)];
+        return s;
+    };
+    for (let i = 0; i < 300; i++) {
+        const v = randVal();
+        assert(typeof maskKey(v) === 'string', 'maskKey 应返回字符串');
+        assert(typeof maskUrl(v) === 'string', 'maskUrl 应返回字符串');
+        // 脱敏结果不应含完整输入（当输入是长字符串时）
+        if (typeof v === 'string' && v.length > 10) {
+            assert(!maskKey(v).includes(v), 'maskKey 不应含完整密钥');
+        }
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 通道测试通过 ${passed}/${passed}`);
 } else {
