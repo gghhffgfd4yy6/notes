@@ -17,6 +17,17 @@ function maskUrl(u) {
     const m = s.match(/^(https?:\/\/[^/]+)\/(.+)$/);
     return m ? m[1] + '/' + maskKey(m[2]) : maskKey(s);
 }
+// 错误摘要（v3.75）：失败日志统一打摘要而非整个 err 对象——
+// $.post 回调的 err 是 err.response.body（API 异常响应体，可能回显请求参数含密钥），
+// 直接 console.log(err) 会在 cron 日志重定向/分享时泄露；截断 200 字符防超长刷屏
+function safeErr(e) {
+    if (e === undefined || e === null) return '';
+    if (typeof e === 'string') return e.length > 200 ? e.slice(0, 200) + '…' : e;
+    if (e && e.message) return String(e.message).slice(0, 200);
+    let s;
+    try { s = JSON.stringify(e); } catch (err) { s = String(e); }
+    return s ? (s.length > 200 ? s.slice(0, 200) + '…' : s) : String(e);
+}
 
 const push_config = {
     // 以下真实密钥由 push_config.local.js 提供（已被 .gitignore 忽略，不入库）
@@ -143,7 +154,9 @@ const $ = {
                 callback(null, res, body);
             },
             (err) => {
-                callback(err?.response?.body || err);
+                // v3.75：失败时传 Error 对象而非响应体——API 异常响应体可能回显请求参数（含密钥），
+                // 且各通道失败日志已统一 safeErr 摘要（打 message 不含响应内容）
+                callback(err || new Error('请求失败'));
             },
         );
     },
@@ -160,7 +173,9 @@ const $ = {
                 callback(null, res, body);
             },
             (err) => {
-                callback(err?.response?.body || err);
+                // v3.75：失败时传 Error 对象而非响应体——API 异常响应体可能回显请求参数（含密钥），
+                // 且各通道失败日志已统一 safeErr 摘要（打 message 不含响应内容）
+                callback(err || new Error('请求失败'));
             },
         );
     },
@@ -192,7 +207,7 @@ function pushPlusNotify(text, desp) {
                         console.log(
                             `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                             }通知消息失败😞\n`,
-                            err,
+                            safeErr(err),
                         );
                     } else {
                         if (data.code === 200) {
@@ -238,7 +253,7 @@ function serverNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
-                        console.log('Server 酱发送通知调用API失败😞\n', err);
+                        console.log('Server 酱发送通知调用API失败😞\n', safeErr(err));
                     } else {
                         // server酱和Server酱·Turbo版的返回json格式不太一样
                         // 响应防御：Server酱/Turbo 返回结构不同，且异常时可能缺字段
@@ -417,7 +432,7 @@ function qywxBotNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
-                        console.log('企业微信发送通知消息失败😞\n', err);
+                        console.log('企业微信发送通知消息失败😞\n', safeErr(err));
                     } else {
                         if (data.errcode === 0) {
                             console.log('企业微信发送通知消息成功🎉。\n');
@@ -545,7 +560,7 @@ function pushDeerNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
-                        console.log('PushDeer 通知调用API失败😞\n', err);
+                        console.log('PushDeer 通知调用API失败😞\n', safeErr(err));
                     } else {
                         // 通过返回的result的长度来判断是否成功（响应防御：异常时可能缺 content/result 字段）
                         if (
@@ -594,7 +609,7 @@ function tgNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
-                        console.log('Telegram 发送通知消息失败😞\n', err);
+                        console.log('Telegram 发送通知消息失败😞\n', safeErr(err));
                     } else {
                         if (data && data.ok === true) {
                             console.log('Telegram 发送通知消息成功🎉\n');

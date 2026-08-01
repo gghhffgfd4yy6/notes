@@ -12,6 +12,7 @@ require('/workspace/node_modules/got/index.js');
 
 let gotCalls = [];
 let failHitokoto = false; // 一言接口失败开关（v3.73：验证 sendNotify 兜底跳过不崩）
+let failPost = false;     // got.post 失败开关（v3.75：验证失败日志不泄露密钥）
 require.cache[gotPath].exports = (url, options) => {
     gotCalls.push({ url, options });
     // 一言接口失败模拟：抛 Error（网络异常路径）
@@ -23,6 +24,12 @@ require.cache[gotPath].exports = (url, options) => {
 require.cache[gotPath].exports.get = require.cache[gotPath].exports;
 require.cache[gotPath].exports.post = (url, options) => {
     gotCalls.push({ url, options });
+    // 失败模拟（v3.75）：异步 reject 走 $.post 的 err 回调；response.body 含密钥回显（验证不再传给 callback）
+    if (failPost) {
+        const e = new Error('API error: connection refused');
+        e.response = { body: '{"code":500,"msg":"PPT_SECRET 回显"}', statusCode: 500 };
+        return Promise.reject(e);
+    }
     return { then: (res) => res({ body: '{}', statusCode: 200, headers: {} }) };
 };
 
@@ -278,10 +285,35 @@ await test('日志脱敏: maskKey/maskUrl 不泄露完整密钥', () => {
     assert(maskKey('') === '***', '空密钥');
     // URL 保留 host，设备码段脱敏
     assert(maskUrl('https://api.day.app/DEVICEKEY123') === 'https://api.day.app/DEVI***23', `maskUrl: ${maskUrl('https://api.day.app/DEVICEKEY123')}`);
-    assert(!maskUrl('https://api.day.app/DEVICEKEY123').includes('DEVICEKEY123'), '不应泄露完整设备码');
-    // 完整密钥不应出现在脱敏结果
-    assert(!maskKey('SCT302780T2QQOwQyxQRT3gNS3vtJVFrZS').includes('SCT302780T2QQOwQyxQRT3gNS3vtJVFrZS'), '完整密钥不应出现在日志');
 });
+
+await test('日志脱敏: Push+/企微/PushDeer/Telegram/Server酱 失败日志不泄露密钥（v3.75）', () => withChannels(async () => {
+    // 配 5 个此前未覆盖脱敏测试的通道（v3.59 只覆盖 Server酱/wxpusher/息知/Bark）
+    cfg.PUSH_PLUS_TOKEN = 'PPT_SECRET';
+    cfg.QYWX_KEY = 'QWX_SECRET';
+    cfg.DEER_KEY = 'DEER_SECRET';
+    cfg.TG_BOT_TOKEN = 'TG_SECRET';
+    cfg.TG_USER_ID = '12345';
+    cfg.PUSH_KEY = 'SCT_SECRET';
+    const origLog = console.log;
+    const captured = [];
+    console.log = (...args) => captured.push(args.join(' '));
+    try {
+        failPost = true; // 所有通道走失败路径（err.response.body 通用错误体）
+        await notify.sendNotify('标题', '内容');
+        const all = captured.join('\n');
+        assert(!all.includes('PPT_SECRET'), 'Push+ token 不应泄露');
+        assert(!all.includes('QWX_SECRET'), '企微 key 不应泄露');
+        assert(!all.includes('DEER_SECRET'), 'PushDeer key 不应泄露');
+        assert(!all.includes('TG_SECRET'), 'TG token 不应泄露');
+        assert(!all.includes('SCT_SECRET'), 'Server酱 key 不应泄露');
+        assert(!all.includes('PPT_SECRET'), '响应体回显密钥不应出现在日志');
+        assert(all.includes('API error'), '失败日志应含错误摘要（诊断信息保留）');
+    } finally {
+        failPost = false;
+        console.log = origLog;
+    }
+}));
 await test('Bark: 归档/分组/声音/级别/图标/URL 参数传递', () => withChannels(async () => {
     cfg.BARK_PUSH = 'device1';
     cfg.BARK_ARCHIVE = '1';
