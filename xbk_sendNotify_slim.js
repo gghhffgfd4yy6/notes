@@ -627,7 +627,7 @@ async function sendNotify(text, desp, params = {}) {
     if (push_config.HITOKOTO !== 'false') {
         if (typeof one === 'function') {
             try { desp += '\n\n' + (await one()); }
-            catch (e) { console.log('一言获取失败，跳过:', e.message); }
+            catch (e) { console.log('一言获取失败，跳过:', e && e.message ? e.message : String(e)); }
         }
     }
     await Promise.all([

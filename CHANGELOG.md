@@ -1,5 +1,26 @@
 # 📋 更新日志
 
+## v3.73（domain 配置校验 + 推送模块日志兜底）
+> 2026-08-01
+
+### 🔧 domain 配置层校验
+
+- **背景**：非法 `Config.domain`（拼错/非 http 开头）要等 fetchData 重试耗尽才报错，配置错误难定位
+- **新增**：App.run 启动校验——domain 非 `http(s)://` 开头 → 启动即警告（与 v3.64 运行时数值校验同款精神）
+- test_app t45 扩展：非法 domain 断言警告
+
+### 🔧 推送模块一言失败日志兜底
+
+- `sendNotify` 的一言 catch 曾直接 `e.message`——非 Error 抛出（字符串等）时显示 undefined；改为 `e && e.message ? e.message : String(e)`（与主代码 v3.31 兜底口径一致）
+
+### 🧹 .git.corrupt_backup 归档
+
+- `git fsck` 确认仓库健康后，将损坏仓库备份 `mv` 至 `/tmp/.git.corrupt_backup_archived`（可逆移动，非删除；红线：先验证再动备份）
+
+### 🧪 测试数
+
+**642 个全绿（单元 569 + 集成 57 + 通道 16）**
+
 ## v3.72（密钥配置示例模板）
 > 2026-08-01
 

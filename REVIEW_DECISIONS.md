@@ -175,6 +175,7 @@
   2. 回滚/清理验证的正确方式：`git stash` / `git checkout` / 工作区层面演练，**不触碰 `.git` 内部**
   3. 涉及 `.git` 的任何删除操作前，先 `git fsck` + `git cat-file` 确认对象被引用
 - **后续影响**：git 历史从 166 条变为 1 条基线；内容完整可继续开发
+- **备份归档**：损坏仓库备份 `.git.corrupt_backup/` 于 v3.72 后经 `git fsck` 确认健康后 `mv` 至 `/tmp/.git.corrupt_backup_archived`（可逆移动，非删除）
 
 ---
 
@@ -209,6 +210,7 @@
 - **v3.70**：text 推送标题兜底截断（分类名+标题拼接超 titleMax 的漏网，与 desp 同口径）
 - **v3.71**：工程化收尾（package.json + README 首次引入）；变异测试验证（7 变异零盲区）；101 章扩展 package.json 版本三方一致
 - **v3.72**：push_config.local.js.example 密钥配置示例模板（新用户配置入口）
+- **v3.73**：domain 配置层校验；推送模块一言日志非 Error 兜底；.git.corrupt_backup 归档 /tmp（fsck 确认后 mv）
 
 ## 七、行为变更记录（语义调整）
 

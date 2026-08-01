@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.72 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 ********
+//******** 线报酷推送脚本 v3.73 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1074,6 +1074,11 @@ const App = {
             // 校验缓存 maxSize（#7）：函数层已回退默认，配置层补提示（validateConfig 只接收 filter，此处兜底完整 Config）
             if (!Number.isInteger(Config.cache.maxSize) || Config.cache.maxSize <= 0) {
                 console.warn(`⚠️ 配置「cache.maxSize」为「${Config.cache.maxSize}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`);
+            }
+
+            // 域名校验（v3.73）：非法 URL 会让 fetchData 重试耗尽才报错，配置层提前提示
+            if (typeof Config.domain !== 'string' || !/^https?:\/\//.test(Config.domain)) {
+                console.warn(`⚠️ 配置「domain」为「${Config.domain}」不是 http(s):// 开头的合法地址`);
             }
 
             // 运行时数值配置校验（函数层已有防御，配置层补提示——#7 同款精神，v3.64）
