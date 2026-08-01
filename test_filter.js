@@ -4738,6 +4738,37 @@ await test('边界: 编码大小写/超范围行为锁定', () => {
     assertEqual(decodeHtmlEntities('&#0;'), '', 'NUL过滤');
 });
 
+console.log('\n📂 100. 审查项 #56/#65/#7');
+
+await test('#56: img 空 src / 纯空白 src → 不生成 ![]() 空图片', () => {
+    const r1 = htmlToMarkdown({ content_html: '<img src="">', url: 'http://x' });
+    assertEqual(r1.includes('![]('), false, '空 src 不应生成空图片');
+    const r2 = htmlToMarkdown({ content_html: '<img src="   ">', url: 'http://x' });
+    assertEqual(r2.includes('![]('), false, '纯空白 src 不应生成空图片');
+    const r3 = htmlToMarkdown({ content_html: '<img src="http://p.jpg" alt="图">', url: 'http://x' });
+    assertEqual(r3.includes('![图](http://p.jpg)'), true, '正常 src 仍转换');
+    const r4 = htmlToMarkdown({ content_html: '<img src=" http://p.jpg ">', url: 'http://x' });
+    assertEqual(r4.includes('![](http://p.jpg)'), true, 'src 首尾空白 trim 后使用');
+});
+
+await test('#65: url 含换行 → 链接文本与目标均剥离换行不破坏', () => {
+    const r = htmlToMarkdown({ content_html: '内容', url: 'http://x.com/a\nb' });
+    assertEqual(r.includes('原文链接：[http://x.com/ab](http://x.com/ab)'), true, '链接完整且无换行（剥离后不再触发<>包裹）');
+    assertEqual(r.includes('\n\n原文链接'), true, '模板分隔正常');
+    const r2 = htmlToMarkdown({ content_html: '内容', url: 'http://x.com/a\r\nb' });
+    assertEqual(r2.includes('http://x.com/ab'), true, 'CRLF 换行也被剥离');
+    const r3 = htmlToMarkdown({ content_html: '内容', url: 'http://x.com/正常' });
+    assertEqual(r3.includes('原文链接：[http://x.com/正常](http://x.com/正常)'), true, '无换行 url 不受影响');
+});
+
+await test('#7: validateConfig maxSize 非正整数 → 警告；合法 → 不警告', () => {
+    assertEqual(validateConfig({ cache: { maxSize: -1 } }).some(w => w.includes('cache.maxSize')), true, '负数警告');
+    assertEqual(validateConfig({ maxSize: 0 }).some(w => w.includes('cache.maxSize')), true, '0 警告（平铺形态）');
+    assertEqual(validateConfig({ maxSize: 2.5 }).some(w => w.includes('cache.maxSize')), true, '小数警告');
+    assertEqual(validateConfig({ cache: { maxSize: 'abc' } }).some(w => w.includes('cache.maxSize')), true, '非数字警告');
+    assertEqual(validateConfig({ cache: { maxSize: 100 } }).length, 0, '正整数不警告');
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {

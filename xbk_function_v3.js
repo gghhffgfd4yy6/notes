@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.62 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 ********
+//******** 线报酷推送脚本 v3.63 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -247,12 +247,14 @@ const Formatter = {
         shuju = shuju || {};
         let html = (typeof shuju.content_html === 'string') ? shuju.content_html
             : (shuju.content_html === undefined || shuju.content_html === null ? '' : ''); // 非字符串内容视为空（避免 [object Object]）
+        // url 文本与链接目标统一：非字符串转字符串、剥离换行（Markdown 链接文本/目标内的裸换行都会破坏链接，#65）
+        const urlText = shuju.url === undefined || shuju.url === null ? '' : String(shuju.url).replace(/[\r\n]+/g, '');
         // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）
-        const mdUrl = shuju.url && /[\s()\[\]]/.test(shuju.url) ? `<${shuju.url}>` : shuju.url;
+        const mdUrl = urlText && /[\s()\[\]]/.test(urlText) ? `<${urlText}>` : urlText;
         // 无标签内容短路：跳过整个替换链（性能优化）
         if (!html.includes('<')) {
             html = Utils.decodeHtmlEntities(html);
-            return this._finalizeMd(mdUrl ? html + `\n\n原文链接：[${shuju.url}](${mdUrl})` : html);
+            return this._finalizeMd(mdUrl ? html + `\n\n原文链接：[${urlText}](${mdUrl})` : html);
         }
         html = html
             .replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_, lv, c) => '#'.repeat(lv) + ' ' + c + '\n\n')
@@ -264,8 +266,10 @@ const Formatter = {
             .replace(/<img\b[^>]*>/gi, (tag) => {
                 const srcM = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
                 if (!srcM) return tag; // 无 src 不转换
+                const src = srcM[1].trim();
+                if (!src) return tag; // 空 src（含纯空白）不生成 ![]() 空图片（#56）
                 const altM = tag.match(/\balt\s*=\s*["']([^"']*)["']/i);
-                return `\n\n![${altM ? altM[1] : ''}](${srcM[1]})\n\n`;
+                return `\n\n![${altM ? altM[1] : ''}](${src})\n\n`;
             })
             .replace(/<br\s*\/?>|<\/br>\s*/gi, '\n\n')
             .replace(/<\/?p[^>]*>/gi, '\n\n')
@@ -287,7 +291,7 @@ const Formatter = {
             .replace(/\n{3,}/g, '\n\n');
         // 先移除 HTML 标签，再解码实体
         html = Utils.decodeHtmlEntities(html);
-        let result = html + (mdUrl ? `\n\n原文链接：[${shuju.url}](${mdUrl})` : '');
+        let result = html + (mdUrl ? `\n\n原文链接：[${urlText}](${mdUrl})` : '');
         // 模板拼接后再次合并连续换行（内容尾部 \n\n + 模板 \n\n 会拼出 3+ 连换行）
         return this._finalizeMd(result);
     },
@@ -657,6 +661,12 @@ const RuleEngine = {
                     warnings.push(`⚠️ 配置「pingbitime」的值「${cfg.pingbitime}」是小数，已按整数处理（建议使用整数天数）`);
                 }
             }
+        }
+        // 校验 cache.maxSize（#7）：MessageStore 函数层已回退默认，配置层补提示。
+        // 兼容传入完整 Config（cfg.cache.maxSize）或平铺（cfg.maxSize）两种形态
+        const maxSizeVal = cfg.cache ? cfg.cache.maxSize : cfg.maxSize;
+        if (maxSizeVal !== undefined && (!Number.isInteger(maxSizeVal) || maxSizeVal <= 0)) {
+            warnings.push(`⚠️ 配置「cache.maxSize」为「${maxSizeVal}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`);
         }
         return [...new Set(warnings)];
     },
@@ -1034,6 +1044,11 @@ const App = {
             // ① 校验配置
             const warnings = RuleEngine.validateConfig(Config.filter);
             for (const w of warnings) console.warn(w);
+
+            // 校验缓存 maxSize（#7）：函数层已回退默认，配置层补提示（validateConfig 只接收 filter，此处兜底完整 Config）
+            if (!Number.isInteger(Config.cache.maxSize) || Config.cache.maxSize <= 0) {
+                console.warn(`⚠️ 配置「cache.maxSize」为「${Config.cache.maxSize}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`);
+            }
 
             // ② 预编译规则（只执行一次）
             const compiledRules = RuleEngine.compileRules(Config.filter);
