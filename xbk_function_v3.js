@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.104 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 + 配置防御 + CLI兜底 + UA版本化 + 实体扩展 + 并行组合测试 + href换行剥离 + 一言防御 + runlog耗时 + 文档同步 + md链路锁定 + 测试隔离 + readme同步 + index同步 + domain斜杠防御 + 配置矩阵 + 目录同步 + 默认值契约 + 记录同步 + example补全 + 里程碑 + 状态同步 + readme最终同步 + index行数同步 + 真机验证清单 ********
+//******** 线报酷推送脚本 v3.105 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 + 标题兜底截断 + 工程化 + 密钥示例 + domain校验 + 链接占位符安全 + 推送模块密钥泄露修复 + 失败日志统一 + got加固 + 版本四方一致 + 配置防御 + CLI兜底 + UA版本化 + 实体扩展 + 并行组合测试 + href换行剥离 + 一言防御 + runlog耗时 + 文档同步 + md链路锁定 + 测试隔离 + readme同步 + index同步 + domain斜杠防御 + 配置矩阵 + 目录同步 + 默认值契约 + 记录同步 + example补全 + 里程碑 + 状态同步 + readme最终同步 + index行数同步 + 真机验证清单 + 递归解码 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -243,10 +243,17 @@ const Utils = {
         if (str === undefined || str === null) return '';
         str = String(str);
         if (!str) return str;
-        return str
-            .replace(ENTITY_RE, m => ENTITY_MAP[m] || m)
-            .replace(DEC_RE, (_, code) => this._decodeNumeric(Number(code), `&#${code};`))
-            .replace(HEX_RE, (_, hex) => this._decodeNumeric(parseInt(hex, 16), `&#x${hex};`));
+        // 递归解码（v3.105）：真实接口存在双重转义（&amp;amp; → &amp; → &，真机验证发现 2/20 条），
+        // 单轮解码会残留 &amp; 破坏 URL 参数（链接 key 参数错乱）；最多 3 轮防死循环，收敛即停
+        for (let i = 0; i < 3; i++) {
+            const next = str
+                .replace(ENTITY_RE, m => ENTITY_MAP[m] || m)
+                .replace(DEC_RE, (_, code) => this._decodeNumeric(Number(code), `&#${code};`))
+                .replace(HEX_RE, (_, hex) => this._decodeNumeric(parseInt(hex, 16), `&#x${hex};`));
+            if (next === str) break;
+            str = next;
+        }
+        return str;
     },
 };
 

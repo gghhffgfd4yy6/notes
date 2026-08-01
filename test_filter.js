@@ -4859,6 +4859,16 @@ await test('实体扩展: ensp/emsp/cent/curren/箭头（v3.83）', () => {
     assertEqual(decodeHtmlEntities('&ensp;'), ' ', '单独 ensp');
 });
 
+await test('实体递归解码: 双重转义 &amp;amp; → &（v3.105 真机验证发现）', () => {
+    assertEqual(decodeHtmlEntities('&amp;amp;'), '&', '双重转义应完全解码');
+    assertEqual(decodeHtmlEntities('a=1&amp;amp;b=2'), 'a=1&b=2', 'URL 参数双重转义');
+    assertEqual(decodeHtmlEntities('&amp;amp;lt;'), '<', '三重转义收敛');
+    assertEqual(decodeHtmlEntities('&amp;'), '&', '单重转义');
+    assertEqual(decodeHtmlEntities('&lt;b&gt;'), '<b>', '普通实体一轮收敛不误伤');
+    assertEqual(decodeHtmlEntities('&#38;amp;'), '&', '数字实体双重转义');
+    assertEqual(decodeHtmlEntities('文本&nbsp;空格'), '文本 空格', '正常内容不受影响');
+});
+
 await test('防御: domain 尾斜杠 → pushUrl 无双斜杠（v3.94）', () => {
     const orig = Config.domain;
     try {
