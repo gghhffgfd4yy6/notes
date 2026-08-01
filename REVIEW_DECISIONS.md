@@ -202,7 +202,7 @@
 - **#22 日期无时区参数（本地时区漂移）**——不修：部署环境通常固定时区，引入时区配置需贯穿 daysComputed/tuisong_replace/parseTime 全链路，复杂度高；cron 场景可自行 TZ 环境变量控制
 - **#15/#16 布尔/数组时间输入静默转 0**——不修：parseTime 已统一为 null 判无效（不崩溃、不留误导日期）；daysComputed 高频调用，对脏数据告警会产生噪音且无实际收益
 
-## 六、自主进化记录（v3.62~v3.65）
+## 六、自主进化记录（v3.62~v3.97）
 
 - **v3.62**：#26 日期解析统一——daysComputed/tuisong_replace 共用 Utils.parseTime 单例（消除重复逻辑；数字类型含 -1 统一判无效，修掉 new Date('-1')→2001 怪异行为）
 - **v3.63**：#56 img 空 src 不生成 ![]() 空图片；#65 url 换行剥离保护 Markdown 链接；#7 maxSize 配置层双保险校验
@@ -240,6 +240,7 @@
 - **v3.95**：配置矩阵防御测试（t51，全部非法值并行模式不崩）
 - **v3.96**：README 目录结构同步；example 补 TG_PROXY 说明
 - **v3.97**：template/push 新配置默认值契约测试；TG parse_mode 决策记录（待真机验证）
+- **v3.98**：REVIEW_DECISIONS 自主进化记录标题同步（v3.62~v3.97）
 
 ## 七、行为变更记录（语义调整）
 
