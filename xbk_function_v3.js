@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.63 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 ********
+//******** 线报酷推送脚本 v3.64 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1048,6 +1048,18 @@ const App = {
             // 校验缓存 maxSize（#7）：函数层已回退默认，配置层补提示（validateConfig 只接收 filter，此处兜底完整 Config）
             if (!Number.isInteger(Config.cache.maxSize) || Config.cache.maxSize <= 0) {
                 console.warn(`⚠️ 配置「cache.maxSize」为「${Config.cache.maxSize}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`);
+            }
+
+            // 运行时数值配置校验（函数层已有防御，配置层补提示——#7 同款精神，v3.64）
+            const numConfig = [
+                ['api.timeout', Config.api.timeout, (v) => Number.isFinite(v) && v > 0],
+                ['api.retry', Config.api.retry, (v) => Number.isInteger(v) && v >= 0],
+                ['timing.pushInterval', Config.timing.pushInterval, (v) => Number.isFinite(v) && v >= 0],
+                ['timing.finalWait', Config.timing.finalWait, (v) => Number.isFinite(v) && v >= 0],
+                ['push.parallelLimit', Config.push.parallelLimit, (v) => Number.isFinite(v) && v >= 0],
+            ];
+            for (const [name, val, ok] of numConfig) {
+                if (!ok(val)) console.warn(`⚠️ 配置「${name}」为「${val}」不是有效值，已按内部防御逻辑处理（建议修正）`);
             }
 
             // ② 预编译规则（只执行一次）

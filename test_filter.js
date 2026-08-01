@@ -4769,6 +4769,20 @@ await test('#7: validateConfig maxSize 非正整数 → 警告；合法 → 不�
     assertEqual(validateConfig({ cache: { maxSize: 100 } }).length, 0, '正整数不警告');
 });
 
+console.log('\n📂 101. 版本一致性（防文件头版本号过时——v3.35 曾出现「v3.8 当前最新」过时误导）');
+
+await test('版本一致性：文件头版本号与 CHANGELOG 顶部一致', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const main = fs.readFileSync(path.join(__dirname, 'xbk_function_v3.js'), 'utf8');
+    const changelog = fs.readFileSync(path.join(__dirname, 'CHANGELOG.md'), 'utf8');
+    const m = main.match(/v(\d+\.\d+)/);
+    const c = changelog.match(/^## v(\d+\.\d+)/m);
+    assertEqual(!!m, true, '主代码文件头应有版本号');
+    assertEqual(!!c, true, 'CHANGELOG 顶部应有版本号');
+    assertEqual(m[1], c[1], `文件头版本号(${m[1]})应与 CHANGELOG 顶部(${c[1]})一致`);
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {

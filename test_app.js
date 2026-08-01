@@ -869,6 +869,49 @@ await test('协议相对 // 开头 URL 不拼前缀（urlOf）', async () => {
     assert(!pushCalls[0].desp.includes('new.ixbk.net//'), '不应拼坏');
 });
 
+await test('运行时配置校验：非法数值配置警告、合法不警告（v3.64）', async () => {
+    reset();
+    setPushUrl('t45_cfgcheck');
+    fakeData = [makeItem({ id: 1 })];
+    const orig = {
+        timeout: Config.api.timeout, retry: Config.api.retry,
+        pushInterval: Config.timing.pushInterval, finalWait: Config.timing.finalWait,
+        parallelLimit: Config.push.parallelLimit,
+    };
+    let warns = [];
+    const origWarn = console.warn;
+    console.warn = (m) => warns.push(String(m));
+    try {
+        Config.api.timeout = -1;
+        Config.api.retry = 2.5;
+        Config.timing.pushInterval = 'abc';
+        Config.timing.finalWait = -5;
+        Config.push.parallelLimit = -1;
+        await xbk.run();
+        assert(warns.some(w => w.includes('api.timeout')), 'timeout 应警告');
+        assert(warns.some(w => w.includes('api.retry')), 'retry 应警告');
+        assert(warns.some(w => w.includes('pushInterval')), 'pushInterval 应警告');
+        assert(warns.some(w => w.includes('finalWait')), 'finalWait 应警告');
+        assert(warns.some(w => w.includes('parallelLimit')), 'parallelLimit 应警告');
+    } finally {
+        Config.api.timeout = orig.timeout;
+        Config.api.retry = orig.retry;
+        Config.timing.pushInterval = orig.pushInterval;
+        Config.timing.finalWait = orig.finalWait;
+        Config.push.parallelLimit = orig.parallelLimit;
+        console.warn = origWarn;
+    }
+    // 合法值不警告
+    warns = [];
+    console.warn = (m) => warns.push(String(m));
+    try {
+        await xbk.run();
+        assert(!warns.some(w => w.includes('⚠️ 配置「')), '合法配置不应有运行时配置警告');
+    } finally {
+        console.warn = origWarn;
+    }
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {
