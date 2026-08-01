@@ -1,8 +1,8 @@
 # 📡 线报酷推送脚本（xbk-push）
 
-定时拉取线报酷接口数据 → 规则过滤 → 多通道推送的 Node.js 脚本。零第三方依赖（自制精简 HTTP 模块），674 个测试全绿。
+定时拉取线报酷接口数据 → 规则过滤 → 多通道推送的 Node.js 脚本。零第三方依赖（自制精简 HTTP 模块），677 个测试全绿。
 
-> 当前版本：v3.106（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本：v3.107（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
 
 ---
 
@@ -36,13 +36,16 @@ npm start
 ## 🧪 测试
 
 ```bash
-# 三套件全跑（退出码 0 = 全绿）
-npm test
-# 或直接：
+# 一键执行三套测试 + 汇总报告（推荐）
+npm test            # 或 node run_tests.js
+
+# 单套执行
 node test_filter.js && node test_app.js && node test_notify.js
 ```
 
-三套件分工：`test_filter.js`（单元 586）→ `test_app.js`（集成 67，mock 完整主流程）→ `test_notify.js`（通道 21）。**101 章会自动校验文件头版本号 / CHANGELOG / package.json / README 四方一致**。
+三套件分工：`test_filter.js`（单元 589，含 Fuzz 随机冒烟 + 10000 条性能基准）→ `test_app.js`（集成 67，mock 完整主流程）→ `test_notify.js`（通道 21）。**101 章自动校验文件头/CHANGELOG/package.json/README 四方一致**。
+
+**CI**：`.github/workflows/test.yml`——push/PR 自动跑三套（Node 16/18/20 矩阵），全部 PASS 才可合并。**103 章 Fuzz**（固定 seed 随机脏数据 500 轮）曾抓到 `hasValidId` 崩溃 bug（v3.107）。
 
 ## ⏰ cron 定时（示例）
 

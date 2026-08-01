@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.106 — 低风险防御批次15项：非法max/非字符串兜底/非Error日志/br闭合/domain防御/maxSize整数化/retry有界防死循环/原型键防御/url三处统一/title类型/zkt_gjc对象防御 ********
+//******** 线报酷推送脚本 v3.107 — 低风险防御批次15项+清理+统一测试入口+CI+Fuzz(hasValidId修复) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -198,6 +198,8 @@ const Utils = {
 
     /** 是否拥有有效 id：仅接受非空字符串与有限数字（布尔/对象/数组/Symbol/NaN 视为无效，避免误合并） */
     hasValidId(m) {
+        // v3.107 fuzz 发现：m 本身缺失/非对象时 m.id 会抛 TypeError（公开导出应防御）
+        if (m === undefined || m === null || typeof m !== 'object') return false;
         if (m.id === undefined || m.id === null) return false;
         const t = typeof m.id;
         if (t === 'string') return m.id.trim() !== '';

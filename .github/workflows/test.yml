@@ -1,0 +1,30 @@
+name: Test
+
+# 每次 push / PR 自动执行三套测试，全部 PASS 才可合并/发布
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [16, 18, 20]   # 兼容测试（engines 声明 >=14）
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # 零第三方依赖，无需 npm install（自制 got 已入库）
+      - name: 单元测试（test_filter.js）
+        run: node test_filter.js
+
+      - name: 通道测试（test_notify.js）
+        run: node test_notify.js
+
+      - name: 集成测试（test_app.js，含真实重试等待 ~45s）
+        run: node test_app.js

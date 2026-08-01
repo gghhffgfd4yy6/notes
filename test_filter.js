@@ -4892,6 +4892,93 @@ await test('契约: template/push 新配置默认值锁定（v3.97）', () => {
     assertEqual(Config.push.parallelLimit, 0, 'push.parallelLimit 默认');
 });
 
+console.log('\n📂 103. 随机输入冒烟（Fuzz，固定 seed 确定性）');
+
+await test('Fuzz: 纯函数随机脏数据 500 轮不崩（v3.107）', () => {
+    // 确定性伪随机（固定 seed 42——跨运行结果一致，88 章确定性精神）
+    let seed = 42;
+    const rand = () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+    };
+    // 随机脏数据源：null/undefined/空串/大数/NaN/Infinity/对象/数组/含实体与标签的随机串
+    const randomValue = () => {
+        const r = rand();
+        if (r < 0.08) return null;
+        if (r < 0.16) return undefined;
+        if (r < 0.24) return '';
+        if (r < 0.32) return rand() * 1e12;
+        if (r < 0.40) return Math.floor(rand() * 1e10);
+        if (r < 0.46) return NaN;
+        if (r < 0.52) return Infinity;
+        if (r < 0.60) return { a: 1, b: { c: [1] } };
+        if (r < 0.68) return [1, 2, 3];
+        const chars = 'abc0123 &<>=#?/\\n\t\u00e9\ud83d\ude00;&#amp;lt;';
+        let s = '';
+        const len = Math.floor(rand() * 60);
+        for (let i = 0; i < len; i++) s += chars[Math.floor(rand() * chars.length)];
+        return s;
+    };
+    const fns = [
+        ['decodeHtmlEntities', (v) => decodeHtmlEntities(v)],
+        ['normUrl', (v) => normUrl(v)],
+        ['daysComputed', (v) => daysComputed(v)],
+        ['hasValidId', (v) => hasValidId(v)],
+        ['anonKey', (v) => anonKey(v, v, v)],
+        ['tuisong_replace', (v) => tuisong_replace('{标题}|{日期}|{Markdown内容}|{链接}', v)],
+        ['htmlToMarkdown', (v) => htmlToMarkdown(v)],
+        ['truncateUtf16', (v) => truncateUtf16(v, Math.floor(rand() * 200))],
+        ['whitelistFilter', (v) => whitelistFilter(v, 'title', String(v))],
+        ['hasNestedQuantifier', (v) => hasNestedQuantifier(v)],
+    ];
+    for (let i = 0; i < 500; i++) {
+        for (const [name, fn] of fns) {
+            const input = randomValue();
+            try { fn(input); }
+            catch (e) {
+                // 注意：JSON.stringify(undefined) 返回 undefined，需兜底再 slice
+                const raw = JSON.stringify(input);
+                const inputStr = raw === undefined ? 'undefined' : raw;
+                assertEqual(false, true, `${name} 对输入 ${inputStr.slice(0, 60)} 抛错: ${e.message}`);
+            }
+        }
+    }
+});
+
+await test('Fuzz: 大数据量性能冒烟 10000 条 listfilter（v3.107）', () => {
+    // 模拟 10000 条真实形态数据（含脏字段），验证过滤不崩且耗时可控
+    const items = [];
+    for (let i = 0; i < 10000; i++) {
+        items.push({
+            id: i,
+            catename: i % 3 === 0 ? null : `分类${i % 10}`,
+            title: `标题${i} 京东神券`,
+            content: '内容' + (i % 5 === 0 ? '&amp;amp;' : ''),
+            louzhu: i % 7 === 0 ? '' : `楼主${i}`,
+            louzhuregtime: i % 11 === 0 ? null : '2026-01-01',
+            url: `/item/${i}.html`,
+        });
+    }
+    const t0 = Date.now();
+    let pushed = 0, filtered = 0;
+    for (const it of items) {
+        if (listfilter(it, {})) pushed++; else filtered++;
+    }
+    const ms = Date.now() - t0;
+    assertEqual(pushed + filtered, 10000, '10000 条应全部处理');
+    assertEqual(ms < 3000, true, `10000 条 listfilter 应 <3s，实际 ${ms}ms`);
+});
+
+await test('Fuzz 回归: hasValidId 对缺失/非对象输入不崩（v3.107）', () => {
+    assertEqual(hasValidId(undefined), false, 'undefined 不崩且无效');
+    assertEqual(hasValidId(null), false, 'null 不崩且无效');
+    assertEqual(hasValidId(42), false, '数字不崩且无效');
+    assertEqual(hasValidId('abc'), false, '字符串不崩且无效');
+    assertEqual(hasValidId({ id: 1 }), true, '正常对象仍有效');
+    assertEqual(hasValidId({ id: 'x' }), true, '字符串 id 有效');
+    assertEqual(hasValidId({}), false, '无 id 无效');
+});
+
 await test('#链接: {Html内容} href 换行剥离（v3.85）', () => {
     const r = tuisong_replace('{Html内容}', { url: 'http://x.com/a\nb', content_html: '<p>内容</p>', title: 't' });
     assertEqual(r.includes('\n'), false, 'Html内容不应残留换行');

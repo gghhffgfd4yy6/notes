@@ -1,5 +1,32 @@
 # 📋 更新日志
 
+## v3.107（统一测试入口 + CI + Fuzz 测试体系）
+> 2026-08-01
+
+### 🧪 统一测试入口 run_tests.js
+
+- **背景**（用户评审建议）：三套测试缺统一入口——`npm test` 只串跑无汇总；建议一键执行+汇总+退出码
+- **新增**：`run_tests.js`（三套件依次执行、透传输出、汇总 ✅/❌/耗时/描述、总耗时、退出码 0=全过）；`package.json` 的 `npm test` 指向它
+
+### 🤖 CI 配置 .github/workflows/test.yml
+
+- **新增**：GitHub Actions——push/PR 自动跑三套（Node 16/18/20 矩阵），全部 PASS 才可合并；零依赖无需 install（自制 got 已入库）
+
+### 🎲 Fuzz/Property 测试（103 章）
+
+- **Fuzz 随机脏数据 500 轮**：固定 seed 42（确定性），对 10 个公开纯函数塞 null/undefined/NaN/Infinity/对象/数组/含实体随机串——**立刻抓到真实 bug：`hasValidId(undefined)` 抛 TypeError**（公开导出对缺失/非对象输入无防御）
+- **修复**：hasValidId 加 `m === undefined/null/非对象 → false` + 显式回归测试
+- **大数据量基准**：10000 条 listfilter <3s（实测 55ms）
+- 测试 674 → **677**（589 单元 + 67 集成 + 21 通道）
+
+### 🧹 清理（用户要求）
+
+- 删除 4 个一次性报告/清单（REVIEW_ROUND10/REVIEW_LOWRISK/REVIEW_MODULES/VERIFY），备份于 /tmp/reports_backup_20260801/+git 历史
+
+### 🧪 测试数
+
+**677 个全绿（单元 589 + 集成 67 + 通道 21）**
+
 ## v3.106（第11轮审查：低风险防御批次15项 + 版本固化）
 > 2026-08-01
 
