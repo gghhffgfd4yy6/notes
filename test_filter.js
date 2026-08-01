@@ -4851,6 +4851,14 @@ await test('防御: cache.dir 非字符串 → 回退默认不崩（v3.80）', (
     }
 });
 
+await test('实体扩展: ensp/emsp/cent/curren/箭头（v3.83）', () => {
+    assertEqual(decodeHtmlEntities('a&ensp;b'), 'a b', '&ensp; 半角空格');
+    assertEqual(decodeHtmlEntities('a&emsp;b'), 'a b', '&emsp; 全角空格（与 nbsp 同口径转普通空格）');
+    assertEqual(decodeHtmlEntities('&cent;&curren;'), '¢¤', '货币符号');
+    assertEqual(decodeHtmlEntities('&larr;&rarr;&uarr;&darr;'), '←→↑↓', '方向箭头');
+    assertEqual(decodeHtmlEntities('&ensp;'), ' ', '单独 ensp');
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {
