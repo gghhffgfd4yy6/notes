@@ -2,7 +2,7 @@
 
 定时拉取线报酷接口数据 → 规则过滤 → 多通道推送的 Node.js 脚本。零第三方依赖（自制精简 HTTP 模块），642 个测试全绿。
 
-> 当前版本：v3.70（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本：v3.79（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
 
 ---
 
@@ -50,6 +50,19 @@ node test_filter.js && node test_app.js && node test_notify.js
 # 每 5 分钟跑一次（注意路径用绝对路径，缓存目录基于脚本位置不受 cwd 影响）
 */5 * * * * cd /path/to/xbk-push && node xbk_function_v3.js >> /var/log/xbk-push.log 2>&1
 ```
+
+## 📝 运行日志
+
+每次运行自动追加到 `xianbaoku_cache/run.log`（gitignore，不入库）：
+
+```
+2026-08-01T12:00:00.000Z total=5 dedup=1 filtered=2 pushed=2 failed=0
+2026-08-01T12:05:00.000Z ERROR 请求失败: boom
+```
+
+- **成功行**：`total` 拉取总数 / `dedup` 去重跳过 / `filtered` 过滤屏蔽 / `pushed` 推送成功 / `failed` 失败数（下次运行重试）
+- **失败行**：`ERROR <原因>`（cron 场景回溯失败趋势）
+- 超过 1MB 自动截断保留尾部 512KB（防无限增长）
 
 ## ⚙️ 配置速查（xbk_function_v3.js 顶部 Config）
 

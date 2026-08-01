@@ -4825,6 +4825,17 @@ await test('版本一致性：package.json 版本与文件头一致（v3.71）',
     assertEqual(pkg.version, expected, `package.json 版本(${pkg.version})应与文件头(v${expected})一致`);
 });
 
+await test('版本一致性：README 当前版本与文件头一致（v3.79）', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const main = fs.readFileSync(path.join(__dirname, 'xbk_function_v3.js'), 'utf8');
+    const readme = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8');
+    const m = main.match(/v(\d+\.\d+)/);
+    const r = readme.match(/当前版本：v(\d+\.\d+)/);
+    assertEqual(!!r, true, 'README 应有「当前版本」标记');
+    assertEqual(m[1], r[1], `README 版本(${r[1]})应与文件头(${m[1]})一致`);
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {
