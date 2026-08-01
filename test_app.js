@@ -982,6 +982,42 @@ await test('推送模板可配置 + 非法回退默认（v3.68）', async () => 
     }
 });
 
+await test('推送截断长度可配置 + 非法回退默认（v3.69）', async () => {
+    reset();
+    setPushUrl('t49_trunc');
+    fakeData = [makeItem({ id: 1, title: '这是一个非常长的标题用于测试截断', content: '内容内容内容内容内容内容' })];
+    const origTitleMax = Config.push.titleMax;
+    const origContentMax = Config.push.contentMax;
+    try {
+        Config.push.titleMax = 5;
+        Config.push.contentMax = 4;
+        await xbk.run();
+        assert(pushCalls.length === 1, '应推送 1 条');
+        assert(pushCalls[0].text.includes('这是一个'), '标题应按 5 截断');
+        assert(!pushCalls[0].text.includes('非常长的标题用于测试截断'), '标题不应超过 5 字符');
+        assert(pushCalls[0].desp.length <= 4, `内容应按 4 截断（含 Markdown 转换结果），实际: ${pushCalls[0].desp.length}`);
+    } finally {
+        Config.push.titleMax = origTitleMax;
+        Config.push.contentMax = origContentMax;
+    }
+    // 非法值（负数/0/非数字）→ 回退默认，不误截
+    reset();
+    setPushUrl('t49b_trunc_fallback');
+    fakeData = [makeItem({ id: 2, title: '正常标题', content: '正常内容' })];
+    try {
+        Config.push.titleMax = -1;
+        Config.push.contentMax = 0;
+        await xbk.run();
+        assert(pushCalls.length === 1, '回退默认仍应推送');
+        assert(pushCalls[0].text.includes('【分类】正常标题') || pushCalls[0].text.includes('正常标题'),
+            `非法 titleMax 不应截断，实际: ${pushCalls[0].text}`);
+        assert(pushCalls[0].desp.includes('原文链接'), '非法 contentMax 不应截断 Markdown 全文');
+    } finally {
+        Config.push.titleMax = origTitleMax;
+        Config.push.contentMax = origContentMax;
+    }
+});
+
 // ================================================
 console.log('\n========================================');
 if (failed === 0) {
@@ -992,13 +1028,14 @@ if (failed === 0) {
 }
 console.log('========================================\n');
 
-// 清理本套件产生的缓存测试文件（t\d{2}_/tpush_/tpar_fail，保留真实运行缓存 push.json）
+// 清理本套件产生的缓存测试文件（t\d{2}_/t48b_/tpush_/tpar_fail，保留真实运行缓存 push.json）
 try {
     const fs = require('fs');
     const dir = path.join(__dirname, 'xianbaoku_cache');
     if (fs.existsSync(dir)) {
         for (const f of fs.readdirSync(dir)) {
-            if (/^t\d{2}_|^tpush_|^tpar_fail/.test(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch (e) { /* 忽略 */ } }
+            // t\d{2}[a-z]?_ 同时匹配 t48_ 与 t48b_（v3.69 修复：原 ^t\d{2}_ 漏掉带字母后缀的测试名）
+            if (/^t\d{2}[a-z]?_|^tpush_|^tpar_fail/.test(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch (e) { /* 忽略 */ } }
         }
     }
 } catch (e) { /* 忽略 */ }

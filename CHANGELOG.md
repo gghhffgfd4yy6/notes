@@ -1,5 +1,28 @@
 # 📋 更新日志
 
+## v3.69（推送截断可配置 + desp 兜底截断修复）
+> 2026-08-01
+
+### ✨ Config.push.titleMax / contentMax（截断长度可配置）
+
+- **背景**：截断长度硬编码（title 100 / content 3000）；注释提到 Server酱 title 限 32 字符但无法配置
+- **新增**：`Config.push.titleMax`（标题，默认 100）/ `Config.push.contentMax`（内容，默认 3000）；非法值（负数/0/非数字）回退默认（负数会让 truncateUtf16 的 slice(0,-1) 误截尾字符）
+- test_app t49：titleMax=5/contentMax=4 生效 + 非法值回退
+
+### 🐛 desp 兜底截断（{Markdown内容} 从不截断的真实 bug）
+
+- **发现**（t49 测试暴露）：原 3000 截断只作用于 pushItem.content（{内容} 占位符），而 `{Markdown内容}` 走 content_html → htmlToMarkdown 转换**从不截断**——超长 HTML（如 10 万字符）会生成超长 desp 撑爆推送 API（Server酱 32KB 上限）
+- **修复**：desp 生成后兜底截断（`truncateUtf16(desp, contentMax)`），contentMax 语义统一为「推送内容最终长度」；默认 3000 下正常 desp 不受影响（<3000 不截断），超长才截断
+- 现有测试零回归（默认 desp 均 <3000）
+
+### 🧹 test_app 测试自清理正则修复
+
+- `/^t\d{2}_/` 不匹配 `t48b_template_fallback.json`（带字母后缀的测试名）→ 缓存文件残留；改为 `/^t\d{2}[a-z]?_/`，跑完缓存目录零残留
+
+### 🧪 测试数
+
+**641 个全绿（单元 568 + 集成 57 + 通道 16）**
+
 ## v3.68（推送模板可配置）
 > 2026-08-01
 

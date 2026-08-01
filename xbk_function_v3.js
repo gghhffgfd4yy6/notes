@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.68 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板可配置 ********
+//******** 线报酷推送脚本 v3.69 — 规则预编译 + 白名单重构 + HTML实体解码 + 原子写入 + 审查加固 + 日期解析统一 + 审查项批量 + 配置校验 + 运行日志增强 + 口径统一 + 推送模板/截断可配置 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -48,9 +48,12 @@ const Config = {
 
     // 推送模式：sequential=顺序逐条(默认) | parallel=并行一次推送
     // parallelLimit：并行并发上限，0=不限制(全量一次发出)，N>0=每批 N 条
+    // titleMax/contentMax：推送截断长度（v3.69 可配置；各通道 API 限制不一，如 Server酱 title 限 32 字符）
     push: {
         mode: 'sequential',
         parallelLimit: 0,
+        titleMax: 100,
+        contentMax: 3000,
     },
 
     // 推送模板（v3.68 可配置）：title=标题、content=内容；默认值与历史硬编码完全一致。
@@ -1169,19 +1172,24 @@ const App = {
             // 推送模板（v3.68 可配置）：非法/缺失回退默认（默认值与历史硬编码完全一致，现有测试锁定）
             const titleTpl = (typeof Config.template.title === 'string' && Config.template.title) ? Config.template.title : '【{分类名}】{标题}';
             const contentTpl = (typeof Config.template.content === 'string' && Config.template.content) ? Config.template.content : '{Markdown内容}';
+            // 推送截断长度（v3.69 可配置）：非正数/非数字回退默认（负数会让 slice(0,-1) 误截尾字符）
+            const titleMax = Number.isFinite(Config.push.titleMax) && Config.push.titleMax > 0 ? Config.push.titleMax : 100;
+            const contentMax = Number.isFinite(Config.push.contentMax) && Config.push.contentMax > 0 ? Config.push.contentMax : 3000;
 
             // 单条推送（两种模式共用）：成功返回 {ok:true} 并记录；失败警告且不写缓存(下次重试)
             const pushOne = async (item) => {
-                // 推送内容截断：避免超长标题/内容被推送 API 拒绝（Server酱 title 限 32 字符）
+                // 推送内容截断：避免超长标题/内容被推送 API 拒绝（长度可配置，默认 100/3000）
                 // 用 UTF-16 安全截断（不切断 emoji 代理对）
                 const pushItem = {
                     ...item,
                     url: urlOf(item),
-                    title: Utils.truncateUtf16(item.title || '(无标题)', 100),
-                    content: Utils.truncateUtf16(item.content || '', 3000),
+                    title: Utils.truncateUtf16(item.title || '(无标题)', titleMax),
+                    content: Utils.truncateUtf16(item.content || '', contentMax),
                 };
                 const text = Formatter.tuisong_replace(titleTpl, pushItem);
-                const desp = Formatter.tuisong_replace(contentTpl, pushItem);
+                // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
+                // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
+                const desp = Utils.truncateUtf16(Formatter.tuisong_replace(contentTpl, pushItem), contentMax);
                 try {
                     await Pusher.send(text, desp);
                     pushedKeys.add(keyOf(item));

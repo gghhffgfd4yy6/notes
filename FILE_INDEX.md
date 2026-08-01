@@ -48,10 +48,14 @@ Config.keyword.zkt_gjc     // 只看它关键词
 Config.timing.pushInterval // 顺序模式条间间隔(100ms)
 Config.push.mode           // 'sequential'顺序 | 'parallel'并行
 Config.push.parallelLimit  // 并行并发上限(0=不限)
+Config.push.titleMax       // 推送标题截断长度(默认100,非法回退)
+Config.push.contentMax     // 推送内容最终长度上限(默认3000,含Markdown转换结果,非法回退)
+Config.template.title      // 推送标题模板(默认【{分类名}】{标题},支持全部占位符)
+Config.template.content    // 推送内容模板(默认{Markdown内容})
 Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.68)需人工维护,但已有 101 章版本一致性测试自动校验(与 CHANGELOG 顶部一致);`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号(v3.69)需人工维护,但已有 101 章版本一致性测试自动校验(与 CHANGELOG 顶部一致);`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
@@ -144,7 +148,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ---
 
-### `test_app.js` — 集成测试(约 52 个)
+### `test_app.js` — 集成测试(约 56 个)
 
 **定位**:mock got/notify 验证 App.run 完整主流程(约 858 行)。
 
@@ -221,7 +225,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.68),每轮修复/重构/功能变更的摘要。
+版本演进记录(v3.0 → v3.69),每轮修复/重构/功能变更的摘要。
 
 ---
 
