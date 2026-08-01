@@ -1,5 +1,17 @@
 # 📋 更新日志
 
+## v3.96（README 目录结构同步 + example 补 TG_PROXY 说明）
+> 2026-08-01
+
+### 📖 文档同步
+
+- README 目录结构补全（example/package.json/README/CHANGELOG + 测试数 576/59/21）
+- push_config.local.js.example 补 TG_PROXY 保留项说明（防误配）
+
+### 🧪 测试数
+
+**656 个全绿（单元 576 + 集成 59 + 通道 21）**
+
 ## v3.95（配置矩阵防御测试）
 > 2026-08-01
 

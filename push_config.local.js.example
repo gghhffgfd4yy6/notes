@@ -34,6 +34,7 @@ module.exports = {
     // TG_BOT_TOKEN: '123456:ABC-DEF...',
     // TG_USER_ID: '你的chat_id',
     // TG_API_HOST: '', // 自定义 API host（可选，默认 api.telegram.org）
+    // TG_PROXY_HOST/TG_PROXY_PORT: 保留配置项（自制 got 不支持 http 代理，配置不生效；需要代理请用 TG_API_HOST）
 
     // 一言：推送内容尾部附加随机一句话（'false' 关闭）
     // HITOKOTO: 'true',

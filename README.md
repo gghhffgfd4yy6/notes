@@ -2,7 +2,7 @@
 
 定时拉取线报酷接口数据 → 规则过滤 → 多通道推送的 Node.js 脚本。零第三方依赖（自制精简 HTTP 模块），654 个测试全绿。
 
-> 当前版本：v3.95（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本：v3.96（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
 
 ---
 
@@ -87,11 +87,14 @@ node test_filter.js && node test_app.js && node test_notify.js
 xbk_function_v3.js        主代码（9 层架构：Config→Utils→Formatter→RuleEngine→FilterEngine→MessageStore→Network→Pusher→App）
 xbk_sendNotify_slim.js    推送模块（9 通道实现）
 push_config.local.js      本地密钥（不入库！）
+push_config.local.js.example  密钥配置示例模板（可入库）
 xianbaoku_cache/          去重缓存 + run.log（不入库）
 node_modules/got/         自制精简 HTTP 模块（唯一依赖，被 git 追踪）
-test_filter.js            单元测试（569）
-test_app.js               集成测试（57）
-test_notify.js            通道测试（16）
+test_filter.js            单元测试（576）
+test_app.js               集成测试（59）
+test_notify.js            通道测试（21）
+package.json              工程入口（npm start / npm test）
+README.md                 本文件
 FILE_INDEX.md             文件索引（最详细）
 REVIEW_DECISIONS.md       审查决策记录（为什么修/为什么不修）
 REVIEW_ROUND10.md         第 10 轮 300 项问题清单
