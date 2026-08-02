@@ -2,7 +2,7 @@
 
 定时拉取线报酷接口数据 → 规则过滤 → 多通道推送的 Node.js 脚本。零第三方依赖（自制精简 HTTP 模块），677 个测试全绿。
 
-> 当前版本：v3.119（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本：v3.120（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
 
 ---
 
@@ -80,7 +80,7 @@ node test_filter.js && node test_app.js && node test_notify.js
 | `push.parallelLimit` | 0 | 并行并发上限(0=不限) |
 | `push.titleMax` / `contentMax` | 100 / 3000 | 推送标题/内容截断长度 |
 | `template.title` / `content` | `【{分类名}】{标题}` / `{Markdown内容}` | 推送模板，支持占位符 |
-| `cache.maxSize` / `dir` | 100 / `xianbaoku_cache` | 缓存上限 / 目录 |
+| `cache.maxSize` / `dir` | 10000 / `xianbaoku_cache` | 缓存上限 / 目录 |
 
 **占位符**：`{分类名} {分类ID} {标题} {链接} {日期} {时间} {楼主} {类目} {价格} {商城} {品牌} {图片} {Html内容} {Markdown内容}`
 

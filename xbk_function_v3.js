@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.119 — saveBatch索引化修正与强化验证：第一版reindex漏维护同key次小(用户质疑验证属实)→scanNext扫描重建+同id/url跳过优化；100轮随机(独立文件/同数据A-B对比)全一致(此前"不一致"系验证脚本缺陷：数据不同/裁剪未模拟/内存缓存残留)；113章2测试固化；725全绿 ********
+//******** 线报酷推送脚本 v3.120 — 缓存上限 100→10000(用户要求：N固定~20 条查询量 N×M=20万次 35ms 可控)；DEFAULT_MAX_SIZE 同步；9 处测试显式设 maxSize=100 保留裁剪语义(853/1921/2009/2450/2735/3236/3266/3540/R3-2)；725全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -70,7 +70,8 @@ const Config = {
     },
 
     cache: {
-        maxSize: 100,
+        // v3.120 上限 100 → 10000：真实接口 N 固定 ~20 条，查询量 N×M=20 万次可接受（实测 35ms）
+        maxSize: 10000,
         dir: 'xianbaoku_cache',
     },
 };
@@ -92,7 +93,7 @@ const TS_BOUND = 1e11;                         // 秒/毫秒时间戳分界（10
 const MAX_CODE_POINT = 0x10FFFF;               // Unicode 最大码点
 const SURROGATE_LO = 0xD800;                   // 代理区起点
 const SURROGATE_HI = 0xDFFF;                   // 代理区终点
-const DEFAULT_MAX_SIZE = 100;                  // 缓存默认上限
+const DEFAULT_MAX_SIZE = 10000;                 // 缓存默认上限（v3.120：100 → 10000）
 
 // 实体映射与正则提升为模块级常量（避免每次调用重建）
 const ENTITY_MAP = {

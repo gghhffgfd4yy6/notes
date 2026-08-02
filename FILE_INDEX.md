@@ -52,10 +52,10 @@ Config.push.titleMax       // 推送标题截断长度(默认100,非法回退)
 Config.push.contentMax     // 推送内容最终长度上限(默认3000,含Markdown转换结果,非法回退)
 Config.template.title      // 推送标题模板(默认【{分类名}】{标题},支持全部占位符)
 Config.template.content    // 推送内容模板(默认{Markdown内容})
-Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
+Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.119)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号(v3.120)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
@@ -225,7 +225,7 @@ Config.cache.maxSize       // 缓存上限(100条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.119),每轮修复/重构/功能变更的摘要。
+版本演进记录(v3.0 → v3.120),每轮修复/重构/功能变更的摘要。
 
 ---
 

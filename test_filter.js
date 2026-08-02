@@ -852,17 +852,23 @@ console.log('\n📂 20. 缓存管理 更多场景');
 
 await test('缓存超过100条 → 自动裁剪', () => {
     const name = 'test_trim.json';
-    // 写入101条
-    for (let i = 0; i < 101; i++) {
-        appendMessageToFile({ id: i, title: `第${i}条` }, name);
+    const orig = Config.cache.maxSize;
+    Config.cache.maxSize = 100; // v3.120：显式小上限（默认已 10000）
+    try {
+        // 写入101条
+        for (let i = 0; i < 101; i++) {
+            appendMessageToFile({ id: i, title: `第${i}条` }, name);
+        }
+        // 验证最多保留100条（ID 1~100，第0条被删）
+        const r = isMessageInFile({ id: 0 }, name);
+        const r2 = isMessageInFile({ id: 100 }, name);
+        // 模块内 splice(0, length-100) 会删掉前1条
+        // 0被删，100保留
+        assertEqual(r, false, '第0条应被裁剪');
+        assertEqual(r2, true);
+    } finally {
+        Config.cache.maxSize = orig;
     }
-    // 验证最多保留100条（ID 1~100，第0条被删）
-    const r = isMessageInFile({ id: 0 }, name);
-    const r2 = isMessageInFile({ id: 100 }, name);
-    // 模块内 splice(0, length-100) 会删掉前1条
-    // 0被删，100保留
-    assertEqual(r, false, '第0条应被裁剪');
-    assertEqual(r2, true);
 });
 
 await test('更新已存在消息 → 内容更新', () => {
@@ -1922,7 +1928,13 @@ await test('saveMessages 超过maxSize自动裁剪', () => {
     const p = path.join(CACHE, 'test_trim2.json');
     const many = [];
     for (let i = 0; i < 150; i++) many.push({ id: i });
-    saveMessages(p, many);
+    const orig = Config.cache.maxSize;
+    Config.cache.maxSize = 100; // v3.120：显式小上限
+    try {
+        saveMessages(p, many);
+    } finally {
+        Config.cache.maxSize = orig;
+    }
     const msgs = readMessages(p);
     assertEqual(msgs.length <= 100, true);
 });
@@ -2011,7 +2023,13 @@ await test('saveMessages 裁剪后保留最新数据', () => {
     const p = path.join(CACHE, 'test_trim_new.json');
     const many = [];
     for (let i = 0; i < 150; i++) many.push({ id: i });
-    saveMessages(p, many);
+    const orig = Config.cache.maxSize;
+    Config.cache.maxSize = 100; // v3.120：显式小上限
+    try {
+        saveMessages(p, many);
+    } finally {
+        Config.cache.maxSize = orig;
+    }
     const msgs = readMessages(p);
     // 裁剪后保留的是后面的数据（splice 删除前面的）
     assertEqual(msgs.length, 100);
@@ -2457,12 +2475,15 @@ await test('saveMessages 恰好 maxSize 条 → 不裁剪', () => {
     assertEqual(r.length, 100);  // 恰好100条不裁剪
 });
 
-await test('saveMessages 超过maxSize → 裁剪到100', () => {
+await test('saveMessages 超过maxSize → 裁剪到上限（v3.120：显式 maxSize=100 验证裁剪逻辑）', () => {
     const fs = require('fs');
     const p = path.join(CACHE, 'test_over100.json');
     const msgs = [];
     for (let i = 0; i < 101; i++) msgs.push({ id: i });
+    const orig = Config.cache.maxSize;
+    Config.cache.maxSize = 100; // 显式小上限，验证裁剪（不依赖默认 10000）
     saveMessages(p, msgs);
+    Config.cache.maxSize = orig;
     const r = readMessages(p);
     assertEqual(r.length, 100);
 });
@@ -2734,7 +2755,13 @@ await test('MS 裁剪用splice保留后100条', () => {
     const p = path.join(CACHE, 'test_splice.json');
     const msgs = [];
     for (let i = 0; i < 150; i++) msgs.push({ id: i });
-    saveMessages(p, msgs);
+    const orig = Config.cache.maxSize;
+    Config.cache.maxSize = 100; // v3.120：显式小上限验证裁剪（默认已 10000）
+    try {
+        saveMessages(p, msgs);
+    } finally {
+        Config.cache.maxSize = orig;
+    }
     const r = readMessages(p);
     assertEqual(r.length, 100);
     // 裁剪应删前面的，保留后面的
@@ -3233,7 +3260,13 @@ await test('readMessages 非数组 JSON → 重置不崩溃（v3.21审查11）',
 await test('saveMessages 不原地修改传入数组（v3.21审查13）', () => {
     const arr = [];
     for (let i = 0; i < 150; i++) arr.push({ id: i });
-    saveMessages(getFilePath('test_no_mutate.json'), arr);
+    const orig = Config.cache.maxSize;
+    Config.cache.maxSize = 100; // v3.120：显式小上限（默认已 10000）
+    try {
+        saveMessages(getFilePath('test_no_mutate.json'), arr);
+    } finally {
+        Config.cache.maxSize = orig;
+    }
     assertEqual(arr.length, 150, '原数组不应被截断');
     const r = readMessages(getFilePath('test_no_mutate.json'));
     assertEqual(r.length, 100);
@@ -3264,7 +3297,13 @@ await test('saveMessages 内存缓存与裁剪结果一致', () => {
     const p = getFilePath('test_trim_mem.json');
     const arr = [];
     for (let i = 0; i < 150; i++) arr.push({ id: i });
-    saveMessages(p, arr);
+    const orig = Config.cache.maxSize;
+    Config.cache.maxSize = 100; // v3.120：显式小上限（默认已 10000）
+    try {
+        saveMessages(p, arr);
+    } finally {
+        Config.cache.maxSize = orig;
+    }
     const r = readMessages(p); // 应读内存缓存（已裁剪的 toSave）
     assertEqual(r.length, 100);
 });
@@ -3537,7 +3576,7 @@ await test('daysComputed 8位日期 YYYYMMDD → 解析（审查8-3）', () => {
 // ==================== 78. 审查9轮(文档项升级) ====================
 console.log('\n📂 78. 审查9轮(文档项升级)');
 
-await test('saveMessages maxSize 0/负 → 回退默认100（审查9-B）', () => {
+await test('saveMessages maxSize 0/负 → 回退默认10000（审查9-B，v3.120）', () => {
     const { Config } = require('./xbk_function_v3.js');
     const orig = Config.cache.maxSize;
     Config.cache.maxSize = 0; // 恶意/误配
@@ -3546,7 +3585,7 @@ await test('saveMessages maxSize 0/负 → 回退默认100（审查9-B）', () =
     saveMessages(getFilePath('test_maxsize0.json'), arr);
     Config.cache.maxSize = orig;
     const r = readMessages(getFilePath('test_maxsize0.json'));
-    assertEqual(r.length, 100, 'maxSize=0 时应回退默认 100');
+    assertEqual(r.length, 150, 'maxSize=0 时回退默认 10000，150 条不裁剪');
 });
 
 // ==================== 79. 审查10轮高价值修复 ====================
@@ -4378,7 +4417,7 @@ await test('契约: Config 默认值全量锁定', () => {
     assertEqual(Config.keyword.zkt_gjc, '');
     assertEqual(Config.timing.pushInterval, 100);
     assertEqual(Config.timing.finalWait, 200);
-    assertEqual(Config.cache.maxSize, 100);
+    assertEqual(Config.cache.maxSize, 10000);
     assertEqual(Config.cache.dir, 'xianbaoku_cache');
     assertEqual(Config.push.mode, 'sequential');
     assertEqual(Config.push.parallelLimit, 0);
@@ -5034,10 +5073,10 @@ await test('saveMessages: maxSize 小数回退默认、整数裁剪生效（R3-2
     const p = getFilePath('test_103_maxsize.json');
     const msgs = Array.from({ length: 100 }, (_, i) => ({ id: i, title: `t${i}` }));
     try {
-        // 小数 maxSize → 回退默认 100 → 100 条不裁剪
+        // 小数 maxSize → 回退默认 10000（v3.120）→ 100 条不裁剪
         Config.cache.maxSize = 2.5;
         saveMessages(p, msgs);
-        assertEqual(readMessages(p).length, 100, `maxSize=2.5 应回退默认 100 不裁剪: ${readMessages(p).length}`);
+        assertEqual(readMessages(p).length, 100, `maxSize=2.5 应回退默认 10000 不裁剪: ${readMessages(p).length}`);
         // 整数 maxSize=3 → 裁剪到 3 条（上限语义为整数条数）
         Config.cache.maxSize = 3;
         saveMessages(p, msgs);
@@ -5045,7 +5084,7 @@ await test('saveMessages: maxSize 小数回退默认、整数裁剪生效（R3-2
         // 0/负值仍回退默认（原行为保持）
         Config.cache.maxSize = 0;
         saveMessages(p, msgs);
-        assertEqual(readMessages(p).length, 100, 'maxSize=0 回退默认不裁剪');
+        assertEqual(readMessages(p).length, 100, 'maxSize=0 回退默认 10000 不裁剪');
     } finally {
         Config.cache.maxSize = saved;
         try { fs.unlinkSync(p); } catch (e) { /* 忽略 */ }

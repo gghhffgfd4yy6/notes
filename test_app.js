@@ -128,7 +128,7 @@ function reset() {
     Config.push.titleMax = 100;
     Config.push.contentMax = 3000;
     Config.domain = 'https://new.ixbk.net';
-    Config.cache.maxSize = 100;
+    Config.cache.maxSize = 10000;
     Config.cache.dir = 'xianbaoku_cache';
     // R3-1：api 配置也恢复默认（t51 等会改 api.retry/timeout，漏恢复会污染后续测试）
     Config.api.timeout = 5000;
