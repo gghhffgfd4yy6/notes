@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.120 — 缓存上限 100→10000(用户要求：N固定~20 条查询量 N×M=20万次 35ms 可控)；DEFAULT_MAX_SIZE 同步；9 处测试显式设 maxSize=100 保留裁剪语义(853/1921/2009/2450/2735/3236/3266/3540/R3-2)；725全绿 ********
+//******** 线报酷推送脚本 v3.121 — 未闭合全量查：Pusher.send 10s超时定时器从未清除(race后仍挂着→进程退出延迟+定时器堆积，验证124超时被杀)→finally clearTimeout(修复后0快速退出)；7层面全查(语法/资源/定时器/监听/异步/文件清理/git)其余正常；725全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1219,10 +1219,17 @@ const Pusher = {
         desp = desp === undefined || desp === null ? '' : String(desp);
         // 抛异常由主流程处理：推送失败的消息不写缓存，下次运行重试（避免永久丢失）
         // 加整体超时：单通道最坏 15s，避免慢通道把整批推送拖到数分钟
-        await Promise.race([
-            notify.sendNotify(text, desp),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('推送超时(10s)')), 10000)),
-        ]);
+        // v3.121：clearTimeout 清除超时定时器——Promise.race 完成后定时器仍挂着会导致
+        // 进程退出延迟（事件循环被 keep-alive）+ 多次推送定时器堆积（资源泄漏）
+        let timer;
+        try {
+            await Promise.race([
+                notify.sendNotify(text, desp),
+                new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('推送超时(10s)')), 10000); }),
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
     },
 };
 
