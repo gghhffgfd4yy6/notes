@@ -147,6 +147,10 @@ function reset() {
     // R3-1：api 配置也恢复默认（t51 等会改 api.retry/timeout，漏恢复会污染后续测试）
     Config.api.timeout = 5000;
     Config.api.retry = 2;
+    // v3.140：告警/日报默认关闭——预期失败测试(4xx/超时)触发告警、跨天时成功 run 触发日报，
+    // 都会污染 pushCalls 断言（t56/t57 显式开启）
+    Config.alert.enabled = false;
+    Config.report.enabled = false;
 }
 
 function readCacheFile(suffix) {
