@@ -5948,6 +5948,17 @@ await test('边界: 跨日边界（今天 0 点 = 0 天 / 昨天 0 点 = 1 天�
 console.log('\n📂 111. 边界回归补充（负数天数/空值/TS_BOUND 下界/normUrl 空）');
 
 
+
+await test("时区回归: 数字形态字符串无效(v3.142: 字符串-1曾宿主解析成2001)", () => {
+    // 数字形态字符串（负号/小数）应无效——与数字 -1/2026.5 一致（审查5-2 精神）
+    assertEqual(daysComputed('-1'), 0, '字符串 -1 应无效(曾解析成 2001 年 9344 天)');
+    assertEqual(daysComputed('2026.5'), 0, '字符串小数应无效(曾解析成 2026-05-01)');
+    assertEqual(daysComputed('-100'), 0, '字符串 -100 应无效');
+    assertEqual(daysComputed('0') > 20000, true, '字符串 0=1970 应巨大天数（与数字 0 一致）');
+    assertEqual(daysComputed('2026-07-28') > 0, true, '正常日期不受影响');
+    assertEqual(daysComputed('1785346200') > 0, true, '正常时间戳不受影响');
+});
+
 await test('时区回归: ISO 无时区标记与含 Z 恒等（v3.131：v3.115 漏此格式，Honolulu 差 1 天）', () => {
     // 无 Z / 含 Z / 空格分隔 三者在任何时区都应恒等（统一 UTC 解析）
     const t = '2026-08-01T10:30:00';
