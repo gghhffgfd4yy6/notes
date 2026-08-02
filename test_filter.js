@@ -2430,10 +2430,10 @@ await test('htmlToMarkdown 原文链接格式精确断言', () => {
 
 await test('天数过滤 恰好等于阈值 → 不拦截', () => {
     // 注册天数恰好等于 pingbitime 时，> 判断不拦截
-    // 构造注册时间使 days 恰好为 5：用 daysComputed 反推不可行，改用接近值
-    const item = { louzhuregtime: '2026-07-26' };  // 约5天前
-    const days = daysComputed('2026-07-26');
-    // pingbitime 设为 days+1 → 拦截；设为 days → 不拦截（= 不是 >）
+    // v3.112：用 daysAgo(5) 精确构造"注册5天前"（原写死 2026-07-26 随日期漂移，靠 daysComputed 反推自适应但不清晰）
+    const item = { louzhuregtime: daysAgo(5) };  // 注册 5 天前
+    const days = daysComputed(daysAgo(5));
+    // pingbitime 设为 days → 不拦截（= 不是 >）；days+1 → 拦截
     const r1 = listfilter(item, { pingbitime: String(days) });
     const r2 = listfilter(item, { pingbitime: String(days + 1) });
     assertEqual(r1, true);   // days == pingbitime → 不拦截
