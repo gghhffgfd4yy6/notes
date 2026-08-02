@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.117 — 边界回归补充：111章4测试(daysComputed负数→0 v3.62修复显式回归/空值边界/TS_BOUND下界1e8上界1e14精确/normUrl空空白null)；720全绿 ********
+//******** 线报酷推送脚本 v3.118 — 性能问题修复：saveBatch O(n²)→O(n)索引化(id/url Map+O(1)维护+最小index首个语义)；5000条2475ms→164ms(15x)；112章3测试(性能基准<500ms/随机判重一致性vs逐条upsert/更新索引维护)；723全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1061,11 +1061,66 @@ const MessageStore = {
         if (!newMessages || newMessages.length === 0) return;
         const filePath = this.getFilePath(filename);
         const messages = this.readMessages(filePath);
+        // v3.118 性能：逐条 _upsert 的 findIndex 是 O(N×M)（缓存 100 条 + 新 N 条累积 → O(N²)，
+        // 实测 5000 条 2475ms）。构建 id/url 索引 O(1) 判重定位，维护 O(1)。
+        // 判重口径与 _findDedupIndex 完全一致：有 id 匹配 String(id)（或 m 无 id 时 url）；
+        // 无 id 匹配 url；findIndex 顺序语义 = 最小 index（addKey 用"更小覆盖"维护首个）
+        const addKey = (map, key, i) => {
+            const e = map.get(key);
+            if (e === undefined || i < e) map.set(key, i); // 首个 = 最小 index（与 findIndex 顺序一致）
+        };
+        const idMap = new Map();      // String(id) -> 首个 index（有 id 的 m）
+        const urlMap = new Map();     // normUrl(url) -> 首个 index（所有有 url 的 m）
+        const urlOnlyMap = new Map(); // normUrl(url) -> 首个 index（无 id 有 url 的 m）
+        messages.forEach((m, i) => {
+            if (!m || typeof m !== 'object') return;
+            if (Utils.hasValidId(m)) addKey(idMap, String(m.id), i);
+            if (m.url) addKey(urlMap, Utils.normUrl(m.url), i);
+            if (!Utils.hasValidId(m) && m.url) addKey(urlOnlyMap, Utils.normUrl(m.url), i);
+        });
+        const NOW = () => new Date().toISOString();
+        // 更新后维护索引（O(1)：删旧 m 的键 + 加新 m 的键，保"最小 index 首个"语义）
+        const reindex = (idx, oldM) => {
+            if (oldM && typeof oldM === 'object') {
+                if (Utils.hasValidId(oldM) && idMap.get(String(oldM.id)) === idx) idMap.delete(String(oldM.id));
+                if (oldM.url && urlMap.get(Utils.normUrl(oldM.url)) === idx) urlMap.delete(Utils.normUrl(oldM.url));
+                if (!Utils.hasValidId(oldM) && oldM.url && urlOnlyMap.get(Utils.normUrl(oldM.url)) === idx) urlOnlyMap.delete(Utils.normUrl(oldM.url));
+            }
+            const m = messages[idx];
+            if (m && typeof m === 'object') {
+                if (Utils.hasValidId(m)) addKey(idMap, String(m.id), idx);
+                if (m.url) addKey(urlMap, Utils.normUrl(m.url), idx);
+                if (!Utils.hasValidId(m) && m.url) addKey(urlOnlyMap, Utils.normUrl(m.url), idx);
+            }
+        };
         for (const message of newMessages) {
             // 元素级校验：非对象元素跳过（避免访问 message.id 崩溃）
             if (!message || typeof message !== 'object' || Array.isArray(message)) continue;
-            // 统一更新/追加（helper）：判重 + upsert 一体
-            this._upsert(messages, message, filename);
+            let idx = -1;
+            if (Utils.hasValidId(message)) {
+                const c1 = idMap.get(String(message.id));
+                const c2 = message.url ? urlOnlyMap.get(Utils.normUrl(message.url)) : undefined;
+                const cands = [c1, c2].filter(x => x !== undefined);
+                if (cands.length) idx = Math.min(...cands); // findIndex 顺序语义：取最早出现
+            } else if (message.url) {
+                const u = urlMap.get(Utils.normUrl(message.url));
+                if (u !== undefined) idx = u;
+            }
+            if (idx >= 0) {
+                const oldM = messages[idx];
+                // 与原 _upsert 口径一致：内容变化时提示（循环引用等比较失败按"已更新"处理）
+                let changed = false;
+                try { changed = JSON.stringify(oldM) !== JSON.stringify(message); } catch (e) { changed = true; }
+                if (changed) console.log(`更新缓存记录: ${filename}`);
+                messages[idx] = { ...message, timestamp: NOW() };
+                reindex(idx, oldM);
+            } else {
+                messages.push({ ...message, timestamp: NOW() });
+                const i = messages.length - 1;
+                if (Utils.hasValidId(message)) addKey(idMap, String(message.id), i);
+                if (message.url) addKey(urlMap, Utils.normUrl(message.url), i);
+                if (!Utils.hasValidId(message) && message.url) addKey(urlOnlyMap, Utils.normUrl(message.url), i);
+            }
         }
         this.saveMessages(filePath, messages);
     },

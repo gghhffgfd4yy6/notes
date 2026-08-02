@@ -5933,6 +5933,79 @@ await test('边界回归: normUrl 空/空白/null', () => {
     assertEqual(normUrl('http://x.com/'), 'http://x.com', '尾斜杠去除');
 });
 
+console.log('\n📂 112. saveBatch 索引化：判重一致性 + 性能基准');
+
+await test('性能: saveBatch 5000 条 <500ms（v3.118 索引化，原 2475ms）', () => {
+    const msgs = [];
+    for (let i = 0; i < 5000; i++) msgs.push({ id: i % 3000, title: 'T' + i, url: '/u/' + (i % 3000) + '.html' });
+    const t0 = Date.now();
+    saveBatch(msgs, 'test_112_perf.json');
+    const ms = Date.now() - t0;
+    assertEqual(ms < 500, true, `5000 条 saveBatch 应 <500ms，实际 ${ms}ms`);
+    try { require('fs').unlinkSync(getFilePath('test_112_perf.json')); } catch (e) { /* 忽略 */ }
+});
+
+await test('一致性: saveBatch 索引判重 vs 逐条 upsert 结果一致（随机数据）', () => {
+    let seed = 20261202;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    // 生成含重复 id/url/无 id 的随机消息流（覆盖 id 命中/url 命中/更新/追加）
+    const mkMsgs = () => {
+        const msgs = [];
+        for (let i = 0; i < 60; i++) {
+            const r = rand();
+            const m = { title: 'T' + i, content: 'C' + Math.floor(rand() * 20) };
+            if (r < 0.4) m.id = Math.floor(rand() * 30);          // 有 id（含重复）
+            else if (r < 0.7) m.url = '/u/' + Math.floor(rand() * 25) + '.html'; // 无 id 有 url
+            else { m.id = Math.floor(rand() * 15); m.url = '/u/' + Math.floor(rand() * 15) + '.html'; } // id+url
+            msgs.push(m);
+        }
+        return msgs;
+    };
+    // 两轮：第一轮 + 第二轮（覆盖缓存中已存在时的更新/追加）
+    for (let round = 0; round < 3; round++) {
+        const msgs = mkMsgs();
+        // A: saveBatch（索引版）
+        const fa = getFilePath('test_112_cmp_a.json');
+        try { require('fs').unlinkSync(fa); } catch (e) { /* 忽略 */ }
+        saveBatch(msgs, 'test_112_cmp_a.json');
+        const ra = readMessages(fa).map(x => ({ id: x.id, title: x.title, url: x.url }));
+        // B: 逐条 appendMessageToFile（原 _upsert 逻辑，每批同序）
+        const fb = getFilePath('test_112_cmp_b.json');
+        try { require('fs').unlinkSync(fb); } catch (e) { /* 忽略 */ }
+        for (const msg of msgs) {
+            if (msg && typeof msg === 'object' && !Array.isArray(msg)) appendMessageToFile(msg, 'test_112_cmp_b.json');
+        }
+        const rb = readMessages(fb).map(x => ({ id: x.id, title: x.title, url: x.url }));
+        // 结果数组必须一致（顺序 + 内容）
+        assertEqual(JSON.stringify(ra), JSON.stringify(rb), `第${round}轮 saveBatch 与逐条 upsert 结果应一致`);
+        try { require('fs').unlinkSync(fa); } catch (e) { /* 忽略 */ }
+        try { require('fs').unlinkSync(fb); } catch (e) { /* 忽略 */ }
+    }
+});
+
+await test('一致性: 更新后索引维护（id 变化/url 失效）', () => {
+    const file = 'test_112_reindex.json';
+    const fp = getFilePath(file);
+    try { require('fs').unlinkSync(fp); } catch (e) { /* 忽略 */ }
+    try {
+        saveBatch([{ id: 1, title: 'old', url: '/a' }], file);
+        saveBatch([{ id: 1, title: 'new', url: '/b' }], file); // 同 id 更新，url 变化
+        const r = readMessages(fp);
+        assertEqual(r.length, 1, '更新后仍 1 条');
+        assertEqual(r[0].title, 'new', '标题已更新');
+        assertEqual(r[0].url, '/b', 'url 已更新');
+        assertEqual(isMessageInFile({ id: 1 }, file), true, '新 id 查到');
+        assertEqual(isMessageInFile({ url: '/a' }, file), false, '旧 url 失效');
+        assertEqual(isMessageInFile({ url: '/b' }, file), true, '新 url 查到');
+        // 追加新 id + 更新旧 id 混合
+        saveBatch([{ id: 2, title: 'x' }, { id: 1, title: 'final' }], file);
+        assertEqual(readMessages(fp).length, 2, '混合后 2 条');
+        assertEqual(isMessageInFile({ id: 1, title: 'final' }, file), true, 'id1 更新');
+    } finally {
+        try { require('fs').unlinkSync(fp); } catch (e) { /* 忽略 */ }
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 全部通过！${passed}/${passed}  100%`);
 } else {

@@ -1,5 +1,33 @@
 # 📋 更新日志
 
+## v3.118（性能问题修复：saveBatch O(n²)→O(n)）
+> 2026-08-02
+
+### 🐛 O(n²) 放大（实测 5000 条 2475ms）
+
+- **问题**：saveBatch 逐条 `_upsert` → `_findDedupIndex` 对**累积增长的数组** findIndex——N 条新消息 = O(N²) 次比较（1000 条 60ms → 5000 条 2475ms，平方放大）
+- **修复**：saveBatch 构建 id/url **Map 索引**（O(1) 判重定位 + O(1) 维护）：
+  - `idMap`（有 id）/ `urlMap`（所有有 url）/ `urlOnlyMap`（无 id 有 url）
+  - 判重口径与 `_findDedupIndex` 完全一致（id 匹配或 m 无 id 时 url；无 id 匹配 url）
+  - **findIndex 顺序语义 = 最小 index**——`addKey` 用"更小覆盖"维护首个
+  - 更新后 reindex（删旧键 + 加新键，保最小 index 语义）
+- **性能**：5000 条 2475ms → **164ms（15 倍）**
+- 单条 has/save 路径不变（`_upsert` 保留）
+
+### 🔍 修复过程中的关键 bug（一致性测试抓到）
+
+- reindex 加键曾用"不存在才加"——更新使更小 index 成为新"首个 id"时 Map 未更新 → 与 findIndex 顺序语义不一致（随机数据一致性测试抓出，旧逻辑模拟确认）
+
+### 🧪 112 章 3 个测试
+
+- 性能基准：5000 条 <500ms（防回归）
+- **随机判重一致性**：saveBatch（索引）vs 逐条 upsert（旧逻辑模拟）结果数组 JSON 一致（3 轮）
+- 更新索引维护：id 变化/url 失效/混合追加
+
+### 🧪 测试数
+
+**723 个全绿（单元 630 + 集成 70 + 通道 23）**
+
 ## v3.117（边界回归补充：修复过的边界 bug 显式锁定）
 > 2026-08-02
 
