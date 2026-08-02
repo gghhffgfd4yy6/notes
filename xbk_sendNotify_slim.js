@@ -435,7 +435,7 @@ function qywxBotNotify(text, desp) {
     return new Promise((resolve, reject) => {
         const { QYWX_ORIGIN, QYWX_KEY } = push_config;
         const options = {
-            url: `${QYWX_ORIGIN}/cgi-bin/webhook/send?key=${QYWX_KEY}`,
+            url: `${String(QYWX_ORIGIN || 'https://qyapi.weixin.qq.com').replace(/\/+$/, '')}/cgi-bin/webhook/send?key=${QYWX_KEY}`, // v3.138：去尾斜杠防双斜杠
             json: {
                 // v3.127：msgtype 'text' → 'markdown'——desp 是 Markdown 内容，text 模式会显示 ** 等原始符号（企微支持 markdown）
                 msgtype: 'markdown',
@@ -633,7 +633,7 @@ function tgNotify(text, desp) {
             const tgDesp = mdToPlain(desp, false); // v3.136：TG 保留 < >（HTML 转义），不剥 autolink
             const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             const options = {
-                url: `${TG_API_HOST || 'https://api.telegram.org'}/bot${TG_BOT_TOKEN}/sendMessage`,
+                url: `${String(TG_API_HOST || 'https://api.telegram.org').replace(/\/+$/, '')}/bot${TG_BOT_TOKEN}/sendMessage`, // v3.138：去尾斜杠防双斜杠
                 json: {
                     chat_id: TG_USER_ID,
                     text: esc(tgDesp ? `${tgText}\n\n${tgDesp}` : tgText),

@@ -168,12 +168,19 @@ await test('企业微信: webhook URL 含 key + JSON body', () => withChannels(a
     cfg.QYWX_KEY = 'webhook-abc';
     await notify.sendNotify('标题', '内容 ![图](http://img/1.jpg)');
     assert(gotCalls[0].url.includes('qyapi.weixin.qq.com'), `企微 URL: ${gotCalls[0].url}`);
+    assert(!gotCalls[0].url.includes('//cgi-bin'), `v3.138：QYWX_ORIGIN 尾斜杠不应双斜杠: ${gotCalls[0].url}`);
     assert(gotCalls[0].url.includes('webhook-abc'), 'key 在 URL');
     assert(gotCalls[0].options.json.msgtype === 'markdown', 'msgtype（v3.127：desp 是 Markdown，text 会显示原始符号）');
     assert(gotCalls[0].options.json.markdown.content.includes('标题'), '内容含标题');
     assert(!gotCalls[0].options.json.markdown.content.includes('!['), 'v3.130：企微 markdown 不支持图片，![]() 应剥成 alt');
     assert(gotCalls[0].options.json.markdown.content.includes('图'), '图片 alt 应保留');
     assert(gotCalls.length === 1, '仅企微一次请求');
+    // v3.138：QYWX_ORIGIN 带尾斜杠 → URL 无双斜杠
+    const origOrigin = cfg.QYWX_ORIGIN;
+    cfg.QYWX_ORIGIN = 'https://qyapi.weixin.qq.com/';
+    await notify.sendNotify('标题', '内容');
+    assert(!gotCalls[1].url.includes('//cgi-bin'), `尾斜杠 host 不应双斜杠: ${gotCalls[1].url}`);
+    cfg.QYWX_ORIGIN = origOrigin;
 }));
 
 // 6. wxpusher
