@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.133 — 全通道失败reject(9通道err改reject+sendNotify allSettled，仅统计已配置通道；防网络故障丢消息不写缓存下次重试，部分成功不重复推)；732全绿(633+74+26) ********
+//******** 线报酷推送脚本 v3.134 — 截断不缓存(异常海量时截断的未推消息写缓存会静默丢失，现下次运行推剩余不丢不重复)；732全绿(633+73+26) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1423,8 +1423,12 @@ const App = {
 
             // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/8 分钟运行；正常 ~20 条无影响）
             const maxPerRun = (Number.isFinite(Config.push.maxPerRun) && Config.push.maxPerRun > 0) ? Config.push.maxPerRun : 100;
+            let truncatedKeys = new Set();
             if (items.length > maxPerRun) {
                 console.warn(`⚠️ 单次待推送 ${items.length} 条超过上限 ${maxPerRun}，只推前 ${maxPerRun} 条（防接口异常推送风暴；调整 Config.push.maxPerRun）`);
+                // v3.134：截断掉的不写缓存——否则下次运行去重跳过导致静默丢失（缓存当"已处理"）；下次运行推剩余
+                // keyOf 在 ⑥ 才定义，此处用同口径（id 优先 + url 归一）构造截断 key
+                truncatedKeys = new Set(items.slice(maxPerRun).map(it => Utils.hasValidId(it) ? 'id:' + it.id : 'url:' + Utils.normUrl(it.url)));
                 items = items.slice(0, maxPerRun);
             }
 
@@ -1515,7 +1519,8 @@ const App = {
             // ⑦ 写缓存：只收录「被过滤的数据」+「推送成功的数据」
             //    推送失败的排除在外 → 下次运行重新推送（避免消息永久丢失）
             const itemsKeys = new Set(items.map(keyOf));
-            const toCache = newMessages.filter(m => !itemsKeys.has(keyOf(m)) || pushedKeys.has(keyOf(m)));
+            // v3.134：排除截断未推的（下次运行推剩余，防静默丢失）
+            const toCache = newMessages.filter(m => !truncatedKeys.has(keyOf(m)) && (!itemsKeys.has(keyOf(m)) || pushedKeys.has(keyOf(m))));
             MessageStore.saveBatch(toCache, cacheName);
 
             // ⑧ 统计

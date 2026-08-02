@@ -1428,6 +1428,23 @@ await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () 
         for (let i = 0; i < 20; i++) fakeData.push(makeItem({ id: i + 2000 }));
         const s2 = await xbk.run();
         assert(s2.pushed === 20, `正常 20 条应全推: ${JSON.stringify(s2)}`);
+        // v3.134：截断未推的不写缓存 → 下次运行推剩余（不丢不重复）
+        reset();
+        setPushUrl('t58c_trunc_retry');
+        Config.push.maxPerRun = 100;
+        fakeData = [];
+        for (let i = 0; i < 150; i++) fakeData.push(makeItem({ id: i + 3000 }));
+        const s3 = await xbk.run(); // 第一次：截断推 100
+        assert(s3.pushed === 100, `首次应推 100: ${JSON.stringify(s3)}`);
+        const cached1 = readCacheFile('t58c_trunc_retry');
+        assert(cached1.length === 100, `首次只缓存推的 100（截断的 50 不缓存）: ${cached1.length}`);
+        reset();
+        setPushUrl('t58c_trunc_retry');
+        fakeData = [];
+        for (let i = 0; i < 150; i++) fakeData.push(makeItem({ id: i + 3000 }));
+        const s4 = await xbk.run(); // 第二次：缓存去重 100 → 剩 50 → 推 50（不重复）
+        assert(s4.pushed === 50, `二次应推剩余 50: ${JSON.stringify(s4)}`);
+        assert(s4.dedup === 100, `二次去重 100: ${JSON.stringify(s4)}`);
     } finally {
         Config.push.maxPerRun = orig;
     }
