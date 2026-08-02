@@ -4857,16 +4857,18 @@ await test('#链接: {链接} 占位符 Markdown 安全化（v3.74）', () => {
 
 console.log('\n📂 101. 版本一致性（防文件头版本号过时——v3.35 曾出现「v3.8 当前最新」过时误导）');
 
-await test('版本一致性：文件头版本号与 CHANGELOG 顶部一致', () => {
+await test('版本一致性：文件头版本号与 CHANGELOG 最新一致', () => {
     const fs = require('fs');
     const path = require('path');
     const main = fs.readFileSync(path.join(__dirname, 'xbk_function_v3.js'), 'utf8');
     const changelog = fs.readFileSync(path.join(__dirname, 'CHANGELOG.md'), 'utf8');
     const m = main.match(/v(\d+\.\d+)/);
-    const c = changelog.match(/^## v(\d+\.\d+)/m);
+    // v3.123：CHANGELOG 改为正序（最新在最下面）——取最后一个版本号
+    const all = changelog.match(/^## v(\d+\.\d+)/gm);
+    const c = all ? all[all.length - 1].match(/v(\d+\.\d+)/) : null;
     assertEqual(!!m, true, '主代码文件头应有版本号');
-    assertEqual(!!c, true, 'CHANGELOG 顶部应有版本号');
-    assertEqual(m[1], c[1], `文件头版本号(${m[1]})应与 CHANGELOG 顶部(${c[1]})一致`);
+    assertEqual(!!c, true, 'CHANGELOG 应有版本号');
+    assertEqual(m[1], c[1], `文件头版本号(${m[1]})应与 CHANGELOG 最新(${c[1]})一致`);
 });
 
 await test('版本一致性：package.json 版本与文件头一致（v3.71）', () => {
