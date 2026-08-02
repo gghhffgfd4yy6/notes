@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.113 — 依赖排查：修复3处路径硬编码移植性bug(test_filter 23处/workspace→CACHE+test_notify gotPath+require+主代码package.json缺省回退)；环境依赖盘点(时区#22取舍/随机性jitter预期/Node版本lookbehind9+✓)；模拟移植验证通过；712全绿 ********
+//******** 线报酷推送脚本 v3.114 — 边界条件检查：110章(EBODYLIMIT恰好maxBody/getFilePath 200字节精确/跨日0点边界)+t55集成边界(parallelLimit=1串行等价/pushInterval=0/retry=0不重试/retry=1重试成功)；716全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';

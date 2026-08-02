@@ -5834,6 +5834,70 @@ await test('Fuzz-时间: checkTimeCompiled 随机 compiled × 随机 group 不�
     }
 });
 
+console.log('\n📂 110. 边界精确值二（EBODYLIMIT 恰好/getFilePath 200 字节/跨日边界）');
+
+await test('边界: got 响应体恰好等于 maxBody 不超（精确边界）', async () => {
+    const http = require('http');
+    const got = require('got');
+    const server = http.createServer((req, res) => { res.writeHead(200); res.end('1234567890'); }); // 10 字节
+    await new Promise(r => server.listen(0, r));
+    const port = server.address().port;
+    try {
+        // 恰好 10 字节 ≤ maxBody 10 → 正常
+        const ok = await got(`http://127.0.0.1:${port}/x`, { maxBody: 10 });
+        assertEqual(ok.statusCode, 200, '恰好等于 maxBody 应正常');
+        // 10 字节 > maxBody 9 → EBODYLIMIT（超过 1 字节即超）
+        let err = null;
+        try { await got(`http://127.0.0.1:${port}/x`, { maxBody: 9 }); } catch (e) { err = e; }
+        assertEqual(!!err && err.code === 'EBODYLIMIT', true, '超过 maxBody 1 字节应 EBODYLIMIT');
+        // maxBody=0 → 回退默认（20MB），不误报
+        const ok0 = await got(`http://127.0.0.1:${port}/x`, { maxBody: 0 });
+        assertEqual(ok0.statusCode, 200, 'maxBody=0 应回退默认不误报');
+    } finally {
+        await new Promise(r => server.close(r));
+    }
+});
+
+await test('边界: getFilePath 200 字节精确截断（ASCII/中文/混合）', () => {
+    // 恰好 200 字节 → 不截断（v3.33 逻辑：>200 才截）
+    const n200 = 'x'.repeat(195) + '.json'; // 195+5=200 字节
+    const p1 = getFilePath(n200);
+    assertEqual(require('path').basename(p1), n200, '恰好 200 字节不截断');
+    // 201 字节 → 截断到 ≤200
+    const n201 = 'x'.repeat(196) + '.json'; // 201 字节
+    const p2 = getFilePath(n201);
+    const base2 = require('path').basename(p2);
+    assertEqual(Buffer.byteLength(base2, 'utf8') <= 200, true, `201 字节截断到 ≤200: ${Buffer.byteLength(base2, 'utf8')}`);
+    // 中文（3 字节/字）边界：67 字 = 201 字节
+    const cn = '中'.repeat(65) + '.json'; // 195+5=200
+    const p3 = getFilePath(cn);
+    assertEqual(Buffer.byteLength(require('path').basename(p3), 'utf8') <= 200, true, '中文名截断 ≤200');
+    // 尾部代理对 emoji 名不崩
+    const em = '😀'.repeat(80) + '.json'; // 160+5=165 字节（代理对 4 字节/个）
+    const p4 = getFilePath(em);
+    assertEqual(typeof p4, 'string', 'emoji 文件名不崩');
+    // 极端：200 字节恰好是代理对中间 → 截断安全
+    const edge = 'x'.repeat(196) + '\ud83d\ude00' + '.json';
+    const p5 = getFilePath(edge);
+    assertEqual(typeof p5, 'string', '代理对边界文件名不崩');
+});
+
+await test('边界: 跨日边界（今天 0 点 = 0 天 / 昨天 0 点 = 1 天）', () => {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    assertEqual(daysComputed(today.getTime()), 0, '今天 0 点应=0 天');
+    const yesterday = new Date(); yesterday.setHours(0, 0, 0, 0); yesterday.setDate(yesterday.getDate() - 1);
+    assertEqual(daysComputed(yesterday.getTime()), 1, '昨天 0 点应=1 天');
+    // 未来 1 分钟 → 0（非正差归零）
+    const future = Date.now() + 60000;
+    assertEqual(daysComputed(future), 0, '未来 1 分钟应=0');
+    // 恰好 23:59:59 前（不足 1 天）→ 0
+    const almost = Date.now() - 86399999;
+    assertEqual(daysComputed(almost), 0, '不足 1 天应=0');
+    // 恰好 24h 前 → 1
+    const dayAgo = Date.now() - 86400000;
+    assertEqual(daysComputed(dayAgo), 1, '恰好 24h 前应=1');
+});
+
 if (failed === 0) {
     console.log(`  🎉 全部通过！${passed}/${passed}  100%`);
 } else {

@@ -1285,6 +1285,52 @@ await test('Fuzz 回归: 孤立代理内容 run() 推送成功且无孤立代理
     }
 });
 
+
+await test('边界: parallelLimit=1 与顺序模式等价 + pushInterval=0 快速 + retry=0 不重试', async () => {
+    // parallelLimit=1：每批 1 条 = 串行效果
+    reset();
+    setPushUrl('t55_limit1');
+    fakeData = [makeItem({ id: 1 }), makeItem({ id: 2 }), makeItem({ id: 3 })];
+    const origMode = Config.push.mode, origLimit = Config.push.parallelLimit, origPI = Config.timing.pushInterval;
+    try {
+        Config.push.mode = 'parallel';
+        Config.push.parallelLimit = 1;
+        Config.timing.pushInterval = 0;
+        const summary = await xbk.run();
+        assert(summary.pushed === 3, `parallelLimit=1 应推 3 条: ${JSON.stringify(summary)}`);
+        assert(pushCalls.length === 3, '3 条全部推送');
+        assert(summary.failed === 0, '无失败');
+    } finally {
+        Config.push.mode = origMode; Config.push.parallelLimit = origLimit; Config.timing.pushInterval = origPI;
+    }
+    // retry=0：不重试（mock 首次失败 → 直接抛错）
+    reset();
+    setPushUrl('t55b_retry0');
+    fakeData = [];
+    const origRetry = Config.api.retry;
+    try {
+        Config.api.retry = 0;
+        failCount = 1; // 首次失败，retry=0 不重试
+        let threw = false;
+        try { await xbk.run(); } catch (e) { threw = true; }
+        assert(threw, 'retry=0 时首次失败应直接抛错');
+    } finally {
+        Config.api.retry = origRetry;
+    }
+    // retry=1：失败 1 次后重试成功
+    reset();
+    setPushUrl('t55c_retry1');
+    fakeData = [makeItem({ id: 1 })];
+    try {
+        Config.api.retry = 1;
+        failCount = 1; // 失败 1 次 → 重试成功
+        const summary = await xbk.run();
+        assert(summary.pushed === 1, 'retry=1 失败一次后应重试成功');
+    } finally {
+        Config.api.retry = origRetry;
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 集成测试全部通过！${passed}/${passed}`);
 } else {
