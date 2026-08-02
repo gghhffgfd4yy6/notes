@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.114 — 边界条件检查：110章(EBODYLIMIT恰好maxBody/getFilePath 200字节精确/跨日0点边界)+t55集成边界(parallelLimit=1串行等价/pushInterval=0/retry=0不重试/retry=1重试成功)；716全绿 ********
+//******** 线报酷推送脚本 v3.115 — 时区统一修复：parseTime日期解析本地→Date.UTC(8位/严格日期//分隔)+tuisong datetime/shorttime改getUTC*；顺带修复{时间}小时无add0(+8输出1:30而非01:30)；测试同步(daysAgo getUTC/fake Date.UTC/当天测试daysAgo(0)/ISO快照UTC值)；6时区(UTC/+8/Honolulu/NY/Berlin/Sydney)全绿+行为一致；716全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -132,10 +132,11 @@ const Utils = {
         if (typeof time === 'number' || /^\d+$/.test(s)) {
             const n = Number(s);
             // 8 位 YYYYMMDD：月份 1~12 / 日期 1~31 预检 + 回读校验（拒绝 20261332 这类非法日期）
+            // v3.115 时区修复：Date.UTC 解析——日期是"日粒度"概念，本地时区解析会导致跨时区部署天数差 1（Honolulu 实测）
             const m8 = s.match(/^(\d{4})(\d{2})(\d{2})$/);
             if (m8 && Number(m8[2]) >= 1 && Number(m8[2]) <= 12 && Number(m8[3]) >= 1 && Number(m8[3]) <= 31) {
-                const t = new Date(+m8[1], +m8[2] - 1, +m8[3]);
-                if (t.getFullYear() === +m8[1] && t.getMonth() === +m8[2] - 1 && t.getDate() === +m8[3]) return t.getTime();
+                const t = new Date(Date.UTC(+m8[1], +m8[2] - 1, +m8[3]));
+                if (t.getUTCFullYear() === +m8[1] && t.getUTCMonth() === +m8[2] - 1 && t.getUTCDate() === +m8[3]) return t.getTime();
                 return null;
             }
             // 时间戳：0 = 1970-01-01 不应被短路；秒(1e8~TS_BOUND)/毫秒(TS_BOUND~1e14)按 TS_BOUND 分界
@@ -147,16 +148,23 @@ const Utils = {
             return null;
         }
         // 严格匹配完整 YYYY-MM-DD（1~2 位月日；锚定结尾，拒绝 2026-07-31abc 脏前缀）
+        // v3.115 时区修复：Date.UTC 解析（同 8 位日期）
         const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
         if (m) {
             const y = +m[1], mo = +m[2], d = +m[3];
-            const t = new Date(y, mo - 1, d);
+            const t = new Date(Date.UTC(y, mo - 1, d));
             // 回读校验：new Date 会把 2026-02-31 滚动到 03-03，回读对比即拒绝
-            if (t.getFullYear() === y && t.getMonth() === mo - 1 && t.getDate() === d) return t.getTime();
+            if (t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d) return t.getTime();
             return null;
         }
         // 其他格式（含 ISO 2026-08-01T00:00:00Z、/ 分隔等）回退宿主解析；先原生（支持 ISO），失败再试 / 替换
-        let t = new Date(s);
+        // v3.115：无时区标记的本地语义字符串按 UTC 补 Z（纯日期已被上方分支拦截；此处为 'YYYY/MM/DD' 等）
+        let t;
+        if (!/[T Z]/.test(s) && /^\d{4}\/\d{1,2}\/\d{1,2}$/.test(s)) {
+            t = new Date(s.replace(/\//g, '-') + 'T00:00:00Z');
+        } else {
+            t = new Date(s);
+        }
         if (isNaN(t.getTime())) t = new Date(s.replace(/-/g, '/'));
         if (isNaN(t.getTime())) return null;
         return t.getTime();
@@ -366,8 +374,10 @@ const Formatter = {
                 data.shorttime = undefined;
             } else {
                 const dt = new Date(t);
-                data.datetime = `${dt.getFullYear()}-${Utils.add0(dt.getMonth() + 1)}-${Utils.add0(dt.getDate())}`;
-                data.shorttime = `${dt.getHours()}:${Utils.add0(dt.getMinutes())}`;
+                // v3.115 时区统一：与 parseTime 的 UTC 解析口径一致——getUTC* 保证跨时区部署
+                // 日期时间显示一致；顺带修复 getHours 无 add0（+8 时区输出 '1:30' 而非 '01:30'）
+                data.datetime = `${dt.getUTCFullYear()}-${Utils.add0(dt.getUTCMonth() + 1)}-${Utils.add0(dt.getUTCDate())}`;
+                data.shorttime = `${Utils.add0(dt.getUTCHours())}:${Utils.add0(dt.getUTCMinutes())}`;
             }
         }
 

@@ -1,5 +1,33 @@
 # 📋 更新日志
 
+## v3.115（时区统一：跨时区部署行为一致）
+> 2026-08-02
+
+### 🐛 时区漂移 bug（TZ 环境实测发现）
+
+- **问题**：日期解析用本地时区（`new Date(y,mo-1,d)`），"今天"是绝对时刻——同一数据（注册日期）在不同时区 `daysComputed` 结果不同：UTC/+8 算 1 天、Honolulu 算 **0 天**（差 1 天）→ **跨时区部署过滤行为不一致**（同一条数据在 A 服务器拦截、B 服务器放行）
+- **修复**（3 处）：
+  1. `parseTime` 日期解析 → **Date.UTC**（8 位 YYYYMMDD / 严格 YYYY-MM-DD / `/` 分隔补 Z），回读校验改 getUTC*
+  2. `tuisong_replace` 的 datetime/shorttime → **getUTC***（与解析口径一致）
+  3. **顺带修复 `{时间}` 小时无 add0 bug**（+8 时区输出 `1:30` 而非 `01:30`，UTC 碰巧 17 两位数掩盖）
+
+### 🔧 测试同步（7 处）
+
+- `daysAgo` helper → getUTC* 生成（Honolulu 本地日期 ≠ UTC 日期，差 1 天）
+- fake Date 测试 → `Date.UTC(2026,7,1)` 构造
+- 4 个"当天注册"测试 → `daysAgo(0)`（UTC 今天）
+- `{时间}`/ISO 快照断言 → 格式校验 / UTC 明确值
+- 天数精确计算 expected → `Date.UTC`
+
+### ✅ 验证
+
+- **6 个时区全部 623/623 全绿**：UTC / Asia/Shanghai / Pacific/Honolulu / America/New_York / Europe/Berlin / Australia/Sydney
+- 主代码跨时区行为一致：daysComputed([1,213,5,3]) + `{日期}|{时间}` 四时区全同
+
+### 🧪 测试数
+
+**716 个全绿（单元 623 + 集成 70 + 通道 23）**
+
 ## v3.114（边界条件检查：精确边界二 + 集成边界）
 > 2026-08-02
 

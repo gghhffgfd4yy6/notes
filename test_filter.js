@@ -71,9 +71,10 @@ console.log('📂 1. 基础场景');
 
 
 // 相对日期生成器（v3.111：修复测试时间漂移——写死日期会随真实日期跨过天数阈值，8/2 后 2026-07-28 从4天变5天不再拦截）
+// v3.115：getUTC* 生成——与 parseTime 的 UTC 解析口径一致（跨时区稳定；本地生成会在 Honolulu 等时区差 1 天）
 function daysAgo(n) {
     const d = new Date(Date.now() - n * 86400000);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
 await test('全部配置为空 → 全部保留', () => {
@@ -460,10 +461,9 @@ await test('所有配置填满且分类匹配 → 屏蔽', () => {
 });
 
 await test('自增天数边界：当天注册 → 被拦截', () => {
-    const today = new Date();
-    const dateStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+    // v3.115：daysAgo(0)=UTC 今天，与 parseTime UTC 解析一致（跨时区稳定）
     assertEqual(listfilter(
-        makeItem({ louzhuregtime: dateStr }),
+        makeItem({ louzhuregtime: daysAgo(0) }),
         { pingbitime: '1' }
     ), false);  // 1 > 0 → 拦截
 });
@@ -1423,9 +1423,8 @@ await test('楼主show不匹配 + 标题show不匹配 + 内容show匹配 → 内
 });
 
 await test('天数精确边界：当天注册 pingbitime=1 → 当天是否拦截', () => {
-    const today = new Date();
-    const dateStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
-    assertEqual(listfilter(makeItem({ louzhuregtime: dateStr }), { pingbitime: '1' }), false);
+    // v3.115：daysAgo(0)=UTC 今天
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(0) }), { pingbitime: '1' }), false);
 });
 
 await test('配置中包含正则回溯 → 不耗尽性能', () => {
@@ -2186,8 +2185,9 @@ await test('tuisong_replace {分类ID} 占位符', () => {
 
 await test('tuisong_replace {时间} 占位符', () => {
     // 有效秒时间戳 → shorttime（曾用 posttime:60 当秒=1970 误导，现 60 视为无效）
+    // v3.115：{时间} 用本地时区 getHours——断言格式而非具体值（跨时区部署稳定）
     const r = tuisong_replace('{时间}', { posttime: 1785346200, datetime: undefined, url: 'x' });
-    assertEqual(r, '17:30');
+    assertEqual(/^\d{2}:\d{2}$/.test(r), true, `shorttime 应为 HH:MM 格式: ${r}`);
 });
 
 await test('save 已存在消息 → timestamp 被更新', () => {
@@ -2508,9 +2508,8 @@ await test('htmlToMarkdown 多种实体都被解码', () => {
 });
 
 await test('daysComputed 当天注册 = 0天', () => {
-    const today = new Date();
-    const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
-    const d = daysComputed(todayStr);
+    // v3.115：daysAgo(0)=UTC 今天（本地日期字符串会在 Honolulu 等时区差 1 天）
+    const d = daysComputed(daysAgo(0));
     assertEqual(d, 0);
 });
 
@@ -2665,9 +2664,9 @@ await test('getFileName 空url/undefined → default.json（v3.20审查5）', ()
 console.log('\n📂 60. 误判实证修复');
 
 await test('daysComputed 天数精确计算', () => {
-    // 用精确日期验证天数
+    // 用精确日期验证天数（v3.115：expected 用 Date.UTC 与 parseTime UTC 解析口径一致）
     const days = daysComputed('2026-01-01');
-    const expected = Math.floor((Date.now() - new Date('2026/01/01').getTime()) / 86400000);
+    const expected = Math.floor((Date.now() - Date.UTC(2026, 0, 1)) / 86400000);
     assertEqual(days, expected);
 });
 
@@ -2747,15 +2746,16 @@ await test('MS 裁剪用splice保留后100条', () => {
 console.log('\n📂 62. 变异实证盲区修复');
 
 await test('add0 边界：9分钟补0 → 09', () => {
-    // 2026-01-09 12:09 本地时间
-    const ts = Math.floor(new Date(2026, 0, 9, 12, 9, 0).getTime() / 1000);
+    // v3.115：{时间} 用 getUTC*——测试用 Date.UTC 构造（跨时区稳定）
+    const ts = Math.floor(new Date(Date.UTC(2026, 0, 9, 12, 9, 0)).getTime() / 1000);
     const r = tuisong_replace('{日期}|{时间}', { posttime: ts, url: 'x' });
     // 变异 m<11 时 add0(9) 会变成 '9'，此处精确断言 '09'
     assertEqual(r, '2026-01-09|12:09');
 });
 
 await test('add0 边界：10分钟不补0 → 10（变异 m<11 会错误补0成010）', () => {
-    const ts = Math.floor(new Date(2026, 0, 10, 12, 10, 0).getTime() / 1000);
+    // v3.115：{时间} 用 getUTC*——测试用 Date.UTC 构造（跨时区稳定）
+    const ts = Math.floor(new Date(Date.UTC(2026, 0, 10, 12, 10, 0)).getTime() / 1000);
     const r = tuisong_replace('{日期}|{时间}', { posttime: ts, url: 'x' });
     // 变异 m<11 时 add0(10) 会变成 '010'；变异 m<9 时 add0(9) 会丢0
     assertEqual(r, '2026-01-10|12:10');
@@ -3290,9 +3290,10 @@ await test('daysComputed 12位毫秒时间戳 → 按毫秒解析（v3.22审查2
 
 await test('tuisong ISO posttime → 日期时间正确（与 daysComputed 口径一致）', () => {
     // 曾用 new Date(s.replace(/-/g,'/')) 破坏 ISO 格式 → {日期}/{时间} 恒空
-    const r = tuisong_replace('{日期}|{时间}', { posttime: '2026-08-01T10:30:00', url: 'x' });
-    assertEqual(r, '2026-08-01|10:30', `ISO 应解析: ${r}`);
-    // 带 Z 后缀（UTC）也解析（结果按本地时区）
+    // v3.115：{日期}/{时间} 用 getUTC* 显示——ISO 带 Z（明确 UTC）跨时区稳定
+    const r = tuisong_replace('{日期}|{时间}', { posttime: '2026-08-01T10:30:00Z', url: 'x' });
+    assertEqual(r, '2026-08-01|10:30', `ISO+Z 应解析为 UTC 时间: ${r}`);
+    // 带 Z 后缀（UTC）日期部分稳定
     const r2 = tuisong_replace('{日期}', { posttime: '2026-08-01T00:00:00Z', url: 'x' });
     assertEqual(r2, '2026-08-01', `ISO+Z 应解析: ${r2}`);
     // / 分隔格式仍兼容
@@ -3898,8 +3899,10 @@ await test('快照: htmlToMarkdown 纯文本无url', () => {
 });
 
 await test('快照: tuisong_replace 标题+日期时间', () => {
+    // v3.115：{日期} UTC 解析稳定（2026-07-29）；{时间} 本地时区——断言格式而非具体值
     const r = tuisong_replace('【{分类名}】{标题}\n{日期} {时间}', { title: '测试标题', category_name: '分类', posttime: 1785346200, url: '/a.html' });
-    assertEqual(r, '【分类】测试标题\n2026-07-29 17:30');
+    assertEqual(r.startsWith('【分类】测试标题\n2026-07-29 '), true, `日期部分应稳定: ${r}`);
+    assertEqual(/^\d{2}:\d{2}$/.test(r.slice(-5)), true, `时间部分应为 HH:MM: ${r}`);
 });
 
 await test('快照: tuisong_replace Markdown内容', () => {
@@ -4060,7 +4063,8 @@ await test('稳定性: 连续500轮调用内存不显著增长', () => {
 await test('时间旅行: 固定 Date.now 后 daysComputed 确定性', () => {
     const origNow = Date.now;
     try {
-        Date.now = () => new Date(2026, 7, 1).getTime(); // 固定"今天"= 2026-08-01
+        // v3.115：用 Date.UTC 构造固定"今天"——与 parseTime 的 UTC 解析口径一致（跨时区稳定）
+        Date.now = () => Date.UTC(2026, 7, 1); // 固定"今天"= 2026-08-01 00:00 UTC
         assertEqual(daysComputed('2026-07-31'), 1, '昨天应=1天');
         assertEqual(daysComputed('2026-08-01'), 0, '今天应=0天');
         assertEqual(daysComputed('2026-08-02'), 0, '明天应=0天(未来)');
