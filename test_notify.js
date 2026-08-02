@@ -232,6 +232,21 @@ await test('HITOKOTO: one() 带 3s 短超时（不阻塞推送）', () => withCh
     assert(hitokotoCall.options && hitokotoCall.options.timeout === 3000,
         `一言应带 3s 超时: ${hitokotoCall.options && hitokotoCall.options.timeout}`);
 }));
+await test('mdToPlain: 原文链接 text===url 不重复显示（v3.153）', () => withChannels(async () => {
+    cfg.PUSH_PLUS_TOKEN = 'token123';
+    // 真实 desp 原文链接（text 与 href 相同）
+    await notify.sendNotify('标题', '内容\n\n原文链接：[https://new.ixbk.net/a.html](https://new.ixbk.net/a.html)');
+    const c = gotCalls[0];
+    const content = JSON.parse(c.options.body).content;
+    assert(!content.includes('a.html (https://'), `text===url 不应重复: ${content}`);
+    assert(content.includes('原文链接：https://new.ixbk.net/a.html'), '原文链接应显示一次');
+    // 普通链接 text!==url 仍显示 text (url)
+    await notify.sendNotify('标题2', '[查看详情](https://item.jd.com/1001.html)');
+    const c2 = gotCalls[1];
+    const content2 = JSON.parse(c2.options.body).content;
+    assert(content2.includes('查看详情 (https://item.jd.com/1001.html)'), `普通链接应 text (url): ${content2}`);
+}));
+
 await test('mdToPlain: 数字夹 * 不误剥（规格 5*3*2cm 曾变 532cm）', () => withChannels(async () => {
     cfg.PUSH_PLUS_TOKEN = 'token123';
     // 真实线报规格格式：180ml*12/箱、5*3*2cm
