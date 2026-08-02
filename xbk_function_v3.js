@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.123 — 接口异常告警(Config.alert限频防轰炸，接口挂时主动通知本人；intervalMs<=0不限频)；726全绿(632+71+23) ********
+//******** 线报酷推送脚本 v3.125 — 运行日报(跨天发昨日汇总+当天累加，report.state持久化；Config.report.enabled)；727全绿(632+72+23) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -80,6 +80,11 @@ const Config = {
     alert: {
         enabled: true,
         intervalMs: 3600000,
+    },
+
+    // v3.125：运行日报——每天一条推送汇总（前一天统计），不用翻 run.log
+    report: {
+        enabled: true,
     },
 };
 
@@ -1276,6 +1281,34 @@ const App = {
         } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
     },
 
+    // 运行日报（v3.125）：跨天时发"昨日日报"，当天累加统计；静默不影响主流程
+    _updateReport(summary) {
+        try {
+            if (!Config.report || Config.report.enabled === false) return;
+            const statePath = path.join(MessageStore.cacheDir, 'report.state');
+            let state = { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
+            try { state = JSON.parse(fs.readFileSync(statePath, 'utf8')) || state; } catch (e) { /* 无状态=首次 */ }
+            const today = new Date().toISOString().slice(0, 10); // UTC 日期（跨时区一致）
+            if (state.date && state.date !== today) {
+                // 新的一天：发昨日日报（若有数据）
+                if (state.total > 0 || state.failed > 0) {
+                    const t = `📊 xbk-push 日报（${state.date}）`;
+                    const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}`;
+                    notify.sendNotify(t, d); // fire-and-forget
+                    console.log('已发送昨日运行日报');
+                }
+                state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
+            }
+            if (!state.date) state.date = today;
+            state.total += summary.total || 0;
+            state.dedup += summary.dedup || 0;
+            state.filtered += summary.filtered || 0;
+            state.pushed += summary.pushed || 0;
+            state.failed += summary.failed || 0;
+            fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
+        } catch (e) { /* 日报失败静默 */ }
+    },
+
     async run() {
         console.debug('开始获取线报酷数据...');
 
@@ -1486,14 +1519,18 @@ const App = {
             // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
             this._writeRunLog(`${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} pushed=${successCount} failed=${items.length - successCount} elapsed=${elapsed}s\n`);
 
-            // 返回运行摘要（供外部/测试观测，cron 可据此判断）
-            return {
+            // v3.125：运行日报（跨天发昨日汇总 + 当天累加；静默）
+            const summary = {
                 total: xbkdata.length,
                 dedup: dedupCount,
                 filtered: filteredCount,
                 pushed: successCount,
                 failed: items.length - successCount,
             };
+            this._updateReport(summary);
+
+            // 返回运行摘要（供外部/测试观测，cron 可据此判断）
+            return summary;
 
         } catch (error) {
             // 非 Error 抛出（如字符串）时兜底，避免 error.message undefined

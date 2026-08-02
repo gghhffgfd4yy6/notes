@@ -1378,6 +1378,35 @@ await test('接口异常 → 发送告警 + 限频（v3.123）', async () => {
     }
 });
 
+
+await test('运行日报：跨天发昨日日报 + 当天累加（v3.125）', async () => {
+    reset();
+    setPushUrl('t57_report');
+    fakeData = [makeItem({ id: 1 })];
+    const orig = Config.report.enabled;
+    Config.report.enabled = true;
+    const statePath = path.join(CACHE_DIR, 'report.state');
+    try {
+        // 写昨天状态（有数据）→ 今天首次 run 应发昨日日报
+        require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, dedup: 1, filtered: 1, pushed: 3, failed: 0 }));
+        await xbk.run();
+        const report = pushCalls.find(c => c.text.includes('日报'));
+        assert(!!report, '跨天应发昨日日报');
+        assert(report.desp.includes('推送 3 条'), `日报应含昨日统计: ${report.desp}`);
+        // 同一天再跑 → 不重复发日报（累加今天；用新 id 防缓存去重）
+        pushCalls.length = 0;
+        fakeData = [makeItem({ id: 2 })];
+        await xbk.run();
+        assert(!pushCalls.some(c => c.text.includes('日报')), '同一天不重复发日报');
+        const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'));
+        assert(st.pushed >= 2, `当天应累加 pushed: ${st.pushed}`);
+        assert(st.date === new Date().toISOString().slice(0, 10), '状态日期应为今天');
+    } finally {
+        Config.report.enabled = orig;
+        try { require('fs').unlinkSync(statePath); } catch (e) { /* 忽略 */ }
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 集成测试全部通过！${passed}/${passed}`);
 } else {
