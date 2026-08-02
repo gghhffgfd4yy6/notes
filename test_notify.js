@@ -99,6 +99,18 @@ await test('Server酱: SCT 前缀走 Turbo URL + 表单 URL 编码', () => withC
     assert(c.options.headers['Content-Type'].includes('x-www-form-urlencoded'), '表单类型');
 }));
 
+await test('Server酱: title 超 32 字符截断（v3.126：真实接口 4/20 标题超限）', () => withChannels(async () => {
+    cfg.PUSH_KEY = 'SCT123456';
+    const longTitle = '好朋友幼儿社交启蒙绘本凸凹星的故事 11元，好朋友幼儿社交启蒙绘本久等了集合 1...';
+    await notify.sendNotify(longTitle, '内容');
+    const bodyText = decodeURIComponent(gotCalls[0].options.body.match(/text=([^&]*)/)[1]);
+    assert(bodyText.length <= 32, `title 应截断到 ≤32: ${bodyText.length} 字符`);
+    // 代理对安全：emoji 标题截断不产生孤立高代理
+    await notify.sendNotify('😀'.repeat(20) + '标题', '内容');
+    const t2 = decodeURIComponent(gotCalls[1].options.body.match(/text=([^&]*)/)[1]);
+    assert(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(t2), '不应有孤立高代理');
+}));
+
 // 2. Server酱 老版 URL
 await test('Server酱: 非SCT前缀走老版 URL', () => withChannels(async () => {
     cfg.PUSH_KEY = 'OLD123';

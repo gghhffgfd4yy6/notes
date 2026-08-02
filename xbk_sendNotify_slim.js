@@ -243,6 +243,14 @@ function serverNotify(text, desp) {
     return new Promise((resolve) => {
         const { PUSH_KEY } = push_config;
         if (PUSH_KEY) {
+            // v3.126：Server酱 title 上限 32 字符——主代码 titleMax=100 不满足，此处通道层精准截断
+            // （安全处理代理对：末尾高代理退一位，避免切坏 emoji）
+            if (text.length > 32) {
+                let cut = text.slice(0, 32);
+                const last = cut.charCodeAt(cut.length - 1);
+                if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1);
+                text = cut;
+            }
             // 微信server酱推送通知一个\n不会换行，需要两个\n才能换行，故做此替换
             desp = desp.replace(/[\n\r]/g, '\n\n');
             const options = {
