@@ -77,11 +77,25 @@ const CACHE_DIR = path.join(__dirname, 'xianbaoku_cache');
 let passed = 0, failed = 0;
 const errors = [];
 
+// v3.122：支持 --only=子串（并行调度用：只跑匹配测试，其余跳过不计失败）
+// 支持环境变量 QUICK=1（快测模式：pushInterval/finalWait 置 0，加速非 timing 测试）
+const onlyFilter = (() => {
+    const idx = process.argv.indexOf('--only');
+    return idx >= 0 ? process.argv[idx + 1] : null;
+})();
+if (process.env.QUICK === '1') {
+    Config.timing.pushInterval = 0;
+    Config.timing.finalWait = 0;
+}
+
 async function test(name, fn) {
+    if (onlyFilter && !name.includes(onlyFilter)) { passed++; return; } // 跳过（并行调度用）
+    const t0 = Date.now(); // v3.122：耗时统计（识别慢测试供并行调度）
     try {
         await fn();
         passed++;
-        console.log(`  ✅ ${name}`);
+        const ms = Date.now() - t0;
+        console.log(`  ✅ ${name}${ms > 100 ? `  (${(ms / 1000).toFixed(1)}s)` : ''}`);
     } catch (e) {
         failed++;
         errors.push(`${name}: ${e.message}`);
@@ -1340,16 +1354,19 @@ if (failed === 0) {
 console.log('========================================\n');
 
 // 清理本套件产生的缓存测试文件（t\d{2}_/t48b_/tpush_/tpar_fail，保留真实运行缓存 push.json）
-try {
-    const fs = require('fs');
-    const dir = path.join(__dirname, 'xianbaoku_cache');
-    if (fs.existsSync(dir)) {
-        for (const f of fs.readdirSync(dir)) {
-            // t\d{2}[a-z]?_ 同时匹配 t48_ 与 t48b_（v3.69 修复：原 ^t\d{2}_ 漏掉带字母后缀的测试名）
-            if (/^t\d{2}[a-z]?_|^tpush_|^tpar_fail/.test(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch (e) { /* 忽略 */ } }
+// v3.122：--only 模式（并行调度）跳过清理——并行进程删除会删掉其他仍在跑的进程正在使用的缓存文件
+if (!onlyFilter) {
+    try {
+        const fs = require('fs');
+        const dir = path.join(__dirname, 'xianbaoku_cache');
+        if (fs.existsSync(dir)) {
+            for (const f of fs.readdirSync(dir)) {
+                // t\d{2}[a-z]?_ 同时匹配 t48_ 与 t48b_（v3.69 修复：原 ^t\d{2}_ 漏掉带字母后缀的测试名）
+                if (/^t\d{2}[a-z]?_|^tpush_|^tpar_fail/.test(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch (e) { /* 忽略 */ } }
+            }
         }
-    }
-} catch (e) { /* 忽略 */ }
+    } catch (e) { /* 忽略 */ }
+}
 
 process.exit(failed > 0 ? 1 : 0);
 })();

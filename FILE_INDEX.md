@@ -55,7 +55,7 @@ Config.template.content    // 推送内容模板(默认{Markdown内容})
 Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.121)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号(v3.122)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 顶部/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
@@ -225,7 +225,7 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.121),每轮修复/重构/功能变更的摘要。
+版本演进记录(v3.0 → v3.122),每轮修复/重构/功能变更的摘要。
 
 ---
 
@@ -278,6 +278,10 @@ node test_filter.js && node test_app.js && node test_notify.js
 ### `run_tests.js` — 统一测试入口(v3.107 新增)
 
 **定位**:一键执行三套测试 + 汇总报告（✅/❌/耗时/退出码）——`npm test` 指向它。CI 与本地统一入口。
+
+### `test_app_parallel.js` — test_app 并行调度器(v3.122 新增)
+
+**定位**:test_app 70 个集成测试并行 fork（独立进程，无全局污染）——`node test_app_parallel.js`，46s → 11s（4 倍）。慢测真实等待、快测 QUICK 加速、run.log 测试独占串行、并发 8 稳定。
 
 ### `.github/workflows/test.yml` — CI 配置(v3.107 新增)
 
