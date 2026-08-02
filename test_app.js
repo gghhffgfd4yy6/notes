@@ -1354,6 +1354,7 @@ await test('接口异常 → 发送告警 + 限频（v3.123）', async () => {
     const origEnabled = Config.alert.enabled;
     try {
         // ① 不限频 → 接口异常发告警
+        Config.alert.enabled = true; // reset() 默认关闭（v3.124），此处显式开启
         Config.alert.intervalMs = 0;
         fail4xx = true; // 404 不重试 → run 抛错
         let threw = false;
