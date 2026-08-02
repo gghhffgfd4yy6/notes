@@ -1407,6 +1407,32 @@ await test('运行日报：跨天发昨日日报 + 当天累加（v3.125）', as
     }
 });
 
+
+await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () => {
+    reset();
+    setPushUrl('t58_maxperrun');
+    const orig = Config.push.maxPerRun;
+    try {
+        // 150 条 → 只推 100
+        Config.push.maxPerRun = 100;
+        fakeData = [];
+        for (let i = 0; i < 150; i++) fakeData.push(makeItem({ id: i + 1000 }));
+        const summary = await xbk.run();
+        assert(summary.pushed === 100, `应只推 100 条: ${JSON.stringify(summary)}`);
+        assert(summary.total === 150, 'total 仍是拉取数 150');
+        // 正常 20 条不截断
+        reset();
+        setPushUrl('t58b_maxperrun_ok');
+        Config.push.maxPerRun = 100;
+        fakeData = [];
+        for (let i = 0; i < 20; i++) fakeData.push(makeItem({ id: i + 2000 }));
+        const s2 = await xbk.run();
+        assert(s2.pushed === 20, `正常 20 条应全推: ${JSON.stringify(s2)}`);
+    } finally {
+        Config.push.maxPerRun = orig;
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 集成测试全部通过！${passed}/${passed}`);
 } else {

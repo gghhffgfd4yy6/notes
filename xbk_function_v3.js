@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.128 — Bark/Push+ markdown剥离(mdToPlain：不支持渲染的通道显示干净文本)；729全绿(632+72+25) ********
+//******** 线报酷推送脚本 v3.129 — 单次推送上限 maxPerRun(防接口异常海量→推送风暴/8分钟)；730全绿(632+73+25) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -60,6 +60,8 @@ const Config = {
         parallelLimit: 0,
         titleMax: 100,
         contentMax: 3000,
+        // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/长时间运行；正常 ~20 条无影响）
+        maxPerRun: 100,
     },
 
     // 推送模板（v3.68 可配置）：title=标题、content=内容；默认值与历史硬编码完全一致。
@@ -1414,6 +1416,13 @@ const App = {
                 }
             }
             filteredCount += (beforeKwd - items.length);
+
+            // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/8 分钟运行；正常 ~20 条无影响）
+            const maxPerRun = (Number.isFinite(Config.push.maxPerRun) && Config.push.maxPerRun > 0) ? Config.push.maxPerRun : 100;
+            if (items.length > maxPerRun) {
+                console.warn(`⚠️ 单次待推送 ${items.length} 条超过上限 ${maxPerRun}，只推前 ${maxPerRun} 条（防接口异常推送风暴；调整 Config.push.maxPerRun）`);
+                items = items.slice(0, maxPerRun);
+            }
 
             // ⑥ 推送（sequential=顺序逐条 / parallel=并行一次推送；失败不中断、不写缓存，下次重试）
             const startTime = Date.now();
