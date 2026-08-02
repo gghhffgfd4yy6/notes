@@ -5947,6 +5947,17 @@ await test('边界: 跨日边界（今天 0 点 = 0 天 / 昨天 0 点 = 1 天�
 
 console.log('\n📂 111. 边界回归补充（负数天数/空值/TS_BOUND 下界/normUrl 空）');
 
+
+await test('时区回归: ISO 无时区标记与含 Z 恒等（v3.131：v3.115 漏此格式，Honolulu 差 1 天）', () => {
+    // 无 Z / 含 Z / 空格分隔 三者在任何时区都应恒等（统一 UTC 解析）
+    const t = '2026-08-01T10:30:00';
+    assertEqual(daysComputed(t), daysComputed(t + 'Z'), 'ISO 无 Z 应等于含 Z');
+    assertEqual(daysComputed('2026-08-01 10:30:00'), daysComputed(t + 'Z'), '空格分隔应等于含 Z');
+    assertEqual(daysComputed('2026-07-31T22:00:00'), daysComputed('2026-07-31T22:00:00Z'), '边界日期');
+    // 带偏移的不受影响（保留原语义）
+    assertEqual(daysComputed('2026-08-01T10:30:00+08:00'), daysComputed('2026-08-01T02:30:00Z'), '偏移解析正确');
+});
+
 await test('边界回归: daysComputed 负数 → 0（v3.62 修复 -1→2001 bug 的显式回归）', () => {
     assertEqual(daysComputed(-1), 0, '-1 应无效→0（曾 new Date(-1)=1969/2001 怪异）');
     assertEqual(daysComputed(-100), 0, '-100 应无效→0');
