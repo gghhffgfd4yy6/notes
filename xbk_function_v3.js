@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.145 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
+//******** 线报酷推送脚本 v3.146 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1309,8 +1309,10 @@ const App = {
                 if (state.total > 0 || state.failed > 0) {
                     const t = `📊 xbk-push 日报（${state.date}）`;
                     const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}`;
-                    notify.sendNotify(t, d).catch(() => { /* v3.135：日报通道失败静默（防 unhandledRejection） */ });
-                    console.log('已发送昨日运行日报');
+                // 成功才打印"已发送"（v3.146：与告警 v3.145 同类——sendNotify reject 曾误报，实际未送达）
+                notify.sendNotify(t, d)
+                    .then(() => console.log('已发送昨日运行日报'))
+                    .catch(() => { /* v3.135：日报通道失败静默（防 unhandledRejection） */ });
                 }
                 state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
             }
