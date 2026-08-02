@@ -5542,11 +5542,13 @@ await test('Fuzz-IO: 随机文件名/内容 → 缓存 API 不崩（临时文件
         if (r < 0.6) return [{ id: Math.floor(rand() * 100), title: 'x' }, null, 'str'];
         return [];
     };
-    for (let i = 0; i < 50; i++) {
-        const name = randName();
-        const content = randContent();
-        try {
+    const written = []; // 记录本测试实际写过的文件（getFilePath 的 basename 可能截断前缀，不能按前缀猜）
+    try {
+        for (let i = 0; i < 50; i++) {
+            const name = randName();
+            const content = randContent();
             const fp = getFilePath(name);
+            written.push(fp);
             assertEqual(typeof fp, 'string', 'getFilePath 应返回字符串');
             // saveBatch 只收对象数组（内部有校验）；用合法内容写入
             const msgs = Array.isArray(content) ? content.filter(x => x && typeof x === 'object') : [];
@@ -5554,9 +5556,15 @@ await test('Fuzz-IO: 随机文件名/内容 → 缓存 API 不崩（临时文件
             const read = readMessages(fp);
             assertEqual(Array.isArray(read), true, 'readMessages 应返回数组');
             assertEqual(isMessageInFile(name, { id: 99999, title: 'n' }), false, 'isMessageInFile 不崩');
-        } catch (e) {
-            throw new Error(`IO fuzz 失败 name="${name.slice(0, 40)}" content=${JSON.stringify(content).slice(0, 40)}: ${e.message}`);
         }
+    } catch (e) {
+        throw new Error(`IO fuzz 失败 name="${name.slice(0, 40)}" content=${JSON.stringify(content).slice(0, 40)}: ${e.message}`);
+    } finally {
+        // v3.155：清理本测试实际写过的文件（曾声称"自动清理"但未实现，跑完留乱码名垃圾如 01Zc;Z.json）
+        try {
+            const fs = require('fs');
+            for (const fp of written) { try { fs.unlinkSync(fp); } catch (e) { /* 忽略 */ } }
+        } catch (e) { /* 清理失败忽略 */ }
     }
 });
 

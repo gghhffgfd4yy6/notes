@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.154 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
+//******** 线报酷推送脚本 v3.155 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1303,7 +1303,9 @@ const App = {
             const statePath = path.join(MessageStore.cacheDir, 'report.state');
             let state = { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
             try { state = JSON.parse(fs.readFileSync(statePath, 'utf8')) || state; } catch (e) { /* 无状态=首次 */ }
-            const today = new Date().toISOString().slice(0, 10); // UTC 日期（跨时区一致）
+            // v3.155：日报日期用本地时区（原 UTC——中国用户凌晨 cron 时本地已跨天但 UTC 未跨，日报日期错位一天）
+            const _d = new Date();
+            const today = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`;
             if (state.date && state.date !== today) {
                 // 新的一天：发昨日日报（若有数据）
                 if (state.total > 0 || state.failed > 0) {
