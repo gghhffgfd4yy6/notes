@@ -408,3 +408,14 @@
 - 测试：101 章 4 个；变异 3 条可锁定全红
 
 **758 个全绿（单元 643 + 集成 80 + 通道 35）**
+
+## v3.158（配置类型字符串兼容：环境变量场景）
+
+- 新清单 50 条中新增量 21-30（配置/类型）：环境变量/配置文件传值全是字符串，Number.isFinite(数字串)=false 曾 7 处静默回退默认
+- 加 Utils.num 统一转换：api.retry/parallelLimit/maxPerRun/titleMax/contentMax/pushInterval/finalWait 字符串生效
+- alert/report.enabled 字符串 'false' 也关闭（环境变量场景）
+- Config.domain trim（前后空格曾污染 pushUrl/外链）
+- fetchData 408/409 也重试（临时性，非终态）
+- 测试：test_app t64/t65/t66 共 3 个；变异 2 条锁定
+
+**761 个全绿（单元 643 + 集成 83 + 通道 35）**
