@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.115 — 时区统一修复：parseTime日期解析本地→Date.UTC(8位/严格日期//分隔)+tuisong datetime/shorttime改getUTC*；顺带修复{时间}小时无add0(+8输出1:30而非01:30)；测试同步(daysAgo getUTC/fake Date.UTC/当天测试daysAgo(0)/ISO快照UTC值)；6时区(UTC/+8/Honolulu/NY/Berlin/Sydney)全绿+行为一致；716全绿 ********
+//******** 线报酷推送脚本 v3.116 — 测试时区假设清除：2处残留本地getFullYear生成(daysAgo(-1)明天/daysAgo(2))；全量扫描确认无本地Date构造残留(仅5888数字路径自洽)；6时区(UTC/+8/Honolulu/NY/Berlin/Sydney)全绿；716全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';

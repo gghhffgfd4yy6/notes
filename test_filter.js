@@ -2771,10 +2771,8 @@ await test('decodeHtmlEntities null → 空串', () => {
 });
 
 await test('daysComputed 明天（未来24h内）→ 0（变异 >-1 会返回负数）', () => {
-    const tomorrow = new Date(Date.now() + 86400000);
-    const tStr = `${tomorrow.getFullYear()}-${tomorrow.getMonth() + 1}-${tomorrow.getDate()}`;
-    // 变异 diff>-1 时未来不足1天的日期会 floor 出 -1
-    assertEqual(daysComputed(tStr), 0);
+    // v3.115：daysAgo(-1) = 明天（UTC，与 parseTime 口径一致）
+    assertEqual(daysComputed(daysAgo(-1)), 0);
 });
 
 await test('htmlToMarkdown h0 无效标签 → 不转为标题', () => {
@@ -2867,10 +2865,8 @@ await test('pingbitime 多行分类正则大小写不敏感（变异 L229 DROP i
     // 变异 pingbitime 多行的 catRe 去掉 i flag 后，'weibo' 无法匹配 /WEIBO/
     const r = compileRules({ pingbitime: 'WEIBO###5' });
     assertEqual(r.pingbitime._type, 'timeMulti');
-    // 2天前注册的新号（注册天数 < 5 → 应拦截）
-    const twoDaysAgo = new Date(Date.now() - 2 * 86400000);
-    const tStr = `${twoDaysAgo.getFullYear()}-${twoDaysAgo.getMonth() + 1}-${twoDaysAgo.getDate()}`;
-    const group = { catename: 'weibo', louzhuregtime: tStr };
+    // 2天前注册的新号（注册天数 < 5 → 应拦截）——v3.115：daysAgo(2) UTC 统一
+    const group = { catename: 'weibo', louzhuregtime: daysAgo(2) };
     // 分类大小写不敏感 → 规则命中 → 拦截
     assertEqual(checkTimeCompiled(r.pingbitime, group), true);
 });
