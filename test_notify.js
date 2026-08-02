@@ -221,6 +221,17 @@ await test('Push+: token + JSON body + 换行转 <br>', () => withChannels(async
     assert(c.options.headers['Content-Type'].includes('application/json'), 'JSON 头');
 }));
 
+// 17. mdToPlain 斜体误伤（v3.150：数字夹 * 不算斜体）
+await test('mdToPlain: 数字夹 * 不误剥（规格 5*3*2cm 曾变 532cm）', () => withChannels(async () => {
+    cfg.PUSH_PLUS_TOKEN = 'token123';
+    // 真实线报规格格式：180ml*12/箱、5*3*2cm
+    await notify.sendNotify('标题', '蒙牛鲜牛奶180ml*12/箱 11.24元 规格 5*3*2cm *斜体内容*');
+    const c = gotCalls[0];
+    const content = JSON.parse(c.options.body).content;
+    assert(content.includes('180ml*12/箱'), `尺寸星号应保留: ${content}`);
+    assert(content.includes('5*3*2cm'), `规格星号应保留: ${content}`);
+    assert(content.includes('斜体内容'), '斜体应正常转换');
+}));
 await test('Push+/Bark: {Html内容} 模板产物无残留标签属性（v3.149）', () => withChannels(async () => {
     // 模拟 {Html内容} 模板产物（HTML）+ Push+（mdToPlain）
     cfg.PUSH_PLUS_TOKEN = 'token123';

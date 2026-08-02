@@ -709,7 +709,7 @@ function truncateBytes(s, maxBytes) {
 function mdToPlain(s, stripAngle = true) {
     return String(s === undefined || s === null ? '' : s)
         .replace(/\*\*([^*]+)\*\*/g, '$1')            // **粗体** → 粗体
-        .replace(/\*([^*]+)\*/g, '$1')                // *斜体* → 斜体
+        .replace(/(?<![0-9])\*([^*\n]+?)(?<![0-9])\*(?!\*)/g, '$1') // *斜体* → 斜体（v3.150：数字前后 * 不算斜体——'5*3*2cm' 曾误剥成 '532cm'）
         .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1')   // ![alt](url) → alt
         .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)') // [text](url) → text (url)
         .replace(/^#{1,6}\s+/gm, '')                  // # 标题
