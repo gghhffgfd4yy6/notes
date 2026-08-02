@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.118 — 性能问题修复：saveBatch O(n²)→O(n)索引化(id/url Map+O(1)维护+最小index首个语义)；5000条2475ms→164ms(15x)；112章3测试(性能基准<500ms/随机判重一致性vs逐条upsert/更新索引维护)；723全绿 ********
+//******** 线报酷推送脚本 v3.119 — saveBatch索引化修正与强化验证：第一版reindex漏维护同key次小(用户质疑验证属实)→scanNext扫描重建+同id/url跳过优化；100轮随机(独立文件/同数据A-B对比)全一致(此前"不一致"系验证脚本缺陷：数据不同/裁剪未模拟/内存缓存残留)；113章2测试固化；725全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1079,18 +1079,43 @@ const MessageStore = {
             if (!Utils.hasValidId(m) && m.url) addKey(urlOnlyMap, Utils.normUrl(m.url), i);
         });
         const NOW = () => new Date().toISOString();
-        // 更新后维护索引（O(1)：删旧 m 的键 + 加新 m 的键，保"最小 index 首个"语义）
-        const reindex = (idx, oldM) => {
-            if (oldM && typeof oldM === 'object') {
-                if (Utils.hasValidId(oldM) && idMap.get(String(oldM.id)) === idx) idMap.delete(String(oldM.id));
-                if (oldM.url && urlMap.get(Utils.normUrl(oldM.url)) === idx) urlMap.delete(Utils.normUrl(oldM.url));
-                if (!Utils.hasValidId(oldM) && oldM.url && urlOnlyMap.get(Utils.normUrl(oldM.url)) === idx) urlOnlyMap.delete(Utils.normUrl(oldM.url));
+        // 删除后扫描 idx 之后重建次小 index（保 findIndex 顺序语义；脏缓存同 key 多条时正确）
+        const scanNext = (map, key, fromIdx, match) => {
+            for (let j = fromIdx + 1; j < messages.length; j++) {
+                const mm = messages[j];
+                if (mm && typeof mm === 'object' && match(mm)) { addKey(map, key, j); break; }
             }
+        };
+        // 更新后维护索引：先加新键（同 id/url 时自动恢复，跳过扫描）→ 再处理旧键（删+扫描次小）
+        const reindex = (idx, oldM) => {
             const m = messages[idx];
             if (m && typeof m === 'object') {
                 if (Utils.hasValidId(m)) addKey(idMap, String(m.id), idx);
                 if (m.url) addKey(urlMap, Utils.normUrl(m.url), idx);
                 if (!Utils.hasValidId(m) && m.url) addKey(urlOnlyMap, Utils.normUrl(m.url), idx);
+            }
+            if (oldM && typeof oldM === 'object') {
+                if (Utils.hasValidId(oldM)) {
+                    const k = String(oldM.id);
+                    if (idMap.get(k) === idx && !(m && Utils.hasValidId(m) && String(m.id) === k)) {
+                        idMap.delete(k);
+                        scanNext(idMap, k, idx, (mm) => Utils.hasValidId(mm) && String(mm.id) === k);
+                    }
+                }
+                if (oldM.url) {
+                    const k = Utils.normUrl(oldM.url);
+                    if (urlMap.get(k) === idx && !(m && m.url && Utils.normUrl(m.url) === k)) {
+                        urlMap.delete(k);
+                        scanNext(urlMap, k, idx, (mm) => mm.url && Utils.normUrl(mm.url) === k);
+                    }
+                }
+                if (!Utils.hasValidId(oldM) && oldM.url) {
+                    const k = Utils.normUrl(oldM.url);
+                    if (urlOnlyMap.get(k) === idx && !(m && !Utils.hasValidId(m) && m.url && Utils.normUrl(m.url) === k)) {
+                        urlOnlyMap.delete(k);
+                        scanNext(urlOnlyMap, k, idx, (mm) => !Utils.hasValidId(mm) && mm.url && Utils.normUrl(mm.url) === k);
+                    }
+                }
             }
         };
         for (const message of newMessages) {

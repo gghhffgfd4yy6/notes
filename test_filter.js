@@ -6006,6 +6006,77 @@ await test('一致性: 更新后索引维护（id 变化/url 失效）', () => {
     }
 });
 
+console.log('\n📂 113. saveBatch 索引化强化验证（脏缓存/多批/同键多条 vs 旧逻辑）');
+
+await test('一致性-强化: 30 轮随机（脏缓存+多批+同键多条）索引版 vs 旧 findIndex 逻辑', () => {
+    // 旧逻辑精确复刻 _findDedupIndex（findIndex 顺序语义）——作为对照基准
+    const oldDedup = (messages, message) => messages.findIndex(mm => {
+        const isId = (v) => v !== undefined && v !== null && (typeof v === 'string' ? v.trim() !== '' : typeof v === 'number' && Number.isFinite(v));
+        const mid = mm && mm.id, qid = message.id;
+        return (isId(qid) && (String(mid) === String(qid) || (!isId(mid) && mm.url && message.url && normUrl(mm.url) === normUrl(message.url)))) ||
+               (!isId(qid) && message.url && normUrl(mm.url) === normUrl(message.url));
+    });
+    let seed = 424242;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const randMsg = () => {
+        const r = rand();
+        const msg = { title: 'T' + Math.floor(rand() * 1000) };
+        if (r < 0.35) msg.id = Math.floor(rand() * 40);
+        else if (r < 0.65) msg.url = '/u/' + Math.floor(rand() * 30) + '.html';
+        else { msg.id = Math.floor(rand() * 20); msg.url = '/u/' + Math.floor(rand() * 20) + '.html'; }
+        return msg;
+    };
+    for (let round = 0; round < 30; round++) {
+        const fname = 'test_113_r' + round + '.json';
+        // 脏缓存（同 id/同 url 多条）
+        const dirty = [];
+        const nd = Math.floor(rand() * 6);
+        for (let i = 0; i < nd; i++) dirty.push(randMsg());
+        const batches = [];
+        let total = nd;
+        for (let b = 0; b < 4 && total < 80; b++) {
+            const batch = [];
+            const nb = Math.min(Math.floor(rand() * 12), 80 - total);
+            for (let i = 0; i < nb; i++) batch.push(randMsg());
+            total += nb;
+            batches.push(batch);
+        }
+        // A：saveBatch（索引版）
+        const fa = getFilePath(fname);
+        try { require('fs').unlinkSync(fa); } catch (e) { /* 忽略 */ }
+        require('fs').writeFileSync(fa, JSON.stringify(dirty));
+        for (const batch of batches) saveBatch(batch, fname);
+        const ra = readMessages(fa).map(x => ({ id: x.id === undefined ? undefined : String(x.id), title: x.title, url: x.url }));
+        try { require('fs').unlinkSync(fa); } catch (e) { /* 忽略 */ }
+        // B：旧 findIndex 逻辑（同数据）
+        const arr = dirty.map(x => ({ ...x }));
+        for (const batch of batches) for (const msg of batch) {
+            const idx = oldDedup(arr, msg);
+            if (idx >= 0) arr[idx] = { ...msg }; else arr.push({ ...msg });
+        }
+        const rb = arr.map(x => ({ id: x.id === undefined ? undefined : String(x.id), title: x.title, url: x.url }));
+        assertEqual(JSON.stringify(ra), JSON.stringify(rb), `第${round}轮索引版与旧逻辑结果应一致`);
+    }
+});
+
+await test('一致性-强化: 脏缓存同键多条 + 首条被覆盖 + 更新索引维护', () => {
+    // 场景：同 url 多条无 id 脏缓存，首条被 id 消息覆盖，再有无 id 同 url 消息
+    const fname = 'test_113_dirty.json';
+    const fp = getFilePath(fname);
+    try { require('fs').unlinkSync(fp); } catch (e) { /* 忽略 */ }
+    try {
+        require('fs').writeFileSync(fp, JSON.stringify([{ title: 'x1', url: '/u/1' }, { title: 'x2', url: '/u/1' }]));
+        saveBatch([{ id: 5, title: 'id5', url: '/u/1' }], fname);
+        saveBatch([{ title: 'noId', url: '/u/1' }], fname);
+        const r = readMessages(fp);
+        assertEqual(r.length, 2, '应 2 条');
+        assertEqual(r[0].title, 'noId', '无 id 消息更新了 index 0（id5 那条，url 匹配首个）');
+        assertEqual(r[1].title, 'x2', 'x2 保留');
+    } finally {
+        try { require('fs').unlinkSync(fp); } catch (e) { /* 忽略 */ }
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 全部通过！${passed}/${passed}  100%`);
 } else {
