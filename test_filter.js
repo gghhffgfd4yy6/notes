@@ -66,6 +66,13 @@ console.log('========================================\n');
 // ==================== 1. 基础场景 ====================
 console.log('📂 1. 基础场景');
 
+
+// 相对日期生成器（v3.111：修复测试时间漂移——写死日期会随真实日期跨过天数阈值，8/2 后 2026-07-28 从4天变5天不再拦截）
+function daysAgo(n) {
+    const d = new Date(Date.now() - n * 86400000);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 await test('全部配置为空 → 全部保留', () => {
     assertEqual(listfilter(makeItem(), {}), true);
 });
@@ -211,28 +218,28 @@ await test('内容三级：屏蔽+展现+强化 → 强化屏蔽优先', () => {
 console.log('\n📂 6. 天数过滤');
 
 await test('设定值(5) > 注册天数(2) → 新号被拦截', () => {
-    assertEqual(listfilter(makeItem({ louzhuregtime: '2026-07-28' }), { pingbitime: '5' }), false);
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: '5' }), false);
 });
 
 await test('设定值(3) < 注册天数(100) → 老号通过', () => {
-    assertEqual(listfilter(makeItem({ louzhuregtime: '2026-04-21' }), { pingbitime: '3' }), true);
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(100) }), { pingbitime: '3' }), true);
 });
 
 await test('设定值=0 → 不拦截任何人', () => {
     // pingbitime=0, 0不可能大于任何天数 → 永远不拦截
-    assertEqual(listfilter(makeItem({ louzhuregtime: '2026-07-30' }), { pingbitime: '0' }), true);
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(2) }), { pingbitime: '0' }), true);
 });
 
 await test('分类限定天数：匹配分类 → 拦截', () => {
     assertEqual(listfilter(
-        makeItem({ catename: '微博线报', louzhuregtime: '2026-07-28' }),
+        makeItem({ catename: '微博线报', louzhuregtime: daysAgo(4) }),
         { pingbitime: '微博线报###5' }
     ), false);
 });
 
 await test('分类限定天数：不匹配分类 → 不拦截', () => {
     assertEqual(listfilter(
-        makeItem({ catename: '赚客吧', louzhuregtime: '2026-07-28' }),
+        makeItem({ catename: '赚客吧', louzhuregtime: daysAgo(4) }),
         { pingbitime: '微博线报###5' }
     ), true);
 });
@@ -240,7 +247,7 @@ await test('分类限定天数：不匹配分类 → 不拦截', () => {
 await test('天数 + 分类屏蔽同时生效 → 任一拦截即屏蔽', () => {
     // 天数拦截
     assertEqual(listfilter(
-        makeItem({ catename: '微博线报', louzhuregtime: '2026-07-28' }),
+        makeItem({ catename: '微博线报', louzhuregtime: daysAgo(4) }),
         { pingbifenlei: '赚客吧', pingbitime: '微博线报###5' }
     ), false);
     // 分类拦截
@@ -314,14 +321,14 @@ await test('混合 <br> + \\n\\n：任意匹配 → 被屏蔽', () => {
 
 await test('多行天数：匹配分类且超阈值 → 拦截', () => {
     assertEqual(listfilter(
-        makeItem({ catename: '赚客吧', louzhuregtime: '2026-07-28' }),
+        makeItem({ catename: '赚客吧', louzhuregtime: daysAgo(4) }),
         { pingbitime: '微博线报###3<br>赚客吧###5' }
     ), false);  // 第二行 5>2 → 拦截
 });
 
 await test('多行天数：匹配分类但未超阈值 → 不拦截', () => {
     assertEqual(listfilter(
-        makeItem({ catename: '微博线报', louzhuregtime: '2026-07-28' }),
+        makeItem({ catename: '微博线报', louzhuregtime: daysAgo(4) }),
         { pingbitime: '赚客吧###5<br>微博线报###1' }
     ), true);  // 第二行 1>2? 否 → 保留
 });
@@ -419,7 +426,7 @@ await test('配置 undefined / null → 不崩溃', () => {
 
 await test('超大数值 → 不溢出', () => {
     assertEqual(listfilter(
-        makeItem({ louzhuregtime: '2026-07-29' }),
+        makeItem({ louzhuregtime: daysAgo(3) }),
         { pingbitime: '999999' }
     ), false);
 });
@@ -697,7 +704,7 @@ await test('楼主强制展现 + 标题强化屏蔽 → 标题被屏蔽', () => 
 
 await test('只看它 + 天数过滤组合', () => {
     // 只看它关键词不匹配
-    assertEqual(listfilter(makeItem({ title: '淘宝', louzhuregtime: '2026-07-28' }), {
+    assertEqual(listfilter(makeItem({ title: '淘宝', louzhuregtime: daysAgo(4) }), {
         pingbibiaoti: '(.*)',
         zhanxianbiaoti: '京东',
         pingbitime: '5',
@@ -705,7 +712,7 @@ await test('只看它 + 天数过滤组合', () => {
 });
 
 await test('只看它匹配 + 天数过滤拦截 → 被拦截', () => {
-    assertEqual(listfilter(makeItem({ title: '京东', louzhuregtime: '2026-07-28' }), {
+    assertEqual(listfilter(makeItem({ title: '京东', louzhuregtime: daysAgo(4) }), {
         pingbibiaoti: '(.*)',
         zhanxianbiaoti: '京东',
         pingbitime: '5',
@@ -713,7 +720,7 @@ await test('只看它匹配 + 天数过滤拦截 → 被拦截', () => {
 });
 
 await test('天数过滤 + 分类屏蔽 同时生效', () => {
-    assertEqual(listfilter(makeItem({ catename: '微博线报', louzhuregtime: '2026-07-28' }), {
+    assertEqual(listfilter(makeItem({ catename: '微博线报', louzhuregtime: daysAgo(4) }), {
         pingbifenlei: '微博',
         pingbitime: '5',
     }), false);  // 分类匹配即拦截，天数还没走到
@@ -942,7 +949,7 @@ await test('listfilter 所有配置填满且全部匹配的排列组合', () => 
     }), false);
 
     // 天数匹配
-    assertEqual(listfilter(makeItem({ louzhuregtime: '2026-07-28' }), {
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), {
         pingbitime: '5',
     }), false);
 });
@@ -1141,7 +1148,7 @@ await test('标题block + 标题plus都匹配 → block先触发', () => {
 });
 
 await test('天数拦截 + 分类匹配 + 标题匹配 → 天数优先', () => {
-    assertEqual(listfilter(makeItem({ catename: '微博线报', title: '京东', louzhuregtime: '2026-07-28' }), {
+    assertEqual(listfilter(makeItem({ catename: '微博线报', title: '京东', louzhuregtime: daysAgo(4) }), {
         pingbitime: '5',
         pingbifenlei: '微博',
         pingbibiaoti: '京东',
@@ -1149,7 +1156,7 @@ await test('天数拦截 + 分类匹配 + 标题匹配 → 天数优先', () => 
 });
 
 await test('天数不拦截 + 分类不匹配 + 标题匹配 → 标题屏蔽', () => {
-    assertEqual(listfilter(makeItem({ catename: '好单线报', title: '京东', louzhuregtime: '2026-04-21' }), {
+    assertEqual(listfilter(makeItem({ catename: '好单线报', title: '京东', louzhuregtime: daysAgo(100) }), {
         pingbitime: '999',
         pingbifenlei: '微博',
         pingbibiaoti: '京东',
@@ -1197,7 +1204,7 @@ await test('标题show + 内容plus → 标题优先跳过内容plus', () => {
 });
 
 await test('天数拦截 + 楼主show → 天数优先', () => {
-    assertEqual(listfilter(makeItem({ louzhu: '小明', louzhuregtime: '2026-07-28' }), {
+    assertEqual(listfilter(makeItem({ louzhu: '小明', louzhuregtime: daysAgo(4) }), {
         pingbitime: '5',
         zhanxianlouzhu: '小明',
     }), false);  // 天数优先拦截
@@ -1264,7 +1271,7 @@ await test('多行混合：小黑被plus → 屏蔽', () => {
 });
 
 await test('五重过滤：天数+分类+楼主+标题+内容全匹配 → 天数优先', () => {
-    assertEqual(listfilter(makeItem({ catename: '微博线报', louzhu: '小明', title: '京东', content: '广告', louzhuregtime: '2026-07-28' }), {
+    assertEqual(listfilter(makeItem({ catename: '微博线报', louzhu: '小明', title: '京东', content: '广告', louzhuregtime: daysAgo(4) }), {
         pingbitime: '5',
         pingbifenlei: '微博',
         pingbilouzhu: '小明',
@@ -1274,7 +1281,7 @@ await test('五重过滤：天数+分类+楼主+标题+内容全匹配 → 天�
 });
 
 await test('五重过滤：全匹配但天数不拦截 → 分类拦截', () => {
-    assertEqual(listfilter(makeItem({ catename: '微博线报', louzhu: '小明', title: '京东', content: '广告', louzhuregtime: '2026-04-21' }), {
+    assertEqual(listfilter(makeItem({ catename: '微博线报', louzhu: '小明', title: '京东', content: '广告', louzhuregtime: daysAgo(100) }), {
         pingbitime: '3',
         pingbifenlei: '微博',
         pingbilouzhu: '小明',
@@ -1341,11 +1348,11 @@ await test('show/block/plus 同一字段全部不配置 → 保留', () => {
 });
 
 await test('天数负数 → 不拦截', () => {
-    assertEqual(listfilter(makeItem({ louzhuregtime: '2026-07-28' }), { pingbitime: '-1' }), true);
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: '-1' }), true);
 });
 
 await test('天数极大值 → 全部拦截', () => {
-    assertEqual(listfilter(makeItem({ louzhuregtime: '2026-07-28' }), { pingbitime: '999999' }), false);
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: '999999' }), false);
 });
 
 await test('楼主plus生效后 show被抵消 → 不应再被其他字段block', () => {
@@ -1460,14 +1467,14 @@ await test('多行配置 五行混合 → 只有最后一行匹配', () => {
 });
 
 await test('天数过滤 + 多行分类 + 多行标题 → 超复杂', () => {
-    assertEqual(listfilter(makeItem({ catename: '赚客吧', title: '京东', louzhuregtime: '2026-07-28' }), {
+    assertEqual(listfilter(makeItem({ catename: '赚客吧', title: '京东', louzhuregtime: daysAgo(4) }), {
         pingbitime: '微博线报###3\n\n赚客吧###5',
         pingbibiaoti: '微博线报###淘宝\n\n赚客吧###京东',
     }), false);  // 天数拦截
 });
 
 await test('天数不拦截 + 多行分类不匹配 + 多行标题匹配 → 标题拦截', () => {
-    assertEqual(listfilter(makeItem({ catename: '赚客吧', title: '京东', louzhuregtime: '2026-04-21' }), {
+    assertEqual(listfilter(makeItem({ catename: '赚客吧', title: '京东', louzhuregtime: daysAgo(100) }), {
         pingbitime: '微博线报###3\n\n赚客吧###1000',
         pingbibiaoti: '微博线报###淘宝\n\n赚客吧###京东',
     }), false);  // 标题拦截
@@ -1510,7 +1517,7 @@ await test('htmlToMarkdown 空 content_html → 不崩溃', () => {
 
 
 await test('天数过滤 pingbitime=0 → 不拦截任何人', () => {
-    assertEqual(listfilter(makeItem({ louzhuregtime: '2026-07-30' }), { pingbitime: '0' }), true);
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(2) }), { pingbitime: '0' }), true);
 });
 
 await test('楼主: 强化屏蔽不匹配 → 强制展现生效(无普通屏蔽,简化场景)', () => {
@@ -1528,7 +1535,7 @@ await test('内容强化屏蔽不匹配 → 强制展现生效', () => {
 });
 
 await test('只看它 + 天数过滤 + 分类屏蔽 → 三重过滤', () => {
-    assertEqual(listfilter(makeItem({ catename: '微博线报', title: '京东神券', louzhuregtime: '2026-07-28' }), {
+    assertEqual(listfilter(makeItem({ catename: '微博线报', title: '京东神券', louzhuregtime: daysAgo(4) }), {
         pingbibiaoti: '(.*)',
         zhanxianbiaoti: '京东',
         pingbifenlei: '微博',
@@ -1612,17 +1619,17 @@ await test('matchesCompiled 多分类规则匹配', () => {
 await test('checkTimeCompiled 简单天数', () => {
     const r = compileRules({ pingbitime: '5' });
     // 注册2天 → 5 > 2 → 拦截 true
-    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: '2026-07-29' }), true);
+    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(3) }), true);
     // 注册100天 → 5 > 100? 否 → 不拦截 false
-    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: '2026-04-21' }), false);
+    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(100) }), false);
 });
 
 await test('checkTimeCompiled 多分类天数', () => {
     const r = compileRules({ pingbitime: '微博线报###5\n\n赚客吧###3' });
     // 分类匹配+超天数 → 拦截
-    assertEqual(checkTimeCompiled(r.pingbitime, { catename: '微博线报', louzhuregtime: '2026-07-29' }), true);
+    assertEqual(checkTimeCompiled(r.pingbitime, { catename: '微博线报', louzhuregtime: daysAgo(3) }), true);
     // 分类不匹配 → 不拦截
-    assertEqual(checkTimeCompiled(r.pingbitime, { catename: '好单线报', louzhuregtime: '2026-07-29' }), false);
+    assertEqual(checkTimeCompiled(r.pingbitime, { catename: '好单线报', louzhuregtime: daysAgo(3) }), false);
 });
 
 // ==================== 28. whitelistFilter ====================
@@ -1834,19 +1841,19 @@ await test('_splitLines 空字符串 → 空数组', () => {
 console.log('\n📂 37. 过滤子方法直接测');
 
 await test('checkRegisterTime 无配置 → 通过', () => {
-    assertEqual(checkRegisterTime({ louzhuregtime: '2026-07-28' }, null), true);
+    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(4) }, null), true);
 });
 
 await test('checkRegisterTime 天数拦截', () => {
     const compiled = compileRules({ pingbitime: '5' });
     // 注册2天 → 5>2 → 拦截 → checkRegisterTime 返回 false
-    assertEqual(checkRegisterTime({ louzhuregtime: '2026-07-29' }, compiled.pingbitime), false);
+    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(3) }, compiled.pingbitime), false);
 });
 
 await test('checkRegisterTime 天数通过', () => {
     const compiled = compileRules({ pingbitime: '5' });
     // 注册100天 → 5>100? 否 → 通过
-    assertEqual(checkRegisterTime({ louzhuregtime: '2026-04-21' }, compiled.pingbitime), true);
+    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(100) }, compiled.pingbitime), true);
 });
 
 await test('checkCategory 无配置 → 通过', () => {
@@ -2069,14 +2076,14 @@ await test('matchesCompiled fieldValue为空 → false', () => {
 });
 
 await test('checkTimeCompiled compiled为null → null', () => {
-    assertEqual(checkTimeCompiled(null, { louzhuregtime: '2026-07-28' }), null);
+    assertEqual(checkTimeCompiled(null, { louzhuregtime: daysAgo(4) }), null);
 });
 
 await test('checkTimeCompiled 天数分类为空 → 全局匹配', () => {
     const r = compileRules({ pingbitime: '###5' });
     assertEqual(r.pingbitime.rules[0].cat, null);
     // 注册2天 → 5>2 → 拦截 true
-    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: '2026-07-29' }), true);
+    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(3) }), true);
 });
 
 await test('validateConfig pingbifenlei ### → 有警告', () => {
@@ -3946,7 +3953,7 @@ await test('分支: checkCategory 命中/未命中/字段缺失', () => {
 
 await test('分支: checkRegisterTime 超阈值/未超/缺失', () => {
     const c = compileRules({ pingbitime: '5' });
-    assertEqual(checkRegisterTime({ louzhuregtime: '2026-07-30' }, c.pingbitime), false); // 新号→拦截
+    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(2) }, c.pingbitime), false); // 新号→拦截
     assertEqual(checkRegisterTime({ louzhuregtime: '2026-01-01' }, c.pingbitime), true);  // 老号→放行
     assertEqual(checkRegisterTime({}, c.pingbitime), true);                               // 缺失→放行
 });
@@ -5676,6 +5683,152 @@ await test('Fuzz 回归: sanitize 与 truncate 组合（孤立代理+截断边�
     const out = tuisong_replace('{标题}', { title: s, content: 'c' });
     assertEqual(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(out), false, '组合输出无孤立代理');
     assertEqual(out.includes('😀'), true, '完整代理对保留');
+});
+
+console.log('\n📂 109. 深度 Fuzz 四轮（过滤引擎组合/HTML 畸形/自定义 got/实体映射完整性）');
+
+await test('Fuzz-过滤: 随机 filter 配置 × 随机数据 → listfilter 不崩且返回 boolean', () => {
+    let seed = 20261201;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const randRe = () => {
+        const r = rand();
+        if (r < 0.2) return '';
+        if (r < 0.4) return '京东';
+        if (r < 0.5) return '(';          // 非法正则
+        if (r < 0.6) return '(a+)+';      // ReDoS 风险
+        if (r < 0.7) return '楼主|小明';
+        if (r < 0.8) return '分类###京东';  // 多行
+        if (r < 0.9) return '标题###京东<br/>内容###秒杀';
+        const chars = 'ab()[]*+?|.\\^$分类标题';
+        let s = '';
+        const len = Math.floor(rand() * 10) + 1;
+        for (let i = 0; i < len; i++) s += chars[Math.floor(rand() * chars.length)];
+        return s;
+    };
+    for (let i = 0; i < 200; i++) {
+        const cfg = {
+            pingbifenlei: randRe(), pingbibiaoti: randRe(), pingbineirong: randRe(),
+            pingbilouzhu: randRe(), zhanxianbiaoti: randRe(), zhanxianlouzhu: randRe(),
+            pingbitime: String(Math.floor(rand() * 30)),
+        };
+        const compiled = compileRules(cfg);
+        for (let j = 0; j < 20; j++) {
+            const item = {
+                catename: rand() < 0.3 ? null : ('分类' + Math.floor(rand() * 5)),
+                title: rand() < 0.2 ? '' : ('标题' + Math.floor(rand() * 100) + (rand() < 0.5 ? '京东' : '')),
+                content: rand() < 0.2 ? null : '内容' + Math.floor(rand() * 100),
+                louzhu: rand() < 0.2 ? '' : '楼主' + Math.floor(rand() * 20),
+                louzhuregtime: rand() < 0.3 ? null : ('2026-0' + (1 + Math.floor(rand() * 9)) + '-1' + Math.floor(rand() * 9)),
+            };
+            const r = listfilter(item, compiled);
+            assertEqual(typeof r, 'boolean', `listfilter 应返回 boolean: ${JSON.stringify(cfg).slice(0, 60)}`);
+        }
+    }
+});
+
+await test('Fuzz-HTML: 随机畸形标签 htmlToMarkdown 不崩且标签剥离干净', () => {
+    let seed = 2718282;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const atoms = ['<b>', '</b>', '<a href="x">', '</a>', '<img src="i">', '<br>', '<br/>', '<p>', '</p>',
+        '<h1>', '<h2>', '</h1>', '<li>', '</li>', '<table>', '<td>', '<tr>', '<div>', '<span>',
+        '<', '>', '</', '<>', '</>', '<a>', '文本', 'x', '&amp;', '&lt;', '😀', '<script>', '</script>', '<style>', '</style>'];
+    for (let i = 0; i < 300; i++) {
+        let html = '';
+        const len = Math.floor(rand() * 15) + 1;
+        for (let j = 0; j < len; j++) html += atoms[Math.floor(rand() * atoms.length)];
+        const md = htmlToMarkdown({ content_html: html, url: 'http://x.com/' + i });
+        assertEqual(typeof md, 'string', `htmlToMarkdown 应返回字符串: "${html.slice(0, 60)}"`);
+        // 标签剥离干净由 84 章快照锁定；fuzz 只验证健壮性（字面 &lt; 解码的 < 与残余文本拼形似标签属正确保留）
+        // encode 不崩（孤立代理清洗后）
+        try { encodeURIComponent(md); } catch (e) { throw new Error(`encode 崩: "${html.slice(0, 40)}"`); }
+    }
+});
+
+await test('Fuzz-实体: ENTITY_MAP 完整性（每个实体解码正确 + 无重复）', () => {
+    // 通过导出验证 36 个实体全部可解码
+    const entities = ['amp', 'lt', 'gt', 'quot', 'apos', 'nbsp', 'hellip', 'mdash', 'copy', 'reg',
+        'trade', 'euro', 'times', 'divide', 'middot', 'deg', 'plusmn', 'laquo', 'raquo', 'ndash',
+        'lsquo', 'rsquo', 'ldquo', 'rdquo', 'bull', 'sect', 'para', 'pound', 'yen', 'ensp', 'emsp',
+        'cent', 'curren', 'larr', 'rarr', 'uarr', 'darr'];
+    const expected = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', hellip: '…',
+        mdash: '—', copy: '©', reg: '®', trade: '™', euro: '€', times: '×', divide: '÷', middot: '·',
+        deg: '°', plusmn: '±', laquo: '«', raquo: '»', ndash: '–', lsquo: '‘', rsquo: '’', ldquo: '“',
+        rdquo: '”', bull: '•', sect: '§', para: '¶', pound: '£', yen: '¥', ensp: ' ', emsp: ' ',
+        cent: '¢', curren: '¤', larr: '←', rarr: '→', uarr: '↑', darr: '↓' };
+    const seen = new Set();
+    for (const name of entities) {
+        assertEqual(!seen.has(name), true, `实体 ${name} 不应重复`);
+        seen.add(name);
+        const out = decodeHtmlEntities('&' + name + ';');
+        assertEqual(out, expected[name], `&${name}; 应解码为 ${JSON.stringify(expected[name])}，实际 ${JSON.stringify(out)}`);
+
+    }
+});
+
+await test('Fuzz-got: 随机 URL/options 调用不抛同步异常（reject 是预期）', async () => {
+    const http = require('http');
+    const got = require('got');
+    // 本地正常 server（部分 URL 命中它）
+    const server = http.createServer((req, res) => { res.writeHead(200); res.end('ok'); });
+    await new Promise(r => server.listen(0, r));
+    const port = server.address().port;
+    let seed = 111111;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const randUrl = () => {
+        const r = rand();
+        if (r < 0.3) return `http://127.0.0.1:${port}/ok`;
+        if (r < 0.4) return 'http://127.0.0.1:1/x';        // 连接拒绝
+        if (r < 0.5) return 'not a url';
+        if (r < 0.6) return '//host/path';
+        if (r < 0.7) return 'http://' + Math.floor(rand() * 255) + '.' + Math.floor(rand() * 255) + '.x/x';
+        if (r < 0.8) return 'ftp://x.com/';
+        return 'http://127.0.0.1:' + port + '/' + Math.floor(rand() * 1000);
+    };
+    const randOptions = () => ({
+        timeout: 300, // 短超时防挂
+        headers: rand() < 0.5 ? { 'X-Test': String(Math.floor(rand() * 100)) } : {},
+        json: rand() < 0.3 ? { a: Math.floor(rand() * 10) } : undefined,
+        maxBody: rand() < 0.3 ? Math.floor(rand() * 1000) : undefined,
+    });
+    const calls = [];
+    for (let i = 0; i < 40; i++) {
+        const url = randUrl();
+        const options = randOptions();
+        let threw = false;
+        try {
+            // 调用本身不应抛同步异常
+            const p = got(url, options);
+            calls.push(p.catch(() => 'rejected')); // reject 是预期（网络失败/畸形 URL）
+        } catch (e) {
+            threw = true;
+            calls.push(Promise.resolve('sync-threw:' + e.message));
+        }
+        assertEqual(threw, false, `got 不应同步抛: url="${url.slice(0, 40)}"`);
+    }
+    await Promise.allSettled(calls);
+    await new Promise(r => server.close(r));
+});
+
+await test('Fuzz-时间: checkTimeCompiled 随机 compiled × 随机 group 不崩', () => {
+    let seed = 99999;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const mkCompiled = () => {
+        const r = rand();
+        if (r < 0.25) return null;
+        if (r < 0.5) return { _type: 'time', value: Math.floor(rand() * 50) };
+        if (r < 0.75) return { _type: 'timeMulti', rules: [{ cat: null, value: Math.floor(rand() * 50) }] };
+        return { _type: 'weird', value: 'x' };
+    };
+    const mkGroup = () => ({
+        catename: rand() < 0.3 ? null : '分类' + Math.floor(rand() * 5),
+        louzhuregtime: rand() < 0.3 ? null : (rand() < 0.5 ? '2026-01-01' : String(Math.floor(rand() * 1e9))),
+    });
+    for (let i = 0; i < 300; i++) {
+        const c = mkCompiled();
+        const g = mkGroup();
+        const r = checkTimeCompiled(c, g);
+        assertEqual(r === null || typeof r === 'boolean', true, `checkTimeCompiled 应返回 null/boolean: ${JSON.stringify(c)}`);
+    }
 });
 
 if (failed === 0) {

@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.110 — Fuzz三轮广覆盖：107章(单调性/前缀性/组合无残留/Unicode/数字极端/模板/存储一致性)+108章回归+notify fuzz(随机text/desp/params+maskKey/maskUrl)+got fuzz准备；抓到孤立代理URIError真实bug(encodeURIComponent崩→推送失败)双层修复(主代码tuisong输出+sendNotify入口清洗)；恢复R9/审查9-C语义；707全绿 ********
+//******** 线报酷推送脚本 v3.111 — Fuzz四轮(109章：过滤引擎组合/HTML畸形/got/实体映射完整性/checkTimeCompiled)+测试时间漂移修复(daysAgo相对日期，8/2暴露7个写死日期跨阈值失败)；修正2个fuzz断言(HTML字面<误报/实体大小写规范)；712全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
