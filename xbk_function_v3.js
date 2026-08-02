@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.134 — 截断不缓存(异常海量时截断的未推消息写缓存会静默丢失，现下次运行推剩余不丢不重复)；732全绿(633+73+26) ********
+//******** 线报酷推送脚本 v3.135 — 告警/日报 fire-and-forget加.catch(通道全挂时sendNotify reject曾unhandledRejection)；733全绿(633+74+26) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1281,7 +1281,7 @@ const App = {
             if (interval > 0 && Date.now() - lastAt < interval) return; // 限频：间隔内不重复轰炸
             const alertText = '⚠️ xbk-push 运行异常';
             const alertDesp = `接口/推送异常，请检查。\n时间：${new Date().toLocaleString('zh-CN')}\n原因：${String(errMsg).slice(0, 500)}`;
-            notify.sendNotify(alertText, alertDesp); // fire-and-forget，不阻塞主流程
+            notify.sendNotify(alertText, alertDesp).catch(() => { /* v3.135：告警通道也挂了，静默（防 unhandledRejection） */ });
             fs.writeFileSync(statePath, JSON.stringify({ lastAt: Date.now() }), 'utf8');
             console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）');
         } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
@@ -1300,7 +1300,7 @@ const App = {
                 if (state.total > 0 || state.failed > 0) {
                     const t = `📊 xbk-push 日报（${state.date}）`;
                     const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}`;
-                    notify.sendNotify(t, d); // fire-and-forget
+                    notify.sendNotify(t, d).catch(() => { /* v3.135：日报通道失败静默（防 unhandledRejection） */ });
                     console.log('已发送昨日运行日报');
                 }
                 state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };

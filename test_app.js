@@ -1450,6 +1450,31 @@ await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () 
     }
 });
 
+
+await test('告警/日报触发时通道失败 → 无 unhandledRejection（v3.135）', async () => {
+    reset();
+    setPushUrl('t59_alert_unhandled');
+    fakeData = [];
+    Config.alert.enabled = true;
+    Config.alert.intervalMs = 0; // 不限频
+    let unhandled = 0;
+    const handler = () => unhandled++;
+    process.on('unhandledRejection', handler);
+    try {
+        fail4xx = true;    // 接口 404 → run 抛错 → _sendAlert
+        notifyFail = true; // 告警通道 mock reject
+        let threw = false;
+        try { await xbk.run(); } catch (e) { threw = true; }
+        assert(threw, '接口异常应抛错');
+        await new Promise(r => setTimeout(r, 100)); // 等 fire-and-forget 完成
+        assert(unhandled === 0, `告警通道失败不应 unhandledRejection: ${unhandled}`);
+    } finally {
+        process.removeListener('unhandledRejection', handler);
+        Config.alert.enabled = false;
+        try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 忽略 */ }
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 集成测试全部通过！${passed}/${passed}`);
 } else {
