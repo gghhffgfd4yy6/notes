@@ -20,7 +20,9 @@ const isSlow = (n) => SLOW_SUBSTR.some(s => n.includes(s));
 const RUNLOG_SUBSTR = ['运行摘要持久化', '运行失败也写 ERROR'];
 const isRunlog = (n) => RUNLOG_SUBSTR.some(s => n.includes(s));
 
-const CONCURRENCY = 8; // 并发进程数（v3.122b：16 并发在沙箱 fd/资源紧张时偶发缓存写失败，8 稳定）
+// 并发进程数（v3.122b）：沙箱 overlayfs 在高并发(16/32)偶发 IO 竞态(existsSync→readFileSync 窗口)，
+// 默认 8 稳定(11s)；真机资源充足可用 CONCURRENCY=32 加速(~7s)
+const CONCURRENCY = parseInt(process.env.CONCURRENCY, 10) || 8;
 let queue = [...names].filter(n => !isRunlog(n)); // 并行池排除 run.log 测试
 const runlogTests = names.filter(isRunlog);
 const TOTAL = queue.length; // 快照（v3.122b：原 done===queue.length 在 shift 后比较出错）
