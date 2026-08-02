@@ -267,3 +267,6 @@
 
 ## v3.135（告警/日报 rejection 处理）
 
+
+## v3.136（mdToPlain autolink 剥离）
+

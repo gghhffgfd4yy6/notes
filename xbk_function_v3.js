@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.135 — 告警/日报 fire-and-forget加.catch(通道全挂时sendNotify reject曾unhandledRejection)；733全绿(633+74+26) ********
+//******** 线报酷推送脚本 v3.136 — mdToPlain剥autolink尖括号(Bark/Push+的{链接}<url>显示尖括号；TG传false保留<>转义)；变异验证前两轮测试有效；733全绿(633+74+26) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';

@@ -121,6 +121,7 @@ await test('Bark/Push+: markdown 符号剥离为纯文本（v3.128：不支持 m
     assert(!barkBody.body.includes('[') && !barkBody.body.includes(']'), 'Bark 不应含链接符号');
     assert(barkBody.body.includes('http://x.com/a'), '链接文本保留 url');
     assert(!barkBody.body.includes('```'), 'Bark 不应含代码符号');
+    assert(!barkBody.body.includes('<'), 'v3.136：{链接} 的 <url> autolink 尖括号应剥掉');
     // Push+（html 模式）
     cfg.BARK_PUSH = '';
     cfg.PUSH_PLUS_TOKEN = 'token1';

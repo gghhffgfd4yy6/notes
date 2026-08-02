@@ -628,8 +628,8 @@ function tgNotify(text, desp) {
             // v3.132：parse_mode 'Markdown' → 'HTML'——真实接口 20 条中 19 条含 markdown 特殊字符、
             // 1 条含未配对 *（TG Markdown 对未配对 * 报错发送失败）；改 HTML 模式 + 剥 markdown 符号
             // + 转义 & < >（HTML 只对这 3 个敏感，无报错、无乱码，纯文本显示）
-            const tgText = mdToPlain(text);
-            const tgDesp = mdToPlain(desp);
+            const tgText = mdToPlain(text, false);
+            const tgDesp = mdToPlain(desp, false); // v3.136：TG 保留 < >（HTML 转义），不剥 autolink
             const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             const options = {
                 url: `${TG_API_HOST || 'https://api.telegram.org'}/bot${TG_BOT_TOKEN}/sendMessage`,
@@ -669,14 +669,16 @@ function tgNotify(text, desp) {
 }
 
 // markdown → 纯文本（v3.128：Bark/Push+ 不支持 markdown 渲染，desp 会显示 ** 等原始符号）
-function mdToPlain(s) {
+// v3.136：剥 <url> autolink 尖括号（stripAngle 默认 true）；TG 传 false（保留 < > 给 HTML 转义）
+function mdToPlain(s, stripAngle = true) {
     return String(s === undefined || s === null ? '' : s)
         .replace(/\*\*([^*]+)\*\*/g, '$1')            // **粗体** → 粗体
         .replace(/\*([^*]+)\*/g, '$1')                // *斜体* → 斜体
         .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1')   // ![alt](url) → alt
         .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)') // [text](url) → text (url)
         .replace(/^#{1,6}\s+/gm, '')                  // # 标题
-        .replace(/`([^`]+)`/g, '$1');                 // `代码` → 代码
+        .replace(/`([^`]+)`/g, '$1')                  // `代码` → 代码
+        .replace(/<([^>]+)>/g, stripAngle ? '$1' : '<$1>'); // <url> autolink → url（TG 保留转义）
 }
 
 // 孤立代理清洗（v3.110）：encodeURIComponent 对孤立代理抛 URIError——推送前统一处理
