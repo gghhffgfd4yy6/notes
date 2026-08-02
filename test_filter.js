@@ -2041,10 +2041,9 @@ await test('saveMessages 裁剪后保留最新数据', () => {
 // ==================== 41. 错误分支覆盖 ====================
 console.log('\n📂 41. 错误分支覆盖');
 
-await test('compileRules pingbitime 非数字 → value 0', () => {
+await test('compileRules pingbitime 非数字 → null 不编译（v3.157）', () => {
     const r = compileRules({ pingbitime: 'abc' });
-    assertEqual(r.pingbitime._type, 'time');
-    assertEqual(r.pingbitime.value, 0);
+    assertEqual(r.pingbitime, null);
 });
 
 await test('validateConfig pingbitime ### 分类正则无效 → 有警告', () => {
@@ -3407,11 +3406,11 @@ await test('getFilePath 路径逃逸防护（v3.22审查11）', () => {
     assertEqual(getFilePath('normal.json').startsWith(cacheDir), true);
 });
 
-await test('pingbitime 负数/Infinity → 0 不拦截（v3.22审查16）', () => {
+await test('pingbitime 负数/Infinity → null 不编译（v3.157: 曾落 value:0 静默关闭过滤）', () => {
     const r = compileRules({ pingbitime: '-5' });
-    assertEqual(r.pingbitime.value, 0);
+    assertEqual(r.pingbitime, null);
     const r2 = compileRules({ pingbitime: 'Infinity' });
-    assertEqual(r2.pingbitime.value, 0);
+    assertEqual(r2.pingbitime, null);
     const warns = validateConfig({ pingbitime: '-5' });
     assertEqual(warns.some(w => w.includes('pingbitime')), true);
 });
@@ -4834,7 +4833,7 @@ await test('边界: pingbitime 0/极大行为锁定', () => {
     const cBig = compileRules({ pingbitime: '99999' });
     assertEqual(checkTimeCompiled(cBig.pingbitime, { louzhuregtime: '2026-01-01' }), true, 'pingbitime=99999 拦截所有');
     const cNeg = compileRules({ pingbitime: '-5' });
-    assertEqual(checkTimeCompiled(cNeg.pingbitime, { louzhuregtime: '2026-01-01' }), false, '负数→value0→不拦截');
+    assertEqual(cNeg.pingbitime, null, '负数→不编译(null)');
 });
 
 await test('边界: 编码大小写/超范围行为锁定', () => {
@@ -5089,11 +5088,12 @@ await test('truncateUtf16: 非法 max(undefined/NaN/0/负数) 不截断（R1）'
     assertEqual(truncateUtf16('😀😀', 1), '', '代理对边界仍安全（max=1 → 高代理退位）');
 });
 
-await test('getFileName: 非字符串 url 兜底 default.json（R1）', () => {
-    assertEqual(getFileName({ a: 1 }), 'default.json', '对象兜底');
-    assertEqual(getFileName(123), 'default.json', '数字兜底');
-    assertEqual(getFileName(true), 'default.json', '布尔兜底');
-    assertEqual(getFileName(null), 'default.json', 'null 兜底');
+await test('getFileName: 非字符串 url 哈希命名（v3.157: 曾共用 default.json 互相误判重）', () => {
+    const n1 = getFileName({ a: 1 });
+    const n2 = getFileName(123);
+    assertEqual(n1.endsWith('.json') && n2.endsWith('.json'), true, '应 .json 结尾');
+    assertEqual(n1 !== n2, true, '不同坏源应不同缓存名');
+    assertEqual(getFileName({ a: 1 }), getFileName({ a: 1 }), '同坏源应幂等');
     assertEqual(getFileName(''), 'default.json', '空串兜底');
     assertEqual(getFileName('/weibo/123.html'), '123.html.json', '正常路径补 .json 后缀不受影响');
     assertEqual(getFileName('https://x.com/a/b.json?x=1'), 'b.json', 'query 剥离不受影响');
@@ -6236,6 +6236,46 @@ await test('saveBatch 同内容更新不误报"更新缓存记录"（#5）', () 
     }
     assertEqual(logs.some(l => l.includes('更新缓存记录')), false, '内容相同不应报更新（曾因 timestamp 差异误报）');
     try { fs.unlinkSync(p); } catch (e) {}
+});
+
+// ==================== 101. v3.157 修复 ====================
+console.log('\n📂 101. v3.157 修复');
+
+await test('anonKey 字段差异不合并（#2/41）', () => {
+    const k1 = anonKey('同标题', '同内容', null, null, 'pic1', '京东', '9.9', 'A牌', '分类');
+    const k2 = anonKey('同标题', '同内容', null, null, 'pic1', '京东', '19.9', 'A牌', '分类');
+    assertEqual(k1 !== k2, true, '价格不同应不同 key');
+    const k3 = anonKey('同标题', '同内容', null, null, 'pic1', '淘宝', '9.9', 'B牌', '分类');
+    assertEqual(k1 !== k3, true, '商城/品牌不同应不同 key');
+});
+
+await test('pingbitime 非法数值 → null + validateConfig 警告（#15）', () => {
+    const c = compileRules({ pingbitime: 'abc' });
+    assertEqual(c.pingbitime, null, '非法值不应落 value:0');
+    const warns = validateConfig({ pingbitime: 'abc' });
+    assertEqual(warns.some(w => w.includes('不是有效数字')), true, '应警告');
+    assertEqual(compileRules({ pingbitime: '5' }).pingbitime.value, 5, '合法值不受影响');
+});
+
+await test('readMessages 数组元素被排除（#21）', () => {
+    const fs = require('fs');
+    const p = getFilePath('test_arr157.json');
+    try { fs.unlinkSync(p); } catch (e) {}
+    fs.writeFileSync(p, JSON.stringify([{ id: 1, title: 'A' }, [1, 2], 'str', null]), 'utf8');
+    const r = readMessages(p);
+    assertEqual(r.length, 1, '数组/字符串/null 应被排除，仅保留对象');
+    try { fs.unlinkSync(p); } catch (e) {}
+});
+
+await test('getFileName 坏源命名（#10/49）', () => {
+    const n1 = getFileName(123);
+    const n2 = getFileName(456);
+    assertEqual(n1 !== n2, true, '不同数字应不同缓存名');
+    assertEqual(n1.endsWith('.json') && n2.endsWith('.json'), true, '应 .json 结尾');
+    assertEqual(getFileName(123), getFileName(123), '同坏源幂等');
+    assertEqual(getFileName(''), 'default.json', '空串 default');
+    assertEqual(getFileName(undefined), 'default.json', 'undefined default');
+    assertEqual(getFileName({ a: 1 }), 'default.json', '对象 default');
 });
 
 if (failed === 0) {

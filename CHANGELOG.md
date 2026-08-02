@@ -394,3 +394,17 @@
 - 测试：100 章 4 个 + t62/t63 共 6 个；变异 5/5 全红
 
 **754 个全绿（单元 639 + 集成 80 + 通道 35）**
+
+## v3.157（50 条清单筛选后修 7 点）
+
+- #2/41 anonKey 补 price/mall_name/brand/catename（同商品不同价曾误合并）
+- #15 pingbitime 非法数值(如 abc)→null 不编译（曾落 value:0 静默关闭时间过滤）
+- #21 readMessages 排除数组元素（typeof object 含数组，判重混乱）
+- #26 fetchData 重试门槛用 maxRetry（曾用原始 Config.api.retry 不一致）
+- #33/34 告警/日报走 Pusher.send（超时+surrogate 清洗与主推送统一）
+- #43 统计区分非对象元素（badElementCount，曾混入 filteredCount）
+- #10/49 可区分坏源(数字/布尔)哈希命名（曾共用 default.json 互相误判重）
+- 不修：anonKey 哈希碰撞/whitelistFilter 放行/normUrl 去 query(用户确认的#4)等设计取舍
+- 测试：101 章 4 个；变异 3 条可锁定全红
+
+**758 个全绿（单元 643 + 集成 80 + 通道 35）**

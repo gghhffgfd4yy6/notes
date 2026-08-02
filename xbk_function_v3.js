@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.156 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
+//******** 线报酷推送脚本 v3.157 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -635,7 +635,8 @@ const RuleEngine = {
                 compiled.pingbitime = { _type: 'timeMulti', rules };
             } else {
                 const value = Number(rawCfg.pingbitime);
-                compiled.pingbitime = (Number.isFinite(value) && value >= 0) ? { _type: 'time', value } : { _type: 'time', value: 0 };
+                // v3.157：非法数值(如 'abc')→ null 不编译（曾落 value:0 静默关闭时间过滤；空白已 v3.156 处理）
+                compiled.pingbitime = (Number.isFinite(value) && value >= 0) ? { _type: 'time', value } : null;
             }
         } else {
             compiled.pingbitime = null;
@@ -1040,7 +1041,8 @@ const MessageStore = {
             const data = JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
             if (Array.isArray(data)) {
                 // 过滤非对象元素（null/原始值），避免后续 has/save 访问 m.id 崩溃
-                const clean = data.filter(m => m && typeof m === 'object');
+                // v3.157：排除数组元素（typeof object 含数组——数组元素 m.id 访问异常、判重混乱）
+                const clean = data.filter(m => m && typeof m === 'object' && !Array.isArray(m));
                 this._memoSet(filePath, clean);
                 return clean;
             }
@@ -1196,8 +1198,15 @@ const MessageStore = {
     },
 
     getFileName(url) {
-        // 防御（R1）：非字符串 url（对象/数字/布尔）→ default.json（避免 '[object Object].json' 怪文件名）
-        if (typeof url !== 'string' || !url) return 'default.json';
+        // 防御（R1）：非字符串 url → 可区分坏源(数字/布尔)哈希命名；无信息(空串/对象)保持 default.json
+        // v3.157：数字/布尔 String 化可区分（123 vs 456），曾与空串/对象共用 default.json 互相误判重
+        if (typeof url !== 'string') {
+            let badStr;
+            try { badStr = String(url); } catch (e) { return 'default.json'; }
+            if (!badStr || badStr === '[object Object]' || badStr === 'undefined' || badStr === 'null') return 'default.json';
+            return 'bad_' + Utils.anonKey(badStr) + '.json';
+        }
+        if (!url) return 'default.json';
         const parts = url.split('/');
         let name = parts[parts.length - 1].split(/[?#]/)[0]; // 去掉查询参数与 hash
         if (!name || /^\.+$/.test(name)) name = 'default'; // 空/纯点串兜底，避免 '..' → '...json'
@@ -1240,7 +1249,7 @@ const Network = {
                     if (sc !== undefined && sc < 500 && sc !== 429) throw e;
                 }
 
-                if (attempt < Config.api.retry) {
+                if (attempt < maxRetry) { // v3.157：用兜底后的 maxRetry（曾用原始 Config.api.retry，非法类型时与实际重试不一致）
                     // 退避等待：1s、2s、3s...（加 0-500ms 随机抖动，避免多实例同时重试）
                     const wait = 1000 * (attempt + 1) + Math.floor(Math.random() * 500);
                     console.log(`请求失败（${(e && (e.code || e.message)) || String(e)}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）...`); // R5-1：显示兜底后次数
@@ -1308,7 +1317,8 @@ const App = {
             const alertText = '⚠️ xbk-push 运行异常';
             const alertDesp = `接口/推送异常，请检查。\n时间：${new Date().toLocaleString('zh-CN')}\n原因：${String(errMsg).slice(0, 500)}`;
             // v3.156：发送成功才写状态+打印——曾先写 lastAt（发送失败也限频，60s 内挡住重试，信息丢失）
-            notify.sendNotify(alertText, alertDesp)
+            // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗，与主推送不一致）
+            Pusher.send(alertText, alertDesp)
                 .then(() => {
                     fs.writeFileSync(statePath, JSON.stringify({ lastAt: Date.now() }), 'utf8');
                     console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）');
@@ -1340,7 +1350,8 @@ const App = {
                     const t = `📊 xbk-push 日报（${state.date}）`;
                     const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}`;
                     // v3.156：发送成功才重置日期——曾先写 state.date（日报失败也跨天，昨日日报丢失）
-                    notify.sendNotify(t, d)
+                    // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗）
+                    Pusher.send(t, d)
                         .then(() => {
                             state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
                             acc(state); // 本次数据计入新的一天
@@ -1419,14 +1430,16 @@ const App = {
             const newMessages = [];
             const seenInBatch = new Set(); // 防止同一批接口数据里出现重复 id/url 时被重复收录
 
+            let badElementCount = 0; // v3.157：非对象元素单独统计（曾混入 filteredCount，诊断不清）
             for (const item of xbkdata) {
                 // 元素级校验：非对象元素跳过（统计为屏蔽，不崩溃）
-                if (!Utils.isValidItem(item)) { filteredCount++; continue; }
+                if (!Utils.isValidItem(item)) { badElementCount++; filteredCount++; continue; }
                 // 归一化：category_name/category_id 兼容映射 + 无标识数据生成合成 id（在判重前统一处理）
                 if (!item.catename && item.category_name) item.catename = item.category_name;
                 if (!item.cateid && item.category_id) item.cateid = item.category_id;
                 if (!Utils.hasValidId(item) && (!item.url || String(item.url).trim() === '')) {
-                    item.id = Utils.anonKey(item.title, item.content, item.posttime, item.shijianchuo, item.pic, item.mall_name);
+                    // v3.157：anonKey 补 price/mall_name/brand/catename——曾忽略这些差异致同商品不同价被误合并
+                    item.id = Utils.anonKey(item.title, item.content, item.posttime, item.shijianchuo, item.pic, item.mall_name, item.price, item.brand, item.catename);
                 }
                 // key：有效 id 优先（null/'' 不算；归一化已为无标识数据生成合成 id），url 兜底
                 const key = Utils.hasValidId(item) ? `id:${item.id}` : `url:${Utils.normUrl(item.url)}`;
@@ -1590,6 +1603,7 @@ const App = {
             console.log(`  去重跳过:  ${dedupCount} 条`);
             console.log(`  过滤屏蔽:  ${filteredCount} 条`);
             if (truncatedCount > 0) console.log(`  截断待推:  ${truncatedCount} 条（下次运行推送，防推送风暴）`);
+            if (badElementCount > 0) console.log(`  非对象元素: ${badElementCount} 条（接口脏数据，已跳过）`);
             console.log(`  推送:     ${successCount} 条${successCount < items.length ? `（${items.length - successCount} 条失败，下次运行重试）` : ''}`);
             console.log(`  耗时:     ${elapsed}s`);
             console.log('══════════════════════════════');
