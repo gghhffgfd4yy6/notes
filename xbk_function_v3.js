@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.157 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
+//******** 线报酷推送脚本 v3.158 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -24,7 +24,7 @@ const Config = {
     api: {
         // v3.94：domain 尾斜杠防御——`https://x.com/` + 路径曾拼成 `//plus/...` 双斜杠 404
         // R2：domain 非字符串（数字/对象脏配置）→ 空串（避免 getter 内 .replace 崩溃）
-        get pushUrl() { return `${(typeof Config.domain === 'string' ? Config.domain.replace(/\/+$/, '') : '')}/plus/json/push.json`; },
+        get pushUrl() { return `${(typeof Config.domain === 'string' ? Config.domain.trim().replace(/\/+$/, '') : '')}/plus/json/push.json`; }, // v3.158: domain trim
         timeout: 5000,
         retry: 2,
     },
@@ -291,6 +291,15 @@ const Utils = {
     sanitizeSurrogates(s) {
         try { s = String(s === undefined || s === null ? '' : s); } catch (e) { return ''; }
         return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+    },
+
+    /**
+     * 数值配置统一转换（v3.158）：环境变量/配置文件传入的数字都是字符串——Number.isFinite('5')=false
+     * 曾全部回退默认(api.retry/parallelLimit/titleMax 等 7 处失效)；'5'→5，'abc'/undefined→默认
+     */
+    num(v, def) {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : def;
     },
 
     /** 解码常见 HTML 实体 */
@@ -1228,7 +1237,8 @@ const Network = {
         let lastErr;
         // R4-1：retry 非法值有界兜底——Infinity 会让 `attempt <= retry` 死循环重试（validateConfig 只警告不阻止）；
         // NaN → 意外只跑 1 次；小数 → 次数模糊。合法整数（默认 2）行为零变更
-        const maxRetry = Number.isInteger(Config.api.retry) && Config.api.retry >= 0 ? Config.api.retry : 2;
+        // v3.158：Utils.num 转换——'5'(环境变量字符串) → 5（曾 Number.isFinite('5')=false 回退 2）
+        const maxRetry = (() => { const r = Utils.num(Config.api.retry, 2); return Number.isInteger(r) && r >= 0 ? r : 2; })();
         for (let attempt = 0; attempt <= maxRetry; attempt++) {
             try {
                 // retry: { limit: 0 } 关闭 got 内置重试，完全交给外层手写逻辑
@@ -1246,7 +1256,7 @@ const Network = {
                 // 4xx 客户端错误：重试也没用，直接抛出（429 限流除外——限流可能瞬时，值得重试）
                 if (e.response) {
                     const sc = e.response.statusCode;
-                    if (sc !== undefined && sc < 500 && sc !== 429) throw e;
+                    if (sc !== undefined && sc < 500 && sc !== 429 && sc !== 408 && sc !== 409) throw e; // v3.158: 408/409 临时性也重试
                 }
 
                 if (attempt < maxRetry) { // v3.157：用兜底后的 maxRetry（曾用原始 Config.api.retry，非法类型时与实际重试不一致）
@@ -1308,7 +1318,7 @@ const App = {
     // 接口异常告警（v3.123）：限频 + 静默——不影响主流程；告警也走推送通道（通道挂了就静默，无解）
     _sendAlert(errMsg) {
         try {
-            if (!Config.alert || Config.alert.enabled === false) return;
+            if (!Config.alert || Config.alert.enabled === false || Config.alert.enabled === 'false') return; // v3.158：环境变量 'false' 字符串也关闭
             const statePath = path.join(MessageStore.cacheDir, 'alert.state');
             let lastAt = 0;
             try { lastAt = JSON.parse(fs.readFileSync(statePath, 'utf8')).lastAt || 0; } catch (e) { /* 无状态文件=首次 */ }
@@ -1330,7 +1340,7 @@ const App = {
     // 运行日报（v3.125）：跨天时发"昨日日报"，当天累加统计；静默不影响主流程
     _updateReport(summary) {
         try {
-            if (!Config.report || Config.report.enabled === false) return;
+            if (!Config.report || Config.report.enabled === false || Config.report.enabled === 'false') return; // v3.158
             const statePath = path.join(MessageStore.cacheDir, 'report.state');
             let state = { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
             try { state = JSON.parse(fs.readFileSync(statePath, 'utf8')) || state; } catch (e) { /* 无状态=首次 */ }
@@ -1484,7 +1494,7 @@ const App = {
             filteredCount += (beforeKwd - items.length);
 
             // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/8 分钟运行；正常 ~20 条无影响）
-            const maxPerRun = (Number.isFinite(Config.push.maxPerRun) && Config.push.maxPerRun > 0) ? Config.push.maxPerRun : 100;
+            const maxPerRun = (() => { const v = Utils.num(Config.push.maxPerRun, 100); return v > 0 ? v : 100; })();
             let truncatedKeys = new Set();
             if (items.length > maxPerRun) {
                 truncatedCount = items.length - maxPerRun;
@@ -1500,7 +1510,7 @@ const App = {
             const keyOf = (it) => Utils.hasValidId(it) ? `id:${it.id}` : `url:${Utils.normUrl(it.url)}`;
             // domain 去尾斜杠后与相对路径统一拼接（避免 'https://x.com//rel' 双斜杠）
             // R2：非字符串 domain（脏配置）→ 空串 baseUrl（相对路径不拼前缀，避免 .replace 崩溃）
-            const baseUrl = (typeof Config.domain === 'string') ? Config.domain.replace(/\/+$/, '') : '';
+            const baseUrl = (typeof Config.domain === 'string') ? Config.domain.trim().replace(/\/+$/, '') : ''; // v3.158: trim
             // url 类型防御：非字符串(null/undefined/对象/数字)视为无链接——避免 .includes 崩溃或 [object Object]
             // 与 htmlToMarkdown 的 content_html 口径一致（非字符串视为空）
             const urlOf = (it) => {
@@ -1515,8 +1525,8 @@ const App = {
             const titleTpl = (typeof Config.template.title === 'string' && Config.template.title) ? Config.template.title : '【{分类名}】{标题}';
             const contentTpl = (typeof Config.template.content === 'string' && Config.template.content) ? Config.template.content : '{Markdown内容}';
             // 推送截断长度（v3.69 可配置）：非正数/非数字回退默认（负数会让 slice(0,-1) 误截尾字符）
-            const titleMax = Number.isFinite(Config.push.titleMax) && Config.push.titleMax > 0 ? Config.push.titleMax : 100;
-            const contentMax = Number.isFinite(Config.push.contentMax) && Config.push.contentMax > 0 ? Config.push.contentMax : 3000;
+            const titleMax = (() => { const v = Utils.num(Config.push.titleMax, 100); return v > 0 ? v : 100; })();
+            const contentMax = (() => { const v = Utils.num(Config.push.contentMax, 3000); return v > 0 ? v : 3000; })();
 
             // 单条推送（两种模式共用）：成功返回 {ok:true} 并记录；失败警告且不写缓存(下次重试)
             const pushOne = async (item) => {
@@ -1567,13 +1577,12 @@ const App = {
             if (Config.push && Config.push.mode === 'parallel') {
                 // 并行推送：一次性全部发出（parallelLimit>0 时按批限并发）
                 // parallelLimit 防御：小数取整（0.5 会产生空批）、0/负数回退全量、空 items 兜底 1
-                const limit = (Number.isFinite(Config.push.parallelLimit) && Config.push.parallelLimit > 0
-                    ? Math.floor(Config.push.parallelLimit) : items.length) || 1;
+                const limit = (() => { const pl = Utils.num(Config.push.parallelLimit, 0); return pl > 0 ? Math.floor(pl) : items.length; })() || 1;
                 const results = [];
                 for (let i = 0; i < items.length; i += limit) {
                     const batch = items.slice(i, i + limit);
                     results.push(...await Promise.all(batch.map(pushOne)));
-                    if (i + limit < items.length) await new Promise(r => setTimeout(r, Config.timing.pushInterval));
+                    if (i + limit < items.length) await new Promise(r => setTimeout(r, Utils.num(Config.timing.pushInterval, 100)));
                 }
                 // 按原顺序输出成功日志（并发完成顺序不定，日志保持数据顺序）
                 for (const r of results) {
@@ -1585,7 +1594,7 @@ const App = {
                 for (const item of items) {
                     const r = await pushOne(item);
                     if (r.ok) { successCount++; console.log(`发现到新数据：${item.title}【${item.catename}】${urlOf(item)}`); }
-                    await new Promise(r2 => setTimeout(r2, Config.timing.pushInterval));
+                    await new Promise(r2 => setTimeout(r2, Utils.num(Config.timing.pushInterval, 100)));
                 }
             }
 
@@ -1607,7 +1616,7 @@ const App = {
             console.log(`  推送:     ${successCount} 条${successCount < items.length ? `（${items.length - successCount} 条失败，下次运行重试）` : ''}`);
             console.log(`  耗时:     ${elapsed}s`);
             console.log('══════════════════════════════');
-            await new Promise(r => setTimeout(r, Config.timing.finalWait));
+            await new Promise(r => setTimeout(r, Utils.num(Config.timing.finalWait, 200)));
 
             // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
             this._writeRunLog(`${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${items.length - successCount} elapsed=${elapsed}s\n`);

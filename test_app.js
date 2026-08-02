@@ -1514,6 +1514,57 @@ await test('日报发送失败 → report.state date 不重置（v3.156 #3）', 
     }
 });
 
+await test('retry 字符串配置生效（v3.158 #21）', async () => {
+    reset();
+    setPushUrl('t64_retry_str');
+    const orig = Config.api.retry;
+    try {
+        Config.api.retry = '3'; // 环境变量字符串(区分默认2)
+        failCount = 99; // 一直失败直到重试耗尽
+        fakeData = [makeItem({ id: 1 })];
+        let crashed = false;
+        try { await xbk.run(); } catch (e) { crashed = true; }
+        assert(gotCalls.length === 4, `字符串 retry='3' 应重试3次(共4请求)，实际${gotCalls.length}`);
+        assert(crashed, '重试耗尽应抛错');
+    } finally {
+        Config.api.retry = orig;
+    }
+});
+
+await test('alert.enabled 字符串 "false" 关闭告警（v3.158 #28）', async () => {
+    reset();
+    setPushUrl('t65_alert_str');
+    fakeData = [];
+    const orig = Config.alert.enabled;
+    try {
+        Config.alert.enabled = 'false'; // 环境变量字符串
+        Config.alert.intervalMs = 0;
+        fail4xx = true;
+        try { await xbk.run(); } catch (e) { /* 预期 */ }
+        assert(!pushCalls.some(c => c.text.includes('运行异常')), `字符串 false 应关闭告警: ${pushCalls.length}`);
+    } finally {
+        Config.alert.enabled = orig;
+        try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 忽略 */ }
+    }
+});
+
+await test('parallelLimit 字符串配置生效（v3.158 #24）', async () => {
+    reset();
+    setPushUrl('t66_plimit_str');
+    const orig = Config.push.parallelLimit;
+    try {
+        Config.push.mode = 'parallel';
+        Config.push.parallelLimit = '1'; // 字符串 → 每批 1 条
+        fakeData = [1, 2, 3].map(i => makeItem({ id: i }));
+        await xbk.run();
+        assert(pushCalls.length === 3, `parallelLimit='1' 应全推 3 条`);
+        assert(Config.push.parallelLimit === '1', '不应修改用户配置');
+    } finally {
+        Config.push.parallelLimit = orig;
+        Config.push.mode = 'sequential';
+    }
+});
+
 await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () => {
     reset();
     setPushUrl('t58_maxperrun');
