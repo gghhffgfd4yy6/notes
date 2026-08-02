@@ -327,3 +327,11 @@
 - test_notify 新增换行处理测试（29 → 30）
 
 **740 个全绿（单元 635 + 集成 75 + 通道 30）**
+
+## v3.149（mdToPlain HTML 残留属性修复）
+
+- **`{Html内容}` 模板 + Push+/Bark**：mdToPlain 曾把 `<a href="..." target="_blank">` 剥成残留属性垃圾文本（高概率：{Html内容} 模板 + 纯文本通道）
+- **修复**：HTML 标签（含属性）整体剥空、`<url>` autolink 保留内容、`&nbsp;` 等实体解码；TG（stripAngle=false）保留 `<>`
+- test_notify 新增 HTML 内容场景测试（30 → 31）
+
+**741 个全绿（单元 635 + 集成 75 + 通道 31）**

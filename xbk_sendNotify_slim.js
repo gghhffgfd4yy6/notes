@@ -704,6 +704,8 @@ function truncateBytes(s, maxBytes) {
 
 // markdown → 纯文本（v3.128：Bark/Push+ 不支持 markdown 渲染，desp 会显示 ** 等原始符号）
 // v3.136：剥 <url> autolink 尖括号（stripAngle 默认 true）；TG 传 false（保留 < > 给 HTML 转义）
+// v3.149：HTML 标签（含属性）整体剥空——{Html内容} 模板产物曾残留 'a href="..." target="_blank"' 垃圾文本；
+//          <url> autolink（http 开头）保留内容；&nbsp; 等实体解码为空格
 function mdToPlain(s, stripAngle = true) {
     return String(s === undefined || s === null ? '' : s)
         .replace(/\*\*([^*]+)\*\*/g, '$1')            // **粗体** → 粗体
@@ -712,7 +714,13 @@ function mdToPlain(s, stripAngle = true) {
         .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)') // [text](url) → text (url)
         .replace(/^#{1,6}\s+/gm, '')                  // # 标题
         .replace(/`([^`]+)`/g, '$1')                  // `代码` → 代码
-        .replace(/<([^>]+)>/g, stripAngle ? '$1' : '<$1>'); // <url> autolink → url（TG 保留转义）
+        .replace(/<([^>]+)>/g, (m, inner) => {
+            if (!stripAngle) return m; // TG：保留 <>（HTML 转义）
+            const t = inner.trim();
+            return /^https?:(\/\/)?/i.test(t) ? t : ''; // <url> autolink 保留内容；HTML 标签剥空
+        })
+        .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"').replace(/&#39;/g, "'"); // 实体解码（{Html内容} 的 &nbsp; 等）
 }
 
 // 孤立代理清洗（v3.110）：encodeURIComponent 对孤立代理抛 URIError——推送前统一处理

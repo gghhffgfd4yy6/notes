@@ -221,6 +221,20 @@ await test('Push+: token + JSON body + 换行转 <br>', () => withChannels(async
     assert(c.options.headers['Content-Type'].includes('application/json'), 'JSON 头');
 }));
 
+await test('Push+/Bark: {Html内容} 模板产物无残留标签属性（v3.149）', () => withChannels(async () => {
+    // 模拟 {Html内容} 模板产物（HTML）+ Push+（mdToPlain）
+    cfg.PUSH_PLUS_TOKEN = 'token123';
+    const htmlDesp = '<p>内容</p><a href="https://x.com" target="_blank">链接</a><img src="https://x.com/a.jpg" alt="图"><br>&nbsp;<br>原文链接：<a href="/a.html">/a.html</a>';
+    await notify.sendNotify('标题', htmlDesp);
+    const c = gotCalls[0];
+    const content = JSON.parse(c.options.body).content;
+    assert(!content.includes('target='), `不应残留 target= 属性: ${content}`);
+    assert(!content.includes('href='), `不应残留 href= 属性: ${content}`);
+    assert(!content.includes('&nbsp;'), '&nbsp; 应解码');
+    assert(content.includes('链接'), '链接文本应保留');
+    assert(content.includes('原文链接'), '原文链接文本应保留');
+}));
+
 // 9. 无通道 → reject 且零请求
 await test('通道全空 → reject 不静默成功', () => withChannels(async () => {
     let rejected = false;
