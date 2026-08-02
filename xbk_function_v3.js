@@ -214,6 +214,8 @@ const Utils = {
         let s;
         try { s = String(u); } catch (e) { return ''; }
         s = s.trim();
+        // v3.156：去 query/hash（与 getFileName 口径一致）——同一内容带跟踪参数/锚点曾判为不同，重复入库推送
+        s = s.split(/[?#]/)[0];
         // 交替去首尾斜杠与 trim 直到稳定（保证幂等：斜杠挡住的尾空格需多轮去除）
         let prev;
         do {
@@ -598,6 +600,9 @@ const RuleEngine = {
                 compiled[field] = { _type: 'multi', rules };
             } else {
                 // 简单模式：直接编译为 RegExp
+                // v3.156：先 trim——空白配置('   ')曾编译成 /   /i 假过滤（validateConfig 说忽略但实际生效）
+                val = val.trim();
+                if (!val) { compiled[field] = null; continue; }
                 if (this.hasNestedQuantifier(val)) { compiled[field] = null; continue; } // ReDoS 防护
                 try {
                     compiled[field] = { _type: 're', re: new RegExp(val, 'i') };
@@ -608,7 +613,10 @@ const RuleEngine = {
         }
 
         // 编译 pingbitime（特殊处理）
-        if (rawCfg.pingbitime) {
+        // v3.156：先 trim——空白('   ')曾 Number→0 静默关闭时间过滤
+        const pbRaw = String(rawCfg.pingbitime === undefined || rawCfg.pingbitime === null ? '' : rawCfg.pingbitime).trim();
+        if (pbRaw) {
+            rawCfg.pingbitime = pbRaw;
             if (/###/.test(rawCfg.pingbitime)) {
                 const lines = this._splitLines(rawCfg.pingbitime);
                 const rules = [];
@@ -757,7 +765,15 @@ const RuleEngine = {
         }
 
         // 验证 pingbitime
-        if (cfg.pingbitime) {
+        // v3.156：空白配置('   ')警告（曾静默当 0 关闭时间过滤，复制粘贴带空格常见）
+        const pbStr = cfg.pingbitime === undefined || cfg.pingbitime === null ? '' : String(cfg.pingbitime);
+        // v3.156：空白/首尾空格警告（多行 ### 不警告——行内分类已 trim，整串首尾空格是格式不是错误）
+        if (pbStr.trim() === '' && pbStr !== '') {
+            warnings.push('⚠️ 配置「pingbitime」为空白字符，将被忽略');
+        } else if (!/###/.test(pbStr) && pbStr.trim() !== '' && pbStr !== pbStr.trim()) {
+            warnings.push('⚠️ 配置「pingbitime」含首尾空白，已按去空格后的值处理');
+        }
+        if (String(cfg.pingbitime || '').trim()) {
             if (/###/.test(cfg.pingbitime)) {
                 const lines = cfg.pingbitime.split(/<br\s*\/?>|\r\n|\r|\n/); // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
                 for (const line of lines) {
@@ -948,8 +964,10 @@ const MessageStore = {
         const idx = this._findDedupIndex(messages, message);
         if (idx >= 0) {
             // 序列化比较（循环引用等失败时按"已更新"处理，不崩溃）
+            // v3.156：排除 timestamp（同 saveBatch 主路径口径）
+            const stripTs = (o) => { if (!o || typeof o !== 'object') return o; const c = { ...o }; delete c.timestamp; return c; };
             let changed = false;
-            try { changed = JSON.stringify(messages[idx]) !== JSON.stringify(message); } catch (e) { changed = true; }
+            try { changed = JSON.stringify(stripTs(messages[idx])) !== JSON.stringify(stripTs(message)); } catch (e) { changed = true; }
             if (changed) {
                 console.log(`更新缓存记录: ${filename}`);
             }
@@ -1159,9 +1177,10 @@ const MessageStore = {
             }
             if (idx >= 0) {
                 const oldM = messages[idx];
-                // 与原 _upsert 口径一致：内容变化时提示（循环引用等比较失败按"已更新"处理）
+                // v3.156：比较排除 timestamp——曾因 oldM 有 timestamp、message 无而内容相同也必报"更新缓存记录"
+                const stripTs = (o) => { if (!o || typeof o !== 'object') return o; const c = { ...o }; delete c.timestamp; return c; };
                 let changed = false;
-                try { changed = JSON.stringify(oldM) !== JSON.stringify(message); } catch (e) { changed = true; }
+                try { changed = JSON.stringify(stripTs(oldM)) !== JSON.stringify(stripTs(message)); } catch (e) { changed = true; }
                 if (changed) console.log(`更新缓存记录: ${filename}`);
                 messages[idx] = { ...message, timestamp: NOW() };
                 reindex(idx, oldM);
@@ -1288,11 +1307,13 @@ const App = {
             if (interval > 0 && Date.now() - lastAt < interval) return; // 限频：间隔内不重复轰炸
             const alertText = '⚠️ xbk-push 运行异常';
             const alertDesp = `接口/推送异常，请检查。\n时间：${new Date().toLocaleString('zh-CN')}\n原因：${String(errMsg).slice(0, 500)}`;
-            // 成功才打印"已发送"（v3.145：sendNotify reject 时曾误报"已发送"，实际未送达）
+            // v3.156：发送成功才写状态+打印——曾先写 lastAt（发送失败也限频，60s 内挡住重试，信息丢失）
             notify.sendNotify(alertText, alertDesp)
-                .then(() => console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）'))
-                .catch(() => { /* v3.135：告警通道也挂了，静默（防 unhandledRejection） */ });
-            fs.writeFileSync(statePath, JSON.stringify({ lastAt: Date.now() }), 'utf8');
+                .then(() => {
+                    fs.writeFileSync(statePath, JSON.stringify({ lastAt: Date.now() }), 'utf8');
+                    console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）');
+                })
+                .catch(() => { /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */ });
         } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
     },
 
@@ -1306,24 +1327,38 @@ const App = {
             // v3.155：日报日期用本地时区（原 UTC——中国用户凌晨 cron 时本地已跨天但 UTC 未跨，日报日期错位一天）
             const _d = new Date();
             const today = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`;
+            const acc = (st) => {
+                st.total += summary.total || 0;
+                st.dedup += summary.dedup || 0;
+                st.filtered += summary.filtered || 0;
+                st.pushed += summary.pushed || 0;
+                st.failed += summary.failed || 0;
+            };
             if (state.date && state.date !== today) {
                 // 新的一天：发昨日日报（若有数据）
                 if (state.total > 0 || state.failed > 0) {
                     const t = `📊 xbk-push 日报（${state.date}）`;
                     const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}`;
-                // 成功才打印"已发送"（v3.146：与告警 v3.145 同类——sendNotify reject 曾误报，实际未送达）
-                notify.sendNotify(t, d)
-                    .then(() => console.log('已发送昨日运行日报'))
-                    .catch(() => { /* v3.135：日报通道失败静默（防 unhandledRejection） */ });
+                    // v3.156：发送成功才重置日期——曾先写 state.date（日报失败也跨天，昨日日报丢失）
+                    notify.sendNotify(t, d)
+                        .then(() => {
+                            state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
+                            acc(state); // 本次数据计入新的一天
+                            fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
+                            console.log('已发送昨日运行日报');
+                        })
+                        .catch(() => {
+                            // 失败：date 不重置（下次运行重试昨日日报），本次数据先累计进旧 state（不丢）
+                            acc(state);
+                            fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
+                        });
+                    return;
                 }
+                // 昨日无数据：直接跨天
                 state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
             }
             if (!state.date) state.date = today;
-            state.total += summary.total || 0;
-            state.dedup += summary.dedup || 0;
-            state.filtered += summary.filtered || 0;
-            state.pushed += summary.pushed || 0;
-            state.failed += summary.failed || 0;
+            acc(state);
             fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
         } catch (e) { /* 日报失败静默 */ }
     },

@@ -1470,6 +1470,50 @@ await test('日报通道挂 → 不误报"已发送"（v3.146）', async () => {
     }
 });
 
+await test('告警发送失败 → alert.state 不写（v3.156 #3）', async () => {
+    reset();
+    setPushUrl('t62_alert_state');
+    try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 清残留 */ }
+    fakeData = [];
+    const origInterval = Config.alert.intervalMs;
+    const origEnabled = Config.alert.enabled;
+    try {
+        Config.alert.enabled = true;
+        Config.alert.intervalMs = 60000;
+        fail4xx = true; // 接口失败触发告警
+        notifyFail = true; // 告警通道也挂（sendNotify reject）
+        try { await xbk.run(); } catch (e) { /* 预期抛错 */ }
+        await new Promise(r => setTimeout(r, 50)); // 等 sendNotify 微任务（fire-and-forget）
+        const statePath = path.join(CACHE_DIR, 'alert.state');
+        assert(!fs.existsSync(statePath), `发送失败不应写状态(曾写 lastAt 限频挡重试): ${fs.existsSync(statePath)}`);
+    } finally {
+        Config.alert.intervalMs = origInterval;
+        Config.alert.enabled = origEnabled;
+        try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 忽略 */ }
+    }
+});
+
+await test('日报发送失败 → report.state date 不重置（v3.156 #3）', async () => {
+    reset();
+    setPushUrl('t63_report_state');
+    fakeData = [makeItem({ id: 1 })];
+    const orig = Config.report.enabled;
+    const statePath = path.join(CACHE_DIR, 'report.state');
+    try {
+        Config.report.enabled = true;
+        notifyFail = true; // 日报通道挂
+        require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, pushed: 3, failed: 0 }));
+        await xbk.run();
+        await new Promise(r => setTimeout(r, 50)); // 等 sendNotify 微任务（fire-and-forget）
+        const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'));
+        assert(st.date === '2026-08-01', `发送失败不应重置 date(曾直接跨天丢日报): ${st.date}`);
+        assert(st.total >= 5, '本次数据应累计进旧 state(不丢)');
+    } finally {
+        Config.report.enabled = orig;
+        try { require('fs').unlinkSync(statePath); } catch (e) { /* 忽略 */ }
+    }
+});
+
 await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () => {
     reset();
     setPushUrl('t58_maxperrun');

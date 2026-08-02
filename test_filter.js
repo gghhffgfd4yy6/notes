@@ -4822,7 +4822,8 @@ await test('边界: TS_BOUND(1e11) 精确分界行为锁定', () => {
 await test('边界: normUrl 极端输入行为锁定', () => {
     assertEqual(normUrl('http://'), 'http:', '纯协议残留(已知#27)');
     assertEqual(normUrl('///'), '', '全斜杠→空');
-    assertEqual(normUrl('a?x=1'), 'a?x=1', 'query保留(已知#29)');
+    assertEqual(normUrl('a?x=1'), 'a', 'v3.156: query 去除(与 getFileName 口径一致,防跟踪参数重复判重)');
+    assertEqual(normUrl('http://A.com/p?x=1#s'), 'http://a.com/p', 'v3.156: query+hash+主机小写');
     assertEqual(normUrl('/A/B/'), 'A/B', '首尾斜杠去除');
     assertEqual(normUrl('  /a/  '), 'a', '空白+斜杠');
 });
@@ -6184,6 +6185,57 @@ await test('一致性-强化: 脏缓存同键多条 + 首条被覆盖 + 更新�
     } finally {
         try { require('fs').unlinkSync(fp); } catch (e) { /* 忽略 */ }
     }
+});
+
+// ==================== 100. v3.156 配置空白/normUrl/更新日志修复 ====================
+console.log('\n📂 100. v3.156 修复');
+
+await test('空白 pingbibiaoti → 编译为 null + validateConfig 警告（#1/#6）', () => {
+    const c = compileRules({ pingbibiaoti: '   ' });
+    assertEqual(c.pingbibiaoti, null, '空白不应编译成正则（曾 /   /i 假过滤）');
+    const warns = validateConfig({ pingbibiaoti: '   ' });
+    assertEqual(warns.some(w => w.includes('空白字符')), true, '应警告空白配置');
+    assertEqual(listfilter(makeItem({ title: '京东   神券' }), c), true, '3+空格标题不应被假过滤');
+});
+
+await test('空白 pingbitime → 编译为 null + validateConfig 警告（#2/#6）', () => {
+    const c = compileRules({ pingbitime: '   ' });
+    assertEqual(c.pingbitime, null, '空白不应编译成 value:0（曾静默关闭时间过滤）');
+    const warns = validateConfig({ pingbitime: '   ' });
+    assertEqual(warns.some(w => w.includes('空白字符')), true, '应警告空白配置');
+    const c2 = compileRules({ pingbitime: ' 5 ' });
+    assertEqual(c2.pingbitime._type === 'time' && c2.pingbitime.value === 5, true, '首尾空格应 trim 后生效');
+});
+
+await test('normUrl 去 query/hash + 无id同内容不同query去重（#4）', () => {
+    assertEqual(normUrl('/a?x=1'), 'a');
+    assertEqual(normUrl('/a?x=2'), 'a');
+    assertEqual(normUrl('/a#sec'), 'a');
+    assertEqual(normUrl('https://A.com/p?u=1&t=2#top'), 'https://a.com/p');
+    const fs = require('fs');
+    const p = getFilePath('test_q156.json');
+    try { fs.unlinkSync(p); } catch (e) {}
+    saveBatch([{ url: '/a?x=1', title: '同' }], 'test_q156.json');
+    saveBatch([{ url: '/a?x=2', title: '同' }], 'test_q156.json');
+    assertEqual(readMessages(p).length, 1, '去 query 后应判重 1 条');
+    try { fs.unlinkSync(p); } catch (e) {}
+});
+
+await test('saveBatch 同内容更新不误报"更新缓存记录"（#5）', () => {
+    const fs = require('fs');
+    const p = getFilePath('test_ts156.json');
+    try { fs.unlinkSync(p); } catch (e) {}
+    saveBatch([{ id: 1, title: 'A' }], 'test_ts156.json');
+    const logs = [];
+    const orig = console.log;
+    console.log = (...a) => logs.push(a.join(' '));
+    try {
+        saveBatch([{ id: 1, title: 'A' }], 'test_ts156.json');
+    } finally {
+        console.log = orig;
+    }
+    assertEqual(logs.some(l => l.includes('更新缓存记录')), false, '内容相同不应报更新（曾因 timestamp 差异误报）');
+    try { fs.unlinkSync(p); } catch (e) {}
 });
 
 if (failed === 0) {
