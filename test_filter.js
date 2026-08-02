@@ -5898,6 +5898,41 @@ await test('边界: 跨日边界（今天 0 点 = 0 天 / 昨天 0 点 = 1 天�
     assertEqual(daysComputed(dayAgo), 1, '恰好 24h 前应=1');
 });
 
+console.log('\n📂 111. 边界回归补充（负数天数/空值/TS_BOUND 下界/normUrl 空）');
+
+await test('边界回归: daysComputed 负数 → 0（v3.62 修复 -1→2001 bug 的显式回归）', () => {
+    assertEqual(daysComputed(-1), 0, '-1 应无效→0（曾 new Date(-1)=1969/2001 怪异）');
+    assertEqual(daysComputed(-100), 0, '-100 应无效→0');
+    assertEqual(daysComputed(-1e12), 0, '-1e12 应无效→0');
+    assertEqual(daysComputed(-Infinity), 0, '-Infinity 应无效→0');
+    assertEqual(daysComputed(0) > 20000, true, '0=1970 应有巨大天数');
+});
+
+await test('边界回归: parseTime/daysComputed 空值边界', () => {
+    assertEqual(daysComputed(null), 0, 'null → 0');
+    assertEqual(daysComputed(''), 0, '空串 → 0');
+    assertEqual(daysComputed(undefined), 0, 'undefined → 0');
+    assertEqual(daysComputed('   '), 0, '纯空白 → 0');
+    assertEqual(daysComputed('abc'), 0, '非日期字符串 → 0');
+});
+
+await test('边界回归: TS_BOUND 下界/上界精确（1e8/1e14）', () => {
+    assertEqual(daysComputed(99999999), 0, '9位(1e8-1) 范围外→0');
+    assertEqual(daysComputed(100000000) > 19000, true, '1e8 秒起点(1973)有天数');
+    assertEqual(daysComputed(99999999999999), 0, '1e14-1(5138年)未来→0');
+    assertEqual(daysComputed(100000000000000), 0, '1e14 超范围→0');
+});
+
+await test('边界回归: normUrl 空/空白/null', () => {
+    assertEqual(normUrl(''), '', '空串→空');
+    assertEqual(normUrl('   '), '', '纯空白→空');
+    assertEqual(normUrl('///'), '', '全斜杠→空');
+    assertEqual(normUrl('//'), '', '双斜杠→空');
+    assertEqual(normUrl(null), '', 'null→空');
+    assertEqual(normUrl(undefined), '', 'undefined→空');
+    assertEqual(normUrl('http://x.com/'), 'http://x.com', '尾斜杠去除');
+});
+
 if (failed === 0) {
     console.log(`  🎉 全部通过！${passed}/${passed}  100%`);
 } else {
