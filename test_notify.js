@@ -537,6 +537,31 @@ await test('全通道失败 → sendNotify reject / 部分成功 → resolve（v
     assert(ok, '单通道成功应 resolve');
 }));
 
+
+await test('企微/TG 超长内容截断（v3.139：通道长度限制）', () => withChannels(async () => {
+    // 企微：>4096 字节 content → 截断
+    cfg.QYWX_KEY = 'webhook-abc';
+    const longCn = '中'.repeat(2000); // 6000 字节
+    await notify.sendNotify('标题', longCn);
+    const qywx = gotCalls.find(c => c.url.includes('qyapi.weixin.qq.com'));
+    const qContent = qywx.options.json.markdown.content;
+    assert(Buffer.byteLength(qContent, 'utf8') <= 4096, `企微 content 应 ≤4096 字节: ${Buffer.byteLength(qContent, 'utf8')}`);
+    // TG：>4000 字符 → 截断
+    cfg.QYWX_KEY = '';
+    cfg.TG_BOT_TOKEN = '123:ABC';
+    cfg.TG_USER_ID = '456';
+    const longTg = 'a'.repeat(5000);
+    await notify.sendNotify('标题', longTg);
+    const tg = gotCalls.find(c => c.url.includes('telegram.org'));
+    assert(tg.options.json.text.length <= 4000, `TG text 应 ≤4000 字符: ${tg.options.json.text.length}`);
+    // 代理对安全（emoji 结尾截断）
+    cfg.TG_USER_ID = '456';
+    await notify.sendNotify('😀'.repeat(3000) + 'x', '内容');
+    const tg2 = gotCalls.find((c, i) => i > 0 && c.url.includes('telegram.org'));
+    const t2 = tg2 ? tg2.options.json.text : null;
+    assert(t2 && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(t2), 'TG 截断不应有孤立高代理');
+}));
+
 if (failed === 0) {
     console.log(`  🎉 通道测试通过 ${passed}/${passed}`);
 } else {

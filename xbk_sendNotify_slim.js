@@ -441,7 +441,8 @@ function qywxBotNotify(text, desp) {
                 msgtype: 'markdown',
                 markdown: {
                     // v3.130：企微 markdown 不支持图片——真实接口 desp 全含 ![]()，剥成 alt 文本（保留粗体/链接等其他语法）
-                    content: desp ? `${text}\n\n${String(desp).replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt) => alt || '(图片)')}` : text,
+                    // v3.139：企微 markdown content 上限约 4096 字节——contentMax=3000 字符(中文 9000 字节)可能超，按字节截断(代理对安全)
+                    content: truncateBytes(desp ? `${text}\n\n${String(desp).replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt) => alt || '(图片)')}` : text, 4096),
                 },
             },
             headers: {
@@ -632,11 +633,16 @@ function tgNotify(text, desp) {
             const tgText = mdToPlain(text, false);
             const tgDesp = mdToPlain(desp, false); // v3.136：TG 保留 < >（HTML 转义），不剥 autolink
             const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            // v3.139：TG 消息上限 4096 字符——内容超长截断（字符截断+代理对安全）
+            const tgFull = esc(tgDesp ? `${tgText}\n\n${tgDesp}` : tgText);
+            const tgCut = tgFull.length > 4000 ? tgFull.slice(0, 4000) : tgFull;
+            const tgLast = tgCut.charCodeAt(tgCut.length - 1);
+            const tgSafe = (tgLast >= 0xD800 && tgLast <= 0xDBFF) ? tgCut.slice(0, -1) : tgCut;
             const options = {
                 url: `${String(TG_API_HOST || 'https://api.telegram.org').replace(/\/+$/, '')}/bot${TG_BOT_TOKEN}/sendMessage`, // v3.138：去尾斜杠防双斜杠
                 json: {
                     chat_id: TG_USER_ID,
-                    text: esc(tgDesp ? `${tgText}\n\n${tgDesp}` : tgText),
+                    text: tgSafe,
                     parse_mode: 'HTML',
                     disable_web_page_preview: true,
                 },
@@ -667,6 +673,17 @@ function tgNotify(text, desp) {
             resolve();
         }
     });
+}
+
+// 按 UTF-8 字节截断（v3.139：企微 markdown content 4096 字节上限；代理对安全——末尾高代理退一位）
+function truncateBytes(s, maxBytes) {
+    let str = String(s === undefined || s === null ? '' : s);
+    if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;
+    let cut = str.slice(0, maxBytes); // 近似（UTF-8 多字节可能超）
+    while (Buffer.byteLength(cut, 'utf8') > maxBytes) cut = cut.slice(0, -1);
+    const last = cut.charCodeAt(cut.length - 1);
+    if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1); // 高代理退位
+    return cut;
 }
 
 // markdown → 纯文本（v3.128：Bark/Push+ 不支持 markdown 渲染，desp 会显示 ** 等原始符号）
