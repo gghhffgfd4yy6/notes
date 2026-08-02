@@ -486,7 +486,8 @@ function wxPusherNotify(text, desp) {
                 content: desp,
                 summary: text.substring(0, 90),
                 contentType: 3, // 1文字 2HTML 3Markdown
-                topicIds: [WX_pusher_topicIds] // 推送给指定的群组
+                // v3.137：配置注释"多个用逗号分隔"但未分割——[WX_pusher_topicIds] 曾发 ['1,2'] 而非 ['1','2']，多主题失效
+                topicIds: String(WX_pusher_topicIds || '').split(',').map(s => s.trim()).filter(Boolean),
             },
             headers: {
                 'Content-Type': 'application/json',

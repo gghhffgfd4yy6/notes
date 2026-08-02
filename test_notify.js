@@ -177,15 +177,16 @@ await test('企业微信: webhook URL 含 key + JSON body', () => withChannels(a
 }));
 
 // 6. wxpusher
-await test('wxpusher: appToken + topicIds 数组 + Markdown', () => withChannels(async () => {
+await test('wxpusher: appToken + topicIds 数组(逗号分割) + Markdown', () => withChannels(async () => {
     cfg.WX_pusher_appToken = 'AT123';
-    cfg.WX_pusher_topicIds = '456';
+    cfg.WX_pusher_topicIds = '456,789'; // v3.137：配置注释"逗号分隔"——应分割成数组
     await notify.sendNotify('标题', '内容');
     assert(gotCalls.length >= 1, '应有请求');
     const c = gotCalls[0];
     assert(c.url.includes('wxpusher.zjiecode.com'), `wxpusher URL: ${c.url}`);
     assert(c.options.json.appToken === 'AT123', 'appToken');
-    assert(Array.isArray(c.options.json.topicIds) && c.options.json.topicIds[0] === '456', 'topicIds 数组');
+    assert(Array.isArray(c.options.json.topicIds) && c.options.json.topicIds[0] === '456' && c.options.json.topicIds[1] === '789',
+        `v3.137：逗号应分割成数组: ${JSON.stringify(c.options.json.topicIds)}`);
     assert(c.options.json.contentType === 3, 'Markdown');
     assert(gotCalls.length === 1, '仅 wxpusher 一次请求');
 }));
