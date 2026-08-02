@@ -1025,6 +1025,18 @@ await test('推送模板可配置 + 非法回退默认（v3.68）', async () => 
     }
 });
 
+await test('长 desp 截断保留原文链接（v3.152）', async () => {
+    reset();
+    setPushUrl('t61_linkkeep');
+    // 超长 content_html → desp 超 contentMax → 截断后原文链接应保留
+    fakeData = [makeItem({ id: 1, content_html: '<p>' + '很长内容'.repeat(2000) + '</p>' })];
+    await xbk.run();
+    assert(pushCalls.length === 1, '应推送');
+    const d = pushCalls[0].desp;
+    assert(d.length <= Config.push.contentMax, `desp 应 ≤ contentMax: ${d.length}`);
+    assert(d.includes('原文链接'), `截断后原文链接应保留: 尾部 ${JSON.stringify(d.slice(-30))}`);
+});
+
 await test('推送截断长度可配置 + 非法回退默认（v3.69）', async () => {
     reset();
     setPushUrl('t49_trunc');

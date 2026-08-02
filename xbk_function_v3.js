@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.151 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
+//******** 线报酷推送脚本 v3.152 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1487,7 +1487,17 @@ const App = {
                 // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
                 // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
                 // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
-                const desp = Utils.truncateUtf16(Utils.sanitizeSurrogates(Formatter.tuisong_replace(contentTpl, pushItem)), contentMax);
+                const rawDesp = Formatter.tuisong_replace(contentTpl, pushItem);
+                let desp = Utils.truncateUtf16(Utils.sanitizeSurrogates(rawDesp), contentMax);
+                // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
+                const rawClean = Utils.sanitizeSurrogates(rawDesp);
+                if (rawClean.includes('原文链接') && !desp.includes('原文链接') && pushItem.url) {
+                    const link = `原文链接：[${pushItem.url}](<${pushItem.url}>)`;
+                    // 链接本身超过 contentMax 时不保留（尊重截断配置）；否则内容截短补链接（仍 ≤ contentMax）
+                    if (link.length < contentMax) {
+                        desp = Utils.truncateUtf16(desp, contentMax - link.length - 2) + '\n\n' + link;
+                    }
+                }
                 try {
                     await Pusher.send(text, desp);
                     pushedKeys.add(keyOf(item));
