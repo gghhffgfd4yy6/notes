@@ -2482,8 +2482,11 @@ await test('saveMessages 超过maxSize → 裁剪到上限（v3.120：显式 max
     for (let i = 0; i < 101; i++) msgs.push({ id: i });
     const orig = Config.cache.maxSize;
     Config.cache.maxSize = 100; // 显式小上限，验证裁剪（不依赖默认 10000）
-    saveMessages(p, msgs);
-    Config.cache.maxSize = orig;
+    try {
+        saveMessages(p, msgs);
+    } finally {
+        Config.cache.maxSize = orig; // v3.120b：finally 保证恢复（断言失败也恢复，防污染）
+    }
     const r = readMessages(p);
     assertEqual(r.length, 100);
 });
@@ -3582,8 +3585,11 @@ await test('saveMessages maxSize 0/负 → 回退默认10000（审查9-B，v3.12
     Config.cache.maxSize = 0; // 恶意/误配
     const arr = [];
     for (let i = 0; i < 150; i++) arr.push({ id: i });
-    saveMessages(getFilePath('test_maxsize0.json'), arr);
-    Config.cache.maxSize = orig;
+    try {
+        saveMessages(getFilePath('test_maxsize0.json'), arr);
+    } finally {
+        Config.cache.maxSize = orig; // v3.120b：finally 保证恢复
+    }
     const r = readMessages(getFilePath('test_maxsize0.json'));
     assertEqual(r.length, 150, 'maxSize=0 时回退默认 10000，150 条不裁剪');
 });
