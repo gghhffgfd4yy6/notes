@@ -1345,6 +1345,38 @@ await test('边界: parallelLimit=1 与顺序模式等价 + pushInterval=0 快�
     }
 });
 
+
+await test('接口异常 → 发送告警 + 限频（v3.123）', async () => {
+    reset();
+    setPushUrl('t56_alert');
+    fakeData = [];
+    const origInterval = Config.alert.intervalMs;
+    const origEnabled = Config.alert.enabled;
+    try {
+        // ① 不限频 → 接口异常发告警
+        Config.alert.intervalMs = 0;
+        fail4xx = true; // 404 不重试 → run 抛错
+        let threw = false;
+        try { await xbk.run(); } catch (e) { threw = true; }
+        assert(threw, '接口异常应抛错');
+        const alert = pushCalls.find(c => c.text.includes('运行异常'));
+        assert(!!alert, '应发送运行异常告警');
+        assert(alert.desp.includes('Not Found'), `告警内容应含原因: ${alert.desp.slice(0, 80)}`);
+        // ② 限频生效：intervalMs 大 → 第二次异常不发（状态文件记录上次）
+        Config.alert.intervalMs = 3600000;
+        reset();
+        setPushUrl('t56_alert_2');
+        fail4xx = true;
+        try { await xbk.run(); } catch (e) { /* 预期抛错 */ }
+        const alert2 = pushCalls.find(c => c.text.includes('运行异常'));
+        assert(!alert2, '限频内不应重复发送告警');
+    } finally {
+        Config.alert.intervalMs = origInterval;
+        Config.alert.enabled = origEnabled;
+        try { require('fs').unlinkSync(getFilePath('alert.state')); } catch (e) { /* 忽略 */ }
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 集成测试全部通过！${passed}/${passed}`);
 } else {

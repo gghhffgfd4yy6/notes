@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.122b — 并行并发可配置：CONCURRENCY 环境变量(默认8稳定11s，真机可32≈7s)；定位高并发偶发=沙箱overlayfs IO竞态(非文件名冲突，setPushUrl唯一性已验证)非代码bug；725全绿 ********
+//******** 线报酷推送脚本 v3.123 — 接口异常告警(Config.alert限频防轰炸，接口挂时主动通知本人；intervalMs<=0不限频)；726全绿(632+71+23) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -73,6 +73,13 @@ const Config = {
         // v3.120 上限 100 → 10000：真实接口 N 固定 ~20 条，查询量 N×M=20 万次可接受（实测 35ms）
         maxSize: 10000,
         dir: 'xianbaoku_cache',
+    },
+
+    // v3.123：接口异常告警——接口挂/密钥失效时主动通知本人（防"跑了但没推没人知道"）
+    // enabled: 开关；intervalMs: 限频（同错误间隔内不重复轰炸，默认 1 小时）
+    alert: {
+        enabled: true,
+        intervalMs: 3600000,
     },
 };
 
@@ -1252,6 +1259,23 @@ const App = {
         } catch (e) { /* 日志写失败静默（磁盘只读/权限等，不中断推送） */ }
     },
 
+    // 接口异常告警（v3.123）：限频 + 静默——不影响主流程；告警也走推送通道（通道挂了就静默，无解）
+    _sendAlert(errMsg) {
+        try {
+            if (!Config.alert || Config.alert.enabled === false) return;
+            const statePath = path.join(MessageStore.cacheDir, 'alert.state');
+            let lastAt = 0;
+            try { lastAt = JSON.parse(fs.readFileSync(statePath, 'utf8')).lastAt || 0; } catch (e) { /* 无状态文件=首次 */ }
+            const interval = (Config.alert.intervalMs > 0) ? Config.alert.intervalMs : 0; // <=0 = 不限频（每次异常都发）
+            if (interval > 0 && Date.now() - lastAt < interval) return; // 限频：间隔内不重复轰炸
+            const alertText = '⚠️ xbk-push 运行异常';
+            const alertDesp = `接口/推送异常，请检查。\n时间：${new Date().toLocaleString('zh-CN')}\n原因：${String(errMsg).slice(0, 500)}`;
+            notify.sendNotify(alertText, alertDesp); // fire-and-forget，不阻塞主流程
+            fs.writeFileSync(statePath, JSON.stringify({ lastAt: Date.now() }), 'utf8');
+            console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）');
+        } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
+    },
+
     async run() {
         console.debug('开始获取线报酷数据...');
 
@@ -1483,6 +1507,8 @@ const App = {
             }
             // 失败也写运行日志（cron 可回溯失败原因；错误信息去换行避免破坏日志行）
             this._writeRunLog(`${new Date().toISOString()} ERROR ${String(errMsg).replace(/[\r\n]+/g, ' ')}\n`);
+            // v3.123：接口异常告警（限频 + 静默，不影响主流程）
+            this._sendAlert(errMsg);
             throw error; // 重新抛出，让外层/调度感知失败（cron 场景 exit code 非 0）
         }
     },
