@@ -1,5 +1,32 @@
 # 📋 更新日志
 
+## v3.113（依赖排查：路径硬编码移植性修复 + 环境依赖盘点）
+> 2026-08-02
+
+### 🐛 3 处路径硬编码移植性 bug（依赖排查发现）
+
+| 位置 | 问题 | 修复 |
+|---|---|---|
+| test_filter.js | 23 处 `'/workspace/xianbaoku_cache/'` 硬编码 | 新增 `CACHE = path.join(__dirname, 'xianbaoku_cache')`，全部替换 |
+| test_notify.js | `require.resolve('/workspace/node_modules/got/...')` + `require('/workspace/xbk_sendNotify_slim.js')` | 改为 `path.join(__dirname, ...)` + `require('./...')` |
+| xbk_function_v3.js | `require('./package.json')` 缺失时 MODULE_NOT_FOUND 挂 | try-catch 回退 `'3.x'`（UA 版本化 v3.82 的移植性防御） |
+
+**验证**：模拟移植（拷全套到 /tmp/portable_test）→ 测试跑通 ✓
+
+### 📋 环境依赖盘点（全量排查结论）
+
+| 依赖 | 状态 | 说明 |
+|---|---|---|
+| 时区 | ⚠️ 已知取舍 #22 | parseTime 用本地时区解析；测试 daysAgo/daysComputed 同进程同区自洽 ✓；部署时区变化影响 {时间} 显示（已记录） |
+| 随机性 | ✅ 预期 | 仅 fetchData 重试 jitter（测试 mock 不触发）；fuzz 全部固定 seed |
+| Node 版本 | ✅ 兼容 | lookbehind `(?<!...)` 需 Node 9+（engines >=14 ✓）；无 replaceAll/at/Object.hasOwn |
+| 外部服务 | ✅ mock | got/notify 全部 mock；真机接口验证已在 v3.105 完成 |
+| cwd | ✅ 免疫 | 缓存路径基于 __dirname（v3.80 起），不依赖 process.cwd() |
+
+### 🧪 测试数
+
+**712 个全绿（单元 620 + 集成 69 + 通道 23）**
+
 ## v3.111（Fuzz 四轮广覆盖 + 测试时间漂移修复）
 > 2026-08-02
 

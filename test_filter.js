@@ -6,6 +6,9 @@
 
 const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, fetchData, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, hasNestedQuantifier, truncateUtf16 } = require('./xbk_function_v3.js');
 const assert = require('assert');
+const path = require('path');
+// 缓存目录（基于 __dirname——v3.113 修复 /workspace 硬编码，仓库可移植）
+const CACHE = path.join(__dirname, 'xianbaoku_cache');
 
 let passed = 0;
 let failed = 0;
@@ -1683,7 +1686,7 @@ await test('saveBatch 含重复 id → 更新不重复', () => {
     // 应该只有一条
     assertEqual(isMessageInFile({ id: 10 }, 'test_batch_dup.json'), true);
     const fs = require('fs');
-    const msgs = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/test_batch_dup.json', 'utf8'));
+    const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, 'test_batch_dup.json'), 'utf8'));
     assertEqual(msgs.filter(m => m.id === 10).length, 1);
 });
 
@@ -1899,25 +1902,25 @@ await test('getFilePath 拼接路径', () => {
 });
 
 await test('_ensureFileExists 创建文件', () => {
-    _ensureFileExists('/workspace/xianbaoku_cache/test_ensure.json');
-    assertEqual(require('fs').existsSync('/workspace/xianbaoku_cache/test_ensure.json'), true);
+    _ensureFileExists(path.join(CACHE, 'test_ensure.json'));
+    assertEqual(require('fs').existsSync(path.join(CACHE, 'test_ensure.json')), true);
 });
 
 await test('readMessages 空文件返回[]', () => {
-    _ensureFileExists('/workspace/xianbaoku_cache/test_read.json');
-    const msgs = readMessages('/workspace/xianbaoku_cache/test_read.json');
+    _ensureFileExists(path.join(CACHE, 'test_read.json'));
+    const msgs = readMessages(path.join(CACHE, 'test_read.json'));
     assertEqual(Array.isArray(msgs), true);
 });
 
 await test('saveMessages 写入后 readMessages 可读', () => {
-    const p = '/workspace/xianbaoku_cache/test_wr.json';
+    const p = path.join(CACHE, 'test_wr.json');
     saveMessages(p, [{ id: 1 }, { id: 2 }]);
     const msgs = readMessages(p);
     assertEqual(msgs.length, 2);
 });
 
 await test('saveMessages 超过maxSize自动裁剪', () => {
-    const p = '/workspace/xianbaoku_cache/test_trim2.json';
+    const p = path.join(CACHE, 'test_trim2.json');
     const many = [];
     for (let i = 0; i < 150; i++) many.push({ id: i });
     saveMessages(p, many);
@@ -1979,7 +1982,7 @@ await test('matchesCompiled ### 分类为空 → 走全局匹配', () => {
 // readMessages JSON 损坏
 await test('readMessages JSON损坏 → 重置并返回空数组', () => {
     const fs = require('fs');
-    const p = '/workspace/xianbaoku_cache/test_corrupt.json';
+    const p = path.join(CACHE, 'test_corrupt.json');
     fs.writeFileSync(p, '这不是合法JSON{{{', 'utf8');
     // 清内存缓存
     const msgs = readMessages(p);
@@ -2006,7 +2009,7 @@ await test('compileRules ### 部分行无效 → 保留有效行', () => {
 // saveMessages 裁剪后数据正确
 await test('saveMessages 裁剪后保留最新数据', () => {
     const fs = require('fs');
-    const p = '/workspace/xianbaoku_cache/test_trim_new.json';
+    const p = path.join(CACHE, 'test_trim_new.json');
     const many = [];
     for (let i = 0; i < 150; i++) many.push({ id: i });
     saveMessages(p, many);
@@ -2034,7 +2037,7 @@ await test('validateConfig pingbitime ### 分类正则无效 → 有警告', () 
 
 await test('init 在目录不存在时自动创建', () => {
     const fs = require('fs');
-    const dir = '/workspace/xianbaoku_cache';
+    const dir = CACHE;
     // 临时删除缓存目录
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
     init();
@@ -2043,7 +2046,7 @@ await test('init 在目录不存在时自动创建', () => {
 
 await test('save 在目录不存在时自动创建（_ensureFileExists）', () => {
     const fs = require('fs');
-    const dir = '/workspace/xianbaoku_cache';
+    const dir = CACHE;
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
     appendMessageToFile({ id: 555 }, 'test_recreate.json');
     assertEqual(fs.existsSync(dir), true);
@@ -2102,7 +2105,7 @@ await test('save 已存在消息 → 内容被更新', () => {
     appendMessageToFile({ id: 777, title: '旧标题' }, name);
     appendMessageToFile({ id: 777, title: '新标题' }, name);
     // 读取缓存文件，验证内容确实被更新
-    const msgs = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/' + name, 'utf8'));
+    const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'));
     const item = msgs.find(m => m.id === 777);
     assertEqual(item.title, '新标题');  // 内容已更新
     assertEqual(msgs.length, 1);        // 没有重复新增
@@ -2113,7 +2116,7 @@ await test('save 不同id → 各自追加不覆盖', () => {
     const name = 'test_upsert2.json';
     appendMessageToFile({ id: 1, title: 'A' }, name);
     appendMessageToFile({ id: 2, title: 'B' }, name);
-    const msgs = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/' + name, 'utf8'));
+    const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'));
     assertEqual(msgs.length, 2);
     assertEqual(msgs.some(m => m.id === 1), true);
     assertEqual(msgs.some(m => m.id === 2), true);
@@ -2130,7 +2133,7 @@ await test('whitelistFilter 空关键词+字段为空 → 返回true', () => {
 });
 
 await test('readMessages 内存缓存生效 → 返回同一引用', () => {
-    const p = '/workspace/xianbaoku_cache/test_memcache.json';
+    const p = path.join(CACHE, 'test_memcache.json');
     saveMessages(p, [{ id: 1 }]);
     const first = readMessages(p);
     const second = readMessages(p);
@@ -2191,11 +2194,11 @@ await test('save 已存在消息 → timestamp 被更新', () => {
     const fs = require('fs');
     const name = 'test_ts.json';
     appendMessageToFile({ id: 888, title: 'a' }, name);
-    const first = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/' + name, 'utf8'));
+    const first = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'));
     const t1 = first[0].timestamp;
     // 再存一次同id
     appendMessageToFile({ id: 888, title: 'b' }, name);
-    const second = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/' + name, 'utf8'));
+    const second = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'));
     // 至少有一个 timestamp 字段
     assertEqual(typeof second[0].timestamp, 'string');
     assertEqual(second.length, 1);
@@ -2239,7 +2242,7 @@ await test('saveBatch 已存在消息 → 更新内容', () => {
     const fs = require('fs');
     saveBatch([{ id: 55, title: '旧' }], 'test_sb_up.json');
     saveBatch([{ id: 55, title: '新' }], 'test_sb_up.json');
-    const msgs = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/test_sb_up.json', 'utf8'));
+    const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, 'test_sb_up.json'), 'utf8'));
     assertEqual(msgs.length, 1);
     assertEqual(msgs[0].title, '新');
 });
@@ -2412,7 +2415,7 @@ await test('MessageStore save 更新保留旧字段', () => {
     const fs = require('fs');
     appendMessageToFile({ id: 66, title: '旧', extra: '保留' }, 'test_keep.json');
     appendMessageToFile({ id: 66, title: '新' }, 'test_keep.json');
-    const msgs = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/test_keep.json', 'utf8'));
+    const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, 'test_keep.json'), 'utf8'));
     assertEqual(msgs.length, 1);
     assertEqual(msgs[0].title, '新');
 });
@@ -2446,7 +2449,7 @@ await test('Config.filter.pingbitime 默认值', () => {
 
 await test('saveMessages 恰好 maxSize 条 → 不裁剪', () => {
     const fs = require('fs');
-    const p = '/workspace/xianbaoku_cache/test_exact100.json';
+    const p = path.join(CACHE, 'test_exact100.json');
     const msgs = [];
     for (let i = 0; i < 100; i++) msgs.push({ id: i });
     saveMessages(p, msgs);
@@ -2456,7 +2459,7 @@ await test('saveMessages 恰好 maxSize 条 → 不裁剪', () => {
 
 await test('saveMessages 超过maxSize → 裁剪到100', () => {
     const fs = require('fs');
-    const p = '/workspace/xianbaoku_cache/test_over100.json';
+    const p = path.join(CACHE, 'test_over100.json');
     const msgs = [];
     for (let i = 0; i < 101; i++) msgs.push({ id: i });
     saveMessages(p, msgs);
@@ -2515,10 +2518,10 @@ await test('save timestamp 每次更新为新值', () => {
     const fs = require('fs');
     const name = 'test_ts2.json';
     appendMessageToFile({ id: 42 }, name);
-    const t1 = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/' + name, 'utf8'))[0].timestamp;
+    const t1 = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'))[0].timestamp;
     // 等1ms再存
     appendMessageToFile({ id: 42 }, name);
-    const t2 = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/' + name, 'utf8'))[0].timestamp;
+    const t2 = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'))[0].timestamp;
     // 两次 timestamp 应该是 ISO 字符串格式
     assertEqual(typeof t1, 'string');
     assertEqual(typeof t2, 'string');
@@ -2624,7 +2627,7 @@ await test('whitelistFilter 字段名大小写敏感', () => {
 await test('MS save 时间戳格式为ISO完整', () => {
     const fs = require('fs');
     appendMessageToFile({ id: 77 }, 'test_iso.json');
-    const msgs = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/test_iso.json', 'utf8'));
+    const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, 'test_iso.json'), 'utf8'));
     // ISO 格式：yyyy-mm-ddThh:mm:ss.msZ（含 T 和 Z）
     assertEqual(/^\d{4}-\d{2}-\d{2}T/.test(msgs[0].timestamp), true);
 });
@@ -2715,7 +2718,7 @@ await test('whitelistFilter 正则边界（\b 影响匹配）', () => {
 await test('MS save 时间戳是ISO格式非时间戳数字', () => {
     const fs = require('fs');
     appendMessageToFile({ id: 88 }, 'test_ts_iso.json');
-    const msgs = JSON.parse(fs.readFileSync('/workspace/xianbaoku_cache/test_ts_iso.json', 'utf8'));
+    const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, 'test_ts_iso.json'), 'utf8'));
     assertEqual(typeof msgs[0].timestamp, 'string');
     assertEqual(/^\d{4}-\d{2}-\d{2}T/.test(msgs[0].timestamp), true);
 });
@@ -2729,7 +2732,7 @@ await test('compileRules 天数值精确（不减不加）', () => {
 
 await test('MS 裁剪用splice保留后100条', () => {
     const fs = require('fs');
-    const p = '/workspace/xianbaoku_cache/test_splice.json';
+    const p = path.join(CACHE, 'test_splice.json');
     const msgs = [];
     for (let i = 0; i < 150; i++) msgs.push({ id: i });
     saveMessages(p, msgs);

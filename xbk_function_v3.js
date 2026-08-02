@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.111 — Fuzz四轮(109章：过滤引擎组合/HTML畸形/got/实体映射完整性/checkTimeCompiled)+测试时间漂移修复(daysAgo相对日期，8/2暴露7个写死日期跨阈值失败)；修正2个fuzz断言(HTML字面<误报/实体大小写规范)；712全绿 ********
+//******** 线报酷推送脚本 v3.113 — 依赖排查：修复3处路径硬编码移植性bug(test_filter 23处/workspace→CACHE+test_notify gotPath+require+主代码package.json缺省回退)；环境依赖盘点(时区#22取舍/随机性jitter预期/Node版本lookbehind9+✓)；模拟移植验证通过；712全绿 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -11,7 +11,9 @@ const fs = require('fs');
 const got = require('got');
 const path = require('path');
 // 版本号单一来源（v3.82）：package.json 与文件头/CHANGELOG/README 四方一致由 101 章测试保证
-const { version: PKG_VERSION } = require('./package.json');
+// 版本号单一来源（v3.82）；缺 package.json 时回退 '3.x'（移植性防御，v3.113）
+let PKG_VERSION = '3.x';
+try { PKG_VERSION = require('./package.json').version; } catch (e) { /* package.json 缺失时用默认 */ }
 
 // ============================================================
 // ⚙️ Config — 配置层

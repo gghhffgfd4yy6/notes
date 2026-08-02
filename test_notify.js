@@ -7,8 +7,9 @@
 // - 每个测试用 withChannels 清空全部通道再只配被测通道，避免本地密钥(push_config.local.js)
 //   与上一个测试残留的通道配置污染 gotCalls / 断言
 
-const gotPath = require.resolve('/workspace/node_modules/got/index.js');
-require('/workspace/node_modules/got/index.js');
+const path = require('path');
+const gotPath = path.join(__dirname, 'node_modules', 'got', 'index.js');
+require(gotPath);
 
 let gotCalls = [];
 let failHitokoto = false; // 一言接口失败开关（v3.73：验证 sendNotify 兜底跳过不崩）
@@ -36,7 +37,7 @@ require.cache[gotPath].exports.post = (url, options) => {
     return { then: (res) => res({ body: '{}', statusCode: 200, headers: {} }) };
 };
 
-const notify = require('/workspace/xbk_sendNotify_slim.js');
+const notify = require('./xbk_sendNotify_slim.js');
 const cfg = notify.push_config;
 
 let passed = 0, failed = 0;
