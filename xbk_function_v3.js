@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.144 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
+//******** 线报酷推送脚本 v3.145 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1288,9 +1288,11 @@ const App = {
             if (interval > 0 && Date.now() - lastAt < interval) return; // 限频：间隔内不重复轰炸
             const alertText = '⚠️ xbk-push 运行异常';
             const alertDesp = `接口/推送异常，请检查。\n时间：${new Date().toLocaleString('zh-CN')}\n原因：${String(errMsg).slice(0, 500)}`;
-            notify.sendNotify(alertText, alertDesp).catch(() => { /* v3.135：告警通道也挂了，静默（防 unhandledRejection） */ });
+            // 成功才打印"已发送"（v3.145：sendNotify reject 时曾误报"已发送"，实际未送达）
+            notify.sendNotify(alertText, alertDesp)
+                .then(() => console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）'))
+                .catch(() => { /* v3.135：告警通道也挂了，静默（防 unhandledRejection） */ });
             fs.writeFileSync(statePath, JSON.stringify({ lastAt: Date.now() }), 'utf8');
-            console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）');
         } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
     },
 
@@ -1373,6 +1375,7 @@ const App = {
             let items = [];
             let dedupCount = 0;
             let filteredCount = 0;
+            let truncatedCount = 0; // v3.145：maxPerRun 截断数计入统计（曾凭空消失）
             const cacheName = MessageStore.getFileName(Config.api.pushUrl);
             const newMessages = [];
             const seenInBatch = new Set(); // 防止同一批接口数据里出现重复 id/url 时被重复收录
@@ -1432,6 +1435,7 @@ const App = {
             const maxPerRun = (Number.isFinite(Config.push.maxPerRun) && Config.push.maxPerRun > 0) ? Config.push.maxPerRun : 100;
             let truncatedKeys = new Set();
             if (items.length > maxPerRun) {
+                truncatedCount = items.length - maxPerRun;
                 console.warn(`⚠️ 单次待推送 ${items.length} 条超过上限 ${maxPerRun}，只推前 ${maxPerRun} 条（防接口异常推送风暴；调整 Config.push.maxPerRun）`);
                 // v3.134：截断掉的不写缓存——否则下次运行去重跳过导致静默丢失（缓存当"已处理"）；下次运行推剩余
                 // keyOf 在 ⑥ 才定义，此处用同口径（id 优先 + url 归一）构造截断 key
@@ -1536,19 +1540,21 @@ const App = {
             console.log(`  获取:     ${xbkdata.length} 条`);
             console.log(`  去重跳过:  ${dedupCount} 条`);
             console.log(`  过滤屏蔽:  ${filteredCount} 条`);
+            if (truncatedCount > 0) console.log(`  截断待推:  ${truncatedCount} 条（下次运行推送，防推送风暴）`);
             console.log(`  推送:     ${successCount} 条${successCount < items.length ? `（${items.length - successCount} 条失败，下次运行重试）` : ''}`);
             console.log(`  耗时:     ${elapsed}s`);
             console.log('══════════════════════════════');
             await new Promise(r => setTimeout(r, Config.timing.finalWait));
 
             // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
-            this._writeRunLog(`${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} pushed=${successCount} failed=${items.length - successCount} elapsed=${elapsed}s\n`);
+            this._writeRunLog(`${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${items.length - successCount} elapsed=${elapsed}s\n`);
 
             // v3.125：运行日报（跨天发昨日汇总 + 当天累加；静默）
             const summary = {
                 total: xbkdata.length,
                 dedup: dedupCount,
                 filtered: filteredCount,
+                truncated: truncatedCount, // v3.145：截断数（下次推送）
                 pushed: successCount,
                 failed: items.length - successCount,
             };
