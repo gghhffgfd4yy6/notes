@@ -221,7 +221,17 @@ await test('Push+: token + JSON body + 换行转 <br>', () => withChannels(async
     assert(c.options.headers['Content-Type'].includes('application/json'), 'JSON 头');
 }));
 
-// 17. mdToPlain 斜体误伤（v3.150：数字夹 * 不算斜体）
+// 18. 一言短超时（v3.151：一言 API 慢/挂不阻塞推送）
+await test('HITOKOTO: one() 带 3s 短超时（不阻塞推送）', () => withChannels(async () => {
+    cfg.PUSH_KEY = 'SCT123';
+    cfg.HITOKOTO = 'true';
+    await notify.sendNotify('标题', '内容');
+    // 一言请求（gotCalls[0]）应带 timeout: 3000
+    const hitokotoCall = gotCalls.find(c => c.url.includes('hitokoto.cn'));
+    assert(!!hitokotoCall, '应请求一言');
+    assert(hitokotoCall.options && hitokotoCall.options.timeout === 3000,
+        `一言应带 3s 超时: ${hitokotoCall.options && hitokotoCall.options.timeout}`);
+}));
 await test('mdToPlain: 数字夹 * 不误剥（规格 5*3*2cm 曾变 532cm）', () => withChannels(async () => {
     cfg.PUSH_PLUS_TOKEN = 'token123';
     // 真实线报规格格式：180ml*12/箱、5*3*2cm

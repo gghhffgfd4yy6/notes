@@ -148,7 +148,8 @@ if (fs.existsSync(localPath)) {
 
 async function one() {
     const url = 'https://v1.hitokoto.cn/';
-    const res = await got.get(url);
+    // v3.151：3s 短超时——一言是推送装饰，API 慢/挂时不应阻塞推送（曾默认 15s，启用 HITOKOTO 用户每次推送延迟）
+    const res = await got.get(url, { timeout: 3000 });
     // body 兼容：自制 got 已自动 JSON 解析为对象；字符串时手动解析
     const body = typeof res.body === 'string' ? JSON.parse(res.body) : res.body;
     // 防御（v3.86）：响应结构异常（缺 hitokoto/from）→ 抛错走 sendNotify 的 catch 跳过，
