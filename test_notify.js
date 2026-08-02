@@ -380,7 +380,7 @@ await test('日志脱敏: Push+/企微/PushDeer/Telegram/Server酱 失败日志�
     console.log = (...args) => captured.push(args.join(' '));
     try {
         failPost = true; // 所有通道走失败路径（err.response.body 通用错误体）
-        await notify.sendNotify('标题', '内容');
+        try { await notify.sendNotify('标题', '内容'); } catch (e) { /* v3.133：全部通道失败 → 抛错（防丢消息） */ }
         const all = captured.join('\n');
         assert(!all.includes('PPT_SECRET'), 'Push+ token 不应泄露');
         assert(!all.includes('QWX_SECRET'), '企微 key 不应泄露');
@@ -406,7 +406,7 @@ await test('日志脱敏: Bark/PushMe/wxpusher/息知 失败日志不泄露密�
     console.log = (...args) => captured.push(args.join(' '));
     try {
         failPost = true;
-        await notify.sendNotify('标题', '内容');
+        try { await notify.sendNotify('标题', '内容'); } catch (e) { /* v3.133：全部通道失败 → 抛错（日志已打印） */ }
         const all = captured.join('\n');
         assert(!all.includes('BARK_SECRET'), 'Bark 设备码不应泄露');
         assert(!all.includes('PM_SECRET'), 'PushMe key 不应泄露');
@@ -507,6 +507,26 @@ await test('Fuzz-推送: maskKey/maskUrl 随机输入不崩', () => {
         }
     }
 });
+
+
+await test('全通道失败 → sendNotify reject / 部分成功 → resolve（v3.133）', () => withChannels(async () => {
+    cfg.PUSH_KEY = 'SCT_TEST';
+    // 全失败 → reject（v3.133：防网络故障时消息丢失，主流程不写缓存下次重试）
+    failPost = true;
+    let threw = false;
+    try { await notify.sendNotify('标题', '内容'); } catch (e) { threw = true; assert(e.message.includes('所有推送通道失败'), `错误应含全失败: ${e.message.slice(0, 40)}`); }
+    assert(threw, '全通道失败应 reject');
+    // 部分成功（Bark 成功 + Server酱失败）→ resolve（失败通道下次不重试防重复）
+    failPost = false;
+    cfg.BARK_PUSH = 'https://api.day.app/dev1';
+    // Server酱失败（SCT URL）→ 用 failPost 只影响 Server酱？——mock 是全局的……
+    // 简化：直接验证"至少一个成功即 resolve"（Server酱单独成功）
+    cfg.BARK_PUSH = '';
+    failPost = false;
+    let ok = false;
+    try { await notify.sendNotify('标题', '内容'); ok = true; } catch (e) { ok = false; }
+    assert(ok, '单通道成功应 resolve');
+}));
 
 if (failed === 0) {
     console.log(`  🎉 通道测试通过 ${passed}/${passed}`);

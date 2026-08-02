@@ -188,7 +188,7 @@ const $ = {
 };
 
 function pushPlusNotify(text, desp) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const { PUSH_PLUS_TOKEN, PUSH_PLUS_USER } = push_config;
         if (PUSH_PLUS_TOKEN) {
             desp = mdToPlain(desp); // v3.128：Push+ 默认 html，markdown 符号会原样显示
@@ -210,6 +210,7 @@ function pushPlusNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
+                    reject(err);
                         console.log(
                             `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                             }通知消息失败😞\n`,
@@ -241,7 +242,7 @@ function pushPlusNotify(text, desp) {
 }
 
 function serverNotify(text, desp) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const { PUSH_KEY } = push_config;
         if (PUSH_KEY) {
             // v3.126：Server酱 title 上限 32 字符——主代码 titleMax=100 不满足，此处通道层精准截断
@@ -267,6 +268,7 @@ function serverNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
+                    reject(err);
                         console.log('Server 酱发送通知调用API失败😞\n', safeErr(err));
                     } else {
                         // server酱和Server酱·Turbo版的返回json格式不太一样
@@ -294,7 +296,7 @@ function serverNotify(text, desp) {
 }
 
 function barkNotify(text, desp, params = {}) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         let {
             BARK_PUSH,
             BARK_ICON,
@@ -347,6 +349,7 @@ function barkNotify(text, desp, params = {}) {
                 $.post(options, (err, resp, data) => {
                     try {
                         if (err) {
+                    reject(err);
                             console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(err));
                         } else {
                             if (data.code === 200) {
@@ -370,7 +373,7 @@ function barkNotify(text, desp, params = {}) {
 }
 
 function pushMeNotify(text, desp, params = {}) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const { PUSHME_KEY, PUSHME_URL } = push_config;
 
         if (!PUSHME_KEY) {
@@ -405,6 +408,7 @@ function pushMeNotify(text, desp, params = {}) {
                 $.post(options, (err, resp, data) => {
                     try {
                         if (err) {
+                    reject(err);
                             console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, safeErr(err));
                         } else {
                             if (data === 'success') {
@@ -428,7 +432,7 @@ function pushMeNotify(text, desp, params = {}) {
 }
 
 function qywxBotNotify(text, desp) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const { QYWX_ORIGIN, QYWX_KEY } = push_config;
         const options = {
             url: `${QYWX_ORIGIN}/cgi-bin/webhook/send?key=${QYWX_KEY}`,
@@ -449,6 +453,7 @@ function qywxBotNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
+                    reject(err);
                         console.log('企业微信发送通知消息失败😞\n', safeErr(err));
                     } else {
                         if (data.errcode === 0) {
@@ -470,7 +475,7 @@ function qywxBotNotify(text, desp) {
 }
 
 function wxPusherNotify(text, desp) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const { WX_pusher_appToken, WX_pusher_topicIds } =
             push_config;
 
@@ -493,6 +498,7 @@ function wxPusherNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
+                    reject(err);
                         console.log('WxPusher发送通知消息失败😞\n', safeErr(err));
                     } else {
                         if (data.code === 1000) {
@@ -517,7 +523,7 @@ function wxPusherNotify(text, desp) {
 }
 
 function wxXiZhiNotify(text, desp) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const { WX_XIZHI_KEY } =
             push_config;
 
@@ -537,6 +543,7 @@ function wxXiZhiNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
+                    reject(err);
                         console.log('息知发送通知消息失败😞\n', safeErr(err));
                     } else {
                         if (data.code === 200) {
@@ -561,7 +568,7 @@ function wxXiZhiNotify(text, desp) {
 }
 
 function pushDeerNotify(text, desp) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const { DEER_KEY, DEER_URL } = push_config;
         if (DEER_KEY) {
             // PushDeer 建议对消息内容进行 urlencode（encodeURI 不编码 & = #，需 encodeURIComponent）
@@ -577,6 +584,7 @@ function pushDeerNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
+                    reject(err);
                         console.log('PushDeer 通知调用API失败😞\n', safeErr(err));
                     } else {
                         // 通过返回的result的长度来判断是否成功（响应防御：异常时可能缺 content/result 字段）
@@ -609,7 +617,7 @@ function pushDeerNotify(text, desp) {
 let tgProxyWarned = false;
 
 function tgNotify(text, desp) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const { TG_BOT_TOKEN, TG_USER_ID, TG_API_HOST } = push_config;
         // TG_PROXY_* 保留配置项：自制 got 不支持 http 代理（v3.76 一次性警告防误配静默失效）
         if (!tgProxyWarned && (push_config.TG_PROXY_HOST || push_config.TG_PROXY_PORT)) {
@@ -639,6 +647,7 @@ function tgNotify(text, desp) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
+                    reject(err);
                         console.log('Telegram 发送通知消息失败😞\n', safeErr(err));
                     } else {
                         if (data && data.ok === true) {
@@ -695,7 +704,10 @@ async function sendNotify(text, desp, params = {}) {
             catch (e) { console.log('一言获取失败，跳过:', e && e.message ? e.message : String(e)); }
         }
     }
-    await Promise.all([
+    // v3.133：Promise.all → allSettled——单个通道失败不再整条失败；
+    // 至少一个通道成功 = 成功（写缓存，失败的通道下次不重试防重复推送）；
+    // 全部通道失败 = 抛错（主流程不写缓存，下次运行重试——防网络故障时消息丢失）
+    const results = await Promise.allSettled([
         pushPlusNotify(text, desp, params),
         serverNotify(text, desp),
         barkNotify(text, desp, params),
@@ -706,6 +718,19 @@ async function sendNotify(text, desp, params = {}) {
         pushMeNotify(text, desp, params),
         tgNotify(text, desp, params),
     ]);
+    // v3.133b：只统计"已配置"通道——未配置的通道 resolve（不参与），不掩盖已配置通道的失败
+    const configuredFlags = [
+        !!push_config.PUSH_PLUS_TOKEN, !!push_config.PUSH_KEY, !!push_config.BARK_PUSH,
+        !!push_config.QYWX_KEY, !!push_config.WX_pusher_appToken, !!push_config.WX_XIZHI_KEY,
+        !!push_config.DEER_KEY, !!push_config.PUSHME_KEY,
+        !!(push_config.TG_BOT_TOKEN && push_config.TG_USER_ID),
+    ];
+    const attempted = results.filter((r, i) => configuredFlags[i]);
+    const okCount = attempted.filter(r => r.status === 'fulfilled').length;
+    if (attempted.length > 0 && okCount === 0) {
+        const reasons = attempted.map(r => r.reason && r.reason.message ? r.reason.message : String(r.reason || '')).filter(Boolean).join('; ');
+        throw new Error('所有推送通道失败: ' + reasons.slice(0, 200));
+    }
 }
 
 module.exports = { sendNotify, push_config, maskKey, maskUrl };
