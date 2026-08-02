@@ -311,3 +311,11 @@
 
 - **日报误报（与告警 v3.145 同类，高概率：默认开启每天触发）**：sendNotify reject（无通道/通道挂）时仍同步打印"已发送昨日运行日报"（实际未送达）→ 改为成功回调才打印
 - 扫描确认无其他 sendNotify().catch 后同步日志
+
+## v3.147（wxpusher summary 代理对截断修复）
+
+- **wxpusher `summary: text.substring(0, 90)` 按码元截断**：真实长标题+emoji 时 90 处可能切断半个 emoji（高概率：长标题常见）
+- **新增 `safeSlice`**（高/低代理统一处理，Server酱 v3.126 只处理高代理）；wxpusher summary 复用
+- test_notify 新增 safeSlice 单元 + wxpusher 应用测试（27 → 29）
+
+**739 个全绿（单元 635 + 集成 75 + 通道 29）**

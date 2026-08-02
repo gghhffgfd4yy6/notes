@@ -17,6 +17,21 @@ function maskUrl(u) {
     const m = s.match(/^(https?:\/\/[^/]+)\/(.+)$/);
     return m ? m[1] + '/' + maskKey(m[2]) : maskKey(s);
 }
+// 代理对安全截断（v3.147）：按码元截断但不切断 emoji——末尾高代理退一位、孤立低代理退一位
+// （Server酱 v3.126 只处理高代理；此处统一高/低代理，wxpusher summary 复用）
+function safeSlice(s, max) {
+    let str;
+    try { str = String(s === undefined || s === null ? '' : s); } catch (e) { str = ''; }
+    if (str.length <= max) return str;
+    let cut = str.slice(0, max);
+    const last = cut.charCodeAt(cut.length - 1);
+    if (last >= 0xD800 && last <= 0xDBFF) return cut.slice(0, -1); // 孤立高代理
+    if (last >= 0xDC00 && last <= 0xDFFF) {
+        const prev = cut.charCodeAt(cut.length - 2);
+        if (!(prev >= 0xD800 && prev <= 0xDBFF)) return cut.slice(0, -1); // 孤立低代理
+    }
+    return cut;
+}
 // 错误摘要（v3.75）：失败日志统一打摘要而非整个 err 对象——
 // $.post 回调的 err 是 err.response.body（API 异常响应体，可能回显请求参数含密钥），
 // 直接 console.log(err) 会在 cron 日志重定向/分享时泄露；截断 200 字符防超长刷屏
@@ -485,7 +500,7 @@ function wxPusherNotify(text, desp) {
             json: {
                 appToken: WX_pusher_appToken,
                 content: desp,
-                summary: text.substring(0, 90),
+                summary: safeSlice(text, 90),
                 contentType: 3, // 1文字 2HTML 3Markdown
                 // v3.137：配置注释"多个用逗号分隔"但未分割——[WX_pusher_topicIds] 曾发 ['1,2'] 而非 ['1','2']，多主题失效
                 topicIds: String(WX_pusher_topicIds || '').split(',').map(s => s.trim()).filter(Boolean),
@@ -753,4 +768,4 @@ async function sendNotify(text, desp, params = {}) {
     }
 }
 
-module.exports = { sendNotify, push_config, maskKey, maskUrl };
+module.exports = { sendNotify, push_config, maskKey, maskUrl, safeSlice };

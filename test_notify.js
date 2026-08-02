@@ -341,7 +341,36 @@ await test('TG_PROXY 配置 → 一次性警告不生效（v3.76）', () => with
     }
 }));
 
-// 14. 日志脱敏全覆盖：走真实通道异常路径，stub 日志断言不泄露
+// 15. safeSlice 代理对安全截断（v3.147：wxpusher summary 曾可能切断 emoji）
+await test('safeSlice: 代理对安全截断', () => {
+    const { safeSlice } = notify;
+    const s = '😀'.repeat(50); // 100 码元
+    // 奇数截断 91 → 末尾高代理退位到 90（45 个完整 emoji）
+    const cut = safeSlice(s, 91);
+    assert(cut.length === 90, `91 应退到 90: ${cut.length}`);
+    assert(cut === '😀'.repeat(45), '应为 45 个完整 emoji');
+    // 偶数完整保留
+    assert(safeSlice(s, 90).length === 90, '偶数完整保留');
+    // 短串不截
+    assert(safeSlice('abc', 5) === 'abc', '短串不截');
+    // 中文/混合
+    assert(safeSlice('中文😀混合', 3) === '中文', '中文后截断');
+});
+
+await test('wxpusher summary 代理对安全（v3.147）', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123';
+    cfg.WX_pusher_topicIds = '456';
+    await notify.sendNotify('😀'.repeat(46) + '很长标题内容'.repeat(3), '内容');
+    const c = gotCalls[0];
+    const summary = c.options.json.summary;
+    assert(summary.length <= 90, `summary ≤90: ${summary.length}`);
+    // 末尾不孤立（高代理必配低代理）
+    const last = summary.charCodeAt(summary.length - 1);
+    const prev = summary.charCodeAt(summary.length - 2);
+    const loneHigh = last >= 0xD800 && last <= 0xDBFF;
+    const loneLow = last >= 0xDC00 && last <= 0xDFFF && !(prev >= 0xD800 && prev <= 0xDBFF);
+    assert(!loneHigh && !loneLow, `末尾不应孤立代理: 0x${last.toString(16)}`);
+}));
 await test('日志脱敏: 通道异常日志不泄露密钥（真实路径）', () => withChannels(async () => {
     const origLog = console.log;
     const captured = [];
