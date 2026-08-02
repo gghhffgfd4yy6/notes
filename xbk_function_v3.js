@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.142 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
+//******** 线报酷推送脚本 v3.143 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -336,7 +336,8 @@ const Formatter = {
             .replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_, lv, c) => '#'.repeat(lv) + ' ' + c + '\n\n')
             .replace(/<a\s*[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
                 // 空 href 不生成空链接；危险协议(javascript:/vbscript:/data:)仅保留文本，防 XSS
-                const h = String(href).trim().toLowerCase();
+                // v3.143：href 先解码实体再检查——'javascript&#58;' 曾绕过（decode 在 a 转换后）
+                const h = Utils.decodeHtmlEntities(String(href).trim().toLowerCase());
                 return (href.trim() && !/^(javascript|vbscript|data):/.test(h)) ? `[${txt}](${href})` : txt;
             })
             .replace(/<img\b[^>]*>/gi, (tag) => {

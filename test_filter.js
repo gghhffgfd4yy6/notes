@@ -4079,6 +4079,27 @@ await test('安全: htmlToMarkdown 输出无事件注入残留', () => {
     assertEqual(r.includes('<script'), false, '不应残留 script');
 });
 
+await test('安全: 实体编码 href 不绕过危险协议检查（v3.143）', () => {
+    // javascript&#58; / &#106;avascript: / jav&#x61;script: 等编码形式曾绕过（decode 在 a 转换后）
+    const cases = [
+        'javascript&#58;alert(1)',
+        'javascript&#x3A;alert(1)',
+        '&#106;avascript:alert(1)',
+        'jav&#x61;script:alert(1)',
+        'vbscript&#58;msgbox(1)',
+    ];
+    for (const h of cases) {
+        const r = htmlToMarkdown({ content_html: `<a href="${h}">点我</a>`, url: '' });
+        assertEqual(r.includes('javascript:'), false, `不应残留 javascript: (${h})`);
+        assertEqual(r.includes('vbscript:'), false, `不应残留 vbscript: (${h})`);
+        assertEqual(r.includes('[点我]'), false, '危险链接应降级为纯文本');
+        assertEqual(r.includes('alert(1)') || r.includes('msgbox(1)'), false, '不应保留危险 payload');
+    }
+    // 正常 http/https 链接不受影响
+    const ok = htmlToMarkdown({ content_html: '<a href="https://x.com/a?b=1">正常</a>', url: '' });
+    assertEqual(ok.includes('[正常](https://x.com/a?b=1)'), true, '正常链接应保留');
+});
+
 await test('安全: 剥标签后无闭合标签残留', () => {
     const r = htmlToMarkdown({ content_html: '文本</div><p>段</p><br><h1>标题</h1>', url: 'http://x' });
     assertEqual(/<\/?[a-z][a-z0-9]*\s*>/i.test(r), false, '不应残留任何 HTML 标签');
