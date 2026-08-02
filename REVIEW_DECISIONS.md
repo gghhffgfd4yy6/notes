@@ -49,6 +49,12 @@
 | v3.59 审查 | 安全 | 1 | wxpusher/息知日志打整个响应对象(异常回显 token 风险→摘要) |
 | v3.60 审查 | 故障注入 | 1 | 循环引用 message 序列化崩溃(saveMessages/_upsert) |
 | v3.61 审查 | 内存 | 1 | _memoryCache 按文件名无限累积(加 100 上限) |
+| v3.145 审查 | 日志 | 1 | 告警"已发送"误报(sendNotify reject 仍同步打印) |
+| v3.145 审查 | 统计 | 1 | maxPerRun 截断未计入统计(差值凭空消失) |
+| v3.146 审查 | 日志 | 1 | 日报"已发送"误报(与告警同类,每天触发) |
+| v3.147 审查 | Unicode | 1 | wxpusher summary substring(0,90) 切断 emoji |
+| v3.148 审查 | 通道 | 1 | Server酱 \n\n 整体加倍成 \n\n\n\n |
+| v3.149 审查 | 通道 | 1 | mdToPlain HTML 残留属性({Html内容}+Push+/Bark) |
 
 **当前：632 个测试全绿（单元 564 + 集成 52 + 通道 16）**
 

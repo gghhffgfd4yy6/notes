@@ -1412,6 +1412,52 @@ await test('运行日报：跨天发昨日日报 + 当天累加（v3.125）', as
 });
 
 
+await test('告警通道挂 → 不误报"已发送"（v3.145）', async () => {
+    reset();
+    setPushUrl('t59_alert_nofalse');
+    fakeData = [];
+    const origInterval = Config.alert.intervalMs;
+    const origEnabled = Config.alert.enabled;
+    const origLog = console.log;
+    const logs = [];
+    console.log = (...a) => logs.push(a.join(' '));
+    try {
+        Config.alert.enabled = true;
+        Config.alert.intervalMs = 0;
+        fail4xx = true; // 接口失败触发告警
+        notifyFail = true; // 告警通道也挂（sendNotify reject）
+        try { await xbk.run(); } catch (e) { /* 预期抛错 */ }
+        assert(!logs.some(l => l.includes('已发送运行异常告警')), `通道挂不应误报已发送: ${logs.join(' | ')}`);
+    } finally {
+        console.log = origLog;
+        Config.alert.intervalMs = origInterval;
+        Config.alert.enabled = origEnabled;
+        try { require('fs').unlinkSync(getFilePath('alert.state')); } catch (e) { /* 忽略 */ }
+    }
+});
+
+await test('日报通道挂 → 不误报"已发送"（v3.146）', async () => {
+    reset();
+    setPushUrl('t60_report_nofalse');
+    fakeData = [makeItem({ id: 1 })];
+    const orig = Config.report.enabled;
+    const statePath = path.join(CACHE_DIR, 'report.state');
+    const origLog = console.log;
+    const logs = [];
+    console.log = (...a) => logs.push(a.join(' '));
+    try {
+        Config.report.enabled = true;
+        notifyFail = true; // 日报通道挂
+        require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, pushed: 3, failed: 0 }));
+        await xbk.run();
+        assert(!logs.some(l => l.includes('已发送昨日运行日报')), `通道挂不应误报已发送日报: ${logs.join(' | ')}`);
+    } finally {
+        console.log = origLog;
+        Config.report.enabled = orig;
+        try { require('fs').unlinkSync(statePath); } catch (e) { /* 忽略 */ }
+    }
+});
+
 await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () => {
     reset();
     setPushUrl('t58_maxperrun');
@@ -1424,6 +1470,7 @@ await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () 
         const summary = await xbk.run();
         assert(summary.pushed === 100, `应只推 100 条: ${JSON.stringify(summary)}`);
         assert(summary.total === 150, 'total 仍是拉取数 150');
+        assert(summary.truncated === 50, `截断应计入统计: ${JSON.stringify(summary)}`); // v3.145
         // 正常 20 条不截断
         reset();
         setPushUrl('t58b_maxperrun_ok');

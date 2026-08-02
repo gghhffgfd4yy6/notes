@@ -387,7 +387,7 @@ await test('safeSlice: 代理对安全截断', () => {
 await test('wxpusher summary 代理对安全（v3.147）', () => withChannels(async () => {
     cfg.WX_pusher_appToken = 'AT123';
     cfg.WX_pusher_topicIds = '456';
-    await notify.sendNotify('😀'.repeat(46) + '很长标题内容'.repeat(3), '内容');
+    await notify.sendNotify('a' + '😀'.repeat(50) + '很长标题内容', '内容'); // 90 截断点落在奇数位(高代理)
     const c = gotCalls[0];
     const summary = c.options.json.summary;
     assert(summary.length <= 90, `summary ≤90: ${summary.length}`);
