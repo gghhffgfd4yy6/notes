@@ -1479,6 +1479,36 @@ await test('告警/日报触发时通道失败 → 无 unhandledRejection（v3.1
     }
 });
 
+
+await test('连续运行：report.state 累加/缓存去重/状态文件正确（v3.141）', async () => {
+    reset();
+    setPushUrl('t60_cron');
+    fakeData = [makeItem({ id: 1 }), makeItem({ id: 2 })];
+    const orig = Config.report.enabled;
+    Config.report.enabled = true;
+    const statePath = path.join(CACHE_DIR, 'report.state');
+    try {
+        try { require('fs').unlinkSync(statePath); } catch (e) { /* 不存在则忽略 */ }
+        // 第 1 次：推 2 条
+        const s1 = await xbk.run();
+        assert(s1.pushed === 2, `第1次应推2: ${JSON.stringify(s1)}`);
+        // 第 2 次：同数据 → 缓存去重 → 推 0
+        const s2 = await xbk.run();
+        assert(s2.pushed === 0 && s2.dedup === 2, `第2次应全去重: ${JSON.stringify(s2)}`);
+        // 第 3 次：新数据 1 条 + 旧 1 条 → 推 1 去重 1
+        fakeData = [makeItem({ id: 1 }), makeItem({ id: 3 })];
+        const s3 = await xbk.run();
+        assert(s3.pushed === 1 && s3.dedup === 1, `第3次应推1去重1: ${JSON.stringify(s3)}`);
+        // report.state：3 次累加 pushed = 2+0+1 = 3
+        const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'));
+        assert(st.pushed === 3, `report.state 应累加 3 条: ${JSON.stringify(st)}`);
+        assert(st.total === 6, `report.state total 应 2×3 次=6: ${JSON.stringify(st)}`);
+    } finally {
+        Config.report.enabled = orig;
+        try { require('fs').unlinkSync(statePath); } catch (e) { /* 忽略 */ }
+    }
+});
+
 if (failed === 0) {
     console.log(`  🎉 集成测试全部通过！${passed}/${passed}`);
 } else {
