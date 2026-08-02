@@ -521,11 +521,14 @@ function wxPusherNotify(text, desp) {
                         console.log('WxPusher发送通知消息失败😞\n', safeErr(err));
                     } else {
                         if (data.code === 1000) {
-                            // console.log('WxPusher发送通知消息成功🎉。\n');
+                            console.log('WxPusher发送通知消息成功🎉。\n'); // v3.154：恢复成功日志（曾注释——单通道用户无法确认推送）
                         } else {
                             console.log(`WxPusher发送通知消息异常\n`);
                             // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数含 token）
                             console.log(data && data.msg ? data.msg : JSON.stringify(data).slice(0, 200));
+                            // v3.154：API 级失败(code≠1000)也 reject——曾 resolve 静默，单通道用户
+                            // （如只保留 wxpusher）主流程会写缓存 → 消息永久丢失（下次去重跳过）
+                            reject(new Error(data && data.msg ? data.msg : 'wxpusher 发送失败'));
                         }
                     }
                 } catch (e) {

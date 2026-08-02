@@ -15,6 +15,7 @@ let gotCalls = [];
 let failHitokoto = false; // 一言接口失败开关（v3.73：验证 sendNotify 兜底跳过不崩）
 let failHitokotoStruct = false; // 一言响应结构异常开关（v3.86：缺 hitokoto 字段）
 let failPost = false;     // got.post 失败开关（v3.75：验证失败日志不泄露密钥）
+let failWxpusher = false; // wxpusher API 失败开关（v3.154：code≠1000 应 reject 不静默）
 require.cache[gotPath].exports = (url, options) => {
     gotCalls.push({ url, options });
     // 一言接口失败模拟：抛 Error（网络异常路径）
@@ -34,7 +35,12 @@ require.cache[gotPath].exports.post = (url, options) => {
         e.response = { body: '{"code":500,"msg":"PPT_SECRET 回显"}', statusCode: 500 };
         return Promise.reject(e);
     }
-    return { then: (res) => res({ body: '{}', statusCode: 200, headers: {} }) };
+    // wxpusher 返回成功响应（v3.154：API 失败会 reject，成功需 code:1000）；其余 '{}'
+    return { then: (res) => {
+        let body = '{}';
+        if (String(url).includes('wxpusher')) body = failWxpusher ? { code: 1300, msg: '推送失败' } : { code: 1000, msg: 'success' };
+        return res({ body, statusCode: 200, headers: {} });
+    } };
 };
 
 const notify = require('./xbk_sendNotify_slim.js');
@@ -652,6 +658,17 @@ await test('企微/TG 超长内容截断（v3.139：通道长度限制）', () =
     const tg2 = gotCalls.find((c, i) => i > 0 && c.url.includes('telegram.org'));
     const t2 = tg2 ? tg2.options.json.text : null;
     assert(t2 && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(t2), 'TG 截断不应有孤立高代理');
+}));
+
+// 19. wxpusher API 失败 → reject 不静默（v3.154：单通道用户防消息丢失）
+await test('wxpusher API 失败(code≠1000) → reject 不静默', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123';
+    cfg.WX_pusher_topicIds = '456';
+    failWxpusher = true;
+    let rejected = false;
+    try { await notify.sendNotify('标题', '内容'); } catch (e) { rejected = true; }
+    assert(rejected, 'wxpusher API 失败应 reject（主流程不写缓存，下次重试）');
+    failWxpusher = false;
 }));
 
 if (failed === 0) {

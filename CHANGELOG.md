@@ -367,3 +367,12 @@
 - test_notify 新增测试（33 → 34）
 
 **747 个全绿（单元 635 + 集成 78 + 通道 34）**
+
+## v3.154（wxpusher 通道加固）
+
+- **成功日志恢复**：曾注释（单通道用户无法确认推送）——现打印"WxPusher发送通知消息成功🎉"
+- **API 级失败(code≠1000) reject**：曾 resolve 静默 → 单通道用户（只保留 wxpusher）主流程写缓存 → 消息永久丢失；现 reject → 主流程不写缓存下次重试
+- **只保留 wxpusher 渠道**：push_config.local.js 删除 Server酱(PUSH_KEY)/PushMe(PUSHME_KEY) 密钥
+- test_notify mock 更新（wxpusher 成功响应）+ 新增 API 失败测试（34 → 35）
+
+**748 个全绿（单元 635 + 集成 78 + 通道 35）**
