@@ -617,12 +617,18 @@ function tgNotify(text, desp) {
             console.warn('⚠️ 配置了 TG_PROXY_HOST/PORT，但自制 got 不支持 http 代理，该配置不生效；需要代理请改用 TG_API_HOST 指向代理网关');
         }
         if (TG_BOT_TOKEN && TG_USER_ID) {
+            // v3.132：parse_mode 'Markdown' → 'HTML'——真实接口 20 条中 19 条含 markdown 特殊字符、
+            // 1 条含未配对 *（TG Markdown 对未配对 * 报错发送失败）；改 HTML 模式 + 剥 markdown 符号
+            // + 转义 & < >（HTML 只对这 3 个敏感，无报错、无乱码，纯文本显示）
+            const tgText = mdToPlain(text);
+            const tgDesp = mdToPlain(desp);
+            const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             const options = {
                 url: `${TG_API_HOST || 'https://api.telegram.org'}/bot${TG_BOT_TOKEN}/sendMessage`,
                 json: {
                     chat_id: TG_USER_ID,
-                    text: desp ? `${text}\n\n${desp}` : text,
-                    parse_mode: 'Markdown',
+                    text: esc(tgDesp ? `${tgText}\n\n${tgDesp}` : tgText),
+                    parse_mode: 'HTML',
                     disable_web_page_preview: true,
                 },
                 headers: {

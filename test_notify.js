@@ -277,7 +277,7 @@ await test('息知: WX_XIZHI_KEY 作为 URL + JSON body', () => withChannels(asy
 }));
 
 // 11.5 Telegram（v3.49 新增实现，曾为死配置——配置项存在但从未实现/调用）
-await test('Telegram: bot token + chat_id + Markdown（新增实现）', () => withChannels(async () => {
+await test('Telegram: bot token + chat_id + HTML 模式（v3.132：Markdown 对未配对 * 报错）', () => withChannels(async () => {
     cfg.TG_BOT_TOKEN = '123:ABC';
     cfg.TG_USER_ID = '456';
     await notify.sendNotify('标题', '内容');
@@ -286,8 +286,18 @@ await test('Telegram: bot token + chat_id + Markdown（新增实现）', () => w
     assert(c.url.includes('api.telegram.org/bot123:ABC/sendMessage'), `TG URL: ${c.url}`);
     assert(c.options.json.chat_id === '456', 'chat_id 正确');
     assert(c.options.json.text.includes('标题') && c.options.json.text.includes('内容'), 'text 含标题与内容');
-    assert(c.options.json.parse_mode === 'Markdown', 'Markdown 模式');
+    assert(c.options.json.parse_mode === 'HTML', 'v3.132：Markdown 对未配对 * 报错，改 HTML');
     assert(c.options.json.disable_web_page_preview === true, '禁网页预览');
+    // 真实场景：未配对 * → HTML 模式下无害（Markdown 模式会报错，HTML 只对 & < > 敏感）
+    await notify.sendNotify('再发一遍*符合的去', '速度*0.01撸库迪');
+    const c2 = gotCalls[1];
+    assert(c2.options.json.text.includes('再发一遍') && c2.options.json.text.includes('速度'), '内容保留');
+    assert(c2.options.json.parse_mode === 'HTML', 'HTML 模式对未配对 * 安全（Markdown 会报错）');
+    assert(!c2.options.json.text.includes('**'), '配对的 markdown 符号应被 mdToPlain 剥掉');
+    // HTML 特殊字符转义
+    await notify.sendNotify('a<b>&', 'c>d');
+    const c3 = gotCalls[2];
+    assert(c3.options.json.text.includes('&lt;') && c3.options.json.text.includes('&amp;'), 'HTML 转义 & < >');
 }));
 
 await test('Telegram: 缺 chat_id 不发送(不影响其他通道) + 自定义 host', () => withChannels(async () => {
