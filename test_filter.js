@@ -3910,6 +3910,17 @@ await test('htmlToMarkdown 列表/粗体/斜体 → Markdown（v3.48）', () => 
     // 有序列表 ol
     const r3 = htmlToMarkdown({ content_html: '<ol><li>第一步</li><li>第二步</li></ol>', url: '' });
     assertEqual(r3.includes('- 第一步'), true, 'ol 项也转 - 前缀');
+    // div 块级元素：真实接口数据常见，曾粘连（v3.144）
+    const rd = htmlToMarkdown({ content_html: '<div>商品一</div><div>商品二</div>', url: '' });
+    assertEqual(rd.includes('商品一\n\n商品二'), true, `div 应换行: ${JSON.stringify(rd)}`);
+    assertEqual(rd.includes('商品一商品二'), false, 'div 不应粘连');
+    // img alt 截断（真实接口 alt 250+ 字符）+ URL 含空格不产生空 ![]()（v3.144）
+    const ri = htmlToMarkdown({ content_html: '<img src="http://x.jpg" alt="' + '很长的描述'.repeat(20) + '">', url: '' });
+    const altM = ri.match(/!\[([^\]]*)\]/);
+    assertEqual(altM && altM[1].length <= 50, true, `alt 应截断 ≤50: ${altM && altM[1].length}`);
+    const ri2 = htmlToMarkdown({ content_html: '<img src="http://x.com/a b.jpg">', url: '' });
+    assertEqual(ri2.includes('http://x.com/a b.jpg'), true, 'URL 含空格应保留非空');
+    assertEqual(ri2.includes('![]()'), false, '不应产生空图片');
     // 空标签不残留
     assertEqual(/<\/?[a-z][a-z0-9]*\s*>/i.test(r), false, '不应残留 HTML 标签');
 });
