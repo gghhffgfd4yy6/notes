@@ -436,7 +436,8 @@ function qywxBotNotify(text, desp) {
                 // v3.127：msgtype 'text' → 'markdown'——desp 是 Markdown 内容，text 模式会显示 ** 等原始符号（企微支持 markdown）
                 msgtype: 'markdown',
                 markdown: {
-                    content: desp ? `${text}\n\n${desp}` : text,
+                    // v3.130：企微 markdown 不支持图片——真实接口 desp 全含 ![]()，剥成 alt 文本（保留粗体/链接等其他语法）
+                    content: desp ? `${text}\n\n${String(desp).replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt) => alt || '(图片)')}` : text,
                 },
             },
             headers: {

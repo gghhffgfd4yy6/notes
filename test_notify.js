@@ -165,11 +165,13 @@ await test('PushDeer: body 全字段 URL 编码(& # 转义)', () => withChannels
 // 5. 企业微信 webhook
 await test('企业微信: webhook URL 含 key + JSON body', () => withChannels(async () => {
     cfg.QYWX_KEY = 'webhook-abc';
-    await notify.sendNotify('标题', '内容');
+    await notify.sendNotify('标题', '内容 ![图](http://img/1.jpg)');
     assert(gotCalls[0].url.includes('qyapi.weixin.qq.com'), `企微 URL: ${gotCalls[0].url}`);
     assert(gotCalls[0].url.includes('webhook-abc'), 'key 在 URL');
     assert(gotCalls[0].options.json.msgtype === 'markdown', 'msgtype（v3.127：desp 是 Markdown，text 会显示原始符号）');
     assert(gotCalls[0].options.json.markdown.content.includes('标题'), '内容含标题');
+    assert(!gotCalls[0].options.json.markdown.content.includes('!['), 'v3.130：企微 markdown 不支持图片，![]() 应剥成 alt');
+    assert(gotCalls[0].options.json.markdown.content.includes('图'), '图片 alt 应保留');
     assert(gotCalls.length === 1, '仅企微一次请求');
 }));
 
