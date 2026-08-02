@@ -341,7 +341,20 @@ await test('TG_PROXY 配置 → 一次性警告不生效（v3.76）', () => with
     }
 }));
 
-// 15. safeSlice 代理对安全截断（v3.147：wxpusher summary 曾可能切断 emoji）
+// 16. Server酱 换行处理（v3.148：只加倍单个 \n，\n\n 段落保持）
+await test('Server酱: 单个\\n加倍、\\n\\n段落保持（v3.148）', () => withChannels(async () => {
+    cfg.PUSH_KEY = 'SCT123';
+    // Markdown 形态（含 \n\n 段落）+ 单个 \n（内容内换行）
+    await notify.sendNotify('标题', '段落一\n\n段落二\n单行续');
+    const c = gotCalls[0];
+    const body = decodeURIComponent(c.options.body);
+    const despPart = body.split('desp=')[1];
+    assert(!despPart.includes('\n\n\n\n'), `不应 4+ 连续换行: ${JSON.stringify(despPart.slice(0, 60))}`);
+    // 单个 \n 应被加倍（Server酱要求）
+    assert(despPart.includes('段落二\n\n单行续'), '单个换行应加倍');
+    // \n\n 段落应保持（不翻倍）
+    assert(despPart.includes('段落一\n\n段落二'), '段落分隔应保持');
+}));
 await test('safeSlice: 代理对安全截断', () => {
     const { safeSlice } = notify;
     const s = '😀'.repeat(50); // 100 码元

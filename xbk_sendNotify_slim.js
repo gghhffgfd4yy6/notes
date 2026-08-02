@@ -269,7 +269,8 @@ function serverNotify(text, desp) {
                 text = cut;
             }
             // 微信server酱推送通知一个\n不会换行，需要两个\n才能换行，故做此替换
-            desp = desp.replace(/[\n\r]/g, '\n\n');
+            // v3.148：只加倍"单个 \n"——\n\n（Markdown 段落分隔）已是 Server酱换行格式，曾整体加倍成 \n\n\n\n 大段空白
+            desp = desp.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/([^\n])\n(?!\n)/g, '$1\n\n');
             const options = {
                 url: PUSH_KEY.includes('SCT')
                     ? `https://sctapi.ftqq.com/${PUSH_KEY}.send`
