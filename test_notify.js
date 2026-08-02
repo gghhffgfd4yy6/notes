@@ -111,6 +111,25 @@ await test('Server酱: title 超 32 字符截断（v3.126：真实接口 4/20 �
     assert(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(t2), '不应有孤立高代理');
 }));
 
+await test('Bark/Push+: markdown 符号剥离为纯文本（v3.128：不支持 markdown 渲染）', () => withChannels(async () => {
+    const md = '**京东神券** 秒杀\n[点我](http://x.com/a) ![图](http://img/1.jpg) `代码`';
+    // Bark
+    cfg.BARK_PUSH = 'https://api.day.app/dev1';
+    await notify.sendNotify('标题', md);
+    const barkBody = gotCalls[0].options.json;
+    assert(!barkBody.body.includes('**'), `Bark 不应含 **: ${barkBody.body}`);
+    assert(!barkBody.body.includes('[') && !barkBody.body.includes(']'), 'Bark 不应含链接符号');
+    assert(barkBody.body.includes('http://x.com/a'), '链接文本保留 url');
+    assert(!barkBody.body.includes('```'), 'Bark 不应含代码符号');
+    // Push+（html 模式）
+    cfg.BARK_PUSH = '';
+    cfg.PUSH_PLUS_TOKEN = 'token1';
+    await notify.sendNotify('标题', md);
+    const ppBody = gotCalls[1].options.body;
+    assert(!ppBody.includes('**'), 'Push+ 不应含 **');
+    assert(ppBody.includes('&lt;br&gt;') || ppBody.includes('<br>'), 'Push+ 换行转 html');
+}));
+
 // 2. Server酱 老版 URL
 await test('Server酱: 非SCT前缀走老版 URL', () => withChannels(async () => {
     cfg.PUSH_KEY = 'OLD123';

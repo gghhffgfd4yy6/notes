@@ -243,3 +243,6 @@
 
 ## v3.127（企微 markdown）
 
+
+## v3.128（Bark/Push+ markdown 剥离）
+

@@ -191,6 +191,7 @@ function pushPlusNotify(text, desp) {
     return new Promise((resolve) => {
         const { PUSH_PLUS_TOKEN, PUSH_PLUS_USER } = push_config;
         if (PUSH_PLUS_TOKEN) {
+            desp = mdToPlain(desp); // v3.128：Push+ 默认 html，markdown 符号会原样显示
             desp = desp.replace(/[\n\r]/g, '<br>'); // 默认为html, 不支持plaintext
             const body = {
                 token: `${PUSH_PLUS_TOKEN}`,
@@ -307,6 +308,7 @@ function barkNotify(text, desp, params = {}) {
         if (!BARK_PUSH) {
             return resolve();
         }
+        desp = mdToPlain(desp); // v3.128：Bark iOS 纯文本，markdown 符号会原样显示
 
         // 分割多个设备码
         const deviceKeys = BARK_PUSH.split('#').filter(key => key.trim());
@@ -648,6 +650,17 @@ function tgNotify(text, desp) {
             resolve();
         }
     });
+}
+
+// markdown → 纯文本（v3.128：Bark/Push+ 不支持 markdown 渲染，desp 会显示 ** 等原始符号）
+function mdToPlain(s) {
+    return String(s === undefined || s === null ? '' : s)
+        .replace(/\*\*([^*]+)\*\*/g, '$1')            // **粗体** → 粗体
+        .replace(/\*([^*]+)\*/g, '$1')                // *斜体* → 斜体
+        .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1')   // ![alt](url) → alt
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)') // [text](url) → text (url)
+        .replace(/^#{1,6}\s+/gm, '')                  // # 标题
+        .replace(/`([^`]+)`/g, '$1');                 // `代码` → 代码
 }
 
 // 孤立代理清洗（v3.110）：encodeURIComponent 对孤立代理抛 URIError——推送前统一处理
