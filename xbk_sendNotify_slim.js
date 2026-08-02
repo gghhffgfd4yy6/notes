@@ -431,8 +431,9 @@ function qywxBotNotify(text, desp) {
         const options = {
             url: `${QYWX_ORIGIN}/cgi-bin/webhook/send?key=${QYWX_KEY}`,
             json: {
-                msgtype: 'text',
-                text: {
+                // v3.127：msgtype 'text' → 'markdown'——desp 是 Markdown 内容，text 模式会显示 ** 等原始符号（企微支持 markdown）
+                msgtype: 'markdown',
+                markdown: {
                     content: desp ? `${text}\n\n${desp}` : text,
                 },
             },

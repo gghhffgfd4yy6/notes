@@ -149,8 +149,8 @@ await test('企业微信: webhook URL 含 key + JSON body', () => withChannels(a
     await notify.sendNotify('标题', '内容');
     assert(gotCalls[0].url.includes('qyapi.weixin.qq.com'), `企微 URL: ${gotCalls[0].url}`);
     assert(gotCalls[0].url.includes('webhook-abc'), 'key 在 URL');
-    assert(gotCalls[0].options.json.msgtype === 'text', 'msgtype');
-    assert(gotCalls[0].options.json.text.content.includes('标题'), '内容含标题');
+    assert(gotCalls[0].options.json.msgtype === 'markdown', 'msgtype（v3.127：desp 是 Markdown，text 会显示原始符号）');
+    assert(gotCalls[0].options.json.markdown.content.includes('标题'), '内容含标题');
     assert(gotCalls.length === 1, '仅企微一次请求');
 }));
 
