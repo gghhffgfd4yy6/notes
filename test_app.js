@@ -1605,6 +1605,10 @@ await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () 
     reset();
     setPushUrl('t58_maxperrun');
     const orig = Config.push.maxPerRun;
+    const origInt = Config.timing.pushInterval, origWait = Config.timing.finalWait;
+    // v3.171 性能：3 次 run 各推 100 条 × 100ms 间隔曾耗时 ~29s——截断逻辑验证不依赖真实间隔
+    Config.timing.pushInterval = 0;
+    Config.timing.finalWait = 0;
     try {
         // 150 条 → 只推 100
         Config.push.maxPerRun = 100;
@@ -1641,6 +1645,8 @@ await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () 
         assert(s4.dedup === 100, `二次去重 100: ${JSON.stringify(s4)}`);
     } finally {
         Config.push.maxPerRun = orig;
+        Config.timing.pushInterval = origInt;
+        Config.timing.finalWait = origWait;
     }
 });
 
