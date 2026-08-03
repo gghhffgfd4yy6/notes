@@ -1978,6 +1978,19 @@ await test('getFilePath 拼接路径', () => {
     assertEqual(p.endsWith('test.json'), true);
 });
 
+await test('getFilePath 非信息文件名回退 default.json（v3.176 修复#4）', () => {
+    // 对象/布尔 String 化产物曾产生 xianbaoku_cache/[object Object] 垃圾文件——与 getFileName 口径一致
+    // （不断言完整路径——前置测试可能改过 Config.cache.dir；只断言文件名部分与无垃圾名）
+    assertEqual(getFilePath({}).endsWith('default.json'), true);
+    assertEqual(getFilePath({}).includes('[object Object]'), false);
+    assertEqual(getFilePath(undefined).endsWith('default.json'), true);
+    assertEqual(getFilePath(null).endsWith('default.json'), true);
+    assertEqual(getFilePath(true).endsWith('default.json'), true);
+    assertEqual(getFilePath('').endsWith('default.json'), true);
+    // 正常文件名不受影响
+    assertEqual(getFilePath('正常.json').endsWith('正常.json'), true);
+});
+
 await test('_ensureFileExists 创建文件', () => {
     _ensureFileExists(path.join(CACHE, 'test_ensure.json'));
     assertEqual(require('fs').existsSync(path.join(CACHE, 'test_ensure.json')), true);
@@ -2009,6 +2022,21 @@ await test('saveMessages 超过maxSize自动裁剪', () => {
     }
     const msgs = readMessages(p);
     assertEqual(msgs.length <= 100, true);
+});
+
+await test('saveMessages maxSize 字符串配置生效（v3.176 修复#1：层间一致）', () => {
+    const p = path.join(CACHE, 'test_trim3.json');
+    const many = [];
+    for (let i = 0; i < 12000; i++) many.push({ id: i });
+    const orig = Config.cache.maxSize;
+    Config.cache.maxSize = '5000'; // 环境变量字符串（validateConfig 认合法，函数层曾静默回退 10000）
+    try {
+        saveMessages(p, many);
+    } finally {
+        Config.cache.maxSize = orig;
+    }
+    const msgs = readMessages(p);
+    assertEqual(msgs.length, 5000, `字符串 maxSize '5000' 应生效（曾回退默认 10000），实际 ${msgs.length}`);
 });
 
 
@@ -2700,7 +2728,8 @@ await test('tuisong {Html内容} 链接文本是URL本身', () => {
 });
 
 await test('Config.filter 各字段默认值', () => {
-    assertEqual(Config.filter.pingbifenlei, '美妆'); // v3.168：用户配置默认屏蔽美妆分类
+    // v3.176：个人过滤配置不再硬编码进默认 Config（'美妆' 曾默认屏蔽——克隆用户意外继承）
+    assertEqual(Config.filter.pingbifenlei, ''); // 需屏蔽分类请自行配置
     assertEqual(Config.filter.pingbibiaoti, '');
     assertEqual(Config.filter.zhanxianbiaoti, '');
     assertEqual(Config.filter.pingbineirong, '');
@@ -3248,6 +3277,15 @@ await test('anonKey 稳定合成id：相同输入相同key（v3.18审查Bug2）'
     assertEqual(anonKey('京东', '内容A') !== anonKey('淘宝', '内容A'), true);
     // 格式: anon: 前缀 + 十六进制
     assertEqual(/^anon:[0-9a-f]+$/.test(anonKey('x', 'y')), true);
+});
+
+await test('anonKey 楼主不同 → 不同key（v3.176 修复#6）', () => {
+    // 曾：同标题/内容/时间/图/价/商城/品牌/分类但楼主不同 → 误合并（合成 id 漏 louzhu）
+    const base = ['京东', '内容A', 1699999999, 1699999999, '/p.png', '京东商城', '99', '京东自营', '数码'];
+    assertEqual(anonKey(...base, '小明'), anonKey(...base, '小明'), '同楼主应同key');
+    assertEqual(anonKey(...base, '小明') !== anonKey(...base, '小红'), true, '楼主不同应不同key');
+    // 无楼主字段与空楼主 → 同 key（空值被过滤，行为不变）
+    assertEqual(anonKey(...base), anonKey(...base, ''), '空楼主不影响key');
 });
 
 await test('tuisong {类目} 与 {分类名} 统一来源（v3.18审查Bug3）', () => {
@@ -5717,7 +5755,9 @@ await test('Fuzz-IO: 随机文件名/内容 → 缓存 API 不崩（临时文件
             saveBatch(msgs, name);
             const read = readMessages(fp);
             assertEqual(Array.isArray(read), true, 'readMessages 应返回数组');
-            assertEqual(isMessageInFile(name, { id: 99999, title: 'n' }), false, 'isMessageInFile 不崩');
+            // v3.176：参数顺序纠正——曾 isMessageInFile(name, {id}) 颠倒（message 位传文件名、
+            // filename 位传对象），断言空转 + 每次运行残留 xianbaoku_cache/[object Object] 垃圾文件
+            assertEqual(isMessageInFile({ id: 99999, title: 'n' }, name), false, 'isMessageInFile 不崩且不误判');
         }
     } catch (e) {
         throw new Error(`IO fuzz 失败 name="${name.slice(0, 40)}" content=${JSON.stringify(content).slice(0, 40)}: ${e.message}`);

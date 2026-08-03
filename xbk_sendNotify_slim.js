@@ -264,6 +264,8 @@ function serverNotify(text, desp) {
     return new Promise((resolve, reject) => {
         const { PUSH_KEY } = push_config;
         if (PUSH_KEY) {
+            // v3.176：PUSH_KEY 数字/对象脏配置 → String 化（曾 .includes 抛 TypeError 通道静默失败）
+            const pushKey = String(PUSH_KEY);
             // v3.126：Server酱 title 上限 32 字符——主代码 titleMax=100 不满足，此处通道层精准截断
             // （安全处理代理对：末尾高代理退一位，避免切坏 emoji）
             if (text.length > 32) {
@@ -276,9 +278,9 @@ function serverNotify(text, desp) {
             // v3.148：只加倍"单个 \n"——\n\n（Markdown 段落分隔）已是 Server酱换行格式，曾整体加倍成 \n\n\n\n 大段空白
             desp = desp.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/([^\n])\n(?!\n)/g, '$1\n\n');
             const options = {
-                url: PUSH_KEY.includes('SCT')
-                    ? `https://sctapi.ftqq.com/${PUSH_KEY}.send`
-                    : `https://sc.ftqq.com/${PUSH_KEY}.send`,
+                url: pushKey.includes('SCT')
+                    ? `https://sctapi.ftqq.com/${pushKey}.send`
+                    : `https://sc.ftqq.com/${pushKey}.send`,
                 body: `text=${encodeURIComponent(text)}&desp=${encodeURIComponent(desp)}`,
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
@@ -335,7 +337,8 @@ function barkNotify(text, desp, params = {}) {
         desp = mdToPlain(desp); // v3.128：Bark iOS 纯文本，markdown 符号会原样显示
 
         // 分割多个设备码
-        const deviceKeys = BARK_PUSH.split('#').filter(key => key.trim());
+        // v3.176：BARK_PUSH 数字/对象脏配置 → String 化（曾 .split 抛 TypeError 通道静默失败）
+        const deviceKeys = String(BARK_PUSH).split('#').filter(key => key.trim());
         if (deviceKeys.length === 0) {
             return resolve();
         }
@@ -412,7 +415,8 @@ function pushMeNotify(text, desp, params = {}) {
         }
 
         // 分割多个推送KEY
-        const pushKeys = PUSHME_KEY.split('#').filter(key => key.trim());
+        // v3.176：PUSHME_KEY 数字/对象脏配置 → String 化（曾 .split 抛 TypeError 通道静默失败）
+        const pushKeys = String(PUSHME_KEY).split('#').filter(key => key.trim());
         if (pushKeys.length === 0) {
             return resolve();
         }

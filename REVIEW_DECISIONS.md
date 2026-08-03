@@ -60,6 +60,7 @@
 | v3.152 审查 | 推送 | 1 | 长 desp 截断丢原文链接 |
 | v3.153 审查 | 通道 | 1 | 原文链接 text===url 重复显示 |
 | v3.159 审查 | BUG_HUNT | 5 | wxpusher HTML 内容自动切 contentType=2 / 过滤规则变更失效过滤写入缓存 / pingbitime 接口缺字段警告 / 告警日报换行统一 / 模板占位符有效性警告 |
+| v3.176 系统审查 | 全文件 | 10 | cache.maxSize 字符串层间不一致 / 批内 vs 跨运行判重口径分裂 / 日报失败今日数据错标 / getFilePath 对象文件名垃圾文件+测试参数颠倒 / 垃圾 url 归一为空误判重 / anonKey 漏 louzhu / 通道 key 数字 TypeError / run.log 时间戳本地化 / 统计双计与 report 缺 truncated / 默认配置外置（美妆） |
 
 **当前：全部测试通过（数量以 `node run_tests.js` 实际输出为准，本文件不维护具体数字）**
 

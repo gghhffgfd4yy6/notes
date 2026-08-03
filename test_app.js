@@ -283,6 +283,53 @@ await test('同一批重复 url（无id）→ 只收录1条', async () => {
     assert(pushCalls.length === 1, `同url应只推1条，实际${pushCalls.length}`);
 });
 
+await test('批内 id-ful 与无 id 同 url → 只收录1条（v3.176 修复#2：口径对齐）', async () => {
+    reset();
+    setPushUrl('t06b_mixed_dup');
+    // 曾：A key='id:1'、B key='url:/m/1.html' → seenInBatch 互不可见 → 双推
+    // 跨运行 _findDedupIndex 是双向 url fallback（无 id 方命中同 url），批内应与之一致
+    fakeData = [
+        { id: 1, url: '/m/1.html', catename: 'a', title: '有id', content: 'c' },
+        { url: '/m/1.html', catename: 'a', title: '无id', content: 'c' },
+    ];
+    await xbk.run();
+    assert(pushCalls.length === 1, `id-ful+无id同url应只推1条，实际${pushCalls.length}`);
+    const cached = readCacheFile('t06b_mixed_dup');
+    assert(cached.length === 1, `缓存应只有1条，实际${cached.length}`);
+});
+
+await test('批内无 id 与有 id 同 url → 只收录1条（v3.176 修复#2 反向）', async () => {
+    reset();
+    setPushUrl('t06c_mixed_rev');
+    fakeData = [
+        { url: '/m/2.html', catename: 'a', title: '无id', content: 'c' },
+        { id: 2, url: '/m/2.html', catename: 'a', title: '有id', content: 'c' },
+    ];
+    await xbk.run();
+    assert(pushCalls.length === 1, `无id在前+有id同url应只推1条，实际${pushCalls.length}`);
+});
+
+await test('垃圾 url（#/?x=1）归一为空 → anonKey 化不互判重（v3.176 修复#5）', async () => {
+    reset();
+    setPushUrl('t06d_garbage_url');
+    // 曾：normUrl('#')=normUrl('?x=1')='' → 两条 key 均为 'url:' 互判为同一资源 → 后者静默丢弃
+    fakeData = [
+        { url: '#', catename: 'a', title: '垃圾A', content: '内容A' },
+        { url: '?x=1', catename: 'a', title: '垃圾B', content: '内容B' },
+    ];
+    await xbk.run();
+    assert(pushCalls.length === 2, `两条不同内容垃圾url应全推，实际${pushCalls.length}`);
+    // 跨运行：anonKey 稳定 → 下次全去重（不重复推送）
+    reset();
+    setPushUrl('t06d_garbage_url');
+    fakeData = [
+        { url: '#', catename: 'a', title: '垃圾A', content: '内容A' },
+        { url: '?x=1', catename: 'a', title: '垃圾B', content: '内容B' },
+    ];
+    const s2 = await xbk.run();
+    assert(s2.pushed === 0 && s2.dedup === 2, `二次应全去重: ${JSON.stringify(s2)}`);
+});
+
 // ==================== 4. 过滤生效 ====================
 console.log('\n📂 4. 过滤生效');
 

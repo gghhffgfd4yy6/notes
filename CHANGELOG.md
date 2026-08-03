@@ -574,3 +574,17 @@
 - **85 章性能基准负载容错**：固定阈值在 CI 2 核/并行残留进程下偶发超时误报——首轮超时重跑一次（排除瞬时负载），真实性能回归两次都超时仍红（保留检测力）
 - **t57 日报断言时区**（Gitee Go 暴露，与 v3.174 补充②同批）：断言改用本地日期（与 _updateReport 的 v3.155 本地口径一致）
 - 测试：652 + 93 并行 + 41 = 786 全绿；UTC/+8 双时区验证通过
+
+## v3.176（系统级审查修复：配置层间不一致 / 批内判重口径 / 日报错标 / 垃圾文件 / 通道类型防御）
+
+- **#1 cache.maxSize 字符串配置层间不一致**：v3.175 让 validateConfig 认字符串 `'5000'`（不再误报），但 `saveMessages` 仍 `Number.isInteger('5000')` → 静默回退 10000——用户以为 5000 生效实际 10000 且无提示（v3.158 全量 Utils.num 化的唯一漏网点）；`saveMessages` 改 Utils.num 口径，与校验层一致
+- **#2 批内判重与跨运行判重口径分裂**：App.run 批内 `seenInBatch` 用单维 key（`id:`/`url:`），`_findDedupIndex`（跨运行）是双向 url fallback——同一批「有 id 条目」与「无 id 同 url 条目」key 不同互不可见 → 双推窗口（有 id 条目命中「无 id 方同 url」/无 id 条目命中「任意同 url」）；批内改为三个索引（batchIds/batchUrls/batchNoIdUrls）与 `_findDedupIndex` 完全同口径
+- **#3 日报发送失败路径今日数据错标**：catch 分支曾 `acc(state)` 把今日 summary 累进 date=昨日的 state → 下次重试「昨日日报」含今日数据错标、连续失败越积越错；新增 `state.pending` 暂存今日累计，昨日日报发送成功时并入新的一天（数据不丢、不错标）
+- **#4 getFilePath 对象文件名无防御 + test_filter 参数颠倒**：`getFilePath({})` → `xianbaoku_cache/[object Object]` 垃圾文件（每次跑测试残留）；`getFileName` 有 `[object Object]→default.json` 防御而 getFilePath 没有——补同口径回退；test_filter Fuzz-IO `isMessageInFile(name, {id})` 参数颠倒（断言空转）已纠正
+- **#5 垃圾 url 归一为空误判重**：`normUrl('#')=normUrl('?x=1')=''`——多条不同垃圾 url 数据互判为同一资源静默丢弃，且不触发 anonKey（trim 后非空）；anonKey 条件补「url 归一为空」分支
+- **#6 anonKey 缺 louzhu**：同标题/内容/时间/图/价/商城/品牌/分类但楼主不同的无 id 无 url 条目被误合并；合成 id 补 louzhu 字段
+- **#7 通道 key 数字型 TypeError**：`BARK_PUSH: 12345`/`PUSHME_KEY`/`PUSH_KEY`（漏引号）→ `.split`/`.includes` 抛 TypeError 通道静默失败（其余通道均已防御）；三处补 String() 化
+- **#8 run.log 时间戳本地化**：曾 toISOString（UTC）与日报/告警本地口径混排（UTC+8 用户凌晨 cron 排查误判）；`_localStamp()` 统一本地 `YYYY-MM-DD HH:mm:ss`
+- **#9 统计口径**：非对象元素不再双计 filteredCount（「过滤屏蔽」专指规则过滤）；日报 state 补 truncated 字段（曾只有 run.log 有）
+- **#10 默认配置外置**：`pingbifenlei: '美妆'`（个人过滤配置）不再硬编码进默认 Config——克隆用户曾意外继承屏蔽；需屏蔽请自行配置
+- 测试：test_filter Fuzz-IO 断言纠正 +1；test_app 补「批内 id-ful/无 id 同 url 双推修复」「垃圾 url 批内判重」「maxSize 字符串生效」锁定

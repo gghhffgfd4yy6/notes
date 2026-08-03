@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.175 — 审查八轮修复：运行时数值配置校验误报警告(字符串'5000'环境变量场景曾误报,改Utils.num口径3处)/85章性能基准负载容错重试(CI 2核偶发超时)/t57日报断言时区(本地日期与v3.155口径一致) ********
+//******** 线报酷推送脚本 v3.176 — 系统级审查修复：①cache.maxSize字符串配置静默回退(validateConfig称合法但saveMessages按10000裁剪,唯一漏网Utils.num点)②批内判重与跨运行判重口径对齐(_findDedupIndex双向url fallback,曾同批id-ful/无id同url双推)③日报发送失败今日数据错标进昨日日报(新增pending暂存)④getFilePath对象文件名防御+test_filter参数颠倒修复(残留[object Object]垃圾文件)⑤垃圾url('#'/'?x=1')归一为空误判重→补anonKey⑥anonKey补louzhu⑦通道key数字型TypeError防御(server酱/bark/pushMe)⑧run.log时间戳本地化(与日报/告警口径一致)⑨badElement不再双计filteredCount⑩report补truncated⑪默认屏蔽美妆外置(用户配置不再硬编码) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -30,7 +30,9 @@ const Config = {
     },
 
     filter: {
-        pingbifenlei: '美妆', // 屏蔽分类（正则匹配分类名，2026-08-03 用户配置：屏蔽美妆分类）
+        // v3.176：默认不再携带个人过滤配置（'美妆' 曾硬编码于此——克隆用户意外继承屏蔽）。
+        // 需要屏蔽分类请自行配置，例如：pingbifenlei: '美妆'
+        pingbifenlei: '',
         pingbibiaoti: '',
         zhanxianbiaoti: '',
         pingbibiaotiplus: '',
@@ -1079,7 +1081,9 @@ const MessageStore = {
         let fnStr;
         try { fnStr = String(filename || ''); } catch (e) { fnStr = ''; }
         let safe = path.basename(fnStr).replace(/[\\/:*?"<>|]/g, '');
-        if (!safe || safe === '.' || safe === '..') safe = 'default.json';
+        // v3.176：非信息文件名（对象/布尔 String 化产物）回退 default.json——与 getFileName 口径一致
+        // （曾产生 xianbaoku_cache/[object Object] 垃圾文件：test_filter 参数颠倒 + 此处无防御）
+        if (!safe || safe === '.' || safe === '..' || safe === '[object Object]' || safe === 'undefined' || safe === 'null' || safe === 'true' || safe === 'false') safe = 'default.json';
         // 文件名超长截断（避免 >255 字节落盘失败）
         if (Buffer.byteLength(safe, 'utf8') > 200) {
             const ext = safe.includes('.') ? safe.slice(safe.lastIndexOf('.')) : '';
@@ -1138,8 +1142,9 @@ const MessageStore = {
         // 拷贝后再截断：不原地修改调用方传入的数组（外部复用场景）
         const toSave = Array.isArray(messages) ? [...messages] : [];
         // maxSize 防御：非正整数回退默认（R3-2 整数化——小数 2.5 会让 splice 的 ToInteger 截断产生模糊条数；0/负值避免缓存被清空）
-        const maxSize = Number.isInteger(Config.cache.maxSize) && Config.cache.maxSize > 0
-            ? Config.cache.maxSize : DEFAULT_MAX_SIZE;
+        // v3.176：Utils.num 口径——'5000'(环境变量字符串) 曾 Number.isInteger 判否 → 静默回退 10000
+        // （validateConfig 按 v3.175 口径判合法不警告 → 层间不一致，用户以为 5000 生效实际 10000）
+        const maxSize = (() => { const v = Utils.num(Config.cache.maxSize, -1); return Number.isInteger(v) && v > 0 ? v : DEFAULT_MAX_SIZE; })();
         if (toSave.length > maxSize) {
             console.warn(`缓存超出上限(${maxSize})，裁剪掉最早 ${toSave.length - maxSize} 条`);
             toSave.splice(0, toSave.length - maxSize);
@@ -1368,6 +1373,13 @@ const Pusher = {
 // 🚀 App — 主流程层
 // ============================================================
 const App = {
+    // v3.176：运行日志时间戳本地化（与日报/告警本地口径一致）——曾 toISOString（UTC），
+    // UTC+8 用户凌晨 cron 排查时 UTC 行与本地日期混排易误判（系统审查 #9）
+    _localStamp() {
+        const d = new Date();
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+    },
+
     // 运行日志：追加一行到缓存目录 run.log（成功摘要/失败 ERROR 共用），超过 1MB 截断保留尾部（防无限增长；写失败静默不中断）
     _writeRunLog(line) {
         try {
@@ -1418,7 +1430,7 @@ const App = {
             const en = Config.report && Config.report.enabled;
             if (!Config.report || !en || en === 'false' || en === '0') return;
             const statePath = path.join(MessageStore.cacheDir, 'report.state');
-            let state = { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
+            let state = { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 };
             try { state = JSON.parse(fs.readFileSync(statePath, 'utf8')) || state; } catch (e) { /* 无状态=首次 */ }
             // v3.155：日报日期用本地时区（原 UTC——中国用户凌晨 cron 时本地已跨天但 UTC 未跨，日报日期错位一天）
             const _d = new Date();
@@ -1429,31 +1441,56 @@ const App = {
                 st.filtered += summary.filtered || 0;
                 st.pushed += summary.pushed || 0;
                 st.failed += summary.failed || 0;
+                st.truncated += summary.truncated || 0; // v3.176：截断数也入日报（曾只有 run.log 有）
             };
             if (state.date && state.date !== today) {
                 // 新的一天：发昨日日报（若有数据）
                 if (state.total > 0 || state.failed > 0) {
                     const t = `📊 xbk-push 日报（${state.date}）`;
                     // v3.159：段落分隔 \n\n（与主推送口径一致）——wxpusher Markdown 渲染单个 \n 可能挤成一行
-                    const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}`;
+                    const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}${state.truncated ? ` | 截断 ${state.truncated}` : ''}`;
                     // v3.156：发送成功才重置日期——曾先写 state.date（日报失败也跨天，昨日日报丢失）
                     // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗）
                     Pusher.send(t, d)
                         .then(() => {
-                            state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
+                            // v3.176：昨日日报发送成功 → 重置为今日；取出「昨日日报失败期间的今日累计」
+                            // （pending），与本次数据一并计入新的一天（曾直接丢弃——今日数据丢失）
+                            const pend = state.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 };
+                            state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 };
                             acc(state); // 本次数据计入新的一天
+                            state.total += pend.total || 0;
+                            state.dedup += pend.dedup || 0;
+                            state.filtered += pend.filtered || 0;
+                            state.pushed += pend.pushed || 0;
+                            state.failed += pend.failed || 0;
+                            state.truncated += pend.truncated || 0;
                             fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
                             console.log('已发送昨日运行日报');
                         })
                         .catch(() => {
-                            // 失败：date 不重置（下次运行重试昨日日报），本次数据先累计进旧 state（不丢）
-                            acc(state);
+                            // v3.176：失败 → date 不重置（下次运行重试昨日日报）；本次（今日）数据暂存
+                            // pending，不污染昨日统计——曾 acc 进旧 state：今日数据被错标进「昨日日报」
+                            // 重复发送（系统审查 #4）
+                            const pend = state.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 };
+                            pend.total += summary.total || 0;
+                            pend.dedup += summary.dedup || 0;
+                            pend.filtered += summary.filtered || 0;
+                            pend.pushed += summary.pushed || 0;
+                            pend.failed += summary.failed || 0;
+                            pend.truncated += summary.truncated || 0;
+                            state.pending = pend;
                             fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
                         });
                     return;
                 }
-                // 昨日无数据：直接跨天
-                state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
+                // 昨日无数据：直接跨天（pending 若有则并入今日——防御，正常路径无）
+                const pend = state.pending;
+                state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 };
+                if (pend) {
+                    state.total += pend.total || 0; state.dedup += pend.dedup || 0;
+                    state.filtered += pend.filtered || 0; state.pushed += pend.pushed || 0;
+                    state.failed += pend.failed || 0; state.truncated += pend.truncated || 0;
+                }
             }
             if (!state.date) state.date = today;
             acc(state);
@@ -1551,26 +1588,46 @@ const App = {
                 try { fs.writeFileSync(hashPath, filterHash, 'utf8'); } catch (e) { /* 写失败静默（缓存目录只读等） */ }
             }
             const newMessages = [];
-            const seenInBatch = new Set(); // 防止同一批接口数据里出现重复 id/url 时被重复收录
+            // v3.176：批内判重与跨运行判重（_findDedupIndex）口径对齐——曾 key=id:|url: 单维度，
+            // 同一批「有 id 条目」与「无 id 同 url 条目」key 不同互不可见 → 双推（系统审查 #2）
+            const batchIds = new Set();      // 已收录条目的 String(id)（有 id 条目）
+            const batchUrls = new Set();     // 已收录条目的 normUrl(url)（所有有 url 条目）
+            const batchNoIdUrls = new Set(); // 已收录无 id 条目的 normUrl(url)（有 id 条目经此与无 id 同 url 交叉判重）
 
             let badElementCount = 0; // v3.157：非对象元素单独统计（曾混入 filteredCount，诊断不清）
             let regTimePresent = 0; // v3.159：louzhuregtime 有值统计（pingbitime 有效性警告用）
             for (const item of xbkdata) {
-                // 元素级校验：非对象元素跳过（统计为屏蔽，不崩溃）
-                if (!Utils.isValidItem(item)) { badElementCount++; filteredCount++; continue; }
+                // 元素级校验：非对象元素跳过（v3.176：不再计入 filteredCount——「过滤屏蔽」专指规则过滤，
+                // 非对象元素有独立「非对象元素」行，曾双计误导诊断）
+                if (!Utils.isValidItem(item)) { badElementCount++; continue; }
                 // v3.159：注册时间字段缺失统计（接口可能不提供，pingbitime 配置将不生效）
                 if (item.louzhuregtime !== undefined && item.louzhuregtime !== null && item.louzhuregtime !== '') regTimePresent++;
                 // 归一化：category_name/category_id 兼容映射 + 无标识数据生成合成 id（在判重前统一处理）
                 if (!item.catename && item.category_name) item.catename = item.category_name;
                 if (!item.cateid && item.category_id) item.cateid = item.category_id;
-                if (!Utils.hasValidId(item) && (!item.url || String(item.url).trim() === '')) {
-                    // v3.157：anonKey 补 price/mall_name/brand/catename——曾忽略这些差异致同商品不同价被误合并
-                    item.id = Utils.anonKey(item.title, item.content, item.posttime, item.shijianchuo, item.pic, item.mall_name, item.price, item.brand, item.catename);
+                if (!Utils.hasValidId(item) && (!item.url || String(item.url).trim() === '' || Utils.normUrl(item.url) === '')) {
+                    // v3.176：url 归一为空（'#'/'?x=1'/'//' 等垃圾值）同样视为无 url → 合成 id
+                    // （曾走 key='url:' 空键，多条不同垃圾 url 数据互判为同一资源，后者静默丢弃——系统审查 #5）
+                    // v3.176：补 louzhu——同内容不同楼主曾被误合并（系统审查 #6）
+                    item.id = Utils.anonKey(item.title, item.content, item.posttime, item.shijianchuo, item.pic, item.mall_name, item.price, item.brand, item.catename, item.louzhu);
                 }
-                // key：有效 id 优先（null/'' 不算；归一化已为无标识数据生成合成 id），url 兜底
-                const key = Utils.hasValidId(item) ? `id:${item.id}` : `url:${Utils.normUrl(item.url)}`;
-                if (MessageStore.has(item, cacheName) || seenInBatch.has(key)) { dedupCount++; continue; }
-                seenInBatch.add(key);
+                // 批内判重（口径与 MessageStore._findDedupIndex 一致）：
+                //   有 id 条目：按 String(id) 判重，或「对方为无 id 条目且 url 归一相同」交叉判重
+                //   无 id 条目：按 url 归一判重（不论对方有无 id）
+                const batchUrl = Utils.normUrl(item.url);
+                let batchDup = false;
+                if (Utils.hasValidId(item)) {
+                    batchDup = batchIds.has(String(item.id)) || (item.url && batchNoIdUrls.has(batchUrl));
+                } else if (item.url) {
+                    batchDup = batchUrls.has(batchUrl);
+                }
+                if (MessageStore.has(item, cacheName) || batchDup) { dedupCount++; continue; }
+                // 收录进批内索引
+                if (Utils.hasValidId(item)) batchIds.add(String(item.id));
+                if (item.url) {
+                    batchUrls.add(batchUrl);
+                    if (!Utils.hasValidId(item)) batchNoIdUrls.add(batchUrl);
+                }
                 if (FilterEngine.listfilter(item, compiledRules)) {
                     items.push(item);
                 } else {
@@ -1754,10 +1811,10 @@ const App = {
             // run() 返回后进程退出时序不确定（虽然内部 .catch 兜底不丢，但行为不一致）
             if (items.length > 0 && successCount === 0) {
                 try { await this._sendAlert(`推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`); } catch (e) { /* 告警失败不阻塞主流程 */ }
-                this._writeRunLog(`${new Date().toISOString()} ERROR 推送全部失败 ${items.length} 条（通道可能失效）\n`);
+                this._writeRunLog(`${this._localStamp()} ERROR 推送全部失败 ${items.length} 条（通道可能失效）\n`);
             }
             // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
-            this._writeRunLog(`${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${items.length - successCount} elapsed=${elapsed}s\n`);
+            this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${items.length - successCount} elapsed=${elapsed}s\n`);
 
             // v3.125：运行日报（跨天发昨日汇总 + 当天累加；静默）
             const summary = {
@@ -1784,7 +1841,7 @@ const App = {
                 console.log('请求错误:', errMsg);
             }
             // 失败也写运行日志（cron 可回溯失败原因；错误信息去换行避免破坏日志行）
-            this._writeRunLog(`${new Date().toISOString()} ERROR ${String(errMsg).replace(/[\r\n]+/g, ' ')}\n`);
+            this._writeRunLog(`${this._localStamp()} ERROR ${String(errMsg).replace(/[\r\n]+/g, ' ')}\n`);
             // v3.123：接口异常告警（限频 + 静默，不影响主流程）
             // v3.164：await 告警完成——主入口 process.exit(1) 前需确保告警 HTTP 送达（#10）
             try { await this._sendAlert(errMsg); } catch (e) { /* 告警失败不阻塞重抛 */ }
