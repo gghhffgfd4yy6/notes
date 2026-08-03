@@ -4585,10 +4585,14 @@ await test('ReDoS: hasNestedQuantifier 命中嵌套量词模式', () => {
     for (const p of ['(a+)+', '(a*)*', '(a+)*', '(a*)+', '(?:a+)+', '((a+)+)', '((a)+)+', '(a+)+$', '(a{2,})+', '(a+)+(b+)+', '(a?)+', '(ab?)+', '(a?){2,}', '(\\d+)+']) {
         assertEqual(hasNestedQuantifier(p), true, `应判定危险: ${p}`);
     }
+    // v3.174：歧义交替 + 无限量词也判危险（(a|aa)+ 曾漏检——'^(a|aa)+b$' 对 30a 已 156ms/40a 2.5s 指数爆炸）
+    for (const p of ['(a|aa)+', '(a|ab)+', '(ab|a)+', '(?:a|aa)+', '(a|b)+', '(a|a)+', '(aa|ab)+b', '(a|aa){2,}', '((a|b)+)+']) {
+        assertEqual(hasNestedQuantifier(p), true, `歧义交替应判定危险: ${p}`);
+    }
 });
 
 await test('ReDoS: hasNestedQuantifier 放过安全模式', () => {
-    for (const p of ['(a+){1,3}', '(a+)?', '(a|b)+', '(ab)+', 'a+', 'a{2,}', '[()]+', '\\(a+\\)+', '', '(a+b)+', '(a+)b', '[a+]', '(a{2})+', '(a{2,3})+', '京东', '微博|赚客吧']) {
+    for (const p of ['(a+){1,3}', '(a+)?', '(ab)+', 'a+', 'a{2,}', '[()]+', '\\\\(a+\\\\)+', '', '(a+b)+', '(a+)b', '[a+]', '(a{2})+', '(a{2,3})+', '京东', '微博|赚客吧', 'a|b', '(a|b)', '(a|b){2,3}', '[a|b]+', 'colou?r', '(a|b)c']) {
         assertEqual(hasNestedQuantifier(p), false, `不应判定危险: ${p}`);
     }
 });
@@ -5642,7 +5646,8 @@ await test('Fuzz-正则: 100 个随机正则模式 hasNestedQuantifier 不崩且
     }
     // 已知安全模式不误报
     assertEqual(hasNestedQuantifier('a+b+c'), false, 'a+b+c 安全');
-    assertEqual(hasNestedQuantifier('(a|b)+'), false, '(a|b)+ 安全(无嵌套)');
+    assertEqual(hasNestedQuantifier('(a|b)+'), true, '(a|b)+ 歧义交替+无限量词 → 保守判危险（v3.174）');
+    assertEqual(hasNestedQuantifier('(a|b)'), false, '(a|b) 无量词安全');
     assertEqual(hasNestedQuantifier('(a+){1,3}'), false, '(a+){1,3} 有界安全');
     assertEqual(hasNestedQuantifier('a+{2,}'), false, '量词后不嵌套');
     // 已知危险模式必须被标记（无转义干扰的显式模式——防漏报）

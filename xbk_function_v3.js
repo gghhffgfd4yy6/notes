@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.173 — 审查三轮修复2项：htmlToMarkdown删除成对尖括号剥离(5>>3曾误删成53/价格<<100变价格100)/告警日报enabled补falsy判断(0和'0'曾不关闭) ********
+//******** 线报酷推送脚本 v3.174 — ReDoS防护扩展：hasNestedQuantifier补歧义交替检测(组内含|+无限量词, (a|aa)+曾漏检——'^(a|aa)+b$' 30字符156ms/40字符2.5s指数爆炸卡死过滤) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -549,11 +549,11 @@ const RuleEngine = {
             }
             return 0;
         };
-        const stack = [{ inf: false }]; // 栈顶=当前分组：inf=组内最后一个 token 是否以无限量词结尾
+        const stack = [{ inf: false, alt: false }]; // 栈顶=当前分组：inf=组内最后 token 是否以无限量词结尾；alt=组内是否含 |（交替）
         for (let i = 0; i < s.length; i++) {
             const ch = s[i];
             const cur = stack[stack.length - 1];
-            if (ch === '\\') { i++; cur.inf = false; continue; } // 转义（含 \( \) \d 等）视为普通 token
+            if (ch === '\\') { i++; cur.inf = false; continue; } // 转义（含 \\( \\) \\d 等）视为普通 token
             if (ch === '[') {
                 let j = i + 1;
                 if (s[j] === '^') j++;
@@ -561,13 +561,17 @@ const RuleEngine = {
                 while (j < s.length && s[j] !== ']') { if (s[j] === '\\') j++; j++; }
                 i = j; cur.inf = false; continue; // 字符类整体视为普通 token
             }
-            if (ch === '(') { stack.push({ inf: false }); continue; }
+            if (ch === '(') { stack.push({ inf: false, alt: false }); continue; }
+            if (ch === '|') { cur.alt = true; cur.inf = false; continue; } // v3.174：交替标记（歧义回溯候选）
             if (ch === ')') {
                 if (stack.length === 1) { cur.inf = false; continue; } // 多余右括号
                 const closed = stack.pop();
                 const parent = stack[stack.length - 1];
                 const ql = infQuantLen(i + 1);
                 if (closed.inf && ql > 0) return true; // 组以无限量词结尾 + 组后无限量词 → 灾难性
+                // v3.174：组内含交替 + 组后无限量词 → 歧义交替灾难性回溯（(a|aa)+ 曾漏检，
+                // '^(a|aa)+b$' 对 30a 已 156ms/40a 2.5s/50a+ 指数爆炸卡死）；保守拦截（宁可误拦多推）
+                if (closed.alt && ql > 0) return true;
                 if (ql > 0) { parent.inf = true; i += ql; } else { parent.inf = false; }
                 continue;
             }
