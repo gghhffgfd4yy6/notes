@@ -9,7 +9,7 @@
 
 ### `xbk_function_v3.js` — 主代码(推送脚本核心)
 
-**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。约 1776 行,9 层职责分层架构。
+**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。9 层职责分层架构。
 
 **运行流程**(`App.run()` 主流程):
 ```
@@ -55,13 +55,13 @@ Config.template.content    // 推送内容模板(默认{Markdown内容})
 Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.159)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 最新/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号由 101 章测试自动校验（与 CHANGELOG 最新/package.json 三方一致）——版本更新时无需手动核对文档;`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
 ### `xbk_sendNotify_slim.js` — 推送模块(各通道实现)
 
-**定位**:主代码依赖的推送实现,约 792 行。实现 9 个推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。
+**定位**:主代码依赖的推送实现。实现 9 个推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。
 
 **结构**:
 | 部分 | 内容 |
@@ -115,9 +115,9 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 
 ## 二、测试相关
 
-### `test_filter.js` — 单元测试(约 643 个)
+### `test_filter.js` — 单元测试
 
-**定位**:主测试文件(约 6210 行),涵盖 20+ 种测试手段,按章节组织。
+**定位**:主测试文件,涵盖 20+ 种测试手段,按章节组织。
 
 **章节结构**(📂 编号):
 
@@ -133,8 +133,8 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 | **83** | **契约测试** | 33 个导出键存在+类型正确+bind 生效+判重口径一致 |
 | **84** | **快照测试** | 6 个完整输出锁定(htmlToMarkdown/tuisong_replace) |
 | **85** | **性能基准** | htmlToMarkdown 1000次<500ms/tuisong 1000次<300ms/listfilter 5000次<500ms |
-| **86** | **分支覆盖** | 关键 if 两方向显式验证(7 个) |
-| **87** | **安全测试** | 原型污染(3)+输出注入(2,抓到 javascript: XSS 注入面) |
+| **86** | **分支覆盖** | 关键 if 两方向显式验证 |
+| **87** | **安全测试** | 原型污染 + 输出注入(抓到 javascript: XSS 注入面) |
 | **88** | **稳定性/时间旅行/竞态** | 内存不增长/fake Date 确定性/并发原子写/内存缓存上限 |
 | **89** | **配置矩阵** | 2^10 组合 listfilter 不崩 |
 | **90** | **死代码检测** | 导出全被引用/内部 helper 都被调用 |
@@ -148,17 +148,17 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 | **98** | **异常路径批量** | 未知占位符保留/对象字段不崩/重定向循环停止/连接拒绝 ECONNREFUSED/timeout 归一 |
 | **99** | **边界精确值** | TS_BOUND 精确分界/normUrl 极端/pingbitime 0-极大-负数/编码大小写-超范围-代理区-NUL |
 | **100** | **审查项 #56/#65/#7/#链接** | img 空 src/url 换行/maxSize 校验/{链接} Markdown 安全化 |
-| **101** | **版本一致性** | 文件头 ↔ CHANGELOG ↔ package.json ↔ README 四方一致（防版本号过时） |
-| **102** | **配置防御/实体扩展** | cache.dir 非字符串回退/实体扩展(36 个)/href 换行剥离 |
+| **101** | **版本一致性** | 文件头 ↔ CHANGELOG 最新 ↔ package.json 三方一致（防版本号过时；README 不维护版本号，v3.169 起） |
+| **102** | **配置防御/实体扩展** | cache.dir 非字符串回退/实体映射扩展/href 换行剥离 |
 | **103** | **低风险修复批次** | R1-R6/R9：truncateUtf16 非法max/getFileName 非字符串/_splitLines <br\/\>/domain 防御/maxSize 整数化/retry 有界/原型键/url 三处统一/title 类型/zkt_gjc 对象防御（v3.106 第11轮审查 15 项） |
 
-**运行**:`node test_filter.js`(约 1.6s),退出码 0=全绿。
+**运行**:`node test_filter.js`,退出码 0=全绿。
 
 ---
 
-### `test_app.js` — 集成测试(约 86 个)
+### `test_app.js` — 集成测试
 
-**定位**:mock got/notify 验证 App.run 完整主流程(约 1595 行)。
+**定位**:mock got/notify 验证 App.run 完整主流程。
 
 **覆盖场景**:
 - 拉取→推送完整链路、缓存去重、空数据、字段归一化
@@ -174,13 +174,13 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 
 **机制**:在 require 主模块**前**替换 `require.cache` 的 got/notify(模块加载时引用固定,测试中再改无效——这是反复踩过的坑)。
 
-**运行**:`node test_app.js`(约 26s,含重试等待场景)。
+**运行**:`node test_app.js`(含重试等待场景)。
 
 ---
 
-### `test_notify.js` — 推送通道适配器测试(37 个)
+### `test_notify.js` — 推送通道适配器测试
 
-**定位**:mock got 验证各推送通道的**请求构造**(URL/body/headers/编码/设备分割),约 666 行。
+**定位**:mock got 验证各推送通道的**请求构造**(URL/body/headers/编码/设备分割)。
 
 **覆盖**:
 - Server酱:URL 含 key、表单 URL 编码、SCT 前缀走 Turbo 版
@@ -225,7 +225,7 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.159),每轮修复/重构/功能变更的摘要。
+版本演进记录(见 [CHANGELOG.md](CHANGELOG.md)),每轮修复/重构/功能变更的摘要。
 
 ---
 
@@ -243,7 +243,7 @@ push_config.local.js # 本地密钥(必须忽略!)
 
 ### `node_modules/got/index.js` — 自制精简 HTTP 模块
 
-**定位**:替代真实 got 的自制实现(约 100 行),被 git 追踪。
+**定位**:替代真实 got 的自制实现,被 git 追踪。
 
 **功能**:重定向(301/302/303/307/308)、JSON 自动解析、4xx/5xx 抛错带 response、超时(ETIMEDOUT)、.json() 方法、get/post。
 
