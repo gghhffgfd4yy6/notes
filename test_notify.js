@@ -16,6 +16,7 @@ let failHitokoto = false; // 一言接口失败开关（v3.73：验证 sendNotif
 let failHitokotoStruct = false; // 一言响应结构异常开关（v3.86：缺 hitokoto 字段）
 let failPost = false;     // got.post 失败开关（v3.75：验证失败日志不泄露密钥）
 let failWxpusher = false; // wxpusher API 失败开关（v3.154：code≠1000 应 reject 不静默）
+let failBiz = false;      // 全部通道 API 业务失败开关（v3.160：code≠成功 应 reject 不静默）
 require.cache[gotPath].exports = (url, options) => {
     gotCalls.push({ url, options });
     // 一言接口失败模拟：抛 Error（网络异常路径）
@@ -37,8 +38,29 @@ require.cache[gotPath].exports.post = (url, options) => {
     }
     // wxpusher 返回成功响应（v3.154：API 失败会 reject，成功需 code:1000）；其余 '{}'
     return { then: (res) => {
+        // v3.160：各通道 API 级失败会 reject → 成功响应需返回对应业务成功码（曾全 '{}' 因通道不检查）
+        const u = String(url);
         let body = '{}';
-        if (String(url).includes('wxpusher')) body = failWxpusher ? { code: 1300, msg: '推送失败' } : { code: 1000, msg: 'success' };
+        if (failBiz) {
+            // 全部通道 API 业务失败（HTTP 200 + 业务码非成功）
+            if (u.includes('wxpusher')) body = { code: 1300, msg: '推送失败' };
+            else if (u.includes('pushplus.plus')) body = { code: 500, msg: 'token 无效' };
+            else if (u.includes('ftqq.com')) body = { errno: 999, errmsg: 'key 无效' };
+            else if (u.includes('api.day.app')) body = { code: 500, message: 'deviceKey 无效' };
+            else if (u.includes('qyapi.weixin.qq.com')) body = { errcode: 40013, errmsg: 'invalid appid' };
+            else if (u.includes('xizhi.qqoq.net')) body = { code: 500, msg: 'key 无效' };
+            else if (u.includes('pushdeer.com')) body = { content: { result: [] } };
+            else if (u.includes('push.i-i.me')) body = 'error';
+            else if (u.includes('api.telegram.org')) body = { ok: false, error_code: 400, description: 'Bad Request' };
+        } else if (u.includes('wxpusher')) body = failWxpusher ? { code: 1300, msg: '推送失败' } : { code: 1000, msg: 'success' };
+        else if (u.includes('pushplus.plus')) body = { code: 200, msg: 'success' };
+        else if (u.includes('ftqq.com')) body = { errno: 0, errmsg: 'success' };
+        else if (u.includes('api.day.app')) body = { code: 200, message: 'success' };
+        else if (u.includes('qyapi.weixin.qq.com')) body = { errcode: 0, errmsg: 'ok' };
+        else if (u.includes('xizhi.qqoq.net')) body = { code: 200, msg: 'success' };
+        else if (u.includes('pushdeer.com')) body = { content: { result: [{ id: 1 }] } };
+        else if (u.includes('push.i-i.me')) body = 'success';
+        else if (u.includes('api.telegram.org')) body = { ok: true, result: {} };
         return res({ body, statusCode: 200, headers: {} });
     } };
 };
@@ -688,6 +710,33 @@ await test('wxpusher API 失败(code≠1000) → reject 不静默', () => withCh
     try { await notify.sendNotify('标题', '内容'); } catch (e) { rejected = true; }
     assert(rejected, 'wxpusher API 失败应 reject（主流程不写缓存，下次重试）');
     failWxpusher = false;
+}));
+
+// 19.5 其他 7 个通道 API 业务失败 → reject 不静默（v3.160：曾静默 resolve → 单通道用户消息永久丢失）
+await test('息知 API 失败(code≠200) → reject（v3.160）', () => withChannels(async () => {
+    cfg.WX_XIZHI_KEY = 'https://xizhi.qqoq.net/abc.send';
+    failBiz = true;
+    let rejected = false;
+    try { await notify.sendNotify('标题', '内容'); } catch (e) { rejected = true; }
+    assert(rejected, '息知 API 失败应 reject（主流程不写缓存，下次重试）');
+    failBiz = false;
+}));
+
+await test('全部 8 通道 API 业务失败 → 至少失败时 reject（v3.160：防假成功掩盖真失败）', () => withChannels(async () => {
+    cfg.PUSH_PLUS_TOKEN = 't';
+    cfg.PUSH_KEY = 'SCT123';
+    cfg.BARK_PUSH = 'https://api.day.app/k';
+    cfg.QYWX_KEY = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc';
+    cfg.WX_pusher_appToken = 't'; cfg.WX_pusher_topicIds = '1';
+    cfg.WX_XIZHI_KEY = 'https://xizhi.qqoq.net/abc.send';
+    cfg.DEER_KEY = 'k';
+    cfg.PUSHME_KEY = 'k';
+    cfg.TG_BOT_TOKEN = 't'; cfg.TG_USER_ID = 'u';
+    failBiz = true;
+    let rejected = false;
+    try { await notify.sendNotify('标题', '内容'); } catch (e) { rejected = true; }
+    assert(rejected, '全部通道 API 业务失败应 reject（防消息丢失）');
+    failBiz = false;
 }));
 
 if (failed === 0) {

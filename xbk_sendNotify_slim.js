@@ -243,6 +243,9 @@ function pushPlusNotify(text, desp) {
                                 `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                                 }通知消息异常 ${data.msg}\n`,
                             );
+                            // v3.160：API 级失败(code≠200) reject（与 wxpusher v3.154 同口径）——曾静默 resolve，
+                            // 单通道用户主流程写缓存 → 消息永久丢失
+                            reject(new Error(data && data.msg ? data.msg : 'Push+ 发送失败'));
                         }
                     }
                 } catch (e) {
@@ -294,10 +297,12 @@ function serverNotify(text, desp) {
                         if (errno === 0) {
                             console.log('Server 酱发送通知消息成功🎉\n');
                         } else if (errno === 1024) {
-                            // 一分钟内发送相同的内容会触发
+                            // 一分钟内发送相同的内容会触发（内容已送达，视为成功不重试）
                             console.log(`Server 酱发送通知消息异常 ${data.errmsg}\n`);
                         } else {
-                            console.log(`Server 酱发送通知消息异常 ${safeErr(data)}`);
+                            console.log(`Server 酱发送通知消息异常 ${safeErr(data)}\n`);
+                            // v3.160：API 级失败(errno≠0/1024) reject——曾静默 resolve 致单通道用户消息丢失
+                            reject(new Error(data && data.errmsg ? data.errmsg : 'Server酱 发送失败'));
                         }
                     }
                 } catch (e) {
@@ -373,6 +378,8 @@ function barkNotify(text, desp, params = {}) {
                                 console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`);
                             } else {
                                 console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${data.message}\n`);
+                                // v3.160：API 级失败(code≠200) reject——曾静默 resolve 致单通道用户消息丢失
+                                reject(new Error(data && data.message ? data.message : 'Bark 发送失败'));
                             }
                         }
                     } catch (e) {
@@ -432,6 +439,8 @@ function pushMeNotify(text, desp, params = {}) {
                                 console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 成功🎉\n`);
                             } else {
                                 console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${data}\n`);
+                                // v3.160：API 级失败(非 success) reject——曾静默 resolve 致单通道用户消息丢失
+                                reject(new Error(data && typeof data === 'string' ? data : 'PushMe 发送失败'));
                             }
                         }
                     } catch (e) {
@@ -478,6 +487,8 @@ function qywxBotNotify(text, desp) {
                             console.log('企业微信发送通知消息成功🎉。\n');
                         } else {
                             console.log(`企业微信发送通知消息异常 ${data.errmsg}\n`);
+                            // v3.160：API 级失败(errcode≠0) reject——曾静默 resolve 致单通道用户消息丢失
+                            reject(new Error(data && data.errmsg ? data.errmsg : '企业微信 发送失败'));
                         }
                     }
                 } catch (e) {
@@ -582,6 +593,8 @@ function wxXiZhiNotify(text, desp) {
                             console.log(`息知发送通知消息异常 \n`);
                             // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数）
                             console.log(data && data.msg ? data.msg : JSON.stringify(data).slice(0, 200));
+                            // v3.160：API 级失败(code≠200) reject——曾静默 resolve 致单通道用户消息永久丢失
+                            reject(new Error(data && data.msg ? data.msg : '息知 发送失败'));
                         }
                     }
                 } catch (e) {
@@ -626,8 +639,10 @@ function pushDeerNotify(text, desp) {
                             console.log('PushDeer 发送通知消息成功🎉\n');
                         } else {
                             console.log(
-                                `PushDeer 发送通知消息异常😞 ${safeErr(data)}`,
+                                `PushDeer 发送通知消息异常😞 ${safeErr(data)}\n`,
                             );
+                            // v3.160：API 级失败(result 空) reject——曾静默 resolve 致单通道用户消息丢失
+                            reject(new Error('PushDeer 发送失败'));
                         }
                     }
                 } catch (e) {
@@ -689,6 +704,8 @@ function tgNotify(text, desp) {
                             console.log('Telegram 发送通知消息成功🎉\n');
                         } else {
                             console.log(`Telegram 发送通知消息异常 ${safeErr(data)}\n`);
+                            // v3.160：API 级失败(ok≠true) reject——曾静默 resolve 致单通道用户消息丢失
+                            reject(new Error(data && data.description ? data.description : 'Telegram 发送失败'));
                         }
                     }
                 } catch (e) {
