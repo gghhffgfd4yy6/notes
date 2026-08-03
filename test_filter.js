@@ -4066,32 +4066,42 @@ await test('快照: tuisong_replace 多字段', () => {
 // ==================== 85. 性能基准(防性能回归) ====================
 console.log('\n📂 85. 性能基准(防性能回归)');
 
-await test('基准: htmlToMarkdown 1000次 < 500ms', () => {
-    const t0 = Date.now();
-    for (let i = 0; i < 1000; i++) {
-        htmlToMarkdown({ content_html: '<h2>标题</h2><p>段</p><a href="http://u">链</a><img src="p.jpg" alt="图">', url: 'http://x' });
+// v3.175：基准测试负载容错——瞬时系统负载（CI 2核/并行残留进程）可能偶发超时误报，
+// 首次超时重跑一次（排除瞬时负载）；真实性能回归两次都超时仍会红（保留检测力）
+function benchRetry(fn, limitMs, label) {
+    let elapsed = Infinity;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const t0 = Date.now();
+        fn();
+        elapsed = Date.now() - t0;
+        if (elapsed < limitMs) break;
     }
-    const elapsed = Date.now() - t0;
-    assertEqual(elapsed < 500, true, `1000次htmlToMarkdown 耗时 ${elapsed}ms(应<500ms)`);
+    assertEqual(elapsed < limitMs, true, `${label} 耗时 ${elapsed}ms(应<${limitMs}ms)`);
+}
+
+await test('基准: htmlToMarkdown 1000次 < 500ms', () => {
+    benchRetry(() => {
+        for (let i = 0; i < 1000; i++) {
+            htmlToMarkdown({ content_html: '<h2>标题</h2><p>段</p><a href="http://u">链</a><img src="p.jpg" alt="图">', url: 'http://x' });
+        }
+    }, 500, '1000次htmlToMarkdown');
 });
 
 await test('基准: tuisong_replace 1000次 < 300ms', () => {
-    const t0 = Date.now();
-    const data = { title: 'T', content: 'C', content_html: '<b>x</b>', category_name: '分类', url: '/a', posttime: 1785346200 };
-    for (let i = 0; i < 1000; i++) {
-        tuisong_replace('【{分类名}】{标题}\n{Markdown内容}', data);
-    }
-    const elapsed = Date.now() - t0;
-    assertEqual(elapsed < 300, true, `1000次tuisong_replace 耗时 ${elapsed}ms(应<300ms)`);
+    benchRetry(() => {
+        const data = { title: 'T', content: 'C', content_html: '<b>x</b>', category_name: '分类', url: '/a', posttime: 1785346200 };
+        for (let i = 0; i < 1000; i++) {
+            tuisong_replace('【{分类名}】{标题}\n{Markdown内容}', data);
+        }
+    }, 300, '1000次tuisong_replace');
 });
 
 await test('基准: listfilter 5000次 < 500ms', () => {
-    const cfg = compileRules({ pingbibiaoti: '京东', pingbilouzhu: '微博###小明', pingbitime: '5' });
-    const group = { catename: '微博线报', louzhu: '小明', title: '京东神券', content: '大促', louzhuregtime: '2026-01-01' };
-    const t0 = Date.now();
-    for (let i = 0; i < 5000; i++) listfilter(group, cfg);
-    const elapsed = Date.now() - t0;
-    assertEqual(elapsed < 500, true, `5000次listfilter 耗时 ${elapsed}ms(应<500ms)`);
+    benchRetry(() => {
+        const cfg = compileRules({ pingbibiaoti: '京东', pingbilouzhu: '微博###小明', pingbitime: '5' });
+        const group = { catename: '微博线报', louzhu: '小明', title: '京东神券', content: '大促', louzhuregtime: '2026-01-01' };
+        for (let i = 0; i < 5000; i++) listfilter(group, cfg);
+    }, 500, '5000次listfilter');
 });
 
 // ==================== 86. 分支覆盖显式验证(关键if两方向) ====================
