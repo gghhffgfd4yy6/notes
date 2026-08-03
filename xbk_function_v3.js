@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.176 — 系统级审查修复：①cache.maxSize字符串配置静默回退(validateConfig称合法但saveMessages按10000裁剪,唯一漏网Utils.num点)②批内判重与跨运行判重口径对齐(_findDedupIndex双向url fallback,曾同批id-ful/无id同url双推)③日报发送失败今日数据错标进昨日日报(新增pending暂存)④getFilePath对象文件名防御+test_filter参数颠倒修复(残留[object Object]垃圾文件)⑤垃圾url('#'/'?x=1')归一为空误判重→补anonKey⑥anonKey补louzhu⑦通道key数字型TypeError防御(server酱/bark/pushMe)⑧run.log时间戳本地化(与日报/告警口径一致)⑨badElement不再双计filteredCount⑩report补truncated⑪默认屏蔽美妆外置(用户配置不再硬编码) ********
+//******** 线报酷推送脚本 v3.178 — 系统验证结论落地：①safeSlice 与 truncateUtf16 对齐(补ZWJ/VS16/组合字符退位,wxpusher summary/TG截断不再拆散家庭emoji,§12-2/§12-4重复实现收敛)②run.log 1MB截断UTF-8半字符修复(代理对边界退位,§10-C)③got重定向响应体resume消费(keep-alive连接归还,§10-D) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1388,7 +1388,13 @@ const App = {
             const st = fs.statSync(logPath);
             if (st.size > 1024 * 1024) {
                 const all = fs.readFileSync(logPath, 'utf8');
-                const trimmed = all.slice(-512 * 1024);
+                let trimmed = all.slice(-512 * 1024);
+                // v3.178：slice 可能切在代理对中间（首字符为孤立低代理/尾字符为孤立高代理）→
+                // 写回后文件含非法 UTF-8 序列，下次读取显示 U+FFFD（§10-C）——退位到完整字符
+                const first = trimmed.charCodeAt(0);
+                if (first >= 0xDC00 && first <= 0xDFFF) trimmed = trimmed.slice(1); // 开头孤立低代理（高代理被切掉）
+                const last = trimmed.charCodeAt(trimmed.length - 1);
+                if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1); // 结尾孤立高代理（低代理被切掉）
                 const nl = trimmed.indexOf('\n');
                 fs.writeFileSync(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed, 'utf8');
             }
@@ -1739,8 +1745,12 @@ const App = {
                 if (rawClean.includes('原文链接') && !desp.includes('原文链接') && pushItem.url) {
                     const link = `原文链接：[${pushItem.url}](<${pushItem.url}>)`;
                     // 链接本身超过 contentMax 时不保留（尊重截断配置）；否则内容截短补链接（仍 ≤ contentMax）
-                    if (link.length < contentMax) {
-                        desp = Utils.truncateUtf16(desp, contentMax - link.length - 2) + '\n\n' + link;
+                    // v3.177：边界修正——link 接近 contentMax 时 contentMax-link-2 曾 ≤0，truncateUtf16 对非正
+                    // max 返回原串 → desp 全量+链接显著超限（系统验证反证 #3）；改为「链接+分隔符完整容纳
+                    // 才补」+ keep≥0 保证总长 ≤ contentMax
+                    if (link.length + 2 <= contentMax) {
+                        const keep = contentMax - link.length - 2;
+                        desp = Utils.truncateUtf16(desp, keep) + '\n\n' + link;
                     }
                 }
                 try {

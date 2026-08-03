@@ -493,6 +493,21 @@ await test('safeSlice: 代理对安全截断', () => {
     assert(safeSlice('中文😀混合', 3) === '中文', '中文后截断');
 });
 
+await test('safeSlice: ZWJ/VS16/组合字符退位（v3.178 §12-2 与 truncateUtf16 对齐）', () => {
+    const { safeSlice } = notify;
+    // 家庭 emoji（👨 ZWJ 👩 ZWJ 👧 ZWJ 👦）截断到 5 → 完整前两个，无孤立 ZWJ
+    const fam = '👨👩👧👦';
+    const r1 = safeSlice(fam, 5);
+    assert(r1 === '👨👩', `max=5 → 完整前两个: ${JSON.stringify(r1)}`);
+    assert(!r1.includes('\u200D'), '无孤立 ZWJ');
+    // ❤️（❤+VS16）max=1 → 保守退空
+    assert(safeSlice('❤️', 1) === '', 'VS16 序列 max=1 → 退空');
+    // e + 组合重音 max=1 → 退空
+    assert(safeSlice('e\u0301', 1) === '', '组合字符 max=1 → 退空');
+    // 正常代理对行为不变
+    assert(safeSlice('😀😀', 2) === '😀', '双 emoji 完整保留');
+});
+
 await test('wxpusher summary 代理对安全（v3.147）', () => withChannels(async () => {
     cfg.WX_pusher_appToken = 'AT123';
     cfg.WX_pusher_topicIds = '456';

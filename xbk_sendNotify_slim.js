@@ -19,16 +19,28 @@ function maskUrl(u) {
 }
 // 代理对安全截断（v3.147）：按码元截断但不切断 emoji——末尾高代理退一位、孤立低代理退一位
 // （Server酱 v3.126 只处理高代理；此处统一高/低代理，wxpusher summary 复用）
+// v3.178：与主代码 truncateUtf16 对齐——补 ZWJ/变体选择符/组合字符退位（wxpusher summary/TG 截断
+// 曾拆散 👨👩👧👦 家庭 emoji、❤️ 丢 VS16；§12-2 重复实现收敛）
 function safeSlice(s, max) {
     let str;
     try { str = String(s === undefined || s === null ? '' : s); } catch (e) { str = ''; }
     if (str.length <= max) return str;
     let cut = str.slice(0, max);
-    const last = cut.charCodeAt(cut.length - 1);
-    if (last >= 0xD800 && last <= 0xDBFF) return cut.slice(0, -1); // 孤立高代理
-    if (last >= 0xDC00 && last <= 0xDFFF) {
-        const prev = cut.charCodeAt(cut.length - 2);
-        if (!(prev >= 0xD800 && prev <= 0xDBFF)) return cut.slice(0, -1); // 孤立低代理
+    const isModifier = (c) => c === 0x200D || (c >= 0xFE00 && c <= 0xFE0F)
+        || (c >= 0x0300 && c <= 0x036F) || (c >= 0x1AB0 && c <= 0x1AFF) || (c >= 0x1DC0 && c <= 0x1DFF)
+        || (c >= 0x20D0 && c <= 0x20FF) || (c >= 0xFE20 && c <= 0xFE2F);
+    while (cut.length > 0) {
+        const last = cut.charCodeAt(cut.length - 1);
+        if (last >= 0xD800 && last <= 0xDBFF) { cut = cut.slice(0, -1); continue; } // 孤立高代理
+        if (last >= 0xDC00 && last <= 0xDFFF) {
+            const prev = cut.charCodeAt(cut.length - 2);
+            if (!(prev >= 0xD800 && prev <= 0xDBFF)) { cut = cut.slice(0, -1); continue; } // 孤立低代理
+            break; // 配对完整
+        }
+        if (last === 0x200D) { cut = cut.slice(0, -1); continue; } // 末尾孤立 ZWJ
+        const next = str.charCodeAt(cut.length);
+        if (isModifier(next)) { cut = cut.slice(0, -1); continue; } // 截断点后是修饰符 → 退位
+        break;
     }
     return cut;
 }
@@ -694,11 +706,10 @@ function tgNotify(text, desp) {
             const tgText = mdToPlain(text, false);
             const tgDesp = mdToPlain(desp, false); // v3.136：TG 保留 < >（HTML 转义），不剥 autolink
             const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            // v3.139：TG 消息上限 4096 字符——内容超长截断（字符截断+代理对安全）
+            // v3.139：TG 消息上限 4096 字符——内容超长截断（v3.178：统一 safeSlice——曾内联只处理
+            // 高代理，孤立低代理/ZWJ/VS16 会残留乱码；§12-4 重复实现收敛）
             const tgFull = esc(tgDesp ? `${tgText}\n\n${tgDesp}` : tgText);
-            const tgCut = tgFull.length > 4000 ? tgFull.slice(0, 4000) : tgFull;
-            const tgLast = tgCut.charCodeAt(tgCut.length - 1);
-            const tgSafe = (tgLast >= 0xD800 && tgLast <= 0xDBFF) ? tgCut.slice(0, -1) : tgCut;
+            const tgSafe = tgFull.length > 4000 ? safeSlice(tgFull, 4000) : tgFull;
             const options = {
                 url: `${String(TG_API_HOST || 'https://api.telegram.org').replace(/\/+$/, '')}/bot${TG_BOT_TOKEN}/sendMessage`, // v3.138：去尾斜杠防双斜杠
                 json: {

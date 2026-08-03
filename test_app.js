@@ -1102,6 +1102,32 @@ await test('长 desp 截断保留原文链接（v3.152）', async () => {
     assert(d.includes('原文链接'), `截断后原文链接应保留: 尾部 ${JSON.stringify(d.slice(-30))}`);
 });
 
+await test('desp 链接补回极端 contentMax 不超限（v3.177 边界修正）', async () => {
+    reset();
+    setPushUrl('t61b_linkkeep_edge');
+    const origContentMax = Config.push.contentMax;
+    try {
+        // contentMax 略大于链接长度：曾 contentMax-link-2 ≤0 → truncateUtf16 返回原串 → desp 全量+链接超限
+        Config.push.contentMax = 90; // 链接(81)+2 分隔符=83 ≤ 90 → 应补且总长 ≤ 90
+        fakeData = [makeItem({ id: 1, content_html: '<p>' + '很长内容'.repeat(30) + '</p>' })];
+        await xbk.run();
+        const d = pushCalls[0].desp;
+        assert(d.length <= 90, `极端 contentMax=90 时 desp 应 ≤90: 实际 ${d.length}`);
+        assert(d.includes('原文链接'), '链接应保留');
+        assert(d.endsWith(')'), 'desp 应以链接结尾');
+        // contentMax 太小（链接都放不下）→ 不补链接，尊重截断配置
+        reset();
+        setPushUrl('t61c_linkkeep_tiny');
+        Config.push.contentMax = 10;
+        fakeData = [makeItem({ id: 1, content_html: '<p>' + '很长内容'.repeat(30) + '</p>' })];
+        await xbk.run();
+        const d2 = pushCalls[0].desp;
+        assert(d2.length <= 10, `contentMax=10 时 desp 应 ≤10: 实际 ${d2.length}`);
+    } finally {
+        Config.push.contentMax = origContentMax;
+    }
+});
+
 await test('推送截断长度可配置 + 非法回退默认（v3.69）', async () => {
     reset();
     setPushUrl('t49_trunc');

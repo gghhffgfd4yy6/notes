@@ -588,3 +588,18 @@
 - **#9 统计口径**：非对象元素不再双计 filteredCount（「过滤屏蔽」专指规则过滤）；日报 state 补 truncated 字段（曾只有 run.log 有）
 - **#10 默认配置外置**：`pingbifenlei: '美妆'`（个人过滤配置）不再硬编码进默认 Config——克隆用户曾意外继承屏蔽；需屏蔽请自行配置
 - 测试：test_filter Fuzz-IO 断言纠正 +1；test_app 补「批内 id-ful/无 id 同 url 双推修复」「垃圾 url 批内判重」「maxSize 字符串生效」锁定
+
+## v3.177（系统验证反证修复：desp 链接补回极端 contentMax 边界）
+
+- **#11 desp 链接补回在极端 contentMax 下超限**（系统验证反证 #3 发现）：`contentMax` 配置接近链接长度时（`link.length < contentMax` 但 `contentMax - link.length - 2 ≤ 0`），`truncateUtf16(desp, 非正数)` 防御性返回原串 → desp 全量 + 原文链接 → 推送总长显著超 contentMax（实测 contentMax=46、链接 81 时…边界窗口为 link ∈ [contentMax-1, contentMax)）
+- **修复**：补链接条件改为「链接+`\n\n` 分隔符完整容纳才补」（`link.length + 2 <= contentMax`）+ `keep ≥ 0` 保证补回后总长 ≤ contentMax；链接放不下时保持原有「尊重截断配置不补」语义
+- **系统验证（反证）**：①批内判重（三索引）与 `_findDedupIndex` 语义 800 轮随机属性测试**完全等价（0 失配）**——含垃圾 url/anonKey/id 类型漂移边界 ②缓存不变量 500 轮随机模拟成立：成功必缓存/失败不缓存/截断不缓存/过滤必缓存 + 缓存条目自洽命中
+- 测试：test_app +1（t61b 极端 contentMax 补链接不超限 + t61c 链接放不下不补），97/97；656+97+41=794 全绿
+
+## v3.178（系统验证结论落地：safeSlice 对齐 / run.log 半字符 / got 重定向连接）
+
+- **#12 safeSlice 与 truncateUtf16 对齐（§12-2/§12-4 重复实现收敛）**：wxpusher summary/TG 消息截断用的 safeSlice 只保护代理对，主代码 truncateUtf16 已扩展 ZWJ/变体选择符/组合字符保护——通道层截断仍会拆散 `👨👩👧👦`（孤立 ZWJ）、丢 `❤️` 的 VS16；safeSlice 补同款循环退位（代理对 + 末尾 ZWJ + 截断点后修饰符），tgNotify 内联截断（只查高代理，孤立低代理残留）统一改调 safeSlice——三处通道截断行为一致
+- **#13 run.log 1MB 截断 UTF-8 半字符（§10-C）**：`all.slice(-512KB)` 可能切在代理对中间（首字符孤立低代理/尾字符孤立高代理）→ 写回文件含非法 UTF-8 序列，下次读取显示 U+FFFD；截断后做代理对边界退位
+- **#14 got 重定向响应体未消费（§10-D）**：301/302 分支 resolve 前 `res.resume()`——不消费则 keep-alive 连接不归还连接池，长连接场景连接数缓慢累积
+- 决策记录：**多实例并发双推（§10-A）不修**——系统设计假设单实例（无进程锁），多实例需 lockfile 属新增架构能力；**推送超时歧义（§11-1）/whitelistFilter 契约（§12-1）/anonKey 版本化（§11-2）/末条 pushInterval（§11-4）/日报无限频（§11-5）不修**——改动大或收益低或属锁定契约
+- 测试：test_notify +1（safeSlice ZWJ/VS16/组合字符退位），42/42；656+97+42=795 全绿
