@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.161 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；768全绿(643+86+39) ********
+//******** 线报酷推送脚本 v3.162 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；768全绿(643+86+39) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1261,7 +1261,7 @@ const Network = {
             try {
                 // retry: { limit: 0 } 关闭 got 内置重试，完全交给外层手写逻辑
                 return await got(Config.api.pushUrl, {
-                    timeout: Config.api.timeout,
+                    timeout: Utils.num(Config.api.timeout, 5000), // v3.162：字符串'5000'→5000（v3.158 转换 7 处漏了 timeout，曾回退 15s）
                     retry: { limit: 0 },
                     headers: {
                         'User-Agent': `xbk-push-script/${PKG_VERSION}`,

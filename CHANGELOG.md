@@ -449,3 +449,11 @@
 - 测试：test_app t68（pingbitime 变更 → 清除 _f → 放宽重推）；变异锁定
 
 **769 个全绿（单元 643 + 集成 87 + 通道 39）**
+
+## v3.162（#8：api.timeout 字符串配置生效）
+
+- #8（BUG_HUNT）：v3.158 用 Utils.num 转换 7 处数值配置，漏了 api.timeout——字符串 '5000' 曾原样传 got，Number.isFinite 失败回退 15s（超时等待 3×15s=45s，cron 可能重叠）
+- 修复：fetchData `timeout: Utils.num(Config.api.timeout, 5000)`（与 retry 同款转换）
+- 测试：test_app t69（字符串 timeout → got 收到 5000）；变异锁定
+
+**770 个全绿（单元 643 + 集成 88 + 通道 39）**

@@ -1723,6 +1723,21 @@ await test('pingbitime 变更 → 清除过滤写入缓存并重推（#7 v3.161�
     }
 });
 
+await test('api.timeout 字符串配置生效（#8 v3.162）', async () => {
+    reset();
+    setPushUrl('t69_timeout_str');
+    const orig = Config.api.timeout;
+    try {
+        Config.api.timeout = '5000'; // 环境变量字符串（曾回退 15s）
+        fakeData = [makeItem({ id: 1 })];
+        await xbk.run();
+        const call = gotCalls.find(c => c.url.includes('t69_timeout_str'));
+        assert(call && call.opts && call.opts.timeout === 5000, `字符串 timeout 应生效为 5000: ${call && call.opts && call.opts.timeout}`);
+    } finally {
+        Config.api.timeout = orig;
+    }
+});
+
 await test('pingbitime 配置 + 接口缺 louzhuregtime → 运行期警告（v3.159）', async () => {
     reset();
     setPushUrl('t67_pingbtime_warn');
