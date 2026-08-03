@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.164 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；768全绿(643+86+39) ********
+//******** 线报酷推送脚本 v3.165 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；778全绿(648+91+39) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1564,7 +1564,7 @@ const App = {
             filteredCount += (beforeKwd - items.length);
 
             // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/8 分钟运行；正常 ~20 条无影响）
-            const maxPerRun = (() => { const v = Utils.num(Config.push.maxPerRun, 100); return v > 0 ? v : 100; })();
+            const maxPerRun = (() => { const v = Utils.num(Config.push.maxPerRun, 100); return v > 0 ? Math.floor(v) : 100; })(); // v3.165: Math.floor 整数化（parallelLimit v3.121 同款——小数'2.5'曾 truncatedCount 减出 0.5 条）
             let truncatedKeys = new Set();
             if (items.length > maxPerRun) {
                 truncatedCount = items.length - maxPerRun;

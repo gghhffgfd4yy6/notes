@@ -473,3 +473,11 @@
 - 测试：test_app t71（sendNotify 延迟 50ms 模拟网络，run 返回时告警已完成）；变异锁定
 
 **775 个全绿（单元 646 + 集成 90 + 通道 39）**
+
+## v3.165（maxPerRun 整数化 + 自制 got 挂起修复 #11）
+
+- **maxPerRun 整数化**：加 `Math.floor`（parallelLimit v3.121 同款）——小数配置（如环境变量字符串 `'2.5'`）曾让 `truncatedCount` 统计出 0.5 条；默认 100 与非法值回退零变更；test_app t70b 锁定
+- **#11 自制 got 挂起修复**：a) `res` 补监听 `'aborted'/'error'` → 响应传输中断快速 reject（曾永久挂起——只监听 data/end，'end' 不触发 promise 永不 settle，fetchData 挂起 → cron 永久卡死）；b) 总时长超时 `timeout×3`（曾只有 Node 空闲超时——慢流间隔<timeout 永不触发，响应无限拖）各完成路径 clearTimeout
+- 测试：test_filter 97 章 +2（响应中断 aborted 快速 reject 37ms / 慢流总时长超时 732ms）；变异验证（总时长 ×3→×30 测试红 ✓，aborted/error 双监听互兜底=等价变异）
+
+**778 个全绿（单元 648 + 集成 91 + 通道 39）**

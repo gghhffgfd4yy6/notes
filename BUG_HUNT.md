@@ -1,7 +1,7 @@
 # 🐛 真实 Bug 评估与修复记录（BUG_HUNT）
 
 > 曾收录**未修复**的、真实触发、有实际影响（非边缘/罕见/理论/企业级）的 bug，每项经**真实验证**。
-> **10 项已修复（v3.164，2026-08-03）**——下方每项标注状态、修复方式与验证结果。
+> **11 项已修复（v3.165，2026-08-03）**——下方每项标注状态、修复方式与验证结果。
 
 ---
 
@@ -138,6 +138,19 @@
 - **修复（v3.164）**：`_sendAlert` 返回 promise（Pusher.send 链），`App.run` catch `await this._sendAlert(errMsg)` 后再 throw（exit 前告警送达）；test_app t71 锁定（sendNotify 延迟 50ms 模拟网络）+ 变异验证
 - **验证**：`run` reject 返回耗时 149ms（等告警完成）；变异（去掉 await）→ t71 红 ✓
 
+## 11. 自制 got：响应中断永久挂起 + 慢流超时形同虚设（挂起问题）✅ 已修复（v3.165）
+
+- **触发场景**：A) 接口响应传输中断（服务器写部分响应后断开连接——网络抖动/代理断连/服务器异常）；B) 服务器慢流响应（每 2s 发 1 字节，间隔 < timeout）
+- **根因**：`node_modules/got/index.js` 的 `request()` 只监听 `res` 的 `'data'/'end'`——**未监听 `'aborted'/'error'`** → 响应中断时 `'end'` 不触发、promise 永不 settle（永久挂起）；且 `req.on('timeout')` 是 Node **空闲超时**语义——慢流（间隔 < timeout）时 socket 不空闲、timeout 事件永不触发（总时长超时形同虚设）
+- **真实验证**（2026-08-03，本地 HTTP server）：
+  ```
+  A) 服务器 200 + 写部分响应 + 20ms 后 res.destroy() → got(timeout=3000) 40s 无 resolve/reject（永久挂起）
+  B) 服务器每 2s 发 1 字节（timeout=3000）→ 3.5s 未 settle，实际 8051ms 才完成（timeout 未生效）
+  ```
+- **风险**：A) `fetchData` 挂起（无兜底）→ 主流程永久卡死 → cron 无限挂起/重叠 → 推送停滞（**影响所有通道**——got 是所有请求的基础）；B) 慢接口 → 单次运行时间不可控 → cron 5 分钟可能被单次运行打满（推送通道有 Pusher.send 10s 超时兜底，fetchData 无）
+- **修复（v3.165）**：a) `res` 补监听 `'aborted'/'error'` → 响应中断快速 reject（不挂起）；b) 总时长超时 `timeout×3`（覆盖连接+响应全程，非空闲超时）；各完成路径 clearTimeout（防泄漏）
+- **验证**：响应中断 37ms reject ✓（曾 40s 挂起）；慢流（间隔100ms<timeout200ms）732ms 总时长超时 reject ✓（曾无限拖）；变异（总时长 ×3→×30）→ 慢流测试红 ✓；aborted/error 双监听互兜底（单监听变异=等价）✓；test_filter 97 章 +2
+
 ---
 
 ## 附：验证方法（可复现）
@@ -152,10 +165,9 @@ node -e "const x=require('./xbk_function_v3.js');x.fetchData().then(d=>{const c=
 ---
 
 ## 状态说明
-- 十个候选均**真实验证触发**、风险明确、收益中-高、修复难度低-中
-- **v3.163 已修复 9 项**（2026-08-03），修复顺序：1（wxpusher 当前唯一通道，易触发）→ 2（配置变更体验，缓存语义）→ 3（配置无效无提示）→ 4（格式统一）→ 5（模板配置提示）→ 6（7 通道 API 业务失败静默 → 消息丢失）→ 7（filterHash 漏 pingbitime，改宽不重推）→ 8（v3.158 漏 timeout 字符串转换）→ 9（推送失败无告警 + exit 0）
-- **#10 已修复**（v3.164）：接口异常告警被 `process.exit(1)` 杀死——`_sendAlert` 返回 promise + App.run catch await，exit 前送达
-- 测试：test_app +5（t67 过滤变更/pingbitime 警告/占位符警告 + t68 pingbitime 变更重推 + t69 timeout 字符串）、test_notify +4（wxpusher HTML/autolink + v3.160 息知失败/全通道失败）、test_filter +3（M1/M2/M3 盲区锁定）——**774 全绿**
+- 十一个候选均**真实验证触发**、风险明确、收益中-高、修复难度低-中
+- **v3.165 已修复 11 项**（2026-08-03），修复顺序：1（wxpusher 当前唯一通道，易触发）→ 2（配置变更体验，缓存语义）→ 3（配置无效无提示）→ 4（格式统一）→ 5（模板配置提示）→ 6（7 通道 API 业务失败静默 → 消息丢失）→ 7（filterHash 漏 pingbitime，改宽不重推）→ 8（v3.158 漏 timeout 字符串转换）→ 9（推送失败无告警 + exit 0）→ 10（接口异常告警被 process.exit 杀死）→ 11（自制 got 响应中断挂起 + 慢流超时形同虚设）
+- 测试：test_app +6（t67/t68/t69/t70/t70b/t71）、test_notify +4、test_filter +5（M1/M2/M3 盲区 + 2 got 挂起修复）——**778 全绿**（v3.165）
 
 ## 4b. 真实验证补充（非 bug，记录排除）
 

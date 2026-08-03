@@ -1613,6 +1613,28 @@ await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () 
     }
 });
 
+await test('maxPerRun 小数配置 → truncated 整数化（v3.165，parallelLimit 同款 Math.floor）', async () => {
+    reset();
+    setPushUrl('t70b_maxperrun_float');
+    const orig = Config.push.maxPerRun;
+    try {
+        Config.push.maxPerRun = '2.5'; // 环境变量字符串 + 小数（曾 truncatedCount 减出 0.5 条）
+        fakeData = [];
+        for (let i = 0; i < 5; i++) fakeData.push(makeItem({ id: i + 4000 }));
+        const summary = await xbk.run();
+        assert(Number.isInteger(summary.truncated), `truncated 应为整数: ${JSON.stringify(summary)}`);
+        assert(summary.truncated === 3, `5 条 - 2 条 = 截断 3: ${JSON.stringify(summary)}`);
+        assert(summary.pushed === 2, `应推 2 条: ${JSON.stringify(summary)}`);
+        // 非法值仍回退默认
+        Config.push.maxPerRun = 'abc';
+        fakeData = [{ id: 1, title: 'T', content: 'c', catename: 'c', url: 'https://x.com/1', datetime: '2026-08-03', shijianchuo: 1785734400, content_html: '<p>c</p>' }];
+        const s2 = await xbk.run();
+        assert(s2.pushed === 1 && s2.truncated === 0, `非法 maxPerRun 回退默认不截断: ${JSON.stringify(s2)}`);
+    } finally {
+        Config.push.maxPerRun = orig;
+    }
+});
+
 
 await test('告警/日报触发时通道失败 → 无 unhandledRejection（v3.135）', async () => {
     reset();

@@ -4698,6 +4698,49 @@ await test('got: 响应体超限(maxBody) → 报 EBODYLIMIT 不无限读入', a
     }
 });
 
+await test('got: 响应中断(aborted) → 快速 reject 不挂起（#11 v3.165）', async () => {
+    const http = require('http');
+    const got = require('got');
+    const server = http.createServer((req, res) => {
+        res.writeHead(200);
+        res.write('partial');
+        setTimeout(() => res.destroy(), 20); // 写部分后断开（响应中断）
+    });
+    await new Promise(r => server.listen(0, r));
+    const t0 = Date.now();
+    try {
+        let caught = null;
+        try { await got(`http://127.0.0.1:${server.address().port}/x`, { timeout: 3000 }); }
+        catch (e) { caught = e; }
+        assertEqual(!!caught, true, '响应中断应 reject');
+        assertEqual(Date.now() - t0 < 2000, true, '应快速 reject 不挂起（曾永久挂起）');
+    } finally {
+        await new Promise(r => server.close(r));
+    }
+});
+
+await test('got: 慢流响应按总时长超时（#11 v3.165，空闲超时不触发）', async () => {
+    const http = require('http');
+    const got = require('got');
+    const server = http.createServer((req, res) => {
+        res.writeHead(200);
+        let i = 0;
+        const iv = setInterval(() => { res.write('x'); if (++i > 20) { clearInterval(iv); res.end(); } }, 100);
+    });
+    await new Promise(r => server.listen(0, r));
+    const t0 = Date.now();
+    try {
+        let caught = null;
+        try { await got(`http://127.0.0.1:${server.address().port}/x`, { timeout: 200 }); }
+        catch (e) { caught = e; }
+        // 总时长 = timeout×3 = 600ms 强制超时（间隔100ms<200ms 空闲超时不触发，曾无限拖）
+        assertEqual(caught && caught.code === 'ETIMEDOUT', true, '慢流应总时长超时');
+        assertEqual(Date.now() - t0 < 2000, true, `应在总时长内 reject（曾无限拖），耗时 ${Date.now() - t0}ms`);
+    } finally {
+        await new Promise(r => server.close(r));
+    }
+});
+
 await test('got: 超时抛 ETIMEDOUT', async () => {
     const http = require('http');
     const got = require('got');
