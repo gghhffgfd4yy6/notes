@@ -2628,7 +2628,7 @@ await test('tuisong {Html内容} 链接文本是URL本身', () => {
 });
 
 await test('Config.filter 各字段默认值', () => {
-    assertEqual(Config.filter.pingbifenlei, '');
+    assertEqual(Config.filter.pingbifenlei, '美妆'); // v3.168：用户配置默认屏蔽美妆分类
     assertEqual(Config.filter.pingbibiaoti, '');
     assertEqual(Config.filter.zhanxianbiaoti, '');
     assertEqual(Config.filter.pingbineirong, '');

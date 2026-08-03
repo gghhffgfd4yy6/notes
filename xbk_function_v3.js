@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.167 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；781全绿(648+92+41) ********
+//******** 线报酷推送脚本 v3.168 — 用户配置：默认屏蔽美妆分类（pingbifenlei='美妆'，正则匹配分类名）；781全绿(648+92+41) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -30,7 +30,7 @@ const Config = {
     },
 
     filter: {
-        pingbifenlei: '',
+        pingbifenlei: '美妆', // 屏蔽分类（正则匹配分类名，2026-08-03 用户配置：屏蔽美妆分类）
         pingbibiaoti: '',
         zhanxianbiaoti: '',
         pingbibiaotiplus: '',
