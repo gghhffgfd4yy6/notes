@@ -17,6 +17,8 @@ let failHitokotoStruct = false; // 一言响应结构异常开关（v3.86：缺 
 let failPost = false;     // got.post 失败开关（v3.75：验证失败日志不泄露密钥）
 let failWxpusher = false; // wxpusher API 失败开关（v3.154：code≠1000 应 reject 不静默）
 let failBiz = false;      // 全部通道 API 业务失败开关（v3.160：code≠成功 应 reject 不静默）
+let failMDevSecond = false; // v3.166：Bark/PushMe 多设备第 2 个失败（至少一个成功=通道成功不重试）
+let mdevCount = 0;          // 多设备计数（failMDevSecond 时按调用序第 1 成功第 2 失败）
 require.cache[gotPath].exports = (url, options) => {
     gotCalls.push({ url, options });
     // 一言接口失败模拟：抛 Error（网络异常路径）
@@ -41,7 +43,12 @@ require.cache[gotPath].exports.post = (url, options) => {
         // v3.160：各通道 API 级失败会 reject → 成功响应需返回对应业务成功码（曾全 '{}' 因通道不检查）
         const u = String(url);
         let body = '{}';
-        if (failBiz) {
+        if (failMDevSecond) {
+            // v3.166：多设备部分失败——第 1 个设备成功、第 2 个失败（应至少一个成功=通道成功）
+            mdevCount++;
+            if (u.includes('api.day.app')) body = mdevCount === 1 ? { code: 200, message: 'success' } : { code: 500, message: 'bad key' };
+            else if (u.includes('push.i-i.me')) body = mdevCount === 1 ? 'success' : 'error';
+        } else if (failBiz) {
             // 全部通道 API 业务失败（HTTP 200 + 业务码非成功）
             if (u.includes('wxpusher')) body = { code: 1300, msg: '推送失败' };
             else if (u.includes('pushplus.plus')) body = { code: 500, msg: 'token 无效' };
@@ -177,6 +184,25 @@ await test('Bark: 多设备 # 分割 + 设备码补全 https', () => withChannel
     assert(gotCalls.every(c => c.options.json), 'Bark 应 JSON body');
     assert(gotCalls.every(c => c.options.json.title === '标题'), 'title 正确');
     assert(gotCalls.length === 2, '两个设备两次请求');
+}));
+
+// v3.166：Bark/PushMe 多设备部分失败 → 至少一个成功 = 通道成功（曾单设备失效 → 整体失败 → 不写缓存 → 有效设备重复轰炸）
+await test('Bark: 多设备一成一败 → 通道成功不重试（v3.166）', () => withChannels(async () => {
+    cfg.BARK_PUSH = 'https://api.day.app/D1#https://api.day.app/D2';
+    failMDevSecond = true;
+    mdevCount = 0;
+    try {
+        await notify.sendNotify('标题', '内容'); // 不应抛错：dev1 成功已送达，dev2 失效不拖垮整体
+    } finally { failMDevSecond = false; }
+}));
+
+await test('PushMe: 多 key 一成一败 → 通道成功不重试（v3.166）', () => withChannels(async () => {
+    cfg.PUSHME_KEY = 'K1#K2';
+    failMDevSecond = true;
+    mdevCount = 0;
+    try {
+        await notify.sendNotify('标题', '内容'); // 不应抛错：K1 成功已送达
+    } finally { failMDevSecond = false; }
 }));
 
 // 4. PushDeer: URL 编码

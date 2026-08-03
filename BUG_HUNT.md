@@ -1,7 +1,7 @@
 # 🐛 真实 Bug 评估与修复记录（BUG_HUNT）
 
 > 曾收录**未修复**的、真实触发、有实际影响（非边缘/罕见/理论/企业级）的 bug，每项经**真实验证**。
-> **11 项已修复（v3.165，2026-08-03）**——下方每项标注状态、修复方式与验证结果。
+> **12 项已修复（v3.166，2026-08-03）**——下方每项标注状态、修复方式与验证结果。
 
 ---
 
@@ -151,6 +151,19 @@
 - **修复（v3.165）**：a) `res` 补监听 `'aborted'/'error'` → 响应中断快速 reject（不挂起）；b) 总时长超时 `timeout×3`（覆盖连接+响应全程，非空闲超时）；各完成路径 clearTimeout（防泄漏）
 - **验证**：响应中断 37ms reject ✓（曾 40s 挂起）；慢流（间隔100ms<timeout200ms）732ms 总时长超时 reject ✓（曾无限拖）；变异（总时长 ×3→×30）→ 慢流测试红 ✓；aborted/error 双监听互兜底（单监听变异=等价）✓；test_filter 97 章 +2
 
+## 12. Bark/PushMe 多设备「单设备失效=整体失败」→ 有效设备重复轰炸 ✅ 已修复（v3.166）
+
+- **触发场景**：Bark 多设备（`BARK_PUSH` 用 `#` 分割多个设备码）或 PushMe 多 key（`#` 分割）——**任一设备失效**（key 错误/设备删除/API 返回 code≠200）
+- **根因**：barkNotify/pushMeNotify 的设备级回调里 `reject(err)`/`reject(new Error(...))` 是**外层 reject**——一个设备失败 → 整个通道 promise rejected（其他设备成功的 `innerResolve` 无法改变已 rejected 状态）→ 若该通道为唯一通道 → sendNotify 全部失败 → 不写缓存 → **每次运行重试 → 有效设备每 5 分钟重复收到**（轰炸，且消息永不写缓存）
+- **来源**：v3.160「API 级失败 reject」修复（单通道用户消息不丢）引入的副作用——没考虑多设备模式
+- **真实验证**（2026-08-03，mock got）：
+  ```
+  修复前：Bark 双设备 dev1 成功 dev2 code=500 → 整体 reject → sendNotify 抛错 → 不写缓存 → dev1 每 5 分钟重复收到
+  修复后：Bark 1 成 1 败 → 通道成功（写缓存，不重复）；全败 → reject（消息不丢重试）
+  ```
+- **修复（v3.166）**：设备级回调改 `innerResolve({ok})`（不再外层 reject）→ `Promise.all` 汇总「至少一个成功 = 通道成功，全部失败才 reject」——与 sendNotify 的 allSettled 哲学（至少一个通道成功=成功）一致；单设备场景行为不变
+- **验证**：Bark/PushMe 1 成 1 败 → 成功 ✓；全败 → reject ✓；变异（some→every）→ 测试红 ✓；test_notify +2
+
 ---
 
 ## 附：验证方法（可复现）
@@ -165,9 +178,9 @@ node -e "const x=require('./xbk_function_v3.js');x.fetchData().then(d=>{const c=
 ---
 
 ## 状态说明
-- 十一个候选均**真实验证触发**、风险明确、收益中-高、修复难度低-中
-- **v3.165 已修复 11 项**（2026-08-03），修复顺序：1（wxpusher 当前唯一通道，易触发）→ 2（配置变更体验，缓存语义）→ 3（配置无效无提示）→ 4（格式统一）→ 5（模板配置提示）→ 6（7 通道 API 业务失败静默 → 消息丢失）→ 7（filterHash 漏 pingbitime，改宽不重推）→ 8（v3.158 漏 timeout 字符串转换）→ 9（推送失败无告警 + exit 0）→ 10（接口异常告警被 process.exit 杀死）→ 11（自制 got 响应中断挂起 + 慢流超时形同虚设）
-- 测试：test_app +6（t67/t68/t69/t70/t70b/t71）、test_notify +4、test_filter +5（M1/M2/M3 盲区 + 2 got 挂起修复）——**778 全绿**（v3.165）
+- 十二个候选均**真实验证触发**、风险明确、收益中-高、修复难度低-中
+- **v3.166 已修复 12 项**（2026-08-03），修复顺序：1（wxpusher 当前唯一通道，易触发）→ 2（配置变更体验，缓存语义）→ 3（配置无效无提示）→ 4（格式统一）→ 5（模板配置提示）→ 6（7 通道 API 业务失败静默 → 消息丢失）→ 7（filterHash 漏 pingbitime，改宽不重推）→ 8（v3.158 漏 timeout 字符串转换）→ 9（推送失败无告警 + exit 0）→ 10（接口异常告警被 process.exit 杀死）→ 11（自制 got 响应中断挂起 + 慢流超时形同虚设）→ 12（Bark/PushMe 多设备单失效=整体失败 → 有效设备重复轰炸）
+- 测试：test_app +6（t67/t68/t69/t70/t70b/t71）、test_notify +6（wxpusher HTML/autolink + 息知失败/全通道失败 + Bark/PushMe 一成一败）、test_filter +5（M1/M2/M3 盲区 + 2 got 挂起修复）——**780 全绿**（v3.166）
 
 ## 4b. 真实验证补充（非 bug，记录排除）
 

@@ -481,3 +481,12 @@
 - 测试：test_filter 97 章 +2（响应中断 aborted 快速 reject 37ms / 慢流总时长超时 732ms）；变异验证（总时长 ×3→×30 测试红 ✓，aborted/error 双监听互兜底=等价变异）
 
 **778 个全绿（单元 648 + 集成 91 + 通道 39）**
+
+## v3.166（Bark/PushMe 多设备部分失败修复 #12）
+
+- **#12 多设备通道「单设备失效=整体失败」**：barkNotify（多设备 `#` 分割）/pushMeNotify（多 key）曾任何设备失败（网络 err 或 API code≠200）→ 外层 `reject` → 整个通道失败 → 若为唯一通道 → 不写缓存 → 每次运行重试 → **有效设备每 5 分钟重复收到**（轰炸，v3.160 API 失败 reject 引入的副作用）
+- **修复**：设备级回调改 `innerResolve({ok})`（不再外层 reject）→ `Promise.all` 汇总「至少一个成功 = 通道成功，全部失败才 reject」（与 sendNotify allSettled 哲学一致）；单设备场景行为不变（成功 resolve / 失败 reject）
+- 测试：test_notify +2（Bark 一成一败→成功 / PushMe 一成一败→成功）；变异（some→every）→ 测试红 ✓
+- 验证：Bark/PushMe 多设备 1 成 1 败 → 通道成功（不再重复轰炸）；全败 → reject（消息不丢重试）✓
+
+**780 个全绿（单元 648 + 集成 91 + 通道 41）**

@@ -371,28 +371,35 @@ function barkNotify(text, desp, params = {}) {
                 $.post(options, (err, resp, data) => {
                     try {
                         if (err) {
-                    reject(err);
                             console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(err));
+                            innerResolve({ ok: false });
                         } else {
                             if (data.code === 200) {
                                 console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`);
+                                innerResolve({ ok: true });
                             } else {
                                 console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${data.message}\n`);
-                                // v3.160：API 级失败(code≠200) reject——曾静默 resolve 致单通道用户消息丢失
-                                reject(new Error(data && data.message ? data.message : 'Bark 发送失败'));
+                                // v3.166：单设备失败不拖垮整体——多设备（# 分割）一个失效时，
+                                // 曾外层 reject → 有效设备已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效设备重复轰炸
+                                innerResolve({ ok: false });
                             }
                         }
                     } catch (e) {
                         $.logErr(e, resp);
+                        innerResolve({ ok: false });
                     } finally {
-                        innerResolve();
+                        innerResolve({ ok: false });
                     }
                 });
             });
         });
 
         // 等待所有推送完成
-        Promise.all(pushPromises).then(resolve);
+        // v3.166：至少一个设备成功 = 通道成功（与 sendNotify allSettled 哲学一致）——全部失败才 reject
+        Promise.all(pushPromises).then(results => {
+            if (results.some(r => r && r.ok)) resolve();
+            else reject(new Error('Bark 全部设备发送失败'));
+        });
     });
 }
 
@@ -432,28 +439,35 @@ function pushMeNotify(text, desp, params = {}) {
                 $.post(options, (err, resp, data) => {
                     try {
                         if (err) {
-                    reject(err);
                             console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, safeErr(err));
+                            innerResolve({ ok: false });
                         } else {
                             if (data === 'success') {
                                 console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 成功🎉\n`);
+                                innerResolve({ ok: true });
                             } else {
                                 console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${data}\n`);
-                                // v3.160：API 级失败(非 success) reject——曾静默 resolve 致单通道用户消息丢失
-                                reject(new Error(data && typeof data === 'string' ? data : 'PushMe 发送失败'));
+                                // v3.166：单 key 失败不拖垮整体——多 key（# 分割）一个失效时，
+                                // 曾外层 reject → 有效 key 已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效 key 重复轰炸
+                                innerResolve({ ok: false });
                             }
                         }
                     } catch (e) {
                         $.logErr(e, resp);
+                        innerResolve({ ok: false });
                     } finally {
-                        innerResolve(data);
+                        innerResolve({ ok: false });
                     }
                 });
             });
         });
 
         // 等待所有推送完成
-        Promise.all(pushPromises).then(resolve);
+        // v3.166：至少一个 key 成功 = 通道成功（与 sendNotify allSettled 哲学一致）——全部失败才 reject
+        Promise.all(pushPromises).then(results => {
+            if (results.some(r => r && r.ok)) resolve();
+            else reject(new Error('PushMe 全部 key 发送失败'));
+        });
     });
 }
 
