@@ -1,7 +1,7 @@
 # 🐛 真实 Bug 评估与修复记录（BUG_HUNT）
 
 > 曾收录**未修复**的、真实触发、有实际影响（非边缘/罕见/理论/企业级）的 bug，每项经**真实验证**。
-> **9 项已修复（v3.163，2026-08-03）**——下方每项标注状态、修复方式与验证结果。
+> **10 项已修复（v3.164，2026-08-03）**——下方每项标注状态、修复方式与验证结果。
 
 ---
 
@@ -123,6 +123,21 @@
 - **修复（v3.163）**：a) 推送全部失败（items>0 && successCount===0）→ `_sendAlert`（限频复用 alert.state）；b) run.log 追加 ERROR 行；c) 连续失败阈值（防瞬时抖动）暂未做（限频已防轰炸）
 - **验证**：推送全失败 → _sendAlert 触发 + run.log ERROR 行 ✓；变异（去掉）→ t70 红 ✓（注：告警通道与推送同一通道，通道挂时告警也发不出——v3.135 静默处理，无解）
 
+## 10. 接口异常告警被 `process.exit(1)` 杀死 → cron 直接运行场景收不到告警 ✅ 已修复（v3.164）
+
+- **触发场景**：接口异常（fetchData 失败）+ **直接运行**（`node xbk_function_v3.js`，cron 场景）——**正是 v3.123 告警功能的核心里程碑场景**
+- **根因**：`_sendAlert` 是 fire-and-forget（`.then().catch()` 不 await，只发起 HTTP 请求）→ `App.run` catch 里 `throw error` → 主入口 `App.run().catch(e => { console.error(...); process.exit(1); })` **同步立即退出** → 未完成的告警 HTTP 请求被 `process.exit` 终止 → **告警丢失**
+- **真实验证**（2026-08-03，mock got：fetchData 404 立即失败 + 延迟 50ms 的 post 模拟真实网络）：
+  ```
+  run reject（模拟 process.exit 时刻）: 告警已发起=1, 已完成=false
+  500ms 后（若无 exit）: 告警完成=true
+  → 真实网络往返 >0ms，process.exit 在发起后几微秒内同步执行 → 告警必然未完成 → 丢失
+  ```
+- **风险**：接口挂时（v3.123 告警的核心场景）用户**收不到告警**（只能靠 run.log ERROR 行感知，cron 用户不常翻）——告警功能在主要场景下实际失效
+- **对照**：测试/被 require 场景（无 `process.exit`）→ 告警能发（v3.156/157 验证的是这种）→ **直接运行（cron 真实场景）与测试行为不一致**；推送失败告警（v3.163）不受影响（正常路径无 exit）
+- **修复（v3.164）**：`_sendAlert` 返回 promise（Pusher.send 链），`App.run` catch `await this._sendAlert(errMsg)` 后再 throw（exit 前告警送达）；test_app t71 锁定（sendNotify 延迟 50ms 模拟网络）+ 变异验证
+- **验证**：`run` reject 返回耗时 149ms（等告警完成）；变异（去掉 await）→ t71 红 ✓
+
 ---
 
 ## 附：验证方法（可复现）
@@ -137,10 +152,10 @@ node -e "const x=require('./xbk_function_v3.js');x.fetchData().then(d=>{const c=
 ---
 
 ## 状态说明
-- 九个候选均**真实验证触发**、风险明确、收益中-高、修复难度低-中
-- **v3.162 已修复 8 项**（2026-08-03），修复顺序：1（wxpusher 当前唯一通道，易触发）→ 2（配置变更体验，缓存语义）→ 3（配置无效无提示）→ 4（格式统一）→ 5（模板配置提示）→ 6（7 通道 API 业务失败静默 → 消息丢失）→ 7（filterHash 漏 pingbitime，改宽不重推）→ 8（v3.158 漏 timeout 字符串转换）
-- **#9 已修复**（v3.163）：推送通道失败无告警 + exit 0（v3.123 声称的「密钥失效告警」未实现）→ 补告警 + run.log ERROR
-- 测试：test_app +5（t67 过滤变更/pingbitime 警告/占位符警告 + t68 pingbitime 变更重推 + t69 timeout 字符串）、test_notify +4（wxpusher HTML/autolink + v3.160 息知失败/全通道失败）——**770 全绿**
+- 十个候选均**真实验证触发**、风险明确、收益中-高、修复难度低-中
+- **v3.163 已修复 9 项**（2026-08-03），修复顺序：1（wxpusher 当前唯一通道，易触发）→ 2（配置变更体验，缓存语义）→ 3（配置无效无提示）→ 4（格式统一）→ 5（模板配置提示）→ 6（7 通道 API 业务失败静默 → 消息丢失）→ 7（filterHash 漏 pingbitime，改宽不重推）→ 8（v3.158 漏 timeout 字符串转换）→ 9（推送失败无告警 + exit 0）
+- **#10 已修复**（v3.164）：接口异常告警被 `process.exit(1)` 杀死——`_sendAlert` 返回 promise + App.run catch await，exit 前送达
+- 测试：test_app +5（t67 过滤变更/pingbitime 警告/占位符警告 + t68 pingbitime 变更重推 + t69 timeout 字符串）、test_notify +4（wxpusher HTML/autolink + v3.160 息知失败/全通道失败）、test_filter +3（M1/M2/M3 盲区锁定）——**774 全绿**
 
 ## 4b. 真实验证补充（非 bug，记录排除）
 

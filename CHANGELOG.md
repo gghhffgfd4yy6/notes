@@ -465,3 +465,11 @@
 - 测试：test_app t70；变异锁定
 
 **771 个全绿（单元 643 + 集成 89 + 通道 39）**
+
+## v3.164（#10：接口异常告警 await 完成）
+
+- #10（BUG_HUNT）：接口异常时 _sendAlert fire-and-forget → App.run catch → 主入口同步 process.exit(1) 杀死未完成的告警 HTTP（cron 直接运行收不到告警，正是告警核心场景）
+- 修复：_sendAlert 返回 promise（Pusher.send 链），App.run catch await 告警完成后再 throw（exit 前送达）
+- 测试：test_app t71（sendNotify 延迟 50ms 模拟网络，run 返回时告警已完成）；变异锁定
+
+**775 个全绿（单元 646 + 集成 90 + 通道 39）**

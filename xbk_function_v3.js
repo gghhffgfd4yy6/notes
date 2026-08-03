@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.163 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；768全绿(643+86+39) ********
+//******** 线报酷推送脚本 v3.164 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；768全绿(643+86+39) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1347,7 +1347,9 @@ const App = {
             const alertDesp = `接口/推送异常，请检查。\n\n时间：${new Date().toLocaleString('zh-CN')}\n\n原因：${String(errMsg).slice(0, 500)}`;
             // v3.156：发送成功才写状态+打印——曾先写 lastAt（发送失败也限频，60s 内挡住重试，信息丢失）
             // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗，与主推送不一致）
-            Pusher.send(alertText, alertDesp)
+            // v3.164：返回 promise 供 App.run catch await——曾 fire-and-forget，接口异常时主入口同步 process.exit(1)
+            // 杀死未完成的告警 HTTP（cron 直接运行收不到告警，#10）
+            return Pusher.send(alertText, alertDesp)
                 .then(() => {
                     fs.writeFileSync(statePath, JSON.stringify({ lastAt: Date.now() }), 'utf8');
                     console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）');
@@ -1724,7 +1726,8 @@ const App = {
             // 失败也写运行日志（cron 可回溯失败原因；错误信息去换行避免破坏日志行）
             this._writeRunLog(`${new Date().toISOString()} ERROR ${String(errMsg).replace(/[\r\n]+/g, ' ')}\n`);
             // v3.123：接口异常告警（限频 + 静默，不影响主流程）
-            this._sendAlert(errMsg);
+            // v3.164：await 告警完成——主入口 process.exit(1) 前需确保告警 HTTP 送达（#10）
+            try { await this._sendAlert(errMsg); } catch (e) { /* 告警失败不阻塞重抛 */ }
             throw error; // 重新抛出，让外层/调度感知失败（cron 场景 exit code 非 0）
         }
     },

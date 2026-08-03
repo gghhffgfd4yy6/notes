@@ -54,10 +54,12 @@ let pushCalls = [];
 let notifyFail = false;
 let notifyFailAt = -1; // -1=永不失败，N=第N次调用失败
 let notifyFailString = false; // 抛非 Error(字符串)——R1：验证 pushOne catch 兜底
+let notifyDelayMs = 0;   // sendNotify 响应延迟（v3.164 #10：模拟真实网络，验证告警 await 后 exit）
 let notifyCalls = 0;
 require.cache[notifyPath].exports = {
     sendNotify: async (text, desp) => {
         notifyCalls++;
+        if (notifyDelayMs > 0) await new Promise(r => setTimeout(r, notifyDelayMs));
         if (notifyFailString) throw 'push boom string'; // 字符串异常（非 Error）
         if (notifyFail) throw new Error('push boom');
         if (notifyFailAt > 0 && notifyCalls === notifyFailAt) throw new Error('push boom');
@@ -127,6 +129,7 @@ function reset() {
     fail429Once = false;
     failPlainString = false;
     failNonJson = false;
+    notifyDelayMs = 0;
     notifyFail = false;
     notifyFailAt = -1;
     notifyFailString = false;
@@ -1756,6 +1759,32 @@ await test('推送全部失败 → 触发告警调用 + run.log ERROR（#9 v3.16
         assert(log.includes('推送全部失败'), 'ERROR 行应标明推送全部失败');
     } finally {
         Config.alert.enabled = orig;
+        try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 忽略 */ }
+    }
+});
+
+await test('接口异常告警在 run 返回前完成（#10 v3.164，防 exit 杀死）', async () => {
+    reset();
+    setPushUrl('t71_alert_await');
+    fakeData = [];
+    const origInterval = Config.alert.intervalMs;
+    const origEnabled = Config.alert.enabled;
+    try {
+        Config.alert.enabled = true;
+        Config.alert.intervalMs = 0;
+        fail4xx = true; // 接口失败 → 触发告警
+        notifyDelayMs = 50; // 模拟真实网络往返：告警 sendNotify 延迟 50ms（fire-and-forget 会被 process.exit(1) 杀死）
+        let crashed = false;
+        try { await xbk.run(); } catch (e) { crashed = true; }
+        assert(crashed, '接口失败应抛错');
+        // v3.164：catch 里 await _sendAlert → run 返回时告警已完成（曾 fire-and-forget → exit 杀死告警 HTTP）
+        const alertSent = pushCalls.some(c => c.text && String(c.text).includes('运行异常'));
+        assert(alertSent, '告警应在 run 返回前完成（否则被 process.exit 杀死，cron 直接运行收不到）');
+    } finally {
+        fail4xx = false;
+        notifyDelayMs = 0;
+        Config.alert.intervalMs = origInterval;
+        Config.alert.enabled = origEnabled;
         try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 忽略 */ }
     }
 });
