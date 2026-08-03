@@ -1850,6 +1850,21 @@ await test('parseTime 单数字月日 T 分隔（v3.171：2026-8-1T10:30 曾 Inv
     }
 });
 
+await test('truncateUtf16 ZWJ/变体选择符/组合字符不切断（v3.175）', () => {
+    // ZWJ 序列：截断后无孤立 ZWJ、无半代理
+    assertEqual(truncateUtf16('👨👩👧👦', 3), '👨', '家庭 emoji max=3 → 完整首个');
+    assertEqual(truncateUtf16('👨👩👧👦', 5), '👨👩', 'max=5 → 完整前两个（无孤立 ZWJ）');
+    const r5 = truncateUtf16('👨👩👧👦', 5);
+    assertEqual(r5.endsWith('\u200D'), false, '末尾不应是孤立 ZWJ');
+    // 变体选择符：❤️ max=1 → 退位为空（不丢 VS16 留残缺 ❤）
+    assertEqual(truncateUtf16('❤️', 1), '', 'VS16 序列 max=1 → 保守退位');
+    // 组合字符：e + 重音 max=1 → 退位（不丢重音留残缺 e）
+    assertEqual(truncateUtf16('e\u0301', 1), '', '组合字符 max=1 → 保守退位');
+    // 普通行为不变
+    assertEqual(truncateUtf16('abc', 2), 'ab', '普通文本正常截断');
+    assertEqual(truncateUtf16('😀😀', 2), '😀', '双 emoji 完整保留');
+});
+
 await test('htmlToMarkdown 短标签词边界（v3.171：img/input/blockquote 不再误当 i/b）', () => {
     // 前缀标签不应输出 */**/- 垃圾
     assertEqual(htmlToMarkdown({ content_html: '<img class="x">', url: '' }), '', 'img 无 src 应剥空（曾输出 *）');

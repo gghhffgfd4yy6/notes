@@ -297,6 +297,8 @@ const Utils = {
     /**
      * UTF-16 安全截断：按码元截断但不在代理对中间切断（避免半个 emoji 乱码）
      * 末尾高代理→退一位；末尾低代理且前一位非高代理(孤立)→退一位；配对完整低代理→保留
+     * v3.175：ZWJ 序列/变体选择符/组合字符同样不切断——👨👩👧👦 截断曾拆散家庭 emoji、
+     * ❤️ 丢 VS16、é 丢重音；统一循环退位（代理对 + 修饰符 + 末尾 ZWJ）
      */
     truncateUtf16(s, max) {
         try { s = String(s === undefined || s === null ? '' : s); } catch (e) { s = ''; } // v3.108 fuzz：嵌套 Symbol 数组 String() 崩 → 空
@@ -305,12 +307,27 @@ const Utils = {
         if (!Number.isFinite(max) || max <= 0) return s;
         if (s.length <= max) return s;
         let cut = s.slice(0, max);
-        const last = cut.charCodeAt(cut.length - 1);
-        if (last >= SURROGATE_LO && last <= SURROGATE_HI) {
-            // 代理区：高代理必孤立(缺低代理)；低代理需确认前一位是高代理(配对完整)才保留
-            if (!(last >= 0xDC00)) return cut.slice(0, -1); // 高代理 → 退一位
-            const prev = cut.charCodeAt(cut.length - 2);
-            if (!(prev >= SURROGATE_LO && prev <= 0xDBFF)) return cut.slice(0, -1); // 孤立低代理 → 退一位
+        // 修饰符判定：作用于前一字符的 Unicode 修饰符（ZWJ/变体选择符/组合音标/组合符号）
+        const isModifier = (c) => c === 0x200D || (c >= 0xFE00 && c <= 0xFE0F)
+            || (c >= 0x0300 && c <= 0x036F) || (c >= 0x1AB0 && c <= 0x1AFF) || (c >= 0x1DC0 && c <= 0x1DFF)
+            || (c >= 0x20D0 && c <= 0x20FF) || (c >= 0xFE20 && c <= 0xFE2F);
+        while (cut.length > 0) {
+            const last = cut.charCodeAt(cut.length - 1);
+            // 代理对：完整低代理对保留；高代理/孤立低代理退位
+            if (last >= SURROGATE_LO && last <= SURROGATE_HI) {
+                if (last >= 0xDC00) {
+                    const prev = cut.charCodeAt(cut.length - 2);
+                    if (prev >= SURROGATE_LO && prev <= 0xDBFF) break; // 配对完整，保留
+                }
+                cut = cut.slice(0, -1);
+                continue;
+            }
+            // 末尾 ZWJ 本身退位（连接符不应做结尾）
+            if (last === 0x200D) { cut = cut.slice(0, -1); continue; }
+            // 截断点后是作用于上一字符的修饰符 → 退位（避免拆散 ❤️ / é）
+            const next = s.charCodeAt(cut.length);
+            if (isModifier(next)) { cut = cut.slice(0, -1); continue; }
+            break;
         }
         return cut;
     },
