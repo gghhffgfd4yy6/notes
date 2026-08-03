@@ -559,3 +559,4 @@
 - 影响路径全覆盖：compileRules（跳过）/validateConfig（警告）/whitelistFilter/App.run 同走 hasNestedQuantifier
 - 测试：95 章危险列表 +8 歧义模式、安全列表调整（`(a|b)+` 移出、`(a|b)*c` 保守判险）；另测 5645 断言更新
 - **补充（变异验证）**：9 个已修 bug 逐个变异（修复改回 bug 行为）验证测试锁定——**9/9 全部检测到**；变异还发现 #10 修复不完整：字符串 `'0'` 是 truthy（`!'0'`=false）曾漏关，已补 `en === '0'` 判断；补测试 2 个（t73 enabled=0 数字+字符串+对照 true、t70 补 notifyDelayMs=50 时序断言锁定成功路径告警 await）——test_app 92→93
+- **补充（Gitee Go +8 容器暴露的测试时区 bug ×2）**：①「跨日边界」测试用 setHours 本地 0 点 vs daysFrom UTC 日期差——+8 时区本地 0 点=UTC 前一天 16:00 误算 1 天，改用 UTC 日期构造；②t57 日报断言用 toISOString()（UTC 日期）vs 主代码 _updateReport 本地日期（v3.155 设计）——+8 本地凌晨差 1 天，断言改用本地日期；UTC/+8 双时区全量验证通过（单元 652 + 集成 93 并行 + 通道 41）

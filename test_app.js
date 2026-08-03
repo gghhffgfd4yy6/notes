@@ -1494,7 +1494,12 @@ await test('运行日报：跨天发昨日日报 + 当天累加（v3.125）', as
         assert(!pushCalls.some(c => c.text.includes('日报')), '同一天不重复发日报');
         const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'));
         assert(st.pushed >= 2, `当天应累加 pushed: ${st.pushed}`);
-        assert(st.date === new Date().toISOString().slice(0, 10), '状态日期应为今天');
+        // v3.174：断言用本地日期（与 _updateReport 的 v3.155 本地日期口径一致）——曾用
+        // toISOString()（UTC 日期），+8 时区本地凌晨（UTC 前一天）时 state.date 是本地今天、
+        // 断言是 UTC 日期 → 差 1 天失败（Gitee Go +8 容器实测暴露）
+        const _d = new Date();
+        const localToday = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`;
+        assert(st.date === localToday, `状态日期应为今天(本地): ${st.date} vs ${localToday}`);
     } finally {
         Config.report.enabled = orig;
         try { require('fs').unlinkSync(statePath); } catch (e) { /* 忽略 */ }
@@ -1831,13 +1836,20 @@ await test('api.timeout 字符串配置生效（#8 v3.162）', async () => {
     reset();
     setPushUrl('t69_timeout_str');
     const orig = Config.api.timeout;
+    const origWarn = console.warn;
+    const warns = [];
+    console.warn = (m) => warns.push(String(m));
     try {
         Config.api.timeout = '5000'; // 环境变量字符串（曾回退 15s）
         fakeData = [makeItem({ id: 1 })];
         await xbk.run();
         const call = gotCalls.find(c => c.url.includes('t69_timeout_str'));
         assert(call && call.opts && call.opts.timeout === 5000, `字符串 timeout 应生效为 5000: ${call && call.opts && call.opts.timeout}`);
+        // v3.175：字符串配置（环境变量场景）不应误报「不是有效值」（曾 Number.isFinite('5000')=false 假警告）
+        assert(!warns.some(w => w.includes('api.timeout') && w.includes('不是有效值')),
+            `字符串 timeout 不应误报警告: ${warns.filter(w => w.includes('timeout')).join(' | ')}`);
     } finally {
+        console.warn = origWarn;
         Config.api.timeout = orig;
     }
 });

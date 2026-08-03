@@ -854,8 +854,10 @@ const RuleEngine = {
         }
         // 校验 cache.maxSize（#7）：MessageStore 函数层已回退默认，配置层补提示。
         // 兼容传入完整 Config（cfg.cache.maxSize）或平铺（cfg.maxSize）两种形态
+        // v3.175：字符串 maxSize（'10000' 环境变量）曾误报——用 Utils.num 口径
         const maxSizeVal = cfg.cache ? cfg.cache.maxSize : cfg.maxSize;
-        if (maxSizeVal !== undefined && (!Number.isInteger(maxSizeVal) || maxSizeVal <= 0)) {
+        const msNum = Utils.num(maxSizeVal, -1);
+        if (maxSizeVal !== undefined && (!Number.isInteger(msNum) || msNum <= 0)) {
             warnings.push(`⚠️ 配置「cache.maxSize」为「${maxSizeVal}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`);
         }
         return [...new Set(warnings)];
@@ -1453,7 +1455,8 @@ const App = {
             for (const w of warnings) console.warn(w);
 
             // 校验缓存 maxSize（#7）：函数层已回退默认，配置层补提示（validateConfig 只接收 filter，此处兜底完整 Config）
-            if (!Number.isInteger(Config.cache.maxSize) || Config.cache.maxSize <= 0) {
+            // v3.175：字符串 maxSize（'10000' 环境变量）曾误报——用 Utils.num 口径
+            if (!Number.isInteger(Utils.num(Config.cache.maxSize, -1)) || Utils.num(Config.cache.maxSize, -1) <= 0) {
                 console.warn(`⚠️ 配置「cache.maxSize」为「${Config.cache.maxSize}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`);
             }
 
@@ -1483,12 +1486,14 @@ const App = {
             }
 
             // 运行时数值配置校验（函数层已有防御，配置层补提示——#7 同款精神，v3.64）
+            // v3.175：校验用 Utils.num 口径——字符串配置（'5000' 环境变量场景）曾误报「不是有效值」
+            // （Number.isFinite('5000')=false，但 Utils.num 已生效——假警告误导用户）
             const numConfig = [
-                ['api.timeout', Config.api.timeout, (v) => Number.isFinite(v) && v > 0],
-                ['api.retry', Config.api.retry, (v) => Number.isInteger(v) && v >= 0],
-                ['timing.pushInterval', Config.timing.pushInterval, (v) => Number.isFinite(v) && v >= 0],
-                ['timing.finalWait', Config.timing.finalWait, (v) => Number.isFinite(v) && v >= 0],
-                ['push.parallelLimit', Config.push.parallelLimit, (v) => Number.isFinite(v) && v >= 0],
+                ['api.timeout', Config.api.timeout, (v) => Utils.num(v, -1) > 0],
+                ['api.retry', Config.api.retry, (v) => { const n = Utils.num(v, -1); return Number.isInteger(n) && n >= 0; }],
+                ['timing.pushInterval', Config.timing.pushInterval, (v) => Utils.num(v, -1) >= 0],
+                ['timing.finalWait', Config.timing.finalWait, (v) => Utils.num(v, -1) >= 0],
+                ['push.parallelLimit', Config.push.parallelLimit, (v) => Utils.num(v, -1) >= 0],
             ];
             for (const [name, val, ok] of numConfig) {
                 if (!ok(val)) console.warn(`⚠️ 配置「${name}」为「${val}」不是有效值，已按内部防御逻辑处理（建议修正）`);
