@@ -1413,6 +1413,33 @@ await test('接口异常 → 发送告警 + 限频（v3.123）', async () => {
     }
 });
 
+await test('告警 enabled=0（数字）→ 关闭不发送（v3.173）', async () => {
+    reset();
+    setPushUrl('t73_alert_enabled_zero');
+    const origEnabled = Config.alert.enabled;
+    try {
+        Config.alert.enabled = 0; // 数字 0（falsy）→ 应关闭（曾 === false/=== 'false' 严格判断漏掉）
+        Config.alert.intervalMs = 0; // 不限频，确保只受 enabled 控制
+        fakeData = [];
+        fail4xx = true;
+        try { await xbk.run(); } catch (e) { /* 预期抛错 */ }
+        assert(!pushCalls.find(c => c.text.includes('运行异常')), 'enabled=0 不应发送告警');
+        // 字符串 '0' 同样关闭
+        pushCalls = [];
+        Config.alert.enabled = '0';
+        try { await xbk.run(); } catch (e) { /* 预期抛错 */ }
+        assert(!pushCalls.find(c => c.text.includes('运行异常')), 'enabled="0" 不应发送告警');
+        // 对照：true 时发送（确保测试本身有效）
+        pushCalls = [];
+        Config.alert.enabled = true;
+        try { await xbk.run(); } catch (e) { /* 预期抛错 */ }
+        assert(!!pushCalls.find(c => c.text.includes('运行异常')), 'enabled=true 应发送告警（对照）');
+    } finally {
+        Config.alert.enabled = origEnabled;
+        try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 忽略 */ }
+    }
+});
+
 await test('告警 intervalMs 非法字符串 → 回退默认限频不轰炸（v3.167）', async () => {
     reset();
     setPushUrl('t72_alert_interval_abc');
@@ -1825,14 +1852,22 @@ await test('推送全部失败 → 触发告警调用 + run.log ERROR（#9 v3.16
         Config.alert.enabled = true;
         Config.alert.intervalMs = 0;
         // 推送全部失败（notify mock 抛错）→ pushOne 全 catch → 触发 _sendAlert + ERROR 日志
-        notifyFail = true;
-        fakeData = [makeItem({ id: 1 }), makeItem({ id: 2 })];
+        // v3.174：notifyFailAt=1 第 1 次主推送失败、第 2 次（告警）成功；notifyDelayMs=50 模拟告警慢——
+        // await 时 run 等待告警完成（fire-and-forget 会提前返回，pushCalls 未达）
+        notifyFailAt = 1;
+        notifyDelayMs = 50;
+        fakeData = [makeItem({ id: 1 })];
         await xbk.run();
         const log = require('fs').readFileSync(logPath, 'utf8');
         assert(log.includes('ERROR'), `推送全失败应写 ERROR 行: ${log.slice(-100)}`);
         assert(log.includes('推送全部失败'), 'ERROR 行应标明推送全部失败');
+        // v3.170：成功路径 _sendAlert 也 await——告警应在 run 返回前完成
+        assert(pushCalls.some(c => c.text && String(c.text).includes('运行异常')),
+            '告警应在 run 返回前完成（v3.170 await；曾 fire-and-forget 时序不定）');
     } finally {
         Config.alert.enabled = orig;
+        notifyFailAt = -1;
+        notifyDelayMs = 0;
         try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 忽略 */ }
     }
 });

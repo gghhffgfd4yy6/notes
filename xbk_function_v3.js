@@ -1367,8 +1367,9 @@ const App = {
     // 接口异常告警（v3.123）：限频 + 静默——不影响主流程；告警也走推送通道（通道挂了就静默，无解）
     _sendAlert(errMsg) {
         try {
-            // v3.173：!enabled 也关闭（数字 0 / 空串等 falsy 曾 === false/=== 'false' 严格判断漏掉，0 配置不关闭）
-            if (!Config.alert || !Config.alert.enabled || Config.alert.enabled === 'false') return;
+            // v3.173/174：!enabled（数字0/空串）或 'false'/'0' 字符串均关闭（'0' 字符串是 truthy，曾漏）
+            const en = Config.alert && Config.alert.enabled;
+            if (!Config.alert || !en || en === 'false' || en === '0') return;
             const statePath = path.join(MessageStore.cacheDir, 'alert.state');
             let lastAt = 0;
             try { lastAt = JSON.parse(fs.readFileSync(statePath, 'utf8')).lastAt || 0; } catch (e) { /* 无状态文件=首次 */ }
@@ -1394,8 +1395,9 @@ const App = {
     // 运行日报（v3.125）：跨天时发"昨日日报"，当天累加统计；静默不影响主流程
     _updateReport(summary) {
         try {
-            // v3.173：!enabled 也关闭（数字 0 / 空串等 falsy 曾 === false/=== 'false' 严格判断漏掉，0 配置不关闭）
-            if (!Config.report || !Config.report.enabled || Config.report.enabled === 'false') return;
+            // v3.173/174：!enabled（数字0/空串）或 'false'/'0' 字符串均关闭（'0' 字符串是 truthy，曾漏）
+            const en = Config.report && Config.report.enabled;
+            if (!Config.report || !en || en === 'false' || en === '0') return;
             const statePath = path.join(MessageStore.cacheDir, 'report.state');
             let state = { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
             try { state = JSON.parse(fs.readFileSync(statePath, 'utf8')) || state; } catch (e) { /* 无状态=首次 */ }
