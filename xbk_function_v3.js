@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.171 — 审查修复2项：htmlToMarkdown短标签正则加词边界(img/input/iframe/blockquote/link曾被误当i/b/li输出*/**/-垃圾)/parseTime回退T转空格(2026-8-1T10:30单数字月日曾Invalid而空格格式有效) ********
+//******** 线报酷推送脚本 v3.172 — 重写并行调度器test_app_parallel(v3.122因共享缓存目录overlayfs竞态被回滚；新方案worker独立缓存目录XBK_PARALLEL_ID+--list-file精确分片+失败串行重跑；test_app 92测64.6s→11s) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -991,7 +991,9 @@ const FilterEngine = {
 // 💾 MessageStore — 缓存管理层
 // ============================================================
 const MessageStore = {
-    get cacheDir() { return path.join(__dirname, typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : 'xianbaoku_cache'); },
+    // v3.172：cache.dir 非法回退时支持并行 worker 隔离（test_app_parallel 用 XBK_PARALLEL_ID 分片，
+    // 回退硬编码 'xianbaoku_cache' 会让 t51 等非法配置测试撞共享目录竞态）
+    get cacheDir() { return path.join(__dirname, typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : (process.env.XBK_PARALLEL_ID ? `xianbaoku_cache_p${process.env.XBK_PARALLEL_ID}` : 'xianbaoku_cache')); },
     _memoryCache: {},
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
     _MEMO_MAX: 100,

@@ -532,3 +532,14 @@
 - **#8 htmlToMarkdown 短标签正则加 `\b` 词边界**：`<i|em>`/`<b|strong>`/`<li>`/`<td|th|tr|table>` 正则曾无词边界——`<img>/<input>/<iframe>/<ins>` 被 `<i` 前缀误当斜体、`<blockquote>/<bdo>` 被 `<b` 误当粗体、`<link>` 被 `<li` 误当列表项 → 推送输出 `*`/`**`/`-` 垃圾符号；加 `\b` 后仅匹配完整标签名（`<br>` 双保险不受影响）；实测：img/input/link 剥空、blockquote 保留文本、正常 b/i/li/table 不变
 - **#7 parseTime 回退 T 转空格**：`2026-8-1T10:30`（单数字月日 T 分隔）曾 Invalid 返回 null（daysComputed 0 → pingbitime 误拦），而 `2026-8-1 10:30`（空格分隔）宽松解析有效——同类格式不一致；回退路径补 `.replace('T',' ')`（`2026/8/1 10:30` 有效）；已成功路径零影响
 - 测试：test_filter +2（词边界 5 场景/单数字 T 与空格同口径），652/652
+
+## v3.172（重写并行调度器：worker 独立缓存目录根治共享 IO 竞态）
+
+- **背景**：v3.122 并行调度器（46s→11s）因「多 worker 共享 xianbaoku_cache 目录」在沙箱 overlayfs 产生 IO 竞态（ENOENT 偶发失败）被 v3.124b 回滚；本次重写根治
+- **根因实证**：不只是并发写同一目录——t51 配置矩阵测试故意设 `Config.cache.dir=123`（非法）→ `MessageStore.cacheDir` 回退硬编码共享目录 → worker 撞车；修复：回退值支持 `XBK_PARALLEL_ID` 隔离（主代码一行，普通模式零变化）
+- **新方案**：
+  - 每个 worker 独立缓存目录（`xianbaoku_cache_p<N>`）——缓存/run.log/state 全隔离
+  - `--list-file=<json>` 精确名单分片（替代 --only 子串，防重叠/漏跑）
+  - 首轮并发 QUICK 快测 → 失败片串行完整重跑（flaky 容错）
+- **效果**：test_app 92 个测试 64.6s（串行）→ 11s（并行，5.9 倍），连续多轮稳定
+- 使用：`node test_app_parallel.js`（沙箱默认并发 8 稳定）| `CONCURRENCY=N node test_app_parallel.js`（真机可调大）

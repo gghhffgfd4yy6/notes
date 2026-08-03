@@ -279,9 +279,9 @@ node test_filter.js && node test_app.js && node test_notify.js
 
 **定位**:一键执行三套测试 + 汇总报告（✅/❌/耗时/退出码）——`npm test` 指向它。CI 与本地统一入口。
 
-### `test_app_parallel.js` — test_app 并行调度器(v3.122 新增)
+### `test_app_parallel.js` — test_app 并行调度器（v3.172 重写）
 
-**定位**:test_app 集成测试并行 fork（独立进程，无全局污染）——`node test_app_parallel.js`。慢测真实等待、快测 QUICK 加速、run.log 测试独占串行。**并发可配**：`CONCURRENCY=N node test_app_parallel.js`（真机加速，沙箱默认见代码）。
+**定位**:test_app 集成测试并行 fork（独立进程，无全局污染）——`node test_app_parallel.js`。**v3.172 重写**：每个 worker 独立缓存目录（XBK_PARALLEL_ID）+ `--list-file` 精确分片 + 失败片串行重跑（flaky 容错）——根治 v3.122 版共享缓存目录的沙箱 IO 竞态。**并发可配**：`CONCURRENCY=N node test_app_parallel.js`（沙箱默认见代码，真机可调大）。
 
 ### `.github/workflows/test.yml` — CI 配置(v3.107 新增)
 

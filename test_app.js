@@ -73,7 +73,11 @@ const { Config } = xbk;
 const fs = require('fs');
 const path = require('path');
 
-const CACHE_DIR = path.join(__dirname, 'xianbaoku_cache');
+// v3.172：并行 worker 独立缓存目录——多进程共享同一缓存目录曾致沙箱 overlayfs IO 竞态(ENOENT)，
+// 每个 worker 用 xianbaoku_cache_p<N> 彻底隔离（缓存/run.log/state 全独立，无竞态）
+const PARALLEL_ID = process.env.XBK_PARALLEL_ID || '';
+const DEFAULT_CACHE_DIR = PARALLEL_ID ? `xianbaoku_cache_p${PARALLEL_ID}` : 'xianbaoku_cache';
+const CACHE_DIR = path.join(__dirname, DEFAULT_CACHE_DIR);
 
 // ---------- 工具 ----------
 let passed = 0, failed = 0;
@@ -85,6 +89,16 @@ const onlyFilter = (() => {
     const idx = process.argv.indexOf('--only');
     return idx >= 0 ? process.argv[idx + 1] : null;
 })();
+// v3.172：并行调度精确名单——--list-file=<json数组文件>，只跑名单内的测试（与 --only 子串互补，
+// 避免 --only 子串重叠/漏跑；worker 由 test_app_parallel.js 分片生成）
+let nameSet = null;
+{
+    const lfIdx = process.argv.indexOf('--list-file');
+    if (lfIdx >= 0) {
+        try { nameSet = new Set(JSON.parse(fs.readFileSync(process.argv[lfIdx + 1], 'utf8'))); }
+        catch (e) { console.error('--list-file 解析失败:', e.message); process.exit(2); }
+    }
+}
 if (process.env.QUICK === '1') {
     Config.timing.pushInterval = 0;
     Config.timing.finalWait = 0;
@@ -92,6 +106,7 @@ if (process.env.QUICK === '1') {
 
 async function test(name, fn) {
     if (onlyFilter && !name.includes(onlyFilter)) { passed++; return; } // 跳过（并行调度用）
+    if (nameSet && !nameSet.has(name)) { passed++; return; } // v3.172：名单外跳过（并行分片）
     const t0 = Date.now(); // v3.122：耗时统计（识别慢测试供并行调度）
     try {
         await fn();
@@ -146,7 +161,7 @@ function reset() {
     Config.push.contentMax = 3000;
     Config.domain = 'https://new.ixbk.net';
     Config.cache.maxSize = 10000;
-    Config.cache.dir = 'xianbaoku_cache';
+    Config.cache.dir = DEFAULT_CACHE_DIR; // v3.172：并行 worker 恢复各自独立目录（曾硬编码 'xianbaoku_cache'）
     // R3-1：api 配置也恢复默认（t51 等会改 api.retry/timeout，漏恢复会污染后续测试）
     Config.api.timeout = 5000;
     Config.api.retry = 2;
@@ -1900,7 +1915,8 @@ console.log('========================================\n');
 
 // 清理本套件产生的缓存测试文件（t\d{2}_/t48b_/tpush_/tpar_fail，保留真实运行缓存 push.json）
 // v3.122：--only 模式（并行调度）跳过清理——并行进程删除会删掉其他仍在跑的进程正在使用的缓存文件
-if (!onlyFilter) {
+// v3.172：--list-file 模式同样跳过（调度器统一清理 worker 独立目录）
+if (!onlyFilter && !nameSet) {
     try {
         const fs = require('fs');
         const dir = path.join(__dirname, 'xianbaoku_cache');
