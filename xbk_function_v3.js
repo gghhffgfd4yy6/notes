@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.178 — 系统验证结论落地：①safeSlice 与 truncateUtf16 对齐(补ZWJ/VS16/组合字符退位,wxpusher summary/TG截断不再拆散家庭emoji,§12-2/§12-4重复实现收敛)②run.log 1MB截断UTF-8半字符修复(代理对边界退位,§10-C)③got重定向响应体resume消费(keep-alive连接归还,§10-D) ********
+//******** 线报酷推送脚本 v3.179 — 判重缓存索引化：接口异常返回海量数据时逐条MessageStore.has() O(N×M)判重卡死(maxPerRun只防推送未防判重,实测N=2万/M=1万→11.6s,外推10万→~60s),改循环前一次性构建缓存三索引与批内索引合并→O(N+M)(实测10万→94ms,约640倍);等价性800轮属性测试证明(含缓存非空场景,0失配);test_app+1海量回归 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1594,6 +1594,24 @@ const App = {
                 try { fs.writeFileSync(hashPath, filterHash, 'utf8'); } catch (e) { /* 写失败静默（缓存目录只读等） */ }
             }
             const newMessages = [];
+            // v3.179：缓存索引化——曾逐条 MessageStore.has()（每条 O(M) findIndex，共 O(N×M)）：
+            // 接口异常返回海量数据（maxPerRun 想防的同一场景）时判重卡死——实测 N=2万/M=1万 → 11.6s，
+            // 外推 N=10万 → ~60s（cron 长时间挂起）。改为循环前一次性构建缓存三索引（O(M)），
+            // 与批内三索引合并判重 → 全程 O(N+M)。三个 Set 与 _findDedupIndex 三条件同构，
+            // 等价性由属性测试证明（800 轮含缓存非空场景，0 失配）
+            const cacheMsgs = MessageStore.readMessages(MessageStore.getFilePath(cacheName));
+            const cacheIds = new Set();      // 缓存中有 id 条目的 String(id)
+            const cacheUrls = new Set();     // 缓存中所有有 url 条目的 normUrl
+            const cacheNoIdUrls = new Set(); // 缓存中无 id 有 url 条目的 normUrl
+            for (const m of cacheMsgs) {
+                if (!m || typeof m !== 'object') continue;
+                if (Utils.hasValidId(m)) cacheIds.add(String(m.id));
+                if (m.url) {
+                    const u = Utils.normUrl(m.url);
+                    cacheUrls.add(u);
+                    if (!Utils.hasValidId(m)) cacheNoIdUrls.add(u);
+                }
+            }
             // v3.176：批内判重与跨运行判重（_findDedupIndex）口径对齐——曾 key=id:|url: 单维度，
             // 同一批「有 id 条目」与「无 id 同 url 条目」key 不同互不可见 → 双推（系统审查 #2）
             const batchIds = new Set();      // 已收录条目的 String(id)（有 id 条目）
@@ -1617,17 +1635,18 @@ const App = {
                     // v3.176：补 louzhu——同内容不同楼主曾被误合并（系统审查 #6）
                     item.id = Utils.anonKey(item.title, item.content, item.posttime, item.shijianchuo, item.pic, item.mall_name, item.price, item.brand, item.catename, item.louzhu);
                 }
-                // 批内判重（口径与 MessageStore._findDedupIndex 一致）：
+                // 判重（口径与 MessageStore._findDedupIndex 一致：缓存索引 + 批内索引合并）：
                 //   有 id 条目：按 String(id) 判重，或「对方为无 id 条目且 url 归一相同」交叉判重
                 //   无 id 条目：按 url 归一判重（不论对方有无 id）
                 const batchUrl = Utils.normUrl(item.url);
-                let batchDup = false;
+                let dup = false;
                 if (Utils.hasValidId(item)) {
-                    batchDup = batchIds.has(String(item.id)) || (item.url && batchNoIdUrls.has(batchUrl));
+                    dup = cacheIds.has(String(item.id)) || (item.url && cacheNoIdUrls.has(batchUrl))
+                       || batchIds.has(String(item.id)) || (item.url && batchNoIdUrls.has(batchUrl));
                 } else if (item.url) {
-                    batchDup = batchUrls.has(batchUrl);
+                    dup = cacheUrls.has(batchUrl) || batchUrls.has(batchUrl);
                 }
-                if (MessageStore.has(item, cacheName) || batchDup) { dedupCount++; continue; }
+                if (dup) { dedupCount++; continue; }
                 // 收录进批内索引
                 if (Utils.hasValidId(item)) batchIds.add(String(item.id));
                 if (item.url) {

@@ -1770,6 +1770,32 @@ await test('单次推送上限 maxPerRun 防推送风暴（v3.129）', async () 
     }
 });
 
+await test('接口异常返回海量数据 → 判重不卡死（v3.179 缓存索引化）', async () => {
+    reset();
+    setPushUrl('t58d_massive');
+    const orig = Config.push.maxPerRun;
+    const origInt = Config.timing.pushInterval, origWait = Config.timing.finalWait;
+    Config.push.maxPerRun = 100;
+    Config.timing.pushInterval = 0;
+    Config.timing.finalWait = 0;
+    try {
+        // 2 万条全不同数据（修复前逐条 has() O(N×M) 约 12s；修复后索引化 ~O(N+M)）
+        fakeData = [];
+        for (let i = 0; i < 20000; i++) fakeData.push(makeItem({ id: i + 100000 }));
+        const t0 = Date.now();
+        const summary = await xbk.run();
+        const ms = Date.now() - t0;
+        assert(summary.pushed === 100, `海量数据应只推 maxPerRun=100: ${JSON.stringify(summary)}`);
+        assert(summary.total === 20000, `total 应 20000: ${JSON.stringify(summary)}`);
+        assert(summary.truncated === 19900, `截断应 19900: ${JSON.stringify(summary)}`);
+        assert(ms < 5000, `海量判重应 <5s（修复前 ~12s）: 实际 ${ms}ms`);
+    } finally {
+        Config.push.maxPerRun = orig;
+        Config.timing.pushInterval = origInt;
+        Config.timing.finalWait = origWait;
+    }
+});
+
 await test('maxPerRun 小数配置 → truncated 整数化（v3.165，parallelLimit 同款 Math.floor）', async () => {
     reset();
     setPushUrl('t70b_maxperrun_float');
