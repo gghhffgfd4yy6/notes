@@ -18,6 +18,6 @@ stages:
     displayName: Nodejs 构建与测试
     nodeVersion: 16.14.2
     commands:
-    - npm config set registry https://registry.npmmirror.com
-    - npm test
+    - git checkout -- node_modules/got 2>/dev/null || true
+    - node run_tests.js
 notify: []
