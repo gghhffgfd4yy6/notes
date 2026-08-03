@@ -1394,7 +1394,38 @@ await test('接口异常 → 发送告警 + 限频（v3.123）', async () => {
     } finally {
         Config.alert.intervalMs = origInterval;
         Config.alert.enabled = origEnabled;
-        try { require('fs').unlinkSync(getFilePath('alert.state')); } catch (e) { /* 忽略 */ }
+        try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 忽略 */ }
+    }
+});
+
+await test('告警 intervalMs 非法字符串 → 回退默认限频不轰炸（v3.167）', async () => {
+    reset();
+    setPushUrl('t72_alert_interval_abc');
+    fakeData = [];
+    const origInterval = Config.alert.intervalMs;
+    const origEnabled = Config.alert.enabled;
+    const alertStatePath = path.join(CACHE_DIR, 'alert.state'); // getFilePath 未导出（曾吞错致假清理，残留 lastAt 限频）
+    try { require('fs').unlinkSync(alertStatePath); } catch (e) { /* 清残留防限频 */ }
+    try {
+        Config.alert.enabled = true;
+        Config.alert.intervalMs = 'abc'; // 非法字符串（环境变量拼错）——曾 'abc' > 0 比较 false → 0 不限频轰炸
+        // 第一次：接口异常 → 发告警（lastAt 空，'abc' 回退默认 3600000 仍发首次）
+        fail4xx = true;
+        try { await xbk.run(); } catch (e) { /* 预期抛错 */ }
+        const alert1 = pushCalls.find(c => c.text.includes('运行异常'));
+        assert(!!alert1, '第一次应发告警');
+        // 第二次：限频应生效（'abc' → 默认 3600000，曾 0 不限频每次轰炸）
+        reset();
+        setPushUrl('t72_alert_interval_abc_2');
+        Config.alert.enabled = true; // reset() 默认关闭告警（曾漏开 → 第二次不发是 disabled 而非限频，变异抓不住）
+        fail4xx = true;
+        try { await xbk.run(); } catch (e) { /* 预期抛错 */ }
+        const alert2 = pushCalls.find(c => c.text.includes('运行异常'));
+        assert(!alert2, `非法 intervalMs 应回退默认限频（曾不限频轰炸）: ${pushCalls.map(c => c.text).join('|')}`);
+    } finally {
+        Config.alert.intervalMs = origInterval;
+        Config.alert.enabled = origEnabled;
+        try { require('fs').unlinkSync(alertStatePath); } catch (e) { /* 忽略 */ }
     }
 });
 
@@ -1449,7 +1480,7 @@ await test('告警通道挂 → 不误报"已发送"（v3.145）', async () => {
         console.log = origLog;
         Config.alert.intervalMs = origInterval;
         Config.alert.enabled = origEnabled;
-        try { require('fs').unlinkSync(getFilePath('alert.state')); } catch (e) { /* 忽略 */ }
+        try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 忽略 */ }
     }
 });
 

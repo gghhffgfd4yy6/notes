@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.166 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；780全绿(648+91+41) ********
+//******** 线报酷推送脚本 v3.167 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；781全绿(648+92+41) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1340,7 +1340,8 @@ const App = {
             const statePath = path.join(MessageStore.cacheDir, 'alert.state');
             let lastAt = 0;
             try { lastAt = JSON.parse(fs.readFileSync(statePath, 'utf8')).lastAt || 0; } catch (e) { /* 无状态文件=首次 */ }
-            const interval = (Config.alert.intervalMs > 0) ? Config.alert.intervalMs : 0; // <=0 = 不限频（每次异常都发）
+            const intervalMs = Utils.num(Config.alert.intervalMs, 3600000); // v3.167: 非法字符串'abc'曾>0比较false→0不限频轰炸（其他数值配置均num回退）
+            const interval = intervalMs > 0 ? intervalMs : 0; // <=0(含-1) = 不限频（每次异常都发）
             if (interval > 0 && Date.now() - lastAt < interval) return; // 限频：间隔内不重复轰炸
             const alertText = '⚠️ xbk-push 运行异常';
             // v3.159：段落分隔 \n\n（与主推送/日报口径一致）——wxpusher Markdown 渲染单个 \n 可能挤成一行

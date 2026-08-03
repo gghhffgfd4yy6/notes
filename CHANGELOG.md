@@ -490,3 +490,12 @@
 - 验证：Bark/PushMe 多设备 1 成 1 败 → 通道成功（不再重复轰炸）；全败 → reject（消息不丢重试）✓
 
 **780 个全绿（单元 648 + 集成 91 + 通道 41）**
+
+## v3.167（告警 intervalMs 非法字符串回退默认 #13）
+
+- **#13 `alert.intervalMs` 非法字符串 → 告警不限频轰炸**：`'abc' > 0` 比较 false → interval=0 不限频（每次接口异常都告警）——其他数值配置均 `Utils.num` 回退默认，此遗漏；修复 `Utils.num(intervalMs, 3600000)`：`'abc'`→默认 1 小时限频，`-1`/`0` 不限频语义保留，字符串 `'3600000'` 正常
+- **连带修复 test_app 假清理**：5 处 `getFilePath('alert.state')` 未从 xbk 解构（`getFilePath is not defined` 被 catch 吞）→ alert.state 从未真正清理 → 残留 lastAt 限频污染后续告警测试——改 `path.join(CACHE_DIR, 'alert.state')`
+- 测试：test_app t72（第一次发/第二次限频）；变异（去掉 num 转换）→ t72 红 ✓
+- 验证：`'abc'`→3600000 限频 ✓；`-1`/`0`→不限频保留 ✓
+
+**781 个全绿（单元 648 + 集成 92 + 通道 41）**
