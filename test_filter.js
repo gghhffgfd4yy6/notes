@@ -6107,10 +6107,14 @@ await test('边界: getFilePath 200 字节精确截断（ASCII/中文/混合）'
 });
 
 await test('边界: 跨日边界（今天 0 点 = 0 天 / 昨天 0 点 = 1 天）', () => {
-    const today = new Date(); today.setHours(0, 0, 0, 0);
-    assertEqual(daysComputed(today.getTime()), 0, '今天 0 点应=0 天');
-    const yesterday = new Date(); yesterday.setHours(0, 0, 0, 0); yesterday.setDate(yesterday.getDate() - 1);
-    assertEqual(daysComputed(yesterday.getTime()), 1, '昨天 0 点应=1 天');
+    // v3.174：用 UTC 日期构造"今天/昨天 0 点"——daysFrom 按 UTC 日期差（v3.170）；
+    // 原 setHours(0,0,0,0) 是本地时区 0 点，+8 时区本地 0 点 = UTC 前一天 16:00 → 误算 1 天
+    // （Gitee Go 容器 +8 时区实测失败，本地 UTC 时区全绿——跨环境暴露）
+    const now = new Date();
+    const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    assertEqual(daysComputed(todayUtc), 0, '今天 0 点应=0 天');
+    const yesterdayUtc = todayUtc - 86400000;
+    assertEqual(daysComputed(yesterdayUtc), 1, '昨天 0 点应=1 天');
     // v3.170：自然日语义（原 24h 段）——以下用固定"今天"避免真实时刻导致边界不稳
     const origNow = Date.now;
     try {
