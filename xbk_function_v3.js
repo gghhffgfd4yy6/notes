@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.170 — 审查修复4项：daysFrom改UTC自然日差(24h段曾少算1天)/htmlToMarkdown无引号href支持+原文链接与{链接}危险协议过滤(javascript:等)/推送全部失败告警await对齐catch路径 ********
+//******** 线报酷推送脚本 v3.171 — 审查修复2项：htmlToMarkdown短标签正则加词边界(img/input/iframe/blockquote/link曾被误当i/b/li输出*/**/-垃圾)/parseTime回退T转空格(2026-8-1T10:30单数字月日曾Invalid而空格格式有效) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -185,7 +185,10 @@ const Utils = {
         } else {
             t = new Date(s);
         }
-        if (isNaN(t.getTime())) t = new Date(s.replace(/-/g, '/'));
+        if (isNaN(t.getTime())) t = new Date(s.replace(/-/g, '/')); 
+        // v3.171：回退时 T 分隔一并转空格——'2026-8-1T10:30'（单数字月日 T 格式）曾 Invalid 返回 null，
+        // 而 '2026-8-1 10:30'（空格格式）宽松解析有效——同类格式不一致；'2026/8/1 10:30' 解析有效
+        if (isNaN(t.getTime())) t = new Date(s.replace(/-/g, '/').replace('T', ' '));
         if (isNaN(t.getTime())) return null;
         return t.getTime();
     },
@@ -402,16 +405,18 @@ const Formatter = {
             .replace(/<\/?p[^>]*>/gi, '\n\n')
             .replace(/<\/?div[^>]*>/gi, '\n\n') // div 为块级元素：真实接口数据常见，缺换行会粘连
             // 列表/粗体/斜体转 Markdown（在标签剥离前）：<li> → - 项、<b>/<strong> → **、<i>/<em> → *
-            .replace(/<li[^>]*>/gi, '\n- ')
-            .replace(/<\/li>/gi, '\n')
-            .replace(/<\/?(?:ul|ol)[^>]*>/gi, '\n')
-            .replace(/<\/?(?:b|strong)[^>]*>/gi, '**')
-            .replace(/<\/?(?:i|em)[^>]*>/gi, '*')
+            // v3.171：短标签正则加 \b 词边界——`<img>/<input>/<iframe>` 曾被 `<i` 前缀误当斜体、
+            // `<blockquote>/<bdo>` 被 `<b` 误当粗体、`<link>` 被 `<li` 误当列表项，输出 */**/- 垃圾
+            .replace(/<li\b[^>]*>/gi, '\n- ')
+            .replace(/<\/li\b>/gi, '\n')
+            .replace(/<\/?(?:ul|ol)\b[^>]*>/gi, '\n')
+            .replace(/<\/?(?:b|strong)\b[^>]*>/gi, '**')
+            .replace(/<\/?(?:i|em)\b[^>]*>/gi, '*')
             // 表格：单元格 | 分隔、行/表换行（曾全部粘连成"甲乙丙丁"）
-            .replace(/<td[^>]*>/gi, ' | ')
-            .replace(/<th[^>]*>/gi, ' | ')
-            .replace(/<tr[^>]*>/gi, '\n')
-            .replace(/<table[^>]*>/gi, '\n\n')
+            .replace(/<td\b[^>]*>/gi, ' | ')
+            .replace(/<th\b[^>]*>/gi, ' | ')
+            .replace(/<tr\b[^>]*>/gi, '\n')
+            .replace(/<table\b[^>]*>/gi, '\n\n')
             .replace(/<script[\s\S]*?<\/script>/gi, '')   // 脚本内容整体移除
             .replace(/<style[\s\S]*?<\/style>/gi, '')     // 样式内容整体移除
             .replace(/<{2,}|>{2,}/g, '')   // 成对尖括号剥离

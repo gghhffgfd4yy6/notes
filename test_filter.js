@@ -1836,6 +1836,31 @@ await test('daysComputed 带时刻注册：UTC 自然日差（v3.170 修复 24h 
     }
 });
 
+await test('parseTime 单数字月日 T 分隔（v3.171：2026-8-1T10:30 曾 Invalid 而空格格式有效）', () => {
+    const origNow = Date.now;
+    try {
+        Date.now = () => Date.UTC(2026, 7, 3, 6, 0);
+        // T 分隔（无秒）与空格分隔应一致
+        assertEqual(daysComputed('2026-8-1T10:30'), 2, '单数字 T 分隔应=2 天（与空格分隔同口径）');
+        assertEqual(daysComputed('2026-8-1 10:30'), 2, '单数字空格分隔应=2 天');
+        // 非法时刻仍无效
+        assertEqual(daysComputed('2026-08-01T25:00:00'), 0, '非法时刻仍=0');
+    } finally {
+        Date.now = origNow;
+    }
+});
+
+await test('htmlToMarkdown 短标签词边界（v3.171：img/input/blockquote 不再误当 i/b）', () => {
+    // 前缀标签不应输出 */**/- 垃圾
+    assertEqual(htmlToMarkdown({ content_html: '<img class="x">', url: '' }), '', 'img 无 src 应剥空（曾输出 *）');
+    assertEqual(htmlToMarkdown({ content_html: '<input type="text">', url: '' }), '', 'input 应剥空（曾输出 *）');
+    assertEqual(htmlToMarkdown({ content_html: '<blockquote>引用</blockquote>', url: '' }), '引用', 'blockquote 保留文本（曾输出 **引用**）');
+    assertEqual(htmlToMarkdown({ content_html: '<link rel="stylesheet">', url: '' }), '', 'link 应剥空（曾输出 -）');
+    // 正常标签不受影响
+    assertEqual(htmlToMarkdown({ content_html: '<b>粗</b><i>斜</i>', url: '' }), '**粗***斜*', '正常 b/i 不变');
+    assertEqual(htmlToMarkdown({ content_html: '<ul><li>项</li></ul>', url: '' }), '- 项', '正常 li 不变');
+});
+
 await test('htmlToMarkdown 无引号 href（v3.170）', () => {
     const r = htmlToMarkdown({ content_html: '<a href=https://u.jd.com/x>京东</a>', url: '' });
     assertEqual(r.includes('[京东](https://u.jd.com/x)'), true, `无引号 href 应转换链接: ${JSON.stringify(r)}`);

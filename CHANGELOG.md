@@ -526,3 +526,9 @@
 - **#5 推送全部失败告警 await**：与 catch 路径（v3.164）同口径——曾 fire-and-forget（内部 .catch 兜底不丢，行为不一致）
 - 未修（设计取舍）：#4 Pusher 超时竞态（符合"宁可多推"哲学）、#6 href 含 > 丢链接（极低影响）
 - 测试：test_filter +3（自然日带时刻/无引号 href/危险 url 过滤），110 章断言更新
+
+## v3.171（审查二轮修复：短标签词边界/单数字月日 T 格式）
+
+- **#8 htmlToMarkdown 短标签正则加 `\b` 词边界**：`<i|em>`/`<b|strong>`/`<li>`/`<td|th|tr|table>` 正则曾无词边界——`<img>/<input>/<iframe>/<ins>` 被 `<i` 前缀误当斜体、`<blockquote>/<bdo>` 被 `<b` 误当粗体、`<link>` 被 `<li` 误当列表项 → 推送输出 `*`/`**`/`-` 垃圾符号；加 `\b` 后仅匹配完整标签名（`<br>` 双保险不受影响）；实测：img/input/link 剥空、blockquote 保留文本、正常 b/i/li/table 不变
+- **#7 parseTime 回退 T 转空格**：`2026-8-1T10:30`（单数字月日 T 分隔）曾 Invalid 返回 null（daysComputed 0 → pingbitime 误拦），而 `2026-8-1 10:30`（空格分隔）宽松解析有效——同类格式不一致；回退路径补 `.replace('T',' ')`（`2026/8/1 10:30` 有效）；已成功路径零影响
+- 测试：test_filter +2（词边界 5 场景/单数字 T 与空格同口径），652/652
