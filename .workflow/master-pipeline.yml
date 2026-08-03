@@ -1,0 +1,23 @@
+version: '1.0'
+name: master-pipeline
+displayName: MasterPipeline
+triggers:
+  trigger: auto
+  push:
+    branches:
+      include:
+      - master
+stages:
+- name: test
+  displayName: 全量测试
+  strategy: naturally
+  trigger: auto
+  steps:
+  - step: build@nodejs
+    name: build_nodejs
+    displayName: Nodejs 构建与测试
+    nodeVersion: 16.14.2
+    commands:
+    - npm config set registry https://registry.npmmirror.com
+    - npm test
+notify: []
