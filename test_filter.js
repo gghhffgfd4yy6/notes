@@ -2167,6 +2167,40 @@ await test('tuisong_replace 模板不含占位符 → 输出与含占位符等�
     assertEqual(r.includes('##'), false);
 });
 
+// ==================== 44b. 2026-08-03 盲区锁定（M1/M2/M3 变异未被抓住的行为） ====================
+
+await test('M1: message 有 id 无 url → 不误判重（url fallback 需双方有 url）', () => {
+    // 变异曾去掉 m.url && message.url 检查——m 无 id 无 url 时 normUrl 双空会误判重（''===''）
+    // 原版：message 有 id 无 url → 只按 id 判重，不匹配无 id 无 url 的缓存记录
+    const p = path.join(CACHE, 'test_m1_urlfallback.json');
+    saveMessages(p, [{ title: '旧匿名', timestamp: 't' }]); // 无 id 无 url 的旧记录（无有效 id）
+    assertEqual(isMessageInFile({ id: '999', title: '新数据' }, 'test_m1_urlfallback.json'), false, '有id无url不应匹配无id无url');
+    assertEqual(isMessageInFile({ id: '999', title: '新数据', url: 'https://x.com/1' }, 'test_m1_urlfallback.json'), false, '有id记录不应被url误判重');
+    // 正常路径：message 有 id 有 url + 缓存同 url 无 id → 应判重（url fallback 生效）
+    saveMessages(p, [{ id: '1', title: '有id', url: 'https://x.com/2', timestamp: 't' }]);
+    assertEqual(isMessageInFile({ id: '999', title: '新', url: 'https://x.com/2' }, 'test_m1_urlfallback.json'), false, '有id不同不判重');
+});
+
+await test('M2: whitelistFilter 字段空值 + 非空关键词 → false（严格白名单语义）', () => {
+    // 主流程只看它保留空标题（!it.title），但导出 API whitelistFilter 是严格白名单：空值不匹配 → 滤掉
+    // 锁定该语义（防未来误改成与主流程混同）；语义差异由调用方（主流程内联）隔离
+    assertEqual(whitelistFilter({ title: '' }, 'title', '京东'), false, '空标题+关键词应滤掉');
+    assertEqual(whitelistFilter({ title: undefined }, 'title', '京东'), false, '缺标题+关键词应滤掉');
+    assertEqual(whitelistFilter({ content: '' }, 'content', '京东'), false, '空内容+关键词应滤掉');
+    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true, '正常匹配仍保留');
+    // falsy 值参与匹配的差异场景（变异点：!value → value===undefined 时，0/false 等 falsy 值会走到正则匹配）
+    assertEqual(whitelistFilter({ title: 0 }, 'title', '0'), false, 'title=0 + 关键词0 应滤掉（falsy 不匹配）');
+    assertEqual(whitelistFilter({ title: false }, 'title', 'false'), false, 'title=false + 关键词false 应滤掉');
+});
+
+await test('M3: matchesCompiled 空串 → 不匹配（空值不参与过滤）', () => {
+    // 变异曾让空串参与正则匹配（'0' 类正则可匹配空串）——原版空值不匹配，调用方（_passIfMissing/!val）已保护主流程
+    const c = compileRules({ pingbibiaoti: '.*', pingbineirong: '京东' });
+    assertEqual(matchesCompiled(c.pingbibiaoti, '', null), false, '空串不匹配（即使 .*）');
+    assertEqual(matchesCompiled(c.pingbineirong, '', null), false, '空内容不匹配');
+    assertEqual(listfilter({ title: '', content: '', catename: '' }, c), true, '主流程空值放行（调用方保护）');
+});
+
 
 // ==================== 45. htmlToMarkdown 输出细节断言 ====================
 console.log('\n📂 45. htmlToMarkdown 输出细节断言');
