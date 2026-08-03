@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.169 — 文档去静态数字（README/FILE_INDEX/REVIEW_DECISIONS 不再维护版本号/测试数/行数/结构数字；版本一致性测试收敛为三方：文件头↔CHANGELOG↔package.json）********
+//******** 线报酷推送脚本 v3.170 — 审查修复4项：daysFrom改UTC自然日差(24h段曾少算1天)/htmlToMarkdown无引号href支持+原文链接与{链接}危险协议过滤(javascript:等)/推送全部失败告警await对齐catch路径 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -200,10 +200,18 @@ const Utils = {
         return m < 10 ? '0' + m : '' + m;
     },
 
-    /** 距今天数：正差向下取整，非正差(今天/未来)返回 0 */
+    /** 距今天数：UTC 自然日差（今天/未来返回 0）
+     *  v3.170：原 24 小时整段（Math.floor((now-ms)/DAY_MS)）——注册时间带具体时刻时少算 1 天
+     *  （8/1 23:00 注册 → 当前 24h 段算 1 天、自然日差 2 天，pingbitime 边界错误拦截）；
+     *  改按 UTC 日期差；无时刻日期（接口实际格式）两种口径恒等，零行为变更
+     */
     daysFrom(ms) {
-        const diff = Date.now() - ms;
-        return diff > 0 ? Math.floor(diff / DAY_MS) : 0;
+        const nowMs = Date.now(); // 保持 Date.now()（测试可 fake Date.now 固定\"今天\"）
+        const now = new Date(nowMs);
+        const dNow = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+        const t = new Date(ms);
+        const dMs = Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate());
+        return dNow > dMs ? Math.floor((dNow - dMs) / DAY_MS) : 0;
     },
 
     /** 归一化 URL 用于判重：trim + 去尾部斜杠（/foo 与 foo、foo/ 视为同一资源） */
@@ -354,8 +362,11 @@ const Formatter = {
             : (shuju.content_html === undefined || shuju.content_html === null ? '' : ''); // 非字符串内容视为空（避免 [object Object]）
         // url 文本与链接目标统一：非字符串视为无链接（与 urlOf 口径一致，避免 '[object Object]' 泄漏）、剥离换行（Markdown 链接文本/目标内的裸换行都会破坏链接，#65）
         const urlText = (typeof shuju.url === 'string') ? shuju.url.replace(/[\r\n]+/g, '') : '';
+        // v3.170：url 危险协议过滤（与 a href 的 javascript:/vbscript:/data: 检查同口径）——
+        // 曾 {链接}/原文链接 对接口 url 无协议过滤；正常链接/相对路径不受影响
+        const safeUrl = urlText && !/^(javascript|vbscript|data):/i.test(urlText.trim()) ? urlText : '';
         // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）
-        const mdUrl = urlText && /[\s()\[\]]/.test(urlText) ? `<${urlText}>` : urlText;
+        const mdUrl = safeUrl && /[\s()\[\]]/.test(safeUrl) ? `<${safeUrl}>` : safeUrl;
         // 无标签内容短路：跳过整个替换链（性能优化）
         if (!html.includes('<')) {
             html = Utils.decodeHtmlEntities(html);
@@ -366,6 +377,12 @@ const Formatter = {
             .replace(/<a\s*[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
                 // 空 href 不生成空链接；危险协议(javascript:/vbscript:/data:)仅保留文本，防 XSS
                 // v3.143：href 先解码实体再检查——'javascript&#58;' 曾绕过（decode 在 a 转换后）
+                const h = Utils.decodeHtmlEntities(String(href).trim().toLowerCase());
+                return (href.trim() && !/^(javascript|vbscript|data):/.test(h)) ? `[${txt}](${href})` : txt;
+            })
+            // v3.170：无引号 href（HTML 合法写法，`<a href=https://x.com>`）曾不匹配 → 链接丢失变纯文本——
+            // 追加处理（带引号的已被上方替换吃掉，此处只处理剩余的无引号形式）
+            .replace(/<a\s+[^>]*?href\s*=\s*([^\s"'>]+)[^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
                 const h = Utils.decodeHtmlEntities(String(href).trim().toLowerCase());
                 return (href.trim() && !/^(javascript|vbscript|data):/.test(h)) ? `[${txt}](${href})` : txt;
             })
@@ -450,7 +467,9 @@ const Formatter = {
         const linkText = (() => {
             // R6-1：非字符串视为无链接（与 htmlToMarkdown urlText 同口径）
             const u = (typeof data.url === 'string') ? data.url.replace(/[\r\n]+/g, '') : '';
-            return u && /[\s()\[\]]/.test(u) ? `<${u}>` : u;
+            // v3.170：危险协议过滤（与 htmlToMarkdown safeUrl 同口径）——{链接} 曾对 javascript: 等无拦截
+            const safeU = u && !/^(javascript|vbscript|data):/i.test(u.trim()) ? u : '';
+            return safeU && /[\s()\[\]]/.test(safeU) ? `<${safeU}>` : safeU;
         })();
         const getContentHtml = () => `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`;
 
@@ -1693,8 +1712,10 @@ const App = {
 
             // v3.163：#9 推送全部失败无告警（v3.123 声称覆盖密钥失效但只实现接口挂）——
             // 补告警推送（限频复用 alert.state，防轰炸）+ run.log ERROR 行（cron 翻日志可见）
+            // v3.170：await 告警完成（与 catch 路径 v3.164 同口径）——曾 fire-and-forget，
+            // run() 返回后进程退出时序不确定（虽然内部 .catch 兜底不丢，但行为不一致）
             if (items.length > 0 && successCount === 0) {
-                this._sendAlert(`推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`);
+                try { await this._sendAlert(`推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`); } catch (e) { /* 告警失败不阻塞主流程 */ }
                 this._writeRunLog(`${new Date().toISOString()} ERROR 推送全部失败 ${items.length} 条（通道可能失效）\n`);
             }
             // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）

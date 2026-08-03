@@ -1823,6 +1823,38 @@ await test('daysComputed 未来日期 → 0', () => {
     assertEqual(daysComputed('2030-01-01'), 0);
 });
 
+await test('daysComputed 带时刻注册：UTC 自然日差（v3.170 修复 24h 段少算 1 天）', () => {
+    const origNow = Date.now;
+    try {
+        Date.now = () => Date.UTC(2026, 7, 3, 6, 0); // 固定"今天"= 2026-08-03 06:00 UTC
+        // 8/1 23:00 注册（带时刻）→ 24h 段曾算 1 天，自然日差应为 2 天
+        assertEqual(daysComputed('2026-08-01T23:00:00Z'), 2, '8/1 23:00 → 8/3 应 2 天（自然日）');
+        assertEqual(daysComputed('2026-08-02T23:00:00Z'), 1, '8/2 23:00 → 应 1 天');
+        assertEqual(daysComputed('2026-08-03T05:59:59Z'), 0, '今天（含未来时刻）→ 0 天');
+    } finally {
+        Date.now = origNow;
+    }
+});
+
+await test('htmlToMarkdown 无引号 href（v3.170）', () => {
+    const r = htmlToMarkdown({ content_html: '<a href=https://u.jd.com/x>京东</a>', url: '' });
+    assertEqual(r.includes('[京东](https://u.jd.com/x)'), true, `无引号 href 应转换链接: ${JSON.stringify(r)}`);
+    // 无引号 + 危险协议仍拦截
+    const r2 = htmlToMarkdown({ content_html: '<a href=javascript:alert(1)>点我</a>', url: '' });
+    assertEqual(r2.includes('javascript:'), false, '无引号危险 href 应拦截');
+});
+
+await test('{链接}/原文链接 危险协议过滤（v3.170）', () => {
+    // javascript: url → {链接} 为空、原文链接不出现
+    assertEqual(tuisong_replace('{链接}', { url: 'javascript:alert(1)', title: 't' }), '', '危险 url 的 {链接} 应为空');
+    const r2 = htmlToMarkdown({ content_html: '<p>x</p>', url: 'javascript:alert(1)' });
+    assertEqual(r2.includes('原文链接'), false, '危险 url 不应生成原文链接');
+    // 正常 url 不受影响（含空格 → <> 包裹）
+    assertEqual(tuisong_replace('{链接}', { url: 'https://u.jd.com/a b', title: 't' }), '<https://u.jd.com/a b>', '正常 url 含空格应 <> 包裹');
+    // 相对路径不受影响
+    assertEqual(tuisong_replace('{链接}', { url: '/haodan/123.html', title: 't' }), '/haodan/123.html', '相对路径保留');
+});
+
 // ==================== 36. _splitLines 解析 ====================
 console.log('\n📂 36. _splitLines 解析');
 
@@ -6044,15 +6076,21 @@ await test('边界: 跨日边界（今天 0 点 = 0 天 / 昨天 0 点 = 1 天�
     assertEqual(daysComputed(today.getTime()), 0, '今天 0 点应=0 天');
     const yesterday = new Date(); yesterday.setHours(0, 0, 0, 0); yesterday.setDate(yesterday.getDate() - 1);
     assertEqual(daysComputed(yesterday.getTime()), 1, '昨天 0 点应=1 天');
-    // 未来 1 分钟 → 0（非正差归零）
-    const future = Date.now() + 60000;
-    assertEqual(daysComputed(future), 0, '未来 1 分钟应=0');
-    // 恰好 23:59:59 前（不足 1 天）→ 0
-    const almost = Date.now() - 86399999;
-    assertEqual(daysComputed(almost), 0, '不足 1 天应=0');
-    // 恰好 24h 前 → 1
-    const dayAgo = Date.now() - 86400000;
-    assertEqual(daysComputed(dayAgo), 1, '恰好 24h 前应=1');
+    // v3.170：自然日语义（原 24h 段）——以下用固定"今天"避免真实时刻导致边界不稳
+    const origNow = Date.now;
+    try {
+        Date.now = () => Date.UTC(2026, 7, 3, 12, 0); // 今天 = 2026-08-03 12:00 UTC
+        const future = Date.now() + 60000;
+        assertEqual(daysComputed(future), 0, '未来 1 分钟应=0');
+        // 差 24h-1ms（昨日同时刻）→ 自然日 = 昨天 → 1 天（24h 段曾算 0，v3.170 修正）
+        const almost = Date.now() - 86399999;
+        assertEqual(daysComputed(almost), 1, '差 24h-1ms 属昨日 → 1 天（自然日，v3.170）');
+        // 恰好 24h 前 → 昨日 → 1 天（两种口径一致）
+        const dayAgo = Date.now() - 86400000;
+        assertEqual(daysComputed(dayAgo), 1, '恰好 24h 前应=1');
+    } finally {
+        Date.now = origNow;
+    }
 });
 
 console.log('\n📂 111. 边界回归补充（负数天数/空值/TS_BOUND 下界/normUrl 空）');
