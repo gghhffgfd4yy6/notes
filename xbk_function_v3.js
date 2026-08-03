@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.162 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；768全绿(643+86+39) ********
+//******** 线报酷推送脚本 v3.163 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；768全绿(643+86+39) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1688,6 +1688,12 @@ const App = {
             console.log('══════════════════════════════');
             await new Promise(r => setTimeout(r, Utils.num(Config.timing.finalWait, 200)));
 
+            // v3.163：#9 推送全部失败无告警（v3.123 声称覆盖密钥失效但只实现接口挂）——
+            // 补告警推送（限频复用 alert.state，防轰炸）+ run.log ERROR 行（cron 翻日志可见）
+            if (items.length > 0 && successCount === 0) {
+                this._sendAlert(`推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`);
+                this._writeRunLog(`${new Date().toISOString()} ERROR 推送全部失败 ${items.length} 条（通道可能失效）\n`);
+            }
             // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
             this._writeRunLog(`${new Date().toISOString()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${items.length - successCount} elapsed=${elapsed}s\n`);
 

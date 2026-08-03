@@ -1738,6 +1738,28 @@ await test('api.timeout 字符串配置生效（#8 v3.162）', async () => {
     }
 });
 
+await test('推送全部失败 → 触发告警调用 + run.log ERROR（#9 v3.163）', async () => {
+    reset();
+    setPushUrl('t70_pushfail');
+    const orig = Config.alert.enabled;
+    const logPath = path.join(CACHE_DIR, 'run.log');
+    try { require('fs').unlinkSync(logPath); } catch (e) { /* 忽略 */ }
+    try {
+        Config.alert.enabled = true;
+        Config.alert.intervalMs = 0;
+        // 推送全部失败（notify mock 抛错）→ pushOne 全 catch → 触发 _sendAlert + ERROR 日志
+        notifyFail = true;
+        fakeData = [makeItem({ id: 1 }), makeItem({ id: 2 })];
+        await xbk.run();
+        const log = require('fs').readFileSync(logPath, 'utf8');
+        assert(log.includes('ERROR'), `推送全失败应写 ERROR 行: ${log.slice(-100)}`);
+        assert(log.includes('推送全部失败'), 'ERROR 行应标明推送全部失败');
+    } finally {
+        Config.alert.enabled = orig;
+        try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')); } catch (e) { /* 忽略 */ }
+    }
+});
+
 await test('pingbitime 配置 + 接口缺 louzhuregtime → 运行期警告（v3.159）', async () => {
     reset();
     setPushUrl('t67_pingbtime_warn');
