@@ -1,8 +1,8 @@
 # 📡 线报酷推送脚本（xbk-push）
 
-定时拉取线报酷接口数据 → 规则过滤 → 多通道推送的 Node.js 脚本。零第三方依赖（自制精简 HTTP 模块），737 个测试全绿。
+定时拉取线报酷接口数据 → 规则过滤 → 多通道推送的 Node.js 脚本。零第三方依赖（自制精简 HTTP 模块），766 个测试全绿。
 
-> 当前版本：v3.158（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本：v3.159（演进历史见 [CHANGELOG.md](CHANGELOG.md)）
 
 ---
 
@@ -43,7 +43,7 @@ npm test            # 或 node run_tests.js
 node test_filter.js && node test_app.js && node test_notify.js
 ```
 
-三套件分工：`test_filter.js`（单元 589，含 Fuzz 随机冒烟 + 10000 条性能基准）→ `test_app.js`（集成 67，mock 完整主流程）→ `test_notify.js`（通道 21）。**101 章自动校验文件头/CHANGELOG/package.json/README 四方一致**。
+三套件分工：`test_filter.js`（单元 643，含 Fuzz 随机冒烟 + 10000 条性能基准）→ `test_app.js`（集成 86，mock 完整主流程）→ `test_notify.js`（通道 37）。**101 章自动校验文件头/CHANGELOG/package.json/README 四方一致**。
 
 **CI**：`.github/workflows/test.yml`——push/PR 自动跑三套（Node 16/18/20 矩阵），全部 PASS 才可合并。**103 章 Fuzz**（固定 seed 随机脏数据 500 轮）曾抓到 `hasValidId` 崩溃 bug（v3.107）。
 
@@ -93,9 +93,9 @@ push_config.local.js      本地密钥（不入库！）
 push_config.local.js.example  密钥配置示例模板（可入库）
 xianbaoku_cache/          去重缓存 + run.log（不入库）
 node_modules/got/         自制精简 HTTP 模块（唯一依赖，被 git 追踪）
-test_filter.js            单元测试（586）
-test_app.js               集成测试（67）
-test_notify.js            通道测试（21）
+test_filter.js            单元测试（643）
+test_app.js               集成测试（86）
+test_notify.js            通道测试（37）
 package.json              工程入口（npm start / npm test）
 README.md                 本文件
 FILE_INDEX.md             文件索引（最详细）

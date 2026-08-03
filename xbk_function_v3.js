@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.158 — 字符串数字形态无效(parseTime数字正则加负号/小数："-1"曾宿主解析2001年9344天、"2026.5"成2026-05)；736全绿(634+75+27) ********
+//******** 线报酷推送脚本 v3.159 — BUG_HUNT 5 项真实bug修复：wxpusher HTML内容自动切contentType2(标签白名单)/过滤规则变更失效「过滤写入」缓存(_f标记+filter.hash)/pingbitime接口缺字段运行期警告/告警日报desp换行统一为段落分隔/模板占位符有效性警告；766全绿(643+86+37) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -256,6 +256,20 @@ const Utils = {
         let h = 5381;
         for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
         return 'anon:' + h.toString(16);
+    },
+
+    /** v3.159：过滤规则稳定哈希（过滤字段固定顺序 + 只看它关键词）——规则变更时用于失效「过滤写入」缓存 */
+    filterHash(filterCfg, zktGjc) {
+        const parts = [];
+        for (const f of FILTER_FIELDS) {
+            const v = filterCfg && filterCfg[f];
+            parts.push(f + '=' + (v === undefined || v === null ? '' : String(v)));
+        }
+        parts.push('zkt_gjc=' + (zktGjc === undefined || zktGjc === null ? '' : String(zktGjc)));
+        const s = parts.join('\u0001');
+        let h = 5381;
+        for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+        return String(h);
     },
 
     /** 数字实体解码统一：NUL 过滤 / 代理区与超范围保留原文 */
@@ -1325,7 +1339,8 @@ const App = {
             const interval = (Config.alert.intervalMs > 0) ? Config.alert.intervalMs : 0; // <=0 = 不限频（每次异常都发）
             if (interval > 0 && Date.now() - lastAt < interval) return; // 限频：间隔内不重复轰炸
             const alertText = '⚠️ xbk-push 运行异常';
-            const alertDesp = `接口/推送异常，请检查。\n时间：${new Date().toLocaleString('zh-CN')}\n原因：${String(errMsg).slice(0, 500)}`;
+            // v3.159：段落分隔 \n\n（与主推送/日报口径一致）——wxpusher Markdown 渲染单个 \n 可能挤成一行
+            const alertDesp = `接口/推送异常，请检查。\n\n时间：${new Date().toLocaleString('zh-CN')}\n\n原因：${String(errMsg).slice(0, 500)}`;
             // v3.156：发送成功才写状态+打印——曾先写 lastAt（发送失败也限频，60s 内挡住重试，信息丢失）
             // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗，与主推送不一致）
             Pusher.send(alertText, alertDesp)
@@ -1358,7 +1373,8 @@ const App = {
                 // 新的一天：发昨日日报（若有数据）
                 if (state.total > 0 || state.failed > 0) {
                     const t = `📊 xbk-push 日报（${state.date}）`;
-                    const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}`;
+                    // v3.159：段落分隔 \n\n（与主推送口径一致）——wxpusher Markdown 渲染单个 \n 可能挤成一行
+                    const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}`;
                     // v3.156：发送成功才重置日期——曾先写 state.date（日报失败也跨天，昨日日报丢失）
                     // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗）
                     Pusher.send(t, d)
@@ -1408,6 +1424,21 @@ const App = {
             if (typeof Config.template.title !== 'string' || typeof Config.template.content !== 'string') {
                 console.warn('⚠️ 配置「template.title/content」应为字符串，已回退默认模板');
             }
+            // v3.159：模板占位符有效性检查——{价格}/{商城}/{品牌}/{图片} 等接口真实字段不提供，输出恒空且无提示
+            const SUPPORTED_TPL_KEYS = ['分类名', '分类ID', '标题', '链接', '日期', '时间', '楼主', '类目', '内容', 'Html内容', 'Markdown内容'];
+            for (const tplName of ['title', 'content']) {
+                const tpl = Config.template[tplName];
+                if (typeof tpl !== 'string') continue;
+                const used = new Set();
+                const tplRe = /\{([^{}]+)\}/g;
+                let tplM;
+                while ((tplM = tplRe.exec(tpl))) used.add(tplM[1]);
+                for (const k of used) {
+                    if (!SUPPORTED_TPL_KEYS.includes(k)) {
+                        console.warn(`⚠️ 模板「template.${tplName}」含占位符「{${k}}」——接口真实字段不提供该数据，将输出为空。支持占位符：{${SUPPORTED_TPL_KEYS.join('} {')}}`);
+                    }
+                }
+            }
 
             // 运行时数值配置校验（函数层已有防御，配置层补提示——#7 同款精神，v3.64）
             const numConfig = [
@@ -1437,13 +1468,34 @@ const App = {
             let filteredCount = 0;
             let truncatedCount = 0; // v3.145：maxPerRun 截断数计入统计（曾凭空消失）
             const cacheName = MessageStore.getFileName(Config.api.pushUrl);
+            // v3.159：过滤规则哈希比对——规则变更时失效「过滤写入」缓存（改宽过滤后旧条目重新评估/推送，
+            // 无需手动清缓存；「推送成功」缓存不受影响，防重复推送）
+            {
+                const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc);
+                const hashPath = path.join(MessageStore.cacheDir, 'filter.hash');
+                let lastHash = '';
+                try { lastHash = fs.readFileSync(hashPath, 'utf8').trim(); } catch (e) { /* 首次运行无状态 */ }
+                if (lastHash && lastHash !== filterHash) {
+                    const fp = MessageStore.getFilePath(cacheName);
+                    const msgs = MessageStore.readMessages(fp);
+                    const kept = msgs.filter(m => !(m && typeof m === 'object' && m._f === true));
+                    if (kept.length !== msgs.length) {
+                        MessageStore.saveMessages(fp, kept);
+                        console.warn(`⚠️ 检测到过滤规则/只看它变更（${lastHash.slice(0, 8)} → ${filterHash.slice(0, 8)}），已清除 ${msgs.length - kept.length} 条「过滤写入」缓存——之前被过滤的条目将重新评估（改宽后即重新推送）`);
+                    }
+                }
+                try { fs.writeFileSync(hashPath, filterHash, 'utf8'); } catch (e) { /* 写失败静默（缓存目录只读等） */ }
+            }
             const newMessages = [];
             const seenInBatch = new Set(); // 防止同一批接口数据里出现重复 id/url 时被重复收录
 
             let badElementCount = 0; // v3.157：非对象元素单独统计（曾混入 filteredCount，诊断不清）
+            let regTimePresent = 0; // v3.159：louzhuregtime 有值统计（pingbitime 有效性警告用）
             for (const item of xbkdata) {
                 // 元素级校验：非对象元素跳过（统计为屏蔽，不崩溃）
                 if (!Utils.isValidItem(item)) { badElementCount++; filteredCount++; continue; }
+                // v3.159：注册时间字段缺失统计（接口可能不提供，pingbitime 配置将不生效）
+                if (item.louzhuregtime !== undefined && item.louzhuregtime !== null && item.louzhuregtime !== '') regTimePresent++;
                 // 归一化：category_name/category_id 兼容映射 + 无标识数据生成合成 id（在判重前统一处理）
                 if (!item.catename && item.category_name) item.catename = item.category_name;
                 if (!item.cateid && item.category_id) item.cateid = item.category_id;
@@ -1455,11 +1507,21 @@ const App = {
                 const key = Utils.hasValidId(item) ? `id:${item.id}` : `url:${Utils.normUrl(item.url)}`;
                 if (MessageStore.has(item, cacheName) || seenInBatch.has(key)) { dedupCount++; continue; }
                 seenInBatch.add(key);
-                newMessages.push(item);
                 if (FilterEngine.listfilter(item, compiledRules)) {
                     items.push(item);
                 } else {
                     filteredCount++;
+                    item._f = true; // v3.159：过滤写入标记（规则变更时失效；过滤=已处理语义，改宽后重新评估）
+                }
+                newMessages.push(item);
+            }
+
+            // v3.159：接口未提供注册时间字段时 pingbitime 过滤不生效——运行期警告（配置无效不感知）
+            const pbCfg = Config.filter && Config.filter.pingbitime;
+            if (pbCfg !== undefined && pbCfg !== null && String(pbCfg).trim() !== '' && xbkdata.length > 0) {
+                const missing = xbkdata.length - regTimePresent;
+                if (missing / xbkdata.length > 0.5) {
+                    console.warn(`⚠️ 接口返回「louzhuregtime」注册时间字段缺失 ${missing}/${xbkdata.length} 条（>50%）——配置的「pingbitime」过滤基本不会生效（接口可能不提供该字段）`);
                 }
             }
 
@@ -1486,7 +1548,9 @@ const App = {
                 }
                 if (kwRe) {
                     // 空标题保留（与推送占位一致，避免"只看它"把无标题数据滤掉）
-                    items = items.filter(it => !it.title || kwRe.test(it.title));
+                    const kept = items.filter(it => !it.title || kwRe.test(it.title));
+                    for (const it of items) { if (!kept.includes(it)) it._f = true; } // v3.159：只看它滤掉的同样标记（规则变更失效）
+                    items = kept;
                 }
                 // 非法正则时 kwRe 为 null：items 不过滤，继续正常推送（避免静默清空）
                 }
@@ -1561,6 +1625,8 @@ const App = {
                 try {
                     await Pusher.send(text, desp);
                     pushedKeys.add(keyOf(item));
+                    // v3.159：推送成功 → 清除过滤写入标记（否则 _f 随对象写回缓存，下次规则变更又误清）
+                    delete item._f;
                     return { item, ok: true };
                 } catch (e) {
                     // 非 Error 兜底（R1）：notify 抛字符串等非 Error 时避免 e.message undefined（与 v3.31/73/81 口径一致）

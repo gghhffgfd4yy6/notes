@@ -204,6 +204,25 @@ await test('wxpusher: appToken + topicIds 数组(逗号分割) + Markdown', () =
     assert(gotCalls.length === 1, '仅 wxpusher 一次请求');
 }));
 
+// 6b. wxpusher 内容类型自适应（v3.159：{Html内容} 模板 + Markdown 通道时 HTML 源码裸露——含 HTML 标签自动切 HTML 渲染）
+await test('wxpusher: 内容含 HTML 标签 → contentType 自动切 2(HTML)', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123';
+    cfg.WX_pusher_topicIds = '456';
+    await notify.sendNotify('标题', '内容<br>第二行<a href="https://x.com">链接</a>');
+    assert(gotCalls.length === 1, '仅 wxpusher 一次请求');
+    assert(gotCalls[0].options.json.contentType === 2,
+        `含HTML应切HTML渲染(contentType=2): ${gotCalls[0].options.json.contentType}`);
+}));
+
+// 6c. Markdown autolink（<https://...>）不应误判为 HTML（v3.159 标签白名单）
+await test('wxpusher: Markdown 内容（<url> autolink）不误判 HTML → 保持 Markdown', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123';
+    cfg.WX_pusher_topicIds = '456';
+    await notify.sendNotify('标题', '原文链接：<https://x.com/a> **粗体**');
+    assert(gotCalls[0].options.json.contentType === 3,
+        `无HTML标签应保持Markdown(contentType=3): ${gotCalls[0].options.json.contentType}`);
+}));
+
 // 7. PushMe（修复后新接入）
 await test('PushMe: 多 key # 分割 + type markdown', () => withChannels(async () => {
     cfg.PUSHME_KEY = 'k1#k2';

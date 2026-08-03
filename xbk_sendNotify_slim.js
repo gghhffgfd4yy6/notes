@@ -492,6 +492,13 @@ function qywxBotNotify(text, desp) {
     });
 }
 
+// v3.159：wxpusher 内容类型自适应——contentType=3(Markdown) 不渲染 HTML 源码（{Html内容} 模板时内容裸露 <br>/<a href>）
+// 含真实 HTML 标签时自动切 contentType=2(HTML 渲染)；标签白名单避免误判 Markdown 的 <https://...> autolink
+function looksHtml(s) {
+    if (!s || typeof s !== 'string') return false;
+    return /<\s*\/?\s*(?:br|a|img|p|div|strong|b|i|em|u|s|table|tr|td|th|ul|ol|li|h[1-6]|span|font|blockquote|code|pre|hr)\b[^>]*>/i.test(s);
+}
+
 function wxPusherNotify(text, desp) {
     return new Promise((resolve, reject) => {
         const { WX_pusher_appToken, WX_pusher_topicIds } =
@@ -503,7 +510,8 @@ function wxPusherNotify(text, desp) {
                 appToken: WX_pusher_appToken,
                 content: desp,
                 summary: safeSlice(text, 90),
-                contentType: 3, // 1文字 2HTML 3Markdown
+                // v3.159：内容含 HTML 标签时用 contentType=2（HTML 渲染）——Markdown(3) 会把 <br>/<a> 当纯文本裸露
+                contentType: looksHtml(desp) ? 2 : 3, // 1文字 2HTML 3Markdown
                 // v3.137：配置注释"多个用逗号分隔"但未分割——[WX_pusher_topicIds] 曾发 ['1,2'] 而非 ['1','2']，多主题失效
                 topicIds: String(WX_pusher_topicIds || '').split(',').map(s => s.trim()).filter(Boolean),
             },

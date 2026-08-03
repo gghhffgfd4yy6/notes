@@ -9,7 +9,7 @@
 
 ### `xbk_function_v3.js` — 主代码(推送脚本核心)
 
-**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。约 1650 行,9 层职责分层架构。
+**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。约 1776 行,9 层职责分层架构。
 
 **运行流程**(`App.run()` 主流程):
 ```
@@ -55,13 +55,13 @@ Config.template.content    // 推送内容模板(默认{Markdown内容})
 Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 ```
 
-**注意**:文件头版本号(v3.153)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 最新/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号(v3.159)需人工维护,但已有 101 章版本一致性测试自动校验(文件头/CHANGELOG 最新/package.json/README 四方一致);`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
 ### `xbk_sendNotify_slim.js` — 推送模块(各通道实现)
 
-**定位**:主代码依赖的推送实现,约 781 行。实现 9 个推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。
+**定位**:主代码依赖的推送实现,约 792 行。实现 9 个推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。
 
 **结构**:
 | 部分 | 内容 |
@@ -115,7 +115,7 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 
 ## 二、测试相关
 
-### `test_filter.js` — 单元测试(约 635 个)
+### `test_filter.js` — 单元测试(约 643 个)
 
 **定位**:主测试文件(约 6210 行),涵盖 20+ 种测试手段,按章节组织。
 
@@ -156,7 +156,7 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 
 ---
 
-### `test_app.js` — 集成测试(约 78 个)
+### `test_app.js` — 集成测试(约 86 个)
 
 **定位**:mock got/notify 验证 App.run 完整主流程(约 1595 行)。
 
@@ -178,7 +178,7 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 
 ---
 
-### `test_notify.js` — 推送通道适配器测试(21 个)
+### `test_notify.js` — 推送通道适配器测试(37 个)
 
 **定位**:mock got 验证各推送通道的**请求构造**(URL/body/headers/编码/设备分割),约 666 行。
 
@@ -225,7 +225,7 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 
 ### `CHANGELOG.md` — 变更日志
 
-版本演进记录(v3.0 → v3.153),每轮修复/重构/功能变更的摘要。
+版本演进记录(v3.0 → v3.159),每轮修复/重构/功能变更的摘要。
 
 ---
 

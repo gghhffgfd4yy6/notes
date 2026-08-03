@@ -1379,6 +1379,7 @@ await test('接口异常 → 发送告警 + 限频（v3.123）', async () => {
         const alert = pushCalls.find(c => c.text.includes('运行异常'));
         assert(!!alert, '应发送运行异常告警');
         assert(alert.desp.includes('Not Found'), `告警内容应含原因: ${alert.desp.slice(0, 80)}`);
+        assert(alert.desp.includes('\n\n时间：'), `告警 desp 应用段落分隔 \\n\\n（v3.159，wxpusher Markdown 渲染单\\n可能挤行）: ${JSON.stringify(alert.desp.slice(0, 60))}`);
         // ② 限频生效：intervalMs 大 → 第二次异常不发（状态文件记录上次）
         Config.alert.intervalMs = 3600000;
         reset();
@@ -1409,6 +1410,7 @@ await test('运行日报：跨天发昨日日报 + 当天累加（v3.125）', as
         const report = pushCalls.find(c => c.text.includes('日报'));
         assert(!!report, '跨天应发昨日日报');
         assert(report.desp.includes('推送 3 条'), `日报应含昨日统计: ${report.desp}`);
+        assert(report.desp.includes('条\n\n获取'), `日报 desp 应用段落分隔 \\n\\n（v3.159，与主推送口径一致）: ${JSON.stringify(report.desp.slice(0, 60))}`);
         // 同一天再跑 → 不重复发日报（累加今天；用新 id 防缓存去重）
         pushCalls.length = 0;
         fakeData = [makeItem({ id: 2 })];
@@ -1661,6 +1663,81 @@ await test('连续运行：report.state 累加/缓存去重/状态文件正确�
         Config.report.enabled = orig;
         try { require('fs').unlinkSync(statePath); } catch (e) { /* 忽略 */ }
     }
+});
+
+// ==================== v3.159：BUG_HUNT 候选修复验证 ====================
+await test('过滤规则变更 → 清除过滤写入缓存，改宽后旧条目重新推送（v3.159）', async () => {
+    reset();
+    setPushUrl('t67_filter_change');
+    const hashPath = path.join(CACHE_DIR, 'filter.hash');
+    try { require('fs').unlinkSync(hashPath); } catch (e) { /* 忽略 */ }
+    try {
+        // 第一次运行：屏蔽「京东」→ 京东条目被过滤写入缓存（_f 标记）
+        Config.filter.pingbibiaoti = '京东';
+        fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '淘宝特价' }), makeItem({ id: 3, title: '拼多多砍价' })];
+        let s = await xbk.run();
+        assert(s.pushed === 2 && s.filtered === 1, `首次应推2过滤1: ${JSON.stringify(s)}`);
+        const cached1 = readCacheFile('t67_filter_change');
+        const marked = cached1.filter(m => m._f === true);
+        assert(marked.length === 1 && marked[0].id === 1,
+            `缓存应有 1 条过滤标记(京东 id=1): ${cached1.map(m => `${m.id}:_f=${m._f}`).join(',')}`);
+
+        // 第二次运行：改宽（不屏蔽）→ 过滤写入缓存失效 → 京东重新评估并推送
+        Config.filter.pingbibiaoti = '';
+        pushCalls = [];
+        s = await xbk.run();
+        assert(s.pushed === 1 && s.filtered === 0 && s.dedup === 2,
+            `改宽后应重推 1 条(京东)，其余去重: ${JSON.stringify(s)}`);
+        assert(pushCalls.length === 1 && pushCalls[0].desp.includes('京东神券'),
+            `京东应重新推送: ${pushCalls.map(c => c.text).join('|')}`);
+        const cached2 = readCacheFile('t67_filter_change');
+        assert(cached2.length === 3 && cached2.every(m => m._f !== true),
+            `过滤标记应已清除（重新推送的 id=1 以成功态写回）: ${cached2.map(m => `${m.id}:_f=${m._f}`).join(',')}`);
+    } finally {
+        try { require('fs').unlinkSync(hashPath); } catch (e) { /* 忽略 */ }
+    }
+});
+
+await test('pingbitime 配置 + 接口缺 louzhuregtime → 运行期警告（v3.159）', async () => {
+    reset();
+    setPushUrl('t67_pingbtime_warn');
+    Config.filter.pingbitime = '5';
+    fakeData = [makeItem({ id: 1, louzhuregtime: null }), makeItem({ id: 2, louzhuregtime: '' }), makeItem({ id: 3 })];
+    const origWarn = console.warn;
+    const warns = [];
+    console.warn = (m) => warns.push(String(m));
+    try {
+        await xbk.run();
+    } finally {
+        console.warn = origWarn;
+        Config.filter.pingbitime = '';
+    }
+    assert(warns.some(w => w.includes('louzhuregtime') && w.includes('pingbitime')),
+        `应有注册时间缺失警告: ${warns.join(' | ')}`);
+});
+
+await test('模板含不支持占位符（{价格}等）→ 启动警告且推送不崩（v3.159）', async () => {
+    reset();
+    setPushUrl('t67_tpl_warn');
+    const origT = Config.template.title, origC = Config.template.content;
+    Config.template.title = '【{分类名}】{标题}';
+    Config.template.content = '{价格} {商城} {品牌} {图片} {标题}';
+    fakeData = [makeItem({ id: 1 })];
+    const origWarn = console.warn;
+    const warns = [];
+    console.warn = (m) => warns.push(String(m));
+    try {
+        await xbk.run();
+    } finally {
+        console.warn = origWarn;
+        Config.template.title = origT;
+        Config.template.content = origC;
+    }
+    assert(warns.some(w => w.includes('{价格}') && w.includes('template.content')),
+        `应有模板占位符警告: ${warns.join(' | ')}`);
+    // {价格} 等未知占位符被 tuisong_replace 替换为空（非保留原样）；{标题} 正常替换——推送不崩
+    assert(pushCalls.some(c => c.desp.includes('京东神券 100元') && !c.desp.includes('{价格}') && !c.desp.includes('{商城}')),
+        `占位符应替换为空且标题正常: ${pushCalls.map(c => JSON.stringify(c.desp.slice(0, 80))).join('|')}`);
 });
 
 if (failed === 0) {
