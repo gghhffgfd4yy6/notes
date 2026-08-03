@@ -18,6 +18,8 @@ stages:
     displayName: Nodejs 构建与测试
     nodeVersion: 16.14.2
     commands:
-    - git checkout -- node_modules/got 2>/dev/null || true
+    - echo "=== 环境检查: 提交=$(git log -1 --format=%H) node=$(node -v) ==="
+    - ls node_modules/got/index.js && echo "got 存在"
+    - git checkout -- node_modules/got 2>/dev/null || echo "checkout got 无变化"
     - node run_tests.js
 notify: []
