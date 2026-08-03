@@ -1698,6 +1698,31 @@ await test('过滤规则变更 → 清除过滤写入缓存，改宽后旧条目
     }
 });
 
+await test('pingbitime 变更 → 清除过滤写入缓存并重推（#7 v3.161）', async () => {
+    reset();
+    setPushUrl('t68_pb_change');
+    const origPb = Config.filter.pingbitime;
+    const fiveDaysAgo = Date.now() - 5 * 86400000;
+    try {
+        Config.filter.pingbitime = '30'; // 注册5天 < 30 → 被天数过滤
+        fakeData = [makeItem({ id: 1, louzhuregtime: fiveDaysAgo })];
+        await xbk.run();
+        const cached1 = readCacheFile('t68_pb_change');
+        assert(cached1.some(m => m._f === true), '被过滤条目应写 _f 标记');
+        // 放宽 pingbitime → filterHash 变化 → 清除 _f → 重推
+        reset();
+        setPushUrl('t68_pb_change');
+        Config.filter.pingbitime = '3'; // 5天 > 3 → 应推送
+        fakeData = [makeItem({ id: 1, louzhuregtime: fiveDaysAgo })];
+        await xbk.run();
+        const cached2 = readCacheFile('t68_pb_change');
+        assert(pushCalls.length === 1, `放宽后应重推(不再被缓存判重跳过)，实际${pushCalls.length}`);
+        assert(!cached2.some(m => m._f === true), '重推后 _f 标记应清除');
+    } finally {
+        Config.filter.pingbitime = origPb;
+    }
+});
+
 await test('pingbitime 配置 + 接口缺 louzhuregtime → 运行期警告（v3.159）', async () => {
     reset();
     setPushUrl('t67_pingbtime_warn');

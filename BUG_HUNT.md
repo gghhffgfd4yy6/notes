@@ -1,7 +1,7 @@
 # 🐛 真实 Bug 评估与修复记录（BUG_HUNT）
 
 > 曾收录**未修复**的、真实触发、有实际影响（非边缘/罕见/理论/企业级）的 bug，每项经**真实验证**。
-> **5 项已全部修复（v3.159，2026-08-03）**——下方每项标注修复方式与验证结果。
+> **6 项已修复（v3.160，2026-08-03）+ 1 项未修复待处理（#7）**——下方每项标注状态、修复方式与验证结果。
 
 ---
 
@@ -63,6 +63,36 @@
 - **修复（v3.159）**：启动检查模板（title/content）含不支持的占位符 → 警告（支持列表 11 个：分类名/分类ID/标题/链接/日期/时间/楼主/类目/内容/Html内容/Markdown内容）。test_app 覆盖。
 - **验证**：`{价格}` 模板 → 启动警告 ✓ 推送正常（占位符替换为空）✓
 
+## 6. 7 个推送通道 API 业务失败被当成功 → 消息永久丢失 ✅ 已修复（v3.160）
+
+- **触发场景**：任一通道 API 返回**业务失败码**（HTTP 200 + code≠成功）——key 失效/被限流/参数错误（配置常见错误）
+- **真实验证**（2026-08-03，mock 各通道业务失败响应）：
+  ```
+  修复前：Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全部「静默成功」（sendNotify 不抛错）
+         仅 wxpusher 正确 reject（v3.154 已修同 class 问题）
+  端到端：单息知通道 + key 无效(code=500) → 修复前 pushed:1、消息写入缓存；
+         修复后 pushed:0、failed:1、缓存不写（下次运行重试，消息不丢）
+  ```
+- **风险**：单通道用户 → 主流程写缓存 → 下次去重跳过 → **消息永久丢失且无感知**（run.log 显示 pushed=N、无告警、无失败日志）；
+  多通道用户更隐蔽——息知「假成功」掩盖 wxpusher「真失败」（allSettled 判定至少一个成功 → 写缓存）
+- **修复（v3.160）**：8 通道 API 级失败统一 reject（与 wxpusher v3.154 同口径）；Server酱 errno=1024（一分钟内重复内容=已送达）保持视为成功；
+  日志脱敏不受影响（reject 消息取 data.msg/description，不打印完整响应）
+- **验证**：8 通道业务失败 8/8 抛错 ✓（verify_api_fail.js）；端到端息知失败缓存不写 ✓；test_notify 39/39（mock 按 URL 返回业务成功码 + 新增 2 测试锁定）
+
+## 7. `pingbitime` 变更不失效「过滤写入」缓存 → 放宽后旧条目不重推 ✅ 已修复（v3.161）
+
+- **触发场景**：用户**调整 `pingbitime`**（注册天数过滤，默认开启 `'5'`）——如从 30 放宽到 5，之前被 `pingbitime` 过滤的条目应重新评估推送
+- **根因**：`Utils.filterHash` 只哈希 `FILTER_FIELDS`（10 个字段）+ `zkt_gjc`，**漏了 `pingbitime`**（`FILTER_FIELDS` 第 97 行无 pingbitime，filterHash 第 264 行遍历它）→ `filter.hash` 不变 → 「过滤写入」缓存（`_f` 标记）不失效 → 被 `pingbitime` 过滤的条目改宽后**永远不重新评估**
+- **真实验证**（2026-08-03，mock got 完整 App.run 两轮）：
+  ```
+  运行1: pingbitime=30 → 注册5天的条目被过滤 → 缓存写 _f 标记(1条)
+  运行2: pingbitime=3（放宽，应推送）→ filter.hash 变化: 否
+         → 条目被缓存判重跳过（pushed=0, dedup=1）→ 不重推 ❌
+  ```
+- **风险**：v3.159 修复 #2（过滤条件变更 → 失效「过滤写入」缓存）时只覆盖 10 个 FILTER_FIELDS + zkt_gjc，**漏了 pingbitime 这一路过滤**（`checkRegisterTime` 也是 `listfilter` 的过滤维度，被它拦的同样写 `_f`）——用户改宽 pingbitime 后旧条目不出现，需手动 `rm xianbaoku_cache/push.json`（与 #2 同 class 的疏漏）
+- **修复（v3.161）**：`filterHash` 补入 `pingbitime`（哈希原始字符串，含多行 `###` 形式）；test_app t68 锁定（pingbitime 变更 → 清除 _f → 放宽重推）
+- **验证**：修复后两轮运行 `filter.hash` 变化 + `pushed=1`（放宽重推）✓；变异（去掉 pingbitime）→ t68 红 ✓
+
 ---
 
 ## 附：验证方法（可复现）
@@ -77,9 +107,10 @@ node -e "const x=require('./xbk_function_v3.js');x.fetchData().then(d=>{const c=
 ---
 
 ## 状态说明
-- 五个候选均**真实验证触发**、风险明确、收益中等、修复难度低-中
-- **v3.159 全部修复**（2026-08-03），修复顺序：1（wxpusher 当前唯一通道，易触发）→ 2（配置变更体验，缓存语义）→ 3（配置无效无提示）→ 4（格式统一）→ 5（模板配置提示）
-- 测试：test_app +3（t67 过滤变更/pingbitime 警告/占位符警告）、test_notify +2（wxpusher HTML/autolink）——**766 全绿**
+- 七个候选均**真实验证触发**、风险明确、收益中-高、修复难度低-中
+- **v3.160 已修复 6 项**（2026-08-03），修复顺序：1（wxpusher 当前唯一通道，易触发）→ 2（配置变更体验，缓存语义）→ 3（配置无效无提示）→ 4（格式统一）→ 5（模板配置提示）→ 6（7 通道 API 业务失败静默 → 消息丢失）
+- **#7 已修复**（v3.161）：filterHash 漏 pingbitime——与 #2 同 class 疏漏，触发不难（改 pingbitime 配置）、收益真实（改宽后旧条目不重推）
+- 测试：test_app +3（t67 过滤变更/pingbitime 警告/占位符警告）、test_notify +4（wxpusher HTML/autolink + v3.160 息知失败/全通道失败）——**768 全绿**
 
 ## 4b. 真实验证补充（非 bug，记录排除）
 

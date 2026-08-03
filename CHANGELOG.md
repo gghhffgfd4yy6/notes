@@ -430,3 +430,22 @@
 - 测试：test_app t67 过滤变更 / pingbitime 警告 / 占位符警告 3 个；test_notify wxpusher HTML / autolink 不误判 2 个；真实验证 5 项全部触发（{Html内容}→HTML、{Markdown内容}→Markdown、缺失 20/20、占位符空）
 
 **766 个全绿（单元 643 + 集成 86 + 通道 37）**
+
+## v3.160（BUG_HUNT 第 6 项真实 bug 修复）
+
+- **#6 7 个推送通道 API 业务失败静默成功 → 消息永久丢失**：Push+/Server酱/Bark/企业微信/息知/PushDeer/PushMe/Telegram 在 **API 返回业务失败码（HTTP 200 + code≠成功）** 时只打日志不 reject（如 key 失效/被限流/参数错误）——sendNotify 判定该通道 fulfilled → 主流程写缓存 → 下次运行去重跳过 → **消息永久丢失且用户无感知**（run.log 显示 pushed=N、无告警）
+  - **wxpusher 已在 v3.154 修复同 class 问题（code≠1000 reject）——其余 7 通道是漏网之鱼**
+  - 端到端实测：息知 key 无效（code=500）→ 修复前 `pushed:1` + 消息写入缓存；修复后 `pushed:0, failed:1` + 缓存不写（下次重试不丢）
+  - 多通道场景更隐蔽：息知「假成功」会掩盖 wxpusher 的「真失败」（allSettled 判定至少一个成功 → 写缓存）
+  - **修复**：8 通道 API 级失败统一 reject（与 wxpusher 同口径）；Server酱 errno=1024（一分钟内重复内容=已送达）保持视为成功
+  - 测试：test_notify mock 按 URL 返回各通道业务成功码（曾全 `'{}'`）+ 新增息知 API 失败 / 全部 8 通道失败 2 个测试（37 → 39）
+
+**768 个全绿（单元 643 + 集成 86 + 通道 39）**
+
+## v3.161（#7：filterHash 补 pingbitime）
+
+- #7（BUG_HUNT 未修复项）：filterHash 曾漏 pingbitime（FILTER_FIELDS 不含它）——改宽 pingbitime 后「过滤写入」缓存不失效，被天数过滤的旧条目不重推（与 v3.159 #2 同 class 疏漏）
+- 修复：filterHash 补入 pingbitime（哈希原始字符串，含多行 ### 形式）
+- 测试：test_app t68（pingbitime 变更 → 清除 _f → 放宽重推）；变异锁定
+
+**769 个全绿（单元 643 + 集成 87 + 通道 39）**

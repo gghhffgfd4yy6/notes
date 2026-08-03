@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.159 — BUG_HUNT 5 项真实bug修复：wxpusher HTML内容自动切contentType2(标签白名单)/过滤规则变更失效「过滤写入」缓存(_f标记+filter.hash)/pingbitime接口缺字段运行期警告/告警日报desp换行统一为段落分隔/模板占位符有效性警告；766全绿(643+86+37) ********
+//******** 线报酷推送脚本 v3.161 — BUG_HUNT 6 项真实bug修复：7 通道 API 业务失败静默成功致消息丢失（Push+/Server酱/Bark/企微/息知/PushDeer/PushMe/TG 全通道 reject 对齐 wxpusher v3.154）；768全绿(643+86+39) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -265,6 +265,10 @@ const Utils = {
             const v = filterCfg && filterCfg[f];
             parts.push(f + '=' + (v === undefined || v === null ? '' : String(v)));
         }
+        // v3.161：补 pingbitime——曾漏（FILTER_FIELDS 不含它），改宽 pingbitime 后「过滤写入」缓存不失效，
+        // 被天数过滤的旧条目不重推（#7，与 v3.159 #2 同 class 疏漏）；哈希原始字符串（含多行###形式）
+        const pb = filterCfg && filterCfg.pingbitime;
+        parts.push('pingbitime=' + (pb === undefined || pb === null ? '' : String(pb)));
         parts.push('zkt_gjc=' + (zktGjc === undefined || zktGjc === null ? '' : String(zktGjc)));
         const s = parts.join('\u0001');
         let h = 5381;
