@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.172 — 重写并行调度器test_app_parallel(v3.122因共享缓存目录overlayfs竞态被回滚；新方案worker独立缓存目录XBK_PARALLEL_ID+--list-file精确分片+失败串行重跑；test_app 92测64.6s→11s) ********
+//******** 线报酷推送脚本 v3.173 — 审查三轮修复2项：htmlToMarkdown删除成对尖括号剥离(5>>3曾误删成53/价格<<100变价格100)/告警日报enabled补falsy判断(0和'0'曾不关闭) ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -419,7 +419,8 @@ const Formatter = {
             .replace(/<table\b[^>]*>/gi, '\n\n')
             .replace(/<script[\s\S]*?<\/script>/gi, '')   // 脚本内容整体移除
             .replace(/<style[\s\S]*?<\/style>/gi, '')     // 样式内容整体移除
-            .replace(/<{2,}|>{2,}/g, '')   // 成对尖括号剥离
+            // v3.173：删除 /<{2,}|>{2,}/g 剥离——曾把合法文本的 >>/<< 误删（'5>>3'→'53'、'价格<<100'→'价格100'）；
+            // 标签形态由上方 <[^>]+> 剥离处理（'<<a>' 被剥），孤立 < / > 文本保留（Markdown 渲染为普通文本）
             .replace(/<[^>]+>/g, '')
             .replace(/\n{3,}/g, '\n\n');
         // 先移除 HTML 标签，再解码实体
@@ -1362,7 +1363,8 @@ const App = {
     // 接口异常告警（v3.123）：限频 + 静默——不影响主流程；告警也走推送通道（通道挂了就静默，无解）
     _sendAlert(errMsg) {
         try {
-            if (!Config.alert || Config.alert.enabled === false || Config.alert.enabled === 'false') return; // v3.158：环境变量 'false' 字符串也关闭
+            // v3.173：!enabled 也关闭（数字 0 / 空串等 falsy 曾 === false/=== 'false' 严格判断漏掉，0 配置不关闭）
+            if (!Config.alert || !Config.alert.enabled || Config.alert.enabled === 'false') return;
             const statePath = path.join(MessageStore.cacheDir, 'alert.state');
             let lastAt = 0;
             try { lastAt = JSON.parse(fs.readFileSync(statePath, 'utf8')).lastAt || 0; } catch (e) { /* 无状态文件=首次 */ }
@@ -1388,7 +1390,8 @@ const App = {
     // 运行日报（v3.125）：跨天时发"昨日日报"，当天累加统计；静默不影响主流程
     _updateReport(summary) {
         try {
-            if (!Config.report || Config.report.enabled === false || Config.report.enabled === 'false') return; // v3.158
+            // v3.173：!enabled 也关闭（数字 0 / 空串等 falsy 曾 === false/=== 'false' 严格判断漏掉，0 配置不关闭）
+            if (!Config.report || !Config.report.enabled || Config.report.enabled === 'false') return;
             const statePath = path.join(MessageStore.cacheDir, 'report.state');
             let state = { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0 };
             try { state = JSON.parse(fs.readFileSync(statePath, 'utf8')) || state; } catch (e) { /* 无状态=首次 */ }

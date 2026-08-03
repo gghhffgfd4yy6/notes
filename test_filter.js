@@ -3741,6 +3741,11 @@ await test('htmlToMarkdown 尖括号剥离（#61）', () => {
     const r = htmlToMarkdown({ content_html: '<<>> 文本 >>', url: 'http://x' });
     assertEqual(r.includes('<<'), false);
     assertEqual(r.includes('文本'), true);
+    // v3.173：>> / << 合法文本不再被剥离（'5>>3' 曾误删成 '53'）
+    const r2 = htmlToMarkdown({ content_html: '<p>5>>3 位运算</p>', url: '' });
+    assertEqual(r2.includes('5>>3'), true, `>> 应保留: ${JSON.stringify(r2)}`);
+    const r3 = htmlToMarkdown({ content_html: '<p>价格<<100</p>', url: '' });
+    assertEqual(r3.includes('<<'), true, `<< 应保留: ${JSON.stringify(r3)}`);
 });
 
 await test('htmlToMarkdown 纯文本短路路径输出正确（#66）', () => {

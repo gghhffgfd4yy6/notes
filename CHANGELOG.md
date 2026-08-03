@@ -544,3 +544,10 @@
 - **效果**：test_app 92 个测试 64.6s（串行）→ 11s（并行，5.9 倍），连续多轮稳定
 - 使用：`node test_app_parallel.js`（沙箱默认并发 8 稳定）| `CONCURRENCY=N node test_app_parallel.js`（真机可调大）
 - **npm test 接入**：run_tests.js 集成测试改走并行调度器（一键全量 97s→17s）；需完整串行验证时直接 `node test_app.js`（CI 即如此）
+
+## v3.173（审查三轮修复：成对尖括号误删文本 / 告警日报 enabled falsy）
+
+- **#9 htmlToMarkdown 删除 `/<{2,}|>{2,}/g` 剥离**：曾把合法文本的 `>>`/`<<` 误删——`5>>3 位运算`→`53 位运算`、`价格<<100`→`价格100`（C++/位运算/数学符号内容被破坏）；标签形态由 `<[^>]+>` 剥离处理（`<<a>` 仍被剥），孤立 `<`/`>` 文本保留（Markdown 渲染为普通文本）；测试 #61 断言更新（`>>`/`<<` 保留）
+- **#10 告警/日报 enabled 补 falsy 判断**：`=== false`/`=== 'false'` 严格判断漏了数字 `0` 和字符串 `'0'`——用户配 `enabled: 0` 想关闭但告警/日报照发；改 `!enabled || === 'false'`（false/0/''/null/undefined 均关闭）；现有 true/false/'false' 行为不变
+- 未修（低影响记录）：href 属性跨行不剥离（真实接口无）、report.state 非对象时日报静默失效（损坏状态罕见）
+- 测试：test_filter #61 断言扩展（+2 场景）
