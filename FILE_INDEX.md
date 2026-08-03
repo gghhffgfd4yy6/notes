@@ -146,7 +146,7 @@ Config.cache.maxSize       // 缓存上限(滚动淘汰)
 |  **一致性修复** | validateConfig 多行分隔符含单独 `\r`(与 _splitLines 口径一致), 分隔符(<br>/\n/\r\n/\r)解析一致 |
 |  **自制 got 直测** | 本地 HTTP server：302 重定向/协议相对 `//` 重定向/4xx 带 statusCode/ETIMEDOUT 超时/POST JSON body/UTF-8 跨 chunk 不乱码/响应体超限 EBODYLIMIT |
 |  **异常路径批量** | 未知占位符保留/对象字段不崩/重定向循环停止/连接拒绝 ECONNREFUSED/timeout 归一 |
-|  **边界精确值** | TS_BOUND 精确分界/normUrl 极端/pingbitime 0-极大-负数/编码大小写-超范围-代理区-NUL |
+|  **边界精确值** | TS_BOUND 精确分界/normUrl 极端/pingbitime 边界值/编码大小写-超范围-代理区-NUL |
 |  **审查项 #56/#65/#7/#链接** | img 空 src/url 换行/maxSize 校验/{链接} Markdown 安全化 |
 |  **版本一致性** | 文件头 ↔ CHANGELOG 最新 ↔ package.json 三方一致（防版本号过时；README 不维护版本号，v3.169 起） |
 |  **配置防御/实体扩展** | cache.dir 非字符串回退/实体映射扩展/href 换行剥离 |

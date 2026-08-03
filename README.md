@@ -51,7 +51,7 @@ node test_filter.js && node test_app.js && node test_notify.js
 
 ```cron
 # 示例：按需设置运行间隔（注意路径用绝对路径，缓存目录基于脚本位置不受 cwd 影响）
-*/5 * * * * cd /path/to/xbk-push && node xbk_function_v3.js >> /var/log/xbk-push.log 2>&1
+*/N * * * * cd /path/to/xbk-push && node xbk_function_v3.js >> /var/log/xbk-push.log 2>&1
 ```
 
 ## 📝 运行日志
@@ -59,8 +59,8 @@ node test_filter.js && node test_app.js && node test_notify.js
 每次运行自动追加到 `xianbaoku_cache/run.log`（gitignore，不入库）：
 
 ```
-2026-08-01T12:00:00.000Z total=5 dedup=1 filtered=2 pushed=2 failed=0 elapsed=0.8s
-2026-08-01T12:05:00.000Z ERROR 请求失败: boom
+<运行时间> total=N dedup=N filtered=N pushed=N failed=N elapsed=Ns
+<运行时间> ERROR <原因>
 ```
 
 - **成功行**：`total` 拉取总数 / `dedup` 去重跳过 / `filtered` 过滤屏蔽 / `pushed` 推送成功 / `failed` 失败数（下次运行重试）/ `elapsed` 运行耗时
