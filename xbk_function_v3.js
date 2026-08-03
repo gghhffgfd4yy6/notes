@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.169 — 文档去静态版本信息（README/FILE_INDEX/REVIEW_DECISIONS 不再维护版本号/测试数/行数；101 章版本一致性收敛为三方：文件头↔CHANGELOG↔package.json）********
+//******** 线报酷推送脚本 v3.169 — 文档去静态数字（README/FILE_INDEX/REVIEW_DECISIONS 不再维护版本号/测试数/行数/结构数字；版本一致性测试收敛为三方：文件头↔CHANGELOG↔package.json）********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';

@@ -26,5 +26,5 @@ jobs:
       - name: 通道测试（test_notify.js）
         run: node test_notify.js
 
-      - name: 集成测试（test_app.js，含真实重试等待 ~45s）
+      - name: 集成测试（test_app.js，含真实重试等待）
         run: node test_app.js

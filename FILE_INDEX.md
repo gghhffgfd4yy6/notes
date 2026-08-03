@@ -281,11 +281,11 @@ node test_filter.js && node test_app.js && node test_notify.js
 
 ### `test_app_parallel.js` — test_app 并行调度器(v3.122 新增)
 
-**定位**:test_app 70 个集成测试并行 fork（独立进程，无全局污染）——`node test_app_parallel.js`，46s → 11s（4 倍）。慢测真实等待、快测 QUICK 加速、run.log 测试独占串行。**并发可配**：`CONCURRENCY=32 node test_app_parallel.js`（真机加速，沙箱默认 8 稳定）。
+**定位**:test_app 集成测试并行 fork（独立进程，无全局污染）——`node test_app_parallel.js`。慢测真实等待、快测 QUICK 加速、run.log 测试独占串行。**并发可配**：`CONCURRENCY=N node test_app_parallel.js`（真机加速，沙箱默认见代码）。
 
 ### `.github/workflows/test.yml` — CI 配置(v3.107 新增)
 
-**定位**:GitHub Actions——push/PR 自动跑三套测试（Node 16/18/20 矩阵），全部 PASS 才可合并。零依赖无需 npm install（自制 got 已入库）。
+**定位**:GitHub Actions——push/PR 自动跑三套测试（Node 多版本矩阵），全部 PASS 才可合并。零依赖无需 npm install（自制 got 已入库）。
 
 ---
 

@@ -22,11 +22,11 @@
 ## 🚀 快速开始
 
 ```bash
-# 1. 配置推送密钥（本地文件，不入库，已 gitignore）
+# 配置推送密钥（本地文件，不入库，已 gitignore）
 cp push_config.local.js.example push_config.local.js
 #    编辑填入你的通道 key（PUSH_KEY / BARK_PUSH / TG_BOT_TOKEN 等）
 
-# 2. 运行（真实拉取 + 推送）
+# 运行（真实拉取 + 推送）
 node xbk_function_v3.js
 
 # 或（有 npm 的环境）
@@ -50,7 +50,7 @@ node test_filter.js && node test_app.js && node test_notify.js
 ## ⏰ cron 定时（示例）
 
 ```cron
-# 每 5 分钟跑一次（注意路径用绝对路径，缓存目录基于脚本位置不受 cwd 影响）
+# 示例：按需设置运行间隔（注意路径用绝对路径，缓存目录基于脚本位置不受 cwd 影响）
 */5 * * * * cd /path/to/xbk-push && node xbk_function_v3.js >> /var/log/xbk-push.log 2>&1
 ```
 
