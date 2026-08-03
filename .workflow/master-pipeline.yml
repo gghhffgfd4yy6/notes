@@ -52,9 +52,10 @@ stages:
   strategy: naturally
   trigger: auto
   steps:
-  - step: shell@agent
+  - step: build@nodejs
     name: summary_ok
     displayName: 打印通过摘要
+    nodeVersion: 16.14.2
     commands:
     - echo "✅ 三套测试全部通过：test_filter + test_app(并行) + test_notify"
     - echo "📊 失败定位方式：Gitee Go 日志中搜索 ❌ 即为失败测试名（各测试文件末尾会打印失败清单）"
