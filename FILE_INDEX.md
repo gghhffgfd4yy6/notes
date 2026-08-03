@@ -9,7 +9,7 @@
 
 ### `xbk_function_v3.js` — 主代码(推送脚本核心)
 
-**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。9 层职责分层架构。
+**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。职责分层架构。
 
 **运行流程**(`App.run()` 主流程):
 ```
@@ -17,21 +17,21 @@
 → 推送(顺序/并行) → 写缓存 → 统计 → 失败重抛(exit 1)
 ```
 
-**9 层结构**:
+**分层结构**:
 
 | 层 | 内容 | 关键内容 |
 |---|---|---|
-| **Config**(1-90 行) | 全部配置 | domain/api(超时5s/重试2)/filter(11个过滤字段)/keyword/timing/push(顺序并行)/cache(maxSize100) |
-| **常量**(90-110) | 魔法数 | DAY_MS/TS_BOUND/MAX_CODE_POINT/SURROGATE/DEFAULT_MAX_SIZE/FILTER_FIELDS |
-| **Utils**(~110-240) | 工具函数 | daysComputed(日期/时间戳/ISO/8位)/normUrl(归一化+幂等)/hasValidId/isValidItem/anonKey(合成id)/decodeHtmlEntities(28实体+数字+emoji)/daysFrom/_decodeNumeric |
-| **Formatter**(~240-330) | 格式化纯函数 | htmlToMarkdown(正则链+短路)/tuisong_replace(占位符替换+惰性)/_finalizeMd |
-| **RuleEngine**(~330-520) | 规则引擎 | _splitLines/_parseLine/compileRules(预编译)/matchesCompiled/checkTimeCompiled/validateConfig(警告)/_compileCatRe/_validateCatRe/_catMatches/_anyRule |
-| **FilterEngine**(~520-620) | 过滤引擎 | checkRegisterTime(注册天数)/checkCategory(分类)/checkFields(三级屏蔽优先级)/listfilter/whitelistFilter/_passIfMissing |
-| **MessageStore**(~620-780) | 缓存管理 | _findDedupIndex(判重)/_upsert/_resetCache/save/saveBatch(复用)/has/readMessages/saveMessages(原子写)/getFileName/getFilePath(防逃逸) |
-| **Network**(~780-810) | 网络层 | fetchData(4xx不重试/429重试/jitter/UA/Accept) |
-| **Pusher**(~810-820) | 推送层 | send(10s超时,抛错由主流程处理) |
-| **App**(~820-960) | 主流程 | run(含并行/顺序推送双模式) |
-| **导出**(~960-1200) | 供测试 | 33 个导出 + Pusher + Config |
+| **Config** | 全部配置 | domain/api(超时/重试)/filter(过滤字段)/keyword/timing/push(顺序并行)/cache(maxSize) |
+| **常量** | 魔法数 | DAY_MS/TS_BOUND/MAX_CODE_POINT/SURROGATE/DEFAULT_MAX_SIZE/FILTER_FIELDS |
+| **Utils** | 工具函数 | daysComputed(日期/时间戳/ISO/8位)/normUrl(归一化+幂等)/hasValidId/isValidItem/anonKey(合成id)/decodeHtmlEntities(实体+数字+emoji)/daysFrom/_decodeNumeric |
+| **Formatter** | 格式化纯函数 | htmlToMarkdown(正则链+短路)/tuisong_replace(占位符替换+惰性)/_finalizeMd |
+| **RuleEngine** | 规则引擎 | _splitLines/_parseLine/compileRules(预编译)/matchesCompiled/checkTimeCompiled/validateConfig(警告)/_compileCatRe/_validateCatRe/_catMatches/_anyRule |
+| **FilterEngine** | 过滤引擎 | checkRegisterTime(注册天数)/checkCategory(分类)/checkFields(三级屏蔽优先级)/listfilter/whitelistFilter/_passIfMissing |
+| **MessageStore** | 缓存管理 | _findDedupIndex(判重)/_upsert/_resetCache/save/saveBatch(复用)/has/readMessages/saveMessages(原子写)/getFileName/getFilePath(防逃逸) |
+| **Network** | 网络层 | fetchData(4xx不重试/429重试/jitter/UA/Accept) |
+| **Pusher** | 推送层 | send(超时,抛错由主流程处理) |
+| **App** | 主流程 | run(含并行/顺序推送双模式) |
+| **导出** | 供测试 | 导出 + Pusher + Config |
 
 **关键设计**:
 - 推送成功才写缓存(失败下次重试,不永久丢失)
@@ -43,7 +43,7 @@
 ```js
 Config.domain              // 接口域名
 Config.api.timeout/retry   // 网络超时(5s)/重试次数(2=最多3次)
-Config.filter.*            // 11 个过滤规则(屏蔽/展现/强化)
+Config.filter.*            // 过滤规则(屏蔽/展现/强化)
 Config.keyword.zkt_gjc     // 只看它关键词
 Config.timing.pushInterval // 顺序模式条间间隔(100ms)
 Config.push.mode           // 'sequential'顺序 | 'parallel'并行
@@ -61,12 +61,12 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 
 ### `xbk_sendNotify_slim.js` — 推送模块(各通道实现)
 
-**定位**:主代码依赖的推送实现。实现 9 个推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。
+**定位**:主代码依赖的推送实现。实现推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。
 
 **结构**:
 | 部分 | 内容 |
 |---|---|
-| `push_config`(9-90 行) | 各通道配置项(BARK_PUSH/PUSH_KEY/PUSHME_KEY/WX_pusher/DEER/QYWX…) |
+| `push_config` | 各通道配置项(BARK_PUSH/PUSH_KEY/PUSHME_KEY/WX_pusher/DEER/QYWX…) |
 | `push_config.local.js` 加载 | 自动加载本地密钥覆盖默认空值(不入库) |
 | `one()` | 一言(随机句子)获取,失败不中断 |
 | `$` 对象 | got.post/get 封装(JSON 解析 + 回调风格) |
@@ -117,7 +117,7 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 
 ### `test_filter.js` — 单元测试
 
-**定位**:主测试文件,涵盖 20+ 种测试手段,按章节组织。
+**定位**:主测试文件,涵盖多种测试手段,按章节组织。
 
 **章节结构**(📂 编号):
 
@@ -130,17 +130,17 @@ Config.cache.maxSize       // 缓存上限(10000条,滚动淘汰)
 | 62-70 | 审查修复 | v3.14-v3.22 审查的修复测试 |
 | 71-81 | 复查/批量 | 通读复查 + 300项清单高价值修复测试 |
 | **82** | **性质测试** | 不变量(daysComputed非负/decode只缩短/normUrl幂等/anonKey确定/标签不残留/占位符全替换/getFileName后缀/compileRules契约) |
-| **83** | **契约测试** | 33 个导出键存在+类型正确+bind 生效+判重口径一致 |
-| **84** | **快照测试** | 6 个完整输出锁定(htmlToMarkdown/tuisong_replace) |
-| **85** | **性能基准** | htmlToMarkdown 1000次<500ms/tuisong 1000次<300ms/listfilter 5000次<500ms |
+| **83** | **契约测试** | 导出键存在+类型正确+bind 生效+判重口径一致 |
+| **84** | **快照测试** | 完整输出锁定(htmlToMarkdown/tuisong_replace) |
+| **85** | **性能基准** | htmlToMarkdown/tuisong/listfilter 性能阈值（具体值见 test_filter.js） |
 | **86** | **分支覆盖** | 关键 if 两方向显式验证 |
 | **87** | **安全测试** | 原型污染 + 输出注入(抓到 javascript: XSS 注入面) |
 | **88** | **稳定性/时间旅行/竞态** | 内存不增长/fake Date 确定性/并发原子写/内存缓存上限 |
-| **89** | **配置矩阵** | 2^10 组合 listfilter 不崩 |
+| **89** | **配置矩阵** | 配置组合 listfilter 不崩 |
 | **90** | **死代码检测** | 导出全被引用/内部 helper 都被调用 |
 | **91** | **Unicode 深度** | emoji 代理对/全角/组合/零宽 + truncateUtf16 代理对安全截断 |
 | **92** | **故障注入** | fs.writeFileSync/readFileSync/renameSync/mkdirSync/readdirSync 抛错 + 双故障(read+write) + 循环引用序列化 |
-| **93** | **深度嵌套压力** | 100 层 HTML/100 条规则 |
+| **93** | **深度嵌套压力** | 深层 HTML/多条规则 |
 | **94** | **兼容/契约/一致性** | 旧缓存兼容/默认值全量契约/内存磁盘一致 |
 | **95** | **ReDoS 防护** | 嵌套量词灾难性回溯检测(hasNestedQuantifier)+compileRules/validateConfig/whitelistFilter/App.run 全入口拦截+端到端不卡死 |
 | **96** | **一致性修复** | validateConfig 多行分隔符含单独 `\r`(与 _splitLines 口径一致)，4 种分隔符(<br>/\n/\r\n/\r)解析一致 |

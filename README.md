@@ -11,7 +11,7 @@
 - **规则过滤**：分类/标题/内容/楼主三级屏蔽 + 强制展现 + 强化屏蔽（`###` 多行语法）
 - **只看它**：关键词白名单过滤（zkt_gjc）
 - **注册天数过滤**：楼主注册 < N 天不推（pingbitime）
-- **9 个推送通道**：Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram
+- **推送通道**：Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram
 - **去重缓存**：推送成功才写缓存，失败下次自动重试；原子写入 + 路径防逃逸
 - **可配置推送模板**：标题/内容模板自由组合占位符，截断长度可调
 - **运行日志**：每次运行摘要 + 失败原因持久化到 `xianbaoku_cache/run.log`
@@ -73,7 +73,7 @@ node test_filter.js && node test_app.js && node test_notify.js
 |---|---|---|
 | `domain` | `https://new.ixbk.net` | 接口域名 |
 | `api.timeout` / `api.retry` | 5000 / 2 | 网络超时 / 重试次数 |
-| `filter.*` | — | 11 个过滤规则（屏蔽/展现/强化） |
+| `filter.*` | — | 过滤规则（屏蔽/展现/强化） |
 | `keyword.zkt_gjc` | `''` | 只看它关键词（正则） |
 | `timing.pushInterval` | 100 | 顺序模式条间间隔(ms) |
 | `push.mode` | `sequential` | 顺序 / `parallel` 并行 |
@@ -87,8 +87,8 @@ node test_filter.js && node test_app.js && node test_notify.js
 ## 📁 目录结构
 
 ```
-xbk_function_v3.js        主代码（9 层架构：Config→Utils→Formatter→RuleEngine→FilterEngine→MessageStore→Network→Pusher→App）
-xbk_sendNotify_slim.js    推送模块（9 通道实现）
+xbk_function_v3.js        主代码（分层架构：Config→Utils→Formatter→RuleEngine→FilterEngine→MessageStore→Network→Pusher→App）
+xbk_sendNotify_slim.js    推送模块（通道实现）
 push_config.local.js      本地密钥（不入库！）
 push_config.local.js.example  密钥配置示例模板（可入库）
 xianbaoku_cache/          去重缓存 + run.log（不入库）

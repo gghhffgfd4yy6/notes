@@ -8,9 +8,9 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 
 const SUITES = [
-    { name: '单元测试',   file: 'test_filter.js',  desc: '主代码 33 导出函数逐函数逻辑' },
+    { name: '单元测试',   file: 'test_filter.js',  desc: '主代码导出函数逐函数逻辑' },
     { name: '集成测试',   file: 'test_app.js',     desc: 'App.run 完整主流程(mock got/notify)' },
-    { name: '通道测试',   file: 'test_notify.js',  desc: '9 推送通道请求构造+脱敏' },
+    { name: '通道测试',   file: 'test_notify.js',  desc: '推送通道请求构造+脱敏' },
 ];
 
 const results = [];
