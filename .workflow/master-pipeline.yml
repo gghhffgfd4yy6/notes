@@ -8,18 +8,54 @@ triggers:
       include:
       - master
 stages:
-- name: test
-  displayName: 全量测试
+- name: unit-test
+  displayName: ① 单元测试 test_filter.js
   strategy: naturally
   trigger: auto
   steps:
   - step: build@nodejs
-    name: build_nodejs
-    displayName: Nodejs 构建与测试
+    name: test_filter
+    displayName: 运行 test_filter.js（单元 652 个）
     nodeVersion: 16.14.2
     commands:
-    - echo "=== 环境检查: 提交=$(git log -1 --format=%H) node=$(node -v) ==="
-    - ls node_modules/got/index.js && echo "got 存在"
-    - git checkout -- node_modules/got 2>/dev/null || echo "checkout got 无变化"
-    - node run_tests.js
+    - git checkout -- node_modules/got 2>/dev/null || true
+    - node test_filter.js
+
+- name: integration-test
+  displayName: ② 集成测试 test_app（并行）
+  strategy: naturally
+  trigger: auto
+  steps:
+  - step: build@nodejs
+    name: test_app
+    displayName: 运行 test_app_parallel.js（集成 93 个，并发 8）
+    nodeVersion: 16.14.2
+    commands:
+    - git checkout -- node_modules/got 2>/dev/null || true
+    - node test_app_parallel.js
+
+- name: notify-test
+  displayName: ③ 通道测试 test_notify.js
+  strategy: naturally
+  trigger: auto
+  steps:
+  - step: build@nodejs
+    name: test_notify
+    displayName: 运行 test_notify.js（通道 41 个）
+    nodeVersion: 16.14.2
+    commands:
+    - git checkout -- node_modules/got 2>/dev/null || true
+    - node test_notify.js
+
+- name: summary
+  displayName: ④ 汇总（三套全过才到这一步）
+  strategy: naturally
+  trigger: auto
+  steps:
+  - step: shell@agent
+    name: summary_ok
+    displayName: 打印通过摘要
+    commands:
+    - echo "✅ 三套测试全部通过：test_filter + test_app(并行) + test_notify"
+    - echo "📊 失败定位方式：Gitee Go 日志中搜索 ❌ 即为失败测试名（各测试文件末尾会打印失败清单）"
 notify: []
