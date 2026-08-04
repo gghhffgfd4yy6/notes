@@ -1459,6 +1459,9 @@ const Pusher = {
         // R4-2：非字符串归一——undefined/null → 空串（避免模板串输出 'undefined' 文本）；数字等 String() 化
         text = text === undefined || text === null ? '' : String(text);
         desp = desp === undefined || desp === null ? '' : String(desp);
+        // 最终推送出口再清理一次：自定义 {内容} 模板可能绕过 Formatter 的 {Html内容} 专用清理，
+        // 而 WxPusher HTML 通道会直接渲染 desp；统一出口防止任意模板把主动 HTML 带入客户端。
+        desp = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(desp));
         // 抛异常由主流程处理：推送失败的消息不写缓存，下次运行重试（避免永久丢失）
         // 加整体超时：单通道最坏 15s，避免慢通道把整批推送拖到数分钟
         // v3.121：clearTimeout 清除超时定时器——Promise.race 完成后定时器仍挂着会导致

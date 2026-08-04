@@ -1103,6 +1103,27 @@ await test('推送模板可配置 + 非法回退默认（v3.68）', async () => 
     }
 });
 
+await test('自定义 {内容} 模板绕过 Formatter 后仍清理主动 HTML（最终推送出口防护）', async () => {
+    reset();
+    setPushUrl('t_html_final_sanitize');
+    const origContent = Config.template.content;
+    try {
+        Config.template.content = '{内容}';
+        fakeData = [makeItem({
+            id: 6001,
+            content: '<script>alert(1)</script><img/onerror=alert(2)>正文',
+            content_html: '<p>安全 HTML</p>',
+        })];
+        await xbk.run();
+        assert(pushCalls.length === 1, '应推送一条');
+        const d = pushCalls[0].desp;
+        assert(!/<script|onerror\s*=|javascript:/i.test(d), `自定义内容不应带主动 HTML: ${d}`);
+        assert(d.includes('正文'), '普通内容文本应保留');
+    } finally {
+        Config.template.content = origContent;
+    }
+});
+
 await test('长 desp 截断保留原文链接（v3.152）', async () => {
     reset();
     setPushUrl('t61_linkkeep');
