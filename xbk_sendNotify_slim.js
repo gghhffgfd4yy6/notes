@@ -52,7 +52,19 @@ function redactSecrets(text) {
     try {
         for (const value of Object.values(push_config)) {
             if (typeof value !== 'string' || value.length < 4) continue;
-            out = out.split(value).join(maskKey(value));
+            // 先替换完整配置值；URL/分隔路径型配置还要拆出 token 段，
+            // 因为服务端错误消息可能只回显路径中的密钥（如 APP_SECRET），而不是完整 URL。
+            const candidates = new Set([value]);
+            const parts = value.split('#').flatMap(part => {
+                const result = part.length >= 4 ? [part] : [];
+                const m = part.match(/^[a-z][a-z0-9+.-]*:\/\/[^/]+\/(.+)$/i);
+                if (m) result.push(...m[1].split(/[^A-Za-z0-9_-]+/).filter(p => p.length >= 4));
+                return result;
+            });
+            for (const part of parts) candidates.add(part);
+            for (const candidate of [...candidates].sort((a, b) => b.length - a.length)) {
+                out = out.split(candidate).join(maskKey(candidate));
+            }
         }
     } catch (e) { /* 配置异常不影响错误摘要输出 */ }
     return out;
@@ -286,14 +298,16 @@ function pushPlusNotify(text, desp) {
                         } else {
                             console.log(
                                 `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
-                                }通知消息异常 ${data && data.msg ? data.msg : ''}\n`,
+                                }通知消息异常 ${data && data.msg ? safeErr(data.msg) : ''}\n`,
                             ); // v3.180：data.msg 也判空——null 时模板访问曾二次抛错走 catch→虚假成功
                             // v3.160：API 级失败(code≠200) reject（与 wxpusher v3.154 同口径）——曾静默 resolve，
                             // 单通道用户主流程写缓存 → 消息永久丢失
-                            reject(new Error(data && data.msg ? data.msg : 'Push+ 发送失败'));
+                            reject(new Error(data && data.msg ? safeErr(data.msg) : 'Push+ 发送失败'));
                         }
                     }
                 } catch (e) {
+                    // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+                    reject(e);
                     $.logErr(e, resp);
                 } finally {
                     resolve(data);
@@ -345,14 +359,16 @@ function serverNotify(text, desp) {
                             console.log('Server 酱发送通知消息成功🎉\n');
                         } else if (errno === 1024) {
                             // 一分钟内发送相同的内容会触发（内容已送达，视为成功不重试）
-                            console.log(`Server 酱发送通知消息异常 ${data.errmsg}\n`);
+                            console.log(`Server 酱发送通知消息异常 ${safeErr(data && data.errmsg)}\n`);
                         } else {
                             console.log(`Server 酱发送通知消息异常 ${safeErr(data)}\n`);
                             // v3.160：API 级失败(errno≠0/1024) reject——曾静默 resolve 致单通道用户消息丢失
-                            reject(new Error(data && data.errmsg ? data.errmsg : 'Server酱 发送失败'));
+                            reject(new Error(data && data.errmsg ? safeErr(data.errmsg) : 'Server酱 发送失败'));
                         }
                     }
                 } catch (e) {
+                    // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+                    reject(e);
                     $.logErr(e, resp);
                 } finally {
                     resolve(data);
@@ -427,7 +443,7 @@ function barkNotify(text, desp, params = {}) {
                                 console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`);
                                 innerResolve({ ok: true });
                             } else {
-                                console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${data.message}\n`);
+                                console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${safeErr(data && data.message)}\n`);
                                 // v3.166：单设备失败不拖垮整体——多设备（# 分割）一个失效时，
                                 // 曾外层 reject → 有效设备已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效设备重复轰炸
                                 innerResolve({ ok: false });
@@ -551,12 +567,14 @@ function qywxBotNotify(text, desp) {
                         if (data && data.errcode === 0) {
                             console.log('企业微信发送通知消息成功🎉。\n');
                         } else {
-                            console.log(`企业微信发送通知消息异常 ${data && data.errmsg ? data.errmsg : ''}\n`); // v3.180：errmsg 判空（同 Push+ else 分支）
+                            console.log(`企业微信发送通知消息异常 ${data && data.errmsg ? safeErr(data.errmsg) : ''}\n`); // v3.180：errmsg 判空（同 Push+ else 分支）
                             // v3.160：API 级失败(errcode≠0) reject——曾静默 resolve 致单通道用户消息丢失
-                            reject(new Error(data && data.errmsg ? data.errmsg : '企业微信 发送失败'));
+                            reject(new Error(data && data.errmsg ? safeErr(data.errmsg) : '企业微信 发送失败'));
                         }
                     }
                 } catch (e) {
+                    // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+                    reject(e);
                     $.logErr(e, resp);
                 } finally {
                     resolve(data);
@@ -613,10 +631,12 @@ function wxPusherNotify(text, desp) {
                             console.log(safeErr(data));
                             // v3.154：API 级失败(code≠1000)也 reject——曾 resolve 静默，单通道用户
                             // （如只保留 wxpusher）主流程会写缓存 → 消息永久丢失（下次去重跳过）
-                            reject(new Error(data && data.msg ? data.msg : 'wxpusher 发送失败'));
+                            reject(new Error(data && data.msg ? safeErr(data.msg) : 'wxpusher 发送失败'));
                         }
                     }
                 } catch (e) {
+                    // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+                    reject(e);
                     $.logErr(e, resp);
                 } finally {
                     resolve(data);
@@ -661,10 +681,12 @@ function wxXiZhiNotify(text, desp) {
                             // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数）
                             console.log(safeErr(data));
                             // v3.160：API 级失败(code≠200) reject——曾静默 resolve 致单通道用户消息永久丢失
-                            reject(new Error(data && data.msg ? data.msg : '息知 发送失败'));
+                            reject(new Error(data && data.msg ? safeErr(data.msg) : '息知 发送失败'));
                         }
                     }
                 } catch (e) {
+                    // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+                    reject(e);
                     $.logErr(e, resp);
                 } finally {
                     resolve(data);
@@ -713,6 +735,8 @@ function pushDeerNotify(text, desp) {
                         }
                     }
                 } catch (e) {
+                    // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+                    reject(e);
                     $.logErr(e, resp);
                 } finally {
                     resolve(data);
@@ -771,10 +795,12 @@ function tgNotify(text, desp) {
                         } else {
                             console.log(`Telegram 发送通知消息异常 ${safeErr(data)}\n`);
                             // v3.160：API 级失败(ok≠true) reject——曾静默 resolve 致单通道用户消息丢失
-                            reject(new Error(data && data.description ? data.description : 'Telegram 发送失败'));
+                            reject(new Error(data && data.description ? safeErr(data.description) : 'Telegram 发送失败'));
                         }
                     }
                 } catch (e) {
+                    // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+                    reject(e);
                     $.logErr(e, resp);
                 } finally {
                     resolve(data);
@@ -829,12 +855,24 @@ async function sendNotify(text, desp, params = {}) {
     text = cleanSurrogates(text);
     desp = cleanSurrogates(desp);
     // 通道配置检查：一个都没配 → 拒绝（避免"静默成功"让主流程以为推送完成并写缓存）
-    // 注意：这里必须与下方 Promise.all 实际调用的通道一一对应，漏一个就会让已配置的通道静默失效
-    const hasChannel = push_config.PUSH_PLUS_TOKEN || push_config.PUSH_KEY || push_config.BARK_PUSH ||
-        push_config.QYWX_KEY || push_config.WX_pusher_appToken || push_config.WX_XIZHI_KEY ||
-        push_config.DEER_KEY || push_config.PUSHME_KEY ||
-        (push_config.TG_BOT_TOKEN && push_config.TG_USER_ID);
-    if (!hasChannel) {
+    // 注意：这里必须与下方 Promise.all 实际调用的通道一一对应，漏一个就会让已配置的通道静默失效。
+    // 分隔型配置（Bark/PushMe）还要排除只有分隔符/空白的值，否则通道函数会无请求地 resolve，
+    // configuredFlags 又把它计为已配置，最终出现「无实际设备却虚假成功」的 P1。
+    const nonEmpty = (v) => {
+        if (!v) return false;
+        try { return String(v).trim() !== ''; } catch (e) { return false; }
+    };
+    const delimitedNonEmpty = (v) => {
+        if (!v) return false;
+        try { return String(v).split('#').some(s => s.trim() !== ''); } catch (e) { return false; }
+    };
+    const configuredFlags = [
+        nonEmpty(push_config.PUSH_PLUS_TOKEN), nonEmpty(push_config.PUSH_KEY), delimitedNonEmpty(push_config.BARK_PUSH),
+        nonEmpty(push_config.QYWX_KEY), nonEmpty(push_config.WX_pusher_appToken), nonEmpty(push_config.WX_XIZHI_KEY),
+        nonEmpty(push_config.DEER_KEY), delimitedNonEmpty(push_config.PUSHME_KEY),
+        nonEmpty(push_config.TG_BOT_TOKEN) && nonEmpty(push_config.TG_USER_ID),
+    ];
+    if (!configuredFlags.some(Boolean)) {
         throw new Error('未配置任何推送通道（Push+/Server酱/Bark/企业微信/wxpusher/息知/PushDeer/PushMe/Telegram）');
     }
     // 一言开关按显式 true 开启；false/0/空值及其他非法值均关闭，兼容环境变量字符串。
@@ -861,13 +899,8 @@ async function sendNotify(text, desp, params = {}) {
         pushMeNotify(text, desp, params),
         tgNotify(text, desp, params),
     ]);
-    // v3.133b：只统计"已配置"通道——未配置的通道 resolve（不参与），不掩盖已配置通道的失败
-    const configuredFlags = [
-        !!push_config.PUSH_PLUS_TOKEN, !!push_config.PUSH_KEY, !!push_config.BARK_PUSH,
-        !!push_config.QYWX_KEY, !!push_config.WX_pusher_appToken, !!push_config.WX_XIZHI_KEY,
-        !!push_config.DEER_KEY, !!push_config.PUSHME_KEY,
-        !!(push_config.TG_BOT_TOKEN && push_config.TG_USER_ID),
-    ];
+    // v3.133b：只统计实际可用的已配置通道——与入口检查共用同一组 configuredFlags，
+    // 防止 Bark/PushMe 只有 '#' 分隔符时被统计为成功。
     const attempted = results.filter((r, i) => configuredFlags[i]);
     const okCount = attempted.filter(r => r.status === 'fulfilled').length;
     if (attempted.length > 0 && okCount === 0) {

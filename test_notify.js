@@ -18,6 +18,7 @@ let failPost = false;     // got.post 失败开关（v3.75：验证失败日志�
 let failWxpusher = false; // wxpusher API 失败开关（v3.154：code≠1000 应 reject 不静默）
 let failBiz = false;      // 全部通道 API 业务失败开关（v3.160：code≠成功 应 reject 不静默）
 let nullBody = false;     // v3.180：HTTP 200 + 响应体 JSON null 开关（曾 4 通道虚假成功→消息丢失 P1）
+let malformedResponse = false; // 响应字段 getter 抛异常：必须按通道失败，不能被 finally resolve 掩盖
 let leakResponse = false; // v3.185：异常响应含敏感字段时，日志只允许输出安全摘要
 let failMDevSecond = false; // v3.166：Bark/PushMe 多设备第 2 个失败（至少一个成功=通道成功不重试）
 let mdevCount = 0;          // 多设备计数（failMDevSecond 时按调用序第 1 成功第 2 失败）
@@ -48,9 +49,19 @@ require.cache[gotPath].exports.post = (url, options) => {
         if (nullBody) {
             // v3.180：HTTP 200 + JSON null——JSON.parse('null') → data=null → 无防御通道曾虚假成功
             body = 'null';
+        } else if (malformedResponse) {
+            // 字段 getter 抛错模拟：覆盖 data.code/errno/errcode/content/ok 等响应访问路径。
+            // 旧版 catch 只记日志、finally 仍 resolve，单通道会被误记成功。
+            body = {};
+            for (const key of ['code', 'errno', 'errcode', 'content', 'ok', 'description', 'msg', 'errmsg', 'data']) {
+                Object.defineProperty(body, key, {
+                    enumerable: true,
+                    get() { throw new Error(`malformed ${key}`); },
+                });
+            }
         } else if (leakResponse) {
             // v3.185：模拟无标准错误字段但回显 token/key/请求体的异常响应
-            body = { code: 500, requestToken: 'LEAK_TOKEN_SECRET', payload: { key: 'LEAK_KEY_SECRET' }, msg: '业务失败 APP_SECRET' };
+            body = { code: 500, requestToken: 'LEAK_TOKEN_SECRET', payload: { key: 'LEAK_KEY_SECRET' }, msg: '业务失败 APP_SECRET', errmsg: '业务失败 APP_SECRET', message: '业务失败 APP_SECRET', description: '业务失败 APP_SECRET' };
         } else if (failMDevSecond) {
             // v3.166：多设备部分失败——第 1 个设备成功、第 2 个失败（应至少一个成功=通道成功）
             mdevCount++;
@@ -372,6 +383,15 @@ await test('通道全空 → reject 不静默成功', () => withChannels(async (
     assert(gotCalls.length === 0, '无通道不应发请求');
 }));
 
+await test('分隔型通道只有 #/空白 → reject，不虚假成功', () => withChannels(async () => {
+    cfg.BARK_PUSH = ' #  ';
+    cfg.PUSHME_KEY = '##';
+    let rejected = false;
+    try { await notify.sendNotify('t', 'd'); } catch (e) { rejected = true; }
+    assert(rejected, '无实际设备/key 时应 reject');
+    assert(gotCalls.length === 0, `无实际设备/key 不应发请求: ${gotCalls.length}`);
+}));
+
 // 10. 一言 HITOKOTO 分支（曾从未被测试；one() 曾因 JSON.parse(已解析对象) 崩溃致一言永不生效）
 await test('HITOKOTO 启用 → 一言内容追加到推送（真实 got 对象 body）', () => withChannels(async () => {
     cfg.PUSH_KEY = 'SCT123456';
@@ -636,8 +656,12 @@ await test('日志脱敏：异常响应中的 token/key 不进入日志', () => 
     console.log = (...args) => captured.push(args.join(' '));
     try {
         leakResponse = true;
-        try { await notify.sendNotify('标题', '内容'); } catch (e) { /* 业务失败应 reject */ }
+        let caught = null;
+        try { await notify.sendNotify('标题', '内容'); } catch (e) { caught = e; }
         const all = captured.join('\\n');
+        assert(caught, '业务失败应 reject');
+        assert(!caught.message.includes('APP_SECRET'), `reject 错误信息不应泄露已配置 token: ${caught.message}`);
+        assert(caught.message.includes('业务失败'), `reject 错误信息仍应保留诊断摘要: ${caught.message}`);
         assert(!all.includes('LEAK_TOKEN_SECRET'), '响应 token 不应进入日志');
         assert(!all.includes('LEAK_KEY_SECRET'), '响应 key 不应进入日志');
         assert(!all.includes('APP_SECRET'), '错误摘要中的已配置 token 也不应明文出现');
@@ -645,6 +669,33 @@ await test('日志脱敏：异常响应中的 token/key 不进入日志', () => 
     } finally {
         leakResponse = false;
         console.log = origLog;
+    }
+}));
+
+await test('各通道 reject 错误摘要也脱敏，不进入错误信息', () => withChannels(async () => {
+    leakResponse = true;
+    try {
+        const cases = [
+            ['Push+', { PUSH_PLUS_TOKEN: 'APP_SECRET' }],
+            ['Server酱', { PUSH_KEY: 'APP_SECRET' }],
+            ['Bark', { BARK_PUSH: 'APP_SECRET' }],
+            ['企业微信', { QYWX_KEY: 'APP_SECRET' }],
+            ['wxpusher', { WX_pusher_appToken: 'APP_SECRET', WX_pusher_topicIds: '1' }],
+            ['息知', { WX_XIZHI_KEY: 'https://xizhi.qqoq.net/APP_SECRET.send' }],
+            ['Telegram', { TG_BOT_TOKEN: 'APP_SECRET', TG_USER_ID: '1' }],
+        ];
+        for (const [name, c] of cases) {
+            for (const k of CHANNEL_KEYS) cfg[k] = '';
+            cfg.HITOKOTO = 'false';
+            Object.assign(cfg, c);
+            let caught = null;
+            try { await notify.sendNotify('t', 'd'); } catch (e) { caught = e; }
+            assert(caught, `${name}: 业务失败应 reject`);
+            assert(!caught.message.includes('APP_SECRET'), `${name}: reject 错误不应泄露密钥: ${caught.message}`);
+            if (name !== 'Bark') assert(caught.message.includes('业务失败'), `${name}: 应保留诊断文本: ${caught.message}`);
+        }
+    } finally {
+        leakResponse = false;
     }
 }));
 
@@ -786,6 +837,31 @@ await test('HTTP 200 + 响应体 JSON null → 全部通道 reject 不虚假成�
         }
     } finally {
         nullBody = false;
+    }
+}));
+
+await test('响应字段访问异常 → 通道 reject，不被 finally resolve 掩盖', () => withChannels(async () => {
+    malformedResponse = true;
+    try {
+        const cases = [
+            ['Push+', { PUSH_PLUS_TOKEN: 't' }],
+            ['Server酱', { PUSH_KEY: 'SCT123' }],
+            ['企业微信', { QYWX_KEY: 'k' }],
+            ['wxpusher', { WX_pusher_appToken: 'a', WX_pusher_topicIds: '1' }],
+            ['息知', { WX_XIZHI_KEY: 'https://xizhi.qqoq.net/x.send' }],
+            ['PushDeer', { DEER_KEY: 'd' }],
+            ['Telegram', { TG_BOT_TOKEN: 't', TG_USER_ID: 'u' }],
+        ];
+        for (const [name, c] of cases) {
+            for (const k of CHANNEL_KEYS) cfg[k] = '';
+            cfg.HITOKOTO = 'false';
+            Object.assign(cfg, c);
+            let rejected = false;
+            try { await notify.sendNotify('t', 'd'); } catch (e) { rejected = true; }
+            assert(rejected, `${name}: 响应字段访问异常应 reject，不能虚假成功`);
+        }
+    } finally {
+        malformedResponse = false;
     }
 }));
 
