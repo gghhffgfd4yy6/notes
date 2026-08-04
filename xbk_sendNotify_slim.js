@@ -51,9 +51,22 @@ function safeErr(e) {
     if (e === undefined || e === null) return '';
     if (typeof e === 'string') return e.length > 200 ? e.slice(0, 200) + '…' : e;
     if (e && e.message) return String(e.message).slice(0, 200);
-    let s;
-    try { s = JSON.stringify(e); } catch (err) { s = String(e); }
-    return s ? (s.length > 200 ? s.slice(0, 200) + '…' : s) : String(e);
+    // 只保留协议错误摘要字段，禁止把服务端完整响应（可能回显 token/key/请求体）写入日志。
+    // 未知结构不再 JSON.stringify 全对象，避免敏感字段通过兜底路径泄露。
+    if (typeof e === 'object') {
+        const fields = ['code', 'errno', 'errcode', 'error_code', 'statusCode', 'message', 'msg', 'errmsg', 'description', 'error'];
+        const summary = {};
+        for (const key of fields) {
+            try {
+                if (e[key] !== undefined && e[key] !== null) summary[key] = String(e[key]);
+            } catch (err) { /* getter 异常字段跳过 */ }
+        }
+        let s;
+        try { s = Object.keys(summary).length ? JSON.stringify(summary) : '[响应结构异常]'; }
+        catch (err) { s = '[响应结构异常]'; }
+        return s.length > 200 ? s.slice(0, 200) + '…' : s;
+    }
+    return String(e).slice(0, 200);
 }
 
 const push_config = {
@@ -580,7 +593,7 @@ function wxPusherNotify(text, desp) {
                         } else {
                             console.log(`WxPusher发送通知消息异常\n`);
                             // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数含 token）
-                            console.log(data && data.msg ? data.msg : JSON.stringify(data).slice(0, 200));
+                            console.log(safeErr(data));
                             // v3.154：API 级失败(code≠1000)也 reject——曾 resolve 静默，单通道用户
                             // （如只保留 wxpusher）主流程会写缓存 → 消息永久丢失（下次去重跳过）
                             reject(new Error(data && data.msg ? data.msg : 'wxpusher 发送失败'));
@@ -629,7 +642,7 @@ function wxXiZhiNotify(text, desp) {
                         } else {
                             console.log(`息知发送通知消息异常 \n`);
                             // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数）
-                            console.log(data && data.msg ? data.msg : JSON.stringify(data).slice(0, 200));
+                            console.log(safeErr(data));
                             // v3.160：API 级失败(code≠200) reject——曾静默 resolve 致单通道用户消息永久丢失
                             reject(new Error(data && data.msg ? data.msg : '息知 发送失败'));
                         }

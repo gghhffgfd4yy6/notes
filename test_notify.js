@@ -18,6 +18,7 @@ let failPost = false;     // got.post 失败开关（v3.75：验证失败日志�
 let failWxpusher = false; // wxpusher API 失败开关（v3.154：code≠1000 应 reject 不静默）
 let failBiz = false;      // 全部通道 API 业务失败开关（v3.160：code≠成功 应 reject 不静默）
 let nullBody = false;     // v3.180：HTTP 200 + 响应体 JSON null 开关（曾 4 通道虚假成功→消息丢失 P1）
+let leakResponse = false; // v3.185：异常响应含敏感字段时，日志只允许输出安全摘要
 let failMDevSecond = false; // v3.166：Bark/PushMe 多设备第 2 个失败（至少一个成功=通道成功不重试）
 let mdevCount = 0;          // 多设备计数（failMDevSecond 时按调用序第 1 成功第 2 失败）
 require.cache[gotPath].exports = (url, options) => {
@@ -47,6 +48,9 @@ require.cache[gotPath].exports.post = (url, options) => {
         if (nullBody) {
             // v3.180：HTTP 200 + JSON null——JSON.parse('null') → data=null → 无防御通道曾虚假成功
             body = 'null';
+        } else if (leakResponse) {
+            // v3.185：模拟无标准错误字段但回显 token/key/请求体的异常响应
+            body = { code: 500, requestToken: 'LEAK_TOKEN_SECRET', payload: { key: 'LEAK_KEY_SECRET' }, msg: '业务失败' };
         } else if (failMDevSecond) {
             // v3.166：多设备部分失败——第 1 个设备成功、第 2 个失败（应至少一个成功=通道成功）
             mdevCount++;
@@ -625,6 +629,24 @@ await test('日志脱敏: Bark/PushMe/wxpusher/息知 失败日志不泄露密�
         console.log = origLog;
     }
 }));
+await test('日志脱敏：异常响应中的 token/key 不进入日志', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'APP_SECRET';
+    const origLog = console.log;
+    const captured = [];
+    console.log = (...args) => captured.push(args.join(' '));
+    try {
+        leakResponse = true;
+        try { await notify.sendNotify('标题', '内容'); } catch (e) { /* 业务失败应 reject */ }
+        const all = captured.join('\\n');
+        assert(!all.includes('LEAK_TOKEN_SECRET'), '响应 token 不应进入日志');
+        assert(!all.includes('LEAK_KEY_SECRET'), '响应 key 不应进入日志');
+        assert(all.includes('业务失败'), '安全错误摘要仍应保留');
+    } finally {
+        leakResponse = false;
+        console.log = origLog;
+    }
+}));
+
 await test('Bark: 归档/分组/声音/级别/图标/URL 参数传递', () => withChannels(async () => {
     cfg.BARK_PUSH = 'device1';
     cfg.BARK_ARCHIVE = '1';

@@ -1662,6 +1662,34 @@ await test('告警发送失败 → alert.state 不写（v3.156 #3）', async () 
     }
 });
 
+await test('状态文件 rename 失败 → 保留旧 JSON，不留下半写状态（v3.185）', async () => {
+    reset();
+    setPushUrl('t62_state_atomic');
+    const statePath = path.join(CACHE_DIR, 'alert.state');
+    const oldState = { lastAt: 123456789 };
+    const origRename = fs.renameSync;
+    const origEnabled = Config.alert.enabled;
+    try {
+        Config.alert.enabled = true;
+        Config.alert.intervalMs = 0;
+        fs.writeFileSync(statePath, JSON.stringify(oldState));
+        fs.renameSync = (from, to) => {
+            if (to === statePath) throw new Error('模拟状态 rename 失败');
+            return origRename(from, to);
+        };
+        fail4xx = true;
+        try { await xbk.run(); } catch (e) { /* 接口失败预期抛错 */ }
+        const st = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+        assert(st.lastAt === oldState.lastAt, `rename 失败不应破坏旧状态: ${JSON.stringify(st)}`);
+        assert(!fs.existsSync(statePath + '.tmp'), '状态临时文件应清理');
+    } finally {
+        fs.renameSync = origRename;
+        Config.alert.enabled = origEnabled;
+        try { fs.unlinkSync(statePath); } catch (e) { /* 忽略 */ }
+        try { fs.unlinkSync(statePath + '.tmp'); } catch (e) { /* 忽略 */ }
+    }
+});
+
 await test('日报发送失败 → report.state date 不重置（v3.156 #3）', async () => {
     reset();
     setPushUrl('t63_report_state');
@@ -1925,6 +1953,38 @@ await test('过滤规则变更 → 清除过滤写入缓存，改宽后旧条目
             `过滤标记应已清除（重新推送的 id=1 以成功态写回）: ${cached2.map(m => `${m.id}:_f=${m._f}`).join(',')}`);
     } finally {
         try { require('fs').unlinkSync(hashPath); } catch (e) { /* 忽略 */ }
+    }
+});
+
+await test('过滤缓存清理写入失败 → filter.hash 不推进，下次可重试（P2 防回归）', async () => {
+    reset();
+    setPushUrl('t67_filter_hash_write_fail');
+    const hashPath = path.join(CACHE_DIR, 'filter.hash');
+    const origFilter = Config.filter.pingbibiaoti;
+    const origRename = fs.renameSync;
+    try {
+        try { fs.unlinkSync(hashPath); } catch (e) { /* 首次运行无 hash */ }
+        Config.filter.pingbibiaoti = '京东';
+        fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '淘宝特价' })];
+        await xbk.run();
+        const oldHash = fs.readFileSync(hashPath, 'utf8');
+
+        Config.filter.pingbibiaoti = '';
+        let failedOnce = true;
+        fs.renameSync = (from, to) => {
+            if (failedOnce && String(to).endsWith('t67_filter_hash_write_fail.json')) {
+                failedOnce = false;
+                throw new Error('模拟过滤缓存 rename 失败');
+            }
+            return origRename(from, to);
+        };
+        fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '淘宝特价' })];
+        await xbk.run();
+        assert(fs.readFileSync(hashPath, 'utf8') === oldHash, '过滤缓存清理失败时 filter.hash 不应推进');
+    } finally {
+        fs.renameSync = origRename;
+        Config.filter.pingbibiaoti = origFilter;
+        try { fs.unlinkSync(hashPath); } catch (e) { /* 忽略 */ }
     }
 });
 

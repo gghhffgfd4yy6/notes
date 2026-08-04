@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.184 — 修复 cache.dir 路径逃逸与危险 URL 内部控制空白绕过；安全回归测试锁定 ********
+//******** 线报酷推送脚本 v3.185 — 修复 filter.hash 时序、状态文件原子写与通道错误日志敏感字段泄露；全调用点回归锁定 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1191,19 +1191,22 @@ const MessageStore = {
         })();
         if (text === null) {
             this._memoSet(filePath, toSave);
-            return;
+            return false;
         }
         // 原子写入：先写 tmp 再 rename，避免并发/崩溃时半写文件损坏缓存
         const tmpFile = filePath + '.tmp';
+        let saved = true;
         try {
             fs.writeFileSync(tmpFile, text, 'utf8');
             fs.renameSync(tmpFile, filePath);
         } catch (e) {
+            saved = false;
             // 写失败/rename 失败：清理 tmp 残留，不中断
             try { fs.unlinkSync(tmpFile); } catch (e2) { /* 忽略 */ }
             console.error(`缓存写入失败 ${filePath}:`, e.message);
         }
         this._memoSet(filePath, toSave);
+        return saved;
     },
 
     has(message, filename) {
@@ -1415,6 +1418,25 @@ const App = {
         return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
     },
 
+    // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
+    _writeState(filePath, state) {
+        let text;
+        try { text = JSON.stringify(state); } catch (e) {
+            console.error(`状态序列化失败 ${filePath}:`, e.message);
+            return false;
+        }
+        const tmpFile = filePath + '.tmp';
+        try {
+            fs.writeFileSync(tmpFile, text, 'utf8');
+            fs.renameSync(tmpFile, filePath);
+            return true;
+        } catch (e) {
+            try { fs.unlinkSync(tmpFile); } catch (e2) { /* 忽略 */ }
+            console.error(`状态写入失败 ${filePath}:`, e.message);
+            return false;
+        }
+    },
+
     // 运行日志：追加一行到缓存目录 run.log（成功摘要/失败 ERROR 共用），超过 1MB 截断保留尾部（防无限增长；写失败静默不中断）
     _writeRunLog(line) {
         try {
@@ -1457,7 +1479,7 @@ const App = {
             // 杀死未完成的告警 HTTP（cron 直接运行收不到告警，#10）
             return Pusher.send(alertText, alertDesp)
                 .then(() => {
-                    fs.writeFileSync(statePath, JSON.stringify({ lastAt: Date.now() }), 'utf8');
+                    this._writeState(statePath, { lastAt: Date.now() });
                     console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）');
                 })
                 .catch(() => { /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */ });
@@ -1505,7 +1527,7 @@ const App = {
                             state.pushed += pend.pushed || 0;
                             state.failed += pend.failed || 0;
                             state.truncated += pend.truncated || 0;
-                            fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
+                            this._writeState(statePath, state);
                             console.log('已发送昨日运行日报');
                         })
                         .catch(() => {
@@ -1520,7 +1542,7 @@ const App = {
                             pend.failed += summary.failed || 0;
                             pend.truncated += summary.truncated || 0;
                             state.pending = pend;
-                            fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
+                            this._writeState(statePath, state);
                         });
                     return;
                 }
@@ -1535,7 +1557,7 @@ const App = {
             }
             if (!state.date) state.date = today;
             acc(state);
-            fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
+            this._writeState(statePath, state);
         } catch (e) { /* 日报失败静默 */ }
     },
 
@@ -1618,16 +1640,24 @@ const App = {
                 const hashPath = path.join(MessageStore.cacheDir, 'filter.hash');
                 let lastHash = '';
                 try { lastHash = fs.readFileSync(hashPath, 'utf8').trim(); } catch (e) { /* 首次运行无状态 */ }
+                let filterStateReady = true;
                 if (lastHash && lastHash !== filterHash) {
                     const fp = MessageStore.getFilePath(cacheName);
                     const msgs = MessageStore.readMessages(fp);
                     const kept = msgs.filter(m => !(m && typeof m === 'object' && m._f === true));
                     if (kept.length !== msgs.length) {
-                        MessageStore.saveMessages(fp, kept);
-                        console.warn(`⚠️ 检测到过滤规则/只看它变更（${lastHash.slice(0, 8)} → ${filterHash.slice(0, 8)}），已清除 ${msgs.length - kept.length} 条「过滤写入」缓存——之前被过滤的条目将重新评估（改宽后即重新推送）`);
+                        filterStateReady = MessageStore.saveMessages(fp, kept);
+                        if (filterStateReady) {
+                            console.warn(`⚠️ 检测到过滤规则/只看它变更（${lastHash.slice(0, 8)} → ${filterHash.slice(0, 8)}），已清除 ${msgs.length - kept.length} 条「过滤写入」缓存——之前被过滤的条目将重新评估（改宽后即重新推送）`);
+                        } else {
+                            console.warn('⚠️ 过滤缓存失效写入失败，本次不更新 filter.hash，下次运行将继续重试规则变更处理');
+                        }
                     }
                 }
-                try { fs.writeFileSync(hashPath, filterHash, 'utf8'); } catch (e) { /* 写失败静默（缓存目录只读等） */ }
+                // 只有过滤缓存清理成功后才推进 hash；否则下次运行必须继续重试，避免旧 _f 永久失效。
+                if (filterStateReady) {
+                    try { fs.writeFileSync(hashPath, filterHash, 'utf8'); } catch (e) { /* 写失败静默（下次运行重新比对） */ }
+                }
             }
             const newMessages = [];
             // v3.179：缓存索引化——曾逐条 MessageStore.has()（每条 O(M) findIndex，共 O(N×M)）：
