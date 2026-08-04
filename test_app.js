@@ -1202,6 +1202,20 @@ await test('并行模式 + 自定义模板/截断组合（v3.84）', async () =>
     }
 });
 
+await test('组合防御: 过滤配置含嵌套 Symbol → filterHash/run 不崩', async () => {
+    reset();
+    setPushUrl('t_filter_hash_symbol');
+    const orig = Config.filter.pingbibiaoti;
+    try {
+        Config.filter.pingbibiaoti = [Symbol('bad')];
+        fakeData = [];
+        const s = await xbk.run();
+        assert(s && s.total === 0, `脏过滤配置不应阻断主流程: ${JSON.stringify(s)}`);
+    } finally {
+        Config.filter.pingbibiaoti = orig;
+    }
+});
+
 await test('配置矩阵: 全部非法值并行模式不崩（v3.95）', async () => {
     reset();
     setPushUrl('t51_cfg_matrix');

@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.186 — 修复符号链接缓存逃逸、损坏日报状态与实体编码主动 HTML 注入；全调用点回归锁定 ********
+//******** 线报酷推送脚本 v3.187 — 修复组合配置脏值 hash 崩溃与异常日志已配置密钥回显；联合路径回归锁定 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -274,15 +274,19 @@ const Utils = {
     /** v3.159：过滤规则稳定哈希（过滤字段固定顺序 + 只看它关键词）——规则变更时用于失效「过滤写入」缓存 */
     filterHash(filterCfg, zktGjc) {
         const parts = [];
+        const safeStr = (v) => {
+            if (v === undefined || v === null || typeof v === 'symbol') return '';
+            try { return String(v); } catch (e) { return ''; }
+        };
         for (const f of FILTER_FIELDS) {
             const v = filterCfg && filterCfg[f];
-            parts.push(f + '=' + (v === undefined || v === null ? '' : String(v)));
+            parts.push(f + '=' + safeStr(v));
         }
         // v3.161：补 pingbitime——曾漏（FILTER_FIELDS 不含它），改宽 pingbitime 后「过滤写入」缓存不失效，
         // 被天数过滤的旧条目不重推（#7，与 v3.159 #2 同 class 疏漏）；哈希原始字符串（含多行###形式）
         const pb = filterCfg && filterCfg.pingbitime;
-        parts.push('pingbitime=' + (pb === undefined || pb === null ? '' : String(pb)));
-        parts.push('zkt_gjc=' + (zktGjc === undefined || zktGjc === null ? '' : String(zktGjc)));
+        parts.push('pingbitime=' + safeStr(pb));
+        parts.push('zkt_gjc=' + safeStr(zktGjc));
         const s = parts.join('\u0001');
         let h = 5381;
         for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;

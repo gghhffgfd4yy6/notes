@@ -47,10 +47,27 @@ function safeSlice(s, max) {
 // 错误摘要（v3.75）：失败日志统一打摘要而非整个 err 对象——
 // $.post 回调的 err 是 err.response.body（API 异常响应体，可能回显请求参数含密钥），
 // 直接 console.log(err) 会在 cron 日志重定向/分享时泄露；截断 200 字符防超长刷屏
+function redactSecrets(text) {
+    let out = String(text === undefined || text === null ? '' : text);
+    try {
+        for (const value of Object.values(push_config)) {
+            if (typeof value !== 'string' || value.length < 4) continue;
+            out = out.split(value).join(maskKey(value));
+        }
+    } catch (e) { /* 配置异常不影响错误摘要输出 */ }
+    return out;
+}
+
 function safeErr(e) {
     if (e === undefined || e === null) return '';
-    if (typeof e === 'string') return e.length > 200 ? e.slice(0, 200) + '…' : e;
-    if (e && e.message) return String(e.message).slice(0, 200);
+    if (typeof e === 'string') {
+        const s = redactSecrets(e);
+        return s.length > 200 ? s.slice(0, 200) + '…' : s;
+    }
+    if (e && e.message) {
+        const s = redactSecrets(e.message);
+        return s.length > 200 ? s.slice(0, 200) + '…' : s;
+    }
     // 只保留协议错误摘要字段，禁止把服务端完整响应（可能回显 token/key/请求体）写入日志。
     // 未知结构不再 JSON.stringify 全对象，避免敏感字段通过兜底路径泄露。
     if (typeof e === 'object') {
@@ -58,7 +75,7 @@ function safeErr(e) {
         const summary = {};
         for (const key of fields) {
             try {
-                if (e[key] !== undefined && e[key] !== null) summary[key] = String(e[key]);
+                if (e[key] !== undefined && e[key] !== null) summary[key] = redactSecrets(e[key]);
             } catch (err) { /* getter 异常字段跳过 */ }
         }
         let s;
@@ -66,7 +83,7 @@ function safeErr(e) {
         catch (err) { s = '[响应结构异常]'; }
         return s.length > 200 ? s.slice(0, 200) + '…' : s;
     }
-    return String(e).slice(0, 200);
+    return redactSecrets(e).slice(0, 200);
 }
 
 const push_config = {

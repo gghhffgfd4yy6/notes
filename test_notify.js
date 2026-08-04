@@ -50,7 +50,7 @@ require.cache[gotPath].exports.post = (url, options) => {
             body = 'null';
         } else if (leakResponse) {
             // v3.185：模拟无标准错误字段但回显 token/key/请求体的异常响应
-            body = { code: 500, requestToken: 'LEAK_TOKEN_SECRET', payload: { key: 'LEAK_KEY_SECRET' }, msg: '业务失败' };
+            body = { code: 500, requestToken: 'LEAK_TOKEN_SECRET', payload: { key: 'LEAK_KEY_SECRET' }, msg: '业务失败 APP_SECRET' };
         } else if (failMDevSecond) {
             // v3.166：多设备部分失败——第 1 个设备成功、第 2 个失败（应至少一个成功=通道成功）
             mdevCount++;
@@ -640,6 +640,7 @@ await test('日志脱敏：异常响应中的 token/key 不进入日志', () => 
         const all = captured.join('\\n');
         assert(!all.includes('LEAK_TOKEN_SECRET'), '响应 token 不应进入日志');
         assert(!all.includes('LEAK_KEY_SECRET'), '响应 key 不应进入日志');
+        assert(!all.includes('APP_SECRET'), '错误摘要中的已配置 token 也不应明文出现');
         assert(all.includes('业务失败'), '安全错误摘要仍应保留');
     } finally {
         leakResponse = false;
