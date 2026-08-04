@@ -2554,8 +2554,10 @@ await test('tuisong_replace posttime为字符串', () => {
     assertEqual(r.length > 0, true);
 });
 
-await test('saveBatch undefined → 不崩溃', () => {
-    saveBatch(undefined, 'test_sb_undef.json');
+await test('saveBatch 非数组输入 → 不崩溃', () => {
+    for (const value of [undefined, null, {}, 123, true, Symbol('x'), 'abc']) {
+        saveBatch(value, 'test_sb_non_array.json');
+    }
     assertEqual(true, true);
 });
 
@@ -4809,6 +4811,43 @@ await test('got: 协议相对 // 重定向 location 不拼坏（曾拼成 origin
         const res = await got(`http://127.0.0.1:${port}/pr`);
         assertEqual(res.statusCode, 200, `协议相对 location 应正确跟随，实际 ${res.statusCode}（修复前拼成 origin//host 404）`);
         assertEqual(res.body, 'ok');
+    } finally {
+        await new Promise(r => server.close(r));
+    }
+});
+
+await test('got: 路径相对重定向正确解析（Location: next）', async () => {
+    const http = require('http');
+    const got = require('got');
+    const server = http.createServer((req, res) => {
+        if (req.url === '/r') { res.writeHead(302, { Location: 'next' }); res.end(); }
+        else if (req.url === '/next') { res.writeHead(200); res.end('relative-ok'); }
+        else { res.writeHead(404); res.end('nf:' + req.url); }
+    });
+    await new Promise(r => server.listen(0, r));
+    const port = server.address().port;
+    try {
+        const res = await got(`http://127.0.0.1:${port}/r`);
+        assertEqual(res.statusCode, 200, `路径相对 location 应正确跟随，实际 ${res.statusCode}`);
+        assertEqual(res.body, 'relative-ok');
+    } finally {
+        await new Promise(r => server.close(r));
+    }
+});
+
+await test('got: 非法重定向地址应 reject，不应抛出到进程外', async () => {
+    const http = require('http');
+    const got = require('got');
+    const server = http.createServer((req, res) => {
+        res.writeHead(302, { Location: 'http://[' });
+        res.end();
+    });
+    await new Promise(r => server.listen(0, r));
+    const port = server.address().port;
+    try {
+        let caught = null;
+        try { await got(`http://127.0.0.1:${port}/bad`); } catch (e) { caught = e; }
+        assertEqual(!!caught, true, '非法重定向应以 Promise reject 返回');
     } finally {
         await new Promise(r => server.close(r));
     }

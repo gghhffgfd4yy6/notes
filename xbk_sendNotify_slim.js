@@ -807,7 +807,11 @@ async function sendNotify(text, desp, params = {}) {
     if (!hasChannel) {
         throw new Error('未配置任何推送通道（Push+/Server酱/Bark/企业微信/wxpusher/息知/PushDeer/PushMe/Telegram）');
     }
-    if (push_config.HITOKOTO !== 'false') {
+    // 一言开关按显式 true 开启；false/0/空值及其他非法值均关闭，兼容环境变量字符串。
+    // 旧逻辑仅排除字符串 'false'，导致 HITOKOTO=0/'0'/undefined 时仍请求一言并额外增加延迟。
+    const hitokotoEnabled = push_config.HITOKOTO === true ||
+        (typeof push_config.HITOKOTO === 'string' && push_config.HITOKOTO.toLowerCase() === 'true');
+    if (hitokotoEnabled) {
         if (typeof one === 'function') {
             try { desp += '\n\n' + (await one()); }
             catch (e) { console.log('一言获取失败，跳过:', e && e.message ? e.message : String(e)); }

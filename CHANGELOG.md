@@ -618,3 +618,22 @@
 - **修复**：4 通道判定改 `data && data.code === 200`（errcode 同）——**且补 else 分支二次防御**（Push+/企微的 `data.msg`/`data.errmsg` 模板访问在 null 时同样抛错走 catch，曾使第一版修复失效）；5 个本就有防御的通道（Server酱 data&&链 / Bark·PushMe catch 显式 false / PushDeer·TG data&&链）经实测确认安全无需改
 - **为什么测试没抓到**：test_notify 覆盖 err/业务失败码/成功码/全通道失败，未 mock "HTTP 200 + body=null"（JSON null）场景
 - 测试：test_notify +1（4 victim + 2 对照全部 reject），43/43；656+98+43=797 全绿
+
+## v3.181（HITOKOTO 开关误判修复）
+
+- **问题**：`HITOKOTO` 旧逻辑仅排除字符串 `'false'`；当配置为数字 `0`、字符串 `'0'`、空值或其他非法值时，仍会请求一言接口，增加不必要的网络请求和推送延迟。
+- **修复**：仅显式布尔值 `true` 或字符串 `'true'`（大小写不敏感）启用一言；其他值均关闭。
+- **回归测试**：覆盖 `false`、`0`、`'0'`、`'false'`、空值、非法字符串等配置形态。
+
+## v3.182（自制 got 重定向解析与异常防御修复）
+
+- **问题 1**：HTTP `Location: next` 这类路径相对重定向被旧逻辑拼成错误地址，导致重定向失败。
+- **问题 2**：非法 `Location` 在异步响应回调中直接 `new URL()` 抛异常，可能绕过 Promise reject，造成进程级异常或请求无法正常结束。
+- **修复**：统一使用 `new URL(location, currentUrl)` 解析重定向；解析失败时消费响应体并以 Promise reject 返回。
+- **回归测试**：覆盖路径相对重定向和非法重定向地址。
+
+## v3.183（saveBatch 非数组输入防御修复）
+
+- **问题**：公开的 `saveBatch()` 接口收到对象、数字、布尔值或 Symbol 等非数组输入时，旧逻辑进入 `for...of` 并抛出 `newMessages is not iterable`。
+- **修复**：批量写入入口统一要求数组；非数组输入直接安全返回，不影响正常数组写入。
+- **回归测试**：覆盖空值、对象、数字、布尔值、Symbol 和字符串输入。

@@ -309,6 +309,18 @@ await test('HITOKOTO: one() 带 3s 短超时（不阻塞推送）', () => withCh
     assert(hitokotoCall.options && hitokotoCall.options.timeout === 3000,
         `一言应带 3s 超时: ${hitokotoCall.options && hitokotoCall.options.timeout}`);
 }));
+
+await test('HITOKOTO: false/0/非法值不请求一言（配置防御）', () => withChannels(async () => {
+    cfg.PUSH_KEY = 'SCT123';
+    for (const value of [false, 0, '0', 'false', '', 'abc', undefined, null]) {
+        cfg.HITOKOTO = value;
+        reset();
+        await notify.sendNotify('标题', '内容');
+        assert(!gotCalls.some(c => c.url.includes('hitokoto.cn')), `HITOKOTO=${String(value)} 不应请求一言`);
+        assert(gotCalls.length === 1, `HITOKOTO=${String(value)} 应只发推送请求，实际${gotCalls.length}`);
+    }
+}));
+
 await test('mdToPlain: 原文链接 text===url 不重复显示（v3.153）', () => withChannels(async () => {
     cfg.PUSH_PLUS_TOKEN = 'token123';
     // 真实 desp 原文链接（text 与 href 相同）
