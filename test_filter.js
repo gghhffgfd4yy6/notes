@@ -5204,6 +5204,27 @@ await test('防御: cache.dir 非字符串 → 回退默认不崩（v3.80）', (
     }
 });
 
+await test('防御: cache.dir 路径不能逃出项目根目录', () => {
+    const orig = Config.cache.dir;
+    const root = path.resolve(__dirname) + path.sep;
+    try {
+        for (const dir of ['../../tmp/xbk-escape', '../../../etc', 'foo/../../bar', '/tmp/outside']) {
+            Config.cache.dir = dir;
+            const p = getFilePath('push.json');
+            assertEqual(p.startsWith(root), true, `cache.dir=${dir} 不应逃出项目根目录: ${p}`);
+        }
+    } finally {
+        Config.cache.dir = orig;
+    }
+});
+
+await test('安全: URL 协议内部控制空白不能绕过危险协议过滤', () => {
+    for (const u of ['java\nscript:alert(1)', 'java\tscript:alert(1)', 'java\rscript:alert(1)']) {
+        const out = htmlToMarkdown({ content_html: `<a href="${u}">危险链接</a>` });
+        assertEqual(out.includes('[危险链接]('), false, `内部控制空白不应生成可点击链接: ${JSON.stringify(u)} -> ${out}`);
+    }
+});
+
 await test('实体扩展: ensp/emsp/cent/curren/箭头（v3.83）', () => {
     assertEqual(decodeHtmlEntities('a&ensp;b'), 'a b', '&ensp; 半角空格');
     assertEqual(decodeHtmlEntities('a&emsp;b'), 'a b', '&emsp; 全角空格（与 nbsp 同口径转普通空格）');

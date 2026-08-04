@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.183 — 修复 HITOKOTO 开关误判 + 自制 got 重定向防御 + saveBatch 非数组输入崩溃；回归测试锁定 ********
+//******** 线报酷推送脚本 v3.184 — 修复 cache.dir 路径逃逸与危险 URL 内部控制空白绕过；安全回归测试锁定 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -355,8 +355,8 @@ const Utils = {
         if (url === undefined || url === null) return false;
         let s;
         try { s = String(url); } catch (e) { return false; }
-        // 去除首尾空白和协议前控制空白，防止 JavaScript URL 借空白绕过协议检查
-        s = this.decodeHtmlEntities(s).replace(/^[\u0000-\u0020]+/, '').toLowerCase();
+        // 去除 ASCII 控制空白，防止 `java\nscript:`/`java\tscript:` 等内部空白绕过协议检查
+        s = this.decodeHtmlEntities(s).replace(/[\u0000-\u0020]+/g, '').toLowerCase();
         return /^(javascript|vbscript|data):/.test(s);
     },
 
@@ -1039,7 +1039,15 @@ const FilterEngine = {
 const MessageStore = {
     // v3.172：cache.dir 非法回退时支持并行 worker 隔离（test_app_parallel 用 XBK_PARALLEL_ID 分片，
     // 回退硬编码 'xianbaoku_cache' 会让 t51 等非法配置测试撞共享目录竞态）
-    get cacheDir() { return path.join(__dirname, typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : (process.env.XBK_PARALLEL_ID ? `xianbaoku_cache_p${process.env.XBK_PARALLEL_ID}` : 'xianbaoku_cache')); },
+    get cacheDir() {
+        const fallback = process.env.XBK_PARALLEL_ID ? `xianbaoku_cache_p${process.env.XBK_PARALLEL_ID}` : 'xianbaoku_cache';
+        const raw = typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : fallback;
+        const root = path.resolve(__dirname);
+        const candidate = path.resolve(root, raw);
+        // P2 防御：cache.dir 不能通过 .. 或绝对路径逃出项目根目录；越界配置回退到默认缓存目录。
+        const insideRoot = candidate !== root && candidate.startsWith(root + path.sep);
+        return insideRoot ? candidate : path.join(root, fallback);
+    },
     _memoryCache: {},
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
     _MEMO_MAX: 100,
