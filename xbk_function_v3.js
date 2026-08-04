@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.191 — 修复 PushMe 错误响应日志密钥回显；联合路径回归锁定 ********
+//******** 线报酷推送脚本 v3.192 — 修复 Html内容 主动 HTML 联合渲染路径；联合路径回归锁定 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -521,7 +521,11 @@ const Formatter = {
         const escUrl = safeHtmlUrl
             .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         // 与 htmlToMarkdown 口径一致：非字符串 content_html 视为空（避免 [object Object] 泄漏）
-        const rawHtml = (typeof data.content_html === 'string') ? Utils.sanitizeHtmlUrls(data.content_html) : '';
+        // {Html内容} 会在 wxpusher 等通道以 HTML 类型渲染；实体解码后再次清理主动标签、事件属性和危险 URL，
+        // 防止接口 content_html 中的 <script>/onerror 或 &lt;script&gt; 进入客户端渲染。
+        const rawHtml = (typeof data.content_html === 'string')
+            ? Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(data.content_html))
+            : '';
         // {链接} 占位符 Markdown 安全化（v3.74）：与 htmlToMarkdown 的 mdUrl 同口径——
         // 含空格/括号/] 用 <> 包裹、剥离换行（原样输出会在 Markdown 链接场景破坏）
         const linkText = (() => {

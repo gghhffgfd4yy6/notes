@@ -1901,6 +1901,13 @@ await test('{链接}/原文链接 危险协议过滤（v3.170）', () => {
     // 原始 content_html 中的危险 href/src 也必须清洗
     const raw = tuisong_replace('{Html内容}', { content_html: '<a href="javascript:alert(1)">点我</a><img src="javascript:x">', url: 'https://safe.example/a' });
     assertEqual(/(?:href|src)\s*=\s*["']javascript:/i.test(raw), false, '原始 HTML 属性中的危险协议应清洗');
+    // {Html内容} 会进入 HTML 渲染通道：主动标签、事件属性和实体编码绕过必须清除
+    const active = tuisong_replace('{Html内容}', {
+        content_html: '<script>alert(1)</script><img src="x" onerror="alert(2)"><p>&lt;iframe&gt;x&lt;/iframe&gt;</p>',
+        url: 'https://safe.example/a',
+    });
+    assertEqual(/<script|<iframe|\bonerror\s*=/i.test(active), false, 'Html内容 不应保留主动标签/事件属性');
+    assertEqual(active.includes('alert(1)'), false, 'script 内容不应进入 HTML 推送');
     // 正常 url 不受影响（含空格 → <> 包裹）
     assertEqual(tuisong_replace('{链接}', { url: 'https://u.jd.com/a b', title: 't' }), '<https://u.jd.com/a b>', '正常 url 含空格应 <> 包裹');
     // 相对路径不受影响
