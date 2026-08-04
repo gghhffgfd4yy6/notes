@@ -1560,6 +1560,7 @@ const App = {
                 ['timing.pushInterval', Config.timing.pushInterval, (v) => Utils.num(v, -1) >= 0],
                 ['timing.finalWait', Config.timing.finalWait, (v) => Utils.num(v, -1) >= 0],
                 ['push.parallelLimit', Config.push.parallelLimit, (v) => Utils.num(v, -1) >= 0],
+                ['push.maxPerRun', Config.push.maxPerRun, (v) => { const n = Utils.num(v, -1); return Number.isInteger(n) && n > 0; }],
             ];
             for (const [name, val, ok] of numConfig) {
                 if (!ok(val)) console.warn(`⚠️ 配置「${name}」为「${val}」不是有效值，已按内部防御逻辑处理（建议修正）`);
@@ -1710,7 +1711,8 @@ const App = {
             filteredCount += (beforeKwd - items.length);
 
             // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/8 分钟运行；正常 ~20 条无影响）
-            const maxPerRun = (() => { const v = Utils.num(Config.push.maxPerRun, 100); return v > 0 ? Math.floor(v) : 100; })(); // v3.165: Math.floor 整数化（parallelLimit v3.121 同款——小数'2.5'曾 truncatedCount 减出 0.5 条）
+            // maxPerRun 必须是正整数；小数先取整可能变成 0（如 0.5），会静默跳过全部推送，非法值统一回退默认
+            const maxPerRun = (() => { const v = Utils.num(Config.push.maxPerRun, -1); return Number.isInteger(v) && v > 0 ? v : 100; })();
             let truncatedKeys = new Set();
             if (items.length > maxPerRun) {
                 truncatedCount = items.length - maxPerRun;

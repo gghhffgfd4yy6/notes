@@ -1809,25 +1809,34 @@ await test('接口异常返回海量数据 → 判重不卡死（v3.179 缓存�
     }
 });
 
-await test('maxPerRun 小数配置 → truncated 整数化（v3.165，parallelLimit 同款 Math.floor）', async () => {
+await test('maxPerRun 非正整数/小数配置 → 回退默认且不跳过推送', async () => {
     reset();
-    setPushUrl('t70b_maxperrun_float');
+    setPushUrl('t70b_maxperrun_invalid');
     const orig = Config.push.maxPerRun;
+    const origInt = Config.timing.pushInterval, origWait = Config.timing.finalWait;
+    Config.timing.pushInterval = 0;
+    Config.timing.finalWait = 0;
     try {
-        Config.push.maxPerRun = '2.5'; // 环境变量字符串 + 小数（曾 truncatedCount 减出 0.5 条）
-        fakeData = [];
-        for (let i = 0; i < 5; i++) fakeData.push(makeItem({ id: i + 4000 }));
-        const summary = await xbk.run();
-        assert(Number.isInteger(summary.truncated), `truncated 应为整数: ${JSON.stringify(summary)}`);
-        assert(summary.truncated === 3, `5 条 - 2 条 = 截断 3: ${JSON.stringify(summary)}`);
-        assert(summary.pushed === 2, `应推 2 条: ${JSON.stringify(summary)}`);
-        // 非法值仍回退默认
-        Config.push.maxPerRun = 'abc';
-        fakeData = [{ id: 1, title: 'T', content: 'c', catename: 'c', url: 'https://x.com/1', datetime: '2026-08-03', shijianchuo: 1785734400, content_html: '<p>c</p>' }];
+        // 0.5 若先 Math.floor 会变成 0，导致 1 条消息被截断且不推送；现在必须回退默认 100
+        for (const [idx, invalid] of ['0.5', 0.5, '2.5', 2.5, '0', 0, '-1', 'abc', ''].entries()) {
+            reset();
+            setPushUrl('t70b_maxperrun_invalid_' + idx);
+            Config.timing.pushInterval = 0;
+            Config.timing.finalWait = 0;
+            Config.push.maxPerRun = invalid;
+            fakeData = [{ id: 4000, title: 'T', content: 'c', catename: 'c', url: 'https://x.com/1', content_html: '<p>c</p>' }];
+            const summary = await xbk.run();
+            assert(summary.pushed === 1 && summary.truncated === 0,
+                `非法 maxPerRun=${JSON.stringify(invalid)} 应回退默认并推送: ${JSON.stringify(summary)}`);
+        }
+        Config.push.maxPerRun = '2.5';
+        fakeData = [{ id: 4001, title: 'T2', content: 'c', catename: 'c', url: 'https://x.com/2', content_html: '<p>c</p>' }];
         const s2 = await xbk.run();
-        assert(s2.pushed === 1 && s2.truncated === 0, `非法 maxPerRun 回退默认不截断: ${JSON.stringify(s2)}`);
+        assert(s2.pushed === 1 && s2.truncated === 0, `小数 maxPerRun 不应变成 0: ${JSON.stringify(s2)}`);
     } finally {
         Config.push.maxPerRun = orig;
+        Config.timing.pushInterval = origInt;
+        Config.timing.finalWait = origWait;
     }
 });
 
