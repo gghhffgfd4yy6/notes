@@ -1124,6 +1124,33 @@ await test('自定义 {内容} 模板绕过 Formatter 后仍清理主动 HTML（
     }
 });
 
+await test('最终推送出口不破坏纯文本/纯 Markdown 内容（P2 过杀修复）', async () => {
+    reset();
+    setPushUrl('t_html_final_keep_plain');
+    const origContent = Config.template.content;
+    try {
+        // {内容} 模板 + 纯文本（含技术讨论字面量、实体文本）：无 HTML 标签形态，出口不应清洗
+        Config.template.content = '{内容}';
+        fakeData = [makeItem({
+            id: 6002,
+            content: '技术讨论：img 标签的 onerror=alert(1) 属性和 &lt;script&gt; 代码',
+            content_html: '<p>安全 HTML</p>',
+        })];
+        await xbk.run();
+        assert(pushCalls.length === 1, '应推送一条');
+        const d = pushCalls[0].desp;
+        assert(d.includes('onerror=alert(1)'), `纯文本讨论不应被删: ${d}`);
+        assert(d.includes('<script>') || d.includes('&lt;script&gt;'), `代码字面量应保留: ${d}`);
+        // 对照：含真实 HTML 标签的 desp 仍被清洗（出口防护不失效）
+        fakeData = [makeItem({ id: 6003, content: '<script>alert(1)</script>正文', content_html: '<p>x</p>' })];
+        await xbk.run();
+        const d2 = pushCalls[pushCalls.length - 1].desp;
+        assert(!/<script|onerror\s*=/i.test(d2), `HTML 形态内容仍应清洗: ${d2}`);
+    } finally {
+        Config.template.content = origContent;
+    }
+});
+
 await test('长 desp 截断保留原文链接（v3.152）', async () => {
     reset();
     setPushUrl('t61_linkkeep');
