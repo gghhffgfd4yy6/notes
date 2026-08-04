@@ -3432,6 +3432,19 @@ await test('判重：旧url-only缓存 + 新id+url → 判重（v3.21审查16）
     assertEqual(r.length, 1);
 });
 
+await test('判重：空归一 URL 不得作为 id/url fallback 键', () => {
+    const fname = 'test_empty_norm_url_dedup.json';
+    const fp = getFilePath(fname);
+    try {
+        saveBatch([{ url: '#', title: '旧垃圾 URL' }], fname);
+        saveBatch([{ id: 123, url: '#', title: '新有效 ID' }], fname);
+        const r = readMessages(fp);
+        assertEqual(r.length, 2, '有效 ID 不应被旧垃圾 URL 判重拦截');
+    } finally {
+        try { require('fs').unlinkSync(fp); } catch (e) { /* 忽略 */ }
+    }
+});
+
 await test('判重：id 类型漂移 1 vs "1" → 判重（v3.21审查17）', () => {
     saveBatch([{ id: 1, url: '/t.html', title: '数字' }], 'test_idtype.json');
     const r = readMessages(getFilePath('test_idtype.json'));

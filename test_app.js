@@ -309,6 +309,19 @@ await test('批内无 id 与有 id 同 url → 只收录1条（v3.176 修复#2 �
     assert(pushCalls.length === 1, `无id在前+有id同url应只推1条，实际${pushCalls.length}`);
 });
 
+await test('缓存垃圾 url 不应拦截新有效 id 消息', async () => {
+    reset();
+    setPushUrl('t06e_empty_url_cache');
+    fs.writeFileSync(path.join(CACHE_DIR, 't06e_empty_url_cache.json'), JSON.stringify([
+        { url: '#', title: '旧垃圾 URL', content: 'old' },
+    ]));
+    fakeData = [{ id: 123, url: '#', catename: 'a', title: '新有效 ID', content: 'new' }];
+    await xbk.run();
+    assert(pushCalls.length === 1, `新有效 id 消息不应被垃圾 URL 判重，实际推送${pushCalls.length}条`);
+    const summary = await xbk.run();
+    assert(summary.pushed === 0 && summary.dedup === 1, `第二次应只按有效 id 去重: ${JSON.stringify(summary)}`);
+});
+
 await test('垃圾 url（#/?x=1）归一为空 → anonKey 化不互判重（v3.176 修复#5）', async () => {
     reset();
     setPushUrl('t06d_garbage_url');

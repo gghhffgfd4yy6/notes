@@ -1057,12 +1057,15 @@ const MessageStore = {
         }
     },
 
-    /** 统一判重：有效 id 优先（类型归一 + 同 url 兜底，兼容旧 url-only 缓存与 id 类型漂移），否则 url fallback */
+    /** 统一判重：有效 id 优先（类型归一 + 有效 url 兜底，兼容旧 url-only 缓存与 id 类型漂移），否则 url fallback */
     _findDedupIndex(messages, message) {
-        return messages.findIndex(m =>
-            (Utils.hasValidId(message) && (String(m.id) === String(message.id) || (!Utils.hasValidId(m) && m.url && message.url && Utils.normUrl(m.url) === Utils.normUrl(message.url)))) ||
-            (!Utils.hasValidId(message) && message.url && Utils.normUrl(m.url) === Utils.normUrl(message.url))
-        );
+        const messageUrl = message && message.url ? Utils.normUrl(message.url) : '';
+        return messages.findIndex(m => {
+            const cachedUrl = m && m.url ? Utils.normUrl(m.url) : '';
+            const sameValidUrl = !!(messageUrl && cachedUrl && messageUrl === cachedUrl);
+            return (Utils.hasValidId(message) && (String(m.id) === String(message.id) || (!Utils.hasValidId(m) && sameValidUrl))) ||
+                (!Utils.hasValidId(message) && sameValidUrl);
+        });
     },
 
     init() {
@@ -1203,8 +1206,9 @@ const MessageStore = {
         messages.forEach((m, i) => {
             if (!m || typeof m !== 'object') return;
             if (Utils.hasValidId(m)) addKey(idMap, String(m.id), i);
-            if (m.url) addKey(urlMap, Utils.normUrl(m.url), i);
-            if (!Utils.hasValidId(m) && m.url) addKey(urlOnlyMap, Utils.normUrl(m.url), i);
+            const u = m.url ? Utils.normUrl(m.url) : '';
+            if (u) addKey(urlMap, u, i);
+            if (!Utils.hasValidId(m) && u) addKey(urlOnlyMap, u, i);
         });
         const NOW = () => new Date().toISOString();
         // 删除后扫描 idx 之后重建次小 index（保 findIndex 顺序语义；脏缓存同 key 多条时正确）
@@ -1217,10 +1221,11 @@ const MessageStore = {
         // 更新后维护索引：先加新键（同 id/url 时自动恢复，跳过扫描）→ 再处理旧键（删+扫描次小）
         const reindex = (idx, oldM) => {
             const m = messages[idx];
+            const newUrl = m && typeof m === 'object' && m.url ? Utils.normUrl(m.url) : '';
             if (m && typeof m === 'object') {
                 if (Utils.hasValidId(m)) addKey(idMap, String(m.id), idx);
-                if (m.url) addKey(urlMap, Utils.normUrl(m.url), idx);
-                if (!Utils.hasValidId(m) && m.url) addKey(urlOnlyMap, Utils.normUrl(m.url), idx);
+                if (newUrl) addKey(urlMap, newUrl, idx);
+                if (!Utils.hasValidId(m) && newUrl) addKey(urlOnlyMap, newUrl, idx);
             }
             if (oldM && typeof oldM === 'object') {
                 if (Utils.hasValidId(oldM)) {
@@ -1232,14 +1237,14 @@ const MessageStore = {
                 }
                 if (oldM.url) {
                     const k = Utils.normUrl(oldM.url);
-                    if (urlMap.get(k) === idx && !(m && m.url && Utils.normUrl(m.url) === k)) {
+                    if (k && urlMap.get(k) === idx && !(m && newUrl === k)) {
                         urlMap.delete(k);
                         scanNext(urlMap, k, idx, (mm) => mm.url && Utils.normUrl(mm.url) === k);
                     }
                 }
                 if (!Utils.hasValidId(oldM) && oldM.url) {
                     const k = Utils.normUrl(oldM.url);
-                    if (urlOnlyMap.get(k) === idx && !(m && !Utils.hasValidId(m) && m.url && Utils.normUrl(m.url) === k)) {
+                    if (k && urlOnlyMap.get(k) === idx && !(m && !Utils.hasValidId(m) && newUrl === k)) {
                         urlOnlyMap.delete(k);
                         scanNext(urlOnlyMap, k, idx, (mm) => !Utils.hasValidId(mm) && mm.url && Utils.normUrl(mm.url) === k);
                     }
@@ -1272,8 +1277,9 @@ const MessageStore = {
                 messages.push({ ...message, timestamp: NOW() });
                 const i = messages.length - 1;
                 if (Utils.hasValidId(message)) addKey(idMap, String(message.id), i);
-                if (message.url) addKey(urlMap, Utils.normUrl(message.url), i);
-                if (!Utils.hasValidId(message) && message.url) addKey(urlOnlyMap, Utils.normUrl(message.url), i);
+                const newUrl = message.url ? Utils.normUrl(message.url) : '';
+                if (newUrl) addKey(urlMap, newUrl, i);
+                if (!Utils.hasValidId(message) && newUrl) addKey(urlOnlyMap, newUrl, i);
             }
         }
         this.saveMessages(filePath, messages);
@@ -1606,8 +1612,8 @@ const App = {
             for (const m of cacheMsgs) {
                 if (!m || typeof m !== 'object') continue;
                 if (Utils.hasValidId(m)) cacheIds.add(String(m.id));
-                if (m.url) {
-                    const u = Utils.normUrl(m.url);
+                const u = m.url ? Utils.normUrl(m.url) : '';
+                if (u) {
                     cacheUrls.add(u);
                     if (!Utils.hasValidId(m)) cacheNoIdUrls.add(u);
                 }
@@ -1641,15 +1647,15 @@ const App = {
                 const batchUrl = Utils.normUrl(item.url);
                 let dup = false;
                 if (Utils.hasValidId(item)) {
-                    dup = cacheIds.has(String(item.id)) || (item.url && cacheNoIdUrls.has(batchUrl))
-                       || batchIds.has(String(item.id)) || (item.url && batchNoIdUrls.has(batchUrl));
-                } else if (item.url) {
+                    dup = cacheIds.has(String(item.id)) || (batchUrl && cacheNoIdUrls.has(batchUrl))
+                       || batchIds.has(String(item.id)) || (batchUrl && batchNoIdUrls.has(batchUrl));
+                } else if (batchUrl) {
                     dup = cacheUrls.has(batchUrl) || batchUrls.has(batchUrl);
                 }
                 if (dup) { dedupCount++; continue; }
                 // 收录进批内索引
                 if (Utils.hasValidId(item)) batchIds.add(String(item.id));
-                if (item.url) {
+                if (batchUrl) {
                     batchUrls.add(batchUrl);
                     if (!Utils.hasValidId(item)) batchNoIdUrls.add(batchUrl);
                 }
