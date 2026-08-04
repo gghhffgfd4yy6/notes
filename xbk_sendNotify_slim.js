@@ -245,7 +245,10 @@ function pushPlusNotify(text, desp) {
                             safeErr(err),
                         );
                     } else {
-                        if (data.code === 200) {
+                        // v3.180：data 判空防御——HTTP 200 + 响应体 JSON null 时 data.code 曾抛
+                        // TypeError → catch 只记日志 → finally resolve(data) 虚假成功 → 主流程写缓存
+                        // → 消息永久丢失（系统验证实测确认，P1）
+                        if (data && data.code === 200) {
                             console.log(
                                 `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                                 }通知消息完成🎉\n`,
@@ -253,8 +256,8 @@ function pushPlusNotify(text, desp) {
                         } else {
                             console.log(
                                 `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
-                                }通知消息异常 ${data.msg}\n`,
-                            );
+                                }通知消息异常 ${data && data.msg ? data.msg : ''}\n`,
+                            ); // v3.180：data.msg 也判空——null 时模板访问曾二次抛错走 catch→虚假成功
                             // v3.160：API 级失败(code≠200) reject（与 wxpusher v3.154 同口径）——曾静默 resolve，
                             // 单通道用户主流程写缓存 → 消息永久丢失
                             reject(new Error(data && data.msg ? data.msg : 'Push+ 发送失败'));
@@ -513,10 +516,11 @@ function qywxBotNotify(text, desp) {
                     reject(err);
                         console.log('企业微信发送通知消息失败😞\n', safeErr(err));
                     } else {
-                        if (data.errcode === 0) {
+                        // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
+                        if (data && data.errcode === 0) {
                             console.log('企业微信发送通知消息成功🎉。\n');
                         } else {
-                            console.log(`企业微信发送通知消息异常 ${data.errmsg}\n`);
+                            console.log(`企业微信发送通知消息异常 ${data && data.errmsg ? data.errmsg : ''}\n`); // v3.180：errmsg 判空（同 Push+ else 分支）
                             // v3.160：API 级失败(errcode≠0) reject——曾静默 resolve 致单通道用户消息丢失
                             reject(new Error(data && data.errmsg ? data.errmsg : '企业微信 发送失败'));
                         }
@@ -569,7 +573,8 @@ function wxPusherNotify(text, desp) {
                     reject(err);
                         console.log('WxPusher发送通知消息失败😞\n', safeErr(err));
                     } else {
-                        if (data.code === 1000) {
+                        // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
+                        if (data && data.code === 1000) {
                             console.log('WxPusher发送通知消息成功🎉。\n'); // v3.154：恢复成功日志（曾注释——单通道用户无法确认推送）
                         } else {
                             console.log(`WxPusher发送通知消息异常\n`);
@@ -617,7 +622,8 @@ function wxXiZhiNotify(text, desp) {
                     reject(err);
                         console.log('息知发送通知消息失败😞\n', safeErr(err));
                     } else {
-                        if (data.code === 200) {
+                        // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
+                        if (data && data.code === 200) {
                             console.log('息知发送通知消息成功🎉。\n');
                         } else {
                             console.log(`息知发送通知消息异常 \n`);

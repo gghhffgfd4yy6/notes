@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.179 — 判重缓存索引化：接口异常返回海量数据时逐条MessageStore.has() O(N×M)判重卡死(maxPerRun只防推送未防判重,实测N=2万/M=1万→11.6s,外推10万→~60s),改循环前一次性构建缓存三索引与批内索引合并→O(N+M)(实测10万→94ms,约640倍);等价性800轮属性测试证明(含缓存非空场景,0失配);test_app+1海量回归 ********
+//******** 线报酷推送脚本 v3.180 — P1 修复：HTTP 200+响应体 JSON null 时 4 通道虚假成功(Push+/企业微信/wxpusher/息知 data.code 无防御→null 抛 TypeError→catch 只记日志→finally resolve(data)→sendNotify 计成功→主流程写缓存→消息永久丢失;实测确认+用户审查发现);修复 if 与 else 双分支判空(Push+/企微 else 分支 data.msg/data.errmsg 曾二次抛错),5 通道原有防御验证安全(Server酱 data&&/Bark·PushMe catch显式false/PushDeer·TG data&&链);test_notify+1 锁定 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';

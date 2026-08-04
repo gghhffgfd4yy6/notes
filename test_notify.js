@@ -17,6 +17,7 @@ let failHitokotoStruct = false; // 一言响应结构异常开关（v3.86：缺 
 let failPost = false;     // got.post 失败开关（v3.75：验证失败日志不泄露密钥）
 let failWxpusher = false; // wxpusher API 失败开关（v3.154：code≠1000 应 reject 不静默）
 let failBiz = false;      // 全部通道 API 业务失败开关（v3.160：code≠成功 应 reject 不静默）
+let nullBody = false;     // v3.180：HTTP 200 + 响应体 JSON null 开关（曾 4 通道虚假成功→消息丢失 P1）
 let failMDevSecond = false; // v3.166：Bark/PushMe 多设备第 2 个失败（至少一个成功=通道成功不重试）
 let mdevCount = 0;          // 多设备计数（failMDevSecond 时按调用序第 1 成功第 2 失败）
 require.cache[gotPath].exports = (url, options) => {
@@ -43,7 +44,10 @@ require.cache[gotPath].exports.post = (url, options) => {
         // v3.160：各通道 API 级失败会 reject → 成功响应需返回对应业务成功码（曾全 '{}' 因通道不检查）
         const u = String(url);
         let body = '{}';
-        if (failMDevSecond) {
+        if (nullBody) {
+            // v3.180：HTTP 200 + JSON null——JSON.parse('null') → data=null → 无防御通道曾虚假成功
+            body = 'null';
+        } else if (failMDevSecond) {
             // v3.166：多设备部分失败——第 1 个设备成功、第 2 个失败（应至少一个成功=通道成功）
             mdevCount++;
             if (u.includes('api.day.app')) body = mdevCount === 1 ? { code: 200, message: 'success' } : { code: 500, message: 'bad key' };
@@ -697,6 +701,43 @@ await test('Fuzz-推送: maskKey/maskUrl 随机输入不崩', () => {
     }
 });
 
+
+await test('HTTP 200 + 响应体 JSON null → 全部通道 reject 不虚假成功（v3.180 P1 修复）', () => withChannels(async () => {
+    nullBody = true;
+    try {
+        // 4 个曾中招的通道：data.code/errcode 无防御 → null 曾抛 TypeError → catch 只记日志
+        // → finally resolve(data) 虚假成功 → 主流程写缓存 → 消息永久丢失
+        const victimCases = [
+            ['Push+', { PUSH_PLUS_TOKEN: 't' }],
+            ['企业微信', { QYWX_KEY: 'k' }],
+            ['wxpusher', { WX_pusher_appToken: 'a', WX_pusher_topicIds: '1' }],
+            ['息知', { WX_XIZHI_KEY: 'https://xizhi.qqoq.net/x.send' }],
+        ];
+        for (const [name, c] of victimCases) {
+            for (const k of CHANNEL_KEYS) cfg[k] = '';
+            cfg.HITOKOTO = 'false';
+            Object.assign(cfg, c);
+            let rejected = false;
+            try { await notify.sendNotify('t', 'd'); } catch (e) { rejected = true; }
+            assert(rejected, `${name}: HTTP 200+null 应 reject（曾虚假成功→消息丢失）`);
+        }
+        // 对照组：本来就有 data && 防御的通道同样 reject
+        const safeCases = [
+            ['Server酱', { PUSH_KEY: 'SCT123' }],
+            ['Bark', { BARK_PUSH: 'https://api.day.app/d1' }],
+        ];
+        for (const [name, c] of safeCases) {
+            for (const k of CHANNEL_KEYS) cfg[k] = '';
+            cfg.HITOKOTO = 'false';
+            Object.assign(cfg, c);
+            let rejected = false;
+            try { await notify.sendNotify('t', 'd'); } catch (e) { rejected = true; }
+            assert(rejected, `${name}: HTTP 200+null 应 reject`);
+        }
+    } finally {
+        nullBody = false;
+    }
+}));
 
 await test('全通道失败 → sendNotify reject / 部分成功 → resolve（v3.133）', () => withChannels(async () => {
     cfg.PUSH_KEY = 'SCT_TEST';

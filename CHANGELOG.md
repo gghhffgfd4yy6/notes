@@ -610,3 +610,11 @@
 - **修复**：循环前一次性从缓存构建三索引（cacheIds/cacheUrls/cacheNoIdUrls，O(M)），与批内三索引合并判重 → 全程 O(N+M)；实测 N=10万 → **94ms（约 640 倍提升）**；三个 Set 与 `_findDedupIndex` 三条件同构
 - **等价性证明**：800 轮属性测试（含缓存非空场景，随机缓存 0~20 条 + 随机输入流）——新判重 ≡ 逐条 has()+批内判重，**0 失配**
 - 测试：test_app +1（t58d 海量 2 万条判重 <5s + maxPerRun 语义正确），98/98；656+98+42=796 全绿
+
+## v3.180（P1 修复：HTTP 200 + JSON null 响应致 4 通道虚假成功 → 消息永久丢失）
+
+- **#16 通道响应结构异常被误判为成功（用户审查发现 + 实测确认，P1）**：HTTP 200 但响应体为 JSON `null` 时——Push+/企业微信/wxpusher/息知 的 `data.code/data.errcode` 无判空 → `null.code` 抛 TypeError → `catch` 只记日志 → `finally { resolve(data) }` 把 Promise 结算为成功 → sendNotify allSettled 计 fulfilled → 主流程写缓存 → **消息实际未送达却被当作已处理，永久丢失**（下次运行去重跳过）
+- **触发条件精确化**：`JSON.parse('null')` → `data === null` 才触发；字符串/数组/`{}` 访问 `.code` 不抛（走 else reject，安全）；`data === undefined` 不可达（$.post 兜底空串）
+- **修复**：4 通道判定改 `data && data.code === 200`（errcode 同）——**且补 else 分支二次防御**（Push+/企微的 `data.msg`/`data.errmsg` 模板访问在 null 时同样抛错走 catch，曾使第一版修复失效）；5 个本就有防御的通道（Server酱 data&&链 / Bark·PushMe catch 显式 false / PushDeer·TG data&&链）经实测确认安全无需改
+- **为什么测试没抓到**：test_notify 覆盖 err/业务失败码/成功码/全通道失败，未 mock "HTTP 200 + body=null"（JSON null）场景
+- 测试：test_notify +1（4 victim + 2 对照全部 reject），43/43；656+98+43=797 全绿
