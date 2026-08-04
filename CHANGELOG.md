@@ -682,3 +682,8 @@
 - **问题**：通道日志使用 `safeErr()` 脱敏，但部分通道构造 reject 错误时直接使用服务端 `msg`/`errmsg`/`description`；`sendNotify` 再把该错误传入主流程日志和异常告警，服务端若回显已配置 token/key，可能导致密钥进入 `run.log` 或告警消息。
 - **修复**：Push+、Server酱、企业微信、WxPusher、息知、Telegram 的错误摘要和 reject 信息统一经过 `safeErr()`；诊断文本保留，敏感值脱敏。
 - **回归测试**：新增 reject 错误信息不泄露已配置密钥的断言，并保留日志脱敏测试。
+
+## v3.191（PushMe 错误响应日志脱敏补漏）
+
+- **问题**：PushMe 的异常响应日志仍直接插入 `${data}`；服务端返回纯文本并回显 key 时，前一轮脱敏修复无法覆盖该路径。
+- **修复**：PushMe 异常响应统一使用 `safeErr(data)`；补充纯文本错误响应测试和对应变异验证。

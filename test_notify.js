@@ -61,7 +61,9 @@ require.cache[gotPath].exports.post = (url, options) => {
             }
         } else if (leakResponse) {
             // v3.185：模拟无标准错误字段但回显 token/key/请求体的异常响应
-            body = { code: 500, requestToken: 'LEAK_TOKEN_SECRET', payload: { key: 'LEAK_KEY_SECRET' }, msg: '业务失败 APP_SECRET', errmsg: '业务失败 APP_SECRET', message: '业务失败 APP_SECRET', description: '业务失败 APP_SECRET' };
+            body = u.includes('push.i-i.me')
+                ? '业务失败 PM_SECRET'
+                : { code: 500, requestToken: 'LEAK_TOKEN_SECRET', payload: { key: 'LEAK_KEY_SECRET' }, msg: '业务失败 APP_SECRET', errmsg: '业务失败 APP_SECRET', message: '业务失败 APP_SECRET', description: '业务失败 APP_SECRET' };
         } else if (failMDevSecond) {
             // v3.166：多设备部分失败——第 1 个设备成功、第 2 个失败（应至少一个成功=通道成功）
             mdevCount++;
@@ -674,6 +676,9 @@ await test('日志脱敏：异常响应中的 token/key 不进入日志', () => 
 
 await test('各通道 reject 错误摘要也脱敏，不进入错误信息', () => withChannels(async () => {
     leakResponse = true;
+    const origLog = console.log;
+    const captured = [];
+    console.log = (...args) => captured.push(args.join(' '));
     try {
         const cases = [
             ['Push+', { PUSH_PLUS_TOKEN: 'APP_SECRET' }],
@@ -682,6 +687,7 @@ await test('各通道 reject 错误摘要也脱敏，不进入错误信息', () 
             ['企业微信', { QYWX_KEY: 'APP_SECRET' }],
             ['wxpusher', { WX_pusher_appToken: 'APP_SECRET', WX_pusher_topicIds: '1' }],
             ['息知', { WX_XIZHI_KEY: 'https://xizhi.qqoq.net/APP_SECRET.send' }],
+            ['PushMe', { PUSHME_KEY: 'PM_SECRET' }],
             ['Telegram', { TG_BOT_TOKEN: 'APP_SECRET', TG_USER_ID: '1' }],
         ];
         for (const [name, c] of cases) {
@@ -691,11 +697,14 @@ await test('各通道 reject 错误摘要也脱敏，不进入错误信息', () 
             let caught = null;
             try { await notify.sendNotify('t', 'd'); } catch (e) { caught = e; }
             assert(caught, `${name}: 业务失败应 reject`);
-            assert(!caught.message.includes('APP_SECRET'), `${name}: reject 错误不应泄露密钥: ${caught.message}`);
-            if (name !== 'Bark') assert(caught.message.includes('业务失败'), `${name}: 应保留诊断文本: ${caught.message}`);
+            const secret = c.PUSHME_KEY ? 'PM_SECRET' : 'APP_SECRET';
+            assert(!caught.message.includes(secret), `${name}: reject 错误不应泄露密钥: ${caught.message}`);
+            assert(!captured.join('\\n').includes(secret), `${name}: 日志不应泄露密钥: ${captured.join(' | ')}`);
+            if (!['Bark', 'PushMe'].includes(name)) assert(caught.message.includes('业务失败'), `${name}: 应保留诊断文本: ${caught.message}`);
         }
     } finally {
         leakResponse = false;
+        console.log = origLog;
     }
 }));
 

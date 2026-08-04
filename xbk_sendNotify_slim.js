@@ -512,7 +512,7 @@ function pushMeNotify(text, desp, params = {}) {
                                 console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 成功🎉\n`);
                                 innerResolve({ ok: true });
                             } else {
-                                console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${data}\n`);
+                                console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${safeErr(data)}\n`);
                                 // v3.166：单 key 失败不拖垮整体——多 key（# 分割）一个失效时，
                                 // 曾外层 reject → 有效 key 已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效 key 重复轰炸
                                 innerResolve({ ok: false });
