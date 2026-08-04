@@ -1906,8 +1906,14 @@ await test('{链接}/原文链接 危险协议过滤（v3.170）', () => {
         content_html: '<script>alert(1)</script><img src="x" onerror="alert(2)"><p>&lt;iframe&gt;x&lt;/iframe&gt;</p>',
         url: 'https://safe.example/a',
     });
-    assertEqual(/<script|<iframe|\bonerror\s*=/i.test(active), false, 'Html内容 不应保留主动标签/事件属性');
+    assertEqual(/<script|<iframe|<svg|<meta|\bonerror\s*=/i.test(active), false, 'Html内容 不应保留主动标签/事件属性');
     assertEqual(active.includes('alert(1)'), false, 'script 内容不应进入 HTML 推送');
+    const activeAttrs = tuisong_replace('{Html内容}', {
+        content_html: '<svg><a xlink:href="javascript:alert(1)">x</a></svg><div style="background:url(javascript:alert(2))">y</div><img srcset="javascript:alert(3) 1x">',
+        url: 'https://safe.example/a',
+    });
+    assertEqual(/xlink:href\s*=\s*["']javascript:|url\s*\(\s*javascript:|srcset\s*=\s*["']javascript:/i.test(activeAttrs), false,
+        'Html内容 不应保留 xlink/style/srcset 危险加载路径');
     // 正常 url 不受影响（含空格 → <> 包裹）
     assertEqual(tuisong_replace('{链接}', { url: 'https://u.jd.com/a b', title: 't' }), '<https://u.jd.com/a b>', '正常 url 含空格应 <> 包裹');
     // 相对路径不受影响

@@ -377,13 +377,33 @@ const Utils = {
     sanitizeDecodedHtml(html) {
         if (html === undefined || html === null) return '';
         try { html = String(html); } catch (e) { return ''; }
-        return this.sanitizeHtmlUrls(html)
-            .replace(/<script\b[\s\S]*?<\/script\s*>/gi, '')
-            .replace(/<style\b[\s\S]*?<\/style\s*>/gi, '')
-            .replace(/<iframe\b[\s\S]*?<\/iframe\s*>/gi, '')
-            .replace(/<object\b[\s\S]*?<\/object\s*>/gi, '')
-            .replace(/<embed\b[^>]*>/gi, '')
+        html = this.sanitizeHtmlUrls(html)
+            // 成对和未闭合的主动标签都处理：不依赖恶意输入自觉补齐闭合标签。
+            .replace(/<(?:script|style|iframe|object|svg|math)\b[\s\S]*?<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
+            .replace(/<(?:script|style|iframe|object|embed|svg|math)\b[^>]*>/gi, '')
+            .replace(/<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
+            // 基础/外链/刷新标签可改变文档导航或加载外部资源，HTML 推送不需要它们。
+            .replace(/<(?:base|link|meta)\b[^>]*>/gi, '')
             .replace(/\s+on[a-z][a-z0-9_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+        const cleanUrlAttr = (name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`;
+        html = html
+            // 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）。
+            .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2/gi,
+                (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
+            .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*([^\s"'<>`]+)/gi,
+                (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
+            // srcset 可在候选项中藏危险协议；检测到任意危险候选即清空整个属性。
+            .replace(/\bsrcset\s*=\s*(["'])([\s\S]*?)\1/gi, (_, quote, value) => {
+                const v = this.decodeHtmlEntities(value).replace(/[\u0000-\u0020]+/g, '').toLowerCase();
+                return /(?:^|[,])(?:javascript|vbscript|data):/.test(v) ? `srcset=${quote}${quote}` : `srcset=${quote}${value}${quote}`;
+            })
+            // CSS url()/expression()/behavior 可形成主动加载或脚本执行路径；不需要保留这类 style。
+            .replace(/\bstyle\s*=\s*(["'])([\s\S]*?)\1/gi, (_, quote, value) => {
+                const v = this.decodeHtmlEntities(value).toLowerCase();
+                return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
+                    ? `style=${quote}${quote}` : `style=${quote}${value}${quote}`;
+            });
+        return html;
     },
 
     /** 解码常见 HTML 实体 */
