@@ -271,6 +271,10 @@ node test_filter.js && node test_app.js && node test_notify.js
 
 **定位**:仓库最外层说明——项目简介、特性、快速开始(含密钥配置)、测试、cron 示例、配置速查、目录结构、安全红线。新人第一入口。
 
+### `SYSTEM_CONTRACT.md` — 系统契约(v3.179 定稿)
+
+**定位**:规范描述(normative)——设计理念(宁可多推不可少推等五大原则)、系统不变量(I1-I9)、判重三条件契约、缓存写入时机、时间口径约定、配置传播契约(Utils.num/filterHash/FILTER_FIELDS 耦合)、设计边界与已知取舍(多实例/超时歧义等不修项)。**改代码前必读**;行号标注 v3.179 位置,契约文字不随版本过时。
+
 ### `package.json` — 工程化入口(v3.71 新增)
 
 **定位**:`npm start`(运行推送)/`npm test`(经 run_tests.js 一键三套件+汇总报告,退出码 0=全绿)/engines node>=14/零依赖声明。版本一致性测试校验其 version 与文件头一致。

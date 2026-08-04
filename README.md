@@ -88,6 +88,7 @@ test_notify.js            通道测试
 package.json              工程入口（npm start / npm test）
 README.md                 本文件
 FILE_INDEX.md             文件索引（最详细）
+SYSTEM_CONTRACT.md        系统契约（设计理念/不变量/判重缓存推送契约/设计边界——改代码前必读）
 REVIEW_DECISIONS.md       审查决策记录（为什么修/为什么不修）
 CHANGELOG.md              版本演进
 ```
