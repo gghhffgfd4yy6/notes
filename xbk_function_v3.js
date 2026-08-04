@@ -397,11 +397,20 @@ const Utils = {
                 const v = this.decodeHtmlEntities(value).replace(/[\u0000-\u0020]+/g, '').toLowerCase();
                 return /(?:^|[,])(?:javascript|vbscript|data):/.test(v) ? `srcset=${quote}${quote}` : `srcset=${quote}${value}${quote}`;
             })
+            .replace(/\bsrcset\s*=\s*([^\s"'<>`]+)/gi, (_, value) => {
+                const v = this.decodeHtmlEntities(value).replace(/[\u0000-\u0020]+/g, '').toLowerCase();
+                return /^(?:javascript|vbscript|data):/.test(v) ? 'srcset=""' : `srcset=${value}`;
+            })
             // CSS url()/expression()/behavior 可形成主动加载或脚本执行路径；不需要保留这类 style。
             .replace(/\bstyle\s*=\s*(["'])([\s\S]*?)\1/gi, (_, quote, value) => {
                 const v = this.decodeHtmlEntities(value).toLowerCase();
                 return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
                     ? `style=${quote}${quote}` : `style=${quote}${value}${quote}`;
+            })
+            .replace(/\bstyle\s*=\s*([^\s"'<>`]+)/gi, (_, value) => {
+                const v = this.decodeHtmlEntities(value).toLowerCase();
+                return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
+                    ? 'style=""' : `style=${value}`;
             });
         return html;
     },

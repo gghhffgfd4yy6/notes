@@ -1914,6 +1914,12 @@ await test('{链接}/原文链接 危险协议过滤（v3.170）', () => {
     });
     assertEqual(/xlink:href\s*=\s*["']javascript:|url\s*\(\s*javascript:|srcset\s*=\s*["']javascript:/i.test(activeAttrs), false,
         'Html内容 不应保留 xlink/style/srcset 危险加载路径');
+    const activeUnquoted = tuisong_replace('{Html内容}', {
+        content_html: '<img srcset=javascript:alert(4)><div style=background:url(javascript:alert(5))>z</div>',
+        url: 'https://safe.example/a',
+    });
+    assertEqual(/srcset\s*=\s*javascript:|style\s*=\s*[^>]*javascript:/i.test(activeUnquoted), false,
+        'Html内容 不应遗漏无引号 srcset/style 危险路径');
     // 正常 url 不受影响（含空格 → <> 包裹）
     assertEqual(tuisong_replace('{链接}', { url: 'https://u.jd.com/a b', title: 't' }), '<https://u.jd.com/a b>', '正常 url 含空格应 <> 包裹');
     // 相对路径不受影响
