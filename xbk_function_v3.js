@@ -384,7 +384,7 @@ const Utils = {
             .replace(/<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
             // 基础/外链/刷新标签可改变文档导航或加载外部资源，HTML 推送不需要它们。
             .replace(/<(?:base|link|meta)\b[^>]*>/gi, '')
-            .replace(/\s+on[a-z][a-z0-9_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+            .replace(/(?:\s|\/)on[a-z][a-z0-9_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
         const cleanUrlAttr = (name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`;
         html = html
             // 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）。

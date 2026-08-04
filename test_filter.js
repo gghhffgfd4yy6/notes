@@ -1920,6 +1920,12 @@ await test('{链接}/原文链接 危险协议过滤（v3.170）', () => {
     });
     assertEqual(/srcset\s*=\s*javascript:|style\s*=\s*[^>]*javascript:/i.test(activeUnquoted), false,
         'Html内容 不应遗漏无引号 srcset/style 危险路径');
+    const slashEvent = tuisong_replace('{Html内容}', {
+        content_html: '<img/onerror=alert(6)><div/onload = "alert(7)">x</div>',
+        url: 'https://safe.example/a',
+    });
+    assertEqual(/(?:\/|\s)on(?:error|load)\s*=/i.test(slashEvent), false,
+        'Html内容 不应遗漏斜杠分隔的事件属性');
     // 正常 url 不受影响（含空格 → <> 包裹）
     assertEqual(tuisong_replace('{链接}', { url: 'https://u.jd.com/a b', title: 't' }), '<https://u.jd.com/a b>', '正常 url 含空格应 <> 包裹');
     // 相对路径不受影响

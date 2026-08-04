@@ -691,5 +691,5 @@
 ## v3.192（Html内容 主动 HTML 联合渲染路径修复）
 
 - **问题**：`{Html内容}` 模板直接把接口 `content_html` 交给 HTML 渲染通道；原有清理只处理危险 URL，`<script>`、事件属性和实体编码后的主动标签仍可能进入推送内容。
-- **修复**：`{Html内容}` 路径统一先解码实体，再清理主动标签、事件属性、危险 URL、xlink/formaction/srcset/style 等加载路径，并覆盖带引号和无引号属性；普通安全 HTML 保持可用。
-- **回归测试**：覆盖 script、iframe、svg、onerror、xlink、srcset、style、无引号属性和实体编码主动标签；删除新清理链路的变异会被测试捕获。
+- **修复**：`{Html内容}` 路径统一先解码实体，再清理主动标签、事件属性、危险 URL、xlink/formaction/srcset/style 等加载路径，并覆盖带引号、无引号和斜杠分隔属性；普通安全 HTML 保持可用。
+- **回归测试**：覆盖 script、iframe、svg、onerror、xlink、srcset、style、无引号属性、斜杠事件属性和实体编码主动标签；删除新清理链路的变异会被测试捕获。
