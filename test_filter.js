@@ -4277,6 +4277,21 @@ await test('安全: htmlToMarkdown 输出无事件注入残留', () => {
     assertEqual(r.includes('<script'), false, '不应残留 script');
 });
 
+await test('安全: 实体解码后主动 HTML/事件属性仍被清理', () => {
+    const cases = [
+        '&lt;script&gt;alert(1)&lt;/script&gt;正文',
+        '&lt;img src="javascript:x" onerror="alert(1)"&gt;正文',
+        '&lt;iframe src="https://evil.example"&gt;恶意&lt;/iframe&gt;正文',
+    ];
+    for (const h of cases) {
+        const r = htmlToMarkdown({ content_html: h, url: '' });
+        assertEqual(/<\/?(?:script|iframe|object|embed)\b/i.test(r), false, `实体主动标签不应残留: ${r}`);
+        assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `实体事件属性不应残留: ${r}`);
+        assertEqual(/(?:javascript|vbscript|data):/i.test(r), false, `实体危险协议不应残留: ${r}`);
+        assertEqual(r.includes('正文'), true, '安全文本应保留');
+    }
+});
+
 await test('安全: 实体编码 href 不绕过危险协议检查（v3.143）', () => {
     // javascript&#58; / &#106;avascript: / jav&#x61;script: 等编码形式曾绕过（decode 在 a 转换后）
     const cases = [
@@ -5201,6 +5216,27 @@ await test('防御: cache.dir 非字符串 → 回退默认不崩（v3.80）', (
         try { require('fs').unlinkSync(p); } catch (e) { /* 忽略 */ }
     } finally {
         Config.cache.dir = orig;
+    }
+});
+
+await test('防御: cache.dir 符号链接不能指向项目外部', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const orig = Config.cache.dir;
+    const link = path.join(__dirname, 'test_cache_symlink_probe');
+    const target = path.join(os.tmpdir(), 'xbk-cache-symlink-target');
+    try {
+        try { fs.unlinkSync(link); } catch (e) { /* 不存在 */ }
+        try { fs.rmdirSync(target); } catch (e) { /* 不存在 */ }
+        fs.mkdirSync(target, { recursive: true });
+        fs.symlinkSync(target, link, 'dir');
+        Config.cache.dir = 'test_cache_symlink_probe';
+        const p = getFilePath('push.json');
+        assertEqual(fs.realpathSync(path.dirname(p)).startsWith(path.resolve(__dirname) + path.sep), true, `符号链接缓存目录不应逃逸: ${p}`);
+    } finally {
+        Config.cache.dir = orig;
+        try { fs.unlinkSync(link); } catch (e) { /* 忽略 */ }
+        try { fs.rmdirSync(target); } catch (e) { /* 忽略 */ }
     }
 });
 

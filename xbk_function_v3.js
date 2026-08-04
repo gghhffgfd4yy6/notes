@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.185 — 修复 filter.hash 时序、状态文件原子写与通道错误日志敏感字段泄露；全调用点回归锁定 ********
+//******** 线报酷推送脚本 v3.186 — 修复符号链接缓存逃逸、损坏日报状态与实体编码主动 HTML 注入；全调用点回归锁定 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -369,6 +369,19 @@ const Utils = {
         return html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`);
     },
 
+    /** 实体解码后再次清理主动 HTML/事件属性，防止 &lt;script&gt; 重新形成可执行标签 */
+    sanitizeDecodedHtml(html) {
+        if (html === undefined || html === null) return '';
+        try { html = String(html); } catch (e) { return ''; }
+        return this.sanitizeHtmlUrls(html)
+            .replace(/<script\b[\s\S]*?<\/script\s*>/gi, '')
+            .replace(/<style\b[\s\S]*?<\/style\s*>/gi, '')
+            .replace(/<iframe\b[\s\S]*?<\/iframe\s*>/gi, '')
+            .replace(/<object\b[\s\S]*?<\/object\s*>/gi, '')
+            .replace(/<embed\b[^>]*>/gi, '')
+            .replace(/\s+on[a-z][a-z0-9_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+    },
+
     /** 解码常见 HTML 实体 */
     decodeHtmlEntities(str) {
         if (str === undefined || str === null) return '';
@@ -410,7 +423,7 @@ const Formatter = {
         const mdUrl = safeUrl && /[\s()\[\]]/.test(safeUrl) ? `<${safeUrl}>` : safeUrl;
         // 无标签内容短路：跳过整个替换链（性能优化）
         if (!html.includes('<')) {
-            html = Utils.decodeHtmlEntities(html);
+            html = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(html));
             return this._finalizeMd(mdUrl ? html + `\n\n原文链接：[${urlText}](${mdUrl})` : html);
         }
         html = html
@@ -459,8 +472,8 @@ const Formatter = {
             // 标签形态由上方 <[^>]+> 剥离处理（'<<a>' 被剥），孤立 < / > 文本保留（Markdown 渲染为普通文本）
             .replace(/<[^>]+>/g, '')
             .replace(/\n{3,}/g, '\n\n');
-        // 先移除 HTML 标签，再解码实体
-        html = Utils.decodeHtmlEntities(html);
+        // 先移除真实 HTML 标签，再解码实体；实体解码可能重新形成标签，需再次清理主动内容/危险属性。
+        html = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(html));
         let result = html + (mdUrl ? `\n\n原文链接：[${urlText}](${mdUrl})` : '');
         // 模板拼接后再次合并连续换行（内容尾部 \n\n + 模板 \n\n 会拼出 3+ 连换行）
         return this._finalizeMd(result);
@@ -1044,9 +1057,24 @@ const MessageStore = {
         const raw = typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : fallback;
         const root = path.resolve(__dirname);
         const candidate = path.resolve(root, raw);
-        // P2 防御：cache.dir 不能通过 .. 或绝对路径逃出项目根目录；越界配置回退到默认缓存目录。
-        const insideRoot = candidate !== root && candidate.startsWith(root + path.sep);
-        return insideRoot ? candidate : path.join(root, fallback);
+        const realInsideRoot = (p) => {
+            const lexicalInside = p !== root && p.startsWith(root + path.sep);
+            if (!lexicalInside) return false;
+            // 逐级回溯到已存在目录，再 realpath 校验；防止项目内符号链接指向项目外部。
+            let probe = p;
+            try {
+                while (probe !== root && !fs.existsSync(probe)) probe = path.dirname(probe);
+                const realProbe = fs.realpathSync(probe);
+                const resolved = path.resolve(realProbe, path.relative(probe, p));
+                return resolved !== root && resolved.startsWith(root + path.sep);
+            } catch (e) {
+                return false;
+            }
+        };
+        // P2 防御：cache.dir 不能通过 ..、绝对路径或符号链接逃出项目根目录；越界配置回退默认目录。
+        if (realInsideRoot(candidate)) return candidate;
+        const safeFallback = path.resolve(root, fallback);
+        return realInsideRoot(safeFallback) ? safeFallback : path.join(root, 'xianbaoku_cache');
     },
     _memoryCache: {},
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
@@ -1493,8 +1521,24 @@ const App = {
             const en = Config.report && Config.report.enabled;
             if (!Config.report || !en || en === 'false' || en === '0') return;
             const statePath = path.join(MessageStore.cacheDir, 'report.state');
-            let state = { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 };
-            try { state = JSON.parse(fs.readFileSync(statePath, 'utf8')) || state; } catch (e) { /* 无状态=首次 */ }
+            const blankState = () => ({ date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 });
+            const safeCounter = (v) => {
+                const n = Number(v);
+                return Number.isFinite(n) && n >= 0 ? n : 0;
+            };
+            const normalizeState = (raw) => {
+                if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return blankState();
+                const st = blankState();
+                st.date = typeof raw.date === 'string' ? raw.date : '';
+                for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st[k] = safeCounter(raw[k]);
+                if (raw.pending && typeof raw.pending === 'object' && !Array.isArray(raw.pending)) {
+                    st.pending = blankState();
+                    for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st.pending[k] = safeCounter(raw.pending[k]);
+                }
+                return st;
+            };
+            let state = blankState();
+            try { state = normalizeState(JSON.parse(fs.readFileSync(statePath, 'utf8'))); } catch (e) { /* 无状态或损坏状态=首次 */ }
             // v3.155：日报日期用本地时区（原 UTC——中国用户凌晨 cron 时本地已跨天但 UTC 未跨，日报日期错位一天）
             const _d = new Date();
             const today = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`;

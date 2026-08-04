@@ -1894,6 +1894,25 @@ await test('告警/日报触发时通道失败 → 无 unhandledRejection（v3.1
 });
 
 
+await test('损坏 report.state 非对象 → 重置为安全状态并继续日报累计（v3.186）', async () => {
+    reset();
+    setPushUrl('t63_report_state_corrupt');
+    const statePath = path.join(CACHE_DIR, 'report.state');
+    const orig = Config.report.enabled;
+    try {
+        Config.report.enabled = true;
+        fakeData = [makeItem({ id: 1 })];
+        fs.writeFileSync(statePath, JSON.stringify('corrupt-state'));
+        await xbk.run();
+        const st = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+        assert(st && typeof st === 'object' && !Array.isArray(st), '损坏状态应重置为对象');
+        assert(typeof st.total === 'number' && st.total >= 1, `状态累计应为安全数字: ${JSON.stringify(st)}`);
+    } finally {
+        Config.report.enabled = orig;
+        try { fs.unlinkSync(statePath); } catch (e) { /* 忽略 */ }
+    }
+});
+
 await test('连续运行：report.state 累加/缓存去重/状态文件正确（v3.141）', async () => {
     reset();
     setPushUrl('t60_cron');
