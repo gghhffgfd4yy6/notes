@@ -731,8 +731,23 @@ await test('HTTP 200 + 响应体 JSON null → 全部通道 reject 不虚假成�
             cfg.HITOKOTO = 'false';
             Object.assign(cfg, c);
             let rejected = false;
+            let output = '';
+            const originalWrite = process.stdout.write;
+            if (name === 'Bark') {
+                process.stdout.write = function (chunk, ...args) {
+                    output += String(chunk);
+                    return true;
+                };
+            }
             try { await notify.sendNotify('t', 'd'); } catch (e) { rejected = true; }
+            finally {
+                if (name === 'Bark') process.stdout.write = originalWrite;
+            }
             assert(rejected, `${name}: HTTP 200+null 应 reject`);
+            if (name === 'Bark') {
+                assert(!output.includes("Cannot read properties of null (reading 'code')"),
+                    `Bark null 响应不应产生 TypeError 日志: ${output}`);
+            }
         }
     } finally {
         nullBody = false;

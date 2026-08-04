@@ -392,7 +392,8 @@ function barkNotify(text, desp, params = {}) {
                             console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(err));
                             innerResolve({ ok: false });
                         } else {
-                            if (data.code === 200) {
+                            // data 判空：HTTP 200 + JSON null 时不依赖 catch 兜底，避免 TypeError 噪音
+                            if (data && data.code === 200) {
                                 console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`);
                                 innerResolve({ ok: true });
                             } else {
