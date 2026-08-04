@@ -37,8 +37,8 @@
 
 **关键设计**:
 - 推送成功才写缓存(失败下次重试,不永久丢失);被过滤/只看它滤掉的标记 `_f`(规则变更自动失效重评)
-- **判重一处语义、三处同构**(v3.176/v3.179):`_findDedupIndex`(缓存判重,L1061)与 App.run 批内+缓存索引判定(L1603-1652)与 saveBatch 索引(L1188)必须保持同构——批内判重 ≡ 跨运行判重(属性测试锁定)
-- **判重索引化 O(N+M)**(v3.179):缓存三索引 + 批内三索引合并——接口异常返回海量数据不卡死(曾逐条 has() O(N×M) 卡 ~60s)
+- **判重一处语义、三处同构**：`_findDedupIndex`（缓存判重）、App.run 批内+缓存索引判定与 saveBatch 索引必须保持同构——批内判重 ≡ 跨运行判重（属性测试锁定）
+- **判重索引化 O(N+M)**（v3.179）：缓存三索引 + 批内三索引合并，避免海量接口数据触发逐条 `has()` 的 O(N×M) 扫描
 - 原子写入(tmp+rename)、路径防逃逸(basename)、maxSize 滚动淘汰(字符串配置经 Utils.num 生效)
 - 合成 id(anonKey)支持无 id 无 url 数据跨运行去重(含 title/content/posttime/pic/mall/price/brand/cate/louzhu)
 
@@ -177,7 +177,7 @@ Config.cache.maxSize       // 缓存上限(滚动淘汰)
 
 **机制**:在 require 主模块**前**替换 `require.cache` 的 got/notify(模块加载时引用固定,测试中再改无效——这是反复踩过的坑)。
 
-**运行**:`node test_app.js`(含重试等待场景)。
+**运行**:`node test_app_parallel.js`（默认推荐；需要与 CI 完全一致时再直接运行 `node test_app.js`）。
 
 ---
 
@@ -263,7 +263,8 @@ push_config.local.js # 本地密钥(必须忽略!)
 node xbk_function_v3.js
 
 # 跑全部测试
-node test_filter.js && node test_app.js && node test_notify.js
+npm test
+# 或分别运行：node test_filter.js && node test_app_parallel.js && node test_notify.js
 
 # 切换并行推送(主代码 Config.push.mode = 'parallel')
 # 配置推送密钥(编辑 push_config.local.js,不入库)
@@ -274,9 +275,9 @@ node test_filter.js && node test_app.js && node test_notify.js
 
 **定位**:仓库最外层说明——项目简介、特性、快速开始(含密钥配置)、测试、cron 示例、配置速查、目录结构、安全红线。新人第一入口。
 
-### `SYSTEM_CONTRACT.md` — 系统契约(v3.179 定稿)
+### `SYSTEM_CONTRACT.md` — 系统契约(v3.180 定稿)
 
-**定位**:规范描述(normative)——设计理念(宁可多推不可少推等五大原则)、系统不变量(I1-I9)、判重三条件契约、缓存写入时机、时间口径约定、配置传播契约(Utils.num/filterHash/FILTER_FIELDS 耦合)、设计边界与已知取舍(多实例/超时歧义等不修项)。**改代码前必读**;行号标注 v3.179 位置,契约文字不随版本过时。
+**定位**:规范描述(normative)——设计理念(宁可多推不可少推等五大原则)、系统不变量(I1-I9)、判重三条件契约、缓存写入时机、时间口径约定、配置传播契约(Utils.num/filterHash/FILTER_FIELDS 耦合)、设计边界与已知取舍(多实例/超时歧义等不修项)。**改代码前必读**；代码位置仅作参考，契约文字不随版本过时。
 
 ### `package.json` — 工程化入口(v3.71 新增)
 

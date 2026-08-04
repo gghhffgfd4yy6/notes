@@ -61,8 +61,12 @@
 | v3.153 审查 | 通道 | 1 | 原文链接 text===url 重复显示 |
 | v3.159 审查 | BUG_HUNT | 5 | wxpusher HTML 内容自动切 contentType=2 / 过滤规则变更失效过滤写入缓存 / pingbitime 接口缺字段警告 / 告警日报换行统一 / 模板占位符有效性警告 |
 | v3.176 系统审查 | 全文件 | 10 | cache.maxSize 字符串层间不一致 / 批内 vs 跨运行判重口径分裂 / 日报失败今日数据错标 / getFilePath 对象文件名垃圾文件+测试参数颠倒 / 垃圾 url 归一为空误判重 / anonKey 漏 louzhu / 通道 key 数字 TypeError / run.log 时间戳本地化 / 统计双计与 report 缺 truncated / 默认配置外置（美妆） |
+| v3.177 系统验证 | 推送截断 | 1 | 极端 contentMax 下链接补回可能超限 |
+| v3.178 系统验证 | 推送/日志/got | 3 | 通道截断统一、run.log UTF-8 边界、重定向响应消费 |
+| v3.179 系统验证 | 判重性能 | 1 | 判重索引化，避免海量数据 O(N×M) 扫描 |
+| v3.180 P1 审查 | 推送通道 | 1 | HTTP 200 + JSON null 响应不得被当作成功 |
 
-**当前：全部测试通过（数量以 `node run_tests.js` 实际输出为准，本文件不维护具体数字）**
+**当前基线：v3.180。测试结果以 `node run_tests.js` 实际输出为准，本文件不维护测试数量。**
 
 ---
 
