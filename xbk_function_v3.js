@@ -377,6 +377,9 @@ const Utils = {
     sanitizeDecodedHtml(html) {
         if (html === undefined || html === null) return '';
         try { html = String(html); } catch (e) { return ''; }
+        // HTML tokenizer 将 NUL 替换为 U+FFFD；先移除可被用来拆散属性名的 NUL，
+        // 让 `on\u0000error` 收敛为 `onerror` 后进入统一事件属性清理。
+        html = html.replace(/\u0000/g, '');
         html = this.sanitizeHtmlUrls(html)
             // 成对和未闭合的主动标签都处理：不依赖恶意输入自觉补齐闭合标签。
             .replace(/<(?:script|style|iframe|object|svg|math)\b[\s\S]*?<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')

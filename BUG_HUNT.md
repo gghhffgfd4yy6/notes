@@ -260,7 +260,7 @@
 - **触发场景**：接口 `content_html` 含 `<script>`、事件属性、实体编码主动标签等内容，用户使用 `{Html内容}` 模板并通过 HTML 渲染通道发送。
 - **根因**：`{Html内容}` 路径只清洗危险 URL，没有复用实体解码后的主动 HTML 清理链路；`htmlToMarkdown` 路径虽有防御，但不能保护 `{Html内容}`。
 - **影响**：恶意或被污染的线报内容可能在支持 HTML 渲染的客户端中触发脚本/事件属性；属于高风险内容安全问题，具体严重级别取决于客户端实际 HTML 隔离能力。
-- **修复**：实体解码后统一调用 `sanitizeDecodedHtml()`，清理 script/style/iframe/object/embed/svg/math、事件属性、危险 URL 以及 xlink/formaction/srcset/style 等加载路径，并覆盖带引号、无引号和斜杠分隔属性。
+- **修复**：实体解码后统一调用 `sanitizeDecodedHtml()`，清理 script/style/iframe/object/embed/svg/math、事件属性、危险 URL 以及 xlink/formaction/srcset/style 等加载路径，并覆盖带引号、无引号、斜杠分隔和 NUL 拆散属性。
 - **验证**：新增主动标签、事件属性和实体编码测试；删除新清理链路的变异会导致测试失败；全量测试通过。
 
 ## 附：验证方法（可复现）

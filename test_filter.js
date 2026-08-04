@@ -1926,6 +1926,18 @@ await test('{链接}/原文链接 危险协议过滤（v3.170）', () => {
     });
     assertEqual(/(?:\/|\s)on(?:error|load)\s*=/i.test(slashEvent), false,
         'Html内容 不应遗漏斜杠分隔的事件属性');
+    const nested = tuisong_replace('{Html内容}', {
+        content_html: '<div><svg><foreignObject><img/onerror=alert(8)></foreignObject></svg><script>&amp;lt;img onerror=alert(9)&amp;gt;</script></div>',
+        url: 'https://safe.example/a',
+    });
+    assertEqual(/<script|<svg|<foreignObject|(?:\/|\s)onerror\s*=/i.test(nested), false,
+        '嵌套 SVG/foreignObject/script 主动路径不应残留');
+    const nulAttr = tuisong_replace('{Html内容}', {
+        content_html: '<img on\u0000error=alert(10)>',
+        url: 'https://safe.example/a',
+    });
+    assertEqual(/on(?:\u0000)?error\s*=/i.test(nulAttr), false,
+        'NUL 拆散的事件属性不应残留');
     // 正常 url 不受影响（含空格 → <> 包裹）
     assertEqual(tuisong_replace('{链接}', { url: 'https://u.jd.com/a b', title: 't' }), '<https://u.jd.com/a b>', '正常 url 含空格应 <> 包裹');
     // 相对路径不受影响
