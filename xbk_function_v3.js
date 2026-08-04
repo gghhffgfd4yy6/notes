@@ -350,6 +350,25 @@ const Utils = {
         return Number.isFinite(n) ? n : def;
     },
 
+    /** 判断 URL 是否为危险协议（先解码实体，兼容 javascript&#58; 等编码绕过） */
+    isDangerousUrl(url) {
+        if (url === undefined || url === null) return false;
+        let s;
+        try { s = String(url); } catch (e) { return false; }
+        // 去除首尾空白和协议前控制空白，防止 JavaScript URL 借空白绕过协议检查
+        s = this.decodeHtmlEntities(s).replace(/^[\u0000-\u0020]+/, '').toLowerCase();
+        return /^(javascript|vbscript|data):/.test(s);
+    },
+
+    /** 清洗 HTML href/src 中的危险协议，保留标签和普通文本 */
+    sanitizeHtmlUrls(html) {
+        if (html === undefined || html === null) return '';
+        try { html = String(html); } catch (e) { return ''; }
+        const cleanAttr = (name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`;
+        html = html.replace(/\b(href|src)\s*=\s*(["'])([\s\S]*?)\2/gi, (_, name, quote, value) => cleanAttr(name, quote, value));
+        return html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`);
+    },
+
     /** 解码常见 HTML 实体 */
     decodeHtmlEntities(str) {
         if (str === undefined || str === null) return '';
@@ -386,7 +405,7 @@ const Formatter = {
         const urlText = (typeof shuju.url === 'string') ? shuju.url.replace(/[\r\n]+/g, '') : '';
         // v3.170：url 危险协议过滤（与 a href 的 javascript:/vbscript:/data: 检查同口径）——
         // 曾 {链接}/原文链接 对接口 url 无协议过滤；正常链接/相对路径不受影响
-        const safeUrl = urlText && !/^(javascript|vbscript|data):/i.test(urlText.trim()) ? urlText : '';
+        const safeUrl = urlText && !Utils.isDangerousUrl(urlText) ? urlText : '';
         // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）
         const mdUrl = safeUrl && /[\s()\[\]]/.test(safeUrl) ? `<${safeUrl}>` : safeUrl;
         // 无标签内容短路：跳过整个替换链（性能优化）
@@ -399,20 +418,18 @@ const Formatter = {
             .replace(/<a\s*[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
                 // 空 href 不生成空链接；危险协议(javascript:/vbscript:/data:)仅保留文本，防 XSS
                 // v3.143：href 先解码实体再检查——'javascript&#58;' 曾绕过（decode 在 a 转换后）
-                const h = Utils.decodeHtmlEntities(String(href).trim().toLowerCase());
-                return (href.trim() && !/^(javascript|vbscript|data):/.test(h)) ? `[${txt}](${href})` : txt;
+                return (href.trim() && !Utils.isDangerousUrl(href)) ? `[${txt}](${href})` : txt;
             })
             // v3.170：无引号 href（HTML 合法写法，`<a href=https://x.com>`）曾不匹配 → 链接丢失变纯文本——
             // 追加处理（带引号的已被上方替换吃掉，此处只处理剩余的无引号形式）
             .replace(/<a\s+[^>]*?href\s*=\s*([^\s"'>]+)[^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
-                const h = Utils.decodeHtmlEntities(String(href).trim().toLowerCase());
-                return (href.trim() && !/^(javascript|vbscript|data):/.test(h)) ? `[${txt}](${href})` : txt;
+                return (href.trim() && !Utils.isDangerousUrl(href)) ? `[${txt}](${href})` : txt;
             })
             .replace(/<img\b[^>]*>/gi, (tag) => {
                 const srcM = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
                 if (!srcM) return tag; // 无 src 不转换
                 const src = srcM[1].trim();
-                if (!src) return tag; // 空 src（含纯空白）不生成 ![]() 空图片（#56）
+                if (!src || Utils.isDangerousUrl(src)) return tag.replace(/\bsrc\s*=\s*(["'])[^"']*\1/i, ''); // 空/危险 src 不生成可执行图片链接
                 const altM = tag.match(/\balt\s*=\s*["']([^"']*)["']/i);
                 // alt 截断（真实接口 alt 可长达 250+ 字符拖累推送）——代理对安全
                 const alt = altM ? Utils.truncateUtf16(altM[1], 50) : '';
@@ -482,21 +499,24 @@ const Formatter = {
         // 避免像 App.run 里那样对同一条数据分别调用 tuisong_replace 生成 text/desp 时，
         // 没用到 Markdown 的那次也白白算一遍 htmlToMarkdown
         // url 做 HTML 转义，避免特殊字符破坏 <a href="..."> 结构；换行先剥离（v3.85，与 linkText 口径一致）；非字符串视为无链接（R6-1）
-        const escUrl = (typeof data.url === 'string' ? data.url : '')
-            .replace(/[\r\n]+/g, '')
+        const rawUrl = (typeof data.url === 'string' ? data.url : '').replace(/[\r\n]+/g, '');
+        const safeHtmlUrl = rawUrl && !Utils.isDangerousUrl(rawUrl) ? rawUrl : '';
+        const escUrl = safeHtmlUrl
             .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         // 与 htmlToMarkdown 口径一致：非字符串 content_html 视为空（避免 [object Object] 泄漏）
-        const rawHtml = (typeof data.content_html === 'string') ? data.content_html : '';
+        const rawHtml = (typeof data.content_html === 'string') ? Utils.sanitizeHtmlUrls(data.content_html) : '';
         // {链接} 占位符 Markdown 安全化（v3.74）：与 htmlToMarkdown 的 mdUrl 同口径——
         // 含空格/括号/] 用 <> 包裹、剥离换行（原样输出会在 Markdown 链接场景破坏）
         const linkText = (() => {
             // R6-1：非字符串视为无链接（与 htmlToMarkdown urlText 同口径）
             const u = (typeof data.url === 'string') ? data.url.replace(/[\r\n]+/g, '') : '';
             // v3.170：危险协议过滤（与 htmlToMarkdown safeUrl 同口径）——{链接} 曾对 javascript: 等无拦截
-            const safeU = u && !/^(javascript|vbscript|data):/i.test(u.trim()) ? u : '';
+            const safeU = u && !Utils.isDangerousUrl(u) ? u : '';
             return safeU && /[\s()\[\]]/.test(safeU) ? `<${safeU}>` : safeU;
         })();
-        const getContentHtml = () => `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`;
+        const getContentHtml = () => safeHtmlUrl
+            ? `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`
+            : `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：${escUrl}<br>&nbsp;<br>&nbsp;<br>`;
 
         const map = {
             '{标题}': data.title,

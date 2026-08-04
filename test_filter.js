@@ -1889,6 +1889,18 @@ await test('{链接}/原文链接 危险协议过滤（v3.170）', () => {
     assertEqual(tuisong_replace('{链接}', { url: 'javascript:alert(1)', title: 't' }), '', '危险 url 的 {链接} 应为空');
     const r2 = htmlToMarkdown({ content_html: '<p>x</p>', url: 'javascript:alert(1)' });
     assertEqual(r2.includes('原文链接'), false, '危险 url 不应生成原文链接');
+    // {Html内容} 的原文链接必须是文本，不能生成危险 href
+    const html = tuisong_replace('{Html内容}', { content_html: '<p>x</p>', url: 'javascript:alert(1)' });
+    assertEqual(/href\s*=\s*["']javascript:/i.test(html), false, 'Html内容 不应生成 javascript href');
+    assertEqual(html.includes('原文链接：'), true, '危险 URL 仍保留原文链接文本提示');
+    // 实体编码/控制空白绕过也必须拦截
+    for (const u of ['javascript&#58;alert(1)', ' \u0000javascript:alert(1)', 'VBScript:msgbox(1)', 'data:text/html,x']) {
+        const out = tuisong_replace('{Html内容}', { content_html: '<p>x</p>', url: u });
+        assertEqual(/href\s*=\s*["'](?:javascript|vbscript|data):/i.test(out), false, `编码危险 URL 不应生成 href: ${u}`);
+    }
+    // 原始 content_html 中的危险 href/src 也必须清洗
+    const raw = tuisong_replace('{Html内容}', { content_html: '<a href="javascript:alert(1)">点我</a><img src="javascript:x">', url: 'https://safe.example/a' });
+    assertEqual(/(?:href|src)\s*=\s*["']javascript:/i.test(raw), false, '原始 HTML 属性中的危险协议应清洗');
     // 正常 url 不受影响（含空格 → <> 包裹）
     assertEqual(tuisong_replace('{链接}', { url: 'https://u.jd.com/a b', title: 't' }), '<https://u.jd.com/a b>', '正常 url 含空格应 <> 包裹');
     // 相对路径不受影响
@@ -4122,6 +4134,8 @@ await test('快照: tuisong_replace Markdown内容', () => {
     const r = tuisong_replace('{Markdown内容}', { content_html: '<b>粗</b>文本', title: 'T', url: 'http://x' });
     // v3.48: <b> 转 Markdown 粗体 **（原剥成纯文本）
     assertEqual(r, '**粗**文本\n\n原文链接：[http://x](http://x)');
+    const safe = tuisong_replace('{Markdown内容}', { content_html: '<img src="javascript:x">', title: 'T', url: 'http://x' });
+    assertEqual(/javascript:/i.test(safe), false, 'Markdown 图片不应保留危险 src');
 });
 
 await test('快照: tuisong_replace 多字段', () => {
