@@ -4,7 +4,9 @@
 // 仅保留：PushPlus、Server酱、Bark、PushMe、企业微信机器人、wxpusher、息知、PushDeer
 
 const got = require('got');
+const { AGENTS } = require('./xbk_agents');
 const timeout = 15000;
+const REQUEST_OPTIONS = { agent: AGENTS };
 
 // 日志密钥脱敏：保留前4位+后2位，中间 ***（防止 cron 日志重定向/分享时泄露密钥）
 function maskKey(k) {
@@ -212,7 +214,7 @@ if (fs.existsSync(localPath)) {
 async function one() {
     const url = 'https://v1.hitokoto.cn/';
     // v3.151：3s 短超时——一言是推送装饰，API 慢/挂时不应阻塞推送（曾默认 15s，启用 HITOKOTO 用户每次推送延迟）
-    const res = await got.get(url, { timeout: 3000 });
+    const res = await got.get(url, { ...REQUEST_OPTIONS, timeout: 3000 });
     // body 兼容：官方 got 已自动解析 JSON；字符串响应时保留原文
     const body = typeof res.body === 'string' ? JSON.parse(res.body) : res.body;
     // 防御（v3.86）：响应结构异常（缺 hitokoto/from）→ 抛错走 sendNotify 的 catch 跳过，
@@ -279,6 +281,7 @@ function pushPlusNotify(text, desp) {
                 topic: `${PUSH_PLUS_USER}`,
             };
             const options = {
+                ...REQUEST_OPTIONS,
                 url: `https://www.pushplus.plus/send`,
                 body: JSON.stringify(body),
                 headers: {
@@ -346,6 +349,7 @@ function serverNotify(text, desp) {
             // v3.148：只加倍"单个 \n"——\n\n（Markdown 段落分隔）已是 Server酱换行格式，曾整体加倍成 \n\n\n\n 大段空白
             desp = desp.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/([^\n])\n(?!\n)/g, '$1\n\n');
             const options = {
+                ...REQUEST_OPTIONS,
                 url: pushKey.includes('SCT')
                     ? `https://sctapi.ftqq.com/${pushKey}.send`
                     : `https://sc.ftqq.com/${pushKey}.send`,
@@ -424,6 +428,7 @@ function barkNotify(text, desp, params = {}) {
             }
 
             const options = {
+                ...REQUEST_OPTIONS,
                 url: pushUrl,
                 json: {
                     title: text,
@@ -498,6 +503,7 @@ function pushMeNotify(text, desp, params = {}) {
         const pushPromises = pushKeys.map(pushKey => {
             const trimmedKey = pushKey.trim();
             const options = {
+                ...REQUEST_OPTIONS,
                 url: PUSHME_URL || 'https://push.i-i.me',
                 json: {
                     push_key: trimmedKey,
@@ -552,6 +558,7 @@ function qywxBotNotify(text, desp) {
     return new Promise((resolve, reject) => {
         const { QYWX_ORIGIN, QYWX_KEY } = push_config;
         const options = {
+            ...REQUEST_OPTIONS,
             url: `${String(QYWX_ORIGIN || 'https://qyapi.weixin.qq.com').replace(/\/+$/, '')}/cgi-bin/webhook/send?key=${QYWX_KEY}`, // v3.138：去尾斜杠防双斜杠
             json: {
                 // v3.127：msgtype 'text' → 'markdown'——desp 是 Markdown 内容，text 模式会显示 ** 等原始符号（企微支持 markdown）
@@ -612,6 +619,7 @@ function wxPusherNotify(text, desp) {
             push_config;
 
         const options = {
+            ...REQUEST_OPTIONS,
             url: `https://wxpusher.zjiecode.com/api/send/message`,
             json: {
                 appToken: WX_pusher_appToken,
@@ -668,6 +676,7 @@ function wxXiZhiNotify(text, desp) {
             push_config;
 
         const options = {
+            ...REQUEST_OPTIONS,
             url: WX_XIZHI_KEY,
             json: {
                 title: text,
@@ -719,6 +728,7 @@ function pushDeerNotify(text, desp) {
             // PushDeer 建议对消息内容进行 urlencode（encodeURI 不编码 & = #，需 encodeURIComponent）
             const enc = (s) => encodeURIComponent(s);
             const options = {
+                ...REQUEST_OPTIONS,
                 url: DEER_URL || `https://api2.pushdeer.com/message/push`,
                 body: `pushkey=${enc(DEER_KEY)}&text=${enc(text)}&desp=${enc(desp)}&type=markdown`,
                 headers: {
@@ -785,6 +795,7 @@ function tgNotify(text, desp) {
             const tgFull = esc(tgDesp ? `${tgText}\n\n${tgDesp}` : tgText);
             const tgSafe = tgFull.length > 4000 ? safeSlice(tgFull, 4000) : tgFull;
             const options = {
+                ...REQUEST_OPTIONS,
                 url: `${String(TG_API_HOST || 'https://api.telegram.org').replace(/\/+$/, '')}/bot${TG_BOT_TOKEN}/sendMessage`, // v3.138：去尾斜杠防双斜杠
                 json: {
                     chat_id: TG_USER_ID,

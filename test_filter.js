@@ -4925,7 +4925,8 @@ await test('got: 4xx 抛错带 response.statusCode', async () => {
 await test('got/项目 HTTP 薄封装：官方读取响应体且保留大小上限', async () => {
     const http = require('http');
     const got = require('got');
-    const { fetchJson } = require('./xbk_http');
+    const { fetchJson, AGENTS } = require('./xbk_http');
+    assert(AGENTS && AGENTS.http && AGENTS.https, 'HTTP 薄封装应导出共享 HTTP/HTTPS Agent');
     const body = JSON.stringify({ data: 'x'.repeat(4096) });
     const server = http.createServer((req, res) => { res.writeHead(200); res.end(body); });
     await new Promise(r => server.listen(0, r));

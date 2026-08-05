@@ -150,6 +150,7 @@ await test('Server酱: SCT 前缀走 Turbo URL + 表单 URL 编码', () => withC
     const c = gotCalls[0];
     assert(c.url.includes('sctapi.ftqq.com'), `Turbo URL: ${c.url}`);
     assert(c.url.includes('SCT123456'), 'URL 应含 key');
+    assert(c.options.agent && c.options.agent.http && c.options.agent.https, '请求应使用共享 HTTP/HTTPS Agent');
     assert(c.options.body.includes('text=%E6%A0%87%E9%A2%98%26A'), `text 应编码: ${c.options.body}`);
     assert(c.options.body.includes('desp='), '应含 desp');
     assert(c.options.headers['Content-Type'].includes('x-www-form-urlencoded'), '表单类型');
