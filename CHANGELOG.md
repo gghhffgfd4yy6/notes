@@ -748,6 +748,6 @@
 
 ## 文档维护（不改变程序版本）
 
-- 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS、BUG_HUNT 和 BUG_AUDIT_P1_P2 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。
+- 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS 和 BUG_AUDIT 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。
 - 移除易过时的当前结构行号、测试规模和运行耗时表述；历史变更记录保留为历史事实。
-- 补充 `.workflow/master-pipeline.yml` 在文件索引中的说明，并明确 GitHub Actions 与分阶段流水线的测试入口差异。
+- 补充 `.workflow/master-pipeline.yml` 在文件索引中的说明，并明确 GitHub Actions 与分阶段流水线的测试入口差异；合并重复的 Bug 与 P1/P2 审计文档。

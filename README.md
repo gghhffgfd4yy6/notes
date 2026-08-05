@@ -167,6 +167,7 @@ README.md                 本文件（展示页）
 SYSTEM_CONTRACT.md        系统契约（设计理念/不变量/契约/设计边界）
 FILE_INDEX.md             文件索引（最详细）
 REVIEW_DECISIONS.md       审查决策记录（为什么修/为什么不修）
+BUG_AUDIT.md              Bug、P1/P2 审计与验证记录
 CHANGELOG.md              版本演进
 ```
 
@@ -178,6 +179,7 @@ CHANGELOG.md              版本演进
 | **SYSTEM_CONTRACT.md** | 想改代码 / 想理解设计 → 先读：设计哲学、系统不变量 I1-I9、判重/缓存/推送契约、设计边界（不修项） |
 | **FILE_INDEX.md** | 想找某个函数/配置/测试在哪个文件哪一行 |
 | **REVIEW_DECISIONS.md** | 想知道某个问题为什么修/为什么不修 |
+| **BUG_AUDIT.md** | 想查看 Bug、P1/P2 审计和验证记录 |
 | **CHANGELOG.md** | 版本演进史 |
 
 ## ⚠️ 安全红线（重要）
