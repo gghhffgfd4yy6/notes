@@ -1146,6 +1146,11 @@ await test('最终推送出口不破坏纯文本/纯 Markdown 内容（P2 过杀
         await xbk.run();
         const d2 = pushCalls[pushCalls.length - 1].desp;
         assert(!/<script|onerror\s*=/i.test(d2), `HTML 形态内容仍应清洗: ${d2}`);
+        // 对照：非白名单 HTML 元素（input/form 等）也必须触发最终出口清洗，不能绕过 htmlLike 检测
+        fakeData = [makeItem({ id: 6004, content: '<input autofocus onfocus=alert(3)>输入控件', content_html: '<p>x</p>' })];
+        await xbk.run();
+        const d3 = pushCalls[pushCalls.length - 1].desp;
+        assert(!/onfocus\s*=/i.test(d3), `非白名单 HTML 元素的事件属性也应清洗: ${d3}`);
     } finally {
         Config.template.content = origContent;
     }

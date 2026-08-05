@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.192 — 修复 Html内容 主动 HTML 联合渲染路径；联合路径回归锁定 ********
+//******** 线报酷推送脚本 v3.193 — 修复最终推送出口 HTML 形态检测漏网；补非白名单元素回归 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1464,7 +1464,7 @@ const Pusher = {
         // 仅当 desp 呈 HTML 形态（将触发 wxpusher 等 HTML 渲染通道）时清洗：
         // 纯 Markdown/纯文本（默认 {Markdown内容}、{内容} 普通文本）不清洗，
         // 避免破坏 Markdown 代码块、技术讨论文本（onerror= 等字面量）与排版实体。
-        const htmlLike = /<\s*\/?\s*(?:br|a|img|p|div|strong|b|i|em|u|s|table|tr|td|th|ul|ol|li|h[1-6]|span|font|blockquote|code|pre|hr)\b[^>]*>|<(?:script|style|iframe|object|embed|svg|math|base|link|meta)\b/i.test(desp);
+        const htmlLike = /<\s*\/?\s*[A-Za-z][^>]*>/i.test(desp);
         if (htmlLike) {
             desp = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(desp));
         }
