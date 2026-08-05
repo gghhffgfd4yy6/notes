@@ -158,7 +158,7 @@ node_modules/got/         官方 got HTTP 客户端（版本由 package.json 管
 xbk_http.js              官方 got 薄封装（JSON 解析 + 响应体大小上限）
 test_filter.js            单元测试（属性/Fuzz/性能基准/版本一致性）
 test_app.js               集成测试（mock 完整主流程）
-test_app_parallel.js      集成测试并行调度器
+test_app_p.js      集成测试并行调度器
 test_notify.js            通道测试
 run_tests.js              一键全量测试入口
 qinglong/xbk_push.js      青龙面板直接执行入口（自动定位根目录/补齐依赖）

@@ -542,7 +542,7 @@
   - `--list-file=<json>` 精确名单分片（替代 --only 子串，防重叠/漏跑）
   - 首轮并发 QUICK 快测 → 失败片串行完整重跑（flaky 容错）
 - **效果**：test_app 92 个测试 64.6s（串行）→ 11s（并行，5.9 倍），连续多轮稳定
-- 使用：`node test_app_parallel.js`（沙箱默认并发 8 稳定）| `CONCURRENCY=N node test_app_parallel.js`（真机可调大）
+- 使用：`node test_app_p.js`（沙箱默认并发 8 稳定）| `CONCURRENCY=N node test_app_p.js`（真机可调大）
 - **npm test 接入**：run_tests.js 集成测试改走并行调度器（一键全量 97s→17s）；需完整串行验证时直接 `node test_app.js`（CI 即如此）
 
 ## v3.173（审查三轮修复：成对尖括号误删文本 / 告警日报 enabled falsy）

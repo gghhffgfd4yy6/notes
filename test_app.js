@@ -90,7 +90,7 @@ const onlyFilter = (() => {
     return idx >= 0 ? process.argv[idx + 1] : null;
 })();
 // v3.172：并行调度精确名单——--list-file=<json数组文件>，只跑名单内的测试（与 --only 子串互补，
-// 避免 --only 子串重叠/漏跑；worker 由 test_app_parallel.js 分片生成）
+// 避免 --only 子串重叠/漏跑；worker 由 test_app_p.js 分片生成）
 let nameSet = null;
 {
     const lfIdx = process.argv.indexOf('--list-file');

@@ -28,7 +28,7 @@ stages:
   steps:
   - step: build@nodejs
     name: test_app
-    displayName: 运行 test_app_parallel.js（集成测试，并发 8）
+    displayName: 运行 test_app_p.js（集成测试，并发 8）
     nodeVersion: 16.14.2
     commands:
     - npm install --ignore-scripts

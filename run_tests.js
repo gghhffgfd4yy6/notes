@@ -11,7 +11,7 @@ const SUITES = [
     { name: '单元测试',   file: 'test_filter.js',        desc: '主代码导出函数逐函数逻辑' },
     // v3.172：集成测试走并行调度器（worker 独立缓存目录 + 失败片串行重跑）。
     // 需要完整串行验证时直接 node test_app.js（CI 即如此）
-    { name: '集成测试',   file: 'test_app_parallel.js',  desc: 'App.run 完整主流程(并行调度,失败自动重跑)' },
+    { name: '集成测试',   file: 'test_app_p.js',  desc: 'App.run 完整主流程(并行调度,失败自动重跑)' },
     { name: '通道测试',   file: 'test_notify.js',        desc: '推送通道请求构造+脱敏' },
 ];
 

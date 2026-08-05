@@ -8,8 +8,8 @@
 //   2. --list-file 精确名单分片（--only 子串可能重叠/漏跑）
 //   3. QUICK=1 快测（pushInterval/finalWait=0；重试类测试的真实退避等待保留）
 //   4. 每次运行使用唯一 worker ID，允许多个调度器同时执行而不撞临时文件/缓存目录
-// 用法：node test_app_parallel.js        （沙箱默认并发 8 稳定）
-//       CONCURRENCY=32 node test_app_parallel.js   （真机可调大）
+// 用法：node test_app_p.js        （沙箱默认并发 8 稳定）
+//       CONCURRENCY=32 node test_app_p.js   （真机可调大）
 // 失败时用串行定位：node test_app.js --only=<测试名子串>
 // ============================================================
 const { fork } = require('child_process');

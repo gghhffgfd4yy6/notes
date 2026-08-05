@@ -7,7 +7,7 @@
     "start": "node xbk_function_v3.js",
     "test": "node run_tests.js",
     "test:filter": "node test_filter.js",
-    "test:app": "node test_app_parallel.js",
+    "test:app": "node test_app_p.js",
     "test:app:serial": "node test_app.js",
     "test:notify": "node test_notify.js"
   },
