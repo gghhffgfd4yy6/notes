@@ -8,14 +8,19 @@ const { AGENTS } = require('./xbk_agents');
 const timeout = 15000;
 const REQUEST_OPTIONS = { agent: AGENTS };
 
+// 配置/错误值安全字符串化：异常 toString/valueOf 不能让脱敏和错误处理路径再次崩溃。
+function safeString(value) {
+    try { return String(value === undefined || value === null ? '' : value); }
+    catch (e) { return ''; }
+}
 // 日志密钥脱敏：保留前4位+后2位，中间 ***（防止 cron 日志重定向/分享时泄露密钥）
 function maskKey(k) {
-    const s = String(k === undefined || k === null ? '' : k);
+    const s = safeString(k);
     return s.length <= 6 ? '***' : s.slice(0, 4) + '***' + s.slice(-2);
 }
 // URL 脱敏：host 保留，路径/设备码段脱敏（Bark 的 api.day.app/deviceKey）
 function maskUrl(u) {
-    const s = String(u === undefined || u === null ? '' : u);
+    const s = safeString(u);
     const m = s.match(/^(https?:\/\/[^/]+)\/(.+)$/);
     return m ? m[1] + '/' + maskKey(m[2]) : maskKey(s);
 }
@@ -50,7 +55,7 @@ function safeSlice(s, max) {
 // $.post 回调的 err 是 err.response.body（API 异常响应体，可能回显请求参数含密钥），
 // 直接 console.log(err) 会在 cron 日志重定向/分享时泄露；截断 200 字符防超长刷屏
 function redactSecrets(text) {
-    let out = String(text === undefined || text === null ? '' : text);
+    let out = safeString(text);
     try {
         for (const value of Object.values(push_config)) {
             if (typeof value !== 'string' || value.length < 4) continue;

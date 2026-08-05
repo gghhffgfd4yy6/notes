@@ -762,6 +762,11 @@
 - **修复**：`App.run()` 的 `cache.maxSize`、`domain` 和 `push.mode` 非法配置告警统一安全字符串化，`Symbol` 或异常对象不再让诊断路径崩溃。
 - **回归测试**：新增三类配置告警的完整主流程测试。
 
+## v3.203（推送脱敏异常防御）
+
+- **修复**：`maskKey()`、`maskUrl()` 和 `safeErr()` 对异常 `toString()`/`valueOf()` 对象安全降级，不再让脱敏或错误摘要路径抛出二次异常。
+- **回归测试**：新增异常对象脱敏测试。
+
 ## 文档维护（不改变程序版本）
 
 - 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS 和 BUG_AUDIT 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。

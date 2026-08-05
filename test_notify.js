@@ -603,6 +603,13 @@ await test('safeErr: message getter 抛异常时仍返回安全摘要', () => {
     assert(typeof out === 'string' && out.includes('E_TEST'), `应返回安全字段摘要: ${out}`);
 });
 
+await test('脱敏函数: 异常 toString 对象不应崩溃', () => {
+    const bad = { toString() { throw new Error('bad toString'); } };
+    assert(typeof notify.maskKey(bad) === 'string', 'maskKey 应安全返回字符串');
+    assert(typeof notify.maskUrl(bad) === 'string', 'maskUrl 应安全返回字符串');
+    assert(typeof notify.safeErr({ message: bad }) === 'string', 'safeErr 应安全返回字符串');
+});
+
 await test('日志脱敏: maskKey/maskUrl 不泄露完整密钥', () => {
     const { maskKey, maskUrl } = notify;
     // 长密钥保留首尾
