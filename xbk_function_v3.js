@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.204 — 缓存落盘失败一致性防御 ********
+//******** 线报酷推送脚本 v3.205 — 磁盘余量与状态持久化防御 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -89,6 +89,11 @@ const Config = {
     // v3.125：运行日报——每天一条推送汇总（前一天统计），不用翻 run.log
     report: {
         enabled: true,
+    },
+
+    // 磁盘余量监测：仅告警，不阻断推送；不支持 statfs 的旧 Node/平台自动跳过。
+    storage: {
+        minFreeBytes: 50 * 1024 * 1024,
     },
 };
 
@@ -358,6 +363,25 @@ const Utils = {
         try { n = Number(v); }
         catch (e) { return def; } // Symbol / valueOf 抛错等脏配置回退默认，不中断主流程
         return Number.isFinite(n) ? n : def;
+    },
+
+    /** 返回路径所在文件系统的容量信息；平台/Node 不支持时返回 null，不影响主流程。 */
+    diskSpace(targetPath) {
+        const statfs = fs.statfsSync;
+        if (typeof statfs !== 'function') return null;
+        try {
+            const st = statfs(targetPath);
+            const bsize = Number(st.bsize || st.frsize || 0);
+            const bavail = Number(st.bavail);
+            const blocks = Number(st.blocks);
+            if (!Number.isFinite(bsize) || bsize <= 0 || !Number.isFinite(bavail) || bavail < 0) return null;
+            return {
+                freeBytes: bsize * bavail,
+                totalBytes: Number.isFinite(blocks) && blocks >= 0 ? bsize * blocks : null,
+            };
+        } catch (e) {
+            return null;
+        }
     },
 
     /** 判断 URL 是否为危险协议（先解码实体，兼容 javascript&#58; 等编码绕过） */
@@ -1569,6 +1593,25 @@ const App = {
         } catch (e) { /* 日志写失败静默（磁盘只读/权限等，不中断推送） */ }
     },
 
+    _diskWarningAt: 0,
+    _alertLastAtByPath: new Map(),
+    _reportMemoryStateByPath: new Map(),
+
+    // 磁盘余量只告警不阻断：statfs 不可用或读取失败时静默跳过。
+    _warnLowDisk() {
+        const minFree = Utils.num(Config.storage && Config.storage.minFreeBytes, 50 * 1024 * 1024);
+        if (!Number.isFinite(minFree) || minFree <= 0) return;
+        const info = Utils.diskSpace(MessageStore.cacheDir);
+        if (!info || info.freeBytes >= minFree) return;
+        const now = Date.now();
+        // 同一进程最多每小时提示一次，避免磁盘低时刷屏。
+        if (now - this._diskWarningAt < 3600000) return;
+        this._diskWarningAt = now;
+        const freeMiB = (info.freeBytes / 1024 / 1024).toFixed(1);
+        const minMiB = (minFree / 1024 / 1024).toFixed(1);
+        console.warn(`⚠️ 缓存所在磁盘余量不足：${freeMiB} MiB（告警阈值 ${minMiB} MiB），写入状态/缓存可能失败`);
+    },
+
     // 接口异常告警（v3.123）：限频 + 静默——不影响主流程；告警也走推送通道（通道挂了就静默，无解）
     _sendAlert(errMsg) {
         try {
@@ -1576,8 +1619,14 @@ const App = {
             const en = Config.alert && Config.alert.enabled;
             if (!Config.alert || !en || en === 'false' || en === '0') return;
             const statePath = path.join(MessageStore.cacheDir, 'alert.state');
-            let lastAt = 0;
-            try { lastAt = JSON.parse(fs.readFileSync(statePath, 'utf8')).lastAt || 0; } catch (e) { /* 无状态文件=首次 */ }
+            const alertMemory = this._alertLastAtByPath.get(statePath);
+            let lastAt = alertMemory ? alertMemory.lastAt : 0;
+            // 状态文件被外部删除时，已持久化的旧内存状态不应继续生效；写失败的内存状态仍用于本进程限频。
+            if (alertMemory && alertMemory.persisted && !fs.existsSync(statePath)) {
+                this._alertLastAtByPath.delete(statePath);
+                lastAt = 0;
+            }
+            try { lastAt = Math.max(lastAt, JSON.parse(fs.readFileSync(statePath, 'utf8')).lastAt || 0); } catch (e) { /* 无状态文件=首次 */ }
             const intervalMs = Utils.num(Config.alert.intervalMs, 3600000); // v3.167: 非法字符串'abc'曾>0比较false→0不限频轰炸（其他数值配置均num回退）
             const interval = intervalMs > 0 ? intervalMs : 0; // <=0(含-1) = 不限频（每次异常都发）
             if (interval > 0 && Date.now() - lastAt < interval) return; // 限频：间隔内不重复轰炸
@@ -1590,8 +1639,15 @@ const App = {
             // 杀死未完成的告警 HTTP（cron 直接运行收不到告警，#10）
             return Pusher.send(alertText, alertDesp)
                 .then(() => {
-                    this._writeState(statePath, { lastAt: Date.now() });
-                    console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）');
+                    const sentAt = Date.now();
+                    const persisted = this._writeState(statePath, { lastAt: sentAt });
+                    this._alertLastAtByPath.set(statePath, { lastAt: sentAt, persisted });
+                    if (!persisted) {
+                        this._warnLowDisk();
+                        console.warn('⚠️ 运行异常告警已发送，但 alert.state 持久化失败；本进程将继续使用内存限频');
+                    } else {
+                        console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）');
+                    }
                 })
                 .catch(() => { /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */ });
         } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
@@ -1620,8 +1676,26 @@ const App = {
                 }
                 return st;
             };
-            let state = blankState();
-            try { state = normalizeState(JSON.parse(fs.readFileSync(statePath, 'utf8'))); } catch (e) { /* 无状态或损坏状态=首次 */ }
+            const persistReportState = (next) => {
+                const normalized = normalizeState(next);
+                const ok = this._writeState(statePath, normalized);
+                // 状态写失败时保留进程内已知状态，避免同一进程重复发送日报；重启后仍会重试并发出低磁盘告警。
+                this._reportMemoryStateByPath.set(statePath, { state: normalized, persisted: ok });
+                if (!ok) {
+                    this._warnLowDisk();
+                    console.warn('⚠️ 日报发送/累计状态持久化失败；本进程将继续使用内存状态');
+                }
+                return ok;
+            };
+            let memoryState = this._reportMemoryStateByPath.get(statePath);
+            if (memoryState && memoryState.persisted && !fs.existsSync(statePath)) {
+                this._reportMemoryStateByPath.delete(statePath);
+                memoryState = null;
+            }
+            let state = memoryState ? normalizeState(memoryState.state) : blankState();
+            if (!memoryState) {
+                try { state = normalizeState(JSON.parse(fs.readFileSync(statePath, 'utf8'))); } catch (e) { /* 无状态或损坏状态=首次 */ }
+            }
             // v3.155：日报日期用本地时区（原 UTC——中国用户凌晨 cron 时本地已跨天但 UTC 未跨，日报日期错位一天）
             const _d = new Date();
             const today = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`;
@@ -1654,7 +1728,7 @@ const App = {
                             state.pushed += pend.pushed || 0;
                             state.failed += pend.failed || 0;
                             state.truncated += pend.truncated || 0;
-                            this._writeState(statePath, state);
+                            persistReportState(state);
                             console.log('已发送昨日运行日报');
                         })
                         .catch(() => {
@@ -1669,7 +1743,7 @@ const App = {
                             pend.failed += summary.failed || 0;
                             pend.truncated += summary.truncated || 0;
                             state.pending = pend;
-                            this._writeState(statePath, state);
+                            persistReportState(state);
                         });
                     return;
                 }
@@ -1684,7 +1758,7 @@ const App = {
             }
             if (!state.date) state.date = today;
             acc(state);
-            this._writeState(statePath, state);
+            persistReportState(state);
         } catch (e) { /* 日报失败静默 */ }
     },
 
@@ -1694,6 +1768,7 @@ const App = {
         console.debug('开始获取线报酷数据...');
 
         MessageStore.init();
+        this._warnLowDisk();
 
         try {
             // ① 校验配置

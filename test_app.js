@@ -162,6 +162,7 @@ function reset() {
     Config.domain = 'https://new.ixbk.net';
     Config.cache.maxSize = 10000;
     Config.cache.dir = DEFAULT_CACHE_DIR; // v3.172：并行 worker 恢复各自独立目录（曾硬编码 'xianbaoku_cache'）
+    Config.storage.minFreeBytes = 50 * 1024 * 1024;
     // R3-1：api 配置也恢复默认（t51 等会改 api.retry/timeout，漏恢复会污染后续测试）
     Config.api.timeout = 5000;
     Config.api.retry = 2;
@@ -1566,6 +1567,26 @@ await test('接口异常 → 发送告警 + 限频（v3.123）', async () => {
     }
 });
 
+await test('磁盘余量低于阈值 → 告警但不阻断主流程', async () => {
+    reset();
+    setPushUrl('t74_low_disk');
+    const fs = require('fs');
+    const origStatfs = fs.statfsSync;
+    const origWarn = console.warn;
+    const warns = [];
+    fs.statfsSync = () => ({ bsize: 1024, bavail: 10, blocks: 100 });
+    console.warn = (m) => warns.push(String(m));
+    try {
+        Config.storage.minFreeBytes = 20 * 1024;
+        fakeData = [];
+        await xbk.run();
+        assert(warns.some(w => w.includes('磁盘余量不足')), `低磁盘应告警: ${warns.join(' | ')}`);
+    } finally {
+        fs.statfsSync = origStatfs;
+        console.warn = origWarn;
+    }
+});
+
 await test('告警 intervalMs 空字符串 → 回退默认限频不轰炸', async () => {
     reset();
     setPushUrl('t72_alert_interval_empty');
@@ -1765,7 +1786,7 @@ await test('状态文件 rename 失败 → 保留旧 JSON，不留下半写状�
     const origEnabled = Config.alert.enabled;
     try {
         Config.alert.enabled = true;
-        Config.alert.intervalMs = 0;
+        Config.alert.intervalMs = 60000;
         fs.writeFileSync(statePath, JSON.stringify(oldState));
         fs.renameSync = (from, to) => {
             if (to === statePath) throw new Error('模拟状态 rename 失败');
@@ -1776,6 +1797,10 @@ await test('状态文件 rename 失败 → 保留旧 JSON，不留下半写状�
         const st = JSON.parse(fs.readFileSync(statePath, 'utf8'));
         assert(st.lastAt === oldState.lastAt, `rename 失败不应破坏旧状态: ${JSON.stringify(st)}`);
         assert(!fs.existsSync(statePath + '.tmp'), '状态临时文件应清理');
+        // 同一进程第二次异常不应因状态落盘失败而再次轰炸告警。
+        const callsAfterFirst = notifyCalls;
+        try { await xbk.run(); } catch (e) { /* 接口失败预期抛错 */ }
+        assert(notifyCalls === callsAfterFirst, '状态落盘失败后应使用内存限频，不重复发送告警');
     } finally {
         fs.renameSync = origRename;
         Config.alert.enabled = origEnabled;
