@@ -47,10 +47,10 @@ npm install --ignore-scripts
 cp push_config.local.js.example push_config.local.js
 #    编辑填入你的通道 key（PUSH_KEY / BARK_PUSH / TG_BOT_TOKEN 等）
 
-# ② 运行（真实拉取 + 推送）
+# ③ 运行（真实拉取 + 推送）
 npm start                      # 运行推送脚本
 
-# ③ 可选：修改过滤规则等配置（xbk_function_v3.js 顶部 Config）
+# ④ 可选：修改过滤规则等配置（xbk_function_v3.js 顶部 Config）
 ```
 
 ## 🐉 青龙面板部署

@@ -744,3 +744,4 @@
 - **运行入口**：运行推送统一使用 `npm start`。
 - **测试入口**：单元、集成、通道和全量测试统一提供 npm scripts，避免文档和 CI 直接调用 Node 文件。
 - **CI/文档同步**：GitHub Actions、Gitee Go、README、FILE_INDEX 全部改用 `npm run ...` 入口；串行集成验证保留为独立脚本。
+- **文档状态收敛**：当前状态改为引用 `package.json`、文件头和 CHANGELOG 的版本一致性；系统契约、审查记录和 Bug 文档不再绑定旧的当前版本或过时测试数量。
