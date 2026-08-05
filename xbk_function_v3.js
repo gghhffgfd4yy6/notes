@@ -1090,12 +1090,9 @@ const FilterEngine = {
         if (!item) return false; // 防御：item 缺失 = 不匹配
         const value = item[field];
         if (!value) return false;
-        let matchValue;
-        try { matchValue = typeof value === 'string' ? value : String(value); }
-        catch (e) { return true; } // 脏字段无法转文本时保守放行，不让只看它整条流程崩溃
         if (RuleEngine.hasNestedQuantifier(kwStr)) return true; // ReDoS 防护：风险关键词不执行匹配，全部放行（与非法正则口径一致）
         try {
-            return new RegExp(kwStr, 'i').test(matchValue);
+            return new RegExp(kwStr, 'i').test(value);
         } catch (e) {
             // 非法正则：放行（与 App.run 的 zkt_gjc 预编译失败 kwRe=null 不过滤口径一致；宁可多推不可少推）
             return true;

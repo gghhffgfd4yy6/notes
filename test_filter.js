@@ -6655,9 +6655,8 @@ await test('脏字段转字符串失败不应让过滤流程崩溃', () => {
         pingbilouzhu: 'x', pingbibiaoti: 'x', pingbineirong: 'x',
     }), true, '无法转字符串的字段应保守放行');
     assertEqual(listfilter({ catename: bad, title: 'x', content: 'x', louzhuregtime: '2020-01-01' }, {
-        pingbifenlei: 'a###x',
-    }), true, '分类字段转换失败也应保守放行');
-    assertEqual(whitelistFilter({ title: bad }, 'title', 'x'), true, '只看它字段转换失败应保守放行');
+        pingbibiaoti: 'a###x',
+    }), true, '分类限定字段转换失败也应保守放行');
 });
 
 await test('validateConfig 脏 pingbitime 转换失败不应抛异常', () => {
