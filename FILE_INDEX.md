@@ -147,7 +147,7 @@ Config.cache.maxSize       // 缓存上限(滚动淘汰)
 |  **兼容/契约/一致性** | 旧缓存兼容/默认值全量契约/内存磁盘一致 |
 |  **ReDoS 防护** | 嵌套量词灾难性回溯检测(hasNestedQuantifier)+compileRules/validateConfig/whitelistFilter/App.run 全入口拦截+端到端不卡死 |
 |  **一致性修复** | validateConfig 多行分隔符含单独 `\r`(与 _splitLines 口径一致), 分隔符(<br>/\n/\r\n/\r)解析一致 |
-|  **自制 got 直测** | 本地 HTTP server：302 重定向/协议相对 `//` 重定向/4xx 带 statusCode/ETIMEDOUT 超时/POST JSON body/UTF-8 跨 chunk 不乱码/响应体超限 EBODYLIMIT |
+|  **官方 got 直测** | 本地 HTTP server：重定向/4xx 响应/超时/POST JSON body/UTF-8 跨 chunk/原始 JSON/连接失败/官方 timeout 与响应体读取 |
 |  **异常路径批量** | 未知占位符保留/对象字段不崩/重定向循环停止/连接拒绝 ECONNREFUSED/timeout 归一 |
 |  **边界精确值** | TS_BOUND 精确分界/normUrl 极端/pingbitime 边界值/编码大小写-超范围-代理区-NUL |
 |  **审查项 #56/#65/#7/#链接** | img 空 src/url 换行/maxSize 校验/{链接} Markdown 安全化 |
@@ -237,22 +237,20 @@ Config.cache.maxSize       // 缓存上限(滚动淘汰)
 ### `.gitignore` — 忽略规则
 
 ```
-node_modules/        # 依赖(除 got)
+node_modules/        # npm 依赖（got 包目录被 git 追踪，其他依赖由 npm install 生成）
 xianbaoku_cache/     # 运行缓存
 push_config.local.js # 本地密钥(必须忽略!)
 ```
 
-注意:`!node_modules/got/` 是反向规则——**自制 got 模块被刻意追踪**(修复 4xx 未提交的历史问题)。
+注意:`!node_modules/got/` 是反向规则——**官方 got 包目录被刻意追踪**，其余依赖由 `npm install` 按 `package.json` 生成。
 
-### `node_modules/got/index.js` — 自制精简 HTTP 模块
+### `node_modules/got/` — 官方 got HTTP 客户端
 
-**定位**:替代真实 got 的自制实现,被 git 追踪。
+**定位**:官方 CommonJS got 客户端，当前版本由 `package.json` 管理；本项目使用兼容 Node 14+ / CommonJS 的官方版本。
 
-**功能**:重定向(301/302/303/307/308)、JSON 自动解析、4xx/5xx 抛错带 response、超时(ETIMEDOUT)、.json() 方法、get/post。
+**功能**:官方重定向、JSON 解析、HTTP 错误响应、请求超时、重试、Keep-Alive/连接复用和 GET/POST。
 
-**细节**:chunk 用 Buffer.concat(修复 UTF-8 跨 chunk 乱码);body 类型在 JSON 解析后变为对象。
-
-**注意**:这是自制代码,有自身测试(通过 fetchData/通道测试间接覆盖)。
+**注意**:首次部署或 CI 需先执行 `npm install --ignore-scripts`；测试通过 `require.resolve('got')` 注入 mock，不再依赖自制模块的固定 `index.js` 路径。
 
 ---
 
@@ -281,7 +279,7 @@ npm test
 
 ### `package.json` — 工程化入口(v3.71 新增)
 
-**定位**:`npm start`(运行推送)/`npm test`(经 run_tests.js 一键三套件+汇总报告,退出码 0=全绿)/engines node>=14/零依赖声明。版本一致性测试校验其 version 与文件头一致。
+**定位**:`npm start`(运行推送)/`npm test`(经 run_tests.js 一键三套件+汇总报告,退出码 0=全绿)/engines node>=14/官方 got 依赖声明。版本一致性测试校验其 version 与文件头一致。
 
 ### `run_tests.js` — 统一测试入口(v3.107 新增)
 
@@ -293,7 +291,7 @@ npm test
 
 ### `.github/workflows/test.yml` — CI 配置(v3.107 新增)
 
-**定位**:GitHub Actions——push/PR 自动跑三套测试（Node 多版本矩阵），全部 PASS 才可合并。零依赖无需 npm install（自制 got 已入库）。
+**定位**:GitHub Actions——push/PR 自动安装官方 got 依赖并跑三套测试（Node 多版本矩阵），全部 PASS 才可合并。
 
 ---
 

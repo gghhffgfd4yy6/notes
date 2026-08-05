@@ -1,11 +1,14 @@
 {
   "name": "xbk-push",
-  "version": "3.196.0",
+  "version": "3.197.0",
   "description": "线报酷推送脚本——规则过滤 + 多通道推送 + 去重缓存 + 运行日志 + 完整测试体系",
   "main": "xbk_function_v3.js",
   "scripts": {
     "start": "node xbk_function_v3.js",
     "test": "node run_tests.js"
+  },
+  "dependencies": {
+    "got": "11.8.6"
   },
   "engines": {
     "node": ">=14"

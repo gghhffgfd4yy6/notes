@@ -15,10 +15,10 @@ stages:
   steps:
   - step: build@nodejs
     name: test_filter
-    displayName: 运行 test_filter.js（单元 652 个）
+    displayName: 运行 test_filter.js（单元测试）
     nodeVersion: 16.14.2
     commands:
-    - git checkout -- node_modules/got 2>/dev/null || true
+    - npm install --ignore-scripts
     - node test_filter.js
 
 - name: integration-test
@@ -28,10 +28,10 @@ stages:
   steps:
   - step: build@nodejs
     name: test_app
-    displayName: 运行 test_app_parallel.js（集成 93 个，并发 8）
+    displayName: 运行 test_app_parallel.js（集成测试，并发 8）
     nodeVersion: 16.14.2
     commands:
-    - git checkout -- node_modules/got 2>/dev/null || true
+    - npm install --ignore-scripts
     - node test_app_parallel.js
 
 - name: notify-test
@@ -41,10 +41,10 @@ stages:
   steps:
   - step: build@nodejs
     name: test_notify
-    displayName: 运行 test_notify.js（通道 41 个）
+    displayName: 运行 test_notify.js（通道测试）
     nodeVersion: 16.14.2
     commands:
-    - git checkout -- node_modules/got 2>/dev/null || true
+    - npm install --ignore-scripts
     - node test_notify.js
 
 - name: summary

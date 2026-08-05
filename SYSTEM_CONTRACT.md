@@ -57,7 +57,7 @@
 
 ## 2. 架构分层与模块职责
 
-单向依赖链（无循环依赖）：`Config → Utils → Formatter → RuleEngine → FilterEngine → MessageStore → Network → Pusher → App`，外部依赖 `notify`（推送通道）与 `got`（自制 HTTP）。
+单向依赖链（无循环依赖）：`Config → Utils → Formatter → RuleEngine → FilterEngine → MessageStore → Network → Pusher → App`，外部依赖 `notify`（推送通道）与官方 `got`（HTTP 客户端）。
 
 | 层 | 行号 | 职责 | 设计要点 |
 |---|---|---|---|
@@ -299,7 +299,7 @@ fetchData 失败/格式异常 → run() catch（L1862-1879）
 | Promise | 所有 async 调用必须有处理：allSettled/race loser 有 handler；fire-and-forget（告警/日报）内部 .catch |
 | 文件 | 原子写（tmp+rename）；失败清理 tmp；日志写失败静默不中断主流程 |
 | 缓存目录 | init 自动创建；目录可随时清空（下次运行重建）；filter.hash/alert.state/report.state/run.log 均在其中 |
-| Buffer/body | got 响应体 20MB 上限（EBODYLIMIT） |
+| Buffer/body | 官方 got 负责响应体读取；业务层校验 JSON 结构/数组形态，部署依赖官方 got 的响应处理语义 |
 | 进程 | 成功路径自然退出（等 pending socket）；失败路径 exit(1) 前 await 告警 |
 
 ---

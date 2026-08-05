@@ -19,7 +19,9 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
-      # 零第三方依赖，无需 npm install（自制 got 已入库）
+      - name: 安装 HTTP 依赖（官方 got）
+        run: npm install --ignore-scripts
+
       - name: 单元测试（test_filter.js）
         run: node test_filter.js
 

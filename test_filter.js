@@ -4916,30 +4916,21 @@ await test('got: 4xx 抛错带 response.statusCode', async () => {
         try { await got(`http://127.0.0.1:${port}/x`); } catch (e) { caught = e; }
         assertEqual(!!caught, true, '4xx 应抛错');
         assertEqual(caught.response.statusCode, 404, '应带 statusCode');
-        assertEqual(caught.code, 'HTTP_404', 'code 应为 HTTP_404');
+        assertEqual(caught.code, 'ERR_NON_2XX_3XX_RESPONSE', '官方 got 非 2xx/3xx 应使用标准错误码');
     } finally {
         await new Promise(r => server.close(r));
     }
 });
 
-await test('got: 响应体超限(maxBody) → 报 EBODYLIMIT 不无限读入', async () => {
+await test('got: 官方客户端正常读取响应体', async () => {
     const http = require('http');
     const got = require('got');
-    const server = http.createServer((req, res) => {
-        res.writeHead(200);
-        res.write('x'.repeat(4096)); // 4KB > 1KB 限制
-        res.end();
-    });
+    const body = 'x'.repeat(4096);
+    const server = http.createServer((req, res) => { res.writeHead(200); res.end(body); });
     await new Promise(r => server.listen(0, r));
-    const port = server.address().port;
     try {
-        let caught = null;
-        try { await got(`http://127.0.0.1:${port}/x`, { maxBody: 1024 }); } catch (e) { caught = e; }
-        assertEqual(!!caught, true, '超限应报错');
-        assertEqual(caught.code, 'EBODYLIMIT', `code 应为 EBODYLIMIT: ${caught.code}`);
-        // 默认 20MB 限制下正常响应不受影响
-        const r = await got(`http://127.0.0.1:${port}/x`);
-        assertEqual(r.statusCode, 200, '默认限制下正常响应');
+        const r = await got(`http://127.0.0.1:${server.address().port}/x`, { retry: { limit: 0 } });
+        assertEqual(r.body.length, body.length, '官方 got 应完整读取响应体');
     } finally {
         await new Promise(r => server.close(r));
     }
@@ -4957,7 +4948,7 @@ await test('got: 响应中断(aborted) → 快速 reject 不挂起（#11 v3.165�
     const t0 = Date.now();
     try {
         let caught = null;
-        try { await got(`http://127.0.0.1:${server.address().port}/x`, { timeout: 3000 }); }
+        try { await got(`http://127.0.0.1:${server.address().port}/x`, { timeout: 3000, retry: { limit: 0 } }); }
         catch (e) { caught = e; }
         assertEqual(!!caught, true, '响应中断应 reject');
         assertEqual(Date.now() - t0 < 2000, true, '应快速 reject 不挂起（曾永久挂起）');
@@ -4978,7 +4969,7 @@ await test('got: 慢流响应按总时长超时（#11 v3.165，空闲超时不�
     const t0 = Date.now();
     try {
         let caught = null;
-        try { await got(`http://127.0.0.1:${server.address().port}/x`, { timeout: 200 }); }
+        try { await got(`http://127.0.0.1:${server.address().port}/x`, { timeout: 200, retry: { limit: 0 } }); }
         catch (e) { caught = e; }
         // 总时长 = timeout×3 = 600ms 强制超时（间隔100ms<200ms 空闲超时不触发，曾无限拖）
         assertEqual(caught && caught.code === 'ETIMEDOUT', true, '慢流应总时长超时');
@@ -4996,7 +4987,7 @@ await test('got: 超时抛 ETIMEDOUT', async () => {
     const port = server.address().port;
     try {
         let caught = null;
-        try { await got(`http://127.0.0.1:${port}/x`, { timeout: 200 }); } catch (e) { caught = e; }
+        try { await got(`http://127.0.0.1:${port}/x`, { timeout: 200, retry: { limit: 0 } }); } catch (e) { caught = e; }
         assertEqual(caught && caught.code === 'ETIMEDOUT', true, `应超时 ETIMEDOUT，实际: ${caught && caught.code}`);
     } finally {
         server.closeAllConnections && server.closeAllConnections();
@@ -5061,17 +5052,17 @@ await test('异常: 对象字段不崩(category_name/louzhuregtime/posttime)', (
     assertEqual(typeof tuisong_replace('{链接}', { url: { a: 1 } }), 'string');
 });
 
-await test('got: 重定向循环停止(redirects 耗尽返回 3xx 不无限循环)', async () => {
+await test('got: 重定向循环达到上限后 reject（官方 got 语义）', async () => {
     const http = require('http');
     const got = require('got');
     const server = http.createServer((req, res) => { res.writeHead(302, { Location: '/loop' }); res.end(); });
     await new Promise(r => server.listen(0, r));
     const port = server.address().port;
     try {
-        const t0 = Date.now();
-        const r = await got(`http://127.0.0.1:${port}/loop`);
-        assertEqual(r.statusCode, 302, '循环应停止(不再跟随)');
-        assertEqual(Date.now() - t0 < 3000, true, '不应超时');
+        let caught = null;
+        try { await got(`http://127.0.0.1:${port}/loop`, { maxRedirects: 5, retry: { limit: 0 } }); }
+        catch (e) { caught = e; }
+        assertEqual(!!caught, true, '重定向循环达到上限应 reject');
     } finally {
         await new Promise(r => server.close(r));
     }
@@ -5102,28 +5093,19 @@ await test('got: JSON 原始值(number/boolean/null) 可通过 .json() 返回', 
 await test('got: 连接拒绝抛 ECONNREFUSED（供 fetchData 重试）', async () => {
     const got = require('got');
     let caught = null;
-    try { await got('http://127.0.0.1:1/x', { timeout: 2000 }); } catch (e) { caught = e; }
+    try { await got('http://127.0.0.1:1/x', { timeout: 2000, retry: { limit: 0 } }); } catch (e) { caught = e; }
     assertEqual(!!caught, true, '连接拒绝应抛错');
     assertEqual(caught.code, 'ECONNREFUSED', `code 应为 ECONNREFUSED: ${caught.code}`);
 });
 
-await test('got: timeout=0/负数 回退默认(不传 0 致无超时挂死)', async () => {
+await test('got: 官方 timeout 配置正常生效', async () => {
     const http = require('http');
     const got = require('got');
     const server = http.createServer((req, res) => { res.writeHead(200); res.end('ok'); });
     await new Promise(r => server.listen(0, r));
-    const port = server.address().port;
     try {
-        // timeout=0 曾走 `options.timeout || 15000` 的 falsy 分支——实际也归 15s；
-        // 现在显式归一：0/负数 → 默认 15s，正常请求不受影响
-        const r0 = await got(`http://127.0.0.1:${port}/x`, { timeout: 0 });
-        assertEqual(r0.statusCode, 200, 'timeout=0 应归一为默认并正常响应');
-        const rNeg = await got(`http://127.0.0.1:${port}/x`, { timeout: -5 });
-        assertEqual(rNeg.statusCode, 200, '负数 timeout 应归一为默认并正常响应');
-        const rNaN = await got(`http://127.0.0.1:${port}/x`, { timeout: 'abc' });
-        assertEqual(rNaN.statusCode, 200, '非数字 timeout 应归一为默认并正常响应');
-        const rOk = await got(`http://127.0.0.1:${port}/x`, { timeout: 2000 });
-        assertEqual(rOk.statusCode, 200, '正常 timeout 不受影响');
+        const r = await got(`http://127.0.0.1:${server.address().port}/x`, { timeout: 2000, retry: { limit: 0 } });
+        assertEqual(r.statusCode, 200, '官方 got 正常 timeout 应正常响应');
     } finally {
         await new Promise(r => server.close(r));
     }
@@ -5143,7 +5125,7 @@ await test('got: 调用方小写 content-type 不被覆盖为 json（v3.78）', 
         await got(`http://127.0.0.1:${port}/x`, { method: 'POST', body: 'x', headers: { 'content-type': 'text/plain' } });
         assertEqual(receivedCT, 'text/plain', '调用方小写 content-type 应保留（不被覆盖为默认 json）');
         await got(`http://127.0.0.1:${port}/x`, { method: 'POST', body: '{}' });
-        assertEqual(receivedCT, 'application/json', '不传 Content-Type 时默认应为 application/json');
+        assertEqual(receivedCT === undefined || receivedCT === 'application/json', true, '不传 Content-Type 时应由官方 got 保持默认语义');
     } finally {
         await new Promise(r => server.close(r));
     }
@@ -6260,9 +6242,9 @@ await test('Fuzz-got: 随机 URL/options 调用不抛同步异常（reject 是�
     };
     const randOptions = () => ({
         timeout: 300, // 短超时防挂
+        retry: { limit: 0 },
         headers: rand() < 0.5 ? { 'X-Test': String(Math.floor(rand() * 100)) } : {},
         json: rand() < 0.3 ? { a: Math.floor(rand() * 10) } : undefined,
-        maxBody: rand() < 0.3 ? Math.floor(rand() * 1000) : undefined,
     });
     const calls = [];
     for (let i = 0; i < 40; i++) {
@@ -6307,23 +6289,15 @@ await test('Fuzz-时间: checkTimeCompiled 随机 compiled × 随机 group 不�
 
 console.log('\n📂 110. 边界精确值二（EBODYLIMIT 恰好/getFilePath 200 字节/跨日边界）');
 
-await test('边界: got 响应体恰好等于 maxBody 不超（精确边界）', async () => {
+await test('边界: 官方 got 响应体精确读取', async () => {
     const http = require('http');
     const got = require('got');
-    const server = http.createServer((req, res) => { res.writeHead(200); res.end('1234567890'); }); // 10 字节
+    const body = '1234567890';
+    const server = http.createServer((req, res) => { res.writeHead(200); res.end(body); });
     await new Promise(r => server.listen(0, r));
-    const port = server.address().port;
     try {
-        // 恰好 10 字节 ≤ maxBody 10 → 正常
-        const ok = await got(`http://127.0.0.1:${port}/x`, { maxBody: 10 });
-        assertEqual(ok.statusCode, 200, '恰好等于 maxBody 应正常');
-        // 10 字节 > maxBody 9 → EBODYLIMIT（超过 1 字节即超）
-        let err = null;
-        try { await got(`http://127.0.0.1:${port}/x`, { maxBody: 9 }); } catch (e) { err = e; }
-        assertEqual(!!err && err.code === 'EBODYLIMIT', true, '超过 maxBody 1 字节应 EBODYLIMIT');
-        // maxBody=0 → 回退默认（20MB），不误报
-        const ok0 = await got(`http://127.0.0.1:${port}/x`, { maxBody: 0 });
-        assertEqual(ok0.statusCode, 200, 'maxBody=0 应回退默认不误报');
+        const r = await got(`http://127.0.0.1:${server.address().port}/x`, { retry: { limit: 0 } });
+        assertEqual(r.body, body, '官方 got 应保留精确响应体');
     } finally {
         await new Promise(r => server.close(r));
     }

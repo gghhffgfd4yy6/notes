@@ -8,7 +8,7 @@
 //   与上一个测试残留的通道配置污染 gotCalls / 断言
 
 const path = require('path');
-const gotPath = path.join(__dirname, 'node_modules', 'got', 'index.js');
+const gotPath = require.resolve('got');
 require(gotPath);
 
 let gotCalls = [];

@@ -1,7 +1,7 @@
 # 📡 线报酷推送脚本（xbk-push）
 
 > **定时拉取线报酷接口数据 → 规则过滤 → 多通道推送** 的 Node.js 脚本。
-> 零第三方依赖（自制精简 HTTP 模块）、单文件主程序、完整测试体系与系统契约文档——**个人使用、青龙单实例场景**的成熟方案。
+> 使用官方 got HTTP 客户端、单文件主程序、完整测试体系与系统契约文档——**个人使用、青龙单实例场景**的成熟方案。
 
 - 版本演进见 [CHANGELOG.md](CHANGELOG.md)；当前版本以 [package.json](package.json) 为准（版本一致性测试自动校验三方一致，不会过时）
 - 设计理念 / 系统不变量 / 各模块契约 / 设计边界见 **[SYSTEM_CONTRACT.md](SYSTEM_CONTRACT.md)**（改代码前必读）
@@ -40,7 +40,10 @@
 ## 🚀 快速开始
 
 ```bash
-# ① 配置推送密钥（本地文件，不入库，已 gitignore）
+# ① 安装官方 HTTP 客户端依赖
+npm install --ignore-scripts
+
+# ② 配置推送密钥（本地文件，不入库，已 gitignore）
 cp push_config.local.js.example push_config.local.js
 #    编辑填入你的通道 key（PUSH_KEY / BARK_PUSH / TG_BOT_TOKEN 等）
 
@@ -118,7 +121,7 @@ xbk_sendNotify_slim.js    推送模块（9 通道实现 + 密钥脱敏）
 push_config.local.js      本地密钥（不入库！）
 push_config.local.js.example  密钥配置示例模板（可入库）
 xianbaoku_cache/          去重缓存 + run.log + 状态文件（不入库）
-node_modules/got/         自制精简 HTTP 模块（唯一依赖，被 git 追踪）
+node_modules/got/         官方 got HTTP 客户端（版本由 package.json 管理）
 test_filter.js            单元测试（属性/Fuzz/性能基准/版本一致性）
 test_app.js               集成测试（mock 完整主流程）
 test_app_parallel.js      集成测试并行调度器
