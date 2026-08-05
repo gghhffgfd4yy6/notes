@@ -237,16 +237,16 @@ Config.cache.maxSize       // 缓存上限(滚动淘汰)
 ### `.gitignore` — 忽略规则
 
 ```
-node_modules/        # npm 依赖（got 包目录被 git 追踪，其他依赖由 npm install 生成）
+node_modules/        # npm 依赖（全部由 npm install 按 package.json 生成）
 xianbaoku_cache*/    # 运行缓存（含测试/多实例隔离目录）
 push_config.local.js # 本地密钥(必须忽略!)
 ```
 
-注意:`!node_modules/got/` 是反向规则——**官方 got 包目录被刻意追踪**，其余依赖由 `npm install` 按 `package.json` 生成。
+注意：`node_modules/` 整体忽略，官方 got 及其传递依赖均由 `npm install --ignore-scripts` 按 `package.json` / `package-lock.json` 生成，不提交依赖源码。
 
 ### `node_modules/got/` — 官方 got HTTP 客户端
 
-**定位**:官方 CommonJS got 客户端，当前版本由 `package.json` 管理；本项目使用兼容 Node 14+ / CommonJS 的官方版本。
+**定位**:官方 CommonJS got 客户端，版本由 `package.json` / `package-lock.json` 管理；项目部署和 CI 通过 `npm install --ignore-scripts` 生成依赖，不把 `node_modules` 纳入 Git。
 
 **功能**:官方重定向、JSON 解析、HTTP 错误响应、请求超时、重试、Keep-Alive/连接复用和 GET/POST。
 
@@ -285,9 +285,9 @@ npm run test:notify
 
 **定位**:仓库最外层说明——项目简介、特性、快速开始(含密钥配置)、测试、cron 示例、配置速查、目录结构、安全红线。新人第一入口。
 
-### `SYSTEM_CONTRACT.md` — 系统契约(v3.187 定稿)
+### `SYSTEM_CONTRACT.md` — 系统契约
 
-**定位**:规范描述(normative)——设计理念(宁可多推不可少推等五大原则)、系统不变量(I1-I9)、判重三条件契约、缓存写入时机、时间口径约定、配置传播契约(Utils.num/filterHash/FILTER_FIELDS 耦合)、设计边界与已知取舍(多实例/超时歧义等不修项)。**改代码前必读**；代码位置仅作参考，契约文字不随版本过时。
+**定位**:规范描述（normative）——设计理念(宁可多推不可少推等五大原则)、系统不变量(I1-I9)、判重三条件契约、缓存写入时机、时间口径约定、配置传播契约(Utils.num/filterHash/FILTER_FIELDS 耦合)、设计边界与已知取舍(多实例/超时歧义等不修项)。**改代码前必读**；代码位置仅作参考，契约文字不随版本过时。
 
 ### `package.json` — 工程化入口(v3.71 新增)
 
