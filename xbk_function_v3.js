@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.203 — 推送脱敏异常防御 ********
+//******** 线报酷推送脚本 v3.204 — 缓存落盘失败一致性防御 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1261,6 +1261,15 @@ const MessageStore = {
     },
 
     saveMessages(filePath, messages) {
+        // 记录写入前的内存缓存：落盘失败时不能把未持久化的新状态伪装成已保存。
+        const hadMemo = Object.prototype.hasOwnProperty.call(this._memoryCache, filePath);
+        const memoBefore = hadMemo ? this._memoryCache[filePath] : undefined;
+        const restoreMemo = () => {
+            if (hadMemo) this._memoSet(filePath, memoBefore);
+            else {
+                try { delete this._memoryCache[filePath]; } catch (e) { /* 忽略 */ }
+            }
+        };
         // 拷贝后再截断：不原地修改调用方传入的数组（外部复用场景）
         const toSave = Array.isArray(messages) ? [...messages] : [];
         // maxSize 防御：非正整数回退默认（R3-2 整数化——小数 2.5 会让 splice 的 ToInteger 截断产生模糊条数；0/负值避免缓存被清空）
@@ -1281,7 +1290,7 @@ const MessageStore = {
             }
         })();
         if (text === null) {
-            this._memoSet(filePath, toSave);
+            restoreMemo();
             return false;
         }
         // 原子写入：先写 tmp 再 rename，避免并发/崩溃时半写文件损坏缓存
@@ -1292,11 +1301,12 @@ const MessageStore = {
             fs.renameSync(tmpFile, filePath);
         } catch (e) {
             saved = false;
-            // 写失败/rename 失败：清理 tmp 残留，不中断
+            // 写失败/rename 失败：清理 tmp 残留，不中断；恢复写入前内存快照，避免未落盘消息被判重吞掉。
             try { fs.unlinkSync(tmpFile); } catch (e2) { /* 忽略 */ }
+            restoreMemo();
             console.error(`缓存写入失败 ${filePath}:`, e.message);
         }
-        this._memoSet(filePath, toSave);
+        if (saved) this._memoSet(filePath, toSave);
         return saved;
     },
 
@@ -1314,7 +1324,8 @@ const MessageStore = {
         // 公开 API 防御：批量输入必须是数组；对象/数字/Symbol 等不可迭代值不能直接进入 for...of。
         if (!Array.isArray(newMessages) || newMessages.length === 0) return;
         const filePath = this.getFilePath(filename);
-        const messages = this.readMessages(filePath);
+        // readMessages 可能返回进程内内存缓存权威数组；先复制，避免落盘失败前原地污染内存缓存。
+        const messages = [...this.readMessages(filePath)];
         // v3.118 性能：逐条 _upsert 的 findIndex 是 O(N×M)（缓存 100 条 + 新 N 条累积 → O(N²)，
         // 实测 5000 条 2475ms）。构建 id/url 索引 O(1) 判重定位，维护 O(1)。
         // 判重口径与 _findDedupIndex 完全一致：有 id 匹配 String(id)（或 m 无 id 时 url）；

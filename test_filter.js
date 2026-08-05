@@ -4603,6 +4603,24 @@ await test('故障注入: fs.renameSync 抛错 → saveMessages 不崩溃+tmp残
     assertEqual(true, true, 'rename 失败应被容错');
 });
 
+await test('故障注入: saveBatch 落盘失败 → 内存缓存不得提前判重', () => {
+    const fs = require('fs');
+    const name = 'test_save_batch_persist_fail.json';
+    const p = getFilePath(name);
+    try { fs.unlinkSync(p); } catch (e) {}
+    // 先建立空的内存缓存快照，再模拟 rename 失败。
+    readMessages(p);
+    const orig = fs.renameSync;
+    fs.renameSync = () => { throw new Error('rename失败'); };
+    try {
+        saveBatch([{ id: 991 }], name);
+    } finally {
+        fs.renameSync = orig;
+    }
+    assertEqual(isMessageInFile({ id: 991 }, name), false, '落盘失败的消息不能被内存缓存判定为已处理');
+    try { fs.unlinkSync(p); } catch (e) {}
+});
+
 await test('故障注入: fs.mkdirSync 抛错 → init 不崩溃', () => {
     const fs = require('fs');
     const orig = fs.mkdirSync;
