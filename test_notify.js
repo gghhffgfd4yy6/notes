@@ -956,6 +956,27 @@ await test('全部 8 通道 API 业务失败 → 至少失败时 reject（v3.160
     failBiz = false;
 }));
 
+await test('Server酱字符串 errno 成功/重复码应按数字语义处理', () => withChannels(async () => {
+    cfg.PUSH_KEY = 'SCT123';
+    const originalPost = require.cache[gotPath].exports.post;
+    require.cache[gotPath].exports.post = (url, options) => ({
+        then: (res) => res({ body: String(url).includes('ftqq.com') ? { errno: '0', errmsg: 'success' } : '{}', statusCode: 200, headers: {} }),
+    });
+    try {
+        await notify.sendNotify('标题', '内容');
+    } finally {
+        require.cache[gotPath].exports.post = originalPost;
+    }
+}));
+
+await test('wxpusher 非白名单 HTML 元素自动切换 HTML 内容类型', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123';
+    cfg.WX_pusher_topicIds = '1';
+    await notify.sendNotify('标题', '<input autofocus onfocus=alert(1)>内容');
+    const c = gotCalls.find(x => x.url.includes('wxpusher'));
+    assert(c && c.options.json.contentType === 2, `真实 HTML 应使用 HTML 类型: ${JSON.stringify(c && c.options.json)}`);
+}));
+
 if (failed === 0) {
     console.log(`  🎉 通道测试通过 ${passed}/${passed}`);
 } else {

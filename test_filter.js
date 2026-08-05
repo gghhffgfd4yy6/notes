@@ -6649,6 +6649,37 @@ await test('getFileName 坏源命名（#10/49）', () => {
     assertEqual(getFileName({ a: 1 }), 'default.json', '对象 default');
 });
 
+await test('脏字段转字符串失败不应让过滤流程崩溃', () => {
+    const bad = { toString() { throw new Error('bad toString'); } };
+    assertEqual(listfilter({ catename: 'a', louzhu: bad, title: bad, content: bad, louzhuregtime: '2020-01-01' }, {
+        pingbilouzhu: 'x', pingbibiaoti: 'x', pingbineirong: 'x',
+    }), true, '无法转字符串的字段应保守放行');
+    assertEqual(listfilter({ catename: bad, title: 'x', content: 'x', louzhuregtime: '2020-01-01' }, {
+        pingbifenlei: 'a###x',
+    }), true, '分类字段转换失败也应保守放行');
+    assertEqual(whitelistFilter({ title: bad }, 'title', 'x'), true, '只看它字段转换失败应保守放行');
+});
+
+await test('validateConfig 脏 pingbitime 转换失败不应抛异常', () => {
+    const bad = { toString() { throw new Error('bad pingbitime'); } };
+    const warnings = validateConfig({ pingbitime: bad });
+    assertEqual(Array.isArray(warnings), true, '应返回警告数组');
+    assertEqual(warnings.some(w => w.includes('无法转换')), true, '应提示无法转换');
+});
+
+await test('tuisong_replace 循环引用字段不应崩溃', () => {
+    const circular = {};
+    circular.self = circular;
+    assertEqual(tuisong_replace('{内容}|{标题}|{分类名}', {
+        content: circular, title: circular, catename: circular,
+    }), '||', '循环引用字段应安全降为空');
+});
+
+await test('HTML 图片支持无引号 src/alt', () => {
+    const out = htmlToMarkdown({ content_html: '<img src=https://img.example/a.png alt=示例>' });
+    assertEqual(out.includes('![示例](https://img.example/a.png)'), true, `无引号图片应转换: ${out}`);
+});
+
 if (failed === 0) {
     console.log(`  🎉 全部通过！${passed}/${passed}  100%`);
 } else {

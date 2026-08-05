@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.193 — 修复最终推送出口 HTML 形态检测漏网；补非白名单元素回归 ********
+//******** 线报酷推送脚本 v3.194 — 多路径脏输入/通道兼容/HTML 检测批量修复 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -475,11 +475,11 @@ const Formatter = {
                 return (href.trim() && !Utils.isDangerousUrl(href)) ? `[${txt}](${href})` : txt;
             })
             .replace(/<img\b[^>]*>/gi, (tag) => {
-                const srcM = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
+                const srcM = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i) || tag.match(/\bsrc\s*=\s*([^\s"'<>`]+)/i);
                 if (!srcM) return tag; // 无 src 不转换
                 const src = srcM[1].trim();
-                if (!src || Utils.isDangerousUrl(src)) return tag.replace(/\bsrc\s*=\s*(["'])[^"']*\1/i, ''); // 空/危险 src 不生成可执行图片链接
-                const altM = tag.match(/\balt\s*=\s*["']([^"']*)["']/i);
+                if (!src || Utils.isDangerousUrl(src)) return tag.replace(/\bsrc\s*=\s*(?:(["'])[^"']*\1|[^\s"'<>`]+)/i, ''); // 空/危险 src 不生成可执行图片链接
+                const altM = tag.match(/\balt\s*=\s*["']([^"']*)["']/i) || tag.match(/\balt\s*=\s*([^\s"'<>`]+)/i);
                 // alt 截断（真实接口 alt 可长达 250+ 字符拖累推送）——代理对安全
                 const alt = altM ? Utils.truncateUtf16(altM[1], 50) : '';
                 // 注：img URL 不包裹 <>——此处早于标签剥离，<url> 会被 /<[^>]+>/g 当标签剥掉成空 ![]()
@@ -592,7 +592,9 @@ const Formatter = {
         for (const [key, val] of Object.entries(map)) {
             text = text.replace(new RegExp(key, 'g'), () => {
                 if (val === undefined || val === null) return '';
-                return typeof val === 'object' ? JSON.stringify(val) : val;
+                if (typeof val !== 'object') return val;
+                try { return JSON.stringify(val); }
+                catch (e) { return ''; } // 循环引用等脏字段不应让整条推送流程崩溃
             });
         }
         // v3.110：输出统一清洗孤立代理（encodeURIComponent 会崩；所有模板路径受益）
@@ -796,7 +798,14 @@ const RuleEngine = {
 
     /** 多行规则分类匹配：无 cat 限制(匹配所有)或有 cat 且 catename 匹配 */
     _catMatches(rule, catename) {
-        return !rule.cat || (catename && rule.cat.test(catename));
+        if (!rule.cat) return true;
+        if (!catename) return false;
+        try {
+            const value = typeof catename === 'string' ? catename : String(catename);
+            return rule.cat.test(value);
+        } catch (e) {
+            return false;
+        }
     },
 
     /** 多行规则任意匹配：分类匹配 + 断言成立即返回 true（matchesCompiled/checkTimeCompiled 共用） */
@@ -810,15 +819,18 @@ const RuleEngine = {
     /** 使用编译后的规则进行匹配（单条） */
     matchesCompiled(compiled, fieldValue, catename) {
         if (!compiled || !fieldValue) return false;
+        let value;
+        try { value = typeof fieldValue === 'string' ? fieldValue : String(fieldValue); }
+        catch (e) { return false; } // 脏字段 toString/Symbol 失败时保守放行，不让整批 run 崩溃
 
         if (compiled._type === 're') {
             // 简单正则
-            return compiled.re.test(fieldValue);
+            return compiled.re.test(value);
         }
 
         if (compiled._type === 'multi') {
             // 多行多分类：任意一行匹配即匹配
-            return this._anyRule(compiled.rules, catename, r => r.val.test(fieldValue));
+            return this._anyRule(compiled.rules, catename, r => r.val.test(value));
         }
 
         return false;
@@ -915,16 +927,18 @@ const RuleEngine = {
 
         // 验证 pingbitime
         // v3.156：空白配置('   ')警告（曾静默当 0 关闭时间过滤，复制粘贴带空格常见）
-        const pbStr = cfg.pingbitime === undefined || cfg.pingbitime === null ? '' : String(cfg.pingbitime);
+        let pbStr = '';
+        try { pbStr = cfg.pingbitime === undefined || cfg.pingbitime === null ? '' : String(cfg.pingbitime); }
+        catch (e) { pbStr = ''; warnings.push('⚠️ 配置「pingbitime」无法转换为字符串，已忽略'); }
         // v3.156：空白/首尾空格警告（多行 ### 不警告——行内分类已 trim，整串首尾空格是格式不是错误）
         if (pbStr.trim() === '' && pbStr !== '') {
             warnings.push('⚠️ 配置「pingbitime」为空白字符，将被忽略');
         } else if (!/###/.test(pbStr) && pbStr.trim() !== '' && pbStr !== pbStr.trim()) {
             warnings.push('⚠️ 配置「pingbitime」含首尾空白，已按去空格后的值处理');
         }
-        if (String(cfg.pingbitime || '').trim()) {
-            if (/###/.test(cfg.pingbitime)) {
-                const lines = cfg.pingbitime.split(/<br\s*\/?>|\r\n|\r|\n/); // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
+        if (pbStr.trim()) {
+            if (/###/.test(pbStr)) {
+                const lines = pbStr.split(/<br\s*\/?>|\r\n|\r|\n/); // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
                 for (const line of lines) {
                     const { cat, val, parts } = this._parseLine(line);
                     if (parts.length >= 2) {
@@ -1076,9 +1090,12 @@ const FilterEngine = {
         if (!item) return false; // 防御：item 缺失 = 不匹配
         const value = item[field];
         if (!value) return false;
+        let matchValue;
+        try { matchValue = typeof value === 'string' ? value : String(value); }
+        catch (e) { return true; } // 脏字段无法转文本时保守放行，不让只看它整条流程崩溃
         if (RuleEngine.hasNestedQuantifier(kwStr)) return true; // ReDoS 防护：风险关键词不执行匹配，全部放行（与非法正则口径一致）
         try {
-            return new RegExp(kwStr, 'i').test(value);
+            return new RegExp(kwStr, 'i').test(matchValue);
         } catch (e) {
             // 非法正则：放行（与 App.run 的 zkt_gjc 预编译失败 kwRe=null 不过滤口径一致；宁可多推不可少推）
             return true;
@@ -1464,7 +1481,7 @@ const Pusher = {
         // 仅当 desp 呈 HTML 形态（将触发 wxpusher 等 HTML 渲染通道）时清洗：
         // 纯 Markdown/纯文本（默认 {Markdown内容}、{内容} 普通文本）不清洗，
         // 避免破坏 Markdown 代码块、技术讨论文本（onerror= 等字面量）与排版实体。
-        const htmlLike = /<\s*\/?\s*[A-Za-z][^>]*>/i.test(desp);
+        const htmlLike = /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^>]*>/i.test(desp);
         if (htmlLike) {
             desp = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(desp));
         }

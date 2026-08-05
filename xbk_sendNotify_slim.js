@@ -354,9 +354,11 @@ function serverNotify(text, desp) {
                     } else {
                         // server酱和Server酱·Turbo版的返回json格式不太一样
                         // 响应防御：Server酱/Turbo 返回结构不同，且异常时可能缺字段
-                        const errno = data && (data.errno !== undefined ? data.errno : (data.data && data.data.errno));
+                        const rawErrno = data && (data.errno !== undefined ? data.errno : (data.data && data.data.errno));
+                        const errno = rawErrno === '0' || rawErrno === 0 ? 0
+                            : (rawErrno === '1024' || rawErrno === 1024 ? 1024 : rawErrno);
                         if (errno === 0) {
-                            console.log('Server 酱发送通知消息成功🎉\n');
+                            console.log('Server 酱发送通知消息成功🎉\\n');
                         } else if (errno === 1024) {
                             // 一分钟内发送相同的内容会触发（内容已送达，视为成功不重试）
                             console.log(`Server 酱发送通知消息异常 ${safeErr(data && data.errmsg)}\n`);
@@ -590,7 +592,9 @@ function qywxBotNotify(text, desp) {
 // 含真实 HTML 标签时自动切 contentType=2(HTML 渲染)；标签白名单避免误判 Markdown 的 <https://...> autolink
 function looksHtml(s) {
     if (!s || typeof s !== 'string') return false;
-    return /<\s*\/?\s*(?:br|a|img|p|div|strong|b|i|em|u|s|table|tr|td|th|ul|ol|li|h[1-6]|span|font|blockquote|code|pre|hr)\b[^>]*>/i.test(s);
+    // 与主流程 Pusher 的最终出口保持同一口径：不能只识别有限白名单，
+    // 否则 input/form 等真实 HTML 会被当 Markdown 原样发送。
+    return /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^>]*>/i.test(s);
 }
 
 function wxPusherNotify(text, desp) {
