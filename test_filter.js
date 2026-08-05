@@ -4922,15 +4922,20 @@ await test('got: 4xx 抛错带 response.statusCode', async () => {
     }
 });
 
-await test('got: 官方客户端正常读取响应体', async () => {
+await test('got/项目 HTTP 薄封装：官方读取响应体且保留大小上限', async () => {
     const http = require('http');
     const got = require('got');
-    const body = 'x'.repeat(4096);
+    const { fetchJson } = require('./xbk_http');
+    const body = JSON.stringify({ data: 'x'.repeat(4096) });
     const server = http.createServer((req, res) => { res.writeHead(200); res.end(body); });
     await new Promise(r => server.listen(0, r));
     try {
         const r = await got(`http://127.0.0.1:${server.address().port}/x`, { retry: { limit: 0 } });
         assertEqual(r.body.length, body.length, '官方 got 应完整读取响应体');
+        let caught = null;
+        try { await fetchJson(`http://127.0.0.1:${server.address().port}/x`, { retry: { limit: 0 } }, 1024); }
+        catch (e) { caught = e; }
+        assertEqual(caught && caught.code === 'EBODYLIMIT', true, '项目薄封装应保留响应体上限');
     } finally {
         await new Promise(r => server.close(r));
     }

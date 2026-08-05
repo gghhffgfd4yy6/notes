@@ -299,7 +299,7 @@ fetchData 失败/格式异常 → run() catch（L1862-1879）
 | Promise | 所有 async 调用必须有处理：allSettled/race loser 有 handler；fire-and-forget（告警/日报）内部 .catch |
 | 文件 | 原子写（tmp+rename）；失败清理 tmp；日志写失败静默不中断主流程 |
 | 缓存目录 | init 自动创建；目录可随时清空（下次运行重建）；filter.hash/alert.state/report.state/run.log 均在其中 |
-| Buffer/body | 官方 got 负责响应体读取；业务层校验 JSON 结构/数组形态，部署依赖官方 got 的响应处理语义 |
+| Buffer/body | 官方 got 负责 HTTP 传输；`xbk_http.fetchJson()` 流式限制响应体大小并解析 JSON，业务层继续校验数组形态 |
 | 进程 | 成功路径自然退出（等 pending socket）；失败路径 exit(1) 前 await 告警 |
 
 ---

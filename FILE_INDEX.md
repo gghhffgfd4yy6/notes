@@ -252,6 +252,12 @@ push_config.local.js # 本地密钥(必须忽略!)
 
 **注意**:首次部署或 CI 需先执行 `npm install --ignore-scripts`；测试通过 `require.resolve('got')` 注入 mock，不再依赖自制模块的固定 `index.js` 路径。
 
+### `xbk_http.js` — 官方 got 薄封装
+
+**定位**:不重新实现 HTTP，只在官方 got 之上补项目契约：流式累计响应体大小、超过上限时终止请求、解析 JSON、保留 HTTP 错误状态。
+
+**使用**:主接口拉取通过 `fetchJson()` 调用；推送通道仍直接使用官方 got。
+
 ---
 
 ## 五、使用入口速查

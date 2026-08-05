@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.197 — 切换官方 got HTTP 客户端 ********
+//******** 线报酷推送脚本 v3.198 — 官方 got 薄封装恢复响应体上限 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -8,7 +8,7 @@
 // ============================================================
 const notify = require('./xbk_sendNotify_slim');
 const fs = require('fs');
-const got = require('got');
+const { fetchJson } = require('./xbk_http');
 const path = require('path');
 // 版本号单一来源（v3.82）：package.json 与文件头/CHANGELOG/README 四方一致由 101 章测试保证
 // 版本号单一来源（v3.82）；缺 package.json 时回退 '3.x'（移植性防御，v3.113）
@@ -1441,14 +1441,14 @@ const Network = {
         for (let attempt = 0; attempt <= maxRetry; attempt++) {
             try {
                 // retry: { limit: 0 } 关闭 got 内置重试，完全交给外层手写逻辑
-                return await got(Config.api.pushUrl, {
+                return await fetchJson(Config.api.pushUrl, {
                     timeout: Utils.num(Config.api.timeout, 5000), // v3.162：字符串'5000'→5000（v3.158 转换 7 处漏了 timeout，曾回退 15s）
                     retry: { limit: 0 },
                     headers: {
                         'User-Agent': `xbk-push-script/${PKG_VERSION}`,
                         'Accept': 'application/json',
                     },
-                }).json();
+                });
             } catch (e) {
                 lastErr = e;
 
