@@ -745,3 +745,9 @@
 - **测试入口**：单元、集成、通道和全量测试统一提供 npm scripts，避免文档和 CI 直接调用 Node 文件。
 - **CI/文档同步**：GitHub Actions、Gitee Go、README、FILE_INDEX 全部改用 `npm run ...` 入口；串行集成验证保留为独立脚本。
 - **文档状态收敛**：当前状态改为引用 `package.json`、文件头和 CHANGELOG 的版本一致性；系统契约、审查记录和 Bug 文档不再绑定旧的当前版本或过时测试数量。
+
+## 文档维护（不改变程序版本）
+
+- 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS、BUG_HUNT 和 BUG_AUDIT_P1_P2 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。
+- 移除易过时的当前结构行号、测试规模和运行耗时表述；历史变更记录保留为历史事实。
+- 补充 `.workflow/master-pipeline.yml` 在文件索引中的说明，并明确 GitHub Actions 与分阶段流水线的测试入口差异。

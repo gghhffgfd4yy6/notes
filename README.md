@@ -3,7 +3,7 @@
 > **定时拉取线报酷接口数据 → 规则过滤 → 多通道推送** 的 Node.js 脚本。
 > 使用官方 got HTTP 客户端、单文件主程序、完整测试体系与系统契约文档——**个人使用、青龙单实例场景**的成熟方案。
 
-- 版本演进见 [CHANGELOG.md](CHANGELOG.md)；当前版本以 [package.json](package.json) 为准（版本一致性测试自动校验三方一致，不会过时）
+- 版本演进见 [CHANGELOG.md](CHANGELOG.md)；版本一致性由文件头、`CHANGELOG.md` 和 `package.json` 的自动测试校验（README 不维护版本号）
 - 设计理念 / 系统不变量 / 各模块契约 / 设计边界见 **[SYSTEM_CONTRACT.md](SYSTEM_CONTRACT.md)**（改代码前必读）
 - 文件级索引见 [FILE_INDEX.md](FILE_INDEX.md)；修/不修决策记录见 [REVIEW_DECISIONS.md](REVIEW_DECISIONS.md)
 
@@ -96,10 +96,10 @@ npm run test:app
 npm run test:notify
 ```
 
-- **三套件分工**：`test_filter.js`（单元/属性/Fuzz/性能基准/版本一致性）→ `test_app.js`（集成，mock 完整主流程，经并行调度器）→ `test_notify.js`（通道请求构造 + 密钥脱敏）
-- **测试数量不在此维护**（以 `npm test` 实际输出为准）；版本一致性三方自动校验（README 不含版本号）
+- **三套件分工**：`test_filter.js`（单元/属性/Fuzz/性能基准/版本一致性）→ `test_app.js`（集成测试 worker，mock 完整主流程）→ `test_notify.js`（通道请求构造 + 密钥脱敏）；推荐入口 `npm run test:app` 由 `test_app_p.js` 并行调度，需串行完整验证时使用 `npm run test:app:serial`
+- **测试数量不在此维护**（以 `npm test` 实际输出为准）；版本一致性由文件头、CHANGELOG 和 package.json 自动校验（README 不含版本号）
 - **系统验证**：判重等价性/缓存不变量经**固定种子属性测试**（双路径逐条比对 + 已知答案锚点，零失配）；连续运行稳定性验收；故障注入 / 变异测试 / ReDoS 全入口防护均有测试锁定
-- **CI**：`.github/workflows/test.yml`——push/PR 自动跑三套，全部 PASS 才可合并；Gitee Go 流水线分步骤标红失败环节
+- **CI**：`.github/workflows/test.yml` 在 push/PR 时执行三套测试；`.workflow/master-pipeline.yml` 提供分阶段的单元、并行集成、通道测试和汇总步骤。
 
 ## ⏰ cron 定时（示例）
 
@@ -150,15 +150,15 @@ push: {
 
 ```
 xbk_function_v3.js        主代码（分层架构：Config→Utils→Formatter→RuleEngine→FilterEngine→MessageStore→Network→Pusher→App）
-xbk_sendNotify_slim.js    推送模块（9 通道实现 + 密钥脱敏）
+xbk_sendNotify_slim.js    推送模块（多通道实现 + 密钥脱敏）
 push_config.local.js      本地密钥（不入库！）
 push_config.local.js.example  密钥配置示例模板（可入库）
 xianbaoku_cache/          去重缓存 + run.log + 状态文件（不入库）
 node_modules/got/         官方 got HTTP 客户端（版本由 package.json 管理）
 xbk_http.js              官方 got 薄封装（JSON 解析 + 响应体大小上限）
 test_filter.js            单元测试（属性/Fuzz/性能基准/版本一致性）
-test_app.js               集成测试（mock 完整主流程）
-test_app_p.js      集成测试并行调度器
+test_app.js               集成测试 worker（mock 完整主流程）
+test_app_p.js               集成测试并行调度器
 test_notify.js            通道测试
 run_tests.js              一键全量测试入口
 qinglong/xbk_push.js      青龙面板直接执行入口（自动定位根目录/补齐依赖）

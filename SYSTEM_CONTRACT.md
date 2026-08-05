@@ -1,8 +1,8 @@
 # 📜 xbk-push 系统契约（SYSTEM CONTRACT）
 
-> 本文档记录当前维护基线下的系统契约；版本以 `package.json` 和 `CHANGELOG.md` 为准
+> 本文档记录当前维护基线下的系统契约；版本信息以 `package.json`、文件头和 `CHANGELOG.md` 的自动一致性校验为准
 > 本文件回答「**为什么这么写**」——记录设计理念、系统不变量、模块契约与设计边界。
-> 代码可以演进，**契约与理由不随版本过时**；代码位置仅作参考，结构变化后以代码为准。
+> 代码可以演进，**契约与理由不随版本过时**；代码结构仅作实现参考，结构变化后以代码和测试为准。
 > 配套文档：README（使用）、FILE_INDEX（文件结构）、REVIEW_DECISIONS（修/不修的取舍）、CHANGELOG（演进史）。
 
 > **项目状态：维护阶段（MAINTENANCE）**——核心逻辑已成熟（多轮系统审查 + 属性测试 + 千轮稳定性验收收敛），
@@ -30,9 +30,9 @@
 ### 1.1 宁可多推，不可少推
 - 推送是面向用户的动作，**少推 = 丢失信息**（用户不知道），多推 = 重复（用户可忽略）。
 - 所有"歧义决策"一律向"多推"倾斜：
-  - 缺字段保守放行（`_passIfMissing`，L891）——数据缺标题/分类/注册时间时**不拦截**，宁可多推。
-  - 非法正则跳过规则而非拦截（compileRules L633 / whitelistFilter L997）——配错规则不惩罚正常数据。
-  - ReDoS 风险规则"宁可误拦（跳过该规则→少过滤→多推）"（hasNestedQuantifier L556）。
+  - 缺字段保守放行（`_passIfMissing`）——数据缺标题/分类/注册时间时**不拦截**，宁可多推。
+  - 非法正则跳过规则而非拦截（compileRules / whitelistFilter）——配错规则不惩罚正常数据。
+  - ReDoS 风险规则"宁可误拦（跳过该规则→少过滤→多推）"（hasNestedQuantifier）。
   - 推送超时歧义（10s race 后底层可能成功）→ 按失败处理 → 下次重推（重复一次，不丢）。
 - **推论**：任何"可能阻止一条合法推送"的新逻辑，必须比"可能多推一次"的代价更重才有理由引入。
 
@@ -59,17 +59,17 @@
 
 单向依赖链（无循环依赖）：`Config → Utils → Formatter → RuleEngine → FilterEngine → MessageStore → Network → Pusher → App`，外部依赖 `notify`（推送通道）与官方 `got`（HTTP 客户端）。
 
-| 层 | 行号 | 职责 | 设计要点 |
-|---|---|---|---|
-| **Config** | L21-129 | 全部配置 + 默认值 | `pushUrl` 是 getter（L24-27）：domain 尾斜杠防御 + 非字符串回退空串——**运行时读，动态生效** |
-| **Utils** | L130-374 | 纯函数工具 | 无状态、无副作用；parseTime（L142）/normUrl（L223）/anonKey（L261）/filterHash（L275）/truncateUtf16（L305）/num（L348） |
-| **Formatter** | L375-531 | 纯函数格式化 | htmlToMarkdown（L381）正则链 + 短路优化；tuisong_replace（L452）占位符惰性计算 |
-| **RuleEngine** | L533-888 | 规则预编译 + 校验 | compileRules（L633）启动时一次编译；hasNestedQuantifier（L556）ReDoS 防护；validateConfig（L771）与 compileRules 同口径 |
-| **FilterEngine** | L889-1017 | 过滤判定 | 三级屏蔽优先级（checkFields L922）；只看它（whitelistFilter L997） |
-| **MessageStore** | L1019-1302 | 去重缓存 | 唯一判重实现 `_findDedupIndex`（L1061）；原子写；防路径逃逸 |
-| **Network** | L1304-1350 | 拉取 + 重试 | 手写退避重试；4xx 不重试、429/408/409 重试 |
-| **Pusher** | L1351-1374 | 推送封装 | 10s 整体超时 race；错误由主流程处理 |
-| **App** | L1375-1890 | 主流程编排 | run()（L1507）单遍主循环；告警（L1405）/日报（L1433）/运行日志（L1384） |
+| 层 | 职责 | 设计要点 |
+|---|---|---|
+| **Config** | 全部配置 + 默认值 | `pushUrl` 是 getter：domain 尾斜杠防御 + 非字符串回退空串——**运行时读，动态生效** |
+| **Utils** | 纯函数工具 | 无状态、无副作用；parseTime / normUrl / anonKey / filterHash / truncateUtf16 / num |
+| **Formatter** | 纯函数格式化 | htmlToMarkdown 正则链 + 短路优化；tuisong_replace 占位符惰性计算 |
+| **RuleEngine** | 规则预编译 + 校验 | compileRules 启动时一次编译；hasNestedQuantifier 的 ReDoS 防护；validateConfig 与 compileRules 同口径 |
+| **FilterEngine** | 过滤判定 | 三级屏蔽优先级；只看它 |
+| **MessageStore** | 去重缓存 | 唯一判重实现 `_findDedupIndex`；原子写；防路径逃逸 |
+| **Network** | 拉取 + 重试 | 手写退避重试；4xx 不重试、429/408/409 重试 |
+| **Pusher** | 推送封装 | 整体超时 race；错误由主流程处理 |
+| **App** | 主流程编排 | run() 单遍主循环；负责告警、日报和运行日志 |
 
 **分层规则**：上层可调用下层，下层不得引用上层；纯函数层不得有 IO/状态；MessageStore 是唯一缓存权威；App 是唯一流程编排者。
 
@@ -79,10 +79,10 @@
 
 | # | 不变量 | 成立位置 | 说明 |
 |---|---|---|---|
-| I1 | **同一消息最多推送一次**（单实例假设内） | App.run 判重循环 L1623-1654 | 批内 + 缓存双重判重；**多实例并发不成立**（设计边界，§10.1） |
-| I2 | **失败的数据不得写入缓存** | pushOne 失败→不进 pushedKeys→toCache 排除（L1821） | 属性测试验证 |
-| I3 | **截断未推的数据不得写入缓存** | truncatedKeys 排除（L1714/L1821） | 下次运行推剩余，防静默丢失 |
-| I4 | **被过滤的数据写缓存且带 _f 标记** | L1660 | 规则变更时失效重评（filterHash，§7.3） |
+| I1 | **同一消息最多推送一次**（单实例假设内） | App.run 判重循环 | 批内 + 缓存双重判重；**多实例并发不成立**（设计边界，§10.1） |
+| I2 | **失败的数据不得写入缓存** | pushOne 失败→不进 pushedKeys→toCache 排除 | 属性测试验证 |
+| I3 | **截断未推的数据不得写入缓存** | truncatedKeys 排除 | 下次运行推剩余，防静默丢失 |
+| I4 | **被过滤的数据写缓存且带 _f 标记** | App.run 过滤路径 | 规则变更时失效重评（filterHash，§7.3） |
 | I5 | **缓存不得污染下一轮运行** | 原子写 + 内存缓存一致性（§5.4） | 进程内内存缓存是权威 |
 | I6 | **状态不得逆向转换** | 日报 date 只前进；_f 只清除不反向标记 | v3.176 pending 机制 |
 | I7 | **统计必须自洽** | total = dedup + filtered + truncated + 新推 + 失败 + 坏元素 | 连续运行稳定性验证 |
@@ -93,7 +93,7 @@
 
 ## 4. 判重契约（核心）
 
-### 4.1 唯一判重实现：`_findDedupIndex`（L1061-1066）
+### 4.1 唯一判重实现：`_findDedupIndex`
 
 ```js
 messages.findIndex(m =>
@@ -109,18 +109,18 @@ messages.findIndex(m =>
 
 **关键推论**：
 - id 权威优先于 url——同一 url 但**双方都有不同 id** → 不判重（id 不同视为不同资源）。
-- url 是"无 id 世界的资源标识"；normUrl（L223）统一 trim/去斜杠/去 query-hash/主机名小写。
+- url 是"无 id 世界的资源标识"；normUrl 统一 trim/去斜杠/去 query-hash/主机名小写。
 
 ### 4.2 批内判重 ≡ 跨运行判重（v3.176 起，v3.179 索引化）
 
-- 同一逻辑三个 Set 表达（cacheIds/cacheUrls/cacheNoIdUrls，L1603-1615；batchIds/batchUrls/batchNoIdUrls，L1617-1620），循环内合并判定（L1641-1652）。
+- 同一逻辑三个 Set 表达（cacheIds/cacheUrls/cacheNoIdUrls；batchIds/batchUrls/batchNoIdUrls），循环内合并判定。
 - **为什么索引化**：逐条 `has()` 是 O(N×M)（每条扫全缓存），接口异常返回海量时可能长时间阻塞；索引化为 O(N+M)。等价性由属性测试证明。
 - **维护约束**：修改 `_findDedupIndex` 必须同步修改 App.run 的索引判定（或反之）——两者必须保持同构，否则"批内"与"跨运行"行为分裂（v3.176 曾修复此类分裂）。
 
-### 4.3 键的生成（keyOf，L1720）
+### 4.3 键的生成（keyOf）
 
 - 有 id：`id:<id>`；无 id：`url:<normUrl>`。
-- 无 id 且无 url（或 url 归一为空，如 `#`/`?x=1`/`//`）→ **anonKey 合成 id**（L1636，含 title/content/posttime/shijianchuo/pic/mall_name/price/brand/catename/louzhu）——合成 id 参与 id 判重，跨运行稳定。
+- 无 id 且无 url（或 url 归一为空，如 `#`/`?x=1`/`//`）→ **anonKey 合成 id**（含 title/content/posttime/shijianchuo/pic/mall_name/price/brand/catename/louzhu）——合成 id 参与 id 判重，跨运行稳定。
 - 合成 id 字段变化（v3.157 加 price 等、v3.176 加 louzhu）会导致**旧缓存 anonKey 不匹配 → 升级后一次重推**（可接受：宁可多推）。
 
 ### 4.4 判重性能契约
@@ -130,9 +130,9 @@ messages.findIndex(m =>
 
 ---
 
-## 5. 缓存契约（MessageStore，L1019-1302）
+## 5. 缓存契约（MessageStore）
 
-### 5.1 写入时机（App.run L1821-1822）
+### 5.1 写入时机（App.run）
 
 ```
 toCache = newMessages 中：
@@ -148,31 +148,31 @@ toCache = newMessages 中：
 | 被截断（超过 maxPerRun） | ❌ | 下次运行推剩余 |
 | 批内/缓存判重命中 | ❌ | 不进入 newMessages |
 
-### 5.2 原子写（saveMessages L1141-1176）
+### 5.2 原子写（saveMessages）
 
 tmp 文件写入 + rename——崩溃/并发时不会留下半写文件；失败清理 tmp 不中断主流程；序列化失败（循环引用）保留内存缓存不落盘。
 
-### 5.3 maxSize（L1148-1153）
+### 5.3 maxSize
 
 - 非正整数/字符串数字均回退默认 10000（`Utils.num` 口径，v3.176 修复层间不一致）。
 - 超限裁剪**最早**条目（splice 头部）——滚动淘汰，缓存有界。
 
-### 5.4 内存缓存（L1028-1042）
+### 5.4 内存缓存
 
 - 进程内 `_memoryCache` 以文件路径为键，上限 100（超限整体重置，磁盘不受影响）。
-- **内存缓存是进程内权威**：readMessages（L1117）优先读内存——外部改文件本进程不感知（固有代价，属设计取舍）。
-- 原型键（__proto__ 等）用 defineProperty 写入，防原型污染（L1037-1041）。
+- **内存缓存是进程内权威**：readMessages 优先读内存——外部改文件本进程不感知（固有代价，属设计取舍）。
+- 原型键（__proto__ 等）用 defineProperty 写入，防原型污染。
 
-### 5.5 路径安全（getFilePath L1078 / getFileName L1282）
+### 5.5 路径安全（getFilePath / getFileName）
 
 - 文件名只取 basename + 清洗保留字符；非信息名（`[object Object]`/`undefined`/`null`/`true`/`false`）回退 default.json——**无法逃出缓存目录**。
 
 ### 5.6 过滤标记 `_f`（v3.159）
 
-- 被过滤条目写缓存时带 `_f: true`；推送成功时 `delete item._f`（L1779）——防下次规则变更误清已推送条目。
+- 被过滤条目写缓存时带 `_f: true`；推送成功时 `delete item._f`——防下次规则变更误清已推送条目。
 - 规则变更（filterHash 变化）→ 清除全部 `_f` 条目 → 重新评估（改宽后即重推，改窄后重滤）。
 
-### 5.7 saveBatch 索引化（L1188-1280）
+### 5.7 saveBatch 索引化
 
 - idMap/urlMap/urlOnlyMap 三索引 + reindex 维护，判重口径与 `_findDedupIndex` 一致（O(N+M)，实测 5000 条 2475ms → 索引化后毫秒级）。
 - **维护约束**：saveBatch 的索引逻辑与 `_findDedupIndex` 必须同构（v3.14 曾修复分裂）。
@@ -183,11 +183,11 @@ tmp 文件写入 + rename——崩溃/并发时不会留下半写文件；失败
 
 | 用途 | 口径 | 位置 | 原因 |
 |---|---|---|---|
-| 判重缓存 timestamp | UTC ISO | saveBatch L1204 附近 | 机器可读，且比较时 stripTs 排除 |
-| run.log 时间戳 | **本地** `YYYY-MM-DD HH:mm:ss` | `_localStamp` L1378 | 用户 cron 排查，v3.176 统一（曾 UTC 混排） |
-| 日报日期 | **本地** | `_updateReport` L1433 | v3.155 中国用户凌晨跨天场景 |
-| 告警时间 | 本地 locale | `_sendAlert` L1405 | 面向人 |
-| 解析日期显示 | **UTC**（getUTC*） | tuisong_replace L452 | v3.115 跨时区部署一致 |
+| 判重缓存 timestamp | UTC ISO | saveBatch 附近 | 机器可读，且比较时 stripTs 排除 |
+| run.log 时间戳 | **本地** `YYYY-MM-DD HH:mm:ss` | `_localStamp` | 用户 cron 排查，v3.176 统一（曾 UTC 混排） |
+| 日报日期 | **本地** | `_updateReport` | v3.155 中国用户凌晨跨天场景 |
+| 告警时间 | 本地 locale | `_sendAlert` | 面向人 |
+| 解析日期显示 | **UTC**（getUTC*） | tuisong_replace | v3.115 跨时区部署一致 |
 
 **原则**：机器消费用 UTC，人消费用本地；跨时区部署显示一致优先于"本地正确"（接口时间戳按 UTC 语义处理，v3.115/v3.131 决策）。
 
@@ -195,19 +195,19 @@ tmp 文件写入 + rename——崩溃/并发时不会留下半写文件；失败
 
 ## 7. 配置传播契约
 
-### 7.1 数值配置统一 `Utils.num` 口径（L348）
+### 7.1 数值配置统一 `Utils.num` 口径
 
 - 环境变量/配置文件的数字都是**字符串**——`Number.isFinite('5')=false` 曾导致 7 处配置静默回退（v3.158 修）。
 - **规则**：所有数值配置的消费点必须经 `Utils.num`，校验层（validateConfig/运行时校验）与函数层必须同一口径（v3.175/v3.176 收尾，当前无漏网点）。
 
 ### 7.2 校验与编译同口径
 
-- validateConfig（L771）与 compileRules（L633）共享解析逻辑（多行 `###`、`<br>`/`\r\n`/`\r`/`\n` 分隔、非法正则跳过）——改一处必须同步另一处（v3.36 修复 \r 口径分裂）。
+- validateConfig 与 compileRules 共享解析逻辑（多行 `###`、`<br>`/`\r\n`/`\r`/`\n` 分隔、非法正则跳过）——改一处必须同步另一处（v3.36 修复 \r 口径分裂）。
 
-### 7.3 filterHash 失效机制（L1581-1594）
+### 7.3 filterHash 失效机制
 
-- 哈希覆盖全部过滤字段（`FILTER_FIELDS`）+ pingbitime + zkt_gjc（L275-289）。
-- **耦合点（维护约束）**：新增过滤字段必须同步三处——`FILTER_FIELDS`（L96-101）+ compileRules 编译分支 + filterHash；漏改任何一处 = 配置静默不生效或缓存不失效。
+- 哈希覆盖全部过滤字段（`FILTER_FIELDS`）+ pingbitime + zkt_gjc。
+- **耦合点（维护约束）**：新增过滤字段必须同步三处——`FILTER_FIELDS` + compileRules 编译分支 + filterHash；漏改任何一处 = 配置静默不生效或缓存不失效。
 - 哈希文件写失败静默（下次运行重新比对，无害）。
 
 ### 7.4 运行时生效
@@ -227,18 +227,18 @@ tmp 文件写入 + rename——崩溃/并发时不会留下半写文件；失败
 
 ### 8.2 超时
 
-- Pusher.send（L1352）10s 整体 race；通道层 got 15s；一言 3s。
+- Pusher.send 10s 整体 race；通道层 got 15s；一言 3s。
 - **超时歧义**：10s 后底层可能仍成功 → 下次重推（宁可多推，§1.1）。这是设计取舍，不是 bug。
 
-### 8.3 模板与截断（pushOne L1742-1808）
+### 8.3 模板与截断（pushOne）
 
-- titleMax 语义 = **推送标题最终长度**（模板拼接后再截断，L1758）。
-- contentMax 语义 = **推送内容最终长度**（desp 兜底截断，L1762）。
+- titleMax 语义 = **推送标题最终长度**（模板拼接后再截断）。
+- contentMax 语义 = **推送内容最终长度**（desp 兜底截断）。
 - 截断用 UTF-16 安全截断（truncateUtf16，不切代理对/ZWJ/VS16/组合字符）。
-- 原文链接补回（L1771-1777）：desp 截断掉链接时补回，**条件「链接+分隔符完整容纳才补」**（v3.177 边界修正，保证总长 ≤ contentMax）。
+- 原文链接补回：desp 截断掉链接时补回，**条件「链接+分隔符完整容纳才补」**（v3.177 边界修正，保证总长 ≤ contentMax）。
 - 孤立代理清洗（sanitizeSurrogates）——encodeURIComponent 对孤立代理抛 URIError。
 
-### 8.4 maxPerRun（L1707-1715）
+### 8.4 maxPerRun
 
 - 单次推送上限（默认 100）——防接口异常返回海量 → 推送风暴/长时间运行。
 - **只防推送，不防判重**（判重由 §4.4 索引化兜住，v3.179）。
@@ -250,26 +250,26 @@ tmp 文件写入 + rename——崩溃/并发时不会留下半写文件；失败
 ### 9.1 错误传播链
 
 ```
-fetchData 失败/格式异常 → run() catch（L1862-1879）
+fetchData 失败/格式异常 → run() catch
   → 打印原因 + 写 run.log ERROR + 告警（限频）→ rethrow → 主入口 exit(1)
 ```
-- 非 Error 抛出（字符串）统一兜底（L1863）。
+- 非 Error 抛出（字符串）统一兜底。
 - 告警 await 完成后再退出（v3.164，防 exit 杀死未送达的告警 HTTP）。
 
-### 9.2 告警（_sendAlert L1405）
+### 9.2 告警（_sendAlert）
 
 - 接口挂/密钥失效/推送全失败时通知本人（v3.123/v3.163）。
 - 限频：alert.state 记录 lastAt，**发送成功才写**（失败不写 → 下次可重试）。
 - enabled 支持 false/0/'false'/'0' 全部关闭（v3.173/174）。
 
-### 9.3 日报（_updateReport L1433）
+### 9.3 日报（_updateReport）
 
 - 跨天发"昨日日报"；当天累加。
 - 发送成功才重置日期（失败保留昨日 → 下次重试，v3.156）。
 - **pending 机制**（v3.176）：昨日日报失败期间，今日数据暂存 pending，成功时并入新的一天——不丢、不错标。
 - 日报日期本地时区（v3.155）。
 
-### 9.4 运行日志（_writeRunLog L1384）
+### 9.4 运行日志（_writeRunLog）
 
 - 成功摘要行 + ERROR 行；1MB 截断保留尾部 512KB（行边界 + 代理对边界，v3.178）。
 - 密钥脱敏（notify 模块 maskKey/maskUrl）——cron 日志重定向/分享时不泄露密钥。
@@ -295,7 +295,7 @@ fetchData 失败/格式异常 → run() catch（L1862-1879）
 
 | 资源 | 契约 |
 |---|---|
-| Timer | 所有 setTimeout 必须可清理：Pusher race clearTimeout（L1359-1367）；got totalTimer 全路径 clearTimeout |
+| Timer | 所有 setTimeout 必须可清理：Pusher race clearTimeout；got totalTimer 全路径 clearTimeout |
 | Promise | 所有 async 调用必须有处理：allSettled/race loser 有 handler；fire-and-forget（告警/日报）内部 .catch |
 | 文件 | 原子写（tmp+rename）；失败清理 tmp；日志写失败静默不中断主流程 |
 | 缓存目录 | init 自动创建；目录可随时清空（下次运行重建）；filter.hash/alert.state/report.state/run.log 均在其中 |

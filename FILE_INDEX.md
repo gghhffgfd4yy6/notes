@@ -58,7 +58,7 @@ Config.template.content    // 推送内容模板(默认{Markdown内容})
 Config.cache.maxSize       // 缓存上限(滚动淘汰)
 ```
 
-**注意**:文件头版本号由版本一致性测试自动校验（与 CHANGELOG 最新/package.json 三方一致）——版本更新时无需手动核对文档;`require.main === module` 时才自动运行(被 require 时不跑)。
+**注意**:文件头版本号由版本一致性测试自动校验（与 CHANGELOG 最新/package.json 的一致性自动校验）——版本更新时无需手动核对文档;`require.main === module` 时才自动运行(被 require 时不跑)。
 
 ---
 
@@ -151,7 +151,7 @@ Config.cache.maxSize       // 缓存上限(滚动淘汰)
 |  **异常路径批量** | 未知占位符保留/对象字段不崩/重定向循环停止/连接拒绝 ECONNREFUSED/timeout 归一 |
 |  **边界精确值** | TS_BOUND 精确分界/normUrl 极端/pingbitime 边界值/编码大小写-超范围-代理区-NUL |
 |  **审查项 #56/#65/#7/#链接** | img 空 src/url 换行/maxSize 校验/{链接} Markdown 安全化 |
-|  **版本一致性** | 文件头 ↔ CHANGELOG 最新 ↔ package.json 三方一致（防版本号过时；README 不维护版本号，v3.169 起） |
+|  **版本一致性** | 文件头 ↔ CHANGELOG 最新 ↔ package.json 三方一致（防版本号过时；README 不维护版本号） |
 |  **配置防御/实体扩展** | cache.dir 非字符串回退/实体映射扩展/href 换行剥离 |
 |  **低风险修复批次** | R1-R6/R9：truncateUtf16 非法max/getFileName 非字符串/_splitLines <br\/\>/domain 防御/maxSize 整数化/retry 有界/原型键/url 三处统一/title 类型/zkt_gjc 对象防御（v3.106 第11轮审查 15 项） |
 
@@ -289,21 +289,25 @@ npm run test:notify
 
 **定位**:规范描述（normative）——设计理念(宁可多推不可少推等五大原则)、系统不变量(I1-I9)、判重三条件契约、缓存写入时机、时间口径约定、配置传播契约(Utils.num/filterHash/FILTER_FIELDS 耦合)、设计边界与已知取舍(多实例/超时歧义等不修项)。**改代码前必读**；代码位置仅作参考，契约文字不随版本过时。
 
-### `package.json` — 工程化入口(v3.71 新增)
+### `package.json` — 工程化入口
 
 **定位**:`npm start`(运行推送)/`npm test`(经 run_tests.js 一键三套件+汇总报告)/`npm run test:filter`/`npm run test:app`/`npm run test:app:serial`/`npm run test:notify`；官方 got 依赖声明。版本一致性测试校验其 version 与文件头一致。
 
-### `run_tests.js` — 统一测试入口(v3.107 新增)
+### `run_tests.js` — 统一测试入口
 
 **定位**:一键执行三套测试 + 汇总报告（✅/❌/耗时/退出码）——`npm test` 指向它。CI 与本地统一入口。
 
-### `test_app_p.js` — test_app 并行调度器（v3.172 重写）
+### `test_app_p.js` — test_app 并行调度器
 
-**定位**:test_app 集成测试并行 fork（独立进程，无全局污染）——`npm run test:app`。**v3.172 重写**：每个 worker 独立缓存目录（XBK_PARALLEL_ID）+ `--list-file` 精确分片 + 失败片串行重跑（flaky 容错）——根治 v3.122 版共享缓存目录的沙箱 IO 竞态。**并发可配**：`CONCURRENCY=N npm run test:app`（沙箱默认见代码，真机可调大）。
+**定位**：test_app 集成测试并行调度器（独立进程、worker 独立缓存目录、精确名单分片、失败片串行重跑）——`npm run test:app`。并发可通过 `CONCURRENCY=N npm run test:app` 调整；需要与 CI 一致的串行完整验证时使用 `npm run test:app:serial`。
 
-### `.github/workflows/test.yml` — CI 配置(v3.107 新增)
+### `.github/workflows/test.yml` — GitHub Actions CI 配置
 
-**定位**:GitHub Actions——push/PR 自动安装官方 got 依赖并跑三套测试（Node 多版本矩阵），全部 PASS 才可合并。
+**定位**：GitHub Actions——push/PR 自动安装官方 got 依赖，并按工作流配置执行单元、通道和串行集成测试；全部 PASS 才可合并。
+
+### `.workflow/master-pipeline.yml` — 分阶段流水线配置
+
+**定位**：按阶段执行单元测试、并行集成测试、通道测试和最终汇总；命令与 `package.json` 的 npm scripts 保持一致。
 
 ---
 
