@@ -1675,6 +1675,8 @@ const App = {
     },
 
     async run() {
+        const runStart = Date.now();
+        let fetchMs = null;
         console.debug('开始获取线报酷数据...');
 
         MessageStore.init();
@@ -1734,7 +1736,9 @@ const App = {
             const compiledRules = RuleEngine.compileRules(Config.filter);
 
             // ③ 拉取数据
+            const fetchStart = Date.now();
             const xbkdata = await Network.fetchData();
+            fetchMs = Date.now() - fetchStart;
             if (!Array.isArray(xbkdata)) {
                 // 接口返回格式异常时不盲跑 for 循环，抛错让调度感知
                 throw new Error(`接口返回数据格式异常：期望数组，实际为 ${xbkdata === null ? 'null' : typeof xbkdata}`);
@@ -2002,7 +2006,8 @@ const App = {
             MessageStore.saveBatch(toCache, cacheName);
 
             // ⑧ 统计
-            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+            const pushMs = Date.now() - startTime;
+            const elapsed = (pushMs / 1000).toFixed(1);
             console.log('\n══════════ 本次运行 ══════════');
             console.log(`  获取:     ${xbkdata.length} 条`);
             console.log(`  去重跳过:  ${dedupCount} 条`);
@@ -2011,6 +2016,10 @@ const App = {
             if (badElementCount > 0) console.log(`  非对象元素: ${badElementCount} 条（接口脏数据，已跳过）`);
             console.log(`  推送:     ${successCount} 条${successCount < items.length ? `（${items.length - successCount} 条失败，下次运行重试）` : ''}`);
             console.log(`  耗时:     ${elapsed}s`);
+            if (process.env.XBK_PROFILE === '1') {
+                const totalMs = Date.now() - runStart;
+                console.log(`  [profile] 接口: ${fetchMs === null ? 'n/a' : (fetchMs / 1000).toFixed(3) + 's'} | 推送: ${(pushMs / 1000).toFixed(3)}s | 总计: ${(totalMs / 1000).toFixed(3)}s`);
+            }
             console.log('══════════════════════════════');
             await new Promise(r => setTimeout(r, Utils.num(Config.timing.finalWait, 200)));
 

@@ -909,23 +909,23 @@ async function sendNotify(text, desp, params = {}) {
             catch (e) { console.log('一言获取失败，跳过:', e && e.message ? e.message : String(e)); }
         }
     }
-    // v3.133：Promise.all → allSettled——单个通道失败不再整条失败；
-    // 至少一个通道成功 = 成功（写缓存，失败的通道下次不重试防重复推送）；
-    // 全部通道失败 = 抛错（主流程不写缓存，下次运行重试——防网络故障时消息丢失）
-    const results = await Promise.allSettled([
-        pushPlusNotify(text, desp, params),
-        serverNotify(text, desp),
-        barkNotify(text, desp, params),
-        qywxBotNotify(text, desp),
-        wxPusherNotify(text, desp),
-        wxXiZhiNotify(text, desp),
-        pushDeerNotify(text, desp),
-        pushMeNotify(text, desp, params),
-        tgNotify(text, desp, params),
-    ]);
-    // v3.133b：只统计实际可用的已配置通道——与入口检查共用同一组 configuredFlags，
-    // 防止 Bark/PushMe 只有 '#' 分隔符时被统计为成功。
-    const attempted = results.filter((r, i) => configuredFlags[i]);
+    // 只启动已配置通道：未配置通道原本虽会立即 resolve，但每条消息仍会创建函数/Promise/对象。
+    // 保持数组顺序与 configuredFlags 一致，便于失败统计和后续扩展。
+    const channelTasks = [
+        [configuredFlags[0], () => pushPlusNotify(text, desp, params)],
+        [configuredFlags[1], () => serverNotify(text, desp)],
+        [configuredFlags[2], () => barkNotify(text, desp, params)],
+        [configuredFlags[3], () => qywxBotNotify(text, desp)],
+        [configuredFlags[4], () => wxPusherNotify(text, desp)],
+        [configuredFlags[5], () => wxXiZhiNotify(text, desp)],
+        [configuredFlags[6], () => pushDeerNotify(text, desp)],
+        [configuredFlags[7], () => pushMeNotify(text, desp, params)],
+        [configuredFlags[8], () => tgNotify(text, desp, params)],
+    ];
+    const results = await Promise.allSettled(
+        channelTasks.filter(([enabled]) => enabled).map(([, task]) => task()),
+    );
+    const attempted = results;
     const okCount = attempted.filter(r => r.status === 'fulfilled').length;
     if (attempted.length > 0 && okCount === 0) {
         const reasons = attempted.map(r => r.reason && r.reason.message ? r.reason.message : String(r.reason || '')).filter(Boolean).join('; ');
