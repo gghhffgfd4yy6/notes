@@ -2162,6 +2162,20 @@ await test('数值配置为 Symbol → 回退默认且主流程不崩（#14）',
     }
 });
 
+await test('pingbitime 为 Symbol → validateConfig 链路安全放行（#15）', async () => {
+    reset();
+    setPushUrl('t74_pingbitime_symbol');
+    const orig = Config.filter.pingbitime;
+    try {
+        Config.filter.pingbitime = Symbol('bad-pingbitime');
+        fakeData = [makeItem({ id: 1 })];
+        await xbk.run();
+        assert(pushCalls.length === 1, `Symbol pingbitime 不应阻断主流程，实际${pushCalls.length}`);
+    } finally {
+        Config.filter.pingbitime = orig;
+    }
+});
+
 await test('推送全部失败 → 触发告警调用 + run.log ERROR（#9 v3.163）', async () => {
     reset();
     setPushUrl('t70_pushfail');

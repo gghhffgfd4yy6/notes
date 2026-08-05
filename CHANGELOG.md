@@ -752,6 +752,11 @@
 - **修复**：运行时数值配置告警对无法转字符串的值使用安全显示，避免告警模板自身再次抛错。
 - **回归测试**：新增集成测试覆盖 `Config.push.maxPerRun = Symbol(...)` 的主流程路径；全量测试通过。
 
+## v3.201（pingbitime 校验链路防御）
+
+- **修复**：`validateConfig()` 复用安全转换后的 `pingbitime` 字符串，避免 `Symbol` 或异常 `valueOf()` 对象在校验阶段再次进入 `Number()` 或告警模板。
+- **回归测试**：补充 `validateConfig` 直接调用和 `App.run()` 完整链路的 `Symbol` 配置测试。
+
 ## 文档维护（不改变程序版本）
 
 - 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS 和 BUG_AUDIT 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。

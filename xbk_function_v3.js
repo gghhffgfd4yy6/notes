@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.200 — 数值配置异常防御 ********
+//******** 线报酷推送脚本 v3.201 — pingbitime 校验链路防御 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -958,11 +958,12 @@ const RuleEngine = {
                     }
                 }
             } else {
-                const tv = Number(cfg.pingbitime);
+                // 使用已经安全转换的 pbStr，避免 Symbol/valueOf 异常值再次进入 Number() 或模板插值。
+                const tv = Number(pbStr);
                 if (!Number.isFinite(tv) || tv < 0) {
-                    warnings.push(`⚠️ 配置「pingbitime」的值「${cfg.pingbitime}」不是有效数字（需 ≥0 的有限数）`);
+                    warnings.push(`⚠️ 配置「pingbitime」的值「${pbStr}」不是有效数字（需 ≥0 的有限数）`);
                 } else if (!Number.isInteger(tv)) {
-                    warnings.push(`⚠️ 配置「pingbitime」的值「${cfg.pingbitime}」是小数，已按整数处理（建议使用整数天数）`);
+                    warnings.push(`⚠️ 配置「pingbitime」的值「${pbStr}」是小数，已按整数处理（建议使用整数天数）`);
                 }
             }
         }
@@ -972,7 +973,7 @@ const RuleEngine = {
         const maxSizeVal = cfg.cache ? cfg.cache.maxSize : cfg.maxSize;
         const msNum = Utils.num(maxSizeVal, -1);
         if (maxSizeVal !== undefined && (!Number.isInteger(msNum) || msNum <= 0)) {
-            warnings.push(`⚠️ 配置「cache.maxSize」为「${maxSizeVal}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`);
+            warnings.push(`⚠️ 配置「cache.maxSize」为「${safeStr(maxSizeVal)}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`);
         }
         return [...new Set(warnings)];
     },

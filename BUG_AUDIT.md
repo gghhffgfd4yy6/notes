@@ -500,6 +500,14 @@ WxPusher、息知等异常路径可能完整输出未知响应对象；白名单
 - **修复**：`Utils.num()` 捕获数值转换异常并回退默认值；告警显示值使用安全字符串化。
 - **验证**：集成测试覆盖 `Config.push.maxPerRun = Symbol(...)`；并行集成测试和 `npm test` 全部通过。
 
+## v3.201：`pingbitime` 校验链路对 Symbol 配置崩溃 ✅ 已修复
+
+- **触发场景**：公开 `validateConfig()` 或 `App.run()` 收到 `Config.filter.pingbitime = Symbol(...)`。
+- **根因链路**：`App.run()` → `RuleEngine.validateConfig()` → 已安全生成 `pbStr` 后，普通单值分支却重新读取原始 `cfg.pingbitime` 执行 `Number()`，导致 Symbol 转数字抛异常；告警模板也直接插入原始值，存在二次崩溃风险。
+- **影响**：配置校验阶段提前中断，接口尚未拉取，消息无法推送。
+- **修复**：普通单值分支改用安全的 `pbStr` 进行数值校验和告警显示；同一校验函数的 `cache.maxSize` 告警也改用安全字符串化。
+- **验证**：直接校验、`App.run()` 完整链路、并行集成测试和全量测试均通过。
+
 ## 深挖后暂不修的项目
 
 ### POST 301/302 重定向方法语义

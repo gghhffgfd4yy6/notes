@@ -6667,6 +6667,14 @@ await test('validateConfig/compileRules 脏 pingbitime 转换失败不应抛异�
     assertEqual(Array.isArray(warnings), true, '应返回警告数组');
     assertEqual(warnings.some(w => w.includes('无法转换')), true, '应提示无法转换');
     assertEqual(compileRules({ pingbitime: bad }).pingbitime, null, '编译失败应忽略脏规则');
+
+    const symbolWarnings = validateConfig({ pingbitime: Symbol('bad pingbitime') });
+    assertEqual(Array.isArray(symbolWarnings), true, 'Symbol pingbitime 应返回警告数组');
+    assertEqual(symbolWarnings.some(w => w.includes('不是有效数字')), true, 'Symbol pingbitime 应给出数值警告');
+    assertEqual(compileRules({ pingbitime: Symbol('bad pingbitime') }).pingbitime, null, 'Symbol 编译应忽略脏规则');
+
+    const maxWarnings = validateConfig({ cache: { maxSize: Symbol('bad maxSize') } });
+    assertEqual(Array.isArray(maxWarnings), true, 'Symbol maxSize 应返回警告数组');
 });
 
 await test('tuisong_replace 循环引用字段不应崩溃', () => {
