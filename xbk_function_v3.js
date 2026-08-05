@@ -1430,7 +1430,7 @@ const MessageStore = {
 const Network = {
     /**
      * 拉取数据，失败自动重试
-     * got 简易模块不支持 retry，这里手动实现
+     * 官方 got 自带 retry；这里显式关闭内置重试，由主流程统一实现重试、退避和 4xx 例外语义
      */
     async fetchData() {
         let lastErr;

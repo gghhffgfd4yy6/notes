@@ -6287,7 +6287,7 @@ await test('Fuzz-时间: checkTimeCompiled 随机 compiled × 随机 group 不�
     }
 });
 
-console.log('\n📂 110. 边界精确值二（EBODYLIMIT 恰好/getFilePath 200 字节/跨日边界）');
+console.log('\n📂 110. 边界精确值二（官方 got 响应体/getFilePath 200 字节/跨日边界）');
 
 await test('边界: 官方 got 响应体精确读取', async () => {
     const http = require('http');
