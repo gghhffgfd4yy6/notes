@@ -7,6 +7,7 @@
 //      ——缓存/run.log/state 全隔离，无任何共享 IO，根除竞态
 //   2. --list-file 精确名单分片（--only 子串可能重叠/漏跑）
 //   3. QUICK=1 快测（pushInterval/finalWait=0；重试类测试的真实退避等待保留）
+//   4. 每次运行使用唯一 worker ID，允许多个调度器同时执行而不撞临时文件/缓存目录
 // 用法：node test_app_parallel.js        （沙箱默认并发 8 稳定）
 //       CONCURRENCY=32 node test_app_parallel.js   （真机可调大）
 // 失败时用串行定位：node test_app.js --only=<测试名子串>
@@ -20,6 +21,9 @@ const CONCURRENCY = (() => {
     return Number.isInteger(c) && c > 0 ? c : 8;
 })();
 const SRC = path.join(__dirname, 'test_app.js');
+// 同一目录内并发启动多个调度器时，临时名单和 worker 缓存必须互不碰撞。
+const RUN_ID = `${process.pid}_${Date.now()}`;
+const workerIds = [];
 
 // ---------- 1. 提取测试名（与 test_app.js 的 await test('name' 一一对应） ----------
 const src = fs.readFileSync(SRC, 'utf8');
@@ -30,7 +34,10 @@ if (names.length === 0) { console.error('未提取到测试名'); process.exit(2
 const sorted = names.slice().sort();
 const chunkSize = Math.ceil(sorted.length / CONCURRENCY);
 const chunks = [];
-for (let i = 0; i < sorted.length; i += chunkSize) chunks.push(sorted.slice(i, i + chunkSize));
+for (let i = 0; i < sorted.length; i += chunkSize) {
+    chunks.push(sorted.slice(i, i + chunkSize));
+    workerIds.push(`${RUN_ID}_${chunks.length - 1}`);
+}
 
 // ---------- 3. 并发 fork（独立缓存目录 + 精确名单 + QUICK 快测） ----------
 const t0 = Date.now();
@@ -38,10 +45,11 @@ const t0 = Date.now();
 // 跑一个分片：返回退出码。quick=true 时用 QUICK 快测；重跑时用非 QUICK 完整验证
 function runChunk(chunk, idx, quick) {
     return new Promise((resolve) => {
-        const listFile = path.join(__dirname, `.tmp_parallel_${idx}.json`);
+        const workerId = workerIds[idx];
+        const listFile = path.join(__dirname, `.tmp_parallel_${workerId}.json`);
         fs.writeFileSync(listFile, JSON.stringify(chunk));
         const child = fork(SRC, ['--list-file', listFile], {
-            env: { ...process.env, XBK_PARALLEL_ID: String(idx), QUICK: quick ? '1' : '' },
+            env: { ...process.env, XBK_PARALLEL_ID: workerId, QUICK: quick ? '1' : '' },
             stdio: 'inherit',
         });
         child.on('exit', (code) => { try { fs.unlinkSync(listFile); } catch (e) {} resolve(code); });
@@ -63,8 +71,8 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
     }
 
     // 清理：worker 独立缓存目录（自己创建的临时产物）
-    for (let i = 0; i < chunks.length; i++) {
-        try { fs.rmSync(path.join(__dirname, `xianbaoku_cache_p${i}`), { recursive: true, force: true }); } catch (e) {}
+    for (const workerId of workerIds) {
+        try { fs.rmSync(path.join(__dirname, `xianbaoku_cache_p${workerId}`), { recursive: true, force: true }); } catch (e) {}
     }
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     const failedWorkers = codes.map((c, i) => ({ c, i })).filter(w => w.c !== 0);
