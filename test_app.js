@@ -2148,6 +2148,20 @@ await test('api.timeout 字符串配置生效（#8 v3.162）', async () => {
     }
 });
 
+await test('数值配置为 Symbol → 回退默认且主流程不崩（#14）', async () => {
+    reset();
+    setPushUrl('t73_num_symbol');
+    const orig = Config.push.maxPerRun;
+    try {
+        Config.push.maxPerRun = Symbol('bad-maxPerRun');
+        fakeData = [makeItem({ id: 1 })];
+        await xbk.run();
+        assert(pushCalls.length === 1, `Symbol 数值配置回退默认后应正常推送，实际${pushCalls.length}`);
+    } finally {
+        Config.push.maxPerRun = orig;
+    }
+});
+
 await test('推送全部失败 → 触发告警调用 + run.log ERROR（#9 v3.163）', async () => {
     reset();
     setPushUrl('t70_pushfail');

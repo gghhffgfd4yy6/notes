@@ -746,6 +746,12 @@
 - **CI/文档同步**：GitHub Actions、Gitee Go、README、FILE_INDEX 全部改用 `npm run ...` 入口；串行集成验证保留为独立脚本。
 - **文档状态收敛**：当前状态改为引用 `package.json`、文件头和 CHANGELOG 的版本一致性；系统契约、审查记录和 Bug 文档不再绑定旧的当前版本或过时测试数量。
 
+## v3.200（数值配置异常防御）
+
+- **修复**：`Utils.num()` 对 `Symbol` 或 `valueOf()` 抛异常的配置值安全回退默认，不再让主流程因 `Number(v)` 崩溃。
+- **修复**：运行时数值配置告警对无法转字符串的值使用安全显示，避免告警模板自身再次抛错。
+- **回归测试**：新增集成测试覆盖 `Config.push.maxPerRun = Symbol(...)` 的主流程路径；全量测试通过。
+
 ## 文档维护（不改变程序版本）
 
 - 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS 和 BUG_AUDIT 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。

@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.199 — 统一 npm 脚本入口 ********
+//******** 线报酷推送脚本 v3.200 — 数值配置异常防御 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -10,8 +10,8 @@ const notify = require('./xbk_sendNotify_slim');
 const fs = require('fs');
 const { fetchJson } = require('./xbk_http');
 const path = require('path');
-// 版本号单一来源（v3.82）：package.json 与文件头/CHANGELOG/README 四方一致由 101 章测试保证
-// 版本号单一来源（v3.82）；缺 package.json 时回退 '3.x'（移植性防御，v3.113）
+// 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
+// 缺 package.json 时回退 '3.x'（移植性防御）
 let PKG_VERSION = '3.x';
 try { PKG_VERSION = require('./package.json').version; } catch (e) { /* package.json 缺失时用默认 */ }
 
@@ -354,7 +354,9 @@ const Utils = {
         // 从而意外关闭限频；显式字符串 '0' 仍保留 0 的特殊语义。
         if (v === undefined || v === null || typeof v === 'boolean') return def;
         if (typeof v === 'string' && v.trim() === '') return def;
-        const n = Number(v);
+        let n;
+        try { n = Number(v); }
+        catch (e) { return def; } // Symbol / valueOf 抛错等脏配置回退默认，不中断主流程
         return Number.isFinite(n) ? n : def;
     },
 
@@ -1729,7 +1731,11 @@ const App = {
                 ['push.maxPerRun', Config.push.maxPerRun, (v) => { const n = Utils.num(v, -1); return Number.isInteger(n) && n > 0; }],
             ];
             for (const [name, val, ok] of numConfig) {
-                if (!ok(val)) console.warn(`⚠️ 配置「${name}」为「${val}」不是有效值，已按内部防御逻辑处理（建议修正）`);
+                if (!ok(val)) {
+                    let display;
+                    try { display = String(val); } catch (e) { display = '<不可转换值>'; }
+                    console.warn(`⚠️ 配置「${name}」为「${display}」不是有效值，已按内部防御逻辑处理（建议修正）`);
+                }
             }
 
             // ② 预编译规则（只执行一次）
