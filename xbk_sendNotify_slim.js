@@ -771,7 +771,7 @@ function tgNotify(text, desp) {
         // TG_PROXY_* 保留配置项：当前项目未接入 HTTP 代理（v3.76 一次性警告防误配静默失效）
         if (!tgProxyWarned && (push_config.TG_PROXY_HOST || push_config.TG_PROXY_PORT)) {
             tgProxyWarned = true;
-            console.warn('⚠️ 配置了 TG_PROXY_HOST/PORT，但自制 got 不支持 http 代理，该配置不生效；需要代理请改用 TG_API_HOST 指向代理网关');
+            console.warn('⚠️ 配置了 TG_PROXY_HOST/PORT，但当前项目未接入 HTTP 代理，该配置不生效；需要代理请改用 TG_API_HOST 指向代理网关');
         }
         if (TG_BOT_TOKEN && TG_USER_ID) {
             // v3.132：parse_mode 'Markdown' → 'HTML'——真实接口 20 条中 19 条含 markdown 特殊字符、
