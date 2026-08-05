@@ -88,6 +88,15 @@ WxPusher、息知等异常路径可能完整输出未知响应对象；白名单
 - Server 酱字符串 `errno` 与数字 `errno` 语义不一致：统一兼容字符串成功码/重复码。
 - WxPusher HTML 检测与主流程有限白名单分裂：统一一般 HTML 标签检测，同时保留 Markdown autolink 不误判。
 
+### v3.195 批量审查新增项
+
+- 数值配置空值的 JavaScript 隐式转换可能改变限频/配置语义：已统一回退默认。
+- `compileRules()` 对无法字符串化的 `pingbitime` 配置可能抛错：已安全忽略。
+- 自制 got `.json()` 对 number/boolean 原始 JSON 误判：已支持所有已解析 JSON 原始值。
+- `safeErr()` 读取异常 `message` getter 可能二次抛错：已隔离 getter 异常。
+- Bark 绝对地址判断区分大小写：已改为大小写不敏感。
+- 多个通道业务成功码数字/字符串类型不一致：已统一兼容。
+
 ## 深挖后暂不修的项目
 
 ### POST 301/302 重定向方法语义

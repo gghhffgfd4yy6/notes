@@ -207,6 +207,13 @@ await test('Bark: 多设备 # 分割 + 设备码补全 https', () => withChannel
     assert(gotCalls.length === 2, '两个设备两次请求');
 }));
 
+await test('Bark: 大写 HTTP(S) 地址不应被错误拼接设备前缀', () => withChannels(async () => {
+    cfg.BARK_PUSH = 'HTTPS://api.day.app/UpperDevice';
+    await notify.sendNotify('标题', '内容');
+    assert(gotCalls.length === 1, '应只请求一次');
+    assert(gotCalls[0].url === 'HTTPS://api.day.app/UpperDevice', `大写协议地址应原样保留: ${gotCalls[0].url}`);
+}));
+
 // v3.166：Bark/PushMe 多设备部分失败 → 至少一个成功 = 通道成功（曾单设备失效 → 整体失败 → 不写缓存 → 有效设备重复轰炸）
 await test('Bark: 多设备一成一败 → 通道成功不重试（v3.166）', () => withChannels(async () => {
     cfg.BARK_PUSH = 'https://api.day.app/D1#https://api.day.app/D2';
@@ -587,6 +594,14 @@ await test('日志脱敏: 通道异常日志不泄露密钥（真实路径）', 
         console.log = origLog;
     }
 }));
+await test('safeErr: message getter 抛异常时仍返回安全摘要', () => {
+    const err = {};
+    Object.defineProperty(err, 'message', { get() { throw new Error('getter boom'); } });
+    err.code = 'E_TEST';
+    const out = notify.safeErr(err);
+    assert(typeof out === 'string' && out.includes('E_TEST'), `应返回安全字段摘要: ${out}`);
+});
+
 await test('日志脱敏: maskKey/maskUrl 不泄露完整密钥', () => {
     const { maskKey, maskUrl } = notify;
     // 长密钥保留首尾
@@ -961,6 +976,20 @@ await test('Server酱字符串 errno 成功/重复码应按数字语义处理', 
     const originalPost = require.cache[gotPath].exports.post;
     require.cache[gotPath].exports.post = (url, options) => ({
         then: (res) => res({ body: String(url).includes('ftqq.com') ? { errno: '0', errmsg: 'success' } : '{}', statusCode: 200, headers: {} }),
+    });
+    try {
+        await notify.sendNotify('标题', '内容');
+    } finally {
+        require.cache[gotPath].exports.post = originalPost;
+    }
+}));
+
+await test('通道数字业务码为字符串时仍识别成功', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123';
+    cfg.WX_pusher_topicIds = '1';
+    const originalPost = require.cache[gotPath].exports.post;
+    require.cache[gotPath].exports.post = (url, options) => ({
+        then: (res) => res({ body: String(url).includes('wxpusher') ? { code: '1000', msg: 'success' } : '{}', statusCode: 200, headers: {} }),
     });
     try {
         await notify.sendNotify('标题', '内容');

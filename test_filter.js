@@ -5077,6 +5077,28 @@ await test('got: 重定向循环停止(redirects 耗尽返回 3xx 不无限循�
     }
 });
 
+await test('got: JSON 原始值(number/boolean/null) 可通过 .json() 返回', async () => {
+    const http = require('http');
+    const got = require('got');
+    const values = ['123', 'true', 'null'];
+    const expected = [123, true, null];
+    const server = http.createServer((req, res) => {
+        const body = values.shift();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(body);
+    });
+    await new Promise(r => server.listen(0, r));
+    const port = server.address().port;
+    try {
+        for (const want of expected) {
+            const gotValue = await got(`http://127.0.0.1:${port}/primitive`).json();
+            assertEqual(gotValue, want, `JSON 原始值应保留: ${want}`);
+        }
+    } finally {
+        await new Promise(r => server.close(r));
+    }
+});
+
 await test('got: 连接拒绝抛 ECONNREFUSED（供 fetchData 重试）', async () => {
     const got = require('got');
     let caught = null;
@@ -6659,11 +6681,12 @@ await test('脏字段转字符串失败不应让过滤流程崩溃', () => {
     }), true, '分类限定字段转换失败也应保守放行');
 });
 
-await test('validateConfig 脏 pingbitime 转换失败不应抛异常', () => {
+await test('validateConfig/compileRules 脏 pingbitime 转换失败不应抛异常', () => {
     const bad = { toString() { throw new Error('bad pingbitime'); } };
     const warnings = validateConfig({ pingbitime: bad });
     assertEqual(Array.isArray(warnings), true, '应返回警告数组');
     assertEqual(warnings.some(w => w.includes('无法转换')), true, '应提示无法转换');
+    assertEqual(compileRules({ pingbitime: bad }).pingbitime, null, '编译失败应忽略脏规则');
 });
 
 await test('tuisong_replace 循环引用字段不应崩溃', () => {

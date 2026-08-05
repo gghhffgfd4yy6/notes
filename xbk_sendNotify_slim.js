@@ -76,9 +76,13 @@ function safeErr(e) {
         const s = redactSecrets(e);
         return s.length > 200 ? s.slice(0, 200) + '…' : s;
     }
-    if (e && e.message) {
-        const s = redactSecrets(e.message);
-        return s.length > 200 ? s.slice(0, 200) + '…' : s;
+    if (e && typeof e === 'object') {
+        let message;
+        try { message = e.message; } catch (err) { message = undefined; }
+        if (message) {
+            const s = redactSecrets(message);
+            return s.length > 200 ? s.slice(0, 200) + '…' : s;
+        }
     }
     // 只保留协议错误摘要字段，禁止把服务端完整响应（可能回显 token/key/请求体）写入日志。
     // 未知结构不再 JSON.stringify 全对象，避免敏感字段通过兜底路径泄露。
@@ -96,6 +100,11 @@ function safeErr(e) {
         return s.length > 200 ? s.slice(0, 200) + '…' : s;
     }
     return redactSecrets(e).slice(0, 200);
+}
+
+// 部分通道/API 代理会把数字业务码序列化成字符串；成功语义允许两种 JSON 类型。
+function isCode(value, expected) {
+    return value === expected || value === String(expected);
 }
 
 const push_config = {
@@ -290,7 +299,7 @@ function pushPlusNotify(text, desp) {
                         // v3.180：data 判空防御——HTTP 200 + 响应体 JSON null 时 data.code 曾抛
                         // TypeError → catch 只记日志 → finally resolve(data) 虚假成功 → 主流程写缓存
                         // → 消息永久丢失（系统验证实测确认，P1）
-                        if (data && data.code === 200) {
+                        if (data && isCode(data.code, 200)) {
                             console.log(
                                 `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                                 }通知消息完成🎉\n`,
@@ -410,7 +419,7 @@ function barkNotify(text, desp, params = {}) {
         const pushPromises = deviceKeys.map(deviceKey => {
             let pushUrl = deviceKey.trim();
             // 兼容BARK本地用户只填写设备码的情况
-            if (!pushUrl.startsWith('http')) {
+            if (!/^https?:\/\//i.test(pushUrl)) {
                 pushUrl = `https://api.day.app/${pushUrl}`;
             }
 
@@ -441,7 +450,7 @@ function barkNotify(text, desp, params = {}) {
                             innerResolve({ ok: false });
                         } else {
                             // data 判空：HTTP 200 + JSON null 时不依赖 catch 兜底，避免 TypeError 噪音
-                            if (data && data.code === 200) {
+                            if (data && isCode(data.code, 200)) {
                                 console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`);
                                 innerResolve({ ok: true });
                             } else {
@@ -566,7 +575,7 @@ function qywxBotNotify(text, desp) {
                         console.log('企业微信发送通知消息失败😞\n', safeErr(err));
                     } else {
                         // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
-                        if (data && data.errcode === 0) {
+                        if (data && isCode(data.errcode, 0)) {
                             console.log('企业微信发送通知消息成功🎉。\n');
                         } else {
                             console.log(`企业微信发送通知消息异常 ${data && data.errmsg ? safeErr(data.errmsg) : ''}\n`); // v3.180：errmsg 判空（同 Push+ else 分支）
@@ -627,7 +636,7 @@ function wxPusherNotify(text, desp) {
                         console.log('WxPusher发送通知消息失败😞\n', safeErr(err));
                     } else {
                         // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
-                        if (data && data.code === 1000) {
+                        if (data && isCode(data.code, 1000)) {
                             console.log('WxPusher发送通知消息成功🎉。\n'); // v3.154：恢复成功日志（曾注释——单通道用户无法确认推送）
                         } else {
                             console.log(`WxPusher发送通知消息异常\n`);
@@ -678,7 +687,7 @@ function wxXiZhiNotify(text, desp) {
                         console.log('息知发送通知消息失败😞\n', safeErr(err));
                     } else {
                         // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
-                        if (data && data.code === 200) {
+                        if (data && isCode(data.code, 200)) {
                             console.log('息知发送通知消息成功🎉。\n');
                         } else {
                             console.log(`息知发送通知消息异常 \n`);
@@ -913,4 +922,4 @@ async function sendNotify(text, desp, params = {}) {
     }
 }
 
-module.exports = { sendNotify, push_config, maskKey, maskUrl, safeSlice };
+module.exports = { sendNotify, push_config, maskKey, maskUrl, safeSlice, safeErr };

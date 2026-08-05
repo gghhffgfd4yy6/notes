@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.194 — 多路径脏输入/通道兼容/HTML 检测批量修复 ********
+//******** 线报酷推送脚本 v3.195 — 配置空值/原始 JSON/通道协议与错误防御批量修复 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -350,6 +350,10 @@ const Utils = {
      * 曾全部回退默认(api.retry/parallelLimit/titleMax 等 7 处失效)；'5'→5，'abc'/undefined→默认
      */
     num(v, def) {
+        // 空值/空白/布尔值不是有效数值配置：避免 alert.intervalMs='' 被 Number('') 转成 0，
+        // 从而意外关闭限频；显式字符串 '0' 仍保留 0 的特殊语义。
+        if (v === undefined || v === null || typeof v === 'boolean') return def;
+        if (typeof v === 'string' && v.trim() === '') return def;
         const n = Number(v);
         return Number.isFinite(n) ? n : def;
     },
@@ -764,7 +768,9 @@ const RuleEngine = {
 
         // 编译 pingbitime（特殊处理）
         // v3.156：先 trim——空白('   ')曾 Number→0 静默关闭时间过滤
-        const pbRaw = String(rawCfg.pingbitime === undefined || rawCfg.pingbitime === null ? '' : rawCfg.pingbitime).trim();
+        let pbRaw = '';
+        try { pbRaw = rawCfg.pingbitime === undefined || rawCfg.pingbitime === null ? '' : String(rawCfg.pingbitime).trim(); }
+        catch (e) { pbRaw = ''; } // 脏配置无法转字符串时忽略规则，不让启动崩溃
         if (pbRaw) {
             rawCfg.pingbitime = pbRaw;
             if (/###/.test(rawCfg.pingbitime)) {

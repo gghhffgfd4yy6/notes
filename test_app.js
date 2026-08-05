@@ -1566,6 +1566,33 @@ await test('接口异常 → 发送告警 + 限频（v3.123）', async () => {
     }
 });
 
+await test('告警 intervalMs 空字符串 → 回退默认限频不轰炸', async () => {
+    reset();
+    setPushUrl('t72_alert_interval_empty');
+    fakeData = [];
+    const origInterval = Config.alert.intervalMs;
+    const origEnabled = Config.alert.enabled;
+    const alertStatePath = path.join(CACHE_DIR, 'alert.state');
+    try { fs.unlinkSync(alertStatePath); } catch (e) { /* 清理旧状态 */ }
+    try {
+        Config.alert.enabled = true;
+        Config.alert.intervalMs = '';
+        fail4xx = true;
+        try { await xbk.run(); } catch (e) { /* 预期失败 */ }
+        assert(pushCalls.some(c => c.text.includes('运行异常')), '首次异常应发告警');
+        reset();
+        setPushUrl('t72_alert_interval_empty_2');
+        Config.alert.enabled = true;
+        fail4xx = true;
+        try { await xbk.run(); } catch (e) { /* 预期失败 */ }
+        assert(!pushCalls.some(c => c.text.includes('运行异常')), '空字符串应回退默认限频，不应第二次轰炸');
+    } finally {
+        Config.alert.intervalMs = origInterval;
+        Config.alert.enabled = origEnabled;
+        try { fs.unlinkSync(alertStatePath); } catch (e) { /* 忽略 */ }
+    }
+});
+
 await test('告警 enabled=0（数字）→ 关闭不发送（v3.173）', async () => {
     reset();
     setPushUrl('t73_alert_enabled_zero');
