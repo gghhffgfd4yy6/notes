@@ -211,6 +211,31 @@ if (fs.existsSync(localPath)) {
     }
 }
 
+// 青龙面板环境变量覆盖本地配置：本地开发可用 push_config.local.js，
+// 青龙无需把密钥写进仓库，直接在环境变量中配置即可。
+const ENV_ALIASES = {
+    PUSH_PLUS_TOKEN: ['PUSH_PLUS_TOKEN'],
+    PUSH_PLUS_USER: ['PUSH_PLUS_USER'],
+    PUSH_KEY: ['PUSH_KEY'],
+    BARK_PUSH: ['BARK_PUSH'],
+    QYWX_KEY: ['QYWX_KEY'],
+    WX_pusher_appToken: ['WX_pusher_appToken', 'WX_PUSHER_APP_TOKEN'],
+    WX_pusher_topicIds: ['WX_pusher_topicIds', 'WX_PUSHER_TOPIC_IDS'],
+    WX_XIZHI_KEY: ['WX_XIZHI_KEY'],
+    DEER_KEY: ['DEER_KEY'],
+    DEER_URL: ['DEER_URL'],
+    PUSHME_KEY: ['PUSHME_KEY'],
+    PUSHME_URL: ['PUSHME_URL'],
+    TG_BOT_TOKEN: ['TG_BOT_TOKEN'],
+    TG_USER_ID: ['TG_USER_ID'],
+    TG_API_HOST: ['TG_API_HOST'],
+    HITOKOTO: ['HITOKOTO'],
+};
+for (const [configKey, names] of Object.entries(ENV_ALIASES)) {
+    const envName = names.find(name => process.env[name] !== undefined);
+    if (envName !== undefined) push_config[configKey] = process.env[envName];
+}
+
 async function one() {
     const url = 'https://v1.hitokoto.cn/';
     // v3.151：3s 短超时——一言是推送装饰，API 慢/挂时不应阻塞推送（曾默认 15s，启用 HITOKOTO 用户每次推送延迟）

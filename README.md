@@ -53,6 +53,37 @@ npm start                      # 运行推送脚本
 # ③ 可选：修改过滤规则等配置（xbk_function_v3.js 顶部 Config）
 ```
 
+## 🐉 青龙面板部署
+
+项目提供独立入口 `qinglong/xbk_push.js`，会自动定位项目根目录，因此青龙任务不依赖当前工作目录。
+
+### 推荐方式：环境变量配置密钥
+
+在青龙面板的环境变量中配置推送密钥，例如 WxPusher：
+
+```text
+WX_PUSHER_APP_TOKEN=你的 appToken
+WX_PUSHER_TOPIC_IDS=主题ID（多个用逗号分隔）
+```
+
+也支持 `PUSH_PLUS_TOKEN`、`PUSH_KEY`、`BARK_PUSH`、`QYWX_KEY`、`WX_XIZHI_KEY`、`DEER_KEY`、`PUSHME_KEY`、`TG_BOT_TOKEN`、`TG_USER_ID` 等变量。环境变量优先于 `push_config.local.js`。
+
+### 青龙任务命令
+
+仓库拉取到青龙脚本目录后，任务命令使用：
+
+```bash
+node qinglong/xbk_push.js
+```
+
+入口会在依赖缺失时自动执行不带生命周期脚本的生产依赖安装；依赖已经存在时不会每次重复安装。缓存、运行日志和状态文件仍写入项目根目录下的 `xianbaoku_cache/`，不会受青龙任务当前工作目录影响。
+
+本地开发仍可直接使用：
+
+```bash
+npm start
+```
+
 ## 🧪 测试与系统验证
 
 ```bash
@@ -130,6 +161,7 @@ test_app.js               集成测试（mock 完整主流程）
 test_app_parallel.js      集成测试并行调度器
 test_notify.js            通道测试
 run_tests.js              一键全量测试入口
+qinglong/xbk_push.js      青龙面板直接执行入口（自动定位根目录/补齐依赖）
 package.json              工程入口（npm start / npm test）
 README.md                 本文件（展示页）
 SYSTEM_CONTRACT.md        系统契约（设计理念/不变量/契约/设计边界）

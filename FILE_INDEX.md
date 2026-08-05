@@ -238,7 +238,7 @@ Config.cache.maxSize       // 缓存上限(滚动淘汰)
 
 ```
 node_modules/        # npm 依赖（got 包目录被 git 追踪，其他依赖由 npm install 生成）
-xianbaoku_cache/     # 运行缓存
+xianbaoku_cache*/    # 运行缓存（含测试/多实例隔离目录）
 push_config.local.js # 本地密钥(必须忽略!)
 ```
 
@@ -263,6 +263,9 @@ push_config.local.js # 本地密钥(必须忽略!)
 ## 五、使用入口速查
 
 ```bash
+# 青龙面板任务入口（不依赖当前工作目录，依赖缺失时自动补齐）
+node qinglong/xbk_push.js
+
 # 运行推送(真实拉取+推送)
 npm start
 
