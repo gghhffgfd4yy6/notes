@@ -23,10 +23,10 @@ jobs:
         run: npm install --ignore-scripts
 
       - name: 单元测试（test_filter.js）
-        run: node test_filter.js
+        run: npm run test:filter
 
       - name: 通道测试（test_notify.js）
-        run: node test_notify.js
+        run: npm run test:notify
 
       - name: 集成测试（test_app.js，含真实重试等待）
-        run: node test_app.js
+        run: npm run test:app:serial

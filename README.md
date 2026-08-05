@@ -48,7 +48,7 @@ cp push_config.local.js.example push_config.local.js
 #    编辑填入你的通道 key（PUSH_KEY / BARK_PUSH / TG_BOT_TOKEN 等）
 
 # ② 运行（真实拉取 + 推送）
-node xbk_function_v3.js        # 或 npm start
+npm start                      # 运行推送脚本
 
 # ③ 可选：修改过滤规则等配置（xbk_function_v3.js 顶部 Config）
 ```
@@ -57,14 +57,16 @@ node xbk_function_v3.js        # 或 npm start
 
 ```bash
 # 一键执行三套测试 + 汇总报告（推荐）
-npm test            # 或 node run_tests.js
+npm test            # 全量测试（推荐）
 
 # 单套执行
-node test_filter.js && node test_app_parallel.js && node test_notify.js
+npm run test:filter
+npm run test:app
+npm run test:notify
 ```
 
 - **三套件分工**：`test_filter.js`（单元/属性/Fuzz/性能基准/版本一致性）→ `test_app.js`（集成，mock 完整主流程，经并行调度器）→ `test_notify.js`（通道请求构造 + 密钥脱敏）
-- **测试数量不在此维护**（以 `node run_tests.js` 实际输出为准）；版本一致性三方自动校验（README 不含版本号）
+- **测试数量不在此维护**（以 `npm test` 实际输出为准）；版本一致性三方自动校验（README 不含版本号）
 - **系统验证**：判重等价性/缓存不变量经**固定种子属性测试**（双路径逐条比对 + 已知答案锚点，零失配）；连续运行稳定性验收；故障注入 / 变异测试 / ReDoS 全入口防护均有测试锁定
 - **CI**：`.github/workflows/test.yml`——push/PR 自动跑三套，全部 PASS 才可合并；Gitee Go 流水线分步骤标红失败环节
 
@@ -72,7 +74,7 @@ node test_filter.js && node test_app_parallel.js && node test_notify.js
 
 ```cron
 # 示例：按需设置运行间隔（注意路径用绝对路径，缓存目录基于脚本位置不受 cwd 影响）
-*/N * * * * cd /path/to/xbk-push && node xbk_function_v3.js >> /var/log/xbk-push.log 2>&1
+*/N * * * * cd /path/to/xbk-push && npm start >> /var/log/xbk-push.log 2>&1
 ```
 
 ## 📝 运行日志与告警/日报

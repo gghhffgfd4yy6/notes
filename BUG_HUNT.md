@@ -126,7 +126,7 @@
 
 ## 10. 接口异常告警被 `process.exit(1)` 杀死 → cron 直接运行场景收不到告警 ✅ 已修复（v3.164）
 
-- **触发场景**：接口异常（fetchData 失败）+ **直接运行**（`node xbk_function_v3.js`，cron 场景）——**正是 v3.123 告警功能的核心里程碑场景**
+- **触发场景**：接口异常（fetchData 失败）+ **直接运行**（当前入口为 `npm start`，cron 场景）——**正是 v3.123 告警功能的核心里程碑场景**
 - **根因**：`_sendAlert` 是 fire-and-forget（`.then().catch()` 不 await，只发起 HTTP 请求）→ `App.run` catch 里 `throw error` → 主入口 `App.run().catch(e => { console.error(...); process.exit(1); })` **同步立即退出** → 未完成的告警 HTTP 请求被 `process.exit` 终止 → **告警丢失**
 - **真实验证**（2026-08-03，mock got：fetchData 404 立即失败 + 延迟 50ms 的 post 模拟真实网络）：
   ```
@@ -362,7 +362,7 @@ node -e "const x=require('./xbk_function_v3.js');x.fetchData().then(d=>{const c=
 ## 状态说明
 - 已记录的问题均**真实验证触发**、风险明确，且已有对应修复与验证记录
 - **历史问题已持续收敛至 v3.180**：v3.159～v3.167 修复前 13 项真实问题；v3.180 又补齐 HTTP 200 + JSON `null` 响应结构异常的 P1 防御。
-- 测试覆盖：对应集成测试、通道测试和 got/输入防御测试均已补齐；全量结果以 `node run_tests.js` 实际输出为准。
+- 测试覆盖：对应集成测试、通道测试和 got/输入防御测试均已补齐；全量结果以 `npm test` 实际输出为准。
 
 ## 4b. 真实验证补充（非 bug，记录排除）
 

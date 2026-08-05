@@ -738,3 +738,9 @@
 - **响应体保护**：新增 `xbk_http.js`，在官方 got 之上以流式方式限制接口响应体大小，超过上限立即终止并返回 `EBODYLIMIT`。
 - **职责划分**：官方 got 负责 HTTP/TLS/重定向/超时；薄封装只负责响应体上限、JSON 解析和 HTTP 状态传递，不重新实现 HTTP 客户端。
 - **回归测试**：增加官方 got 正常读取与响应体超限测试。
+
+## v3.199（统一 npm 脚本入口）
+
+- **运行入口**：运行推送统一使用 `npm start`。
+- **测试入口**：单元、集成、通道和全量测试统一提供 npm scripts，避免文档和 CI 直接调用 Node 文件。
+- **CI/文档同步**：GitHub Actions、Gitee Go、README、FILE_INDEX 全部改用 `npm run ...` 入口；串行集成验证保留为独立脚本。

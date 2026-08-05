@@ -307,7 +307,7 @@ fetchData 失败/格式异常 → run() catch（L1862-1879）
 ## 12. 测试契约
 
 - **三套件分工**：test_filter（单元/属性/fuzz/性能基准/版本一致性）→ test_app（集成，mock 全链路，经 test_app_parallel 并行调度）→ test_notify（通道请求构造/脱敏）。
-- **测试数量以 `node run_tests.js` 实际输出为准**（文档不维护数字）。
+- **测试数量以 `npm test` 实际输出为准**（文档不维护数字）。
 - **关键契约测试**（改代码必跑）：版本一致性三方（文件头/CHANGELOG/package.json）；判重口径一致性；缓存不变量；ReDoS 全入口；快照（htmlToMarkdown/tuisong_replace）；性能基准。
 - **属性测试方法论**（本项目验证范式）：固定 seed 伪随机 + 双路径逐条比对 + 已知答案锚点——验证"一致性"与"正确性"（锚点防两条路径一起错）。
 

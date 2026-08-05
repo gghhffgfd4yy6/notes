@@ -9,7 +9,7 @@
 
 ### `xbk_function_v3.js` — 主代码(推送脚本核心)
 
-**定位**:唯一的主程序,`node xbk_function_v3.js` 直接运行。职责分层架构。
+**定位**:唯一的主程序，通过 `npm start` 运行。职责分层架构。
 
 **运行流程**(`App.run()` 主流程):
 ```
@@ -155,7 +155,7 @@ Config.cache.maxSize       // 缓存上限(滚动淘汰)
 |  **配置防御/实体扩展** | cache.dir 非字符串回退/实体映射扩展/href 换行剥离 |
 |  **低风险修复批次** | R1-R6/R9：truncateUtf16 非法max/getFileName 非字符串/_splitLines <br\/\>/domain 防御/maxSize 整数化/retry 有界/原型键/url 三处统一/title 类型/zkt_gjc 对象防御（v3.106 第11轮审查 15 项） |
 
-**运行**:`node test_filter.js`,退出码 0=全绿。
+**运行**:`npm run test:filter`,退出码 0=全绿。
 
 ---
 
@@ -177,7 +177,7 @@ Config.cache.maxSize       // 缓存上限(滚动淘汰)
 
 **机制**:在 require 主模块**前**替换 `require.cache` 的 got/notify(模块加载时引用固定,测试中再改无效——这是反复踩过的坑)。
 
-**运行**:`node test_app_parallel.js`（默认推荐；需要与 CI 完全一致时再直接运行 `node test_app.js`）。
+**运行**:`npm run test:app`（默认推荐；需要与 CI 完全一致时使用 `npm run test:app:serial`）。
 
 ---
 
@@ -204,7 +204,7 @@ Config.cache.maxSize       // 缓存上限(滚动淘汰)
 
 **独立文件原因**:需在 require `xbk_sendNotify_slim.js` 前替换 got(模块加载时引用固定)。
 
-**运行**:`node test_notify.js`。
+**运行**:`npm run test:notify`。
 
 ---
 
@@ -264,11 +264,14 @@ push_config.local.js # 本地密钥(必须忽略!)
 
 ```bash
 # 运行推送(真实拉取+推送)
-node xbk_function_v3.js
+npm start
 
 # 跑全部测试
 npm test
-# 或分别运行：node test_filter.js && node test_app_parallel.js && node test_notify.js
+# 或分别运行：
+npm run test:filter
+npm run test:app
+npm run test:notify
 
 # 切换并行推送(主代码 Config.push.mode = 'parallel')
 # 配置推送密钥(编辑 push_config.local.js,不入库)
@@ -285,7 +288,7 @@ npm test
 
 ### `package.json` — 工程化入口(v3.71 新增)
 
-**定位**:`npm start`(运行推送)/`npm test`(经 run_tests.js 一键三套件+汇总报告,退出码 0=全绿)/engines node>=14/官方 got 依赖声明。版本一致性测试校验其 version 与文件头一致。
+**定位**:`npm start`(运行推送)/`npm test`(经 run_tests.js 一键三套件+汇总报告)/`npm run test:filter`/`npm run test:app`/`npm run test:app:serial`/`npm run test:notify`；官方 got 依赖声明。版本一致性测试校验其 version 与文件头一致。
 
 ### `run_tests.js` — 统一测试入口(v3.107 新增)
 
@@ -293,7 +296,7 @@ npm test
 
 ### `test_app_parallel.js` — test_app 并行调度器（v3.172 重写）
 
-**定位**:test_app 集成测试并行 fork（独立进程，无全局污染）——`node test_app_parallel.js`。**v3.172 重写**：每个 worker 独立缓存目录（XBK_PARALLEL_ID）+ `--list-file` 精确分片 + 失败片串行重跑（flaky 容错）——根治 v3.122 版共享缓存目录的沙箱 IO 竞态。**并发可配**：`CONCURRENCY=N node test_app_parallel.js`（沙箱默认见代码，真机可调大）。
+**定位**:test_app 集成测试并行 fork（独立进程，无全局污染）——`npm run test:app`。**v3.172 重写**：每个 worker 独立缓存目录（XBK_PARALLEL_ID）+ `--list-file` 精确分片 + 失败片串行重跑（flaky 容错）——根治 v3.122 版共享缓存目录的沙箱 IO 竞态。**并发可配**：`CONCURRENCY=N npm run test:app`（沙箱默认见代码，真机可调大）。
 
 ### `.github/workflows/test.yml` — CI 配置(v3.107 新增)
 

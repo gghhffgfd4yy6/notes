@@ -19,7 +19,7 @@ stages:
     nodeVersion: 16.14.2
     commands:
     - npm install --ignore-scripts
-    - node test_filter.js
+    - npm run test:filter
 
 - name: integration-test
   displayName: ② 集成测试 test_app（并行）
@@ -32,7 +32,7 @@ stages:
     nodeVersion: 16.14.2
     commands:
     - npm install --ignore-scripts
-    - node test_app_parallel.js
+    - npm run test:app
 
 - name: notify-test
   displayName: ③ 通道测试 test_notify.js
@@ -45,7 +45,7 @@ stages:
     nodeVersion: 16.14.2
     commands:
     - npm install --ignore-scripts
-    - node test_notify.js
+    - npm run test:notify
 
 - name: summary
   displayName: ④ 汇总（三套全过才到这一步）
