@@ -2176,6 +2176,28 @@ await test('pingbitime 为 Symbol → validateConfig 链路安全放行（#15）
     }
 });
 
+await test('配置告警脏值 Symbol → cache/domain/mode 链路不崩（#16）', async () => {
+    reset();
+    setPushUrl('t75_config_warning_symbol');
+    const original = {
+        maxSize: Config.cache.maxSize,
+        domain: Config.domain,
+        mode: Config.push.mode,
+    };
+    try {
+        Config.cache.maxSize = Symbol('bad-maxSize');
+        Config.domain = Symbol('bad-domain');
+        Config.push.mode = Symbol('bad-mode');
+        fakeData = [makeItem({ id: 1 })];
+        await xbk.run();
+        assert(pushCalls.length === 1, `脏配置告警不应阻断主流程，实际${pushCalls.length}`);
+    } finally {
+        Config.cache.maxSize = original.maxSize;
+        Config.domain = original.domain;
+        Config.push.mode = original.mode;
+    }
+});
+
 await test('推送全部失败 → 触发告警调用 + run.log ERROR（#9 v3.163）', async () => {
     reset();
     setPushUrl('t70_pushfail');

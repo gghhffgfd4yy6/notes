@@ -757,6 +757,11 @@
 - **修复**：`validateConfig()` 复用安全转换后的 `pingbitime` 字符串，避免 `Symbol` 或异常 `valueOf()` 对象在校验阶段再次进入 `Number()` 或告警模板。
 - **回归测试**：补充 `validateConfig` 直接调用和 `App.run()` 完整链路的 `Symbol` 配置测试。
 
+## v3.202（配置告警脏值防御）
+
+- **修复**：`App.run()` 的 `cache.maxSize`、`domain` 和 `push.mode` 非法配置告警统一安全字符串化，`Symbol` 或异常对象不再让诊断路径崩溃。
+- **回归测试**：新增三类配置告警的完整主流程测试。
+
 ## 文档维护（不改变程序版本）
 
 - 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS 和 BUG_AUDIT 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。

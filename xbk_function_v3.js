@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.201 — pingbitime 校验链路防御 ********
+//******** 线报酷推送脚本 v3.202 — 配置告警脏值防御 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1689,15 +1689,20 @@ const App = {
             const warnings = RuleEngine.validateConfig(Config.filter);
             for (const w of warnings) console.warn(w);
 
+            // 配置告警显示统一安全字符串化：脏值（Symbol / 异常 valueOf）不能让告警路径再次崩溃。
+            const safeConfigText = (value) => {
+                try { return String(value); } catch (e) { return '<不可转换值>'; }
+            };
+
             // 校验缓存 maxSize（#7）：函数层已回退默认，配置层补提示（validateConfig 只接收 filter，此处兜底完整 Config）
             // v3.175：字符串 maxSize（'10000' 环境变量）曾误报——用 Utils.num 口径
             if (!Number.isInteger(Utils.num(Config.cache.maxSize, -1)) || Utils.num(Config.cache.maxSize, -1) <= 0) {
-                console.warn(`⚠️ 配置「cache.maxSize」为「${Config.cache.maxSize}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`);
+                console.warn(`⚠️ 配置「cache.maxSize」为「${safeConfigText(Config.cache.maxSize)}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`);
             }
 
             // 域名校验（v3.73）：非法 URL 会让 fetchData 重试耗尽才报错，配置层提前提示
             if (typeof Config.domain !== 'string' || !/^https?:\/\//.test(Config.domain)) {
-                console.warn(`⚠️ 配置「domain」为「${Config.domain}」不是 http(s):// 开头的合法地址`);
+                console.warn(`⚠️ 配置「domain」为「${safeConfigText(Config.domain)}」不是 http(s):// 开头的合法地址`);
             }
 
             // 模板校验（v3.80）：非字符串回退默认（pushOne 已有回退，配置层补提示）
@@ -1979,7 +1984,7 @@ const App = {
             let successCount = 0;
             // push.mode 非法值提示（防静默降级：用户配 'PARALLEL' 等会按顺序执行）
             if (Config.push && Config.push.mode && Config.push.mode !== 'sequential' && Config.push.mode !== 'parallel') {
-                console.warn(`⚠️ 配置「push.mode」值无效：「${Config.push.mode}」（应为 sequential/parallel），已按顺序模式执行`);
+                console.warn(`⚠️ 配置「push.mode」值无效：「${safeConfigText(Config.push.mode)}」（应为 sequential/parallel），已按顺序模式执行`);
             }
             if (Config.push && Config.push.mode === 'parallel') {
                 // 并行推送：一次性全部发出（parallelLimit>0 时按批限并发）
