@@ -156,7 +156,7 @@ function reset() {
     // v3.91：reset 同时恢复运行配置默认值（防未来测试忘恢复导致跨测试污染）
     Config.template.title = '【{分类名}】{标题}';
     Config.template.content = '{Markdown内容}';
-    Config.push.mode = 'sequential';
+    Config.push.mode = 'parallel';
     Config.push.titleMax = 100;
     Config.push.contentMax = 3000;
     Config.domain = 'https://new.ixbk.net';
@@ -796,7 +796,7 @@ async function runWithPushMode(mode, limit, data, sendFn) {
     const cacheName = 'tpush_' + mode + (limit || 0) + '_' + (pushSeq - 1) + '.json';
     const res = { pushed: pushCalls.length, cached: readCacheFile(cacheName).length, summary };
     // 恢复默认
-    Config.push.mode = 'sequential';
+    Config.push.mode = 'parallel';
     Config.push.parallelLimit = 0;
     require.cache[notifyPath].exports = {
         sendNotify: async (text, desp) => {
@@ -840,7 +840,7 @@ await test('push.mode 非法值 → 警告并按顺序模式推送（防静默�
     assert(pushCalls.length === 2, `非法 mode 应按顺序推送全部，实际${pushCalls.length}`);
     assert(Config.push.mode === 'PARALLEL', '不应修改用户配置');
     // 恢复
-    Config.push.mode = 'sequential';
+    Config.push.mode = 'parallel';
 });
 
 await test('parallel 模式部分失败 → 只缓存成功的', async () => {
@@ -853,7 +853,7 @@ await test('parallel 模式部分失败 → 只缓存成功的', async () => {
     assert(pushCalls.length === 2, `应成功推2条，实际${pushCalls.length}`);
     const cached = readCacheFile('tpar_fail.json');
     assert(cached.length === 2, `应只缓存成功2条，实际${cached.length}`);
-    Config.push.mode = 'sequential';
+    Config.push.mode = 'parallel';
 });
 
 await test('parallel 与 sequential 推送结果一致', async () => {
@@ -1852,7 +1852,7 @@ await test('parallelLimit 字符串配置生效（v3.158 #24）', async () => {
         assert(Config.push.parallelLimit === '1', '不应修改用户配置');
     } finally {
         Config.push.parallelLimit = orig;
-        Config.push.mode = 'sequential';
+        Config.push.mode = 'parallel';
     }
 });
 

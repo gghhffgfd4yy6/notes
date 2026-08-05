@@ -104,7 +104,7 @@ filter: {
     // 多行规则：'分类###值正则<br/>分类2###值2'
 },
 push: {
-    mode: 'parallel',           // 或 'sequential'（默认）
+    mode: 'parallel',           // 或 'sequential'（当前默认并行）
     maxPerRun: 100,             // 单次推送上限（防推送风暴）
     titleMax: 100, contentMax: 3000,
 },

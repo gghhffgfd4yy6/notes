@@ -49,7 +49,7 @@ Config.api.timeout/retry   // 网络超时/重试次数
 Config.filter.*            // 过滤规则(屏蔽/展现/强化)
 Config.keyword.zkt_gjc     // 只看它关键词
 Config.timing.pushInterval // 顺序模式条间间隔
-Config.push.mode           // 'sequential'顺序 | 'parallel'并行
+Config.push.mode           // 'sequential'顺序 | 'parallel'并行（当前默认并行）
 Config.push.parallelLimit  // 并行并发上限(0=不限)
 Config.push.titleMax       // 推送标题截断长度(非法回退默认)
 Config.push.contentMax     // 推送内容最终长度上限(非法回退默认)

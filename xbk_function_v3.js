@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.195 — 配置空值/原始 JSON/通道协议与错误防御批量修复 ********
+//******** 线报酷推送脚本 v3.196 — 默认切换并行推送模式 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -54,11 +54,11 @@ const Config = {
         finalWait: 200,
     },
 
-    // 推送模式：sequential=顺序逐条(默认) | parallel=并行一次推送
+    // 推送模式：sequential=顺序逐条 | parallel=并行一次推送(默认)
     // parallelLimit：并行并发上限，0=不限制(全量一次发出)，N>0=每批 N 条
     // titleMax/contentMax：推送截断长度（v3.69 可配置；各通道 API 限制不一，如 Server酱 title 限 32 字符）
     push: {
-        mode: 'sequential',
+        mode: 'parallel',
         parallelLimit: 0,
         titleMax: 100,
         contentMax: 3000,
