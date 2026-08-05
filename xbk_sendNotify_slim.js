@@ -213,7 +213,7 @@ async function one() {
     const url = 'https://v1.hitokoto.cn/';
     // v3.151：3s 短超时——一言是推送装饰，API 慢/挂时不应阻塞推送（曾默认 15s，启用 HITOKOTO 用户每次推送延迟）
     const res = await got.get(url, { timeout: 3000 });
-    // body 兼容：自制 got 已自动 JSON 解析为对象；字符串时手动解析
+    // body 兼容：官方 got 已自动解析 JSON；字符串响应时保留原文
     const body = typeof res.body === 'string' ? JSON.parse(res.body) : res.body;
     // 防御（v3.86）：响应结构异常（缺 hitokoto/from）→ 抛错走 sendNotify 的 catch 跳过，
     // 避免输出 'undefined    ----undefined' 垃圾文本
@@ -768,7 +768,7 @@ let tgProxyWarned = false;
 function tgNotify(text, desp) {
     return new Promise((resolve, reject) => {
         const { TG_BOT_TOKEN, TG_USER_ID, TG_API_HOST } = push_config;
-        // TG_PROXY_* 保留配置项：自制 got 不支持 http 代理（v3.76 一次性警告防误配静默失效）
+        // TG_PROXY_* 保留配置项：当前项目未接入 HTTP 代理（v3.76 一次性警告防误配静默失效）
         if (!tgProxyWarned && (push_config.TG_PROXY_HOST || push_config.TG_PROXY_PORT)) {
             tgProxyWarned = true;
             console.warn('⚠️ 配置了 TG_PROXY_HOST/PORT，但自制 got 不支持 http 代理，该配置不生效；需要代理请改用 TG_API_HOST 指向代理网关');

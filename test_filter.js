@@ -4827,8 +4827,8 @@ await test('一致性: {Html内容} 对象 content_html 置空(与 {Markdown内�
     }
 });
 
-// ==================== 97. 自制 got 模块直测(本地 server) ====================
-console.log('\n📂 97. 自制 got 模块直测');
+// ==================== 97. 官方 got 客户端直测(本地 server) ====================
+console.log('\n📂 97. 官方 got 客户端直测');
 
 await test('got: 302 重定向跟随 + JSON 解析', async () => {
     const http = require('http');
