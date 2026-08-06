@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.216 — DNS 地址族配置兼容 ********
+//******** 线报酷推送脚本 v3.217 — WxPusher DNS 并行预热 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -9,6 +9,7 @@
 const notify = require('./xbk_sendNotify_slim');
 const fs = require('fs');
 const { fetchJson } = require('./xbk_http');
+const { prewarmDns } = require('./xbk_agents');
 const path = require('path');
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
 // 缺 package.json 时回退 '3.x'（移植性防御）
@@ -1777,6 +1778,7 @@ const App = {
         let fetchMs = null;
         let preprocessMs = null;
         let cacheMs = null;
+        let dnsWarmup = null;
         console.debug('开始获取线报酷数据...');
 
         MessageStore.init();
@@ -1845,10 +1847,12 @@ const App = {
             // ② 预编译规则（只执行一次）
             const compiledRules = RuleEngine.compileRules(Config.filter);
 
-            // ③ 拉取数据
+            // ③ 拉取数据：同时预解析 WxPusher 域名，把冷 DNS 等待与线报接口请求重叠。
+            const dnsWarmupPromise = prewarmDns('wxpusher.zjiecode.com');
             const fetchStart = Date.now();
             const xbkdata = await Network.fetchData();
             fetchMs = Date.now() - fetchStart;
+            dnsWarmup = await dnsWarmupPromise;
             if (!Array.isArray(xbkdata)) {
                 // 接口返回格式异常时不盲跑 for 循环，抛错让调度感知
                 throw new Error(`接口返回数据格式异常：期望数组，实际为 ${xbkdata === null ? 'null' : typeof xbkdata}`);
@@ -2141,7 +2145,8 @@ const App = {
                 const totalMs = Date.now() - runStart;
                 console.log(`  [profile] 接口: ${fetchMs === null ? 'n/a' : (fetchMs / 1000).toFixed(3) + 's'} | 推送: ${(pushMs / 1000).toFixed(3) + 's'} | 总计: ${(totalMs / 1000).toFixed(3) + 's'}`);
                 if (detailedProfile) {
-                    console.log(`  [profile detail] 预处理: ${(Math.max(0, preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(Config.timing.finalWait, 10) / 1000).toFixed(3)}s`);
+                    const warmupText = dnsWarmup ? `${dnsWarmup.ok ? '成功' : '失败'} ${(dnsWarmup.elapsedMs / 1000).toFixed(3)}s${dnsWarmup.family ? ` IPv${dnsWarmup.family}` : ''}` : 'n/a';
+                    console.log(`  [profile detail] DNS预热: ${warmupText} | 预处理: ${(Math.max(0, preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(Config.timing.finalWait, 10) / 1000).toFixed(3)}s`);
                 }
             }
             console.log('══════════════════════════════');

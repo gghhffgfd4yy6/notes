@@ -841,6 +841,12 @@
 - **修复**：IPv4/IPv6 对比改用官方 got 支持的 `dnsLookupIpVersion`，不再触发废弃的 `options.family` 警告。
 - **保持**：`XBK_DNS_FAMILY=4/6` 的配置语义不变，未设置时仍自动选择。
 
+## v3.217（WxPusher DNS 并行预热）
+
+- **优化**：v3 主流程开始拉取线报接口时，同时预解析 WxPusher 域名；把冷 DNS 等待与接口请求重叠，减少推送阶段的首个解析等待。
+- **诊断**：`XBK_PROFILE=2` 增加 DNS 预热结果、地址族和耗时；预热失败不阻断正常运行。
+- **保持**：不发送额外推送请求，DNS 预热只使用进程内解析缓存。
+
 ## 文档维护（不改变程序版本）
 
 - 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS 和 BUG_AUDIT 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。

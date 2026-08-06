@@ -45,4 +45,21 @@ function dnsLookup(hostname, options, callback) {
     });
 }
 
-module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, DNS_CACHE: null, dnsLookup };
+function prewarmDns(hostname) {
+    const options = DNS_LOOKUP_IP_VERSION === 'ipv4' ? { family: 4 } : DNS_LOOKUP_IP_VERSION === 'ipv6' ? { family: 6 } : {};
+    const started = Date.now();
+    return new Promise(resolve => {
+        dnsLookup(hostname, options, (error, address, family) => {
+            resolve({
+                hostname,
+                ok: !error,
+                error: error ? error.code || error.message || String(error) : '',
+                address: Array.isArray(address) ? address.map(x => x.address || x) : address,
+                family,
+                elapsedMs: Date.now() - started,
+            });
+        });
+    });
+}
+
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, DNS_CACHE: null, dnsLookup, prewarmDns };
