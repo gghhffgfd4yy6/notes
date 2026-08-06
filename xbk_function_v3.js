@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.205 — 磁盘余量与状态持久化防御 ********
+//******** 线报酷推送脚本 v3.206 — 非法零日期防御 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -162,6 +162,8 @@ const Utils = {
                 if (t.getUTCFullYear() === +m8[1] && t.getUTCMonth() === +m8[2] - 1 && t.getUTCDate() === +m8[3]) return t.getTime();
                 return null;
             }
+            // 严格八位数字优先按 YYYYMMDD 解释；非法八位日期不能继续落入 n===0 的 Unix 时间戳分支。
+            if (/^\d{8}$/.test(s)) return null;
             // 时间戳：0 = 1970-01-01 不应被短路；秒(1e8~TS_BOUND)/毫秒(TS_BOUND~1e14)按 TS_BOUND 分界
             if (n === 0 || (n >= 1e8 && n < 1e14)) {
                 const ms = n < TS_BOUND ? n * 1000 : n;

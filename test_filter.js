@@ -3549,8 +3549,9 @@ await test('tuisong ISO posttime → 日期时间正确（与 daysComputed 口�
 await test('tuisong 8位日期/范围限制（与 daysComputed 口径一致）', () => {
     // 8 位 YYYYMMDD：曾当秒时间戳 → '1970-08-23'（daysComputed 正确解析 2026-07-31）
     assertEqual(tuisong_replace('{日期}', { posttime: '20260731' }), '2026-07-31', '8 位日期应正确解析');
-    // 非法 8 位日期 → 空
+    // 非法 8 位日期 → 空，不能因数值为 0 落入 Unix 时间戳分支
     assertEqual(tuisong_replace('{日期}', { posttime: '20261332' }), '', '非法 8 位日期应空');
+    assertEqual(tuisong_replace('{日期}', { posttime: '00000000' }), '', '零日期应空，不应变成 1970-01-01');
     // 超大数字(≥1e14)：曾生成 '33658-09-27'，现应空
     assertEqual(tuisong_replace('{日期}', { posttime: 1e15 }), '', '超大数字应视为无效');
     // 小数字(<1e8)：曾当秒 → '1970-01-01'，现应空（避免误导日期）
