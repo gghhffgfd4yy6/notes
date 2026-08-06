@@ -14,10 +14,12 @@
 **运行流程**(`App.run()` 主流程):
 ```
 校验配置 → 预编译规则 → filterHash 比对(规则变更失效过滤缓存)
-→ 拉取数据 → 缓存/批内索引化判重 → 字段归一化+过滤(_f 标记) → 只看它
-→ maxPerRun 截断 → 推送(顺序/并行) → 写缓存(成功才写) → 统计
+→ 拉取数据 + 并行预热 WxPusher DNS → 缓存/批内索引化判重 → 字段归一化+过滤(_f 标记) → 只看它
+→ maxPerRun 截断 → 推送(顺序/滑动窗口并行) → 写缓存(成功才写) → 统计
 → 运行日志 + 告警/日报 → 失败重抛(exit 1)
 ```
+
+**性能诊断**:`XBK_PROFILE=1` 输出阶段摘要；`XBK_PROFILE=2` 额外输出 DNS 预热、预处理、缓存写入、收尾等待及每个 WxPusher 请求的 wait/dns/tcp/tls/request/firstByte/download 分阶段耗时。`XBK_DNS_FAMILY=4/6` 可强制对比 IPv4/IPv6 路径（默认自动）。
 
 **分层结构**:
 
