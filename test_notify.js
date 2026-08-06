@@ -302,6 +302,18 @@ await test('wxpusher: 多应用按消息轮流分流，单条只发一个主题'
     assert(gotCalls[1].options.json.topicIds[0] === '202', '应用 B 主题');
 }));
 
+await test('wxpusher: 并发消息也按应用轮询预占，不集中打首个应用', () => withChannels(async () => {
+    cfg.WX_pusher_channels = [
+        { appToken: 'AT_X', topicIds: '101' },
+        { appToken: 'AT_Y', topicIds: '202' },
+        { appToken: 'AT_Z', topicIds: '303' },
+    ];
+    await Promise.all(Array.from({ length: 9 }, (_, i) => notify.sendNotify(`并发${i + 1}`, '内容')));
+    const apps = gotCalls.map(c => c.options.json.appToken);
+    assert(apps.join(',') === 'AT_X,AT_Y,AT_Z,AT_X,AT_Y,AT_Z,AT_X,AT_Y,AT_Z',
+        `并发轮询应均匀预占: ${apps.join(',')}`);
+}));
+
 await test('wxpusher: 首选应用明确限频时切换备用应用重试', () => withChannels(async () => {
     cfg.WX_pusher_channels = [
         { appToken: 'AT_A', topicIds: '101' },

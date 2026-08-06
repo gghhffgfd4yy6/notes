@@ -662,6 +662,7 @@ const WXPUSHER_WINDOW_LIMIT = 19;
 const wxPusherWindows = new Map();
 let wxPusherRoundRobin = 0;
 let wxPusherChannelSignature = '';
+let wxPusherSelectionTail = Promise.resolve();
 let wxPusherParsedConfigKey = null;
 let wxPusherParsedChannels = [];
 
@@ -712,6 +713,20 @@ function wxPusherWindow(channel) {
     let timestamps = wxPusherWindows.get(key);
     if (!timestamps) { timestamps = []; wxPusherWindows.set(key, timestamps); }
     return timestamps;
+}
+
+async function reserveWxPusherOrder(channels) {
+    let release;
+    const previous = wxPusherSelectionTail;
+    wxPusherSelectionTail = new Promise(resolve => { release = resolve; });
+    await previous;
+    try {
+        const start = wxPusherRoundRobin;
+        wxPusherRoundRobin = (start + 1) % channels.length;
+        return channels.map((_, i) => channels[(start + i) % channels.length]);
+    } finally {
+        release();
+    }
 }
 
 async function acquireWxPusherSlot(channels, tried) {
@@ -800,12 +815,10 @@ async function wxPusherNotify(text, desp, params = {}) {
     let lastErr;
     const tried = new Set();
     // 每条消息只选一个主题；只有明确收到限频拒绝时才换下一个应用重试，避免重复通知。
+    const ordered = await reserveWxPusherOrder(channels);
     for (let attempt = 0; attempt < channels.length; attempt++) {
-        const ordered = channels.map((_, i) => channels[(wxPusherRoundRobin + i) % channels.length]);
         const selected = await acquireWxPusherSlot(ordered, tried);
         if (!selected) break;
-        const selectedIndex = channels.indexOf(selected);
-        wxPusherRoundRobin = (selectedIndex + 1) % channels.length;
         tried.add(wxPusherChannelKey(selected));
         try {
             await wxPusherPost(selected, text, desp, params);
