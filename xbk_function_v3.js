@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.208 — WxPusher 限频安全余量 ********
+//******** 线报酷推送脚本 v3.209 — 并行推送滑动窗口 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -54,12 +54,12 @@ const Config = {
         finalWait: 200,
     },
 
-    // 推送模式：sequential=顺序逐条 | parallel=并行一次推送(默认)
-    // parallelLimit：并行并发上限，0=不限制(全量一次发出)，N>0=每批 N 条
+    // 推送模式：sequential=顺序逐条 | parallel=并行滑动窗口(默认)
+    // parallelLimit：并发上限；并行模式下完成一条立即补下一条，0=按消息总数作为窗口
     // titleMax/contentMax：推送截断长度（v3.69 可配置；各通道 API 限制不一，如 Server酱 title 限 32 字符）
     push: {
         mode: 'parallel',
-        parallelLimit: 0,
+        parallelLimit: 10,
         titleMax: 100,
         contentMax: 3000,
         // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/长时间运行；正常 ~20 条无影响）
@@ -2075,20 +2075,28 @@ const App = {
                 console.warn(`⚠️ 配置「push.mode」值无效：「${safeConfigText(Config.push.mode)}」（应为 sequential/parallel），已按顺序模式执行`);
             }
             if (Config.push && Config.push.mode === 'parallel') {
-                // 并行推送：一次性全部发出（parallelLimit>0 时按批限并发）
-                // parallelLimit 防御：小数取整（0.5 会产生空批）、0/负数回退全量、空 items 兜底 1
+                // 并行推送：滑动窗口限并发；任意一条完成后立即补下一条。
+                // parallelLimit 防御：小数取整（0.5 取 0 后回退 1）、0/负数回退全量、空 items 兜底 1。
                 const limit = (() => { const pl = Utils.num(Config.push.parallelLimit, 0); return pl > 0 ? Math.floor(pl) : items.length; })() || 1;
-                const results = [];
-                for (let i = 0; i < items.length; i += limit) {
-                    const batch = items.slice(i, i + limit);
-                    results.push(...await Promise.all(batch.map(pushOne)));
-                    if (i + limit < items.length) await new Promise(r => setTimeout(r, Utils.num(Config.timing.pushInterval, 100)));
-                }
+                const results = new Array(items.length);
+                let nextIndex = 0;
+                const worker = async () => {
+                    while (true) {
+                        const index = nextIndex++;
+                        if (index >= items.length) return;
+                        results[index] = await pushOne(items[index]);
+                        // 保留可配置的补位间隔，但不等待同批其他慢任务；pushInterval=0 即完成即补。
+                        if (nextIndex < items.length) {
+                            await new Promise(r => setTimeout(r, Utils.num(Config.timing.pushInterval, 100)));
+                        }
+                    }
+                };
+                await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
                 // 按原顺序输出成功日志（并发完成顺序不定，日志保持数据顺序）
                 for (const r of results) {
-                    if (r.ok) console.log(`发现到新数据：${r.item.title}【${r.item.catename}】${urlOf(r.item)}`);
+                    if (r && r.ok) console.log(`发现到新数据：${r.item.title}【${r.item.catename}】${urlOf(r.item)}`);
                 }
-                successCount = results.filter(r => r.ok).length;
+                successCount = results.filter(r => r && r.ok).length;
             } else {
                 // 顺序推送（默认）：逐条 await + 间隔
                 for (const item of items) {

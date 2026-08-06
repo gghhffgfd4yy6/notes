@@ -66,6 +66,9 @@ require.cache[notifyPath].exports = {
         pushCalls.push({ text, desp });
     },
 };
+// Pusher 在主模块加载时持有这个对象引用；测试替换 sendNotify 时必须修改对象属性，
+// 仅替换 require.cache.exports 不会影响已捕获的引用。
+const notifyMock = require.cache[notifyPath].exports;
 
 // ---------- require 主模块 ----------
 const xbk = require('./xbk_function_v3.js');
@@ -791,7 +794,7 @@ async function runWithPushMode(mode, limit, data, sendFn) {
     notifyFail = false;
     notifyFailAt = -1;
     if (sendFn) {
-        require.cache[notifyPath].exports = { sendNotify: sendFn };
+        notifyMock.sendNotify = sendFn;
     }
     const summary = await xbk.run();
     const cacheName = 'tpush_' + mode + (limit || 0) + '_' + (pushSeq - 1) + '.json';
@@ -799,14 +802,13 @@ async function runWithPushMode(mode, limit, data, sendFn) {
     // 恢复默认
     Config.push.mode = 'parallel';
     Config.push.parallelLimit = 0;
-    require.cache[notifyPath].exports = {
-        sendNotify: async (text, desp) => {
-            notifyCalls++;
-            if (notifyFail) throw new Error('push boom');
-            if (notifyFailAt > 0 && notifyCalls === notifyFailAt) throw new Error('push boom');
-            pushCalls.push({ text, desp });
-        },
+    notifyMock.sendNotify = async (text, desp) => {
+        notifyCalls++;
+        if (notifyFail) throw new Error('push boom');
+        if (notifyFailAt > 0 && notifyCalls === notifyFailAt) throw new Error('push boom');
+        pushCalls.push({ text, desp });
     };
+    require.cache[notifyPath].exports = notifyMock;
     return res;
 }
 
@@ -817,7 +819,34 @@ await test('parallel 模式: 多条全部推送+缓存（并行模式）', async
     assert(r.cached === 5, `缓存应5条，实际${r.cached}`);
 });
 
-await test('parallelLimit=2: 分批限并发推送', async () => {
+await test('parallelLimit=2: 滑动窗口补位且不超过并发上限', async () => {
+    const data = [1, 2, 3].map(i => ({ id: i, catename: 'a', title: '滑动' + i, content: 'x', url: '/slide/' + i + '.html' }));
+    const starts = [];
+    const ends = [];
+    let active = 0;
+    let maxActive = 0;
+    const origInterval = Config.timing.pushInterval;
+    try {
+        Config.timing.pushInterval = 0;
+        const r = await runWithPushMode('parallel', 2, data, async (text) => {
+            const index = Number(String(text).match(/滑动(\d+)/)[1]);
+            starts[index] = Date.now();
+            active++;
+            maxActive = Math.max(maxActive, active);
+            await new Promise(resolve => setTimeout(resolve, index === 1 ? 60 : 5));
+            ends[index] = Date.now();
+            active--;
+        });
+        assert(r.summary && r.summary.pushed === 3, `自定义 sendFn 三条应全部完成: ${JSON.stringify(r.summary)}`);
+        assert(r.cached === 3, `缓存应3条，实际${r.cached}`);
+        assert(maxActive === 2, `并发上限应为2，实际峰值${maxActive}`);
+        assert(starts[3] < ends[1], '第3条应在第1条完成前补位，必须是滑动窗口');
+    } finally {
+        Config.timing.pushInterval = origInterval;
+    }
+});
+
+await test('parallelLimit=2: 兼容并发推送与缓存', async () => {
     const data = [1, 2, 3, 4].map(i => ({ id: i, catename: 'a', title: '批' + i, content: 'x', url: '/q/' + i + '.html' }));
     const r = await runWithPushMode('parallel', 2, data);
     assert(r.pushed === 4, `应推4条，实际${r.pushed}`);

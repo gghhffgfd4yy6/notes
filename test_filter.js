@@ -4716,7 +4716,7 @@ await test('契约: Config 默认值全量锁定', () => {
     assertEqual(Config.cache.maxSize, 10000);
     assertEqual(Config.cache.dir, 'xianbaoku_cache');
     assertEqual(Config.push.mode, 'parallel');
-    assertEqual(Config.push.parallelLimit, 0);
+    assertEqual(Config.push.parallelLimit, 10);
     assertEqual(Config.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json');
 });
 
@@ -5365,7 +5365,7 @@ await test('契约: template/push 新配置默认值锁定（v3.97）', () => {
     assertEqual(Config.push.titleMax, 100, 'push.titleMax 默认');
     assertEqual(Config.push.contentMax, 3000, 'push.contentMax 默认');
     assertEqual(Config.push.mode, 'parallel', 'push.mode 默认');
-    assertEqual(Config.push.parallelLimit, 0, 'push.parallelLimit 默认');
+    assertEqual(Config.push.parallelLimit, 10, 'push.parallelLimit 默认');
 });
 
 console.log('\n📂 103. 随机输入冒烟（Fuzz，固定 seed 确定性）');
