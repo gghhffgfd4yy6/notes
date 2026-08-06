@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.220 — TLS 后台预取不阻塞推送 ********
+//******** 线报酷推送脚本 v3.221 — HEAD 快速预取全量连接 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1851,7 +1851,9 @@ const App = {
             // ③ 拉取数据：同时预解析 WxPusher 域名并后台预建 HTTPS 连接。
             // 预取不 await——推送开始后能复用多少就复用多少，绝不因预取未完成而阻塞主流程。
             const dnsWarmupPromise = prewarmDns('wxpusher.zjiecode.com');
-            const tlsWarmupPromise = prewarmTls('wxpusher.zjiecode.com', 5000, 3);
+            // HEAD 预取：连接数与并发窗口对齐，全部第一批请求可复用；预取快于接口时不阻塞、无收尾等待。
+            const prewarmCount = (() => { const pl = Utils.num(Config.push.parallelLimit, 10); return pl > 0 ? Math.min(Math.floor(pl), 10) : 10; })();
+            const tlsWarmupPromise = prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount);
             const fetchStart = Date.now();
             const xbkdata = await Network.fetchData();
             fetchMs = Date.now() - fetchStart;
