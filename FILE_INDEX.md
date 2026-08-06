@@ -70,7 +70,7 @@ Config.storage.minFreeBytes // 磁盘余量告警阈值（只告警，不阻断�
 **结构**:
 | 部分 | 内容 |
 |---|---|
-| `push_config` | 各通道配置项(BARK_PUSH/PUSH_KEY/PUSHME_KEY/WX_pusher/DEER/QYWX…) |
+| `push_config` | 各通道配置项(BARK_PUSH/PUSH_KEY/PUSHME_KEY/WX_pusher/WX_pusher_channels/DEER/QYWX…) |
 | `push_config.local.js` 加载 | 自动加载本地密钥覆盖默认空值(不入库) |
 | `one()` | 一言(随机句子)获取,失败不中断 |
 | `$` 对象 | got.post/get 封装(JSON 解析 + 回调风格) |
@@ -83,7 +83,7 @@ Config.storage.minFreeBytes // 磁盘余量告警阈值（只告警，不阻断�
 - PushMe:多 key 分割、`type: 'markdown'`
 - PushDeer:全字段 encodeURIComponent
 - 企业微信:webhook URL + key
-- wxpusher:topicIds 数组、contentType 3(Markdown)
+- wxpusher:topicIds 数组、contentType 3(Markdown)；支持 `WX_pusher_channels` 多应用按消息分流和限频后切换
 
 **注意**:**含真实密钥的 `push_config.local.js` 不入库**(`.gitignore` 忽略),密钥只存在于本地。推送失败会被主流程感知(无通道 reject / 抛错)。
 

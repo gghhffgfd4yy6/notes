@@ -31,6 +31,11 @@ module.exports = {
     // wxpusher（https://wxpusher.zjiecode.com/）
     // WX_pusher_appToken: '你的appToken',
     // WX_pusher_topicIds: '主题ID(多个用逗号分隔)',
+    // 多应用自动分流（每条消息只发一个应用；两边订阅者应保持一致）：
+    // WX_pusher_channels: [
+    //     { appToken: '应用1appToken', topicIds: '主题ID1' },
+    //     { appToken: '应用2appToken', topicIds: '主题ID2' },
+    // ],
 
     // 息知（https://xz.qqoq.net/）
     // WX_XIZHI_KEY: 'https://xizhi.qqoq.net/你的key',

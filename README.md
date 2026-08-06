@@ -67,6 +67,17 @@ WX_PUSHER_APP_TOKEN=你的 appToken
 WX_PUSHER_TOPIC_IDS=主题ID（多个用逗号分隔）
 ```
 
+需要两个 WxPusher 应用自动分流时，在未入库的 `push_config.local.js` 中配置：
+
+```js
+WX_pusher_channels: [
+    { appToken: '应用1 appToken', topicIds: '主题ID1' },
+    { appToken: '应用2 appToken', topicIds: '主题ID2' },
+]
+```
+
+每条消息只发送到一个应用，按轮询分流；每个应用独立维护发送窗口，收到明确限频响应时才切换另一个应用重试。两个主题应由同一批接收者订阅。环境变量方式仍适用于单应用配置。
+
 也支持 `PUSH_PLUS_TOKEN`、`PUSH_KEY`、`BARK_PUSH`、`QYWX_KEY`、`WX_XIZHI_KEY`、`DEER_KEY`、`PUSHME_KEY`、`TG_BOT_TOKEN`、`TG_USER_ID` 等变量。环境变量优先于 `push_config.local.js`。
 
 ### 青龙任务命令

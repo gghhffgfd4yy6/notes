@@ -153,6 +153,8 @@ const push_config = {
     //注意wxpusher填写的是主题ID，而不是用户ID
     WX_pusher_appToken: '', // wxpusher appToken(真实token已移除,请自行配置)
     WX_pusher_topicIds: '', // wxpusher 主题ID(真实ID已移除)
+    // 多应用分流：[{ appToken: '...', topicIds: '主题ID' }]；为空时兼容上面单应用配置
+    WX_pusher_channels: [],
 
     //息知文档：https://xz.qqoq.net/
     //推送地址示例：https://xizhi.qqoq.net/xxxxxxxxxxxxx.send
@@ -226,6 +228,7 @@ const ENV_ALIASES = {
     QYWX_KEY: ['QYWX_KEY'],
     WX_pusher_appToken: ['WX_pusher_appToken', 'WX_PUSHER_APP_TOKEN'],
     WX_pusher_topicIds: ['WX_pusher_topicIds', 'WX_PUSHER_TOPIC_IDS'],
+    WX_pusher_channels: ['WX_pusher_channels', 'WX_PUSHER_CHANNELS'],
     WX_XIZHI_KEY: ['WX_XIZHI_KEY'],
     DEER_KEY: ['DEER_KEY'],
     DEER_URL: ['DEER_URL'],
@@ -643,61 +646,135 @@ function looksHtml(s) {
     return /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^>]*>/i.test(s);
 }
 
-function wxPusherNotify(text, desp) {
-    return new Promise((resolve, reject) => {
-        const { WX_pusher_appToken, WX_pusher_topicIds } =
-            push_config;
+// WxPusher 默认窗口：每个 appToken 单独维护，避免多应用分流时把两个额度混成一个。
+const WXPUSHER_WINDOW_MS = 10000;
+const WXPUSHER_WINDOW_LIMIT = 20;
+const wxPusherWindows = new Map();
+let wxPusherRoundRobin = 0;
+let wxPusherChannelSignature = '';
 
+function parseWxPusherChannels() {
+    let raw = push_config.WX_pusher_channels;
+    if (typeof raw === 'string') {
+        try { raw = JSON.parse(raw); } catch (e) { raw = []; }
+    }
+    const list = Array.isArray(raw) ? raw : [];
+    const channels = list.map((item) => {
+        if (!item || typeof item !== 'object') return null;
+        const appToken = safeString(item.appToken || item.app_token || item.WX_pusher_appToken).trim();
+        const topicIds = safeString(item.topicIds || item.topic_ids || item.WX_pusher_topicIds)
+            .split(',').map(s => s.trim()).filter(Boolean);
+        return appToken && topicIds.length ? { appToken, topicIds } : null;
+    }).filter(Boolean);
+    if (channels.length) return channels;
+    const appToken = safeString(push_config.WX_pusher_appToken).trim();
+    const topicIds = safeString(push_config.WX_pusher_topicIds).split(',').map(s => s.trim()).filter(Boolean);
+    // 兼容旧测试/配置：历史实现允许只填 appToken，topicIds 为空时仍按 API 请求发送。
+    return appToken ? [{ appToken, topicIds }] : [];
+}
+
+function wxPusherChannelKey(channel) {
+    // 限频按 appToken 归属；同一应用配置多个主题时不能错误地各算一份额度。
+    return channel.appToken;
+}
+
+function wxPusherWindow(channel) {
+    const key = wxPusherChannelKey(channel);
+    let timestamps = wxPusherWindows.get(key);
+    if (!timestamps) { timestamps = []; wxPusherWindows.set(key, timestamps); }
+    return timestamps;
+}
+
+async function acquireWxPusherSlot(channels, tried) {
+    for (;;) {
+        const now = Date.now();
+        let nextRelease = Infinity;
+        for (let i = 0; i < channels.length; i++) {
+            const channel = channels[i];
+            if (tried.has(wxPusherChannelKey(channel))) continue;
+            const timestamps = wxPusherWindow(channel);
+            while (timestamps.length && timestamps[0] <= now - WXPUSHER_WINDOW_MS) timestamps.shift();
+            if (timestamps.length < WXPUSHER_WINDOW_LIMIT) {
+                timestamps.push(now);
+                return channel;
+            }
+            nextRelease = Math.min(nextRelease, timestamps[0] + WXPUSHER_WINDOW_MS);
+        }
+        // 所有未尝试应用都满窗时再等最早释放；若只有已尝试应用，交给调用方结束重试。
+        if (!Number.isFinite(nextRelease)) return null;
+        await new Promise(resolve => setTimeout(resolve, Math.max(20, nextRelease - now + 10)));
+    }
+}
+
+function wxPusherRateLimited(err) {
+    const text = safeString(err && err.message ? err.message : err);
+    return /1001|速度太快|10秒内访问超过20次|限流|限频/i.test(text);
+}
+
+function wxPusherPost(channel, text, desp) {
+    return new Promise((resolve, reject) => {
         const options = {
             ...REQUEST_OPTIONS,
             url: `https://wxpusher.zjiecode.com/api/send/message`,
             json: {
-                appToken: WX_pusher_appToken,
+                appToken: channel.appToken,
                 content: desp,
                 summary: safeSlice(text, 90),
                 // v3.159：内容含 HTML 标签时用 contentType=2（HTML 渲染）——Markdown(3) 会把 <br>/<a> 当纯文本裸露
                 contentType: looksHtml(desp) ? 2 : 3, // 1文字 2HTML 3Markdown
-                // v3.137：配置注释"多个用逗号分隔"但未分割——[WX_pusher_topicIds] 曾发 ['1,2'] 而非 ['1','2']，多主题失效
-                topicIds: String(WX_pusher_topicIds || '').split(',').map(s => s.trim()).filter(Boolean),
+                topicIds: channel.topicIds,
             },
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             timeout,
         };
-
-        if (WX_pusher_appToken) {
-            $.post(options, (err, resp, data) => {
-                try {
-                    if (err) {
+        $.post(options, (err, resp, data) => {
+            try {
+                if (err) {
+                    console.log('WxPusher发送通知消息失败😞\n', safeErr(err));
                     reject(err);
-                        console.log('WxPusher发送通知消息失败😞\n', safeErr(err));
-                    } else {
-                        // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
-                        if (data && isCode(data.code, 1000)) {
-                            console.log('WxPusher发送通知消息成功🎉。\n'); // v3.154：恢复成功日志（曾注释——单通道用户无法确认推送）
-                        } else {
-                            console.log(`WxPusher发送通知消息异常\n`);
-                            // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数含 token）
-                            console.log(safeErr(data));
-                            // v3.154：API 级失败(code≠1000)也 reject——曾 resolve 静默，单通道用户
-                            // （如只保留 wxpusher）主流程会写缓存 → 消息永久丢失（下次去重跳过）
-                            reject(new Error(data && data.msg ? safeErr(data.msg) : 'wxpusher 发送失败'));
-                        }
-                    }
-                } catch (e) {
-                    // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
-                    reject(e);
-                    $.logErr(e, resp);
-                } finally {
+                } else if (data && isCode(data.code, 1000)) {
+                    console.log('WxPusher发送通知消息成功🎉。\n');
                     resolve(data);
+                } else {
+                    console.log(`WxPusher发送通知消息异常\n`);
+                    console.log(safeErr(data));
+                    reject(new Error(data && data.msg ? safeErr(data.msg) : 'wxpusher 发送失败'));
                 }
-            });
-
-        } else {
-            resolve();
-        }
+            } catch (e) {
+                reject(e);
+                $.logErr(e, resp);
+            }
+        });
     });
+}
+
+async function wxPusherNotify(text, desp) {
+    const channels = parseWxPusherChannels();
+    if (!channels.length) return;
+    const signature = channels.map(channel => `${channel.appToken}\0${channel.topicIds.join(',')}`).join('\n');
+    if (signature !== wxPusherChannelSignature) {
+        wxPusherChannelSignature = signature;
+        wxPusherRoundRobin = 0;
+    }
+    let lastErr;
+    const tried = new Set();
+    // 每条消息只选一个主题；只有明确收到限频拒绝时才换下一个应用重试，避免重复通知。
+    for (let attempt = 0; attempt < channels.length; attempt++) {
+        const ordered = channels.map((_, i) => channels[(wxPusherRoundRobin + i) % channels.length]);
+        const selected = await acquireWxPusherSlot(ordered, tried);
+        if (!selected) break;
+        const selectedIndex = channels.indexOf(selected);
+        wxPusherRoundRobin = (selectedIndex + 1) % channels.length;
+        tried.add(wxPusherChannelKey(selected));
+        try {
+            await wxPusherPost(selected, text, desp);
+            return;
+        } catch (e) {
+            lastErr = e;
+            if (!wxPusherRateLimited(e)) throw e;
+        }
+    }
+    throw lastErr || new Error('wxpusher 发送失败');
 }
 
 function wxXiZhiNotify(text, desp) {
@@ -922,7 +999,7 @@ async function sendNotify(text, desp, params = {}) {
     };
     const configuredFlags = [
         nonEmpty(push_config.PUSH_PLUS_TOKEN), nonEmpty(push_config.PUSH_KEY), delimitedNonEmpty(push_config.BARK_PUSH),
-        nonEmpty(push_config.QYWX_KEY), nonEmpty(push_config.WX_pusher_appToken), nonEmpty(push_config.WX_XIZHI_KEY),
+        nonEmpty(push_config.QYWX_KEY), parseWxPusherChannels().length > 0, nonEmpty(push_config.WX_XIZHI_KEY),
         nonEmpty(push_config.DEER_KEY), delimitedNonEmpty(push_config.PUSHME_KEY),
         nonEmpty(push_config.TG_BOT_TOKEN) && nonEmpty(push_config.TG_USER_ID),
     ];

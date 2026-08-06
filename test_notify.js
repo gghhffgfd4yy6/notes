@@ -16,6 +16,7 @@ let failHitokoto = false; // 一言接口失败开关（v3.73：验证 sendNotif
 let failHitokotoStruct = false; // 一言响应结构异常开关（v3.86：缺 hitokoto 字段）
 let failPost = false;     // got.post 失败开关（v3.75：验证失败日志不泄露密钥）
 let failWxpusher = false; // wxpusher API 失败开关（v3.154：code≠1000 应 reject 不静默）
+let rateLimitWxpusherFirst = false; // 多应用分流：首个应用限频时应切换下一个应用
 let failBiz = false;      // 全部通道 API 业务失败开关（v3.160：code≠成功 应 reject 不静默）
 let nullBody = false;     // v3.180：HTTP 200 + 响应体 JSON null 开关（曾 4 通道虚假成功→消息丢失 P1）
 let malformedResponse = false; // 响应字段 getter 抛异常：必须按通道失败，不能被 finally resolve 掩盖
@@ -80,7 +81,12 @@ require.cache[gotPath].exports.post = (url, options) => {
             else if (u.includes('pushdeer.com')) body = { content: { result: [] } };
             else if (u.includes('push.i-i.me')) body = 'error';
             else if (u.includes('api.telegram.org')) body = { ok: false, error_code: 400, description: 'Bad Request' };
-        } else if (u.includes('wxpusher')) body = failWxpusher ? { code: 1300, msg: '推送失败' } : { code: 1000, msg: 'success' };
+        } else if (u.includes('wxpusher')) {
+            const appToken = options && options.json && options.json.appToken;
+            body = rateLimitWxpusherFirst && appToken === 'AT_A'
+                ? { code: 1001, msg: '你访问的速度太快了。当前限制QPS为2.0' }
+                : (failWxpusher ? { code: 1300, msg: '推送失败' } : { code: 1000, msg: 'success' });
+        }
         else if (u.includes('pushplus.plus')) body = { code: 200, msg: 'success' };
         else if (u.includes('ftqq.com')) body = { errno: 0, errmsg: 'success' };
         else if (u.includes('api.day.app')) body = { code: 200, message: 'success' };
@@ -116,7 +122,7 @@ function reset() { gotCalls = []; }
 // 所有通道相关配置 key：每个测试前清空 → 只配被测通道（防本地密钥/跨测试污染）
 const CHANNEL_KEYS = ['PUSH_PLUS_TOKEN', 'PUSH_PLUS_USER', 'PUSH_KEY',
     'BARK_PUSH', 'BARK_ARCHIVE', 'BARK_GROUP', 'BARK_SOUND', 'BARK_ICON', 'BARK_LEVEL', 'BARK_URL',
-    'QYWX_KEY', 'WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_XIZHI_KEY',
+    'QYWX_KEY', 'WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_pusher_channels', 'WX_XIZHI_KEY',
     'DEER_KEY', 'DEER_URL', 'PUSHME_KEY', 'PUSHME_URL', 'HITOKOTO',
     'TG_BOT_TOKEN', 'TG_USER_ID', 'TG_API_HOST',
     'TG_PROXY_HOST', 'TG_PROXY_PORT', 'TG_PROXY_AUTH'];
@@ -279,6 +285,37 @@ await test('wxpusher: appToken + topicIds 数组(逗号分割) + Markdown', () =
         `v3.137：逗号应分割成数组: ${JSON.stringify(c.options.json.topicIds)}`);
     assert(c.options.json.contentType === 3, 'Markdown');
     assert(gotCalls.length === 1, '仅 wxpusher 一次请求');
+}));
+
+await test('wxpusher: 多应用按消息轮流分流，单条只发一个主题', () => withChannels(async () => {
+    cfg.WX_pusher_channels = [
+        { appToken: 'AT_X', topicIds: '101' },
+        { appToken: 'AT_Y', topicIds: ['202'] },
+    ];
+    await notify.sendNotify('标题1', '内容1');
+    await notify.sendNotify('标题2', '内容2');
+    await notify.sendNotify('标题3', '内容3');
+    assert(gotCalls.length === 3, `三条消息应三次请求，实际 ${gotCalls.length}`);
+    assert(gotCalls.map(c => c.options.json.appToken).join(',') === 'AT_X,AT_Y,AT_X',
+        `应按应用轮流分流: ${gotCalls.map(c => c.options.json.appToken).join(',')}`);
+    assert(gotCalls[0].options.json.topicIds[0] === '101', '应用 A 主题');
+    assert(gotCalls[1].options.json.topicIds[0] === '202', '应用 B 主题');
+}));
+
+await test('wxpusher: 首选应用明确限频时切换备用应用重试', () => withChannels(async () => {
+    cfg.WX_pusher_channels = [
+        { appToken: 'AT_A', topicIds: '101' },
+        { appToken: 'AT_B', topicIds: '202' },
+    ];
+    rateLimitWxpusherFirst = true;
+    try {
+        await notify.sendNotify('标题', '内容');
+    } finally {
+        rateLimitWxpusherFirst = false;
+    }
+    assert(gotCalls.length === 2, `首个应用限频后应切换，实际请求 ${gotCalls.length}`);
+    assert(gotCalls[0].options.json.appToken === 'AT_A', '首选应用先尝试');
+    assert(gotCalls[1].options.json.appToken === 'AT_B', '限频后切换备用应用');
 }));
 
 // 6b. wxpusher 内容类型自适应（v3.159：{Html内容} 模板 + Markdown 通道时 HTML 源码裸露——含 HTML 标签自动切 HTML 渲染）
