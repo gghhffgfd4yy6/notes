@@ -883,6 +883,12 @@
 - **兼容**：测试环境 require.cache mock 时序不变（已加载则同步复用）；推送、告警、日报共用同一模块实例，行为不变。
 - **保持**：默认运行行为不变；`XBK_PROFILE=3` 检查点与接口分阶段测速（v3.222）保持不变。
 
+## v3.224（推送补位间隔默认归零）
+
+- **调整**：`Config.timing.pushInterval` 默认值由 10 毫秒改为 0；并行滑动窗口完成一条消息后立即补下一条，顺序模式也不再默认等待补位间隔。
+- **保持**：仍可通过 `Config.timing.pushInterval` 手动设置间隔；失败消息不写成功缓存，推送和判重语义不变。
+- **版本同步**：主脚本文件头、`package.json` 与 `package-lock.json` 已同步更新。
+
 ## 文档维护（不改变程序版本）
 
 - 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS 和 BUG_AUDIT 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。

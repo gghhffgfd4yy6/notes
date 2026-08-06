@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.223 — 推送模块延迟加载 ********
+//******** 线报酷推送脚本 v3.224 — 推送补位间隔默认归零 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -97,7 +97,7 @@ const Config = {
     },
 
     timing: {
-        pushInterval: 10,
+        pushInterval: 0,
         finalWait: 0,
     },
 
@@ -2190,6 +2190,7 @@ const App = {
                 // 并行推送：滑动窗口限并发；任意一条完成后立即补下一条。
                 // parallelLimit 防御：小数取整（0.5 取 0 后回退 1）、0/负数回退全量、空 items 兜底 1。
                 const limit = (() => { const pl = Utils.num(Config.push.parallelLimit, 0); return pl > 0 ? Math.floor(pl) : items.length; })() || 1;
+                const pushInterval = Utils.num(Config.timing.pushInterval, 0);
                 const results = new Array(items.length);
                 let nextIndex = 0;
                 const worker = async () => {
@@ -2198,8 +2199,8 @@ const App = {
                         if (index >= items.length) return;
                         results[index] = await pushOne(items[index], notifyModule);
                         // 保留可配置的补位间隔，但不等待同批其他慢任务；pushInterval=0 即完成即补。
-                        if (nextIndex < items.length) {
-                            await new Promise(r => setTimeout(r, Utils.num(Config.timing.pushInterval, 10)));
+                        if (pushInterval > 0 && nextIndex < items.length) {
+                            await new Promise(r => setTimeout(r, pushInterval));
                         }
                     }
                 };
@@ -2210,11 +2211,12 @@ const App = {
                 }
                 successCount = results.filter(r => r && r.ok).length;
             } else {
-                // 顺序推送（默认）：逐条 await + 间隔
+                // 顺序推送（默认）：逐条 await；仅在显式配置正间隔时等待。
+                const pushInterval = Utils.num(Config.timing.pushInterval, 0);
                 for (const item of items) {
                     const r = await pushOne(item, notifyModule);
                     if (r.ok) { successCount++; console.log(`发现到新数据：${item.title}【${item.catename}】${urlOf(item)}`); }
-                    await new Promise(r2 => setTimeout(r2, Utils.num(Config.timing.pushInterval, 10)));
+                    if (pushInterval > 0) await new Promise(r2 => setTimeout(r2, pushInterval));
                 }
             }
             checkpoint('push-complete', `success=${successCount} failed=${items.length - successCount}`);
