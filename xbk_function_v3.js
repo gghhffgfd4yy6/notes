@@ -2218,6 +2218,9 @@ const App = {
                 }
             }
             checkpoint('push-complete', `success=${successCount} failed=${items.length - successCount}`);
+            if (PROFILE3 && notifyModule && typeof notifyModule.printWxPusherProfileSummary === 'function') {
+                notifyModule.printWxPusherProfileSummary();
+            }
 
             // ⑦ 写缓存：只收录「被过滤的数据」+「推送成功的数据」
             //    推送失败的排除在外 → 下次运行重新推送（避免消息永久丢失）

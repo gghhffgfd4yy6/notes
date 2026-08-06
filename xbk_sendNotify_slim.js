@@ -665,6 +665,8 @@ let wxPusherChannelSignature = '';
 let wxPusherSelectionTail = Promise.resolve();
 let wxPusherParsedConfigKey = null;
 let wxPusherParsedChannels = [];
+// XBK_PROFILE=3 专用：按实际 WxPusher API 尝试聚合统计；默认运行不记录。
+const wxPusherProfileStats = new Map();
 
 function parseWxPusherChannels() {
     const configuredRaw = push_config.WX_pusher_channels;
@@ -755,8 +757,41 @@ function wxPusherRateLimited(err) {
     return /1001|速度太快|10秒内访问超过20次|限流|限频/i.test(text);
 }
 
+function wxPusherProfileStat(channel, outcome) {
+    if (process.env.XBK_PROFILE !== '3') return;
+    const key = safeString(channel.appToken);
+    let stat = wxPusherProfileStats.get(key);
+    if (!stat) {
+        stat = { app: `***${key.slice(-4)}`, attempts: 0, success: 0, failed: 0, rateLimited: 0, networkError: 0, apiError: 0 };
+        wxPusherProfileStats.set(key, stat);
+    }
+    stat.attempts++;
+    if (outcome === 'success') stat.success++;
+    else {
+        stat.failed++;
+        if (outcome === 'rate_limited') stat.rateLimited++;
+        else if (outcome === 'network_error') stat.networkError++;
+        else stat.apiError++;
+    }
+}
+
+function getWxPusherProfileSummary() {
+    if (process.env.XBK_PROFILE !== '3') return [];
+    return [...wxPusherProfileStats.values()].map(stat => ({ ...stat }));
+}
+
+function printWxPusherProfileSummary() {
+    if (process.env.XBK_PROFILE !== '3' || wxPusherProfileStats.size === 0) return;
+    const summary = getWxPusherProfileSummary();
+    console.log('  [profile wxpusher summary]');
+    for (const stat of summary) {
+        console.log(`    app=${stat.app} attempts=${stat.attempts} success=${stat.success} failed=${stat.failed} rateLimited=${stat.rateLimited} networkError=${stat.networkError} apiError=${stat.apiError}`);
+    }
+}
+
 function wxPusherProfile(channel, outcome, started, timings) {
     if (process.env.XBK_PROFILE !== '2' && process.env.XBK_PROFILE !== '3') return;
+    wxPusherProfileStat(channel, outcome);
     const elapsedMs = Date.now() - started;
     console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=${outcome} elapsedMs=${elapsedMs}`);
     if (timings && timings.phases) {
@@ -1103,4 +1138,4 @@ async function sendNotify(text, desp, params = {}) {
     }
 }
 
-module.exports = { sendNotify, push_config, maskKey, maskUrl, safeSlice, safeErr };
+module.exports = { sendNotify, push_config, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary };
