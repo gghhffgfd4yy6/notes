@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.210 — 并行推送补位间隔调整 ********
+//******** 线报酷推送脚本 v3.211 — 推送链路性能诊断与取消 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1533,13 +1533,20 @@ const Pusher = {
         // v3.121：clearTimeout 清除超时定时器——Promise.race 完成后定时器仍挂着会导致
         // 进程退出延迟（事件循环被 keep-alive）+ 多次推送定时器堆积（资源泄漏）
         let timer;
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
         try {
             await Promise.race([
-                notify.sendNotify(text, desp),
-                new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('推送超时(10s)')), 10000); }),
+                notify.sendNotify(text, desp, controller ? { signal: controller.signal } : {}),
+                new Promise((_, rej) => {
+                    timer = setTimeout(() => {
+                        if (controller) controller.abort();
+                        rej(new Error('推送超时(10s)'));
+                    }, 10000);
+                }),
             ]);
         } finally {
             clearTimeout(timer);
+            if (controller) controller.abort();
         }
     },
 };
@@ -1766,7 +1773,10 @@ const App = {
 
     async run() {
         const runStart = Date.now();
+        const detailedProfile = process.env.XBK_PROFILE === '2';
         let fetchMs = null;
+        let preprocessMs = null;
+        let cacheMs = null;
         console.debug('开始获取线报酷数据...');
 
         MessageStore.init();
@@ -1999,8 +2009,9 @@ const App = {
                 items = items.slice(0, maxPerRun);
             }
 
-            // ⑥ 推送（sequential=顺序逐条 / parallel=并行一次推送；失败不中断、不写缓存，下次重试）
+            // ⑥ 推送（sequential=顺序逐条 / parallel=并行滑动窗口；失败不中断、不写缓存，下次重试）
             const startTime = Date.now();
+            preprocessMs = startTime - runStart - (fetchMs || 0);
             const keyOf = (it) => Utils.hasValidId(it) ? `id:${it.id}` : `url:${Utils.normUrl(it.url)}`;
             // domain 去尾斜杠后与相对路径统一拼接（避免 'https://x.com//rel' 双斜杠）
             // R2：非字符串 domain（脏配置）→ 空串 baseUrl（相对路径不拼前缀，避免 .replace 崩溃）
@@ -2111,7 +2122,9 @@ const App = {
             const itemsKeys = new Set(items.map(keyOf));
             // v3.134：排除截断未推的（下次运行推剩余，防静默丢失）
             const toCache = newMessages.filter(m => !truncatedKeys.has(keyOf(m)) && (!itemsKeys.has(keyOf(m)) || pushedKeys.has(keyOf(m))));
+            const cacheStart = Date.now();
             MessageStore.saveBatch(toCache, cacheName);
+            cacheMs = Date.now() - cacheStart;
 
             // ⑧ 统计
             const pushMs = Date.now() - startTime;
@@ -2124,9 +2137,12 @@ const App = {
             if (badElementCount > 0) console.log(`  非对象元素: ${badElementCount} 条（接口脏数据，已跳过）`);
             console.log(`  推送:     ${successCount} 条${successCount < items.length ? `（${items.length - successCount} 条失败，下次运行重试）` : ''}`);
             console.log(`  耗时:     ${elapsed}s`);
-            if (process.env.XBK_PROFILE === '1') {
+            if (process.env.XBK_PROFILE === '1' || detailedProfile) {
                 const totalMs = Date.now() - runStart;
-                console.log(`  [profile] 接口: ${fetchMs === null ? 'n/a' : (fetchMs / 1000).toFixed(3) + 's'} | 推送: ${(pushMs / 1000).toFixed(3)}s | 总计: ${(totalMs / 1000).toFixed(3)}s`);
+                console.log(`  [profile] 接口: ${fetchMs === null ? 'n/a' : (fetchMs / 1000).toFixed(3) + 's'} | 推送: ${(pushMs / 1000).toFixed(3) + 's'} | 总计: ${(totalMs / 1000).toFixed(3) + 's'}`);
+                if (detailedProfile) {
+                    console.log(`  [profile detail] 预处理: ${(Math.max(0, preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(Config.timing.finalWait, 10) / 1000).toFixed(3)}s`);
+                }
             }
             console.log('══════════════════════════════');
             await new Promise(r => setTimeout(r, Utils.num(Config.timing.finalWait, 200)));

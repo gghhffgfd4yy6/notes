@@ -7,6 +7,10 @@ const got = require('got');
 const { AGENTS } = require('./xbk_agents');
 const timeout = 15000;
 const REQUEST_OPTIONS = { agent: AGENTS };
+const requestExtras = (params) => {
+    try { return params && params.signal ? { signal: params.signal } : {}; }
+    catch (e) { return {}; }
+};
 
 // 配置/错误值安全字符串化：异常 toString/valueOf 不能让脱敏和错误处理路径再次崩溃。
 function safeString(value) {
@@ -301,7 +305,7 @@ const $ = {
     logErr: console.log,
 };
 
-function pushPlusNotify(text, desp) {
+function pushPlusNotify(text, desp, params = {}) {
     return new Promise((resolve, reject) => {
         const { PUSH_PLUS_TOKEN, PUSH_PLUS_USER } = push_config;
         if (PUSH_PLUS_TOKEN) {
@@ -315,6 +319,7 @@ function pushPlusNotify(text, desp) {
             };
             const options = {
                 ...REQUEST_OPTIONS,
+                ...requestExtras(params),
                 url: `https://www.pushplus.plus/send`,
                 body: JSON.stringify(body),
                 headers: {
@@ -364,7 +369,7 @@ function pushPlusNotify(text, desp) {
     });
 }
 
-function serverNotify(text, desp) {
+function serverNotify(text, desp, params = {}) {
     return new Promise((resolve, reject) => {
         const { PUSH_KEY } = push_config;
         if (PUSH_KEY) {
@@ -383,6 +388,7 @@ function serverNotify(text, desp) {
             desp = desp.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/([^\n])\n(?!\n)/g, '$1\n\n');
             const options = {
                 ...REQUEST_OPTIONS,
+                ...requestExtras(params),
                 url: pushKey.includes('SCT')
                     ? `https://sctapi.ftqq.com/${pushKey}.send`
                     : `https://sc.ftqq.com/${pushKey}.send`,
@@ -462,6 +468,7 @@ function barkNotify(text, desp, params = {}) {
 
             const options = {
                 ...REQUEST_OPTIONS,
+                ...requestExtras(params),
                 url: pushUrl,
                 json: {
                     title: text,
@@ -537,6 +544,7 @@ function pushMeNotify(text, desp, params = {}) {
             const trimmedKey = pushKey.trim();
             const options = {
                 ...REQUEST_OPTIONS,
+                ...requestExtras(params),
                 url: PUSHME_URL || 'https://push.i-i.me',
                 json: {
                     push_key: trimmedKey,
@@ -587,11 +595,12 @@ function pushMeNotify(text, desp, params = {}) {
     });
 }
 
-function qywxBotNotify(text, desp) {
+function qywxBotNotify(text, desp, params = {}) {
     return new Promise((resolve, reject) => {
         const { QYWX_ORIGIN, QYWX_KEY } = push_config;
         const options = {
             ...REQUEST_OPTIONS,
+            ...requestExtras(params),
             url: `${String(QYWX_ORIGIN || 'https://qyapi.weixin.qq.com').replace(/\/+$/, '')}/cgi-bin/webhook/send?key=${QYWX_KEY}`, // v3.138：去尾斜杠防双斜杠
             json: {
                 // v3.127：msgtype 'text' → 'markdown'——desp 是 Markdown 内容，text 模式会显示 ** 等原始符号（企微支持 markdown）
@@ -653,9 +662,22 @@ const WXPUSHER_WINDOW_LIMIT = 19;
 const wxPusherWindows = new Map();
 let wxPusherRoundRobin = 0;
 let wxPusherChannelSignature = '';
+let wxPusherParsedConfigKey = null;
+let wxPusherParsedChannels = [];
 
 function parseWxPusherChannels() {
-    let raw = push_config.WX_pusher_channels;
+    const configuredRaw = push_config.WX_pusher_channels;
+    let configKey;
+    try {
+        configKey = JSON.stringify({
+            channels: configuredRaw,
+            appToken: push_config.WX_pusher_appToken,
+            topicIds: push_config.WX_pusher_topicIds,
+        });
+    } catch (e) { configKey = '<unserializable>'; }
+    if (configKey === wxPusherParsedConfigKey) return wxPusherParsedChannels;
+
+    let raw = configuredRaw;
     if (typeof raw === 'string') {
         try { raw = JSON.parse(raw); } catch (e) { raw = []; }
     }
@@ -667,11 +689,17 @@ function parseWxPusherChannels() {
             .split(',').map(s => s.trim()).filter(Boolean);
         return appToken && topicIds.length ? { appToken, topicIds } : null;
     }).filter(Boolean);
-    if (channels.length) return channels;
+    if (channels.length) {
+        wxPusherParsedConfigKey = configKey;
+        wxPusherParsedChannels = channels;
+        return channels;
+    }
     const appToken = safeString(push_config.WX_pusher_appToken).trim();
     const topicIds = safeString(push_config.WX_pusher_topicIds).split(',').map(s => s.trim()).filter(Boolean);
     // 兼容旧测试/配置：历史实现允许只填 appToken，topicIds 为空时仍按 API 请求发送。
-    return appToken ? [{ appToken, topicIds }] : [];
+    wxPusherParsedConfigKey = configKey;
+    wxPusherParsedChannels = appToken ? [{ appToken, topicIds }] : [];
+    return wxPusherParsedChannels;
 }
 
 function wxPusherChannelKey(channel) {
@@ -712,10 +740,18 @@ function wxPusherRateLimited(err) {
     return /1001|速度太快|10秒内访问超过20次|限流|限频/i.test(text);
 }
 
-function wxPusherPost(channel, text, desp) {
+function wxPusherProfile(channel, outcome, started) {
+    if (process.env.XBK_PROFILE !== '2') return;
+    console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=${outcome} elapsedMs=${Date.now() - started}`);
+}
+
+function wxPusherPost(channel, text, desp, params = {}) {
+    const started = Date.now();
+    if (process.env.XBK_PROFILE === '2') console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=start`);
     return new Promise((resolve, reject) => {
         const options = {
             ...REQUEST_OPTIONS,
+            ...requestExtras(params),
             url: `https://wxpusher.zjiecode.com/api/send/message`,
             json: {
                 appToken: channel.appToken,
@@ -731,12 +767,16 @@ function wxPusherPost(channel, text, desp) {
         $.post(options, (err, resp, data) => {
             try {
                 if (err) {
+                    wxPusherProfile(channel, 'network_error', started);
                     console.log('WxPusher发送通知消息失败😞\n', safeErr(err));
                     reject(err);
                 } else if (data && isCode(data.code, 1000)) {
+                    wxPusherProfile(channel, 'success', started);
                     console.log('WxPusher发送通知消息成功🎉。\n');
                     resolve(data);
                 } else {
+                    const outcome = data && isCode(data.code, 1001) ? 'rate_limited' : 'api_error';
+                    wxPusherProfile(channel, outcome, started);
                     console.log(`WxPusher发送通知消息异常\n`);
                     console.log(safeErr(data));
                     reject(new Error(data && data.msg ? safeErr(data.msg) : 'wxpusher 发送失败'));
@@ -749,7 +789,7 @@ function wxPusherPost(channel, text, desp) {
     });
 }
 
-async function wxPusherNotify(text, desp) {
+async function wxPusherNotify(text, desp, params = {}) {
     const channels = parseWxPusherChannels();
     if (!channels.length) return;
     const signature = channels.map(channel => `${channel.appToken}\0${channel.topicIds.join(',')}`).join('\n');
@@ -768,7 +808,7 @@ async function wxPusherNotify(text, desp) {
         wxPusherRoundRobin = (selectedIndex + 1) % channels.length;
         tried.add(wxPusherChannelKey(selected));
         try {
-            await wxPusherPost(selected, text, desp);
+            await wxPusherPost(selected, text, desp, params);
             return;
         } catch (e) {
             lastErr = e;
@@ -778,13 +818,14 @@ async function wxPusherNotify(text, desp) {
     throw lastErr || new Error('wxpusher 发送失败');
 }
 
-function wxXiZhiNotify(text, desp) {
+function wxXiZhiNotify(text, desp, params = {}) {
     return new Promise((resolve, reject) => {
         const { WX_XIZHI_KEY } =
             push_config;
 
         const options = {
             ...REQUEST_OPTIONS,
+            ...requestExtras(params),
             url: WX_XIZHI_KEY,
             json: {
                 title: text,
@@ -829,7 +870,7 @@ function wxXiZhiNotify(text, desp) {
     });
 }
 
-function pushDeerNotify(text, desp) {
+function pushDeerNotify(text, desp, params = {}) {
     return new Promise((resolve, reject) => {
         const { DEER_KEY, DEER_URL } = push_config;
         if (DEER_KEY) {
@@ -837,6 +878,7 @@ function pushDeerNotify(text, desp) {
             const enc = (s) => encodeURIComponent(s);
             const options = {
                 ...REQUEST_OPTIONS,
+                ...requestExtras(params),
                 url: DEER_URL || `https://api2.pushdeer.com/message/push`,
                 body: `pushkey=${enc(DEER_KEY)}&text=${enc(text)}&desp=${enc(desp)}&type=markdown`,
                 headers: {
@@ -883,7 +925,7 @@ function pushDeerNotify(text, desp) {
 // 模块级：TG_PROXY 未实现警告只提示一次（防每次推送刷屏）
 let tgProxyWarned = false;
 
-function tgNotify(text, desp) {
+function tgNotify(text, desp, params = {}) {
     return new Promise((resolve, reject) => {
         const { TG_BOT_TOKEN, TG_USER_ID, TG_API_HOST } = push_config;
         // TG_PROXY_* 保留配置项：当前项目未接入 HTTP 代理（v3.76 一次性警告防误配静默失效）
@@ -904,6 +946,7 @@ function tgNotify(text, desp) {
             const tgSafe = tgFull.length > 4000 ? safeSlice(tgFull, 4000) : tgFull;
             const options = {
                 ...REQUEST_OPTIONS,
+                ...requestExtras(params),
                 url: `${String(TG_API_HOST || 'https://api.telegram.org').replace(/\/+$/, '')}/bot${TG_BOT_TOKEN}/sendMessage`, // v3.138：去尾斜杠防双斜杠
                 json: {
                     chat_id: TG_USER_ID,
@@ -1021,12 +1064,12 @@ async function sendNotify(text, desp, params = {}) {
     // 保持数组顺序与 configuredFlags 一致，便于失败统计和后续扩展。
     const channelTasks = [
         [configuredFlags[0], () => pushPlusNotify(text, desp, params)],
-        [configuredFlags[1], () => serverNotify(text, desp)],
+        [configuredFlags[1], () => serverNotify(text, desp, params)],
         [configuredFlags[2], () => barkNotify(text, desp, params)],
-        [configuredFlags[3], () => qywxBotNotify(text, desp)],
-        [configuredFlags[4], () => wxPusherNotify(text, desp)],
-        [configuredFlags[5], () => wxXiZhiNotify(text, desp)],
-        [configuredFlags[6], () => pushDeerNotify(text, desp)],
+        [configuredFlags[3], () => qywxBotNotify(text, desp, params)],
+        [configuredFlags[4], () => wxPusherNotify(text, desp, params)],
+        [configuredFlags[5], () => wxXiZhiNotify(text, desp, params)],
+        [configuredFlags[6], () => pushDeerNotify(text, desp, params)],
         [configuredFlags[7], () => pushMeNotify(text, desp, params)],
         [configuredFlags[8], () => tgNotify(text, desp, params)],
     ];

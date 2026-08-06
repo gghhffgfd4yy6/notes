@@ -825,10 +825,12 @@ await test('parallelLimit=2: 滑动窗口补位且不超过并发上限', async 
     const ends = [];
     let active = 0;
     let maxActive = 0;
+    let abortSignalSeen = false;
     const origInterval = Config.timing.pushInterval;
     try {
         Config.timing.pushInterval = 0;
-        const r = await runWithPushMode('parallel', 2, data, async (text) => {
+        const r = await runWithPushMode('parallel', 2, data, async (text, desp, params) => {
+            abortSignalSeen = !!(params && params.signal);
             const index = Number(String(text).match(/滑动(\d+)/)[1]);
             starts[index] = Date.now();
             active++;
@@ -841,6 +843,7 @@ await test('parallelLimit=2: 滑动窗口补位且不超过并发上限', async 
         assert(r.cached === 3, `缓存应3条，实际${r.cached}`);
         assert(maxActive === 2, `并发上限应为2，实际峰值${maxActive}`);
         assert(starts[3] < ends[1], '第3条应在第1条完成前补位，必须是滑动窗口');
+        assert(abortSignalSeen, 'Pusher.send 应向底层 notify 传递 AbortSignal');
     } finally {
         Config.timing.pushInterval = origInterval;
     }
