@@ -4712,7 +4712,7 @@ await test('契约: Config 默认值全量锁定', () => {
     assertEqual(Config.filter.pingbitime, '5');
     assertEqual(Config.keyword.zkt_gjc, '');
     assertEqual(Config.timing.pushInterval, 10);
-    assertEqual(Config.timing.finalWait, 200);
+    assertEqual(Config.timing.finalWait, 0);
     assertEqual(Config.cache.maxSize, 10000);
     assertEqual(Config.cache.dir, 'xianbaoku_cache');
     assertEqual(Config.push.mode, 'parallel');

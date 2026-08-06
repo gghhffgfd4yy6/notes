@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.217 — WxPusher DNS 并行预热 ********
+//******** 线报酷推送脚本 v3.218 — 收尾等待归零 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -52,7 +52,7 @@ const Config = {
 
     timing: {
         pushInterval: 10,
-        finalWait: 200,
+        finalWait: 0,
     },
 
     // 推送模式：sequential=顺序逐条 | parallel=并行滑动窗口(默认)
@@ -2146,11 +2146,11 @@ const App = {
                 console.log(`  [profile] 接口: ${fetchMs === null ? 'n/a' : (fetchMs / 1000).toFixed(3) + 's'} | 推送: ${(pushMs / 1000).toFixed(3) + 's'} | 总计: ${(totalMs / 1000).toFixed(3) + 's'}`);
                 if (detailedProfile) {
                     const warmupText = dnsWarmup ? `${dnsWarmup.ok ? '成功' : '失败'} ${(dnsWarmup.elapsedMs / 1000).toFixed(3)}s${dnsWarmup.family ? ` IPv${dnsWarmup.family}` : ''}` : 'n/a';
-                    console.log(`  [profile detail] DNS预热: ${warmupText} | 预处理: ${(Math.max(0, preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(Config.timing.finalWait, 10) / 1000).toFixed(3)}s`);
+                    console.log(`  [profile detail] DNS预热: ${warmupText} | 预处理: ${(Math.max(0, preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(Config.timing.finalWait, 0) / 1000).toFixed(3)}s`);
                 }
             }
             console.log('══════════════════════════════');
-            await new Promise(r => setTimeout(r, Utils.num(Config.timing.finalWait, 200)));
+            await new Promise(r => setTimeout(r, Utils.num(Config.timing.finalWait, 0)));
 
             // v3.163：#9 推送全部失败无告警（v3.123 声称覆盖密钥失效但只实现接口挂）——
             // 补告警推送（限频复用 alert.state，防轰炸）+ run.log ERROR 行（cron 翻日志可见）
