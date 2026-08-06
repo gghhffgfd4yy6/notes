@@ -2,7 +2,7 @@
 
 // 官方 got 的薄封装：got 负责 HTTP/TLS/重定向/超时，本文只补项目需要的响应体大小与 JSON 解析。
 const got = require('got');
-const { AGENTS } = require('./xbk_agents');
+const { AGENTS, dnsLookup } = require('./xbk_agents');
 
 const DEFAULT_MAX_BODY = 20 * 1024 * 1024;
 
@@ -16,7 +16,7 @@ function parseJsonBody(text) {
 }
 
 async function fetchJson(url, options = {}, maxBody = DEFAULT_MAX_BODY) {
-    const requestOptions = { agent: AGENTS, ...options };
+    const requestOptions = { agent: AGENTS, lookup: dnsLookup, ...options };
     // 集成测试的 got mock 只提供 promise API；生产官方 got 提供 stream API，走可限流的真实路径。
     if (!got.stream) return got(url, requestOptions).json();
 

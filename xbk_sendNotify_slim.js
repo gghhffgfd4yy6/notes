@@ -4,9 +4,9 @@
 // 仅保留：PushPlus、Server酱、Bark、PushMe、企业微信机器人、wxpusher、息知、PushDeer
 
 const got = require('got');
-const { AGENTS } = require('./xbk_agents');
+const { AGENTS, dnsLookup } = require('./xbk_agents');
 const timeout = 15000;
-const REQUEST_OPTIONS = { agent: AGENTS };
+const REQUEST_OPTIONS = { agent: AGENTS, lookup: dnsLookup };
 const requestExtras = (params) => {
     try { return params && params.signal ? { signal: params.signal } : {}; }
     catch (e) { return {}; }
