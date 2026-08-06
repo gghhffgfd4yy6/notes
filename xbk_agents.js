@@ -63,8 +63,9 @@ function prewarmDns(hostname) {
     });
 }
 
-async function prewarmTls(hostname, timeoutMs = 5000, count = 1) {
+async function prewarmTls(hostname, timeoutMs = 5000, count = 1, signal = null) {
     const started = Date.now();
+    if (signal && signal.aborted) return { hostname, count, skipped: true, cancelled: true, ok: false, okCount: 0, elapsedMs: 0 };
     try {
         // 测试环境 got 为 mock（无 stream）：跳过真实建连，避免破坏 gotCalls 断言。
         if (!got.stream) return { hostname, count, skipped: true, ok: true, elapsedMs: Date.now() - started };
@@ -75,15 +76,23 @@ async function prewarmTls(hostname, timeoutMs = 5000, count = 1) {
         timeout: timeoutMs,
         retry: { limit: 0 },
         throwHttpErrors: false,
+        ...(signal ? { signal } : {}),
     };
     const results = await Promise.all(Array.from({ length: Math.max(1, Math.floor(count)) }, async () => {
         const singleStart = Date.now();
         try {
             // HEAD 无响应体：只需 DNS+TCP+TLS+响应头即可完成建连，连接进入 Keep-Alive 池，
             // 比 GET 下载首页快得多（GET 会把 body 下载时间也算进预取）。
-            await got.head(`https://${hostname}/`, baseOptions);
+            const response = await got.head(`https://${hostname}/`, baseOptions);
+            // throwHttpErrors=false 时 405 不会进入 catch，显式检查后才回退 GET。
+            if (response && response.statusCode >= 400) {
+                if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart };
+                await got.get(`https://${hostname}/`, baseOptions);
+                return { ok: true, elapsedMs: Date.now() - singleStart, viaGet: true };
+            }
             return { ok: true, elapsedMs: Date.now() - singleStart };
         } catch (e) {
+            if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart };
             // 服务端不支持 HEAD（如 405）时回退 GET 建连；仍失败则静默跳过。
             try {
                 await got.get(`https://${hostname}/`, baseOptions);

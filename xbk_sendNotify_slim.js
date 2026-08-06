@@ -753,6 +753,7 @@ async function acquireWxPusherSlot(channels, tried) {
 }
 
 function wxPusherRateLimited(err) {
+    if (err && (err.code === 1001 || err.code === '1001')) return true;
     const text = safeString(err && err.message ? err.message : err);
     return /1001|速度太快|10秒内访问超过20次|限流|限频/i.test(text);
 }
@@ -835,7 +836,10 @@ function wxPusherPost(channel, text, desp, params = {}) {
                     wxPusherProfile(channel, outcome, started, timings);
                     console.log(`WxPusher发送通知消息异常\n`);
                     console.log(safeErr(data));
-                    reject(new Error(data && data.msg ? safeErr(data.msg) : 'wxpusher 发送失败'));
+                    const error = new Error(data && data.msg ? safeErr(data.msg) : 'wxpusher 发送失败');
+                    // 保留结构化业务码：限频响应可能没有 msg，不能只靠错误文本判断是否切换备用应用。
+                    if (data && data.code !== undefined && data.code !== null) error.code = data.code;
+                    reject(error);
                 }
             } catch (e) {
                 reject(e);

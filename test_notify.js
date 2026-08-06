@@ -17,6 +17,7 @@ let failHitokotoStruct = false; // 一言响应结构异常开关（v3.86：缺 
 let failPost = false;     // got.post 失败开关（v3.75：验证失败日志不泄露密钥）
 let failWxpusher = false; // wxpusher API 失败开关（v3.154：code≠1000 应 reject 不静默）
 let rateLimitWxpusherFirst = false; // 多应用分流：首个应用限频时应切换下一个应用
+let rateLimitWxpusherCodeOnly = false; // 限频响应仅返回 code=1001，无 msg（必须仍切换备用应用）
 let failBiz = false;      // 全部通道 API 业务失败开关（v3.160：code≠成功 应 reject 不静默）
 let nullBody = false;     // v3.180：HTTP 200 + 响应体 JSON null 开关（曾 4 通道虚假成功→消息丢失 P1）
 let malformedResponse = false; // 响应字段 getter 抛异常：必须按通道失败，不能被 finally resolve 掩盖
@@ -83,9 +84,11 @@ require.cache[gotPath].exports.post = (url, options) => {
             else if (u.includes('api.telegram.org')) body = { ok: false, error_code: 400, description: 'Bad Request' };
         } else if (u.includes('wxpusher')) {
             const appToken = options && options.json && options.json.appToken;
-            body = rateLimitWxpusherFirst && appToken === 'AT_A'
-                ? { code: 1001, msg: '你访问的速度太快了。当前限制QPS为2.0' }
-                : (failWxpusher ? { code: 1300, msg: '推送失败' } : { code: 1000, msg: 'success' });
+            body = rateLimitWxpusherCodeOnly && appToken === 'AT_C'
+                ? { code: 1001 }
+                : (rateLimitWxpusherFirst && appToken === 'AT_A'
+                    ? { code: 1001, msg: '你访问的速度太快了。当前限制QPS为2.0' }
+                    : (failWxpusher ? { code: 1300, msg: '推送失败' } : { code: 1000, msg: 'success' }));
         }
         else if (u.includes('pushplus.plus')) body = { code: 200, msg: 'success' };
         else if (u.includes('ftqq.com')) body = { errno: 0, errmsg: 'success' };
@@ -328,6 +331,21 @@ await test('wxpusher: 首选应用明确限频时切换备用应用重试', () =
     assert(gotCalls.length === 2, `首个应用限频后应切换，实际请求 ${gotCalls.length}`);
     assert(gotCalls[0].options.json.appToken === 'AT_A', '首选应用先尝试');
     assert(gotCalls[1].options.json.appToken === 'AT_B', '限频后切换备用应用');
+}));
+
+await test('wxpusher: 仅返回 code=1001 时仍切换备用应用', () => withChannels(async () => {
+    cfg.WX_pusher_channels = [
+        { appToken: 'AT_C', topicIds: '301' },
+        { appToken: 'AT_D', topicIds: '302' },
+    ];
+    rateLimitWxpusherCodeOnly = true;
+    try {
+        await notify.sendNotify('标题', '内容');
+    } finally {
+        rateLimitWxpusherCodeOnly = false;
+    }
+    assert(gotCalls.length === 2, `仅 code=1001 也应切换，实际请求 ${gotCalls.length}`);
+    assert(gotCalls[1].options.json.appToken === 'AT_D', 'code=1001 无 msg 时应切换备用应用');
 }));
 
 // 6b. wxpusher 内容类型自适应（v3.159：{Html内容} 模板 + Markdown 通道时 HTML 源码裸露——含 HTML 标签自动切 HTML 渲染）

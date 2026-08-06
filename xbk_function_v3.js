@@ -1857,6 +1857,7 @@ const App = {
         let tlsWarmup = null;
         let dnsWarmupSettled = false;
         let tlsWarmupSettled = false;
+        let warmupController = null;
         console.debug('开始获取线报酷数据...');
         checkpoint('run-start');
 
@@ -1930,17 +1931,55 @@ const App = {
             const compiledRules = RuleEngine.compileRules(Config.filter);
             checkpoint('rules-compiled');
 
-            // ③ 拉取数据：同时预解析 WxPusher 域名并后台预建 HTTPS 连接。
-            // 预取不 await——推送开始后能复用多少就复用多少，绝不因预取未完成而阻塞主流程。
-            const dnsWarmupPromise = Promise.resolve(prewarmDns('wxpusher.zjiecode.com'))
-                .then((result) => { dnsWarmup = result; dnsWarmupSettled = true; return result; })
-                .catch((error) => { dnsWarmup = { ok: false, error: String(error) }; dnsWarmupSettled = true; return dnsWarmup; });
-            checkpoint('warmup-started', `tlsCount=${(() => { const pl = Utils.num(Config.push.parallelLimit, 10); return pl > 0 ? Math.min(Math.floor(pl), 10) : 10; })()}`);
-            // HEAD 预取：连接数与并发窗口对齐，全部第一批请求可复用；预热快于接口时不阻塞、无收尾等待。
-            const prewarmCount = (() => { const pl = Utils.num(Config.push.parallelLimit, 10); return pl > 0 ? Math.min(Math.floor(pl), 10) : 10; })();
-            const tlsWarmupPromise = Promise.resolve(prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount))
-                .then((result) => { tlsWarmup = result; tlsWarmupSettled = true; return result; })
-                .catch((error) => { tlsWarmup = { ok: false, okCount: 0, count: prewarmCount, error: String(error) }; tlsWarmupSettled = true; return tlsWarmup; });
+            // ③ 拉取数据：仅在实际配置 WxPusher 时预解析域名并后台预建 HTTPS 连接。
+            // 预热可被主流程结束时取消，避免“未 await”仍因活动 socket 延长进程退出。
+            const warmupPromise = getNotify().then((notifyModule) => {
+                const cfg = notifyModule && notifyModule.push_config;
+                let hasWxPusher = false;
+                try {
+                    const single = cfg && typeof cfg.WX_pusher_appToken === 'string' && cfg.WX_pusher_appToken.trim() !== '';
+                    let multi = false;
+                    if (cfg) {
+                        if (Array.isArray(cfg.WX_pusher_channels)) {
+                            multi = cfg.WX_pusher_channels.length > 0;
+                        } else if (typeof cfg.WX_pusher_channels === 'string' && cfg.WX_pusher_channels.trim() !== '') {
+                            try {
+                                const parsed = JSON.parse(cfg.WX_pusher_channels);
+                                multi = Array.isArray(parsed) && parsed.length > 0;
+                            } catch (e) { multi = false; }
+                        }
+                    }
+                    hasWxPusher = Boolean(single || multi);
+                } catch (e) { hasWxPusher = false; }
+                if (!hasWxPusher) {
+                    dnsWarmup = { ok: true, skipped: true };
+                    tlsWarmup = { ok: true, skipped: true, okCount: 0, count: 0 };
+                    dnsWarmupSettled = true;
+                    tlsWarmupSettled = true;
+                    checkpoint('warmup-skipped', 'wxpusher=unconfigured');
+                    return null;
+                }
+                warmupController = typeof AbortController === 'function' ? new AbortController() : null;
+                const signal = warmupController ? warmupController.signal : null;
+                const dnsWarmupPromise = Promise.resolve(prewarmDns('wxpusher.zjiecode.com'))
+                    .then((result) => { dnsWarmup = result; dnsWarmupSettled = true; return result; })
+                    .catch((error) => { dnsWarmup = { ok: false, error: String(error) }; dnsWarmupSettled = true; return dnsWarmup; });
+                const prewarmCount = (() => { const pl = Utils.num(Config.push.parallelLimit, 10); return pl > 0 ? Math.min(Math.floor(pl), 10) : 10; })();
+                // HEAD 预取：连接数与并发窗口对齐；signal 允许主流程结束/失败时取消未完成请求。
+                const tlsWarmupPromise = Promise.resolve(prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount, signal))
+                    .then((result) => { tlsWarmup = result; tlsWarmupSettled = true; return result; })
+                    .catch((error) => { tlsWarmup = { ok: false, okCount: 0, count: prewarmCount, error: String(error) }; tlsWarmupSettled = true; return tlsWarmup; });
+                checkpoint('warmup-started', `tlsCount=${prewarmCount}`);
+                return Promise.all([dnsWarmupPromise, tlsWarmupPromise]);
+            }).catch((error) => {
+                dnsWarmup = { ok: false, error: String(error) };
+                tlsWarmup = { ok: false, okCount: 0, count: 0, error: String(error) };
+                dnsWarmupSettled = true;
+                tlsWarmupSettled = true;
+                return null;
+            });
+            // 显式接住后台预热 Promise；主流程不等待它。
+            warmupPromise.catch(() => {});
             const fetchStart = Date.now();
             const xbkdata = await Network.fetchData();
             fetchMs = Date.now() - fetchStart;
@@ -2310,6 +2349,9 @@ const App = {
             // v3.164：await 告警完成——主入口 process.exit(1) 前需确保告警 HTTP 送达（#10）
             try { await this._sendAlert(errMsg); } catch (e) { /* 告警失败不阻塞重抛 */ }
             throw error; // 重新抛出，让外层/调度感知失败（cron 场景 exit code 非 0）
+        } finally {
+            // 后台 DNS/TLS 预热不是业务结果，运行结束或失败时取消未完成请求，避免拖住进程退出。
+            if (warmupController) warmupController.abort();
         }
     },
 };
