@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.224 — 推送补位间隔默认归零 ********
+//******** 线报酷推送脚本 v3.225 — 后台预热不阻塞主流程 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1855,6 +1855,8 @@ const App = {
         let cacheMs = null;
         let dnsWarmup = null;
         let tlsWarmup = null;
+        let dnsWarmupSettled = false;
+        let tlsWarmupSettled = false;
         console.debug('开始获取线报酷数据...');
         checkpoint('run-start');
 
@@ -1930,17 +1932,20 @@ const App = {
 
             // ③ 拉取数据：同时预解析 WxPusher 域名并后台预建 HTTPS 连接。
             // 预取不 await——推送开始后能复用多少就复用多少，绝不因预取未完成而阻塞主流程。
-            const dnsWarmupPromise = prewarmDns('wxpusher.zjiecode.com');
+            const dnsWarmupPromise = Promise.resolve(prewarmDns('wxpusher.zjiecode.com'))
+                .then((result) => { dnsWarmup = result; dnsWarmupSettled = true; return result; })
+                .catch((error) => { dnsWarmup = { ok: false, error: String(error) }; dnsWarmupSettled = true; return dnsWarmup; });
             checkpoint('warmup-started', `tlsCount=${(() => { const pl = Utils.num(Config.push.parallelLimit, 10); return pl > 0 ? Math.min(Math.floor(pl), 10) : 10; })()}`);
-            // HEAD 预取：连接数与并发窗口对齐，全部第一批请求可复用；预取快于接口时不阻塞、无收尾等待。
+            // HEAD 预取：连接数与并发窗口对齐，全部第一批请求可复用；预热快于接口时不阻塞、无收尾等待。
             const prewarmCount = (() => { const pl = Utils.num(Config.push.parallelLimit, 10); return pl > 0 ? Math.min(Math.floor(pl), 10) : 10; })();
-            const tlsWarmupPromise = prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount);
+            const tlsWarmupPromise = Promise.resolve(prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount))
+                .then((result) => { tlsWarmup = result; tlsWarmupSettled = true; return result; })
+                .catch((error) => { tlsWarmup = { ok: false, okCount: 0, count: prewarmCount, error: String(error) }; tlsWarmupSettled = true; return tlsWarmup; });
             const fetchStart = Date.now();
             const xbkdata = await Network.fetchData();
             fetchMs = Date.now() - fetchStart;
             checkpoint('api-fetch-complete', `items=${Array.isArray(xbkdata) ? xbkdata.length : 'invalid'} fetchMs=${fetchMs}`);
-            dnsWarmup = await dnsWarmupPromise;
-            checkpoint('dns-warmup-observed', dnsWarmup ? `ok=${dnsWarmup.ok} elapsedMs=${dnsWarmup.elapsedMs}` : 'n/a');
+            checkpoint('dns-warmup-observed', dnsWarmupSettled && dnsWarmup ? `ok=${dnsWarmup.ok} elapsedMs=${dnsWarmup.elapsedMs}` : 'pending');
             if (!Array.isArray(xbkdata)) {
                 // 接口返回格式异常时不盲跑 for 循环，抛错让调度感知
                 throw new Error(`接口返回数据格式异常：期望数组，实际为 ${xbkdata === null ? 'null' : typeof xbkdata}`);
@@ -2234,9 +2239,10 @@ const App = {
             cacheMs = Date.now() - cacheStart;
             checkpoint('cache-write-complete', `cached=${toCache.length} cacheMs=${cacheMs}`);
 
-            // 预取收尾：记录后台预取最终状态，供 XBK_PROFILE=3 判断它是否拖慢收尾。
-            tlsWarmup = await tlsWarmupPromise;
-            checkpoint('tls-warmup-observed', tlsWarmup ? `ok=${tlsWarmup.ok} okCount=${tlsWarmup.okCount || 0}/${tlsWarmup.count || 0} elapsedMs=${tlsWarmup.elapsedMs}` : 'n/a');
+            // 预取收尾：只观察已完成结果，不等待后台预取，避免它拖慢主流程退出。
+            checkpoint('tls-warmup-observed', tlsWarmupSettled && tlsWarmup
+                ? `ok=${tlsWarmup.ok} okCount=${tlsWarmup.okCount || 0}/${tlsWarmup.count || 0} elapsedMs=${tlsWarmup.elapsedMs}`
+                : 'pending');
 
             // ⑧ 统计
             const pushMs = Date.now() - startTime;

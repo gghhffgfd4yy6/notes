@@ -889,6 +889,12 @@
 - **保持**：仍可通过 `Config.timing.pushInterval` 手动设置间隔；失败消息不写成功缓存，推送和判重语义不变。
 - **版本同步**：主脚本文件头、`package.json` 与 `package-lock.json` 已同步更新。
 
+## v3.225（后台 DNS/TLS 预热不阻塞主流程）
+
+- **优化**：DNS 预热和 TLS 预取结果改为后台记录，主流程不再在缓存写入后等待预热 Promise 完成；预热未完成时也不拖慢运行结束。
+- **保持**：预热仍与接口请求并行启动，已完成的 DNS/Keep-Alive 连接继续复用；预热失败只记录状态，不阻断推送。
+- **版本同步**：主脚本文件头、`package.json` 与 `package-lock.json` 已同步更新。
+
 ## 文档维护（不改变程序版本）
 
 - 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS 和 BUG_AUDIT 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。
