@@ -1200,6 +1200,9 @@ const MessageStore = {
             let probe = p;
             try {
                 while (probe !== root && !fs.existsSync(probe)) probe = path.dirname(probe);
+                // 已存在的路径层级必须是目录；否则 cache.dir 指向普通文件时，
+                // 后续拼接缓存文件会得到 ENOTDIR，而校验却错误放行。
+                if (!fs.lstatSync(probe).isDirectory()) return false;
                 const realProbe = fs.realpathSync(probe);
                 const resolved = path.resolve(realProbe, path.relative(probe, p));
                 return resolved !== root && resolved.startsWith(root + path.sep);
@@ -1210,7 +1213,9 @@ const MessageStore = {
         // P2 防御：cache.dir 不能通过 ..、绝对路径或符号链接逃出项目根目录；越界配置回退默认目录。
         if (realInsideRoot(candidate)) return candidate;
         const safeFallback = path.resolve(root, fallback);
-        return realInsideRoot(safeFallback) ? safeFallback : path.join(root, 'xianbaoku_cache');
+        if (realInsideRoot(safeFallback)) return safeFallback;
+        // 默认目录本身若被替换成外部符号链接，也不能原样返回；使用项目根内的应急目录。
+        return path.join(root, '.xbk_cache_safe');
     },
     _memoryCache: {},
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
@@ -1617,11 +1622,23 @@ const App = {
         return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
     },
 
-    // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
-    _writeState(filePath, state) {
-        let text;
-        try { text = JSON.stringify(state); } catch (e) {
-            console.error(`状态序列化失败 ${filePath}:`, e.message);
+    // 文件级安全检查：缓存目录安全并不等于目录内的单个文件安全。
+    // 拒绝符号链接/目录作为文件目标，避免 filter.hash/run.log 等路径跟随链接逃逸。
+    _isRegularOrMissing(filePath) {
+        try { return fs.lstatSync(filePath).isFile(); }
+        catch (e) { return e && e.code === 'ENOENT'; }
+    },
+
+    _readSafeText(filePath) {
+        try {
+            if (!fs.lstatSync(filePath).isFile()) return null;
+            return fs.readFileSync(filePath, 'utf8');
+        } catch (e) { return null; }
+    },
+
+    _writeTextAtomic(filePath, text) {
+        if (!this._isRegularOrMissing(filePath)) {
+            console.error(`拒绝写入非普通缓存文件 ${filePath}`);
             return false;
         }
         const tmpFile = filePath + '.tmp';
@@ -1631,15 +1648,29 @@ const App = {
             return true;
         } catch (e) {
             try { fs.unlinkSync(tmpFile); } catch (e2) { /* 忽略 */ }
-            console.error(`状态写入失败 ${filePath}:`, e.message);
+            console.error(`缓存文件写入失败 ${filePath}:`, e.message);
             return false;
         }
+    },
+
+    // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
+    _writeState(filePath, state) {
+        let text;
+        try { text = JSON.stringify(state); } catch (e) {
+            console.error(`状态序列化失败 ${filePath}:`, e.message);
+            return false;
+        }
+        return this._writeTextAtomic(filePath, text);
     },
 
     // 运行日志：追加一行到缓存目录 run.log（成功摘要/失败 ERROR 共用），超过 1MB 截断保留尾部（防无限增长；写失败静默不中断）
     _writeRunLog(line) {
         try {
             const logPath = path.join(MessageStore.cacheDir, 'run.log');
+            if (!this._isRegularOrMissing(logPath)) {
+                console.error(`拒绝写入非普通运行日志文件 ${logPath}`);
+                return;
+            }
             fs.appendFileSync(logPath, line, 'utf8');
             const st = fs.statSync(logPath);
             if (st.size > 1024 * 1024) {
@@ -1652,7 +1683,7 @@ const App = {
                 const last = trimmed.charCodeAt(trimmed.length - 1);
                 if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1); // 结尾孤立高代理（低代理被切掉）
                 const nl = trimmed.indexOf('\n');
-                fs.writeFileSync(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed, 'utf8');
+                this._writeTextAtomic(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed);
             }
         } catch (e) { /* 日志写失败静默（磁盘只读/权限等，不中断推送） */ }
     },
@@ -1690,7 +1721,10 @@ const App = {
                 this._alertLastAtByPath.delete(statePath);
                 lastAt = 0;
             }
-            try { lastAt = Math.max(lastAt, JSON.parse(fs.readFileSync(statePath, 'utf8')).lastAt || 0); } catch (e) { /* 无状态文件=首次 */ }
+            try {
+                const stateText = this._readSafeText(statePath);
+                if (stateText !== null) lastAt = Math.max(lastAt, JSON.parse(stateText).lastAt || 0);
+            } catch (e) { /* 无状态文件=首次 */ }
             const intervalMs = Utils.num(Config.alert.intervalMs, 3600000); // v3.167: 非法字符串'abc'曾>0比较false→0不限频轰炸（其他数值配置均num回退）
             const interval = intervalMs > 0 ? intervalMs : 0; // <=0(含-1) = 不限频（每次异常都发）
             if (interval > 0 && Date.now() - lastAt < interval) return; // 限频：间隔内不重复轰炸
@@ -1758,7 +1792,10 @@ const App = {
             }
             let state = memoryState ? normalizeState(memoryState.state) : blankState();
             if (!memoryState) {
-                try { state = normalizeState(JSON.parse(fs.readFileSync(statePath, 'utf8'))); } catch (e) { /* 无状态或损坏状态=首次 */ }
+                try {
+                    const stateText = this._readSafeText(statePath);
+                    if (stateText !== null) state = normalizeState(JSON.parse(stateText));
+                } catch (e) { /* 无状态或损坏状态=首次 */ }
             }
             // v3.155：日报日期用本地时区（原 UTC——中国用户凌晨 cron 时本地已跨天但 UTC 未跨，日报日期错位一天）
             const _d = new Date();
@@ -2002,7 +2039,8 @@ const App = {
                 const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc);
                 const hashPath = path.join(MessageStore.cacheDir, 'filter.hash');
                 let lastHash = '';
-                try { lastHash = fs.readFileSync(hashPath, 'utf8').trim(); } catch (e) { /* 首次运行无状态 */ }
+                const hashText = this._readSafeText(hashPath);
+                if (hashText !== null) lastHash = hashText.trim();
                 let filterStateReady = true;
                 if (lastHash && lastHash !== filterHash) {
                     const fp = MessageStore.getFilePath(cacheName);
@@ -2019,7 +2057,7 @@ const App = {
                 }
                 // 只有过滤缓存清理成功后才推进 hash；否则下次运行必须继续重试，避免旧 _f 永久失效。
                 if (filterStateReady) {
-                    try { fs.writeFileSync(hashPath, filterHash, 'utf8'); } catch (e) { /* 写失败静默（下次运行重新比对） */ }
+                    this._writeTextAtomic(hashPath, filterHash);
                 }
             }
             const newMessages = [];

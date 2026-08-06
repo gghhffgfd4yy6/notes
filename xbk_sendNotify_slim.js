@@ -731,8 +731,42 @@ async function reserveWxPusherOrder(channels) {
     }
 }
 
-async function acquireWxPusherSlot(channels, tried) {
+function waitWithAbort(ms, signal) {
+    return new Promise((resolve, reject) => {
+        let timer;
+        let cleaned = false;
+        const cleanup = () => {
+            if (cleaned) return;
+            cleaned = true;
+            clearTimeout(timer);
+            if (signal && typeof signal.removeEventListener === 'function') {
+                signal.removeEventListener('abort', onAbort);
+            }
+        };
+        const onAbort = () => {
+            cleanup();
+            const error = new Error('WxPusher 限频等待已取消');
+            error.code = 'ABORT_ERR';
+            reject(error);
+        };
+        timer = setTimeout(() => {
+            cleanup();
+            resolve();
+        }, Math.max(0, ms));
+        if (signal && typeof signal.addEventListener === 'function') {
+            if (signal.aborted) onAbort();
+            else signal.addEventListener('abort', onAbort, { once: true });
+        }
+    });
+}
+
+async function acquireWxPusherSlot(channels, tried, signal = null) {
     for (;;) {
+        if (signal && signal.aborted) {
+            const error = new Error('WxPusher 限频等待已取消');
+            error.code = 'ABORT_ERR';
+            throw error;
+        }
         const now = Date.now();
         let nextRelease = Infinity;
         for (let i = 0; i < channels.length; i++) {
@@ -748,7 +782,7 @@ async function acquireWxPusherSlot(channels, tried) {
         }
         // 所有未尝试应用都满窗时再等最早释放；若只有已尝试应用，交给调用方结束重试。
         if (!Number.isFinite(nextRelease)) return null;
-        await new Promise(resolve => setTimeout(resolve, Math.max(20, nextRelease - now + 10)));
+        await waitWithAbort(Math.max(20, nextRelease - now + 10), signal);
     }
 }
 
@@ -861,8 +895,9 @@ async function wxPusherNotify(text, desp, params = {}) {
     const tried = new Set();
     // 每条消息只选一个主题；只有明确收到限频拒绝时才换下一个应用重试，避免重复通知。
     const ordered = await reserveWxPusherOrder(channels);
+    const signal = params && params.signal ? params.signal : null;
     for (let attempt = 0; attempt < channels.length; attempt++) {
-        const selected = await acquireWxPusherSlot(ordered, tried);
+        const selected = await acquireWxPusherSlot(ordered, tried, signal);
         if (!selected) break;
         tried.add(wxPusherChannelKey(selected));
         try {

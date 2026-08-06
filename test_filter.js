@@ -3615,6 +3615,23 @@ await test('getFilePath 路径逃逸防护（v3.22审查11）', () => {
     assertEqual(getFilePath('normal.json').startsWith(cacheDir), true);
 });
 
+await test('cache.dir 指向普通文件 → 回退安全缓存目录而不崩溃', () => {
+    const fs = require('fs');
+    const name = 'test_cache_regular_file_dir.json';
+    const original = Config.cache.dir;
+    let p = '';
+    try {
+        Config.cache.dir = 'package.json';
+        p = getFilePath(name);
+        assertEqual(p.startsWith(path.join(__dirname, 'package.json')), false, `普通文件不能作为缓存目录: ${p}`);
+        saveBatch([{ id: 'regular-dir-safe' }], name);
+        assertEqual(readMessages(p).length, 1, '回退目录应能正常落盘缓存');
+    } finally {
+        try { fs.unlinkSync(p); } catch (e) {}
+        Config.cache.dir = original;
+    }
+});
+
 await test('pingbitime 负数/Infinity → null 不编译（v3.157: 曾落 value:0 静默关闭过滤）', () => {
     const r = compileRules({ pingbitime: '-5' });
     assertEqual(r.pingbitime, null);

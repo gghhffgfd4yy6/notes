@@ -56,16 +56,15 @@ let notifyFailAt = -1; // -1=永不失败，N=第N次调用失败
 let notifyFailString = false; // 抛非 Error(字符串)——R1：验证 pushOne catch 兜底
 let notifyDelayMs = 0;   // sendNotify 响应延迟（v3.164 #10：模拟真实网络，验证告警 await 后 exit）
 let notifyCalls = 0;
-require.cache[notifyPath].exports = {
-    sendNotify: async (text, desp) => {
-        notifyCalls++;
-        if (notifyDelayMs > 0) await new Promise(r => setTimeout(r, notifyDelayMs));
-        if (notifyFailString) throw 'push boom string'; // 字符串异常（非 Error）
-        if (notifyFail) throw new Error('push boom');
-        if (notifyFailAt > 0 && notifyCalls === notifyFailAt) throw new Error('push boom');
-        pushCalls.push({ text, desp });
-    },
+const defaultNotifySend = async (text, desp) => {
+    notifyCalls++;
+    if (notifyDelayMs > 0) await new Promise(r => setTimeout(r, notifyDelayMs));
+    if (notifyFailString) throw 'push boom string'; // 字符串异常（非 Error）
+    if (notifyFail) throw new Error('push boom');
+    if (notifyFailAt > 0 && notifyCalls === notifyFailAt) throw new Error('push boom');
+    pushCalls.push({ text, desp });
 };
+require.cache[notifyPath].exports = { sendNotify: defaultNotifySend };
 // Pusher 在主模块加载时持有这个对象引用；测试替换 sendNotify 时必须修改对象属性，
 // 仅替换 require.cache.exports 不会影响已捕获的引用。
 const notifyMock = require.cache[notifyPath].exports;
@@ -802,12 +801,7 @@ async function runWithPushMode(mode, limit, data, sendFn) {
     // 恢复默认
     Config.push.mode = 'parallel';
     Config.push.parallelLimit = 0;
-    notifyMock.sendNotify = async (text, desp) => {
-        notifyCalls++;
-        if (notifyFail) throw new Error('push boom');
-        if (notifyFailAt > 0 && notifyCalls === notifyFailAt) throw new Error('push boom');
-        pushCalls.push({ text, desp });
-    };
+    notifyMock.sendNotify = defaultNotifySend;
     require.cache[notifyPath].exports = notifyMock;
     return res;
 }
@@ -1843,11 +1837,15 @@ await test('状态文件 rename 失败 → 保留旧 JSON，不留下半写状�
 
 await test('日报发送失败 → report.state date 不重置（v3.156 #3）', async () => {
     reset();
+    const originalCacheDir = Config.cache.dir;
+    Config.cache.dir = DEFAULT_CACHE_DIR + '_report_state_isolated';
     setPushUrl('t63_report_state');
     fakeData = [makeItem({ id: 1 })];
     const orig = Config.report.enabled;
-    const statePath = path.join(CACHE_DIR, 'report.state');
+    const stateDir = path.join(__dirname, Config.cache.dir);
+    const statePath = path.join(stateDir, 'report.state');
     try {
+        fs.mkdirSync(stateDir, { recursive: true });
         Config.report.enabled = true;
         notifyFail = true; // 日报通道挂
         require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, pushed: 3, failed: 0 }));
@@ -1858,7 +1856,9 @@ await test('日报发送失败 → report.state date 不重置（v3.156 #3）', 
         assert(st.total >= 5, '本次数据应累计进旧 state(不丢)');
     } finally {
         Config.report.enabled = orig;
+        Config.cache.dir = originalCacheDir;
         try { require('fs').unlinkSync(statePath); } catch (e) { /* 忽略 */ }
+        try { fs.rmdirSync(stateDir); } catch (e) { /* 忽略 */ }
     }
 });
 
@@ -2327,6 +2327,33 @@ await test('pingbitime 配置 + 接口缺 louzhuregtime → 运行期警告（v3
     }
     assert(warns.some(w => w.includes('louzhuregtime') && w.includes('pingbitime')),
         `应有注册时间缺失警告: ${warns.join(' | ')}`);
+});
+
+await test('缓存文件级符号链接 → filter.hash/run.log 不跟随到目录外（P2 安全防护）', async () => {
+    reset();
+    setPushUrl('t_symlink_file_guard');
+    fakeData = [];
+    const os = require('os');
+    const hashPath = path.join(CACHE_DIR, 'filter.hash');
+    const logPath = path.join(CACHE_DIR, 'run.log');
+    const hashTarget = path.join(os.tmpdir(), `xbk-filter-hash-${process.pid}`);
+    const logTarget = path.join(os.tmpdir(), `xbk-run-log-${process.pid}`);
+    const oldHash = 'KEEP_HASH';
+    const oldLog = 'KEEP_LOG\\n';
+    try {
+        for (const p of [hashPath, logPath, hashTarget, logTarget]) { try { fs.unlinkSync(p); } catch (e) {} }
+        fs.writeFileSync(hashTarget, oldHash, 'utf8');
+        fs.writeFileSync(logTarget, oldLog, 'utf8');
+        fs.symlinkSync(hashTarget, hashPath);
+        fs.symlinkSync(logTarget, logPath);
+        await xbk.run();
+        assert(fs.lstatSync(hashPath).isSymbolicLink(), 'filter.hash 符号链接应被拒绝并保留');
+        assert(fs.lstatSync(logPath).isSymbolicLink(), 'run.log 符号链接应被拒绝并保留');
+        assert(fs.readFileSync(hashTarget, 'utf8') === oldHash, 'filter.hash 不应跟随符号链接写外部文件');
+        assert(fs.readFileSync(logTarget, 'utf8') === oldLog, 'run.log 不应跟随符号链接写外部文件');
+    } finally {
+        for (const p of [hashPath, logPath, hashTarget, logTarget]) { try { fs.unlinkSync(p); } catch (e) {} }
+    }
 });
 
 await test('模板含不支持占位符（{价格}等）→ 启动警告且推送不崩（v3.159）', async () => {

@@ -348,6 +348,17 @@ await test('wxpusher: 仅返回 code=1001 时仍切换备用应用', () => withC
     assert(gotCalls[1].options.json.appToken === 'AT_D', 'code=1001 无 msg 时应切换备用应用');
 }));
 
+await test('wxpusher: 限频等待收到 AbortSignal 后不再迟到发送', () => withChannels(async () => {
+    cfg.WX_pusher_channels = [{ appToken: 'AT_ABORT', topicIds: '401' }];
+    const controller = new AbortController();
+    const all = Promise.allSettled(Array.from({ length: 20 }, (_, i) => notify.sendNotify(`取消${i}`, '内容', { signal: controller.signal })));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    controller.abort();
+    await all;
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert(gotCalls.length === 19, `取消后不应发送迟到的第20条，实际 ${gotCalls.length}`);
+}));
+
 // 6b. wxpusher 内容类型自适应（v3.159：{Html内容} 模板 + Markdown 通道时 HTML 源码裸露——含 HTML 标签自动切 HTML 渲染）
 await test('wxpusher: 内容含 HTML 标签 → contentType 自动切 2(HTML)', () => withChannels(async () => {
     cfg.WX_pusher_appToken = 'AT123';
