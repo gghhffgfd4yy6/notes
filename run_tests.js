@@ -8,6 +8,7 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 
 const SUITES = [
+    { name: '延迟加载回归', file: 'test_lazy_notify.js', desc: '验证接口请求先于推送模块加载' },
     { name: '单元测试',   file: 'test_filter.js',        desc: '主代码导出函数逐函数逻辑' },
     // v3.172：集成测试走并行调度器（worker 独立缓存目录 + 失败片串行重跑）。
     // 需要完整串行验证时直接 node test_app.js（CI 即如此）

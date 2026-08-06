@@ -36,13 +36,17 @@ let notifyLoading = null;
 function getNotify() {
     if (notify) return Promise.resolve(notify);
     if (!notifyLoading) {
-        // 若调用方已同步 require 过（require.cache 命中），同步拿模块对象，避免 mock 时序差异
-        let cached = null;
-        try { cached = require('./xbk_sendNotify_slim'); } catch (e) { /* 加载失败由推送阶段真实报错 */ }
-        if (cached) { notify = cached; return Promise.resolve(notify); }
-        // 真实模式：require 是同步的，但延迟到微任务里执行——接口请求已发出，加载与网络并行，
+        // 只检查已加载的缓存，不能用 require() 探测：require() 本身会同步执行模块，
+        // 那样会在接口请求发出前加载推送模块，直接抵消延迟加载收益。
+        const notifyPath = require.resolve('./xbk_sendNotify_slim');
+        const cached = require.cache[notifyPath];
+        if (cached && cached.loaded && cached.exports) {
+            notify = cached.exports;
+            return Promise.resolve(notify);
+        }
+        // 真实模式：接口请求已发出后再在微任务中同步 require，加载与网络并行；
         // 主流程不等待它（首推前 await getNotify() 才汇合）。
-        notifyLoading = Promise.resolve().then(() => profile3Require('xbk_sendNotify_slim', () => require('./xbk_sendNotify_slim')))
+        notifyLoading = Promise.resolve().then(() => profile3Require('xbk_sendNotify_slim', () => require(notifyPath)))
             .then((mod) => { notify = mod; return notify; })
             .catch((e) => { notifyLoading = null; throw e; });
     }

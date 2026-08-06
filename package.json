@@ -9,7 +9,8 @@
     "test:filter": "node test_filter.js",
     "test:app": "node test_app_p.js",
     "test:app:serial": "node test_app.js",
-    "test:notify": "node test_notify.js"
+    "test:notify": "node test_notify.js",
+    "test:lazy": "node test_lazy_notify.js"
   },
   "dependencies": {
     "got": "11.8.6"
