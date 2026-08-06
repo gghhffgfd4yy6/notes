@@ -756,7 +756,7 @@ function wxPusherRateLimited(err) {
 }
 
 function wxPusherProfile(channel, outcome, started, timings) {
-    if (process.env.XBK_PROFILE !== '2') return;
+    if (process.env.XBK_PROFILE !== '2' && process.env.XBK_PROFILE !== '3') return;
     const elapsedMs = Date.now() - started;
     console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=${outcome} elapsedMs=${elapsedMs}`);
     if (timings && timings.phases) {
@@ -768,7 +768,7 @@ function wxPusherProfile(channel, outcome, started, timings) {
 
 function wxPusherPost(channel, text, desp, params = {}) {
     const started = Date.now();
-    if (process.env.XBK_PROFILE === '2') console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=start`);
+    if (process.env.XBK_PROFILE === '2' || process.env.XBK_PROFILE === '3') console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=start`);
     return new Promise((resolve, reject) => {
         const options = {
             ...REQUEST_OPTIONS,

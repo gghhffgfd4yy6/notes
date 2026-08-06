@@ -1,20 +1,62 @@
-//******** 线报酷推送脚本 v3.221 — HEAD 快速预取全量连接 ********
+//******** 线报酷推送脚本 v3.223 — 推送模块延迟加载 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
 
 // ============================================================
+// ⏱️ 启动性能诊断（仅 XBK_PROFILE=3 收集，不改变默认行为）
+// ============================================================
+const PROFILE3 = process.env.XBK_PROFILE === '3';
+const PROFILE3_BOOT_START = process.hrtime.bigint();
+const PROFILE3_BOOT_MARKS = [];
+function profile3NowMs() {
+    return Number(process.hrtime.bigint() - PROFILE3_BOOT_START) / 1e6;
+}
+function profile3BootMark(name) {
+    if (PROFILE3) PROFILE3_BOOT_MARKS.push({ name, ms: profile3NowMs() });
+}
+function profile3Require(name, loader) {
+    const started = profile3NowMs();
+    const value = loader();
+    if (PROFILE3) PROFILE3_BOOT_MARKS.push({ name: `require:${name}`, ms: profile3NowMs(), deltaMs: profile3NowMs() - started });
+    return value;
+}
+
+// ============================================================
 // 📦 外部依赖
 // ============================================================
-const notify = require('./xbk_sendNotify_slim');
-const fs = require('fs');
-const { fetchJson } = require('./xbk_http');
-const { prewarmDns, prewarmTls } = require('./xbk_agents');
-const path = require('path');
+// 推送模块（xbk_sendNotify_slim → got）是启动最重的依赖（约 300ms）。
+// 主流程只在真正推送前才用到它——延迟到接口返回后再加载（首推前），
+// 与接口拉取并行进行，减少冷启动路径上的串行等待。
+// 测试（test_app/test_filter）在 require 主模块前预置 require.cache mock——
+// 若模块尚未加载，延迟加载会在推送阶段才命中 mock 缓存（require.cache 已就绪），
+// 语义一致；这里保留顶层同步 require 兼容性探测：同步加载过的直接复用。
+let notify = null;
+let notifyLoading = null;
+function getNotify() {
+    if (notify) return Promise.resolve(notify);
+    if (!notifyLoading) {
+        // 若调用方已同步 require 过（require.cache 命中），同步拿模块对象，避免 mock 时序差异
+        let cached = null;
+        try { cached = require('./xbk_sendNotify_slim'); } catch (e) { /* 加载失败由推送阶段真实报错 */ }
+        if (cached) { notify = cached; return Promise.resolve(notify); }
+        // 真实模式：require 是同步的，但延迟到微任务里执行——接口请求已发出，加载与网络并行，
+        // 主流程不等待它（首推前 await getNotify() 才汇合）。
+        notifyLoading = Promise.resolve().then(() => profile3Require('xbk_sendNotify_slim', () => require('./xbk_sendNotify_slim')))
+            .then((mod) => { notify = mod; return notify; })
+            .catch((e) => { notifyLoading = null; throw e; });
+    }
+    return notifyLoading;
+}
+const fs = profile3Require('fs', () => require('fs'));
+const { fetchJson } = profile3Require('xbk_http', () => require('./xbk_http'));
+const { prewarmDns, prewarmTls } = profile3Require('xbk_agents', () => require('./xbk_agents'));
+const path = profile3Require('path', () => require('path'));
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
 // 缺 package.json 时回退 '3.x'（移植性防御）
 let PKG_VERSION = '3.x';
-try { PKG_VERSION = require('./package.json').version; } catch (e) { /* package.json 缺失时用默认 */ }
+try { PKG_VERSION = profile3Require('package.json', () => require('./package.json')).version; } catch (e) { /* package.json 缺失时用默认 */ }
+profile3BootMark('module-load-complete');
 
 // ============================================================
 // ⚙️ Config — 配置层
@@ -1479,10 +1521,14 @@ const Network = {
         // NaN → 意外只跑 1 次；小数 → 次数模糊。合法整数（默认 2）行为零变更
         // v3.158：Utils.num 转换——'5'(环境变量字符串) → 5（曾 Number.isFinite('5')=false 回退 2）
         const maxRetry = (() => { const r = Utils.num(Config.api.retry, 2); return Number.isInteger(r) && r >= 0 ? r : 2; })();
+        // v3.223：延迟加载推送模块（含 got）——与接口请求并行，主流程不必先等模块加载完成
+        getNotify().catch(() => { /* 加载失败由推送阶段真实报错，这里不阻塞接口 */ });
         for (let attempt = 0; attempt <= maxRetry; attempt++) {
+            if (PROFILE3) console.log(`[profile api attempt] start=${attempt + 1}/${maxRetry + 1}`);
             try {
                 // retry: { limit: 0 } 关闭 got 内置重试，完全交给外层手写逻辑
-                return await fetchJson(Config.api.pushUrl, {
+                const result = await fetchJson(Config.api.pushUrl, {
+
                     timeout: Utils.num(Config.api.timeout, 5000), // v3.162：字符串'5000'→5000（v3.158 转换 7 处漏了 timeout，曾回退 15s）
                     retry: { limit: 0 },
                     headers: {
@@ -1490,6 +1536,8 @@ const Network = {
                         'Accept': 'application/json',
                     },
                 });
+                if (PROFILE3) console.log(`[profile api attempt] success=${attempt + 1}/${maxRetry + 1}`);
+                return result;
             } catch (e) {
                 lastErr = e;
 
@@ -1516,7 +1564,8 @@ const Network = {
 // 📤 Pusher — 推送层
 // ============================================================
 const Pusher = {
-    async send(text, desp) {
+    // notifyModule：可选推送模块实例（延迟加载）；未传时按需加载（保持兼容/测试兜底）
+    async send(text, desp, notifyModule) {
         // R4-2：非字符串归一——undefined/null → 空串（避免模板串输出 'undefined' 文本）；数字等 String() 化
         text = text === undefined || text === null ? '' : String(text);
         desp = desp === undefined || desp === null ? '' : String(desp);
@@ -1535,9 +1584,10 @@ const Pusher = {
         // 进程退出延迟（事件循环被 keep-alive）+ 多次推送定时器堆积（资源泄漏）
         let timer;
         const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        const notifyMod = notifyModule || (notify ? notify : await getNotify());
         try {
             await Promise.race([
-                notify.sendNotify(text, desp, controller ? { signal: controller.signal } : {}),
+                notifyMod.sendNotify(text, desp, controller ? { signal: controller.signal } : {}),
                 new Promise((_, rej) => {
                     timer = setTimeout(() => {
                         if (controller) controller.abort();
@@ -1774,16 +1824,40 @@ const App = {
 
     async run() {
         const runStart = Date.now();
-        const detailedProfile = process.env.XBK_PROFILE === '2';
+        const detailedProfile = process.env.XBK_PROFILE === '2' || PROFILE3;
+        const checkpointProfile = PROFILE3;
+        const runMarks = [];
+        let lastRunMarkMs = runStart;
+        const checkpoint = (name, extra = '') => {
+            if (!checkpointProfile) return;
+            const now = Date.now();
+            runMarks.push({ name, atMs: now - runStart, deltaMs: now - lastRunMarkMs, extra });
+            lastRunMarkMs = now;
+        };
+        const dumpCheckpoints = () => {
+            if (!checkpointProfile) return;
+            console.log('  [profile checkpoints]');
+            for (const mark of runMarks) {
+                console.log(`    ${mark.name}: +${mark.atMs}ms (delta ${mark.deltaMs}ms)${mark.extra ? ` ${mark.extra}` : ''}`);
+            }
+            console.log('  [profile boot]');
+            for (const mark of PROFILE3_BOOT_MARKS) {
+                const delta = mark.deltaMs === undefined ? '' : ` (delta ${Math.round(mark.deltaMs)}ms)`;
+                console.log(`    ${mark.name}: +${Math.round(mark.ms)}ms${delta}`);
+            }
+        };
         let fetchMs = null;
         let preprocessMs = null;
         let cacheMs = null;
         let dnsWarmup = null;
         let tlsWarmup = null;
         console.debug('开始获取线报酷数据...');
+        checkpoint('run-start');
 
         MessageStore.init();
+        checkpoint('cache-init');
         this._warnLowDisk();
+        checkpoint('disk-check');
 
         try {
             // ① 校验配置
@@ -1844,20 +1918,25 @@ const App = {
                     console.warn(`⚠️ 配置「${name}」为「${display}」不是有效值，已按内部防御逻辑处理（建议修正）`);
                 }
             }
+            checkpoint('config-validated');
 
             // ② 预编译规则（只执行一次）
             const compiledRules = RuleEngine.compileRules(Config.filter);
+            checkpoint('rules-compiled');
 
             // ③ 拉取数据：同时预解析 WxPusher 域名并后台预建 HTTPS 连接。
             // 预取不 await——推送开始后能复用多少就复用多少，绝不因预取未完成而阻塞主流程。
             const dnsWarmupPromise = prewarmDns('wxpusher.zjiecode.com');
+            checkpoint('warmup-started', `tlsCount=${(() => { const pl = Utils.num(Config.push.parallelLimit, 10); return pl > 0 ? Math.min(Math.floor(pl), 10) : 10; })()}`);
             // HEAD 预取：连接数与并发窗口对齐，全部第一批请求可复用；预取快于接口时不阻塞、无收尾等待。
             const prewarmCount = (() => { const pl = Utils.num(Config.push.parallelLimit, 10); return pl > 0 ? Math.min(Math.floor(pl), 10) : 10; })();
             const tlsWarmupPromise = prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount);
             const fetchStart = Date.now();
             const xbkdata = await Network.fetchData();
             fetchMs = Date.now() - fetchStart;
+            checkpoint('api-fetch-complete', `items=${Array.isArray(xbkdata) ? xbkdata.length : 'invalid'} fetchMs=${fetchMs}`);
             dnsWarmup = await dnsWarmupPromise;
+            checkpoint('dns-warmup-observed', dnsWarmup ? `ok=${dnsWarmup.ok} elapsedMs=${dnsWarmup.elapsedMs}` : 'n/a');
             if (!Array.isArray(xbkdata)) {
                 // 接口返回格式异常时不盲跑 for 循环，抛错让调度感知
                 throw new Error(`接口返回数据格式异常：期望数组，实际为 ${xbkdata === null ? 'null' : typeof xbkdata}`);
@@ -2004,6 +2083,7 @@ const App = {
                 }
             }
             filteredCount += (beforeKwd - items.length);
+            checkpoint('data-processed', `items=${items.length} dedup=${dedupCount} filtered=${filteredCount} bad=${badElementCount}`);
 
             // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/8 分钟运行；正常 ~20 条无影响）
             // maxPerRun 必须是正整数；小数先取整可能变成 0（如 0.5），会静默跳过全部推送，非法值统一回退默认
@@ -2019,6 +2099,10 @@ const App = {
             }
 
             // ⑥ 推送（sequential=顺序逐条 / parallel=并行滑动窗口；失败不中断、不写缓存，下次重试）
+            const pushModeForProfile = (() => {
+                try { return String(Config.push && Config.push.mode); } catch (e) { return '<不可转换值>'; }
+            })();
+            checkpoint('push-start', `count=${items.length} mode=${pushModeForProfile}`);
             const startTime = Date.now();
             preprocessMs = startTime - runStart - (fetchMs || 0);
             const keyOf = (it) => Utils.hasValidId(it) ? `id:${it.id}` : `url:${Utils.normUrl(it.url)}`;
@@ -2043,7 +2127,7 @@ const App = {
             const contentMax = (() => { const v = Utils.num(Config.push.contentMax, 3000); return v > 0 ? v : 3000; })();
 
             // 单条推送（两种模式共用）：成功返回 {ok:true} 并记录；失败警告且不写缓存(下次重试)
-            const pushOne = async (item) => {
+            const pushOne = async (item, notifyModule) => {
                 // 推送内容截断：避免超长标题/内容被推送 API 拒绝（长度可配置，默认 100/3000）
                 // 用 UTF-16 安全截断（不切断 emoji 代理对）
                 // R9：title/content 非字符串（对象等脏数据）→ 空标题占位/空内容（避免 '[object Object]' 泄漏）
@@ -2077,7 +2161,7 @@ const App = {
                     }
                 }
                 try {
-                    await Pusher.send(text, desp);
+                    await Pusher.send(text, desp, notifyModule);
                     pushedKeys.add(keyOf(item));
                     // v3.159：推送成功 → 清除过滤写入标记（否则 _f 随对象写回缓存，下次规则变更又误清）
                     delete item._f;
@@ -2088,6 +2172,10 @@ const App = {
                     return { item, ok: false };
                 }
             };
+
+            // v3.223：推送模块（含 got）已与接口并行加载，首推前确保完成（接口快时最多等剩余加载时间）
+            const notifyModule = await getNotify();
+            checkpoint('notify-module-loaded');
 
             let successCount = 0;
             // push.mode 非法值提示（防静默降级：用户配 'PARALLEL' 等会按顺序执行）
@@ -2104,7 +2192,7 @@ const App = {
                     while (true) {
                         const index = nextIndex++;
                         if (index >= items.length) return;
-                        results[index] = await pushOne(items[index]);
+                        results[index] = await pushOne(items[index], notifyModule);
                         // 保留可配置的补位间隔，但不等待同批其他慢任务；pushInterval=0 即完成即补。
                         if (nextIndex < items.length) {
                             await new Promise(r => setTimeout(r, Utils.num(Config.timing.pushInterval, 10)));
@@ -2120,11 +2208,12 @@ const App = {
             } else {
                 // 顺序推送（默认）：逐条 await + 间隔
                 for (const item of items) {
-                    const r = await pushOne(item);
+                    const r = await pushOne(item, notifyModule);
                     if (r.ok) { successCount++; console.log(`发现到新数据：${item.title}【${item.catename}】${urlOf(item)}`); }
                     await new Promise(r2 => setTimeout(r2, Utils.num(Config.timing.pushInterval, 10)));
                 }
             }
+            checkpoint('push-complete', `success=${successCount} failed=${items.length - successCount}`);
 
             // ⑦ 写缓存：只收录「被过滤的数据」+「推送成功的数据」
             //    推送失败的排除在外 → 下次运行重新推送（避免消息永久丢失）
@@ -2134,10 +2223,11 @@ const App = {
             const cacheStart = Date.now();
             MessageStore.saveBatch(toCache, cacheName);
             cacheMs = Date.now() - cacheStart;
+            checkpoint('cache-write-complete', `cached=${toCache.length} cacheMs=${cacheMs}`);
 
-            // 预取收尾：推送已完成，等待后台预取结束（正常早已完成，零等待），
-            // 避免进程退出时挂起未完成的预取请求。
+            // 预取收尾：记录后台预取最终状态，供 XBK_PROFILE=3 判断它是否拖慢收尾。
             tlsWarmup = await tlsWarmupPromise;
+            checkpoint('tls-warmup-observed', tlsWarmup ? `ok=${tlsWarmup.ok} okCount=${tlsWarmup.okCount || 0}/${tlsWarmup.count || 0} elapsedMs=${tlsWarmup.elapsedMs}` : 'n/a');
 
             // ⑧ 统计
             const pushMs = Date.now() - startTime;
@@ -2159,6 +2249,7 @@ const App = {
                     console.log(`  [profile detail] DNS预热: ${warmupText} | TLS预取: ${tlsText} | 预处理: ${(Math.max(0, preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(Config.timing.finalWait, 0) / 1000).toFixed(3)}s`);
                 }
             }
+            dumpCheckpoints();
             console.log('══════════════════════════════');
             await new Promise(r => setTimeout(r, Utils.num(Config.timing.finalWait, 0)));
 
@@ -2197,6 +2288,7 @@ const App = {
             } else {
                 console.log('请求错误:', errMsg);
             }
+            dumpCheckpoints();
             // 失败也写运行日志（cron 可回溯失败原因；错误信息去换行避免破坏日志行）
             this._writeRunLog(`${this._localStamp()} ERROR ${String(errMsg).replace(/[\r\n]+/g, ' ')}\n`);
             // v3.123：接口异常告警（限频 + 静默，不影响主流程）
