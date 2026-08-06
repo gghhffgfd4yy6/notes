@@ -23,7 +23,7 @@
 
 | 层 | 内容 | 关键内容 |
 |---|---|---|
-| **Config** | 全部配置 | domain/api(超时/重试)/filter(过滤字段)/keyword/timing/push(顺序并行)/cache(maxSize) |
+| **Config** | 全部配置 | domain/api(超时/重试)/filter(过滤字段)/keyword/timing/push(顺序并行)/cache(maxSize)/storage(磁盘余量告警) |
 | **常量** | 魔法数 | DAY_MS/TS_BOUND/MAX_CODE_POINT/SURROGATE/DEFAULT_MAX_SIZE/FILTER_FIELDS |
 | **Utils** | 工具函数 | daysComputed(日期/时间戳/ISO/紧凑日期)/normUrl(归一化+幂等)/hasValidId/isValidItem/anonKey(合成id)/decodeHtmlEntities(实体+数字+emoji)/daysFrom/_decodeNumeric |
 | **Formatter** | 格式化纯函数 | htmlToMarkdown(正则链+短路)/tuisong_replace(占位符替换+惰性)/_finalizeMd |
@@ -56,6 +56,7 @@ Config.push.contentMax     // 推送内容最终长度上限(非法回退默认)
 Config.template.title      // 推送标题模板(默认【{分类名}】{标题},支持全部占位符)
 Config.template.content    // 推送内容模板(默认{Markdown内容})
 Config.cache.maxSize       // 缓存上限(滚动淘汰)
+Config.storage.minFreeBytes // 磁盘余量告警阈值（只告警，不阻断推送）
 ```
 
 **注意**:文件头版本号由版本一致性测试自动校验（与 CHANGELOG 最新/package.json 的一致性自动校验）——版本更新时无需手动核对文档;`require.main === module` 时才自动运行(被 require 时不跑)。

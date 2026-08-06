@@ -61,7 +61,7 @@
 
 | 层 | 职责 | 设计要点 |
 |---|---|---|
-| **Config** | 全部配置 + 默认值 | `pushUrl` 是 getter：domain 尾斜杠防御 + 非字符串回退空串——**运行时读，动态生效** |
+| **Config** | 全部配置 + 默认值 | `pushUrl` 是 getter：domain 尾斜杠防御 + 非字符串回退空串——**运行时读，动态生效**；storage 提供可选磁盘余量告警 |
 | **Utils** | 纯函数工具 | 无状态、无副作用；parseTime / normUrl / anonKey / filterHash / truncateUtf16 / num |
 | **Formatter** | 纯函数格式化 | htmlToMarkdown 正则链 + 短路优化；tuisong_replace 占位符惰性计算 |
 | **RuleEngine** | 规则预编译 + 校验 | compileRules 启动时一次编译；hasNestedQuantifier 的 ReDoS 防护；validateConfig 与 compileRules 同口径 |
@@ -150,7 +150,7 @@ toCache = newMessages 中：
 
 ### 5.2 原子写（saveMessages）
 
-tmp 文件写入 + rename——崩溃/并发时不会留下半写文件；失败清理 tmp 不中断主流程；序列化失败（循环引用）保留内存缓存不落盘。
+tmp 文件写入 + rename——崩溃/并发时不会留下半写文件；失败清理 tmp 不中断主流程；序列化、写入或 rename 失败时恢复写入前的内存快照，只有成功落盘才更新内存缓存。
 
 ### 5.3 maxSize
 
@@ -259,14 +259,16 @@ fetchData 失败/格式异常 → run() catch
 ### 9.2 告警（_sendAlert）
 
 - 接口挂/密钥失效/推送全失败时通知本人（v3.123/v3.163）。
-- 限频：alert.state 记录 lastAt，**发送成功才写**（失败不写 → 下次可重试）。
+- 限频：alert.state 记录 lastAt，**发送成功才写**（失败不写 → 下次可重试）。状态文件写入失败时保留进程内限频，并提示持久化失败。
 - enabled 支持 false/0/'false'/'0' 全部关闭（v3.173/174）。
+- 缓存所在文件系统余量低于 `Config.storage.minFreeBytes` 时只告警，不阻断主流程；平台不支持余量查询时跳过。
 
 ### 9.3 日报（_updateReport）
 
 - 跨天发"昨日日报"；当天累加。
 - 发送成功才重置日期（失败保留昨日 → 下次重试，v3.156）。
 - **pending 机制**（v3.176）：昨日日报失败期间，今日数据暂存 pending，成功时并入新的一天——不丢、不错标。
+- 状态文件写入失败时保留进程内日报状态，避免同一进程重复发送；重启后仍依据磁盘状态重试。
 - 日报日期本地时区（v3.155）。
 
 ### 9.4 运行日志（_writeRunLog）
@@ -298,7 +300,7 @@ fetchData 失败/格式异常 → run() catch
 | Timer | 所有 setTimeout 必须可清理：Pusher race clearTimeout；got totalTimer 全路径 clearTimeout |
 | Promise | 所有 async 调用必须有处理：allSettled/race loser 有 handler；fire-and-forget（告警/日报）内部 .catch |
 | 文件 | 原子写（tmp+rename）；失败清理 tmp；日志写失败静默不中断主流程 |
-| 缓存目录 | init 自动创建；目录可随时清空（下次运行重建）；filter.hash/alert.state/report.state/run.log 均在其中 |
+| 缓存目录 | init 自动创建；目录可随时清空（下次运行重建）；filter.hash/alert.state/report.state/run.log 均在其中；可选 statfs 余量监测只告警不阻断 |
 | Buffer/body | 官方 got 负责 HTTP 传输；`xbk_http.fetchJson()` 流式限制响应体大小并解析 JSON，业务层继续校验数组形态 |
 | 进程 | 成功路径自然退出（等 pending socket）；失败路径 exit(1) 前 await 告警 |
 
