@@ -648,7 +648,8 @@ function looksHtml(s) {
 
 // WxPusher 默认窗口：每个 appToken 单独维护，避免多应用分流时把两个额度混成一个。
 const WXPUSHER_WINDOW_MS = 10000;
-const WXPUSHER_WINDOW_LIMIT = 20;
+// 服务端窗口存在边界/传输时序误差，留一个请求安全余量，减少真实并发时的 1001 限频响应。
+const WXPUSHER_WINDOW_LIMIT = 19;
 const wxPusherWindows = new Map();
 let wxPusherRoundRobin = 0;
 let wxPusherChannelSignature = '';

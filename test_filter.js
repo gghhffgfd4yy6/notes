@@ -3733,7 +3733,7 @@ await test('推送模块无通道 → reject 不静默成功（审查6-2）', as
     const notify = require('./xbk_sendNotify_slim.js');
     // 临时清空所有通道（不受本地配置影响），验证无通道时 reject
     const orig = { ...notify.push_config };
-    const channelKeys = ['BARK_PUSH','QYWX_KEY','WX_pusher_appToken','WX_XIZHI_KEY','DEER_KEY','PUSH_KEY','PUSHME_KEY'];
+    const channelKeys = ['BARK_PUSH','QYWX_KEY','WX_pusher_appToken','WX_pusher_channels','WX_XIZHI_KEY','DEER_KEY','PUSH_KEY','PUSHME_KEY'];
     channelKeys.forEach(k => { notify.push_config[k] = ''; });
     let rejected = false;
     try { await notify.sendNotify('标题', '内容'); } catch (e) { rejected = true; }
