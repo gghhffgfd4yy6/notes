@@ -274,12 +274,12 @@ const $ = {
                 } catch (error) {
                     // 预期路径：非 JSON 响应（HTML/文本）保留原始字符串，供各通道按需解析
                 }
-                callback(null, res, body);
+                callback(null, res, body, res.timings);
             },
             (err) => {
                 // v3.75：失败时传 Error 对象而非响应体——API 异常响应体可能回显请求参数（含密钥），
                 // 且各通道失败日志已统一 safeErr 摘要（打 message 不含响应内容）
-                callback(err || new Error('请求失败'));
+                callback(err || new Error('请求失败'), null, null, err && err.timings);
             },
         );
     },
@@ -755,9 +755,15 @@ function wxPusherRateLimited(err) {
     return /1001|速度太快|10秒内访问超过20次|限流|限频/i.test(text);
 }
 
-function wxPusherProfile(channel, outcome, started) {
+function wxPusherProfile(channel, outcome, started, timings) {
     if (process.env.XBK_PROFILE !== '2') return;
-    console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=${outcome} elapsedMs=${Date.now() - started}`);
+    const elapsedMs = Date.now() - started;
+    console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=${outcome} elapsedMs=${elapsedMs}`);
+    if (timings && timings.phases) {
+        const p = timings.phases;
+        const n = (v) => Number.isFinite(v) ? Math.round(v) : 'n/a';
+        console.log(`[profile wxpusher timing] app=***${safeString(channel.appToken).slice(-4)} wait=${n(p.wait)} dns=${n(p.dns)} tcp=${n(p.tcp)} tls=${n(p.tls)} request=${n(p.request)} firstByte=${n(p.firstByte)} download=${n(p.download)} total=${n(p.total)}`);
+    }
 }
 
 function wxPusherPost(channel, text, desp, params = {}) {
@@ -779,19 +785,19 @@ function wxPusherPost(channel, text, desp, params = {}) {
             headers: { 'Content-Type': 'application/json' },
             timeout,
         };
-        $.post(options, (err, resp, data) => {
+        $.post(options, (err, resp, data, timings) => {
             try {
                 if (err) {
-                    wxPusherProfile(channel, 'network_error', started);
+                    wxPusherProfile(channel, 'network_error', started, timings);
                     console.log('WxPusher发送通知消息失败😞\n', safeErr(err));
                     reject(err);
                 } else if (data && isCode(data.code, 1000)) {
-                    wxPusherProfile(channel, 'success', started);
+                    wxPusherProfile(channel, 'success', started, timings);
                     console.log('WxPusher发送通知消息成功🎉。\n');
                     resolve(data);
                 } else {
                     const outcome = data && isCode(data.code, 1001) ? 'rate_limited' : 'api_error';
-                    wxPusherProfile(channel, outcome, started);
+                    wxPusherProfile(channel, outcome, started, timings);
                     console.log(`WxPusher发送通知消息异常\n`);
                     console.log(safeErr(data));
                     reject(new Error(data && data.msg ? safeErr(data.msg) : 'wxpusher 发送失败'));
