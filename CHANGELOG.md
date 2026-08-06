@@ -831,6 +831,16 @@
 - **适用**：线报接口和各推送通道共用该 DNS 缓存；成功解析短期复用，解析失败只短暂缓存；不依赖网卡枚举，兼容受限 Android/沙箱环境。
 - **保持**：Keep-Alive、HTTP 分阶段测速、推送超时取消和滑动窗口行为不变。
 
+## v3.215（IPv4/IPv6 路径对比）
+
+- **新增**：支持通过 `XBK_DNS_FAMILY=4` 或 `XBK_DNS_FAMILY=6` 强制选择 IPv4/IPv6；未设置时保持自动选择。
+- **用途**：用于对比 DNS、TCP、TLS 阶段耗时，定位具体网络地址族路径问题；默认行为不变。
+
+## v3.216（DNS 地址族配置兼容）
+
+- **修复**：IPv4/IPv6 对比改用官方 got 支持的 `dnsLookupIpVersion`，不再触发废弃的 `options.family` 警告。
+- **保持**：`XBK_DNS_FAMILY=4/6` 的配置语义不变，未设置时仍自动选择。
+
 ## 文档维护（不改变程序版本）
 
 - 统一 README、FILE_INDEX、SYSTEM_CONTRACT、REVIEW_DECISIONS 和 BUG_AUDIT 对当前入口、测试调度方式、维护阶段状态及验证口径的说明。

@@ -5,6 +5,9 @@ const http = require('http');
 const https = require('https');
 const dns = require('dns');
 
+// DNS 地址族：默认 auto；XBK_DNS_FAMILY=4/6 可用于对比 IPv4/IPv6 路径。
+const DNS_LOOKUP_IP_VERSION = process.env.XBK_DNS_FAMILY === '4' ? 'ipv4' : process.env.XBK_DNS_FAMILY === '6' ? 'ipv6' : '';
+
 const AGENTS = {
     http: new http.Agent({ keepAlive: true, maxSockets: 20, maxFreeSockets: 20, keepAliveMsecs: 1000 }),
     https: new https.Agent({ keepAlive: true, maxSockets: 20, maxFreeSockets: 20, keepAliveMsecs: 1000 }),
@@ -42,4 +45,4 @@ function dnsLookup(hostname, options, callback) {
     });
 }
 
-module.exports = { AGENTS, DNS_CACHE: null, dnsLookup };
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, DNS_CACHE: null, dnsLookup };
