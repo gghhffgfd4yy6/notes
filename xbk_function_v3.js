@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.218 — 收尾等待归零 ********
+//******** 线报酷推送脚本 v3.219 — WxPusher TLS 并行预取 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -9,7 +9,7 @@
 const notify = require('./xbk_sendNotify_slim');
 const fs = require('fs');
 const { fetchJson } = require('./xbk_http');
-const { prewarmDns } = require('./xbk_agents');
+const { prewarmDns, prewarmTls } = require('./xbk_agents');
 const path = require('path');
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
 // 缺 package.json 时回退 '3.x'（移植性防御）
@@ -1779,6 +1779,7 @@ const App = {
         let preprocessMs = null;
         let cacheMs = null;
         let dnsWarmup = null;
+        let tlsWarmup = null;
         console.debug('开始获取线报酷数据...');
 
         MessageStore.init();
@@ -1847,12 +1848,15 @@ const App = {
             // ② 预编译规则（只执行一次）
             const compiledRules = RuleEngine.compileRules(Config.filter);
 
-            // ③ 拉取数据：同时预解析 WxPusher 域名，把冷 DNS 等待与线报接口请求重叠。
+            // ③ 拉取数据：同时预解析 WxPusher 域名并预建 HTTPS 连接，
+            // 把冷 DNS/TLS 等待与线报接口请求重叠，推送时直接复用 Keep-Alive 连接。
             const dnsWarmupPromise = prewarmDns('wxpusher.zjiecode.com');
+            const tlsWarmupPromise = prewarmTls('wxpusher.zjiecode.com', 5000, 3);
             const fetchStart = Date.now();
             const xbkdata = await Network.fetchData();
             fetchMs = Date.now() - fetchStart;
             dnsWarmup = await dnsWarmupPromise;
+            tlsWarmup = await tlsWarmupPromise;
             if (!Array.isArray(xbkdata)) {
                 // 接口返回格式异常时不盲跑 for 循环，抛错让调度感知
                 throw new Error(`接口返回数据格式异常：期望数组，实际为 ${xbkdata === null ? 'null' : typeof xbkdata}`);
@@ -2146,7 +2150,8 @@ const App = {
                 console.log(`  [profile] 接口: ${fetchMs === null ? 'n/a' : (fetchMs / 1000).toFixed(3) + 's'} | 推送: ${(pushMs / 1000).toFixed(3) + 's'} | 总计: ${(totalMs / 1000).toFixed(3) + 's'}`);
                 if (detailedProfile) {
                     const warmupText = dnsWarmup ? `${dnsWarmup.ok ? '成功' : '失败'} ${(dnsWarmup.elapsedMs / 1000).toFixed(3)}s${dnsWarmup.family ? ` IPv${dnsWarmup.family}` : ''}` : 'n/a';
-                    console.log(`  [profile detail] DNS预热: ${warmupText} | 预处理: ${(Math.max(0, preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(Config.timing.finalWait, 0) / 1000).toFixed(3)}s`);
+                    const tlsText = tlsWarmup ? `${tlsWarmup.okCount}/${tlsWarmup.count} 成功 ${(tlsWarmup.elapsedMs / 1000).toFixed(3)}s` : 'n/a';
+                    console.log(`  [profile detail] DNS预热: ${warmupText} | TLS预取: ${tlsText} | 预处理: ${(Math.max(0, preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(Config.timing.finalWait, 0) / 1000).toFixed(3)}s`);
                 }
             }
             console.log('══════════════════════════════');

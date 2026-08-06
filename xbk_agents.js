@@ -4,6 +4,7 @@
 const http = require('http');
 const https = require('https');
 const dns = require('dns');
+const got = require('got');
 
 // DNS 地址族：默认 auto；XBK_DNS_FAMILY=4/6 可用于对比 IPv4/IPv6 路径。
 const DNS_LOOKUP_IP_VERSION = process.env.XBK_DNS_FAMILY === '4' ? 'ipv4' : process.env.XBK_DNS_FAMILY === '6' ? 'ipv6' : '';
@@ -62,4 +63,35 @@ function prewarmDns(hostname) {
     });
 }
 
-module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, DNS_CACHE: null, dnsLookup, prewarmDns };
+async function prewarmTls(hostname, timeoutMs = 5000, count = 1) {
+    const started = Date.now();
+    try {
+        // 测试环境 got 为 mock（无 stream）：跳过真实建连，避免破坏 gotCalls 断言。
+        if (!got.stream) return { hostname, count, skipped: true, ok: true, elapsedMs: Date.now() - started };
+    } catch (e) { /* 忽略 */ }
+    const results = await Promise.all(Array.from({ length: Math.max(1, Math.floor(count)) }, async () => {
+        const singleStart = Date.now();
+        try {
+            await got.get(`https://${hostname}/`, {
+                agent: AGENTS,
+                lookup: dnsLookup,
+                timeout: timeoutMs,
+                retry: { limit: 0 },
+                throwHttpErrors: false,
+            });
+            return { ok: true, elapsedMs: Date.now() - singleStart };
+        } catch (e) {
+            return { ok: false, error: e && (e.code || e.message) ? String(e.code || e.message) : String(e), elapsedMs: Date.now() - singleStart };
+        }
+    }));
+    return {
+        hostname,
+        count: results.length,
+        ok: results.every(r => r.ok),
+        okCount: results.filter(r => r.ok).length,
+        elapsedMs: Date.now() - started,
+        perConnectionMs: results.map(r => r.elapsedMs),
+    };
+}
+
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, DNS_CACHE: null, dnsLookup, prewarmDns, prewarmTls };

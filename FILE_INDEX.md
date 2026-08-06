@@ -19,7 +19,7 @@
 → 运行日志 + 告警/日报 → 失败重抛(exit 1)
 ```
 
-**性能诊断**:`XBK_PROFILE=1` 输出阶段摘要；`XBK_PROFILE=2` 额外输出 DNS 预热、预处理、缓存写入、收尾等待及每个 WxPusher 请求的 wait/dns/tcp/tls/request/firstByte/download 分阶段耗时。`XBK_DNS_FAMILY=4/6` 可强制对比 IPv4/IPv6 路径（默认自动）。
+**性能诊断**:`XBK_PROFILE=1` 输出阶段摘要；`XBK_PROFILE=2` 额外输出 DNS 预热、TLS 预取、预处理、缓存写入、收尾等待及每个 WxPusher 请求的 wait/dns/tcp/tls/request/firstByte/download 分阶段耗时。`XBK_DNS_FAMILY=4/6` 可强制对比 IPv4/IPv6 路径（默认自动）。启动时并行预热 WxPusher DNS 并预建 3 个 HTTPS 连接，与线报接口请求重叠。
 
 **分层结构**:
 
