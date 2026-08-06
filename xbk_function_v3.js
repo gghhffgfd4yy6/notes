@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.219 — WxPusher TLS 并行预取 ********
+//******** 线报酷推送脚本 v3.220 — TLS 后台预取不阻塞推送 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1848,15 +1848,14 @@ const App = {
             // ② 预编译规则（只执行一次）
             const compiledRules = RuleEngine.compileRules(Config.filter);
 
-            // ③ 拉取数据：同时预解析 WxPusher 域名并预建 HTTPS 连接，
-            // 把冷 DNS/TLS 等待与线报接口请求重叠，推送时直接复用 Keep-Alive 连接。
+            // ③ 拉取数据：同时预解析 WxPusher 域名并后台预建 HTTPS 连接。
+            // 预取不 await——推送开始后能复用多少就复用多少，绝不因预取未完成而阻塞主流程。
             const dnsWarmupPromise = prewarmDns('wxpusher.zjiecode.com');
             const tlsWarmupPromise = prewarmTls('wxpusher.zjiecode.com', 5000, 3);
             const fetchStart = Date.now();
             const xbkdata = await Network.fetchData();
             fetchMs = Date.now() - fetchStart;
             dnsWarmup = await dnsWarmupPromise;
-            tlsWarmup = await tlsWarmupPromise;
             if (!Array.isArray(xbkdata)) {
                 // 接口返回格式异常时不盲跑 for 循环，抛错让调度感知
                 throw new Error(`接口返回数据格式异常：期望数组，实际为 ${xbkdata === null ? 'null' : typeof xbkdata}`);
@@ -2133,6 +2132,10 @@ const App = {
             const cacheStart = Date.now();
             MessageStore.saveBatch(toCache, cacheName);
             cacheMs = Date.now() - cacheStart;
+
+            // 预取收尾：推送已完成，等待后台预取结束（正常早已完成，零等待），
+            // 避免进程退出时挂起未完成的预取请求。
+            tlsWarmup = await tlsWarmupPromise;
 
             // ⑧ 统计
             const pushMs = Date.now() - startTime;

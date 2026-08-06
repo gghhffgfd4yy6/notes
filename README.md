@@ -201,4 +201,4 @@ CHANGELOG.md              版本演进
 - `.git/objects` 下文件**绝不凭文件名判断"临时"就删除**——先 `git cat-file` / `git fsck` 验证
 - 本脚本**设计为单实例运行**（青龙单实例）：多实例并发不保证"最多推送一次"（见 SYSTEM_CONTRACT §10）
 
-**性能诊断**：`XBK_PROFILE=1` 输出接口/推送/总计；`XBK_PROFILE=2` 输出 DNS 预热、TLS 预取、预处理、缓存写入、收尾等待和每个 WxPusher 请求的 wait/dns/tcp/tls/request/firstByte/download 分阶段耗时（不改变默认运行行为）。`XBK_DNS_FAMILY=4/6` 可强制对比 IPv4/IPv6 路径，默认自动。启动时并行预热 WxPusher DNS 并预建 3 个 HTTPS 连接，与线报接口请求重叠，推送时直接复用，减少冷启动 DNS/TLS 等待。
+**性能诊断**：`XBK_PROFILE=1` 输出接口/推送/总计；`XBK_PROFILE=2` 输出 DNS 预热、TLS 预取、预处理、缓存写入、收尾等待和每个 WxPusher 请求的 wait/dns/tcp/tls/request/firstByte/download 分阶段耗时（不改变默认运行行为）。`XBK_DNS_FAMILY=4/6` 可强制对比 IPv4/IPv6 路径，默认自动。启动时并行预热 WxPusher DNS 并在后台预建 3 个 HTTPS 连接（不阻塞推送，推送时能复用就复用），减少冷启动 DNS/TLS 等待。
