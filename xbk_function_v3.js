@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.209 — 并行推送滑动窗口 ********
+//******** 线报酷推送脚本 v3.210 — 并行推送补位间隔调整 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -50,7 +50,7 @@ const Config = {
     },
 
     timing: {
-        pushInterval: 100,
+        pushInterval: 10,
         finalWait: 200,
     },
 
@@ -2087,7 +2087,7 @@ const App = {
                         results[index] = await pushOne(items[index]);
                         // 保留可配置的补位间隔，但不等待同批其他慢任务；pushInterval=0 即完成即补。
                         if (nextIndex < items.length) {
-                            await new Promise(r => setTimeout(r, Utils.num(Config.timing.pushInterval, 100)));
+                            await new Promise(r => setTimeout(r, Utils.num(Config.timing.pushInterval, 10)));
                         }
                     }
                 };
@@ -2102,7 +2102,7 @@ const App = {
                 for (const item of items) {
                     const r = await pushOne(item);
                     if (r.ok) { successCount++; console.log(`发现到新数据：${item.title}【${item.catename}】${urlOf(item)}`); }
-                    await new Promise(r2 => setTimeout(r2, Utils.num(Config.timing.pushInterval, 100)));
+                    await new Promise(r2 => setTimeout(r2, Utils.num(Config.timing.pushInterval, 10)));
                 }
             }
 
