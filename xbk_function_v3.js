@@ -1316,7 +1316,17 @@ const MessageStore = {
 
     readMessages(filePath) {
         // R5-2：hasOwnProperty 读取（'__proto__' 直读会返回 Object.prototype 而非缓存值）
-        if (Object.prototype.hasOwnProperty.call(this._memoryCache, filePath)) return this._memoryCache[filePath];
+        if (Object.prototype.hasOwnProperty.call(this._memoryCache, filePath)) {
+            // 常驻进程保护：外部误删缓存文件时，内存中的权威快照继续用于判重，
+            // 并尝试原子恢复磁盘文件，避免进程重启后持久化去重状态丢失。
+            let exists = true;
+            try { exists = fs.existsSync(filePath); } catch (e) { exists = true; }
+            if (!exists) {
+                const restored = this.saveMessages(filePath, this._memoryCache[filePath]);
+                if (!restored) console.warn(`缓存文件缺失且恢复失败，继续使用内存缓存：${filePath}`);
+            }
+            return this._memoryCache[filePath];
+        }
         this._ensureFileExists(filePath);
         try {
             const data = JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
@@ -1526,12 +1536,32 @@ const Network = {
      */
     async fetchData() {
         let lastErr;
+        // v3.223：延迟加载推送模块（含 got）——与接口请求并行，主流程不必先等模块加载完成
+        getNotify().catch(() => { /* 加载失败由推送阶段真实报错，这里不阻塞接口 */ });
+        // 线报接口 DNS 与实际请求共用 xbk_agents.dnsLookup：提前启动解析，
+        // 若请求随后进入同一主机，dnsLookup 会合并到同一个 pending 查询，
+        // 不增加额外 HTTP 请求，也不阻塞请求启动。
+        try {
+            const apiHost = new URL(Config.api.pushUrl).hostname;
+            if (apiHost) {
+                Promise.resolve(prewarmDns(apiHost))
+                    .then((result) => {
+                        if (PROFILE3) console.log(`[profile api dns-prewarm] host=${apiHost} ok=${result.ok} elapsedMs=${result.elapsedMs} family=${result.family || 'auto'}`);
+                        return result;
+                    })
+                    .catch((error) => {
+                        if (PROFILE3) console.log(`[profile api dns-prewarm] host=${apiHost} ok=false error=${error && (error.code || error.message) ? error.code || error.message : String(error)}`);
+                        return null;
+                    });
+            }
+        } catch (e) {
+            if (PROFILE3) console.log(`[profile api dns-prewarm] skipped reason=${e && e.message ? e.message : String(e)}`);
+        }
         // R4-1：retry 非法值有界兜底——Infinity 会让 `attempt <= retry` 死循环重试（validateConfig 只警告不阻止）；
+
         // NaN → 意外只跑 1 次；小数 → 次数模糊。合法整数（默认 2）行为零变更
         // v3.158：Utils.num 转换——'5'(环境变量字符串) → 5（曾 Number.isFinite('5')=false 回退 2）
         const maxRetry = (() => { const r = Utils.num(Config.api.retry, 2); return Number.isInteger(r) && r >= 0 ? r : 2; })();
-        // v3.223：延迟加载推送模块（含 got）——与接口请求并行，主流程不必先等模块加载完成
-        getNotify().catch(() => { /* 加载失败由推送阶段真实报错，这里不阻塞接口 */ });
         for (let attempt = 0; attempt <= maxRetry; attempt++) {
             if (PROFILE3) console.log(`[profile api attempt] start=${attempt + 1}/${maxRetry + 1}`);
             try {
@@ -1897,7 +1927,61 @@ const App = {
         let warmupController = null;
         console.debug('开始获取线报酷数据...');
         checkpoint('run-start');
-
+            // ③ 拉取数据：仅在实际配置 WxPusher 时预解析域名并后台预建 HTTPS 连接。
+            // 预热可被主流程结束时取消，避免“未 await”仍因活动 socket 延长进程退出。
+            const warmupPromise = getNotify().then((notifyModule) => {
+                const cfg = notifyModule && notifyModule.push_config;
+                let hasWxPusher = false;
+                try {
+                    const single = cfg && typeof cfg.WX_pusher_appToken === 'string' && cfg.WX_pusher_appToken.trim() !== '';
+                    let multi = false;
+                    if (cfg) {
+                        if (Array.isArray(cfg.WX_pusher_channels)) {
+                            multi = cfg.WX_pusher_channels.length > 0;
+                        } else if (typeof cfg.WX_pusher_channels === 'string' && cfg.WX_pusher_channels.trim() !== '') {
+                            try {
+                                const parsed = JSON.parse(cfg.WX_pusher_channels);
+                                multi = Array.isArray(parsed) && parsed.length > 0;
+                            } catch (e) { multi = false; }
+                        }
+                    }
+                    hasWxPusher = Boolean(single || multi);
+                } catch (e) { hasWxPusher = false; }
+                if (!hasWxPusher) {
+                    dnsWarmup = { ok: true, skipped: true };
+                    tlsWarmup = { ok: true, skipped: true, okCount: 0, count: 0 };
+                    dnsWarmupSettled = true;
+                    tlsWarmupSettled = true;
+                    checkpoint('warmup-skipped', 'wxpusher=unconfigured');
+                    return null;
+                }
+                warmupController = typeof AbortController === 'function' ? new AbortController() : null;
+                const signal = warmupController ? warmupController.signal : null;
+                const dnsWarmupPromise = Promise.resolve(prewarmDns('wxpusher.zjiecode.com'))
+                    .then((result) => { dnsWarmup = result; dnsWarmupSettled = true; return result; })
+                    .catch((error) => { dnsWarmup = { ok: false, error: String(error) }; dnsWarmupSettled = true; return dnsWarmup; });
+                const prewarmCount = (() => {
+                    const pl = Utils.num(Config.push.parallelLimit, 10);
+                    const maxPerRun = Utils.num(Config.push.maxPerRun, 100);
+                    const window = pl > 0 ? Math.min(Math.floor(pl), 10) : 10;
+                    const batch = Number.isInteger(maxPerRun) && maxPerRun > 0 ? maxPerRun : 100;
+                    return Math.max(1, Math.min(window, batch));
+                })();
+                // HEAD 预取：连接数与并发窗口对齐；signal 允许主流程结束/失败时取消未完成请求。
+                const tlsWarmupPromise = Promise.resolve(prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount, signal))
+                    .then((result) => { tlsWarmup = result; tlsWarmupSettled = true; return result; })
+                    .catch((error) => { tlsWarmup = { ok: false, okCount: 0, count: prewarmCount, error: String(error) }; tlsWarmupSettled = true; return tlsWarmup; });
+                checkpoint('warmup-started', `tlsCount=${prewarmCount}`);
+                return Promise.all([dnsWarmupPromise, tlsWarmupPromise]);
+            }).catch((error) => {
+                dnsWarmup = { ok: false, error: String(error) };
+                tlsWarmup = { ok: false, okCount: 0, count: 0, error: String(error) };
+                dnsWarmupSettled = true;
+                tlsWarmupSettled = true;
+                return null;
+            });
+            // 显式接住后台预热 Promise；主流程不等待它。
+            warmupPromise.catch(() => {});
         MessageStore.init();
         checkpoint('cache-init');
         this._warnLowDisk();
@@ -1968,55 +2052,6 @@ const App = {
             const compiledRules = RuleEngine.compileRules(Config.filter);
             checkpoint('rules-compiled');
 
-            // ③ 拉取数据：仅在实际配置 WxPusher 时预解析域名并后台预建 HTTPS 连接。
-            // 预热可被主流程结束时取消，避免“未 await”仍因活动 socket 延长进程退出。
-            const warmupPromise = getNotify().then((notifyModule) => {
-                const cfg = notifyModule && notifyModule.push_config;
-                let hasWxPusher = false;
-                try {
-                    const single = cfg && typeof cfg.WX_pusher_appToken === 'string' && cfg.WX_pusher_appToken.trim() !== '';
-                    let multi = false;
-                    if (cfg) {
-                        if (Array.isArray(cfg.WX_pusher_channels)) {
-                            multi = cfg.WX_pusher_channels.length > 0;
-                        } else if (typeof cfg.WX_pusher_channels === 'string' && cfg.WX_pusher_channels.trim() !== '') {
-                            try {
-                                const parsed = JSON.parse(cfg.WX_pusher_channels);
-                                multi = Array.isArray(parsed) && parsed.length > 0;
-                            } catch (e) { multi = false; }
-                        }
-                    }
-                    hasWxPusher = Boolean(single || multi);
-                } catch (e) { hasWxPusher = false; }
-                if (!hasWxPusher) {
-                    dnsWarmup = { ok: true, skipped: true };
-                    tlsWarmup = { ok: true, skipped: true, okCount: 0, count: 0 };
-                    dnsWarmupSettled = true;
-                    tlsWarmupSettled = true;
-                    checkpoint('warmup-skipped', 'wxpusher=unconfigured');
-                    return null;
-                }
-                warmupController = typeof AbortController === 'function' ? new AbortController() : null;
-                const signal = warmupController ? warmupController.signal : null;
-                const dnsWarmupPromise = Promise.resolve(prewarmDns('wxpusher.zjiecode.com'))
-                    .then((result) => { dnsWarmup = result; dnsWarmupSettled = true; return result; })
-                    .catch((error) => { dnsWarmup = { ok: false, error: String(error) }; dnsWarmupSettled = true; return dnsWarmup; });
-                const prewarmCount = (() => { const pl = Utils.num(Config.push.parallelLimit, 10); return pl > 0 ? Math.min(Math.floor(pl), 10) : 10; })();
-                // HEAD 预取：连接数与并发窗口对齐；signal 允许主流程结束/失败时取消未完成请求。
-                const tlsWarmupPromise = Promise.resolve(prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount, signal))
-                    .then((result) => { tlsWarmup = result; tlsWarmupSettled = true; return result; })
-                    .catch((error) => { tlsWarmup = { ok: false, okCount: 0, count: prewarmCount, error: String(error) }; tlsWarmupSettled = true; return tlsWarmup; });
-                checkpoint('warmup-started', `tlsCount=${prewarmCount}`);
-                return Promise.all([dnsWarmupPromise, tlsWarmupPromise]);
-            }).catch((error) => {
-                dnsWarmup = { ok: false, error: String(error) };
-                tlsWarmup = { ok: false, okCount: 0, count: 0, error: String(error) };
-                dnsWarmupSettled = true;
-                tlsWarmupSettled = true;
-                return null;
-            });
-            // 显式接住后台预热 Promise；主流程不等待它。
-            warmupPromise.catch(() => {});
             const fetchStart = Date.now();
             const xbkdata = await Network.fetchData();
             fetchMs = Date.now() - fetchStart;
@@ -2439,6 +2474,8 @@ if (typeof module !== 'undefined' && module.exports) {
         _splitLines: RuleEngine._splitLines.bind(RuleEngine),
         // UTF-16 安全截断（代理对感知）
         truncateUtf16: Utils.truncateUtf16.bind(Utils),
+        // 统一数值配置转换（供常驻入口复用，保持字符串环境变量与主流程同一语义）
+        num: Utils.num.bind(Utils),
         // ReDoS 防护检测（嵌套量词）
         hasNestedQuantifier: RuleEngine.hasNestedQuantifier.bind(RuleEngine),
         // 缓存内部方法

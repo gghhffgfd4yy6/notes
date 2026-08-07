@@ -4,9 +4,14 @@
 // 仅保留：PushPlus、Server酱、Bark、PushMe、企业微信机器人、wxpusher、息知、PushDeer
 
 const got = require('got');
-const { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup } = require('./xbk_agents');
+const { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs } = require('./xbk_agents');
 const timeout = 15000;
 const REQUEST_OPTIONS = { agent: AGENTS, lookup: dnsLookup, ...(DNS_LOOKUP_IP_VERSION ? { dnsLookupIpVersion: DNS_LOOKUP_IP_VERSION } : {}) };
+
+function invalidateDnsForError(error, url) {
+    if (!shouldInvalidateDns(error)) return;
+    try { invalidateDns(new URL(url).hostname); } catch (e) { /* 非 URL 请求不影响原错误 */ }
+}
 const requestExtras = (params) => {
     try { return params && params.signal ? { signal: params.signal } : {}; }
     catch (e) { return {}; }
@@ -279,6 +284,7 @@ const $ = {
             (err) => {
                 // v3.75：失败时传 Error 对象而非响应体——API 异常响应体可能回显请求参数（含密钥），
                 // 且各通道失败日志已统一 safeErr 摘要（打 message 不含响应内容）
+                invalidateDnsForError(err, url);
                 callback(err || new Error('请求失败'), null, null, err && err.timings);
             },
         );
@@ -298,6 +304,7 @@ const $ = {
             (err) => {
                 // v3.75：失败时传 Error 对象而非响应体——API 异常响应体可能回显请求参数（含密钥），
                 // 且各通道失败日志已统一 safeErr 摘要（打 message 不含响应内容）
+                invalidateDnsForError(err, url);
                 callback(err || new Error('请求失败'));
             },
         );
@@ -831,8 +838,7 @@ function wxPusherProfile(channel, outcome, started, timings) {
     console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=${outcome} elapsedMs=${elapsedMs}`);
     if (timings && timings.phases) {
         const p = timings.phases;
-        const n = (v) => Number.isFinite(v) ? Math.round(v) : 'n/a';
-        console.log(`[profile wxpusher timing] app=***${safeString(channel.appToken).slice(-4)} wait=${n(p.wait)} dns=${n(p.dns)} tcp=${n(p.tcp)} tls=${n(p.tls)} request=${n(p.request)} firstByte=${n(p.firstByte)} download=${n(p.download)} total=${n(p.total)}`);
+        console.log(`[profile wxpusher timing] app=***${safeString(channel.appToken).slice(-4)} wait=${profileMs(p.wait)} dns=${profileMs(p.dns)} tcp=${profileMs(p.tcp)} tls=${profileMs(p.tls)} request=${profileMs(p.request)} firstByte=${profileMs(p.firstByte)} download=${profileMs(p.download)} total=${profileMs(p.total)}`);
     }
 }
 

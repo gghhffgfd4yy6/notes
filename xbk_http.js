@@ -2,9 +2,13 @@
 
 // 官方 got 的薄封装：got 负责 HTTP/TLS/重定向/超时，本文只补项目需要的响应体大小与 JSON 解析。
 const got = require('got');
-const { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup } = require('./xbk_agents');
+const { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs } = require('./xbk_agents');
 
 const DEFAULT_MAX_BODY = 20 * 1024 * 1024;
+
+function hostOf(url) {
+    try { return new URL(url).hostname; } catch (e) { return ''; }
+}
 
 function parseJsonBody(text) {
     try { return JSON.parse(text); }
@@ -17,6 +21,7 @@ function parseJsonBody(text) {
 
 async function fetchJson(url, options = {}, maxBody = DEFAULT_MAX_BODY) {
     const requestOptions = { agent: AGENTS, lookup: dnsLookup, ...(DNS_LOOKUP_IP_VERSION ? { dnsLookupIpVersion: DNS_LOOKUP_IP_VERSION } : {}), ...options };
+    const requestHost = hostOf(url);
     const detailedProfile = process.env.XBK_PROFILE === '3';
     const started = Date.now();
     if (detailedProfile) console.log(`[profile api] start url=${String(url).replace(/\/[^/]+$/, '/***')}`);
@@ -37,6 +42,7 @@ async function fetchJson(url, options = {}, maxBody = DEFAULT_MAX_BODY) {
         const finishReject = (err) => {
             if (settled) return;
             settled = true;
+            if (shouldInvalidateDns(err) && requestHost) invalidateDns(requestHost);
             if (detailedProfile) console.log(`[profile api] error totalMs=${Date.now() - started} code=${err && err.code ? err.code : 'unknown'}`);
             reject(err);
         };
@@ -74,8 +80,7 @@ async function fetchJson(url, options = {}, maxBody = DEFAULT_MAX_BODY) {
                 settled = true;
                 if (detailedProfile) {
                     const timings = stream.timings && stream.timings.phases ? stream.timings.phases : {};
-                    const n = (v) => Number.isFinite(v) ? Math.round(v) : 'n/a';
-                    console.log(`[profile api timing] wait=${n(timings.wait)} dns=${n(timings.dns)} tcp=${n(timings.tcp)} tls=${n(timings.tls)} request=${n(timings.request)} firstByte=${n(timings.firstByte)} download=${n(timings.download)} responseAt=${response ? Date.now() - started : 'n/a'} firstDataAt=${firstDataAt ? firstDataAt - started : 'n/a'} downloadEnd=${endedAt - started} parse=${Date.now() - endedAt} total=${Date.now() - started} bytes=${total}`);
+                    console.log(`[profile api timing] wait=${profileMs(timings.wait)} dns=${profileMs(timings.dns)} tcp=${profileMs(timings.tcp)} tls=${profileMs(timings.tls)} request=${profileMs(timings.request)} firstByte=${profileMs(timings.firstByte)} download=${profileMs(timings.download)} responseAt=${response ? Date.now() - started : 'n/a'} firstDataAt=${firstDataAt ? firstDataAt - started : 'n/a'} downloadEnd=${endedAt - started} parse=${Date.now() - endedAt} total=${Date.now() - started} bytes=${total}`);
                 }
                 resolve(body);
             } catch (e) { finishReject(e); }

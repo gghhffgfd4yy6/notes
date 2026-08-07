@@ -18,8 +18,20 @@ const AGENTS = {
 // 使用 Node 原生 dns.lookup，不依赖网卡枚举，兼容受限 Android/沙箱环境。
 const DNS_TTL_MS = 60000;
 const DNS_ERROR_TTL_MS = 1000;
+const DNS_INVALIDATION_CODES = new Set([
+    'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH',
+    'ENOTFOUND', 'EAI_AGAIN', 'ERR_SOCKET_CLOSED', 'ERR_TLS_CERT_ALTNAME_INVALID',
+]);
 const dnsCache = new Map();
 const dnsPending = new Map();
+
+function profileMs(value) {
+    return Number.isFinite(value) ? Math.round(value) : 'n/a';
+}
+
+function shouldInvalidateDns(error) {
+    return Boolean(error && DNS_INVALIDATION_CODES.has(error.code));
+}
 
 function dnsLookup(hostname, options, callback) {
     const opts = options || {};
@@ -63,6 +75,21 @@ function prewarmDns(hostname) {
     });
 }
 
+// 连接错误可能意味着缓存中的地址已失效；清除该主机的所有地址族缓存，
+// 让下一次重试重新走系统 DNS，而不是在 TTL 内反复使用旧地址。
+function invalidateDns(hostname) {
+    const host = typeof hostname === 'string' ? hostname : '';
+    if (!host) return 0;
+    let removed = 0;
+    for (const key of dnsCache.keys()) {
+        if (key.startsWith(host + '|')) {
+            dnsCache.delete(key);
+            removed += 1;
+        }
+    }
+    return removed;
+}
+
 async function prewarmTls(hostname, timeoutMs = 5000, count = 1, signal = null) {
     const started = Date.now();
     if (signal && signal.aborted) return { hostname, count, skipped: true, cancelled: true, ok: false, okCount: 0, elapsedMs: 0 };
@@ -73,6 +100,9 @@ async function prewarmTls(hostname, timeoutMs = 5000, count = 1, signal = null) 
     const baseOptions = {
         agent: AGENTS,
         lookup: dnsLookup,
+        // 预热连接必须与实际推送使用同一地址族，否则 got/Node Agent 会进入不同连接池，
+        // 强制 IPv4/IPv6 时预热连接无法被推送复用（表现为首批请求全部重新 DNS/TLS）。
+        ...(DNS_LOOKUP_IP_VERSION ? { dnsLookupIpVersion: DNS_LOOKUP_IP_VERSION } : {}),
         timeout: timeoutMs,
         retry: { limit: 0 },
         throwHttpErrors: false,
@@ -112,4 +142,4 @@ async function prewarmTls(hostname, timeoutMs = 5000, count = 1, signal = null) 
     };
 }
 
-module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, DNS_CACHE: null, dnsLookup, prewarmDns, prewarmTls };
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, DNS_CACHE: null, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, prewarmDns, prewarmTls };

@@ -86,5 +86,44 @@ const noWarmupOutput = execFileSync(process.execPath, ['-e', noWarmupProbe], {
     cwd: __dirname,
     encoding: 'utf8',
 });
-assert.deepStrictEqual(JSON.parse(noWarmupOutput.trim().split(/\r?\n/).pop()), []);
-console.log('✅ 未配置 WxPusher 时不启动 DNS/TLS 预热');
+
+assert.deepStrictEqual(JSON.parse(noWarmupOutput.trim().split(/\r?\n/).pop()), ['dns-warmup']);
+console.log('✅ 未配置 WxPusher 时仅启动线报接口 DNS 预热，不启动 WxPusher DNS/TLS 预热');
+
+// 回归测试：TLS 预热必须携带与实际请求一致的 DNS 地址族，避免 Agent 连接池分裂。
+function probePrewarmDnsFamily(family) {
+    const probe = String.raw`
+'use strict';
+const gotPath = require.resolve('got');
+const calls = [];
+const fakeGot = function () { return { then(resolve) { resolve({ statusCode: 200 }); } }; };
+fakeGot.stream = () => {};
+fakeGot.head = (url, options) => {
+    calls.push({ method: 'head', url, options });
+    return { then(resolve) { resolve({ statusCode: 200 }); } };
+};
+fakeGot.get = (url, options) => {
+    calls.push({ method: 'get', url, options });
+    return { then(resolve) { resolve({ statusCode: 200 }); } };
+};
+require.cache[gotPath] = { id: gotPath, filename: gotPath, loaded: true, exports: fakeGot };
+const { prewarmTls } = require('./xbk_agents');
+prewarmTls('example.test', 100, 1).then(() => {
+    process.stdout.write(JSON.stringify(calls.map(call => call.options.dnsLookupIpVersion)));
+}).catch(error => {
+    console.error(error);
+    process.exit(1);
+});
+`;
+    const output = execFileSync(process.execPath, ['-e', probe], {
+        cwd: __dirname,
+        encoding: 'utf8',
+        env: { ...process.env, ...(family ? { XBK_DNS_FAMILY: family } : { XBK_DNS_FAMILY: '' }) },
+    });
+    return JSON.parse(output.trim().split(/\r?\n/).pop());
+}
+
+assert.deepStrictEqual(probePrewarmDnsFamily('4'), ['ipv4'], 'XBK_DNS_FAMILY=4 时预热应使用 ipv4');
+assert.deepStrictEqual(probePrewarmDnsFamily('6'), ['ipv6'], 'XBK_DNS_FAMILY=6 时预热应使用 ipv6');
+assert.deepStrictEqual(probePrewarmDnsFamily(''), [null], 'auto 模式不应强制地址族');
+console.log('✅ TLS 预热与推送请求使用一致的 DNS 地址族');

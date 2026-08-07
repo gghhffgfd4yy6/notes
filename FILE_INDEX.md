@@ -312,6 +312,16 @@ npm run test:notify
 
 **定位**：GitHub Actions——push/PR 自动安装官方 got 依赖，并按工作流配置执行单元、通道和串行集成测试；全部 PASS 才可合并。
 
+### `qinglong/xbk_push.js` — 青龙面板常驻执行入口
+
+**定位**：不依赖当前工作目录，自动定位项目根目录并补齐依赖；启动一次后在同一进程内循环执行 `App.run()`，复用主模块、got、Agent、DNS 缓存和 Keep-Alive 连接池。
+
+**行为**：每轮完成后等待配置间隔再拉取；定期在等待期间后台刷新接口/WxPusher DNS 并预热少量 TLS 连接，不阻塞下一轮；单轮异常记录后继续下一轮；收到 SIGTERM/SIGINT 时在当前轮结束后安全停止。通过 `XBK_INTERVAL_MS` 覆盖轮询间隔。单次运行仍使用 `npm start`。
+
+### `xbk_loop.js` — 常驻循环调度器
+
+**定位**：提供可测试的长驻循环、间隔等待、AbortSignal 停止和单轮错误隔离。青龙入口使用它，测试通过 `test_loop.js` 锁定异常不中断和优雅停止语义。
+
 ### `.workflow/master-pipeline.yml` — 分阶段流水线配置
 
 **定位**：按阶段执行单元测试、并行集成测试、通道测试和最终汇总；命令与 `package.json` 的 npm scripts 保持一致。
@@ -320,8 +330,7 @@ npm run test:notify
 
 ## 六、数据关系图
 
-```
-push_config.local.js ──加载──> xbk_sendNotify_slim.js <──依赖── xbk_function_v3.js
+```push_config.local.js ──加载──> xbk_sendNotify_slim.js <──依赖── xbk_function_v3.js
      (密钥,不入库)              (推送通道)                  (主代码)
                                                               │
         test_notify.js ──测──> xbk_sendNotify_slim.js        │ require

@@ -2306,6 +2306,19 @@ await test('readMessages 内存缓存生效 → 返回同一引用', () => {
     assertEqual(first === second, true);
 });
 
+await test('readMessages 外部删除文件 → 用内存快照自动恢复', () => {
+    const fs = require('fs');
+    const p = path.join(CACHE, 'test_mem_restore.json');
+    saveMessages(p, [{ id: 7001, title: '内存恢复' }]);
+    assertEqual(fs.existsSync(p), true);
+    fs.unlinkSync(p);
+    const msgs = readMessages(p);
+    assertEqual(msgs.length, 1);
+    assertEqual(msgs[0].id, 7001);
+    assertEqual(fs.existsSync(p), true);
+    assertEqual(JSON.parse(fs.readFileSync(p, 'utf8')).length, 1);
+});
+
 await test('tuisong_replace 模板不含占位符 → 输出与含占位符等价', () => {
     // 惰性计算的正确性：不含Markdown的模板输出不含Markdown内容
     const r = tuisong_replace('{标题}', {
