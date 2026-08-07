@@ -47,13 +47,8 @@ async function refreshConnections(app, signal) {
     if (signal && signal.aborted) return;
     const agents = require(path.join(ROOT, 'xbk_agents'));
     const notify = require(path.join(ROOT, 'xbk_sendNotify_slim'));
-    const cfg = notify && notify.push_config;
-    const hasWxPusher = Boolean(
-        cfg && typeof cfg.WX_pusher_appToken === 'string' && cfg.WX_pusher_appToken.trim()
-    ) || Boolean(
-        cfg && (Array.isArray(cfg.WX_pusher_channels) && cfg.WX_pusher_channels.length > 0
-            || typeof cfg.WX_pusher_channels === 'string' && cfg.WX_pusher_channels.trim())
-    );
+    const hasWxPusher = Boolean(notify && typeof notify.hasWxPusherConfigured === 'function'
+        && notify.hasWxPusherConfigured());
     const apiHost = (() => {
         try { return new URL(app.Config.api.pushUrl).hostname; } catch (e) { return ''; }
     })();

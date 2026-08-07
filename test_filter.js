@@ -2319,6 +2319,25 @@ await test('readMessages 外部删除文件 → 用内存快照自动恢复', ()
     assertEqual(JSON.parse(fs.readFileSync(p, 'utf8')).length, 1);
 });
 
+await test('缓存符号链接 → 拒绝读取和写入外部目标', () => {
+    const fs = require('fs');
+    const p = path.join(CACHE, 'test_cache_symlink.json');
+    const outside = path.join('/tmp', `xbk-cache-symlink-${process.pid}.json`);
+    try {
+        fs.writeFileSync(outside, JSON.stringify([{ id: 9001 }]), 'utf8');
+        try { fs.unlinkSync(p); } catch (e) { /* 不存在 */ }
+        fs.symlinkSync(outside, p);
+        const msgs = readMessages(p);
+        assertEqual(msgs.length, 0);
+        saveMessages(p, [{ id: 9002 }]);
+        assertEqual(JSON.parse(fs.readFileSync(outside, 'utf8'))[0].id, 9001);
+        assertEqual(fs.lstatSync(p).isSymbolicLink(), true);
+    } finally {
+        try { fs.unlinkSync(p); } catch (e) { /* 忽略 */ }
+        try { fs.unlinkSync(outside); } catch (e) { /* 忽略 */ }
+    }
+});
+
 await test('tuisong_replace 模板不含占位符 → 输出与含占位符等价', () => {
     // 惰性计算的正确性：不含Markdown的模板输出不含Markdown内容
     const r = tuisong_replace('{标题}', {

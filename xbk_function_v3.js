@@ -55,6 +55,7 @@ function getNotify() {
 const fs = profile3Require('fs', () => require('fs'));
 const { fetchJson } = profile3Require('xbk_http', () => require('./xbk_http'));
 const { prewarmDns, prewarmTls } = profile3Require('xbk_agents', () => require('./xbk_agents'));
+const { isRegularOrMissing, readSafeText, writeAtomic } = profile3Require('xbk_storage', () => require('./xbk_storage'));
 const path = profile3Require('path', () => require('path'));
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
 // 缺 package.json 时回退 '3.x'（移植性防御）
@@ -1298,7 +1299,7 @@ const MessageStore = {
         try {
             const dir = path.dirname(filePath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, '[]', 'utf8');
+            if (!fs.existsSync(filePath)) writeAtomic(filePath, '[]', '缓存初始化');
         } catch (e) {
             console.error(`缓存初始化失败 ${filePath}:`, e.message);
         }
@@ -1306,11 +1307,7 @@ const MessageStore = {
 
     /** 重置缓存文件为空数组（写 '[]' 并更新内存缓存；写失败也容错——双故障时 readMessages 不崩） */
     _resetCache(filePath) {
-        try {
-            fs.writeFileSync(filePath, '[]', 'utf8');
-        } catch (e) {
-            console.error(`缓存重置失败 ${filePath}:`, e.message);
-        }
+        writeAtomic(filePath, '[]', '缓存重置');
         this._memoSet(filePath, []);
     },
 
@@ -1329,7 +1326,8 @@ const MessageStore = {
         }
         this._ensureFileExists(filePath);
         try {
-            const data = JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+            const raw = readSafeText(filePath);
+            const data = JSON.parse(raw || '[]');
             if (Array.isArray(data)) {
                 // 过滤非对象元素（null/原始值），避免后续 has/save 访问 m.id 崩溃
                 // v3.157：排除数组元素（typeof object 含数组——数组元素 m.id 访问异常、判重混乱）
@@ -1381,21 +1379,14 @@ const MessageStore = {
             restoreMemo();
             return false;
         }
-        // 原子写入：先写 tmp 再 rename，避免并发/崩溃时半写文件损坏缓存
-        const tmpFile = filePath + '.tmp';
-        let saved = true;
-        try {
-            fs.writeFileSync(tmpFile, text, 'utf8');
-            fs.renameSync(tmpFile, filePath);
-        } catch (e) {
-            saved = false;
-            // 写失败/rename 失败：清理 tmp 残留，不中断；恢复写入前内存快照，避免未落盘消息被判重吞掉。
-            try { fs.unlinkSync(tmpFile); } catch (e2) { /* 忽略 */ }
+        // 统一安全原子写入：普通文件检查、唯一临时文件、失败清理和错误日志集中处理。
+        const saved = writeAtomic(filePath, text, '缓存');
+        if (!saved) {
             restoreMemo();
-            console.error(`缓存写入失败 ${filePath}:`, e.message);
+            return false;
         }
-        if (saved) this._memoSet(filePath, toSave);
-        return saved;
+        this._memoSet(filePath, toSave);
+        return true;
     },
 
     has(message, filename) {
@@ -1655,32 +1646,15 @@ const App = {
     // 文件级安全检查：缓存目录安全并不等于目录内的单个文件安全。
     // 拒绝符号链接/目录作为文件目标，避免 filter.hash/run.log 等路径跟随链接逃逸。
     _isRegularOrMissing(filePath) {
-        try { return fs.lstatSync(filePath).isFile(); }
-        catch (e) { return e && e.code === 'ENOENT'; }
+        return isRegularOrMissing(filePath);
     },
 
     _readSafeText(filePath) {
-        try {
-            if (!fs.lstatSync(filePath).isFile()) return null;
-            return fs.readFileSync(filePath, 'utf8');
-        } catch (e) { return null; }
+        return readSafeText(filePath);
     },
 
     _writeTextAtomic(filePath, text) {
-        if (!this._isRegularOrMissing(filePath)) {
-            console.error(`拒绝写入非普通缓存文件 ${filePath}`);
-            return false;
-        }
-        const tmpFile = filePath + '.tmp';
-        try {
-            fs.writeFileSync(tmpFile, text, 'utf8');
-            fs.renameSync(tmpFile, filePath);
-            return true;
-        } catch (e) {
-            try { fs.unlinkSync(tmpFile); } catch (e2) { /* 忽略 */ }
-            console.error(`缓存文件写入失败 ${filePath}:`, e.message);
-            return false;
-        }
+        return writeAtomic(filePath, text, '缓存文件');
     },
 
     // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
@@ -1930,23 +1904,8 @@ const App = {
             // ③ 拉取数据：仅在实际配置 WxPusher 时预解析域名并后台预建 HTTPS 连接。
             // 预热可被主流程结束时取消，避免“未 await”仍因活动 socket 延长进程退出。
             const warmupPromise = getNotify().then((notifyModule) => {
-                const cfg = notifyModule && notifyModule.push_config;
-                let hasWxPusher = false;
-                try {
-                    const single = cfg && typeof cfg.WX_pusher_appToken === 'string' && cfg.WX_pusher_appToken.trim() !== '';
-                    let multi = false;
-                    if (cfg) {
-                        if (Array.isArray(cfg.WX_pusher_channels)) {
-                            multi = cfg.WX_pusher_channels.length > 0;
-                        } else if (typeof cfg.WX_pusher_channels === 'string' && cfg.WX_pusher_channels.trim() !== '') {
-                            try {
-                                const parsed = JSON.parse(cfg.WX_pusher_channels);
-                                multi = Array.isArray(parsed) && parsed.length > 0;
-                            } catch (e) { multi = false; }
-                        }
-                    }
-                    hasWxPusher = Boolean(single || multi);
-                } catch (e) { hasWxPusher = false; }
+                const hasWxPusher = Boolean(notifyModule && typeof notifyModule.hasWxPusherConfigured === 'function'
+                    && notifyModule.hasWxPusherConfigured());
                 if (!hasWxPusher) {
                     dnsWarmup = { ok: true, skipped: true };
                     tlsWarmup = { ok: true, skipped: true, okCount: 0, count: 0 };

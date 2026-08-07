@@ -33,6 +33,23 @@ function shouldInvalidateDns(error) {
     return Boolean(error && DNS_INVALIDATION_CODES.has(error.code));
 }
 
+function baseRequestOptions() {
+    return {
+        agent: AGENTS,
+        lookup: dnsLookup,
+        ...(DNS_LOOKUP_IP_VERSION ? { dnsLookupIpVersion: DNS_LOOKUP_IP_VERSION } : {}),
+    };
+}
+
+function invalidateDnsForError(error, url) {
+    if (!shouldInvalidateDns(error)) return false;
+    try {
+        const hostname = new URL(url).hostname;
+        if (!hostname) return false;
+        invalidateDns(hostname);
+        return true;
+    } catch (e) { return false; }
+}
 function dnsLookup(hostname, options, callback) {
     const opts = options || {};
     const key = [hostname, opts.family || 0, opts.hints || 0, opts.all ? 1 : 0, opts.verbatim ? 1 : 0].join('|');
@@ -98,11 +115,7 @@ async function prewarmTls(hostname, timeoutMs = 5000, count = 1, signal = null) 
         if (!got.stream) return { hostname, count, skipped: true, ok: true, elapsedMs: Date.now() - started };
     } catch (e) { /* 忽略 */ }
     const baseOptions = {
-        agent: AGENTS,
-        lookup: dnsLookup,
-        // 预热连接必须与实际推送使用同一地址族，否则 got/Node Agent 会进入不同连接池，
-        // 强制 IPv4/IPv6 时预热连接无法被推送复用（表现为首批请求全部重新 DNS/TLS）。
-        ...(DNS_LOOKUP_IP_VERSION ? { dnsLookupIpVersion: DNS_LOOKUP_IP_VERSION } : {}),
+        ...baseRequestOptions(),
         timeout: timeoutMs,
         retry: { limit: 0 },
         throwHttpErrors: false,
@@ -142,4 +155,4 @@ async function prewarmTls(hostname, timeoutMs = 5000, count = 1, signal = null) 
     };
 }
 
-module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, DNS_CACHE: null, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, prewarmDns, prewarmTls };
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, DNS_CACHE: null, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls };

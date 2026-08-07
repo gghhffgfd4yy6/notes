@@ -2,13 +2,9 @@
 
 // 官方 got 的薄封装：got 负责 HTTP/TLS/重定向/超时，本文只补项目需要的响应体大小与 JSON 解析。
 const got = require('got');
-const { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs } = require('./xbk_agents');
+const { AGENTS, baseRequestOptions, invalidateDnsForError, profileMs } = require('./xbk_agents');
 
 const DEFAULT_MAX_BODY = 20 * 1024 * 1024;
-
-function hostOf(url) {
-    try { return new URL(url).hostname; } catch (e) { return ''; }
-}
 
 function parseJsonBody(text) {
     try { return JSON.parse(text); }
@@ -20,8 +16,7 @@ function parseJsonBody(text) {
 }
 
 async function fetchJson(url, options = {}, maxBody = DEFAULT_MAX_BODY) {
-    const requestOptions = { agent: AGENTS, lookup: dnsLookup, ...(DNS_LOOKUP_IP_VERSION ? { dnsLookupIpVersion: DNS_LOOKUP_IP_VERSION } : {}), ...options };
-    const requestHost = hostOf(url);
+    const requestOptions = { ...baseRequestOptions(), ...options };
     const detailedProfile = process.env.XBK_PROFILE === '3';
     const started = Date.now();
     if (detailedProfile) console.log(`[profile api] start url=${String(url).replace(/\/[^/]+$/, '/***')}`);
@@ -42,7 +37,7 @@ async function fetchJson(url, options = {}, maxBody = DEFAULT_MAX_BODY) {
         const finishReject = (err) => {
             if (settled) return;
             settled = true;
-            if (shouldInvalidateDns(err) && requestHost) invalidateDns(requestHost);
+            invalidateDnsForError(err, url);
             if (detailedProfile) console.log(`[profile api] error totalMs=${Date.now() - started} code=${err && err.code ? err.code : 'unknown'}`);
             reject(err);
         };

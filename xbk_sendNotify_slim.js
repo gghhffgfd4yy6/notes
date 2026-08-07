@@ -4,14 +4,10 @@
 // 仅保留：PushPlus、Server酱、Bark、PushMe、企业微信机器人、wxpusher、息知、PushDeer
 
 const got = require('got');
-const { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs } = require('./xbk_agents');
+const { baseRequestOptions, invalidateDnsForError, profileMs } = require('./xbk_agents');
 const timeout = 15000;
-const REQUEST_OPTIONS = { agent: AGENTS, lookup: dnsLookup, ...(DNS_LOOKUP_IP_VERSION ? { dnsLookupIpVersion: DNS_LOOKUP_IP_VERSION } : {}) };
+const REQUEST_OPTIONS = baseRequestOptions();
 
-function invalidateDnsForError(error, url) {
-    if (!shouldInvalidateDns(error)) return;
-    try { invalidateDns(new URL(url).hostname); } catch (e) { /* 非 URL 请求不影响原错误 */ }
-}
 const requestExtras = (params) => {
     try { return params && params.signal ? { signal: params.signal } : {}; }
     catch (e) { return {}; }
@@ -712,6 +708,10 @@ function parseWxPusherChannels() {
     return wxPusherParsedChannels;
 }
 
+function hasWxPusherConfigured() {
+    return parseWxPusherChannels().length > 0;
+}
+
 function wxPusherChannelKey(channel) {
     // 限频按 appToken 归属；同一应用配置多个主题时不能错误地各算一份额度。
     return channel.appToken;
@@ -1183,4 +1183,4 @@ async function sendNotify(text, desp, params = {}) {
     }
 }
 
-module.exports = { sendNotify, push_config, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary };
+module.exports = { sendNotify, push_config, hasWxPusherConfigured, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary };

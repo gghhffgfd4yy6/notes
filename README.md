@@ -178,6 +178,7 @@ push_config.local.js.example  密钥配置示例模板（可入库）
 xianbaoku_cache/          去重缓存 + run.log + 状态文件（不入库）
 node_modules/got/         官方 got HTTP 客户端（版本由 package.json 管理）
 xbk_http.js              官方 got 薄封装（JSON 解析 + 响应体大小上限）
+xbk_storage.js           统一安全文件读取与原子写入基础设施
 test_filter.js            单元测试（属性/Fuzz/性能基准/版本一致性）
 test_app.js               集成测试 worker（mock 完整主流程）
 test_app_p.js               集成测试并行调度器
