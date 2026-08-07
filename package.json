@@ -13,7 +13,8 @@
     "test:notify": "node test_notify.js",
     "test:lazy": "node test_lazy_notify.js",
     "test:loop": "node test_loop.js",
-    "test:dns": "node test_dns_cache.js"
+    "test:dns": "node test_dns_cache.js",
+    "test:mutation": "stryker run"
   },
   "dependencies": {
     "got": "11.8.6"

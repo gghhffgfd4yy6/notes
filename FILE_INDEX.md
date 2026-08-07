@@ -77,6 +77,23 @@ Config.storage.minFreeBytes // 磁盘余量告警阈值（只告警，不阻断�
 
 ---
 
+### `stryker.config.js` — StrykerJS 变异测试配置
+
+**定位**:正式变异测试入口。使用 Stryker 的 command runner 执行完整单元测试命令，并限制生产源码变异范围；并发数通过 `STRYKER_CONCURRENCY` 调整，默认按当前设备能力取安全上限。
+
+**测试命令**:
+```bash
+# 先安装/准备 StrykerJS，再执行
+npm run test:mutation
+```
+
+**边界**:
+- `test_filter.js` 作为一个自定义测试命令运行，内部覆盖完整单元测试集；
+- `coverageAnalysis` 关闭，避免自定义测试命令被错误拆分；
+- 变异在 Stryker 临时目录中执行，不修改工作区源文件。
+
+---
+
 ### `xbk_sendNotify_slim.js` — 推送模块(各通道实现)
 
 **定位**:主代码依赖的推送实现。实现推送通道的请求构造与发送(Push+/Server酱/Bark/PushMe/企业微信/wxpusher/息知/PushDeer/Telegram),sendNotify 并行发送全部已配置通道。

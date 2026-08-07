@@ -168,7 +168,18 @@ push: {
 },
 ```
 
-## 📁 目录结构
+## 🧬 变异测试（StrykerJS）
+
+项目提供 `stryker.config.js` 和 `npm run test:mutation` 入口。StrykerJS 作为独立开发工具使用，不参与默认 `npm test`，避免把变异测试的长耗时带入普通回归。
+
+准备好 StrykerJS 后执行：
+
+```bash
+STRYKER_CONCURRENCY=2 npm run test:mutation
+```
+
+该入口使用 `node test_filter.js` 作为自定义测试命令；Stryker 会在临时目录中生成和执行变异，不直接修改当前工作区源码。`STRYKER_CONCURRENCY` 可按设备资源调整。
+
 
 ```
 xbk_function_v3.js        主代码（分层架构：Config→Utils→Formatter→RuleEngine→FilterEngine→MessageStore→Network→Pusher→App）
@@ -179,6 +190,7 @@ xianbaoku_cache/          去重缓存 + run.log + 状态文件（不入库）
 node_modules/got/         官方 got HTTP 客户端（版本由 package.json 管理）
 xbk_http.js              官方 got 薄封装（JSON 解析 + 响应体大小上限）
 xbk_storage.js           统一安全文件读取与原子写入基础设施
+stryker.config.js        StrykerJS 变异测试配置（自定义 test_filter 入口）
 test_filter.js            单元测试（属性/Fuzz/性能基准/版本一致性）
 test_app.js               集成测试 worker（mock 完整主流程）
 test_app_p.js               集成测试并行调度器
