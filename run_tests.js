@@ -9,6 +9,7 @@ const path = require('path');
 
 const SUITES = [
     { name: '常驻循环',   file: 'test_loop.js',          desc: '长驻调度、单轮异常隔离、停止信号' },
+    { name: '常驻失败策略', file: 'test_failure_policy.js', desc: '网络/永久错误分类、有限重试、摘要失败和恢复' },
     { name: 'DNS失效回归', file: 'test_dns_cache.js',    desc: '连接错误后清除主机 DNS 缓存并重新解析' },
     { name: 'TLS预热回归', file: 'test_tls_prewarm.js',   desc: 'TLS 预热 aggregate ok 与连接成功数保持一致' },
     { name: '延迟加载回归', file: 'test_lazy_notify.js', desc: '验证接口请求先于推送模块加载' },

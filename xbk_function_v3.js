@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.225 — 后台预热不阻塞主流程 ********
+//******** 线报酷推送脚本 v3.226 — 常驻失败分类与有限熔断 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -56,6 +56,7 @@ const fs = profile3Require('fs', () => require('fs'));
 const { fetchJson } = profile3Require('xbk_http', () => require('./xbk_http'));
 const { prewarmDns, prewarmTls } = profile3Require('xbk_agents', () => require('./xbk_agents'));
 const { isRegularOrMissing, readSafeText, writeAtomic } = profile3Require('xbk_storage', () => require('./xbk_storage'));
+const { summarizeError } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'));
 const path = profile3Require('path', () => require('path'));
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
 // 缺 package.json 时回退 '3.x'（移植性防御）
@@ -2198,6 +2199,7 @@ const App = {
                 return (u.includes('://') || u.startsWith('//') ? u : baseUrl + (u.startsWith('/') ? u : '/' + u));
             };
             const pushedKeys = new Set();
+            const failureInfos = [];
 
             // 推送模板（v3.68 可配置）：非法/缺失回退默认（默认值与历史硬编码完全一致，现有测试锁定）
             const titleTpl = (typeof Config.template.title === 'string' && Config.template.title) ? Config.template.title : '【{分类名}】{标题}';
@@ -2248,8 +2250,10 @@ const App = {
                     return { item, ok: true };
                 } catch (e) {
                     // 非 Error 兜底（R1）：notify 抛字符串等非 Error 时避免 e.message undefined（与 v3.31/73/81 口径一致）
-                    console.log(`⚠️ 推送失败（不写入缓存，下次运行重试）: ${item.title}【${item.catename}】 ${e && e.message ? e.message : String(e)}`);
-                    return { item, ok: false };
+                    const failure = summarizeError(e);
+                    failureInfos.push(failure);
+                    console.log(`⚠️ 推送失败（不写入缓存，下次运行重试）: ${item.title}【${item.catename}】 ${failure.message || String(e)}`);
+                    return { item, ok: false, failure };
                 }
             };
 
@@ -2358,6 +2362,7 @@ const App = {
                 truncated: truncatedCount, // v3.145：截断数（下次推送）
                 pushed: successCount,
                 failed: items.length - successCount,
+                failures: failureInfos,
             };
             this._updateReport(summary);
 

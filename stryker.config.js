@@ -19,6 +19,7 @@ module.exports = {
         'xbk_sendNotify_slim.js',
         'xbk_storage.js',
         'xbk_loop.js',
+        'xbk_failure_policy.js',
         'qinglong/xbk_push.js',
     ],
     coverageAnalysis: 'off',

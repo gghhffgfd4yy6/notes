@@ -21,6 +21,7 @@ async function runLoop(run, options = {}) {
     const intervalMs = Number.isFinite(options.intervalMs) && options.intervalMs >= 0 ? options.intervalMs : 10000;
     const refreshEvery = Number.isInteger(options.refreshEvery) && options.refreshEvery > 0 ? options.refreshEvery : 10;
     const onError = typeof options.onError === 'function' ? options.onError : (() => {});
+    const onIntervalError = typeof options.onIntervalError === 'function' ? options.onIntervalError : onError;
     const onInterval = typeof options.onInterval === 'function' ? options.onInterval : null;
     let cycle = 0;
     while (!(signal && signal.aborted)) {
@@ -34,7 +35,7 @@ async function runLoop(run, options = {}) {
         const intervalTask = sleep(intervalMs, signal);
         const refreshTask = onInterval && cycle % refreshEvery === 0
             ? Promise.resolve().then(() => onInterval({ cycle, signal })).catch(async error => {
-                try { await onError(error); } catch (ignored) { /* 刷新失败不能阻止下一轮 */ }
+                try { await onIntervalError(error); } catch (ignored) { /* 刷新失败不能阻止下一轮 */ }
             })
             : Promise.resolve();
         await Promise.all([intervalTask, refreshTask]);

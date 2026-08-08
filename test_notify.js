@@ -980,7 +980,14 @@ await test('全通道失败 → sendNotify reject / 部分成功 → resolve（v
     // 全失败 → reject（v3.133：防网络故障时消息丢失，主流程不写缓存下次重试）
     failPost = true;
     let threw = false;
-    try { await notify.sendNotify('标题', '内容'); } catch (e) { threw = true; assert(e.message.includes('所有推送通道失败'), `错误应含全失败: ${e.message.slice(0, 40)}`); }
+    try {
+        await notify.sendNotify('标题', '内容');
+    } catch (e) {
+        threw = true;
+        assert(e.message.includes('所有推送通道失败'), `错误应含全失败: ${e.message.slice(0, 40)}`);
+        assert(e.code === 'ALL_CHANNELS_FAILED', `全失败错误应保留聚合 code: ${e.code}`);
+        assert(Array.isArray(e.failures) && e.failures.length > 0, '全失败错误应保留子通道失败原因');
+    }
     assert(threw, '全通道失败应 reject');
     // 部分成功（Bark 成功 + Server酱失败）→ resolve（失败通道下次不重试防重复）
     failPost = false;

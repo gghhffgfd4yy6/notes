@@ -2270,7 +2270,11 @@ await test('推送全部失败 → 触发告警调用 + run.log ERROR（#9 v3.16
         notifyFailAt = 1;
         notifyDelayMs = 50;
         fakeData = [makeItem({ id: 1 })];
-        await xbk.run();
+        const summary = await xbk.run();
+        assert(summary && summary.failed === 1 && summary.pushed === 0, '推送全失败摘要应保留失败统计');
+        assert(Array.isArray(summary.failures) && summary.failures.length === 1
+            && summary.failures[0].message.includes('push boom'),
+            `推送全失败摘要应保留结构化失败原因: ${JSON.stringify(summary)}`);
         const log = require('fs').readFileSync(logPath, 'utf8');
         assert(log.includes('ERROR'), `推送全失败应写 ERROR 行: ${log.slice(-100)}`);
         assert(log.includes('推送全部失败'), 'ERROR 行应标明推送全部失败');

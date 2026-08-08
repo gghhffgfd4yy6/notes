@@ -114,6 +114,29 @@ function safeErr(e) {
     return redactSecrets(e).slice(0, 200);
 }
 
+function channelError(error, channel, response = null, providerCode = '') {
+    const message = safeErr(error) || `${channel} 发送失败`;
+    const result = new Error(message);
+    const source = error && typeof error === 'object' ? error : null;
+    const statusCode = response && Number.isInteger(response.statusCode)
+        ? response.statusCode
+        : source && source.response && Number.isInteger(source.response.statusCode)
+            ? source.response.statusCode
+            : source && Number.isInteger(source.statusCode) ? source.statusCode : null;
+    if (source && source.code !== undefined && source.code !== null) result.code = source.code;
+    if (statusCode !== null) result.statusCode = statusCode;
+    if (providerCode !== undefined && providerCode !== null && providerCode !== '') result.providerCode = providerCode;
+    result.channel = channel;
+    return result;
+}
+
+function aggregateChannelError(channel, message, failures = []) {
+    const result = channelError(new Error(message), channel);
+    result.failures = failures.filter(Boolean);
+    result.code = `CHANNEL_${safeString(channel).toUpperCase()}_FAILED`;
+    return result;
+}
+
 // 部分通道/API 代理会把数字业务码序列化成字符串；成功语义允许两种 JSON 类型。
 function isCode(value, expected) {
     return value === expected || value === String(expected);
@@ -333,11 +356,12 @@ function pushPlusNotify(text, desp, params = {}) {
             $.post(options, (err, resp, data) => {
                 try {
                     if (err) {
-                    reject(err);
+                        const failure = channelError(err, 'pushplus', resp);
+                        reject(failure);
                         console.log(
                             `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                             }通知消息失败😞\n`,
-                            safeErr(err),
+                            safeErr(failure),
                         );
                     } else {
                         // v3.180：data 判空防御——HTTP 200 + 响应体 JSON null 时 data.code 曾抛
@@ -355,13 +379,20 @@ function pushPlusNotify(text, desp, params = {}) {
                             ); // v3.180：data.msg 也判空——null 时模板访问曾二次抛错走 catch→虚假成功
                             // v3.160：API 级失败(code≠200) reject（与 wxpusher v3.154 同口径）——曾静默 resolve，
                             // 单通道用户主流程写缓存 → 消息永久丢失
-                            reject(new Error(data && data.msg ? safeErr(data.msg) : 'Push+ 发送失败'));
+                            const failure = channelError(
+                                new Error(data && data.msg ? safeErr(data.msg) : 'Push+ 发送失败'),
+                                'pushplus',
+                                resp,
+                                data && data.code,
+                            );
+                            reject(failure);
                         }
                     }
                 } catch (e) {
                     // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
-                    reject(e);
-                    $.logErr(e, resp);
+                    const failure = channelError(e, 'pushplus', resp);
+                    reject(failure);
+                    $.logErr(failure, resp);
                 } finally {
                     resolve(data);
                 }
@@ -420,7 +451,13 @@ function serverNotify(text, desp, params = {}) {
                         } else {
                             console.log(`Server 酱发送通知消息异常 ${safeErr(data)}\n`);
                             // v3.160：API 级失败(errno≠0/1024) reject——曾静默 resolve 致单通道用户消息丢失
-                            reject(new Error(data && data.errmsg ? safeErr(data.errmsg) : 'Server酱 发送失败'));
+                            const failure = channelError(
+                                new Error(data && data.errmsg ? safeErr(data.errmsg) : 'Server酱 发送失败'),
+                                'server酱',
+                                resp,
+                                rawErrno,
+                            );
+                            reject(failure);
                         }
                     }
                 } catch (e) {
@@ -494,23 +531,31 @@ function barkNotify(text, desp, params = {}) {
                 $.post(options, (err, resp, data) => {
                     try {
                         if (err) {
-                            console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(err));
-                            innerResolve({ ok: false });
+                            const failure = channelError(err, 'bark', resp);
+                            console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(failure));
+                            innerResolve({ ok: false, error: failure });
                         } else {
                             // data 判空：HTTP 200 + JSON null 时不依赖 catch 兜底，避免 TypeError 噪音
                             if (data && isCode(data.code, 200)) {
                                 console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`);
                                 innerResolve({ ok: true });
                             } else {
-                                console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${safeErr(data && data.message)}\n`);
+                                const failure = channelError(
+                                    new Error(data && data.message ? safeErr(data.message) : 'Bark 发送失败'),
+                                    'bark',
+                                    resp,
+                                    data && data.code,
+                                );
+                                console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${safeErr(failure)}\n`);
                                 // v3.166：单设备失败不拖垮整体——多设备（# 分割）一个失效时，
                                 // 曾外层 reject → 有效设备已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效设备重复轰炸
-                                innerResolve({ ok: false });
+                                innerResolve({ ok: false, error: failure });
                             }
                         }
                     } catch (e) {
-                        $.logErr(e, resp);
-                        innerResolve({ ok: false });
+                        const failure = channelError(e, 'bark', resp);
+                        $.logErr(failure, resp);
+                        innerResolve({ ok: false, error: failure });
                     } finally {
                         innerResolve({ ok: false });
                     }
@@ -522,7 +567,7 @@ function barkNotify(text, desp, params = {}) {
         // v3.166：至少一个设备成功 = 通道成功（与 sendNotify allSettled 哲学一致）——全部失败才 reject
         Promise.all(pushPromises).then(results => {
             if (results.some(r => r && r.ok)) resolve();
-            else reject(new Error('Bark 全部设备发送失败'));
+            else reject(aggregateChannelError('bark', 'Bark 全部设备发送失败', results.map(r => r && r.error)));
         });
     });
 }
@@ -566,22 +611,30 @@ function pushMeNotify(text, desp, params = {}) {
                 $.post(options, (err, resp, data) => {
                     try {
                         if (err) {
-                            console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, safeErr(err));
-                            innerResolve({ ok: false });
+                            const failure = channelError(err, 'pushme', resp);
+                            console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, safeErr(failure));
+                            innerResolve({ ok: false, error: failure });
                         } else {
                             if (data === 'success') {
                                 console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 成功🎉\n`);
                                 innerResolve({ ok: true });
                             } else {
-                                console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${safeErr(data)}\n`);
+                                const failure = channelError(
+                                    new Error('PushMe 发送失败'),
+                                    'pushme',
+                                    resp,
+                                    data && (data.code !== undefined ? data.code : data.error_code || data.errno),
+                                );
+                                console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${safeErr(failure)}\n`);
                                 // v3.166：单 key 失败不拖垮整体——多 key（# 分割）一个失效时，
                                 // 曾外层 reject → 有效 key 已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效 key 重复轰炸
-                                innerResolve({ ok: false });
+                                innerResolve({ ok: false, error: failure });
                             }
                         }
                     } catch (e) {
-                        $.logErr(e, resp);
-                        innerResolve({ ok: false });
+                        const failure = channelError(e, 'pushme', resp);
+                        $.logErr(failure, resp);
+                        innerResolve({ ok: false, error: failure });
                     } finally {
                         innerResolve({ ok: false });
                     }
@@ -593,7 +646,7 @@ function pushMeNotify(text, desp, params = {}) {
         // v3.166：至少一个 key 成功 = 通道成功（与 sendNotify allSettled 哲学一致）——全部失败才 reject
         Promise.all(pushPromises).then(results => {
             if (results.some(r => r && r.ok)) resolve();
-            else reject(new Error('PushMe 全部 key 发送失败'));
+            else reject(aggregateChannelError('pushme', 'PushMe 全部 key 发送失败', results.map(r => r && r.error)));
         });
     });
 }
@@ -632,7 +685,13 @@ function qywxBotNotify(text, desp, params = {}) {
                         } else {
                             console.log(`企业微信发送通知消息异常 ${data && data.errmsg ? safeErr(data.errmsg) : ''}\n`); // v3.180：errmsg 判空（同 Push+ else 分支）
                             // v3.160：API 级失败(errcode≠0) reject——曾静默 resolve 致单通道用户消息丢失
-                            reject(new Error(data && data.errmsg ? safeErr(data.errmsg) : '企业微信 发送失败'));
+                            const failure = channelError(
+                                new Error(data && data.errmsg ? safeErr(data.errmsg) : '企业微信 发送失败'),
+                                '企业微信',
+                                resp,
+                                data && data.errcode,
+                            );
+                            reject(failure);
                         }
                     }
                 } catch (e) {
@@ -951,7 +1010,13 @@ function wxXiZhiNotify(text, desp, params = {}) {
                             // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数）
                             console.log(safeErr(data));
                             // v3.160：API 级失败(code≠200) reject——曾静默 resolve 致单通道用户消息永久丢失
-                            reject(new Error(data && data.msg ? safeErr(data.msg) : '息知 发送失败'));
+                            const failure = channelError(
+                                new Error(data && data.msg ? safeErr(data.msg) : '息知 发送失败'),
+                                '息知',
+                                resp,
+                                data && (data.code !== undefined ? data.code : data.errcode),
+                            );
+                            reject(failure);
                         }
                     }
                 } catch (e) {
@@ -1003,7 +1068,13 @@ function pushDeerNotify(text, desp, params = {}) {
                                 `PushDeer 发送通知消息异常😞 ${safeErr(data)}\n`,
                             );
                             // v3.160：API 级失败(result 空) reject——曾静默 resolve 致单通道用户消息丢失
-                            reject(new Error('PushDeer 发送失败'));
+                            const failure = channelError(
+                                new Error('PushDeer 发送失败'),
+                                'pushdeer',
+                                resp,
+                                data && (data.code !== undefined ? data.code : data.error_code || data.errno),
+                            );
+                            reject(failure);
                         }
                     }
                 } catch (e) {
@@ -1069,7 +1140,13 @@ function tgNotify(text, desp, params = {}) {
                         } else {
                             console.log(`Telegram 发送通知消息异常 ${safeErr(data)}\n`);
                             // v3.160：API 级失败(ok≠true) reject——曾静默 resolve 致单通道用户消息丢失
-                            reject(new Error(data && data.description ? safeErr(data.description) : 'Telegram 发送失败'));
+                            const failure = channelError(
+                                new Error(data && data.description ? safeErr(data.description) : 'Telegram 发送失败'),
+                                'telegram',
+                                resp,
+                                data && data.error_code,
+                            );
+                            reject(failure);
                         }
                     }
                 } catch (e) {
@@ -1147,7 +1224,9 @@ async function sendNotify(text, desp, params = {}) {
         nonEmpty(push_config.TG_BOT_TOKEN) && nonEmpty(push_config.TG_USER_ID),
     ];
     if (!configuredFlags.some(Boolean)) {
-        throw new Error('未配置任何推送通道（Push+/Server酱/Bark/企业微信/wxpusher/息知/PushDeer/PushMe/Telegram）');
+        const error = new Error('未配置任何推送通道（Push+/Server酱/Bark/企业微信/wxpusher/息知/PushDeer/PushMe/Telegram）');
+        error.code = 'NO_CHANNEL_CONFIG';
+        throw error;
     }
     // 一言开关按显式 true 开启；false/0/空值及其他非法值均关闭，兼容环境变量字符串。
     // 旧逻辑仅排除字符串 'false'，导致 HITOKOTO=0/'0'/undefined 时仍请求一言并额外增加延迟。
@@ -1162,24 +1241,38 @@ async function sendNotify(text, desp, params = {}) {
     // 只启动已配置通道：未配置通道原本虽会立即 resolve，但每条消息仍会创建函数/Promise/对象。
     // 保持数组顺序与 configuredFlags 一致，便于失败统计和后续扩展。
     const channelTasks = [
-        [configuredFlags[0], () => pushPlusNotify(text, desp, params)],
-        [configuredFlags[1], () => serverNotify(text, desp, params)],
-        [configuredFlags[2], () => barkNotify(text, desp, params)],
-        [configuredFlags[3], () => qywxBotNotify(text, desp, params)],
-        [configuredFlags[4], () => wxPusherNotify(text, desp, params)],
-        [configuredFlags[5], () => wxXiZhiNotify(text, desp, params)],
-        [configuredFlags[6], () => pushDeerNotify(text, desp, params)],
-        [configuredFlags[7], () => pushMeNotify(text, desp, params)],
-        [configuredFlags[8], () => tgNotify(text, desp, params)],
+        [configuredFlags[0], 'pushplus', () => pushPlusNotify(text, desp, params)],
+        [configuredFlags[1], 'server酱', () => serverNotify(text, desp, params)],
+        [configuredFlags[2], 'bark', () => barkNotify(text, desp, params)],
+        [configuredFlags[3], '企业微信', () => qywxBotNotify(text, desp, params)],
+        [configuredFlags[4], 'wxpusher', () => wxPusherNotify(text, desp, params)],
+        [configuredFlags[5], '息知', () => wxXiZhiNotify(text, desp, params)],
+        [configuredFlags[6], 'pushdeer', () => pushDeerNotify(text, desp, params)],
+        [configuredFlags[7], 'pushme', () => pushMeNotify(text, desp, params)],
+        [configuredFlags[8], 'telegram', () => tgNotify(text, desp, params)],
     ];
+    const enabledTasks = channelTasks.filter(([enabled]) => enabled);
     const results = await Promise.allSettled(
-        channelTasks.filter(([enabled]) => enabled).map(([, task]) => task()),
+        enabledTasks.map(([, , task]) => task()),
     );
+    results.forEach((result, index) => {
+        if (result.status === 'rejected' && result.reason && typeof result.reason === 'object'
+            && !result.reason.channel) {
+            try { result.reason.channel = enabledTasks[index][1]; } catch (e) { /* 只读错误对象不影响失败结果 */ }
+        }
+    });
     const attempted = results;
     const okCount = attempted.filter(r => r.status === 'fulfilled').length;
     if (attempted.length > 0 && okCount === 0) {
-        const reasons = attempted.map(r => r.reason && r.reason.message ? r.reason.message : String(r.reason || '')).filter(Boolean).join('; ');
-        throw new Error('所有推送通道失败: ' + reasons.slice(0, 200));
+        const failures = attempted
+            .filter(r => r.status === 'rejected')
+            .map(r => r.reason)
+            .filter(Boolean);
+        const reasons = failures.map(reason => reason && reason.message ? reason.message : String(reason || '')).filter(Boolean).join('; ');
+        const error = new Error('所有推送通道失败: ' + reasons.slice(0, 200));
+        error.code = 'ALL_CHANNELS_FAILED';
+        error.failures = failures;
+        throw error;
     }
 }
 

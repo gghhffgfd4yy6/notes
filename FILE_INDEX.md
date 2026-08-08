@@ -77,6 +77,10 @@ Config.storage.minFreeBytes // 磁盘余量告警阈值（只告警，不阻断�
 
 ---
 
+### `xbk_failure_policy.js` — 常驻失败分类策略
+
+**定位**：统一判断网络/服务波动、限流、配置错误、权限错误、响应契约错误和推送摘要失败；未知错误默认按可重试处理，避免误判后永久漏推。常驻入口使用该模块决定有限重试、立即停止和成功后清零。
+
 ### `stryker.config.js` — StrykerJS 变异测试配置
 
 **定位**:正式变异测试入口。使用 Stryker 的 command runner 执行完整单元测试命令，并限制生产源码变异范围；并发数通过 `STRYKER_CONCURRENCY` 调整，默认按当前设备能力取安全上限。
@@ -337,6 +341,10 @@ npm run test:notify
 
 **定位**：test_app 集成测试并行调度器（独立进程、worker 独立缓存目录、精确名单分片、失败片串行重跑）——`npm run test:app`。并发可通过 `CONCURRENCY=N npm run test:app` 调整；需要与 CI 一致的串行完整验证时使用 `npm run test:app:serial`。
 
+### `test_failure_policy.js` — 常驻失败策略回归
+
+**定位**：验证失败类型分类、有限重试、永久错误立即停止、部分成功不熔断、成功恢复和推送摘要失败路径。
+
 ### `.github/workflows/test.yml` — GitHub Actions CI 配置
 
 **定位**：GitHub Actions——push/PR 自动安装官方 got 依赖，并按工作流配置执行单元、通道和串行集成测试；全部 PASS 才可合并。
@@ -345,7 +353,7 @@ npm run test:notify
 
 **定位**：不依赖当前工作目录，自动定位项目根目录并补齐依赖；启动一次后在同一进程内循环执行 `App.run()`，复用主模块、got、Agent、DNS 缓存和 Keep-Alive 连接池。
 
-**行为**：每轮完成后等待配置间隔再拉取；定期在等待期间后台刷新接口/WxPusher DNS 并预热少量 TLS 连接，不阻塞下一轮；单轮异常记录后继续下一轮；收到 SIGTERM/SIGINT 时在当前轮结束后安全停止。通过 `XBK_INTERVAL_MS` 覆盖轮询间隔。单次运行仍使用 `npm start`。
+**行为**：每轮完成后等待配置间隔再拉取；定期在等待期间后台刷新接口/WxPusher DNS 并预热少量 TLS 连接，不阻塞下一轮；网络抖动、超时、限流和服务端暂时故障按有限次数重试并退避，明确不可恢复错误立即停止并返回非零退出状态；推送全部失败依据结构化原因分类，部分成功不熔断，成功一轮清零连续失败；性能预热失败不计入业务失败；收到 SIGTERM/SIGINT 时在当前轮结束后安全停止。通过 `XBK_INTERVAL_MS` 覆盖轮询间隔。单次运行仍使用 `npm start`。
 
 ### `xbk_loop.js` — 常驻循环调度器
 

@@ -3,7 +3,8 @@
 // 青龙面板直接执行入口：不依赖当前工作目录，配置/缓存仍统一放在项目根目录。
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { runLoop } = require(path.join(__dirname, '..', 'xbk_loop'));
+const { runLoop, sleep } = require(path.join(__dirname, '..', 'xbk_loop'));
+const { classifyFailure, classifySummary, summarizeError } = require(path.join(__dirname, '..', 'xbk_failure_policy'));
 
 const ROOT = path.resolve(__dirname, '..');
 const MAIN = path.join(ROOT, 'xbk_function_v3.js');
@@ -67,7 +68,68 @@ async function refreshConnections(app, signal) {
     }
 }
 
-(async () => {
+let residentExitCode = 0;
+let consecutiveRetryableFailures = 0;
+const MAX_CONSECUTIVE_RETRYABLE_FAILURES = 3;
+
+async function runResident(app, controller) {
+    residentExitCode = 0;
+    consecutiveRetryableFailures = 0;
+    const runOnce = async () => {
+        const summary = await app.run();
+        const resultFailure = classifySummary(summary);
+        if (resultFailure) {
+            const error = new Error(resultFailure.info && resultFailure.info.message
+                ? resultFailure.info.message
+                : resultFailure.reason);
+            error.failureKind = resultFailure.kind;
+            error.failureReason = resultFailure.reason;
+            error.failureInfo = resultFailure.info;
+            error.summary = summary;
+            throw error;
+        }
+        consecutiveRetryableFailures = 0;
+        return summary;
+    };
+
+    const handleFailure = async (error) => {
+        const decision = classifyFailure(error);
+        const info = decision.info || summarizeError(error);
+        const detail = info.message || error && error.message || String(error);
+        if (decision.kind === 'permanent') {
+            residentExitCode = 1;
+            console.error(`本轮遇到不可恢复错误（${decision.reason}），停止常驻：${detail}`);
+            controller.abort();
+            return;
+        }
+
+        consecutiveRetryableFailures += 1;
+        console.error(`本轮遇到可重试错误（${decision.reason}），连续失败 ${consecutiveRetryableFailures}/${MAX_CONSECUTIVE_RETRYABLE_FAILURES}：${detail}`);
+        if (consecutiveRetryableFailures >= MAX_CONSECUTIVE_RETRYABLE_FAILURES) {
+            residentExitCode = 1;
+            console.error(`连续 ${MAX_CONSECUTIVE_RETRYABLE_FAILURES} 轮可重试错误仍未恢复，停止常驻`);
+            controller.abort();
+            return;
+        }
+        // 即使轮询间隔被设置为 0，失败重试也必须留出退避时间，避免快速空转打爆接口。
+        const backoffMs = Math.min(30000, 1000 * (2 ** (consecutiveRetryableFailures - 1)));
+        await sleep(backoffMs, controller.signal);
+    };
+
+    await runLoop(runOnce, {
+        intervalMs: intervalMs(app.num),
+        refreshEvery: 10,
+        signal: controller.signal,
+        onInterval: ({ signal }) => refreshConnections(app, signal),
+        onError: handleFailure,
+        // DNS/TLS 预热只是性能优化；预热失败不能被当成业务连续失败。
+        onIntervalError: async (e) => {
+            console.error('常驻连接刷新失败，继续下一轮:', e && e.message ? e.message : String(e));
+        },
+    });
+}
+
+async function main() {
     ensureDependencies();
     const app = require(MAIN);
     const controller = new AbortController();
@@ -75,22 +137,18 @@ async function refreshConnections(app, signal) {
     process.once('SIGTERM', stop);
     process.once('SIGINT', stop);
     console.log(`青龙常驻模式启动，单轮完成后等待 ${intervalMs(app.num)}ms 再拉取`);
-    await runLoop(
-        () => app.run(),
-        {
-            intervalMs: intervalMs(app.num),
-            refreshEvery: 10,
-            signal: controller.signal,
-            onInterval: ({ signal }) => refreshConnections(app, signal),
-            onError: async (e) => {
-                console.error('本轮运行失败，等待下一轮:', e && e.message ? e.message : String(e));
-            },
-        },
-    );
+    await runResident(app, controller);
     process.removeListener('SIGTERM', stop);
     process.removeListener('SIGINT', stop);
-    console.log('青龙常驻模式已停止');
-})().catch((e) => {
-    console.error('青龙任务执行失败:', e && e.message ? e.message : String(e));
-    process.exitCode = 1;
-});
+    if (residentExitCode !== 0) process.exitCode = residentExitCode;
+    console.log(residentExitCode === 0 ? '青龙常驻模式已停止' : '青龙常驻模式因连续/不可恢复错误停止');
+}
+
+if (require.main === module) {
+    main().catch((e) => {
+        console.error('青龙任务执行失败:', e && e.message ? e.message : String(e));
+        process.exitCode = 1;
+    });
+}
+
+module.exports = { classifyFailure, classifySummary, runResident, refreshConnections, intervalMs };
