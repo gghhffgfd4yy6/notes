@@ -58,9 +58,11 @@ function summarizeError(error) {
     const source = error && typeof error === 'object' ? error : { message: error };
     const rawProviderCode = readProp(source, 'providerCode');
     const rawChannel = readProp(source, 'channel');
+    const rawName = readProp(source, 'name');
     const rawMessage = readProp(source, 'message') || readProp(source, 'reason') || source;
     const info = {
         code: codeOf(source),
+        name: rawName ? safeString(rawName).toUpperCase() : '',
         statusCode: statusCodeOf(source),
         providerCode: rawProviderCode === undefined || rawProviderCode === null ? '' : safeString(rawProviderCode),
         channel: rawChannel ? redact(rawChannel).slice(0, 40) : '',
@@ -89,10 +91,17 @@ function classifyOne(error) {
     }
     const code = String(info.code || '').toUpperCase();
     const status = Number.isInteger(info.statusCode) ? info.statusCode : null;
+    const errorName = String(info.name || '').toUpperCase();
     const providerCode = String(info.providerCode || '').toUpperCase();
     const channel = String(info.channel || '').toLowerCase();
     const message = String(info.message || '').toLowerCase();
+    const permanentMessage = /接口返回数据格式异常|未配置任何推送通道|invalid\s+url|module\s+not\s+found|证书.*(主机|域名)|主机名.*证书/.test(message)
+        || /(?:unauthori[sz]ed|forbidden|bad request|not found|invalid\s+(?:token|key|parameter)|(?:token|key|密钥).*(?:invalid|invalidated|无效|错误|不存在|过期))/.test(message)
+        || /(?:参数|配置).*(?:错误|无效|非法)/.test(message);
 
+    if (errorName === 'SYNTAXERROR' || errorName === 'REFERENCEERROR') {
+        return { kind: 'permanent', reason: errorName, info };
+    }
     if (codeIs(code, RETRYABLE_CODES)) return { kind: 'retryable', reason: code, info };
     if (codeIs(code, PERMANENT_CODES)) return { kind: 'permanent', reason: code, info };
     if (channel.includes('wxpusher') && providerCode) {
@@ -101,8 +110,14 @@ function classifyOne(error) {
         }
         return { kind: 'permanent', reason: `WXPUSHER_${providerCode}`, info };
     }
-    if (channel.includes('企业微信') && providerCode === '45009') {
-        return { kind: 'retryable', reason: 'QYWX_RATE_LIMIT', info };
+    if (channel.includes('企业微信') && providerCode) {
+        if (providerCode === '45009') {
+            return { kind: 'retryable', reason: 'QYWX_RATE_LIMIT', info };
+        }
+        return { kind: 'permanent', reason: `QYWX_${providerCode}`, info };
+    }
+    if (permanentMessage) {
+        return { kind: 'permanent', reason: 'CONFIG_OR_CONTRACT', info };
     }
     const numericCode = Number(code);
     if (code === '1001' || code === '429' || (Number.isInteger(numericCode) && numericCode >= 500 && numericCode <= 599)) {
@@ -135,11 +150,6 @@ function classifyOne(error) {
         if (status >= 400 && status < 500) return { kind: 'permanent', reason: `HTTP_${status}`, info };
     }
 
-    if (/接口返回数据格式异常|未配置任何推送通道|invalid\s+url|module\s+not\s+found|证书.*(主机|域名)|主机名.*证书/.test(message)
-        || /(?:unauthori[sz]ed|forbidden|bad request|not found|invalid\s+(?:token|key|parameter)|(?:token|key|密钥).*(?:invalid|invalidated|无效|错误|不存在|过期))/.test(message)
-        || /(?:参数|配置).*(?:错误|无效|非法)/.test(message)) {
-        return { kind: 'permanent', reason: 'CONFIG_OR_CONTRACT', info };
-    }
     if (/(?:timeout|timed out|超时|econn|eai_again|enet|ehost|epipe|socket|rate.?limit|限流|限频|暂时|服务.*(?:不可用|繁忙)|连接.*(?:失败|重置))/.test(message)) {
         return { kind: 'retryable', reason: 'TRANSIENT_TEXT', info };
     }
@@ -168,20 +178,30 @@ function classifySummary(summary) {
     const total = Number(summary.total) || 0;
     const pushed = Number(summary.pushed) || 0;
     const failed = Number(summary.failed) || 0;
-    // 只有“有待推送数据且全部失败”才是常驻失败；部分成功按主流程契约继续运行。
-    if (total <= 0 || failed <= 0 || pushed > 0) return null;
+    // 有失败消息时进入分类；纯部分成功且剩余失败均为可重试/未知时继续，明确永久失败则停止。
+    if (total <= 0 || failed <= 0) return null;
     const failures = Array.isArray(summary.failures) ? summary.failures : [];
     if (failures.length === 0) {
-        return { kind: 'retryable', reason: 'ALL_PUSH_FAILED_UNKNOWN', info: { message: '推送全部失败（原因未结构化）' } };
+        return pushed > 0
+            ? null
+            : { kind: 'retryable', reason: 'ALL_PUSH_FAILED_UNKNOWN', info: { message: '推送全部失败（原因未结构化）' } };
     }
     const nested = failures.map(classifyOne);
-    if (nested.some(x => x.kind === 'retryable')) {
-        return { kind: 'retryable', reason: 'ALL_PUSH_FAILED_TRANSIENT', info: { failures: nested.map(x => x.info) } };
+    const hasRetryable = nested.some(x => x.kind === 'retryable');
+    const hasPermanent = nested.some(x => x.kind === 'permanent');
+    // 混合失败中只要还有可恢复通道，就不能被某一个永久错误过早熔断；
+    // 只有不存在可重试原因时，永久错误才足以停止常驻。
+    if (hasRetryable) {
+        if (pushed > 0) return null;
+        return { kind: 'retryable', reason: 'PUSH_HAS_RETRYABLE_FAILURE', info: { failures: nested.map(x => x.info) } };
     }
-    if (nested.every(x => x.kind === 'permanent')) {
-        return { kind: 'permanent', reason: 'ALL_PUSH_FAILED_PERMANENT', info: { failures: nested.map(x => x.info) } };
+    if (hasPermanent) {
+        return { kind: 'permanent', reason: 'PUSH_HAS_ONLY_PERMANENT_FAILURES', info: { failures: nested.map(x => x.info) } };
     }
-    return { kind: 'retryable', reason: 'ALL_PUSH_FAILED_UNKNOWN', info: { failures: nested.map(x => x.info) } };
+    // 部分成功且剩余失败无法分类：保持主流程“至少有成功就继续”，
+    // 全部失败则保守重试，避免未知错误造成永久漏推。
+    if (pushed > 0) return null;
+    return { kind: 'retryable', reason: 'PUSH_HAS_UNKNOWN_FAILURE', info: { failures: nested.map(x => x.info) } };
 }
 
 module.exports = {

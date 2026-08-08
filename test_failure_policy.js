@@ -49,10 +49,13 @@ function error(message, code) {
     assert.strictEqual(classifyFailure({ code: 401, message: 'unauthorized' }).kind, 'permanent');
     assert.strictEqual(classifyFailure({ providerCode: 40014, message: 'token invalid' }).kind, 'permanent');
     assert.strictEqual(classifyFailure({ providerCode: 500, message: 'provider busy' }).kind, 'retryable');
+    assert.strictEqual(classifyFailure({ providerCode: 500, message: 'invalid token' }).kind, 'permanent');
     assert.strictEqual(classifyFailure({ channel: 'wxpusher', providerCode: 1300, message: 'bad app token' }).kind, 'permanent');
     assert.strictEqual(classifyFailure({ channel: 'wxpusher', providerCode: 1001, message: '速度太快' }).kind, 'retryable');
     assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 45009, message: '频率限制' }).kind, 'retryable');
+    assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 40014, message: '请求失败' }).kind, 'permanent');
     assert.strictEqual(classifyFailure(error('完全未知故障')).kind, 'retryable');
+    assert.strictEqual(classifyFailure(Object.assign(new SyntaxError('代码解析失败'), { name: 'SyntaxError' })).kind, 'permanent');
 
     const summarized = require('./xbk_failure_policy').summarizeError({
         code: 'HTTP_500', providerCode: 500, channel: 'test', message: 'token=SECRET',
@@ -79,9 +82,27 @@ function error(message, code) {
         failures: [{ code: 'HTTP_401', message: 'unauthorized' }],
     }).kind, 'permanent');
     assert.strictEqual(classifySummary({
-        total: 1, pushed: 1, failed: 1,
-        failures: [{ code: 'HTTP_401', message: 'one channel failed' }],
-    }), null, '部分成功仍按主流程成功，不触发常驻熔断');
+        total: 1, pushed: 0, failed: 1,
+        failures: [
+            { code: 'HTTP_401', message: 'permanent failure' },
+            { code: 'ETIMEDOUT', message: 'transient failure' },
+        ],
+    }).kind, 'retryable', '永久+临时混合失败时应保留重试机会');
+    assert.strictEqual(classifySummary({
+        total: 2, pushed: 1, failed: 1,
+        failures: [
+            { code: 'HTTP_401', message: 'permanent failure' },
+            { code: 'ETIMEDOUT', message: 'transient failure' },
+        ],
+    }), null, '部分成功且剩余失败含临时因素时不应熔断');
+    assert.strictEqual(classifySummary({
+        total: 2, pushed: 1, failed: 1,
+        failures: [{ code: 'HTTP_401', message: 'one channel permanent failure' }],
+    }).kind, 'permanent', '部分成功但只剩永久失败时仍应停止');
+    assert.strictEqual(classifySummary({
+        total: 2, pushed: 1, failed: 1,
+        failures: [{ code: 'ETIMEDOUT', message: 'one channel transient failure' }],
+    }), null, '部分成功且仅临时失败时保持继续');
 
     const oldInterval = process.env.XBK_INTERVAL_MS;
     process.env.XBK_INTERVAL_MS = '0';
