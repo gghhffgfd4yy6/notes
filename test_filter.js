@@ -4,7 +4,7 @@
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================
 
-const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, fetchData, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, hasNestedQuantifier, truncateUtf16 } = require('./xbk_function_v3.js');
+const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, fetchData, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, runSingleEntry, hasNestedQuantifier, truncateUtf16 } = require('./xbk_function_v3.js');
 const assert = require('assert');
 const path = require('path');
 // 缓存目录（基于 __dirname——v3.113 修复 /workspace 硬编码，仓库可移植）
@@ -1850,6 +1850,20 @@ await test('parseTime 单数字月日 T 分隔（v3.171：2026-8-1T10:30 曾 Inv
     }
 });
 
+await test('日期统一 UTC：不同宿主时区下单数字月日结果一致', () => {
+    const cp = require('child_process');
+    const script = `const x=require('./xbk_function_v3.js'); Date.now=()=>Date.UTC(2026,7,3,6,0); console.log(JSON.stringify({days:x.daysComputed('2026-8-1T10:30'), display:x.tuisong_replace('{日期}|{时间}', {posttime:'2026-8-1T10:30'})}));`;
+    const outputs = ['UTC', 'Asia/Shanghai', 'Pacific/Honolulu'].map(tz => cp.execFileSync(process.execPath, ['-e', script], {
+        cwd: __dirname,
+        env: { ...process.env, TZ: tz },
+        encoding: 'utf8',
+    }).trim());
+    assertEqual(new Set(outputs).size, 1, `UTC 日期结果不应随宿主时区变化: ${outputs.join(' | ')}`);
+    const result = JSON.parse(outputs[0]);
+    assertEqual(result.days, 2, 'UTC 自然日差应为2');
+    assertEqual(result.display, '2026-08-01|10:30', `日期时间显示应明确按 UTC: ${result.display}`);
+});
+
 await test('truncateUtf16 ZWJ/变体选择符/组合字符不切断（v3.175）', () => {
     // ZWJ 序列：截断后无孤立 ZWJ、无半代理
     assertEqual(truncateUtf16('👨👩👧👦', 3), '👨', '家庭 emoji max=3 → 完整首个');
@@ -3281,6 +3295,14 @@ await test('saveBatch 无id不同url → 互不覆盖（修复前 undefined===un
     assertEqual(r.map(m => m.title).join(','), 'A,B');
 });
 
+await test('saveBatch 无id非字符串 url → 不互相覆盖（v3.228）', () => {
+    saveBatch([{ url: {}, title: '对象URL-A' }], 'test_noid_invalid_url.json');
+    saveBatch([{ url: {}, title: '对象URL-B' }], 'test_noid_invalid_url.json');
+    const r = readMessages(getFilePath('test_noid_invalid_url.json'));
+    assertEqual(r.length, 2, `非字符串 URL 的不同消息应分别保留，实际${r.length}`);
+    assertEqual(r.map(m => m.title).join(','), '对象URL-A,对象URL-B');
+});
+
 await test('saveBatch 无id同url → 更新不重复', () => {
     saveBatch([{ url: '/c.html', title: 'C1' }], 'test_noid_sameurl.json');
     saveBatch([{ url: '/c.html', title: 'C2' }], 'test_noid_sameurl.json');
@@ -3875,9 +3897,14 @@ await test('htmlToMarkdown content_html 对象 → 空（#68）', () => {
     assertEqual(r.includes('[object Object]'), false);
 });
 
-await test('normUrl 主机名大小写归一（#30）', () => {
-    assertEqual(normUrl('HTTP://A.com/x'), normUrl('http://a.com/x'));
-    assertEqual(normUrl('http://a.com/X'), normUrl('http://a.com/X')); // 路径大小写敏感
+await test('safeText：Symbol/异常对象/循环引用不抛且不泄漏伪文本（v3.229）', () => {
+    assertEqual(safeText(Symbol('bad')), '', 'Symbol 应为空串');
+    const bad = { toJSON() { throw new Error('bad json'); } };
+    assertEqual(safeText(bad), '', '异常序列化对象应为空串');
+    const circular = {}; circular.self = circular;
+    assertEqual(safeText(circular), '', '循环对象应为空串');
+    assertEqual(safeText({ a: 1 }), '{"a":1}', '普通对象保留安全 JSON 摘要');
+    assertEqual(safeText('a\uD800b'), 'a�b', '孤立代理应清洗');
 });
 
 await test('_splitLines 单\r 分隔（#84）', () => {
@@ -4102,7 +4129,7 @@ await test('契约: 全部导出键存在且类型正确', () => {
         listfilter: 'function', filterByKeyword: 'function', validateConfig: 'function',
         tuisong_replace: 'function', htmlToMarkdown: 'function', isMessageInFile: 'function',
         appendMessageToFile: 'function', getFileName: 'function', fetchData: 'function',
-        run: 'function', whitelistFilter: 'function', compileRules: 'function',
+        run: 'function', runSingleEntry: 'function', whitelistFilter: 'function', compileRules: 'function',
         matchesCompiled: 'function', checkTimeCompiled: 'function', saveBatch: 'function',
         init: 'function', decodeHtmlEntities: 'function', anonKey: 'function',
         hasValidId: 'function', normUrl: 'function', daysComputed: 'function',
@@ -4112,7 +4139,7 @@ await test('契约: 全部导出键存在且类型正确', () => {
         hasNestedQuantifier: 'function', truncateUtf16: 'function',
     };
     const keys = Object.keys(expected);
-    assertEqual(keys.length, 33, `导出键数应为33，实际${keys.length}`);
+    assertEqual(keys.length, 34, `导出键数应为34，实际${keys.length}`);
     for (const [k, type] of Object.entries(expected)) {
         assertEqual(k in mod, true, `缺少导出: ${k}`);
         assertEqual(typeof mod[k], type, `导出类型错误: ${k} 应为${type}`);
@@ -4129,6 +4156,30 @@ await test('契约: 关键导出可独立调用(bind 生效)', () => {
     assertEqual(typeof mod.whitelistFilter({ title: 'a' }, 'title', 'a'), 'boolean');
     assertEqual(typeof mod.compileRules({}).__compiled, 'boolean');
     assertEqual(mod.Config.domain, 'https://new.ixbk.net');
+});
+
+await test('契约: 单次入口全失败设置非零语义，部分成功保持成功', async () => {
+    const oldExitCode = process.exitCode;
+    try {
+        delete process.exitCode;
+        await runSingleEntry({
+            run: async () => ({ total: 1, pushed: 0, failed: 1, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }] }),
+        });
+        assertEqual(process.exitCode, 1, '全推送失败时单次入口应设置非零退出码');
+        delete process.exitCode;
+        await runSingleEntry({
+            run: async () => ({ total: 2, pushed: 1, failed: 1, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }] }),
+        });
+        assertEqual(process.exitCode, undefined, '部分成功时不应设置失败退出码');
+        delete process.exitCode;
+        await runSingleEntry({
+            run: async () => ({ total: 2, pushed: 1, failed: 1, failures: [{ code: 'HTTP_401', message: 'invalid token' }] }),
+        });
+        assertEqual(process.exitCode, undefined, '部分成功即使失败通道为永久错误，也不应熔断单次入口');
+    } finally {
+        if (oldExitCode === undefined) delete process.exitCode;
+        else process.exitCode = oldExitCode;
+    }
 });
 
 await test('契约: 核心判重链路导出互相一致(has/save/saveBatch 同口径)', () => {
@@ -4668,6 +4719,47 @@ await test('故障注入: saveBatch 落盘失败 → 内存缓存不得提前判
         fs.renameSync = orig;
     }
     assertEqual(isMessageInFile({ id: 991 }, name), false, '落盘失败的消息不能被内存缓存判定为已处理');
+    try { fs.unlinkSync(p); } catch (e) {}
+});
+
+await test('故障注入: 缓存损坏且重置 rename 失败 → 不污染内存，恢复后可重新读取', () => {
+    const fs = require('fs');
+    const name = 'test_reset_failure_memory.json';
+    const p = getFilePath(name);
+    try { fs.unlinkSync(p); } catch (e) {}
+    fs.writeFileSync(p, '{bad json', 'utf8');
+    const origRename = fs.renameSync;
+    fs.renameSync = () => { throw new Error('reset rename 失败'); };
+    try {
+        const first = readMessages(p);
+        assertEqual(Array.isArray(first), true, '损坏缓存读取应返回数组');
+    } finally {
+        fs.renameSync = origRename;
+    }
+    fs.writeFileSync(p, JSON.stringify([{ id: 992 }]), 'utf8');
+    const recovered = readMessages(p);
+    assertEqual(recovered.some(m => m.id === 992), true, '重置失败时不能缓存空数组，恢复后应重新读到磁盘内容');
+    try { fs.unlinkSync(p); } catch (e) {}
+});
+
+await test('故障注入: 缓存读取 ioError → 不缓存空结果，恢复后重新读取', () => {
+    const fs = require('fs');
+    const name = 'test_read_failure_memory.json';
+    const p = getFilePath(name);
+    try { fs.unlinkSync(p); } catch (e) {}
+    fs.writeFileSync(p, JSON.stringify([{ id: 993 }]), 'utf8');
+    const origRead = fs.readFileSync;
+    fs.readFileSync = (filePath, ...args) => {
+        if (filePath === p) throw new Error('read 失败');
+        return origRead.call(fs, filePath, ...args);
+    };
+    try {
+        assertEqual(readMessages(p).length, 0, '读取失败本次返回空数组但不能缓存');
+    } finally {
+        fs.readFileSync = origRead;
+    }
+    const recovered = readMessages(p);
+    assertEqual(recovered.some(m => m.id === 993), true, '读取恢复后必须重新读取文件');
     try { fs.unlinkSync(p); } catch (e) {}
 });
 
@@ -6485,6 +6577,44 @@ await test('边界回归: normUrl 空/空白/null', () => {
 });
 
 console.log('\n📂 112. saveBatch 索引化：判重一致性 + 性能基准');
+
+await test('统一 URL 身份：伪 URL/危险 URL 不参与判重，脏 URL 走匿名身份', () => {
+    const fs = require('fs');
+    assertEqual(safeUrl({}), '', '对象 URL 不应字符串化');
+    assertEqual(validUrl('[object Object]'), '', '历史伪 URL 不应参与判重');
+    assertEqual(validUrl('java\nscript:alert(1)'), '', '危险协议不应参与判重');
+    const name = 'test_identity_url_contract.json';
+    const p = getFilePath(name);
+    try { fs.unlinkSync(p); } catch (e) {}
+    fs.writeFileSync(p, JSON.stringify([{ url: '[object Object]', title: '旧伪URL' }]), 'utf8');
+    saveBatch([{ url: {}, title: '新匿名消息' }], name);
+    assertEqual(readMessages(p).length, 2, '旧伪 URL 与新脏 URL 不应互相吞掉');
+    try { fs.unlinkSync(p); } catch (e) {}
+});
+
+await test('异常 getter 字段在模板/HTML/缓存路径均安全降级（v3.231）', () => {
+    const item = {};
+    Object.defineProperty(item, 'title', {
+        enumerable: true,
+        configurable: true,
+        get() { throw new Error('title getter'); },
+    });
+    Object.defineProperty(item, 'content_html', {
+        enumerable: true,
+        configurable: true,
+        get() { throw new Error('html getter'); },
+    });
+    assertEqual(tuisong_replace('{标题}|{内容}', item), '|', '异常 getter 不应让模板替换抛错');
+    assertEqual(htmlToMarkdown(item), '', '异常 content_html getter 应按空内容处理');
+    item.id = 5832;
+    saveBatch([item], 'test_throwing_getter_cache.json');
+    assertEqual(readMessages(getFilePath('test_throwing_getter_cache.json')).length, 1, '异常 getter 消息仍可安全落盘');
+});
+
+await test('safeUrl 拒绝非换行 ASCII 控制字符（v3.231）', () => {
+    assertEqual(safeUrl('https://example.com/a\u0000b'), '', 'NUL 不应进入 URL 输出/身份');
+    assertEqual(validUrl('https://example.com/a\u0000b'), '', 'NUL URL 不应参与身份判重');
+});
 
 await test('性能: saveBatch 5000 条 <500ms（v3.118 索引化，原 2475ms）', () => {
     const msgs = [];

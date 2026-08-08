@@ -37,11 +37,25 @@ function writeAtomic(filePath, text, label = '缓存文件') {
     }
 }
 
-function readSafeText(filePath) {
+function readSafeTextResult(filePath) {
+    let stat;
     try {
-        if (!fs.lstatSync(filePath).isFile()) return null;
-        return fs.readFileSync(filePath, 'utf8');
-    } catch (e) { return null; }
+        stat = fs.lstatSync(filePath);
+    } catch (e) {
+        if (e && e.code === 'ENOENT') return { status: 'missing', text: null, error: e };
+        return { status: 'ioError', text: null, error: e };
+    }
+    if (!stat.isFile()) return { status: 'unsafe', text: null, error: new Error('非普通文件') };
+    try {
+        return { status: 'ok', text: fs.readFileSync(filePath, 'utf8'), error: null };
+    } catch (e) {
+        return { status: 'ioError', text: null, error: e };
+    }
 }
 
-module.exports = { isRegularOrMissing, writeAtomic, readSafeText };
+function readSafeText(filePath) {
+    const result = readSafeTextResult(filePath);
+    return result.status === 'ok' ? result.text : null;
+}
+
+module.exports = { isRegularOrMissing, writeAtomic, readSafeText, readSafeTextResult };

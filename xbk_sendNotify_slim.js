@@ -59,24 +59,64 @@ function safeSlice(s, max) {
 // 错误摘要（v3.75）：失败日志统一打摘要而非整个 err 对象——
 // $.post 回调的 err 是 err.response.body（API 异常响应体，可能回显请求参数含密钥），
 // 直接 console.log(err) 会在 cron 日志重定向/分享时泄露；截断 200 字符防超长刷屏
+const SECRET_FIELD_RE = /(?:token|app[_-]?token|secret|password|authorization|(?:^|_)(?:key|auth)|bark_push|push_key|pushme_key|deer_key|xizhi_key|bot_token|user_id)/i;
+
+function addSecretCandidates(value, secrets) {
+    const text = safeString(value);
+    if (text.length < 4) return;
+    secrets.add(text);
+    for (const part of text.split('#')) {
+        if (part.length >= 4) secrets.add(part);
+        const m = part.match(/^[a-z][a-z0-9+.-]*:\/\/[^/]+\/(.+)$/i);
+        if (m) {
+            for (const segment of m[1].split(/[^A-Za-z0-9_-]+/)) {
+                if (segment.length >= 4) secrets.add(segment);
+            }
+        }
+    }
+}
+
+function collectConfiguredSecrets(value, fieldName, secrets, seen) {
+    if (value === undefined || value === null) return;
+    if (typeof value === 'string') {
+        // 环境变量 WX_PUSHER_CHANNELS 可能仍是 JSON 字符串，先尝试展开嵌套 appToken。
+        if (/channels/i.test(fieldName || '') && /^[\[{]/.test(value.trim())) {
+            try {
+                const parsed = JSON.parse(value);
+                collectConfiguredSecrets(parsed, fieldName, secrets, seen);
+            } catch (e) { /* 不是 JSON 时继续按普通密钥文本处理 */ }
+        }
+        if (SECRET_FIELD_RE.test(fieldName || '')) addSecretCandidates(value, secrets);
+        return;
+    }
+    if (typeof value !== 'object') return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+        for (const item of value) collectConfiguredSecrets(item, fieldName, secrets, seen);
+        return;
+    }
+    for (const [key, child] of Object.entries(value)) {
+        collectConfiguredSecrets(child, key, secrets, seen);
+    }
+}
+
+function configuredSecrets() {
+    const secrets = new Set();
+    try {
+        const seen = new WeakSet();
+        for (const [key, value] of Object.entries(push_config)) {
+            collectConfiguredSecrets(value, key, secrets, seen);
+        }
+    } catch (e) { /* 配置脏值不影响日志输出 */ }
+    return [...secrets].sort((a, b) => b.length - a.length);
+}
+
 function redactSecrets(text) {
     let out = safeString(text);
     try {
-        for (const value of Object.values(push_config)) {
-            if (typeof value !== 'string' || value.length < 4) continue;
-            // 先替换完整配置值；URL/分隔路径型配置还要拆出 token 段，
-            // 因为服务端错误消息可能只回显路径中的密钥（如 APP_SECRET），而不是完整 URL。
-            const candidates = new Set([value]);
-            const parts = value.split('#').flatMap(part => {
-                const result = part.length >= 4 ? [part] : [];
-                const m = part.match(/^[a-z][a-z0-9+.-]*:\/\/[^/]+\/(.+)$/i);
-                if (m) result.push(...m[1].split(/[^A-Za-z0-9_-]+/).filter(p => p.length >= 4));
-                return result;
-            });
-            for (const part of parts) candidates.add(part);
-            for (const candidate of [...candidates].sort((a, b) => b.length - a.length)) {
-                out = out.split(candidate).join(maskKey(candidate));
-            }
+        for (const candidate of configuredSecrets()) {
+            out = out.split(candidate).join(maskKey(candidate));
         }
     } catch (e) { /* 配置异常不影响错误摘要输出 */ }
     return out;
@@ -519,7 +559,6 @@ function barkNotify(text, desp, params = {}) {
                     isArchive: BARK_ARCHIVE,
                     level: BARK_LEVEL,
                     url: BARK_URL,
-                    ...params,
                 },
                 headers: {
                     'Content-Type': 'application/json',
@@ -598,8 +637,7 @@ function pushMeNotify(text, desp, params = {}) {
                     push_key: trimmedKey,
                     title: text,
                     content: desp,
-                    type: "markdown",
-                    ...params
+                    type: "markdown"
                 },
                 headers: {
                     'Content-Type': 'application/json',

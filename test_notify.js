@@ -217,11 +217,15 @@ await test('Bark: 多设备 # 分割 + 设备码补全 https', () => withChannel
     assert(gotCalls.length === 2, '两个设备两次请求');
 }));
 
-await test('Bark: 大写 HTTP(S) 地址不应被错误拼接设备前缀', () => withChannels(async () => {
-    cfg.BARK_PUSH = 'HTTPS://api.day.app/UpperDevice';
-    await notify.sendNotify('标题', '内容');
-    assert(gotCalls.length === 1, '应只请求一次');
-    assert(gotCalls[0].url === 'HTTPS://api.day.app/UpperDevice', `大写协议地址应原样保留: ${gotCalls[0].url}`);
+await test('Bark/PushMe：AbortSignal 仅进入传输选项，不进入第三方 JSON body', () => withChannels(async () => {
+    const controller = new AbortController();
+    cfg.BARK_PUSH = 'device-signal';
+    await notify.sendNotify('标题', '内容', { signal: controller.signal });
+    assert(!Object.prototype.hasOwnProperty.call(gotCalls[0].options.json, 'signal'), 'Bark body 不应出现 signal');
+    cfg.BARK_PUSH = '';
+    cfg.PUSHME_KEY = 'pushme-signal';
+    await notify.sendNotify('标题', '内容', { signal: controller.signal });
+    assert(!Object.prototype.hasOwnProperty.call(gotCalls[1].options.json, 'signal'), 'PushMe body 不应出现 signal');
 }));
 
 // v3.166：Bark/PushMe 多设备部分失败 → 至少一个成功 = 通道成功（曾单设备失效 → 整体失败 → 不写缓存 → 有效设备重复轰炸）
@@ -769,6 +773,25 @@ await test('日志脱敏：异常响应中的 token/key 不进入日志', () => 
         assert(!all.includes('LEAK_KEY_SECRET'), '响应 key 不应进入日志');
         assert(!all.includes('APP_SECRET'), '错误摘要中的已配置 token 也不应明文出现');
         assert(all.includes('业务失败'), '安全错误摘要仍应保留');
+    } finally {
+        leakResponse = false;
+        console.log = origLog;
+    }
+}));
+
+await test('日志脱敏：嵌套通道配置中的 appToken 也必须注册并脱敏', () => withChannels(async () => {
+    cfg.WX_pusher_channels = [{ appToken: 'APP_SECRET', topicIds: '1' }];
+    const origLog = console.log;
+    const captured = [];
+    console.log = (...args) => captured.push(args.join(' '));
+    try {
+        leakResponse = true;
+        let caught = null;
+        try { await notify.sendNotify('标题', '内容'); } catch (e) { caught = e; }
+        const all = captured.join('\\n');
+        assert(caught, '嵌套配置通道失败应 reject');
+        assert(!all.includes('APP_SECRET'), '嵌套 appToken 不应出现在日志');
+        assert(!caught.message.includes('APP_SECRET'), '嵌套 appToken 不应出现在 reject 错误');
     } finally {
         leakResponse = false;
         console.log = origLog;

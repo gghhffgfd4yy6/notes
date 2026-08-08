@@ -81,13 +81,11 @@ function error(message, code) {
         total: 1, pushed: 0, failed: 1,
         failures: [{ code: 'HTTP_401', message: 'unauthorized' }],
     }).kind, 'permanent');
-    assert.strictEqual(classifySummary({
-        total: 1, pushed: 0, failed: 1,
-        failures: [
-            { code: 'HTTP_401', message: 'permanent failure' },
-            { code: 'ETIMEDOUT', message: 'transient failure' },
-        ],
-    }).kind, 'retryable', '永久+临时混合失败时应保留重试机会');
+    assert.strictEqual(classifyFailure({
+        code: 'HTTP_401', message: 'invalid token + timeout summary', failureKind: 'permanent',
+        failures: [{ code: 'HTTP_401', message: 'invalid token' }, { code: 'ETIMEDOUT', message: 'timeout' }],
+    }).kind, 'retryable', '顶层 permanent 标签不能覆盖嵌套 retryable 失败');
+
     assert.strictEqual(classifySummary({
         total: 2, pushed: 1, failed: 1,
         failures: [
@@ -98,7 +96,7 @@ function error(message, code) {
     assert.strictEqual(classifySummary({
         total: 2, pushed: 1, failed: 1,
         failures: [{ code: 'HTTP_401', message: 'one channel permanent failure' }],
-    }).kind, 'permanent', '部分成功但只剩永久失败时仍应停止');
+    }), null, '部分成功即保持成功，不应因失败通道的永久错误熔断');
     assert.strictEqual(classifySummary({
         total: 2, pushed: 1, failed: 1,
         failures: [{ code: 'ETIMEDOUT', message: 'one channel transient failure' }],

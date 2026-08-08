@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.227 — 常驻刷新任务有界 ********
+//******** 线报酷推送脚本 v3.231 — V3统一契约收敛收尾 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -55,7 +55,7 @@ function getNotify() {
 const fs = profile3Require('fs', () => require('fs'));
 const { fetchJson } = profile3Require('xbk_http', () => require('./xbk_http'));
 const { prewarmDns, prewarmTls } = profile3Require('xbk_agents', () => require('./xbk_agents'));
-const { isRegularOrMissing, readSafeText, writeAtomic } = profile3Require('xbk_storage', () => require('./xbk_storage'));
+const { isRegularOrMissing, readSafeText, readSafeTextResult, writeAtomic } = profile3Require('xbk_storage', () => require('./xbk_storage'));
 const { summarizeError } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'));
 const path = profile3Require('path', () => require('path'));
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
@@ -221,7 +221,21 @@ const Utils = {
             }
             return null;
         }
-        // 严格匹配完整 YYYY-MM-DD（1~2 位月日；锚定结尾，拒绝 2026-07-31abc 脏前缀）
+        // 显式解析无时区的日期时间（含单数字月日），统一按 UTC，不再落入宿主本地时区。
+        const dateTime = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/);
+        if (dateTime) {
+            const y = +dateTime[1], mo = +dateTime[2], d = +dateTime[3];
+            const hh = +dateTime[4], mm = +dateTime[5], ss = dateTime[6] === undefined ? 0 : +dateTime[6];
+            const ms = dateTime[7] === undefined ? 0 : +(dateTime[7] + '00').slice(0, 3);
+            if (mo < 1 || mo > 12 || d < 1 || d > 31 || hh > 23 || mm > 59 || ss > 59) return null;
+            const t = new Date(Date.UTC(y, mo - 1, d, hh, mm, ss, ms));
+            if (t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d
+                && t.getUTCHours() === hh && t.getUTCMinutes() === mm && t.getUTCSeconds() === ss) {
+                return t.getTime();
+            }
+            return null;
+        }
+
         // v3.115 时区修复：Date.UTC 解析（同 8 位日期）
         const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
         if (m) {
@@ -297,19 +311,137 @@ const Utils = {
         return s;
     },
 
+    /**
+     * 用户/接口 URL 的统一安全字符串入口：仅接受非空字符串且拒绝危险协议。
+     * 只负责类型、空白和协议安全；是否参与身份判重由 validUrl 决定。
+     */
+    safeUrl(u) {
+        if (typeof u !== 'string') return '';
+        const value = u.replace(/[\r\n]+/g, '').trim();
+        // 换行历史上按既有契约剥离；其余 ASCII 控制字符不能进入 Markdown/JSON/缓存身份。
+        if (/[\u0000-\u001F\u007F]/.test(value)) return '';
+        if (!value) return '';
+        // 兼容早期错误缓存：非字符串 URL 曾被 String() 写成这些伪值，不能继续参与身份判重。
+        if (/^(?:\[object\s+(?:object|array)\]|undefined|null|true|false)$/i.test(value)) return '';
+        // 统一先经过危险协议判定：实体编码、内部控制空白和大小写变体都必须在同一入口拒绝。
+        if (this.isDangerousUrl(value)) return '';
+        return value;
+    },
+
+    /**
+     * 可用于身份判重的 URL：仅接受字符串、可归一化且非危险协议。
+     * 非字符串 URL（对象/数组/数字/Symbol）不能通过 String() 变成判重键，
+     * 否则不同脏数据会共同落到 `[object Object]` 等伪 URL，造成静默丢消息。
+     */
+    validUrl(u) {
+        const safe = this.safeUrl(u);
+        if (!safe) return '';
+        const normalized = this.normUrl(safe);
+        return normalized || '';
+    },
+
+    /**
+     * 安全读取用户/接口对象字段：代理 getter 或异常 getter 不能中断主流程。
+     */
+    safeGet(object, key, fallback = undefined) {
+        try {
+            return object && object[key] !== undefined ? object[key] : fallback;
+        } catch (e) {
+            return fallback;
+        }
+    },
+
+    /**
+     * 安全写入用户/接口对象字段：只把可写字段归一化，setter 异常不影响整批处理。
+     */
+    safeSet(object, key, value) {
+        try {
+            if (object && (typeof object === 'object' || typeof object === 'function')) object[key] = value;
+            return true;
+        } catch (e) {
+            return false;
+        }
+    },
+
+    /**
+     * 安全浅复制对象：逐字段读取并隔离异常 getter，不让脏字段破坏模板、推送或缓存事务。
+     * 使用 defineProperty 写入，避免 __proto__ 等键触发原型 setter。
+     */
+    safeObjectCopy(object) {
+        const out = {};
+        if (!object || (typeof object !== 'object' && typeof object !== 'function')) return out;
+        let keys;
+        try { keys = Object.keys(object); } catch (e) { return out; }
+        for (const key of keys) {
+            try {
+                Object.defineProperty(out, key, {
+                    value: object[key], enumerable: true, configurable: true, writable: true,
+                });
+            } catch (e) { /* 异常 getter/代理字段跳过 */ }
+        }
+        return out;
+    },
+
+    /**
+     * 生成统一消息身份：id 优先，随后是有效 URL，最后是稳定匿名合成键。
+     * 所有判重、缓存、截断和成功状态路径必须复用该函数，避免各入口各自拼 key。
+     */
+    getMessageIdentity(message) {
+        if (!this.isValidItem(message)) return { valid: false, kind: 'invalid', key: '', idKey: '', url: '' };
+        if (this.hasValidId(message)) {
+            const id = this.safeGet(message, 'id');
+            const idKey = String(id);
+            const url = this.validUrl(this.safeGet(message, 'url'));
+            // 兼容历史 App 生成的匿名 id：让它与旧缓存中仍无 id/URL 的同一条消息保持同一身份。
+            if (/^anon:[0-9a-f]+$/i.test(idKey) && !url) {
+                return { valid: true, kind: 'anon', key: idKey, idKey: '', url: '', anonKey: idKey };
+            }
+            return { valid: true, kind: 'id', key: `id:${idKey}`, idKey, url };
+        }
+        const url = this.validUrl(this.safeGet(message, 'url'));
+        if (url) return { valid: true, kind: 'url', key: `url:${url}`, idKey: '', url };
+        const anon = this.anonKey(
+            this.safeGet(message, 'title'),
+            this.safeGet(message, 'content'),
+            this.safeGet(message, 'posttime'),
+            this.safeGet(message, 'shijianchuo'),
+            this.safeGet(message, 'pic'),
+            this.safeGet(message, 'mall_name'),
+            this.safeGet(message, 'price'),
+            this.safeGet(message, 'brand'),
+            this.safeGet(message, 'catename'),
+            this.safeGet(message, 'louzhu'),
+        );
+        return { valid: true, kind: 'anon', key: anon, idKey: '', url: '', anonKey: anon };
+    },
+
+    /**
+     * 统一判重关系：保留 id 权威 + 有效 URL 双向 fallback，同时支持匿名合成键。
+     */
+    sameMessageIdentity(left, right) {
+        const a = this.getMessageIdentity(left);
+        const b = this.getMessageIdentity(right);
+        if (!a.valid || !b.valid) return false;
+        if (a.kind === 'id') {
+            return a.idKey === b.idKey || (b.kind !== 'id' && !!a.url && !!b.url && a.url === b.url);
+        }
+        if (a.url) return !!b.url && a.url === b.url;
+        return b.kind === 'anon' && a.key === b.key;
+    },
+
     /** 有效数据条目：对象且非数组（排除 null/原始值/嵌套数组） */
     isValidItem(m) {
         return !!(m && typeof m === 'object' && !Array.isArray(m));
     },
 
-    /** 是否拥有有效 id：仅接受非空字符串与有限数字（布尔/对象/数组/Symbol/NaN 视为无效，避免误合并） */
     hasValidId(m) {
-        // v3.107 fuzz 发现：m 本身缺失/非对象时 m.id 会抛 TypeError（公开导出应防御）
+        // v3.107 fuzz 发现：m 本身缺失/非对象时 m.id 会抛 TypeError；异常 getter 也按无效 id 处理。
         if (m === undefined || m === null || typeof m !== 'object') return false;
-        if (m.id === undefined || m.id === null) return false;
-        const t = typeof m.id;
-        if (t === 'string') return m.id.trim() !== '';
-        if (t === 'number') return Number.isFinite(m.id); // 数字 id 有效（含 0，语义依数据源）
+        const id = this.safeGet(m, 'id');
+        if (id === undefined || id === null) return false;
+        const t = typeof id;
+        if (t === 'string') return id.trim() !== '';
+        if (t === 'number') return Number.isFinite(id); // 数字 id 有效（含 0，语义依数据源）
         return false; // 布尔/对象/数组/Symbol 等脏数据 id 一律无效
     },
 
@@ -399,6 +531,36 @@ const Utils = {
     sanitizeSurrogates(s) {
         try { s = String(s === undefined || s === null ? '' : s); } catch (e) { return ''; }
         return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+    },
+
+    /**
+     * 用户字段安全文本化：模板/日志路径不能把 Symbol、异常 toString、循环对象带入主流程。
+     * 字符串/数字/布尔/BigInt 保持可读；Symbol、函数和不可序列化对象保守置空。
+     */
+    safeText(value, fallback = '') {
+        if (value === undefined || value === null) return fallback;
+        if (typeof value === 'symbol' || typeof value === 'function') return fallback;
+        let text;
+        try {
+            if (typeof value === 'object') {
+                text = JSON.stringify(value);
+                if (text === undefined) return fallback;
+            } else {
+                text = String(value);
+            }
+        } catch (e) {
+            return fallback;
+        }
+        try { return this.sanitizeSurrogates(text); }
+        catch (e) { return fallback; }
+    },
+
+    safeErrorText(error, fallback = '') {
+        const message = this.safeGet(error, 'message');
+        if (message !== undefined && message !== null && message !== '') return this.safeText(message, fallback);
+        const code = this.safeGet(error, 'code');
+        if (code !== undefined && code !== null && code !== '') return this.safeText(code, fallback);
+        return fallback;
     },
 
     /**
@@ -528,14 +690,12 @@ const Formatter = {
     },
 
     htmlToMarkdown(shuju) {
-        shuju = shuju || {};
+        shuju = Utils.safeObjectCopy(shuju || {});
         let html = (typeof shuju.content_html === 'string') ? shuju.content_html
             : (shuju.content_html === undefined || shuju.content_html === null ? '' : ''); // 非字符串内容视为空（避免 [object Object]）
-        // url 文本与链接目标统一：非字符串视为无链接（与 urlOf 口径一致，避免 '[object Object]' 泄漏）、剥离换行（Markdown 链接文本/目标内的裸换行都会破坏链接，#65）
-        const urlText = (typeof shuju.url === 'string') ? shuju.url.replace(/[\r\n]+/g, '') : '';
-        // v3.170：url 危险协议过滤（与 a href 的 javascript:/vbscript:/data: 检查同口径）——
-        // 曾 {链接}/原文链接 对接口 url 无协议过滤；正常链接/相对路径不受影响
-        const safeUrl = urlText && !Utils.isDangerousUrl(urlText) ? urlText : '';
+        // URL 文本/目标统一使用 safeUrl：非字符串、空值、伪 URL、危险协议和换行都不生成 Markdown 链接。
+        const urlText = Utils.safeUrl(shuju && shuju.url);
+        const safeUrl = urlText;
         // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）
         const mdUrl = safeUrl && /[\s()\[\]]/.test(safeUrl) ? `<${safeUrl}>` : safeUrl;
         // 无标签内容短路：跳过整个替换链（性能优化）
@@ -546,20 +706,18 @@ const Formatter = {
         html = html
             .replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_, lv, c) => '#'.repeat(lv) + ' ' + c + '\n\n')
             .replace(/<a\s*[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
-                // 空 href 不生成空链接；危险协议(javascript:/vbscript:/data:)仅保留文本，防 XSS
-                // v3.143：href 先解码实体再检查——'javascript&#58;' 曾绕过（decode 在 a 转换后）
-                return (href.trim() && !Utils.isDangerousUrl(href)) ? `[${txt}](${href})` : txt;
+                const cleanHref = Utils.safeUrl(href);
+                return cleanHref ? `[${txt}](${cleanHref})` : txt;
             })
-            // v3.170：无引号 href（HTML 合法写法，`<a href=https://x.com>`）曾不匹配 → 链接丢失变纯文本——
-            // 追加处理（带引号的已被上方替换吃掉，此处只处理剩余的无引号形式）
             .replace(/<a\s+[^>]*?href\s*=\s*([^\s"'>]+)[^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
-                return (href.trim() && !Utils.isDangerousUrl(href)) ? `[${txt}](${href})` : txt;
+                const cleanHref = Utils.safeUrl(href);
+                return cleanHref ? `[${txt}](${cleanHref})` : txt;
             })
             .replace(/<img\b[^>]*>/gi, (tag) => {
                 const srcM = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i) || tag.match(/\bsrc\s*=\s*([^\s"'<>`]+)/i);
                 if (!srcM) return tag; // 无 src 不转换
-                const src = srcM[1].trim();
-                if (!src || Utils.isDangerousUrl(src)) return tag.replace(/\bsrc\s*=\s*(?:(["'])[^"']*\1|[^\s"'<>`]+)/i, ''); // 空/危险 src 不生成可执行图片链接
+                const src = Utils.safeUrl(srcM[1]);
+                if (!src) return tag.replace(/\bsrc\s*=\s*(?:(["'])[^"']*\1|[^\s"'<>`]+)/i, ''); // 空/危险 src 不生成可执行图片链接
                 const altM = tag.match(/\balt\s*=\s*["']([^"']*)["']/i) || tag.match(/\balt\s*=\s*([^\s"'<>`]+)/i);
                 // alt 截断（真实接口 alt 可长达 250+ 字符拖累推送）——代理对安全
                 const alt = altM ? Utils.truncateUtf16(altM[1], 50) : '';
@@ -600,7 +758,7 @@ const Formatter = {
         // 防御：模板缺失/非字符串时转空串或字符串化，避免 text.includes 崩溃
         // v3.108 fuzz：String(嵌套 Symbol 数组) 崩 → 视为空模板
         try { text = text === undefined || text === null ? '' : String(text); } catch (e) { text = ''; }
-        const data = { ...shuju };
+        const data = Utils.safeObjectCopy(shuju);
 
         if (data.category_name) data.catename = data.category_name;
         if (data.category_id) data.cateid = data.category_id; // 与 category_name→catename 对称（修复 {分类ID} 恒空）
@@ -629,8 +787,8 @@ const Formatter = {
         // 避免像 App.run 里那样对同一条数据分别调用 tuisong_replace 生成 text/desp 时，
         // 没用到 Markdown 的那次也白白算一遍 htmlToMarkdown
         // url 做 HTML 转义，避免特殊字符破坏 <a href="..."> 结构；换行先剥离（v3.85，与 linkText 口径一致）；非字符串视为无链接（R6-1）
-        const rawUrl = (typeof data.url === 'string' ? data.url : '').replace(/[\r\n]+/g, '');
-        const safeHtmlUrl = rawUrl && !Utils.isDangerousUrl(rawUrl) ? rawUrl : '';
+        const rawUrl = Utils.safeUrl(Utils.safeGet(data, 'url'));
+        const safeHtmlUrl = rawUrl;
         const escUrl = safeHtmlUrl
             .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         // 与 htmlToMarkdown 口径一致：非字符串 content_html 视为空（避免 [object Object] 泄漏）
@@ -643,10 +801,8 @@ const Formatter = {
         // 含空格/括号/] 用 <> 包裹、剥离换行（原样输出会在 Markdown 链接场景破坏）
         const linkText = (() => {
             // R6-1：非字符串视为无链接（与 htmlToMarkdown urlText 同口径）
-            const u = (typeof data.url === 'string') ? data.url.replace(/[\r\n]+/g, '') : '';
-            // v3.170：危险协议过滤（与 htmlToMarkdown safeUrl 同口径）——{链接} 曾对 javascript: 等无拦截
-            const safeU = u && !Utils.isDangerousUrl(u) ? u : '';
-            return safeU && /[\s()\[\]]/.test(safeU) ? `<${safeU}>` : safeU;
+            const u = Utils.safeUrl(Utils.safeGet(data, 'url'));
+            return u && /[\s()\[\]]/.test(u) ? `<${u}>` : u;
         })();
         const getContentHtml = () => safeHtmlUrl
             ? `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`
@@ -671,12 +827,7 @@ const Formatter = {
         };
 
         for (const [key, val] of Object.entries(map)) {
-            text = text.replace(new RegExp(key, 'g'), () => {
-                if (val === undefined || val === null) return '';
-                if (typeof val !== 'object') return val;
-                try { return JSON.stringify(val); }
-                catch (e) { return ''; } // 循环引用等脏字段不应让整条推送流程崩溃
-            });
+            text = text.replace(new RegExp(key, 'g'), () => Utils.safeText(val));
         }
         // v3.110：输出统一清洗孤立代理（encodeURIComponent 会崩；所有模板路径受益）
         return Utils.sanitizeSurrogates(text);
@@ -921,15 +1072,16 @@ const RuleEngine = {
 
     /** 编译后的天数规则检查 */
     checkTimeCompiled(compiled, group) {
-        if (!compiled || !group || group.louzhuregtime === undefined || group.louzhuregtime === null || group.louzhuregtime === '') return null; // null = 不拦截；0 时间戳视为有效
-        const days = Utils.daysComputed(group.louzhuregtime);
+        const regTime = Utils.safeGet(group, 'louzhuregtime');
+        if (!compiled || !group || regTime === undefined || regTime === null || regTime === '') return null; // null = 不拦截；0 时间戳视为有效
+        const days = Utils.daysComputed(regTime);
 
         if (compiled._type === 'time') {
             return compiled.value > days; // true = 拦截
         }
 
         if (compiled._type === 'timeMulti') {
-            return this._anyRule(compiled.rules, group.catename, r => r.value > days);
+            return this._anyRule(compiled.rules, Utils.safeGet(group, 'catename'), r => r.value > days);
         }
 
         return false;
@@ -1061,7 +1213,7 @@ const FilterEngine = {
     /** 缺字段保守放行统一：compiled/group 缺失或字段缺失 → true；否则取反执行检查 */
     _passIfMissing(group, field, compiled, checkFn) {
         if (!compiled || !group) return true;
-        const v = group[field];
+        const v = Utils.safeGet(group, field);
         if (v === undefined || v === null || v === '') return true;
         return !checkFn(compiled, group);
     },
@@ -1074,7 +1226,7 @@ const FilterEngine = {
 
     /** 分类屏蔽（使用编译后的规则） */
     checkCategory(group, compiled) {
-        return this._passIfMissing(group, 'catename', compiled, (c, g) => RuleEngine.matchesCompiled(c, g.catename, null));
+        return this._passIfMissing(group, 'catename', compiled, (c, g) => RuleEngine.matchesCompiled(c, Utils.safeGet(g, 'catename'), null));
     },
 
     /**
@@ -1092,9 +1244,9 @@ const FilterEngine = {
      */
     checkFields(group, compiled) {
         const fieldStages = [
-            { key: 'louzhu',  getVal: (g) => g.louzhu,  showCfg: compiled.zhanxianlouzhu,  blockCfg: compiled.pingbilouzhu,  plusCfg: compiled.pingbilouzhuplus,  blockedBy: [] },
-            { key: 'title',   getVal: (g) => g.title,   showCfg: compiled.zhanxianbiaoti,   blockCfg: compiled.pingbibiaoti,   plusCfg: compiled.pingbibiaotiplus,   blockedBy: ['louzhu'] },
-            { key: 'content', getVal: (g) => g.content, showCfg: compiled.zhanxianneirong,  blockCfg: compiled.pingbineirong,  plusCfg: compiled.pingbineirongplus,  blockedBy: ['louzhu', 'title'] },
+            { key: 'louzhu',  getVal: (g) => Utils.safeGet(g, 'louzhu'),  showCfg: compiled.zhanxianlouzhu,  blockCfg: compiled.pingbilouzhu,  plusCfg: compiled.pingbilouzhuplus,  blockedBy: [] },
+            { key: 'title',   getVal: (g) => Utils.safeGet(g, 'title'),   showCfg: compiled.zhanxianbiaoti,   blockCfg: compiled.pingbibiaoti,   plusCfg: compiled.pingbibiaotiplus,   blockedBy: ['louzhu'] },
+            { key: 'content', getVal: (g) => Utils.safeGet(g, 'content'), showCfg: compiled.zhanxianneirong,  blockCfg: compiled.pingbineirong,  plusCfg: compiled.pingbineirongplus,  blockedBy: ['louzhu', 'title'] },
         ];
 
         const showFlags = {};
@@ -1105,7 +1257,7 @@ const FilterEngine = {
         for (const stage of fieldStages) {
             const val = stage.getVal(group);
             if (stage.showCfg && val) {
-                if (RuleEngine.matchesCompiled(stage.showCfg, val, group.catename)) {
+                if (RuleEngine.matchesCompiled(stage.showCfg, val, Utils.safeGet(group, 'catename'))) {
                     showFlags[stage.key] = true;
                 }
             }
@@ -1118,12 +1270,12 @@ const FilterEngine = {
             const blocked = stage.blockedBy.some(k => showFlags[k]);
 
             if (stage.blockCfg && !blocked && !showFlags[stage.key]) {
-                if (RuleEngine.matchesCompiled(stage.blockCfg, val, group.catename)) {
+                if (RuleEngine.matchesCompiled(stage.blockCfg, val, Utils.safeGet(group, 'catename'))) {
                     blockFlags[stage.key] = true;
                 }
             }
             if (stage.plusCfg && !blocked && !blockFlags[stage.key]) {
-                if (RuleEngine.matchesCompiled(stage.plusCfg, val, group.catename)) {
+                if (RuleEngine.matchesCompiled(stage.plusCfg, val, Utils.safeGet(group, 'catename'))) {
                     blockPlusFlags[stage.key] = true;
                     showFlags[stage.key] = false;
                 }
@@ -1172,11 +1324,11 @@ const FilterEngine = {
         try { kwStr = String(keyword); } catch (e) { return true; } // 嵌套 Symbol 数组 String() 崩 → 放行
         if (kwStr.trim() === '') return true;
         if (!item) return false; // 防御：item 缺失 = 不匹配
-        const value = item[field];
+        const value = Utils.safeGet(item, field);
         if (!value) return false;
         if (RuleEngine.hasNestedQuantifier(kwStr)) return true; // ReDoS 防护：风险关键词不执行匹配，全部放行（与非法正则口径一致）
         try {
-            return new RegExp(kwStr, 'i').test(value);
+            return new RegExp(kwStr, 'i').test(typeof value === 'string' ? value : Utils.safeText(value, ''));
         } catch (e) {
             // 非法正则：放行（与 App.run 的 zkt_gjc 预编译失败 kwRe=null 不过滤口径一致；宁可多推不可少推）
             return true;
@@ -1250,21 +1402,16 @@ const MessageStore = {
             if (changed) {
                 console.log(`更新缓存记录: ${filename}`);
             }
-            messages[idx] = { ...message, timestamp: new Date().toISOString() };
+            messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: new Date().toISOString() };
         } else {
-            messages.push({ ...message, timestamp: new Date().toISOString() });
+            messages.push({ ...Utils.safeObjectCopy(message), timestamp: new Date().toISOString() });
         }
     },
 
-    /** 统一判重：有效 id 优先（类型归一 + 有效 url 兜底，兼容旧 url-only 缓存与 id 类型漂移），否则 url fallback */
+    /** 统一判重：所有入口复用 Utils.sameMessageIdentity，避免单条/批内/缓存逻辑分裂 */
     _findDedupIndex(messages, message) {
-        const messageUrl = message && message.url ? Utils.normUrl(message.url) : '';
-        return messages.findIndex(m => {
-            const cachedUrl = m && m.url ? Utils.normUrl(m.url) : '';
-            const sameValidUrl = !!(messageUrl && cachedUrl && messageUrl === cachedUrl);
-            return (Utils.hasValidId(message) && (String(m.id) === String(message.id) || (!Utils.hasValidId(m) && sameValidUrl))) ||
-                (!Utils.hasValidId(message) && sameValidUrl);
-        });
+        if (!Array.isArray(messages)) return -1;
+        return messages.findIndex(m => Utils.sameMessageIdentity(m, message));
     },
 
     init() {
@@ -1306,17 +1453,18 @@ const MessageStore = {
         }
     },
 
-    /** 重置缓存文件为空数组（写 '[]' 并更新内存缓存；写失败也容错——双故障时 readMessages 不崩） */
+    /** 重置缓存文件为空数组：只有原子写成功后才更新内存权威状态。 */
     _resetCache(filePath) {
-        writeAtomic(filePath, '[]', '缓存重置');
-        this._memoSet(filePath, []);
+        const saved = writeAtomic(filePath, '[]', '缓存重置');
+        if (saved) this._memoSet(filePath, []);
+        return saved;
     },
 
     readMessages(filePath) {
         // R5-2：hasOwnProperty 读取（'__proto__' 直读会返回 Object.prototype 而非缓存值）
         if (Object.prototype.hasOwnProperty.call(this._memoryCache, filePath)) {
             // 常驻进程保护：外部误删缓存文件时，内存中的权威快照继续用于判重，
-            // 并尝试原子恢复磁盘文件，避免进程重启后持久化去重状态丢失。
+            // 并尝试原子恢复磁盘文件；恢复失败时保留旧快照，不写入空数组。
             let exists = true;
             try { exists = fs.existsSync(filePath); } catch (e) { exists = true; }
             if (!exists) {
@@ -1326,25 +1474,33 @@ const MessageStore = {
             return this._memoryCache[filePath];
         }
         this._ensureFileExists(filePath);
-        try {
-            const raw = readSafeText(filePath);
-            const data = JSON.parse(raw || '[]');
-            if (Array.isArray(data)) {
-                // 过滤非对象元素（null/原始值），避免后续 has/save 访问 m.id 崩溃
-                // v3.157：排除数组元素（typeof object 含数组——数组元素 m.id 访问异常、判重混乱）
-                const clean = data.filter(m => m && typeof m === 'object' && !Array.isArray(m));
-                this._memoSet(filePath, clean);
-                return clean;
-            }
-            // 合法 JSON 但非数组（对象等）→ 重置，避免后续 .some()/.findIndex() 崩溃
-            console.error(`缓存格式异常（非数组），重置文件 ${filePath}`);
-            this._resetCache(filePath);
+        const result = readSafeTextResult(filePath);
+        if (result.status !== 'ok') {
+            const detail = result.error && result.error.message ? result.error.message : result.status;
+            if (result.status === 'unsafe') console.error(`拒绝读取非普通缓存文件 ${filePath}`);
+            else if (result.status === 'ioError') console.error(`缓存读取失败 ${filePath}:`, detail);
+            // missing/ioError/unsafe 都不能缓存空数组；后续恢复后仍应重新读取磁盘。
             return [];
+        }
+        let data;
+        try {
+            data = JSON.parse(result.text || '[]');
         } catch (e) {
             console.error(`JSON解析错误，重置文件 ${filePath}:`, e.message);
             this._resetCache(filePath);
             return [];
         }
+        if (Array.isArray(data)) {
+            // 过滤非对象元素（null/原始值），避免后续 has/save 访问 m.id 崩溃
+            // v3.157：排除数组元素（typeof object 含数组——数组元素 m.id 访问异常、判重混乱）
+            const clean = data.filter(m => m && typeof m === 'object' && !Array.isArray(m));
+            this._memoSet(filePath, clean);
+            return clean;
+        }
+        // 合法 JSON 但非数组（对象等）→ 重置，避免后续 .some()/.findIndex() 崩溃
+        console.error(`缓存格式异常（非数组），重置文件 ${filePath}`);
+        this._resetCache(filePath);
+        return [];
     },
 
     saveMessages(filePath, messages) {
@@ -1395,8 +1551,12 @@ const MessageStore = {
     },
 
     save(message, filename) {
-        // 单条是批量的特例：复用 saveBatch（含元素校验/统一 upsert/原子写）
-        return this.saveBatch([message], filename);
+        // 单条写入走同一统一身份/事务路径，同时保留 _upsert 作为单条缓存 API 的可达实现。
+        if (!Utils.isValidItem(message)) return false;
+        const filePath = this.getFilePath(filename);
+        const messages = [...this.readMessages(filePath)];
+        this._upsert(messages, message, filename);
+        return this.saveMessages(filePath, messages);
     },
 
     /** 批量写入：一次性 append 多条消息，只触发一次磁盘写入（用于单次运行内的多条新数据） */
@@ -1406,78 +1566,67 @@ const MessageStore = {
         const filePath = this.getFilePath(filename);
         // readMessages 可能返回进程内内存缓存权威数组；先复制，避免落盘失败前原地污染内存缓存。
         const messages = [...this.readMessages(filePath)];
-        // v3.118 性能：逐条 _upsert 的 findIndex 是 O(N×M)（缓存 100 条 + 新 N 条累积 → O(N²)，
-        // 实测 5000 条 2475ms）。构建 id/url 索引 O(1) 判重定位，维护 O(1)。
-        // 判重口径与 _findDedupIndex 完全一致：有 id 匹配 String(id)（或 m 无 id 时 url）；
-        // 无 id 匹配 url；findIndex 顺序语义 = 最小 index（addKey 用"更小覆盖"维护首个）
-        const addKey = (map, key, i) => {
-            const e = map.get(key);
-            if (e === undefined || i < e) map.set(key, i); // 首个 = 最小 index（与 findIndex 顺序一致）
+        // 统一身份索引：每个键保存可能命中的 index 集合；更新时保留历史候选，查询时按当前身份校验，
+        // 避免复杂的删除/重建逻辑在同 id/同 URL 脏缓存场景下产生索引分裂。
+        const addIndex = (map, key, i) => {
+            if (!key) return;
+            let set = map.get(key);
+            if (!set) { set = new Set(); map.set(key, set); }
+            set.add(i);
         };
-        const idMap = new Map();      // String(id) -> 首个 index（有 id 的 m）
-        const urlMap = new Map();     // normUrl(url) -> 首个 index（所有有 url 的 m）
-        const urlOnlyMap = new Map(); // normUrl(url) -> 首个 index（无 id 有 url 的 m）
-        messages.forEach((m, i) => {
-            if (!m || typeof m !== 'object') return;
-            if (Utils.hasValidId(m)) addKey(idMap, String(m.id), i);
-            const u = m.url ? Utils.normUrl(m.url) : '';
-            if (u) addKey(urlMap, u, i);
-            if (!Utils.hasValidId(m) && u) addKey(urlOnlyMap, u, i);
-        });
+        const firstIndex = (map, key, match) => {
+            const set = map.get(key);
+            if (!set) return undefined;
+            let first;
+            for (const i of set) {
+                if (i < 0 || i >= messages.length) continue;
+                if (!match(messages[i])) continue;
+                if (first === undefined || i < first) first = i;
+            }
+            return first;
+        };
+        const idMap = new Map();
+        const urlMap = new Map();
+        const urlOnlyMap = new Map();
+        const identityMap = new Map();
+        const addIdentityIndexes = (message, i) => {
+            const identity = Utils.getMessageIdentity(message);
+            if (!identity.valid) return;
+            addIndex(identityMap, identity.key, i);
+            if (identity.kind === 'id') addIndex(idMap, identity.idKey, i);
+            if (identity.url) addIndex(urlMap, identity.url, i);
+            if (identity.kind === 'url') addIndex(urlOnlyMap, identity.url, i);
+        };
+        messages.forEach(addIdentityIndexes);
         const NOW = () => new Date().toISOString();
-        // 删除后扫描 idx 之后重建次小 index（保 findIndex 顺序语义；脏缓存同 key 多条时正确）
-        const scanNext = (map, key, fromIdx, match) => {
-            for (let j = fromIdx + 1; j < messages.length; j++) {
-                const mm = messages[j];
-                if (mm && typeof mm === 'object' && match(mm)) { addKey(map, key, j); break; }
-            }
-        };
-        // 更新后维护索引：先加新键（同 id/url 时自动恢复，跳过扫描）→ 再处理旧键（删+扫描次小）
-        const reindex = (idx, oldM) => {
-            const m = messages[idx];
-            const newUrl = m && typeof m === 'object' && m.url ? Utils.normUrl(m.url) : '';
-            if (m && typeof m === 'object') {
-                if (Utils.hasValidId(m)) addKey(idMap, String(m.id), idx);
-                if (newUrl) addKey(urlMap, newUrl, idx);
-                if (!Utils.hasValidId(m) && newUrl) addKey(urlOnlyMap, newUrl, idx);
-            }
-            if (oldM && typeof oldM === 'object') {
-                if (Utils.hasValidId(oldM)) {
-                    const k = String(oldM.id);
-                    if (idMap.get(k) === idx && !(m && Utils.hasValidId(m) && String(m.id) === k)) {
-                        idMap.delete(k);
-                        scanNext(idMap, k, idx, (mm) => Utils.hasValidId(mm) && String(mm.id) === k);
-                    }
-                }
-                if (oldM.url) {
-                    const k = Utils.normUrl(oldM.url);
-                    if (k && urlMap.get(k) === idx && !(m && newUrl === k)) {
-                        urlMap.delete(k);
-                        scanNext(urlMap, k, idx, (mm) => mm.url && Utils.normUrl(mm.url) === k);
-                    }
-                }
-                if (!Utils.hasValidId(oldM) && oldM.url) {
-                    const k = Utils.normUrl(oldM.url);
-                    if (k && urlOnlyMap.get(k) === idx && !(m && !Utils.hasValidId(m) && newUrl === k)) {
-                        urlOnlyMap.delete(k);
-                        scanNext(urlOnlyMap, k, idx, (mm) => !Utils.hasValidId(mm) && mm.url && Utils.normUrl(mm.url) === k);
-                    }
-                }
-            }
-        };
         for (const message of newMessages) {
             // 元素级校验：非对象元素跳过（避免访问 message.id 崩溃）
-            if (!message || typeof message !== 'object' || Array.isArray(message)) continue;
+            if (!Utils.isValidItem(message)) continue;
+            const identity = Utils.getMessageIdentity(message);
+            if (!identity.valid) continue;
             let idx = -1;
-            if (Utils.hasValidId(message)) {
-                const c1 = idMap.get(String(message.id));
-                const c2 = message.url ? urlOnlyMap.get(Utils.normUrl(message.url)) : undefined;
+            if (identity.kind === 'id') {
+                const c1 = firstIndex(idMap, identity.idKey, mm => {
+                    const i = Utils.getMessageIdentity(mm);
+                    return i.kind === 'id' && i.idKey === identity.idKey;
+                });
+                const c2 = identity.url ? firstIndex(urlOnlyMap, identity.url, mm => {
+                    const i = Utils.getMessageIdentity(mm);
+                    return i.kind === 'url' && i.url === identity.url;
+                }) : undefined;
                 const cands = [c1, c2].filter(x => x !== undefined);
-                if (cands.length) idx = Math.min(...cands); // findIndex 顺序语义：取最早出现
-            } else if (message.url) {
-                const u = urlMap.get(Utils.normUrl(message.url));
+                if (cands.length) idx = Math.min(...cands);
+            } else if (identity.kind === 'url') {
+                const u = firstIndex(urlMap, identity.url, mm => {
+                    const i = Utils.getMessageIdentity(mm);
+                    return !!i.url && i.url === identity.url;
+                });
                 if (u !== undefined) idx = u;
+            } else {
+                const a = firstIndex(identityMap, identity.key, mm => Utils.getMessageIdentity(mm).key === identity.key);
+                if (a !== undefined) idx = a;
             }
+            if (idx === undefined) idx = -1;
             if (idx >= 0) {
                 const oldM = messages[idx];
                 // v3.156：比较排除 timestamp——曾因 oldM 有 timestamp、message 无而内容相同也必报"更新缓存记录"
@@ -1485,15 +1634,18 @@ const MessageStore = {
                 let changed = false;
                 try { changed = JSON.stringify(stripTs(oldM)) !== JSON.stringify(stripTs(message)); } catch (e) { changed = true; }
                 if (changed) console.log(`更新缓存记录: ${filename}`);
-                messages[idx] = { ...message, timestamp: NOW() };
-                reindex(idx, oldM);
+                messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: NOW() };
+                addIdentityIndexes(messages[idx], idx);
             } else {
-                messages.push({ ...message, timestamp: NOW() });
+                messages.push({ ...Utils.safeObjectCopy(message), timestamp: NOW() });
                 const i = messages.length - 1;
-                if (Utils.hasValidId(message)) addKey(idMap, String(message.id), i);
-                const newUrl = message.url ? Utils.normUrl(message.url) : '';
-                if (newUrl) addKey(urlMap, newUrl, i);
-                if (!Utils.hasValidId(message) && newUrl) addKey(urlOnlyMap, newUrl, i);
+                const newIdentity = Utils.getMessageIdentity(messages[i]);
+                if (newIdentity.valid) {
+                    addIndex(identityMap, newIdentity.key, i);
+                    if (newIdentity.kind === 'id') addIndex(idMap, newIdentity.idKey, i);
+                    if (newIdentity.url) addIndex(urlMap, newIdentity.url, i);
+                    if (newIdentity.kind === 'url') addIndex(urlOnlyMap, newIdentity.url, i);
+                }
             }
         }
         this.saveMessages(filePath, messages);
@@ -1542,12 +1694,12 @@ const Network = {
                         return result;
                     })
                     .catch((error) => {
-                        if (PROFILE3) console.log(`[profile api dns-prewarm] host=${apiHost} ok=false error=${error && (error.code || error.message) ? error.code || error.message : String(error)}`);
+                        if (PROFILE3) console.log(`[profile api dns-prewarm] host=${apiHost} ok=false error=${Utils.safeErrorText(error, 'unknown')}`);
                         return null;
                     });
             }
         } catch (e) {
-            if (PROFILE3) console.log(`[profile api dns-prewarm] skipped reason=${e && e.message ? e.message : String(e)}`);
+            if (PROFILE3) console.log(`[profile api dns-prewarm] skipped reason=${Utils.safeErrorText(e, 'unknown')}`);
         }
         // R4-1：retry 非法值有界兜底——Infinity 会让 `attempt <= retry` 死循环重试（validateConfig 只警告不阻止）；
 
@@ -1581,7 +1733,7 @@ const Network = {
                 if (attempt < maxRetry) { // v3.157：用兜底后的 maxRetry（曾用原始 Config.api.retry，非法类型时与实际重试不一致）
                     // 退避等待：1s、2s、3s...（加 0-500ms 随机抖动，避免多实例同时重试）
                     const wait = 1000 * (attempt + 1) + Math.floor(Math.random() * 500);
-                    console.log(`请求失败（${(e && (e.code || e.message)) || String(e)}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）...`); // R5-1：显示兜底后次数
+                    console.log(`请求失败（${Utils.safeErrorText(e, 'unknown')}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）...`); // R5-1：显示兜底后次数
                     await new Promise(r => setTimeout(r, wait));
                 }
             }
@@ -2062,23 +2214,26 @@ const App = {
             // 与批内三索引合并判重 → 全程 O(N+M)。三个 Set 与 _findDedupIndex 三条件同构，
             // 等价性由属性测试证明（800 轮含缓存非空场景，0 失配）
             const cacheMsgs = MessageStore.readMessages(MessageStore.getFilePath(cacheName));
-            const cacheIds = new Set();      // 缓存中有 id 条目的 String(id)
-            const cacheUrls = new Set();     // 缓存中所有有 url 条目的 normUrl
-            const cacheNoIdUrls = new Set(); // 缓存中无 id 有 url 条目的 normUrl
+            const cacheIds = new Set();       // 缓存中有 id 条目的 String(id)
+            const cacheUrls = new Set();      // 缓存中所有有 URL 条目的 validUrl
+            const cacheNoIdUrls = new Set();  // 缓存中无 id 有 URL 条目的 validUrl
+            const cacheAnonKeys = new Set();  // 缓存中无 id/URL 条目的 anonKey
             for (const m of cacheMsgs) {
-                if (!m || typeof m !== 'object') continue;
-                if (Utils.hasValidId(m)) cacheIds.add(String(m.id));
-                const u = m.url ? Utils.normUrl(m.url) : '';
-                if (u) {
-                    cacheUrls.add(u);
-                    if (!Utils.hasValidId(m)) cacheNoIdUrls.add(u);
+                const identity = Utils.getMessageIdentity(m);
+                if (!identity.valid) continue;
+                if (identity.kind === 'id') cacheIds.add(identity.idKey);
+                if (identity.url) {
+                    cacheUrls.add(identity.url);
+                    if (identity.kind === 'url') cacheNoIdUrls.add(identity.url);
                 }
+                if (identity.kind === 'anon') cacheAnonKeys.add(identity.key);
             }
-            // v3.176：批内判重与跨运行判重（_findDedupIndex）口径对齐——曾 key=id:|url: 单维度，
-            // 同一批「有 id 条目」与「无 id 同 url 条目」key 不同互不可见 → 双推（系统审查 #2）
-            const batchIds = new Set();      // 已收录条目的 String(id)（有 id 条目）
-            const batchUrls = new Set();     // 已收录条目的 normUrl(url)（所有有 url 条目）
-            const batchNoIdUrls = new Set(); // 已收录无 id 条目的 normUrl(url)（有 id 条目经此与无 id 同 url 交叉判重）
+            // v3.228：批内与跨运行统一使用 getMessageIdentity；保留 id/url 的双向 fallback，
+            // 另为无标识数据维护 anonKey 集合，避免各入口各自拼接 url:/id: 键。
+            const batchIds = new Set();
+            const batchUrls = new Set();
+            const batchNoIdUrls = new Set();
+            const batchAnonKeys = new Set();
 
             let badElementCount = 0; // v3.157：非对象元素单独统计（曾混入 filteredCount，诊断不清）
             let regTimePresent = 0; // v3.159：louzhuregtime 有值统计（pingbitime 有效性警告用）
@@ -2086,47 +2241,48 @@ const App = {
                 // 元素级校验：非对象元素跳过（v3.176：不再计入 filteredCount——「过滤屏蔽」专指规则过滤，
                 // 非对象元素有独立「非对象元素」行，曾双计误导诊断）
                 if (!Utils.isValidItem(item)) { badElementCount++; continue; }
-                // v3.159：注册时间字段缺失统计（接口可能不提供，pingbitime 配置将不生效）
-                if (item.louzhuregtime !== undefined && item.louzhuregtime !== null && item.louzhuregtime !== '') regTimePresent++;
-                // 归一化：category_name/category_id 兼容映射 + 无标识数据生成合成 id（在判重前统一处理）
-                if (!item.catename && item.category_name) item.catename = item.category_name;
-                if (!item.cateid && item.category_id) item.cateid = item.category_id;
-                if (!Utils.hasValidId(item) && (!item.url || String(item.url).trim() === '' || Utils.normUrl(item.url) === '')) {
-                    // v3.176：url 归一为空（'#'/'?x=1'/'//' 等垃圾值）同样视为无 url → 合成 id
-                    // （曾走 key='url:' 空键，多条不同垃圾 url 数据互判为同一资源，后者静默丢弃——系统审查 #5）
-                    // v3.176：补 louzhu——同内容不同楼主曾被误合并（系统审查 #6）
-                    item.id = Utils.anonKey(item.title, item.content, item.posttime, item.shijianchuo, item.pic, item.mall_name, item.price, item.brand, item.catename, item.louzhu);
-                }
-                // 判重（口径与 MessageStore._findDedupIndex 一致：缓存索引 + 批内索引合并）：
-                //   有 id 条目：按 String(id) 判重，或「对方为无 id 条目且 url 归一相同」交叉判重
-                //   无 id 条目：按 url 归一判重（不论对方有无 id）
-                const batchUrl = Utils.normUrl(item.url);
+                // 字段归一化：通过安全 getter 读取别名字段，避免脏 getter 破坏整批一致性。
+                const categoryName = Utils.safeGet(item, 'catename');
+                const categoryAlias = Utils.safeGet(item, 'category_name');
+                if (!categoryName && categoryAlias) Utils.safeSet(item, 'catename', categoryAlias);
+                const categoryId = Utils.safeGet(item, 'cateid');
+                const categoryIdAlias = Utils.safeGet(item, 'category_id');
+                if (!categoryId && categoryIdAlias) Utils.safeSet(item, 'cateid', categoryIdAlias);
+                const louzhuRegTime = Utils.safeGet(item, 'louzhuregtime');
+                if (louzhuRegTime !== undefined && louzhuRegTime !== null && louzhuRegTime !== '') regTimePresent++;
+
+                const identity = Utils.getMessageIdentity(item);
+                if (!identity.valid) continue;
                 let dup = false;
-                if (Utils.hasValidId(item)) {
-                    dup = cacheIds.has(String(item.id)) || (batchUrl && cacheNoIdUrls.has(batchUrl))
-                       || batchIds.has(String(item.id)) || (batchUrl && batchNoIdUrls.has(batchUrl));
-                } else if (batchUrl) {
-                    dup = cacheUrls.has(batchUrl) || batchUrls.has(batchUrl);
+                if (identity.kind === 'id') {
+                    dup = cacheIds.has(identity.idKey) || (identity.url && cacheNoIdUrls.has(identity.url))
+                       || batchIds.has(identity.idKey) || (identity.url && batchNoIdUrls.has(identity.url));
+                } else if (identity.kind === 'url') {
+                    dup = cacheUrls.has(identity.url) || batchUrls.has(identity.url);
+                } else {
+                    dup = cacheAnonKeys.has(identity.key) || batchAnonKeys.has(identity.key);
                 }
                 if (dup) { dedupCount++; continue; }
-                // 收录进批内索引
-                if (Utils.hasValidId(item)) batchIds.add(String(item.id));
-                if (batchUrl) {
-                    batchUrls.add(batchUrl);
-                    if (!Utils.hasValidId(item)) batchNoIdUrls.add(batchUrl);
+                // 收录进批内索引，字段身份与 MessageStore/saveBatch 完全相同。
+                if (identity.kind === 'id') batchIds.add(identity.idKey);
+                if (identity.url) {
+                    batchUrls.add(identity.url);
+                    if (identity.kind === 'url') batchNoIdUrls.add(identity.url);
                 }
+                if (identity.kind === 'anon') batchAnonKeys.add(identity.key);
                 if (FilterEngine.listfilter(item, compiledRules)) {
                     items.push(item);
                 } else {
                     filteredCount++;
-                    item._f = true; // v3.159：过滤写入标记（规则变更时失效；过滤=已处理语义，改宽后重新评估）
+                    Utils.safeSet(item, '_f', true); // v3.159：过滤写入标记（规则变更时失效）
                 }
                 newMessages.push(item);
             }
 
             // v3.159：接口未提供注册时间字段时 pingbitime 过滤不生效——运行期警告（配置无效不感知）
             const pbCfg = Config.filter && Config.filter.pingbitime;
-            if (pbCfg !== undefined && pbCfg !== null && String(pbCfg).trim() !== '' && xbkdata.length > 0) {
+            const pbText = Utils.safeText(pbCfg, '');
+            if (pbCfg !== undefined && pbCfg !== null && pbText.trim() !== '' && xbkdata.length > 0) {
                 const missing = xbkdata.length - regTimePresent;
                 if (missing / xbkdata.length > 0.5) {
                     console.warn(`⚠️ 接口返回「louzhuregtime」注册时间字段缺失 ${missing}/${xbkdata.length} 条（>50%）——配置的「pingbitime」过滤基本不会生效（接口可能不提供该字段）`);
@@ -2156,7 +2312,13 @@ const App = {
                 }
                 if (kwRe) {
                     // 空标题保留（与推送占位一致，避免"只看它"把无标题数据滤掉）
-                    const kept = items.filter(it => !it.title || kwRe.test(it.title));
+                    const kept = items.filter(it => {
+                        const rawTitle = Utils.safeGet(it, 'title');
+                        if (!rawTitle) return true;
+                        const title = Utils.safeText(rawTitle, '');
+                        try { return kwRe.test(title); }
+                        catch (e) { return true; } // 转换/匹配异常按保守放行
+                    });
                     for (const it of items) { if (!kept.includes(it)) it._f = true; } // v3.159：只看它滤掉的同样标记（规则变更失效）
                     items = kept;
                 }
@@ -2175,7 +2337,7 @@ const App = {
                 console.warn(`⚠️ 单次待推送 ${items.length} 条超过上限 ${maxPerRun}，只推前 ${maxPerRun} 条（防接口异常推送风暴；调整 Config.push.maxPerRun）`);
                 // v3.134：截断掉的不写缓存——否则下次运行去重跳过导致静默丢失（缓存当"已处理"）；下次运行推剩余
                 // keyOf 在 ⑥ 才定义，此处用同口径（id 优先 + url 归一）构造截断 key
-                truncatedKeys = new Set(items.slice(maxPerRun).map(it => Utils.hasValidId(it) ? 'id:' + it.id : 'url:' + Utils.normUrl(it.url)));
+                truncatedKeys = new Set(items.slice(maxPerRun).map(it => Utils.getMessageIdentity(it).key));
                 items = items.slice(0, maxPerRun);
             }
 
@@ -2186,20 +2348,25 @@ const App = {
             checkpoint('push-start', `count=${items.length} mode=${pushModeForProfile}`);
             const startTime = Date.now();
             preprocessMs = startTime - runStart - (fetchMs || 0);
-            const keyOf = (it) => Utils.hasValidId(it) ? `id:${it.id}` : `url:${Utils.normUrl(it.url)}`;
+            const keyOf = (it) => Utils.getMessageIdentity(it).key;
             // domain 去尾斜杠后与相对路径统一拼接（避免 'https://x.com//rel' 双斜杠）
             // R2：非字符串 domain（脏配置）→ 空串 baseUrl（相对路径不拼前缀，避免 .replace 崩溃）
             const baseUrl = (typeof Config.domain === 'string') ? Config.domain.trim().replace(/\/+$/, '') : ''; // v3.158: trim
             // url 类型防御：非字符串(null/undefined/对象/数字)视为无链接——避免 .includes 崩溃或 [object Object]
             // 与 htmlToMarkdown 的 content_html 口径一致（非字符串视为空）
             const urlOf = (it) => {
-                const u = (typeof it.url === 'string') ? it.url.trim() : '';
+                const u = Utils.safeUrl(it && it.url);
                 if (!u) return '';
                 // 含协议或协议相对(//)不拼前缀；相对路径拼 domain（补斜杠）
                 return (u.includes('://') || u.startsWith('//') ? u : baseUrl + (u.startsWith('/') ? u : '/' + u));
             };
             const pushedKeys = new Set();
             const failureInfos = [];
+            const readItemField = (item, field) => {
+                try { return item && item[field]; }
+                catch (e) { return undefined; }
+            };
+            const itemLogText = (item, field, fallback = '') => Utils.safeText(readItemField(item, field), fallback);
 
             // 推送模板（v3.68 可配置）：非法/缺失回退默认（默认值与历史硬编码完全一致，现有测试锁定）
             const titleTpl = (typeof Config.template.title === 'string' && Config.template.title) ? Config.template.title : '【{分类名}】{标题}';
@@ -2214,12 +2381,18 @@ const App = {
                 // 用 UTF-16 安全截断（不切断 emoji 代理对）
                 // R9：title/content 非字符串（对象等脏数据）→ 空标题占位/空内容（避免 '[object Object]' 泄漏）
                 const pushItem = {
-                    ...item,
+                    ...Utils.safeObjectCopy(item),
                     url: urlOf(item),
                     // v3.110：孤立代理清洗（encodeURIComponent 对孤立代理抛 URIError → 推送失败）
                     // R9/审查9-C 语义保留：非字符串或空串 title → (无标题) 占位；content 空串置空
-                    title: Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof item.title === 'string' && item.title !== '' ? item.title : '(无标题)'), titleMax),
-                    content: Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof item.content === 'string' ? item.content : ''), contentMax),
+                    title: (() => {
+                        const value = readItemField(item, 'title');
+                        return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' && value !== '' ? value : '(无标题)'), titleMax);
+                    })(),
+                    content: (() => {
+                        const value = readItemField(item, 'content');
+                        return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' ? value : ''), contentMax);
+                    })(),
                 };
                 // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
                 // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
@@ -2231,8 +2404,9 @@ const App = {
                 let desp = Utils.truncateUtf16(Utils.sanitizeSurrogates(rawDesp), contentMax);
                 // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
                 const rawClean = Utils.sanitizeSurrogates(rawDesp);
-                if (rawClean.includes('原文链接') && !desp.includes('原文链接') && pushItem.url) {
-                    const link = `原文链接：[${pushItem.url}](<${pushItem.url}>)`;
+                const safePushUrl = Utils.safeUrl(pushItem.url);
+                if (rawClean.includes('原文链接') && !desp.includes('原文链接') && safePushUrl) {
+                    const link = `原文链接：[${safePushUrl}](<${safePushUrl}>)`;
                     // 链接本身超过 contentMax 时不保留（尊重截断配置）；否则内容截短补链接（仍 ≤ contentMax）
                     // v3.177：边界修正——link 接近 contentMax 时 contentMax-link-2 曾 ≤0，truncateUtf16 对非正
                     // max 返回原串 → desp 全量+链接显著超限（系统验证反证 #3）；改为「链接+分隔符完整容纳
@@ -2246,13 +2420,14 @@ const App = {
                     await Pusher.send(text, desp, notifyModule);
                     pushedKeys.add(keyOf(item));
                     // v3.159：推送成功 → 清除过滤写入标记（否则 _f 随对象写回缓存，下次规则变更又误清）
-                    delete item._f;
+                    // 标记属性异常不能把已送达消息改判为失败；即使无法删除，后续缓存仍按成功处理。
+                    try { delete item._f; } catch (e) { /* 非可配置脏属性不影响已成功推送 */ }
                     return { item, ok: true };
                 } catch (e) {
                     // 非 Error 兜底（R1）：notify 抛字符串等非 Error 时避免 e.message undefined（与 v3.31/73/81 口径一致）
                     const failure = summarizeError(e);
                     failureInfos.push(failure);
-                    console.log(`⚠️ 推送失败（不写入缓存，下次运行重试）: ${item.title}【${item.catename}】 ${failure.message || String(e)}`);
+                    console.log(`⚠️ 推送失败（不写入缓存，下次运行重试）: ${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】 ${failure.message || Utils.safeText(e)}`);
                     return { item, ok: false, failure };
                 }
             };
@@ -2287,7 +2462,7 @@ const App = {
                 await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
                 // 按原顺序输出成功日志（并发完成顺序不定，日志保持数据顺序）
                 for (const r of results) {
-                    if (r && r.ok) console.log(`发现到新数据：${r.item.title}【${r.item.catename}】${urlOf(r.item)}`);
+                    if (r && r.ok) console.log(`发现到新数据：${itemLogText(r.item, 'title', '(无标题)')}【${itemLogText(r.item, 'catename')}】${urlOf(r.item)}`);
                 }
                 successCount = results.filter(r => r && r.ok).length;
             } else {
@@ -2295,7 +2470,7 @@ const App = {
                 const pushInterval = Utils.num(Config.timing.pushInterval, 0);
                 for (const item of items) {
                     const r = await pushOne(item, notifyModule);
-                    if (r.ok) { successCount++; console.log(`发现到新数据：${item.title}【${item.catename}】${urlOf(item)}`); }
+                    if (r.ok) { successCount++; console.log(`发现到新数据：${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】${urlOf(item)}`); }
                     if (pushInterval > 0) await new Promise(r2 => setTimeout(r2, pushInterval));
                 }
             }
@@ -2371,7 +2546,7 @@ const App = {
 
         } catch (error) {
             // 非 Error 抛出（如字符串）时兜底，避免 error.message undefined
-            const errMsg = error && error.message ? error.message : String(error);
+            const errMsg = Utils.safeErrorText(error, Utils.safeText(error, '未知错误'));
             if (error && error.response) {
                 console.log('请求失败，状态码:', error.response.statusCode);
             } else if (error && error.code === 'ETIMEDOUT') {
@@ -2393,10 +2568,28 @@ const App = {
     },
 };
 
+async function runSingleEntry(app = App) {
+    const summary = await app.run();
+    // 单次入口与常驻入口统一失败语义：App.run 保持返回摘要兼容，
+    // 但待推送项全部失败时设置非零退出码，不能让调度器误认为成功。
+    try {
+        const { classifySummary } = require('./xbk_failure_policy');
+        const decision = classifySummary(summary);
+        if (decision) {
+            console.error(`程序运行失败（${decision.reason}）：${decision.kind === 'permanent' ? '不可恢复' : '可重试'}`);
+            process.exitCode = 1;
+        }
+    } catch (e) {
+        // 失败分类模块异常时保守设置非零，避免全失败被静默吞掉。
+        process.exitCode = 1;
+    }
+    return summary;
+}
+
 if (require.main === module) {
-    App.run().catch(e => {
-        console.error('程序运行失败:', e && e.message ? e.message : String(e));
-        process.exit(1); // 失败时非 0 退出，便于 cron/调度感知
+    runSingleEntry().catch(e => {
+        console.error('程序运行失败:', Utils.safeErrorText(e, Utils.safeText(e, '未知错误')));
+        process.exitCode = 1;
     });
 }
 
@@ -2416,6 +2609,7 @@ if (typeof module !== 'undefined' && module.exports) {
         fetchData: Network.fetchData.bind(Network),
         // 主流程（集成测试用）
         run: App.run.bind(App),
+        runSingleEntry,
         // 推送层（测试/扩展用）
         Pusher,
         // 补充导出（供更全面的测试）
@@ -2429,6 +2623,8 @@ if (typeof module !== 'undefined' && module.exports) {
         anonKey: Utils.anonKey.bind(Utils),
         hasValidId: Utils.hasValidId.bind(Utils),
         normUrl: Utils.normUrl.bind(Utils),
+        safeUrl: Utils.safeUrl.bind(Utils),
+        validUrl: Utils.validUrl.bind(Utils),
         daysComputed: Utils.daysComputed.bind(Utils),
         // 过滤子方法
         checkRegisterTime: FilterEngine.checkRegisterTime.bind(FilterEngine),
@@ -2440,6 +2636,7 @@ if (typeof module !== 'undefined' && module.exports) {
         truncateUtf16: Utils.truncateUtf16.bind(Utils),
         // 统一数值配置转换（供常驻入口复用，保持字符串环境变量与主流程同一语义）
         num: Utils.num.bind(Utils),
+        safeText: Utils.safeText.bind(Utils),
         // ReDoS 防护检测（嵌套量词）
         hasNestedQuantifier: RuleEngine.hasNestedQuantifier.bind(RuleEngine),
         // 缓存内部方法

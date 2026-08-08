@@ -38,6 +38,9 @@
 | **导出** | 供测试 | 导出 + Pusher + Config |
 
 **关键设计**:
+- `safeObjectCopy`/`safeGet` 统一隔离异常 getter；模板、推送构造、成功缓存写回和日志路径不得因脏字段改变业务结果
+- `getMessageIdentity` 统一生成 id/url/anon 身份；App、`_findDedupIndex`、`saveBatch`、截断排除和成功缓存写入必须共享该身份语义
+- `safeUrl`/`validUrl` 统一处理非字符串、历史伪 URL、危险协议、实体编码和控制字符；Markdown、HTML、模板和最终补链均复用安全入口
 - 推送成功才写缓存(失败下次重试,不永久丢失);被过滤/只看它滤掉的标记 `_f`(规则变更自动失效重评)
 - **判重一处语义、三处同构**：`_findDedupIndex`（缓存判重）、App.run 批内+缓存索引判定与 saveBatch 索引必须保持同构——批内判重 ≡ 跨运行判重（属性测试锁定）
 - **判重索引化 O(N+M)**（v3.179）：缓存三索引 + 批内三索引合并，避免海量接口数据触发逐条 `has()` 的 O(N×M) 扫描
@@ -68,6 +71,8 @@ Config.storage.minFreeBytes // 磁盘余量告警阈值（只告警，不阻断�
 ### `xbk_storage.js` — 安全文件与状态存储基础设施
 
 **定位**:统一普通文件检查、安全原子写入、受保护文本读取；消息缓存、运行日志和告警/日报状态共用同一套文件安全边界。
+
+**读取结果**：存储层区分 `missing`、`ok`、`ioError` 和 `unsafe`；缓存只有成功落盘后才更新进程内权威快照，损坏重置失败不缓存空数组。
 
 **安全约束**:
 - 拒绝符号链接和目录作为写入目标；
@@ -120,7 +125,7 @@ npm run test:mutation
 - 企业微信:webhook URL + key
 - wxpusher:topicIds 数组、contentType 3(Markdown)；支持 `WX_pusher_channels` 多应用按消息分流和限频后切换
 
-**注意**:**含真实密钥的 `push_config.local.js` 不入库**(`.gitignore` 忽略),密钥只存在于本地。推送失败会被主流程感知(无通道 reject / 抛错)。
+**注意**:**含真实密钥的 `push_config.local.js` 不入库**(`.gitignore` 忽略),密钥只存在于本地。推送失败会被主流程感知(无通道 reject / 抛错)。密钥脱敏递归覆盖嵌套通道配置；AbortSignal 等传输控制参数不进入第三方业务 body。
 
 ---
 

@@ -346,8 +346,21 @@ await test('垃圾 url（#/?x=1）归一为空 → anonKey 化不互判重（v3.
     assert(s2.pushed === 0 && s2.dedup === 2, `二次应全去重: ${JSON.stringify(s2)}`);
 });
 
-// ==================== 4. 过滤生效 ====================
-console.log('\n📂 4. 过滤生效');
+await test('批内无id非字符串 url → 不得误判重，改走匿名身份（v3.228）', async () => {
+    reset();
+    setPushUrl('t06e_invalid_url_type');
+    fakeData = [
+        { url: {}, catename: 'a', title: '对象URL-A', content: '内容A' },
+        { url: {}, catename: 'a', title: '对象URL-B', content: '内容B' },
+    ];
+    const summary = await xbk.run();
+    assert(summary && summary.dedup === 0 && summary.pushed === 2,
+        `非字符串 URL 不应把不同匿名消息判重: ${JSON.stringify(summary)}`);
+    assert(pushCalls.length === 2, `两条不同消息都应推送，实际${pushCalls.length}`);
+    assert(readCacheFile('t06e_invalid_url_type').length === 2, '两条消息都应进入缓存');
+});
+
+
 
 await test('标题屏蔽规则 → 命中数据不推送', async () => {
     reset();
@@ -1221,6 +1234,26 @@ await test('desp 链接补回极端 contentMax 不超限（v3.177 边界修正�
     }
 });
 
+await test('截断补回原文链接不得重新引入危险 URL（v3.228）', async () => {
+    reset();
+    setPushUrl('t61d_danger_linkkeep');
+    const originalContentMax = Config.push.contentMax;
+    try {
+        Config.push.contentMax = 100;
+        fakeData = [makeItem({
+            id: 6104,
+            url: 'javascript://evil',
+            content_html: '<p>' + '长'.repeat(100) + '原文链接</p>',
+        })];
+        await xbk.run();
+        assert(pushCalls.length === 1, '危险 URL 场景仍应完成推送');
+        assert(!/javascript:|vbscript:|data:/i.test(pushCalls[0].desp),
+            `截断补链不得包含危险协议: ${pushCalls[0].desp}`);
+    } finally {
+        Config.push.contentMax = originalContentMax;
+    }
+});
+
 await test('推送截断长度可配置 + 非法回退默认（v3.69）', async () => {
     reset();
     setPushUrl('t49_trunc');
@@ -1434,6 +1467,35 @@ await test('对象 title 脏数据 → (无标题) 占位、无 [object Object]�
     const p = pushCalls[0];
     assert(!p.text.includes('[object Object]'), `标题无泄漏: ${p.text.slice(0, 80)}`);
     assert(p.text.includes('(无标题)'), `标题应为 (无标题) 占位: ${p.text.slice(0, 80)}`);
+});
+
+await test('Symbol/异常字段不应破坏已成功推送的缓存一致性（v3.229）', async () => {
+    reset();
+    setPushUrl('t58_dirty_fields');
+    const bad = { toString() { throw new Error('bad field'); } };
+    fakeData = [makeItem({ id: 5801, title: Symbol('bad-title'), catename: Symbol('bad-category'), content: bad })];
+    const r = await xbk.run();
+    assert(r && r.pushed === 1 && r.failed === 0, `脏字段不应影响成功摘要: ${JSON.stringify(r)}`);
+    assert(pushCalls.length === 1, `底层推送应成功一次，实际${pushCalls.length}`);
+    assert(readCacheFile('t58_dirty_fields').length === 1, '成功推送后仍应写入缓存');
+    assert(!pushCalls[0].text.includes('Symbol') && !pushCalls[0].text.includes('[object Object]'), '推送标题不应泄漏脏字段');
+});
+
+await test('异常 getter 字段不应破坏推送后缓存事务（v3.231）', async () => {
+    reset();
+    setPushUrl('t58_throwing_getter');
+    const item = makeItem({ id: 5831 });
+    Object.defineProperty(item, 'title', {
+        enumerable: true,
+        configurable: true,
+        get() { throw new Error('title getter'); },
+    });
+    fakeData = [item];
+    const r = await xbk.run();
+    assert(r && r.pushed === 1 && r.failed === 0, `异常 getter 不应影响成功摘要: ${JSON.stringify(r)}`);
+    assert(pushCalls.length === 1, `异常 getter 数据仍应推送一次，实际${pushCalls.length}`);
+    assert(readCacheFile('t58_throwing_getter').length === 1, '成功推送后异常 getter 数据仍应写缓存');
+    assert(pushCalls[0].text.includes('(无标题)'), '异常 getter 标题应使用安全占位');
 });
 
 await test('zkt_gjc 对象配置 → 警告并全部推送（R11-1 防御）', async () => {

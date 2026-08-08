@@ -86,6 +86,20 @@ function codeIs(code, set) {
 
 function classifyOne(error) {
     const info = summarizeError(error);
+
+    // 结构化聚合错误优先递归：顶层可能只保留“token 无效”等永久摘要，
+    // 但子通道仍可能有超时/限流。只要任一子错误可重试，就必须保留重试机会。
+    if (Array.isArray(info.failures) && info.failures.length > 0) {
+        const nested = info.failures.map(classifyOne);
+        if (nested.some(x => x.kind === 'retryable')) {
+            return { kind: 'retryable', reason: 'MIXED_CHANNEL_FAILURES', info };
+        }
+        if (nested.some(x => x.kind !== 'permanent')) {
+            return { kind: 'retryable', reason: 'UNKNOWN_CHANNEL_FAILURE', info };
+        }
+        return { kind: 'permanent', reason: 'ALL_CHANNELS_PERMANENT', info };
+    }
+
     if (info.failureKind === 'retryable' || info.failureKind === 'permanent') {
         return { kind: info.failureKind, reason: info.failureReason || 'EXPLICIT', info };
     }
@@ -154,20 +168,15 @@ function classifyOne(error) {
         return { kind: 'retryable', reason: 'TRANSIENT_TEXT', info };
     }
 
-    // 多通道聚合：只要有一个通道仍可能恢复，就不能过早停止，避免消息丢失。
-    if (Array.isArray(info.failures) && info.failures.length > 0) {
-        const nested = info.failures.map(classifyOne);
-        if (nested.some(x => x.kind === 'retryable')) return { kind: 'retryable', reason: 'MIXED_CHANNEL_FAILURES', info };
-        if (nested.every(x => x.kind === 'permanent')) return { kind: 'permanent', reason: 'ALL_CHANNELS_PERMANENT', info };
-    }
-
     // 未知错误默认可重试：重复几轮的代价低于误判后永久漏推。
     return { kind: 'retryable', reason: 'UNKNOWN', info };
 }
 
 function classifyFailure(error) {
     const explicitKind = readProp(error, 'failureKind');
-    if (explicitKind === 'retryable' || explicitKind === 'permanent') {
+    const nested = readProp(error, 'failures');
+    // 聚合失败的子错误优先于父级预填标签，避免父级 permanent 覆盖子级 retryable。
+    if ((explicitKind === 'retryable' || explicitKind === 'permanent') && !(Array.isArray(nested) && nested.length > 0)) {
         return { kind: explicitKind, reason: readProp(error, 'failureReason') || 'EXPLICIT', info: summarizeError(error) };
     }
     return classifyOne(error);
@@ -186,21 +195,22 @@ function classifySummary(summary) {
             ? null
             : { kind: 'retryable', reason: 'ALL_PUSH_FAILED_UNKNOWN', info: { message: '推送全部失败（原因未结构化）' } };
     }
+    // 主流程契约：一条消息至少有一个通道成功即视为该消息处理成功。
+    // 因此只要本轮已有成功推送，就不能因另一个通道的永久错误让单次/常驻入口熔断；
+    // 失败通道不对该条消息立即重试，避免重复轰炸。只有全失败才进入退出/重试分类。
+    if (pushed > 0) return null;
     const nested = failures.map(classifyOne);
     const hasRetryable = nested.some(x => x.kind === 'retryable');
     const hasPermanent = nested.some(x => x.kind === 'permanent');
-    // 混合失败中只要还有可恢复通道，就不能被某一个永久错误过早熔断；
-    // 只有不存在可重试原因时，永久错误才足以停止常驻。
+    // 全部失败时，混合原因中只要还有可恢复通道，就不能过早永久停止；
+    // 只有不存在可重试原因时，永久错误才足以停止。
     if (hasRetryable) {
-        if (pushed > 0) return null;
         return { kind: 'retryable', reason: 'PUSH_HAS_RETRYABLE_FAILURE', info: { failures: nested.map(x => x.info) } };
     }
     if (hasPermanent) {
         return { kind: 'permanent', reason: 'PUSH_HAS_ONLY_PERMANENT_FAILURES', info: { failures: nested.map(x => x.info) } };
     }
-    // 部分成功且剩余失败无法分类：保持主流程“至少有成功就继续”，
-    // 全部失败则保守重试，避免未知错误造成永久漏推。
-    if (pushed > 0) return null;
+    // 全部失败且无法分类：保守重试，避免未知错误造成永久漏推。
     return { kind: 'retryable', reason: 'PUSH_HAS_UNKNOWN_FAILURE', info: { failures: nested.map(x => x.info) } };
 }
 
