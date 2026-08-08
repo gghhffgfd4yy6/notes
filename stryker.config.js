@@ -28,4 +28,12 @@ module.exports = {
     reporters: ['clear-text', 'html', 'json'],
     tempDirName: '.stryker-tmp',
     cleanTempDir: 'always',
+    // 这些目录不是源码/测试输入；尤其 .tools 中的 Python venv 含 lib64 符号链接，
+    // 不排除会导致 Stryker 沙箱复制时报 EISDIR。
+    ignorePatterns: [
+        '.tools',
+        'xianbaoku_cache*',
+        'reports',
+        '*.bundle',
+    ],
 };

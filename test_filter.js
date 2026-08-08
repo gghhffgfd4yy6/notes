@@ -4161,24 +4161,23 @@ await test('契约: 关键导出可独立调用(bind 生效)', () => {
 await test('契约: 单次入口全失败设置非零语义，部分成功保持成功', async () => {
     const oldExitCode = process.exitCode;
     try {
-        delete process.exitCode;
+        process.exitCode = undefined;
         await runSingleEntry({
             run: async () => ({ total: 1, pushed: 0, failed: 1, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }] }),
         });
         assertEqual(process.exitCode, 1, '全推送失败时单次入口应设置非零退出码');
-        delete process.exitCode;
+        process.exitCode = undefined;
         await runSingleEntry({
             run: async () => ({ total: 2, pushed: 1, failed: 1, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }] }),
         });
         assertEqual(process.exitCode, undefined, '部分成功时不应设置失败退出码');
-        delete process.exitCode;
+        process.exitCode = undefined;
         await runSingleEntry({
             run: async () => ({ total: 2, pushed: 1, failed: 1, failures: [{ code: 'HTTP_401', message: 'invalid token' }] }),
         });
         assertEqual(process.exitCode, undefined, '部分成功即使失败通道为永久错误，也不应熔断单次入口');
     } finally {
-        if (oldExitCode === undefined) delete process.exitCode;
-        else process.exitCode = oldExitCode;
+        process.exitCode = oldExitCode;
     }
 });
 

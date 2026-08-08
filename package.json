@@ -33,5 +33,11 @@
     "pushplus"
   ],
   "license": "UNLICENSED",
-  "private": true
+  "private": true,
+  "overrides": {
+    "qs": "6.15.3"
+  },
+  "devDependencies": {
+    "@stryker-mutator/core": "^9.6.1"
+  }
 }

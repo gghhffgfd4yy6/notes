@@ -1,0 +1,9 @@
+{
+  "entry": [
+    "run_mutation.js",
+    "test_tls_prewarm.js"
+  ],
+  "ignoreDependencies": [
+    "@stryker-mutator/command-runner"
+  ]
+}
