@@ -42,5 +42,27 @@ const { runLoop } = require('./xbk_loop');
     assert.strictEqual(intervalErrors, 1, '性能预热失败应走独立错误处理');
     console.log('✅ 常驻循环：性能刷新失败与业务运行失败隔离');
 
+    const controller3 = new AbortController();
+    let refreshTimeout;
+    let refreshSignal;
+    await runLoop(async () => {}, {
+        intervalMs: 0,
+        refreshEvery: 1,
+        signal: controller3.signal,
+        onIntervalTimeoutMs: 20,
+        onInterval: async ({ signal }) => {
+            refreshSignal = signal;
+            return new Promise(() => {});
+        },
+        onIntervalError: async error => {
+            refreshTimeout = error;
+            controller3.abort();
+        },
+    });
+    assert.strictEqual(refreshTimeout && refreshTimeout.code, 'INTERVAL_REFRESH_TIMEOUT', '刷新挂起应有超时边界');
+    assert.strictEqual(refreshSignal && refreshSignal.aborted, true, '刷新超时应取消子刷新信号');
+    assert.strictEqual(controller3.signal.aborted, true, '刷新超时后应可安全停止循环');
+    console.log('✅ 常驻循环：性能刷新挂起有界，不阻塞停止信号');
+
     console.log('✅ 常驻循环：单轮异常不中断，停止信号在当前轮结束后生效，定期刷新与等待并行');
 })();
