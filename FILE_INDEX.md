@@ -257,7 +257,7 @@ npm run test:mutation
 
 ### `BUG_AUDIT.md` — Bug、P1/P2 审计与验证记录
 
-**定位**：合并真实 Bug 记录与 P1/P2 深度审计，覆盖问题触发、影响面、修复方式、资源生命周期、HTTP 连接、内存和稳定性验证。
+**定位**：合并真实 Bug 记录与 P1/P2 深度审计，覆盖问题触发、影响面、修复方式、资源生命周期、HTTP 连接、内存和稳定性验证；末尾含**静态扫描审计记录**（非 P1/P2 项：扫描发现的加固/整洁修复与误报判定清单）。
 
 ### `REVIEW_DECISIONS.md` — 审查决策记录
 
@@ -267,6 +267,7 @@ npm run test:mutation
 - 历轮审查概览(修复数+核心内容)
 - **设计取舍(不修项)**:多项,每项含「问题→为什么不修→出处」(Config 不冻结/内存缓存不失效/缺字段保守放行/并发无锁/空值不匹配…)
 - **修复意图**:多类关键修复背后的设计理由(推送成功才写缓存/判重统一/原子写入/失败重抛/防御输入…)
+- **静态安全扫描决策**:扫描发现的修复项（含 P4/P5/P6 定级）与误报/设计取舍清单（防后人误改）
 - 核心哲学:宁可多推不可少推 / 处理完的才记 / 缺信息保守放行 / 每个取舍都写下来
 
 **用途**:防止未来有人把设计取舍当 bug 改掉;快速理解每个决定的依据。
@@ -302,6 +303,22 @@ push_config.local.js # 本地密钥(必须忽略!)
 **定位**:不重新实现 HTTP，只在官方 got 之上补项目契约：流式累计响应体大小、超过上限时终止请求、解析 JSON、保留 HTTP 错误状态。
 
 **使用**:主接口拉取通过 `fetchJson()` 调用；推送通道仍直接使用官方 got。
+
+### `.tools/code-audit/` — 工作区本地静态扫描工具（不入库）
+
+**定位**:本地安全/静态扫描工具集（gitignore，不随仓库分发；克隆用户无此目录）。内含四个工具，可用自带 CLI 选项以最严格模式运行，无需额外配置文件：
+
+| 工具 | 位置 | 用途 | 最严格运行要点 |
+|---|---|---|---|
+| osv-scanner | `bin/osv-scanner` | 依赖漏洞扫描（OSV 数据库） | `scan -r --no-ignore --all-vulns --experimental-flag-deprecated-packages` |
+| Semgrep | `semgrep-venv/bin/semgrep` | 静态安全规则扫描 | `scan --config auto --strict --error`（联网拉规则） |
+| ESLint | `node_modules/.bin/eslint` | JS 严格规则检查 | `--no-config-lookup --max-warnings 0` + 逐条 `--rule '规则:error'` + `--global` 声明 Node 全局 |
+| Knip | `node_modules/.bin/knip` | 死代码/未使用依赖 | `--strict --include 全部类型 --treat-config-hints-as-errors` |
+
+**结果判定注意事项**（详见 REVIEW_DECISIONS.md「静态安全扫描决策」）：
+- eslint `no-control-regex`、semgrep `detect-non-literal-regexp` 等是**有意防护**，非缺陷；
+- eslint catch 参数未使用可用 `--rule 'no-unused-vars:["error",{"caughtErrors":"none"}]'` 豁免（静默 catch 有意设计）；
+- knip 对延迟加载 `require`（`profile3Require(() => require(...))`）静态解析受限，入口文件与模块导出会误报，以项目自身死代码测试为准。
 
 ---
 

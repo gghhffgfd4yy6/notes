@@ -122,6 +122,7 @@ npm run test:notify
 - **测试数量不在此维护**（以 `npm test` 实际输出为准）；版本一致性由文件头、CHANGELOG 和 package.json 自动校验（README 不含版本号）
 - **系统验证**：判重等价性/缓存不变量经**固定种子属性测试**（双路径逐条比对 + 已知答案锚点，零失配）；连续运行稳定性验收；故障注入 / 变异测试 / ReDoS 全入口防护均有测试锁定
 - **CI**：`.github/workflows/test.yml` 在 push/PR 时执行三套测试；`.workflow/master-pipeline.yml` 提供分阶段的单元、并行集成、通道测试和汇总步骤。
+- **静态安全扫描**（工作区本地工具，不入库）：osv-scanner（依赖漏洞）/ Semgrep（静态安全）/ ESLint（严格规则）/ Knip（死代码）可一键最严格运行，工具位置、命令要点与结果判定见 FILE_INDEX 的 `.tools/code-audit/` 条目
 
 ## ⏰ cron 定时（示例）
 
