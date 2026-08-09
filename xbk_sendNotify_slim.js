@@ -80,7 +80,7 @@ function collectConfiguredSecrets(value, fieldName, secrets, seen) {
     if (value === undefined || value === null) return;
     if (typeof value === 'string') {
         // 环境变量 WX_PUSHER_CHANNELS 可能仍是 JSON 字符串，先尝试展开嵌套 appToken。
-        if (/channels/i.test(fieldName || '') && /^[\[{]/.test(value.trim())) {
+        if (/channels/i.test(fieldName || '') && /^[[{]/.test(value.trim())) {
             try {
                 const parsed = JSON.parse(value);
                 collectConfiguredSecrets(parsed, fieldName, secrets, seen);

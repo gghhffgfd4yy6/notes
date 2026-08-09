@@ -631,7 +631,6 @@ const Utils = {
             // 基础/外链/刷新标签可改变文档导航或加载外部资源，HTML 推送不需要它们。
             .replace(/<(?:base|link|meta)\b[^>]*>/gi, '')
             .replace(/(?:\s|\/)on[a-z][a-z0-9_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
-        const cleanUrlAttr = (name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`;
         html = html
             // 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）。
             .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2/gi,
@@ -697,7 +696,7 @@ const Formatter = {
         const urlText = Utils.safeUrl(shuju && shuju.url);
         const safeUrl = urlText;
         // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）
-        const mdUrl = safeUrl && /[\s()\[\]]/.test(safeUrl) ? `<${safeUrl}>` : safeUrl;
+        const mdUrl = safeUrl && /[\s()[\]]/.test(safeUrl) ? `<${safeUrl}>` : safeUrl;
         // 无标签内容短路：跳过整个替换链（性能优化）
         if (!html.includes('<')) {
             html = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(html));
@@ -802,7 +801,7 @@ const Formatter = {
         const linkText = (() => {
             // R6-1：非字符串视为无链接（与 htmlToMarkdown urlText 同口径）
             const u = Utils.safeUrl(Utils.safeGet(data, 'url'));
-            return u && /[\s()\[\]]/.test(u) ? `<${u}>` : u;
+            return u && /[\s()[\]]/.test(u) ? `<${u}>` : u;
         })();
         const getContentHtml = () => safeHtmlUrl
             ? `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`
