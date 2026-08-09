@@ -79,6 +79,7 @@ export CONFIG__MODEL="openai/deepseek-v4-flash"             # 模型名，openai
 export CONFIG__FALLBACK_MODELS='["openai/deepseek-v4-flash"]'  # 失败回退也指同一模型（防回退到官方 gpt）
 export CONFIG__CUSTOM_MODEL_MAX_TOKENS=32000              # 非内置模型的 token 上限（不设会报 MAX_TOKENS 未定义）
 export CONFIG__OUTPUT_RUN_DETAILS=true                    # 审查后输出运行明细（模型/tokens/耗时/AI 调用次数，v0.42.0 新增）
+export CONFIG__REASONING_EFFORT=none                      # 关闭推理模型的思考预算（v0.42.0 包改动后生效；实测快 5.3 倍且质量不降，见 §6.7）
 export LITELLM_LOCAL_MODEL_COST_MAP=True                  # 用本地模型价格表，跳过启动时拉 GitHub 的超时等待（每次省约 5s）
 ```
 
@@ -195,6 +196,14 @@ rm /workspace/review.md /workspace/description.md
 - 慢的构成：启动 ~11s（Python+litellm 加载 137 个包，固定成本）+ 模型串行调用（每次 3-6s，review 对每个文件/hunk 单独调用，**时间随 diff 线性增长**）
 - **结论**：AI 审查只用于小范围/单提交/刚提交的新变更；**不要**回头审 50 次提交这种大范围（已实测不可行且边际价值低——历史已被多轮人工审查覆盖）
 - `review` 命令是多步流水线（主分析+code suggestions 等 3-4 次串行调用），`ask` 命令单次调用更快（约 20s）
+
+### 6.7 审查提速：reasoning_effort=none（2026-08-09 实测）
+
+- **根因**：deepseek-v4-flash 是推理模型，思考无上限时 review 输出随机 1.6K~10.8K tokens（耗时 18s~300s+ 波动，曾 300s 超时）
+- **修复 1**（包代码）：`SUPPORT_REASONING_EFFORT_MODELS` 加 `deepseek-v4-flash` + handler 补 `allowed_openai_params`（litellm 参数门禁）——升级 pr-agent 后需重打（改 `/opt/pr-agent-venv/lib/python3.12/site-packages/pr_agent/algo/__init__.py` 和 `litellm_ai_handler.py`，备份在 /tmp/*.bak）
+- **修复 2**（配置）：`CONFIG__REASONING_EFFORT=none` 关闭思考预算
+- **实测对比**（完整 review 18650cb，7.7K tokens）：无限制=300s 超时 / low=74.7s / **none=14.2s**（且抓到与 low 完全相同的 2 个真 bug）——**none 比 low 再快 5.3 倍，质量不降**
+- 若遇需深层推理的场景（复杂跨函数竞态分析）可临时切 low/medium
 
 ### 6.4 网络
 

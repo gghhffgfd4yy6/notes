@@ -508,3 +508,11 @@
 | 628ef54 | barkNotify/pushMeNotify params spread 被移除（Functional Regression）| **误报（幻觉+归因错误）**：移除发生在 63a939b（统一契约加固，body 字段收敛为配置驱动是有意设计，v3.231 已验证）；628ef54 的 diff 无相关代码；params 仍用于请求级 extras |
 | 37de6b1 | PROFILE3 未定义 → ReferenceError | **误报**：PROFILE3 定义于 xbk_function_v3.js 第 9 行（AI 未见文件顶部）；双重检查冗余但无害（防御性写法）|
 | 122e5d0 | ABORT_ERR 触发 onIntervalError（优雅停止虚假错误）| **真实但设计边界不修**：逻辑确凿，但 xbk_loop.js 仅被 test_loop 使用，主代码不经过该路径；记录待主代码接入 runLoop 时处理 |
+
+### 20.4 审查速度优化：reasoning_effort=none 验证通过（2026-08-09）
+
+- **动机**：用户反馈审查仍慢（low 模式完整 review 40-190s）。
+- **对照实验**（已知 P2 d3e7923 简化 diff）：flash+low 13.9s / **flash+none 3.0s**（均抓到 P2）/ minimax-m2.7 22.1s / kimi-k2.7-code 10.0s。
+- **端到端验证**（完整 review 18650cb，已知 P3×2）：**none 14.2s 抓到与 low（74.7s）完全相同的 2 个真 bug**——速度 5.3 倍、质量不降。
+- **决策**：`CONFIG__REASONING_EFFORT` 由 low 改为 **none**（已写入 .bashrc）。找 bug 任务的准确性由模型能力保证（flash 本身强），思考预算削减不损失此类任务的表现；若未来遇到需深层推理的场景可临时切回 low/medium。
+- **附带验证**：none 审 d3e7923 报的 classifySummary issue 经确认是误报（pushed>0 → null 是 v3.231"部分成功不熔断"契约，设计正确），不修。
