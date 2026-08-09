@@ -532,3 +532,16 @@
 - 恢复写入包 try-catch，抛错时降级保留内存快照（与 `!restored` 路径一致）。
 - 版本 v3.235 → v3.236（三方一致），全量测试 33.8s 全绿。
 - **同批误报/设计边界**：b22f7d6 另 2 条（app.num 契约保证传入、sleep 双重 resolve 不存在——done 内 removeEventListener 双保险）均为误报；be614c6 3 条、13d099a 2 条均为安全加固的有意副作用（设计边界不修）。
+
+---
+
+## 22. 大提交批量审查（reasoning_effort=none，2026-08-09）
+
+- **背景**：5 个大提交（63a939b/5e42187/13d099a/b22f7d6/be614c6）此前 low 配置全部超时（300s+），切换 none 后全部 15-20s 完成。
+- **结论**：
+  - be614c6：3 条报告均为安全加固的有意副作用（symlink 拒绝写、日志截断静默失败等）——设计边界不修。
+  - 13d099a：2 条均为安全设计（0o600 基线 + renameSync 保留已有权限是标准原子写；broken symlink 拒绝写入比写穿更安全）。
+  - b22f7d6：**1 真 P3（readMessages 缓存恢复写入未捕获异常，已修 v3.236）** + 2 误报（app.num 契约保证、sleep 无双重 resolve——done 内 removeEventListener 双保险）。
+  - 5e42187：3 条全误报（finally 重复 resolve 对已 settle promise 无效、abort 后 while 条件下一轮 break、channel 40 字符脱敏截断为设计）。
+  - 63a939b：3 条全自我否定（checkTimeCompiled 非数组风险是 pre-existing 非本次引入；saveBatch stale index 经 firstIndex match 校验无害；runSingleEntry 用 exitCode 而非 process.exit 是有意设计）。
+- **效率验证**：none 模式审 49K tokens 大提交仅 18.4s（low 300s 超时）——审查吞吐提升 16 倍+。
