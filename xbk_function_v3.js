@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.234 — 空环境变量不覆盖配置修复 ********
+//******** 线报酷推送脚本 v3.235 — getNotify模块缺失同步崩溃修复 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -38,7 +38,17 @@ function getNotify() {
     if (!notifyLoading) {
         // 只检查已加载的缓存，不能用 require() 探测：require() 本身会同步执行模块，
         // 那样会在接口请求发出前加载推送模块，直接抵消延迟加载收益。
-        const notifyPath = require.resolve('./xbk_sendNotify_slim');
+        let notifyPath;
+        try {
+            notifyPath = require.resolve('./xbk_sendNotify_slim');
+        } catch (e) {
+            // v3.235：模块缺失时不在此同步抛（曾导致 getNotify() 同步崩溃、.catch 来不及接住，
+            // 主流程中断）——与旧行为一致，延迟到推送阶段以 promise 形式真实报错。
+            notifyLoading = Promise.resolve().then(() => profile3Require('xbk_sendNotify_slim', () => require('./xbk_sendNotify_slim')))
+                .then((mod) => { notify = mod; return notify; })
+                .catch((err) => { notifyLoading = null; throw err; });
+            return notifyLoading;
+        }
         const cached = require.cache[notifyPath];
         if (cached && cached.loaded && cached.exports) {
             notify = cached.exports;

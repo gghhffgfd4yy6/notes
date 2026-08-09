@@ -961,3 +961,10 @@
 - 修复：过滤空白值（`raw !== undefined && String(raw).trim() !== ''`），空 env 不覆盖，保留本地配置。
 - 新增回归测试：空 env 不覆盖 push_config、非空 env 正常覆盖（模块重载隔离）。
 - 发现途径：Qodo Merge（PR-Agent）AI 审查 1163a11 提交（55s 完成）。
+
+## v3.235（getNotify 模块缺失同步崩溃修复，2026-08-09，AI 审查发现）
+
+- **getNotify 同步抛错回归**（P2）：ef1116e 将缓存探测从 `require()`（try-catch 包裹）改为 `require.resolve()`——模块缺失（部署不完整）时 getNotify() **同步抛 MODULE_NOT_FOUND**，1529 行 `.catch()` 来不及接住 → 主流程中断（接口请求未发出）。
+- 修复：`require.resolve` 包 try-catch，缺失时走延迟加载路径（promise 化报错，与旧行为一致：延迟到推送阶段真实报错）。
+- 新增回归测试：patch 模块解析让 xbk_sendNotify_slim 缺失，断言接口请求仍正常发出（fetched=true）。
+- 发现途径：Qodo Merge（PR-Agent）AI 审查 ef1116e 提交（75.2s 完成）。

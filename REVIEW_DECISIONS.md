@@ -484,3 +484,27 @@
 - **验证**：新增回归测试（空 env 不覆盖、非空 env 覆盖，模块重载隔离避免 require 缓存污染）；全量测试 28.2s 全绿（通道测试 62/62）。
 - **版本**：v3.233 → v3.234（三方一致）。
 - **备注**：测试过程中发现 node_modules 缺 got 依赖（中间被清理），已 `npm install` 恢复（+1 package），不影响代码。
+
+---
+
+## 20. getNotify 模块缺失同步崩溃修复（AI 审查发现，2026-08-09，P2 已修）
+
+### 20.1 发现与定性（AI 审 ef1116e 提交报告）
+
+- **问题**：ef1116e（懒加载重叠保留）将缓存探测从 `try { require(...) } catch` 改为 `require.resolve()`（try-catch 外）——xbk_sendNotify_slim.js 缺失（部署不完整）时 getNotify() **同步抛 MODULE_NOT_FOUND**，调用方 `getNotify().catch()` 来不及接住 → 主流程中断（接口请求未发出即崩）。
+- **定级 P2**：触发条件为推送模块文件缺失（安装/部署失误）；后果为主流程中断（比旧行为"延迟到推送阶段优雅报错"更糟）。
+- **发现途径**：Qodo Merge（PR-Agent）AI 审查 ef1116e（75.2s）。
+
+### 20.2 修复决策
+
+- **修复**：`require.resolve` 包 try-catch——缺失时走延迟加载路径（promise 化报错），与旧行为一致。
+- **验证**：新回归测试（patch Module._resolveFilename 模拟缺失，断言接口请求仍发出 fetched=true；修复前 fetched=false）；全量测试 26.6s 全绿。
+- **版本**：v3.234 → v3.235（三方一致）。
+
+### 20.3 本批审查误报记录（30 条范围内小提交）
+
+| 提交 | AI 报告 | 结论 |
+|---|---|---|
+| 628ef54 | barkNotify/pushMeNotify params spread 被移除（Functional Regression）| **误报（幻觉+归因错误）**：移除发生在 63a939b（统一契约加固，body 字段收敛为配置驱动是有意设计，v3.231 已验证）；628ef54 的 diff 无相关代码；params 仍用于请求级 extras |
+| 37de6b1 | PROFILE3 未定义 → ReferenceError | **误报**：PROFILE3 定义于 xbk_function_v3.js 第 9 行（AI 未见文件顶部）；双重检查冗余但无害（防御性写法）|
+| 122e5d0 | ABORT_ERR 触发 onIntervalError（优雅停止虚假错误）| **真实但设计边界不修**：逻辑确凿，但 xbk_loop.js 仅被 test_loop 使用，主代码不经过该路径；记录待主代码接入 runLoop 时处理 |
