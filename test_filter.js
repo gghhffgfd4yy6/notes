@@ -6914,6 +6914,26 @@ try {
 
 
 
+// v3.236：缓存文件缺失且恢复写入抛错（磁盘满/权限）时，readMessages 降级返回内存快照，不向外抛
+await test('readMessages 文件缺失且恢复写入抛错时降级返回内存快照（v3.236）', () => {
+    const p = path.join(CACHE, 'test_restore_throw.json');
+    saveMessages(p, [{ id: 'restore-ok' }]); // 内存快照 + 磁盘文件
+    assertEqual(require('fs').existsSync(p), true, '写入后文件应存在');
+    require('fs').unlinkSync(p); // 模拟外部误删缓存文件
+    require('fs').chmodSync(CACHE, 0o444); // 目录只读 → 恢复写入必然抛 EACCES
+    let threw = false;
+    let result = null;
+    try {
+        result = readMessages(p);
+    } catch (e) {
+        threw = true;
+    }
+    require('fs').chmodSync(CACHE, 0o755); // 无论如何先恢复权限
+    require('fs').unlinkSync(p);
+    assertEqual(threw, false, '恢复写入抛错时 readMessages 不得抛出（v3.236 降级）');
+    assertEqual(Array.isArray(result) && result.length === 1 && result[0].id === 'restore-ok', true, '应返回内存快照而非清空');
+});
+
 process.exit(failed > 0 ? 1 : 0);
 
 })();
