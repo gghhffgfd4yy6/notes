@@ -73,6 +73,7 @@
 | v3.185 系统审查 | 状态/日志/过滤 | 3 | filter.hash 时序 / 状态文件原子写 / 异常响应敏感字段日志泄露 |
 | v3.186 深度审查 | 缓存/日报/HTML | 3 | 符号链接缓存逃逸 / 损坏日报状态 / 实体编码主动 HTML |
 | v3.187 联合路径审查 | 配置/日志 | 2 | filterHash 脏值崩溃 / 已配置密钥进入错误摘要 |
+| v3.231 扫描审查 | 静态扫描（osv-scanner/semgrep/eslint/knip 最严格模式） | 3+1 | GHA 固定 SHA(P4) / cleanUrlAttr 死代码(P5) / 冗余转义×3(P6)；另修复 catch 日志 resp 对象泄露（logErr 脱敏） |
 
 **当前基线以 `package.json`、文件头和 `CHANGELOG.md` 的版本一致性为准；测试结果以 `npm test` 实际输出为准，本文件不维护测试数量。**
 
@@ -351,3 +352,32 @@
   2. **断言具体天数的测试用 fake Date**（88 章已 mock Date.now，如 '61天前应=61' 受保护）
   3. 允许的超老固定日期：2020-01-01/2026-01-01（距离阈值安全边际大，且只用于"老号/不依赖天数"场景）
 - **价值**：此根因只有 CI/隔天重跑才能暴露——单次运行永远全绿，印证持续集成的必要性（v3.107 引入 CI 的决策正确）
+
+## 静态安全扫描决策（2026-08-09）
+
+> 背景：用户要求用最严格方式运行工作区内的静态扫描工具（osv-scanner / semgrep / eslint / knip，位于 `.tools/code-audit/`），全部使用工具自带 CLI 选项（未引入新配置文件/脚本/文档）。结果按真实问题与误报分类后修复。
+
+### 修复项（含定级）
+
+| 项 | 定级 | 问题 | 修复 | 验证 |
+|---|---|---|---|---|
+| A | **P4** | CI 供应链：`actions/checkout@v4`、`actions/setup-node@v4` 用可变 tag，上游可重新指向注入攻击代码（semgrep github-actions 规则） | 固定完整 commit SHA（GitHub API 验证 v4 tag 直指该 commit，行为零变化） | semgrep 复扫：该类发现 2→0 |
+| B | **P5** | 死代码：`sanitizeDecodedHtml` 中 `cleanUrlAttr` 定义未使用（eslint no-unused-vars 抓到，豁免 catch 参数后仅剩此项） | 删除（后续为内联等价实现） | eslint 复扫清零 |
+| C | **P6** | 冗余转义 ×3：字符类内 `\[`/`\{` 不必要（eslint no-useless-escape） | 简化（`/[\s()\[\]]/`→`/[\s()[\]]/`、`/^[\[]{/`→`/^[[{]/`） | 行为等价 6-7 样本验证 + 全量测试 |
+
+**定级理由**：A 无当前实际触发（需上游官方 action tag 被攻陷，概率极低），属低概率高影响的加固项；B/C 行为零变化，属整洁/风格档。均不构成 P1/P2（无消息丢失/轰炸/挂死/泄露/崩溃的当前缺陷）。
+
+### 误报与设计取舍（不要当 bug 改）
+
+- **eslint no-control-regex ×5**：均为**有意的安全防护**——`safeUrl` 拒绝 ASCII 控制字符、危险协议判定前清理控制空白、`sanitizeDecodedHtml` 移除 NUL。正是"URL 控制字符拒绝"契约（v3.231）的实现。
+- **eslint no-unused-vars（catch 参数）×87**：`catch (e) { /* 静默 */ }` 是有意设计（告警/日报失败静默等），配置 `caughtErrors: 'none'` 豁免（ESLint 认可做法）。
+- **eslint no-unmodified-loop-condition**：`while (!(signal && signal.aborted))` 中 `signal.aborted` 是 AbortSignal 响应式属性，由外部 `abort()` 修改，静态分析误报。
+- **semgrep detect-non-literal-regexp ×8**：配置驱动的过滤正则（`compileRules`），已有 `hasNestedQuantifier` ReDoS 防护 + 非法正则跳过（§1.4 防御输入），属设计取舍。
+- **semgrep unsafe-formatstring ×10**：`console.log` 模板拼接不解析格式说明符（非 `util.format` 风格），且内容为脱敏摘要，误报。
+- **semgrep using-http-server ×18 / rest-http-client / XSS 测试字符串 / bash IFS / TG 注释示例 token**：测试基建（本地 http server）、一次性脚本或注释占位示例，非生产风险。
+- **knip 22 项（unused files/exports）**：`test_*.js`/`run_tests.js`/`xbk_loop.js` 等是 npm scripts 直接运行的入口；模块导出经 `profile3Require(name, () => require(...))` 延迟加载，knip 静态分析解析不了该 require 形式，误报全部导出为 unused。项目自身的死代码测试（导出全被引用）才是权威。
+
+### 遗留说明
+
+- 静态扫描工具位于 `.tools/code-audit/`（已 gitignore，不入库）；本轮未新增任何配置文件或脚本，命令为一次性 CLI 参数。
+- 扫描结果中的历史数字（规则数/发现数）仅为本轮快照，后续以实际运行输出为准。

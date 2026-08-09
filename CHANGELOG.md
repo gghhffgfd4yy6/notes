@@ -932,3 +932,12 @@
 - URL 安全收尾：保留历史换行剥离兼容，同时拒绝 NUL 等其余 ASCII 控制字符，避免进入 Markdown、JSON 和缓存身份。
 - 部分成功语义统一：只要本轮存在成功推送，不因失败通道的永久错误让单次或常驻入口熔断；只有全失败才进入退出/重试分类。
 - 新增对应集成、模板、缓存、URL 和退出语义回归测试。
+
+## 审查与静态扫描修复（不改变程序版本，2026-08-09）
+
+- **推送 catch 日志脱敏**：9 个通道的响应结构异常日志不再打印原始 got 响应对象（`resp.request.options.body` 可能回显 token/key），统一输出 `safeErr()` 安全摘要；新增回归测试并经变异验证（还原旧写法即变红）。
+- **静态安全扫描**（osv-scanner / semgrep / eslint / knip 最严格模式）：
+  - CI 供应链加固（P4）：GitHub Actions 固定完整 commit SHA（`actions/checkout`、`actions/setup-node`），可变 tag 可被上游重新指向。
+  - 死代码清理（P5）：删除 `sanitizeDecodedHtml` 中未使用的 `cleanUrlAttr`。
+  - 冗余转义修正（P6）：3 处字符类转义简化（行为等价，已验证）。
+- 扫描其余发现均为误报或有意设计（控制字符防护正则、配置驱动正则的 ReDoS 防护、eslint catch 参数豁免、knip 对延迟加载 require 的静态分析局限），详见 REVIEW_DECISIONS.md 与 BUG_AUDIT.md。

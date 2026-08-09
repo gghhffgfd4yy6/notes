@@ -674,3 +674,33 @@ WxPusher、息知等异常路径可能完整输出未知响应对象；白名单
 - URL 安全收尾：换行继续按历史兼容规则剥离，NUL、制表符及其余 ASCII 控制字符拒绝进入 URL 输出和身份判重。
 - 部分成功语义统一：只要存在成功推送，失败通道不触发单次/常驻入口熔断；只有全部推送失败才进入退出码和重试分类。
 - 新增对应的模板、HTML、缓存事务、URL 控制字符、集成推送和单次退出码回归测试。
+
+## 静态扫描审计记录（2026-08-09，非 P1/P2）
+
+> 背景：用 `.tools/code-audit/` 下的四个工具（osv-scanner / semgrep / eslint / knip）以最严格模式扫描全仓库（全部 CLI 参数，未新增配置文件/脚本）。本节记录真实修复项与误报判定；历史发现数仅为本轮快照，以实际运行输出为准。
+
+### 真实修复项（定级 + 验证）
+
+| 项 | 定级 | 发现工具 | 修复 | 验证 |
+|---|---|---|---|---|
+| GHA 可变 tag | P4 | semgrep（github-actions 规则） | `actions/checkout`、`actions/setup-node` 固定完整 commit SHA | 复扫 2→0 |
+| `cleanUrlAttr` 死代码 | P5 | eslint（no-unused-vars，豁免 catch 参数后唯一剩余） | 删除未使用定义 | eslint 复扫清零 |
+| 冗余转义 ×3 | P6 | eslint（no-useless-escape） | 字符类转义简化 | 行为等价样本验证 |
+
+- **附修复（审查发现）**：9 个推送通道 catch 分支日志曾打印原始 got 响应对象（`resp.request.options.body` 可能回显 token/key），已统一 `safeErr()` 脱敏 + 回归测试锁定（变异验证：还原旧写法即变红）。
+
+### 误报/设计取舍清单（不要当 bug 改）
+
+- eslint `no-control-regex` ×5：有意的控制字符拒绝/清理防护（v3.231 URL 契约实现）。
+- eslint catch 参数未使用 ×87：`catch (e) { /* 静默 */ }` 有意设计，配置 `caughtErrors: 'none'` 豁免。
+- eslint `no-unmodified-loop-condition`：`signal.aborted` 为 AbortSignal 响应式属性，静态分析误报。
+- semgrep `detect-non-literal-regexp` ×8：配置驱动过滤正则，已有 `hasNestedQuantifier` ReDoS 防护（设计取舍）。
+- semgrep `unsafe-formatstring` ×10：`console.log` 模板拼接不解析格式说明符，内容为脱敏摘要。
+- semgrep `using-http-server` ×18 等：本地测试 server / 一次性脚本 / 注释示例 token，非生产风险。
+- knip unused files/exports ×22：入口文件（npm scripts 直接运行）与 `profile3Require(() => require(...))` 延迟加载导致的静态分析局限，导出实际全部被使用。
+
+### 结论
+
+- 依赖层（osv-scanner）：无已知漏洞。
+- 源码层：真实问题 3 项 + 1 项审查发现，均已修复并全量回归通过；其余为误报或有记录的取舍。
+- 本次修复未升版本号（文件头/CHANGELOG/package.json 三方一致性由 101 章测试维护）。
