@@ -432,7 +432,7 @@ function pushPlusNotify(text, desp, params = {}) {
                     // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
                     const failure = channelError(e, 'pushplus', resp);
                     reject(failure);
-                    $.logErr(failure, resp);
+                    $.logErr(safeErr(failure));
                 } finally {
                     resolve(data);
                 }
@@ -503,7 +503,7 @@ function serverNotify(text, desp, params = {}) {
                 } catch (e) {
                     // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
                     reject(e);
-                    $.logErr(e, resp);
+                    $.logErr(safeErr(e));
                 } finally {
                     resolve(data);
                 }
@@ -593,7 +593,7 @@ function barkNotify(text, desp, params = {}) {
                         }
                     } catch (e) {
                         const failure = channelError(e, 'bark', resp);
-                        $.logErr(failure, resp);
+                        $.logErr(safeErr(failure));
                         innerResolve({ ok: false, error: failure });
                     } finally {
                         innerResolve({ ok: false });
@@ -671,7 +671,7 @@ function pushMeNotify(text, desp, params = {}) {
                         }
                     } catch (e) {
                         const failure = channelError(e, 'pushme', resp);
-                        $.logErr(failure, resp);
+                        $.logErr(safeErr(failure));
                         innerResolve({ ok: false, error: failure });
                     } finally {
                         innerResolve({ ok: false });
@@ -735,7 +735,7 @@ function qywxBotNotify(text, desp, params = {}) {
                 } catch (e) {
                     // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
                     reject(e);
-                    $.logErr(e, resp);
+                    $.logErr(safeErr(e));
                 } finally {
                     resolve(data);
                 }
@@ -980,7 +980,7 @@ function wxPusherPost(channel, text, desp, params = {}) {
                 }
             } catch (e) {
                 reject(e);
-                $.logErr(e, resp);
+                $.logErr(safeErr(e));
             }
         });
     });
@@ -1060,7 +1060,7 @@ function wxXiZhiNotify(text, desp, params = {}) {
                 } catch (e) {
                     // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
                     reject(e);
-                    $.logErr(e, resp);
+                    $.logErr(safeErr(e));
                 } finally {
                     resolve(data);
                 }
@@ -1118,7 +1118,7 @@ function pushDeerNotify(text, desp, params = {}) {
                 } catch (e) {
                     // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
                     reject(e);
-                    $.logErr(e, resp);
+                    $.logErr(safeErr(e));
                 } finally {
                     resolve(data);
                 }
@@ -1190,7 +1190,7 @@ function tgNotify(text, desp, params = {}) {
                 } catch (e) {
                     // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
                     reject(e);
-                    $.logErr(e, resp);
+                    $.logErr(safeErr(e));
                 } finally {
                     resolve(data);
                 }
