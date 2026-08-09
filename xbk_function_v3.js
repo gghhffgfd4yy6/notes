@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.235 — getNotify模块缺失同步崩溃修复 ********
+//******** 线报酷推送脚本 v3.236 — 缓存恢复写入异常降级修复 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -1477,8 +1477,13 @@ const MessageStore = {
             let exists = true;
             try { exists = fs.existsSync(filePath); } catch (e) { exists = true; }
             if (!exists) {
-                const restored = this.saveMessages(filePath, this._memoryCache[filePath]);
-                if (!restored) console.warn(`缓存文件缺失且恢复失败，继续使用内存缓存：${filePath}`);
+                // v3.236：恢复写入抛错（磁盘满/权限）时同样降级保留内存快照，不向外传播破坏判重流程
+                try {
+                    const restored = this.saveMessages(filePath, this._memoryCache[filePath]);
+                    if (!restored) console.warn(`缓存文件缺失且恢复失败，继续使用内存缓存：${filePath}`);
+                } catch (e) {
+                    console.warn(`缓存文件缺失且恢复异常，继续使用内存缓存：${filePath} (${String(e && e.message || e)})`);
+                }
             }
             return this._memoryCache[filePath];
         }

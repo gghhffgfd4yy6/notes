@@ -516,3 +516,19 @@
 - **端到端验证**（完整 review 18650cb，已知 P3×2）：**none 14.2s 抓到与 low（74.7s）完全相同的 2 个真 bug**——速度 5.3 倍、质量不降。
 - **决策**：`CONFIG__REASONING_EFFORT` 由 low 改为 **none**（已写入 .bashrc）。找 bug 任务的准确性由模型能力保证（flash 本身强），思考预算削减不损失此类任务的表现；若未来遇到需深层推理的场景可临时切回 low/medium。
 - **附带验证**：none 审 d3e7923 报的 classifySummary issue 经确认是误报（pushed>0 → null 是 v3.231"部分成功不熔断"契约，设计正确），不修。
+
+---
+
+## 21. 缓存恢复写入异常降级修复（AI 审查发现，2026-08-09，P3 已修）
+
+### 21.1 发现与定性（AI 审 b22f7d6 提交报告）
+
+- **问题**：MessageStore.readMessages 的"文件缺失恢复写入"路径未包 try-catch——外部误删缓存文件 + 恢复写入抛错（磁盘满/权限）时异常传播出 readMessages → 判重流程崩溃。正常流程不触发（需"外部删文件 + 写入失败"叠加）。
+- **定级 P3**：边界场景崩溃（无消息丢失/轰炸，仅恢复路径）。
+- **发现途径**：Qodo Merge（PR-Agent）AI 审查 b22f7d6（reasoning_effort=none，17.9s）。
+
+### 21.2 修复决策
+
+- 恢复写入包 try-catch，抛错时降级保留内存快照（与 `!restored` 路径一致）。
+- 版本 v3.235 → v3.236（三方一致），全量测试 33.8s 全绿。
+- **同批误报/设计边界**：b22f7d6 另 2 条（app.num 契约保证传入、sleep 双重 resolve 不存在——done 内 removeEventListener 双保险）均为误报；be614c6 3 条、13d099a 2 条均为安全加固的有意副作用（设计边界不修）。

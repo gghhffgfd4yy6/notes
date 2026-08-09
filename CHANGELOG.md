@@ -968,3 +968,9 @@
 - 修复：`require.resolve` 包 try-catch，缺失时走延迟加载路径（promise 化报错，与旧行为一致：延迟到推送阶段真实报错）。
 - 新增回归测试：patch 模块解析让 xbk_sendNotify_slim 缺失，断言接口请求仍正常发出（fetched=true）。
 - 发现途径：Qodo Merge（PR-Agent）AI 审查 ef1116e 提交（75.2s 完成）。
+
+## v3.236（缓存恢复写入异常降级修复，2026-08-09，AI 审查发现）
+
+- **readMessages 恢复写入未捕获异常**（P3）：缓存文件被外部误删时，恢复写入 `saveMessages` 抛错（磁盘满/权限）会异常传播出 readMessages → 判重流程崩溃。正常流程不触发（仅"外部删文件 + 写入失败"叠加）。
+- 修复：恢复写入包 try-catch，抛错时同样降级保留内存快照（与 `!restored` 路径一致）。
+- 发现途径：Qodo Merge（PR-Agent）AI 审查 b22f7d6 提交（reasoning_effort=none，17.9s 完成）。
