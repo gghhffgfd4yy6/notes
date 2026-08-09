@@ -22,6 +22,7 @@ let failBiz = false;      // 全部通道 API 业务失败开关（v3.160：code
 let nullBody = false;     // v3.180：HTTP 200 + 响应体 JSON null 开关（曾 4 通道虚假成功→消息丢失 P1）
 let malformedResponse = false; // 响应字段 getter 抛异常：必须按通道失败，不能被 finally resolve 掩盖
 let leakResponse = false; // v3.185：异常响应含敏感字段时，日志只允许输出安全摘要
+let catchRespLeak = false; // logErr 修复后补充回归：响应结构异常时 resp 对象携带 request.options（模拟 got 响应对象含原始请求体）
 let failMDevSecond = false; // v3.166：Bark/PushMe 多设备第 2 个失败（至少一个成功=通道成功不重试）
 let mdevCount = 0;          // 多设备计数（failMDevSecond 时按调用序第 1 成功第 2 失败）
 require.cache[gotPath].exports = (url, options) => {
@@ -48,6 +49,7 @@ require.cache[gotPath].exports.post = (url, options) => {
         // v3.160：各通道 API 级失败会 reject → 成功响应需返回对应业务成功码（曾全 '{}' 因通道不检查）
         const u = String(url);
         let body = '{}';
+        let respExtras = null; // 仅在 catchRespLeak 时附加：模拟 got 响应对象的 request.options（含原始请求体）
         if (nullBody) {
             // v3.180：HTTP 200 + JSON null——JSON.parse('null') → data=null → 无防御通道曾虚假成功
             body = 'null';
@@ -60,6 +62,11 @@ require.cache[gotPath].exports.post = (url, options) => {
                     enumerable: true,
                     get() { throw new Error(`malformed ${key}`); },
                 });
+            }
+            if (catchRespLeak) {
+                // 模拟 got 响应对象携带 request.options（原始请求体可能回显密钥）：
+                // 修复前 $.logErr(e, resp) 会把整个 resp（含 request.options.body）打印到日志。
+                respExtras = { request: { options: { body: 'CATCH_LEAK_SECRET' } } };
             }
         } else if (leakResponse) {
             // v3.185：模拟无标准错误字段但回显 token/key/请求体的异常响应
@@ -98,7 +105,7 @@ require.cache[gotPath].exports.post = (url, options) => {
         else if (u.includes('pushdeer.com')) body = { content: { result: [{ id: 1 }] } };
         else if (u.includes('push.i-i.me')) body = 'success';
         else if (u.includes('api.telegram.org')) body = { ok: true, result: {} };
-        return res({ body, statusCode: 200, headers: {} });
+        return res({ body, statusCode: 200, headers: {}, ...(respExtras || {}) });
     } };
 };
 
@@ -995,6 +1002,35 @@ await test('响应字段访问异常 → 通道 reject，不被 finally resolve 
         }
     } finally {
         malformedResponse = false;
+    }
+}));
+
+await test('响应结构异常 catch 分支日志不输出 resp 对象（含 request body 敏感字段）', () => withChannels(async () => {
+    // 回归锁定（logErr 修复）：修复前 $.logErr(e, resp) 把整个 got 响应对象打印到日志，
+    // resp.request.options.body 含原始请求体（token/key 可能回显）；修复后只输出 safeErr 摘要。
+    // 注意：$.logErr 在模块加载时绑定原生 console.log 引用，替换 console.log 不生效，
+    // 必须捕获 process.stdout.write（console.log 的底层出口）才能拿到 $.logErr 输出。
+    for (const k of CHANNEL_KEYS) cfg[k] = '';
+    cfg.HITOKOTO = 'false';
+    cfg.PUSH_PLUS_TOKEN = 't';
+    malformedResponse = true;
+    catchRespLeak = true;
+    const origWrite = process.stdout.write;
+    const chunks = [];
+    process.stdout.write = (chunk, ...args) => { chunks.push(String(chunk)); return true; };
+    try {
+        let rejected = false;
+        try { await notify.sendNotify('标题', '内容'); } catch (e) { rejected = true; }
+        const all = chunks.join('');
+        assert(rejected, '响应结构异常应 reject');
+        assert(!all.includes('CATCH_LEAK_SECRET'), `catch 分支日志不应包含 resp.request.options.body 敏感字段: ${all.slice(0, 300)}`);
+        assert(!all.includes('statusCode'), `catch 分支日志不应输出完整 resp 对象（含 statusCode）: ${all.slice(0, 300)}`);
+        assert(!all.includes('headers'), `catch 分支日志不应输出完整 resp 对象（含 headers）: ${all.slice(0, 300)}`);
+        assert(all.includes('malformed'), `安全错误摘要仍应保留（应含 malformed 原因）: ${all.slice(0, 300)}`);
+    } finally {
+        malformedResponse = false;
+        catchRespLeak = false;
+        process.stdout.write = origWrite;
     }
 }));
 
