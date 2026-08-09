@@ -54,6 +54,9 @@ function error(message, code) {
     assert.strictEqual(classifyFailure({ channel: 'wxpusher', providerCode: 1001, message: '速度太快' }).kind, 'retryable');
     assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 45009, message: '频率限制' }).kind, 'retryable');
     assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 40014, message: '请求失败' }).kind, 'permanent');
+    // v3.232：企业微信瞬时错误（500 系统繁忙）不得误判永久（曾导致常驻停止重试、消息丢失）
+    assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 500, message: 'system error' }).kind, 'retryable');
+    assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 45001, message: 'no permission' }).kind, 'permanent');
     assert.strictEqual(classifyFailure(error('完全未知故障')).kind, 'retryable');
     assert.strictEqual(classifyFailure(Object.assign(new SyntaxError('代码解析失败'), { name: 'SyntaxError' })).kind, 'permanent');
 

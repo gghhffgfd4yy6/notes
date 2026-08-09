@@ -128,7 +128,11 @@ function classifyOne(error) {
         if (providerCode === '45009') {
             return { kind: 'retryable', reason: 'QYWX_RATE_LIMIT', info };
         }
-        return { kind: 'permanent', reason: `QYWX_${providerCode}`, info };
+        // v3.232：仅明确配置类错误判永久（key/token 无效、缺 token、无权限、webhook 未找到）；
+        // 其余（如 500 系统繁忙）落回通用分类（5xx → retryable），防瞬时错误误判永久导致常驻停止重试、消息丢失
+        if (['40014', '41001', '42001', '45001', '130101'].includes(providerCode)) {
+            return { kind: 'permanent', reason: `QYWX_${providerCode}`, info };
+        }
     }
     if (permanentMessage) {
         return { kind: 'permanent', reason: 'CONFIG_OR_CONTRACT', info };
