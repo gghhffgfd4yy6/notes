@@ -130,8 +130,15 @@ async function prewarmTls(hostname, timeoutMs = 5000, count = 1, signal = null) 
             // throwHttpErrors=false 时 405 不会进入 catch，显式检查后才回退 GET。
             if (response && response.statusCode >= 400) {
                 if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart };
-                await got.get(`https://${hostname}/`, baseOptions);
-                return { ok: true, elapsedMs: Date.now() - singleStart, viaGet: true };
+                try {
+                    await got.get(`https://${hostname}/`, baseOptions);
+                    return { ok: true, elapsedMs: Date.now() - singleStart, viaGet: true };
+                } catch (e2) {
+                    // v3.233：GET 独立捕获，失败不回落到外层 catch 再发一次 GET（同一主机重复建连）
+                    // 复核修正：保持取消语义——GET 被 abort 时返回 cancelled 而非 error（此前外层 catch 会识别）
+                    if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart };
+                    return { ok: false, error: e2 && (e2.code || e2.message) ? String(e2.code || e2.message) : String(e2), elapsedMs: Date.now() - singleStart };
+                }
             }
             return { ok: true, elapsedMs: Date.now() - singleStart };
         } catch (e) {

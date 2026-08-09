@@ -1,4 +1,4 @@
-//******** 线报酷推送脚本 v3.232 — 企业微信瞬时错误分类修复 ********
+//******** 线报酷推送脚本 v3.233 — 预热冗余GET与取消竞态修复 ********
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict';
@@ -2051,6 +2051,7 @@ const App = {
         let dnsWarmupSettled = false;
         let tlsWarmupSettled = false;
         let warmupController = null;
+        let warmupCancelled = false; // v3.233：主流程先于 getNotify() resolve 结束时置位，防止预热在 run 结束后启动
         console.debug('开始获取线报酷数据...');
         checkpoint('run-start');
             // ③ 拉取数据：仅在实际配置 WxPusher 时预解析域名并后台预建 HTTPS 连接。
@@ -2064,6 +2065,16 @@ const App = {
                     dnsWarmupSettled = true;
                     tlsWarmupSettled = true;
                     checkpoint('warmup-skipped', 'wxpusher=unconfigured');
+                    return null;
+                }
+                // v3.233：主流程已结束（finally 置位）但 getNotify() 此刻才 resolve——不再启动预热，
+                // 否则 controller 刚创建而 run 已退出，无人取消请求会拖住进程。
+                if (warmupCancelled) {
+                    dnsWarmup = { ok: true, skipped: true };
+                    tlsWarmup = { ok: true, skipped: true, okCount: 0, count: 0 };
+                    dnsWarmupSettled = true;
+                    tlsWarmupSettled = true;
+                    checkpoint('warmup-cancelled', 'run-finished-before-load');
                     return null;
                 }
                 warmupController = typeof AbortController === 'function' ? new AbortController() : null;
@@ -2562,6 +2573,9 @@ const App = {
             throw error; // 重新抛出，让外层/调度感知失败（cron 场景 exit code 非 0）
         } finally {
             // 后台 DNS/TLS 预热不是业务结果，运行结束或失败时取消未完成请求，避免拖住进程退出。
+            // v3.233：flag 兜底 getNotify() 未 resolve 的竞态——controller 尚未创建时主流程已结束，
+            // then 回调稍后凭 flag 跳过启动，防止预热请求拖住退出。
+            warmupCancelled = true;
             if (warmupController) warmupController.abort();
         }
     },

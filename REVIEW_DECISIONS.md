@@ -428,3 +428,35 @@
 - **为什么只修企业微信**：AI 仅报告该通道（有明确证据：45009 特判 vs 其余全永久）；wxpusher 分支模式类似但错误码语义未经确认，保持现状避免引入新风险（如需修需先确认 wxpusher 错误码语义）
 - **验证**：新增回归测试（企业微信 500 → retryable、45001 → permanent），还原旧写法即变红；全量测试 26.7s 全绿
 - **版本**：v3.231 → v3.232（三方一致）
+
+---
+
+## 18. 预热冗余 GET 与取消竞态修复（AI 审查发现，2026-08-09，P3 已修）
+
+### 18.1 发现与定性（AI 审 18650cb 提交报告）
+
+- **冗余 GET**（xbk_agents.js prewarmTls）：HEAD 返回 ≥400 后的 GET 若抛异常，会落到外层 catch **再发一次 GET**——同一主机连续两次建连。多余网络调用 + 错误处理混乱。**P3**（无丢失/轰炸，仅浪费一次请求）。
+- **预热取消竞态**（xbk_function_v3.js）：warmupController 只在 `getNotify().then()` 回调内创建——主流程提前结束（异常/快速返回）时 finally 看到 null 不取消，`getNotify()` 稍后 resolve 后预热仍启动且无人取消 → pending 请求拖住进程退出（最长 5s）。与 v3.224/18650cb 的"运行结束取消预热"目标矛盾。**P3**（退出延迟最多 5s，非常驻挂死）。
+
+### 18.2 修复决策
+
+- 冗余 GET：GET 独立 try/catch，失败直接返回 error（不回落到外层 catch 重试）——语义变化：HEAD≥400 且 GET 失败时不再"外层 catch 再 GET 一次"（本就是重复请求）。
+- 竞态：新增 `warmupCancelled` flag——finally 置位，then 回调凭 flag 跳过启动（含 checkpoint 标记）。不依赖 controller 是否已创建，从根上消除竞态。
+- **未修项**：wxpusher 分支"非 1001 全永久"分类模式类似（v3.232 企业微信修复时评估过）——wxpusher 错误码语义未确认，保持现状（避免引入新风险）。
+
+### 18.3 验证
+
+- 全量测试 27.6s 全绿（含 test_lazy_notify 预热跳过/取消回归、test_tls_prewarm 建连计数）。
+- 版本 v3.232 → v3.233（三方一致）。
+
+### 18.4 工具链优化（本次审查附带）
+
+- **审查慢的根因**：deepseek-v4-flash 是推理模型，review 时思考无上限（out tokens 1.6K~10.8K 随机波动，耗时 18s~300s+）。修复：pr-agent 包代码将 `deepseek-v4-flash` 加入 `SUPPORT_REASONING_EFFORT_MODELS` + `CONFIG__REASONING_EFFORT=low` + handler 补 `allowed_openai_params`（包修改需在升级后重打，见 PR_AGENT_GUIDE）。
+- 实测效果：18650cb 审查从 300s 超时 → **74.7s 完成**。
+
+### 18.5 复核修正（AI 审 v3.233 修复提交发现，2026-08-09）
+
+- **问题**：v3.233 修复 1（GET 独立捕获）的内层 catch 未检查 `signal.aborted`——GET 被取消时返回 error 而非 `cancelled: true`（此前外层 catch 会识别 abort），取消语义回归。
+- **影响评估**：当前无消费方消费 `cancelled`（仅 prewarmTls 内部自洽），属语义一致性回归（P3 偏下），但未来消费方会踩坑，修复成本极低。
+- **修复**：内层 catch 补 `if (signal && signal.aborted) return { cancelled: true, ... }`。
+- **闭环**：AI 发现 → 修复 → AI 复核修复 → 发现修复的回归 → 再修正——两轮复核链条完整。

@@ -948,3 +948,9 @@
 - 修复：仅明确配置类错误（40014/41001/42001/45001/130101：key/token 无效、缺 token、无权限、webhook 未找到）判永久，其余落回通用分类（5xx → retryable）。
 - 新增回归测试：企业微信 500 → retryable、45001 → permanent（还原旧写法即变红）。
 - 发现途径：Qodo Merge（PR-Agent）AI 审查 d3e7923 提交（单提交小范围审查，104s 完成）。
+
+## v3.233（预热冗余 GET 与取消竞态修复，2026-08-09，AI 审查发现）
+
+- **prewarmTls 冗余 GET**（P3）：HEAD 返回 ≥400 后的 GET 若失败，会落到外层 catch 再发一次 GET——同一主机连续两次建连。修复：GET 独立 try/catch，失败即返回（不回退重试）。
+- **预热取消竞态**（P3）：warmupController 仅在 `getNotify().then()` 回调内创建——主流程先结束时 finally 看到 null 不取消，稍后预热仍启动，pending 请求拖住进程退出（最长 5s）。修复：`warmupCancelled` flag 在 finally 置位，then 回调凭 flag 跳过启动。
+- 发现途径：Qodo Merge（PR-Agent）AI 审查 18650cb 提交（修复 reasoning_effort=low 后 74.7s 完成）。
