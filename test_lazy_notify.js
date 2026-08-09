@@ -1,8 +1,8 @@
-'use strict';
+'use strict'
 
 // 回归测试：推送模块未预加载时，接口请求必须先发出，再后台加载推送模块。
-const assert = require('assert');
-const { execFileSync } = require('child_process');
+const assert = require('assert')
+const { execFileSync } = require('child_process')
 
 const probe = String.raw`
 'use strict';
@@ -45,15 +45,15 @@ xbk.fetchData().then(() => {
     console.error(error);
     process.exit(1);
 });
-`;
+`
 
 const output = execFileSync(process.execPath, ['-e', probe], {
-    cwd: __dirname,
-    encoding: 'utf8',
-});
-const events = JSON.parse(output.trim().split(/\r?\n/).pop());
-assert.deepStrictEqual(events.slice(0, 2), ['fetch-start', 'notify-load']);
-console.log('✅ 延迟加载顺序：接口请求先发出，推送模块后加载');
+  cwd: __dirname,
+  encoding: 'utf8'
+})
+const events = JSON.parse(output.trim().split(/\r?\n/).pop())
+assert.deepStrictEqual(events.slice(0, 2), ['fetch-start', 'notify-load'])
+console.log('✅ 延迟加载顺序：接口请求先发出，推送模块后加载')
 
 // 回归测试：未配置 WxPusher 时不应启动 DNS/TLS 预热请求。
 const noWarmupProbe = String.raw`
@@ -81,18 +81,18 @@ xbk.run().then(() => process.stdout.write(JSON.stringify(events))).catch(error =
     console.error(error);
     process.exit(1);
 });
-`;
+`
 const noWarmupOutput = execFileSync(process.execPath, ['-e', noWarmupProbe], {
-    cwd: __dirname,
-    encoding: 'utf8',
-});
+  cwd: __dirname,
+  encoding: 'utf8'
+})
 
-assert.deepStrictEqual(JSON.parse(noWarmupOutput.trim().split(/\r?\n/).pop()), ['dns-warmup']);
-console.log('✅ 未配置 WxPusher 时仅启动线报接口 DNS 预热，不启动 WxPusher DNS/TLS 预热');
+assert.deepStrictEqual(JSON.parse(noWarmupOutput.trim().split(/\r?\n/).pop()), ['dns-warmup'])
+console.log('✅ 未配置 WxPusher 时仅启动线报接口 DNS 预热，不启动 WxPusher DNS/TLS 预热')
 
 // 回归测试：TLS 预热必须携带与实际请求一致的 DNS 地址族，避免 Agent 连接池分裂。
-function probePrewarmDnsFamily(family) {
-    const probe = String.raw`
+function probePrewarmDnsFamily (family) {
+  const probe = String.raw`
 'use strict';
 const gotPath = require.resolve('got');
 const calls = [];
@@ -114,19 +114,19 @@ prewarmTls('example.test', 100, 1).then(() => {
     console.error(error);
     process.exit(1);
 });
-`;
-    const output = execFileSync(process.execPath, ['-e', probe], {
-        cwd: __dirname,
-        encoding: 'utf8',
-        env: { ...process.env, ...(family ? { XBK_DNS_FAMILY: family } : { XBK_DNS_FAMILY: '' }) },
-    });
-    return JSON.parse(output.trim().split(/\r?\n/).pop());
+`
+  const output = execFileSync(process.execPath, ['-e', probe], {
+    cwd: __dirname,
+    encoding: 'utf8',
+    env: { ...process.env, ...(family ? { XBK_DNS_FAMILY: family } : { XBK_DNS_FAMILY: '' }) }
+  })
+  return JSON.parse(output.trim().split(/\r?\n/).pop())
 }
 
-assert.deepStrictEqual(probePrewarmDnsFamily('4'), ['ipv4'], 'XBK_DNS_FAMILY=4 时预热应使用 ipv4');
-assert.deepStrictEqual(probePrewarmDnsFamily('6'), ['ipv6'], 'XBK_DNS_FAMILY=6 时预热应使用 ipv6');
-assert.deepStrictEqual(probePrewarmDnsFamily(''), [null], 'auto 模式不应强制地址族');
-console.log('✅ TLS 预热与推送请求使用一致的 DNS 地址族');
+assert.deepStrictEqual(probePrewarmDnsFamily('4'), ['ipv4'], 'XBK_DNS_FAMILY=4 时预热应使用 ipv4')
+assert.deepStrictEqual(probePrewarmDnsFamily('6'), ['ipv6'], 'XBK_DNS_FAMILY=6 时预热应使用 ipv6')
+assert.deepStrictEqual(probePrewarmDnsFamily(''), [null], 'auto 模式不应强制地址族')
+console.log('✅ TLS 预热与推送请求使用一致的 DNS 地址族')
 
 // v3.235：xbk_sendNotify_slim 缺失时 getNotify 不得同步抛错（AI 审 ef1116e 发现：
 // require.resolve 在 try-catch 外，模块缺失时 1529 行 .catch() 来不及接住，主流程中断）。
@@ -150,8 +150,8 @@ const missingProbe = `
     xbk.Config.report.enabled = false;
     xbk.run().then(() => process.stdout.write(JSON.stringify({ fetched })))
         .catch(e => process.stdout.write(JSON.stringify({ fetched, err: (e && e.code) || String(e) })));
-`;
-const missingOut = execFileSync(process.execPath, ['-e', missingProbe], { cwd: __dirname, encoding: 'utf8', timeout: 20000 }).trim().split(/\r?\n/).pop();
-const missingParsed = JSON.parse(missingOut);
-assert.strictEqual(missingParsed.fetched, true, '模块缺失时接口请求必须发出（getNotify 不得同步抛错）: ' + missingOut);
-console.log('✅ 推送模块缺失时 getNotify 不同步崩溃（接口请求正常发出）');
+`
+const missingOut = execFileSync(process.execPath, ['-e', missingProbe], { cwd: __dirname, encoding: 'utf8', timeout: 20000 }).trim().split(/\r?\n/).pop()
+const missingParsed = JSON.parse(missingOut)
+assert.strictEqual(missingParsed.fetched, true, '模块缺失时接口请求必须发出（getNotify 不得同步抛错）: ' + missingOut)
+console.log('✅ 推送模块缺失时 getNotify 不同步崩溃（接口请求正常发出）')

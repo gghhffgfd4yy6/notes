@@ -6,6 +6,8 @@
   "scripts": {
     "start": "node xbk_function_v3.js",
     "start:loop": "node qinglong/xbk_push.js",
+    "lint": "standard",
+    "lint:fix": "standard --fix",
     "test": "node run_tests.js",
     "test:filter": "node test_filter.js",
     "test:app": "node test_app_p.js",
@@ -38,6 +40,7 @@
     "qs": "6.15.3"
   },
   "devDependencies": {
-    "@stryker-mutator/core": "^9.6.1"
+    "@stryker-mutator/core": "^9.6.1",
+    "standard": "^17.1.2"
   }
 }
