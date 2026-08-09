@@ -113,6 +113,8 @@ const Config = {
   },
 
   timing: {
+    // pushInterval：推送间隔（毫秒）。顺序模式=全局逐条间隔；并行模式=每 worker 完成后的补位间隔
+    // （并行全局速率 = parallelLimit × interval；20 条量级 + 自动重试兜底，不构成频控问题——已知取舍）
     pushInterval: 0,
     finalWait: 0
   },
@@ -2508,7 +2510,8 @@ const App = {
             const index = nextIndex++
             if (index >= items.length) return
             results[index] = await pushOne(items[index], notifyModule)
-            // 保留可配置的补位间隔，但不等待同批其他慢任务；pushInterval=0 即完成即补。
+            // 保留可配置的补位间隔（per-worker 语义：每个 worker 完成一条后等 pushInterval 再补下一条，
+            // 并行全局速率 = parallelLimit × interval；已知取舍，量小+重试兜底不改），pushInterval=0 即完成即补。
             if (pushInterval > 0 && nextIndex < items.length) {
               await new Promise(r => setTimeout(r, pushInterval))
             }
