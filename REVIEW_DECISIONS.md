@@ -545,3 +545,20 @@
   - 5e42187：3 条全误报（finally 重复 resolve 对已 settle promise 无效、abort 后 while 条件下一轮 break、channel 40 字符脱敏截断为设计）。
   - 63a939b：3 条全自我否定（checkTimeCompiled 非数组风险是 pre-existing 非本次引入；saveBatch stale index 经 firstIndex match 校验无害；runSingleEntry 用 exitCode 而非 process.exit 是有意设计）。
 - **效率验证**：none 模式审 49K tokens 大提交仅 18.4s（low 300s 超时）——审查吞吐提升 16 倍+。
+
+---
+
+## 23. 修复提交 none 模式复核（2026-08-09）
+
+- **目的**：验证 none 模式审查"我们自己的修复提交"的效果（用户要求）。
+- **结果**（5 个修复提交全部 none 复核，7.5-14.0s/个）：
+
+| 提交 | none 耗时 | 发现 | 处理 |
+|---|---|---|---|
+| 32d155a（v3.232）| 13.1s | 130101/41001/42001 语义未测试锁定 | **有价值**：补 3 条测试（webhook 未找到/缺 token/token 过期 → permanent）|
+| 1a82c23（v3.233）| 14.0s | ① GET fallback elapsedMs 含 HEAD 时间（观察数据）② warmupCancelled 竞态 | ①已知取舍不修 ②误报（JS 单线程，检查→创建 controller 无 yield 点，无真实竞态）|
+| 61fc318（v3.234）| 7.5s | 同名别名"一空一有值"行为变化 | 设计取舍（有值优先更合理）|
+| 4370579（v3.235）| 12.8s | profile3Require 同步抛假设 | 误报（在 .then 回调内异步执行）|
+| 5213f03（v3.236）| 11.2s | — | No issues |
+
+- **结论**：none 模式审查修复提交有效——抓到 1 个真实改进点（测试覆盖缺口），其余多为误报/设计取舍；证明修复本身质量过关（5 个修复无真实缺陷遗留）。
