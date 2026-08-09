@@ -460,3 +460,9 @@
 - **影响评估**：当前无消费方消费 `cancelled`（仅 prewarmTls 内部自洽），属语义一致性回归（P3 偏下），但未来消费方会踩坑，修复成本极低。
 - **修复**：内层 catch 补 `if (signal && signal.aborted) return { cancelled: true, ... }`。
 - **闭环**：AI 发现 → 修复 → AI 复核修复 → 发现修复的回归 → 再修正——两轮复核链条完整。
+
+### 18.6 复核误报记录（AI 审 v3.232+v3.233 合集，2026-08-09）
+
+- **AI 报告**：`['40014','41001','42001','45001','130101'].includes(providerCode)` 严格相等——若 providerCode 为数字（数字 API 响应）则匹配失败，配置类错误落回通用分类。
+- **实测证伪**：`classifyFailure` 开头 `const providerCode = String(info.providerCode || '').toUpperCase()` 已先转字符串，includes 匹配前 providerCode 恒为字符串；数字/字符串输入均正确分类（40014→permanent、45009→retryable、500→retryable）。
+- **结论**：误报（AI 未注意到函数顶部已 String 化）。不修代码；后续 AI 再报同类问题可引用本条。
