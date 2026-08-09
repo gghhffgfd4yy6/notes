@@ -1047,6 +1047,7 @@ const RuleEngine = {
         const rules = []
         for (const line of lines) {
           const { cat, val, parts } = this._parseLine(line)
+          if (!val) continue // 空值跳过（与 pingbifenlei 惯例一致；否则 Number('')=0 静默生成 0 天规则，v3.238）
           if (parts.length >= 2) {
             let catRe = null
             if (cat) {

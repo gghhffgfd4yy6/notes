@@ -261,6 +261,15 @@ console.log('========================================\n');
     ), false)
   })
 
+  await test('多行 pingbitime 空值行 → 跳过不生成 0 天规则（v3.238）', () => {
+    // 修复前：'微博线报###' 空值 → Number('')=0 → 静默生成"拦截当天注册"规则 → 当天注册被拦
+    // 修复后：空值行跳过（与 pingbifenlei 惯例一致）→ 不拦截
+    assertEqual(listfilter(
+      makeItem({ catename: '微博线报', louzhuregtime: new Date().toISOString() }),
+      { pingbitime: '微博线报###' }
+    ), true)
+  })
+
   // ==================== 7. 多分类模式（###） ====================
   console.log('\n📂 7. 多分类模式（###）')
 
