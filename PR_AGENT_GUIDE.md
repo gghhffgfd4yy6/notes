@@ -33,8 +33,16 @@ Qodo Merge（原名 PR-Agent）是开源的 **AI 代码审查工具**，在终�
 ```text
 虚拟环境：/opt/pr-agent-venv        （Python venv，隔离安装）
 可执行文件：/opt/pr-agent-venv/bin/pr-agent
+代码版本：v0.42.0（2026-08-09 从 GitHub The-PR-Agent/pr-agent 源码安装）
+版本自报：0.41.0（官方已知坑：源码安装的版本号元数据滞后，--version 显示不代表代码版本）
 配置文件：/opt/pr-agent-venv/lib/python3.12/site-packages/pr_agent/settings/
 ```
+
+> ⚠️ **PyPI 已停更（重要）**：pr-agent 在 PyPI 上停在 0.39.0（2026-02 项目从 Qodo 独立后 PyPI 发布暂停，官方正在恢复中）。`pip install pr-agent` 只能装到 0.39.0；**升级到 0.40+ 必须源码安装**：
+> ```bash
+> /opt/pr-agent-venv/bin/pip install "git+https://github.com/The-PR-Agent/pr-agent.git@v0.42.0"
+> ```
+> 官方地址：`github.com/The-PR-Agent/pr-agent`（原 qodo-ai/pr-agent 已重定向；描述明确"This project is not the Qodo free tier"）。
 
 使用前把 venv bin 加入 PATH：
 
@@ -70,6 +78,8 @@ export OPENAI__API_BASE="https://opencode.ai/zen/go/v1"   # 第三方端点（�
 export CONFIG__MODEL="openai/deepseek-v4-flash"             # 模型名，openai/ 前缀强制走自定义端点
 export CONFIG__FALLBACK_MODELS='["openai/deepseek-v4-flash"]'  # 失败回退也指同一模型（防回退到官方 gpt）
 export CONFIG__CUSTOM_MODEL_MAX_TOKENS=32000              # 非内置模型的 token 上限（不设会报 MAX_TOKENS 未定义）
+export CONFIG__OUTPUT_RUN_DETAILS=true                    # 审查后输出运行明细（模型/tokens/耗时/AI 调用次数，v0.42.0 新增）
+export LITELLM_LOCAL_MODEL_COST_MAP=True                  # 用本地模型价格表，跳过启动时拉 GitHub 的超时等待（每次省约 5s）
 ```
 
 - 官方 OpenAI：只设 `OPENAI_API_KEY` 即可，其余可省
@@ -174,6 +184,18 @@ rm /workspace/review.md /workspace/description.md
 - 默认模型为 GPT 系列；可用 `--pr_reviewer.model=...` 切换（文档不维护模型名，以官方文档为准）
 - 大仓库建议限定审查范围：临时分支只覆盖目标提交（`HEAD~N` 取小），或加 `extra_instructions` 聚焦模块
 
+### 6.6 审查耗时：小范围才可行（实测结论，2026-08-09）
+
+| 范围 | diff 规模 | 实测耗时 |
+|---|---|---|
+| 单提交 / HEAD~3（几十行） | ~2K tokens | **约 36-40s** |
+| HEAD~10（3,645 行） | ~30K tokens | 3-4 分钟 |
+| HEAD~50（7,300 行） | **148K tokens** | **8 分钟+ 无法完成** |
+
+- 慢的构成：启动 ~11s（Python+litellm 加载 137 个包，固定成本）+ 模型串行调用（每次 3-6s，review 对每个文件/hunk 单独调用，**时间随 diff 线性增长**）
+- **结论**：AI 审查只用于小范围/单提交/刚提交的新变更；**不要**回头审 50 次提交这种大范围（已实测不可行且边际价值低——历史已被多轮人工审查覆盖）
+- `review` 命令是多步流水线（主分析+code suggestions 等 3-4 次串行调用），`ask` 命令单次调用更快（约 20s）
+
 ### 6.4 网络
 
 - 运行需要能访问模型 API（本环境实测：pypi 官方源与阿里/腾讯镜像可用；第三方端点 `opencode.ai` 可直连）
@@ -213,6 +235,13 @@ Cloudflare 拦截非浏览器客户端，请求头加浏览器 User-Agent（§6.
 
 **Q：不想让 review.md 出现在 git status？**
 加入 `.gitignore`（§5）。
+
+**Q：遇到工具/订阅/计费问题去哪找支持？**
+pr-agent 无传统客服（无工单/客服邮箱），官方渠道：
+- **GitHub Issues**：`github.com/The-PR-Agent/pr-agent`（正式报 bug，响应快）
+- **Discord 社区**：`opencode.ai/discord`（注意这是 OpenCode 的社区；pr-agent 的社区见 GitHub 主页链接）
+- **官方文档**：`qodo-merge-docs.qodo.ai`（每页底部可提交 issue）
+- 第三方端点（opencode.ai）的订阅/额度问题：登录 `zen.opencode.ai` 控制台，或走 OpenCode 的 GitHub/Discord
 
 ---
 

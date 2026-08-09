@@ -205,6 +205,7 @@ FILE_INDEX.md             文件索引（最详细）
 REVIEW_DECISIONS.md       审查决策记录（为什么修/为什么不修）
 BUG_AUDIT.md              Bug、P1/P2 审计与验证记录
 CHANGELOG.md              版本演进
+PR_AGENT_GUIDE.md         Qodo Merge（PR-Agent）终端 AI 审查使用指南（不入库的审查工具链文档）
 ```
 
 ## 📚 文档导航（新人看这里）
@@ -217,6 +218,7 @@ CHANGELOG.md              版本演进
 | **REVIEW_DECISIONS.md** | 想知道某个问题为什么修/为什么不修 |
 | **BUG_AUDIT.md** | 想查看 Bug、P1/P2 审计和验证记录 |
 | **CHANGELOG.md** | 版本演进史 |
+| **PR_AGENT_GUIDE.md** | 终端 AI 代码审查工具（Qodo Merge / PR-Agent）安装、配置与使用指南 |
 
 ## ⚠️ 安全红线（重要）
 
