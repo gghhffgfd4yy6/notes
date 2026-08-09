@@ -1158,6 +1158,24 @@ await test('wxpusher 非白名单 HTML 元素自动切换 HTML 内容类型', ()
     assert(c && c.options.json.contentType === 2, `真实 HTML 应使用 HTML 类型: ${JSON.stringify(c && c.options.json)}`);
 }));
 
+// v3.234：空环境变量不覆盖本地配置（QingLong 面板留空场景，AI 审查 1163a11 发现）
+await test('空 env 不覆盖 push_config，非空 env 正常覆盖（v3.234）', async () => {
+    const notifyPath = require.resolve('./xbk_sendNotify_slim');
+    const cleanLoad = () => { delete require.cache[notifyPath]; return require('./xbk_sendNotify_slim'); };
+    const base = cleanLoad(); // 无 env 基线
+    process.env.PUSH_PLUS_TOKEN = '';
+    const withEmpty = cleanLoad();
+    delete process.env.PUSH_PLUS_TOKEN;
+    process.env.PUSH_PLUS_USER = 'env-user';
+    const withValue = cleanLoad();
+    delete process.env.PUSH_PLUS_USER;
+    // 空 env 不改变（保持基线值，防 QingLong 留空覆盖有效 token 导致通道失效）
+    assert(withEmpty.push_config.PUSH_PLUS_TOKEN === base.push_config.PUSH_PLUS_TOKEN, '空 env 不得覆盖本地配置');
+    // 非空 env 正常覆盖
+    assert(withValue.push_config.PUSH_PLUS_USER === 'env-user', '非空 env 应覆盖');
+    cleanLoad(); // 恢复干净模块（后续汇总不受 env 残留影响）
+});
+
 if (failed === 0) {
     console.log(`  🎉 通道测试通过 ${passed}/${passed}`);
 } else {

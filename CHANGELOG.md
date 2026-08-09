@@ -954,3 +954,10 @@
 - **prewarmTls 冗余 GET**（P3）：HEAD 返回 ≥400 后的 GET 若失败，会落到外层 catch 再发一次 GET——同一主机连续两次建连。修复：GET 独立 try/catch，失败即返回（不回退重试）。
 - **预热取消竞态**（P3）：warmupController 仅在 `getNotify().then()` 回调内创建——主流程先结束时 finally 看到 null 不取消，稍后预热仍启动，pending 请求拖住进程退出（最长 5s）。修复：`warmupCancelled` flag 在 finally 置位，then 回调凭 flag 跳过启动。
 - 发现途径：Qodo Merge（PR-Agent）AI 审查 18650cb 提交（修复 reasoning_effort=low 后 74.7s 完成）。
+
+## v3.234（空环境变量不覆盖配置修复，2026-08-09，AI 审查发现）
+
+- **QingLong 环境变量空值覆盖本地配置**（P2）：ENV_ALIASES 覆盖逻辑用 `!== undefined` 判断——环境变量存在但为空（''）时仍覆盖本地有效配置，QingLong 面板留空/误删值会导致单通道用户 token 被清空、推送失效（消息丢失）。
+- 修复：过滤空白值（`raw !== undefined && String(raw).trim() !== ''`），空 env 不覆盖，保留本地配置。
+- 新增回归测试：空 env 不覆盖 push_config、非空 env 正常覆盖（模块重载隔离）。
+- 发现途径：Qodo Merge（PR-Agent）AI 审查 1163a11 提交（55s 完成）。

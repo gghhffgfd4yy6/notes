@@ -466,3 +466,21 @@
 - **AI 报告**：`['40014','41001','42001','45001','130101'].includes(providerCode)` 严格相等——若 providerCode 为数字（数字 API 响应）则匹配失败，配置类错误落回通用分类。
 - **实测证伪**：`classifyFailure` 开头 `const providerCode = String(info.providerCode || '').toUpperCase()` 已先转字符串，includes 匹配前 providerCode 恒为字符串；数字/字符串输入均正确分类（40014→permanent、45009→retryable、500→retryable）。
 - **结论**：误报（AI 未注意到函数顶部已 String 化）。不修代码；后续 AI 再报同类问题可引用本条。
+
+---
+
+## 19. QingLong 空环境变量覆盖配置修复（AI 审查发现，2026-08-09，P2 已修）
+
+### 19.1 发现与定性（AI 审 1163a11 提交报告）
+
+- **问题**：ENV_ALIASES 覆盖逻辑用 `process.env[name] !== undefined` 判断存在——**空字符串（''）不算 undefined**，QingLong 面板中环境变量留空/误删值时，空值覆盖 `push_config.local.js` 的有效 token → 单通道用户推送通道失效（**消息丢失**）。
+- **定级 P2**：触发条件为"环境变量存在但为空"（QingLong 面板常见：新增变量留空、误删值、模板默认空）；后果为静默配置破坏 + 推送失效。
+- **发现途径**：Qodo Merge（PR-Agent）AI 审查 1163a11（feat: QingLong direct execution entry，55.1s）。
+
+### 19.2 修复决策
+
+- **修复**：`names.find()` 过滤空白值（`raw !== undefined && String(raw).trim() !== ''`）——空 env 不覆盖，保留本地配置。非空 env 行为不变。
+- **为什么过滤空白而非仅空串**：面板常见值含空格（误输入），trim 后为空的同样不应覆盖。
+- **验证**：新增回归测试（空 env 不覆盖、非空 env 覆盖，模块重载隔离避免 require 缓存污染）；全量测试 28.2s 全绿（通道测试 62/62）。
+- **版本**：v3.233 → v3.234（三方一致）。
+- **备注**：测试过程中发现 node_modules 缺 got 依赖（中间被清理），已 `npm install` 恢复（+1 package），不影响代码。

@@ -308,7 +308,12 @@ const ENV_ALIASES = {
     HITOKOTO: ['HITOKOTO'],
 };
 for (const [configKey, names] of Object.entries(ENV_ALIASES)) {
-    const envName = names.find(name => process.env[name] !== undefined);
+    // v3.234：存在但为空的 env 不覆盖本地配置——QingLong 面板留空/误删值时，
+    // 空字符串覆盖有效 token 会导致单通道用户推送失效（消息丢失）
+    const envName = names.find(name => {
+        const raw = process.env[name];
+        return raw !== undefined && String(raw).trim() !== '';
+    });
     if (envName !== undefined) push_config[configKey] = process.env[envName];
 }
 
