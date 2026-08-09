@@ -1,3 +1,5 @@
+/* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
+/* eslint camelcase: off */ // push_config 等 snake_case 为项目设计命名（standard 风格检查忽略）
 'use strict'
 
 // 精简版推送模块
@@ -827,7 +829,7 @@ async function reserveWxPusherOrder (channels) {
 
 function waitWithAbort (ms, signal) {
   return new Promise((resolve, reject) => {
-    let timer
+    let timer // eslint-disable-line prefer-const -- 声明与赋值分离（setTimeout 回填），let 语义清晰
     let cleaned = false
     const cleanup = () => {
       if (cleaned) return

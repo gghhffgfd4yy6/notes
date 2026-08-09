@@ -158,10 +158,6 @@ function loadCheckpoint (file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch (e) { return null }
 }
 
-function resultMapToObject (map) {
-  return Object.fromEntries([...map.entries()].map(([id, value]) => [String(id), value]))
-}
-
 async function main () {
   const batchSize = Number(process.env.MUTATION_BATCH || 50)
   const concurrency = Number(process.env.MUTATION_CONCURRENCY || Math.max(1, Math.min(os.cpus().length, 8)))
@@ -171,9 +167,9 @@ async function main () {
   const mutants = collectMutants(files)
   const byId = new Map(mutants.map(m => [m.id, m]))
   const old = loadCheckpoint(checkpointFile)
-  const killed = new Map(old && old.killed || [])
-  const survived = new Map(old && old.survived || [])
-  const compileErrors = new Map(old && old.compileErrors || [])
+  const killed = new Map((old && old.killed) || [])
+  const survived = new Map((old && old.survived) || [])
+  const compileErrors = new Map((old && old.compileErrors) || [])
   const resolved = new Set([...killed.keys(), ...survived.keys(), ...compileErrors.keys()].map(Number))
   const allBatches = []
   for (let i = 0; i < mutants.length; i += batchSize) allBatches.push(mutants.slice(i, i + batchSize))

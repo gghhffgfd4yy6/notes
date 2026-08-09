@@ -1,3 +1,5 @@
+/* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
+/* eslint camelcase: off */ // tuisong_replace 等 snake_case 为项目设计命名
 'use strict'
 
 // ============================================================
@@ -22,7 +24,10 @@ let failNonJson = false // 仅第一次返回非 JSON 响应（.json() 抛错，
 
 require.cache[gotPath].exports = (url, opts) => {
   gotCalls.push({ url, opts })
-  if (failPlainString) { throw 'plain string error' }
+  if (failPlainString) {
+    // eslint-disable-next-line no-throw-literal -- 测试字符串异常处理
+    throw 'plain string error'
+  }
   if (fail429Once) {
     fail429Once = false
     const e = new Error('Too Many')
@@ -61,7 +66,10 @@ let notifyCalls = 0
 const defaultNotifySend = async (text, desp) => {
   notifyCalls++
   if (notifyDelayMs > 0) await new Promise(r => setTimeout(r, notifyDelayMs))
-  if (notifyFailString) throw 'push boom string' // 字符串异常（非 Error）
+  if (notifyFailString) {
+    // eslint-disable-next-line no-throw-literal -- 测试字符串异常处理
+    throw 'push boom string' // 字符串异常（非 Error）
+  }
   if (notifyFail) throw new Error('push boom')
   if (notifyFailAt > 0 && notifyCalls === notifyFailAt) throw new Error('push boom')
   pushCalls.push({ text, desp })

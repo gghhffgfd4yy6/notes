@@ -2,7 +2,7 @@
 
 function runBounded (task, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
-    let timer
+    let timer // eslint-disable-line prefer-const -- 声明与赋值分离（setTimeout 回填），let 语义清晰
     let settled = false
     const childController = typeof AbortController === 'function' ? new AbortController() : null
     const childSignal = childController ? childController.signal : signal
@@ -70,6 +70,7 @@ async function runLoop (run, options = {}) {
     ? options.onIntervalTimeoutMs
     : 10000
   let cycle = 0
+  // eslint-disable-next-line no-unmodified-loop-condition -- signal 由外部 abort 修改（等待中断信号是有意设计）
   while (!(signal && signal.aborted)) {
     try {
       await run()

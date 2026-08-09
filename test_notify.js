@@ -7,7 +7,6 @@
 // - 每个测试用 withChannels 清空全部通道再只配被测通道，避免本地密钥(push_config.local.js)
 //   与上一个测试残留的通道配置污染 gotCalls / 断言
 
-const path = require('path')
 const gotPath = require.resolve('got')
 require(gotPath)
 

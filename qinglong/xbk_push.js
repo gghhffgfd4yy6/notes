@@ -95,7 +95,7 @@ async function runResident (app, controller) {
   const handleFailure = async (error) => {
     const decision = classifyFailure(error)
     const info = decision.info || summarizeError(error)
-    const detail = info.message || error && error.message || String(error)
+    const detail = info.message || (error && error.message) || String(error)
     if (decision.kind === 'permanent') {
       residentExitCode = 1
       console.error(`本轮遇到不可恢复错误（${decision.reason}），停止常驻：${detail}`)

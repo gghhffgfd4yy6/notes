@@ -1,10 +1,12 @@
+/* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
+/* eslint no-control-regex: off, camelcase: off */ // 脱敏正则与 tuisong_replace/zkt_gjc 等 snake_case 为设计命名
 'use strict'
 
 // ============================================================
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================
 
-const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, fetchData, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, runSingleEntry, hasNestedQuantifier, truncateUtf16 } = require('./xbk_function_v3.js')
+const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, runSingleEntry, hasNestedQuantifier, truncateUtf16 } = require('./xbk_function_v3.js')
 const assert = require('assert')
 const path = require('path')
 // 缓存目录（基于 __dirname——v3.113 修复 /workspace 硬编码，仓库可移植）
@@ -1419,7 +1421,7 @@ console.log('========================================\n');
   })
 
   await test('内容含单引号 → 正常匹配', () => {
-    assertEqual(listfilter(makeItem({ content: "它's 好物" }), { pingbineirong: "它\'s" }), false)
+    assertEqual(listfilter(makeItem({ content: "它's 好物" }), { pingbineirong: "它's" }), false)
   })
 
   await test('楼主名含数字 → 正常匹配', () => {
@@ -2220,7 +2222,6 @@ console.log('========================================\n');
 
   // saveMessages 裁剪后数据正确
   await test('saveMessages 裁剪后保留最新数据', () => {
-    const fs = require('fs')
     const p = path.join(CACHE, 'test_trim_new.json')
     const many = []
     for (let i = 0; i < 150; i++) many.push({ id: i })
@@ -2472,8 +2473,6 @@ console.log('========================================\n');
     const fs = require('fs')
     const name = 'test_ts.json'
     appendMessageToFile({ id: 888, title: 'a' }, name)
-    const first = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'))
-    const t1 = first[0].timestamp
     // 再存一次同id
     appendMessageToFile({ id: 888, title: 'b' }, name)
     const second = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'))
@@ -2722,7 +2721,6 @@ console.log('========================================\n');
   })
 
   await test('saveMessages 恰好 maxSize 条 → 不裁剪', () => {
-    const fs = require('fs')
     const p = path.join(CACHE, 'test_exact100.json')
     const msgs = []
     for (let i = 0; i < 100; i++) msgs.push({ id: i })
@@ -2732,7 +2730,6 @@ console.log('========================================\n');
   })
 
   await test('saveMessages 超过maxSize → 裁剪到上限（v3.120：显式 maxSize=100 验证裁剪逻辑）', () => {
-    const fs = require('fs')
     const p = path.join(CACHE, 'test_over100.json')
     const msgs = []
     for (let i = 0; i < 101; i++) msgs.push({ id: i })
@@ -3002,7 +2999,6 @@ console.log('========================================\n');
   })
 
   await test('MS 裁剪用splice保留后100条', () => {
-    const fs = require('fs')
     const p = path.join(CACHE, 'test_splice.json')
     const msgs = []
     for (let i = 0; i < 150; i++) msgs.push({ id: i })
@@ -3998,7 +3994,6 @@ console.log('========================================\n');
   })
 
   await test('缓存裁剪给出提示（#243）', () => {
-    const fs = require('fs')
     const orig = require('./xbk_function_v3.js').Config.cache.maxSize
     require('./xbk_function_v3.js').Config.cache.maxSize = 5
     const warns = []
@@ -4593,8 +4588,8 @@ console.log('========================================\n');
 
   await test('可达性: 全部导出被测试引用', () => {
     const mod = require('./xbk_function_v3.js')
-    const tf = require('fs').readFileSync(__dirname + '/test_filter.js', 'utf8')
-    const ta = require('fs').readFileSync(__dirname + '/test_app.js', 'utf8')
+    const tf = require('fs').readFileSync(path.join(__dirname, 'test_filter.js'), 'utf8')
+    const ta = require('fs').readFileSync(path.join(__dirname, '/test_app.js'), 'utf8')
     const all = tf + ta
     const unused = []
     for (const k of Object.keys(mod)) {
@@ -4606,7 +4601,7 @@ console.log('========================================\n');
   })
 
   await test('可达性: _splitLines/_parseLine 等内部方法被使用', () => {
-    const src = require('fs').readFileSync(__dirname + '/xbk_function_v3.js', 'utf8')
+    const src = require('fs').readFileSync(path.join(__dirname, '/xbk_function_v3.js'), 'utf8')
     // 内部 helper 都应被调用(出现次数 > 定义处)
     for (const h of ['_parseLine', '_compileCatRe', '_validateCatRe', '_catMatches', '_anyRule', '_passIfMissing', '_findDedupIndex', '_upsert', '_resetCache', '_finalizeMd', '_decodeNumeric', 'isValidItem', 'daysFrom']) {
       const cnt = (src.match(new RegExp(h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length
@@ -4832,7 +4827,7 @@ console.log('========================================\n');
       try {
         const dir = require('path').join(__dirname, 'xianbaoku_cache')
         if (fs.existsSync(dir)) {
-          for (const f of fs.readdirSync(dir)) { /* 清理 */ }
+          fs.readdirSync(dir).forEach(() => { /* 清理 */ })
         }
       } catch (e) { /* 预期吞掉 */ }
       assertEqual(true, true, 'readdir 失败应被容错')
@@ -5206,7 +5201,7 @@ console.log('========================================\n');
     let received = null
     const server = http.createServer((req, res) => {
       let body = ''
-      req.on('data', c => body += c)
+      req.on('data', c => { body += c })
       req.on('end', () => { received = body; res.writeHead(200); res.end('{}') })
     })
     await new Promise(r => server.listen(0, r))
@@ -6062,7 +6057,6 @@ console.log('========================================\n');
     let seed = 999
     const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
     const atoms = ['a', 'b', '\\d', '.', '[ab]', '(ab)', '(?:cd)', 'a+', 'b*', 'a?', 'x{1,3}', 'y{2,}', '(a+)+', '(b*)*', '\\', '|', '^', '$']
-    let checked = 0
     for (let i = 0; i < 100; i++) {
       let pat = ''
       const len = Math.floor(rand() * 8) + 1
@@ -6070,7 +6064,6 @@ console.log('========================================\n');
       const r = hasNestedQuantifier(pat)
       // 随机模式（可能含转义干扰）：只断言返回 boolean 不崩——危险判定用下方显式模式验证
       assertEqual(typeof r, 'boolean', `hasNestedQuantifier 应返回 boolean: "${pat}"`)
-      checked++
     }
     // 已知安全模式不误报
     assertEqual(hasNestedQuantifier('a+b+c'), false, 'a+b+c 安全')
@@ -6108,10 +6101,15 @@ console.log('========================================\n');
       return []
     }
     const written = [] // 记录本测试实际写过的文件（getFilePath 的 basename 可能截断前缀，不能按前缀猜）
+    // v3.237：name/content 提到 try 外——catch 里引用（此前 catch 块引用 try 内块级变量会 ReferenceError，掩盖原始失败原因）
+    let lastName = ''
+    let lastContent = null
     try {
       for (let i = 0; i < 50; i++) {
         const name = randName()
         const content = randContent()
+        lastName = name
+        lastContent = content
         const fp = getFilePath(name)
         written.push(fp)
         assertEqual(typeof fp, 'string', 'getFilePath 应返回字符串')
@@ -6125,7 +6123,7 @@ console.log('========================================\n');
         assertEqual(isMessageInFile({ id: 99999, title: 'n' }, name), false, 'isMessageInFile 不崩且不误判')
       }
     } catch (e) {
-      throw new Error(`IO fuzz 失败 name="${name.slice(0, 40)}" content=${JSON.stringify(content).slice(0, 40)}: ${e.message}`)
+      throw new Error(`IO fuzz 失败 name="${String(lastName).slice(0, 40)}" content=${JSON.stringify(lastContent).slice(0, 40)}: ${e.message}`)
     } finally {
       // v3.155：清理本测试实际写过的文件（曾声称"自动清理"但未实现，跑完留乱码名垃圾如 01Zc;Z.json）
       try {

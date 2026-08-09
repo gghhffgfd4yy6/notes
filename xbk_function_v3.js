@@ -1,4 +1,8 @@
 //* ******* 线报酷推送脚本 v3.236 — 缓存恢复写入异常降级修复 ********
+
+/* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
+
+/* eslint no-control-regex: off, no-new: off */ // 控制字符正则用于脱敏、new RegExp 用于配置正则合法性验证（均有意）
 // 按职责分层：配置 → 工具 → 格式化 → 规则 → 过滤 → 缓存 → 网络 → 推送 → 主流程
 
 'use strict'
@@ -942,8 +946,7 @@ const RuleEngine = {
         continue
       }
       const ql = infQuantLen(i)
-      if (ql > 0) { cur.inf = true; i += ql - 1 } else if (ch === '?') { cur.inf = true } // ? 可变量词：组内以 ? 结尾时组可匹配空串，配合组后无限量词同样灾难性（如 (a?)+）
-      else { cur.inf = false } // 普通字符 / {n} / {n,m} 视为有界
+      if (ql > 0) { cur.inf = true; i += ql - 1 } else if (ch === '?') { cur.inf = true } else { cur.inf = false } // 普通字符 / {n} / {n,m} 视为有界；? 可变量词：组内以 ? 结尾组可匹配空串，配合组后无限量词同样灾难性（如 (a?)+）
     }
     return false
   },
@@ -1179,8 +1182,8 @@ const RuleEngine = {
           warnings.push(`⚠️ 配置「${field}」的正则含嵌套量词，可能导致灾难性回溯，该规则将被忽略：「${val}」`)
           continue
         }
-        try { new RegExp(val, 'i') } // 与 compileRules 的 'i' 保持一致
-        catch (e) { warnings.push(`⚠️ 配置「${field}」包含无效的正则表达式：「${val}」\n   原因：${e.message}`) }
+        // 与 compileRules 的 'i' 保持一致
+        try { new RegExp(val, 'i') } catch (e) { warnings.push(`⚠️ 配置「${field}」包含无效的正则表达式：「${val}」\n   原因：${e.message}`) }
       }
     }
 
@@ -1508,7 +1511,7 @@ const MessageStore = {
           const restored = this.saveMessages(filePath, this._memoryCache[filePath])
           if (!restored) console.warn(`缓存文件缺失且恢复失败，继续使用内存缓存：${filePath}`)
         } catch (e) {
-          console.warn(`缓存文件缺失且恢复异常，继续使用内存缓存：${filePath} (${String(e && e.message || e)})`)
+          console.warn(`缓存文件缺失且恢复异常，继续使用内存缓存：${filePath} (${String((e && e.message) || e)})`)
         }
       }
       return this._memoryCache[filePath]
