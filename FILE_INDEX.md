@@ -276,6 +276,19 @@ npm run test:mutation
 
 版本演进记录(见 [CHANGELOG.md](CHANGELOG.md)),每轮修复/重构/功能变更的摘要。
 
+### `PR_AGENT_GUIDE.md` — Qodo Merge（PR-Agent）终端 AI 审查使用指南
+
+**定位**:记录 Qodo Merge（PR-Agent）CLI 的安装位置、配置、local 模式用法与注意事项——本仓库远程为 Gitee（云端 App 类 AI 审查工具不支持），CLI 本地审查是适配路径。
+
+**内容**:
+- venv 安装位置（`/opt/pr-agent-venv`）与重装/升级命令（含网络镜像实测：pypi.org/阿里云/腾讯云通、清华不通；PEP 668 必须用 venv）
+- `OPENAI_API_KEY`（或 `OPENAI__KEY`）配置与敏感信息红线（`OPENAI_KEY` 是 GitHub Action 专用变量，CLI 下不生效）；pr-agent 不加载 `.env`
+- `CONFIG__GIT_PROVIDER=local` 本地审查模式；临时分支审查流程（`git branch review-base HEAD~N` → `pr-agent --pr_url=review-base review` → 删分支）
+- 审查产物 `review.md`/`description.md` 写入仓库根目录的清理与 `.gitignore` 建议
+- 注意事项:仓库必须干净、目标分支必须存在、local 模式不支持行内评论、API 按量计费
+
+**使用**:速查命令见文档正文 §8（日常审查五步）;与 `.tools/code-audit/` 静态扫描、`npm test` 形成三层验收。
+
 ---
 
 ## 四、配置/依赖
