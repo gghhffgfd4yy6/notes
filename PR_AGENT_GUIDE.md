@@ -11,7 +11,7 @@
 Qodo Merge（原名 PR-Agent）是开源的 **AI 代码审查工具**，在终端直接对 Git 仓库做审查：
 
 - 审查**本地 git 变更**（不需要 PR、不需要 GitHub/GitLab），因此**适配本仓库的 Gitee 远程**——云端 App 类工具（如 CodeRabbit）不支持 Gitee，CLI 是可行路径
-- 由大模型（OpenAI GPT 系列，或任意 OpenAI 兼容第三方端点；本环境配置为 `deepseek-v4-pro`）生成：变更总结、潜在 Bug、改进建议、安全风险
+- 由大模型（OpenAI GPT 系列，或任意 OpenAI 兼容第三方端点；本环境配置为 `deepseek-v4-flash`）生成：变更总结、潜在 Bug、改进建议、安全风险
 - 输出为 Markdown 文本（`review.md`），可人工审阅
 
 与项目已有审查手段的分层：
@@ -62,13 +62,13 @@ python3 -m venv /opt/pr-agent-venv                          # 首次：创建虚
 
 ### 3.1 API Key 与模型端点（官方或第三方）
 
-CLI 运行时需要 OpenAI 兼容的 API key。**官方 OpenAI 与第三方兼容端点都支持**（本环境实测为第三方端点 `opencode.ai` + 模型 `deepseek-v4-pro`）。
+CLI 运行时需要 OpenAI 兼容的 API key。**官方 OpenAI 与第三方兼容端点都支持**（本环境实测为第三方端点 `opencode.ai` + 模型 `deepseek-v4-flash`）。
 
 ```bash
 export OPENAI_API_KEY=sk-你的key                          # litellm 标准变量
 export OPENAI__API_BASE="https://opencode.ai/zen/go/v1"   # 第三方端点（到 /v1，litellm 自动拼 /chat/completions）
-export CONFIG__MODEL="openai/deepseek-v4-pro"             # 模型名，openai/ 前缀强制走自定义端点
-export CONFIG__FALLBACK_MODELS='["openai/deepseek-v4-pro"]'  # 失败回退也指同一模型（防回退到官方 gpt）
+export CONFIG__MODEL="openai/deepseek-v4-flash"             # 模型名，openai/ 前缀强制走自定义端点
+export CONFIG__FALLBACK_MODELS='["openai/deepseek-v4-flash"]'  # 失败回退也指同一模型（防回退到官方 gpt）
 export CONFIG__CUSTOM_MODEL_MAX_TOKENS=32000              # 非内置模型的 token 上限（不设会报 MAX_TOKENS 未定义）
 ```
 
