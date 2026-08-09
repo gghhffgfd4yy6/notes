@@ -11,7 +11,7 @@
 Qodo Merge（原名 PR-Agent）是开源的 **AI 代码审查工具**，在终端直接对 Git 仓库做审查：
 
 - 审查**本地 git 变更**（不需要 PR、不需要 GitHub/GitLab），因此**适配本仓库的 Gitee 远程**——云端 App 类工具（如 CodeRabbit）不支持 Gitee，CLI 是可行路径
-- 由大模型（默认 OpenAI GPT 系列）生成：变更总结、潜在 Bug、改进建议、安全风险
+- 由大模型（OpenAI GPT 系列，或任意 OpenAI 兼容第三方端点；本环境配置为 `deepseek-v4-pro`）生成：变更总结、潜在 Bug、改进建议、安全风险
 - 输出为 Markdown 文本（`review.md`），可人工审阅
 
 与项目已有审查手段的分层：
@@ -60,16 +60,23 @@ python3 -m venv /opt/pr-agent-venv                          # 首次：创建虚
 
 ## 3. 配置（一次性）
 
-### 3.1 OpenAI API Key
+### 3.1 API Key 与模型端点（官方或第三方）
 
-CLI 运行时需要 OpenAI API key，二选一（推荐第一种）：
+CLI 运行时需要 OpenAI 兼容的 API key。**官方 OpenAI 与第三方兼容端点都支持**（本环境实测为第三方端点 `opencode.ai` + 模型 `deepseek-v4-pro`）。
 
 ```bash
-export OPENAI_API_KEY=sk-你的key      # 方式一：litellm 标准变量（推荐）
-export OPENAI__KEY=sk-你的key         # 方式二：pr-agent 原生配置键
+export OPENAI_API_KEY=sk-你的key                          # litellm 标准变量
+export OPENAI__API_BASE="https://opencode.ai/zen/go/v1"   # 第三方端点（到 /v1，litellm 自动拼 /chat/completions）
+export CONFIG__MODEL="openai/deepseek-v4-pro"             # 模型名，openai/ 前缀强制走自定义端点
+export CONFIG__FALLBACK_MODELS='["openai/deepseek-v4-pro"]'  # 失败回退也指同一模型（防回退到官方 gpt）
+export CONFIG__CUSTOM_MODEL_MAX_TOKENS=32000              # 非内置模型的 token 上限（不设会报 MAX_TOKENS 未定义）
 ```
 
-**保存建议**：写入 `~/.bashrc`（`export OPENAI_API_KEY=sk-...`）免每次输入。
+- 官方 OpenAI：只设 `OPENAI_API_KEY` 即可，其余可省
+- 第三方兼容端点：**必须**设 `OPENAI__API_BASE` + `CONFIG__MODEL`；`CONFIG__FALLBACK_MODELS` 与 `CONFIG__CUSTOM_MODEL_MAX_TOKENS` 强烈建议（否则失败会回退到官方 `gpt-5.4-mini` 导致"Model not supported"）
+- 以上配置已写入本环境 `~/.bashrc`（登录即生效）
+
+**保存建议**：写入 `~/.bashrc` 免每次输入（本环境已配好）。
 
 **安全红线**：
 - key 是敏感凭证，**绝不写入仓库文件**、绝不提交 git（与 `push_config.local.js` 同等对待）
@@ -169,7 +176,8 @@ rm /workspace/review.md /workspace/description.md
 
 ### 6.4 网络
 
-- 运行需要能访问 OpenAI API（本环境实测 pypi 官方源与阿里/腾讯镜像可用，OpenAI 域名按实际网络测试）
+- 运行需要能访问模型 API（本环境实测：pypi 官方源与阿里/腾讯镜像可用；第三方端点 `opencode.ai` 可直连）
+- 第三方端点带 Cloudflare 防护时，**手动脚本测试需带浏览器 User-Agent**（否则 HTTP 403 error 1010）；pr-agent 的 litellm 请求实测无需特殊处理
 - 安装依赖失败时重试命令见 §2
 
 ### 6.5 与项目红线的关系
@@ -190,6 +198,15 @@ rm /workspace/review.md /workspace/description.md
 
 **Q：提示 key 相关错误 / DUMMY key？**
 `OPENAI_API_KEY` 未设置或为空。检查环境变量；注意 CLI 下不要用 `OPENAI_KEY`（那是 GitHub Action 专用）。
+
+**Q：提示 `Model gpt-5.4-mini is not supported`？**
+第三方端点的模型名与默认回退模型不一致：设置 `CONFIG__MODEL` 指向你的模型，并设 `CONFIG__FALLBACK_MODELS` 指向同一模型（§3.1）。
+
+**Q：提示 `not defined in MAX_TOKENS`？**
+第三方非内置模型需要设 `CONFIG__CUSTOM_MODEL_MAX_TOKENS`（§3.1）。
+
+**Q：手动测试 API 返回 HTTP 403 error 1010？**
+Cloudflare 拦截非浏览器客户端，请求头加浏览器 User-Agent（§6.4）；pr-agent 本身实测不受影响。
 
 **Q：pip 安装中断？**
 网络问题，换阿里云/腾讯云镜像重试（§2），已下载部分会自动续装。
