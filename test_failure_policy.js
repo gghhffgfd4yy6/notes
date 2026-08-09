@@ -57,6 +57,11 @@ function error(message, code) {
     // v3.232：企业微信瞬时错误（500 系统繁忙）不得误判永久（曾导致常驻停止重试、消息丢失）
     assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 500, message: 'system error' }).kind, 'retryable');
     assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 45001, message: 'no permission' }).kind, 'permanent');
+    // v3.236 补充（AI none 复核 32d155a 质疑）：130101=webhook 未找到/机器人删除、41001=缺 token、
+    // 42001=token 过期——均配置类永久错误，锁定语义防回归
+    assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 130101, message: 'webhook not found' }).kind, 'permanent');
+    assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 41001, message: 'missing token' }).kind, 'permanent');
+    assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 42001, message: 'token expired' }).kind, 'permanent');
     assert.strictEqual(classifyFailure(error('完全未知故障')).kind, 'retryable');
     assert.strictEqual(classifyFailure(Object.assign(new SyntaxError('代码解析失败'), { name: 'SyntaxError' })).kind, 'permanent');
 
