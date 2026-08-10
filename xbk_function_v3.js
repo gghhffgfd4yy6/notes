@@ -575,8 +575,27 @@ const Utils = {
       const idKey = typeof id === 'string' ? id.trim() : String(id)
       const url = this.validUrl(this.safeGet(message, 'url'))
       // 兼容历史 App 生成的匿名 id：让它与旧缓存中仍无 id/URL 的同一条消息保持同一身份。
+      // 仅当该 id 确为「本消息自身字段」的历史合成键时才降级为匿名：旧版 App 曾把
+      // anonKey(自身 title/content/…) 写入 id 字段落缓存。真实消息的 id 即便形如
+      // 'anon:abc123'（全十六进制），也与自身内容哈希不同 → 保持 id/url 权威判重，
+      // 不再被误降级而丢失 id/url 判重（v3.247 修复）。
       if (/^anon:[0-9a-f]+$/i.test(idKey) && !url) {
-        return { valid: true, kind: 'anon', key: idKey, idKey: '', url: '', anonKey: idKey }
+        const selfAnon = this.anonKey(
+          this.safeGet(message, 'title'),
+          this.safeGet(message, 'content'),
+          this.safeGet(message, 'posttime'),
+          this.safeGet(message, 'shijianchuo'),
+          this.safeGet(message, 'pic'),
+          this.safeGet(message, 'mall_name'),
+          this.safeGet(message, 'price'),
+          this.safeGet(message, 'brand'),
+          this.safeGet(message, 'catename'),
+          this.safeGet(message, 'louzhu')
+        )
+        // 自内容哈希须与 id 一致，且非「全空字段退化键」(anon:1505) 才视为历史匿名合成键
+        if (selfAnon !== this.anonKey() && selfAnon === idKey) {
+          return { valid: true, kind: 'anon', key: idKey, idKey: '', url: '', anonKey: idKey }
+        }
       }
       return { valid: true, kind: 'id', key: `id:${idKey}`, idKey, url }
     }
@@ -631,7 +650,11 @@ const Utils = {
     return false // 布尔/对象/数组/Symbol 等脏数据 id 一律无效
   },
 
-  /** 无 id 无 url 数据的稳定合成 id：基于 title+content 哈希，跨运行可去重 */
+  /** 无 id 无 url 数据的稳定合成 id：基于 title+content 哈希，跨运行可去重。
+      v3.247 设计取舍：32 位 djb2 存在理论碰撞，可能让两条不同内容的消息判为同一身份而互相吞掉
+      （P3）。但单缓存文件内匿名条数通常为数百，碰撞概率 ≈ N²/2^33，实际极小；且格式被测试锁定为
+      anon:hex，且判重键由缓存内容重算（非落盘存储），拓宽哈希将改变稳定键 → 与既有缓存及历史
+      anon:hex id 失配，造成一次性重复推送，代价大于碰撞风险本身。故维持 32 位，接受该理论风险。 */
   anonKey (...parts) {
     // 过滤空值：避免全空字段导致不同数据撞同一个 key
     // v3.108 fuzz 发现：String(Symbol()) 抛 TypeError——Symbol 字段视为无效过滤
@@ -1128,13 +1151,23 @@ const RuleEngine = {
     return compiled
   },
 
+  // ReDoS 纵深防御：matchesCompiled 正则在热路径对输入长度设上限。配置侧 hasNestedQuantifier
+  // 已在编译期拦截「嵌套无限量词」这一主要灾难性回溯来源，但仍有其他慢回溯形态（交替/前视/
+  // 超大字符类 × 超长输入）可能卡住主线程。对超长输入先截断再 .test()，限界单次匹配最坏耗时。
+  // 取舍：超过 _RE_INPUT_MAX 的长文本只在前缀段参与过滤（罕见且可控），换取匹配复杂度有界。
+  _RE_INPUT_MAX: 4096,
+  /** 截断超长输入到 _RE_INPUT_MAX（避免 .test() 对超长串灾难性回溯） */
+  _capReInput (s) {
+    return s.length > this._RE_INPUT_MAX ? s.slice(0, this._RE_INPUT_MAX) : s
+  },
+
   /** 多行规则分类匹配：无 cat 限制(匹配所有)或有 cat 且 catename 匹配 */
   _catMatches (rule, catename) {
     if (!rule.cat) return true
     if (!catename) return false
     try {
       const value = typeof catename === 'string' ? catename : String(catename)
-      return rule.cat.test(value)
+      return rule.cat.test(this._capReInput(value))
     } catch (e) {
       return false
     }
@@ -1158,13 +1191,13 @@ const RuleEngine = {
     if (compiled._type === 're') {
       // 简单正则
       if (!compiled.re || typeof compiled.re.test !== 'function') return false
-      return compiled.re.test(value)
+      return compiled.re.test(this._capReInput(value))
     }
 
     if (compiled._type === 'multi') {
       // 多行多分类：任意一行匹配即匹配
       if (!Array.isArray(compiled.rules) || compiled.rules.length === 0) return false
-      return this._anyRule(compiled.rules, catename, r => r.val.test(value))
+      return this._anyRule(compiled.rules, catename, r => r.val.test(this._capReInput(value)))
     }
 
     return false
@@ -1550,13 +1583,21 @@ const MessageStore = {
   _upsert (messages, message, filename) {
     // v3.245 P1：非数组 messages 直接返回 false（不推送）——此前 messages.push 抛 TypeError 崩溃。
     if (!Array.isArray(messages)) return false
+    // 脏 message（非有效数据对象）不写入：避免 `{ ...safeObjectCopy(message), timestamp }` 把无效/未规范化
+    // 条目带 timestamp 塞进缓存（与 save 入口的 isValidItem 口径一致；此前 _upsert 仅判数组、不判消息）。
+    if (!Utils.isValidItem(message)) return false
     const idx = this._findDedupIndex(messages, message)
-    // 序列化比较（循环引用等失败时按"已更新"处理，不崩溃）
-    // v3.156：排除 timestamp（同 saveBatch 主路径口径）
-    const stripTs = (o) => { if (!o || typeof o !== 'object') return o; const c = { ...o }; delete c.timestamp; return c }
     if (idx >= 0) {
-      let changed = false
-      try { changed = JSON.stringify(normalize(stripTs(messages[idx]))) !== JSON.stringify(normalize(stripTs(message))) } catch (e) { changed = true }
+      // v3.156：比较排除 timestamp（同 saveBatch 主路径口径）——否则 oldM 带 timestamp、
+      // message 无 timestamp 而内容相同也必报"更新缓存记录"并刷新 timestamp。
+      // 优化：键序无关归一化仅在命中更新路径执行，且每条只归一化一次（此前内联两次
+      // JSON.stringify(normalize(stripTs(...))) 对两侧重复深排；循环引用等失败时按"已更新"处理不崩溃）。
+      const stripTs = (o) => { if (!o || typeof o !== 'object') return o; const c = { ...o }; delete c.timestamp; return c }
+      const canon = (o) => { try { return JSON.stringify(normalize(stripTs(o))) } catch (e) { return null } }
+      const a = canon(messages[idx])
+      const b = canon(message)
+      let changed = true
+      if (a !== null && b !== null) changed = a !== b
       if (!changed) return false // 内容完全一致：不更新、不刷新 timestamp、不触发落盘
       console.log(`更新缓存记录: ${filename}`)
       messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: new Date().toISOString() }
@@ -1582,8 +1623,11 @@ const MessageStore = {
 
   init () {
     try {
-      if (!fs.existsSync(this.cacheDir)) {
-        fs.mkdirSync(this.cacheDir, { recursive: true })
+      // 昂贵的 cacheDir getter（含 realpath 校验）只求值一次；existsSync 守卫保留，
+      // 避免目录已存在时调用 mkdirSync（故障注入测试依赖该守卫）。
+      const dir = this.cacheDir
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true })
       }
     } catch (e) {
       // v3.245 P1：目录创建失败必须暴露——此前只 console.error 吞错，后续所有缓存写
@@ -1661,7 +1705,12 @@ const MessageStore = {
     // 空路径早退：writeAtomic 对空路径会留下无法重命名的残留 .tmp。
     if (!filePath) return false
     const saved = writeAtomic(filePath, '[]', '缓存重置')
-    if (saved) this._memoSet(filePath, [])
+    // 只清理本文件自己的内存快照，不再走 _memoSet：重置一个文件不应触发 _memoSet 的容量淘汰，
+    // 以免把其他仍在使用的文件快照（_memoSet 满时删最旧键）当作“最旧键”误删。本文件磁盘已置
+    // 为 []（writeAtomic 成功），下次 readMessages 会从磁盘重建空快照，正确性与语义均不受影响。
+    if (saved) {
+      try { delete this._memoryCache[filePath] } catch (e) { /* 忽略 */ }
+    }
     return saved
   },
 

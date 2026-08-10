@@ -3443,6 +3443,33 @@ console.log('========================================\n');
     assertEqual(hasValidId({ id: 'anon:abc' }), true)
   })
 
+  await test('真实 anon:... 前缀 id 保持 id 权威，跨 url 判重（v3.247 修复）', async () => {
+    // 曾：无 url 的 id='anon:abc1' 被 /^anon:[0-9a-f]+$/i 误降级为匿名身份，与同 id 带 url 的
+    // 记录（kind 'id'）判重路径分裂 → 同一条消息被重复推送。修复后保持 id 权威，按 idKey 合并。
+    const fs = require('fs')
+    const name = 'test_identity_real_anon_id.json'
+    const p = getFilePath(name)
+    try { fs.unlinkSync(p) } catch (e) {}
+    saveBatch([{ id: 'anon:abc1', title: '真实A', url: '/u/x.html' }], name)
+    saveBatch([{ id: 'anon:abc1', title: '真实A' }], name) // 同 id 无 url → 不应降级
+    assertEqual(readMessages(p).length, 1, `真实 anon:... id 应保持 id 权威跨 url 合并，实际${readMessages(p).length}`)
+    try { fs.unlinkSync(p) } catch (e) {}
+  })
+
+  await test('历史 anon:hash 自身内容键仍降级匿名并跨运行去重（兼容保留）', async () => {
+    // 旧版 App 曾把 anonKey(自身字段) 写入 id 字段落缓存；该 id 与自身内容哈希一致 → 仍降级
+    // 为匿名，与同内容的无 id 消息判同一身份（兼容路径不受影响）。
+    const fs = require('fs')
+    const name = 'test_identity_legacy_anon_id.json'
+    const p = getFilePath(name)
+    try { fs.unlinkSync(p) } catch (e) {}
+    const legacyId = anonKey('历史标题', '历史内容')
+    saveBatch([{ id: legacyId, title: '历史标题', content: '历史内容' }], name)
+    saveBatch([{ title: '历史标题', content: '历史内容' }], name) // 无 id → anonKey 相同
+    assertEqual(readMessages(p).length, 1, `历史 anon:hash id 应降级匿名并与同内容无 id 消息去重，实际${readMessages(p).length}`)
+    try { fs.unlinkSync(p) } catch (e) {}
+  })
+
   await test('id为null的记录不与正常记录误合并（v3.20审查2）', () => {
     // null id 不参与 id 判重 → url 兜底
     saveBatch([{ id: null, url: '/a.html', title: 'A' }], 'test_nullid.json')
