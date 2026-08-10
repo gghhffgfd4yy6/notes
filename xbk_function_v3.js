@@ -230,6 +230,17 @@ const ENTITY_RE = new RegExp('&(?:' + Object.keys(ENTITY_MAP).map(k => escapeRe(
 const DEC_RE = /&#(\d+);/g
 const HEX_RE = /&#[xX]([0-9a-fA-F]+);/g
 
+// 键序无关规范化：递归排序对象键，避免 JSON.stringify 比较对键顺序敏感（数组顺序保留）
+function normalize (o) {
+  if (Array.isArray(o)) return o.map(normalize)
+  if (o && typeof o === 'object') {
+    const out = {}
+    for (const k of Object.keys(o).sort()) out[k] = normalize(o[k])
+    return out
+  }
+  return o
+}
+
 const Utils = {
   // ==================== 时间工具 ====================
   /**
@@ -552,7 +563,7 @@ const Utils = {
     if (!this.isValidItem(message)) return { valid: false, kind: 'invalid', key: '', idKey: '', url: '' }
     if (this.hasValidId(message)) {
       const id = this.safeGet(message, 'id')
-      const idKey = String(id)
+      const idKey = typeof id === 'string' ? id.trim() : String(id)
       const url = this.validUrl(this.safeGet(message, 'url'))
       // 兼容历史 App 生成的匿名 id：让它与旧缓存中仍无 id/URL 的同一条消息保持同一身份。
       if (/^anon:[0-9a-f]+$/i.test(idKey) && !url) {
@@ -579,10 +590,11 @@ const Utils = {
 
   /**
      * 统一判重关系：保留 id 权威 + 有效 URL 双向 fallback，同时支持匿名合成键。
+     * 支持预计算身份传入（a=left 身份, b=right 身份）：循环判重时避免对同一消息重复计算。
      */
-  sameMessageIdentity (left, right) {
-    const a = this.getMessageIdentity(left)
-    const b = this.getMessageIdentity(right)
+  sameMessageIdentity (left, right, a, b) {
+    if (!a) a = this.getMessageIdentity(left)
+    if (!b) b = this.getMessageIdentity(right)
     if (!a.valid || !b.valid) return false
     if (a.kind === 'id') {
       return a.idKey === b.idKey || (b.kind !== 'id' && !!a.url && !!b.url && a.url === b.url)
@@ -613,7 +625,7 @@ const Utils = {
     // v3.108 fuzz 发现：String(Symbol()) 抛 TypeError——Symbol 字段视为无效过滤
     const str = (p) => {
       if (typeof p === 'symbol') return ''
-      try { return String(p) } catch (e) { return '' }
+      try { return String(p).replace(/\\/g, '%5C').replace(/\|/g, '%7C') } catch (e) { return '' }
     }
     const s = parts.filter(p => p !== undefined && p !== null && str(p).trim() !== '').map(str).join('|')
     let h = 5381
@@ -722,7 +734,7 @@ const Utils = {
     if (!str) return str
     // 递归解码（v3.105）：真实接口存在双重转义（&amp;amp; → &amp; → &，真机验证发现 2/20 条），
     // 单轮解码会残留 &amp; 破坏 URL 参数（链接 key 参数错乱）；最多 3 轮防死循环，收敛即停
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 8; i++) {
       const next = str
         .replace(ENTITY_RE, m => ENTITY_MAP[m] || m)
         .replace(DEC_RE, (_, code) => this._decodeNumeric(Number(code), `&#${code};`))
@@ -1440,12 +1452,18 @@ const MessageStore = {
   // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
   _MEMO_MAX: 100,
 
-  /** 带上限的内存缓存写入：超限时整体重置（磁盘不受影响），防理论无限增长 */
+  /** 带上限的内存缓存写入：超限时淘汰最旧键（磁盘不受影响），防理论无限增长；返回是否写入成功 */
   _memoSet (filePath, val) {
     // R5-2：hasOwnProperty 判断（__proto__ 等原型键不会被 in 误判/直写污染对象原型）
-    if (!Object.prototype.hasOwnProperty.call(this._memoryCache, filePath) && Object.keys(this._memoryCache).length >= this._MEMO_MAX) {
-      this._memoryCache = {}
-      console.warn(`内存缓存达到上限(${this._MEMO_MAX})，已重置（磁盘缓存不受影响）`)
+    if (!Object.prototype.hasOwnProperty.call(this._memoryCache, filePath)) {
+      const keys = Object.keys(this._memoryCache)
+      if (keys.length >= this._MEMO_MAX) {
+        // 超限时淘汰最旧键：普通字符串键按插入顺序，keys[0] 即最早写入的键；无需整体重置
+        if (keys.length === 0) return false // 上限非正且缓存为空时无可淘汰，拒绝写入
+        const oldest = keys[0]
+        try { delete this._memoryCache[oldest] } catch (e) { /* 忽略 */ }
+        console.warn(`内存缓存达到上限(${this._MEMO_MAX})，已淘汰最旧键: ${oldest}（磁盘缓存不受影响）`)
+      }
     }
     // 原型键（__proto__/constructor/prototype）用 defineProperty 写入，避免 `obj['__proto__']=val` 修改对象原型
     if (filePath === '__proto__' || filePath === 'constructor' || filePath === 'prototype') {
@@ -1453,6 +1471,7 @@ const MessageStore = {
     } else {
       this._memoryCache[filePath] = val
     }
+    return true
   },
 
   /** 统一更新/追加：命中则更新(含覆盖提示)，未命中追加 */
@@ -1463,7 +1482,7 @@ const MessageStore = {
       // v3.156：排除 timestamp（同 saveBatch 主路径口径）
       const stripTs = (o) => { if (!o || typeof o !== 'object') return o; const c = { ...o }; delete c.timestamp; return c }
       let changed = false
-      try { changed = JSON.stringify(stripTs(messages[idx])) !== JSON.stringify(stripTs(message)) } catch (e) { changed = true }
+      try { changed = JSON.stringify(normalize(stripTs(messages[idx]))) !== JSON.stringify(normalize(stripTs(message))) } catch (e) { changed = true }
       if (changed) {
         console.log(`更新缓存记录: ${filename}`)
       }
@@ -1476,7 +1495,9 @@ const MessageStore = {
   /** 统一判重：所有入口复用 Utils.sameMessageIdentity，避免单条/批内/缓存逻辑分裂 */
   _findDedupIndex (messages, message) {
     if (!Array.isArray(messages)) return -1
-    return messages.findIndex(m => Utils.sameMessageIdentity(m, message))
+    // 新消息身份只计算一次（findIndex 逐条比对不再重复计算；m 侧身份仍需逐条求值）
+    const b = Utils.getMessageIdentity(message)
+    return messages.findIndex(m => Utils.sameMessageIdentity(m, message, undefined, b))
   },
 
   init () {
@@ -1498,10 +1519,21 @@ const MessageStore = {
     // v3.176：非信息文件名（对象/布尔 String 化产物）回退 default.json——与 getFileName 口径一致
     // （曾产生 xianbaoku_cache/[object Object] 垃圾文件：test_filter 参数颠倒 + 此处无防御）
     if (!safe || safe === '.' || safe === '..' || safe === '[object Object]' || safe === 'undefined' || safe === 'null' || safe === 'true' || safe === 'false') safe = 'default.json'
-    // 文件名超长截断（避免 >255 字节落盘失败）
+    // 文件名超长截断：按 UTF-8 字节数二分截断（多字节字符不能按字符索引截断），保证总字节 <= 200
     if (Buffer.byteLength(safe, 'utf8') > 200) {
-      const ext = safe.includes('.') ? safe.slice(safe.lastIndexOf('.')) : ''
-      safe = safe.slice(0, Math.max(1, 200 - Buffer.byteLength(ext))) + ext
+      const dot = safe.lastIndexOf('.')
+      let ext = dot > 0 ? safe.slice(dot) : ''
+      let maxBase = 200 - Buffer.byteLength(ext, 'utf8')
+      if (maxBase < 1) { ext = ''; maxBase = 200 } // 扩展名本身超长：放弃保留扩展名
+      const maxChars = ext ? dot : safe.length
+      let lo = 0
+      let hi = maxChars
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1
+        if (Buffer.byteLength(safe.slice(0, mid), 'utf8') <= maxBase) lo = mid
+        else hi = mid - 1
+      }
+      safe = safe.slice(0, Math.max(1, lo)) + ext
     }
     return path.join(this.cacheDir, safe)
   },
@@ -1704,7 +1736,7 @@ const MessageStore = {
         // v3.156：比较排除 timestamp——曾因 oldM 有 timestamp、message 无而内容相同也必报"更新缓存记录"
         const stripTs = (o) => { if (!o || typeof o !== 'object') return o; const c = { ...o }; delete c.timestamp; return c }
         let changed = false
-        try { changed = JSON.stringify(stripTs(oldM)) !== JSON.stringify(stripTs(message)) } catch (e) { changed = true }
+        try { changed = JSON.stringify(normalize(stripTs(oldM))) !== JSON.stringify(normalize(stripTs(message))) } catch (e) { changed = true }
         if (changed) console.log(`更新缓存记录: ${filename}`)
         messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: NOW() }
         addIdentityIndexes(messages[idx], idx)
@@ -1737,6 +1769,7 @@ const MessageStore = {
     let name = parts[parts.length - 1].split(/[?#]/)[0] // 去掉查询参数与 hash
     if (!name || /^\.+$/.test(name)) name = 'default' // 空/纯点串兜底，避免 '..' → '...json'
     name = name.replace(/[\\/:*"<>|]/g, '_') // 清洗文件系统保留字符
+    name = name.replace(/[\u0000-\u001f]/g, '') // 过滤控制字符
     if (!name.endsWith('.json')) name += '.json'
     return name
   }
@@ -1884,6 +1917,12 @@ const App = {
 
   // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
   _writeState (filePath, state) {
+    // v3.179：类型守卫——state 为 undefined/null/非对象时 JSON.stringify 会静默产出
+    // "null"/undefined 文本或抛错，明确告警并拒绝写入，避免状态文件被污染
+    if (state === undefined || state === null || typeof state !== 'object') {
+      console.warn(`_writeState: state 必须是非空对象, 实际为 ${state === null ? 'null' : typeof state}, 拒绝写入 ${filePath}`)
+      return false
+    }
     let text
     try { text = JSON.stringify(state) } catch (e) {
       console.error(`状态序列化失败 ${filePath}:`, e.message)
