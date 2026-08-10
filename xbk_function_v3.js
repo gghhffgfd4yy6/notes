@@ -29,6 +29,18 @@ function profile3Require (name, loader) {
 // ============================================================
 // 📦 外部依赖
 // ============================================================
+const fs = profile3Require('fs', () => require('fs'))
+const { fetchJson } = profile3Require('xbk_http', () => require('./xbk_http'))
+const { prewarmDns, prewarmTls } = profile3Require('xbk_agents', () => require('./xbk_agents'))
+const { isRegularOrMissing, readSafeText, readSafeTextResult, writeAtomic } = profile3Require('xbk_storage', () => require('./xbk_storage'))
+const { summarizeError } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'))
+const path = profile3Require('path', () => require('path'))
+// 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
+// 缺 package.json 时回退 '3.x'（移植性防御）
+let PKG_VERSION = '3.x'
+try { PKG_VERSION = profile3Require('package.json', () => require('./package.json')).version } catch (e) { /* package.json 缺失时用默认 */ }
+profile3BootMark('module-load-complete')
+
 // 推送模块（xbk_sendNotify_slim → got）是启动最重的依赖（约 300ms）。
 // 主流程只在真正推送前才用到它——延迟到接口返回后再加载（首推前），
 // 与接口拉取并行进行，减少冷启动路径上的串行等待。
@@ -66,17 +78,6 @@ function getNotify () {
   }
   return notifyLoading
 }
-const fs = profile3Require('fs', () => require('fs'))
-const { fetchJson } = profile3Require('xbk_http', () => require('./xbk_http'))
-const { prewarmDns, prewarmTls } = profile3Require('xbk_agents', () => require('./xbk_agents'))
-const { isRegularOrMissing, readSafeText, readSafeTextResult, writeAtomic } = profile3Require('xbk_storage', () => require('./xbk_storage'))
-const { summarizeError } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'))
-const path = profile3Require('path', () => require('path'))
-// 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
-// 缺 package.json 时回退 '3.x'（移植性防御）
-let PKG_VERSION = '3.x'
-try { PKG_VERSION = profile3Require('package.json', () => require('./package.json')).version } catch (e) { /* package.json 缺失时用默认 */ }
-profile3BootMark('module-load-complete')
 
 // ============================================================
 // ⚙️ Config — 配置层
@@ -165,7 +166,8 @@ const Config = {
 // ============================================================
 // 🔧 Utils — 工具层
 // ============================================================
-// ============ 过滤正则字段(compileRules/validateConfig 共用，加字段改一处) ============
+
+// ---------- 过滤正则字段（compileRules/validateConfig 共用，加字段改一处） ----------
 const FILTER_FIELDS = [
   'pingbifenlei', 'pingbibiaoti', 'zhanxianbiaoti',
   'pingbibiaotiplus', 'pingbineirong', 'zhanxianneirong',
@@ -173,7 +175,7 @@ const FILTER_FIELDS = [
   'pingbilouzhuplus'
 ]
 
-// ============ 魔法数字常量 ============
+// ---------- 魔法数字常量 ----------
 const DAY_MS = 24 * 60 * 60 * 1000 // 一天的毫秒数
 const TS_BOUND = 1e11 // 秒/毫秒时间戳分界（10位秒 / 12+位毫秒）
 const MAX_CODE_POINT = 0x10FFFF // Unicode 最大码点
@@ -181,7 +183,7 @@ const SURROGATE_LO = 0xD800 // 代理区起点
 const SURROGATE_HI = 0xDFFF // 代理区终点
 const DEFAULT_MAX_SIZE = 10000 // 缓存默认上限（v3.120：100 → 10000）
 
-// 实体映射与正则提升为模块级常量（避免每次调用重建）
+// ---------- HTML 实体映射（避免每次调用重建） ----------
 const ENTITY_MAP = {
   '&amp;': '&',
   '&lt;': '<',
@@ -227,6 +229,7 @@ const DEC_RE = /&#(\d+);/g
 const HEX_RE = /&#[xX]([0-9a-fA-F]+);/g
 
 const Utils = {
+  // ==================== 时间工具 ====================
   /**
      * 统一时间解析：返回毫秒时间戳，无效返回 null。
      * v3.62 统一 daysComputed/tuisong_replace 两份重复逻辑（REVIEW_ROUND10 #26），
@@ -334,6 +337,7 @@ const Utils = {
     return dNow > dMs ? Math.floor((dNow - dMs) / DAY_MS) : 0
   },
 
+  // ==================== URL 工具 ====================
   /** 归一化 URL 用于判重：trim + 去尾部斜杠（/foo 与 foo、foo/ 视为同一资源） */
   normUrl (u) {
     // 归一化用于判重：trim + 去首尾斜杠 + 主机名小写（/foo、foo、foo/、A.com/a vs a.com/a 视为同一资源）
@@ -385,6 +389,72 @@ const Utils = {
     return normalized || ''
   },
 
+  /** 判断 URL 是否为危险协议（先解码实体，兼容 javascript&#58; 等编码绕过） */
+  isDangerousUrl (url) {
+    if (url === undefined || url === null) return false
+    let s
+    try { s = String(url) } catch (e) { return false }
+    // 去除 ASCII 控制空白，防止 `java\nscript:`/`java\tscript:` 等内部空白绕过协议检查
+    s = this.decodeHtmlEntities(s).replace(/[\u0000-\u0020]+/g, '').toLowerCase()
+    return /^(javascript|vbscript|data):/.test(s)
+  },
+
+  /** 清洗 HTML href/src 中的危险协议，保留标签和普通文本 */
+  sanitizeHtmlUrls (html) {
+    if (html === undefined || html === null) return ''
+    try { html = String(html) } catch (e) { return '' }
+    const cleanAttr = (name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`
+    html = html.replace(/\b(href|src)\s*=\s*(["'])([\s\S]*?)\2/gi, (_, name, quote, value) => cleanAttr(name, quote, value))
+    return html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
+  },
+
+  /** 实体解码后再次清理主动 HTML/事件属性，防止 &lt;script&gt; 重新形成可执行标签 */
+  sanitizeDecodedHtml (html) {
+    if (html === undefined || html === null) return ''
+    try { html = String(html) } catch (e) { return '' }
+    // HTML tokenizer 将 NUL 替换为 U+FFFD；先移除可被用来拆散属性名的 NUL，
+    // 让 `on\u0000error` 收敛为 `onerror` 后进入统一事件属性清理。
+    html = html.replace(/\u0000/g, '')
+    html = this.sanitizeHtmlUrls(html)
+    // 成对和未闭合的主动标签都处理：不依赖恶意输入自觉补齐闭合标签。
+      .replace(/<(?:script|style|iframe|object|svg|math)\b[\s\S]*?<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
+      .replace(/<(?:script|style|iframe|object|embed|svg|math)\b[^>]*>/gi, '')
+      .replace(/<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
+    // 基础/外链/刷新标签可改变文档导航或加载外部资源，HTML 推送不需要它们。
+      .replace(/<(?:base|link|meta)\b[^>]*>/gi, '')
+      .replace(/(?:\s|\/)on[a-z][a-z0-9_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    html = html
+    // 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）。
+      .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2/gi,
+        (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
+      .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*([^\s"'<>`]+)/gi,
+        (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
+    // srcset 可在候选项中藏危险协议；检测到任意危险候选即清空整个属性。
+      .replace(/\bsrcset\s*=\s*(["'])([\s\S]*?)\1/gi, (_, quote, value) => {
+        const v = this.decodeHtmlEntities(value).replace(/[\u0000-\u0020]+/g, '').toLowerCase()
+        return /(?:^|[,])(?:javascript|vbscript|data):/.test(v) ? `srcset=${quote}${quote}` : `srcset=${quote}${value}${quote}`
+      })
+      .replace(/\bsrcset\s*=\s*([^\s"'<>`]+)/gi, (_, value) => {
+        const v = this.decodeHtmlEntities(value).replace(/[\u0000-\u0020]+/g, '').toLowerCase()
+        return /^(?:javascript|vbscript|data):/.test(v) ? 'srcset=""' : `srcset=${value}`
+      })
+    // CSS url()/expression()/behavior 可形成主动加载或脚本执行路径；不需要保留这类 style。
+      .replace(/\bstyle\s*=\s*(["'])([\s\S]*?)\1/gi, (_, quote, value) => {
+        const v = this.decodeHtmlEntities(value).toLowerCase()
+        return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
+          ? `style=${quote}${quote}`
+          : `style=${quote}${value}${quote}`
+      })
+      .replace(/\bstyle\s*=\s*([^\s"'<>`]+)/gi, (_, value) => {
+        const v = this.decodeHtmlEntities(value).toLowerCase()
+        return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
+          ? 'style=""'
+          : `style=${value}`
+      })
+    return html
+  },
+
+  // ==================== 安全访问/文本 ====================
   /**
      * 安全读取用户/接口对象字段：代理 getter 或异常 getter 不能中断主流程。
      */
@@ -427,6 +497,51 @@ const Utils = {
     return out
   },
 
+  /**
+     * 用户字段安全文本化：模板/日志路径不能把 Symbol、异常 toString、循环对象带入主流程。
+     * 字符串/数字/布尔/BigInt 保持可读；Symbol、函数和不可序列化对象保守置空。
+     */
+  safeText (value, fallback = '') {
+    if (value === undefined || value === null) return fallback
+    if (typeof value === 'symbol' || typeof value === 'function') return fallback
+    let text
+    try {
+      if (typeof value === 'object') {
+        text = JSON.stringify(value)
+        if (text === undefined) return fallback
+      } else {
+        text = String(value)
+      }
+    } catch (e) {
+      return fallback
+    }
+    try { return this.sanitizeSurrogates(text) } catch (e) { return fallback }
+  },
+
+  safeErrorText (error, fallback = '') {
+    const message = this.safeGet(error, 'message')
+    if (message !== undefined && message !== null && message !== '') return this.safeText(message, fallback)
+    const code = this.safeGet(error, 'code')
+    if (code !== undefined && code !== null && code !== '') return this.safeText(code, fallback)
+    return fallback
+  },
+
+  // 清洗孤立代理（v3.110 fuzz 发现）：encodeURIComponent 对孤立代理抛 URIError → 推送失败。
+  // 孤立高/低代理替换为 U+FFFD（完整代理对保留）；脏数据/截断 emoji 的真实防御
+  sanitizeSurrogates (s) {
+    try { s = String(s === undefined || s === null ? '' : s) } catch (e) { return '' }
+    return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD')
+  },
+
+  /** 数字实体解码统一：NUL 过滤 / 代理区与超范围保留原文 */
+  _decodeNumeric (n, original) {
+    if (n === 0) return ''
+    return (n > 0 && n <= MAX_CODE_POINT && !(n >= SURROGATE_LO && n <= SURROGATE_HI))
+      ? String.fromCodePoint(n)
+      : original
+  },
+
+  // ==================== 身份/去重 ====================
   /**
      * 生成统一消息身份：id 优先，随后是有效 URL，最后是稳定匿名合成键。
      * 所有判重、缓存、截断和成功状态路径必须复用该函数，避免各入口各自拼 key。
@@ -526,12 +641,38 @@ const Utils = {
     return String(h)
   },
 
-  /** 数字实体解码统一：NUL 过滤 / 代理区与超范围保留原文 */
-  _decodeNumeric (n, original) {
-    if (n === 0) return ''
-    return (n > 0 && n <= MAX_CODE_POINT && !(n >= SURROGATE_LO && n <= SURROGATE_HI))
-      ? String.fromCodePoint(n)
-      : original
+  // ==================== 转换/系统 ====================
+  /**
+     * 数值配置统一转换（v3.158）：环境变量/配置文件传入的数字都是字符串——Number.isFinite('5')=false
+     * 曾全部回退默认(api.retry/parallelLimit/titleMax 等 7 处失效)；'5'→5，'abc'/undefined→默认
+     */
+  num (v, def) {
+    // 空值/空白/布尔值不是有效数值配置：避免 alert.intervalMs='' 被 Number('') 转成 0，
+    // 从而意外关闭限频；显式字符串 '0' 仍保留 0 的特殊语义。
+    if (v === undefined || v === null || typeof v === 'boolean') return def
+    if (typeof v === 'string' && v.trim() === '') return def
+    let n
+    try { n = Number(v) } catch (e) { return def } // Symbol / valueOf 抛错等脏配置回退默认，不中断主流程
+    return Number.isFinite(n) ? n : def
+  },
+
+  /** 返回路径所在文件系统的容量信息；平台/Node 不支持时返回 null，不影响主流程。 */
+  diskSpace (targetPath) {
+    const statfs = fs.statfsSync
+    if (typeof statfs !== 'function') return null
+    try {
+      const st = statfs(targetPath)
+      const bsize = Number(st.bsize || st.frsize || 0)
+      const bavail = Number(st.bavail)
+      const blocks = Number(st.blocks)
+      if (!Number.isFinite(bsize) || bsize <= 0 || !Number.isFinite(bavail) || bavail < 0) return null
+      return {
+        freeBytes: bsize * bavail,
+        totalBytes: Number.isFinite(blocks) && blocks >= 0 ? bsize * blocks : null
+      }
+    } catch (e) {
+      return null
+    }
   },
 
   /**
@@ -570,140 +711,6 @@ const Utils = {
       break
     }
     return cut
-  },
-
-  // 清洗孤立代理（v3.110 fuzz 发现）：encodeURIComponent 对孤立代理抛 URIError → 推送失败。
-  // 孤立高/低代理替换为 U+FFFD（完整代理对保留）；脏数据/截断 emoji 的真实防御
-  sanitizeSurrogates (s) {
-    try { s = String(s === undefined || s === null ? '' : s) } catch (e) { return '' }
-    return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD')
-  },
-
-  /**
-     * 用户字段安全文本化：模板/日志路径不能把 Symbol、异常 toString、循环对象带入主流程。
-     * 字符串/数字/布尔/BigInt 保持可读；Symbol、函数和不可序列化对象保守置空。
-     */
-  safeText (value, fallback = '') {
-    if (value === undefined || value === null) return fallback
-    if (typeof value === 'symbol' || typeof value === 'function') return fallback
-    let text
-    try {
-      if (typeof value === 'object') {
-        text = JSON.stringify(value)
-        if (text === undefined) return fallback
-      } else {
-        text = String(value)
-      }
-    } catch (e) {
-      return fallback
-    }
-    try { return this.sanitizeSurrogates(text) } catch (e) { return fallback }
-  },
-
-  safeErrorText (error, fallback = '') {
-    const message = this.safeGet(error, 'message')
-    if (message !== undefined && message !== null && message !== '') return this.safeText(message, fallback)
-    const code = this.safeGet(error, 'code')
-    if (code !== undefined && code !== null && code !== '') return this.safeText(code, fallback)
-    return fallback
-  },
-
-  /**
-     * 数值配置统一转换（v3.158）：环境变量/配置文件传入的数字都是字符串——Number.isFinite('5')=false
-     * 曾全部回退默认(api.retry/parallelLimit/titleMax 等 7 处失效)；'5'→5，'abc'/undefined→默认
-     */
-  num (v, def) {
-    // 空值/空白/布尔值不是有效数值配置：避免 alert.intervalMs='' 被 Number('') 转成 0，
-    // 从而意外关闭限频；显式字符串 '0' 仍保留 0 的特殊语义。
-    if (v === undefined || v === null || typeof v === 'boolean') return def
-    if (typeof v === 'string' && v.trim() === '') return def
-    let n
-    try { n = Number(v) } catch (e) { return def } // Symbol / valueOf 抛错等脏配置回退默认，不中断主流程
-    return Number.isFinite(n) ? n : def
-  },
-
-  /** 返回路径所在文件系统的容量信息；平台/Node 不支持时返回 null，不影响主流程。 */
-  diskSpace (targetPath) {
-    const statfs = fs.statfsSync
-    if (typeof statfs !== 'function') return null
-    try {
-      const st = statfs(targetPath)
-      const bsize = Number(st.bsize || st.frsize || 0)
-      const bavail = Number(st.bavail)
-      const blocks = Number(st.blocks)
-      if (!Number.isFinite(bsize) || bsize <= 0 || !Number.isFinite(bavail) || bavail < 0) return null
-      return {
-        freeBytes: bsize * bavail,
-        totalBytes: Number.isFinite(blocks) && blocks >= 0 ? bsize * blocks : null
-      }
-    } catch (e) {
-      return null
-    }
-  },
-
-  /** 判断 URL 是否为危险协议（先解码实体，兼容 javascript&#58; 等编码绕过） */
-  isDangerousUrl (url) {
-    if (url === undefined || url === null) return false
-    let s
-    try { s = String(url) } catch (e) { return false }
-    // 去除 ASCII 控制空白，防止 `java\nscript:`/`java\tscript:` 等内部空白绕过协议检查
-    s = this.decodeHtmlEntities(s).replace(/[\u0000-\u0020]+/g, '').toLowerCase()
-    return /^(javascript|vbscript|data):/.test(s)
-  },
-
-  /** 清洗 HTML href/src 中的危险协议，保留标签和普通文本 */
-  sanitizeHtmlUrls (html) {
-    if (html === undefined || html === null) return ''
-    try { html = String(html) } catch (e) { return '' }
-    const cleanAttr = (name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`
-    html = html.replace(/\b(href|src)\s*=\s*(["'])([\s\S]*?)\2/gi, (_, name, quote, value) => cleanAttr(name, quote, value))
-    return html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
-  },
-
-  /** 实体解码后再次清理主动 HTML/事件属性，防止 &lt;script&gt; 重新形成可执行标签 */
-  sanitizeDecodedHtml (html) {
-    if (html === undefined || html === null) return ''
-    try { html = String(html) } catch (e) { return '' }
-    // HTML tokenizer 将 NUL 替换为 U+FFFD；先移除可被用来拆散属性名的 NUL，
-    // 让 `on\u0000error` 收敛为 `onerror` 后进入统一事件属性清理。
-    html = html.replace(/\u0000/g, '')
-    html = this.sanitizeHtmlUrls(html)
-    // 成对和未闭合的主动标签都处理：不依赖恶意输入自觉补齐闭合标签。
-      .replace(/<(?:script|style|iframe|object|svg|math)\b[\s\S]*?<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
-      .replace(/<(?:script|style|iframe|object|embed|svg|math)\b[^>]*>/gi, '')
-      .replace(/<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
-    // 基础/外链/刷新标签可改变文档导航或加载外部资源，HTML 推送不需要它们。
-      .replace(/<(?:base|link|meta)\b[^>]*>/gi, '')
-      .replace(/(?:\s|\/)on[a-z][a-z0-9_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    html = html
-    // 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）。
-      .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2/gi,
-        (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
-      .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*([^\s"'<>`]+)/gi,
-        (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
-    // srcset 可在候选项中藏危险协议；检测到任意危险候选即清空整个属性。
-      .replace(/\bsrcset\s*=\s*(["'])([\s\S]*?)\1/gi, (_, quote, value) => {
-        const v = this.decodeHtmlEntities(value).replace(/[\u0000-\u0020]+/g, '').toLowerCase()
-        return /(?:^|[,])(?:javascript|vbscript|data):/.test(v) ? `srcset=${quote}${quote}` : `srcset=${quote}${value}${quote}`
-      })
-      .replace(/\bsrcset\s*=\s*([^\s"'<>`]+)/gi, (_, value) => {
-        const v = this.decodeHtmlEntities(value).replace(/[\u0000-\u0020]+/g, '').toLowerCase()
-        return /^(?:javascript|vbscript|data):/.test(v) ? 'srcset=""' : `srcset=${value}`
-      })
-    // CSS url()/expression()/behavior 可形成主动加载或脚本执行路径；不需要保留这类 style。
-      .replace(/\bstyle\s*=\s*(["'])([\s\S]*?)\1/gi, (_, quote, value) => {
-        const v = this.decodeHtmlEntities(value).toLowerCase()
-        return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
-          ? `style=${quote}${quote}`
-          : `style=${quote}${value}${quote}`
-      })
-      .replace(/\bstyle\s*=\s*([^\s"'<>`]+)/gi, (_, value) => {
-        const v = this.decodeHtmlEntities(value).toLowerCase()
-        return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
-          ? 'style=""'
-          : `style=${value}`
-      })
-    return html
   },
 
   /** 解码常见 HTML 实体 */
