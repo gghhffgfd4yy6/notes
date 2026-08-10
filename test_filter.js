@@ -2207,7 +2207,7 @@ console.log('========================================\n');
   })
 
   // readMessages JSON 损坏
-  await test('readMessages JSON损坏 → 重置并返回空数组', () => {
+  await test('readMessages JSON损坏 → 保留文件并标记读取失败（不重置，防重复入库）', () => {
     const fs = require('fs')
     const p = path.join(CACHE, 'test_corrupt.json')
     fs.writeFileSync(p, '这不是合法JSON{{{', 'utf8')
@@ -2215,8 +2215,13 @@ console.log('========================================\n');
     const msgs = readMessages(p)
     assertEqual(Array.isArray(msgs), true)
     assertEqual(msgs.length, 0)
-    // 文件应被重置为 []
-    assertEqual(fs.readFileSync(p, 'utf8'), '[]')
+    // 文件应被保留（不被重置为 []），避免销毁去重缓存
+    assertEqual(fs.readFileSync(p, 'utf8'), '这不是合法JSON{{{')
+    // save() 应因 _readFailed 拒绝写入，防止同一条消息重复入库
+    assertEqual(appendMessageToFile({ id: 1 }, 'test_corrupt.json'), false)
+    // 恢复合法缓存后重新可读判重
+    fs.writeFileSync(p, JSON.stringify([{ id: 1 }]), 'utf8')
+    assertEqual(isMessageInFile({ id: 1 }, 'test_corrupt.json'), true)
   })
 
   // decodeHtmlEntities 未知实体 fallback
@@ -3555,13 +3560,15 @@ console.log('========================================\n');
     assertEqual(decodeHtmlEntities('&euro;&times;'), '€×')
   })
 
-  await test('readMessages 非数组 JSON → 重置不崩溃（v3.21审查11）', () => {
+  await test('readMessages 非数组 JSON → 保留文件返回[]不崩溃（v3.21审查11）', () => {
     const p = getFilePath('test_notarray.json')
     const fs = require('fs')
     fs.writeFileSync(p, JSON.stringify({ foo: 'bar' }), 'utf8')
     const r = readMessages(p)
     assertEqual(Array.isArray(r), true)
     assertEqual(r.length, 0)
+    // 非数组 JSON 不再被重置，原文件保留（供排查/恢复）
+    assertEqual(fs.readFileSync(p, 'utf8'), JSON.stringify({ foo: 'bar' }))
   })
 
   await test('saveMessages 不原地修改传入数组（v3.21审查13）', () => {
@@ -4646,7 +4653,7 @@ console.log('========================================\n');
   await test('可达性: _splitLines/_parseLine 等内部方法被使用', () => {
     const src = require('fs').readFileSync(path.join(__dirname, '/xbk_function_v3.js'), 'utf8')
     // 内部 helper 都应被调用(出现次数 > 定义处)
-    for (const h of ['_parseLine', '_compileCatRe', '_validateCatRe', '_catMatches', '_anyRule', '_passIfMissing', '_findDedupIndex', '_upsert', '_resetCache', '_finalizeMd', '_decodeNumeric', 'isValidItem', 'daysFrom']) {
+    for (const h of ['_parseLine', '_compileCatRe', '_validateCatRe', '_catMatches', '_anyRule', '_passIfMissing', '_findDedupIndex', '_upsert', '_finalizeMd', '_decodeNumeric', 'isValidItem', 'daysFrom']) {
       const cnt = (src.match(new RegExp(h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length
       assertEqual(cnt >= 2, true, `${h} 应被调用(出现${cnt}次)`)
     }

@@ -32,7 +32,7 @@ function profile3Require (name, loader) {
 const fs = profile3Require('fs', () => require('fs'))
 const { fetchJson } = profile3Require('xbk_http', () => require('./xbk_http'))
 const { prewarmDns, prewarmTls } = profile3Require('xbk_agents', () => require('./xbk_agents'))
-const { isRegularOrMissing, readSafeText, readSafeTextResult, writeAtomic } = profile3Require('xbk_storage', () => require('./xbk_storage'))
+const { isRegularOrMissing, readSafeTextResult, writeAtomic } = profile3Require('xbk_storage', () => require('./xbk_storage'))
 const { summarizeError } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'))
 const path = profile3Require('path', () => require('path'))
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
@@ -182,6 +182,9 @@ const MAX_CODE_POINT = 0x10FFFF // Unicode 最大码点
 const SURROGATE_LO = 0xD800 // 代理区起点
 const SURROGATE_HI = 0xDFFF // 代理区终点
 const DEFAULT_MAX_SIZE = 10000 // 缓存默认上限（v3.120：100 → 10000）
+// 状态/哈希文件体积上限：alert.state/report.state/filter.hash 均为数百字节级小文件，
+// 强制大小上限防止异常膨胀文件被整读入内存（readSafeTextResult 的 maxBytes 兜底）。
+const STATE_TEXT_MAX_BYTES = 64 * 1024
 
 // ---------- HTML 实体映射（避免每次调用重建） ----------
 const ENTITY_MAP = {
@@ -634,6 +637,30 @@ const Utils = {
     return b.kind === 'anon' && a.key === b.key
   },
 
+  /** 零分配浅层相等（忽略顶层 timestamp）：仅比较原始值/相同引用是否一致。
+      任一侧存在对象/数组值时不能据此断定相等，返回 false 交由调用方退回深排——用于去重
+      更新路径的快速短路，避免对内容未变的大消息做两次深度 normalize+JSON.stringify。 */
+  shallowEqualIgnoringTimestamp (a, b) {
+    if (a === b) return true
+    if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false
+    if (Array.isArray(a) !== Array.isArray(b)) return false
+    const keysA = []
+    const keysB = []
+    for (const k of Object.keys(a)) if (k !== 'timestamp') keysA.push(k)
+    for (const k of Object.keys(b)) if (k !== 'timestamp') keysB.push(k)
+    if (keysA.length !== keysB.length) return false
+    for (let i = 0; i < keysA.length; i++) {
+      const k = keysA[i]
+      if (!Object.prototype.hasOwnProperty.call(b, k)) return false
+      const va = a[k]
+      const vb = b[k]
+      // 对象/数组 → 引用不同不代表内容不同，交由慢路径判定
+      if ((typeof va === 'object' && va !== null) || (typeof vb === 'object' && vb !== null)) return false
+      if (va !== vb) return false
+    }
+    return true
+  },
+
   /** 有效数据条目：对象且非数组（排除 null/原始值/嵌套数组） */
   isValidItem (m) {
     return !!(m && typeof m === 'object' && !Array.isArray(m))
@@ -641,7 +668,8 @@ const Utils = {
 
   hasValidId (m) {
     // v3.107 fuzz 发现：m 本身缺失/非对象时 m.id 会抛 TypeError；异常 getter 也按无效 id 处理。
-    if (m === undefined || m === null || typeof m !== 'object') return false
+    // 与 isValidItem 口径一致：排除数组（带自定义 id 属性的数组不视为有效条目）。
+    if (m === undefined || m === null || typeof m !== 'object' || Array.isArray(m)) return false
     const id = this.safeGet(m, 'id')
     if (id === undefined || id === null) return false
     const t = typeof id
@@ -651,39 +679,79 @@ const Utils = {
   },
 
   /** 无 id 无 url 数据的稳定合成 id：基于 title+content 哈希，跨运行可去重。
-      v3.247 设计取舍：32 位 djb2 存在理论碰撞，可能让两条不同内容的消息判为同一身份而互相吞掉
-      （P3）。但单缓存文件内匿名条数通常为数百，碰撞概率 ≈ N²/2^33，实际极小；且格式被测试锁定为
-      anon:hex，且判重键由缓存内容重算（非落盘存储），拓宽哈希将改变稳定键 → 与既有缓存及历史
-      anon:hex id 失配，造成一次性重复推送，代价大于碰撞风险本身。故维持 32 位，接受该理论风险。 */
+      v3.248：由单一 32 位 djb2 升级为两路独立 32 位 djb2 拼接（64 位碰撞空间），降低不同内容
+      消息哈希碰撞被判同一身份而互相吞掉的风险（P3）。仍输出 anon:hex，格式与测试锁定一致；
+      判重键由缓存内容重算，跨运行稳定。 */
   anonKey (...parts) {
     // 过滤空值：避免全空字段导致不同数据撞同一个 key
     // v3.108 fuzz 发现：String(Symbol()) 抛 TypeError——Symbol 字段视为无效过滤
+    // str 只执行一次（原 filter 与 map 各跑一遍、每字段 3 次正则 replace 属轻微浪费，P3）
     const str = (p) => {
       if (typeof p === 'symbol') return ''
       try { return String(p).replace(/%/g, '%25').replace(/\\/g, '%5C').replace(/\|/g, '%7C') } catch (e) { return '' }
     }
-    const s = parts.filter(p => p !== undefined && p !== null && str(p).trim() !== '').map(str).join('|')
-    let h = 5381
-    for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0
-    return 'anon:' + h.toString(16)
+    let s = ''
+    for (const p of parts) {
+      if (p === undefined || p === null) continue
+      const t = str(p)
+      if (t.trim() !== '') s = s === '' ? t : s + '|' + t
+    }
+    let h1 = 5381, h2 = 52711
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i)
+      h1 = ((h1 * 33) ^ c) >>> 0
+      h2 = ((h2 * 31) + c + i) >>> 0
+    }
+    return 'anon:' + h1.toString(16) + h2.toString(16)
   },
 
   /** v3.159：过滤规则稳定哈希（过滤字段固定顺序 + 只看它关键词）——规则变更时用于失效「过滤写入」缓存 */
   filterHash (filterCfg, zktGjc) {
     const parts = []
-    const safeStr = (v) => {
+    const rawStr = (v) => {
       if (v === undefined || v === null || typeof v === 'symbol') return ''
       try { return String(v) } catch (e) { return '' }
+    }
+    // 与 compileRules 归一化口径对齐：字段值先 trim，避免纯空白/格式微调（'abc ' vs 'abc'）误失效「过滤写入」缓存
+    const safeStr = (v) => {
+      if (v === undefined || v === null || typeof v === 'symbol') return ''
+      try { return String(v).trim() } catch (e) { return '' }
     }
     for (const f of FILTER_FIELDS) {
       const v = filterCfg && filterCfg[f]
       parts.push(f + '=' + safeStr(v))
     }
     // v3.161：补 pingbitime——曾漏（FILTER_FIELDS 不含它），改宽 pingbitime 后「过滤写入」缓存不失效，
-    // 被天数过滤的旧条目不重推（#7，与 v3.159 #2 同 class 疏漏）；哈希原始字符串（含多行###形式）
-    const pb = filterCfg && filterCfg.pingbitime
-    parts.push('pingbitime=' + safeStr(pb))
-    parts.push('zkt_gjc=' + safeStr(zktGjc))
+    // 被天数过滤的旧条目不重推（#7，与 v3.159 #2 同 class 疏漏）。
+    // 简单数字形式再按 compileRules 做 Number 归一：'5'/'05'/'5.0'/' 5 ' 同编译为 value 5；
+    // 非法/负数 → ''（compileRules 编译为 null，无时间过滤）；### 多行形式仅整体 trim，保留行内格式。
+    let pb = safeStr(filterCfg && filterCfg.pingbitime)
+    let timeActive = false
+    if (pb) {
+      if (/###/.test(pb)) {
+        timeActive = true // 多行天数规则可能 >0，时间过滤生效
+      } else {
+        const n = Number(pb)
+        if (Number.isFinite(n) && n >= 0) {
+          pb = String(n)
+          timeActive = n > 0 // 0 天永不拦截，无时间依赖
+        } else {
+          pb = ''
+        }
+      }
+    }
+    parts.push('pingbitime=' + pb)
+    // zkt_gjc 保持原样：只看它过滤实际用 new RegExp(kw) 未 trim，空白在语义上有意义；若 trim，
+    // 真实语义变更（如 'abc'→' abc'）不会失效缓存而漏推——故不能按 compileRules 同款 trim（compileRules 不处理 zkt_gjc）。
+    parts.push('zkt_gjc=' + rawStr(zktGjc))
+    // P3：pingbitime 天数过滤结果随注册天数增长（daysFrom 逐日 UTC 日期差）而变化，静态配置哈希不会变——
+    // 已 _f 标记的旧条目因「缓存失效仅由静态哈希触发」而永不重评、长期漏推（老化过阈值后本应补推）。
+    // pingbitime 启用时把当前 UTC 日期折进哈希：跨天即失效 _f 缓存 → 老化过阈值的条目被重新评估/推送；
+    // 未启用则无时间依赖，不折入日期，避免无谓的每日全量重评。
+    if (timeActive) {
+      const d = new Date()
+      parts.push('date=' + d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0'))
+    }
     const s = parts.join('\u0001')
     let h = 5381
     for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
@@ -699,6 +767,9 @@ const Utils = {
     // 空值/空白/布尔值不是有效数值配置：避免 alert.intervalMs='' 被 Number('') 转成 0，
     // 从而意外关闭限频；显式字符串 '0' 仍保留 0 的特殊语义。
     if (v === undefined || v === null || typeof v === 'boolean') return def
+    // P3：仅接受 number 与数字字符串——数组([]→0/[5]→5)与带 valueOf 的对象会经 Number() 隐式
+    // 转换绕过守卫，导致 alert.intervalMs 等意外变 0 而非回退默认。
+    if (typeof v !== 'number' && typeof v !== 'string') return def
     if (typeof v === 'string' && v.trim() === '') return def
     let n
     try { n = Number(v) } catch (e) { return def } // Symbol / valueOf 抛错等脏配置回退默认，不中断主流程
@@ -1350,6 +1421,28 @@ const FilterEngine = {
   // 缓存容量上限：keyword 可来自外部/动态输入（消息字段等），理论上无限增长；
   // 带上限 + 淘汰最旧键（Map 保持插入序 ≈ LRU），防内存无限泄漏。
   _WHITELIST_RE_CACHE_MAX: 1000,
+  // v3.249 P3：_legacyListfilter 编译结果缓存（热路径复用，避免同配置反复 compileRules 重复 new RegExp）。
+  // 键 = rawCfg 各过滤字段的安全 String+trim 归一（与 compileRules 口径对齐）：内容变更→键变更，
+  // 天然防止脏缓存；同配置对象/同值配置共享一次编译结果。
+  _legacyCompileCache: new Map(),
+  _LEGACY_COMPILE_CACHE_MAX: 1000,
+  /** 编译缓存键：仅按 compileRules 真正消费的字段归一，保证「编译结果相同 ⇒ 键相同」 */
+  _legacyCompileKey (rawCfg) {
+    const safeStr = (v) => {
+      if (v === undefined || v === null || typeof v === 'symbol') return ''
+      try { return String(v).trim() } catch (e) { return '' }
+    }
+    const parts = []
+    for (const f of FILTER_FIELDS) {
+      let v
+      try { v = rawCfg && rawCfg[f] } catch (e) { v = undefined }
+      parts.push(f + '=' + safeStr(v))
+    }
+    let pb
+    try { pb = safeStr(rawCfg && rawCfg.pingbitime) } catch (e) { pb = '' }
+    parts.push('pingbitime=' + pb)
+    return parts.join('\u0001')
+  },
   /** 缺字段保守放行统一：compiled/group 缺失或字段缺失 → true；否则取反执行检查 */
   _passIfMissing (group, field, compiled, checkFn) {
     if (!compiled || !group) return true
@@ -1370,7 +1463,12 @@ const FilterEngine = {
 
   /** 分类屏蔽（使用编译后的规则） */
   checkCategory (group, compiled) {
-    return this._passIfMissing(group, 'catename', compiled, (c, g) => RuleEngine.matchesCompiled(c, Utils.safeGet(g, 'catename'), null))
+    return this._passIfMissing(group, 'catename', compiled, (c, g) => {
+      const catename = Utils.safeGet(g, 'catename')
+      // multi 型规则按行内「分类###值」匹配：分类判定与值判定都基于本条 catename，
+      // 传入 null 会导致带分类限制的多行规则永不命中，分类屏蔽失效（P3 修复）。
+      return RuleEngine.matchesCompiled(c, catename, catename)
+    })
   },
 
   /**
@@ -1453,8 +1551,18 @@ const FilterEngine = {
     // 保守放行，避免异常冒泡；同时防止 compileRules 结果异常时 listfilter 再走 _legacyListfilter
     // 造成无限递归（旧路径判定 !cfg.__compiled 是启发式，异常对象可能缺失该标记）。
     let compiled
-    try { compiled = RuleEngine.compileRules(rawCfg) } catch (e) { return true }
-    if (!compiled || typeof compiled !== 'object' || !compiled.__compiled) return true
+    // v3.249 P3：热路径避免每次重新编译——按配置内容归一化键命中缓存；仅缓存有效编译结果。
+    const key = this._legacyCompileKey(rawCfg)
+    compiled = this._legacyCompileCache.get(key)
+    if (compiled === undefined) {
+      try { compiled = RuleEngine.compileRules(rawCfg) } catch (e) { return true }
+      if (!compiled || typeof compiled !== 'object' || !compiled.__compiled) return true
+      this._legacyCompileCache.set(key, compiled)
+      // 超限淘汰最旧键（Map 保持插入序 ≈ LRU），防动态/外部配置无限增长。
+      if (this._legacyCompileCache.size > this._LEGACY_COMPILE_CACHE_MAX) {
+        this._legacyCompileCache.delete(this._legacyCompileCache.keys().next().value)
+      }
+    }
     return this.listfilter(group, compiled)
   },
 
@@ -1495,7 +1603,9 @@ const FilterEngine = {
       }
     }
     if (re === null) return true // 非法正则：放行（与 App.run 的 zkt_gjc 预编译失败 kwRe=null 不过滤口径一致；宁可多推不可少推）
-    return re.test(typeof value === 'string' ? value : Utils.safeText(value, ''))
+    // ReDoS 纵深防御：与 matchesCompiled 同口径，超长输入先截断再 .test()——即使关键词含
+    // 未被子嵌套量词检测覆盖的慢回溯形态（交替/前视/大字符类 × 超长输入），单次匹配最坏耗时也有界。
+    return re.test(RuleEngine._capReInput(typeof value === 'string' ? value : Utils.safeText(value, '')))
   }
 }
 
@@ -1535,6 +1645,8 @@ const MessageStore = {
     return path.join(root, '.xbk_cache_safe')
   },
   _memoryCache: {},
+  // 内存缓存实际键数（与 _memoryCache 同步维护，替代热路径上每次新键写都 Object.keys O(n)）
+  _memoCount: 0,
   // 身份索引缓存：WeakMap 按“权威内存缓存数组引用”绑定预计算身份索引，批量 has 判重 O(1)，
   // 避免对同一文件反复线性扫描；权威数组每次变更都是新对象引用（_memoSet 全量替换），
   // 数组被 GC 回收时索引随之自动释放，无需手动失效。
@@ -1552,14 +1664,18 @@ const MessageStore = {
     const key = typeof filePath === 'string' ? filePath : String(filePath)
     // R5-2：hasOwnProperty 判断（__proto__ 等原型键不会被 in 误判/直写污染对象原型）
     if (!Object.prototype.hasOwnProperty.call(this._memoryCache, key)) {
-      const keys = Object.keys(this._memoryCache)
-      if (keys.length >= this._MEMO_MAX) {
+      // 用维护的 _memoCount 判断是否打满：热路径每次新键写只需 O(1)，不再全量 Object.keys。
+      // 容量上限 100，仅在打满后（每次淘汰最旧键）才需要 Object.keys 定位最旧键，成本被封顶。
+      if (this._memoCount >= this._MEMO_MAX) {
         // 超限时淘汰最旧键：普通字符串键按插入顺序，keys[0] 即最早写入的键；无需整体重置
+        const keys = Object.keys(this._memoryCache)
         if (keys.length === 0) return false // 上限非正且缓存为空时无可淘汰，拒绝写入
         // 只对字符串键淘汰：数字样键会被 Object.keys 按数值序排列，keys[0] 并非最旧，
         // 故跳过数组索引样键，取首个普通字符串键；全部为索引键时退回 keys[0]。
         const oldest = keys.find(k => typeof k === 'string' && !/^(?:0|[1-9]\d*)$/.test(k)) ?? keys[0]
         try { delete this._memoryCache[oldest] } catch (e) { /* 忽略 */ }
+        // 淘汰后按实际键数校准计数（防御外部直删导致的漂移；新增键由下方统一自增）
+        this._memoCount = keys.length - 1
         // warn 降频：容量打满后不再每次新键写都提示，仅在从“未满”首次进入“打满淘汰”时提醒一次
         if (!this._memoWarned) {
           console.warn(`内存缓存达到上限(${this._MEMO_MAX})，已淘汰最旧键: ${oldest}（磁盘缓存不受影响）`)
@@ -1569,6 +1685,8 @@ const MessageStore = {
         // 缓存仍有空间 → 重置降频标记，下次打满时再提醒一次
         this._memoWarned = false
       }
+      // 新键写入后计数 +1（打满分支已在上方校准到“淘汰后键数”，此处统一补上新增的这一个）
+      this._memoCount++
     }
     // 原型键（__proto__/constructor/prototype）用 defineProperty 写入，避免 `obj['__proto__']=val` 修改对象原型
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
@@ -1586,25 +1704,37 @@ const MessageStore = {
     // 脏 message（非有效数据对象）不写入：避免 `{ ...safeObjectCopy(message), timestamp }` 把无效/未规范化
     // 条目带 timestamp 塞进缓存（与 save 入口的 isValidItem 口径一致；此前 _upsert 仅判数组、不判消息）。
     if (!Utils.isValidItem(message)) return false
+    // P3：拒绝空对象/空身份——isValidItem 只保证"对象且非数组"，空对象 {} 或缺失 id/url/key 的条目
+    // 会被 anonKey 退化为恒定键；这里与 saveBatch 的 identity.valid 口径一致，避免把无意义条目
+    // 带 timestamp 塞进缓存（此前 _findDedupIndex 对无效身份返回 -1，会走 else 分支无脑 push）。
+    if (!Utils.getMessageIdentity(message).valid) return false
     const idx = this._findDedupIndex(messages, message)
     if (idx >= 0) {
       // v3.156：比较排除 timestamp（同 saveBatch 主路径口径）——否则 oldM 带 timestamp、
       // message 无 timestamp 而内容相同也必报"更新缓存记录"并刷新 timestamp。
-      // 优化：键序无关归一化仅在命中更新路径执行，且每条只归一化一次（此前内联两次
-      // JSON.stringify(normalize(stripTs(...))) 对两侧重复深排；循环引用等失败时按"已更新"处理不崩溃）。
-      const stripTs = (o) => { if (!o || typeof o !== 'object') return o; const c = { ...o }; delete c.timestamp; return c }
-      const canon = (o) => { try { return JSON.stringify(normalize(stripTs(o))) } catch (e) { return null } }
-      const a = canon(messages[idx])
-      const b = canon(message)
-      let changed = true
-      if (a !== null && b !== null) changed = a !== b
-      if (!changed) return false // 内容完全一致：不更新、不刷新 timestamp、不触发落盘
+      // P3 优化：先做零分配的浅层快速相等检查（内容未变的常见去重路径直接短路，避免深排），
+      // 未命中再退回键序无关规范化深排；循环引用等失败时按"已更新"处理不崩溃。
+      if (!this._contentChangedIgnoringTs(messages[idx], message)) return false // 内容完全一致：不更新、不刷新 timestamp、不触发落盘
       console.log(`更新缓存记录: ${filename}`)
       messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: new Date().toISOString() }
     } else {
       messages.push({ ...Utils.safeObjectCopy(message), timestamp: new Date().toISOString() })
     }
     return true
+  },
+
+  /** 判重内容比较：排除顶层 timestamp、键序无关，判断两消息内容是否实际变更。
+      P3 优化：先做零分配的浅层快速相等检查（内容未变的去重路径直接短路，避免对整条大消息
+      做两次 deep normalize+JSON.stringify），未命中再退回既有键序无关规范化序列化比较，
+      语义与旧实现完全一致（循环引用/异常按"已变更"处理）。 */
+  _contentChangedIgnoringTs (oldM, message) {
+    if (Utils.shallowEqualIgnoringTimestamp(oldM, message)) return false
+    const stripTs = (o) => { if (!o || typeof o !== 'object') return o; const c = { ...o }; delete c.timestamp; return c }
+    const canon = (o) => { try { return JSON.stringify(normalize(stripTs(o))) } catch (e) { return null } }
+    const a = canon(oldM)
+    const b = canon(message)
+    if (a === null || b === null) return true
+    return a !== b
   },
 
   /** 统一判重：所有入口复用 Utils.sameMessageIdentity，避免单条/批内/缓存逻辑分裂 */
@@ -1700,20 +1830,6 @@ const MessageStore = {
     }
   },
 
-  /** 重置缓存文件为空数组：只有原子写成功后才更新内存权威状态。 */
-  _resetCache (filePath) {
-    // 空路径早退：writeAtomic 对空路径会留下无法重命名的残留 .tmp。
-    if (!filePath) return false
-    const saved = writeAtomic(filePath, '[]', '缓存重置')
-    // 只清理本文件自己的内存快照，不再走 _memoSet：重置一个文件不应触发 _memoSet 的容量淘汰，
-    // 以免把其他仍在使用的文件快照（_memoSet 满时删最旧键）当作“最旧键”误删。本文件磁盘已置
-    // 为 []（writeAtomic 成功），下次 readMessages 会从磁盘重建空快照，正确性与语义均不受影响。
-    if (saved) {
-      try { delete this._memoryCache[filePath] } catch (e) { /* 忽略 */ }
-    }
-    return saved
-  },
-
   readMessages (filePath) {
     // R5-2：hasOwnProperty 读取（'__proto__' 直读会返回 Object.prototype 而非缓存值）
     if (Object.prototype.hasOwnProperty.call(this._memoryCache, filePath)) {
@@ -1752,8 +1868,11 @@ const MessageStore = {
     try {
       data = JSON.parse(result.text || '[]')
     } catch (e) {
-      console.error(`JSON解析错误，重置文件 ${filePath}:`, e.message)
-      this._resetCache(filePath)
+      // 不再重置文件为 []：那会销毁磁盘上的去重缓存，且未标记 _readFailed，
+      // 使 has() 误判 false 并放行同一条消息重复入库。改为与 ioError/unsafe 一致的
+      // 保守处理——保留异常文件供恢复，并标记 _readFailed 让 save() 拒绝覆写。
+      console.error(`缓存 JSON 解析失败，跳过写入以保护数据 ${filePath}:`, e.message)
+      try { this._readFailed[filePath] = true } catch (err) { /* 忽略 */ }
       return []
     }
     if (Array.isArray(data)) {
@@ -1765,9 +1884,10 @@ const MessageStore = {
       this._memoSet(filePath, clean)
       return clean
     }
-    // 合法 JSON 但非数组（对象等）→ 重置，避免后续 .some()/.findIndex() 崩溃
-    console.error(`缓存格式异常（非数组），重置文件 ${filePath}`)
-    this._resetCache(filePath)
+    // 合法 JSON 但非数组（对象等）→ 不再重置：保留原文件并标记读取失败，
+    // 避免误判空缓存导致同一条消息重复入库；save() 会因 _readFailed 拒绝覆写。
+    console.error(`缓存格式异常（非数组），跳过写入以保护数据 ${filePath}`)
+    try { this._readFailed[filePath] = true } catch (e) { /* 忽略 */ }
     return []
   },
 
@@ -1859,6 +1979,9 @@ const MessageStore = {
   },
 
   has (message, filename) {
+    // 与 save 一致：先做条目有效性校验，无效 message（null/原始值/数组）直接判不存在，
+    // 不依赖 getMessageIdentity 的隐式容错。
+    if (!Utils.isValidItem(message)) return false
     const messages = this.readMessages(this.getFilePath(filename))
     // 预计算身份索引按数组引用缓存：同文件重复 has 直接 O(1) 命中，不再对整数组线性扫描。
     let idx = this._identityIndex.get(messages)
@@ -1872,6 +1995,10 @@ const MessageStore = {
   save (message, filename) {
     // 单条写入走同一统一身份/事务路径，同时保留 _upsert 作为单条缓存 API 的可达实现。
     if (!Utils.isValidItem(message)) return false
+    // P3：拒绝空对象/空身份——isValidItem 只保证"对象且非数组"，空对象 {} 或缺失 id/url/key 的
+    // 条目会被 anonKey 退化为恒定键；这里在入口一并拒绝（与 saveBatch/_upsert 的 identity.valid
+    // 口径一致），既避免把无意义条目带 timestamp 写进缓存，也避免在读盘/落盘前多一次磁盘 IO。
+    if (!Utils.getMessageIdentity(message).valid) return false
     const filePath = this.getFilePath(filename)
     const messages = [...this.readMessages(filePath)]
     // 读失败保守处理：磁盘缓存读取失败（ioError/unsafe）时返回的是 []，若直接落盘会把
@@ -1958,9 +2085,8 @@ const MessageStore = {
       if (idx >= 0) {
         const oldM = messages[idx]
         // v3.156：比较排除 timestamp——曾因 oldM 有 timestamp、message 无而内容相同也必报"更新缓存记录"
-        const stripTs = (o) => { if (!o || typeof o !== 'object') return o; const c = { ...o }; delete c.timestamp; return c }
-        let changed = false
-        try { changed = JSON.stringify(normalize(stripTs(oldM))) !== JSON.stringify(normalize(stripTs(message))) } catch (e) { changed = true }
+        // P3 优化：复用 _contentChangedIgnoringTs（先浅层短路、后键序无关深排），与 _upsert 口径一致
+        const changed = this._contentChangedIgnoringTs(oldM, message)
         if (changed) console.log(`更新缓存记录: ${filename}`)
         messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: NOW() }
         addIdentityIndexes(messages[idx], idx)
@@ -1986,7 +2112,11 @@ const MessageStore = {
       let badStr
       try { badStr = String(url) } catch (e) { return 'default.json' }
       if (!badStr || badStr === '[object Object]' || badStr === 'undefined' || badStr === 'null' || badStr === 'true' || badStr === 'false') return 'default.json'
-      return 'bad_' + Utils.anonKey(badStr) + '.json'
+      // v3.249：bad_ 名内嵌坏源字节长 + anonKey(64位) 双重区分——单纯哈希不同坏源存在理论碰撞
+      // 会产出同名缓存互相覆盖（P3）；anonKey 已由 32 位升级为两路 djb2 拼接(64位)，再附字节长
+      // 进一步把碰撞面收窄到「同长+同哈希」，并让文件名自描述便于排查。开销仅数个字节，
+      // getFileName 产物后续经 getFilePath 200 字节截断，不影响路径安全不变量。
+      return 'bad_' + Buffer.byteLength(badStr, 'utf8') + '_' + Utils.anonKey(badStr) + '.json'
     }
     if (!url) return 'default.json'
     const parts = url.split('/')
@@ -2132,8 +2262,10 @@ const App = {
     return isRegularOrMissing(filePath)
   },
 
-  _readSafeText (filePath) {
-    return readSafeText(filePath)
+  // 状态/哈希文件安全读取：保持 readSafeTextResult 的 status 区分（missing/ioError/
+  // unsafe/tooLarge），并强制大小上限，杜绝异常膨胀文件被整读入内存。
+  _readSafeState (filePath) {
+    return readSafeTextResult(filePath, STATE_TEXT_MAX_BYTES)
   },
 
   _writeTextAtomic (filePath, text) {
@@ -2161,6 +2293,10 @@ const App = {
   },
 
   // 运行日志：追加一行到缓存目录 run.log（成功摘要/失败 ERROR 共用），超过 1MB 截断保留尾部（防无限增长；写失败静默不中断）
+  // v3.xxx P3 并发安全：appendFileSync 在单进程内全程同步无交错；真正竞态在跨进程（重叠 cron/
+  // 常驻实例共用同一 cacheDir）——进程 A「追加→读尾→原子改写」的读改写间隙里，B 刚追加的行会被
+  // A 的整文件覆盖冲掉（丢日志）。修复：用 run.log.lock（O_EXCL）把「追加 + 超限截尾」包成互斥
+  // 临界区；拿不到锁（竞争/陈旧锁/异常）时 fail-open 只追加不截尾，日志绝不因锁而丢。
   _writeRunLog (line) {
     try {
       const logPath = path.join(MessageStore.cacheDir, 'run.log')
@@ -2168,30 +2304,63 @@ const App = {
         console.error(`拒绝写入非普通运行日志文件 ${logPath}`)
         return
       }
-      fs.appendFileSync(logPath, line, 'utf8')
-      const st = fs.statSync(logPath)
-      const LIMIT = 1024 * 1024
-      if (st.size > LIMIT) {
-        // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
-        // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
-        const KEEP = 512 * 1024
-        const fd = fs.openSync(logPath, 'r+')
-        try {
-          const readLen = Math.min(KEEP, st.size)
-          const buf = Buffer.alloc(readLen)
-          fs.readSync(fd, buf, 0, readLen, st.size - readLen) // 只读末尾 KEEP 字节
-          let trimmed = buf.toString('utf8')
-          // v3.178：尾部切片可能切在代理对中间（首字符为孤立低代理/尾字符为孤立高代理）→
-          // 写回后文件含非法 UTF-8 序列，下次读取显示 U+FFFD（§10-C）——退位到完整字符
-          const first = trimmed.charCodeAt(0)
-          if (first >= 0xDC00 && first <= 0xDFFF) trimmed = trimmed.slice(1) // 开头孤立低代理（高代理被切掉）
-          const last = trimmed.charCodeAt(trimmed.length - 1)
-          if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1) // 结尾孤立高代理（低代理被切掉）
-          const nl = trimmed.indexOf('\n')
-          // 原子写入（tmp + rename）覆盖原文件，避免中断留下半写日志
-          this._writeTextAtomic(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed)
-        } finally {
-          fs.closeSync(fd)
+      const lockPath = logPath + '.lock'
+      let lockFd = -1
+      try {
+        // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠 mtime 超龄抢占
+        const LOCK_STALE_MS = 10000
+        const lockDeadline = Date.now() + 3000
+        const waiter = new Int32Array(new SharedArrayBuffer(4))
+        for (;;) {
+          try {
+            lockFd = fs.openSync(lockPath, 'wx')
+            try { fs.writeSync(lockFd, `${process.pid}\n`) } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
+            break
+          } catch (e) {
+            if (e.code !== 'EEXIST') break // 权限等异常：拿不到锁也继续（fail-open，只追加）
+            let stale = false
+            try {
+              const ls = fs.statSync(lockPath)
+              stale = Date.now() - ls.mtimeMs > LOCK_STALE_MS
+            } catch (e2) { stale = true } // 锁文件刚被释放/删除：当作空位重试
+            if (stale) {
+              try { fs.unlinkSync(lockPath) } catch (e2) { /* 抢占失败则下一轮重试 */ }
+              continue
+            }
+            if (Date.now() >= lockDeadline) break // 超时：fail-open，仅追加不截尾
+            try { Atomics.wait(waiter, 0, 0, 10) } catch (e2) { /* 非主线程/受限时退避失败，直接重试 */ }
+          }
+        }
+        fs.appendFileSync(logPath, line, 'utf8')
+        const st = fs.statSync(logPath)
+        const LIMIT = 1024 * 1024
+        if (st.size > LIMIT) {
+          // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
+          // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
+          const KEEP = 512 * 1024
+          const fd = fs.openSync(logPath, 'r+')
+          try {
+            const readLen = Math.min(KEEP, st.size)
+            const buf = Buffer.alloc(readLen)
+            fs.readSync(fd, buf, 0, readLen, st.size - readLen) // 只读末尾 KEEP 字节
+            let trimmed = buf.toString('utf8')
+            // v3.178：尾部切片可能切在代理对中间（首字符为孤立低代理/尾字符为孤立高代理）→
+            // 写回后文件含非法 UTF-8 序列，下次读取显示 U+FFFD（§10-C）——退位到完整字符
+            const first = trimmed.charCodeAt(0)
+            if (first >= 0xDC00 && first <= 0xDFFF) trimmed = trimmed.slice(1) // 开头孤立低代理（高代理被切掉）
+            const last = trimmed.charCodeAt(trimmed.length - 1)
+            if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1) // 结尾孤立高代理（低代理被切掉）
+            const nl = trimmed.indexOf('\n')
+            // 原子写入（tmp + rename）覆盖原文件，避免中断留下半写日志
+            this._writeTextAtomic(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed)
+          } finally {
+            fs.closeSync(fd)
+          }
+        }
+      } finally {
+        if (lockFd >= 0) {
+          try { fs.closeSync(lockFd) } catch (e) { /* 锁 fd 关闭失败忽略 */ }
+          try { fs.unlinkSync(lockPath) } catch (e) { /* 锁文件已被抢删等，忽略 */ }
         }
       }
     } catch (e) { /* 日志写失败静默（磁盘只读/权限等，不中断推送） */ }
@@ -2205,11 +2374,12 @@ const App = {
   _warnLowDisk () {
     const minFree = Utils.num(Config.storage && Config.storage.minFreeBytes, 50 * 1024 * 1024)
     if (!Number.isFinite(minFree) || minFree <= 0) return
-    const info = Utils.diskSpace(MessageStore.cacheDir)
-    if (!info || info.freeBytes >= minFree) return
     const now = Date.now()
-    // 同一进程最多每小时提示一次，避免磁盘低时刷屏。
+    // 同一进程最多每小时提示一次，避免磁盘低时刷屏；限流前置，避免高频写入时每次都无谓同步 statfs 阻塞事件循环。
     if (now - this._diskWarningAt < 3600000) return
+    const info = Utils.diskSpace(MessageStore.cacheDir)
+    // freeBytes 需有限性校验：NaN 时 >=minFree 为 false 会误入告警并在 toFixed 抛 RangeError。
+    if (!info || !Number.isFinite(info.freeBytes) || info.freeBytes >= minFree) return
     this._diskWarningAt = now
     const freeMiB = (info.freeBytes / 1024 / 1024).toFixed(1)
     const minMiB = (minFree / 1024 / 1024).toFixed(1)
@@ -2230,10 +2400,15 @@ const App = {
         this._alertLastAtByPath.delete(statePath)
         lastAt = 0
       }
-      try {
-        const stateText = this._readSafeText(statePath)
-        if (stateText !== null) lastAt = Math.max(lastAt, JSON.parse(stateText).lastAt || 0)
-      } catch (e) { /* 无状态文件=首次 */ }
+      const stateResult = this._readSafeState(statePath)
+      if (stateResult.status === 'ok') {
+        try { lastAt = Math.max(lastAt, JSON.parse(stateResult.text).lastAt || 0) } catch (e) { /* 损坏状态=忽略 */ }
+      } else if (stateResult.status !== 'missing') {
+        // ioError/unsafe/tooLarge：无法确认真实限频状态。若按"无状态文件"处理会重置
+        // lastAt 导致限频失效、重复推送；保守跳过本次告警，下次运行再重试。
+        console.error(`告警限频状态读取失败(${stateResult.status})，跳过本次告警以免限频被重置导致重复推送 ${statePath}`)
+        return
+      }
       const intervalMs = Utils.num(Config.alert.intervalMs, 3600000) // v3.167: 非法字符串'abc'曾>0比较false→0不限频轰炸（其他数值配置均num回退）
       const interval = intervalMs > 0 ? intervalMs : 0 // <=0(含-1) = 不限频（每次异常都发）
       if (interval > 0 && Date.now() - lastAt < interval) return // 限频：间隔内不重复轰炸
@@ -2301,10 +2476,16 @@ const App = {
       }
       let state = memoryState ? normalizeState(memoryState.state) : blankState()
       if (!memoryState) {
-        try {
-          const stateText = this._readSafeText(statePath)
-          if (stateText !== null) state = normalizeState(JSON.parse(stateText))
-        } catch (e) { /* 无状态或损坏状态=首次 */ }
+        const stateResult = this._readSafeState(statePath)
+        if (stateResult.status === 'ok') {
+          try { state = normalizeState(JSON.parse(stateResult.text)) } catch (e) { /* 损坏状态=重置为安全状态 */ }
+        } else if (stateResult.status !== 'missing') {
+          // ioError/unsafe/tooLarge：读不到累计状态。若按"无状态文件"处理会把已累计的
+          // 日报/告警累计状态静默重置、可能重复推送；保守跳过本次日报更新，下次再重试。
+          console.error(`日报累计状态读取失败(${stateResult.status})，跳过本次日报更新以免累计状态被重置 ${statePath}`)
+          return
+        }
+        // status === 'missing' → state 保持 blankState()（首次）
       }
       // v3.155：日报日期用本地时区（原 UTC——中国用户凌晨 cron 时本地已跨天但 UTC 未跨，日报日期错位一天）
       const _d = new Date()
@@ -2549,9 +2730,16 @@ const App = {
         const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc)
         const hashPath = path.join(MessageStore.cacheDir, 'filter.hash')
         let lastHash = ''
-        const hashText = this._readSafeText(hashPath)
-        if (hashText !== null) lastHash = hashText.trim()
         let filterStateReady = true
+        const hashResult = this._readSafeState(hashPath)
+        if (hashResult.status === 'ok') {
+          lastHash = (hashResult.text || '').trim()
+        } else if (hashResult.status !== 'missing') {
+          // ioError/unsafe/tooLarge：读不到已存 hash。若当"无 hash"处理会静默跳过规则
+          // 变更检测且立即覆写 hash；保守视为未就绪，本次不检测也不推进 hash，下次重试。
+          console.error(`过滤规则 hash 读取失败(${hashResult.status})，跳过本次规则变更检测 ${hashPath}`)
+          filterStateReady = false
+        }
         if (lastHash && lastHash !== filterHash) {
           const fp = MessageStore.getFilePath(cacheName)
           const msgs = MessageStore.readMessages(fp)

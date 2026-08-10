@@ -5,7 +5,16 @@ const fs = require('fs')
 const path = require('path')
 
 function isRegularOrMissing (filePath) {
-  try { return fs.lstatSync(filePath).isFile() } catch (e) { return e && e.code === 'ENOENT' }
+  if (typeof filePath !== 'string') {
+    console.warn(`isRegularOrMissing: filePath 非字符串(${typeof filePath})，视为不安全，拒绝`)
+    return false
+  }
+  try { return fs.lstatSync(filePath).isFile() } catch (e) {
+    if (e && e.code === 'ENOENT') return true
+    const detail = e && e.code ? `${e.code}` : (e && e.message ? e.message : String(e))
+    console.warn(`isRegularOrMissing: 检查 ${filePath} 读取异常(${detail})，视为不安全，拒绝`)
+    return false
+  }
 }
 
 function ensureParent (filePath) {
@@ -36,7 +45,9 @@ function writeAtomic (filePath, text, label = '缓存文件') {
   }
 }
 
-function readSafeTextResult (filePath) {
+// 可选大小上限：maxBytes > 0 时，普通文件超过该字节数即判 tooLarge，避免异常膨胀
+// 文件被整读入内存（状态/哈希等小文件场景）。
+function readSafeTextResult (filePath, maxBytes) {
   // 修复 TOCTOU：先以 O_NOFOLLOW 打开并 fstat 确认为普通文件，读取后复检路径仍指向
   // 同一 inode（dev+ino）的普通文件。路径读取（保持既有故障注入兼容）后若被替换成
   // 符号链接/其他文件，读后复检会将其判为 unsafe 并丢弃结果，不再泄露任意文件内容。
@@ -52,6 +63,9 @@ function readSafeTextResult (filePath) {
   try {
     const stat = fs.fstatSync(fd)
     if (!stat.isFile()) return { status: 'unsafe', text: null, error: new Error('非普通文件') }
+    if (typeof maxBytes === 'number' && maxBytes > 0 && stat.size > maxBytes) {
+      return { status: 'tooLarge', text: null, error: new Error(`文件过大(${stat.size} 字节)，超过上限 ${maxBytes} 字节`) }
+    }
     const text = fs.readFileSync(filePath, 'utf8')
     let reFd
     try {
