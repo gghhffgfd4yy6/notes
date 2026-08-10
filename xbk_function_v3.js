@@ -224,7 +224,9 @@ const ENTITY_MAP = {
   '&uarr;': '↑',
   '&darr;': '↓'
 }
-const ENTITY_RE = new RegExp('&(?:' + Object.keys(ENTITY_MAP).map(k => k.slice(1, -1)).join('|') + ');', 'g') // 从 ENTITY_MAP 自动生成，加实体只改一处
+// v3.239：实体名先转义正则元字符（. * + ? ( ) [ ] { } | \ $ ^ 等）——实体名含元字符时曾产出错误/失效正则
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const ENTITY_RE = new RegExp('&(?:' + Object.keys(ENTITY_MAP).map(k => escapeRe(k.slice(1, -1))).join('|') + ');', 'g') // 从 ENTITY_MAP 自动生成，加实体只改一处
 const DEC_RE = /&#(\d+);/g
 const HEX_RE = /&#[xX]([0-9a-fA-F]+);/g
 
@@ -1029,7 +1031,10 @@ const RuleEngine = {
             }
             let valRe = null
             if (this.hasNestedQuantifier(val)) continue // ReDoS 防护：嵌套量词跳过
-            try { valRe = new RegExp(val, 'i') } catch (e) { continue } // 预期：非法正则该行跳过（validateConfig 已警告）
+            try { valRe = new RegExp(val, 'i') } catch (e) {
+              console.warn(`⚠️ 规则「${String(field)}」包含非法正则「${String(val)}」，已跳过（v3.239 口径统一：validateConfig 与 compileRules 均告警）`)
+              continue
+            }
             if (valRe) rules.push({ cat: catRe, val: valRe })
           }
         }
@@ -1043,7 +1048,8 @@ const RuleEngine = {
         try {
           compiled[field] = { _type: 're', re: new RegExp(val, 'i') }
         } catch (e) {
-          compiled[field] = null // 预期：非法正则置 null 跳过（validateConfig 已警告）
+          console.warn(`⚠️ 规则「${String(field)}」包含非法正则「${String(val)}」，已跳过（v3.239 口径统一：validateConfig 与 compileRules 均告警）`)
+          compiled[field] = null // 非法正则置 null 跳过（validateConfig 已警告）
         }
       }
     }
@@ -1261,6 +1267,8 @@ const RuleEngine = {
 // 🎯 FilterEngine — 过滤引擎层
 // ============================================================
 const FilterEngine = {
+  // v3.239：whitelistFilter 正则编译缓存（热路径复用，避免每条消息 × 字段重复 new RegExp）
+  _whitelistReCache: new Map(),
   /** 缺字段保守放行统一：compiled/group 缺失或字段缺失 → true；否则取反执行检查 */
   _passIfMissing (group, field, compiled, checkFn) {
     if (!compiled || !group) return true
@@ -1378,12 +1386,18 @@ const FilterEngine = {
     const value = Utils.safeGet(item, field)
     if (!value) return false
     if (RuleEngine.hasNestedQuantifier(kwStr)) return true // ReDoS 防护：风险关键词不执行匹配，全部放行（与非法正则口径一致）
-    try {
-      return new RegExp(kwStr, 'i').test(typeof value === 'string' ? value : Utils.safeText(value, ''))
-    } catch (e) {
-      // 非法正则：放行（与 App.run 的 zkt_gjc 预编译失败 kwRe=null 不过滤口径一致；宁可多推不可少推）
-      return true
+    // v3.239：正则编译缓存（过滤热路径，每条消息 × 每个字段都调 whitelistFilter，避免重复 new RegExp）
+    let re = this._whitelistReCache.get(kwStr)
+    if (re === undefined) {
+      try {
+        re = new RegExp(kwStr, 'i')
+      } catch (e) {
+        re = null // 非法正则缓存 null，避免每次重建；语义与下方一致
+      }
+      this._whitelistReCache.set(kwStr, re)
     }
+    if (re === null) return true // 非法正则：放行（与 App.run 的 zkt_gjc 预编译失败 kwRe=null 不过滤口径一致；宁可多推不可少推）
+    return re.test(typeof value === 'string' ? value : Utils.safeText(value, ''))
   }
 }
 
@@ -2403,6 +2417,8 @@ const App = {
       if (items.length > maxPerRun) {
         truncatedCount = items.length - maxPerRun
         console.warn(`⚠️ 单次待推送 ${items.length} 条超过上限 ${maxPerRun}，只推前 ${maxPerRun} 条（防接口异常推送风暴；调整 Config.push.maxPerRun）`)
+        // v3.239：截断告警推送（复用 alert 限频，防轰炸）——静默丢失曾无感知，手机端可及时发现
+        this._sendAlert(`⚠️ 线报酷截断：单次待推送 ${items.length} 条超上限 ${maxPerRun}，已丢弃 ${truncatedCount} 条（防推送风暴）`)
         // v3.134：截断掉的不写缓存——否则下次运行去重跳过导致静默丢失（缓存当"已处理"）；下次运行推剩余
         // keyOf 在 ⑥ 才定义，此处用同口径（id 优先 + url 归一）构造截断 key
         truncatedKeys = new Set(items.slice(maxPerRun).map(it => Utils.getMessageIdentity(it).key))
