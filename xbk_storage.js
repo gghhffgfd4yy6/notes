@@ -37,18 +37,40 @@ function writeAtomic (filePath, text, label = '缓存文件') {
 }
 
 function readSafeTextResult (filePath) {
-  let stat
+  // 修复 TOCTOU：先以 O_NOFOLLOW 打开并 fstat 确认为普通文件，读取后复检路径仍指向
+  // 同一 inode（dev+ino）的普通文件。路径读取（保持既有故障注入兼容）后若被替换成
+  // 符号链接/其他文件，读后复检会将其判为 unsafe 并丢弃结果，不再泄露任意文件内容。
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+  let fd
   try {
-    stat = fs.lstatSync(filePath)
+    fd = fs.openSync(filePath, flags)
   } catch (e) {
     if (e && e.code === 'ENOENT') return { status: 'missing', text: null, error: e }
+    if (e && e.code === 'ELOOP') return { status: 'unsafe', text: null, error: new Error('非普通文件') }
     return { status: 'ioError', text: null, error: e }
   }
-  if (!stat.isFile()) return { status: 'unsafe', text: null, error: new Error('非普通文件') }
   try {
-    return { status: 'ok', text: fs.readFileSync(filePath, 'utf8'), error: null }
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFile()) return { status: 'unsafe', text: null, error: new Error('非普通文件') }
+    const text = fs.readFileSync(filePath, 'utf8')
+    let reFd
+    try {
+      reFd = fs.openSync(filePath, flags)
+      const reStat = fs.fstatSync(reFd)
+      if (!reStat.isFile() || reStat.dev !== stat.dev || reStat.ino !== stat.ino) {
+        return { status: 'unsafe', text: null, error: new Error('文件读取期间被替换') }
+      }
+    } catch (e) {
+      if (e && (e.code === 'ELOOP' || e.code === 'ENOENT')) return { status: 'unsafe', text: null, error: new Error('非普通文件') }
+      return { status: 'ioError', text: null, error: e }
+    } finally {
+      if (reFd !== undefined) { try { fs.closeSync(reFd) } catch (e) { /* 忽略 */ } }
+    }
+    return { status: 'ok', text, error: null }
   } catch (e) {
     return { status: 'ioError', text: null, error: e }
+  } finally {
+    try { fs.closeSync(fd) } catch (e) { /* 忽略 */ }
   }
 }
 

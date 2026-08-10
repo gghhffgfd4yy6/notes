@@ -1110,17 +1110,16 @@ console.log('========================================\n');
     }, { pingbifenlei: '微博' }), true) // catename 是 undefined，不匹配
   })
 
-  await test('louzhuregtime 非法格式 → 返回 0 天，不过滤', () => {
-    // daysComputed 对非法日期返回 0，pingbitime 5 > 0 → 理论会拦截
-    // 但实际代码中 daysComputed 处理非法日期返回 0
-    // 所以需要检查 listfilter 是否正常处理
+  await test('louzhuregtime 非法格式 → 与缺失一致放行', () => {
+    // 非空但 parseTime 失败（非法格式）→ checkTimeCompiled 返回 null（不拦截），
+    // 与"缺失"口径一致放行；曾因 daysComputed 归 0 天（5 > 0）被误判为老号而拦截
     assertEqual(listfilter({
       catename: '线报',
       louzhu: '小明',
       title: '京东',
       content: '内容',
       louzhuregtime: 'not-a-date'
-    }, { pingbitime: '5' }), false) // 5 > 0 → 拦截
+    }, { pingbitime: '5' }), true) // 解析失败 → 放行
   })
 
   // ==================== 25. 缓存管理 更多边界 ====================
@@ -2432,9 +2431,12 @@ console.log('========================================\n');
     assertEqual(whitelistFilter({ title: undefined }, 'title', '京东'), false, '缺标题+关键词应滤掉')
     assertEqual(whitelistFilter({ content: '' }, 'content', '京东'), false, '空内容+关键词应滤掉')
     assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true, '正常匹配仍保留')
-    // falsy 值参与匹配的差异场景（变异点：!value → value===undefined 时，0/false 等 falsy 值会走到正则匹配）
-    assertEqual(whitelistFilter({ title: 0 }, 'title', '0'), false, 'title=0 + 关键词0 应滤掉（falsy 不匹配）')
-    assertEqual(whitelistFilter({ title: false }, 'title', 'false'), false, 'title=false + 关键词false 应滤掉')
+    // 已定义假值（0/false）视为有效内容参与匹配（仅 undefined/null 视为字段缺失）；
+    // 修复 !value 短路把 0 误判为不匹配：0 应可被关键词 '0' 命中
+    assertEqual(whitelistFilter({ title: 0 }, 'title', '0'), true, 'title=0 + 关键词0 应命中（0 是有效值）')
+    assertEqual(whitelistFilter({ title: false }, 'title', 'false'), true, 'title=false + 关键词false 应命中（false 是有效值）')
+    assertEqual(whitelistFilter({ title: 0 }, 'title', '京东'), false, 'title=0 + 不相关关键词仍不命中')
+    assertEqual(whitelistFilter({ title: false }, 'title', '京东'), false, 'title=false + 不相关关键词仍不命中')
   })
 
   await test('M3: matchesCompiled 空串 → 不匹配（空值不参与过滤）', () => {
