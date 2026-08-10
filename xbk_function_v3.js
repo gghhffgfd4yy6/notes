@@ -880,7 +880,10 @@ const Formatter = {
     }
 
     for (const [key, val] of Object.entries(map)) {
-      text = text.replace(new RegExp(key, 'g'), () => Utils.safeText(val))
+      // v3.237：字面量替换（split/join）替代 new RegExp(key)——占位符是固定文本而非正则模式，
+      // 避免每次调用重建 14 个正则对象 + 消除占位符含正则元字符（$ ( [ 等）时的隐式陷阱。
+      // 语义等价：replace(/X/g, fn) 对字面量 X ≡ split('X').join(fn())。
+      text = text.split(key).join(Utils.safeText(val))
     }
     // v3.110：输出统一清洗孤立代理（encodeURIComponent 会崩；所有模板路径受益）
     return Utils.sanitizeSurrogates(text)
