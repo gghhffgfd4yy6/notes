@@ -625,7 +625,7 @@ const Utils = {
     // v3.108 fuzz 发现：String(Symbol()) 抛 TypeError——Symbol 字段视为无效过滤
     const str = (p) => {
       if (typeof p === 'symbol') return ''
-      try { return String(p).replace(/\\/g, '%5C').replace(/\|/g, '%7C') } catch (e) { return '' }
+      try { return String(p).replace(/%/g, '%25').replace(/\\/g, '%5C').replace(/\|/g, '%7C') } catch (e) { return '' }
     }
     const s = parts.filter(p => p !== undefined && p !== null && str(p).trim() !== '').map(str).join('|')
     let h = 5381
