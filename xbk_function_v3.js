@@ -407,8 +407,14 @@ const Utils = {
     if (url === undefined || url === null) return false
     let s
     try { s = String(url) } catch (e) { return false }
+    // v3.245 P0(XSS)：浏览器解析 href/src 时会解码命名实体——&colon;→':'、&Tab;→'\t'、
+    // &NewLine;/&Newline;/&NewLine → '\n'、&nbsp;→'\u00A0'。decodeHtmlEntities 的 ENTITY_MAP
+    // 不含这些，故在安全校验链路上单独解码，防止 javascript&colon;alert(1) 绕过黑名单。
+    // 注意：只在此链路解码，不污染 ENTITY_MAP（消息正文渲染口径不变）。
+    s = s.replace(/&(?:colon|Tab|NewLine|Newline|nbsp);/gi, m => ({ '&colon;': ':', '&Tab;': '\t', '&NewLine;': '\n', '&Newline;': '\n', '&nbsp;': '\u00A0' })[m] || '')
     // 去除 ASCII 控制空白，防止 `java\nscript:`/`java\tscript:` 等内部空白绕过协议检查
-    s = this.decodeHtmlEntities(s).replace(/[\u0000-\u0020]+/g, '').toLowerCase()
+    // v3.245 P0：同时清理 \u00A0(nbsp 解码产物) 与 \u200B 等零宽，防 java\u00A0script: 变体
+    s = this.decodeHtmlEntities(s).replace(/[\u0000-\u0020\u00A0\u200B-\u200D\uFEFF]+/g, '').toLowerCase()
     return /^(javascript|vbscript|data):/.test(s)
   },
 
@@ -532,6 +538,9 @@ const Utils = {
   },
 
   safeErrorText (error, fallback = '') {
+    // v3.245 P1：字符串 error（如 throw 'xxx'）直接返回内容——safeGet 对原始字符串取
+    // message/code 均为 undefined，此前会丢内容落到 fallback，异常信息不可见。
+    if (typeof error === 'string' && error.trim() !== '') return this.safeText(error, fallback)
     const message = this.safeGet(error, 'message')
     if (message !== undefined && message !== null && message !== '') return this.safeText(message, fallback)
     const code = this.safeGet(error, 'code')
@@ -752,6 +761,9 @@ const Utils = {
 const Formatter = {
   /** Markdown 收尾：合并连续换行 + 去首尾空白（短路与正常路径共用） */
   _finalizeMd (s) {
+    // v3.245 P1：非 string 输入（undefined/null/对象/Symbol）String() 兜底，此前直接
+    // s.replace 抛 TypeError 无防护。
+    try { s = String(s) } catch (e) { return '' }
     return s.replace(/\n{3,}/g, '\n\n').trim()
   },
 
@@ -910,7 +922,9 @@ const Formatter = {
 const RuleEngine = {
   /** 解析单行规则：split('###') + trim，返回 { cat, val, parts } */
   _parseLine (line) {
-    const parts = String(line).split('###')
+    // v3.245 P1：String(line) 对嵌套 Symbol 数组抛 TypeError——catch 兜底返回空规则。
+    let parts
+    try { parts = String(line).split('###') } catch (e) { parts = [] }
     return {
       cat: (parts[0] || '').trim(),
       val: (parts[1] || '').trim(),
@@ -920,8 +934,11 @@ const RuleEngine = {
 
   /** 编译分类正则，失败返回 null（调用方决定跳过） */
   _compileCatRe (cat) {
+    // v3.245 P1：null/undefined 显式返回 null——此前 new RegExp(undefined) 隐式编译
+    // /undefined/i 字面量正则，会静默匹配含 "undefined" 文本的字段，行为与预期不符。
+    if (cat === null || cat === undefined) return null
     if (this.hasNestedQuantifier(cat)) return null // ReDoS 防护：嵌套量词直接跳过
-    try { return new RegExp(cat, 'i') } catch (e) { return null }
+    try { return new RegExp(String(cat), 'i') } catch (e) { return null }
   },
 
   /**
@@ -996,7 +1013,7 @@ const RuleEngine = {
     try { s = String(configStr) } catch (e) { return [] } // 嵌套 Symbol 数组 String() 崩 → 无配置
     configStr = s
     if (!configStr) return []
-    if (!/###/.test(configStr)) return null // 简单模式
+    if (!/###/.test(configStr)) return null // 简单模式（测试锁定契约；调用方均有 /###/ 守卫才调用）
     return configStr.split(/<br\s*\/?>|\r\n|\r|\n/) // R2：支持 <br/> 自闭合（与 htmlToMarkdown br 口径一致）
   },
 
@@ -1376,7 +1393,13 @@ const FilterEngine = {
 
   /** 兼容旧调用的备用路径（直接编译传入的原始字符串） */
   _legacyListfilter (group, rawCfg) {
-    return this.listfilter(group, RuleEngine.compileRules(rawCfg))
+    // v3.245 P1：compileRules 对脏输入（Symbol/嵌套 Symbol 数组等）可能抛异常——兜底返回 true
+    // 保守放行，避免异常冒泡；同时防止 compileRules 结果异常时 listfilter 再走 _legacyListfilter
+    // 造成无限递归（旧路径判定 !cfg.__compiled 是启发式，异常对象可能缺失该标记）。
+    let compiled
+    try { compiled = RuleEngine.compileRules(rawCfg) } catch (e) { return true }
+    if (!compiled || typeof compiled !== 'object' || !compiled.__compiled) return true
+    return this.listfilter(group, compiled)
   },
 
   /**
@@ -1476,6 +1499,8 @@ const MessageStore = {
 
   /** 统一更新/追加：命中则更新(含覆盖提示)，未命中追加 */
   _upsert (messages, message, filename) {
+    // v3.245 P1：非数组 messages 直接返回 -1（不推送）——此前 messages.push 抛 TypeError 崩溃。
+    if (!Array.isArray(messages)) return -1
     const idx = this._findDedupIndex(messages, message)
     if (idx >= 0) {
       // 序列化比较（循环引用等失败时按"已更新"处理，不崩溃）
@@ -1506,7 +1531,10 @@ const MessageStore = {
         fs.mkdirSync(this.cacheDir, { recursive: true })
       }
     } catch (e) {
-      console.error(`缓存目录创建失败: ${this.cacheDir}`, e.message)
+      // v3.245 P1：目录创建失败必须暴露——此前只 console.error 吞错，后续所有缓存写
+      // 操作（save/saveBatch）都会因目录缺失而连锁失败且原因不明。
+      console.error(`缓存目录创建失败: ${this.cacheDir}`, e && e.message || e)
+      throw e
     }
   },
 
@@ -1912,7 +1940,9 @@ const App = {
   },
 
   _writeTextAtomic (filePath, text) {
-    return writeAtomic(filePath, text, '缓存文件')
+    // v3.245 P1：writeAtomic 内部有 try/catch 正常不抛；此处再加一层防御（如 text 含
+    // Symbol 等 String 化异常），任何意外不向调用链冒泡。
+    try { return writeAtomic(filePath, text, '缓存文件') } catch (e) { return false }
   },
 
   // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。

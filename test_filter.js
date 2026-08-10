@@ -1959,9 +1959,14 @@ console.log('========================================\n');
     assertEqual(/href\s*=\s*["']javascript:/i.test(html), false, 'Html内容 不应生成 javascript href')
     assertEqual(html.includes('原文链接：'), true, '危险 URL 仍保留原文链接文本提示')
     // 实体编码/控制空白绕过也必须拦截
-    for (const u of ['javascript&#58;alert(1)', ' \u0000javascript:alert(1)', 'VBScript:msgbox(1)', 'data:text/html,x']) {
+    for (const u of ['javascript&#58;alert(1)', ' \\u0000javascript:alert(1)', 'VBScript:msgbox(1)', 'data:text/html,x']) {
       const out = tuisong_replace('{Html内容}', { content_html: '<p>x</p>', url: u })
       assertEqual(/href\s*=\s*["'](?:javascript|vbscript|data):/i.test(out), false, `编码危险 URL 不应生成 href: ${u}`)
+    }
+    // v3.245 P0(XSS)：浏览器解析时解码的命名实体绕过（&colon;→:、&Tab;→\t、&NewLine;→\n、&nbsp;→\u00A0）
+    for (const u of ['javascript&colon;alert(1)', 'java&Tab;script:alert(1)', 'javascript&NewLine;:alert(1)', 'java&nbsp;script:alert(1)']) {
+      const out = tuisong_replace('{Html内容}', { content_html: '<p>x</p>', url: u })
+      assertEqual(/href\s*=\s*["'](?:javascript|vbscript|data):/i.test(out), false, `命名实体绕过不应生成 href: ${u}`)
     }
     // 原始 content_html 中的危险 href/src 也必须清洗
     const raw = tuisong_replace('{Html内容}', { content_html: '<a href="javascript:alert(1)">点我</a><img src="javascript:x">', url: 'https://safe.example/a' })
