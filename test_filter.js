@@ -4563,6 +4563,30 @@ console.log('========================================\n');
     }
   })
 
+  await test('安全: 引号值内 on 开头的合法 URL/值不被误伤（v3.257 修复 086）', () => {
+    // 曾把 href="onclick=x" 当事件属性清空为 href=""（合法 URL 被破坏）
+    const keep = [
+      '<a href="onclick=x">link</a>',                    // on 开头的合法相对 URL
+      '<a href="https://x.com/p?onclick=1">go</a>',      // URL 参数含 onclick
+      '<a href="http://onmouseover.example/a">m</a>'     // 值内含 on 字样
+    ]
+    for (const h of keep) {
+      const r = tuisong_replace('{Html内容}', { content_html: h, url: 'https://example.com' })
+      const m = h.match(/href="([^"]*)"/)
+      assertEqual(r.includes(`href="${m[1]}"`), true, `引号值内合法 on 开头值应保留: ${h} → ${r.slice(0, 90)}`)
+    }
+    // 回归：无空格 XSS 形态与真事件属性仍必须清除
+    const strip = [
+      '<img src="x"onerror="alert(1)">',
+      '<img onclick="f()" src="x">',
+      '<a href="x" onmouseover="g()">h</a>'
+    ]
+    for (const h of strip) {
+      const r = tuisong_replace('{Html内容}', { content_html: h, url: 'https://example.com' })
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `事件属性不应残留: ${h} → ${r.slice(0, 90)}`)
+    }
+  })
+
   await test('安全: 实体编码 href 不绕过危险协议检查（v3.143）', () => {
     // javascript&#58; / &#106;avascript: / jav&#x61;script: 等编码形式曾绕过（decode 在 a 转换后）
     const cases = [

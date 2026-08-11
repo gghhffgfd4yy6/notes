@@ -1140,6 +1140,27 @@ console.log('========================================\n');
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
   })
 
+  await test('run.log 锁竞争时 fail-open 只追加不截尾（v3.257 修复 049）', async () => {
+    reset()
+    setPushUrl('t63_runlog_lock')
+    fakeData = [makeItem({ id: 1 })]
+    const logPath = path.join(CACHE_DIR, 'run.log')
+    try {
+      // 预创建锁文件模拟其他进程持锁（EEXIST → 3s 超时 fail-open：拿不到锁只追加）
+      require('fs').writeFileSync(logPath + '.lock', '99999\n')
+      await xbk.run()
+      const content = fs.readFileSync(logPath, 'utf8')
+      const lastLine = content.trim().split('\n').pop()
+      assert(/total=\d+/.test(lastLine), `fail-open 下日志仍应追加摘要行，实际: ${lastLine}`)
+      assert(lastLine.includes('pushed=1'), `应记录推送 1 条，实际: ${lastLine}`)
+      // 外部创建的锁文件不应被误删（非本次调用创建的锁）
+      assert(fs.existsSync(logPath + '.lock'), '外部锁文件不应被删除')
+    } finally {
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+      try { fs.unlinkSync(logPath + '.lock') } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('推送模板可配置 + 非法回退默认（v3.68）', async () => {
     reset()
     setPushUrl('t48_template')
@@ -1818,6 +1839,31 @@ console.log('========================================\n');
       const _d = new Date()
       const localToday = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`
       assert(st.date === localToday, `状态日期应为今天(本地): ${st.date} vs ${localToday}`)
+    } finally {
+      Config.report.enabled = orig
+      try { require('fs').unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('日报发送成功 → 今日累计不重复计数（v3.257 修复 089）', async () => {
+    reset()
+    setPushUrl('t62_report_nodup')
+    fakeData = [makeItem({ id: 1 })]
+    const orig = Config.report.enabled
+    Config.report.enabled = true
+    const statePath = path.join(CACHE_DIR, 'report.state')
+    try {
+      // 写昨天状态（有数据）→ 今天首次 run 发昨日日报
+      require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, dedup: 1, filtered: 1, pushed: 3, failed: 0 }))
+      await xbk.run()
+      assert(pushCalls.some(c => c.text.includes('日报')), '跨天应发昨日日报')
+      // 等待发送成功回调持久化（Pusher.send resolve 后的 .then）
+      await new Promise(r => setTimeout(r, 100))
+      const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
+      assert(st.date !== '2026-08-01', '发送成功应重置日期为今天')
+      // v3.257：pend2 已含本次 summary，曾 acc 一次 + pend2 一次 → 双重计数（pushed=2）
+      assert(st.pushed === 1, `今日 pushed 应只计本次 summary 一次，实际: ${st.pushed}`)
+      assert(st.total === 1, `今日 total 应只计一次，实际: ${st.total}`)
     } finally {
       Config.report.enabled = orig
       try { require('fs').unlinkSync(statePath) } catch (e) { /* 忽略 */ }

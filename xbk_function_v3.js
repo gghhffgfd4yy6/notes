@@ -462,11 +462,28 @@ const Utils = {
     // 字符会将其解析为新属性名，故 `<img src="x"onerror="alert(1)">`（src 引号值与 onerror
     // 间无空格）也是合法事件属性；此前仅匹配空白或 / 会完全绕过清洗。
     // 完整删除事件属性（含空值形式）：测试锁定 `\bon[a-z]*\s*=` 不残留，故不能用清空值保留属性。
-      .replace(/(?:\s|\/|["'])(on[a-z][a-z0-9_-]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, (m, name) => {
-        // 保留属性名前的分隔符（空格/引号是 HTML 语法必需），删除整个 onxxx="值" 段
-        const sep = m[0][0] === '"' || m[0][0] === "'" ? m[0][0] : ' '
-        return sep
+    // v3.257 修正：原正则把引号值内形如 `href="onclick=x"` 的合法 URL/值（on 开头内容）误判为
+    // 事件属性并清空。修复：先把非事件属性对（attr="value"，含值内 onxxx= 字样）整体保护为
+    // 占位符，事件属性（on*）不保护，再清洗引号外的事件属性，最后还原——值内的 onxxx= 不再
+    // 暴露给清洗正则，无空格恶意形态（src="x"onerror=...）的闭合引号随保护占位符边界保留。
+    {
+      const attrStore = []
+      html = html.replace(/([a-zA-Z_:][\w:.-]*\s*=\s*)(["'])([\s\S]*?)\2/gi, (m, name) => {
+        // on* 事件属性不保护（留待下一步清洗）；其余属性对整体保护
+        if (/^on[a-z]/i.test(name.trim())) return m
+        attrStore.push(m)
+        return '\u0001' + (attrStore.length - 1) + '\u0001'
       })
+      html = html.replace(/(?:\s|\/|["'\u0001\u0002])(on[a-z][a-z0-9_-]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, (m, name) => {
+        // 保留属性名前的分隔符（空格/引号/占位符边界是 HTML 语法必需），删除整个 onxxx="值" 段
+        const c = m[0][0]
+        if (c === '\u0001' || c === '\u0002') return c
+        return c === '"' || c === "'" ? c : ' '
+      })
+      html = html.replace(/\u0001(\d+)\u0001/g, (_, i) => attrStore[Number(i)])
+      // 清理清洗后残留的孤立占位符边界（原无空格恶意形态的闭合引号被删除后遗留）
+      html = html.replace(/[\u0001\u0002]/g, '')
+    }
     html = html
     // 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）。
       .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2/gi,
@@ -2521,7 +2538,9 @@ const App = {
         fs.appendFileSync(logPath, line, 'utf8')
         const st = fs.statSync(logPath)
         const LIMIT = 1024 * 1024
-        if (st.size > LIMIT) {
+        // v3.257：截尾（读改写）仅在有锁时执行——锁失败/超时 fail-open 分支只追加，
+        // 与注释口径一致（无锁的读改写会在跨进程竞态下冲掉并发追加的行）。
+        if (lockFd >= 0 && st.size > LIMIT) {
           // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
           // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
           const KEEP = 512 * 1024
@@ -2717,16 +2736,20 @@ const App = {
           persistReportState(pendingState)
           Pusher.send(t, d)
             .then(() => {
-              // v3.176：昨日日报发送成功 → 重置为今日；取出 pending 与本次数据并入新的一天
+              // v3.176：昨日日报发送成功 → 重置为今日；取出 pending 并入新的一天。
+              // v3.257：pend2 已在发送前并入本次 summary（v3.254 同步持久化），
+              // 不再 acc(state) 重复累加——曾 acc 一次 + pend2（含 summary）一次，
+              // 导致发送成功后今日统计双重计数（summary 计两次）。
               const pend2 = pendingState.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-              state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-              acc(state)
-              state.total += pend2.total || 0
-              state.dedup += pend2.dedup || 0
-              state.filtered += pend2.filtered || 0
-              state.pushed += pend2.pushed || 0
-              state.failed += pend2.failed || 0
-              state.truncated += pend2.truncated || 0
+              state = {
+                date: today,
+                total: pend2.total || 0,
+                dedup: pend2.dedup || 0,
+                filtered: pend2.filtered || 0,
+                pushed: pend2.pushed || 0,
+                failed: pend2.failed || 0,
+                truncated: pend2.truncated || 0
+              }
               persistReportState(state)
               console.log('已发送昨日运行日报')
             })
