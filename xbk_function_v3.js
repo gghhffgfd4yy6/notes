@@ -2101,11 +2101,16 @@ const MessageStore = {
       let t = Date.now()
       if (this._nowLastTs === undefined) this._nowLastTs = 0
       if (this._nowInc === undefined) this._nowInc = 0
-      if (t < this._nowLastTs) t = this._nowLastTs
-      else if (t === this._nowLastTs) this._nowInc++
-      else this._nowInc = 0
-      this._nowLastTs = t
-      return new Date(t + this._nowInc).toISOString()
+      if (t > this._nowLastTs) {
+        // 系统时钟前进：以真实时间戳为准
+        this._nowLastTs = t
+        this._nowInc = 0
+      } else {
+        // 同毫秒或时钟回拨：在上一已返回值上严格 +1，保证全局严格单调
+        this._nowLastTs += 1
+        this._nowInc = 0
+      }
+      return new Date(this._nowLastTs).toISOString()
     }
     for (const message of newMessages) {
       // 元素级校验：非对象元素跳过（避免访问 message.id 崩溃）
