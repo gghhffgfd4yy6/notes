@@ -3886,8 +3886,10 @@ console.log('========================================\n');
   await test('validateConfig 校验 zkt_gjc（审查5-3）', () => {
     const warns = validateConfig({ zkt_gjc: '[' })
     assertEqual(warns.some(w => w.includes('zkt_gjc')), true)
-    // 空白/合法不警告
-    assertEqual(validateConfig({ zkt_gjc: ' ' }).length, 0)
+    // 纯空白 → 与 App.run 口径一致，显式告警（p12 修复空白口径漂移）
+    const blankWarns = validateConfig({ zkt_gjc: ' ' })
+    assertEqual(blankWarns.some(w => w.includes('zkt_gjc') && w.includes('空白')), true, '空白 zkt_gjc 应显式告警')
+    // 合法关键词不告警
     assertEqual(validateConfig({ zkt_gjc: '京东' }).length, 0)
   })
 
@@ -5492,12 +5494,14 @@ console.log('========================================\n');
     assertEqual(r3.includes('原文链接：[http://x.com/正常](http://x.com/正常)'), true, '无换行 url 不受影响')
   })
 
-  await test('#7: validateConfig maxSize 非正整数 → 警告；合法 → 不警告', () => {
-    assertEqual(validateConfig({ cache: { maxSize: -1 } }).some(w => w.includes('cache.maxSize')), true, '负数警告')
-    assertEqual(validateConfig({ maxSize: 0 }).some(w => w.includes('cache.maxSize')), true, '0 警告（平铺形态）')
-    assertEqual(validateConfig({ maxSize: 2.5 }).some(w => w.includes('cache.maxSize')), true, '小数警告')
-    assertEqual(validateConfig({ cache: { maxSize: 'abc' } }).some(w => w.includes('cache.maxSize')), true, '非数字警告')
-    assertEqual(validateConfig({ cache: { maxSize: 100 } }).length, 0, '正整数不警告')
+  await test('#7: cache.maxSize 校验统一在 App.run（validateConfig 只接收 Config.filter，不做双形态校验）', () => {
+    // v3.x：validateConfig 只被 RuleEngine.validateConfig(Config.filter) 调用，cfg 无 cache/maxSize 字段，
+    // 原双形态（cfg.cache.maxSize / cfg.maxSize）校验是恒不触发的死代码，已移除；maxSize 校验统一由 App.run 兜底。
+    assertEqual(validateConfig({ cache: { maxSize: -1 } }).some(w => w.includes('cache.maxSize')), false, '负数不再在此校验（App.run 兜底）')
+    assertEqual(validateConfig({ maxSize: 0 }).some(w => w.includes('cache.maxSize')), false, '平铺形态不再在此校验')
+    assertEqual(validateConfig({ maxSize: 2.5 }).some(w => w.includes('cache.maxSize')), false, '小数不再在此校验')
+    assertEqual(validateConfig({ cache: { maxSize: 'abc' } }).some(w => w.includes('cache.maxSize')), false, '非数字不再在此校验')
+    assertEqual(validateConfig({ cache: { maxSize: 100 } }).length, 0, '无 filter 字段时无任何警告')
   })
 
   await test('#链接: {链接} 占位符 Markdown 安全化（v3.74）', () => {

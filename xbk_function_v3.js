@@ -187,6 +187,9 @@ const DEFAULT_MAX_SIZE = 10000 // 缓存默认上限（v3.120：100 → 10000）
 // 状态/哈希文件体积上限：alert.state/report.state/filter.hash 均为数百字节级小文件，
 // 强制大小上限防止异常膨胀文件被整读入内存（readSafeTextResult 的 maxBytes 兜底）。
 const STATE_TEXT_MAX_BYTES = 64 * 1024
+// 消息缓存文件体积上限：缓存默认上限 10000 条，正常体积为 MB 级；此上限作为硬兜底，
+// 阻止异常膨胀的缓存文件被整读入内存（readSafeTextResult 的 maxBytes 兜底）。
+const MESSAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 // ---------- HTML 实体映射（避免每次调用重建） ----------
 const ENTITY_MAP = {
@@ -922,19 +925,25 @@ const Formatter = {
     const safeUrl = urlText
     // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）
     const mdUrl = safeUrl && /[\s()[\]]/.test(safeUrl) ? `<${safeUrl}>` : safeUrl
+    // 显示文本转义：urlText 原样插入 [] 会被 Markdown 特殊字符(] [ \\)破坏，转义后与 mdUrl 口径一致
+    const mdLinkText = urlText ? urlText.replace(/[[\]\\]/g, '\\$&') : urlText
     // 无标签内容短路：跳过整个替换链（性能优化）
     if (!html.includes('<')) {
       html = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(html))
-      return this._finalizeMd(mdUrl ? html + `\n\n原文链接：[${urlText}](${mdUrl})` : html)
+      return this._finalizeMd(mdUrl ? html + `\n\n原文链接：[${mdLinkText}](${mdUrl})` : html)
     }
     html = html
       .replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_, lv, c) => '#'.repeat(lv) + ' ' + c + '\n\n')
       .replace(/<a\s*[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
         const cleanHref = Utils.safeUrl(href)
+        // P10：先解码实体并剥离 txt 内嵌套 <a>/</a>（HTML 禁止嵌套 a，接口脏数据可能出现），
+        // 避免 [[内层](url)](外层url) 或未解码实体原文破坏外层链接结构。
+        txt = Utils.decodeHtmlEntities(txt).replace(/<a\b[^>]*>/gi, '').replace(/<\/a\b\s*>/gi, '')
         return cleanHref ? `[${txt}](${cleanHref})` : txt
       })
       .replace(/<a\s+[^>]*?href\s*=\s*([^\s"'>]+)[^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
         const cleanHref = Utils.safeUrl(href)
+        txt = Utils.decodeHtmlEntities(txt).replace(/<a\b[^>]*>/gi, '').replace(/<\/a\b\s*>/gi, '')
         return cleanHref ? `[${txt}](${cleanHref})` : txt
       })
       .replace(/<img\b[^>]*>/gi, (tag) => {
@@ -973,7 +982,7 @@ const Formatter = {
       .replace(/\n{3,}/g, '\n\n')
     // 先移除真实 HTML 标签，再解码实体；实体解码可能重新形成标签，需再次清理主动内容/危险属性。
     html = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(html))
-    const result = html + (mdUrl ? `\n\n原文链接：[${urlText}](${mdUrl})` : '')
+    const result = html + (mdUrl ? `\n\n原文链接：[${mdLinkText}](${mdUrl})` : '')
     // 模板拼接后再次合并连续换行（内容尾部 \n\n + 模板 \n\n 会拼出 3+ 连换行）
     return this._finalizeMd(result)
   },
@@ -1102,7 +1111,9 @@ const RuleEngine = {
       const ch = s[i]
       if (ch === '+' || ch === '*') return 1
       if (ch === '{') {
-        const m = /^\{(\d+)(?:,(\d*))?\}/.exec(s.slice(i))
+        const mre = /\{(\d+)(?:,(\d*))?\}/y
+        mre.lastIndex = i
+        const m = mre.exec(s)
         if (m && m[2] === '') return m[0].length // {n,} 无上限=无限；{n}/{n,m} 有界
       }
       return 0
@@ -1150,7 +1161,9 @@ const RuleEngine = {
         // 注意：小次数有界量词（{1,3}/{2,3} 等）测试锁定安全（V8 对小重复有优化），
         // 仅拦截大次数（≥100，如 {500}）——既防灾难性回溯又不误伤正常配置。
         if (closed.alt || closed.inf) {
-          const bqm = /^\{\d+(?:,\d*)?\}/.exec(s.slice(i + 1))
+          const bqmr = /\{\d+(?:,\d*)?\}/y
+          bqmr.lastIndex = i + 1
+          const bqm = bqmr.exec(s)
           if (bqm) {
             const [lo, hi] = bqm[0].slice(1, -1).split(',').map(x => x === '' ? Infinity : Number(x))
             if (lo >= 100 || (hi !== undefined && hi >= 100)) return true
@@ -1228,6 +1241,10 @@ const RuleEngine = {
         const rules = []
         for (const line of lines) {
           const { cat, val, parts } = this._parseLine(line)
+          if (parts.length > 2) {
+            // v3.239 口径统一：与 validateConfig 一致，行内多余 ### 仅前两段生效时告警
+            console.warn(`⚠️ 配置「${String(field)}」行包含多个 ###，仅前两段生效：「${String(line)}」`)
+          }
           if (parts.length >= 2) {
             if (!val) continue // 值正则为空 → 跳过（避免永真规则）
             let catRe = null
@@ -1265,9 +1282,8 @@ const RuleEngine = {
     let pbRaw = ''
     try { pbRaw = rawCfg.pingbitime === undefined || rawCfg.pingbitime === null ? '' : String(rawCfg.pingbitime).trim() } catch (e) { pbRaw = '' } // 脏配置无法转字符串时忽略规则，不让启动崩溃
     if (pbRaw) {
-      rawCfg.pingbitime = pbRaw
-      if (/###/.test(rawCfg.pingbitime)) {
-        const lines = this._splitLines(rawCfg.pingbitime)
+      if (/###/.test(pbRaw)) {
+        const lines = this._splitLines(pbRaw)
         const rules = []
         for (const line of lines) {
           const { cat, val, parts } = this._parseLine(line)
@@ -1278,13 +1294,13 @@ const RuleEngine = {
               catRe = this._compileCatRe(cat)
               if (!catRe) continue
             }
-            const value = Number(val)
+            const value = Math.floor(Number(val))
             if (Number.isFinite(value) && value >= 0) rules.push({ cat: catRe, value })
           }
         }
         compiled.pingbitime = { _type: 'timeMulti', rules }
       } else {
-        const value = Number(rawCfg.pingbitime)
+        const value = Math.floor(Number(pbRaw))
         // v3.157：非法数值(如 'abc')→ null 不编译（曾落 value:0 静默关闭时间过滤；空白已 v3.156 处理）
         compiled.pingbitime = (Number.isFinite(value) && value >= 0) ? { _type: 'time', value } : null
       }
@@ -1388,6 +1404,8 @@ const RuleEngine = {
     for (const field of FILTER_FIELDS) {
       const val = safeStr(cfg[field])
       if (!val) continue
+      // pingbifenlei 不支持 ### 多行语法，已在上面给出明确警告，跳过以避免逐行告警（与 compileRules 口径一致）
+      if (field === 'pingbifenlei' && /###/.test(val)) continue
       // 多行模式：逐行验证
       if (/###/.test(val)) {
         const lines = val.split(/<br\s*\/?>|\r\n|\r|\n/) // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
@@ -1433,6 +1451,9 @@ const RuleEngine = {
     // R11-1：非字符串（对象/数字等脏配置）→ 显式警告（String 化会把 '[object Object]' 当合法正则，静默怪行为）
     if (cfg.zkt_gjc !== undefined && cfg.zkt_gjc !== null && typeof cfg.zkt_gjc !== 'string') {
       warnings.push(`⚠️ 配置「zkt_gjc」应为字符串，当前为 ${typeof cfg.zkt_gjc}，已忽略只看它过滤`)
+    } else if (cfg.zkt_gjc && String(cfg.zkt_gjc).trim() === '') {
+      // 与 App.run 口径一致：纯空白关键词为误配置，显式告警并忽略只看它过滤
+      warnings.push('⚠️ 配置「zkt_gjc」为空白字符，已忽略只看它过滤')
     } else if (cfg.zkt_gjc && String(cfg.zkt_gjc).trim() !== '') {
       if (this.hasNestedQuantifier(cfg.zkt_gjc)) {
         warnings.push('⚠️ 配置「zkt_gjc」的正则含嵌套量词，可能导致灾难性回溯，已忽略只看它过滤')
@@ -1474,14 +1495,8 @@ const RuleEngine = {
         }
       }
     }
-    // 校验 cache.maxSize（#7）：MessageStore 函数层已回退默认，配置层补提示。
-    // 兼容传入完整 Config（cfg.cache.maxSize）或平铺（cfg.maxSize）两种形态
-    // v3.175：字符串 maxSize（'10000' 环境变量）曾误报——用 Utils.num 口径
-    const maxSizeVal = cfg.cache ? cfg.cache.maxSize : cfg.maxSize
-    const msNum = Utils.num(maxSizeVal, -1)
-    if (maxSizeVal !== undefined && (!Number.isInteger(msNum) || msNum <= 0)) {
-      warnings.push(`⚠️ 配置「cache.maxSize」为「${safeStr(maxSizeVal)}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`)
-    }
+    // cache.maxSize 校验统一由 App.run（Config.cache.maxSize）负责；validateConfig 只接收 Config.filter，无此字段，
+    // 此处不做双形态（cfg.cache.maxSize / cfg.maxSize）校验，避免死代码与口径矛盾。
     return [...new Set(warnings)]
   }
 }
@@ -1929,15 +1944,16 @@ const MessageStore = {
       return this._memoryCache[filePath]
     }
     this._ensureFileExists(filePath)
-    const result = readSafeTextResult(filePath)
+    const result = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES)
     if (result.status !== 'ok') {
       const detail = result.error && result.error.message ? result.error.message : result.status
       if (result.status === 'unsafe') console.error(`拒绝读取非普通缓存文件 ${filePath}`)
       else if (result.status === 'ioError') console.error(`缓存读取失败 ${filePath}:`, detail)
-      // missing/ioError/unsafe 都不能缓存空数组；后续恢复后仍应重新读取磁盘。
-      // ioError/unsafe 读取失败时记录失败标记：返回 [] 供判重/调用方降级，但绝不允许
+      else if (result.status === 'tooLarge') console.error(`缓存文件过大，拒绝整读入内存 ${filePath}:`, detail)
+      // missing/ioError/unsafe/tooLarge 都不能缓存空数组；后续恢复后仍应重新读取磁盘。
+      // ioError/unsafe/tooLarge 读取失败时记录失败标记：返回 [] 供判重/调用方降级，但绝不允许
       // 后续 save 据此全量覆写磁盘（会把未读到的存量数据覆盖丢失）。
-      if (result.status === 'ioError' || result.status === 'unsafe') {
+      if (result.status === 'ioError' || result.status === 'unsafe' || result.status === 'tooLarge') {
         try { this._readFailed[filePath] = true } catch (e) { /* 忽略 */ }
       }
       return []
