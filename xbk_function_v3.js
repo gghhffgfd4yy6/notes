@@ -239,11 +239,14 @@ const DEC_RE = /&#(\d+);/g
 const HEX_RE = /&#[xX]([0-9a-fA-F]+);/g
 
 // 键序无关规范化：递归排序对象键，避免 JSON.stringify 比较对键顺序敏感（数组顺序保留）
-function normalize (o) {
-  if (Array.isArray(o)) return o.map(normalize)
+const NORMALIZE_MAX_DEPTH = 32
+function normalize (o, depth = 0) {
+  if (depth > NORMALIZE_MAX_DEPTH) return o
+  if (Array.isArray(o)) return o.map(x => normalize(x, depth + 1))
+  if (o instanceof Date || o instanceof RegExp) return o
   if (o && typeof o === 'object') {
     const out = {}
-    for (const k of Object.keys(o).sort()) Object.defineProperty(out, k, { value: normalize(o[k]), enumerable: true, writable: true, configurable: true })
+    for (const k of Object.keys(o).sort()) Object.defineProperty(out, k, { value: normalize(o[k], depth + 1), enumerable: true, writable: true, configurable: true })
     return out
   }
   return o
@@ -665,8 +668,16 @@ const Utils = {
     if (Array.isArray(a) !== Array.isArray(b)) return false
     const keysA = []
     const keysB = []
-    for (const k of Object.keys(a)) if (k !== 'timestamp') keysA.push(k)
-    for (const k of Object.keys(b)) if (k !== 'timestamp') keysB.push(k)
+    try {
+      for (const k of Object.keys(a)) if (k !== 'timestamp') keysA.push(k)
+    } catch (e) {
+      return false
+    }
+    try {
+      for (const k of Object.keys(b)) if (k !== 'timestamp') keysB.push(k)
+    } catch (e) {
+      return false
+    }
     if (keysA.length !== keysB.length) return false
     for (let i = 0; i < keysA.length; i++) {
       const k = keysA[i]
@@ -681,6 +692,8 @@ const Utils = {
       }
       // 对象/数组 → 引用不同不代表内容不同，交由慢路径判定
       if ((typeof va === 'object' && va !== null) || (typeof vb === 'object' && vb !== null)) return false
+      // BigInt：深排 JSON.stringify 无法序列化会抛错→按"已变更"处理，浅排不短路保持口径一致
+      if (typeof va === 'bigint' || typeof vb === 'bigint') return false
       if (va !== vb) return false
     }
     return true
@@ -1224,6 +1237,12 @@ const RuleEngine = {
         compiled[field] = null
         continue
       }
+      if (typeof val === 'number' || typeof val === 'object') {
+        // 数字/对象等非字符串值 String 化后会变成误导性字面量正则（如 0 → /0/i），直接跳过
+        console.warn(`⚠️ 规则「${String(field)}」的值必须为字符串（当前为 ${typeof val}），已跳过`)
+        compiled[field] = null
+        continue
+      }
       try { val = String(val) } catch (e) { compiled[field] = null; continue }
       if (!val) {
         compiled[field] = null
@@ -1279,6 +1298,9 @@ const RuleEngine = {
 
     // 编译 pingbitime（特殊处理）
     // v3.156：先 trim——空白('   ')曾 Number→0 静默关闭时间过滤
+    // v3.x：pingbitime 天数加上限 PINGBITIME_MAX_DAYS（3650000 天≈10000 年），
+    // 超过视为无效（置 null 不编译）——巨大值(如 1e20)会让注册年龄永远达不到上限，等效永久拦截新账号。
+    const PINGBITIME_MAX_DAYS = 3650000
     let pbRaw = ''
     try { pbRaw = rawCfg.pingbitime === undefined || rawCfg.pingbitime === null ? '' : String(rawCfg.pingbitime).trim() } catch (e) { pbRaw = '' } // 脏配置无法转字符串时忽略规则，不让启动崩溃
     if (pbRaw) {
@@ -1295,14 +1317,26 @@ const RuleEngine = {
               if (!catRe) continue
             }
             const value = Math.floor(Number(val))
-            if (Number.isFinite(value) && value >= 0) rules.push({ cat: catRe, value })
+            if (Number.isFinite(value) && value >= 0 && value <= PINGBITIME_MAX_DAYS) {
+              rules.push({ cat: catRe, value })
+            } else if (Number.isFinite(value) && value >= 0 && value > PINGBITIME_MAX_DAYS) {
+              console.warn(`⚠️ 配置「pingbitime」的天数值「${(parts[1] || '').trim()}」超过上限 ${PINGBITIME_MAX_DAYS} 天，已忽略`)
+            }
           }
         }
         compiled.pingbitime = { _type: 'timeMulti', rules }
       } else {
         const value = Math.floor(Number(pbRaw))
         // v3.157：非法数值(如 'abc')→ null 不编译（曾落 value:0 静默关闭时间过滤；空白已 v3.156 处理）
-        compiled.pingbitime = (Number.isFinite(value) && value >= 0) ? { _type: 'time', value } : null
+        // v3.x：数值超过 PINGBITIME_MAX_DAYS 上限同样置 null 不编译（同下界处理）
+        if (Number.isFinite(value) && value >= 0 && value <= PINGBITIME_MAX_DAYS) {
+          compiled.pingbitime = { _type: 'time', value }
+        } else {
+          if (Number.isFinite(value) && value >= 0 && value > PINGBITIME_MAX_DAYS) {
+            console.warn(`⚠️ 配置「pingbitime」的值「${pbRaw}」超过上限 ${PINGBITIME_MAX_DAYS} 天，已忽略`)
+          }
+          compiled.pingbitime = null
+        }
       }
     } else {
       compiled.pingbitime = null
@@ -1319,7 +1353,11 @@ const RuleEngine = {
   _RE_INPUT_MAX: 4096,
   /** 截断超长输入到 _RE_INPUT_MAX（避免 .test() 对超长串灾难性回溯） */
   _capReInput (s) {
-    return s.length > this._RE_INPUT_MAX ? s.slice(0, this._RE_INPUT_MAX) : s
+    if (s.length <= this._RE_INPUT_MAX) return s
+    let cut = s.slice(0, this._RE_INPUT_MAX)
+    const last = cut.charCodeAt(cut.length - 1)
+    if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1) // 结尾孤立高代理（低代理被切掉）→ 退一位
+    return cut
   },
 
   /** 多行规则分类匹配：无 cat 限制(匹配所有)或有 cat 且 catename 匹配 */
@@ -1402,6 +1440,11 @@ const RuleEngine = {
     }
 
     for (const field of FILTER_FIELDS) {
+      // 非字符串（对象/数组/数字等脏配置）→ 显式警告（String 化会把 '[object Object]' 当合法正则，静默怪行为），与 zkt_gjc 口径一致
+      if (cfg[field] !== undefined && cfg[field] !== null && typeof cfg[field] !== 'string') {
+        warnings.push(`⚠️ 配置「${field}」应为字符串，当前为 ${typeof cfg[field]}，已忽略该字段过滤`)
+        continue
+      }
       const val = safeStr(cfg[field])
       if (!val) continue
       // pingbifenlei 不支持 ### 多行语法，已在上面给出明确警告，跳过以避免逐行告警（与 compileRules 口径一致）
@@ -1483,6 +1526,8 @@ const RuleEngine = {
             if (!Number.isFinite(tNum) || tNum < 0) {
               warnings.push(`⚠️ 配置「pingbitime」的天数值「${(parts[1] || '').trim()}」不是有效数字（需 ≥0 的有限数）`)
             }
+          } else if (String(line).trim() !== '') {
+            warnings.push(`⚠️ 配置「pingbitime」的行「${String(line).trim()}」缺少「###」分类/数值分隔符，已忽略该行`)
           }
         }
       } else {
@@ -1497,7 +1542,7 @@ const RuleEngine = {
     }
     // cache.maxSize 校验统一由 App.run（Config.cache.maxSize）负责；validateConfig 只接收 Config.filter，无此字段，
     // 此处不做双形态（cfg.cache.maxSize / cfg.maxSize）校验，避免死代码与口径矛盾。
-    return [...new Set(warnings)]
+    return warnings
   }
 }
 
@@ -1525,12 +1570,12 @@ const FilterEngine = {
     for (const f of FILTER_FIELDS) {
       let v
       try { v = rawCfg && rawCfg[f] } catch (e) { v = undefined }
-      parts.push(f + '=' + safeStr(v))
+      parts.push([f, safeStr(v)])
     }
     let pb
     try { pb = safeStr(rawCfg && rawCfg.pingbitime) } catch (e) { pb = '' }
-    parts.push('pingbitime=' + pb)
-    return parts.join('\u0001')
+    parts.push(['pingbitime', pb])
+    return JSON.stringify(parts)
   },
   /** 缺字段保守放行统一：compiled/group 缺失或字段缺失 → true；否则取反执行检查 */
   _passIfMissing (group, field, compiled, checkFn) {
@@ -1749,6 +1794,9 @@ const MessageStore = {
   // 磁盘读取失败标记（按缓存文件路径记录）：ioError/unsafe 读取失败时置位，
   // 供 save 等写入口保守处理——不基于“未读到的空数组”全量覆写磁盘，避免覆盖丢失存量。
   _readFailed: {},
+  // 磁盘已验证标记（按缓存文件路径记录）：内存命中时是否已对该文件做过一次 existsSync+恢复检查。
+  // 消除热路径上每次内存命中都同步 stat 的磁盘 IO；saveMessages 直写后清除，使下次命中重新检查。
+  _verified: new Set(),
 
   /** 带上限的内存缓存写入：超限时淘汰最旧键（磁盘不受影响），防理论无限增长；返回是否写入成功 */
   _memoSet (filePath, val) {
@@ -1867,7 +1915,7 @@ const MessageStore = {
     try { fnStr = String(filename || '') } catch (e) { fnStr = '' }
     // v3.248：NUL（\u0000）不在非法字符正则内，会被保留进路径导致 fs 抛
     // ERR_INVALID_ARG_VALUE——一并清洗，避免 getFilePath 产物触发 fs 报错。
-    let safe = path.basename(fnStr).replace(/[\\/:*?"<>|\u0000]/g, '')
+    let safe = path.basename(fnStr).replace(/[\\/:*?"<>|\x00-\x1F]/g, '')
     // v3.176：非信息文件名（对象/布尔 String 化产物）回退 default.json——与 getFileName 口径一致
     // （曾产生 xianbaoku_cache/[object Object] 垃圾文件：test_filter 参数颠倒 + 此处无防御）
     if (!safe || safe === '.' || safe === '..' || safe === '[object Object]' || safe === 'undefined' || safe === 'null' || safe === 'true' || safe === 'false') safe = 'default.json'
@@ -1928,16 +1976,23 @@ const MessageStore = {
     if (Object.prototype.hasOwnProperty.call(this._memoryCache, filePath)) {
       // 常驻进程保护：外部误删缓存文件时，内存中的权威快照继续用于判重，
       // 并尝试原子恢复磁盘文件；恢复失败时保留旧快照，不写入空数组。
-      let exists = true
-      try { exists = fs.existsSync(filePath) } catch (e) { exists = true }
-      if (!exists) {
-        // v3.236：恢复写入抛错（磁盘满/权限）时同样降级保留内存快照，不向外传播破坏判重流程
-        try {
-          const restored = this.saveMessages(filePath, this._memoryCache[filePath])
-          if (!restored) console.warn(`缓存文件缺失且恢复失败，继续使用内存缓存：${filePath}`)
-        } catch (e) {
-          console.warn(`缓存文件缺失且恢复异常，继续使用内存缓存：${filePath} (${String((e && e.message) || e)})`)
+      // v3.x：按文件记录“已验证”标记——仅首次内存命中未验证时做一次 existsSync+恢复检查，
+      // 后续命中直接返回内存快照，不再同步 stat 磁盘，消除热路径退化磁盘 IO。
+      if (!this._verified.has(filePath)) {
+        let exists = true
+        try { exists = fs.existsSync(filePath) } catch (e) { exists = true }
+        if (!exists) {
+          // v3.236：恢复写入抛错（磁盘满/权限）时同样降级保留内存快照，不向外传播破坏判重流程
+          try {
+            const restored = this.saveMessages(filePath, this._memoryCache[filePath])
+            if (!restored) console.warn(`缓存文件缺失且恢复失败，继续使用内存缓存：${filePath}`)
+          } catch (e) {
+            console.warn(`缓存文件缺失且恢复异常，继续使用内存缓存：${filePath} (${String((e && e.message) || e)})`)
+          }
         }
+        // 无论磁盘存在还是已恢复，都视为已验证，后续命中直接返回内存。
+        // 注意恢复调用的 saveMessages 会清除本标记，故在此重新置位。
+        try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
       }
       // 内存快照为权威读取：清除该文件的读取失败标记（后续 save 可安全基于快照落盘）
       try { delete this._readFailed[filePath] } catch (e) { /* 忽略 */ }
@@ -1976,6 +2031,8 @@ const MessageStore = {
       // 成功读取 → 清除该文件读取失败标记
       try { delete this._readFailed[filePath] } catch (e) { /* 忽略 */ }
       this._memoSet(filePath, clean)
+      // 磁盘读取成功并记忆化：直接标记已验证，避免下次内存命中再白做一次 stat。
+      try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
       return clean
     }
     // 合法 JSON 但非数组（对象等）→ 不再重置：保留原文件并标记读取失败，
@@ -2025,6 +2082,9 @@ const MessageStore = {
       return false
     }
     this._memoSet(filePath, toSave)
+    // v3.x：磁盘刚被直写，外部删除可能在后续发生；清除“已验证”标记，
+    // 使下次 readMessages 内存命中重新做一次 existsSync+恢复检查（保持外部删除恢复测试语义）。
+    try { this._verified.delete(filePath) } catch (e) { /* 忽略 */ }
     return true
   },
 
@@ -2143,7 +2203,13 @@ const MessageStore = {
     const removeIdentityIndexes = (message, i) => {
       const identity = Utils.getMessageIdentity(message)
       if (!identity.valid) return
-      const del = (map, key) => { const s = map.get(key); if (s) s.delete(i) }
+      const del = (map, key) => {
+        const s = map.get(key)
+        if (s) {
+          s.delete(i)
+          if (s.size === 0) map.delete(key)
+        }
+      }
       del(identityMap, identity.key)
       if (identity.kind === 'id') del(idMap, identity.idKey)
       if (identity.url) del(urlMap, identity.url)
@@ -2218,7 +2284,12 @@ const MessageStore = {
         }
       }
     }
-    this.saveMessages(filePath, messages)
+    // v3.x q9：捕获落盘结果——saveMessages 在序列化/写入失败时返回 false，
+    // 忽略返回值会让落盘失败被静默吞掉，仅保留内存快照。
+    const saved = this.saveMessages(filePath, messages)
+    if (!saved) {
+      console.warn('缓存落盘失败，仅保留内存快照 ' + filePath)
+    }
   },
 
   getFileName (url) {
@@ -2525,6 +2596,8 @@ const App = {
         console.error(`告警限频状态读取失败(${stateResult.status})，跳过本次告警以免限频被重置导致重复推送 ${statePath}`)
         return
       }
+      // v3.251：校验 lastAt——NaN/Infinity 或未来时间戳会令限频失效或告警永久静默，视为 0 以恢复正常限频
+      lastAt = Number.isFinite(lastAt) && lastAt <= Date.now() ? lastAt : 0
       const intervalMs = Utils.num(Config.alert.intervalMs, 3600000) // v3.167: 非法字符串'abc'曾>0比较false→0不限频轰炸（其他数值配置均num回退）
       const interval = intervalMs > 0 ? intervalMs : 0 // <=0(含-1) = 不限频（每次异常都发）
       if (interval > 0 && Date.now() - lastAt < interval) return // 限频：间隔内不重复轰炸
@@ -2556,7 +2629,7 @@ const App = {
     try {
       // v3.173/174：!enabled（数字0/空串）或 'false'/'0' 字符串均关闭（'0' 字符串是 truthy，曾漏）
       const en = Config.report && Config.report.enabled
-      if (!Config.report || !en || en === 'false' || en === '0') return
+      if (!Config.report || !en || String(en).trim().toLowerCase() === 'false' || String(en).trim().toLowerCase() === '0') return
       const statePath = path.join(MessageStore.cacheDir, 'report.state')
       const blankState = () => ({ date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 })
       const safeCounter = (v) => {
@@ -2625,7 +2698,7 @@ const App = {
         if (state.total > 0 || state.failed > 0) {
           const t = `📊 xbk-push 日报（${state.date}）`
           // v3.159：段落分隔 \n\n（与主推送口径一致）——wxpusher Markdown 渲染单个 \n 可能挤成一行
-          const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}${state.truncated ? ` | 截断 ${state.truncated}` : ''}`
+          const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}${state.truncated ? ` | 待推送 ${state.truncated}` : ''}`
           // v3.156：发送成功才重置日期——曾先写 state.date（日报失败也跨天，昨日日报丢失）
           // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗）
           // v3.254 P1：发送前先把「今日累计」并入 pending 并同步落盘（见下方持久化）——
