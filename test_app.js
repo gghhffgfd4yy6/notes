@@ -1847,13 +1847,17 @@ console.log('========================================\n');
 
   await test('日报发送成功 → 今日累计不重复计数（v3.257 修复 089）', async () => {
     reset()
+    const originalCacheDir = Config.cache.dir
+    Config.cache.dir = DEFAULT_CACHE_DIR + '_report_nodup_isolated'
     setPushUrl('t62_report_nodup')
     fakeData = [makeItem({ id: 1 })]
     const orig = Config.report.enabled
     Config.report.enabled = true
-    const statePath = path.join(CACHE_DIR, 'report.state')
+    const stateDir = path.join(__dirname, Config.cache.dir)
+    const statePath = path.join(stateDir, 'report.state')
     try {
       // 写昨天状态（有数据）→ 今天首次 run 发昨日日报
+      require('fs').mkdirSync(stateDir, { recursive: true })
       require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, dedup: 1, filtered: 1, pushed: 3, failed: 0 }))
       await xbk.run()
       assert(pushCalls.some(c => c.text.includes('日报')), '跨天应发昨日日报')
@@ -1866,6 +1870,7 @@ console.log('========================================\n');
       assert(st.total === 1, `今日 total 应只计一次，实际: ${st.total}`)
     } finally {
       Config.report.enabled = orig
+      Config.cache.dir = originalCacheDir
       try { require('fs').unlinkSync(statePath) } catch (e) { /* 忽略 */ }
     }
   })

@@ -974,3 +974,20 @@
 - **readMessages 恢复写入未捕获异常**（P3）：缓存文件被外部误删时，恢复写入 `saveMessages` 抛错（磁盘满/权限）会异常传播出 readMessages → 判重流程崩溃。正常流程不触发（仅"外部删文件 + 写入失败"叠加）。
 - 修复：恢复写入包 try-catch，抛错时同样降级保留内存快照（与 `!restored` 路径一致）。
 - 发现途径：Qodo Merge（PR-Agent）AI 审查 b22f7d6 提交（reasoning_effort=none，17.9s 完成）。
+
+## v3.257（124-agent 子代理审查修复，2026-08-12）
+
+- 对 V3 审查工作簿（v3.245→v3.256，124 修复点）派出 124 个 Codex CLI 子代理逐一审查（一个子代理一个修复点）。发现：15 个工作簿数据错误（版本/提交归属失实，5 项声称的修复在当前代码中不存在）、2 项误报、9 项真实代码问题。
+- **人工修复（P1/P2，提交 ee740f4）**：
+  - **_updateReport 日报双重计数**（P1）：昨日日报发送成功后，`acc(state)` 与 `pend2`（已含本次 summary）各计一次 → 今日统计 ×2。修复：成功回调直接取 pend2，删除重复累加。回归测试 t62。
+  - **sanitizeDecodedHtml 误伤合法 URL**（P2）：事件属性清洗正则把引号值内 `href="onclick=x"` 误判为事件属性清空。修复：先保护非 on* 属性对（attr="value"），再清洗引号外事件属性，最后还原——无空格 XSS 形态（`<img src="x"onerror="alert(1)">`）仍清除，合法 on 开头值保留。回归测试 4 用例。
+  - **writeRunLog fail-open 与注释不符**（P2）：锁失败/超时分支仍执行读改写截尾（跨进程竞态丢日志）。修复：截尾仅在有锁时执行（`lockFd >= 0`）。回归测试 t63。
+- **子代理修复（P3，6 项）**：
+  - **truncateUtf16 旗帜 emoji 误删**：区域指示符（U+1F1E6–1F1FF）移出修饰符判定（`A🇨🇳,2` 不再变空），肤色/VS 补充仍保护。
+  - **whitelistFilter 空串被通配正则命中**：空串并入"字段缺失"判定（`. *`/`^$` 不再命中空字段），0/false 仍参与匹配。
+  - **htmlToMarkdown nested-a 误删字面文本**：先剥真实嵌套 `<a>` 再统一解码实体（`&lt;a&gt;` 字面保留）。
+  - **validateConfig 警告去重**：恢复 `[...new Set(warnings)]`（与声称的 dedup keep 一致）。
+  - **readMessages 恢复失败不固化已验证**：磁盘恢复失败时不标记 `_verified`，保留重试窗口。
+  - **compileRules 类型守卫补 boolean/bigint**：与 validateConfig 字符串守卫口径对齐（`true → /true/i` 误导性正则被拒）。
+- 修复后派出 9 个验证子代理复核 9 项修复（6 P3 + 3 P1/P2）：8 项无异议；1 项（t62 测试）发现全量串行下因内存状态缓存共享导致失败 → 改为独立 cacheDir 隔离修复。
+- 测试：单元 701/701、集成 119/119（并行+串行）、通道全绿。

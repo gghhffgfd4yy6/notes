@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.236 — 缓存恢复写入异常降级修复 ********
+//* ******* 线报酷推送脚本 v3.257 — 124-agent 子代理审查修复 ********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -873,19 +873,21 @@ const Utils = {
     if (s.length <= max) return s
     let cut = s.slice(0, max)
     // 修饰符判定：作用于前一字符的 Unicode 修饰符（ZWJ/变体选择符/组合音标/组合符号）；
-    // v3.185：补充平面修饰符（肤色 U+1F3FB–1F3FF / VS 补充 U+E0100–E01EF / 区域指示符 U+1F1E6–1F1FF）
-    // 也纳入判定（用 codePointAt 读取码点，避免截断拆散 👍🏽 等补充平面 emoji）
+    // v3.185：补充平面修饰符（肤色 U+1F3FB–1F3FF / VS 补充 U+E0100–E01EF）也纳入判定
+    // （用 codePointAt 读取码点，避免截断拆散 👍🏽 等补充平面 emoji）
+    // 注意：区域指示符 U+1F1E6–1F1FF 不纳入修饰符判定——旗帜由两个区域指示符组成，
+    // 每个区域指示符是独立码点；作为"前一字符的修饰符"退位会误删其前面的正常字符（A🇨🇳→空）。
     const isModifier = (c) => c === 0x200D || (c >= 0xFE00 && c <= 0xFE0F) ||
             (c >= 0x0300 && c <= 0x036F) || (c >= 0x1AB0 && c <= 0x1AFF) || (c >= 0x1DC0 && c <= 0x1DFF) ||
             (c >= 0x20D0 && c <= 0x20FF) || (c >= 0xFE20 && c <= 0xFE2F) ||
-            (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0100 && c <= 0xE01EF) || (c >= 0x1F1E6 && c <= 0x1F1FF)
+            (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0100 && c <= 0xE01EF)
     // 补充平面修饰符专用判定：紧随补充平面基符的修饰符（不含 ZWJ，避免拆散 👨👩👧👦 首个完整 emoji）
     const isSupplementaryModifier = (c) =>
-            (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0100 && c <= 0xE01EF) || (c >= 0x1F1E6 && c <= 0x1F1FF)
+            (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0100 && c <= 0xE01EF)
     while (cut.length > 0) {
       const last = cut.charCodeAt(cut.length - 1)
       // 代理对：完整低代理对保留；高代理/孤立低代理退位；
-      // 完整对后若是补充平面修饰符则退位（不拆散基底代理对，如 👍🏽 / 🇨🇳）
+      // 完整对后若是补充平面修饰符则退位（不拆散基底代理对，如 👍🏽）
       if (last >= SURROGATE_LO && last <= SURROGATE_HI) {
         if (last >= 0xDC00) {
           const prev = cut.charCodeAt(cut.length - 2)
@@ -966,14 +968,14 @@ const Formatter = {
       .replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_, lv, c) => '#'.repeat(lv) + ' ' + c + '\n\n')
       .replace(/<a\s*[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
         const cleanHref = Utils.safeUrl(href)
-        // P10：先解码实体并剥离 txt 内嵌套 <a>/</a>（HTML 禁止嵌套 a，接口脏数据可能出现），
-        // 避免 [[内层](url)](外层url) 或未解码实体原文破坏外层链接结构。
-        txt = Utils.decodeHtmlEntities(txt).replace(/<a\b[^>]*>/gi, '').replace(/<\/a\b\s*>/gi, '')
+        // P10：先剥离真实嵌套 <a>/</a>（HTML 禁止嵌套 a，接口脏数据可能出现），
+        // 实体编码的 &lt;a&gt; 是字面文本，留到通用标签剥离后统一解码，避免被误剥。
+        txt = txt.replace(/<a\b[^>]*>/gi, '').replace(/<\/a\b\s*>/gi, '')
         return cleanHref ? `[${txt}](${cleanHref})` : txt
       })
       .replace(/<a\s+[^>]*?href\s*=\s*([^\s"'>]+)[^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
         const cleanHref = Utils.safeUrl(href)
-        txt = Utils.decodeHtmlEntities(txt).replace(/<a\b[^>]*>/gi, '').replace(/<\/a\b\s*>/gi, '')
+        txt = txt.replace(/<a\b[^>]*>/gi, '').replace(/<\/a\b\s*>/gi, '')
         return cleanHref ? `[${txt}](${cleanHref})` : txt
       })
       .replace(/<img\b[^>]*>/gi, (tag) => {
@@ -1254,8 +1256,9 @@ const RuleEngine = {
         compiled[field] = null
         continue
       }
-      if (typeof val === 'number' || typeof val === 'object') {
-        // 数字/对象等非字符串值 String 化后会变成误导性字面量正则（如 0 → /0/i），直接跳过
+      if (typeof val === 'number' || typeof val === 'object' || typeof val === 'boolean' || typeof val === 'bigint') {
+        // v3.257：与 validateConfig 的字符串守卫口径对齐（非字符串一律拒绝），
+        // 数字/对象/布尔/BigInt 等非字符串值 String 化后会变成误导性字面量正则（如 0 → /0/i、true → /true/i），直接跳过
         console.warn(`⚠️ 规则「${String(field)}」的值必须为字符串（当前为 ${typeof val}），已跳过`)
         compiled[field] = null
         continue
@@ -1559,7 +1562,8 @@ const RuleEngine = {
     }
     // cache.maxSize 校验统一由 App.run（Config.cache.maxSize）负责；validateConfig 只接收 Config.filter，无此字段，
     // 此处不做双形态（cfg.cache.maxSize / cfg.maxSize）校验，避免死代码与口径矛盾。
-    return warnings
+    // v3.257：恢复去重，与清单声称的 "dedup keep" 一致；同一配置缺陷只警告一次。
+    return [...new Set(warnings)]
   }
 }
 
@@ -1734,10 +1738,10 @@ const FilterEngine = {
     if (kwStr.trim() === '') return true
     if (!item) return false // 防御：item 缺失 = 不匹配
     const value = Utils.safeGet(item, field)
-    // 仅 undefined/null 视为「字段缺失」→ 不匹配；0/空串/false 等已定义值作为有效内容参与匹配，
-    // 修复 0 被 if(!value) 短路误判不匹配（0 应可被关键词 '0' 命中）；空串对非空关键词天然不命中，
-    // 语义不受影响但不再被短路拦截。
-    if (value === undefined || value === null) return false
+    // 仅 undefined/null/空串视为「字段缺失」→ 不匹配；0/false 等已定义值作为有效内容参与匹配，
+    // 修复 0 被 if(!value) 短路误判不匹配（0 应可被关键词 '0' 命中）。
+    // v3.257：空串若不视为缺失，会被 ".*"、"^$"、"a*" 等零宽/通配正则命中导致白名单误放行空字段。
+    if (value === undefined || value === null || value === '') return false
     if (RuleEngine.hasNestedQuantifier(kwStr)) return true // ReDoS 防护：风险关键词不执行匹配，全部放行（与非法正则口径一致）
     // v3.239：正则编译缓存（过滤热路径，每条消息 × 每个字段都调 whitelistFilter，避免重复 new RegExp）
     let re = this._whitelistReCache.get(kwStr)
@@ -1998,18 +2002,22 @@ const MessageStore = {
       if (!this._verified.has(filePath)) {
         let exists = true
         try { exists = fs.existsSync(filePath) } catch (e) { exists = true }
+        let restored = false
         if (!exists) {
           // v3.236：恢复写入抛错（磁盘满/权限）时同样降级保留内存快照，不向外传播破坏判重流程
           try {
-            const restored = this.saveMessages(filePath, this._memoryCache[filePath])
+            restored = this.saveMessages(filePath, this._memoryCache[filePath])
             if (!restored) console.warn(`缓存文件缺失且恢复失败，继续使用内存缓存：${filePath}`)
           } catch (e) {
             console.warn(`缓存文件缺失且恢复异常，继续使用内存缓存：${filePath} (${String((e && e.message) || e)})`)
           }
         }
-        // 无论磁盘存在还是已恢复，都视为已验证，后续命中直接返回内存。
-        // 注意恢复调用的 saveMessages 会清除本标记，故在此重新置位。
-        try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
+        // v3.257：恢复失败不固化“已验证”，保留重试窗口；内存快照仍为权威（判重不受影响）。
+        // 仅当磁盘文件已存在或恢复成功时才视为已验证；注意恢复调用的 saveMessages 会清除本标记，
+        // 故成功/已存在时在此重新置位，后续命中直接返回内存快照。
+        if (exists || restored) {
+          try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
+        }
       }
       // 内存快照为权威读取：清除该文件的读取失败标记（后续 save 可安全基于快照落盘）
       try { delete this._readFailed[filePath] } catch (e) { /* 忽略 */ }

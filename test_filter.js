@@ -575,6 +575,12 @@ console.log('========================================\n');
     assertEqual(warns.length, 3)
   })
 
+  await test('validateConfig ### 多行同源警告去重（v3.257）', () => {
+    const warns = validateConfig({ pingbibiaoti: '###x###y\n###x###y' })
+    assertEqual(warns.length, 1)
+    assertEqual(new Set(warns).size, warns.length)
+  })
+
   // ==================== 14. tuisong_replace（模板替换） ====================
   console.log('\n📂 14. tuisong_replace（模板替换）')
 
@@ -690,6 +696,27 @@ console.log('========================================\n');
       url: 'http://x'
     })
     assertEqual(result.includes('## 二级标题'), true)
+  })
+
+  await test('htmlToMarkdown 字面 &lt;a&gt; 文本保留（#098）', () => {
+    const r = htmlToMarkdown({ url: 'https://x', content_html: '<a href="https://x">见 &lt;a&gt;标签</a>' })
+    assertEqual(r.includes('见 <a>标签'), true, `字面 &lt;a&gt; 不应被误删: ${r}`)
+  })
+
+  await test('htmlToMarkdown 真实嵌套 <a> 仍被剥离（#098）', () => {
+    const r = htmlToMarkdown({ url: '', content_html: '<a href="https://x"><a href="https://y">内</a></a>' })
+    assertEqual(r.includes('[内](https://x)'), true, `嵌套内层 a 应剥离: ${r}`)
+    assertEqual(r.includes('https://y'), false, `内层链接不应出现: ${r}`)
+  })
+
+  await test('htmlToMarkdown 原有嵌套/转义不回归（#098）', () => {
+    const r1 = htmlToMarkdown({ url: '', content_html: '<a href="http://url">链接</a>' })
+    assertEqual(r1.includes('[链接](http://url)'), true, `普通链接应正常: ${r1}`)
+    const r2 = htmlToMarkdown({ url: '', content_html: 'A&amp;B' })
+    assertEqual(r2.includes('A&B'), true, `实体解码不回归: ${r2}`)
+    const r3 = htmlToMarkdown({ url: '', content_html: '<div><p>段落<b>加粗</b></p><a href="http://url">链接</a></div>' })
+    assertEqual(r3.includes('加粗'), true, `复杂嵌套文本应保留: ${r3}`)
+    assertEqual(r3.includes('[链接](http://url)'), true, `复杂嵌套链接应保留: ${r3}`)
   })
 
   // ==================== 16. 缓存管理 ====================
@@ -1694,6 +1721,28 @@ console.log('========================================\n');
     assertEqual(checkTimeCompiled(r.pingbitime, { catename: '好单线报', louzhuregtime: daysAgo(3) }), false)
   })
 
+  await test('compileRules boolean 值 → null（v3.257 口径对齐）', () => {
+    const r = compileRules({ pingbibiaoti: true })
+    assertEqual(r.pingbibiaoti, null)
+  })
+
+  await test('compileRules BigInt 值 → null（v3.257 口径对齐）', () => {
+    const r = compileRules({ pingbibiaoti: 5n })
+    assertEqual(r.pingbibiaoti, null)
+  })
+
+  await test('compileRules 正常字符串规则不受影响', () => {
+    const r = compileRules({ pingbibiaoti: '京东|淘宝' })
+    assertEqual(r.pingbibiaoti._type, 're')
+    assertEqual(r.pingbibiaoti.re.test('京东'), true)
+  })
+
+  await test('validateConfig 对 true 仍告警（v3.257 口径对齐）', () => {
+    const warns = validateConfig({ pingbibiaoti: true })
+    assertEqual(warns.length, 1)
+    assertEqual(warns[0].includes('应为字符串'), true)
+  })
+
   // ==================== 28. whitelistFilter ====================
   console.log('\n📂 28. whitelistFilter')
 
@@ -1723,6 +1772,26 @@ console.log('========================================\n');
 
   await test('whitelistFilter 无效正则 → 放行（与 App.run 预编译失败口径一致）', () => {
     assertEqual(whitelistFilter({ title: '京东' }, 'title', '[未闭合'), true)
+  })
+
+  await test('whitelistFilter 空串 + .* → false（v3.257 空串视为缺失，不被通配正则放行）', () => {
+    assertEqual(whitelistFilter({ title: '' }, 'title', '.*'), false)
+  })
+
+  await test('whitelistFilter 空串 + 非空关键词 → false', () => {
+    assertEqual(whitelistFilter({ title: '' }, 'title', 'abc'), false)
+  })
+
+  await test('whitelistFilter 0 + 关键词 "0" → true（0 参与匹配）', () => {
+    assertEqual(whitelistFilter({ title: 0 }, 'title', '0'), true)
+  })
+
+  await test('whitelistFilter undefined → false', () => {
+    assertEqual(whitelistFilter({ title: undefined }, 'title', '.*'), false)
+  })
+
+  await test('whitelistFilter 正常值匹配不受影响', () => {
+    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true)
   })
 
   // ==================== 29. saveBatch 批量写入 ====================
@@ -1949,14 +2018,30 @@ console.log('========================================\n');
     assertEqual(truncateUtf16('👍🏽', 2), '', '👍🏽 max=2 → 退位为空（不拆散基底与肤色）')
     assertEqual(truncateUtf16('👍🏽', 3), '', '👍🏽 max=3 → 退位为空')
     assertEqual(truncateUtf16('👍🏽', 4), '👍🏽', '👍🏽 max=4 → 完整保留')
-    // 区域指示符（旗帜）：不得拆散国旗对
-    assertEqual(truncateUtf16('🇨🇳', 2), '', '🇨🇳 max=2 → 退位为空（不拆散国旗对）')
+    // 区域指示符（旗帜）：每个区域指示符是独立码点，不作为修饰符退位（#073）
+    assertEqual(truncateUtf16('🇨🇳', 2), '🇨', '🇨🇳 max=2 → 保留首个区域指示符（不误删为修饰符）')
     assertEqual(truncateUtf16('🇨🇳', 4), '🇨🇳', '🇨🇳 max=4 → 完整保留')
     // 既有 BMP 用例仍通过
     assertEqual(truncateUtf16('👨👩👧👦', 3), '👨', '家庭 emoji max=3 → 完整首个')
     assertEqual(truncateUtf16('👨👩👧👦', 5), '👨👩', 'max=5 → 完整前两个（无孤立 ZWJ）')
     assertEqual(truncateUtf16('❤️', 1), '', 'VS16 序列 max=1 → 保守退位')
     assertEqual(truncateUtf16('e\u0301', 1), '', '组合字符 max=1 → 保守退位')
+  })
+
+  await test('truncateUtf16 区域指示符不误删（#073）', () => {
+    // 区域指示符是独立码点，不应作为"前一字符修饰符"误删正常字符
+    assertEqual(truncateUtf16('A🇨🇳', 2), 'A', 'A🇨🇳 max=2 → 保留 A（曾误删为空）')
+    // 多旗帜：截断到 4 应保留第一个完整旗帜
+    const flagCut = truncateUtf16('🇨🇳🇺🇸', 4)
+    assertEqual(flagCut.length > 0, true, '🇨🇳🇺🇸 max=4 → 至少保留第一个旗帜')
+    assertEqual(flagCut, '🇨🇳', '🇨🇳🇺🇸 max=4 → 保留第一个旗帜')
+    // 肤色修饰符仍受保护，不产生孤代理
+    const skin = truncateUtf16('👍🏽', 2)
+    assertEqual(/[\uD800-\uDBFF]$/.test(skin), false, '👍🏽 max=2 → 末尾无孤高代理')
+    assertEqual(skin.length === 0 || skin.endsWith('🏽'), true, '👍🏽 max=2 → 不拆散修饰符')
+    // 原有用例不得回归
+    assertEqual(truncateUtf16('❤️', 1), '', '❤️ max=1 → 保守退位')
+    assertEqual(truncateUtf16('e\u0301', 1), '', '组合音标 max=1 → 保守退位')
   })
 
   await test('htmlToMarkdown 短标签词边界（v3.171：img/input/blockquote 不再误当 i/b）', () => {
@@ -2428,6 +2513,35 @@ console.log('========================================\n');
     assertEqual(msgs[0].id, 7001)
     assertEqual(fs.existsSync(p), true)
     assertEqual(JSON.parse(fs.readFileSync(p, 'utf8')).length, 1)
+  })
+
+  await test('readMessages 磁盘缺失且恢复失败 → 不标记已验证，下次重新恢复（v3.257）', () => {
+    const fs = require('fs')
+    const p = path.join(CACHE, 'test_mem_restore_retry', 'cache.json')
+    const parent = path.dirname(p)
+    try {
+      saveMessages(p, [{ id: 7002, title: '恢复重试' }])
+      assertEqual(fs.existsSync(p), true)
+      fs.unlinkSync(p)
+      // 用普通文件顶替父目录：existsSync(child) 为 false，但 saveMessages/writeAtomic 会拒绝写入
+      fs.rmdirSync(parent)
+      fs.writeFileSync(parent, '')
+      const msgs = readMessages(p)
+      assertEqual(msgs.length, 1)
+      assertEqual(msgs[0].id, 7002)
+      assertEqual(fs.existsSync(p), false)
+      // 排除故障后再次读取：应重新触发恢复并重建文件（若首次失败被固化 verified 则不会重建）
+      fs.unlinkSync(parent)
+      const msgs2 = readMessages(p)
+      assertEqual(msgs2.length, 1)
+      assertEqual(msgs2[0].id, 7002)
+      assertEqual(fs.existsSync(p), true)
+      assertEqual(JSON.parse(fs.readFileSync(p, 'utf8')).length, 1)
+    } finally {
+      try { if (fs.existsSync(p)) fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+      try { if (fs.statSync(parent).isDirectory()) fs.rmdirSync(parent) } catch (e) { /* 忽略 */ }
+      try { if (fs.existsSync(parent) && !fs.statSync(parent).isDirectory()) fs.unlinkSync(parent) } catch (e) { /* 忽略 */ }
+    }
   })
 
   await test('缓存符号链接 → 拒绝读取和写入外部目标', () => {
