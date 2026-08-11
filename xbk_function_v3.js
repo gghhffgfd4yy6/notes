@@ -860,6 +860,8 @@ const Formatter = {
   _finalizeMd (s) {
     // v3.245 P1：非 string 输入（undefined/null/对象/Symbol）String() 兜底，此前直接
     // s.replace 抛 TypeError 无防护。
+    // v3.249：undefined/null/空串直接返回空——String(undefined)→'undefined' 会泄漏成字面文本
+    if (s === undefined || s === null || s === '') return ''
     try { s = String(s) } catch (e) { return '' }
     return s.replace(/\n{3,}/g, '\n\n').trim()
   },
@@ -1605,7 +1607,11 @@ const FilterEngine = {
     if (re === null) return true // 非法正则：放行（与 App.run 的 zkt_gjc 预编译失败 kwRe=null 不过滤口径一致；宁可多推不可少推）
     // ReDoS 纵深防御：与 matchesCompiled 同口径，超长输入先截断再 .test()——即使关键词含
     // 未被子嵌套量词检测覆盖的慢回溯形态（交替/前视/大字符类 × 超长输入），单次匹配最坏耗时也有界。
-    return re.test(RuleEngine._capReInput(typeof value === 'string' ? value : Utils.safeText(value, '')))
+    // v3.249：超长 keyword 的 V8 会把正则编译推迟到首次 .test()，此时抛 "Regular expression too
+    // large"（new RegExp 不抛）——test 也需 try/catch，失败按放行处理（宁可多推不可少推）。
+    try {
+      return re.test(RuleEngine._capReInput(typeof value === 'string' ? value : Utils.safeText(value, '')))
+    } catch (e) { return true }
   }
 }
 
@@ -2017,6 +2023,12 @@ const MessageStore = {
     // 公开 API 防御：批量输入必须是数组；对象/数字/Symbol 等不可迭代值不能直接进入 for...of。
     if (!Array.isArray(newMessages) || newMessages.length === 0) return
     const filePath = this.getFilePath(filename)
+    // v3.249：与 save 同口径——缓存读取失败（ioError/unsafe/_readFailed）时拒绝覆写，
+    // 避免把未读到的存量数据全量覆盖销毁去重缓存（此前仅 save 检查，saveBatch 会漏）。
+    if (this._readFailed[filePath]) {
+      console.error(`缓存读取失败，跳过批量写入以保护存量数据 ${filePath}`)
+      return
+    }
     // readMessages 可能返回进程内内存缓存权威数组；先复制，避免落盘失败前原地污染内存缓存。
     const messages = [...this.readMessages(filePath)]
     // 统一身份索引：每个键保存可能命中的 index 集合；更新时保留历史候选，查询时按当前身份校验，
