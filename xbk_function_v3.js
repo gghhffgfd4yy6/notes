@@ -432,8 +432,9 @@ const Utils = {
     html = html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
     // v3.251 P0(XSS)：未闭合引号属性绕过——`<a href="javascript:alert(1)` 无闭合引号时
     // 上面两个正则均不匹配（成对引号/无引号值），危险协议保留并被执行。这里单独处理
-    // 未闭合引号形态：引号后到标签边界(< 或行尾)之间的值也做危险协议检查。
-    html = html.replace(/\b(href|src)\s*=\s*(["'])([\s\S]*?)(?=<|$)/gi, (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
+    // 未闭合引号形态：引号后到标签边界(< 或行尾)之间【不含相同闭合引号】的值才处理，
+    // 避免误伤已闭合的合法 href（此前会多补引号并吞掉后续属性）。
+    html = html.replace(/\b(href|src)\s*=\s*(["'])((?:[^"']|(?!\2)[\s\S])*?)(?=<|$)/gi, (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
     return html
   },
 
@@ -2094,15 +2095,17 @@ const MessageStore = {
       if (identity.kind === 'url') del(urlOnlyMap, identity.url)
     }
     messages.forEach(addIdentityIndexes)
-    let lastTs = 0
-    let inc = 0
     const NOW = () => {
+      // v3.251 g5：lastTs/inc 提升为 MessageStore 级（_nowLastTs/_nowInc），跨 saveBatch
+      // 调用保持全局单调——此前每次调用重置导致跨批次时间戳回退乱序（1002→1001）。
       let t = Date.now()
-      if (t < lastTs) t = lastTs
-      else if (t === lastTs) inc++
-      else inc = 0
-      lastTs = t
-      return new Date(t + inc).toISOString()
+      if (this._nowLastTs === undefined) this._nowLastTs = 0
+      if (this._nowInc === undefined) this._nowInc = 0
+      if (t < this._nowLastTs) t = this._nowLastTs
+      else if (t === this._nowLastTs) this._nowInc++
+      else this._nowInc = 0
+      this._nowLastTs = t
+      return new Date(t + this._nowInc).toISOString()
     }
     for (const message of newMessages) {
       // 元素级校验：非对象元素跳过（避免访问 message.id 崩溃）
