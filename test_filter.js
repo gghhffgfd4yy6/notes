@@ -2219,6 +2219,14 @@ console.log('========================================\n');
     assertEqual(fs.readFileSync(p, 'utf8'), '这不是合法JSON{{{')
     // save() 应因 _readFailed 拒绝写入，防止同一条消息重复入库
     assertEqual(appendMessageToFile({ id: 1 }, 'test_corrupt.json'), false)
+    // v3.249：saveBatch 首次调用也必须拒绝覆写损坏文件（先读后判的时序守卫）——
+    // 此前检查在读取之前，首次调用会绕过守卫直接覆写，销毁去重缓存。
+    const fs2 = require('fs')
+    const p2 = path.join(CACHE, 'test_corrupt_batch.json')
+    fs2.writeFileSync(p2, '这不是合法JSON{{{', 'utf8')
+    saveBatch([{ id: 9, title: 'x' }], 'test_corrupt_batch.json')
+    assertEqual(fs2.readFileSync(p2, 'utf8'), '这不是合法JSON{{{', 'saveBatch 首次调用应拒绝覆写损坏文件')
+    fs2.unlinkSync(p2)
     // 恢复合法缓存后重新可读判重
     fs.writeFileSync(p, JSON.stringify([{ id: 1 }]), 'utf8')
     assertEqual(isMessageInFile({ id: 1 }, 'test_corrupt.json'), true)

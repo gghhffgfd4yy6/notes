@@ -2023,14 +2023,16 @@ const MessageStore = {
     // 公开 API 防御：批量输入必须是数组；对象/数字/Symbol 等不可迭代值不能直接进入 for...of。
     if (!Array.isArray(newMessages) || newMessages.length === 0) return
     const filePath = this.getFilePath(filename)
+    // readMessages 可能返回进程内内存缓存权威数组；先复制，避免落盘失败前原地污染内存缓存。
+    const messages = [...this.readMessages(filePath)]
     // v3.249：与 save 同口径——缓存读取失败（ioError/unsafe/_readFailed）时拒绝覆写，
-    // 避免把未读到的存量数据全量覆盖销毁去重缓存（此前仅 save 检查，saveBatch 会漏）。
+    // 避免把未读到的存量数据全量覆盖销毁去重缓存。注意：必须先 readMessages 再检查
+    // _readFailed（置位发生在 readMessages 内部），检查必须在读取之后，否则首次调用
+    // 会绕过守卫直接覆写损坏文件（此前先判后读的时序漏洞）。
     if (this._readFailed[filePath]) {
       console.error(`缓存读取失败，跳过批量写入以保护存量数据 ${filePath}`)
       return
     }
-    // readMessages 可能返回进程内内存缓存权威数组；先复制，避免落盘失败前原地污染内存缓存。
-    const messages = [...this.readMessages(filePath)]
     // 统一身份索引：每个键保存可能命中的 index 集合；更新时保留历史候选，查询时按当前身份校验，
     // 避免复杂的删除/重建逻辑在同 id/同 URL 脏缓存场景下产生索引分裂。
     const addIndex = (map, key, i) => {
