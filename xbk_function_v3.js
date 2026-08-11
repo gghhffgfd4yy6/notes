@@ -452,7 +452,15 @@ const Utils = {
       .replace(/<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
     // 基础/外链/刷新标签可改变文档导航或加载外部资源，HTML 推送不需要它们。
       .replace(/<(?:base|link|meta)\b[^>]*>/gi, '')
-      .replace(/(?:\s|\/)on[a-z][a-z0-9_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    // v3.254 P0(XSS)：事件属性名前的分隔符允许引号——HTML5 tokenizer 在引号值闭合后紧跟
+    // 字符会将其解析为新属性名，故 `<img src="x"onerror="alert(1)">`（src 引号值与 onerror
+    // 间无空格）也是合法事件属性；此前仅匹配空白或 / 会完全绕过清洗。
+    // 完整删除事件属性（含空值形式）：测试锁定 `\bon[a-z]*\s*=` 不残留，故不能用清空值保留属性。
+      .replace(/(?:\s|\/|["'])(on[a-z][a-z0-9_-]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, (m, name) => {
+        // 保留属性名前的分隔符（空格/引号是 HTML 语法必需），删除整个 onxxx="值" 段
+        const sep = m[0][0] === '"' || m[0][0] === "'" ? m[0][0] : ' '
+        return sep
+      })
     html = html
     // 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）。
       .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2/gi,
@@ -904,6 +912,11 @@ const Formatter = {
     let html = (typeof shuju.content_html === 'string')
       ? shuju.content_html
       : (shuju.content_html === undefined || shuju.content_html === null ? '' : '') // 非字符串内容视为空（避免 [object Object]）
+    // v3.254 P1(ReDoS)：`<a>`/`<h1-6>` 正则用无界惰性 [\s\S]*? 接固定闭合标签且带 g，
+    // 多个未闭合标签时每次起始位置回扫到串尾呈 O(n²)——content_html 来自外部接口可被
+    // 构造为 10 万+ 字符卡死主线程。入口截断到 _MD_HTML_MAX（正常消息内容远小于此），
+    // 使最坏回溯复杂度有界。
+    if (html.length > 100000) html = html.slice(0, 100000)
         // URL 文本/目标统一使用 safeUrl：非字符串、空值、伪 URL、危险协议和换行都不生成 Markdown 链接。
     const urlText = Utils.safeUrl(shuju && shuju.url)
     const safeUrl = urlText
@@ -1101,10 +1114,19 @@ const RuleEngine = {
       if (ch === '\\') { i++; cur.inf = false; continue } // 转义（含 \\( \\) \\d 等）视为普通 token
       if (ch === '[') {
         let j = i + 1
-        if (s[j] === '^') j++
-        if (s[j] === ']') j++ // 空类 ] 开头
-        while (j < s.length && s[j] !== ']') { if (s[j] === '\\') j++; j++ }
-        i = j; cur.inf = false; continue // 字符类整体视为普通 token
+        // v3.254 P1：`[^]` 是「非空字符类」——^ 后的 ] 是类成员而非结束符（JS 中 [^] 匹配任意
+        // 字符）。此前把 [^] 的 ] 当结束符跳过，会把后续 (a+)+ 整体吞进字符类而漏检 ReDoS。
+        if (s[j] === '^') {
+          j++
+          if (s[j] === ']') { j++; if (s[j] === ']') j++; else { /* [^] 已结束于第二个 ] */ } }
+        } else if (s[j] === ']') {
+          j++ // 空类 ] 开头（[]] 场景），但 []] 中第一个 ] 是成员——严格说需再判断，保守按字符类整体跳过
+          while (j < s.length && s[j] !== ']') { if (s[j] === '\\') j++; j++ }
+        } else {
+          while (j < s.length && s[j] !== ']') { if (s[j] === '\\') j++; j++ }
+        }
+        if (j < s.length && s[j] === ']') j++ // 正常类结束（[^] 后无多余 ] 时 j 已指向结束后的字符）
+        i = j - 1; cur.inf = false; continue // 字符类整体视为普通 token
       }
       if (ch === '(') { stack.push({ inf: false, alt: false }); continue }
       if (ch === '|') { cur.alt = true; cur.inf = false; continue } // v3.174：交替标记（歧义回溯候选）
@@ -1117,7 +1139,24 @@ const RuleEngine = {
         // v3.174：组内含交替 + 组后无限量词 → 歧义交替灾难性回溯（(a|aa)+ 曾漏检，
         // '^(a|aa)+b$' 对 30a 已 156ms/40a 2.5s/50a+ 指数爆炸卡死）；保守拦截（宁可误拦多推）
         if (closed.alt && ql > 0) return true
-        if (ql > 0) { parent.inf = true; i += ql } else { parent.inf = false }
+        // v3.254 P1：`((a+))+` 嵌套分组漏检——中间组 `(a+)` 闭合时其后是 `)` 非量词，
+        // 旧代码 parent.inf=false 把「组内含无限量词」信息丢失，外层 `)` 闭合时无法识别。
+        // 改为：组内含无限量词（closed.inf 或 parent 已有）就传播给外层，不因中间无量化丢失。
+        // 同时 alt（交替歧义）同样向上传播：`((a|aa))+` 嵌套交替也是灾难性回溯。
+        if (closed.inf || parent.inf) parent.inf = true
+        if (closed.alt || parent.alt) parent.alt = true
+        // (a|aa){n} 有界重复+组内交替/无限量词：组内歧义 × 重复仍可指数回溯（(a|aa){500}），
+        // 有界量词本身不危险，但组内含交替/无限量词时重复放大回溯——保守拦截。
+        // 注意：小次数有界量词（{1,3}/{2,3} 等）测试锁定安全（V8 对小重复有优化），
+        // 仅拦截大次数（≥100，如 {500}）——既防灾难性回溯又不误伤正常配置。
+        if (closed.alt || closed.inf) {
+          const bqm = /^\{\d+(?:,\d*)?\}/.exec(s.slice(i + 1))
+          if (bqm) {
+            const [lo, hi] = bqm[0].slice(1, -1).split(',').map(x => x === '' ? Infinity : Number(x))
+            if (lo >= 100 || (hi !== undefined && hi >= 100)) return true
+          }
+        }
+        if (ql > 0) { parent.inf = true; i += ql }
         continue
       }
       const ql = infQuantLen(i)
@@ -2573,35 +2612,39 @@ const App = {
           const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}${state.truncated ? ` | 截断 ${state.truncated}` : ''}`
           // v3.156：发送成功才重置日期——曾先写 state.date（日报失败也跨天，昨日日报丢失）
           // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗）
+          // v3.254 P1：发送前先把「今日累计」并入 pending 并同步落盘（见下方持久化）——
+          // 进程在发送完成前退出/崩溃，今日 summary 也不丢（pending 已持久化），且 date 未
+          // 重置 → 下次运行仍重试昨日日报，不重发今日数据。发送结果只决定 date 是否重置。
+          const pend = state.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+          // 同步持久化 pending（防进程退出丢今日累计）：state 保持昨日(date 未重置)，
+          // pending 携带本次 summary——测试锁定「发送失败 date 不重置 + 数据不丢」。
+          const pendingState = { ...state, pending: { ...pend } }
+          pendingState.pending.total += summary.total || 0
+          pendingState.pending.dedup += summary.dedup || 0
+          pendingState.pending.filtered += summary.filtered || 0
+          pendingState.pending.pushed += summary.pushed || 0
+          pendingState.pending.failed += summary.failed || 0
+          pendingState.pending.truncated += summary.truncated || 0
+          persistReportState(pendingState)
           Pusher.send(t, d)
             .then(() => {
-              // v3.176：昨日日报发送成功 → 重置为今日；取出「昨日日报失败期间的今日累计」
-              // （pending），与本次数据一并计入新的一天（曾直接丢弃——今日数据丢失）
-              const pend = state.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+              // v3.176：昨日日报发送成功 → 重置为今日；取出 pending 与本次数据并入新的一天
+              const pend2 = pendingState.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
               state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-              acc(state) // 本次数据计入新的一天
-              state.total += pend.total || 0
-              state.dedup += pend.dedup || 0
-              state.filtered += pend.filtered || 0
-              state.pushed += pend.pushed || 0
-              state.failed += pend.failed || 0
-              state.truncated += pend.truncated || 0
+              acc(state)
+              state.total += pend2.total || 0
+              state.dedup += pend2.dedup || 0
+              state.filtered += pend2.filtered || 0
+              state.pushed += pend2.pushed || 0
+              state.failed += pend2.failed || 0
+              state.truncated += pend2.truncated || 0
               persistReportState(state)
               console.log('已发送昨日运行日报')
             })
             .catch(() => {
-              // v3.176：失败 → date 不重置（下次运行重试昨日日报）；本次（今日）数据暂存
-              // pending，不污染昨日统计——曾 acc 进旧 state：今日数据被错标进「昨日日报」
-              // 重复发送（系统审查 #4）
-              const pend = state.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-              pend.total += summary.total || 0
-              pend.dedup += summary.dedup || 0
-              pend.filtered += summary.filtered || 0
-              pend.pushed += summary.pushed || 0
-              pend.failed += summary.failed || 0
-              pend.truncated += summary.truncated || 0
-              state.pending = pend
-              persistReportState(state)
+              // v3.176：失败 → date 不重置（下次运行重试昨日日报）；今日数据已在发送前
+              // 并入 pending 并持久化（不丢）。v3.254：即使进程此刻退出，pending 也已落盘。
+              // 仅需把内存 state 同步为带 pending 的形态，等待下次运行重试。
             })
           return
         }

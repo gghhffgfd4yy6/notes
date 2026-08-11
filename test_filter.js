@@ -4547,7 +4547,10 @@ console.log('========================================\n');
     const cases = [
       '&lt;script&gt;alert(1)&lt;/script&gt;正文',
       '&lt;img src="javascript:x" onerror="alert(1)"&gt;正文',
-      '&lt;iframe src="https://evil.example"&gt;恶意&lt;/iframe&gt;正文'
+      '&lt;iframe src="https://evil.example"&gt;恶意&lt;/iframe&gt;正文',
+      // v3.254 P0(XSS)：引号值闭合后无空格紧跟的 onerror（HTML5 视为新属性）也必须清除
+      '<img src="x"onerror="alert(1)">正文',
+      '<img src="x"onclick="f()" onmouseover="g()">正文'
     ]
     for (const h of cases) {
       const r = htmlToMarkdown({ content_html: h, url: '' })
