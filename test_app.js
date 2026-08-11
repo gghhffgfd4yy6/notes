@@ -874,6 +874,26 @@ console.log('========================================\n');
     assert(r.cached === 4, `缓存应4条，实际${r.cached}`)
   })
 
+  await test('parallelLimit=1000: 硬性上限50，并发峰值不超过50', async () => {
+    const data = Array.from({ length: 60 }, (_, i) => ({ id: i, catename: 'a', title: '上限' + i, content: 'x', url: '/cap/' + i + '.html' }))
+    let active = 0
+    let maxActive = 0
+    const origInterval = Config.timing.pushInterval
+    try {
+      Config.timing.pushInterval = 0
+      const r = await runWithPushMode('parallel', 1000, data, async () => {
+        active++
+        maxActive = Math.max(maxActive, active)
+        await new Promise(resolve => setTimeout(resolve, 3))
+        active--
+      })
+      assert(r.summary && r.summary.pushed === 60, `60条应全部完成: ${JSON.stringify(r.summary)}`)
+      assert(maxActive <= 50, `并发峰值应≤50（硬性上限），实际${maxActive}`)
+    } finally {
+      Config.timing.pushInterval = origInterval
+    }
+  })
+
   await test('parallelLimit=2.5(小数) → 取整为2，正常推送无空批', async () => {
     const data = [1, 2, 3, 4, 5].map(i => ({ id: i, catename: 'a', title: '小' + i, content: 'x', url: '/m/' + i + '.html' }))
     const r = await runWithPushMode('parallel', 2.5, data)
