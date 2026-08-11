@@ -20,9 +20,11 @@ function profile3BootMark (name) {
   if (PROFILE3) PROFILE3_BOOT_MARKS.push({ name, ms: profile3NowMs() })
 }
 function profile3Require (name, loader) {
+  if (!PROFILE3) return loader()
   const started = profile3NowMs()
   const value = loader()
-  if (PROFILE3) PROFILE3_BOOT_MARKS.push({ name: `require:${name}`, ms: profile3NowMs(), deltaMs: profile3NowMs() - started })
+  const now = profile3NowMs()
+  PROFILE3_BOOT_MARKS.push({ name: `require:${name}`, ms: now, deltaMs: now - started })
   return value
 }
 
@@ -238,7 +240,7 @@ function normalize (o) {
   if (Array.isArray(o)) return o.map(normalize)
   if (o && typeof o === 'object') {
     const out = {}
-    for (const k of Object.keys(o).sort()) out[k] = normalize(o[k])
+    for (const k of Object.keys(o).sort()) Object.defineProperty(out, k, { value: normalize(o[k]), enumerable: true, writable: true, configurable: true })
     return out
   }
   return o
@@ -427,7 +429,12 @@ const Utils = {
     try { html = String(html) } catch (e) { return '' }
     const cleanAttr = (name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`
     html = html.replace(/\b(href|src)\s*=\s*(["'])([\s\S]*?)\2/gi, (_, name, quote, value) => cleanAttr(name, quote, value))
-    return html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
+    html = html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
+    // v3.251 P0(XSS)：未闭合引号属性绕过——`<a href="javascript:alert(1)` 无闭合引号时
+    // 上面两个正则均不匹配（成对引号/无引号值），危险协议保留并被执行。这里单独处理
+    // 未闭合引号形态：引号后到标签边界(< 或行尾)之间的值也做危险协议检查。
+    html = html.replace(/\b(href|src)\s*=\s*(["'])([\s\S]*?)(?=<|$)/gi, (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
+    return html
   },
 
   /** 实体解码后再次清理主动 HTML/事件属性，防止 &lt;script&gt; 重新形成可执行标签 */
@@ -652,8 +659,14 @@ const Utils = {
     for (let i = 0; i < keysA.length; i++) {
       const k = keysA[i]
       if (!Object.prototype.hasOwnProperty.call(b, k)) return false
-      const va = a[k]
-      const vb = b[k]
+      let va, vb
+      try {
+        va = a[k]
+        vb = b[k]
+      } catch (e) {
+        // getter/proxy 抛错：不能断定相等，退回慢路径按"已变更"处理（与深排口径一致）
+        return false
+      }
       // 对象/数组 → 引用不同不代表内容不同，交由慢路径判定
       if ((typeof va === 'object' && va !== null) || (typeof vb === 'object' && vb !== null)) return false
       if (va !== vb) return false
@@ -703,6 +716,15 @@ const Utils = {
       h2 = ((h2 * 31) + c + i) >>> 0
     }
     return 'anon:' + h1.toString(16) + h2.toString(16)
+  },
+
+  /** 共享身份索引写入：Map<key, Set<index>>，空 key 跳过，重复 index 由 Set 天然去重。
+      _buildIdentityIndex 与 saveBatch 共用此定义，避免两份重复实现漂移。 */
+  addIndex (map, key, i) {
+    if (!key) return
+    let set = map.get(key)
+    if (!set) { set = new Set(); map.set(key, set) }
+    set.add(i)
   },
 
   /** v3.159：过滤规则稳定哈希（过滤字段固定顺序 + 只看它关键词）——规则变更时用于失效「过滤写入」缓存 */
@@ -808,17 +830,27 @@ const Utils = {
     if (!Number.isFinite(max) || max <= 0) return s
     if (s.length <= max) return s
     let cut = s.slice(0, max)
-    // 修饰符判定：作用于前一字符的 Unicode 修饰符（ZWJ/变体选择符/组合音标/组合符号）
+    // 修饰符判定：作用于前一字符的 Unicode 修饰符（ZWJ/变体选择符/组合音标/组合符号）；
+    // v3.185：补充平面修饰符（肤色 U+1F3FB–1F3FF / VS 补充 U+E0100–E01EF / 区域指示符 U+1F1E6–1F1FF）
+    // 也纳入判定（用 codePointAt 读取码点，避免截断拆散 👍🏽 等补充平面 emoji）
     const isModifier = (c) => c === 0x200D || (c >= 0xFE00 && c <= 0xFE0F) ||
             (c >= 0x0300 && c <= 0x036F) || (c >= 0x1AB0 && c <= 0x1AFF) || (c >= 0x1DC0 && c <= 0x1DFF) ||
-            (c >= 0x20D0 && c <= 0x20FF) || (c >= 0xFE20 && c <= 0xFE2F)
+            (c >= 0x20D0 && c <= 0x20FF) || (c >= 0xFE20 && c <= 0xFE2F) ||
+            (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0100 && c <= 0xE01EF) || (c >= 0x1F1E6 && c <= 0x1F1FF)
+    // 补充平面修饰符专用判定：紧随补充平面基符的修饰符（不含 ZWJ，避免拆散 👨👩👧👦 首个完整 emoji）
+    const isSupplementaryModifier = (c) =>
+            (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0100 && c <= 0xE01EF) || (c >= 0x1F1E6 && c <= 0x1F1FF)
     while (cut.length > 0) {
       const last = cut.charCodeAt(cut.length - 1)
-      // 代理对：完整低代理对保留；高代理/孤立低代理退位
+      // 代理对：完整低代理对保留；高代理/孤立低代理退位；
+      // 完整对后若是补充平面修饰符则退位（不拆散基底代理对，如 👍🏽 / 🇨🇳）
       if (last >= SURROGATE_LO && last <= SURROGATE_HI) {
         if (last >= 0xDC00) {
           const prev = cut.charCodeAt(cut.length - 2)
-          if (prev >= SURROGATE_LO && prev <= 0xDBFF) break // 配对完整，保留
+          if (prev >= SURROGATE_LO && prev <= 0xDBFF) {
+            if (isSupplementaryModifier(s.codePointAt(cut.length))) { cut = cut.slice(0, -1); continue }
+            break // 配对完整，保留
+          }
         }
         cut = cut.slice(0, -1)
         continue
@@ -826,7 +858,7 @@ const Utils = {
       // 末尾 ZWJ 本身退位（连接符不应做结尾）
       if (last === 0x200D) { cut = cut.slice(0, -1); continue }
       // 截断点后是作用于上一字符的修饰符 → 退位（避免拆散 ❤️ / é）
-      const next = s.charCodeAt(cut.length)
+      const next = s.codePointAt(cut.length)
       if (isModifier(next)) { cut = cut.slice(0, -1); continue }
       break
     }
@@ -977,11 +1009,11 @@ const Formatter = {
       : ''
     // {链接} 占位符 Markdown 安全化（v3.74）：与 htmlToMarkdown 的 mdUrl 同口径——
     // 含空格/括号/] 用 <> 包裹、剥离换行（原样输出会在 Markdown 链接场景破坏）
-    const linkText = (() => {
+    const linkText = () => {
       // R6-1：非字符串视为无链接（与 htmlToMarkdown urlText 同口径）
       const u = Utils.safeUrl(Utils.safeGet(data, 'url'))
       return u && /[\s()[\]]/.test(u) ? `<${u}>` : u
-    })()
+    }
     const getContentHtml = () => safeHtmlUrl
       ? `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`
       : `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：${escUrl}<br>&nbsp;<br>&nbsp;<br>`
@@ -993,7 +1025,7 @@ const Formatter = {
       '{Markdown内容}': text.includes('{Markdown内容}') ? this.htmlToMarkdown(data) : undefined,
       '{分类名}': data.catename,
       '{分类ID}': data.cateid,
-      '{链接}': linkText,
+      '{链接}': text.includes('{链接}') ? linkText() : undefined,
       '{日期}': data.datetime,
       '{时间}': data.shorttime,
       '{楼主}': data.louzhu,
@@ -1944,25 +1976,19 @@ const MessageStore = {
      仅构建一次并在批量 has 间复用，避免每次全量线性扫描 + 逐条重算身份。 */
   _buildIdentityIndex (messages) {
     const idx = { idByKey: new Map(), urlOnly: new Map(), idWithUrl: new Map(), anonByKey: new Map() }
-    const addIndex = (map, key, i) => {
-      if (!key) return
-      let set = map.get(key)
-      if (!set) { set = new Set(); map.set(key, set) }
-      set.add(i)
-    }
     for (let i = 0; i < messages.length; i++) {
       const ident = Utils.getMessageIdentity(messages[i])
       if (!ident.valid) continue
       if (ident.kind === 'id') {
         // id 消息：按 idKey 匹配（对 id 查询），也按 url 匹配（对 url 查询的双向 fallback）
-        addIndex(idx.idByKey, ident.idKey, i)
-        if (ident.url) addIndex(idx.idWithUrl, ident.url, i)
+        Utils.addIndex(idx.idByKey, ident.idKey, i)
+        if (ident.url) Utils.addIndex(idx.idWithUrl, ident.url, i)
       } else if (ident.kind === 'url') {
         // 纯 url 消息：对 id/url 查询均按 url 匹配
-        addIndex(idx.urlOnly, ident.url, i)
+        Utils.addIndex(idx.urlOnly, ident.url, i)
       } else {
         // anon 消息：仅按匿名合成键匹配
-        addIndex(idx.anonByKey, ident.key, i)
+        Utils.addIndex(idx.anonByKey, ident.key, i)
       }
     }
     return idx
@@ -2035,12 +2061,6 @@ const MessageStore = {
     }
     // 统一身份索引：每个键保存可能命中的 index 集合；更新时保留历史候选，查询时按当前身份校验，
     // 避免复杂的删除/重建逻辑在同 id/同 URL 脏缓存场景下产生索引分裂。
-    const addIndex = (map, key, i) => {
-      if (!key) return
-      let set = map.get(key)
-      if (!set) { set = new Set(); map.set(key, set) }
-      set.add(i)
-    }
     const firstIndex = (map, key, match) => {
       const set = map.get(key)
       if (!set) return undefined
@@ -2059,13 +2079,31 @@ const MessageStore = {
     const addIdentityIndexes = (message, i) => {
       const identity = Utils.getMessageIdentity(message)
       if (!identity.valid) return
-      addIndex(identityMap, identity.key, i)
-      if (identity.kind === 'id') addIndex(idMap, identity.idKey, i)
-      if (identity.url) addIndex(urlMap, identity.url, i)
-      if (identity.kind === 'url') addIndex(urlOnlyMap, identity.url, i)
+      Utils.addIndex(identityMap, identity.key, i)
+      if (identity.kind === 'id') Utils.addIndex(idMap, identity.idKey, i)
+      if (identity.url) Utils.addIndex(urlMap, identity.url, i)
+      if (identity.kind === 'url') Utils.addIndex(urlOnlyMap, identity.url, i)
+    }
+    const removeIdentityIndexes = (message, i) => {
+      const identity = Utils.getMessageIdentity(message)
+      if (!identity.valid) return
+      const del = (map, key) => { const s = map.get(key); if (s) s.delete(i) }
+      del(identityMap, identity.key)
+      if (identity.kind === 'id') del(idMap, identity.idKey)
+      if (identity.url) del(urlMap, identity.url)
+      if (identity.kind === 'url') del(urlOnlyMap, identity.url)
     }
     messages.forEach(addIdentityIndexes)
-    const NOW = () => new Date().toISOString()
+    let lastTs = 0
+    let inc = 0
+    const NOW = () => {
+      let t = Date.now()
+      if (t < lastTs) t = lastTs
+      else if (t === lastTs) inc++
+      else inc = 0
+      lastTs = t
+      return new Date(t + inc).toISOString()
+    }
     for (const message of newMessages) {
       // 元素级校验：非对象元素跳过（避免访问 message.id 崩溃）
       if (!Utils.isValidItem(message)) continue
@@ -2102,6 +2140,7 @@ const MessageStore = {
         // P3 优化：复用 _contentChangedIgnoringTs（先浅层短路、后键序无关深排），与 _upsert 口径一致
         const changed = this._contentChangedIgnoringTs(oldM, message)
         if (changed) console.log(`更新缓存记录: ${filename}`)
+        removeIdentityIndexes(oldM, idx)
         messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: NOW() }
         addIdentityIndexes(messages[idx], idx)
       } else {
@@ -2109,10 +2148,10 @@ const MessageStore = {
         const i = messages.length - 1
         const newIdentity = Utils.getMessageIdentity(messages[i])
         if (newIdentity.valid) {
-          addIndex(identityMap, newIdentity.key, i)
-          if (newIdentity.kind === 'id') addIndex(idMap, newIdentity.idKey, i)
-          if (newIdentity.url) addIndex(urlMap, newIdentity.url, i)
-          if (newIdentity.kind === 'url') addIndex(urlOnlyMap, newIdentity.url, i)
+          Utils.addIndex(identityMap, newIdentity.key, i)
+          if (newIdentity.kind === 'id') Utils.addIndex(idMap, newIdentity.idKey, i)
+          if (newIdentity.url) Utils.addIndex(urlMap, newIdentity.url, i)
+          if (newIdentity.kind === 'url') Utils.addIndex(urlOnlyMap, newIdentity.url, i)
         }
       }
     }
@@ -2179,7 +2218,7 @@ const Network = {
 
     // NaN → 意外只跑 1 次；小数 → 次数模糊。合法整数（默认 2）行为零变更
     // v3.158：Utils.num 转换——'5'(环境变量字符串) → 5（曾 Number.isFinite('5')=false 回退 2）
-    const maxRetry = (() => { const r = Utils.num(Config.api.retry, 2); return Number.isInteger(r) && r >= 0 ? r : 2 })()
+    const maxRetry = (() => { const r = Utils.num(Config.api.retry, 2); return Number.isInteger(r) && r >= 0 ? Math.min(r, 9999) : 2 })()
     for (let attempt = 0; attempt <= maxRetry; attempt++) {
       if (PROFILE3) console.log(`[profile api attempt] start=${attempt + 1}/${maxRetry + 1}`)
       try {
@@ -2459,7 +2498,7 @@ const App = {
       const blankState = () => ({ date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 })
       const safeCounter = (v) => {
         const n = Number(v)
-        return Number.isFinite(n) && n >= 0 ? n : 0
+        return typeof v !== 'boolean' && Number.isInteger(n) && n >= 0 && n <= Number.MAX_SAFE_INTEGER ? n : 0
       }
       const normalizeState = (raw) => {
         if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return blankState()
@@ -2469,6 +2508,11 @@ const App = {
         if (raw.pending && typeof raw.pending === 'object' && !Array.isArray(raw.pending)) {
           st.pending = blankState()
           for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st.pending[k] = safeCounter(raw.pending[k])
+        } else if (raw.pending) {
+          // pending 存在但非普通对象（状态文件损坏/结构异常）：不能静默丢弃跨天累计，
+          // 保留其占位并大声告警，让下游按 blankState 处理而不崩溃。
+          console.warn('⚠️ report.state 的 pending 字段格式异常，已重置为空累计（原值被丢弃）')
+          st.pending = blankState()
         }
         return st
       }
@@ -2505,12 +2549,13 @@ const App = {
       const _d = new Date()
       const today = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`
       const acc = (st) => {
-        st.total += summary.total || 0
-        st.dedup += summary.dedup || 0
-        st.filtered += summary.filtered || 0
-        st.pushed += summary.pushed || 0
-        st.failed += summary.failed || 0
-        st.truncated += summary.truncated || 0 // v3.176：截断数也入日报（曾只有 run.log 有）
+        const add = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : 0 }
+        st.total += add(summary.total)
+        st.dedup += add(summary.dedup)
+        st.filtered += add(summary.filtered)
+        st.pushed += add(summary.pushed)
+        st.failed += add(summary.failed)
+        st.truncated += add(summary.truncated) // v3.176：截断数也入日报（曾只有 run.log 有）
       }
       if (state.date && state.date !== today) {
         // 新的一天：发昨日日报（若有数据）
@@ -2911,12 +2956,20 @@ const App = {
 
       // ⑥ 推送（sequential=顺序逐条 / parallel=并行滑动窗口；失败不中断、不写缓存，下次重试）
       const pushModeForProfile = (() => {
-        try { return String(Config.push && Config.push.mode) } catch (e) { return '<不可转换值>' }
+        // v3.250：Config.push 缺失/未配置 mode 时 String(undefined) 会产出字面量 "undefined"；
+        // 显式回退默认顺序模式，仅用于 push-start 日志（不改变实际推送语义）
+        try { const m = Config.push && Config.push.mode; return (m == null || m === '') ? 'sequential' : String(m) } catch (e) { return '<不可转换值>' }
       })()
       checkpoint('push-start', `count=${items.length} mode=${pushModeForProfile}`)
       const startTime = Date.now()
       preprocessMs = startTime - runStart - (fetchMs || 0)
-      const keyOf = (it) => Utils.getMessageIdentity(it).key
+      // v3.250：预计算每条 items 的 identity key 并缓存（含 newMessages 惰性缓存），
+      // keyOf 复用，避免 getMessageIdentity 对同一对象反复重算（pushedKeys/itemsKeys/toCache 均调用）
+      const itemKeyCache = new Map(items.map(it => [it, Utils.getMessageIdentity(it).key]))
+      const keyOf = (it) => {
+        if (!itemKeyCache.has(it)) itemKeyCache.set(it, Utils.getMessageIdentity(it).key)
+        return itemKeyCache.get(it)
+      }
       // domain 去尾斜杠后与相对路径统一拼接（避免 'https://x.com//rel' 双斜杠）
       // R2：非字符串 domain（脏配置）→ 空串 baseUrl（相对路径不拼前缀，避免 .replace 崩溃）
       const baseUrl = (typeof Config.domain === 'string') ? Config.domain.trim().replace(/\/+$/, '') : '' // v3.158: trim
@@ -2933,14 +2986,20 @@ const App = {
       const readItemField = (item, field) => {
         try { return item && item[field] } catch (e) { return undefined }
       }
-      const itemLogText = (item, field, fallback = '') => Utils.safeText(readItemField(item, field), fallback)
+      // v3.250：日志边界——超长字段值（脏数据/整段内容/大对象 JSON）原样入日志会撑爆日志行；
+      // 与推送内容截断同口径，仅限制日志显示长度，不影响实际推送内容
+      const ITEM_LOG_MAX = 100
+      const itemLogText = (item, field, fallback = '') => {
+        const text = Utils.safeText(readItemField(item, field), fallback)
+        return typeof text === 'string' && text.length > ITEM_LOG_MAX ? Utils.truncateUtf16(text, ITEM_LOG_MAX) : text
+      }
 
       // 推送模板（v3.68 可配置）：非法/缺失回退默认（默认值与历史硬编码完全一致，现有测试锁定）
       const titleTpl = (typeof Config.template.title === 'string' && Config.template.title) ? Config.template.title : '【{分类名}】{标题}'
       const contentTpl = (typeof Config.template.content === 'string' && Config.template.content) ? Config.template.content : '{Markdown内容}'
       // 推送截断长度（v3.69 可配置）：非正数/非数字回退默认（负数会让 slice(0,-1) 误截尾字符）
-      const titleMax = (() => { const v = Utils.num(Config.push.titleMax, 100); return v > 0 ? v : 100 })()
-      const contentMax = (() => { const v = Utils.num(Config.push.contentMax, 3000); return v > 0 ? v : 3000 })()
+      const titleMax = (() => { const v = Math.floor(Utils.num(Config.push.titleMax, 100)); return v > 0 ? v : 100 })()
+      const contentMax = (() => { const v = Math.floor(Utils.num(Config.push.contentMax, 3000)); return v > 0 ? v : 3000 })()
 
       // 单条推送（两种模式共用）：成功返回 {ok:true} 并记录；失败警告且不写缓存(下次重试)
       const pushOne = async (item, notifyModule) => {
@@ -2977,8 +3036,8 @@ const App = {
           // 链接本身超过 contentMax 时不保留（尊重截断配置）；否则内容截短补链接（仍 ≤ contentMax）
           // v3.177：边界修正——link 接近 contentMax 时 contentMax-link-2 曾 ≤0，truncateUtf16 对非正
           // max 返回原串 → desp 全量+链接显著超限（系统验证反证 #3）；改为「链接+分隔符完整容纳
-          // 才补」+ keep≥0 保证总长 ≤ contentMax
-          if (link.length + 2 <= contentMax) {
+          // 才补」+ keep≥1 保证总长 ≤ contentMax（link+2 == contentMax 时 keep=0 会触发上述缺陷）
+          if (link.length + 2 < contentMax) {
             const keep = contentMax - link.length - 2
             desp = Utils.truncateUtf16(desp, keep) + '\n\n' + link
           }
@@ -3011,7 +3070,13 @@ const App = {
       if (Config.push && Config.push.mode === 'parallel') {
         // 并行推送：滑动窗口限并发；任意一条完成后立即补下一条。
         // parallelLimit 防御：小数取整（0.5 取 0 后回退 1）、0/负数回退全量、空 items 兜底 1。
-        const limit = (() => { const pl = Utils.num(Config.push.parallelLimit, 0); return pl > 0 ? Math.floor(pl) : items.length })() || 1
+        const MAX_PARALLEL_WORKERS = 50 // 并行推送硬性上限：防超大 parallelLimit/大批量瞬时拉起海量 worker
+        const limit = (() => {
+          const pl = Utils.num(Config.push.parallelLimit, 0)
+          // 有效正数取整；0/负数/非法回退全量 items；二者均受硬性上限约束，空 items 兜底 1
+          const base = pl > 0 ? Math.floor(pl) : items.length
+          return Math.min(base, MAX_PARALLEL_WORKERS)
+        })() || 1
         const pushInterval = Utils.num(Config.timing.pushInterval, 0)
         const results = new Array(items.length)
         let nextIndex = 0

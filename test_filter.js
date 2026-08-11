@@ -1749,6 +1749,20 @@ console.log('========================================\n');
     assertEqual(msgs.filter(m => m.id === 10).length, 1)
   })
 
+  await test('saveBatch 共享 addIndex 后索引化判重一致（f7）', () => {
+    // 共享 Utils.addIndex 后：id 与 url 两种身份键在跨批保存时仍能正确命中索引并判重
+    const name = 'test_batch_f7_shared.json'
+    saveBatch([{ id: 30, title: 'id-old' }], name)
+    saveBatch([{ id: 30, title: 'id-new' }], name) // 同 id → 更新不重复
+    saveBatch([{ url: '/f7.html', title: 'url-old' }], name)
+    saveBatch([{ url: '/f7.html', title: 'url-new' }], name) // 同 url（纯 url 消息）→ 更新不重复
+    const fs = require('fs')
+    const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'))
+    assertEqual(msgs.filter(m => m.id === 30).length, 1, '同 id 应只保留一条')
+    assertEqual(msgs.filter(m => m.url === '/f7.html').length, 1, '同 url 应只保留一条')
+    assertEqual(msgs.length, 2, '共享 addIndex 后总条数不应因索引失效而膨胀')
+  })
+
   // ==================== 30. init & decodeHtmlEntities ====================
   console.log('\n📂 30. init & decodeHtmlEntities')
 
@@ -1929,6 +1943,22 @@ console.log('========================================\n');
     assertEqual(truncateUtf16('😀😀', 2), '😀', '双 emoji 完整保留')
   })
 
+  await test('truncateUtf16 补充平面修饰符不切断（v3.185）', () => {
+    // 肤色修饰符 U+1F3FD：小 max 应退为空，不得留下半个代理（👍 基底）
+    assertEqual(truncateUtf16('👍🏽', 1), '', '👍🏽 max=1 → 退位为空（无半代理）')
+    assertEqual(truncateUtf16('👍🏽', 2), '', '👍🏽 max=2 → 退位为空（不拆散基底与肤色）')
+    assertEqual(truncateUtf16('👍🏽', 3), '', '👍🏽 max=3 → 退位为空')
+    assertEqual(truncateUtf16('👍🏽', 4), '👍🏽', '👍🏽 max=4 → 完整保留')
+    // 区域指示符（旗帜）：不得拆散国旗对
+    assertEqual(truncateUtf16('🇨🇳', 2), '', '🇨🇳 max=2 → 退位为空（不拆散国旗对）')
+    assertEqual(truncateUtf16('🇨🇳', 4), '🇨🇳', '🇨🇳 max=4 → 完整保留')
+    // 既有 BMP 用例仍通过
+    assertEqual(truncateUtf16('👨👩👧👦', 3), '👨', '家庭 emoji max=3 → 完整首个')
+    assertEqual(truncateUtf16('👨👩👧👦', 5), '👨👩', 'max=5 → 完整前两个（无孤立 ZWJ）')
+    assertEqual(truncateUtf16('❤️', 1), '', 'VS16 序列 max=1 → 保守退位')
+    assertEqual(truncateUtf16('e\u0301', 1), '', '组合字符 max=1 → 保守退位')
+  })
+
   await test('htmlToMarkdown 短标签词边界（v3.171：img/input/blockquote 不再误当 i/b）', () => {
     // 前缀标签不应输出 */**/- 垃圾
     assertEqual(htmlToMarkdown({ content_html: '<img class="x">', url: '' }), '', 'img 无 src 应剥空（曾输出 *）')
@@ -1966,6 +1996,12 @@ console.log('========================================\n');
     for (const u of ['javascript&colon;alert(1)', 'java&Tab;script:alert(1)', 'javascript&NewLine;:alert(1)', 'java&nbsp;script:alert(1)']) {
       const out = tuisong_replace('{Html内容}', { content_html: '<p>x</p>', url: u })
       assertEqual(/href\s*=\s*["'](?:javascript|vbscript|data):/i.test(out), false, `命名实体绕过不应生成 href: ${u}`)
+    }
+    // v3.251 P0(XSS)：未闭合引号属性绕过——`href="javascript:alert(1)` 无闭合引号时
+    // 成对引号/无引号正则均不匹配，危险协议会保留执行；必须单独清洗。
+    for (const bad of ['<a href="javascript:alert(1)>x</a>', "<a href='javascript:alert(1)>x</a>", '<a href=javascript:alert(1)>x</a>', '<img src="data:text/html,x">']) {
+      const out = tuisong_replace('{Html内容}', { content_html: bad, url: 'https://safe.example/a' })
+      assertEqual(/\[[^\]]*\]\((?:javascript|vbscript|data):/i.test(out), false, `未闭合引号危险属性不应生成链接: ${bad.slice(0, 30)}`)
     }
     // 原始 content_html 中的危险 href/src 也必须清洗
     const raw = tuisong_replace('{Html内容}', { content_html: '<a href="javascript:alert(1)">点我</a><img src="javascript:x">', url: 'https://safe.example/a' })
