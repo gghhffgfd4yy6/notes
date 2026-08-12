@@ -7498,6 +7498,21 @@ console.log('========================================\n');
     assertEqual(sanitizeDecodedHtml('<svg><script>x</script></svg>'), '')
   })
 
+  await test('sanitizeDecodedHtml 文本引号内的主动标签仍被移除（Round2 C002 终修）', () => {
+    // 引号保护方案曾把文本中 "<iframe src=x>" 保护为占位符导致真实标签漏网（可执行）。
+    // 终修：不做全局引号保护，文本中的主动标签照常移除。
+    const cases = [
+      '<div>text "<iframe src=x>" more</div>',
+      '说 "太 <svg onload=alert(1)> 了" 吧',
+      '<p>"<script>alert(2)</script>"</p>'
+    ]
+    for (const h of cases) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/<(?:iframe|svg|script)\b/i.test(r), false, `文本引号内主动标签应移除: ${h} → ${r}`)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `事件属性不应残留: ${h} → ${r}`)
+    }
+  })
+
   await test('sanitizeDecodedHtml 嵌套引号 script 内容被移除（Round2 C002）', () => {
     const cases = [
       '前<script>var s = "<img src=x onerror=alert(1)>";</script>后',

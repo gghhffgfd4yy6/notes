@@ -490,26 +490,17 @@ const Utils = {
     html = html.replace(/\u0000/g, '')
     html = this.sanitizeHtmlUrls(html)
     // 成对和未闭合的主动标签都处理：不依赖恶意输入自觉补齐闭合标签。
-    // Round2 C002 二次修复：先把引号对整体保护为占位符，避免引号内嵌套
-    // `<script>` 干扰主动标签正则的嵌套边界（如 `<script>a="<script>b</script><img onerror>` 泄漏）。
-    // 引号内 < 已保护后恢复宽松 [\s\S]*?；入口 100k 截断使最坏回溯有界（C002 ReDoS 不回归）。
-    {
-      const quoteStore = []
-      html = html.replace(/"[^"]*"/g, (m) => {
-        quoteStore.push(m)
-        return '\u0002' + (quoteStore.length - 1) + '\u0002'
-      })
-      html = html.replace(/'[^']*'/g, (m) => {
-        quoteStore.push(m)
-        return '\u0002' + (quoteStore.length - 1) + '\u0002'
-      })
-      html = html
-        .replace(/<(?:script|style|iframe|object|svg|math)\b[\s\S]*?<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
-        .replace(/<(?:script|style|iframe|object|embed|svg|math)\b[^<>]*>/gi, '')
-        .replace(/<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
-        .replace(/<(?:base|link|meta)\b[^<>]*>/gi, '')
-      html = html.replace(/\u0002(\d+)\u0002/g, (_, i) => quoteStore[Number(i)])
-    }
+    // Round2 C002 终修：恢复宽松 [\s\S]*?（HTML 语义：script 内容中第一个 </script> 即闭合，
+    // 与浏览器解析一致；闭合后残留的标签由下方未闭合移除与事件属性清洗链兜底）。
+    // 不再做全局引号保护——全局引号保护会把文本中的 "<iframe src=x>" 也保护为占位符，
+    // 导致文本中的真实主动标签漏网（验证 agent 复核发现的可执行泄漏）。
+    // 性能：入口 100k 截断使最坏回溯有界（10 万字符实测 ~270ms）。
+    html = html
+      .replace(/<(?:script|style|iframe|object|svg|math)\b[\s\S]*?<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
+      .replace(/<(?:script|style|iframe|object|embed|svg|math)\b[^<>]*>/gi, '')
+      .replace(/<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
+    // 基础/外链/刷新标签可改变文档导航或加载外部资源，HTML 推送不需要它们。
+      .replace(/<(?:base|link|meta)\b[^<>]*>/gi, '')
     // v3.254 P0(XSS)：事件属性名前的分隔符允许引号——HTML5 tokenizer 在引号值闭合后紧跟
     // 字符会将其解析为新属性名，故 `<img src="x"onerror="alert(1)">`（src 引号值与 onerror
     // 间无空格）也是合法事件属性；此前仅匹配空白或 / 会完全绕过清洗。
