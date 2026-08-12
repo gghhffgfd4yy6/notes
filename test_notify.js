@@ -1172,6 +1172,77 @@ console.log('========================================\n');
     cleanLoad() // 恢复干净模块（后续汇总不受 env 残留影响）
   })
 
+  // C030：Pusher.send 的 htmlLike 正则 O(n²)——大量 `<tag ` 前缀但全文无 `>` 的超长输入必须快速返回。
+  // Round2 C030：100k 截断统一提前到入口，检测与清洗作用于同一份（截断后的）desp，
+  // 避免“检测截断、清洗不截断”导致第 100k 后的 HTML 绕过出口清洗（行为回归）。
+  await test('Pusher.send: 超长无 > 输入入口截断且耗时 < 1s', async () => {
+    const xbk = require('./xbk_function_v3.js')
+    const longNoClose = '<a '.repeat(100000) // 30 万字符，无 >
+    const started = Date.now()
+    let sentDesp = null
+    await xbk.Pusher.send('标题', longNoClose, { sendNotify: async (t, d) => { sentDesp = d } })
+    const cost = Date.now() - started
+    assert(cost < 1000, `超长无 > 输入应 <1s，实际 ${cost}ms`)
+    assert(sentDesp === longNoClose.slice(0, 100000), '无 HTML 闭合时超长 desp 应入口截断到 100k')
+  })
+
+  // Round2 C030：截断必须发生在清洗前，第 100k 后的 HTML 不再进入发送内容（消除检测截断/清洗不截断的不一致）。
+  await test('Pusher.send: 第 100k 后的 HTML 不绕过出口清洗（Round2 C030）', async () => {
+    const xbk = require('./xbk_function_v3.js')
+    const prefix = 'x'.repeat(100001) // 前 100k 无 HTML 形态
+    const attack = '<script>alert(1)</script>'
+    let sentDesp = null
+    await xbk.Pusher.send('标题', prefix + attack, { sendNotify: async (t, d) => { sentDesp = d } })
+    assert(sentDesp.length <= 100000, `超长 desp 应入口截断到 100k，实际 ${sentDesp.length}`)
+    assert(!sentDesp.includes('<script'), '第 100k 后的 HTML 不应出现在发送内容')
+    assert(sentDesp.endsWith('x'), '截断边界不应混入 attack 前缀')
+  })
+
+  // Round2 C030 回归：入口截断后，位于前 100k 的主动 HTML 仍按既有 C001/C002/C010/C045 口径清洗。
+  await test('Pusher.send: 前 100k 内主动 HTML 边界用例仍清洗（C001/C002/C010/C045）', async () => {
+    const xbk = require('./xbk_function_v3.js')
+    let chain = '<img '
+    for (let i = 0; i < 32; i++) chain += `onerror${i}="x"`
+    chain += '>'
+    const cases = [
+      {
+        name: 'C001 32 链事件属性',
+        input: chain,
+        check: (out) => !/\bon[a-z][a-z0-9_-]*\s*=/i.test(out)
+      },
+      {
+        name: 'C002 嵌套引号 script',
+        input: '前<script>a="<script>b</script><img src=x onerror=alert(1)>";</script>后',
+        check: (out) => !out.includes('<script') && !/\bon[a-z][a-z0-9_-]*\s*=/i.test(out)
+      },
+      {
+        name: 'C010 style 超界码点',
+        input: '<div style="background:\\u110000url(javascript:alert(1))">x</div>',
+        check: (out) => !/url\s*\(/i.test(out) && !out.includes('javascript')
+      },
+      {
+        name: 'C045 未闭合引号事件属性',
+        input: '<img src="x" onerror="a>',
+        check: (out) => !/\bon[a-z][a-z0-9_-]*\s*=/i.test(out)
+      },
+      {
+        name: 'C045 未闭合引号属性不吞文本',
+        input: '<p title="unterminated>text</p>',
+        check: (out) => out.includes('text')
+      },
+      {
+        name: 'C017 单数字月日文本不被破坏',
+        input: '2026-8-1T10:30 单数字月日正常文本',
+        check: (out) => out.includes('2026-8-1T10:30')
+      }
+    ]
+    for (const c of cases) {
+      let sentDesp = null
+      await xbk.Pusher.send('标题', c.input, { sendNotify: async (t, d) => { sentDesp = d } })
+      assert(c.check(sentDesp), `${c.name} 出口清洗不符合预期: ${sentDesp.slice(0, 120)}`)
+    }
+  })
+
   if (failed === 0) {
     console.log(`  🎉 通道测试通过 ${passed}/${passed}`)
   } else {

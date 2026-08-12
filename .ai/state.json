@@ -1,30 +1,75 @@
 {
-  "round": 1,
-  "commit": "d049676",
-  "candidate_count": 124,
-  "confirmed_count": 9,
-  "rejected_count": 2,
-  "design_count": 4,
+  "round": 2,
+  "commit": null,
+  "candidate_count": 45,
+  "confirmed_count": 31,
+  "rejected_count": 11,
+  "design_count": 7,
   "workbook_erratum_count": 15,
-  "fixed_count": 9,
+  "fixed_count": 31,
   "failed_count": 0,
   "verification_status": "done",
-  "note": "round1 = v3.257 124-agent 审查（验证既有修复点模式）：124 候选全部裁判完毕，9 项确认并修复（P1/P2 人工 3 + P3 子代理 6），2 项误报（065/084），4 项设计边界（031/036/041/025），15 项工作簿归类错误已勘误；9 个独立验证 agent 复核通过（t62 隔离问题已修）。",
+  "note": "round2 = 全函数找bug审查：8观察者分区审查→55候选聚类45→裁判→31 CONFIRMED（P1×3/P2×6/P3×22）→31子代理串行修复→31独立验证→7二次修复→全量绿。DESIGN 7（C019/023/031/034/037/039/044），REJECTED/LOW 11，DUPLICATE 1（C012=round1 DESIGN-001）。",
   "bugs": {
-    "BUG-001": {"status": "CONFIRMED+FIXED", "id": 89, "level": "P1", "fn": "_updateReport", "desc": "日报发送成功后今日统计双重计数", "evidence": "成功回调 acc(state) 与 pend2（含 summary）各计一次", "patch": "ee740f4", "test": "t62_report_nodup（后补独立 cacheDir 隔离）", "verification": "V089 agent: fixCorrect=YES, t62 隔离修复后串行 119/119"},
-    "BUG-002": {"status": "CONFIRMED+FIXED", "id": 86, "level": "P2", "fn": "sanitizeDecodedHtml", "desc": "引号值内 on 开头合法 URL 被误清空", "evidence": "href=\"onclick=x\" 实测被清成 href=\"\"", "patch": "ee740f4", "test": "test_filter 4 用例（keep/strip）", "verification": "V086 agent: fixCorrect=YES，XSS 回归不破"},
-    "BUG-003": {"status": "CONFIRMED+FIXED", "id": 49, "level": "P2", "fn": "writeRunLog", "desc": "锁失败仍截尾（fail-open 与注释不符）", "evidence": "lockFd<0 时仍执行读改写截尾", "patch": "ee740f4", "test": "t63_runlog_lock", "verification": "V049 agent: fixCorrect=YES"},
-    "BUG-004": {"status": "CONFIRMED+FIXED", "id": 73, "level": "P3", "fn": "truncateUtf16", "desc": "区域指示符误删旗帜 emoji", "evidence": "truncateUtf16('A🇨🇳',2)=''", "patch": "99c0e24", "test": "test_filter 旗帜用例", "verification": "V073 agent: fixCorrect=YES"},
-    "BUG-005": {"status": "CONFIRMED+FIXED", "id": 18, "level": "P3", "fn": "whitelistFilter", "desc": "空串被通配正则命中", "evidence": "whitelistFilter({title:''},'title','.*')=true", "patch": "99c0e24", "test": "test_filter 空串用例", "verification": "V018 agent: fixCorrect=YES"},
-    "BUG-006": {"status": "CONFIRMED+FIXED", "id": 98, "level": "P3", "fn": "htmlToMarkdown", "desc": "nested-a 剥离误删字面 &lt;a&gt; 文本", "evidence": "字面 &lt;a&gt; 被解码后误剥", "patch": "99c0e24", "test": "test_filter 字面/nested 用例", "verification": "V098 agent: fixCorrect=YES"},
-    "BUG-007": {"status": "CONFIRMED+FIXED", "id": 110, "level": "P3", "fn": "validateConfig", "desc": "警告去重被移除", "evidence": "return warnings 替代 new Set", "patch": "99c0e24", "test": "test_filter 去重用例", "verification": "V110 agent: fixCorrect=YES"},
-    "BUG-008": {"status": "CONFIRMED+FIXED", "id": 114, "level": "P3", "fn": "readMessages", "desc": "恢复失败仍标记 _verified 不再重试", "evidence": "restored=false 仍 add verified", "patch": "99c0e24", "test": "test_filter 恢复重试用例", "verification": "V114 agent: fixCorrect=YES"},
-    "BUG-009": {"status": "CONFIRMED+FIXED", "id": 109, "level": "P3", "fn": "compileRules", "desc": "类型守卫漏 boolean/bigint", "evidence": "compileRules({pingbibiaoti:true}) 仍编译", "patch": "99c0e24", "test": "test_filter 类型守卫用例", "verification": "V109 agent: fixCorrect=YES"},
-    "REJECTED-001": {"status": "REJECTED", "id": 65, "desc": "sanitizeHtmlUrls 吞合法 href——实测不复现（v3.252 已修正则）"},
-    "REJECTED-002": {"status": "REJECTED", "id": 84, "desc": "NOW 单调残余——当前代码已是 v3.253 严格单调版"},
-    "DESIGN-001": {"status": "DESIGN", "id": 31, "desc": "_capReInput 截断改变锚点语义——ReDoS 防御取舍"},
-    "DESIGN-002": {"status": "DESIGN", "id": 36, "desc": "anonKey 64 位破坏旧 32 位稳定键——碰撞率 vs 稳定键取舍"},
-    "DESIGN-003": {"status": "DESIGN", "id": 41, "desc": "checkCategory 修复不可达——上游已禁用 multi"},
-    "DESIGN-004": {"status": "DESIGN", "id": 25, "desc": "readSafeText TOCTOU——需 fd 方案，xbk_storage 既有边界"}
+    "R2-C001": {
+      "status": "CONFIRMED+FIXED",
+      "level": "P1",
+      "fn": "sanitizeDecodedHtml",
+      "desc": "事件属性残留XSS",
+      "verification": "验证agent+二次修复"
+    },
+    "R2-C005": {
+      "status": "CONFIRMED+FIXED",
+      "level": "P1",
+      "fn": "readMessages/App.run",
+      "desc": "损坏缓存重复推送"
+    },
+    "R2-C008": {
+      "status": "CONFIRMED+FIXED",
+      "level": "P1",
+      "fn": "htmlToMarkdown",
+      "desc": "Markdown注入"
+    },
+    "R2-C002": {
+      "status": "CONFIRMED+FIXED",
+      "level": "P2",
+      "fn": "sanitizeDecodedHtml",
+      "desc": "主动标签O(n²)"
+    },
+    "R2-C006": {
+      "status": "CONFIRMED+FIXED",
+      "level": "P2",
+      "fn": "getMessageIdentity",
+      "desc": "继承id判重"
+    },
+    "R2-C007": {
+      "status": "CONFIRMED+FIXED",
+      "level": "P2",
+      "fn": "_legacyCompileKey",
+      "desc": "缓存键击穿"
+    },
+    "R2-C009": {
+      "status": "CONFIRMED+FIXED",
+      "level": "P2",
+      "fn": "isDangerousUrl",
+      "desc": "实体变体绕过"
+    },
+    "R2-C010": {
+      "status": "CONFIRMED+FIXED",
+      "level": "P2",
+      "fn": "sanitizeDecodedHtml",
+      "desc": "style转义绕过"
+    },
+    "R2-C011": {
+      "status": "CONFIRMED+FIXED",
+      "level": "P2",
+      "fn": "tuisong_replace",
+      "desc": "eager rawHtml"
+    },
+    "R2-P3-1": {
+      "status": "CONFIRMED+FIXED",
+      "level": "P3",
+      "desc": "C013/015/016/017/018/022/024/025/030/036/038/040/041/042/043/045/046/047/048/049/050/051 共22项"
+    }
   }
 }

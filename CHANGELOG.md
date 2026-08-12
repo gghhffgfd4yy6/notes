@@ -991,3 +991,16 @@
   - **compileRules 类型守卫补 boolean/bigint**：与 validateConfig 字符串守卫口径对齐（`true → /true/i` 误导性正则被拒）。
 - 修复后派出 9 个验证子代理复核 9 项修复（6 P3 + 3 P1/P2）：8 项无异议；1 项（t62 测试）发现全量串行下因内存状态缓存共享导致失败 → 改为独立 cacheDir 隔离修复。
 - 测试：单元 701/701、集成 119/119（并行+串行）、通道全绿。
+
+## v3.258（Round2 全函数找 bug 审查 + 31 项修复，2026-08-12）
+
+- 按 .ai/README.md v1.0 流水线启动 round2：8 个观察者子代理（Codex CLI）分区只读审查全部模块 → 55 候选聚类 45 → 中央裁判实测验证 → 31 项 CONFIRMED → 31 个修复子代理串行修复（一个 agent 一个 bug）→ 31 个独立验证 agent 复核 → 7 项二次修复 → 全量测试绿。
+- **P1（3 项）**：
+  - **sanitizeDecodedHtml 事件属性残留**（C001）：单次 replace 消费分隔引号导致相邻 on* 属性残留（`<img onerror="a"onclick="b">`）。修复：do-while 逐轮剥除至无变化。
+  - **损坏缓存重复推送**（C005）：readMessages 失败返回 [] 使判重放行 + save 拒写 → 重复轰炸。修复：App.run 判重前检查 `_readFailed` 跳过推送并告警。
+  - **htmlToMarkdown Markdown 注入**（C008）：anchor/alt 文本未转义可注入 `](javascript:)` 链接。修复：拼入前转义 `[ ] \`。
+- **P2（6 项）**：C002 sanitizeDecodedHtml 主动标签 O(n²)（100k 截断+引号保护+有界路径）、C006 继承属性 id 判重 vs 落盘丢 id（仅自有属性参与判重）、C007 legacy 缓存键字符串/对象同键击穿（键加 typeof）、C009 `&Colon;/&amp;colon;` 变体绕过（大小写不敏感查表+双编码两轮+关键字后空白拦截）、C010 style CSS 转义绕过（解码转义后跑黑名单）、C011 tuisong_replace eager rawHtml（惰性计算+100k 截断）。
+- **P3（22 项）**：C013 matchesCompiled 0/false 缺失语义、C015 filterHash 类型归一、C016 alert/report enabled 口径、C017 parseTime 时区/斜杠日期、C018 truncateUtf16 ZWJ 二次删除、C022 cacheDir 应急路径符号链接、C024 saveBatch 内容一致仍落盘、C025 timestamp 单调共享、C030 Pusher htmlLike O(n²)（入口 100k 截断）、C036 safeErrorText 原始值、C038 零宽字符过滤归一、C040 模板占位符清单、C041 frozen item 赋值、C042 init 移入 try、C043 日志异常截断、C045 引号内 > 标签解析、C046 截断代理对、C047 compileRules function 守卫、C048 trim 口径、C049 pingbitime 多行口径、C050 whitelistFilter 非字符串 keyword、C051 空标题语义。
+- **独立复核发现的二次修复（7 项）**：C001 轮数上限不足（32 链）→ 无限收敛、C002 嵌套引号 script 泄漏 → 引号保护、C008 哨兵字符回归 → 直接转义、C010 CSS 转义超界码点抛错 → 码点校验、C017 isoZ 单数字月日回归 → NaN 回退、C030 截断后清洗不一致 → 入口统一截断、C045 可选引号吞文本 → 必选闭合引号。
+- 设计边界 7 项（DESIGN）：C019/023/031/034/037/039/044；理论项 11 项（REJECTED/LOW_VALUE）；1 项 DUPLICATE（= round1 DESIGN-001）。
+- 测试：单元 731+、集成 119+、通道全绿。

@@ -6,7 +6,7 @@
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================
 
-const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, runSingleEntry, hasNestedQuantifier, truncateUtf16 } = require('./xbk_function_v3.js')
+const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash } = require('./xbk_function_v3.js')
 const assert = require('assert')
 const path = require('path')
 // 缓存目录（基于 __dirname——v3.113 修复 /workspace 硬编码，仓库可移植）
@@ -719,6 +719,75 @@ console.log('========================================\n');
     assertEqual(r3.includes('[链接](http://url)'), true, `复杂嵌套链接应保留: ${r3}`)
   })
 
+  await test('htmlToMarkdown anchor 文本 ](javascript:) 不注入（Round2 C008）', () => {
+    const r = htmlToMarkdown({ content_html: '<a href="https://x.com">foo](javascript:alert(1))</a>', url: '' })
+    assertEqual(r.includes('[foo](javascript:'), false, `不得生成 javascript 链接: ${r}`)
+    assertEqual(r.includes('\\]'), true, `] 应转义: ${r}`)
+    assertEqual(r.includes('(https://x.com)'), true, `仍保留安全 href: ${r}`)
+  })
+
+  await test('htmlToMarkdown img alt ](javascript:) 不注入（Round2 C008）', () => {
+    const r = htmlToMarkdown({ content_html: '<img src="http://x.jpg" alt="x](javascript:y)">', url: '' })
+    assertEqual(r.includes('![x](javascript:'), false, `img alt 不得生成 javascript 链接: ${r}`)
+    assertEqual(r.includes('\\]'), true, `alt ] 应转义: ${r}`)
+    assertEqual(r.includes('(http://x.jpg)'), true, `仍保留安全 src: ${r}`)
+  })
+
+  await test('htmlToMarkdown 普通链接不回归（Round2 C008）', () => {
+    const r1 = htmlToMarkdown({ content_html: '<a href="https://x.com">text</a>', url: '' })
+    assertEqual(r1.includes('[text](https://x.com)'), true, `普通链接应正常: ${r1}`)
+    const r2 = htmlToMarkdown({ content_html: '<a href="https://x.com">[text](url)</a>', url: '' })
+    assertEqual(r2.includes('\\[text\\]'), true, `字面 [text](url) 应转义括号: ${r2}`)
+    assertEqual(r2.includes('[text](url)'), false, `不应生成嵌套链接: ${r2}`)
+  })
+
+  await test('htmlToMarkdown 嵌套 <img> 于 <a> 内各自独立转义（Round2 C008 二次修复）', () => {
+    const r = htmlToMarkdown({ content_html: '<a href="https://x.com">before <img src="http://p.jpg" alt="pic[1]"> after</a>', url: '' })
+    assertEqual(r.includes('[before'), true, `anchor 文本应保留: ${r}`)
+    assertEqual(r.includes(' after](https://x.com)'), true, `anchor 闭合应正常: ${r}`)
+    assertEqual(r.includes('![pic\\[1\\]](http://p.jpg)'), true, `img alt 应独立转义且图片转换正常: ${r}`)
+    assertEqual(/\u0003|\u0004/.test(r), false, `不应残留哨兵字符: ${JSON.stringify(r)}`)
+  })
+
+  await test('htmlToMarkdown 文本含字面 \u0003/\u0004 不冲突（Round2 C008 二次修复）', () => {
+    const r1 = htmlToMarkdown({ content_html: '<a href="https://x.com">a\u0003b\u0004c</a>', url: '' })
+    assertEqual(r1.includes('a\u0003b\u0004c'), true, `anchor 字面哨兵字符应原样保留: ${JSON.stringify(r1)}`)
+    const r2 = htmlToMarkdown({ content_html: '<img src="http://p.jpg" alt="a\u0003b\u0004c">', url: '' })
+    assertEqual(r2.includes('a\u0003b\u0004c'), true, `alt 字面哨兵字符应原样保留: ${JSON.stringify(r2)}`)
+  })
+
+  await test('htmlToMarkdown 嵌套 <img> + 字面哨兵字符组合不互相干扰（Round2 C008 二次修复）', () => {
+    const r = htmlToMarkdown({ content_html: '<a href="https://x.com">\u0003 <img src="http://p.jpg" alt="\u0004pic[1](javascript:y)"> \u0004</a>', url: '' })
+    assertEqual(/(?<!\\)\]\(javascript:/i.test(r), false, `img alt 不得形成 javascript 链接: ${JSON.stringify(r)}`)
+    assertEqual(r.includes('\\[1\\]'), true, `img alt 中的 ] 应转义: ${JSON.stringify(r)}`)
+    assertEqual(r.includes('\u0003'), true, `anchor 字面哨兵字符应原样保留: ${JSON.stringify(r)}`)
+    assertEqual(r.includes('\u0004'), true, `alt 字面哨兵字符应原样保留: ${JSON.stringify(r)}`)
+  })
+
+  await test('htmlToMarkdown anchor 实体编码 ] 也转义（Round2 C008 二次修复）', () => {
+    const r = htmlToMarkdown({ content_html: '<a href="https://x.com">foo&#93;(javascript:alert(1))</a>', url: '' })
+    assertEqual(r.includes('[foo](javascript:'), false, `实体编码 ] 不得形成 javascript 链接: ${r}`)
+    assertEqual(r.includes('\\]'), true, `实体编码 ] 应转义: ${r}`)
+    assertEqual(r.includes('(https://x.com)'), true, `仍保留安全 href: ${r}`)
+  })
+
+  await test('htmlToMarkdown 99999+emoji 截断无孤立代理（C046）', () => {
+    const content = '.'.repeat(99999) + '😀'
+    const r = htmlToMarkdown({ content_html: content, url: '' })
+    let orphan = false
+    for (let i = 0; i < r.length; i++) {
+      const c = r.charCodeAt(i)
+      if (c >= 0xD800 && c <= 0xDBFF) {
+        const n = r.charCodeAt(i + 1)
+        if (!(n >= 0xDC00 && n <= 0xDFFF)) { orphan = true; break }
+      } else if (c >= 0xDC00 && c <= 0xDFFF) {
+        const p = r.charCodeAt(i - 1)
+        if (!(p >= 0xD800 && p <= 0xDBFF)) { orphan = true; break }
+      }
+    }
+    assertEqual(orphan, false, `100k 截断后不应有孤立代理: ${r.length}`)
+  })
+
   // ==================== 16. 缓存管理 ====================
   console.log('\n📂 16. 缓存管理')
 
@@ -977,6 +1046,14 @@ console.log('========================================\n');
       pingbitime: '微博线报###5<br>赚客吧###abc'
     })
     assertEqual(warns.length, 1)
+  })
+  await test('多行天数配置：空值行/小数/超上限均告警（C049）', () => {
+    const warns = validateConfig({
+      pingbitime: '微博线报###<br>赚客吧###1.5<br>好单###3650001'
+    })
+    assertEqual(warns.some(w => w.includes('天数值为空')), true, `空值行应告警: ${JSON.stringify(warns)}`)
+    assertEqual(warns.some(w => w.includes('是小数')), true, `小数行应告警: ${JSON.stringify(warns)}`)
+    assertEqual(warns.some(w => w.includes('超过上限')), true, `超上限应告警: ${JSON.stringify(warns)}`)
   })
 
   await test('空配置对象 → 无警告', () => {
@@ -1661,6 +1738,20 @@ console.log('========================================\n');
     assertEqual(r.pingbifenlei.re.test('好单线报'), false)
   })
 
+  await test('" 美妆 " 校验/编译一致（C048 trim口径）', () => {
+    // 简单模式 validateConfig 与 compileRules 都使用 trim 后的值
+    const cfg = { pingbibiaoti: ' 美妆 ' }
+    assertEqual(validateConfig(cfg).length, 0)
+    const r = compileRules(cfg)
+    assertEqual(r.pingbibiaoti._type, 're')
+    assertEqual(r.pingbibiaoti.re.source, '美妆')
+    assertEqual(matchesCompiled(r.pingbibiaoti, '美妆', '线报'), true)
+
+    // trim 暴露出的非法正则：compileRules 会跳过，validateConfig 也必须告警
+    assertEqual(validateConfig({ pingbibiaoti: ' * ' }).length, 1)
+    assertEqual(compileRules({ pingbibiaoti: ' * ' }).pingbibiaoti, null)
+  })
+
   await test('compileRules ### 多分类字段', () => {
     const r = compileRules({ pingbilouzhu: '线报###小明\n\n线报###小黑' })
     assertEqual(r.pingbilouzhu._type, 'multi')
@@ -1693,6 +1784,11 @@ console.log('========================================\n');
     const r = compileRules({ pingbibiaoti: '京东|淘宝' })
     assertEqual(matchesCompiled(r.pingbibiaoti, '京东神券', '线报'), true)
     assertEqual(matchesCompiled(r.pingbibiaoti, '拼多多', '线报'), false)
+  })
+
+  await test('matchesCompiled 零宽字符归一（C038）', () => {
+    const r = compileRules({ pingbibiaoti: 'bad' })
+    assertEqual(matchesCompiled(r.pingbibiaoti, 'ba\u200Bd', '线报'), true)
   })
 
   await test('matchesCompiled 多分类规则匹配', () => {
@@ -1731,10 +1827,42 @@ console.log('========================================\n');
     assertEqual(r.pingbibiaoti, null)
   })
 
+  await test('compileRules function 值 → null（v3.257 口径对齐）', () => {
+    const r = compileRules({ pingbibiaoti: () => {} })
+    assertEqual(r.pingbibiaoti, null)
+  })
+
   await test('compileRules 正常字符串规则不受影响', () => {
     const r = compileRules({ pingbibiaoti: '京东|淘宝' })
     assertEqual(r.pingbibiaoti._type, 're')
     assertEqual(r.pingbibiaoti.re.test('京东'), true)
+  })
+
+  // ==================== C007 _legacyCompileKey 字符串/对象同缓存键 ====================
+  console.log('\n📂 C007 _legacyCompileKey 字符串/对象同缓存键')
+
+  await test('C007 先字符串后对象：对象按 compileRules null 放行', () => {
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false)
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: { toString: () => 'x' } }), true)
+  })
+
+  await test('C007 先对象后字符串：不互相污染', () => {
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: { toString: () => 'x' } }), true)
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false)
+  })
+
+  await test('C007 同类型同值仍共享缓存', () => {
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false)
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false)
+    assertEqual(listfilter(makeItem({ title: 'y' }), { pingbibiaoti: { toString: () => 'y' } }), true)
+    assertEqual(listfilter(makeItem({ title: 'y' }), { pingbibiaoti: { toString: () => 'y' } }), true)
+  })
+
+  // ==================== C015 filterHash 类型归一 ====================
+  console.log('\n📂 C015 filterHash 类型归一')
+
+  await test('C015 filterHash number 0 与 string "0" 哈希不同', () => {
+    assertEqual(filterHash({ pingbibiaoti: 0 }) === filterHash({ pingbibiaoti: '0' }), false, '0 与 "0" 应不同哈希')
   })
 
   await test('validateConfig 对 true 仍告警（v3.257 口径对齐）', () => {
@@ -1748,6 +1876,10 @@ console.log('========================================\n');
 
   await test('whitelistFilter 空关键词 → 全部通过', () => {
     assertEqual(whitelistFilter({ title: '随便' }, 'title', ''), true)
+  })
+
+  await test('whitelistFilter 非字符串 keyword → 放行', () => {
+    assertEqual(whitelistFilter({ title: 'foo' }, 'title', { toString: () => 'bar' }), true)
   })
 
   await test('whitelistFilter 标题匹配', () => {
@@ -1766,28 +1898,29 @@ console.log('========================================\n');
     assertEqual(whitelistFilter({ louzhu: '小明' }, 'louzhu', '小明'), true)
   })
 
-  await test('whitelistFilter 字段值缺失 → false', () => {
-    assertEqual(whitelistFilter({}, 'title', '京东'), false)
+  await test('whitelistFilter 字段值缺失 → 放行（与 App.run 保留空标题口径一致）', () => {
+    assertEqual(whitelistFilter({}, 'title', '京东'), true)
   })
 
   await test('whitelistFilter 无效正则 → 放行（与 App.run 预编译失败口径一致）', () => {
     assertEqual(whitelistFilter({ title: '京东' }, 'title', '[未闭合'), true)
   })
 
-  await test('whitelistFilter 空串 + .* → false（v3.257 空串视为缺失，不被通配正则放行）', () => {
-    assertEqual(whitelistFilter({ title: '' }, 'title', '.*'), false)
+  await test('whitelistFilter 空串 + .* → true（空串视为缺失，不参与白名单匹配也不拦截）', () => {
+    assertEqual(whitelistFilter({ title: '' }, 'title', '.*'), true)
   })
 
-  await test('whitelistFilter 空串 + 非空关键词 → false', () => {
-    assertEqual(whitelistFilter({ title: '' }, 'title', 'abc'), false)
+  await test('whitelistFilter 空串 + 非空关键词 → true（与 App.run 空标题保留一致）', () => {
+    assertEqual(whitelistFilter({ title: '' }, 'title', 'abc'), true)
+    assertEqual(whitelistFilter({ title: '' }, 'title', 'foo'), true)
   })
 
   await test('whitelistFilter 0 + 关键词 "0" → true（0 参与匹配）', () => {
     assertEqual(whitelistFilter({ title: 0 }, 'title', '0'), true)
   })
 
-  await test('whitelistFilter undefined → false', () => {
-    assertEqual(whitelistFilter({ title: undefined }, 'title', '.*'), false)
+  await test('whitelistFilter undefined → true（缺失视为放行）', () => {
+    assertEqual(whitelistFilter({ title: undefined }, 'title', '.*'), true)
   })
 
   await test('whitelistFilter 正常值匹配不受影响', () => {
@@ -1873,6 +2006,23 @@ console.log('========================================\n');
       content_html: '<h2>标题</h2>', url: 'http://x'
     })
     assertEqual(r.includes('## 标题'), true)
+    assertEqual(r.includes('原文链接'), true)
+  })
+
+  await test('模板不用Html内容 → rawHtml 惰性生效（100k content_html <500ms）', () => {
+    const big = 'a'.repeat(100000)
+    const t0 = Date.now()
+    const r = tuisong_replace('{标题}', { title: '测试', content_html: big })
+    const dt = Date.now() - t0
+    assertEqual(r, '测试')
+    assertEqual(dt < 500, true, `耗时 ${dt}ms 应 <500ms`)
+  })
+
+  await test('模板用Html内容 → 功能不回归', () => {
+    const r = tuisong_replace('{Html内容}', {
+      content_html: '<p>hello</p>', url: 'http://x'
+    })
+    assertEqual(r.includes('hello'), true)
     assertEqual(r.includes('原文链接'), true)
   })
 
@@ -2003,6 +2153,8 @@ console.log('========================================\n');
     assertEqual(truncateUtf16('👨👩👧👦', 5), '👨👩', 'max=5 → 完整前两个（无孤立 ZWJ）')
     const r5 = truncateUtf16('👨👩👧👦', 5)
     assertEqual(r5.endsWith('\u200D'), false, '末尾不应是孤立 ZWJ')
+    // Round2 C018：删除末尾 ZWJ 后不再二次回退
+    assertEqual(truncateUtf16('a\u200Db', 2), 'a', 'a\u200Db max=2 → 保留 a（曾误删为空）')
     // 变体选择符：❤️ max=1 → 退位为空（不丢 VS16 留残缺 ❤）
     assertEqual(truncateUtf16('❤️', 1), '', 'VS16 序列 max=1 → 保守退位')
     // 组合字符：e + 重音 max=1 → 退位（不丢重音留残缺 e）
@@ -2441,6 +2593,16 @@ console.log('========================================\n');
     assertEqual(matchesCompiled(r.pingbibiaoti, '', '线报'), false)
   })
 
+  await test('matchesCompiled 0/false 参与匹配（非缺失）', () => {
+    // 修复 !fieldValue 短路把 0/false 误判为缺失：0/false 应参与匹配
+    assertEqual(matchesCompiled({ _type: 're', re: /0/i }, 0), true)
+    assertEqual(matchesCompiled({ _type: 're', re: /false/i }, false), true)
+    assertEqual(matchesCompiled({ _type: 're', re: /0/i }, '0'), true)
+    assertEqual(matchesCompiled({ _type: 're', re: /false/i }, 'false'), true)
+    assertEqual(matchesCompiled({ _type: 're', re: /0/i }, '1'), false)
+    assertEqual(matchesCompiled({ _type: 're', re: /false/i }, 'true'), false)
+  })
+
   await test('checkTimeCompiled compiled为null → null', () => {
     assertEqual(checkTimeCompiled(null, { louzhuregtime: daysAgo(4) }), null)
   })
@@ -2587,14 +2749,13 @@ console.log('========================================\n');
     assertEqual(isMessageInFile({ id: '999', title: '新', url: 'https://x.com/2' }, 'test_m1_urlfallback.json'), false, '有id不同不判重')
   })
 
-  await test('M2: whitelistFilter 字段空值 + 非空关键词 → false（严格白名单语义）', () => {
-    // 主流程只看它保留空标题（!it.title），但导出 API whitelistFilter 是严格白名单：空值不匹配 → 滤掉
-    // 锁定该语义（防未来误改成与主流程混同）；语义差异由调用方（主流程内联）隔离
-    assertEqual(whitelistFilter({ title: '' }, 'title', '京东'), false, '空标题+关键词应滤掉')
-    assertEqual(whitelistFilter({ title: undefined }, 'title', '京东'), false, '缺标题+关键词应滤掉')
-    assertEqual(whitelistFilter({ content: '' }, 'content', '京东'), false, '空内容+关键词应滤掉')
+  await test('M2: whitelistFilter 字段空值/缺失 → 放行（与 App.run 空标题保留一致）', () => {
+    // 主流程只看它保留空标题（!it.title），导出 API whitelistFilter 同步统一：空/缺失值不参与匹配也不拦截
+    assertEqual(whitelistFilter({ title: '' }, 'title', '京东'), true, '空标题+关键词应放行')
+    assertEqual(whitelistFilter({ title: undefined }, 'title', '京东'), true, '缺标题+关键词应放行')
+    assertEqual(whitelistFilter({ content: '' }, 'content', '京东'), true, '空内容+关键词应放行')
     assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true, '正常匹配仍保留')
-    // 已定义假值（0/false）视为有效内容参与匹配（仅 undefined/null 视为字段缺失）；
+    // 已定义假值（0/false）视为有效内容参与匹配（仅 undefined/null/空串视为字段缺失）；
     // 修复 !value 短路把 0 误判为不匹配：0 应可被关键词 '0' 命中
     assertEqual(whitelistFilter({ title: 0 }, 'title', '0'), true, 'title=0 + 关键词0 应命中（0 是有效值）')
     assertEqual(whitelistFilter({ title: false }, 'title', 'false'), true, 'title=false + 关键词false 应命中（false 是有效值）')
@@ -2991,6 +3152,19 @@ console.log('========================================\n');
     assertEqual(r2.includes('### 标题'), false)
   })
 
+  await test('htmlToMarkdown 引号内 > 不截断 + 未闭合引号不吞文本（Round2 C045）', () => {
+    const r = htmlToMarkdown({ content_html: '<h1 title="a>b">text</h1>', url: '' })
+    assertEqual(r, '# text', '引号内 > 不应截断 h 标签')
+    // C045 二次修复：未闭合引号的属性值在第一个 > 处结束，不吞后续标签/文本
+    assertEqual(htmlToMarkdown({ content_html: '<p title="unterminated>text</p>', url: '' }), 'text', '未闭合双引号属性不应吞文本')
+    assertEqual(htmlToMarkdown({ content_html: "<p title='unterminated>text</p>", url: '' }), 'text', '未闭合单引号属性不应吞文本')
+    assertEqual(htmlToMarkdown({ content_html: '<h1 title="unterminated>text</h1>', url: '' }), '# text', '未闭合引号 h1 不应吞文本')
+    assertEqual(htmlToMarkdown({ content_html: "<h1 title='a>b'>text</h1>", url: '' }), '# text', '闭合单引号含 > h1 仍应正确')
+    assertEqual(htmlToMarkdown({ content_html: "<h1 title='unterminated>text</h1>", url: '' }), '# text', '未闭合单引号 h1 不应吞文本')
+    assertEqual(htmlToMarkdown({ content_html: '<p title="a>b">text</p>', url: '' }), 'text', '闭合双引号含 > p 仍应正确')
+    assertEqual(htmlToMarkdown({ content_html: "<p title='a>b'>text</p>", url: '' }), 'text', '闭合单引号含 > p 仍应正确')
+  })
+
   await test('whitelistFilter 大小写不敏感（i flag）', () => {
     assertEqual(whitelistFilter({ title: 'JINGDONG神券' }, 'title', 'jingdong'), true)
     assertEqual(whitelistFilter({ title: '京东神券' }, 'title', 'JD'), false)
@@ -3068,10 +3242,10 @@ console.log('========================================\n');
     assertEqual(matchesCompiled(compiled.pingbilouzhu, '小明', '微博线报'), true)
   })
 
-  await test('whitelistFilter 字段名大小写敏感', () => {
-    // 字段名是精确的，不因大小写变化
+  await test('whitelistFilter 字段名大小写敏感（缺失字段放行）', () => {
+    // 字段名是精确的，不因大小写变化；缺失字段（大小写不匹配）按空值放行
     assertEqual(whitelistFilter({ title: '京东' }, 'title', '京东'), true)
-    assertEqual(whitelistFilter({ Title: '京东' }, 'title', '京东'), false)
+    assertEqual(whitelistFilter({ Title: '京东' }, 'title', '京东'), true)
   })
 
   await test('MS save 时间戳格式为ISO完整', () => {
@@ -3409,10 +3583,10 @@ console.log('========================================\n');
     }
   })
 
-  await test('whitelistFilter 空字段不匹配任何关键词（变异删空值检查会误判）', () => {
-    // 变异删除 if(!value) return false 后，空字段会与 'undefined' 字符串比对
-    assertEqual(whitelistFilter({ title: '' }, 'title', 'undefined'), false)
-    assertEqual(whitelistFilter({ title: undefined }, 'title', 'undefined'), false)
+  await test('whitelistFilter 空字段不参与匹配（缺失按放行，不与关键词比对）', () => {
+    // 空/缺失字段按缺失放行，不会与 'undefined' 等关键词比对
+    assertEqual(whitelistFilter({ title: '' }, 'title', 'undefined'), true)
+    assertEqual(whitelistFilter({ title: undefined }, 'title', 'undefined'), true)
   })
 
   await test('htmlToMarkdown h标签替换模板无附加字符（变异模板后追加x）', () => {
@@ -3642,6 +3816,63 @@ console.log('========================================\n');
     assertEqual(r.map(m => m.title).join(','), 'A,B')
   })
 
+  // ==================== C006 继承属性 id 判重 vs 落盘丢 id ====================
+  console.log('\n📂 C006 继承属性 id 判重 vs 落盘丢 id')
+
+  await test('C006 继承 id 不参与判重（无自有字段不落盘，避免重复入库）', async () => {
+    const fs = require('fs')
+    const name = 'test_c006_inherited_noown.json'
+    const p = getFilePath(name)
+    try { fs.unlinkSync(p) } catch (e) {}
+    saveBatch([Object.create({ id: 'X' })], name)
+    assertEqual(readMessages(p).length, 0, `仅继承 id 且无自有字段的消息不应落盘，实际${readMessages(p).length}`)
+    assertEqual(isMessageInFile(Object.create({ id: 'X' }), name), false, '仅继承 id 且无自有字段的消息不应命中')
+    try { fs.unlinkSync(p) } catch (e) {}
+  })
+
+  await test('C006 继承 id 不参与判重（同构造含自有字段消息 saveBatch 后 has 命中）', async () => {
+    const fs = require('fs')
+    const name = 'test_c006_inherited_ownfields.json'
+    const p = getFilePath(name)
+    try { fs.unlinkSync(p) } catch (e) {}
+    const mk = () => { const m = Object.create({ id: 'X' }); m.title = '继承ID消息'; return m }
+    saveBatch([mk()], name)
+    assertEqual(isMessageInFile(mk(), name), true, '继承 id 不应参与判重，同构造消息应命中')
+    const stored = readMessages(p)
+    assertEqual(stored.length, 1, `同构造消息应合并为1条，实际${stored.length}`)
+    assertEqual(Object.prototype.hasOwnProperty.call(stored[0], 'id'), false, '落盘副本不应携带继承 id')
+    try { fs.unlinkSync(p) } catch (e) {}
+  })
+
+  await test('C006 自有 id 正常判重', async () => {
+    const fs = require('fs')
+    const name = 'test_c006_own_id.json'
+    const p = getFilePath(name)
+    try { fs.unlinkSync(p) } catch (e) {}
+    const mk = () => {
+      const m = Object.create({ id: 'X' })
+      m.id = 'own-X'
+      m.title = '自有ID消息'
+      return m
+    }
+    saveBatch([mk()], name)
+    assertEqual(isMessageInFile(mk(), name), true, '自有 id 应正常判重命中')
+    assertEqual(readMessages(p).length, 1, `自有 id 同构造消息应合并为1条，实际${readMessages(p).length}`)
+    try { fs.unlinkSync(p) } catch (e) {}
+  })
+
+  await test('C006 原身份用例不回归（普通自有 id/url 判重）', async () => {
+    const fs = require('fs')
+    const name = 'test_c006_regress.json'
+    const p = getFilePath(name)
+    try { fs.unlinkSync(p) } catch (e) {}
+    saveBatch([{ id: 'c006-a', url: '/c006.html', title: 'old' }], name)
+    saveBatch([{ id: 'c006-a', url: '/c006-other.html', title: 'new' }], name)
+    assertEqual(readMessages(p).length, 1, `同自有 id 跨 url 仍应合并为1条，实际${readMessages(p).length}`)
+    try { fs.unlinkSync(p) } catch (e) {}
+  })
+
+
   await test('decodeHtmlEntities 超BMP emoji 实体（v3.20审查7：fromCodePoint）', () => {
     assertEqual(decodeHtmlEntities('&#128512;'), '😀')
     assertEqual(decodeHtmlEntities('&#x1F600;'), '😀')
@@ -3669,6 +3900,18 @@ console.log('========================================\n');
     assertEqual(daysComputed('2026-02-31'), 0)
     assertEqual(daysComputed('2026-13-01'), 0)
     assertEqual(daysComputed('2026-00-10'), 0)
+  })
+
+  await test('parseTime 斜杠/带时区 ISO 非法日期 → null（C017：宿主解析曾滚动到 2026-03-03）', () => {
+    // parseTime 未单独导出，用 daysComputed 断言 parseTime(...)===null → 0
+    assertEqual(daysComputed('2026/02/31'), 0, 'parseTime(2026/02/31) 应 null')
+    assertEqual(daysComputed('2026-02-31T00:00:00Z'), 0, 'parseTime(2026-02-31T00:00:00Z) 应 null')
+    // 合法同格式不受影响
+    assertEqual(typeof daysComputed('2026/08/01'), 'number', '合法斜杠日期仍可解析')
+    assertEqual(typeof daysComputed('2026-08-01T00:00:00Z'), 'number', '合法 ISO 仍可解析')
+    // 单数字月/日带时区 ISO（v3.171 行为）：宿主 Invalid 时补零回退，仍应有效
+    assertEqual(daysComputed('2026-8-1T00:00:00Z'), daysComputed('2026-08-01T00:00:00Z'),
+        '合法单数字 ISO 应与补零 ISO 同值（2026-8-1T00:00:00Z）')
   })
 
   await test('daysComputed 脏后缀 2026-07-31abc → 0（v3.21审查2：锚定）', () => {
@@ -4128,6 +4371,12 @@ console.log('========================================\n');
     assertEqual(safeText(circular), '', '循环对象应为空串')
     assertEqual(safeText({ a: 1 }), '{"a":1}', '普通对象保留安全 JSON 摘要')
     assertEqual(safeText('a\uD800b'), 'a�b', '孤立代理应清洗')
+  })
+
+  await test('safeErrorText：0/false 等非空原始值不被吞（Round2 C036）', () => {
+    assertEqual(safeErrorText(0, 'fb'), '0', 'safeErrorText(0) 应为 0 的字符串')
+    assertEqual(safeErrorText(false, 'fb'), 'false', 'safeErrorText(false) 应为 false 的字符串')
+    assertEqual(safeErrorText(Symbol('x'), 'fb'), 'Symbol(x)', 'Symbol 不应被吞')
   })
 
   await test('_splitLines 单\r 分隔（#84）', () => {
@@ -4675,6 +4924,34 @@ console.log('========================================\n');
       assertEqual(/(?:javascript|vbscript|data):/i.test(r), false, `实体危险协议不应残留: ${r}`)
       assertEqual(r.includes('正文'), true, '安全文本应保留')
     }
+  })
+
+  await test('安全: 相邻 on* 事件属性逐轮剥除（Round2 C001）', () => {
+    // 单次 replace 连引号分隔符一起消费后，后续相邻 on* 属性会残留；逐轮剥除覆盖该形态
+    const strip = [
+      '<img onerror="alert(1)"onclick="alert(2)">',
+      '<img src="x"onerror="a"onclick="b">'
+    ]
+    for (const h of strip) {
+      const r = htmlToMarkdown({ content_html: h, url: '' })
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `事件属性不应残留: ${h} → ${r.slice(0, 90)}`)
+    }
+    // Round2 二次修复：32 个相邻 on* 属性链（去掉 5 轮上限后应全部剥除，曾残留最后 1 个）
+    let chain = '<img '
+    for (let i = 0; i < 32; i++) chain += `onerror${i}="x"`
+    chain += '>'
+    const r2 = sanitizeDecodedHtml(chain)
+    assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r2), false, `32 链事件属性不应残留: ${r2.slice(0, 90)}`)
+    // 未闭合引号事件属性也应剥除（Round2 C045 边界）
+    for (const h of ['<img src="x"onerror="a>', '<img src="x" onerror="a>']) {
+      const r3 = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r3), false, `未闭合引号事件属性不应残留: ${h} → ${r3.slice(0, 90)}`)
+    }
+    // 回归：引号值内 on 开头的合法 URL 仍应保留
+    const keep = '<a href="onclick=x">link</a>'
+    const r = tuisong_replace('{Html内容}', { content_html: keep, url: 'https://example.com' })
+    const m = keep.match(/href="([^"]*)"/)
+    assertEqual(r.includes(`href="${m[1]}"`), true, `引号值内合法 on 开头值应保留: ${keep} → ${r.slice(0, 90)}`)
   })
 
   await test('安全: 引号值内 on 开头的合法 URL/值不被误伤（v3.257 修复 086）', () => {
@@ -6931,6 +7208,14 @@ console.log('========================================\n');
     assertEqual(validUrl('https://example.com/a\u0000b'), '', 'NUL URL 不应参与身份判重')
   })
 
+  await test('safeUrl 拒绝命名实体/双编码危险协议变体（Round2 C009）', () => {
+    assertEqual(safeUrl('javascript&Colon;alert(1)'), '', '&Colon; 不应绕过危险协议检查')
+    assertEqual(safeUrl('javascript&COLON;alert(1)'), '', '&COLON; 不应绕过危险协议检查')
+    assertEqual(safeUrl('javascript&amp;colon;alert(1)'), '', '&amp;colon; 双编码不应绕过危险协议检查')
+    assertEqual(safeUrl('javascript&Newline;x'), '', '&Newline; 不应绕过危险协议检查')
+    assertEqual(safeUrl('https://example.com/a?b=1'), 'https://example.com/a?b=1', '正常 https URL 不受影响')
+  })
+
   await test('性能: saveBatch 5000 条 <500ms（v3.118 索引化，原 2475ms）', () => {
     const msgs = []
     for (let i = 0; i < 5000; i++) msgs.push({ id: i % 3000, title: 'T' + i, url: '/u/' + (i % 3000) + '.html' })
@@ -7203,6 +7488,82 @@ console.log('========================================\n');
   await test('HTML 图片支持无引号 src/alt', () => {
     const out = htmlToMarkdown({ content_html: '<img src=https://img.example/a.png alt=示例>' })
     assertEqual(out.includes('![示例](https://img.example/a.png)'), true, `无引号图片应转换: ${out}`)
+  })
+
+  // ==================== C002：sanitizeDecodedHtml ReDoS/性能 ====================
+  console.log('\n📂 C002 sanitizeDecodedHtml ReDoS/性能')
+
+  await test('sanitizeDecodedHtml 正常 <script>...</script> 被移除', () => {
+    assertEqual(sanitizeDecodedHtml('a<script>alert(1)</script>b'), 'ab')
+    assertEqual(sanitizeDecodedHtml('<svg><script>x</script></svg>'), '')
+  })
+
+  await test('sanitizeDecodedHtml 嵌套引号 script 内容被移除（Round2 C002）', () => {
+    const cases = [
+      '前<script>var s = "<img src=x onerror=alert(1)>";</script>后',
+      // 验证 agent 边界：引号内再嵌套一个主动标签，曾泄漏 img+onerror
+      '前<script>a="<script>b</script><img src=x onerror=alert(1)>";</script>后'
+    ]
+    for (const h of cases) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(r.includes('<script'), false, `script 不应残留: ${h} → ${r}`)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `嵌套引号内事件属性不应残留: ${h} → ${r}`)
+      assertEqual(r.includes('前'), true, 'script 前文本应保留')
+      assertEqual(r.includes('后'), true, 'script 后文本应保留')
+    }
+  })
+
+  await test('sanitizeDecodedHtml C001 32 链事件属性 + C045 未闭合引号（Round2 C002 回归）', () => {
+    let chain = '<img '
+    for (let i = 0; i < 32; i++) chain += `onerror${i}="x"`
+    chain += '>'
+    const r1 = sanitizeDecodedHtml(chain)
+    assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r1), false, `32 链事件属性不应残留: ${r1.slice(0, 90)}`)
+    for (const h of ['<img src="x"onerror="a>', '<img src="x" onerror="a>']) {
+      const r2 = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r2), false, `未闭合引号事件属性不应残留: ${h} → ${r2.slice(0, 90)}`)
+    }
+  })
+
+  await test('sanitizeDecodedHtml 未闭合主动标签堆叠 <2s（C002）', () => {
+    const input = Array(20000).fill('<script').join(' ')
+    const start = Date.now()
+    console.time('sanitizeDecodedHtml-20k')
+    const out = sanitizeDecodedHtml(input)
+    console.timeEnd('sanitizeDecodedHtml-20k')
+    const cost = Date.now() - start
+    assertEqual(cost < 2000, true, `性能超时 ${cost}ms >= 2000ms`)
+    assertEqual(out.length, 100000, '超长输入应按 100k 截断')
+  })
+
+  await test('sanitizeDecodedHtml style CSS 十六进制转义 url 变体被拦截（Round2 C010）', () => {
+    const r = sanitizeDecodedHtml('<div style="background:u\\72l(javascript:alert(1))">x</div>')
+    assertEqual(/url\s*\(/i.test(r), false, `url( 不应残留: ${r}`)
+    assertEqual(r.includes('javascript'), false, `javascript 不应残留: ${r}`)
+  })
+
+  await test('sanitizeDecodedHtml style CSS 十六进制转义 expression 变体被拦截（Round2 C010）', () => {
+    const r = sanitizeDecodedHtml('<div style="e\\78pression(alert(1))">x</div>')
+    assertEqual(/expression/i.test(r), false, `expression 不应残留: ${r}`)
+  })
+
+  await test('sanitizeDecodedHtml 正常 style 值保留（Round2 C010）', () => {
+    const r = sanitizeDecodedHtml('<div style="color:red">x</div>')
+    assertEqual(r.includes('style="color:red"'), true, `正常 style 应保留: ${r}`)
+  })
+
+  await test('sanitizeDecodedHtml style 超界码点不抛异常且危险 url 仍拦截（Round2 C010）', () => {
+    const inputs = [
+      '<div style="background:\\u110000url(javascript:alert(1))">x</div>',
+      '<div style="background:\\110000url(javascript:alert(1))">x</div>',
+      '<div style="background:\\uFFFFFFurl(javascript:alert(1))">x</div>',
+      '<div style="background:\\FFFFFFurl(javascript:alert(1))">x</div>'
+    ]
+    for (const h of inputs) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/url\s*\(/i.test(r), false, `url( 不应残留: ${r}`)
+      assertEqual(r.includes('javascript'), false, `javascript 不应残留: ${r}`)
+    }
   })
 
   if (failed === 0) {

@@ -21,9 +21,13 @@ let failTimeout = false // 超时失败（code=ETIMEDOUT，会重试）
 let fail429Once = false // 仅第一次抛 429（限流，应重试）
 let failPlainString = false // 抛普通字符串(非 Error)
 let failNonJson = false // 仅第一次返回非 JSON 响应（.json() 抛错，应重试）
+let failLongMsg = false // 抛超长 message 的 Error（C043 日志截断）
 
 require.cache[gotPath].exports = (url, opts) => {
   gotCalls.push({ url, opts })
+  if (failLongMsg) {
+    throw new Error('E'.repeat(3000)) // C043：超长 error.message
+  }
   if (failPlainString) {
     // eslint-disable-next-line no-throw-literal -- 测试字符串异常处理
     throw 'plain string error'
@@ -156,6 +160,7 @@ function reset () {
   fail429Once = false
   failPlainString = false
   failNonJson = false
+  failLongMsg = false
   notifyDelayMs = 0
   notifyFail = false
   notifyFailAt = -1
@@ -401,6 +406,21 @@ console.log('========================================\n');
     Config.keyword.zkt_gjc = '京东'
     fakeData = [makeItem({ id: 1, title: '京东神券' }), makeItem({ id: 2, title: '淘宝特价' })]
     await xbk.run()
+    assert(pushCalls.length === 1, `应只推京东1条，实际${pushCalls.length}`)
+    assert(pushCalls[0].text.includes('京东'), '推送的应是京东')
+  })
+
+  await test('zkt_gjc + frozen item → 不抛错（C041）', async () => {
+    reset()
+    setPushUrl('t09b_kwd_frozen')
+    Config.keyword.zkt_gjc = '京东'
+    fakeData = [
+      makeItem({ id: 1, title: '京东神券' }),
+      Object.freeze(makeItem({ id: 2, title: '淘宝特价' }))
+    ]
+    let crashed = false
+    try { await xbk.run() } catch (e) { crashed = true }
+    assert(!crashed, `frozen item + zkt_gjc 不应抛错: ${crashed}`)
     assert(pushCalls.length === 1, `应只推京东1条，实际${pushCalls.length}`)
     assert(pushCalls[0].text.includes('京东'), '推送的应是京东')
   })
@@ -1137,6 +1157,23 @@ console.log('========================================\n');
     assert(fs.existsSync(logPath), 'run.log 应已创建')
     const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
     assert(lastLine.includes('ERROR'), `应记录 ERROR 行，实际: ${lastLine}`)
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+  })
+
+  await test('超长 error.message 日志行 < 1KB（C043）', async () => {
+    reset()
+    setPushUrl('t_c043_runlog_longmsg')
+    fakeData = []
+    failLongMsg = true
+    try { fs.unlinkSync(path.join(CACHE_DIR, 'run.log')) } catch (e) { /* 忽略 */ }
+    let threw = false
+    try { await xbk.run() } catch (e) { threw = true }
+    assert(threw, '超长错误应使 run 抛错')
+    const logPath = path.join(CACHE_DIR, 'run.log')
+    assert(fs.existsSync(logPath), 'run.log 应已创建')
+    const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
+    assert(lastLine.includes('ERROR'), `应记录 ERROR 行，实际: ${lastLine.slice(0, 80)}`)
+    assert(lastLine.length < 1024, `超长 error.message 日志行应 <1KB，实际 ${lastLine.length}`)
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
   })
 
@@ -2037,6 +2074,23 @@ console.log('========================================\n');
     }
   })
 
+  await test('Config.alert.enabled=" FALSE " 时不发告警（C016）', async () => {
+    reset()
+    setPushUrl('t65_alert_str_space')
+    fakeData = []
+    const orig = Config.alert.enabled
+    try {
+      Config.alert.enabled = ' FALSE ' // 环境变量字符串带空格/大写，应关闭
+      Config.alert.intervalMs = 0
+      fail4xx = true
+      try { await xbk.run() } catch (e) { /* 预期 */ }
+      assert(!pushCalls.some(c => c.text.includes('运行异常')), `" FALSE " 应关闭告警: ${pushCalls.length}`)
+    } finally {
+      Config.alert.enabled = orig
+      try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('parallelLimit 字符串配置生效（v3.158 #24）', async () => {
     reset()
     setPushUrl('t66_plimit_str')
@@ -2499,7 +2553,46 @@ console.log('========================================\n');
     }
   })
 
-  await test('模板含不支持占位符（{价格}等）→ 启动警告且推送不崩（v3.159）', async () => {
+  await test('应急路径 .xbk_cache_safe 符号链接 → cacheDir 不指向外部（C022）', async () => {
+    reset()
+    setPushUrl('t_c022_cache_safe_symlink')
+    fakeData = []
+    const os = require('os')
+    const safeLinkPath = path.join(__dirname, '.xbk_cache_safe')
+    const defaultCachePath = path.join(__dirname, DEFAULT_CACHE_DIR)
+    const externalTarget = path.join(os.tmpdir(), `xbk-cache-safe-${process.pid}`)
+    const backupDefault = path.join(__dirname, `.xbk_cache_safe_default_${process.pid}.bak`)
+    const origCacheDir = Config.cache.dir
+    const removePath = (p) => { try { fs.rmSync(p, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } }
+    try {
+      removePath(backupDefault)
+      removePath(externalTarget)
+      removePath(safeLinkPath)
+      let defaultStat = null
+      try { defaultStat = fs.lstatSync(defaultCachePath) } catch (e) { defaultStat = null }
+      if (defaultStat) {
+        if (defaultStat.isSymbolicLink()) fs.unlinkSync(defaultCachePath)
+        else fs.renameSync(defaultCachePath, backupDefault)
+      }
+      fs.mkdirSync(externalTarget, { recursive: true })
+      fs.symlinkSync(externalTarget, safeLinkPath)
+      fs.symlinkSync(externalTarget, defaultCachePath)
+      Config.cache.dir = '.xbk_cache_safe'
+      const probe = xbk.getFilePath('c022_probe.json')
+      assert(!probe.startsWith(externalTarget), `cacheDir 不应指向外部: ${probe}`)
+      assert(probe.startsWith(__dirname + path.sep), `cacheDir 应留在项目根内: ${probe}`)
+      assert(!probe.startsWith(safeLinkPath + path.sep), `cacheDir 不应使用被符号链接的应急路径: ${probe}`)
+    } finally {
+      Config.cache.dir = origCacheDir
+      removePath(safeLinkPath)
+      removePath(defaultCachePath)
+      removePath(externalTarget)
+      if (fs.existsSync(backupDefault)) fs.renameSync(backupDefault, defaultCachePath)
+      removePath(backupDefault)
+    }
+  })
+
+  await test('模板含 {价格} 无警告且推送不崩（C040）', async () => {
     reset()
     setPushUrl('t67_tpl_warn')
     const origT = Config.template.title; const origC = Config.template.content
@@ -2516,11 +2609,120 @@ console.log('========================================\n');
       Config.template.title = origT
       Config.template.content = origC
     }
-    assert(warns.some(w => w.includes('{价格}') && w.includes('template.content')),
-        `应有模板占位符警告: ${warns.join(' | ')}`)
-    // {价格} 等未知占位符被 tuisong_replace 替换为空（非保留原样）；{标题} 正常替换——推送不崩
+    assert(!warns.some(w => w.includes('{价格}') && w.includes('template.content')),
+        `不应有模板占位符警告: ${warns.join(' | ')}`)
+    // {价格} 等占位符由 tuisong_replace 替换；{标题} 正常替换——推送不崩
     assert(pushCalls.some(c => c.desp.includes('京东神券 100元') && !c.desp.includes('{价格}') && !c.desp.includes('{商城}')),
-        `占位符应替换为空且标题正常: ${pushCalls.map(c => JSON.stringify(c.desp.slice(0, 80))).join('|')}`)
+        `占位符应替换且标题正常: ${pushCalls.map(c => JSON.stringify(c.desp.slice(0, 80))).join('|')}`)
+  })
+
+  await test('损坏缓存文件 → 首次跳过推送防重复轰炸，修复后恢复推送（C005）', async () => {
+    reset()
+    setPushUrl('t99_corrupt_cache')
+    const cachePath = path.join(CACHE_DIR, 't99_corrupt_cache.json')
+    fs.writeFileSync(cachePath, '{ invalid json', 'utf8')
+    fakeData = [makeItem({ id: 9001, title: '损坏缓存测试' })]
+    const origErr = console.error
+    const errs = []
+    console.error = (m) => errs.push(String(m))
+    try {
+      await xbk.run()
+    } finally {
+      console.error = origErr
+    }
+    assert(pushCalls.length === 0, `损坏缓存首次运行不应推送，实际${pushCalls.length}`)
+    assert(errs.some(e => e.includes('缓存读取失败，跳过本轮推送以防重复轰炸')),
+        `应有跳过推送告警: ${errs.join(' | ')}`)
+    // 修复缓存（写合法 JSON 空数组）后恢复正常推送
+    reset()
+    setPushUrl('t99_corrupt_cache')
+    fs.writeFileSync(cachePath, '[]', 'utf8')
+    fakeData = [makeItem({ id: 9002, title: '修复后推送' })]
+    await xbk.run()
+    assert(pushCalls.length === 1, `修复缓存后应推送，实际${pushCalls.length}`)
+  })
+
+  await test('saveBatch 同内容两次 → 文件 mtime/timestamp 不变（C024）', async () => {
+    reset()
+    const fname = 't68b_savebatch_mtime.json'
+    const p = path.join(CACHE_DIR, fname)
+    try { fs.unlinkSync(p) } catch (e) { /* ignore */ }
+    const msg = { id: 'c024-1', title: 'same', content: 'same' }
+    xbk.saveBatch([msg], fname)
+    const cached1 = readCacheFile('t68b_savebatch_mtime')
+    const stat1 = fs.statSync(p)
+    xbk.saveBatch([msg], fname)
+    const cached2 = readCacheFile('t68b_savebatch_mtime')
+    const stat2 = fs.statSync(p)
+    assert(stat2.mtimeMs === stat1.mtimeMs, '同内容 saveBatch 不应重写文件 mtime')
+    assert(cached2[0].timestamp === cached1[0].timestamp, '同内容 saveBatch 不应刷新 timestamp')
+  })
+
+  await test('save 与 saveBatch 交错调用 timestamp 单调（C025）', async () => {
+    reset()
+    const fname = 't68c_save_savebatch_monotonic.json'
+    const p = path.join(CACHE_DIR, fname)
+    try { fs.unlinkSync(p) } catch (e) { /* ignore */ }
+    const bigBatch = Array.from({ length: 200 }, (_, i) => ({ id: `c025-b${i}`, title: `b${i}` }))
+    const steps = [
+      () => xbk.appendMessageToFile({ id: 'c025-1', title: 'a' }, fname),
+      () => xbk.saveBatch(bigBatch, fname),
+      () => xbk.appendMessageToFile({ id: 'c025-4', title: 'd' }, fname),
+      () => xbk.saveBatch([{ id: 'c025-5', title: 'e' }], fname),
+      () => xbk.appendMessageToFile({ id: 'c025-6', title: 'f' }, fname)
+    ]
+    for (const step of steps) step()
+    const stamps = readCacheFile('t68c_save_savebatch_monotonic').map(m => m.timestamp)
+    assert(stamps.length >= 6, `应交错写入多条消息，实际 ${stamps.length}`)
+    for (let i = 1; i < stamps.length; i++) {
+      assert(Date.parse(stamps[i]) > Date.parse(stamps[i - 1]),
+          `save/saveBatch 交错 timestamp 应单调递增: ${stamps.join(' -> ')}`)
+    }
+  })
+
+  await test('MessageStore.init mkdirSync 抛错 → finally/warmupCancelled 仍执行（C042）', async () => {
+    reset()
+    setPushUrl('t_c042_init_finally')
+    fakeData = []
+    const origCacheDir = Config.cache.dir
+    const testCacheDir = DEFAULT_CACHE_DIR + '_c042_missing'
+    const testDir = path.join(__dirname, testCacheDir)
+    const origMkdirSync = fs.mkdirSync
+    const dnsMod = require('dns')
+    const origLookup = dnsMod.lookup
+    const origHasWx = notifyMock.hasWxPusherConfigured
+    const origAbort = typeof AbortController !== 'undefined' ? AbortController.prototype.abort : null
+    let aborted = 0
+    try { fs.rmSync(testDir, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+    Config.cache.dir = testCacheDir
+    notifyMock.hasWxPusherConfigured = () => true // 让预热路径创建 controller，用于观测 finally abort
+    dnsMod.lookup = (host, opts, cb) => {
+      if (typeof opts === 'function') { cb = opts; opts = {} }
+      cb(null, '127.0.0.1', 4)
+    }
+    fs.mkdirSync = () => { throw new Error('mock mkdir fail') }
+    if (origAbort) {
+      AbortController.prototype.abort = function () {
+        aborted++
+        return origAbort.call(this)
+      }
+    }
+    let threw = false
+    try {
+      await xbk.run()
+    } catch (e) {
+      threw = true
+    } finally {
+      Config.cache.dir = origCacheDir
+      fs.mkdirSync = origMkdirSync
+      dnsMod.lookup = origLookup
+      if (origHasWx === undefined) delete notifyMock.hasWxPusherConfigured
+      else notifyMock.hasWxPusherConfigured = origHasWx
+      if (origAbort) AbortController.prototype.abort = origAbort
+      try { fs.rmSync(testDir, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+    }
+    assert(threw, 'mkdirSync 抛错应使 run 抛错')
+    assert(aborted > 0, 'finally 应取消预热（warmupCancelled/abort 执行）')
   })
 
   if (failed === 0) {
