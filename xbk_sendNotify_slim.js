@@ -1219,8 +1219,10 @@ function mdToPlain (s, stripAngle = true) {
       const t = inner.trim()
       return /^https?:(\/\/)?/i.test(t) ? t : '' // <url> autolink 保留内容；HTML 标签剥空
     })
-    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'") // 实体解码（{Html内容} 的 &nbsp; 等）
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&') // & 最后解码：防 &amp;lt; 二次解码成 <（CodeQL js/double-escaping）
 }
 
 // 孤立代理清洗（v3.110）：encodeURIComponent 对孤立代理抛 URIError——推送前统一处理

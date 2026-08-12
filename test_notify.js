@@ -459,6 +459,22 @@ console.log('========================================\n');
     assert(content.includes('5*3*2cm'), `规格星号应保留: ${content}`)
     assert(content.includes('斜体内容'), '斜体应正常转换')
   }))
+  await test('mdToPlain: &amp;lt; 不二次解码（CodeQL js/double-escaping）', () => withChannels(async () => {
+    cfg.PUSH_PLUS_TOKEN = 'token123'
+    // {Html内容} 模板实体文本：&amp;lt; 应一次解码为字面 &lt;，不能二次解码成 <
+    await notify.sendNotify('标题', '代码示例 &amp;lt;b&amp;gt; 应为字面实体')
+    const c = gotCalls[0]
+    const content = JSON.parse(c.options.body).content
+    assert(content.includes('&lt;b&gt;'), `&amp;lt; 应保留为字面 &lt;b&gt;（一次解码）: ${content}`)
+    assert(!content.includes('<b>'), `不应二次解码出原始标签: ${content}`)
+    // 正常实体仍正确解码（&lt;br&gt; → <br>，解码在标签剥离之后不受影响）
+    await notify.sendNotify('标题2', '换行实体 &lt;br&gt; 与 &amp; 符号')
+    const c2 = gotCalls[1]
+    const content2 = JSON.parse(c2.options.body).content
+    assert(content2.includes('<br>'), `&lt; 应正常解码为 <: ${content2}`)
+    assert(content2.includes('& 符号'), `&amp; 应正常解码为 &: ${content2}`)
+  }))
+
   await test('Push+/Bark: {Html内容} 模板产物无残留标签属性（v3.149）', () => withChannels(async () => {
     // 模拟 {Html内容} 模板产物（HTML）+ Push+（mdToPlain）
     cfg.PUSH_PLUS_TOKEN = 'token123'

@@ -1409,7 +1409,7 @@ const RuleEngine = {
               console.warn(`⚠️ 规则「${String(field)}」包含非法正则「${String(val)}」，已跳过（v3.239 口径统一：validateConfig 与 compileRules 均告警）`)
               continue
             }
-            if (valRe) rules.push({ cat: catRe, val: valRe })
+            rules.push({ cat: catRe, val: valRe }) // valRe 恒真（失败已 continue）
           }
         }
         compiled[field] = { _type: 'multi', rules }
@@ -1855,10 +1855,10 @@ const FilterEngine = {
   },
 
   whitelistFilter (item, field, keyword) {
-    // 非字符串 keyword（对象/数字/布尔/函数）→ 全部放行（与 App.run 告警跳过一致）
+    // 非字符串 keyword（对象/数字/布尔/函数/undefined/null）→ 全部放行（与 App.run 告警跳过一致）
     if (typeof keyword !== 'string') return true
     // 空/空白关键词 = 全部通过（最优先——与历史语义一致；v3.108 安全 String 化）
-    if (keyword === undefined || keyword === null || keyword === '') return true
+    if (keyword === '') return true
     let kwStr
     try { kwStr = String(keyword) } catch (e) { return true } // 嵌套 Symbol 数组 String() 崩 → 放行
     if (kwStr.trim() === '') return true
@@ -2148,7 +2148,7 @@ const MessageStore = {
       // v3.x：按文件记录“已验证”标记——仅首次内存命中未验证时做一次 existsSync+恢复检查，
       // 后续命中直接返回内存快照，不再同步 stat 磁盘，消除热路径退化磁盘 IO。
       if (!this._verified.has(filePath)) {
-        let exists = true
+        let exists
         try { exists = fs.existsSync(filePath) } catch (e) { exists = true }
         let restored = false
         if (!exists) {
