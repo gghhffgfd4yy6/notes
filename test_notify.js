@@ -467,6 +467,12 @@ console.log('========================================\n');
     const content = JSON.parse(c.options.body).content
     assert(content.includes('&lt;b&gt;'), `&amp;lt; 应保留为字面 &lt;b&gt;（一次解码）: ${content}`)
     assert(!content.includes('<b>'), `不应二次解码出原始标签: ${content}`)
+    // 边界：&amp;amp; 单遍解码保持 &amp;；无分号实体不误转
+    await notify.sendNotify('标题3', '边界 &amp;amp; 与 &amp;lt 无分号')
+    const c3 = gotCalls[2]
+    const content3 = JSON.parse(c3.options.body).content
+    assert(content3.includes('&amp;'), `&amp;amp; 应单遍解码为 &amp;: ${content3}`)
+    assert(content3.includes('&lt 无分号'), `无分号实体不应误转: ${content3}`)
     // 正常实体仍正确解码（&lt;br&gt; → <br>，解码在标签剥离之后不受影响）
     await notify.sendNotify('标题2', '换行实体 &lt;br&gt; 与 &amp; 符号')
     const c2 = gotCalls[1]
