@@ -1,0 +1,27 @@
+name: Stale
+
+# 清理长期无活动的 Issue/PR（自动化维护，依据 .ai/skills/ci-cd-and-automation/）
+# 供应链安全：固定 commit SHA
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 每天 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/stale@5bef64f19d7facfb25b37b414482c7164d639639  # v9
+        with:
+          days-before-issue-stale: 60
+          days-before-issue-close: 14
+          days-before-pr-stale: 60
+          days-before-pr-close: 14
+          stale-issue-label: 'stale'
+          stale-pr-label: 'stale'
+          exempt-issue-labels: 'pinned,security'
+          exempt-pr-labels: 'pinned,security,dependabot'   # Dependabot 升级 PR 不清理
+          operations-per-run: 100
