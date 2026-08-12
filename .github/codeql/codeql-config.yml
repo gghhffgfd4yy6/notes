@@ -1,0 +1,12 @@
+# CodeQL 扫描配置：排除测试/工具文件（测试代码中的攻击样本与断言不参与扫描）
+name: "CodeQL config"
+paths-ignore:
+  - test_filter.js
+  - test_app.js
+  - test_app_parallel.js
+  - test_notify.js
+  - test_failure_policy.js
+  - run_tests.js
+  - run_mutation.js
+  - stryker.config.js
+  - check-version.js
