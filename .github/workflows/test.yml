@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [18, 20, 22]   # 兼容测试（engines 声明 >=14）
+        node-version: [20, 22, 24]   # 兼容测试（node 18 已于 2025-04 EOL，矩阵 20/22/24）
     steps:
       # 供应链安全：固定完整 commit SHA（可变 tag 可被上游重新指向，静默注入攻击代码）
       # 升级时由 Dependabot/手动替换为新 SHA
