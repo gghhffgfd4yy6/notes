@@ -8,10 +8,22 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
-    # 仅生产依赖更新走自动 PR；dev 依赖（stryker/standard）同样检查
+    # got 15+ 是纯 ESM 包，项目为 CommonJS（require）不兼容，已评估为不可升级（2026-08-12）
+    ignore:
+      - dependency-name: got
+        versions: [">=15.0.0"]
+    # 分组更新：同类升级合并成一个 PR，减少 PR 噪音
+    groups:
+      npm-production:
+        dependency-type: production
+      npm-development:
+        dependency-type: development
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: monthly
     labels:
       - ci
+    groups:
+      actions:
+        patterns: ["*"]
