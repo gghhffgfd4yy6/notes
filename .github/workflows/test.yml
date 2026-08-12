@@ -1,17 +1,18 @@
 name: Test
 
-# 每次 push / PR 自动执行三套测试，全部 PASS 才可合并/发布
+# 质量门禁：push / PR 自动执行。任何一步失败 → 阻断合并。
+# 流水线：lint → 版本一致性 → 单元 → 通道 → 集成(并行) → 集成(串行完整) → 安全审计
 on:
   push:
     branches: [master]
   pull_request:
 
 jobs:
-  test:
+  quality:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [16, 18, 20]   # 兼容测试（engines 声明 >=14）
+        node-version: [18, 20, 22]   # 兼容测试（engines 声明 >=14）
     steps:
       # 供应链安全：固定完整 commit SHA（可变 tag 可被上游重新指向，静默注入攻击代码）
       # 升级时由 Dependabot/手动替换为新 SHA
@@ -20,15 +21,28 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: ${{ matrix.node-version }}
+          cache: npm
 
-      - name: 安装 HTTP 依赖（官方 got）
-        run: npm install --ignore-scripts
+      - name: 安装依赖（忽略脚本，防供应链风险）
+        run: npm ci --ignore-scripts
 
-      - name: 单元测试（test_filter.js）
+      - name: Lint（standard）
+        run: npm run lint
+
+      - name: 版本一致性闸门（文件头 ↔ CHANGELOG ↔ package.json）
+        run: node check-version.js
+
+      - name: 单元测试（test_filter.js，含 101 章版本校验）
         run: npm run test:filter
 
       - name: 通道测试（test_notify.js）
         run: npm run test:notify
 
-      - name: 集成测试（test_app.js，含真实重试等待）
+      - name: 集成测试（test_app_p.js，并行调度）
+        run: npm run test:app
+
+      - name: 集成测试（test_app.js 串行完整版，绝对验证）
         run: npm run test:app:serial
+
+      - name: 安全审计（高危及以上）
+        run: npm audit --audit-level=high --omit=dev
