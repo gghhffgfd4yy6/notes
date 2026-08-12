@@ -44,5 +44,11 @@
   "devDependencies": {
     "@stryker-mutator/core": "^9.6.1",
     "standard": "^17.1.2"
+  },
+  "allowScripts": {
+    "re2@1.26.1": true
+  },
+  "optionalDependencies": {
+    "re2": "^1.26.1"
   }
 }

@@ -13,6 +13,21 @@
 const PROFILE3 = process.env.XBK_PROFILE === '3'
 const PROFILE3_BOOT_START = process.hrtime.bigint()
 const PROFILE3_BOOT_MARKS = []
+
+// ReDoS 防护：优先用 Google RE2（线性时间无回溯）；不支持反向引用等特性时回落原生 RegExp。
+let RE2C = null
+try { RE2C = require('re2') } catch (e) { RE2C = null }
+const _reCache = new Map()
+const safeRe = (src, flags) => {
+  const k = src + '\u0000' + flags
+  let r = _reCache.get(k)
+  if (r) return r
+  if (RE2C) { try { r = new RE2C(src, flags); _reCache.set(k, r); return r } catch (e) { /* 反向引用等不支持特性回落 */ } }
+  r = new RegExp(src, flags)
+  _reCache.set(k, r)
+  return r
+}
+
 function profile3NowMs () {
   return Number(process.hrtime.bigint() - PROFILE3_BOOT_START) / 1e6
 }
@@ -487,7 +502,7 @@ const Utils = {
     if (html.length > 100000) html = html.slice(0, 100000)
     // HTML tokenizer 将 NUL 替换为 U+FFFD；先移除可被用来拆散属性名的 NUL，
     // 让 `on\u0000error` 收敛为 `onerror` 后进入统一事件属性清理。
-    html = html.replace(/\u0000/g, '')
+    html = html.replace(safeRe('\\u0000', 'g'), '')
     html = this.sanitizeHtmlUrls(html)
     // 成对和未闭合的主动标签都处理：不依赖恶意输入自觉补齐闭合标签。
     // Round2 C002 终修：恢复宽松 [\s\S]*?（HTML 语义：script 内容中第一个 </script> 即闭合，
@@ -496,11 +511,11 @@ const Utils = {
     // 导致文本中的真实主动标签漏网（验证 agent 复核发现的可执行泄漏）。
     // 性能：入口 100k 截断使最坏回溯有界（10 万字符实测 ~270ms）。
     html = html
-      .replace(/<(?:script|style|iframe|object|svg|math)\b[\s\S]*?<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
-      .replace(/<(?:script|style|iframe|object|embed|svg|math)\b(?:[^<>]|"[^"]*"|'[^']*')*>/gi, '')
-      .replace(/<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
+      .replace(safeRe('<(?:script|style|iframe|object|svg|math)\\b[\\s\\S]*?<\\/(?:script|style|iframe|object|svg|math)\\s*>', 'gi'), '')
+      .replace(safeRe('<(?:script|style|iframe|object|embed|svg|math)\\b(?:[^<>]|"[^"]*"|\'[^\']*\')*>', 'gi'), '')
+      .replace(safeRe('<\\/(?:script|style|iframe|object|svg|math)\\s*>', 'gi'), '')
     // 基础/外链/刷新标签可改变文档导航或加载外部资源，HTML 推送不需要它们。
-      .replace(/<(?:base|link|meta)\b[^<>]*>/gi, '')
+      .replace(safeRe('<(?:base|link|meta)\\b[^<>]*>', 'gi'), '')
     // v3.254 P0(XSS)：事件属性名前的分隔符允许引号——HTML5 tokenizer 在引号值闭合后紧跟
     // 字符会将其解析为新属性名，故 `<img src="x"onerror="alert(1)">`（src 引号值与 onerror
     // 间无空格）也是合法事件属性；此前仅匹配空白或 / 会完全绕过清洗。
@@ -511,7 +526,7 @@ const Utils = {
     // 暴露给清洗正则，无空格恶意形态（src="x"onerror=...）的闭合引号随保护占位符边界保留。
     {
       const attrStore = []
-      html = html.replace(/([a-zA-Z_:][\w:.-]*\s*=\s*)(["'])([\s\S]*?)\2/gi, (m, name) => {
+      html = html.replace(safeRe('([a-zA-Z_:][\\w:.-]*\\s*=\\s*)(["\'])([\\s\\S]*?)\\2', 'gi'), (m, name) => {
         // on* 事件属性不保护（留待下一步清洗）；其余属性对整体保护
         if (/^on[a-z]/i.test(name.trim())) return m
         attrStore.push(m)
@@ -523,37 +538,37 @@ const Utils = {
       let _prev
       do {
         _prev = html
-        html = html.replace(/(?:\s|\/|["'\u0001\u0002])(on[a-z][a-z0-9_-]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, (m, name) => {
+        html = html.replace(safeRe('(?:\\s|\\/|["\'\\u0001\\u0002])(on[a-z][a-z0-9_-]*)\\s*=\\s*(?:"[^"]*"|\'[^\']*\'|[^\\s>]+)', 'gi'), (m, name) => {
           // 保留属性名前的分隔符（空格/引号/占位符边界是 HTML 语法必需），删除整个 onxxx="值" 段
           const c = m[0][0]
           if (c === '\u0001' || c === '\u0002') return c
           return c === '"' || c === "'" ? c : ' '
         })
       } while (html !== _prev)
-      html = html.replace(/\u0001(\d+)\u0001/g, (_, i) => attrStore[Number(i)])
+      html = html.replace(safeRe('\\u0001(\\d+)\\u0001', 'g'), (_, i) => attrStore[Number(i)])
       // 清理清洗后残留的孤立占位符边界（原无空格恶意形态的闭合引号被删除后遗留）
-      html = html.replace(/[\u0001\u0002]/g, '')
+      html = html.replace(safeRe('[\\u0001\\u0002]', 'g'), '')
     }
     html = html
     // 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）。
-      .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2/gi,
+      .replace(safeRe('\\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\\s*=\\s*(["\'])([\\s\\S]*?)\\2', 'gi'),
         (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
-      .replace(/\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*([^\s"'<>`]+)/gi,
+      .replace(safeRe('\\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\\s*=\\s*([^\\s"\'<>`]+)', 'gi'),
         (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
     // srcset 可在候选项中藏危险协议；检测到任意危险候选即清空整个属性。
-      .replace(/\bsrcset\s*=\s*(["'])([\s\S]*?)\1/gi, (_, quote, value) => {
-        const v = this.decodeHtmlEntities(value).replace(/[\u0000-\u0020]+/g, '').toLowerCase()
+      .replace(safeRe('\\bsrcset\\s*=\\s*(["\'])([\\s\\S]*?)\\1', 'gi'), (_, quote, value) => {
+        const v = this.decodeHtmlEntities(value).replace(safeRe('[\\u0000-\\u0020]+', 'g'), '').toLowerCase()
         return /(?:^|[,])(?:javascript|vbscript|data):/.test(v) ? `srcset=${quote}${quote}` : `srcset=${quote}${value}${quote}`
       })
-      .replace(/\bsrcset\s*=\s*([^\s"'<>`]+)/gi, (_, value) => {
-        const v = this.decodeHtmlEntities(value).replace(/[\u0000-\u0020]+/g, '').toLowerCase()
+      .replace(safeRe('\\bsrcset\\s*=\\s*([^\\s"\'<>`]+)', 'gi'), (_, value) => {
+        const v = this.decodeHtmlEntities(value).replace(safeRe('[\\u0000-\\u0020]+', 'g'), '').toLowerCase()
         return /^(?:javascript|vbscript|data):/.test(v) ? 'srcset=""' : `srcset=${value}`
       })
     // CSS url()/expression()/behavior 可形成主动加载或脚本执行路径；不需要保留这类 style。
     // C010：先解 CSS 十六进制转义（u\72l→url、e\78pression→expression），再跑现有黑名单。
-      .replace(/\bstyle\s*=\s*(["'])([\s\S]*?)\1/gi, (_, quote, value) => {
+      .replace(safeRe('\\bstyle\\s*=\\s*(["\'])([\\s\\S]*?)\\1', 'gi'), (_, quote, value) => {
         const v = this.decodeHtmlEntities(value)
-          .replace(/\\u([0-9a-fA-F]{1,6})|\\([0-9a-fA-F]{1,6})[\s]?/g, (m, a, b) => {
+          .replace(safeRe('\\\\u([0-9a-fA-F]{1,6})|\\\\([0-9a-fA-F]{1,6})[\\s]?', 'g'), (m, a, b) => {
             const cp = parseInt(a || b, 16)
             return (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : m
           })
@@ -562,9 +577,9 @@ const Utils = {
           ? `style=${quote}${quote}`
           : `style=${quote}${value}${quote}`
       })
-      .replace(/\bstyle\s*=\s*([^\s"'<>`]+)/gi, (_, value) => {
+      .replace(safeRe('\\bstyle\\s*=\\s*([^\\s"\'<>`]+)', 'gi'), (_, value) => {
         const v = this.decodeHtmlEntities(value)
-          .replace(/\\u([0-9a-fA-F]{1,6})|\\([0-9a-fA-F]{1,6})[\s]?/g, (m, a, b) => {
+          .replace(safeRe('\\\\u([0-9a-fA-F]{1,6})|\\\\([0-9a-fA-F]{1,6})[\\s]?', 'g'), (m, a, b) => {
             const cp = parseInt(a || b, 16)
             return (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : m
           })
@@ -659,7 +674,7 @@ const Utils = {
   // 孤立高/低代理替换为 U+FFFD（完整代理对保留）；脏数据/截断 emoji 的真实防御
   sanitizeSurrogates (s) {
     try { s = String(s === undefined || s === null ? '' : s) } catch (e) { return '' }
-    return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD')
+    return s.replace(safeRe('[\\uD800-\\uDBFF](?![\\uDC00-\\uDFFF])|(?<![\\uD800-\\uDBFF])[\\uDC00-\\uDFFF]', 'g'), '\uFFFD')
   },
 
   /** 数字实体解码统一：NUL 过滤 / 代理区与超范围保留原文 */
@@ -812,7 +827,7 @@ const Utils = {
     // str 只执行一次（原 filter 与 map 各跑一遍、每字段 3 次正则 replace 属轻微浪费，P3）
     const str = (p) => {
       if (typeof p === 'symbol') return ''
-      try { return String(p).replace(/%/g, '%25').replace(/\\/g, '%5C').replace(/\|/g, '%7C') } catch (e) { return '' }
+      try { return String(p).replace(safeRe('%', 'g'), '%25').replace(safeRe('\\\\', 'g'), '%5C').replace(safeRe('\\|', 'g'), '%7C') } catch (e) { return '' }
     }
     let s = ''
     for (const p of parts) {
