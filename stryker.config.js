@@ -10,7 +10,7 @@ const concurrency = Number.isInteger(requestedConcurrency) && requestedConcurren
 module.exports = {
   testRunner: 'command',
   commandRunner: {
-    command: 'node test_filter.js'
+    command: 'PERF_MS=3000 node test_filter.js'
   },
   mutate: [
     'xbk_function_v3.js',

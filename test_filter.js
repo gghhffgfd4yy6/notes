@@ -2709,7 +2709,7 @@ console.log('========================================\n');
   await test('缓存符号链接 → 拒绝读取和写入外部目标', () => {
     const fs = require('fs')
     const p = path.join(CACHE, 'test_cache_symlink.json')
-    const outside = path.join('/tmp', `xbk-cache-symlink-${process.pid}.json`)
+    const outside = path.join(process.env.TMPDIR || "/tmp", `xbk-cache-symlink-${process.pid}.json`)
     try {
       fs.writeFileSync(outside, JSON.stringify([{ id: 9001 }]), 'utf8')
       try { fs.unlinkSync(p) } catch (e) { /* 不存在 */ }
@@ -7222,7 +7222,7 @@ console.log('========================================\n');
     const t0 = Date.now()
     saveBatch(msgs, 'test_112_perf.json')
     const ms = Date.now() - t0
-    assertEqual(ms < 500, true, `5000 条 saveBatch 应 <500ms，实际 ${ms}ms`)
+    assertEqual(ms < Number(process.env.PERF_MS || 500), true, `5000 条 saveBatch 应 <${process.env.PERF_MS || 500}ms，实际 ${ms}ms`)
     try { require('fs').unlinkSync(getFilePath('test_112_perf.json')) } catch (e) { /* 忽略 */ }
   })
 
@@ -7634,7 +7634,7 @@ console.log('========================================\n');
       threw = true
     }
     require('fs').chmodSync(CACHE, 0o755) // 无论如何先恢复权限
-    require('fs').unlinkSync(p)
+    try { require("fs").unlinkSync(p) } catch (e) { /* 清理容错: 只读目录下文件未创建 */ }
     assertEqual(threw, false, '恢复写入抛错时 readMessages 不得抛出（v3.236 降级）')
     assertEqual(Array.isArray(result) && result.length === 1 && result[0].id === 'restore-ok', true, '应返回内存快照而非清空')
   })
