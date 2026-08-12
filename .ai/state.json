@@ -1,0 +1,11 @@
+{
+  "round": 0,
+  "commit": null,
+  "candidate_count": 0,
+  "confirmed_count": 0,
+  "rejected_count": 0,
+  "fixed_count": 0,
+  "failed_count": 0,
+  "verification_status": "idle",
+  "bugs": {}
+}
