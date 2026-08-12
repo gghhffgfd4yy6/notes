@@ -1,0 +1,25 @@
+name: Mutation
+
+# 变异测试（手动触发）：完整变异在 CI 上耗时过长，这里限定核心文件子集做质量抽查。
+# 触发方式：GitHub 仓库 → Actions → Mutation → Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --ignore-scripts
+
+      - name: 变异测试（核心文件子集：缓存 + 失败策略）
+        run: npx stryker run --mutate "xbk_storage.js,xbk_failure_policy.js" --concurrency 2
+        env:
+          PERF_MS: 3000   # 宽松性能阈值（插桩开销）

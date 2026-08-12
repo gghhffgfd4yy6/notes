@@ -1,0 +1,9 @@
+#!/bin/bash
+# pre-commit 钩子：提交前自动验证（可 git commit --no-verify 跳过）
+# 三道快检：lint → 版本闸门 → 单元测试
+echo "🔍 pre-commit 验证中..."
+set -e
+npm run lint > /dev/null 2>&1 || { echo "❌ lint 未通过，修复后再提交"; exit 1; }
+node check-version.js > /dev/null 2>&1 || { echo "❌ 版本三方不一致，先同步再提交"; exit 1; }
+npm run test:filter > /dev/null 2>&1 || { echo "❌ 单元测试未通过，先修复再提交"; exit 1; }
+echo "✅ pre-commit 全部通过"

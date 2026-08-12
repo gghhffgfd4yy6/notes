@@ -1,0 +1,16 @@
+#!/bin/bash
+# commit-msg 钩子：提交信息规范校验（可 git commit --no-verify 跳过）
+# 允许前缀：fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:
+msg_file="$1"
+msg=$(head -1 "$msg_file")
+if ! echo "$msg" | grep -qE '^(fix|feat|refactor|docs|chore|style|test|perf|revert|build|ci)(\(.*\))?:'; then
+  echo "❌ 提交信息必须以类型前缀开头: fix: / feat: / refactor: / docs: / chore: / style: / test: / perf: / revert: / build: / ci:"
+  echo "   实际: $msg"
+  exit 1
+fi
+len=${#msg}
+if [ "$len" -gt 100 ]; then
+  echo "❌ 提交信息首行过长（${len} 字符 > 100），请精简"
+  exit 1
+fi
+exit 0

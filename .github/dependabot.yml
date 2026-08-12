@@ -1,0 +1,17 @@
+# Dependabot：依赖安全与更新检查（GitHub 免费）
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    # 仅生产依赖更新走自动 PR；dev 依赖（stryker/standard）同样检查
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels:
+      - ci

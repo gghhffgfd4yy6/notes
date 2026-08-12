@@ -17,7 +17,9 @@
     "test:loop": "node test_loop.js",
     "test:failure-policy": "node test_failure_policy.js",
     "test:dns": "node test_dns_cache.js",
-    "test:mutation": "stryker run"
+    "test:mutation": "stryker run",
+    "check": "npm run lint && node check-version.js && npm test",
+    "verify": "npm run check"
   },
   "dependencies": {
     "got": "11.8.6"
