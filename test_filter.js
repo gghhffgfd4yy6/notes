@@ -7498,6 +7498,22 @@ console.log('========================================\n');
     assertEqual(sanitizeDecodedHtml('<svg><script>x</script></svg>'), '')
   })
 
+  await test('sanitizeDecodedHtml iframe srcdoc XSS 移除（codex review 发现 P1）', () => {
+    // codex review 5a0c785 发现：未闭合主动标签正则 [^<>]* 遇引号值内 <img 停住，
+    // iframe srcdoc="<img onerror>" 原样通过（srcdoc 内文档可执行）。修复：引号值整体匹配。
+    const cases = [
+      '<iframe srcdoc="<img src=x onerror=alert(1)>">',
+      '<iframe srcdoc=\'<svg onload=alert(2)>\'>',
+      '<svg viewBox="0 0 <x>" onload="alert(3)">',
+      '<script src="a"><img src=x onerror=y>'
+    ]
+    for (const h of cases) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/<(?:iframe|svg|script)\b/i.test(r), false, `带引号属性的主动标签应移除: ${h} → ${r}`)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `事件属性不应残留: ${h} → ${r}`)
+    }
+  })
+
   await test('sanitizeDecodedHtml 文本引号内的主动标签仍被移除（Round2 C002 终修）', () => {
     // 引号保护方案曾把文本中 "<iframe src=x>" 保护为占位符导致真实标签漏网（可执行）。
     // 终修：不做全局引号保护，文本中的主动标签照常移除。

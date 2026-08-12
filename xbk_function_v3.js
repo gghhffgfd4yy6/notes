@@ -497,7 +497,7 @@ const Utils = {
     // 性能：入口 100k 截断使最坏回溯有界（10 万字符实测 ~270ms）。
     html = html
       .replace(/<(?:script|style|iframe|object|svg|math)\b[\s\S]*?<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
-      .replace(/<(?:script|style|iframe|object|embed|svg|math)\b[^<>]*>/gi, '')
+      .replace(/<(?:script|style|iframe|object|embed|svg|math)\b(?:[^<>]|"[^"]*"|'[^']*')*>/gi, '')
       .replace(/<\/(?:script|style|iframe|object|svg|math)\s*>/gi, '')
     // 基础/外链/刷新标签可改变文档导航或加载外部资源，HTML 推送不需要它们。
       .replace(/<(?:base|link|meta)\b[^<>]*>/gi, '')
