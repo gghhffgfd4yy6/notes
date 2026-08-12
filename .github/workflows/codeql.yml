@@ -3,11 +3,7 @@ name: CodeQL
 # 安全扫描（质量门禁最后一道，依据 .ai/skills/ci-cd-and-automation/）
 # 供应链安全：固定 commit SHA（可变 tag 可被上游重新指向）
 on:
-  push:
-    branches: [master]
-  pull_request:
-  schedule:
-    - cron: '0 12 * * 1'   # 每周一 12:00 UTC 定期扫描，防环境漂移
+  workflow_dispatch:   # 手动触发：私有仓库需 GHAS 授权（免费账户不支持），授权后改回 push+schedule
 
 jobs:
   analyze:
