@@ -554,9 +554,9 @@ const Utils = {
       .replace(/\bstyle\s*=\s*(["'])([\s\S]*?)\1/gi, (_, quote, value) => {
         const v = this.decodeHtmlEntities(value)
           .replace(/\\u([0-9a-fA-F]{1,6})|\\([0-9a-fA-F]{1,6})[\s]?/g, (m, a, b) => {
-          const cp = parseInt(a || b, 16)
-          return (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : m
-        })
+            const cp = parseInt(a || b, 16)
+            return (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : m
+          })
           .toLowerCase()
         return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
           ? `style=${quote}${quote}`
@@ -565,9 +565,9 @@ const Utils = {
       .replace(/\bstyle\s*=\s*([^\s"'<>`]+)/gi, (_, value) => {
         const v = this.decodeHtmlEntities(value)
           .replace(/\\u([0-9a-fA-F]{1,6})|\\([0-9a-fA-F]{1,6})[\s]?/g, (m, a, b) => {
-          const cp = parseInt(a || b, 16)
-          return (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : m
-        })
+            const cp = parseInt(a || b, 16)
+            return (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : m
+          })
           .toLowerCase()
         return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
           ? 'style=""'
@@ -820,7 +820,7 @@ const Utils = {
       const t = str(p)
       if (t.trim() !== '') s = s === '' ? t : s + '|' + t
     }
-    let h1 = 5381, h2 = 52711
+    let h1 = 5381; let h2 = 52711
     for (let i = 0; i < s.length; i++) {
       const c = s.charCodeAt(i)
       h1 = ((h1 * 33) ^ c) >>> 0
@@ -955,7 +955,7 @@ const Utils = {
             (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0100 && c <= 0xE01EF)
     // 补充平面修饰符专用判定：紧随补充平面基符的修饰符（不含 ZWJ，避免拆散 👨👩👧👦 首个完整 emoji）
     const isSupplementaryModifier = (c) =>
-            (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0100 && c <= 0xE01EF)
+      (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0100 && c <= 0xE01EF)
     while (cut.length > 0) {
       const last = cut.charCodeAt(cut.length - 1)
       // 代理对：完整低代理对保留；高代理/孤立低代理退位；
@@ -1026,7 +1026,7 @@ const Formatter = {
     // 构造为 10 万+ 字符卡死主线程。入口截断到 _MD_HTML_MAX（正常消息内容远小于此），
     // 使最坏回溯复杂度有界。
     if (html.length > 100000) html = Utils.truncateUtf16(html, 100000)
-        // URL 文本/目标统一使用 safeUrl：非字符串、空值、伪 URL、危险协议和换行都不生成 Markdown 链接。
+    // URL 文本/目标统一使用 safeUrl：非字符串、空值、伪 URL、危险协议和换行都不生成 Markdown 链接。
     const urlText = Utils.safeUrl(shuju && shuju.url)
     const safeUrl = urlText
     // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）
@@ -1977,7 +1977,7 @@ const MessageStore = {
   _now () {
     // v3.251 g5：lastTs/inc 提升为 MessageStore 级（_nowLastTs/_nowInc），跨 saveBatch/_upsert
     // 调用保持全局单调——此前每次调用重置导致跨批次时间戳回退乱序（1002→1001）。
-    let t = Date.now()
+    const t = Date.now()
     if (this._nowLastTs === undefined) this._nowLastTs = 0
     if (this._nowInc === undefined) this._nowInc = 0
     if (t > this._nowLastTs) {
@@ -2057,7 +2057,7 @@ const MessageStore = {
     } catch (e) {
       // v3.245 P1：目录创建失败必须暴露——此前只 console.error 吞错，后续所有缓存写
       // 操作（save/saveBatch）都会因目录缺失而连锁失败且原因不明。
-      console.error(`缓存目录创建失败: ${this.cacheDir}`, e && e.message || e)
+      console.error(`缓存目录创建失败: ${this.cacheDir}`, (e && e.message) || e)
       throw e
     }
   },

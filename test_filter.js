@@ -2709,7 +2709,7 @@ console.log('========================================\n');
   await test('缓存符号链接 → 拒绝读取和写入外部目标', () => {
     const fs = require('fs')
     const p = path.join(CACHE, 'test_cache_symlink.json')
-    const outside = path.join(process.env.TMPDIR || "/tmp", `xbk-cache-symlink-${process.pid}.json`)
+    const outside = path.join(process.env.TMPDIR || '/tmp', `xbk-cache-symlink-${process.pid}.json`)
     try {
       fs.writeFileSync(outside, JSON.stringify([{ id: 9001 }]), 'utf8')
       try { fs.unlinkSync(p) } catch (e) { /* 不存在 */ }
@@ -3872,7 +3872,6 @@ console.log('========================================\n');
     try { fs.unlinkSync(p) } catch (e) {}
   })
 
-
   await test('decodeHtmlEntities 超BMP emoji 实体（v3.20审查7：fromCodePoint）', () => {
     assertEqual(decodeHtmlEntities('&#128512;'), '😀')
     assertEqual(decodeHtmlEntities('&#x1F600;'), '😀')
@@ -3911,7 +3910,7 @@ console.log('========================================\n');
     assertEqual(typeof daysComputed('2026-08-01T00:00:00Z'), 'number', '合法 ISO 仍可解析')
     // 单数字月/日带时区 ISO（v3.171 行为）：宿主 Invalid 时补零回退，仍应有效
     assertEqual(daysComputed('2026-8-1T00:00:00Z'), daysComputed('2026-08-01T00:00:00Z'),
-        '合法单数字 ISO 应与补零 ISO 同值（2026-8-1T00:00:00Z）')
+      '合法单数字 ISO 应与补零 ISO 同值（2026-8-1T00:00:00Z）')
   })
 
   await test('daysComputed 脏后缀 2026-07-31abc → 0（v3.21审查2：锚定）', () => {
@@ -4957,9 +4956,9 @@ console.log('========================================\n');
   await test('安全: 引号值内 on 开头的合法 URL/值不被误伤（v3.257 修复 086）', () => {
     // 曾把 href="onclick=x" 当事件属性清空为 href=""（合法 URL 被破坏）
     const keep = [
-      '<a href="onclick=x">link</a>',                    // on 开头的合法相对 URL
-      '<a href="https://x.com/p?onclick=1">go</a>',      // URL 参数含 onclick
-      '<a href="http://onmouseover.example/a">m</a>'     // 值内含 on 字样
+      '<a href="onclick=x">link</a>', // on 开头的合法相对 URL
+      '<a href="https://x.com/p?onclick=1">go</a>', // URL 参数含 onclick
+      '<a href="http://onmouseover.example/a">m</a>' // 值内含 on 字样
     ]
     for (const h of keep) {
       const r = tuisong_replace('{Html内容}', { content_html: h, url: 'https://example.com' })
@@ -7634,7 +7633,7 @@ console.log('========================================\n');
       threw = true
     }
     require('fs').chmodSync(CACHE, 0o755) // 无论如何先恢复权限
-    try { require("fs").unlinkSync(p) } catch (e) { /* 清理容错: 只读目录下文件未创建 */ }
+    try { require('fs').unlinkSync(p) } catch (e) { /* 清理容错: 只读目录下文件未创建 */ }
     assertEqual(threw, false, '恢复写入抛错时 readMessages 不得抛出（v3.236 降级）')
     assertEqual(Array.isArray(result) && result.length === 1 && result[0].id === 'restore-ok', true, '应返回内存快照而非清空')
   })

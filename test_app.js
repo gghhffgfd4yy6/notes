@@ -2580,7 +2580,7 @@ console.log('========================================\n');
       Config.cache.dir = '.xbk_cache_safe'
       const probe = xbk.getFilePath('c022_probe.json')
       assert(!probe.startsWith(externalTarget), `cacheDir 不应指向外部: ${probe}`)
-      assert(probe.startsWith(__dirname + path.sep), `cacheDir 应留在项目根内: ${probe}`)
+      assert(probe.startsWith(path.join(__dirname, path.sep)), `cacheDir 应留在项目根内: ${probe}`)
       assert(!probe.startsWith(safeLinkPath + path.sep), `cacheDir 不应使用被符号链接的应急路径: ${probe}`)
     } finally {
       Config.cache.dir = origCacheDir
