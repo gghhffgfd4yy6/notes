@@ -8,10 +8,10 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
-    # got 15+ 是纯 ESM 包，项目为 CommonJS（require）不兼容，已评估为不可升级（2026-08-12）
+    # got 12+ 是纯 ESM 包，项目为 CommonJS（require）不兼容（got 14 实测 CI 失败），不可升级
     ignore:
       - dependency-name: got
-        versions: [">=15.0.0"]
+        versions: [">=12.0.0"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
