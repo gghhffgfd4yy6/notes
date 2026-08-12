@@ -1,6 +1,7 @@
 name: Mutation
 
-# 变异测试（手动触发）：完整变异在 CI 上耗时过长，这里限定核心文件子集做质量抽查。
+# 变异测试（手动触发）：全量生产代码变异覆盖。
+# 免费 runner 单任务上限 6h——按文件拆 5 个并行任务，每批 <6h。
 # 触发方式：GitHub 仓库 → Actions → Mutation → Run workflow
 on:
   workflow_dispatch:
@@ -8,6 +9,20 @@ on:
 jobs:
   mutation:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 小文件组
+            mutate: "xbk_storage.js,xbk_failure_policy.js,xbk_agents.js,xbk_http.js,xbk_loop.js,qinglong/xbk_push.js"
+          - name: sendnotify
+            mutate: "xbk_sendNotify_slim.js"
+          - name: v3-第一部分
+            mutate: "xbk_function_v3.js#1-1200"
+          - name: v3-第二部分
+            mutate: "xbk_function_v3.js#1201-2400"
+          - name: v3-第三部分
+            mutate: "xbk_function_v3.js#2401-3618"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -19,7 +34,7 @@ jobs:
       - name: 安装依赖
         run: npm ci --ignore-scripts
 
-      - name: 变异测试（核心文件子集：缓存 + 失败策略）
-        run: npx stryker run --mutate "xbk_storage.js,xbk_failure_policy.js" --concurrency 2
+      - name: 变异测试（${{ matrix.name }}）
+        run: npx stryker run --mutate "${{ matrix.mutate }}" --concurrency 2
         env:
           PERF_MS: 3000   # 宽松性能阈值（插桩开销）
