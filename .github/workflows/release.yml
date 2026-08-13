@@ -1,0 +1,44 @@
+name: Release
+
+# 版本发布自动化：推送 v* tag 时自动校验版本一致性（101 章测试）并创建 GitHub Release
+# 触发方式：git tag vX.Y.Z && git push origin vX.Y.Z
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --ignore-scripts
+
+      - name: 版本一致性校验（101 章：文件头 ↔ CHANGELOG ↔ package.json）
+        run: npm run check
+
+      - name: 提取 Release Notes（从 CHANGELOG 对应版本段）
+        id: notes
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          node -e "
+            const fs = require('fs')
+            const c = fs.readFileSync('CHANGELOG.md', 'utf8')
+            const esc = process.argv[1].replace(/[.*+?^\${}()|[\]\\\\]/g, '\\\\$&')
+            const m = c.match(new RegExp('## v' + esc + '[\\\\s\\\\S]*?(?=\\n## v|$)', 'm'))
+            fs.writeFileSync('release-notes.md', m ? m[0].trim() : 'v' + process.argv[1])
+          " "$VERSION"
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          gh release create "v$VERSION" --title "v$VERSION" --notes-file release-notes.md
