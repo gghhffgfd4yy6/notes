@@ -7879,5 +7879,23 @@ console.log('========================================\n');
     ), { numRuns: 200 })
   })
 
+  await test('_validateTplConfig：全部支持占位符不告警（CodeRabbit 建议——杀 SUPPORTED_TPL_KEYS 15 个 StringLiteral）', async () => {
+    const saved = JSON.stringify(Config.template)
+    try {
+      const keys = ['分类名', '分类ID', '标题', '链接', '日期', '时间', '楼主', '类目', '内容', '价格', '商城', '品牌', '图片', 'Html内容', 'Markdown内容']
+      // 全组合：title+content 用全部 key
+      Config.template = { title: keys.map(k => `{${k}}`).join(' '), content: keys.map(k => `{${k}}`).join(' ') }
+      assertEqual(V3App._validateTplConfig().length, 0, '全部支持占位符不应警告')
+      // 逐个 key 单独验证（任一 key 被变异 → 此处抓出）
+      for (const k of keys) {
+        Config.template = { title: `{${k}}`, content: '正常内容' }
+        const warns = V3App._validateTplConfig()
+        assertEqual(warns.length, 0, `占位符 {${k}} 不应警告: ${JSON.stringify(warns)}`)
+      }
+    } finally {
+      Config.template = JSON.parse(saved)
+    }
+  })
+
   process.exit(failed > 0 ? 1 : 0)
 })()
