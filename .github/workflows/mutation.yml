@@ -47,11 +47,11 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       - name: 恢复增量缓存
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: reports
           key: stryker-${{ matrix.name }}-${{ github.sha }}
@@ -65,3 +65,12 @@ jobs:
         run: npx stryker run --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 2
         env:
           PERF_MS: 3000   # 宽松性能阈值（插桩开销）
+
+      # 明细报告留档（inc-*.json + mutation.json/html），artifact 有公开下载 API
+      - name: 上传变异报告
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: mutation-report-${{ matrix.name }}
+          path: reports/
+          retention-days: 14
