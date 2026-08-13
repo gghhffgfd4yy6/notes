@@ -538,11 +538,12 @@ const Utils = {
         re.lastIndex = closeQuote + 1
         continue
       }
-      // CodeAnt 审查（PR #27）：仅处理标签内的 href/src——普通文本
-      // 「see href='x」不是属性，不应被合成修复（htmlToMarkdown 会对无标签内容调用本函数）
-      const lastLt = html.lastIndexOf('<', m.index)
-      const lastGt = html.lastIndexOf('>', m.index)
-      if (lastLt === -1 || lastGt > lastLt) {
+      // CodeAnt 审查（PR #27/#28）：仅处理标签内的 href/src——普通文本
+      // 「see href='x」不是属性，不应被合成修复（htmlToMarkdown 会对无标签内容调用本函数）。
+      // PR #28 Critical 修复：标签边界判断必须尊重引号属性——`<a title=">" href='javascript:...`
+      // 的 > 在引号内不算标签结束（lastIndexOf 会误判为标签外而跳过危险 URL）。
+      // 线性回扫：引号内跳过 >；未引号的 > 表示标签已结束；< 表示在标签内。
+      if (!this._isInHtmlTag(html, m.index)) {
         re.lastIndex = valueStart
         continue
       }
@@ -554,6 +555,28 @@ const Utils = {
       re.lastIndex = end
     }
     return out + html.slice(last)
+  },
+
+  // v3.260：判断 pos 是否位于 HTML 标签内（线性回扫，尊重引号属性）
+  // 引号内 > 不算标签结束（`<a title=">" href=...` 的 > 是属性值）；
+  // 未引号的 > 标签已结束；< 即标签开始；越界视为普通文本。
+  _isInHtmlTag (html, pos) {
+    let i = pos - 1
+    let quote = ''
+    while (i >= 0) {
+      const ch = html[i]
+      if (quote) {
+        if (ch === quote) quote = ''
+      } else if (ch === '"' || ch === "'") {
+        quote = ch
+      } else if (ch === '>') {
+        return false
+      } else if (ch === '<') {
+        return true
+      }
+      i--
+    }
+    return false
   },
 
   /** 实体解码后再次清理主动 HTML/事件属性，防止 &lt;script&gt; 重新形成可执行标签 */

@@ -7587,6 +7587,15 @@ console.log('========================================\n');
     assertEqual(c.includes('javascript'), false, `标签内未闭合 javascript: 仍应清空: ${c}`)
   })
 
+  await test('sanitizeDecodedHtml 引号内 > 不当作标签结束（CodeAnt PR28 Critical：XSS 绕过）', () => {
+    const r = sanitizeDecodedHtml('<a title=">" href=\'javascript:alert(1)')
+    assertEqual(r.includes('javascript'), false, `引号内 > 场景危险 URL 应清空: ${r}`)
+    const p = sanitizeDecodedHtml('see href="https://example')
+    assertEqual(p, 'see href="https://example', `普通文本不应被改写: ${p}`)
+    const e = sanitizeDecodedHtml('</a> href="javascript:alert(1)')
+    assertEqual(e.includes('javascript'), true, `标签结束后的 href= 是普通文本不应清空: ${e}`)
+  })
+
   await test('sanitizeDecodedHtml 未闭合安全链接补闭合引号（CodeAnt PR27 审查：畸形 HTML）', () => {
     const r = sanitizeDecodedHtml('<a href="https://x.com/a b')
     assertEqual(r, '<a href="https://x.com/a b"', `未闭合安全链接应补闭合引号: ${r}`)
