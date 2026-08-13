@@ -1,0 +1,17 @@
+name: analyze-artifacts
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 下载全部变异报告
+        uses: actions/download-artifact@v5
+        with:
+          path: reports-all
+          pattern: mutation-report-*
+          merge-multiple: true
+      - name: 解析存活变异体分布
+        run: node .github/analyze-artifacts.js
