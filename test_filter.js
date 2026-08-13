@@ -7638,5 +7638,156 @@ console.log('========================================\n');
     assertEqual(Array.isArray(result) && result.length === 1 && result[0].id === 'restore-ok', true, '应返回内存快照而非清空')
   })
 
+  // ============================================================
+  // v3.258 变异驱动补测（V3 尾部存活变异体定向击杀）
+  // 数据来源：8-13 全量变异报告（v3-part4 存活 1171 个，其中
+  // L2763 alert 启用判断 19 个 + L2819 report 启用判断 16 个
+  // 已提取为 _enabledFlag 纯函数——测试直接打纯函数精准击杀）
+  // ============================================================
+  const { App: V3App, truncateUtf16: v3Truncate } = require('./xbk_function_v3.js')
+  const fc = require('fast-check')
+
+  // 参考实现（与源码 _enabledFlag 同口径，仅用于属性测试对照）
+  function refEnabledFlag (cfg) {
+    const en = cfg && cfg.enabled
+    return !(!cfg || !en || String(en).trim().toLowerCase() === 'false' || String(en).trim().toLowerCase() === '0')
+  }
+
+  await test('_enabledFlag：表格驱动——全部关闭/开启形态（杀 L2763+L2819 共 35 存活）', async () => {
+    const cases = [
+    // [输入, 预期开启]
+      [undefined, false], [null, false], [{}, false], [{ enabled: undefined }, false],
+      [{ enabled: '' }, false], [{ enabled: 0 }, false], [{ enabled: '0' }, false],
+      [{ enabled: 'false' }, false], [{ enabled: 'FALSE' }, false], [{ enabled: 'False' }, false],
+      [{ enabled: ' false ' }, false], [{ enabled: 'FaLsE' }, false],
+      [{ enabled: true }, true], [{ enabled: 1 }, true], [{ enabled: '1' }, true],
+      [{ enabled: 'true' }, true], [{ enabled: 'TRUE' }, true], [{ enabled: ' true ' }, true],
+      [{ enabled: '2' }, true], [{ enabled: 'yes' }, true], [{ enabled: 'on' }, true]
+    ]
+    for (const [input, expected] of cases) {
+      assertEqual(V3App._enabledFlag(input), expected, `_enabledFlag(${JSON.stringify(input)})`)
+    }
+  })
+
+  await test('_enabledFlag：属性测试——任意输入与参考实现一致（不变量）', async () => {
+    fc.assert(fc.property(
+      fc.oneof(
+        fc.constant(undefined),
+        fc.constant(null),
+        fc.constant({}),
+        fc.record({ enabled: fc.oneof(fc.boolean(), fc.integer(), fc.string({ maxLength: 10 })) }),
+        fc.record({ enabled: fc.oneof(fc.constant(''), fc.constant(0), fc.constant('0'), fc.constant('false'), fc.constant(' true ')) })
+      ),
+      (cfg) => {
+        assertEqual(V3App._enabledFlag(cfg), refEnabledFlag(cfg), `cfg=${JSON.stringify(cfg)}`)
+      }
+    ), { numRuns: 400 })
+  })
+
+  await test('truncateUtf16：属性测试——任意字符串截断后无孤立代理且长度不超 max', async () => {
+    fc.assert(fc.property(
+      fc.string({ maxLength: 150 }),
+      fc.integer({ min: 1, max: 60 }),
+      (s, max) => {
+        const out = v3Truncate(s, max)
+        assert.ok(out.length <= max, `长度 ${out.length} > ${max}（输入 ${JSON.stringify(s)} max=${max}）`)
+        for (let i = 0; i < out.length; i++) {
+          const c = out.charCodeAt(i)
+          if (c >= 0xD800 && c <= 0xDBFF) {
+            const nx = out.charCodeAt(i + 1)
+            assert.ok(!Number.isNaN(nx) && nx >= 0xDC00 && nx <= 0xDFFF, `孤立高代理 at ${i}（输出 ${JSON.stringify(out)}）`)
+          }
+          if (c >= 0xDC00 && c <= 0xDFFF) {
+            const pv = out.charCodeAt(i - 1)
+            assert.ok(!Number.isNaN(pv) && pv >= 0xD800 && pv <= 0xDBFF, `孤立低代理 at ${i}（输出 ${JSON.stringify(out)}）`)
+          }
+        }
+      }
+    ), { numRuns: 400 })
+  })
+
+  await test('_diskMinFree：表格驱动——边界配置解析（Utils.num 语义）', async () => {
+    const D = 50 * 1024 * 1024
+    const cases = [
+      [undefined, D],
+      [null, D],
+      [{}, D],
+      [{ storage: {} }, D],
+      [{ storage: { minFreeBytes: undefined } }, D],
+      [{ storage: { minFreeBytes: null } }, D],
+      [{ storage: { minFreeBytes: false } }, D],
+      [{ storage: { minFreeBytes: '' } }, D],
+      [{ storage: { minFreeBytes: 'abc' } }, D],
+      [{ storage: { minFreeBytes: '5000' } }, 5000],
+      [{ storage: { minFreeBytes: 1e9 } }, 1e9],
+      [{ storage: { minFreeBytes: 0 } }, null],
+      [{ storage: { minFreeBytes: -1 } }, null]
+    ]
+    for (const [cfg, expected] of cases) {
+      assertEqual(V3App._diskMinFree(cfg), expected, `_diskMinFree(${JSON.stringify(cfg)})`)
+    }
+  })
+
+  await test('_diskMinFree：属性测试——任意输入返回 null 或正数有限（不变量）', async () => {
+    fc.assert(fc.property(
+      fc.oneof(
+        fc.constant(undefined),
+        fc.constant(null),
+        fc.constant({}),
+        fc.record({ storage: fc.constant(null) }),
+        fc.record({ storage: fc.record({ minFreeBytes: fc.oneof(fc.constant(undefined), fc.constant(0), fc.constant(-1), fc.integer({ min: -1e6, max: 1e9 }), fc.string({ maxLength: 8 }), fc.constant(false), fc.constant('5000')) }) })
+      ),
+      (cfg) => {
+        const r = V3App._diskMinFree(cfg)
+        if (r !== null) {
+          assert.ok(Number.isFinite(r) && r > 0, `应返回正数有限，实际 ${r}（cfg=${JSON.stringify(cfg)}）`)
+        }
+      }
+    ), { numRuns: 300 })
+  })
+
+  await test('_validateTplConfig：合法模板零警告 + 非法占位符警告（表格驱动）', async () => {
+    const saved = JSON.stringify(Config.template)
+    try {
+    // 合法模板：全部占位符在支持列表内
+      Config.template = { title: '【{分类名}】{标题} {价格}', content: '内容：{内容} 商城：{商城} 品牌：{品牌}' }
+      assertEqual(V3App._validateTplConfig().length, 0, '合法占位符不应警告')
+      // 非法占位符
+      Config.template = { title: '含非法占位符 {不存在字段}', content: '正常内容' }
+      const warns = V3App._validateTplConfig()
+      assert.ok(warns.length >= 1, '非法占位符应警告')
+      assert.ok(warns.some(w => w.includes('不存在字段')), `警告应含占位符名: ${JSON.stringify(warns)}`)
+      // 非字符串模板
+      Config.template = { title: 123, content: null }
+      assert.ok(V3App._validateTplConfig().some(w => w.includes('template.title/content')), '非字符串应警告')
+    } finally {
+      Config.template = JSON.parse(saved)
+    }
+  })
+
+  await test('_validateTplConfig：属性测试——任意模板不崩溃，合法占位符不产生警告', async () => {
+    const saved = JSON.stringify(Config.template)
+    try {
+      fc.assert(fc.property(
+        fc.record({
+          title: fc.oneof(fc.string({ maxLength: 60 }), fc.constant(null), fc.constant(123)),
+          content: fc.oneof(fc.string({ maxLength: 60 }), fc.constant(null))
+        }),
+        (tpl) => {
+          Config.template = tpl
+          const warns = V3App._validateTplConfig()
+          assert.ok(Array.isArray(warns), '应返回数组')
+          assert.ok(warns.every(w => typeof w === 'string'), '警告应为字符串')
+          // 纯合法占位符模板不应产生"非法占位符"警告
+          if (typeof tpl.title === 'string' && !/\{[^{}]+\}/.test(tpl.title)) {
+            assert.ok(!warns.some(w => w.includes('含占位符')), `不应有占位符警告: ${JSON.stringify(warns)}`)
+          }
+        }
+      ), { numRuns: 200 })
+    } finally {
+      Config.template = JSON.parse(saved)
+    }
+  })
+
   process.exit(failed > 0 ? 1 : 0)
 })()

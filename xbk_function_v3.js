@@ -2739,9 +2739,49 @@ const App = {
   _reportMemoryStateByPath: new Map(),
 
   // 磁盘余量只告警不阻断：statfs 不可用或读取失败时静默跳过。
+  // 配置启用开关解析（v3.173 口径，供 _sendAlert/_updateReport 共用，v3.258 提取）：
+  // !enabled（数字0/空串）或 'false'/'0' 字符串均关闭；'0' 字符串是 truthy 曾漏；
+  // C016：trim + 小写，空格/大小写变体也关闭
+  _enabledFlag (cfg) {
+    const en = cfg && cfg.enabled
+    return !(!cfg || !en || String(en).trim().toLowerCase() === 'false' || String(en).trim().toLowerCase() === '0')
+  },
+
+  // v3.258 提取：磁盘阈值解析（行为不变，供测试直接打纯函数）
+  // Utils.num 口径：字符串配置（'5000'）有效；非有限/<=0 视为未配置（不告警）
+  _diskMinFree (cfg) {
+    const minFree = Utils.num(cfg && cfg.storage && cfg.storage.minFreeBytes, 50 * 1024 * 1024)
+    return Number.isFinite(minFree) && minFree > 0 ? minFree : null
+  },
+
+  // v3.258 提取：模板配置校验（占位符支持列表），返回警告消息数组（行为不变）
+  _validateTplConfig () {
+    const warns = []
+    // 模板校验（v3.80）：非字符串回退默认（pushOne 已有回退，配置层补提示）
+    if (typeof Config.template.title !== 'string' || typeof Config.template.content !== 'string') {
+      warns.push('⚠️ 配置「template.title/content」应为字符串，已回退默认模板')
+    }
+    // v3.159：模板占位符有效性检查——{价格}/{商城}/{品牌}/{图片} 已由 tuisong_replace 实际支持
+    const SUPPORTED_TPL_KEYS = ['分类名', '分类ID', '标题', '链接', '日期', '时间', '楼主', '类目', '内容', '价格', '商城', '品牌', '图片', 'Html内容', 'Markdown内容']
+    for (const tplName of ['title', 'content']) {
+      const tpl = Config.template[tplName]
+      if (typeof tpl !== 'string') continue
+      const used = new Set()
+      const tplRe = /\{([^{}]+)\}/g
+      let tplM
+      while ((tplM = tplRe.exec(tpl))) used.add(tplM[1])
+      for (const k of used) {
+        if (!SUPPORTED_TPL_KEYS.includes(k)) {
+          warns.push(`⚠️ 模板「template.${tplName}」含占位符「{${k}}」——接口真实字段不提供该数据，将输出为空。支持占位符：{${SUPPORTED_TPL_KEYS.join('} {')}}`)
+        }
+      }
+    }
+    return warns
+  },
+
   _warnLowDisk () {
-    const minFree = Utils.num(Config.storage && Config.storage.minFreeBytes, 50 * 1024 * 1024)
-    if (!Number.isFinite(minFree) || minFree <= 0) return
+    const minFree = this._diskMinFree(Config)
+    if (minFree === null) return
     const now = Date.now()
     // 同一进程最多每小时提示一次，避免磁盘低时刷屏；限流前置，避免高频写入时每次都无谓同步 statfs 阻塞事件循环。
     if (now - this._diskWarningAt < 3600000) return
@@ -2757,10 +2797,8 @@ const App = {
   // 接口异常告警（v3.123）：限频 + 静默——不影响主流程；告警也走推送通道（通道挂了就静默，无解）
   _sendAlert (errMsg) {
     try {
-      // v3.173/174：!enabled（数字0/空串）或 'false'/'0' 字符串均关闭（'0' 字符串是 truthy，曾漏）
-      // C016：口径与 report 一致——trim + 小写，空格/大小写变体也关闭
-      const en = Config.alert && Config.alert.enabled
-      if (!Config.alert || !en || String(en).trim().toLowerCase() === 'false' || String(en).trim().toLowerCase() === '0') return
+      // v3.258：启用判断提取到 _enabledFlag（口径不变，供测试直接打纯函数）
+      if (!this._enabledFlag(Config.alert)) return
       const statePath = path.join(MessageStore.cacheDir, 'alert.state')
       const alertMemory = this._alertLastAtByPath.get(statePath)
       let lastAt = alertMemory ? alertMemory.lastAt : 0
@@ -2809,9 +2847,8 @@ const App = {
   // 运行日报（v3.125）：跨天时发"昨日日报"，当天累加统计；静默不影响主流程
   _updateReport (summary) {
     try {
-      // v3.173/174：!enabled（数字0/空串）或 'false'/'0' 字符串均关闭（'0' 字符串是 truthy，曾漏）
-      const en = Config.report && Config.report.enabled
-      if (!Config.report || !en || String(en).trim().toLowerCase() === 'false' || String(en).trim().toLowerCase() === '0') return
+      // v3.258：启用判断提取到 _enabledFlag（口径不变，供测试直接打纯函数）
+      if (!this._enabledFlag(Config.report)) return
       const statePath = path.join(MessageStore.cacheDir, 'report.state')
       const blankState = () => ({ date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 })
       const safeCounter = (v) => {
@@ -3049,25 +3086,8 @@ const App = {
         console.warn(`⚠️ 配置「domain」为「${safeConfigText(Config.domain)}」不是 http(s):// 开头的合法地址`)
       }
 
-      // 模板校验（v3.80）：非字符串回退默认（pushOne 已有回退，配置层补提示）
-      if (typeof Config.template.title !== 'string' || typeof Config.template.content !== 'string') {
-        console.warn('⚠️ 配置「template.title/content」应为字符串，已回退默认模板')
-      }
-      // v3.159：模板占位符有效性检查——{价格}/{商城}/{品牌}/{图片} 已由 tuisong_replace 实际支持
-      const SUPPORTED_TPL_KEYS = ['分类名', '分类ID', '标题', '链接', '日期', '时间', '楼主', '类目', '内容', '价格', '商城', '品牌', '图片', 'Html内容', 'Markdown内容']
-      for (const tplName of ['title', 'content']) {
-        const tpl = Config.template[tplName]
-        if (typeof tpl !== 'string') continue
-        const used = new Set()
-        const tplRe = /\{([^{}]+)\}/g
-        let tplM
-        while ((tplM = tplRe.exec(tpl))) used.add(tplM[1])
-        for (const k of used) {
-          if (!SUPPORTED_TPL_KEYS.includes(k)) {
-            console.warn(`⚠️ 模板「template.${tplName}」含占位符「{${k}}」——接口真实字段不提供该数据，将输出为空。支持占位符：{${SUPPORTED_TPL_KEYS.join('} {')}}`)
-          }
-        }
-      }
+      // 模板校验（v3.80 + v3.159）：v3.258 提取到 _validateTplConfig（口径不变，返回警告数组）
+      for (const w of this._validateTplConfig()) console.warn(w)
 
       // 运行时数值配置校验（函数层已有防御，配置层补提示——#7 同款精神，v3.64）
       // v3.175：校验用 Utils.num 口径——字符串配置（'5000' 环境变量场景）曾误报「不是有效值」
@@ -3613,6 +3633,8 @@ if (typeof module !== 'undefined' && module.exports) {
     _ensureFileExists: MessageStore._ensureFileExists.bind(MessageStore),
     readMessages: MessageStore.readMessages.bind(MessageStore),
     saveMessages: MessageStore.saveMessages.bind(MessageStore),
-    Config
+    Config,
+    // v3.258：导出 App 供测试直接打内部方法（_enabledFlag 等纯函数）
+    App
   }
 }
