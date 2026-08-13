@@ -7778,8 +7778,10 @@ console.log('========================================\n');
           const warns = V3App._validateTplConfig()
           assert.ok(Array.isArray(warns), '应返回数组')
           assert.ok(warns.every(w => typeof w === 'string'), '警告应为字符串')
-          // 纯合法占位符模板不应产生"非法占位符"警告
-          if (typeof tpl.title === 'string' && !/\{[^{}]+\}/.test(tpl.title)) {
+          // 纯合法占位符模板（title 与 content 均无占位符）不应产生"非法占位符"警告
+          // v3.259 修复：原断言只查 title，content 含 '{ }' 等非法占位符时误报失败
+          if (typeof tpl.title === 'string' && typeof tpl.content === 'string' &&
+              !/\{[^{}]+\}/.test(tpl.title) && !/\{[^{}]+\}/.test(tpl.content)) {
             assert.ok(!warns.some(w => w.includes('含占位符')), `不应有占位符警告: ${JSON.stringify(warns)}`)
           }
         }

@@ -288,78 +288,103 @@ const Utils = {
     // 数字类型（含 -1 等负值）也走数字分支——负值/范围外在下方统一判无效，
     // 避免掉进宿主解析被 new Date('-1') 解析成 2001-01-01（审查5-2 锁定）
     // v3.142：数字形态字符串（含负号/小数）也走数字分支——'-1'/'2026.5' 曾漏到宿主解析成 2001/2026-05
+    // v3.259：格式分支提取为子函数降圈复杂度（行为不变）；返回约定：undefined=未匹配，null=非法，数字=毫秒
     if (typeof time === 'number' || /^-?\d+(\.\d+)?$/.test(s)) {
-      const n = Number(s)
-      // 8 位 YYYYMMDD：月份 1~12 / 日期 1~31 预检 + 回读校验（拒绝 20261332 这类非法日期）
-      // v3.115 时区修复：Date.UTC 解析——日期是"日粒度"概念，本地时区解析会导致跨时区部署天数差 1（Honolulu 实测）
-      const m8 = s.match(/^(\d{4})(\d{2})(\d{2})$/)
-      if (m8 && Number(m8[2]) >= 1 && Number(m8[2]) <= 12 && Number(m8[3]) >= 1 && Number(m8[3]) <= 31) {
-        const t = new Date(Date.UTC(+m8[1], +m8[2] - 1, +m8[3]))
-        if (t.getUTCFullYear() === +m8[1] && t.getUTCMonth() === +m8[2] - 1 && t.getUTCDate() === +m8[3]) return t.getTime()
-        return null
-      }
-      // 严格八位数字优先按 YYYYMMDD 解释；非法八位日期不能继续落入 n===0 的 Unix 时间戳分支。
-      if (/^\d{8}$/.test(s)) return null
-      // 时间戳：0 = 1970-01-01 不应被短路；秒(1e8~TS_BOUND)/毫秒(TS_BOUND~1e14)按 TS_BOUND 分界
-      if (n === 0 || (n >= 1e8 && n < 1e14)) {
-        const ms = n < TS_BOUND ? n * 1000 : n
-        const t = new Date(ms)
-        if (!isNaN(t.getTime())) return t.getTime()
-      }
-      return null
+      return this._parseNumericTime(s)
     }
-    // 显式解析无时区的日期时间（含单数字月日），统一按 UTC，不再落入宿主本地时区。
-    const dateTime = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/)
-    if (dateTime) {
-      const y = +dateTime[1]; const mo = +dateTime[2]; const d = +dateTime[3]
-      const hh = +dateTime[4]; const mm = +dateTime[5]; const ss = dateTime[6] === undefined ? 0 : +dateTime[6]
-      const ms = dateTime[7] === undefined ? 0 : +(dateTime[7] + '00').slice(0, 3)
-      if (mo < 1 || mo > 12 || d < 1 || d > 31 || hh > 23 || mm > 59 || ss > 59) return null
-      const t = new Date(Date.UTC(y, mo - 1, d, hh, mm, ss, ms))
-      if (t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d &&
-                t.getUTCHours() === hh && t.getUTCMinutes() === mm && t.getUTCSeconds() === ss) {
-        return t.getTime()
-      }
-      return null
-    }
+    let r = this._parseDateTimeNoTz(s)
+    if (r !== undefined) return r
+    r = this._parseDashDate(s)
+    if (r !== undefined) return r
+    r = this._parseSlashDate(s)
+    if (r !== undefined) return r
+    r = this._parseIsoZ(s)
+    if (r !== undefined) return r
+    return this._parseFallback(s)
+  },
 
-    // v3.115 时区修复：Date.UTC 解析（同 8 位日期）
+  // v3.259 提取（parseTime 子函数，行为不变）：数字形态（8 位日期 > 时间戳）
+  _parseNumericTime (s) {
+    const n = Number(s)
+    // 8 位 YYYYMMDD：月份 1~12 / 日期 1~31 预检 + 回读校验（拒绝 20261332 这类非法日期）
+    // v3.115 时区修复：Date.UTC 解析——日期是"日粒度"概念，本地时区解析会导致跨时区部署天数差 1（Honolulu 实测）
+    const m8 = s.match(/^(\d{4})(\d{2})(\d{2})$/)
+    if (m8 && Number(m8[2]) >= 1 && Number(m8[2]) <= 12 && Number(m8[3]) >= 1 && Number(m8[3]) <= 31) {
+      const t = new Date(Date.UTC(+m8[1], +m8[2] - 1, +m8[3]))
+      if (t.getUTCFullYear() === +m8[1] && t.getUTCMonth() === +m8[2] - 1 && t.getUTCDate() === +m8[3]) return t.getTime()
+      return null
+    }
+    // 严格八位数字优先按 YYYYMMDD 解释；非法八位日期不能继续落入 n===0 的 Unix 时间戳分支。
+    if (/^\d{8}$/.test(s)) return null
+    // 时间戳：0 = 1970-01-01 不应被短路；秒(1e8~TS_BOUND)/毫秒(TS_BOUND~1e14)按 TS_BOUND 分界
+    if (n === 0 || (n >= 1e8 && n < 1e14)) {
+      const ms = n < TS_BOUND ? n * 1000 : n
+      const t = new Date(ms)
+      if (!isNaN(t.getTime())) return t.getTime()
+    }
+    return null
+  },
+
+  // v3.259 提取：显式解析无时区的日期时间（含单数字月日），统一按 UTC，不再落入宿主本地时区。
+  _parseDateTimeNoTz (s) {
+    const dateTime = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/)
+    if (!dateTime) return undefined
+    const y = +dateTime[1]; const mo = +dateTime[2]; const d = +dateTime[3]
+    const hh = +dateTime[4]; const mm = +dateTime[5]; const ss = dateTime[6] === undefined ? 0 : +dateTime[6]
+    const ms = dateTime[7] === undefined ? 0 : +(dateTime[7] + '00').slice(0, 3)
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || hh > 23 || mm > 59 || ss > 59) return null
+    const t = new Date(Date.UTC(y, mo - 1, d, hh, mm, ss, ms))
+    if (t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d &&
+              t.getUTCHours() === hh && t.getUTCMinutes() === mm && t.getUTCSeconds() === ss) {
+      return t.getTime()
+    }
+    return null
+  },
+
+  // v3.259 提取：YYYY-MM-DD（v3.115 时区修复：Date.UTC 解析，同 8 位日期）
+  _parseDashDate (s) {
     const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/)
-    if (m) {
-      const y = +m[1]; const mo = +m[2]; const d = +m[3]
-      const t = new Date(Date.UTC(y, mo - 1, d))
-      // 回读校验：new Date 会把 2026-02-31 滚动到 03-03，回读对比即拒绝
-      if (t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d) return t.getTime()
-      return null
-    }
-    // v3.258 C017：'YYYY/MM/DD' 显式分支（与 'YYYY-MM-DD' 同口径回读校验，拒绝 2026/02/31 等宿主滚动）
+    if (!m) return undefined
+    const y = +m[1]; const mo = +m[2]; const d = +m[3]
+    const t = new Date(Date.UTC(y, mo - 1, d))
+    // 回读校验：new Date 会把 2026-02-31 滚动到 03-03，回读对比即拒绝
+    if (t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d) return t.getTime()
+    return null
+  },
+
+  // v3.259 提取：'YYYY/MM/DD' 显式分支（与 'YYYY-MM-DD' 同口径回读校验，拒绝 2026/02/31 等宿主滚动）
+  _parseSlashDate (s) {
     const slash = s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/)
-    if (slash) {
-      const y = +slash[1]; const mo = +slash[2]; const d = +slash[3]
-      if (mo < 1 || mo > 12 || d < 1 || d > 31) return null
-      const t = new Date(Date.UTC(y, mo - 1, d))
-      if (t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d) return t.getTime()
-      return null
-    }
-    // v3.258 C017：带时区 ISO 显式分支——先尝试宿主解析；仅对原生 Invalid 的合法单数字月/日
-    // 做补零回退；任何路径都先做年月日回读校验，拒绝 2026-02-31T00:00:00Z 等宿主滚动。
+    if (!slash) return undefined
+    const y = +slash[1]; const mo = +slash[2]; const d = +slash[3]
+    if (mo < 1 || mo > 12 || d < 1 || d > 31) return null
+    const t = new Date(Date.UTC(y, mo - 1, d))
+    if (t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d) return t.getTime()
+    return null
+  },
+
+  // v3.259 提取：带时区 ISO 显式分支——先尝试宿主解析；仅对原生 Invalid 的合法单数字月/日
+  // 做补零回退；任何路径都先做年月日回读校验，拒绝 2026-02-31T00:00:00Z 等宿主滚动。
+  _parseIsoZ (s) {
     const isoZ = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})T\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:?\d{2})$/i)
-    if (isoZ) {
-      const y = +isoZ[1]; const mo = +isoZ[2]; const d = +isoZ[3]
-      if (mo < 1 || mo > 12 || d < 1 || d > 31) return null
-      const t = new Date(Date.UTC(y, mo - 1, d))
-      const dateOk = t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d
-      if (dateOk) {
-        const r = new Date(s)
-        if (!isNaN(r.getTime())) return r.getTime()
-        // 宿主解析不接受非补零 ISO（如 '2026-8-1T00:00:00Z'）：补零后仍按原格式解析。
-        const normalized = s.replace(/^(\d{4})-(\d{1,2})-(\d{1,2})/, (_, yy, mm, dd) => `${yy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`)
-        const r2 = new Date(normalized)
-        if (!isNaN(r2.getTime())) return r2.getTime()
-      }
-      return null
+    if (!isoZ) return undefined
+    const y = +isoZ[1]; const mo = +isoZ[2]; const d = +isoZ[3]
+    if (mo < 1 || mo > 12 || d < 1 || d > 31) return null
+    const t = new Date(Date.UTC(y, mo - 1, d))
+    const dateOk = t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d
+    if (dateOk) {
+      const r = new Date(s)
+      if (!isNaN(r.getTime())) return r.getTime()
+      // 宿主解析不接受非补零 ISO（如 '2026-8-1T00:00:00Z'）：补零后仍按原格式解析。
+      const normalized = s.replace(/^(\d{4})-(\d{1,2})-(\d{1,2})/, (_, yy, mm, dd) => `${yy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`)
+      const r2 = new Date(normalized)
+      if (!isNaN(r2.getTime())) return r2.getTime()
     }
-    // 其他格式（含 ISO 2026-08-01T00:00:00Z、/ 分隔等）回退宿主解析；先原生（支持 ISO），失败再试 / 替换
+    return null
+  },
+
+  // v3.259 提取：其他格式回退宿主解析（含 ISO 2026-08-01T00:00:00Z、/ 分隔等）
+  _parseFallback (s) {
     // v3.115：无时区标记的本地语义字符串按 UTC 补 Z（纯日期已被上方分支拦截；此处为 'YYYY/MM/DD' 等）
     let t
     if (!/[T Z]/.test(s) && /^\d{4}\/\d{1,2}\/\d{1,2}$/.test(s)) {
