@@ -538,8 +538,18 @@ const Utils = {
         re.lastIndex = closeQuote + 1
         continue
       }
+      // CodeAnt 审查（PR #27）：仅处理标签内的 href/src——普通文本
+      // 「see href='x」不是属性，不应被合成修复（htmlToMarkdown 会对无标签内容调用本函数）
+      const lastLt = html.lastIndexOf('<', m.index)
+      const lastGt = html.lastIndexOf('>', m.index)
+      if (lastLt === -1 || lastGt > lastLt) {
+        re.lastIndex = valueStart
+        continue
+      }
       const value = html.slice(valueStart, end)
-      out += html.slice(last, m.index) + (this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}`)
+      // CodeAnt 审查（PR #27）：非危险分支补闭合引号（与 v3.251 语义一致，
+      // 原实现漏尾部 quote 会产出畸形 HTML，浏览器吞并后续 markup）
+      out += html.slice(last, m.index) + (this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
       last = end
       re.lastIndex = end
     }

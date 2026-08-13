@@ -7576,6 +7576,22 @@ console.log('========================================\n');
     assertEqual(out.includes('javascript'), false, '危险协议不应残留')
   })
 
+  await test('sanitizeDecodedHtml 普通文本 href= 不误修（CodeAnt PR27 审查：仅标签内属性）', () => {
+    // 无标签上下文的普通文本（htmlToMarkdown 会对纯文本调用 sanitizeDecodedHtml）
+    const a = sanitizeDecodedHtml('see href="https://example')
+    assertEqual(a, 'see href="https://example', `普通文本不应被改写: ${a}`)
+    const b = sanitizeDecodedHtml('讨论 XSS: href="javascript:alert(1)')
+    assertEqual(b.includes('javascript'), true, `普通文本中的 javascript: 字样不应被清空: ${b}`)
+    // 标签内才处理（XSS 防护语义保持）
+    const c = sanitizeDecodedHtml('<a href="javascript:alert(1)')
+    assertEqual(c.includes('javascript'), false, `标签内未闭合 javascript: 仍应清空: ${c}`)
+  })
+
+  await test('sanitizeDecodedHtml 未闭合安全链接补闭合引号（CodeAnt PR27 审查：畸形 HTML）', () => {
+    const r = sanitizeDecodedHtml('<a href="https://x.com/a b')
+    assertEqual(r, '<a href="https://x.com/a b"', `未闭合安全链接应补闭合引号: ${r}`)
+  })
+
   await test('sanitizeDecodedHtml 未闭合引号 javascript: 清空 + 合法链接保留（v3.260 线性扫描语义）', () => {
     const a = sanitizeDecodedHtml('<a href="javascript:alert(1)')
     assertEqual(a.includes('javascript'), false, `未闭合 javascript: 应清空: ${a}`)
