@@ -7789,5 +7789,95 @@ console.log('========================================\n');
     }
   })
 
+  await test('_safeCounter：表格驱动——计数归一化边界', async () => {
+    const cases = [
+      [0, 0], [1, 1], [999, 999], [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+      [-1, 0], [1.5, 0], [NaN, 0], [Infinity, 0], [-Infinity, 0],
+      [true, 0], [false, 0], ['5', 5], ['abc', 0], ['', 0], [null, 0], [undefined, 0], [{}, 0], [[5], 5] // 数组经 Number() 隐式转换（源码实际行为，保持口径）
+    ]
+    for (const [input, expected] of cases) {
+      assertEqual(V3App._safeCounter(input), expected, `_safeCounter(${JSON.stringify(input)})`)
+    }
+  })
+
+  await test('_safeCounter：属性测试——任意输入返回非负整数（不变量）', async () => {
+    fc.assert(fc.property(
+      fc.oneof(fc.integer(), fc.double(), fc.boolean(), fc.string(), fc.constant(null), fc.constant(undefined), fc.constant(NaN), fc.constant(Infinity)),
+      (v) => {
+        const r = V3App._safeCounter(v)
+        assert.ok(Number.isInteger(r) && r >= 0 && r <= Number.MAX_SAFE_INTEGER, `应返回非负整数，实际 ${r}（输入 ${JSON.stringify(v)}）`)
+      }
+    ), { numRuns: 300 })
+  })
+
+  await test('_normalizeReportState：表格驱动——损坏/异常输入归一化', async () => {
+    const blank = () => V3App._blankReportState()
+    // 非对象 → blank
+    assertEqual(JSON.stringify(V3App._normalizeReportState(null)), JSON.stringify(blank()))
+    assertEqual(JSON.stringify(V3App._normalizeReportState(undefined)), JSON.stringify(blank()))
+    assertEqual(JSON.stringify(V3App._normalizeReportState(42)), JSON.stringify(blank()))
+    assertEqual(JSON.stringify(V3App._normalizeReportState('x')), JSON.stringify(blank()))
+    assertEqual(JSON.stringify(V3App._normalizeReportState([1, 2])), JSON.stringify(blank()))
+    // 正常对象
+    const ok = V3App._normalizeReportState({ date: '2026-08-13', total: 5, dedup: '3', filtered: -1, pushed: 1.5, failed: true, truncated: 'abc' })
+    assertEqual(ok.date, '2026-08-13')
+    assertEqual(ok.total, 5)
+    assertEqual(ok.dedup, 3)
+    assertEqual(ok.filtered, 0, '负数归 0')
+    assertEqual(ok.pushed, 0, '小数归 0')
+    assertEqual(ok.failed, 0, '布尔归 0')
+    assertEqual(ok.truncated, 0, '非法字符串归 0')
+    // pending 正常
+    const withPending = V3App._normalizeReportState({ total: 1, pending: { total: 9, dedup: '2' } })
+    assertEqual(withPending.pending.total, 9)
+    assertEqual(withPending.pending.dedup, 2)
+    // pending 损坏（非对象）→ 警告 + 空 pending
+    const warns = []
+    const oldWarn = console.warn
+    console.warn = (m) => warns.push(String(m))
+    try {
+      const bad = V3App._normalizeReportState({ total: 1, pending: 'corrupt' })
+      assertEqual(JSON.stringify(bad.pending), JSON.stringify(blank()), '损坏 pending 重置为空累计')
+    } finally {
+      console.warn = oldWarn
+    }
+    assert.ok(warns.length >= 1, '损坏 pending 应告警')
+  })
+
+  await test('_normalizeReportState：属性测试——任意输入不崩溃且计数合法（不变量）', async () => {
+    fc.assert(fc.property(
+      fc.oneof(
+        fc.constant(null), fc.constant(undefined), fc.constant(42), fc.constant('x'),
+        fc.array(fc.integer()),
+        fc.record({
+          date: fc.oneof(fc.string(), fc.constant(null), fc.constant(42)),
+          total: fc.oneof(fc.integer(), fc.boolean(), fc.string(), fc.constant(null)),
+          pending: fc.oneof(fc.constant('corrupt'), fc.constant(7), fc.record({ total: fc.integer(), dedup: fc.string() }), fc.constant(null))
+        })
+      ),
+      (raw) => {
+        const oldWarn = console.warn
+        console.warn = () => {}
+        try {
+          const st = V3App._normalizeReportState(raw)
+          assert.ok(st && typeof st === 'object', '应返回对象')
+          assert.ok(!Array.isArray(st), '不应是数组')
+          assert.ok(typeof st.date === 'string', `date 应为字符串: ${JSON.stringify(st.date)}`)
+          for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+            assert.ok(Number.isInteger(st[k]) && st[k] >= 0, `字段 ${k} 应为非负整数: ${st[k]}`)
+          }
+          if (st.pending) {
+            assert.ok(typeof st.pending === 'object' && !Array.isArray(st.pending), 'pending 应为对象')
+            for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+              assert.ok(Number.isInteger(st.pending[k]) && st.pending[k] >= 0, `pending.${k} 应为非负整数: ${st.pending[k]}`)
+            }
+          }
+        } finally {
+          console.warn = oldWarn
+        }
+      }
+    ), { numRuns: 200 })
+  })
+
   process.exit(failed > 0 ? 1 : 0)
 })()

@@ -2844,33 +2844,40 @@ const App = {
     } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
   },
 
+  // v3.258 提取：日报状态归一化（行为不变，供测试直接打纯函数）
+  _blankReportState () {
+    return { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+  },
+  _safeCounter (v) {
+    const n = Number(v)
+    return typeof v !== 'boolean' && Number.isInteger(n) && n >= 0 && n <= Number.MAX_SAFE_INTEGER ? n : 0
+  },
+  _normalizeReportState (raw) {
+    const blank = () => this._blankReportState()
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return blank()
+    const st = blank()
+    st.date = typeof raw.date === 'string' ? raw.date : ''
+    for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st[k] = this._safeCounter(raw[k])
+    if (raw.pending && typeof raw.pending === 'object' && !Array.isArray(raw.pending)) {
+      st.pending = blank()
+      for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st.pending[k] = this._safeCounter(raw.pending[k])
+    } else if (raw.pending) {
+      // pending 存在但非普通对象（状态文件损坏/结构异常）：不能静默丢弃跨天累计，
+      // 保留其占位并大声告警，让下游按 blankState 处理而不崩溃。
+      console.warn('⚠️ report.state 的 pending 字段格式异常，已重置为空累计（原值被丢弃）')
+      st.pending = blank()
+    }
+    return st
+  },
+
   // 运行日报（v3.125）：跨天时发"昨日日报"，当天累加统计；静默不影响主流程
   _updateReport (summary) {
     try {
       // v3.258：启用判断提取到 _enabledFlag（口径不变，供测试直接打纯函数）
       if (!this._enabledFlag(Config.report)) return
       const statePath = path.join(MessageStore.cacheDir, 'report.state')
-      const blankState = () => ({ date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 })
-      const safeCounter = (v) => {
-        const n = Number(v)
-        return typeof v !== 'boolean' && Number.isInteger(n) && n >= 0 && n <= Number.MAX_SAFE_INTEGER ? n : 0
-      }
-      const normalizeState = (raw) => {
-        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return blankState()
-        const st = blankState()
-        st.date = typeof raw.date === 'string' ? raw.date : ''
-        for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st[k] = safeCounter(raw[k])
-        if (raw.pending && typeof raw.pending === 'object' && !Array.isArray(raw.pending)) {
-          st.pending = blankState()
-          for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st.pending[k] = safeCounter(raw.pending[k])
-        } else if (raw.pending) {
-          // pending 存在但非普通对象（状态文件损坏/结构异常）：不能静默丢弃跨天累计，
-          // 保留其占位并大声告警，让下游按 blankState 处理而不崩溃。
-          console.warn('⚠️ report.state 的 pending 字段格式异常，已重置为空累计（原值被丢弃）')
-          st.pending = blankState()
-        }
-        return st
-      }
+      const blankState = () => this._blankReportState()
+      const normalizeState = (raw) => this._normalizeReportState(raw)
       const persistReportState = (next) => {
         const normalized = normalizeState(next)
         const ok = this._writeState(statePath, normalized)
