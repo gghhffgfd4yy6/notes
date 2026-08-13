@@ -7566,6 +7566,25 @@ console.log('========================================\n');
     assertEqual(out.length, 100000, '超长输入应按 100k 截断')
   })
 
+  await test('sanitizeDecodedHtml 长 href/src 值 + 多标签不回溯（v3.260 ReDoS 回归：v3.251 未闭合引号正则曾同步卡死）', () => {
+    const evil = '<a href="https://u.jd.com/' + 'A'.repeat(500) + '" onclick="x()"><img src="https://img.com/x.jpg">'.repeat(5)
+    const start = Date.now()
+    const out = sanitizeDecodedHtml(evil)
+    const cost = Date.now() - start
+    assertEqual(cost < 500, true, `长 href 输入应 <500ms，实际 ${cost}ms（v3.251 正则回溯复活）`)
+    assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(out), false, `事件属性不应残留: ${out.slice(0, 90)}`)
+    assertEqual(out.includes('javascript'), false, '危险协议不应残留')
+  })
+
+  await test('sanitizeDecodedHtml 未闭合引号 javascript: 清空 + 合法链接保留（v3.260 线性扫描语义）', () => {
+    const a = sanitizeDecodedHtml('<a href="javascript:alert(1)')
+    assertEqual(a.includes('javascript'), false, `未闭合 javascript: 应清空: ${a}`)
+    const b = sanitizeDecodedHtml('<a href="https://u.jd.com/abc" target="_blank">链接</a>')
+    assertEqual(b.includes('https://u.jd.com/abc'), true, `合法链接应保留: ${b}`)
+    const c = sanitizeDecodedHtml('<img src="javascript:alert(1)">')
+    assertEqual(c.includes('javascript'), false, `未闭合 src javascript: 应清空: ${c}`)
+  })
+
   await test('sanitizeDecodedHtml style CSS 十六进制转义 url 变体被拦截（Round2 C010）', () => {
     const r = sanitizeDecodedHtml('<div style="background:u\\72l(javascript:alert(1))">x</div>')
     assertEqual(/url\s*\(/i.test(r), false, `url( 不应残留: ${r}`)

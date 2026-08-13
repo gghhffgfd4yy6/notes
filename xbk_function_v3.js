@@ -515,8 +515,35 @@ const Utils = {
     // 上面两个正则均不匹配（成对引号/无引号值），危险协议保留并被执行。这里单独处理
     // 未闭合引号形态：引号后到标签边界(< 或行尾)之间【不含相同闭合引号】的值才处理，
     // 避免误伤已闭合的合法 href（此前会多补引号并吞掉后续属性）。
-    html = html.replace(/\b(href|src)\s*=\s*(["'])((?:[^"']|(?!\2)[\s\S])*?)(?=<|$)/gi, (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
+    html = this._cleanUnclosedUrlAttrs(html)
     return html
+  },
+
+  // v3.260：未闭合引号 href/src 清洗（线性扫描替代回溯正则，语义与 v3.251 等价）
+  // 匹配 `href="value`（引号后到 < 或行尾之间无同引号）→ 危险协议清空，否则补闭合引号。
+  // 已闭合（同引号在 < 前出现）→ 跳过（由成对引号正则处理），不重复处理。
+  _cleanUnclosedUrlAttrs (html) {
+    const re = /\b(href|src)\s*=\s*(["'])/gi
+    let m
+    let out = ''
+    let last = 0
+    while ((m = re.exec(html)) !== null) {
+      const name = m[1].toLowerCase()
+      const quote = m[2]
+      const valueStart = re.lastIndex
+      const lt = html.indexOf('<', valueStart)
+      const end = lt === -1 ? html.length : lt
+      const closeQuote = html.indexOf(quote, valueStart)
+      if (closeQuote !== -1 && closeQuote < end) {
+        re.lastIndex = closeQuote + 1
+        continue
+      }
+      const value = html.slice(valueStart, end)
+      out += html.slice(last, m.index) + (this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}`)
+      last = end
+      re.lastIndex = end
+    }
+    return out + html.slice(last)
   },
 
   /** 实体解码后再次清理主动 HTML/事件属性，防止 &lt;script&gt; 重新形成可执行标签 */
