@@ -16,10 +16,24 @@ function analyze (dir) {
   return results
 }
 
+// 递归查找 mutation-report.json（download-artifact 下载后目录结构可能嵌套 reports/ 等层）
+function findReportJson (dir) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name)
+    if (e.isDirectory()) {
+      const found = findReportJson(p)
+      if (found) return found
+    } else if (e.name === 'mutation-report.json') {
+      return p
+    }
+  }
+  return null
+}
+
 // 解析单个段的 mutation-report.json（复杂度拆分：analyze 保持线性遍历）
 function analyzeSegment (dir, entry) {
-  const reportPath = path.join(dir, entry.name, 'mutation-report.json')
-  if (!fs.existsSync(reportPath)) return { seg: entry.name.replace('mutation-report-', ''), error: '缺 mutation-report.json' }
+  const reportPath = findReportJson(path.join(dir, entry.name))
+  if (!reportPath) return { seg: entry.name.replace('mutation-report-', ''), error: '缺 mutation-report.json' }
   let report
   try {
     report = JSON.parse(fs.readFileSync(reportPath, 'utf8'))
