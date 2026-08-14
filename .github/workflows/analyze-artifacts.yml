@@ -1,17 +1,39 @@
 name: analyze-artifacts
 on:
   workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'mutation workflow run ID（留空 = 自动取最新）'
+        required: false
+        type: string
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: 获取 mutation run ID
+        id: mutation-run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID_INPUT: ${{ github.event.inputs.run_id }}
+        run: |
+          # 经 env 传参防 $GITHUB_OUTPUT 注入；run_id 严格校验纯数字
+          if [ -n "$RUN_ID_INPUT" ]; then
+            case "$RUN_ID_INPUT" in
+              *[!0-9]*) echo "::error::run_id 必须为纯数字"; exit 1 ;;
+            esac
+            echo "run_id=$RUN_ID_INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_id=$(gh run list --workflow=mutation.yml --limit=1 --json databaseId --jq '.[0].databaseId')" >> "$GITHUB_OUTPUT"
+          fi
       - name: 下载全部变异报告
         uses: actions/download-artifact@v5
         with:
           path: reports-all
           pattern: mutation-report-*
           merge-multiple: true
+          run-id: ${{ steps.mutation-run.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: 解析存活变异体分布
         run: node .github/analyze-artifacts.js

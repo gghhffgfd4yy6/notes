@@ -509,7 +509,11 @@ const Utils = {
     if (html === undefined || html === null) return ''
     try { html = String(html) } catch (e) { return '' }
     const cleanAttr = (name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`
-    html = html.replace(/\b(href|src)\s*=\s*(["'])([\s\S]*?)\2/gi, (_, name, quote, value) => cleanAttr(name, quote, value))
+    // 成对引号 href/src：值域禁止含 `<`（[^<]*?）——未闭合引号若与后续属性引号跨标签配对，
+    // 会把中间标签吞掉并遗留危险文本（子代理审查发现：`<a href="javascript:x><b><a href="javascript:y>`
+    // 输出 `<a href=""javascript:y>` 残留 javascript）。含 `<` 的"成对"实为未闭合，
+    // 由下方 _cleanUnclosedUrlAttrs 线性处理（值内 `<` 是标签边界，合法 URL 值不含裸 `<`）。
+    html = html.replace(/\b(href|src)\s*=\s*(["'])([^<]*?)\2/gi, (_, name, quote, value) => cleanAttr(name, quote, value))
     html = html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
     // v3.251 P0(XSS)：未闭合引号属性绕过——`<a href="javascript:alert(1)` 无闭合引号时
     // 上面两个正则均不匹配（成对引号/无引号值），危险协议保留并被执行。这里单独处理
@@ -2934,6 +2938,7 @@ const App = {
     return { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
   },
   _safeCounter (v) {
+    if (typeof v === 'symbol') return 0 // Number(Symbol) 抛 TypeError（子代理审查 commit-12）
     const n = Number(v)
     return typeof v !== 'boolean' && Number.isInteger(n) && n >= 0 && n <= Number.MAX_SAFE_INTEGER ? n : 0
   },

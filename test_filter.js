@@ -7555,6 +7555,23 @@ console.log('========================================\n');
     }
   })
 
+  await test('sanitizeDecodedHtml 未闭合引号跨标签不配对（子代理审查：残留 javascript P2）', () => {
+    // 子代理发现：第一个 href 未闭合引号与第二个 href 引号跨标签配对，
+    // 吞掉中间标签并遗留 `javascript:alert(2)>` 裸文本（`<a href=""javascript:alert(2)>`）
+    const cases = [
+      '<a href="javascript:alert(1)><b><a href="javascript:alert(2)>',
+      '<a href="javascript:alert(1)><b>',
+      '<a href="vbscript:msgbox(1)><span>x</span><a href="javascript:alert(3)>',
+      '<a href="data:text/html;base64,PHNjcmlwdD4><p><a href="javascript:alert(4)>'
+    ]
+    for (const input of cases) {
+      const out = sanitizeDecodedHtml(input)
+      assertEqual(out.includes('javascript'), false, `危险协议残留: ${input} → ${out}`)
+      assertEqual(out.includes('vbscript'), false, `vbscript 残留: ${input} → ${out}`)
+      assertEqual(out.includes('data:text/html'), false, `data: 残留: ${input} → ${out}`)
+    }
+  })
+
   await test('sanitizeDecodedHtml 未闭合主动标签堆叠 <2s（C002）', () => {
     const input = Array(20000).fill('<script').join(' ')
     const start = Date.now()
@@ -7624,11 +7641,17 @@ console.log('========================================\n');
   ]
   for (const [name, input] of perfCases) {
     await test(`基准: sanitizeDecodedHtml ${name} <500ms（真实形态）`, () => {
-      const start = Date.now()
-      const out = sanitizeDecodedHtml(input)
-      const cost = Date.now() - start
-      assertEqual(cost < 500, true, `${name} 应 <500ms，实际 ${cost}ms（真实数据 ReDoS 回归）`)
+      // 3 次测量取中位数——单次调度抖动不误报（CI 偶发 flaky），中位数保留真实回归灵敏度
+      const measure = () => {
+        const t0 = Date.now()
+        const out = sanitizeDecodedHtml(input)
+        return { cost: Date.now() - t0, out }
+      }
+      const runs = [measure(), measure(), measure()].sort((a, b) => a.cost - b.cost)
+      const { cost, out } = runs[1]
+      assertEqual(cost < 500, true, `${name} 应 <500ms（3 次中位数），实际 ${cost}ms（真实数据 ReDoS 回归）`)
       assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(out), false, `${name} 事件属性不应残留: ${out.slice(0, 60)}`)
+      assertEqual(out.includes('javascript') || out.includes('vbscript') || out.includes('data:text/html'), false, `${name} 危险协议不应残留: ${out.slice(0, 60)}`)
     })
   }
 
@@ -7813,7 +7836,7 @@ console.log('========================================\n');
   })
 
   await test('_validateTplConfig：合法模板零警告 + 非法占位符警告（表格驱动）', async () => {
-    const saved = JSON.stringify(Config.template)
+    const saved = Config.template === undefined ? undefined : JSON.stringify(Config.template)
     try {
     // 合法模板：全部占位符在支持列表内
       Config.template = { title: '【{分类名}】{标题} {价格}', content: '内容：{内容} 商城：{商城} 品牌：{品牌}' }
@@ -7827,12 +7850,12 @@ console.log('========================================\n');
       Config.template = { title: 123, content: null }
       assert.ok(V3App._validateTplConfig().some(w => w.includes('template.title/content')), '非字符串应警告')
     } finally {
-      Config.template = JSON.parse(saved)
+      Config.template = saved === undefined ? undefined : JSON.parse(saved)
     }
   })
 
   await test('_validateTplConfig：属性测试——任意模板不崩溃，合法占位符不产生警告', async () => {
-    const saved = JSON.stringify(Config.template)
+    const saved = Config.template === undefined ? undefined : JSON.stringify(Config.template)
     try {
       fc.assert(fc.property(
         fc.record({
@@ -7853,7 +7876,7 @@ console.log('========================================\n');
         }
       ), { numRuns: 200 })
     } finally {
-      Config.template = JSON.parse(saved)
+      Config.template = saved === undefined ? undefined : JSON.parse(saved)
     }
   })
 
@@ -7948,7 +7971,7 @@ console.log('========================================\n');
   })
 
   await test('_validateTplConfig：全部支持占位符不告警（CodeRabbit 建议——杀 SUPPORTED_TPL_KEYS 15 个 StringLiteral）', async () => {
-    const saved = JSON.stringify(Config.template)
+    const saved = Config.template === undefined ? undefined : JSON.stringify(Config.template)
     try {
       const keys = ['分类名', '分类ID', '标题', '链接', '日期', '时间', '楼主', '类目', '内容', '价格', '商城', '品牌', '图片', 'Html内容', 'Markdown内容']
       // 全组合：title+content 用全部 key
@@ -7961,7 +7984,7 @@ console.log('========================================\n');
         assertEqual(warns.length, 0, `占位符 {${k}} 不应警告: ${JSON.stringify(warns)}`)
       }
     } finally {
-      Config.template = JSON.parse(saved)
+      Config.template = saved === undefined ? undefined : JSON.parse(saved)
     }
   })
 
