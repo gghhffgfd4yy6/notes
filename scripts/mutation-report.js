@@ -204,7 +204,7 @@ async function postIssue (body) {
     const list = await listRes.json()
     const existing = (list || []).find(i => i.title === title)
     if (existing) {
-      console.log(`⏭️  当日日报已存在（#${existing.number}），跳过重复发布`)
+      console.log('⏭️  当日日报已存在，跳过重复发布')
       return { html_url: existing.html_url, skipped: true }
     }
   }
