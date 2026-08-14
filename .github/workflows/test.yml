@@ -3,6 +3,8 @@ name: Test
 # 质量门禁：push / PR 自动执行。任何一步失败 → 阻断合并。
 # 流水线：lint → 版本一致性 → 单元 → 通道 → 集成(并行) → 集成(串行完整) → 安全审计
 on:
+  pull_request:
+    branches: [master]
   schedule:
     - cron: "0 8 * * *"   # 每日冒烟，防环境漂移
   push:

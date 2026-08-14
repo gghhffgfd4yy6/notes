@@ -3,6 +3,8 @@ name: CodeQL
 # 安全扫描（质量门禁最后一道，依据 .ai/skills/ci-cd-and-automation/）
 # 供应链安全：固定 commit SHA（可变 tag 可被上游重新指向）
 on:
+  pull_request:
+    branches: [master]
   push:
     branches: [master]
   pull_request:

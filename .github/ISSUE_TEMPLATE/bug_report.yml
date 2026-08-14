@@ -1,0 +1,28 @@
+name: Bug 报告
+description: 报告一个 Bug
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 问题描述
+      description: 发生了什么？预期应该是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 怎么复现这个问题
+      placeholder: |
+        1. 执行 ...
+        2. 输入 ...
+        3. 看到报错 ...
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      description: Node 版本 / 触发方式（手动/CI/定时）
