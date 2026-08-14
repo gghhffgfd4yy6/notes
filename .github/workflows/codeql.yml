@@ -1,0 +1,40 @@
+name: CodeQL
+
+# 安全扫描（质量门禁最后一道，依据 .ai/skills/ci-cd-and-automation/）
+# 供应链安全：固定 commit SHA（可变 tag 可被上游重新指向）
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: '0 12 * * 1'   # 每周一 12:00 UTC 定期扫描
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # CodeQL 上传扫描结果必需
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['javascript']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@c4dd10e44af883a891fe31ced449bcb4a6728b9b  # v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality   # 默认安全查询 + 质量查询（更严）
+          config-file: .github/codeql/codeql-config.yml   # 排除测试/工具文件
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@c4dd10e44af883a891fe31ced449bcb4a6728b9b  # v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b  # v3
