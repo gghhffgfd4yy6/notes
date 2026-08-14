@@ -1,5 +1,8 @@
 name: analyze-artifacts
 on:
+  push:
+    paths:
+      - '.github/workflows/analyze-artifacts.yml'
   workflow_dispatch:
     inputs:
       run_id:

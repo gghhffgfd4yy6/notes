@@ -3,6 +3,7 @@ name: Release
 # 版本发布自动化：推送 v* tag 时自动校验版本一致性（101 章测试）并创建 GitHub Release
 # 触发方式：git tag vX.Y.Z && git push origin vX.Y.Z
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'

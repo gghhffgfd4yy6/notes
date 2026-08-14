@@ -3,6 +3,9 @@ name: Stale
 # 清理长期无活动的 Issue/PR（自动化维护，依据 .ai/skills/ci-cd-and-automation/）
 # 供应链安全：固定 commit SHA
 on:
+  push:
+    paths:
+      - '.github/workflows/stale.yml'
   schedule:
     - cron: '0 3 * * *'   # 每天 03:00 UTC
   workflow_dispatch:
