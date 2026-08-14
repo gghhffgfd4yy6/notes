@@ -194,7 +194,20 @@ async function postIssue (body) {
   const token = process.env.GITHUB_TOKEN
   if (!token) throw new Error('缺少 GITHUB_TOKEN')
   const repo = process.env.GITHUB_REPOSITORY || 'junhanw868-bot/notes'
-  const title = `🧬 变异测试日报 ${new Date().toISOString().slice(0, 10)}`
+  const today = new Date().toISOString().slice(0, 10)
+  const title = `🧬 变异测试日报 ${today}`
+  // 同天去重：当天已有日报则跳过（避免多次运行重复发 Issue）
+  const listRes = await fetch(`https://api.github.com/repos/${repo}/issues?state=all&per_page=100&creator=github-actions%5Bbot%5D`, {
+    headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'mutation-report' }
+  })
+  if (listRes.ok) {
+    const list = await listRes.json()
+    const existing = (list || []).find(i => i.title === title)
+    if (existing) {
+      console.log(`⏭️  当日日报已存在（#${existing.number}），跳过重复发布`)
+      return { html_url: existing.html_url, skipped: true }
+    }
+  }
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'mutation-report' },
