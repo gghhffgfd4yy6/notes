@@ -7610,6 +7610,28 @@ console.log('========================================\n');
     assertEqual(c.includes('javascript'), false, `未闭合 src javascript: 应清空: ${c}`)
   })
 
+  // ==================== 真实数据形态性能基准（v3.260：v3.251 长 href ReDoS 教训） ====================
+  // 覆盖真实接口 content_html 的各类触发形态——修复前这些数据会让 sanitizeDecodedHtml 同步卡死
+  // （单条正则快、组合真实数据才炸——基准数据必须用真实形态才能抓到这类雷）
+  const perfCases = [
+    ['长 href URL + 多标签（v3.251 触发形态）', '<a href="https://u.jd.com/' + 'A'.repeat(800) + '" target="_blank">领券</a><img src="https://img.com/x.jpg" alt="图">'.repeat(6)],
+    ['长 src + img 堆叠', '<img src="https://img14.360buyimg.com/n1/s450x450_jfs/t1/170905/30/12345/67890/1234567890abcdef.jpg">'.repeat(8)],
+    ['未闭合引号长值（v3.251 XSS 形态）', '<a href="javascript:alert(1)' + 'B'.repeat(600)],
+    ['引号内 > 标签边界（PR#28 Critical 形态）', '<a title="' + '>'.repeat(100) + '" href="javascript:alert(1)" onclick="x()">'.repeat(4)],
+    ['嵌套引号 + script 长内容', '<script>var x = "' + 'C'.repeat(2000) + '"</script><a href="https://x.com/a">链</a>'.repeat(3)],
+    ['100k 截断边界 + 长 URL', ('<a href="https://u.jd.com/' + 'D'.repeat(5000) + '"><img src="x">').repeat(20)],
+    ['on* 属性链 + style 危险值', ('<div onclick="x()" onmouseover="y()" style="background:url(javascript:alert(1))"><a href="https://x.com/a">t</a></div>').repeat(5)]
+  ]
+  for (const [name, input] of perfCases) {
+    await test(`基准: sanitizeDecodedHtml ${name} <500ms（真实形态）`, () => {
+      const start = Date.now()
+      const out = sanitizeDecodedHtml(input)
+      const cost = Date.now() - start
+      assertEqual(cost < 500, true, `${name} 应 <500ms，实际 ${cost}ms（真实数据 ReDoS 回归）`)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(out), false, `${name} 事件属性不应残留: ${out.slice(0, 60)}`)
+    })
+  }
+
   await test('sanitizeDecodedHtml style CSS 十六进制转义 url 变体被拦截（Round2 C010）', () => {
     const r = sanitizeDecodedHtml('<div style="background:u\\72l(javascript:alert(1))">x</div>')
     assertEqual(/url\s*\(/i.test(r), false, `url( 不应残留: ${r}`)
