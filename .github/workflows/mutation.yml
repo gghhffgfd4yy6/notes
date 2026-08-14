@@ -6,6 +6,9 @@ name: Mutation
 # 免费 runner 单任务上限 6h——每段预估 1-2h，余量充足。
 # 触发方式：手动（Actions → Mutation → Run workflow）+ 每日自动（北京时间 0:00 = UTC 16:00）
 on:
+  push:
+    paths:
+      - '.github/workflows/mutation.yml'
   workflow_dispatch:
   schedule:
     - cron: '0 16 * * *'
