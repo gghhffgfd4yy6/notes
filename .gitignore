@@ -7,3 +7,5 @@ push_config.local.js
 reports/
 mutation-progress.json
 mutation-report.json
+.ai/
+cleanup_rootfs_junk.sh
