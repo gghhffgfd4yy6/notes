@@ -42,8 +42,8 @@ function analyzeSegment (dir, entry) {
     return { seg: entry.name.replace('mutation-report-', ''), error: String(e.message || e) }
   }
   const stats = { total: 0, killed: 0, survived: 0, noCoverage: 0, timeout: 0, survivedMutants: [] }
-  for (const file of Object.values(report.files || {})) {
-    for (const m of file.mutants || []) countMutant(stats, file, m)
+  for (const [fileKey, file] of Object.entries(report.files || {})) {
+    for (const m of file.mutants || []) countMutant(stats, fileKey, m)
   }
   const score = stats.total > 0 ? ((stats.killed + stats.timeout) / stats.total) * 100 : 100
   return {
@@ -59,16 +59,17 @@ function analyzeSegment (dir, entry) {
 }
 
 // 单个变异体计数（独立小函数：killed/survived/noCoverage/timeout 分类）
-function countMutant (stats, file, m) {
+function countMutant (stats, fileKey, m) {
   stats.total++
   if (m.status === 'Killed') {
     stats.killed++
   } else if (m.status === 'Survived') {
     stats.survived++
     stats.survivedMutants.push({
-      file: (file.sourcePath || file.name || '?').split('/').pop(),
+      file: String(fileKey || '?'),
       line: m.location ? m.location.start.line : '?',
-      mutator: m.mutatorName
+      mutator: m.mutatorName,
+      replacement: m.replacement
     })
   } else if (m.status === 'NoCoverage') {
     stats.noCoverage++
@@ -77,8 +78,24 @@ function countMutant (stats, file, m) {
   }
 }
 
+// 统计收集（独立小函数——降低 render 圈复杂度：文件分布 + 类型分布 + 存活列表）
+function collectStats (results) {
+  const byFile = {}
+  const byKind = {}
+  const allSurvived = []
+  for (const r of results) {
+    for (const m of r.survivedMutants || []) {
+      allSurvived.push(m)
+      byFile[m.file] = (byFile[m.file] || 0) + 1
+      byKind[m.mutator] = (byKind[m.mutator] || 0) + 1
+    }
+  }
+  return { byFile, byKind, allSurvived }
+}
+
 function render (results) {
   const lines = []
+  const { byFile, byKind, allSurvived } = collectStats(results)
   lines.push('## 🧬 变异测试日报')
   lines.push('')
   lines.push('| 段 | 变异体 | 被杀 | 存活 | 无覆盖 | 分数 |')
@@ -99,7 +116,28 @@ function render (results) {
   const overall = tTotal > 0 ? Math.round(((tKilled / tTotal) * 100) * 100) / 100 : 100
   lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tSurvived}** | | **${overall}%** |`)
   lines.push('')
-  const allSurvived = results.flatMap(r => r.survivedMutants || [])
+  // 存活最多的文件 Top 10（含具体数量——定位补测重点）
+  const topFiles = Object.entries(byFile).sort((a, b) => b[1] - a[1]).slice(0, 10)
+  if (topFiles.length > 0) {
+    lines.push('## 存活最多的文件 Top 10')
+    lines.push('')
+    lines.push('| 文件 | 存活变异体数 |')
+    lines.push('|---|---|')
+    for (const [f, n] of topFiles) lines.push(`| \`${f}\` | ${n} |`)
+    lines.push('')
+  }
+
+  // 按变异类型分布（存活——种类 + 数量，定位测试弱在哪类）
+  const topKinds = Object.entries(byKind).sort((a, b) => b[1] - a[1]).slice(0, 15)
+  if (topKinds.length > 0) {
+    lines.push('## 存活变异类型分布 Top 15')
+    lines.push('')
+    lines.push('| 变异类型 | 存活数 |')
+    lines.push('|---|---|')
+    for (const [k, n] of topKinds) lines.push(`| ${k} | ${n} |`)
+    lines.push('')
+  }
+
   if (allSurvived.length > 0) {
     lines.push(`## 存活变异体（${allSurvived.length} 个）`)
     lines.push('')
