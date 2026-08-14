@@ -16,14 +16,15 @@ function analyze (dir) {
   return results
 }
 
-// 递归查找 mutation-report.json（download-artifact 下载后目录结构可能嵌套 reports/ 等层）
+// 递归查找 stryker 报告文件（文件名 mutation.json——json reporter 输出 reports/mutation/mutation.json；
+// 兼容旧名 mutation-report.json；目录可能嵌套 reports/ 等层）
 function findReportJson (dir) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name)
     if (e.isDirectory()) {
       const found = findReportJson(p)
       if (found) return found
-    } else if (e.name === 'mutation-report.json') {
+    } else if (e.name === 'mutation.json' || e.name === 'mutation-report.json') {
       return p
     }
   }
