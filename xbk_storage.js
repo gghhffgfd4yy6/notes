@@ -23,6 +23,11 @@ function ensureParent (filePath) {
 }
 
 function writeAtomic (filePath, text, label = '缓存文件') {
+  // 已知取舍（审查 2026-08-15，记录不修）：isRegularOrMissing 检查与 renameSync 之间、以及
+  // cacheDir 的 realpath 校验与每次写入之间均存在 TOCTOU 窗口（校验时是普通文件/目录，窗口内被替换
+  // 为符号链接时，rename 会替换链接本身不跟随，但中间目录若为链接可指向根外）。已属多层防御
+  // （basename 清洗 + O_NOFOLLOW 读 + 原子写 + 唯一 tmp），攻击者需先具备对项目根/缓存目录的写权限，
+  // 风险等级低，接受现状（单实例 cron 信任本地文件系统）。
   if (!isRegularOrMissing(filePath)) {
     console.error(`拒绝写入非普通文件 ${label} ${filePath}`)
     return false

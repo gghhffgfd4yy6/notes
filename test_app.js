@@ -19,6 +19,7 @@ let failCount = 0 // 5xx 类失败次数（无 response，会重试）
 let fail4xx = false // 4xx 失败（带 response，不重试）
 let failTimeout = false // 超时失败（code=ETIMEDOUT，会重试）
 let fail429Once = false // 仅第一次抛 429（限流，应重试）
+let fail425Once = false // 仅第一次抛 425（Too Early，应重试——P2：与 failure_policy RETRYABLE_CODES 收敛）
 let failPlainString = false // 抛普通字符串(非 Error)
 let failNonJson = false // 仅第一次返回非 JSON 响应（.json() 抛错，应重试）
 let failLongMsg = false // 抛超长 message 的 Error（C043 日志截断）
@@ -36,6 +37,12 @@ require.cache[gotPath].exports = (url, opts) => {
     fail429Once = false
     const e = new Error('Too Many')
     e.response = { statusCode: 429 }
+    throw e
+  }
+  if (fail425Once) {
+    fail425Once = false
+    const e = new Error('Too Early')
+    e.response = { statusCode: 425 }
     throw e
   }
   if (failTimeout) {
@@ -156,6 +163,7 @@ function reset () {
   fakeData = []
   failCount = 0
   fail4xx = false
+  fail425Once = false
   failTimeout = false
   fail429Once = false
   failPlainString = false
@@ -452,6 +460,16 @@ console.log('========================================\n');
     assert(crashed, '4xx 应抛出异常（不再静默吞错）')
     assert(gotCalls.length === 1, `4xx 不应重试，实际请求${gotCalls.length}次`)
     assert(pushCalls.length === 0, '4xx 不应推送')
+  })
+
+  await test('425 Too Early → 重试成功（P2：fetchData 与 failure_policy RETRYABLE_CODES 收敛）', async () => {
+    reset()
+    setPushUrl('t425_retry')
+    fail425Once = true // 第一次 425，第二次成功
+    fakeData = [makeItem({ id: 1 })]
+    await xbk.run()
+    assert(gotCalls.length === 2, `425 应重试，实际请求${gotCalls.length}次`)
+    assert(pushCalls.length === 1, '425 重试成功后应推送')
   })
 
   // ==================== 7. 组合场景 ====================
@@ -2625,14 +2643,19 @@ console.log('========================================\n');
     const origErr = console.error
     const errs = []
     console.error = (m) => errs.push(String(m))
+    let summary
     try {
-      await xbk.run()
+      summary = await xbk.run()
     } finally {
       console.error = origErr
     }
     assert(pushCalls.length === 0, `损坏缓存首次运行不应推送，实际${pushCalls.length}`)
     assert(errs.some(e => e.includes('缓存读取失败，跳过本轮推送以防重复轰炸')),
         `应有跳过推送告警: ${errs.join(' | ')}`)
+    // P1（审查 2026-08-15）：缓存读失败早退曾返回 undefined（退出码 0 + 零告警零日志，静默漏推）；
+    // 修复后应返回带失败语义的摘要，使 classifySummary 判可重试失败 → runSingleEntry 置非零退出码
+    assert(summary?.total === 1 && summary?.failed === 1 && summary?.pushed === 0,
+        `缓存读失败应返回失败摘要(failed=待推送条数)，实际 ${JSON.stringify(summary)}`)
     // 修复缓存（写合法 JSON 空数组）后恢复正常推送
     reset()
     setPushUrl('t99_corrupt_cache')
@@ -2640,6 +2663,69 @@ console.log('========================================\n');
     fakeData = [makeItem({ id: 9002, title: '修复后推送' })]
     await xbk.run()
     assert(pushCalls.length === 1, `修复缓存后应推送，实际${pushCalls.length}`)
+  })
+
+  await test('sendNotify 同步返回非 Promise → 拒绝静默成功（P2：契约防御，不写缓存）', async () => {
+    reset()
+    setPushUrl('t_p2_sync_notify')
+    fakeData = [makeItem({ id: 1 })]
+    // 同步返回 undefined 的第三方实现：Promise.race 会对 undefined 立即 resolve → 曾误判成功写缓存
+    notifyMock.sendNotify = () => undefined
+    const summary = await xbk.run()
+    notifyMock.sendNotify = defaultNotifySend
+    assert(pushCalls.length === 0, `同步 sendNotify 不应产生推送记录，实际${pushCalls.length}`)
+    assert(summary?.pushed === 0 && summary?.failed === 1,
+        `应记录失败语义（不写缓存下次重试），实际 ${JSON.stringify(summary)}`)
+    const cached = readCacheFile('t_p2_sync_notify')
+    assert(cached.length === 0, '同步 sendNotify 失败不应写缓存')
+  })
+
+  await test('只看它：0/false 标题参与匹配（P2：App.run 收敛 whitelistFilter 消除漂移）', async () => {
+    // title=0 且 zkt_gjc='0' → 匹配 → 推送（修复前内联 !rawTitle 对 0 一律放行，无法被关键词 '0' 命中）
+    reset()
+    setPushUrl('t_p2_kwd_zero')
+    Config.keyword.zkt_gjc = '0'
+    fakeData = [makeItem({ id: 1, title: 0 })]
+    await xbk.run()
+    assert(pushCalls.length === 1, `title=0 且 zkt_gjc='0' 应匹配推送，实际${pushCalls.length}`)
+    // title=0 且 zkt_gjc='abc' → 不匹配 → 滤掉（修复前 0/false 一律放行会误推）
+    reset()
+    setPushUrl('t_p2_kwd_miss')
+    Config.keyword.zkt_gjc = 'abc'
+    fakeData = [makeItem({ id: 2, title: 0 })]
+    await xbk.run()
+    assert(pushCalls.length === 0, `title=0 且 zkt_gjc='abc' 应被滤掉，实际${pushCalls.length}`)
+  })
+
+  await test('缓存读失败时 filter.hash 不推进（P2：旧 _f 永久失效防线）', async () => {
+    const hashPath = path.join(CACHE_DIR, 'filter.hash')
+    const cachePath = path.join(CACHE_DIR, 't_p2_hash_broken.json')
+    // ① 规则 A（屏蔽词）：正常 run → 写入 filter.hash(A)
+    reset()
+    setPushUrl('t_p2_hash_base')
+    Config.filter.pingbibiaoti = '屏蔽词'
+    fakeData = [makeItem({ id: 1, title: '屏蔽词内容' })]
+    await xbk.run()
+    const h1 = fs.readFileSync(hashPath, 'utf8').trim()
+    // ② 规则改为 B + 切换到「从未读入内存」的损坏缓存文件（内存缓存会屏蔽磁盘损坏，须用新 cacheName）
+    reset()
+    setPushUrl('t_p2_hash_broken') // 清残留
+    fs.writeFileSync(cachePath, '{ broken json', 'utf8')
+    Config.filter.pingbibiaoti = '新词'
+    fakeData = [makeItem({ id: 1, title: '屏蔽词内容' })]
+    await xbk.run()
+    const h3 = fs.readFileSync(hashPath, 'utf8').trim()
+    assert(h3 === h1, `缓存读失败时 filter.hash 不应推进，期望 ${h1} 实际 ${h3}`)
+    // ③ 修复缓存为空数组
+    fs.writeFileSync(cachePath, '[]', 'utf8')
+    // ④ 规则仍 B：hash(A) !== hash(B) → 检测到规则变更 → 推进 hash(B) → 正常推送
+    reset()
+    Config.filter.pingbibiaoti = '新词'
+    fakeData = [makeItem({ id: 1, title: '屏蔽词内容' })]
+    await xbk.run()
+    const h5 = fs.readFileSync(hashPath, 'utf8').trim()
+    assert(h5 !== h1, `修复缓存后 hash 应推进为新规则: ${h1} vs ${h5}`)
+    assert(pushCalls.length === 1, `修复缓存后应正常推送，实际${pushCalls.length}`)
   })
 
   await test('saveBatch 同内容两次 → 文件 mtime/timestamp 不变（C024）', async () => {

@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.258 — Round2 全函数找bug审查 31项修复 ********
+//* ******* 线报酷推送脚本 v3.259 — 手机端AI只读审查 P1/P2 修复 ********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -50,7 +50,7 @@ const fs = profile3Require('fs', () => require('fs'))
 const { fetchJson } = profile3Require('xbk_http', () => require('./xbk_http'))
 const { prewarmDns, prewarmTls } = profile3Require('xbk_agents', () => require('./xbk_agents'))
 const { isRegularOrMissing, readSafeTextResult, writeAtomic } = profile3Require('xbk_storage', () => require('./xbk_storage'))
-const { summarizeError } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'))
+const { summarizeError, RETRYABLE_CODES } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'))
 const path = profile3Require('path', () => require('path'))
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
 // 缺 package.json 时回退 '3.x'（移植性防御）
@@ -993,9 +993,17 @@ const Utils = {
       parts.push('date=' + d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0'))
     }
     const s = parts.join('\u0001')
-    let h = 5381
-    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
-    return String(h)
+    // P2（审查 2026-08-15）：由单一 32 位 djb2 升级为两路独立 32 位 djb2 拼接（64 位碰撞空间），
+    // 与 anonKey（v3.248）同款——32 位下配置变更哈希碰撞 → 「过滤写入」缓存不失效 → 改宽过滤后
+    // 旧条目静默漏推。仍输出确定性十进制串，仅用于相等比较，格式变更无兼容问题。
+    let h1 = 5381; let h2 = 52711
+    for (let i = 0; i < s.length; i++) {
+      // S7758：codePointAt 对代理对返回完整码点（BMP 字符与 charCodeAt 等价，ASCII 配置哈希值不变）
+      const c = s.codePointAt(i)
+      h1 = ((h1 * 33) ^ c) >>> 0
+      h2 = ((h2 * 31) + c + i) >>> 0
+    }
+    return String(h1) + '-' + String(h2)
   },
 
   // ==================== 转换/系统 ====================
@@ -1722,6 +1730,12 @@ const RuleEngine = {
       // 与 App.run 口径一致：纯空白关键词为误配置，显式告警并忽略只看它过滤
       warnings.push('⚠️ 配置「zkt_gjc」为空白字符，已忽略只看它过滤')
     } else if (cfg.zkt_gjc && String(cfg.zkt_gjc).trim() !== '') {
+      // P2（审查 2026-08-15）：zkt_gjc 首尾空白地雷——hash 与 App.run 均按字面正则匹配（不能 trim，
+      // 空白在正则语义中有意义），' abc' 与 'abc' 行为完全不同；「只看它」是白名单语义，误配空格会
+      // 静默全量滤空且无告警（pingbitime 已有同款告警，此处补齐低成本保险）。
+      if (String(cfg.zkt_gjc) !== String(cfg.zkt_gjc).trim()) {
+        warnings.push('⚠️ 配置「zkt_gjc」含首尾空白，将按字面正则匹配（不会被 trim）；若非有意配置请去除首尾空格')
+      }
       if (this.hasNestedQuantifier(cfg.zkt_gjc)) {
         warnings.push('⚠️ 配置「zkt_gjc」的正则含嵌套量词，可能导致灾难性回溯，已忽略只看它过滤')
       } else {
@@ -1866,7 +1880,9 @@ const FilterEngine = {
     // 第一轮：强制展现
     for (const stage of fieldStages) {
       const val = stage.getVal(group)
-      if (stage.showCfg && val) {
+      // P2（审查 2026-08-15）：真值判定会把 0/false 当「字段缺失」跳过匹配，与 matchesCompiled
+      // C013 契约（0/false 为有效值、参与匹配）分裂——统一为仅 undefined/null/空串视为缺失。
+      if (stage.showCfg && val !== undefined && val !== null && val !== '') {
         if (RuleEngine.matchesCompiled(stage.showCfg, val, Utils.safeGet(group, 'catename'))) {
           showFlags[stage.key] = true
         }
@@ -1876,7 +1892,8 @@ const FilterEngine = {
     // 第二轮：屏蔽 + 强化屏蔽
     for (const stage of fieldStages) {
       const val = stage.getVal(group)
-      if (!val) continue
+      // P2（同上）：0/false 是有效字段值，参与屏蔽/强化屏蔽匹配
+      if (val === undefined || val === null || val === '') continue
       const blocked = stage.blockedBy.some(k => showFlags[k])
 
       if (stage.blockCfg && !blocked && !showFlags[stage.key]) {
@@ -2019,7 +2036,13 @@ const MessageStore = {
     // C022：应急目录同样校验 realpath；被替换成外部符号链接时不能原样返回。
     if (realInsideRoot(emergencyFallback)) return emergencyFallback
     // 校验失败回退到根目录下唯一安全路径（固定新目录名，不跟随外部符号链接）。
-    return path.join(root, '.xbk_cache_safe_internal')
+    // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换为
+    // 指向项目外的符号链接，写入会逃出根目录（前两级候选均先过 realInsideRoot，唯独此级曾直接返回）。
+    const internalFallback = path.join(root, '.xbk_cache_safe_internal')
+    if (realInsideRoot(internalFallback)) return internalFallback
+    // 所有候选目录（含应急目录）均不可用：说明项目根目录层级已被外部符号链接劫持，
+    // 继续返回任意路径都会逃出根目录——显式抛错，由 init()/App.run 的 try/catch 暴露，禁止静默写穿。
+    throw new Error('缓存目录安全检查失败：所有候选目录（含 .xbk_cache_safe_internal）均不可用，可能被符号链接劫持')
   },
   _memoryCache: {},
   // 内存缓存实际键数（与 _memoryCache 同步维护，替代热路径上每次新键写都 Object.keys O(n)）
@@ -2314,8 +2337,14 @@ const MessageStore = {
         try { delete this._memoryCache[filePath] } catch (e) { /* 忽略 */ }
       }
     }
+    // P2（审查 2026-08-15）：非数组入参曾退化为「写空数组」——会在未读取磁盘的情况下把去重
+    // 缓存整体覆写为 []，违背「损坏缓存重置失败不得缓存空数组」铁律（当前调用方均传数组，属防御加固）。
+    if (!Array.isArray(messages)) {
+      console.error(`缓存写入拒绝：messages 必须为数组 ${filePath}`)
+      return false
+    }
     // 拷贝后再截断：不原地修改调用方传入的数组（外部复用场景）
-    const toSave = Array.isArray(messages) ? [...messages] : []
+    const toSave = [...messages]
     // maxSize 防御：非正整数回退默认（R3-2 整数化——小数 2.5 会让 splice 的 ToInteger 截断产生模糊条数；0/负值避免缓存被清空）
     // v3.176：Utils.num 口径——'5000'(环境变量字符串) 曾 Number.isInteger 判否 → 静默回退 10000
     // （validateConfig 按 v3.175 口径判合法不警告 → 层间不一致，用户以为 5000 生效实际 10000）
@@ -2622,10 +2651,12 @@ const Network = {
       } catch (e) {
         lastErr = e
 
-        // 4xx 客户端错误：重试也没用，直接抛出（429 限流除外——限流可能瞬时，值得重试）
+        // 4xx 客户端错误：重试也没用，直接抛出（限流/临时性状态码除外——408/409/425/429 可能瞬时，值得重试）
+        // P2（审查 2026-08-15）：可重试状态码收敛到 xbk_failure_policy.RETRYABLE_CODES 单一来源，
+        // 曾内联硬编码 429/408/409 漏掉 425（failure_policy 判 retryable 而 fetchData 立即抛，两份清单漂移）。
         if (e.response) {
           const sc = e.response.statusCode
-          if (sc !== undefined && sc < 500 && sc !== 429 && sc !== 408 && sc !== 409) throw e // v3.158: 408/409 临时性也重试
+          if (sc !== undefined && sc < 500 && !RETRYABLE_CODES.has('HTTP_' + sc)) throw e
         }
 
         if (attempt < maxRetry) { // v3.157：用兜底后的 maxRetry（曾用原始 Config.api.retry，非法类型时与实际重试不一致）
@@ -2674,8 +2705,15 @@ const Pusher = {
     const controller = typeof AbortController === 'function' ? new AbortController() : null
     const notifyMod = notifyModule || (notify || await getNotify())
     try {
+      // P2（审查 2026-08-15）：契约防御——第三方 sendNotify 必须返回 thenable；同步 undefined 会让
+      // Promise.race 立即 resolve → 主流程误写缓存造成「未发送即成功」静默丢消息。真实模块为 async，
+      // 此处防未来接入同步实现时静默成功（抛错由 pushOne catch → 不写缓存 → 下次重试）。
+      const sendResult = notifyMod.sendNotify(text, desp, controller ? { signal: controller.signal } : {})
+      if (!sendResult || typeof sendResult.then !== 'function') {
+        throw new Error('推送模块 sendNotify 未返回 Promise，拒绝静默成功')
+      }
       await Promise.race([
-        notifyMod.sendNotify(text, desp, controller ? { signal: controller.signal } : {}),
+        sendResult,
         new Promise((_, rej) => {
           timer = setTimeout(() => {
             if (controller) controller.abort()
@@ -3164,7 +3202,9 @@ const App = {
       checkpoint('disk-check')
 
       // ① 校验配置
-      const warnings = RuleEngine.validateConfig(Config.filter)
+      const warnings = RuleEngine.validateConfig({ ...Config.filter, zkt_gjc: Config.keyword.zkt_gjc })
+      // CodeRabbit：zkt_gjc 在 Config.keyword 下（validateConfig 只收 filter 配置时该字段恒为 undefined，
+      // 首尾空白/非法正则告警在正常执行时永不触发）——显式传入 active 配置使告警生效
       for (const w of warnings) console.warn(w)
 
       // 配置告警显示统一安全字符串化：脏值（Symbol / 异常 valueOf）不能让告警路径再次崩溃。
@@ -3256,7 +3296,10 @@ const App = {
           }
         }
         // 只有过滤缓存清理成功后才推进 hash；否则下次运行必须继续重试，避免旧 _f 永久失效。
-        if (filterStateReady) {
+        // P2（审查 2026-08-15）：缓存读失败时 readMessages 返回 [] 且置 _readFailed，kept.length===msgs.length
+        // （0===0）不会进清理分支，filterStateReady 保持 true 曾导致 hash 照常覆写——缓存修复后规则变更
+        // 检测永不再次触发（改宽过滤规则后旧条目永远不再重新评估/推送）。与 hash 读失败同口径：不推进，下轮重试。
+        if (filterStateReady && !MessageStore._readFailed[MessageStore.getFilePath(cacheName)]) {
           this._writeTextAtomic(hashPath, filterHash)
         }
       }
@@ -3270,7 +3313,21 @@ const App = {
       const cacheMsgs = MessageStore.readMessages(cacheFilePath)
       if (MessageStore._readFailed[cacheFilePath]) {
         console.error('缓存读取失败，跳过本轮推送以防重复轰炸')
-        return
+        // P1（审查 2026-08-15）：此路径曾直接 return undefined——退出码 0 + 零告警 + 零日志，
+        // 缓存持续损坏时 cron 每次「绿色成功」却零推送零告警，静默漏推。与 catch 路径同口径可观测：
+        // 写 run.log ERROR + 告警（测试默认关 alert 不污染推送计数）+ 返回带失败语义的摘要，
+        // 使 classifySummary 判可重试失败 → runSingleEntry 置非零退出码，调度感知失败。
+        this._writeRunLog(`${this._localStamp()} ERROR 缓存读取失败，跳过本轮推送（防重复轰炸）${cacheFilePath}\n`)
+        try { await this._sendAlert(`缓存读取失败，本轮推送已跳过（防重复轰炸）：${cacheFilePath}`) } catch (e) { /* 告警失败不阻塞 */ }
+        return {
+          total: xbkdata.length,
+          dedup: 0,
+          filtered: 0,
+          truncated: 0,
+          pushed: 0,
+          failed: xbkdata.length,
+          failures: []
+        }
       }
       const cacheIds = new Set() // 缓存中有 id 条目的 String(id)
       const cacheUrls = new Set() // 缓存中所有有 URL 条目的 validUrl
@@ -3369,14 +3426,15 @@ const App = {
             }
           }
           if (kwRe) {
-            // 空标题保留（与推送占位一致，避免"只看它"把无标题数据滤掉）
-            const kept = items.filter(it => {
-              const rawTitle = Utils.safeGet(it, 'title')
-              if (!rawTitle) return true
-              const title = Utils.safeText(rawTitle, '')
-              try { return kwRe.test(title) } catch (e) { return true } // 转换/匹配异常按保守放行
-            })
-            for (const it of items) { if (!kept.includes(it)) Utils.safeSet(it, '_f', true) } // v3.159：只看它滤掉的同样标记（规则变更失效）
+            // 只看它过滤：统一走 FilterEngine.whitelistFilter（P2 审查 2026-08-15：消除两套漂移实现——
+            // 内联版曾 0/false 标题一律放行、无 4096 长输入截断、无正则缓存；whitelistFilter 均覆盖：
+            // 仅 undefined/null/空串视为字段缺失，0/false 参与匹配、超长输入 _capReInput 截断、正则缓存复用）
+            // CodeRabbit：单次遍历评估 + 标记被拒项（曾 filter+includes 为 O(n²)），行为等价
+            const kept = []
+            for (const it of items) {
+              if (FilterEngine.whitelistFilter(it, 'title', kw)) kept.push(it)
+              else Utils.safeSet(it, '_f', true) // v3.159：只看它滤掉的同样标记（规则变更失效）
+            }
             items = kept
           }
           // 非法正则时 kwRe 为 null：items 不过滤，继续正常推送（避免静默清空）

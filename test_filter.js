@@ -555,6 +555,15 @@ console.log('========================================\n');
     assertEqual(warns[0].includes('不是有效数字'), true)
   })
 
+  await test('zkt_gjc 首尾空白 → 告警（P2：白名单语义下误配空格会静默全量滤空）', () => {
+    const warns = validateConfig({ zkt_gjc: ' 京东 ' })
+    assertEqual(warns.some(w => w.includes('zkt_gjc') && w.includes('首尾空白')), true,
+        `应有 zkt_gjc 首尾空白告警: ${warns.join(' | ')}`)
+    // 正常关键词不告警（无首尾空白）
+    const warns2 = validateConfig({ zkt_gjc: '京东' })
+    assertEqual(warns2.some(w => w.includes('zkt_gjc') && w.includes('首尾空白')), false)
+  })
+
   await test('多分类天数：合法 → 无警告', () => {
     const warns = validateConfig({ pingbitime: '微博线报###5<br>赚客吧###3' })
     assertEqual(warns.length, 0)
@@ -1865,6 +1874,18 @@ console.log('========================================\n');
     assertEqual(filterHash({ pingbibiaoti: 0 }) === filterHash({ pingbibiaoti: '0' }), false, '0 与 "0" 应不同哈希')
   })
 
+  await test('C015b filterHash 64 位确定性 + 碰撞空间扩展（P2：32 位 djb2 曾碰撞致 _f 缓存不失效）', () => {
+    // 确定性：相同输入 → 相同输出（filter.hash 相等比较依赖此性质）
+    const a = filterHash({ pingbibiaoti: '京东' }, 'abc')
+    const b = filterHash({ pingbibiaoti: '京东' }, 'abc')
+    assertEqual(a === b, true, '相同输入应产生相同哈希')
+    // 64 位拼接形态（两段 32 位，'-' 分隔）
+    assertEqual(typeof a === 'string' && a.includes('-'), true, `应输出 64 位拼接形态: ${a}`)
+    assertEqual(a.split('-').length === 2, true)
+    // 不同输入 → 不同哈希
+    assertEqual(filterHash({ pingbibiaoti: '京东' }) === filterHash({ pingbibiaoti: '淘宝' }), false)
+  })
+
   await test('validateConfig 对 true 仍告警（v3.257 口径对齐）', () => {
     const warns = validateConfig({ pingbibiaoti: true })
     assertEqual(warns.length, 1)
@@ -2351,6 +2372,18 @@ console.log('========================================\n');
     assertEqual(checkFields({ louzhu: '小明', title: 'x', content: 'y' }, compiled), true)
   })
 
+  await test('checkFields 0/false 字段值参与匹配（P2：与 matchesCompiled C013 契约一致）', () => {
+    // title=0（数字）：修复前 if(!val) 真值判定跳过匹配（放行）；修复后 String(0)='0' 参与匹配
+    const c0 = compileRules({ pingbibiaoti: '^0$' })
+    assertEqual(checkFields({ louzhu: 'x', title: 0, content: 'y' }, c0), false, 'title=0 应参与匹配被屏蔽')
+    // title=false：修复后 String(false)='false' 参与匹配
+    const cf = compileRules({ pingbibiaoti: '^false$' })
+    assertEqual(checkFields({ louzhu: 'x', title: false, content: 'y' }, cf), false, 'title=false 应参与匹配被屏蔽')
+    // 空串/缺失仍视为字段缺失 → 不拦截（口径不变）
+    assertEqual(checkFields({ louzhu: 'x', title: '', content: 'y' }, c0), true, '空串仍视为缺失放行')
+    assertEqual(checkFields({ louzhu: 'x', content: 'y' }, c0), true, '字段缺失仍放行')
+  })
+
   await test('checkFields 强化屏蔽抵消展现', () => {
     const compiled = compileRules({ zhanxianbiaoti: '京东', pingbibiaotiplus: '京东' })
     assertEqual(checkFields({ louzhu: 'x', title: '京东', content: 'y' }, compiled), false)
@@ -2398,6 +2431,16 @@ console.log('========================================\n');
     saveMessages(p, [{ id: 1 }, { id: 2 }])
     const msgs = readMessages(p)
     assertEqual(msgs.length, 2)
+  })
+
+  await test('saveMessages 非数组入参 → 返回 false 且不写空缓存（P2：防清空缓存路径）', () => {
+    const p = path.join(CACHE, 'test_nonarray.json')
+    saveMessages(p, [{ id: 1 }])
+    const ok = saveMessages(p, 'not-array')
+    assertEqual(ok, false, '非数组写入应被拒绝返回 false')
+    const msgs = readMessages(p)
+    assertEqual(msgs.length, 1, '非数组写入不应把缓存覆写为空数组')
+    assertEqual(msgs[0].id, 1)
   })
 
   await test('saveMessages 超过maxSize自动裁剪', () => {
