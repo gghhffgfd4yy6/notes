@@ -50,6 +50,25 @@ function writeAtomic (filePath, text, label = '缓存文件') {
   }
 }
 
+function writeAtomicIfAbsent (filePath, text, label = '缓存初始化') {
+  // v3.263（CodeAnt）：独占创建（wx）——仅当文件不存在时才写入。writeAtomic 的 tmp+rename 会
+  // 无条件替换目标文件，初始化场景若在检查与写入之间另一进程已创建有效缓存，会把新文件覆盖成
+  // [] 丢失判重记录；wx 语义下并发创建只会得到 EEXIST，视为初始化成功不覆盖。
+  if (!isRegularOrMissing(filePath)) {
+    console.error(`拒绝写入非普通文件 ${label} ${filePath}`)
+    return false
+  }
+  try {
+    ensureParent(filePath)
+    fs.writeFileSync(filePath, text, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+    return true
+  } catch (e) {
+    if (e?.code === 'EEXIST') return true // 另一进程已创建：不覆盖，视为初始化成功
+    console.error(`${label}写入失败 ${filePath}:`, e.message)
+    return false
+  }
+}
+
 // 可选大小上限：maxBytes > 0 时，普通文件超过该字节数即判 tooLarge，避免异常膨胀
 // 文件被整读入内存（状态/哈希等小文件场景）。
 function readSafeTextResult (filePath, maxBytes) {
@@ -98,4 +117,4 @@ function readSafeText (filePath) {
   return result.status === 'ok' ? result.text : null
 }
 
-module.exports = { isRegularOrMissing, writeAtomic, readSafeText, readSafeTextResult }
+module.exports = { isRegularOrMissing, writeAtomic, writeAtomicIfAbsent, readSafeText, readSafeTextResult }

@@ -65,30 +65,59 @@ function dnsLookup (hostname, options, callback) {
     pending.push(callback)
     return
   }
-  dnsPending.set(key, [callback])
+  const pendingList = [callback]
+  dnsPending.set(key, pendingList)
   dns.lookup(hostname, opts, (error, address, family) => {
-    const callbacks = dnsPending.get(key) || []
+    // v3.263（CodeAnt）：只派发并缓存本次记账列表——abort 摘除回调后若同一 key 已有新 lookup
+    // 接管，旧 lookup 完成时不得清空/派发到新列表，也不得写缓存（接管等待期间新调用方会读到
+    // 旧结果，且晚到的旧回调会覆盖更新的缓存条目；新 lookup 会缓存自己的结果）
+    if (dnsPending.get(key) !== pendingList) return
     dnsPending.delete(key)
     const ttl = error ? DNS_ERROR_TTL_MS : DNS_TTL_MS
     dnsCache.set(key, { error, address, family, expiresAt: Date.now() + ttl })
-    for (const cb of callbacks) cb(error, address, family)
+    for (const cb of pendingList) cb(error, address, family)
   })
 }
 
-function prewarmDns (hostname) {
+function prewarmDns (hostname, signal = null) {
   const options = DNS_LOOKUP_IP_VERSION === 'ipv4' ? { family: 4 } : DNS_LOOKUP_IP_VERSION === 'ipv6' ? { family: 6 } : {}
   const started = Date.now()
+  const makeResult = (error, address, family) => ({
+    hostname,
+    ok: !error,
+    error: error ? error.code || error.message || String(error) : '',
+    address: Array.isArray(address) ? address.map(x => x.address || x) : address,
+    family,
+    elapsedMs: Date.now() - started
+  })
   return new Promise(resolve => {
-    dnsLookup(hostname, options, (error, address, family) => {
-      resolve({
-        hostname,
-        ok: !error,
-        error: error ? error.code || error.message || String(error) : '',
-        address: Array.isArray(address) ? address.map(x => x.address || x) : address,
-        family,
-        elapsedMs: Date.now() - started
-      })
-    })
+    // P3（审查 2026-08-15）：支持取消信号——坏解析器场景挂起的 dns.lookup 不再拖住进程退出
+    // （与 prewarmTls 同款；dns.lookup 无原生 signal 选项，用 abort 监听 + settled 防重复 resolve）。
+    // v3.263（CodeRabbit）：dns.lookup 无法真正取消，abort 只 settle 本 Promise；同时把本回调从
+    // dnsPending 记账中摘除（不持有引用、再次预热会重新发起解析），并在解析完成时移除 abort 监听。
+    // 契约：取消不保证进程立刻退出——底层解析仍可能后台完成，退出时机由调用方退出策略负责。
+    let settled = false
+    // 与 dnsLookup 内部同构的 key：abort 时按 key 定位 dnsPending 中的本回调
+    const key = [hostname, options.family || 0, options.hints || 0, options.all ? 1 : 0, options.verbatim ? 1 : 0].join('|')
+    const done = (error, address, family) => { if (!settled) { settled = true; resolve(makeResult(error, address, family)) } }
+    const callback = (error, address, family) => {
+      if (signal) signal.removeEventListener('abort', onAbort)
+      done(error, address, family)
+    }
+    const onAbort = () => {
+      const pending = dnsPending.get(key)
+      if (pending) {
+        const i = pending.indexOf(callback)
+        if (i !== -1) pending.splice(i, 1)
+        if (pending.length === 0) dnsPending.delete(key)
+      }
+      done(new Error('aborted'))
+    }
+    if (signal) {
+      if (signal.aborted) { onAbort(); return }
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+    dnsLookup(hostname, options, callback)
   })
 }
 

@@ -993,6 +993,41 @@ console.log('========================================\n');
     }
   })
 
+  await test('htmlToMarkdown data-href 不当作链接目标（CodeRabbit）', () => {
+    const r = htmlToMarkdown({ content_html: '<a data-href="https://evil.example">文本</a>', url: '' })
+    assertEqual(r.includes('(https://evil.example)'), false, 'data-href 不应生成 Markdown 链接')
+    assertEqual(r.includes('文本'), true, '内容应保留为纯文本')
+  })
+
+  await test('htmlToMarkdown <area>/<abbr> 前缀不误当锚点（CodeAnt）', () => {
+    const r1 = htmlToMarkdown({ content_html: '<area href="https://x">中间内容</a>尾部', url: '' })
+    assertEqual(r1.includes('[中间内容](https://x)'), false, '<area> 不应吞并后续内容转链接')
+    assertEqual(r1.includes('中间内容尾部'), true)
+    const r2 = htmlToMarkdown({ content_html: '<abbr>缩略</abbr>', url: '' })
+    assertEqual(r2.includes('缩略'), true, '<abbr> 不应被当作锚点')
+  })
+
+  await test('htmlToMarkdown İ 大小写闭合搜索索引不错位（CodeRabbit）', () => {
+    const a = htmlToMarkdown({ content_html: '<a href="https://x">İçerik</a>', url: '' })
+    assertEqual(a.includes('[İçerik](https://x)'), true, 'İ 后锚点内容不应带出 <')
+    const h = htmlToMarkdown({ content_html: '<h2>İ</h2>', url: '' })
+    assertEqual(h.includes('## İ'), true)
+    assertEqual(h.includes('## İ<'), false, 'İ 后标题内容不应带出 <')
+    const s = htmlToMarkdown({ content_html: '<script>İ</script>after', url: '' })
+    assertEqual(s.startsWith('after'), true, 'İ 后 script 移除不应丢首字符（曾错位丢 a 只剩 fter）')
+  })
+
+  await test('htmlToMarkdown 属性值内字面 <a>/<h> 不转换（CodeAnt）', () => {
+    const r1 = htmlToMarkdown({ content_html: '<div data-x="<a href="https://x">text</a>', url: '' })
+    assertEqual(r1.includes('[text](https://x)'), false, '属性值内 <a> 不应被伪造成链接')
+    assertEqual(r1.includes('text'), true)
+    const r2 = htmlToMarkdown({ content_html: '<div data-x="<h2>标题</h2>', url: '' })
+    assertEqual(r2.includes('## 标题'), false, '属性值内 <h2> 不应被转换为标题')
+    assertEqual(r2.includes('标题'), true)
+    const r3 = htmlToMarkdown({ content_html: '<div data-x="<a href="https://x">text</a>">', url: '' })
+    assertEqual(r3.includes('[text](https://x)'), false)
+  })
+
   await test('content_html 为 undefined → 不崩溃', () => {
     const r = htmlToMarkdown({ url: 'http://x' })
     assertEqual(typeof r, 'string')
@@ -2431,6 +2466,31 @@ console.log('========================================\n');
     saveMessages(p, [{ id: 1 }, { id: 2 }])
     const msgs = readMessages(p)
     assertEqual(msgs.length, 2)
+  })
+
+  await test('缓存初始化独占创建：不覆盖已存在文件（CodeAnt）', () => {
+    const fs = require('fs')
+    const { writeAtomicIfAbsent } = require('./xbk_storage')
+    const p = path.join(CACHE, 'test_init_race.json')
+    fs.writeFileSync(p, '[{"id":"keep"}]')
+    const ok = writeAtomicIfAbsent(p, '[]', '测试')
+    assertEqual(ok, true, '已存在文件应视为初始化成功（并发创建不覆盖）')
+    assertEqual(fs.readFileSync(p, 'utf8'), '[{"id":"keep"}]', '不得覆盖另一进程已写入的缓存')
+    const p2 = path.join(CACHE, 'test_init_absent.json')
+    const ok2 = writeAtomicIfAbsent(p2, '[]', '测试')
+    assertEqual(ok2, true, '缺失文件应创建')
+    assertEqual(fs.readFileSync(p2, 'utf8'), '[]')
+  })
+
+  await test('saveMessages 单条超读端上限 → 跳过落盘（防 tooLarge 自锁）', () => {
+    const fs = require('fs')
+    const p = path.join(CACHE, 'test_oversized_single.json')
+    const ok = saveMessages(p, [{ id: 0, body: 'x'.repeat(64 * 1024 * 1024 + 1024) }])
+    assertEqual(ok, false, '单条超限应拒绝落盘')
+    assertEqual(fs.existsSync(p), false, '不应写出超限缓存文件（读端会置 _readFailed 永久自锁）')
+    const ok2 = saveMessages(p, [{ id: 1 }, { id: 2 }])
+    assertEqual(ok2, true, '正常写入不应受影响')
+    assertEqual(readMessages(p).length, 2)
   })
 
   await test('saveMessages 非数组入参 → 返回 false 且不写空缓存（P2：防清空缓存路径）', () => {
@@ -7473,7 +7533,7 @@ console.log('========================================\n');
   })
 
   await test('readMessages 数组元素被排除（#21）', () => {
-    const fs = require('fs')
+    const fs = require('node:fs')
     const p = getFilePath('test_arr157.json')
     try { fs.unlinkSync(p) } catch (e) {}
     fs.writeFileSync(p, JSON.stringify([{ id: 1, title: 'A' }, [1, 2], 'str', null]), 'utf8')
@@ -7740,7 +7800,7 @@ console.log('========================================\n');
 
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
   try {
-    const fs = require('fs')
+    const fs = require('node:fs')
     const path = require('path')
     const dir = path.join(__dirname, 'xianbaoku_cache')
     if (fs.existsSync(dir)) {

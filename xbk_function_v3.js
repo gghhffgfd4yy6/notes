@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.259 — 手机端AI只读审查 P1/P2 修复 ********
+//* ******* 线报酷推送脚本 v3.261 — 手机端AI只读审查 P0/P1 修复 ********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -46,10 +46,10 @@ function profile3Require (name, loader) {
 // ============================================================
 // 📦 外部依赖
 // ============================================================
-const fs = profile3Require('fs', () => require('fs'))
+const fs = profile3Require('fs', () => require('node:fs'))
 const { fetchJson } = profile3Require('xbk_http', () => require('./xbk_http'))
 const { prewarmDns, prewarmTls } = profile3Require('xbk_agents', () => require('./xbk_agents'))
-const { isRegularOrMissing, readSafeTextResult, writeAtomic } = profile3Require('xbk_storage', () => require('./xbk_storage'))
+const { isRegularOrMissing, readSafeTextResult, writeAtomic, writeAtomicIfAbsent } = profile3Require('xbk_storage', () => require('./xbk_storage'))
 const { summarizeError, RETRYABLE_CODES } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'))
 const path = profile3Require('path', () => require('path'))
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
@@ -583,6 +583,24 @@ const Utils = {
     return false
   },
 
+  /** CSS 转义全量解码：十六进制（\\XXXXXX）、\\uXXXX 兼容形态、行延续（\\换行）与恒等转义
+      （\\r → r）。P1（审查 2026-08-15）：C010 只解十六进制，u\\rl(javascript:) 的恒等转义在
+      浏览器 CSS 解析时还原为 url(...)，绕过 style 黑名单；解码后再跑黑名单即可拦截。 */
+  _decodeCssEscapes (value) {
+    try { value = String(value) } catch (e) { return '' }
+    return value.replace(
+      safeRe(String.raw`\\u([0-9a-fA-F]{1,6})|\\([0-9a-fA-F]{1,6})[\s]?|\\([\n\r\u0000])|\\([^0-9a-fA-F\n\r\u0000])`, 'g'),
+      (m, a, b, nl, ident) => {
+        if (a !== undefined || b !== undefined) {
+          const cp = parseInt(a || b, 16)
+          return (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : m
+        }
+        if (ident !== undefined) return ident // CSS 恒等转义：\r → r（随后黑名单拦截 url(...)/expression(...)）
+        return '' // \\ 后接换行/CR/NUL：CSS 行延续/无效转义 → 移除
+      }
+    )
+  },
+
   /** 实体解码后再次清理主动 HTML/事件属性，防止 &lt;script&gt; 重新形成可执行标签 */
   sanitizeDecodedHtml (html) {
     if (html === undefined || html === null) return ''
@@ -593,91 +611,142 @@ const Utils = {
     // 让 `on\u0000error` 收敛为 `onerror` 后进入统一事件属性清理。
     html = html.replace(safeRe('\\u0000', 'g'), '')
     html = this.sanitizeHtmlUrls(html)
-    // 成对和未闭合的主动标签都处理：不依赖恶意输入自觉补齐闭合标签。
-    // Round2 C002 终修：恢复宽松 [\s\S]*?（HTML 语义：script 内容中第一个 </script> 即闭合，
-    // 与浏览器解析一致；闭合后残留的标签由下方未闭合移除与事件属性清洗链兜底）。
-    // 不再做全局引号保护——全局引号保护会把文本中的 "<iframe src=x>" 也保护为占位符，
-    // 导致文本中的真实主动标签漏网（验证 agent 复核发现的可执行泄漏）。
-    // 性能：入口 100k 截断使最坏回溯有界（10 万字符实测 ~270ms）。
-    html = html
+    // 成对和未闭合的主动标签都处理；不再做全局引号保护——全局引号保护会把文本中的
+    // "<iframe src=x>" 也保护为占位符，导致文本中的真实主动标签漏网（验证 agent 复核发现）。
+    html = this._removeActiveTags(html)
+    html = this._protectAndCleanEventAttrs(html)
+    html = this._cleanNavAttrs(html)
+    html = this._cleanSrcsetAttrs(html)
+    html = this._cleanStyleAttrs(html)
+    return html
+  },
+
+  /** 移除成对/未闭合的主动标签（script/style/iframe/object/embed/svg/math）与导航标签（base/link/meta）。
+   *  Round2 C002 终修：恢复宽松 [\s\S]*?（HTML 语义：script 内容中第一个 </script> 即闭合，
+   *  与浏览器解析一致；闭合后残留的标签由未闭合移除与事件属性清洗链兜底）。
+   *  性能：入口 100k 截断使最坏回溯有界（10 万字符实测 ~270ms）。 */
+  _removeActiveTags (html) {
+    return html
       .replace(safeRe('<(?:script|style|iframe|object|svg|math)\\b[\\s\\S]*?<\\/(?:script|style|iframe|object|svg|math)\\s*>', 'gi'), '')
       .replace(safeRe('<(?:script|style|iframe|object|embed|svg|math)\\b(?:[^<>]|"[^"]*"|\'[^\']*\')*>', 'gi'), '')
       .replace(safeRe('<\\/(?:script|style|iframe|object|svg|math)\\s*>', 'gi'), '')
-    // 基础/外链/刷新标签可改变文档导航或加载外部资源，HTML 推送不需要它们。
       .replace(safeRe('<(?:base|link|meta)\\b[^<>]*>', 'gi'), '')
-    // v3.254 P0(XSS)：事件属性名前的分隔符允许引号——HTML5 tokenizer 在引号值闭合后紧跟
-    // 字符会将其解析为新属性名，故 `<img src="x"onerror="alert(1)">`（src 引号值与 onerror
-    // 间无空格）也是合法事件属性；此前仅匹配空白或 / 会完全绕过清洗。
-    // 完整删除事件属性（含空值形式）：测试锁定 `\bon[a-z]*\s*=` 不残留，故不能用清空值保留属性。
-    // v3.257 修正：原正则把引号值内形如 `href="onclick=x"` 的合法 URL/值（on 开头内容）误判为
-    // 事件属性并清空。修复：先把非事件属性对（attr="value"，含值内 onxxx= 字样）整体保护为
-    // 占位符，事件属性（on*）不保护，再清洗引号外的事件属性，最后还原——值内的 onxxx= 不再
-    // 暴露给清洗正则，无空格恶意形态（src="x"onerror=...）的闭合引号随保护占位符边界保留。
-    {
-      const attrStore = []
-      html = html.replace(safeRe('([a-zA-Z_:][\\w:.-]*\\s*=\\s*)(["\'])([\\s\\S]*?)\\2', 'gi'), (m, name) => {
-        // on* 事件属性不保护（留待下一步清洗）；其余属性对整体保护
-        if (/^on[a-z]/i.test(name.trim())) return m
-        attrStore.push(m)
-        return '\u0001' + (attrStore.length - 1) + '\u0001'
-      })
-      // v3.257 后补充 C001：单次 replace 会连分隔引号一起消费，导致后续相邻 on* 属性
-      // 失去引号分隔符无法匹配；用 do-while 逐轮剥除。每次 replace 至少删除一个 on* 属性，
-      // 字符串必然变短，有限输入下必然收敛，故无轮数上限（防长链仍残留）。
-      let _prev
-      do {
-        _prev = html
-        html = html.replace(safeRe('(?:\\s|\\/|["\'\\u0001\\u0002])(on[a-z][a-z0-9_-]*)\\s*=\\s*(?:"[^"]*"|\'[^\']*\'|[^\\s>]+)', 'gi'), (m, name) => {
-          // 保留属性名前的分隔符（空格/引号/占位符边界是 HTML 语法必需），删除整个 onxxx="值" 段
-          const c = m[0][0]
-          if (c === '\u0001' || c === '\u0002') return c
-          return c === '"' || c === "'" ? c : ' '
-        })
-      } while (html !== _prev)
-      html = html.replace(safeRe('\\u0001(\\d+)\\u0001', 'g'), (_, i) => attrStore[Number(i)])
-      // 清理清洗后残留的孤立占位符边界（原无空格恶意形态的闭合引号被删除后遗留）
-      html = html.replace(safeRe('[\\u0001\\u0002]', 'g'), '')
+  },
+
+  /** 事件属性（on*）清洗（v3.254 P0(XSS)：事件属性名前的分隔符允许引号，`src="x"onerror=` 是
+   *  合法事件属性；完整删除事件属性，测试锁定 `\bon[a-z]*\s*=` 不残留）。
+   *  v3.257 修正：先把非事件属性对（attr="value"，含值内 onxxx= 字样）整体占位保护，
+   *  事件属性（on*）不保护，再清洗引号外的事件属性，最后还原——值内的 onxxx= 不再暴露给
+   *  清洗正则，无空格恶意形态的闭合引号随保护占位符边界保留。 */
+  _protectAndCleanEventAttrs (html) {
+    const { html: protectedHtml, attrStore } = this._protectAttrPairs(html)
+    html = this._stripEventAttrs(protectedHtml)
+    html = html.replace(safeRe(String.raw`\u0001(\d+)\u0001`, 'g'), (_, i) => attrStore[Number(i)])
+    // 清理清洗后残留的孤立占位符边界（原无空格恶意形态的闭合引号被删除后遗留）
+    return html.replace(safeRe(String.raw`[\u0001\u0002]`, 'g'), '')
+  },
+
+  /** 非事件属性对整体占位（v3.261 P1(ReDoS)：原贪心名称前缀在长词串上逐位回溯找 = 呈 O(n²)，
+   *  改为线性扫描先定位 =["']（前缀无量词天然线性），再回扫确认属性名与引号值闭合）。 */
+  _protectAttrPairs (html) {
+    const attrStore = []
+    const attrValueRe = safeRe(String.raw`=\s*(["'])`, 'gi')
+    let attrOut = ''
+    let attrPos = 0
+    let attrM
+    while ((attrM = attrValueRe.exec(html)) !== null) {
+      const valueStart = attrValueRe.lastIndex
+      const seg = this._attrSegAt(html, attrM, valueStart)
+      if (seg === null) {
+        // 无闭合引号：本处及之后不再有可完整保护的属性对，剩余原样保留（与原正则无匹配一致）
+        attrOut += html.slice(attrPos)
+        attrPos = html.length
+        break
+      }
+      const segText = html.slice(seg.segStart, seg.closeEnd)
+      // on* 事件属性不保护（留待下一步清洗）；其余属性对整体保护
+      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name)) {
+        attrStore.push(segText)
+        attrOut += html.slice(attrPos, seg.segStart) + '\u0001' + (attrStore.length - 1) + '\u0001'
+      } else {
+        attrOut += html.slice(attrPos, seg.closeEnd)
+      }
+      attrPos = seg.closeEnd
+      attrValueRe.lastIndex = seg.closeEnd // 跳过已消费的引号值，避免值内 = 被重复扫描
     }
-    html = html
-    // 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）。
-      .replace(safeRe('\\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\\s*=\\s*(["\'])([\\s\\S]*?)\\2', 'gi'),
+    if (attrPos < html.length) attrOut += html.slice(attrPos)
+    return { html: attrOut, attrStore }
+  },
+
+  /** 解析 =["'] 属性段：返回 {name, segStart, closeEnd}；引号未闭合返回 null。
+   *  回扫确认属性名：= 前允许空白；名字 [a-zA-Z_:][\w:.-]*（语义与原正则一致，仅用于 on* 判定与段边界）。 */
+  _attrSegAt (html, attrM, valueStart) {
+    const eqPos = attrM.index
+    const quote = attrM[1]
+    const closeRel = html.indexOf(quote, valueStart)
+    if (closeRel === -1) return null
+    const closeEnd = closeRel + 1
+    let i = eqPos - 1
+    while (i >= 0 && /\s/.test(html[i])) i--
+    const runEnd = i + 1
+    while (i >= 0 && /[\w:.-]/.test(html[i])) i--
+    const run = html.slice(i + 1, runEnd)
+    const nameStartInRun = run.search(/[a-zA-Z_:]/)
+    const name = nameStartInRun === -1 ? '' : run.slice(nameStartInRun)
+    const segStart = nameStartInRun === -1 ? eqPos : i + 1 + nameStartInRun
+    return { name, segStart, closeEnd }
+  },
+
+  /** 逐轮剥除事件属性（v3.257 后补充 C001：单次 replace 会连分隔引号一起消费，导致后续相邻
+   *  on* 属性失去引号分隔符无法匹配；do-while 每轮至少删除一个，字符串必然变短并收敛）。
+   *  保留属性名前的分隔符（空格/引号/占位符边界是 HTML 语法必需），删除整个 onxxx="值" 段。 */
+  _stripEventAttrs (html) {
+    let prev
+    do {
+      prev = html
+      html = html.replace(safeRe(String.raw`(?:\s|\/|["\'\u0001\u0002])(on[a-z][a-z0-9_-]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)`, 'gi'), (m) => {
+        const c = m[0][0]
+        if (c === '\u0001' || c === '\u0002') return c
+        return c === '"' || c === "'" ? c : ' '
+      })
+    } while (html !== prev)
+    return html
+  },
+
+  /** 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）清洗。 */
+  _cleanNavAttrs (html) {
+    return html
+      .replace(safeRe(String.raw`\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2`, 'gi'),
         (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
-      .replace(safeRe('\\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\\s*=\\s*([^\\s"\'<>`]+)', 'gi'),
+      .replace(safeRe(String.raw`\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*([^\s"'<>\`]+)`, 'gi'),
         (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
-    // srcset 可在候选项中藏危险协议；检测到任意危险候选即清空整个属性。
+  },
+
+  /** srcset 可在候选项中藏危险协议；检测到任意危险候选即清空整个属性。 */
+  _cleanSrcsetAttrs (html) {
+    const compact = (value) => this.decodeHtmlEntities(value).replace(safeRe(String.raw`[\u0000-\u0020]+`, 'g'), '').toLowerCase()
+    return html
       .replace(safeRe('\\bsrcset\\s*=\\s*(["\'])([\\s\\S]*?)\\1', 'gi'), (_, quote, value) => {
-        const v = this.decodeHtmlEntities(value).replace(safeRe('[\\u0000-\\u0020]+', 'g'), '').toLowerCase()
+        const v = compact(value)
         return /(?:^|[,])(?:javascript|vbscript|data):/.test(v) ? `srcset=${quote}${quote}` : `srcset=${quote}${value}${quote}`
       })
       .replace(safeRe('\\bsrcset\\s*=\\s*([^\\s"\'<>`]+)', 'gi'), (_, value) => {
-        const v = this.decodeHtmlEntities(value).replace(safeRe('[\\u0000-\\u0020]+', 'g'), '').toLowerCase()
+        const v = compact(value)
         return /^(?:javascript|vbscript|data):/.test(v) ? 'srcset=""' : `srcset=${value}`
       })
-    // CSS url()/expression()/behavior 可形成主动加载或脚本执行路径；不需要保留这类 style。
-    // C010：先解 CSS 十六进制转义（u\72l→url、e\78pression→expression），再跑现有黑名单。
-      .replace(safeRe('\\bstyle\\s*=\\s*(["\'])([\\s\\S]*?)\\1', 'gi'), (_, quote, value) => {
-        const v = this.decodeHtmlEntities(value)
-          .replace(safeRe('\\\\u([0-9a-fA-F]{1,6})|\\\\([0-9a-fA-F]{1,6})[\\s]?', 'g'), (m, a, b) => {
-            const cp = parseInt(a || b, 16)
-            return (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : m
-          })
-          .toLowerCase()
-        return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
-          ? `style=${quote}${quote}`
-          : `style=${quote}${value}${quote}`
-      })
-      .replace(safeRe('\\bstyle\\s*=\\s*([^\\s"\'<>`]+)', 'gi'), (_, value) => {
-        const v = this.decodeHtmlEntities(value)
-          .replace(safeRe('\\\\u([0-9a-fA-F]{1,6})|\\\\([0-9a-fA-F]{1,6})[\\s]?', 'g'), (m, a, b) => {
-            const cp = parseInt(a || b, 16)
-            return (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : m
-          })
-          .toLowerCase()
-        return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
-          ? 'style=""'
-          : `style=${value}`
-      })
+  },
+
+  /** CSS url()/expression()/behavior 可形成主动加载或脚本执行路径；不需要保留这类 style。
+   *  C010 + P1（审查 2026-08-15）：先解 CSS 转义（十六进制 u\72l→url、恒等转义 u\rl→url 等），
+   *  再跑现有黑名单。 */
+  _cleanStyleAttrs (html) {
+    const unsafeStyle = (value) => {
+      const v = this._decodeCssEscapes(this.decodeHtmlEntities(value)).toLowerCase()
+      return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
+    }
     return html
+      .replace(safeRe(String.raw`\bstyle\s*=\s*(["'])([\s\S]*?)\1`, 'gi'), (_, quote, value) => unsafeStyle(value) ? `style=${quote}${quote}` : `style=${quote}${value}${quote}`)
+      .replace(safeRe(String.raw`\bstyle\s*=\s*([^\s"'<>\x60]+)`, 'gi'), (_, value) => unsafeStyle(value) ? 'style=""' : `style=${value}`)
   },
 
   // ==================== 安全访问/文本 ====================
@@ -853,6 +922,8 @@ const Utils = {
       任一侧存在对象/数组值时不能据此断定相等，返回 false 交由调用方退回深排——用于去重
       更新路径的快速短路，避免对内容未变的大消息做两次深度 normalize+JSON.stringify。 */
   shallowEqualIgnoringTimestamp (a, b) {
+    // P3（审查 2026-08-15）：顶层 Date/Map/Set（无可枚举键）会被误判相等——当前管道消息均为
+    // JSON 纯对象，不可达；若未来接入特殊对象需在此加 a.constructor === Object 前提（注释锁定）。
     if (a === b) return true
     if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false
     if (Array.isArray(a) !== Array.isArray(b)) return false
@@ -880,11 +951,11 @@ const Utils = {
         // getter/proxy 抛错：不能断定相等，退回慢路径按"已变更"处理（与深排口径一致）
         return false
       }
-      // 对象/数组 → 引用不同不代表内容不同，交由慢路径判定
-      if ((typeof va === 'object' && va !== null) || (typeof vb === 'object' && vb !== null)) return false
-      // BigInt：深排 JSON.stringify 无法序列化会抛错→按"已变更"处理，浅排不短路保持口径一致
-      if (typeof va === 'bigint' || typeof vb === 'bigint') return false
-      if (va !== vb) return false
+      // P3（审查 2026-08-15）：同值/同引用（含同引用对象——内容必相同）直接短路为未变更，
+      // 曾置于对象检查之后导致同引用对象仍走深排慢路径（浪费）；移到最前真正生效
+      if (va === vb) continue
+      // 任何非同值（含不同引用对象、BigInt、不同原始值）都不短路：统一交由慢路径（深排）判定
+      return false
     }
     return true
   },
@@ -956,7 +1027,8 @@ const Utils = {
       try { return (typeof v === 'string' ? '' : typeof v + ':') + String(v).trim() } catch (e) { return '' }
     }
     for (const f of FILTER_FIELDS) {
-      const v = filterCfg && filterCfg[f]
+      // P3（审查 2026-08-15）：属性访问套 safeGet——getter/proxy 抛错不崩 App.run
+      const v = Utils.safeGet(filterCfg, f)
       parts.push(f + '=' + safeStr(v))
     }
     // v3.161：补 pingbitime——曾漏（FILTER_FIELDS 不含它），改宽 pingbitime 后「过滤写入」缓存不失效，
@@ -965,7 +1037,7 @@ const Utils = {
     // 非法/负数 → ''（compileRules 编译为 null，无时间过滤）；### 多行形式仅整体 trim，保留行内格式。
     // C015：pingbitime 用 rawStr 而非 safeStr——compileRules 对 pingbitime 不拒绝 number，String 化后同样编译；
     // 此处若带 typeof 前缀会导致 Number('number:5')=NaN 而误判无时间过滤（安全侧保持一致）。
-    let pb = rawStr(filterCfg && filterCfg.pingbitime).trim()
+    let pb = rawStr(Utils.safeGet(filterCfg, 'pingbitime')).trim()
     let timeActive = false
     if (pb) {
       if (/###/.test(pb)) {
@@ -983,7 +1055,15 @@ const Utils = {
     parts.push('pingbitime=' + pb)
     // zkt_gjc 保持原样：只看它过滤实际用 new RegExp(kw) 未 trim，空白在语义上有意义；若 trim，
     // 真实语义变更（如 'abc'→' abc'）不会失效缓存而漏推——故不能按 compileRules 同款 trim（compileRules 不处理 zkt_gjc）。
-    parts.push('zkt_gjc=' + rawStr(zktGjc))
+    // P1（审查 2026-08-15）：与 C015 同款类型归一（typeof 前缀，不 trim）——zkt_gjc 在字符串↔
+    // 非字符串间切换（'0'→0、'true'→true、'[object Object]'→{}）时，App.run 对非字符串直接
+    // 跳过只看它过滤（R11-1）、字符串则执行并标记 _f；此前 rawStr 无类型前缀 → 哈希不变 →
+    // 改宽/取消只看它过滤后旧 _f 条目永不重评、静默漏推（与 C015 已修的 FILTER_FIELDS 同类疏漏）。
+    const typedRawStr = (v) => {
+      if (v === undefined || v === null || typeof v === 'symbol') return ''
+      try { return (typeof v === 'string' ? '' : typeof v + ':') + String(v) } catch (e) { return '' }
+    }
+    parts.push('zkt_gjc=' + typedRawStr(zktGjc))
     // P3：pingbitime 天数过滤结果随注册天数增长（daysFrom 逐日 UTC 日期差）而变化，静态配置哈希不会变——
     // 已 _f 标记的旧条目因「缓存失效仅由静态哈希触发」而永不重评、长期漏推（老化过阈值后本应补推）。
     // pingbitime 启用时把当前 UTC 日期折进哈希：跨天即失效 _f 缓存 → 老化过阈值的条目被重新评估/推送；
@@ -1128,15 +1208,137 @@ const Formatter = {
     return s.replace(/\n{3,}/g, '\n\n').trim()
   },
 
+  /** 从 from 起引号感知扫描定位标签结束 >：引号值内 > 不算结束（与原属性扫描正则口径一致），
+   *  引号未闭合退化为首个 > 结束（Round2 C045 口径）。返回 > 下标，未找到返回 -1。
+   *  线性扫描，供 _replaceTagged/anchorText/scanConvert/scanStrip 共用（消除重复代码）。 */
+  _findTagEnd (str, from) {
+    let j = from
+    while (j < str.length) {
+      const c = str[j]
+      if (c === '>') return j
+      if (c === '"' || c === "'") {
+        const closeQ = str.indexOf(c, j + 1)
+        j = closeQ === -1 ? j + 1 : closeQ + 1
+      } else j++
+    }
+    return -1
+  },
+
+  /** 已知标签转换操作查找（v3.262 扫描器用）：语义与原 if 链逐条一致——p/div 前缀匹配
+   *  （原 <\/?p 无 \b），img/td/th/tr/table 仅开标签（</td> 由通用剥离移除），li 开闭均可，其余词边界内。 */
+  _tagOpFor (name, closing, wordAfter, tagOps) {
+    if (name.startsWith('p')) return tagOps.p
+    if (name.startsWith('div')) return tagOps.div
+    if (wordAfter) return null
+    const op = Object.hasOwn(tagOps, name) ? tagOps[name] : null
+    if (op == null) return null
+    if (closing && (name === 'img' || name === 'td' || name === 'th' || name === 'tr' || name === 'table')) return null
+    return op
+  },
+
+  /**
+   * 线性化「开标签 + 首个闭合标签」转换：替代 ([\\s\\S]*?)<\\/x> 无界惰性正则——大量未闭合
+   * 开标签时每处起始位置都回扫到串尾呈 O(n²)，v3.254 的 100k 截断不能根治（100k 最坏形态
+   * 仍 12-16s 卡死主线程）。改为单标签打开正则 + indexOf 定位首个闭合：开标签互不重叠、
+   * 每处只向前扫一次 → 全程 O(n)。
+   * @param {string} html 待处理串
+   * @param {RegExp} openRe 全局开标签正则（仅匹配标签名前缀，不含属性扫描；首捕获组 [1] 供
+   *   closeOf/buildReplacement 使用；标签结束 > 由函数内引号感知扫描定位，杜绝属性扫描回溯）
+   * @param {(m: RegExpExecArray, content: string, openTag: string) => string} buildReplacement 构建替换文本
+   * @param {(m: RegExpExecArray) => string} closeOf 计算闭合标签（小写）
+   */
+  _replaceTagged (html, openRe, buildReplacement, closeOf) {
+    // v3.263（CodeAnt）：先标记引号属性值区间——<a>/<h> 若位于另一标签的引号属性值内则不转换
+    // （未闭合标签按「剩余原样保留」兜底时，属性里的字面标签不得被伪造成 Markdown 链接/标题）
+    const attrSpans = this._quotedAttrSpans(html)
+    openRe.lastIndex = 0
+    let out = ''
+    let pos = 0
+    let m
+    while ((m = openRe.exec(html)) !== null) {
+      if (attrSpans.has(m.index)) continue // 命中属性值区间：原样保留，交由后续标签剥离处理
+      // 开标签结束 >：引号值内 > 不算结束；无 > 视为无法转换（本处及之后无完整配对，剩余原样保留）
+      const openEndRel = this._findTagEnd(html, m.index + m[0].length)
+      if (openEndRel === -1) {
+        out += html.slice(pos)
+        pos = html.length
+        break
+      }
+      const openEnd = openEndRel + 1
+      const closeTag = closeOf(m)
+      // v3.263：闭合搜索改用原串上的 i 标志正则——toLowerCase 在 İ(U+0130) 等字符上会展开为
+      // 2 个码元，导致 lower 的索引相对原串错位（锚点/标题内容尾部多出 <、script 后内容丢首字符）。
+      // lastIndex 线性推进，全程 O(n)，索引与 html 严格对齐。
+      const closeRe = safeRe(closeTag, 'gi')
+      closeRe.lastIndex = openEnd
+      const closeM = closeRe.exec(html)
+      if (closeM === null) {
+        // 无闭合标签：本处及之后不再有可完整转换的配对，剩余原样保留（与原正则不产生匹配一致）
+        out += html.slice(pos)
+        pos = html.length
+        break
+      }
+      const closeRel = closeM.index
+      const closeEnd = closeRel + closeTag.length
+      const content = html.slice(openEnd, closeRel)
+      const openTag = html.slice(m.index, openEnd)
+      out += html.slice(pos, m.index) + buildReplacement(m, content, openTag)
+      pos = closeEnd
+      openRe.lastIndex = closeEnd // 跳过已消费的开标签与闭合，避免重复扫描
+    }
+    if (pos < html.length) out += html.slice(pos)
+    return out
+  },
+
+  /** 引号属性值区间标记：返回 Set<index>，命中表示该位置位于某标签的引号属性值内。
+   *  与 _findTagEnd 同构的引号语义（跳到同引号下一次出现；未闭合引号视为延伸到串尾）。 */
+  _quotedAttrSpans (html) {
+    const inside = new Set()
+    let inTag = false
+    let i = 0
+    while (i < html.length) {
+      const c = html[i]
+      if (!inTag) {
+        const n = html[i + 1]
+        if (c === '<' && n && (n === '/' || /[a-zA-Z]/.test(n))) inTag = true
+        i++
+        continue
+      }
+      if (c === '>') {
+        inTag = false
+        i++
+        continue
+      }
+      if (c === '"' || c === "'") {
+        i = this._markQuotedSpan(html, c, i, inside)
+        continue
+      }
+      i++
+    }
+    return inside
+  },
+
+  /** 标记单个引号属性值跨度（供 _quotedAttrSpans 使用）：返回扫描结束位置；未闭合引号视为延伸到串尾。 */
+  _markQuotedSpan (html, quote, from, inside) {
+    const closeQ = html.indexOf(quote, from + 1)
+    if (closeQ === -1) {
+      for (let k = from + 1; k < html.length; k++) inside.add(k)
+      return html.length
+    }
+    for (let k = from + 1; k < closeQ; k++) inside.add(k)
+    return closeQ + 1
+  },
+
   htmlToMarkdown (shuju) {
     shuju = Utils.safeObjectCopy(shuju || {})
     let html = (typeof shuju.content_html === 'string')
       ? shuju.content_html
       : (shuju.content_html === undefined || shuju.content_html === null ? '' : '') // 非字符串内容视为空（避免 [object Object]）
-    // v3.254 P1(ReDoS)：`<a>`/`<h1-6>` 正则用无界惰性 [\s\S]*? 接固定闭合标签且带 g，
+    // v3.254 P1(ReDoS)：`<a>`/`<h1-6>` 正则曾用无界惰性 [\s\S]*? 接固定闭合标签且带 g，
     // 多个未闭合标签时每次起始位置回扫到串尾呈 O(n²)——content_html 来自外部接口可被
-    // 构造为 10 万+ 字符卡死主线程。入口截断到 _MD_HTML_MAX（正常消息内容远小于此），
-    // 使最坏回溯复杂度有界。
+    // 构造为 10 万+ 字符卡死主线程。v3.254 的 100k 截断只能把最坏输入压到 ~100k（实测
+    // 仍 12-16s）。v3.261：h/a/script/style 全部改为 _replaceTagged 线性定位（开标签互不
+    // 重叠、indexOf 找首个闭合，全程 O(n)），入口截断保留作为下游（解码/清洗）的防护。
     if (html.length > 100000) html = Utils.truncateUtf16(html, 100000)
     // URL 文本/目标统一使用 safeUrl：非字符串、空值、伪 URL、危险协议和换行都不生成 Markdown 链接。
     const urlText = Utils.safeUrl(shuju && shuju.url)
@@ -1150,67 +1352,155 @@ const Formatter = {
       html = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(html))
       return this._finalizeMd(mdUrl ? html + `\n\n原文链接：[${mdLinkText}](${mdUrl})` : html)
     }
-    html = html
-      .replace(/<h([1-6])(?:'[^']*'|"[^"]*"|[^>])*>([\s\S]*?)<\/h\1>/gi, (_, lv, c) => '#'.repeat(lv) + ' ' + c + '\n\n')
-      .replace(/<a\s*(?:'[^']*'|"[^"]*"|[^>])*?href\s*=\s*["']([^"']*)["'](?:'[^']*'|"[^"]*"|[^>])*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
-        const cleanHref = Utils.safeUrl(href)
-        // P10：先剥离真实嵌套 <a>/</a>（HTML 禁止嵌套 a，接口脏数据可能出现）。
-        // 实体编码的 &lt;a&gt; 是字面文本，在下方解码后重新 &lt;/&gt; 编码，避免被通用标签剥离误删。
-        txt = txt.replace(/<a\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, '').replace(/<\/a\b\s*>/gi, '')
-        // C008 二次修复：去掉哨兵包裹。嵌套 <img> 留给后续 <img> 替换独立转义，这里只转义 img 外的文本；
-        // 文本先实体解码（&#93; → ]）再转义，避免解码后重新形成 ]( 注入；解码出的 < > 重新 &lt;/&gt; 编码，
-        // 延迟到通用标签剥离后再统一解码，保持 &lt;a&gt; 字面文本不被误剥。
-        txt = txt.split(/(<(?:'[^']*'|"[^"]*"|[^>])+>)/gi)
-          .map((part, idx) => idx % 2 ? part : Utils.decodeHtmlEntities(part).replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[[\]\\]/g, '\\$&'))
-          .join('')
-        return cleanHref ? `[${txt}](${cleanHref})` : txt
-      })
-      .replace(/<a\s+(?:'[^']*'|"[^"]*"|[^>])*?href\s*=\s*([^\s"'>]+)(?:'[^']*'|"[^"]*"|[^>])*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
-        const cleanHref = Utils.safeUrl(href)
-        txt = txt.replace(/<a\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, '').replace(/<\/a\b\s*>/gi, '')
-        // C008 二次修复：去掉哨兵包裹。嵌套 <img> 留给后续 <img> 替换独立转义，这里只转义 img 外的文本；
-        // 文本先实体解码（&#93; → ]）再转义，避免解码后重新形成 ]( 注入；解码出的 < > 重新 &lt;/&gt; 编码，
-        // 延迟到通用标签剥离后再统一解码，保持 &lt;a&gt; 字面文本不被误剥。
-        txt = txt.split(/(<(?:'[^']*'|"[^"]*"|[^>])+>)/gi)
-          .map((part, idx) => idx % 2 ? part : Utils.decodeHtmlEntities(part).replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[[\]\\]/g, '\\$&'))
-          .join('')
-        return cleanHref ? `[${txt}](${cleanHref})` : txt
-      })
-      .replace(/<img\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, (tag) => {
-        const srcM = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i) || tag.match(/\bsrc\s*=\s*([^\s"'<>`]+)/i)
-        if (!srcM) return tag // 无 src 不转换
-        const src = Utils.safeUrl(srcM[1])
-        if (!src) return tag.replace(/\bsrc\s*=\s*(?:(["'])[^"']*\1|[^\s"'<>`]+)/i, '') // 空/危险 src 不生成可执行图片链接
-        const altM = tag.match(/\balt\s*=\s*["']([^"']*)["']/i) || tag.match(/\balt\s*=\s*([^\s"'<>`]+)/i)
-        // alt 截断（真实接口 alt 可长达 250+ 字符拖累推送）——代理对安全
-        const alt = altM ? Utils.truncateUtf16(altM[1], 50) : ''
-        // C008 二次修复：alt 实体解码后直接转义（&#93; → \] 等），与 anchor 文本同口径
-        const altText = alt ? Utils.decodeHtmlEntities(alt).replace(/[[\]\\]/g, '\\$&') : ''
-        // 注：img URL 不包裹 <>——此处早于标签剥离，<url> 会被 /<[^>]+>/g 当标签剥掉成空 ![]()
-        //     （a 链接的 <> 包裹安全是因为在最后拼接）；含空格/括号 URL 保持原样
-        return `\n\n![${altText}](${src})\n\n`
-      })
-      .replace(/<br\s*\/?>|<\/br>\s*/gi, '\n\n')
-      .replace(/<\/?p(?:'[^']*'|"[^"]*"|[^>])*>/gi, '\n\n')
-      .replace(/<\/?div(?:'[^']*'|"[^"]*"|[^>])*>/gi, '\n\n') // div 为块级元素：真实接口数据常见，缺换行会粘连
-    // 列表/粗体/斜体转 Markdown（在标签剥离前）：<li> → - 项、<b>/<strong> → **、<i>/<em> → *
-    // v3.171：短标签正则加 \b 词边界——`<img>/<input>/<iframe>` 曾被 `<i` 前缀误当斜体、
-    // `<blockquote>/<bdo>` 被 `<b` 误当粗体、`<link>` 被 `<li` 误当列表项，输出 */**/- 垃圾
-      .replace(/<li\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, '\n- ')
-      .replace(/<\/li\b>/gi, '\n')
-      .replace(/<\/?(?:ul|ol)\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, '\n')
-      .replace(/<\/?(?:b|strong)\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, '**')
-      .replace(/<\/?(?:i|em)\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, '*')
-    // 表格：单元格 | 分隔、行/表换行（曾全部粘连成"甲乙丙丁"）
-      .replace(/<td\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, ' | ')
-      .replace(/<th\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, ' | ')
-      .replace(/<tr\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, '\n')
-      .replace(/<table\b(?:'[^']*'|"[^"]*"|[^>])*>/gi, '\n\n')
-      .replace(/<script[\s\S]*?<\/script>/gi, '') // 脚本内容整体移除
-      .replace(/<style[\s\S]*?<\/style>/gi, '') // 样式内容整体移除
-    // v3.173：删除 /<{2,}|>{2,}/g 剥离——曾把合法文本的 >>/<< 误删（'5>>3'→'53'、'价格<<100'→'价格100'）；
-    // 标签形态由上方 <[^>]+> 剥离处理（'<<a>' 被剥），孤立 < / > 文本保留（Markdown 渲染为普通文本）
-      .replace(/<(?:'[^']*'|"[^"]*"|[^>])+>/g, '')
+    // P10/C008：锚点文本处理逻辑与原实现逐字一致（嵌套 <a> 剥离、实体解码、] ( 转义）
+    // 解析 < 后的标签名：返回 {i: 属性起点, closing, name(小写), wordAfter}；< 后非字母时 name 为空串
+    const readTagName = (txt, lt) => {
+      let i = lt + 1
+      const closing = txt[i] === '/'
+      if (closing) i++
+      const nameStart = i
+      while (i < txt.length && /[a-zA-Z]/.test(txt[i])) i++
+      return {
+        i,
+        closing,
+        name: txt.slice(nameStart, i).toLowerCase(),
+        wordAfter: i < txt.length && /[a-zA-Z0-9]/.test(txt[i])
+      }
+    }
+    const anchorText = (txt) => {
+      // v3.262 线性化：原 replace+split 正则链在「大量 <a 前缀且无闭合 >」的长文本上逐位重扫 O(n²)
+      // （单条 <a href=x> + <a 重复 + </a> 即可卡主线程）；改为单趟扫描：标签段原样保留、其余段
+      // 解码并转义，<a...>/</a> 整段剥除，全程线性，语义与原实现逐字一致。
+      const esc = (s2) => Utils.decodeHtmlEntities(s2).replaceAll('<', '&lt;').replaceAll('>', '&gt;').replace(/[[\]\\]/g, String.raw`\$&`)
+      let out = ''
+      let pos = 0
+      while (pos < txt.length) {
+        const lt = txt.indexOf('<', pos)
+        if (lt === -1) { out += esc(txt.slice(pos)); break }
+        const { i, name, wordAfter } = readTagName(txt, lt)
+        const gt = this._findTagEnd(txt, i)
+        if (gt === -1) { out += esc(txt.slice(pos)); break }
+        if (gt === lt + 1) { out += esc(txt.slice(pos, lt + 1)); pos = lt + 1; continue } // <> 不算标签，按文本转义（原 + 需至少 1 字符）
+        const isA = name === 'a' && !wordAfter // 嵌套 <a...>/</a> 整段剥除（原 <a\b...>/<\/a\b\s*>）
+        out += esc(txt.slice(pos, lt)) + (isA ? '' : txt.slice(lt, gt + 1))
+        pos = gt + 1
+      }
+      return out
+    }
+    html = this._replaceTagged(html, /<h([1-6])/gi,
+      (m, c) => '#'.repeat(Number(m[1])) + ' ' + c + '\n\n',
+      (m) => '</h' + m[1] + '>')
+    // P1（审查 2026-08-15）：href 引号/无引号两形态合并——开标签正则仅匹配 <a 前缀（无属性扫描
+    // 无回溯），href 值从开标签段内引号感知提取；原两正则语义一致（<ahref 无空格形态除外，
+    // 非合法 HTML 不再转换，由下方扫描器按普通标签剥离）。v3.263：<a 后仅接受空白/紧接 >/href=
+    // （<area/<abbr/<article 等更长标签名不再误当锚点；<ahref 无空格形态保持转换，审查4-5 锁定），
+    // href 前不允许 -/_ 属性名续接（data-href/data_href 不再误取链接目标）。
+    html = this._replaceTagged(html, /<a(?=[\s>]|href\s*=)/gi,
+      (m, txt, openTag) => {
+        const hrefM = /(?<![-_])href\s*=\s*["']([^"']*)["']/i.exec(openTag) || /(?<![-_])href\s*=\s*([^\s"'>]+)/i.exec(openTag)
+        const cleanHref = Utils.safeUrl(hrefM ? hrefM[1] : '')
+        return cleanHref ? `[${anchorText(txt)}](${cleanHref})` : anchorText(txt)
+      },
+      () => '</a>')
+    // 线性标签转换/剥离（v3.262）：两阶段单趟扫描替代原 11 个 replace 链 + 通用剥离 + script/style 区域移除。
+    // 原正则链在「大量同前缀标签且无闭合 >」的输入上逐位重扫呈 O(n²)——<p 重复 28600 次实测 ~6s、
+    // <h1 重复 ~9s、<td 重复 ~10s，单条外部消息即可触发 DoS（入口 100k 截断只能压到有界常数）。
+    // 阶段一：只转换已知标签（img/br/p/div/li/ul/ol/b/strong/i/em/td/th/tr/table）与 script/style 区域移除，
+    // 未知标签原样保留——'<<100</p>' 中的 << 先按字面文本处理（< 后非字母），不吞并后续已知标签，
+    // 与原链「先逐标签替换、最后统一剥离」的顺序语义一致；阶段二：通用剥离剩余 <...>（含 <<a> 整体）。
+    // 引号值内 > 不算标签结束；引号未闭合时退化按首个 > 结束（Round2 C045 口径，与原 [^>] 行为一致）。
+    // p/div 无词边界按前缀匹配（原 <\/?p 无 \b，<pre> 同样转 \n\n）；其余标签名后须非词字符（\b 语义）；
+    // td/th/tr/table 只转换开标签（原正则无 \/?，</td> 由通用剥离移除）。
+    // script/style 按 HTML 语义整体移除（内容直至 </script>；无闭合则丢弃至末尾），且只识别真实
+    // 标签位置——`data-x="<script>"` 这类属性值内的 <script 不再误触发整段丢弃。
+    html = (() => {
+      const tagOps = {
+        img: (tag) => {
+          const srcM = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i) || tag.match(/\bsrc\s*=\s*([^\s"'<>`]+)/i)
+          if (!srcM) return tag // 无 src 不转换（原链由通用剥离兜底剥空）
+          const src = Utils.safeUrl(srcM[1])
+          if (!src) return tag.replace(/\bsrc\s*=\s*(?:(["'])[^"']*\1|[^\s"'<>`]+)/i, '') // 空/危险 src 不生成可执行图片链接
+          const altM = tag.match(/\balt\s*=\s*["']([^"']*)["']/i) || tag.match(/\balt\s*=\s*([^\s"'<>`]+)/i)
+          // alt 截断（真实接口 alt 可长达 250+ 字符拖累推送）——代理对安全
+          const alt = altM ? Utils.truncateUtf16(altM[1], 50) : ''
+          // C008 二次修复：alt 实体解码后直接转义（&#93; → \] 等），与 anchor 文本同口径
+          const altText = alt ? Utils.decodeHtmlEntities(alt).replace(/[[\]\\]/g, '\\$&') : ''
+          return `\n\n![${altText}](${src})\n\n`
+        },
+        br: () => '\n\n',
+        p: () => '\n\n',
+        div: () => '\n\n',
+        li: (tag, closing) => closing ? '\n' : '\n- ',
+        ul: () => '\n',
+        ol: () => '\n',
+        b: () => '**',
+        strong: () => '**',
+        i: () => '*',
+        em: () => '*',
+        td: () => ' | ',
+        th: () => ' | ',
+        tr: () => '\n',
+        table: () => '\n\n'
+      }
+      // 阶段一：转换已知标签 + script/style 区域移除；未知标签原样保留
+      // 单个 < 标签处理一步：返回 {out, next}；stop=true 表示本处起剩余原样保留（无闭合结构）
+      const convertStep = (str, lt, pos, tagOps) => {
+        const { i, closing, name, wordAfter } = readTagName(str, lt)
+        if (name === '') {
+          // < 后非字母：按字面文本处理（'<<100</p>' 的 << 不吞并后续已知标签）
+          return { out: str.slice(pos, lt + 1), next: lt + 1 }
+        }
+        if (!wordAfter && !closing && (name === 'script' || name === 'style')) {
+          // script/style：内容直至 </x> 整体移除；无闭合则丢弃至末尾（HTML 语义：内容到 EOF）
+          // v3.263：同 _replaceTagged——原串 i 标志正则定位闭合（toLowerCase 长度展开会让索引错位）
+          const closeRe = safeRe('</' + name + '>', 'gi')
+          closeRe.lastIndex = lt + 1
+          const closeM = closeRe.exec(str)
+          if (closeM === null) return { out: str.slice(pos, lt), stop: true }
+          return { out: str.slice(pos, lt), next: closeM.index + name.length + 3 }
+        }
+        const gt = this._findTagEnd(str, i)
+        if (gt === -1) return { out: str.slice(pos), stop: true }
+        const tag = str.slice(lt, gt + 1)
+        const op = this._tagOpFor(name, closing, wordAfter, tagOps)
+        if (op == null) return { out: str.slice(pos, gt + 1), next: gt + 1 } // 未知标签原样保留
+        const replaced = op(tag, closing)
+        // img 无 src 返回原标签——由通用剥离兜底剥空（其余 op 替换文本均非原标签）
+        return {
+          out: str.slice(pos, lt) + (op === tagOps.img && replaced === tag ? '' : replaced),
+          next: gt + 1
+        }
+      }
+      const scanConvert = (str) => {
+        let out = ''
+        let pos = 0
+        while (pos < str.length) {
+          const lt = str.indexOf('<', pos)
+          if (lt === -1) { out += str.slice(pos); break }
+          const step = convertStep(str, lt, pos, tagOps)
+          out += step.out
+          if (step.stop) break
+          pos = step.next
+        }
+        return out
+      }
+      // 阶段二：通用剥离剩余 <...>（原 <(?:...)+> 兜底；<> 保留）
+      const scanStrip = (str) => {
+        let out = ''
+        let pos = 0
+        while (pos < str.length) {
+          const lt = str.indexOf('<', pos)
+          if (lt === -1) { out += str.slice(pos); break }
+          const gt = this._findTagEnd(str, lt + 1)
+          if (gt === -1) { out += str.slice(pos); break }
+          if (gt === lt + 1) { out += str.slice(pos, gt + 1); pos = gt + 1; continue }
+          out += str.slice(pos, lt)
+          pos = gt + 1
+        }
+        return out
+      }
+      return scanStrip(scanConvert(html))
+    })()
       .replace(/\n{3,}/g, '\n\n')
     // 先移除真实 HTML 标签，再解码实体；实体解码可能重新形成标签，需再次清理主动内容/危险属性。
     html = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(html))
@@ -1397,17 +1687,20 @@ const RuleEngine = {
         // 同时 alt（交替歧义）同样向上传播：`((a|aa))+` 嵌套交替也是灾难性回溯。
         if (closed.inf || parent.inf) parent.inf = true
         if (closed.alt || parent.alt) parent.alt = true
-        // (a|aa){n} 有界重复+组内交替/无限量词：组内歧义 × 重复仍可指数回溯（(a|aa){500}），
-        // 有界量词本身不危险，但组内含交替/无限量词时重复放大回溯——保守拦截。
-        // 注意：小次数有界量词（{1,3}/{2,3} 等）测试锁定安全（V8 对小重复有优化），
-        // 仅拦截大次数（≥100，如 {500}）——既防灾难性回溯又不误伤正常配置。
+        // (a|aa){n} 有界重复+组内交替/无限量词：组内歧义 × 重复仍可指数回溯（(a|aa){30} 对
+        // ~60 字符输入实测 8-12s 卡死），有界量词本身不危险，但组内含交替/无限量词时重复
+        // 放大回溯——保守拦截。
+        // P1（审查 2026-08-15）：阈值曾为 ≥100（如 {500}）——实测 V8 对小重复的优化仅对
+        // ≤~10 成立，{20}-{99} 区间（(a+){20}/(\d+){1,20}/(a|aa){30}）对 40-200 字符输入
+        // 即指数级卡死主线程，全部漏检。下调到 ≥10：覆盖 20-99 爆炸区间，且不误伤已测试
+        // 锁定安全的 {1,3}/{2,3} 等小次数配置。
         if (closed.alt || closed.inf) {
           const bqmr = /\{\d+(?:,\d*)?\}/y
           bqmr.lastIndex = i + 1
           const bqm = bqmr.exec(s)
           if (bqm) {
             const [lo, hi] = bqm[0].slice(1, -1).split(',').map(x => x === '' ? Infinity : Number(x))
-            if (lo >= 100 || (hi !== undefined && hi >= 100)) return true
+            if (lo >= 10 || (hi !== undefined && hi >= 10)) return true
           }
         }
         if (ql > 0) { parent.inf = true; i += ql }
@@ -2075,9 +2368,15 @@ const MessageStore = {
         if (keys.length === 0) return false // 上限非正且缓存为空时无可淘汰，拒绝写入
         // 只对字符串键淘汰：数字样键会被 Object.keys 按数值序排列，keys[0] 并非最旧，
         // 故跳过数组索引样键，取首个普通字符串键；全部为索引键时退回 keys[0]。
+        // P3（审查 2026-08-15）：数字样键分支为防御性死代码——_memoryCache 键恒为 getFilePath
+        // 产物（绝对路径字符串），绝不可能是数字样键；保留以防未来键来源变化（注释锁定）。
+        // P3（审查 2026-08-15，v3.260 回归）：正则误写成 \\d（匹配字面反斜杠+d）导致数字样键
+        // 不再被识别为索引键、会被当「最旧键」淘汰（行为翻转）；恢复 \d 语义。
         const oldest = keys.find(k => typeof k === 'string' && !/^(?:0|[1-9]\d*)$/.test(k)) ?? keys[0]
         try { delete this._memoryCache[oldest] } catch (e) { /* 忽略 */ }
-        // 淘汰后按实际键数校准计数（防御外部直删导致的漂移；新增键由下方统一自增）
+        // 淘汰后按实际键数校准计数（防御外部直删导致的漂移；新增键由下方统一自增）。
+        // P3（审查 2026-08-15）：依赖 delete 一定成功——当前实现 delete 永不抛错（自身属性可配置），
+        // 属理论防御；若未来键为不可配置属性，此处计数会与键数脱钩（注释锁定）。
         this._memoCount = keys.length - 1
         // warn 降频：容量打满后不再每次新键写都提示，仅在从“未满”首次进入“打满淘汰”时提醒一次
         if (!this._memoWarned) {
@@ -2242,13 +2541,19 @@ const MessageStore = {
 
   _ensureFileExists (filePath) {
     // 空路径早退：writeAtomic 对空路径会留下无法重命名的残留 .tmp，直接跳过。
-    if (!filePath) return
+    if (!filePath) return false
     // 父目录创建与原子初始化交给 writeAtomic（内部已 ensureParent），避免冗余 stat。
-    // 容错：文件不存在时 writeFile 抛错不逃逸（双故障下 readMessages 仍可返回 []）
+    // P1（审查 2026-08-15）：返回初始化是否成功——readMessages 据此区分「文件缺失但初始化
+    // 成功（正常空缓存）」与「缺失且初始化失败（磁盘满/目录只读/EACCES，须置 _readFailed
+    // 防主流程按空缓存全量重推）」。
     try {
-      if (!fs.existsSync(filePath)) writeAtomic(filePath, '[]', '缓存初始化')
+      // v3.263（CodeAnt）：初始化用独占创建替代 writeAtomic——tmp+rename 会无条件替换目标文件，
+      // 检查与写入之间另一进程若已创建有效缓存会被覆盖成 [] 丢失判重记录；wx 语义并发创建不覆盖。
+      if (!fs.existsSync(filePath)) return writeAtomicIfAbsent(filePath, '[]', '缓存初始化')
+      return true
     } catch (e) {
       console.error(`缓存初始化失败 ${filePath}:`, e.message)
+      return false
     }
   },
 
@@ -2283,7 +2588,7 @@ const MessageStore = {
       try { delete this._readFailed[filePath] } catch (e) { /* 忽略 */ }
       return this._memoryCache[filePath]
     }
-    this._ensureFileExists(filePath)
+    const initialized = this._ensureFileExists(filePath)
     const result = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES)
     if (result.status !== 'ok') {
       const detail = result.error && result.error.message ? result.error.message : result.status
@@ -2294,6 +2599,13 @@ const MessageStore = {
       // ioError/unsafe/tooLarge 读取失败时记录失败标记：返回 [] 供判重/调用方降级，但绝不允许
       // 后续 save 据此全量覆写磁盘（会把未读到的存量数据覆盖丢失）。
       if (result.status === 'ioError' || result.status === 'unsafe' || result.status === 'tooLarge') {
+        try { this._readFailed[filePath] = true } catch (e) { /* 忽略 */ }
+      }
+      // P1（审查 2026-08-15）：缓存缺失且初始化写入失败（磁盘满/目录只读/EACCES）时与
+      // ioError 同口径置 _readFailed——此前 missing 不置位，主流程按「空缓存」放行全量
+      // 重推且 saveBatch 落盘同样失败 → 每轮重复轰炸（与 v3.259 修复的损坏缓存重复推送
+      // 同类但未被覆盖）；磁盘恢复后初始化成功自动解除。
+      if (result.status === 'missing' && !initialized) {
         try { this._readFailed[filePath] = true } catch (e) { /* 忽略 */ }
       }
       return []
@@ -2353,16 +2665,25 @@ const MessageStore = {
       console.warn(`缓存超出上限(${maxSize})，裁剪掉最早 ${toSave.length - maxSize} 条`)
       toSave.splice(0, toSave.length - maxSize)
     }
-    const text = (() => {
-      // 序列化防御：循环引用等无法 JSON.stringify 时容错（内存缓存保留，不落盘不崩溃）
-      try {
-        return JSON.stringify(toSave, null, 2)
-      } catch (e) {
-        console.error(`缓存序列化失败 ${filePath}（可能含循环引用）:`, e.message)
-        return null
-      }
-    })()
+    let text
+    // 序列化防御：循环引用等无法 JSON.stringify 时容错（内存缓存保留，不落盘不崩溃）
+    try {
+      // P3（审查 2026-08-15）：紧凑输出替代美化缩进——缓存文件体积 -30~50%，万条级序列化内存峰值更低
+      text = JSON.stringify(toSave)
+    } catch (e) {
+      console.error(`缓存序列化失败 ${filePath}（可能含循环引用）:`, e.message)
+      text = null
+    }
     if (text === null) {
+      restoreMemo()
+      return false
+    }
+    // P1（审查 2026-08-15）：写端字节上限与读端 MESSAGE_CACHE_MAX_BYTES 对齐——此前仅按条数
+    // （maxSize）裁剪，单条 >6.7KB（base64 图/长 HTML 常见）时 10000 条即可超 64MB，读端判
+    // tooLarge → 置 _readFailed → 写端被 _readFailed 拒绝覆写 → 永久自锁直至人工删文件。
+    text = this._trimCacheByBytes(text, toSave, filePath)
+    if (text === null) {
+      // 单条即超读端上限，无法裁剪出可读文件：跳过落盘，保留磁盘原状（避免写出超限文件触发自锁）
       restoreMemo()
       return false
     }
@@ -2377,6 +2698,33 @@ const MessageStore = {
     // 使下次 readMessages 内存命中重新做一次 existsSync+恢复检查（保持外部删除恢复测试语义）。
     try { this._verified.delete(filePath) } catch (e) { /* 忽略 */ }
     return true
+  },
+
+  /** 写端字节上限裁剪：二分查找「最新 k 条序列化后不超读端上限」的最大 k（O(log n) 次序列化），
+   *  至少保留最新 1 条；不超限原样返回；连最新单条都超限时返回 null（调用方跳过落盘）。 */
+  _trimCacheByBytes (text, toSave, filePath) {
+    if (Buffer.byteLength(text, 'utf8') <= MESSAGE_CACHE_MAX_BYTES) return text
+    if (toSave.length <= 1) {
+      console.warn(`缓存单条消息即超过读端上限(${MESSAGE_CACHE_MAX_BYTES} 字节)，无法裁剪：${filePath}`)
+      return null
+    }
+    let lo = 1
+    let hi = toSave.length
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1
+      const kept = toSave.slice(-mid)
+      if (Buffer.byteLength(JSON.stringify(kept), 'utf8') <= MESSAGE_CACHE_MAX_BYTES) lo = mid
+      else hi = mid - 1
+    }
+    // 二分收敛到 lo=1 时校验最新单条本身：仍超限则无法裁剪，与单条路径同口径跳过落盘（防自锁）
+    if (lo === 1 && Buffer.byteLength(JSON.stringify(toSave.slice(-1)), 'utf8') > MESSAGE_CACHE_MAX_BYTES) {
+      console.warn(`缓存单条消息即超过读端上限(${MESSAGE_CACHE_MAX_BYTES} 字节)，无法裁剪：${filePath}`)
+      return null
+    }
+    const dropped = toSave.length - lo
+    console.warn(`缓存字节超上限(${MESSAGE_CACHE_MAX_BYTES} 字节)，裁剪掉最早 ${dropped} 条（防读端 tooLarge 自锁）`)
+    toSave.splice(0, dropped)
+    return JSON.stringify(toSave)
   },
 
   /** 预计算某缓存文件的身份索引：与 sameMessageIdentity 的匹配关系同构（见 has），
@@ -2509,6 +2857,7 @@ const MessageStore = {
     messages.forEach(addIdentityIndexes)
     const NOW = () => this._now()
     let changedAny = false
+    let updatedCount = 0 // P3：批内逐条日志降频——改为批尾一条汇总（大批次曾刷屏）
     for (const message of newMessages) {
       // 元素级校验：非对象元素跳过（避免访问 message.id 崩溃）
       if (!Utils.isValidItem(message)) continue
@@ -2545,7 +2894,7 @@ const MessageStore = {
         // P3 优化：复用 _contentChangedIgnoringTs（先浅层短路、后键序无关深排），与 _upsert 口径一致
         const changed = this._contentChangedIgnoringTs(oldM, message)
         if (!changed) continue // 内容完全一致：不更新、不刷新 timestamp、不触发落盘（与 _upsert 口径一致）
-        if (changed) console.log(`更新缓存记录: ${filename}`)
+        updatedCount++
         changedAny = true
         removeIdentityIndexes(oldM, idx)
         messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: NOW() }
@@ -2568,7 +2917,12 @@ const MessageStore = {
     // 忽略返回值会让落盘失败被静默吞掉，仅保留内存快照。
     const saved = this.saveMessages(filePath, messages)
     if (!saved) {
-      console.warn('缓存落盘失败，仅保留内存快照 ' + filePath)
+      // P3（审查 2026-08-15）：原文案「仅保留内存快照」误导——saveMessages 失败路径实际把内存
+      // 快照回滚到写入前状态，本批变更既不落盘也不在内存；改为如实描述。
+      console.warn('缓存落盘失败，本次变更已回滚（内存与磁盘均保持旧快照） ' + filePath)
+    } else if (updatedCount > 0) {
+      // P3：批尾一条汇总日志替代逐条刷屏（大批次场景）——落盘成功后再报（CodeRabbit：失败不报"已更新"）
+      console.log(`缓存批量更新: ${filename} 更新 ${updatedCount} 条`)
     }
   },
 
@@ -2589,7 +2943,7 @@ const MessageStore = {
     const parts = url.split('/')
     let name = parts[parts.length - 1].split(/[?#]/)[0] // 去掉查询参数与 hash
     if (!name || /^\.+$/.test(name)) name = 'default' // 空/纯点串兜底，避免 '..' → '...json'
-    name = name.replace(/[\\/:*"<>|]/g, '_') // 清洗文件系统保留字符
+    name = name.replace(/[\\/:*?"<>|]/g, '_') // 清洗文件系统保留字符（P3：补 ? 与 getFilePath 口径对齐）
     name = name.replace(/[\u0000-\u001f]/g, '') // 过滤控制字符
     if (!name) name = 'default' // 清洗后复检空串：末段全为控制字符时避免生成隐藏文件 '.json'
     if (!name.endsWith('.json')) name += '.json'
@@ -2679,8 +3033,9 @@ const Pusher = {
   // notifyModule：可选推送模块实例（延迟加载）；未传时按需加载（保持兼容/测试兜底）
   async send (text, desp, notifyModule) {
     // R4-2：非字符串归一——undefined/null → 空串（避免模板串输出 'undefined' 文本）；数字等 String() 化
-    text = text === undefined || text === null ? '' : String(text)
-    desp = desp === undefined || desp === null ? '' : String(desp)
+    // P3（审查 2026-08-15）：Symbol/抛错 toString 会抛 TypeError——try/catch 防护（对象保持 String() 语义不变）
+    try { text = text === undefined || text === null ? '' : String(text) } catch (e) { text = '' }
+    try { desp = desp === undefined || desp === null ? '' : String(desp) } catch (e) { desp = '' }
     // 最终推送出口再清理一次：自定义 {内容} 模板可能绕过 Formatter 的 {Html内容} 专用清理，
     // 而 WxPusher HTML 通道会直接渲染 desp；统一出口防止任意模板把主动 HTML 带入客户端。
     // 仅当 desp 呈 HTML 形态（将触发 wxpusher 等 HTML 渲染通道）时清洗：
@@ -2698,7 +3053,8 @@ const Pusher = {
       desp = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(desp))
     }
     // 抛异常由主流程处理：推送失败的消息不写缓存，下次运行重试（避免永久丢失）
-    // 加整体超时：单通道最坏 15s，避免慢通道把整批推送拖到数分钟
+    // 加整体超时：整体 race 上限 10s（slim 层每通道 HTTP timeout 15s 为单通道上限），
+    // 避免慢通道把整批推送拖到数分钟
     // v3.121：clearTimeout 清除超时定时器——Promise.race 完成后定时器仍挂着会导致
     // 进程退出延迟（事件循环被 keep-alive）+ 多次推送定时器堆积（资源泄漏）
     let timer
@@ -3170,7 +3526,7 @@ const App = {
       }
       warmupController = typeof AbortController === 'function' ? new AbortController() : null
       const signal = warmupController ? warmupController.signal : null
-      const dnsWarmupPromise = Promise.resolve(prewarmDns('wxpusher.zjiecode.com'))
+      const dnsWarmupPromise = Promise.resolve(prewarmDns('wxpusher.zjiecode.com', signal))
         .then((result) => { dnsWarmup = result; dnsWarmupSettled = true; return result })
         .catch((error) => { dnsWarmup = { ok: false, error: String(error) }; dnsWarmupSettled = true; return dnsWarmup })
       const prewarmCount = (() => {
@@ -3453,7 +3809,9 @@ const App = {
         // v3.239：截断告警推送（复用 alert 限频，防轰炸）——静默丢失曾无感知，手机端可及时发现
         // v3.240：await 告警（v3.164 曾修复 fire-and-forget 导致告警 HTTP 未送达被杀，子代理审查发现本轮修复回归该模式）
         // v3.241：文案改为「已暂存待补推」（下轮接口重放时补推，非永久丢弃；子代理审查提示避免误导）
-        try { await this._sendAlert(`⚠️ 线报酷截断：单次待推送 ${items.length} 条超上限 ${maxPerRun}，已暂存 ${truncatedCount} 条待下轮补推（防推送风暴）`) } catch (e) { /* 告警失败不阻塞主流程 */ }
+        // P3（审查 2026-08-15）：再修正——截断条目并未暂存（不入缓存、无任何持久化），仅依赖接口下轮重放，
+        // 「已暂存」仍会误导用户以为已持久化；改为如实描述「待下轮接口重放时补推」
+        try { await this._sendAlert(`⚠️ 线报酷截断：单次待推送 ${items.length} 条超上限 ${maxPerRun}，截断 ${truncatedCount} 条待下轮接口重放时补推（防推送风暴）`) } catch (e) { /* 告警失败不阻塞主流程 */ }
         // v3.134：截断掉的不写缓存——否则下次运行去重跳过导致静默丢失（缓存当"已处理"）；下次运行推剩余
         // keyOf 在 ⑥ 才定义，此处用同口径（id 优先 + url 归一）构造截断 key
         truncatedKeys = new Set(items.slice(maxPerRun).map(it => Utils.getMessageIdentity(it).key))

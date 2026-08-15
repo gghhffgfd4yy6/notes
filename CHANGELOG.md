@@ -1022,3 +1022,29 @@
   - **zkt_gjc 首尾空白地雷**：白名单语义下 `' abc'` 按字面正则匹配，误配空格静默全量滤空且无告警（hash 不能 trim，无法自动纠正）。validateConfig 补首尾空白告警。回归测试。
 - **设计边界（评估后记录不修）**：多进程并发 saveBatch 无文件锁（lost-update，单实例 cron 设计下不可达，加锁引入复杂度大于收益）；writeAtomic TOCTOU 窗口（多层防御已存在：basename+O_NOFOLLOW+原子写+唯一 tmp，攻击者需项目根写权限，注释说明边界）。
 - 测试：全量（单元 + 集成并行 + 通道）全绿。
+
+## v3.260（手机端 AI 只读审查 P3 清理，2026-08-15）
+
+- 6 份审查报告共 24 条 P3，本版处置：**A 类 12 条修复 + B 类 12 条记录到 REVIEW_DECISIONS（评估后不修）**。
+- **A 类修复（12 条）**：
+  - **文案修正（3）**：截断告警「已暂存待下轮补推」→「待下轮接口重放时补推」（截断条目未持久化，靠接口重放）；缓存落盘失败「仅保留内存快照」→「本次变更已回滚」（saveMessages 失败实际回滚内存）；推送超时注释「单通道最坏 15s」→「整体 race 上限 10s」。
+  - **防御加固（4）**：Pusher.send `String(text/desp)` 加 try/catch（Symbol/抛错 toString 曾 TypeError）；filterHash 属性访问套 safeGet（getter/proxy 抛错不崩）；getFileName 清洗补 `?`（与 getFilePath 口径对齐）；prewarmDns 支持取消信号（坏解析器挂起不再拖住进程退出）。
+  - **性能优化（3）**：只看它过滤 `kept.includes` O(n²) 改单次遍历（CodeRabbit 建议）；shallowEqualIgnoringTimestamp 同值/同引用短路（省深排）；缓存 JSON 紧凑输出（文件体积 -30~50%）。
+  - **注释锁定（2）**：shallowEqualIgnoringTimestamp 顶层 Date/Map/Set 误判相等不可达；_memoCount 防漂移/数字样键淘汰为理论防御与死代码。
+  - **日志降频（1）**：saveBatch 批内逐条「更新缓存记录」刷屏 → 批尾一条汇总。
+- **B 类记录不修（12 条）**：预热连接数对齐、顺序模式收尾等待、全空消息计数、saveBatch 返回类型统一、非数组补日志、空 catch 防御噪音、cacheDir 热路径 realpath、pingbitime 多行/上限、if(!item) 不对称、keyword 空串重复检查、getNotify 分支消重、d474 只读注记。理由详见 REVIEW_DECISIONS.md。
+- 测试：全量（单元 + 集成并行 + 通道）全绿。
+
+## v3.261（手机端 AI 只读审查 P0/P1 修复，2026-08-15）
+
+- 6 分区只读审查共确认 5 条 P0/P1 候选，本版全部修复；修复中顺带处理 1 处同源 ReDoS 根因、1 条 P1 候选（style 恒等转义）与 1 处 v3.260 正则回归。
+- **P1（5 项）**：
+  - **缓存超 64MB 永久自锁（存储）**：写端只按条数裁剪、读端 64MB 上限不对称，单条 >6.7KB（base64 图/长 HTML）时 10000 条即可超限 → 读端 tooLarge → `_readFailed` → 写端拒绝覆写，永久停推直至人工删文件。修复：写端新增字节上限，二分裁剪至读端上限内（至少保留最新 1 条）。
+  - **缓存缺失且初始化写失败 → 无保护全量重推（存储）**：`_ensureFileExists` 吞错且 missing 不置 `_readFailed`，主流程按「空缓存」放行全量重推、落盘持续失败 → 每轮重复轰炸。修复：`_ensureFileExists` 返回是否成功，缺失+初始化失败与 ioError 同口径置 `_readFailed`，磁盘恢复后自动解除。
+  - **ReDoS 防护有界量词阈值下界绕过（过滤引擎）**：`hasNestedQuantifier` 仅拦 ≥100，实测 V8 对小重复的优化只到 ~10，`(a|aa){30}`/`(a+){20}`/`(\d+){1,20}` 对 40-200 字符输入即指数级卡死（探针 8-12s）。修复：阈值下调至 ≥10，覆盖 20-99 爆炸区间，不误伤 {1,3}/{2,3} 等安全配置。
+  - **filterHash 对 zkt_gjc 缺类型归一（过滤引擎）**：字符串↔非字符串（'0'→0）切换时哈希不变，`_f` 缓存不失效 → 改宽/取消只看它过滤后旧条目静默漏推。修复：与 C015 同款 typeof 前缀（不 trim，保持空白字面语义）。
+  - **htmlToMarkdown/sanitizeDecodedHtml 正则 ReDoS（安全面）**：`<h1>`/`<a>`/`<script>`/`<style>` 的无界惰性 `[\s\S]*?<\/x>` 在大量未闭合开标签下 O(n²)（100k 实测 12-16s 卡死主线程）；属性保护正则 `([a-zA-Z_:][\w:.-]*\s*=\s*)(["'])([\s\S]*?)\2` 的贪心名称前缀在长文本上逐位回溯（78k 实测 12.5s，任何长文本消息即 DoS）。修复：`_replaceTagged` 线性定位（开标签正则 + indexOf 找首个闭合，语义与原实现逐字一致）+ 属性保护改「`=`引号 定位 + 回扫属性名」；v3.254 的 100k 截断保留作为下游防护。
+- **P1 候选 / 顺带修复**：
+  - **style CSS 恒等转义绕过（安全面）**：C010 只解十六进制转义，`u\rl(javascript:)`/`-mo\z-binding` 等恒等转义在浏览器 CSS 解析时还原为 url(...)/-moz-binding。修复：`_decodeCssEscapes` 全量解码（十六进制 + 恒等 + 行延续），再跑黑名单。
+  - **v3.260 正则回归（潜伏 P3）**：`_memoSet` 淘汰最旧键的正则 `\d` 被误改为 `\\d`，数字样键不再被识别为索引键（行为翻转）。修复：恢复 `\d`。
+- 测试：全量（单元 757/757 + 集成串行 131/131 + 并行 + 通道 66/66）全绿。

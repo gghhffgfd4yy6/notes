@@ -9,3 +9,4 @@ mutation-progress.json
 mutation-report.json
 .ai/
 cleanup_rootfs_junk.sh
+.tmp_parallel_*.json
