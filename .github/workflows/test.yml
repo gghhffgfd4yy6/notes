@@ -9,7 +9,6 @@ on:
     - cron: "0 8 * * *"   # 每日冒烟，防环境漂移
   push:
     branches: [master]
-  pull_request:
 
 jobs:
   quality:
