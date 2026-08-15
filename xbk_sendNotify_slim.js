@@ -18,6 +18,14 @@ const requestExtras = (params) => {
 function safeString (value) {
   try { return String(value === undefined || value === null ? '' : value) } catch (e) { return '' }
 }
+
+// 去尾部斜杠：线性扫描替代 /\/+$/（S8786 对 X+$ 型正则标记超线性回溯；配置值虽可信，
+// 但改成等价线性实现可消除告警且无语义差异）
+function trimTrailingSlashes (s) {
+  let i = s.length
+  while (i > 0 && s.codePointAt(i - 1) === 47) i-- // 47 = '/'
+  return i === s.length ? s : s.slice(0, i)
+}
 // 日志密钥脱敏：保留前4位+后2位，中间 ***（防止 cron 日志重定向/分享时泄露密钥）
 function maskKey (k) {
   const s = safeString(k)
@@ -687,7 +695,7 @@ function qywxBotNotify (text, desp, params = {}) {
     const options = {
       ...REQUEST_OPTIONS,
       ...requestExtras(params),
-      url: `${String(QYWX_ORIGIN || 'https://qyapi.weixin.qq.com').replace(/\/+$/, '')}/cgi-bin/webhook/send?key=${QYWX_KEY}`, // v3.138：去尾斜杠防双斜杠
+      url: `${trimTrailingSlashes(String(QYWX_ORIGIN || 'https://qyapi.weixin.qq.com'))}/cgi-bin/webhook/send?key=${QYWX_KEY}`, // v3.138：去尾斜杠防双斜杠
       json: {
         // v3.127：msgtype 'text' → 'markdown'——desp 是 Markdown 内容，text 模式会显示 ** 等原始符号（企微支持 markdown）
         msgtype: 'markdown',
@@ -744,7 +752,36 @@ function looksHtml (s) {
   if (!s || typeof s !== 'string') return false
   // 与主流程 Pusher 的最终出口保持同一口径：不能只识别有限白名单，
   // 否则 input/form 等真实 HTML 会被当 Markdown 原样发送。
-  return /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^>]*>/i.test(s)
+  // S8786：原 /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^>]*>/i 在大量 "<tag" 且无 ">"
+  // 的对抗输入上呈 O(n²) 回溯；改为线性扫描：< → 可选空白/斜杠 → 字母开头标签名 →
+  // 名字后须跟空白、> 或 />（排除 <https://...> autolink）→ 其后存在 > 即判定为 HTML。
+  let i = 0
+  while (i < s.length) {
+    const lt = s.indexOf('<', i)
+    if (lt === -1) return false
+    if (looksHtmlTagAt(s, lt)) return true
+    i = lt + 1
+  }
+  return false
+}
+
+// < 后可选空白/斜杠 → 字母开头标签名 → 名字后跟空白、> 或 />（排除 autolink）→ 其后存在 >
+function looksHtmlTagAt (s, lt) {
+  const n = s.length
+  const isWs = (ch) => ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f'
+  const isNameChar = (ch) => /[A-Za-z0-9-]/.test(ch)
+  let j = lt + 1
+  while (j < n && isWs(s[j])) j++
+  if (j < n && s[j] === '/') {
+    j++
+    while (j < n && isWs(s[j])) j++
+  }
+  if (j >= n || !/[A-Za-z]/.test(s[j])) return false
+  let k = j + 1
+  while (k < n && isNameChar(s[k])) k++
+  const c = k < n ? s[k] : ''
+  const nameOk = isWs(c) || c === '>' || (c === '/' && s[k + 1] === '>')
+  return nameOk && s.includes('>', k)
 }
 
 // WxPusher 默认窗口：每个 appToken 单独维护，避免多应用分流时把两个额度混成一个。
@@ -1145,7 +1182,7 @@ function tgNotify (text, desp, params = {}) {
       const options = {
         ...REQUEST_OPTIONS,
         ...requestExtras(params),
-        url: `${String(TG_API_HOST || 'https://api.telegram.org').replace(/\/+$/, '')}/bot${TG_BOT_TOKEN}/sendMessage`, // v3.138：去尾斜杠防双斜杠
+        url: `${trimTrailingSlashes(String(TG_API_HOST || 'https://api.telegram.org'))}/bot${TG_BOT_TOKEN}/sendMessage`, // v3.138：去尾斜杠防双斜杠
         json: {
           chat_id: TG_USER_ID,
           text: tgSafe,
@@ -1205,20 +1242,73 @@ function truncateBytes (s, maxBytes) {
 // markdown → 纯文本（v3.128：Bark/Push+ 不支持 markdown 渲染，desp 会显示 ** 等原始符号）
 // v3.136：剥 <url> autolink 尖括号（stripAngle 默认 true）；TG 传 false（保留 < > 给 HTML 转义）
 // v3.149：HTML 标签（含属性）整体剥空——{Html内容} 模板产物曾残留 'a href="..." target="_blank"' 垃圾文本；
+// S8786：原 /\[([^\]]+)\]\(([^)]+)\)/ 在大量未配对 "[" 上呈 O(n²) 回溯；线性扫描等价替换：
+// [text](url) → text (url)（text===url 原文链接只显示一次；text/url 空或未闭合保持原样）
+function mdLinksToPlain (s) {
+  let out = ''
+  let i = 0
+  while (i < s.length) {
+    const open = s.indexOf('[', i)
+    if (open === -1) { out += s.slice(i); break }
+    const link = mdLinkAt(s, open)
+    if (link) {
+      out += s.slice(i, link.start) + link.text
+      i = link.end
+      continue
+    }
+    const close = s.indexOf(']', open + 1)
+    if (close === -1) { out += s.slice(i); break }
+    out += s.slice(i, close + 1)
+    i = close + 1
+  }
+  return out
+}
+
+// 解析 open 处的 [text](url)：成功返回 {start, end, text}；text/url 空、未闭合 ]/) 返回 null
+function mdLinkAt (s, open) {
+  const close = s.indexOf(']', open + 1)
+  if (close === -1) return null
+  const t = s.slice(open + 1, close)
+  if (t === '' || s[close + 1] !== '(') return null
+  const end = s.indexOf(')', close + 2)
+  if (end === -1) return null
+  const u = s.slice(close + 2, end)
+  if (u === '') return null
+  return { start: open, end: end + 1, text: t === u ? t : `${t} (${u})` }
+}
+
+// S8786：原 /<([^>]+)>/ 在无 ">" 的对抗输入上呈 O(n²) 回溯；线性扫描等价替换：
+// stripAngle=true 时剥掉 HTML 标签、<url> autolink 保留内容；false 时（TG）整体保留
+function stripAngleTags (s, stripAngle) {
+  let out = ''
+  let i = 0
+  while (i < s.length) {
+    const lt = s.indexOf('<', i)
+    if (lt === -1) { out += s.slice(i); break }
+    const gt = s.indexOf('>', lt + 1)
+    if (gt === -1) { out += s.slice(i); break }
+    const inner = s.slice(lt + 1, gt)
+    if (!stripAngle || inner === '') { out += s.slice(i, gt + 1); i = gt + 1; continue }
+    const t = inner.trim()
+    out += s.slice(i, lt) + (/^https?:(\/\/)?/i.test(t) ? t : '')
+    i = gt + 1
+  }
+  return out
+}
+
 //          <url> autolink（http 开头）保留内容；&nbsp; 等实体解码为空格
 function mdToPlain (s, stripAngle = true) {
-  return String(s === undefined || s === null ? '' : s)
+  let out = String(s === undefined || s === null ? '' : s)
     .replace(/\*\*([^*]+)\*\*/g, '$1') // **粗体** → 粗体
     .replace(/(?<![0-9])\*([^*\n]+?)(?<![0-9])\*(?!\*)/g, '$1') // *斜体* → 斜体（v3.150：数字前后 * 不算斜体——'5*3*2cm' 曾误剥成 '532cm'）
     .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1') // ![alt](url) → alt
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, t, u) => (t === u ? t : `${t} (${u})`)) // [text](url) → text (url)；v3.153：text===url(原文链接) 只显示一次
-    .replace(/^#{1,6}\s+/gm, '') // # 标题
-    .replace(/`([^`]+)`/g, '$1') // `代码` → 代码
-    .replace(/<([^>]+)>/g, (m, inner) => {
-      if (!stripAngle) return m // TG：保留 <>（HTML 转义）
-      const t = inner.trim()
-      return /^https?:(\/\/)?/i.test(t) ? t : '' // <url> autolink 保留内容；HTML 标签剥空
-    })
+  out = mdLinksToPlain(out) // [text](url) → text (url)；v3.153：text===url(原文链接) 只显示一次
+  return stripAngleTags(
+    out
+      .replace(/^#{1,6}\s+/gm, '') // # 标题
+      .replace(/`([^`]+)`/g, '$1'), // `代码` → 代码
+    stripAngle
+  )
     .replace(/&nbsp;/g, ' ')
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
@@ -1305,4 +1395,4 @@ async function sendNotify (text, desp, params = {}) {
   }
 }
 
-module.exports = { sendNotify, push_config, hasWxPusherConfigured, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary }
+module.exports = { sendNotify, push_config, hasWxPusherConfigured, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdToPlain, looksHtml, stripAngleTags }

@@ -6,11 +6,36 @@
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================
 
-const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash } = require('./xbk_function_v3.js')
+const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity } = require('./xbk_function_v3.js')
 const assert = require('assert')
+const slim = require('./xbk_sendNotify_slim.js')
 const path = require('path')
 // 缓存目录（基于 __dirname——v3.113 修复 /workspace 硬编码，仓库可移植）
 const CACHE = path.join(__dirname, 'xianbaoku_cache')
+
+// CodeAnt R7 建议：运行前/后清理 test_ 前缀缓存残留（含 .seen.json/.seen.lock 与临时目录），
+// 避免上次异常中断残留影响本次结果；真实运行缓存 push.json 保留
+function cleanupTestCache () {
+  try {
+    const fs = require('node:fs')
+    const dir = path.join(__dirname, 'xianbaoku_cache')
+    if (fs.existsSync(dir)) {
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.startsWith('test_')) continue
+        const p = path.join(dir, f)
+        try {
+          const st = fs.statSync(p)
+          if (st.isDirectory()) fs.rmSync(p, { recursive: true })
+          else fs.unlinkSync(p)
+        } catch (e) {
+          console.warn(`清理测试残留失败 ${f}:`, e?.message) // 单个残留清理失败不影响测试结果
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('清理测试缓存失败:', e?.message) // 清理失败不影响测试结果
+  }
+}
 
 let passed = 0
 let failed = 0
@@ -67,7 +92,8 @@ console.log('  🧪 listfilter 全套测试（直测 xbk_function_v3.js）')
 console.log('========================================\n');
 
 (async () => {
-// ==================== 1. 基础场景 ====================
+  cleanupTestCache() // 运行前清理上次可能残留的 test_ 缓存/墓碑/锁文件（CodeAnt R7）
+  // ==================== 1. 基础场景 ====================
   console.log('📂 1. 基础场景')
 
   // 相对日期生成器（v3.111：修复测试时间漂移——写死日期会随真实日期跨过天数阈值，8/2 后 2026-07-28 从4天变5天不再拦截）
@@ -1048,13 +1074,328 @@ console.log('========================================\n');
       // 验证最多保留100条（ID 1~100，第0条被删）
       const r = isMessageInFile({ id: 0 }, name)
       const r2 = isMessageInFile({ id: 100 }, name)
-      // 模块内 splice(0, length-100) 会删掉前1条
-      // 0被删，100保留
-      assertEqual(r, false, '第0条应被裁剪')
+      // 模块内 splice(0, length-100) 会删掉前1条；P4：被裁剪记录的身份进墓碑，
+      // isMessageInFile 仍应判重命中（防上游重放重复推送）
+      assertEqual(r, true, '第0条被裁剪但身份应保留（墓碑判重）')
       assertEqual(r2, true)
     } finally {
       Config.cache.maxSize = orig
     }
+  })
+
+  await test('P4 裁剪后判重身份保留：被裁记录重放不重复入库', () => {
+    const name = 'test_tomb_replay.json'
+    const orig = Config.cache.maxSize
+    Config.cache.maxSize = 50 // 显式小上限触发条数裁剪
+    try {
+      for (let i = 0; i < 60; i++) appendMessageToFile({ id: i, title: `t${i}` }, name)
+      assertEqual(isMessageInFile({ id: 0 }, name), true, '被裁 id 0 应仍判重命中（墓碑）')
+      assertEqual(isMessageInFile({ id: 59 }, name), true, '未裁记录正常命中')
+      const before = readMessages(getFilePath(name)).length
+      assertEqual(before, 50, '消息数组应裁剪到 50 条')
+      // 重放被裁记录：saveBatch/append 不应再收进缓存（身份已在墓碑）
+      saveBatch([{ id: 0, title: 't0' }], name)
+      assertEqual(readMessages(getFilePath(name)).length, before, '重放被裁记录不应重复入库')
+      const r = appendMessageToFile({ id: 1, title: 't1' }, name)
+      assertEqual(r, true, '重放被裁记录应视为已判重（不触发落盘）')
+      assertEqual(readMessages(getFilePath(name)).length, before, 'append 重放被裁记录也不应重复入库')
+    } finally {
+      Config.cache.maxSize = orig
+    }
+  })
+
+  await test('P4 过滤未推(_f)记录不落墓碑：规则改宽后仍可重新评估', () => {
+    const name = 'test_tomb_f.json'
+    const orig = Config.cache.maxSize
+    Config.cache.maxSize = 100
+    try {
+      for (let i = 0; i < 120; i++) appendMessageToFile({ id: i, title: `t${i}`, _f: true }, name)
+      // _f 记录从未推送：被裁剪后不应进墓碑 → isMessageInFile 判不存在
+      assertEqual(isMessageInFile({ id: 0 }, name), false, '过滤未推记录被裁剪后不应被墓碑误判')
+      // 同身份重放应能重新入库（规则改宽后可重新评估/推送）——墓碑未收录，正常 append
+      appendMessageToFile({ id: 0, title: 't0', _f: true }, name)
+      assertEqual(isMessageInFile({ id: 0 }, name), true, '过滤未推记录重放应重新收录')
+    } finally {
+      Config.cache.maxSize = orig
+    }
+  })
+
+  await test('P4 墓碑四类身份 × 条数裁剪后 has() 命中 + save/saveBatch 不重写', () => {
+    const name = 'test_tomb_4kinds_count.json'
+    const orig = Config.cache.maxSize
+    Config.cache.maxSize = 20
+    try {
+      // 四类身份各自灌满并触发条数裁剪：id / id+url / url-only / anon
+      for (let i = 0; i < 30; i++) appendMessageToFile({ id: i, title: `c${i}` }, name)
+      for (let i = 0; i < 30; i++) appendMessageToFile({ id: 100 + i, url: `https://idurl.example/${i}`, title: `d${i}` }, name)
+      for (let i = 0; i < 30; i++) appendMessageToFile({ url: `https://url.example/${i}`, title: `e${i}` }, name)
+      for (let i = 0; i < 30; i++) appendMessageToFile({ title: `匿名内容 f${i} 足够长避免退化` }, name)
+      const before = readMessages(getFilePath(name)).length
+      assertEqual(before, 20, '缓存应裁剪到 20 条')
+      // 四类被裁身份 has() 仍命中（墓碑兜底）
+      assertEqual(isMessageInFile({ id: 0 }, name), true, 'id 被裁身份应墓碑命中')
+      assertEqual(isMessageInFile({ id: 100, url: 'https://idurl.example/0' }, name), true, 'id+url 被裁身份应墓碑命中')
+      assertEqual(isMessageInFile({ url: 'https://url.example/0' }, name), true, 'url-only 被裁身份应墓碑命中')
+      assertEqual(isMessageInFile({ title: '匿名内容 f0 足够长避免退化' }, name), true, 'anon 被裁身份应墓碑命中')
+      // save/saveBatch 重放均不重新入库
+      saveBatch([{ id: 0 }], name)
+      appendMessageToFile({ id: 100, url: 'https://idurl.example/0' }, name)
+      appendMessageToFile({ url: 'https://url.example/0' }, name)
+      appendMessageToFile({ title: '匿名内容 f0 足够长避免退化' }, name)
+      assertEqual(readMessages(getFilePath(name)).length, before, '四类重放均不应重复入库')
+    } finally {
+      Config.cache.maxSize = orig
+    }
+  })
+
+  await test('P4 墓碑四类身份 × 字节裁剪后 has() 命中', () => {
+    const name = 'test_tomb_4kinds_bytes.json'
+    const fp = getFilePath(name)
+    const toSave = []
+    for (let i = 0; i < 10; i++) toSave.push({ id: i, title: `b${i}`, content: 'x'.repeat(200) })
+    for (let i = 0; i < 10; i++) toSave.push({ id: 100 + i, url: `https://idurl.example/${i}`, title: `c${i}`, content: 'y'.repeat(200) })
+    for (let i = 0; i < 10; i++) toSave.push({ url: `https://url.example/${i}`, title: `d${i}`, content: 'z'.repeat(200) })
+    for (let i = 0; i < 10; i++) toSave.push({ title: `匿名字节 f${i}`, content: 'w'.repeat(200) })
+    const droppedOut = []
+    const trimmed = MessageStore._trimCacheByBytes(JSON.stringify(toSave), toSave, fp, 1500, droppedOut)
+    assertEqual(typeof trimmed, 'string', '小上限应裁剪成功')
+    assertEqual(toSave.length < 40, true, `应裁剪掉最早一部分，实际保留 ${toSave.length}`)
+    assertEqual(droppedOut.length > 0, true, '被裁剪记录应收敛到 droppedOut')
+    // Round2 时序：裁剪只收集，缓存写盘成功后由 saveMessages 统一落墓碑（此处模拟）
+    MessageStore._tombstoneDropped(fp, droppedOut)
+    // 被字节裁剪的最早各身份应墓碑命中
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), true, '字节裁剪后 id 墓碑命中')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 100, url: 'https://idurl.example/0' }), true, '字节裁剪后 id+url 墓碑命中')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { url: 'https://url.example/0' }), true, '字节裁剪后 url-only 墓碑命中')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { title: '匿名字节 f0', content: 'w'.repeat(200) }), true, '字节裁剪后 anon 墓碑命中')
+    // 最新保留的记录不落墓碑
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { title: '匿名字节 f9' }), false, '未裁剪记录不应有墓碑')
+  })
+
+  await test('P4 墓碑时序：条数裁剪后序列化失败 → 不落墓碑（CodeAnt Round2 Major）', () => {
+    const name = 'test_tomb_serialize_fail.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const orig = Config.cache.maxSize
+    Config.cache.maxSize = 2
+    try {
+      const circular = { id: 9, title: '循环引用' }
+      circular.self = circular
+      // 条数裁剪会先收集 {id:0}，但随后 JSON.stringify 失败 → 缓存未落盘，不得落墓碑
+      const ok = MessageStore.saveMessages(fp, [{ id: 0 }, { id: 1 }, circular])
+      assertEqual(ok, false, '序列化失败应返回 false')
+      assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '写盘失败不得产生墓碑')
+      const fsmod = require('node:fs')
+      assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '.seen.json 不应存在')
+    } finally {
+      Config.cache.maxSize = orig
+    }
+  })
+
+  await test('P4 墓碑时序：缓存原子写失败 → 不落墓碑（CodeAnt Round2 Major）', () => {
+    const name = 'test_tomb_atomic_fail.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const orig = Config.cache.maxSize
+    Config.cache.maxSize = 2
+    const fsmod = require('node:fs')
+    const origRename = fsmod.renameSync
+    try {
+      // 模拟 writeAtomic 的 rename 失败（tmp 已写、目标未替换 → 磁盘缓存保持原状）
+      fsmod.renameSync = () => { throw new Error('模拟 rename 失败') }
+      const ok = MessageStore.saveMessages(fp, [{ id: 0 }, { id: 1 }, { id: 2 }])
+      assertEqual(ok, false, '原子写失败应返回 false')
+    } finally {
+      fsmod.renameSync = origRename
+      Config.cache.maxSize = orig
+    }
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '写盘失败不得产生墓碑')
+    assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '.seen.json 不应存在')
+    // 同身份重放应能正常重新入库（无墓碑误判）
+    const ok2 = MessageStore.saveMessages(fp, [{ id: 0 }])
+    assertEqual(ok2, true, '写盘失败后重放应正常落盘')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '成功落盘但未裁剪不得产生墓碑')
+  })
+
+  await test('P4 墓碑时序：字节裁剪返回 null → 不产生墓碑（CodeAnt Round2 Major）', () => {
+    const name = 'test_tomb_bytenull.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const droppedOut = []
+    // 单条即超 tiny 上限：字节裁剪返回 null，不得产生任何丢弃/墓碑
+    const big = { id: 0, content: 'x'.repeat(500) }
+    const toSave = [big]
+    const r = MessageStore._trimCacheByBytes(JSON.stringify(toSave), toSave, fp, 100, droppedOut)
+    assertEqual(r, null, '单条超限应返回 null')
+    assertEqual(droppedOut.length, 0, 'null 路径不应收集丢弃记录')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, 'null 路径不得产生墓碑')
+    assertEqual(require('node:fs').existsSync(fp + '.seen.json'), false, '.seen.json 不应存在')
+  })
+
+  await test('P4 墓碑双向 fallback 与原缓存索引一致', () => {
+    const name = 'test_tomb_fallback.json'
+    const fp = getFilePath(name)
+    // 带 id+url 的记录被裁：无 id 的 url 查询应命中（idWithUrl 兜底，与 _indexHasIdentity 同构）
+    MessageStore._tombstoneDropped(fp, [{ id: 1, url: 'https://fb.example/a' }])
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { url: 'https://fb.example/a' }), true, 'url 查询应命中带 url 的 id 墓碑')
+    // 纯 url 记录被裁：不同 id 同 url 的 id 查询应命中（urlOnly 兜底，与 _indexHasIdentity 同构）
+    MessageStore._tombstoneDropped(fp, [{ url: 'https://fb.example/b' }])
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 99, url: 'https://fb.example/b' }), true, 'id 查询应命中纯 url 墓碑')
+    // 带 id+url 记录被裁后，不同 id 同 url 的 id 查询不命中（缓存索引 sameMessageIdentity 同样不判重）
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 2, url: 'https://fb.example/a' }), false, '不同 id 同 url 不应判重（与索引一致）')
+    // anon 互相独立
+    MessageStore._tombstoneDropped(fp, [{ title: '匿名fallback1' }])
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { title: '匿名fallback2' }), false, '不同匿名内容不应互相命中')
+  })
+
+  await test('P4 墓碑统一判重接口 _tombstoneSetsHas（App 闸门复用）与 has 同构', () => {
+    const name = 'test_tomb_gate.json'
+    const fp = getFilePath(name)
+    const probes = [
+      { id: 1 },
+      { id: 2, url: 'https://g.example/a' },
+      { url: 'https://g.example/b' },
+      { title: '匿名gate内容足够长' }
+    ]
+    MessageStore._tombstoneDropped(fp, probes)
+    for (const p of probes) {
+      const ident = getMessageIdentity(p)
+      assertEqual(ident.valid, true, `身份应有效: ${JSON.stringify(p)}`)
+      // App 推送闸门与 has/save/saveBatch 现在统一走同一墓碑判重接口，结果必须一致
+      assertEqual(MessageStore._tombstoneSetsHas(fp, ident), true, `_tombstoneSetsHas 应命中: ${JSON.stringify(p)}`)
+      assertEqual(MessageStore._tombstoneSetsHas(fp, ident), MessageStore._tombstoneHasIdentity(fp, p), '两入口结果应一致')
+    }
+    assertEqual(MessageStore._tombstoneSetsHas(fp, getMessageIdentity({ id: 999 })), false, '未收录身份不命中')
+  })
+
+  await test('P4 墓碑容量超限按文件体积淘汰最旧键（不放弃持久化）', () => {
+    const name = 'test_tomb_bytes_evict.json'
+    const fp = getFilePath(name)
+    const ts = { id: new Map(), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() }
+    const pad = 'x'.repeat(64)
+    for (let i = 0; i < 40; i++) ts.id.set(`id-${i}-${pad}`, true)
+    const ok = MessageStore._saveTombstones(fp, ts, 600)
+    assertEqual(ok, true, '超限应通过淘汰达标而非放弃持久化')
+    MessageStore._tombstoneLoaded.delete(fp) // 绕过进程内缓存，验证磁盘真实内容
+    const loaded = MessageStore._loadTombstones(fp)
+    assertEqual(loaded.id.size > 0 && loaded.id.size < 40, true, `应淘汰到体积达标，保留 ${loaded.id.size} 个`)
+    assertEqual(loaded.id.has(`id-39-${pad}`), true, '最新键应保留')
+    assertEqual(loaded.id.has(`id-0-${pad}`), false, '最旧键应被淘汰')
+  })
+
+  await test('P4 墓碑写前重读合并：并发进程新增身份不互相覆盖（CodeAnt Major 竞态）', () => {
+    const name = 'test_tomb_merge.json'
+    const fp = getFilePath(name)
+    // 进程 B 先加载空快照（模拟并发窗口内的旧缓存）
+    MessageStore._tombstoneLoaded.delete(fp)
+    MessageStore._loadTombstones(fp)
+    // 进程 A 已写入 id:1（模拟另一进程先落盘）
+    MessageStore._saveTombstones(fp, { id: new Map([['1', true]]), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() })
+    // 进程 B 裁剪新增 id:2：写前重读磁盘合并，而非基于旧快照覆盖
+    MessageStore._tombstoneDropped(fp, [{ id: 2 }])
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), true, 'A 进程身份应被合并保留')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 2 }), true, 'B 进程身份应新增')
+  })
+
+  await test('P4 墓碑锁忙（他人持有）：等待超时放弃写入，不无锁覆盖（CodeAnt Round3 Major）', () => {
+    const name = 'test_tomb_lock_busy.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const fsmod = require('node:fs')
+    // 模拟另一进程正持有锁（新 mtime，未过期）
+    fsmod.writeFileSync(fp + '.seen.lock', '', { flag: 'wx' })
+    const t0 = Date.now()
+    MessageStore._tombstoneDropped(fp, [{ id: 1 }])
+    // 等待超时（TOMBSTONE_LOCK_TIMEOUT_MS=2000）后应放弃，不得写盘
+    assertEqual(Date.now() - t0 >= 1800, true, `应等到锁超时，实际 ${Date.now() - t0}ms`)
+    assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '锁忙时不得写墓碑文件')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), false, '锁忙时墓碑不命中')
+    fsmod.unlinkSync(fp + '.seen.lock')
+  })
+
+  await test('P4 墓碑锁残留过期：按 STALE 抢占恢复写入（CodeAnt Round3 Major）', () => {
+    const name = 'test_tomb_lock_stale.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const fsmod = require('node:fs')
+    // 模拟崩溃残留锁：mtime 改到 20s 前 → 超过 STALE(10s) 可抢占
+    fsmod.writeFileSync(fp + '.seen.lock', '', { flag: 'wx' })
+    const past = new Date(Date.now() - 20000)
+    fsmod.utimesSync(fp + '.seen.lock', past, past)
+    MessageStore._tombstoneDropped(fp, [{ id: 1 }])
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), true, '过期残留锁抢占后应正常写入墓碑')
+    assertEqual(fsmod.existsSync(fp + '.seen.lock'), false, '抢占后锁文件应被清理')
+  })
+
+  await test('P4 墓碑锁被抢占（token 被换）：放弃写盘不覆盖他人身份，释放不删他人锁（CodeAnt Round5 Major）', () => {
+    const name = 'test_tomb_lock_stolen.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const fsmod = require('node:fs')
+    const lockPath = fp + '.seen.lock'
+    // 进程 A 正常拿锁，锁文件写入 owner token
+    const token = MessageStore._acquireTombstoneLock(lockPath, Date.now() + 1000)
+    assertEqual(typeof token === 'string' && token.length > 0, true, '拿锁应返回 owner token')
+    // 另一进程误判 stale 抢占：删除 A 的锁并创建自己的锁（token 被替换），且已落盘自己的身份
+    fsmod.writeFileSync(lockPath, 'other-process-token', { flag: 'w' })
+    MessageStore._saveTombstones(fp, { id: new Map([['other', true]]), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() })
+    // A 继续写盘：写前 token 校验失败 → 静默放弃，不得覆盖 B 已写入的身份
+    MessageStore._recordTombstoneDrops(fp, [{ id: 1 }], lockPath, token)
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 'other' }), true, '抢占者身份应保留')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), false, '被抢占进程身份不得写入')
+    // A 释放：token 不匹配，不得删除抢占者的锁
+    MessageStore._releaseTombstoneLock(lockPath, token)
+    assertEqual(fsmod.existsSync(lockPath), true, '不得删除他人锁')
+    // 旧格式空锁文件（无 token）：释放同样不得删除（内容不匹配视为非本人）
+    fsmod.unlinkSync(lockPath)
+    fsmod.writeFileSync(lockPath, '', { flag: 'wx' })
+    MessageStore._releaseTombstoneLock(lockPath, token)
+    assertEqual(fsmod.existsSync(lockPath), true, '空锁非本人持有，释放不得删除')
+    fsmod.unlinkSync(lockPath)
+  })
+
+  await test('P4 墓碑读改写中途锁被抢占：临时副本不提交，内存不污染（CodeAnt Round6 Major）', () => {
+    const name = 'test_tomb_lock_mid_stolen.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const fsmod = require('node:fs')
+    const lockPath = fp + '.seen.lock'
+    const token = MessageStore._acquireTombstoneLock(lockPath, Date.now() + 1000)
+    // 在第二次 owner 校验（写盘瞬间）前替换锁内容，模拟读改写期间被抢占
+    const origOwner = MessageStore._isTombstoneLockOwner.bind(MessageStore)
+    let calls = 0
+    MessageStore._isTombstoneLockOwner = (p, t) => {
+      calls++
+      if (calls === 2) fsmod.writeFileSync(p, 'other-token', { flag: 'w' })
+      return origOwner(p, t)
+    }
+    try {
+      MessageStore._recordTombstoneDrops(fp, [{ id: 1 }], lockPath, token)
+    } finally {
+      MessageStore._isTombstoneLockOwner = origOwner
+    }
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), false, '中途被抢占：内存墓碑不得命中')
+    assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '中途被抢占：不得写盘')
+    fsmod.unlinkSync(lockPath)
+  })
+
+  await test('P4 墓碑写盘失败：临时副本不提交，内存不污染（CodeAnt Round6 Major）', () => {
+    const name = 'test_tomb_save_fail.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const fsmod = require('node:fs')
+    const lockPath = fp + '.seen.lock'
+    const token = MessageStore._acquireTombstoneLock(lockPath, Date.now() + 1000)
+    const origSave = MessageStore._saveTombstones
+    MessageStore._saveTombstones = () => false
+    try {
+      MessageStore._recordTombstoneDrops(fp, [{ id: 1 }], lockPath, token)
+    } finally {
+      MessageStore._saveTombstones = origSave
+    }
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), false, '写盘失败：内存墓碑不得命中')
+    assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '写盘失败：不得产生墓碑文件')
+    MessageStore._releaseTombstoneLock(lockPath, token)
   })
 
   await test('更新已存在消息 → 内容更新', () => {
@@ -4271,6 +4612,13 @@ console.log('========================================\n');
     assertEqual(normUrl('/foo/'), 'foo') // 首尾斜杠都去除
     assertEqual(normUrl('/foo'), 'foo')
     assertEqual(normUrl(' foo '), 'foo')
+    // S8786 线性化回归（CodeAnt 建议）：畸形输入与旧正则语义等价
+    assertEqual(normUrl('https://'), 'https:', '协议尾斜杠被剥（与旧行为一致）')
+    assertEqual(normUrl('https:///path'), 'https:///path', '空 host 原样保留')
+    assertEqual(normUrl('https://host'), 'https://host', 'host 小写化')
+    assertEqual(normUrl('https://HOST/path'), 'https://host/path', 'host 小写化+路径保留')
+    assertEqual(normUrl('  / '), '', '纯斜杠空白归空')
+    assertEqual(normUrl('/\t/  /x/ '), 'x', '交替空白/斜杠线性剥离')
     // 清理可能残留的旧缓存文件
     try { require('fs').unlinkSync(getFilePath('test_urlnorm.json')) } catch (e) {}
     // 同一 url 不同形态（尾斜杠）→ 应判重为 1 条
@@ -4281,6 +4629,35 @@ console.log('========================================\n');
     saveBatch([{ url: '/other.html' }], 'test_urlnorm2.json')
     saveBatch([{ url: '/dup2.html' }], 'test_urlnorm2.json')
     assertEqual(readMessages(getFilePath('test_urlnorm2.json')).length, 2, '不同url应2条')
+  })
+
+  await test('mdLinksToPlain 畸形输入线性等价（CodeAnt 建议回归）', () => {
+    const f = slim.mdLinksToPlain
+    assertEqual(f('[abc'), '[abc', '未闭合 [ 原样保留')
+    assertEqual(f('[abc]()'), '[abc]()', '空 url 原样保留')
+    assertEqual(f('[abc](url'), '[abc](url', '未闭合 ) 原样保留')
+    assertEqual(f('[a[b](url)'), 'a[b (url)', '嵌套 [ 在首个 ] 闭合（与原正则一致）')
+    assertEqual(f('x[text](https://a) y'), 'xtext (https://a) y', '常规链接正常转换')
+    assertEqual(f('[https://a](https://a)'), 'https://a', '原文链接只显示一次')
+    assertEqual(f('[a](url)[b](url2)'), 'a (url)b (url2)', '多链接连续转换')
+  })
+
+  await test('looksHtml/stripAngleTags 畸形输入线性等价（CodeAnt 建议回归）', () => {
+    // looksHtml：大量 "<tag" 且无 ">" 的对抗输入不得回溯卡死（线性扫描）
+    const long = '<script'.repeat(20000)
+    const t0 = Date.now()
+    assertEqual(slim.looksHtml(long), false, '无 > 不应判 HTML')
+    assertEqual(Date.now() - t0 < 1000, true, `对抗输入应 <1s，实际 ${Date.now() - t0}ms`)
+    assertEqual(slim.looksHtml('<b>hi</b>'), true, '正常 HTML 判定')
+    assertEqual(slim.looksHtml('https://a.com/<b>x</b>'), true, '含 HTML 判定')
+    assertEqual(slim.looksHtml('看看 <https://autolink>'), false, 'autolink 不算 HTML')
+    assertEqual(slim.looksHtml('<br/>x'), true, '自闭合标签算 HTML')
+    // stripAngleTags：无 > 的输入原样保留，autolink 保留内容，HTML 标签剥空
+    assertEqual(slim.stripAngleTags('<url>https://a</url>', true), 'https://a', 'autolink 保留内容')
+    assertEqual(slim.stripAngleTags('<b>加粗</b>', true), '加粗', 'HTML 标签剥空')
+    assertEqual(slim.stripAngleTags('a<b', true), 'a<b', '无 > 原样保留')
+    assertEqual(slim.stripAngleTags('<b', true), '<b', '无 > 原样保留')
+    assertEqual(slim.stripAngleTags('<b>x</b>', false), '<b>x</b>', 'stripAngle=false 整体保留')
   })
 
   // ==================== 71. 通读复查修复 ====================
@@ -7600,6 +7977,29 @@ console.log('========================================\n');
     assertEqual(sanitizeDecodedHtml('<svg><script>x</script></svg>'), '')
   })
 
+  await test('sanitizeDecodedHtml 错配闭合标签不吞有效内容（CodeAnt L630）', () => {
+    // 开/闭标签独立交替曾让 <script>content</iframe> 整段删除；改为同标签名配对后，
+    // 错配闭合只移除标签本体，中间内容保留
+    assertEqual(sanitizeDecodedHtml('<script>content</iframe>'), 'content', '错配闭合不应删除有效内容')
+    assertEqual(sanitizeDecodedHtml('<style>css</script>css'), 'csscss', 'style 错配 script 闭合应保留内容')
+    assertEqual(sanitizeDecodedHtml('<script>a</iframe>b</script>c'), 'c', '正常配对仍整段移除')
+    assertEqual(sanitizeDecodedHtml('<script><style>x</style>y</script>z'), 'z', '嵌套不同主动标签正常移除')
+  })
+
+  await test('sanitizeDecodedHtml 交叉嵌套标签不吞有效内容（CodeAnt 建议回归）', () => {
+    // 逐标签成对移除不是完整 HTML 栈解析：交叉闭合按循环顺序处理，
+    // 锁定行为——不允许跨标签名配对把中间有效内容整段删除。
+    // <script>a<style>b</script>c</style>d：script 对移除 a<style>b，剩余 c</style>d → 孤立 style 闭合被兜底剥掉
+    assertEqual(sanitizeDecodedHtml('<script>a<style>b</script>c</style>d'), 'cd', 'script 配对移除后 style 孤立闭合只剥标签本体')
+    // <script>a</iframe>b：无 script 闭合 → 未闭合规则只剥 <script> 本体，孤立 </iframe> 由闭合规则剥掉
+    assertEqual(sanitizeDecodedHtml('<script>a</iframe>b'), 'ab', '未闭合 script/孤立闭合只剥标签本体，内容保留')
+    // <iframe>a</script>b</iframe>c：iframe 成对移除 a</script>b，剩 c
+    assertEqual(sanitizeDecodedHtml('<iframe>a</script>b</iframe>c'), 'c', 'iframe 配对移除整段')
+    // 交叉嵌套中的有效文本不得被跨标签名配对吞掉
+    assertEqual(sanitizeDecodedHtml('<style>a<script>b</style>c</script>d'), 'ad', 'script 配对移除后 style 未闭合只剥标签本体')
+    assertEqual(sanitizeDecodedHtml('x<script>a<style>b</style>c</script>y'), 'xy', '嵌套不同标签正常移除，外圈文本保留')
+  })
+
   await test('sanitizeDecodedHtml iframe srcdoc XSS 移除（codex review 发现 P1）', () => {
     // codex review 5a0c785 发现：未闭合主动标签正则 [^<>]* 遇引号值内 <img 停住，
     // iframe srcdoc="<img onerror>" 原样通过（srcdoc 内文档可执行）。修复：引号值整体匹配。
@@ -7799,16 +8199,7 @@ console.log('========================================\n');
   console.log('========================================\n')
 
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
-  try {
-    const fs = require('node:fs')
-    const path = require('path')
-    const dir = path.join(__dirname, 'xianbaoku_cache')
-    if (fs.existsSync(dir)) {
-      for (const f of fs.readdirSync(dir)) {
-        if (/^test_/.test(f)) { try { fs.unlinkSync(path.join(dir, f)) } catch (e) { /* 忽略 */ } }
-      }
-    }
-  } catch (e) { /* 忽略 */ }
+  cleanupTestCache()
 
   // v3.236：缓存文件缺失且恢复写入抛错（磁盘满/权限）时，readMessages 降级返回内存快照，不向外抛
   await test('readMessages 文件缺失且恢复写入抛错时降级返回内存快照（v3.236）', () => {

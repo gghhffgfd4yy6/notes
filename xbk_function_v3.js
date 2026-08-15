@@ -7,6 +7,8 @@
 
 'use strict'
 
+const crypto = require('node:crypto') // SonarCloud S7772：优先 node: 前缀内置模块
+
 // ============================================================
 // ⏱️ 启动性能诊断（仅 XBK_PROFILE=3 收集，不改变默认行为）
 // ============================================================
@@ -105,7 +107,7 @@ const Config = {
   api: {
     // v3.94：domain 尾斜杠防御——`https://x.com/` + 路径曾拼成 `//plus/...` 双斜杠 404
     // R2：domain 非字符串（数字/对象脏配置）→ 空串（避免 getter 内 .replace 崩溃）
-    get pushUrl () { return `${(typeof Config.domain === 'string' ? Config.domain.trim().replace(/\/+$/, '') : '')}/plus/json/push.json` }, // v3.158: domain trim
+    get pushUrl () { return `${(typeof Config.domain === 'string' ? trimTrailingSlashes(Config.domain.trim()) : '')}/plus/json/push.json` }, // v3.158: domain trim
     timeout: 5000,
     retry: 2
   },
@@ -205,6 +207,13 @@ const STATE_TEXT_MAX_BYTES = 64 * 1024
 // 消息缓存文件体积上限：缓存默认上限 10000 条，正常体积为 MB 级；此上限作为硬兜底，
 // 阻止异常膨胀的缓存文件被整读入内存（readSafeTextResult 的 maxBytes 兜底）。
 const MESSAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+// 判重身份墓碑：缓存裁剪丢弃的记录身份独立保留（见 MessageStore._tombstone*），
+// 上限按每类键数约束，防止墓碑文件随裁剪无限膨胀。
+const TOMBSTONE_MAX_KEYS = 5000 // 每类墓碑键上限（id/urlOnly/idWithUrl/anon 各 5000）
+const TOMBSTONE_MAX_BYTES = 8 * 1024 * 1024 // 墓碑文件读取/写入体积上限
+const TOMBSTONE_LOCK_TIMEOUT_MS = 2000 // 墓碑跨进程锁等待上限（重叠 cron/多 worker 串行化读-改-写）
+const TOMBSTONE_LOCK_STALE_MS = 10000 // 锁文件超过该年龄视为崩溃残留，可抢占
+const TOMBSTONE_LOCK_RETRY_MS = 25 // 拿锁失败重试间隔
 
 // ---------- HTML 实体映射（避免每次调用重建） ----------
 const ENTITY_MAP = {
@@ -249,6 +258,13 @@ const ENTITY_MAP = {
 }
 // v3.239：实体名先转义正则元字符（. * + ? ( ) [ ] { } | \ $ ^ 等）——实体名含元字符时曾产出错误/失效正则
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+// 去尾部斜杠：线性扫描替代 /\/+$/（S8786 对 X+$ 型正则标记超线性回溯；配置值虽可信，
+// 但改成等价线性实现可消除告警且无语义差异）
+function trimTrailingSlashes (s) {
+  let i = s.length
+  while (i > 0 && s.codePointAt(i - 1) === 47) i-- // 47 = '/'
+  return i === s.length ? s : s.slice(0, i)
+}
 const ENTITY_RE = new RegExp('&(?:' + Object.keys(ENTITY_MAP).map(k => escapeRe(k.slice(1, -1))).join('|') + ');', 'g') // 从 ENTITY_MAP 自动生成，加实体只改一处
 const DEC_RE = /&#(\d+);/g
 const HEX_RE = /&#[xX]([0-9a-fA-F]+);/g
@@ -441,10 +457,26 @@ const Utils = {
     s = s.split(/[?#]/)[0]
     // 单次遍历去首尾【斜杠|空白】（原多轮 do-while 对交替空格/斜杠长串是 O(n²)，
     // 脏数据 10 万字符实测 ~12-18s 拖垮判重；语义等价：只剥首尾 \s/ 直到稳定）
-    s = s.replace(/^[\s/]+|[\s/]+$/g, '')
+    // S8786：^[\s/]+|[\s/]+$ 交替被 Sonar 标记超线性回溯（X+$ 失败路径仍逐位回溯）；
+    // 改为线性扫描：单次遍历确定首尾边界，/\s/ 单字符判定与正则 \s 集合完全一致
+    {
+      const isTrimChar = (ch) => ch === '/' || /\s/.test(ch)
+      let lo = 0
+      let hi = s.length
+      while (lo < hi && isTrimChar(s[lo])) lo++
+      while (hi > lo && isTrimChar(s[hi - 1])) hi--
+      if (lo !== 0 || hi !== s.length) s = s.slice(lo, hi)
+    }
     // 含协议时协议+主机名转小写（路径大小写敏感保留）
-    const m = s.match(/^([a-z][a-z0-9+.-]*:\/\/)([^/]+)(.*)$/i)
-    if (m) s = m[1].toLowerCase() + m[2].toLowerCase() + m[3]
+    // S8786：([^/]+)(.*)$ 双量词在失败路径呈 O(n²) 回溯；改为先匹配协议前缀、再线性切主机，
+    // 语义与原正则一致（host 至少 1 字符才成立，否则原样保留）
+    const m = /^[a-z][a-z0-9+.-]*:\/\//i.exec(s)
+    if (m) {
+      const rest = s.slice(m[0].length)
+      const slash = rest.indexOf('/')
+      const host = slash === -1 ? rest : rest.slice(0, slash)
+      if (host !== '') s = m[0].toLowerCase() + host.toLowerCase() + (slash === -1 ? '' : rest.slice(slash))
+    }
     return s
   },
 
@@ -626,8 +658,21 @@ const Utils = {
    *  与浏览器解析一致；闭合后残留的标签由未闭合移除与事件属性清洗链兜底）。
    *  性能：入口 100k 截断使最坏回溯有界（10 万字符实测 ~270ms）。 */
   _removeActiveTags (html) {
-    return html
-      .replace(safeRe('<(?:script|style|iframe|object|svg|math)\\b[\\s\\S]*?<\\/(?:script|style|iframe|object|svg|math)\\s*>', 'gi'), '')
+    // P4（CodeAnt）：开/闭标签用独立交替会跨标签名配对——`<script>content</iframe>` 会把
+    // 中间有效内容整段删除。改为逐标签名成对移除（`<tag>...</tag>`），错配的闭合标签交给
+    // 下方未闭合/孤立闭合规则兜底。不用反向引用 `<\1`：RE2 不支持，且 `[\s\S]*?<\/\1`
+    // 无法做字面量快速搜索，畸形输入（大量无闭合 `<script`）会退化为 O(n²) 回溯。
+    let out = html
+    // 外层守卫：无任何主动标签时整轮跳过（热路径常见纯文本/无主动标签内容，省 6 次正则）
+    if (safeRe(String.raw`<(?:script|style|iframe|object|svg|math)\b`, 'i').test(out)) {
+      for (const tag of ['script', 'style', 'iframe', 'object', 'svg', 'math']) {
+        // 逐标签快速预检：无该标签时跳过整轮 replace
+        if (safeRe(String.raw`<${tag}\b`, 'i').test(out)) {
+          out = out.replace(safeRe(String.raw`<${tag}\b[\s\S]*?<\/${tag}\s*>`, 'gi'), '')
+        }
+      }
+    }
+    return out
       .replace(safeRe('<(?:script|style|iframe|object|embed|svg|math)\\b(?:[^<>]|"[^"]*"|\'[^\']*\')*>', 'gi'), '')
       .replace(safeRe('<\\/(?:script|style|iframe|object|svg|math)\\s*>', 'gi'), '')
       .replace(safeRe('<(?:base|link|meta)\\b[^<>]*>', 'gi'), '')
@@ -2344,6 +2389,11 @@ const MessageStore = {
   // 避免对同一文件反复线性扫描；权威数组每次变更都是新对象引用（_memoSet 全量替换），
   // 数组被 GC 回收时索引随之自动释放，无需手动失效。
   _identityIndex: new WeakMap(),
+  // 判重身份墓碑（按缓存文件路径）：字节/条数裁剪丢弃记录的紧凑身份键（Map 保插入序，
+  // 超 TOMBSTONE_MAX_KEYS 丢最旧）。主判重闸门与 has/save/saveBatch 统一并入查询，
+  // 防上游重放被裁记录时重复推送；过滤未推（_f）记录不落墓碑，规则改宽后仍可重新评估。
+  _tombstones: new Map(),
+  _tombstoneLoaded: new Set(),
   // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
   _MEMO_MAX: 100,
   // 磁盘读取失败标记（按缓存文件路径记录）：ioError/unsafe 读取失败时置位，
@@ -2439,6 +2489,8 @@ const MessageStore = {
       console.log(`更新缓存记录: ${filename}`)
       messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: this._now() }
     } else {
+      // P4（CodeAnt）：身份已在墓碑（曾被裁剪且已推送过）→ 视为已判重，不重复收录/推送
+      if (this._tombstoneHasIdentity(this.getFilePath(filename), message)) return false
       messages.push({ ...Utils.safeObjectCopy(message), timestamp: this._now() })
     }
     return true
@@ -2661,9 +2713,14 @@ const MessageStore = {
     // v3.176：Utils.num 口径——'5000'(环境变量字符串) 曾 Number.isInteger 判否 → 静默回退 10000
     // （validateConfig 按 v3.175 口径判合法不警告 → 层间不一致，用户以为 5000 生效实际 10000）
     const maxSize = (() => { const v = Utils.num(Config.cache.maxSize, -1); return Number.isInteger(v) && v > 0 ? v : DEFAULT_MAX_SIZE })()
+    // P4（CodeAnt Round2）：被裁剪记录先收集、缓存原子写盘成功后才统一落墓碑——
+    // 写盘失败（序列化/单条超限/rename 失败）时记录并未真正从磁盘缓存移除，
+    // 提前落墓碑会把仍在缓存中的身份误判为已判重（消息被永久跳过）。
+    const droppedAll = []
     if (toSave.length > maxSize) {
       console.warn(`缓存超出上限(${maxSize})，裁剪掉最早 ${toSave.length - maxSize} 条`)
-      toSave.splice(0, toSave.length - maxSize)
+      const dropped = toSave.splice(0, toSave.length - maxSize)
+      droppedAll.push(...dropped)
     }
     let text
     // 序列化防御：循环引用等无法 JSON.stringify 时容错（内存缓存保留，不落盘不崩溃）
@@ -2675,15 +2732,18 @@ const MessageStore = {
       text = null
     }
     if (text === null) {
+      // 序列化失败：记录未被持久化，不落墓碑（墓碑只收录「已成功裁剪并落盘」的记录，
+      // 异常路径上记录未真正丢弃，重放时缓存自身仍会判重/重新评估）
       restoreMemo()
       return false
     }
     // P1（审查 2026-08-15）：写端字节上限与读端 MESSAGE_CACHE_MAX_BYTES 对齐——此前仅按条数
     // （maxSize）裁剪，单条 >6.7KB（base64 图/长 HTML 常见）时 10000 条即可超 64MB，读端判
     // tooLarge → 置 _readFailed → 写端被 _readFailed 拒绝覆写 → 永久自锁直至人工删文件。
-    text = this._trimCacheByBytes(text, toSave, filePath)
+    text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll)
     if (text === null) {
       // 单条即超读端上限，无法裁剪出可读文件：跳过落盘，保留磁盘原状（避免写出超限文件触发自锁）
+      // 同样不落墓碑——未发生实际裁剪，旧身份仍在磁盘缓存中，无需墓碑兜底
       restoreMemo()
       return false
     }
@@ -2697,15 +2757,20 @@ const MessageStore = {
     // v3.x：磁盘刚被直写，外部删除可能在后续发生；清除“已验证”标记，
     // 使下次 readMessages 内存命中重新做一次 existsSync+恢复检查（保持外部删除恢复测试语义）。
     try { this._verified.delete(filePath) } catch (e) { /* 忽略 */ }
+    // 缓存写盘成功：被裁剪记录才真正退出磁盘缓存，此时落墓碑防重放（防重复推送）
+    if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll)
     return true
   },
 
   /** 写端字节上限裁剪：二分查找「最新 k 条序列化后不超读端上限」的最大 k（O(log n) 次序列化），
-   *  至少保留最新 1 条；不超限原样返回；连最新单条都超限时返回 null（调用方跳过落盘）。 */
-  _trimCacheByBytes (text, toSave, filePath) {
-    if (Buffer.byteLength(text, 'utf8') <= MESSAGE_CACHE_MAX_BYTES) return text
+   *  至少保留最新 1 条；不超限原样返回；连最新单条都超限时返回 null（调用方跳过落盘）。
+   *  maxBytes 仅供测试缩限（生产恒为 MESSAGE_CACHE_MAX_BYTES）。
+   *  本方法不写墓碑：被裁剪记录追加到 droppedOut（与条数裁剪统一），
+   *  由 saveMessages 在缓存原子写盘成功后一并落墓碑（CodeAnt Round2 时序修复）。 */
+  _trimCacheByBytes (text, toSave, filePath, maxBytes = MESSAGE_CACHE_MAX_BYTES, droppedOut = null) {
+    if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
     if (toSave.length <= 1) {
-      console.warn(`缓存单条消息即超过读端上限(${MESSAGE_CACHE_MAX_BYTES} 字节)，无法裁剪：${filePath}`)
+      console.warn(`缓存单条消息即超过读端上限(${maxBytes} 字节)，无法裁剪：${filePath}`)
       return null
     }
     let lo = 1
@@ -2713,18 +2778,279 @@ const MessageStore = {
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1
       const kept = toSave.slice(-mid)
-      if (Buffer.byteLength(JSON.stringify(kept), 'utf8') <= MESSAGE_CACHE_MAX_BYTES) lo = mid
+      if (Buffer.byteLength(JSON.stringify(kept), 'utf8') <= maxBytes) lo = mid
       else hi = mid - 1
     }
     // 二分收敛到 lo=1 时校验最新单条本身：仍超限则无法裁剪，与单条路径同口径跳过落盘（防自锁）
-    if (lo === 1 && Buffer.byteLength(JSON.stringify(toSave.slice(-1)), 'utf8') > MESSAGE_CACHE_MAX_BYTES) {
-      console.warn(`缓存单条消息即超过读端上限(${MESSAGE_CACHE_MAX_BYTES} 字节)，无法裁剪：${filePath}`)
+    if (lo === 1 && Buffer.byteLength(JSON.stringify(toSave.slice(-1)), 'utf8') > maxBytes) {
+      console.warn(`缓存单条消息即超过读端上限(${maxBytes} 字节)，无法裁剪：${filePath}`)
+      // 未实际裁剪任何记录：不产生丢弃（与单条超限路径同口径，见 saveMessages）
       return null
     }
     const dropped = toSave.length - lo
-    console.warn(`缓存字节超上限(${MESSAGE_CACHE_MAX_BYTES} 字节)，裁剪掉最早 ${dropped} 条（防读端 tooLarge 自锁）`)
-    toSave.splice(0, dropped)
+    console.warn(`缓存字节超上限(${maxBytes} 字节)，裁剪掉最早 ${dropped} 条（防读端 tooLarge 自锁）`)
+    const droppedMsgs = toSave.splice(0, dropped)
+    if (droppedOut) droppedOut.push(...droppedMsgs)
     return JSON.stringify(toSave)
+  },
+
+  /** 读取/初始化某缓存文件的墓碑身份集；缺失/损坏按空集处理，不阻断主流程。
+   *  有意设计：损坏文件只在本进程内按空集使用（_tombstoneLoaded 防重复读盘），
+   *  进程重启后会重新读取外部修复/替换的文件，不永久丢弃。 */
+  _loadTombstones (filePath) {
+    if (this._tombstoneLoaded.has(filePath)) return this._tombstones.get(filePath)
+    this._tombstoneLoaded.add(filePath)
+    const ts = { id: new Map(), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() }
+    this._tombstones.set(filePath, ts)
+    const data = this._readTombstoneData(filePath)
+    if (!data) return ts
+    const fill = (map, arr) => { if (Array.isArray(arr)) for (const k of arr) if (typeof k === 'string' && k !== '') map.set(k, true) }
+    fill(ts.id, data.id)
+    fill(ts.urlOnly, data.urlOnly)
+    fill(ts.idWithUrl, data.idWithUrl)
+    fill(ts.anon, data.anon)
+    return ts
+  },
+
+  /** 读墓碑文件并解析；缺失/损坏/非对象统一返回 null（调用方按空集处理）。
+   *  损坏仅警告一次（每进程每文件首次加载），不抛异常不阻断主流程。 */
+  _readTombstoneData (filePath) {
+    try {
+      const result = readSafeTextResult(filePath + '.seen.json', TOMBSTONE_MAX_BYTES)
+      if (result.status !== 'ok' || !result.text) return null
+      const data = JSON.parse(result.text)
+      if (!data || typeof data !== 'object') return null
+      return data
+    } catch (e) {
+      console.warn(`墓碑读取异常，按空集处理 ${filePath}.seen.json:`, e?.message)
+      return null
+    }
+  },
+
+  /** 持久化墓碑文件（原子写）。超 TOMBSTONE_MAX_BYTES 时按各 Map 最旧键继续淘汰到
+   *  体积达标，不直接放弃（避免重启后丢全部新墓碑）。写失败仅影响旧身份防重放，不阻断主流程。
+   *  maxBytes 仅供测试缩限。 */
+  _saveTombstones (filePath, ts, maxBytes = TOMBSTONE_MAX_BYTES) {
+    try {
+      const text = this._evictTombstonesToSize(ts, maxBytes)
+      if (text === null) {
+        console.warn(`墓碑文件超限且无法通过淘汰达标，放弃持久化 ${filePath}.seen.json`)
+        return false
+      }
+      return writeAtomic(filePath + '.seen.json', text, '墓碑')
+    } catch (e) {
+      console.error(`墓碑持久化失败 ${filePath}.seen.json:`, e?.message)
+      return false
+    }
+  },
+
+  /** 序列化墓碑四集合；超 maxBytes 时按各 Map 最旧键淘汰到达标，返回最终文本；
+   *  无法达标（淘汰到空仍超限）返回 null（调用方放弃持久化）。 */
+  _evictTombstonesToSize (ts, maxBytes) {
+    const maps = [ts.id, ts.urlOnly, ts.idWithUrl, ts.anon]
+    const serialize = () => JSON.stringify({ v: 1, id: [...ts.id.keys()], urlOnly: [...ts.urlOnly.keys()], idWithUrl: [...ts.idWithUrl.keys()], anon: [...ts.anon.keys()] })
+    let text = serialize()
+    if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
+    // 超限：先按超限比例批量淘汰最旧键（体积≈线性于键数），再逐轮精修到达标。
+    // 四类轮流取各自最旧键，保证最旧身份先丢、最新身份保留。
+    const totalKeys = maps.reduce((n, m) => n + m.size, 0)
+    const toDrop = Math.ceil(((Buffer.byteLength(text, 'utf8') - maxBytes) / Buffer.byteLength(text, 'utf8')) * totalKeys)
+    this._evictOldestKeys(maps, toDrop, totalKeys)
+    text = serialize()
+    // 精修：比例估算偏差导致的少量超限，继续逐键淘汰直到达标（全空后必然达标）
+    while (Buffer.byteLength(text, 'utf8') > maxBytes) {
+      this._evictOldestKeys(maps, 1, 1)
+      text = serialize()
+    }
+    return text
+  },
+
+  /** 从四类墓碑 Map 各删一个最旧键，循环至删够 count 或全部清空 */
+  _evictOldestKeys (maps, count, guardMax) {
+    let guard = 0
+    while (count > 0 && guard <= guardMax) {
+      let evicted = false
+      for (const map of maps) {
+        if (count <= 0) break
+        if (map.size === 0) continue
+        map.delete(map.keys().next().value)
+        count--
+        evicted = true
+      }
+      if (!evicted) break
+      guard++
+    }
+  },
+
+  /** 跨进程墓碑锁：以 .seen.lock 独占创建实现互斥，重叠 cron/多 worker 并发写墓碑时
+   *  串行化「读-改-写」，避免原子替换互相覆盖丢身份（CodeAnt Major 竞态）。
+   *  锁残留超 TOMBSTONE_LOCK_STALE_MS 视为崩溃可抢占；等待超时返回 false（调用方放弃本次写入）。 */
+  _withTombstoneLock (filePath, fn) {
+    const lockPath = filePath + '.seen.lock'
+    const deadline = Date.now() + TOMBSTONE_LOCK_TIMEOUT_MS
+    const token = this._acquireTombstoneLock(lockPath, deadline)
+    if (token === null) return false
+    try {
+      return fn(lockPath, token)
+    } finally {
+      this._releaseTombstoneLock(lockPath, token)
+    }
+  },
+
+  /** 独占创建锁文件（wx），内容写入 owner token（PID:时间戳:随机串）——
+   *  CodeAnt Round5：仅凭 mtime 判 stale 会把仍在写盘的活跃锁误判为崩溃残留并抢占，
+   *  抢占者随后可能覆盖原进程已合并的身份；token 使释放与写盘前校验都能识别锁归属。
+   *  锁残留超 STALE 仍按 mtime 抢占（对空/旧格式锁文件同样兼容）；等待超时返回 null（调用方放弃）。 */
+  _acquireTombstoneLock (lockPath, deadline) {
+    const token = this._newTombstoneLockToken()
+    while (true) {
+      try {
+        fs.writeFileSync(lockPath, token, { flag: 'wx' })
+        return token
+      } catch (e) {
+        if (e.code !== 'EEXIST') {
+          console.error(`墓碑锁创建失败 ${lockPath}:`, e?.message)
+          return null
+        }
+        if (this._isStaleTombstoneLock(lockPath)) continue
+        if (Date.now() >= deadline) {
+          console.warn(`墓碑锁等待超时，放弃本次墓碑写入 ${lockPath}`)
+          return null
+        }
+        const end = Date.now() + TOMBSTONE_LOCK_RETRY_MS
+        while (Date.now() < end) { /* 忙等重试（同步路径，锁持有窗口为毫秒级） */ }
+      }
+    }
+  },
+
+  /** 生成锁 owner token：PID 便于排查归属，crypto 随机 UUID 防止同 PID 复用时误判本人
+   *  （worker 轮换/重启）；不用 Math.random（SonarCloud S2245 伪随机安全告警） */
+  _newTombstoneLockToken () {
+    return process.pid + ':' + crypto.randomUUID()
+  },
+
+  /** 释放墓碑锁：仅当锁内容仍是自己写入的 token 时才删除——被抢占/替换后不删他人锁。
+   *  ENOENT（已被抢占者删除）视为正常；其余错误忽略，崩溃残留由 STALE 抢占兜底。 */
+  _releaseTombstoneLock (lockPath, token) {
+    try {
+      if (fs.readFileSync(lockPath, 'utf8') === token) fs.unlinkSync(lockPath)
+    } catch (e) {
+      if (e && e.code !== 'ENOENT') { /* 其余错误同样忽略，锁清理非关键 */ }
+    }
+  },
+
+  /** 写盘前校验锁仍归当前进程持有：被误判 stale 抢占/替换后返回 false，调用方静默放弃本次写入 */
+  _isTombstoneLockOwner (lockPath, token) {
+    try {
+      return fs.readFileSync(lockPath, 'utf8') === token
+    } catch {
+      return false
+    }
+  },
+
+  /** 锁文件超过 STALE 阈值视为崩溃残留：尝试删除并返回 true；stat 失败（刚被删）返回 false 继续重试 */
+  _isStaleTombstoneLock (lockPath) {
+    try {
+      const st = fs.statSync(lockPath)
+      if (Date.now() - st.mtimeMs <= TOMBSTONE_LOCK_STALE_MS) return false
+    } catch {
+      return false // stat 失败（锁刚被删）：视为未过期，继续重试
+    }
+    try { fs.unlinkSync(lockPath) } catch { return true }
+    return true
+  },
+
+  /** 记录被裁剪消息的身份到墓碑；过滤未推（_f）记录不记录——它们从未推送，
+   *  规则变更失效后须能重新评估/推送。与 _buildIdentityIndex 四集合同构：
+   *  id 记录记 idKey（+url 入 idWithUrl）、url 记录记 urlOnly、anon 记 anonKey。
+   *  写前强制重读磁盘合并其他进程已写入的身份（配合跨进程锁，消除覆盖竞态）。 */
+  _tombstoneDropped (filePath, dropped) {
+    // 拿锁成功：串行读-改-写；拿锁失败（IO 错误/等待超时）：放弃本次墓碑写入——
+    // 无锁读-改-写仍可能覆盖并发进程已写入的身份（CodeAnt Round3 Major），
+    // 放弃的代价仅是本次裁剪身份在重放时可能重复推送（与墓碑机制引入前行为一致）。
+    this._withTombstoneLock(filePath, (lockPath, token) => this._recordTombstoneDrops(filePath, dropped, lockPath, token))
+  },
+
+  /** 写路径绕过 _tombstoneLoaded 缓存：重读磁盘并与本次新增合并后原子写回，
+   *  避免「各自加载快照→后写覆盖先写」丢失其他进程已收录的身份。
+   *  在临时副本上完成合并/淘汰，仅当 owner 校验通过且 .seen.json 原子写成功后才
+   *  提交到内存缓存——锁被抢占或写盘失败时当前内存状态保持与磁盘一致（CodeAnt Round6）。
+   *  过滤未推（_f）记录不记录——它们从未推送，规则变更失效后须能重新评估/推送。 */
+  _recordTombstoneDrops (filePath, dropped, lockPath, token) {
+    // 写盘前（进入读-改-写前）先确认锁仍归当前进程：被抢占/替换后立即放弃，
+    // 不重读不合并不修改内存墓碑（CodeAnt Round5 Major：避免覆盖抢占者已写入的身份）
+    if (!this._isTombstoneLockOwner(lockPath, token)) return
+    this._tombstoneLoaded.delete(filePath)
+    const next = this._cloneTombstones(this._loadTombstones(filePath))
+    let changed = false
+    for (const m of dropped) {
+      if (!m || typeof m !== 'object' || m._f === true) continue
+      changed = this._applyTombstoneIdentity(next, Utils.getMessageIdentity(m)) || changed
+    }
+    if (!changed) return
+    this._trimTombstoneMaps(next)
+    // 写盘瞬间再次确认锁仍归当前进程：读-改-写期间若被误判 stale 抢占/替换，
+    // 静默放弃本次写入，避免基于旧快照的原子替换覆盖抢占者已合并的身份
+    if (!this._isTombstoneLockOwner(lockPath, token)) return
+    if (!this._saveTombstones(filePath, next)) return
+    // 原子写成功后才提交内存缓存，避免「内存命中、磁盘未落盘」不一致
+    this._tombstones.set(filePath, next)
+    this._tombstoneLoaded.add(filePath)
+  },
+
+  /** 复制墓碑四集合：读改写全程在副本上进行，写盘失败/锁失效时当前缓存不被污染 */
+  _cloneTombstones (ts) {
+    return {
+      id: new Map(ts.id),
+      urlOnly: new Map(ts.urlOnly),
+      idWithUrl: new Map(ts.idWithUrl),
+      anon: new Map(ts.anon)
+    }
+  },
+
+  /** 把单条消息身份写入墓碑对应集合；返回是否新增（_f 由调用方过滤） */
+  _applyTombstoneIdentity (ts, ident) {
+    if (!ident.valid) return false
+    if (ident.kind === 'id') {
+      let changed = false
+      if (!ts.id.has(ident.idKey)) { ts.id.set(ident.idKey, true); changed = true }
+      if (ident.url && !ts.idWithUrl.has(ident.url)) { ts.idWithUrl.set(ident.url, true); changed = true }
+      return changed
+    }
+    if (ident.url) {
+      if (!ts.urlOnly.has(ident.url)) { ts.urlOnly.set(ident.url, true); return true }
+      return false
+    }
+    if (!ts.anon.has(ident.key)) { ts.anon.set(ident.key, true); return true }
+    return false
+  },
+
+  /** 四类墓碑 Map 超 TOMBSTONE_MAX_KEYS 时丢最旧键 */
+  _trimTombstoneMaps (ts) {
+    for (const map of [ts.id, ts.urlOnly, ts.idWithUrl, ts.anon]) {
+      while (map.size > TOMBSTONE_MAX_KEYS) {
+        const oldest = map.keys().next().value
+        if (oldest === undefined) break
+        map.delete(oldest)
+      }
+    }
+  },
+
+  /** 墓碑身份命中查询（预计算身份版）：与 _indexHasIdentity 的匹配关系同构——
+   *  id 查询命中 id 墓碑同 idKey，或纯 url 墓碑同 url；
+   *  url 查询命中纯 url 墓碑同 url，或带 url 的 id 墓碑同 url；anon 按匿名合成键。 */
+  _tombstoneSetsHas (filePath, b) {
+    const ts = this._loadTombstones(filePath)
+    if (b.kind === 'id') return ts.id.has(b.idKey) || (!!b.url && ts.urlOnly.has(b.url))
+    if (b.kind === 'url') return (!!b.url && ts.urlOnly.has(b.url)) || (!!b.url && ts.idWithUrl.has(b.url))
+    return ts.anon.has(b.key)
+  },
+
+  /** 墓碑身份命中查询：与 _indexHasIdentity 的匹配关系同构（统一入口，供 has/save/saveBatch/App 闸门复用） */
+  _tombstoneHasIdentity (filePath, message) {
+    const b = Utils.getMessageIdentity(message)
+    if (!b.valid) return false
+    return this._tombstoneSetsHas(filePath, b)
   },
 
   /** 预计算某缓存文件的身份索引：与 sameMessageIdentity 的匹配关系同构（见 has），
@@ -2769,14 +3095,17 @@ const MessageStore = {
     // 与 save 一致：先做条目有效性校验，无效 message（null/原始值/数组）直接判不存在，
     // 不依赖 getMessageIdentity 的隐式容错。
     if (!Utils.isValidItem(message)) return false
-    const messages = this.readMessages(this.getFilePath(filename))
+    const filePath = this.getFilePath(filename)
+    const messages = this.readMessages(filePath)
     // 预计算身份索引按数组引用缓存：同文件重复 has 直接 O(1) 命中，不再对整数组线性扫描。
     let idx = this._identityIndex.get(messages)
     if (!idx) {
       idx = this._buildIdentityIndex(messages)
       this._identityIndex.set(messages, idx)
     }
-    return this._indexHasIdentity(idx, message)
+    if (this._indexHasIdentity(idx, message)) return true
+    // P4（CodeAnt）：消息数组未命中时查墓碑——被裁剪记录的判重身份不丢
+    return this._tombstoneHasIdentity(filePath, message)
   },
 
   save (message, filename) {
@@ -2900,6 +3229,8 @@ const MessageStore = {
         messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: NOW() }
         addIdentityIndexes(messages[idx], idx)
       } else {
+        // P4（CodeAnt）：身份已在墓碑（曾被裁剪且已推送过）→ 不重复收录，防重放
+        if (this._tombstoneHasIdentity(filePath, message)) continue
         changedAny = true
         messages.push({ ...Utils.safeObjectCopy(message), timestamp: NOW() })
         const i = messages.length - 1
@@ -3699,6 +4030,8 @@ const App = {
         }
         if (identity.kind === 'anon') cacheAnonKeys.add(identity.key)
       }
+      // P4（CodeAnt）：并入墓碑身份——字节/条数裁剪丢弃的记录身份仍参与判重，防重放重复推送。
+      // 统一走 MessageStore._tombstoneSetsHas（与 has/save/saveBatch 同一判重接口，避免语义漂移）
       // v3.228：批内与跨运行统一使用 getMessageIdentity；保留 id/url 的双向 fallback，
       // 另为无标识数据维护 anonKey 集合，避免各入口各自拼接 url:/id: 键。
       const batchIds = new Set()
@@ -3727,11 +4060,14 @@ const App = {
         let dup = false
         if (identity.kind === 'id') {
           dup = cacheIds.has(identity.idKey) || (identity.url && cacheNoIdUrls.has(identity.url)) ||
-                       batchIds.has(identity.idKey) || (identity.url && batchNoIdUrls.has(identity.url))
+                       batchIds.has(identity.idKey) || (identity.url && batchNoIdUrls.has(identity.url)) ||
+                       MessageStore._tombstoneSetsHas(cacheFilePath, identity)
         } else if (identity.kind === 'url') {
-          dup = cacheUrls.has(identity.url) || batchUrls.has(identity.url)
+          dup = cacheUrls.has(identity.url) || batchUrls.has(identity.url) ||
+                       MessageStore._tombstoneSetsHas(cacheFilePath, identity)
         } else {
-          dup = cacheAnonKeys.has(identity.key) || batchAnonKeys.has(identity.key)
+          dup = cacheAnonKeys.has(identity.key) || batchAnonKeys.has(identity.key) ||
+                       MessageStore._tombstoneSetsHas(cacheFilePath, identity)
         }
         if (dup) { dedupCount++; continue }
         // 收录进批内索引，字段身份与 MessageStore/saveBatch 完全相同。
@@ -4122,6 +4458,7 @@ if (typeof module !== 'undefined' && module.exports) {
     filterHash: Utils.filterHash.bind(Utils),
     anonKey: Utils.anonKey.bind(Utils),
     hasValidId: Utils.hasValidId.bind(Utils),
+    getMessageIdentity: Utils.getMessageIdentity.bind(Utils),
     normUrl: Utils.normUrl.bind(Utils),
     safeUrl: Utils.safeUrl.bind(Utils),
     validUrl: Utils.validUrl.bind(Utils),
@@ -4148,6 +4485,8 @@ if (typeof module !== 'undefined' && module.exports) {
     saveMessages: MessageStore.saveMessages.bind(MessageStore),
     Config,
     // v3.258：导出 App 供测试直接打内部方法（_enabledFlag 等纯函数）
-    App
+    App,
+    // P4（CodeAnt）：导出 MessageStore 供墓碑身份一致性测试直接验证四类身份 × 各判重入口
+    MessageStore
   }
 }
