@@ -1913,6 +1913,9 @@ console.log('========================================\n');
     try {
       // 写昨天状态（有数据）→ 今天首次 run 发昨日日报
       require('fs').mkdirSync(stateDir, { recursive: true })
+      // 清理本测试隔离目录的历史缓存残留（setPushUrl 只清默认 CACHE_DIR；残留 id=1
+      // 会让第二次本地运行被去重 → pushed=0 假失败；CI 全新 checkout 不触发）
+      try { require('fs').unlinkSync(path.join(stateDir, 't62_report_nodup.json')) } catch (e) { /* 不存在则忽略 */ }
       require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, dedup: 1, filtered: 1, pushed: 3, failed: 0 }))
       await xbk.run()
       assert(pushCalls.some(c => c.text.includes('日报')), '跨天应发昨日日报')
@@ -2334,6 +2337,42 @@ console.log('========================================\n');
             `过滤标记应已清除（重新推送的 id=1 以成功态写回）: ${cached2.map(m => `${m.id}:_f=${m._f}`).join(',')}`)
     } finally {
       try { require('fs').unlinkSync(hashPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('切换 pushUrl 后旧文件 _f 仍能随规则变更重评（v3.262 P2）', async () => {
+    const hashPath = path.join(CACHE_DIR, 'filter.hash')
+    try { fs.unlinkSync(hashPath) } catch (e) { /* 忽略 */ }
+    try {
+      // ① A 源 + 屏蔽「京东」→ id=1 过滤写入 _f
+      reset()
+      setPushUrl('t67_filter_switch_a')
+      Config.filter.pingbibiaoti = '京东'
+      fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '淘宝特价' })]
+      let s = await xbk.run()
+      assert(s.pushed === 1 && s.filtered === 1, `首次应推1过滤1: ${JSON.stringify(s)}`)
+      const markedA = readCacheFile('t67_filter_switch_a').filter(m => m._f === true)
+      assert(markedA.length === 1 && markedA[0].id === 1, `A 文件应有 id=1 的 _f 条目: ${JSON.stringify(markedA)}`)
+
+      // ② 规则改宽 + 切到 B 源 → hash 在 B 上推进（B 无 _f，清理空转）
+      reset()
+      setPushUrl('t67_filter_switch_b')
+      Config.filter.pingbibiaoti = ''
+      fakeData = [makeItem({ id: 1 })]
+      s = await xbk.run()
+      assert(s.pushed === 1, `B 源应正常推送: ${JSON.stringify(s)}`)
+
+      // ③ 切回 A 源（规则仍改宽）→ 旧 _f 必须被重评并推送（修复前 lastHash 相同被跳过 → 静默漏推）
+      reset()
+      setPushUrl('t67_filter_switch_a')
+      fakeData = [makeItem({ id: 1 })]
+      s = await xbk.run()
+      assert(s.pushed === 1 && s.filtered === 0, `切回 A 后 id=1 应重评推送: ${JSON.stringify(s)}`)
+      assert(pushCalls.length === 1 && pushCalls[0].desp.includes('京东神券'),
+            `京东应重新推送: ${pushCalls.map(c => c.text).join('|')}`)
+    } finally {
+      Config.filter.pingbibiaoti = ''
+      try { fs.unlinkSync(hashPath) } catch (e) { /* 忽略 */ }
     }
   })
 
