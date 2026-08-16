@@ -135,18 +135,46 @@ function extractTestSummary (output) {
   for (let i = lines.length - 1; i >= 0; i--) {
     const all = /全部通过！(\d+)\/(\d+)/.exec(lines[i])
     if (all) return [all[1], all[2]]
-    const pass = numberBefore(lines[i], '通过')
-    const fail = numberBefore(lines[i], '失败')
-    const total = numberAfter(lines[i], '共')
-    if (pass !== null && fail !== null && total !== null) return [pass, fail, total]
+    const triple = lineTriple(lines[i])
+    if (triple) return triple
   }
   return []
 }
 
-// 关键字前紧邻的整数字符串（允许空白间隔），找不到返回 null
-function numberBefore (s, kw) {
-  const idx = s.indexOf(kw)
-  if (idx === -1) return null
+// 单行内找「K 通过, M 失败, 共 N」：取最后一个「共 N」，再向左取最近的「M 失败」「K 通过」。
+// CodeAnt 复审：同一行前置无关「通过/失败/共」文本（如「检查通过：…」「之前失败 0」）不得抢答。
+function lineTriple (s) {
+  let total = null
+  let totalPos = -1
+  for (let i = 0; (i = s.indexOf('共', i)) !== -1; i += 1) {
+    const n = numberAfter(s, i, 1)
+    if (n !== null) {
+      total = n
+      totalPos = i
+    }
+  }
+  if (total === null) return null
+  let fail = null
+  let failPos = -1
+  for (let i = 0; (i = s.indexOf('失败', i)) !== -1 && i < totalPos; i += 1) {
+    const n = numberBefore(s, i)
+    if (n !== null) {
+      fail = n
+      failPos = i
+    }
+  }
+  if (fail === null) return null
+  let pass = null
+  for (let i = 0; (i = s.indexOf('通过', i)) !== -1 && i < failPos; i += 1) {
+    const n = numberBefore(s, i)
+    if (n !== null) pass = n
+  }
+  if (pass === null) return null
+  return [pass, fail, total]
+}
+
+// 关键字起点 idx 前紧邻的整数字符串（允许空白间隔），找不到返回 null
+function numberBefore (s, idx) {
   let end = idx
   while (end > 0 && /\s/.test(s[end - 1])) end--
   let start = end
@@ -154,11 +182,9 @@ function numberBefore (s, kw) {
   return start < end ? s.slice(start, end) : null
 }
 
-// 关键字后紧邻的整数字符串（允许空白间隔），找不到返回 null
-function numberAfter (s, kw) {
-  const idx = s.indexOf(kw)
-  if (idx === -1) return null
-  let start = idx + kw.length
+// 关键字终点（idx + kwLen）后紧邻的整数字符串（允许空白间隔），找不到返回 null
+function numberAfter (s, idx, kwLen) {
+  let start = idx + kwLen
   while (start < s.length && /\s/.test(s[start])) start++
   let end = start
   while (end < s.length && s[end] >= '0' && s[end] <= '9') end++

@@ -213,7 +213,11 @@ async function postIssue (body) {
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'mutation-report' },
     body: JSON.stringify({ title, body })
   })
-  if (!res.ok) throw new Error(`发 Issue 失败: ${res.status} ${await res.text()}`)
+  if (!res.ok) {
+    // S5145：远端响应体不可信（可能含换行/控制字符/伪日志前缀），只记录固定状态码
+    await res.text().catch(() => {})
+    throw new Error(`发 Issue 失败，HTTP 状态码：${res.status}`)
+  }
   return res.json()
 }
 

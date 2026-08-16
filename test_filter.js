@@ -78,14 +78,41 @@ function assertEqual (actual, expected, msg) {
 
 // 输出中是否存在成链的 Markdown 危险链接 `[label](javascript:/vbscript:/data:)`。
 // CodeRabbit 审查：只查首个标记会漏掉「前畸形后有效」的组合——扫描全部标记，任一成链即 true
+// CodeAnt 复审：label 可含转义 `\]`——配对须跳过转义右括号，避免漏检
 function hasDangerLink (out) {
   const re = /\]\((?:javascript|vbscript|data):/gi
   let m
   while ((m = re.exec(out)) !== null) {
-    const open = out.lastIndexOf('[', m.index)
-    if (open !== -1 && !out.slice(open + 1, m.index).includes(']')) return true
+    if (findLinkOpen(out, m.index) !== -1) return true
   }
   return false
+}
+
+// 从 `](` 所在右括号向左找配对的 `[`：两者之间不得有未转义的 `]`
+function findLinkOpen (s, closeIdx) {
+  let open = s.lastIndexOf('[', closeIdx - 1)
+  while (open !== -1) {
+    if (!hasUnescapedClose(s, open + 1, closeIdx - 1)) return open
+    // lastIndexOf 的负 fromIndex 会被钳制为 0——open 已到 0 时须终止，否则死循环
+    if (open === 0) break
+    open = s.lastIndexOf('[', open - 1)
+  }
+  return -1
+}
+
+// 区间 [from, to] 内是否存在未转义的 `]`（`\]` 属转义，不视为闭合）
+function hasUnescapedClose (s, from, to) {
+  for (let i = from; i <= to; i++) {
+    if (s[i] === ']' && !isEscaped(s, i)) return true
+  }
+  return false
+}
+
+// 下标 i 的字符是否被奇数个反斜杠转义
+function isEscaped (s, i) {
+  let backslashes = 0
+  for (let j = i - 1; j >= 0 && s[j] === '\\'; j--) backslashes++
+  return (backslashes & 1) === 1
 }
 
 function makeItem (overrides = {}) {
@@ -8289,6 +8316,9 @@ console.log('========================================\n');
       ['0 通过, 1 失败, 共 1 个\n1. 检查点通过', ['0', '1', '1']],
       // CodeAnt 复审：更早的无关「全部通过！1/1」日志不得抢答真实汇总行
       ['测试名：全部通过！1/1\n实际结果：7 通过, 0 失败, 共 7', ['7', '0', '7']],
+      // CodeAnt 复审：同一行前置无关「通过/失败」文本不得抢答
+      ['检查通过：准备完成；实际结果：7 通过, 0 失败, 共 7', ['7', '0', '7']],
+      ['之前失败 0；实际结果：7 通过, 0 失败, 共 7', ['7', '0', '7']],
       ['全部通过！785/785  100%', ['785', '785']],
       ['🎉 全部通过！12/12', ['12', '12']],
       ['无关键字的普通输出', []]
@@ -8304,6 +8334,10 @@ console.log('========================================\n');
     // 畸形标记本身不误报
     assertEqual(hasDangerLink('[a]b](javascript:alert(1))'), false, '畸形标记不应误报')
     assertEqual(hasDangerLink('plain ](javascript:alert(1))'), false, '无配对 [ 不误报')
+    // CodeAnt 复审：边界——转义右括号、额外开括号、安全链接后的悬空标记
+    assertEqual(hasDangerLink('[a\\]b](javascript:alert(1))'), true, 'label 含转义 ] 仍应检出')
+    assertEqual(hasDangerLink('[[x](javascript:alert(1))'), true, '前有额外 [ 仍应检出')
+    assertEqual(hasDangerLink('[x](safe) text ](javascript:alert(1))'), false, '安全链接后的悬空标记不误报')
     // 安全链接不误报
     assertEqual(hasDangerLink('[x](https://safe.example/a)'), false, '安全链接不误报')
     // 三种危险协议均检出
