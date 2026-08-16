@@ -237,7 +237,8 @@ async function main () {
       // S5145：existing.number 来自远端 Issue 列表，属用户可控数据——跳过时不输出
       console.log('\n⏭️ 日报已存在，跳过发布')
     } else {
-      console.log(`\n✅ 日报已发布: issue #${issue.number}`) // S5145：不直接输出远端可控的 html_url
+      // S5145：number 来自远端响应（POST /issues），属用户可控数据——日志不再输出远端字段
+      console.log('\n✅ 日报已发布')
     }
   }
 }
