@@ -8335,7 +8335,7 @@ console.log('========================================\n');
     assertEqual(hasDangerLink('[a]b](javascript:alert(1))'), false, '畸形标记不应误报')
     assertEqual(hasDangerLink('plain ](javascript:alert(1))'), false, '无配对 [ 不误报')
     // CodeAnt 复审：边界——转义右括号、额外开括号、安全链接后的悬空标记
-    assertEqual(hasDangerLink('[a\\]b](javascript:alert(1))'), true, 'label 含转义 ] 仍应检出')
+    assertEqual(hasDangerLink(String.raw`[a\]b](javascript:alert(1))`), true, 'label 含转义 ] 仍应检出')
     assertEqual(hasDangerLink('[[x](javascript:alert(1))'), true, '前有额外 [ 仍应检出')
     assertEqual(hasDangerLink('[x](safe) text ](javascript:alert(1))'), false, '安全链接后的悬空标记不误报')
     // 安全链接不误报
