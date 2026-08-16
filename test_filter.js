@@ -2664,7 +2664,7 @@ console.log('========================================\n');
     // S8786：`style=[^>]*javascript:` 回溯 O(n²)；拆成 srcset 直查 + style 段线性扫描
     const srcsetDanger = /srcset\s*=\s*javascript:/i.test(activeUnquoted)
     let styleDanger = false
-    for (let i = 0; !styleDanger && i < activeUnquoted.length; ) {
+    for (let i = 0; !styleDanger && i < activeUnquoted.length;) {
       const m = /style\s*=\s*/i.exec(activeUnquoted.slice(i))
       if (!m) break
       const start = i + m.index + m[0].length

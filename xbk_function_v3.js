@@ -3365,7 +3365,7 @@ const Network = {
 // 对抗输入上 O(n²) 回溯；改单趟扫描：< → 可选空白/斜杠 → 字母开头标签名 → 名字后跟
 // 空白、> 或 />（排除 <https://...> autolink）→ 其后存在 > 即判定为 HTML。
 function looksLikeHtmlLinear (s) {
-  for (let i = 0; i < s.length; ) {
+  for (let i = 0; i < s.length;) {
     const lt = s.indexOf('<', i)
     if (lt === -1) return false
     const nameEnd = htmlTagNameEnd(s, lt)

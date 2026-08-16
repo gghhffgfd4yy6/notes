@@ -117,13 +117,21 @@ function runTests (dir, timeoutMs) {
     const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ status: 'timeout', output }) }, timeoutMs)
     child.on('close', (code, signal) => {
       clearTimeout(timer)
-      // S8786/S6594：交替+可选量词邻接曾 O(n²) 且 String.match 被标；改 exec + 合并可选量词
-      // 为单一字符类 [,\s]*（无邻接回溯），summary 无消费方，分组语义不变
-      let match = /全部通过！(\d+)\/(\d+)/.exec(output)
-      if (!match) match = /(\d+) 通过[,\s]*(\d+) 失败[,\s]*共[,\s]*(\d+)/.exec(output)
-      resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: match ? match.slice(1) : [] })
+      // S8786/S6594：多量词组正则（(\d+)(sep)(\d+)）被标超线性回溯且 String.match 被标；
+      // 改 exec + 逐关键字单数字组线性提取（summary 仅写入变异报告，无逻辑消费方）
+      resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: extractTestSummary(output) })
     })
   })
+}
+
+// 提取测试汇总数字："全部通过！N/M" 或 "N 通过, M 失败, 共 K"（线性解析，规避 S8786）
+function extractTestSummary (output) {
+  const all = /全部通过！(\d+)\/(\d+)/.exec(output)
+  if (all) return [all[1], all[2]]
+  const pass = /(\d+)\s*通过/.exec(output)
+  const fail = /(\d+)\s*失败/.exec(output)
+  const total = /共\s*(\d+)/.exec(output)
+  return pass && fail && total ? [pass[1], fail[1], total[1]] : []
 }
 
 async function evaluate (mutants, files, timeoutMs) {
