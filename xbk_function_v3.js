@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.262 — 子代理审查 P2/P3 修复 ********
+//* ******* 线报酷推送脚本 v3.263 — SonarCloud 全量扫描 P1/P2 修复 ********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -1378,7 +1378,7 @@ const Formatter = {
     shuju = Utils.safeObjectCopy(shuju || {})
     let html = (typeof shuju.content_html === 'string')
       ? shuju.content_html
-      : (shuju.content_html === undefined || shuju.content_html === null ? '' : '') // 非字符串内容视为空（避免 [object Object]）
+      : '' // 非字符串内容视为空（避免 [object Object]）
     // v3.254 P1(ReDoS)：`<a>`/`<h1-6>` 正则曾用无界惰性 [\s\S]*? 接固定闭合标签且带 g，
     // 多个未闭合标签时每次起始位置回扫到串尾呈 O(n²)——content_html 来自外部接口可被
     // 构造为 10 万+ 字符卡死主线程。v3.254 的 100k 截断只能把最坏输入压到 ~100k（实测
@@ -3360,6 +3360,28 @@ const Network = {
   }
 }
 
+// S8786：HTML 形态线性检测（与 xbk_sendNotify_slim.looksHtml 同思路）——原正则
+// /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^<>]*>/i 在「大量 <tag 前缀但全文无 >」的
+// 对抗输入上 O(n²) 回溯；改单趟扫描：< → 可选空白/斜杠 → 字母开头标签名 → 名字后跟
+// 空白、> 或 />（排除 <https://...> autolink）→ 其后存在 > 即判定为 HTML。
+function looksLikeHtmlLinear (s) {
+  for (let i = 0; i < s.length; ) {
+    const lt = s.indexOf('<', i)
+    if (lt === -1) return false
+    let j = lt + 1
+    while (j < s.length && /\s/.test(s[j])) j++
+    if (s[j] === '/') { j++; while (j < s.length && /\s/.test(s[j])) j++ }
+    if (!/[A-Za-z]/.test(s[j] || '')) { i = lt + 1; continue }
+    j++
+    while (j < s.length && /[A-Za-z0-9-]/.test(s[j])) j++
+    const b = s[j]
+    if (b !== undefined && b !== '>' && b !== '/' && !/\s/.test(b)) { i = lt + 1; continue }
+    // 本处起无 > 则后续 < 也不可能再凑成完整标签（与 slim looksHtml 判定一致）
+    return s.includes('>', j)
+  }
+  return false
+}
+
 // ============================================================
 // 📤 Pusher — 推送层
 // ============================================================
@@ -3381,8 +3403,7 @@ const Pusher = {
     // 超长 desp 截断为已知边界（与全局 htmlToMarkdown/sanitizeDecodedHtml 截断策略一致）。
     const HTML_LIKE_MAX_LEN = 100000
     if (desp.length > HTML_LIKE_MAX_LEN) desp = desp.slice(0, HTML_LIKE_MAX_LEN)
-    const htmlLike =
-      /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^<>]*>/i.test(desp)
+    const htmlLike = looksLikeHtmlLinear(desp) // S8786：线性扫描替代原回溯正则
     if (htmlLike) {
       desp = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(desp))
     }

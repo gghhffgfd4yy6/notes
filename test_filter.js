@@ -2635,7 +2635,11 @@ console.log('========================================\n');
     // 成对引号/无引号正则均不匹配，危险协议会保留执行；必须单独清洗。
     for (const bad of ['<a href="javascript:alert(1)>x</a>', "<a href='javascript:alert(1)>x</a>", '<a href=javascript:alert(1)>x</a>', '<img src="data:text/html,x">']) {
       const out = tuisong_replace('{Html内容}', { content_html: bad, url: 'https://safe.example/a' })
-      assertEqual(/\[[^\]]*\]\((?:javascript|vbscript|data):/i.test(out), false, `未闭合引号危险属性不应生成链接: ${bad.slice(0, 30)}`)
+      // S8786：`[^\]]*` + 后缀回溯 O(n²)；改定位 `](危险协议` 后核对配对 `[`（线性）
+      const dm = /\]\((?:javascript|vbscript|data):/i.exec(out)
+      const open = dm ? out.lastIndexOf('[', dm.index) : -1
+      const hasDangerLink = !!(dm && open !== -1 && !out.slice(open + 1, dm.index).includes(']'))
+      assertEqual(hasDangerLink, false, `未闭合引号危险属性不应生成链接: ${bad.slice(0, 30)}`)
     }
     // 原始 content_html 中的危险 href/src 也必须清洗
     const raw = tuisong_replace('{Html内容}', { content_html: '<a href="javascript:alert(1)">点我</a><img src="javascript:x">', url: 'https://safe.example/a' })
@@ -2657,7 +2661,19 @@ console.log('========================================\n');
       content_html: '<img srcset=javascript:alert(4)><div style=background:url(javascript:alert(5))>z</div>',
       url: 'https://safe.example/a'
     })
-    assertEqual(/srcset\s*=\s*javascript:|style\s*=\s*[^>]*javascript:/i.test(activeUnquoted), false,
+    // S8786：`style=[^>]*javascript:` 回溯 O(n²)；拆成 srcset 直查 + style 段线性扫描
+    const srcsetDanger = /srcset\s*=\s*javascript:/i.test(activeUnquoted)
+    let styleDanger = false
+    for (let i = 0; !styleDanger && i < activeUnquoted.length; ) {
+      const m = /style\s*=\s*/i.exec(activeUnquoted.slice(i))
+      if (!m) break
+      const start = i + m.index + m[0].length
+      const end = activeUnquoted.indexOf('>', start)
+      const seg = activeUnquoted.slice(start, end === -1 ? activeUnquoted.length : end)
+      styleDanger = /javascript:/i.test(seg)
+      i = end === -1 ? activeUnquoted.length : end + 1
+    }
+    assertEqual(srcsetDanger || styleDanger, false,
       'Html内容 不应遗漏无引号 srcset/style 危险路径')
     const slashEvent = tuisong_replace('{Html内容}', {
       content_html: '<img/onerror=alert(6)><div/onload = "alert(7)">x</div>',

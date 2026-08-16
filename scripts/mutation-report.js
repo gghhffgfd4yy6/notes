@@ -232,7 +232,7 @@ async function main () {
   console.log(body)
   if (process.argv.includes('--issue')) {
     const issue = await postIssue(body)
-    console.log(`\n✅ 日报已发布: ${issue.html_url}`)
+    console.log(`\n✅ 日报已发布: issue #${issue.number}`) // S5145：不直接输出远端可控的 html_url
   }
 }
 

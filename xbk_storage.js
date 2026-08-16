@@ -3,6 +3,7 @@
 // 统一安全文件入口：状态、日志和消息缓存都通过同一套普通文件检查与原子写入。
 const fs = require('fs')
 const path = require('path')
+const crypto = require('node:crypto')
 
 function isRegularOrMissing (filePath) {
   if (typeof filePath !== 'string') {
@@ -36,7 +37,8 @@ function writeAtomic (filePath, text, label = '缓存文件') {
   try {
     ensureParent(filePath)
     // 每次使用唯一临时文件，避免预置/竞态 .tmp 符号链接；rename 替换目标本身不会跟随目标链接。
-    tmpFile = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
+    // S2245：Math.random 伪随机可预测（临时文件路径防预置/竞态），改加密随机
+    tmpFile = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`
     fs.writeFileSync(tmpFile, text, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
     fs.renameSync(tmpFile, filePath)
     tmpFile = ''

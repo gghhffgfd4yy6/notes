@@ -31,7 +31,7 @@ const names = [...src.matchAll(/await test\((['"])(.*?)\1,/g)].map(m => m[2])
 if (names.length === 0) { console.error('未提取到测试名'); process.exit(2) }
 
 // ---------- 2. 分片（名称排序后均分，每片一个 worker，保证无重叠） ----------
-const sorted = names.slice().sort()
+const sorted = names.slice().sort((a, b) => a.localeCompare(b)) // S2871：显式比较器，排序确定性
 const chunkSize = Math.ceil(sorted.length / CONCURRENCY)
 const chunks = []
 for (let i = 0; i < sorted.length; i += chunkSize) {

@@ -1065,3 +1065,11 @@
 - 测试：全量（单元 + 通道 + 常驻 5 套件 + 集成并行/串行）全绿。
 - SonarCloud 质量门（PR #25）：`Security Rating on New Code` 恢复 A——重试抖动改 `crypto.randomInt` 消除 S2245 安全热点；顺带清掉新代码告警：wxpusher 回调认知复杂度 16→拆 `wxPusherBusinessError`、Push+ 换行归一化改 `replaceAll`、可选链、`node:fs`、测试 URL 改 https。
 - CodeAnt 审查低优先级项（PR #25）：常驻入口信号监听器清理移入 `finally`，异常路径不再遗留 SIGTERM/SIGINT 钩子。
+
+## v3.263（SonarCloud 全量扫描 P1/P2 修复，2026-08-17）
+
+- 用 SonarCloud token 拉取全量 793 条未解决问题分级梳理：约 700 条为风格/维护性噪音（node: 前缀、http、可选链、复杂度等），真 bug 集中在少数几处，本版修复：
+- 主程序：htmlToMarkdown 死三元（S3923）；Pusher 出口 HTML 形态检测正则线性化（S8786，与 slim looksHtml 同思路）+ 字符类去重（S5869）；xbk_storage 临时文件名 `Math.random` → `crypto.randomBytes`（S2245）。
+- 工具/测试：run_mutation 汇总正则拆交替（S8786）；mutation-report 日报日志不再输出远端可控 html_url（S5145）；test_filter 两处断言正则线性化（S8786）；test_app 无用赋值（S1854）；test_app_p 排序加比较器（S2871）。
+- 核实为误报不修：`test_app.js:2125` 与 `slim:1378` 的 S3403（Sonar 数据流未跟踪赋值/local.js 动态配置）、`v3:280` S2871（ASCII 键确定性排序）、S2681×7/S7727/S2310（密集写法与箭头函数）。
+- 测试：全量套件全绿；check-version 三方一致 v3.263。
