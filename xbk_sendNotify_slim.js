@@ -375,7 +375,8 @@ function pushPlusNotify (text, desp, params = {}) {
     const { PUSH_PLUS_TOKEN, PUSH_PLUS_USER } = push_config
     if (PUSH_PLUS_TOKEN) {
       desp = mdToPlain(desp) // v3.128：Push+ 默认 html，markdown 符号会原样显示
-      desp = desp.replace(/[\n\r]/g, '<br>') // 默认为html, 不支持plaintext
+      // v3.262：先归一化 \r\n → \n，避免 Windows 换行被逐字符替换成两个 <br>（多余空行）
+      desp = desp.replace(/\r\n/g, '\n').replace(/[\n\r]/g, '<br>') // 默认为html, 不支持plaintext
       const body = {
         token: `${PUSH_PLUS_TOKEN}`,
         title: `${text}`,
@@ -1008,9 +1009,13 @@ function wxPusherPost (channel, text, desp, params = {}) {
           wxPusherProfile(channel, outcome, started, timings)
           console.log('WxPusher发送通知消息异常\n')
           console.log(safeErr(data))
-          const error = new Error(data && data.msg ? safeErr(data.msg) : 'wxpusher 发送失败')
+          const sourceErr = new Error(data && data.msg ? safeErr(data.msg) : 'wxpusher 发送失败')
           // 保留结构化业务码：限频响应可能没有 msg，不能只靠错误文本判断是否切换备用应用。
-          if (data && data.code !== undefined && data.code !== null) error.code = data.code
+          if (data && data.code !== undefined && data.code !== null) sourceErr.code = data.code
+          // v3.262：统一走 channelError 并携带 providerCode——修复 xbk_failure_policy 的
+          // wxpusher 专用分支永不触发（此前裸 new Error 不设 providerCode，非 1001 业务码
+          // 如 1300 被误归为可重试，常驻模式空转 3 轮才停止）。
+          const error = channelError(sourceErr, 'wxpusher', null, sourceErr.code ? String(sourceErr.code) : '')
           reject(error)
         }
       } catch (e) {
