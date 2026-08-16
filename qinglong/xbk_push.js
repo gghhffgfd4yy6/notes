@@ -139,9 +139,14 @@ async function main () {
   process.on('SIGTERM', stop)
   process.on('SIGINT', stop)
   console.log(`青龙常驻模式启动，单轮完成后等待 ${intervalMs(app.num)}ms 再拉取`)
-  await runResident(app, controller)
-  process.removeListener('SIGTERM', stop)
-  process.removeListener('SIGINT', stop)
+  try {
+    await runResident(app, controller)
+  } finally {
+    // CodeAnt 审查建议：异常路径（ensureDependencies/require/runResident 抛错）也清理监听器，
+    // 不遗留信号钩子（常驻进程随后退出，实际影响有限，但 finally 语义更稳）。
+    process.removeListener('SIGTERM', stop)
+    process.removeListener('SIGINT', stop)
+  }
   if (residentExitCode !== 0) process.exitCode = residentExitCode
   console.log(residentExitCode === 0 ? '青龙常驻模式已停止' : '青龙常驻模式因连续/不可恢复错误停止')
 }

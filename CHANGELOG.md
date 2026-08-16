@@ -1064,3 +1064,4 @@
   - CI：test.yml 与 master-pipeline 补齐常驻 5 套件并加最小权限；mutation.yml 行范围对齐当前行数；analyze-artifacts 关闭 merge-multiple 防同名报告覆盖。
 - 测试：全量（单元 + 通道 + 常驻 5 套件 + 集成并行/串行）全绿。
 - SonarCloud 质量门（PR #25）：`Security Rating on New Code` 恢复 A——重试抖动改 `crypto.randomInt` 消除 S2245 安全热点；顺带清掉新代码告警：wxpusher 回调认知复杂度 16→拆 `wxPusherBusinessError`、Push+ 换行归一化改 `replaceAll`、可选链、`node:fs`、测试 URL 改 https。
+- CodeAnt 审查低优先级项（PR #25）：常驻入口信号监听器清理移入 `finally`，异常路径不再遗留 SIGTERM/SIGINT 钩子。
