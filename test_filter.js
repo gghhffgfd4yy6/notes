@@ -3296,8 +3296,8 @@ console.log('========================================\n');
   await test('tuisong_replace {图片} 危险协议被清空（v3.262 统一安全 URL 入口）', () => {
     const r = tuisong_replace('图片:{图片}', { pic: 'javascript:alert(1)', url: 'x' })
     assertEqual(r, '图片:', '危险协议 pic 应清空')
-    const ok = tuisong_replace('图片:{图片}', { pic: 'http://img/1.jpg' })
-    assertEqual(ok, '图片:http://img/1.jpg', '合法 pic 保留')
+    const ok = tuisong_replace('图片:{图片}', { pic: 'https://img/1.jpg' })
+    assertEqual(ok, '图片:https://img/1.jpg', '合法 pic 保留')
   })
 
   await test('htmlToMarkdown h2 换行精确断言', () => {

@@ -1915,7 +1915,7 @@ console.log('========================================\n');
       require('fs').mkdirSync(stateDir, { recursive: true })
       // 清理本测试隔离目录的历史缓存残留（setPushUrl 只清默认 CACHE_DIR；残留 id=1
       // 会让第二次本地运行被去重 → pushed=0 假失败；CI 全新 checkout 不触发）
-      try { require('fs').unlinkSync(path.join(stateDir, 't62_report_nodup.json')) } catch (e) { /* 不存在则忽略 */ }
+      try { require('node:fs').unlinkSync(path.join(stateDir, 't62_report_nodup.json')) } catch (e) { /* 不存在则忽略 */ }
       require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, dedup: 1, filtered: 1, pushed: 3, failed: 0 }))
       await xbk.run()
       assert(pushCalls.some(c => c.text.includes('日报')), '跨天应发昨日日报')

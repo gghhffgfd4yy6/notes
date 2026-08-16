@@ -1116,8 +1116,8 @@ console.log('========================================\n');
       // v3.262：通道级错误必须携带 providerCode/channel（聚合错误的 failures[0]），
       // failure_policy 的 wxpusher 专用分支才不是死代码（此前裸 Error 不设 providerCode）
       const first = e && Array.isArray(e.failures) ? e.failures[0] : null
-      assert(first && first.providerCode === '1300', `wxpusher 通道错误应携带 providerCode=1300，实际 ${first && first.providerCode}`)
-      assert(first && first.channel === 'wxpusher', `wxpusher 通道错误应携带 channel，实际 ${first && first.channel}`)
+      assert(first?.providerCode === '1300', `wxpusher 通道错误应携带 providerCode=1300，实际 ${first?.providerCode}`)
+      assert(first?.channel === 'wxpusher', `wxpusher 通道错误应携带 channel，实际 ${first?.channel}`)
     } finally {
       failWxpusher = false
     }

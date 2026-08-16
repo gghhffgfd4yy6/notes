@@ -3349,7 +3349,7 @@ const Network = {
         if (attempt < maxRetry) { // v3.157：用兜底后的 maxRetry（曾用原始 Config.api.retry，非法类型时与实际重试不一致）
           // 退避等待：1s、2s、4s、8s...指数退避（与 README「指数退避+随机抖动」声明一致；
           // 封顶 30s 防长挂；0-500ms 随机抖动避免多实例同时重试）
-          const wait = Math.min(1000 * 2 ** attempt, 30000) + Math.floor(Math.random() * 500)
+          const wait = Math.min(1000 * 2 ** attempt, 30000) + crypto.randomInt(500)
           console.log(`请求失败（${Utils.safeErrorText(e, 'unknown')}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）...`) // R5-1：显示兜底后次数
           await new Promise(r => setTimeout(r, wait))
         }
