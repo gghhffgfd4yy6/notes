@@ -1,6 +1,6 @@
 {
   "name": "xbk-push",
-  "version": "3.261.0",
+  "version": "3.262.0",
   "description": "线报酷推送脚本——规则过滤 + 多通道推送 + 去重缓存 + 运行日志 + 完整测试体系",
   "main": "xbk_function_v3.js",
   "scripts": {
@@ -17,6 +17,7 @@
     "test:loop": "node test_loop.js",
     "test:failure-policy": "node test_failure_policy.js",
     "test:dns": "node test_dns_cache.js",
+    "test:tls-prewarm": "node test_tls_prewarm.js",
     "test:mutation": "stryker run",
     "check": "npm run lint && node check-version.js && npm test",
     "verify": "npm run check"

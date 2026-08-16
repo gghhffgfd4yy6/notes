@@ -11,6 +11,7 @@ const ROOT = __dirname
 const DEFAULT_FILES = [
   'xbk_function_v3.js', 'xbk_agents.js', 'xbk_http.js',
   'xbk_sendNotify_slim.js', 'xbk_storage.js', 'xbk_loop.js',
+  'xbk_failure_policy.js',
   'qinglong/xbk_push.js'
 ]
 const DEFAULT_TEST = ['node', 'test_filter.js']

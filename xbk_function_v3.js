@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.261 — 手机端AI只读审查 P0/P1 修复 ********
+//* ******* 线报酷推送脚本 v3.262 — 子代理审查 P2/P3 修复 ********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -1632,7 +1632,9 @@ const Formatter = {
       '{价格}': data.price,
       '{商城}': data.mall_name,
       '{品牌}': data.brand,
-      '{图片}': data.pic
+      // v3.262：与 {链接}/{Html内容} 同口径走统一安全 URL 入口，防接口 pic 被污染为
+      // javascript:/data: 等危险协议后原样进入模板（Markdown 图片/HTML 渲染通道）
+      '{图片}': Utils.safeUrl(Utils.safeGet(data, 'pic'))
     }
 
     for (const [key, val] of Object.entries(map)) {
@@ -3345,8 +3347,9 @@ const Network = {
         }
 
         if (attempt < maxRetry) { // v3.157：用兜底后的 maxRetry（曾用原始 Config.api.retry，非法类型时与实际重试不一致）
-          // 退避等待：1s、2s、3s...（加 0-500ms 随机抖动，避免多实例同时重试）
-          const wait = 1000 * (attempt + 1) + Math.floor(Math.random() * 500)
+          // 退避等待：1s、2s、4s、8s...指数退避（与 README「指数退避+随机抖动」声明一致；
+          // 封顶 30s 防长挂；0-500ms 随机抖动避免多实例同时重试）
+          const wait = Math.min(1000 * 2 ** attempt, 30000) + crypto.randomInt(500)
           console.log(`请求失败（${Utils.safeErrorText(e, 'unknown')}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）...`) // R5-1：显示兜底后次数
           await new Promise(r => setTimeout(r, wait))
         }
@@ -3960,25 +3963,33 @@ const App = {
       {
         const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc)
         const hashPath = path.join(MessageStore.cacheDir, 'filter.hash')
+        let lastFile = ''
         let lastHash = ''
         let filterStateReady = true
         const hashResult = this._readSafeState(hashPath)
         if (hashResult.status === 'ok') {
-          lastHash = (hashResult.text || '').trim()
+          // v3.262 P2：filter.hash 记录「上次清理的缓存文件名 + 规则哈希」两行。
+          // 切 pushUrl 后旧缓存文件的 _f 条目也能被重新评估——此前全局 hash 被别的源
+          // 推进后，旧文件 _f 永久失效（改宽规则静默漏推）。兼容旧格式（单行纯 hash）：
+          // 文件名段视为与当前不符，触发一次安全重评（宁可多推）。
+          const parts = (hashResult.text || '').trim().split('\n')
+          lastFile = (parts[0] || '').trim()
+          lastHash = (parts[1] || '').trim()
         } else if (hashResult.status !== 'missing') {
           // ioError/unsafe/tooLarge：读不到已存 hash。若当"无 hash"处理会静默跳过规则
           // 变更检测且立即覆写 hash；保守视为未就绪，本次不检测也不推进 hash，下次重试。
           console.error(`过滤规则 hash 读取失败(${hashResult.status})，跳过本次规则变更检测 ${hashPath}`)
           filterStateReady = false
         }
-        if (lastHash && lastHash !== filterHash) {
+        // 规则哈希变化（正常失效）或「上次清理的文件 ≠ 当前缓存文件」（切源后回到本文件也重评）
+        if ((lastHash && lastHash !== filterHash) || (lastFile && lastFile !== cacheName)) {
           const fp = MessageStore.getFilePath(cacheName)
           const msgs = MessageStore.readMessages(fp)
           const kept = msgs.filter(m => !(m && typeof m === 'object' && m._f === true))
           if (kept.length !== msgs.length) {
             filterStateReady = MessageStore.saveMessages(fp, kept)
             if (filterStateReady) {
-              console.warn(`⚠️ 检测到过滤规则/只看它变更（${lastHash.slice(0, 8)} → ${filterHash.slice(0, 8)}），已清除 ${msgs.length - kept.length} 条「过滤写入」缓存——之前被过滤的条目将重新评估（改宽后即重新推送）`)
+              console.warn(`⚠️ 检测到过滤规则/只看它变更或缓存文件切换（${(lastHash || lastFile || '?').slice(0, 8)} → ${filterHash.slice(0, 8)}），已清除 ${msgs.length - kept.length} 条「过滤写入」缓存——之前被过滤的条目将重新评估（改宽后即重新推送）`)
             } else {
               console.warn('⚠️ 过滤缓存失效写入失败，本次不更新 filter.hash，下次运行将继续重试规则变更处理')
             }
@@ -3989,7 +4000,7 @@ const App = {
         // （0===0）不会进清理分支，filterStateReady 保持 true 曾导致 hash 照常覆写——缓存修复后规则变更
         // 检测永不再次触发（改宽过滤规则后旧条目永远不再重新评估/推送）。与 hash 读失败同口径：不推进，下轮重试。
         if (filterStateReady && !MessageStore._readFailed[MessageStore.getFilePath(cacheName)]) {
-          this._writeTextAtomic(hashPath, filterHash)
+          this._writeTextAtomic(hashPath, `${cacheName}\n${filterHash}`)
         }
       }
       const newMessages = []

@@ -375,7 +375,8 @@ function pushPlusNotify (text, desp, params = {}) {
     const { PUSH_PLUS_TOKEN, PUSH_PLUS_USER } = push_config
     if (PUSH_PLUS_TOKEN) {
       desp = mdToPlain(desp) // v3.128：Push+ 默认 html，markdown 符号会原样显示
-      desp = desp.replace(/[\n\r]/g, '<br>') // 默认为html, 不支持plaintext
+      // v3.262：先归一化 \r\n → \n，避免 Windows 换行被逐字符替换成两个 <br>（多余空行）
+      desp = desp.replaceAll('\r\n', '\n').replaceAll('\n', '<br>').replaceAll('\r', '<br>') // 默认为html, 不支持plaintext
       const body = {
         token: `${PUSH_PLUS_TOKEN}`,
         title: `${text}`,
@@ -974,6 +975,15 @@ function wxPusherProfile (channel, outcome, started, timings) {
   }
 }
 
+// v3.262：把 wxpusher 业务失败转成带 providerCode/channel 的通道错误（failure_policy 的
+// wxpusher 专用分支才不是死代码）。独立成函数：回调只负责分发，同时压住回调认知复杂度。
+function wxPusherBusinessError (data) {
+  const sourceErr = new Error(data?.msg ? safeErr(data.msg) : 'wxpusher 发送失败')
+  // 保留结构化业务码：限频响应可能没有 msg，不能只靠错误文本判断是否切换备用应用。
+  if (data?.code != null) sourceErr.code = data.code
+  return channelError(sourceErr, 'wxpusher', null, sourceErr.code ? String(sourceErr.code) : '')
+}
+
 function wxPusherPost (channel, text, desp, params = {}) {
   const started = Date.now()
   if (process.env.XBK_PROFILE === '2' || process.env.XBK_PROFILE === '3') console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=start`)
@@ -1008,10 +1018,7 @@ function wxPusherPost (channel, text, desp, params = {}) {
           wxPusherProfile(channel, outcome, started, timings)
           console.log('WxPusher发送通知消息异常\n')
           console.log(safeErr(data))
-          const error = new Error(data && data.msg ? safeErr(data.msg) : 'wxpusher 发送失败')
-          // 保留结构化业务码：限频响应可能没有 msg，不能只靠错误文本判断是否切换备用应用。
-          if (data && data.code !== undefined && data.code !== null) error.code = data.code
-          reject(error)
+          reject(wxPusherBusinessError(data))
         }
       } catch (e) {
         reject(e)

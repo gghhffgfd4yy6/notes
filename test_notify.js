@@ -1109,9 +1109,19 @@ console.log('========================================\n');
     cfg.WX_pusher_topicIds = '456'
     failWxpusher = true
     let rejected = false
-    try { await notify.sendNotify('标题', '内容') } catch (e) { rejected = true }
+    try {
+      await notify.sendNotify('标题', '内容')
+    } catch (e) {
+      rejected = true
+      // v3.262：通道级错误必须携带 providerCode/channel（聚合错误的 failures[0]），
+      // failure_policy 的 wxpusher 专用分支才不是死代码（此前裸 Error 不设 providerCode）
+      const first = e && Array.isArray(e.failures) ? e.failures[0] : null
+      assert(first?.providerCode === '1300', `wxpusher 通道错误应携带 providerCode=1300，实际 ${first?.providerCode}`)
+      assert(first?.channel === 'wxpusher', `wxpusher 通道错误应携带 channel，实际 ${first?.channel}`)
+    } finally {
+      failWxpusher = false
+    }
     assert(rejected, 'wxpusher API 失败应 reject（主流程不写缓存，下次重试）')
-    failWxpusher = false
   }))
 
   // 19.5 其他 7 个通道 API 业务失败 → reject 不静默（v3.160：曾静默 resolve → 单通道用户消息永久丢失）

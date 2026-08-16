@@ -1048,3 +1048,20 @@
   - **style CSS 恒等转义绕过（安全面）**：C010 只解十六进制转义，`u\rl(javascript:)`/`-mo\z-binding` 等恒等转义在浏览器 CSS 解析时还原为 url(...)/-moz-binding。修复：`_decodeCssEscapes` 全量解码（十六进制 + 恒等 + 行延续），再跑黑名单。
   - **v3.260 正则回归（潜伏 P3）**：`_memoSet` 淘汰最旧键的正则 `\d` 被误改为 `\\d`，数字样键不再被识别为索引键（行为翻转）。修复：恢复 `\d`。
 - 测试：全量（单元 757/757 + 集成串行 131/131 + 并行 + 通道 66/66）全绿。
+
+## v3.262（子代理并行审查 P2/P3 修复，2026-08-16）
+
+- 4 路子代理并行只读审查 + 关键项人工复核，确认无 P1；本版修复 2 条 P2 与一批 P3。
+- **P2**：
+  - **filter.hash 全局耦合（缓存）**：`_f` 失效清理只作用于当前 pushUrl 缓存文件，全局 hash 被别的源推进后旧文件 `_f` 永久失效（改宽规则静默漏推）。修复：hash 文件记录「上次清理的缓存文件名 + 规则哈希」两行，切源后回到旧文件也触发重评；兼容旧格式，升级后一次安全重评。
+  - **run_mutation 假全绿（工具）**：沙箱复制缺 `xbk_failure_policy.js`，所有批次模块加载即失败被记 killed。修复：`DEFAULT_FILES` 补齐。
+- **P3**：
+  - `{图片}` 占位符接入统一安全 URL 入口（`javascript:`/`data:` 等危险协议不再进模板）。
+  - fetchData 重试退避改指数（1s/2s/4s…封顶 30s），与 README「指数退避」声明一致。
+  - wxpusher API 业务码错误携带 `providerCode`/`channel`，失败分类专用分支不再死代码（非 1001 码正确判永久，常驻不再空转 3 轮）。
+  - Push+ 内容 `\r\n` 先归一化再转 `<br>`，不再产生双 `<br>` 空行。
+  - 常驻入口：DNS 预热补传停止信号（坏解析器不再拖住退出）、停止信号改 `process.on` 幂等（二次信号不强杀推送）、依赖安装加 120s 超时。
+  - CI：test.yml 与 master-pipeline 补齐常驻 5 套件并加最小权限；mutation.yml 行范围对齐当前行数；analyze-artifacts 关闭 merge-multiple 防同名报告覆盖。
+- 测试：全量（单元 + 通道 + 常驻 5 套件 + 集成并行/串行）全绿。
+- SonarCloud 质量门（PR #25）：`Security Rating on New Code` 恢复 A——重试抖动改 `crypto.randomInt` 消除 S2245 安全热点；顺带清掉新代码告警：wxpusher 回调认知复杂度 16→拆 `wxPusherBusinessError`、Push+ 换行归一化改 `replaceAll`、可选链、`node:fs`、测试 URL 改 https。
+- CodeAnt 审查低优先级项（PR #25）：常驻入口信号监听器清理移入 `finally`，异常路径不再遗留 SIGTERM/SIGINT 钩子。

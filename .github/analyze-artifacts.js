@@ -37,7 +37,7 @@ for (const [f, st] of Object.entries(byFileStatus)) {
   console.log(`  ${f.padEnd(24)} ${JSON.stringify(st)}`)
 }
 
-// V3 尾部（2701-3618 行）存活分布
+// V3 尾部（2701-4494 行）存活分布
 const v3tail = allSurvivors.filter(m => m.file === 'xbk_function_v3.js' && m.location?.start?.line >= 2701) // 无位置信息不进尾部统计
 console.log(`\n=== V3 尾部(2701+) 存活: ${v3tail.length} ===`)
 const byKind = {}
