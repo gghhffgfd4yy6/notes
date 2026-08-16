@@ -3363,15 +3363,19 @@ const Network = {
 // S8786：HTML 形态线性检测（与 xbk_sendNotify_slim.looksHtml 同思路）——原正则
 // /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^<>]*>/i 在「大量 <tag 前缀但全文无 >」的
 // 对抗输入上 O(n²) 回溯；改单趟扫描：< → 可选空白/斜杠 → 字母开头标签名 → 名字后跟
-// 空白、> 或 />（排除 <https://...> autolink）→ 其后存在 > 即判定为 HTML。
+// 空白、> 或 />（/ 后必须紧跟 >，排除 <https://...> autolink）→ 在下一个 < 之前存在 >
+// 即判定为 HTML（与旧正则 [^<>]*> 一致，CodeAnt 审查确认边界）。
 function looksLikeHtmlLinear (s) {
   for (let i = 0; i < s.length;) {
     const lt = s.indexOf('<', i)
     if (lt === -1) return false
     const nameEnd = htmlTagNameEnd(s, lt)
     if (nameEnd === -1) { i = lt + 1; continue }
-    // 本处起无 > 则后续 < 也不可能再凑成完整标签（与 slim looksHtml 判定一致）
-    return s.includes('>', nameEnd)
+    const gt = s.indexOf('>', nameEnd)
+    const nextLt = s.indexOf('<', nameEnd)
+    if (gt !== -1 && (nextLt === -1 || gt < nextLt)) return true
+    // 本处 < 不构成完整标签：继续找下一个 <（与正则逐位置尝试一致）
+    i = lt + 1
   }
   return false
 }
@@ -3384,10 +3388,15 @@ function htmlTagNameEnd (s, lt) {
   if (!/[A-Za-z]/.test(s[j] || '')) return -1
   j++
   while (j < s.length && /[A-Za-z0-9-]/.test(s[j])) j++
-  return isTagNameBoundary(s[j]) ? j : -1
+  return isTagNameBoundary(s, j) ? j : -1
 }
 
-const isTagNameBoundary = (ch) => ch === undefined || ch === '>' || ch === '/' || /\s/.test(ch)
+// 标签名结束边界：空白、>，或 / 且后一个字符必须是 >（与旧正则 (?=\s|\/?>) 一致）
+function isTagNameBoundary (s, pos) {
+  const ch = s[pos]
+  if (ch === undefined || ch === '>' || /\s/.test(ch)) return true
+  return ch === '/' && s[pos + 1] === '>'
+}
 
 // ============================================================
 // 📤 Pusher — 推送层
@@ -4479,6 +4488,7 @@ if (typeof module !== 'undefined' && module.exports) {
     validateConfig: RuleEngine.validateConfig.bind(RuleEngine),
     tuisong_replace: Formatter.tuisong_replace.bind(Formatter),
     htmlToMarkdown: Formatter.htmlToMarkdown.bind(Formatter),
+    looksLikeHtmlLinear,
     isMessageInFile: MessageStore.has.bind(MessageStore),
     appendMessageToFile: MessageStore.save.bind(MessageStore),
     getFileName: MessageStore.getFileName.bind(MessageStore),

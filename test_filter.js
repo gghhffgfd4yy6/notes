@@ -6,9 +6,10 @@
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================
 
-const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity } = require('./xbk_function_v3.js')
+const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity } = require('./xbk_function_v3.js')
 const assert = require('assert')
 const slim = require('./xbk_sendNotify_slim.js')
+const { extractTestSummary } = require('./run_mutation.js')
 const path = require('path')
 // 缓存目录（基于 __dirname——v3.113 修复 /workspace 硬编码，仓库可移植）
 const CACHE = path.join(__dirname, 'xianbaoku_cache')
@@ -8241,6 +8242,44 @@ console.log('========================================\n');
       const r = sanitizeDecodedHtml(h)
       assertEqual(/url\s*\(/i.test(r), false, `url( 不应残留: ${r}`)
       assertEqual(r.includes('javascript'), false, `javascript 不应残留: ${r}`)
+    }
+  })
+
+  await test('looksLikeHtmlLinear 与旧正则边界一致（CodeAnt 审查）', () => {
+    // / 后必须紧跟 >：<tag/foo> 不构成标签（旧正则 (?=\s|\/?>) 不匹配）
+    assertEqual(looksLikeHtmlLinear('<tag/foo>x>'), false, '<tag/foo>x> 不应判定为 HTML')
+    // 标签名后先出现 < 再 >：旧正则 [^<>]*> 不跨 <
+    assertEqual(looksLikeHtmlLinear('<tag <2> '), false, '<tag <2> 不应判定为 HTML')
+    // /> 要求 / 后紧跟 >（旧正则 \/?> 语义）
+    assertEqual(looksLikeHtmlLinear('<br/ >'), false, '<br/ > 不应判定为 HTML')
+    // autolink、无 >、非字母开头均不触发
+    assertEqual(looksLikeHtmlLinear('<https://example.com>'), false, 'autolink 不应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<a'), false, '<a 不应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<2>'), false, '<2> 不应判定为 HTML')
+    // 完整标签触发
+    assertEqual(looksLikeHtmlLinear('<b>x</b>'), true, '<b>x</b> 应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<br/>'), true, '<br/> 应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<br />'), true, '<br /> 应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<a href="x">y'), true, '<a href> 应判定为 HTML')
+    // 首个 < 不完整但后段完整标签仍触发（与正则逐位置尝试一致）
+    assertEqual(looksLikeHtmlLinear('<tag <2> <b>'), true, '后段 <b> 应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<b>x <i>'), true, '后段 <i> 应判定为 HTML')
+  })
+
+  await test('extractTestSummary 噪声日志不干扰汇总提取（CodeAnt 审查）', () => {
+    const cases = [
+      ['预检查通过\n实际结果：10 通过, 2 失败, 共 12', ['10', '2', '12']],
+      ['检查点通过\n检查点失败\n最终：3 通过, 1 失败, 共 4', ['3', '1', '4']],
+      ['10 通过, 2 失败, 共 12', ['10', '2', '12']],
+      ['共 99 条记录（无关）\n运行结束：7 通过, 0 失败, 共 7 个', ['7', '0', '7']],
+      // 汇总行后还有错误条目（含「通过」字样）也要取到汇总行
+      ['0 通过, 1 失败, 共 1 个\n1. 检查点通过', ['0', '1', '1']],
+      ['全部通过！785/785  100%', ['785', '785']],
+      ['🎉 全部通过！12/12', ['12', '12']],
+      ['无关键字的普通输出', []]
+    ]
+    for (const [input, expected] of cases) {
+      assert.deepStrictEqual(extractTestSummary(input), expected, `输入: ${JSON.stringify(input)}`)
     }
   })
 

@@ -125,14 +125,20 @@ function runTests (dir, timeoutMs) {
 }
 
 // 提取测试汇总数字："全部通过！N/M" 或 "N 通过, M 失败, 共 K"
-// S8786：数字组后接空白量词（\d+\s*）会被标超线性回溯，改用纯线性扫描
+// S8786：数字组后接空白量词（\d+\s*）会被标超线性回溯，改用纯线性扫描。
+// CodeAnt 审查：indexOf 取全文首个关键字会被无关日志（如测试名「…全部通过」）干扰；
+// 汇总行位于输出末尾——从末行向上找首个「通过/失败/共」三数字齐全的行，噪声日志不影响。
 function extractTestSummary (output) {
   const all = /全部通过！(\d+)\/(\d+)/.exec(output)
   if (all) return [all[1], all[2]]
-  const pass = numberBefore(output, '通过')
-  const fail = numberBefore(output, '失败')
-  const total = numberAfter(output, '共')
-  return pass !== null && fail !== null && total !== null ? [pass, fail, total] : []
+  const lines = output.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const pass = numberBefore(lines[i], '通过')
+    const fail = numberBefore(lines[i], '失败')
+    const total = numberAfter(lines[i], '共')
+    if (pass !== null && fail !== null && total !== null) return [pass, fail, total]
+  }
+  return []
 }
 
 // 关键字前紧邻的整数字符串（允许空白间隔），找不到返回 null
@@ -263,4 +269,4 @@ async function main () {
 }
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1 })
-module.exports = { generateMutants, collectMutants }
+module.exports = { generateMutants, collectMutants, extractTestSummary }
