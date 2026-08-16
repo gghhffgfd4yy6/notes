@@ -1074,5 +1074,6 @@
 - 核实为误报不修：`test_app.js:2125` 与 `slim:1378` 的 S3403（Sonar 数据流未跟踪赋值/local.js 动态配置）、`v3:280` S2871（ASCII 键确定性排序）、S2681×7/S7727/S2310（密集写法与箭头函数）。
 - PR #27 质量门 4 个新问题：run_mutation 汇总正则改 exec（S6594×2）+ 逐关键字单数字组线性提取（S8786）；looksLikeHtmlLinear 拆 helper 压认知复杂度（S3776）。
 - PR #27 CodeAnt 复审：looksLikeHtmlLinear 补两处与旧正则一致的边界（`/` 后须紧跟 `>`、`[^<>]*` 不跨 `<`）；run_mutation 汇总提取改末行向上扫描，无关日志不再干扰；新增对应回归测试。
+- PR #27 CodeRabbit 复审：mutation-report 跳过分支补 issue `number`（不再 `#undefined`）且跳过不再报"已发布"；test_app_p 分片排序改 code-unit 比较（locale 无关，C/zh-CN 分片一致）；test_filter 危险链接断言改扫全部标记（前畸形后有效不再漏检）+ 回归测试。
 - CI 质量矩阵修复：清掉 6f48aaa 引入的两处 `for (...; )` 尾空格 lint 错误（test_filter.js / xbk_function_v3.js）。
 - 测试：全量套件全绿；check-version 三方一致 v3.263。

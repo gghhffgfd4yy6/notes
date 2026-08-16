@@ -76,6 +76,18 @@ function assertEqual (actual, expected, msg) {
   }
 }
 
+// 输出中是否存在成链的 Markdown 危险链接 `[label](javascript:/vbscript:/data:)`。
+// CodeRabbit 审查：只查首个标记会漏掉「前畸形后有效」的组合——扫描全部标记，任一成链即 true
+function hasDangerLink (out) {
+  const re = /\]\((?:javascript|vbscript|data):/gi
+  let m
+  while ((m = re.exec(out)) !== null) {
+    const open = out.lastIndexOf('[', m.index)
+    if (open !== -1 && !out.slice(open + 1, m.index).includes(']')) return true
+  }
+  return false
+}
+
 function makeItem (overrides = {}) {
   return {
     catename: '微博线报',
@@ -2637,10 +2649,8 @@ console.log('========================================\n');
     for (const bad of ['<a href="javascript:alert(1)>x</a>', "<a href='javascript:alert(1)>x</a>", '<a href=javascript:alert(1)>x</a>', '<img src="data:text/html,x">']) {
       const out = tuisong_replace('{Html内容}', { content_html: bad, url: 'https://safe.example/a' })
       // S8786：`[^\]]*` + 后缀回溯 O(n²)；改定位 `](危险协议` 后核对配对 `[`（线性）
-      const dm = /\]\((?:javascript|vbscript|data):/i.exec(out)
-      const open = dm ? out.lastIndexOf('[', dm.index) : -1
-      const hasDangerLink = !!(dm && open !== -1 && !out.slice(open + 1, dm.index).includes(']'))
-      assertEqual(hasDangerLink, false, `未闭合引号危险属性不应生成链接: ${bad.slice(0, 30)}`)
+      // CodeRabbit 审查：exec 只取首个标记会漏检——hasDangerLink 扫描全部标记，任一成链即失败
+      assertEqual(hasDangerLink(out), false, `未闭合引号危险属性不应生成链接: ${bad.slice(0, 30)}`)
     }
     // 原始 content_html 中的危险 href/src 也必须清洗
     const raw = tuisong_replace('{Html内容}', { content_html: '<a href="javascript:alert(1)">点我</a><img src="javascript:x">', url: 'https://safe.example/a' })
@@ -8281,6 +8291,20 @@ console.log('========================================\n');
     for (const [input, expected] of cases) {
       assert.deepStrictEqual(extractTestSummary(input), expected, `输入: ${JSON.stringify(input)}`)
     }
+  })
+
+  await test('hasDangerLink 扫描全部危险标记，前畸形后有效也检出（CodeRabbit 审查）', () => {
+    // 前畸形（标签含 ]）后有效：只查首个标记会漏检
+    assertEqual(hasDangerLink('[a]b](javascript:alert(1)) [c](javascript:alert(1))'), true, '后段有效危险链接应检出')
+    // 畸形标记本身不误报
+    assertEqual(hasDangerLink('[a]b](javascript:alert(1))'), false, '畸形标记不应误报')
+    assertEqual(hasDangerLink('plain ](javascript:alert(1))'), false, '无配对 [ 不误报')
+    // 安全链接不误报
+    assertEqual(hasDangerLink('[x](https://safe.example/a)'), false, '安全链接不误报')
+    // 三种危险协议均检出
+    assertEqual(hasDangerLink('[x](javascript:alert(1))'), true, 'javascript: 应检出')
+    assertEqual(hasDangerLink('[x](vbscript:msgbox(1))'), true, 'vbscript: 应检出')
+    assertEqual(hasDangerLink('[x](data:text/html,x)'), true, 'data: 应检出')
   })
 
   if (failed === 0) {

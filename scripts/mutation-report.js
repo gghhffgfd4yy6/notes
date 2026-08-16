@@ -205,7 +205,7 @@ async function postIssue (body) {
     const existing = (list || []).find(i => i.title === title)
     if (existing) {
       console.log('⏭️  当日日报已存在，跳过重复发布')
-      return { html_url: existing.html_url, skipped: true }
+      return { number: existing.number, html_url: existing.html_url, skipped: true }
     }
   }
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
@@ -232,7 +232,10 @@ async function main () {
   console.log(body)
   if (process.argv.includes('--issue')) {
     const issue = await postIssue(body)
-    console.log(`\n✅ 日报已发布: issue #${issue.number}`) // S5145：不直接输出远端可控的 html_url
+    // CodeRabbit 审查：跳过分支补 number，且跳过不应标记为“已发布”
+    console.log(issue.skipped
+      ? `\n⏭️ 日报已存在，跳过发布（issue #${issue.number}）`
+      : `\n✅ 日报已发布: issue #${issue.number}`) // S5145：不直接输出远端可控的 html_url
   }
 }
 

@@ -31,7 +31,8 @@ const names = [...src.matchAll(/await test\((['"])(.*?)\1,/g)].map(m => m[2])
 if (names.length === 0) { console.error('未提取到测试名'); process.exit(2) }
 
 // ---------- 2. 分片（名称排序后均分，每片一个 worker，保证无重叠） ----------
-const sorted = names.slice().sort((a, b) => a.localeCompare(b)) // S2871：显式比较器，排序确定性
+// CodeRabbit 审查：localeCompare 跟随进程 locale（C=en-US 与 zh-CN 分片不同）→ 改 code-unit 比较，全环境确定性
+const sorted = names.slice().sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)) // S2871：显式且 locale 无关
 const chunkSize = Math.ceil(sorted.length / CONCURRENCY)
 const chunks = []
 for (let i = 0; i < sorted.length; i += chunkSize) {
