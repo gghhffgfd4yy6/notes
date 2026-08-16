@@ -26,7 +26,7 @@ function ensureDependencies () {
     '--no-audit',
     '--no-fund',
     '--prefix', ROOT
-  ], { cwd: ROOT, stdio: 'inherit' })
+  ], { cwd: ROOT, stdio: 'inherit', timeout: 120000 })
   if (result.error) throw result.error
   if (result.status !== 0) throw new Error(`npm install 失败，退出码 ${result.status}`)
 }
@@ -55,9 +55,9 @@ async function refreshConnections (app, signal) {
   })()
   const wxHost = 'wxpusher.zjiecode.com'
   const tasks = []
-  if (apiHost) tasks.push(agents.prewarmDns(apiHost))
+  if (apiHost) tasks.push(agents.prewarmDns(apiHost, signal))
   if (hasWxPusher) {
-    tasks.push(agents.prewarmDns(wxHost))
+    tasks.push(agents.prewarmDns(wxHost, signal))
     tasks.push(agents.prewarmTls(wxHost, 5000, refreshCount(app), signal))
   }
   const results = await Promise.all(tasks)
@@ -134,8 +134,10 @@ async function main () {
   const app = require(MAIN)
   const controller = new AbortController()
   const stop = () => controller.abort()
-  process.once('SIGTERM', stop)
-  process.once('SIGINT', stop)
+  // v3.262：用 process.on 而非 once——once 在首次信号后移除监听，第二次信号会走 Node
+  // 默认行为直接杀进程，可能打断进行中的推送；abort 幂等，多次信号只触发一次优雅停止。
+  process.on('SIGTERM', stop)
+  process.on('SIGINT', stop)
   console.log(`青龙常驻模式启动，单轮完成后等待 ${intervalMs(app.num)}ms 再拉取`)
   await runResident(app, controller)
   process.removeListener('SIGTERM', stop)
