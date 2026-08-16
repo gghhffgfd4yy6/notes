@@ -79,20 +79,21 @@ function assertEqual (actual, expected, msg) {
 // 输出中是否存在成链的 Markdown 危险链接 `[label](javascript:/vbscript:/data:)`。
 // CodeRabbit 审查：只查首个标记会漏掉「前畸形后有效」的组合——扫描全部标记，任一成链即 true
 // CodeAnt 复审：label 可含转义 `\]`——配对须跳过转义右括号，避免漏检
+// CodeRabbit 复审：`[`/`](` 定界符自身被转义时属纯文本，不得误报为危险链接
 function hasDangerLink (out) {
   const re = /\]\((?:javascript|vbscript|data):/gi
   let m
   while ((m = re.exec(out)) !== null) {
-    if (findLinkOpen(out, m.index) !== -1) return true
+    if (!isEscaped(out, m.index) && findLinkOpen(out, m.index) !== -1) return true
   }
   return false
 }
 
-// 从 `](` 所在右括号向左找配对的 `[`：两者之间不得有未转义的 `]`
+// 从 `](` 所在右括号向左找配对的 `[`：`[` 未被转义，且两者之间不得有未转义的 `]`
 function findLinkOpen (s, closeIdx) {
   let open = s.lastIndexOf('[', closeIdx - 1)
   while (open !== -1) {
-    if (!hasUnescapedClose(s, open + 1, closeIdx - 1)) return open
+    if (!isEscaped(s, open) && !hasUnescapedClose(s, open + 1, closeIdx - 1)) return open
     // lastIndexOf 的负 fromIndex 会被钳制为 0——open 已到 0 时须终止，否则死循环
     if (open === 0) break
     open = s.lastIndexOf('[', open - 1)
@@ -8338,6 +8339,9 @@ console.log('========================================\n');
     assertEqual(hasDangerLink(String.raw`[a\]b](javascript:alert(1))`), true, 'label 含转义 ] 仍应检出')
     assertEqual(hasDangerLink('[[x](javascript:alert(1))'), true, '前有额外 [ 仍应检出')
     assertEqual(hasDangerLink('[x](safe) text ](javascript:alert(1))'), false, '安全链接后的悬空标记不误报')
+    // CodeRabbit 复审：定界符被转义时属纯文本，不得误报
+    assertEqual(hasDangerLink(String.raw`\[x](javascript:alert(1))`), false, '转义 [ 不误报')
+    assertEqual(hasDangerLink(String.raw`[x\](javascript:alert(1))`), false, '转义 ] 不误报')
     // 安全链接不误报
     assertEqual(hasDangerLink('[x](https://safe.example/a)'), false, '安全链接不误报')
     // 三种危险协议均检出
