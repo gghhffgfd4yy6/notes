@@ -35,7 +35,9 @@ jobs:
         with:
           path: reports-all
           pattern: mutation-report-*
-          merge-multiple: true
+          # v3.262：merge-multiple 会把各 job 同名的 mutation.json 互相覆盖，分析只统计到
+          # 最后一个 job；改 false 保留目录结构（analyze-artifacts.js 递归遍历），统计完整。
+          merge-multiple: false
           run-id: ${{ steps.mutation-run.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: 解析存活变异体分布

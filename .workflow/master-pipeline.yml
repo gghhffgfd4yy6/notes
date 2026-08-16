@@ -80,8 +80,49 @@ stages:
     - npm install --ignore-scripts
     - npm run test:notify
 
+- name: resident-test
+  displayName: ⑥ 常驻回归（循环/失败策略/DNS/TLS/延迟加载）
+  strategy: naturally
+  trigger: auto
+  steps:
+  - step: build@nodejs
+    name: test_loop
+    displayName: test_loop.js（常驻循环）
+    nodeVersion: 20.19.0
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:loop
+  - step: build@nodejs
+    name: test_failure_policy
+    displayName: test_failure_policy.js（失败分类）
+    nodeVersion: 20.19.0
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:failure-policy
+  - step: build@nodejs
+    name: test_dns
+    displayName: test_dns_cache.js（DNS 失效）
+    nodeVersion: 20.19.0
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:dns
+  - step: build@nodejs
+    name: test_tls_prewarm
+    displayName: test_tls_prewarm.js（TLS 预热）
+    nodeVersion: 20.19.0
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:tls-prewarm
+  - step: build@nodejs
+    name: test_lazy
+    displayName: test_lazy_notify.js（延迟加载）
+    nodeVersion: 20.19.0
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:lazy
+
 - name: summary
-  displayName: ⑥ 汇总（全过才到这一步）
+  displayName: ⑦ 汇总（全过才到这一步）
   strategy: naturally
   trigger: auto
   steps:
@@ -90,7 +131,7 @@ stages:
     displayName: 打印通过摘要
     nodeVersion: 20.19.0
     commands:
-    - echo "✅ 全部门禁通过：lint + 版本闸门 + 单元 + 集成(并行/串行) + 通道"
+    - echo "✅ 全部门禁通过：lint + 版本闸门 + 单元 + 集成(并行/串行) + 通道 + 常驻回归"
     - echo "📊 失败定位：Gitee Go 日志中搜索 ❌ 即为失败测试名（各测试文件末尾打印失败清单）"
 notify: []
 # 说明：notify 可按 Gitee Go 平台格式配置失败通知（webhook/邮件），平台格式变化时更新。

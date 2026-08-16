@@ -20,20 +20,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # V3（3618 行）拆 4 段
+          # V3（4494 行，v3.262 按当前行数重拆）拆 4 段
           - name: v3-part1
-            mutate: "xbk_function_v3.js:1-900"
+            mutate: "xbk_function_v3.js:1-1150"
           - name: v3-part2
-            mutate: "xbk_function_v3.js:901-1800"
+            mutate: "xbk_function_v3.js:1151-2300"
           - name: v3-part3
-            mutate: "xbk_function_v3.js:1801-2700"
+            mutate: "xbk_function_v3.js:2301-3450"
           - name: v3-part4
-            mutate: "xbk_function_v3.js:2701-3618"
-          # sendnotify（1308 行）拆 2 段
+            mutate: "xbk_function_v3.js:3451-4494"
+          # sendnotify（1416 行，v3.262 按当前行数重拆）拆 2 段
           - name: sendnotify-part1
-            mutate: "xbk_sendNotify_slim.js:1-654"
+            mutate: "xbk_sendNotify_slim.js:1-750"
           - name: sendnotify-part2
-            mutate: "xbk_sendNotify_slim.js:655-1308"
+            mutate: "xbk_sendNotify_slim.js:751-1416"
           # 小文件各一任务
           - name: failure-policy
             mutate: "xbk_failure_policy.js"

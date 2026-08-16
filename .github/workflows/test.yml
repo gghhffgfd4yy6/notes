@@ -10,6 +10,9 @@ on:
   push:
     branches: [master]
 
+permissions:
+  contents: read
+
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -40,6 +43,23 @@ jobs:
 
       - name: 通道测试（test_notify.js）
         run: npm run test:notify
+
+      # v3.262：常驻相关回归此前只在 run_tests.js/npm test 里跑，CI 门禁完全未覆盖，
+      # 改动 xbk_loop/xbk_push/xbk_agents 可带回归通过 PR。补齐 5 个套件。
+      - name: 常驻循环测试（test_loop.js）
+        run: npm run test:loop
+
+      - name: 常驻失败策略测试（test_failure_policy.js）
+        run: npm run test:failure-policy
+
+      - name: DNS 失效回归（test_dns_cache.js）
+        run: npm run test:dns
+
+      - name: TLS 预热回归（test_tls_prewarm.js）
+        run: npm run test:tls-prewarm
+
+      - name: 延迟加载回归（test_lazy_notify.js）
+        run: npm run test:lazy
 
       - name: 集成测试（test_app_p.js，并行调度）
         run: npm run test:app
