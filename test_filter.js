@@ -6,9 +6,10 @@
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================
 
-const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity } = require('./xbk_function_v3.js')
+const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity } = require('./xbk_function_v3.js')
 const assert = require('assert')
 const slim = require('./xbk_sendNotify_slim.js')
+const { extractTestSummary } = require('./run_mutation.js')
 const path = require('path')
 // 缓存目录（基于 __dirname——v3.113 修复 /workspace 硬编码，仓库可移植）
 const CACHE = path.join(__dirname, 'xianbaoku_cache')
@@ -73,6 +74,46 @@ function assertEqual (actual, expected, msg) {
     e.message = msg || `期望=${expected}, 实际=${actual}`
     throw e
   }
+}
+
+// 输出中是否存在成链的 Markdown 危险链接 `[label](javascript:/vbscript:/data:)`。
+// CodeRabbit 审查：只查首个标记会漏掉「前畸形后有效」的组合——扫描全部标记，任一成链即 true
+// CodeAnt 复审：label 可含转义 `\]`——配对须跳过转义右括号，避免漏检
+// CodeRabbit 复审：`[`/`](` 定界符自身被转义时属纯文本，不得误报为危险链接
+function hasDangerLink (out) {
+  const re = /\]\((?:javascript|vbscript|data):/gi
+  let m
+  while ((m = re.exec(out)) !== null) {
+    if (!isEscaped(out, m.index) && findLinkOpen(out, m.index) !== -1) return true
+  }
+  return false
+}
+
+// 从 `](` 所在右括号向左找配对的 `[`：`[` 未被转义，且两者之间不得有未转义的 `]`
+function findLinkOpen (s, closeIdx) {
+  let open = s.lastIndexOf('[', closeIdx - 1)
+  while (open !== -1) {
+    if (!isEscaped(s, open) && !hasUnescapedClose(s, open + 1, closeIdx - 1)) return open
+    // lastIndexOf 的负 fromIndex 会被钳制为 0——open 已到 0 时须终止，否则死循环
+    if (open === 0) break
+    open = s.lastIndexOf('[', open - 1)
+  }
+  return -1
+}
+
+// 区间 [from, to] 内是否存在未转义的 `]`（`\]` 属转义，不视为闭合）
+function hasUnescapedClose (s, from, to) {
+  for (let i = from; i <= to; i++) {
+    if (s[i] === ']' && !isEscaped(s, i)) return true
+  }
+  return false
+}
+
+// 下标 i 的字符是否被奇数个反斜杠转义
+function isEscaped (s, i) {
+  let backslashes = 0
+  for (let j = i - 1; j >= 0 && s[j] === '\\'; j--) backslashes++
+  return (backslashes & 1) === 1
 }
 
 function makeItem (overrides = {}) {
@@ -2635,7 +2676,9 @@ console.log('========================================\n');
     // 成对引号/无引号正则均不匹配，危险协议会保留执行；必须单独清洗。
     for (const bad of ['<a href="javascript:alert(1)>x</a>', "<a href='javascript:alert(1)>x</a>", '<a href=javascript:alert(1)>x</a>', '<img src="data:text/html,x">']) {
       const out = tuisong_replace('{Html内容}', { content_html: bad, url: 'https://safe.example/a' })
-      assertEqual(/\[[^\]]*\]\((?:javascript|vbscript|data):/i.test(out), false, `未闭合引号危险属性不应生成链接: ${bad.slice(0, 30)}`)
+      // S8786：`[^\]]*` + 后缀回溯 O(n²)；改定位 `](危险协议` 后核对配对 `[`（线性）
+      // CodeRabbit 审查：exec 只取首个标记会漏检——hasDangerLink 扫描全部标记，任一成链即失败
+      assertEqual(hasDangerLink(out), false, `未闭合引号危险属性不应生成链接: ${bad.slice(0, 30)}`)
     }
     // 原始 content_html 中的危险 href/src 也必须清洗
     const raw = tuisong_replace('{Html内容}', { content_html: '<a href="javascript:alert(1)">点我</a><img src="javascript:x">', url: 'https://safe.example/a' })
@@ -2657,7 +2700,19 @@ console.log('========================================\n');
       content_html: '<img srcset=javascript:alert(4)><div style=background:url(javascript:alert(5))>z</div>',
       url: 'https://safe.example/a'
     })
-    assertEqual(/srcset\s*=\s*javascript:|style\s*=\s*[^>]*javascript:/i.test(activeUnquoted), false,
+    // S8786：`style=[^>]*javascript:` 回溯 O(n²)；拆成 srcset 直查 + style 段线性扫描
+    const srcsetDanger = /srcset\s*=\s*javascript:/i.test(activeUnquoted)
+    let styleDanger = false
+    for (let i = 0; !styleDanger && i < activeUnquoted.length;) {
+      const m = /style\s*=\s*/i.exec(activeUnquoted.slice(i))
+      if (!m) break
+      const start = i + m.index + m[0].length
+      const end = activeUnquoted.indexOf('>', start)
+      const seg = activeUnquoted.slice(start, end === -1 ? activeUnquoted.length : end)
+      styleDanger = /javascript:/i.test(seg)
+      i = end === -1 ? activeUnquoted.length : end + 1
+    }
+    assertEqual(srcsetDanger || styleDanger, false,
       'Html内容 不应遗漏无引号 srcset/style 危险路径')
     const slashEvent = tuisong_replace('{Html内容}', {
       content_html: '<img/onerror=alert(6)><div/onload = "alert(7)">x</div>',
@@ -8226,6 +8281,73 @@ console.log('========================================\n');
       assertEqual(/url\s*\(/i.test(r), false, `url( 不应残留: ${r}`)
       assertEqual(r.includes('javascript'), false, `javascript 不应残留: ${r}`)
     }
+  })
+
+  await test('looksLikeHtmlLinear 与旧正则边界一致（CodeAnt 审查）', () => {
+    // / 后必须紧跟 >：<tag/foo> 不构成标签（旧正则 (?=\s|\/?>) 不匹配）
+    assertEqual(looksLikeHtmlLinear('<tag/foo>x>'), false, '<tag/foo>x> 不应判定为 HTML')
+    // 标签名后先出现 < 再 >：旧正则 [^<>]*> 不跨 <
+    assertEqual(looksLikeHtmlLinear('<tag <2> '), false, '<tag <2> 不应判定为 HTML')
+    // /> 要求 / 后紧跟 >（旧正则 \/?> 语义）
+    assertEqual(looksLikeHtmlLinear('<br/ >'), false, '<br/ > 不应判定为 HTML')
+    // autolink、无 >、非字母开头均不触发
+    assertEqual(looksLikeHtmlLinear('<https://example.com>'), false, 'autolink 不应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<a'), false, '<a 不应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<2>'), false, '<2> 不应判定为 HTML')
+    // 完整标签触发
+    assertEqual(looksLikeHtmlLinear('<b>x</b>'), true, '<b>x</b> 应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<br/>'), true, '<br/> 应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<br />'), true, '<br /> 应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<a href="x">y'), true, '<a href> 应判定为 HTML')
+    // 首个 < 不完整但后段完整标签仍触发（与正则逐位置尝试一致）
+    assertEqual(looksLikeHtmlLinear('<tag <2> <b>'), true, '后段 <b> 应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<b>x <i>'), true, '后段 <i> 应判定为 HTML')
+    // CodeAnt 复审：大量候选标签但全文无 > 必须快速返回（曾因每候选 indexOf('>') 到末尾 O(n²)）
+    assertEqual(looksLikeHtmlLinear('<a '.repeat(50000)), false, '大量 <a 前缀无 > 不应判定为 HTML')
+    assertEqual(looksLikeHtmlLinear('<a '.repeat(50000) + 'x>'), true, '大量 <a 前缀后出现 > 应判定为 HTML')
+  })
+
+  await test('extractTestSummary 噪声日志不干扰汇总提取（CodeAnt 审查）', () => {
+    const cases = [
+      ['预检查通过\n实际结果：10 通过, 2 失败, 共 12', ['10', '2', '12']],
+      ['检查点通过\n检查点失败\n最终：3 通过, 1 失败, 共 4', ['3', '1', '4']],
+      ['10 通过, 2 失败, 共 12', ['10', '2', '12']],
+      ['共 99 条记录（无关）\n运行结束：7 通过, 0 失败, 共 7 个', ['7', '0', '7']],
+      // 汇总行后还有错误条目（含「通过」字样）也要取到汇总行
+      ['0 通过, 1 失败, 共 1 个\n1. 检查点通过', ['0', '1', '1']],
+      // CodeAnt 复审：更早的无关「全部通过！1/1」日志不得抢答真实汇总行
+      ['测试名：全部通过！1/1\n实际结果：7 通过, 0 失败, 共 7', ['7', '0', '7']],
+      // CodeAnt 复审：同一行前置无关「通过/失败」文本不得抢答
+      ['检查通过：准备完成；实际结果：7 通过, 0 失败, 共 7', ['7', '0', '7']],
+      ['之前失败 0；实际结果：7 通过, 0 失败, 共 7', ['7', '0', '7']],
+      ['全部通过！785/785  100%', ['785', '785']],
+      ['🎉 全部通过！12/12', ['12', '12']],
+      ['无关键字的普通输出', []]
+    ]
+    for (const [input, expected] of cases) {
+      assert.deepStrictEqual(extractTestSummary(input), expected, `输入: ${JSON.stringify(input)}`)
+    }
+  })
+
+  await test('hasDangerLink 扫描全部危险标记，前畸形后有效也检出（CodeRabbit 审查）', () => {
+    // 前畸形（标签含 ]）后有效：只查首个标记会漏检
+    assertEqual(hasDangerLink('[a]b](javascript:alert(1)) [c](javascript:alert(1))'), true, '后段有效危险链接应检出')
+    // 畸形标记本身不误报
+    assertEqual(hasDangerLink('[a]b](javascript:alert(1))'), false, '畸形标记不应误报')
+    assertEqual(hasDangerLink('plain ](javascript:alert(1))'), false, '无配对 [ 不误报')
+    // CodeAnt 复审：边界——转义右括号、额外开括号、安全链接后的悬空标记
+    assertEqual(hasDangerLink(String.raw`[a\]b](javascript:alert(1))`), true, 'label 含转义 ] 仍应检出')
+    assertEqual(hasDangerLink('[[x](javascript:alert(1))'), true, '前有额外 [ 仍应检出')
+    assertEqual(hasDangerLink('[x](safe) text ](javascript:alert(1))'), false, '安全链接后的悬空标记不误报')
+    // CodeRabbit 复审：定界符被转义时属纯文本，不得误报
+    assertEqual(hasDangerLink(String.raw`\[x](javascript:alert(1))`), false, '转义 [ 不误报')
+    assertEqual(hasDangerLink(String.raw`[x\](javascript:alert(1))`), false, '转义 ] 不误报')
+    // 安全链接不误报
+    assertEqual(hasDangerLink('[x](https://safe.example/a)'), false, '安全链接不误报')
+    // 三种危险协议均检出
+    assertEqual(hasDangerLink('[x](javascript:alert(1))'), true, 'javascript: 应检出')
+    assertEqual(hasDangerLink('[x](vbscript:msgbox(1))'), true, 'vbscript: 应检出')
+    assertEqual(hasDangerLink('[x](data:text/html,x)'), true, 'data: 应检出')
   })
 
   if (failed === 0) {

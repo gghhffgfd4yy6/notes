@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.262 — 子代理审查 P2/P3 修复 ********
+//* ******* 线报酷推送脚本 v3.263 — SonarCloud 全量扫描 P1/P2 修复 ********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -1378,7 +1378,7 @@ const Formatter = {
     shuju = Utils.safeObjectCopy(shuju || {})
     let html = (typeof shuju.content_html === 'string')
       ? shuju.content_html
-      : (shuju.content_html === undefined || shuju.content_html === null ? '' : '') // 非字符串内容视为空（避免 [object Object]）
+      : '' // 非字符串内容视为空（避免 [object Object]）
     // v3.254 P1(ReDoS)：`<a>`/`<h1-6>` 正则曾用无界惰性 [\s\S]*? 接固定闭合标签且带 g，
     // 多个未闭合标签时每次起始位置回扫到串尾呈 O(n²)——content_html 来自外部接口可被
     // 构造为 10 万+ 字符卡死主线程。v3.254 的 100k 截断只能把最坏输入压到 ~100k（实测
@@ -3360,6 +3360,48 @@ const Network = {
   }
 }
 
+// S8786：HTML 形态线性检测（与 xbk_sendNotify_slim.looksHtml 同思路）——原正则
+// /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^<>]*>/i 在「大量 <tag 前缀但全文无 >」的
+// 对抗输入上 O(n²) 回溯；改单趟扫描：< → 可选空白/斜杠 → 字母开头标签名 → 名字后跟
+// 空白、> 或 />（/ 后必须紧跟 >，排除 <https://...> autolink）→ 在下一个 < 之前存在 >
+// 即判定为 HTML（与旧正则 [^<>]*> 一致，CodeAnt 审查确认边界）。
+// CodeAnt 复审：每个候选都 indexOf('>') 到末尾对「大量 <a 前缀但全文无 >」仍 O(n²)；
+// 改为从标签名后单趟扫到第一个 < 或 >，先遇 > 即成链，先遇 < 则直接以它为下一候选起点，
+// 每个字符至多扫常数次，严格线性。
+function looksLikeHtmlLinear (s) {
+  let i = 0
+  while (i < s.length) {
+    const lt = s.indexOf('<', i)
+    if (lt === -1) return false
+    const nameEnd = htmlTagNameEnd(s, lt)
+    if (nameEnd === -1) { i = lt + 1; continue }
+    let j = nameEnd
+    while (j < s.length && s[j] !== '>' && s[j] !== '<') j++
+    if (j < s.length && s[j] === '>') return true
+    // 先遇 <（或到末尾）：本候选不成链；遇 < 时该 < 即下一候选起点（与正则逐位置尝试一致）
+    i = j
+  }
+  return false
+}
+
+// 返回 < 处标签名结束位；非完整标签返回 -1（S3776：独立成函数压认知复杂度）
+function htmlTagNameEnd (s, lt) {
+  let j = lt + 1
+  while (j < s.length && /\s/.test(s[j])) j++
+  if (s[j] === '/') { j++; while (j < s.length && /\s/.test(s[j])) j++ }
+  if (!/[A-Za-z]/.test(s[j] || '')) return -1
+  j++
+  while (j < s.length && /[A-Za-z0-9-]/.test(s[j])) j++
+  return isTagNameBoundary(s, j) ? j : -1
+}
+
+// 标签名结束边界：空白、>，或 / 且后一个字符必须是 >（与旧正则 (?=\s|\/?>) 一致）
+function isTagNameBoundary (s, pos) {
+  const ch = s[pos]
+  if (ch === undefined || ch === '>' || /\s/.test(ch)) return true
+  return ch === '/' && s[pos + 1] === '>'
+}
+
 // ============================================================
 // 📤 Pusher — 推送层
 // ============================================================
@@ -3381,8 +3423,7 @@ const Pusher = {
     // 超长 desp 截断为已知边界（与全局 htmlToMarkdown/sanitizeDecodedHtml 截断策略一致）。
     const HTML_LIKE_MAX_LEN = 100000
     if (desp.length > HTML_LIKE_MAX_LEN) desp = desp.slice(0, HTML_LIKE_MAX_LEN)
-    const htmlLike =
-      /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^<>]*>/i.test(desp)
+    const htmlLike = looksLikeHtmlLinear(desp) // S8786：线性扫描替代原回溯正则
     if (htmlLike) {
       desp = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(desp))
     }
@@ -4451,6 +4492,7 @@ if (typeof module !== 'undefined' && module.exports) {
     validateConfig: RuleEngine.validateConfig.bind(RuleEngine),
     tuisong_replace: Formatter.tuisong_replace.bind(Formatter),
     htmlToMarkdown: Formatter.htmlToMarkdown.bind(Formatter),
+    looksLikeHtmlLinear,
     isMessageInFile: MessageStore.has.bind(MessageStore),
     appendMessageToFile: MessageStore.save.bind(MessageStore),
     getFileName: MessageStore.getFileName.bind(MessageStore),

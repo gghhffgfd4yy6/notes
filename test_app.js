@@ -2822,7 +2822,7 @@ console.log('========================================\n');
     Config.cache.dir = testCacheDir
     notifyMock.hasWxPusherConfigured = () => true // 让预热路径创建 controller，用于观测 finally abort
     dnsMod.lookup = (host, opts, cb) => {
-      if (typeof opts === 'function') { cb = opts; opts = {} }
+      if (typeof opts === 'function') { cb = opts }
       cb(null, '127.0.0.1', 4)
     }
     fs.mkdirSync = () => { throw new Error('mock mkdir fail') }

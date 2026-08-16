@@ -205,7 +205,7 @@ async function postIssue (body) {
     const existing = (list || []).find(i => i.title === title)
     if (existing) {
       console.log('⏭️  当日日报已存在，跳过重复发布')
-      return { html_url: existing.html_url, skipped: true }
+      return { number: existing.number, html_url: existing.html_url, skipped: true }
     }
   }
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
@@ -213,7 +213,11 @@ async function postIssue (body) {
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'mutation-report' },
     body: JSON.stringify({ title, body })
   })
-  if (!res.ok) throw new Error(`发 Issue 失败: ${res.status} ${await res.text()}`)
+  if (!res.ok) {
+    // S5145：远端响应体不可信（可能含换行/控制字符/伪日志前缀），只记录固定状态码
+    await res.text().catch(() => {})
+    throw new Error(`发 Issue 失败，HTTP 状态码：${res.status}`)
+  }
   return res.json()
 }
 
@@ -232,7 +236,14 @@ async function main () {
   console.log(body)
   if (process.argv.includes('--issue')) {
     const issue = await postIssue(body)
-    console.log(`\n✅ 日报已发布: ${issue.html_url}`)
+    // CodeRabbit 审查：跳过分支补 number，且跳过不应标记为“已发布”
+    if (issue.skipped) {
+      // S5145：existing.number 来自远端 Issue 列表，属用户可控数据——跳过时不输出
+      console.log('\n⏭️ 日报已存在，跳过发布')
+    } else {
+      // S5145：number 来自远端响应（POST /issues），属用户可控数据——日志不再输出远端字段
+      console.log('\n✅ 日报已发布')
+    }
   }
 }
 

@@ -1065,3 +1065,16 @@
 - 测试：全量（单元 + 通道 + 常驻 5 套件 + 集成并行/串行）全绿。
 - SonarCloud 质量门（PR #25）：`Security Rating on New Code` 恢复 A——重试抖动改 `crypto.randomInt` 消除 S2245 安全热点；顺带清掉新代码告警：wxpusher 回调认知复杂度 16→拆 `wxPusherBusinessError`、Push+ 换行归一化改 `replaceAll`、可选链、`node:fs`、测试 URL 改 https。
 - CodeAnt 审查低优先级项（PR #25）：常驻入口信号监听器清理移入 `finally`，异常路径不再遗留 SIGTERM/SIGINT 钩子。
+
+## v3.263（SonarCloud 全量扫描 P1/P2 修复，2026-08-17）
+
+- 用 SonarCloud token 拉取全量未解决问题分级梳理：多数为风格/维护性噪音（node: 前缀、http、可选链、复杂度等），真 bug 集中在少数几处，本版修复：
+- 主程序：htmlToMarkdown 死三元（S3923）；Pusher 出口 HTML 形态检测正则线性化（S8786，与 slim looksHtml 同思路）+ 字符类去重（S5869）；xbk_storage 临时文件名 `Math.random` → `crypto.randomBytes`（S2245）。
+- 工具/测试：run_mutation 汇总正则拆交替（S8786）；mutation-report 日报日志不再输出远端可控 html_url（S5145）；test_filter 两处断言正则线性化（S8786）；test_app 无用赋值（S1854）；test_app_p 排序加比较器（S2871）。
+- 核实为误报不修：test_app 与 slim 的 S3403（Sonar 数据流未跟踪赋值/动态配置）、v3 的 S2871（ASCII 键确定性排序）、S2681/S7727/S2310（密集写法与箭头函数）。
+- 质量门新问题：run_mutation 汇总正则改 exec（S6594）+ 逐关键字单数字组线性提取（S8786）；looksLikeHtmlLinear 拆 helper 压认知复杂度（S3776）。
+- CodeAnt 复审：looksLikeHtmlLinear 补两处与旧正则一致的边界（`/` 后须紧跟 `>`、`[^<>]*` 不跨 `<`）；run_mutation 汇总提取改末行向上扫描，无关日志不再干扰；新增对应回归测试。
+- CodeRabbit 复审：mutation-report 跳过分支补 issue `number`（不再 `#undefined`）且跳过不再报"已发布"；test_app_p 分片排序改 code-unit 比较（locale 无关，C/zh-CN 分片一致）；test_filter 危险链接断言改扫全部标记（前畸形后有效不再漏检）+ 回归测试。
+- 复审二轮：looksLikeHtmlLinear 改严格单趟线性（大量 `<a ` 前缀无 `>` 不再 O(n²)）；run_mutation「全部通过」并入末行逐行扫描（前置噪声日志不再抢答）；test_app_p 嵌套三元拆函数（S3358）；mutation-report 日志不再输出远端可控 `number`（S5145，type=VULNERABILITY 拉低 Security Rating）。
+- CI 质量矩阵修复：清掉引入的两处 `for (...; )` 尾空格 lint 错误（test_filter.js / xbk_function_v3.js）。
+- 测试：全量套件全绿；check-version 三方一致。

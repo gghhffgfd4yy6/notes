@@ -117,10 +117,78 @@ function runTests (dir, timeoutMs) {
     const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ status: 'timeout', output }) }, timeoutMs)
     child.on('close', (code, signal) => {
       clearTimeout(timer)
-      const match = output.match(/(?:全部通过！(\d+)\/(\d+)|(?:⚠️\s+)?\s*(\d+) 通过,?\s*(\d+) 失败,?\s*共\s*(\d+))/)
-      resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: match ? match.slice(1) : [] })
+      // S8786/S6594：多量词组正则（(\d+)(sep)(\d+)）被标超线性回溯且 String.match 被标；
+      // 改 exec + 逐关键字单数字组线性提取（summary 仅写入变异报告，无逻辑消费方）
+      resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: extractTestSummary(output) })
     })
   })
+}
+
+// 提取测试汇总数字："全部通过！N/M" 或 "N 通过, M 失败, 共 K"
+// S8786：数字组后接空白量词（\d+\s*）会被标超线性回溯，改用纯线性扫描。
+// CodeAnt 审查：indexOf 取全文首个关键字会被无关日志（如测试名「…全部通过」）干扰；
+// 汇总行位于输出末尾——从末行向上逐行匹配「全部通过！N/M」或「通过/失败/共」三数字齐全
+// 的行；CodeAnt 复审：「全部通过」正则原先在行扫描前全文匹配，会被更早的无关「全部通过！1/1」
+// 日志抢答——现与关键字检查同属逐行扫描，噪声日志不影响。
+function extractTestSummary (output) {
+  const lines = output.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const all = /全部通过！(\d+)\/(\d+)/.exec(lines[i])
+    if (all) return [all[1], all[2]]
+    const triple = lineTriple(lines[i])
+    if (triple) return triple
+  }
+  return []
+}
+
+// 单行内找「K 通过, M 失败, 共 N」：取最后一个「共 N」，再向左取最近的「M 失败」「K 通过」。
+// CodeAnt 复审：同一行前置无关「通过/失败/共」文本（如「检查通过：…」「之前失败 0」）不得抢答。
+function lineTriple (s) {
+  let total = null
+  let totalPos = -1
+  for (let i = 0; (i = s.indexOf('共', i)) !== -1; i += 1) {
+    const n = numberAfter(s, i, 1)
+    if (n !== null) {
+      total = n
+      totalPos = i
+    }
+  }
+  if (total === null) return null
+  let fail = null
+  let failPos = -1
+  for (let i = 0; (i = s.indexOf('失败', i)) !== -1 && i < totalPos; i += 1) {
+    const n = numberBefore(s, i)
+    if (n !== null) {
+      fail = n
+      failPos = i
+    }
+  }
+  if (fail === null) return null
+  let pass = null
+  for (let i = 0; (i = s.indexOf('通过', i)) !== -1 && i < failPos; i += 1) {
+    const n = numberBefore(s, i)
+    if (n !== null) pass = n
+  }
+  if (pass === null) return null
+  return [pass, fail, total]
+}
+
+// 关键字起点 idx 前紧邻的整数字符串（允许空白间隔），找不到返回 null
+function numberBefore (s, idx) {
+  let end = idx
+  while (end > 0 && /\s/.test(s[end - 1])) end--
+  let start = end
+  while (start > 0 && s[start - 1] >= '0' && s[start - 1] <= '9') start--
+  return start < end ? s.slice(start, end) : null
+}
+
+// 关键字终点（idx + kwLen）后紧邻的整数字符串（允许空白间隔），找不到返回 null
+function numberAfter (s, idx, kwLen) {
+  let start = idx + kwLen
+  while (start < s.length && /\s/.test(s[start])) start++
+  let end = start
+  while (end < s.length && s[end] >= '0' && s[end] <= '9') end++
+  return start < end ? s.slice(start, end) : null
 }
 
 async function evaluate (mutants, files, timeoutMs) {
@@ -229,4 +297,4 @@ async function main () {
 }
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1 })
-module.exports = { generateMutants, collectMutants }
+module.exports = { generateMutants, collectMutants, extractTestSummary }
