@@ -4640,6 +4640,11 @@ console.log('========================================\n');
     assertEqual(f('x[text](https://a) y'), 'xtext (https://a) y', '常规链接正常转换')
     assertEqual(f('[https://a](https://a)'), 'https://a', '原文链接只显示一次')
     assertEqual(f('[a](url)[b](url2)'), 'a (url)b (url2)', '多链接连续转换')
+    // v3.264：大量「[text]( 后无 )」的未闭合块曾每块重扫 indexOf(')') 退化为 O(n²)
+    const bad = '[x]('.repeat(200000)
+    const tBad = Date.now()
+    assertEqual(f(bad), bad, '未闭合 ) 应原样保留')
+    assert(Date.now() - tBad < 1000, `[x]( 对抗输入应 <1s，实际 ${Date.now() - tBad}ms`)
   })
 
   await test('looksHtml/stripAngleTags 畸形输入线性等价（CodeAnt 建议回归）', () => {
@@ -4648,16 +4653,44 @@ console.log('========================================\n');
     const t0 = Date.now()
     assertEqual(slim.looksHtml(long), false, '无 > 不应判 HTML')
     assertEqual(Date.now() - t0 < 1000, true, `对抗输入应 <1s，实际 ${Date.now() - t0}ms`)
+    // v3.264：`<tag `（名字后跟空格）形态会走 includes('>') 全扫剩余串——原实现每处重扫
+    // 呈 O(n²)（80 万字符 3s）；此形态旧测试的 '<script'（后跟 '<'）未覆盖
+    const long2 = '<h1 '.repeat(200000)
+    const t1 = Date.now()
+    assertEqual(slim.looksHtml(long2), false, '无 > 不应判 HTML')
+    assert(Date.now() - t1 < 1000, `对抗输入 <h1 应 <1s，实际 ${Date.now() - t1}ms`)
     assertEqual(slim.looksHtml('<b>hi</b>'), true, '正常 HTML 判定')
     assertEqual(slim.looksHtml('https://a.com/<b>x</b>'), true, '含 HTML 判定')
     assertEqual(slim.looksHtml('看看 <https://autolink>'), false, 'autolink 不算 HTML')
     assertEqual(slim.looksHtml('<br/>x'), true, '自闭合标签算 HTML')
+    assertEqual(slim.looksHtml('<h1\u00A0id="a">hi</h1>'), true, 'U+00A0 等 Unicode 空白分隔属性仍判 HTML（空白类语义回归，CodeRabbit 完整审核）')
     // stripAngleTags：无 > 的输入原样保留，autolink 保留内容，HTML 标签剥空
     assertEqual(slim.stripAngleTags('<url>https://a</url>', true), 'https://a', 'autolink 保留内容')
     assertEqual(slim.stripAngleTags('<b>加粗</b>', true), '加粗', 'HTML 标签剥空')
     assertEqual(slim.stripAngleTags('a<b', true), 'a<b', '无 > 原样保留')
     assertEqual(slim.stripAngleTags('<b', true), '<b', '无 > 原样保留')
     assertEqual(slim.stripAngleTags('<b>x</b>', false), '<b>x</b>', 'stripAngle=false 整体保留')
+  })
+
+  await test('mdImagesToPlain 线性等价（v3.264：图片正则 O(n²) 修复回归）', () => {
+    const f = slim.mdImagesToPlain
+    // 行为：与旧 /!\[([^\]]*)\]\(([^)]+)\)/ → alt 逐例等价
+    assertEqual(f('![alt](https://a)'), 'alt', '常规图片替换为 alt')
+    assertEqual(f('![](url)'), '', '空 alt 替换为空')
+    assertEqual(f('![](url)', '(图片)'), '(图片)', 'emptyAlt 参数生效')
+    assertEqual(f('![] (url)'), '![] (url)', '] 与 ( 之间有空格：不匹配原样保留')
+    assertEqual(f('x![a]()y'), 'x![a]()y', '空 url 原样保留')
+    assertEqual(f('![a](b'), '![a](b', '未闭合 ) 原样保留')
+    assertEqual(f('![a'), '![a', '未闭合 ] 原样保留')
+    assertEqual(f('![a]x(b)'), '![a]x(b)', '] 后非 ( 原样保留')
+    assertEqual(f('![a](b)(c)'), 'a(c)', '只替换首个闭合图片，剩余保留')
+    assertEqual(f('![a![b]](c)'), '![a![b]](c)', '嵌套 [ 与旧正则一致：不匹配原样保留')
+    assertEqual(f('![a](b)![c](d)'), 'ac', '多图片连续替换')
+    // 性能：大量未配对 ![ 不得回溯卡死（旧正则 4 万字符 ~9.5s）
+    const bad = '![a'.repeat(200000)
+    const t0 = Date.now()
+    assertEqual(f(bad), bad, '未配对 ![ 应原样保留')
+    assert(Date.now() - t0 < 1000, `![ 对抗输入应 <1s，实际 ${Date.now() - t0}ms`)
   })
 
   // ==================== 71. 通读复查修复 ====================

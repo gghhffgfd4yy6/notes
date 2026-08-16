@@ -3906,7 +3906,9 @@ const App = {
       }
 
       // 域名校验（v3.73）：非法 URL 会让 fetchData 重试耗尽才报错，配置层提前提示
-      if (typeof Config.domain !== 'string' || !/^https?:\/\//.test(Config.domain)) {
+      // v3.265：先 trim 再校验——与 baseUrl/pushUrl 的 trimTrailingSlashes(trim()) 使用口径一致，
+      // 避免「带首尾空格的合法 domain」被误报非法（CodeAnt PR24 完整审核）
+      if (typeof Config.domain !== 'string' || !/^https?:\/\//.test(Config.domain.trim())) {
         console.warn(`⚠️ 配置「domain」为「${safeConfigText(Config.domain)}」不是 http(s):// 开头的合法地址`)
       }
 
@@ -4172,7 +4174,7 @@ const App = {
       }
       // domain 去尾斜杠后与相对路径统一拼接（避免 'https://x.com//rel' 双斜杠）
       // R2：非字符串 domain（脏配置）→ 空串 baseUrl（相对路径不拼前缀，避免 .replace 崩溃）
-      const baseUrl = (typeof Config.domain === 'string') ? Config.domain.trim().replace(/\/+$/, '') : '' // v3.158: trim
+      const baseUrl = (typeof Config.domain === 'string') ? trimTrailingSlashes(Config.domain.trim()) : '' // v3.158: trim
       // url 类型防御：非字符串(null/undefined/对象/数字)视为无链接——避免 .includes 崩溃或 [object Object]
       // 与 htmlToMarkdown 的 content_html 口径一致（非字符串视为空）
       const urlOf = (it) => {

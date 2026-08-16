@@ -702,7 +702,7 @@ function qywxBotNotify (text, desp, params = {}) {
         markdown: {
           // v3.130：企微 markdown 不支持图片——真实接口 desp 全含 ![]()，剥成 alt 文本（保留粗体/链接等其他语法）
           // v3.139：企微 markdown content 上限约 4096 字节——contentMax=3000 字符(中文 9000 字节)可能超，按字节截断(代理对安全)
-          content: truncateBytes(desp ? `${text}\n\n${String(desp).replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt) => alt || '(图片)')}` : text, 4096)
+          content: truncateBytes(desp ? `${text}\n\n${mdImagesToPlain(String(desp), '(图片)')}` : text, 4096)
         }
       },
       headers: {
@@ -759,16 +759,22 @@ function looksHtml (s) {
   while (i < s.length) {
     const lt = s.indexOf('<', i)
     if (lt === -1) return false
-    if (looksHtmlTagAt(s, lt)) return true
-    i = lt + 1
+    const k = looksHtmlTagAt(s, lt) // 标签名结束位；-1 表示本处非完整标签
+    if (k === -1) { i = lt + 1; continue }
+    if (s.includes('>', k)) return true
+    return false // 本处起剩余串无 >：完整标签必然需要结束 >，后续不可能再命中
   }
   return false
 }
 
 // < 后可选空白/斜杠 → 字母开头标签名 → 名字后跟空白、> 或 />（排除 autolink）→ 其后存在 >
+// 返回标签名结束位 k（数字）；本处非完整标签返回 -1（继续找下一个 <）。调用方检查 k 之后
+// 是否存在 >：有则命中 HTML，无则剩余串再无 >，可直接判定非 HTML——避免每个 < 位置都对
+// 剩余串重复 includes 全扫，回到 O(n²)（S3516：统一返回数字类型，避免 bool/string 混用）
 function looksHtmlTagAt (s, lt) {
   const n = s.length
-  const isWs = (ch) => ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f'
+  // \s 语义（含 U+00A0 等 Unicode 空白）——与原 /<\s*.../ 正则口径一致（CodeRabbit 完整审核）
+  const isWs = (ch) => /\s/.test(ch)
   const isNameChar = (ch) => /[A-Za-z0-9-]/.test(ch)
   let j = lt + 1
   while (j < n && isWs(s[j])) j++
@@ -776,12 +782,12 @@ function looksHtmlTagAt (s, lt) {
     j++
     while (j < n && isWs(s[j])) j++
   }
-  if (j >= n || !/[A-Za-z]/.test(s[j])) return false
+  if (j >= n || !/[A-Za-z]/.test(s[j])) return -1
   let k = j + 1
   while (k < n && isNameChar(s[k])) k++
   const c = k < n ? s[k] : ''
   const nameOk = isWs(c) || c === '>' || (c === '/' && s[k + 1] === '>')
-  return nameOk && s.includes('>', k)
+  return nameOk ? k : -1
 }
 
 // WxPusher 默认窗口：每个 appToken 单独维护，避免多应用分流时把两个额度混成一个。
@@ -1244,37 +1250,49 @@ function truncateBytes (s, maxBytes) {
 // v3.149：HTML 标签（含属性）整体剥空——{Html内容} 模板产物曾残留 'a href="..." target="_blank"' 垃圾文本；
 // S8786：原 /\[([^\]]+)\]\(([^)]+)\)/ 在大量未配对 "[" 上呈 O(n²) 回溯；线性扫描等价替换：
 // [text](url) → text (url)（text===url 原文链接只显示一次；text/url 空或未闭合保持原样）
+// 注意：失败路径必须推进或终止——`[text](` 后无 ")" 时剩余串不可能再有完整链接，直接保留
+// 剩余并终止；若每块只推进到 "]" 就重扫 indexOf(')')，大量未闭合块会退化为 O(n²)（v3.264 修复）。
 function mdLinksToPlain (s) {
   let out = ''
   let i = 0
   while (i < s.length) {
     const open = s.indexOf('[', i)
     if (open === -1) { out += s.slice(i); break }
-    const link = mdLinkAt(s, open)
-    if (link) {
-      out += s.slice(i, link.start) + link.text
-      i = link.end
-      continue
-    }
     const close = s.indexOf(']', open + 1)
-    if (close === -1) { out += s.slice(i); break }
-    out += s.slice(i, close + 1)
-    i = close + 1
+    if (close === -1) { out += s.slice(i); break } // 未闭合 ]：剩余不可能再有完整链接
+    const t = s.slice(open + 1, close)
+    if (t === '' || s[close + 1] !== '(') { out += s.slice(i, close + 1); i = close + 1; continue }
+    const end = s.indexOf(')', close + 2)
+    if (end === -1) { out += s.slice(i); break } // 未闭合 )：剩余串无 ")"，不可能再有完整 [text](url)
+    const u = s.slice(close + 2, end)
+    if (u === '') { out += s.slice(i, end + 1); i = end + 1; continue } // url 空：原样保留
+    out += s.slice(i, open) + (t === u ? t : `${t} (${u})`)
+    i = end + 1
   }
   return out
 }
 
-// 解析 open 处的 [text](url)：成功返回 {start, end, text}；text/url 空、未闭合 ]/) 返回 null
-function mdLinkAt (s, open) {
-  const close = s.indexOf(']', open + 1)
-  if (close === -1) return null
-  const t = s.slice(open + 1, close)
-  if (t === '' || s[close + 1] !== '(') return null
-  const end = s.indexOf(')', close + 2)
-  if (end === -1) return null
-  const u = s.slice(close + 2, end)
-  if (u === '') return null
-  return { start: open, end: end + 1, text: t === u ? t : `${t} (${u})` }
+// 线性剥离 Markdown 图片语法：![alt](url) → alt（url 至少 1 字符才成立；未闭合 ]/) 保持原样）。
+// 替代原 /!\[([^\]]*)\]\(([^)]+)\)/ 替换——该正则在大量未配对 "![" 上 O(n²) 回溯（v3.264 修复）。
+// emptyAlt：alt 为空时的替换文本（企微用 '(图片)'，mdToPlain 用 ''）
+function mdImagesToPlain (s, emptyAlt = '') {
+  let out = ''
+  let i = 0
+  while (i < s.length) {
+    const bang = s.indexOf('![', i)
+    if (bang === -1) { out += s.slice(i); break }
+    const close = s.indexOf(']', bang + 2)
+    if (close === -1) { out += s.slice(i); break } // 未闭合 ]：剩余不可能再有完整图片语法
+    const alt = s.slice(bang + 2, close)
+    if (s[close + 1] !== '(') { out += s.slice(i, close + 1); i = close + 1; continue }
+    const end = s.indexOf(')', close + 2)
+    if (end === -1) { out += s.slice(i); break } // 未闭合 )：剩余串无 ")"，不可能再有完整图片语法
+    const u = s.slice(close + 2, end)
+    if (u === '') { out += s.slice(i, end + 1); i = end + 1; continue } // url 空：原样保留
+    out += s.slice(i, bang) + (alt === '' ? emptyAlt : alt)
+    i = end + 1
+  }
+  return out
 }
 
 // S8786：原 /<([^>]+)>/ 在无 ">" 的对抗输入上呈 O(n²) 回溯；线性扫描等价替换：
@@ -1301,7 +1319,7 @@ function mdToPlain (s, stripAngle = true) {
   let out = String(s === undefined || s === null ? '' : s)
     .replace(/\*\*([^*]+)\*\*/g, '$1') // **粗体** → 粗体
     .replace(/(?<![0-9])\*([^*\n]+?)(?<![0-9])\*(?!\*)/g, '$1') // *斜体* → 斜体（v3.150：数字前后 * 不算斜体——'5*3*2cm' 曾误剥成 '532cm'）
-    .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1') // ![alt](url) → alt
+  out = mdImagesToPlain(out) // ![alt](url) → alt（v3.264：原正则大量未配对 ![ 上 O(n²)，改线性）
   out = mdLinksToPlain(out) // [text](url) → text (url)；v3.153：text===url(原文链接) 只显示一次
   return stripAngleTags(
     out
@@ -1395,4 +1413,4 @@ async function sendNotify (text, desp, params = {}) {
   }
 }
 
-module.exports = { sendNotify, push_config, hasWxPusherConfigured, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdToPlain, looksHtml, stripAngleTags }
+module.exports = { sendNotify, push_config, hasWxPusherConfigured, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags }
