@@ -124,14 +124,37 @@ function runTests (dir, timeoutMs) {
   })
 }
 
-// 提取测试汇总数字："全部通过！N/M" 或 "N 通过, M 失败, 共 K"（线性解析，规避 S8786）
+// 提取测试汇总数字："全部通过！N/M" 或 "N 通过, M 失败, 共 K"
+// S8786：数字组后接空白量词（\d+\s*）会被标超线性回溯，改用纯线性扫描
 function extractTestSummary (output) {
   const all = /全部通过！(\d+)\/(\d+)/.exec(output)
   if (all) return [all[1], all[2]]
-  const pass = /(\d+)\s*通过/.exec(output)
-  const fail = /(\d+)\s*失败/.exec(output)
-  const total = /共\s*(\d+)/.exec(output)
-  return pass && fail && total ? [pass[1], fail[1], total[1]] : []
+  const pass = numberBefore(output, '通过')
+  const fail = numberBefore(output, '失败')
+  const total = numberAfter(output, '共')
+  return pass !== null && fail !== null && total !== null ? [pass, fail, total] : []
+}
+
+// 关键字前紧邻的整数字符串（允许空白间隔），找不到返回 null
+function numberBefore (s, kw) {
+  const idx = s.indexOf(kw)
+  if (idx === -1) return null
+  let end = idx
+  while (end > 0 && /\s/.test(s[end - 1])) end--
+  let start = end
+  while (start > 0 && s[start - 1] >= '0' && s[start - 1] <= '9') start--
+  return start < end ? s.slice(start, end) : null
+}
+
+// 关键字后紧邻的整数字符串（允许空白间隔），找不到返回 null
+function numberAfter (s, kw) {
+  const idx = s.indexOf(kw)
+  if (idx === -1) return null
+  let start = idx + kw.length
+  while (start < s.length && /\s/.test(s[start])) start++
+  let end = start
+  while (end < s.length && s[end] >= '0' && s[end] <= '9') end++
+  return start < end ? s.slice(start, end) : null
 }
 
 async function evaluate (mutants, files, timeoutMs) {
