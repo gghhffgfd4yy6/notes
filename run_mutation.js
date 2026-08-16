@@ -127,12 +127,14 @@ function runTests (dir, timeoutMs) {
 // 提取测试汇总数字："全部通过！N/M" 或 "N 通过, M 失败, 共 K"
 // S8786：数字组后接空白量词（\d+\s*）会被标超线性回溯，改用纯线性扫描。
 // CodeAnt 审查：indexOf 取全文首个关键字会被无关日志（如测试名「…全部通过」）干扰；
-// 汇总行位于输出末尾——从末行向上找首个「通过/失败/共」三数字齐全的行，噪声日志不影响。
+// 汇总行位于输出末尾——从末行向上逐行匹配「全部通过！N/M」或「通过/失败/共」三数字齐全
+// 的行；CodeAnt 复审：「全部通过」正则原先在行扫描前全文匹配，会被更早的无关「全部通过！1/1」
+// 日志抢答——现与关键字检查同属逐行扫描，噪声日志不影响。
 function extractTestSummary (output) {
-  const all = /全部通过！(\d+)\/(\d+)/.exec(output)
-  if (all) return [all[1], all[2]]
   const lines = output.split('\n')
   for (let i = lines.length - 1; i >= 0; i--) {
+    const all = /全部通过！(\d+)\/(\d+)/.exec(lines[i])
+    if (all) return [all[1], all[2]]
     const pass = numberBefore(lines[i], '通过')
     const fail = numberBefore(lines[i], '失败')
     const total = numberAfter(lines[i], '共')

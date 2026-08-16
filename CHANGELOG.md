@@ -1075,5 +1075,6 @@
 - PR #27 质量门 4 个新问题：run_mutation 汇总正则改 exec（S6594×2）+ 逐关键字单数字组线性提取（S8786）；looksLikeHtmlLinear 拆 helper 压认知复杂度（S3776）。
 - PR #27 CodeAnt 复审：looksLikeHtmlLinear 补两处与旧正则一致的边界（`/` 后须紧跟 `>`、`[^<>]*` 不跨 `<`）；run_mutation 汇总提取改末行向上扫描，无关日志不再干扰；新增对应回归测试。
 - PR #27 CodeRabbit 复审：mutation-report 跳过分支补 issue `number`（不再 `#undefined`）且跳过不再报"已发布"；test_app_p 分片排序改 code-unit 比较（locale 无关，C/zh-CN 分片一致）；test_filter 危险链接断言改扫全部标记（前畸形后有效不再漏检）+ 回归测试。
+- PR #27 复审二轮：looksLikeHtmlLinear 改严格单趟线性（大量 `<a ` 前缀无 `>` 不再 O(n²)）；run_mutation「全部通过」并入末行逐行扫描（前置噪声日志不再抢答）；test_app_p 嵌套三元拆函数（S3358）；mutation-report 跳过分支不再输出远端可控 `number`（S5145）。
 - CI 质量矩阵修复：清掉 6f48aaa 引入的两处 `for (...; )` 尾空格 lint 错误（test_filter.js / xbk_function_v3.js）。
 - 测试：全量套件全绿；check-version 三方一致 v3.263。

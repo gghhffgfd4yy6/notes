@@ -3365,17 +3365,21 @@ const Network = {
 // 对抗输入上 O(n²) 回溯；改单趟扫描：< → 可选空白/斜杠 → 字母开头标签名 → 名字后跟
 // 空白、> 或 />（/ 后必须紧跟 >，排除 <https://...> autolink）→ 在下一个 < 之前存在 >
 // 即判定为 HTML（与旧正则 [^<>]*> 一致，CodeAnt 审查确认边界）。
+// CodeAnt 复审：每个候选都 indexOf('>') 到末尾对「大量 <a 前缀但全文无 >」仍 O(n²)；
+// 改为从标签名后单趟扫到第一个 < 或 >，先遇 > 即成链，先遇 < 则直接以它为下一候选起点，
+// 每个字符至多扫常数次，严格线性。
 function looksLikeHtmlLinear (s) {
-  for (let i = 0; i < s.length;) {
+  let i = 0
+  while (i < s.length) {
     const lt = s.indexOf('<', i)
     if (lt === -1) return false
     const nameEnd = htmlTagNameEnd(s, lt)
     if (nameEnd === -1) { i = lt + 1; continue }
-    const gt = s.indexOf('>', nameEnd)
-    const nextLt = s.indexOf('<', nameEnd)
-    if (gt !== -1 && (nextLt === -1 || gt < nextLt)) return true
-    // 本处 < 不构成完整标签：继续找下一个 <（与正则逐位置尝试一致）
-    i = lt + 1
+    let j = nameEnd
+    while (j < s.length && s[j] !== '>' && s[j] !== '<') j++
+    if (j < s.length && s[j] === '>') return true
+    // 先遇 <（或到末尾）：本候选不成链；遇 < 时该 < 即下一候选起点（与正则逐位置尝试一致）
+    i = j
   }
   return false
 }

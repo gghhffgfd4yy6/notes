@@ -233,9 +233,12 @@ async function main () {
   if (process.argv.includes('--issue')) {
     const issue = await postIssue(body)
     // CodeRabbit 审查：跳过分支补 number，且跳过不应标记为“已发布”
-    console.log(issue.skipped
-      ? `\n⏭️ 日报已存在，跳过发布（issue #${issue.number}）`
-      : `\n✅ 日报已发布: issue #${issue.number}`) // S5145：不直接输出远端可控的 html_url
+    if (issue.skipped) {
+      // S5145：existing.number 来自远端 Issue 列表，属用户可控数据——跳过时不输出
+      console.log('\n⏭️ 日报已存在，跳过发布')
+    } else {
+      console.log(`\n✅ 日报已发布: issue #${issue.number}`) // S5145：不直接输出远端可控的 html_url
+    }
   }
 }
 
