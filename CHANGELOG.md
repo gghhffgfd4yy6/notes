@@ -1072,4 +1072,5 @@
 - 主程序：htmlToMarkdown 死三元（S3923）；Pusher 出口 HTML 形态检测正则线性化（S8786，与 slim looksHtml 同思路）+ 字符类去重（S5869）；xbk_storage 临时文件名 `Math.random` → `crypto.randomBytes`（S2245）。
 - 工具/测试：run_mutation 汇总正则拆交替（S8786）；mutation-report 日报日志不再输出远端可控 html_url（S5145）；test_filter 两处断言正则线性化（S8786）；test_app 无用赋值（S1854）；test_app_p 排序加比较器（S2871）。
 - 核实为误报不修：`test_app.js:2125` 与 `slim:1378` 的 S3403（Sonar 数据流未跟踪赋值/local.js 动态配置）、`v3:280` S2871（ASCII 键确定性排序）、S2681×7/S7727/S2310（密集写法与箭头函数）。
+- PR #27 质量门 4 个新问题：run_mutation 汇总正则改 exec（S6594×2）+ 邻接可选量词改字符类（S8786）；looksLikeHtmlLinear 拆 helper 压认知复杂度（S3776）。
 - 测试：全量套件全绿；check-version 三方一致 v3.263。

@@ -117,9 +117,10 @@ function runTests (dir, timeoutMs) {
     const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ status: 'timeout', output }) }, timeoutMs)
     child.on('close', (code, signal) => {
       clearTimeout(timer)
-      // S8786：交替 + 可选组曾 O(n²)；拆成两条独立线性正则（分组语义不变，summary 无消费方）
-      let match = output.match(/全部通过！(\d+)\/(\d+)/)
-      if (!match) match = output.match(/(\d+) 通过,?\s*(\d+) 失败,?\s*共\s*(\d+)/)
+      // S8786/S6594：交替+可选量词邻接曾 O(n²) 且 String.match 被标；改 exec + 合并可选量词
+      // 为单一字符类 [,\s]*（无邻接回溯），summary 无消费方，分组语义不变
+      let match = /全部通过！(\d+)\/(\d+)/.exec(output)
+      if (!match) match = /(\d+) 通过[,\s]*(\d+) 失败[,\s]*共[,\s]*(\d+)/.exec(output)
       resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: match ? match.slice(1) : [] })
     })
   })

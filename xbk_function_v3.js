@@ -3368,19 +3368,26 @@ function looksLikeHtmlLinear (s) {
   for (let i = 0; i < s.length; ) {
     const lt = s.indexOf('<', i)
     if (lt === -1) return false
-    let j = lt + 1
-    while (j < s.length && /\s/.test(s[j])) j++
-    if (s[j] === '/') { j++; while (j < s.length && /\s/.test(s[j])) j++ }
-    if (!/[A-Za-z]/.test(s[j] || '')) { i = lt + 1; continue }
-    j++
-    while (j < s.length && /[A-Za-z0-9-]/.test(s[j])) j++
-    const b = s[j]
-    if (b !== undefined && b !== '>' && b !== '/' && !/\s/.test(b)) { i = lt + 1; continue }
+    const nameEnd = htmlTagNameEnd(s, lt)
+    if (nameEnd === -1) { i = lt + 1; continue }
     // 本处起无 > 则后续 < 也不可能再凑成完整标签（与 slim looksHtml 判定一致）
-    return s.includes('>', j)
+    return s.includes('>', nameEnd)
   }
   return false
 }
+
+// 返回 < 处标签名结束位；非完整标签返回 -1（S3776：独立成函数压认知复杂度）
+function htmlTagNameEnd (s, lt) {
+  let j = lt + 1
+  while (j < s.length && /\s/.test(s[j])) j++
+  if (s[j] === '/') { j++; while (j < s.length && /\s/.test(s[j])) j++ }
+  if (!/[A-Za-z]/.test(s[j] || '')) return -1
+  j++
+  while (j < s.length && /[A-Za-z0-9-]/.test(s[j])) j++
+  return isTagNameBoundary(s[j]) ? j : -1
+}
+
+const isTagNameBoundary = (ch) => ch === undefined || ch === '>' || ch === '/' || /\s/.test(ch)
 
 // ============================================================
 // 📤 Pusher — 推送层
