@@ -128,11 +128,9 @@ function collectStats (results) {
   return { byFile, byKind, allSurvived }
 }
 
-function render (results) {
+function _renderSegmentTable (results) {
+  // 段汇总表（含合计行）：正常段 + error 段分支
   const lines = []
-  const { byFile, byKind, allSurvived } = collectStats(results)
-  lines.push('## 🧬 变异测试日报')
-  lines.push('')
   lines.push('| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 |')
   lines.push('|---|---|---|---|---|---|---|')
   let tTotal = 0
@@ -153,29 +151,40 @@ function render (results) {
   // 口径与段分一致（超时计入已处理）；无数据报 0 而非 100（机器人审查）
   const overall = tTotal > 0 ? Math.round((((tKilled + tTimeout) / tTotal) * 100) * 100) / 100 : 0
   lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | | **${overall}%** |`)
-  lines.push('')
+  return lines
+}
+
+function _renderTopFiles (byFile) {
   // 存活最多的文件 Top 10（含具体数量——定位补测重点）
+  const lines = []
   const topFiles = Object.entries(byFile).sort((a, b) => b[1] - a[1]).slice(0, 10)
-  if (topFiles.length > 0) {
-    lines.push('## 存活最多的文件 Top 10')
-    lines.push('')
-    lines.push('| 文件 | 存活变异体数 |')
-    lines.push('|---|---|')
-    for (const [f, n] of topFiles) lines.push(`| \`${escCell(f)}\` | ${n} |`)
-    lines.push('')
-  }
+  if (topFiles.length === 0) return lines
+  lines.push('## 存活最多的文件 Top 10')
+  lines.push('')
+  lines.push('| 文件 | 存活变异体数 |')
+  lines.push('|---|---|')
+  for (const [f, n] of topFiles) lines.push(`| \`${escCell(f)}\` | ${n} |`)
+  lines.push('')
+  return lines
+}
 
+function _renderTopKinds (byKind) {
   // 按变异类型分布（存活——种类 + 数量，定位测试弱在哪类）
+  const lines = []
   const topKinds = Object.entries(byKind).sort((a, b) => b[1] - a[1]).slice(0, 15)
-  if (topKinds.length > 0) {
-    lines.push('## 存活变异类型分布 Top 15')
-    lines.push('')
-    lines.push('| 变异类型 | 存活数 |')
-    lines.push('|---|---|')
-    for (const [k, n] of topKinds) lines.push(`| ${escCell(k)} | ${n} |`)
-    lines.push('')
-  }
+  if (topKinds.length === 0) return lines
+  lines.push('## 存活变异类型分布 Top 15')
+  lines.push('')
+  lines.push('| 变异类型 | 存活数 |')
+  lines.push('|---|---|')
+  for (const [k, n] of topKinds) lines.push(`| ${escCell(k)} | ${n} |`)
+  lines.push('')
+  return lines
+}
 
+function _renderSurvivors (allSurvived) {
+  // 存活变异体清单（>30 时截断显示"还有 N 个"）；无存活则 🎉 分支
+  const lines = []
   if (allSurvived.length > 0) {
     lines.push(`## 存活变异体（${allSurvived.length} 个）`)
     lines.push('')
@@ -186,6 +195,20 @@ function render (results) {
   } else {
     lines.push('## 🎉 无存活变异体！')
   }
+  return lines
+}
+
+function render (results) {
+  // 协调器：标题 + collectStats + 4 个子段拼装 + footer
+  const { byFile, byKind, allSurvived } = collectStats(results)
+  const lines = []
+  lines.push('## 🧬 变异测试日报')
+  lines.push('')
+  lines.push(..._renderSegmentTable(results))
+  lines.push('')
+  lines.push(..._renderTopFiles(byFile))
+  lines.push(..._renderTopKinds(byKind))
+  lines.push(..._renderSurvivors(allSurvived))
   lines.push('')
   lines.push('> 由 mutation-report.js 自动生成')
   return lines.join('\n')
@@ -248,7 +271,12 @@ async function main () {
   }
 }
 
-main().catch((e) => {
-  console.error('❌', e.message || e)
-  process.exit(1)
-})
+if (require.main === module) {
+  main().catch((e) => {
+    console.error('❌', e.message || e)
+    process.exit(1)
+  })
+}
+
+// 导出供测试（不导出 main/postIssue：前者依赖 CLI 副作用、后者侧效应无关单元行为）
+module.exports = { analyze, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render }
