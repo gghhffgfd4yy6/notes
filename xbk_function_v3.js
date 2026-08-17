@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.264 — 变异日报超大 JSON 解析修复 ********
+//* ******* 线报酷推送脚本 v3.265 — readReportJson 加 path.resolve 防御性 normalize ********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
