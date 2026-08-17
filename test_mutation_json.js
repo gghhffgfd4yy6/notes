@@ -1,4 +1,7 @@
 'use strict'
+/* codacy-disable-file: 测试 sandbox — tmpdir 由 fs.mkdtempSync 创建，
+   Codacy 对"动态路径 + fs.writeFileSync" pattern 误报；本文件不参与
+   生产 I/O，无路径遍历风险。 */
 
 // 回归测试：mutation-json 超大文件解析（v3.264）
 // stryker command runner 把整段测试输出写进每个变异体的 statusReason，单文件可达 500MB+，
