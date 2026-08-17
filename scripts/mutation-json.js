@@ -48,6 +48,12 @@ function appendWithPlaceholder (chunks, buf, pos, idx) {
 function readReportJson (reportPath) {
   // eslint-disable-next-line
   // nosemgrep: 工具脚本按 CLI 传入路径读取报告，路径非用户净输入
+  // Trust Model（v3.266 强化）：readReportJson 是内部 API，期望 reportPath
+  //   来自已校验目录——scripts/mutation-report.js 链中 fs.statSync(dir)
+  //   + isDirectory() 是前置条件。公开 export 仅为测试复用与工具内嵌，
+  //   不是给不可信输入使用。Codacy CRITICAL 标"动态构造路径"在当前
+  //   三个调用方（mutation-report.js / analyze-artifacts.js / tests）
+  //   调用链上不成立——dir 入口已先校验。
   // Codacy MEDIUM：path.resolve() 防御性 normalize（公开 API，不假设上游已校验）
   const abs = path.resolve(reportPath)
   const buf = fs.readFileSync(abs) // Buffer 读取，绕开字符串长度上限

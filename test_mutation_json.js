@@ -55,6 +55,8 @@ try {
     const origCwd = process.cwd()
     try {
       const file = path.join(tmpdir, 'abs-path-err.json')
+      // codacy-disable-next-line：test sandbox — tmpdir 由 fs.mkdtempSync 创建，非用户输入
+      // nosemgrep: test fixture, no path traversal risk
       fs.writeFileSync(file, '{ broken')
       process.chdir(tmpdir) // 让后续相对路径以 tmpdir 为基准
       let err
