@@ -41,6 +41,9 @@ jobs:
       - name: 单元测试（test_filter.js，含 101 章版本校验）
         run: npm run test:filter
 
+      - name: mutation-json 回归（超大报告解析）
+        run: npm run test:mutation-json
+
       - name: 通道测试（test_notify.js）
         run: npm run test:notify
 

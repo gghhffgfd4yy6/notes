@@ -46,6 +46,13 @@ stages:
     commands:
     - npm install --ignore-scripts
     - npm run test:filter
+  - step: build@nodejs
+    name: test_mutation_json
+    displayName: mutation-json 超大报告解析回归
+    nodeVersion: 20.19.0
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:mutation-json
 
 - name: integration-test
   displayName: ④ 集成测试（并行 + 串行完整）

@@ -6,6 +6,7 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
+const { readReportJson } = require('./mutation-json.js')
 
 function analyze (dir) {
   // S8707：CLI 参数显式校验（防 LLM/错误参数访问任意路径——先验证存在且是目录）
@@ -64,7 +65,7 @@ function analyzeSegment (dir, entry) {
   if (!reportPath) return { seg: entry.name.replace('mutation-report-', ''), error: '缺 mutation-report.json' }
   let report
   try {
-    report = JSON.parse(fs.readFileSync(reportPath, 'utf8'))
+    report = readReportJson(reportPath)
   } catch (e) {
     return { seg: entry.name.replace('mutation-report-', ''), error: String(e.message || e) }
   }

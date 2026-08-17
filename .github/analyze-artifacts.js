@@ -2,6 +2,7 @@
 // 解析全部 mutation artifact 的 mutation.json，统计存活变异体分布
 const fs = require('fs')
 const path = require('path')
+const { readReportJson } = require('../scripts/mutation-json.js')
 
 function walk (dir, out = []) {
   if (!fs.existsSync(dir)) return out
@@ -18,7 +19,7 @@ const byFileStatus = {}
 
 for (const f of walk('reports-all')) {
   let d
-  try { d = JSON.parse(fs.readFileSync(f, 'utf8')) } catch (e) { continue }
+  try { d = readReportJson(f) } catch (e) { continue }
   for (const [file, info] of Object.entries(d.files || {})) {
     const fileKey = file.split('/').pop()
     if (!byFileStatus[fileKey]) byFileStatus[fileKey] = {}

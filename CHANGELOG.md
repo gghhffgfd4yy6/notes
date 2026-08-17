@@ -1078,3 +1078,12 @@
 - 复审二轮：looksLikeHtmlLinear 改严格单趟线性（大量 `<a ` 前缀无 `>` 不再 O(n²)）；run_mutation「全部通过」并入末行逐行扫描（前置噪声日志不再抢答）；test_app_p 嵌套三元拆函数（S3358）；mutation-report 日志不再输出远端可控 `number`（S5145，type=VULNERABILITY 拉低 Security Rating）。
 - CI 质量矩阵修复：清掉引入的两处 `for (...; )` 尾空格 lint 错误（test_filter.js / xbk_function_v3.js）。
 - 测试：全量套件全绿；check-version 三方一致。
+
+## v3.264（变异日报超大 JSON 解析修复，2026-08-17）
+
+- 根因：stryker command runner 把整段测试输出写进每个变异体的 `statusReason`，v3-part2/part3 的 `mutation.json` 达 544–614MB，超过 Node 单字符串上限（0x1fffffe8 ≈ 536MB），日报该两段显示「无法创建长度超过…的字符串」。
+- 修复：新增 `scripts/mutation-json.js` 的 `readReportJson`——Buffer 按字节剥离 `statusReason`（日报用不到）再解析，绕开字符串上限；日报 `scripts/mutation-report.js` 与 `analyze-artifacts` 分析脚本均接入。
+- 验证：真实 614MB/544MB 报告解析通过（v3-part2：2520 变异体 78.85%；v3-part3：2271 变异体 78.47%）；剥离边界用例 7/7；standard lint 通过。
+- SonarCloud（PR #28）：S3776 认知复杂度 31→重构拆 helper（skipWhitespace/stringEnd/statusReasonValueEnd/appendWithPlaceholder）；S7778 连续单参 push→合并为变参调用；质量门 0 新问题。
+- 评审跟进（PR #28）：`readReportJson` 解析失败补文件路径与剥离前后尺寸上下文；剥离后仍超 V8 字符串上限时快速失败给出清晰报错；新增 `test_mutation_json.js` 单测（边界 7 项 + 8MB 大值 + 损坏 JSON 报错）并接入 `run_tests.js`。
+- CI 接入：新增 `npm run test:mutation-json` 脚本，并补入 GitHub `test.yml` 与 Gitee Go `master-pipeline.yml`（原为显式枚举，不会自动跑到新套件）；`release.yml` 经 `npm run check` 自动覆盖。
