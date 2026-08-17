@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.265 — readReportJson 加 path.resolve 防御性 normalize ********
+//* ******* 线报酷推送脚本 v3.266 — mutation-report render 重构降复杂度 *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
