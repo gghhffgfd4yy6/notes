@@ -1093,6 +1093,7 @@
 - 根因：PR #28 Codacy 行内评审（`scripts/mutation-json.js`）MEDIUM 风险——`readReportJson` 作为公开 API 未对入参做 `path.resolve()` 防御性 normalize，若跨调用方复用且上游未校验即承担路径遍历风险；且错误信息保留原始传入路径（相对路径/../ 等），不利于定位。
 - 修复：`readReportJson` 入口加 `path.resolve(reportPath)`，读文件与报错上下文均使用规范化后的绝对路径；其它逻辑、API、签名、行为不变。
 - 验证：`test_mutation_json.js` 新增"相对路径 + 损坏 JSON 时错误信息报告绝对路径"回归用例；`npm test` 9 套件全绿。
+
 ## v3.266（mutation-report render 重构降复杂度，2026-08-17）
 
 - 根因：Codacy 行内 HIGH 风险——`scripts/mutation-report.js` 文件圈复杂度集中于 `render` 函数（单函数同时承担段表/Top 文件/Top 类型/存活清单四段职责，单点维护风险高、不利于单测）。
