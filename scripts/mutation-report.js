@@ -200,17 +200,20 @@ function _renderSurvivors (allSurvived) {
 
 function render (results) {
   // 协调器：标题 + collectStats + 4 个子段拼装 + footer
+  // 单 push 多参调用避免 SonarCloud S7778 / Lizard_ccn 重复 push 告警
   const { byFile, byKind, allSurvived } = collectStats(results)
   const lines = []
-  lines.push('## 🧬 变异测试日报')
-  lines.push('')
-  lines.push(..._renderSegmentTable(results))
-  lines.push('')
-  lines.push(..._renderTopFiles(byFile))
-  lines.push(..._renderTopKinds(byKind))
-  lines.push(..._renderSurvivors(allSurvived))
-  lines.push('')
-  lines.push('> 由 mutation-report.js 自动生成')
+  lines.push(
+    '## 🧬 变异测试日报',
+    '',
+    ..._renderSegmentTable(results),
+    '',
+    ..._renderTopFiles(byFile),
+    ..._renderTopKinds(byKind),
+    ..._renderSurvivors(allSurvived),
+    '',
+    '> 由 mutation-report.js 自动生成'
+  )
   return lines.join('\n')
 }
 
