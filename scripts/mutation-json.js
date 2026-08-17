@@ -5,6 +5,7 @@
 // statusReason 日报用不到，解析前按字节剥离：Buffer 无字符串长度限制。
 // 注意：整文件读入 + Buffer.concat 会短暂翻倍内存（600MB 级报告峰值约 1.2GB，CI 7GB 内存下安全）。
 const fs = require('node:fs')
+const path = require('node:path')
 
 const KEY = Buffer.from('"statusReason"')
 const PLACEHOLDER = Buffer.from(':""')
@@ -47,7 +48,9 @@ function appendWithPlaceholder (chunks, buf, pos, idx) {
 function readReportJson (reportPath) {
   // eslint-disable-next-line
   // nosemgrep: 工具脚本按 CLI 传入路径读取报告，路径非用户净输入
-  const buf = fs.readFileSync(reportPath) // Buffer 读取，绕开字符串长度上限
+  // Codacy MEDIUM：path.resolve() 防御性 normalize（公开 API，不假设上游已校验）
+  const abs = path.resolve(reportPath)
+  const buf = fs.readFileSync(abs) // Buffer 读取，绕开字符串长度上限
   const chunks = []
   let pos = 0
   let idx = buf.indexOf(KEY, pos)
@@ -66,13 +69,13 @@ function readReportJson (reportPath) {
   const stripped = Buffer.concat(chunks)
   // 剥离后仍超上限：快速失败并给出可行动报错（V8 原生异常不含文件上下文）
   if (stripped.length > MAX_STRING_LENGTH) {
-    throw new Error(`JSON 剥离 statusReason 后仍为 ${stripped.length} 字节，超过 V8 字符串上限 ${MAX_STRING_LENGTH}：${reportPath}`)
+    throw new Error(`JSON 剥离 statusReason 后仍为 ${stripped.length} 字节，超过 V8 字符串上限 ${MAX_STRING_LENGTH}：${abs}`)
   }
   try {
     return JSON.parse(stripped.toString('utf8'))
   } catch (err) {
     // 带上文件路径与剥离前后尺寸，便于定位（报告文件损坏时原始异常不含上下文）
-    throw new Error(`解析 ${reportPath} 失败（原始 ${buf.length} 字节，剥离后 ${stripped.length} 字节）：${err.message}`)
+    throw new Error(`解析 ${abs} 失败（原始 ${buf.length} 字节，剥离后 ${stripped.length} 字节）：${err.message}`)
   }
 }
 

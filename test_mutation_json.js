@@ -48,6 +48,34 @@ try {
   assert.throws(() => parseJson('{"a":1'), err => String(err.message).includes('case.json'), '损坏 JSON 报错应包含文件路径')
   console.log('✅ 解析失败报错包含文件路径与尺寸上下文')
   pass++
+
+  // Codacy MEDIUM：传入相对路径时，错误信息中的路径应是绝对路径（path.resolve 防御性 normalize）
+  // 当前实现（不加 path.resolve）错误信息会保留传入的相对路径 → 测试会红
+  {
+    const origCwd = process.cwd()
+    try {
+      const file = path.join(tmpdir, 'abs-path-err.json')
+      fs.writeFileSync(file, '{ broken')
+      process.chdir(tmpdir) // 让后续相对路径以 tmpdir 为基准
+      let err
+      try {
+        readReportJson('./abs-path-err.json')
+      } catch (e) {
+        err = e
+      }
+      assert.ok(err, '相对路径 + 损坏 JSON 应抛出错误')
+      const msg = String(err.message)
+      const pathMatches = msg.match(/[^\s：:]+\.json/g) || [] // 取出 message 中所有 *.json 出现
+      assert.ok(
+        pathMatches.some(p => path.isAbsolute(p)),
+        `错误信息应至少含一个绝对路径（防御性 path.resolve），实际：${msg}`
+      )
+      console.log('✅ 错误信息报告绝对路径（path.resolve 防御性 normalize）')
+      pass++
+    } finally {
+      process.chdir(origCwd)
+    }
+  }
 } finally {
   fs.rmSync(tmpdir, { recursive: true, force: true })
 }

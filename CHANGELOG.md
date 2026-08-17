@@ -1087,3 +1087,8 @@
 - SonarCloud（PR #28）：S3776 认知复杂度 31→重构拆 helper（skipWhitespace/stringEnd/statusReasonValueEnd/appendWithPlaceholder）；S7778 连续单参 push→合并为变参调用；质量门 0 新问题。
 - 评审跟进（PR #28）：`readReportJson` 解析失败补文件路径与剥离前后尺寸上下文；剥离后仍超 V8 字符串上限时快速失败给出清晰报错；新增 `test_mutation_json.js` 单测（边界 7 项 + 8MB 大值 + 损坏 JSON 报错）并接入 `run_tests.js`。
 - CI 接入：新增 `npm run test:mutation-json` 脚本，并补入 GitHub `test.yml` 与 Gitee Go `master-pipeline.yml`（原为显式枚举，不会自动跑到新套件）；`release.yml` 经 `npm run check` 自动覆盖。
+## v3.265（PR #28 评审跟进·Codacy MEDIUM 修复，2026-08-17）
+
+- 根因：PR #28 Codacy 行内评审（`scripts/mutation-json.js`）MEDIUM 风险——`readReportJson` 作为公开 API 未对入参做 `path.resolve()` 防御性 normalize，若跨调用方复用且上游未校验即承担路径遍历风险；且错误信息保留原始传入路径（相对路径/../ 等），不利于定位。
+- 修复：`readReportJson` 入口加 `path.resolve(reportPath)`，读文件与报错上下文均使用规范化后的绝对路径；其它逻辑、API、签名、行为不变。
+- 验证：`test_mutation_json.js` 新增"相对路径 + 损坏 JSON 时错误信息报告绝对路径"回归用例；`npm test` 9 套件全绿。
