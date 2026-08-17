@@ -46,7 +46,6 @@ function appendWithPlaceholder (chunks, buf, pos, idx) {
 }
 
 function readReportJson (reportPath) {
-  // eslint-disable-next-line
   // nosemgrep: 工具脚本按 CLI 传入路径读取报告，路径非用户净输入
   // Trust Model（v3.266 强化）：readReportJson 是内部 API，期望 reportPath
   //   来自已校验目录——scripts/mutation-report.js 链中 fs.statSync(dir)

@@ -17,7 +17,6 @@ const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'mutation-json-test-'))
 
 function parseJson (json) {
   const file = path.join(tmpdir, 'case.json')
-  // eslint-disable-next-line
   // nosemgrep: 测试临时文件路径由代码生成，非外部输入
   fs.writeFileSync(file, json)
   return readReportJson(file)
