@@ -29,6 +29,10 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
 
+      # FORCED FAIL: 故障注入实证——验证任一 matrix job 失败 ⇒ quality-gate 必须失败
+      - name: FORCE_FAIL_VERIFY
+        run: exit 1
+
       - name: 安装依赖（忽略脚本，防供应链风险）
         run: npm ci --ignore-scripts
 
