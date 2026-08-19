@@ -5,7 +5,7 @@ const {
   classifyFailure,
   classifySummary
 } = require('./xbk_failure_policy')
-const { runResident } = require('./qinglong/xbk_push')
+const { runResident, shouldAutoInstallDependencies } = require('./qinglong/xbk_push')
 
 function error (message, code) {
   const e = new Error(message)
@@ -14,6 +14,10 @@ function error (message, code) {
 }
 
 (async () => {
+  assert.strictEqual(shouldAutoInstallDependencies({}), false, '默认不得在任务运行时安装依赖')
+  assert.strictEqual(shouldAutoInstallDependencies({ XBK_AUTO_INSTALL_DEPS: '1' }), true, '显式开关应允许自动安装依赖')
+  assert.strictEqual(shouldAutoInstallDependencies({ XBK_AUTO_INSTALL_DEPS: 'true' }), false, '仅接受明确值 1，避免误开启')
+
   assert.strictEqual(classifyFailure(error('timeout', 'ETIMEDOUT')).kind, 'retryable')
   assert.strictEqual(classifyFailure(error('HTTP 500', 'HTTP_500')).kind, 'retryable')
   assert.strictEqual(classifyFailure(error('HTTP 401', 'HTTP_401')).kind, 'permanent')
