@@ -3,6 +3,10 @@ description: 报告一个 Bug
 title: "[Bug] "
 labels: [bug]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **不要提交 Token、Cookie、密码、个人密钥等敏感信息**。涉及本地配置（如 `push_config.local.js`）时请脱敏后再贴。
   - type: textarea
     id: what
     attributes:
@@ -13,11 +17,11 @@ body:
   - type: textarea
     id: repro
     attributes:
-      label: 复现步骤
-      description: 怎么复现这个问题
+      label: 最小复现
+      description: 尽量给出最小可复现步骤（规则配置片段 + 输入数据即可，不需要真实密钥）
       placeholder: |
-        1. 执行 ...
-        2. 输入 ...
+        1. 执行 ...（命令 / 运行方式）
+        2. 输入 ...（最小化示例）
         3. 看到报错 ...
     validations:
       required: true
@@ -25,4 +29,27 @@ body:
     id: env
     attributes:
       label: 环境
-      description: Node 版本 / 触发方式（手动/CI/定时）
+      description: Node 版本 / 运行方式（手动 / 青龙定时 / CI）
+      placeholder: "node v22.x / 青龙面板"
+  - type: textarea
+    id: config
+    attributes:
+      label: 配置环境
+      description: 运行参数概览（脱敏后）——过滤规则 / 通道类型 / 是否常驻 / 缓存目录
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 实际输出 / 报错信息
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+      description: 期望的正确输出
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 相关运行日志片段（脱敏；含推送通道配置的请打码）

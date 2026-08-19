@@ -1,0 +1,29 @@
+name: 功能请求
+description: 提出新功能或改进建议
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 当前有什么痛点 / 场景缺失？请描述实际使用场景
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: 期望的方案
+      description: 你希望新增 / 改变什么行为？给出大致接口或配置形态
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 替代方案
+      description: 你尝试过的其他方式 / 绕过方法（可选）
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影响面评估
+      description: 该功能可能影响的区域：缓存/判重契约、推送行为、配置兼容性、性能？（可选）

@@ -229,7 +229,7 @@ PR_AGENT_GUIDE.md         Qodo Merge（PR-Agent）终端 AI 审查使用指南�
 
 **性能诊断**：`XBK_PROFILE=1` 输出接口/推送/总计；`XBK_PROFILE=2` 输出 DNS 预热、TLS 预取、预处理、缓存写入、收尾等待和每个 WxPusher 请求的 wait/dns/tcp/tls/request/firstByte/download 分阶段耗时；`XBK_PROFILE=3` 在此基础上增加启动模块加载、配置校验、规则编译、接口拉取、数据处理、推送、缓存写入和预热收尾等生命周期检查点，并输出线报接口的响应/首数据/下载/解析阶段信息（均不改变默认运行行为）。`XBK_DNS_FAMILY=4/6` 可强制对比 IPv4/IPv6 路径，默认自动。启动时并行预热 WxPusher DNS，并在后台用 HEAD 请求预建与并发窗口对齐的 HTTPS 连接（默认 10 个，不阻塞推送），推送时直接复用，减少冷启动 DNS/TLS 等待。
 
-## 🤖 机器人审查说明
+## 🤖 CI 门禁说明
 
-- **合并门禁**：master 保护分支要求 8 个检查全绿（quality 20/22/24 + CodeQL + SonarCloud + Socket + CodeFactor + Analyze）；机器人（CodeAnt/CodeRabbit）的审查评论未人工 resolve 会阻止合并。
-- **CodeRabbit 限流**：免费额度耗尽时（PR 评论显示 Review limit reached），等额度恢复（约 2 小时）或手动在 PR 上评论 `@coderabbitai review` 触发补审。
+- **合并门禁**：main 保护分支要求 CI 检查全绿（lint / 版本一致性 / 单元 / 集成并行+串行 / 通道 / 常驻回归 / 安全审计 / CodeQL），未通过不允许合并；合并方式为 Squash Merge（保持 main 历史干净）。
+- main 不允许直接 push / force push / 删除，统一走 PR。

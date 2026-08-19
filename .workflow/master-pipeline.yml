@@ -1,3 +1,12 @@
+# ═══════════════════════════════════════════════════════════════════
+# 【用途声明】这是 Gitee Go 平台流水线（非 GitHub Actions），由 Gitee 侧
+# 私有仓 origin（hdjjdj/rikka-hub）使用。分支名 master 对应该仓库的
+# Gitee 主分支（master），语义正确，勿改为 main。
+#
+# GitHub 侧主质量门禁是 .github/workflows/test.yml（on: main），
+# 本文件与 GitHub CI 无重复执行关系（不同平台、不同仓库侧）。
+# 若 Gitee Go 流水线停用，可整体删除本文件；当前保留。
+# ═══════════════════════════════════════════════════════════════════
 version: '1.0'
 name: master-pipeline
 displayName: MasterPipeline

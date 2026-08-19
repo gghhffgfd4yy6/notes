@@ -107,4 +107,4 @@ jobs:
         run: node scripts/mutation-report.js mutation-reports --issue
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: junhanw868-bot/notes
+          GITHUB_REPOSITORY: ${{ github.repository }}
