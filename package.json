@@ -11,6 +11,7 @@
     "test": "node run_tests.js",
     "test:filter": "node test_filter.js",
     "test:mutation-json": "node test_mutation_json.js",
+    "test:mutation-report": "node test_mutation_report.js",
     "test:app": "node test_app_p.js",
     "test:app:serial": "node test_app.js",
     "test:notify": "node test_notify.js",
