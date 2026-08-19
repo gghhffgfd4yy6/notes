@@ -1099,3 +1099,13 @@
 - 根因：Codacy 行内 HIGH 风险——`scripts/mutation-report.js` 文件圈复杂度集中于 `render` 函数（单函数同时承担段表/Top 文件/Top 类型/存活清单四段职责，单点维护风险高、不利于单测）。
 - 重构：纯行为零变化的拆分——`render` 拆为 4 个 helper（`_renderSegmentTable` / `_renderTopFiles` / `_renderTopKinds` / `_renderSurvivors`）+ 一个协调器 `render`；外部 API 与签名保持一致（仍 `render(results) → markdown string`）。`main()` 调用改为 `require.main === module` 守护（`require` 时不再触发 CLI 副作用），并显式 `module.exports` 供测试。
 - 验证：新增 `test_mutation_report.js`，两个 fixture（含 error 段 + 正常段 + 全被杀段；以及 🎉 无存活分支）byte-equal 锁定当前 markdown 输出，确保拆分后输出严格一致；`run_tests.js` 新增"变异报告渲染"套件，`npm test` 全部通过。
+
+## v3.267（独立深度审查确认·零缺陷，2026-08-19）
+
+- 审查：对 HEAD（a651fe5）执行系统性主动式深度审查（判重/缓存/推送语义/URL安全/文件持久化/异常生命周期/配置边界/文档契约/测试覆盖 10 个维度）。
+- 结论：未发现已确认缺陷；14 项候选（URL 协议绕过、实体编码/控制字符绕过、未闭合属性、嵌套量词 ReDoS、缓存损坏自锁、fire-and-forget 告警、非 Error 抛出、部分成功误判、tombstone 竞态、符号链接 TOCTOU）全部经代码证据或实测排除。
+- 待验证候选排查结果：
+  - 并行模式 `pushInterval` per-worker 语义——确认为 Config 顶部注释明示的已知取舍（并行全局速率 = parallelLimit × interval），非契约失配，记录不修。
+  - `_trimCacheByBytes` 极端分布（最新消息巨大）——实测保留最新不超限，无过度丢弃，排除。
+- 验证：全量 `npm test` 6 套件 27.4s 全绿；补充 30+ 项独立边界断言（判重同构、URL 双编码/控制字符/协议相对绕过、hasNestedQuantifier、超长输入、缓存损坏恢复、模板注入转义）全部通过。
+- 保持：无代码变更（纯审查记录）。

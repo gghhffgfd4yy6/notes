@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.266 — mutation-report render 重构降复杂度 *********
+//* ******* 线报推送脚本 v3.267 — 独立深度审查确认零缺陷（2026-08-19） *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
