@@ -72,6 +72,8 @@ jobs:
 
       - name: 安全审计（高危及以上）
         run: npm audit --audit-level=high --omit=dev
+      - name: [故障注入验证] 故意失败——验证 quality-gate 会汇总标记 failure
+        run: exit 1
 
   # 稳定合并门禁：汇总 quality matrix 结果。
   # 背景：quality 的 check 名带 matrix 版本后缀（quality (20) 等），若未来增删 Node 版本
