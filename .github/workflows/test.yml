@@ -72,3 +72,22 @@ jobs:
 
       - name: 安全审计（高危及以上）
         run: npm audit --audit-level=high --omit=dev
+
+  # 稳定合并门禁：汇总 quality matrix 结果。
+  # 背景：quality 的 check 名带 matrix 版本后缀（quality (20) 等），若未来增删 Node 版本
+  # 或改 job 名，branch protection 绑定的 check 名会失配 → 永久阻塞合并。
+  # 方案：加无后缀的汇总 job，Required Checks 只绑定 quality-gate。
+  quality-gate:
+    runs-on: ubuntu-latest
+    needs: quality
+    if: always()   # quality 失败也要执行，以产出正确的失败结论
+    steps:
+      - name: 汇总 quality matrix 结果
+        run: |
+          RESULT="${{ needs.quality.result }}"
+          echo "quality matrix result = ${RESULT}"
+          if [ "$RESULT" != "success" ]; then
+            echo "❌ quality matrix 存在失败，合并门禁未通过"
+            exit 1
+          fi
+          echo "✅ quality matrix 全部通过"

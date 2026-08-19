@@ -10,3 +10,7 @@ mutation-report.json
 .ai/
 cleanup_rootfs_junk.sh
 .tmp_parallel_*.json
+
+# .ai/ 目录被忽略，但以下"跨 session 必须共享"的文件被强制跟踪（git add -f 或早于忽略规则）：
+#   .ai/README.md  .ai/REVIEW_CHECKLIST.md  .ai/skills/**/SKILL.md
+# 其余 .ai 内容（state.json、candidates/ 等 round 产物）由 .ai/ 规则忽略，不入库。
