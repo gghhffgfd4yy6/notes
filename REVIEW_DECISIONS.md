@@ -615,3 +615,22 @@
 | 过滤 L1950 | keyword==='' 与下方 trim 检查重复 | 纯风格，保留双保险（空串早退 + 空白早退）无害 |
 | 网络 L80-L94 | getNotify 两分支（模块缺失/缓存未命中）同构 | 重构惰性加载有并发安全回归风险，当前测试锁定行为，收益 < 风险 |
 | 报告 2（d474） | 只读验证注记（104 字节，无问题） | 非 bug，无需动作 |
+
+## 2026-08-19 · 独立深度审查 v3.267（a651fe5，零缺陷确认）
+
+**背景**：对 HEAD 的主动式深层审查（10 维度：判重一致性/推送语义/URL安全/持久化/异常生命周期/配置边界/日期时区/filter.hash/文档契约/测试覆盖），先列候选再验证分级。
+
+| 候选 | 处置 |
+|---|---|
+| 并行模式 `pushInterval` 全局速率 = parallelLimit × interval（P2 候选）| ✅ 排除——Config 顶部注释（L136-137）明示 per-worker 补位语义为已知取舍，20 条量级 + 重试兜底不构成频控问题，非契约失配 |
+| `_trimCacheByBytes` 极端分布过度丢弃（P3 候选）| ✅ 排除——实测最新巨大消息全保留，二分"保最新"语义正确 |
+| URL 四类绕过（协议相对/实体编码/控制字符/未闭合属性）| ✅ 排除——validUrl/safeUrl/sanitizeHtmlUrls 链路实测全拦 |
+| 判重三通道（id→url→anon）同构性 | ✅ 排除——同构且有 getMessageIdentity 单点实现 + 属性测试锁定 |
+| 缓存损坏→空数组覆写自锁 | ✅ 排除——readMessages 置 _readFailed、saveMessages 拒绝覆写 |
+| 部分推送成功误判全成功 | ✅ 排除——**sendNotify 仅 okCount===0 抛错**，pushOne 仅成功写缓存 |
+| fire-and-forget 告警丢失 | ✅ 排除——v3.164 起 await，exit 前送达 |
+| tombstone 竞态/覆盖 | ✅ 排除——跨进程锁 + owner token + 写前复检 + 原子写后落墓碑 |
+| 嵌套量词 ReDoS / 超长输入 | ✅ 排除——hasNestedQuantifier + matchesCompiled 长度上限实测 |
+| 模板 {链接} Markdown 注入 | ✅ 排除——mdLinkText 转义 + < > 包裹实测 |
+
+**结论**：无代码变更（纯审查记录）；版本三方同步升至 v3.267。测试基线 632+ 全绿（27.4s）+ 30+ 独立边界断言全过。盲区：Stryker 全量变异执行、scripts/ 辅助脚本、gitee 同步路径。
