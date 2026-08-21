@@ -2742,7 +2742,13 @@ const MessageStore = {
     // P1（审查 2026-08-15）：写端字节上限与读端 MESSAGE_CACHE_MAX_BYTES 对齐——此前仅按条数
     // （maxSize）裁剪，单条 >6.7KB（base64 图/长 HTML 常见）时 10000 条即可超 64MB，读端判
     // tooLarge → 置 _readFailed → 写端被 _readFailed 拒绝覆写 → 永久自锁直至人工删文件。
-    text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll)
+    try {
+      text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll)
+    } catch (e) {
+      // 评审 qodo（v3.267）：裁剪阶段意外异常（如极端不可序列化元素）也不崩溃进程，与序列化失败同口径 fail-open
+      console.error(`缓存裁剪失败 ${filePath}:`, e.message)
+      text = null
+    }
     if (text === null) {
       // 单条即超读端上限，无法裁剪出可读文件：跳过落盘，保留磁盘原状（避免写出超限文件触发自锁）
       // 同样不落墓碑——未发生实际裁剪，旧身份仍在磁盘缓存中，无需墓碑兜底
@@ -2776,7 +2782,12 @@ const MessageStore = {
       return null
     }
     // v3.267：预计算每条消息序列化字节（每条仅 stringify 一次），二分不再重复 JSON.stringify，避免 O(log n) 次全量序列化
-    const sizes = toSave.map(m => Buffer.byteLength(JSON.stringify(m), 'utf8'))
+    // 数组序列化口径：不可序列化元素（undefined/函数/Symbol/toJSON→undefined）在整体 JSON.stringify 时写为 null，
+    // 单条 stringify 返回 undefined 会令 Buffer.byteLength 抛 TypeError——统一按 'null' 计字节（评审 qodo/coderabbit）
+    const sizes = toSave.map((m) => {
+      const s = JSON.stringify(m)
+      return Buffer.byteLength(s === undefined ? 'null' : s, 'utf8')
+    })
     const sizeOfLast = (count) => { // 最后 count 条的数组序列化字节 = [] 开销 2 + (count-1) 个逗号 + 各条字节
       let sum = 2 + (count > 1 ? count - 1 : 0)
       for (let i = toSave.length - count; i < toSave.length; i++) sum += sizes[i]
