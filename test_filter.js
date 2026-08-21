@@ -8393,16 +8393,19 @@ console.log('========================================\n');
   const fc = require('fast-check')
 
   // 参考实现（与源码 _enabledFlag 同口径，仅用于属性测试对照）
+  // v3.267：同步空串/纯空白串关闭口径
   function refEnabledFlag (cfg) {
     const en = cfg && cfg.enabled
-    return !(!cfg || !en || String(en).trim().toLowerCase() === 'false' || String(en).trim().toLowerCase() === '0')
+    const s = en == null ? '' : String(en).trim().toLowerCase()
+    return !(!cfg || !en || s === '' || s === 'false' || s === '0')
   }
 
   await test('_enabledFlag：表格驱动——全部关闭/开启形态（杀 L2763+L2819 共 35 存活）', async () => {
     const cases = [
     // [输入, 预期开启]
       [undefined, false], [null, false], [{}, false], [{ enabled: undefined }, false],
-      [{ enabled: '' }, false], [{ enabled: 0 }, false], [{ enabled: '0' }, false],
+      [{ enabled: '' }, false], [{ enabled: ' ' }, false], [{ enabled: '   ' }, false],
+      [{ enabled: 0 }, false], [{ enabled: '0' }, false],
       [{ enabled: 'false' }, false], [{ enabled: 'FALSE' }, false], [{ enabled: 'False' }, false],
       [{ enabled: ' false ' }, false], [{ enabled: 'FaLsE' }, false],
       [{ enabled: true }, true], [{ enabled: 1 }, true], [{ enabled: '1' }, true],
