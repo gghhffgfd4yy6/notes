@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.267 — _enabledFlag 空白串修复 + _trimCacheByBytes 预计算字节 *********
+//* ******* 线报酷推送脚本 v3.268 — _enabledFlag 空白串修复 + _trimCacheByBytes 预计算字节 *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -2801,8 +2801,12 @@ const MessageStore = {
       if (sizeOfLast(mid) <= maxBytes) lo = mid
       else hi = mid - 1
     }
-    // 二分收敛到 lo=1 时校验最新单条本身：仍超限则无法裁剪，与单条路径同口径跳过落盘（防自锁）
-    if (lo === 1 && sizeOfLast(1) > maxBytes) {
+    // 评审 coderabbit（v3.267）：key-sensitive toJSON 时根级估算可能低估数组内真实字节
+    // （根级 key='' vs 数组内 key=索引，toJSON 可返回不同长度，实测可低估 10 倍）——
+    // 收敛后做一次真实数组口径校验，超限则线性回退（极罕见场景，正常路径零额外开销），防写盘超限触发读端 tooLarge 自锁
+    while (lo > 1 && Buffer.byteLength(JSON.stringify(toSave.slice(-lo)), 'utf8') > maxBytes) lo--
+    // 二分收敛到 lo=1 时校验最新单条本身（真实数组口径）：仍超限则无法裁剪，与单条路径同口径跳过落盘（防自锁）
+    if (lo === 1 && Buffer.byteLength(JSON.stringify(toSave.slice(-1)), 'utf8') > maxBytes) {
       console.warn(`缓存单条消息即超过读端上限(${maxBytes} 字节)，无法裁剪：${filePath}`)
       // 未实际裁剪任何记录：不产生丢弃（与单条超限路径同口径，见 saveMessages）
       return null
