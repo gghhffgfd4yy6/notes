@@ -56,7 +56,7 @@ jobs:
           cache: npm
 
       - name: 恢复增量缓存
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5.0.0
         with:
           path: reports
           key: stryker-${{ matrix.name }}-${{ github.sha }}
@@ -74,7 +74,7 @@ jobs:
       # 明细报告留档（inc-*.json + mutation.json/html），artifact 有公开下载 API
       - name: 上传变异报告
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
         with:
           name: mutation-report-${{ matrix.name }}
           path: reports/
@@ -97,7 +97,7 @@ jobs:
           node-version: 24
 
       - name: 下载各段变异报告
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5.0.0
         with:
           path: mutation-reports
           pattern: mutation-report-*
