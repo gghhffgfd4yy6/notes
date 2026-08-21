@@ -2788,10 +2788,11 @@ const MessageStore = {
       const s = JSON.stringify(m)
       return Buffer.byteLength(s === undefined ? 'null' : s, 'utf8')
     })
-    const sizeOfLast = (count) => { // 最后 count 条的数组序列化字节 = [] 开销 2 + (count-1) 个逗号 + 各条字节
-      let sum = 2 + (count > 1 ? count - 1 : 0)
-      for (let i = toSave.length - count; i < toSave.length; i++) sum += sizes[i]
-      return sum
+    // v3.267（评审建议）：后缀和数组——sizeOfLast(count) 从 O(count) 线性求和降为 O(1)，大数组二分不再重复累加
+    const suffix = new Array(toSave.length + 1).fill(0)
+    for (let i = toSave.length - 1; i >= 0; i--) suffix[i] = suffix[i + 1] + sizes[i]
+    const sizeOfLast = (count) => { // 最后 count 条的数组序列化字节 = [] 开销 2 + (count-1) 个逗号 + 后缀和
+      return 2 + (count > 1 ? count - 1 : 0) + suffix[toSave.length - count]
     }
     let lo = 1
     let hi = toSave.length
@@ -3618,10 +3619,13 @@ const App = {
   // !enabled（数字0/空串）或 'false'/'0' 字符串均关闭；'0' 字符串是 truthy 曾漏；
   // C016：trim + 小写，空格/大小写变体也关闭
   _enabledFlag (cfg) {
-    // v3.267：纯空白字符串（' '）此前被误判为启用（trim 后为空串但原值 truthy），与 C016 注释矛盾；统一走 s === '' 关闭
-    const en = cfg && cfg.enabled
+    // v3.267：纯空白字符串（' '）此前被误判为启用（trim 后为空串但原值 truthy），与 C016 注释矛盾；统一关闭
+    // v3.267（评审建议）：移除原始 truthiness 与规范化条件的重叠——Boolean(en) 兜底原始 falsy（0/false/''/NaN），
+    // 规范化 s 兜底空白变体与 'false'/'0' 字符串，各关闭条件仅出现一次
+    if (!cfg) return false
+    const en = cfg.enabled
     const s = en == null ? '' : String(en).trim().toLowerCase()
-    return !(!cfg || !en || s === '' || s === 'false' || s === '0')
+    return Boolean(en) && s !== '' && s !== 'false' && s !== '0'
   },
 
   // v3.258 提取：磁盘阈值解析（行为不变，供测试直接打纯函数）

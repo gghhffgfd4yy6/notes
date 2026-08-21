@@ -8431,11 +8431,12 @@ console.log('========================================\n');
   const fc = require('fast-check')
 
   // 参考实现（与源码 _enabledFlag 同口径，仅用于属性测试对照）
-  // v3.267：同步空串/纯空白串关闭口径
+  // v3.267：同步空串/纯空白串关闭口径 + 移除 truthiness/规范化重叠
   function refEnabledFlag (cfg) {
-    const en = cfg && cfg.enabled
+    if (!cfg) return false
+    const en = cfg.enabled
     const s = en == null ? '' : String(en).trim().toLowerCase()
-    return !(!cfg || !en || s === '' || s === 'false' || s === '0')
+    return Boolean(en) && s !== '' && s !== 'false' && s !== '0'
   }
 
   await test('_enabledFlag：表格驱动——全部关闭/开启形态（杀 L2763+L2819 共 35 存活）', async () => {
