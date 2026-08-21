@@ -1105,3 +1105,9 @@
 - 根因：第二轮分区审计 + 三路 Judge 评审确认 2 个真实缺陷——① `_enabledFlag` 对纯空白字符串（`' '`）误判为启用（实现只比较 'false'/'0'，漏掉 trim 后空串），与 C016 注释"空格/大小写变体也关闭"矛盾，配置 `enabled: ' '` 会意外开启告警/日报；② `_trimCacheByBytes` 二分查找每次迭代对 `toSave.slice(-mid)` 重复 JSON.stringify 计算字节，最坏 O(log n) 次全量序列化（1 万条约 14 次），高 payload 场景有可测量 CPU/内存开销。
 - 修复：① `_enabledFlag` 统一 `s = String(en).trim().toLowerCase()`，空串/`'false'`/`'0'` 均关闭，行为口径不变；② `_trimCacheByBytes` 预计算每条消息序列化字节（每条仅 stringify 一次），二分时按"2 + (n-1) 逗号 + 各条字节"精确求和，不再重复全量序列化，裁剪语义与日志不变。
 - 验证：`check-version.js` 三方一致；`_enabledFlag(' ')` → false 单测断言；`npm test` 全绿。
+
+## v3.268（评审对账跟进·`_trimCacheByBytes` key-sensitive toJSON 数组口径校验，2026-08-22）
+
+- 根因：PR #15 全量对账发现 codeRabbit 标注"已修复"的评论实际未修复——`_trimCacheByBytes` 用根级 `JSON.stringify(m)` 估算单条字节，但消息作为数组元素序列化时 `toJSON(key)` 收到的是索引 key（如 `'0'`），可返回与根级（key=`''`）完全不同的长度（实测 root 7B vs array 1024B，低估 10 倍）。二分选出的保留条数可能让最终数组仍超 `maxBytes` → 写盘超限 → 读端 tooLarge 自锁（历史 P1 回归）。
+- 修复：二分收敛后补一次真实数组口径校验 `Buffer.byteLength(JSON.stringify(toSave.slice(-lo))) > maxBytes` 则线性回退（仅 key-sensitive toJSON 极端场景触发，正常路径零额外开销）；单条校验同样改为真实数组口径。
+- 验证：新增 `P4 字节裁剪：key-sensitive toJSON 按数组口径校验不超限` 回归测试（前置断言根级估算 < 真实字节保证用例有效，断言裁剪结果绝不超 maxBytes）；`npm test` 全部通过。

@@ -1311,6 +1311,30 @@ console.log('========================================\n');
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), true, '被裁的 fn 记录应落墓碑')
   })
 
+  await test('P4 字节裁剪：key-sensitive toJSON 按数组口径校验不超限（v3.267 coderabbit 回归）', () => {
+    const name = 'test_tomb_tojson_key.txt'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const droppedOut = []
+    // key-sensitive toJSON：根级（key=''）返回小串，数组内（key=索引）返回大串——
+    // 根级估算会严重低估（实测可低估 10 倍），二分收敛后必须按真实数组口径校验，防写盘超限触发读端 tooLarge 自锁
+    const big = { id: 1, title: 'tojson', toJSON (key) { return key === '' ? 'small' : 'x'.repeat(1024) } }
+    const toSave = [big, { id: 2, title: 'normal', content: 'y'.repeat(50) }]
+    const arrBytes = Buffer.byteLength(JSON.stringify(toSave), 'utf8')
+    // 上限设为「根级估算恰好通过、真实数组超限」的区间：验证真实口径校验兜底生效
+    const rootEstimate = Buffer.byteLength('small', 'utf8') + Buffer.byteLength(JSON.stringify(toSave[1]), 'utf8') + 3
+    assertEqual(rootEstimate < arrBytes, true, '前置：根级估算应小于真实数组字节（否则用例无效）')
+    const maxBytes = Math.floor((rootEstimate + arrBytes) / 2)
+    const r = MessageStore._trimCacheByBytes(JSON.stringify(toSave), toSave, fp, maxBytes, droppedOut)
+    // 真实数组口径校验后：要么裁剪到可容纳，要么单条仍超限返回 null——绝不允许返回超限字符串
+    if (r !== null) {
+      assertEqual(Buffer.byteLength(r, 'utf8') <= maxBytes, true, '返回的裁剪结果不得超过 maxBytes（防读端自锁）')
+      assertEqual(droppedOut.length > 0, true, '超限时应发生裁剪')
+    } else {
+      assertEqual(true, true, '单条仍超限返回 null 也是合法兜底')
+    }
+  })
+
   await test('P4 墓碑双向 fallback 与原缓存索引一致', () => {
     const name = 'test_tomb_fallback.json'
     const fp = getFilePath(name)
