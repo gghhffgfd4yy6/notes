@@ -1273,6 +1273,44 @@ console.log('========================================\n');
     assertEqual(require('node:fs').existsSync(fp + '.seen.json'), false, '.seen.json 不应存在')
   })
 
+  await test('P4 字节裁剪：不可序列化元素不崩溃且按数组口径计字节（v3.267 评审回归）', () => {
+    const name = 'test_tomb_unserializable.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const droppedOut = []
+    // 含 undefined / 函数 / Symbol / toJSON→undefined 的元素：整体 JSON.stringify 时写为 null，
+    // 单条 JSON.stringify 返回 undefined——此前 Buffer.byteLength(undefined) 抛 TypeError，v3.267 回归修复
+    const toSave = [
+      undefined,
+      { id: 1, title: 'fn', cb: function () {} },
+      { id: 2, title: 'sym', s: Symbol('x') },
+      { id: 3, title: 'tojson', toJSON: () => undefined },
+      { id: 4, title: 'normal', content: 'y'.repeat(50) }
+    ]
+    // 数组整体序列化口径（对照）：不可序列化元素落盘为 null
+    const ref = JSON.stringify(toSave)
+    assertEqual(ref.includes('null'), true, '对照：数组 stringify 应将不可序列化元素写为 null')
+    const sizesRef = Buffer.byteLength(ref, 'utf8')
+    let r = null
+    try {
+      r = MessageStore._trimCacheByBytes(JSON.stringify(toSave), toSave, fp, sizesRef, droppedOut)
+      assertEqual(typeof r, 'string', '裁剪不应崩溃且应返回字符串')
+    } catch (e) {
+      assertEqual(false, true, '不得抛出异常: ' + e.message)
+    }
+    // 上限等于整体大小（含 null 口径）时全部保留，无丢弃
+    assertEqual(droppedOut.length, 0, '上限足够时不应裁剪')
+    // 上限收紧到只放得下最新 1 条：仍不崩溃，裁掉最早 4 条
+    droppedOut.length = 0
+    const small = Buffer.byteLength(JSON.stringify([{ id: 4, title: 'normal', content: 'y'.repeat(50) }]), 'utf8')
+    r = MessageStore._trimCacheByBytes(JSON.stringify(toSave), toSave, fp, small + 2, droppedOut)
+    assertEqual(typeof r, 'string', '收紧上限后仍不应崩溃')
+    assertEqual(droppedOut.length, 4, '应裁掉 4 条不可/可序列化混合的最早记录')
+    assertEqual(JSON.parse(r).length, 1, '应仅保留最新 1 条')
+    MessageStore._tombstoneDropped(fp, droppedOut) // 模拟 saveMessages 裁剪后统一落墓碑
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), true, '被裁的 fn 记录应落墓碑')
+  })
+
   await test('P4 墓碑双向 fallback 与原缓存索引一致', () => {
     const name = 'test_tomb_fallback.json'
     const fp = getFilePath(name)
@@ -8393,16 +8431,22 @@ console.log('========================================\n');
   const fc = require('fast-check')
 
   // 参考实现（与源码 _enabledFlag 同口径，仅用于属性测试对照）
+  // v3.267：同步空串/纯空白串关闭口径 + 移除 truthiness/规范化重叠
   function refEnabledFlag (cfg) {
-    const en = cfg && cfg.enabled
-    return !(!cfg || !en || String(en).trim().toLowerCase() === 'false' || String(en).trim().toLowerCase() === '0')
+    if (!cfg) return false
+    const en = cfg.enabled
+    const s = en == null ? '' : String(en).trim().toLowerCase()
+    return Boolean(en) && s !== '' && s !== 'false' && s !== '0'
   }
 
   await test('_enabledFlag：表格驱动——全部关闭/开启形态（杀 L2763+L2819 共 35 存活）', async () => {
     const cases = [
     // [输入, 预期开启]
       [undefined, false], [null, false], [{}, false], [{ enabled: undefined }, false],
-      [{ enabled: '' }, false], [{ enabled: 0 }, false], [{ enabled: '0' }, false],
+      [{ enabled: '' }, false], [{ enabled: ' ' }, false], [{ enabled: '   ' }, false],
+      [{ enabled: '\t' }, false], [{ enabled: '\n' }, false], [{ enabled: '\r\n' }, false],
+      [{ enabled: '\u00A0' }, false], [{ enabled: '\u3000' }, false],
+      [{ enabled: 0 }, false], [{ enabled: '0' }, false],
       [{ enabled: 'false' }, false], [{ enabled: 'FALSE' }, false], [{ enabled: 'False' }, false],
       [{ enabled: ' false ' }, false], [{ enabled: 'FaLsE' }, false],
       [{ enabled: true }, true], [{ enabled: 1 }, true], [{ enabled: '1' }, true],

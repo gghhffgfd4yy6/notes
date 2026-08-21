@@ -1099,3 +1099,9 @@
 - 根因：Codacy 行内 HIGH 风险——`scripts/mutation-report.js` 文件圈复杂度集中于 `render` 函数（单函数同时承担段表/Top 文件/Top 类型/存活清单四段职责，单点维护风险高、不利于单测）。
 - 重构：纯行为零变化的拆分——`render` 拆为 4 个 helper（`_renderSegmentTable` / `_renderTopFiles` / `_renderTopKinds` / `_renderSurvivors`）+ 一个协调器 `render`；外部 API 与签名保持一致（仍 `render(results) → markdown string`）。`main()` 调用改为 `require.main === module` 守护（`require` 时不再触发 CLI 副作用），并显式 `module.exports` 供测试。
 - 验证：新增 `test_mutation_report.js`，两个 fixture（含 error 段 + 正常段 + 全被杀段；以及 🎉 无存活分支）byte-equal 锁定当前 markdown 输出，确保拆分后输出严格一致；`run_tests.js` 新增"变异报告渲染"套件，`npm test` 全部通过。
+
+## v3.267（缺陷评审修复·`_enabledFlag` 空白串 + `_trimCacheByBytes` 预计算，2026-08-22）
+
+- 根因：第二轮分区审计 + 三路 Judge 评审确认 2 个真实缺陷——① `_enabledFlag` 对纯空白字符串（`' '`）误判为启用（实现只比较 'false'/'0'，漏掉 trim 后空串），与 C016 注释"空格/大小写变体也关闭"矛盾，配置 `enabled: ' '` 会意外开启告警/日报；② `_trimCacheByBytes` 二分查找每次迭代对 `toSave.slice(-mid)` 重复 JSON.stringify 计算字节，最坏 O(log n) 次全量序列化（1 万条约 14 次），高 payload 场景有可测量 CPU/内存开销。
+- 修复：① `_enabledFlag` 统一 `s = String(en).trim().toLowerCase()`，空串/`'false'`/`'0'` 均关闭，行为口径不变；② `_trimCacheByBytes` 预计算每条消息序列化字节（每条仅 stringify 一次），二分时按"2 + (n-1) 逗号 + 各条字节"精确求和，不再重复全量序列化，裁剪语义与日志不变。
+- 验证：`check-version.js` 三方一致；`_enabledFlag(' ')` → false 单测断言；`npm test` 全绿。

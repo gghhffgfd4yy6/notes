@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.266 — mutation-report render 重构降复杂度 *********
+//* ******* 线报酷推送脚本 v3.267 — _enabledFlag 空白串修复 + _trimCacheByBytes 预计算字节 *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -2742,7 +2742,13 @@ const MessageStore = {
     // P1（审查 2026-08-15）：写端字节上限与读端 MESSAGE_CACHE_MAX_BYTES 对齐——此前仅按条数
     // （maxSize）裁剪，单条 >6.7KB（base64 图/长 HTML 常见）时 10000 条即可超 64MB，读端判
     // tooLarge → 置 _readFailed → 写端被 _readFailed 拒绝覆写 → 永久自锁直至人工删文件。
-    text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll)
+    try {
+      text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll)
+    } catch (e) {
+      // 评审 qodo（v3.267）：裁剪阶段意外异常（如极端不可序列化元素）也不崩溃进程，与序列化失败同口径 fail-open
+      console.error(`缓存裁剪失败 ${filePath}:`, e.message)
+      text = null
+    }
     if (text === null) {
       // 单条即超读端上限，无法裁剪出可读文件：跳过落盘，保留磁盘原状（避免写出超限文件触发自锁）
       // 同样不落墓碑——未发生实际裁剪，旧身份仍在磁盘缓存中，无需墓碑兜底
@@ -2775,16 +2781,28 @@ const MessageStore = {
       console.warn(`缓存单条消息即超过读端上限(${maxBytes} 字节)，无法裁剪：${filePath}`)
       return null
     }
+    // v3.267：预计算每条消息序列化字节（每条仅 stringify 一次），二分不再重复 JSON.stringify，避免 O(log n) 次全量序列化
+    // 数组序列化口径：不可序列化元素（undefined/函数/Symbol/toJSON→undefined）在整体 JSON.stringify 时写为 null，
+    // 单条 stringify 返回 undefined 会令 Buffer.byteLength 抛 TypeError——统一按 'null' 计字节（评审 qodo/coderabbit）
+    const sizes = toSave.map((m) => {
+      const s = JSON.stringify(m)
+      return Buffer.byteLength(s === undefined ? 'null' : s, 'utf8')
+    })
+    // v3.267（评审建议）：后缀和数组——sizeOfLast(count) 从 O(count) 线性求和降为 O(1)，大数组二分不再重复累加
+    const suffix = new Array(toSave.length + 1).fill(0)
+    for (let i = toSave.length - 1; i >= 0; i--) suffix[i] = suffix[i + 1] + sizes[i]
+    const sizeOfLast = (count) => { // 最后 count 条的数组序列化字节 = [] 开销 2 + (count-1) 个逗号 + 后缀和
+      return 2 + (count > 1 ? count - 1 : 0) + suffix[toSave.length - count]
+    }
     let lo = 1
     let hi = toSave.length
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1
-      const kept = toSave.slice(-mid)
-      if (Buffer.byteLength(JSON.stringify(kept), 'utf8') <= maxBytes) lo = mid
+      if (sizeOfLast(mid) <= maxBytes) lo = mid
       else hi = mid - 1
     }
     // 二分收敛到 lo=1 时校验最新单条本身：仍超限则无法裁剪，与单条路径同口径跳过落盘（防自锁）
-    if (lo === 1 && Buffer.byteLength(JSON.stringify(toSave.slice(-1)), 'utf8') > maxBytes) {
+    if (lo === 1 && sizeOfLast(1) > maxBytes) {
       console.warn(`缓存单条消息即超过读端上限(${maxBytes} 字节)，无法裁剪：${filePath}`)
       // 未实际裁剪任何记录：不产生丢弃（与单条超限路径同口径，见 saveMessages）
       return null
@@ -3601,8 +3619,13 @@ const App = {
   // !enabled（数字0/空串）或 'false'/'0' 字符串均关闭；'0' 字符串是 truthy 曾漏；
   // C016：trim + 小写，空格/大小写变体也关闭
   _enabledFlag (cfg) {
-    const en = cfg && cfg.enabled
-    return !(!cfg || !en || String(en).trim().toLowerCase() === 'false' || String(en).trim().toLowerCase() === '0')
+    // v3.267：纯空白字符串（' '）此前被误判为启用（trim 后为空串但原值 truthy），与 C016 注释矛盾；统一关闭
+    // v3.267（评审建议）：移除原始 truthiness 与规范化条件的重叠——Boolean(en) 兜底原始 falsy（0/false/''/NaN），
+    // 规范化 s 兜底空白变体与 'false'/'0' 字符串，各关闭条件仅出现一次
+    if (!cfg) return false
+    const en = cfg.enabled
+    const s = en == null ? '' : String(en).trim().toLowerCase()
+    return Boolean(en) && s !== '' && s !== 'false' && s !== '0'
   },
 
   // v3.258 提取：磁盘阈值解析（行为不变，供测试直接打纯函数）
