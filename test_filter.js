@@ -8730,12 +8730,19 @@ console.log('========================================\n');
   })
 
   await test('P4 _now 时钟回拨：在上一次值上严格 +1 不回退（v3.253）', () => {
-    const base = Date.now() + 60000 // 模拟时钟回拨：上次时间在未来
-    MessageStore._nowLastTs = base
-    const a = Date.parse(MessageStore._now())
-    assert.ok(a > base, `回拨后不得回退到当前时间: ${a}`)
-    const b = Date.parse(MessageStore._now())
-    assert.ok(b > a, '回拨后连续调用仍严格递增')
+    const prevTs = MessageStore._nowLastTs
+    const prevInc = MessageStore._nowInc
+    try {
+      const base = Date.now() + 60000 // 模拟时钟回拨：上次时间在未来
+      MessageStore._nowLastTs = base
+      const a = Date.parse(MessageStore._now())
+      assert.ok(a > base, `回拨后不得回退到当前时间: ${a}`)
+      const b = Date.parse(MessageStore._now())
+      assert.ok(b > a, '回拨后连续调用仍严格递增')
+    } finally {
+      MessageStore._nowLastTs = prevTs
+      MessageStore._nowInc = prevInc
+    }
   })
 
   await test('P4 _memoSet 容量 LRU 淘汰最旧键（v3.260 正则回归）', () => {
