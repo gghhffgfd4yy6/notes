@@ -6,7 +6,7 @@
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================
 
-const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity } = require('./xbk_function_v3.js')
+const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity, num } = require('./xbk_function_v3.js')
 const assert = require('assert')
 const slim = require('./xbk_sendNotify_slim.js')
 const { extractTestSummary } = require('./run_mutation.js')
@@ -8709,6 +8709,477 @@ console.log('========================================\n');
       }
     } finally {
       Config.template = saved === undefined ? undefined : JSON.parse(saved)
+    }
+  })
+
+  // ============================================================
+  // 补测：近期修复点零覆盖内部方法击杀
+  // 目标：_now 单调时钟(v3.251/253)、_memoSet LRU(v3.260)、
+  //       _contentChangedIgnoringTs(v3.156)、墓碑身份应用/索引、_localStamp
+  // ============================================================
+  console.log('\n📂 补测：单调时钟 / 内存缓存 LRU / 判重深排 / 墓碑身份')
+
+  await test('P4 _now 同毫秒连续调用严格单调递增（v3.251/253 时钟回拨修复）', () => {
+    MessageStore._nowLastTs = undefined
+    MessageStore._nowInc = undefined
+    const r1 = Date.parse(MessageStore._now())
+    const r2 = Date.parse(MessageStore._now())
+    const r3 = Date.parse(MessageStore._now())
+    assert.ok(r2 > r1, `第二次应严格大于第一次: ${r1} -> ${r2}`)
+    assert.ok(r3 > r2, `第三次应严格大于第二次: ${r2} -> ${r3}`)
+  })
+
+  await test('P4 _now 时钟回拨：在上一次值上严格 +1 不回退（v3.253）', () => {
+    MessageStore._nowLastTs = Date.now() + 60000 // 模拟时钟回拨：上次时间在未来
+    const a = Date.parse(MessageStore._now())
+    assert.ok(a >= Date.now() + 60000, `回拨后不得回退到当前时间: ${a}`)
+    const b = Date.parse(MessageStore._now())
+    assert.ok(b > a, '回拨后连续调用仍严格递增')
+  })
+
+  await test('P4 _memoSet 容量 LRU 淘汰最旧键（v3.260 正则回归）', () => {
+    const saved = { cache: MessageStore._memoryCache, count: MessageStore._memoCount, warned: MessageStore._memoWarned, max: MessageStore._MEMO_MAX }
+    try {
+      MessageStore._MEMO_MAX = 3
+      MessageStore._memoryCache = {}
+      MessageStore._memoCount = 0
+      MessageStore._memoWarned = false
+      const oldWarn = console.warn
+      console.warn = () => {}
+      try {
+        MessageStore._memoSet('k1', 1)
+        MessageStore._memoSet('k2', 2)
+        MessageStore._memoSet('k3', 3)
+        MessageStore._memoSet('k4', 4) // 打满：应淘汰最旧键 k1
+        assertEqual(Object.keys(MessageStore._memoryCache).join(','), 'k2,k3,k4', '打满后应淘汰最旧键 k1')
+        assertEqual(MessageStore._memoCount, 3, '淘汰后计数应保持 3')
+        // 重复写不膨胀计数
+        MessageStore._memoSet('k2', 22)
+        assertEqual(MessageStore._memoCount, 3, '重复键写不应增加计数')
+        assertEqual(MessageStore._memoryCache.k2, 22, '重复键写应更新值')
+      } finally {
+        console.warn = oldWarn
+      }
+    } finally {
+      MessageStore._memoryCache = saved.cache
+      MessageStore._memoCount = saved.count
+      MessageStore._memoWarned = saved.warned
+      MessageStore._MEMO_MAX = saved.max
+    }
+  })
+
+  await test('P4 _memoSet 原型键安全写入不污染原型（__proto__ 防御）', () => {
+    const saved = { cache: MessageStore._memoryCache, count: MessageStore._memoCount, warned: MessageStore._memoWarned }
+    try {
+      MessageStore._memoryCache = {}
+      MessageStore._memoCount = 0
+      MessageStore._memoWarned = false
+      MessageStore._memoSet('__proto__', 'evil')
+      MessageStore._memoSet('constructor', 'c')
+      MessageStore._memoSet('prototype', 'p')
+      assertEqual(Object.getPrototypeOf(MessageStore._memoryCache) === Object.prototype, true, '__proto__ 键不得污染原型')
+      assertEqual(Object.prototype.hasOwnProperty.call(MessageStore._memoryCache, '__proto__'), true, '__proto__ 应为自有键')
+      assertEqual(Object.prototype.hasOwnProperty.call(MessageStore._memoryCache, 'constructor'), true, 'constructor 应为自有键')
+      assertEqual(Object.prototype.hasOwnProperty.call(MessageStore._memoryCache, 'prototype'), true, 'prototype 应为自有键')
+      const protoKey = '__proto__'
+      assertEqual(MessageStore._memoryCache[protoKey], 'evil', '__proto__ 键值应可读')
+    } finally {
+      MessageStore._memoryCache = saved.cache
+      MessageStore._memoCount = saved.count
+      MessageStore._memoWarned = saved.warned
+    }
+  })
+
+  await test('P4 _contentChangedIgnoringTs 键序无关且忽略顶层 timestamp（v3.156）', () => {
+    // 键序不同 + 顶层 timestamp 不同 → 内容未变更
+    assertEqual(MessageStore._contentChangedIgnoringTs(
+      { id: 1, title: 'x', timestamp: '2026-01-01T00:00:00.000Z' },
+      { timestamp: '2026-02-02T00:00:00.000Z', title: 'x', id: 1 }
+    ), false, '同内容键序不同应判未变更')
+    // 嵌套对象键序不同
+    assertEqual(MessageStore._contentChangedIgnoringTs(
+      { id: 1, nested: { a: 1, b: 2 } },
+      { id: 1, nested: { b: 2, a: 1 } }
+    ), false, '嵌套键序不同应判未变更')
+    // 内容真正变化
+    assertEqual(MessageStore._contentChangedIgnoringTs({ id: 1, title: 'x' }, { id: 1, title: 'y' }), true, '内容变更应判已变更')
+    // 原始值
+    assertEqual(MessageStore._contentChangedIgnoringTs(1, 1), false, '同原始值应判未变更')
+    assertEqual(MessageStore._contentChangedIgnoringTs(1, 2), true, '异原始值应判已变更')
+    // 循环引用不崩溃（按已变更处理可接受，绝不能抛）
+    const cyc = { id: 1 }
+    cyc.self = cyc
+    let threw = false
+    try {
+      MessageStore._contentChangedIgnoringTs(cyc, { id: 2 })
+    } catch (e) {
+      threw = true
+    }
+    assertEqual(threw, false, '循环引用不得抛出')
+    // getter 抛错不崩溃（退回已变更）
+    const evil = { id: 1 }
+    Object.defineProperty(evil, 'title', { get () { throw new Error('boom') } })
+    threw = false
+    try {
+      MessageStore._contentChangedIgnoringTs(evil, { id: 1, title: 'x' })
+    } catch (e) {
+      threw = true
+    }
+    assertEqual(threw, false, 'getter 抛错不得抛出')
+  })
+
+  await test('P4 _applyTombstoneIdentity 四类身份写入与重复幂等', () => {
+    const ts = { id: new Map(), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() }
+    const gid = getMessageIdentity
+    // id + url：id 集合 + idWithUrl 集合
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ id: 5, url: 'https://a.com/x' })), true, '首次写入应返回新增')
+    assertEqual(ts.id.has('5'), true, 'id 集合应含 idKey')
+    assertEqual(ts.idWithUrl.has('https://a.com/x'), true, 'idWithUrl 集合应含 url')
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ id: 5, url: 'https://a.com/x' })), false, '重复写入应返回 false')
+    // 仅 id：idWithUrl 不新增
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ id: 6 })), true)
+    assertEqual(ts.idWithUrl.size, 1, '无 url 的 id 不得写 idWithUrl')
+    // 纯 url
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ url: 'https://b.com/y' })), true)
+    assertEqual(ts.urlOnly.has('https://b.com/y'), true, 'url 类应写 urlOnly')
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ url: 'https://b.com/y' })), false, '重复 url 应返回 false')
+    // anon
+    const anon = gid({ title: 'anon-msg' })
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, anon), true)
+    assertEqual(ts.anon.has(anon.key), true, 'anon 应写匿名键')
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, anon), false, '重复 anon 应返回 false')
+    // 无效身份
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, { valid: false }), false, '无效身份应返回 false 不写入')
+  })
+
+  await test('P4 _buildIdentityIndex 四类索引构建与无效消息跳过', () => {
+    const idx = MessageStore._buildIdentityIndex([
+      { id: 7, url: 'https://a.com/x' }, // id + url
+      { url: 'https://b.com/y' }, // 纯 url
+      { title: 'anon-msg' }, // anon
+      {}, // 无效：跳过
+      null // 无效：跳过
+    ])
+    assertEqual(idx.idByKey.has('7'), true, 'idByKey 应含 id')
+    assertEqual(idx.idWithUrl.has('https://a.com/x'), true, 'idWithUrl 应含 id 消息的 url')
+    assertEqual(idx.urlOnly.has('https://b.com/y'), true, 'urlOnly 应含纯 url')
+    assertEqual(idx.anonByKey.size, 1, 'anonByKey 应含 1 个匿名键')
+    assertEqual(idx.idByKey.size + idx.urlOnly.size + idx.idWithUrl.size + idx.anonByKey.size, 4, '无效消息不应入索引')
+  })
+
+  await test('P4 App._localStamp 本地时间戳格式 YYYY-MM-DD HH:mm:ss', () => {
+    const s = V3App._localStamp()
+    assertEqual(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s), true, `格式应为 YYYY-MM-DD HH:mm:ss: ${s}`)
+  })
+
+  // ============================================================
+  // 补测 2：判重索引 + 墓碑淘汰类零覆盖内部方法
+  // 目标：_findDedupIndex、_indexHasIdentity、_evictOldestKeys、
+  //       _evictTombstonesToSize、_trimTombstoneMaps、_cloneTombstones、_readTombstoneData
+  // ============================================================
+  console.log('\n📂 补测 2：判重索引 / 墓碑淘汰 / 墓碑读取')
+
+  await test('P4 _findDedupIndex 统一判重：四类身份命中/未命中与防御', () => {
+    assertEqual(MessageStore._findDedupIndex(null, { id: 1 }), -1, '非数组应返回 -1')
+    assertEqual(MessageStore._findDedupIndex([{ id: 1 }], {}), -1, '无效身份应返回 -1')
+    assertEqual(MessageStore._findDedupIndex([{ id: 1, title: 'a' }], { id: 1, title: 'b' }), 0, '同 id 应命中')
+    assertEqual(MessageStore._findDedupIndex([{ id: 1 }], { id: 2 }), -1, '不同 id 不应命中')
+    assertEqual(MessageStore._findDedupIndex([{ id: 9, url: 'https://a.com/x' }], { url: 'https://a.com/x', title: 't' }), 0, 'id 缓存消息的 url 应对纯 url 查询命中')
+    assertEqual(MessageStore._findDedupIndex([{ title: 'x' }], { title: 'x' }), 0, '同匿名键应命中')
+    assertEqual(MessageStore._findDedupIndex([{ title: 'x' }], { title: 'y' }), -1, '异匿名键不应命中')
+    assertEqual(MessageStore._findDedupIndex([{ url: 'https://a.com/x/' }], { url: 'https://a.com/x' }), 0, '尾斜杠应归一化命中')
+    assertEqual(MessageStore._findDedupIndex([{ url: 'https://A.com/x' }], { url: 'https://a.com/x' }), 0, '主机大小写应归一化命中')
+  })
+
+  await test('P4 _indexHasIdentity 预计算索引查询与 _findDedupIndex 同构', () => {
+    const idx = MessageStore._buildIdentityIndex([
+      { id: 7, url: 'https://a.com/x' },
+      { url: 'https://b.com/y' },
+      { title: 'anon-msg' }
+    ])
+    assertEqual(MessageStore._indexHasIdentity(idx, { id: 7 }), true, 'id 查询应命中 idByKey')
+    assertEqual(MessageStore._indexHasIdentity(idx, { id: 999, url: 'https://b.com/y' }), true, 'id 查询应 fallback 纯 url 缓存')
+    assertEqual(MessageStore._indexHasIdentity(idx, { url: 'https://b.com/y' }), true, 'url 查询应命中 urlOnly')
+    assertEqual(MessageStore._indexHasIdentity(idx, { url: 'https://a.com/x' }), true, 'url 查询应命中 idWithUrl')
+    assertEqual(MessageStore._indexHasIdentity(idx, { title: 'anon-msg' }), true, 'anon 查询应命中')
+    assertEqual(MessageStore._indexHasIdentity(idx, {}), false, '无效身份查询应 false')
+    assertEqual(MessageStore._indexHasIdentity(idx, { url: 'https://nope.com/z' }), false, '未命中应 false')
+  })
+
+  await test('P4 _evictOldestKeys 墓碑最旧键淘汰：count/guard 边界', () => {
+    const m1 = [new Map([['a', 1], ['b', 2]]), new Map([['c', 3]])]
+    MessageStore._evictOldestKeys(m1, 0, 3)
+    assertEqual(m1.map(x => [...x.keys()].join('')).join('|'), 'ab|c', 'count=0 不应删除')
+    const m3 = [new Map([['a', 1], ['b', 2], ['c', 3]]), new Map([['x', 1], ['y', 2]])]
+    MessageStore._evictOldestKeys(m3, 2, 3)
+    assertEqual(m3[0].has('a'), false, '第一轮删各 map 最旧键')
+    assertEqual(m3[1].has('x'), false, '第一轮删各 map 最旧键')
+    MessageStore._evictOldestKeys([new Map(), new Map()], 3, 3) // 全空不崩
+  })
+
+  await test('P4 _evictTombstonesToSize 字节淘汰达标且四类键齐全', () => {
+    const ts = {
+      id: new Map(Array.from({ length: 50 }, (_, i) => ['id' + i, true])),
+      urlOnly: new Map(Array.from({ length: 30 }, (_, i) => ['u' + i, true])),
+      idWithUrl: new Map(),
+      anon: new Map(Array.from({ length: 20 }, (_, i) => ['k' + i, true]))
+    }
+    const text = MessageStore._evictTombstonesToSize(ts, 200)
+    assertEqual(Buffer.byteLength(text, 'utf8') <= 200, true, `淘汰后体积应达标: ${Buffer.byteLength(text, 'utf8')}`)
+    const parsed = JSON.parse(text)
+    assertEqual(parsed.v, 1, '序列化格式 v1')
+    assertEqual(Array.isArray(parsed.id) && Array.isArray(parsed.urlOnly) && Array.isArray(parsed.idWithUrl) && Array.isArray(parsed.anon), true, '四类键应齐全')
+    const empty = MessageStore._evictTombstonesToSize({ id: new Map(), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() }, 100)
+    assertEqual(Buffer.byteLength(empty, 'utf8') <= 100, true, '空墓碑应达标')
+  })
+
+  await test('P4 _trimTombstoneMaps 超 TOMBSTONE_MAX_KEYS(5000) 丢最旧键', () => {
+    const big = { id: new Map(), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() }
+    for (let i = 0; i < 5001; i++) big.id.set('id' + i, true)
+    big.anon.set('k1', true)
+    MessageStore._trimTombstoneMaps(big)
+    assertEqual(big.id.size, 5000, 'id map 应裁剪到 5000')
+    assertEqual(big.id.has('id0'), false, '最旧键应被淘汰')
+    assertEqual(big.id.has('id5000'), true, '最新键应保留')
+    assertEqual(big.anon.size, 1, '未超限 map 不应裁剪')
+  })
+
+  await test('P4 _cloneTombstones 深拷贝：改副本不影响原', () => {
+    const t = { id: new Map([['x', 1]]), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() }
+    const c = MessageStore._cloneTombstones(t)
+    c.id.set('y', 2)
+    c.anon.set('k', 1)
+    assertEqual(t.id.has('y'), false, '副本写入不应影响原 id map')
+    assertEqual(t.anon.size, 0, '副本写入不应影响原 anon map')
+    assertEqual(c.id.has('x'), true, '副本应含原键')
+  })
+
+  await test('P4 _readTombstoneData 缺失/损坏/空串返回 null，合法文件解析', () => {
+    const fp = getFilePath('test_tomb_readdata.json')
+    const fsmod = require('node:fs')
+    const seen = fp + '.seen.json'
+    try { fsmod.unlinkSync(seen) } catch (e) { /* 忽略 */ }
+    try {
+      assertEqual(MessageStore._readTombstoneData(fp), null, '缺失应返回 null')
+      fsmod.writeFileSync(seen, '{not json')
+      const oldWarn = console.warn
+      console.warn = () => {}
+      try {
+        assertEqual(MessageStore._readTombstoneData(fp), null, '损坏 JSON 应返回 null')
+      } finally {
+        console.warn = oldWarn
+      }
+      fsmod.writeFileSync(seen, '')
+      assertEqual(MessageStore._readTombstoneData(fp), null, '空串应返回 null')
+      fsmod.writeFileSync(seen, JSON.stringify({ v: 1, id: ['a', 'b'], urlOnly: [], idWithUrl: [], anon: [] }))
+      const d = MessageStore._readTombstoneData(fp)
+      assertEqual(!!d && Array.isArray(d.id) && d.id.length === 2, true, '合法文件应解析')
+    } finally {
+      try { fsmod.unlinkSync(seen) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  // ============================================================
+  // 补测 3：状态读写 / 告警限频 / 日报更新内部方法
+  // 目标：_writeState、_writeTextAtomic、_readSafeState、
+  //       _sendAlert(v3.251 lastAt 校验)、_warnLowDisk、_updateReport
+  // ============================================================
+  console.log('\n📂 补测 3：状态读写 / 告警限频 / 日报更新')
+
+  await test('P4 _writeState 类型守卫：非对象/数组拒绝，合法对象原子落盘', () => {
+    const fp = getFilePath('test_state_write.json')
+    const fsmod = require('node:fs')
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    const oldWarn = console.warn
+    console.warn = () => {}
+    try {
+      assertEqual(V3App._writeState(fp, undefined), false, 'undefined 应拒绝')
+      assertEqual(V3App._writeState(fp, null), false, 'null 应拒绝')
+      assertEqual(V3App._writeState(fp, 'str'), false, '字符串应拒绝')
+      assertEqual(V3App._writeState(fp, [1, 2]), false, '数组应拒绝（v3.246）')
+      assertEqual(V3App._writeState(fp, { lastAt: 123 }), true, '合法对象应写入')
+      assertEqual(fsmod.existsSync(fp), true, '写入后文件应存在')
+      assertEqual(JSON.parse(fsmod.readFileSync(fp, 'utf8')).lastAt, 123, '内容应正确')
+    } finally {
+      console.warn = oldWarn
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('P4 _writeTextAtomic 异常目标不冒泡（v3.245 P1 防御）', () => {
+    let threw = false
+    try {
+      V3App._writeTextAtomic(path.join(CACHE, 'test_state_dir_atomic'), 'x')
+    } catch (e) {
+      threw = true
+    }
+    assertEqual(threw, false, '写目录路径不得抛出')
+  })
+
+  await test('P4 _readSafeState 缺失/损坏/超限/合法四态', () => {
+    const fp = getFilePath('test_state_read.json')
+    const fsmod = require('node:fs')
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    try {
+      assertEqual(V3App._readSafeState(fp).status, 'missing', '缺失应 missing')
+      fsmod.writeFileSync(fp, '{bad')
+      const oldWarn = console.warn
+      console.warn = () => {}
+      try {
+        assertEqual(V3App._readSafeState(fp).status, 'ok', '小文件损坏 JSON 读取状态应为 ok（解析层处理）')
+      } finally {
+        console.warn = oldWarn
+      }
+      fsmod.writeFileSync(fp, 'x'.repeat(64 * 1024 + 10))
+      assertEqual(V3App._readSafeState(fp).status, 'tooLarge', '超 64KB 应 tooLarge')
+      fsmod.writeFileSync(fp, JSON.stringify({ lastAt: 123 }))
+      assertEqual(V3App._readSafeState(fp).status, 'ok', '合法小文件应 ok')
+    } finally {
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('P4 _warnLowDisk 限流内与未配置阈值均静默', () => {
+    const saved = { at: V3App._diskWarningAt, cfg: JSON.stringify(Config) }
+    const oldWarn = console.warn
+    try {
+      // 限流内：刚告警过 → 直接返回
+      V3App._diskWarningAt = Date.now()
+      let warned = false
+      console.warn = () => { warned = true }
+      V3App._warnLowDisk()
+      assertEqual(warned, false, '限流内不应重复告警')
+      // 未配置阈值 → 直接返回
+      V3App._diskWarningAt = 0
+      const savedStorage = Config.storage
+      delete Config.storage
+      warned = false
+      V3App._warnLowDisk()
+      assertEqual(warned, false, '未配置 minFree 不应告警')
+      Config.storage = savedStorage
+    } finally {
+      console.warn = oldWarn
+      V3App._diskWarningAt = saved.at
+      Config.storage = JSON.parse(saved.cfg).storage
+    }
+  })
+
+  await test('P4 _sendAlert 未启用/限频内不发，lastAt=NaN 绕过限频（v3.251）', async () => {
+    const saved = { alert: JSON.stringify(Config.alert), map: new Map(V3App._alertLastAtByPath) }
+    const statePath = path.join(MessageStore.cacheDir, 'alert.state')
+    const fsmod = require('node:fs')
+    const pusherMod = require('./xbk_function_v3.js').Pusher
+    try {
+      // 1) alert 关闭 → 直接 return
+      Config.alert = { enabled: false }
+      assertEqual(V3App._sendAlert('err'), undefined, '关闭时应直接返回')
+      // 2) 限频内 → 不发送
+      Config.alert = { enabled: true, intervalMs: 3600000 }
+      V3App._alertLastAtByPath.set(statePath, { lastAt: Date.now() - 1000, persisted: false })
+      const origSend = pusherMod.send
+      let called = 0
+      pusherMod.send = () => { called++; return Promise.resolve() }
+      assertEqual(V3App._sendAlert('err'), undefined, '限频内应直接返回')
+      assertEqual(called, 0, '限频内不得调用推送')
+      // 3) lastAt NaN → 视为 0 → 应发送（v3.251 校验）
+      V3App._alertLastAtByPath.set(statePath, { lastAt: NaN, persisted: false })
+      const p2 = V3App._sendAlert('boom')
+      assertEqual(typeof (p2 && p2.then), 'function', '应返回 promise 走发送')
+      await p2
+      assertEqual(called >= 1, true, 'lastAt=NaN 应绕过限频发送')
+      pusherMod.send = origSend
+    } finally {
+      Config.alert = JSON.parse(saved.alert)
+      V3App._alertLastAtByPath = saved.map
+      try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('P4 _updateReport 关闭时不落盘不发（防跨天误发）', () => {
+    const saved = { report: JSON.stringify(Config.report) }
+    const statePath = path.join(MessageStore.cacheDir, 'report.state')
+    const fsmod = require('node:fs')
+    try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+    try {
+      Config.report = { enabled: false }
+      assertEqual(V3App._updateReport({ total: 1, pushed: 1 }), undefined, '关闭时应直接返回')
+      assertEqual(fsmod.existsSync(statePath), false, '关闭时不得写 report.state')
+    } finally {
+      Config.report = JSON.parse(saved.report)
+      try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  // ============================================================
+  // 补测 4：num 数值配置解析 + _upsert 统一更新/追加
+  // 目标：num（导出零直接测试）、_upsert 防御分支/判重/墓碑拦截（v3.245 P1）
+  // ============================================================
+  console.log('\n📂 补测 4：num 数值配置解析 / _upsert 统一更新')
+
+  await test('P4 num 数值配置解析：脏类型回退默认、有效数字/数字串保留', () => {
+    assertEqual(num(undefined), undefined, 'undefined 应回退默认')
+    assertEqual(num(null), undefined, 'null 应回退默认')
+    assertEqual(num(true), undefined, '布尔应回退默认')
+    assertEqual(num(''), undefined, '空白串应回退默认')
+    assertEqual(num(' '), undefined, '纯空白串应回退默认')
+    assertEqual(num('abc'), undefined, '非数字串应回退默认')
+    assertEqual(num(NaN), undefined, 'NaN 应回退默认')
+    assertEqual(num([]), undefined, '数组应回退默认（防 Number([])→0 绕过）')
+    assertEqual(num([5]), undefined, '单元素数组应回退默认')
+    assertEqual(num({ valueOf: () => 5 }), undefined, '带 valueOf 对象应回退默认')
+    assertEqual(num('5000'), 5000, '数字串应解析')
+    assertEqual(num(5000), 5000, '数字应保留')
+    assertEqual(num(1.5), 1.5, '小数应保留')
+    assertEqual(num(-1), -1, '负数应保留')
+    assertEqual(num('0'), 0, '字符串 0 保留特殊语义')
+    assertEqual(num(undefined, 42), 42, '应回退显式默认值')
+    assertEqual(num('abc', 7), 7, '脏串应回退显式默认值')
+  })
+
+  await test('P4 _upsert 防御分支：非数组/无效消息/无效身份不写', () => {
+    const arr = []
+    assertEqual(MessageStore._upsert(null, { id: 1 }, 'f.json'), false, '非数组应 false')
+    assertEqual(MessageStore._upsert(arr, {}, 'f.json'), false, '空对象应 false')
+    assertEqual(MessageStore._upsert(arr, [1, 2], 'f.json'), false, '数组消息应 false')
+    assertEqual(arr.length, 0, '防御分支不得写入')
+  })
+
+  await test('P4 _upsert 追加/同内容不更新/内容变更更新（timestamp 排除）', () => {
+    const arr = []
+    assertEqual(MessageStore._upsert(arr, { id: 1, title: 'a' }, 'f.json'), true, '新消息应追加')
+    assertEqual(arr.length, 1, '追加后长度 1')
+    const before = JSON.stringify(arr)
+    assertEqual(MessageStore._upsert(arr, { id: 1, title: 'a' }, 'f.json'), false, '同内容应 false（不刷新 timestamp 不落盘）')
+    assertEqual(JSON.stringify(arr), before, '同内容不得改动数组')
+    assertEqual(MessageStore._upsert(arr, { id: 1, title: 'b' }, 'f.json'), true, '同 id 不同内容应更新')
+    assertEqual(arr.length, 1, '更新不得追加')
+    assertEqual(arr[0].title, 'b', '内容应更新')
+  })
+
+  await test('P4 _upsert url 判重：同 url 不同标题仍判重更新', () => {
+    const arr = []
+    assertEqual(MessageStore._upsert(arr, { url: 'https://a.com/x' }, 'f2.json'), true, '首条 url 应追加')
+    assertEqual(MessageStore._upsert(arr, { url: 'https://a.com/x', title: 'z' }, 'f2.json'), true, '同 url 应判重并更新')
+    assertEqual(arr.length, 1, '同 url 不得追加')
+    assertEqual(arr[0].title, 'z', '应更新为新标题')
+  })
+
+  await test('P4 _upsert 撞墓碑：曾被裁剪的身份拒绝重入（防重推）', () => {
+    const fsmod = require('node:fs')
+    const fp = getFilePath('test_upsert_tomb.json')
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    try {
+      MessageStore._tombstoneLoaded.delete(fp)
+      MessageStore._saveTombstones(fp, { id: new Map([['777', true]]), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() })
+      MessageStore._tombstoneLoaded.delete(fp)
+      const arr = [{ id: 1 }]
+      assertEqual(MessageStore._upsert(arr, { id: 777, title: 'x' }, 'test_upsert_tomb.json'), false, '撞墓碑应拒绝写入')
+      assertEqual(arr.length, 1, '撞墓碑不得追加')
+    } finally {
+      MessageStore._tombstoneLoaded.delete(fp)
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
     }
   })
 
