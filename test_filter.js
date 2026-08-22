@@ -8730,9 +8730,10 @@ console.log('========================================\n');
   })
 
   await test('P4 _now 时钟回拨：在上一次值上严格 +1 不回退（v3.253）', () => {
-    MessageStore._nowLastTs = Date.now() + 60000 // 模拟时钟回拨：上次时间在未来
+    const base = Date.now() + 60000 // 模拟时钟回拨：上次时间在未来
+    MessageStore._nowLastTs = base
     const a = Date.parse(MessageStore._now())
-    assert.ok(a >= Date.now() + 60000, `回拨后不得回退到当前时间: ${a}`)
+    assert.ok(a > base, `回拨后不得回退到当前时间: ${a}`)
     const b = Date.parse(MessageStore._now())
     assert.ok(b > a, '回拨后连续调用仍严格递增')
   })
@@ -9007,13 +9008,20 @@ console.log('========================================\n');
   })
 
   await test('P4 _writeTextAtomic 异常目标不冒泡（v3.245 P1 防御）', () => {
+    const fsmod = require('node:fs')
+    const dir = path.join(CACHE, 'test_state_dir_atomic')
+    fsmod.mkdirSync(dir, { recursive: true })
     let threw = false
+    let ret
     try {
-      V3App._writeTextAtomic(path.join(CACHE, 'test_state_dir_atomic'), 'x')
+      ret = V3App._writeTextAtomic(dir, 'x')
     } catch (e) {
       threw = true
+    } finally {
+      try { fsmod.rmSync(dir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
     }
     assertEqual(threw, false, '写目录路径不得抛出')
+    assertEqual(ret, false, '写目录路径应返回 false')
   })
 
   await test('P4 _readSafeState 缺失/损坏/超限/合法四态', () => {
@@ -9069,6 +9077,7 @@ console.log('========================================\n');
     const statePath = path.join(MessageStore.cacheDir, 'alert.state')
     const fsmod = require('node:fs')
     const pusherMod = require('./xbk_function_v3.js').Pusher
+    const origSend = pusherMod.send
     try {
       // 1) alert 关闭 → 直接 return
       Config.alert = { enabled: false }
@@ -9076,7 +9085,6 @@ console.log('========================================\n');
       // 2) 限频内 → 不发送
       Config.alert = { enabled: true, intervalMs: 3600000 }
       V3App._alertLastAtByPath.set(statePath, { lastAt: Date.now() - 1000, persisted: false })
-      const origSend = pusherMod.send
       let called = 0
       pusherMod.send = () => { called++; return Promise.resolve() }
       assertEqual(V3App._sendAlert('err'), undefined, '限频内应直接返回')
@@ -9087,8 +9095,8 @@ console.log('========================================\n');
       assertEqual(typeof (p2 && p2.then), 'function', '应返回 promise 走发送')
       await p2
       assertEqual(called >= 1, true, 'lastAt=NaN 应绕过限频发送')
-      pusherMod.send = origSend
     } finally {
+      pusherMod.send = origSend
       Config.alert = JSON.parse(saved.alert)
       V3App._alertLastAtByPath = saved.map
       try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
@@ -9137,6 +9145,12 @@ console.log('========================================\n');
   })
 
   await test('P4 _upsert 防御分支：非数组/无效消息/无效身份不写', () => {
+    const fsmod = require('node:fs')
+    // 清理可能残留的墓碑（f.json/f2.json 非 test_ 前缀，启动清理不会覆盖）
+    for (const fn of ['f.json', 'f2.json']) {
+      const fp = getFilePath(fn)
+      try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    }
     const arr = []
     assertEqual(MessageStore._upsert(null, { id: 1 }, 'f.json'), false, '非数组应 false')
     assertEqual(MessageStore._upsert(arr, {}, 'f.json'), false, '空对象应 false')
