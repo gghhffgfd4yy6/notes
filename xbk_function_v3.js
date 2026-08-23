@@ -2579,10 +2579,10 @@ const MessageStore = {
     if (this._tombstoneLocksCleaned.has(dir)) return
     const guard = this._acquireTombstoneCleanupGuard(dir)
     if (guard === null) return
-    this._tombstoneLocksCleaned.add(dir)
     let names
     try {
       names = fs.readdirSync(dir)
+      this._tombstoneLocksCleaned.add(dir)
       for (const name of names) {
         if (!name.endsWith('.seen.lock')) continue
         const lockPath = path.join(dir, name)
@@ -2613,7 +2613,16 @@ const MessageStore = {
     } catch (e) {
       if (e.code !== 'EEXIST') return null
       if (this._isTombstoneLockProcessAlive(guardPath)) return null
-      try { fs.unlinkSync(guardPath) } catch (unlinkError) { return null }
+      // 原子认领旧哨兵；不要在 liveness 检查后按原路径 unlink，避免误删后来创建的新哨兵。
+      const reclaimPath = `${guardPath}.${process.pid}.${Date.now()}.reclaim`
+      try { fs.renameSync(guardPath, reclaimPath) } catch (renameError) { return null }
+      try {
+        if (this._isTombstoneLockProcessAlive(reclaimPath)) return null
+        fs.unlinkSync(reclaimPath)
+      } catch (reclaimError) {
+        try { fs.unlinkSync(reclaimPath) } catch (ignored) {}
+        return null
+      }
       try {
         fs.writeFileSync(guardPath, token, { flag: 'wx' })
         return token
@@ -4290,8 +4299,8 @@ const App = {
             try {
               kwRe = compileUserRegex(kw, 'i')
             } catch (e) {
-              console.warn('⚠️ 配置「zkt_gjc」包含无效的正则表达式，已忽略只看它过滤')
             }
+            if (!kwRe) console.warn('⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式，已忽略只看它过滤')
           }
           if (kwRe) {
             // 只看它过滤：统一走 FilterEngine.whitelistFilter（P2 审查 2026-08-15：消除两套漂移实现——
