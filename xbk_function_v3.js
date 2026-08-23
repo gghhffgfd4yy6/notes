@@ -3824,6 +3824,8 @@ const App = {
       // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗，与主推送不一致）
       // v3.164：返回 promise 供 App.run catch await——曾 fire-and-forget，接口异常时主入口同步 process.exit(1)
       // 杀死未完成的告警 HTTP（cron 直接运行收不到告警，#10）
+      // R1（v3.269）：告警通道挂掉时本地留痕——run.log 写入告警摘要+时间戳+版本，退出/连败时不再无痕
+      this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${String(errMsg).replace(/[\r\n]+/g, ' ').slice(0, 200)}\n`)
       return Pusher.send(alertText, alertDesp)
         .then(() => {
           const sentAt = Date.now()
