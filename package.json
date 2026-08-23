@@ -53,6 +53,6 @@
     "re2@1.23.3": true
   },
   "optionalDependencies": {
-    "re2": "^1.23.3"
+    "re2": "^1.26.1"
   }
 }
