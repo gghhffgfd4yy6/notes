@@ -1421,13 +1421,29 @@ console.log('========================================\n');
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
     const fsmod = require('node:fs')
-    // 模拟上次异常退出留下的残留锁：启动阶段统一清理，不在运行中抢占。
+    // 模拟上次异常退出留下的陈旧旧格式锁：启动阶段清理，不在运行中抢占。
     fsmod.writeFileSync(fp + '.seen.lock', '', { flag: 'wx' })
+    const past = new Date(Date.now() - 20000)
+    fsmod.utimesSync(fp + '.seen.lock', past, past)
     MessageStore._tombstoneLocksCleaned.delete(path.dirname(fp))
     MessageStore._cleanupResidualTombstoneLocks(path.dirname(fp))
     MessageStore._tombstoneDropped(fp, [{ id: 1 }])
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), true, '启动清理残留锁后应正常写入墓碑')
     assertEqual(fsmod.existsSync(fp + '.seen.lock'), false, '启动清理后锁文件应被删除')
+  })
+
+  await test('P4 启动清理：当前进程持有的陈旧锁不得删除（重叠启动保护）', () => {
+    const name = 'test_tomb_lock_live.json'
+    const fp = getFilePath(name)
+    const fsmod = require('node:fs')
+    const lockPath = fp + '.seen.lock'
+    fsmod.writeFileSync(lockPath, `${process.pid}:live-test`, { flag: 'wx' })
+    const past = new Date(Date.now() - 20000)
+    fsmod.utimesSync(lockPath, past, past)
+    MessageStore._tombstoneLocksCleaned.delete(path.dirname(fp))
+    MessageStore._cleanupResidualTombstoneLocks(path.dirname(fp))
+    assertEqual(fsmod.existsSync(lockPath), true, '活跃进程锁即使陈旧也不得被启动清理删除')
+    fsmod.unlinkSync(lockPath)
   })
 
   await test('P4 墓碑锁被抢占（token 被换）：放弃写盘不覆盖他人身份，释放不删他人锁（CodeAnt Round5 Major）', () => {

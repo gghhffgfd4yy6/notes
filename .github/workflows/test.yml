@@ -32,6 +32,10 @@ jobs:
       - name: 安装依赖（忽略脚本，防供应链风险）
         run: npm ci --ignore-scripts
 
+      # re2 是可选原生依赖；忽略安装脚本后必须显式构建，否则用户正则会全部被安全闸门跳过。
+      - name: 构建 re2 原生模块
+        run: npm rebuild re2
+
       - name: Lint（standard）
         run: npm run lint
 

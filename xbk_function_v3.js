@@ -2574,7 +2574,7 @@ const MessageStore = {
 
   _tombstoneLocksCleaned: new Set(),
 
-  /** 单实例启动清理上次异常退出残留的墓碑锁；不等待、不重试，不阻塞业务。 */
+  /** 启动清理可确认属于已退出进程的陈旧墓碑锁；活跃锁和新锁一律保留。 */
   _cleanupResidualTombstoneLocks (dir) {
     if (this._tombstoneLocksCleaned.has(dir)) return
     this._tombstoneLocksCleaned.add(dir)
@@ -2582,12 +2582,30 @@ const MessageStore = {
     try { names = fs.readdirSync(dir) } catch (e) { return }
     for (const name of names) {
       if (!name.endsWith('.seen.lock')) continue
+      const lockPath = path.join(dir, name)
       try {
-        fs.unlinkSync(path.join(dir, name))
+        const st = fs.statSync(lockPath)
+        if (Date.now() - st.mtimeMs <= TOMBSTONE_LOCK_STALE_MS) continue
+        if (this._isTombstoneLockProcessAlive(lockPath)) continue
+        fs.unlinkSync(lockPath)
         console.warn(`清理启动残留墓碑锁：${name}`)
       } catch (e) {
         console.warn(`启动清理墓碑锁失败，跳过：${name}`)
       }
+    }
+  },
+
+  /** 锁 token 首段为创建者 PID；无法解析的旧格式锁只由陈旧时间阈值保护。 */
+  _isTombstoneLockProcessAlive (lockPath) {
+    let token
+    try { token = fs.readFileSync(lockPath, 'utf8') } catch (e) { return true }
+    const pid = Number(String(token).split(':', 1)[0])
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (e) {
+      return e && e.code === 'EPERM'
     }
   },
 
@@ -2955,9 +2973,8 @@ const MessageStore = {
     }
   },
 
-  /** 跨进程墓碑锁：以 .seen.lock 独占创建实现互斥，重叠 cron/多 worker 并发写墓碑时
-   *  串行化「读-改-写」，避免原子替换互相覆盖丢身份（CodeAnt Major 竞态）。
-   *  锁残留超 TOMBSTONE_LOCK_STALE_MS 视为崩溃可抢占；等待超时返回 false（调用方放弃本次写入）。 */
+  /** 墓碑锁：以 .seen.lock 独占创建实现互斥，串行化「读-改-写」。
+   *  启动阶段只清理已退出进程的陈旧锁；运行中遇到 EEXIST 立即放弃本次墓碑写入。 */
   _withTombstoneLock (filePath, fn) {
     const lockPath = filePath + '.seen.lock'
     const token = this._acquireTombstoneLock(lockPath)
@@ -2969,10 +2986,7 @@ const MessageStore = {
     }
   },
 
-  /** 独占创建锁文件（wx），内容写入 owner token（PID:时间戳:随机串）——
-   *  CodeAnt Round5：仅凭 mtime 判 stale 会把仍在写盘的活跃锁误判为崩溃残留并抢占，
-   *  抢占者随后可能覆盖原进程已合并的身份；token 使释放与写盘前校验都能识别锁归属。
-   *  锁残留超 STALE 仍按 mtime 抢占（对空/旧格式锁文件同样兼容）；等待超时返回 null（调用方放弃）。 */
+  /** 独占创建锁文件（wx），内容写入 owner token（PID:随机串）；EEXIST 立即返回 null。 */
   _acquireTombstoneLock (lockPath) {
     const token = this._newTombstoneLockToken()
     try {
@@ -2994,8 +3008,7 @@ const MessageStore = {
     return process.pid + ':' + crypto.randomUUID()
   },
 
-  /** 释放墓碑锁：仅当锁内容仍是自己写入的 token 时才删除——被抢占/替换后不删他人锁。
-   *  ENOENT（已被抢占者删除）视为正常；其余错误忽略，崩溃残留由 STALE 抢占兜底。 */
+  /** 释放墓碑锁：仅当锁内容仍是自己写入的 token 时才删除；ENOENT 视为正常。 */
   _releaseTombstoneLock (lockPath, token) {
     try {
       if (fs.readFileSync(lockPath, 'utf8') === token) fs.unlinkSync(lockPath)
@@ -3004,7 +3017,7 @@ const MessageStore = {
     }
   },
 
-  /** 写盘前校验锁仍归当前进程持有：被误判 stale 抢占/替换后返回 false，调用方静默放弃本次写入 */
+  /** 写盘前校验锁仍归当前进程持有；锁被替换或删除时放弃本次写入。 */
   _isTombstoneLockOwner (lockPath, token) {
     try {
       return fs.readFileSync(lockPath, 'utf8') === token
@@ -3013,24 +3026,12 @@ const MessageStore = {
     }
   },
 
-  /** 锁文件超过 STALE 阈值视为崩溃残留：尝试删除并返回 true；stat 失败（刚被删）返回 false 继续重试 */
-  _isStaleTombstoneLock (lockPath) {
-    try {
-      const st = fs.statSync(lockPath)
-      if (Date.now() - st.mtimeMs <= TOMBSTONE_LOCK_STALE_MS) return false
-    } catch {
-      return false // stat 失败（锁刚被删）：视为未过期，继续重试
-    }
-    try { fs.unlinkSync(lockPath) } catch { return true }
-    return true
-  },
-
   /** 记录被裁剪消息的身份到墓碑；过滤未推（_f）记录不记录——它们从未推送，
    *  规则变更失效后须能重新评估/推送。与 _buildIdentityIndex 四集合同构：
    *  id 记录记 idKey（+url 入 idWithUrl）、url 记录记 urlOnly、anon 记 anonKey。
    *  写前强制重读磁盘合并其他进程已写入的身份（配合跨进程锁，消除覆盖竞态）。 */
   _tombstoneDropped (filePath, dropped) {
-    // 拿锁成功：串行读-改-写；拿锁失败（IO 错误/等待超时）：放弃本次墓碑写入——
+    // 拿锁成功：串行读-改-写；拿锁失败（IO 错误/锁忙）：放弃本次墓碑写入——
     // 无锁读-改-写仍可能覆盖并发进程已写入的身份（CodeAnt Round3 Major），
     // 放弃的代价仅是本次裁剪身份在重放时可能重复推送（与墓碑机制引入前行为一致）。
     this._withTombstoneLock(filePath, (lockPath, token) => this._recordTombstoneDrops(filePath, dropped, lockPath, token))
@@ -3754,8 +3755,6 @@ const App = {
       // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗，与主推送不一致）
       // v3.164：返回 promise 供 App.run catch await——曾 fire-and-forget，接口异常时主入口同步 process.exit(1)
       // 杀死未完成的告警 HTTP（cron 直接运行收不到告警，#10）
-      // R1（v3.269）：告警通道挂掉时本地留痕——run.log 写入告警摘要+时间戳+版本，退出/连败时不再无痕
-      this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${String(errMsg).replace(/[\r\n]+/g, ' ').slice(0, 200)}\n`)
       return Pusher.send(alertText, alertDesp)
         .then(() => {
           const sentAt = Date.now()
@@ -3768,7 +3767,12 @@ const App = {
             console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）')
           }
         })
-        .catch(() => { /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */ })
+        .catch((sendError) => {
+          // R1（v3.269）：仅在告警通道失败时本地留痕，避免成功告警被误记为失败。
+          const reason = String(sendError || errMsg).replace(/[\r\n]+/g, ' ').slice(0, 200)
+          this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${reason}\n`)
+          /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */
+        })
     } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
   },
 
