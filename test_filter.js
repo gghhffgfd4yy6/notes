@@ -1446,6 +1446,26 @@ console.log('========================================\n');
     fsmod.unlinkSync(lockPath)
   })
 
+  await test('P4 启动清理：同 PID 但不同进程启动时钟的锁可回收（防 PID 复用）', () => {
+    const name = 'test_tomb_lock_pid_reuse.json'
+    const fp = getFilePath(name)
+    const fsmod = require('node:fs')
+    const lockPath = fp + '.seen.lock'
+    const origStart = MessageStore._getTombstoneProcessStart
+    fsmod.writeFileSync(lockPath, `${process.pid}:0:stale-incarnation`, { flag: 'wx' })
+    const past = new Date(Date.now() - 20000)
+    fsmod.utimesSync(lockPath, past, past)
+    MessageStore._getTombstoneProcessStart = () => '1'
+    MessageStore._tombstoneLocksCleaned.delete(path.dirname(fp))
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(path.dirname(fp))
+      assertEqual(fsmod.existsSync(lockPath), false, '同 PID 但启动时钟不同的陈旧锁应被回收')
+    } finally {
+      MessageStore._getTombstoneProcessStart = origStart
+      try { fsmod.unlinkSync(lockPath) } catch (e) {}
+    }
+  })
+
   await test('P4 墓碑锁被抢占（token 被换）：放弃写盘不覆盖他人身份，释放不删他人锁（CodeAnt Round5 Major）', () => {
     const name = 'test_tomb_lock_stolen.json'
     const fp = getFilePath(name)

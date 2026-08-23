@@ -2637,17 +2637,36 @@ const MessageStore = {
     this._releaseTombstoneLock(guardPath, token)
   },
 
-  /** 锁 token 首段为创建者 PID；无法解析的旧格式锁只由陈旧时间阈值保护。 */
+  /**
+   * 锁 token 含 PID 与 Linux 进程启动时钟；PID 复用但启动时钟不同即视为旧锁。
+   * 无法读取身份时保守保留锁，旧格式 token 仍按 PID 兼容判断。
+   */
   _isTombstoneLockProcessAlive (lockPath) {
     let token
     try { token = fs.readFileSync(lockPath, 'utf8') } catch (e) { return true }
-    const pid = Number(String(token).split(':', 1)[0])
+    const parts = String(token).split(':')
+    const pid = Number(parts[0])
     if (!Number.isSafeInteger(pid) || pid <= 0) return false
     try {
       process.kill(pid, 0)
-      return true
+      const expectedStart = parts[1]
+      if (!expectedStart || !/^[0-9]+$/.test(expectedStart)) return true
+      const actualStart = this._getTombstoneProcessStart(pid)
+      return actualStart === null || actualStart === expectedStart
     } catch (e) {
       return e && e.code === 'EPERM'
+    }
+  },
+
+  _getTombstoneProcessStart (pid) {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const close = stat.lastIndexOf(')')
+      if (close < 0) return null
+      const fields = stat.slice(close + 1).trim().split(/\s+/)
+      return /^[0-9]+$/.test(fields[19] || '') ? fields[19] : null
+    } catch (e) {
+      return null
     }
   },
 
@@ -3051,10 +3070,11 @@ const MessageStore = {
     }
   },
 
-  /** 生成锁 owner token：PID 便于排查归属，crypto 随机 UUID 防止同 PID 复用时误判本人
-   *  （worker 轮换/重启）；不用 Math.random（SonarCloud S2245 伪随机安全告警） */
+  /** 生成锁 owner token：PID + 进程启动时钟识别进程 incarnation，UUID 便于排查归属。
+   * 不用 Math.random（SonarCloud S2245 伪随机安全告警）。 */
   _newTombstoneLockToken () {
-    return process.pid + ':' + crypto.randomUUID()
+    const start = this._getTombstoneProcessStart(process.pid)
+    return process.pid + ':' + (start || 'unknown') + ':' + crypto.randomUUID()
   },
 
   /** 释放墓碑锁：仅当锁内容仍是自己写入的 token 时才删除；ENOENT 视为正常。 */
