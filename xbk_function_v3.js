@@ -19,6 +19,7 @@ const PROFILE3_BOOT_MARKS = []
 // ReDoS 防护：优先用 Google RE2（线性时间无回溯）；不支持反向引用等特性时回落原生 RegExp。
 let RE2C = null
 try { RE2C = require('re2') } catch (e) { RE2C = null }
+let re2MissingWarned = false
 const _reCache = new Map()
 const safeRe = (src, flags) => {
   const k = src + '\u0000' + flags
@@ -29,6 +30,25 @@ const safeRe = (src, flags) => {
   _reCache.set(k, r)
   return r
 }
+
+// 用户配置正则不允许在缺少 RE2 时回退到 V8 原生 RegExp：复杂模式可能阻塞单线程事件循环。
+// 内部固定正则仍由 safeRe() 处理；这里仅作为用户配置正则的编译闸门。
+function compileUserRegex (source, flags = 'i') {
+  if (typeof source !== 'string' || !RE2C) return null
+  try { return new RE2C(source, flags) } catch (e) { return null }
+}
+
+function isRe2Available () {
+  return Boolean(RE2C)
+}
+
+function markRe2MissingWarned () {
+  if (RE2C || re2MissingWarned) return false
+  re2MissingWarned = true
+  return true
+}
+
+const RE2_MISSING_WARNING = '⚠️ 当前环境未安装可用的 re2，用户过滤正则将被跳过，以避免 V8 原生 RegExp 阻塞事件循环。建议执行：npm install re2'
 
 function profile3NowMs () {
   return Number(process.hrtime.bigint() - PROFILE3_BOOT_START) / 1e6
@@ -211,9 +231,7 @@ const MESSAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 // 上限按每类键数约束，防止墓碑文件随裁剪无限膨胀。
 const TOMBSTONE_MAX_KEYS = 5000 // 每类墓碑键上限（id/urlOnly/idWithUrl/anon 各 5000）
 const TOMBSTONE_MAX_BYTES = 8 * 1024 * 1024 // 墓碑文件读取/写入体积上限
-const TOMBSTONE_LOCK_TIMEOUT_MS = 2000 // 墓碑跨进程锁等待上限（重叠 cron/多 worker 串行化读-改-写）
 const TOMBSTONE_LOCK_STALE_MS = 10000 // 锁文件超过该年龄视为崩溃残留，可抢占
-const TOMBSTONE_LOCK_RETRY_MS = 25 // 拿锁失败重试间隔
 
 // ---------- HTML 实体映射（避免每次调用重建） ----------
 const ENTITY_MAP = {
@@ -1670,7 +1688,7 @@ const RuleEngine = {
     // /undefined/i 字面量正则，会静默匹配含 "undefined" 文本的字段，行为与预期不符。
     if (cat === null || cat === undefined) return null
     if (this.hasNestedQuantifier(cat)) return null // ReDoS 防护：嵌套量词直接跳过
-    try { return new RegExp(String(cat), 'i') } catch (e) { return null }
+    return compileUserRegex(String(cat), 'i')
   },
 
   /**
@@ -1771,7 +1789,7 @@ const RuleEngine = {
       warnings.push(`⚠️ 配置「${field}」分类正则含嵌套量词，可能导致灾难性回溯，该行将被忽略：「${cat}」`)
       return
     }
-    try { new RegExp(cat, 'i') } catch (e) {
+    if (isRe2Available() && !compileUserRegex(String(cat), 'i')) {
       warnings.push(`⚠️ 配置「${field}」分类正则无效：「${cat}」`)
     }
   },
@@ -1842,10 +1860,12 @@ const RuleEngine = {
             }
             let valRe = null
             if (this.hasNestedQuantifier(val)) continue // ReDoS 防护：嵌套量词跳过
-            try { valRe = new RegExp(val, 'i') } catch (e) {
+            valRe = compileUserRegex(val, 'i')
+            if (!valRe && isRe2Available()) {
               console.warn(`⚠️ 规则「${String(field)}」包含非法正则「${String(val)}」，已跳过（v3.239 口径统一：validateConfig 与 compileRules 均告警）`)
               continue
             }
+            if (!valRe) continue
             rules.push({ cat: catRe, val: valRe }) // valRe 恒真（失败已 continue）
           }
         }
@@ -1856,10 +1876,15 @@ const RuleEngine = {
         val = val.trim()
         if (!val) { compiled[field] = null; continue }
         if (this.hasNestedQuantifier(val)) { compiled[field] = null; continue } // ReDoS 防护
-        try {
-          compiled[field] = { _type: 're', re: new RegExp(val, 'i') }
-        } catch (e) {
-          console.warn(`⚠️ 规则「${String(field)}」包含非法正则「${String(val)}」，已跳过（v3.239 口径统一：validateConfig 与 compileRules 均告警）`)
+        const re = compileUserRegex(val, 'i')
+        if (re) {
+          compiled[field] = { _type: 're', re }
+        } else {
+          if (!isRe2Available()) {
+            compiled[field] = null
+            continue
+          }
+          console.warn(`⚠️ 规则「${String(field)}」无法使用安全正则引擎，已跳过`)
           compiled[field] = null // 非法正则置 null 跳过（validateConfig 已警告）
         }
       }
@@ -2043,8 +2068,8 @@ const RuleEngine = {
             warnings.push(`⚠️ 配置「${field}」值正则含嵌套量词，可能导致灾难性回溯，该行将被忽略：「${val}」`)
             continue
           }
-          try { new RegExp(val, 'i') } catch (e) {
-            warnings.push(`⚠️ 配置「${field}」值正则无效：「${val}」`)
+          if (isRe2Available() && !compileUserRegex(val, 'i')) {
+            warnings.push(`⚠️ 配置「${field}」值正则无效或当前环境不支持：「${val}」`)
           }
         }
       } else {
@@ -2058,7 +2083,9 @@ const RuleEngine = {
           continue
         }
         // 与 compileRules 的 'i' 保持一致
-        try { new RegExp(trimmedVal, 'i') } catch (e) { warnings.push(`⚠️ 配置「${field}」包含无效的正则表达式：「${trimmedVal}」\n   原因：${e.message}`) }
+        if (isRe2Available() && !compileUserRegex(trimmedVal, 'i')) {
+          warnings.push(`⚠️ 配置「${field}」包含无效或当前环境不支持的正则表达式：「${trimmedVal}」`)
+        }
       }
     }
 
@@ -2079,7 +2106,9 @@ const RuleEngine = {
       if (this.hasNestedQuantifier(cfg.zkt_gjc)) {
         warnings.push('⚠️ 配置「zkt_gjc」的正则含嵌套量词，可能导致灾难性回溯，已忽略只看它过滤')
       } else {
-        try { new RegExp(cfg.zkt_gjc, 'i') } catch (e) { warnings.push(`⚠️ 配置「zkt_gjc」包含无效的正则表达式：「${cfg.zkt_gjc}」`) }
+        if (isRe2Available() && !compileUserRegex(cfg.zkt_gjc, 'i')) {
+          warnings.push(`⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式：「${cfg.zkt_gjc}」`)
+        }
       }
     }
 
@@ -2318,7 +2347,7 @@ const FilterEngine = {
     let re = this._whitelistReCache.get(kwStr)
     if (re === undefined) {
       try {
-        re = new RegExp(kwStr, 'i')
+        re = compileUserRegex(kwStr, 'i')
       } catch (e) {
         re = null // 非法正则缓存 null，避免每次重建；语义与下方一致
       }
@@ -2328,7 +2357,7 @@ const FilterEngine = {
         this._whitelistReCache.delete(this._whitelistReCache.keys().next().value)
       }
     }
-    if (re === null) return true // 非法正则：放行（与 App.run 的 zkt_gjc 预编译失败 kwRe=null 不过滤口径一致；宁可多推不可少推）
+    if (re === null) return true // 缺少 RE2 或非法正则：放行（宁可多推不可少推）
     // ReDoS 纵深防御：与 matchesCompiled 同口径，超长输入先截断再 .test()——即使关键词含
     // 未被子嵌套量词检测覆盖的慢回溯形态（交替/前视/大字符类 × 超长输入），单次匹配最坏耗时也有界。
     // v3.249：超长 keyword 的 V8 会把正则编译推迟到首次 .test()，此时抛 "Regular expression too
@@ -2534,11 +2563,31 @@ const MessageStore = {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true })
       }
+      this._cleanupResidualTombstoneLocks(dir)
     } catch (e) {
       // v3.245 P1：目录创建失败必须暴露——此前只 console.error 吞错，后续所有缓存写
       // 操作（save/saveBatch）都会因目录缺失而连锁失败且原因不明。
       console.error(`缓存目录创建失败: ${this.cacheDir}`, (e && e.message) || e)
       throw e
+    }
+  },
+
+  _tombstoneLocksCleaned: new Set(),
+
+  /** 单实例启动清理上次异常退出残留的墓碑锁；不等待、不重试，不阻塞业务。 */
+  _cleanupResidualTombstoneLocks (dir) {
+    if (this._tombstoneLocksCleaned.has(dir)) return
+    this._tombstoneLocksCleaned.add(dir)
+    let names
+    try { names = fs.readdirSync(dir) } catch (e) { return }
+    for (const name of names) {
+      if (!name.endsWith('.seen.lock')) continue
+      try {
+        fs.unlinkSync(path.join(dir, name))
+        console.warn(`清理启动残留墓碑锁：${name}`)
+      } catch (e) {
+        console.warn(`启动清理墓碑锁失败，跳过：${name}`)
+      }
     }
   },
 
@@ -2911,8 +2960,7 @@ const MessageStore = {
    *  锁残留超 TOMBSTONE_LOCK_STALE_MS 视为崩溃可抢占；等待超时返回 false（调用方放弃本次写入）。 */
   _withTombstoneLock (filePath, fn) {
     const lockPath = filePath + '.seen.lock'
-    const deadline = Date.now() + TOMBSTONE_LOCK_TIMEOUT_MS
-    const token = this._acquireTombstoneLock(lockPath, deadline)
+    const token = this._acquireTombstoneLock(lockPath)
     if (token === null) return false
     try {
       return fn(lockPath, token)
@@ -2925,25 +2973,18 @@ const MessageStore = {
    *  CodeAnt Round5：仅凭 mtime 判 stale 会把仍在写盘的活跃锁误判为崩溃残留并抢占，
    *  抢占者随后可能覆盖原进程已合并的身份；token 使释放与写盘前校验都能识别锁归属。
    *  锁残留超 STALE 仍按 mtime 抢占（对空/旧格式锁文件同样兼容）；等待超时返回 null（调用方放弃）。 */
-  _acquireTombstoneLock (lockPath, deadline) {
+  _acquireTombstoneLock (lockPath) {
     const token = this._newTombstoneLockToken()
-    while (true) {
-      try {
-        fs.writeFileSync(lockPath, token, { flag: 'wx' })
-        return token
-      } catch (e) {
-        if (e.code !== 'EEXIST') {
-          console.error(`墓碑锁创建失败 ${lockPath}:`, e?.message)
-          return null
-        }
-        if (this._isStaleTombstoneLock(lockPath)) continue
-        if (Date.now() >= deadline) {
-          console.warn(`墓碑锁等待超时，放弃本次墓碑写入 ${lockPath}`)
-          return null
-        }
-        const end = Date.now() + TOMBSTONE_LOCK_RETRY_MS
-        while (Date.now() < end) { /* 忙等重试（同步路径，锁持有窗口为毫秒级） */ }
+    try {
+      fs.writeFileSync(lockPath, token, { flag: 'wx' })
+      return token
+    } catch (e) {
+      if (e.code !== 'EEXIST') {
+        console.error(`墓碑锁创建失败 ${lockPath}:`, e?.message)
       }
+      // 单实例模式不等待其他进程持锁：残留锁已在启动时清理，运行中遇锁直接放弃本次墓碑写入。
+      // 这样保留现有锁/原子写结构，同时绝不阻塞 Node.js 事件循环。
+      return null
     }
   },
 
@@ -3731,6 +3772,13 @@ const App = {
     } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
   },
 
+  async _warnMissingRe2 () {
+    if (!markRe2MissingWarned()) return
+    console.warn(RE2_MISSING_WARNING)
+    this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
+    try { await this._sendAlert(RE2_MISSING_WARNING) } catch (e) { /* 提醒失败不阻塞主流程 */ }
+  },
+
   // v3.258 提取：日报状态归一化（行为不变，供测试直接打纯函数）
   _blankReportState () {
     return { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
@@ -3958,6 +4006,7 @@ const App = {
     try {
       MessageStore.init()
       checkpoint('cache-init')
+      await this._warnMissingRe2()
       this._warnLowDisk()
       checkpoint('disk-check')
 
@@ -4195,7 +4244,7 @@ const App = {
             console.warn('⚠️ 配置「zkt_gjc」的正则含嵌套量词，可能导致灾难性回溯，已忽略只看它过滤')
           } else {
             try {
-              kwRe = new RegExp(kw, 'i')
+              kwRe = compileUserRegex(kw, 'i')
             } catch (e) {
               console.warn('⚠️ 配置「zkt_gjc」包含无效的正则表达式，已忽略只看它过滤')
             }

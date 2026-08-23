@@ -613,7 +613,7 @@ console.log('========================================\n');
   await test('非法正则 → 有警告', () => {
     const warns = validateConfig({ pingbibiaoti: '[未闭合' })
     assertEqual(warns.length, 1)
-    assertEqual(warns[0].includes('无效的正则'), true)
+    assertEqual(warns[0].includes('无效') || warns[0].includes('不支持'), true)
   })
 
   await test('非法天数 → 有警告', () => {
@@ -1400,7 +1400,7 @@ console.log('========================================\n');
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 2 }), true, 'B 进程身份应新增')
   })
 
-  await test('P4 墓碑锁忙（他人持有）：等待超时放弃写入，不无锁覆盖（CodeAnt Round3 Major）', () => {
+  await test('P4 墓碑锁忙（他人持有）：立即放弃写入，不阻塞且不无锁覆盖（单实例契约）', () => {
     const name = 'test_tomb_lock_busy.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
@@ -1409,25 +1409,25 @@ console.log('========================================\n');
     fsmod.writeFileSync(fp + '.seen.lock', '', { flag: 'wx' })
     const t0 = Date.now()
     MessageStore._tombstoneDropped(fp, [{ id: 1 }])
-    // 等待超时（TOMBSTONE_LOCK_TIMEOUT_MS=2000）后应放弃，不得写盘
-    assertEqual(Date.now() - t0 >= 1800, true, `应等到锁超时，实际 ${Date.now() - t0}ms`)
+    // 运行中遇到锁立即放弃，不等待、不忙等，避免阻塞事件循环。
+    assertEqual(Date.now() - t0 < 100, true, `锁忙时应立即返回，实际 ${Date.now() - t0}ms`)
     assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '锁忙时不得写墓碑文件')
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), false, '锁忙时墓碑不命中')
     fsmod.unlinkSync(fp + '.seen.lock')
   })
 
-  await test('P4 墓碑锁残留过期：按 STALE 抢占恢复写入（CodeAnt Round3 Major）', () => {
+  await test('P4 启动清理墓碑锁残留：清理后可正常写入（单实例契约）', () => {
     const name = 'test_tomb_lock_stale.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
     const fsmod = require('node:fs')
-    // 模拟崩溃残留锁：mtime 改到 20s 前 → 超过 STALE(10s) 可抢占
+    // 模拟上次异常退出留下的残留锁：启动阶段统一清理，不在运行中抢占。
     fsmod.writeFileSync(fp + '.seen.lock', '', { flag: 'wx' })
-    const past = new Date(Date.now() - 20000)
-    fsmod.utimesSync(fp + '.seen.lock', past, past)
+    MessageStore._tombstoneLocksCleaned.delete(path.dirname(fp))
+    MessageStore._cleanupResidualTombstoneLocks(path.dirname(fp))
     MessageStore._tombstoneDropped(fp, [{ id: 1 }])
-    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), true, '过期残留锁抢占后应正常写入墓碑')
-    assertEqual(fsmod.existsSync(fp + '.seen.lock'), false, '抢占后锁文件应被清理')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), true, '启动清理残留锁后应正常写入墓碑')
+    assertEqual(fsmod.existsSync(fp + '.seen.lock'), false, '启动清理后锁文件应被删除')
   })
 
   await test('P4 墓碑锁被抢占（token 被换）：放弃写盘不覆盖他人身份，释放不删他人锁（CodeAnt Round5 Major）', () => {
