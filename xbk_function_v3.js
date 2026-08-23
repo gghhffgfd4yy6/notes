@@ -3818,14 +3818,15 @@ const App = {
       const interval = intervalMs > 0 ? intervalMs : 0 // <=0(含-1) = 不限频（每次异常都发）
       if (interval > 0 && Date.now() - lastAt < interval) return // 限频：间隔内不重复轰炸
       const alertText = '⚠️ xbk-push 运行异常'
+      const safeReason = Utils.safeErrorText(errMsg, '未知错误')
       // v3.159：段落分隔 \n\n（与主推送/日报口径一致）——wxpusher Markdown 渲染单个 \n 可能挤成一行
-      const alertDesp = `接口/推送异常，请检查。\n\n时间：${new Date().toLocaleString('zh-CN')}\n\n原因：${String(errMsg).slice(0, 500)}`
+      const alertDesp = `接口/推送异常，请检查。\n\n时间：${new Date().toLocaleString('zh-CN')}\n\n原因：${safeReason.slice(0, 500)}`
       // v3.156：发送成功才写状态+打印——曾先写 lastAt（发送失败也限频，60s 内挡住重试，信息丢失）
       // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗，与主推送不一致）
       // v3.164：返回 promise 供 App.run catch await——曾 fire-and-forget，接口异常时主入口同步 process.exit(1)
       // 杀死未完成的告警 HTTP（cron 直接运行收不到告警，#10）
       // R1（v3.269）：告警通道挂掉时本地留痕——run.log 写入告警摘要+时间戳+版本，退出/连败时不再无痕
-      this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${String(errMsg).replace(/[\r\n]+/g, ' ').slice(0, 200)}\n`)
+      this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${safeReason.replace(/[\r\n]+/g, ' ').slice(0, 200)}\n`)
       return Pusher.send(alertText, alertDesp)
         .then(() => {
           const sentAt = Date.now()
@@ -3840,7 +3841,7 @@ const App = {
         })
         .catch((sendError) => {
           // R1（v3.269）：仅在告警通道失败时本地留痕，避免成功告警被误记为失败。
-          const reason = String(sendError || errMsg).replace(/[\r\n]+/g, ' ').slice(0, 200)
+          const reason = Utils.safeErrorText(sendError || errMsg, safeReason).replace(/[\r\n]+/g, ' ').slice(0, 200)
           this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${reason}\n`)
           /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */
         })
