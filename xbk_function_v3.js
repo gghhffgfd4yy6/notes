@@ -2577,22 +2577,55 @@ const MessageStore = {
   /** 启动清理可确认属于已退出进程的陈旧墓碑锁；活跃锁和新锁一律保留。 */
   _cleanupResidualTombstoneLocks (dir) {
     if (this._tombstoneLocksCleaned.has(dir)) return
+    const guard = this._acquireTombstoneCleanupGuard(dir)
+    if (guard === null) return
     this._tombstoneLocksCleaned.add(dir)
     let names
-    try { names = fs.readdirSync(dir) } catch (e) { return }
-    for (const name of names) {
-      if (!name.endsWith('.seen.lock')) continue
-      const lockPath = path.join(dir, name)
+    try {
+      names = fs.readdirSync(dir)
+      for (const name of names) {
+        if (!name.endsWith('.seen.lock')) continue
+        const lockPath = path.join(dir, name)
+        try {
+          const st = fs.statSync(lockPath)
+          if (Date.now() - st.mtimeMs <= TOMBSTONE_LOCK_STALE_MS) continue
+          if (this._isTombstoneLockProcessAlive(lockPath)) continue
+          fs.unlinkSync(lockPath)
+          console.warn(`清理启动残留墓碑锁：${name}`)
+        } catch (e) {
+          console.warn(`启动清理墓碑锁失败，跳过：${name}`)
+        }
+      }
+    } catch (e) {
+      return
+    } finally {
+      this._releaseTombstoneCleanupGuard(dir, guard)
+    }
+  },
+
+  /** 目录级非阻塞哨兵：串行化启动清理与墓碑锁创建，覆盖检查-删除竞态。 */
+  _acquireTombstoneCleanupGuard (dir) {
+    const guardPath = path.join(dir, '.seen.cleanup.lock')
+    const token = this._newTombstoneLockToken()
+    try {
+      fs.writeFileSync(guardPath, token, { flag: 'wx' })
+      return token
+    } catch (e) {
+      if (e.code !== 'EEXIST') return null
+      if (this._isTombstoneLockProcessAlive(guardPath)) return null
+      try { fs.unlinkSync(guardPath) } catch (unlinkError) { return null }
       try {
-        const st = fs.statSync(lockPath)
-        if (Date.now() - st.mtimeMs <= TOMBSTONE_LOCK_STALE_MS) continue
-        if (this._isTombstoneLockProcessAlive(lockPath)) continue
-        fs.unlinkSync(lockPath)
-        console.warn(`清理启动残留墓碑锁：${name}`)
-      } catch (e) {
-        console.warn(`启动清理墓碑锁失败，跳过：${name}`)
+        fs.writeFileSync(guardPath, token, { flag: 'wx' })
+        return token
+      } catch (retryError) {
+        return null
       }
     }
+  },
+
+  _releaseTombstoneCleanupGuard (dir, token) {
+    const guardPath = path.join(dir, '.seen.cleanup.lock')
+    this._releaseTombstoneLock(guardPath, token)
   },
 
   /** 锁 token 首段为创建者 PID；无法解析的旧格式锁只由陈旧时间阈值保护。 */
@@ -2976,13 +3009,20 @@ const MessageStore = {
   /** 墓碑锁：以 .seen.lock 独占创建实现互斥，串行化「读-改-写」。
    *  启动阶段只清理已退出进程的陈旧锁；运行中遇到 EEXIST 立即放弃本次墓碑写入。 */
   _withTombstoneLock (filePath, fn) {
+    const dir = path.dirname(filePath)
+    const guard = this._acquireTombstoneCleanupGuard(dir)
+    if (guard === null) return false
     const lockPath = filePath + '.seen.lock'
     const token = this._acquireTombstoneLock(lockPath)
-    if (token === null) return false
+    if (token === null) {
+      this._releaseTombstoneCleanupGuard(dir, guard)
+      return false
+    }
     try {
       return fn(lockPath, token)
     } finally {
       this._releaseTombstoneLock(lockPath, token)
+      this._releaseTombstoneCleanupGuard(dir, guard)
     }
   },
 
