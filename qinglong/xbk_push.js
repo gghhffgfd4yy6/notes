@@ -19,6 +19,7 @@ function ensureDependencies () {
     require(path.join(ROOT, 'node_modules', 'got'))
     return
   } catch (e) {
+    if (!e || e.code !== 'MODULE_NOT_FOUND') throw e
     if (!shouldAutoInstallDependencies()) {
       throw new Error('检测到 Node.js 依赖未完整安装；请在部署阶段执行 npm ci --omit=dev --ignore-scripts。如确需在本次运行时安装，请显式设置 XBK_AUTO_INSTALL_DEPS=1')
     }
