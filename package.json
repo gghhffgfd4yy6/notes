@@ -28,7 +28,7 @@
     "got": "11.8.6"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.22.2"
   },
   "keywords": [
     "\u63a8\u9001",
@@ -50,7 +50,7 @@
     "standard": "^17.1.2"
   },
   "allowScripts": {
-    "re2@1.23.3": true
+    "re2@1.26.1": true
   },
   "optionalDependencies": {
     "re2": "^1.26.1"
