@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20, 22, 24]   # 兼容测试（node 18 已于 2025-04 EOL，矩阵 20/22/24）
+        node-version: [22.22.2, 24]   # re2@1.26.1 要求 Node >=22.22.2
     steps:
       # 供应链安全：固定完整 commit SHA（可变 tag 可被上游重新指向，静默注入攻击代码）
       # 升级时由 Dependabot/手动替换为新 SHA
@@ -83,7 +83,7 @@ jobs:
         run: npm audit --audit-level=high --omit=dev
 
   # 稳定合并门禁：汇总 quality matrix 结果。
-  # 背景：quality 的 check 名带 matrix 版本后缀（quality (20) 等），若未来增删 Node 版本
+  # 背景：quality 的 check 名带 matrix 版本后缀（quality (22.22.2) 等），若未来增删 Node 版本
   # 或改 job 名，branch protection 绑定的 check 名会失配 → 永久阻塞合并。
   # 方案：加无后缀的汇总 job，Required Checks 只绑定 quality-gate。
   quality-gate:

@@ -30,7 +30,7 @@ Squash Merge → main
 
 ## 开发环境
 
-- Node.js：`>=20`（见 package.json engines；CI 矩阵 20/22/24）
+- Node.js：`>=22.22.2`（见 package.json engines；CI 矩阵 22.22.2/24）
 - 测试：`npm test`（并行调度器）
 
 ## 代码风格
