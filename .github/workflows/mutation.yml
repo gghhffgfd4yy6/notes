@@ -66,6 +66,12 @@ jobs:
       - name: 安装依赖
         run: npm ci --ignore-scripts
 
+      # re2 是可选原生依赖；忽略安装脚本后必须显式构建，否则用户正则会被安全闸门跳过。
+      - name: 构建 re2 原生模块
+        run: |
+          RE2_DOWNLOAD_FORCE_BUILD=1 npm rebuild re2
+          node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
+
       - name: 变异测试（${{ matrix.name }}）
         run: npx stryker run --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 2
         env:
