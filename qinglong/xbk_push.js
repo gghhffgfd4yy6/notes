@@ -9,13 +9,21 @@ const { classifyFailure, classifySummary, summarizeError } = require(path.join(_
 const ROOT = path.resolve(__dirname, '..')
 const MAIN = path.join(ROOT, 'xbk_function_v3.js')
 
+function shouldAutoInstallDependencies (env = process.env) {
+  return env && env.XBK_AUTO_INSTALL_DEPS === '1'
+}
+
 function ensureDependencies () {
   try {
     // 不只检查 require.resolve：got 的传递依赖缺失时，真正 require 才能发现。
     require(path.join(ROOT, 'node_modules', 'got'))
     return
   } catch (e) {
-    console.warn('检测到 Node.js 依赖未完整安装，正在安装 got 依赖...')
+    if (!e || e.code !== 'MODULE_NOT_FOUND') throw e
+    if (!shouldAutoInstallDependencies()) {
+      throw new Error('检测到 Node.js 依赖未完整安装；请在部署阶段执行 npm ci --omit=dev --ignore-scripts。如确需在本次运行时安装，请显式设置 XBK_AUTO_INSTALL_DEPS=1')
+    }
+    console.warn('检测到 Node.js 依赖未完整安装，已按 XBK_AUTO_INSTALL_DEPS=1 执行安装...')
   }
 
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
@@ -158,4 +166,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { classifyFailure, classifySummary, runResident, refreshConnections, intervalMs }
+module.exports = { classifyFailure, classifySummary, runResident, refreshConnections, intervalMs, shouldAutoInstallDependencies }
