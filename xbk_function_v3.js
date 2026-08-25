@@ -33,6 +33,11 @@ const safeRe = (src, flags) => {
 
 // 用户配置正则不允许在缺少 RE2 时回退到 V8 原生 RegExp：复杂模式可能阻塞单线程事件循环。
 // 内部固定正则仍由 safeRe() 处理；这里仅作为用户配置正则的编译闸门。
+// ⚠️ RE2 兼容性（取舍说明）：RE2 为线性时间、无回溯，因此不支持 V8 的部分语法——
+// 反向引用（/(a)\1/）、lookbehind（/(?<=x)/）、命名捕获组的部分写法等。
+// 装了 re2 后，原本在 V8 下可用的这类用户正则可能编译失败被跳过（有告警），
+// 表现为规则静默不生效；这是「防 ReDoS 卡死事件循环」的刻意取舍，
+// 如用户规则必须用这些特性，可保持不装 re2（代价是失去回溯防护）。
 function compileUserRegex (source, flags = 'i') {
   if (typeof source !== 'string' || !RE2C) return null
   try { return new RE2C(source, flags) } catch (e) { return null }
@@ -49,6 +54,11 @@ function markRe2MissingWarned () {
 }
 
 const RE2_MISSING_WARNING = '⚠️ 当前环境未安装可用的 re2，用户过滤正则将被跳过，以避免 V8 原生 RegExp 阻塞事件循环。建议执行：npm install re2'
+
+// 跨进程防重：re2 缺失提醒用状态文件记录最近一次提醒时间（cron 每次运行为新进程，
+// 仅靠进程内 flag 防不住每天多次提醒）；同一环境缺 re2 最多每天提醒一次。
+const RE2_WARN_INTERVAL_MS = 24 * 60 * 60 * 1000
+const RE2_WARN_STATE_FILE = 're2warn.state'
 
 function profile3NowMs () {
   return Number(process.hrtime.bigint() - PROFILE3_BOOT_START) / 1e6
@@ -2659,6 +2669,10 @@ const MessageStore = {
   },
 
   _getTombstoneProcessStart (pid) {
+    // 仅 Linux 提供 /proc/PID/stat 的进程启动时钟（starttime）。
+    // 非 Linux（macOS/Windows）无法读取 → 返回 null，调用方按
+    // “PID 存活即活跃”的保守口径处理：无法识别 PID 复用，宁可保留陈旧锁。
+    if (process.platform !== 'linux') return null
     try {
       const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
       const close = stat.lastIndexOf(')')
@@ -3825,7 +3839,8 @@ const App = {
       // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗，与主推送不一致）
       // v3.164：返回 promise 供 App.run catch await——曾 fire-and-forget，接口异常时主入口同步 process.exit(1)
       // 杀死未完成的告警 HTTP（cron 直接运行收不到告警，#10）
-      // R1（v3.269）：告警通道挂掉时本地留痕——run.log 写入告警摘要+时间戳+版本，退出/连败时不再无痕
+      // R1（v3.269）：告警本地留痕——发送前先写一行摘要到 run.log（无论成败），
+      // 这样告警通道挂掉/退出连败时仍有痕可查；发送失败时下方 catch 再补一行原因。
       this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${safeReason.replace(/[\r\n]+/g, ' ').slice(0, 200)}\n`)
       return Pusher.send(alertText, alertDesp)
         .then(() => {
@@ -3849,7 +3864,21 @@ const App = {
   },
 
   async _warnMissingRe2 () {
-    if (!markRe2MissingWarned()) return
+    if (RE2C || !markRe2MissingWarned()) return
+    // 跨进程防重：写状态文件记录最近一次提醒时间，cron/常驻多次运行最多每天提醒一次
+    // （进程内 flag 防不住 cron 每次新进程；状态文件与 alert.state 同模式）。
+    const statePath = path.join(MessageStore.cacheDir, RE2_WARN_STATE_FILE)
+    const stateResult = this._readSafeState(statePath)
+    if (stateResult.status === 'ok') {
+      try {
+        const lastWarn = JSON.parse(stateResult.text).lastWarnAt || 0
+        if (Number.isFinite(lastWarn) && Date.now() - lastWarn < RE2_WARN_INTERVAL_MS) return
+      } catch (e) { /* 损坏状态忽略，允许重新提醒 */ }
+    } else if (stateResult.status !== 'missing') {
+      // 无法确认真实状态：保守跳过本次提醒，避免状态损坏时重复轰炸
+      return
+    }
+    this._writeState(statePath, { lastWarnAt: Date.now() })
     console.warn(RE2_MISSING_WARNING)
     this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
     try { await this._sendAlert(RE2_MISSING_WARNING) } catch (e) { /* 提醒失败不阻塞主流程 */ }
