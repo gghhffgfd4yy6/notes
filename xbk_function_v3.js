@@ -3859,7 +3859,11 @@ const App = {
         .catch((sendError) => {
           // R1（v3.269）：仅在告警通道失败时本地留痕，避免成功告警被误记为失败。
           const reason = Utils.safeErrorText(sendError || errMsg, safeReason).replace(/[\r\n]+/g, ' ').slice(0, 200)
-          this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${reason}\n`)
+          // J1（v3.269 审查）：留痕写日志自身也可能抛错（磁盘/权限），必须包住——
+          // 否则 handler 自身 reject，_sendAlert 不会返回 false，调用方 await 会中断。
+          try {
+            this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${reason}\n`)
+          } catch (logError) { /* 留痕失败静默 */ }
           /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */
           return false // 发送失败（供 _warnMissingRe2 等调用方决定是否撤销标记/重试）
         })
@@ -3871,6 +3875,20 @@ const App = {
       try {
         this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ⚠️ xbk-push 运行异常 原因：${reason}\n`)
       } catch (logError) { /* 留痕失败静默 */ }
+      return false
+    }
+  },
+
+  // 当前日期标记原子写入（J2：临时文件 + rename，避免 writeFileSync 半写留下截断 JSON，
+  // 导致 _isRe2WarnMarkerStale 无法解析而永久压制当天提醒）。
+  _writeRe2WarnMarkerAtomic (statePath, text) {
+    const tmp = `${statePath}.${process.pid}.${Date.now()}.tmp`
+    try {
+      fs.writeFileSync(tmp, text, { flag: 'wx' })
+      fs.renameSync(tmp, statePath)
+      return true
+    } catch (e) {
+      try { fs.unlinkSync(tmp) } catch (ignored) { /* 清理失败临时文件 */ }
       return false
     }
   },
@@ -3901,22 +3919,12 @@ const App = {
       let exists = false
       try { exists = fs.existsSync(statePath) } catch (e) { exists = false }
       if (!exists) {
-        try {
-          fs.writeFileSync(statePath, token, { flag: 'wx' })
-          shouldWarn = true
-        } catch (e) {
-          shouldWarn = false
-          if (e && e.code === 'EEXIST' && this._isRe2WarnMarkerStale(statePath)) {
-            // 并发下另一进程已建但已判定残留：尝试替换（best-effort）
-            try { fs.unlinkSync(statePath); fs.writeFileSync(statePath, token, { flag: 'wx' }); shouldWarn = true } catch (e2) { shouldWarn = false }
-          }
-        }
+        shouldWarn = this._writeRe2WarnMarkerAtomic(statePath, token)
       } else {
         if (this._isRe2WarnMarkerStale(statePath)) {
           try {
             fs.unlinkSync(statePath)
-            fs.writeFileSync(statePath, token, { flag: 'wx' })
-            shouldWarn = true
+            shouldWarn = this._writeRe2WarnMarkerAtomic(statePath, token)
           } catch (e) { shouldWarn = false }
         } else {
           shouldWarn = false // 活跃标记或已完成：今天已处理过
@@ -3940,13 +3948,13 @@ const App = {
         if (fs.readFileSync(statePath, 'utf8') === token) fs.unlinkSync(statePath)
       } catch (ignore) { /* 删除失败不影响主流程 */ }
     } else {
-      // 成功或跳过：标记为 completed（仅当文件仍是我们创建的 pending 标记时）
+      // 成功或跳过：标记为 completed（仅当文件仍是我们创建的 pending 标记时；原子写防半写）
       try {
         const content = fs.readFileSync(statePath, 'utf8')
         if (content === token) {
           const completed = JSON.parse(token)
           completed.status = 'completed'
-          fs.writeFileSync(statePath, JSON.stringify(completed), 'utf8')
+          this._writeRe2WarnMarkerAtomic(statePath, JSON.stringify(completed))
         }
       } catch (ignore) { /* 更新失败不影响主流程 */ }
     }
@@ -4018,7 +4026,7 @@ const App = {
     let parsed
     try { parsed = JSON.parse(content) } catch (e) { return false }
     if (!parsed || parsed.status !== 'pending') return false // completed/未知：不回收
-    const pid = parsed && Number.isInteger(parsed.pid) ? parsed.pid : 0
+    const pid = Number.isInteger(parsed.pid) ? parsed.pid : 0
     if (pid <= 0) return false
     let alive
     try {
