@@ -3977,7 +3977,9 @@ const App = {
         if (e.code !== 'EEXIST') return null // 权限等异常：无法加锁，放弃本次
         let stale = false
         try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS } catch (e2) { stale = true }
-        if (stale) {
+        if (stale && !MessageStore._isTombstoneLockProcessAlive(lockPath)) {
+          // 年龄超限且持有进程已确认退出（含损坏/无主锁）才回收；
+          // 进程仍存活（如被暂停>10s）绝不回收，避免双进程同时进入临界区（CodeRabbit 第十一轮）。
           try { fs.unlinkSync(lockPath) } catch (e2) { /* 抢占失败则下一轮重试 */ }
           continue
         }
