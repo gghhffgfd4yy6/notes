@@ -3872,24 +3872,31 @@ const App = {
       fs.writeFileSync(statePath, token, { flag: 'wx' })
     } catch (e) {
       if (e && e.code === 'EEXIST') {
-        // 崩溃残留回收：持有进程已不存在 → 删除标记并重试一次（Sourcery）
-        if (this._isRe2WarnMarkerStale(statePath)) {
-          try { fs.unlinkSync(statePath) } catch (unlinkError) { return }
-          try {
-            fs.writeFileSync(statePath, token, { flag: 'wx' })
-          } catch (retryError) {
-            if (retryError && retryError.code === 'EEXIST') return // 并发进程抢先创建
-            console.error(`re2 缺失提醒标记写入失败，跳过本次提醒 ${statePath}:`, (retryError && retryError.message) || retryError)
-            return
-          }
-        } else {
-          return // 活跃进程持有：今天已提醒过
+        // 崩溃残留回收（CodeRabbit：改用 rename 原子认领，避免 unlink 竞态——
+        // 两个进程都判 stale 后，A unlink+重建、B 又 unlink 掉 A 的新标记）。
+        // 认领：把旧标记 rename 到唯一临时路径，原子操作只有一个进程能成功。
+        if (!this._isRe2WarnMarkerStale(statePath)) return // 活跃进程持有：今天已提醒过
+        const reclaimPath = `${statePath}.${process.pid}.${Date.now()}.reclaim`
+        try {
+          fs.renameSync(statePath, reclaimPath)
+        } catch (renameError) {
+          return // 认领失败（被并发进程抢先 rename/删除）：直接放弃本次
+        }
+        try { fs.unlinkSync(reclaimPath) } catch (ignore) { /* 临时认领文件删除失败不阻塞 */ }
+        try {
+          fs.writeFileSync(statePath, token, { flag: 'wx' })
+        } catch (retryError) {
+          if (retryError && retryError.code === 'EEXIST') return // 并发进程抢先创建
+          console.error(`re2 缺失提醒标记写入失败，跳过本次提醒 ${statePath}:`, (retryError && retryError.message) || retryError)
+          return
         }
       } else {
         console.error(`re2 缺失提醒标记写入失败，跳过本次提醒 ${statePath}:`, (e && e.message) || e)
         return
       }
     }
+    // 顺带清理 7 天前的按天标记文件，防止长期缺 re2 时缓存目录无限累积（Sourcery）
+    this._cleanupStaleRe2WarnMarkers()
     console.warn(RE2_MISSING_WARNING)
     this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
     // 发送失败（通道挂/超时/禁用/同步异常）时删除自己的标记：下一次运行可重新提醒，
@@ -3903,6 +3910,25 @@ const App = {
         if (parsed && parsed.pid === process.pid) fs.unlinkSync(statePath)
       } catch (ignore) { /* 删除失败不影响主流程 */ }
     }
+  },
+
+  // 清理超过保留期的 re2warn.state.YYYY-MM-DD 标记文件（best-effort；仅删除严格早于 cutoff 的日期）
+  _cleanupStaleRe2WarnMarkers () {
+    try {
+      const cacheDir = MessageStore.cacheDir
+      const prefix = RE2_WARN_STATE_FILE + '.'
+      const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) // 保留 7 天
+      const cutoffStamp = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, '0')}-${String(cutoff.getDate()).padStart(2, '0')}`
+      for (const name of fs.readdirSync(cacheDir)) {
+        if (!name.startsWith(prefix)) continue
+        const markerStamp = name.slice(prefix.length)
+        try {
+          if (/^\d{4}-\d{2}-\d{2}$/.test(markerStamp) && markerStamp < cutoffStamp) {
+            fs.unlinkSync(path.join(cacheDir, name))
+          }
+        } catch (ignore) { /* best effort */ }
+      }
+    } catch (ignore) { /* best effort */ }
   },
 
   // re2 提醒标记是否属于已退出进程（崩溃残留）：标记中的 PID 已不存在即可回收；
