@@ -3867,25 +3867,58 @@ const App = {
     const stamp = this._localStamp().slice(0, 10) // YYYY-MM-DD
     const statePath = path.join(MessageStore.cacheDir, `${RE2_WARN_STATE_FILE}.${stamp}`)
     const token = JSON.stringify({ warnedAt: Date.now(), pid: process.pid })
-    // 原子独占创建：成功 = 今天首次提醒；EEXIST = 今天已提醒过；其他错误 = 无法标记，跳过提醒
+    // 原子独占创建：成功 = 今天首次提醒；EEXIST = 今天已提醒过（已退出进程的残留会回收重试）
     try {
       fs.writeFileSync(statePath, token, { flag: 'wx' })
     } catch (e) {
-      if (e && e.code === 'EEXIST') return
-      console.error(`re2 缺失提醒标记写入失败，跳过本次提醒 ${statePath}:`, (e && e.message) || e)
-      return
+      if (e && e.code === 'EEXIST') {
+        // 崩溃残留回收：持有进程已不存在 → 删除标记并重试一次（Sourcery）
+        if (this._isRe2WarnMarkerStale(statePath)) {
+          try { fs.unlinkSync(statePath) } catch (unlinkError) { return }
+          try {
+            fs.writeFileSync(statePath, token, { flag: 'wx' })
+          } catch (retryError) {
+            if (retryError && retryError.code === 'EEXIST') return // 并发进程抢先创建
+            console.error(`re2 缺失提醒标记写入失败，跳过本次提醒 ${statePath}:`, (retryError && retryError.message) || retryError)
+            return
+          }
+        } else {
+          return // 活跃进程持有：今天已提醒过
+        }
+      } else {
+        console.error(`re2 缺失提醒标记写入失败，跳过本次提醒 ${statePath}:`, (e && e.message) || e)
+        return
+      }
     }
     console.warn(RE2_MISSING_WARNING)
     this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
-    // 发送失败（通道挂/超时）时删除自己的标记：下一次运行可重新提醒，
+    // 发送失败（通道挂/超时/禁用/同步异常）时删除自己的标记：下一次运行可重新提醒，
     // 避免“标记已占但用户没收到”导致当天提醒被永久压制（Sourcery）。
+    // 注意：_sendAlert 在告警禁用或同步异常时返回 undefined，必须按“非 true 即失败”处理。
     const sent = await this._sendAlert(RE2_MISSING_WARNING)
-    if (sent === false) {
+    if (sent !== true) {
       try {
         const content = fs.readFileSync(statePath, 'utf8')
         const parsed = JSON.parse(content)
         if (parsed && parsed.pid === process.pid) fs.unlinkSync(statePath)
       } catch (ignore) { /* 删除失败不影响主流程 */ }
+    }
+  },
+
+  // re2 提醒标记是否属于已退出进程（崩溃残留）：标记中的 PID 已不存在即可回收；
+  // 无法解析/PID 无效/进程存活一律保守保留，避免误删并发进程刚创建的标记。
+  _isRe2WarnMarkerStale (statePath) {
+    let content
+    try { content = fs.readFileSync(statePath, 'utf8') } catch (e) { return false }
+    let parsed
+    try { parsed = JSON.parse(content) } catch (e) { return false }
+    const pid = parsed && Number.isInteger(parsed.pid) ? parsed.pid : 0
+    if (pid <= 0 || pid === process.pid) return false
+    try {
+      process.kill(pid, 0)
+      return false // 进程存活
+    } catch (err) {
+      return Boolean(err && err.code === 'ESRCH') // 进程不存在 = 崩溃残留
     }
   },
 
