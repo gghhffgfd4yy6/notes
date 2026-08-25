@@ -3881,15 +3881,55 @@ const App = {
 
   // 当前日期标记原子写入（J2：临时文件 + rename，避免 writeFileSync 半写留下截断 JSON，
   // 导致 _isRe2WarnMarkerStale 无法解析而永久压制当天提醒）。
+  // 调用方必须在 per-date 锁内调用：Windows 上 rename 到已存在目标会失败（EEXIST/EPERM），
+  // 此时先删目标再 rename——锁内无并发，删除窗口不构成竞态（Sourcery 第十二轮）。
   _writeRe2WarnMarkerAtomic (statePath, text) {
     const tmp = `${statePath}.${process.pid}.${Date.now()}.tmp`
     try {
       fs.writeFileSync(tmp, text, { flag: 'wx' })
-      fs.renameSync(tmp, statePath)
+      try {
+        fs.renameSync(tmp, statePath)
+      } catch (renameError) {
+        // Windows：目标已存在时 rename 失败，先移除目标再重试；
+        // 其他平台 rename 天然覆盖，不会进此分支。
+        try { fs.unlinkSync(statePath) } catch (unlinkError) { /* 目标已被删/不存在则忽略 */ }
+        fs.renameSync(tmp, statePath)
+      }
       return true
     } catch (e) {
       try { fs.unlinkSync(tmp) } catch (ignored) { /* 清理失败临时文件 */ }
       return false
+    }
+  },
+
+  // 发送完成（成功/跳过）后把标记置 completed：加锁 + 校验仍是自己的 token + 原子写。
+  // 放在锁内执行，与创建/回收共用同一 per-date 锁，避免锁外写导致并发交错（Sourcery 第十二轮）。
+  _completeRe2WarnMarker (statePath, token) {
+    const acquired = this._acquireRe2WarnLock(statePath)
+    if (!acquired) return
+    try {
+      try {
+        if (fs.readFileSync(statePath, 'utf8') === token) {
+          const completed = JSON.parse(token)
+          completed.status = 'completed'
+          this._writeRe2WarnMarkerAtomic(statePath, JSON.stringify(completed))
+        }
+      } catch (ignore) { /* 读取/解析失败不影响主流程 */ }
+    } finally {
+      this._releaseRe2WarnLock(statePath, acquired)
+    }
+  },
+
+  // 发送失败后删除自己的 pending 标记（锁内 + 完整 token 校验，防误删并发进程的标记）。
+  _removeRe2WarnMarker (statePath, token) {
+    const acquired = this._acquireRe2WarnLock(statePath)
+    if (!acquired) return
+    try {
+      try {
+        if (fs.readFileSync(statePath, 'utf8') === token) fs.unlinkSync(statePath)
+      } catch (ignore) { /* 删除失败不影响主流程 */ }
+    } finally {
+      this._releaseRe2WarnLock(statePath, acquired)
     }
   },
 
@@ -3943,20 +3983,11 @@ const App = {
     // 防止正常进程退出后被误判为残留造成同一天重复提醒）。
     const sent = await this._sendAlert(RE2_MISSING_WARNING)
     if (sent === false) {
-      // 只删除自己创建的那份（完整 token 比对，杜绝误删并发进程的标记）
-      try {
-        if (fs.readFileSync(statePath, 'utf8') === token) fs.unlinkSync(statePath)
-      } catch (ignore) { /* 删除失败不影响主流程 */ }
+      // 发送失败：锁内删除自己的 pending 标记（完整 token 校验），下次运行可重试
+      this._removeRe2WarnMarker(statePath, token)
     } else {
-      // 成功或跳过：标记为 completed（仅当文件仍是我们创建的 pending 标记时；原子写防半写）
-      try {
-        const content = fs.readFileSync(statePath, 'utf8')
-        if (content === token) {
-          const completed = JSON.parse(token)
-          completed.status = 'completed'
-          this._writeRe2WarnMarkerAtomic(statePath, JSON.stringify(completed))
-        }
-      } catch (ignore) { /* 更新失败不影响主流程 */ }
+      // 成功或跳过：锁内把标记置 completed（防止正常进程退出后被误判残留导致同一天重复提醒）
+      this._completeRe2WarnMarker(statePath, token)
     }
   },
 
