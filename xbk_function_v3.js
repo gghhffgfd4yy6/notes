@@ -3908,7 +3908,7 @@ const App = {
     const token = JSON.stringify({
       warnedAt: Date.now(),
       pid: process.pid,
-      start: this._getTombstoneProcessStart(process.pid) || '', // Linux 启动时钟；非 Linux 为空
+      start: MessageStore._getTombstoneProcessStart(process.pid) || '', // Linux 启动时钟；非 Linux 为空
       status: 'pending'
     })
     const acquired = this._acquireRe2WarnLock(statePath)
@@ -3967,7 +3967,7 @@ const App = {
     const LOCK_STALE_MS = 10000
     const deadline = Date.now() + 3000
     const waiter = new Int32Array(new SharedArrayBuffer(4))
-    const lockToken = `${process.pid}:${this._getTombstoneProcessStart(process.pid) || ''}`
+    const lockToken = `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`
     for (;;) {
       try {
         const fd = fs.openSync(lockPath, 'wx')
@@ -4039,7 +4039,7 @@ const App = {
     // PID 存活时用启动时钟识别 incarnation：标记里的 start 与当前进程实际 start 不一致 = PID 被复用
     const expectedStart = parsed.start
     if (expectedStart && /^[0-9]+$/.test(expectedStart)) {
-      const actualStart = this._getTombstoneProcessStart(pid)
+      const actualStart = MessageStore._getTombstoneProcessStart(pid)
       if (actualStart !== null && actualStart !== expectedStart) return true
     }
     return false
