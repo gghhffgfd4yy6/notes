@@ -2650,15 +2650,20 @@ const MessageStore = {
     const parts = String(token).split(':')
     const pid = Number(parts[0])
     if (!Number.isSafeInteger(pid) || pid <= 0) return false
+    let alive
     try {
       process.kill(pid, 0)
-      const expectedStart = parts[1]
-      if (!expectedStart || !/^[0-9]+$/.test(expectedStart)) return true
-      const actualStart = this._getTombstoneProcessStart(pid)
-      return actualStart === null || actualStart === expectedStart
+      alive = true
     } catch (e) {
-      return e && e.code === 'EPERM'
+      alive = e && e.code === 'EPERM' // EPERM = 进程存在但无权限，视为活跃；ESRCH = 进程不存在
     }
+    if (!alive) return false
+    const expectedStart = parts[1]
+    // 非 Linux / 旧格式 token 无有效启动时钟：无法验证进程 incarnation，只能按 PID 存活兜底。
+    // Linux 且有合法 start 时才对比启动时钟，防 PID 复用误判。
+    if (!expectedStart || !/^[0-9]+$/.test(expectedStart)) return true
+    const actualStart = this._getTombstoneProcessStart(pid)
+    return actualStart === null || actualStart === expectedStart
   },
 
   _getTombstoneProcessStart (pid) {
@@ -3078,10 +3083,13 @@ const MessageStore = {
   },
 
   /** 生成锁 owner token：PID + 进程启动时钟识别进程 incarnation，UUID 便于排查归属。
+   * Linux 才有 /proc 启动时钟；非 Linux 平台省略 start 字段（保持 pid::uuid 三段结构），
+   * 由 _isTombstoneLockProcessAlive 回退为仅按 PID 存活判断——避免写入无法解析的
+   * 占位值（如 unknown）导致 PID 复用时残留锁永不回收。
    * 不用 Math.random（SonarCloud S2245 伪随机安全告警）。 */
   _newTombstoneLockToken () {
     const start = this._getTombstoneProcessStart(process.pid)
-    return process.pid + ':' + (start || 'unknown') + ':' + crypto.randomUUID()
+    return process.pid + ':' + (start || '') + ':' + crypto.randomUUID()
   },
 
   /** 释放墓碑锁：仅当锁内容仍是自己写入的 token 时才删除；ENOENT 视为正常。 */
@@ -3885,23 +3893,19 @@ const App = {
         // 竞态——A 判完 stale 后 B 抢先认领重建，A 的 rename 会把 B 的新标记认领走）。
         // rename 是原子操作，同一时刻只有一个进程能认领成功，天然串行化。
         const reclaimPath = `${statePath}.${process.pid}.${Date.now()}.reclaim`
-        let claimed = false
         try {
           fs.renameSync(statePath, reclaimPath)
-          claimed = true
         } catch (renameError) {
           return // 认领失败（被并发进程抢先 rename/删除）：直接放弃本次
         }
-        if (claimed) {
-          // 认领成功后再检查内容：活跃进程的标记 → 放回原位并放弃；残留 → 删除并重建
-          if (!this._isRe2WarnMarkerStale(reclaimPath)) {
-            try { fs.renameSync(reclaimPath, statePath) } catch (putBackError) {
-              try { fs.unlinkSync(reclaimPath) } catch (ignored) { /* 放回失败则删除，避免遗留 */ }
-            }
-            return
+        // rename 成功后即已认领（失败已 return）：检查内容——活跃进程标记放回原位，残留则删除重建
+        if (!this._isRe2WarnMarkerStale(reclaimPath)) {
+          try { fs.renameSync(reclaimPath, statePath) } catch (putBackError) {
+            try { fs.unlinkSync(reclaimPath) } catch (ignored) { /* 放回失败则删除，避免遗留 */ }
           }
-          try { fs.unlinkSync(reclaimPath) } catch (ignored) { /* 临时认领文件删除失败不阻塞 */ }
+          return
         }
+        try { fs.unlinkSync(reclaimPath) } catch (ignored) { /* 临时认领文件删除失败不阻塞 */ }
         try {
           fs.writeFileSync(statePath, token, { flag: 'wx' })
         } catch (retryError) {
