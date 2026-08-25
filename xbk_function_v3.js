@@ -19,7 +19,6 @@ const PROFILE3_BOOT_MARKS = []
 // ReDoS 防护：优先用 Google RE2（线性时间无回溯）；不支持反向引用等特性时回落原生 RegExp。
 let RE2C = null
 try { RE2C = require('re2') } catch (e) { RE2C = null }
-let re2MissingWarned = false
 const _reCache = new Map()
 const safeRe = (src, flags) => {
   const k = src + '\u0000' + flags
@@ -46,12 +45,6 @@ function compileUserRegex (source, flags = 'i') {
 
 function isRe2Available () {
   return Boolean(RE2C)
-}
-
-function markRe2MissingWarned () {
-  if (RE2C || re2MissingWarned) return false
-  re2MissingWarned = true
-  return true
 }
 
 const RE2_MISSING_WARNING = '⚠️ 当前环境未安装可用的 re2，用户过滤正则将被跳过，以避免 V8 原生 RegExp 阻塞事件循环。建议执行：npm install re2'
@@ -3853,24 +3846,27 @@ const App = {
           } else {
             console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）')
           }
+          return true // 发送成功
         })
         .catch((sendError) => {
           // R1（v3.269）：仅在告警通道失败时本地留痕，避免成功告警被误记为失败。
           const reason = Utils.safeErrorText(sendError || errMsg, safeReason).replace(/[\r\n]+/g, ' ').slice(0, 200)
           this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${reason}\n`)
           /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */
+          return false // 发送失败（供 _warnMissingRe2 等调用方决定是否撤销标记/重试）
         })
     } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
   },
 
   async _warnMissingRe2 () {
-    if (RE2C || !markRe2MissingWarned()) return
+    if (RE2C) return
     // 跨进程防重：按天命名的状态文件 + wx 独占创建——并发 cron 只有一个能创建成功，
     // 其余全部跳过；文件已存在 = 今天已提醒过。天然串行化“检查-提醒-标记”，
     // 避免读-判-写竞态（两个进程同时读到缺失都去提醒）与未来时间戳压制。
+    // 不依赖进程内 flag：常驻进程跨天后第二天会基于新日期文件再次提醒（CodeRabbit）。
     const stamp = this._localStamp().slice(0, 10) // YYYY-MM-DD
     const statePath = path.join(MessageStore.cacheDir, `${RE2_WARN_STATE_FILE}.${stamp}`)
-    const token = JSON.stringify({ warnedAt: Date.now() })
+    const token = JSON.stringify({ warnedAt: Date.now(), pid: process.pid })
     // 原子独占创建：成功 = 今天首次提醒；EEXIST = 今天已提醒过；其他错误 = 无法标记，跳过提醒
     try {
       fs.writeFileSync(statePath, token, { flag: 'wx' })
@@ -3881,7 +3877,16 @@ const App = {
     }
     console.warn(RE2_MISSING_WARNING)
     this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
-    try { await this._sendAlert(RE2_MISSING_WARNING) } catch (e) { /* 提醒失败不阻塞主流程 */ }
+    // 发送失败（通道挂/超时）时删除自己的标记：下一次运行可重新提醒，
+    // 避免“标记已占但用户没收到”导致当天提醒被永久压制（Sourcery）。
+    const sent = await this._sendAlert(RE2_MISSING_WARNING)
+    if (sent === false) {
+      try {
+        const content = fs.readFileSync(statePath, 'utf8')
+        const parsed = JSON.parse(content)
+        if (parsed && parsed.pid === process.pid) fs.unlinkSync(statePath)
+      } catch (ignore) { /* 删除失败不影响主流程 */ }
+    }
   },
 
   // v3.258 提取：日报状态归一化（行为不变，供测试直接打纯函数）
