@@ -36,8 +36,9 @@ const safeRe = (src, flags) => {
 // ⚠️ RE2 兼容性（取舍说明）：RE2 为线性时间、无回溯，因此不支持 V8 的部分语法——
 // 反向引用（/(a)\1/）、lookbehind（/(?<=x)/）、命名捕获组的部分写法等。
 // 装了 re2 后，原本在 V8 下可用的这类用户正则可能编译失败被跳过（有告警），
-// 表现为规则静默不生效；这是「防 ReDoS 卡死事件循环」的刻意取舍，
-// 如用户规则必须用这些特性，可保持不装 re2（代价是失去回溯防护）。
+// 表现为规则静默不生效；这是「防 ReDoS 卡死事件循环」的刻意取舍。
+// 注意：未安装 re2 时用户配置正则同样会被跳过（不会回退 V8），不存在“不装就能用
+// 反向引用/lookbehind”的选项——使用这些特性只能改写为 RE2 兼容语法。
 function compileUserRegex (source, flags = 'i') {
   if (typeof source !== 'string' || !RE2C) return null
   try { return new RE2C(source, flags) } catch (e) { return null }
@@ -55,9 +56,8 @@ function markRe2MissingWarned () {
 
 const RE2_MISSING_WARNING = '⚠️ 当前环境未安装可用的 re2，用户过滤正则将被跳过，以避免 V8 原生 RegExp 阻塞事件循环。建议执行：npm install re2'
 
-// 跨进程防重：re2 缺失提醒用状态文件记录最近一次提醒时间（cron 每次运行为新进程，
-// 仅靠进程内 flag 防不住每天多次提醒）；同一环境缺 re2 最多每天提醒一次。
-const RE2_WARN_INTERVAL_MS = 24 * 60 * 60 * 1000
+// 跨进程防重：re2 缺失提醒用按天命名的状态文件 + wx 独占创建（cron 每次运行为新进程，
+// 仅靠进程内 flag 防不住每天多次提醒）；文件已存在 = 今天已提醒过，同一环境最多每天提醒一次。
 const RE2_WARN_STATE_FILE = 're2warn.state'
 
 function profile3NowMs () {
@@ -3865,20 +3865,20 @@ const App = {
 
   async _warnMissingRe2 () {
     if (RE2C || !markRe2MissingWarned()) return
-    // 跨进程防重：写状态文件记录最近一次提醒时间，cron/常驻多次运行最多每天提醒一次
-    // （进程内 flag 防不住 cron 每次新进程；状态文件与 alert.state 同模式）。
-    const statePath = path.join(MessageStore.cacheDir, RE2_WARN_STATE_FILE)
-    const stateResult = this._readSafeState(statePath)
-    if (stateResult.status === 'ok') {
-      try {
-        const lastWarn = JSON.parse(stateResult.text).lastWarnAt || 0
-        if (Number.isFinite(lastWarn) && Date.now() - lastWarn < RE2_WARN_INTERVAL_MS) return
-      } catch (e) { /* 损坏状态忽略，允许重新提醒 */ }
-    } else if (stateResult.status !== 'missing') {
-      // 无法确认真实状态：保守跳过本次提醒，避免状态损坏时重复轰炸
+    // 跨进程防重：按天命名的状态文件 + wx 独占创建——并发 cron 只有一个能创建成功，
+    // 其余全部跳过；文件已存在 = 今天已提醒过。天然串行化“检查-提醒-标记”，
+    // 避免读-判-写竞态（两个进程同时读到缺失都去提醒）与未来时间戳压制。
+    const stamp = this._localStamp().slice(0, 10) // YYYY-MM-DD
+    const statePath = path.join(MessageStore.cacheDir, `${RE2_WARN_STATE_FILE}.${stamp}`)
+    const token = JSON.stringify({ warnedAt: Date.now() })
+    // 原子独占创建：成功 = 今天首次提醒；EEXIST = 今天已提醒过；其他错误 = 无法标记，跳过提醒
+    try {
+      fs.writeFileSync(statePath, token, { flag: 'wx' })
+    } catch (e) {
+      if (e && e.code === 'EEXIST') return
+      console.error(`re2 缺失提醒标记写入失败，跳过本次提醒 ${statePath}:`, (e && e.message) || e)
       return
     }
-    this._writeState(statePath, { lastWarnAt: Date.now() })
     console.warn(RE2_MISSING_WARNING)
     this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
     try { await this._sendAlert(RE2_MISSING_WARNING) } catch (e) { /* 提醒失败不阻塞主流程 */ }
