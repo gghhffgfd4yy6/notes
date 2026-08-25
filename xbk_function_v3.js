@@ -19,7 +19,6 @@ const PROFILE3_BOOT_MARKS = []
 // ReDoS 防护：优先用 Google RE2（线性时间无回溯）；不支持反向引用等特性时回落原生 RegExp。
 let RE2C = null
 try { RE2C = require('re2') } catch (e) { RE2C = null }
-let re2MissingWarned = false
 const _reCache = new Map()
 const safeRe = (src, flags) => {
   const k = src + '\u0000' + flags
@@ -33,6 +32,12 @@ const safeRe = (src, flags) => {
 
 // 用户配置正则不允许在缺少 RE2 时回退到 V8 原生 RegExp：复杂模式可能阻塞单线程事件循环。
 // 内部固定正则仍由 safeRe() 处理；这里仅作为用户配置正则的编译闸门。
+// ⚠️ RE2 兼容性（取舍说明）：RE2 为线性时间、无回溯，因此不支持 V8 的部分语法——
+// 反向引用（/(a)\1/）、lookbehind（/(?<=x)/）、命名捕获组的部分写法等。
+// 装了 re2 后，原本在 V8 下可用的这类用户正则可能编译失败被跳过（有告警），
+// 表现为规则静默不生效；这是「防 ReDoS 卡死事件循环」的刻意取舍。
+// 注意：未安装 re2 时用户配置正则同样会被跳过（不会回退 V8），不存在“不装就能用
+// 反向引用/lookbehind”的选项——使用这些特性只能改写为 RE2 兼容语法。
 function compileUserRegex (source, flags = 'i') {
   if (typeof source !== 'string' || !RE2C) return null
   try { return new RE2C(source, flags) } catch (e) { return null }
@@ -42,13 +47,11 @@ function isRe2Available () {
   return Boolean(RE2C)
 }
 
-function markRe2MissingWarned () {
-  if (RE2C || re2MissingWarned) return false
-  re2MissingWarned = true
-  return true
-}
-
 const RE2_MISSING_WARNING = '⚠️ 当前环境未安装可用的 re2，用户过滤正则将被跳过，以避免 V8 原生 RegExp 阻塞事件循环。建议执行：npm install re2'
+
+// 跨进程防重：re2 缺失提醒用按天命名的状态文件 + wx 独占创建（cron 每次运行为新进程，
+// 仅靠进程内 flag 防不住每天多次提醒）；文件已存在 = 今天已提醒过，同一环境最多每天提醒一次。
+const RE2_WARN_STATE_FILE = 're2warn.state'
 
 function profile3NowMs () {
   return Number(process.hrtime.bigint() - PROFILE3_BOOT_START) / 1e6
@@ -2647,18 +2650,27 @@ const MessageStore = {
     const parts = String(token).split(':')
     const pid = Number(parts[0])
     if (!Number.isSafeInteger(pid) || pid <= 0) return false
+    let alive
     try {
       process.kill(pid, 0)
-      const expectedStart = parts[1]
-      if (!expectedStart || !/^[0-9]+$/.test(expectedStart)) return true
-      const actualStart = this._getTombstoneProcessStart(pid)
-      return actualStart === null || actualStart === expectedStart
+      alive = true
     } catch (e) {
-      return e && e.code === 'EPERM'
+      alive = e && e.code === 'EPERM' // EPERM = 进程存在但无权限，视为活跃；ESRCH = 进程不存在
     }
+    if (!alive) return false
+    const expectedStart = parts[1]
+    // 非 Linux / 旧格式 token 无有效启动时钟：无法验证进程 incarnation，只能按 PID 存活兜底。
+    // Linux 且有合法 start 时才对比启动时钟，防 PID 复用误判。
+    if (!expectedStart || !/^[0-9]+$/.test(expectedStart)) return true
+    const actualStart = this._getTombstoneProcessStart(pid)
+    return actualStart === null || actualStart === expectedStart
   },
 
   _getTombstoneProcessStart (pid) {
+    // 仅 Linux 提供 /proc/PID/stat 的进程启动时钟（starttime）。
+    // 非 Linux（macOS/Windows）无法读取 → 返回 null，调用方按
+    // “PID 存活即活跃”的保守口径处理：无法识别 PID 复用，宁可保留陈旧锁。
+    if (process.platform !== 'linux') return null
     try {
       const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
       const close = stat.lastIndexOf(')')
@@ -3071,10 +3083,13 @@ const MessageStore = {
   },
 
   /** 生成锁 owner token：PID + 进程启动时钟识别进程 incarnation，UUID 便于排查归属。
+   * Linux 才有 /proc 启动时钟；非 Linux 平台省略 start 字段（保持 pid::uuid 三段结构），
+   * 由 _isTombstoneLockProcessAlive 回退为仅按 PID 存活判断——避免写入无法解析的
+   * 占位值（如 unknown）导致 PID 复用时残留锁永不回收。
    * 不用 Math.random（SonarCloud S2245 伪随机安全告警）。 */
   _newTombstoneLockToken () {
     const start = this._getTombstoneProcessStart(process.pid)
-    return process.pid + ':' + (start || 'unknown') + ':' + crypto.randomUUID()
+    return process.pid + ':' + (start || '') + ':' + crypto.randomUUID()
   },
 
   /** 释放墓碑锁：仅当锁内容仍是自己写入的 token 时才删除；ENOENT 视为正常。 */
@@ -3825,7 +3840,8 @@ const App = {
       // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗，与主推送不一致）
       // v3.164：返回 promise 供 App.run catch await——曾 fire-and-forget，接口异常时主入口同步 process.exit(1)
       // 杀死未完成的告警 HTTP（cron 直接运行收不到告警，#10）
-      // R1（v3.269）：告警通道挂掉时本地留痕——run.log 写入告警摘要+时间戳+版本，退出/连败时不再无痕
+      // R1（v3.269）：告警本地留痕——发送前先写一行摘要到 run.log（无论成败），
+      // 这样告警通道挂掉/退出连败时仍有痕可查；发送失败时下方 catch 再补一行原因。
       this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${safeReason.replace(/[\r\n]+/g, ' ').slice(0, 200)}\n`)
       return Pusher.send(alertText, alertDesp)
         .then(() => {
@@ -3838,21 +3854,228 @@ const App = {
           } else {
             console.log('已发送运行异常告警（限频 ' + Math.ceil(interval / 60000) + ' 分钟）')
           }
+          return true // 发送成功
         })
         .catch((sendError) => {
           // R1（v3.269）：仅在告警通道失败时本地留痕，避免成功告警被误记为失败。
           const reason = Utils.safeErrorText(sendError || errMsg, safeReason).replace(/[\r\n]+/g, ' ').slice(0, 200)
-          this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${reason}\n`)
+          // J1（v3.269 审查）：留痕写日志自身也可能抛错（磁盘/权限），必须包住——
+          // 否则 handler 自身 reject，_sendAlert 不会返回 false，调用方 await 会中断。
+          try {
+            this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${reason}\n`)
+          } catch (logError) { /* 留痕失败静默 */ }
           /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */
+          return false // 发送失败（供 _warnMissingRe2 等调用方决定是否撤销标记/重试）
         })
-    } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
+    } catch (e) {
+      // F1（v3.269 审查）：同步异常（run.log 写失败 / Pusher.send 同步抛错）时
+      // 不能只静默——补写失败原因留痕并返回 false，让调用方能区分
+      // “发送失败”(false)与“跳过”(undefined：禁用/限频/状态读取失败)。
+      const reason = Utils.safeErrorText(e || errMsg, '未知错误').replace(/[\r\n]+/g, ' ').slice(0, 200)
+      try {
+        this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ⚠️ xbk-push 运行异常 原因：${reason}\n`)
+      } catch (logError) { /* 留痕失败静默 */ }
+      return false
+    }
+  },
+
+  // 当前日期标记原子写入（J2：临时文件 + rename，避免 writeFileSync 半写留下截断 JSON，
+  // 导致 _isRe2WarnMarkerStale 无法解析而永久压制当天提醒）。
+  // 调用方必须在 per-date 锁内调用：Windows 上 rename 到已存在目标会失败（EEXIST/EPERM），
+  // 此时先删目标再 rename——锁内无并发，删除窗口不构成竞态（Sourcery 第十二轮）。
+  _writeRe2WarnMarkerAtomic (statePath, text) {
+    const tmp = `${statePath}.${process.pid}.${Date.now()}.tmp`
+    try {
+      fs.writeFileSync(tmp, text, { flag: 'wx' })
+      try {
+        fs.renameSync(tmp, statePath)
+      } catch (renameError) {
+        // Windows：目标已存在时 rename 失败，先移除目标再重试；
+        // 其他平台 rename 天然覆盖，不会进此分支。
+        try { fs.unlinkSync(statePath) } catch (unlinkError) { /* 目标已被删/不存在则忽略 */ }
+        fs.renameSync(tmp, statePath)
+      }
+      return true
+    } catch (e) {
+      try { fs.unlinkSync(tmp) } catch (ignored) { /* 清理失败临时文件 */ }
+      return false
+    }
+  },
+
+  // 发送完成（成功/跳过）后把标记置 completed：加锁 + 校验仍是自己的 token + 原子写。
+  // 放在锁内执行，与创建/回收共用同一 per-date 锁，避免锁外写导致并发交错（Sourcery 第十二轮）。
+  _completeRe2WarnMarker (statePath, token) {
+    const acquired = this._acquireRe2WarnLock(statePath)
+    if (!acquired) return
+    try {
+      try {
+        if (fs.readFileSync(statePath, 'utf8') === token) {
+          const completed = JSON.parse(token)
+          completed.status = 'completed'
+          this._writeRe2WarnMarkerAtomic(statePath, JSON.stringify(completed))
+        }
+      } catch (ignore) { /* 读取/解析失败不影响主流程 */ }
+    } finally {
+      this._releaseRe2WarnLock(statePath, acquired)
+    }
+  },
+
+  // 发送失败后删除自己的 pending 标记（锁内 + 完整 token 校验，防误删并发进程的标记）。
+  _removeRe2WarnMarker (statePath, token) {
+    const acquired = this._acquireRe2WarnLock(statePath)
+    if (!acquired) return
+    try {
+      try {
+        if (fs.readFileSync(statePath, 'utf8') === token) fs.unlinkSync(statePath)
+      } catch (ignore) { /* 删除失败不影响主流程 */ }
+    } finally {
+      this._releaseRe2WarnLock(statePath, acquired)
+    }
   },
 
   async _warnMissingRe2 () {
-    if (!markRe2MissingWarned()) return
+    // Sourcery 第八轮：RE2C 可用时也要顺带清理残留旧标记文件，否则安装 re2 后堆积文件永不清理。
+    if (RE2C) {
+      this._cleanupStaleRe2WarnMarkers()
+      return
+    }
+    // 跨进程防重（终版）：按天命名的标记文件 + per-date 互斥锁。
+    // 锁串行化「读-判-写」标记，杜绝并发创建/回收竞态（CodeRabbit F2/第七轮）；
+    // 标记记录 pid + 进程启动时钟（incarnation）+ 状态（pending/completed）：
+    // 已完成的标记永不回收，只有 pending（崩溃未完成）才允许回收（CodeRabbit 第八轮）。
+    const stamp = this._localStamp().slice(0, 10) // YYYY-MM-DD
+    const statePath = path.join(MessageStore.cacheDir, `${RE2_WARN_STATE_FILE}.${stamp}`)
+    const token = JSON.stringify({
+      warnedAt: Date.now(),
+      pid: process.pid,
+      start: MessageStore._getTombstoneProcessStart(process.pid) || '', // Linux 启动时钟；非 Linux 为空
+      status: 'pending'
+    })
+    const acquired = this._acquireRe2WarnLock(statePath)
+    if (!acquired) return // 拿不到锁（并发竞争/超时）：跳过本次
+    let shouldWarn = false
+    try {
+      // 锁内重读标记：缺失→创建；残留(pending+已退出)→删除重建；活跃/已完成→跳过
+      let exists = false
+      try { exists = fs.existsSync(statePath) } catch (e) { exists = false }
+      if (!exists) {
+        shouldWarn = this._writeRe2WarnMarkerAtomic(statePath, token)
+      } else {
+        if (this._isRe2WarnMarkerStale(statePath)) {
+          try {
+            fs.unlinkSync(statePath)
+            shouldWarn = this._writeRe2WarnMarkerAtomic(statePath, token)
+          } catch (e) { shouldWarn = false }
+        } else {
+          shouldWarn = false // 活跃标记或已完成：今天已处理过
+        }
+      }
+    } finally {
+      this._releaseRe2WarnLock(statePath, acquired)
+    }
+    if (!shouldWarn) return
+    // 锁外：清理 7 天前旧文件 + 提醒 + 发送（发送不在锁内，避免长 HTTP 阻塞其他进程拿锁）
+    this._cleanupStaleRe2WarnMarkers()
     console.warn(RE2_MISSING_WARNING)
     this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
-    try { await this._sendAlert(RE2_MISSING_WARNING) } catch (e) { /* 提醒失败不阻塞主流程 */ }
+    // 发送结果三态：true 成功 / false 失败删标记重试 /
+    // undefined 跳过（禁用/限频）——成功与跳过都视为当天已处理，标记置 completed（CodeRabbit 第八轮：
+    // 防止正常进程退出后被误判为残留造成同一天重复提醒）。
+    const sent = await this._sendAlert(RE2_MISSING_WARNING)
+    if (sent === false) {
+      // 发送失败：锁内删除自己的 pending 标记（完整 token 校验），下次运行可重试
+      this._removeRe2WarnMarker(statePath, token)
+    } else {
+      // 成功或跳过：锁内把标记置 completed（防止正常进程退出后被误判残留导致同一天重复提醒）
+      this._completeRe2WarnMarker(statePath, token)
+    }
+  },
+
+  // 单个日期标记的跨进程互斥锁（O_EXCL 独占创建 + 短退避 + 陈旧锁抢占）：
+  // 把「读-判-写」标记串行化，使同一时刻只有一个进程能创建/回收当天的标记。
+  _acquireRe2WarnLock (statePath) {
+    const lockPath = statePath + '.lock'
+    const LOCK_STALE_MS = 10000
+    const deadline = Date.now() + 3000
+    const waiter = new Int32Array(new SharedArrayBuffer(4))
+    const lockToken = `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`
+    for (;;) {
+      try {
+        const fd = fs.openSync(lockPath, 'wx')
+        try { fs.writeSync(fd, lockToken) } catch (e) { /* 锁内容仅供排查 */ }
+        return { lockPath, fd }
+      } catch (e) {
+        if (e.code !== 'EEXIST') return null // 权限等异常：无法加锁，放弃本次
+        let stale = false
+        try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS } catch (e2) { stale = true }
+        if (stale && !MessageStore._isTombstoneLockProcessAlive(lockPath)) {
+          // 年龄超限且持有进程已确认退出（含损坏/无主锁）才回收；
+          // 进程仍存活（如被暂停>10s）绝不回收，避免双进程同时进入临界区（CodeRabbit 第十一轮）。
+          try { fs.unlinkSync(lockPath) } catch (e2) { /* 抢占失败则下一轮重试 */ }
+          continue
+        }
+        if (Date.now() >= deadline) return null // 超时：放弃本次（避免阻塞事件循环）
+        try { Atomics.wait(waiter, 0, 0, 10) } catch (e2) { /* 受限环境退避失败直接重试 */ }
+      }
+    }
+  },
+
+  _releaseRe2WarnLock (statePath, acquired) {
+    if (!acquired) return
+    try { fs.closeSync(acquired.fd) } catch (e) { /* 忽略 */ }
+    try { fs.unlinkSync(acquired.lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
+  },
+
+  // 清理超过保留期的 re2 标记文件（best-effort；仅删除严格早于 cutoff 的日期）：
+  // - re2warn.state.YYYY-MM-DD（正常按天标记）
+  // - re2warn.state.YYYY-MM-DD.<pid>.<time>.reclaim（F3：崩溃残留的认领临时文件，
+  //   进程在 rename 后、删除前退出会遗留；同样按日期兜底清理，避免永久累积）
+  _cleanupStaleRe2WarnMarkers () {
+    try {
+      const cacheDir = MessageStore.cacheDir
+      const prefix = RE2_WARN_STATE_FILE + '.'
+      const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) // 保留 7 天
+      const cutoffStamp = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, '0')}-${String(cutoff.getDate()).padStart(2, '0')}`
+      for (const name of fs.readdirSync(cacheDir)) {
+        if (!name.startsWith(prefix)) continue
+        const markerStamp = name.slice(prefix.length).split('.')[0] // 取日期段，忽略 .pid.time.reclaim 后缀
+        try {
+          if (/^\d{4}-\d{2}-\d{2}$/.test(markerStamp) && markerStamp < cutoffStamp) {
+            fs.unlinkSync(path.join(cacheDir, name))
+          }
+        } catch (ignore) { /* best effort */ }
+      }
+    } catch (ignore) { /* best effort */ }
+  },
+
+  // re2 提醒标记是否属于可回收的崩溃残留（CodeRabbit 第八轮）：
+  // - 仅当标记为 pending（未完成发送）且持有进程已退出时才允许回收；
+  //   completed（已成功发送/跳过）即使进程退出也永不回收，避免同一天重复提醒。
+  // - PID 不存在 → pending 即残留；PID 存活但启动时钟不一致（PID 复用）→ 残留
+  // - 无法解析/PID 无效/状态非 pending → 保守保留
+  _isRe2WarnMarkerStale (statePath) {
+    let content
+    try { content = fs.readFileSync(statePath, 'utf8') } catch (e) { return false }
+    let parsed
+    try { parsed = JSON.parse(content) } catch (e) { return false }
+    if (!parsed || parsed.status !== 'pending') return false // completed/未知：不回收
+    const pid = Number.isInteger(parsed.pid) ? parsed.pid : 0
+    if (pid <= 0) return false
+    let alive
+    try {
+      process.kill(pid, 0)
+      alive = true
+    } catch (err) {
+      alive = err && err.code === 'EPERM' // EPERM=存在但无权限；ESRCH=不存在
+    }
+    if (!alive) return true // PID 不存在 = 崩溃残留
+    // PID 存活时用启动时钟识别 incarnation：标记里的 start 与当前进程实际 start 不一致 = PID 被复用
+    const expectedStart = parsed.start
+    if (expectedStart && /^[0-9]+$/.test(expectedStart)) {
+      const actualStart = MessageStore._getTombstoneProcessStart(pid)
+      if (actualStart !== null && actualStart !== expectedStart) return true
+    }
+    return false
   },
 
   // v3.258 提取：日报状态归一化（行为不变，供测试直接打纯函数）
