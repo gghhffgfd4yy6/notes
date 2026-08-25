@@ -3876,22 +3876,28 @@ const App = {
   },
 
   async _warnMissingRe2 () {
-    if (RE2C) return
+    // Sourcery 第八轮：RE2C 可用时也要顺带清理残留旧标记文件，否则安装 re2 后堆积文件永不清理。
+    if (RE2C) {
+      this._cleanupStaleRe2WarnMarkers()
+      return
+    }
     // 跨进程防重（终版）：按天命名的标记文件 + per-date 互斥锁。
     // 锁串行化「读-判-写」标记，杜绝并发创建/回收竞态（CodeRabbit F2/第七轮）；
-    // 标记记录 pid + 进程启动时钟（incarnation），PID 复用也能识别残留（Sourcery 第七轮）。
+    // 标记记录 pid + 进程启动时钟（incarnation）+ 状态（pending/completed）：
+    // 已完成的标记永不回收，只有 pending（崩溃未完成）才允许回收（CodeRabbit 第八轮）。
     const stamp = this._localStamp().slice(0, 10) // YYYY-MM-DD
     const statePath = path.join(MessageStore.cacheDir, `${RE2_WARN_STATE_FILE}.${stamp}`)
     const token = JSON.stringify({
       warnedAt: Date.now(),
       pid: process.pid,
-      start: this._getTombstoneProcessStart(process.pid) || '' // Linux 启动时钟；非 Linux 为空
+      start: this._getTombstoneProcessStart(process.pid) || '', // Linux 启动时钟；非 Linux 为空
+      status: 'pending'
     })
     const acquired = this._acquireRe2WarnLock(statePath)
     if (!acquired) return // 拿不到锁（并发竞争/超时）：跳过本次
     let shouldWarn = false
     try {
-      // 锁内重读标记：缺失→创建；残留→删除重建；活跃→跳过
+      // 锁内重读标记：缺失→创建；残留(pending+已退出)→删除重建；活跃/已完成→跳过
       let exists = false
       try { exists = fs.existsSync(statePath) } catch (e) { exists = false }
       if (!exists) {
@@ -3913,7 +3919,7 @@ const App = {
             shouldWarn = true
           } catch (e) { shouldWarn = false }
         } else {
-          shouldWarn = false // 活跃标记：今天已提醒过
+          shouldWarn = false // 活跃标记或已完成：今天已处理过
         }
       }
     } finally {
@@ -3924,14 +3930,25 @@ const App = {
     this._cleanupStaleRe2WarnMarkers()
     console.warn(RE2_MISSING_WARNING)
     this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
-    // 发送结果三态：true 成功保留标记 / false 失败删标记重试 /
-    // undefined 跳过（禁用/限频）保留标记（F4：禁用/限频不是通道故障）
+    // 发送结果三态：true 成功 / false 失败删标记重试 /
+    // undefined 跳过（禁用/限频）——成功与跳过都视为当天已处理，标记置 completed（CodeRabbit 第八轮：
+    // 防止正常进程退出后被误判为残留造成同一天重复提醒）。
     const sent = await this._sendAlert(RE2_MISSING_WARNING)
     if (sent === false) {
       // 只删除自己创建的那份（完整 token 比对，杜绝误删并发进程的标记）
       try {
         if (fs.readFileSync(statePath, 'utf8') === token) fs.unlinkSync(statePath)
       } catch (ignore) { /* 删除失败不影响主流程 */ }
+    } else {
+      // 成功或跳过：标记为 completed（仅当文件仍是我们创建的 pending 标记时）
+      try {
+        const content = fs.readFileSync(statePath, 'utf8')
+        if (content === token) {
+          const completed = JSON.parse(token)
+          completed.status = 'completed'
+          fs.writeFileSync(statePath, JSON.stringify(completed), 'utf8')
+        }
+      } catch (ignore) { /* 更新失败不影响主流程 */ }
     }
   },
 
@@ -3990,15 +4007,17 @@ const App = {
     } catch (ignore) { /* best effort */ }
   },
 
-  // re2 提醒标记是否属于已退出进程（崩溃残留）：
-  // - 标记的 PID 已不存在 → 残留（ESRCH）
-  // - 标记带 Linux 启动时钟且与 /proc/<pid> 的实际启动时钟不一致 → 残留（PID 被复用）
-  // - 其它情况（进程存活/PID 无效/无法解析）→ 保守保留
+  // re2 提醒标记是否属于可回收的崩溃残留（CodeRabbit 第八轮）：
+  // - 仅当标记为 pending（未完成发送）且持有进程已退出时才允许回收；
+  //   completed（已成功发送/跳过）即使进程退出也永不回收，避免同一天重复提醒。
+  // - PID 不存在 → pending 即残留；PID 存活但启动时钟不一致（PID 复用）→ 残留
+  // - 无法解析/PID 无效/状态非 pending → 保守保留
   _isRe2WarnMarkerStale (statePath) {
     let content
     try { content = fs.readFileSync(statePath, 'utf8') } catch (e) { return false }
     let parsed
     try { parsed = JSON.parse(content) } catch (e) { return false }
+    if (!parsed || parsed.status !== 'pending') return false // completed/未知：不回收
     const pid = parsed && Number.isInteger(parsed.pid) ? parsed.pid : 0
     if (pid <= 0) return false
     let alive
