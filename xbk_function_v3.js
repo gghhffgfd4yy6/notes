@@ -3855,7 +3855,16 @@ const App = {
           /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */
           return false // 发送失败（供 _warnMissingRe2 等调用方决定是否撤销标记/重试）
         })
-    } catch (e) { /* 告警失败静默（通道也挂了，无解） */ }
+    } catch (e) {
+      // F1（v3.269 审查）：同步异常（run.log 写失败 / Pusher.send 同步抛错）时
+      // 不能只静默——补写失败原因留痕并返回 false，让调用方能区分
+      // “发送失败”(false)与“跳过”(undefined：禁用/限频/状态读取失败)。
+      const reason = Utils.safeErrorText(e || errMsg, '未知错误').replace(/[\r\n]+/g, ' ').slice(0, 200)
+      try {
+        this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ⚠️ xbk-push 运行异常 原因：${reason}\n`)
+      } catch (logError) { /* 留痕失败静默 */ }
+      return false
+    }
   },
 
   async _warnMissingRe2 () {
@@ -3872,17 +3881,27 @@ const App = {
       fs.writeFileSync(statePath, token, { flag: 'wx' })
     } catch (e) {
       if (e && e.code === 'EEXIST') {
-        // 崩溃残留回收（CodeRabbit：改用 rename 原子认领，避免 unlink 竞态——
-        // 两个进程都判 stale 后，A unlink+重建、B 又 unlink 掉 A 的新标记）。
-        // 认领：把旧标记 rename 到唯一临时路径，原子操作只有一个进程能成功。
-        if (!this._isRe2WarnMarkerStale(statePath)) return // 活跃进程持有：今天已提醒过
+        // 崩溃残留回收（F2：先 rename 原子认领、再检查内容，避免“先判 stale 后 rename”
+        // 竞态——A 判完 stale 后 B 抢先认领重建，A 的 rename 会把 B 的新标记认领走）。
+        // rename 是原子操作，同一时刻只有一个进程能认领成功，天然串行化。
         const reclaimPath = `${statePath}.${process.pid}.${Date.now()}.reclaim`
+        let claimed = false
         try {
           fs.renameSync(statePath, reclaimPath)
+          claimed = true
         } catch (renameError) {
           return // 认领失败（被并发进程抢先 rename/删除）：直接放弃本次
         }
-        try { fs.unlinkSync(reclaimPath) } catch (ignore) { /* 临时认领文件删除失败不阻塞 */ }
+        if (claimed) {
+          // 认领成功后再检查内容：活跃进程的标记 → 放回原位并放弃；残留 → 删除并重建
+          if (!this._isRe2WarnMarkerStale(reclaimPath)) {
+            try { fs.renameSync(reclaimPath, statePath) } catch (putBackError) {
+              try { fs.unlinkSync(reclaimPath) } catch (ignored) { /* 放回失败则删除，避免遗留 */ }
+            }
+            return
+          }
+          try { fs.unlinkSync(reclaimPath) } catch (ignored) { /* 临时认领文件删除失败不阻塞 */ }
+        }
         try {
           fs.writeFileSync(statePath, token, { flag: 'wx' })
         } catch (retryError) {
@@ -3899,11 +3918,13 @@ const App = {
     this._cleanupStaleRe2WarnMarkers()
     console.warn(RE2_MISSING_WARNING)
     this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
-    // 发送失败（通道挂/超时/禁用/同步异常）时删除自己的标记：下一次运行可重新提醒，
-    // 避免“标记已占但用户没收到”导致当天提醒被永久压制（Sourcery）。
-    // 注意：_sendAlert 在告警禁用或同步异常时返回 undefined，必须按“非 true 即失败”处理。
+    // 发送结果三态（v3.269 审查收敛）：
+    // - true：发送成功 → 保留标记（今天已提醒）
+    // - false：发送失败（通道挂/同步异常，F1 已保证同步异常也返回 false）→ 删标记下次重试
+    // - undefined：跳过（告警禁用/限频/状态读取失败）→ 保留标记
+    //   （F4：禁用/限频是配置意图，不是通道故障，不应删标记导致同一天反复提示）
     const sent = await this._sendAlert(RE2_MISSING_WARNING)
-    if (sent !== true) {
+    if (sent === false) {
       try {
         const content = fs.readFileSync(statePath, 'utf8')
         const parsed = JSON.parse(content)
@@ -3912,7 +3933,10 @@ const App = {
     }
   },
 
-  // 清理超过保留期的 re2warn.state.YYYY-MM-DD 标记文件（best-effort；仅删除严格早于 cutoff 的日期）
+  // 清理超过保留期的 re2 标记文件（best-effort；仅删除严格早于 cutoff 的日期）：
+  // - re2warn.state.YYYY-MM-DD（正常按天标记）
+  // - re2warn.state.YYYY-MM-DD.<pid>.<time>.reclaim（F3：崩溃残留的认领临时文件，
+  //   进程在 rename 后、删除前退出会遗留；同样按日期兜底清理，避免永久累积）
   _cleanupStaleRe2WarnMarkers () {
     try {
       const cacheDir = MessageStore.cacheDir
@@ -3921,7 +3945,7 @@ const App = {
       const cutoffStamp = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, '0')}-${String(cutoff.getDate()).padStart(2, '0')}`
       for (const name of fs.readdirSync(cacheDir)) {
         if (!name.startsWith(prefix)) continue
-        const markerStamp = name.slice(prefix.length)
+        const markerStamp = name.slice(prefix.length).split('.')[0] // 取日期段，忽略 .pid.time.reclaim 后缀
         try {
           if (/^\d{4}-\d{2}-\d{2}$/.test(markerStamp) && markerStamp < cutoffStamp) {
             fs.unlinkSync(path.join(cacheDir, name))
