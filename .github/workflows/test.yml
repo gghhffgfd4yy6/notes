@@ -13,6 +13,12 @@ on:
 permissions:
   contents: read
 
+# 同一 PR/分支有新提交时，旧提交的完整矩阵已无参考价值；取消它以释放 runner，
+# 只保留最新提交的质量结果。主分支与每日定时任务各自独立，不会互相取消。
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality:
     runs-on: ubuntu-latest
