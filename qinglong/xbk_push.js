@@ -26,7 +26,8 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
     check()
     return
   } catch (e) {
-    if (!e || e.code !== 'MODULE_NOT_FOUND') throw e
+    // 缺模块与原生 ABI/平台不匹配都可通过重新构建 re2 恢复；其余运行时错误不掩盖。
+    if (!e || (e.code !== 'MODULE_NOT_FOUND' && e.code !== 'ERR_DLOPEN_FAILED')) throw e
     if (!shouldAutoInstallDependencies(env)) {
       throw new Error('检测到 Node.js 依赖或 re2 原生模块未完整安装；请在部署阶段依次执行：npm ci --omit=dev --ignore-scripts && npm run rebuild --prefix node_modules/re2。如确需在本次运行时安装，请显式设置 XBK_AUTO_INSTALL_DEPS=1')
     }

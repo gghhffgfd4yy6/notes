@@ -84,8 +84,8 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
   ensureDependencies({
     requireFn: (id) => {
       if (id.endsWith('/re2') && !re2Ready) {
-        const error = new Error('Cannot find native binding')
-        error.code = 'MODULE_NOT_FOUND'
+        const error = new Error('Native module version mismatch')
+        error.code = 'ERR_DLOPEN_FAILED'
         throw error
       }
       return {}
@@ -97,7 +97,7 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
     },
     env: { XBK_AUTO_INSTALL_DEPS: '1' }
   })
-  assert.strictEqual(commands.length, 2, '自动恢复应先安装依赖，再构建 re2 原生模块')
+  assert.strictEqual(commands.length, 2, '缺模块或 ABI 不匹配时，自动恢复应先安装依赖，再构建 re2 原生模块')
   assert.strictEqual(commands[0][1][0], 'install')
   assert.deepStrictEqual(commands[1][1].slice(0, 3), ['run', 'rebuild', '--prefix'])
   console.log('✅ 青龙入口：re2 缺失会阻止启动，自动恢复后显式构建并复检')
