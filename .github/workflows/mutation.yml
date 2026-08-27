@@ -4,17 +4,59 @@ name: Mutation
 # 长文件按官方行范围语法（file:start-end）拆分防超时：V3 拆 4 段、sendnotify 拆 2 段。
 # 增量模式：每 job 独立缓存（reports/inc-*.json），首次全量、之后只跑 diff 部分。
 # 免费 runner 单任务上限 6h——每段预估 1-2h，余量充足。
-# 触发方式：手动（Actions → Mutation → Run workflow）+ 每日自动（北京时间 0:00 = UTC 16:00）
+# 触发方式：workflow 文件变更 push、手动（Actions → Mutation → Run workflow）和每日自动。
+# 主任务避开 UTC 整点：北京时间 00:17 = UTC 16:17；北京时间 12:17 仅在当天无成功或进行中主任务时补跑。
 on:
   push:
     paths:
       - '.github/workflows/mutation.yml'
   workflow_dispatch:
   schedule:
-    - cron: '0 16 * * *'
+    - cron: '17 16 * * *'
+    - cron: '17 4 * * *'
 
 jobs:
+  # GitHub schedule 是尽力调度。中午补偿任务查询同日任意触发方式下成功或未完成的运行，
+  # 避免重复执行手动/push 触发的变异测试；主 cron、手动和 push 始终运行。
+  decide-run:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          # 只有中午补偿 cron 需要判定；其他 schedule 新旧主任务均默认执行，避免主 cron 双点维护。
+          if [ "$EVENT_NAME" != "schedule" ] || [ "$SCHEDULE" != "17 4 * * *" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TODAY_SH=$(TZ=Asia/Shanghai date +%F)
+          START=$(TZ=Asia/Shanghai date -d "$TODAY_SH 00:00:00" +%s)
+          END=$((START + 86400))
+          # GitHub 返回 UTC createdAt，按上海自然日的 epoch 边界比较，不能直接做日期字符串前缀匹配。
+          # 排除当前补偿运行本身；已有成功结果或任意未完成的同日运行时都不补跑，避免重叠或重复。
+          RUNS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow mutation.yml --limit 100 --json databaseId,createdAt,status,conclusion)
+          ACTIVE_OR_SUCCESS=$(printf '%s' "$RUNS" | jq --argjson start "$START" --argjson end "$END" --arg current "$CURRENT_RUN_ID" \
+            '[.[] | select((.databaseId | tostring) != $current and (.createdAt | fromdateiso8601) >= $start and (.createdAt | fromdateiso8601) < $end and (.conclusion == "success" or .status != "completed"))] | length')
+          if [ "$ACTIVE_OR_SUCCESS" -gt 0 ]; then
+            echo "当天已有成功或未完成的 Mutation，跳过中午补偿"
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "当天没有成功或未完成的 Mutation，执行中午补偿"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   mutation:
+    needs: decide-run
+    if: needs.decide-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -92,8 +134,8 @@ jobs:
 
   # 汇总各段变异报告 → 发日报 Issue（每日定时自动汇报，手动触发也发）
   report:
-    needs: mutation
-    if: always()
+    needs: [decide-run, mutation]
+    if: always() && needs.decide-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     # 发日报 Issue 需要 issues: write（Actions 默认 GITHUB_TOKEN 可能 read-only → 403 失败）
     permissions:
