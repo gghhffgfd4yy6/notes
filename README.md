@@ -41,8 +41,10 @@
 ## 🚀 快速开始
 
 ```bash
-# ① 安装官方 HTTP 客户端依赖
+# ① 安装依赖；--ignore-scripts 后需显式构建 re2，保证过滤规则可用
 npm install --ignore-scripts
+npm run rebuild --prefix node_modules/re2
+node -e "const RE2=require('re2'); if (!new RE2('^ok$').test('ok')) process.exit(1)"
 
 # ② 配置推送密钥（本地文件，不入库，已 gitignore）
 cp push_config.local.js.example push_config.local.js
@@ -92,9 +94,11 @@ node qinglong/xbk_push.js
 
 ```bash
 npm ci --omit=dev --ignore-scripts
+npm run rebuild --prefix node_modules/re2
+node -e "const RE2=require('re2'); if (!new RE2('^ok$').test('ok')) process.exit(1)"
 ```
 
-依赖缺失时，入口默认退出并提示部署命令，避免定时任务运行时联网修改依赖树。仅在明确接受该风险的临时环境中，才可设置 `XBK_AUTO_INSTALL_DEPS=1` 允许入口以 `npm install --production --ignore-scripts` 自动恢复依赖。缓存、运行日志和状态文件仍写入项目根目录下的 `xianbaoku_cache/`，不会受青龙任务当前工作目录影响。
+`re2` 是用户过滤规则的安全正则引擎；由于安装使用 `--ignore-scripts`，必须显式构建并校验它，否则脚本会为防止 ReDoS 而跳过所有用户正则规则。依赖或 `re2` 原生模块缺失时，入口默认退出并提示部署命令，避免定时任务带着失效过滤继续运行。仅在明确接受该风险的临时环境中，才可设置 `XBK_AUTO_INSTALL_DEPS=1`：入口会执行 `npm install --production --ignore-scripts`，随后自动构建并验证 `re2`。缓存、运行日志和状态文件仍写入项目根目录下的 `xianbaoku_cache/`，不会受青龙任务当前工作目录影响。
 
 该入口现在是**常驻模式**：进程启动时加载一次主程序、got、Agent、DNS 缓存和连接池；每轮完成后等待配置间隔，再重新拉取接口。每完成一组轮询后，会在等待期间后台刷新线报接口和 WxPusher 的 DNS，并预热少量 TLS 连接；刷新任务有独立超时和停止信号边界，不会无限阻塞下一轮或安全停止。单轮失败会按错误类型处理：网络抖动、超时、限流和服务端暂时故障有限重试；明确的配置、权限、参数、地址或响应格式错误立即停止并返回非零退出状态；推送全部失败时也会进入同一分类流程。部分通道成功仍按成功处理，成功一轮会清零连续失败状态。DNS/TLS 性能预热失败只记录，不触发业务熔断。收到青龙停止信号（SIGTERM/SIGINT）时，会在当前轮完成后安全停止，不强杀正在进行的推送。
 
