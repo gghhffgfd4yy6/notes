@@ -28,11 +28,13 @@ jobs:
       - id: decide
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           SCHEDULE: ${{ github.event.schedule }}
           CURRENT_RUN_ID: ${{ github.run_id }}
         run: |
-          if [ "$EVENT_NAME" != "schedule" ] || [ "$SCHEDULE" = "17 16 * * *" ]; then
+          # 只有中午补偿 cron 需要判定；其他 schedule 新旧主任务均默认执行，避免主 cron 双点维护。
+          if [ "$EVENT_NAME" != "schedule" ] || [ "$SCHEDULE" != "17 4 * * *" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -41,7 +43,7 @@ jobs:
           END=$((START + 86400))
           # GitHub 返回 UTC createdAt，按上海自然日的 epoch 边界比较，不能直接做日期字符串前缀匹配。
           # 排除当前补偿运行本身；已有成功结果或另一条仍 queued/in_progress 的定时运行时都不补跑，避免重叠。
-          RUNS=$(gh run list --workflow mutation.yml --event schedule --limit 100 --json databaseId,createdAt,status,conclusion)
+          RUNS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow mutation.yml --event schedule --limit 100 --json databaseId,createdAt,status,conclusion)
           ACTIVE_OR_SUCCESS=$(printf '%s' "$RUNS" | jq --argjson start "$START" --argjson end "$END" --arg current "$CURRENT_RUN_ID" \
             '[.[] | select((.databaseId | tostring) != $current and (.createdAt | fromdateiso8601) >= $start and (.createdAt | fromdateiso8601) < $end and (.conclusion == "success" or .status == "queued" or .status == "in_progress"))] | length')
           if [ "$ACTIVE_OR_SUCCESS" -gt 0 ]; then
