@@ -10,16 +10,5 @@ mutation-report.json
 cleanup_rootfs_junk.sh
 .tmp_parallel_*.json
 
-# .ai/ 默认不跟踪（运行时状态/中间产物），只显式跟踪"跨 session 必须共享"的规范和 skill
-.ai/*
-!.ai/README.md
-!.ai/REVIEW_CHECKLIST.md
-!.ai/skills/
-!.ai/skills/**
-
-# .ai 下运行时状态显式忽略（白名单后防止误跟踪）
-.ai/state.json
-.ai/candidates/
-.ai/runtime/
-.ai/reports/
-.ai/agent_reports/
+# AI 审查运行时产物不入库
+.ai/
