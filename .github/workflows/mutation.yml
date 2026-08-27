@@ -4,14 +4,15 @@ name: Mutation
 # 长文件按官方行范围语法（file:start-end）拆分防超时：V3 拆 4 段、sendnotify 拆 2 段。
 # 增量模式：每 job 独立缓存（reports/inc-*.json），首次全量、之后只跑 diff 部分。
 # 免费 runner 单任务上限 6h——每段预估 1-2h，余量充足。
-# 触发方式：手动（Actions → Mutation → Run workflow）+ 每日自动（北京时间 0:00 = UTC 16:00）
+# 触发方式：手动（Actions → Mutation → Run workflow）+ 每日自动。
+# GitHub 在整点常有排队或丢弃定时任务的情况，避开 UTC 整点：北京时间 00:17 = UTC 16:17。
 on:
   push:
     paths:
       - '.github/workflows/mutation.yml'
   workflow_dispatch:
   schedule:
-    - cron: '0 16 * * *'
+    - cron: '17 16 * * *'
 
 jobs:
   mutation:
