@@ -32,6 +32,8 @@ node qinglong/xbk_push.js
 
 主配置在 `xbk_function_v3.js` 顶部；本地密钥在 `push_config.local.js`。支持 Push+、Server酱、Bark、企业微信、WxPusher、息知、PushDeer、Telegram 等通道。
 
+常用通知环境变量：`PUSH_PLUS_TOKEN`、`PUSH_KEY`、`BARK_PUSH`、`QYWX_KEY`、`WX_PUSHER_APP_TOKEN`、`WX_PUSHER_TOPIC_IDS`、`WX_XIZHI_KEY`、`DEER_KEY`、`PUSHME_KEY`、`TG_BOT_TOKEN`、`TG_USER_ID`。
+
 常用过滤配置：
 
 ```js
