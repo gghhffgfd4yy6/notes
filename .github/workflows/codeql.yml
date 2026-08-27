@@ -10,9 +10,9 @@ on:
   schedule:
     - cron: '0 12 * * 1'   # 每周一 12:00 UTC 定期扫描
 
-# 新提交到达时取消旧提交的扫描；定时扫描以 ref 独立分组保留，不影响安全巡检。
+# 同一事件类型下新提交到达时取消旧提交的扫描；定时扫描独立分组，不影响安全巡检。
 concurrency:
-  group: codeql-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: codeql-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
