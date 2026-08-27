@@ -16,8 +16,8 @@ on:
     - cron: '17 4 * * *'
 
 jobs:
-  # GitHub schedule 是尽力调度。中午补偿任务查询同日成功或未完成的 schedule 运行，
-  # 不重复执行手动/push 触发的变异测试；主 cron、手动和 push 始终运行。
+  # GitHub schedule 是尽力调度。中午补偿任务查询同日任意触发方式下成功或未完成的运行，
+  # 避免重复执行手动/push 触发的变异测试；主 cron、手动和 push 始终运行。
   decide-run:
     runs-on: ubuntu-latest
     permissions:
@@ -42,15 +42,15 @@ jobs:
           START=$(TZ=Asia/Shanghai date -d "$TODAY_SH 00:00:00" +%s)
           END=$((START + 86400))
           # GitHub 返回 UTC createdAt，按上海自然日的 epoch 边界比较，不能直接做日期字符串前缀匹配。
-          # 排除当前补偿运行本身；已有成功结果或任意未完成的同日定时运行时都不补跑，避免重叠。
-          RUNS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow mutation.yml --event schedule --limit 100 --json databaseId,createdAt,status,conclusion)
+          # 排除当前补偿运行本身；已有成功结果或任意未完成的同日运行时都不补跑，避免重叠或重复。
+          RUNS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow mutation.yml --limit 100 --json databaseId,createdAt,status,conclusion)
           ACTIVE_OR_SUCCESS=$(printf '%s' "$RUNS" | jq --argjson start "$START" --argjson end "$END" --arg current "$CURRENT_RUN_ID" \
             '[.[] | select((.databaseId | tostring) != $current and (.createdAt | fromdateiso8601) >= $start and (.createdAt | fromdateiso8601) < $end and (.conclusion == "success" or .status != "completed"))] | length')
           if [ "$ACTIVE_OR_SUCCESS" -gt 0 ]; then
-            echo "当天已有成功或未完成的定时 Mutation，跳过中午补偿"
+            echo "当天已有成功或未完成的 Mutation，跳过中午补偿"
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           else
-            echo "当天没有成功或进行中的定时 Mutation，执行中午补偿"
+            echo "当天没有成功或未完成的 Mutation，执行中午补偿"
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           fi
 
