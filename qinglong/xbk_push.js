@@ -17,18 +17,20 @@ function shouldAutoInstallDependencies (env = process.env) {
 // 安装命令刻意使用 --ignore-scripts 防供应链风险，但这也会跳过 re2 原生模块构建；
 // 因此必须显式构建并加载校验，不能只因 got 可用就带着“所有正则规则被跳过”的状态启动。
 function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env = process.env } = {}) {
-  const dependencyPath = (name) => path.join(ROOT, 'node_modules', name)
-  const load = (name) => {
+  // 固定依赖路径：入口不会将外部输入拼入模块或构建路径。
+  const gotPath = path.join(ROOT, 'node_modules', 'got')
+  const re2Path = path.join(ROOT, 'node_modules', 're2')
+  const load = (name, modulePath) => {
     try {
       // 不只检查 require.resolve：got 的传递依赖、re2 的原生 .node 缺失时，真正 require 才能发现。
-      requireFn(dependencyPath(name))
+      requireFn(modulePath)
       return null
     } catch (error) {
       return error
     }
   }
   const isRecoverable = (error) => error && (error.code === 'MODULE_NOT_FOUND' || error.code === 'ERR_DLOPEN_FAILED')
-  const initial = { got: load('got'), re2: load('re2') }
+  const initial = { got: load('got', gotPath), re2: load('re2', re2Path) }
   if (!initial.got && !initial.re2) return
   const initialError = initial.got || initial.re2
   // 缺模块与原生 ABI/平台不匹配都可通过重新安装/构建恢复；其余运行时错误不掩盖。
@@ -52,17 +54,17 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
   if (install.status !== 0) throw new Error(`npm install 失败，退出码 ${install.status}`)
 
   // 仅当安装后 re2 仍无法加载才构建：单纯 got 缺失但 re2 正常时，不要求无关的 C++ 构建环境。
-  const re2AfterInstall = load('re2')
+  const re2AfterInstall = load('re2', re2Path)
   if (re2AfterInstall) {
     if (!isRecoverable(re2AfterInstall)) throw re2AfterInstall
     const rebuild = spawnSyncFn(npm, [
-      'run', 'rebuild', '--prefix', dependencyPath('re2')
+      'run', 'rebuild', '--prefix', re2Path
     ], { cwd: ROOT, stdio: 'inherit', timeout: 120000 })
     if (rebuild.error) throw rebuild.error
     if (rebuild.status !== 0) throw new Error(`re2 原生模块构建失败，退出码 ${rebuild.status}`)
   }
 
-  const recovered = { got: load('got'), re2: load('re2') }
+  const recovered = { got: load('got', gotPath), re2: load('re2', re2Path) }
   if (recovered.got || recovered.re2) {
     const failed = recovered.got ? 'got' : 're2'
     const error = recovered[failed]
