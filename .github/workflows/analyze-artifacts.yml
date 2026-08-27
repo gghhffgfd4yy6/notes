@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: 'mutation workflow run ID（留空 = 自动取最新）'
+        description: 'mutation workflow run ID（留空 = 自动取最新成功运行）'
         required: false
         type: string
 
@@ -33,7 +33,8 @@ jobs:
             esac
             echo "run_id=$RUN_ID_INPUT" >> "$GITHUB_OUTPUT"
           else
-            echo "run_id=$(gh run list --workflow=mutation.yml --limit=1 --json databaseId --jq '.[0].databaseId')" >> "$GITHUB_OUTPUT"
+            # 默认只选已成功完成的运行，避免下载仍在执行中的不完整 artifact；显式 run_id 不受此限制。
+            echo "run_id=$(gh run list --workflow=mutation.yml --status=success --limit=1 --json databaseId --jq '.[0].databaseId')" >> "$GITHUB_OUTPUT"
           fi
       - name: 下载全部变异报告
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5.0.0
