@@ -1,6 +1,7 @@
 'use strict'
 
 const assert = require('assert')
+const path = require('path')
 const { runLoop } = require('./xbk_loop')
 const { ensureDependencies } = require('./qinglong/xbk_push')
 
@@ -69,7 +70,7 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
   // 入口必须把 re2 当作必需运行依赖检查，缺失时拒绝带着“正则全部跳过”的状态启动。
   assert.throws(() => ensureDependencies({
     requireFn: (id) => {
-      if (id.endsWith('/re2')) {
+      if (path.basename(id) === 're2') {
         const error = new Error('Cannot find native binding')
         error.code = 'MODULE_NOT_FOUND'
         throw error
@@ -77,13 +78,13 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
       return {}
     },
     env: {}
-  }), /re2 原生模块未完整安装/, 'got 正常但 re2 不可加载时应明确阻止启动')
+  }), /re2 依赖或原生模块未完整安装/, 'got 正常但 re2 不可加载时应明确阻止启动')
 
   const commands = []
   let re2Ready = false
   ensureDependencies({
     requireFn: (id) => {
-      if (id.endsWith('/re2') && !re2Ready) {
+      if (path.basename(id) === 're2' && !re2Ready) {
         const error = new Error('Native module version mismatch')
         error.code = 'ERR_DLOPEN_FAILED'
         throw error
@@ -100,7 +101,28 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
   assert.strictEqual(commands.length, 2, '缺模块或 ABI 不匹配时，自动恢复应先安装依赖，再构建 re2 原生模块')
   assert.strictEqual(commands[0][1][0], 'install')
   assert.deepStrictEqual(commands[1][1].slice(0, 3), ['run', 'rebuild', '--prefix'])
-  console.log('✅ 青龙入口：re2 缺失会阻止启动，自动恢复后显式构建并复检')
+
+  const gotOnlyCommands = []
+  let gotReady = false
+  ensureDependencies({
+    requireFn: (id) => {
+      if (path.basename(id) === 'got' && !gotReady) {
+        const error = new Error('Cannot find module got')
+        error.code = 'MODULE_NOT_FOUND'
+        throw error
+      }
+      return {}
+    },
+    spawnSyncFn: (cmd, args) => {
+      gotOnlyCommands.push([cmd, args])
+      if (args[0] === 'install') gotReady = true
+      return { status: 0 }
+    },
+    env: { XBK_AUTO_INSTALL_DEPS: '1' }
+  })
+  assert.strictEqual(gotOnlyCommands.length, 1, '仅 got 缺失且 re2 可用时不得触发无关的 re2 构建')
+  assert.strictEqual(gotOnlyCommands[0][1][0], 'install')
+  console.log('✅ 青龙入口：re2 缺失会阻止启动，自动恢复按实际失败依赖构建并复检')
 
   console.log('✅ 常驻循环：单轮异常不中断，停止信号在当前轮结束后生效，定期刷新与等待并行')
 })()
