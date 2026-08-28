@@ -1,6 +1,6 @@
 {
   "name": "xbk-push",
-  "version": "3.269.0",
+  "version": "3.270.0",
   "description": "\u7ebf\u62a5\u9177\u63a8\u9001\u811a\u672c\u2014\u2014\u89c4\u5219\u8fc7\u6ee4 + \u591a\u901a\u9053\u63a8\u9001 + \u53bb\u91cd\u7f13\u5b58 + \u8fd0\u884c\u65e5\u5fd7 + \u5b8c\u6574\u6d4b\u8bd5\u4f53\u7cfb",
   "main": "xbk_function_v3.js",
   "scripts": {
@@ -21,7 +21,8 @@
     "test:dns": "node test_dns_cache.js",
     "test:tls-prewarm": "node test_tls_prewarm.js",
     "test:mutation": "stryker run",
-    "check": "npm run lint && node check-version.js && npm test",
+    "test:mutation-ranges": "node scripts/check-mutation-ranges.js",
+    "check": "npm run lint && node check-version.js && node scripts/check-mutation-ranges.js && npm test",
     "verify": "npm run check"
   },
   "dependencies": {

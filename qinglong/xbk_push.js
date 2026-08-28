@@ -111,7 +111,16 @@ async function refreshConnections (app, signal) {
 
 let residentExitCode = 0
 let consecutiveRetryableFailures = 0
-const MAX_CONSECUTIVE_RETRYABLE_FAILURES = 3
+// v3.270：可重试失败退避上限。旧「连续 3 轮可重试错误即退出常驻」在 DNS/网络/上游 5xx 等
+// 可恢复故障下依赖外部重启器兜底，青龙未配置失败自动重启时会永久停摆、后续全部漏推。
+// 现改为进程内指数退避持续重试（默认 30 分钟封顶），仅不可恢复（permanent）错误退出。
+const DEFAULT_RETRY_BACKOFF_CAP_MS = 30 * 60 * 1000
+
+function retryBackoffMs (count, env = process.env) {
+  const capRaw = Number(env && env.XBK_RETRY_BACKOFF_CAP_MS)
+  const cap = Number.isFinite(capRaw) && capRaw >= 1 ? capRaw : DEFAULT_RETRY_BACKOFF_CAP_MS
+  return Math.min(cap, 1000 * (2 ** (Math.min(count, 31) - 1)))
+}
 
 async function runResident (app, controller) {
   residentExitCode = 0
@@ -145,15 +154,10 @@ async function runResident (app, controller) {
     }
 
     consecutiveRetryableFailures += 1
-    console.error(`本轮遇到可重试错误（${decision.reason}），连续失败 ${consecutiveRetryableFailures}/${MAX_CONSECUTIVE_RETRYABLE_FAILURES}：${detail}`)
-    if (consecutiveRetryableFailures >= MAX_CONSECUTIVE_RETRYABLE_FAILURES) {
-      residentExitCode = 1
-      console.error(`连续 ${MAX_CONSECUTIVE_RETRYABLE_FAILURES} 轮可重试错误仍未恢复，停止常驻`)
-      controller.abort()
-      return
-    }
-    // 即使轮询间隔被设置为 0，失败重试也必须留出退避时间，避免快速空转打爆接口。
-    const backoffMs = Math.min(30000, 1000 * (2 ** (consecutiveRetryableFailures - 1)))
+    // v3.270：即使轮询间隔被设置为 0，失败重试也必须留出退避时间，避免快速空转打爆接口。
+    // 不再「连续 3 轮退出」：指数退避持续重试，恢复成功后由 runOnce 清零，仅 permanent 错误退出。
+    const backoffMs = retryBackoffMs(consecutiveRetryableFailures)
+    console.error(`本轮遇到可重试错误（${decision.reason}），连续失败 ${consecutiveRetryableFailures} 次，${Math.round(backoffMs / 1000)}s 后重试：${detail}`)
     await sleep(backoffMs, controller.signal)
   }
 
@@ -189,7 +193,7 @@ async function main () {
     process.removeListener('SIGINT', stop)
   }
   if (residentExitCode !== 0) process.exitCode = residentExitCode
-  console.log(residentExitCode === 0 ? '青龙常驻模式已停止' : '青龙常驻模式因连续/不可恢复错误停止')
+  console.log(residentExitCode === 0 ? '青龙常驻模式已停止' : '青龙常驻模式因不可恢复错误停止')
 }
 
 if (require.main === module) {
@@ -199,4 +203,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { classifyFailure, classifySummary, runResident, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies }
+module.exports = { classifyFailure, classifySummary, runResident, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs }
