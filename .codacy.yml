@@ -1,0 +1,7 @@
+---
+# check-mutation-ranges.js 是本地/CI 行段覆盖校验脚本：
+# 按 mutation.yml 内容动态读仓库内文件是其本职工作，且已做
+# path.resolve + 仓库根前缀校验（运行时防护），静态路径告警属误报。
+# 详细说明见 PR #34 及脚本头部注释。
+exclude_paths:
+  - "scripts/check-mutation-ranges.js"

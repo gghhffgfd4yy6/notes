@@ -11,7 +11,7 @@ const fs = require('fs')
 const path = require('path')
 
 const root = path.resolve(__dirname, '..')
-const yml = fs.readFileSync(path.join(root, '.github/workflows/mutation.yml'), 'utf8')
+const yml = fs.readFileSync(path.join(root, '.github/workflows/mutation.yml'), 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
 
 // 收集 yml 中形如 "file.js:start-end" 的行段（含引号），按文件聚合
 const rangeRe = /"([\w/.-]+\.(?:js|mjs|cjs)):(\d+)-(\d+)"/g
@@ -37,13 +37,13 @@ for (const [file, ranges] of fileRanges) {
     failed = true
     continue
   }
-  if (!fs.existsSync(filePath)) {
+  if (!fs.existsSync(filePath)) { // nosemgrep（filePath 已做 resolve + 仓库根前缀校验，运行时防护到位）
     console.error(`❌ ${file}: mutation.yml 引用的文件不存在`)
     failed = true
     continue
   }
   // 行数口径与 wc -l 一致：以换行符计数，末尾换行不额外算一行
-  const raw = fs.readFileSync(filePath, 'utf8')
+  const raw = fs.readFileSync(filePath, 'utf8') // nosemgrep（同上：运行时已校验路径在仓库根目录内）
   const actualLines = raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
   const sorted = ranges.slice().sort((a, b) => a.start - b.start)
 
