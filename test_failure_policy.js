@@ -143,11 +143,22 @@ function error (message, code) {
 
     let transientRuns = 0
     const transientController = new AbortController()
-    await runResident({
+    // v3.270：可重试错误不再「三轮退出」，改为持续退避重试。
+    // 通过把退避封顶调到极小值验证多轮重试（真实默认封顶 30 分钟）。
+    process.env.XBK_RETRY_BACKOFF_CAP_MS = '1'
+    const transientApp = {
       num: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
-      run: async () => { transientRuns++; throw error('连接超时', 'ETIMEDOUT') }
-    }, transientController)
-    assert.strictEqual(transientRuns, 3, '可重试错误应达到三轮后停止')
+      run: async () => {
+        transientRuns++
+        if (transientRuns >= 5) {
+          transientController.abort()
+          return { total: 0, pushed: 0, failed: 0, failures: [] }
+        }
+        throw error('连接超时', 'ETIMEDOUT')
+      }
+    }
+    await runResident(transientApp, transientController)
+    assert.strictEqual(transientRuns, 5, '可重试错误应持续退避重试而非三轮后退出')
     assert.strictEqual(transientController.signal.aborted, true)
 
     let recoveryRuns = 0
@@ -168,7 +179,7 @@ function error (message, code) {
     else process.env.XBK_INTERVAL_MS = oldInterval
   }
 
-  console.log('✅ 常驻失败策略：网络错误有限重试、永久错误立即停止、部分成功不熔断、成功后恢复')
+  console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分成功不熔断、成功后恢复')
 })().catch(error => {
   console.error(error)
   process.exit(1)
