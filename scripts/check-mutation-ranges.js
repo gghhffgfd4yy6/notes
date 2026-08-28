@@ -42,8 +42,15 @@ for (const [file, ranges] of fileRanges) {
     failed = true
     continue
   }
-  // 行数口径与 wc -l 一致：以换行符计数，末尾换行不额外算一行
-  const raw = fs.readFileSync(filePath, 'utf8') // nosemgrep（同上：运行时已校验路径在仓库根目录内）
+  // 读取失败（如 yml 指向目录、权限问题）必须转为校验失败，不能让脚本崩溃
+  let raw
+  try {
+    raw = fs.readFileSync(filePath, 'utf8') // nosemgrep（filePath 已做 resolve + 仓库根前缀校验，运行时防护到位）
+  } catch (err) {
+    console.error(`❌ ${file}: 读取失败 —— ${err.message}`)
+    failed = true
+    continue
+  }
   const actualLines = raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
   const sorted = ranges.slice().sort((a, b) => a.start - b.start)
 
