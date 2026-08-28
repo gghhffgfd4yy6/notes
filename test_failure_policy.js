@@ -130,6 +130,7 @@ function error (message, code) {
   }), null, '部分成功且仅临时失败时保持继续')
 
   const oldInterval = process.env.XBK_INTERVAL_MS
+  const oldBackoffCap = process.env.XBK_RETRY_BACKOFF_CAP_MS
   process.env.XBK_INTERVAL_MS = '0'
   try {
     let permanentRuns = 0
@@ -177,6 +178,8 @@ function error (message, code) {
   } finally {
     if (oldInterval === undefined) delete process.env.XBK_INTERVAL_MS
     else process.env.XBK_INTERVAL_MS = oldInterval
+    if (oldBackoffCap === undefined) delete process.env.XBK_RETRY_BACKOFF_CAP_MS
+    else process.env.XBK_RETRY_BACKOFF_CAP_MS = oldBackoffCap
   }
 
   console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分成功不熔断、成功后恢复')

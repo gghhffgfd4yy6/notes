@@ -29,7 +29,14 @@ if (fileRanges.size === 0) {
 
 let failed = false
 for (const [file, ranges] of fileRanges) {
-  const filePath = path.join(root, file)
+  let fileFailed = false
+  // 路径加固：解析后必须仍在仓库根目录内，拒绝 yml 里的越界路径
+  const filePath = path.resolve(root, file)
+  if (!filePath.startsWith(root + path.sep)) {
+    console.error(`❌ ${file}: 路径越出仓库根目录，拒绝处理`)
+    failed = true
+    continue
+  }
   if (!fs.existsSync(filePath)) {
     console.error(`❌ ${file}: mutation.yml 引用的文件不存在`)
     failed = true
@@ -40,24 +47,31 @@ for (const [file, ranges] of fileRanges) {
   const actualLines = raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
   const sorted = ranges.slice().sort((a, b) => a.start - b.start)
 
-  // 校验 1：连续无缝隙、不重叠
+  // 校验 1：首段必须从第 1 行开始（防头部静默漏测）
+  if (sorted[0].start !== 1) {
+    console.error(`❌ ${file}: 首段从第 ${sorted[0].start} 行开始 —— 第 1-${sorted[0].start - 1} 行未被变异测试覆盖`)
+    fileFailed = true
+  }
+
+  // 校验 2：连续无缝隙、不重叠
   for (let i = 1; i < sorted.length; i++) {
     if (sorted[i].start !== sorted[i - 1].end + 1) {
       console.error(`❌ ${file}: 行段不连续 —— ${sorted[i - 1].start}-${sorted[i - 1].end} 与 ${sorted[i].start}-${sorted[i].end} 之间有缝隙或重叠`)
-      failed = true
+      fileFailed = true
     }
   }
 
-  // 校验 2：最后一段必须覆盖到实际行数（文件增长检测）
+  // 校验 3：最后一段必须覆盖到实际行数（文件增长检测）
   const coveredEnd = sorted[sorted.length - 1].end
   if (coveredEnd < actualLines) {
     console.error(`❌ ${file}: 行段止于 ${coveredEnd}，但文件实际 ${actualLines} 行 —— 尾部 ${actualLines - coveredEnd} 行未被变异测试覆盖（v3.270 教训）`)
-    failed = true
+    fileFailed = true
   } else if (coveredEnd > actualLines) {
     console.error(`⚠️  ${file}: 行段止于 ${coveredEnd}，超过文件实际行数 ${actualLines}（不算错误，但建议收紧）`)
   }
 
-  if (!failed) {
+  if (fileFailed) failed = true
+  if (!fileFailed) {
     const segs = sorted.map(r => `${r.start}-${r.end}`).join(', ')
     console.log(`✅ ${file}: ${actualLines} 行，${sorted.length} 段全覆盖 [${segs}]`)
   }
