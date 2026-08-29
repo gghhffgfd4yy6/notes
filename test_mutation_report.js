@@ -57,6 +57,11 @@ const EMPTY_CASE = [
 ]
 
 let pass = 0
+/**
+ * 执行一项同步断言并累计通过数量。
+ * @param {string} name 测试名称
+ * @param {Function} fn 测试函数
+ */
 function check (name, fn) {
   try { fn(); pass++ } catch (e) { console.error(`❌ ${name}\n   ${e.message}`); process.exitCode = 1 }
 }
@@ -113,10 +118,14 @@ check('render 输出快照（全被杀 → 🎉 无存活变异体分支）', ()
   assert.strictEqual(render(EMPTY_CASE), expected)
 })
 
-check('日报日期按 Asia/Shanghai 自然日计算', () => {
+/**
+ * 验证日报在上海时区跨 UTC 日期边界时仍使用正确自然日。
+ */
+function testShanghaiDate () {
   // UTC 16:17 已是北京时间次日 00:17，不能继续使用 UTC 日期。
   assert.strictEqual(shanghaiDate(new Date('2026-08-28T16:17:00.000Z')), '2026-08-29')
   assert.strictEqual(shanghaiDate(new Date('2026-08-29T04:17:00.000Z')), '2026-08-29')
-})
+}
+check('日报日期按 Asia/Shanghai 自然日计算', testShanghaiDate)
 
 console.log(`\n🎉 test_mutation_report.js 全部通过（${pass} 项）`)
