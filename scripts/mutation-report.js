@@ -221,7 +221,7 @@ async function postIssue (body) {
   const token = process.env.GITHUB_TOKEN
   if (!token) throw new Error('缺少 GITHUB_TOKEN')
   const repo = process.env.GITHUB_REPOSITORY || 'junhanw868-bot/notes'
-  const today = new Date().toISOString().slice(0, 10)
+  const today = shanghaiDate()
   const title = `🧬 变异测试日报 ${today}`
   // 同天去重：当天已有日报则跳过（避免多次运行重复发 Issue）
   const listRes = await fetch(`https://api.github.com/repos/${repo}/issues?state=all&per_page=100&creator=github-actions%5Bbot%5D`, {
@@ -246,6 +246,14 @@ async function postIssue (body) {
     throw new Error(`发 Issue 失败，HTTP 状态码：${res.status}`)
   }
   return res.json()
+}
+
+// GitHub Actions 的 Mutation workflow 按北京时间调度；日报标题和同日去重也必须使用同一自然日。
+// 不使用 toISOString()，因为它固定按 UTC 格式化，在北京时间 00:00-07:59 会落到前一天。
+function shanghaiDate (now = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai'
+  }).format(now)
 }
 
 async function main () {
@@ -282,4 +290,4 @@ if (require.main === module) {
 }
 
 // 导出供测试（不导出 main/postIssue：前者依赖 CLI 副作用、后者侧效应无关单元行为）
-module.exports = { analyze, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render }
+module.exports = { analyze, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate }
