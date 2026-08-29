@@ -4,7 +4,7 @@
 // 目标：拆 render 之前先固化为 markdown 快照；拆分后行为必须字节级一致。
 // 同时覆盖日报日期的 Asia/Shanghai 跨 UTC 日期边界。
 const assert = require('node:assert')
-const { render, shanghaiDate } = require('./scripts/mutation-report.js')
+const { render, validateSegments, shanghaiDate } = require('./scripts/mutation-report.js')
 
 // Fixture：3 段（正常 + 错误 + 全被杀）→ 覆盖全部 6 条核心分支
 //   1) 段汇总表（正常行）
@@ -127,5 +127,17 @@ function testShanghaiDate () {
   assert.strictEqual(shanghaiDate(new Date('2026-08-29T04:17:00.000Z')), '2026-08-29')
 }
 check('日报日期按 Asia/Shanghai 自然日计算', testShanghaiDate)
+
+check('缺少变异测试分段时拒绝发布不完整日报', () => {
+  assert.throws(
+    () => validateSegments([{ seg: 'v3-part1' }], ['v3-part1', 'v3-part2']),
+    /缺少分段：v3-part2/
+  )
+})
+
+check('变异测试分段完整时允许生成日报', () => {
+  const results = Array.from({ length: 13 }, (_, index) => ({ seg: `segment-${index}` }))
+  assert.deepStrictEqual(validateSegments(results, results.map(result => result.seg)), results)
+})
 
 console.log(`\n🎉 test_mutation_report.js 全部通过（${pass} 项）`)
