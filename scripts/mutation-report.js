@@ -217,11 +217,16 @@ function render (results) {
   return lines.join('\n')
 }
 
+/**
+ * 汇总日报并按上海自然日创建或复用 GitHub Issue。
+ * @param {string} body 已渲染的日报 Markdown
+ * @returns {Promise<object>} 新建或已存在的 Issue 信息
+ */
 async function postIssue (body) {
   const token = process.env.GITHUB_TOKEN
   if (!token) throw new Error('缺少 GITHUB_TOKEN')
   const repo = process.env.GITHUB_REPOSITORY || 'junhanw868-bot/notes'
-  const today = new Date().toISOString().slice(0, 10)
+  const today = shanghaiDate()
   const title = `🧬 变异测试日报 ${today}`
   // 同天去重：当天已有日报则跳过（避免多次运行重复发 Issue）
   const listRes = await fetch(`https://api.github.com/repos/${repo}/issues?state=all&per_page=100&creator=github-actions%5Bbot%5D`, {
@@ -246,6 +251,17 @@ async function postIssue (body) {
     throw new Error(`发 Issue 失败，HTTP 状态码：${res.status}`)
   }
   return res.json()
+}
+
+/**
+ * 将时间转换为上海时区的 ISO 日期（YYYY-MM-DD）。
+ * @param {Date} [now=new Date()] 待格式化时间
+ * @returns {string} 上海自然日
+ */
+function shanghaiDate (now = new Date()) {
+  return new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Shanghai'
+  }).format(now)
 }
 
 async function main () {
@@ -282,4 +298,4 @@ if (require.main === module) {
 }
 
 // 导出供测试（不导出 main/postIssue：前者依赖 CLI 副作用、后者侧效应无关单元行为）
-module.exports = { analyze, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render }
+module.exports = { analyze, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate }

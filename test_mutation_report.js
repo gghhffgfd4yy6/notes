@@ -2,8 +2,9 @@
 
 // 回归测试（v3.266）：scripts/mutation-report.js 的 render 函数输出快照
 // 目标：拆 render 之前先固化为 markdown 快照；拆分后行为必须字节级一致。
+// 同时覆盖日报日期的 Asia/Shanghai 跨 UTC 日期边界。
 const assert = require('node:assert')
-const { render } = require('./scripts/mutation-report.js')
+const { render, shanghaiDate } = require('./scripts/mutation-report.js')
 
 // Fixture：3 段（正常 + 错误 + 全被杀）→ 覆盖全部 6 条核心分支
 //   1) 段汇总表（正常行）
@@ -56,6 +57,11 @@ const EMPTY_CASE = [
 ]
 
 let pass = 0
+/**
+ * 执行一项同步断言并累计通过数量。
+ * @param {string} name 测试名称
+ * @param {Function} fn 测试函数
+ */
 function check (name, fn) {
   try { fn(); pass++ } catch (e) { console.error(`❌ ${name}\n   ${e.message}`); process.exitCode = 1 }
 }
@@ -111,5 +117,15 @@ check('render 输出快照（全被杀 → 🎉 无存活变异体分支）', ()
 '> 由 mutation-report.js 自动生成'
   assert.strictEqual(render(EMPTY_CASE), expected)
 })
+
+/**
+ * 验证日报在上海时区跨 UTC 日期边界时仍使用正确自然日。
+ */
+function testShanghaiDate () {
+  // UTC 16:17 已是北京时间次日 00:17，不能继续使用 UTC 日期。
+  assert.strictEqual(shanghaiDate(new Date('2026-08-28T16:17:00.000Z')), '2026-08-29')
+  assert.strictEqual(shanghaiDate(new Date('2026-08-29T04:17:00.000Z')), '2026-08-29')
+}
+check('日报日期按 Asia/Shanghai 自然日计算', testShanghaiDate)
 
 console.log(`\n🎉 test_mutation_report.js 全部通过（${pass} 项）`)
