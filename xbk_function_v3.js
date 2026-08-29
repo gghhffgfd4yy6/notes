@@ -4106,116 +4106,111 @@ const App = {
   },
 
   // 运行日报（v3.125）：跨天时发"昨日日报"，当天累加统计；静默不影响主流程
+  _reportToday () {
+    const d = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date())
+    return d
+  },
+
+  _persistReportState (statePath, state) {
+    const normalized = this._normalizeReportState(state)
+    const ok = this._writeState(statePath, normalized)
+    // 状态写失败时保留进程内已知状态；重启后仍会重试并发出低磁盘告警。
+    this._reportMemoryStateByPath.set(statePath, { state: normalized, persisted: ok })
+    if (!ok) {
+      this._warnLowDisk()
+      console.warn('⚠️ 日报发送/累计状态持久化失败；本进程将继续使用内存状态')
+    }
+    return ok
+  },
+
+  _loadReportState (statePath) {
+    let memoryState = this._reportMemoryStateByPath.get(statePath)
+    if (memoryState && memoryState.persisted && !fs.existsSync(statePath)) {
+      this._reportMemoryStateByPath.delete(statePath)
+      memoryState = null
+    }
+    if (memoryState) return this._normalizeReportState(memoryState.state)
+
+    const stateResult = this._readSafeState(statePath)
+    if (stateResult.status === 'ok') {
+      try { return this._normalizeReportState(JSON.parse(stateResult.text)) } catch (e) { return this._blankReportState() }
+    }
+    if (stateResult.status !== 'missing') {
+      console.error(`日报累计状态读取失败(${stateResult.status})，跳过本次日报更新以免累计状态被重置 ${statePath}`)
+      return null
+    }
+    return this._blankReportState()
+  },
+
+  _accumulateReport (state, summary) {
+    const add = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : 0 }
+    state.total += add(summary.total)
+    state.dedup += add(summary.dedup)
+    state.filtered += add(summary.filtered)
+    state.pushed += add(summary.pushed)
+    state.failed += add(summary.failed)
+    state.truncated += add(summary.truncated)
+  },
+
+  async _sendCrossDayReport (statePath, state, summary, today) {
+    const reportText = `📊 xbk-push 日报（${state.date}）`
+    const reportBody = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}${state.truncated ? ` | 待推送 ${state.truncated}` : ''}`
+    const pending = state.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+    const pendingState = { ...state, pending: { ...pending } }
+    this._accumulateReport(pendingState.pending, summary)
+    this._persistReportState(statePath, pendingState)
+    try {
+      // 单次青龙入口会在 App.run 返回后退出，必须等待日报发送完成。
+      await Pusher.send(reportText, reportBody)
+      const nextState = {
+        date: today,
+        total: pendingState.pending.total || 0,
+        dedup: pendingState.pending.dedup || 0,
+        filtered: pendingState.pending.filtered || 0,
+        pushed: pendingState.pending.pushed || 0,
+        failed: pendingState.pending.failed || 0,
+        truncated: pendingState.pending.truncated || 0
+      }
+      this._persistReportState(statePath, nextState)
+      console.log('已发送昨日运行日报')
+    } catch (e) {
+      // 失败保留旧日期和 pending，下一次运行继续重试；记录脱敏后的摘要便于排查。
+      console.error('发送昨日运行日报失败:', Utils.safeErrorText(e, '未知错误'))
+    }
+  },
+
+  // 运行日报更新：跨天日报发送完成后才返回，失败不影响主推送结果。
   async _updateReport (summary) {
     try {
-      // v3.258：启用判断提取到 _enabledFlag（口径不变，供测试直接打纯函数）
       if (!this._enabledFlag(Config.report)) return
       const statePath = path.join(MessageStore.cacheDir, 'report.state')
-      const blankState = () => this._blankReportState()
-      const normalizeState = (raw) => this._normalizeReportState(raw)
-      const persistReportState = (next) => {
-        const normalized = normalizeState(next)
-        const ok = this._writeState(statePath, normalized)
-        // 状态写失败时保留进程内已知状态，避免同一进程重复发送日报；重启后仍会重试并发出低磁盘告警。
-        this._reportMemoryStateByPath.set(statePath, { state: normalized, persisted: ok })
-        if (!ok) {
-          this._warnLowDisk()
-          console.warn('⚠️ 日报发送/累计状态持久化失败；本进程将继续使用内存状态')
-        }
-        return ok
-      }
-      let memoryState = this._reportMemoryStateByPath.get(statePath)
-      if (memoryState && memoryState.persisted && !fs.existsSync(statePath)) {
-        this._reportMemoryStateByPath.delete(statePath)
-        memoryState = null
-      }
-      let state = memoryState ? normalizeState(memoryState.state) : blankState()
-      if (!memoryState) {
-        const stateResult = this._readSafeState(statePath)
-        if (stateResult.status === 'ok') {
-          try { state = normalizeState(JSON.parse(stateResult.text)) } catch (e) { /* 损坏状态=重置为安全状态 */ }
-        } else if (stateResult.status !== 'missing') {
-          // ioError/unsafe/tooLarge：读不到累计状态。若按"无状态文件"处理会把已累计的
-          // 日报/告警累计状态静默重置、可能重复推送；保守跳过本次日报更新，下次再重试。
-          console.error(`日报累计状态读取失败(${stateResult.status})，跳过本次日报更新以免累计状态被重置 ${statePath}`)
-          return
-        }
-        // status === 'missing' → state 保持 blankState()（首次）
-      }
-      // v3.155：日报日期用本地时区（原 UTC——中国用户凌晨 cron 时本地已跨天但 UTC 未跨，日报日期错位一天）
-      const _d = new Date()
-      const today = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`
-      const acc = (st) => {
-        const add = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : 0 }
-        st.total += add(summary.total)
-        st.dedup += add(summary.dedup)
-        st.filtered += add(summary.filtered)
-        st.pushed += add(summary.pushed)
-        st.failed += add(summary.failed)
-        st.truncated += add(summary.truncated) // v3.176：截断数也入日报（曾只有 run.log 有）
-      }
+      const state = this._loadReportState(statePath)
+      if (!state) return
+      const today = this._reportToday()
       if (state.date && state.date !== today) {
-        // 新的一天：发昨日日报（若有数据）
         if (state.total > 0 || state.failed > 0) {
-          const t = `📊 xbk-push 日报（${state.date}）`
-          // v3.159：段落分隔 \n\n（与主推送口径一致）——wxpusher Markdown 渲染单个 \n 可能挤成一行
-          const d = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}${state.truncated ? ` | 待推送 ${state.truncated}` : ''}`
-          // v3.156：发送成功才重置日期——曾先写 state.date（日报失败也跨天，昨日日报丢失）
-          // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗）
-          // v3.254 P1：发送前先把「今日累计」并入 pending 并同步落盘（见下方持久化）——
-          // 进程在发送完成前退出/崩溃，今日 summary 也不丢（pending 已持久化），且 date 未
-          // 重置 → 下次运行仍重试昨日日报，不重发今日数据。发送结果只决定 date 是否重置。
-          const pend = state.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-          // 同步持久化 pending（防进程退出丢今日累计）：state 保持昨日(date 未重置)，
-          // pending 携带本次 summary——测试锁定「发送失败 date 不重置 + 数据不丢」。
-          const pendingState = { ...state, pending: { ...pend } }
-          pendingState.pending.total += summary.total || 0
-          pendingState.pending.dedup += summary.dedup || 0
-          pendingState.pending.filtered += summary.filtered || 0
-          pendingState.pending.pushed += summary.pushed || 0
-          pendingState.pending.failed += summary.failed || 0
-          pendingState.pending.truncated += summary.truncated || 0
-          persistReportState(pendingState)
-          try {
-            // 必须等待日报发送完成：青龙单次入口会在 App.run 返回后退出进程，
-            // 未等待的 Promise 可能在请求完成前被终止，导致跨天日报丢失。
-            await Pusher.send(t, d)
-            // v3.176：昨日日报发送成功 → 重置为今日；取出 pending 并入新的一天。
-            // v3.257：pend2 已在发送前并入本次 summary（v3.254 同步持久化），
-            // 不再 acc(state) 重复累加——曾 acc 一次 + pend2（含 summary）一次，
-            // 导致发送成功后今日统计双重计数（summary 计两次）。
-            const pend2 = pendingState.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-            state = {
-              date: today,
-              total: pend2.total || 0,
-              dedup: pend2.dedup || 0,
-              filtered: pend2.filtered || 0,
-              pushed: pend2.pushed || 0,
-              failed: pend2.failed || 0,
-              truncated: pend2.truncated || 0
-            }
-            persistReportState(state)
-            console.log('已发送昨日运行日报')
-          } catch (e) {
-            // v3.176：失败 → date 不重置（下次运行重试昨日日报）；今日数据已在发送前
-            // 并入 pending 并持久化（不丢）。v3.254：即使进程此刻退出，pending 也已落盘。
-            // 日报失败不影响主推送结果。
-          }
+          await this._sendCrossDayReport(statePath, state, summary, today)
           return
         }
-        // 昨日无数据：直接跨天（pending 若有则并入今日——防御，正常路径无）
-        const pend = state.pending
-        state = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-        if (pend) {
-          state.total += pend.total || 0; state.dedup += pend.dedup || 0
-          state.filtered += pend.filtered || 0; state.pushed += pend.pushed || 0
-          state.failed += pend.failed || 0; state.truncated += pend.truncated || 0
+        const pending = state.pending
+        const nextState = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+        if (pending) {
+          Object.assign(nextState, {
+            total: pending.total || 0,
+            dedup: pending.dedup || 0,
+            filtered: pending.filtered || 0,
+            pushed: pending.pushed || 0,
+            failed: pending.failed || 0,
+            truncated: pending.truncated || 0
+          })
         }
+        this._persistReportState(statePath, nextState)
+        return
       }
       if (!state.date) state.date = today
-      acc(state)
-      persistReportState(state)
-    } catch (e) { /* 日报失败静默 */ }
+      this._accumulateReport(state, summary)
+      this._persistReportState(statePath, state)
+    } catch (e) { /* 日报失败静默，不影响主流程 */ }
   },
 
   async run () {

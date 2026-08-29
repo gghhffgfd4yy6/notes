@@ -9177,7 +9177,7 @@ console.log('========================================\n');
       pusherMod.send = () => pendingSend
       const update = V3App._updateReport({ total: 1, pushed: 1 })
       assertEqual(sent, false, '日报发送完成前不应提前结束')
-      assertEqual(typeof (update && update.then), 'function', '日报更新应返回 Promise')
+      assertEqual(typeof update?.then, 'function', '日报更新应返回 Promise')
       await new Promise(resolve => setImmediate(resolve))
       assertEqual(sent, false, '等待中的日报发送不应被跳过')
       release()
