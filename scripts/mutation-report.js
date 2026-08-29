@@ -50,6 +50,10 @@ function validateSegments (results, expected = EXPECTED_SEGMENTS) {
   if (missing.length > 0) {
     throw new Error(`变异测试报告缺少分段：${missing.join(', ')}；拒绝发布不完整日报`)
   }
+  const errored = results.filter(result => result.error).map(result => result.seg)
+  if (errored.length > 0) {
+    throw new Error(`变异测试报告包含错误分段：${errored.join(', ')}；拒绝发布不完整日报`)
+  }
   return results
 }
 

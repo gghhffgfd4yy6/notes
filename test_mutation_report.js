@@ -135,9 +135,21 @@ check('缺少变异测试分段时拒绝发布不完整日报', () => {
   )
 })
 
-check('变异测试分段完整时允许生成日报', () => {
-  const results = Array.from({ length: 13 }, (_, index) => ({ seg: `segment-${index}` }))
-  assert.deepStrictEqual(validateSegments(results, results.map(result => result.seg)), results)
+check('包含错误变异测试分段时拒绝发布不完整日报', () => {
+  const results = [{ seg: 'v3-part1', error: '缺 mutation.json' }]
+  assert.throws(
+    () => validateSegments(results, ['v3-part1']),
+    /包含错误分段：v3-part1/
+  )
+})
+
+check('生产默认分段完整时允许生成日报', () => {
+  const results = [
+    'v3-part1', 'v3-part2', 'v3-part3', 'v3-part4', 'v3-part5',
+    'sendnotify-part1', 'sendnotify-part2',
+    'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push'
+  ].map(seg => ({ seg }))
+  assert.deepStrictEqual(validateSegments(results), results)
 })
 
 console.log(`\n🎉 test_mutation_report.js 全部通过（${pass} 项）`)
