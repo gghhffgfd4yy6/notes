@@ -78,7 +78,7 @@ jobs:
       # Node 24/Linux x64 的 re2 二进制供全部 mutation 矩阵任务复用；下载失败时自动回退源码构建。
       - name: 安装并验证 re2 原生模块
         run: |
-          npm run install --prefix node_modules/re2
+          (cd node_modules/re2 && npm_package_json="$PWD/package.json" node ../install-artifact-from-github/bin/install-from-cache.js --artifact build/Release/re2.node --host-var RE2_DOWNLOAD_MIRROR --skip-path-var RE2_DOWNLOAD_SKIP_PATH --skip-ver-var RE2_DOWNLOAD_SKIP_VER --force-build-var RE2_DOWNLOAD_FORCE_BUILD)
           node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
 
       - name: 上传 re2 原生模块
