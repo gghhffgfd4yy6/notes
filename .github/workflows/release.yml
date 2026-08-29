@@ -24,10 +24,10 @@ jobs:
       - name: 安装依赖
         run: npm ci --ignore-scripts
 
-      # --ignore-scripts 不会构建 re2 原生模块；未构建时用户正则规则会被安全闸门跳过。
-      - name: 构建并验证 re2 原生模块
+      # 仅执行 re2 自身安装脚本，优先使用带 SHA-256 校验的预编译包，失败时由其脚本回退 node-gyp 源码构建。
+      - name: 安装并验证 re2 原生模块
         run: |
-          npm run rebuild --prefix node_modules/re2
+          (cd node_modules/re2 && npm_package_json="$PWD/package.json" node ../install-artifact-from-github/bin/install-from-cache.js --artifact build/Release/re2.node --host-var RE2_DOWNLOAD_MIRROR --skip-path-var RE2_DOWNLOAD_SKIP_PATH --skip-ver-var RE2_DOWNLOAD_SKIP_VER --force-build-var RE2_DOWNLOAD_FORCE_BUILD)
           node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
 
       - name: 版本一致性校验（101 章：文件头 ↔ CHANGELOG ↔ package.json）

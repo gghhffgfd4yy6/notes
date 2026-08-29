@@ -1888,12 +1888,10 @@ console.log('========================================\n');
       assert(!pushCalls.some(c => c.text.includes('日报')), '同一天不重复发日报')
       const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
       assert(st.pushed >= 2, `当天应累加 pushed: ${st.pushed}`)
-      // v3.174：断言用本地日期（与 _updateReport 的 v3.155 本地日期口径一致）——曾用
-      // toISOString()（UTC 日期），+8 时区本地凌晨（UTC 前一天）时 state.date 是本地今天、
-      // 断言是 UTC 日期 → 差 1 天失败（Gitee Go +8 容器实测暴露）
-      const _d = new Date()
-      const localToday = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`
-      assert(st.date === localToday, `状态日期应为今天(本地): ${st.date} vs ${localToday}`)
+      // v3.174：断言统一使用上海自然日（与 _updateReport 的 Asia/Shanghai 口径一致）。
+      // 不能依赖 CI runner 的系统时区；GitHub runner 通常为 UTC，北京时间凌晨会差一天。
+      const localToday = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date())
+      assert(st.date === localToday, `状态日期应为今天(上海): ${st.date} vs ${localToday}`)
     } finally {
       Config.report.enabled = orig
       try { require('fs').unlinkSync(statePath) } catch (e) { /* 忽略 */ }
