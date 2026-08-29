@@ -9146,17 +9146,47 @@ console.log('========================================\n');
     }
   })
 
-  await test('P4 _updateReport 关闭时不落盘不发（防跨天误发）', () => {
+  await test('P4 _updateReport 关闭时不落盘不发（防跨天误发）', async () => {
     const saved = { report: JSON.stringify(Config.report) }
     const statePath = path.join(MessageStore.cacheDir, 'report.state')
     const fsmod = require('node:fs')
     try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
     try {
       Config.report = { enabled: false }
-      assertEqual(V3App._updateReport({ total: 1, pushed: 1 }), undefined, '关闭时应直接返回')
+      await V3App._updateReport({ total: 1, pushed: 1 })
       assertEqual(fsmod.existsSync(statePath), false, '关闭时不得写 report.state')
     } finally {
       Config.report = JSON.parse(saved.report)
+      try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('P4 _updateReport 等待跨天日报发送完成后再返回', async () => {
+    const saved = { report: JSON.stringify(Config.report), map: new Map(V3App._reportMemoryStateByPath) }
+    const statePath = path.join(MessageStore.cacheDir, 'report.state')
+    const fsmod = require('node:fs')
+    const pusherMod = require('./xbk_function_v3.js').Pusher
+    const origSend = pusherMod.send
+    let release
+    let sent = false
+    const pendingSend = new Promise(resolve => { release = () => { sent = true; resolve() } })
+    try {
+      Config.report = { enabled: true }
+      V3App._reportMemoryStateByPath = new Map()
+      fsmod.writeFileSync(statePath, JSON.stringify({ date: '2000-01-01', total: 1, dedup: 0, filtered: 0, pushed: 1, failed: 0, truncated: 0 }))
+      pusherMod.send = () => pendingSend
+      const update = V3App._updateReport({ total: 1, pushed: 1 })
+      assertEqual(sent, false, '日报发送完成前不应提前结束')
+      assertEqual(typeof (update && update.then), 'function', '日报更新应返回 Promise')
+      await new Promise(resolve => setImmediate(resolve))
+      assertEqual(sent, false, '等待中的日报发送不应被跳过')
+      release()
+      await update
+      assertEqual(sent, true, '日报发送完成后更新才应返回')
+    } finally {
+      pusherMod.send = origSend
+      Config.report = JSON.parse(saved.report)
+      V3App._reportMemoryStateByPath = saved.map
       try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
     }
   })

@@ -4106,7 +4106,7 @@ const App = {
   },
 
   // 运行日报（v3.125）：跨天时发"昨日日报"，当天累加统计；静默不影响主流程
-  _updateReport (summary) {
+  async _updateReport (summary) {
     try {
       // v3.258：启用判断提取到 _enabledFlag（口径不变，供测试直接打纯函数）
       if (!this._enabledFlag(Config.report)) return
@@ -4176,30 +4176,31 @@ const App = {
           pendingState.pending.failed += summary.failed || 0
           pendingState.pending.truncated += summary.truncated || 0
           persistReportState(pendingState)
-          Pusher.send(t, d)
-            .then(() => {
-              // v3.176：昨日日报发送成功 → 重置为今日；取出 pending 并入新的一天。
-              // v3.257：pend2 已在发送前并入本次 summary（v3.254 同步持久化），
-              // 不再 acc(state) 重复累加——曾 acc 一次 + pend2（含 summary）一次，
-              // 导致发送成功后今日统计双重计数（summary 计两次）。
-              const pend2 = pendingState.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-              state = {
-                date: today,
-                total: pend2.total || 0,
-                dedup: pend2.dedup || 0,
-                filtered: pend2.filtered || 0,
-                pushed: pend2.pushed || 0,
-                failed: pend2.failed || 0,
-                truncated: pend2.truncated || 0
-              }
-              persistReportState(state)
-              console.log('已发送昨日运行日报')
-            })
-            .catch(() => {
-              // v3.176：失败 → date 不重置（下次运行重试昨日日报）；今日数据已在发送前
-              // 并入 pending 并持久化（不丢）。v3.254：即使进程此刻退出，pending 也已落盘。
-              // 仅需把内存 state 同步为带 pending 的形态，等待下次运行重试。
-            })
+          try {
+            // 必须等待日报发送完成：青龙单次入口会在 App.run 返回后退出进程，
+            // 未等待的 Promise 可能在请求完成前被终止，导致跨天日报丢失。
+            await Pusher.send(t, d)
+            // v3.176：昨日日报发送成功 → 重置为今日；取出 pending 并入新的一天。
+            // v3.257：pend2 已在发送前并入本次 summary（v3.254 同步持久化），
+            // 不再 acc(state) 重复累加——曾 acc 一次 + pend2（含 summary）一次，
+            // 导致发送成功后今日统计双重计数（summary 计两次）。
+            const pend2 = pendingState.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+            state = {
+              date: today,
+              total: pend2.total || 0,
+              dedup: pend2.dedup || 0,
+              filtered: pend2.filtered || 0,
+              pushed: pend2.pushed || 0,
+              failed: pend2.failed || 0,
+              truncated: pend2.truncated || 0
+            }
+            persistReportState(state)
+            console.log('已发送昨日运行日报')
+          } catch (e) {
+            // v3.176：失败 → date 不重置（下次运行重试昨日日报）；今日数据已在发送前
+            // 并入 pending 并持久化（不丢）。v3.254：即使进程此刻退出，pending 也已落盘。
+            // 日报失败不影响主推送结果。
+          }
           return
         }
         // 昨日无数据：直接跨天（pending 若有则并入今日——防御，正常路径无）
@@ -4803,7 +4804,7 @@ const App = {
         failed: items.length - successCount,
         failures: failureInfos
       }
-      this._updateReport(summary)
+      await this._updateReport(summary)
 
       // 返回运行摘要（供外部/测试观测，cron 可据此判断）
       return summary
