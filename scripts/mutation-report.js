@@ -8,6 +8,13 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { readReportJson } = require('./mutation-json.js')
 
+// 必须与 mutation.yml 的矩阵名称保持一致；缺段时禁止把部分结果伪装成完整日报。
+const EXPECTED_SEGMENTS = Object.freeze([
+  'v3-part1', 'v3-part2', 'v3-part3', 'v3-part4', 'v3-part5',
+  'sendnotify-part1', 'sendnotify-part2',
+  'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push'
+])
+
 function analyze (dir) {
   // S8707：CLI 参数显式校验（防 LLM/错误参数访问任意路径——先验证存在且是目录）
   let st
@@ -33,6 +40,26 @@ function analyze (dir) {
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith('mutation-report-')) continue
     results.push(analyzeSegment(dir, entry))
+  }
+  return results
+}
+
+/**
+ * 验证变异测试报告是否包含全部预期分段且每段均可解析。
+ * @param {Array<{seg: string, error?: string}>} results 已分析的分段结果
+ * @param {string[]} [expected=EXPECTED_SEGMENTS] 预期分段名称
+ * @returns {Array<{seg: string, error?: string}>} 原始分段结果
+ * @throws {Error} 缺少分段或存在错误分段时抛出
+ */
+function validateSegments (results, expected = EXPECTED_SEGMENTS) {
+  const actual = new Set(results.map(result => result.seg))
+  const missing = expected.filter(seg => !actual.has(seg))
+  if (missing.length > 0) {
+    throw new Error(`变异测试报告缺少分段：${missing.join(', ')}；拒绝发布不完整日报`)
+  }
+  const errored = results.filter(result => result.error).map(result => result.seg)
+  if (errored.length > 0) {
+    throw new Error(`变异测试报告包含错误分段：${errored.join(', ')}；拒绝发布不完整日报`)
   }
   return results
 }
@@ -274,7 +301,7 @@ async function main () {
     console.error(`❌ 报告目录不存在或不可访问：${dir}（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
     process.exit(1)
   }
-  const results = analyze(dir)
+  const results = validateSegments(analyze(dir))
   const body = render(results)
   console.log(body)
   if (process.argv.includes('--issue')) {
@@ -298,4 +325,4 @@ if (require.main === module) {
 }
 
 // 导出供测试（不导出 main/postIssue：前者依赖 CLI 副作用、后者侧效应无关单元行为）
-module.exports = { analyze, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate }
+module.exports = { analyze, validateSegments, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate }
