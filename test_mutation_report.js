@@ -2,6 +2,7 @@
 
 // 回归测试（v3.266）：scripts/mutation-report.js 的 render 函数输出快照
 // 目标：拆 render 之前先固化为 markdown 快照；拆分后行为必须字节级一致。
+// 同时覆盖日报日期的 Asia/Shanghai 跨 UTC 日期边界。
 const assert = require('node:assert')
 const { render, shanghaiDate } = require('./scripts/mutation-report.js')
 

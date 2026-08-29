@@ -217,6 +217,11 @@ function render (results) {
   return lines.join('\n')
 }
 
+/**
+ * 汇总日报并按上海自然日创建或复用 GitHub Issue。
+ * @param {string} body 已渲染的日报 Markdown
+ * @returns {Promise<object>} 新建或已存在的 Issue 信息
+ */
 async function postIssue (body) {
   const token = process.env.GITHUB_TOKEN
   if (!token) throw new Error('缺少 GITHUB_TOKEN')
@@ -248,10 +253,13 @@ async function postIssue (body) {
   return res.json()
 }
 
-// GitHub Actions 的 Mutation workflow 按北京时间调度；日报标题和同日去重也必须使用同一自然日。
-// 不使用 toISOString()，因为它固定按 UTC 格式化，在北京时间 00:00-07:59 会落到前一天。
+/**
+ * 将时间转换为上海时区的 ISO 日期（YYYY-MM-DD）。
+ * @param {Date} [now=new Date()] 待格式化时间
+ * @returns {string} 上海自然日
+ */
 function shanghaiDate (now = new Date()) {
-  return new Intl.DateTimeFormat('en-CA', {
+  return new Intl.DateTimeFormat('sv-SE', {
     timeZone: 'Asia/Shanghai'
   }).format(now)
 }
