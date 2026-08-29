@@ -44,6 +44,13 @@ function analyze (dir) {
   return results
 }
 
+/**
+ * 验证变异测试报告是否包含全部预期分段且每段均可解析。
+ * @param {Array<{seg: string, error?: string}>} results 已分析的分段结果
+ * @param {string[]} [expected=EXPECTED_SEGMENTS] 预期分段名称
+ * @returns {Array<{seg: string, error?: string}>} 原始分段结果
+ * @throws {Error} 缺少分段或存在错误分段时抛出
+ */
 function validateSegments (results, expected = EXPECTED_SEGMENTS) {
   const actual = new Set(results.map(result => result.seg))
   const missing = expected.filter(seg => !actual.has(seg))
