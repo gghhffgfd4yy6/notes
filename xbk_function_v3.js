@@ -20,6 +20,7 @@ const PROFILE3_BOOT_MARKS = []
 let RE2C = null
 try { RE2C = require('re2') } catch (e) { RE2C = null }
 const _reCache = new Map()
+const TRACKING_QUERY_NAMES = new Set(['fbclid', 'gclid', 'dclid', 'msclkid', 'yclid', 'mc_cid', 'mc_eid', 'igshid', '_ga', '_gl'])
 const safeRe = (src, flags) => {
   const k = src + '\u0000' + flags
   let r = _reCache.get(k)
@@ -502,12 +503,11 @@ const Utils = {
       if (host !== '') s = m[0].toLowerCase() + host.toLowerCase() + (slash === -1 ? '' : rest.slice(slash))
     }
     if (rawQuery) {
-      const trackingNames = new Set(['fbclid', 'gclid', 'dclid', 'msclkid', 'yclid', 'mc_cid', 'mc_eid', 'igshid', '_ga', '_gl'])
       const kept = rawQuery.split('&').filter(part => {
         const rawName = part.split('=', 1)[0]
         let name = rawName.toLowerCase()
         try { name = decodeURIComponent(rawName.replace(/\+/g, '%20')).toLowerCase() } catch (e) { /* 保留无法解码的业务参数 */ }
-        return !name.startsWith('utm_') && !trackingNames.has(name)
+        return !name.startsWith('utm_') && !TRACKING_QUERY_NAMES.has(name)
       })
       if (kept.length) s += '?' + kept.join('&')
     }
@@ -1309,13 +1309,13 @@ const Formatter = {
     const wanted = wantedName.toLowerCase()
     const end = tag.endsWith('>') ? tag.length - 1 : tag.length
     let i = 1
-    while (i < end && /[A-Za-z]/.test(tag[i])) i++
+    while (i < end && /[A-Za-z0-9]/.test(tag[i])) i++
     // 历史兼容：<ahref=...> 视作 <a href=...>。
     if (wanted === 'href' && /^<ahref\s*=/i.test(tag)) i = 2
     while (i < end) {
       while (i < end && /[\s/]/.test(tag[i])) i++
       const nameStart = i
-      while (i < end && /[A-Za-z0-9:_-]/.test(tag[i])) i++
+      while (i < end && !/[\s"'/>=]/.test(tag[i])) i++
       if (nameStart === i) { i++; continue }
       const name = tag.slice(nameStart, i).toLowerCase()
       while (i < end && /\s/.test(tag[i])) i++
