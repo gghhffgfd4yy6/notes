@@ -480,7 +480,10 @@ const Utils = {
     const rest = value.slice(m[0].length)
     const slash = rest.indexOf('/')
     const host = slash === -1 ? rest : rest.slice(0, slash)
-    return host === '' ? value : m[0].toLowerCase() + host.toLowerCase() + (slash === -1 ? '' : rest.slice(slash))
+    if (host === '') return value
+    const at = host.lastIndexOf('@')
+    const normalizedHost = at === -1 ? host.toLowerCase() : host.slice(0, at + 1) + host.slice(at + 1).toLowerCase()
+    return m[0].toLowerCase() + normalizedHost + (slash === -1 ? '' : rest.slice(slash))
   },
   _isTrackingQueryName (rawName) {
     let name = rawName.toLowerCase()
