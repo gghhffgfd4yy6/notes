@@ -1554,6 +1554,8 @@ const Formatter = {
       const scanStrip = (str) => {
         let out = ''
         let pos = 0
+        const knownTags = new Set(['a', 'br', 'p', 'div', 'li', 'ul', 'ol', 'b', 'strong', 'i', 'em', 'img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'td', 'th', 'tr', 'table', 'script', 'style', 'input', 'link', 'blockquote'])
+        const unknownPairs = []
         while (pos < str.length) {
           const lt = str.indexOf('<', pos)
           if (lt === -1) { out += str.slice(pos); break }
@@ -1563,11 +1565,11 @@ const Formatter = {
           const tagStart = str[lt + 1] === '/' ? lt + 2 : lt + 1
           const nameM = /^[a-z][a-z0-9-]*/i.exec(str.slice(tagStart, gt))
           const name = nameM ? nameM[0].toLowerCase() : ''
-          const knownTags = new Set(['a', 'br', 'p', 'div', 'li', 'ul', 'ol', 'b', 'strong', 'i', 'em', 'img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'td', 'th', 'tr', 'table', 'script', 'style', 'input', 'link', 'blockquote'])
+          const isClosing = str[lt + 1] === '/'
           const looksLikeClosedUnknown = name && !knownTags.has(name) &&
-            !str.slice(lt, gt + 1).startsWith('</') &&
-            new RegExp(`</${name}\\s*>`, 'i').test(str.slice(gt + 1))
-          if (gt === lt + 1 || !name || (!knownTags.has(name) && !looksLikeClosedUnknown)) {
+            !isClosing && new RegExp(`</${name}\\s*>`, 'i').test(str.slice(gt + 1))
+          const isTrackedUnknownClose = isClosing && unknownPairs.length > 0 && unknownPairs[unknownPairs.length - 1] === name
+          if (gt === lt + 1 || !name || (!knownTags.has(name) && !looksLikeClosedUnknown && !isTrackedUnknownClose)) {
             // 未闭合的未知片段更可能是普通文本（如 `<world>`）；保留当前字符继续扫描。
             // `<<>>` 仍按历史语义丢弃首个尖括号，避免旧的畸形输入断言回归。
             if (!name && str[lt + 1] === '<') {
@@ -1579,6 +1581,8 @@ const Formatter = {
             }
             continue
           }
+          if (looksLikeClosedUnknown) unknownPairs.push(name)
+          if (isTrackedUnknownClose) unknownPairs.pop()
           out += str.slice(pos, lt)
           pos = gt + 1
         }
@@ -4160,8 +4164,15 @@ const App = {
             throw new Error(`日报状态字段 ${k} 无效`)
           }
         }
-        if (raw.pending !== undefined && (!raw.pending || typeof raw.pending !== 'object' || Array.isArray(raw.pending))) {
-          throw new Error('日报状态 pending 字段无效')
+        if (raw.pending !== undefined) {
+          if (!raw.pending || typeof raw.pending !== 'object' || Array.isArray(raw.pending)) {
+            throw new Error('日报状态 pending 字段无效')
+          }
+          for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+            if (raw.pending[k] !== undefined && (!Number.isSafeInteger(raw.pending[k]) || raw.pending[k] < 0)) {
+              throw new Error(`日报 pending 字段 ${k} 无效`)
+            }
+          }
         }
         return this._normalizeReportState(raw)
       } catch (e) {
