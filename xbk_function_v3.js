@@ -474,8 +474,11 @@ const Utils = {
     let s
     try { s = String(u) } catch (e) { return '' }
     s = s.trim()
-    // v3.156：去 query/hash（与 getFileName 口径一致）——同一内容带跟踪参数/锚点曾判为不同，重复入库推送
-    s = s.split(/[?#]/)[0]
+    const hashIndex = s.indexOf('#')
+    if (hashIndex !== -1) s = s.slice(0, hashIndex)
+    const queryIndex = s.indexOf('?')
+    const rawQuery = queryIndex === -1 ? '' : s.slice(queryIndex + 1)
+    if (queryIndex !== -1) s = s.slice(0, queryIndex)
     // 单次遍历去首尾【斜杠|空白】（原多轮 do-while 对交替空格/斜杠长串是 O(n²)，
     // 脏数据 10 万字符实测 ~12-18s 拖垮判重；语义等价：只剥首尾 \s/ 直到稳定）
     // S8786：^[\s/]+|[\s/]+$ 交替被 Sonar 标记超线性回溯（X+$ 失败路径仍逐位回溯）；
@@ -497,6 +500,16 @@ const Utils = {
       const slash = rest.indexOf('/')
       const host = slash === -1 ? rest : rest.slice(0, slash)
       if (host !== '') s = m[0].toLowerCase() + host.toLowerCase() + (slash === -1 ? '' : rest.slice(slash))
+    }
+    if (rawQuery) {
+      const trackingNames = new Set(['fbclid', 'gclid', 'dclid', 'msclkid', 'yclid', 'mc_cid', 'mc_eid', 'igshid', '_ga', '_gl'])
+      const kept = rawQuery.split('&').filter(part => {
+        const rawName = part.split('=', 1)[0]
+        let name = rawName.toLowerCase()
+        try { name = decodeURIComponent(rawName.replace(/\+/g, '%20')).toLowerCase() } catch (e) { /* 保留无法解码的业务参数 */ }
+        return !name.startsWith('utm_') && !trackingNames.has(name)
+      })
+      if (kept.length) s += '?' + kept.join('&')
     }
     return s
   },
@@ -1290,6 +1303,43 @@ const Formatter = {
     return -1
   },
 
+  /** 读取单个标签的真实属性值，跳过其他属性的引号内容，避免把 title/data-* 中的 href/src 文本误当属性。 */
+  _getTagAttr (tag, wantedName) {
+    if (typeof tag !== 'string') return ''
+    const wanted = wantedName.toLowerCase()
+    const end = tag.endsWith('>') ? tag.length - 1 : tag.length
+    let i = 1
+    while (i < end && /[A-Za-z]/.test(tag[i])) i++
+    // 历史兼容：<ahref=...> 视作 <a href=...>。
+    if (wanted === 'href' && /^<ahref\s*=/i.test(tag)) i = 2
+    while (i < end) {
+      while (i < end && /[\s/]/.test(tag[i])) i++
+      const nameStart = i
+      while (i < end && /[A-Za-z0-9:_-]/.test(tag[i])) i++
+      if (nameStart === i) { i++; continue }
+      const name = tag.slice(nameStart, i).toLowerCase()
+      while (i < end && /\s/.test(tag[i])) i++
+      if (tag[i] !== '=') continue
+      i++
+      while (i < end && /\s/.test(tag[i])) i++
+      let value = ''
+      if (tag[i] === '"' || tag[i] === "'") {
+        const quote = tag[i++]
+        const valueStart = i
+        while (i < end && tag[i] !== quote) i++
+        if (i >= end) return ''
+        value = tag.slice(valueStart, i)
+        i++
+      } else {
+        const valueStart = i
+        while (i < end && !/[\s>]/.test(tag[i])) i++
+        value = tag.slice(valueStart, i)
+      }
+      if (name === wanted) return value
+    }
+    return ''
+  },
+
   /** 已知标签转换操作查找（v3.262 扫描器用）：语义与原 if 链逐条一致——p/div 前缀匹配
    *  （原 <\/?p 无 \b），img/td/th/tr/table 仅开标签（</td> 由通用剥离移除），li 开闭均可，其余词边界内。 */
   _tagOpFor (name, closing, wordAfter, tagOps) {
@@ -1463,8 +1513,7 @@ const Formatter = {
     // href 前不允许 -/_ 属性名续接（data-href/data_href 不再误取链接目标）。
     html = this._replaceTagged(html, /<a(?=[\s>]|href\s*=)/gi,
       (m, txt, openTag) => {
-        const hrefM = /(?<![-_])href\s*=\s*["']([^"']*)["']/i.exec(openTag) || /(?<![-_])href\s*=\s*([^\s"'>]+)/i.exec(openTag)
-        const cleanHref = Utils.safeUrl(hrefM ? hrefM[1] : '')
+        const cleanHref = Utils.safeUrl(this._getTagAttr(openTag, 'href'))
         return cleanHref ? `[${anchorText(txt)}](${cleanHref})` : anchorText(txt)
       },
       () => '</a>')
@@ -1482,13 +1531,12 @@ const Formatter = {
     html = (() => {
       const tagOps = {
         img: (tag) => {
-          const srcM = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i) || tag.match(/\bsrc\s*=\s*([^\s"'<>`]+)/i)
-          if (!srcM) return tag // 无 src 不转换（原链由通用剥离兜底剥空）
-          const src = Utils.safeUrl(srcM[1])
+          const srcValue = this._getTagAttr(tag, 'src')
+          if (!srcValue) return tag // 无 src 不转换（原链由通用剥离兜底剥空）
+          const src = Utils.safeUrl(srcValue)
           if (!src) return tag.replace(/\bsrc\s*=\s*(?:(["'])[^"']*\1|[^\s"'<>`]+)/i, '') // 空/危险 src 不生成可执行图片链接
-          const altM = tag.match(/\balt\s*=\s*["']([^"']*)["']/i) || tag.match(/\balt\s*=\s*([^\s"'<>`]+)/i)
-          // alt 截断（真实接口 alt 可长达 250+ 字符拖累推送）——代理对安全
-          const alt = altM ? Utils.truncateUtf16(altM[1], 50) : ''
+          // alt 截断（真实接口 alt 可长达 250+字符拖累推送）——代理对安全
+          const alt = Utils.truncateUtf16(this._getTagAttr(tag, 'alt'), 50)
           // C008 二次修复：alt 实体解码后直接转义（&#93; → \] 等），与 anchor 文本同口径
           const altText = alt ? Utils.decodeHtmlEntities(alt).replace(/[[\]\\]/g, '\\$&') : ''
           return `\n\n![${altText}](${src})\n\n`

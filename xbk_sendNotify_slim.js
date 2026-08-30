@@ -283,7 +283,7 @@ if (fs.existsSync(localPath)) {
       console.warn('⚠️ push_config.local.js 导出格式异常（应为对象），推送密钥可能未生效')
     }
   } catch (e) {
-    console.warn('⚠️ push_config.local.js 加载失败（推送密钥可能未生效）:', e && e.message ? e.message : String(e))
+    console.warn('⚠️ push_config.local.js 加载失败（推送密钥可能未生效），请检查配置文件语法')
   }
 }
 
