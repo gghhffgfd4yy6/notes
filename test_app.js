@@ -2277,6 +2277,26 @@ console.log('========================================\n');
     }
   })
 
+  await test('report.state date 非字符串 → 保留原文件并跳过更新（v3.270）', async () => {
+    reset()
+    setPushUrl('t270_report_date_invalid')
+    const statePath = path.join(CACHE_DIR, 'report.state')
+    const orig = Config.report.enabled
+    const original = JSON.stringify({ date: 123, total: 9, pushed: 9 })
+    try {
+      Config.report.enabled = true
+      xbk.App._reportMemoryStateByPath.delete(statePath)
+      fs.writeFileSync(statePath, original)
+      fakeData = [makeItem({ id: 1 })]
+      await xbk.run()
+      assert(fs.readFileSync(statePath, 'utf8') === original, '非法 date 状态应保留原文件')
+    } finally {
+      Config.report.enabled = orig
+      xbk.App._reportMemoryStateByPath.delete(statePath)
+      try { fs.unlinkSync(statePath) } catch (e) {}
+    }
+  })
+
   await test('连续运行：report.state 累加/缓存去重/状态文件正确（v3.141）', async () => {
     reset()
     setPushUrl('t60_cron')

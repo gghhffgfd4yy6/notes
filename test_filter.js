@@ -8699,6 +8699,7 @@ console.log('========================================\n');
     const withPending = V3App._normalizeReportState({ total: 1, pending: { total: 9, dedup: '2' } })
     assertEqual(withPending.pending.total, 9)
     assertEqual(withPending.pending.dedup, 2)
+    // _loadReportState 的严格校验覆盖 pending 内部字段和 date 类型；归一化函数保持兼容旧调用口径
     // pending 损坏（非对象）→ 警告 + 空 pending
     const warns = []
     const oldWarn = console.warn

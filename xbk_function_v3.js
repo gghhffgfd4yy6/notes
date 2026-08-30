@@ -4159,6 +4159,9 @@ const App = {
         if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
           throw new Error('日报状态顶层必须是对象')
         }
+        if (raw.date !== undefined && typeof raw.date !== 'string') {
+          throw new Error('日报状态 date 字段无效')
+        }
         for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
           if (raw[k] !== undefined && (!Number.isSafeInteger(raw[k]) || raw[k] < 0)) {
             throw new Error(`日报状态字段 ${k} 无效`)
