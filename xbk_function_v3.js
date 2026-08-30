@@ -1557,9 +1557,11 @@ const Formatter = {
         const knownTags = new Set(['a', 'br', 'p', 'div', 'li', 'ul', 'ol', 'b', 'strong', 'i', 'em', 'img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'td', 'th', 'tr', 'table', 'script', 'style', 'input', 'link', 'blockquote'])
         const unknownPairs = []
         const lowerStr = str.replace(/[A-Z]/g, c => c.toLowerCase())
+        const quotedAttrSpans = this._quotedAttrSpans(str)
         const findUnknownClose = (name, from) => {
           const needle = `</${name}`
           for (let i = lowerStr.indexOf(needle, from); i !== -1; i = lowerStr.indexOf(needle, i + 1)) {
+            if (quotedAttrSpans.has(i)) continue
             const end = i + needle.length
             let j = end
             while (j < str.length && /\s/.test(str[j])) j++

@@ -758,6 +758,7 @@ console.log('========================================\n');
     assertEqual(htmlToMarkdown({ content_html: '2 < 3 > 1', url: '' }), '2 < 3 > 1')
     assertEqual(htmlToMarkdown({ content_html: 'hello <world>', url: '' }), 'hello <world>')
     assertEqual(htmlToMarkdown({ content_html: '<foo>İ</foo>', url: '' }), 'İ')
+    assertEqual(htmlToMarkdown({ content_html: '<foo><bar title="</foo>">text</bar>', url: '' }), '<foo>text')
   })
 
   await test('HTML 标签被正确转换', () => {
