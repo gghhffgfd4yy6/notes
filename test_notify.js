@@ -757,6 +757,9 @@ console.log('========================================\n');
     assert(maskKey('') === '***', '空密钥')
     // URL 保留 host，设备码段脱敏
     assert(maskUrl('https://api.day.app/DEVICEKEY123') === 'https://api.day.app/DEVI***23', `maskUrl: ${maskUrl('https://api.day.app/DEVICEKEY123')}`)
+    const userinfo = maskUrl('https://user:SUPERSECRET@[2001:db8::1]:8443/DEVICEKEY123?token=LEAK#frag')
+    assert(!userinfo.includes('user') && !userinfo.includes('SUPERSECRET') && !userinfo.includes('LEAK'), `userinfo/query 不应泄露: ${userinfo}`)
+    assert(userinfo === 'https://[2001:db8::1]:8443/DEVI***23', `IPv6/端口应保留: ${userinfo}`)
   })
 
   await test('日志脱敏: Push+/企微/PushDeer/Telegram/Server酱 失败日志不泄露密钥（v3.75）', () => withChannels(async () => {
@@ -946,6 +949,19 @@ console.log('========================================\n');
     } finally {
       console.log = origLog
     }
+  }))
+
+  await test('WxPusher profile 日志不泄露短 appToken（v3.271）', () => withChannels(async () => {
+    const oldProfile = process.env.XBK_PROFILE; const logs = []; const oldLog = console.log
+    process.env.XBK_PROFILE = '3'; console.log = (...args) => logs.push(args.join(' '))
+    try {
+      cfg.WX_pusher_appToken = 'ABCD'; cfg.WX_pusher_topicIds = '123'
+      await notify.sendNotify('标题', '内容')
+      notify.printWxPusherProfileSummary()
+      assert(!logs.join('\n').includes('ABCD'), `profile 日志泄露短 token: ${logs.join(' | ')}`)
+      assert(logs.join('\n').includes('app=***'), 'profile 应使用统一脱敏')
+      assert(gotCalls[0].options.json.appToken === 'ABCD', '请求必须保留原 token')
+    } finally { console.log = oldLog; if (oldProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = oldProfile }
   }))
 
   await test('Fuzz-推送: maskKey/maskUrl 随机输入不崩', () => {
