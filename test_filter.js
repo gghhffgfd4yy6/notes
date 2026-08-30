@@ -6567,7 +6567,7 @@ console.log('========================================\n');
     assertEqual(normUrl('a?id=1'), 'a?id=1', '业务 query 应保留为身份')
     assertEqual(normUrl('a?id=1'), normUrl('a?id=1&utm_source=x'), 'utm 追踪参数应忽略')
     assertEqual(normUrl('a?id=1#s'), 'a?id=1', 'hash 不参与身份')
-    assertEqual(normUrl('http://A.com/p?id=1&utm_source=x#s'), 'http://a.com/p?id=1', '主机小写、追踪参数和hash归一化')
+    assertEqual(normUrl('https://A.com/p?id=1&utm_source=x#s'), 'https://a.com/p?id=1', '主机小写、追踪参数和hash归一化')
     assertEqual(normUrl('/A/B/'), 'A/B', '首尾斜杠去除')
     assertEqual(normUrl('  /a/  '), 'a', '空白+斜杠')
   })

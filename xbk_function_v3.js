@@ -467,48 +467,40 @@ const Utils = {
   },
 
   // ==================== URL 工具 ====================
-  /** 归一化 URL 用于判重：trim + 去尾部斜杠（/foo 与 foo、foo/ 视为同一资源） */
+  _trimUrlEdges (value) {
+    const isTrimChar = (ch) => ch === '/' || /\s/.test(ch)
+    let lo = 0; let hi = value.length
+    while (lo < hi && isTrimChar(value[lo])) lo++
+    while (hi > lo && isTrimChar(value[hi - 1])) hi--
+    return lo === 0 && hi === value.length ? value : value.slice(lo, hi)
+  },
+  _normalizeUrlAuthority (value) {
+    const m = /^[a-z][a-z0-9+.-]*:\/\//i.exec(value)
+    if (!m) return value
+    const rest = value.slice(m[0].length)
+    const slash = rest.indexOf('/')
+    const host = slash === -1 ? rest : rest.slice(0, slash)
+    return host === '' ? value : m[0].toLowerCase() + host.toLowerCase() + (slash === -1 ? '' : rest.slice(slash))
+  },
+  _isTrackingQueryName (rawName) {
+    let name = rawName.toLowerCase()
+    try { name = decodeURIComponent(rawName.replace(/\+/g, '%20')).toLowerCase() } catch (e) { /* 保留无法解码的业务参数 */ }
+    return name.startsWith('utm_') || TRACKING_QUERY_NAMES.has(name)
+  },
+  /** 归一化 URL 用于判重：trim + 去尾部斜杠（/foo 与 foo/ 视为同一资源） */
   normUrl (u) {
-    // 归一化用于判重：trim + 去首尾斜杠 + 主机名小写（/foo、foo、foo/、A.com/a vs a.com/a 视为同一资源）
-    // v3.108 fuzz：String(嵌套 Symbol 的数组) 崩——统一兜底视为空
     if (u === undefined || u === null) return ''
     let s
-    try { s = String(u) } catch (e) { return '' }
-    s = s.trim()
+    try { s = String(u).trim() } catch (e) { return '' }
     const hashIndex = s.indexOf('#')
     if (hashIndex !== -1) s = s.slice(0, hashIndex)
     const queryIndex = s.indexOf('?')
     const rawQuery = queryIndex === -1 ? '' : s.slice(queryIndex + 1)
     if (queryIndex !== -1) s = s.slice(0, queryIndex)
-    // 单次遍历去首尾【斜杠|空白】（原多轮 do-while 对交替空格/斜杠长串是 O(n²)，
-    // 脏数据 10 万字符实测 ~12-18s 拖垮判重；语义等价：只剥首尾 \s/ 直到稳定）
-    // S8786：^[\s/]+|[\s/]+$ 交替被 Sonar 标记超线性回溯（X+$ 失败路径仍逐位回溯）；
-    // 改为线性扫描：单次遍历确定首尾边界，/\s/ 单字符判定与正则 \s 集合完全一致
-    {
-      const isTrimChar = (ch) => ch === '/' || /\s/.test(ch)
-      let lo = 0
-      let hi = s.length
-      while (lo < hi && isTrimChar(s[lo])) lo++
-      while (hi > lo && isTrimChar(s[hi - 1])) hi--
-      if (lo !== 0 || hi !== s.length) s = s.slice(lo, hi)
-    }
-    // 含协议时协议+主机名转小写（路径大小写敏感保留）
-    // S8786：([^/]+)(.*)$ 双量词在失败路径呈 O(n²) 回溯；改为先匹配协议前缀、再线性切主机，
-    // 语义与原正则一致（host 至少 1 字符才成立，否则原样保留）
-    const m = /^[a-z][a-z0-9+.-]*:\/\//i.exec(s)
-    if (m) {
-      const rest = s.slice(m[0].length)
-      const slash = rest.indexOf('/')
-      const host = slash === -1 ? rest : rest.slice(0, slash)
-      if (host !== '') s = m[0].toLowerCase() + host.toLowerCase() + (slash === -1 ? '' : rest.slice(slash))
-    }
+    s = this._trimUrlEdges(s)
+    s = this._normalizeUrlAuthority(s)
     if (rawQuery) {
-      const kept = rawQuery.split('&').filter(part => {
-        const rawName = part.split('=', 1)[0]
-        let name = rawName.toLowerCase()
-        try { name = decodeURIComponent(rawName.replace(/\+/g, '%20')).toLowerCase() } catch (e) { /* 保留无法解码的业务参数 */ }
-        return !name.startsWith('utm_') && !TRACKING_QUERY_NAMES.has(name)
-      })
+      const kept = rawQuery.split('&').filter(part => !this._isTrackingQueryName(part.split('=', 1)[0]))
       if (kept.length) s += '?' + kept.join('&')
     }
     return s
@@ -1303,6 +1295,20 @@ const Formatter = {
     return -1
   },
 
+  _readTagAttrValue (tag, index, end) {
+    while (index < end && /\s/.test(tag[index])) index++
+    if (index >= end) return ['', end]
+    if (tag[index] === '"' || tag[index] === "'") {
+      const quote = tag[index++]
+      const start = index
+      while (index < end && tag[index] !== quote) index++
+      return index >= end ? ['', end] : [tag.slice(start, index), index + 1]
+    }
+    const start = index
+    while (index < end && !/[\s>]/.test(tag[index])) index++
+    return [tag.slice(start, index), index]
+  },
+
   /** 读取单个标签的真实属性值，跳过其他属性的引号内容，避免把 title/data-* 中的 href/src 文本误当属性。 */
   _getTagAttr (tag, wantedName) {
     if (typeof tag !== 'string') return ''
@@ -1310,7 +1316,6 @@ const Formatter = {
     const end = tag.endsWith('>') ? tag.length - 1 : tag.length
     let i = 1
     while (i < end && /[A-Za-z0-9]/.test(tag[i])) i++
-    // 历史兼容：<ahref=...> 视作 <a href=...>。
     if (wanted === 'href' && /^<ahref\s*=/i.test(tag)) i = 2
     while (i < end) {
       while (i < end && /[\s/]/.test(tag[i])) i++
@@ -1320,21 +1325,8 @@ const Formatter = {
       const name = tag.slice(nameStart, i).toLowerCase()
       while (i < end && /\s/.test(tag[i])) i++
       if (tag[i] !== '=') continue
-      i++
-      while (i < end && /\s/.test(tag[i])) i++
-      let value = ''
-      if (tag[i] === '"' || tag[i] === "'") {
-        const quote = tag[i++]
-        const valueStart = i
-        while (i < end && tag[i] !== quote) i++
-        if (i >= end) return ''
-        value = tag.slice(valueStart, i)
-        i++
-      } else {
-        const valueStart = i
-        while (i < end && !/[\s>]/.test(tag[i])) i++
-        value = tag.slice(valueStart, i)
-      }
+      const [value, next] = this._readTagAttrValue(tag, i + 1, end)
+      i = next
       if (name === wanted) return value
     }
     return ''
