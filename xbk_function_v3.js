@@ -20,6 +20,7 @@ const PROFILE3_BOOT_MARKS = []
 let RE2C = null
 try { RE2C = require('re2') } catch (e) { RE2C = null }
 const _reCache = new Map()
+const TRACKING_QUERY_NAMES = new Set(['fbclid', 'gclid', 'dclid', 'msclkid', 'yclid', 'mc_cid', 'mc_eid', 'igshid', '_ga', '_gl'])
 const safeRe = (src, flags) => {
   const k = src + '\u0000' + flags
   let r = _reCache.get(k)
@@ -466,37 +467,44 @@ const Utils = {
   },
 
   // ==================== URL 工具 ====================
-  /** 归一化 URL 用于判重：trim + 去尾部斜杠（/foo 与 foo、foo/ 视为同一资源） */
+  _trimUrlEdges (value) {
+    const isTrimChar = (ch) => ch === '/' || /\s/.test(ch)
+    let lo = 0; let hi = value.length
+    while (lo < hi && isTrimChar(value[lo])) lo++
+    while (hi > lo && isTrimChar(value[hi - 1])) hi--
+    return lo === 0 && hi === value.length ? value : value.slice(lo, hi)
+  },
+  _normalizeUrlAuthority (value) {
+    const m = /^[a-z][a-z0-9+.-]*:\/\//i.exec(value)
+    if (!m) return value
+    const rest = value.slice(m[0].length)
+    const slash = rest.indexOf('/')
+    const host = slash === -1 ? rest : rest.slice(0, slash)
+    if (host === '') return value
+    const at = host.lastIndexOf('@')
+    const normalizedHost = at === -1 ? host.toLowerCase() : host.slice(0, at + 1) + host.slice(at + 1).toLowerCase()
+    return m[0].toLowerCase() + normalizedHost + (slash === -1 ? '' : rest.slice(slash))
+  },
+  _isTrackingQueryName (rawName) {
+    let name = rawName.toLowerCase()
+    try { name = decodeURIComponent(rawName.replace(/\+/g, '%20')).toLowerCase() } catch (e) { /* 保留无法解码的业务参数 */ }
+    return name.startsWith('utm_') || TRACKING_QUERY_NAMES.has(name)
+  },
+  /** 归一化 URL 用于判重：trim + 去尾部斜杠（/foo 与 foo/ 视为同一资源） */
   normUrl (u) {
-    // 归一化用于判重：trim + 去首尾斜杠 + 主机名小写（/foo、foo、foo/、A.com/a vs a.com/a 视为同一资源）
-    // v3.108 fuzz：String(嵌套 Symbol 的数组) 崩——统一兜底视为空
     if (u === undefined || u === null) return ''
     let s
-    try { s = String(u) } catch (e) { return '' }
-    s = s.trim()
-    // v3.156：去 query/hash（与 getFileName 口径一致）——同一内容带跟踪参数/锚点曾判为不同，重复入库推送
-    s = s.split(/[?#]/)[0]
-    // 单次遍历去首尾【斜杠|空白】（原多轮 do-while 对交替空格/斜杠长串是 O(n²)，
-    // 脏数据 10 万字符实测 ~12-18s 拖垮判重；语义等价：只剥首尾 \s/ 直到稳定）
-    // S8786：^[\s/]+|[\s/]+$ 交替被 Sonar 标记超线性回溯（X+$ 失败路径仍逐位回溯）；
-    // 改为线性扫描：单次遍历确定首尾边界，/\s/ 单字符判定与正则 \s 集合完全一致
-    {
-      const isTrimChar = (ch) => ch === '/' || /\s/.test(ch)
-      let lo = 0
-      let hi = s.length
-      while (lo < hi && isTrimChar(s[lo])) lo++
-      while (hi > lo && isTrimChar(s[hi - 1])) hi--
-      if (lo !== 0 || hi !== s.length) s = s.slice(lo, hi)
-    }
-    // 含协议时协议+主机名转小写（路径大小写敏感保留）
-    // S8786：([^/]+)(.*)$ 双量词在失败路径呈 O(n²) 回溯；改为先匹配协议前缀、再线性切主机，
-    // 语义与原正则一致（host 至少 1 字符才成立，否则原样保留）
-    const m = /^[a-z][a-z0-9+.-]*:\/\//i.exec(s)
-    if (m) {
-      const rest = s.slice(m[0].length)
-      const slash = rest.indexOf('/')
-      const host = slash === -1 ? rest : rest.slice(0, slash)
-      if (host !== '') s = m[0].toLowerCase() + host.toLowerCase() + (slash === -1 ? '' : rest.slice(slash))
+    try { s = String(u).trim() } catch (e) { return '' }
+    const hashIndex = s.indexOf('#')
+    if (hashIndex !== -1) s = s.slice(0, hashIndex)
+    const queryIndex = s.indexOf('?')
+    const rawQuery = queryIndex === -1 ? '' : s.slice(queryIndex + 1)
+    if (queryIndex !== -1) s = s.slice(0, queryIndex)
+    s = this._trimUrlEdges(s)
+    s = this._normalizeUrlAuthority(s)
+    if (rawQuery) {
+      const kept = rawQuery.split('&').filter(part => !this._isTrackingQueryName(part.split('=', 1)[0]))
+      if (kept.length) s += '?' + kept.join('&')
     }
     return s
   },
@@ -1290,6 +1298,43 @@ const Formatter = {
     return -1
   },
 
+  _readTagAttrValue (tag, index, end) {
+    while (index < end && /\s/.test(tag[index])) index++
+    if (index >= end) return ['', end]
+    if (tag[index] === '"' || tag[index] === "'") {
+      const quote = tag[index++]
+      const start = index
+      while (index < end && tag[index] !== quote) index++
+      return index >= end ? ['', end] : [tag.slice(start, index), index + 1]
+    }
+    const start = index
+    while (index < end && !/[\s>]/.test(tag[index])) index++
+    return [tag.slice(start, index), index]
+  },
+
+  /** 读取单个标签的真实属性值，跳过其他属性的引号内容，避免把 title/data-* 中的 href/src 文本误当属性。 */
+  _getTagAttr (tag, wantedName) {
+    if (typeof tag !== 'string') return ''
+    const wanted = wantedName.toLowerCase()
+    const end = tag.endsWith('>') ? tag.length - 1 : tag.length
+    let i = 1
+    while (i < end && /[A-Za-z0-9]/.test(tag[i])) i++
+    if (wanted === 'href' && /^<ahref\s*=/i.test(tag)) i = 2
+    while (i < end) {
+      while (i < end && /[\s/]/.test(tag[i])) i++
+      const nameStart = i
+      while (i < end && !/[\s"'/>=]/.test(tag[i])) i++
+      if (nameStart === i) { i++; continue }
+      const name = tag.slice(nameStart, i).toLowerCase()
+      while (i < end && /\s/.test(tag[i])) i++
+      if (tag[i] !== '=') continue
+      const [value, next] = this._readTagAttrValue(tag, i + 1, end)
+      i = next
+      if (name === wanted) return value
+    }
+    return ''
+  },
+
   /** 已知标签转换操作查找（v3.262 扫描器用）：语义与原 if 链逐条一致——p/div 前缀匹配
    *  （原 <\/?p 无 \b），img/td/th/tr/table 仅开标签（</td> 由通用剥离移除），li 开闭均可，其余词边界内。 */
   _tagOpFor (name, closing, wordAfter, tagOps) {
@@ -1463,8 +1508,7 @@ const Formatter = {
     // href 前不允许 -/_ 属性名续接（data-href/data_href 不再误取链接目标）。
     html = this._replaceTagged(html, /<a(?=[\s>]|href\s*=)/gi,
       (m, txt, openTag) => {
-        const hrefM = /(?<![-_])href\s*=\s*["']([^"']*)["']/i.exec(openTag) || /(?<![-_])href\s*=\s*([^\s"'>]+)/i.exec(openTag)
-        const cleanHref = Utils.safeUrl(hrefM ? hrefM[1] : '')
+        const cleanHref = Utils.safeUrl(this._getTagAttr(openTag, 'href'))
         return cleanHref ? `[${anchorText(txt)}](${cleanHref})` : anchorText(txt)
       },
       () => '</a>')
@@ -1482,13 +1526,12 @@ const Formatter = {
     html = (() => {
       const tagOps = {
         img: (tag) => {
-          const srcM = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i) || tag.match(/\bsrc\s*=\s*([^\s"'<>`]+)/i)
-          if (!srcM) return tag // 无 src 不转换（原链由通用剥离兜底剥空）
-          const src = Utils.safeUrl(srcM[1])
+          const srcValue = this._getTagAttr(tag, 'src')
+          if (!srcValue) return tag // 无 src 不转换（原链由通用剥离兜底剥空）
+          const src = Utils.safeUrl(srcValue)
           if (!src) return tag.replace(/\bsrc\s*=\s*(?:(["'])[^"']*\1|[^\s"'<>`]+)/i, '') // 空/危险 src 不生成可执行图片链接
-          const altM = tag.match(/\balt\s*=\s*["']([^"']*)["']/i) || tag.match(/\balt\s*=\s*([^\s"'<>`]+)/i)
-          // alt 截断（真实接口 alt 可长达 250+ 字符拖累推送）——代理对安全
-          const alt = altM ? Utils.truncateUtf16(altM[1], 50) : ''
+          // alt 截断（真实接口 alt 可长达 250+字符拖累推送）——代理对安全
+          const alt = Utils.truncateUtf16(this._getTagAttr(tag, 'alt'), 50)
           // C008 二次修复：alt 实体解码后直接转义（&#93; → \] 等），与 anchor 文本同口径
           const altText = alt ? Utils.decodeHtmlEntities(alt).replace(/[[\]\\]/g, '\\$&') : ''
           return `\n\n![${altText}](${src})\n\n`

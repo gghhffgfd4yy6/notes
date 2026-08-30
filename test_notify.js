@@ -748,6 +748,26 @@ console.log('========================================\n');
     assert(typeof notify.safeErr({ message: bad }) === 'string', 'safeErr 应安全返回字符串')
   })
 
+  await test('本地配置加载失败不泄露异常中的凭据（v3.271）', () => {
+    const { execFileSync } = require('child_process')
+    const script = `
+      const Module = require('module'); const fs = require('fs');
+      const local = require('path').join(process.cwd(), 'push_config.local.js');
+      const originalExists = fs.existsSync; const originalLoad = Module._load;
+      const logs = []; const originalWarn = console.warn;
+      fs.existsSync = p => p === local || originalExists(p);
+      Module._load = function (request, parent, isMain) {
+        if (request === local) throw new Error('LOCAL_CONFIG_SECRET_123');
+        return originalLoad.call(this, request, parent, isMain);
+      };
+      console.warn = (...args) => logs.push(args.join(' '));
+      require('./xbk_sendNotify_slim.js');
+      console.warn = originalWarn; fs.existsSync = originalExists; Module._load = originalLoad;
+      if (logs.join('\\n').includes('LOCAL_CONFIG_SECRET_123')) process.exit(1);
+    `
+    execFileSync(process.execPath, ['-e', script], { cwd: __dirname })
+  })
+
   await test('日志脱敏: maskKey/maskUrl 不泄露完整密钥', () => {
     const { maskKey, maskUrl } = notify
     // 长密钥保留首尾

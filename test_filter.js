@@ -1072,6 +1072,17 @@ console.log('========================================\n');
     }
   })
 
+  await test('htmlToMarkdown 只读取标签层真实 href/src 属性（v3.271）', () => {
+    const a1 = htmlToMarkdown({ content_html: '<a title="客服提示 href=https://evil.example" href="https://good.example/deal">优惠</a>', url: '' })
+    assertEqual(a1.includes('[优惠](https://good.example/deal)'), true, `应使用真实 href: ${a1}`)
+    assertEqual(a1.includes('evil.example'), false, `不得读取属性文本中的 href: ${a1}`)
+    const a2 = htmlToMarkdown({ content_html: '<a title="href=https://evil.example">优惠</a>', url: '' })
+    assertEqual(a2.includes('evil.example'), false, `无真实 href 不得生成恶意链接: ${a2}`)
+    const img = htmlToMarkdown({ content_html: '<img data-src="https://evil.example/x.png" title="src=https://evil.example/y.png" src="https://good.example/z.png" alt="图">', url: '' })
+    assertEqual(img.includes('![图](https://good.example/z.png)'), true, `应使用真实 src: ${img}`)
+    assertEqual(img.includes('evil.example'), false, `不得读取 data-src/属性文本: ${img}`)
+  })
+
   await test('htmlToMarkdown data-href 不当作链接目标（CodeRabbit）', () => {
     const r = htmlToMarkdown({ content_html: '<a data-href="https://evil.example">文本</a>', url: '' })
     assertEqual(r.includes('(https://evil.example)'), false, 'data-href 不应生成 Markdown 链接')
@@ -6553,8 +6564,11 @@ console.log('========================================\n');
   await test('边界: normUrl 极端输入行为锁定', () => {
     assertEqual(normUrl('http://'), 'http:', '纯协议残留(已知#27)')
     assertEqual(normUrl('///'), '', '全斜杠→空')
-    assertEqual(normUrl('a?x=1'), 'a', 'v3.156: query 去除(与 getFileName 口径一致,防跟踪参数重复判重)')
-    assertEqual(normUrl('http://A.com/p?x=1#s'), 'http://a.com/p', 'v3.156: query+hash+主机小写')
+    assertEqual(normUrl('a?id=1'), 'a?id=1', '业务 query 应保留为身份')
+    assertEqual(normUrl('a?id=1'), normUrl('a?id=1&utm_source=x'), 'utm 追踪参数应忽略')
+    assertEqual(normUrl('a?id=1#s'), 'a?id=1', 'hash 不参与身份')
+    assertEqual(normUrl('https://A.com/p?id=1&utm_source=x#s'), 'https://a.com/p?id=1', '主机小写、追踪参数和hash归一化')
+    assertEqual(normUrl('https://user:Token@A.com/p'), 'https://user:Token@a.com/p', 'userinfo 保持大小写，仅主机名归一化')
     assertEqual(normUrl('/A/B/'), 'A/B', '首尾斜杠去除')
     assertEqual(normUrl('  /a/  '), 'a', '空白+斜杠')
   })
@@ -8071,17 +8085,20 @@ console.log('========================================\n');
     assertEqual(c2.pingbitime._type === 'time' && c2.pingbitime.value === 5, true, '首尾空格应 trim 后生效')
   })
 
-  await test('normUrl 去 query/hash + 无id同内容不同query去重（#4）', () => {
-    assertEqual(normUrl('/a?x=1'), 'a')
-    assertEqual(normUrl('/a?x=2'), 'a')
+  await test('normUrl 保留业务 query，仅忽略追踪参数（v3.271）', () => {
+    assertEqual(normUrl('/a?x=1'), 'a?x=1')
+    assertEqual(normUrl('/a?x=2'), 'a?x=2')
+    assertEqual(normUrl('/a?x=1&utm_source=x'), 'a?x=1')
     assertEqual(normUrl('/a#sec'), 'a')
-    assertEqual(normUrl('https://A.com/p?u=1&t=2#top'), 'https://a.com/p')
+    assertEqual(normUrl('https://A.com/p?u=1&t=2#top'), 'https://a.com/p?u=1&t=2')
     const fs = require('fs')
     const p = getFilePath('test_q156.json')
     try { fs.unlinkSync(p) } catch (e) {}
     saveBatch([{ url: '/a?x=1', title: '同' }], 'test_q156.json')
     saveBatch([{ url: '/a?x=2', title: '同' }], 'test_q156.json')
-    assertEqual(readMessages(p).length, 1, '去 query 后应判重 1 条')
+    assertEqual(readMessages(p).length, 2, '不同业务 query 不应判重')
+    saveBatch([{ url: '/a?x=1&utm_source=x', title: '同' }], 'test_q156.json')
+    assertEqual(readMessages(p).length, 2, '仅追踪参数差异应判重')
     try { fs.unlinkSync(p) } catch (e) {}
   })
 
