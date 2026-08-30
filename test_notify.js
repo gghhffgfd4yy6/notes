@@ -24,6 +24,7 @@ let leakResponse = false // v3.185：异常响应含敏感字段时，日志只�
 let catchRespLeak = false // logErr 修复后补充回归：响应结构异常时 resp 对象携带 request.options（模拟 got 响应对象含原始请求体）
 let failMDevSecond = false // v3.166：Bark/PushMe 多设备第 2 个失败（至少一个成功=通道成功不重试）
 let mdevCount = 0 // 多设备计数（failMDevSecond 时按调用序第 1 成功第 2 失败）
+let syncPostThrow = false // got.post 同步构造异常
 require.cache[gotPath].exports = (url, options) => {
   gotCalls.push({ url, options })
   // 一言接口失败模拟：抛 Error（网络异常路径）
@@ -37,6 +38,7 @@ require.cache[gotPath].exports = (url, options) => {
 require.cache[gotPath].exports.get = require.cache[gotPath].exports
 require.cache[gotPath].exports.post = (url, options) => {
   gotCalls.push({ url, options })
+  if (syncPostThrow) throw new Error('sync request construction failure')
   // 失败模拟（v3.75）：异步 reject 走 $.post 的 err 回调；response.body 含密钥回显（验证不再传给 callback）
   if (failPost) {
     const e = new Error('API error: connection refused')
@@ -253,6 +255,29 @@ console.log('========================================\n');
     } finally { failMDevSecond = false }
   }))
 
+  await test('Bark/PushMe: got.post 同步异常 → 外层 Promise reject 不挂起（v3.270）', async () => withChannels(async () => {
+    syncPostThrow = true
+    try {
+      cfg.BARK_PUSH = 'sync-bark'
+      const expectRejected = async (promise, label) => {
+        let timer
+        try {
+          await Promise.race([promise, new Promise((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} pending`)), 200)
+          })])
+          throw new Error(`${label} 未 reject`)
+        } catch (e) {
+          assert(!String(e.message).includes('pending'), `${label} 不应永久 pending`)
+        } finally { clearTimeout(timer) }
+      }
+      cfg.BARK_PUSH = 'sync-bark'
+      await expectRejected(notify.sendNotify('标题', '内容'), 'Bark')
+      cfg.BARK_PUSH = ''
+      cfg.PUSHME_KEY = 'sync-pushme'
+      await expectRejected(notify.sendNotify('标题', '内容'), 'PushMe')
+    } finally { syncPostThrow = false }
+  }))
+
   // 4. PushDeer: URL 编码
   await test('PushDeer: body 全字段 URL 编码(& # 转义)', () => withChannels(async () => {
     cfg.DEER_KEY = 'key1'
@@ -277,6 +302,9 @@ console.log('========================================\n');
     assert(!gotCalls[0].options.json.markdown.content.includes('!['), 'v3.130：企微 markdown 不支持图片，![]() 应剥成 alt')
     assert(gotCalls[0].options.json.markdown.content.includes('图'), '图片 alt 应保留')
     assert(gotCalls.length === 1, '仅企微一次请求')
+    cfg.QYWX_KEY = 'a+b/c?d&e=f'
+    await notify.sendNotify('标题', '内容')
+    assert(new URL(gotCalls[1].url).searchParams.get('key') === 'a+b/c?d&e=f', '企微 key 应按 URL 参数解码还原')
     // v3.138：QYWX_ORIGIN 带尾斜杠 → URL 无双斜杠
     const origOrigin = cfg.QYWX_ORIGIN
     cfg.QYWX_ORIGIN = 'https://qyapi.weixin.qq.com/'
