@@ -608,7 +608,7 @@ function barkNotify (text, desp, params = {}) {
     Promise.all(pushPromises).then(results => {
       if (results.some(r => r && r.ok)) resolve()
       else reject(aggregateChannelError('bark', 'Bark 全部设备发送失败', results.map(r => r && r.error)))
-    })
+    }).catch(reject)
   })
 }
 
@@ -686,7 +686,7 @@ function pushMeNotify (text, desp, params = {}) {
     Promise.all(pushPromises).then(results => {
       if (results.some(r => r && r.ok)) resolve()
       else reject(aggregateChannelError('pushme', 'PushMe 全部 key 发送失败', results.map(r => r && r.error)))
-    })
+    }).catch(reject)
   })
 }
 
@@ -696,7 +696,7 @@ function qywxBotNotify (text, desp, params = {}) {
     const options = {
       ...REQUEST_OPTIONS,
       ...requestExtras(params),
-      url: `${trimTrailingSlashes(String(QYWX_ORIGIN || 'https://qyapi.weixin.qq.com'))}/cgi-bin/webhook/send?key=${QYWX_KEY}`, // v3.138：去尾斜杠防双斜杠
+      url: `${trimTrailingSlashes(String(QYWX_ORIGIN || 'https://qyapi.weixin.qq.com'))}/cgi-bin/webhook/send?key=${encodeURIComponent(String(QYWX_KEY || ''))}`, // 参数值编码，防特殊字符破坏 query
       json: {
         // v3.127：msgtype 'text' → 'markdown'——desp 是 Markdown 内容，text 模式会显示 ** 等原始符号（企微支持 markdown）
         msgtype: 'markdown',

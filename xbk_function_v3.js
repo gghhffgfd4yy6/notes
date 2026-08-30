@@ -1559,7 +1559,26 @@ const Formatter = {
           if (lt === -1) { out += str.slice(pos); break }
           const gt = this._findTagEnd(str, lt + 1)
           if (gt === -1) { out += str.slice(pos); break }
-          if (gt === lt + 1) { out += str.slice(pos, gt + 1); pos = gt + 1; continue }
+          // 只有看起来像 HTML 标签的片段才剥离；`2 < 3 > 1`、`<world>` 等普通文本保留。
+          const tagStart = str[lt + 1] === '/' ? lt + 2 : lt + 1
+          const nameM = /^[a-z][a-z0-9-]*/i.exec(str.slice(tagStart, gt))
+          const name = nameM ? nameM[0].toLowerCase() : ''
+          const knownTags = new Set(['a', 'br', 'p', 'div', 'li', 'ul', 'ol', 'b', 'strong', 'i', 'em', 'img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'td', 'th', 'tr', 'table', 'script', 'style', 'input', 'link', 'blockquote'])
+          const looksLikeClosedUnknown = name && !knownTags.has(name) &&
+            !str.slice(lt, gt + 1).startsWith('</') &&
+            new RegExp(`</${name}\\s*>`, 'i').test(str.slice(gt + 1))
+          if (gt === lt + 1 || !name || (!knownTags.has(name) && !looksLikeClosedUnknown)) {
+            // 未闭合的未知片段更可能是普通文本（如 `<world>`）；保留当前字符继续扫描。
+            // `<<>>` 仍按历史语义丢弃首个尖括号，避免旧的畸形输入断言回归。
+            if (!name && str[lt + 1] === '<') {
+              out += str.slice(pos, lt)
+              pos = lt + 1
+            } else {
+              out += str.slice(pos, lt + 1)
+              pos = lt + 1
+            }
+            continue
+          }
           out += str.slice(pos, lt)
           pos = gt + 1
         }
@@ -1943,26 +1962,21 @@ const RuleEngine = {
     return compiled
   },
 
-  // ReDoS 纵深防御：matchesCompiled 正则在热路径对输入长度设上限。配置侧 hasNestedQuantifier
-  // 已在编译期拦截「嵌套无限量词」这一主要灾难性回溯来源，但仍有其他慢回溯形态（交替/前视/
-  // 超大字符类 × 超长输入）可能卡住主线程。对超长输入先截断再 .test()，限界单次匹配最坏耗时。
-  // 取舍：超过 _RE_INPUT_MAX 的长文本只在前缀段参与过滤（罕见且可控），换取匹配复杂度有界。
+  // RE2 本身保证线性时间；不再截断匹配输入，避免关键词位于长文本后半段时漏匹配。
+  // _RE_INPUT_MAX 保留为兼容性常量，供外部诊断/旧调用方参考。
   _RE_INPUT_MAX: 4096,
   /** 截断超长输入到 _RE_INPUT_MAX（避免 .test() 对超长串灾难性回溯） */
   _capReInput (s) {
     // Round2 C038：过滤链路与 URL 安全链路口径一致，匹配前剥离零宽字符（\u200B-\u200D、\uFEFF）
     s = s.replace(/[\u200B-\u200D\uFEFF]+/g, '')
-    if (s.length <= this._RE_INPUT_MAX) return s
-    let cut = s.slice(0, this._RE_INPUT_MAX)
-    const last = cut.charCodeAt(cut.length - 1)
-    if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1) // 结尾孤立高代理（低代理被切掉）→ 退一位
-    return cut
+    // RE2 提供线性时间保证，因此完整输入不会引入 V8 回溯风险；只做零宽字符归一化。
+    return s
   },
 
   /** 多行规则分类匹配：无 cat 限制(匹配所有)或有 cat 且 catename 匹配 */
   _catMatches (rule, catename) {
     if (!rule.cat) return true
-    if (!catename) return false
+    if (catename === undefined || catename === null || catename === '') return false
     try {
       const value = typeof catename === 'string' ? catename : String(catename)
       return rule.cat.test(this._capReInput(value))
@@ -3474,7 +3488,10 @@ const Network = {
         // retry: { limit: 0 } 关闭 got 内置重试，完全交给外层手写逻辑
         const result = await fetchJson(Config.api.pushUrl, {
 
-          timeout: Utils.num(Config.api.timeout, 5000), // v3.162：字符串'5000'→5000（v3.158 转换 7 处漏了 timeout，曾回退 15s）
+          timeout: (() => {
+            const n = Utils.num(Config.api.timeout, 5000)
+            return n > 0 ? n : 5000
+          })(), // 非正 timeout 只告警不应传入 HTTP 层
           retry: { limit: 0 },
           headers: {
             'User-Agent': `xbk-push-script/${PKG_VERSION}`,
@@ -4133,7 +4150,24 @@ const App = {
 
     const stateResult = this._readSafeState(statePath)
     if (stateResult.status === 'ok') {
-      try { return this._normalizeReportState(JSON.parse(stateResult.text)) } catch (e) { return this._blankReportState() }
+      try {
+        const raw = JSON.parse(stateResult.text)
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+          throw new Error('日报状态顶层必须是对象')
+        }
+        for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+          if (raw[k] !== undefined && (!Number.isSafeInteger(raw[k]) || raw[k] < 0)) {
+            throw new Error(`日报状态字段 ${k} 无效`)
+          }
+        }
+        if (raw.pending !== undefined && (!raw.pending || typeof raw.pending !== 'object' || Array.isArray(raw.pending))) {
+          throw new Error('日报状态 pending 字段无效')
+        }
+        return this._normalizeReportState(raw)
+      } catch (e) {
+        console.error(`日报累计状态损坏，跳过本次日报更新以保留原文件 ${statePath}: ${Utils.safeErrorText(e, '解析失败')}`)
+        return null
+      }
     }
     if (stateResult.status !== 'missing') {
       console.error(`日报累计状态读取失败(${stateResult.status})，跳过本次日报更新以免累计状态被重置 ${statePath}`)
@@ -4158,7 +4192,8 @@ const App = {
     const pending = state.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
     const pendingState = { ...state, pending: { ...pending } }
     this._accumulateReport(pendingState.pending, summary)
-    this._persistReportState(statePath, pendingState)
+    const pendingSaved = this._persistReportState(statePath, pendingState)
+    if (!pendingSaved) console.warn('⚠️ 日报待发送状态未持久化，继续发送但失败时将保留旧状态')
     try {
       // 单次青龙入口会在 App.run 返回后退出，必须等待日报发送完成。
       await Pusher.send(reportText, reportBody)
@@ -4171,8 +4206,9 @@ const App = {
         failed: pendingState.pending.failed || 0,
         truncated: pendingState.pending.truncated || 0
       }
-      this._persistReportState(statePath, nextState)
-      console.log('已发送昨日运行日报')
+      const nextSaved = this._persistReportState(statePath, nextState)
+      if (nextSaved) console.log('已发送昨日运行日报')
+      else console.warn('⚠️ 昨日日报已发送，但最终状态未持久化，重启后可能重复发送')
     } catch (e) {
       // 失败保留旧日期和 pending，下一次运行继续重试；记录脱敏后的摘要便于排查。
       console.error('发送昨日运行日报失败:', Utils.safeErrorText(e, '未知错误'))
@@ -4396,7 +4432,8 @@ const App = {
           filterStateReady = false
         }
         // 规则哈希变化（正常失效）或「上次清理的文件 ≠ 当前缓存文件」（切源后回到本文件也重评）
-        if ((lastHash && lastHash !== filterHash) || (lastFile && lastFile !== cacheName)) {
+        const hashKnown = hashResult.status === 'ok' && lastFile !== '' && lastHash !== ''
+        if (!hashKnown || lastHash !== filterHash || lastFile !== cacheName) {
           const fp = MessageStore.getFilePath(cacheName)
           const msgs = MessageStore.readMessages(fp)
           const kept = msgs.filter(m => !(m && typeof m === 'object' && m._f === true))

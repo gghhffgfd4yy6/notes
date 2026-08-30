@@ -337,6 +337,11 @@ console.log('========================================\n');
     ), true)
   })
 
+  await test('多行分类 0/false 参与匹配（v3.270）', () => {
+    assertEqual(listfilter({ catename: 0, louzhu: 'u', title: 'x', content: 'x' }, compileRules({ pingbilouzhu: '0###u' })), false)
+    assertEqual(listfilter({ catename: false, louzhu: 'u', title: 'x', content: 'x' }, compileRules({ pingbilouzhu: 'false###u' })), false)
+  })
+
   // ==================== 7. 多分类模式（###） ====================
   console.log('\n📂 7. 多分类模式（###）')
 
@@ -747,6 +752,11 @@ console.log('========================================\n');
     const result = htmlToMarkdown({ url: 'http://x' })
     assertEqual(result.includes('原文链接'), true)
     assertEqual(result.includes('http://x'), true)
+  })
+
+  await test('HTML 纯文本尖括号保留（v3.270）', () => {
+    assertEqual(htmlToMarkdown({ content_html: '2 < 3 > 1', url: '' }), '2 < 3 > 1')
+    assertEqual(htmlToMarkdown({ content_html: 'hello <world>', url: '' }), 'hello <world>')
   })
 
   await test('HTML 标签被正确转换', () => {
@@ -2302,6 +2312,13 @@ console.log('========================================\n');
   await test('compileRules 无效正则安全处理', () => {
     const r = compileRules({ pingbibiaoti: '[未闭合' })
     assertEqual(r.pingbibiaoti, null)
+  })
+
+  await test('长文本完整匹配不截断（v3.270）', () => {
+    const c = compileRules({ pingbibiaoti: 'forbidden' })
+    const value = 'x'.repeat(4096) + 'forbidden'
+    assertEqual(matchesCompiled(c.pingbibiaoti, value, 'cat'), true)
+    assertEqual(whitelistFilter({ title: value }, 'title', 'forbidden'), true)
   })
 
   await test('matchesCompiled 简单正则匹配', () => {

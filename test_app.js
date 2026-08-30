@@ -2257,19 +2257,20 @@ console.log('========================================\n');
     }
   })
 
-  await test('损坏 report.state 非对象 → 重置为安全状态并继续日报累计（v3.186）', async () => {
+  await test('损坏 report.state 非对象 → 保留原文件并跳过日报更新（v3.270）', async () => {
     reset()
     setPushUrl('t63_report_state_corrupt')
     const statePath = path.join(CACHE_DIR, 'report.state')
     const orig = Config.report.enabled
     try {
       Config.report.enabled = true
-      fakeData = [makeItem({ id: 1 })]
+      xbk.App._reportMemoryStateByPath.delete(statePath)
+      try { fs.unlinkSync(statePath) } catch (e) {}
       fs.writeFileSync(statePath, JSON.stringify('corrupt-state'))
+      xbk.App._reportMemoryStateByPath.delete(statePath)
+      fakeData = [makeItem({ id: 1 })]
       await xbk.run()
-      const st = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(st && typeof st === 'object' && !Array.isArray(st), '损坏状态应重置为对象')
-      assert(typeof st.total === 'number' && st.total >= 1, `状态累计应为安全数字: ${JSON.stringify(st)}`)
+      assert(fs.readFileSync(statePath, 'utf8') === JSON.stringify('corrupt-state'), '损坏状态原文应保留，不应覆盖为空状态')
     } finally {
       Config.report.enabled = orig
       try { fs.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
@@ -2374,6 +2375,32 @@ console.log('========================================\n');
     }
   })
 
+  await test('缺失/空 filter.hash → 历史 _f 重新评估并重推（v3.270）', async () => {
+    const hashPath = path.join(CACHE_DIR, 'filter.hash')
+    const orig = Config.filter.pingbibiaoti
+    try {
+      for (const [i, text] of ['', '   '].entries()) {
+        reset()
+        const suffix = `t270_filter_hash_missing_${i}`
+        setPushUrl(suffix)
+        Config.filter.pingbibiaoti = '屏蔽词'
+        fakeData = [makeItem({ id: 100 + i, title: '屏蔽词内容' })]
+        await xbk.run()
+        assert(readCacheFile(suffix).some(m => m._f === true), '首次应留下 _f')
+        fs.writeFileSync(hashPath, text, 'utf8')
+        reset()
+        Config.filter.pingbibiaoti = ''
+        fakeData = [makeItem({ id: 100 + i, title: '屏蔽词内容' })]
+        await xbk.run()
+        assert(pushCalls.length === 1, `hash=${JSON.stringify(text)} 时应重推`)
+        assert(!readCacheFile(suffix).some(m => m._f === true), '重推后不应保留 _f')
+      }
+    } finally {
+      Config.filter.pingbibiaoti = orig
+      try { fs.unlinkSync(hashPath) } catch (e) {}
+    }
+  })
+
   await test('过滤缓存清理写入失败 → filter.hash 不推进，下次可重试（P2 防回归）', async () => {
     reset()
     setPushUrl('t67_filter_hash_write_fail')
@@ -2450,6 +2477,20 @@ console.log('========================================\n');
     } finally {
       console.warn = origWarn
       Config.api.timeout = orig
+    }
+  })
+
+  await test('api.timeout 非正数 → HTTP 请求回退默认 5000（v3.270）', async () => {
+    for (const bad of [0, -1, '0', '-1']) {
+      reset()
+      setPushUrl(`t270_timeout_${String(bad).replace('-', 'neg')}`)
+      Config.api.timeout = bad
+      fakeData = [makeItem({ id: 1 })]
+      try {
+        await xbk.run()
+        const call = gotCalls.find(c => c.url.includes('t270_timeout_'))
+        assert(call && call.opts.timeout === 5000, `timeout=${bad} 应回退 5000: ${JSON.stringify(call && call.opts)}`)
+      } finally { Config.api.timeout = 5000 }
     }
   })
 
