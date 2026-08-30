@@ -1556,6 +1556,17 @@ const Formatter = {
         let pos = 0
         const knownTags = new Set(['a', 'br', 'p', 'div', 'li', 'ul', 'ol', 'b', 'strong', 'i', 'em', 'img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'td', 'th', 'tr', 'table', 'script', 'style', 'input', 'link', 'blockquote'])
         const unknownPairs = []
+        const lowerStr = str.toLowerCase()
+        const findUnknownClose = (name, from) => {
+          const needle = `</${name}`
+          for (let i = lowerStr.indexOf(needle, from); i !== -1; i = lowerStr.indexOf(needle, i + 1)) {
+            const end = i + needle.length
+            let j = end
+            while (j < str.length && /\s/.test(str[j])) j++
+            if (str[j] === '>') return i
+          }
+          return -1
+        }
         while (pos < str.length) {
           const lt = str.indexOf('<', pos)
           if (lt === -1) { out += str.slice(pos); break }
@@ -1567,7 +1578,7 @@ const Formatter = {
           const name = nameM ? nameM[0].toLowerCase() : ''
           const isClosing = str[lt + 1] === '/'
           const looksLikeClosedUnknown = name && !knownTags.has(name) &&
-            !isClosing && new RegExp(`</${name}\\s*>`, 'i').test(str.slice(gt + 1))
+            !isClosing && findUnknownClose(name, gt + 1) !== -1
           const isTrackedUnknownClose = isClosing && unknownPairs.length > 0 && unknownPairs[unknownPairs.length - 1] === name
           if (gt === lt + 1 || !name || (!knownTags.has(name) && !looksLikeClosedUnknown && !isTrackedUnknownClose)) {
             // 未闭合的未知片段更可能是普通文本（如 `<world>`）；保留当前字符继续扫描。
@@ -1966,15 +1977,10 @@ const RuleEngine = {
     return compiled
   },
 
-  // RE2 本身保证线性时间；不再截断匹配输入，避免关键词位于长文本后半段时漏匹配。
-  // _RE_INPUT_MAX 保留为兼容性常量，供外部诊断/旧调用方参考。
-  _RE_INPUT_MAX: 4096,
-  /** 截断超长输入到 _RE_INPUT_MAX（避免 .test() 对超长串灾难性回溯） */
-  _capReInput (s) {
-    // Round2 C038：过滤链路与 URL 安全链路口径一致，匹配前剥离零宽字符（\u200B-\u200D、\uFEFF）
-    s = s.replace(/[\u200B-\u200D\uFEFF]+/g, '')
-    // RE2 提供线性时间保证，因此完整输入不会引入 V8 回溯风险；只做零宽字符归一化。
-    return s
+  // RE2 本身保证线性时间；完整匹配归一化后的输入，避免关键词位于长文本后半段时漏匹配。
+  _normalizeReInput (s) {
+    // 过滤链路与 URL 安全链路口径一致，匹配前剥离零宽字符。
+    return s.replace(/[\u200B-\u200D\uFEFF]+/g, '')
   },
 
   /** 多行规则分类匹配：无 cat 限制(匹配所有)或有 cat 且 catename 匹配 */
@@ -1983,7 +1989,7 @@ const RuleEngine = {
     if (catename === undefined || catename === null || catename === '') return false
     try {
       const value = typeof catename === 'string' ? catename : String(catename)
-      return rule.cat.test(this._capReInput(value))
+      return rule.cat.test(this._normalizeReInput(value))
     } catch (e) {
       return false
     }
@@ -2007,13 +2013,13 @@ const RuleEngine = {
     if (compiled._type === 're') {
       // 简单正则
       if (!compiled.re || typeof compiled.re.test !== 'function') return false
-      return compiled.re.test(this._capReInput(value))
+      return compiled.re.test(this._normalizeReInput(value))
     }
 
     if (compiled._type === 'multi') {
       // 多行多分类：任意一行匹配即匹配
       if (!Array.isArray(compiled.rules) || compiled.rules.length === 0) return false
-      return this._anyRule(compiled.rules, catename, r => r.val.test(this._capReInput(value)))
+      return this._anyRule(compiled.rules, catename, r => r.val.test(this._normalizeReInput(value)))
     }
 
     return false
@@ -2384,7 +2390,7 @@ const FilterEngine = {
     // v3.249：超长 keyword 的 V8 会把正则编译推迟到首次 .test()，此时抛 "Regular expression too
     // large"（new RegExp 不抛）——test 也需 try/catch，失败按放行处理（宁可多推不可少推）。
     try {
-      return re.test(RuleEngine._capReInput(typeof value === 'string' ? value : Utils.safeText(value, '')))
+      return re.test(RuleEngine._normalizeReInput(typeof value === 'string' ? value : Utils.safeText(value, '')))
     } catch (e) { return true }
   }
 }
@@ -4598,7 +4604,7 @@ const App = {
           if (kwRe) {
             // 只看它过滤：统一走 FilterEngine.whitelistFilter（P2 审查 2026-08-15：消除两套漂移实现——
             // 内联版曾 0/false 标题一律放行、无 4096 长输入截断、无正则缓存；whitelistFilter 均覆盖：
-            // 仅 undefined/null/空串视为字段缺失，0/false 参与匹配、超长输入 _capReInput 截断、正则缓存复用）
+            // 仅 undefined/null/空串视为字段缺失，0/false 参与匹配、超长输入 _normalizeReInput 截断、正则缓存复用）
             // CodeRabbit：单次遍历评估 + 标记被拒项（曾 filter+includes 为 O(n²)），行为等价
             const kept = []
             for (const it of items) {

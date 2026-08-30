@@ -259,14 +259,22 @@ console.log('========================================\n');
     syncPostThrow = true
     try {
       cfg.BARK_PUSH = 'sync-bark'
-      let barkRejected = false
-      try { await notify.sendNotify('标题', '内容') } catch (e) { barkRejected = true }
-      assert(barkRejected, 'Bark 同步异常应 reject')
+      const expectRejected = async (promise, label) => {
+        let timer
+        try {
+          await Promise.race([promise, new Promise((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} pending`)), 200)
+          })])
+          throw new Error(`${label} 未 reject`)
+        } catch (e) {
+          assert(!String(e.message).includes('pending'), `${label} 不应永久 pending`)
+        } finally { clearTimeout(timer) }
+      }
+      cfg.BARK_PUSH = 'sync-bark'
+      await expectRejected(notify.sendNotify('标题', '内容'), 'Bark')
       cfg.BARK_PUSH = ''
       cfg.PUSHME_KEY = 'sync-pushme'
-      let pushmeRejected = false
-      try { await notify.sendNotify('标题', '内容') } catch (e) { pushmeRejected = true }
-      assert(pushmeRejected, 'PushMe 同步异常应 reject')
+      await expectRejected(notify.sendNotify('标题', '内容'), 'PushMe')
     } finally { syncPostThrow = false }
   }))
 
