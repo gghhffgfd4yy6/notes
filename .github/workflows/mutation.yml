@@ -101,7 +101,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # V3（4979 行，v3.270 按当前行数重拆）拆 5 段
+          # V3（4990 行，v3.270 按当前行数重拆）拆 5 段
           - name: v3-part1
             mutate: "xbk_function_v3.js:1-1000"
           - name: v3-part2
@@ -111,12 +111,12 @@ jobs:
           - name: v3-part4
             mutate: "xbk_function_v3.js:3001-4000"
           - name: v3-part5
-            mutate: "xbk_function_v3.js:4001-4979"
+            mutate: "xbk_function_v3.js:4001-4990"
           # sendnotify（1423 行，v3.270 补齐尾部至实际行数）拆 2 段
           - name: sendnotify-part1
             mutate: "xbk_sendNotify_slim.js:1-750"
           - name: sendnotify-part2
-            mutate: "xbk_sendNotify_slim.js:751-1423"
+            mutate: "xbk_sendNotify_slim.js:751-1429"
           # 小文件各一任务
           - name: failure-policy
             mutate: "xbk_failure_policy.js"

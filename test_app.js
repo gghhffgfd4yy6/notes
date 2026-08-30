@@ -2277,6 +2277,20 @@ console.log('========================================\n');
     }
   })
 
+  await test('report.state 非法日期字符串 → 保留原文件并跳过更新（v3.271）', async () => {
+    reset(); setPushUrl('t271_report_bad_date')
+    const statePath = path.join(CACHE_DIR, 'report.state'); const orig = Config.report.enabled
+    try {
+      Config.report.enabled = true
+      for (const date of ['garbage', '2026-99-99', '2026-02-29']) {
+        const original = JSON.stringify({ date, total: 9, pushed: 9 })
+        xbk.App._reportMemoryStateByPath.delete(statePath); fs.writeFileSync(statePath, original)
+        fakeData = [makeItem({ id: Date.now() + date.length })]; await xbk.run()
+        assert(fs.readFileSync(statePath, 'utf8') === original, `非法日期应保留原文件: ${date}`)
+      }
+    } finally { Config.report.enabled = orig; xbk.App._reportMemoryStateByPath.delete(statePath); try { fs.unlinkSync(statePath) } catch (e) {} }
+  })
+
   await test('report.state date 非字符串 → 保留原文件并跳过更新（v3.270）', async () => {
     reset()
     setPushUrl('t270_report_date_invalid')

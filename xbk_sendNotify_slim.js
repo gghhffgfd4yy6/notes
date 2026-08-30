@@ -34,8 +34,14 @@ function maskKey (k) {
 // URL 脱敏：host 保留，路径/设备码段脱敏（Bark 的 api.day.app/deviceKey）
 function maskUrl (u) {
   const s = safeString(u)
-  const m = s.match(/^(https?:\/\/[^/]+)\/(.+)$/)
-  return m ? m[1] + '/' + maskKey(m[2]) : maskKey(s)
+  try {
+    const parsed = new URL(s)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return maskKey(s)
+    const path = parsed.pathname && parsed.pathname !== '/' ? parsed.pathname : ''
+    return `${parsed.protocol}//${parsed.host}${path ? '/' + maskKey(path.replace(/^\/+/, '')) : ''}`
+  } catch (e) {
+    return maskKey(s)
+  }
 }
 // 代理对安全截断（v3.147）：按码元截断但不切断 emoji——末尾高代理退一位、孤立低代理退一位
 // （Server酱 v3.126 只处理高代理；此处统一高/低代理，wxpusher summary 复用）
@@ -937,7 +943,7 @@ function wxPusherProfileStat (channel, outcome) {
   const key = safeString(channel.appToken)
   let stat = wxPusherProfileStats.get(key)
   if (!stat) {
-    stat = { app: `***${key.slice(-4)}`, attempts: 0, success: 0, failed: 0, rateLimited: 0, networkError: 0, apiError: 0 }
+    stat = { app: maskKey(key), attempts: 0, success: 0, failed: 0, rateLimited: 0, networkError: 0, apiError: 0 }
     wxPusherProfileStats.set(key, stat)
   }
   stat.attempts++
@@ -968,10 +974,10 @@ function wxPusherProfile (channel, outcome, started, timings) {
   if (process.env.XBK_PROFILE !== '2' && process.env.XBK_PROFILE !== '3') return
   wxPusherProfileStat(channel, outcome)
   const elapsedMs = Date.now() - started
-  console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=${outcome} elapsedMs=${elapsedMs}`)
+  console.log(`[profile wxpusher] app=${maskKey(channel.appToken)} outcome=${outcome} elapsedMs=${elapsedMs}`)
   if (timings && timings.phases) {
     const p = timings.phases
-    console.log(`[profile wxpusher timing] app=***${safeString(channel.appToken).slice(-4)} wait=${profileMs(p.wait)} dns=${profileMs(p.dns)} tcp=${profileMs(p.tcp)} tls=${profileMs(p.tls)} request=${profileMs(p.request)} firstByte=${profileMs(p.firstByte)} download=${profileMs(p.download)} total=${profileMs(p.total)}`)
+    console.log(`[profile wxpusher timing] app=${maskKey(channel.appToken)} wait=${profileMs(p.wait)} dns=${profileMs(p.dns)} tcp=${profileMs(p.tcp)} tls=${profileMs(p.tls)} request=${profileMs(p.request)} firstByte=${profileMs(p.firstByte)} download=${profileMs(p.download)} total=${profileMs(p.total)}`)
   }
 }
 
@@ -986,7 +992,7 @@ function wxPusherBusinessError (data) {
 
 function wxPusherPost (channel, text, desp, params = {}) {
   const started = Date.now()
-  if (process.env.XBK_PROFILE === '2' || process.env.XBK_PROFILE === '3') console.log(`[profile wxpusher] app=***${safeString(channel.appToken).slice(-4)} outcome=start`)
+  if (process.env.XBK_PROFILE === '2' || process.env.XBK_PROFILE === '3') console.log(`[profile wxpusher] app=${maskKey(channel.appToken)} outcome=start`)
   return new Promise((resolve, reject) => {
     const options = {
       ...REQUEST_OPTIONS,

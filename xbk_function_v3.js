@@ -4116,6 +4116,17 @@ const App = {
     const n = Number(v)
     return typeof v !== 'boolean' && Number.isInteger(n) && n >= 0 && n <= Number.MAX_SAFE_INTEGER ? n : 0
   },
+  _isValidReportDate (value) {
+    if (value === '') return true
+    if (typeof value !== 'string') return false
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+    if (!m) return false
+    const year = Number(m[1]); const month = Number(m[2]); const day = Number(m[3])
+    if (year < 1 || month < 1 || month > 12 || day < 1) return false
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+    const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    return day <= days[month - 1]
+  },
   _normalizeReportState (raw) {
     const blank = () => this._blankReportState()
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return blank()
@@ -4167,7 +4178,7 @@ const App = {
         if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
           throw new Error('日报状态顶层必须是对象')
         }
-        if (raw.date !== undefined && typeof raw.date !== 'string') {
+        if (raw.date !== undefined && !this._isValidReportDate(raw.date)) {
           throw new Error('日报状态 date 字段无效')
         }
         for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
@@ -4210,10 +4221,10 @@ const App = {
 
   async _sendCrossDayReport (statePath, state, summary, today) {
     const reportText = `📊 xbk-push 日报（${state.date}）`
-    const reportBody = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}${state.truncated ? ` | 待推送 ${state.truncated}` : ''}`
     const pending = state.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
     const pendingState = { ...state, pending: { ...pending } }
     this._accumulateReport(pendingState.pending, summary)
+    const reportBody = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}${state.truncated ? ` | 待推送 ${state.truncated}` : ''}${pendingState.pending.total || pendingState.pending.dedup || pendingState.pending.filtered || pendingState.pending.pushed || pendingState.pending.failed || pendingState.pending.truncated ? `\n\n今日待结转：推送 ${pendingState.pending.pushed} 条 | 失败 ${pendingState.pending.failed} 条\n获取 ${pendingState.pending.total} | 去重 ${pendingState.pending.dedup} | 过滤 ${pendingState.pending.filtered}${pendingState.pending.truncated ? ` | 待推送 ${pendingState.pending.truncated}` : ''}` : ''}`
     const pendingSaved = this._persistReportState(statePath, pendingState)
     if (!pendingSaved) console.warn('⚠️ 日报待发送状态未持久化，继续发送但失败时将保留旧状态')
     try {
@@ -4246,7 +4257,7 @@ const App = {
       if (!state) return
       const today = this._reportToday()
       if (state.date && state.date !== today) {
-        if (state.total > 0 || state.failed > 0) {
+        if (['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'].some(k => state[k] > 0)) {
           await this._sendCrossDayReport(statePath, state, summary, today)
           return
         }
