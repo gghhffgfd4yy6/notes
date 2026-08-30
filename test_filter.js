@@ -757,6 +757,7 @@ console.log('========================================\n');
   await test('HTML 纯文本尖括号保留（v3.270）', () => {
     assertEqual(htmlToMarkdown({ content_html: '2 < 3 > 1', url: '' }), '2 < 3 > 1')
     assertEqual(htmlToMarkdown({ content_html: 'hello <world>', url: '' }), 'hello <world>')
+    assertEqual(htmlToMarkdown({ content_html: '<foo>İ</foo>', url: '' }), 'İ')
   })
 
   await test('HTML 标签被正确转换', () => {

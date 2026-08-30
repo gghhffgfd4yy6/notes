@@ -1556,7 +1556,7 @@ const Formatter = {
         let pos = 0
         const knownTags = new Set(['a', 'br', 'p', 'div', 'li', 'ul', 'ol', 'b', 'strong', 'i', 'em', 'img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'td', 'th', 'tr', 'table', 'script', 'style', 'input', 'link', 'blockquote'])
         const unknownPairs = []
-        const lowerStr = str.toLowerCase()
+        const lowerStr = str.replace(/[A-Z]/g, c => c.toLowerCase())
         const findUnknownClose = (name, from) => {
           const needle = `</${name}`
           for (let i = lowerStr.indexOf(needle, from); i !== -1; i = lowerStr.indexOf(needle, i + 1)) {
@@ -4604,7 +4604,7 @@ const App = {
           if (kwRe) {
             // 只看它过滤：统一走 FilterEngine.whitelistFilter（P2 审查 2026-08-15：消除两套漂移实现——
             // 内联版曾 0/false 标题一律放行、无 4096 长输入截断、无正则缓存；whitelistFilter 均覆盖：
-            // 仅 undefined/null/空串视为字段缺失，0/false 参与匹配、超长输入 _normalizeReInput 截断、正则缓存复用）
+            // 仅 undefined/null/空串视为字段缺失，0/false 参与匹配、完整输入归一化、正则缓存复用）
             // CodeRabbit：单次遍历评估 + 标记被拒项（曾 filter+includes 为 O(n²)），行为等价
             const kept = []
             for (const it of items) {
