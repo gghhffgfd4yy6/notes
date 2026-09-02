@@ -4300,7 +4300,9 @@ const App = {
       if (!state) return
       const today = this._reportToday()
       if (state.date && state.date !== today) {
-        if (['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'].some(k => state[k] > 0)) {
+        const reportKeys = ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']
+        const hasCounters = value => Boolean(value && reportKeys.some(k => value[k] > 0))
+        if (hasCounters(state) || hasCounters(state.pending)) {
           await this._sendCrossDayReport(statePath, state, summary, today)
           return
         }
@@ -4316,6 +4318,7 @@ const App = {
             truncated: pending.truncated || 0
           })
         }
+        this._accumulateReport(nextState, summary)
         this._persistReportState(statePath, nextState)
         return
       }
