@@ -1931,6 +1931,171 @@ console.log('========================================\n');
     }
   })
 
+  await test('跨天旧主全0 + pending缺失或全零 → 不发送日报且精确保存今日summary六项', async () => {
+    const originalCacheDir = Config.cache.dir
+    const originalToday = xbk.App._reportToday
+    const origReportEnabled = Config.report.enabled
+    const uniqueSuffix = `_report_zero_empty_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
+    Config.cache.dir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
+    const stateDir = path.join(__dirname, Config.cache.dir)
+    const statePath = path.join(stateDir, 'report.state')
+
+    try {
+      Config.report.enabled = true
+      xbk.App._reportToday = () => '2026-09-02'
+      require('fs').mkdirSync(stateDir, { recursive: true })
+
+      const cases = [
+        { name: 'pending缺失', initialState: { date: '2026-09-01', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 } },
+        { name: 'pending全零', initialState: { date: '2026-09-01', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0, pending: { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 } } }
+      ]
+
+      for (const tc of cases) {
+        reset()
+        Config.cache.dir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
+        Config.report.enabled = true
+        pushCalls.length = 0
+        xbk.App._reportMemoryStateByPath.clear()
+        require('fs').writeFileSync(statePath, JSON.stringify(tc.initialState))
+
+        const summary = { total: 11, dedup: 2, filtered: 3, pushed: 4, failed: 1, truncated: 1 }
+        await xbk.App._updateReport(summary)
+
+        assert(!pushCalls.some(c => c.text.includes('日报')), `${tc.name}: 跨天旧主全0且无非零pending时不应发送日报`)
+
+        const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
+        assert(st.date === '2026-09-02', `${tc.name}: 跨天后日期应更新为今天`)
+        assert(st.total === 11, `${tc.name}: total 应精确保存`)
+        assert(st.dedup === 2, `${tc.name}: dedup 应精确保存`)
+        assert(st.filtered === 3, `${tc.name}: filtered 应精确保存`)
+        assert(st.pushed === 4, `${tc.name}: pushed 应精确保存`)
+        assert(st.failed === 1, `${tc.name}: failed 应精确保存`)
+        assert(st.truncated === 1, `${tc.name}: truncated 应精确保存`)
+        assert(st.pending === undefined, `${tc.name}: 切换到今日后不应保留 pending`)
+      }
+    } finally {
+      Config.report.enabled = origReportEnabled
+      Config.cache.dir = originalCacheDir
+      xbk.App._reportToday = originalToday
+      xbk.App._reportMemoryStateByPath.clear()
+      try { require('fs').rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('跨天旧主全0 + 非零pending → 发送昨日日报、结转成功/保留失败且覆盖failed/truncated', async () => {
+    const originalCacheDir = Config.cache.dir
+    const originalToday = xbk.App._reportToday
+    const origReportEnabled = Config.report.enabled
+    const uniqueSuffix = `_report_zero_pending_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
+    Config.cache.dir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
+    const stateDir = path.join(__dirname, Config.cache.dir)
+    const statePath = path.join(stateDir, 'report.state')
+
+    try {
+      Config.report.enabled = true
+      xbk.App._reportToday = () => '2026-09-02'
+      require('fs').mkdirSync(stateDir, { recursive: true })
+
+      // 1) 成功路径（六项全非零 pending）
+      reset()
+      Config.cache.dir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
+      Config.report.enabled = true
+      pushCalls.length = 0
+      xbk.App._reportMemoryStateByPath.clear()
+      const initialStateSuccess = {
+        date: '2026-09-01',
+        total: 0,
+        dedup: 0,
+        filtered: 0,
+        pushed: 0,
+        failed: 0,
+        truncated: 0,
+        pending: { total: 10, dedup: 1, filtered: 2, pushed: 5, failed: 2, truncated: 3 }
+      }
+      require('fs').writeFileSync(statePath, JSON.stringify(initialStateSuccess))
+
+      const summarySuccess = { total: 7, dedup: 1, filtered: 1, pushed: 4, failed: 1, truncated: 2 }
+      await xbk.App._updateReport(summarySuccess)
+
+      const reportSuccess = pushCalls.find(c => c.text.includes('日报'))
+      assert(!!reportSuccess, '旧主全0但存在非零pending时应发送昨日日报')
+      assert(reportSuccess.text.includes('2026-09-01'), '日报标题应为昨日日期')
+      assert(reportSuccess.desp.includes('推送 0 条 | 失败 0 条'), '正文昨日主统计应保持旧主全0')
+      assert(reportSuccess.desp.includes('今日待结转：推送 9 条 | 失败 3 条'), '正文今日待结转应包含旧pending与当前summary合计')
+
+      const stateSuccess = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
+      assert(stateSuccess.date === '2026-09-02', '成功后日期应切到今天')
+      assert(stateSuccess.total === 17, '今日 total 应为 10 + 7')
+      assert(stateSuccess.dedup === 2, '今日 dedup 应为 1 + 1')
+      assert(stateSuccess.filtered === 3, '今日 filtered 应为 2 + 1')
+      assert(stateSuccess.pushed === 9, '今日 pushed 应为 5 + 4')
+      assert(stateSuccess.failed === 3, '今日 failed 应为 2 + 1')
+      assert(stateSuccess.truncated === 5, '今日 truncated 应为 3 + 2')
+      assert(stateSuccess.pending === undefined, '成功后 pending 应被消费移除')
+
+      // 2) 失败路径（仅 failed / truncated 非零 pending）
+      reset()
+      Config.cache.dir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
+      Config.report.enabled = true
+      pushCalls.length = 0
+      xbk.App._reportMemoryStateByPath.clear()
+      notifyFail = true
+      const initialStateFail = {
+        date: '2026-09-01',
+        total: 0,
+        dedup: 0,
+        filtered: 0,
+        pushed: 0,
+        failed: 0,
+        truncated: 0,
+        pending: { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 1, truncated: 2 }
+      }
+      require('fs').writeFileSync(statePath, JSON.stringify(initialStateFail))
+
+      const summaryFail = { total: 3, dedup: 0, filtered: 0, pushed: 2, failed: 1, truncated: 1 }
+      await xbk.App._updateReport(summaryFail)
+
+      const stateFail = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
+      assert(stateFail.date === '2026-09-01', '发送失败应保持昨日日期以便重试')
+      assert(stateFail.total === 0, '旧主 total 保持 0')
+      assert(stateFail.pushed === 0, '旧主 pushed 保持 0')
+      assert(stateFail.failed === 0, '旧主 failed 保持 0')
+      assert(stateFail.truncated === 0, '旧主 truncated 保持 0')
+      const pendingFail = stateFail.pending
+      assert(pendingFail && pendingFail.date === '', '失败时 pending date 应为空')
+      assert(pendingFail.total === 3, '失败时 pending total 应为 3')
+      assert(pendingFail.dedup === 0, '失败时 pending dedup 应为 0')
+      assert(pendingFail.filtered === 0, '失败时 pending filtered 应为 0')
+      assert(pendingFail.pushed === 2, '失败时 pending pushed 应为 2')
+      assert(pendingFail.failed === 2, '失败时 pending failed 应为 2')
+      assert(pendingFail.truncated === 3, '失败时 pending truncated 应为 3')
+
+      // 3) 后续重试成功（新 run + 新 summary，断言不双计数且成功结转）
+      notifyFail = false
+      pushCalls.length = 0
+      const summaryRetry = { total: 2, dedup: 1, filtered: 0, pushed: 1, failed: 0, truncated: 0 }
+      await xbk.App._updateReport(summaryRetry)
+
+      const reportRetry = pushCalls.find(c => c.text.includes('日报'))
+      assert(!!reportRetry, '重试成功应发送昨日日报')
+      const stateRetrySuccess = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
+      assert(stateRetrySuccess.date === '2026-09-02', '重试成功后日期切到今天')
+      assert(stateRetrySuccess.total === 5, '最终 total 应为 3 + 2')
+      assert(stateRetrySuccess.dedup === 1, '最终 dedup 应为 0 + 1')
+      assert(stateRetrySuccess.filtered === 0, '最终 filtered 应为 0 + 0')
+      assert(stateRetrySuccess.pushed === 3, '最终 pushed 应为 2 + 1')
+      assert(stateRetrySuccess.failed === 2, '最终 failed 应为 2 + 0')
+      assert(stateRetrySuccess.truncated === 3, '最终 truncated 应为 3 + 0')
+      assert(stateRetrySuccess.pending === undefined, '重试成功后 pending 移除')
+    } finally {
+      Config.report.enabled = origReportEnabled
+      Config.cache.dir = originalCacheDir
+      xbk.App._reportToday = originalToday
+      xbk.App._reportMemoryStateByPath.clear()
+      try { require('fs').rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('告警通道挂 → 不误报"已发送"（v3.145）', async () => {
     reset()
     setPushUrl('t59_alert_nofalse')
