@@ -11,7 +11,11 @@ const RETRYABLE_CODES = new Set([
 
 const PERMANENT_CODES = new Set([
   'ERR_INVALID_URL', 'ERR_BODY_NOT_JSON', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_INVALID_ARG_TYPE',
-  'MODULE_NOT_FOUND', 'NO_CHANNEL_CONFIG', 'HTTP_400', 'HTTP_401', 'HTTP_403',
+  'MODULE_NOT_FOUND', 'NO_CHANNEL_CONFIG',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN',
+  'CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID', 'CERT_SIGNATURE_FAILURE', 'CERT_REVOKED',
+  'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'HTTP_400', 'HTTP_401', 'HTTP_403',
   'HTTP_404', 'HTTP_405', 'HTTP_406', 'HTTP_410', 'HTTP_411', 'HTTP_413',
   'HTTP_415', 'HTTP_422', 'HTTP_423', 'HTTP_426', 'HTTP_451'
 ])
@@ -110,7 +114,9 @@ function classifyOne (error) {
   const message = String(info.message || '').toLowerCase()
   const permanentMessage = /接口返回数据格式异常|未配置任何推送通道|invalid\s+url|module\s+not\s+found|证书.*(主机|域名)|主机名.*证书/.test(message) ||
         /(?:unauthori[sz]ed|forbidden|bad request|not found|invalid\s+(?:token|key|parameter)|(?:token|key|密钥).*(?:invalid|invalidated|无效|错误|不存在|过期))/.test(message) ||
-        /(?:参数|配置).*(?:错误|无效|非法)/.test(message)
+        /(?:参数|配置).*(?:错误|无效|非法)/.test(message) ||
+        /(?:certificate has expired|certificate is not yet valid|self[- ]signed certificate|unable to verify the first certificate|unable to get (?:[a-z0-9_-]+\s+)*issuer certificate|certificate signature failure|certificate (?:has been )?revoked)/.test(message) ||
+        /(?:证书(?:已)?(?:过期|失效|吊销)|证书尚未生效|自签名证书|无法获取(?:本地)?(?:颁发者证书|证书颁发者)|证书签名(?:校验)?失败)/.test(message)
 
   if (errorName === 'SYNTAXERROR' || errorName === 'REFERENCEERROR') {
     return { kind: 'permanent', reason: errorName, info }
