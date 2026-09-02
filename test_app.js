@@ -1931,32 +1931,49 @@ console.log('========================================\n');
     }
   })
 
-  await test('跨天旧主全0 + pending缺失或全零 → 不发送日报且精确保存今日summary六项', async () => {
+  let isolatedReportSeq = 0
+  const withIsolatedReportEnv = async (name, testFn) => {
     const originalCacheDir = Config.cache.dir
     const originalToday = xbk.App._reportToday
     const origReportEnabled = Config.report.enabled
-    const uniqueSuffix = `_report_zero_empty_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
-    Config.cache.dir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
-    const stateDir = path.join(__dirname, Config.cache.dir)
+    const uniqueSuffix = `_report_iso_${Date.now()}_${++isolatedReportSeq}`
+    const cacheDir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
+    const stateDir = path.join(__dirname, cacheDir)
     const statePath = path.join(stateDir, 'report.state')
 
+    const setupRound = (initialState) => {
+      reset()
+      Config.cache.dir = cacheDir
+      Config.report.enabled = true
+      pushCalls.length = 0
+      xbk.App._reportMemoryStateByPath.clear()
+      require('fs').writeFileSync(statePath, JSON.stringify(initialState))
+    }
+
     try {
+      Config.cache.dir = cacheDir
       Config.report.enabled = true
       xbk.App._reportToday = () => '2026-09-02'
       require('fs').mkdirSync(stateDir, { recursive: true })
+      await testFn({ statePath, setupRound })
+    } finally {
+      Config.report.enabled = origReportEnabled
+      Config.cache.dir = originalCacheDir
+      xbk.App._reportToday = originalToday
+      xbk.App._reportMemoryStateByPath.clear()
+      try { require('fs').rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  }
 
+  await test('跨天旧主全0 + pending缺失或全零 → 不发送日报且精确保存今日summary六项', async () => {
+    await withIsolatedReportEnv('zero_empty', async ({ statePath, setupRound }) => {
       const cases = [
         { name: 'pending缺失', initialState: { date: '2026-09-01', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 } },
         { name: 'pending全零', initialState: { date: '2026-09-01', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0, pending: { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 } } }
       ]
 
       for (const tc of cases) {
-        reset()
-        Config.cache.dir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
-        Config.report.enabled = true
-        pushCalls.length = 0
-        xbk.App._reportMemoryStateByPath.clear()
-        require('fs').writeFileSync(statePath, JSON.stringify(tc.initialState))
+        setupRound(tc.initialState)
 
         const summary = { total: 11, dedup: 2, filtered: 3, pushed: 4, failed: 1, truncated: 1 }
         await xbk.App._updateReport(summary)
@@ -1973,36 +1990,13 @@ console.log('========================================\n');
         assert(st.truncated === 1, `${tc.name}: truncated 应精确保存`)
         assert(st.pending === undefined, `${tc.name}: 切换到今日后不应保留 pending`)
       }
-    } finally {
-      Config.report.enabled = origReportEnabled
-      Config.cache.dir = originalCacheDir
-      xbk.App._reportToday = originalToday
-      xbk.App._reportMemoryStateByPath.clear()
-      try { require('fs').rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
-    }
+    })
   })
 
   await test('跨天旧主全0 + 非零pending → 发送昨日日报、结转成功/保留失败且覆盖failed/truncated', async () => {
-    const originalCacheDir = Config.cache.dir
-    const originalToday = xbk.App._reportToday
-    const origReportEnabled = Config.report.enabled
-    const uniqueSuffix = `_report_zero_pending_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
-    Config.cache.dir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
-    const stateDir = path.join(__dirname, Config.cache.dir)
-    const statePath = path.join(stateDir, 'report.state')
-
-    try {
-      Config.report.enabled = true
-      xbk.App._reportToday = () => '2026-09-02'
-      require('fs').mkdirSync(stateDir, { recursive: true })
-
+    await withIsolatedReportEnv('zero_pending', async ({ statePath, setupRound }) => {
       // 1) 成功路径（六项全非零 pending）
-      reset()
-      Config.cache.dir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
-      Config.report.enabled = true
-      pushCalls.length = 0
-      xbk.App._reportMemoryStateByPath.clear()
-      const initialStateSuccess = {
+      setupRound({
         date: '2026-09-01',
         total: 0,
         dedup: 0,
@@ -2011,8 +2005,7 @@ console.log('========================================\n');
         failed: 0,
         truncated: 0,
         pending: { total: 10, dedup: 1, filtered: 2, pushed: 5, failed: 2, truncated: 3 }
-      }
-      require('fs').writeFileSync(statePath, JSON.stringify(initialStateSuccess))
+      })
 
       const summarySuccess = { total: 7, dedup: 1, filtered: 1, pushed: 4, failed: 1, truncated: 2 }
       await xbk.App._updateReport(summarySuccess)
@@ -2034,13 +2027,7 @@ console.log('========================================\n');
       assert(stateSuccess.pending === undefined, '成功后 pending 应被消费移除')
 
       // 2) 失败路径（仅 failed / truncated 非零 pending）
-      reset()
-      Config.cache.dir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
-      Config.report.enabled = true
-      pushCalls.length = 0
-      xbk.App._reportMemoryStateByPath.clear()
-      notifyFail = true
-      const initialStateFail = {
+      setupRound({
         date: '2026-09-01',
         total: 0,
         dedup: 0,
@@ -2049,8 +2036,8 @@ console.log('========================================\n');
         failed: 0,
         truncated: 0,
         pending: { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 1, truncated: 2 }
-      }
-      require('fs').writeFileSync(statePath, JSON.stringify(initialStateFail))
+      })
+      notifyFail = true
 
       const summaryFail = { total: 3, dedup: 0, filtered: 0, pushed: 2, failed: 1, truncated: 1 }
       await xbk.App._updateReport(summaryFail)
@@ -2087,13 +2074,7 @@ console.log('========================================\n');
       assert(stateRetrySuccess.failed === 2, '最终 failed 应为 2 + 0')
       assert(stateRetrySuccess.truncated === 3, '最终 truncated 应为 3 + 0')
       assert(stateRetrySuccess.pending === undefined, '重试成功后 pending 移除')
-    } finally {
-      Config.report.enabled = origReportEnabled
-      Config.cache.dir = originalCacheDir
-      xbk.App._reportToday = originalToday
-      xbk.App._reportMemoryStateByPath.clear()
-      try { require('fs').rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
-    }
+    })
   })
 
   await test('告警通道挂 → 不误报"已发送"（v3.145）', async () => {
