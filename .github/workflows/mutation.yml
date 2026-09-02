@@ -84,7 +84,7 @@ jobs:
           node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
 
       - name: 上传 re2 原生模块
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: re2-node24-linux-x64
           path: node_modules/re2/build/Release/re2.node
@@ -169,7 +169,7 @@ jobs:
       # 明细报告留档（inc-*.json + mutation.json/html），artifact 有公开下载 API
       - name: 上传变异报告
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: mutation-report-${{ matrix.name }}
           path: reports/
