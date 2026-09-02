@@ -30,7 +30,10 @@ function error (message, code) {
     assert.strictEqual(classifyFailure(error(code, code)).kind, 'retryable', `${code} 应可重试`)
   }
   for (const code of ['ERR_INVALID_URL', 'ERR_BODY_NOT_JSON', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_INVALID_ARG_TYPE',
-    'MODULE_NOT_FOUND', 'HTTP_400', 'HTTP_403', 'HTTP_404', 'HTTP_405', 'HTTP_406',
+    'MODULE_NOT_FOUND', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN',
+    'CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID', 'CERT_SIGNATURE_FAILURE', 'CERT_REVOKED',
+    'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+    'HTTP_400', 'HTTP_403', 'HTTP_404', 'HTTP_405', 'HTTP_406',
     'HTTP_410', 'HTTP_411', 'HTTP_413', 'HTTP_415', 'HTTP_422', 'HTTP_423', 'HTTP_426', 'HTTP_451']) {
     assert.strictEqual(classifyFailure(error(code, code)).kind, 'permanent', `${code} 应立即停止`)
   }
@@ -69,6 +72,28 @@ function error (message, code) {
   assert.strictEqual(classifyFailure(error('完全未知故障')).kind, 'retryable')
   assert.strictEqual(classifyFailure(Object.assign(new SyntaxError('代码解析失败'), { name: 'SyntaxError' })).kind, 'permanent')
 
+  // TLS / 证书分类：明确证书故障文本判 permanent，瞬时连接/超时/复合文本仍保持 retryable
+  assert.strictEqual(classifyFailure(error('certificate has expired')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('certificate is not yet valid')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('self-signed certificate')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('self signed certificate')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('unable to verify the first certificate')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('unable to get local issuer certificate')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('unable to get issuer certificate')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('certificate signature failure')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('certificate revoked')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('证书已过期')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('自签名证书')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('证书签名失败')).kind, 'permanent')
+  assert.strictEqual(classifyFailure(error('无法获取颁发者证书')).kind, 'permanent')
+
+  // 瞬时证书/网络复合文本反例（禁止泛匹配，必须仍为 retryable）
+  assert.strictEqual(classifyFailure(error('certificate verification timed out')).kind, 'retryable')
+  assert.strictEqual(classifyFailure(error('certificate check failed: ECONNRESET')).kind, 'retryable')
+  assert.strictEqual(classifyFailure(error('TLS handshake temporarily unavailable')).kind, 'retryable')
+  assert.strictEqual(classifyFailure(error('certificate handshake timed out', 'ETIMEDOUT')).kind, 'retryable')
+  assert.strictEqual(classifyFailure(error('certificate socket reset', 'ECONNRESET')).kind, 'retryable')
+
   const summarized = require('./xbk_failure_policy').summarizeError({
     code: 'HTTP_500',
     providerCode: 500,
@@ -100,6 +125,21 @@ function error (message, code) {
     failed: 1,
     failures: [{ code: 'HTTP_401', message: 'unauthorized' }]
   }).kind, 'permanent')
+  assert.strictEqual(classifySummary({
+    total: 1,
+    pushed: 0,
+    failed: 1,
+    failures: [{ code: 'CERT_HAS_EXPIRED', message: 'certificate has expired' }]
+  }).kind, 'permanent')
+  assert.strictEqual(classifySummary({
+    total: 2,
+    pushed: 0,
+    failed: 2,
+    failures: [
+      { code: 'CERT_HAS_EXPIRED', message: 'certificate has expired' },
+      { code: 'ETIMEDOUT', message: 'timeout' }
+    ]
+  }).kind, 'retryable', '全部失败但包含 permanent 与 retryable 混合错误时整体仍应 retryable')
   assert.strictEqual(classifyFailure({
     code: 'HTTP_401',
     message: 'invalid token + timeout summary',
