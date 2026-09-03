@@ -6,31 +6,10 @@
 // ============================================================
 const { execFileSync } = require('child_process')
 const path = require('path')
-
-function checkDependencies ({ requireFn = require } = {}) {
-  const missing = []
-  try {
-    requireFn('got')
-  } catch (error) {
-    missing.push('got')
-  }
-  try {
-    const RE2 = requireFn('re2')
-    const probe = new RE2('^re2$')
-    if (!probe.test('re2')) throw new Error('re2 native binding probe failed')
-  } catch (error) {
-    missing.push('re2')
-  }
-  if (missing.length === 0) return true
-
-  console.error(`❌ 缺少依赖：${missing.join(', ')}`)
-  console.error('请先在项目根目录执行：')
-  console.error('  npm ci --ignore-scripts')
-  console.error('  npm run rebuild --prefix node_modules/re2')
-  return false
-}
+const { checkDependencies } = require('./scripts/check-deps')
 
 const SUITES = [
+  { name: '依赖预检', file: 'test_check_deps.js', desc: 'checkDependencies 缺失/损坏分支' },
   { name: '常驻循环', file: 'test_loop.js', desc: '长驻调度、单轮异常隔离、停止信号' },
   { name: '常驻失败策略', file: 'test_failure_policy.js', desc: '网络/永久错误分类、持续退避重试、摘要失败和恢复' },
   { name: 'DNS失效回归', file: 'test_dns_cache.js', desc: '连接错误后清除主机 DNS 缓存并重新解析' },
