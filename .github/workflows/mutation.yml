@@ -3,7 +3,7 @@ name: Mutation
 # 变异测试：全量生产代码覆盖。
 # 长文件按官方行范围语法（file:start-end）拆分防超时：V3 拆 5 段、sendnotify 拆 2 段。
 # ⚠️ v3.270 教训：行段硬编码曾静默漏测尾部新增代码（4495-4924 未变异）。
-# 修改大文件后必须同步重拆行段；CLAUDE.md 有具体步骤，改动前跑
+# 修改大文件后必须同步重拆行段；AGENTS.md 有具体步骤，改动前跑
 #   node scripts/check-mutation-ranges.js
 # 可校验行段是否覆盖文件全量（含文件增长检测）。
 # 增量模式：每 job 独立缓存（reports/inc-*.json），首次全量、之后只跑 diff 部分。
@@ -112,7 +112,7 @@ jobs:
             mutate: "xbk_function_v3.js:3001-4000"
           - name: v3-part5
             mutate: "xbk_function_v3.js:4001-5036"
-          # sendnotify（1423 行，v3.270 补齐尾部至实际行数）拆 2 段
+          # sendnotify（1429 行，v3.270 补齐尾部至实际行数）拆 2 段
           - name: sendnotify-part1
             mutate: "xbk_sendNotify_slim.js:1-750"
           - name: sendnotify-part2

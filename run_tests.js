@@ -7,26 +7,43 @@
 const { execFileSync } = require('child_process')
 const path = require('path')
 
-function checkDependencies ({ requireFn = require } = {}) {
+function checkDependencies () {
   const missing = []
+  const broken = []
   try {
-    requireFn('got')
+    require('got')
   } catch (error) {
     missing.push('got')
   }
+  let re2Resolvable = false
   try {
-    const RE2 = requireFn('re2')
-    const probe = new RE2('^re2$')
-    if (!probe.test('re2')) throw new Error('re2 native binding probe failed')
+    require.resolve('re2', { paths: [__dirname] })
+    re2Resolvable = true
   } catch (error) {
     missing.push('re2')
   }
-  if (missing.length === 0) return true
+  if (re2Resolvable) {
+    try {
+      const RE2 = require('re2')
+      const probe = new RE2('^re2$')
+      if (!probe.test('re2')) throw new Error('re2 native binding probe failed')
+    } catch (error) {
+      broken.push('re2')
+    }
+  }
+  if (missing.length === 0 && broken.length === 0) return true
 
-  console.error(`❌ 缺少依赖：${missing.join(', ')}`)
-  console.error('请先在项目根目录执行：')
-  console.error('  npm ci --ignore-scripts')
-  console.error('  npm run rebuild --prefix node_modules/re2')
+  if (missing.length > 0) {
+    console.error(`❌ 缺少依赖：${missing.join(', ')}`)
+    console.error('请先在项目根目录执行：')
+    console.error('  npm ci --ignore-scripts')
+    console.error('  npm run rebuild --prefix node_modules/re2')
+  }
+  if (broken.length > 0) {
+    console.error(`❌ 依赖已安装但不可用：${broken.join(', ')}`)
+    console.error('请重建原生模块或切换 Node 版本：')
+    console.error('  npm run rebuild --prefix node_modules/re2')
+  }
   return false
 }
 
