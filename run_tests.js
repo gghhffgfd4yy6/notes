@@ -7,15 +7,19 @@
 const { execFileSync } = require('child_process')
 const path = require('path')
 
-function checkDependencies () {
-  const required = ['got', 're2']
+function checkDependencies ({ requireFn = require } = {}) {
   const missing = []
-  for (const name of required) {
-    try {
-      require.resolve(name, { paths: [__dirname] })
-    } catch (error) {
-      missing.push(name)
-    }
+  try {
+    requireFn('got')
+  } catch (error) {
+    missing.push('got')
+  }
+  try {
+    const RE2 = requireFn('re2')
+    const probe = new RE2('^re2$')
+    if (!probe.test('re2')) throw new Error('re2 native binding probe failed')
+  } catch (error) {
+    missing.push('re2')
   }
   if (missing.length === 0) return true
 
