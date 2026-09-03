@@ -7,6 +7,25 @@
 const { execFileSync } = require('child_process')
 const path = require('path')
 
+function checkDependencies () {
+  const required = ['got', 're2']
+  const missing = []
+  for (const name of required) {
+    try {
+      require.resolve(name, { paths: [__dirname] })
+    } catch (error) {
+      missing.push(name)
+    }
+  }
+  if (missing.length === 0) return true
+
+  console.error(`❌ 缺少依赖：${missing.join(', ')}`)
+  console.error('请先在项目根目录执行：')
+  console.error('  npm ci --ignore-scripts')
+  console.error('  npm run rebuild --prefix node_modules/re2')
+  return false
+}
+
 const SUITES = [
   { name: '常驻循环', file: 'test_loop.js', desc: '长驻调度、单轮异常隔离、停止信号' },
   { name: '常驻失败策略', file: 'test_failure_policy.js', desc: '网络/永久错误分类、持续退避重试、摘要失败和恢复' },
@@ -26,6 +45,8 @@ const results = []
 console.log('══════════════════════════════════════════════')
 console.log('  xbk-push 统一测试入口')
 console.log('══════════════════════════════════════════════\n')
+
+if (!checkDependencies()) process.exit(1)
 
 for (const s of SUITES) {
   const file = path.join(__dirname, s.file)
