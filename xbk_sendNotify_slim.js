@@ -1413,6 +1413,9 @@ async function sendNotify (text, desp, params = {}) {
   })
   const attempted = results
   const okCount = attempted.filter(r => r.status === 'fulfilled').length
+  const successfulChannels = attempted
+    .map((result, index) => result.status === 'fulfilled' ? enabledTasks[index][1] : null)
+    .filter(Boolean)
   if (attempted.length > 0 && okCount === 0) {
     const failures = attempted
       .filter(r => r.status === 'rejected')
@@ -1422,8 +1425,10 @@ async function sendNotify (text, desp, params = {}) {
     const error = new Error('所有推送通道失败: ' + reasons.slice(0, 200))
     error.code = 'ALL_CHANNELS_FAILED'
     error.failures = failures
+    error.successfulChannels = successfulChannels
     throw error
   }
+  return { successfulChannels, failures: attempted.filter(r => r.status === 'rejected').map(r => r.reason).filter(Boolean) }
 }
 
 module.exports = { sendNotify, push_config, hasWxPusherConfigured, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags }

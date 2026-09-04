@@ -36,6 +36,20 @@ node qinglong/xbk_push.js
 
 常用通知环境变量：`PUSH_PLUS_TOKEN`、`PUSH_KEY`、`BARK_PUSH`、`QYWX_KEY`、`WX_PUSHER_APP_TOKEN`、`WX_PUSHER_TOPIC_IDS`、`WX_XIZHI_KEY`、`DEER_KEY`、`PUSHME_KEY`、`TG_BOT_TOKEN`、`TG_USER_ID`。
 
+### 运行日报与通道健康
+
+默认日报会在跨天后的下一轮发送，包含运行轮数、获取、去重、过滤、待推送、成功和失败统计。`Config.report.enabled = false` 可关闭日报。
+
+`Config.channelHealth` 默认开启：某个已配置通道连续失败 3 次时发一次异常提醒，恢复后发一次恢复提醒；同一通道异常默认限频 1 小时。健康状态写入 `channel-health.state`；告警本身不计入健康统计，且健康监测/告警失败绝不影响线报推送、成功缓存或重试语义。
+
+```js
+channelHealth: {
+  enabled: true,
+  consecutiveFailures: 3,
+  intervalMs: 3600000
+}
+```
+
 常用过滤配置：
 
 ```js

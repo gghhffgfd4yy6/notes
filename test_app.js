@@ -2014,7 +2014,7 @@ console.log('========================================\n');
       assert(!!reportSuccess, '旧主全0但存在非零pending时应发送昨日日报')
       assert(reportSuccess.text.includes('2026-09-01'), '日报标题应为昨日日期')
       assert(reportSuccess.desp.includes('推送 0 条 | 失败 0 条'), '正文昨日主统计应保持旧主全0')
-      assert(reportSuccess.desp.includes('今日待结转：推送 9 条 | 失败 3 条'), '正文今日待结转应包含旧pending与当前summary合计')
+      assert(reportSuccess.desp.includes('今日待结转：运行 1 轮 | 推送 9 条 | 失败 3 条'), '正文今日待结转应包含旧pending与当前summary合计')
 
       const stateSuccess = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
       assert(stateSuccess.date === '2026-09-02', '成功后日期应切到今天')
@@ -2075,6 +2075,51 @@ console.log('========================================\n');
       assert(stateRetrySuccess.truncated === 3, '最终 truncated 应为 3 + 0')
       assert(stateRetrySuccess.pending === undefined, '重试成功后 pending 移除')
     })
+  })
+
+  await test('日报累计运行轮数并在日报正文展示', async () => {
+    await withIsolatedReportEnv('run_count', async ({ statePath, setupRound }) => {
+      setupRound({ date: '2026-09-01', total: 1, dedup: 0, filtered: 0, pushed: 1, failed: 0, truncated: 0, runs: 2 })
+      await xbk.App._updateReport({ total: 3, dedup: 1, filtered: 1, pushed: 1, failed: 0, truncated: 0 })
+      const report = pushCalls.find(c => c.text.includes('日报'))
+      assert(report && report.desp.includes('运行 2 轮'), `日报应展示昨日运行轮数: ${report && report.desp}`)
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(state.runs === 1, `跨天后今日运行轮数应为 1，实际 ${state.runs}`)
+    })
+  })
+
+  await test('通道连续失败告警、恢复告警均限频且不影响主推送语义', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalFailures = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const originalInterval = Config.channelHealth && Config.channelHealth.intervalMs
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = true
+      Config.channelHealth.consecutiveFailures = 2
+      Config.channelHealth.intervalMs = 3600000
+      await xbk.App._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      assert(!pushCalls.some(c => c.text.includes('通道异常')), '首次失败未达到阈值不应告警')
+      await xbk.App._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      assert(pushCalls.some(c => c.text.includes('通道异常')), '连续失败达到阈值应告警')
+      pushCalls.length = 0
+      await xbk.App._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      assert(!pushCalls.some(c => c.text.includes('通道异常')), '限频内不得重复告警')
+      await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      assert(pushCalls.some(c => c.text.includes('通道恢复')), '故障通道恢复应告警')
+      const state = JSON.parse(fs.readFileSync(path.join(stateDir, 'channel-health.state'), 'utf8'))
+      assert(state.telegram.consecutiveFailures === 0, '恢复后连续失败计数应清零')
+    } finally {
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalFailures
+      Config.channelHealth.intervalMs = originalInterval
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
   })
 
   await test('告警通道挂 → 不误报"已发送"（v3.145）', async () => {
