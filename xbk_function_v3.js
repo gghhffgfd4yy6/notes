@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.271 — 版本更新 *********
+//* ******* 线报酷推送脚本 v3.272 — 版本更新 *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -198,6 +198,13 @@ const Config = {
   // v3.125：运行日报——每天一条推送汇总（前一天统计），不用翻 run.log
   report: {
     enabled: true
+  },
+
+  // 通道健康：仅记录正常线报推送的通道结果；健康告警自身不反哺状态，避免告警递归。
+  channelHealth: {
+    enabled: true,
+    consecutiveFailures: 3,
+    intervalMs: 3600000
   },
 
   // 磁盘余量监测：仅告警，不阻断推送；不支持 statfs 的旧 Node/平台自动跳过。
@@ -3663,12 +3670,15 @@ const Pusher = {
       if (!sendResult || typeof sendResult.then !== 'function') {
         throw new Error('推送模块 sendNotify 未返回 Promise，拒绝静默成功')
       }
-      await Promise.race([
+      return await Promise.race([
         sendResult,
         new Promise((_, rej) => {
           timer = setTimeout(() => {
             if (controller) controller.abort()
-            rej(new Error('推送超时(10s)'))
+            const error = new Error('推送超时(10s)')
+            const names = notifyMod && typeof notifyMod.configuredChannelNames === 'function' ? notifyMod.configuredChannelNames() : []
+            error.failures = names.map(channel => ({ channel, code: 'PUSH_TIMEOUT', message: '推送超时(10s)' }))
+            rej(error)
           }, 10000)
         })
       ])
@@ -4152,7 +4162,7 @@ const App = {
 
   // v3.258 提取：日报状态归一化（行为不变，供测试直接打纯函数）
   _blankReportState () {
-    return { date: '', total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+    return { date: '', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
   },
   _safeCounter (v) {
     if (typeof v === 'symbol') return 0 // Number(Symbol) 抛 TypeError（子代理审查 commit-12）
@@ -4175,10 +4185,10 @@ const App = {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return blank()
     const st = blank()
     st.date = typeof raw.date === 'string' ? raw.date : ''
-    for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st[k] = this._safeCounter(raw[k])
+    for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st[k] = this._safeCounter(raw[k])
     if (raw.pending && typeof raw.pending === 'object' && !Array.isArray(raw.pending)) {
       st.pending = blank()
-      for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st.pending[k] = this._safeCounter(raw.pending[k])
+      for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st.pending[k] = this._safeCounter(raw.pending[k])
     } else if (raw.pending) {
       // pending 存在但非普通对象（状态文件损坏/结构异常）：不能静默丢弃跨天累计，
       // 保留其占位并大声告警，让下游按 blankState 处理而不崩溃。
@@ -4224,7 +4234,7 @@ const App = {
         if (raw.date !== undefined && !this._isValidReportDate(raw.date)) {
           throw new Error('日报状态 date 字段无效')
         }
-        for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+        for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
           if (raw[k] !== undefined && (!Number.isSafeInteger(raw[k]) || raw[k] < 0)) {
             throw new Error(`日报状态字段 ${k} 无效`)
           }
@@ -4233,7 +4243,7 @@ const App = {
           if (!raw.pending || typeof raw.pending !== 'object' || Array.isArray(raw.pending)) {
             throw new Error('日报状态 pending 字段无效')
           }
-          for (const k of ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+          for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
             if (raw.pending[k] !== undefined && (!Number.isSafeInteger(raw.pending[k]) || raw.pending[k] < 0)) {
               throw new Error(`日报 pending 字段 ${k} 无效`)
             }
@@ -4254,6 +4264,7 @@ const App = {
 
   _accumulateReport (state, summary) {
     const add = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : 0 }
+    state.runs += 1
     state.total += add(summary.total)
     state.dedup += add(summary.dedup)
     state.filtered += add(summary.filtered)
@@ -4264,10 +4275,10 @@ const App = {
 
   async _sendCrossDayReport (statePath, state, summary, today) {
     const reportText = `📊 xbk-push 日报（${state.date}）`
-    const pending = state.pending || { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+    const pending = state.pending || this._blankReportState()
     const pendingState = { ...state, pending: { ...pending } }
     this._accumulateReport(pendingState.pending, summary)
-    const reportBody = `推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}${state.truncated ? ` | 待推送 ${state.truncated}` : ''}${pendingState.pending.total || pendingState.pending.dedup || pendingState.pending.filtered || pendingState.pending.pushed || pendingState.pending.failed || pendingState.pending.truncated ? `\n\n今日待结转：推送 ${pendingState.pending.pushed} 条 | 失败 ${pendingState.pending.failed} 条\n获取 ${pendingState.pending.total} | 去重 ${pendingState.pending.dedup} | 过滤 ${pendingState.pending.filtered}${pendingState.pending.truncated ? ` | 待推送 ${pendingState.pending.truncated}` : ''}` : ''}`
+    const reportBody = `运行 ${state.runs} 轮 | 推送 ${state.pushed} 条 | 失败 ${state.failed} 条\n\n获取 ${state.total} | 去重 ${state.dedup} | 过滤 ${state.filtered}${state.truncated ? ` | 待推送 ${state.truncated}` : ''}${pendingState.pending.runs || pendingState.pending.total || pendingState.pending.dedup || pendingState.pending.filtered || pendingState.pending.pushed || pendingState.pending.failed || pendingState.pending.truncated ? `\n\n今日待结转：运行 ${pendingState.pending.runs} 轮 | 推送 ${pendingState.pending.pushed} 条 | 失败 ${pendingState.pending.failed} 条\n获取 ${pendingState.pending.total} | 去重 ${pendingState.pending.dedup} | 过滤 ${pendingState.pending.filtered}${pendingState.pending.truncated ? ` | 待推送 ${pendingState.pending.truncated}` : ''}` : ''}`
     const pendingSaved = this._persistReportState(statePath, pendingState)
     if (!pendingSaved) console.warn('⚠️ 日报待发送状态未持久化，继续发送但失败时将保留旧状态')
     try {
@@ -4275,6 +4286,7 @@ const App = {
       await Pusher.send(reportText, reportBody)
       const nextState = {
         date: today,
+        runs: pendingState.pending.runs || 0,
         total: pendingState.pending.total || 0,
         dedup: pendingState.pending.dedup || 0,
         filtered: pendingState.pending.filtered || 0,
@@ -4300,16 +4312,17 @@ const App = {
       if (!state) return
       const today = this._reportToday()
       if (state.date && state.date !== today) {
-        const reportKeys = ['total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']
+        const reportKeys = ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']
         const hasCounters = value => Boolean(value && reportKeys.some(k => value[k] > 0))
         if (hasCounters(state) || hasCounters(state.pending)) {
           await this._sendCrossDayReport(statePath, state, summary, today)
           return
         }
         const pending = state.pending
-        const nextState = { date: today, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+        const nextState = { date: today, runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
         if (pending) {
           Object.assign(nextState, {
+            runs: pending.runs || 0,
             total: pending.total || 0,
             dedup: pending.dedup || 0,
             filtered: pending.filtered || 0,
@@ -4326,6 +4339,92 @@ const App = {
       this._accumulateReport(state, summary)
       this._persistReportState(statePath, state)
     } catch (e) { /* 日报失败静默，不影响主流程 */ }
+  },
+
+  async _updateChannelHealth (outcome) {
+    let lockFd = -1
+    let lockPath = ''
+    try {
+      if (!this._enabledFlag(Config.channelHealth)) return
+      const statePath = path.join(MessageStore.cacheDir, 'channel-health.state')
+      lockPath = statePath + '.lock'
+      try {
+        lockFd = fs.openSync(lockPath, 'wx')
+      } catch (e) {
+        let stale = false
+        if (e && e.code === 'EEXIST') {
+          try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 10000 } catch (e2) { stale = true }
+        }
+        if (stale) {
+          try { fs.unlinkSync(lockPath); lockFd = fs.openSync(lockPath, 'wx') } catch (e2) { /* 竞争者已接管，按跳过处理 */ }
+        }
+        if (lockFd < 0) {
+          // 单实例仍可能因手工重复启动/重叠 cron 短暂重入；宁可本轮跳过健康观测，也不能覆盖另一轮状态。
+          console.warn(`通道健康状态正由另一轮更新，跳过本轮健康更新 ${statePath}`)
+          return
+        }
+      }
+      const stateResult = this._readSafeState(statePath)
+      if (stateResult.status !== 'ok' && stateResult.status !== 'missing') {
+        console.error(`通道健康状态读取失败(${stateResult.status})，跳过本轮健康更新 ${statePath}`)
+        return
+      }
+      let state = {}
+      if (stateResult.status === 'ok') {
+        try {
+          state = JSON.parse(stateResult.text)
+          if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('状态顶层必须是对象')
+        } catch (e) {
+          console.error(`通道健康状态损坏，跳过本轮健康更新以保留原文件 ${statePath}`)
+          return
+        }
+      }
+      const succeeded = new Set(Array.isArray(outcome && outcome.successfulChannels) ? outcome.successfulChannels.filter(x => typeof x === 'string' && x) : [])
+      const failures = Array.isArray(outcome && outcome.failures) ? outcome.failures : []
+      const failed = new Map()
+      for (const failure of failures) {
+        const channel = failure && typeof failure.channel === 'string' ? failure.channel : ''
+        if (channel) failed.set(channel, summarizeError(failure))
+      }
+      const threshold = Math.max(1, Math.floor(Utils.num(Config.channelHealth.consecutiveFailures, 3)))
+      const interval = Math.max(0, Utils.num(Config.channelHealth.intervalMs, 3600000))
+      const now = Date.now()
+      const alerts = []
+      for (const channel of succeeded) {
+        const entry = state[channel]
+        if (entry && this._safeCounter(entry.consecutiveFailures) >= threshold) {
+          alerts.push({ type: 'recovered', channel })
+        }
+        state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: now }
+      }
+      for (const [channel, failure] of failed) {
+        if (succeeded.has(channel)) continue
+        const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
+        const count = this._safeCounter(entry.consecutiveFailures) + 1
+        const lastAlertAt = this._safeCounter(entry.lastAlertAt)
+        state[channel] = { consecutiveFailures: count, lastFailureAt: now, lastAlertAt }
+        if (count >= threshold && (!interval || now - lastAlertAt >= interval)) alerts.push({ type: 'failed', channel, count, failure })
+      }
+      if (!this._writeState(statePath, state)) return
+      for (const alert of alerts) {
+        try {
+          const text = alert.type === 'recovered' ? '✅ xbk-push 通道恢复' : '⚠️ xbk-push 通道异常'
+          const desp = alert.type === 'recovered'
+            ? `通道：${alert.channel}\n\n已恢复正常推送。`
+            : `通道：${alert.channel}\n\n连续失败：${alert.count} 次\n\n原因：${Utils.safeErrorText(alert.failure && alert.failure.message, '未知错误').slice(0, 300)}`
+          await Pusher.send(text, desp)
+          if (alert.type === 'failed' && state[alert.channel]) {
+            state[alert.channel].lastAlertAt = Date.now()
+            this._writeState(statePath, state)
+          }
+        } catch (e) { /* 健康告警失败不得影响主推送、缓存或下一次重试 */ }
+      }
+    } catch (e) { /* 健康监测仅作观测，不得影响主流程 */ } finally {
+      if (typeof lockFd === 'number' && lockFd >= 0) {
+        try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
+        try { fs.unlinkSync(lockPath) } catch (e) { /* 忽略 */ }
+      }
+    }
   },
 
   async run () {
@@ -4804,12 +4903,12 @@ const App = {
         }
         if (preview(text, desp)) return { item, ok: false, preview: true }
         try {
-          await Pusher.send(text, desp, notifyModule)
+          const sent = await Pusher.send(text, desp, notifyModule)
           pushedKeys.add(keyOf(item))
           // v3.159：推送成功 → 清除过滤写入标记（否则 _f 随对象写回缓存，下次规则变更又误清）
           // 标记属性异常不能把已送达消息改判为失败；即使无法删除，后续缓存仍按成功处理。
           try { delete item._f } catch (e) { /* 非可配置脏属性不影响已成功推送 */ }
-          return { item, ok: true }
+          return { item, ok: true, sent }
         } catch (e) {
           // 非 Error 兜底（R1）：notify 抛字符串等非 Error 时避免 e.message undefined（与 v3.31/73/81 口径一致）
           const failure = summarizeError(e)
@@ -4824,6 +4923,7 @@ const App = {
       checkpoint('notify-module-loaded')
 
       let successCount = 0
+      const pushResults = []
       // push.mode 非法值提示（防静默降级：用户配 'PARALLEL' 等会按顺序执行）
       if (Config.push && Config.push.mode && Config.push.mode !== 'sequential' && Config.push.mode !== 'parallel') {
         console.warn(`⚠️ 配置「push.mode」值无效：「${safeConfigText(Config.push.mode)}」（应为 sequential/parallel），已按顺序模式执行`)
@@ -4854,6 +4954,7 @@ const App = {
           }
         }
         await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+        pushResults.push(...results)
         // 按原顺序输出成功日志（并发完成顺序不定，日志保持数据顺序）
         for (const r of results) {
           if (r && r.ok) console.log(`发现到新数据：${itemLogText(r.item, 'title', '(无标题)')}【${itemLogText(r.item, 'catename')}】${urlOf(r.item)}`)
@@ -4864,6 +4965,7 @@ const App = {
         const pushInterval = Utils.num(Config.timing.pushInterval, 0)
         for (const item of items) {
           const r = await pushOne(item, notifyModule)
+          pushResults.push(r)
           if (r.ok) { successCount++; console.log(`发现到新数据：${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】${urlOf(item)}`) }
           if (pushInterval > 0) await new Promise(r2 => setTimeout(r2, pushInterval))
         }
@@ -4875,6 +4977,24 @@ const App = {
 
       // ⑦ 写缓存：只收录「被过滤的数据」+「推送成功的数据」
       //    推送失败的排除在外 → 下次运行重新推送（避免消息永久丢失）
+      const channelSuccessful = new Set()
+      const channelFailures = []
+      const recordChannelOutcome = (result) => {
+        if (!result) return
+        const sent = result.sent
+        if (sent && Array.isArray(sent.successfulChannels)) {
+          for (const channel of sent.successfulChannels) channelSuccessful.add(channel)
+        }
+        if (sent && Array.isArray(sent.failures)) channelFailures.push(...sent.failures)
+        if (result.failure) {
+          if (Array.isArray(result.failure.successfulChannels)) {
+            for (const channel of result.failure.successfulChannels) channelSuccessful.add(channel)
+          }
+          if (Array.isArray(result.failure.failures)) channelFailures.push(...result.failure.failures)
+        }
+      }
+      for (const result of pushResults) recordChannelOutcome(result)
+      // 健康观测在成功缓存持久化后执行；其自身失败被完全隔离：绝不改变推送成功语义。
       const itemsKeys = new Set(items.map(keyOf))
       // v3.134：排除截断未推的（下次运行推剩余，防静默丢失）
       const toCache = dryRun
@@ -4884,6 +5004,7 @@ const App = {
       MessageStore.saveBatch(toCache, cacheName)
       cacheMs = Date.now() - cacheStart
       checkpoint('cache-write-complete', `cached=${toCache.length} cacheMs=${cacheMs}`)
+      await this._updateChannelHealth({ successfulChannels: [...channelSuccessful], failures: channelFailures })
 
       // 预取收尾：只观察已完成结果，不等待后台预取，避免它拖慢主流程退出。
       checkpoint('tls-warmup-observed', tlsWarmupSettled && tlsWarmup
