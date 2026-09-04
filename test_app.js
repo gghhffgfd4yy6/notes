@@ -266,6 +266,59 @@ console.log('========================================\n');
     assert(pushCalls.length === 0, '空数据不应推送')
   })
 
+  await test('dry-run：接口失败时不发送告警通知', async () => {
+    reset()
+    setPushUrl('t03a_dry_run_fetch_error')
+    const previousDryRun = process.env.XBK_DRY_RUN
+    const alertState = path.join(CACHE_DIR, 'alert.state')
+    try {
+      process.env.XBK_DRY_RUN = '1'
+      Config.alert.enabled = true
+      Config.alert.intervalMs = 0
+      fail4xx = true
+      try { await xbk.run() } catch (e) { /* 接口失败仍应向调用方暴露 */ }
+      assert(pushCalls.length === 0, `dry-run 接口失败不得发送告警，实际 ${pushCalls.length} 次`)
+      assert(!fs.existsSync(alertState), 'dry-run 接口失败不得写入告警状态')
+    } finally {
+      fail4xx = false
+      Config.alert.enabled = false
+      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = previousDryRun
+      try { fs.unlinkSync(alertState) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('dry-run：预览不发送、不写成功缓存或日报', async () => {
+    reset()
+    setPushUrl('t03b_dry_run_preview')
+    const previousDryRun = process.env.XBK_DRY_RUN
+    const reportState = path.join(CACHE_DIR, 'report.state')
+    const cachePath = path.join(CACHE_DIR, 't03b_dry_run_preview.json')
+    const logs = []
+    const originalLog = console.log
+    try {
+      process.env.XBK_DRY_RUN = '1'
+      Config.alert.enabled = true
+      Config.report.enabled = true
+      fakeData = [makeItem({ id: 'dry-run-preview' })]
+      console.log = (...args) => logs.push(args.join(' '))
+      const summary = await xbk.run()
+      assert(summary && summary.pushed === 0 && summary.failed === 0, `dry-run 摘要不应伪造推送: ${JSON.stringify(summary)}`)
+      assert(pushCalls.length === 0, `dry-run 不得调用通知通道，实际 ${pushCalls.length} 次`)
+      assert(readCacheFile('t03b_dry_run_preview').length === 0, 'dry-run 不得写入成功消息缓存')
+      assert(!fs.existsSync(reportState), 'dry-run 不得写入日报状态')
+      assert(logs.some(line => line.includes('🧪 预览：')), 'dry-run 应输出预览内容')
+    } finally {
+      console.log = originalLog
+      Config.alert.enabled = false
+      Config.report.enabled = false
+      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = previousDryRun
+      try { fs.unlinkSync(cachePath) } catch (e) { /* 忽略 */ }
+      try { fs.unlinkSync(reportState) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   // ==================== 2. 字段归一化 ====================
   console.log('\n📂 2. 字段归一化')
 

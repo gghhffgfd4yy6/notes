@@ -24,6 +24,18 @@ npm run rebuild --prefix node_modules/re2
 node qinglong/xbk_push.js
 ```
 
+启动前可只做环境诊断，不抓取也不推送：
+
+```bash
+node qinglong/xbk_push.js --check
+```
+
+调整过滤规则时可运行抓取和处理流程但不调用通知接口，也不写成功缓存：
+
+```bash
+node qinglong/xbk_push.js --dry-run
+```
+
 入口为常驻模式；只运行一个实例。`XBK_INTERVAL_MS` 可设置轮询间隔。只需执行一次时用 `npm start`。
 
 可重试错误（网络/超时/上游 5xx/限流等）不会退出常驻，按指数退避持续重试，默认 30 分钟封顶（`XBK_RETRY_BACKOFF_CAP_MS` 毫秒可调），恢复后自动回到正常轮询；仅不可恢复错误（如配置错误、认证失败）才会停止。
