@@ -8361,6 +8361,45 @@ console.log('========================================\n');
     assertEqual(c.includes('javascript'), false, `未闭合 src javascript: 应清空: ${c}`)
   })
 
+  await test('sanitizeDecodedHtml 畸形属性输入语义锁定（v3.272 线性化）', () => {
+    // v3.272：未闭合主动标签正则 (?:[^<>]|"[^"]*"|'[^']*')* 线性化为互斥分支
+    // (?:[^<>"']|"[^"]*"|'[^']*')*：<> 保持标签边界语义，引号串与普通字符互斥（每字符
+    // 唯一路径，re2 缺失回退 V8 时不再灾难性回溯）。行为差异仅在引号值内含裸 > 时
+    // 删除更完整（旧版在属性值内第一个 > 处截断，残留 `y">` 残片）。
+    // 引号值内 > 整体消费（v3.272 改善：删除完整，不残留残片）
+    assertEqual(sanitizeDecodedHtml('<script src="x>y">tail'), 'tail', '属性值含 > 的未闭合 script 应整体删除且尾部保留')
+    assertEqual(sanitizeDecodedHtml('<svg viewBox="0 0 <x>" onload="a">t'), 't', '引号值内尖括号整体消费，尾部保留')
+    // 裸 < 无闭合 >：不匹配，原样保留（与旧版行为一致）
+    assertEqual(sanitizeDecodedHtml('<script a<b>tail'), '<script a<b>tail', '属性区裸 < 且无闭合 > 的输入原样保留')
+    // 成对/错配语义不回归：标签边界 <> 必须仍然终止匹配，不得吞掉标签外文本
+    assertEqual(sanitizeDecodedHtml('<script>content</iframe>'), 'content', '错配闭合不应吞有效内容')
+    assertEqual(sanitizeDecodedHtml('<script>a</iframe>b'), 'ab', '未闭合 script/孤立闭合只剥标签本体')
+    // 多个完整匹配的畸形标签连续输入全部删除，文本保留
+    assertEqual(sanitizeDecodedHtml('<script src="x>y">A<svg viewBox="0 0 <x>" onload="a">C'), 'AC', '多畸形标签连续输入应全部删除且文本保留')
+  })
+
+  await test('sanitizeDecodedHtml 无 re2（V8 回退）引号堆叠恶意输入 <1s（v3.272 js/redos 回归）', () => {
+    // CodeQL js/redos：旧 (?:[^<>]|"[^"]*"|'[^']*')* 三路交替不互斥，re2 缺失回退 V8 时
+    // `<script a="` + 大量不成对引号（无闭合 >）触发灾难性回溯（实测 5k 引号即卡死 >120s）。
+    // 线性化引号互斥分支后实测 100k 引号 ~2ms。子进程内禁 re2 强制走 V8 兜底路径：
+    // 旧正则在 30s 子进程超时内无法返回 → execFileSync 抛错 → 测试失败（回归可检出）。
+    const cp = require('child_process')
+    // 性能用无闭合 > 输入（匹配失败才回溯，旧正则的灾难路径）；语义用同一输入补 > 验证
+    // 整体删除。注意 `a="` 已含 1 个引号，repeat 取奇数（19999）使总引号数为偶数 20000，
+    // 引号才能全部配对——奇数引号不匹配是正确语义，不能用于删除断言。
+    const script = 'const Module=require(\'module\');const o=Module._load;Module._load=function(r){if(r===\'re2\'){const e=new Error(\'off\');e.code=\'MODULE_NOT_FOUND\';throw e}return o.apply(this,arguments)};' +
+      'const x=require(\'./xbk_function_v3.js\');' +
+      'const evilNoClose=\'<script a="\'+\'"\'.repeat(19999)+\'x\'.repeat(100);' +
+      'const t=Date.now();const outNoClose=x.sanitizeDecodedHtml(evilNoClose);const ms=Date.now()-t;' +
+      'if(ms>=1000)throw new Error(\'V8 回退 ReDoS 回归:\'+ms+\'ms\');' +
+      'const outClosed=x.sanitizeDecodedHtml(evilNoClose+\'>\');' +
+      'if(outClosed!==\'\')throw new Error(\'畸形标签未整体删除: \'+JSON.stringify(outClosed.slice(0,40)))'
+    const start = Date.now()
+    cp.execFileSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 30000 })
+    const cost = Date.now() - start
+    assertEqual(cost < 30000, true, `V8 路径性能回归应在 30s 内完成（实测 ${cost}ms，进程内断言 <1s）`)
+  })
+
   // ==================== 真实数据形态性能基准（v3.260：v3.251 长 href ReDoS 教训） ====================
   // 覆盖真实接口 content_html 的各类触发形态——修复前这些数据会让 sanitizeDecodedHtml 同步卡死
   // （单条正则快、组合真实数据才炸——基准数据必须用真实形态才能抓到这类雷）

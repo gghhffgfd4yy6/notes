@@ -702,7 +702,7 @@ const Utils = {
       }
     }
     return out
-      .replace(safeRe('<(?:script|style|iframe|object|embed|svg|math)\\b(?:[^<>]|"[^"]*"|\'[^\']*\')*>', 'gi'), '')
+      .replace(safeRe('<(?:script|style|iframe|object|embed|svg|math)\\b(?:[^<>"\']|"[^"]*"|\'[^\']*\')*>', 'gi'), '')
       .replace(safeRe('<\\/(?:script|style|iframe|object|svg|math)\\s*>', 'gi'), '')
       .replace(safeRe('<(?:base|link|meta)\\b[^<>]*>', 'gi'), '')
   },
