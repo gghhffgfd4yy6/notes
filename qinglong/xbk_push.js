@@ -3,11 +3,51 @@
 // 青龙面板直接执行入口：不依赖当前工作目录，配置/缓存仍统一放在项目根目录。
 const path = require('path')
 const { spawnSync } = require('child_process')
-const { runLoop, sleep } = require(path.join(__dirname, '..', 'xbk_loop'))
-const { classifyFailure, classifySummary, summarizeError } = require(path.join(__dirname, '..', 'xbk_failure_policy'))
+const { runLoop, sleep } = require('../xbk_loop')
+const { classifyFailure, classifySummary, summarizeError } = require('../xbk_failure_policy')
 
 const ROOT = path.resolve(__dirname, '..')
-const MAIN = path.join(ROOT, 'xbk_function_v3.js')
+const ARGS = new Set(process.argv.slice(2))
+
+function hasArg (name) {
+  return ARGS.has(name)
+}
+
+function loadApp () {
+  try { return require('../xbk_function_v3') } catch (error) {
+    const dependency = error && error.code === 'MODULE_NOT_FOUND' && /got/.test(error.message)
+    if (dependency) throw new Error(`got 依赖不可加载；请先执行 npm ci --omit=dev --ignore-scripts（原始错误：${error.message}）`)
+    throw error
+  }
+}
+
+function runCheck (app) {
+  const checks = []
+  const add = (name, ok, detail) => {
+    checks.push({ name, ok, detail })
+    console.log(`${ok ? '✅' : '❌'} ${name}${detail ? `：${detail}` : ''}`)
+  }
+  add('Node.js 版本', Number(process.versions.node.split('.')[0]) >= 22, process.version)
+  try {
+    require('got')
+    add('got 依赖', true, '可加载')
+  } catch (e) { add('got 依赖', false, '不可加载') }
+  try {
+    const RE2 = require('re2')
+    const probe = new RE2('^ok$')
+    add('re2 原生模块', probe.test('ok'), '可加载且匹配正常')
+  } catch (e) { add('re2 原生模块', false, '不可加载，过滤正则不会安全执行') }
+  const warnings = app.validateConfig({ ...app.Config.filter, zkt_gjc: app.Config.keyword.zkt_gjc })
+  add('过滤配置', warnings.length === 0, warnings.length ? `${warnings.length} 条警告` : '合法')
+  try {
+    app.init()
+    add('缓存目录', true, app.Config.cache.dir)
+  } catch (e) { add('缓存目录', false, e.message) }
+  const notify = require(path.join(ROOT, 'xbk_sendNotify_slim'))
+  const count = typeof notify.configuredChannelCount === 'function' ? notify.configuredChannelCount() : 0
+  add('通知通道', count > 0, count > 0 ? `${count} 个可用通道` : '未检测到完整通道配置')
+  return checks.every(item => item.ok) ? 0 : 1
+}
 
 function shouldAutoInstallDependencies (env = process.env) {
   return env && env.XBK_AUTO_INSTALL_DEPS === '1'
@@ -175,8 +215,24 @@ async function runResident (app, controller) {
 }
 
 async function main () {
+  if (hasArg('--check')) {
+    try { require('got') } catch (error) {
+      console.error(`❌ got 依赖：不可加载（${error.message}）`)
+      process.exitCode = 1
+      return
+    }
+    let app
+    try { app = loadApp() } catch (error) {
+      console.error(`❌ 应用模块：${error.message}`)
+      process.exitCode = 1
+      return
+    }
+    process.exitCode = runCheck(app)
+    return
+  }
+  const app = loadApp()
+  if (hasArg('--dry-run')) process.env.XBK_DRY_RUN = '1'
   ensureDependencies()
-  const app = require(MAIN)
   const controller = new AbortController()
   const stop = () => controller.abort()
   // v3.262：用 process.on 而非 once——once 在首次信号后移除监听，第二次信号会走 Node
@@ -203,4 +259,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { classifyFailure, classifySummary, runResident, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs }
+module.exports = { classifyFailure, classifySummary, runResident, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs, runCheck, hasArg }
