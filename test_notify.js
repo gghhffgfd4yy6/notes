@@ -41,6 +41,10 @@ require.cache[gotPath].exports.post = (url, options) => {
   if (syncPostThrow) throw new Error('sync request construction failure')
   // 失败模拟（v3.75）：异步 reject 走 $.post 的 err 回调；response.body 含密钥回显（验证不再传给 callback）
   if (failPost) {
+    if (failPost === 'primitive') {
+      // eslint-disable-next-line prefer-promise-reject-errors -- 验证第三方通道抛出原始字符串时仍能结构化归因
+      return Promise.reject('primitive transport failure')
+    }
     const e = new Error('API error: connection refused')
     e.response = { body: '{"code":500,"msg":"PPT_SECRET 回显"}', statusCode: 500 }
     return Promise.reject(e)
@@ -1131,6 +1135,13 @@ console.log('========================================\n');
       assert(Array.isArray(e.failures) && e.failures.length > 0, '全失败错误应保留子通道失败原因')
     }
     assert(threw, '全通道失败应 reject')
+    // 原始 string reject 也必须和所属通道绑定，否则健康监测无法累计失败。
+    failPost = 'primitive'
+    let primitiveError
+    try { await notify.sendNotify('标题', '内容') } catch (e) { primitiveError = e }
+    assert(primitiveError && Array.isArray(primitiveError.failures), '原始异常应保留结构化失败列表')
+    assert(primitiveError.failures[0] && primitiveError.failures[0].channel === 'server酱', `原始异常应带通道名: ${JSON.stringify(primitiveError.failures[0])}`)
+    assert(primitiveError.failures[0].message.includes('primitive transport failure'), '原始异常应保留诊断消息')
     // 部分成功（Bark 成功 + Server酱失败）→ resolve（失败通道下次不重试防重复）
     failPost = false
     cfg.BARK_PUSH = 'https://api.day.app/dev1'

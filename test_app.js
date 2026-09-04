@@ -2166,6 +2166,11 @@ console.log('========================================\n');
       assert(pushCalls.some(c => c.text.includes('通道恢复')), '故障通道恢复应告警')
       const state = JSON.parse(fs.readFileSync(path.join(stateDir, 'channel-health.state'), 'utf8'))
       assert(state.telegram.consecutiveFailures === 0, '恢复后连续失败计数应清零')
+      fs.writeFileSync(path.join(stateDir, 'channel-health.state.lock'), 'other process')
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'timeout' }] })
+      const lockedState = JSON.parse(fs.readFileSync(path.join(stateDir, 'channel-health.state'), 'utf8'))
+      assert(lockedState.telegram.consecutiveFailures === 0, '健康状态被锁定时不得覆盖另一轮的状态更新')
+      fs.unlinkSync(path.join(stateDir, 'channel-health.state.lock'))
     } finally {
       Config.cache.dir = originalCacheDir
       Config.channelHealth.enabled = originalEnabled

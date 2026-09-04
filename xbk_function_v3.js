@@ -3675,7 +3675,10 @@ const Pusher = {
         new Promise((_, rej) => {
           timer = setTimeout(() => {
             if (controller) controller.abort()
-            rej(new Error('推送超时(10s)'))
+            const error = new Error('推送超时(10s)')
+            const names = notifyMod && typeof notifyMod.configuredChannelNames === 'function' ? notifyMod.configuredChannelNames() : []
+            error.failures = names.map(channel => ({ channel, code: 'PUSH_TIMEOUT', message: '推送超时(10s)' }))
+            rej(error)
           }, 10000)
         })
       ])
@@ -4339,9 +4342,28 @@ const App = {
   },
 
   async _updateChannelHealth (outcome) {
+    let lockFd = -1
+    let lockPath = ''
     try {
       if (!this._enabledFlag(Config.channelHealth)) return
       const statePath = path.join(MessageStore.cacheDir, 'channel-health.state')
+      lockPath = statePath + '.lock'
+      try {
+        lockFd = fs.openSync(lockPath, 'wx')
+      } catch (e) {
+        let stale = false
+        if (e && e.code === 'EEXIST') {
+          try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 10000 } catch (e2) { stale = true }
+        }
+        if (stale) {
+          try { fs.unlinkSync(lockPath); lockFd = fs.openSync(lockPath, 'wx') } catch (e2) { /* 竞争者已接管，按跳过处理 */ }
+        }
+        if (lockFd < 0) {
+          // 单实例仍可能因手工重复启动/重叠 cron 短暂重入；宁可本轮跳过健康观测，也不能覆盖另一轮状态。
+          console.warn(`通道健康状态正由另一轮更新，跳过本轮健康更新 ${statePath}`)
+          return
+        }
+      }
       const stateResult = this._readSafeState(statePath)
       if (stateResult.status !== 'ok' && stateResult.status !== 'missing') {
         console.error(`通道健康状态读取失败(${stateResult.status})，跳过本轮健康更新 ${statePath}`)
@@ -4397,7 +4419,12 @@ const App = {
           }
         } catch (e) { /* 健康告警失败不得影响主推送、缓存或下一次重试 */ }
       }
-    } catch (e) { /* 健康监测仅作观测，不得影响主流程 */ }
+    } catch (e) { /* 健康监测仅作观测，不得影响主流程 */ } finally {
+      if (typeof lockFd === 'number' && lockFd >= 0) {
+        try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
+        try { fs.unlinkSync(lockPath) } catch (e) { /* 忽略 */ }
+      }
+    }
   },
 
   async run () {

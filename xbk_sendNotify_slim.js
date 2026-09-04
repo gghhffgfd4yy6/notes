@@ -862,6 +862,23 @@ function configuredChannelCount () {
   return count
 }
 
+function configuredChannelNames () {
+  const c = push_config
+  const nonEmpty = (v) => {
+    try { return v !== undefined && v !== null && String(v).trim() !== '' } catch (e) { return false }
+  }
+  const delimited = (v) => {
+    try { return nonEmpty(v) && String(v).split('#').some(s => s.trim() !== '') } catch (e) { return false }
+  }
+  return [
+    [nonEmpty(c.PUSH_PLUS_TOKEN), 'pushplus'], [nonEmpty(c.PUSH_KEY), 'server酱'],
+    [delimited(c.BARK_PUSH), 'bark'], [nonEmpty(c.QYWX_KEY), '企业微信'],
+    [hasWxPusherConfigured(), 'wxpusher'], [nonEmpty(c.WX_XIZHI_KEY), '息知'],
+    [nonEmpty(c.DEER_KEY), 'pushdeer'], [delimited(c.PUSHME_KEY), 'pushme'],
+    [nonEmpty(c.TG_BOT_TOKEN) && nonEmpty(c.TG_USER_ID), 'telegram']
+  ].filter(([enabled]) => enabled).map(([, name]) => name)
+}
+
 function hasWxPusherConfigured () {
   return parseWxPusherChannels().length > 0
 }
@@ -1420,22 +1437,35 @@ async function sendNotify (text, desp, params = {}) {
   const results = await Promise.allSettled(
     enabledTasks.map(([, , task]) => task())
   )
-  results.forEach((result, index) => {
-    if (result.status === 'rejected' && result.reason && typeof result.reason === 'object' &&
-            !result.reason.channel) {
-      try { result.reason.channel = enabledTasks[index][1] } catch (e) { /* 只读错误对象不影响失败结果 */ }
+  const normalizeFailure = (reason, channel) => {
+    if (reason && typeof reason === 'object' && reason.channel === channel) return reason
+    const message = reason && typeof reason === 'object' && reason.message ? safeErr(reason) : safeErr(reason)
+    const failure = new Error(message || `${channel} 发送失败`)
+    if (reason && typeof reason === 'object') {
+      try {
+        if (reason.code !== undefined) failure.code = reason.code
+        if (reason.statusCode !== undefined) failure.statusCode = reason.statusCode
+        if (reason.providerCode !== undefined) failure.providerCode = reason.providerCode
+      } catch (e) { /* 异常字段只保留安全消息 */ }
     }
-  })
-  const attempted = results
+    failure.channel = channel
+    return failure
+  }
+  const channelResults = results.map((result, index) => ({
+    channel: enabledTasks[index][1],
+    status: result.status,
+    failure: result.status === 'rejected' ? normalizeFailure(result.reason, enabledTasks[index][1]) : null
+  }))
+  const attempted = channelResults
   const okCount = attempted.filter(r => r.status === 'fulfilled').length
   const successfulChannels = attempted
-    .map((result, index) => result.status === 'fulfilled' ? enabledTasks[index][1] : null)
-    .filter(Boolean)
+    .filter(result => result.status === 'fulfilled')
+    .map(result => result.channel)
+  const failedChannels = attempted
+    .filter(result => result.status === 'rejected')
+    .map(result => result.failure)
   if (attempted.length > 0 && okCount === 0) {
-    const failures = attempted
-      .filter(r => r.status === 'rejected')
-      .map(r => r.reason)
-      .filter(Boolean)
+    const failures = failedChannels
     const reasons = failures.map(reason => reason && reason.message ? reason.message : String(reason || '')).filter(Boolean).join('; ')
     const error = new Error('所有推送通道失败: ' + reasons.slice(0, 200))
     error.code = 'ALL_CHANNELS_FAILED'
@@ -1443,7 +1473,7 @@ async function sendNotify (text, desp, params = {}) {
     error.successfulChannels = successfulChannels
     throw error
   }
-  return { successfulChannels, failures: attempted.filter(r => r.status === 'rejected').map(r => r.reason).filter(Boolean) }
+  return { successfulChannels, failures: failedChannels }
 }
 
-module.exports = { sendNotify, push_config, hasWxPusherConfigured, configuredChannelCount, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags }
+module.exports = { sendNotify, push_config, hasWxPusherConfigured, configuredChannelCount, configuredChannelNames, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags }
