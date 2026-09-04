@@ -3,11 +3,10 @@
 // 青龙面板直接执行入口：不依赖当前工作目录，配置/缓存仍统一放在项目根目录。
 const path = require('path')
 const { spawnSync } = require('child_process')
-const { runLoop, sleep } = require(path.join(__dirname, '..', 'xbk_loop'))
-const { classifyFailure, classifySummary, summarizeError } = require(path.join(__dirname, '..', 'xbk_failure_policy'))
+const { runLoop, sleep } = require('../xbk_loop')
+const { classifyFailure, classifySummary, summarizeError } = require('../xbk_failure_policy')
 
 const ROOT = path.resolve(__dirname, '..')
-const MAIN = path.join(ROOT, 'xbk_function_v3.js')
 const ARGS = new Set(process.argv.slice(2))
 
 function hasArg (name) {
@@ -15,7 +14,7 @@ function hasArg (name) {
 }
 
 function loadApp () {
-  try { return require(MAIN) } catch (error) {
+  try { return require('../xbk_function_v3') } catch (error) {
     const dependency = error && error.code === 'MODULE_NOT_FOUND' && /got/.test(error.message)
     if (dependency) throw new Error(`got 依赖不可加载；请先执行 npm ci --omit=dev --ignore-scripts（原始错误：${error.message}）`)
     throw error
@@ -216,25 +215,22 @@ async function runResident (app, controller) {
 }
 
 async function main () {
-  let app
   if (hasArg('--check')) {
     try { require('got') } catch (error) {
       console.error(`❌ got 依赖：不可加载（${error.message}）`)
       process.exitCode = 1
       return
     }
+    let app
     try { app = loadApp() } catch (error) {
       console.error(`❌ 应用模块：${error.message}`)
       process.exitCode = 1
       return
     }
-  } else {
-    app = loadApp()
-  }
-  if (hasArg('--check')) {
     process.exitCode = runCheck(app)
     return
   }
+  const app = loadApp()
   if (hasArg('--dry-run')) process.env.XBK_DRY_RUN = '1'
   ensureDependencies()
   const controller = new AbortController()
