@@ -73,6 +73,22 @@ filter: {
 }
 ```
 
+## 过滤诊断日志
+
+默认会在缓存目录（默认 `xianbaoku_cache/`）追加 `filter-diagnostics.ndjson`。它是“一行一条 JSON”的多轮诊断日志：每次运行写一条 `type: "run"` 汇总，以及被过滤或被强制展现保护的条目明细，可用于查询每条为何屏蔽、命中了哪项配置及哪些后续规则被跳过。
+
+默认最多记录每轮 100 条明细，并在日志超过 1 MiB 时自动保留最新尾部。可在 `xbk_function_v3.js` 的 `diagnostics.filterLog` 中调整：
+
+```js
+diagnostics: {
+  filterLog: {
+    enabled: true,
+    maxDetailsPerRun: 100,
+    includePassed: false // true 时连普通放行条目也写入
+  }
+}
+```
+
 ## 测试
 
 ```bash

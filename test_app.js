@@ -195,6 +195,9 @@ function reset () {
   // 都会污染 pushCalls 断言（t56/t57 显式开启）
   Config.alert.enabled = false
   Config.report.enabled = false
+  Config.diagnostics.filterLog.enabled = true
+  Config.diagnostics.filterLog.maxDetailsPerRun = 100
+  Config.diagnostics.filterLog.includePassed = false
 }
 
 function readCacheFile (suffix) {
@@ -266,6 +269,35 @@ console.log('========================================\n');
     assert(pushCalls.length === 0, '空数据不应推送')
   })
 
+  await test('过滤诊断：跨运行追加屏蔽原因与保护记录', async () => {
+    reset()
+    setPushUrl('t03_filter_diagnostics')
+    const logPath = path.join(CACHE_DIR, 'filter-diagnostics.ndjson')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    try {
+      Config.filter.pingbibiaoti = '屏蔽词'
+      Config.filter.zhanxianlouzhu = 'VIP'
+      Config.diagnostics.filterLog.includePassed = false
+      fakeData = [
+        makeItem({ id: 'diag-blocked', title: '屏蔽词优惠', louzhu: '普通用户' }),
+        makeItem({ id: 'diag-protected', title: '屏蔽词优惠', louzhu: 'VIP' })
+      ]
+      await xbk.run()
+      await xbk.run()
+      const records = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      assert(records.filter(record => record.type === 'run').length === 2, '两轮运行应写入两条汇总记录')
+      const blocked = records.find(record => record.type === 'item' && record.id === 'diag-blocked')
+      assert(blocked && blocked.decision === 'filtered', '屏蔽条目应写入诊断文件')
+      assert(blocked.reason.configKey === 'pingbibiaoti' && blocked.reason.rule === '屏蔽词', `屏蔽原因不正确: ${JSON.stringify(blocked)}`)
+      const protectedItem = records.find(record => record.type === 'item' && record.id === 'diag-protected')
+      assert(protectedItem && protectedItem.decision === 'passed', '被保护条目应写入诊断文件')
+      assert(protectedItem.protections.some(entry => entry.configKey === 'zhanxianlouzhu'), '应记录楼主强制展现')
+      assert(protectedItem.skipped.some(entry => entry.configKey === 'pingbibiaoti'), '应记录跳过的标题屏蔽')
+    } finally {
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('dry-run：接口失败时不发送告警通知', async () => {
     reset()
     setPushUrl('t03a_dry_run_fetch_error')
@@ -316,6 +348,43 @@ console.log('========================================\n');
       else process.env.XBK_DRY_RUN = previousDryRun
       try { fs.unlinkSync(cachePath) } catch (e) { /* 忽略 */ }
       try { fs.unlinkSync(reportState) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('过滤诊断：只看它未命中写入白名单原因', async () => {
+    reset()
+    setPushUrl('t03_filter_diagnostics_keyword')
+    const logPath = path.join(CACHE_DIR, 'filter-diagnostics.ndjson')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    try {
+      Config.keyword.zkt_gjc = '仅保留'
+      fakeData = [makeItem({ id: 'diag-keyword', title: '不匹配标题' })]
+      await xbk.run()
+      const records = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      const blocked = records.find(record => record.type === 'item' && record.id === 'diag-keyword')
+      assert(blocked && blocked.decision === 'filtered', '只看它未命中应写入屏蔽记录')
+      assert(blocked.reason.configKey === 'zkt_gjc' && blocked.reason.kind === 'whitelist', `只看它原因不正确: ${JSON.stringify(blocked)}`)
+    } finally {
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('过滤诊断：明细截断不影响汇总原因计数', async () => {
+    reset()
+    setPushUrl('t03_filter_diagnostics_summary')
+    const logPath = path.join(CACHE_DIR, 'filter-diagnostics.ndjson')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    try {
+      Config.filter.pingbibiaoti = '屏蔽词'
+      Config.diagnostics.filterLog.maxDetailsPerRun = 1
+      fakeData = Array.from({ length: 3 }, (_, index) => makeItem({ id: `diag-summary-${index}`, title: '屏蔽词优惠' }))
+      await xbk.run()
+      const records = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      const run = records.find(record => record.type === 'run')
+      assert(run.detailCount === 1, `明细应按上限截断: ${JSON.stringify(run)}`)
+      assert(run.byReason['title.block.pingbibiaoti'] === 3, `汇总必须统计全部屏蔽项: ${JSON.stringify(run)}`)
+    } finally {
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     }
   })
 
