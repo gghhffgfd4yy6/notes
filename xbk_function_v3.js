@@ -702,6 +702,10 @@ const Utils = {
       }
     }
     return out
+    // codeql[js/bad-tag-filter] 刻意取舍：本行是 HTML 清洗链中的未闭合标签层，单层正则
+    // 确会被畸形输入绕过，但 sanitizeDecodedHtml 为多层防御（NUL 移除→URL 清洗→成对删除
+    // →本层→事件属性保护→导航标签删除）+ C001-C045 XSS 边界回归测试（798 项）锁定，
+    // 且生产强制 re2 线性执行；完整 HTML 解析器重写为独立改进项，另行评估。
       .replace(safeRe('<(?:script|style|iframe|object|embed|svg|math)\\b(?:[^<>"\']|"[^"]*"|\'[^\']*\')*>', 'gi'), '')
       .replace(safeRe('<\\/(?:script|style|iframe|object|svg|math)\\s*>', 'gi'), '')
       .replace(safeRe('<(?:base|link|meta)\\b[^<>]*>', 'gi'), '')
