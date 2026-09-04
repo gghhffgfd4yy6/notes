@@ -41,7 +41,7 @@ require.cache[gotPath].exports.post = (url, options) => {
   if (syncPostThrow) throw new Error('sync request construction failure')
   // 失败模拟（v3.75）：异步 reject 走 $.post 的 err 回调；response.body 含密钥回显（验证不再传给 callback）
   if (failPost) {
-    if (failPost === 'primitive') {
+    if (typeof failPost === 'string') {
       // eslint-disable-next-line prefer-promise-reject-errors -- 验证第三方通道抛出原始字符串时仍能结构化归因
       return Promise.reject('primitive transport failure')
     }

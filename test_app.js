@@ -1613,6 +1613,27 @@ console.log('========================================\n');
     }
   })
 
+  await test('Pusher.send 超时为全部尝试通道保留结构化失败', async () => {
+    reset()
+    const originalSetTimeout = global.setTimeout
+    const names = ['pushplus', 'telegram']
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0)
+    try {
+      let timeoutError
+      try {
+        await xbk.Pusher.send('标题', '内容', {
+          configuredChannelNames: () => names,
+          sendNotify: () => new Promise(() => {})
+        })
+      } catch (e) { timeoutError = e }
+      assert(timeoutError && Array.isArray(timeoutError.failures), '超时应携带 failures')
+      assert(timeoutError.failures.length === names.length, `超时失败数应为 ${names.length}: ${JSON.stringify(timeoutError && timeoutError.failures)}`)
+      assert(timeoutError.failures.every((failure, index) => failure.channel === names[index] && failure.code === 'PUSH_TIMEOUT'), `超时失败应按通道结构化: ${JSON.stringify(timeoutError.failures)}`)
+    } finally {
+      global.setTimeout = originalSetTimeout
+    }
+  })
+
   await test('Pusher.send 非字符串参数 → 归一为空串（R4-2 防御）', async () => {
     reset()
     await xbk.Pusher.send(undefined, null)

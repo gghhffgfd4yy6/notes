@@ -1439,7 +1439,7 @@ async function sendNotify (text, desp, params = {}) {
   )
   const normalizeFailure = (reason, channel) => {
     if (reason && typeof reason === 'object' && reason.channel === channel) return reason
-    const message = reason && typeof reason === 'object' && reason.message ? safeErr(reason) : safeErr(reason)
+    const message = safeErr(reason)
     const failure = new Error(message || `${channel} 发送失败`)
     if (reason && typeof reason === 'object') {
       try {
