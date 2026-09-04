@@ -4372,6 +4372,15 @@ const App = {
     // ③ 拉取数据：仅在实际配置 WxPusher 时预解析域名并后台预建 HTTPS 连接。
     // 预热可被主流程结束时取消，避免“未 await”仍因活动 socket 延长进程退出。
     const warmupPromise = getNotify().then((notifyModule) => {
+      // dry-run 只保留主数据抓取；通知通道的 DNS/TLS 预热也会发起外部连接，必须跳过。
+      if (dryRun) {
+        dnsWarmup = { ok: true, skipped: true }
+        tlsWarmup = { ok: true, skipped: true, okCount: 0, count: 0 }
+        dnsWarmupSettled = true
+        tlsWarmupSettled = true
+        checkpoint('warmup-skipped', 'dry-run')
+        return null
+      }
       const hasWxPusher = Boolean(notifyModule && typeof notifyModule.hasWxPusherConfigured === 'function' &&
                     notifyModule.hasWxPusherConfigured())
       if (!hasWxPusher) {
@@ -4945,7 +4954,10 @@ const App = {
       this._writeRunLog(`${this._localStamp()} ERROR ${String(errMsg).replace(/[\r\n]+/g, ' ')}\n`)
       // v3.123：接口异常告警（限频 + 静默，不影响主流程）
       // v3.164：await 告警完成——主入口 process.exit(1) 前需确保告警 HTTP 送达（#10）
-      try { await this._sendAlert(errMsg) } catch (e) { /* 告警失败不阻塞重抛 */ }
+      // dry-run 不允许任何通知副作用；失败仍重抛给调用方/调度器。
+      if (!dryRun) {
+        try { await this._sendAlert(errMsg) } catch (e) { /* 告警失败不阻塞重抛 */ }
+      }
       throw error // 重新抛出，让外层/调度感知失败（cron 场景 exit code 非 0）
     } finally {
       // 后台 DNS/TLS 预热不是业务结果，运行结束或失败时取消未完成请求，避免拖住进程退出。
