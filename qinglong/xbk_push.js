@@ -8,6 +8,40 @@ const { classifyFailure, classifySummary, summarizeError } = require(path.join(_
 
 const ROOT = path.resolve(__dirname, '..')
 const MAIN = path.join(ROOT, 'xbk_function_v3.js')
+const ARGS = new Set(process.argv.slice(2))
+
+function hasArg (name) {
+  return ARGS.has(name)
+}
+
+function runCheck (app, env = process.env) {
+  const checks = []
+  const add = (name, ok, detail) => {
+    checks.push({ name, ok, detail })
+    console.log(`${ok ? '✅' : '❌'} ${name}${detail ? `：${detail}` : ''}`)
+  }
+  add('Node.js 版本', Number(process.versions.node.split('.')[0]) >= 22, process.version)
+  try {
+    require('got')
+    add('got 依赖', true, '可加载')
+  } catch (e) { add('got 依赖', false, '不可加载') }
+  try {
+    const RE2 = require('re2')
+    const probe = new RE2('^ok$')
+    add('re2 原生模块', probe.test('ok'), '可加载且匹配正常')
+  } catch (e) { add('re2 原生模块', false, '不可加载，过滤正则不会安全执行') }
+  const warnings = app.validateConfig(app.Config.filter)
+  add('过滤配置', warnings.length === 0, warnings.length ? `${warnings.length} 条警告` : '合法')
+  try {
+    app.init()
+    add('缓存目录', true, app.Config.cache.dir)
+  } catch (e) { add('缓存目录', false, e.message) }
+  const configured = ['PUSH_PLUS_TOKEN', 'PUSH_KEY', 'BARK_PUSH', 'QYWX_KEY', 'WX_PUSHER_APP_TOKEN', 'WX_XIZHI_KEY', 'DEER_KEY', 'PUSHME_KEY', 'TG_BOT_TOKEN']
+  const notify = require(path.join(ROOT, 'xbk_sendNotify_slim'))
+  const hasChannel = configured.some(key => notify.push_config && (notify.push_config[key] || env[key]))
+  add('通知通道', hasChannel, hasChannel ? '至少配置一个通道' : '未检测到通道配置')
+  return checks.every(item => item.ok) ? 0 : 1
+}
 
 function shouldAutoInstallDependencies (env = process.env) {
   return env && env.XBK_AUTO_INSTALL_DEPS === '1'
@@ -175,8 +209,13 @@ async function runResident (app, controller) {
 }
 
 async function main () {
-  ensureDependencies()
   const app = require(MAIN)
+  if (hasArg('--check')) {
+    process.exitCode = runCheck(app)
+    return
+  }
+  if (hasArg('--dry-run')) process.env.XBK_DRY_RUN = '1'
+  ensureDependencies()
   const controller = new AbortController()
   const stop = () => controller.abort()
   // v3.262：用 process.on 而非 once——once 在首次信号后移除监听，第二次信号会走 Node
@@ -203,4 +242,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { classifyFailure, classifySummary, runResident, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs }
+module.exports = { classifyFailure, classifySummary, runResident, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs, runCheck, hasArg }

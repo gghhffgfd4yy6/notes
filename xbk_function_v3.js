@@ -4361,6 +4361,7 @@ const App = {
     let tlsWarmupSettled = false
     let warmupController = null
     let warmupCancelled = false // v3.233：主流程先于 getNotify() resolve 结束时置位，防止预热在 run 结束后启动
+    const dryRun = process.env.XBK_DRY_RUN === '1'
     console.debug('开始获取线报酷数据...')
     checkpoint('run-start')
     // ③ 拉取数据：仅在实际配置 WxPusher 时预解析域名并后台预建 HTTPS 连接。
@@ -4785,6 +4786,10 @@ const App = {
             desp = Utils.truncateUtf16(desp, keep) + '\n\n' + link
           }
         }
+        if (dryRun) {
+          console.log(`🧪 预览：${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】${safePushUrl}`)
+          return { item, ok: true, dryRun: true }
+        }
         try {
           await Pusher.send(text, desp, notifyModule)
           pushedKeys.add(keyOf(item))
@@ -4859,7 +4864,9 @@ const App = {
       //    推送失败的排除在外 → 下次运行重新推送（避免消息永久丢失）
       const itemsKeys = new Set(items.map(keyOf))
       // v3.134：排除截断未推的（下次运行推剩余，防静默丢失）
-      const toCache = newMessages.filter(m => !truncatedKeys.has(keyOf(m)) && (!itemsKeys.has(keyOf(m)) || pushedKeys.has(keyOf(m))))
+      const toCache = dryRun
+        ? []
+        : newMessages.filter(m => !truncatedKeys.has(keyOf(m)) && (!itemsKeys.has(keyOf(m)) || pushedKeys.has(keyOf(m))))
       const cacheStart = Date.now()
       MessageStore.saveBatch(toCache, cacheName)
       cacheMs = Date.now() - cacheStart
