@@ -4820,7 +4820,7 @@ const App = {
       const filterReasonCounts = {}
       const filterExplanations = new Map()
       const filterLogCfg = Config.diagnostics && Config.diagnostics.filterLog
-      const includePassedDiagnostics = Boolean(filterLogCfg && filterLogCfg.includePassed)
+      const includePassedDiagnostics = this._enabledFlag({ enabled: filterLogCfg && filterLogCfg.includePassed })
       const maxDiagnosticDetails = (() => {
         const value = Utils.num(filterLogCfg && filterLogCfg.maxDetailsPerRun, 100)
         return Number.isInteger(value) && value > 0 ? Math.min(value, 1000) : 100

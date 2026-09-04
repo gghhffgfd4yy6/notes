@@ -369,6 +369,23 @@ console.log('========================================\n');
     }
   })
 
+  await test('过滤诊断：字符串 false 不记录普通放行条目', async () => {
+    reset()
+    setPushUrl('t03_filter_diagnostics_string_false')
+    const logPath = path.join(CACHE_DIR, 'filter-diagnostics.ndjson')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    try {
+      Config.diagnostics.filterLog.includePassed = 'false'
+      fakeData = [makeItem({ id: 'diag-string-false', title: '普通放行条目' })]
+      await xbk.run()
+      const records = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      assert(records.some(record => record.type === 'run'), '应写入本轮汇总')
+      assert(!records.some(record => record.type === 'item' && record.id === 'diag-string-false'), '字符串 false 不应记录普通放行条目')
+    } finally {
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('过滤诊断：明细截断不影响汇总原因计数', async () => {
     reset()
     setPushUrl('t03_filter_diagnostics_summary')
