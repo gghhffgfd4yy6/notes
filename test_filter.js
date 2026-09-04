@@ -6007,17 +6007,22 @@ console.log('========================================\n');
     const p = getFilePath(name)
     try { fs.unlinkSync(p) } catch (e) {}
     fs.writeFileSync(p, JSON.stringify([{ id: 993 }]), 'utf8')
-    // v3.272：readSafeTextResult 主读取改用已打开的 fd（fs.readFileSync(fd)），
-    // 按路径注入 readFileSync 失效；改在读取入口 openSync 注入（打开失败 → ioError，语义不变）。
-    const origOpen = fs.openSync
-    fs.openSync = (filePath, ...args) => {
-      if (filePath === p) throw new Error('read 失败')
-      return origOpen.call(fs, filePath, ...args)
+    const origRead = fs.readFileSync
+    let sawFd = false
+    fs.readFileSync = (filePath, ...args) => {
+      if (typeof filePath === 'number') {
+        sawFd = true
+        return origRead.call(fs, filePath, ...args)
+      }
+      if (filePath === p) throw new Error('禁止按路径读取')
+      return origRead.call(fs, filePath, ...args)
     }
     try {
-      assertEqual(readMessages(p).length, 0, '读取失败本次返回空数组但不能缓存')
+      const loaded = readMessages(p)
+      assertEqual(loaded.some(m => m.id === 993), true, '应从已验证 fd 读取缓存内容')
+      assertEqual(sawFd, true, '缓存主读取必须传入数字 fd')
     } finally {
-      fs.openSync = origOpen
+      fs.readFileSync = origRead
     }
     const recovered = readMessages(p)
     assertEqual(recovered.some(m => m.id === 993), true, '读取恢复后必须重新读取文件')

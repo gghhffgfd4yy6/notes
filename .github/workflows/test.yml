@@ -86,21 +86,7 @@ jobs:
         run: npm run test:app:serial
 
       - name: 安全审计（高危及以上）
-        # 2026-09 起 npm registry 退役 quick audit 端点，bulk 端点过渡期不稳定（503/400）：
-        # 端点级故障与真实漏洞区分处理——故障仅告警不阻断（依赖漏洞由 Dependabot
-        # alerts + dependency-review 兜底），真高危漏洞依旧 fail。
-        run: |
-          out=$(npm audit --audit-level=high --omit=dev 2>&1)
-          code=$?
-          if [ $code -eq 0 ] || echo "$out" | grep -q "found 0 vulnerabilities"; then
-            echo "✅ npm audit 无高危及以上漏洞"
-          elif echo "$out" | grep -qiE "endpoint|retired|Service Unavailable|audit endpoint returned an error|ECONNREFUSED|ETIMEDOUT|network timeout"; then
-            echo "⚠️ npm audit 服务暂不可用（registry 基础设施），依赖安全检查由 Dependabot 兜底"
-            echo "$out" | tail -6
-          else
-            echo "$out" | tail -20
-            exit 1
-          fi
+        run: npm audit --audit-level=high --omit=dev
 
   # 稳定合并门禁：汇总 quality matrix 结果。
   # 背景：quality 的 check 名带 matrix 版本后缀（quality (22.22.2) 等），若未来增删 Node 版本
