@@ -95,8 +95,9 @@ function readSafeTextResult (filePath, maxBytes) {
     // 消除 CodeQL js/file-system-race 的路径 TOCTOU 窗口（open+fstat 校验后用路径
     // 重读，窗口内路径可被替换）。fd 由 O_NOFOLLOW 打开且未改变句柄，读取的是
     // 校验过的同一 inode；下方 dev+ino 复检保留，防御 fd 生命周期内的极端替换。
-    // nosemgrep 误报：fd 是 openSync(O_NOFOLLOW) 打开的内部缓存路径句柄（路径经
-    // basename 清洗），非用户输入拼接，不存在路径穿越面。
+    // nosemgrep
+    // fd 是 openSync(O_NOFOLLOW) 打开的内部缓存路径句柄（路径经 basename 清洗），
+    // 非用户输入拼接，不存在路径穿越面（Codacy File Access 误报）。
     const text = fs.readFileSync(fd, 'utf8')
     let reFd
     try {
