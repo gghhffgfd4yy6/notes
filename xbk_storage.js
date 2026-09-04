@@ -41,7 +41,6 @@ function writeAtomic (filePath, text, label = '缓存文件') {
     tmpFile = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`
     fs.writeFileSync(tmpFile, text, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
     fs.renameSync(tmpFile, filePath)
-    tmpFile = ''
     return true
   } catch (e) {
     if (tmpFile) {
@@ -92,7 +91,11 @@ function readSafeTextResult (filePath, maxBytes) {
     if (typeof maxBytes === 'number' && maxBytes > 0 && stat.size > maxBytes) {
       return { status: 'tooLarge', text: null, error: new Error(`文件过大(${stat.size} 字节)，超过上限 ${maxBytes} 字节`) }
     }
-    const text = fs.readFileSync(filePath, 'utf8')
+    // v3.272：改用已打开的 fd 读取（fs.readFileSync(fd)），而非再按路径读一次——
+    // 消除 CodeQL js/file-system-race 的路径 TOCTOU 窗口（open+fstat 校验后用路径
+    // 重读，窗口内路径可被替换）。fd 由 O_NOFOLLOW 打开且未改变句柄，读取的是
+    // 校验过的同一 inode；下方 dev+ino 复检保留，防御 fd 生命周期内的极端替换。
+    const text = fs.readFileSync(fd, 'utf8')
     let reFd
     try {
       reFd = fs.openSync(filePath, flags)
