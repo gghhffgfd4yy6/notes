@@ -847,6 +847,21 @@ function parseWxPusherChannels () {
   return wxPusherParsedChannels
 }
 
+function configuredChannelCount () {
+  const c = push_config
+  let count = 0
+  if (c.PUSH_PLUS_TOKEN) count++
+  if (c.PUSH_KEY) count++
+  if (c.BARK_PUSH) count++
+  if (c.QYWX_KEY) count++
+  if (hasWxPusherConfigured()) count++
+  if (c.WX_XIZHI_KEY) count++
+  if (c.DEER_KEY) count++
+  if (c.PUSHME_KEY) count++
+  if (c.TG_BOT_TOKEN && c.TG_USER_ID) count++
+  return count
+}
+
 function hasWxPusherConfigured () {
   return parseWxPusherChannels().length > 0
 }
@@ -1426,4 +1441,4 @@ async function sendNotify (text, desp, params = {}) {
   }
 }
 
-module.exports = { sendNotify, push_config, hasWxPusherConfigured, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags }
+module.exports = { sendNotify, push_config, hasWxPusherConfigured, configuredChannelCount, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags }

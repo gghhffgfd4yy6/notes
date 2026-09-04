@@ -14,7 +14,15 @@ function hasArg (name) {
   return ARGS.has(name)
 }
 
-function runCheck (app, env = process.env) {
+function loadApp () {
+  try { return require(MAIN) } catch (error) {
+    const dependency = error && error.code === 'MODULE_NOT_FOUND' && /got/.test(error.message)
+    if (dependency) throw new Error(`got 依赖不可加载；请先执行 npm ci --omit=dev --ignore-scripts（原始错误：${error.message}）`)
+    throw error
+  }
+}
+
+function runCheck (app) {
   const checks = []
   const add = (name, ok, detail) => {
     checks.push({ name, ok, detail })
@@ -30,16 +38,15 @@ function runCheck (app, env = process.env) {
     const probe = new RE2('^ok$')
     add('re2 原生模块', probe.test('ok'), '可加载且匹配正常')
   } catch (e) { add('re2 原生模块', false, '不可加载，过滤正则不会安全执行') }
-  const warnings = app.validateConfig(app.Config.filter)
+  const warnings = app.validateConfig({ ...app.Config.filter, zkt_gjc: app.Config.keyword.zkt_gjc })
   add('过滤配置', warnings.length === 0, warnings.length ? `${warnings.length} 条警告` : '合法')
   try {
     app.init()
     add('缓存目录', true, app.Config.cache.dir)
   } catch (e) { add('缓存目录', false, e.message) }
-  const configured = ['PUSH_PLUS_TOKEN', 'PUSH_KEY', 'BARK_PUSH', 'QYWX_KEY', 'WX_PUSHER_APP_TOKEN', 'WX_XIZHI_KEY', 'DEER_KEY', 'PUSHME_KEY', 'TG_BOT_TOKEN']
   const notify = require(path.join(ROOT, 'xbk_sendNotify_slim'))
-  const hasChannel = configured.some(key => notify.push_config && (notify.push_config[key] || env[key]))
-  add('通知通道', hasChannel, hasChannel ? '至少配置一个通道' : '未检测到通道配置')
+  const count = typeof notify.configuredChannelCount === 'function' ? notify.configuredChannelCount() : 0
+  add('通知通道', count > 0, count > 0 ? `${count} 个可用通道` : '未检测到完整通道配置')
   return checks.every(item => item.ok) ? 0 : 1
 }
 
@@ -209,7 +216,21 @@ async function runResident (app, controller) {
 }
 
 async function main () {
-  const app = require(MAIN)
+  let app
+  if (hasArg('--check')) {
+    try { require('got') } catch (error) {
+      console.error(`❌ got 依赖：不可加载（${error.message}）`)
+      process.exitCode = 1
+      return
+    }
+    try { app = loadApp() } catch (error) {
+      console.error(`❌ 应用模块：${error.message}`)
+      process.exitCode = 1
+      return
+    }
+  } else {
+    app = loadApp()
+  }
   if (hasArg('--check')) {
     process.exitCode = runCheck(app)
     return

@@ -4362,6 +4362,11 @@ const App = {
     let warmupController = null
     let warmupCancelled = false // v3.233：主流程先于 getNotify() resolve 结束时置位，防止预热在 run 结束后启动
     const dryRun = process.env.XBK_DRY_RUN === '1'
+    const preview = (text, desp) => {
+      if (!dryRun) return false
+      console.log(`🧪 预览：${text}\n${desp}`)
+      return true
+    }
     console.debug('开始获取线报酷数据...')
     checkpoint('run-start')
     // ③ 拉取数据：仅在实际配置 WxPusher 时预解析域名并后台预建 HTTPS 连接。
@@ -4417,7 +4422,7 @@ const App = {
     try {
       MessageStore.init()
       checkpoint('cache-init')
-      await this._warnMissingRe2()
+      if (!dryRun) await this._warnMissingRe2()
       this._warnLowDisk()
       checkpoint('disk-check')
 
@@ -4691,7 +4696,9 @@ const App = {
         // v3.241：文案改为「已暂存待补推」（下轮接口重放时补推，非永久丢弃；子代理审查提示避免误导）
         // P3（审查 2026-08-15）：再修正——截断条目并未暂存（不入缓存、无任何持久化），仅依赖接口下轮重放，
         // 「已暂存」仍会误导用户以为已持久化；改为如实描述「待下轮接口重放时补推」
-        try { await this._sendAlert(`⚠️ 线报酷截断：单次待推送 ${items.length} 条超上限 ${maxPerRun}，截断 ${truncatedCount} 条待下轮接口重放时补推（防推送风暴）`) } catch (e) { /* 告警失败不阻塞主流程 */ }
+        if (!dryRun) {
+          try { await this._sendAlert(`⚠️ 线报酷截断：单次待推送 ${items.length} 条超上限 ${maxPerRun}，截断 ${truncatedCount} 条待下轮接口重放时补推（防推送风暴）`) } catch (e) { /* 告警失败不阻塞主流程 */ }
+        }
         // v3.134：截断掉的不写缓存——否则下次运行去重跳过导致静默丢失（缓存当"已处理"）；下次运行推剩余
         // keyOf 在 ⑥ 才定义，此处用同口径（id 优先 + url 归一）构造截断 key
         truncatedKeys = new Set(items.slice(maxPerRun).map(it => Utils.getMessageIdentity(it).key))
@@ -4786,10 +4793,7 @@ const App = {
             desp = Utils.truncateUtf16(desp, keep) + '\n\n' + link
           }
         }
-        if (dryRun) {
-          console.log(`🧪 预览：${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】${safePushUrl}`)
-          return { item, ok: true, dryRun: true }
-        }
+        if (preview(text, desp)) return { item, ok: false, preview: true }
         try {
           await Pusher.send(text, desp, notifyModule)
           pushedKeys.add(keyOf(item))
@@ -4845,7 +4849,7 @@ const App = {
         for (const r of results) {
           if (r && r.ok) console.log(`发现到新数据：${itemLogText(r.item, 'title', '(无标题)')}【${itemLogText(r.item, 'catename')}】${urlOf(r.item)}`)
         }
-        successCount = results.filter(r => r && r.ok).length
+        successCount = results.filter(r => r && r.ok && !r.preview).length
       } else {
         // 顺序推送（默认）：逐条 await；仅在显式配置正间隔时等待。
         const pushInterval = Utils.num(Config.timing.pushInterval, 0)
@@ -4905,7 +4909,7 @@ const App = {
       // 补告警推送（限频复用 alert.state，防轰炸）+ run.log ERROR 行（cron 翻日志可见）
       // v3.170：await 告警完成（与 catch 路径 v3.164 同口径）——曾 fire-and-forget，
       // run() 返回后进程退出时序不确定（虽然内部 .catch 兜底不丢，但行为不一致）
-      if (items.length > 0 && successCount === 0) {
+      if (!dryRun && items.length > 0 && successCount === 0) {
         try { await this._sendAlert(`推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`) } catch (e) { /* 告警失败不阻塞主流程 */ }
         this._writeRunLog(`${this._localStamp()} ERROR 推送全部失败 ${items.length} 条（通道可能失效）\n`)
       }
@@ -4919,10 +4923,10 @@ const App = {
         filtered: filteredCount,
         truncated: truncatedCount, // v3.145：截断数（下次推送）
         pushed: successCount,
-        failed: items.length - successCount,
+        failed: dryRun ? 0 : items.length - successCount,
         failures: failureInfos
       }
-      await this._updateReport(summary)
+      if (!dryRun) await this._updateReport(summary)
 
       // 返回运行摘要（供外部/测试观测，cron 可据此判断）
       return summary

@@ -1,7 +1,7 @@
 'use strict'
 
 const assert = require('assert')
-const { execFileSync } = require('child_process')
+const { execFileSync, spawnSync } = require('child_process')
 const path = require('path')
 
 const entry = path.join(__dirname, 'qinglong', 'xbk_push.js')
@@ -25,4 +25,6 @@ try {
 const source = require('fs').readFileSync(entry, 'utf8')
 assert.match(source, /--dry-run/)
 assert.match(source, /--check/)
+const dryRun = spawnSync(process.execPath, ['-e', `process.env.XBK_DRY_RUN = '1'; const app = require(${JSON.stringify(path.join(__dirname, 'xbk_function_v3.js'))}); const result = app.App; if (!result || typeof result.run !== 'function') process.exit(2)`], { cwd: __dirname, encoding: 'utf8' })
+assert.strictEqual(dryRun.status, 0, 'dry-run 环境变量应能加载主模块')
 console.log('✅ 青龙命令行：--check 诊断与 --dry-run 参数已接入')
