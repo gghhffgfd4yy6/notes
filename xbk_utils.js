@@ -80,7 +80,6 @@ function trimTrailingSlashes (s) {
   while (i > 0 && s.codePointAt(i - 1) === 47) i-- // 47 = '/'
   return i === s.length ? s : s.slice(0, i)
 }
-const ENTITY_RE = new RegExp('&(?:' + Object.keys(ENTITY_MAP).map(k => escapeRe(k.slice(1, -1))).join('|') + ');', 'g') // 从 ENTITY_MAP 自动生成，加实体只改一处
 const DEC_RE = /&#(\d+);/g
 const HEX_RE = /&#[xX]([0-9a-fA-F]+);/g
 
@@ -92,7 +91,7 @@ function normalize (o, depth = 0) {
   if (o instanceof Date || o instanceof RegExp) return o
   if (o && typeof o === 'object') {
     const out = {}
-    for (const k of Object.keys(o).sort()) Object.defineProperty(out, k, { value: normalize(o[k], depth + 1), enumerable: true, writable: true, configurable: true })
+    for (const k of Object.keys(o).sort((a, b) => a.localeCompare(b))) Object.defineProperty(out, k, { value: normalize(o[k], depth + 1), enumerable: true, writable: true, configurable: true })
     return out
   }
   return o
@@ -101,6 +100,7 @@ function createUtils (options = {}) {
   const fs = options.fs || require('node:fs')
   const safeRe = options.safeRe
   if (typeof safeRe !== 'function') throw new TypeError('createUtils requires the shared safeRe function')
+  const ENTITY_RE = safeRe('&(?:' + Object.keys(ENTITY_MAP).map(k => escapeRe(k.slice(1, -1))).join('|') + ');', 'g') // 从 ENTITY_MAP 自动生成，加实体只改一处
 
 const Utils = {
   // ==================== 时间工具 ====================
@@ -155,7 +155,7 @@ const Utils = {
     if (n === 0 || (n >= 1e8 && n < 1e14)) {
       const ms = n < TS_BOUND ? n * 1000 : n
       const t = new Date(ms)
-      if (!isNaN(t.getTime())) return t.getTime()
+      if (!Number.isNaN(t.getTime())) return t.getTime()
     }
     return null
   },
@@ -209,11 +209,11 @@ const Utils = {
     const dateOk = t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d
     if (dateOk) {
       const r = new Date(s)
-      if (!isNaN(r.getTime())) return r.getTime()
+      if (!Number.isNaN(r.getTime())) return r.getTime()
       // 宿主解析不接受非补零 ISO（如 '2026-8-1T00:00:00Z'）：补零后仍按原格式解析。
       const normalized = s.replace(/^(\d{4})-(\d{1,2})-(\d{1,2})/, (_, yy, mm, dd) => `${yy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`)
       const r2 = new Date(normalized)
-      if (!isNaN(r2.getTime())) return r2.getTime()
+      if (!Number.isNaN(r2.getTime())) return r2.getTime()
     }
     return null
   },
@@ -231,11 +231,11 @@ const Utils = {
     } else {
       t = new Date(s)
     }
-    if (isNaN(t.getTime())) t = new Date(s.replace(/-/g, '/'))
+    if (Number.isNaN(t.getTime())) t = new Date(s.replace(/-/g, '/'))
     // v3.171：回退时 T 分隔一并转空格——'2026-8-1T10:30'（单数字月日 T 格式）曾 Invalid 返回 null，
     // 而 '2026-8-1 10:30'（空格格式）宽松解析有效——同类格式不一致；'2026/8/1 10:30' 解析有效
-    if (isNaN(t.getTime())) t = new Date(s.replace(/-/g, '/').replace('T', ' '))
-    if (isNaN(t.getTime())) return null
+    if (Number.isNaN(t.getTime())) t = new Date(s.replace(/-/g, '/').replace('T', ' '))
+    if (Number.isNaN(t.getTime())) return null
     return t.getTime()
   },
 
@@ -450,7 +450,7 @@ const Utils = {
       safeRe(String.raw`\\u([0-9a-fA-F]{1,6})|\\([0-9a-fA-F]{1,6})[\s]?|\\([\n\r\u0000])|\\([^0-9a-fA-F\n\r\u0000])`, 'g'),
       (m, a, b, nl, ident) => {
         if (a !== undefined || b !== undefined) {
-          const cp = parseInt(a || b, 16)
+          const cp = Number.parseInt(a || b, 16)
           return (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : m
         }
         if (ident !== undefined) return ident // CSS 恒等转义：\r → r（随后黑名单拦截 url(...)/expression(...)）
@@ -1057,7 +1057,7 @@ const Utils = {
       const next = str
         .replace(ENTITY_RE, m => ENTITY_MAP[m] || m)
         .replace(DEC_RE, (_, code) => this._decodeNumeric(Number(code), `&#${code};`))
-        .replace(HEX_RE, (_, hex) => this._decodeNumeric(parseInt(hex, 16), `&#x${hex};`))
+        .replace(HEX_RE, (_, hex) => this._decodeNumeric(Number.parseInt(hex, 16), `&#x${hex};`))
       if (next === str) break
       str = next
     }
