@@ -9,16 +9,17 @@ const { readStatus, formatStatus } = require('./scripts/status')
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-status-'))
 const previousCwd = process.cwd()
 
-function write (name, value) {
-  fs.writeFileSync(name, value)
-}
+function writeRunLog (value) { fs.writeFileSync('run.log', value) }
+function writeReport (value) { fs.writeFileSync('report.state', value) }
+function writeChannels (value) { fs.writeFileSync('channel-health.state', value) }
+function writeDiagnostics (value) { fs.writeFileSync('filter-diagnostics.ndjson', value) }
 
 try {
   process.chdir(dir)
-  write('run.log', '2026-09-05 10:00:00 total=8 dedup=2 filtered=3 truncated=1 pushed=2 failed=1 elapsed=1.2s\n')
-  write('report.state', JSON.stringify({ date: '2026-09-05', runs: 4, total: 20, dedup: 5, filtered: 7, pushed: 6, failed: 1, truncated: 2 }))
-  write('channel-health.state', JSON.stringify({ pushplus: { consecutiveFailures: 2, lastFailureAt: 1000, lastAlertAt: 0 }, bark: { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0 } }))
-  write('filter-diagnostics.ndjson', [
+  writeRunLog('2026-09-05 10:00:00 total=8 dedup=2 filtered=3 truncated=1 pushed=2 failed=1 elapsed=1.2s\n')
+  writeReport(JSON.stringify({ date: '2026-09-05', runs: 4, total: 20, dedup: 5, filtered: 7, pushed: 6, failed: 1, truncated: 2 }))
+  writeChannels(JSON.stringify({ pushplus: { consecutiveFailures: 2, lastFailureAt: 1000, lastAlertAt: 0 }, bark: { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0 } }))
+  writeDiagnostics([
     JSON.stringify({ type: 'run', at: '2026-09-05 10:00:00', total: 8, dedup: 2, filtered: 3, passed: 2, byReason: { title: 2, category: 1 }, detailCount: 3 }),
     JSON.stringify({ type: 'item', id: 'x' })
   ].join('\n') + '\n')
@@ -36,16 +37,16 @@ try {
   assert.match(output, /pushplus：连续失败 2 次/)
   assert.match(output, /title=2/)
 
-  write('report.state', '{broken')
+  writeReport('{broken')
   fs.unlinkSync('channel-health.state')
   const degraded = readStatus('.', { now: 2000 })
   assert.strictEqual(degraded.report.status, 'invalid')
   assert.strictEqual(degraded.channels.status, 'missing')
   assert.match(formatStatus(degraded), /不可读|缺失/)
 
-  write('report.state', '{}')
-  write('channel-health.state', JSON.stringify({ pushplus: { consecutiveFailures: 'two' } }))
-  write('filter-diagnostics.ndjson', JSON.stringify({ type: 'run' }) + '\n')
+  writeReport('{}')
+  writeChannels(JSON.stringify({ pushplus: { consecutiveFailures: 'two' } }))
+  writeDiagnostics(JSON.stringify({ type: 'run' }) + '\n')
   const malformed = readStatus('.')
   assert.strictEqual(malformed.report.status, 'invalid', '缺字段 report.state 不应显示正常')
   assert.strictEqual(malformed.channels.status, 'invalid', '通道失败次数必须是非负整数')
