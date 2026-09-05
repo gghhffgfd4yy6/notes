@@ -13,7 +13,7 @@ const TRACKING_QUERY_NAMES = new Set(['fbclid', 'gclid', 'dclid', 'msclkid', 'yc
 
 // ---------- 魔法数字常量 ----------
 const DAY_MS = 24 * 60 * 60 * 1000 // 一天的毫秒数
-const TS_BOUND = 1e11 // 秒/毫秒时间戳分界（10位秒 / 12+位毫秒）
+const TS_BOUND = 100_000_000_000 // 秒/毫秒时间戳分界（10位秒 / 12+位毫秒）
 const MAX_CODE_POINT = 0x10FFFF // Unicode 最大码点
 const SURROGATE_LO = 0xD800 // 代理区起点
 const SURROGATE_HI = 0xDFFF // 代理区终点
@@ -102,7 +102,7 @@ function createUtils (options = {}) {
   if (typeof safeRe !== 'function') throw new TypeError('createUtils requires the shared safeRe function')
   const ENTITY_RE = safeRe('&(?:' + Object.keys(ENTITY_MAP).map(k => escapeRe(k.slice(1, -1))).join('|') + ');', 'g') // 从 ENTITY_MAP 自动生成，加实体只改一处
 
-const Utils = {
+  const Utils = {
   // ==================== 时间工具 ====================
   /**
      * 统一时间解析：返回毫秒时间戳，无效返回 null。
@@ -1063,7 +1063,7 @@ const Utils = {
     }
     return str
   }
-}
+  }
 
   return Utils
 }
