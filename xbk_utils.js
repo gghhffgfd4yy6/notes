@@ -1070,6 +1070,8 @@ const Utils = {
 
 module.exports = {
   FILTER_FIELDS,
+  trimTrailingSlashes,
+  normalize,
   DAY_MS,
   TS_BOUND,
   MAX_CODE_POINT,
