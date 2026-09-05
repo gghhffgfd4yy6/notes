@@ -30,6 +30,20 @@ node qinglong/xbk_push.js
 node qinglong/xbk_push.js --check
 ```
 
+查看最近运行、日报、通道健康和过滤诊断的只读汇总：
+
+```bash
+node qinglong/xbk_push.js --status
+```
+
+默认读取 `xianbaoku_cache/`。如果部署时使用了自定义缓存目录，可通过绝对路径指定：
+
+```bash
+XBK_CACHE_DIR=/path/to/cache node qinglong/xbk_push.js --status
+```
+
+`--status` 只读取缓存目录中的状态文件，不加载推送依赖、不抓取、不推送、不修复或写入任何文件。
+
 调整过滤规则时可运行抓取和处理流程但不调用通知接口，也不写成功缓存：
 
 ```bash
