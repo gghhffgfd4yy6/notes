@@ -7,13 +7,14 @@ const path = require('path')
 const { readStatus, formatStatus } = require('./scripts/status')
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-status-'))
+const previousCwd = process.cwd()
 
 function write (name, value) {
-  // codacy-disable-next-line: test sandbox path from fs.mkdtempSync, not external input
-  fs.writeFileSync(path.join(dir, name), value)
+  fs.writeFileSync(name, value)
 }
 
 try {
+  process.chdir(dir)
   write('run.log', '2026-09-05 10:00:00 total=8 dedup=2 filtered=3 truncated=1 pushed=2 failed=1 elapsed=1.2s\n')
   write('report.state', JSON.stringify({ date: '2026-09-05', runs: 4, total: 20, dedup: 5, filtered: 7, pushed: 6, failed: 1, truncated: 2 }))
   write('channel-health.state', JSON.stringify({ pushplus: { consecutiveFailures: 2, lastFailureAt: 1000, lastAlertAt: 0 }, bark: { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0 } }))
@@ -22,7 +23,7 @@ try {
     JSON.stringify({ type: 'item', id: 'x' })
   ].join('\n') + '\n')
 
-  const status = readStatus(dir, { now: 2000 })
+  const status = readStatus('.', { now: 2000 })
   assert.strictEqual(status.report.value.runs, 4)
   assert.strictEqual(status.report.value.pushed, 6)
   assert.strictEqual(status.channels.value.pushplus.consecutiveFailures, 2)
@@ -36,9 +37,8 @@ try {
   assert.match(output, /title=2/)
 
   write('report.state', '{broken')
-  // codacy-disable-next-line: test sandbox path from fs.mkdtempSync, not external input
-  fs.unlinkSync(path.join(dir, 'channel-health.state'))
-  const degraded = readStatus(dir, { now: 2000 })
+  fs.unlinkSync('channel-health.state')
+  const degraded = readStatus('.', { now: 2000 })
   assert.strictEqual(degraded.report.status, 'invalid')
   assert.strictEqual(degraded.channels.status, 'missing')
   assert.match(formatStatus(degraded), /不可读|缺失/)
@@ -46,18 +46,17 @@ try {
   write('report.state', '{}')
   write('channel-health.state', JSON.stringify({ pushplus: { consecutiveFailures: 'two' } }))
   write('filter-diagnostics.ndjson', JSON.stringify({ type: 'run' }) + '\n')
-  const malformed = readStatus(dir)
+  const malformed = readStatus('.')
   assert.strictEqual(malformed.report.status, 'invalid', '缺字段 report.state 不应显示正常')
   assert.strictEqual(malformed.channels.status, 'invalid', '通道失败次数必须是非负整数')
   assert.strictEqual(malformed.diagnostics.status, 'invalid', '过滤汇总必须带计数对象')
 
-  // codacy-disable-next-line: test sandbox path from fs.mkdtempSync, not external input
-  fs.unlinkSync(path.join(dir, 'run.log'))
-  // codacy-disable-next-line: test sandbox path from fs.mkdtempSync, not external input
-  fs.symlinkSync('/etc/passwd', path.join(dir, 'run.log'))
-  assert.strictEqual(readStatus(dir).run.status, 'unsafe', '符号链接必须拒绝读取')
+  fs.unlinkSync('run.log')
+  fs.symlinkSync('/etc/passwd', 'run.log')
+  assert.strictEqual(readStatus('.').run.status, 'unsafe', '符号链接必须拒绝读取')
 
   console.log('✅ --status 聚合并展示运行状态，损坏/缺失/符号链接文件安全降级')
 } finally {
+  process.chdir(previousCwd)
   fs.rmSync(dir, { recursive: true, force: true })
 }
