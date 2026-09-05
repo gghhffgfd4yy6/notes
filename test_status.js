@@ -1,6 +1,4 @@
 'use strict'
-/* codacy-disable-file: 测试 sandbox — tmpdir 由 fs.mkdtempSync 创建，
-   Codacy 对“动态路径 + fs.*Sync” pattern 误报；本文件不参与生产 I/O。 */
 
 const assert = require('assert')
 const fs = require('fs')
@@ -11,6 +9,7 @@ const { readStatus, formatStatus } = require('./scripts/status')
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-status-'))
 
 function write (name, value) {
+  // nosemgrep: test sandbox path from fs.mkdtempSync, not external input
   fs.writeFileSync(path.join(dir, name), value)
 }
 
@@ -37,6 +36,7 @@ try {
   assert.match(output, /title=2/)
 
   write('report.state', '{broken')
+  // nosemgrep: test sandbox path from fs.mkdtempSync, not external input
   fs.unlinkSync(path.join(dir, 'channel-health.state'))
   const degraded = readStatus(dir, { now: 2000 })
   assert.strictEqual(degraded.report.status, 'invalid')
@@ -51,7 +51,9 @@ try {
   assert.strictEqual(malformed.channels.status, 'invalid', '通道失败次数必须是非负整数')
   assert.strictEqual(malformed.diagnostics.status, 'invalid', '过滤汇总必须带计数对象')
 
+  // nosemgrep: test sandbox path from fs.mkdtempSync, not external input
   fs.unlinkSync(path.join(dir, 'run.log'))
+  // nosemgrep: test sandbox path from fs.mkdtempSync, not external input
   fs.symlinkSync('/etc/passwd', path.join(dir, 'run.log'))
   assert.strictEqual(readStatus(dir).run.status, 'unsafe', '符号链接必须拒绝读取')
 

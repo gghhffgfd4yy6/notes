@@ -1,6 +1,4 @@
 'use strict'
-/* codacy-disable-file: 测试 sandbox — tmpdir 由 fs.mkdtempSync 创建，
-   Codacy 对“动态路径 + fs.*Sync” pattern 误报；本文件不参与生产 I/O。 */
 
 const assert = require('assert')
 const fs = require('fs')
@@ -33,12 +31,15 @@ assert.match(source, /--status/)
 
 const statusDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-status-cli-'))
 try {
+  // nosemgrep: test sandbox path from fs.mkdtempSync, not external input
   fs.writeFileSync(path.join(statusDir, 'report.state'), JSON.stringify({ date: '2026-09-05', runs: 1, total: 2, dedup: 0, filtered: 0, pushed: 2, failed: 0, truncated: 0 }))
+  // nosemgrep: test sandbox path from fs.mkdtempSync, not external input
   const before = fs.statSync(path.join(statusDir, 'report.state')).mtimeMs
   const statusRun = spawnSync(process.execPath, [entry, '--status'], { cwd: __dirname, encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: statusDir } })
   assert.strictEqual(statusRun.status, 0, '--status 应独立于 got/re2 成功退出')
   assert.match(statusRun.stdout, /xbk-push 运行状态/)
   assert.match(statusRun.stdout, /推送成功：2 条/)
+  // nosemgrep: test sandbox path from fs.mkdtempSync, not external input
   assert.strictEqual(fs.statSync(path.join(statusDir, 'report.state')).mtimeMs, before, '--status 不得写状态文件')
 } finally {
   fs.rmSync(statusDir, { recursive: true, force: true })
