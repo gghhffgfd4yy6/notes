@@ -7,6 +7,7 @@
 
 const got = require('got')
 const { baseRequestOptions, invalidateDnsForError, profileMs } = require('./xbk_agents')
+const { trimTrailingSlashes } = require('./xbk_utils')
 const timeout = 15000
 const REQUEST_OPTIONS = baseRequestOptions()
 
@@ -19,13 +20,6 @@ function safeString (value) {
   try { return String(value === undefined || value === null ? '' : value) } catch (e) { return '' }
 }
 
-// 去尾部斜杠：线性扫描替代 /\/+$/（S8786 对 X+$ 型正则标记超线性回溯；配置值虽可信，
-// 但改成等价线性实现可消除告警且无语义差异）
-function trimTrailingSlashes (s) {
-  let i = s.length
-  while (i > 0 && s.codePointAt(i - 1) === 47) i-- // 47 = '/'
-  return i === s.length ? s : s.slice(0, i)
-}
 // 日志密钥脱敏：保留前4位+后2位，中间 ***（防止 cron 日志重定向/分享时泄露密钥）
 function maskKey (k) {
   const s = safeString(k)
