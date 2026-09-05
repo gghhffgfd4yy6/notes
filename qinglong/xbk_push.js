@@ -214,7 +214,29 @@ async function runResident (app, controller) {
   })
 }
 
+const { readStatus, formatStatus } = require('../scripts/status')
+
+function statusCacheDir () {
+  // --status 不加载主应用，避免缺少 got/re2 时诊断命令反而不可用。
+  // 仅允许绝对路径覆盖，避免环境变量把状态读取重定向到项目目录外的任意相对位置。
+  const configured = process.env.XBK_CACHE_DIR
+  return configured && path.isAbsolute(configured) ? configured : path.join(ROOT, 'xianbaoku_cache')
+}
+
+function runStatus () {
+  const status = readStatus(statusCacheDir())
+  console.log(formatStatus(status))
+  return 0
+}
+
 async function main () {
+  if (hasArg('--status')) {
+    try { process.exitCode = runStatus() } catch (error) {
+      console.error(`❌ 状态读取失败：${error.message}`)
+      process.exitCode = 1
+    }
+    return
+  }
   if (hasArg('--check')) {
     try { require('got') } catch (error) {
       console.error(`❌ got 依赖：不可加载（${error.message}）`)
