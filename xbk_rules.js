@@ -53,7 +53,9 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
         return 0
       }
       const stack = [{ inf: false, alt: false }] // 栈顶=当前分组：inf=组内最后 token 是否以无限量词结尾；alt=组内是否含 |（交替）
+      let skipUntil = -1
       for (let i = 0; i < s.length; i++) {
+        if (i < skipUntil) continue
         const ch = s[i]
         const cur = stack[stack.length - 1]
         if (ch === '\\') { i++; cur.inf = false; continue } // 转义（含 \\( \\) \\d 等）视为普通 token
@@ -71,7 +73,7 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
             while (j < s.length && s[j] !== ']') { if (s[j] === '\\') j++; j++ }
           }
           if (j < s.length && s[j] === ']') j++ // 正常类结束（[^] 后无多余 ] 时 j 已指向结束后的字符）
-          i = j - 1; cur.inf = false; continue // 字符类整体视为普通 token
+          skipUntil = j; cur.inf = false; continue // 字符类整体视为普通 token
         }
         if (ch === '(') { stack.push({ inf: false, alt: false }); continue }
         if (ch === '|') { cur.alt = true; cur.inf = false; continue } // v3.174：交替标记（歧义回溯候选）

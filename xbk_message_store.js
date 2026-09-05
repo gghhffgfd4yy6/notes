@@ -14,6 +14,14 @@ function createMessageStore ({
   storage,
   constants
 }) {
+  const tokenMatches = (actual, expected) => {
+    if (typeof actual !== 'string' || typeof expected !== 'string') return false
+    const actualBytes = Buffer.from(actual, 'utf8')
+    const expectedBytes = Buffer.from(expected, 'utf8')
+    if (actualBytes.length !== expectedBytes.length) return false
+    try { return typeof crypto?.timingSafeEqual === 'function' && crypto.timingSafeEqual(actualBytes, expectedBytes) } catch (e) { return false }
+  }
+
   const { readSafeTextResult, writeAtomic, writeAtomicIfAbsent } = storage
   const {
     DEFAULT_MAX_SIZE,
@@ -703,7 +711,7 @@ function createMessageStore ({
       if (guard === null) return false
       const lockPath = filePath + '.seen.lock'
       const token = this._acquireTombstoneLock(lockPath)
-      if (token === null) {
+      if (typeof token !== 'string') {
         this._releaseTombstoneCleanupGuard(dir, guard)
         return false
       }
@@ -744,7 +752,7 @@ function createMessageStore ({
     /** 释放墓碑锁：仅当锁内容仍是自己写入的 token 时才删除；ENOENT 视为正常。 */
     _releaseTombstoneLock (lockPath, token) {
       try {
-        if (fs.readFileSync(lockPath, 'utf8') === token) fs.unlinkSync(lockPath)
+        if (tokenMatches(fs.readFileSync(lockPath, 'utf8'), token)) fs.unlinkSync(lockPath)
       } catch (e) {
         if (e && e.code !== 'ENOENT') { /* 其余错误同样忽略，锁清理非关键 */ }
       }
@@ -753,7 +761,7 @@ function createMessageStore ({
     /** 写盘前校验锁仍归当前进程持有；锁被替换或删除时放弃本次写入。 */
     _isTombstoneLockOwner (lockPath, token) {
       try {
-        return fs.readFileSync(lockPath, 'utf8') === token
+        return tokenMatches(fs.readFileSync(lockPath, 'utf8'), token)
       } catch {
         return false
       }
@@ -982,7 +990,7 @@ function createMessageStore ({
         if (identity.url) del(urlMap, identity.url)
         if (identity.kind === 'url') del(urlOnlyMap, identity.url)
       }
-      messages.forEach(addIdentityIndexes)
+      messages.forEach((message, i) => addIdentityIndexes(message, i))
       const NOW = () => this._now()
       let changedAny = false
       let updatedCount = 0 // P3：批内逐条日志降频——改为批尾一条汇总（大批次曾刷屏）

@@ -5,6 +5,14 @@ function createApp ({
   summarizeError, PROFILE3, PROFILE3_BOOT_MARKS, prewarmDns, prewarmTls,
   getNotify, PKG_VERSION, trimTrailingSlashes, compileUserRegex
 }) {
+  const tokenMatches = (actual, expected) => {
+    if (typeof actual !== 'string' || typeof expected !== 'string') return false
+    const actualBytes = Buffer.from(actual, 'utf8')
+    const expectedBytes = Buffer.from(expected, 'utf8')
+    if (actualBytes.length !== expectedBytes.length) return false
+    try { return typeof crypto?.timingSafeEqual === 'function' && crypto.timingSafeEqual(actualBytes, expectedBytes) } catch (e) { return false }
+  }
+
   const App = {
   // v3.176：运行日志时间戳本地化（与日报/告警本地口径一致）——曾 toISOString（UTC），
   // UTC+8 用户凌晨 cron 排查时 UTC 行与本地日期混排易误判（系统审查 #9）
@@ -317,7 +325,7 @@ function createApp ({
       if (!acquired) return
       try {
         try {
-          if (fs.readFileSync(statePath, 'utf8') === token) {
+          if (tokenMatches(fs.readFileSync(statePath, 'utf8'), token)) {
             const completed = JSON.parse(token)
             completed.status = 'completed'
             this._writeRe2WarnMarkerAtomic(statePath, JSON.stringify(completed))
@@ -334,7 +342,7 @@ function createApp ({
       if (!acquired) return
       try {
         try {
-          if (fs.readFileSync(statePath, 'utf8') === token) fs.unlinkSync(statePath)
+          if (tokenMatches(fs.readFileSync(statePath, 'utf8'), token)) fs.unlinkSync(statePath)
         } catch (ignore) { /* 删除失败不影响主流程 */ }
       } finally {
         this._releaseRe2WarnLock(statePath, acquired)
