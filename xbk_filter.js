@@ -1,16 +1,8 @@
 'use strict'
 
-// FilterEngine extracted verbatim from xbk_function_v3.js; integration remains the main entrypoint's responsibility.
 /* eslint indent: off */
-let RE2C = null
-try { RE2C = require('re2') } catch (e) { RE2C = null }
-function compileUserRegex (source, flags = 'i') {
-  if (typeof source !== 'string' || !RE2C) return null
-  try { return new RE2C(source, flags) } catch (e) { return null }
-}
-
-function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS }) {
-  if (!Utils || !RuleEngine || !Array.isArray(FILTER_FIELDS)) throw new TypeError('createFilterEngine requires Utils, RuleEngine, and FILTER_FIELDS')
+function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRegex }) {
+  if (!Utils || !RuleEngine || !Array.isArray(FILTER_FIELDS) || typeof compileUserRegex !== 'function') throw new TypeError('createFilterEngine requires Utils, RuleEngine, FILTER_FIELDS, and compileUserRegex')
 
   const FilterEngine = {
   // v3.239：whitelistFilter 正则编译缓存（热路径复用，避免每条消息 × 字段重复 new RegExp）

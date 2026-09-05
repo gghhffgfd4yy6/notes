@@ -103,6 +103,7 @@ function createUtils (options = {}) {
   const ENTITY_RE = safeRe('&(?:' + Object.keys(ENTITY_MAP).map(k => escapeRe(k.slice(1, -1))).join('|') + ');', 'g') // 从 ENTITY_MAP 自动生成，加实体只改一处
 
   const Utils = {
+  safeRe,
   // ==================== 时间工具 ====================
   /**
      * 统一时间解析：返回毫秒时间戳，无效返回 null。

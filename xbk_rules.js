@@ -5,6 +5,9 @@
 // ============================================================
 function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Available }) {
   const RuleEngine = {
+  _compileUserRegex (source, flags = 'i') {
+    return compileUserRegex(source, flags)
+  },
   /** 解析单行规则：split('###') + trim，返回 { cat, val, parts } */
     _parseLine (line) {
     // v3.245 P1：String(line) 对嵌套 Symbol 数组抛 TypeError——catch 兜底返回空规则。

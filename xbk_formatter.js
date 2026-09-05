@@ -2,9 +2,8 @@
 
 /* eslint indent: off */
 // Formatter extracted verbatim; integration remains the main entrypoint's responsibility.
-function createFormatter ({ Utils }) {
-  if (!Utils || typeof Utils.safeRe !== 'function') throw new TypeError('createFormatter requires Utils.safeRe')
-  const safeRe = Utils.safeRe
+function createFormatter ({ Utils, safeRe }) {
+  if (!Utils || typeof safeRe !== 'function') throw new TypeError('createFormatter requires Utils and safeRe')
   const Formatter = {
   /** Markdown 收尾：合并连续换行 + 去首尾空白（短路与正常路径共用） */
   _finalizeMd (s) {
