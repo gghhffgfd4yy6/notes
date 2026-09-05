@@ -181,6 +181,28 @@ console.log('========================================\n');
     assertEqual(result.reason.rule, '数码###耳机')
   })
 
+  await test('过滤解释：后续未生效的展现规则不混入屏蔽诊断', () => {
+    const result = explainFilter(makeItem({ louzhu: 'bad', title: 'vip' }), compileRules({ pingbilouzhu: 'bad', zhanxianbiaoti: 'vip' }))
+    assertEqual(result.passed, false)
+    assertEqual(result.reason.configKey, 'pingbilouzhu')
+    assertEqual(result.protections.length, 0)
+    assertEqual(result.skipped.length, 0)
+  })
+
+  await test('过滤解释：原始配置编译异常时告警并保守放行', () => {
+    const cfg = {}
+    Object.defineProperty(cfg, 'pingbifenlei', { get: () => { throw new Error('模拟配置读取异常') } })
+    const originalWarn = console.warn
+    const warnings = []
+    try {
+      console.warn = (...args) => warnings.push(args.join(' '))
+      assertEqual(explainFilter(makeItem(), cfg).passed, true)
+    } finally {
+      console.warn = originalWarn
+    }
+    assertEqual(warnings.some(message => message.includes('过滤规则编译失败')), true)
+  })
+
   // ==================== 2. 分类屏蔽 ====================
   console.log('\n📂 2. 分类屏蔽')
 

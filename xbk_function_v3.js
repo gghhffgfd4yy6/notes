@@ -2386,9 +2386,15 @@ const FilterEngine = {
   explainFilter (group, cfg, rawCfg = null) {
     const passed = { passed: true, reason: null, protections: [], skipped: [] }
     if (!group || !cfg) return passed
+    const blocked = (reason) => ({ ...passed, passed: false, reason, protections: [], skipped: [] })
     if (!cfg.__compiled) {
       let compiled
-      try { compiled = RuleEngine.compileRules(cfg) } catch (e) { return passed }
+      try {
+        compiled = RuleEngine.compileRules(cfg)
+      } catch (e) {
+        console.warn('⚠️ 过滤规则编译失败，已保守放行')
+        return passed
+      }
       return this.explainFilter(group, compiled, cfg)
     }
     const sourceOf = (key, matchedRule = null) => {
@@ -2421,13 +2427,13 @@ const FilterEngine = {
     const regTime = Utils.safeGet(group, 'louzhuregtime')
     const timeRule = cfg.pingbitime
     if (timeRule && regTime !== undefined && regTime !== null && regTime !== '' && RuleEngine.checkTimeCompiled(timeRule, group)) {
-      return { ...passed, passed: false, reason: reason('time', 'block', 'pingbitime', { matchedRule: timeMatchedRule(timeRule, group) }) }
+      return blocked(reason('time', 'block', 'pingbitime', { matchedRule: timeMatchedRule(timeRule, group) }))
     }
 
     const category = Utils.safeGet(group, 'catename')
     if (cfg.pingbifenlei && category !== undefined && category !== null && category !== '' &&
       RuleEngine.matchesCompiled(cfg.pingbifenlei, category, category)) {
-      return { ...passed, passed: false, reason: reason('category', 'block', 'pingbifenlei', { matchedRule: matchedRule(cfg.pingbifenlei, category, category) }) }
+      return blocked(reason('category', 'block', 'pingbifenlei', { matchedRule: matchedRule(cfg.pingbifenlei, category, category) }))
     }
 
     const stages = [
@@ -2459,14 +2465,14 @@ const FilterEngine = {
         continue
       }
       if (cfg[stage.blockKey] && !showFlags[stage.key] && RuleEngine.matchesCompiled(cfg[stage.blockKey], value, category)) {
-        return { ...passed, passed: false, reason: reason(stage.label, 'block', stage.blockKey, { matchedRule: matchedRule(cfg[stage.blockKey], value, category) }) }
+        return blocked(reason(stage.label, 'block', stage.blockKey, { matchedRule: matchedRule(cfg[stage.blockKey], value, category) }))
       }
       if (cfg[stage.plusKey] && RuleEngine.matchesCompiled(cfg[stage.plusKey], value, category)) {
         if (showMatched[stage.key]) {
           showFlags[stage.key] = false
           passed.protections = passed.protections.filter(entry => entry.configKey !== stage.showKey)
         }
-        return { ...passed, passed: false, reason: reason(stage.label, 'plus', stage.plusKey, { matchedRule: matchedRule(cfg[stage.plusKey], value, category) }) }
+        return blocked(reason(stage.label, 'plus', stage.plusKey, { matchedRule: matchedRule(cfg[stage.plusKey], value, category) }))
       }
       if (showFlags[stage.key] && cfg[stage.blockKey]) {
         passed.skipped.push(reason(stage.label, 'skipped', stage.blockKey, { because: `${stage.key}.show` }))
