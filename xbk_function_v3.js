@@ -207,6 +207,15 @@ const Config = {
     intervalMs: 3600000
   },
 
+  // 过滤诊断：每轮将屏蔽/保护决策追加到缓存目录的 NDJSON 文件，供跨轮排查。
+  diagnostics: {
+    filterLog: {
+      enabled: true,
+      maxDetailsPerRun: 100,
+      includePassed: false
+    }
+  },
+
   // 磁盘余量监测：仅告警，不阻断推送；不支持 statfs 的旧 Node/平台自动跳过。
   storage: {
     minFreeBytes: 50 * 1024 * 1024
@@ -1955,7 +1964,7 @@ const RuleEngine = {
               continue
             }
             if (!valRe) continue
-            rules.push({ cat: catRe, val: valRe }) // valRe 恒真（失败已 continue）
+            rules.push({ cat: catRe, val: valRe, source: line.trim() }) // valRe 恒真（失败已 continue）
           }
         }
         compiled[field] = { _type: 'multi', rules }
@@ -1967,7 +1976,7 @@ const RuleEngine = {
         if (this.hasNestedQuantifier(val)) { compiled[field] = null; continue } // ReDoS 防护
         const re = compileUserRegex(val, 'i')
         if (re) {
-          compiled[field] = { _type: 're', re }
+          compiled[field] = { _type: 're', re, source: val }
         } else {
           if (!isRe2Available()) {
             compiled[field] = null
@@ -2001,7 +2010,7 @@ const RuleEngine = {
             }
             const value = Math.floor(Number(val))
             if (Number.isFinite(value) && value >= 0 && value <= PINGBITIME_MAX_DAYS) {
-              rules.push({ cat: catRe, value })
+              rules.push({ cat: catRe, value, source: line.trim() })
             } else if (Number.isFinite(value) && value >= 0 && value > PINGBITIME_MAX_DAYS) {
               console.warn(`⚠️ 配置「pingbitime」的天数值「${(parts[1] || '').trim()}」超过上限 ${PINGBITIME_MAX_DAYS} 天，已忽略`)
             }
@@ -2013,7 +2022,7 @@ const RuleEngine = {
         // v3.157：非法数值(如 'abc')→ null 不编译（曾落 value:0 静默关闭时间过滤；空白已 v3.156 处理）
         // v3.x：数值超过 PINGBITIME_MAX_DAYS 上限同样置 null 不编译（同下界处理）
         if (Number.isFinite(value) && value >= 0 && value <= PINGBITIME_MAX_DAYS) {
-          compiled.pingbitime = { _type: 'time', value }
+          compiled.pingbitime = { _type: 'time', value, source: pbRaw }
         } else {
           if (Number.isFinite(value) && value >= 0 && value > PINGBITIME_MAX_DAYS) {
             console.warn(`⚠️ 配置「pingbitime」的值「${pbRaw}」超过上限 ${PINGBITIME_MAX_DAYS} 天，已忽略`)
@@ -2054,6 +2063,15 @@ const RuleEngine = {
       if (this._catMatches(rule, catename) && predicate(rule)) return true
     }
     return false
+  },
+
+  /** 返回首个命中的多行规则（供可解释过滤复用；无命中返回 null） */
+  _firstMatchingRule (rules, catename, predicate) {
+    if (!Array.isArray(rules)) return null
+    for (const rule of rules) {
+      if (this._catMatches(rule, catename) && predicate(rule)) return rule
+    }
+    return null
   },
 
   /** 使用编译后的规则进行匹配（单条） */
@@ -2361,21 +2379,116 @@ const FilterEngine = {
   },
 
   /**
+     * 过滤决策解释：与 listfilter 共用同一编译规则和优先级，供日志/审计使用。
+     * reason 表示首个实际拦截原因；protections 表示命中的强制展现；
+     * skipped 表示因更高优先级保护而未执行的后续屏蔽规则。
+     */
+  explainFilter (group, cfg, rawCfg = null) {
+    const passed = { passed: true, reason: null, protections: [], skipped: [] }
+    if (!group || !cfg) return passed
+    const blocked = (reason) => ({ ...passed, passed: false, reason, protections: [], skipped: [] })
+    if (!cfg.__compiled) {
+      let compiled
+      try {
+        compiled = RuleEngine.compileRules(cfg)
+      } catch (e) {
+        console.warn('⚠️ 过滤规则编译失败，已保守放行')
+        return passed
+      }
+      return this.explainFilter(group, compiled, cfg)
+    }
+    const sourceOf = (key, matchedRule = null) => {
+      try {
+        if (matchedRule && typeof matchedRule.source === 'string') return matchedRule.source
+        const rawValue = rawCfg && rawCfg[key]
+        if (typeof rawValue === 'string') return rawValue
+        const compiledValue = cfg[key]
+        return compiledValue && typeof compiledValue.source === 'string' ? compiledValue.source : ''
+      } catch (e) { return '' }
+    }
+    const reason = (stage, kind, configKey, detail = {}) => {
+      const { matchedRule, ...rest } = detail
+      return { stage, kind, configKey, rule: sourceOf(configKey, matchedRule), ...rest }
+    }
+    const matchedRule = (compiled, value, catename) => {
+      if (!compiled || compiled._type !== 'multi') return null
+      let text
+      try { text = typeof value === 'string' ? value : String(value) } catch (e) { return null }
+      return RuleEngine._firstMatchingRule(compiled.rules, catename, rule => rule.val && rule.val.test(RuleEngine._normalizeReInput(text)))
+    }
+    const timeMatchedRule = (compiled, group) => {
+      if (!compiled || compiled._type !== 'timeMulti') return null
+      const ms = Utils.parseTime(Utils.safeGet(group, 'louzhuregtime'))
+      if (ms === null) return null
+      const days = Utils.daysFrom(ms)
+      return RuleEngine._firstMatchingRule(compiled.rules, Utils.safeGet(group, 'catename'), rule => days < rule.value)
+    }
+
+    const regTime = Utils.safeGet(group, 'louzhuregtime')
+    const timeRule = cfg.pingbitime
+    if (timeRule && regTime !== undefined && regTime !== null && regTime !== '' && RuleEngine.checkTimeCompiled(timeRule, group)) {
+      return blocked(reason('time', 'block', 'pingbitime', { matchedRule: timeMatchedRule(timeRule, group) }))
+    }
+
+    const category = Utils.safeGet(group, 'catename')
+    if (cfg.pingbifenlei && category !== undefined && category !== null && category !== '' &&
+      RuleEngine.matchesCompiled(cfg.pingbifenlei, category, category)) {
+      return blocked(reason('category', 'block', 'pingbifenlei', { matchedRule: matchedRule(cfg.pingbifenlei, category, category) }))
+    }
+
+    const stages = [
+      { key: 'louzhu', label: 'louzhu', getVal: (g) => Utils.safeGet(g, 'louzhu'), showKey: 'zhanxianlouzhu', blockKey: 'pingbilouzhu', plusKey: 'pingbilouzhuplus', blockedBy: [] },
+      { key: 'title', label: 'title', getVal: (g) => Utils.safeGet(g, 'title'), showKey: 'zhanxianbiaoti', blockKey: 'pingbibiaoti', plusKey: 'pingbibiaotiplus', blockedBy: ['louzhu'] },
+      { key: 'content', label: 'content', getVal: (g) => Utils.safeGet(g, 'content'), showKey: 'zhanxianneirong', blockKey: 'pingbineirong', plusKey: 'pingbineirongplus', blockedBy: ['louzhu', 'title'] }
+    ]
+    const showFlags = {}
+    const showMatched = {}
+    for (const stage of stages) {
+      const value = stage.getVal(group)
+      const rule = matchedRule(cfg[stage.showKey], value, category)
+      if (cfg[stage.showKey] && value !== undefined && value !== null && value !== '' &&
+        RuleEngine.matchesCompiled(cfg[stage.showKey], value, category)) {
+        showFlags[stage.key] = true
+        showMatched[stage.key] = true
+        passed.protections.push(reason(stage.label, 'show', stage.showKey, { matchedRule: rule }))
+      }
+    }
+
+    for (const stage of stages) {
+      const value = stage.getVal(group)
+      if (value === undefined || value === null || value === '') continue
+      const protectedBy = stage.blockedBy.find(key => showFlags[key])
+      if (protectedBy) {
+        for (const configKey of [stage.blockKey, stage.plusKey]) {
+          if (cfg[configKey]) passed.skipped.push(reason(stage.label, 'skipped', configKey, { because: `${protectedBy}.show` }))
+        }
+        continue
+      }
+      if (cfg[stage.blockKey] && !showFlags[stage.key] && RuleEngine.matchesCompiled(cfg[stage.blockKey], value, category)) {
+        return blocked(reason(stage.label, 'block', stage.blockKey, { matchedRule: matchedRule(cfg[stage.blockKey], value, category) }))
+      }
+      if (cfg[stage.plusKey] && RuleEngine.matchesCompiled(cfg[stage.plusKey], value, category)) {
+        if (showMatched[stage.key]) {
+          showFlags[stage.key] = false
+          passed.protections = passed.protections.filter(entry => entry.configKey !== stage.showKey)
+        }
+        return blocked(reason(stage.label, 'plus', stage.plusKey, { matchedRule: matchedRule(cfg[stage.plusKey], value, category) }))
+      }
+      if (showFlags[stage.key] && cfg[stage.blockKey]) {
+        passed.skipped.push(reason(stage.label, 'skipped', stage.blockKey, { because: `${stage.key}.show` }))
+      }
+    }
+    return passed
+  },
+
+  /**
      * 主过滤函数
      * 接受编译后的规则（推荐）或原始字符串配置（兼容旧调用）
      */
   listfilter (group, cfg) {
-    if (!group) return true
-    if (!cfg) return true
-
-    // 自动适配：如果传入的是原始字符串配置（非编译格式），走旧路径
-    if (!cfg.__compiled) {
-      return this._legacyListfilter(group, cfg)
-    }
-
-    if (!this.checkRegisterTime(group, cfg.pingbitime)) return false
-    if (!this.checkCategory(group, cfg.pingbifenlei)) return false
-    return this.checkFields(group, cfg)
+    if (!group || !cfg) return true
+    if (!cfg.__compiled) return this._legacyListfilter(group, cfg)
+    return this.explainFilter(group, cfg).passed
   },
 
   /** 兼容旧调用的备用路径（直接编译传入的原始字符串） */
@@ -3741,9 +3854,11 @@ const App = {
   // 常驻实例共用同一 cacheDir）——进程 A「追加→读尾→原子改写」的读改写间隙里，B 刚追加的行会被
   // A 的整文件覆盖冲掉（丢日志）。修复：用 run.log.lock（O_EXCL）把「追加 + 超限截尾」包成互斥
   // 临界区；拿不到锁（竞争/陈旧锁/异常）时 fail-open 只追加不截尾，日志绝不因锁而丢。
-  _writeRunLog (line) {
+  // 日志记录名仅接受文件基名，防未来调用传入 ../ 或绝对路径写出缓存目录。
+  _writeRunLog (line, filename = 'run.log') {
     try {
-      const logPath = path.join(MessageStore.cacheDir, 'run.log')
+      const safeFilename = typeof filename === 'string' && path.basename(filename) === filename ? filename : 'run.log'
+      const logPath = path.join(MessageStore.cacheDir, safeFilename)
       if (!this._isRegularOrMissing(logPath)) {
         console.error(`拒绝写入非普通运行日志文件 ${logPath}`)
         return
@@ -3820,6 +3935,17 @@ const App = {
         }
       }
     } catch (e) { /* 日志写失败静默（磁盘只读/权限等，不中断推送） */ }
+  },
+
+  _writeFilterDiagnostics (records) {
+    if (!Array.isArray(records) || records.length === 0) return
+    const cfg = Config.diagnostics && Config.diagnostics.filterLog
+    if (!this._enabledFlag(cfg)) return
+    const lines = []
+    for (const record of records) {
+      try { lines.push(JSON.stringify(record)) } catch (e) { /* 单条异常不阻断整轮 */ }
+    }
+    if (lines.length > 0) this._writeRunLog(lines.join('\n') + '\n', 'filter-diagnostics.ndjson')
   },
 
   _diskWarningAt: 0,
@@ -4696,6 +4822,26 @@ const App = {
       const batchNoIdUrls = new Set()
       const batchAnonKeys = new Set()
 
+      const filterDiagnostics = []
+      const filterReasonCounts = {}
+      const filterExplanations = new Map()
+      const filterLogCfg = Config.diagnostics && Config.diagnostics.filterLog
+      const includePassedDiagnostics = this._enabledFlag({ enabled: filterLogCfg && filterLogCfg.includePassed })
+      const maxDiagnosticDetails = (() => {
+        const value = Utils.num(filterLogCfg && filterLogCfg.maxDetailsPerRun, 100)
+        return Number.isInteger(value) && value > 0 ? Math.min(value, 1000) : 100
+      })()
+      const diagnosticItem = (item, decision, explanation) => ({
+        type: 'item',
+        at: this._localStamp(),
+        decision,
+        id: Utils.safeText(Utils.safeGet(item, 'id'), ''),
+        title: Utils.truncateUtf16(Utils.safeText(Utils.safeGet(item, 'title'), ''), 200),
+        category: Utils.truncateUtf16(Utils.safeText(Utils.safeGet(item, 'catename'), ''), 100),
+        reason: explanation.reason,
+        protections: explanation.protections,
+        skipped: explanation.skipped
+      })
       let badElementCount = 0 // v3.157：非对象元素单独统计（曾混入 filteredCount，诊断不清）
       let regTimePresent = 0 // v3.159：louzhuregtime 有值统计（pingbitime 有效性警告用）
       for (const item of xbkdata) {
@@ -4734,11 +4880,19 @@ const App = {
           if (identity.kind === 'url') batchNoIdUrls.add(identity.url)
         }
         if (identity.kind === 'anon') batchAnonKeys.add(identity.key)
-        if (FilterEngine.listfilter(item, compiledRules)) {
+        const explanation = FilterEngine.explainFilter(item, compiledRules, Config.filter)
+        filterExplanations.set(item, explanation)
+        if (explanation.passed) {
           items.push(item)
+          if ((explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) && filterDiagnostics.length < maxDiagnosticDetails) {
+            filterDiagnostics.push(diagnosticItem(item, 'passed', explanation))
+          }
         } else {
           filteredCount++
           Utils.safeSet(item, '_f', true) // v3.159：过滤写入标记（规则变更时失效）
+          const reasonKey = `${explanation.reason.stage}.${explanation.reason.kind}.${explanation.reason.configKey}`
+          filterReasonCounts[reasonKey] = (filterReasonCounts[reasonKey] || 0) + 1
+          if (filterDiagnostics.length < maxDiagnosticDetails) filterDiagnostics.push(diagnosticItem(item, 'filtered', explanation))
         }
         newMessages.push(item)
       }
@@ -4781,8 +4935,22 @@ const App = {
             // CodeRabbit：单次遍历评估 + 标记被拒项（曾 filter+includes 为 O(n²)），行为等价
             const kept = []
             for (const it of items) {
-              if (FilterEngine.whitelistFilter(it, 'title', kw)) kept.push(it)
-              else Utils.safeSet(it, '_f', true) // v3.159：只看它滤掉的同样标记（规则变更失效）
+              if (FilterEngine.whitelistFilter(it, 'title', kw)) {
+                kept.push(it)
+              } else {
+                Utils.safeSet(it, '_f', true) // v3.159：只看它滤掉的同样标记（规则变更失效）
+                const whitelistReason = { stage: 'title', kind: 'whitelist', configKey: 'zkt_gjc', rule: kw }
+                const reasonKey = `${whitelistReason.stage}.${whitelistReason.kind}.${whitelistReason.configKey}`
+                filterReasonCounts[reasonKey] = (filterReasonCounts[reasonKey] || 0) + 1
+                if (filterDiagnostics.length < maxDiagnosticDetails) {
+                  const explanation = filterExplanations.get(it) || { protections: [], skipped: [] }
+                  filterDiagnostics.push(diagnosticItem(it, 'filtered', {
+                    reason: whitelistReason,
+                    protections: explanation.protections,
+                    skipped: explanation.skipped
+                  }))
+                }
+              }
             }
             items = kept
           }
@@ -4790,6 +4958,20 @@ const App = {
         }
       }
       filteredCount += (beforeKwd - items.length)
+      this._writeFilterDiagnostics([
+        {
+          type: 'run',
+          at: this._localStamp(),
+          total: xbkdata.length,
+          dedup: dedupCount,
+          filtered: filteredCount,
+          passed: items.length,
+          // 不能从受 maxDetailsPerRun 截断的明细反算，否则汇总会少计。
+          byReason: filterReasonCounts,
+          detailCount: filterDiagnostics.length
+        },
+        ...filterDiagnostics
+      ])
       checkpoint('data-processed', `items=${items.length} dedup=${dedupCount} filtered=${filteredCount} bad=${badElementCount}`)
 
       // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/8 分钟运行；正常 ~20 条无影响）
@@ -5121,6 +5303,7 @@ if (require.main === module) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     listfilter: FilterEngine.listfilter.bind(FilterEngine),
+    explainFilter: FilterEngine.explainFilter.bind(FilterEngine),
     filterByKeyword: FilterEngine.filterByKeyword.bind(FilterEngine),
     validateConfig: RuleEngine.validateConfig.bind(RuleEngine),
     tuisong_replace: Formatter.tuisong_replace.bind(Formatter),

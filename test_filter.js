@@ -6,7 +6,7 @@
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================
 
-const { listfilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity, num } = require('./xbk_function_v3.js')
+const { listfilter, explainFilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity, num } = require('./xbk_function_v3.js')
 const assert = require('assert')
 const slim = require('./xbk_sendNotify_slim.js')
 const { extractTestSummary } = require('./run_mutation.js')
@@ -150,6 +150,57 @@ console.log('========================================\n');
 
   await test('所有配置都不匹配 → 保留', () => {
     assertEqual(listfilter(makeItem(), { pingbifenlei: '赚客吧' }), true)
+  })
+
+  await test('过滤解释：分类屏蔽给出配置项与命中规则', () => {
+    const result = explainFilter(makeItem({ catename: '赚客吧' }), compileRules({ pingbifenlei: '微博|赚客吧' }))
+    assertEqual(result.passed, false)
+    assertEqual(result.reason.configKey, 'pingbifenlei')
+    assertEqual(result.reason.kind, 'block')
+    assertEqual(result.reason.rule, '微博|赚客吧')
+  })
+
+  await test('过滤解释：楼主保护记录被跳过的标题屏蔽', () => {
+    const result = explainFilter(makeItem(), compileRules({ zhanxianlouzhu: '小明', pingbibiaoti: '京东' }))
+    assertEqual(result.passed, true)
+    assertEqual(result.protections[0].configKey, 'zhanxianlouzhu')
+    assertEqual(result.skipped[0].configKey, 'pingbibiaoti')
+    assertEqual(result.skipped[0].because, 'louzhu.show')
+  })
+
+  await test('过滤解释：同字段强化屏蔽抵消保护记录', () => {
+    const result = explainFilter(makeItem(), compileRules({ zhanxianlouzhu: '小明', pingbilouzhuplus: '小明' }))
+    assertEqual(result.passed, false)
+    assertEqual(result.reason.configKey, 'pingbilouzhuplus')
+    assertEqual(result.protections.length, 0)
+  })
+
+  await test('过滤解释：多行分类规则记录实际命中行', () => {
+    const result = explainFilter(makeItem({ catename: '数码', title: '耳机优惠' }), compileRules({ pingbibiaoti: '美妆###口红\n数码###耳机' }))
+    assertEqual(result.passed, false)
+    assertEqual(result.reason.rule, '数码###耳机')
+  })
+
+  await test('过滤解释：后续未生效的展现规则不混入屏蔽诊断', () => {
+    const result = explainFilter(makeItem({ louzhu: 'bad', title: 'vip' }), compileRules({ pingbilouzhu: 'bad', zhanxianbiaoti: 'vip' }))
+    assertEqual(result.passed, false)
+    assertEqual(result.reason.configKey, 'pingbilouzhu')
+    assertEqual(result.protections.length, 0)
+    assertEqual(result.skipped.length, 0)
+  })
+
+  await test('过滤解释：原始配置编译异常时告警并保守放行', () => {
+    const cfg = {}
+    Object.defineProperty(cfg, 'pingbifenlei', { get: () => { throw new Error('模拟配置读取异常') } })
+    const originalWarn = console.warn
+    const warnings = []
+    try {
+      console.warn = (...args) => warnings.push(args.join(' '))
+      assertEqual(explainFilter(makeItem(), cfg).passed, true)
+    } finally {
+      console.warn = originalWarn
+    }
+    assertEqual(warnings.some(message => message.includes('过滤规则编译失败')), true)
   })
 
   // ==================== 2. 分类屏蔽 ====================
