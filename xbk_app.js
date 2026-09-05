@@ -12,6 +12,7 @@ function createApp ({
     if (actualBytes.length !== expectedBytes.length) return false
     try { return typeof crypto?.timingSafeEqual === 'function' && crypto.timingSafeEqual(actualBytes, expectedBytes) } catch (e) { return false }
   }
+  const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
 
   const App = {
   // v3.176：运行日志时间戳本地化（与日报/告警本地口径一致）——曾 toISOString（UTC），
@@ -77,7 +78,6 @@ function createApp ({
         // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠 mtime 超龄抢占
           const LOCK_STALE_MS = 10000
           const lockDeadline = Date.now() + 3000
-          const waiter = new Int32Array(new SharedArrayBuffer(4))
           for (;;) {
             try {
               lockFd = fs.openSync(lockPath, 'wx')
@@ -95,7 +95,7 @@ function createApp ({
                 continue
               }
               if (Date.now() >= lockDeadline) break // 超时：fail-open，仅追加不截尾
-              try { Atomics.wait(waiter, 0, 0, 10) } catch (e2) { /* 非主线程/受限时退避失败，直接重试 */ }
+              try { Atomics.wait(lockWaiter, 0, 0, 10) } catch (e2) { /* 非主线程/受限时退避失败，直接重试 */ }
             }
           }
           // C043：ERROR 行 errMsg 截断到 512 字符（与日志行口径一致），防止超长异常 message 撑爆日志行
@@ -413,7 +413,6 @@ function createApp ({
       const lockPath = statePath + '.lock'
       const LOCK_STALE_MS = 10000
       const deadline = Date.now() + 3000
-      const waiter = new Int32Array(new SharedArrayBuffer(4))
       const lockToken = `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`
       for (;;) {
         try {
@@ -431,7 +430,7 @@ function createApp ({
             continue
           }
           if (Date.now() >= deadline) return null // 超时：放弃本次（避免阻塞事件循环）
-          try { Atomics.wait(waiter, 0, 0, 10) } catch (e2) { /* 受限环境退避失败直接重试 */ }
+          try { Atomics.wait(lockWaiter, 0, 0, 10) } catch (e2) { /* 受限环境退避失败直接重试 */ }
         }
       }
     },
@@ -1276,9 +1275,9 @@ function createApp ({
           // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
           // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
           const rawDesp = Formatter.tuisong_replace(contentTpl, pushItem)
-          let desp = Utils.truncateUtf16(Utils.sanitizeSurrogates(rawDesp), contentMax)
-          // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
           const rawClean = Utils.sanitizeSurrogates(rawDesp)
+          let desp = Utils.truncateUtf16(rawClean, contentMax)
+          // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
           const safePushUrl = Utils.safeUrl(pushItem.url)
           if (rawClean.includes('原文链接') && !desp.includes('原文链接') && safePushUrl) {
             const link = `原文链接：[${safePushUrl}](<${safePushUrl}>)`
