@@ -1414,7 +1414,7 @@ function createApp ({
         console.log(`  耗时:     ${elapsed}s`)
         if (process.env.XBK_PROFILE === '1' || detailedProfile) {
           const totalMs = Date.now() - runStart
-          console.log(`  [profile] 接口: ${fetchMs === null ? 'n/a' : (fetchMs / 1000).toFixed(3) + 's'} | 推送: ${(pushMs / 1000).toFixed(3) + 's'} | 总计: ${(totalMs / 1000).toFixed(3) + 's'}`)
+          console.log(`  [profile] 接口: ${typeof fetchMs === 'number' ? (fetchMs / 1000).toFixed(3) + 's' : 'n/a'} | 推送: ${(pushMs / 1000).toFixed(3) + 's'} | 总计: ${(totalMs / 1000).toFixed(3) + 's'}`)
           if (detailedProfile) {
             const warmupText = dnsWarmup ? `${dnsWarmup.ok ? '成功' : '失败'} ${(dnsWarmup.elapsedMs / 1000).toFixed(3)}s${dnsWarmup.family ? ` IPv${dnsWarmup.family}` : ''}` : 'n/a'
             const tlsText = tlsWarmup ? `${tlsWarmup.okCount}/${tlsWarmup.count} 成功 ${(tlsWarmup.elapsedMs / 1000).toFixed(3)}s` : 'n/a'
