@@ -13,7 +13,7 @@ const TRACKING_QUERY_NAMES = new Set(['fbclid', 'gclid', 'dclid', 'msclkid', 'yc
 
 // ---------- 魔法数字常量 ----------
 const DAY_MS = 24 * 60 * 60 * 1000 // 一天的毫秒数
-const TS_BOUND = 100_000_000_000 // 秒/毫秒时间戳分界（10位秒 / 12+位毫秒）
+const TS_BOUND = 100000000000 // 秒/毫秒时间戳分界（10位秒 / 12+位毫秒）
 const MAX_CODE_POINT = 0x10FFFF // Unicode 最大码点
 const SURROGATE_LO = 0xD800 // 代理区起点
 const SURROGATE_HI = 0xDFFF // 代理区终点
