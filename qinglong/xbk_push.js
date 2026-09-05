@@ -218,9 +218,9 @@ const { readStatus, formatStatus } = require('../scripts/status')
 
 function statusCacheDir () {
   // --status 不加载主应用，避免缺少 got/re2 时诊断命令反而不可用。
-  // cache.dir 是主配置项；CLI 入口无法安全加载本地配置，因此支持 XBK_CACHE_DIR 覆盖。
+  // 仅允许绝对路径覆盖，避免环境变量把状态读取重定向到项目目录外的任意相对位置。
   const configured = process.env.XBK_CACHE_DIR
-  return configured && path.isAbsolute(configured) ? configured : path.join(ROOT, configured || 'xianbaoku_cache')
+  return configured && path.isAbsolute(configured) ? configured : path.join(ROOT, 'xianbaoku_cache')
 }
 
 function runStatus () {

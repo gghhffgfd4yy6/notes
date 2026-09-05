@@ -36,7 +36,7 @@ node qinglong/xbk_push.js --check
 node qinglong/xbk_push.js --status
 ```
 
-默认读取 `xianbaoku_cache/`。如果部署时使用了自定义缓存目录，可通过绝对路径指定：
+默认读取 `xianbaoku_cache/`。如果部署时使用了自定义缓存目录，可通过**绝对路径**指定：
 
 ```bash
 XBK_CACHE_DIR=/path/to/cache node qinglong/xbk_push.js --status

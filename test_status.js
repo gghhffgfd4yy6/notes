@@ -17,7 +17,7 @@ try {
   write('report.state', JSON.stringify({ date: '2026-09-05', runs: 4, total: 20, dedup: 5, filtered: 7, pushed: 6, failed: 1, truncated: 2 }))
   write('channel-health.state', JSON.stringify({ pushplus: { consecutiveFailures: 2, lastFailureAt: 1000, lastAlertAt: 0 }, bark: { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0 } }))
   write('filter-diagnostics.ndjson', [
-    JSON.stringify({ type: 'run', date: '2026-09-05', total: 8, byReason: { title: 2, category: 1 }, detailCount: 3 }),
+    JSON.stringify({ type: 'run', at: '2026-09-05 10:00:00', total: 8, dedup: 2, filtered: 3, passed: 2, byReason: { title: 2, category: 1 }, detailCount: 3 }),
     JSON.stringify({ type: 'item', id: 'x' })
   ].join('\n') + '\n')
 
@@ -40,6 +40,14 @@ try {
   assert.strictEqual(degraded.report.status, 'invalid')
   assert.strictEqual(degraded.channels.status, 'missing')
   assert.match(formatStatus(degraded), /不可读|缺失/)
+
+  write('report.state', '{}')
+  write('channel-health.state', JSON.stringify({ pushplus: { consecutiveFailures: 'two' } }))
+  write('filter-diagnostics.ndjson', JSON.stringify({ type: 'run' }) + '\n')
+  const malformed = readStatus(dir)
+  assert.strictEqual(malformed.report.status, 'invalid', '缺字段 report.state 不应显示正常')
+  assert.strictEqual(malformed.channels.status, 'invalid', '通道失败次数必须是非负整数')
+  assert.strictEqual(malformed.diagnostics.status, 'invalid', '过滤汇总必须带计数对象')
 
   fs.unlinkSync(path.join(dir, 'run.log'))
   fs.symlinkSync('/etc/passwd', path.join(dir, 'run.log'))
