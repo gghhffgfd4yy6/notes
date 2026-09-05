@@ -7,6 +7,7 @@
 // ============================================================
 
 const { listfilter, explainFilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity, num } = require('./xbk_function_v3.js')
+const { createUtils } = require('./xbk_utils.js')
 const assert = require('assert')
 const slim = require('./xbk_sendNotify_slim.js')
 const { extractTestSummary } = require('./run_mutation.js')
@@ -3186,6 +3187,17 @@ console.log('========================================\n');
   // decodeHtmlEntities 未知实体 fallback
   await test('decodeHtmlEntities 未知实体 → 原样保留', () => {
     assertEqual(decodeHtmlEntities('&foo;&bar;'), '&foo;&bar;')
+  })
+
+  await test('createUtils 使用注入 safeRe 初始化实体正则', () => {
+    const calls = []
+    const safeRe = (source, flags) => {
+      calls.push({ source, flags })
+      return new RegExp(source, flags)
+    }
+    const utils = createUtils({ safeRe })
+    assertEqual(utils.decodeHtmlEntities('&amp;'), '&')
+    assertEqual(calls.some(call => call.flags === 'g' && call.source.includes('amp')), true)
   })
 
   // compileRules 多行中部分行正则无效 → 跳过无效行保留有效行
