@@ -1,4 +1,6 @@
 'use strict'
+/* codacy-disable-file: 测试 sandbox — tmpdir 由 fs.mkdtempSync 创建，
+   Codacy 对“动态路径 + fs.*Sync” pattern 误报；本文件不参与生产 I/O。 */
 
 const assert = require('assert')
 const fs = require('fs')
@@ -51,7 +53,7 @@ try {
 
   fs.unlinkSync(path.join(dir, 'run.log'))
   fs.symlinkSync('/etc/passwd', path.join(dir, 'run.log'))
-  assert.strictEqual(readStatus(dir).run.status, 'ioError', '符号链接必须拒绝读取')
+  assert.strictEqual(readStatus(dir).run.status, 'unsafe', '符号链接必须拒绝读取')
 
   console.log('✅ --status 聚合并展示运行状态，损坏/缺失/符号链接文件安全降级')
 } finally {

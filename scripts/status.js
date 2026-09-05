@@ -1,7 +1,7 @@
 'use strict'
 
-const fs = require('node:fs')
 const path = require('node:path')
+const { readSafeTextResult } = require('../xbk_storage')
 
 const FILES = {
   run: 'run.log',
@@ -15,23 +15,8 @@ function result (status, value) {
 }
 
 function readText (dir, name, maxBytes = 1024 * 1024) {
-  const file = path.join(dir, name)
-  let fd = -1
-  try {
-    // 打开后再 fstat，避免 lstat/readFile 两步之间被替换成符号链接或设备文件。
-    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
-    fd = fs.openSync(file, flags)
-    const st = fs.fstatSync(fd)
-    if (!st.isFile()) return result('unsafe')
-    if (st.size > maxBytes) return result('tooLarge')
-    return result('ok', fs.readFileSync(fd, 'utf8'))
-  } catch (error) {
-    return result(error && error.code === 'ENOENT' ? 'missing' : 'ioError')
-  } finally {
-    if (fd >= 0) {
-      try { fs.closeSync(fd) } catch (error) { /* 只读诊断，关闭失败不影响调用方 */ }
-    }
-  }
+  const safe = readSafeTextResult(path.join(dir, name), maxBytes)
+  return safe.status === 'ok' ? result('ok', safe.text) : result(safe.status)
 }
 
 function validCounter (value) {
