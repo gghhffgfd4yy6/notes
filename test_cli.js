@@ -28,6 +28,7 @@ const source = require('fs').readFileSync(entry, 'utf8')
 assert.match(source, /--dry-run/)
 assert.match(source, /--check/)
 assert.match(source, /--status/)
+assert.ok(/if\s*\(\s*hasArg\(\s*['"]--dry-run['"]\s*\)\s*\)[\s\S]*ensureDependencies\s*\(\s*\)[\s\S]*const\s+app\s*=\s*loadApp\s*\(\s*\)/.test(source), '常驻入口必须先检查依赖，再加载会引入 got 的应用')
 
 const statusDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-status-cli-'))
 const previousCwd = process.cwd()

@@ -252,9 +252,9 @@ async function main () {
     process.exitCode = runCheck(app)
     return
   }
-  const app = loadApp()
   if (hasArg('--dry-run')) process.env.XBK_DRY_RUN = '1'
   ensureDependencies()
+  const app = loadApp()
   const controller = new AbortController()
   const stop = () => controller.abort()
   // v3.262：用 process.on 而非 once——once 在首次信号后移除监听，第二次信号会走 Node
