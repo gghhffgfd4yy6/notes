@@ -257,10 +257,6 @@ const RuleEngine = createRuleEngine({ Utils, FILTER_FIELDS, compileUserRegex, is
 const { createFilterEngine } = require('./xbk_filter')
 const FilterEngine = createFilterEngine({ Utils, RuleEngine, FILTER_FIELDS, compileUserRegex })
 
-// Compatibility reachability markers for helpers moved behind the injected module seams.
-// _parseLine _compileCatRe _validateCatRe _catMatches _anyRule _passIfMissing _findDedupIndex _upsert _finalizeMd _decodeNumeric isValidItem daysFrom
-// _parseLine _compileCatRe _validateCatRe _catMatches _anyRule _passIfMissing _findDedupIndex _upsert _finalizeMd _decodeNumeric isValidItem daysFrom
-
 // ============================================================
 // 💾 MessageStore — 缓存管理层
 // ============================================================
