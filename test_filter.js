@@ -5880,7 +5880,12 @@ console.log('========================================\n');
   })
 
   await test('可达性: _splitLines/_parseLine 等内部方法被使用', () => {
-    const src = require('fs').readFileSync(path.join(__dirname, '/xbk_function_v3.js'), 'utf8')
+    // v3.272：模块化拆分后，内部 helper 分布在各 xbk_*.js 模块中；
+    // 可达性检测需扫描全部模块源文件，而非仅主入口。
+    const src = require('fs').readdirSync(__dirname)
+      .filter((f) => /^xbk_.*\.js$/.test(f))
+      .map((f) => require('fs').readFileSync(path.join(__dirname, f), 'utf8'))
+      .join('\n')
     // 内部 helper 都应被调用(出现次数 > 定义处)
     for (const h of ['_parseLine', '_compileCatRe', '_validateCatRe', '_catMatches', '_anyRule', '_passIfMissing', '_findDedupIndex', '_upsert', '_finalizeMd', '_decodeNumeric', 'isValidItem', 'daysFrom']) {
       const cnt = (src.match(new RegExp(h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length
