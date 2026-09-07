@@ -9,7 +9,7 @@ const os = require('node:os')
 const path = require('node:path')
 const {
   render, validateSegments, shanghaiDate, escCell, countMutant,
-  collectStats, findReportJson, analyzeSegment, analyze
+  collectStats, findReportJson, analyzeSegment, analyze, postIssue
 } = require('./scripts/mutation-report.js')
 
 // Fixture：3 段（正常 + 错误 + 全被杀）→ 覆盖全部 6 条核心分支
@@ -268,4 +268,149 @@ try {
   fs.rmSync(tmp, { recursive: true, force: true })
 }
 
-console.log(`\n🎉 test_mutation_report.js 全部通过（${pass} 项）`)
+// 回归测试：大数量截断分支——Top10 文件 / Top15 变异类型 / 30+ 存活变异体
+// 构造 31 个存活变异体，每个 file 和 mutator 都不同，一次覆盖三个截断边界。
+check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活变异体', () => {
+  const mutants = []
+  for (let i = 1; i <= 31; i++) {
+    const idx = String(i).padStart(2, '0')
+    mutants.push({
+      file: `src/file${idx}.js`,
+      line: i,
+      mutator: `Mutator${idx}`,
+      replacement: `repl${idx}`
+    })
+  }
+  const bigFixture = [{
+    seg: 'big-seg',
+    total: 100,
+    killed: 69,
+    survived: 31,
+    noCoverage: 0,
+    timeout: 0,
+    score: 69,
+    survivedMutants: mutants
+  }]
+  const out = render(bigFixture)
+  const lines = out.split('\n')
+  // Top10 文件表格：定位"存活最多的文件 Top 10"段，数数据行（排除表头/分隔/空行）
+  const fileStart = lines.findIndex(l => l.includes('存活最多的文件 Top 10'))
+  const fileRows = []
+  for (let i = fileStart + 1; i < lines.length; i++) {
+    if (lines[i].startsWith('## ')) break
+    if (lines[i].startsWith('| `')) fileRows.push(lines[i])
+  }
+  assert.strictEqual(fileRows.length, 10, `Top10 文件表格应只有10行，实际${fileRows.length}行`)
+  assert.ok(fileRows[0].includes('src/file01.js'), '第1行应是file01')
+  assert.ok(fileRows[9].includes('src/file10.js'), '第10行应是file10')
+  // Top15 变异类型表格：定位"存活变异类型分布 Top 15"段，数数据行
+  const kindStart = lines.findIndex(l => l.includes('存活变异类型分布 Top 15'))
+  const kindRows = []
+  for (let i = kindStart + 1; i < lines.length; i++) {
+    if (lines[i].startsWith('## ')) break
+    if (lines[i].startsWith('| Mutator')) kindRows.push(lines[i])
+  }
+  assert.strictEqual(kindRows.length, 15, `Top15 变异类型表格应只有15行，实际${kindRows.length}行`)
+  assert.ok(kindRows[0].includes('Mutator01'), '第1行应是Mutator01')
+  assert.ok(kindRows[14].includes('Mutator15'), '第15行应是Mutator15')
+  // 30+ 存活变异体：显示前 30 个 + "还有 1 个"
+  assert.ok(out.includes('存活变异体（31 个）'), '应显示总存活数 31')
+  assert.ok(out.includes('src/file01.js:1'), '应包含第1个存活变异体')
+  assert.ok(out.includes('src/file30.js:30'), '应包含第30个存活变异体')
+  assert.ok(!out.includes('src/file31.js:31'), '不应包含第31个存活变异体（>30截断）')
+  assert.ok(out.includes('还有 1 个'), '应显示"还有 1 个"截断提示')
+})
+
+// === postIssue 单元测试（mock global.fetch，async IIFE 按顺序执行）===
+;(async function runPostIssueTests () {
+  const ORIG_TOKEN = process.env.GITHUB_TOKEN
+  const ORIG_REPO = process.env.GITHUB_REPOSITORY
+  const ORIG_FETCH = global.fetch
+  let asyncPass = 0
+
+  function mockFetch (responses) {
+    let callIdx = 0
+    global.fetch = async function (url, opts) {
+      const r = responses[callIdx++]
+      if (!r) throw new Error(`unexpected fetch call #${callIdx}: ${url}`)
+      r.capturedUrl = url
+      r.capturedOpts = opts
+      return r
+    }
+  }
+
+  function makeRes (ok, status, body) {
+    return {
+      ok,
+      status,
+      json: async () => body,
+      text: async () => JSON.stringify(body)
+    }
+  }
+
+  async function acheck (name, fn) {
+    try { await fn(); asyncPass++; pass++ } catch (e) { console.error(`❌ ${name}\n   ${e.message}`); process.exitCode = 1 }
+  }
+
+  await acheck('postIssue 缺少 GITHUB_TOKEN 时抛错', async () => {
+    delete process.env.GITHUB_TOKEN
+    await assert.rejects(() => postIssue('body'), /缺少 GITHUB_TOKEN/)
+  })
+
+  await acheck('postIssue 当天日报已存在时跳过发布', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const today = shanghaiDate()
+    const existingIssue = { number: 42, html_url: 'https://github.com/owner/repo/issues/42', title: `🧬 变异测试日报 ${today}` }
+    const listRes = makeRes(true, 200, [existingIssue])
+    mockFetch([listRes])
+    const result = await postIssue('test body')
+    assert.strictEqual(result.skipped, true)
+    assert.strictEqual(result.number, 42)
+    assert.strictEqual(result.html_url, existingIssue.html_url)
+    assert.ok(listRes.capturedUrl.includes('/issues?state=all'), '应调用列表查询 API')
+  })
+
+  await acheck('postIssue 当天无日报时创建新 Issue', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(true, 200, [])
+    const createdIssue = { number: 99, html_url: 'https://github.com/owner/repo/issues/99' }
+    const createRes = makeRes(true, 201, createdIssue)
+    mockFetch([listRes, createRes])
+    const result = await postIssue('test body content')
+    assert.strictEqual(result.number, 99)
+    assert.strictEqual(result.html_url, createdIssue.html_url)
+    assert.strictEqual(result.skipped, undefined)
+    const postBody = JSON.parse(createRes.capturedOpts.body)
+    assert.ok(postBody.title.includes('变异测试日报'), 'title 应包含日报前缀')
+    assert.strictEqual(postBody.body, 'test body content')
+  })
+
+  await acheck('postIssue 列表查询失败时跳过去重直接创建', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(false, 500, { message: 'server error' })
+    const createdIssue = { number: 100, html_url: 'https://github.com/owner/repo/issues/100' }
+    const createRes = makeRes(true, 201, createdIssue)
+    mockFetch([listRes, createRes])
+    const result = await postIssue('body')
+    assert.strictEqual(result.number, 100, '列表失败时应直接创建')
+  })
+
+  await acheck('postIssue 创建 Issue 失败时抛错', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(true, 200, [])
+    const createRes = makeRes(false, 403, { message: 'Forbidden' })
+    mockFetch([listRes, createRes])
+    await assert.rejects(() => postIssue('body'), /发 Issue 失败，HTTP 状态码：403/)
+  })
+
+  // 恢复原始环境变量和 fetch
+  process.env.GITHUB_TOKEN = ORIG_TOKEN
+  if (ORIG_REPO) process.env.GITHUB_REPOSITORY = ORIG_REPO; else delete process.env.GITHUB_REPOSITORY
+  global.fetch = ORIG_FETCH
+
+  console.log(`\n🎉 test_mutation_report.js 全部通过（${pass} 项，含异步 ${asyncPass} 项）`)
+})()
