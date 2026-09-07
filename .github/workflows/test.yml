@@ -129,6 +129,8 @@ jobs:
             echo "✅ 并行集成测试通过，跳过串行完整版"
           elif [ "$SERIAL" = "success" ]; then
             echo "⚠️ 并行失败，串行兜底通过（并行可能为 flaky，建议关注）"
+            # 兜底通过不阻断本次 CI，但必须以注解显形，避免 flaky 长期藏在日志里
+            echo "::warning title=集成测试走了串行兜底::并行调度失败但串行完整版通过，本次不判定失败；若反复出现请排查并行调度 flaky。"
           else
             echo "❌ 集成测试失败：并行${PARALLEL}，串行${SERIAL}"
             exit 1
