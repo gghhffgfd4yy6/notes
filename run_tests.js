@@ -11,6 +11,8 @@ const { checkDependencies } = require('./scripts/check-deps')
 const SUITES = [
   { name: '依赖预检', file: 'test_check_deps.js', desc: 'checkDependencies 缺失/损坏分支' },
   { name: '常驻循环', file: 'test_loop.js', desc: '长驻调度、单轮异常隔离、停止信号' },
+  { name: '循环工具函数', file: 'test_loop_utils.js', desc: 'sleep 信号/超时边界 + runLoop TypeError/错误隔离' },
+  { name: '安全文件存储', file: 'test_storage.js', desc: '原子写入/独占创建/安全读取/符号链接拦截' },
   { name: '常驻失败策略', file: 'test_failure_policy.js', desc: '网络/永久错误分类、持续退避重试、摘要失败和恢复' },
   { name: 'DNS失效回归', file: 'test_dns_cache.js', desc: '连接错误后清除主机 DNS 缓存并重新解析' },
   { name: 'TLS预热回归', file: 'test_tls_prewarm.js', desc: 'TLS 预热 aggregate ok 与连接成功数保持一致' },
@@ -20,6 +22,7 @@ const SUITES = [
   { name: 'HTTP封装', file: 'test_http.js', desc: 'fetchJson 响应体限流/HTTP 错误/JSON 解析' },
   { name: '推送工具函数', file: 'test_sendnotify_utils.js', desc: 'mdToPlain/脱敏/安全截断/通道统计' },
   { name: '青龙命令行', file: 'test_cli.js', desc: '--check/--dry-run/--status 参数和诊断逻辑' },
+  { name: '青龙工具函数', file: 'test_qinglong_utils.js', desc: '退避/刷新计数/间隔/依赖恢复边界/缓存目录' },
   { name: '状态面板', file: 'test_status.js', desc: '--status 只读聚合运行状态' },
   { name: '单元测试', file: 'test_filter.js', desc: '主代码导出函数逐函数逻辑' },
   { name: '变异报告读取', file: 'test_mutation_json.js', desc: '超大 mutation.json 剥离 statusReason 解析（v3.264）' },
