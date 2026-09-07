@@ -91,5 +91,43 @@ const { runLoop, sleep } = require('./xbk_loop')
   c7.abort()
   await runLoop(async () => {}, { signal: c7.signal }) // 用默认 intervalMs/refreshEvery/onError
 
+  // ===== runLoop：onInterval 超时触发 runBounded INTERVAL_REFRESH_TIMEOUT =====
+  const c8 = new AbortController()
+  let runs8 = 0
+  let timeoutErrors = 0
+  await runLoop(async () => {
+    runs8 += 1
+    if (runs8 === 2) c8.abort()
+  }, {
+    intervalMs: 0,
+    refreshEvery: 1,
+    signal: c8.signal,
+    onIntervalTimeoutMs: 10, // 极短超时
+    onInterval: async () => { await sleep(100) }, // 长时间运行，必然超时
+    onIntervalError: async (e) => {
+      if (e && e.code === 'INTERVAL_REFRESH_TIMEOUT') timeoutErrors += 1
+    }
+  })
+  assert.ok(timeoutErrors >= 1, `onInterval 超时应触发 INTERVAL_REFRESH_TIMEOUT，实际 ${timeoutErrors} 次`)
+
+  // ===== runLoop：onInterval 运行期间 abort 触发 runBounded ABORT_ERR =====
+  const c9 = new AbortController()
+  let runs9 = 0
+  let abortErrors = 0
+  await runLoop(async () => {
+    runs9 += 1
+    if (runs9 === 1) setTimeout(() => c9.abort(), 20) // 第一轮 onInterval 运行期间 abort
+  }, {
+    intervalMs: 0,
+    refreshEvery: 1,
+    signal: c9.signal,
+    onIntervalTimeoutMs: 10000, // 很长的超时，避免超时干扰
+    onInterval: async () => { await sleep(100) }, // 长时间运行，等待 abort
+    onIntervalError: async (e) => {
+      if (e && e.code === 'ABORT_ERR') abortErrors += 1
+    }
+  })
+  assert.ok(abortErrors >= 1, `onInterval 运行期间 abort 应触发 ABORT_ERR，实际 ${abortErrors} 次`)
+
   console.log('test_loop_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })

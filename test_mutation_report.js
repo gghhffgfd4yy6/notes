@@ -7,7 +7,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { render, validateSegments, shanghaiDate, escCell, countMutant, collectStats, findReportJson, analyzeSegment } = require('./scripts/mutation-report.js')
+const { render, validateSegments, shanghaiDate, escCell, countMutant, collectStats, findReportJson, analyzeSegment, analyze } = require('./scripts/mutation-report.js')
 
 // Fixture：3 段（正常 + 错误 + 全被杀）→ 覆盖全部 6 条核心分支
 //   1) 段汇总表（正常行）
@@ -237,6 +237,29 @@ try {
     assert.strictEqual(r.score, 50)
     const missing = analyzeSegment(tmp, { name: 'mutation-report-nonexist' })
     assert.strictEqual(missing.error, '缺 mutation-report.json')
+  })
+
+  check('analyze 遍历 mutation-report-* 子目录并跳过普通目录', () => {
+    const results = analyze(tmp)
+    assert.ok(Array.isArray(results), '应返回数组')
+    assert.ok(results.length > 0, 'tmp 下有多个 mutation-report-* 子目录')
+    // 所有 seg 已去除 mutation-report- 前缀
+    assert.ok(results.every(r => !r.seg.startsWith('mutation-report-')), 'seg 应去除前缀')
+    // 包含已知段
+    const segs = results.map(r => r.seg)
+    assert.ok(segs.includes('utils'), '应包含 utils 段')
+    // 普通目录（如 reports/）不应被包含
+    assert.ok(!segs.some(s => s === 'reports' || s.includes('reports')), '应跳过非 mutation-report-* 目录')
+  })
+
+  check('analyze 空目录返回空数组', () => {
+    const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mr-empty-'))
+    try {
+      const results = analyze(emptyDir)
+      assert.deepStrictEqual(results, [], '空目录应返回空数组')
+    } finally {
+      fs.rmSync(emptyDir, { recursive: true, force: true })
+    }
   })
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true })
