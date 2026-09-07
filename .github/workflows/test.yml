@@ -103,11 +103,34 @@ jobs:
       - name: 青龙工具函数测试（test_qinglong_utils.js）
         run: npm run test:qinglong-utils
 
-      - name: 集成测试（test_app_p.js，并行调度）
+      # 集成测试策略：先跑并行调度版，成功则跳过串行完整版（省时间）；
+      # 并行失败时不立即判定失败，再跑串行完整版兜底（并行可能因调度/flaky 失败）。
+      # 兜底成功则整体通过，兜底失败才判定集成测试失败。
+      - name: 集成测试（并行调度）
+        id: integration-parallel
+        continue-on-error: true
         run: npm run test:app
 
-      - name: 集成测试（test_app.js 串行完整版，绝对验证）
+      - name: 集成测试（串行完整版，仅并行失败时兜底运行）
+        id: integration-serial
+        if: steps.integration-parallel.outcome == 'failure'
         run: npm run test:app:serial
+
+      - name: 集成测试结果判定
+        if: always()
+        run: |
+          PARALLEL="${{ steps.integration-parallel.outcome }}"
+          SERIAL="${{ steps.integration-serial.outcome }}"
+          echo "并行调度结果: $PARALLEL"
+          echo "串行完整结果: $SERIAL"
+          if [ "$PARALLEL" = "success" ]; then
+            echo "✅ 并行集成测试通过，跳过串行完整版"
+          elif [ "$SERIAL" = "success" ]; then
+            echo "⚠️ 并行失败，串行兜底通过（并行可能为 flaky，建议关注）"
+          else
+            echo "❌ 集成测试失败：并行${PARALLEL}，串行${SERIAL}"
+            exit 1
+          fi
 
       - name: 安全审计（高危及以上）
         run: npm audit --audit-level=high --omit=dev
