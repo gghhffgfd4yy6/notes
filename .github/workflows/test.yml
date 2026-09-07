@@ -59,6 +59,9 @@ jobs:
       - name: 变异报告渲染回归（v3.266 render 快照，防重构漂移）
         run: npm run test:mutation-report
 
+      - name: 变异矩阵覆盖校验
+        run: npm run test:mutation-ranges
+
       - name: 通道测试（test_notify.js）
         run: npm run test:notify
 
