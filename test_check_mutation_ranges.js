@@ -59,7 +59,7 @@ function run (ymlText) {
   assert.strictEqual(over.status, 1, '行段超过实际行数应 exit 1')
 
   // ===== 引用不存在的文件 → exit 1 =====
-  const notExist = buildYml() + `          - name: ghost\n            mutate: "nonexistent.js:1-10"\n`
+  const notExist = buildYml() + '          - name: ghost\n            mutate: "nonexistent.js:1-10"\n'
   const ne = run(notExist)
   assert.strictEqual(ne.status, 1, '引用不存在的文件应 exit 1')
 

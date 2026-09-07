@@ -194,8 +194,8 @@ check('collectStats 按文件/类型汇总存活变异体', () => {
   assert.strictEqual(stats.allSurvived.length, 3)
   assert.strictEqual(stats.byFile['x.js'], 2)
   assert.strictEqual(stats.byFile['y.js'], 1)
-  assert.strictEqual(stats.byKind['Bin'], 2)
-  assert.strictEqual(stats.byKind['Bool'], 1)
+  assert.strictEqual(stats.byKind.Bin, 2)
+  assert.strictEqual(stats.byKind.Bool, 1)
 })
 
 // ===== findReportJson / analyzeSegment：临时目录 =====
@@ -219,10 +219,16 @@ try {
   check('analyzeSegment 正确解析统计 / 缺报告返回 error', () => {
     const d = path.join(tmp, 'mutation-report-utils'); fs.mkdirSync(d, { recursive: true })
     fs.writeFileSync(path.join(d, 'mutation.json'), JSON.stringify({
-      files: { 'u.js': { mutants: [
-        { status: 'Killed' }, { status: 'Survived', mutatorName: 'B', replacement: 'y', location: { start: { line: 5 } } },
-        { status: 'NoCoverage' }, { status: 'Timeout' }
-      ] } }
+      files: {
+        'u.js': {
+          mutants: [
+            { status: 'Killed' },
+            { status: 'Survived', mutatorName: 'B', replacement: 'y', location: { start: { line: 5 } } },
+            { status: 'NoCoverage' },
+            { status: 'Timeout' }
+          ]
+        }
+      }
     }))
     const r = analyzeSegment(tmp, { name: 'mutation-report-utils' })
     assert.strictEqual(r.seg, 'utils'); assert.strictEqual(r.total, 4)
