@@ -22,9 +22,15 @@
 # test_run_mutation_internal.js 是 run_mutation 内部函数的单元测试：
 # 大量 path.join(mkdtempSync, 硬编码文件名) 用于在临时目录下构造测试文件，
 # 目录和文件名均为测试硬编码常量，无用户输入，静态路径注入告警属误报。
+#
+# test_status_report.js 是 scripts/status.js 的单元测试：
+# path.join(os.tmpdir(), 硬编码前缀) + fs.mkdtempSync/writeFileSync/rmSync 用于
+# 构造临时测试目录和 run.log，目录前缀和文件名均为测试硬编码常量，无用户输入，
+# 静态路径注入告警属误报。
 exclude_paths:
   - "scripts/check-mutation-ranges.js"
   - "test_storage.js"
   - "test_check_mutation_ranges.js"
   - "test_mutation_report.js"
   - "test_run_mutation_internal.js"
+  - "test_status_report.js"

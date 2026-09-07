@@ -89,5 +89,49 @@ function makeNetwork (opts = {}) {
     assert.ok(/fail/.test(rejected.message), '应抛最后一次的 lastErr')
   }
 
+  // 8. PROFILE3 + prewarmDns reject → 走 .catch 日志分支（行38-39），不影响主流程
+  {
+    const logs = []
+    const net = createNetwork({
+      Config: { api: { pushUrl: 'https://api.example.com/push', retry: 0, timeout: 5000 } },
+      Utils: {
+        num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
+        safeErrorText: (e, d) => (e && e.message) || d
+      },
+      fetchJson: async () => ({ ok: true }),
+      prewarmDns: async () => { throw new Error('dns-fail') },
+      getNotify: async () => 'notify',
+      crypto: { randomInt: () => 0 },
+      RETRYABLE_CODES,
+      PROFILE3: true,
+      logger: { log: (...args) => logs.push(args.join(' ')) }
+    })
+    const r = await net.fetchData()
+    assert.strictEqual(r.ok, true, 'prewarmDns 失败不应影响主流程')
+    assert.ok(logs.some(l => l.includes('dns-prewarm') && l.includes('ok=false')), 'PROFILE3 应输出 prewarm 失败日志')
+  }
+
+  // 9. PROFILE3 + 无效 pushUrl → new URL 抛错走 catch 日志分支（行43-44），不影响主流程
+  {
+    const logs = []
+    const net = createNetwork({
+      Config: { api: { pushUrl: 'not-a-valid-url', retry: 0, timeout: 5000 } },
+      Utils: {
+        num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
+        safeErrorText: (e, d) => (e && e.message) || d
+      },
+      fetchJson: async () => ({ ok: true }),
+      prewarmDns: async () => ({ ok: true }),
+      getNotify: async () => 'notify',
+      crypto: { randomInt: () => 0 },
+      RETRYABLE_CODES,
+      PROFILE3: true,
+      logger: { log: (...args) => logs.push(args.join(' ')) }
+    })
+    const r = await net.fetchData()
+    assert.strictEqual(r.ok, true, 'URL 解析失败不应影响主流程')
+    assert.ok(logs.some(l => l.includes('dns-prewarm') && l.includes('skipped')), 'PROFILE3 应输出 skipped 日志')
+  }
+
   console.log('test_network OK')
 })().catch((e) => { console.error(e); process.exit(1) })
