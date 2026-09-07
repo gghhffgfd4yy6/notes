@@ -4,7 +4,10 @@
 // 目标：拆 render 之前先固化为 markdown 快照；拆分后行为必须字节级一致。
 // 同时覆盖日报日期的 Asia/Shanghai 跨 UTC 日期边界。
 const assert = require('node:assert')
-const { render, validateSegments, shanghaiDate } = require('./scripts/mutation-report.js')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { render, validateSegments, shanghaiDate, escCell, countMutant, collectStats, findReportJson, analyzeSegment } = require('./scripts/mutation-report.js')
 
 // Fixture：3 段（正常 + 错误 + 全被杀）→ 覆盖全部 6 条核心分支
 //   1) 段汇总表（正常行）
@@ -151,5 +154,92 @@ check('生产默认分段完整时允许生成日报', () => {
   ].map(seg => ({ seg }))
   assert.deepStrictEqual(validateSegments(results), results)
 })
+
+// ===== escCell：Markdown 表格单元格转义 =====
+check('escCell 转义竖线/反斜杠/换行/反引号', () => {
+  assert.strictEqual(escCell('hello'), 'hello')
+  assert.strictEqual(escCell('a|b'), 'a\\|b')
+  assert.strictEqual(escCell('a\\b'), 'a\\\\b')
+  assert.strictEqual(escCell('a\nb'), 'a b')
+  assert.strictEqual(escCell('a`b'), "a'b")
+  // 反斜杠先行，避免 \| 被二次转义
+  assert.strictEqual(escCell('a\\|b'), 'a\\\\\\|b')
+  assert.strictEqual(escCell(123), '123')
+})
+
+// ===== countMutant：变异体分类计数 =====
+check('countMutant 正确分类 Killed/Survived/NoCoverage/Timeout', () => {
+  const mk = () => ({ total: 0, killed: 0, survived: 0, noCoverage: 0, timeout: 0, survivedMutants: [] })
+  const s1 = mk(); countMutant(s1, 'f.js', { status: 'Killed' })
+  assert.strictEqual(s1.killed, 1); assert.strictEqual(s1.total, 1)
+  const s2 = mk(); countMutant(s2, 'f.js', { status: 'Survived', mutatorName: 'B', replacement: 'y', location: { start: { line: 10 } } })
+  assert.strictEqual(s2.survived, 1); assert.strictEqual(s2.survivedMutants.length, 1)
+  assert.deepStrictEqual(s2.survivedMutants[0], { file: 'f.js', line: 10, mutator: 'B', replacement: 'y' })
+  const s3 = mk(); countMutant(s3, 'f.js', { status: 'Survived', mutatorName: 'X', replacement: 'z' })
+  assert.strictEqual(s3.survivedMutants[0].line, '?', '无 location 时 line 应为 ?')
+  const s4 = mk(); countMutant(s4, 'f.js', { status: 'NoCoverage' }); assert.strictEqual(s4.noCoverage, 1)
+  const s5 = mk(); countMutant(s5, 'f.js', { status: 'Timeout' }); assert.strictEqual(s5.timeout, 1)
+  const s6 = mk(); countMutant(s6, 'f.js', { status: 'Unknown' })
+  assert.strictEqual(s6.total, 1); assert.strictEqual(s6.killed + s6.survived + s6.noCoverage + s6.timeout, 0)
+})
+
+// ===== collectStats：汇总存活变异体 =====
+check('collectStats 按文件/类型汇总存活变异体', () => {
+  const empty = collectStats([])
+  assert.strictEqual(empty.allSurvived.length, 0)
+  const stats = collectStats([
+    { seg: 'a', survivedMutants: [{ file: 'x.js', mutator: 'Bin', line: 1, replacement: 'r' }] },
+    { seg: 'b', survivedMutants: [{ file: 'x.js', mutator: 'Bin', line: 2, replacement: 's' }, { file: 'y.js', mutator: 'Bool', line: 3, replacement: 't' }] }
+  ])
+  assert.strictEqual(stats.allSurvived.length, 3)
+  assert.strictEqual(stats.byFile['x.js'], 2)
+  assert.strictEqual(stats.byFile['y.js'], 1)
+  assert.strictEqual(stats.byKind.Bin, 2)
+  assert.strictEqual(stats.byKind.Bool, 1)
+})
+
+// ===== findReportJson / analyzeSegment：临时目录 =====
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mr-'))
+try {
+  check('findReportJson 递归找到 mutation.json / 旧名 / 无报告返回 null', () => {
+    const d1 = path.join(tmp, 'mutation-report-a'); fs.mkdirSync(d1, { recursive: true })
+    fs.writeFileSync(path.join(d1, 'mutation.json'), '{}')
+    assert.strictEqual(findReportJson(d1), path.join(d1, 'mutation.json'))
+    const d2 = path.join(tmp, 'mutation-report-b', 'reports', 'mutation'); fs.mkdirSync(d2, { recursive: true })
+    fs.writeFileSync(path.join(d2, 'mutation.json'), '{}')
+    assert.strictEqual(findReportJson(path.join(tmp, 'mutation-report-b')), path.join(d2, 'mutation.json'))
+    const d3 = path.join(tmp, 'mutation-report-c'); fs.mkdirSync(d3, { recursive: true })
+    fs.writeFileSync(path.join(d3, 'mutation-report.json'), '{}')
+    assert.strictEqual(findReportJson(d3), path.join(d3, 'mutation-report.json'))
+    const d4 = path.join(tmp, 'mutation-report-d'); fs.mkdirSync(d4, { recursive: true })
+    assert.strictEqual(findReportJson(d4), null)
+    assert.strictEqual(findReportJson(path.join(tmp, 'not-exist')), null)
+  })
+
+  check('analyzeSegment 正确解析统计 / 缺报告返回 error', () => {
+    const d = path.join(tmp, 'mutation-report-utils'); fs.mkdirSync(d, { recursive: true })
+    fs.writeFileSync(path.join(d, 'mutation.json'), JSON.stringify({
+      files: {
+        'u.js': {
+          mutants: [
+            { status: 'Killed' },
+            { status: 'Survived', mutatorName: 'B', replacement: 'y', location: { start: { line: 5 } } },
+            { status: 'NoCoverage' },
+            { status: 'Timeout' }
+          ]
+        }
+      }
+    }))
+    const r = analyzeSegment(tmp, { name: 'mutation-report-utils' })
+    assert.strictEqual(r.seg, 'utils'); assert.strictEqual(r.total, 4)
+    assert.strictEqual(r.killed, 1); assert.strictEqual(r.survived, 1)
+    assert.strictEqual(r.noCoverage, 1); assert.strictEqual(r.timeout, 1)
+    assert.strictEqual(r.score, 50)
+    const missing = analyzeSegment(tmp, { name: 'mutation-report-nonexist' })
+    assert.strictEqual(missing.error, '缺 mutation-report.json')
+  })
+} finally {
+  fs.rmSync(tmp, { recursive: true, force: true })
+}
 
 console.log(`\n🎉 test_mutation_report.js 全部通过（${pass} 项）`)
