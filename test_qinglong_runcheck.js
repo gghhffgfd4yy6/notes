@@ -2,6 +2,8 @@
 
 // 青龙 --check 诊断入口：runCheck 函数的各种通过/失败场景
 const assert = require('assert')
+const os = require('node:os')
+const path = require('node:path')
 const { runCheck } = require('./qinglong/xbk_push')
 
 // 通过 require.cache mock xbk_sendNotify_slim（runCheck 内部动态 require）
@@ -23,7 +25,7 @@ function makeApp (overrides = {}) {
     Config: {
       filter: overrides.filter || {},
       keyword: { zkt_gjc: overrides.zkt_gjc || '' },
-      cache: { dir: overrides.cacheDir || '/tmp/xbk-test-cache' }
+      cache: { dir: overrides.cacheDir || path.join(os.tmpdir(), 'xbk-test-cache') }
     }
   }
 }
