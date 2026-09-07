@@ -102,8 +102,8 @@ const { runLoop, sleep } = require('./xbk_loop')
     intervalMs: 0,
     refreshEvery: 1,
     signal: c8.signal,
-    onIntervalTimeoutMs: 10, // 极短超时
-    onInterval: async () => { await sleep(100) }, // 长时间运行，必然超时
+    onIntervalTimeoutMs: 50, // 较短超时（CI 环境留余量，避免 CPU jitter 导致 flaky）
+    onInterval: async () => { await sleep(200) }, // 长时间运行，必然超时
     onIntervalError: async (e) => {
       if (e && e.code === 'INTERVAL_REFRESH_TIMEOUT') timeoutErrors += 1
     }
@@ -122,7 +122,7 @@ const { runLoop, sleep } = require('./xbk_loop')
     refreshEvery: 1,
     signal: c9.signal,
     onIntervalTimeoutMs: 10000, // 很长的超时，避免超时干扰
-    onInterval: async () => { await sleep(100) }, // 长时间运行，等待 abort
+    onInterval: async () => { await sleep(200) }, // 长时间运行，等待 abort
     onIntervalError: async (e) => {
       if (e && e.code === 'ABORT_ERR') abortErrors += 1
     }

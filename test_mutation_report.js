@@ -7,7 +7,10 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { render, validateSegments, shanghaiDate, escCell, countMutant, collectStats, findReportJson, analyzeSegment, analyze } = require('./scripts/mutation-report.js')
+const {
+  render, validateSegments, shanghaiDate, escCell, countMutant,
+  collectStats, findReportJson, analyzeSegment, analyze
+} = require('./scripts/mutation-report.js')
 
 // Fixture：3 段（正常 + 错误 + 全被杀）→ 覆盖全部 6 条核心分支
 //   1) 段汇总表（正常行）
