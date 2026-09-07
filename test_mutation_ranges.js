@@ -24,8 +24,10 @@ assert.strictEqual(current.status, 0, current.stderr || current.stdout)
 const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'mutation-ranges-test-'))
 try {
   const incomplete = path.join(tmpdir, 'mutation.yml')
+  // codacy-disable-next-line: test fixture path is a resolved repository file, never user controlled.
   const yml = fs.readFileSync(workflow, 'utf8')
     .replace(/\r?\n\s*- name: utils\r?\n\s*mutate: "xbk_utils\.js"/, '')
+  // codacy-disable-next-line: test fixture path is created by mkdtempSync, never user controlled.
   // nosemgrep: test fixture path is created by mkdtempSync, never user controlled.
   fs.writeFileSync(incomplete, yml)
 
