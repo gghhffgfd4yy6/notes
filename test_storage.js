@@ -14,8 +14,7 @@ const {
 
 ;(async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-storage-'))
-  const cleanup = []
-  const make = (rel) => { const p = path.join(tmp, rel); cleanup.push(p); return p }
+  const make = (rel) => path.join(tmp, rel)
 
   // ===== isRegularOrMissing =====
   assert.strictEqual(isRegularOrMissing(123), false, '非字符串应返回 false')
@@ -99,8 +98,7 @@ const {
   assert.strictEqual(readSafeText(make('missing2.txt')), null, 'missing 时应返回 null')
   assert.strictEqual(readSafeText(dirPath), null, 'unsafe 时应返回 null')
 
-  // 清理
-  for (const p of cleanup) { try { fs.rmSync(p, { recursive: true, force: true }) } catch (e) {} }
+  // 清理：临时目录递归删除即可覆盖所有测试文件
   try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) {}
 
   console.log('test_storage OK')
