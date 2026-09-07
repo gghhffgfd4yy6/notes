@@ -16,7 +16,8 @@ const {
   assert.strictEqual(shouldAutoInstallDependencies({ XBK_AUTO_INSTALL_DEPS: '' }), false, '空串应返回 false')
   assert.strictEqual(shouldAutoInstallDependencies({}), false, '未设置应返回 false')
   assert.ok(!shouldAutoInstallDependencies(null), 'null env 应返回 falsy（env && 短路）')
-  assert.strictEqual(shouldAutoInstallDependencies(undefined), false, 'undefined env 触发默认 process.env，应返回 false')
+  // 注：不传参数（undefined）会触发默认参数 process.env，依赖宿主机环境，
+  // 故不单独测；`{}` 已覆盖"未设置该变量时返回 false"的语义。
 
   // ===== intervalMs(num) =====
   // num(envValue, defaultValue) 模拟
@@ -47,97 +48,42 @@ const {
   assert.strictEqual(retryBackoffMs(2, null), 2000, 'null env 应回退默认')
 
   // ===== ensureDependencies：更多边界分支 =====
+  // 统一 mock 构造器：消除 7 个用例间重复的 requireFn/spawnSyncFn 样板
+  const makeDepsMock = ({ gotError = null, re2Error = null, installResult = { status: 0 }, rebuildResult = { status: 0 }, autoInstall = true } = {}) => ({
+    requireFn: (id) => {
+      const base = path.basename(id)
+      if (base === 'got' && gotError) throw gotError
+      if (base === 're2' && re2Error) throw re2Error
+      return {}
+    },
+    spawnSyncFn: (cmd, args) => (args[0] === 'run' && args[1] === 'rebuild' ? rebuildResult : installResult),
+    env: autoInstall ? { XBK_AUTO_INSTALL_DEPS: '1' } : {}
+  })
+  const modNotFound = () => { const e = new Error('Cannot find module'); e.code = 'MODULE_NOT_FOUND'; return e }
+  const dlopenFailed = () => { const e = new Error('Native mismatch'); e.code = 'ERR_DLOPEN_FAILED'; return e }
+
   // 1. got 和 re2 都可加载 → 返回 undefined（不抛错）
-  assert.strictEqual(ensureDependencies({
-    requireFn: () => ({}),
-    env: {}
-  }), undefined, '两个依赖都可加载时应返回 undefined')
+  assert.strictEqual(ensureDependencies(makeDepsMock()), undefined, '两个依赖都可加载时应返回 undefined')
 
   // 2. 不可恢复错误（非 MODULE_NOT_FOUND/ERR_DLOPEN_FAILED）直接 throw，不尝试安装
   const unrecoverable = new Error('Unexpected runtime error')
   unrecoverable.code = 'E_RANDOM'
-  assert.throws(() => ensureDependencies({
-    requireFn: (id) => {
-      if (path.basename(id) === 'got') throw unrecoverable
-      return {}
-    },
-    spawnSyncFn: () => { throw new Error('不应调用 spawnSync') },
-    env: { XBK_AUTO_INSTALL_DEPS: '1' }
-  }), /Unexpected runtime error/, '不可恢复错误应直接抛出，不尝试自动安装')
+  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: unrecoverable })), /Unexpected runtime error/, '不可恢复错误应直接抛出，不尝试自动安装')
 
   // 3. 可恢复错误但未设置自动安装 → 抛明确提示错误
-  assert.throws(() => ensureDependencies({
-    requireFn: (id) => {
-      if (path.basename(id) === 'got') {
-        const e = new Error('Cannot find module')
-        e.code = 'MODULE_NOT_FOUND'
-        throw e
-      }
-      return {}
-    },
-    env: {}
-  }), /got 依赖或原生模块未完整安装/, '未设置 XBK_AUTO_INSTALL_DEPS 时应抛提示错误')
+  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound(), autoInstall: false })), /got 依赖或原生模块未完整安装/, '未设置 XBK_AUTO_INSTALL_DEPS 时应抛提示错误')
 
   // 4. npm install 失败（status != 0）→ throw
-  assert.throws(() => ensureDependencies({
-    requireFn: (id) => {
-      if (path.basename(id) === 'got') {
-        const e = new Error('Cannot find module')
-        e.code = 'MODULE_NOT_FOUND'
-        throw e
-      }
-      return {}
-    },
-    spawnSyncFn: () => ({ status: 1 }),
-    env: { XBK_AUTO_INSTALL_DEPS: '1' }
-  }), /npm install 失败/, 'npm install 退出码非 0 应抛错')
+  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound(), installResult: { status: 1 } })), /npm install 失败/, 'npm install 退出码非 0 应抛错')
 
   // 5. install 成功但 re2 rebuild 失败 → throw
-  const re2Ready5 = false
-  assert.throws(() => ensureDependencies({
-    requireFn: (id) => {
-      if (path.basename(id) === 're2' && !re2Ready5) {
-        const e = new Error('Native mismatch')
-        e.code = 'ERR_DLOPEN_FAILED'
-        throw e
-      }
-      return {}
-    },
-    spawnSyncFn: (cmd, args) => {
-      if (args[0] === 'run' && args[1] === 'rebuild') return { status: 1 }
-      return { status: 0 }
-    },
-    env: { XBK_AUTO_INSTALL_DEPS: '1' }
-  }), /re2 原生模块构建失败/, 'rebuild 退出码非 0 应抛错')
+  assert.throws(() => ensureDependencies(makeDepsMock({ re2Error: dlopenFailed(), rebuildResult: { status: 1 } })), /re2 原生模块构建失败/, 'rebuild 退出码非 0 应抛错')
 
-  // 6. 安装+rebuild 都成功但恢复后仍不可用 → throw
-  assert.throws(() => ensureDependencies({
-    requireFn: (id) => {
-      // got 始终不可加载（模拟恢复失败）
-      if (path.basename(id) === 'got') {
-        const e = new Error('Cannot find module')
-        e.code = 'MODULE_NOT_FOUND'
-        throw e
-      }
-      return {}
-    },
-    spawnSyncFn: () => ({ status: 0 }),
-    env: { XBK_AUTO_INSTALL_DEPS: '1' }
-  }), /依赖恢复后 got 仍不可用/, '恢复后仍不可用应抛错')
+  // 6. 安装+rebuild 都成功但恢复后仍不可用 → throw（got 始终不可加载模拟恢复失败）
+  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound() })), /依赖恢复后 got 仍不可用/, '恢复后仍不可用应抛错')
 
   // 7. spawnSync 返回 error 对象 → throw install.error
-  assert.throws(() => ensureDependencies({
-    requireFn: (id) => {
-      if (path.basename(id) === 'got') {
-        const e = new Error('Cannot find module')
-        e.code = 'MODULE_NOT_FOUND'
-        throw e
-      }
-      return {}
-    },
-    spawnSyncFn: () => ({ error: new Error('spawn ENOENT'), status: null }),
-    env: { XBK_AUTO_INSTALL_DEPS: '1' }
-  }), /spawn ENOENT/, 'spawnSync 返回 error 应抛出该错误')
+  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound(), installResult: { error: new Error('spawn ENOENT'), status: null } })), /spawn ENOENT/, 'spawnSync 返回 error 应抛出该错误')
 
   console.log('test_qinglong_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })
