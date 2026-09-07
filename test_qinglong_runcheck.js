@@ -19,13 +19,14 @@ function restoreNotify () {
 }
 
 function makeApp (overrides = {}) {
+  const uniqueCacheDir = path.join(os.tmpdir(), 'xbk-test-cache-' + Math.random().toString(36).slice(2))
   return {
     validateConfig: overrides.validateConfig || (() => []),
     init: overrides.init || (() => {}),
     Config: {
       filter: overrides.filter || {},
       keyword: { zkt_gjc: overrides.zkt_gjc || '' },
-      cache: { dir: overrides.cacheDir || path.join(os.tmpdir(), 'xbk-test-cache') }
+      cache: { dir: overrides.cacheDir || uniqueCacheDir }
     }
   }
 }
