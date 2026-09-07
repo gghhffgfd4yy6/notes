@@ -3,16 +3,13 @@
 const assert = require('node:assert')
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
-const path = require('node:path')
 
-const root = __dirname
-const workflow = path.resolve(root, '.github/workflows/mutation.yml')
-const checker = path.resolve(root, 'scripts/check-mutation-ranges.js')
+const workflow = '.github/workflows/mutation.yml'
+const checker = 'scripts/check-mutation-ranges.js'
 const yml = fs.readFileSync(workflow, 'utf8')
 
 function runChecker (workflowText) {
   return spawnSync(process.execPath, [checker], {
-    cwd: root,
     encoding: 'utf8',
     env: { ...process.env, MUTATION_WORKFLOW_TEXT: workflowText }
   })
