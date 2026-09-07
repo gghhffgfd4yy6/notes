@@ -12,7 +12,7 @@ const path = require('path')
 
 const root = path.resolve(__dirname, '..')
 const workflowPath = path.resolve(process.env.MUTATION_WORKFLOW_PATH || path.join(root, '.github/workflows/mutation.yml'))
-const yml = fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
+const yml = process.env.MUTATION_WORKFLOW_TEXT || fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
 
 // 收集 yml 中形如 "file.js:start-end" 的行段（含引号），按文件聚合
 const rangeRe = /"([\w/.-]+\.(?:js|mjs|cjs)):(\d+)-(\d+)"/g
