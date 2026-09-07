@@ -8,6 +8,18 @@
 # 大量 path.join(tmpDir, hardcodedName) 用于在 mkdtempSync 生成的
 # 临时目录下构造测试文件路径，目录和文件名均为测试硬编码常量，
 # 无任何用户输入，静态路径注入告警属误报。
+#
+# test_check_mutation_ranges.js 是变异范围校验脚本的单元测试：
+# 通过子进程 + MUTATION_WORKFLOW_TEXT 环境变量注入 yml 文本，
+# buildYml() 构造的 yml 内容和文件路径均为测试硬编码，无用户输入，
+# 静态路径注入告警属误报。
+#
+# test_mutation_report.js 扩展后新增 findReportJson/analyzeSegment 临时目录测试：
+# path.join(mkdtemp, 硬编码子目录名) + fs.mkdirSync/writeFileSync 用于构造
+# 测试用 mutation.json，目录和文件名均为测试硬编码常量，无用户输入，
+# 静态路径注入告警属误报。
 exclude_paths:
   - "scripts/check-mutation-ranges.js"
   - "test_storage.js"
+  - "test_check_mutation_ranges.js"
+  - "test_mutation_report.js"
