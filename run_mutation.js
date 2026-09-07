@@ -297,4 +297,4 @@ async function main () {
 }
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1 })
-module.exports = { generateMutants, collectMutants, extractTestSummary }
+module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, applyMutants }
