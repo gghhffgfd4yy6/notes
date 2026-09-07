@@ -117,7 +117,9 @@ jobs:
         run: npm run test:app:serial
 
       - name: 集成测试结果判定
-        if: always()
+        # 仅在集成测试真正执行过（未被跳过）且 job 未被取消时才判定；
+        # 避免前面步骤失败或 job 被取消时输出误导性的"集成测试失败"。
+        if: !cancelled() && steps.integration-parallel.outcome != 'skipped' && steps.integration-parallel.outcome != '' 
         run: |
           PARALLEL="${{ steps.integration-parallel.outcome }}"
           SERIAL="${{ steps.integration-serial.outcome }}"
