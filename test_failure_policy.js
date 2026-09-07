@@ -222,6 +222,61 @@ function error (message, code) {
     else process.env.XBK_RETRY_BACKOFF_CAP_MS = oldBackoffCap
   }
 
+  // ============ 补测：xbk_failure_policy 未覆盖分支（契约→反例→证据） ============
+
+  // [探针] 最高风险契约：聚合失败所有子通道均永久 → 整体永久停止。
+  // 反例：只要任一子通道可重试，整体必须保留重试机会（见下一组 MIXED 断言）。
+  const allPermanent = classifyFailure({
+    message: 'aggregated',
+    failures: [{ code: 'HTTP_401', message: 'a' }, { code: 'MODULE_NOT_FOUND', message: 'b' }]
+  })
+  assert.strictEqual(allPermanent.kind, 'permanent', '子通道全永久时整体应永久')
+  assert.strictEqual(allPermanent.reason, 'ALL_CHANNELS_PERMANENT')
+
+  // 嵌套混合：任一子通道可重试 → 整体可重试（宁可重复，不可丢失）
+  const mixed = classifyFailure({
+    message: 'agg',
+    failures: [{ code: 'HTTP_401', message: 'a' }, { code: 'ETIMEDOUT', message: 'b' }]
+  })
+  assert.strictEqual(mixed.kind, 'retryable', '混合失败含可重试子通道时整体应可重试')
+  assert.strictEqual(mixed.reason, 'MIXED_CHANNEL_FAILURES')
+
+  // classifySummary：非对象 / 空入参 / 无失败 → null（不进入分类）
+  assert.strictEqual(classifySummary(null), null)
+  assert.strictEqual(classifySummary(undefined), null)
+  assert.strictEqual(classifySummary('not-an-object'), null)
+  assert.strictEqual(classifySummary({ total: 0, pushed: 0, failed: 0 }), null)
+
+  // classifySummary：有失败但 failures 缺失（非数组）→ 全失败但原因未结构化 → 保守重试
+  const unknownAll = classifySummary({ total: 1, pushed: 0, failed: 1 })
+  assert.strictEqual(unknownAll.kind, 'retryable')
+  assert.strictEqual(unknownAll.reason, 'ALL_PUSH_FAILED_UNKNOWN')
+
+  // classifySummary：部分成功 + failures 空数组 → 保持成功，不熔断
+  assert.strictEqual(classifySummary({ total: 2, pushed: 1, failed: 1, failures: [] }), null)
+
+  // code 数值 400-499（未命中 message/错误码集合）→ PROVIDER_xxx 永久
+  assert.strictEqual(classifyFailure({ code: 450, message: 'server replied' }).kind, 'permanent')
+  assert.strictEqual(classifyFailure({ code: 450, message: 'server replied' }).reason, 'PROVIDER_450')
+
+  // providerCode 数值 400-499（无 channel）→ PROVIDER_xxx 永久
+  assert.strictEqual(classifyFailure({ providerCode: 450, message: 'plain' }).kind, 'permanent')
+  assert.strictEqual(classifyFailure({ providerCode: 450, message: 'plain' }).reason, 'PROVIDER_450')
+
+  // providerCode 数值 500-599（无 channel）→ 可重试（瞬时服务故障）
+  assert.strictEqual(classifyFailure({ providerCode: 502, message: 'busy' }).kind, 'retryable')
+
+  // HTTP_ 非错误码集合 4xx → 永久（走 HTTP_ 前缀分支）
+  assert.strictEqual(classifyFailure({ code: 'HTTP_450', message: 'x' }).kind, 'permanent')
+
+  // classifyOne 内部 failureKind（经 classifySummary 传递）：子错误显式永久 → 整体永久
+  assert.strictEqual(classifySummary({
+    total: 1,
+    pushed: 0,
+    failed: 1,
+    failures: [{ failureKind: 'permanent', failureReason: 'EXPLICIT_X', message: 'm' }]
+  }).kind, 'permanent')
+
   console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分成功不熔断、成功后恢复')
 })().catch(error => {
   console.error(error)
