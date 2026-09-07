@@ -26,6 +26,8 @@ const SUITES = [
   { name: '青龙常驻', file: 'test_qinglong_resident.js', desc: 'refreshConnections DNS/TLS 预热 mock + runResident 正常/permanent/可重试退避' },
   { name: '青龙诊断', file: 'test_qinglong_runcheck.js', desc: 'runCheck 全部通过/过滤警告/init失败/无通道/无方法 五种返回码' },
   { name: '状态面板', file: 'test_status.js', desc: '--status 只读聚合运行状态' },
+  { name: '状态报告解析', file: 'test_status_report.js', desc: 'scripts/status.js parseLastRun invalid 分支（run.log 无匹配行）' },
+  { name: '规则引擎校验', file: 'test_rules.js', desc: 'xbk_rules.js 嵌套量词检测/pingbitime 首尾空白/缺少分隔符' },
   { name: '单元测试', file: 'test_filter.js', desc: '主代码导出函数逐函数逻辑' },
   { name: '变异报告读取', file: 'test_mutation_json.js', desc: '超大 mutation.json 剥离 statusReason 解析（v3.264）' },
   { name: '变异报告渲染', file: 'test_mutation_report.js', desc: 'render 函数 markdown 输出快照（v3.266 重构验证）' },
