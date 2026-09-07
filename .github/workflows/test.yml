@@ -155,3 +155,34 @@ jobs:
             exit 1
           fi
           echo "✅ quality matrix 全部通过"
+
+  # 覆盖率报告：quality 通过后跑全量 c8 覆盖率，上传 artifact 供下载查看。
+  # 独立 job 避免拖慢 quality matrix（全量测试约 5-6 分钟）。
+  coverage:
+    runs-on: ubuntu-latest
+    needs: quality-gate
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: 安装依赖（忽略脚本，防供应链风险）
+        run: npm ci --ignore-scripts
+
+      - name: 安装并验证 re2 原生模块
+        run: |
+          (cd node_modules/re2 && npm_package_json="$PWD/package.json" node ../install-artifact-from-github/bin/install-from-cache.js --artifact build/Release/re2.node --host-var RE2_DOWNLOAD_MIRROR --skip-path-var RE2_DOWNLOAD_SKIP_PATH --skip-ver-var RE2_DOWNLOAD_SKIP_VER --force-build-var RE2_DOWNLOAD_FORCE_BUILD)
+          node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
+
+      - name: 全量覆盖率（c8）
+        run: npm run test:coverage
+
+      - name: 上传覆盖率报告
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808  # v4.3.3
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14

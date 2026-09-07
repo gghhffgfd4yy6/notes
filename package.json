@@ -29,6 +29,7 @@
     "test:qinglong-utils": "node test_qinglong_utils.js",
     "test:mutation": "stryker run",
     "test:mutation-ranges": "node scripts/check-mutation-ranges.js",
+    "test:coverage": "c8 --reporter=text --reporter=lcov --reporter=json-summary --exclude='test_*.js' --exclude='run_tests.js' node run_tests.js",
     "check": "npm run lint && node check-version.js && node scripts/check-mutation-ranges.js && npm test",
     "verify": "npm run check"
   },
@@ -54,6 +55,7 @@
   },
   "devDependencies": {
     "@stryker-mutator/core": "^10.0.0",
+    "c8": "^10.1.2",
     "fast-check": "^4.9.0",
     "standard": "^17.1.2"
   },
