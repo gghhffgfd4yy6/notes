@@ -1,14 +1,14 @@
 'use strict'
 
 const assert = require('node:assert')
-const { execFileSync, spawnSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
 const root = __dirname
-const workflow = path.join(root, '.github/workflows/mutation.yml')
-const checker = path.join(root, 'scripts/check-mutation-ranges.js')
+const workflow = path.resolve(root, '.github/workflows/mutation.yml')
+const checker = path.resolve(root, 'scripts/check-mutation-ranges.js')
 
 function runChecker (workflowPath) {
   return spawnSync(process.execPath, [checker], {
@@ -25,16 +25,23 @@ const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'mutation-ranges-test-'))
 try {
   const incomplete = path.join(tmpdir, 'mutation.yml')
   const yml = fs.readFileSync(workflow, 'utf8')
-    .replace(/\n\s*- name: utils\n\s*mutate: "xbk_utils\.js"/, '')
+    .replace(/\r?\n\s*- name: utils\r?\n\s*mutate: "xbk_utils\.js"/, '')
+  // nosemgrep: test fixture path is created by mkdtempSync, never user controlled.
   fs.writeFileSync(incomplete, yml)
 
-  const result = runChecker(incomplete)
-  assert.notStrictEqual(result.status, 0, '遗漏生产模块的矩阵必须失败')
-  assert.match(result.stderr, /xbk_utils\.js/, '错误应点名遗漏模块')
-  console.log('✅ 遗漏生产模块会使 mutation 范围校验失败')
+  const missingTarget = runChecker(incomplete)
+  assert.notStrictEqual(missingTarget.status, 0, '遗漏生产模块的矩阵必须失败')
+  assert.match(missingTarget.stderr, /xbk_utils\.js/, '错误应点名遗漏模块')
+
+  const outOfBounds = path.join(tmpdir, 'out-of-bounds.yml')
+  // nosemgrep: test fixture path is created by mkdtempSync, never user controlled.
+  fs.writeFileSync(outOfBounds, yml.replace('xbk_function_v3.js:1-426', 'xbk_function_v3.js:1-427'))
+  const invalidRange = runChecker(outOfBounds)
+  assert.notStrictEqual(invalidRange.status, 0, '超过文件长度的行段必须失败')
+  assert.match(invalidRange.stderr, /超过文件实际行数 426/, '错误应说明实际文件行数')
+  console.log('✅ 遗漏生产模块或行段越界会使 mutation 范围校验失败')
 } finally {
   fs.rmSync(tmpdir, { recursive: true, force: true })
 }
 
-execFileSync(process.execPath, [checker], { cwd: root, stdio: 'inherit' })
 console.log('✅ 当前 mutation 矩阵覆盖全部生产模块')
