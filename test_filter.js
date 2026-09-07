@@ -9375,5 +9375,62 @@ console.log('========================================\n');
     }
   })
 
+  // ============ 补测：xbk_pusher.createPusher.send（契约→反例→证据） ============
+  const { createPusher } = require('./xbk_pusher')
+  const pusherUtils = {
+    sanitizeDecodedHtml: s => 'SAN[' + s + ']',
+    decodeHtmlEntities: s => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+  }
+  const makeNotify = impl => ({ sendNotify: impl, configuredChannelNames: () => ['ch1'] })
+
+  async function pusherSend (desp, opts = {}) {
+    const p = createPusher({
+      Utils: pusherUtils,
+      getNotify: opts.getNotify || (async () => makeNotify(opts.impl || (async () => 'ok'))),
+      looksLikeHtmlLinear: opts.looksLike || require('./xbk_pusher').looksLikeHtmlLinear
+    })
+    return p.send(opts.text, desp, opts.notifyModule)
+  }
+
+  await test('P5 createPusher：非字符串归一（undefined/null → 空串，不抛错）', async () => {
+    let received
+    await pusherSend(undefined, {
+      text: undefined,
+      impl: async (t, d) => { received = [t, d] }
+    })
+    assertEqual(received[0], '', 'text undefined 应归一为空串')
+    assertEqual(received[1], '', 'desp undefined 应归一为空串')
+  })
+
+  // [探针] 最高风险契约：sendNotify 返回非 Promise → 必须拒绝（拒绝"未发送即成功"静默丢消息）
+  await test('P5 createPusher：sendNotify 返回同步值 → 拒绝静默成功（探针）', async () => {
+    let rejected = false
+    try { await pusherSend('x', { impl: () => 'sync-not-thenable' }) } catch (e) { rejected = true }
+    assertEqual(rejected, true, '非 thenable 的 sendNotify 必须 reject，禁止静默成功')
+  })
+
+  await test('P5 createPusher：正常发送返回解析结果', async () => {
+    const result = await pusherSend('hi', { impl: async () => ({ ok: true }) })
+    assertEqual(result.ok, true, '应返回 sendNotify 的解析值')
+  })
+
+  await test('P5 createPusher：sendNotify reject 透传给调用方', async () => {
+    let rejected = false
+    try { await pusherSend('x', { impl: async () => { throw new Error('chan down') } }) } catch (e) { rejected = e.message === 'chan down' }
+    assertEqual(rejected, true, '底层 reject 应透传')
+  })
+
+  await test('P5 createPusher：HTML 形态 desp → 先解码实体再出口清洗（验证 decode→sanitize 顺序）', async () => {
+    let cleaned
+    await pusherSend('<b>&lt;i&gt;x&lt;/b&gt;', { impl: async (t, d) => { cleaned = d } })
+    assertEqual(cleaned, 'SAN[<b><i>x</b>]', '应先解码 &lt;/&gt; 实体再 sanitize，验证 decode→sanitize 顺序')
+  })
+
+  await test('P5 createPusher：超长 desp 截断到 100000', async () => {
+    let len
+    await pusherSend('a'.repeat(100001), { impl: async (t, d) => { len = d.length } })
+    assertEqual(len, 100000, '超过 100000 的 desp 应截断')
+  })
+
   process.exit(failed > 0 ? 1 : 0)
 })()
