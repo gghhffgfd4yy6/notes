@@ -20,6 +20,7 @@ const SUITES = [
   { name: '单元测试', file: 'test_filter.js', desc: '主代码导出函数逐函数逻辑' },
   { name: '变异报告读取', file: 'test_mutation_json.js', desc: '超大 mutation.json 剥离 statusReason 解析（v3.264）' },
   { name: '变异报告渲染', file: 'test_mutation_report.js', desc: 'render 函数 markdown 输出快照（v3.266 重构验证）' },
+  { name: '变异范围', file: 'test_mutation_ranges.js', desc: '生产模块及行段必须完整纳入 mutation 矩阵' },
   // v3.172：集成测试走并行调度器（worker 独立缓存目录 + 失败片串行重跑）。
   // 需要完整串行验证时直接 node test_app.js（CI 即如此）
   { name: '集成测试', file: 'test_app_p.js', desc: 'App.run 完整主流程(并行调度,失败自动重跑)' },

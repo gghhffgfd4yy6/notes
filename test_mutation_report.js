@@ -145,9 +145,9 @@ check('包含错误变异测试分段时拒绝发布不完整日报', () => {
 
 check('生产默认分段完整时允许生成日报', () => {
   const results = [
-    'v3-part1', 'v3-part2', 'v3-part3', 'v3-part4', 'v3-part5',
+    'v3-entry', 'app', 'filter', 'formatter', 'message-store', 'network', 'pusher', 'rules', 'utils',
     'sendnotify-part1', 'sendnotify-part2',
-    'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push'
+    'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push', 'check-deps'
   ].map(seg => ({ seg }))
   assert.deepStrictEqual(validateSegments(results), results)
 })

@@ -10,9 +10,9 @@ const { readReportJson } = require('./mutation-json.js')
 
 // 必须与 mutation.yml 的矩阵名称保持一致；缺段时禁止把部分结果伪装成完整日报。
 const EXPECTED_SEGMENTS = Object.freeze([
-  'v3-part1', 'v3-part2', 'v3-part3', 'v3-part4', 'v3-part5',
+  'v3-entry', 'app', 'filter', 'formatter', 'message-store', 'network', 'pusher', 'rules', 'utils',
   'sendnotify-part1', 'sendnotify-part2',
-  'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push'
+  'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push', 'check-deps'
 ])
 
 function analyze (dir) {
