@@ -49,8 +49,9 @@ function makeResidentApp (runFn) {
   // ---------- refreshConnections ----------
   // 1. signal.aborted → 直接返回，不调用任何预热
   let state = mockDeps(false)
-  const abortedSignal = { aborted: true }
-  await refreshConnections(makeApp('https://api.example.com/push'), abortedSignal)
+  const abortedController = new AbortController()
+  abortedController.abort()
+  await refreshConnections(makeApp('https://api.example.com/push'), abortedController.signal)
   assert.strictEqual(state.dnsHosts.length, 0, 'signal.aborted 时不应预热 DNS')
   assert.strictEqual(state.tlsHosts.length, 0, 'signal.aborted 时不应预热 TLS')
   restoreDeps()
