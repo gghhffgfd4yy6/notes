@@ -14,7 +14,7 @@ const {
   assert.strictEqual(profileMs(123.6), 124, '有限数值应四舍五入')
   assert.strictEqual(profileMs(0), 0, '0 应保留')
   assert.strictEqual(profileMs(2.4), 2, '2.4 应四舍五入为 2')
-  assert.strictEqual(profileMs(NaN), 'n/a', 'NaN 应为 n/a')
+  assert.strictEqual(profileMs(Number.NaN), 'n/a', 'NaN 应为 n/a')
   assert.strictEqual(profileMs(Infinity), 'n/a', 'Infinity 应为 n/a')
   assert.strictEqual(profileMs(-Infinity), 'n/a', '-Infinity 应为 n/a')
   assert.strictEqual(profileMs('5'), 'n/a', '字符串不应被接受')
@@ -33,8 +33,9 @@ const {
   const opts = baseRequestOptions()
   assert.ok(opts.agent, '应含 agent')
   assert.strictEqual(typeof opts.lookup, 'function', '应含 lookup（dnsLookup）')
-  const expectedFamily = process.env.XBK_DNS_FAMILY === '4' ? 'ipv4'
-    : process.env.XBK_DNS_FAMILY === '6' ? 'ipv6' : ''
+  let expectedFamily = ''
+  if (process.env.XBK_DNS_FAMILY === '4') expectedFamily = 'ipv4'
+  else if (process.env.XBK_DNS_FAMILY === '6') expectedFamily = 'ipv6'
   if (expectedFamily) {
     assert.strictEqual(opts.dnsLookupIpVersion, expectedFamily, 'XBK_DNS_FAMILY 应映射为对应 dnsLookupIpVersion')
   } else {

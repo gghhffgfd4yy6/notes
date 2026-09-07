@@ -12,10 +12,10 @@ const {
   maskUrl,
   safeSlice,
   safeErr,
-  push_config,
   configuredChannelCount,
   configuredChannelNames
 } = slim
+const cfg = slim.push_config
 
 ;(async () => {
   // ===== mdToPlain：Markdown → 纯文本（推送正文可读性） =====
@@ -66,7 +66,7 @@ const {
   assert.strictEqual(maskKey('abc'), '***', '≤6 位全脱敏')
   assert.strictEqual(maskKey('abcdefgh'), 'abcd***gh', '保留首 4 尾 2')
   assert.strictEqual(maskUrl('https://api.day.app/deviceKey12345'), 'https://api.day.app/devi***45', 'host 保留、路径脱敏')
-  assert.strictEqual(maskUrl('ftp://host/x'), 'ftp:***/x', '非 http(s) 按 key 脱敏（保留首 4 尾 2）')
+  assert.strictEqual(maskUrl('file://host/x'), 'file***/x', '非 http(s) 按 key 脱敏（保留首 4 尾 2）')
   assert.strictEqual(maskUrl('not a url'), 'not ***rl', 'URL 解析失败按 key 脱敏')
 
   // ===== safeSlice：安全截断（不拆散 emoji/代理对） =====
@@ -89,33 +89,33 @@ const {
 
   // ===== configuredChannelCount / configuredChannelNames：通道配置统计 =====
   const saved = {}
-  for (const k of Object.keys(push_config)) saved[k] = push_config[k]
+  for (const k of Object.keys(cfg)) saved[k] = cfg[k]
   try {
-    for (const k of Object.keys(push_config)) delete push_config[k]
+    for (const k of Object.keys(cfg)) delete cfg[k]
     assert.strictEqual(configuredChannelCount(), 0, '空配置计数 0')
     assert.deepStrictEqual(configuredChannelNames(), [], '空配置无通道名')
 
-    push_config.PUSH_PLUS_TOKEN = 'tok'
+    cfg.PUSH_PLUS_TOKEN = 'tok'
     assert.strictEqual(configuredChannelCount(), 1, '单个通道计数 1')
     assert.deepStrictEqual(configuredChannelNames(), ['pushplus'])
 
-    push_config.PUSH_KEY = 'key'
+    cfg.PUSH_KEY = 'key'
     assert.strictEqual(configuredChannelCount(), 2)
     assert.deepStrictEqual(configuredChannelNames(), ['pushplus', 'server酱'])
 
     // TG 必须 token 与 user id 同时存在才计入
-    push_config.TG_BOT_TOKEN = 'bot'
+    cfg.TG_BOT_TOKEN = 'bot'
     assert.strictEqual(configuredChannelCount(), 2, '仅 TG token 不计入')
-    push_config.TG_USER_ID = 'uid'
+    cfg.TG_USER_ID = 'uid'
     assert.strictEqual(configuredChannelCount(), 3, 'TG 双字段齐全才计入')
     assert.deepStrictEqual(configuredChannelNames().includes('telegram'), true)
 
     // BARK 分隔型配置：全空白分隔符在 names 中被排除（count 按 truthy 计）
-    push_config.BARK_PUSH = '##'
+    cfg.BARK_PUSH = '##'
     assert.strictEqual(configuredChannelNames().includes('bark'), false, '全空白分隔值不算已配置通道')
   } finally {
-    for (const k of Object.keys(push_config)) delete push_config[k]
-    for (const [k, v] of Object.entries(saved)) push_config[k] = v
+    for (const k of Object.keys(cfg)) delete cfg[k]
+    for (const [k, v] of Object.entries(saved)) cfg[k] = v
   }
 
   console.log('test_sendnotify_utils OK')
