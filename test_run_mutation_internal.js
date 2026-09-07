@@ -99,25 +99,23 @@ const check = (name, fn) => { fn(); pass++; console.log(`  ✅ ${name}`) }
 
   // ===== mapLimit =====
   console.log('\n--- mapLimit ---')
+  async function trackConcurrency (limit, count) {
+    let concurrent = 0; let maxConcurrent = 0
+    await mapLimit(Array.from({ length: count }), limit, async () => {
+      concurrent++; maxConcurrent = Math.max(maxConcurrent, concurrent)
+      await new Promise(resolve => setTimeout(resolve, 10)); concurrent--
+    })
+    return maxConcurrent
+  }
   check('顺序执行结果', async () => {
     const results = await mapLimit([1, 2, 3], 2, async (x) => x * 2)
     assert.deepStrictEqual(results, [2, 4, 6])
   })
   check('limit=1 串行', async () => {
-    let concurrent = 0; let maxConcurrent = 0
-    await mapLimit([1, 2, 3], 1, async () => {
-      concurrent++; maxConcurrent = Math.max(maxConcurrent, concurrent)
-      await new Promise(resolve => setTimeout(resolve, 10)); concurrent--
-    })
-    assert.strictEqual(maxConcurrent, 1)
+    assert.strictEqual(await trackConcurrency(1, 3), 1)
   })
   check('limit=2 最多 2 并发', async () => {
-    let concurrent = 0; let maxConcurrent = 0
-    await mapLimit([1, 2, 3, 4], 2, async () => {
-      concurrent++; maxConcurrent = Math.max(maxConcurrent, concurrent)
-      await new Promise(resolve => setTimeout(resolve, 10)); concurrent--
-    })
-    assert.strictEqual(maxConcurrent, 2)
+    assert.strictEqual(await trackConcurrency(2, 4), 2)
   })
   check('空数组返回空', async () => {
     const r = await mapLimit([], 5, async () => 1)
@@ -169,37 +167,25 @@ const check = (name, fn) => { fn(); pass++; console.log(`  ✅ ${name}`) }
       const nmStat = fs.lstatSync(path.join(projDir, 'node_modules'))
       assert.ok(nmStat.isSymbolicLink(), 'node_modules 应为 symlink')
     })
-    check('applyMutants 替换操作符', () => {
-      const target = path.join(projDir, 'xbk_utils.js')
-      const original = fs.readFileSync(target, 'utf8')
-      // 找一个包含 && 的位置生成变异体
-      const idx = original.indexOf('&&')
-      if (idx >= 0) {
-        const mutants = [{ file: 'xbk_utils.js', start: idx, end: idx + 2, original: '&&', replacement: '||', kind: 'operator', id: 1 }]
-        applyMutants(projDir, mutants)
-        const modified = fs.readFileSync(target, 'utf8')
-        assert.strictEqual(modified.slice(idx, idx + 2), '||', '&& 应被替换为 ||')
-        // 恢复
-        fs.writeFileSync(target, original, 'utf8')
-      }
+    check('applyMutants 替换操作符（fixture 固定内容）', () => {
+      const fixture = path.join(projDir, 'fixture.js')
+      fs.writeFileSync(fixture, 'if (a && b) { c || d }', 'utf8')
+      const mutants = [{ file: 'fixture.js', start: 6, end: 8, original: '&&', replacement: '||', kind: 'operator', id: 1 }]
+      applyMutants(projDir, mutants)
+      const modified = fs.readFileSync(fixture, 'utf8')
+      assert.strictEqual(modified, 'if (a || b) { c || d }', '&& 应被替换为 ||')
     })
-    check('applyMutants 多变异体倒序应用不重叠', () => {
-      const target = path.join(projDir, 'xbk_utils.js')
-      const original = fs.readFileSync(target, 'utf8')
-      // 找两个不重叠的 &&
-      const idx1 = original.indexOf('&&')
-      const idx2 = original.indexOf('&&', idx1 + 2)
-      if (idx1 >= 0 && idx2 >= 0) {
-        const mutants = [
-          { file: 'xbk_utils.js', start: idx1, end: idx1 + 2, original: '&&', replacement: '||', id: 1 },
-          { file: 'xbk_utils.js', start: idx2, end: idx2 + 2, original: '&&', replacement: '||', id: 2 }
-        ]
-        applyMutants(projDir, mutants)
-        const modified = fs.readFileSync(target, 'utf8')
-        assert.strictEqual(modified.slice(idx1, idx1 + 2), '||')
-        assert.strictEqual(modified.slice(idx2, idx2 + 2), '||')
-        fs.writeFileSync(target, original, 'utf8')
-      }
+    check('applyMutants 多变异体倒序应用不重叠（fixture）', () => {
+      const fixture = path.join(projDir, 'fixture2.js')
+      fs.writeFileSync(fixture, 'x && y && z', 'utf8')
+      // 两个 &&：位置 2-4 和 7-9，倒序应用避免偏移
+      const mutants = [
+        { file: 'fixture2.js', start: 2, end: 4, original: '&&', replacement: '||', id: 1 },
+        { file: 'fixture2.js', start: 7, end: 9, original: '&&', replacement: '||', id: 2 }
+      ]
+      applyMutants(projDir, mutants)
+      const modified = fs.readFileSync(fixture, 'utf8')
+      assert.strictEqual(modified, 'x || y || z', '两个 && 都应被替换')
     })
   } finally {
     fs.rmSync(projDir, { recursive: true, force: true })
