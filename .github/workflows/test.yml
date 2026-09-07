@@ -163,9 +163,9 @@ jobs:
     needs: quality-gate
     if: always()
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe502  # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -182,7 +182,7 @@ jobs:
         run: npm run test:coverage
 
       - name: 上传覆盖率报告
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb480  # v4.3.3
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808  # v4.3.3
         with:
           name: coverage-report
           path: coverage/
