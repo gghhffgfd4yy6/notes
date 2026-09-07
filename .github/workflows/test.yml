@@ -82,6 +82,27 @@ jobs:
       - name: 延迟加载回归（test_lazy_notify.js）
         run: npm run test:lazy
 
+      - name: 循环工具函数测试（test_loop_utils.js）
+        run: npm run test:loop-utils
+
+      - name: 安全文件存储测试（test_storage.js）
+        run: npm run test:storage
+
+      - name: Agent辅助函数测试（test_agents.js）
+        run: npm run test:agents
+
+      - name: 网络重试测试（test_network.js）
+        run: npm run test:network
+
+      - name: HTTP封装测试（test_http.js）
+        run: npm run test:http
+
+      - name: 推送工具函数测试（test_sendnotify_utils.js）
+        run: npm run test:sendnotify-utils
+
+      - name: 青龙工具函数测试（test_qinglong_utils.js）
+        run: npm run test:qinglong-utils
+
       - name: 集成测试（test_app_p.js，并行调度）
         run: npm run test:app
 
