@@ -82,5 +82,19 @@ function installMockStream (behavior) {
     } finally { restore() }
   }
 
+  // 6. XBK_PROFILE=3 + 正常 JSON → 走 detailedProfile timing 日志分支（行75-78）
+  {
+    const origProfile = process.env.XBK_PROFILE
+    process.env.XBK_PROFILE = '3'
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"ok":true}'] })
+    try {
+      const body = await fetchJson('https://api.example.com/x')
+      assert.deepStrictEqual(body, { ok: true }, 'PROFILE=3 下应正常解析 JSON')
+    } finally {
+      restore()
+      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
+    }
+  }
+
   console.log('test_http OK')
 })().catch((e) => { console.error(e); process.exit(1) })
