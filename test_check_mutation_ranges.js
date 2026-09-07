@@ -28,11 +28,13 @@ function buildYml (overrides = {}) {
 }
 
 function run (ymlText) {
-  return spawnSync(process.execPath, [SCRIPT], {
+  const result = spawnSync(process.execPath, [SCRIPT], {
     env: { ...process.env, MUTATION_WORKFLOW_TEXT: ymlText },
     encoding: 'utf8',
     timeout: 15000
   })
+  if (result.error) throw new Error(`spawnSync 失败：${result.error.message}`)
+  return result
 }
 
 ;(async () => {
