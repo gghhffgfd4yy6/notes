@@ -17,7 +17,7 @@ const { generateMutants, extractTestSummary } = require('./run_mutation')
   // < 应生成 2 个变异（<=, >）
   const m2 = generateMutants('test.js', 'a < b')
   assert.strictEqual(m2.length, 2, '< 应生成 2 个变异')
-  assert.deepStrictEqual(m2.map(m => m.replacement).sort(), ['<=', '>'])
+  assert.deepStrictEqual(m2.map(m => m.replacement).sort((a, b) => a.localeCompare(b)), ['<=', '>'])
 
   // 逻辑运算符
   const m3 = generateMutants('test.js', 'a && b')
