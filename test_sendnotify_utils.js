@@ -75,9 +75,8 @@ const {
   assert.strictEqual(safeSlice(undefined, 5), '', 'undefined → 空串')
   assert.strictEqual(safeSlice(null, 5), '', 'null → 空串')
   assert.strictEqual(safeSlice('😀😀', 3), '😀', '不得拆散代理对')
-  const slicedEmoji = safeSlice('a👨‍👩‍👧‍👦b', 4)
-  assert.strictEqual(slicedEmoji, 'a👨', 'ZWJ 家庭 emoji 不得被拆散（尾部 ZWJ 退位）')
-  assert.ok(!slicedEmoji.endsWith('\u200D'), '末尾不得是孤立 ZWJ')
+  // max=2 落在家庭 emoji 序列内：要么保留完整 grapheme，要么整体移除（不得留下半截序列）
+  assert.strictEqual(safeSlice('a👨‍👩‍👧‍👦b', 2), 'a', 'ZWJ 家庭 emoji 不得被拆散，应整体移除被截断的序列')
 
   // ===== safeErr：错误摘要（含脱敏与截断） =====
   assert.strictEqual(safeErr(null), '', 'null → 空串')

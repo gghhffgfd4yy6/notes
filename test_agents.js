@@ -33,7 +33,11 @@ const {
   const opts = baseRequestOptions()
   assert.ok(opts.agent, '应含 agent')
   assert.strictEqual(typeof opts.lookup, 'function', '应含 lookup（dnsLookup）')
-  if (!process.env.XBK_DNS_FAMILY) {
+  const expectedFamily = process.env.XBK_DNS_FAMILY === '4' ? 'ipv4'
+    : process.env.XBK_DNS_FAMILY === '6' ? 'ipv6' : ''
+  if (expectedFamily) {
+    assert.strictEqual(opts.dnsLookupIpVersion, expectedFamily, 'XBK_DNS_FAMILY 应映射为对应 dnsLookupIpVersion')
+  } else {
     assert.ok(!('dnsLookupIpVersion' in opts), '未设置 XBK_DNS_FAMILY 时不应带 dnsLookupIpVersion')
   }
 

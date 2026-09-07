@@ -68,14 +68,14 @@ function makeNetwork (opts = {}) {
 
   // 5. retry 非法值兜底：Infinity → 2（共 3 次尝试），前 2 次失败第 3 次成功
   {
-    const { net, getCalls } = makeNetwork({ retry: Infinity, statusCode: 500, failTimes: 2 })
+    const { net } = makeNetwork({ retry: Infinity, statusCode: 500, failTimes: 2 })
     const r = await net.fetchData()
     assert.strictEqual(r.calls, 3, 'Infinity 应兜底为 2 次重试（共 3 次尝试）')
   }
 
   // 6. retry 为字符串 '5' → Utils.num 转 5，第 5 次才成功
   {
-    const { net, getCalls } = makeNetwork({ retry: '5', statusCode: 502, failTimes: 5 })
+    const { net } = makeNetwork({ retry: '5', statusCode: 502, failTimes: 5 })
     const r = await net.fetchData()
     assert.strictEqual(r.calls, 6, "字符串 '5' 应经 Utils.num 转换为 5 次重试")
   }

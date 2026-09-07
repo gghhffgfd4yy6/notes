@@ -9377,7 +9377,10 @@ console.log('========================================\n');
 
   // ============ 补测：xbk_pusher.createPusher.send（契约→反例→证据） ============
   const { createPusher } = require('./xbk_pusher')
-  const pusherUtils = { sanitizeDecodedHtml: s => 'SAN[' + s + ']', decodeHtmlEntities: s => s }
+  const pusherUtils = {
+    sanitizeDecodedHtml: s => 'SAN[' + s + ']',
+    decodeHtmlEntities: s => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+  }
   const makeNotify = impl => ({ sendNotify: impl, configuredChannelNames: () => ['ch1'] })
 
   async function pusherSend (desp, opts = {}) {
@@ -9417,10 +9420,10 @@ console.log('========================================\n');
     assertEqual(rejected, true, '底层 reject 应透传')
   })
 
-  await test('P5 createPusher：HTML 形态 desp → 出口清洗（sanitize+decode）', async () => {
+  await test('P5 createPusher：HTML 形态 desp → 先解码实体再出口清洗（验证 decode→sanitize 顺序）', async () => {
     let cleaned
-    await pusherSend('<b>x</b>', { impl: async (t, d) => { cleaned = d } })
-    assertEqual(cleaned, 'SAN[<b>x</b>]', 'HTML desp 应经过 sanitize 清洗')
+    await pusherSend('<b>&lt;i&gt;x&lt;/b&gt;', { impl: async (t, d) => { cleaned = d } })
+    assertEqual(cleaned, 'SAN[<b><i>x</b>]', '应先解码 &lt;/&gt; 实体再 sanitize，验证 decode→sanitize 顺序')
   })
 
   await test('P5 createPusher：超长 desp 截断到 100000', async () => {
