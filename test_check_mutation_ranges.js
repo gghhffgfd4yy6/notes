@@ -70,5 +70,23 @@ function run (ymlText) {
   assert.strictEqual(noRange.status, 1, '无行段应 exit 1')
   assert.ok(noRange.stderr.includes('未在 mutation.yml 中解析到任何 mutate 行段') || noRange.stdout.includes('未在 mutation.yml 中解析到任何 mutate 行段'), '应报未解析到行段')
 
+  // ===== 路径越出仓库根目录 → exit 1（拒绝 ../ 越界）=====
+  const pathTraversal = buildYml() + '          - name: outside\n            mutate: "../outside.js:1-10"\n'
+  const pt = run(pathTraversal)
+  assert.strictEqual(pt.status, 1, '路径越出仓库根目录应 exit 1')
+  assert.ok(pt.stderr.includes('路径越出仓库根目录') || pt.stdout.includes('路径越出仓库根目录'), '应报路径越界')
+
+  // ===== 引用以 .js 结尾的目录 → 读取失败 exit 1（EISDIR，正则要求 .js 后缀）=====
+  const readFailDir = path.join(ROOT, 'tmp-readfail-dir.js')
+  fs.mkdirSync(readFailDir, { recursive: true })
+  try {
+    const readFailYml = buildYml() + '          - name: readfail\n            mutate: "tmp-readfail-dir.js:1-10"\n'
+    const rf = run(readFailYml)
+    assert.strictEqual(rf.status, 1, '引用以 .js 结尾的目录应读取失败 exit 1')
+    assert.ok(rf.stderr.includes('读取失败') || rf.stdout.includes('读取失败'), '应报读取失败')
+  } finally {
+    fs.rmSync(readFailDir, { recursive: true, force: true })
+  }
+
   console.log('test_check_mutation_ranges OK')
 })().catch((e) => { console.error(e); process.exit(1) })
