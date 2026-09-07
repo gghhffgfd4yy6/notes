@@ -324,5 +324,5 @@ if (require.main === module) {
   })
 }
 
-// 导出供测试（不导出 main/postIssue：前者依赖 CLI 副作用、后者侧效应无关单元行为）
-module.exports = { analyze, validateSegments, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate }
+// 导出供测试（不导出 main：依赖 CLI 副作用；postIssue 导出以便 mock fetch 测去重/错误处理逻辑）
+module.exports = { analyze, validateSegments, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate, postIssue }
