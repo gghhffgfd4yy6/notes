@@ -5,7 +5,8 @@
 const assert = require('node:assert')
 const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags } = require('./xbk_sendNotify_slim')
 
-let pass = 0, fail = 0
+let pass = 0
+let fail = 0
 function check (name, fn) {
   try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { fail++; console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
 }
