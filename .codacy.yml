@@ -52,3 +52,7 @@ exclude_paths:
   - "test_mutation_report_cli.js"
   - "test_run_mutation_cli.js"
   - "test_formatter.js"
+  - "test_utils_pure.js"
+  - "test_rules_extended.js"
+  - "test_message_store_utils.js"
+  - "test_sendnotify_pure.js"
