@@ -10,7 +10,9 @@ const concurrency = Number.isInteger(requestedConcurrency) && requestedConcurren
 module.exports = {
   testRunner: 'command',
   commandRunner: {
-    command: 'PERF_MS=3000 node test_filter.js'
+    // v3.273：从只跑 test_filter.js 改成跑全量单元测试（run_unit_tests.js，26个套件）。
+    // 此前只跑 test_filter.js 导致 PR #100/#101 新增的 238 项测试对变异分数完全无效（issue #106）。
+    command: 'PERF_MS=3000 node run_unit_tests.js'
   },
   mutate: [
     'xbk_function_v3.js',
@@ -32,7 +34,8 @@ module.exports = {
   ],
   coverageAnalysis: 'off',
   concurrency,
-  timeoutMS: 90000,
+  // v3.273：从 90s 增加到 180s，因为 run_unit_tests.js 跑 26 个套件比只跑 test_filter.js 慢。
+  timeoutMS: 180000,
   reporters: ['clear-text', 'html', 'json'],
   tempDirName: '.stryker-tmp',
   cleanTempDir: 'always',
