@@ -42,8 +42,7 @@ const formatter = createFormatter({ Utils: mockUtils, safeRe })
 
 let pass = 0
 function check (name, fn) {
-  try { fn(); pass++; console.log(`  ✅ ${name}`) }
-  catch (e) { console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
+  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
 }
 
 console.log('=== xbk_formatter.js 测试 ===')
