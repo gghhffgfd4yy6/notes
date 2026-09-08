@@ -61,10 +61,8 @@ const {
 
   // 场景 1：缓存未命中 → 真实解析后回调，且第二次调用命中缓存（更快）
   await new Promise((resolve, reject) => {
-    const t0 = Date.now()
     dnsLookup('localhost', {}, (err, address, family) => {
       if (err) { reject(err); return }
-      const firstMs = Date.now() - t0
       // 第二次调用应命中缓存（queueMicrotask 派发，远快于真实解析）
       const t1 = Date.now()
       dnsLookup('localhost', {}, (err2, address2, family2) => {

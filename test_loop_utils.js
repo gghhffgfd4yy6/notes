@@ -31,7 +31,6 @@ const { runLoop, sleep } = require('./xbk_loop')
   // 观测点：默认值生效体现在"未立即返回"——用极短等待验证 timer 已被调度（非 0ms 立即返回）
   const c3 = new AbortController()
   c3.abort()
-  const t3 = Date.now()
   await sleep(Number.NaN, c3.signal) // 不应抛错；signal 已 aborted 所以立即返回
   await sleep(Infinity, c3.signal)
   await sleep('abc', c3.signal)
@@ -58,7 +57,7 @@ const { runLoop, sleep } = require('./xbk_loop')
   // 用 Promise.race 确保 2s 内必须 reject，否则判定为挂死失败。
   const withTimeout = (p, ms, label) => Promise.race([
     p,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} 挂死超时（${ms}ms）`)), ms))
+    new Promise((_resolve, reject) => setTimeout(() => reject(new Error(`${label} 挂死超时（${ms}ms）`)), ms))
   ])
   await assert.rejects(() => withTimeout(runLoop('not-a-function'), 2000, 'runLoop(string)'), /runLoop 需要函数|挂死超时/, '非函数 run 应 reject')
   await assert.rejects(() => withTimeout(runLoop(123), 2000, 'runLoop(number)'), /runLoop 需要函数|挂死超时/, '数字 run 应 reject')
