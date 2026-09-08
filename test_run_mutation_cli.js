@@ -73,9 +73,7 @@ const { runTests, evaluate } = require('./run_mutation')
     assert.ok(['pass', 'fail', 'timeout'].includes(result.status), 'status 应为 pass/fail/timeout')
     assert.ok(Array.isArray(result.mutants), '应返回 mutants 数组')
     assert.strictEqual(result.mutants.length, 0, '无变异时 mutants 应为空')
-    // 验证临时目录已被清理（evaluate 的 finally 块）
-    const tmpDirs = fs.readdirSync(os.tmpdir()).filter(d => d.startsWith('xbk-mutant-'))
-    // 不严格断言，因为可能有其他进程的临时目录；只验证 evaluate 本身不泄漏
+    // evaluate 的 finally 块会清理临时目录，无需额外断言
   }
 
   console.log('test_run_mutation_cli OK')
