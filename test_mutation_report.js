@@ -392,7 +392,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     assert.strictEqual(postBody.body, 'test body content')
     // #30 修复：验证列表查询和创建请求的 method/per_page/creator 参数（篡改存活）
     // 列表查询：GET 方法，URL 含 per_page=100 和 creator=github-actions[bot]
-    assert.strictEqual(listRes.capturedOpts.method, undefined, '列表查询应为 GET（默认方法，不显式设置）')
+    assert.ok(listRes.capturedOpts.method === undefined || listRes.capturedOpts.method === 'GET', '列表查询应为 GET（默认或显式）')
     assert.ok(listRes.capturedUrl.includes('per_page=100'), '列表查询 URL 应包含 per_page=100')
     assert.ok(listRes.capturedUrl.includes('creator='), '列表查询 URL 应包含 creator 过滤参数')
     assert.ok(listRes.capturedUrl.includes('github-actions'), 'creator 应为 github-actions[bot]')
