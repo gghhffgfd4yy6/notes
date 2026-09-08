@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 xianbaoku_cache*/
 push_config.local.js
 .git.corrupt_backup/
