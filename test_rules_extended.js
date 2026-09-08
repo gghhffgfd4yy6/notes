@@ -34,9 +34,9 @@ const engine = createRuleEngine({
   isRe2Available: () => false
 })
 
-let pass = 0
+let pass = 0, fail = 0
 function check (name, fn) {
-  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
+  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { fail++; console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
 }
 
 console.log('=== xbk_rules.js 扩展测试 ===')
@@ -210,4 +210,4 @@ check('validateConfig: 正常配置无警告', () => {
   assert.strictEqual(warnings.length, 0, '正常配置应无警告')
 })
 
-console.log(`\n🎉 test_rules_extended.js 全部通过（${pass} 项）`)
+console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_rules_extended.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

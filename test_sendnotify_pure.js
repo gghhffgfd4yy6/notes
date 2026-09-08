@@ -5,9 +5,9 @@
 const assert = require('node:assert')
 const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags } = require('./xbk_sendNotify_slim')
 
-let pass = 0
+let pass = 0, fail = 0
 function check (name, fn) {
-  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
+  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { fail++; console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
 }
 
 console.log('=== xbk_sendNotify_slim.js 纯函数方法测试 ===')
@@ -86,9 +86,14 @@ check('safeSlice: emoji 不切断代理对', () => {
   assert.ok(!r.includes('\uD83D') || r.includes('\uDE00'), '不应残留孤立高代理')
 })
 check('safeSlice: 截断点后是修饰符则退位', () => {
+  const s = 'ab\u0301c' // b + 组合重音
+  const r = safeSlice(s, 2)
+  assert.strictEqual(r, 'a', '截断点后是修饰符应退位去掉b')
+})
+check('safeSlice: 修饰符退位到空', () => {
   const s = 'a\u0301b' // a + 组合重音
   const r = safeSlice(s, 1)
-  assert.strictEqual(r, 'a', '截断点后是修饰符应退位')
+  assert.strictEqual(r, '', 'a后是修饰符，退位后为空')
 })
 
 // ===== safeErr =====
@@ -239,4 +244,4 @@ check('stripAngleTags: 无标签原样返回', () => {
   assert.strictEqual(stripAngleTags('plain text', true), 'plain text')
 })
 
-console.log(`\n🎉 test_sendnotify_pure.js 全部通过（${pass} 项）`)
+console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_sendnotify_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

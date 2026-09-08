@@ -14,7 +14,9 @@ const DEFAULT_FILES = [
   'xbk_failure_policy.js',
   'qinglong/xbk_push.js'
 ]
-const DEFAULT_TEST = ['node', 'test_filter.js']
+// 变异测试使用全量单元测试入口（26个套件），而非仅 test_filter.js——
+// 此前只跑 test_filter.js 导致 #100/#101 新增的 1400+ 行测试对变异分数完全无效。
+const DEFAULT_TEST = ['node', 'run_unit_tests.js']
 const OPS = new Map([
   ['===', ['!==']], ['!==', ['===']], ['==', ['!=']], ['!=', ['==']],
   ['&&', ['||']], ['||', ['&&']],
