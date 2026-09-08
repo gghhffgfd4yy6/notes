@@ -243,7 +243,7 @@ check('anonKey: 不同参数生成不同键', () => {
 })
 check('anonKey: 多参数连接符不转义，单参数中 | 会转义', () => {
   const k1 = Utils.anonKey('a', 'b') // 连接后 a|b（| 不转义）
-  const k2 = Utils.anonKey('a|b')   // | 被转义为 %7C → a%7Cb
+  const k2 = Utils.anonKey('a|b') // | 被转义为 %7C → a%7Cb
   assert.notStrictEqual(k1, k2, '多参数连接符与单参数中的 | 处理不同')
 })
 check('anonKey: 参数顺序影响结果', () => {
@@ -266,13 +266,13 @@ check('anonKey: Symbol 参数被过滤', () => {
   assert.strictEqual(k1, k2, 'Symbol 应被过滤')
 })
 check('anonKey: % 被转义为 %25（二次转义不等价）', () => {
-  const k1 = Utils.anonKey('a%b')    // % → %25 → a%25b
-  const k2 = Utils.anonKey('a%25b')  // % → %25 → a%2525b
+  const k1 = Utils.anonKey('a%b') // % → %25 → a%25b
+  const k2 = Utils.anonKey('a%25b') // % → %25 → a%2525b
   assert.notStrictEqual(k1, k2, '已转义输入会二次转义，不应等价')
 })
 check('anonKey: 多参数中的 % 被转义', () => {
-  const k1 = Utils.anonKey('a', '%', 'b')  // % → %25，连接后 a|%25|b
-  const k2 = Utils.anonKey('a|%25|b')       // | 转义为 %7C，% 转义为 %25
+  const k1 = Utils.anonKey('a', '%', 'b') // % → %25，连接后 a|%25|b
+  const k2 = Utils.anonKey('a|%25|b') // | 转义为 %7C，% 转义为 %25
   assert.notStrictEqual(k1, k2, '多参数连接符不转义，单参数中 | 会转义')
 })
 

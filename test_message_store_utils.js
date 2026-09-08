@@ -1,4 +1,5 @@
 'use strict'
+/* eslint no-control-regex: off */
 
 // xbk_message_store.js 纯函数方法测试（提升变异分数）
 // 覆盖：getFilePath（路径安全/清洗/截断）+ getFileName（URL 提取/清洗/后缀）
