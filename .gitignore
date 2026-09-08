@@ -1,15 +1,15 @@
 node_modules
-xianbaoku_cache*/
+xianbaoku_cache*
 push_config.local.js
-.git.corrupt_backup/
-.tools/
-.stryker-tmp/
-reports/
-coverage/
+.git.corrupt_backup
+.tools
+.stryker-tmp
+reports
+coverage
 mutation-progress.json
 mutation-report.json
 cleanup_rootfs_junk.sh
 .tmp_parallel_*.json
 
 # AI 审查运行时产物不入库
-.ai/
+.ai
