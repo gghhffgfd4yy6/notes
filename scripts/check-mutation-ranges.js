@@ -10,6 +10,15 @@
 const fs = require('fs')
 const path = require('path')
 
+// Stryker 沙箱内跳过：被 --mutate 的目标文件会被注入插桩代码（426→704 行），
+// 沙箱里数行数必然误报"尾部未覆盖"（CI run #120/#108 后 v3-entry、sendnotify 段失败根因）。
+// 该校验的守护对象是仓库源码的行段，在主仓 npm test 时已完整执行。
+if (__dirname.includes('.stryker-tmp')) {
+  console.log('（Stryker 沙箱内，跳过行段校验）')
+  process.exit(0)
+}
+
+
 const root = path.resolve(__dirname, '..')
 const workflowPath = path.resolve(process.env.MUTATION_WORKFLOW_PATH || path.join(root, '.github/workflows/mutation.yml'))
 const yml = process.env.MUTATION_WORKFLOW_TEXT || fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）

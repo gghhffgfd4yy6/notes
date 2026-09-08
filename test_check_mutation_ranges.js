@@ -100,5 +100,17 @@ function run (ymlText) {
     fs.rmSync(readFailDir, { recursive: true, force: true })
   }
 
+  // ===== Stryker 沙箱内（路径含 .stryker-tmp）→ exit 0 跳过（CI run #120 根因回归）=====
+  const sandboxDir = path.join(ROOT, '.stryker-tmp', 'sandbox-regtest', 'scripts')
+  fs.mkdirSync(sandboxDir, { recursive: true })
+  try {
+    fs.copyFileSync(path.join(ROOT, 'scripts', 'check-mutation-ranges.js'), path.join(sandboxDir, 'check-mutation-ranges.js'))
+    const sb = spawnSync(process.execPath, [path.join(sandboxDir, 'check-mutation-ranges.js')], { encoding: 'utf8' })
+    assert.strictEqual(sb.status, 0, '沙箱内运行应跳过校验 exit 0')
+    assert.ok(sb.stdout.includes('沙箱内'), '应输出跳过说明')
+  } finally {
+    fs.rmSync(path.join(ROOT, '.stryker-tmp'), { recursive: true, force: true })
+  }
+
   console.log('test_check_mutation_ranges OK')
 })().catch((e) => { console.error(e); process.exit(1) })
