@@ -27,6 +27,20 @@
 # path.join(os.tmpdir(), 硬编码前缀) + fs.mkdtempSync/writeFileSync/rmSync 用于
 # 构造临时测试目录和 run.log，目录前缀和文件名均为测试硬编码常量，无用户输入，
 # 静态路径注入告警属误报。
+#
+# test_utils.js 是 xbk_utils.js 的单元测试：
+# safeRe mock 使用 new RegExp(src, flags) 构造测试用正则，src/flags 均为测试硬编码
+# 常量，无用户输入，ReDoS 告警属误报（生产代码使用 re2 防护）。
+#
+# test_mutation_report_cli.js 是 scripts/mutation-report.js 的 CLI 集成测试：
+# path.join(os.tmpdir(), 硬编码前缀) + fs.mkdtempSync/mkdirSync/writeFileSync/rmSync 用于
+# 构造临时测试目录和 mutation.json，目录前缀和文件名均为测试硬编码常量，无用户输入，
+# 静态路径注入告警属误报。
+#
+# test_run_mutation_cli.js 是 run_mutation.js 的运行时单元测试：
+# path.join(os.tmpdir(), 硬编码前缀) + fs.mkdtempSync/writeFileSync/rmSync 用于
+# 构造临时测试目录和 test_filter.js，目录前缀和文件名均为测试硬编码常量，无用户输入，
+# 静态路径注入告警属误报。
 exclude_paths:
   - "scripts/check-mutation-ranges.js"
   - "test_storage.js"
@@ -34,3 +48,6 @@ exclude_paths:
   - "test_mutation_report.js"
   - "test_run_mutation_internal.js"
   - "test_status_report.js"
+  - "test_utils.js"
+  - "test_mutation_report_cli.js"
+  - "test_run_mutation_cli.js"
