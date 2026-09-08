@@ -51,3 +51,4 @@ exclude_paths:
   - "test_utils.js"
   - "test_mutation_report_cli.js"
   - "test_run_mutation_cli.js"
+  - "test_formatter.js"
