@@ -9,6 +9,13 @@ const { spawnSync } = require('child_process')
 const ROOT = path.resolve(__dirname)
 const SCRIPT = path.join(ROOT, 'scripts', 'check-mutation-ranges.js')
 
+// 测试用目标文件：动态选取第一个 xbk_*.js 生产文件，避免硬编码重命名后崩
+const TEST_FILE = fs.readdirSync(ROOT).find(f => /^xbk_.*\.js$/.test(f)) || 'xbk_utils.js'
+const TEST_FILE_LINES = (() => {
+  const raw = fs.readFileSync(path.join(ROOT, TEST_FILE), 'utf8')
+  return raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
+})()
+
 // 构造包含所有生产文件的 yml，行段可按文件覆盖
 function buildYml (overrides = {}) {
   const productionFiles = [
@@ -43,38 +50,43 @@ function run (ymlText) {
   assert.strictEqual(ok.status, 0, `正常全覆盖应 exit 0，实际 ${ok.status}\nstdout: ${ok.stdout}\nstderr: ${ok.stderr}`)
 
   // ===== 尾部漏测：行段止于实际行数之前 → exit 1 =====
-  const leak = run(buildYml({ 'xbk_utils.js': '1-10' }))
+  // #25 修复：错误输出只在 stderr（check-mutation-ranges.js 用 console.error），stdout 是死分支；
+  // 去掉 `stderr || stdout` 的 OR 宽容，精确断言 stderr。
+  const leak = run(buildYml({ [TEST_FILE]: '1-10' }))
   assert.strictEqual(leak.status, 1, '尾部漏测应 exit 1')
-  assert.ok(leak.stderr.includes('未被变异测试覆盖') || leak.stdout.includes('未被变异测试覆盖'), '应报尾部未覆盖')
+  assert.ok(leak.stderr.includes('未被变异测试覆盖'), '应报尾部未覆盖（stderr）')
 
   // ===== 行段不连续（缝隙）→ exit 1 =====
-  const gap = run(buildYml({ 'xbk_utils.js': ['1-10', '20-30'] }))
+  const gap = run(buildYml({ [TEST_FILE]: ['1-10', '20-30'] }))
   assert.strictEqual(gap.status, 1, '行段不连续应 exit 1')
-  assert.ok(gap.stderr.includes('不连续') || gap.stdout.includes('不连续'), '应报行段不连续')
+  assert.ok(gap.stderr.includes('不连续'), '应报行段不连续（stderr）')
 
-  // ===== 首段不从第 1 行开始 → exit 1 =====
-  const head = run(buildYml({ 'xbk_utils.js': '5-100' }))
+  // ===== 首段不从第 1 行开始 → exit 1（隔离：行段覆盖到文件末尾，仅首段起始错位）=====
+  const head = run(buildYml({ [TEST_FILE]: `5-${TEST_FILE_LINES}` }))
   assert.strictEqual(head.status, 1, '首段不从第 1 行开始应 exit 1')
+  assert.ok(head.stderr.includes('首段从第'), '应报首段起始错位（stderr）')
 
   // ===== 行段超过实际行数 → exit 1 =====
-  const over = run(buildYml({ 'xbk_utils.js': '1-999999' }))
+  const over = run(buildYml({ [TEST_FILE]: '1-999999' }))
   assert.strictEqual(over.status, 1, '行段超过实际行数应 exit 1')
+  assert.ok(over.stderr.includes('超过文件实际行数'), '应报行段超过实际行数（stderr）')
 
   // ===== 引用不存在的文件 → exit 1 =====
   const notExist = buildYml() + '          - name: ghost\n            mutate: "nonexistent.js:1-10"\n'
   const ne = run(notExist)
   assert.strictEqual(ne.status, 1, '引用不存在的文件应 exit 1')
+  assert.ok(ne.stderr.includes('引用的文件不存在'), '应报文件不存在（stderr）')
 
   // ===== yml 中无行段 → exit 1 =====
   const noRange = run('name: mutation\non: push\njobs:\n  mutation:\n    runs-on: ubuntu-latest\n')
   assert.strictEqual(noRange.status, 1, '无行段应 exit 1')
-  assert.ok(noRange.stderr.includes('未在 mutation.yml 中解析到任何 mutate 行段') || noRange.stdout.includes('未在 mutation.yml 中解析到任何 mutate 行段'), '应报未解析到行段')
+  assert.ok(noRange.stderr.includes('未在 mutation.yml 中解析到任何 mutate 行段'), '应报未解析到行段（stderr）')
 
   // ===== 路径越出仓库根目录 → exit 1（拒绝 ../ 越界）=====
   const pathTraversal = buildYml() + '          - name: outside\n            mutate: "../outside.js:1-10"\n'
   const pt = run(pathTraversal)
   assert.strictEqual(pt.status, 1, '路径越出仓库根目录应 exit 1')
-  assert.ok(pt.stderr.includes('路径越出仓库根目录') || pt.stdout.includes('路径越出仓库根目录'), '应报路径越界')
+  assert.ok(pt.stderr.includes('路径越出仓库根目录'), '应报路径越界（stderr）')
 
   // ===== 引用以 .js 结尾的目录 → 读取失败 exit 1（EISDIR，正则要求 .js 后缀）=====
   const readFailDir = path.join(ROOT, 'tmp-readfail-dir.js')
@@ -83,7 +95,7 @@ function run (ymlText) {
     const readFailYml = buildYml() + '          - name: readfail\n            mutate: "tmp-readfail-dir.js:1-10"\n'
     const rf = run(readFailYml)
     assert.strictEqual(rf.status, 1, '引用以 .js 结尾的目录应读取失败 exit 1')
-    assert.ok(rf.stderr.includes('读取失败') || rf.stdout.includes('读取失败'), '应报读取失败')
+    assert.ok(rf.stderr.includes('读取失败'), '应报读取失败（stderr）')
   } finally {
     fs.rmSync(readFailDir, { recursive: true, force: true })
   }

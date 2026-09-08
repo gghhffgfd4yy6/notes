@@ -41,8 +41,14 @@
 # path.join(os.tmpdir(), 硬编码前缀) + fs.mkdtempSync/writeFileSync/rmSync 用于
 # 构造临时测试目录和 test_filter.js，目录前缀和文件名均为测试硬编码常量，无用户输入，
 # 静态路径注入告警属误报。
+#
+# run_mutation.js 是变异测试调度器（仅本地/CI 工具，不进入生产运行时）：
+# copyProject 中 path.join(ROOT, name) 的 name 来自 fs.readdirSync(ROOT) 按固定正则
+# 过滤的 *.js 文件名与硬编码目录名（scripts/qinglong），ROOT 为 __dirname 常量，
+# 无任何用户输入参与路径构造，动态路径注入告警属误报。
 exclude_paths:
   - "scripts/check-mutation-ranges.js"
+  - "run_mutation.js"
   - "test_storage.js"
   - "test_check_mutation_ranges.js"
   - "test_mutation_report.js"

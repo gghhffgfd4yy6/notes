@@ -83,15 +83,27 @@ function installMockStream (behavior) {
   }
 
   // 6. XBK_PROFILE=3 + 正常 JSON → 走 detailedProfile timing 日志分支（行75-78）
+  // 行为断言：不仅验证 JSON 解析结果，还验证 profile 日志确实被输出（start/response/timing 三条日志）。
   {
     const origProfile = process.env.XBK_PROFILE
     process.env.XBK_PROFILE = '3'
+    const logs = []
+    const origLog = console.log
+    console.log = (...args) => { logs.push(args.join(' ')) }
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"ok":true}'] })
     try {
       const body = await fetchJson('https://api.example.com/x')
       assert.deepStrictEqual(body, { ok: true }, 'PROFILE=3 下应正常解析 JSON')
+      // 日志断言 1：start 日志应被输出
+      assert.ok(logs.some(l => l.includes('[profile api] start')), '应输出 [profile api] start 日志')
+      // 日志断言 2：response 日志应被输出
+      assert.ok(logs.some(l => l.includes('[profile api] responseAtMs=')), '应输出 [profile api] responseAtMs 日志')
+      // 日志断言 3：timing 日志应被输出（这是行75-78的核心分支，此前唯一断言未覆盖）
+      assert.ok(logs.some(l => l.includes('[profile api timing]')), '应输出 [profile api timing] 日志（覆盖 timing 分支）')
+      assert.ok(logs.some(l => l.includes('total=') && l.includes('bytes=')), 'timing 日志应包含 total 和 bytes 字段')
     } finally {
       restore()
+      console.log = origLog
       if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
     }
   }

@@ -52,11 +52,15 @@ function error (message, code) {
   assert.strictEqual(classifyFailure(error('参数配置错误')).kind, 'permanent')
   assert.strictEqual(classifyFailure(error('服务暂时不可用')).kind, 'retryable')
   assert.strictEqual(classifyFailure({ providerCode: 1001, message: '速度太快' }).kind, 'retryable')
+  assert.strictEqual(classifyFailure({ providerCode: 1001, message: '速度太快' }).reason, 'PROVIDER_RATE_LIMIT')
   assert.strictEqual(classifyFailure({ code: 1001, message: '速度太快' }).kind, 'retryable')
+  assert.strictEqual(classifyFailure({ code: 1001, message: '速度太快' }).reason, 'PROVIDER_1001')
   assert.strictEqual(classifyFailure({ code: 401, message: 'unauthorized' }).kind, 'permanent')
   assert.strictEqual(classifyFailure({ providerCode: 40014, message: 'token invalid' }).kind, 'permanent')
   assert.strictEqual(classifyFailure({ providerCode: 500, message: 'provider busy' }).kind, 'retryable')
+  assert.strictEqual(classifyFailure({ providerCode: 500, message: 'provider busy' }).reason, 'PROVIDER_500')
   assert.strictEqual(classifyFailure({ providerCode: 500, message: 'invalid token' }).kind, 'permanent')
+  assert.strictEqual(classifyFailure({ providerCode: 500, message: 'invalid token' }).reason, 'CONFIG_OR_CONTRACT')
   assert.strictEqual(classifyFailure({ channel: 'wxpusher', providerCode: 1300, message: 'bad app token' }).kind, 'permanent')
   assert.strictEqual(classifyFailure({ channel: 'wxpusher', providerCode: 1001, message: '速度太快' }).kind, 'retryable')
   assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 45009, message: '频率限制' }).kind, 'retryable')
@@ -265,9 +269,11 @@ function error (message, code) {
 
   // providerCode 数值 500-599（无 channel）→ 可重试（瞬时服务故障）
   assert.strictEqual(classifyFailure({ providerCode: 502, message: 'busy' }).kind, 'retryable')
+  assert.strictEqual(classifyFailure({ providerCode: 502, message: 'busy' }).reason, 'PROVIDER_502')
 
   // HTTP_ 非错误码集合 4xx → 永久（走 HTTP_ 前缀分支）
   assert.strictEqual(classifyFailure({ code: 'HTTP_450', message: 'x' }).kind, 'permanent')
+  assert.strictEqual(classifyFailure({ code: 'HTTP_450', message: 'x' }).reason, 'HTTP_450')
 
   // classifyOne 内部 failureKind（经 classifySummary 传递）：子错误显式永久 → 整体永久
   assert.strictEqual(classifySummary({

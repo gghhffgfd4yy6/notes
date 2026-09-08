@@ -59,21 +59,45 @@ const { runTests, evaluate } = require('./run_mutation')
   }
 
   // ===== evaluate：复制项目→应用变异→运行测试→清理 =====
-  // evaluate 会复制 ROOT 下的 run_unit_tests.js + files + node_modules 符号链接，
+  // evaluate 会复制 ROOT 下的完整单元测试运行环境（run_unit_tests.js + 全部 test_*.js + xbk_*.js + scripts/），
   // 然后应用变异，运行测试，最后清理临时目录（finally 块）。
-  // 注意：run_unit_tests.js 依赖其他项目文件，临时目录中可能运行失败，
-  // 但 evaluate 函数本身的代码路径（复制/变异/运行/清理）已被覆盖。
+  // 行为断言：验证 evaluate 真正执行了测试运行（而非因缺文件立即失败），output 含测试入口输出。
 
-  // 场景：无变异（mutants=[]）→ evaluate 正常运行并返回结果
+  // 场景 1：无变异（mutants=[]）→ evaluate 正常运行全量单元测试并返回结果
   {
     const files = ['xbk_utils.js']
-    const result = await evaluate([], files, 30000)
-    // 验证返回结构（不验证 status，因为临时环境中 test_filter 可能失败）
+    const result = await evaluate([], files, 120000)
+    // 行为断言 1：返回结构完整
     assert.ok(typeof result === 'object', 'evaluate 应返回对象')
     assert.ok(['pass', 'fail', 'timeout'].includes(result.status), 'status 应为 pass/fail/timeout')
     assert.ok(Array.isArray(result.mutants), '应返回 mutants 数组')
     assert.strictEqual(result.mutants.length, 0, '无变异时 mutants 应为空')
+    // 行为断言 2：output 中包含单元测试入口的真实输出（证明测试真正运行了，而非 MODULE_NOT_FOUND 立即失败）
+    assert.ok(result.output.includes('单元测试入口') || result.output.includes('统一测试入口'),
+      `output 应包含测试入口输出，证明测试真正运行。output 末尾：${result.output.slice(-200)}`)
+    // 行为断言 3：output 中包含至少一个测试套件的执行痕迹
+    assert.ok(result.output.includes('通过') || result.output.includes('失败'),
+      'output 应包含测试通过/失败的执行痕迹')
+    // 行为断言 4：code 字段存在且为数字（进程退出码）
+    assert.ok(typeof result.code === 'number', 'code 应为数字（进程退出码）')
     // evaluate 的 finally 块会清理临时目录，无需额外断言
+  }
+
+  // 场景 2：有变异体 → evaluate 应用变异后运行测试，mutants 数组包含变异体 ID
+  {
+    const { generateMutants } = require('./run_mutation')
+    const source = fs.readFileSync(path.join(__dirname, 'xbk_utils.js'), 'utf8')
+    const allMutants = generateMutants('xbk_utils.js', source)
+    assert.ok(allMutants.length > 0, 'xbk_utils.js 应能生成变异体')
+    // 取第一个变异体（确定性），验证 evaluate 能应用并返回其 ID
+    const oneMutant = allMutants[0]
+    const result = await evaluate([oneMutant], ['xbk_utils.js'], 120000)
+    assert.ok(Array.isArray(result.mutants), '应返回 mutants 数组')
+    assert.strictEqual(result.mutants.length, 1, '应包含 1 个变异体 ID')
+    assert.strictEqual(result.mutants[0], oneMutant.id, '变异体 ID 应一致')
+    // 行为断言：应用变异后测试仍真正运行（output 含测试入口输出或执行痕迹）
+    assert.ok(result.output.includes('单元测试入口') || result.output.includes('统一测试入口') || result.output.includes('通过') || result.output.includes('失败'),
+      '应用变异后测试应仍真正运行')
   }
 
   console.log('test_run_mutation_cli OK')

@@ -49,21 +49,31 @@ const {
 
   // ===== ensureDependencies：更多边界分支 =====
   // 统一 mock 构造器：消除 7 个用例间重复的 requireFn/spawnSyncFn 样板
-  const makeDepsMock = ({ gotError = null, re2Error = null, installResult = { status: 0 }, rebuildResult = { status: 0 }, autoInstall = true } = {}) => ({
-    requireFn: (id) => {
-      const base = path.basename(id)
-      if (base === 'got' && gotError) throw gotError
-      if (base === 're2' && re2Error) throw re2Error
-      return {}
-    },
-    spawnSyncFn: (cmd, args) => (args[0] === 'run' && args[1] === 'rebuild' ? rebuildResult : installResult),
-    env: autoInstall ? { XBK_AUTO_INSTALL_DEPS: '1' } : {}
-  })
+  // spawnCallCount：记录 spawnSyncFn 被调用次数，用于负向断言——依赖正常时不得触发安装/重建
+  const makeDepsMock = ({ gotError = null, re2Error = null, installResult = { status: 0 }, rebuildResult = { status: 0 }, autoInstall = true } = {}) => {
+    const mock = {
+      spawnCallCount: 0,
+      requireFn: (id) => {
+        const base = path.basename(id)
+        if (base === 'got' && gotError) throw gotError
+        if (base === 're2' && re2Error) throw re2Error
+        return {}
+      },
+      spawnSyncFn: (cmd, args) => {
+        mock.spawnCallCount += 1
+        return args[0] === 'run' && args[1] === 'rebuild' ? rebuildResult : installResult
+      },
+      env: autoInstall ? { XBK_AUTO_INSTALL_DEPS: '1' } : {}
+    }
+    return mock
+  }
   const modNotFound = () => { const e = new Error('Cannot find module'); e.code = 'MODULE_NOT_FOUND'; return e }
   const dlopenFailed = () => { const e = new Error('Native mismatch'); e.code = 'ERR_DLOPEN_FAILED'; return e }
 
-  // 1. got 和 re2 都可加载 → 返回 undefined（不抛错）
-  assert.strictEqual(ensureDependencies(makeDepsMock()), undefined, '两个依赖都可加载时应返回 undefined')
+  // 1. got 和 re2 都可加载 → 返回 undefined（不抛错），且不得触发 spawnSync（安装/重建）
+  const normalMock = makeDepsMock()
+  assert.strictEqual(ensureDependencies(normalMock), undefined, '两个依赖都可加载时应返回 undefined')
+  assert.strictEqual(normalMock.spawnCallCount, 0, '依赖正常时不得触发 spawnSync（安装/重建）——负向断言，防未来重排漏判')
 
   // 2. 不可恢复错误（非 MODULE_NOT_FOUND/ERR_DLOPEN_FAILED）直接 throw，不尝试安装
   const unrecoverable = new Error('Unexpected runtime error')
