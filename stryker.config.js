@@ -10,8 +10,9 @@ const concurrency = Number.isInteger(requestedConcurrency) && requestedConcurren
 module.exports = {
   testRunner: 'command',
   commandRunner: {
-    // v3.273：从只跑 test_filter.js 改成跑全量单元测试（run_unit_tests.js，26个套件）。
+    // 变异测试使用全量单元测试入口（run_unit_tests.js，26+套件），而非仅 test_filter.js。
     // 此前只跑 test_filter.js 导致 PR #100/#101 新增的 238 项测试对变异分数完全无效（issue #106）。
+    // PERF_MS=3000：变异测试开销下放宽 test_filter.js 性能断言阈值（默认500ms），避免误判 Killed。
     command: 'PERF_MS=3000 node run_unit_tests.js'
   },
   mutate: [

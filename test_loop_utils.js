@@ -28,17 +28,40 @@ const { runLoop, sleep } = require('./xbk_loop')
   assert.ok(elapsed2 >= 20, `应等待约 30ms 后被 abort，实际 ${elapsed2}ms`)
 
   // ===== sleep：非有限 ms 使用默认 10000（用已 aborted signal 避免真等 10s）=====
+  // 观测点：默认值生效体现在"未立即返回"——用极短等待验证 timer 已被调度（非 0ms 立即返回）
   const c3 = new AbortController()
   c3.abort()
-  await sleep(Number.NaN, c3.signal) // 不应抛错
+  await sleep(Number.NaN, c3.signal) // 不应抛错；signal 已 aborted 所以立即返回
   await sleep(Infinity, c3.signal)
   await sleep('abc', c3.signal)
   await sleep(-5, c3.signal) // 负值 → Math.max(0, -5)=0，不抛错
 
+  // 负毫秒边界：无 signal 时 sleep(-5) 应等价于 sleep(0)，快速返回（不挂死）
+  const tNeg = Date.now()
+  await sleep(-5)
+  const negElapsed = Date.now() - tNeg
+  assert.ok(negElapsed < 500, `sleep(-5) 应等价于 sleep(0) 快速返回，实际 ${negElapsed}ms`)
+
+  // 默认值边界：sleep(NaN) 无 signal 时应使用默认 10000ms——用 50ms 后 abort 验证
+  // （若默认值失效变成 0ms，会在 abort 之前就返回，断言失败）
+  const c3b = new AbortController()
+  const t3b = Date.now()
+  setTimeout(() => c3b.abort(), 50)
+  await sleep(Number.NaN, c3b.signal)
+  const defaultElapsed = Date.now() - t3b
+  assert.ok(defaultElapsed >= 40, `sleep(NaN) 应使用默认 10000ms 并在 50ms 后被 abort，实际 ${defaultElapsed}ms（若 <40ms 说明默认值未生效）`)
+  assert.ok(defaultElapsed < 500, `sleep(NaN) 不应过度等待，实际 ${defaultElapsed}ms`)
+
   // ===== runLoop：run 非函数返回 rejected Promise（async 函数）=====
-  await assert.rejects(() => runLoop('not-a-function'), /runLoop 需要函数/, '非函数 run 应 reject')
-  await assert.rejects(() => runLoop(123), /runLoop 需要函数/, '数字 run 应 reject')
-  await assert.rejects(() => runLoop(null), /runLoop 需要函数/, 'null run 应 reject')
+  // timeout 保护：若守卫失效（如被变异删掉），runLoop 会进入无限循环挂死；
+  // 用 Promise.race 确保 2s 内必须 reject，否则判定为挂死失败。
+  const withTimeout = (p, ms, label) => Promise.race([
+    p,
+    new Promise((_resolve, reject) => setTimeout(() => reject(new Error(`${label} 挂死超时（${ms}ms）`)), ms))
+  ])
+  await assert.rejects(() => withTimeout(runLoop('not-a-function'), 2000, 'runLoop(string)'), /runLoop 需要函数|挂死超时/, '非函数 run 应 reject')
+  await assert.rejects(() => withTimeout(runLoop(123), 2000, 'runLoop(number)'), /runLoop 需要函数|挂死超时/, '数字 run 应 reject')
+  await assert.rejects(() => withTimeout(runLoop(null), 2000, 'runLoop(null)'), /runLoop 需要函数|挂死超时/, 'null run 应 reject')
 
   // ===== runLoop：signal 初始 aborted → run 一次都不执行 =====
   const c4 = new AbortController()
@@ -111,22 +134,29 @@ const { runLoop, sleep } = require('./xbk_loop')
   assert.ok(timeoutErrors >= 1, `onInterval 超时应触发 INTERVAL_REFRESH_TIMEOUT，实际 ${timeoutErrors} 次`)
 
   // ===== runLoop：onInterval 运行期间 abort 触发 runBounded ABORT_ERR =====
+  // #24 修复：原用例 setTimeout(abort, 20) 延迟过短，在 CI 高负载下可能在 onInterval
+  // 真正开始前就触发 abort（走"预先 abort"路径，while 循环条件直接退出），与注释所述不符。
+  // 修复：① 延长 abort 到 80ms（onInterval sleep 200ms，确保已在运行）；
+  //       ② 添加 onIntervalStarted 标记，验证 onInterval 确实被执行过；
+  //       ③ 断言 abortErrors >= 1 且 onIntervalStarted === true，双重验证路径正确。
   const c9 = new AbortController()
   let runs9 = 0
   let abortErrors = 0
+  let onIntervalStarted = false
   await runLoop(async () => {
     runs9 += 1
-    if (runs9 === 1) setTimeout(() => c9.abort(), 20) // 第一轮 onInterval 运行期间 abort
+    if (runs9 === 1) setTimeout(() => c9.abort(), 80) // 80ms 后 abort，确保 onInterval（200ms）已在运行
   }, {
     intervalMs: 0,
     refreshEvery: 1,
     signal: c9.signal,
     onIntervalTimeoutMs: 10000, // 很长的超时，避免超时干扰
-    onInterval: async () => { await sleep(200) }, // 长时间运行，等待 abort
+    onInterval: async () => { onIntervalStarted = true; await sleep(200) }, // 标记已开始 + 长时间运行等待 abort
     onIntervalError: async (e) => {
       if (e && e.code === 'ABORT_ERR') abortErrors += 1
     }
   })
+  assert.ok(onIntervalStarted, 'onInterval 应确实被执行过（非预先 abort 路径）')
   assert.ok(abortErrors >= 1, `onInterval 运行期间 abort 应触发 ABORT_ERR，实际 ${abortErrors} 次`)
 
   console.log('test_loop_utils OK')

@@ -243,6 +243,11 @@ try {
   })
 
   check('analyze 遍历 mutation-report-* 子目录并跳过普通目录', () => {
+    // 显式创建一个普通目录（非 mutation-report-* 前缀），验证被跳过
+    const plainDir = path.join(tmp, 'reports')
+    fs.mkdirSync(plainDir, { recursive: true })
+    fs.writeFileSync(path.join(plainDir, 'mutation.json'), '{}') // 即使有 mutation.json 也不应被收录
+
     const results = analyze(tmp)
     assert.ok(Array.isArray(results), '应返回数组')
     assert.ok(results.length > 0, 'tmp 下有多个 mutation-report-* 子目录')
@@ -251,8 +256,8 @@ try {
     // 包含已知段
     const segs = results.map(r => r.seg)
     assert.ok(segs.includes('utils'), '应包含 utils 段')
-    // 普通目录（如 reports/）不应被包含
-    assert.ok(!segs.some(s => s === 'reports' || s.includes('reports')), '应跳过非 mutation-report-* 目录')
+    // 普通目录（如 reports/）不应被包含——精确匹配 seg 名，而非宽松 includes
+    assert.ok(!segs.includes('reports'), '应跳过非 mutation-report-* 目录（reports 不应出现在结果中）')
   })
 
   check('analyze 空目录返回空数组', () => {
@@ -385,6 +390,16 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     const postBody = JSON.parse(createRes.capturedOpts.body)
     assert.ok(postBody.title.includes('变异测试日报'), 'title 应包含日报前缀')
     assert.strictEqual(postBody.body, 'test body content')
+    // #30 修复：验证列表查询和创建请求的 method/per_page/creator 参数（篡改存活）
+    // 列表查询：GET 方法，URL 含 per_page=100 和 creator=github-actions[bot]
+    assert.ok(listRes.capturedOpts.method === undefined || listRes.capturedOpts.method === 'GET', '列表查询应为 GET（默认或显式）')
+    assert.ok(listRes.capturedUrl.includes('per_page=100'), '列表查询 URL 应包含 per_page=100')
+    assert.ok(listRes.capturedUrl.includes('creator='), '列表查询 URL 应包含 creator 过滤参数')
+    assert.ok(listRes.capturedUrl.includes('github-actions'), 'creator 应为 github-actions[bot]')
+    // 创建请求：POST 方法，Content-Type 为 application/json
+    assert.strictEqual(createRes.capturedOpts.method, 'POST', '创建 Issue 应为 POST 方法')
+    assert.strictEqual(createRes.capturedOpts.headers['Content-Type'], 'application/json', '创建请求 Content-Type 应为 application/json')
+    assert.ok(createRes.capturedOpts.headers.Authorization.includes('test-token'), '创建请求应携带 Authorization token')
   })
 
   await acheck('postIssue 列表查询失败时跳过去重直接创建', async () => {
@@ -408,7 +423,8 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
   })
 
   // 恢复原始环境变量和 fetch
-  process.env.GITHUB_TOKEN = ORIG_TOKEN
+  // #29 修复：ORIG_TOKEN 为 undefined 时必须 delete，而非赋值字符串 "undefined"
+  if (ORIG_TOKEN !== undefined) process.env.GITHUB_TOKEN = ORIG_TOKEN; else delete process.env.GITHUB_TOKEN
   if (ORIG_REPO) process.env.GITHUB_REPOSITORY = ORIG_REPO; else delete process.env.GITHUB_REPOSITORY
   global.fetch = ORIG_FETCH
 

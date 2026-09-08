@@ -12,27 +12,48 @@ const Utils = createUtils({ safeRe })
 // 行 176：解析失败返回 null
 assert.strictEqual(Utils.parseTime('not-a-date-at-all'), null, '无效日期应返回 null')
 
-// 行 226：YYYY/MM/DD 格式（无时区标记）→ 补 Z 按 UTC 解析
+// 行 191-199：_parseSlashDate 显式分支（YYYY/MM/DD 按 UTC 解析，回读校验拒绝非法日期）
+// 注意：此格式被 _parseSlashDate 拦截，不会走到 _parseFallback 的补 Z 分支（#32 修正口径）
 const slashDate = Utils.parseTime('2026/09/08')
 assert.ok(slashDate !== null && slashDate > 0, 'YYYY/MM/DD 应解析为有效时间戳')
 assert.strictEqual(new Date(slashDate).getUTCFullYear(), 2026, '年份应为 2026')
 assert.strictEqual(new Date(slashDate).getUTCMonth(), 8, '月份应为 9 月(0-indexed=8)')
 assert.strictEqual(new Date(slashDate).getUTCDate(), 8, '日期应为 8 号')
 
-// 行 228-230：空格分隔无时区标记（'2026-09-08 10:30:00'）→ 补 Z
+// 行 164-178：_parseDateTimeNoTz 显式分支（空格分隔无时区按 UTC 解析）
+// 注意：此格式被 _parseDateTimeNoTz 拦截，不会走到 _parseFallback 的补 Z 分支（#32 修正口径）
 const spaceDate = Utils.parseTime('2026-09-08 10:30:00')
 assert.ok(spaceDate !== null && spaceDate > 0, '空格分隔日期应解析为有效时间戳')
 assert.strictEqual(new Date(spaceDate).getUTCHours(), 10, 'UTC 小时应为 10')
 assert.strictEqual(new Date(spaceDate).getUTCMinutes(), 30, 'UTC 分钟应为 30')
 
-// ===== sanitizeDecodedHtml：CSS 转义分支 =====
-// 行 456：CSS 恒等转义 \r → r（随后黑名单拦截）
-const cssIdent = Utils.sanitizeDecodedHtml('\\r')
-assert.ok(typeof cssIdent === 'string', '\\r 转义应返回字符串')
+// #32 修复：真正触达 _parseFallback 补 Z 分支的用例
+// 注意：_parseFallback 第225行（YYYY/MM/DD 补 Z）是死代码——_parseSlashDate 已完全拦截该格式
+// （匹配则返回时间戳，非法则返回 null 导致 parseTime 提前返回），永远不会走到 _parseFallback。
+// _parseFallback 第227行（ISO/空格无时区补 Z）：需绕过 _parseDateTimeNoTz——用超过3位毫秒的格式
+// （如 2026-09-08T10:30:00.123456），_parseDateTimeNoTz 的毫秒正则 \d{1,3} 不匹配，走到 _parseFallback。
+const fallbackIso = Utils.parseTime('2026-09-08T10:30:00.123456')
+assert.ok(fallbackIso !== null && fallbackIso > 0, '超长毫秒 ISO 日期应走 _parseFallback 补 Z 分支')
+assert.strictEqual(new Date(fallbackIso).getUTCFullYear(), 2026, '_parseFallback 补 Z 后年份应为 2026')
+assert.strictEqual(new Date(fallbackIso).getUTCHours(), 10, '_parseFallback 补 Z 后 UTC 小时应为 10')
 
-// 行 457：\\ 后接换行 → CSS 行延续，移除
+// ===== sanitizeDecodedHtml：CSS 转义分支 =====
+// #33 修复：从仅 typeof==='string'（不崩即过）升级为具体返回值断言
+// 输入 '\\r'（反斜杠+r，非回车符）：sanitizeDecodedHtml 不做 CSS 转义，原样返回
+const cssIdent = Utils.sanitizeDecodedHtml('\\r')
+assert.strictEqual(cssIdent, '\\r', '\\r（反斜杠+r）应原样返回（非 CSS 转义上下文）')
+assert.ok(typeof cssIdent === 'string', '返回值应为字符串')
+
+// 输入 'abc\\\ndef'（反斜杠+换行）：原样返回（sanitizeDecodedHtml 不处理 CSS 行延续）
 const cssLineCont = Utils.sanitizeDecodedHtml('abc\\\ndef')
-assert.ok(typeof cssLineCont === 'string', '\\\n 行延续应返回字符串')
+assert.strictEqual(cssLineCont, 'abc\\\ndef', '\\\n（反斜杠+换行）应原样返回')
+assert.ok(typeof cssLineCont === 'string', '返回值应为字符串')
+
+// 额外行为断言：主动标签应被移除（验证 sanitizeDecodedHtml 真正执行了清洗逻辑，而非恒等桩）
+const scriptInput = 'before<script>alert(1)</script>after'
+const scriptOutput = Utils.sanitizeDecodedHtml(scriptInput)
+assert.ok(!scriptOutput.includes('alert(1)'), 'script 标签内容应被移除')
+assert.ok(scriptOutput.includes('before') && scriptOutput.includes('after'), '前后文本应保留')
 
 // ===== safeErrorText：错误文本提取分支 =====
 // 行 697：error 有 code 属性（无 message）→ 返回 code
