@@ -9,13 +9,13 @@ const { runTests, evaluate } = require('./run_mutation')
 
 ;(async () => {
   // ===== runTests：子进程运行测试的 3 种场景 =====
-  // runTests 在指定目录运行 DEFAULT_TEST=['node', 'test_filter.js']
+  // runTests 在指定目录运行 DEFAULT_TEST=['node', 'run_unit_tests.js']
 
   // 场景 1：测试通过（process.exit(0) + 输出汇总）→ status='pass'
   {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-pass-'))
     try {
-      fs.writeFileSync(path.join(dir, 'test_filter.js'), `
+      fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
         console.log('3 通过, 0 失败, 共 3')
         process.exit(0)
       `)
@@ -32,7 +32,7 @@ const { runTests, evaluate } = require('./run_mutation')
   {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-fail-'))
     try {
-      fs.writeFileSync(path.join(dir, 'test_filter.js'), `
+      fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
         console.error('测试失败')
         process.exit(1)
       `)
@@ -48,7 +48,7 @@ const { runTests, evaluate } = require('./run_mutation')
   {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-timeout-'))
     try {
-      fs.writeFileSync(path.join(dir, 'test_filter.js'), `
+      fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
         while (true) {}
       `)
       const result = await runTests(dir, 500) // 500ms 超时
@@ -59,9 +59,9 @@ const { runTests, evaluate } = require('./run_mutation')
   }
 
   // ===== evaluate：复制项目→应用变异→运行测试→清理 =====
-  // evaluate 会复制 ROOT 下的 test_filter.js + files + node_modules 符号链接，
+  // evaluate 会复制 ROOT 下的 run_unit_tests.js + files + node_modules 符号链接，
   // 然后应用变异，运行测试，最后清理临时目录（finally 块）。
-  // 注意：test_filter.js 依赖其他项目文件，临时目录中可能运行失败，
+  // 注意：run_unit_tests.js 依赖其他项目文件，临时目录中可能运行失败，
   // 但 evaluate 函数本身的代码路径（复制/变异/运行/清理）已被覆盖。
 
   // 场景：无变异（mutants=[]）→ evaluate 正常运行并返回结果
