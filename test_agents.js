@@ -80,13 +80,14 @@ const {
   // 场景 2：并发去重 → 同一 key 的并发调用只发起一次真实解析，两个回调都被派发
   await new Promise((resolve, reject) => {
     let callCount = 0
-    const cb1 = () => { callCount += 1; if (callCount === 2) resolve() }
-    const cb2 = () => { callCount += 1; if (callCount === 2) resolve() }
+    // 5 秒超时兜底（DNS 解析不应超过 5 秒）；settled 后 clearTimeout，避免已成功仍空转 5s
+    const timer = setTimeout(() => reject(new Error('dnsLookup 并发去重超时')), 5000)
+    const done = () => { clearTimeout(timer); resolve() }
+    const cb1 = () => { callCount += 1; if (callCount === 2) done() }
+    const cb2 = () => { callCount += 1; if (callCount === 2) done() }
     // 用不同的 hostname 避免命中之前的缓存
     dnsLookup('localhost.localdomain', {}, cb1)
     dnsLookup('localhost.localdomain', {}, cb2)
-    // 5 秒超时兜底（DNS 解析不应超过 5 秒）
-    setTimeout(() => reject(new Error('dnsLookup 并发去重超时')), 5000)
   })
 
   // ===== prewarmDns：基本解析 + abort 取消 =====
@@ -103,7 +104,7 @@ const {
   ac.abort()
   const abortedResult = await prewarmDns('localhost', ac.signal)
   assert.strictEqual(abortedResult.ok, false, 'aborted 时 ok 应为 false')
-  assert.ok(abortedResult.error.includes('abort') || abortedResult.cancelled === true, 'aborted 时应包含取消信息')
+  assert.ok(abortedResult.error?.includes('abort') || abortedResult.cancelled === true, 'aborted 时应包含取消信息')
 
   console.log('test_agents OK')
 })().catch((e) => { console.error(e); process.exit(1) })

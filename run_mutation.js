@@ -97,6 +97,8 @@ function copyProject (dir, files) {
   const srcFiles = entries.filter(f => /^xbk_.*\.js$/.test(f))
   const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'package.json']
   for (const name of [...extraTop, ...testFiles, ...srcFiles, ...files]) {
+    // 信任边界防护：拒绝目录穿越/绝对路径，确保只复制 ROOT 内文件
+    if (name.includes('..') || path.isAbsolute(name)) throw new Error(`copyProject 拒绝越界路径: ${name}`)
     const src = path.join(ROOT, name)
     if (!fs.existsSync(src)) continue
     const dst = path.join(dir, name)
