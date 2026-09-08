@@ -10,8 +10,9 @@ const safeRe = (src, flags) => new RegExp(src, flags)
 const Utils = createUtils({ safeRe })
 
 let pass = 0
+let fail = 0
 function check (name, fn) {
-  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
+  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { fail++; console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
 }
 
 console.log('=== xbk_utils.js 纯函数扩展测试 ===')
@@ -293,4 +294,4 @@ check('safeErrorText: message 非字符串转字符串', () => {
   assert.strictEqual(Utils.safeErrorText({ message: 123 }), '123')
 })
 
-console.log(`\n🎉 test_utils_pure.js 全部通过（${pass} 项）`)
+console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

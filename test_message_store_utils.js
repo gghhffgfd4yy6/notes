@@ -32,8 +32,9 @@ const store = createMessageStore({
 })
 
 let pass = 0
+let fail = 0
 function check (name, fn) {
-  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
+  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { fail++; console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
 }
 
 console.log('=== xbk_message_store.js 纯函数方法测试 ===')
@@ -180,4 +181,4 @@ check('getFileName: 末段全为控制字符回退 default', () => {
   assert.strictEqual(r, 'default.json', '末段全为控制字符应回退 default')
 })
 
-console.log(`\n🎉 test_message_store_utils.js 全部通过（${pass} 项）`)
+console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

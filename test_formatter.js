@@ -38,8 +38,9 @@ const safeRe = (src, flags) => new RegExp(src, flags)
 const formatter = createFormatter({ Utils: mockUtils, safeRe })
 
 let pass = 0
+let fail = 0
 function check (name, fn) {
-  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
+  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { fail++; console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
 }
 
 console.log('=== xbk_formatter.js 测试 ===')
@@ -278,4 +279,4 @@ check('createFormatter: safeRe 非函数 → 抛 TypeError', () => {
   assert.throws(() => createFormatter({ Utils: mockUtils, safeRe: 'notafunction' }), TypeError)
 })
 
-console.log(`\n🎉 test_formatter.js 全部通过（${pass} 项）`)
+console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_formatter.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

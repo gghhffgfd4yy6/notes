@@ -9,6 +9,7 @@
     "lint": "standard",
     "lint:fix": "standard --fix",
     "test": "node run_tests.js",
+    "test:unit": "node run_unit_tests.js",
     "test:filter": "node test_filter.js",
     "test:mutation-json": "node test_mutation_json.js",
     "test:mutation-report": "node test_mutation_report.js",

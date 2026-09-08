@@ -1,27 +1,25 @@
 'use strict'
 // ============================================================
-// 统一测试入口：一键执行三套测试 + 汇总报告 + 退出码
-// 用法：node run_tests.js   （或 npm test）
-// 退出码：0 = 全部通过，非 0 = 有失败（CI/调度可感知）
+// 单元测试入口：只跑快速单元测试，排除集成测试（慢/可能有网络）
+// 用法：node run_unit_tests.js   （或 npm run test:unit）
+// 用途：CI 门禁 + 变异测试 runner，确保新增测试文件不会漏网
 // ============================================================
 const { execFileSync } = require('child_process')
 const path = require('path')
-const { checkDependencies } = require('./scripts/check-deps')
-
 const { SUITES } = require('./test_suites')
+
+const UNIT_SUITES = SUITES.filter(s => !s.integration)
 
 const results = []
 console.log('══════════════════════════════════════════════')
-console.log('  xbk-push 统一测试入口')
+console.log('  xbk-push 单元测试入口（排除集成测试）')
+console.log(`  共 ${UNIT_SUITES.length} 个套件`)
 console.log('══════════════════════════════════════════════\n')
 
-if (!checkDependencies()) process.exit(1)
-
-for (const s of SUITES) {
+for (const s of UNIT_SUITES) {
   const file = path.join(__dirname, s.file)
   const t0 = Date.now()
   try {
-    // 继承 stdout/stderr（各套件自己的 ✅/❌ 输出直接透传），捕获退出码
     execFileSync(process.execPath, [file], { stdio: 'inherit' })
     const ms = Date.now() - t0
     results.push({ ...s, ok: true, ms })

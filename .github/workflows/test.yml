@@ -103,6 +103,11 @@ jobs:
       - name: 青龙工具函数测试（test_qinglong_utils.js）
         run: npm run test:qinglong-utils
 
+      # 全量单元测试门禁：跑 run_unit_tests.js（26个单元测试套件），
+      # 确保新增测试文件不会因未单独列出而漏网（#100/#101 曾因此红测合入）。
+      - name: 全量单元测试（run_unit_tests.js）
+        run: npm run test:unit
+
       # 集成测试策略：先跑并行调度版，成功则跳过串行完整版（省时间）；
       # 并行失败时不立即判定失败，再跑串行完整版兜底（并行可能因调度/flaky 失败）。
       # 兜底成功则整体通过，兜底失败才判定集成测试失败。
