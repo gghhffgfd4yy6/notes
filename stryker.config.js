@@ -10,7 +10,10 @@ const concurrency = Number.isInteger(requestedConcurrency) && requestedConcurren
 module.exports = {
   testRunner: 'command',
   commandRunner: {
-    command: 'PERF_MS=3000 node test_filter.js'
+    // 变异测试使用全量单元测试入口（run_unit_tests.js，26+套件），而非仅 test_filter.js。
+    // 此前只跑 test_filter.js 导致 test_formatter.js / test_sendnotify_pure.js 等新增套件
+    // 对变异分数完全无效（#100/#101 根因）。全量入口确保新增测试不会漏网。
+    command: 'node run_unit_tests.js'
   },
   mutate: [
     'xbk_function_v3.js',

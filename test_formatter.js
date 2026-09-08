@@ -5,7 +5,9 @@
 const assert = require('node:assert')
 const { createFormatter } = require('./xbk_formatter')
 
-// Mock Utils：只实现 formatter 用到的方法，行为与 xbk_utils.js 一致
+// Mock Utils：只实现 formatter 用到的方法，为简化桩（非真实 Utils 完整行为）
+// 注意：truncateUtf16/sanitizeDecodedHtml/sanitizeSurrogates 等为恒等/简化实现，
+// 与 xbk_utils.js 真实行为存在差异，仅用于隔离 formatter 自身逻辑。
 const mockUtils = {
   safeObjectCopy: (obj) => JSON.parse(JSON.stringify(obj)),
   truncateUtf16: (str, len) => str.slice(0, len),

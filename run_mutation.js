@@ -85,11 +85,29 @@ function collectMutants (files) {
 
 function copyProject (dir, files) {
   fs.mkdirSync(dir, { recursive: true })
-  for (const name of ['test_filter.js', 'package.json', ...files]) {
+  // 变异测试运行 run_unit_tests.js（全量单元测试入口），需复制其依赖的全部文件：
+  //   - 测试入口与套件清单：run_unit_tests.js / test_suites.js
+  //   - 所有 test_*.js（单元测试会 require 对应 xbk_*.js 源文件）
+  //   - 所有 xbk_*.js 生产源文件（测试依赖；变异目标 files 也在其中）
+  //   - scripts/ 与 qinglong/ 目录（部分测试依赖）
+  // 此前只复制 test_filter.js 但运行 run_unit_tests.js，导致临时目录 MODULE_NOT_FOUND，
+  // evaluate 恒返回 fail，行为断言无法建立（#15 根因）。
+  const entries = fs.readdirSync(ROOT)
+  const testFiles = entries.filter(f => /^test_.*\.js$/.test(f))
+  const srcFiles = entries.filter(f => /^xbk_.*\.js$/.test(f))
+  const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'package.json']
+  for (const name of [...extraTop, ...testFiles, ...srcFiles, ...files]) {
     const src = path.join(ROOT, name)
+    if (!fs.existsSync(src)) continue
     const dst = path.join(dir, name)
     fs.mkdirSync(path.dirname(dst), { recursive: true })
     fs.copyFileSync(src, dst)
+  }
+  for (const sub of ['scripts', 'qinglong']) {
+    const srcDir = path.join(ROOT, sub)
+    if (fs.existsSync(srcDir)) {
+      fs.cpSync(srcDir, path.join(dir, sub), { recursive: true })
+    }
   }
   fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(dir, 'node_modules'), 'dir')
 }

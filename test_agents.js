@@ -55,5 +55,57 @@ const {
   assert.strictEqual(invalidateDns(123), 0, '非字符串 hostname 返回 0')
   assert.strictEqual(invalidateDns('no.such.host.in.cache.example'), 0, '未缓存 hostname 返回 0')
 
+  // ===== dnsLookup：缓存命中 + 缓存未命中 + 并发去重 =====
+  // #19 修复：此前 dnsLookup 完全未被测试，导致 xbk_agents 分支覆盖率标称 100% 但实测 63-77%。
+  const { dnsLookup } = require('./xbk_agents')
+
+  // 场景 1：缓存未命中 → 真实解析后回调，且第二次调用命中缓存（更快）
+  await new Promise((resolve, reject) => {
+    const t0 = Date.now()
+    dnsLookup('localhost', {}, (err, address, family) => {
+      if (err) { reject(err); return }
+      const firstMs = Date.now() - t0
+      // 第二次调用应命中缓存（queueMicrotask 派发，远快于真实解析）
+      const t1 = Date.now()
+      dnsLookup('localhost', {}, (err2, address2, family2) => {
+        if (err2) { reject(err2); return }
+        const secondMs = Date.now() - t1
+        assert.strictEqual(address, address2, '缓存命中应返回相同 address')
+        assert.strictEqual(family, family2, '缓存命中应返回相同 family')
+        // 缓存命中通过 queueMicrotask 派发，应远快于第一次真实解析（留 100ms 余量防 CI 抖动）
+        assert.ok(secondMs < 100, `缓存命中应快速返回，实际 ${secondMs}ms`)
+        resolve()
+      })
+    })
+  })
+
+  // 场景 2：并发去重 → 同一 key 的并发调用只发起一次真实解析，两个回调都被派发
+  await new Promise((resolve, reject) => {
+    let callCount = 0
+    const cb1 = () => { callCount += 1; if (callCount === 2) resolve() }
+    const cb2 = () => { callCount += 1; if (callCount === 2) resolve() }
+    // 用不同的 hostname 避免命中之前的缓存
+    dnsLookup('localhost.localdomain', {}, cb1)
+    dnsLookup('localhost.localdomain', {}, cb2)
+    // 5 秒超时兜底（DNS 解析不应超过 5 秒）
+    setTimeout(() => reject(new Error('dnsLookup 并发去重超时')), 5000)
+  })
+
+  // ===== prewarmDns：基本解析 + abort 取消 =====
+  const { prewarmDns } = require('./xbk_agents')
+
+  // 场景 1：正常解析 → 返回 ok=true
+  const prewarmResult = await prewarmDns('localhost')
+  assert.strictEqual(prewarmResult.hostname, 'localhost', '应返回 hostname')
+  assert.ok(typeof prewarmResult.ok === 'boolean', 'ok 应为布尔值')
+  assert.ok(typeof prewarmResult.elapsedMs === 'number', 'elapsedMs 应为数字')
+
+  // 场景 2：已 aborted signal → 立即返回 cancelled
+  const ac = new AbortController()
+  ac.abort()
+  const abortedResult = await prewarmDns('localhost', ac.signal)
+  assert.strictEqual(abortedResult.ok, false, 'aborted 时 ok 应为 false')
+  assert.ok(abortedResult.error.includes('abort') || abortedResult.cancelled === true, 'aborted 时应包含取消信息')
+
   console.log('test_agents OK')
 })().catch((e) => { console.error(e); process.exit(1) })

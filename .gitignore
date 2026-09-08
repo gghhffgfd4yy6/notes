@@ -5,6 +5,7 @@ push_config.local.js
 .tools/
 .stryker-tmp/
 reports/
+coverage/
 mutation-progress.json
 mutation-report.json
 cleanup_rootfs_junk.sh
