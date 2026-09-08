@@ -29,6 +29,7 @@ const SUITES = [
   { name: '状态报告解析', file: 'test_status_report.js', desc: 'scripts/status.js parseLastRun invalid 分支（run.log 无匹配行）' },
   { name: '规则引擎校验', file: 'test_rules.js', desc: 'xbk_rules.js 嵌套量词检测/pingbitime 首尾空白/缺少分隔符' },
   { name: '工具函数', file: 'test_utils.js', desc: 'xbk_utils.js 日期解析/CSS转义/safeErrorText/filterHash 9个纯函数分支' },
+  { name: '格式化器', file: 'test_formatter.js', desc: 'xbk_formatter.js HTML→Markdown转换+模板替换+内部方法边界（47项，提升变异分数）' },
   { name: '单元测试', file: 'test_filter.js', desc: '主代码导出函数逐函数逻辑' },
   { name: '变异报告读取', file: 'test_mutation_json.js', desc: '超大 mutation.json 剥离 statusReason 解析（v3.264）' },
   { name: '变异报告渲染', file: 'test_mutation_report.js', desc: 'render 函数 markdown 输出快照（v3.266 重构验证）' },
