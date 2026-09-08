@@ -15,12 +15,9 @@ const mockUtils = {
     return url.replace(/[\r\n]+/g, '').trim()
   },
   sanitizeDecodedHtml: (str) => str,
-  decodeHtmlEntities: (str) => str
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'"),
+  decodeHtmlEntities: (str) => str.replace(/&(lt|gt|amp|quot|#39);/g, (m, name) => ({
+    lt: '<', gt: '>', amp: '&', quot: '"', '#39': "'"
+  }[name] || m)),
   safeText: (val) => {
     if (val === undefined || val === null) return ''
     return String(val)
@@ -162,8 +159,7 @@ check('<style>css</style> → 移除样式', () => {
 // ===== 9. 带 url 的原文链接 =====
 check('带 url → 追加原文链接', () => {
   const r = formatter.htmlToMarkdown({ content_html: '内容', url: 'https://example.com/article' })
-  assert.ok(r.includes('原文链接'), '应追加原文链接')
-  assert.ok(r.includes('https://example.com/article'), '应包含 url')
+  assert.strictEqual(r, '内容\n\n原文链接：[https://example.com/article](https://example.com/article)')
 })
 
 check('带 url 且 url 含空格 → 原文链接用 <> 包裹', () => {
