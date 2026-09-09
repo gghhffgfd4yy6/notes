@@ -34,6 +34,9 @@ module.exports = {
     'qinglong/xbk_push.js'
   ],
   coverageAnalysis: 'off',
+  // 纯 JS 项目无需类型检查注入；Stryker 默认往沙箱文件首行插 "// @ts-nocheck"，
+  // 会使 test_mutation_ranges 在沙箱里数出的行数 +1/+2（426→427），初始测试必红（CI run #120 根因）。
+  disableTypeChecks: false,
   concurrency,
   // v3.273：从 90s 增加到 180s，因为 run_unit_tests.js 跑 26 个套件比只跑 test_filter.js 慢。
   timeoutMS: 180000,

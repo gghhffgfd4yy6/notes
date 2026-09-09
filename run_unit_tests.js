@@ -8,7 +8,10 @@ const { execFileSync } = require('child_process')
 const path = require('path')
 const { SUITES } = require('./test_suites')
 
-const UNIT_SUITES = SUITES.filter(s => !s.integration)
+const UNIT_SUITES = SUITES.filter(s => !s.integration && !s.mutationSkip)
+// mutationSkip：ranges 元校验在 Stryker 沙箱内跑不了——被 --mutate 的目标文件
+// 会被插桩注入，行数膨胀（426→704），数行数必误报（CI run #120 v3-entry/sendnotify 根因）。
+// 它们仍由 npm test（run_tests.js 全量清单）逐个执行，CI 门禁不降级。
 
 const results = []
 console.log('══════════════════════════════════════════════')
