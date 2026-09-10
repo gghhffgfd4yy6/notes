@@ -49,12 +49,13 @@ try {
       '{broken json',
       JSON.stringify({ type: 'item', id: 'x' }),
       JSON.stringify({ type: 'run', at: '2026-09-08 11:00:00', total: 10, dedup: 3, filtered: 4, passed: 5, byReason: { title: 3, category: 1 }, detailCount: 4 }),
+      JSON.stringify({ type: 'run', at: '2026-09-08 12:00:00', total: 20, dedup: 6, filtered: 8, passed: 10, byReason: { title: 6, category: 2 }, detailCount: 8 }),
       JSON.stringify({ type: 'run', total: 'bad' })
     ].join('\n') + '\n')
     const status = readStatus(tmp)
     assert.strictEqual(status.diagnostics.status, 'ok', '应跳过损坏行找到有效记录')
-    assert.strictEqual(status.diagnostics.value.total, 10, '有效记录的 total 应为 10')
-    assert.deepStrictEqual(status.diagnostics.value.byReason, { title: 3, category: 1 }, 'byReason 应完整保留')
+    assert.strictEqual(status.diagnostics.value.total, 20, '应返回最后有效记录的 total=20，而非第一条的 10')
+    assert.deepStrictEqual(status.diagnostics.value.byReason, { title: 6, category: 2 }, '最后有效记录的 byReason 应完整保留')
   })
 
   // ===== formatStatus：channels.value 为 null（status ok 但 value null）时降级 =====

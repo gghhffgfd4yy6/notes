@@ -23,6 +23,11 @@ function test (name, fn) {
   // 最高风险契约：10s 超时后必须 reject，且 error.failures 含 PUSH_TIMEOUT
   await test('P1 超时 reject 且 failures 含 PUSH_TIMEOUT（探针）', async () => {
     const originalSetTimeout = global.setTimeout
+    // 看门狗：若实现 bug 导致超时分支不 settle，5 秒后强制失败而非无限挂起
+    let watchdogTimer
+    const watchdog = new Promise((_resolve, reject) => {
+      watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未在预期时间内 settle')), 5000)
+    })
     // mock：setTimeout 立即执行回调，模拟 10s 超时已到
     global.setTimeout = (fn) => { fn(); return originalSetTimeout(() => {}, 0) }
     try {
@@ -39,7 +44,7 @@ function test (name, fn) {
       let rejected = false
       let err
       try {
-        await p.send('text', 'desp', notifyMod)
+        await Promise.race([p.send('text', 'desp', notifyMod), watchdog])
       } catch (e) {
         rejected = true
         err = e
@@ -52,6 +57,7 @@ function test (name, fn) {
       assert.strictEqual(err.failures[0].channel, 'ch1', 'failure.channel 应对应配置通道名')
       assert.strictEqual(err.failures[1].channel, 'ch2', '第二个通道名应正确')
     } finally {
+      clearTimeout(watchdogTimer)
       global.setTimeout = originalSetTimeout
     }
   })
@@ -84,7 +90,7 @@ function test (name, fn) {
   await test('P6 isTagNameBoundary 各边界字符', () => {
     assert.strictEqual(isTagNameBoundary('<div>', 4), true, '> 是边界')
     assert.strictEqual(isTagNameBoundary('<div ', 4), true, '空白是边界')
-    assert.strictEqual(isTagNameBoundary('<br/>', 4), true, '/ 后跟 > 是边界')
+    assert.strictEqual(isTagNameBoundary('<br/>', 3), true, '/ 后跟 > 是边界（索引 3 指向 /）')
     assert.strictEqual(isTagNameBoundary('<divx', 4), false, '普通字母不是边界')
     assert.strictEqual(isTagNameBoundary('<div', 4), true, '字符串末尾 undefined 是边界')
   })
