@@ -118,16 +118,21 @@ jobs:
       - name: 状态面板测试（test_status.js）
         run: npm run test:status
 
-      # mutationSkip 套件：对 check-mutation-ranges.js 的单元测试。
+      # mutationSkip 套件：被 run_unit_tests.js 跳过，必须在 CI 显式覆盖。
       # 仅因 Stryker 沙箱插桩会行数膨胀跑不了而标记 mutationSkip，CI 可正常独立运行。
       - name: 变异范围校验测试（test_check_mutation_ranges.js）
         run: npm run test:check-mutation-ranges
 
+      # 命名区分：test:mutation-ranges 跑生产脚本 scripts/check-mutation-ranges.js；
+      # test:mutation-ranges-unit 跑对它的单元测试 test_mutation_ranges.js。
       - name: 变异范围测试（test_mutation_ranges.js）
-        run: npm run test:mutation-ranges-suite
+        run: npm run test:mutation-ranges-unit
 
-      # 全量单元测试门禁：跑 run_unit_tests.js（26个单元测试套件），
+      # 全量单元测试门禁：跑 run_unit_tests.js（25个单元测试套件，已排除 integration/mutationSkip），
       # 确保新增测试文件不会因未单独列出而漏网（#100/#101 曾因此红测合入）。
+      # 与工作流中逐个列出的显式步骤互补：显式步骤用于失败时快速定位具体套件，
+      # 本步骤用于兜底防漏网，因此部分非集成套件会执行两次——这是有意的时间换可定位性，非疏漏。
+      # （标记 integration/mutationSkip 的套件不在本入口内，已在本工作流的其他步骤中显式覆盖。）
       - name: 全量单元测试（run_unit_tests.js）
         run: npm run test:unit
 

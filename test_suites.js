@@ -1,6 +1,13 @@
 'use strict'
 // 测试套件清单：run_tests.js 和 run_unit_tests.js 共用
-// integration: true 表示集成测试（慢/可能有网络），单元测试入口会跳过
+// integration: true 表示集成测试（慢/可能有网络），单元测试入口（run_unit_tests.js）会跳过
+// mutationSkip: true 表示在 Stryker 沙箱内无法运行（被 --mutate 目标插桩后行数膨胀，
+//   导致 test_mutation_ranges/check-mutation-ranges 的行段元校验误报），同样由单元入口跳过
+//
+// ⚠️ 被标记 integration / mutationSkip 的套件不会进入 run_unit_tests.js，
+//    因此必须在 .github/workflows/test.yml 中显式列出对应步骤，否则将脱离 CI 门禁
+//    （相关代码回归可通过 PR，历史上多次发生）。反之，未标记的套件由 run_unit_tests.js
+//    统一执行，CI 中即便不再单独列出也不会漏网。
 const SUITES = [
   { name: '依赖预检', file: 'test_check_deps.js', desc: 'checkDependencies 缺失/损坏分支' },
   { name: '常驻循环', file: 'test_loop.js', desc: '长驻调度、单轮异常隔离、停止信号', integration: true },
