@@ -90,6 +90,21 @@ const {
     dnsLookup('localhost.localdomain', {}, cb2)
   })
 
+  // ===== invalidateDns：缓存命中时删除并返回计数 =====
+  // 先清除可能存在的缓存，再 dnsLookup 填充，最后 invalidateDns 断言删除数 > 0
+  const invalidateHost = 'localhost'
+  invalidateDns(invalidateHost) // 预清除，确保计数从 0 开始
+  await new Promise((resolve, reject) => {
+    dnsLookup(invalidateHost, {}, (err) => {
+      if (err) { reject(err); return }
+      resolve()
+    })
+  })
+  const removed = invalidateDns(invalidateHost)
+  assert.ok(removed > 0, `invalidateDns 缓存命中应返回删除数 > 0，实际 ${removed}`)
+  const removedAgain = invalidateDns(invalidateHost)
+  assert.strictEqual(removedAgain, 0, '缓存已删除后再次调用应返回 0')
+
   // ===== prewarmDns：基本解析 + abort 取消 =====
   const { prewarmDns } = require('./xbk_agents')
 

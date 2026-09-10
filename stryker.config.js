@@ -11,9 +11,9 @@ module.exports = {
   testRunner: 'command',
   commandRunner: {
     // 变异测试使用全量单元测试入口（run_unit_tests.js，26+套件），而非仅 test_filter.js。
-    // 此前只跑 test_filter.js 导致 test_formatter.js / test_sendnotify_pure.js 等新增套件
-    // 对变异分数完全无效（#100/#101 根因）。全量入口确保新增测试不会漏网。
-    command: 'node run_unit_tests.js'
+    // 此前只跑 test_filter.js 导致 PR #100/#101 新增的 238 项测试对变异分数完全无效（issue #106）。
+    // PERF_MS=3000：变异测试开销下放宽 test_filter.js 性能断言阈值（默认500ms），避免误判 Killed。
+    command: 'PERF_MS=3000 node run_unit_tests.js'
   },
   mutate: [
     'xbk_function_v3.js',
@@ -34,8 +34,12 @@ module.exports = {
     'qinglong/xbk_push.js'
   ],
   coverageAnalysis: 'off',
+  // 纯 JS 项目无需类型检查注入；Stryker 默认往沙箱文件首行插 "// @ts-nocheck"，
+  // 会使 test_mutation_ranges 在沙箱里数出的行数 +1/+2（426→427），初始测试必红（CI run #120 根因）。
+  disableTypeChecks: false,
   concurrency,
-  timeoutMS: 90000,
+  // v3.273：从 90s 增加到 180s，因为 run_unit_tests.js 跑 26 个套件比只跑 test_filter.js 慢。
+  timeoutMS: 180000,
   reporters: ['clear-text', 'html', 'json'],
   tempDirName: '.stryker-tmp',
   cleanTempDir: 'always',
