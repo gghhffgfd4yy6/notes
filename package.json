@@ -33,7 +33,7 @@
     "test:qinglong-runcheck": "node test_qinglong_runcheck.js",
     "test:status": "node test_status.js",
     "test:check-mutation-ranges": "node test_check_mutation_ranges.js",
-    "test:mutation-ranges-suite": "node test_mutation_ranges.js",
+    "test:mutation-ranges-unit": "node test_mutation_ranges.js",
     "test:mutation": "stryker run",
     "test:mutation-ranges": "node scripts/check-mutation-ranges.js",
     "test:coverage": "c8 --reporter=text --reporter=lcov --reporter=json-summary --exclude='test_*.js' --exclude='run_tests.js' node run_tests.js",
