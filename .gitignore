@@ -13,3 +13,6 @@ cleanup_rootfs_junk.sh
 
 # AI 审查运行时产物不入库
 .ai
+
+# AGENTS.md 要求的"破坏性 Git 操作前快照"产物，属本机文件不入库
+backup.bundle
