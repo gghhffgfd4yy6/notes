@@ -103,6 +103,29 @@ jobs:
       - name: 青龙工具函数测试（test_qinglong_utils.js）
         run: npm run test:qinglong-utils
 
+      # integration 套件虽然被 run_unit_tests.js 跳过（因标记为慢/可能有网络），
+      # 但它们本身可独立通过（mock 化，不依赖真实网络），必须显式接入 CI 门禁，
+      # 否则改动 xbk_push/xbk_agents/scripts/status 可带回归通过 PR。
+      - name: 青龙命令行测试（test_cli.js）
+        run: npm run test:cli
+
+      - name: 青龙常驻测试（test_qinglong_resident.js）
+        run: npm run test:qinglong-resident
+
+      - name: 青龙诊断测试（test_qinglong_runcheck.js）
+        run: npm run test:qinglong-runcheck
+
+      - name: 状态面板测试（test_status.js）
+        run: npm run test:status
+
+      # mutationSkip 套件：对 check-mutation-ranges.js 的单元测试。
+      # 仅因 Stryker 沙箱插桩会行数膨胀跑不了而标记 mutationSkip，CI 可正常独立运行。
+      - name: 变异范围校验测试（test_check_mutation_ranges.js）
+        run: npm run test:check-mutation-ranges
+
+      - name: 变异范围测试（test_mutation_ranges.js）
+        run: npm run test:mutation-ranges-suite
+
       # 全量单元测试门禁：跑 run_unit_tests.js（26个单元测试套件），
       # 确保新增测试文件不会因未单独列出而漏网（#100/#101 曾因此红测合入）。
       - name: 全量单元测试（run_unit_tests.js）
