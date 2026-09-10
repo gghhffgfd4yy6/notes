@@ -59,6 +59,7 @@ function test (name, fn) {
       assert.strictEqual(err.failures[0].code, 'PUSH_TIMEOUT', 'failure.code 应为 PUSH_TIMEOUT')
       assert.strictEqual(err.failures[0].channel, 'ch1', 'failure.channel 应对应配置通道名')
       assert.strictEqual(err.failures[1].channel, 'ch2', '第二个通道名应正确')
+      assert.strictEqual(registeredTimeoutMs, 10000, '实现必须按 10s 注册超时计时器，否则“超时契约”不成立（若改为 Date.now() 计时，此断言会失败提醒）')
     } finally {
       clearTimeout(watchdogTimer)
       global.setTimeout = originalSetTimeout
