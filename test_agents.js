@@ -1,6 +1,7 @@
 'use strict'
 
 const assert = require('assert')
+const dns = require('dns')
 const {
   profileMs,
   shouldInvalidateDns,
@@ -8,6 +9,14 @@ const {
   invalidateDnsForError,
   invalidateDns
 } = require('./xbk_agents')
+
+// 确定性 DNS mock：避免测试依赖真实网络/解析器。
+// 精简容器可能 /etc/hosts 缺 localhost 或 DNS 不可达，导致 dnsLookup 真实解析失败而误报。
+// 统一回环解析，使 dnsCache 的填充/命中/失效路径仍可验证且不触网。
+dns.lookup = (hostname, options, callback) => {
+  const cb = typeof options === 'function' ? options : callback
+  process.nextTick(() => cb(null, '127.0.0.1', 4))
+}
 
 ;(async () => {
   // ===== profileMs：有限数值四舍五入，否则 'n/a' =====
