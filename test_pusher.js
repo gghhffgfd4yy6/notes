@@ -28,8 +28,11 @@ function test (name, fn) {
     const watchdog = new Promise((_resolve, reject) => {
       watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未在预期时间内 settle')), 5000)
     })
-    // mock：setTimeout 立即执行回调，模拟 10s 超时已到
-    global.setTimeout = (fn) => { fn(); return originalSetTimeout(() => {}, 0) }
+    // mock：setTimeout 立即执行回调，模拟 10s 超时已到；同时捕获实现注册的延迟，
+    // 显式固化“实现必须基于 10s setTimeout 计时”这一契约——若将来改为 Date.now() 差值计时，
+    // 此处注册的延迟将不再是 10000，下方断言会失败，从而杜绝测试假绿。
+    let registeredTimeoutMs = null
+    global.setTimeout = (fn, ms) => { registeredTimeoutMs = ms; fn(); return originalSetTimeout(() => {}, 0) }
     try {
       const neverResolve = new Promise(() => {})
       const notifyMod = {
