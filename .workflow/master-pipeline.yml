@@ -44,7 +44,7 @@ stages:
     - node check-version.js
 
 - name: unit-test
-  displayName: ③ 单元测试 test_filter.js
+  displayName: ③ 单元测试（test_filter / mutation-json / 全量 run_unit_tests.js）
   strategy: naturally
   trigger: auto
   steps:
@@ -62,6 +62,13 @@ stages:
     commands:
     - npm install --ignore-scripts
     - npm run test:mutation-json
+  - step: build@nodejs
+    name: test_unit
+    displayName: 全量单元测试 run_unit_tests.js（25 套件兜底防漏网）
+    nodeVersion: 22.22.2
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:unit
 
 - name: integration-test
   displayName: ④ 集成测试（并行 + 串行完整）
@@ -145,9 +152,12 @@ stages:
   # 这 6 个套件被 run_unit_tests.js 跳过（integration / mutationSkip），须在此显式覆盖，
   # 否则相关回归可带病通过 PR（对照 .github/workflows/test.yml 的同名步骤）。
   # Node 取 22.22.2（与 package.json engines、GitHub test.yml 一致）。
-  # 说明：test_qinglong_runcheck.js 的“全部通过”用例已用 withHealthyEnv mock 隔离 Node/got/re2
-  # 探测；个别套件仍可能真实调用 runCheck 校验运行环境。npm install --ignore-scripts 不构建
-  # re2 原生模块，如需相关真实校验全绿，须先按 test.yml 的 re2 安装步骤补齐 re2。
+  # re2 前置（勿按 test.yml 补齐 re2）：test_cli.js:19 断言 --check 在【缺 re2 / 通知未配置】时
+  # 应返回非零（qinglong/xbk_push.js 的 runCheck 对应返回 1），其错误输出须匹配
+  # /Node.js 版本/、/re2 原生模块/、/通知通道/。即本套件依赖“re2 缺失”这一前置；
+  # npm install --ignore-scripts 不构建 re2，恰好满足该前置。若补齐 re2，--check 将返回 0，
+  # test_cli.js 反而会 assert.fail 而失败——故本 stage 不得执行 test.yml 的 re2 安装步骤。
+  # test_qinglong_runcheck.js 的“全部通过”用例已用 withHealthyEnv mock 隔离 Node/got/re2 探测。
   - step: build@nodejs
     name: test_cli
     displayName: test_cli.js（青龙命令行 --check/--status）

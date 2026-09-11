@@ -46,13 +46,17 @@ module.exports = {
   // 处理。二者是双保险：主修复是 mutationSkip，disableTypeChecks:false 为补充保险。
   disableTypeChecks: false,
   concurrency,
-  // timeoutMS 是每次 commandRunner（即整轮 run_unit_tests.js）的上限。
-  // 每轮要跑 25 个单元套件（含 463KB 的 test_filter.js），180s 余量不足 2×。
-  // 注意：mutation-report.js 把 Timeout 记为 detected 并计入 score 分子
-  // （见 scripts/mutation-report.js:103、:179 的 (killed + timeout) / total），
-  // 因此过早超时并非“假存活被排除”，而是会把慢速存活变异体也计入 detected、
-  // 虚增报告分数（掩盖真实存活）。
-  // 故提高到 300000ms（300s），留 ≥2× 余量以吸收性能抖动。
+  // timeoutMS 语义（Stryker 官方口径）：单个变异体单次测试运行的真实超时时间为
+  //   netTimeMs * timeoutFactor + timeoutMS + overheadMs
+  // （timeoutFactor 默认 1.5，timeoutMS 默认 5000）。timeoutMS 是该公式里的【加法偏移项】，
+  // 作用于每个变异体的每次测试运行——它既不是「每条命令的硬上限」，也不是「整轮
+  // run_unit_tests.js 的上限」。
+  // 加大该项，是为在 run_unit_tests.js（25 个单元套件、含 463KB 的 test_filter.js）叠加
+  // Stryker 沙箱插桩/变异开销的场景下，给每次运行留出足够的加法偏移，避免慢套件过早超时。
+  // 注意：mutation-report.js 把 Timeout 计入 score 分子（见 scripts/mutation-report.js:103、
+  // :179 的 (killed + timeout) / total），因此过早超时并非“假存活被排除”，反而会把慢速
+  // 存活变异体也计入 detected、虚增报告分数（掩盖真实存活）。
+  // 值维持 300000ms（300s）：作为加法偏移给多套件 + 插桩场景留足余量，无需下调。
   // 历史：90s → 180s（v3.273 切全量单元入口）→ 300s。
   timeoutMS: 300000,
   reporters: ['clear-text', 'html', 'json'],
