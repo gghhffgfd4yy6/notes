@@ -201,7 +201,7 @@ stages:
     displayName: 打印通过摘要
     nodeVersion: 20.19.0
     commands:
-    - echo "✅ 全部门禁通过：lint + 版本闸门 + 单元 + 集成(并行/串行) + 通道 + 常驻回归"
+    - echo "✅ 全部门禁通过：lint + 版本闸门 + 单元 + 集成(并行/串行) + 通道 + 常驻回归 + 遗漏套件(CLI/青龙常驻/青龙诊断/状态面板/变异范围)"
     - echo "📊 失败定位：Gitee Go 日志中搜索 ❌ 即为失败测试名（各测试文件末尾打印失败清单）"
 notify: []
 # 说明：notify 可按 Gitee Go 平台格式配置失败通知（webhook/邮件），平台格式变化时更新。
