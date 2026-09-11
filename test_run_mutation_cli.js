@@ -8,6 +8,14 @@ const path = require('node:path')
 const { runTests, evaluate } = require('./run_mutation')
 
 ;(async () => {
+  // 防重入：run_mutation.js 的 runTests 在临时目录内运行 run_unit_tests.js 时会设置
+  // XBK_MUTATION_CHILD=1。本套件的 evaluate 场景会再次调用 evaluate（→ copyProject → 跑
+  // run_unit_tests.js → 又跑到本套件），若不拦截将无限递归并超时。嵌套时直接跳过。
+  if (process.env.XBK_MUTATION_CHILD === '1') {
+    console.log('⏭  检测到 XBK_MUTATION_CHILD，跳过 runTests/evaluate 场景（防变异运行递归）')
+    return
+  }
+
   // ===== runTests：子进程运行测试的 3 种场景 =====
   // runTests 在指定目录运行 DEFAULT_TEST=['node', 'run_unit_tests.js']
 

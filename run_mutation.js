@@ -133,7 +133,7 @@ function applyMutants (dir, mutants) {
 
 function runTests (dir, timeoutMs) {
   return new Promise(resolve => {
-    const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, XBK_MUTATION_CHILD: '1' } })
     let output = ''
     child.stdout.on('data', d => { output += d })
     child.stderr.on('data', d => { output += d })
