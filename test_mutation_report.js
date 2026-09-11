@@ -63,13 +63,14 @@ const EMPTY_CASE = [
 ]
 
 let pass = 0
+let fail = 0
 /**
  * 执行一项同步断言并累计通过数量。
  * @param {string} name 测试名称
  * @param {Function} fn 测试函数
  */
 function check (name, fn) {
-  try { fn(); pass++ } catch (e) { console.error(`❌ ${name}\n   ${e.message}`); process.exitCode = 1 }
+  try { fn(); pass++ } catch (e) { fail++; console.error(`❌ ${name}\n   ${e.message}`); process.exitCode = 1 }
 }
 
 check('render 输出快照（含 error 段 + 正常段 + 全被杀段）', () => {
@@ -354,7 +355,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
   }
 
   async function acheck (name, fn) {
-    try { await fn(); asyncPass++; pass++ } catch (e) { console.error(`❌ ${name}\n   ${e.message}`); process.exitCode = 1 }
+    try { await fn(); asyncPass++; pass++ } catch (e) { fail++; console.error(`❌ ${name}\n   ${e.message}`); process.exitCode = 1 }
   }
 
   await acheck('postIssue 缺少 GITHUB_TOKEN 时抛错', async () => {
@@ -428,5 +429,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
   if (ORIG_REPO) process.env.GITHUB_REPOSITORY = ORIG_REPO; else delete process.env.GITHUB_REPOSITORY
   global.fetch = ORIG_FETCH
 
-  console.log(`\n🎉 test_mutation_report.js 全部通过（${pass} 项，含异步 ${asyncPass} 项）`)
+  // 汇总文案按真实失败计数条件化：存在失败项时不再谎报“全部通过”
+  const failSuffix = fail > 0 ? ('，失败 ' + fail + ' 项') : '，全部通过'
+  console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_mutation_report.js 通过 ${pass}/${pass + fail} 项${failSuffix}（含异步 ${asyncPass} 项）`)
 })()

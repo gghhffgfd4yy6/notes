@@ -38,8 +38,15 @@ module.exports = {
   // 会使 test_mutation_ranges 在沙箱里数出的行数 +1/+2（426→427），初始测试必红（CI run #120 根因）。
   disableTypeChecks: false,
   concurrency,
-  // v3.273：从 90s 增加到 180s，因为 run_unit_tests.js 跑 26 个套件比只跑 test_filter.js 慢。
-  timeoutMS: 180000,
+  // timeoutMS 是每次 commandRunner（即整轮 run_unit_tests.js）的上限。
+  // 每轮要跑 25 个单元套件（含 463KB 的 test_filter.js），180s 余量不足 2×。
+  // 注意：mutation-report.js 把 Timeout 记为 detected 并计入 score 分子
+  // （见 scripts/mutation-report.js:103、:179 的 (killed + timeout) / total），
+  // 因此过早超时并非“假存活被排除”，而是会把慢速存活变异体也计入 detected、
+  // 虚增报告分数（掩盖真实存活）。
+  // 故提高到 300000ms（300s），留 ≥2× 余量以吸收性能抖动。
+  // 历史：90s → 180s（v3.273 切全量单元入口）→ 300s。
+  timeoutMS: 300000,
   reporters: ['clear-text', 'html', 'json'],
   tempDirName: '.stryker-tmp',
   cleanTempDir: 'always',

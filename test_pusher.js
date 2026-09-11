@@ -28,12 +28,17 @@ function test (name, fn) {
     const watchdog = new Promise((_resolve, reject) => {
       watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未在预期时间内 settle')), 5000)
     })
-    // mock：setTimeout 立即执行回调，模拟 10s 超时已到；同时捕获实现注册的延迟，
-    // 显式固化“实现必须基于 10s setTimeout 计时”这一契约——若将来改为 Date.now() 差值计时，
-    // 此处注册的延迟将不再是 10000，下方断言会失败，从而杜绝测试假绿。
-    let registeredTimeoutMs = null
-    global.setTimeout = (fn, ms) => { registeredTimeoutMs = ms; fn(); return originalSetTimeout(() => {}, 0) }
+    // mock：仅立即触发“10000ms 超时定时器”（其余定时器不触发），确保导致 reject 的超时定时器就是它。
+    // 若实现改用别的延迟计时，超时分支不会触发、看门狗兜底 → 断言失败，
+    // 杜绝“任意 10000ms 定时器蒙混过关”的假绿（回应 sourcery-ai 评审）。
+    // 第 3 个及以后参数按 Node 语义原样转发给回调（fn(...args)）。
+    // 注意：mock 赋值纳入 try，确保异常时 finally 也能还原 global.setTimeout。
+    let timeoutTimerFired = false
     try {
+      global.setTimeout = (fn, ms, ...args) => {
+        if (ms === 10000) { timeoutTimerFired = true; fn(...args) }
+        return originalSetTimeout(() => {}, 0)
+      }
       const neverResolve = new Promise(() => {})
       const notifyMod = {
         sendNotify: () => neverResolve,
@@ -59,7 +64,7 @@ function test (name, fn) {
       assert.strictEqual(err.failures[0].code, 'PUSH_TIMEOUT', 'failure.code 应为 PUSH_TIMEOUT')
       assert.strictEqual(err.failures[0].channel, 'ch1', 'failure.channel 应对应配置通道名')
       assert.strictEqual(err.failures[1].channel, 'ch2', '第二个通道名应正确')
-      assert.strictEqual(registeredTimeoutMs, 10000, '实现必须按 10s 注册超时计时器，否则“超时契约”不成立（若改为 Date.now() 计时，此断言会失败提醒）')
+      assert.strictEqual(timeoutTimerFired, true, '实现必须按 10s 触发超时定时器，且该定时器即 reject 的来源（仅它被触发，杜绝无关定时器蒙混）')
     } finally {
       clearTimeout(watchdogTimer)
       global.setTimeout = originalSetTimeout

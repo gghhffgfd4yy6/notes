@@ -13,6 +13,9 @@ const {
 // 确定性 DNS mock：避免测试依赖真实网络/解析器。
 // 精简容器可能 /etc/hosts 缺 localhost 或 DNS 不可达，导致 dnsLookup 真实解析失败而误报。
 // 统一回环解析，使 dnsCache 的填充/命中/失效路径仍可验证且不触网。
+// ⚠️ 显式声明：本 mock 不模拟 family/options 语义——无条件返回 family=4，并忽略入参 options
+// （family/all/hints）。若将来新增“XBK_DNS_FAMILY=6 → 解析出 IPv6”等断言，需在此依据
+// options.family / options.all 返回对应结果，否则会因固定返回 4 而假绿。
 dns.lookup = (hostname, options, callback) => {
   const cb = typeof options === 'function' ? options : callback
   process.nextTick(() => cb(null, '127.0.0.1', 4))
