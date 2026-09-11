@@ -4,12 +4,12 @@
 const assert = require('node:assert')
 const { createRuleEngine } = require('./xbk_rules')
 
-// mock 依赖：compileUserRegex 返回 true（模拟正则编译成功，跳过无效正则检查），isRe2Available 返回 false（跳过 re2 检查）
-const mockUtils = {
-  safeStr: (v) => (v === undefined || v === null || typeof v === 'symbol') ? '' : String(v)
-}
+// mock 依赖：validateConfig 内部使用闭包 safeStr（xbk_rules.js:367），从不调用 Utils.safeStr；
+// Utils 仅在 match/_anyRule 的 checkTimeCompiled 路径经 Utils.safeGet/parseTime/daysFrom 使用。
+// 本文件只覆盖 validateConfig，故 Utils 传空占位对象即可（此前提供的 safeStr stub 是死代码，已删除）。
+// compileUserRegex 返回 true（模拟正则编译成功，跳过无效正则检查），isRe2Available 返回 false（跳过 re2 检查）
 const engine = createRuleEngine({
-  Utils: mockUtils,
+  Utils: {},
   FILTER_FIELDS: ['keyword'],
   compileUserRegex: () => true,
   isRe2Available: () => false

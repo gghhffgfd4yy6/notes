@@ -38,8 +38,13 @@ module.exports = {
   // 会使 test_mutation_ranges 在沙箱里数出的行数 +1/+2（426→427），初始测试必红（CI run #120 根因）。
   disableTypeChecks: false,
   concurrency,
-  // v3.273：从 90s 增加到 180s，因为 run_unit_tests.js 跑 26 个套件比只跑 test_filter.js 慢。
-  timeoutMS: 180000,
+  // timeoutMS 是每次 commandRunner（即整轮 run_unit_tests.js）的上限。
+  // 每轮要跑 25 个单元套件（含 463KB 的 test_filter.js），180s 余量不足 2×：
+  // 一旦单轮耗时逼近上限，Stryker 会把变异体判为 Timeout（假存活），
+  // 反而不计入 Killed，污染变异分数与门禁结论。
+  // 故提高到 300000ms（300s），留出 ≥2× 余量以吸收性能抖动导致的误判。
+  // 历史：90s（v3.273 前）→ 180s（v3.273 切全量单元入口后）→ 300s。
+  timeoutMS: 300000,
   reporters: ['clear-text', 'html', 'json'],
   tempDirName: '.stryker-tmp',
   cleanTempDir: 'always',
