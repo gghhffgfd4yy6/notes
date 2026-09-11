@@ -166,6 +166,7 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       assert.ok(fs.existsSync(path.join(projDir, 'test_filter.js')), 'test_filter.js 应复制')
       assert.ok(fs.existsSync(path.join(projDir, 'package.json')), 'package.json 应复制')
       assert.ok(fs.existsSync(path.join(projDir, 'xbk_utils.js')), 'xbk_utils.js 应复制')
+      assert.ok(fs.existsSync(path.join(projDir, 'run_mutation.js')), 'run_mutation.js 应复制（多个单元套件顶层 require 它）')
       const nmStat = fs.lstatSync(path.join(projDir, 'node_modules'))
       assert.ok(nmStat.isSymbolicLink(), 'node_modules 应为 symlink')
     })
