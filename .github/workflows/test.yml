@@ -104,8 +104,11 @@ jobs:
         run: npm run test:qinglong-utils
 
       # integration 套件虽然被 run_unit_tests.js 跳过（因标记为慢/可能有网络），
-      # 但它们本身可独立通过（mock 化，不依赖真实网络），必须显式接入 CI 门禁，
+      # 但它们本身可独立通过，必须显式接入 CI 门禁，
       # 否则改动 xbk_push/xbk_agents/scripts/status 可带回归通过 PR。
+      # 说明：多数套件已 mock 化、不依赖真实网络；test_qinglong_runcheck.js 的“全部通过”用例
+      # 已用 withHealthyEnv mock 隔离 Node/got/re2 探测；个别套件仍可能受运行环境影响
+      # （runCheck 会校验 Node≥22/got/re2，GitHub 侧由本工作流前面的 re2 安装步骤保证）。
       - name: 青龙命令行测试（test_cli.js）
         run: npm run test:cli
 

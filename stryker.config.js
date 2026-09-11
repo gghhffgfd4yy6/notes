@@ -10,9 +10,12 @@ const concurrency = Number.isInteger(requestedConcurrency) && requestedConcurren
 module.exports = {
   testRunner: 'command',
   commandRunner: {
-    // 变异测试使用全量单元测试入口（run_unit_tests.js，26+套件），而非仅 test_filter.js。
+    // 变异测试使用全量单元测试入口（run_unit_tests.js，25 个单元套件），而非仅 test_filter.js。
     // 此前只跑 test_filter.js 导致 PR #100/#101 新增的 238 项测试对变异分数完全无效（issue #106）。
-    // PERF_MS=3000：变异测试开销下放宽 test_filter.js 性能断言阈值（默认500ms），避免误判 Killed。
+    // PERF_MS=3000：放宽 test_filter.js 性能断言阈值（默认 500ms）。Stryker 沙箱内的插桩与变异
+    // 开销会拖慢执行，不放宽则性能断言会因沙箱开销误失败（并可能触发 commandRunner 超时），
+    // 使初始/变异运行无法建立基线。注意：它规避的是沙箱内的误失败/超时，与变异体 Killed 判定无关
+    // （Killed 取决于断言能否捕获行为差异，而非性能计时）。
     command: 'PERF_MS=3000 node run_unit_tests.js'
   },
   mutate: [
@@ -34,8 +37,13 @@ module.exports = {
     'qinglong/xbk_push.js'
   ],
   coverageAnalysis: 'off',
-  // 纯 JS 项目无需类型检查注入；Stryker 默认往沙箱文件首行插 "// @ts-nocheck"，
-  // 会使 test_mutation_ranges 在沙箱里数出的行数 +1/+2（426→427），初始测试必红（CI run #120 根因）。
+  // 纯 JS 项目无需类型检查注入。CI run #120 根因：ranges 行数元校验
+  // （test_mutation_ranges / check-mutation-ranges）在 Stryker 沙箱内误报——同一次运行里
+  // 两类行数扰动叠加：
+  //   ① 被 --mutate 的目标文件被插桩注入，行数大幅膨胀（如 426→704，主因，见 mutationSkip）；
+  //   ② Stryker 默认往沙箱文件首行插 "// @ts-nocheck"，使每个文件多 +1/+2 行（如 426→427）。
+  // 本项关闭 ②（消除头部注入）；① 由 run_unit_tests.js 的 mutationSkip（跳过两个元校验套件）
+  // 处理。二者是双保险：主修复是 mutationSkip，disableTypeChecks:false 为补充保险。
   disableTypeChecks: false,
   concurrency,
   // timeoutMS 是每次 commandRunner（即整轮 run_unit_tests.js）的上限。

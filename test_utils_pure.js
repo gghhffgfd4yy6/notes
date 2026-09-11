@@ -257,9 +257,12 @@ check('anonKey: 空值被过滤', () => {
   const k2 = Utils.anonKey('a', 'b')
   assert.strictEqual(k1, k2, '空值应被过滤')
 })
-check('anonKey: 全空参数返回固定退化键', () => {
+check('anonKey: 全空参数返回稳定的退化键', () => {
   const k = Utils.anonKey(undefined, null, '')
-  assert.strictEqual(k, 'anon:1505cde7', '全空参数应返回退化键 anon:1505cde7')
+  // 只断言语义（前缀/格式/确定性/与无参退化键一致），不锁定具体哈希魔数——避免哈希实现变更即红
+  assert.match(k, /^anon:[0-9a-f]+$/, '应返回 anon:<hex> 格式的退化键')
+  assert.strictEqual(k, Utils.anonKey(), '全空参数应与无参数调用返回同一退化键')
+  assert.strictEqual(k, Utils.anonKey(undefined, null, ''), '重复调用应确定性返回相同键')
 })
 check('anonKey: Symbol 参数被过滤', () => {
   const k1 = Utils.anonKey('a', Symbol('x'), 'b')
