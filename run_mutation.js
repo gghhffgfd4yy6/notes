@@ -90,13 +90,17 @@ function copyProject (dir, files) {
   //   - 所有 test_*.js（单元测试会 require 对应 xbk_*.js 源文件）
   //   - 所有 xbk_*.js 生产源文件（测试依赖；变异目标 files 也在其中）
   //   - run_mutation.js 自身（test_filter.js / test_run_mutation*.js 等单元套件顶层 require 它）
+  //   - package.json（版本一致性用例读取）
+  //   - CHANGELOG.md（test_filter.js 的“文件头版本 ↔ CHANGELOG 最新”用例会 readFileSync 它）
   //   - scripts/ 与 qinglong/ 目录（部分测试依赖）
   // 此前只复制 test_filter.js 但运行 run_unit_tests.js，导致临时目录 MODULE_NOT_FOUND，
   // evaluate 恒返回 fail，行为断言无法建立（#15 根因）。
+  // 注：漏拷 CHANGELOG.md 会使 test_filter.js 版本一致性用例 ENOENT → 同样令 evaluate 恒 fail，
+  // 故“测试会读取的项目根文件”须逐一纳入，切勿遗漏。
   const entries = fs.readdirSync(ROOT)
   const testFiles = entries.filter(f => /^test_.*\.js$/.test(f))
   const srcFiles = entries.filter(f => /^xbk_.*\.js$/.test(f))
-  const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json']
+  const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md']
   for (const name of [...extraTop, ...testFiles, ...srcFiles, ...files]) {
     // 信任边界防护：拒绝目录穿越/绝对路径，确保只复制 ROOT 内文件
     if (name.includes('..') || path.isAbsolute(name)) throw new Error(`copyProject 拒绝越界路径: ${name}`)
