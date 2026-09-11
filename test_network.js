@@ -4,6 +4,9 @@ const assert = require('assert')
 const { createNetwork } = require('./xbk_network')
 const { RETRYABLE_CODES } = require('./xbk_failure_policy')
 
+// 等一个宏任务：用于等待被测代码内未 await 的游离日志链（如 prewarmDns）结算，避免依赖微任务顺序。
+const flushMacrotask = () => new Promise(resolve => setImmediate(resolve))
+
 // fetchData 依赖全部注入：Config / Utils / fetchJson / prewarmDns / getNotify / crypto / RETRYABLE_CODES
 function makeNetwork (opts = {}) {
   const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0 } = opts
@@ -109,7 +112,7 @@ function makeNetwork (opts = {}) {
     const r = await net.fetchData()
     // 显式化时序：prewarmDns 的日志链是 fetchData 内未 await 的游离 Promise，
     // 等一个宏任务（setImmediate）确保其结算/落日志后再断言，避免依赖微任务结算顺序的 flake。
-    await new Promise(resolve => setImmediate(resolve))
+    await flushMacrotask()
     assert.strictEqual(r.ok, true, 'prewarmDns 失败不应影响主流程')
     assert.ok(logs.some(l => l.includes('dns-prewarm') && l.includes('ok=false')), 'PROFILE3 应输出 prewarm 失败日志')
   }
@@ -133,7 +136,7 @@ function makeNetwork (opts = {}) {
     })
     const r = await net.fetchData()
     // 显式化时序：与 #8 同理，等待游离日志链结算后再断言（本用例 skipped 日志为同步输出，此处仅为一致性/防未来时序漂移）
-    await new Promise(resolve => setImmediate(resolve))
+    await flushMacrotask()
     assert.strictEqual(r.ok, true, 'URL 解析失败不应影响主流程')
     assert.ok(logs.some(l => l.includes('dns-prewarm') && l.includes('skipped')), 'PROFILE3 应输出 skipped 日志')
   }
