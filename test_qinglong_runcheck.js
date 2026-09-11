@@ -3,6 +3,7 @@
 // 青龙 --check 诊断入口：runCheck 函数的各种通过/失败场景
 const assert = require('assert')
 const path = require('node:path')
+const Module = require('node:module')
 const { runCheck } = require('./qinglong/xbk_push')
 
 // 通过 require.cache mock xbk_sendNotify_slim（runCheck 内部动态 require）
@@ -15,6 +16,26 @@ function mockNotify (count) {
 
 function restoreNotify () {
   require.cache[notifyPath] = origNotify
+}
+
+// 环境探测 mock：runCheck 内部真实校验 Node 版本 / got / re2（qinglong/xbk_push.js:30-39），
+// 裸环境（Node<22 或缺 got/re2）下"全部通过"用例必然返回 1。这里临时伪装成健康环境，
+// 只覆盖 runCheck 的返回码聚合逻辑，使该用例在裸环境可确定性通过；返回后完整还原。
+function withHealthyEnv (fn) {
+  const origRequire = Module.prototype.require
+  const versionsDesc = Object.getOwnPropertyDescriptor(process, 'versions')
+  Module.prototype.require = function (id, ...rest) {
+    if (id === 'got') return {}
+    if (id === 're2') return class { test () { return true } }
+    return origRequire.call(this, id, ...rest)
+  }
+  Object.defineProperty(process, 'versions', { value: { ...versionsDesc.value, node: '22.0.0' }, configurable: true })
+  try {
+    return fn()
+  } finally {
+    Module.prototype.require = origRequire
+    Object.defineProperty(process, 'versions', versionsDesc)
+  }
 }
 
 // #26 修复：捕获 runCheck 的 console.log 输出，用于区分具体哪个检查失败（而非只断返回码）
@@ -44,8 +65,9 @@ function makeApp (overrides = {}) {
 
 ;(async () => {
   // ===== 全部通过 → 返回 0 =====
+  // Node 版本/got/re2 三项环境探测用 mock 伪装为健康环境，避免裸环境（Node<22、无 got/re2）下必然失败
   mockNotify(1)
-  const code0 = runCheck(makeApp())
+  const code0 = withHealthyEnv(() => runCheck(makeApp()))
   assert.strictEqual(code0, 0, '全部检查通过应返回 0')
   restoreNotify()
 

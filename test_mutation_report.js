@@ -307,8 +307,11 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     if (lines[i].startsWith('| `')) fileRows.push(lines[i])
   }
   assert.strictEqual(fileRows.length, 10, `Top10 文件表格应只有10行，实际${fileRows.length}行`)
-  assert.ok(fileRows[0].includes('src/file01.js'), '第1行应是file01')
-  assert.ok(fileRows[9].includes('src/file10.js'), '第10行应是file10')
+  // 计数全为 1 时并列名次无稳定先后，故只做集合断言（10 个互不相同的合法文件项），
+  // 不依赖 Array.prototype.sort 稳定性 / Object 键插入序，避免实现细节变更引发 flake。
+  const fileNames = fileRows.map(l => l.match(/`([^`]+)`/)[1])
+  assert.strictEqual(new Set(fileNames).size, 10, 'Top10 表格应含 10 个互不重复的文件')
+  assert.ok(fileNames.every(f => /^src\/file\d{2}\.js$/.test(f)), '每行应是合法的 src/fileNN.js 项')
   // Top15 变异类型表格：定位"存活变异类型分布 Top 15"段，数数据行
   const kindStart = lines.findIndex(l => l.includes('存活变异类型分布 Top 15'))
   const kindRows = []
@@ -317,8 +320,9 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     if (lines[i].startsWith('| Mutator')) kindRows.push(lines[i])
   }
   assert.strictEqual(kindRows.length, 15, `Top15 变异类型表格应只有15行，实际${kindRows.length}行`)
-  assert.ok(kindRows[0].includes('Mutator01'), '第1行应是Mutator01')
-  assert.ok(kindRows[14].includes('Mutator15'), '第15行应是Mutator15')
+  const kindNames = kindRows.map(l => l.match(/\| (Mutator\d+) \|/)[1])
+  assert.strictEqual(new Set(kindNames).size, 15, 'Top15 表格应含 15 个互不重复的变异类型')
+  assert.ok(kindNames.every(k => /^Mutator\d{2}$/.test(k)), '每行应是合法的 MutatorNN 项')
   // 30+ 存活变异体：显示前 30 个 + "还有 1 个"
   assert.ok(out.includes('存活变异体（31 个）'), '应显示总存活数 31')
   assert.ok(out.includes('src/file01.js:1'), '应包含第1个存活变异体')

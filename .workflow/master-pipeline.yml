@@ -137,8 +137,62 @@ stages:
     - npm install --ignore-scripts
     - npm run test:lazy
 
+- name: omitted-suites
+  displayName: ⑦ 遗漏套件门禁（CLI/青龙常驻/青龙诊断/状态面板/变异范围）
+  strategy: naturally
+  trigger: auto
+  steps:
+  # 这 6 个套件被 run_unit_tests.js 跳过（integration / mutationSkip），须在此显式覆盖，
+  # 否则相关回归可带病通过 PR（对照 .github/workflows/test.yml 的同名步骤）。
+  # Node 取 22.22.2（与 package.json engines、GitHub test.yml 一致）。
+  # 说明：test_qinglong_runcheck.js 的“全部通过”用例已用 withHealthyEnv mock 隔离 Node/got/re2
+  # 探测；个别套件仍可能真实调用 runCheck 校验运行环境。npm install --ignore-scripts 不构建
+  # re2 原生模块，如需相关真实校验全绿，须先按 test.yml 的 re2 安装步骤补齐 re2。
+  - step: build@nodejs
+    name: test_cli
+    displayName: test_cli.js（青龙命令行 --check/--status）
+    nodeVersion: 22.22.2
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:cli
+  - step: build@nodejs
+    name: test_qinglong_resident
+    displayName: test_qinglong_resident.js（青龙常驻 refreshConnections/runResident）
+    nodeVersion: 22.22.2
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:qinglong-resident
+  - step: build@nodejs
+    name: test_qinglong_runcheck
+    displayName: test_qinglong_runcheck.js（青龙诊断 --check 五种返回码）
+    nodeVersion: 22.22.2
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:qinglong-runcheck
+  - step: build@nodejs
+    name: test_status
+    displayName: test_status.js（状态面板只读聚合）
+    nodeVersion: 22.22.2
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:status
+  - step: build@nodejs
+    name: test_check_mutation_ranges
+    displayName: test_check_mutation_ranges.js（变异范围校验，mutationSkip）
+    nodeVersion: 22.22.2
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:check-mutation-ranges
+  - step: build@nodejs
+    name: test_mutation_ranges_unit
+    displayName: test_mutation_ranges.js（变异范围单元，mutationSkip）
+    nodeVersion: 22.22.2
+    commands:
+    - npm install --ignore-scripts
+    - npm run test:mutation-ranges-unit
+
 - name: summary
-  displayName: ⑦ 汇总（全过才到这一步）
+  displayName: ⑧ 汇总（全过才到这一步）
   strategy: naturally
   trigger: auto
   steps:
@@ -147,7 +201,7 @@ stages:
     displayName: 打印通过摘要
     nodeVersion: 20.19.0
     commands:
-    - echo "✅ 全部门禁通过：lint + 版本闸门 + 单元 + 集成(并行/串行) + 通道 + 常驻回归"
+    - echo "✅ 全部门禁通过：lint + 版本闸门 + 单元 + 集成(并行/串行) + 通道 + 常驻回归 + 遗漏套件(CLI/青龙常驻/青龙诊断/状态面板/变异范围)"
     - echo "📊 失败定位：Gitee Go 日志中搜索 ❌ 即为失败测试名（各测试文件末尾打印失败清单）"
 notify: []
 # 说明：notify 可按 Gitee Go 平台格式配置失败通知（webhook/邮件），平台格式变化时更新。
