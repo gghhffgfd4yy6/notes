@@ -152,11 +152,14 @@ stages:
   # 这 6 个套件被 run_unit_tests.js 跳过（integration / mutationSkip），须在此显式覆盖，
   # 否则相关回归可带病通过 PR（对照 .github/workflows/test.yml 的同名步骤）。
   # Node 取 22.22.2（与 package.json engines、GitHub test.yml 一致）。
-  # re2 前置（勿按 test.yml 补齐 re2）：test_cli.js:19 断言 --check 在【缺 re2 / 通知未配置】时
+  # 环境前置（勿把本 stage 变成“全绿”环境）：test_cli.js:19 断言 --check 在缺依赖/未配通知时
   # 应返回非零（qinglong/xbk_push.js 的 runCheck 对应返回 1），其错误输出须匹配
-  # /Node.js 版本/、/re2 原生模块/、/通知通道/。即本套件依赖“re2 缺失”这一前置；
-  # npm install --ignore-scripts 不构建 re2，恰好满足该前置。若补齐 re2，--check 将返回 0，
-  # test_cli.js 反而会 assert.fail 而失败——故本 stage 不得执行 test.yml 的 re2 安装步骤。
+  # /Node.js 版本/、/re2 原生模块/、/通知通道/。runCheck 只有在【Node≥22、re2 可加载、
+  # 且已配置 ≥1 个通知通道】全部满足时才返回 0；npm install --ignore-scripts 不构建 re2，
+  # 且本 stage 未配置通知通道，故 --check 必然返回非零，恰好满足该断言。
+  # 反之，若让本环境“全绿”（补齐 re2 且配置通知通道），--check 将返回 0，test_cli.js 反而
+  # assert.fail 而失败——故本 stage 不得执行 test.yml 的 re2 安装步骤，也不要注入通知配置。
+  # （仅补齐 re2、但不配置通知通道时，--check 仍返回非零，本套件仍通过。）
   # test_qinglong_runcheck.js 的“全部通过”用例已用 withHealthyEnv mock 隔离 Node/got/re2 探测。
   - step: build@nodejs
     name: test_cli
