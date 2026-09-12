@@ -20,16 +20,6 @@ const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
 const childProcess = require('node:child_process')
 
-// 防重入/省固定成本（#132 review Q6）：stryker 变异沙箱（mutation.yml 的 commandRunner 反复
-// spawn run_unit_tests.js，18 个分片）每次都会执行本套件，场景 B 的 ~2s 兜底等待白白重复 18 次
-// ——run_mutation.js 不在变异目标内，本场景与 mutate 目标无关。与 test_run_mutation_cli.js 同款
-// 防重入：XBK_MUTATION_CHILD=1（run_mutation.js 子进程与 mutation.yml 的 stryker step 均设置）
-// 时跳过；普通单元门禁（npm run test:unit 等）不设该变量，仍完整执行本套件，回归覆盖不受影响。
-if (process.env.XBK_MUTATION_CHILD === '1') {
-  console.log('⏭ 检测到 XBK_MUTATION_CHILD，跳过竞态场景（防变异运行递归/省 2s 固定成本）')
-  return
-}
-
 const originalSpawn = childProcess.spawn
 const killedSignals = [] // fake child 的 kill 收到的信号（按调用次序）
 let lastChild = null // 最近一次 spawn 返回的 fake child（测试需手动触发其 close）
@@ -63,6 +53,17 @@ function waitKillCount (expected, timeoutMs = 1500) {
 }
 
 ;(async () => {
+  // 防重入/省固定成本（#132 review Q6）：stryker 变异沙箱（mutation.yml 的 commandRunner 反复
+  // spawn run_unit_tests.js，18 个分片）每次都会执行本套件，场景 B 的 ~2s 兜底等待白白重复 18 次
+  // ——run_mutation.js 不在变异目标内，本场景与 mutate 目标无关。与 test_run_mutation_cli.js 同款
+  // 防重入：XBK_MUTATION_CHILD=1（run_mutation.js 子进程与 mutation.yml 的 stryker step 均设置）
+  // 时跳过；普通单元门禁（npm run test:unit 等）不设该变量，仍完整执行本套件，回归覆盖不受影响。
+  // #132 CI lint 教训——guard 必须在函数内，模块顶层 return 会被 standard/espree 判解析错误
+  if (process.env.XBK_MUTATION_CHILD === '1') {
+    console.log('⏭ 检测到 XBK_MUTATION_CHILD，跳过竞态场景（防变异运行递归/省 2s 固定成本）')
+    return
+  }
+
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-race-'))
   try {
     // 注入 + 重载：让 run_mutation.js 顶层解构拿到 fake spawn
