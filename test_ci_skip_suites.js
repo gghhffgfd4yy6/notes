@@ -39,7 +39,8 @@ const unitFiles = SUITES.filter(s => !s.integration && !s.mutationSkip).map(s =>
 // 仅在并行失败时跑），不能算作门禁覆盖——否则把某个套件的步骤挂上 `if: false` 也能骗过对账。
 // 解析器对 YAML 排版变化保持稳健（本文件是门禁意图：红=提醒人工同步，常规排版变化不应误红）：
 //   ① 步骤起点：`- name:` / `- uses:` / `- run:` / `- if:`（YAML 允许省略 name）均视为新 step 块；
-//   ② run: 支持多行形式（`run: |` / `run: >`，或 run: 后跟缩进更深的续行），命令文本合并后只提取
+//   ② run: 支持多行形式（块指示符 `|` / `>` 及其 chomp/显式缩进变体 `|-` `>-` `|+` `>-2` `|2` 等，
+//      或 run: 后跟缩进更深的续行），命令文本合并后只提取
 //      `npm run <script>` 命令名——解析不出命令名仍会红（那才是真正的门禁缺口），排版变化不再误红；
 //   ③ 步骤内其它字段（uses/with/env/id/continue-on-error 等）不参与命令提取，也不破坏步骤归属；
 //   ④ if: 仅在缩进比当前 step 起点更深时视为步骤级条件——job 级 if:（缩进更浅）不属任何 step，
@@ -85,6 +86,10 @@ function parseWorkflowSteps (text) {
   let curStep = null
   let runLines = null // 正在累积的 run: 多行块内容（null = 不在块内）
   let runIndent = -1 // 进入块模式时 run: 键的缩进；续行缩进必须更深，回退到 <= runIndent 即块结束
+  // YAML 块标量指示符 = [|>] + 可选 chomp [-+] + 可选显式缩进数字：`|` `>` `|-` `>-` `|+` `>-2` `|2` …。
+  // 识别不进块模式的形态一律按单行命令文本处理——单行文本提取不出命令名时该步骤不贡献 scripts，
+  // 对账保持红（宁红勿绿）：任何未识别变体只会加重门禁，不会静默放行。
+  const blockIndicatorRe = /^[|>][-+]?\d*$/
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim()
     if (!trimmed) continue
@@ -102,9 +107,10 @@ function parseWorkflowSteps (text) {
       steps.push(curStep)
       const inlineRun = trimmed.match(/^- run: ?(.+)$/)
       if (inlineRun) {
-        if (inlineRun[1] === '|' || inlineRun[1] === '>') {
-          // 紧凑块写法 `- run: |` / `- run: >`：块模式此前只由 `run:` 键触发，这里必须同样进入，
-          // 否则该步骤后续的命令行被当作普通行忽略 → 命令丢失（对账误报）
+        if (blockIndicatorRe.test(inlineRun[1])) {
+          // 紧凑块写法 `- run: |` / `- run: >` 及其 chomp/显式缩进变体（`|-` `>-` `|+` `>-2` 等）：
+          // 块模式此前只认 '|' / '>' 两个字面值，`- run: |-` 之类会把后续命令行当普通行忽略 →
+          // 命令丢失（对账误报）。统一用块指示符正则判定；不匹配的 rest 走单行命令文本（宁红勿绿）。
           runLines = []
           runIndent = indent
         } else {
@@ -117,7 +123,9 @@ function parseWorkflowSteps (text) {
     if (trimmed.startsWith('if:') && indent > curStep.indent) curStep.conditional = true
     if (trimmed.startsWith('run:')) {
       const rest = trimmed.slice('run:'.length).trim()
-      if (!rest || rest === '|' || rest === '>') {
+      if (!rest || blockIndicatorRe.test(rest)) {
+        // 键形式 `run:`：rest 为空（纯块）或为块指示符（含 `|-` `>-` 等变体，而非仅 '|' / '>'）→ 块模式；
+        // rest 为具体命令（如 `npm run X`）仍按单行处理；未识别的 rest 形态按单行 → 提取不出命令即保持红
         runLines = [] // 块模式：后续缩进更深的行均为命令文本
         runIndent = indent
       } else {
@@ -153,6 +161,12 @@ assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explici
 //   3. 引号内的文本（echo "npm run notcmd"）不进 scripts
 //   4. `run: |` 块放在文本末尾、且无尾随换行（EOF 补结算路径）仍能收集齐其命令
 //   5. `run: >` 折叠块、`if:` 条件步骤标记正确（conditional）以备对账忽略
+// #131 审查遗留（问题4）：块指示符变体的回归用例——
+//   6. `- run: |-` 行内 chomp 块：块内注释/引号剔除，只收真实命令
+//   7. `run: >-` 键形式折叠 chomp 块：命令仍被提取
+//   8. `- run: >+2` 显式缩进指示符变体：命令仍被提取
+//   9. 失败方向安全：无法识别的指示符（`- run: |+bad`）按单行命令文本处理、不进入块模式，
+//      提取不出命令名即该步骤 scripts 为空（宁红勿绿——缺失的覆盖仍会被主对账断言拦下）
 {
   const dummy = [
     'name: dummy',
@@ -173,11 +187,23 @@ assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explici
     '        run: npm run test:loop',
     '      - name: 末尾块无尾随换行',
     '        run: |',
-    '          npm run test:filter'
+    '          npm run test:filter',
+    '      - run: |-',
+    '          npm run test:rules',
+    '          # npm run ghost2',
+    '          echo "npm run quoted-not-cmd2"',
+    '      - name: 键折叠chomp块',
+    '        run: >-',
+    '          npm run test:app_p',
+    '      - run: >+2',
+    '          npm run test:status',
+    '      - run: |+bad',
+    '          npm run test:ghost3'
   ].join('\n') // 故意不补末尾 \n：验证 EOF 补结算
   const dummySteps = parseWorkflowSteps(dummy)
-  // 步骤数：name多行块 / 折叠块 / if条件 / 末尾块 = 4
-  assert.strictEqual(dummySteps.length, 4, 'dummy 应解析出 4 个步骤')
+  // 步骤数：name多行块 / 折叠块 / if条件 / 末尾块 / 行内chomp块 / 键折叠chomp块 / 显式缩进指示符块 /
+  // 未识别指示符(宁红勿绿) = 8
+  assert.strictEqual(dummySteps.length, 8, 'dummy 应解析出 8 个步骤')
   assert.deepStrictEqual(dummySteps[0].scripts, ['test:unit', 'test:notify'],
     'run:| 块应逐行提取脚本，注释行(# npm run ghost)与行内注释(npm run test:notify #…)与引号文本均剔除')
   assert.deepStrictEqual(dummySteps[1].scripts, ['test:app'], 'run:> 折叠块应提取 test:app')
@@ -185,11 +211,20 @@ assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explici
   assert.deepStrictEqual(dummySteps[2].scripts, ['test:loop'], '条件步骤仍应解析出其脚本')
   assert.deepStrictEqual(dummySteps[3].scripts, ['test:filter'],
     '文本末尾的 run:| 块（无尾随换行）应经 EOF 补结算提取 test:filter')
+  assert.deepStrictEqual(dummySteps[4].scripts, ['test:rules'],
+    '- run: |- 行内 chomp 块应提取真实命令，块内注释(# npm run ghost2)与引号文本(echo "npm run quoted-not-cmd2")剔除')
+  assert.deepStrictEqual(dummySteps[5].scripts, ['test:app_p'], 'run: >- 键形式折叠 chomp 块应提取 test:app_p')
+  assert.deepStrictEqual(dummySteps[6].scripts, ['test:status'], '- run: >+2 显式缩进指示符变体应提取 test:status')
+  assert.deepStrictEqual(dummySteps[7].scripts, [],
+    '未识别的块指示符(- run: |+bad)不得进入块模式，其后行不收集 → scripts 为空（宁红勿绿）')
   // 注释/引号不应污染任何步骤的 scripts
   const allScripts = dummySteps.flatMap(s => s.scripts)
   assert.ok(!allScripts.includes('ghost'), '注释中的命令名不应进入 scripts')
+  assert.ok(!allScripts.includes('ghost2'), 'chomp 块内注释中的命令名不应进入 scripts')
   assert.ok(!allScripts.includes('quoted-not-cmd'), '引号内的文本不应进入 scripts')
-  console.log('✅ dummy workflow 解析断言通过（多行块/EOF补结算/注释剔除/if条件）')
+  assert.ok(!allScripts.includes('quoted-not-cmd2'), 'chomp 块内引号中的文本不应进入 scripts')
+  assert.ok(!allScripts.includes('ghost3'), '未识别指示符的后继行不得进入 scripts（宁红勿绿）')
+  console.log('✅ dummy workflow 解析断言通过（多行块/EOF补结算/注释剔除/if条件/chomp与显式缩进指示符）')
 }
 
 // 2b. integration/mutationSkip 套件被 run_unit_tests.js 排除，只能靠显式步骤进门禁 ——
