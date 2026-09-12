@@ -47,13 +47,32 @@ const unitFiles = SUITES.filter(s => !s.integration && !s.mutationSkip).map(s =>
 // 从命令文本中提取 `npm run <script>` 命令名（脚本名取首个 token，排除 shell 元字符，避免跨行吞并）；
 // 提取不出任何命令名时该步骤对 explicitFiles 无贡献——缺失的覆盖最终仍会被下面对账断言拦下（保持红），
 // 这里只负责「正常排版变化不误红」。
+// 从命令文本中剔除引号段与行内注释，返回线性扫描后的命令串：
+// 引号内的文本（echo "参考: npm run x" 这类诊断输出）不是命令；`#` 后的行内注释也不是。
+// 用逐字符扫描而非 `"[^"]*"|'[^']*'` 交替正则——后者对含大量引号的输入存在超线性回溯面（Sonar S8786）。
+function stripQuotesAndComment (line) {
+  let out = ''
+  let quote = ''
+  for (const ch of line) {
+    if (quote) {
+      if (ch === quote) quote = ''
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+    } else if (ch === '#') {
+      break
+    } else {
+      out += ch
+    }
+  }
+  return out
+}
 function collectNpmScripts (step, commandText) {
   // 只认真实命令：注释行（`# npm run x`）与行内注释（`npm run foo # 说明` 的 # 后部分）不是命令，
   // 引号内的文本（echo "参考: npm run x" 这类诊断输出）也不是命令——提取前剔除，避免对账被虚假满足。
   for (const raw of commandText.split(/\r?\n/)) {
     const line = raw.trim()
     if (!line || line.startsWith('#')) continue
-    const cmd = line.replace(/"[^"]*"|'[^']*'/g, '').replace(/#.*$/, '')
+    const cmd = stripQuotesAndComment(line)
     for (const m of cmd.matchAll(/\bnpm run ([A-Za-z0-9_.:@/-]+)/g)) step.scripts.push(m[1])
   }
 }

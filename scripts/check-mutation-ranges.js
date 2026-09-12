@@ -214,50 +214,49 @@ function listRepoJsFiles () {
 
 function globToRegExp (pattern) {
   let out = '^'
-  for (let i = 0; i < pattern.length; i++) {
-    const c = pattern[i]
+  let cursor = 0
+  while (cursor < pattern.length) {
+    const c = pattern[cursor]
     if (c === '*') {
       // 收起连续的 `*`，先判 globstar（`**` 且位于路径开头或紧跟 / 后）：
       //   - `**/`：匹配零个或多个「目录/」段（可跨 /），消费掉紧随的 `/`（0 层时无前导 /）
       //   - 末尾 `**`：递归匹配其后所有层（如 `scripts/**`）
       //   - 其余位置的 `**`（段中间，如 `a/**b`）：保守按单 `*` 处理，避免跨分隔符误报覆盖
-      let j = i
+      let j = cursor
       while (pattern[j + 1] === '*') j++
-      const isGlobstar = j - i + 1 >= 2 && (i === 0 || pattern[i - 1] === '/')
+      const isGlobstar = j - cursor + 1 >= 2 && (cursor === 0 || pattern[cursor - 1] === '/')
       if (isGlobstar && pattern[j + 1] === '/') {
         out += '(?:[^/]*/)*'
-        i = j + 1 // 消费 `**` 及紧随的 `/`：`**/` 整体表示「零个或多个 dir/」
-        continue
-      }
-      if (isGlobstar && j === pattern.length - 1) {
+        cursor = j + 1 // 消费 `**` 及紧随的 `/`；循环尾 cursor++ 跳到 `/` 之后
+      } else if (isGlobstar && j === pattern.length - 1) {
         out += '[^/]*(?:/[^/]*)*' // 末尾 globstar：递归匹配其余所有层
-        i = j
-        continue
+        cursor = j // 循环尾 cursor++ 跳到末尾之后，循环结束
+      } else {
+        out += '[^/]*'
+        cursor = j // 普通 `*`/段中间 `**`：仅消费 `*` 本身
       }
-      out += '[^/]*'
-      i = j
     } else if (c === '?') {
       out += '[^/]'
     } else if (c === '{') {
-      const close = pattern.indexOf('}', i + 1)
-      const alts = close === -1 ? null : pattern.slice(i + 1, close).split(',')
+      const close = pattern.indexOf('}', cursor + 1)
+      const alts = close === -1 ? null : pattern.slice(cursor + 1, close).split(',')
       if (alts && alts.length >= 2 && alts.every(a => a && !globChars.test(a))) {
         out += '(?:' + alts.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')'
-        i = close // 循环 i++ 跳过 `}`
+        cursor = close // 跳过 `}`；循环尾 cursor++ 到 `}` 之后
       } else {
         out += '\\{'
       }
     } else if (c === '[') {
-      const close = pattern.indexOf(']', i + 1)
+      const close = pattern.indexOf(']', cursor + 1)
       if (close !== -1) {
-        let cls = pattern.slice(i + 1, close)
+        let cls = pattern.slice(cursor + 1, close)
         let negate = ''
         if (cls[0] === '!' || cls[0] === '^') { negate = '^'; cls = cls.slice(1) }
         // 类内仅接受字面与 `-` 范围；含 `\`/`]`/`[`/`^`、空类或乱序范围（`0--` 等会让 new RegExp
         // 抛 Range out of order）一律按字面 `[` 处理——生成的 RegExp 必须永远合法（绝不崩溃，也绝不虚报覆盖）
         if (cls && !/[\]^[\\]/.test(cls) && rangesOrdered(cls)) {
           out += '[' + negate + cls + ']'
-          i = close // 循环 i++ 跳过 `]`
+          cursor = close // 跳过 `]`；循环尾 cursor++ 到 `]` 之后
         } else {
           out += '\\['
         }
@@ -267,6 +266,7 @@ function globToRegExp (pattern) {
     } else {
       out += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     }
+    cursor++
   }
   return new RegExp(out + '$')
 }
