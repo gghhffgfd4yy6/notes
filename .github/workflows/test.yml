@@ -139,10 +139,11 @@ jobs:
       - name: 全量单元测试（run_unit_tests.js）
         run: npm run test:unit
         env:
-          # 显式步骤已单独跑过这些套件（12 个，含最大的 test_filter.js），全量兜底时跳过避免重复。
+          # 显式步骤已单独跑过这些套件（11 个，含最大的 test_filter.js），全量兜底时跳过避免重复。
           # 失败仍由显式步骤独立呈现（step 名定位）；变异评估子进程不继承本变量（run_mutation.js spawn 强制清空），
-          # SKIP 清单须与上方显式步骤保持一致——漏写会重复跑（浪费），多写会漏跑（门禁盲区）。
-          SKIP_SUITES: test_filter.js,test_mutation_json.js,test_mutation_report.js,test_failure_policy.js,test_loop_utils.js,test_storage.js,test_agents.js,test_network.js,test_http.js,test_sendnotify_utils.js,test_qinglong_utils.js,test_notify.js
+          # SKIP 清单须与上方显式步骤保持一致——漏写会重复跑（浪费），多写会漏跑（门禁盲区）；
+          # 该双向对账由 test_ci_skip_suites.js 固定在门禁里（含「拼错即失败」）。
+          SKIP_SUITES: test_filter.js,test_mutation_json.js,test_mutation_report.js,test_failure_policy.js,test_loop_utils.js,test_storage.js,test_agents.js,test_network.js,test_http.js,test_sendnotify_utils.js,test_qinglong_utils.js
 
       # 集成测试策略：先跑并行调度版，成功则跳过串行完整版（省时间）；
       # 并行失败时不立即判定失败，再跑串行完整版兜底（并行可能因调度/flaky 失败）。
