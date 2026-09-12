@@ -7,19 +7,14 @@
 const assert = require('node:assert')
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
 const { SUITES } = require('./test_suites')
 
-// 仓库内固定路径（__dirname + 常量），非用户输入
-const testYmlPath = path.join(__dirname, '.github/workflows/test.yml')
-const mutationYmlPath = path.join(__dirname, '.github/workflows/mutation.yml')
-// codacy-disable-next-line：仓库内固定路径，非外部输入
-// nosemgrep: 仓库内固定路径，非用户输入
-const testYml = fs.readFileSync(testYmlPath, 'utf8')
-// codacy-disable-next-line：仓库内固定路径，非外部输入
-// nosemgrep: 仓库内固定路径，非用户输入
-const mutationYml = fs.readFileSync(mutationYmlPath, 'utf8')
+// 仓库根固定路径：本套件以仓库根为 cwd 运行（CI 的 npm run test:unit、copyProject 沙箱、stryker 沙箱
+// 都在仓库/沙箱根启动），故统一用字面量相对路径——不动态拼路径，静态分析也就没有误报空间。
+assert.ok(fs.existsSync('package.json'), '请在仓库根目录运行本套件（CI 与沙箱均由仓库根启动）')
+const testYml = fs.readFileSync('.github/workflows/test.yml', 'utf8')
+const mutationYml = fs.readFileSync('.github/workflows/mutation.yml', 'utf8')
 const pkg = require('./package.json')
 
 // ── 1. 清单自身必须干净 ─────────────────────────────────────
@@ -83,7 +78,7 @@ function runEntry (env) {
 }
 const skipAll = unitFiles.join(',') // 跳过全部单元套件 → 不真正执行套件，几秒内跑完
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-skip-suites-'))
+fs.mkdirSync('reports', { recursive: true }) // reports/ 已被 .gitignore 忽略，用作 summary 落点
 try {
   // 3a 拼错的条目必须炸（修复前是静默照跑全量）
   const unknown = runEntry({ SKIP_SUITES: 'test_not_exist.js' })
@@ -91,32 +86,36 @@ try {
   assert.match(unknown.stderr, /test_not_exist\.js/, '错误应点名未知套件')
 
   // 3b CI 下写 summary（顺带验证过滤生效：跳过全部 → 0 套件）
-  const sumFile = path.join(tmp, 'summary.md')
-  const filtered = runEntry({ SKIP_SUITES: skipAll, GITHUB_STEP_SUMMARY: sumFile })
+  const filtered = runEntry({ SKIP_SUITES: skipAll, GITHUB_STEP_SUMMARY: 'reports/.ci-summary-check.md' })
   assert.strictEqual(filtered.status, 0, filtered.stderr || filtered.stdout)
   assert.match(filtered.stdout, /共 0 个套件/, '跳过全部套件时应报告 0 个')
-  // codacy-disable-next-line：tmp 目录由 mkdtempSync 生成，非外部输入
-  // nosemgrep: tmp 目录由 mkdtempSync 生成，非外部输入
-  const summary = fs.readFileSync(sumFile, 'utf8')
+  const summary = fs.readFileSync('reports/.ci-summary-check.md', 'utf8')
   assert.match(summary, /^## 单元测试结果/m, 'CI 下应写入 job summary')
   assert.match(summary, /共 0 套件/, 'summary 套件数应与实际执行数一致')
 
-  // 3c 变异子进程必须不写 summary（否则每个变异体追加一次整表）
-  const sumFile2 = path.join(tmp, 'summary-child.md')
-  const child = runEntry({ SKIP_SUITES: skipAll, GITHUB_STEP_SUMMARY: sumFile2, XBK_MUTATION_CHILD: '1' })
+  // 3c 变异子进程必须不写 summary：把落点指到不存在的目录，真去写就会 ENOENT 崩掉 ——
+  //    因此「exit 0 且 stderr 无 ENOENT」即证明没有发生写入
+  const child = runEntry({
+    SKIP_SUITES: skipAll,
+    GITHUB_STEP_SUMMARY: 'reports/.ci-missing-dir/.ci-summary-child.md',
+    XBK_MUTATION_CHILD: '1'
+  })
   assert.strictEqual(child.status, 0, child.stderr || child.stdout)
-  // codacy-disable-next-line：tmp 目录由 mkdtempSync 生成，非外部输入
-  // nosemgrep: tmp 目录由 mkdtempSync 生成，非外部输入
-  assert.ok(!fs.existsSync(sumFile2), 'XBK_MUTATION_CHILD=1 时不得写 job summary')
+  assert.ok(!/ENOENT/.test(child.stderr || ''), 'XBK_MUTATION_CHILD=1 时不得尝试写 job summary')
 
   // 3e 输出超限（ENOBUFS）必须标注为「输出超限」而不是普通测试失败：
   //    XBK_UNIT_MAX_BUFFER 仅测试注入；留一个必输出内容的套件、把上限压到 1 字节
   const oneLeft = unitFiles.filter(f => f !== 'test_check_deps.js').join(',')
-  const overflow = runEntry({ SKIP_SUITES: oneLeft, GITHUB_STEP_SUMMARY: path.join(tmp, 'summary-overflow.md'), XBK_UNIT_MAX_BUFFER: '1' })
+  const overflow = runEntry({
+    SKIP_SUITES: oneLeft,
+    GITHUB_STEP_SUMMARY: 'reports/.ci-summary-overflow.md',
+    XBK_UNIT_MAX_BUFFER: '1'
+  })
   assert.notStrictEqual(overflow.status, 0, '输出超过 maxBuffer 的套件应判定失败')
   assert.match(overflow.stdout, /::error title=输出超限/, '失败原因必须标注为输出超限（非测试失败）')
 } finally {
-  fs.rmSync(tmp, { recursive: true, force: true })
+  fs.rmSync('reports/.ci-summary-check.md', { force: true })
+  fs.rmSync('reports/.ci-summary-overflow.md', { force: true })
 }
 
 // 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加
