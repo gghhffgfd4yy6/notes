@@ -38,7 +38,8 @@
     "test:mutation-ranges": "node scripts/check-mutation-ranges.js",
     "test:coverage": "c8 --reporter=text --reporter=lcov --reporter=json-summary --exclude='test_*.js' --exclude='run_tests.js' node run_tests.js",
     "check": "npm run lint && node check-version.js && node scripts/check-mutation-ranges.js && npm test",
-    "verify": "npm run check"
+    "verify": "npm run check",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "dependencies": {
     "got": "11.8.6"

@@ -12,6 +12,9 @@ permissions:
   contents: write
 jobs:
   release:
+    # 仅在 v* tag 触发时运行：workflow_dispatch 在分支上触发时 GITHUB_REF 为 refs/heads/*，
+    # 会使 VERSION 提取得到错误值并创建错误 tag/Release，故用 job 级条件拦住非 tag 运行。
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

@@ -3,7 +3,6 @@ name: "CodeQL config"
 paths-ignore:
   - test_filter.js
   - test_app.js
-  - test_app_parallel.js
   - test_notify.js
   - test_failure_policy.js
   - run_tests.js
