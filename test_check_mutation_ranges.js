@@ -24,7 +24,7 @@ const SPECIAL_SEGMENTS = {
   'qinglong/xbk_push.js': ['qinglong-push'],
   'scripts/check-deps.js': ['check-deps']
 }
-const SPLIT_DEFAULT_RANGES = { 'xbk_sendNotify_slim.js': ['1-750', '751-1473'] }
+const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': 750 } // 拆段边界固定，终点随文件增长自动跟随
 
 // 构造包含所有生产文件的 yml，行段可按文件覆盖
 function buildYml (overrides = {}) {
@@ -38,7 +38,9 @@ function buildYml (overrides = {}) {
     const raw = fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : 'x\n'
     const lines = raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
     const names = SPECIAL_SEGMENTS[f] || [f.replace(/^xbk_/, '').replace(/\.js$/, '').replace(/_/g, '-')]
-    const fallback = SPLIT_DEFAULT_RANGES[f] || [`1-${lines}`]
+    const fallback = SPLIT_BOUNDARY_RANGES[f]
+      ? [`1-${SPLIT_BOUNDARY_RANGES[f]}`, `${SPLIT_BOUNDARY_RANGES[f] + 1}-${lines}`]
+      : [`1-${lines}`]
     const ranges = Array.isArray(overrides[f]) ? overrides[f] : (overrides[f] ? [overrides[f]] : fallback.map(() => null))
     return ranges.map((range, i) => {
       const name = names[i] || `${names[0]}-${i}`

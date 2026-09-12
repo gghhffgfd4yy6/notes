@@ -10,12 +10,9 @@ const { execFileSync } = require('node:child_process')
 const SCRIPT = path.join(__dirname, 'scripts', 'mutation-report.js')
 
 // validateSegments 要求的全部分段名——以生产脚本为单一来源，消除双份维护：
-// scripts/mutation-report.js 未导出该常量，故直接读取其源码里的 EXPECTED_SEGMENTS 字面量，
-// 生产端新增/改名分段时本测试自动跟随（解析失败即显式报错，不会静默用空清单）。
-const SEG_SOURCE = fs.readFileSync(SCRIPT, 'utf8')
-const SEG_MATCH = SEG_SOURCE.match(/EXPECTED_SEGMENTS\s*=\s*Object\.freeze\(\s*\[([\s\S]*?)\]\)/)
-assert.ok(SEG_MATCH, '应从 scripts/mutation-report.js 解析到 EXPECTED_SEGMENTS 清单')
-const REQUIRED_SEGS = [...SEG_MATCH[1].matchAll(/'([^']+)'/g)].map(m => m[1])
+// 直接消费导出的常量（mutation-report.js 现已导出 EXPECTED_SEGMENTS；
+// 不再从源码文本正则解析——导出后文本解析既多余又脆弱）
+const REQUIRED_SEGS = require('./scripts/mutation-report.js').EXPECTED_SEGMENTS
 assert.ok(REQUIRED_SEGS.length > 0, '生产脚本 EXPECTED_SEGMENTS 不应为空')
 
 function runCli (args, opts = {}) {
