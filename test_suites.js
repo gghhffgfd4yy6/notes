@@ -42,6 +42,7 @@ const SUITES = [
   { name: '变异调度器', file: 'test_run_mutation.js', desc: 'generateMutants 词法扫描/注释字符串跳过 + extractTestSummary 输出解析' },
   { name: '变异内部函数', file: 'test_run_mutation_internal.js', desc: 'lineColumn/isIdent/lineTriple/numberBefore/numberAfter/mapLimit/saveCheckpoint/loadCheckpoint/copyProject/applyMutants 11个内部函数' },
   { name: '变异运行时', file: 'test_run_mutation_cli.js', desc: 'run_mutation.js runTests（通过/失败/超时）+ evaluate（复制项目→应用变异→运行测试→清理）' },
+  { name: '变异超时竞态', file: 'test_run_mutation_race.js', desc: 'runTests 超时兜底/close 透传注入式回归' },
   { name: '变异范围校验', file: 'test_check_mutation_ranges.js', desc: 'check-mutation-ranges.js 子进程：全覆盖/漏测/不连续/越界 exit code', mutationSkip: true },
   { name: '变异范围', file: 'test_mutation_ranges.js', desc: '生产模块及行段必须完整纳入 mutation 矩阵', mutationSkip: true },
   { name: 'CI跳过清单对账', file: 'test_ci_skip_suites.js', desc: 'SKIP_SUITES ↔ test.yml 显式步骤双向一致 + 入口过滤/summary 行为' },
