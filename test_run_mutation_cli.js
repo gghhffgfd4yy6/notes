@@ -86,8 +86,13 @@ const { runTests, evaluate } = require('./run_mutation')
     // 行为断言 3：output 中包含至少一个测试套件的执行痕迹
     assert.ok(result.output.includes('通过') || result.output.includes('失败'),
       'output 应包含测试通过/失败的执行痕迹')
-    // 行为断言 4：code 字段存在且为数字（进程退出码）
-    assert.ok(typeof result.code === 'number', 'code 应为数字（进程退出码）')
+    // 行为断言 4：code 字段契约完整——正常退出是数字；超时路径显式 code: null（不接受 undefined）
+    if (result.status === 'timeout') {
+      assert.ok(result.code === null, '超时结果应显式返回 code: null（不是 undefined）')
+      assert.strictEqual(result.signal, 'SIGKILL', '超时应记录 SIGKILL')
+    } else {
+      assert.ok(typeof result.code === 'number', '非超时结果 code 应为数字（进程退出码）')
+    }
     // evaluate 的 finally 块会清理临时目录，无需额外断言
   }
 
