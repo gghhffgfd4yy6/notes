@@ -15,10 +15,15 @@ function runChecker (workflowText) {
   })
 }
 
+// 按行删除指定内容：不用多行正则（`\s*…\s*` 相邻量词会被静态分析判为可回溯超线性，Sonar S8786）
+function dropLines (text, targets) {
+  return text.split('\n').filter(line => !targets.includes(line.trim())).join('\n')
+}
+
 const current = runChecker(yml)
 assert.strictEqual(current.status, 0, current.stderr || current.stdout)
 
-const missingTarget = runChecker(yml.replace(/\r?\n\s*- name: utils\r?\n(?:\s*src: "[^"]+"\r?\n)?\s*mutate: "xbk_utils\.js"/, ''))
+const missingTarget = runChecker(dropLines(yml, ['- name: utils', 'src: "xbk_utils.js"', 'mutate: "xbk_utils.js"']))
 assert.notStrictEqual(missingTarget.status, 0, '遗漏生产模块的矩阵必须失败')
 assert.match(missingTarget.stderr, /xbk_utils\.js/, '错误应点名遗漏模块')
 
@@ -32,7 +37,7 @@ const badSrc = runChecker(yml.replace('src: "xbk_utils.js"', 'src: "xbk_util.js"
 assert.notStrictEqual(badSrc.status, 0, 'src 与 mutate 目标不一致必须失败')
 assert.match(badSrc.stderr, /src\(xbk_util\.js\)/, '错误应点名不一致的 src')
 
-const missingSrc = runChecker(yml.replace(/\r?\n\s*src: "xbk_utils\.js"/, ''))
+const missingSrc = runChecker(dropLines(yml, ['src: "xbk_utils.js"']))
 assert.notStrictEqual(missingSrc.status, 0, 'matrix 缺 src 字段必须失败')
 assert.match(missingSrc.stderr, /缺 src 字段/, '错误应说明缺 src')
 
