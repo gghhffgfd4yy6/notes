@@ -27,13 +27,29 @@ if (includeIdx !== -1) {
   for (const line of ymlLines.slice(includeIdx + 1)) {
     const indent = line.match(/^\s*/)[0].length
     if (/^\s*[A-Za-z_][\w-]*:/.test(line) && indent <= includeIndent) break // include 块结束（回到 steps: 等同级键）
-    if (/^\s*-\s*\S/.test(line)) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('- ')) {
       currentEntry = { name: null, src: null, mutate: null }
       matrixEntries.push(currentEntry)
     }
     if (!currentEntry) continue
-    const field = line.match(/^\s*-?\s*(name|src|mutate):\s*["']?([^"'\s#]+)/)
-    if (field) currentEntry[field[1]] = field[2]
+    // 字段解析走字符串切片而非正则：`\s*-?\s*` 这类相邻量词会被静态分析判为可回溯超线性（Sonar S8786）
+    const body = trimmed.startsWith('- ') ? trimmed.slice(2).trim() : trimmed
+    const colon = body.indexOf(':')
+    if (colon <= 0) continue
+    const key = body.slice(0, colon)
+    if (key !== 'name' && key !== 'src' && key !== 'mutate') continue
+    let value = body.slice(colon + 1).trim()
+    const quote = value[0]
+    if (quote === '"' || quote === "'") {
+      const close = value.indexOf(quote, 1) // 引号标量：取到闭合引号，内部的 # 属于值而非注释
+      value = close > 0 ? value.slice(1, close) : value.slice(1)
+    } else {
+      const hash = value.indexOf('#') // 裸标量：行内注释从 # 开始
+      if (hash !== -1) value = value.slice(0, hash)
+    }
+    value = value.trim()
+    if (value) currentEntry[key] = value
   }
 }
 

@@ -18,9 +18,10 @@ const mutationYml = fs.readFileSync('.github/workflows/mutation.yml', 'utf8')
 const pkg = require('./package.json')
 
 // ── 1. 清单自身必须干净 ─────────────────────────────────────
-const skipMatch = testYml.match(/^\s*SKIP_SUITES:\s*(\S.*)$/m)
-assert.ok(skipMatch, 'test.yml 应声明 SKIP_SUITES')
-const skips = skipMatch[1].split(',').map(s => s.trim()).filter(Boolean)
+// 清单解析走字符串切片而非正则：`\S.*$` 这类重叠量词会被静态分析判为可回溯超线性（Sonar S8786）
+const skipLine = testYml.split('\n').map(line => line.trim()).find(line => line.startsWith('SKIP_SUITES:'))
+assert.ok(skipLine, 'test.yml 应声明 SKIP_SUITES')
+const skips = skipLine.slice('SKIP_SUITES:'.length).split(',').map(s => s.trim()).filter(Boolean)
 assert.ok(skips.length > 0, 'SKIP_SUITES 不应为空')
 
 const byFile = new Map(SUITES.map(s => [s.file, s]))
@@ -58,7 +59,8 @@ for (const step of steps) {
   }
 }
 assert.ok(explicitFiles.size > 0, '应从 test.yml 解析出显式测试步骤')
-assert.deepStrictEqual(skips.slice().sort(), unitFiles.filter(f => explicitFiles.has(f)).sort(),
+const byName = (a, b) => a.localeCompare(b) // 显式比较函数：默认 sort 的字符串序不保证稳定可预期（Sonar S2871）
+assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explicitFiles.has(f)).sort(byName),
   'SKIP_SUITES 必须等于「显式步骤已覆盖的单元套件」：漏写会重复跑，多写会漏跑（门禁盲区）')
 
 // 2b. integration/mutationSkip 套件被 run_unit_tests.js 排除，只能靠显式步骤进门禁 ——
