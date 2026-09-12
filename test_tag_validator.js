@@ -24,6 +24,19 @@ const scriptSource = SEMVER_RE.source
 assert.strictEqual(scriptSource, bashRegexSource,
   'scripts/validate-release-tag.js 的 SEMVER_RE 必须与 release.yml 的 bash 内联正则逐字一致')
 
+// ── 交集语法约束：逐字一致只防文本漂移，不防语义分叉 ──
+// bash ERE 与 JS RegExp 语法集合不同（\d \w \s \b \B \D \W \S 简写类、反向引用、(?= (?<= (?! (?<!
+// 前瞻/后顾、\p{...} Unicode 属性——两边要么一方不支持、要么语义不同）：若未来把正则扩展进这类写法，
+// 上面的逐字断言照样通过，但 CI（bash）与本地（JS）行为分叉。下面用禁用 token 黑名单强制执行
+// 「只会用两方言语义交集的子集」这一约束（详见 validate-release-tag.js 头部说明），引入即红。
+const FORBIDDEN_TOKENS = ['\\d', '\\w', '\\s', '\\b', '\\B', '\\D', '\\W', '\\S', '(?', '\\p{']
+for (const token of FORBIDDEN_TOKENS) {
+  assert.ok(!scriptSource.includes(token),
+    `SEMVER_RE 不得含 bash/JS 语义分歧写法 ${JSON.stringify(token)}（交集语法约束）`)
+  assert.ok(!bashRegexSource.includes(token),
+    `release.yml 的 bash 正则不得含 bash/JS 语义分歧写法 ${JSON.stringify(token)}（交集语法约束）`)
+}
+
 // 合法 tag 集合（语义：v数字.数字[.数字][-prerelease][+build]；禁止前导零；后缀组件非空）
 const validTags = [
   'v3.272', // 两段（CHANGELOG 风格）
