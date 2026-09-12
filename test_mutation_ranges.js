@@ -46,5 +46,16 @@ const hashInQuote = runChecker(yml.replace('src: "xbk_utils.js"', 'src: "xbk_uti
 assert.notStrictEqual(hashInQuote.status, 0, '带 # 的引号值必须与 mutate 目标判为不一致，不得在 # 处截断')
 assert.match(hashInQuote.stderr, /src\(xbk_utils\.js#frag\)/, '报错应回显完整值（证明未截断）')
 
+// 段名漂移：report 阶段才 throw 会白跑一整轮矩阵，必须在范围校验阶段就拦住
+const renamed = runChecker(yml.replace('- name: utils', '- name: utils-renamed'))
+assert.notStrictEqual(renamed.status, 0, '矩阵段名与 mutation-report 的 EXPECTED_SEGMENTS 不一致必须失败')
+assert.match(renamed.stderr, /期望的分段未出现在矩阵/, '应指出 mutation-report 期望的段缺失')
+assert.match(renamed.stderr, /不认识的段名/, '应指出矩阵多出 report 不认识的段名')
+
+// stryker.config.js 的 mutate 与矩阵文件集漂移（矩阵少一个目标 → config 多一个）
+const configDrift = runChecker(dropLines(yml, ['- name: check-deps', 'src: "scripts/check-deps.js"', 'mutate: "scripts/check-deps.js"']))
+assert.notStrictEqual(configDrift.status, 0, 'stryker.config.js 与矩阵文件集不一致必须失败')
+assert.match(configDrift.stderr, /stryker\.config\.js 的 mutate 含矩阵未覆盖的文件/, '应指出 config 多跑的文件')
+
 console.log('✅ 遗漏生产模块或行段越界会使 mutation 范围校验失败')
 console.log('✅ 当前 mutation 矩阵覆盖全部生产模块')

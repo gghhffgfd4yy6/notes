@@ -325,4 +325,4 @@ if (require.main === module) {
 }
 
 // 导出供测试（不导出 main：依赖 CLI 副作用；postIssue 导出以便 mock fetch 测去重/错误处理逻辑）
-module.exports = { analyze, validateSegments, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate, postIssue }
+module.exports = { analyze, validateSegments, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate, postIssue, EXPECTED_SEGMENTS }

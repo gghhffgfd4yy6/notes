@@ -34,7 +34,8 @@ module.exports = {
     'xbk_storage.js',
     'xbk_loop.js',
     'xbk_failure_policy.js',
-    'qinglong/xbk_push.js'
+    'qinglong/xbk_push.js',
+    'scripts/check-deps.js'
   ],
   coverageAnalysis: 'off',
   // 纯 JS 项目无需类型检查注入。CI run #120 根因：ranges 行数元校验

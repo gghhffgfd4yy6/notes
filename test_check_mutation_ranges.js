@@ -16,6 +16,16 @@ const TEST_FILE_LINES = (() => {
   return raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
 })()
 
+// 段名必须与 mutation-report 的 EXPECTED_SEGMENTS 一致（check-mutation-ranges 会校验），
+// 故默认夹具使用真实段名；被 overrides 拆分/合并的用例段名可能不再对应（那些用例只断言 exit 1 + 具体报错）。
+const SPECIAL_SEGMENTS = {
+  'xbk_function_v3.js': ['v3-entry'],
+  'xbk_sendNotify_slim.js': ['sendnotify-part1', 'sendnotify-part2'],
+  'qinglong/xbk_push.js': ['qinglong-push'],
+  'scripts/check-deps.js': ['check-deps']
+}
+const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': 750 } // 拆段边界固定，终点随文件增长自动跟随
+
 // 构造包含所有生产文件的 yml，行段可按文件覆盖
 function buildYml (overrides = {}) {
   const productionFiles = [
@@ -27,9 +37,15 @@ function buildYml (overrides = {}) {
     const full = path.join(ROOT, f)
     const raw = fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : 'x\n'
     const lines = raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
-    const ranges = Array.isArray(overrides[f]) ? overrides[f] : [overrides[f] || `1-${lines}`]
-    const safeName = f.replace(/[/.]/g, '-')
-    return ranges.map((range, i) => `          - name: ${safeName}-${i}\n            src: "${f}"\n            mutate: "${f}:${range}"`).join('\n')
+    const names = SPECIAL_SEGMENTS[f] || [f.replace(/^xbk_/, '').replace(/\.js$/, '').replace(/_/g, '-')]
+    const fallback = SPLIT_BOUNDARY_RANGES[f]
+      ? [`1-${SPLIT_BOUNDARY_RANGES[f]}`, `${SPLIT_BOUNDARY_RANGES[f] + 1}-${lines}`]
+      : [`1-${lines}`]
+    const ranges = Array.isArray(overrides[f]) ? overrides[f] : (overrides[f] ? [overrides[f]] : fallback.map(() => null))
+    return ranges.map((range, i) => {
+      const name = names[i] || `${names[0]}-${i}`
+      return `          - name: ${name}\n            src: "${f}"\n            mutate: "${f}:${range || fallback[i] || fallback[0]}"`
+    }).join('\n')
   }).join('\n')
   return `name: mutation\non: push\njobs:\n  mutation:\n    strategy:\n      matrix:\n        include:\n${matrix}\n`
 }
