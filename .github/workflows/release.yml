@@ -9,14 +9,43 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 jobs:
+  # 手动触发（workflow_dispatch）但所选 ref 不是 v* tag 时给出明确提示：
+  # 否则 release job 被 job 级 if 拦下仅显示 skipped，用户不知道为什么没运行。
+  # 仅在 dispatch 且非 v* tag 时运行；push tag 与 dispatch 于 v* tag 时条件为假，不影响正常路径。
+  dispatch-hint:
+    if: ${{ github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 明确报错：workflow_dispatch 必须在 v* tag 上运行
+        run: |
+          echo "::error::release 工作流只应在 v* tag 上运行；当前 ref 是 ${GITHUB_REF}（触发方式：workflow_dispatch）。"
+          echo "请在正确的 tag 上重试，例如：git tag v3.272 && git push origin v3.272"
+          exit 1
+
   release:
     # 仅在 v* tag 触发时运行：workflow_dispatch 在分支上触发时 GITHUB_REF 为 refs/heads/*，
     # 会使 VERSION 提取得到错误值并创建错误 tag/Release，故用 job 级条件拦住非 tag 运行。
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
+      # 校验 tag 版本号格式（semver）：job 级 if 只保证 v* 前缀，vfoo 这类非版本 tag 也会被放行，
+      # 必须在创建 Release 前显式失败并 exit 1，避免误建 Release。
+      # 仓库版本格式：CHANGELOG 为 v3.272（两段）、package.json 为 3.272.0（三段），两种形式均接受；
+      # 数字组件不允许前导零（03.2 非法，0.1.0 合法），后缀（prerelease/build）不允许空组件/以 . 结尾
+      # （alpha.、alpha..1 非法，rc.1、build.5 合法）；正则无嵌套/相邻量词，线性安全（参考 #127 超线性正则教训）。
+      - name: 校验 tag 版本号格式（semver）
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?([-][0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?([+][0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::tag 名称 'v${VERSION}' 不是合法版本号（应为 v数字.数字[.数字][-后缀] 形式，如 v3.272 / v3.272.0），已中止 Release 创建。"
+            exit 1
+          fi
+          echo "版本号格式校验通过：v${VERSION}"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0

@@ -101,11 +101,18 @@ function copyProject (dir, files) {
   const testFiles = entries.filter(f => /^test_.*\.js$/.test(f))
   const srcFiles = entries.filter(f => /^xbk_.*\.js$/.test(f))
   const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md']
-  for (const name of [...extraTop, ...testFiles, ...srcFiles, ...files]) {
+  // 固定清单（extraTop + 调用方传入的 files，如 DEFAULT_FILES）属必选：缺失须响亮报错，不能静默 continue——
+  // 漏拷文件会留下沙箱 MODULE_NOT_FOUND/ENOENT → evaluate 恒 fail 的不响亮回归（#120/#122 一类根因）。
+  // 动态清单（testFiles/srcFiles 来自 readdirSync，必已存在）保持 continue 兜底；目录整体复制（scripts/qinglong/.github）是可选复制，语义不变。
+  const required = new Set([...extraTop, ...files])
+  for (const name of [...required, ...testFiles, ...srcFiles]) {
     // 信任边界防护：拒绝目录穿越/绝对路径，确保只复制 ROOT 内文件
     if (name.includes('..') || path.isAbsolute(name)) throw new Error(`copyProject 拒绝越界路径: ${name}`)
     const src = path.join(ROOT, name)
-    if (!fs.existsSync(src)) continue
+    if (!fs.existsSync(src)) {
+      if (required.has(name)) throw new Error(`copyProject 缺少必要文件: ${name}`)
+      continue
+    }
     const dst = path.join(dir, name)
     fs.mkdirSync(path.dirname(dst), { recursive: true })
     fs.copyFileSync(src, dst)
@@ -142,14 +149,38 @@ function runTests (dir, timeoutMs) {
     // 变异评估必须跑全量套件 —— 清除 SKIP_SUITES，防止 CI 显式步骤的跳过清单继承到子进程使变异分数失真。
     const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, XBK_MUTATION_CHILD: '1', SKIP_SUITES: '' } })
     let output = ''
+    // 超时竞态修复：此前 setTimeout 回调里 kill 后立即 resolve，但此时 close 尚未触发、closeSignal 必为 null，
+    // 且 stdout/stderr 还在继续排空——resolve 时既拿不到真实 signal（竞态），也拿不到最终完整 output，
+    // 后续 close 回调的 resolve 因 Promise 已 resolve 被忽略（#131 qodo #3）。现改为：超时分支只标记 timedOut
+    // 并 kill，真正的 resolve 一律收敛到 close 回调（close 时信号/输出已定稿），再叠加一个兜底保险定时器
+    // 防止 kill 后 close 永不触发（异常文件描述符/僵尸进程）导致 Promise 悬空。
+    let timedOut = false
+    let falloutTimer = null
     child.stdout.on('data', d => { output += d })
     child.stderr.on('data', d => { output += d })
-    const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ status: 'timeout', code: null, signal: 'SIGKILL', output }) }, timeoutMs)
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGKILL')
+      // 兜底保险：kill 后若 close 迟迟不触发（极端情况），仍要 resolve 不让 Promise 悬空——
+      // 用当前已 collect 的输出，signal 回退 'SIGKILL'（真实 close signal 已无从得知）。
+      // 正常 kill 会在毫秒级触发 close，此保险不会与 close 的 resolve 竞争（timedOut 已置位，
+      // 谁先 resolve 都会走 timeout 形态且结果一致）。
+      falloutTimer = setTimeout(() => {
+        resolve({ status: 'timeout', code: null, signal: 'SIGKILL', output, summary: extractTestSummary(output) })
+      }, 2000)
+    }, timeoutMs)
     child.on('close', (code, signal) => {
       clearTimeout(timer)
-      // S8786/S6594：多量词组正则（(\d+)(sep)(\d+)）被标超线性回溯且 String.match 被标；
-      // 改 exec + 逐关键字单数字组线性提取（summary 仅写入变异报告，无逻辑消费方）
-      resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: extractTestSummary(output) })
+      if (falloutTimer) clearTimeout(falloutTimer)
+      if (timedOut) {
+        // 已标记超时：契约固定返回 timeout 形态（code: null），signal 用 close 收到的真实值——
+        // 子进程被 SIGKILL 杀死时此地拿到 'SIGKILL'；若 kill 前已自然退出则拿到 null（带真实 code），
+        // 但既然标记了 timedOut，约定仍返回 timeout 形态，signal 用 signal || 'SIGKILL' 兜底。
+        resolve({ status: 'timeout', code: null, signal: signal || 'SIGKILL', output, summary: extractTestSummary(output) })
+      } else {
+        // 正常路径：按退出码判定 pass/fail（与修复前一致）
+        resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: extractTestSummary(output) })
+      }
     })
   })
 }

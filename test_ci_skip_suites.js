@@ -37,18 +37,100 @@ for (const file of skips) {
 const unitFiles = SUITES.filter(s => !s.integration && !s.mutationSkip).map(s => s.file)
 // 显式步骤按「step 块」解析：带 if: 的步骤可能在本次运行中根本不执行（如「集成测试（串行完整版）」
 // 仅在并行失败时跑），不能算作门禁覆盖——否则把某个套件的步骤挂上 `if: false` 也能骗过对账。
-const steps = []
-let curStep = null
-for (const line of testYml.split(/\r?\n/)) {
-  if (/^\s*- (?:name|uses|run):/.test(line)) {
-    curStep = { conditional: false, scripts: [] }
-    steps.push(curStep)
+// 解析器对 YAML 排版变化保持稳健（本文件是门禁意图：红=提醒人工同步，常规排版变化不应误红）：
+//   ① 步骤起点：`- name:` / `- uses:` / `- run:` / `- if:`（YAML 允许省略 name）均视为新 step 块；
+//   ② run: 支持多行形式（`run: |` / `run: >`，或 run: 后跟缩进更深的续行），命令文本合并后只提取
+//      `npm run <script>` 命令名——解析不出命令名仍会红（那才是真正的门禁缺口），排版变化不再误红；
+//   ③ 步骤内其它字段（uses/with/env/id/continue-on-error 等）不参与命令提取，也不破坏步骤归属；
+//   ④ if: 仅在缩进比当前 step 起点更深时视为步骤级条件——job 级 if:（缩进更浅）不属任何 step，
+//      避免把已覆盖的步骤误标为条件步骤而被对账忽略。
+// 从命令文本中提取 `npm run <script>` 命令名（脚本名取首个 token，排除 shell 元字符，避免跨行吞并）；
+// 提取不出任何命令名时该步骤对 explicitFiles 无贡献——缺失的覆盖最终仍会被下面对账断言拦下（保持红），
+// 这里只负责「正常排版变化不误红」。
+// 从命令文本中剔除引号段与行内注释，返回线性扫描后的命令串：
+// 引号内的文本（echo "参考: npm run x" 这类诊断输出）不是命令；`#` 后的行内注释也不是。
+// 用逐字符扫描而非 `"[^"]*"|'[^']*'` 交替正则——后者对含大量引号的输入存在超线性回溯面（Sonar S8786）。
+function stripQuotesAndComment (line) {
+  let out = ''
+  let quote = ''
+  for (const ch of line) {
+    if (quote) {
+      if (ch === quote) quote = ''
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+    } else if (ch === '#') {
+      break
+    } else {
+      out += ch
+    }
   }
-  if (!curStep) continue
-  if (/^\s*if:/.test(line)) curStep.conditional = true
-  const run = line.match(/^\s*run:\s*npm run (\S+)\s*$/)
-  if (run) curStep.scripts.push(run[1])
+  return out
 }
+function collectNpmScripts (step, commandText) {
+  // 只认真实命令：注释行（`# npm run x`）与行内注释（`npm run foo # 说明` 的 # 后部分）不是命令，
+  // 引号内的文本（echo "参考: npm run x" 这类诊断输出）也不是命令——提取前剔除，避免对账被虚假满足。
+  for (const raw of commandText.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    const cmd = stripQuotesAndComment(line)
+    for (const m of cmd.matchAll(/\bnpm run ([A-Za-z0-9_.:@/-]+)/g)) step.scripts.push(m[1])
+  }
+}
+
+// 把 test.yml 的「步骤 → npm run 脚本名」解析抽成可复用函数：主流程对账与下面 dummy 文本的
+// 回归断言共用同一解析器，避免两份口径漂移。#131 qodo #2 要求对 runLines 多行块 / EOF 补结算 /
+// 注释剔除补齐回归覆盖。
+function parseWorkflowSteps (text) {
+  const steps = []
+  let curStep = null
+  let runLines = null // 正在累积的 run: 多行块内容（null = 不在块内）
+  let runIndent = -1 // 进入块模式时 run: 键的缩进；续行缩进必须更深，回退到 <= runIndent 即块结束
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    const indent = line.length - line.trimStart().length
+    if (runLines !== null) {
+      if (indent > runIndent) { // run: 多行块的续行
+        runLines.push(trimmed)
+        continue
+      }
+      collectNpmScripts(curStep, runLines.join('\n')) // 缩进回退：块结束，结算已收集的命令
+      runLines = null
+    }
+    if (/^- (?:name|uses|run|if):/.test(trimmed)) {
+      curStep = { indent, conditional: /^- if:/.test(trimmed), scripts: [] }
+      steps.push(curStep)
+      const inlineRun = trimmed.match(/^- run: ?(.+)$/)
+      if (inlineRun) {
+        if (inlineRun[1] === '|' || inlineRun[1] === '>') {
+          // 紧凑块写法 `- run: |` / `- run: >`：块模式此前只由 `run:` 键触发，这里必须同样进入，
+          // 否则该步骤后续的命令行被当作普通行忽略 → 命令丢失（对账误报）
+          runLines = []
+          runIndent = indent
+        } else {
+          collectNpmScripts(curStep, inlineRun[1]) // `- run: npm run X` 单行简写也识别
+        }
+      }
+      continue
+    }
+    if (!curStep) continue
+    if (trimmed.startsWith('if:') && indent > curStep.indent) curStep.conditional = true
+    if (trimmed.startsWith('run:')) {
+      const rest = trimmed.slice('run:'.length).trim()
+      if (!rest || rest === '|' || rest === '>') {
+        runLines = [] // 块模式：后续缩进更深的行均为命令文本
+        runIndent = indent
+      } else {
+        collectNpmScripts(curStep, rest)
+      }
+    }
+  }
+  // 文件末尾的 run: 多行块：循环内只在缩进回退时结算，最后一步是块时必须在此补一次结算
+  if (runLines !== null) collectNpmScripts(curStep, runLines.join('\n'))
+  return steps
+}
+
+const steps = parseWorkflowSteps(testYml)
 const explicitFiles = new Set()
 for (const step of steps) {
   if (step.conditional) continue
@@ -62,6 +144,53 @@ assert.ok(explicitFiles.size > 0, '应从 test.yml 解析出显式测试步骤')
 const byName = (a, b) => a.localeCompare(b) // 显式比较函数：默认 sort 的字符串序不保证稳定可预期（Sonar S2871）
 assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explicitFiles.has(f)).sort(byName),
   'SKIP_SUITES 必须等于「显式步骤已覆盖的单元套件」：漏写会重复跑，多写会漏跑（门禁盲区）')
+
+// #131 qodo #2：runLines 多行块 / EOF 补结算 / 注释剔除的回归断言。
+// 用 dummy workflow 文本驱动同一解析器 parseWorkflowSteps，验证 scripts 收集正确——不依赖真实
+// test.yml（那是主对账的输入，这里专测解析边界）：
+//   1. `run: |` 块内两行各提取一个 npm run（多行块内逐行提取）
+//   2. 注释行（`# npm run ghost`）与行内注释（`npm run ... # 说明`）不进 scripts
+//   3. 引号内的文本（echo "npm run notcmd"）不进 scripts
+//   4. `run: |` 块放在文本末尾、且无尾随换行（EOF 补结算路径）仍能收集齐其命令
+//   5. `run: >` 折叠块、`if:` 条件步骤标记正确（conditional）以备对账忽略
+{
+  const dummy = [
+    'name: dummy',
+    'on: push',
+    'jobs:',
+    '  test:',
+    '    steps:',
+    '      - name: 多行块',
+    '        run: |',
+    '          npm run test:unit',
+    '          # npm run ghost',
+    '          npm run test:notify # 行内说明',
+    '          echo "npm run quoted-not-cmd"',
+    '      - name: 折叠块',
+    '        run: >',
+    '          npm run test:app',
+    '      - if: false',
+    '        run: npm run test:loop',
+    '      - name: 末尾块无尾随换行',
+    '        run: |',
+    '          npm run test:filter'
+  ].join('\n') // 故意不补末尾 \n：验证 EOF 补结算
+  const dummySteps = parseWorkflowSteps(dummy)
+  // 步骤数：name多行块 / 折叠块 / if条件 / 末尾块 = 4
+  assert.strictEqual(dummySteps.length, 4, 'dummy 应解析出 4 个步骤')
+  assert.deepStrictEqual(dummySteps[0].scripts, ['test:unit', 'test:notify'],
+    'run:| 块应逐行提取脚本，注释行(# npm run ghost)与行内注释(npm run test:notify #…)与引号文本均剔除')
+  assert.deepStrictEqual(dummySteps[1].scripts, ['test:app'], 'run:> 折叠块应提取 test:app')
+  assert.strictEqual(dummySteps[2].conditional, true, 'if: 步骤应标记 conditional（对账时忽略）')
+  assert.deepStrictEqual(dummySteps[2].scripts, ['test:loop'], '条件步骤仍应解析出其脚本')
+  assert.deepStrictEqual(dummySteps[3].scripts, ['test:filter'],
+    '文本末尾的 run:| 块（无尾随换行）应经 EOF 补结算提取 test:filter')
+  // 注释/引号不应污染任何步骤的 scripts
+  const allScripts = dummySteps.flatMap(s => s.scripts)
+  assert.ok(!allScripts.includes('ghost'), '注释中的命令名不应进入 scripts')
+  assert.ok(!allScripts.includes('quoted-not-cmd'), '引号内的文本不应进入 scripts')
+  console.log('✅ dummy workflow 解析断言通过（多行块/EOF补结算/注释剔除/if条件）')
+}
 
 // 2b. integration/mutationSkip 套件被 run_unit_tests.js 排除，只能靠显式步骤进门禁 ——
 //     漏一个就是门禁盲区（test_suites.js 注释写明「历史上多次发生」）

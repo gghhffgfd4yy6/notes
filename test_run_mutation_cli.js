@@ -61,6 +61,11 @@ const { runTests, evaluate } = require('./run_mutation')
       `)
       const result = await runTests(dir, 500) // 500ms 超时
       assert.strictEqual(result.status, 'timeout', '超时的测试应返回 timeout')
+      // 超时契约断言放在确定触发 timeout 的场景（死循环 500ms），而非 evaluate 分支——
+      // evaluate 用 120s 超时跑全量套件，CI 中几乎不会走到 timeout，那里的断言形同虚设（仅作防御保留）。
+      assert.strictEqual(result.code, null, '超时结果应显式返回 code: null（不是 undefined）')
+      assert.strictEqual(result.signal, 'SIGKILL', '超时应记录 SIGKILL')
+      assert.ok(Array.isArray(result.summary), '超时结果应返回 summary 数组（与正常运行路径契约对称）')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

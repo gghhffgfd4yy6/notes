@@ -30,6 +30,9 @@ const skipSuites = new Set((process.env.SKIP_SUITES || '').split(',').map(s => s
 const unknownSkips = [...skipSuites].filter(file => !SUITES.some(s => s.file === file))
 if (unknownSkips.length) {
   console.error(`❌ SKIP_SUITES 含不存在的套件：${unknownSkips.join(', ')}（请对照 test_suites.js 修正）`)
+  // 此 exit(1) 在变异场景同样生效（设计使然）：run_mutation.js 的 spawn 会强制清空 SKIP_SUITES，不受影响；
+  // 但本地直跑 stryker（npm run test:mutation）会继承 shell 环境变量。仅补充提示，不改变校验行为。
+  console.error('💡 若在本地变异场景遇到此错误，请确认未在环境变量中设置 SKIP_SUITES（变异评估要求全量；run_mutation.js 的子进程会自动清空，直跑 stryker 会继承你的 shell 环境）')
   process.exit(1)
 }
 // 无效条目（套件本就不进本入口，如 integration/mutationSkip）不致命，但意味着清单与显式步骤口径漂移。
@@ -56,8 +59,8 @@ console.log('══════════════════════�
 const IN_CI = Boolean(process.env.GITHUB_STEP_SUMMARY)
 const summaryLines = ['| 套件 | 文件 | 结果 | 耗时 |', '|---|---|---|---|']
 // CI 下 stdout 走 pipe 收进内存（失败时打包重显），故必须显式放大上限：execFileSync 默认 maxBuffer=1MiB，
-// 超限会抛 ENOBUFS —— 一个「通过」的套件会被误判为失败。实测最大套件 test_filter.js 约 75KB，余量充足。
-// XBK_UNIT_MAX_BUFFER 仅用于测试注入（构造超限场景），生产不设。
+// 超限会抛 ENOBUFS——触发按失败处理（fail-loud，见下方 catch 的注解）；实测最大套件 test_filter.js 约 75KB，
+// 8MiB 上限余量充足，生产不会误触。XBK_UNIT_MAX_BUFFER 仅用于测试注入（构造超限场景），生产不设。
 const MAX_BUFFER = Number(process.env.XBK_UNIT_MAX_BUFFER) || 8 * 1024 * 1024
 
 for (const s of UNIT_SUITES) {
@@ -77,13 +80,14 @@ for (const s of UNIT_SUITES) {
     summaryLines.push(`| ${s.name} | \`${s.file}\` | ✅ | ${(ms / 1000).toFixed(1)}s |`)
     console.log(`\n  ✅ ${s.name} 通过（${(ms / 1000).toFixed(1)}s）\n`)
   } catch (e) {
-    // 输出超限（ENOBUFS）不是测试失败，必须显式区分，否则「通过但话多」的套件会被当成红测排查。
+    // 输出超限（ENOBUFS）按失败处理（fail-loud 有意设计）：超限本身不是测试断言失败，
+    // 但流程仍以失败收尾（exit 1）——这里的区分只是给排查者的注解（「话多」红 ≠ 断言红），并非放行。
     const overflow = e.code === 'ENOBUFS' || /maxBuffer/i.test(String(e.message || ''))
     if (IN_CI) {
       // 失败必须全量炸出（默认组），拿回具体红测上下文（stderr 已直通，此处补 stdout）
       console.log('::endgroup::')
       console.log(overflow
-        ? `::error title=输出超限：${s.name}::${s.file} 的 stdout 超过 ${MAX_BUFFER} 字节上限（非测试失败）`
+        ? `::error title=输出超限：${s.name}::${s.file} 的 stdout 超过 ${MAX_BUFFER} 字节上限（输出超限按失败处理 fail-loud：超限本身非测试断言失败，但流程仍以 exit 1 收尾）`
         : `::error title=失败套件：${s.name}::${s.file}`)
       console.log((e.stdout || '').toString())
     }

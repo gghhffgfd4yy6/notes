@@ -116,5 +116,60 @@ function run (ymlText) {
     fs.rmSync(readFailDir, { recursive: true, force: true })
   }
 
+  // ===== glob 相关断言（缺陷C/缺陷B 的回归，qodo #4/#5）=====
+  // globToRegExp / listRepoJsFiles 现已被 check-mutation-ranges.js 导出；本文件被 require 时
+  // 该脚本已用 require.main === module 包住主流程，不会提前 process.exit。直接驱动纯函数断言：
+  //   - 合法 glob（含 *、?、{a,b} 交替、[字符类]、[!取反]、双星 **）覆盖判定不误报
+  //   - `**`（globstar）必须能跨目录分隔符（根级 0 层 / 单层 / 多层嵌套均判为覆盖），不误报 configMissing
+  //   - malformed（含 [[、乱序范围 [z-a]、未闭合 [）按字面处理、不抛异常
+  const { globToRegExp, listRepoJsFiles } = require('./scripts/check-mutation-ranges.js')
+  {
+    // globstar 跨目录：'**/xbk_*.js' 必须匹配根级与任意层嵌套
+    const xbkRe = globToRegExp('**/xbk_*.js')
+    for (const f of ['xbk_a.js', 'src/xbk_b.js', 'src/deep/nested/xbk_c.js']) {
+      assert.ok(xbkRe.test(f), `'**/xbk_*.js' 应匹配 ${f}（根级 0 层/单层/多层嵌套），不误报 configMissing`)
+    }
+    assert.ok(!xbkRe.test('xbk_app/bin.js'), "'**/xbk_*.js' 不应匹配 xbk_app/bin.js")
+    assert.ok(!xbkRe.test('other.js'), "'**/xbk_*.js' 不应匹配 other.js")
+
+    // 普通 `*` 不跨目录分隔符
+    const starRe = globToRegExp('xbk_*')
+    assert.ok(starRe.test('xbk_utils.js'), "'xbk_*' 应匹配根级文件")
+    assert.ok(!starRe.test('src/xbk_utils.js'), "'xbk_*' 不应跨 / 匹配子目录（单星语义）")
+
+    // 末尾 `**` 递归匹配其后所有层（scripts/**）
+    const dirRe = globToRegExp('src/**')
+    assert.ok(dirRe.test('src/a.js'), "'src/**' 应匹配 src/a.js")
+    assert.ok(dirRe.test('src/d/b.js'), "'src/**' 应递归匹配深层文件")
+    assert.ok(!dirRe.test('src.js'), "'src/**' 不应匹配 src.js")
+
+    // 交替 / 字符类 / 取反类
+    assert.ok(globToRegExp('{a,b}.js').test('a.js'), "'{a,b}.js' 应匹配 a.js")
+    assert.ok(globToRegExp('{a,b}.js').test('b.js'), "'{a,b}.js' 应匹配 b.js")
+    assert.ok(!globToRegExp('{a,b}.js').test('c.js'), "'{a,b}.js' 不应匹配 c.js")
+    assert.ok(globToRegExp('[a-c]x.js').test('bx.js'), "字符类 '[a-c]x.js' 应匹配 bx.js")
+    assert.ok(!globToRegExp('[a-c]x.js').test('dx.js'), "字符类 '[a-c]x.js' 不应匹配 dx.js")
+    assert.ok(globToRegExp('[!a-z]x.js').test('1x.js'), "取反类 '[!a-z]x.js' 应匹配 1x.js")
+    assert.ok(!globToRegExp('[!a-z]x.js').test('ax.js'), "取反类 '[!a-z]x.js' 不应匹配 ax.js")
+
+    // malformed：非法/不安全 glob 按字面处理且不抛异常
+    for (const bad of ['[[', '[z-a]', '[a-', '{a,', 'a**b', '*.']) {
+      assert.doesNotThrow(() => globToRegExp(bad), `malformed glob '${bad}' 不抛异常`)
+    }
+
+    // 展开出的仓库文件（listRepoJsFiles）：忽略 test_*.js / node_modules / .git
+    const files = listRepoJsFiles()
+    assert.ok(files.length > 0, '应能枚举出生产 js 文件')
+    assert.ok(files.some(f => /^xbk_.*\.js$/.test(path.basename(f))), '展开清单应含 xbk_* 生产源')
+    assert.ok(files.every(f => !/^test_/.test(path.basename(f))), '展开清单不应含 test_*.js')
+    assert.ok(files.every(f => !f.includes('node_modules')), '展开清单不应含 node_modules')
+
+    // 缺陷B回归：glob 展开应与 globToRegExp 口径一致——被 glob 覆盖的仓库文件都在展开结果里
+    const expanded = files.filter(f => globToRegExp('**/xbk_*.js').test(f))
+    assert.ok(expanded.length === files.filter(f => /(?:^|\/)xbk_.*\.js$/.test(f)).length,
+      '展开结果应与 globToRegExp 覆盖口径一致')
+    console.log('✅ globToRegExp / listRepoJsFiles 断言通过（* ? {a,b} [类] [!取反] ** 与 malformed）')
+  }
+
   console.log('test_check_mutation_ranges OK')
 })().catch((e) => { console.error(e); process.exit(1) })
