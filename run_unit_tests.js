@@ -44,10 +44,11 @@ const summaryLines = ['| 套件 | 文件 | 结果 | 耗时 |', '|---|---|---|---
 for (const s of UNIT_SUITES) {
   const file = path.join(__dirname, s.file)
   const t0 = Date.now()
-  // CI 下用 ::group:: 折叠各套件输出（463KB 的 test_filter 不再刷爆日志页）；本地保持 inherit 逐行直出
-  if (IN_CI) console.log(`::group::${s.ok === false ? '❌ ' : ''}${s.name}（${s.file}）`)
+  // CI 下用 ::group:: 折叠各套件输出（463KB 的 test_filter 不再刷爆日志页）；stderr 直通组内（成功套件
+  // 的警告也保留），pipe 仅收 stdout 用于失败时打包重显；本地保持 inherit 逐行直出
+  if (IN_CI) console.log(`::group::${s.name}（${s.file}）`)
   try {
-    const childOut = execFileSync(process.execPath, [file], { stdio: IN_CI ? ['ignore', 'pipe', 'pipe'] : 'inherit' })
+    const childOut = execFileSync(process.execPath, [file], { stdio: IN_CI ? ['ignore', 'pipe', 'inherit'] : 'inherit' })
     if (IN_CI) {
       console.log(childOut.toString())
       console.log('::endgroup::')
@@ -58,11 +59,10 @@ for (const s of UNIT_SUITES) {
     console.log(`\n  ✅ ${s.name} 通过（${(ms / 1000).toFixed(1)}s）\n`)
   } catch (e) {
     if (IN_CI) {
-      // 失败必须全量炸出（默认组），拿回具体红测上下文
+      // 失败必须全量炸出（默认组），拿回具体红测上下文（stderr 已直通，此处补 stdout）
       console.log('::endgroup::')
       console.log(`::error title=失败套件：${s.name}::${s.file}`)
-      const errOut = ((e.stdout || '') + (e.stderr || '')).toString()
-      console.log(errOut)
+      console.log((e.stdout || '').toString())
     }
     const ms = Date.now() - t0
     results.push({ ...s, ok: false, ms })

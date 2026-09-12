@@ -103,42 +103,60 @@ jobs:
         include:
           # V3 入口及拆分模块
           - name: v3-entry
+            src: "xbk_function_v3.js"
             mutate: "xbk_function_v3.js:1-426"
           - name: app
+            src: "xbk_app.js"
             mutate: "xbk_app.js"
           - name: filter
+            src: "xbk_filter.js"
             mutate: "xbk_filter.js"
           - name: formatter
+            src: "xbk_formatter.js"
             mutate: "xbk_formatter.js"
           - name: message-store
+            src: "xbk_message_store.js"
             mutate: "xbk_message_store.js"
           - name: network
+            src: "xbk_network.js"
             mutate: "xbk_network.js"
           - name: pusher
+            src: "xbk_pusher.js"
             mutate: "xbk_pusher.js"
           - name: rules
+            src: "xbk_rules.js"
             mutate: "xbk_rules.js"
           - name: utils
+            src: "xbk_utils.js"
             mutate: "xbk_utils.js"
           # sendnotify（1473 行）拆 2 段
           - name: sendnotify-part1
+            src: "xbk_sendNotify_slim.js"
             mutate: "xbk_sendNotify_slim.js:1-750"
           - name: sendnotify-part2
+            src: "xbk_sendNotify_slim.js"
             mutate: "xbk_sendNotify_slim.js:751-1473"
           # 小文件各一任务
           - name: failure-policy
+            src: "xbk_failure_policy.js"
             mutate: "xbk_failure_policy.js"
           - name: storage
+            src: "xbk_storage.js"
             mutate: "xbk_storage.js"
           - name: agents
+            src: "xbk_agents.js"
             mutate: "xbk_agents.js"
           - name: http
+            src: "xbk_http.js"
             mutate: "xbk_http.js"
           - name: loop
+            src: "xbk_loop.js"
             mutate: "xbk_loop.js"
           - name: qinglong-push
+            src: "qinglong/xbk_push.js"
             mutate: "qinglong/xbk_push.js"
           - name: check-deps
+            src: "scripts/check-deps.js"
             mutate: "scripts/check-deps.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -153,10 +171,11 @@ jobs:
       - name: 恢复增量缓存
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
-          # 主 key 用源码+变异配置内容指纹（可命中），github.sha 放 restore-keys 兜底——
-          # 若用 sha 做主 key 则每次必 miss，只能靠前缀前缀命中，绕且低效。
+          # 主 key 用源码+变异配置内容指纹（可命中）；src 单列（mutate 里的 1-750 段范围字面量不可作
+          # hashFiles 参数——按字面量找不到文件会返回空指纹，导致 range 段的缓存永不过期）。
+          # restore-keys 兜底到该段任意最近缓存（无 sha 精确恢复，增量合并仍正确）。
           path: reports
-          key: stryker-${{ matrix.name }}-${{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.mutate) }}
+          key: stryker-${{ matrix.name }}-${{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}
           restore-keys: |
             stryker-${{ matrix.name }}-
 
