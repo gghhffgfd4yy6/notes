@@ -20,7 +20,11 @@ function padEndWidth (str, width) {
   return str + ' '.repeat(Math.max(0, width - displayWidth(str)))
 }
 
-const UNIT_SUITES = SUITES.filter(s => !s.integration && !s.mutationSkip)
+// SKIP_SUITES：显式列出需跳过的套件文件名（逗号分隔，可选）。
+// 用途：CI 中显式步骤已单独跑过的套件，全量兜底时跳过避免重复（失败仍由显式步骤独立报错）。
+// 变异评估场景（run_mutation.js 子进程）必须保持全量 —— run_mutation.js spawn 时会清除该变量。
+const skipSuites = new Set((process.env.SKIP_SUITES || '').split(',').map(s => s.trim()).filter(Boolean))
+const UNIT_SUITES = SUITES.filter(s => !s.integration && !s.mutationSkip && !skipSuites.has(s.file))
 // mutationSkip：ranges 行数元校验在 Stryker 沙箱内误报（CI run #120 根因）——同一次运行里
 // 两类行数扰动叠加：
 //   ① 被 --mutate 的目标文件被插桩注入，行数大幅膨胀（如 426→704，主因）；
@@ -34,17 +38,35 @@ console.log('  xbk-push 单元测试入口（排除集成测试）')
 console.log(`  共 ${UNIT_SUITES.length} 个套件`)
 console.log('══════════════════════════════════════════════\n')
 
+const IN_CI = Boolean(process.env.GITHUB_STEP_SUMMARY)
+const summaryLines = ['| 套件 | 文件 | 结果 | 耗时 |', '|---|---|---|---|']
+
 for (const s of UNIT_SUITES) {
   const file = path.join(__dirname, s.file)
   const t0 = Date.now()
+  // CI 下用 ::group:: 折叠各套件输出（463KB 的 test_filter 不再刷爆日志页）；本地保持 inherit 逐行直出
+  if (IN_CI) console.log(`::group::${s.ok === false ? '❌ ' : ''}${s.name}（${s.file}）`)
   try {
-    execFileSync(process.execPath, [file], { stdio: 'inherit' })
+    const child_res = execFileSync(process.execPath, [file], { stdio: IN_CI ? ['ignore', 'pipe', 'pipe'] : 'inherit' })
+    if (IN_CI) {
+      console.log(child_res.toString())
+      console.log('::endgroup::')
+    }
     const ms = Date.now() - t0
     results.push({ ...s, ok: true, ms })
+    summaryLines.push(`| ${s.name} | \`${s.file}\` | ✅ | ${(ms / 1000).toFixed(1)}s |`)
     console.log(`\n  ✅ ${s.name} 通过（${(ms / 1000).toFixed(1)}s）\n`)
   } catch (e) {
+    if (IN_CI) {
+      // 失败必须全量炸出（默认组），拿回具体红测上下文
+      console.log('::endgroup::')
+      console.log(`::error title=失败套件：${s.name}::${s.file}`)
+      const errOut = ((e.stdout || '') + (e.stderr || '')).toString()
+      console.log(errOut)
+    }
     const ms = Date.now() - t0
     results.push({ ...s, ok: false, ms })
+    summaryLines.push(`| ${s.name} | \`${s.file}\` | ❌ | ${(ms / 1000).toFixed(1)}s |`)
     console.log(`\n  ❌ ${s.name} 失败（${(ms / 1000).toFixed(1)}s）\n`)
   }
 }
@@ -60,8 +82,16 @@ for (const r of results) {
   if (!r.ok) allOk = false
 }
 const totalMs = results.reduce((a, r) => a + r.ms, 0)
-console.log(`\n  总耗时: ${(totalMs / 1000).toFixed(1)}s`)
+console.log(`  总耗时: ${(totalMs / 1000).toFixed(1)}s`)
 console.log(`  结果:   ${allOk ? '全部通过 🎉' : '存在失败 ⚠️'}`)
 console.log('══════════════════════════════════════════════')
+
+// CI 下把套件结果表写入 $GITHUB_STEP_SUMMARY（run 页可直接看，失败一眼定位）
+// 只在顶层进程写 summary：变异评估的子进程（XBK_MUTATION_CHILD=1）会从 evaluate 场景多次运行本入口，
+// 若允许其追加会产生重复块，且子进程的套件计数与顶层不同——统一只由顶层收口。
+if (IN_CI && process.env.XBK_MUTATION_CHILD !== '1') {
+  require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+    `## 单元测试结果（${allOk ? '全部通过 🎉' : '存在失败 ⚠️'}，共 ${results.length} 套件，${(totalMs / 1000).toFixed(1)}s）\n\n${summaryLines.join('\n')}\n`)
+}
 
 process.exit(allOk ? 0 : 1)

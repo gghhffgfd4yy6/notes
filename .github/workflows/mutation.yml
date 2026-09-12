@@ -153,8 +153,10 @@ jobs:
       - name: 恢复增量缓存
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
+          # 主 key 用源码+变异配置内容指纹（可命中），github.sha 放 restore-keys 兜底——
+          # 若用 sha 做主 key 则每次必 miss，只能靠前缀前缀命中，绕且低效。
           path: reports
-          key: stryker-${{ matrix.name }}-${{ github.sha }}
+          key: stryker-${{ matrix.name }}-${{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.mutate) }}
           restore-keys: |
             stryker-${{ matrix.name }}-
 

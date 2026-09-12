@@ -137,7 +137,8 @@ function applyMutants (dir, mutants) {
 
 function runTests (dir, timeoutMs) {
   return new Promise(resolve => {
-    const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, XBK_MUTATION_CHILD: '1' } })
+    // 变异评估必须跑全量套件 —— 清除 SKIP_SUITES，防止 CI 显式步骤的跳过清单继承到子进程使变异分数失真。
+    const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, XBK_MUTATION_CHILD: '1', SKIP_SUITES: '' } })
     let output = ''
     child.stdout.on('data', d => { output += d })
     child.stderr.on('data', d => { output += d })
