@@ -47,9 +47,9 @@ for (const s of UNIT_SUITES) {
   // CI 下用 ::group:: 折叠各套件输出（463KB 的 test_filter 不再刷爆日志页）；本地保持 inherit 逐行直出
   if (IN_CI) console.log(`::group::${s.ok === false ? '❌ ' : ''}${s.name}（${s.file}）`)
   try {
-    const child_res = execFileSync(process.execPath, [file], { stdio: IN_CI ? ['ignore', 'pipe', 'pipe'] : 'inherit' })
+    const childOut = execFileSync(process.execPath, [file], { stdio: IN_CI ? ['ignore', 'pipe', 'pipe'] : 'inherit' })
     if (IN_CI) {
-      console.log(child_res.toString())
+      console.log(childOut.toString())
       console.log('::endgroup::')
     }
     const ms = Date.now() - t0
