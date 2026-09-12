@@ -141,7 +141,7 @@ function runTests (dir, timeoutMs) {
     let output = ''
     child.stdout.on('data', d => { output += d })
     child.stderr.on('data', d => { output += d })
-    const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ status: 'timeout', output }) }, timeoutMs)
+    const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ status: 'timeout', code: null, signal: 'SIGKILL', output }) }, timeoutMs)
     child.on('close', (code, signal) => {
       clearTimeout(timer)
       // S8786/S6594：多量词组正则（(\d+)(sep)(\d+)）被标超线性回溯且 String.match 被标；
