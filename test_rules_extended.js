@@ -11,7 +11,7 @@ const mockUtils = {
   parseTime: (t) => {
     if (typeof t === 'number' && t > 0) return t < 1e12 ? t * 1000 : t
     const d = new Date(t)
-    return isNaN(d.getTime()) ? null : d.getTime()
+    return Number.isNaN(d.getTime()) ? null : d.getTime()
   },
   daysFrom: (ms) => {
     const now = new Date()
