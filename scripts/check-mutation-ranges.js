@@ -255,7 +255,7 @@ function globToRegExp (pattern) {
         if (cls[0] === '!' || cls[0] === '^') { negate = '^'; cls = cls.slice(1) }
         // 类内仅接受字面与 `-` 范围；含 `\`/`]`/`[`/`^`、空类或乱序范围（`0--` 等会让 new RegExp
         // 抛 Range out of order）一律按字面 `[` 处理——生成的 RegExp 必须永远合法（绝不崩溃，也绝不虚报覆盖）
-        if (cls && !/[\\\]\[\^]/.test(cls) && rangesOrdered(cls)) {
+        if (cls && !/[\]^[\\]/.test(cls) && rangesOrdered(cls)) {
           out += '[' + negate + cls + ']'
           i = close // 循环 i++ 跳过 `]`
         } else {

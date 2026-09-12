@@ -26,10 +26,10 @@ assert.strictEqual(scriptSource, bashRegexSource,
 
 // 合法 tag 集合（语义：v数字.数字[.数字][-prerelease][+build]；禁止前导零；后缀组件非空）
 const validTags = [
-  'v3.272',         // 两段（CHANGELOG 风格）
-  'v3.272.0',       // 三段（package.json 风格）
-  'v0.1.0',         // 前导数字 0 合法
-  'v1.2.3-rc.1',    // prerelease 多组件
+  'v3.272', // 两段（CHANGELOG 风格）
+  'v3.272.0', // 三段（package.json 风格）
+  'v0.1.0', // 前导数字 0 合法
+  'v1.2.3-rc.1', // prerelease 多组件
   'v1.2.3+build.5', // build 多组件
   'v1.2.3-rc.1+build.2' // prerelease + build 同时存在
 ]
@@ -40,15 +40,15 @@ for (const tag of validTags) {
 
 // 非法 tag 集合（必须 reject）
 const invalidTags = [
-  'vfoo',            // 非数字
-  'v1',              // 只一个数字组件
-  'v03.272',         // 前导零
-  'v3.272-alpha.',   // prerelease 以 . 结尾（空组件）
-  'v1.2.3.4',        // 四段（多一个数字组件）
-  'v1.2.3-rc..1',    // 相邻空组件
-  'v01.2.3',         // 前导零
-  'v1.2.3-',         // 连字符后为空
-  'v1.2.3+'          // + 后为空
+  'vfoo', // 非数字
+  'v1', // 只一个数字组件
+  'v03.272', // 前导零
+  'v3.272-alpha.', // prerelease 以 . 结尾（空组件）
+  'v1.2.3.4', // 四段（多一个数字组件）
+  'v1.2.3-rc..1', // 相邻空组件
+  'v01.2.3', // 前导零
+  'v1.2.3-', // 连字符后为空
+  'v1.2.3+' // + 后为空
 ]
 for (const tag of invalidTags) {
   const version = tag.slice(1)
