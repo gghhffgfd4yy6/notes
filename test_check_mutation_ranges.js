@@ -29,7 +29,7 @@ function buildYml (overrides = {}) {
     const lines = raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
     const ranges = Array.isArray(overrides[f]) ? overrides[f] : [overrides[f] || `1-${lines}`]
     const safeName = f.replace(/[/.]/g, '-')
-    return ranges.map((range, i) => `          - name: ${safeName}-${i}\n            mutate: "${f}:${range}"`).join('\n')
+    return ranges.map((range, i) => `          - name: ${safeName}-${i}\n            src: "${f}"\n            mutate: "${f}:${range}"`).join('\n')
   }).join('\n')
   return `name: mutation\non: push\njobs:\n  mutation:\n    strategy:\n      matrix:\n        include:\n${matrix}\n`
 }
