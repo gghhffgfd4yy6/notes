@@ -37,6 +37,15 @@ for (const token of FORBIDDEN_TOKENS) {
     `release.yml 的 bash 正则不得含 bash/JS 语义分歧写法 ${JSON.stringify(token)}（交集语法约束）`)
 }
 
+// 数字反向引用（\1、\12 …）：上面 FORBIDDEN_TOKENS 用 includes 逐字匹配，覆盖不了「反斜杠+数字」
+// 这一形态（'\\d' 字符串不含 '\1'，且多位数无法枚举）——#132 review Q2 漏网项。bash ERE 中
+// \1 是后向引用，JS 正则里无对应捕获组时 \1 为八进制字面量，两边语义同样分叉，纳入禁用：
+// 用正则探测「反斜杠+数字」形态（含 \1..\9 与多位数）。
+const BACKREF_RE = /[\\][1-9][0-9]*/
+assert.ok(!BACKREF_RE.test(scriptSource), 'SEMVER_RE 不得含数字反向引用（\\1、\\12 等，bash/JS 语义分叉）')
+assert.ok(!BACKREF_RE.test(bashRegexSource),
+  'release.yml 的 bash 正则不得含数字反向引用（\\1、\\12 等，bash/JS 语义分叉）')
+
 // 合法 tag 集合（语义：v数字.数字[.数字][-prerelease][+build]；禁止前导零；后缀组件非空）
 const validTags = [
   'v3.272', // 两段（CHANGELOG 风格）
