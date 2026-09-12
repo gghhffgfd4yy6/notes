@@ -39,13 +39,17 @@ if (includeIdx !== -1) {
     if (colon <= 0) continue
     const key = body.slice(0, colon)
     if (key !== 'name' && key !== 'src' && key !== 'mutate') continue
-    let value = body.slice(colon + 1)
-    const hash = value.indexOf('#') // 先剥行内注释（YAML 注释在引号外），再处理引号
-    if (hash !== -1) value = value.slice(0, hash)
+    let value = body.slice(colon + 1).trim()
+    const quote = value[0]
+    if (quote === '"' || quote === "'") {
+      const close = value.indexOf(quote, 1) // 引号标量：取到闭合引号，内部的 # 属于值而非注释
+      value = close > 0 ? value.slice(1, close) : value.slice(1)
+    } else {
+      const hash = value.indexOf('#') // 裸标量：行内注释从 # 开始
+      if (hash !== -1) value = value.slice(0, hash)
+    }
     value = value.trim()
-    if (value.startsWith('"') || value.startsWith("'")) value = value.slice(1)
-    if (value.endsWith('"') || value.endsWith("'")) value = value.slice(0, -1)
-    if (value) currentEntry[key] = value.trim()
+    if (value) currentEntry[key] = value
   }
 }
 
