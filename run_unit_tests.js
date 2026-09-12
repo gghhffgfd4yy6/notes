@@ -22,8 +22,23 @@ function padEndWidth (str, width) {
 
 // SKIP_SUITES：显式列出需跳过的套件文件名（逗号分隔，可选）。
 // 用途：CI 中显式步骤已单独跑过的套件，全量兜底时跳过避免重复（失败仍由显式步骤独立报错）。
-// 变异评估场景（run_mutation.js 子进程）必须保持全量 —— run_mutation.js spawn 时会清除该变量。
+// 清单与 test.yml 的显式步骤必须双向一致（漏写=重复跑，多写=漏跑）——不一致由 test_ci_skip_suites.js 拦截。
+// 变异评估场景（run_mutation.js 子进程）必须保持全量 —— run_mutation.js spawn 时会清除该变量；
+// CI 变异任务走 stryker（不经 run_mutation.js），由 mutation.yml 的 step env 设 XBK_MUTATION_CHILD=1。
 const skipSuites = new Set((process.env.SKIP_SUITES || '').split(',').map(s => s.trim()).filter(Boolean))
+// 拼错的条目会「静默不生效」（等于没跳过，重复跑且无人知道），因此必须在入口处炸出来。
+const unknownSkips = [...skipSuites].filter(file => !SUITES.some(s => s.file === file))
+if (unknownSkips.length) {
+  console.error(`❌ SKIP_SUITES 含不存在的套件：${unknownSkips.join(', ')}（请对照 test_suites.js 修正）`)
+  process.exit(1)
+}
+// 无效条目（套件本就不进本入口，如 integration/mutationSkip）不致命，但意味着清单与显式步骤口径漂移。
+for (const file of skipSuites) {
+  const suite = SUITES.find(s => s.file === file)
+  if (suite && (suite.integration || suite.mutationSkip)) {
+    console.warn(`⚠️ SKIP_SUITES 的 ${file} 本就不在本入口（integration/mutationSkip），该条无效`)
+  }
+}
 const UNIT_SUITES = SUITES.filter(s => !s.integration && !s.mutationSkip && !skipSuites.has(s.file))
 // mutationSkip：ranges 行数元校验在 Stryker 沙箱内误报（CI run #120 根因）——同一次运行里
 // 两类行数扰动叠加：
@@ -40,6 +55,10 @@ console.log('══════════════════════�
 
 const IN_CI = Boolean(process.env.GITHUB_STEP_SUMMARY)
 const summaryLines = ['| 套件 | 文件 | 结果 | 耗时 |', '|---|---|---|---|']
+// CI 下 stdout 走 pipe 收进内存（失败时打包重显），故必须显式放大上限：execFileSync 默认 maxBuffer=1MiB，
+// 超限会抛 ENOBUFS —— 一个「通过」的套件会被误判为失败。实测最大套件 test_filter.js 约 75KB，余量充足。
+// XBK_UNIT_MAX_BUFFER 仅用于测试注入（构造超限场景），生产不设。
+const MAX_BUFFER = Number(process.env.XBK_UNIT_MAX_BUFFER) || 8 * 1024 * 1024
 
 for (const s of UNIT_SUITES) {
   const file = path.join(__dirname, s.file)
@@ -48,7 +67,7 @@ for (const s of UNIT_SUITES) {
   // 的警告也保留），pipe 仅收 stdout 用于失败时打包重显；本地保持 inherit 逐行直出
   if (IN_CI) console.log(`::group::${s.name}（${s.file}）`)
   try {
-    const childOut = execFileSync(process.execPath, [file], { stdio: IN_CI ? ['ignore', 'pipe', 'inherit'] : 'inherit' })
+    const childOut = execFileSync(process.execPath, [file], { stdio: IN_CI ? ['ignore', 'pipe', 'inherit'] : 'inherit', maxBuffer: MAX_BUFFER })
     if (IN_CI) {
       console.log(childOut.toString())
       console.log('::endgroup::')
@@ -58,10 +77,14 @@ for (const s of UNIT_SUITES) {
     summaryLines.push(`| ${s.name} | \`${s.file}\` | ✅ | ${(ms / 1000).toFixed(1)}s |`)
     console.log(`\n  ✅ ${s.name} 通过（${(ms / 1000).toFixed(1)}s）\n`)
   } catch (e) {
+    // 输出超限（ENOBUFS）不是测试失败，必须显式区分，否则「通过但话多」的套件会被当成红测排查。
+    const overflow = e.code === 'ENOBUFS' || /maxBuffer/i.test(String(e.message || ''))
     if (IN_CI) {
       // 失败必须全量炸出（默认组），拿回具体红测上下文（stderr 已直通，此处补 stdout）
       console.log('::endgroup::')
-      console.log(`::error title=失败套件：${s.name}::${s.file}`)
+      console.log(overflow
+        ? `::error title=输出超限：${s.name}::${s.file} 的 stdout 超过 ${MAX_BUFFER} 字节上限（非测试失败）`
+        : `::error title=失败套件：${s.name}::${s.file}`)
       console.log((e.stdout || '').toString())
     }
     const ms = Date.now() - t0
@@ -87,8 +110,10 @@ console.log(`  结果:   ${allOk ? '全部通过 🎉' : '存在失败 ⚠️'}`
 console.log('══════════════════════════════════════════════')
 
 // CI 下把套件结果表写入 $GITHUB_STEP_SUMMARY（run 页可直接看，失败一眼定位）
-// 只在顶层进程写 summary：变异评估的子进程（XBK_MUTATION_CHILD=1）会从 evaluate 场景多次运行本入口，
-// 若允许其追加会产生重复块，且子进程的套件计数与顶层不同——统一只由顶层收口。
+// 只在「本入口的调用方不是变异评估子进程」时写：run_mutation.js 的 spawn 会带 XBK_MUTATION_CHILD=1
+// （它会在临时目录里反复运行本入口，若允许追加会产生重复块，且子进程套件数与顶层不同）。
+// CI 变异任务走 stryker 的 commandRunner（不经过 run_mutation.js），由 mutation.yml 的 step env 设同一位
+// ——否则「初始运行 + 每个变异体」各 append 一次整表，几百次就撞 GitHub 1MiB/step 上限被截断。
 if (IN_CI && process.env.XBK_MUTATION_CHILD !== '1') {
   require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY,
     `## 单元测试结果（${allOk ? '全部通过 🎉' : '存在失败 ⚠️'}，共 ${results.length} 套件，${(totalMs / 1000).toFixed(1)}s）\n\n${summaryLines.join('\n')}\n`)

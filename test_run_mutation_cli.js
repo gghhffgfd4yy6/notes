@@ -66,6 +66,28 @@ const { runTests, evaluate } = require('./run_mutation')
     }
   }
 
+  // 场景 4：runTests 必须清空 SKIP_SUITES，并给子进程带 XBK_MUTATION_CHILD=1
+  // 原因：CI 显式步骤的 SKIP_SUITES 若继承进变异评估子进程，被跳过的套件不再参与变异判定 → 分数失真。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-skip-'))
+    const prev = process.env.SKIP_SUITES
+    try {
+      process.env.SKIP_SUITES = 'test_filter.js,test_storage.js'
+      fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
+        console.log('SKIP=[' + (process.env.SKIP_SUITES || '') + '] MUT=[' + (process.env.XBK_MUTATION_CHILD || '') + ']')
+        process.exit(0)
+      `)
+      const result = await runTests(dir, 10000)
+      assert.strictEqual(result.status, 'pass', `应正常通过，output=${result.output}`)
+      assert.match(result.output, /SKIP=\[\]/, 'runTests 必须清空 SKIP_SUITES（否则 CI 跳过清单会继承到变异评估）')
+      assert.match(result.output, /MUT=\[1\]/, 'runTests 应标记 XBK_MUTATION_CHILD=1（防递归 + 抑制 summary 追加）')
+    } finally {
+      if (prev === undefined) delete process.env.SKIP_SUITES
+      else process.env.SKIP_SUITES = prev
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
   // ===== evaluate：复制项目→应用变异→运行测试→清理 =====
   // evaluate 会复制 ROOT 下的完整单元测试运行环境（run_unit_tests.js + 全部 test_*.js + xbk_*.js + scripts/），
   // 然后应用变异，运行测试，最后清理临时目录（finally 块）。
@@ -77,7 +99,10 @@ const { runTests, evaluate } = require('./run_mutation')
     const result = await evaluate([], files, 120000)
     // 行为断言 1：返回结构完整
     assert.ok(typeof result === 'object', 'evaluate 应返回对象')
-    assert.ok(['pass', 'fail', 'timeout'].includes(result.status), 'status 应为 pass/fail/timeout')
+    // 沙箱内整套必须真的通过：此前只断言 status ∈ {pass,fail,timeout}，copyProject 漏拷文件导致
+    // 沙箱恒红（#120/#122 一类）也无人发现——这里改成硬断言 pass。
+    assert.strictEqual(result.status, 'pass',
+      `沙箱内单元测试应整体通过，实际 ${result.status}。output 末尾：${result.output.slice(-400)}`)
     assert.ok(Array.isArray(result.mutants), '应返回 mutants 数组')
     assert.strictEqual(result.mutants.length, 0, '无变异时 mutants 应为空')
     // 行为断言 2：output 中包含单元测试入口的真实输出（证明测试真正运行了，而非 MODULE_NOT_FOUND 立即失败）

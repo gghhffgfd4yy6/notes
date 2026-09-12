@@ -14,7 +14,7 @@ const DEFAULT_FILES = [
   'xbk_failure_policy.js',
   'qinglong/xbk_push.js'
 ]
-// 变异测试使用全量单元测试入口（25 个单元套件），而非仅 test_filter.js——
+// 变异测试使用全量单元测试入口（26 个单元套件），而非仅 test_filter.js——
 // 此前只跑 test_filter.js 导致 #100/#101 新增的 1400+ 行测试对变异分数完全无效。
 const DEFAULT_TEST = ['node', 'run_unit_tests.js']
 const OPS = new Map([
@@ -110,7 +110,9 @@ function copyProject (dir, files) {
     fs.mkdirSync(path.dirname(dst), { recursive: true })
     fs.copyFileSync(src, dst)
   }
-  for (const sub of ['scripts', 'qinglong']) {
+  // 目录整体复制：scripts/ 与 qinglong/ 是部分测试的依赖；.github/ 是 CI 清单
+  // （test_ci_skip_suites.js 要读 test.yml 与 mutation.yml 对账，缺一个就 ENOENT 误判失败，同 #120/#122 口径）
+  for (const sub of ['scripts', 'qinglong', '.github']) {
     const srcDir = path.join(ROOT, sub)
     if (fs.existsSync(srcDir)) {
       fs.cpSync(srcDir, path.join(dir, sub), { recursive: true })

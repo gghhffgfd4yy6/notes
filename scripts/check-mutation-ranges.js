@@ -14,16 +14,42 @@ const root = path.resolve(__dirname, '..')
 const workflowPath = path.resolve(process.env.MUTATION_WORKFLOW_PATH || path.join(root, '.github/workflows/mutation.yml'))
 const yml = process.env.MUTATION_WORKFLOW_TEXT || fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
 
-// 收集 yml 中形如 "file.js:start-end" 的行段（含引号），按文件聚合
-const rangeRe = /"([\w/.-]+\.(?:js|mjs|cjs)):(\d+)-(\d+)"/g
-const fileRanges = new Map()
-for (const match of yml.matchAll(rangeRe)) {
-  const [, file, start, end] = match
-  if (!fileRanges.has(file)) fileRanges.set(file, [])
-  fileRanges.get(file).push({ start: Number(start), end: Number(end) })
+// matrix include 的唯一解析器：`- name:` / `- src:` / `- mutate:` 任一开头都算新条目，
+// 引号（单/双）与缩进放宽，字段值停在空白或 #。
+// 行段与 mutate 目标都从这里派生——避免「两个解析器口径不一致」（曾出现：条目校验接受单引号
+// mutate，而旧的 range/target 正则只认双引号 → 合法 yml 被误报漏测）。
+const ymlLines = yml.split(/\r?\n/)
+const includeIdx = ymlLines.findIndex(line => /^\s*include:\s*$/.test(line))
+const includeIndent = includeIdx === -1 ? -1 : ymlLines[includeIdx].match(/^\s*/)[0].length
+const matrixEntries = []
+let currentEntry = null
+if (includeIdx !== -1) {
+  for (const line of ymlLines.slice(includeIdx + 1)) {
+    const indent = line.match(/^\s*/)[0].length
+    if (/^\s*[A-Za-z_][\w-]*:/.test(line) && indent <= includeIndent) break // include 块结束（回到 steps: 等同级键）
+    if (/^\s*-\s*\S/.test(line)) {
+      currentEntry = { name: null, src: null, mutate: null }
+      matrixEntries.push(currentEntry)
+    }
+    if (!currentEntry) continue
+    const field = line.match(/^\s*-?\s*(name|src|mutate):\s*["']?([^"'\s#]+)/)
+    if (field) currentEntry[field[1]] = field[2]
+  }
 }
 
-const mutateTargets = new Set([...yml.matchAll(/^\s*mutate:\s*"([^":]+)(?::\d+-\d+)?"/gm)].map(match => match[1]))
+const fileRanges = new Map()
+const mutateTargets = new Set()
+for (const entry of matrixEntries) {
+  if (!entry.mutate) continue
+  const [file, range] = entry.mutate.split(':')
+  mutateTargets.add(file)
+  if (range && /^\d+-\d+$/.test(range)) {
+    const [start, end] = range.split('-').map(Number)
+    if (!fileRanges.has(file)) fileRanges.set(file, [])
+    fileRanges.get(file).push({ start, end })
+  }
+}
+
 const productionFiles = [
   ...fs.readdirSync(root).filter(file => /^xbk_.*\.js$/.test(file)),
   'qinglong/xbk_push.js',
@@ -39,6 +65,31 @@ let failed = false
 for (const file of productionFiles) {
   if (!mutateTargets.has(file)) {
     console.error(`❌ ${file}: 未列入 mutation.yml 的 mutate 目标`)
+    failed = true
+  }
+}
+
+// 校验 0：matrix include 每项必须有 name、src 与其 mutate 目标同文件（解析见文件顶部）。
+// 背景：src 只被 actions/cache 的 hashFiles 指纹使用（mutation.yml），写错或整行删掉都不会让 CI 报错，
+// 只会让该段的缓存指纹失真（缓存串段 / 永不过期）；缺 name 的条目则会让缓存 key 变成 stryker-undefined-*。
+if (matrixEntries.length === 0) {
+  console.error('❌ 未在 mutation.yml 的 matrix include 中解析到任何条目')
+  failed = true
+}
+for (const entry of matrixEntries) {
+  const label = entry.name || '(无 name)'
+  if (!entry.name) {
+    console.error('❌ matrix 条目缺 name 字段（缓存 key 会退化为 stryker-undefined-*）')
+    failed = true
+  }
+  if (!entry.mutate) {
+    console.error(`❌ matrix「${label}」缺 mutate 字段`)
+    failed = true
+  } else if (!entry.src) {
+    console.error(`❌ matrix「${label}」缺 src 字段（缓存指纹会退化为空 → 缓存串段）`)
+    failed = true
+  } else if (entry.src !== entry.mutate.split(':')[0]) {
+    console.error(`❌ matrix「${label}」src(${entry.src}) 与 mutate 目标(${entry.mutate}) 不一致`)
     failed = true
   }
 }

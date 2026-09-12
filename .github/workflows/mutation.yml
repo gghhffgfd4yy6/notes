@@ -173,7 +173,10 @@ jobs:
         with:
           # 主 key 用源码+变异配置内容指纹（可命中）；src 单列（mutate 里的 1-750 段范围字面量不可作
           # hashFiles 参数——按字面量找不到文件会返回空指纹，导致 range 段的缓存永不过期）。
-          # restore-keys 兜底到该段任意最近缓存（无 sha 精确恢复，增量合并仍正确）。
+          # 注意：key 有意不含 test_*.js —— Stryker 的 command runner 只支持 coverageAnalysis:'off'，
+          # 无法感知「测试变化」（incremental-differ 在无覆盖信息时直接复用全部旧结果），把测试指纹并进 key
+          # 只会多存一份等价缓存、加剧缓存淘汰而不提质。
+          # restore-keys 兜底到该段任意最近缓存，作为增量基线（不是精确恢复）。
           path: reports
           key: stryker-${{ matrix.name }}-${{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}
           restore-keys: |
@@ -196,6 +199,11 @@ jobs:
         run: npx stryker run --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 2
         env:
           PERF_MS: 3000   # 宽松性能阈值（插桩开销）
+          # stryker 的 commandRunner 继承本 step 环境，反复 spawn run_unit_tests.js（初始运行 + 每个变异体），
+          # 不设此变量时 run_unit_tests.js 会把整张 26 行套件表反复 append 进本 step 的 job summary
+          # （GitHub 上限 1MiB/step，实测 1598B/次 → 约 656 次即被截断）。该变量的语义即「已在变异运行内」，
+          # 同时被 run_mutation.js 与 test_run_mutation_cli.js 复用。
+          XBK_MUTATION_CHILD: '1'
 
       # 明细报告留档（inc-*.json + mutation.json/html），artifact 有公开下载 API
       - name: 上传变异报告
