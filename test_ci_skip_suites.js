@@ -39,7 +39,7 @@ const unitFiles = SUITES.filter(s => !s.integration && !s.mutationSkip).map(s =>
 // 仅在并行失败时跑），不能算作门禁覆盖——否则把某个套件的步骤挂上 `if: false` 也能骗过对账。
 // 解析器对 YAML 排版变化保持稳健（本文件是门禁意图：红=提醒人工同步，常规排版变化不应误红）：
 //   ① 步骤起点：`- name:` / `- uses:` / `- run:` / `- if:`（YAML 允许省略 name）均视为新 step 块；
-//   ② run: 支持多行形式（块指示符 `|` / `>` 及其 chomp/显式缩进变体 `|-` `>-` `|+` `>-2` `|2` 等，
+//   ② run: 支持多行形式（块指示符 `|` / `>` 及其 chomp/显式缩进变体 `|-` `>-` `|+` `>-2` `|2` `|2-` `>1+` 等，
 //      或 run: 后跟缩进更深的续行），命令文本合并后只提取
 //      `npm run <script>` 命令名——解析不出命令名仍会红（那才是真正的门禁缺口），排版变化不再误红；
 //   ③ 步骤内其它字段（uses/with/env/id/continue-on-error 等）不参与命令提取，也不破坏步骤归属；
@@ -86,10 +86,14 @@ function parseWorkflowSteps (text) {
   let curStep = null
   let runLines = null // 正在累积的 run: 多行块内容（null = 不在块内）
   let runIndent = -1 // 进入块模式时 run: 键的缩进；续行缩进必须更深，回退到 <= runIndent 即块结束
-  // YAML 块标量指示符 = [|>] + 可选 chomp [-+] + 可选显式缩进数字：`|` `>` `|-` `>-` `|+` `>-2` `|2` …。
+  // YAML 块标量指示符 = [|>] + 可选 chomp [-+] + 可选显式缩进数字，两种顺序都合法：
+  //   chomp 在前 `|` `>` `|-` `>-` `|+` `>-2` …；数字在前 `|2` `|2-` `>1+` …。
+  //   #132 review Q1：旧正则 /^[|>][-+]?\d*$/ 只认 chomp 在前，`|2-` `>1+` 这类数字在前的
+  //   变体被当普通行 → 后续命令行丢失（对账误报）。显式缩进指示符按 YAML 规范仅单数字（1-9），
+  //   数字在前分支用 \d[-+]?（单数字 + 可选 chomp），多数字形态不进块模式。
   // 识别不进块模式的形态一律按单行命令文本处理——单行文本提取不出命令名时该步骤不贡献 scripts，
   // 对账保持红（宁红勿绿）：任何未识别变体只会加重门禁，不会静默放行。
-  const blockIndicatorRe = /^[|>][-+]?\d*$/
+  const blockIndicatorRe = /^[|>](?:[-+]?\d*|\d[-+]?)$/
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim()
     if (!trimmed) continue
@@ -159,14 +163,20 @@ assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explici
 //   1. `run: |` 块内两行各提取一个 npm run（多行块内逐行提取）
 //   2. 注释行（`# npm run ghost`）与行内注释（`npm run ... # 说明`）不进 scripts
 //   3. 引号内的文本（echo "npm run notcmd"）不进 scripts
-//   4. `run: |` 块放在文本末尾、且无尾随换行（EOF 补结算路径）仍能收集齐其命令
+//   4. `run: |` 块放在文本真正末尾、且无尾随换行（EOF 补结算路径）仍能收集齐其命令
+//      ——必须保持「末尾块」地位：#132 review Q3 把该用例移回 dummy 真正末尾（此前 SA-B 把
+//      新步骤追加在它后面，最后一步成了不进块模式的 `|+bad`——EOF 补结算分支根本没被走到，
+//      该分支被删/破坏时测试照样绿，回归失去意义）
 //   5. `run: >` 折叠块、`if:` 条件步骤标记正确（conditional）以备对账忽略
 // #131 审查遗留（问题4）：块指示符变体的回归用例——
 //   6. `- run: |-` 行内 chomp 块：块内注释/引号剔除，只收真实命令
 //   7. `run: >-` 键形式折叠 chomp 块：命令仍被提取
 //   8. `- run: >+2` 显式缩进指示符变体：命令仍被提取
-//   9. 失败方向安全：无法识别的指示符（`- run: |+bad`）按单行命令文本处理、不进入块模式，
-//      提取不出命令名即该步骤 scripts 为空（宁红勿绿——缺失的覆盖仍会被主对账断言拦下）
+// #132 review Q1：数字在前、chomp 在后的指示符变体（YAML 规范允许两种顺序，旧正则漏识别）——
+//   9. `- run: |2-`（行内数字+chomp）与 `run: >1+`（键形式数字+chomp 折叠块）各一个：
+//      命令仍被提取，块内注释/引号剔除仍生效
+//   10. 失败方向安全：无法识别的指示符（`- run: |+bad`）按单行命令文本处理、不进入块模式，
+//       提取不出命令名即该步骤 scripts 为空（宁红勿绿——缺失的覆盖仍会被主对账断言拦下）
 {
   const dummy = [
     'name: dummy',
@@ -185,9 +195,6 @@ assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explici
     '          npm run test:app',
     '      - if: false',
     '        run: npm run test:loop',
-    '      - name: 末尾块无尾随换行',
-    '        run: |',
-    '          npm run test:filter',
     '      - run: |-',
     '          npm run test:rules',
     '          # npm run ghost2',
@@ -197,34 +204,52 @@ assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explici
     '          npm run test:app_p',
     '      - run: >+2',
     '          npm run test:status',
+    '      - run: |2-',
+    '          npm run test:digitchomp',
+    '          # npm run ghost-digitchomp',
+    '          echo "npm run quoted-digitchomp"',
+    '      - name: 数字前chomp折叠块',
+    '        run: >1+',
+    '          npm run test:folddigitchomp',
+    '          # npm run ghost-folddigitchomp',
     '      - run: |+bad',
-    '          npm run test:ghost3'
-  ].join('\n') // 故意不补末尾 \n：验证 EOF 补结算
+    '          npm run test:ghost3',
+    '      - name: 末尾块无尾随换行',
+    '        run: |',
+    '          npm run test:filter'
+  ].join('\n') // 故意不补末尾 \n：验证 EOF 补结算（本用例必须是真正最后一个步骤）
   const dummySteps = parseWorkflowSteps(dummy)
-  // 步骤数：name多行块 / 折叠块 / if条件 / 末尾块 / 行内chomp块 / 键折叠chomp块 / 显式缩进指示符块 /
-  // 未识别指示符(宁红勿绿) = 8
-  assert.strictEqual(dummySteps.length, 8, 'dummy 应解析出 8 个步骤')
+  // 步骤数：name多行块 / 折叠块 / if条件 / 行内chomp块 / 键折叠chomp块 / 显式缩进指示符块 /
+  // 数字在前chomp变体(|2- >1+)x2 / 未识别指示符(宁红勿绿) / 末尾块(EOF补结算) = 10
+  assert.strictEqual(dummySteps.length, 10, 'dummy 应解析出 10 个步骤')
   assert.deepStrictEqual(dummySteps[0].scripts, ['test:unit', 'test:notify'],
     'run:| 块应逐行提取脚本，注释行(# npm run ghost)与行内注释(npm run test:notify #…)与引号文本均剔除')
   assert.deepStrictEqual(dummySteps[1].scripts, ['test:app'], 'run:> 折叠块应提取 test:app')
   assert.strictEqual(dummySteps[2].conditional, true, 'if: 步骤应标记 conditional（对账时忽略）')
   assert.deepStrictEqual(dummySteps[2].scripts, ['test:loop'], '条件步骤仍应解析出其脚本')
-  assert.deepStrictEqual(dummySteps[3].scripts, ['test:filter'],
-    '文本末尾的 run:| 块（无尾随换行）应经 EOF 补结算提取 test:filter')
-  assert.deepStrictEqual(dummySteps[4].scripts, ['test:rules'],
+  assert.deepStrictEqual(dummySteps[3].scripts, ['test:rules'],
     '- run: |- 行内 chomp 块应提取真实命令，块内注释(# npm run ghost2)与引号文本(echo "npm run quoted-not-cmd2")剔除')
-  assert.deepStrictEqual(dummySteps[5].scripts, ['test:app_p'], 'run: >- 键形式折叠 chomp 块应提取 test:app_p')
-  assert.deepStrictEqual(dummySteps[6].scripts, ['test:status'], '- run: >+2 显式缩进指示符变体应提取 test:status')
-  assert.deepStrictEqual(dummySteps[7].scripts, [],
+  assert.deepStrictEqual(dummySteps[4].scripts, ['test:app_p'], 'run: >- 键形式折叠 chomp 块应提取 test:app_p')
+  assert.deepStrictEqual(dummySteps[5].scripts, ['test:status'], '- run: >+2 显式缩进指示符变体应提取 test:status')
+  assert.deepStrictEqual(dummySteps[6].scripts, ['test:digitchomp'],
+    '- run: |2- 数字在前 chomp 在后变体应进入块模式并提取命令，块内注释/引号剔除仍生效')
+  assert.deepStrictEqual(dummySteps[7].scripts, ['test:folddigitchomp'],
+    'run: >1+ 键形式数字在前 chomp 在后变体应进入块模式并提取命令，块内注释剔除仍生效')
+  assert.deepStrictEqual(dummySteps[8].scripts, [],
     '未识别的块指示符(- run: |+bad)不得进入块模式，其后行不收集 → scripts 为空（宁红勿绿）')
+  assert.deepStrictEqual(dummySteps[9].scripts, ['test:filter'],
+    '真正位于文本末尾的 run:| 块（无尾随换行）应经 EOF 补结算提取 test:filter')
   // 注释/引号不应污染任何步骤的 scripts
   const allScripts = dummySteps.flatMap(s => s.scripts)
   assert.ok(!allScripts.includes('ghost'), '注释中的命令名不应进入 scripts')
   assert.ok(!allScripts.includes('ghost2'), 'chomp 块内注释中的命令名不应进入 scripts')
+  assert.ok(!allScripts.includes('ghost-digitchomp'), '|2- 块内注释中的命令名不应进入 scripts')
+  assert.ok(!allScripts.includes('ghost-folddigitchomp'), '>1+ 块内注释中的命令名不应进入 scripts')
   assert.ok(!allScripts.includes('quoted-not-cmd'), '引号内的文本不应进入 scripts')
   assert.ok(!allScripts.includes('quoted-not-cmd2'), 'chomp 块内引号中的文本不应进入 scripts')
+  assert.ok(!allScripts.includes('quoted-digitchomp'), '|2- 块内引号中的文本不应进入 scripts')
   assert.ok(!allScripts.includes('ghost3'), '未识别指示符的后继行不得进入 scripts（宁红勿绿）')
-  console.log('✅ dummy workflow 解析断言通过（多行块/EOF补结算/注释剔除/if条件/chomp与显式缩进指示符）')
+  console.log('✅ dummy workflow 解析断言通过（多行块/EOF补结算/注释剔除/if条件/chomp与显式缩进指示符/数字在前变体）')
 }
 
 // 2b. integration/mutationSkip 套件被 run_unit_tests.js 排除，只能靠显式步骤进门禁 ——
