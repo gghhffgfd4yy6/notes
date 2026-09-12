@@ -32,7 +32,7 @@ const mockUtils = {
   parseTime: (t) => {
     if (typeof t === 'number' && t > 0) return t
     const d = new Date(t)
-    return isNaN(d.getTime()) ? null : d.getTime()
+    return Number.isNaN(d.getTime()) ? null : d.getTime()
   }
 }
 
@@ -279,6 +279,16 @@ check('createFormatter: 缺 safeRe → 抛 TypeError', () => {
 
 check('createFormatter: safeRe 非函数 → 抛 TypeError', () => {
   assert.throws(() => createFormatter({ Utils: mockUtils, safeRe: 'notafunction' }), TypeError)
+})
+
+// 夹具契约：mockUtils.parseTime 必须与生产 Utils.parseTime 同语义。
+// 这条非法日期分支此前没有被任何断言覆盖——注毒实验（把 return 改成 d.getTime()）后套件仍绿，故补上。
+check('mockUtils.parseTime：非法日期返回 null', () => {
+  assert.strictEqual(mockUtils.parseTime('不是日期'), null)
+})
+
+check('mockUtils.parseTime：合法日期返回毫秒时间戳', () => {
+  assert.strictEqual(mockUtils.parseTime('2026-01-01T00:00:00Z'), Date.parse('2026-01-01T00:00:00Z'))
 })
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_formatter.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

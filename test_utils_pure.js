@@ -77,7 +77,7 @@ check('num: null 返回默认', () => {
   assert.strictEqual(Utils.num(null, 10), 10)
 })
 check('num: NaN 返回默认', () => {
-  assert.strictEqual(Utils.num(NaN, 10), 10)
+  assert.strictEqual(Utils.num(Number.NaN, 10), 10)
 })
 
 // ===== safeText：安全文本 =====
