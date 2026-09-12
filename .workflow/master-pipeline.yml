@@ -64,7 +64,7 @@ stages:
     - npm run test:mutation-json
   - step: build@nodejs
     name: test_unit
-    displayName: 全量单元测试 run_unit_tests.js（25 套件兜底防漏网）
+    displayName: 全量单元测试 run_unit_tests.js（26 套件兜底防漏网）
     nodeVersion: 22.22.2
     commands:
     - npm install --ignore-scripts

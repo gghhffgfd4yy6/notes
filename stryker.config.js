@@ -10,7 +10,7 @@ const concurrency = Number.isInteger(requestedConcurrency) && requestedConcurren
 module.exports = {
   testRunner: 'command',
   commandRunner: {
-    // 变异测试使用全量单元测试入口（run_unit_tests.js，25 个单元套件），而非仅 test_filter.js。
+    // 变异测试使用全量单元测试入口（run_unit_tests.js，26 个单元套件），而非仅 test_filter.js。
     // 此前只跑 test_filter.js 导致 PR #100/#101 新增的 238 项测试对变异分数完全无效（issue #106）。
     // PERF_MS=3000：放宽 test_filter.js 性能断言阈值（默认 500ms）。Stryker 沙箱内的插桩与变异
     // 开销会拖慢执行，不放宽则性能断言会因沙箱开销误失败（并可能触发 commandRunner 超时），
@@ -51,7 +51,7 @@ module.exports = {
   // （timeoutFactor 默认 1.5，timeoutMS 默认 5000）。timeoutMS 是该公式里的【加法偏移项】，
   // 作用于每个变异体的每次测试运行——它既不是「每条命令的硬上限」，也不是「整轮
   // run_unit_tests.js 的上限」。
-  // 加大该项，是为在 run_unit_tests.js（25 个单元套件、含 463KB 的 test_filter.js）叠加
+  // 加大该项，是为在 run_unit_tests.js（26 个单元套件、含 463KB 的 test_filter.js）叠加
   // Stryker 沙箱插桩/变异开销的场景下，给每次运行留出足够的加法偏移，避免慢套件过早超时。
   // 注意：mutation-report.js 把 Timeout 计入 score 分子（见 scripts/mutation-report.js:103、
   // :179 的 (killed + timeout) / total），因此过早超时并非“假存活被排除”，反而会把慢速

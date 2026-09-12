@@ -131,7 +131,7 @@ jobs:
       - name: 变异范围测试（test_mutation_ranges.js）
         run: npm run test:mutation-ranges-unit
 
-      # 全量单元测试门禁：跑 run_unit_tests.js（25个单元测试套件，已排除 integration/mutationSkip），
+      # 全量单元测试门禁：跑 run_unit_tests.js（26个单元测试套件，已排除 integration/mutationSkip），
       # 确保新增测试文件不会因未单独列出而漏网（#100/#101 曾因此红测合入）。
       # 与工作流中逐个列出的显式步骤互补：显式步骤用于失败时快速定位具体套件，
       # 本步骤用于兜底防漏网，因此部分非集成套件会执行两次——这是有意的时间换可定位性，非疏漏。
