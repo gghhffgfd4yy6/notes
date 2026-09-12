@@ -170,8 +170,12 @@ const configMutate = new Set(configMutateRaw.filter(item => !globChars.test(item
 // 最小 glob→RegExp（仅为「矩阵目标是否可能被 glob 覆盖」的判定服务）：
 // `*`/`?` 不跨 `/`，`{a,b}` 为交替，`[...]` 为字符类（`!`/`^` 开头取反，内部保留 `-` 范围）；
 // 无法安全解析的结构（空类、含 `\`/`^` 的类、含通配符的交替项）一律按字面处理——宁可继续报
-// 「缺矩阵目标」，也不能把不存在的覆盖说成存在。`**` 折叠为单个 `*`，避免相邻量词被静态分析
-// 判为可回溯超线性（Sonar S8786）。
+// 「缺矩阵目标」，也不能把不存在的覆盖说成存在。
+// `**`（globstar）在「路径开头或紧跟 / 后」实现真实递归匹配——`**/` 匹配零个或多个目录段
+// （`(?:[^/]*/)*`，可跨 `/`），末尾 `**`（如 `scripts/**`）递归匹配其后所有层
+// （`[^/]*(?:/[^/]*)*`）。两者均在每次迭代中带显式分隔符 `/`，无嵌套/相邻量词，线性安全
+// （Sonar S8786 把 `(?:.*.*)` 这类判为可回溯超线性，此处避免）。此前把 `**` 折叠成单个 `*`
+// （[^/]*）无法跨目录，导致 `**/xbk_*.js` 这类覆盖文件被误报成 configMissing（#131 缺陷C）。
 // 字符类内 `-` 范围合法性：`x-y` 要求 x <= y（乱序范围如 `0--`/`z-a` 直接拼进字符类会让
 // new RegExp 抛「Range out of order in character class」）。首/尾位置的 `-` 是字面量不算范围；
 // `-` 相邻 `-`（如 `a--z`）无法确定语义，同样判为不安全。不安全 → 整个类按字面 `[` 处理。
@@ -187,13 +191,51 @@ function rangesOrdered (cls) {
   return true
 }
 
+// 递归列举仓库根下的 .js/.mjs/.cjs 生产文件（供 glob 展开匹配），忽略 test_*.js、node_modules、.git。
+// 返回相对仓库根的路径（'/' 分隔）。用于缺陷B：把 stryker 的 glob 条目展开成「实际会跑的仓库文件」，
+// 再与矩阵 mutateTargets 双向比对，检出「矩阵没覆盖但本地会跑」的多余文件。
+function listRepoJsFiles () {
+  const out = []
+  const stack = ['']
+  while (stack.length) {
+    const rel = stack.pop()
+    const full = rel === '' ? root : path.join(root, rel)
+    let entries
+    try { entries = fs.readdirSync(full, { withFileTypes: true }) } catch (e) { continue }
+    for (const ent of entries) {
+      if (ent.name === 'node_modules' || ent.name === '.git') continue
+      const child = rel === '' ? ent.name : rel + '/' + ent.name
+      if (ent.isDirectory()) stack.push(child)
+      else if (/(?:\.js|\.mjs|\.cjs)$/.test(ent.name) && !/^test_.*\.js$/.test(ent.name)) out.push(child)
+    }
+  }
+  return out
+}
+
 function globToRegExp (pattern) {
   let out = '^'
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i]
     if (c === '*') {
-      while (pattern[i + 1] === '*') i++
+      // 收起连续的 `*`，先判 globstar（`**` 且位于路径开头或紧跟 / 后）：
+      //   - `**/`：匹配零个或多个「目录/」段（可跨 /），消费掉紧随的 `/`（0 层时无前导 /）
+      //   - 末尾 `**`：递归匹配其后所有层（如 `scripts/**`）
+      //   - 其余位置的 `**`（段中间，如 `a/**b`）：保守按单 `*` 处理，避免跨分隔符误报覆盖
+      let j = i
+      while (pattern[j + 1] === '*') j++
+      const isGlobstar = j - i + 1 >= 2 && (i === 0 || pattern[i - 1] === '/')
+      if (isGlobstar && pattern[j + 1] === '/') {
+        out += '(?:[^/]*/)*'
+        i = j + 1 // 消费 `**` 及紧随的 `/`：`**/` 整体表示「零个或多个 dir/」
+        continue
+      }
+      if (isGlobstar && j === pattern.length - 1) {
+        out += '[^/]*(?:/[^/]*)*' // 末尾 globstar：递归匹配其余所有层
+        i = j
+        continue
+      }
       out += '[^/]*'
+      i = j
     } else if (c === '?') {
       out += '[^/]'
     } else if (c === '{') {
@@ -229,13 +271,29 @@ function globToRegExp (pattern) {
   return new RegExp(out + '$')
 }
 
-const configGlobMatchers = configGlob.map(pattern => globToRegExp(pattern))
-const coveredByGlob = file => configGlobMatchers.some(re => re.test(file))
+// 暴露给测试：glob→RegExp 与目录文件枚举（test_check_mutation_ranges.js 直接驱动断言）。
+// 注：本文件被 require 时不会提前 process.exit（最终 exit 已用 require.main === module 包住），
+// 供测试安全地复用 globToRegExp / listRepoJsFiles 做单元断言。
+module.exports = { globToRegExp, listRepoJsFiles }
+
 if (configGlob.length) {
-  console.log(`ℹ️ stryker.config.js 的 mutate 含 glob 写法（${configGlob.join(', ')}），跳过精确比对，按通配判定矩阵目标是否被覆盖`)
+  console.log(`ℹ️ stryker.config.js 的 mutate 含 glob 写法（${configGlob.join(', ')}），相对仓库根展开匹配实际文件后再与矩阵双向比对`)
 }
-const configMissing = [...mutateTargets].filter(file => !configMutate.has(file) && !coveredByGlob(file))
-const configExtra = [...configMutate].filter(file => !mutateTargets.has(file))
+// 缺陷B修复：每个 glob 相对仓库根展开成「实际存在的仓库匹配文件」，与字面条目合并成
+// 本地 mutate 全集，再与矩阵 mutateTargets 双向比对——既报 configMissing（矩阵有、glob/字面
+// 都没覆盖），也报 configExtra（本地会跑但矩阵没覆盖）。修复前只看字面条目，glob 覆盖到的
+// 「额外存在文件」检测不到（#131 缺陷B）。config 无 glob 时 allConfiguredMutate 恒等于
+// configMutate，行为与历史完全一致。
+const repoJsFiles = listRepoJsFiles()
+const allConfiguredMutate = new Set([
+  ...configMutate,
+  ...configGlob.flatMap(pattern => {
+    const re = globToRegExp(pattern)
+    return repoJsFiles.filter(file => re.test(file))
+  })
+])
+const configMissing = [...mutateTargets].filter(file => !allConfiguredMutate.has(file))
+const configExtra = [...allConfiguredMutate].filter(file => !mutateTargets.has(file))
 if (configMissing.length) {
   console.error(`❌ stryker.config.js 的 mutate 缺矩阵目标：${configMissing.join(', ')}（本地跑不全）`)
   failed = true
@@ -302,4 +360,7 @@ for (const [file, ranges] of fileRanges) {
   }
 }
 
-process.exit(failed ? 1 : 0)
+// 主入口执行：仅当作为脚本直接运行（node scripts/check-mutation-ranges.js）时按结果 exit；
+// 被 require（test_check_mutation_ranges.js 复用 globToRegExp / listRepoJsFiles）时不退出进程，
+// 保证测试进程不被提前 kill。
+if (require.main === module) process.exit(failed ? 1 : 0)

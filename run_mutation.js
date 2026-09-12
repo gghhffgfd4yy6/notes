@@ -149,23 +149,38 @@ function runTests (dir, timeoutMs) {
     // 变异评估必须跑全量套件 —— 清除 SKIP_SUITES，防止 CI 显式步骤的跳过清单继承到子进程使变异分数失真。
     const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, XBK_MUTATION_CHILD: '1', SKIP_SUITES: '' } })
     let output = ''
-    // close 回调记录的实际 signal：kill 存在竞态——子进程恰已退出时 SIGKILL 未真正送达，
-    // 超时分支 resolve 时优先用真实值，无记录（kill 未触发 close 就已 resolve）才回退 'SIGKILL'。
-    let closeSignal = null
+    // 超时竞态修复：此前 setTimeout 回调里 kill 后立即 resolve，但此时 close 尚未触发、closeSignal 必为 null，
+    // 且 stdout/stderr 还在继续排空——resolve 时既拿不到真实 signal（竞态），也拿不到最终完整 output，
+    // 后续 close 回调的 resolve 因 Promise 已 resolve 被忽略（#131 qodo #3）。现改为：超时分支只标记 timedOut
+    // 并 kill，真正的 resolve 一律收敛到 close 回调（close 时信号/输出已定稿），再叠加一个兜底保险定时器
+    // 防止 kill 后 close 永不触发（异常文件描述符/僵尸进程）导致 Promise 悬空。
+    let timedOut = false
+    let falloutTimer = null
     child.stdout.on('data', d => { output += d })
     child.stderr.on('data', d => { output += d })
     const timer = setTimeout(() => {
+      timedOut = true
       child.kill('SIGKILL')
-      // 契约与正常路径对齐（status/code/signal/output/summary 五字段一致；summary 取 extractTestSummary，
-      // 无汇总输出时自然为 []，与正常路径缺省相同——main() 的 result.summary || [] 兜底依然安全）
-      resolve({ status: 'timeout', code: null, signal: closeSignal || 'SIGKILL', output, summary: extractTestSummary(output) })
+      // 兜底保险：kill 后若 close 迟迟不触发（极端情况），仍要 resolve 不让 Promise 悬空——
+      // 用当前已 collect 的输出，signal 回退 'SIGKILL'（真实 close signal 已无从得知）。
+      // 正常 kill 会在毫秒级触发 close，此保险不会与 close 的 resolve 竞争（timedOut 已置位，
+      // 谁先 resolve 都会走 timeout 形态且结果一致）。
+      falloutTimer = setTimeout(() => {
+        resolve({ status: 'timeout', code: null, signal: 'SIGKILL', output, summary: extractTestSummary(output) })
+      }, 2000)
     }, timeoutMs)
     child.on('close', (code, signal) => {
       clearTimeout(timer)
-      closeSignal = signal
-      // S8786/S6594：多量词组正则（(\d+)(sep)(\d+)）被标超线性回溯且 String.match 被标；
-      // 改 exec + 逐关键字单数字组线性提取（summary 仅写入变异报告，无逻辑消费方）
-      resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: extractTestSummary(output) })
+      if (falloutTimer) clearTimeout(falloutTimer)
+      if (timedOut) {
+        // 已标记超时：契约固定返回 timeout 形态（code: null），signal 用 close 收到的真实值——
+        // 子进程被 SIGKILL 杀死时此地拿到 'SIGKILL'；若 kill 前已自然退出则拿到 null（带真实 code），
+        // 但既然标记了 timedOut，约定仍返回 timeout 形态，signal 用 signal || 'SIGKILL' 兜底。
+        resolve({ status: 'timeout', code: null, signal: signal || 'SIGKILL', output, summary: extractTestSummary(output) })
+      } else {
+        // 正常路径：按退出码判定 pass/fail（与修复前一致）
+        resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: extractTestSummary(output) })
+      }
     })
   })
 }

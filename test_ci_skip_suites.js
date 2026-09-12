@@ -58,52 +58,60 @@ function collectNpmScripts (step, commandText) {
   }
 }
 
-const steps = []
-let curStep = null
-let runLines = null // 正在累积的 run: 多行块内容（null = 不在块内）
-let runIndent = -1 // 进入块模式时 run: 键的缩进；续行缩进必须更深，回退到 <= runIndent 即块结束
-for (const line of testYml.split(/\r?\n/)) {
-  const trimmed = line.trim()
-  if (!trimmed) continue
-  const indent = line.length - line.trimStart().length
-  if (runLines !== null) {
-    if (indent > runIndent) { // run: 多行块的续行
-      runLines.push(trimmed)
+// 把 test.yml 的「步骤 → npm run 脚本名」解析抽成可复用函数：主流程对账与下面 dummy 文本的
+// 回归断言共用同一解析器，避免两份口径漂移。#131 qodo #2 要求对 runLines 多行块 / EOF 补结算 /
+// 注释剔除补齐回归覆盖。
+function parseWorkflowSteps (text) {
+  const steps = []
+  let curStep = null
+  let runLines = null // 正在累积的 run: 多行块内容（null = 不在块内）
+  let runIndent = -1 // 进入块模式时 run: 键的缩进；续行缩进必须更深，回退到 <= runIndent 即块结束
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    const indent = line.length - line.trimStart().length
+    if (runLines !== null) {
+      if (indent > runIndent) { // run: 多行块的续行
+        runLines.push(trimmed)
+        continue
+      }
+      collectNpmScripts(curStep, runLines.join('\n')) // 缩进回退：块结束，结算已收集的命令
+      runLines = null
+    }
+    if (/^- (?:name|uses|run|if):/.test(trimmed)) {
+      curStep = { indent, conditional: /^- if:/.test(trimmed), scripts: [] }
+      steps.push(curStep)
+      const inlineRun = trimmed.match(/^- run: ?(.+)$/)
+      if (inlineRun) {
+        if (inlineRun[1] === '|' || inlineRun[1] === '>') {
+          // 紧凑块写法 `- run: |` / `- run: >`：块模式此前只由 `run:` 键触发，这里必须同样进入，
+          // 否则该步骤后续的命令行被当作普通行忽略 → 命令丢失（对账误报）
+          runLines = []
+          runIndent = indent
+        } else {
+          collectNpmScripts(curStep, inlineRun[1]) // `- run: npm run X` 单行简写也识别
+        }
+      }
       continue
     }
-    collectNpmScripts(curStep, runLines.join('\n')) // 缩进回退：块结束，结算已收集的命令
-    runLines = null
-  }
-  if (/^- (?:name|uses|run|if):/.test(trimmed)) {
-    curStep = { indent, conditional: /^- if:/.test(trimmed), scripts: [] }
-    steps.push(curStep)
-    const inlineRun = trimmed.match(/^- run: ?(.+)$/)
-    if (inlineRun) {
-      if (inlineRun[1] === '|' || inlineRun[1] === '>') {
-        // 紧凑块写法 `- run: |` / `- run: >`：块模式此前只由 `run:` 键触发，这里必须同样进入，
-        // 否则该步骤后续的命令行被当作普通行忽略 → 命令丢失（对账误报）
-        runLines = []
+    if (!curStep) continue
+    if (trimmed.startsWith('if:') && indent > curStep.indent) curStep.conditional = true
+    if (trimmed.startsWith('run:')) {
+      const rest = trimmed.slice('run:'.length).trim()
+      if (!rest || rest === '|' || rest === '>') {
+        runLines = [] // 块模式：后续缩进更深的行均为命令文本
         runIndent = indent
       } else {
-        collectNpmScripts(curStep, inlineRun[1]) // `- run: npm run X` 单行简写也识别
+        collectNpmScripts(curStep, rest)
       }
     }
-    continue
   }
-  if (!curStep) continue
-  if (trimmed.startsWith('if:') && indent > curStep.indent) curStep.conditional = true
-  if (trimmed.startsWith('run:')) {
-    const rest = trimmed.slice('run:'.length).trim()
-    if (!rest || rest === '|' || rest === '>') {
-      runLines = [] // 块模式：后续缩进更深的行均为命令文本
-      runIndent = indent
-    } else {
-      collectNpmScripts(curStep, rest)
-    }
-  }
+  // 文件末尾的 run: 多行块：循环内只在缩进回退时结算，最后一步是块时必须在此补一次结算
+  if (runLines !== null) collectNpmScripts(curStep, runLines.join('\n'))
+  return steps
 }
-// 文件末尾的 run: 多行块：循环内只在缩进回退时结算，最后一步是块时必须在此补一次结算
-if (runLines !== null) collectNpmScripts(curStep, runLines.join('\n'))
+
+const steps = parseWorkflowSteps(testYml)
 const explicitFiles = new Set()
 for (const step of steps) {
   if (step.conditional) continue
@@ -117,6 +125,53 @@ assert.ok(explicitFiles.size > 0, '应从 test.yml 解析出显式测试步骤')
 const byName = (a, b) => a.localeCompare(b) // 显式比较函数：默认 sort 的字符串序不保证稳定可预期（Sonar S2871）
 assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explicitFiles.has(f)).sort(byName),
   'SKIP_SUITES 必须等于「显式步骤已覆盖的单元套件」：漏写会重复跑，多写会漏跑（门禁盲区）')
+
+// #131 qodo #2：runLines 多行块 / EOF 补结算 / 注释剔除的回归断言。
+// 用 dummy workflow 文本驱动同一解析器 parseWorkflowSteps，验证 scripts 收集正确——不依赖真实
+// test.yml（那是主对账的输入，这里专测解析边界）：
+//   1. `run: |` 块内两行各提取一个 npm run（多行块内逐行提取）
+//   2. 注释行（`# npm run ghost`）与行内注释（`npm run ... # 说明`）不进 scripts
+//   3. 引号内的文本（echo "npm run notcmd"）不进 scripts
+//   4. `run: |` 块放在文本末尾、且无尾随换行（EOF 补结算路径）仍能收集齐其命令
+//   5. `run: >` 折叠块、`if:` 条件步骤标记正确（conditional）以备对账忽略
+{
+  const dummy = [
+    'name: dummy',
+    'on: push',
+    'jobs:',
+    '  test:',
+    '    steps:',
+    '      - name: 多行块',
+    '        run: |',
+    '          npm run test:unit',
+    '          # npm run ghost',
+    '          npm run test:notify # 行内说明',
+    '          echo "npm run quoted-not-cmd"',
+    '      - name: 折叠块',
+    '        run: >',
+    '          npm run test:app',
+    '      - if: false',
+    '        run: npm run test:loop',
+    '      - name: 末尾块无尾随换行',
+    '        run: |',
+    '          npm run test:filter'
+  ].join('\n') // 故意不补末尾 \n：验证 EOF 补结算
+  const dummySteps = parseWorkflowSteps(dummy)
+  // 步骤数：name多行块 / 折叠块 / if条件 / 末尾块 = 4
+  assert.strictEqual(dummySteps.length, 4, 'dummy 应解析出 4 个步骤')
+  assert.deepStrictEqual(dummySteps[0].scripts, ['test:unit', 'test:notify'],
+    'run:| 块应逐行提取脚本，注释行(# npm run ghost)与行内注释(npm run test:notify #…)与引号文本均剔除')
+  assert.deepStrictEqual(dummySteps[1].scripts, ['test:app'], 'run:> 折叠块应提取 test:app')
+  assert.strictEqual(dummySteps[2].conditional, true, 'if: 步骤应标记 conditional（对账时忽略）')
+  assert.deepStrictEqual(dummySteps[2].scripts, ['test:loop'], '条件步骤仍应解析出其脚本')
+  assert.deepStrictEqual(dummySteps[3].scripts, ['test:filter'],
+    '文本末尾的 run:| 块（无尾随换行）应经 EOF 补结算提取 test:filter')
+  // 注释/引号不应污染任何步骤的 scripts
+  const allScripts = dummySteps.flatMap(s => s.scripts)
+  assert.ok(!allScripts.includes('ghost'), '注释中的命令名不应进入 scripts')
+  assert.ok(!allScripts.includes('quoted-not-cmd'), '引号内的文本不应进入 scripts')
+  console.log('✅ dummy workflow 解析断言通过（多行块/EOF补结算/注释剔除/if条件）')
+}
 
 // 2b. integration/mutationSkip 套件被 run_unit_tests.js 排除，只能靠显式步骤进门禁 ——
 //     漏一个就是门禁盲区（test_suites.js 注释写明「历史上多次发生」）
