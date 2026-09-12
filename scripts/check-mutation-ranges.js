@@ -110,6 +110,41 @@ for (const entry of matrixEntries) {
   }
 }
 
+// 校验 0.5：矩阵 name 必须与 mutation-report 的 EXPECTED_SEGMENTS 一致（含重复检测）。
+// 背景：name 写错/漏改要等 report 阶段 validateSegments() 才 throw —— 那时整轮矩阵（小时级）已经白跑。
+const expectedSegments = require('../scripts/mutation-report.js').EXPECTED_SEGMENTS || []
+const matrixNames = matrixEntries.map(entry => entry.name).filter(Boolean)
+const dupNames = [...new Set(matrixNames.filter((name, i) => matrixNames.indexOf(name) !== i))]
+const nameMissing = expectedSegments.filter(name => !matrixNames.includes(name))
+const nameExtra = matrixNames.filter(name => !expectedSegments.includes(name))
+if (dupNames.length) {
+  console.error(`❌ matrix name 重复：${dupNames.join(', ')}（缓存 key 会互相覆盖）`)
+  failed = true
+}
+if (nameMissing.length) {
+  console.error(`❌ mutation-report 期望的分段未出现在矩阵：${nameMissing.join(', ')}`)
+  failed = true
+}
+if (nameExtra.length) {
+  console.error(`❌ 矩阵含 mutation-report 不认识的段名：${nameExtra.join(', ')}`)
+  failed = true
+}
+
+// 校验 0.6：stryker.config.js 的 mutate 必须与矩阵文件集完全一致。
+// 背景：本地 `npm run test:mutation` 走 config 的清单，与 CI 矩阵漂移会「本地少跑/多跑」而无人知
+// （实际漏过 scripts/check-deps.js）。
+const configMutate = new Set(require('../stryker.config.js').mutate || [])
+const configMissing = [...mutateTargets].filter(file => !configMutate.has(file))
+const configExtra = [...configMutate].filter(file => !mutateTargets.has(file))
+if (configMissing.length) {
+  console.error(`❌ stryker.config.js 的 mutate 缺矩阵目标：${configMissing.join(', ')}（本地跑不全）`)
+  failed = true
+}
+if (configExtra.length) {
+  console.error(`❌ stryker.config.js 的 mutate 含矩阵未覆盖的文件：${configExtra.join(', ')}（本地比 CI 多跑）`)
+  failed = true
+}
+
 for (const [file, ranges] of fileRanges) {
   let fileFailed = false
   // 路径加固：解析后必须仍在仓库根目录内，拒绝 yml 里的越界路径
