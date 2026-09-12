@@ -2,7 +2,9 @@
 
 // runTests 超时竞态双保险回归（#131 qodo #3）。run_mutation.js 的 runTests 超时竞态修复后两条
 // 路径均无自动化覆盖：
-//   A) 超时 → kill → close 正常到达：resolve 收敛到 close 回调，signal 透传真实值（'SIGKILL'）
+//   A) 超时 → kill → close 正常到达：resolve 收敛到 close 回调，透传 close 的真实 signal
+//      （#132 review Q4：close 发射非默认信号 'SIGTERM' 并断言返回 SIGTERM——兜底值恰是
+//      'SIGKILL'，若实现不透传而硬编码回退值，本断言即红，两个场景不再互相印证）
 //   B) 超时 → kill → close 悬空（异常 fd/僵尸进程）：2000ms 兜底保险定时器 resolve，signal 回退 'SIGKILL'
 // 本套件用注入法（把 child_process.spawn 替换为 fake child 工厂）在不改生产代码（run_mutation.js
 // 一行不动）的前提下覆盖两条路径；只依赖 node 内置模块，不依赖 node_modules。
@@ -64,18 +66,20 @@ function waitKillCount (expected, timeoutMs = 1500) {
       const pending = runTests(dir, 30)
       await waitKillCount(1)
       assert.strictEqual(killedSignals[0], 'SIGKILL', '超时后应向子进程发 SIGKILL')
-      // 模拟真实子进程被 kill 后 close 正常到达（带真实 signal）
-      lastChild.emit('close', null, 'SIGKILL')
+      // 模拟真实子进程被 kill 后 close 正常到达（带真实 signal）。故意发射非默认信号 'SIGTERM'
+      // 而非 'SIGKILL'（#132 review Q4）：兜底回退值恰是 SIGKILL，若实现偷偷硬编码回退值而
+      // 不透传 close 的真实 signal，用 SIGKILL 断言两个场景仍全绿——非默认信号才能证明透传。
+      lastChild.emit('close', null, 'SIGTERM')
       const result = await pending
       const elapsed = Date.now() - t0
       assert.strictEqual(result.status, 'timeout', 'close 已达的超时应返回 timeout')
       assert.strictEqual(result.code, null, '超时结果应显式返回 code: null')
-      assert.strictEqual(result.signal, 'SIGKILL', '应透传 close 的真实 signal（而非兜底回退值）')
+      assert.strictEqual(result.signal, 'SIGTERM', '应透传 close 的真实 signal（SIGTERM，而非兜底回退的 SIGKILL）')
       assert.ok(Array.isArray(result.summary), 'summary 应为数组（空输出 → []）')
       assert.strictEqual(result.output, '', '未写入任何输出时 output 应为空字符串')
       assert.ok(elapsed < 1900,
         `路径 A 应由 close 收敛快速 resolve（实测 ${elapsed}ms，应 < 1900ms，而非等 2000ms 兜底）`)
-      console.log('✅ 场景A：超时→kill→close 透传真实 signal 并快速 resolve')
+      console.log('✅ 场景A：超时→kill→close 透传真实 signal（SIGTERM）并快速 resolve')
     }
 
     // ── 场景 B：超时 → kill → close 悬空 → 兜底定时器 resolve（signal 回退 'SIGKILL'） ──
@@ -84,16 +88,30 @@ function waitKillCount (expected, timeoutMs = 1500) {
       const pending = runTests(dir, 30)
       await waitKillCount(2)
       assert.strictEqual(killedSignals[1], 'SIGKILL', '第二次超时后同样应发 SIGKILL')
-      // 故意不 emit close：只能靠 2000ms 兜底保险定时器 resolve
-      const result = await pending
-      const elapsed = Date.now() - t0
-      assert.strictEqual(result.status, 'timeout', 'close 悬空时兜底结果应为 timeout')
-      assert.strictEqual(result.code, null, '兜底结果 code 应为 null')
-      assert.strictEqual(result.signal, 'SIGKILL', 'close 悬空时 signal 应回退 SIGKILL')
-      assert.ok(Array.isArray(result.summary), 'summary 应为数组（空输出 → []）')
-      assert.ok(elapsed >= 1900,
-        `路径 B 应等待 2000ms 兜底定时器 resolve（实测 ${elapsed}ms，应 >= 1900ms）`)
-      console.log('✅ 场景B：close 悬空由 2000ms 兜底定时器 resolve（signal 回退 SIGKILL）')
+      // 故意不 emit close：只能靠 2000ms 兜底保险定时器 resolve。
+      // #132 review Q5：直接 await pending 时，若生产代码的 2000ms 兜底被移除/变长/未调度，
+      // 测试会无限挂到 CI 作业超时而不是断言失败。加测试侧 watchdog（10s）：兜底故障时显式
+      // 断言失败并给出明确错误；正常路径 watchdog 不触发（unref + clearTimeout，预算仍 ~5s）。
+      let watchdogTimer
+      const watchdog = new Promise((_, reject) => {
+        watchdogTimer = setTimeout(
+          () => reject(new Error('生产兜底未在预期时间内 resolve（2000ms 兜底被移除/变长/未调度？）')),
+          10000)
+        watchdogTimer.unref()
+      })
+      try {
+        const result = await Promise.race([pending, watchdog])
+        const elapsed = Date.now() - t0
+        assert.strictEqual(result.status, 'timeout', 'close 悬空时兜底结果应为 timeout')
+        assert.strictEqual(result.code, null, '兜底结果 code 应为 null')
+        assert.strictEqual(result.signal, 'SIGKILL', 'close 悬空时 signal 应回退 SIGKILL')
+        assert.ok(Array.isArray(result.summary), 'summary 应为数组（空输出 → []）')
+        assert.ok(elapsed >= 1900,
+          `路径 B 应等待 2000ms 兜底定时器 resolve（实测 ${elapsed}ms，应 >= 1900ms）`)
+        console.log('✅ 场景B：close 悬空由 2000ms 兜底定时器 resolve（signal 回退 SIGKILL）')
+      } finally {
+        clearTimeout(watchdogTimer)
+      }
     }
 
     console.log('✅ 变异超时竞态双路径注入式回归通过')
