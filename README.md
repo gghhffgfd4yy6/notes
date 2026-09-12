@@ -6,11 +6,14 @@
 
 ```bash
 npm install --ignore-scripts
+npm run hooks:install
 npm run rebuild --prefix node_modules/re2
 node -e "const RE2=require('re2'); if (!new RE2('^ok$').test('ok')) process.exit(1)"
 cp push_config.local.js.example push_config.local.js
 npm start
 ```
+
+`npm run hooks:install` 会把 `core.hooksPath` 指向 `.githooks`（本地 `pre-commit` 快检 lint/版本/单测、`commit-msg` 校验提交信息）。因安装使用 `--ignore-scripts`（会跳过自动钩子注册），需在安装后显式执行一次；若你已配置过其它 `core.hooksPath`，该脚本不会覆盖。
 
 `push_config.local.js` 含密钥，不能提交。可用环境变量覆盖配置。
 
