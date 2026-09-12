@@ -33,11 +33,12 @@ jobs:
       # 校验 tag 版本号格式（semver）：job 级 if 只保证 v* 前缀，vfoo 这类非版本 tag 也会被放行，
       # 必须在创建 Release 前显式失败并 exit 1，避免误建 Release。
       # 仓库版本格式：CHANGELOG 为 v3.272（两段）、package.json 为 3.272.0（三段），两种形式均接受；
-      # 正则无嵌套/相邻量词，线性安全（参考 #127 超线性正则教训）。
+      # 数字组件不允许前导零（03.2 非法，0.1.0 合法），后缀（prerelease/build）不允许空组件/以 . 结尾
+      # （alpha.、alpha..1 非法，rc.1、build.5 合法）；正则无嵌套/相邻量词，线性安全（参考 #127 超线性正则教训）。
       - name: 校验 tag 版本号格式（semver）
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.-]+)?$ ]]; then
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?([-][0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?([+][0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
             echo "::error::tag 名称 'v${VERSION}' 不是合法版本号（应为 v数字.数字[.数字][-后缀] 形式，如 v3.272 / v3.272.0），已中止 Release 创建。"
             exit 1
           fi

@@ -48,7 +48,14 @@ const unitFiles = SUITES.filter(s => !s.integration && !s.mutationSkip).map(s =>
 // 提取不出任何命令名时该步骤对 explicitFiles 无贡献——缺失的覆盖最终仍会被下面对账断言拦下（保持红），
 // 这里只负责「正常排版变化不误红」。
 function collectNpmScripts (step, commandText) {
-  for (const m of commandText.matchAll(/\bnpm run ([A-Za-z0-9_.:@/-]+)/g)) step.scripts.push(m[1])
+  // 只认真实命令：注释行（`# npm run x`）与行内注释（`npm run foo # 说明` 的 # 后部分）不是命令，
+  // 引号内的文本（echo "参考: npm run x" 这类诊断输出）也不是命令——提取前剔除，避免对账被虚假满足。
+  for (const raw of commandText.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    const cmd = line.replace(/"[^"]*"|'[^']*'/g, '').replace(/#.*$/, '')
+    for (const m of cmd.matchAll(/\bnpm run ([A-Za-z0-9_.:@/-]+)/g)) step.scripts.push(m[1])
+  }
 }
 
 const steps = []
@@ -71,7 +78,16 @@ for (const line of testYml.split(/\r?\n/)) {
     curStep = { indent, conditional: /^- if:/.test(trimmed), scripts: [] }
     steps.push(curStep)
     const inlineRun = trimmed.match(/^- run: ?(.+)$/)
-    if (inlineRun) collectNpmScripts(curStep, inlineRun[1]) // `- run: npm run X` 单行简写也识别
+    if (inlineRun) {
+      if (inlineRun[1] === '|' || inlineRun[1] === '>') {
+        // 紧凑块写法 `- run: |` / `- run: >`：块模式此前只由 `run:` 键触发，这里必须同样进入，
+        // 否则该步骤后续的命令行被当作普通行忽略 → 命令丢失（对账误报）
+        runLines = []
+        runIndent = indent
+      } else {
+        collectNpmScripts(curStep, inlineRun[1]) // `- run: npm run X` 单行简写也识别
+      }
+    }
     continue
   }
   if (!curStep) continue
@@ -86,6 +102,8 @@ for (const line of testYml.split(/\r?\n/)) {
     }
   }
 }
+// 文件末尾的 run: 多行块：循环内只在缩进回退时结算，最后一步是块时必须在此补一次结算
+if (runLines !== null) collectNpmScripts(curStep, runLines.join('\n'))
 const explicitFiles = new Set()
 for (const step of steps) {
   if (step.conditional) continue

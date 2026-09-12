@@ -172,6 +172,21 @@ const configMutate = new Set(configMutateRaw.filter(item => !globChars.test(item
 // 无法安全解析的结构（空类、含 `\`/`^` 的类、含通配符的交替项）一律按字面处理——宁可继续报
 // 「缺矩阵目标」，也不能把不存在的覆盖说成存在。`**` 折叠为单个 `*`，避免相邻量词被静态分析
 // 判为可回溯超线性（Sonar S8786）。
+// 字符类内 `-` 范围合法性：`x-y` 要求 x <= y（乱序范围如 `0--`/`z-a` 直接拼进字符类会让
+// new RegExp 抛「Range out of order in character class」）。首/尾位置的 `-` 是字面量不算范围；
+// `-` 相邻 `-`（如 `a--z`）无法确定语义，同样判为不安全。不安全 → 整个类按字面 `[` 处理。
+function rangesOrdered (cls) {
+  for (let k = 0; k < cls.length; k++) {
+    if (cls[k] !== '-') continue
+    if (k === 0 || k === cls.length - 1) continue // 首/尾 `-` 为字面量
+    const prev = cls[k - 1]
+    const next = cls[k + 1]
+    if (prev === '-' || next === '-') return false // 连续 `-`：无法确定语义，按字面处理
+    if (prev.charCodeAt(0) > next.charCodeAt(0)) return false // 乱序范围 → new RegExp 会抛错
+  }
+  return true
+}
+
 function globToRegExp (pattern) {
   let out = '^'
   for (let i = 0; i < pattern.length; i++) {
@@ -196,7 +211,9 @@ function globToRegExp (pattern) {
         let cls = pattern.slice(i + 1, close)
         let negate = ''
         if (cls[0] === '!' || cls[0] === '^') { negate = '^'; cls = cls.slice(1) }
-        if (cls && /^[^\\\]^]*$/.test(cls)) { // 类内仅接受字面与 `-` 范围；含 `\`/`^` 或空类则按字面 `[` 处理
+        // 类内仅接受字面与 `-` 范围；含 `\`/`]`/`[`/`^`、空类或乱序范围（`0--` 等会让 new RegExp
+        // 抛 Range out of order）一律按字面 `[` 处理——生成的 RegExp 必须永远合法（绝不崩溃，也绝不虚报覆盖）
+        if (cls && !/[\\\]\[\^]/.test(cls) && rangesOrdered(cls)) {
           out += '[' + negate + cls + ']'
           i = close // 循环 i++ 跳过 `]`
         } else {
