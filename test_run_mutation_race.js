@@ -11,6 +11,7 @@
 // 关键原理：run_mutation.js 顶层是 `const { spawn } = require('child_process')`（模块加载时解构），
 // 所以必须先替换 child_process.spawn，再清 require 缓存重新 require('./run_mutation') 才生效。
 // 运行方式：node test_run_mutation_race.js（exit 0 = 通过；全程约 2.2s）。
+// 变异沙箱（XBK_MUTATION_CHILD=1）下秒级跳过（#132 review Q6）；普通单元门禁完整执行。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -18,6 +19,16 @@ const path = require('node:path')
 const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
 const childProcess = require('node:child_process')
+
+// 防重入/省固定成本（#132 review Q6）：stryker 变异沙箱（mutation.yml 的 commandRunner 反复
+// spawn run_unit_tests.js，18 个分片）每次都会执行本套件，场景 B 的 ~2s 兜底等待白白重复 18 次
+// ——run_mutation.js 不在变异目标内，本场景与 mutate 目标无关。与 test_run_mutation_cli.js 同款
+// 防重入：XBK_MUTATION_CHILD=1（run_mutation.js 子进程与 mutation.yml 的 stryker step 均设置）
+// 时跳过；普通单元门禁（npm run test:unit 等）不设该变量，仍完整执行本套件，回归覆盖不受影响。
+if (process.env.XBK_MUTATION_CHILD === '1') {
+  console.log('⏭ 检测到 XBK_MUTATION_CHILD，跳过竞态场景（防变异运行递归/省 2s 固定成本）')
+  return
+}
 
 const originalSpawn = childProcess.spawn
 const killedSignals = [] // fake child 的 kill 收到的信号（按调用次序）
