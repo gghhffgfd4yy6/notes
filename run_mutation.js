@@ -101,11 +101,18 @@ function copyProject (dir, files) {
   const testFiles = entries.filter(f => /^test_.*\.js$/.test(f))
   const srcFiles = entries.filter(f => /^xbk_.*\.js$/.test(f))
   const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md']
-  for (const name of [...extraTop, ...testFiles, ...srcFiles, ...files]) {
+  // 固定清单（extraTop + 调用方传入的 files，如 DEFAULT_FILES）属必选：缺失须响亮报错，不能静默 continue——
+  // 漏拷文件会留下沙箱 MODULE_NOT_FOUND/ENOENT → evaluate 恒 fail 的不响亮回归（#120/#122 一类根因）。
+  // 动态清单（testFiles/srcFiles 来自 readdirSync，必已存在）保持 continue 兜底；目录整体复制（scripts/qinglong/.github）是可选复制，语义不变。
+  const required = new Set([...extraTop, ...files])
+  for (const name of [...required, ...testFiles, ...srcFiles]) {
     // 信任边界防护：拒绝目录穿越/绝对路径，确保只复制 ROOT 内文件
     if (name.includes('..') || path.isAbsolute(name)) throw new Error(`copyProject 拒绝越界路径: ${name}`)
     const src = path.join(ROOT, name)
-    if (!fs.existsSync(src)) continue
+    if (!fs.existsSync(src)) {
+      if (required.has(name)) throw new Error(`copyProject 缺少必要文件: ${name}`)
+      continue
+    }
     const dst = path.join(dir, name)
     fs.mkdirSync(path.dirname(dst), { recursive: true })
     fs.copyFileSync(src, dst)
@@ -142,11 +149,20 @@ function runTests (dir, timeoutMs) {
     // 变异评估必须跑全量套件 —— 清除 SKIP_SUITES，防止 CI 显式步骤的跳过清单继承到子进程使变异分数失真。
     const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, XBK_MUTATION_CHILD: '1', SKIP_SUITES: '' } })
     let output = ''
+    // close 回调记录的实际 signal：kill 存在竞态——子进程恰已退出时 SIGKILL 未真正送达，
+    // 超时分支 resolve 时优先用真实值，无记录（kill 未触发 close 就已 resolve）才回退 'SIGKILL'。
+    let closeSignal = null
     child.stdout.on('data', d => { output += d })
     child.stderr.on('data', d => { output += d })
-    const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ status: 'timeout', code: null, signal: 'SIGKILL', output }) }, timeoutMs)
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      // 契约与正常路径对齐（status/code/signal/output/summary 五字段一致；summary 取 extractTestSummary，
+      // 无汇总输出时自然为 []，与正常路径缺省相同——main() 的 result.summary || [] 兜底依然安全）
+      resolve({ status: 'timeout', code: null, signal: closeSignal || 'SIGKILL', output, summary: extractTestSummary(output) })
+    }, timeoutMs)
     child.on('close', (code, signal) => {
       clearTimeout(timer)
+      closeSignal = signal
       // S8786/S6594：多量词组正则（(\d+)(sep)(\d+)）被标超线性回溯且 String.match 被标；
       // 改 exec + 逐关键字单数字组线性提取（summary 仅写入变异报告，无逻辑消费方）
       resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: extractTestSummary(output) })

@@ -28,13 +28,19 @@ if (includeIdx !== -1) {
     const indent = line.match(/^\s*/)[0].length
     if (/^\s*[A-Za-z_][\w-]*:/.test(line) && indent <= includeIndent) break // include 块结束（回到 steps: 等同级键）
     const trimmed = line.trim()
-    if (trimmed.startsWith('- ')) {
+    let body = trimmed
+    if (trimmed.startsWith('-')) {
+      // 条目起始放宽：`- name:`、`-name:`、`-\tname:` 均视为新条目（曾漏掉无空格/制表符前缀的
+      // 写法，导致条目字段缺失被误报成「缺 name」）；但去掉 `-` 前缀后为空或以 `#` 开头
+      // （如 `- # 纯注释`、`-#注释`）的不算新条目，避免生成全空条目触发「缺 name 字段」误报。
+      const rest = trimmed.slice(1).trim()
+      if (rest === '' || rest.startsWith('#')) continue
       currentEntry = { name: null, src: null, mutate: null }
       matrixEntries.push(currentEntry)
+      body = rest
     }
     if (!currentEntry) continue
     // 字段解析走字符串切片而非正则：`\s*-?\s*` 这类相邻量词会被静态分析判为可回溯超线性（Sonar S8786）
-    const body = trimmed.startsWith('- ') ? trimmed.slice(2).trim() : trimmed
     const colon = body.indexOf(':')
     if (colon <= 0) continue
     const key = body.slice(0, colon)
@@ -42,8 +48,16 @@ if (includeIdx !== -1) {
     let value = body.slice(colon + 1).trim()
     const quote = value[0]
     if (quote === '"' || quote === "'") {
-      const close = value.indexOf(quote, 1) // 引号标量：取到闭合引号，内部的 # 属于值而非注释
-      value = close > 0 ? value.slice(1, close) : value.slice(1)
+      // 引号标量：内部的 # 属于值而非注释；`''`/`""` 是转义后的引号本身——连续两个相同
+      // 引号折叠为一个并继续扫描，到真正的闭合引号为止；未闭合时回退为去掉开引号取全部
+      // （防御性处理——仓库 yml 统一双引号，但解析器不应在首个相遇处误截断）。
+      let raw = ''
+      for (let i = 1; i < value.length; i++) {
+        const ch = value[i]
+        if (ch !== quote) { raw += ch; continue }
+        if (value[i + 1] === quote) { raw += quote; i++ } else break // 闭合引号
+      }
+      value = raw
     } else {
       const hash = value.indexOf('#') // 裸标量：行内注释从 # 开始
       if (hash !== -1) value = value.slice(0, hash)
@@ -110,9 +124,20 @@ for (const entry of matrixEntries) {
   }
 }
 
+// 依赖模块加载的友好降级：mutation-report.js / stryker.config.js 未来若在顶层抛错或引入副作用，
+// checker 不应裸栈崩溃，而要指明是哪个模块加载失败并以 exit 1 退出。
+function requireOrDie (modulePath, displayName) {
+  try {
+    return require(modulePath)
+  } catch (err) {
+    console.error(`❌ 无法加载 ${displayName}（${modulePath}）：${err.message}`)
+    process.exit(1)
+  }
+}
+
 // 校验 0.5：矩阵 name 必须与 mutation-report 的 EXPECTED_SEGMENTS 一致（含重复检测）。
 // 背景：name 写错/漏改要等 report 阶段 validateSegments() 才 throw —— 那时整轮矩阵（小时级）已经白跑。
-const expectedSegments = require('../scripts/mutation-report.js').EXPECTED_SEGMENTS || []
+const expectedSegments = requireOrDie('../scripts/mutation-report.js', 'mutation-report.js').EXPECTED_SEGMENTS || []
 const matrixNames = matrixEntries.map(entry => entry.name).filter(Boolean)
 const dupNames = [...new Set(matrixNames.filter((name, i) => matrixNames.indexOf(name) !== i))]
 const nameMissing = expectedSegments.filter(name => !matrixNames.includes(name))
@@ -133,8 +158,66 @@ if (nameExtra.length) {
 // 校验 0.6：stryker.config.js 的 mutate 必须与矩阵文件集完全一致。
 // 背景：本地 `npm run test:mutation` 走 config 的清单，与 CI 矩阵漂移会「本地少跑/多跑」而无人知
 // （实际漏过 scripts/check-deps.js）。
-const configMutate = new Set(require('../stryker.config.js').mutate || [])
-const configMissing = [...mutateTargets].filter(file => !configMutate.has(file))
+// stryker 的 mutate 原生支持 glob 写法（如 'xbk_*.js'）：含通配符的条目无法字符串精确比对，
+// 硬比会把「被 glob 覆盖的矩阵目标」误报成「缺矩阵目标」。处理：glob 条目输出提示并跳过精确
+// 比对，改用最小 glob→RegExp 判定矩阵目标是否可能被覆盖；非 glob 条目仍严格比对，通过/失败
+// 语义与历史一致（当前 config 无 glob 时行为完全不变）。
+const configMutateRaw = requireOrDie('../stryker.config.js', 'stryker.config.js').mutate || []
+const globChars = /[*?[\]{}]/
+const configGlob = configMutateRaw.filter(item => globChars.test(item))
+const configMutate = new Set(configMutateRaw.filter(item => !globChars.test(item)))
+
+// 最小 glob→RegExp（仅为「矩阵目标是否可能被 glob 覆盖」的判定服务）：
+// `*`/`?` 不跨 `/`，`{a,b}` 为交替，`[...]` 为字符类（`!`/`^` 开头取反，内部保留 `-` 范围）；
+// 无法安全解析的结构（空类、含 `\`/`^` 的类、含通配符的交替项）一律按字面处理——宁可继续报
+// 「缺矩阵目标」，也不能把不存在的覆盖说成存在。`**` 折叠为单个 `*`，避免相邻量词被静态分析
+// 判为可回溯超线性（Sonar S8786）。
+function globToRegExp (pattern) {
+  let out = '^'
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i]
+    if (c === '*') {
+      while (pattern[i + 1] === '*') i++
+      out += '[^/]*'
+    } else if (c === '?') {
+      out += '[^/]'
+    } else if (c === '{') {
+      const close = pattern.indexOf('}', i + 1)
+      const alts = close === -1 ? null : pattern.slice(i + 1, close).split(',')
+      if (alts && alts.length >= 2 && alts.every(a => a && !globChars.test(a))) {
+        out += '(?:' + alts.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')'
+        i = close // 循环 i++ 跳过 `}`
+      } else {
+        out += '\\{'
+      }
+    } else if (c === '[') {
+      const close = pattern.indexOf(']', i + 1)
+      if (close !== -1) {
+        let cls = pattern.slice(i + 1, close)
+        let negate = ''
+        if (cls[0] === '!' || cls[0] === '^') { negate = '^'; cls = cls.slice(1) }
+        if (cls && /^[^\\\]^]*$/.test(cls)) { // 类内仅接受字面与 `-` 范围；含 `\`/`^` 或空类则按字面 `[` 处理
+          out += '[' + negate + cls + ']'
+          i = close // 循环 i++ 跳过 `]`
+        } else {
+          out += '\\['
+        }
+      } else {
+        out += '\\['
+      }
+    } else {
+      out += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    }
+  }
+  return new RegExp(out + '$')
+}
+
+const configGlobMatchers = configGlob.map(pattern => globToRegExp(pattern))
+const coveredByGlob = file => configGlobMatchers.some(re => re.test(file))
+if (configGlob.length) {
+  console.log(`ℹ️ stryker.config.js 的 mutate 含 glob 写法（${configGlob.join(', ')}），跳过精确比对，按通配判定矩阵目标是否被覆盖`)
+}
+const configMissing = [...mutateTargets].filter(file => !configMutate.has(file) && !coveredByGlob(file))
 const configExtra = [...configMutate].filter(file => !mutateTargets.has(file))
 if (configMissing.length) {
   console.error(`❌ stryker.config.js 的 mutate 缺矩阵目标：${configMissing.join(', ')}（本地跑不全）`)
