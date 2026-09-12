@@ -10,7 +10,8 @@ const { execFileSync } = require('node:child_process')
 const HOOKS_DIR = '.githooks'
 
 function git (args) {
-  return execFileSync('git', args, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+  // 跨平台工具脚本需按名调用系统 git（依赖 PATH），非命令注入面 —— 对 SonarCloud S4036 免检
+  return execFileSync('git', args, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() // NOSONAR
 }
 
 let insideRepo = false
