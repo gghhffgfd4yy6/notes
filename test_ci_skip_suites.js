@@ -42,6 +42,13 @@ assert.ok(explicitFiles.size > 0, '应从 test.yml 解析出显式测试步骤')
 assert.deepStrictEqual(skips.slice().sort(), unitFiles.filter(f => explicitFiles.has(f)).sort(),
   'SKIP_SUITES 必须等于「显式步骤已覆盖的单元套件」：漏写会重复跑，多写会漏跑（门禁盲区）')
 
+// 2b. integration/mutationSkip 套件被 run_unit_tests.js 排除，只能靠显式步骤进门禁 ——
+//     漏一个就是门禁盲区（test_suites.js 注释写明「历史上多次发生」）
+const excluded = SUITES.filter(s => s.integration || s.mutationSkip).map(s => s.file)
+const uncovered = excluded.filter(f => !explicitFiles.has(f))
+assert.deepStrictEqual(uncovered, [],
+  `以下 integration/mutationSkip 套件没有 CI 显式步骤，脱离门禁：${uncovered.join(', ')}`)
+
 // ── 3. 入口行为（子进程 + 跳过全部套件，秒级） ───────────────
 const baseEnv = { ...process.env }
 delete baseEnv.SKIP_SUITES
@@ -73,6 +80,13 @@ try {
   const child = runEntry({ SKIP_SUITES: skipAll, GITHUB_STEP_SUMMARY: sumFile2, XBK_MUTATION_CHILD: '1' })
   assert.strictEqual(child.status, 0, child.stderr || child.stdout)
   assert.ok(!fs.existsSync(sumFile2), 'XBK_MUTATION_CHILD=1 时不得写 job summary')
+
+  // 3e 输出超限（ENOBUFS）必须标注为「输出超限」而不是普通测试失败：
+  //    XBK_UNIT_MAX_BUFFER 仅测试注入；留一个必输出内容的套件、把上限压到 1 字节
+  const oneLeft = unitFiles.filter(f => f !== 'test_check_deps.js').join(',')
+  const overflow = runEntry({ SKIP_SUITES: oneLeft, GITHUB_STEP_SUMMARY: path.join(tmp, 'summary-overflow.md'), XBK_UNIT_MAX_BUFFER: '1' })
+  assert.notStrictEqual(overflow.status, 0, '输出超过 maxBuffer 的套件应判定失败')
+  assert.match(overflow.stdout, /::error title=输出超限/, '失败原因必须标注为输出超限（非测试失败）')
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true })
 }

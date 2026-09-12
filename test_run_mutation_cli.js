@@ -99,7 +99,10 @@ const { runTests, evaluate } = require('./run_mutation')
     const result = await evaluate([], files, 120000)
     // 行为断言 1：返回结构完整
     assert.ok(typeof result === 'object', 'evaluate 应返回对象')
-    assert.ok(['pass', 'fail', 'timeout'].includes(result.status), 'status 应为 pass/fail/timeout')
+    // 沙箱内整套必须真的通过：此前只断言 status ∈ {pass,fail,timeout}，copyProject 漏拷文件导致
+    // 沙箱恒红（#120/#122 一类）也无人发现——这里改成硬断言 pass。
+    assert.strictEqual(result.status, 'pass',
+      `沙箱内单元测试应整体通过，实际 ${result.status}。output 末尾：${result.output.slice(-400)}`)
     assert.ok(Array.isArray(result.mutants), '应返回 mutants 数组')
     assert.strictEqual(result.mutants.length, 0, '无变异时 mutants 应为空')
     // 行为断言 2：output 中包含单元测试入口的真实输出（证明测试真正运行了，而非 MODULE_NOT_FOUND 立即失败）

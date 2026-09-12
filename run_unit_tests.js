@@ -57,7 +57,8 @@ const IN_CI = Boolean(process.env.GITHUB_STEP_SUMMARY)
 const summaryLines = ['| 套件 | 文件 | 结果 | 耗时 |', '|---|---|---|---|']
 // CI 下 stdout 走 pipe 收进内存（失败时打包重显），故必须显式放大上限：execFileSync 默认 maxBuffer=1MiB，
 // 超限会抛 ENOBUFS —— 一个「通过」的套件会被误判为失败。实测最大套件 test_filter.js 约 75KB，余量充足。
-const MAX_BUFFER = 8 * 1024 * 1024
+// XBK_UNIT_MAX_BUFFER 仅用于测试注入（构造超限场景），生产不设。
+const MAX_BUFFER = Number(process.env.XBK_UNIT_MAX_BUFFER) || 8 * 1024 * 1024
 
 for (const s of UNIT_SUITES) {
   const file = path.join(__dirname, s.file)
