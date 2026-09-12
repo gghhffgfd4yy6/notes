@@ -11,8 +11,9 @@ const os = require('node:os')
 const path = require('node:path')
 const { SUITES } = require('./test_suites')
 
-const testYml = fs.readFileSync(path.join(__dirname, '.github/workflows/test.yml'), 'utf8')
-const mutationYml = fs.readFileSync(path.join(__dirname, '.github/workflows/mutation.yml'), 'utf8')
+// 仓库内固定路径（__dirname + 常量），非外部输入
+const testYml = fs.readFileSync(path.join(__dirname, '.github/workflows/test.yml'), 'utf8') // nosemgrep: 仓库内固定路径，非用户输入
+const mutationYml = fs.readFileSync(path.join(__dirname, '.github/workflows/mutation.yml'), 'utf8') // nosemgrep: 仓库内固定路径，非用户输入
 const pkg = require('./package.json')
 
 // ── 1. 清单自身必须干净 ─────────────────────────────────────
@@ -71,7 +72,7 @@ try {
   const filtered = runEntry({ SKIP_SUITES: skipAll, GITHUB_STEP_SUMMARY: sumFile })
   assert.strictEqual(filtered.status, 0, filtered.stderr || filtered.stdout)
   assert.match(filtered.stdout, /共 0 个套件/, '跳过全部套件时应报告 0 个')
-  const summary = fs.readFileSync(sumFile, 'utf8')
+  const summary = fs.readFileSync(sumFile, 'utf8') // nosemgrep: tmp 目录由 mkdtempSync 生成，非外部输入
   assert.match(summary, /^## 单元测试结果/m, 'CI 下应写入 job summary')
   assert.match(summary, /共 0 套件/, 'summary 套件数应与实际执行数一致')
 
@@ -79,7 +80,7 @@ try {
   const sumFile2 = path.join(tmp, 'summary-child.md')
   const child = runEntry({ SKIP_SUITES: skipAll, GITHUB_STEP_SUMMARY: sumFile2, XBK_MUTATION_CHILD: '1' })
   assert.strictEqual(child.status, 0, child.stderr || child.stdout)
-  assert.ok(!fs.existsSync(sumFile2), 'XBK_MUTATION_CHILD=1 时不得写 job summary')
+  assert.ok(!fs.existsSync(sumFile2), 'XBK_MUTATION_CHILD=1 时不得写 job summary') // nosemgrep: tmp 目录由 mkdtempSync 生成，非外部输入
 
   // 3e 输出超限（ENOBUFS）必须标注为「输出超限」而不是普通测试失败：
   //    XBK_UNIT_MAX_BUFFER 仅测试注入；留一个必输出内容的套件、把上限压到 1 字节
