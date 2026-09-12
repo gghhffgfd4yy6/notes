@@ -43,6 +43,41 @@ for (const file of productionFiles) {
   }
 }
 
+// 校验 0：matrix include 每项的 src 必须存在且与其 mutate 目标同文件。
+// 背景：src 只被 actions/cache 的 hashFiles 指纹使用（mutation.yml），写错或整行删掉都不会让 CI 报错，
+// 只会让该段的缓存指纹失真（缓存串段 / 永不过期），故在此拦住。
+const matrixEntries = []
+let currentEntry = null
+for (const line of yml.split(/\r?\n/)) {
+  const name = line.match(/^ {10}- name:\s*(\S+)\s*$/)
+  if (name) {
+    currentEntry = { name: name[1], src: null, mutate: null }
+    matrixEntries.push(currentEntry)
+    continue
+  }
+  if (!currentEntry) continue
+  const src = line.match(/^ {12}src:\s*"([^"]+)"/)
+  if (src) { currentEntry.src = src[1]; continue }
+  const target = line.match(/^ {12}mutate:\s*"([^":]+)/)
+  if (target) currentEntry.mutate = target[1]
+}
+if (matrixEntries.length === 0) {
+  console.error('❌ 未在 mutation.yml 的 matrix include 中解析到任何条目（缩进应为 10/12 空格）')
+  failed = true
+}
+for (const entry of matrixEntries) {
+  if (!entry.mutate) {
+    console.error(`❌ matrix「${entry.name}」缺 mutate 字段`)
+    failed = true
+  } else if (!entry.src) {
+    console.error(`❌ matrix「${entry.name}」缺 src 字段（缓存指纹会退化为空 → 缓存串段）`)
+    failed = true
+  } else if (entry.src !== entry.mutate) {
+    console.error(`❌ matrix「${entry.name}」src(${entry.src}) 与 mutate 目标(${entry.mutate}) 不一致`)
+    failed = true
+  }
+}
+
 for (const [file, ranges] of fileRanges) {
   let fileFailed = false
   // 路径加固：解析后必须仍在仓库根目录内，拒绝 yml 里的越界路径

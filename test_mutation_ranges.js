@@ -26,5 +26,15 @@ const invalidRange = runChecker(yml.replace('xbk_function_v3.js:1-426', 'xbk_fun
 assert.notStrictEqual(invalidRange.status, 0, '超过文件长度的行段必须失败')
 assert.match(invalidRange.stderr, /超过文件实际行数 426/, '错误应说明实际文件行数')
 
+// matrix 的 src 字段（actions/cache 指纹用）必须与 mutate 目标同文件：写错或缺行都不会让 CI 报错，
+// 只会悄悄让该段的缓存指纹失真
+const badSrc = runChecker(yml.replace('src: "xbk_utils.js"', 'src: "xbk_util.js"'))
+assert.notStrictEqual(badSrc.status, 0, 'src 与 mutate 目标不一致必须失败')
+assert.match(badSrc.stderr, /src\(xbk_util\.js\)/, '错误应点名不一致的 src')
+
+const missingSrc = runChecker(yml.replace(/\r?\n\s*src: "xbk_utils\.js"/, ''))
+assert.notStrictEqual(missingSrc.status, 0, 'matrix 缺 src 字段必须失败')
+assert.match(missingSrc.stderr, /缺 src 字段/, '错误应说明缺 src')
+
 console.log('✅ 遗漏生产模块或行段越界会使 mutation 范围校验失败')
 console.log('✅ 当前 mutation 矩阵覆盖全部生产模块')
