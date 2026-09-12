@@ -18,7 +18,7 @@ function runChecker (workflowText) {
 const current = runChecker(yml)
 assert.strictEqual(current.status, 0, current.stderr || current.stdout)
 
-const missingTarget = runChecker(yml.replace(/\r?\n\s*- name: utils\r?\n\s*mutate: "xbk_utils\.js"/, ''))
+const missingTarget = runChecker(yml.replace(/\r?\n\s*- name: utils\r?\n(?:\s*src: "[^"]+"\r?\n)?\s*mutate: "xbk_utils\.js"/, ''))
 assert.notStrictEqual(missingTarget.status, 0, '遗漏生产模块的矩阵必须失败')
 assert.match(missingTarget.stderr, /xbk_utils\.js/, '错误应点名遗漏模块')
 
