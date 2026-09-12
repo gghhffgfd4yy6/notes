@@ -105,7 +105,7 @@ function waitKillCount (expected, timeoutMs = 1500) {
       // 测试会无限挂到 CI 作业超时而不是断言失败。加测试侧 watchdog（10s）：兜底故障时显式
       // 断言失败并给出明确错误；正常路径 watchdog 不触发（unref + clearTimeout，预算仍 ~5s）。
       let watchdogTimer
-      const watchdog = new Promise((_, reject) => {
+      const watchdog = new Promise((resolve, reject) => {
         watchdogTimer = setTimeout(
           () => reject(new Error('生产兜底未在预期时间内 resolve（2000ms 兜底被移除/变长/未调度？）')),
           10000)
