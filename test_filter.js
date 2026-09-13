@@ -8061,8 +8061,11 @@ console.log('========================================\n');
   })
 
   // [PERF-C1] identOf 不变量锁定：单批内身份缓存必须与 messages 同步。
-  // 这两条是同批内「写位置 → 再按新身份匹配」的唯一可咬场景——跨批场景每次 saveBatch 都会
-  // 按 messages 重建 identOf，因此旧用例（如上方「更新后索引维护」）即使身份缓存漏刷新也照样通过。
+  // 本组是同批内「写位置 → 再按新身份匹配」的唯一确定性最小复现场景；既有随机对比用例
+  // （「saveBatch 索引判重 vs 逐条 upsert」单批 60 条、「30 轮随机」多批每批 ≤11 条）批内同样会发生
+  // 「写位置 → 再匹配」，但只能概率性咬住同一 identOf 漂移（随机数据恰好命中才失败），不是确定性覆盖。
+  // 纯跨批用例咬不住（如上方「更新后索引维护」）：每次 saveBatch 都按 messages 重建 identOf，
+  // 漂移不跨批传播，故身份缓存漏刷新时它照样通过。
   await test('一致性: 同批内「先更新位置后匹配」身份缓存同步（identOf 漂移必失败）', () => {
     const file = 'test_112_identof_update.json'
     const fp = getFilePath(file)
@@ -8098,6 +8101,33 @@ console.log('========================================\n');
       const r = readMessages(fp)
       assertEqual(r.length, 1, `同批内新增后应仍为 1 条（identOf 未同步会误追加），实际 ${r.length} 条`)
       assertEqual(r[0].title, 'B', '位置 0 应被 url-only 消息就地更新')
+    } finally {
+      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('一致性: 同批内 urlOnlyMap 候选（c2 分支）身份缓存同步（identOf 漂移必失败）', () => {
+    const file = 'test_112_identof_c2.json'
+    const fp = getFilePath(file)
+    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    try {
+      // c2 分支（xbk_message_store.js 的 firstIndex(urlOnlyMap, identity.url, …)）只在
+      // 「缓存位置上挂着纯 url 身份」时才有候选。构造：脏缓存位置 0 是 id 身份（id c1 + url /c2.html），
+      // 同批两步——① 无 id 消息（url /c2.html）经 urlMap 命中位置 0，就地把该位置改成纯 url 身份；
+      // ② 带 id 的 c2 消息（id c2 ≠ c1 + url /c2.html）在 idMap 中无候选（c1 为 undefined），
+      // 只能经 c2 的 urlOnlyMap 命中位置 0。c2 的候选回调读的是 identOf[0]：
+      // 若 ① 未刷新 identOf[0]（仍是 kind:'id'），回调的 ci.kind === 'url' 为假 → c2 无候选 →
+      // 位置 1 被误追加，本用例在条数断言上失败。
+      require('fs').writeFileSync(fp, JSON.stringify([{ id: 'c1', url: '/c2.html', title: 'dirty' }]))
+      saveBatch([
+        { url: '/c2.html', title: 'urlonly' },
+        { id: 'c2', url: '/c2.html', title: 'idagain' }
+      ], file)
+      const r = readMessages(fp)
+      assertEqual(r.length, 1, `c2 命中应就地更新而非误追加（应为 1 条），实际 ${r.length} 条`)
+      assertEqual(String(r[0].id), 'c2', '位置 0 应就地更新为带 id 的 c2 消息（id 形态）')
+      assertEqual(r[0].title, 'idagain', '位置 0 标题应为末条消息（就地更新）')
+      assertEqual(r[0].url, '/c2.html', '位置 0 url 应保持 /c2.html')
     } finally {
       try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
     }

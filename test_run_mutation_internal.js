@@ -161,7 +161,18 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
   console.log('\n--- copyProject / applyMutants ---')
   const projDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-proj-'))
   try {
-    await check('copyProject 复制文件和 node_modules symlink', () => {
+    await check('copyProject 复制文件与 node_modules symlink（缺依赖时按契约抛错）', () => {
+      // node_modules 属必选输入（#136 review F3）：symlinkSync 不校验目标是否存在，缺依赖时会留下
+      // 悬空链接 → 沙箱内套件必然失败 → 每个变异体被判 killed → 分数虚高且 exit 0（不响亮的假绿）。
+      // 故未 npm ci 的环境下必须抛错；有依赖时仍按原断言核对复制结果与 symlink。
+      if (!fs.existsSync(path.resolve(__dirname, 'node_modules'))) {
+        assert.throws(
+          () => copyProject(projDir, ['xbk_utils.js']),
+          /缺少 node_modules/,
+          '无 node_modules 时应抛错，而不是留下悬空 symlink（不响亮的假绿）'
+        )
+        return
+      }
       copyProject(projDir, ['xbk_utils.js'])
       assert.ok(fs.existsSync(path.join(projDir, 'test_filter.js')), 'test_filter.js 应复制')
       assert.ok(fs.existsSync(path.join(projDir, 'package.json')), 'package.json 应复制')
@@ -171,6 +182,14 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       assert.ok(fs.existsSync(path.join(projDir, '.github/workflows/test.yml')), '.github/workflows/test.yml 应复制（test_ci_skip_suites.js 读取它与显式步骤对账）')
       const nmStat = fs.lstatSync(path.join(projDir, 'node_modules'))
       assert.ok(nmStat.isSymbolicLink(), 'node_modules 应为 symlink')
+    })
+    await check('copyProject 缺少调用方必选文件时抛错（固定清单加固回归）', () => {
+      // 原实现遇缺失文件静默 continue，留下临时工程目录 MODULE_NOT_FOUND/ENOENT 的
+      // 不响亮回归（#120/#122 一类根因）；加固后必选文件（extraTop + 调用方 files）缺失须抛错。
+      assert.throws(
+        () => copyProject(path.join(projDir, 'missing'), ['no_such_required_file.js']),
+        /缺少必要文件: no_such_required_file\.js/
+      )
     })
     await check('applyMutants 替换操作符（fixture 固定内容）', () => {
       const fixture = path.join(projDir, 'fixture.js')

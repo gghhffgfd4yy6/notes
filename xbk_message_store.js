@@ -952,12 +952,17 @@ function createMessageStore ({
       }
       // 统一身份索引：每个键保存可能命中的 index 集合；更新时保留历史候选，查询时按当前身份校验，
       // 避免复杂的删除/重建逻辑在同 id/同 URL 脏缓存场景下产生索引分裂。
-      // [PERF-C1] identity 是 message 的确定性纯函数：单批内并行缓存每个位置的身份，
-      // firstIndex 候选匹配直接读缓存，避免对同一存量消息重复走 validUrl 校验链。
+      // [PERF-C1] identity 是 message 的确定性纯函数：单批内按位置顺序逐个登记并缓存身份
+      // （下方 messages.forEach 是顺序写入，不是并行），firstIndex 候选匹配直接读缓存，
+      // 避免对同一存量消息重复走 validUrl 校验链。
       // 不变量：identOf[i] 恒等于 getMessageIdentity(messages[i])。任何改写 messages[i] 的路径
-      // （更新/新增）都必须经 addIdentityIndexes 登记，让缓存与索引集合同步；漏登记会让候选匹配
-      // 读到旧身份（静默误判为「新消息」而重复收录）。该不变量由 test_filter.js
-      // 「同批内身份缓存同步」两条用例锁定（多批场景每次 saveBatch 都会重建 identOf，咬不住）。
+      // （更新/新增）都必须经 setPosition/pushRegistered 写入，让缓存与索引集合同步；漏登记会让候选匹配
+      // 读到旧身份（静默误判为「新消息」而重复收录）。该不变量由 test_filter.js「同批内身份缓存同步」
+      // 三条用例确定性锁定：先更新位置后匹配 / 先新增位置后匹配 / urlOnlyMap 候选（c2 分支），
+      // 用例名均以「（identOf 漂移必失败）」结尾。随机对比用例（「saveBatch 索引判重 vs 逐条 upsert」
+      // 单批 60 条、「30 轮随机」多批每批 ≤11 条）批内同样会发生「写位置 → 再匹配」，只能概率性咬住；
+      // 纯跨批用例（「更新后索引维护（id 变化/url 失效）」）咬不住——每次 saveBatch 都按 messages
+      // 重建 identOf，漂移不跨批传播。
       const identOf = new Array(messages.length)
       const firstIndex = (map, key, match) => {
         const set = map.get(key)
@@ -974,8 +979,8 @@ function createMessageStore ({
       const urlMap = new Map()
       const urlOnlyMap = new Map()
       const identityMap = new Map()
-      // 位置登记唯一入口：identOf 缓存与四类索引在此一并更新（更新/新增/prefill 三条路径共用），
-      // 避免多处各写一遍导致「缓存与 messages 漂移」。
+      // 身份登记唯一入口：identOf 缓存与四类索引在此一并更新（不写 messages），
+      // 避免各处各写一遍导致「缓存与 messages 漂移」。
       const addIdentityIndexes = (message, i) => {
         const identity = Utils.getMessageIdentity(message)
         identOf[i] = identity
@@ -985,8 +990,23 @@ function createMessageStore ({
         if (identity.url) Utils.addIndex(urlMap, identity.url, i)
         if (identity.kind === 'url') Utils.addIndex(urlOnlyMap, identity.url, i)
       }
-      const removeIdentityIndexes = (message, i) => {
-        const identity = Utils.getMessageIdentity(message)
+      // 写入路径的唯一位置入口（更新走这里，新增走下方 pushRegistered）：messages[i] 与其身份
+      // 登记一次写完，让「identOf[i] 恒等于 getMessageIdentity(messages[i])」由构造保证——
+      // 写入路径只要走这里，就不可能「改了 messages 却忘了登记」。
+      const setPosition = (i, message) => {
+        messages[i] = message
+        addIdentityIndexes(message, i)
+      }
+      // 追加写入唯一入口：先 push 再登记末尾位置（push 之后 messages.length - 1 即新位置）。
+      const pushRegistered = (message) => {
+        messages.push(message)
+        addIdentityIndexes(message, messages.length - 1)
+      }
+      // [PERF-C1] 删除索引所需身份直接取调用点已缓存的位置身份：不变量保证 identOf[i] 与
+      // getMessageIdentity(messages[i]) 等价，不再重算（免去对同一条存量消息第二次走最贵的
+      // validUrl 校验链）。缓存对象只被读（valid/key/idKey/url/kind），不被修改。
+      const removeIdentityIndexes = (i) => {
+        const identity = identOf[i]
         if (!identity.valid) return
         const del = (map, key) => {
           const s = map.get(key)
@@ -1000,6 +1020,8 @@ function createMessageStore ({
         if (identity.url) del(urlMap, identity.url)
         if (identity.kind === 'url') del(urlOnlyMap, identity.url)
       }
+      // 存量位置在此一次性登记（只读路径，不写 messages）：更新/新增两条写入路径共用上方
+      // setPosition/pushRegistered，不变量由构造保证。
       messages.forEach((message, i) => addIdentityIndexes(message, i))
       const NOW = () => this._now()
       let changedAny = false
@@ -1042,17 +1064,15 @@ function createMessageStore ({
           if (!changed) continue // 内容完全一致：不更新、不刷新 timestamp、不触发落盘（与 _upsert 口径一致）
           updatedCount++
           changedAny = true
-          removeIdentityIndexes(oldM, idx)
-          messages[idx] = { ...Utils.safeObjectCopy(message), timestamp: NOW() }
-          addIdentityIndexes(messages[idx], idx)
+          removeIdentityIndexes(idx)
+          setPosition(idx, { ...Utils.safeObjectCopy(message), timestamp: NOW() })
         } else {
         // P4（CodeAnt）：身份已在墓碑（曾被裁剪且已推送过）→ 不重复收录，防重放
           if (this._tombstoneHasIdentity(filePath, message)) continue
           changedAny = true
-          messages.push({ ...Utils.safeObjectCopy(message), timestamp: NOW() })
-          const i = messages.length - 1
-          // [PERF-C1] 新位置与更新路径共用同一登记入口，identOf[i] 与索引集合不会各写一遍而漂移。
-          addIdentityIndexes(messages[i], i)
+          // [PERF-C1] 新位置与更新路径共用同一写入入口 setPosition/pushRegistered，
+          // identOf 与索引集合不会各写一遍而漂移。
+          pushRegistered({ ...Utils.safeObjectCopy(message), timestamp: NOW() })
         }
       }
       if (!changedAny) return
