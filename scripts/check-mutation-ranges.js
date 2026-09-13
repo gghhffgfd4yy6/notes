@@ -11,8 +11,10 @@ const fs = require('fs')
 const path = require('path')
 
 const root = path.resolve(__dirname, '..')
-const workflowPath = path.resolve(process.env.MUTATION_WORKFLOW_PATH || path.join(root, '.github/workflows/mutation.yml'))
-const yml = process.env.MUTATION_WORKFLOW_TEXT || fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
+// 环境注入用 ?? 而非 ||（#136 review F7）：夹具显式传空串时，|| 会静默回退去读真实 mutation.yml，
+// 把「空输入」变成假绿（实测旧实现 MUTATION_WORKFLOW_TEXT="" 时 exit 0，且校验的是真实文件）。
+const workflowPath = path.resolve(process.env.MUTATION_WORKFLOW_PATH ?? path.join(root, '.github/workflows/mutation.yml'))
+const yml = process.env.MUTATION_WORKFLOW_TEXT ?? fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
 
 // matrix include 的唯一解析器：`- name:` / `- src:` / `- mutate:` 任一开头都算新条目，
 // 引号（单/双）与缩进放宽，字段值停在空白或 #。
@@ -69,15 +71,22 @@ if (includeIdx !== -1) {
 
 const fileRanges = new Map()
 const mutateTargets = new Set()
+// 格式非法的行段必须响亮失败（#136 review F1）：此前只无条件登记 mutateTargets、行段仅在
+// /^\d+-\d+$/ 命中时才登记，于是把「xbk_function_v3.js:1-426」写成「:1-42x」既不报错、也不进入
+// 逐文件校验循环 —— 该文件的行数/连续性/尾部检查被整段跳过，门禁照旧 exit 0（实测复现）。
+const malformedRanges = []
 for (const entry of matrixEntries) {
   if (!entry.mutate) continue
   const [file, range] = entry.mutate.split(':')
   mutateTargets.add(file)
-  if (range && /^\d+-\d+$/.test(range)) {
-    const [start, end] = range.split('-').map(Number)
-    if (!fileRanges.has(file)) fileRanges.set(file, [])
-    fileRanges.get(file).push({ start, end })
+  if (range === undefined) continue // 完全不带行段 = 合法（按全文件变异处理）
+  if (!/^\d+-\d+$/.test(range)) {
+    malformedRanges.push({ name: entry.name || file, mutate: entry.mutate })
+    continue
   }
+  const [start, end] = range.split('-').map(Number)
+  if (!fileRanges.has(file)) fileRanges.set(file, [])
+  fileRanges.get(file).push({ start, end })
 }
 
 const productionFiles = [
@@ -97,6 +106,13 @@ function exitIfDirectRun (code) {
 }
 
 let failed = false
+
+// 非法行段在此结算（#136 review F1）：置于 fileRanges 空值早退之前，故即使整份 yml 都是非法行段，
+// 也会同时打出「格式非法」与「未解析到任何行段」两条信息，两条路径都非零/抛错。
+for (const bad of malformedRanges) {
+  console.error(`❌ matrix「${bad.name}」的 mutate 行段格式非法：${bad.mutate}（应为 "file.js:start-end"；旧实现会静默忽略该条，使该文件整段跳过行段校验）`)
+  failed = true
+}
 
 if (fileRanges.size === 0) {
   console.error('❌ 未在 mutation.yml 中解析到任何 mutate 行段（格式应为 "file.js:start-end"）')

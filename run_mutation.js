@@ -127,7 +127,11 @@ function copyProject (dir, files) {
     if (!fs.existsSync(srcDir)) throw new Error(`copyProject 缺少必要目录: ${sub}`)
     fs.cpSync(srcDir, path.join(dir, sub), { recursive: true })
   }
-  fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(dir, 'node_modules'), 'dir')
+  // node_modules 同为必选（#136 review F3）：symlinkSync 不校验目标是否存在，缺依赖时会留下悬空
+  // 链接 → 沙箱内套件必然失败 → 每个变异体被判 killed → 分数虚高且 exit 0（不响亮的假绿）。
+  const nodeModules = path.join(ROOT, 'node_modules')
+  if (!fs.existsSync(nodeModules)) throw new Error('copyProject 缺少 node_modules（沙箱内测试必然失败并被误判为「变异体已检出」）：请先 npm ci')
+  fs.symlinkSync(nodeModules, path.join(dir, 'node_modules'), 'dir')
 }
 
 function applyMutants (dir, mutants) {

@@ -161,7 +161,18 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
   console.log('\n--- copyProject / applyMutants ---')
   const projDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-proj-'))
   try {
-    await check('copyProject 复制文件和 node_modules symlink', () => {
+    await check('copyProject 复制文件与 node_modules symlink（缺依赖时按契约抛错）', () => {
+      // node_modules 属必选输入（#136 review F3）：symlinkSync 不校验目标是否存在，缺依赖时会留下
+      // 悬空链接 → 沙箱内套件必然失败 → 每个变异体被判 killed → 分数虚高且 exit 0（不响亮的假绿）。
+      // 故未 npm ci 的环境下必须抛错；有依赖时仍按原断言核对复制结果与 symlink。
+      if (!fs.existsSync(path.resolve(__dirname, 'node_modules'))) {
+        assert.throws(
+          () => copyProject(projDir, ['xbk_utils.js']),
+          /缺少 node_modules/,
+          '无 node_modules 时应抛错，而不是留下悬空 symlink（不响亮的假绿）'
+        )
+        return
+      }
       copyProject(projDir, ['xbk_utils.js'])
       assert.ok(fs.existsSync(path.join(projDir, 'test_filter.js')), 'test_filter.js 应复制')
       assert.ok(fs.existsSync(path.join(projDir, 'package.json')), 'package.json 应复制')

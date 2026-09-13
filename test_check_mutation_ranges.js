@@ -172,5 +172,28 @@ function run (ymlText) {
     console.log('✅ globToRegExp / listRepoJsFiles 断言通过（* ? {a,b} [类] [!取反] ** 与 malformed）')
   }
 
+  // ===== 非法 mutate 行段必须 fail-loud（#136 review F1）：旧实现静默跳过该文件的整段校验 =====
+  const malformed = run(buildYml({ [TEST_FILE]: '1-42x' }))
+  assert.strictEqual(malformed.status, 1, '非法行段应 exit 1（修复前静默 exit 0，该文件的行数/连续性/尾部校验被整段跳过）')
+  assert.ok(malformed.stderr.includes('行段格式非法'), `应报「行段格式非法」，实际 stderr: ${malformed.stderr}`)
+  console.log('✅ 非法行段 fail-loud 断言通过')
+
+  // ===== require 路径的失败必须 throw（#136 review A3）：此前删掉 throw 回到「静默返回」本套件仍全绿 =====
+  // 直跑路径由上面的 run() 子进程覆盖；require 路径此前无任何断言。用 -e 使 require.main 为
+  // undefined（即真实的「被 require」语义），注入空矩阵 yml 后必须抛错而非静默返回。
+  const requireProbe = (ymlText) => spawnSync(process.execPath, ['-e', `try { require(${JSON.stringify(SCRIPT)}); console.log('NO-THROW') } catch (e) { console.log('THROW:' + e.message) }`], {
+    env: { ...process.env, MUTATION_WORKFLOW_TEXT: ymlText },
+    encoding: 'utf8',
+    timeout: 15000
+  })
+  const threw = requireProbe('jobs: {}')
+  assert.ok(!threw.error, `require 探针不应 spawn 失败：${threw.error && threw.error.message}`)
+  assert.ok(threw.stdout.includes('THROW:'),
+    `被 require 且校验失败时应抛错（否则失败被静默吞掉），实际 stdout: ${threw.stdout} stderr: ${threw.stderr}`)
+  const noThrow = requireProbe(buildYml())
+  assert.ok(noThrow.stdout.includes('NO-THROW'),
+    `健康仓库下 require 不应抛错（否则复用该模块的测试会被误杀），实际 stdout: ${noThrow.stdout} stderr: ${noThrow.stderr}`)
+  console.log('✅ require 路径契约断言通过（失败抛错 / 健康不抛）')
+
   console.log('test_check_mutation_ranges OK')
 })().catch((e) => { console.error(e); process.exit(1) })
