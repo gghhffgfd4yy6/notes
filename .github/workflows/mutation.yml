@@ -196,12 +196,8 @@ jobs:
           node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
 
       - name: 变异测试（${{ matrix.name }}）
-        run: npx stryker run --mutate "$MATRIX_MUTATE" --incremental --incrementalFile reports/inc-$MATRIX_NAME.json --concurrency 2
+        run: npx stryker run --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 2
         env:
-          # matrix 值由本工作流自己定义（可信来源），zizmor 未报；但仍经 env 注入而非内联进 run，
-          # 使「任何 run 块都不内联模板」成为可校验的不变量
-          MATRIX_NAME: ${{ matrix.name }}
-          MATRIX_MUTATE: ${{ matrix.mutate }}
           PERF_MS: 3000   # 宽松性能阈值（插桩开销）
           # stryker 的 commandRunner 继承本 step 环境，反复 spawn run_unit_tests.js（初始运行 + 每个变异体），
           # 不设此变量时 run_unit_tests.js 会把整张 26 行套件表反复 append 进本 step 的 job summary
