@@ -103,3 +103,82 @@ for (const tag of invalidTags) {
 }
 
 console.log(`✅ tag 校验通过：${validTags.length} 个合法 / ${invalidTags.length} 个非法（与 release.yml 同源）`)
+
+// ── release.yml 步骤级回归（#136 review）─────────────────────────────────────────
+// 教训：只断言 exit code 会漏掉「内容类」错误 —— notes 步骤曾 exit 0 却只写出标题行（9 字节），
+// CHANGELOG 的要点从不进入 Release 正文。故这里把 release.yml 的 run: 块按 bash 实际执行（与 CI
+// 同路径），并断言产出内容而不只是退出码；闸门则用「package.json × tag」矩阵锁定逐段一致性。
+const os = require('node:os')
+const path = require('node:path')
+const { spawnSync } = require('node:child_process')
+
+// 抽取指定步骤的 run: 块（按 10 空格基准收敛缩进，保留块内相对缩进）
+function extractRunBlock (yml, stepName) {
+  const lines = yml.split('\n')
+  const nameIdx = lines.findIndex(l => l.includes('name: ' + stepName))
+  assert.ok(nameIdx !== -1, 'release.yml 应包含步骤「' + stepName + '」')
+  const runIdx = lines.findIndex((l, i) => i > nameIdx && l.trim().startsWith('run: |'))
+  assert.ok(runIdx !== -1, '步骤「' + stepName + '」应有 run: | 块')
+  const indent = lines[runIdx].length - lines[runIdx].trimStart().length + 2
+  const body = []
+  for (let i = runIdx + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trim() === '') { body.push(''); continue }
+    if (line.length - line.trimStart().length < indent) break
+    body.push(line.slice(indent))
+  }
+  assert.ok(body.length > 0, '步骤「' + stepName + '」的 run: 块不应为空')
+  return body.join('\n')
+}
+
+// 在临时目录里用 bash 执行 run: 块（GITHUB_REF 由调用方给定；夹具文件按需落盘，绝不写仓库）
+function runBlock (block, tag, files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rel136-'))
+  for (const [name, content] of Object.entries(files || {})) {
+    fs.writeFileSync(path.join(dir, name), content)
+  }
+  const res = spawnSync('bash', ['-c', block], {
+    cwd: dir,
+    env: { ...process.env, GITHUB_REF: 'refs/tags/v' + tag },
+    encoding: 'utf8',
+    timeout: 20000
+  })
+  const notesPath = path.join(dir, 'release-notes.md')
+  const notes = fs.existsSync(notesPath) ? fs.readFileSync(notesPath, 'utf8') : null
+  fs.rmSync(dir, { recursive: true, force: true })
+  return { status: res.status, stderr: res.stderr, notes }
+}
+
+const pkgJson = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+const pkgCore = String(pkgJson.version).split('-')[0].split('+')[0]
+const pkgBase = pkgCore.split('.').slice(0, 2).join('.')
+
+// ① notes 必须包含 CHANGELOG 的要点正文，不能只有标题行
+//    （回归点：match 正则带 'm' 时结尾的 $ 在行尾成立 → 惰性匹配止于标题行）
+const notesRun = runBlock(extractRunBlock(releaseYml, '提取 Release Notes'), pkgBase,
+  { 'CHANGELOG.md': fs.readFileSync('CHANGELOG.md', 'utf8') })
+assert.strictEqual(notesRun.status, 0, 'notes 提取应成功（stderr: ' + notesRun.stderr + '）')
+assert.ok(notesRun.notes && notesRun.notes.startsWith('## v' + pkgBase),
+  'Release Notes 应以 ## v' + pkgBase + ' 开头，实际: ' + JSON.stringify(notesRun.notes))
+assert.ok(String(notesRun.notes).split('\n').filter(l => l.startsWith('- ')).length > 0,
+  'Release Notes 必须含 CHANGELOG 要点正文（行首 -），不能只有标题行；实际: ' + JSON.stringify(notesRun.notes))
+
+// ② tag 漂移闸门：逐段一致才放行（覆盖 package.json 补丁段非 0 的两个失效方向）
+const gateBlock = extractRunBlock(releaseYml, '校验 tag 与 package.json 版本一致')
+const gateCases = [
+  { version: pkgCore, tag: pkgBase, expect: 0, why: '两段式 tag = 补丁段为 0 的 package.json（仓库口径）' },
+  { version: pkgCore, tag: pkgCore, expect: 0, why: '完全一致' },
+  { version: pkgCore, tag: pkgBase + '.1', expect: 1, why: '补丁段漂移必须拦下' },
+  { version: pkgBase + '.1', tag: pkgBase + '.1', expect: 0, why: 'package.json 补丁段非 0 时完全一致的 tag 必须放行（早期实现误拦）' },
+  { version: pkgBase + '.1', tag: pkgBase, expect: 1, why: 'package.json 补丁段非 0 时两段式 tag 属漂移（早期实现误放行）' },
+  { version: pkgBase + '.1', tag: pkgBase + '.0', expect: 1, why: '同上，显式补 0 仍是漂移' },
+  { version: pkgCore, tag: pkgBase + '.0.5', expect: 1, why: '四段式 tag 不得因前缀相同而放行' },
+  { version: pkgBase + '.1', tag: pkgBase + '.2', expect: 1, why: '补丁段不同' }
+]
+for (const c of gateCases) {
+  const res = runBlock(gateBlock, c.tag, { 'package.json': JSON.stringify({ ...pkgJson, version: c.version }) })
+  assert.strictEqual(res.status, c.expect,
+    'package.json=' + c.version + ' + tag v' + c.tag + ' 应 exit ' + c.expect + '（' + c.why + '），实际 ' + res.status + '（stderr: ' + res.stderr + '）')
+}
+
+console.log('✅ release.yml 步骤级回归通过：notes 含要点正文；闸门 ' + gateCases.length + ' 组用例全部符合预期')
