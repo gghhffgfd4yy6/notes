@@ -179,6 +179,12 @@ function run (ymlText) {
   assert.ok(malformed.stderr.includes('行段格式非法'), `应报「行段格式非法」，实际 stderr: ${malformed.stderr}`)
   console.log('✅ 非法行段 fail-loud 断言通过')
 
+  // 多余冒号段同样必须拦下（#136 CodeRabbit）：旧实现解构只取前两段，:1-10:extra 会被放行并丢弃尾段
+  const surplus = run(buildYml({ [TEST_FILE]: '1-10:extra' }))
+  assert.strictEqual(surplus.status, 1, '多余冒号段应 exit 1（旧实现静默丢弃尾段后放行）')
+  assert.ok(surplus.stderr.includes('行段格式非法'), `应报「行段格式非法」，实际 stderr: ${surplus.stderr}`)
+  console.log('✅ 多余冒号段 fail-loud 断言通过')
+
   // ===== require 路径的失败必须 throw（#136 review A3）：此前删掉 throw 回到「静默返回」本套件仍全绿 =====
   // 直跑路径由上面的 run() 子进程覆盖；require 路径此前无任何断言。用 -e 使 require.main 为
   // undefined（即真实的「被 require」语义），注入空矩阵 yml 后必须抛错而非静默返回。

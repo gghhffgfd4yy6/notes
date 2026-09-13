@@ -77,8 +77,16 @@ const mutateTargets = new Set()
 const malformedRanges = []
 for (const entry of matrixEntries) {
   if (!entry.mutate) continue
-  const [file, range] = entry.mutate.split(':')
+  const segments = entry.mutate.split(':')
+  const file = segments[0]
   mutateTargets.add(file)
+  // 冒号超过两段必须拦下（#136 CodeRabbit）：旧实现用解构只取前两段，于是「file.js:1-10:extra」
+  // 会被当成合法的 1-10 放行、尾段被静默丢弃（实测旧实现对该夹具 exit 0 并报「1 段全覆盖」）。
+  if (segments.length > 2) {
+    malformedRanges.push({ name: entry.name || file, mutate: entry.mutate })
+    continue
+  }
+  const range = segments[1]
   if (range === undefined) continue // 完全不带行段 = 合法（按全文件变异处理）
   if (!/^\d+-\d+$/.test(range)) {
     malformedRanges.push({ name: entry.name || file, mutate: entry.mutate })
