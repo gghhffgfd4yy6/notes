@@ -514,7 +514,7 @@ function createMessageStore ({
       const maxSize = (() => { const v = Utils.num(Config.cache.maxSize, -1); return Number.isInteger(v) && v > 0 ? v : DEFAULT_MAX_SIZE })()
       // P4（CodeAnt Round2）：被裁剪记录先收集、缓存原子写盘成功后才统一落墓碑——
       // 写盘失败（序列化/单条超限/rename 失败）时记录并未真正从磁盘缓存移除，
-      // 提前落墓碑会把仍在缓存中的记录误判为已判重（消息被永久跳过）。
+      // 提前落墓碑会把仍在缓存中的身份误判为已判重（消息被永久跳过）。
       const droppedAll = []
       if (toSave.length > maxSize) {
         console.warn(`缓存超出上限(${maxSize})，裁剪掉最早 ${toSave.length - maxSize} 条`)
@@ -779,10 +779,10 @@ function createMessageStore ({
     },
 
     /** 写路径绕过 _tombstoneLoaded 缓存：重读磁盘并与本次新增合并后原子写回，
-   *  避免「各自加载快照→后写覆盖先写」丢失其他进程已写入的身份。
+   *  避免「各自加载快照→后写覆盖先写」丢失其他进程已收录的身份。
    *  在临时副本上完成合并/淘汰，仅当 owner 校验通过且 .seen.json 原子写成功后才
    *  提交到内存缓存——锁被抢占或写盘失败时当前内存状态保持与磁盘一致（CodeAnt Round6）。
-   *  过滤未推（_f）记录不记录——它们从未推送，规则变更失效后仍可重新评估/推送。 */
+   *  过滤未推（_f）记录不记录——它们从未推送，规则变更失效后须能重新评估/推送。 */
     _recordTombstoneDrops (filePath, dropped, lockPath, token) {
     // 写盘前（进入读-改-写前）先确认锁仍归当前进程：被抢占/替换后立即放弃，
     // 不重读不合并不修改内存墓碑（CodeAnt Round5 Major：避免覆盖抢占者已写入的身份）
