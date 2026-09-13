@@ -46,6 +46,10 @@
 # copyProject 中 path.join(ROOT, name) 的 name 来自 fs.readdirSync(ROOT) 按固定正则
 # 过滤的 *.js 文件名与硬编码目录名（scripts/qinglong），ROOT 为 __dirname 常量，
 # 无任何用户输入参与路径构造，动态路径注入告警属误报。
+# test_suite_registry.js 是「根目录 test_*.js 必须注册进 test_suites.js」的元门禁（C5）：
+# fs.readdirSync(ROOT) 与 path.join(ROOT, f) 中的 ROOT = path.resolve(__dirname) 常量，
+# f 来自 readdirSync 结果与 test_suites.js 的静态 SUITES 清单，无任何用户输入参与
+# 路径构造，静态路径注入告警属误报。
 exclude_paths:
   - "scripts/check-mutation-ranges.js"
   - "run_mutation.js"
@@ -62,3 +66,4 @@ exclude_paths:
   - "test_rules_extended.js"
   - "test_message_store_utils.js"
   - "test_sendnotify_pure.js"
+  - "test_suite_registry.js"
