@@ -172,6 +172,14 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       const nmStat = fs.lstatSync(path.join(projDir, 'node_modules'))
       assert.ok(nmStat.isSymbolicLink(), 'node_modules 应为 symlink')
     })
+    await check('copyProject 缺少调用方必选文件时抛错（固定清单加固回归）', () => {
+      // 原实现遇缺失文件静默 continue，留下临时工程目录 MODULE_NOT_FOUND/ENOENT 的
+      // 不响亮回归（#120/#122 一类根因）；加固后必选文件（extraTop + 调用方 files）缺失须抛错。
+      assert.throws(
+        () => copyProject(path.join(projDir, 'missing'), ['no_such_required_file.js']),
+        /缺少必要文件: no_such_required_file\.js/
+      )
+    })
     await check('applyMutants 替换操作符（fixture 固定内容）', () => {
       const fixture = path.join(projDir, 'fixture.js')
       fs.writeFileSync(fixture, 'if (a && b) { c || d }', 'utf8')
