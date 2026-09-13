@@ -954,6 +954,10 @@ function createMessageStore ({
       // 避免复杂的删除/重建逻辑在同 id/同 URL 脏缓存场景下产生索引分裂。
       // [PERF-C1] identity 是 message 的确定性纯函数：单批内并行缓存每个位置的身份，
       // firstIndex 候选匹配直接读缓存，避免对同一存量消息重复走 validUrl 校验链。
+      // 不变量：identOf[i] 恒等于 getMessageIdentity(messages[i])。任何改写 messages[i] 的路径
+      // （更新/新增）都必须经 addIdentityIndexes 登记，让缓存与索引集合同步；漏登记会让候选匹配
+      // 读到旧身份（静默误判为「新消息」而重复收录）。该不变量由 test_filter.js
+      // 「同批内身份缓存同步」两条用例锁定（多批场景每次 saveBatch 都会重建 identOf，咬不住）。
       const identOf = new Array(messages.length)
       const firstIndex = (map, key, match) => {
         const set = map.get(key)
@@ -970,6 +974,8 @@ function createMessageStore ({
       const urlMap = new Map()
       const urlOnlyMap = new Map()
       const identityMap = new Map()
+      // 位置登记唯一入口：identOf 缓存与四类索引在此一并更新（更新/新增/prefill 三条路径共用），
+      // 避免多处各写一遍导致「缓存与 messages 漂移」。
       const addIdentityIndexes = (message, i) => {
         const identity = Utils.getMessageIdentity(message)
         identOf[i] = identity
@@ -1045,14 +1051,8 @@ function createMessageStore ({
           changedAny = true
           messages.push({ ...Utils.safeObjectCopy(message), timestamp: NOW() })
           const i = messages.length - 1
-          const newIdentity = Utils.getMessageIdentity(messages[i])
-          identOf[i] = newIdentity // [PERF-C1] 新位置同步身份缓存，供后续候选匹配读取
-          if (newIdentity.valid) {
-            Utils.addIndex(identityMap, newIdentity.key, i)
-            if (newIdentity.kind === 'id') Utils.addIndex(idMap, newIdentity.idKey, i)
-            if (newIdentity.url) Utils.addIndex(urlMap, newIdentity.url, i)
-            if (newIdentity.kind === 'url') Utils.addIndex(urlOnlyMap, newIdentity.url, i)
-          }
+          // [PERF-C1] 新位置与更新路径共用同一登记入口，identOf[i] 与索引集合不会各写一遍而漂移。
+          addIdentityIndexes(messages[i], i)
         }
       }
       if (!changedAny) return

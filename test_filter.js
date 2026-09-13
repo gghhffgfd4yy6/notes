@@ -8060,6 +8060,49 @@ console.log('========================================\n');
     }
   })
 
+  // [PERF-C1] identOf 不变量锁定：单批内身份缓存必须与 messages 同步。
+  // 这两条是同批内「写位置 → 再按新身份匹配」的唯一可咬场景——跨批场景每次 saveBatch 都会
+  // 按 messages 重建 identOf，因此旧用例（如上方「更新后索引维护」）即使身份缓存漏刷新也照样通过。
+  await test('一致性: 同批内「先更新位置后匹配」身份缓存同步（identOf 漂移必失败）', () => {
+    const file = 'test_112_identof_update.json'
+    const fp = getFilePath(file)
+    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    try {
+      // msg2 就地把位置 0 的 url 由 /x.html 换成 /y.html；msg3 再按「更新后的 url」做 url-only 匹配，
+      // 必须命中位置 0。若更新路径未同步 identOf[0]，msg3 会读到旧身份（/x.html）→ 匹配失败 → 误追加。
+      saveBatch([
+        { id: 'c1', url: '/x.html', title: 'old' },
+        { id: 'c1', url: '/y.html', title: 'new' },
+        { url: '/y.html', title: 'urlonly' }
+      ], file)
+      const r = readMessages(fp)
+      assertEqual(r.length, 1, `同批内更新后应仍为 1 条（identOf 未刷新会误追加），实际 ${r.length} 条`)
+      assertEqual(r[0].title, 'urlonly', '位置 0 应被 url-only 消息就地更新')
+      assertEqual(r[0].id === undefined, true, '位置 0 更新后应为无 id 的 url 身份')
+    } finally {
+      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('一致性: 同批内「先新增位置后匹配」身份缓存同步（identOf 漂移必失败）', () => {
+    const file = 'test_112_identof_push.json'
+    const fp = getFilePath(file)
+    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    try {
+      // msg1 新增位置 0（id 身份、带 url /z.html）；msg2 按该 url 做 url-only 匹配必须命中位置 0。
+      // 若新增路径未登记 identOf[0]，候选回调会读到 undefined 身份而抛错（或漏匹配成 2 条）。
+      saveBatch([
+        { id: 'c9', url: '/z.html', title: 'A' },
+        { url: '/z.html', title: 'B' }
+      ], file)
+      const r = readMessages(fp)
+      assertEqual(r.length, 1, `同批内新增后应仍为 1 条（identOf 未同步会误追加），实际 ${r.length} 条`)
+      assertEqual(r[0].title, 'B', '位置 0 应被 url-only 消息就地更新')
+    } finally {
+      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   console.log('\n📂 113. saveBatch 索引化强化验证（脏缓存/多批/同键多条 vs 旧逻辑）')
 
   await test('一致性-强化: 30 轮随机（脏缓存+多批+同键多条）索引版 vs 旧 findIndex 逻辑', () => {
