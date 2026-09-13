@@ -952,13 +952,16 @@ function createMessageStore ({
       }
       // 统一身份索引：每个键保存可能命中的 index 集合；更新时保留历史候选，查询时按当前身份校验，
       // 避免复杂的删除/重建逻辑在同 id/同 URL 脏缓存场景下产生索引分裂。
+      // [PERF-C1] identity 是 message 的确定性纯函数：单批内并行缓存每个位置的身份，
+      // firstIndex 候选匹配直接读缓存，避免对同一存量消息重复走 validUrl 校验链。
+      const identOf = new Array(messages.length)
       const firstIndex = (map, key, match) => {
         const set = map.get(key)
         if (!set) return undefined
         let first
         for (const i of set) {
           if (i < 0 || i >= messages.length) continue
-          if (!match(messages[i])) continue
+          if (!match(messages[i], i)) continue
           if (first === undefined || i < first) first = i
         }
         return first
@@ -969,6 +972,7 @@ function createMessageStore ({
       const identityMap = new Map()
       const addIdentityIndexes = (message, i) => {
         const identity = Utils.getMessageIdentity(message)
+        identOf[i] = identity
         if (!identity.valid) return
         Utils.addIndex(identityMap, identity.key, i)
         if (identity.kind === 'id') Utils.addIndex(idMap, identity.idKey, i)
@@ -1001,26 +1005,26 @@ function createMessageStore ({
         if (!identity.valid) continue
         let idx = -1
         if (identity.kind === 'id') {
-          const c1 = firstIndex(idMap, identity.idKey, mm => {
-            const i = Utils.getMessageIdentity(mm)
-            return i.kind === 'id' && i.idKey === identity.idKey
+          const c1 = firstIndex(idMap, identity.idKey, (mm, ii) => {
+            const ci = identOf[ii]
+            return ci.kind === 'id' && ci.idKey === identity.idKey
           })
           const c2 = identity.url
-            ? firstIndex(urlOnlyMap, identity.url, mm => {
-              const i = Utils.getMessageIdentity(mm)
-              return i.kind === 'url' && i.url === identity.url
+            ? firstIndex(urlOnlyMap, identity.url, (mm, ii) => {
+              const ci = identOf[ii]
+              return ci.kind === 'url' && ci.url === identity.url
             })
             : undefined
           const cands = [c1, c2].filter(x => x !== undefined)
           if (cands.length) idx = Math.min(...cands)
         } else if (identity.kind === 'url') {
-          const u = firstIndex(urlMap, identity.url, mm => {
-            const i = Utils.getMessageIdentity(mm)
-            return !!i.url && i.url === identity.url
+          const u = firstIndex(urlMap, identity.url, (mm, ii) => {
+            const ci = identOf[ii]
+            return !!ci.url && ci.url === identity.url
           })
           if (u !== undefined) idx = u
         } else {
-          const a = firstIndex(identityMap, identity.key, mm => Utils.getMessageIdentity(mm).key === identity.key)
+          const a = firstIndex(identityMap, identity.key, (mm, ii) => identOf[ii].key === identity.key)
           if (a !== undefined) idx = a
         }
         if (idx === undefined) idx = -1
@@ -1042,6 +1046,7 @@ function createMessageStore ({
           messages.push({ ...Utils.safeObjectCopy(message), timestamp: NOW() })
           const i = messages.length - 1
           const newIdentity = Utils.getMessageIdentity(messages[i])
+          identOf[i] = newIdentity // [PERF-C1] 新位置同步身份缓存，供后续候选匹配读取
           if (newIdentity.valid) {
             Utils.addIndex(identityMap, newIdentity.key, i)
             if (newIdentity.kind === 'id') Utils.addIndex(idMap, newIdentity.idKey, i)
