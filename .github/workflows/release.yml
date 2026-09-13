@@ -47,11 +47,15 @@ jobs:
           echo "版本号格式校验通过：v${VERSION}"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false   # 不把 GITHUB_TOKEN 写进 .git/config（zizmor artipacked）；建 Release 走 gh CLI + 环境变量
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: 24
-          cache: npm
+          # 不启用 cache: npm —— 本工作流会创建 Release（发布产物），而 npm 缓存可能被其它工作流
+          # 或 PR 写入并复用（zizmor cache-poisoning，high：被污染的缓存会进入发布流程）。
+          # 发布工作流每次冷装依赖，代价可接受。
 
       # D2：上面的「校验 tag 版本号格式」只保证 tag 长得像版本号，不保证它是仓库当前版本——
       # `git tag v3.273 && git push`（而 package.json 是 3.272.0）旧流程能整条走通并建出 Release。
