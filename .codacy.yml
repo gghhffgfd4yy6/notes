@@ -51,6 +51,11 @@
 # ROOT = path.resolve(__dirname) 为常量；path.join(ROOT, f) 的 f 只来自 test_suites.js 的静态
 # SUITES 清单，fs.readdirSync(ROOT) 的结果仅用于与清单对账、不参与路径构造；无任何用户输入，
 # 静态路径注入告警属误报。
+#
+# test_tag_validator.js 的 release.yml 步骤级回归：用 fs.mkdtempSync(os.tmpdir() + 固定前缀)
+# 建临时目录，写入测试硬编码的 package.json / CHANGELOG.md 夹具，执行 run: 块后读取产出的
+# release-notes.md；目录前缀、夹具文件名与内容全部是测试硬编码常量，无任何用户输入参与路径
+# 构造，静态路径注入告警属误报。
 exclude_paths:
   - "scripts/check-mutation-ranges.js"
   - "run_mutation.js"
@@ -68,3 +73,4 @@ exclude_paths:
   - "test_message_store_utils.js"
   - "test_sendnotify_pure.js"
   - "test_suite_registry.js"
+  - "test_tag_validator.js"
