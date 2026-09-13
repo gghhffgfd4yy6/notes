@@ -39,6 +39,8 @@ const unitFiles = SUITES.filter(s => !s.integration && !s.mutationSkip).map(s =>
 // 仅在并行失败时跑），不能算作门禁覆盖——否则把某个套件的步骤挂上 `if: false` 也能骗过对账。
 // 解析器对 YAML 排版变化保持稳健（本文件是门禁意图：红=提醒人工同步，常规排版变化不应误红）：
 //   ① 步骤起点：`- name:` / `- uses:` / `- run:` / `- if:`（YAML 允许省略 name）均视为新 step 块；
+//      `-` 后允许 1 个及以上空格（YAML 合法排版 `-  name:` / `-   run:`）；若只认恰好一个空格，
+//      这类新 step 会被并进上一步，其后更深缩进的 `if:` 还会把「上一步」误标成 conditional → 对账误红；
 //   ② run: 支持多行形式（块指示符 `|` / `>` 及其 chomp/显式缩进变体 `|-` `>-` `|+` `>-2` `|2` `|2-` `>1+` 等，
 //      或 run: 后跟缩进更深的续行），命令文本合并后只提取
 //      `npm run <script>` 命令名——解析不出命令名仍会红（那才是真正的门禁缺口），排版变化不再误红；
@@ -86,14 +88,15 @@ function parseWorkflowSteps (text) {
   let curStep = null
   let runLines = null // 正在累积的 run: 多行块内容（null = 不在块内）
   let runIndent = -1 // 进入块模式时 run: 键的缩进；续行缩进必须更深，回退到 <= runIndent 即块结束
-  // YAML 块标量指示符 = [|>] + 可选 chomp [-+] + 可选显式缩进数字，两种顺序都合法：
+  // YAML 块标量指示符 = [|>] + 可选显式缩进数字(1-9) + 可选 chomp [-+]，两种顺序都合法：
   //   chomp 在前 `|` `>` `|-` `>-` `|+` `>-2` …；数字在前 `|2` `|2-` `>1+` …。
   //   #132 review Q1：旧正则 /^[|>][-+]?\d*$/ 只认 chomp 在前，`|2-` `>1+` 这类数字在前的
-  //   变体被当普通行 → 后续命令行丢失（对账误报）。显式缩进指示符按 YAML 规范仅单数字（1-9），
-  //   数字在前分支用 \d[-+]?（单数字 + 可选 chomp），多数字形态不进块模式。
+  //   变体被当普通行 → 后续命令行丢失（对账误报）。显式缩进指示符按 YAML 规范仅单数字（1-9）：
+  //   两个分支都收窄到 [1-9]（chomp 可选、数字可选，但顺序只有 <chomp><数字> 与 <数字><chomp>），
+  //   多位数与 `0` 一律不进块模式——旧码 `[-+]?\d*` 会 MATCH `|-12` `|+20` `|0`，与上述口径矛盾。
   // 识别不进块模式的形态一律按单行命令文本处理——单行文本提取不出命令名时该步骤不贡献 scripts，
   // 对账保持红（宁红勿绿）：任何未识别变体只会加重门禁，不会静默放行。
-  const blockIndicatorRe = /^[|>](?:[-+]?\d*|\d[-+]?)$/
+  const blockIndicatorRe = /^[|>](?:[-+]?[1-9]?|[1-9][-+]?)$/
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim()
     if (!trimmed) continue
@@ -106,19 +109,22 @@ function parseWorkflowSteps (text) {
       collectNpmScripts(curStep, runLines.join('\n')) // 缩进回退：块结束，结算已收集的命令
       runLines = null
     }
-    if (/^- (?:name|uses|run|if):/.test(trimmed)) {
-      curStep = { indent, conditional: /^- if:/.test(trimmed), scripts: [] }
+    if (/^- +(?:name|uses|run|if):/.test(trimmed)) {
+      curStep = { indent, conditional: /^- +if:/.test(trimmed), scripts: [] }
       steps.push(curStep)
-      const inlineRun = trimmed.match(/^- run: ?(.+)$/)
+      const inlineRun = trimmed.match(/^- +run: ?(.+)$/)
       if (inlineRun) {
-        if (blockIndicatorRe.test(inlineRun[1])) {
+        // 捕获组先 trim 并剔除行内注释：`- run:   |`（run: 后多个空格）旧码不 trim，前导空格使块指示符
+        // 判定失败 → 后续命令行丢失（对账误报）；`- run: | # 注释`（指示符 + 行内注释）同一路径。
+        const inlineRest = stripQuotesAndComment(inlineRun[1]).trim()
+        if (blockIndicatorRe.test(inlineRest)) {
           // 紧凑块写法 `- run: |` / `- run: >` 及其 chomp/显式缩进变体（`|-` `>-` `|+` `>-2` 等）：
           // 块模式此前只认 '|' / '>' 两个字面值，`- run: |-` 之类会把后续命令行当普通行忽略 →
           // 命令丢失（对账误报）。统一用块指示符正则判定；不匹配的 rest 走单行命令文本（宁红勿绿）。
           runLines = []
           runIndent = indent
         } else {
-          collectNpmScripts(curStep, inlineRun[1]) // `- run: npm run X` 单行简写也识别
+          collectNpmScripts(curStep, inlineRest) // `- run: npm run X` 单行简写也识别
         }
       }
       continue
@@ -126,8 +132,12 @@ function parseWorkflowSteps (text) {
     if (!curStep) continue
     if (trimmed.startsWith('if:') && indent > curStep.indent) curStep.conditional = true
     if (trimmed.startsWith('run:')) {
-      const rest = trimmed.slice('run:'.length).trim()
-      if (!rest || blockIndicatorRe.test(rest)) {
+      // rest 先剔除行内注释再 trim：`run: | # 注释` 旧码拿到 `| # 注释` → 判定不是块指示符 →
+      // 后续命令行丢失（对账误报）。空值判定仍用剔除前的 rawRest：`run: # 注释`（无指示符、仅注释）
+      // 不因此从「按单行处理」变成块模式——不扩大放行面（宁红勿绿）。
+      const rawRest = trimmed.slice('run:'.length).trim()
+      const rest = stripQuotesAndComment(rawRest).trim()
+      if (!rawRest || blockIndicatorRe.test(rest)) {
         // 键形式 `run:`：rest 为空（纯块）或为块指示符（含 `|-` `>-` 等变体，而非仅 '|' / '>'）→ 块模式；
         // rest 为具体命令（如 `npm run X`）仍按单行处理；未识别的 rest 形态按单行 → 提取不出命令即保持红
         runLines = [] // 块模式：后续缩进更深的行均为命令文本
@@ -250,6 +260,90 @@ assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explici
   assert.ok(!allScripts.includes('quoted-digitchomp'), '|2- 块内引号中的文本不应进入 scripts')
   assert.ok(!allScripts.includes('ghost3'), '未识别指示符的后继行不得进入 scripts（宁红勿绿）')
   console.log('✅ dummy workflow 解析断言通过（多行块/EOF补结算/注释剔除/if条件/chomp与显式缩进指示符/数字在前变体）')
+}
+
+// S4 追加块：B5/D4 两处修复的定点回归。
+// 上方 dummy 的 10 个 step 在「修复前 / 修复后」判定完全一致（全是 `- ` 单空格、rest 无 `#`、指示符全是
+// chomp 在前的合法单数字形态），因此锁不住本次改动——把 `- +` 改回 `- `、把 `[1-9]` 改回 `\d*`，上面所有
+// 断言依旧全绿。本块另起一份独立 mini 文本（不改动上方 dummy 的文本、步骤数、索引与末尾块 EOF 地位）专锁：
+//   ① D4：`-` 后 2/3 空格的步骤起点必须被识别（旧码只认恰好一个空格 → 前 10 个 step 全无归属，
+//      整段只解析出 5 个 step，且这 10 个块里的命令行全部丢失）；
+//   ② B5：`- run:   |`（run: 后 3 空格，内联捕获组需 trim）与 `run: | # 注释`（键形式 + 行内注释）必须进块模式；
+//   ③ B5：`|-12` `|+20` `|0` 必须不进块模式（旧码 MATCH → 会把其后的命令行收进来 = 静默放行方向）；
+//   ④ 正向锁定 10 种仍须 MATCH 的指示符：| > |- >- |+ >+2 >-2 |2 |2- >1+；
+//   ⑤ `run: # 注释`（无指示符、仅注释）必须保持「按单行处理」——锁的是「未来把空值判定从 rawRest 放宽回
+//      rest」这类放宽型回归（放宽后该 step 会进块模式并收走下方命令）。
+{
+  const mini = [
+    'jobs:',
+    '  t:',
+    '    steps:',
+    '      -  run:   |',
+    '          npm run mini:block-pipe',
+    '      -   run: >',
+    '          npm run mini:block-fold',
+    '      -  run: |-',
+    '          npm run mini:block-pipe-strip',
+    '      -   run: >-',
+    '          npm run mini:block-fold-strip',
+    '      -  run: |+',
+    '          npm run mini:block-pipe-keep',
+    '      -   run: >+2',
+    '          npm run mini:block-fold-keep2',
+    '      -  run: >-2',
+    '          npm run mini:block-fold-strip2',
+    '      -   run: |2',
+    '          npm run mini:block-pipe2',
+    '      -  run: |2-',
+    '          npm run mini:block-pipe2-strip',
+    '      -   run: >1+',
+    '          npm run mini:block-fold1-keep',
+    '      - name: 键形式指示符带行内注释',
+    '        run: | # 指示符后的行内注释',
+    '          npm run mini:block-key-comment',
+    '      - name: 仅注释无指示符（不得进块模式）',
+    '        run: # 行内注释',
+    '          npm run mini:must-not-collect',
+    '      - run: |-12',
+    '          npm run mini:ghost-12',
+    '      - run: |+20',
+    '          npm run mini:ghost-20',
+    '      - run: |0',
+    '          npm run mini:ghost-0'
+  ].join('\n')
+  const miniSteps = parseWorkflowSteps(mini)
+  // 逐 step 期望值：前 10 个是 10 种指示符变体（各自进块并收集 1 条命令），第 11 个是键形式 + 行内注释
+  // （进块），第 12 个「仅注释」与第 13-15 个多位数/0 都不进块 → scripts 为空，其后命令行不得被收集。
+  const miniCases = [
+    { form: '-  run:   |', scripts: ['mini:block-pipe'] },
+    { form: '-   run: >', scripts: ['mini:block-fold'] },
+    { form: '-  run: |-', scripts: ['mini:block-pipe-strip'] },
+    { form: '-   run: >-', scripts: ['mini:block-fold-strip'] },
+    { form: '-  run: |+', scripts: ['mini:block-pipe-keep'] },
+    { form: '-   run: >+2', scripts: ['mini:block-fold-keep2'] },
+    { form: '-  run: >-2', scripts: ['mini:block-fold-strip2'] },
+    { form: '-   run: |2', scripts: ['mini:block-pipe2'] },
+    { form: '-  run: |2-', scripts: ['mini:block-pipe2-strip'] },
+    { form: '-   run: >1+', scripts: ['mini:block-fold1-keep'] },
+    { form: 'run: | # 行内注释（键形式）', scripts: ['mini:block-key-comment'] },
+    { form: 'run: # 行内注释（无指示符）', scripts: [] },
+    { form: '- run: |-12', scripts: [] },
+    { form: '- run: |+20', scripts: [] },
+    { form: '- run: |0', scripts: [] }
+  ]
+  assert.strictEqual(miniSteps.length, 15,
+    'mini dummy 应解析出 15 个步骤（10 种指示符变体 + 键形式带注释 + 仅注释 + 3 个应拒绝的非法指示符）')
+  miniCases.forEach((c, i) => {
+    assert.deepStrictEqual(miniSteps[i].scripts, c.scripts,
+      `mini step ${i}（${c.form}）的 scripts 应为 ${JSON.stringify(c.scripts)}；不进块模式时其后命令行不得被收集（宁红勿绿）`)
+  })
+  const miniAll = miniSteps.flatMap(s => s.scripts)
+  assert.ok(!miniAll.includes('mini:must-not-collect'),
+    '`run: # 注释`（无指示符、仅注释）必须按单行处理，不得进块模式收走后续命令')
+  assert.ok(!miniAll.includes('mini:ghost-12'), '多位数指示符 |-12 不得进块模式（旧码会误收其后命令 → 已收紧）')
+  assert.ok(!miniAll.includes('mini:ghost-20'), '多位数指示符 |+20 不得进块模式（旧码会误收其后命令 → 已收紧）')
+  assert.ok(!miniAll.includes('mini:ghost-0'), '缩进指示符 |0 非法（仅 1-9），不得进块模式（旧码会误收其后命令 → 已收紧）')
+  console.log('✅ mini 定点回归通过（D4 多空格起点 / B5 指示符 rest trim+剔注释 / 多位数与 0 拒绝 / 10 种指示符正向锁定）')
 }
 
 // 2b. integration/mutationSkip 套件被 run_unit_tests.js 排除，只能靠显式步骤进门禁 ——
