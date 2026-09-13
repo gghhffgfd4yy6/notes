@@ -14,7 +14,7 @@ const DEFAULT_FILES = [
   'xbk_failure_policy.js',
   'qinglong/xbk_push.js'
 ]
-// 变异测试使用全量单元测试入口（26 个单元套件），而非仅 test_filter.js——
+// 变异测试使用全量单元测试入口（覆盖全部未标记 integration/mutationSkip 的单元测试套件），而非仅 test_filter.js——
 // 此前只跑 test_filter.js 导致 #100/#101 新增的 1400+ 行测试对变异分数完全无效。
 const DEFAULT_TEST = ['node', 'run_unit_tests.js']
 const OPS = new Map([
@@ -101,10 +101,11 @@ function copyProject (dir, files) {
   const testFiles = entries.filter(f => /^test_.*\.js$/.test(f))
   const srcFiles = entries.filter(f => /^xbk_.*\.js$/.test(f))
   const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md']
-  // 固定清单（extraTop + 调用方传入的 files，如 DEFAULT_FILES）属必选：缺失须响亮报错，不能静默 continue——
+  // 固定清单（extraTop + 调用方传入的 files + DEFAULT_FILES）属必选：缺失须响亮报错，不能静默 continue——
   // 漏拷文件会留下沙箱 MODULE_NOT_FOUND/ENOENT → evaluate 恒 fail 的不响亮回归（#120/#122 一类根因）。
-  // 动态清单（testFiles/srcFiles 来自 readdirSync，必已存在）保持 continue 兜底；目录整体复制（scripts/qinglong/.github）是可选复制，语义不变。
-  const required = new Set([...extraTop, ...files])
+  // DEFAULT_FILES 在此无条件纳入（D3）：main() 已不再 existsSync 预过滤，缺任一变异目标源文件时由本处响亮报错。
+  // 动态清单（testFiles/srcFiles 来自 readdirSync，必已存在）保持 continue 兜底。
+  const required = new Set([...extraTop, ...files, ...DEFAULT_FILES])
   for (const name of [...required, ...testFiles, ...srcFiles]) {
     // 信任边界防护：拒绝目录穿越/绝对路径，确保只复制 ROOT 内文件
     if (name.includes('..') || path.isAbsolute(name)) throw new Error(`copyProject 拒绝越界路径: ${name}`)
@@ -119,11 +120,12 @@ function copyProject (dir, files) {
   }
   // 目录整体复制：scripts/ 与 qinglong/ 是部分测试的依赖；.github/ 是 CI 清单
   // （test_ci_skip_suites.js 要读 test.yml 与 mutation.yml 对账，缺一个就 ENOENT 误判失败，同 #120/#122 口径）
+  // 三者同为必选（D3）：此前的 if (fs.existsSync) 是静默可选，目录一旦丢失同样留下 evaluate 恒 fail 的
+  // 不响亮回归，与文件清单的必选口径不一致——现改为缺失即 throw。
   for (const sub of ['scripts', 'qinglong', '.github']) {
     const srcDir = path.join(ROOT, sub)
-    if (fs.existsSync(srcDir)) {
-      fs.cpSync(srcDir, path.join(dir, sub), { recursive: true })
-    }
+    if (!fs.existsSync(srcDir)) throw new Error(`copyProject 缺少必要目录: ${sub}`)
+    fs.cpSync(srcDir, path.join(dir, sub), { recursive: true })
   }
   fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(dir, 'node_modules'), 'dir')
 }
@@ -154,6 +156,8 @@ function runTests (dir, timeoutMs) {
     // 后续 close 回调的 resolve 因 Promise 已 resolve 被忽略（#131 qodo #3）。现改为：超时分支只标记 timedOut
     // 并 kill，真正的 resolve 一律收敛到 close 回调（close 时信号/输出已定稿），再叠加一个兜底保险定时器
     // 防止 kill 后 close 永不触发（异常文件描述符/僵尸进程）导致 Promise 悬空。
+    // 契约要点（D1）：timedOut 只是「已过超时线」的标记，不是最终结论——结论一律由 close 携带的
+    // 真实 code 决定；只有 close 悬空（兜底定时器结算）或 close 无 code（被信号杀死）才是 timeout 形态。
     let timedOut = false
     let falloutTimer = null
     child.stdout.on('data', d => { output += d })
@@ -163,8 +167,8 @@ function runTests (dir, timeoutMs) {
       child.kill('SIGKILL')
       // 兜底保险：kill 后若 close 迟迟不触发（极端情况），仍要 resolve 不让 Promise 悬空——
       // 用当前已 collect 的输出，signal 回退 'SIGKILL'（真实 close signal 已无从得知）。
-      // 正常 kill 会在毫秒级触发 close，此保险不会与 close 的 resolve 竞争（timedOut 已置位，
-      // 谁先 resolve 都会走 timeout 形态且结果一致）。
+      // 正常 kill 会在毫秒级触发 close，此保险不会与 close 的 resolve 竞争（close 到达即
+      // clearTimeout(falloutTimer)，无论是否已置 timedOut，一律以 close 的真实结论为准）。
       falloutTimer = setTimeout(() => {
         resolve({ status: 'timeout', code: null, signal: 'SIGKILL', output, summary: extractTestSummary(output) })
       }, 2000)
@@ -172,13 +176,16 @@ function runTests (dir, timeoutMs) {
     child.on('close', (code, signal) => {
       clearTimeout(timer)
       if (falloutTimer) clearTimeout(falloutTimer)
-      if (timedOut) {
-        // 已标记超时：契约固定返回 timeout 形态（code: null），signal 用 close 收到的真实值——
-        // 子进程被 SIGKILL 杀死时此地拿到 'SIGKILL'；若 kill 前已自然退出则拿到 null（带真实 code），
-        // 但既然标记了 timedOut，约定仍返回 timeout 形态，signal 用 signal || 'SIGKILL' 兜底。
+      if (timedOut && (code === null || code === undefined)) {
+        // 已过超时线且 close 没给真实退出码（被信号杀死，如我们的 SIGKILL）：退出码不可知、
+        // 输出不完整 → 维持 timeout 形态，signal 用 close 收到的真实值（拿不到才回退 'SIGKILL'）。
         resolve({ status: 'timeout', code: null, signal: signal || 'SIGKILL', output, summary: extractTestSummary(output) })
       } else {
-        // 正常路径：按退出码判定 pass/fail（与修复前一致）
+        // 正常路径，以及「超时线已过但进程在 kill 生效前已自然退出」（close 携带真实 code）：
+        // 一律按真实退出码判定 pass/fail，signal 透传（自然退出为 null）。此前该分支被并进 timeout
+        // 形态，谎报 code: null + signal: 'SIGKILL'（D1）：把「刚好赶上超时窗口的正常完成」记为
+        // timeout → main() 的 report.timeout 使本地运行误红，且与 scripts/mutation-report.js:103
+        // 的 (killed + timeout) / total 同口径地把超时计入已检出，虚增分数、掩盖真实存活。
         resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: extractTestSummary(output) })
       }
     })
@@ -293,7 +300,16 @@ async function main () {
   const concurrency = Number(process.env.MUTATION_CONCURRENCY || Math.max(1, Math.min(os.cpus().length, 8)))
   const timeoutMs = Number(process.env.MUTATION_TIMEOUT || 90000)
   const checkpointFile = process.env.MUTATION_CHECKPOINT || path.join(ROOT, 'mutation-progress.json')
-  const files = DEFAULT_FILES.filter(f => fs.existsSync(path.join(ROOT, f)))
+  // D3：不再 existsSync 预过滤（会把缺失的 DEFAULT_FILES 静默剔除，使 copyProject 的必选校验不可达，
+  // 且 collectMutants 会先抛出裸 ENOENT）。缺文件属工作区损坏，按 main() 既有风格响亮报错 + 退出码 1，
+  // 而不是「少变异一个文件后仍报成功」。
+  const missingSources = DEFAULT_FILES.filter(f => !fs.existsSync(path.join(ROOT, f)))
+  if (missingSources.length) {
+    console.error(`❌ 缺少变异目标源文件：${missingSources.join('、')}（请检查工作区完整性后重试）`)
+    process.exitCode = 1
+    return
+  }
+  const files = DEFAULT_FILES
   const mutants = collectMutants(files)
   const byId = new Map(mutants.map(m => [m.id, m]))
   const old = loadCheckpoint(checkpointFile)
