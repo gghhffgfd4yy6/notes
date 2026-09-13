@@ -76,19 +76,19 @@ assert.deepStrictEqual(staleExemptions, [],
 //    「无文件」，结果所有已注册文件都被判成幽灵——本块桩全部显式命名语义，判断式桩只用于制造幽灵的用例）。
 {
   const allExists = () => true // 桩：注册文件都在磁盘上（用于「不报幽灵」的语境）
-  // 情形②：假设新增 test_foo.js 未注册 → 必须报漏注册；文件都存在时不得误报幽灵
+  // 情形①：假设新增 test_foo.js 未注册 → 必须报漏注册；文件都存在时不得误报幽灵
   const missing = reconcile(['test_suites.js', 'test_foo.js'], ['test_suites.js'], ['test_suites.js'], allExists)
   assert.deepStrictEqual(missing.unregistered, ['test_foo.js'], '未注册的新增 test_*.js 必须报漏注册')
   assert.deepStrictEqual(missing.ghosts, [], '文件都存在时不应报幽灵条目')
 
-  // 情形③：假设 SUITES 有一条指向不存在的文件 → 必须报幽灵条目
+  // 情形②：假设 SUITES 有一条指向不存在的文件 → 必须报幽灵条目
   // （判断式桩：只有 test_suites.js 真实存在，test_gone.js 不存在 → 该条目必被判幽灵）
   const ghost = reconcile(['test_suites.js'], ['test_suites.js', 'test_gone.js'], ['test_suites.js'],
     f => f === 'test_suites.js')
   assert.deepStrictEqual(ghost.ghosts, ['test_gone.js'], '指向不存在文件的条目必须报幽灵')
   assert.deepStrictEqual(ghost.unregistered, [], '磁盘文件都已注册时不应报漏注册')
 
-  // 情形①：全部已注册（磁盘上的测试文件都在清单内，其余走显式白名单）→ 三项均空 = 通过
+  // 通过路径：全部已注册（磁盘上的测试文件都在清单内，其余走显式白名单）→ 三项均空 = 通过
   const allOk = reconcile(['test_app.js', 'test_suites.js', 'test_x.js'], ['test_x.js'],
     ['test_app.js', 'test_suites.js'], allExists)
   assert.deepStrictEqual(allOk.unregistered, [], '全部已注册（白名单外的文件都在清单里）时不应报漏注册')
