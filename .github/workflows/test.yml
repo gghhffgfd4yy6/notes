@@ -29,6 +29,8 @@ jobs:
       # 供应链安全：固定完整 commit SHA（可变 tag 可被上游重新指向，静默注入攻击代码）
       # 升级时由 Dependabot/手动替换为新 SHA
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false   # 不把 GITHUB_TOKEN 写进 .git/config（zizmor artipacked）；测试 job 不需要 git 凭据
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
@@ -208,6 +210,8 @@ jobs:
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false   # 不把 GITHUB_TOKEN 写进 .git/config（zizmor artipacked）
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:

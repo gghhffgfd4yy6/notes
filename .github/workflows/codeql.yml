@@ -29,6 +29,8 @@ jobs:
         language: ['javascript']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false   # 不把 GITHUB_TOKEN 写进 .git/config（zizmor artipacked）；本 job 不需要 git 凭据
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4.37.9
