@@ -65,7 +65,7 @@ function createMessageStore ({
       // C022：应急目录同样校验 realpath；被替换成外部符号链接时不能原样返回。
       if (realInsideRoot(emergencyFallback)) return emergencyFallback
       // 校验失败回退到根目录下唯一安全路径（固定新目录名，不跟随外部符号链接）。
-      // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换为
+      // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换成
       // 指向项目外的符号链接，写入会逃出根目录（前两级候选均先过 realInsideRoot，唯独此级曾直接返回）。
       const internalFallback = path.join(root, '.xbk_cache_safe_internal')
       if (realInsideRoot(internalFallback)) return internalFallback
@@ -87,10 +87,10 @@ function createMessageStore ({
     _tombstoneLoaded: new Set(),
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
     _MEMO_MAX: 100,
-    // 磁盘读取失败标记（按缓存文件路径记录）：ioError/unsafe 读取失败时置位，
+    // 磁盘读取失败标记（按缓存文件路径）：ioError/unsafe 读取失败时置位，
     // 供 save 等写入口保守处理——不基于“未读到的空数组”全量覆写磁盘，避免覆盖丢失存量。
     _readFailed: {},
-    // 磁盘已验证标记（按缓存文件路径记录）：内存命中时是否已对该文件做过一次 existsSync+恢复检查。
+    // 磁盘已验证标记（按缓存文件路径）：内存命中时是否已对该文件做过一次 existsSync+恢复检查。
     // 消除热路径上每次内存命中都同步 stat 的磁盘 IO；saveMessages 直写后清除，使下次命中重新检查。
     _verified: new Set(),
 
@@ -514,7 +514,7 @@ function createMessageStore ({
       const maxSize = (() => { const v = Utils.num(Config.cache.maxSize, -1); return Number.isInteger(v) && v > 0 ? v : DEFAULT_MAX_SIZE })()
       // P4（CodeAnt Round2）：被裁剪记录先收集、缓存原子写盘成功后才统一落墓碑——
       // 写盘失败（序列化/单条超限/rename 失败）时记录并未真正从磁盘缓存移除，
-      // 提前落墓碑会把仍在缓存中的身份误判为已判重（消息被永久跳过）。
+      // 提前落墓碑会把仍在缓存中的记录误判为已判重（消息被永久跳过）。
       const droppedAll = []
       if (toSave.length > maxSize) {
         console.warn(`缓存超出上限(${maxSize})，裁剪掉最早 ${toSave.length - maxSize} 条`)
@@ -779,10 +779,10 @@ function createMessageStore ({
     },
 
     /** 写路径绕过 _tombstoneLoaded 缓存：重读磁盘并与本次新增合并后原子写回，
-   *  避免「各自加载快照→后写覆盖先写」丢失其他进程已收录的身份。
+   *  避免「各自加载快照→后写覆盖先写」丢失其他进程已写入的身份。
    *  在临时副本上完成合并/淘汰，仅当 owner 校验通过且 .seen.json 原子写成功后才
    *  提交到内存缓存——锁被抢占或写盘失败时当前内存状态保持与磁盘一致（CodeAnt Round6）。
-   *  过滤未推（_f）记录不记录——它们从未推送，规则变更失效后须能重新评估/推送。 */
+   *  过滤未推（_f）记录不记录——它们从未推送，规则变更失效后仍可重新评估/推送。 */
     _recordTombstoneDrops (filePath, dropped, lockPath, token) {
     // 写盘前（进入读-改-写前）先确认锁仍归当前进程：被抢占/替换后立即放弃，
     // 不重读不合并不修改内存墓碑（CodeAnt Round5 Major：避免覆盖抢占者已写入的身份）
@@ -952,13 +952,16 @@ function createMessageStore ({
       }
       // 统一身份索引：每个键保存可能命中的 index 集合；更新时保留历史候选，查询时按当前身份校验，
       // 避免复杂的删除/重建逻辑在同 id/同 URL 脏缓存场景下产生索引分裂。
+      // [PERF-C1] identity 是 message 的确定性纯函数：单批内并行缓存每个位置的身份，
+      // firstIndex 候选匹配直接读缓存，避免对同一存量消息重复走 validUrl 校验链。
+      const identOf = new Array(messages.length)
       const firstIndex = (map, key, match) => {
         const set = map.get(key)
         if (!set) return undefined
         let first
         for (const i of set) {
           if (i < 0 || i >= messages.length) continue
-          if (!match(messages[i])) continue
+          if (!match(messages[i], i)) continue
           if (first === undefined || i < first) first = i
         }
         return first
@@ -969,6 +972,7 @@ function createMessageStore ({
       const identityMap = new Map()
       const addIdentityIndexes = (message, i) => {
         const identity = Utils.getMessageIdentity(message)
+        identOf[i] = identity
         if (!identity.valid) return
         Utils.addIndex(identityMap, identity.key, i)
         if (identity.kind === 'id') Utils.addIndex(idMap, identity.idKey, i)
@@ -1001,26 +1005,26 @@ function createMessageStore ({
         if (!identity.valid) continue
         let idx = -1
         if (identity.kind === 'id') {
-          const c1 = firstIndex(idMap, identity.idKey, mm => {
-            const i = Utils.getMessageIdentity(mm)
-            return i.kind === 'id' && i.idKey === identity.idKey
+          const c1 = firstIndex(idMap, identity.idKey, (mm, ii) => {
+            const ci = identOf[ii]
+            return ci.kind === 'id' && ci.idKey === identity.idKey
           })
           const c2 = identity.url
-            ? firstIndex(urlOnlyMap, identity.url, mm => {
-              const i = Utils.getMessageIdentity(mm)
-              return i.kind === 'url' && i.url === identity.url
+            ? firstIndex(urlOnlyMap, identity.url, (mm, ii) => {
+              const ci = identOf[ii]
+              return ci.kind === 'url' && ci.url === identity.url
             })
             : undefined
           const cands = [c1, c2].filter(x => x !== undefined)
           if (cands.length) idx = Math.min(...cands)
         } else if (identity.kind === 'url') {
-          const u = firstIndex(urlMap, identity.url, mm => {
-            const i = Utils.getMessageIdentity(mm)
-            return !!i.url && i.url === identity.url
+          const u = firstIndex(urlMap, identity.url, (mm, ii) => {
+            const ci = identOf[ii]
+            return !!ci.url && ci.url === identity.url
           })
           if (u !== undefined) idx = u
         } else {
-          const a = firstIndex(identityMap, identity.key, mm => Utils.getMessageIdentity(mm).key === identity.key)
+          const a = firstIndex(identityMap, identity.key, (mm, ii) => identOf[ii].key === identity.key)
           if (a !== undefined) idx = a
         }
         if (idx === undefined) idx = -1
@@ -1042,6 +1046,7 @@ function createMessageStore ({
           messages.push({ ...Utils.safeObjectCopy(message), timestamp: NOW() })
           const i = messages.length - 1
           const newIdentity = Utils.getMessageIdentity(messages[i])
+          identOf[i] = newIdentity // [PERF-C1] 新位置同步身份缓存，供后续候选匹配读取
           if (newIdentity.valid) {
             Utils.addIndex(identityMap, newIdentity.key, i)
             if (newIdentity.kind === 'id') Utils.addIndex(idMap, newIdentity.idKey, i)
