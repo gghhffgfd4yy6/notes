@@ -65,7 +65,7 @@ function createMessageStore ({
       // C022：应急目录同样校验 realpath；被替换成外部符号链接时不能原样返回。
       if (realInsideRoot(emergencyFallback)) return emergencyFallback
       // 校验失败回退到根目录下唯一安全路径（固定新目录名，不跟随外部符号链接）。
-      // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换成
+      // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换为
       // 指向项目外的符号链接，写入会逃出根目录（前两级候选均先过 realInsideRoot，唯独此级曾直接返回）。
       const internalFallback = path.join(root, '.xbk_cache_safe_internal')
       if (realInsideRoot(internalFallback)) return internalFallback
@@ -87,10 +87,10 @@ function createMessageStore ({
     _tombstoneLoaded: new Set(),
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
     _MEMO_MAX: 100,
-    // 磁盘读取失败标记（按缓存文件路径）：ioError/unsafe 读取失败时置位，
+    // 磁盘读取失败标记（按缓存文件路径记录）：ioError/unsafe 读取失败时置位，
     // 供 save 等写入口保守处理——不基于“未读到的空数组”全量覆写磁盘，避免覆盖丢失存量。
     _readFailed: {},
-    // 磁盘已验证标记（按缓存文件路径）：内存命中时是否已对该文件做过一次 existsSync+恢复检查。
+    // 磁盘已验证标记（按缓存文件路径记录）：内存命中时是否已对该文件做过一次 existsSync+恢复检查。
     // 消除热路径上每次内存命中都同步 stat 的磁盘 IO；saveMessages 直写后清除，使下次命中重新检查。
     _verified: new Set(),
 
