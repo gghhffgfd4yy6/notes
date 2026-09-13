@@ -164,9 +164,12 @@ jobs:
         # 仅在集成测试真正执行过（未被跳过）且 job 未被取消时才判定；
         # 避免前面步骤失败或 job 被取消时输出误导性的"集成测试失败"。
         if: ${{ !cancelled() && steps.integration-parallel.outcome != 'skipped' && steps.integration-parallel.outcome != '' }}
+        # 步骤结果经 env 注入，不直接内联进 run 脚本（zizmor template-injection：脚本里出现模板
+        # 展开时，表达式的值会被 shell 当代码解析，注入面随上游内容放大）
+        env:
+          PARALLEL: ${{ steps.integration-parallel.outcome }}
+          SERIAL: ${{ steps.integration-serial.outcome }}
         run: |
-          PARALLEL="${{ steps.integration-parallel.outcome }}"
-          SERIAL="${{ steps.integration-serial.outcome }}"
           echo "并行调度结果: $PARALLEL"
           echo "串行完整结果: $SERIAL"
           if [ "$PARALLEL" = "success" ]; then
@@ -193,8 +196,10 @@ jobs:
     if: always()   # quality 失败也要执行，以产出正确的失败结论
     steps:
       - name: 汇总 quality matrix 结果
+        # 经 env 注入而非内联进 run（zizmor template-injection）
+        env:
+          RESULT: ${{ needs.quality.result }}
         run: |
-          RESULT="${{ needs.quality.result }}"
           echo "quality matrix result = ${RESULT}"
           if [ "$RESULT" != "success" ]; then
             echo "❌ quality matrix 存在失败，合并门禁未通过"
