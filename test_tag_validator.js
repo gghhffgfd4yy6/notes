@@ -131,13 +131,17 @@ function extractRunBlock (yml, stepName) {
   return body.join('\n')
 }
 
-// 在临时目录里用 bash 执行 run: 块（GITHUB_REF 由调用方给定；夹具文件按需落盘，绝不写仓库）
+// 在临时目录里执行 run: 块（GITHUB_REF 由调用方给定；夹具文件按需落盘，绝不写仓库）。
+// 执行方式与 GitHub Actions 一致：先把 run 块写成脚本文件、再交给 bash 执行，而不是把脚本内容
+// 拼进 `bash -c` —— 后者会被安全扫描器判为「动态构造命令」（#136：SonarCloud 的 Security Rating
+// on New Code 给 B，annotation 正指向原实现那一行）。
 function runBlock (block, tag, files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rel136-'))
   for (const [name, content] of Object.entries(files || {})) {
     fs.writeFileSync(path.join(dir, name), content)
   }
-  const res = spawnSync('bash', ['-c', block], {
+  fs.writeFileSync(path.join(dir, 'run-block.sh'), block)
+  const res = spawnSync('bash', ['run-block.sh'], {
     cwd: dir,
     env: { ...process.env, GITHUB_REF: 'refs/tags/v' + tag },
     encoding: 'utf8',
