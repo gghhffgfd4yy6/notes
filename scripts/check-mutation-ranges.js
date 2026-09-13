@@ -86,12 +86,21 @@ const productionFiles = [
   'scripts/check-deps.js'
 ]
 
-if (fileRanges.size === 0) {
-  console.error('❌ 未在 mutation.yml 中解析到任何 mutate 行段（格式应为 "file.js:start-end"）')
-  process.exit(1)
+// 提前退出收敛点：仅当本文件被直接运行（node scripts/check-mutation-ranges.js）时 process.exit，
+// 保证 CI / `npm run check` 照旧 fail-loud（非零退出）；被 require 时（test_check_mutation_ranges.js
+// 复用 globToRegExp / listRepoJsFiles）一律不退出进程，只置失败标记或降级返回，详见文件末尾说明。
+function exitIfDirectRun (code) {
+  if (require.main === module) process.exit(code)
 }
 
 let failed = false
+
+if (fileRanges.size === 0) {
+  console.error('❌ 未在 mutation.yml 中解析到任何 mutate 行段（格式应为 "file.js:start-end"）')
+  failed = true // 两条路径都记录失败；是否提前退出交给 exitIfDirectRun 决定
+  exitIfDirectRun(1) // 直接运行：照旧立即退出非零；require 路径：不退出（空行段不会进入下面的行段循环）
+}
+
 for (const file of productionFiles) {
   if (!mutateTargets.has(file)) {
     console.error(`❌ ${file}: 未列入 mutation.yml 的 mutate 目标`)
@@ -125,19 +134,21 @@ for (const entry of matrixEntries) {
 }
 
 // 依赖模块加载的友好降级：mutation-report.js / stryker.config.js 未来若在顶层抛错或引入副作用，
-// checker 不应裸栈崩溃，而要指明是哪个模块加载失败并以 exit 1 退出。
+// checker 不应裸栈崩溃，而要指明是哪个模块加载失败：直接运行时以 exit 1 退出（照旧 fail-loud）；
+// 被 require 时不退出进程（见 exitIfDirectRun），改以 null 降级返回，由调用方用 `|| {}` 兜底。
 function requireOrDie (modulePath, displayName) {
   try {
     return require(modulePath)
   } catch (err) {
     console.error(`❌ 无法加载 ${displayName}（${modulePath}）：${err.message}`)
-    process.exit(1)
+    exitIfDirectRun(1)
+    return null
   }
 }
 
 // 校验 0.5：矩阵 name 必须与 mutation-report 的 EXPECTED_SEGMENTS 一致（含重复检测）。
 // 背景：name 写错/漏改要等 report 阶段 validateSegments() 才 throw —— 那时整轮矩阵（小时级）已经白跑。
-const expectedSegments = requireOrDie('../scripts/mutation-report.js', 'mutation-report.js').EXPECTED_SEGMENTS || []
+const expectedSegments = (requireOrDie('../scripts/mutation-report.js', 'mutation-report.js') || {}).EXPECTED_SEGMENTS || []
 const matrixNames = matrixEntries.map(entry => entry.name).filter(Boolean)
 const dupNames = [...new Set(matrixNames.filter((name, i) => matrixNames.indexOf(name) !== i))]
 const nameMissing = expectedSegments.filter(name => !matrixNames.includes(name))
@@ -162,7 +173,7 @@ if (nameExtra.length) {
 // 硬比会把「被 glob 覆盖的矩阵目标」误报成「缺矩阵目标」。处理：glob 条目输出提示并跳过精确
 // 比对，改用最小 glob→RegExp 判定矩阵目标是否可能被覆盖；非 glob 条目仍严格比对，通过/失败
 // 语义与历史一致（当前 config 无 glob 时行为完全不变）。
-const configMutateRaw = requireOrDie('../stryker.config.js', 'stryker.config.js').mutate || []
+const configMutateRaw = (requireOrDie('../stryker.config.js', 'stryker.config.js') || {}).mutate || []
 const globChars = /[*?[\]{}]/
 const configGlob = configMutateRaw.filter(item => globChars.test(item))
 const configMutate = new Set(configMutateRaw.filter(item => !globChars.test(item)))
@@ -272,7 +283,8 @@ function globToRegExp (pattern) {
 }
 
 // 暴露给测试：glob→RegExp 与目录文件枚举（test_check_mutation_ranges.js 直接驱动断言）。
-// 注：本文件被 require 时不会提前 process.exit（最终 exit 已用 require.main === module 包住），
+// 注：本文件被 require 时不会提前 process.exit——两处提前退出（未解析到任何行段、依赖模块加载失败）
+// 与文件末尾的最终退出都收敛到「仅直接运行才退出」（exitIfDirectRun / require.main === module），
 // 供测试安全地复用 globToRegExp / listRepoJsFiles 做单元断言。
 module.exports = { globToRegExp, listRepoJsFiles }
 

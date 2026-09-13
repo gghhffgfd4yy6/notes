@@ -27,8 +27,14 @@ assert.strictEqual(scriptSource, bashRegexSource,
 // ── 交集语法约束：逐字一致只防文本漂移，不防语义分叉 ──
 // bash ERE 与 JS RegExp 语法集合不同（\d \w \s \b \B \D \W \S 简写类、反向引用、(?= (?<= (?! (?<!
 // 前瞻/后顾、\p{...} Unicode 属性——两边要么一方不支持、要么语义不同）：若未来把正则扩展进这类写法，
-// 上面的逐字断言照样通过，但 CI（bash）与本地（JS）行为分叉。下面用禁用 token 黑名单强制执行
-// 「只会用两方言语义交集的子集」这一约束（详见 validate-release-tag.js 头部说明），引入即红。
+// 上面的逐字断言照样通过，但 CI（bash）与本地（JS）行为分叉。下面用禁用 token / 禁用形态黑名单
+// 强制执行「只会用两方言语义交集的子集」这一约束（详见 validate-release-tag.js 头部说明），命中即红。
+// 黑名单强制的是下列**已列出**形态（不穷举所有方言差异，边界见 validate-release-tag.js 头部）：
+//   1) 字面简写类 / 前瞻后顾 / Unicode 属性：\d \w \s \b \B \D \W \S、(?、(?= (?<= (?! (?<!、\p{
+//   2) 数字反向引用：\1 \12 …（正则探测，非逐字 includes）
+//   3) JS 专有转义：\n \t \r \f \v \0 \xHH \uHHHH \cX
+//   4) POSIX 字符类：[[:digit:]] 等
+//   5) GNU 扩展：词边界 \< \>、无上界/无下界量词 {n,} {,n}
 const FORBIDDEN_TOKENS = ['\\d', '\\w', '\\s', '\\b', '\\B', '\\D', '\\W', '\\S', '(?', '\\p{']
 for (const token of FORBIDDEN_TOKENS) {
   assert.ok(!scriptSource.includes(token),
@@ -45,6 +51,25 @@ const BACKREF_RE = /[\\][1-9][0-9]*/
 assert.ok(!BACKREF_RE.test(scriptSource), 'SEMVER_RE 不得含数字反向引用（\\1、\\12 等，bash/JS 语义分叉）')
 assert.ok(!BACKREF_RE.test(bashRegexSource),
   'release.yml 的 bash 正则不得含数字反向引用（\\1、\\12 等，bash/JS 语义分叉）')
+
+// 上两条覆盖不到的真实分歧形态（#132 review 补充）：JS 专有转义、POSIX 字符类、GNU 扩展。
+// 与 FORBIDDEN_TOKENS 一样对「脚本正则源」和「release.yml 内联正则源」双向断言。
+// 反斜杠形态一律用**完整形状**（\xHH / \uHHHH / \cX）而非裸 `\x`/`\u`：JS 正则字面量里不完整的 \x、\u
+// 自身就是语法错误、不可能出现在 source 中，完整形状已覆盖所有可表示的该类写法（宁可少加规则）。
+// 逐 token 核对：当前 SEMVER_RE.source 与 release.yml 内联正则逐字一致，反斜杠**只出现在 `\.`**（4 处），
+// 且不含 `[[:` 与任何 `{`，故下列 4 条在现有正则上均不触发、不会误伤。
+const FORBIDDEN_PATTERNS = [
+  { re: /[\\](?:[ntrfv0]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|c[A-Za-z])/, desc: 'JS 专有转义（\\n \\t \\r \\f \\v \\0 \\xHH \\uHHHH \\cX——bash ERE 对普通字符前的反斜杠按字面处理）' },
+  { re: /\[\[:/, desc: 'POSIX 字符类（[[:digit:]] 等——bash 是字符类，JS 是字符集合 + 字面 ]）' },
+  { re: /[\\][<>]/, desc: 'GNU 词边界（\\< \\>——bash 是词首/词尾，JS 是字面 < >）' },
+  { re: /\{[0-9]+,\}|\{,[0-9]+\}/, desc: '无上界/无下界量词（{n,} {,n}——非 POSIX ERE 保证形态，bash(glibc) 与 JS 支持度不一）' }
+]
+for (const { re, desc } of FORBIDDEN_PATTERNS) {
+  assert.ok(!re.test(scriptSource),
+    `SEMVER_RE 不得含 ${desc}（交集语法约束）`)
+  assert.ok(!re.test(bashRegexSource),
+    `release.yml 的 bash 正则不得含 ${desc}（交集语法约束）`)
+}
 
 // 合法 tag 集合（语义：v数字.数字[.数字][-prerelease][+build]；禁止前导零；后缀组件非空）
 const validTags = [
