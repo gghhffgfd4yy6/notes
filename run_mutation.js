@@ -161,7 +161,10 @@ function runTests (dir, timeoutMs) {
     // 并 kill，真正的 resolve 一律收敛到 close 回调（close 时信号/输出已定稿），再叠加一个兜底保险定时器
     // 防止 kill 后 close 永不触发（异常文件描述符/僵尸进程）导致 Promise 悬空。
     // 契约要点（D1）：timedOut 只是「已过超时线」的标记，不是最终结论——结论一律由 close 携带的
-    // 真实 code 决定；只有 close 悬空（兜底定时器结算）或 close 无 code（被信号杀死）才是 timeout 形态。
+    // 真实 code 决定。timeout 形态只覆盖两种：（a）已过超时线且 close 无 code（被我们的 SIGKILL
+    // 杀死）、（b）close 悬空（由兜底定时器结算）。未过超时线却收到无 code 的 close（外部 kill /
+    // OOM）不在其列，走 else 分支按 fail 记为 killed（#136 review：原注释漏了 timedOut 前提，
+    // 与实现 if (timedOut && (code === null || code === undefined)) 不符）。
     let timedOut = false
     let falloutTimer = null
     child.stdout.on('data', d => { output += d })

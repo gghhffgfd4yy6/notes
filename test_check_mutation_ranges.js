@@ -1,6 +1,7 @@
 'use strict'
 
-// check-mutation-ranges.js 无导出（顶层执行 + process.exit），通过子进程注入 MUTATION_WORKFLOW_TEXT 测试
+// check-mutation-ranges.js 导出 globToRegExp / listRepoJsFiles 供直接 require 复用，失败收场收敛到
+// exitIfDirectRun（直跑 process.exit、被 require 则 throw）；夹具 yml 通过 MUTATION_WORKFLOW_TEXT 注入。
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')

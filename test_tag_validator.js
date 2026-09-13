@@ -2,7 +2,7 @@
 
 // release.yml 的 tag semver 校验回归测试（#131 qodo #8）。
 // release.yml 的「校验 tag 版本号格式（semver）」步骤用 bash 内联正则（位于
-// .github/workflows/release.yml 第 41 行）判定 v* tag 是否合法；sourcery 已修复该正则
+// .github/workflows/release.yml 第 43 行）判定 v* tag 是否合法；sourcery 已修复该正则
 // （禁止前导零、禁止空后缀组件），但当时无自动化测试固化。本套件从 scripts/validate-release-tag.js
 // 复用同一套正则与校验函数，逐字断言合法/非法 tag 集合——测试与 workflow 同源，防止语义再漂移。
 // 运行方式：node test_tag_validator.js（exit 0 = 通过）。
