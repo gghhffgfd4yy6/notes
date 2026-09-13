@@ -86,19 +86,22 @@ const productionFiles = [
   'scripts/check-deps.js'
 ]
 
-// 提前退出收敛点：仅当本文件被直接运行（node scripts/check-mutation-ranges.js）时 process.exit，
-// 保证 CI / `npm run check` 照旧 fail-loud（非零退出）；被 require 时（test_check_mutation_ranges.js
-// 复用 globToRegExp / listRepoJsFiles）一律不退出进程，只置失败标记或降级返回，详见文件末尾说明。
+// 失败收敛点：直接运行（node scripts/check-mutation-ranges.js）时按 code process.exit，保证 CI /
+// `npm run check` 照旧 fail-loud（非零退出）；被 require 时（test_check_mutation_ranges.js 复用
+// globToRegExp / listRepoJsFiles）改为 throw —— require 者同样必须拿到失败信号。此前 require 路径
+// 只置失败标记并降级返回，使「依赖模块加载失败 / mutation.yml 无任何行段」退化成 stderr 噪音，
+// require 者拿到「校验通过」的假象（R2 审查发现；虽被同文件的 spawn 夹具兜住，但属脆弱点）。
 function exitIfDirectRun (code) {
   if (require.main === module) process.exit(code)
+  throw new Error('check-mutation-ranges 校验失败：详见上方 stderr 输出（被 require 时以 throw 传递失败）')
 }
 
 let failed = false
 
 if (fileRanges.size === 0) {
   console.error('❌ 未在 mutation.yml 中解析到任何 mutate 行段（格式应为 "file.js:start-end"）')
-  failed = true // 两条路径都记录失败；是否提前退出交给 exitIfDirectRun 决定
-  exitIfDirectRun(1) // 直接运行：照旧立即退出非零；require 路径：不退出（空行段不会进入下面的行段循环）
+  failed = true // 两条路径都记录失败；如何收场交给 exitIfDirectRun 决定
+  exitIfDirectRun(1) // 两条路径都不返回：直接运行立即退出非零，require 路径抛错（fail-loud）
 }
 
 for (const file of productionFiles) {
@@ -133,22 +136,21 @@ for (const entry of matrixEntries) {
   }
 }
 
-// 依赖模块加载的友好降级：mutation-report.js / stryker.config.js 未来若在顶层抛错或引入副作用，
-// checker 不应裸栈崩溃，而要指明是哪个模块加载失败：直接运行时以 exit 1 退出（照旧 fail-loud）；
-// 被 require 时不退出进程（见 exitIfDirectRun），改以 null 降级返回，由调用方用 `|| {}` 兜底。
+// 依赖模块加载的友好报错：mutation-report.js / stryker.config.js 未来若在顶层抛错或引入副作用，
+// checker 不应裸栈崩溃，而要指明是哪个模块加载失败，再以失败收场（直接运行 exit 1 / 被 require
+// throw，两者都不返回）。因此这里不再有 null 降级：模块加载失败必须响亮，不能被翻译成「期望集合为空」。
 function requireOrDie (modulePath, displayName) {
   try {
     return require(modulePath)
   } catch (err) {
     console.error(`❌ 无法加载 ${displayName}（${modulePath}）：${err.message}`)
     exitIfDirectRun(1)
-    return null
   }
 }
 
 // 校验 0.5：矩阵 name 必须与 mutation-report 的 EXPECTED_SEGMENTS 一致（含重复检测）。
 // 背景：name 写错/漏改要等 report 阶段 validateSegments() 才 throw —— 那时整轮矩阵（小时级）已经白跑。
-const expectedSegments = (requireOrDie('../scripts/mutation-report.js', 'mutation-report.js') || {}).EXPECTED_SEGMENTS || []
+const expectedSegments = requireOrDie('../scripts/mutation-report.js', 'mutation-report.js').EXPECTED_SEGMENTS || []
 const matrixNames = matrixEntries.map(entry => entry.name).filter(Boolean)
 const dupNames = [...new Set(matrixNames.filter((name, i) => matrixNames.indexOf(name) !== i))]
 const nameMissing = expectedSegments.filter(name => !matrixNames.includes(name))
@@ -173,7 +175,7 @@ if (nameExtra.length) {
 // 硬比会把「被 glob 覆盖的矩阵目标」误报成「缺矩阵目标」。处理：glob 条目输出提示并跳过精确
 // 比对，改用最小 glob→RegExp 判定矩阵目标是否可能被覆盖；非 glob 条目仍严格比对，通过/失败
 // 语义与历史一致（当前 config 无 glob 时行为完全不变）。
-const configMutateRaw = (requireOrDie('../stryker.config.js', 'stryker.config.js') || {}).mutate || []
+const configMutateRaw = requireOrDie('../stryker.config.js', 'stryker.config.js').mutate || []
 const globChars = /[*?[\]{}]/
 const configGlob = configMutateRaw.filter(item => globChars.test(item))
 const configMutate = new Set(configMutateRaw.filter(item => !globChars.test(item)))
@@ -283,9 +285,10 @@ function globToRegExp (pattern) {
 }
 
 // 暴露给测试：glob→RegExp 与目录文件枚举（test_check_mutation_ranges.js 直接驱动断言）。
-// 注：本文件被 require 时不会提前 process.exit——两处提前退出（未解析到任何行段、依赖模块加载失败）
-// 与文件末尾的最终退出都收敛到「仅直接运行才退出」（exitIfDirectRun / require.main === module），
-// 供测试安全地复用 globToRegExp / listRepoJsFiles 做单元断言。
+// 注：本文件被 require 时不会用 process.exit 结束测试进程——全部失败收场（两处提前退出：未解析到
+// 任何行段、依赖模块加载失败；以及文件末尾的最终判定）都收敛到 exitIfDirectRun / require.main：
+// 直接运行 process.exit(code)，被 require 则 throw。故健康仓库下 require 不抛，可安全复用
+// globToRegExp / listRepoJsFiles；仓库真有问题时抛错让测试失败，正是期望行为。
 module.exports = { globToRegExp, listRepoJsFiles }
 
 if (configGlob.length) {
@@ -372,7 +375,8 @@ for (const [file, ranges] of fileRanges) {
   }
 }
 
-// 主入口执行：仅当作为脚本直接运行（node scripts/check-mutation-ranges.js）时按结果 exit；
-// 被 require（test_check_mutation_ranges.js 复用 globToRegExp / listRepoJsFiles）时不退出进程，
-// 保证测试进程不被提前 kill。
+// 主入口执行：作为脚本直接运行（node scripts/check-mutation-ranges.js）时按结果 process.exit；
+// 被 require（test_check_mutation_ranges.js 复用 globToRegExp / listRepoJsFiles）时改为 throw，
+// 让 require 者也拿到失败（不再静默返回「无结论」）。
 if (require.main === module) process.exit(failed ? 1 : 0)
+if (failed) exitIfDirectRun(1) // 直接运行：上一行已 exit，此处不可达；被 require：throw

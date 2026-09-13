@@ -118,7 +118,8 @@ function run (ymlText) {
 
   // ===== glob 相关断言（缺陷C/缺陷B 的回归，qodo #4/#5）=====
   // globToRegExp / listRepoJsFiles 现已被 check-mutation-ranges.js 导出；本文件被 require 时
-  // 该脚本已用 require.main === module 包住主流程，不会提前 process.exit。直接驱动纯函数断言：
+  // 该脚本不会用 process.exit 结束本测试进程——失败收场收敛到 exitIfDirectRun：直接运行 exit、
+  // 被 require 则 throw（健康仓库下不抛）。直接驱动纯函数断言：
   //   - 合法 glob（含 *、?、{a,b} 交替、[字符类]、[!取反]、双星 **）覆盖判定不误报
   //   - `**`（globstar）必须能跨目录分隔符（根级 0 层 / 单层 / 多层嵌套均判为覆盖），不误报 configMissing
   //   - malformed（含 [[、乱序范围 [z-a]、未闭合 [）按字面处理、不抛异常
