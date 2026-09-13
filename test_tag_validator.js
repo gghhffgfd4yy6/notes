@@ -106,8 +106,11 @@ console.log(`✅ tag 校验通过：${validTags.length} 个合法 / ${invalidTag
 
 // ── release.yml 步骤级回归（#136 review）─────────────────────────────────────────
 // 教训：只断言 exit code 会漏掉「内容类」错误 —— notes 步骤曾 exit 0 却只写出标题行（9 字节），
-// CHANGELOG 的要点从不进入 Release 正文。故这里把 release.yml 的 run: 块按 bash 实际执行（与 CI
-// 同路径），并断言产出内容而不只是退出码；闸门则用「package.json × tag」矩阵锁定逐段一致性。
+// CHANGELOG 的要点从不进入 Release 正文。故这里把 release.yml 的 run: 块里那段 node 载荷抽出来
+// 实际执行，并断言产出内容而不只是退出码；闸门则用「package.json × tag」矩阵锁定逐段一致性。
+// 注意：执行载荷用子进程 + process.execPath（不调用 shell）。CI 上一切正常；Android 上
+// process.execPath 指向 linker64，需 NODE_OPTIONS=--require <shim> 预加载 execpath-shim
+// （与 test_check_mutation_ranges.js / test_ci_skip_suites.js 同一前提）。
 const os = require('node:os')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
@@ -131,19 +134,35 @@ function extractRunBlock (yml, stepName) {
   return body.join('\n')
 }
 
-// 在临时目录里执行 run: 块（GITHUB_REF 由调用方给定；夹具文件按需落盘，绝不写仓库）。
-// 执行方式与 GitHub Actions 一致：先把 run 块写成脚本文件、再交给 bash 执行，而不是把脚本内容
-// 拼进 `bash -c` —— 后者会被安全扫描器判为「动态构造命令」（#136：SonarCloud 的 Security Rating
-// on New Code 给 B，annotation 正指向原实现那一行）。
+// 从 run: 块里取出 node 载荷文本，并按 bash 双引号规则还原转义（bash 在双引号内只对反斜杠、
+// 美元符、双引号、反引号与行尾续行特殊处理，其余反斜杠按字面保留）。这里不执行 shell：按名调用
+// bash 会触发 SonarCloud S4036（PATH 规则，#136），且不执行 shell 也就没有 shell 注入面。
+function extractNodePayload (block) {
+  const start = block.indexOf('node -e "')
+  assert.ok(start !== -1, 'run: 块应包含 node 载荷')
+  const bodyStart = block.indexOf('\n', start) + 1
+  const bodyEnd = block.indexOf('\n" "$VERSION"', bodyStart)
+  assert.ok(bodyEnd !== -1, 'run: 块应包含 node 载荷的结束标记')
+  const raw = block.slice(bodyStart, bodyEnd)
+  assert.ok(raw.trim().length > 0, 'node 载荷不应为空')
+  const BS = String.fromCharCode(92) // 反斜杠：用码点构造，避免本文件里出现层层叠加的转义序列
+  const BT = String.fromCharCode(96) // 反引号
+  const specials = [BS, '$', '"', BT]
+  let out = ''
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === BS && i + 1 < raw.length && specials.includes(raw[i + 1])) { out += raw[i + 1]; i++ } else out += raw[i]
+  }
+  return out
+}
+
+// 在临时目录里执行载荷（夹具文件按需落盘，绝不写仓库），argv[1] 与 CI 一致 = 去掉 v 的版本号
 function runBlock (block, tag, files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rel136-'))
   for (const [name, content] of Object.entries(files || {})) {
     fs.writeFileSync(path.join(dir, name), content)
   }
-  fs.writeFileSync(path.join(dir, 'run-block.sh'), block)
-  const res = spawnSync('bash', ['run-block.sh'], {
+  const res = spawnSync(process.execPath, ['-e', extractNodePayload(block), tag], {
     cwd: dir,
-    env: { ...process.env, GITHUB_REF: 'refs/tags/v' + tag },
     encoding: 'utf8',
     timeout: 20000
   })
