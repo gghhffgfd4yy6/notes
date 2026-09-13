@@ -11,8 +11,10 @@ const fs = require('fs')
 const path = require('path')
 
 const root = path.resolve(__dirname, '..')
-const workflowPath = path.resolve(process.env.MUTATION_WORKFLOW_PATH || path.join(root, '.github/workflows/mutation.yml'))
-const yml = process.env.MUTATION_WORKFLOW_TEXT || fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
+// 环境注入用 ?? 而非 ||（#136 review F7）：夹具显式传空串时，|| 会静默回退去读真实 mutation.yml，
+// 把「空输入」变成假绿（实测旧实现 MUTATION_WORKFLOW_TEXT="" 时 exit 0，且校验的是真实文件）。
+const workflowPath = path.resolve(process.env.MUTATION_WORKFLOW_PATH ?? path.join(root, '.github/workflows/mutation.yml'))
+const yml = process.env.MUTATION_WORKFLOW_TEXT ?? fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
 
 // matrix include 的唯一解析器：`- name:` / `- src:` / `- mutate:` 任一开头都算新条目，
 // 引号（单/双）与缩进放宽，字段值停在空白或 #。
@@ -69,15 +71,30 @@ if (includeIdx !== -1) {
 
 const fileRanges = new Map()
 const mutateTargets = new Set()
+// 格式非法的行段必须响亮失败（#136 review F1）：此前只无条件登记 mutateTargets、行段仅在
+// /^\d+-\d+$/ 命中时才登记，于是把「xbk_function_v3.js:1-426」写成「:1-42x」既不报错、也不进入
+// 逐文件校验循环 —— 该文件的行数/连续性/尾部检查被整段跳过，门禁照旧 exit 0（实测复现）。
+const malformedRanges = []
 for (const entry of matrixEntries) {
   if (!entry.mutate) continue
-  const [file, range] = entry.mutate.split(':')
+  const segments = entry.mutate.split(':')
+  const file = segments[0]
   mutateTargets.add(file)
-  if (range && /^\d+-\d+$/.test(range)) {
-    const [start, end] = range.split('-').map(Number)
-    if (!fileRanges.has(file)) fileRanges.set(file, [])
-    fileRanges.get(file).push({ start, end })
+  // 冒号超过两段必须拦下（#136 CodeRabbit）：旧实现用解构只取前两段，于是「file.js:1-10:extra」
+  // 会被当成合法的 1-10 放行、尾段被静默丢弃（实测旧实现对该夹具 exit 0 并报「1 段全覆盖」）。
+  if (segments.length > 2) {
+    malformedRanges.push({ name: entry.name || file, mutate: entry.mutate })
+    continue
   }
+  const range = segments[1]
+  if (range === undefined) continue // 完全不带行段 = 合法（按全文件变异处理）
+  if (!/^\d+-\d+$/.test(range)) {
+    malformedRanges.push({ name: entry.name || file, mutate: entry.mutate })
+    continue
+  }
+  const [start, end] = range.split('-').map(Number)
+  if (!fileRanges.has(file)) fileRanges.set(file, [])
+  fileRanges.get(file).push({ start, end })
 }
 
 const productionFiles = [
@@ -86,12 +103,31 @@ const productionFiles = [
   'scripts/check-deps.js'
 ]
 
-if (fileRanges.size === 0) {
-  console.error('❌ 未在 mutation.yml 中解析到任何 mutate 行段（格式应为 "file.js:start-end"）')
-  process.exit(1)
+// 失败收敛点：直接运行（node scripts/check-mutation-ranges.js）时按 code process.exit，保证 CI /
+// `npm run check` 照旧 fail-loud（非零退出）；被 require 时（test_check_mutation_ranges.js 复用
+// globToRegExp / listRepoJsFiles）改为 throw —— require 者同样必须拿到失败信号。此前 require 路径
+// 只置失败标记并降级返回，使「依赖模块加载失败 / mutation.yml 无任何行段」退化成 stderr 噪音，
+// require 者拿到「校验通过」的假象（R2 审查发现；虽被同文件的 spawn 夹具兜住，但属脆弱点）。
+function exitIfDirectRun (code) {
+  if (require.main === module) process.exit(code)
+  throw new Error('check-mutation-ranges 校验失败：详见上方 stderr 输出（被 require 时以 throw 传递失败）')
 }
 
 let failed = false
+
+// 非法行段在此结算（#136 review F1）：置于 fileRanges 空值早退之前，故即使整份 yml 都是非法行段，
+// 也会同时打出「格式非法」与「未解析到任何行段」两条信息，两条路径都非零/抛错。
+for (const bad of malformedRanges) {
+  console.error(`❌ matrix「${bad.name}」的 mutate 行段格式非法：${bad.mutate}（应为 "file.js:start-end"；旧实现会静默忽略该条，使该文件整段跳过行段校验）`)
+  failed = true
+}
+
+if (fileRanges.size === 0) {
+  console.error('❌ 未在 mutation.yml 中解析到任何 mutate 行段（格式应为 "file.js:start-end"）')
+  failed = true // 两条路径都记录失败；如何收场交给 exitIfDirectRun 决定
+  exitIfDirectRun(1) // 两条路径都不返回：直接运行立即退出非零，require 路径抛错（fail-loud）
+}
+
 for (const file of productionFiles) {
   if (!mutateTargets.has(file)) {
     console.error(`❌ ${file}: 未列入 mutation.yml 的 mutate 目标`)
@@ -124,14 +160,15 @@ for (const entry of matrixEntries) {
   }
 }
 
-// 依赖模块加载的友好降级：mutation-report.js / stryker.config.js 未来若在顶层抛错或引入副作用，
-// checker 不应裸栈崩溃，而要指明是哪个模块加载失败并以 exit 1 退出。
+// 依赖模块加载的友好报错：mutation-report.js / stryker.config.js 未来若在顶层抛错或引入副作用，
+// checker 不应裸栈崩溃，而要指明是哪个模块加载失败，再以失败收场（直接运行 exit 1 / 被 require
+// throw，两者都不返回）。因此这里不再有 null 降级：模块加载失败必须响亮，不能被翻译成「期望集合为空」。
 function requireOrDie (modulePath, displayName) {
   try {
     return require(modulePath)
   } catch (err) {
     console.error(`❌ 无法加载 ${displayName}（${modulePath}）：${err.message}`)
-    process.exit(1)
+    exitIfDirectRun(1)
   }
 }
 
@@ -272,8 +309,10 @@ function globToRegExp (pattern) {
 }
 
 // 暴露给测试：glob→RegExp 与目录文件枚举（test_check_mutation_ranges.js 直接驱动断言）。
-// 注：本文件被 require 时不会提前 process.exit（最终 exit 已用 require.main === module 包住），
-// 供测试安全地复用 globToRegExp / listRepoJsFiles 做单元断言。
+// 注：本文件被 require 时不会用 process.exit 结束测试进程——全部失败收场（两处提前退出：未解析到
+// 任何行段、依赖模块加载失败；以及文件末尾的最终判定）都收敛到 exitIfDirectRun / require.main：
+// 直接运行 process.exit(code)，被 require 则 throw。故健康仓库下 require 不抛，可安全复用
+// globToRegExp / listRepoJsFiles；仓库真有问题时抛错让测试失败，正是期望行为。
 module.exports = { globToRegExp, listRepoJsFiles }
 
 if (configGlob.length) {
@@ -360,7 +399,8 @@ for (const [file, ranges] of fileRanges) {
   }
 }
 
-// 主入口执行：仅当作为脚本直接运行（node scripts/check-mutation-ranges.js）时按结果 exit；
-// 被 require（test_check_mutation_ranges.js 复用 globToRegExp / listRepoJsFiles）时不退出进程，
-// 保证测试进程不被提前 kill。
+// 主入口执行：作为脚本直接运行（node scripts/check-mutation-ranges.js）时按结果 process.exit；
+// 被 require（test_check_mutation_ranges.js 复用 globToRegExp / listRepoJsFiles）时改为 throw，
+// 让 require 者也拿到失败（不再静默返回「无结论」）。
 if (require.main === module) process.exit(failed ? 1 : 0)
+if (failed) exitIfDirectRun(1) // 直接运行：上一行已 exit，此处不可达；被 require：throw

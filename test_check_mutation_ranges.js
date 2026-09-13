@@ -1,6 +1,7 @@
 'use strict'
 
-// check-mutation-ranges.js 无导出（顶层执行 + process.exit），通过子进程注入 MUTATION_WORKFLOW_TEXT 测试
+// check-mutation-ranges.js 导出 globToRegExp / listRepoJsFiles 供直接 require 复用，失败收场收敛到
+// exitIfDirectRun（直跑 process.exit、被 require 则 throw）；夹具 yml 通过 MUTATION_WORKFLOW_TEXT 注入。
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
@@ -118,7 +119,8 @@ function run (ymlText) {
 
   // ===== glob 相关断言（缺陷C/缺陷B 的回归，qodo #4/#5）=====
   // globToRegExp / listRepoJsFiles 现已被 check-mutation-ranges.js 导出；本文件被 require 时
-  // 该脚本已用 require.main === module 包住主流程，不会提前 process.exit。直接驱动纯函数断言：
+  // 该脚本不会用 process.exit 结束本测试进程——失败收场收敛到 exitIfDirectRun：直接运行 exit、
+  // 被 require 则 throw（健康仓库下不抛）。直接驱动纯函数断言：
   //   - 合法 glob（含 *、?、{a,b} 交替、[字符类]、[!取反]、双星 **）覆盖判定不误报
   //   - `**`（globstar）必须能跨目录分隔符（根级 0 层 / 单层 / 多层嵌套均判为覆盖），不误报 configMissing
   //   - malformed（含 [[、乱序范围 [z-a]、未闭合 [）按字面处理、不抛异常
@@ -170,6 +172,35 @@ function run (ymlText) {
       '展开结果应与 globToRegExp 覆盖口径一致')
     console.log('✅ globToRegExp / listRepoJsFiles 断言通过（* ? {a,b} [类] [!取反] ** 与 malformed）')
   }
+
+  // ===== 非法 mutate 行段必须 fail-loud（#136 review F1）：旧实现静默跳过该文件的整段校验 =====
+  const malformed = run(buildYml({ [TEST_FILE]: '1-42x' }))
+  assert.strictEqual(malformed.status, 1, '非法行段应 exit 1（修复前静默 exit 0，该文件的行数/连续性/尾部校验被整段跳过）')
+  assert.ok(malformed.stderr.includes('行段格式非法'), `应报「行段格式非法」，实际 stderr: ${malformed.stderr}`)
+  console.log('✅ 非法行段 fail-loud 断言通过')
+
+  // 多余冒号段同样必须拦下（#136 CodeRabbit）：旧实现解构只取前两段，:1-10:extra 会被放行并丢弃尾段
+  const surplus = run(buildYml({ [TEST_FILE]: '1-10:extra' }))
+  assert.strictEqual(surplus.status, 1, '多余冒号段应 exit 1（旧实现静默丢弃尾段后放行）')
+  assert.ok(surplus.stderr.includes('行段格式非法'), `应报「行段格式非法」，实际 stderr: ${surplus.stderr}`)
+  console.log('✅ 多余冒号段 fail-loud 断言通过')
+
+  // ===== require 路径的失败必须 throw（#136 review A3）：此前删掉 throw 回到「静默返回」本套件仍全绿 =====
+  // 直跑路径由上面的 run() 子进程覆盖；require 路径此前无任何断言。用 -e 使 require.main 为
+  // undefined（即真实的「被 require」语义），注入空矩阵 yml 后必须抛错而非静默返回。
+  const requireProbe = (ymlText) => spawnSync(process.execPath, ['-e', `try { require(${JSON.stringify(SCRIPT)}); console.log('NO-THROW') } catch (e) { console.log('THROW:' + e.message) }`], {
+    env: { ...process.env, MUTATION_WORKFLOW_TEXT: ymlText },
+    encoding: 'utf8',
+    timeout: 15000
+  })
+  const threw = requireProbe('jobs: {}')
+  assert.ok(!threw.error, `require 探针不应 spawn 失败：${threw.error && threw.error.message}`)
+  assert.ok(threw.stdout.includes('THROW:'),
+    `被 require 且校验失败时应抛错（否则失败被静默吞掉），实际 stdout: ${threw.stdout} stderr: ${threw.stderr}`)
+  const noThrow = requireProbe(buildYml())
+  assert.ok(noThrow.stdout.includes('NO-THROW'),
+    `健康仓库下 require 不应抛错（否则复用该模块的测试会被误杀），实际 stdout: ${noThrow.stdout} stderr: ${noThrow.stderr}`)
+  console.log('✅ require 路径契约断言通过（失败抛错 / 健康不抛）')
 
   console.log('test_check_mutation_ranges OK')
 })().catch((e) => { console.error(e); process.exit(1) })

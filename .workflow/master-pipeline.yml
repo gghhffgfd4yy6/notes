@@ -64,7 +64,7 @@ stages:
     - npm run test:mutation-json
   - step: build@nodejs
     name: test_unit
-    displayName: 全量单元测试 run_unit_tests.js（26 套件兜底防漏网）
+    displayName: 全量单元测试 run_unit_tests.js（套件表兜底防漏网）
     nodeVersion: 22.22.2
     commands:
     - npm install --ignore-scripts
@@ -149,7 +149,7 @@ stages:
   strategy: naturally
   trigger: auto
   steps:
-  # 这 6 个套件被 run_unit_tests.js 跳过（integration / mutationSkip），须在此显式覆盖，
+  # run_unit_tests.js 共跳过 12 个套件（integration 10 + mutationSkip 2）；本 stage 覆盖其中 6 个，
   # 否则相关回归可带病通过 PR（对照 .github/workflows/test.yml 的同名步骤）。
   # Node 取 22.22.2（与 package.json engines、GitHub test.yml 一致）。
   # 环境前置（勿把本 stage 变成“全绿”环境）：test_cli.js:19 断言 --check 在缺依赖/未配通知时
