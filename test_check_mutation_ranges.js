@@ -51,6 +51,23 @@ function buildYml (overrides = {}) {
   return `name: mutation\non: push\njobs:\n  mutation:\n    strategy:\n      matrix:\n        include:\n${matrix}\n`
 }
 
+// 全文件变异矩阵夹具（#138 review）：每条 mutate 都不带 `:start-end`，是本 PR 确立的合法写法。
+// 与 buildYml 同源——同一份生产文件清单、同一套真实段名（段名仍须满足 EXPECTED_SEGMENTS，故
+// xbk_sendNotify_slim.js 会按 sendnotify-part1/part2 出两条、两条都是全文件），仅 mutate 值不带行段。
+// omit 用于删掉某个文件的所有条目，验证早退守卫之后的 productionFiles 校验仍在跑。
+function buildFullFileYml (omit = null) {
+  const productionFiles = [
+    ...fs.readdirSync(ROOT).filter(f => /^xbk_.*\.js$/.test(f)),
+    'qinglong/xbk_push.js',
+    'scripts/check-deps.js'
+  ].filter(f => f !== omit)
+  const matrix = productionFiles.map(f => {
+    const names = SPECIAL_SEGMENTS[f] || [f.replace(/^xbk_/, '').replace(/\.js$/, '').replace(/_/g, '-')]
+    return names.map(name => `          - name: ${name}\n            src: "${f}"\n            mutate: "${f}"`).join('\n')
+  }).join('\n')
+  return `name: mutation\non: push\njobs:\n  mutation:\n    strategy:\n      matrix:\n        include:\n${matrix}\n`
+}
+
 function run (ymlText) {
   const result = spawnSync(process.execPath, [SCRIPT], {
     env: { ...process.env, MUTATION_WORKFLOW_TEXT: ymlText },
@@ -98,6 +115,33 @@ function run (ymlText) {
   const noRange = run('name: mutation\non: push\njobs:\n  mutation:\n    runs-on: ubuntu-latest\n')
   assert.strictEqual(noRange.status, 1, '无行段应 exit 1')
   assert.ok(noRange.stderr.includes('未在 mutation.yml 中解析到任何 mutate 行段'), '应报未解析到行段（stderr）')
+
+  // ===== 全文件变异矩阵（#138 review F1）：每条 mutate 都不带行段 = 合法 → exit 0 =====
+  // 修复前：fileRanges 必然为空 → 早退守卫把它误判成「未解析到任何 mutate 行段」并 exit 1，
+  // 与本 PR 新确立的「全文件变异合法」写法自相矛盾。
+  const fullFile = run(buildFullFileYml())
+  assert.strictEqual(fullFile.status, 0,
+    `全文件变异矩阵应 exit 0（修复前被误报为「未解析到任何 mutate 行段」），实际 ${fullFile.status}\nstdout: ${fullFile.stdout}\nstderr: ${fullFile.stderr}`)
+  assert.ok(fullFile.stderr.includes('未带行段'), `应保留全文件条目的 ⚠️ 提示（stderr），实际 stderr: ${fullFile.stderr}`)
+  assert.ok(!fullFile.stderr.includes('未在 mutation.yml 中解析到任何 mutate 行段'),
+    '全文件矩阵不应再报「未解析到任何 mutate 行段」')
+
+  // ===== 反向断言：守卫没有被削弱 —— 有条目但 mutate 全缺失 → 仍 exit 1 =====
+  // fullFileTargets 与 fileRanges 同时为空，早退守卫必须照旧 fail-loud（这是本修复最关键的反向约束）。
+  const noMutate = run(buildFullFileYml().split('\n').filter(line => !line.includes('mutate:')).join('\n'))
+  assert.strictEqual(noMutate.status, 1, '所有条目都缺 mutate 字段时应 exit 1（守卫放宽后不得变成假绿）')
+  assert.ok(noMutate.stderr.includes('未在 mutation.yml 中解析到任何 mutate 行段'),
+    `应报未解析到任何 mutate 目标（stderr），实际 stderr: ${noMutate.stderr}`)
+
+  // ===== 守卫只放宽「零目标」判定：早退之后的 productionFiles 校验照旧执行 → exit 1 =====
+  // 全文件矩阵删掉一个生产文件（动态取第一个 xbk_*.js）后必须仍 exit 1，且报的是「未列入 mutate 目标」而不是
+  // 那条早退错误——证明守卫被通过、后续校验没有被一起绕过。
+  const omitFile = run(buildFullFileYml(fs.readdirSync(ROOT).find(f => /^xbk_.*\.js$/.test(f))))
+  assert.strictEqual(omitFile.status, 1, '全文件矩阵漏掉一个生产文件应 exit 1（生产文件覆盖校验必须照旧执行）')
+  assert.ok(omitFile.stderr.includes('未列入 mutation.yml 的 mutate 目标'),
+    `应报生产文件未列入 mutate 目标（stderr），实际 stderr: ${omitFile.stderr}`)
+  assert.ok(!omitFile.stderr.includes('未在 mutation.yml 中解析到任何 mutate 行段'),
+    '漏条目场景不应命中早退守卫（说明后续校验确实执行了）')
 
   // ===== 路径越出仓库根目录 → exit 1（拒绝 ../ 越界）=====
   const pathTraversal = buildYml() + '          - name: outside\n            mutate: "../outside.js:1-10"\n'

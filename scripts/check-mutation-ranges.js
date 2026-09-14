@@ -142,8 +142,19 @@ if (fullFileTargets.size) {
   console.warn(`⚠️ ${fullFileTargets.size} 个 mutate 目标未带行段（按全文件变异处理，不参与行段连续性/尾部校验）：${[...fullFileTargets].join(', ')}`)
 }
 
-if (fileRanges.size === 0) {
-  console.error('❌ 未在 mutation.yml 中解析到任何 mutate 行段（格式应为 "file.js:start-end"）')
+// 早退守卫的真实意图：拦「解析压根没产出任何 mutate 目标」——矩阵为空、每条 mutate 都缺失、
+// 或 include 块解析失败，这些一律 fail-loud。判空条件因此必须与 fullFileTargets 联动，不能只看
+// fileRanges（#138 review）：「mutate 不带行段 = 全文件变异」已被本文件确立为合法写法（见上方
+// fullFileTargets），若这里仍写 `fileRanges.size === 0`，则「整份矩阵都是全文件条目」这种完全合法
+// 的形态必然 fileRanges 为空 → 被误报成「未解析到任何 mutate 行段」并 exit 1，与上方那条 ⚠️
+// 提示自相矛盾（真实矩阵 18 条里已有 15 条是全文件条目，一旦行段条目被删/改就会整轮误失败）。
+// 反向仍然成立、没有削弱：矩阵为空或所有条目 mutate 缺失/非法时 fullFileTargets 同样为空 →
+// 条件成立 → 照旧 exit 1 / throw；而 malformedRanges 的结算在其之前，非法行段路径不受影响。
+// 关键：早退之后的校验一条都没少（只拦「零目标」，其余照旧）——逐文件的行数/连续性/尾部校验
+// （fileRanges 循环）、productionFiles 是否都被列为 mutate 目标、条目 name/src/mutate 字段与
+// src-mutate 一致性、EXPECTED_SEGMENTS 段名（缺失/多余/重复）、stryker.config.js 与矩阵双向比对。
+if (fileRanges.size === 0 && fullFileTargets.size === 0) {
+  console.error('❌ 未在 mutation.yml 中解析到任何 mutate 行段（格式应为 "file.js:start-end"，或合法的全文件写法 "file.js"）')
   failed = true // 两条路径都记录失败；如何收场交给 exitIfDirectRun 决定
   exitIfDirectRun(1) // 两条路径都不返回：直接运行立即退出非零，require 路径抛错（fail-loud）
 }
