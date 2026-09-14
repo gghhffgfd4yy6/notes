@@ -8510,6 +8510,84 @@ console.log('========================================\n');
     assertEqual(c.includes('javascript'), false, `未闭合 src javascript: 应清空: ${c}`)
   })
 
+  await test('sanitizeDecodedHtml 纯文本属性对不屏蔽事件属性（P2-01 安全：占位保护需标签感知）', () => {
+    // 子代理审查（xbk_utils P2-01 critical）：_protectAttrPairs 无标签感知时，纯文本
+    // `name="…"` 会把段内存活的 <img onerror> 一并占位，_stripEventAttrs 失效 → XSS 直达推送客户端。
+    const cases = [
+      '说 a="太 <img src=x onerror=alert(1)> 了" 吧',
+      '讨论 XSS: a=\'y <img src=x onload=alert(2)>\' 吧',
+      '说明 b="z <input onfocus=alert(3)>" 完'
+    ]
+    for (const h of cases) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `纯文本引号内事件属性不应残留: ${h} → ${r}`)
+    }
+  })
+
+  await test('sanitizeDecodedHtml 未加引号值内引号不屏蔽事件属性（P2-01 安全：alt=a=" onerror="x）', () => {
+    // 浏览器词法：`<img alt=a=" onerror="alert(1)">` 中 alt 值是未加引号值 `a="`，
+    // 紧随其后的 onerror 是独立存活事件属性；保护机制曾把整段判为普通属性对而原样放行。
+    for (const h of [
+      '<img alt=a=" onerror="alert(1)">',
+      '<img y=a=" onerror="1">',
+      '<b x=a=" onmouseover="1">',
+      '<div data-x=a=" onerror="alert(1)">'
+    ]) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `未加引号值内引号形态事件属性不应残留: ${h} → ${r}`)
+    }
+    // 反向：标签内合法属性值里的 on 开头文本必须保留（保护语义不能被修坏）
+    const keep = sanitizeDecodedHtml('<img title="see onerror=x" src="y">')
+    assertEqual(keep.includes('title="see onerror=x"'), true, `标签内属性值不应被改写: ${keep}`)
+  })
+
+  await test('sanitizeDecodedHtml 未闭合引号不泄漏共享正则状态（P2-02：跨调用结果一致）', () => {
+    // safeRe 全局缓存同一正则对象：未闭合引号分支 break 前不复位 lastIndex 会污染下一次调用，
+    // 同一条输入的输出随「进程内此前处理过哪条消息」而变（本用例即为回归锁定）。
+    const dirty = '<img src=x y=a=" onerror=alert(1)>'
+    const target = '<img title="see onerror=x" src="y">'
+    const clean = sanitizeDecodedHtml(target)
+    sanitizeDecodedHtml(dirty)
+    assertEqual(sanitizeDecodedHtml(target), clean, `泄漏输入之后的输出应与干净态一致: ${sanitizeDecodedHtml(target)}`)
+  })
+
+  await test('sanitizeDecodedHtml 输入自带占位符字符被剥离（P2-06：防伪造占位符）', () => {
+    // U+0001/U+0002 是内部占位符字符；输入自带时会在还原阶段注入 undefined 或复读被保护属性文本。
+    for (const h of ['价格\u00010\u0001元', '<a title="T">x\u00010\u0001y</a>', 'a\u0002b']) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(r.includes('undefined'), false, `不应注入 undefined: ${JSON.stringify(h)} → ${JSON.stringify(r)}`)
+      assertEqual(/[\u0001\u0002]/.test(r), false, `不应残留占位符字符: ${JSON.stringify(r)}`)
+    }
+  })
+
+  await test('sanitizeDecodedHtml 未闭合引号主动标签不回溯（P1-03：引号分支歧义收紧）', () => {
+    // `<iframe` + 重复引号且无 `>`：字符分支含引号时与两个引号串分支歧义，逐位回溯呈指数级
+    // （40 个引号实测 3.6s、47 个 >100s）。收紧字符类后应即时返回。
+    const input = '<iframe' + '"'.repeat(40)
+    const start = Date.now()
+    sanitizeDecodedHtml(input)
+    const cost = Date.now() - start
+    assertEqual(cost < 500, true, `未闭合引号主动标签应 <500ms，实际 ${cost}ms（P1-03 回溯复活）`)
+  })
+
+  await test('parseTime 带空白日期仍按 UTC 零点（P1-02：trim 后不落宿主本地时区）', () => {
+    // 未 trim 时 '2026-08-01 ' 落空所有锚定分支 → _parseFallback 宿主本地解析，
+    // 东八区得到 2026-07-31T16:00Z（天数差 1，pingbitime 边界误拦）；须与无空白形态同值。
+    const expect = new Date(Date.UTC(2026, 7, 1)).getTime()
+    assertEqual(daysComputed('2026-08-01'), 44, '基准：无空白日期天数')
+    for (const v of ['2026-08-01 ', ' 2026-08-01', '2026-08-01\n', '2026-08-01\t', '2026/08/01 ']) {
+      assertEqual(daysComputed(v), 44, `带空白日期应按 UTC 零点解析: ${JSON.stringify(v)}`)
+    }
+    // 数字类型不受 trim 影响（String(number) 本无空白）
+    assertEqual(daysComputed(1755300000), daysComputed('1755300000'), '数字与字符串时间戳口径一致')
+    assertEqual(expect, new Date(Date.UTC(2026, 7, 1)).getTime(), 'UTC 零点常量自检')
+  })
+
+  await test('parseTime 全空白字符串 → 无效（P1-02：trim 后空串返回 null）', () => {
+    assertEqual(daysComputed('   '), 0, '全空白应视为无效日期')
+    assertEqual(daysComputed('\t\n'), 0, '全空白应视为无效日期')
+  })
+
   // ==================== 真实数据形态性能基准（v3.260：v3.251 长 href ReDoS 教训） ====================
   // 覆盖真实接口 content_html 的各类触发形态——修复前这些数据会让 sanitizeDecodedHtml 同步卡死
   // （单条正则快、组合真实数据才炸——基准数据必须用真实形态才能抓到这类雷）

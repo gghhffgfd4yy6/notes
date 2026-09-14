@@ -18,6 +18,10 @@ const MAX_CODE_POINT = 0x10FFFF // Unicode 最大码点
 const SURROGATE_LO = 0xD800 // 代理区起点
 const SURROGATE_HI = 0xDFFF // 代理区终点
 const DEFAULT_MAX_SIZE = 10000 // 缓存默认上限（v3.120：100 → 10000）
+// P2-01 修复：_protectAttrPairs 逐属性对判断「是否在标签内」时的回扫上限。属性对可达数万，
+// 逐个无上限回扫是 O(n²)（100k 实测 4.2s）；正常标签远短于该值，超限按不在标签内处理
+// （只多删文本，不放行事件属性）。
+const ATTR_TAG_SCAN_MAX = 4096
 // 状态/哈希文件体积上限：alert.state/report.state/filter.hash 均为数百字节级小文件，
 // 强制大小上限防止异常膨胀文件被整读入内存（readSafeTextResult 的 maxBytes 兜底）。
 const STATE_TEXT_MAX_BYTES = 64 * 1024
@@ -119,6 +123,13 @@ function createUtils (options = {}) {
     if (time === undefined || time === null || time === '') return null
     let s
     try { s = String(time) } catch (e) { return null } // v3.108 fuzz：嵌套 Symbol 数组 String() 崩 → 无效
+    // P1-02：字符串输入先 trim——带前后空白的无时区日期会落空下方显式分支，进入宿主本地时区解析，
+    // 违背「无时区日期按 UTC」契约（TZ=Asia/Shanghai 实测天数差 1）；trim 后为空串按无效处理。
+    // 数字类型不受影响（String(number) 本无空白）。
+    if (typeof time === 'string') {
+      s = s.trim()
+      if (s === '') return null
+    }
     // 纯数字：8 位日期优先于时间戳（20260731 是日期不是时间戳）
     // 数字类型（含 -1 等负值）也走数字分支——负值/范围外在下方统一判无效，
     // 避免掉进宿主解析被 new Date('-1') 解析成 2001-01-01（审查5-2 锁定）
@@ -422,10 +433,14 @@ function createUtils (options = {}) {
   // v3.260：判断 pos 是否位于 HTML 标签内（线性回扫，尊重引号属性）
   // 引号内 > 不算标签结束（`<a title=">" href=...` 的 > 是属性值）；
   // 未引号的 > 标签已结束；< 即标签开始；越界视为普通文本。
-  _isInHtmlTag (html, pos) {
+  // maxScan（可选）：回扫长度上限。P2-01 修复的调用点逐属性对回调本函数，无上限时在
+  // 长纯文本/超长标签上呈 O(n²)（100k 实测 4.2s，修复前 28ms）；超限按「不在标签内」处理
+  // ——宁可少保护（多删文本）也不放行事件属性，方向安全。其他调用点不传即保持原语义。
+  _isInHtmlTag (html, pos, maxScan) {
     let i = pos - 1
+    const stop = typeof maxScan === 'number' ? Math.max(-1, pos - 1 - maxScan) : -1
     let quote = ''
-    while (i >= 0) {
+    while (i > stop) {
       const ch = html[i]
       if (quote) {
         if (ch === quote) quote = ''
@@ -467,7 +482,9 @@ function createUtils (options = {}) {
     if (html.length > 100000) html = html.slice(0, 100000)
     // HTML tokenizer 将 NUL 替换为 U+FFFD；先移除可被用来拆散属性名的 NUL，
     // 让 `on\u0000error` 收敛为 `onerror` 后进入统一事件属性清理。
-    html = html.replace(safeRe('\\u0000', 'g'), '')
+    // P2-06：U+0001/U+0002 是内部占位符字符，输入自带时会伪造占位符（还原为 undefined 或复读属性文本）；
+    // 占位符在替换之后才生成，入口一次性剥离不影响内部机制。
+    html = html.replace(safeRe('[\\u0000-\\u0002]', 'g'), '')
     html = this.sanitizeHtmlUrls(html)
     // 成对和未闭合的主动标签都处理；不再做全局引号保护——全局引号保护会把文本中的
     // "<iframe src=x>" 也保护为占位符，导致文本中的真实主动标签漏网（验证 agent 复核发现）。
@@ -499,7 +516,11 @@ function createUtils (options = {}) {
       }
     }
     return out
-      .replace(safeRe('<(?:script|style|iframe|object|embed|svg|math)\\b(?:[^<>]|"[^"]*"|\'[^\']*\')*>', 'gi'), '')
+      // P1-03：字符分支原先含引号（[^<>]），与两个引号串分支对同一个引号存在歧义分支，
+      // 匹配失败时逐位回溯呈指数级（`<iframe` + 40 个引号实测 3.6s，47 个 >100s）。
+      // 收紧为同时排除双引号(\x22)与单引号(\x27)后每字符只有一个分支可选，保持线性；
+      // 两个引号串分支不变，srcdoc 等跨尖括号的引号值仍被整段匹配。
+      .replace(safeRe('<(?:script|style|iframe|object|embed|svg|math)\\b(?:[^<>\\x22\\x27]|"[^"]*"|\'[^\']*\')*>', 'gi'), '')
       .replace(safeRe('<\\/(?:script|style|iframe|object|svg|math)\\s*>', 'gi'), '')
       .replace(safeRe('<(?:base|link|meta)\\b[^<>]*>', 'gi'), '')
   },
@@ -530,13 +551,19 @@ function createUtils (options = {}) {
       const seg = this._attrSegAt(html, attrM, valueStart)
       if (seg === null) {
         // 无闭合引号：本处及之后不再有可完整保护的属性对，剩余原样保留（与原正则无匹配一致）
+        attrValueRe.lastIndex = 0 // P2-02：该正则取自 safeRe 全局缓存且带 g，break 前不复位会污染下一次调用
         attrOut += html.slice(attrPos)
         attrPos = html.length
         break
       }
       const segText = html.slice(seg.segStart, seg.closeEnd)
-      // on* 事件属性不保护（留待下一步清洗）；其余属性对整体保护
-      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name)) {
+      // on* 事件属性不保护（留待下一步清洗）；其余属性对整体保护。
+      // P2-01 P1(安全)：仅保护「标签内 + 合法属性边界」的属性对——纯文本里的 name="…" 或
+      // 未加引号值内的引号（`<img alt=a=" onerror="alert(1)">` 的 alt 值 `a=`）会把段内
+      // 存活的 on* 一并占位，使 _stripEventAttrs 失效。非法形态走与 on* 相同的原样保留分支
+      // （下方 else），照旧推进 attrPos/lastIndex，避免死循环。
+      const atBoundary = seg.segStart === 0 || /[\s/<>"']/.test(html[seg.segStart - 1])
+      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name) && atBoundary && this._isInHtmlTag(html, attrM.index, ATTR_TAG_SCAN_MAX)) {
         attrStore.push(segText)
         attrOut += html.slice(attrPos, seg.segStart) + '\u0001' + (attrStore.length - 1) + '\u0001'
       } else {
@@ -747,7 +774,7 @@ function createUtils (options = {}) {
           this.safeGet(message, 'catename'),
           this.safeGet(message, 'louzhu')
         )
-        // 自内容哈希须与 id 一致，且非「全空字段退化键」(anon:1505) 才视为历史匿名合成键
+        // 自内容哈希须与 id 一致，且非「全空字段退化键」(anon:1505cde7) 才视为历史匿名合成键
         if (selfAnon !== this.anonKey() && selfAnon === idKey) {
           return { valid: true, kind: 'anon', key: idKey, idKey: '', url: '', anonKey: idKey }
         }
@@ -768,7 +795,7 @@ function createUtils (options = {}) {
       this.safeGet(message, 'catename'),
       this.safeGet(message, 'louzhu')
     )
-    // 全字段为空时 anonKey 哈希空串退化为固定键(anon:1505)，会使所有此类消息判为同一身份而互相吞掉。
+    // 全字段为空时 anonKey 哈希空串退化为固定键(anon:1505cde7)，会使所有此类消息判为同一身份而互相吞掉。
     // 退化为无效身份，让每条无标识消息各自独立、不再参与匿名判重。
     if (anon === this.anonKey()) return { valid: false, kind: 'invalid', key: '', idKey: '', url: '' }
     return { valid: true, kind: 'anon', key: anon, idKey: '', url: '', anonKey: anon }
