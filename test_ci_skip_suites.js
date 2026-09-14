@@ -445,10 +445,14 @@ try {
 // 3g2 失败原因必须落到输出（RT-02）：静默非零（exit 7）与被信号杀死（SIGKILL）在修复前都只有一行
 //     「❌ … 失败」，两者无法区分；现要求 status / signal 进输出。
 const diagDir = makeRunTestsSandbox(
-  [{ name: '静默非零', file: 'test_stub_exit7.js', desc: '不输出即 exit 7' },
-    { name: '信号击杀', file: 'test_stub_sigkill.js', desc: '被 SIGKILL 杀死' }],
-  { 'test_stub_exit7.js': 'process.exit(7)\n',
-    'test_stub_sigkill.js': "process.kill(process.pid, 'SIGKILL')\n" }
+  [
+    { name: '静默非零', file: 'test_stub_exit7.js', desc: '不输出即 exit 7' },
+    { name: '信号击杀', file: 'test_stub_sigkill.js', desc: '被 SIGKILL 杀死' }
+  ],
+  {
+    'test_stub_exit7.js': 'process.exit(7)\n',
+    'test_stub_sigkill.js': "process.kill(process.pid, 'SIGKILL')\n"
+  }
 )
 try {
   const diag = runRunTestsIn(diagDir)

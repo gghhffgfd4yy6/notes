@@ -30,7 +30,7 @@ const { generateMutants, extractTestSummary, collectMutants } = require('./run_m
   assert.strictEqual(m4[0].original, 'true')
   assert.strictEqual(m4[0].replacement, 'false')
   // review F10：true/false 移出 OPS 后走完整标识符分支，kind 由 'operator' 修正为 'boolean'
-  //（此前 'boolean' 分支永远不可达，且 trueCount 一类标识符会被 startsWith 改名）。
+  // （此前 'boolean' 分支永远不可达，且 trueCount 一类标识符会被 startsWith 改名）。
   assert.strictEqual(m4[0].kind, 'boolean')
 
   // ===== generateMutants：布尔标识符边界（review F10） =====
@@ -80,6 +80,7 @@ const { generateMutants, extractTestSummary, collectMutants } = require('./run_m
   // ===== generateMutants：模板串 ${} 内是代码（review F2） =====
   // 模板文本要跳过，但 ${...} 内是代码；且模板可嵌套（xbk_app.js:1442 的 `${x ? `${a}/${b}` : 'n/a'}`），
   // 内层反引号不得把词法状态带偏。
+  /* eslint-disable no-template-curly-in-string -- 夹具字符串必须原样包含 ${} 模板占位符才能验证词法状态机 */
   assert.strictEqual(generateMutants('test.js', 'const s = `a < b`').length, 0, '模板文本中的运算符不应生成变异')
   const mSubst = generateMutants('test.js', 'const s = `v=${a === b}`')
   assert.strictEqual(mSubst.length, 1, '${} 内的 === 应生成变异')
@@ -90,6 +91,7 @@ const { generateMutants, extractTestSummary, collectMutants } = require('./run_m
   assert.strictEqual(generateMutants('test.js', 'const o = `v=${({ a: 1 }).a && b}`').length, 1,
     '${} 内对象字面量的花括号应配平，&& 应生成变异')
   const mAfterTemplate = generateMutants('test.js', 'const s = `v=${a}`\nconst t = x === y')
+  /* eslint-enable no-template-curly-in-string */
   assert.strictEqual(mAfterTemplate.length, 1, '模板串之后的代码区变异点不得丢失')
   assert.strictEqual(mAfterTemplate[0].line, 2, '应定位到模板之后的第 2 行')
 
