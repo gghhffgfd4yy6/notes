@@ -53,13 +53,16 @@ for (const f of reportFiles) {
   try {
     const d = readReportJson(f)
     if (!d || typeof d !== 'object' || Array.isArray(d)) throw new Error('报告顶层不是 JSON 对象')
+    // PR 评审 #140：files 缺失本身是结构不完整（截断/半写产物），不能当成「空报告」静默放行
+    if (!d.files || typeof d.files !== 'object' || Array.isArray(d.files)) throw new Error('报告缺少 files 对象')
     const counts = {}
     const survivors = []
-    for (const [file, info] of Object.entries(d.files || {})) {
-      if (!info || typeof info !== 'object') throw new Error(`files[${file}] 不是对象`)
+    for (const [file, info] of Object.entries(d.files)) {
+      if (!info || typeof info !== 'object' || Array.isArray(info)) throw new Error(`files[${file}] 不是对象`)
+      if (!Array.isArray(info.mutants)) throw new Error(`files[${file}].mutants 不是数组`)
       const fileKey = file.split('/').pop()
       if (!counts[fileKey]) counts[fileKey] = {}
-      for (const m of info.mutants || []) {
+      for (const m of info.mutants) {
         if (!m || typeof m !== 'object') throw new Error(`files[${file}].mutants 含非对象元素`)
         counts[fileKey][m.status] = (counts[fileKey][m.status] || 0) + 1
         if (m.status === 'Survived') { // NoCoverage 有独立计数，不混入存活（机器人审查）
