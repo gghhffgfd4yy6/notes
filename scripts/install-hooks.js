@@ -57,7 +57,9 @@ function verifyHooks (dir) {
     const file = path.join(dir, name)
     if (isExecutable(file)) return false
     try {
-      fs.chmodSync(file, 0o755)
+      // 0o700：钩子只需属主可读可执行（git 以属主身份运行钩子）。不用 0o755——
+      // 组/其他用户可读可执行对本仓库钩子没有必要，且会被 Sonar S2612 判为过宽权限。
+      fs.chmodSync(file, 0o700)
     } catch (e) {
       // chmod 失败不单独报错，交由下方复检统一给出结论与指引
     }
