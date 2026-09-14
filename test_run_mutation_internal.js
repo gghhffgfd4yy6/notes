@@ -9,7 +9,8 @@ const {
   lineColumn, isIdentStart, isIdentPart,
   lineTriple, numberBefore, numberAfter,
   mapLimit, saveCheckpoint, loadCheckpoint,
-  copyProject, linkNodeModules, applyMutants
+  copyProject, linkNodeModules, applyMutants,
+  generateMutants, positiveIntEnv
 } = require('./run_mutation')
 
 let pass = 0
@@ -99,6 +100,30 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
     assert.deepStrictEqual(r, ['3', '1', '4'])
   })
 
+  // ===== positiveIntEnv（review F9）=====
+  console.log('\n--- positiveIntEnv ---')
+  await check('未设置/空串回落默认值', () => {
+    delete process.env.XBK_TEST_POSITIVE_INT
+    assert.strictEqual(positiveIntEnv('XBK_TEST_POSITIVE_INT', 50), 50)
+    process.env.XBK_TEST_POSITIVE_INT = ''
+    assert.strictEqual(positiveIntEnv('XBK_TEST_POSITIVE_INT', 50), 50)
+    delete process.env.XBK_TEST_POSITIVE_INT
+  })
+  await check('正整数原样返回', () => {
+    process.env.XBK_TEST_POSITIVE_INT = '7'
+    assert.strictEqual(positiveIntEnv('XBK_TEST_POSITIVE_INT', 50), 7)
+    delete process.env.XBK_TEST_POSITIVE_INT
+  })
+  await check('负值/零/小数/非数字回落默认值（不按非法值运行）', () => {
+    // MUTATION_BATCH=-1 会让批次循环 i += batchSize 反向递增并无限 push（OOM）；
+    // MUTATION_CONCURRENCY=-1 会让 mapLimit 零并发空转。非法值必须回落默认值并告警。
+    for (const bad of ['-1', '0', '1.5', 'abc', 'NaN', 'Infinity']) {
+      process.env.XBK_TEST_POSITIVE_INT = bad
+      assert.strictEqual(positiveIntEnv('XBK_TEST_POSITIVE_INT', 50), 50, `${bad} 应回落默认值`)
+    }
+    delete process.env.XBK_TEST_POSITIVE_INT
+  })
+
   // ===== mapLimit =====
   console.log('\n--- mapLimit ---')
   async function trackConcurrency (limit, count) {
@@ -126,6 +151,10 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
   await check('limit 大于 items 长度', async () => {
     const r = await mapLimit([1, 2], 10, async (x) => x + 1)
     assert.deepStrictEqual(r, [2, 3])
+  })
+  await check('limit<1 抛错（不得静默零并发空转，review F9）', async () => {
+    await assert.rejects(() => mapLimit([1, 2], 0, async (x) => x), /并发度必须是正整数/)
+    await assert.rejects(() => mapLimit([1, 2], -1, async (x) => x), /并发度必须是正整数/)
   })
 
   // ===== saveCheckpoint / loadCheckpoint =====
@@ -249,6 +278,36 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       applyMutants(projDir, mutants)
       const modified = fs.readFileSync(fixture, 'utf8')
       assert.strictEqual(modified, 'x || y || z', '两个 && 都应被替换')
+    })
+    await check('applyMutants 同偏移候选只套用一个（review F3，不产出第三种代码）', () => {
+      // '<' 会在同一 [2,3) 生成两个候选（'<=' 与 '>'）。逐条套用会把两个都写进去：
+      // 'a < b' → 'a >= b'（既非原码也非任一变异），'if (a<=b)' → 'if (a>)'（语法错）。
+      const fixture = path.join(projDir, 'fixture3.js')
+      fs.writeFileSync(fixture, 'a < b', 'utf8')
+      const mutants = [
+        { file: 'fixture3.js', start: 2, end: 3, original: '<', replacement: '<=', id: 1 },
+        { file: 'fixture3.js', start: 2, end: 3, original: '<', replacement: '>', id: 2 }
+      ]
+      applyMutants(projDir, mutants)
+      const modified = fs.readFileSync(fixture, 'utf8')
+      assert.ok(modified === 'a <= b' || modified === 'a > b',
+        `同偏移只应套用一个候选，实际 ${JSON.stringify(modified)}`)
+      assert.notStrictEqual(modified, 'a >= b', '不得同时套用两个同偏移候选（产出第三种代码）')
+    })
+    await check('applyMutants 真实 generateMutants 候选全量套用后仍是合法单变异（review F3）', () => {
+      // 报告建议口径：'a <= b' 的全部候选套用后，输出必须等于「原码套用其中一个候选」。
+      const fixture = path.join(projDir, 'fixture4.js')
+      const source = 'if (a<=b) { c() }'
+      fs.writeFileSync(fixture, source, 'utf8')
+      const mutants = generateMutants('fixture4.js', source)
+      assert.ok(mutants.length >= 2, '同一 [start,end) 应生成两个候选')
+      assert.strictEqual(new Set(mutants.map(m => `${m.start}:${m.end}`)).size, 1, 'fixture 的候选应同偏移')
+      applyMutants(projDir, mutants)
+      const modified = fs.readFileSync(fixture, 'utf8')
+      assert.ok(modified === 'if (a<b) { c() }' || modified === 'if (a>b) { c() }',
+        `全量套用后应是合法单变异，实际 ${JSON.stringify(modified)}`)
+      // eslint-disable-next-line no-new-func -- 只是解析校验套用后的源码语法，不执行
+      assert.doesNotThrow(() => new Function(modified), '套用后的源码语法应合法')
     })
   } finally {
     fs.rmSync(projDir, { recursive: true, force: true })

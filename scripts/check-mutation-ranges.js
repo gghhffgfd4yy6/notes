@@ -111,10 +111,16 @@ for (const entry of matrixEntries) {
   fileRanges.get(file).push({ start, end })
 }
 
+// 「生产文件」的判定口径：运行时加载链上的模块，必须全部是 mutate 目标（缺一即漏测，审查 F-01）。
+// 根目录 xbk_*.js 与 qinglong/xbk_push.js 是运行时模块/入口；scripts/status.js 被
+// qinglong/xbk_push.js 顶层无条件 require（--status 诊断与常驻入口都会加载），此前漏列使本门禁与
+// stryker.config.js 对同一份缺口双向对账假绿（实测 exit 0）；scripts/check-deps.js 仅是测试入口
+// run_tests.js 的预检，按历史口径一并保留在此清单中。
 const productionFiles = [
   ...fs.readdirSync(root).filter(file => /^xbk_.*\.js$/.test(file)),
   'qinglong/xbk_push.js',
-  'scripts/check-deps.js'
+  'scripts/check-deps.js',
+  'scripts/status.js'
 ]
 
 // 失败收敛点：直接运行（node scripts/check-mutation-ranges.js）时按 code process.exit，保证 CI /
