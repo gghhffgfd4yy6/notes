@@ -1249,6 +1249,7 @@ function createApp ({
         // APP2-07：stdout 回显专用的控制字符清洗（U+0000–U+001F、U+007F → 空格）——青龙任务日志
         // 按行解析，接口返回的 title/catename 含 \n 或 ANSI ESC 可伪造日志行；推送正文不经此函数
         // （safeText 不动，推送内容保留换行）。
+        // eslint-disable-next-line no-control-regex -- 控制字符清洗本身就需要匹配控制字符（白名单式替换）
         const stripLogControl = (text) => text.replace(/[\u0000-\u001F\u007F]/g, ' ')
         const itemLogText = (item, field, fallback = '') => {
           const text = Utils.safeText(readItemField(item, field), fallback)
