@@ -6,7 +6,8 @@
 // 复用同一套正则与校验函数，逐字断言合法/非法 tag 集合——测试与 workflow 同源，防止语义再漂移。
 // 定位一律按**内容**：全文扫描 `[[ "$VERSION" =~ … ]]` 断言（不只看第一处），命中行的行号由命中下标
 // 现算、并把该行原文打进诊断信息，故本文件任何地方都不写死 release.yml 行号——workflow 增删行
-// （加步骤、改注释）不会让锚点或诊断失真。
+// （加步骤、改注释）不会让锚点或诊断失真。每一处命中还须处于 `!` 取反形态（`if ! [[ … ]]`），
+// 见 isNegatedAt（#138 review Qodo #3：锚点放宽后「把取反写成正向」的语义反转一度无人拦）。
 // 运行方式：node test_tag_validator.js（exit 0 = 通过）。
 const assert = require('node:assert')
 const fs = require('node:fs')
@@ -25,6 +26,23 @@ function describeAt (index) {
   const lineNo = releaseYml.slice(0, index).split('\n').length
   return `release.yml 第 ${lineNo} 行「${releaseYml.split('\n')[lineNo - 1].trim()}」`
 }
+
+// 取反形态判定（#138 review Qodo #3）：该断言必须写成 `if ! [[ "$VERSION" =~ … ]]`。
+// 上一提交把锚点从「带 ! 的旧正则」放宽为不要求 !，于是「把取反写成正向条件」这种**语义反转**
+// （合法 tag 被拒、畸形 tag 反而放行）本测试发现不了——文本层面只差一个 `!`，逐字同源断言毫无察觉。
+// 判定同样不写死行号：取命中下标所在行、`[[` 之前的那段前缀，要求它以 `!`（作用于紧随命令的取反算子）
+// 收尾——`if ! [[ … ]]`、`elif ! [[ … ]]`、`&& ! [[ … ]]` 均成立，而正向条件 `if [[ … ]]` 命中即红。
+function isNegatedAt (index) {
+  const lineStart = releaseYml.lastIndexOf('\n', index) + 1
+  return /(?:^|\s)!\s*$/.test(releaseYml.slice(lineStart, index))
+}
+
+// 处数完备性：锚点只认 `[[ "$VERSION" =~ …`，故另一种取反写法 `if [[ ! "$VERSION" =~ … ]]`
+// （`!` 挪进 `[[` 之内）会让该处**从 versionAsserts 里消失**，逐处断言静默少校验一处。
+// 这里用与 `!` 位置无关的独立计数锚核对：每一处 `"$VERSION" =~` 判断都必须落在锚点扫描内。
+const versionTildeCount = [...releaseYml.matchAll(/"\$VERSION"\s*=~/g)].length
+assert.strictEqual(versionTildeCount, versionAsserts.length,
+  'release.yml 里每一处 `"$VERSION" =~` 判断都必须落在 `[[ "$VERSION" =~ … ]]` 锚点内，不得有绕开逐处校验的写法')
 const scriptSource = SEMVER_RE.source
 // 处数口径：**至少 1 处 + 每一处都与 SEMVER_RE 逐字同源**，而不是「恰好 1 处」：
 //   ① 本断言的价值是「CI 里判定 tag 的每一处正则都与脚本同源」。同源的重复断言（将来另一个 job/步骤
@@ -34,6 +52,10 @@ const scriptSource = SEMVER_RE.source
 //      失败，即「release.yml 中该断言的集合与脚本正则同源」被完整强制，不会静默只校验第一处。
 for (const { index, bashRegexSource } of versionAsserts) {
   const where = describeAt(index)
+  // 先钉取反形态再比正则：丢掉 `!` 是**语义反转**，且文本层面只差一个字符，
+  // 逐字同源断言对它完全无感（#138 review Qodo #3）。
+  assert.ok(isNegatedAt(index),
+    `${where} 的 =~ 判断必须处于取反形态（if ! [[ "$VERSION" =~ … ]]）：写成正向条件会反转判定语义——合法 tag 被拒、畸形 tag 反而放行`)
   // 归一化：bash 正则的 `$` 与脚本 `/.../` 字面等价，故连 `^...$` 边界一起逐字比对
   assert.ok(bashRegexSource.startsWith('^') && bashRegexSource.endsWith('$'),
     `${where} 的 semver 正则应有 ^...$ 边界`)
@@ -202,13 +224,50 @@ const pkgBase = pkgCore.split('.').slice(0, 2).join('.')
 
 // ① notes 必须包含 CHANGELOG 的要点正文，不能只有标题行
 //    （回归点：match 正则带 'm' 时结尾的 $ 在行尾成立 → 惰性匹配止于标题行）
-const notesRun = runBlock(extractRunBlock(releaseYml, '提取 Release Notes'), pkgBase,
+const notesBlock = extractRunBlock(releaseYml, '提取 Release Notes')
+const notesRun = runBlock(notesBlock, pkgBase,
   { 'CHANGELOG.md': fs.readFileSync('CHANGELOG.md', 'utf8') })
 assert.strictEqual(notesRun.status, 0, 'notes 提取应成功（stderr: ' + notesRun.stderr + '）')
 assert.ok(notesRun.notes && notesRun.notes.startsWith('## v' + pkgBase),
   'Release Notes 应以 ## v' + pkgBase + ' 开头，实际: ' + JSON.stringify(notesRun.notes))
 assert.ok(String(notesRun.notes).split('\n').filter(l => l.startsWith('- ')).length > 0,
   'Release Notes 必须含 CHANGELOG 要点正文（行首 -），不能只有标题行；实际: ' + JSON.stringify(notesRun.notes))
+
+// ①' 章节边界「诱饵」夹具（#138 review Qodo #1）：
+// 上面 ① 只用仓库真实 CHANGELOG.md，而真实文件里没有三位标题，于是 notes 步骤那个专为拒绝
+// 「base=3.272 误命中三位标题 ## v3.272.1」而加的 `(?![.][0-9])` 边界即使被删掉/削弱，① 照样绿——
+// 「取错章节」这件事本测试发现不了。下面两个夹具把这层边界钉死。标题按 package.json 现算成
+// `## v<base>.1`（不写死 3.272，仓库升版后夹具自动跟随；与 ① 的 pkgBase 口径一致）：
+//   夹具 A：三位标题出现在目标两段标题**之前**，内容故意不同 → 必须取到两段那一节、且不混入诱饵正文；
+//   夹具 B：只有三位标题、没有两段标题 → 必须 fail-loud（非零退出 + 报「未找到 ## v<base> 章节」），
+//          而不是静默把三位标题那一节当成本版正文发出去。
+const decoyTitle = '## v' + pkgBase + '.1'
+const realTitle = '## v' + pkgBase
+const decoyBody = '- 三位标题节的诱饵要点（绝不能进入 Release Notes）'
+const realBody = '- 两段标题节的要点正文'
+const decoyBefore = runBlock(notesBlock, pkgBase, {
+  'CHANGELOG.md': [
+    '# Changelog', '', decoyTitle, '', decoyBody, '',
+    realTitle, '', realBody, '',
+    '## v0.0', '', '- 更早一节', ''
+  ].join('\n')
+})
+assert.strictEqual(decoyBefore.status, 0, '夹具 A 应成功（stderr: ' + decoyBefore.stderr + '）')
+assert.ok(decoyBefore.notes && decoyBefore.notes.startsWith(realTitle),
+  '夹具 A：三位标题在前时 notes 仍须以「' + realTitle + '」开头（不得取错节），实际: ' + JSON.stringify(decoyBefore.notes))
+assert.ok(String(decoyBefore.notes).includes(realBody), '夹具 A：notes 必须含两段标题节的正文')
+assert.ok(!String(decoyBefore.notes).includes(decoyBody),
+  '夹具 A：notes 不得混入三位标题节的内容，实际: ' + JSON.stringify(decoyBefore.notes))
+
+const decoyOnly = runBlock(notesBlock, pkgBase, {
+  'CHANGELOG.md': ['# Changelog', '', decoyTitle, '', decoyBody, ''].join('\n')
+})
+assert.notStrictEqual(decoyOnly.status, 0,
+  '夹具 B：CHANGELOG 只有三位标题时 notes 步骤必须 fail-loud（非零退出），实际 exit ' + decoyOnly.status +
+  '（产出: ' + JSON.stringify(decoyOnly.notes) + '）')
+assert.ok(String(decoyOnly.stderr).includes('未找到 ## v' + pkgBase + ' 章节'),
+  '夹具 B：应报「未找到 ## v' + pkgBase + ' 章节」，实际 stderr: ' + JSON.stringify(decoyOnly.stderr))
+assert.strictEqual(decoyOnly.notes, null, '夹具 B：fail-loud 时不得写出 release-notes.md')
 
 // ② tag 漂移闸门：逐段一致才放行（覆盖 package.json 补丁段非 0 的两个失效方向）
 const gateBlock = extractRunBlock(releaseYml, '校验 tag 与 package.json 版本一致')
@@ -228,4 +287,4 @@ for (const c of gateCases) {
     'package.json=' + c.version + ' + tag v' + c.tag + ' 应 exit ' + c.expect + '（' + c.why + '），实际 ' + res.status + '（stderr: ' + res.stderr + '）')
 }
 
-console.log('✅ release.yml 步骤级回归通过：notes 含要点正文；闸门 ' + gateCases.length + ' 组用例全部符合预期')
+console.log('✅ release.yml 步骤级回归通过：notes 含要点正文 + 章节边界诱饵夹具 2 组；闸门 ' + gateCases.length + ' 组用例全部符合预期')
