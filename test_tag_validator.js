@@ -1,28 +1,46 @@
 'use strict'
 
 // release.yml 的 tag semver 校验回归测试（#131 qodo #8）。
-// release.yml 的「校验 tag 版本号格式（semver）」步骤用 bash 内联正则（位于
-// .github/workflows/release.yml 第 43 行）判定 v* tag 是否合法；sourcery 已修复该正则
-// （禁止前导零、禁止空后缀组件），但当时无自动化测试固化。本套件从 scripts/validate-release-tag.js
+// release.yml 的「校验 tag 版本号格式（semver）」步骤用 bash 内联正则判定 v* tag 是否合法；sourcery
+// 已修复该正则（禁止前导零、禁止空后缀组件），但当时无自动化测试固化。本套件从 scripts/validate-release-tag.js
 // 复用同一套正则与校验函数，逐字断言合法/非法 tag 集合——测试与 workflow 同源，防止语义再漂移。
+// 定位一律按**内容**：全文扫描 `[[ "$VERSION" =~ … ]]` 断言（不只看第一处），命中行的行号由命中下标
+// 现算、并把该行原文打进诊断信息，故本文件任何地方都不写死 release.yml 行号——workflow 增删行
+// （加步骤、改注释）不会让锚点或诊断失真。
 // 运行方式：node test_tag_validator.js（exit 0 = 通过）。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const { SEMVER_RE, isValidVersion } = require('./scripts/validate-release-tag.js')
 
 // 双保险：脚本里的正则必须与 release.yml 步骤里 bash 内联的正则逐字一致（否则测试固化的不是
-// CI 实际运行的判断）。从 release.yml 提取 `=~ <正则>` 的 bash 正则体，归一化后比对。
+// CI 实际运行的判断）。从 release.yml 提取**全部** `[[ "$VERSION" =~ <正则> ]]` 断言（matchAll 全局
+// 扫描，不再只取第一处）后逐个比对。
 const releaseYml = fs.readFileSync('.github/workflows/release.yml', 'utf8')
-const match = releaseYml.match(/! \[\[ "\$VERSION" =~ (\^.+?\$) \]\]/, '')
-assert.ok(match, 'release.yml 应包含 semver 校验正则（=~ 判断）')
-// 归一化：bash 正则的 `$` 与脚本的 `/.../` 字面等价，去掉 bash 正则里的 `^...$` 边界做正则源比对
-const bashRegexSource = match[1]
-assert.ok(bashRegexSource.startsWith('^') && bashRegexSource.endsWith('$'),
-  'release.yml 的 semver 正则应有 ^...$ 边界')
+const VERSION_ASSERT_RE = /\[\[ "\$VERSION" =~ (\S+) \]\]/g
+const versionAsserts = [...releaseYml.matchAll(VERSION_ASSERT_RE)]
+  .map(m => ({ index: m.index, bashRegexSource: m[1] }))
+assert.ok(versionAsserts.length > 0, 'release.yml 应包含 semver 校验正则（=~ 判断）')
+// 诊断按内容定位：用命中下标现算行号 + 该行原文（不写死行号，release.yml 增删行也不失真）
+function describeAt (index) {
+  const lineNo = releaseYml.slice(0, index).split('\n').length
+  return `release.yml 第 ${lineNo} 行「${releaseYml.split('\n')[lineNo - 1].trim()}」`
+}
 const scriptSource = SEMVER_RE.source
-// bash 正则体里的 `\` 转义序列与 JS 正则源码字符串一致（都不含 / 分隔符转义）
-assert.strictEqual(scriptSource, bashRegexSource,
-  'scripts/validate-release-tag.js 的 SEMVER_RE 必须与 release.yml 的 bash 内联正则逐字一致')
+// 处数口径：**至少 1 处 + 每一处都与 SEMVER_RE 逐字同源**，而不是「恰好 1 处」：
+//   ① 本断言的价值是「CI 里判定 tag 的每一处正则都与脚本同源」。同源的重复断言（将来另一个 job/步骤
+//      复用同一判断、或把该步骤拆成两次断言）属合法演进，「恰好 1 处」会误伤，且报错会红在「处数」
+//      而不是「不同源」上，诊断指向错误的原因；
+//   ② 逐处 strictEqual 保证只要多出**任何一处不同源**的正则（形如 `$VERSION =~ <别的正则>`）就一定
+//      失败，即「release.yml 中该断言的集合与脚本正则同源」被完整强制，不会静默只校验第一处。
+for (const { index, bashRegexSource } of versionAsserts) {
+  const where = describeAt(index)
+  // 归一化：bash 正则的 `$` 与脚本 `/.../` 字面等价，故连 `^...$` 边界一起逐字比对
+  assert.ok(bashRegexSource.startsWith('^') && bashRegexSource.endsWith('$'),
+    `${where} 的 semver 正则应有 ^...$ 边界`)
+  // bash 正则体里的 `\` 转义序列与 JS 正则源码字符串一致（都不含 / 分隔符转义）
+  assert.strictEqual(scriptSource, bashRegexSource,
+    `${where}：scripts/validate-release-tag.js 的 SEMVER_RE 必须与 release.yml 的 bash 内联正则逐字一致`)
+}
 
 // ── 交集语法约束：逐字一致只防文本漂移，不防语义分叉 ──
 // bash ERE 与 JS RegExp 语法集合不同（\d \w \s \b \B \D \W \S 简写类、反向引用、(?= (?<= (?! (?<!
@@ -39,8 +57,10 @@ const FORBIDDEN_TOKENS = ['\\d', '\\w', '\\s', '\\b', '\\B', '\\D', '\\W', '\\S'
 for (const token of FORBIDDEN_TOKENS) {
   assert.ok(!scriptSource.includes(token),
     `SEMVER_RE 不得含 bash/JS 语义分歧写法 ${JSON.stringify(token)}（交集语法约束）`)
-  assert.ok(!bashRegexSource.includes(token),
-    `release.yml 的 bash 正则不得含 bash/JS 语义分歧写法 ${JSON.stringify(token)}（交集语法约束）`)
+  for (const { index, bashRegexSource } of versionAsserts) {
+    assert.ok(!bashRegexSource.includes(token),
+      `${describeAt(index)} 的 bash 正则不得含 bash/JS 语义分歧写法 ${JSON.stringify(token)}（交集语法约束）`)
+  }
 }
 
 // 数字反向引用（\1、\12 …）：上面 FORBIDDEN_TOKENS 用 includes 逐字匹配，覆盖不了「反斜杠+数字」
@@ -49,8 +69,10 @@ for (const token of FORBIDDEN_TOKENS) {
 // 用正则探测「反斜杠+数字」形态（含 \1..\9 与多位数）。
 const BACKREF_RE = /[\\][1-9][0-9]*/
 assert.ok(!BACKREF_RE.test(scriptSource), 'SEMVER_RE 不得含数字反向引用（\\1、\\12 等，bash/JS 语义分叉）')
-assert.ok(!BACKREF_RE.test(bashRegexSource),
-  'release.yml 的 bash 正则不得含数字反向引用（\\1、\\12 等，bash/JS 语义分叉）')
+for (const { index, bashRegexSource } of versionAsserts) {
+  assert.ok(!BACKREF_RE.test(bashRegexSource),
+    `${describeAt(index)} 的 bash 正则不得含数字反向引用（\\1、\\12 等，bash/JS 语义分叉）`)
+}
 
 // 上两条覆盖不到的真实分歧形态（#132 review 补充）：JS 专有转义、POSIX 字符类、GNU 扩展。
 // 与 FORBIDDEN_TOKENS 一样对「脚本正则源」和「release.yml 内联正则源」双向断言。
@@ -67,8 +89,10 @@ const FORBIDDEN_PATTERNS = [
 for (const { re, desc } of FORBIDDEN_PATTERNS) {
   assert.ok(!re.test(scriptSource),
     `SEMVER_RE 不得含 ${desc}（交集语法约束）`)
-  assert.ok(!re.test(bashRegexSource),
-    `release.yml 的 bash 正则不得含 ${desc}（交集语法约束）`)
+  for (const { index, bashRegexSource } of versionAsserts) {
+    assert.ok(!re.test(bashRegexSource),
+      `${describeAt(index)} 的 bash 正则不得含 ${desc}（交集语法约束）`)
+  }
 }
 
 // 合法 tag 集合（语义：v数字.数字[.数字][-prerelease][+build]；禁止前导零；后缀组件非空）
