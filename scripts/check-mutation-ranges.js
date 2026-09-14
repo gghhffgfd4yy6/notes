@@ -13,7 +13,15 @@ const path = require('path')
 const root = path.resolve(__dirname, '..')
 // 环境注入用 ?? 而非 ||（#136 review F7）：夹具显式传空串时，|| 会静默回退去读真实 mutation.yml，
 // 把「空输入」变成假绿（实测旧实现 MUTATION_WORKFLOW_TEXT="" 时 exit 0，且校验的是真实文件）。
-const workflowPath = path.resolve(process.env.MUTATION_WORKFLOW_PATH ?? path.join(root, '.github/workflows/mutation.yml'))
+const workflowPathEnv = process.env.MUTATION_WORKFLOW_PATH
+// 空/仅空白的路径必须显式拦下：path.resolve('') = cwd，readFileSync(目录) 抛裸 EISDIR 堆栈（不可读），
+// 只报错、不回退真实路径——回退就违背「显式传空串」的用意（?? 语义见上）；失败收场照旧收敛到
+// exitIfDirectRun（直跑 exit 1、被 require 则 throw），与本文件其他提前退出一致。
+if (workflowPathEnv !== undefined && workflowPathEnv.trim() === '') {
+  console.error('❌ MUTATION_WORKFLOW_PATH 不能为空（应指向 mutation.yml；不设置才会读仓库默认路径）')
+  exitIfDirectRun(1)
+}
+const workflowPath = path.resolve(workflowPathEnv ?? path.join(root, '.github/workflows/mutation.yml'))
 const yml = process.env.MUTATION_WORKFLOW_TEXT ?? fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
 
 // matrix include 的唯一解析器：`- name:` / `- src:` / `- mutate:` 任一开头都算新条目，
@@ -71,6 +79,9 @@ if (includeIdx !== -1) {
 
 const fileRanges = new Map()
 const mutateTargets = new Set()
+// 全文件变异条目（mutate 不带 `:`）是合法写法，但它不参与下面的行段校验：必须显式提示，
+// 否则「矩阵里有这一条」会被读成「它的行段也被校验过了」（真实 mutation.yml 18 条里 15 条如此）。
+const fullFileTargets = new Set()
 // 格式非法的行段必须响亮失败（#136 review F1）：此前只无条件登记 mutateTargets、行段仅在
 // /^\d+-\d+$/ 命中时才登记，于是把「xbk_function_v3.js:1-426」写成「:1-42x」既不报错、也不进入
 // 逐文件校验循环 —— 该文件的行数/连续性/尾部检查被整段跳过，门禁照旧 exit 0（实测复现）。
@@ -87,7 +98,10 @@ for (const entry of matrixEntries) {
     continue
   }
   const range = segments[1]
-  if (range === undefined) continue // 完全不带行段 = 合法（按全文件变异处理）
+  if (range === undefined) { // 完全不带行段 = 合法（按全文件变异处理）
+    fullFileTargets.add(file)
+    continue
+  }
   if (!/^\d+-\d+$/.test(range)) {
     malformedRanges.push({ name: entry.name || file, mutate: entry.mutate })
     continue
@@ -122,8 +136,25 @@ for (const bad of malformedRanges) {
   failed = true
 }
 
-if (fileRanges.size === 0) {
-  console.error('❌ 未在 mutation.yml 中解析到任何 mutate 行段（格式应为 "file.js:start-end"）')
+// 全文件变异条目的提示（⚠️ 级，不改退出码）：它本身不是失败，只是把「哪些条目不参与行段校验」
+// 明说出来——否则下面的 ✅ 行段清单会被误读成「矩阵每一条都校验过行段」。
+if (fullFileTargets.size) {
+  console.warn(`⚠️ ${fullFileTargets.size} 个 mutate 目标未带行段（按全文件变异处理，不参与行段连续性/尾部校验）：${[...fullFileTargets].join(', ')}`)
+}
+
+// 早退守卫的真实意图：拦「解析压根没产出任何 mutate 目标」——矩阵为空、每条 mutate 都缺失、
+// 或 include 块解析失败，这些一律 fail-loud。判空条件因此必须与 fullFileTargets 联动，不能只看
+// fileRanges（#138 review）：「mutate 不带行段 = 全文件变异」已被本文件确立为合法写法（见上方
+// fullFileTargets），若这里仍写 `fileRanges.size === 0`，则「整份矩阵都是全文件条目」这种完全合法
+// 的形态必然 fileRanges 为空 → 被误报成「未解析到任何 mutate 行段」并 exit 1，与上方那条 ⚠️
+// 提示自相矛盾（真实矩阵 18 条里已有 15 条是全文件条目，一旦行段条目被删/改就会整轮误失败）。
+// 反向仍然成立、没有削弱：矩阵为空或所有条目 mutate 缺失/非法时 fullFileTargets 同样为空 →
+// 条件成立 → 照旧 exit 1 / throw；而 malformedRanges 的结算在其之前，非法行段路径不受影响。
+// 关键：早退之后的校验一条都没少（只拦「零目标」，其余照旧）——逐文件的行数/连续性/尾部校验
+// （fileRanges 循环）、productionFiles 是否都被列为 mutate 目标、条目 name/src/mutate 字段与
+// src-mutate 一致性、EXPECTED_SEGMENTS 段名（缺失/多余/重复）、stryker.config.js 与矩阵双向比对。
+if (fileRanges.size === 0 && fullFileTargets.size === 0) {
+  console.error('❌ 未在 mutation.yml 中解析到任何 mutate 行段（格式应为 "file.js:start-end"，或合法的全文件写法 "file.js"）')
   failed = true // 两条路径都记录失败；如何收场交给 exitIfDirectRun 决定
   exitIfDirectRun(1) // 两条路径都不返回：直接运行立即退出非零，require 路径抛错（fail-loud）
 }

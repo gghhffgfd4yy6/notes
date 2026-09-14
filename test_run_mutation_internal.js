@@ -9,7 +9,7 @@ const {
   lineColumn, isIdentStart, isIdentPart,
   lineTriple, numberBefore, numberAfter,
   mapLimit, saveCheckpoint, loadCheckpoint,
-  copyProject, applyMutants
+  copyProject, linkNodeModules, applyMutants
 } = require('./run_mutation')
 
 let pass = 0
@@ -182,6 +182,45 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       assert.ok(fs.existsSync(path.join(projDir, '.github/workflows/test.yml')), '.github/workflows/test.yml 应复制（test_ci_skip_suites.js 读取它与显式步骤对账）')
       const nmStat = fs.lstatSync(path.join(projDir, 'node_modules'))
       assert.ok(nmStat.isSymbolicLink(), 'node_modules 应为 symlink')
+    })
+    await check('linkNodeModules 来源根缺 node_modules 必抛错且不留悬空 symlink（自建临时目录，CI 亦必执行）', () => {
+      // 上一条用例把「缺依赖必抛错」交给本机是否 npm ci 决定：CI 在 npm ci 之后必然存在 node_modules，
+      // 那条 assert.throws 分支在 CI 中永不执行——删掉 run_mutation.js 的 throw，CI 依然全绿（不响亮的假绿）。
+      // 此处改从依赖注入点触发：来源根是自己造的临时目录（确实没有 node_modules），与 CI 是否装好依赖无关，
+      // 任何环境都会走到「必须抛错」这条分支，且断言覆盖「不能留下悬空 symlink」这一原始危害。
+      const noDepsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-nodeps-src-'))
+      const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-nodeps-dst-'))
+      try {
+        assert.throws(
+          () => linkNodeModules(linkDir, noDepsRoot),
+          /缺少 node_modules/,
+          '来源根缺 node_modules 时应抛错，而不是留下悬空 symlink（不响亮的假绿）'
+        )
+        // existsSync 跟随链接，悬空 symlink 同样返回 false——故必须用 lstatSync 确认「连条目都没有」
+        assert.throws(
+          () => fs.lstatSync(path.join(linkDir, 'node_modules')),
+          /ENOENT/,
+          '抛错须先于 symlinkSync：目标目录不得留下 node_modules 条目（含悬空链接）'
+        )
+      } finally {
+        fs.rmSync(noDepsRoot, { recursive: true, force: true })
+        fs.rmSync(linkDir, { recursive: true, force: true })
+      }
+    })
+    await check('linkNodeModules 来源根有 node_modules 时建出可用 symlink（注入点正向对照）', () => {
+      // 正向对照：证明来源根确实被采纳（若实现恒抛错或忽略 sourceRoot，本用例会失败）
+      const depsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-deps-src-'))
+      const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-deps-dst-'))
+      try {
+        fs.mkdirSync(path.join(depsRoot, 'node_modules'))
+        const link = linkNodeModules(linkDir, depsRoot)
+        assert.ok(fs.lstatSync(link).isSymbolicLink(), 'node_modules 应为 symlink')
+        // realpath 比对：两侧都取真实路径，规避 macOS /tmp → /private/tmp 一类系统级链接差异
+        assert.strictEqual(fs.realpathSync(link), fs.realpathSync(path.join(depsRoot, 'node_modules')), 'symlink 应指向来源根的 node_modules')
+      } finally {
+        fs.rmSync(depsRoot, { recursive: true, force: true })
+        fs.rmSync(linkDir, { recursive: true, force: true })
+      }
     })
     await check('copyProject 缺少调用方必选文件时抛错（固定清单加固回归）', () => {
       // 原实现遇缺失文件静默 continue，留下临时工程目录 MODULE_NOT_FOUND/ENOENT 的

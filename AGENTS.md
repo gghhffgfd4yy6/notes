@@ -8,7 +8,7 @@ xbk-push：个人青龙**单实例**线报推送脚本。
 - 破坏性 Git 操作前：`git bundle create backup.bundle --all && git bundle verify backup.bundle`；不得手动删除 `.git/objects`，清理使用 `git gc --prune=now`。
 - 修改后先验证再称完成；提交前至少运行受影响测试，常规改动跑 `npm test`。
 - 一次提交只做一件事；改版本时同步主文件头、`CHANGELOG.md`、`package.json`。
-- 推送前确认分支和远程；`origin`、`gitee` 均需推送。禁止浅克隆处理远程历史。
+- 推送前确认分支和远程；只需推送 `origin`（2026-09-14 起 Gitee 镜像与 `.workflow/master-pipeline.yml` 已废弃移除，不再双推）。禁止浅克隆处理远程历史。
 
 ## 常用命令
 

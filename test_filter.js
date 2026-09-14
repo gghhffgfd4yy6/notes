@@ -8082,6 +8082,11 @@ console.log('========================================\n');
       assertEqual(r.length, 1, `同批内更新后应仍为 1 条（identOf 未刷新会误追加），实际 ${r.length} 条`)
       assertEqual(r[0].title, 'urlonly', '位置 0 应被 url-only 消息就地更新')
       assertEqual(r[0].id === undefined, true, '位置 0 更新后应为无 id 的 url 身份')
+      // 磁盘字节复核：readMessages 优先返回内存权威快照，「writeAtomic 静默返回成功却未落盘」
+      // 这类变异只有直接读盘才咬得住。
+      const disk = JSON.parse(require('fs').readFileSync(fp, 'utf8'))
+      assertEqual(disk.length, 1, `落盘应同为 1 条，实际 ${disk.length} 条`)
+      assertEqual(disk[0].title, 'urlonly', '落盘记录应为就地更新后的 url-only 消息')
     } finally {
       try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
     }
@@ -8101,6 +8106,11 @@ console.log('========================================\n');
       const r = readMessages(fp)
       assertEqual(r.length, 1, `同批内新增后应仍为 1 条（identOf 未同步会误追加），实际 ${r.length} 条`)
       assertEqual(r[0].title, 'B', '位置 0 应被 url-only 消息就地更新')
+      // 磁盘字节复核：readMessages 优先返回内存权威快照，「writeAtomic 静默返回成功却未落盘」
+      // 这类变异只有直接读盘才咬得住。
+      const disk = JSON.parse(require('fs').readFileSync(fp, 'utf8'))
+      assertEqual(disk.length, 1, `落盘应同为 1 条，实际 ${disk.length} 条`)
+      assertEqual(disk[0].title, 'B', '落盘记录应为就地更新后的 url-only 消息')
     } finally {
       try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
     }

@@ -10,6 +10,12 @@ on:
         required: false
         type: string
 
+# 工作流级兜底最小权限（zizmor excessive-permissions）：唯一的 analyze job 已显式声明 contents/actions: read，
+# job 级整体覆盖工作流级，因此这一层不改变生效权限（跨 run 下载 artifact 仍靠 job 级 actions: read）。
+# 注意：新增未声明 permissions 的 job 会退回这里（而不是仓库默认的写权限），务必为该 job 显式补权限。
+permissions:
+  contents: read
+
 jobs:
   analyze:
     runs-on: ubuntu-latest

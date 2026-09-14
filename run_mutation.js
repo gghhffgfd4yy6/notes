@@ -83,6 +83,21 @@ function collectMutants (files) {
   return all.map((m, index) => ({ ...m, id: index + 1 }))
 }
 
+// node_modules 挂载（#136 review F3）：node_modules 属必选输入，symlinkSync 不校验目标是否存在，
+// 缺依赖时会留下悬空链接 → 沙箱内套件必然失败 → 每个变异体被判 killed → 分数虚高且 exit 0（不响亮的假绿）。
+// 从 copyProject 抽出为独立可调用点（dir = symlink 落点；sourceRoot = 依赖来源项目根，生产路径恒为 ROOT）：
+// 原先该判定埋在 copyProject 内部，测试只能用「本机有没有 node_modules」猜分支——CI 在 npm ci 之后
+// 必然存在 node_modules，缺依赖分支在 CI 中永不执行（删掉本处 throw，CI 依然全绿）。
+// 抽成依赖注入点后，测试可自带一个确实没有 node_modules 的临时目录当来源根，使该分支在任何环境都必被执行。
+function linkNodeModules (dir, sourceRoot = ROOT) {
+  const nodeModules = path.join(sourceRoot, 'node_modules')
+  // existsSync 跟随链接：node_modules 自身即是悬空链接时同样返回 false，一并按缺依赖响亮抛错
+  if (!fs.existsSync(nodeModules)) throw new Error('copyProject 缺少 node_modules（沙箱内测试必然失败并被误判为「变异体已检出」）：请先 npm ci')
+  const link = path.join(dir, 'node_modules')
+  fs.symlinkSync(nodeModules, link, 'dir')
+  return link
+}
+
 function copyProject (dir, files) {
   fs.mkdirSync(dir, { recursive: true })
   // 变异测试运行 run_unit_tests.js（全量单元测试入口），需复制其依赖的全部文件：
@@ -127,11 +142,9 @@ function copyProject (dir, files) {
     if (!fs.existsSync(srcDir)) throw new Error(`copyProject 缺少必要目录: ${sub}`)
     fs.cpSync(srcDir, path.join(dir, sub), { recursive: true })
   }
-  // node_modules 同为必选（#136 review F3）：symlinkSync 不校验目标是否存在，缺依赖时会留下悬空
-  // 链接 → 沙箱内套件必然失败 → 每个变异体被判 killed → 分数虚高且 exit 0（不响亮的假绿）。
-  const nodeModules = path.join(ROOT, 'node_modules')
-  if (!fs.existsSync(nodeModules)) throw new Error('copyProject 缺少 node_modules（沙箱内测试必然失败并被误判为「变异体已检出」）：请先 npm ci')
-  fs.symlinkSync(nodeModules, path.join(dir, 'node_modules'), 'dir')
+  // node_modules 同为必选（#136 review F3）：判定与挂载见 linkNodeModules（生产路径恒以 ROOT 为来源根，
+  // 缺依赖时的报错文案与调用时机均不变）。
+  linkNodeModules(dir)
 }
 
 function applyMutants (dir, mutants) {
@@ -197,6 +210,13 @@ function runTests (dir, timeoutMs) {
       }
     })
   })
+  // 退出码口径披露（低，仅注释，不改行为）：上面的 D1 判定把「超时线已过、但进程在 kill 生效前
+  // 自然非零退出」由 timeout 改写为 fail/killed。对 main() 而言二者不等价——timeout 计入
+  // report.timeout 并让 process.exitCode 置 1，而 killed 只是「已检出」、不单独影响退出码。
+  // 故手工运行 `node run_mutation.js` 时，落在同一超时窗口内的跑法可能出现退出码由 1 变 0：
+  // 这是「按真实退出码判定」的预期结果（超时不再虚增已检出、也不再单独拉红），不是回归。
+  // 影响范围仅限手工运行：run_mutation.js 不被任何 workflow / npm script 直接调用
+  // （mutation.yml 与 stryker.config.js 的入口是 run_unit_tests.js），CI 退出码口径不受此改动影响。
 }
 
 // 提取测试汇总数字："全部通过！N/M" 或 "N 通过, M 失败, 共 K"
@@ -381,4 +401,4 @@ async function main () {
 }
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1 })
-module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, applyMutants, runTests, evaluate }
+module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, runTests, evaluate }

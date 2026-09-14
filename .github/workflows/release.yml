@@ -100,6 +100,9 @@ jobs:
       # 不再像旧实现那样静默退化为字面量 notes（Release 正文只剩一行 "v3.272.0" 而无人察觉）。
       # 标题匹配再加「后一字符不是数字」的边界，避免 base=3.27 前缀误配 ## v3.270 拿到错误章节
       # （#136 sourcery；用 [^0-9] 而非空白类，既不引入多层转义、也顺带挡住 ## v3.2721）。
+      # 该边界当初放行「点」，于是 base=3.272 会命中三位标题 ## v3.272.1 那一节（CHANGELOG 约定两段式
+      # 标题，三位式只在异常时出现），故补 (?![.][0-9]) 拒绝「点 + 数字」续写——仍用字符类表达，
+      # 零反斜杠、不新增 YAML→bash→node 的转义层；## v3.272 位于文件末尾、后跟空格/中文/换行均照常命中。
       # 正则不得加 'm' 标志：#136 review 发现 'm' 下结尾的 $ 在【行尾】也成立，于是惰性匹配在标题行末
       # 就命中收工 —— Release 正文只剩标题行本身（9 字节），CHANGELOG 的要点从不进入 Release Notes。
       - name: 提取 Release Notes（从 CHANGELOG 对应版本段）
@@ -111,7 +114,7 @@ jobs:
             const c = fs.readFileSync('CHANGELOG.md', 'utf8')
             const base = String(process.argv[1]).split(/[-+]/)[0].split('.').slice(0, 2).join('.')
             const esc = base.replace(/[.*+?^\${}()|[\]\\\\]/g, '\\\\$&')
-            const m = c.match(new RegExp('## v' + esc + '(?=[^0-9]|$)' + '[\\\\s\\\\S]*?(?=\\n## v|$)'))
+            const m = c.match(new RegExp('## v' + esc + '(?![.][0-9])(?=[^0-9]|$)' + '[\\\\s\\\\S]*?(?=\\n## v|$)'))
             if (!m) {
               console.error('::error::CHANGELOG 中未找到 ## v' + base + ' 章节（tag v' + process.argv[1] + '），无法生成 Release Notes，已中止 Release 创建。')
               process.exit(1)
@@ -124,4 +127,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          gh release create "v$VERSION" --title "v$VERSION" --notes-file release-notes.md
+          # 显式指定仓库（--repo），不依赖 gh 从 cwd 的 git remote 推断：checkout 已 persist-credentials: false，
+          # 推断链（-R → GH_REPO → git remote）越少依赖环境越好；与 mutation.yml 的 gh run list --repo "$GITHUB_REPOSITORY" 写法一致。
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --title "v$VERSION" --notes-file release-notes.md
