@@ -258,7 +258,9 @@ function createApp ({
         // 杀死未完成的告警 HTTP（cron 直接运行收不到告警，#10）
         // R1（v3.269）：告警本地留痕——发送前先写一行摘要到 run.log（无论成败），
         // 这样告警通道挂掉/退出连败时仍有痕可查；发送失败时下方 catch 再补一行原因。
-        this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${safeReason.replace(/[\r\n]+/g, ' ').slice(0, 200)}\n`)
+        // APP-01：版本取入口注入的 PKG_VERSION（曾 require('./package.json')——缺 package.json
+        // 的青龙部署下此处抛 MODULE_NOT_FOUND，告警静默失效且连本地留痕都没有）。
+        this._writeRunLog(`${this._localStamp()} ALERT [v${PKG_VERSION}] ${alertText.slice(0, 100)} 原因：${safeReason.replace(/[\r\n]+/g, ' ').slice(0, 200)}\n`)
         return Pusher.send(alertText, alertDesp)
           .then(() => {
             const sentAt = Date.now()
@@ -278,7 +280,7 @@ function createApp ({
             // J1（v3.269 审查）：留痕写日志自身也可能抛错（磁盘/权限），必须包住——
             // 否则 handler 自身 reject，_sendAlert 不会返回 false，调用方 await 会中断。
             try {
-              this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ${alertText.slice(0, 100)} 原因：${reason}\n`)
+              this._writeRunLog(`${this._localStamp()} ALERT [v${PKG_VERSION}] ${alertText.slice(0, 100)} 原因：${reason}\n`)
             } catch (logError) { /* 留痕失败静默 */ }
             /* v3.135：告警通道也挂了，静默（防 unhandledRejection）；不写状态→下次可重试 */
             return false // 发送失败（供 _warnMissingRe2 等调用方决定是否撤销标记/重试）
@@ -289,7 +291,7 @@ function createApp ({
       // “发送失败”(false)与“跳过”(undefined：禁用/限频/状态读取失败)。
         const reason = Utils.safeErrorText(e || errMsg, '未知错误').replace(/[\r\n]+/g, ' ').slice(0, 200)
         try {
-          this._writeRunLog(`${this._localStamp()} ALERT [v${require('./package.json').version}] ⚠️ xbk-push 运行异常 原因：${reason}\n`)
+          this._writeRunLog(`${this._localStamp()} ALERT [v${PKG_VERSION}] ⚠️ xbk-push 运行异常 原因：${reason}\n`)
         } catch (logError) { /* 留痕失败静默 */ }
         return false
       }
@@ -671,7 +673,10 @@ function createApp ({
         if (!state.date) state.date = today
         this._accumulateReport(state, summary)
         this._persistReportState(statePath, state)
-      } catch (e) { /* 日报失败静默，不影响主流程 */ }
+      } catch (e) {
+      // APP2-06：「不影响主流程」不等于隐身——整体异常留一行 WARN 到 run.log，便于回溯日报长期不再累计。
+        try { this._writeRunLog(`${this._localStamp()} WARN 日报更新异常: ${Utils.safeErrorText(e, '未知错误').replace(/[\r\n]+/g, ' ')}\n`) } catch (logError) { /* 留痕失败静默 */ }
+      }
     },
 
     async _updateChannelHealth (outcome) {
@@ -752,7 +757,10 @@ function createApp ({
             }
           } catch (e) { /* 健康告警失败不得影响主推送、缓存或下一次重试 */ }
         }
-      } catch (e) { /* 健康监测仅作观测，不得影响主流程 */ } finally {
+      } catch (e) {
+      // APP2-06：「仅作观测」不等于隐身——整体异常留一行 WARN，避免通道健康状态永久不更新却一切「正常」。
+        try { this._writeRunLog(`${this._localStamp()} WARN 通道健康更新异常: ${Utils.safeErrorText(e, '未知错误').replace(/[\r\n]+/g, ' ')}\n`) } catch (logError) { /* 留痕失败静默 */ }
+      } finally {
         if (typeof lockFd === 'number' && lockFd >= 0) {
           try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
           try { fs.unlinkSync(lockPath) } catch (e) { /* 忽略 */ }
@@ -1050,6 +1058,7 @@ function createApp ({
           skipped: explanation.skipped
         })
         let badElementCount = 0 // v3.157：非对象元素单独统计（曾混入 filteredCount，诊断不清）
+        let skippedNoIdentity = 0 // APP-04：isValidItem 通过但 getMessageIdentity 判无效的条目（丢弃正确，但必须可对账）
         let regTimePresent = 0 // v3.159：louzhuregtime 有值统计（pingbitime 有效性警告用）
         for (const item of xbkdata) {
         // 元素级校验：非对象元素跳过（v3.176：不再计入 filteredCount——「过滤屏蔽」专指规则过滤，
@@ -1066,7 +1075,7 @@ function createApp ({
           if (louzhuRegTime !== undefined && louzhuRegTime !== null && louzhuRegTime !== '') regTimePresent++
 
           const identity = Utils.getMessageIdentity(item)
-          if (!identity.valid) continue
+          if (!identity.valid) { skippedNoIdentity++; continue }
           let dup = false
           if (identity.kind === 'id') {
             dup = cacheIds.has(identity.idKey) || (identity.url && cacheNoIdUrls.has(identity.url)) ||
@@ -1237,9 +1246,14 @@ function createApp ({
         // v3.250：日志边界——超长字段值（脏数据/整段内容/大对象 JSON）原样入日志会撑爆日志行；
         // 与推送内容截断同口径，仅限制日志显示长度，不影响实际推送内容
         const ITEM_LOG_MAX = 100
+        // APP2-07：stdout 回显专用的控制字符清洗（U+0000–U+001F、U+007F → 空格）——青龙任务日志
+        // 按行解析，接口返回的 title/catename 含 \n 或 ANSI ESC 可伪造日志行；推送正文不经此函数
+        // （safeText 不动，推送内容保留换行）。
+        const stripLogControl = (text) => text.replace(/[\u0000-\u001F\u007F]/g, ' ')
         const itemLogText = (item, field, fallback = '') => {
           const text = Utils.safeText(readItemField(item, field), fallback)
-          return typeof text === 'string' && text.length > ITEM_LOG_MAX ? Utils.truncateUtf16(text, ITEM_LOG_MAX) : text
+          const safe = typeof text === 'string' ? stripLogControl(text) : text
+          return typeof safe === 'string' && safe.length > ITEM_LOG_MAX ? Utils.truncateUtf16(safe, ITEM_LOG_MAX) : safe
         }
 
         // 推送模板（v3.68 可配置）：非法/缺失回退默认（默认值与历史硬编码完全一致，现有测试锁定）
@@ -1409,14 +1423,23 @@ function createApp ({
         console.log(`  过滤屏蔽:  ${filteredCount} 条`)
         if (truncatedCount > 0) console.log(`  截断待推:  ${truncatedCount} 条（下次运行推送，防推送风暴）`)
         if (badElementCount > 0) console.log(`  非对象元素: ${badElementCount} 条（接口脏数据，已跳过）`)
-        console.log(`  推送:     ${successCount} 条${successCount < items.length ? `（${items.length - successCount} 条失败，下次运行重试）` : ''}`)
+        if (skippedNoIdentity > 0) console.log(`  身份无效:  ${skippedNoIdentity} 条（无 id/有效 url，已跳过）`)
+        // APP2-04：dry-run 从未尝试推送，不能与真实失败共用「N 条失败，下次运行重试」文案
+        // （summary.failed 已显式判 0，日志/终端口径与返回值必须一致）。
+        const pushResultText = dryRun
+          ? (items.length > successCount ? `（dry-run 未推送 ${items.length - successCount} 条）` : '')
+          : (successCount < items.length ? `（${items.length - successCount} 条失败，下次运行重试）` : '')
+        console.log(`  推送:     ${successCount} 条${pushResultText}`)
         console.log(`  耗时:     ${elapsed}s`)
         if (process.env.XBK_PROFILE === '1' || detailedProfile) {
           const totalMs = Date.now() - runStart
           console.log(`  [profile] 接口: ${typeof fetchMs === 'number' ? (fetchMs / 1000).toFixed(3) + 's' : 'n/a'} | 推送: ${(pushMs / 1000).toFixed(3) + 's'} | 总计: ${(totalMs / 1000).toFixed(3) + 's'}`)
           if (detailedProfile) {
-            const warmupText = dnsWarmup ? `${dnsWarmup.ok ? '成功' : '失败'} ${(dnsWarmup.elapsedMs / 1000).toFixed(3)}s${dnsWarmup.family ? ` IPv${dnsWarmup.family}` : ''}` : 'n/a'
-            const tlsText = tlsWarmup ? `${tlsWarmup.okCount}/${tlsWarmup.count} 成功 ${(tlsWarmup.elapsedMs / 1000).toFixed(3)}s` : 'n/a'
+            // APP2-05：预热被跳过（skipped）或未采集 elapsedMs 时，曾 (undefined/1000).toFixed(3) → "NaN"；
+            // 有限性判定后回退 n/a，skipped 路径显式输出「跳过」。
+            const warmupElapsed = (w) => Number.isFinite(w && w.elapsedMs) ? `${(w.elapsedMs / 1000).toFixed(3)}s` : 'n/a'
+            const warmupText = dnsWarmup ? `${dnsWarmup.skipped ? '跳过' : (dnsWarmup.ok ? '成功' : '失败')} ${warmupElapsed(dnsWarmup)}${dnsWarmup.family ? ` IPv${dnsWarmup.family}` : ''}` : 'n/a'
+            const tlsText = tlsWarmup ? `${tlsWarmup.skipped ? '跳过' : `${tlsWarmup.okCount}/${tlsWarmup.count} 成功`} ${warmupElapsed(tlsWarmup)}` : 'n/a'
             console.log(`  [profile detail] DNS预热: ${warmupText} | TLS预取: ${tlsText} | 预处理: ${(Math.max(0, preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(Config.timing.finalWait, 0) / 1000).toFixed(3)}s`)
           }
         }
@@ -1433,7 +1456,8 @@ function createApp ({
           this._writeRunLog(`${this._localStamp()} ERROR 推送全部失败 ${items.length} 条（通道可能失效）\n`)
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
-        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${items.length - successCount} elapsed=${elapsed}s\n`)
+        // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
+        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}\n`)
 
         // v3.125：运行日报（跨天发昨日汇总 + 当天累加；静默）
         const summary = {
