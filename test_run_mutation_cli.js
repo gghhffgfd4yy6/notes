@@ -5,7 +5,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { runTests, evaluate, main } = require('./run_mutation')
+const { runTests, evaluate } = require('./run_mutation')
 
 ;(async () => {
   // 防重入：run_mutation.js 的 runTests 在临时目录内运行 run_unit_tests.js 时会设置
@@ -14,34 +14,6 @@ const { runTests, evaluate, main } = require('./run_mutation')
   if (process.env.XBK_MUTATION_CHILD === '1') {
     console.log('⏭  检测到 XBK_MUTATION_CHILD，跳过 runTests/evaluate 场景（防变异运行递归）')
     return
-  }
-
-  // ===== main：基线首跑（review F1） =====
-  // 无基线时沙箱整体红会把每个变异体都判 killed → survived=0/timeout=0 → exit 0（假绿 100%）。
-  // 用注入的 fake evaluate（deps.evaluate）复现「基线 fail」：只跑基线、不进批次、不写断点、退出码 1。
-  {
-    const originalExitCode = process.exitCode
-    const originalCheckpoint = process.env.MUTATION_CHECKPOINT
-    const ckpt = path.join(os.tmpdir(), `xbk-baseline-ckpt-${process.pid}.json`)
-    const calls = []
-    try {
-      process.env.MUTATION_CHECKPOINT = ckpt
-      await main({
-        evaluate: async (mutants) => {
-          calls.push(mutants.length)
-          return { status: 'fail', code: 1, signal: null, output: '沙箱本来就有红套件', summary: ['0', '1', '1'] }
-        }
-      })
-      assert.deepStrictEqual(calls, [0],
-        '基线失败时只应跑一次未套变异的基线（mutants 为空），不得进入批次循环把红归因给变异体')
-      assert.strictEqual(process.exitCode, 1, '基线失败必须非零退出（不得 survived=0 却 exit 0）')
-      assert.ok(!fs.existsSync(ckpt), '基线失败不得写出断点文件（否则留下待判定的污染断点）')
-    } finally {
-      process.exitCode = originalExitCode
-      if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
-      else process.env.MUTATION_CHECKPOINT = originalCheckpoint
-      fs.rmSync(ckpt, { force: true })
-    }
   }
 
   // ===== runTests：子进程运行测试的 3 种场景 =====

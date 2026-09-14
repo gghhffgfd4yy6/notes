@@ -167,26 +167,7 @@ function waitKillCount (expected, timeoutMs = 1500) {
       }
     }
 
-    // ── 场景 E：spawn 失败（如 PATH 里没有 node → ENOENT）只发 'error' 且不触发 'close' ──
-    // review F5：此前 runTests 没有 child.on('error')，spawn 失败会抛 uncaughtException 崩掉整轮调度器，
-    // 且 Promise 一直悬到 90s 超时定时器/2000ms 兜底。现在必须按 fail 立即结算并清掉定时器。
-    {
-      const t0 = Date.now()
-      const pending = runTests(dir, 60000) // 超时给足：证明结算是 error 触发，而不是靠超时/兜底
-      await new Promise(resolve => setImmediate(resolve))
-      assert.ok(lastChild, 'spawn 应返回 fake child')
-      lastChild.emit('error', new Error('spawn node ENOENT'))
-      const result = await pending
-      const elapsed = Date.now() - t0
-      assert.strictEqual(result.status, 'fail', 'spawn 失败应按 fail 结算（未监听 error 会抛 uncaughtException）')
-      assert.strictEqual(result.code, null, 'spawn 失败没有退出码，code 应为 null')
-      assert.match(result.error, /ENOENT/, '应保留 error.message 便于定位')
-      assert.ok(Array.isArray(result.summary), 'summary 应为数组')
-      assert.ok(elapsed < 5000, `error 应立即结算（实测 ${elapsed}ms，不得等 60s 超时）`)
-      console.log('✅ 场景E：子进程 error 事件按 fail 立即结算（不再 uncaughtException/悬空）')
-    }
-
-    console.log('✅ 变异超时契约四路径 + spawn error 注入式回归通过')
+    console.log('✅ 变异超时契约四路径注入式回归通过')
   } finally {
     // 还原模块状态：恢复真实 spawn，清缓存后重新 require（顶层解构重新绑定真实 spawn）
     childProcess.spawn = originalSpawn

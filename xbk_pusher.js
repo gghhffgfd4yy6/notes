@@ -1,7 +1,7 @@
 // ============================================================
 // 📤 Pusher — 推送层
 // ============================================================
-function createPusher ({ Utils, getNotify }) {
+function createPusher ({ Utils, getNotify, looksLikeHtmlLinear }) {
   return {
     // notifyModule：可选推送模块实例（延迟加载）；未传时按需加载
     async send (text, desp, notifyModule) {
@@ -14,19 +14,13 @@ function createPusher ({ Utils, getNotify }) {
       // 仅当 desp 呈 HTML 形态（将触发 wxpusher 等 HTML 渲染通道）时清洗：
       // 纯 Markdown/纯文本（默认 {Markdown内容}、{内容} 普通文本）不清洗，
       // 避免破坏 Markdown 代码块、技术讨论文本（onerror= 等字面量）与排版实体。
-      // 注意（P5）：门槛是「HTML 形态」而非「模板类型」——含 HTML 形态标签的代码块示例同样会被改写。
       // C030：htmlLike 正则对“大量 <tag 前缀但全文无 >”的输入呈 O(n²) 回溯。
       // Round2 C030：将 100k 截断提升到入口统一——检测与清洗作用于同一份（截断后的）desp，
       // 消除“检测截断、清洗不截断”导致第 100k 后的 HTML 绕过出口清洗的行为回归。
       // 超长 desp 截断为已知边界（与全局 htmlToMarkdown/sanitizeDecodedHtml 截断策略一致）。
       const HTML_LIKE_MAX_LEN = 100000
       if (desp.length > HTML_LIKE_MAX_LEN) desp = desp.slice(0, HTML_LIKE_MAX_LEN)
-      // 审查 P1/S1/F1：门槛收敛为 looksLikeHtmlEnvelope——与渲染侧（slim 的 contentType 判定）
-      // 同一实现，且取宽松包络。此前注入的 looksLikeHtmlLinear 更严：
-      // <img src=x onerror=alert(1) <2> 判 false 不清洗，而 slim 仍以 contentType=2 原文送出
-      // → 未清洗的主动 HTML 直达客户端（「模板/链接统一安全入口」被绕过）。
-      // 门槛必须覆盖所有可能被渲染成 HTML 的输入，不能反向收敛到渲染侧的严格判定。
-      const htmlLike = looksLikeHtmlEnvelope(desp) // S8786：线性扫描替代原回溯正则
+      const htmlLike = looksLikeHtmlLinear(desp) // S8786：线性扫描替代原回溯正则
       if (htmlLike) {
         desp = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(desp))
       }
@@ -66,7 +60,7 @@ function createPusher ({ Utils, getNotify }) {
   }
 }
 
-module.exports = { createPusher, looksLikeHtmlLinear, looksLikeHtmlEnvelope, htmlTagNameEnd, isTagNameBoundary }
+module.exports = { createPusher, looksLikeHtmlLinear, htmlTagNameEnd, isTagNameBoundary }
 
 // 返回 < 处标签名结束位；非完整标签返回 -1（S3776：独立成函数压认知复杂度）
 function htmlTagNameEnd (s, lt) {
@@ -98,28 +92,6 @@ function looksLikeHtmlLinear (s) {
     while (j < s.length && s[j] !== '>' && s[j] !== '<') j++
     if (j < s.length && s[j] === '>') return true
     i = j
-  }
-  return false
-}
-
-// 审查 P1/S1/F1：出口清洗门槛与渲染侧（slim 的 wxpusher contentType 判定）共用的唯一实现。
-// 与上面的 looksLikeHtmlLinear 只差一点：标签名边界成立后，其【后】存在任意 > 即判 HTML——
-// 即使中间又出现 <（HTML5 tokenizer 里引号属性值可含 <，如 <img src="a<b" onerror=alert(1)>
-// 仍会被解析成带 onerror 的标签）。S8786 线性化时此处收窄为「先遇到 < 就跳过」，与它要替代的
-// 旧正则 /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^>]*>/i 不再等价（旧正则跨越 <）。
-// 取宽松包络即 fail-closed：只要可能被当 HTML 渲染就先清洗，避免「本通道判 HTML 渲染、
-// 出口判非 HTML 不清洗」的组合让未清洗的主动 HTML 直达客户端。
-// 注意：looksLikeHtmlLinear 仍是既有导出（test_filter.js 锁定其「不跨界」语义），
-// 但已不再作为出口门槛——门槛只认本函数。
-function looksLikeHtmlEnvelope (s) {
-  if (typeof s !== 'string') return false // undefined/null/数字等调用方输入防御（'' 由循环自然返回 false）
-  let i = 0
-  while (i < s.length) {
-    const lt = s.indexOf('<', i)
-    if (lt === -1) return false
-    const nameEnd = htmlTagNameEnd(s, lt)
-    if (nameEnd === -1) { i = lt + 1; continue }
-    return s.includes('>', nameEnd) // 其后存在 > 即判 HTML；否则剩余串再无 >（O(n) 单趟扫描）
   }
   return false
 }

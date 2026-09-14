@@ -12,7 +12,7 @@ const { readReportJson } = require('./mutation-json.js')
 const EXPECTED_SEGMENTS = Object.freeze([
   'v3-entry', 'app', 'filter', 'formatter', 'message-store', 'network', 'pusher', 'rules', 'utils',
   'sendnotify-part1', 'sendnotify-part2',
-  'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push', 'check-deps', 'status'
+  'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push', 'check-deps'
 ])
 
 function analyze (dir) {

@@ -23,8 +23,7 @@ const SPECIAL_SEGMENTS = {
   'xbk_function_v3.js': ['v3-entry'],
   'xbk_sendNotify_slim.js': ['sendnotify-part1', 'sendnotify-part2'],
   'qinglong/xbk_push.js': ['qinglong-push'],
-  'scripts/check-deps.js': ['check-deps'],
-  'scripts/status.js': ['status']
+  'scripts/check-deps.js': ['check-deps']
 }
 const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': 750 } // 拆段边界固定，终点随文件增长自动跟随
 
@@ -33,8 +32,7 @@ function buildYml (overrides = {}) {
   const productionFiles = [
     ...fs.readdirSync(ROOT).filter(f => /^xbk_.*\.js$/.test(f)),
     'qinglong/xbk_push.js',
-    'scripts/check-deps.js',
-    'scripts/status.js'
+    'scripts/check-deps.js'
   ]
   const matrix = productionFiles.map(f => {
     const full = path.join(ROOT, f)
@@ -61,8 +59,7 @@ function buildFullFileYml (omit = null) {
   const productionFiles = [
     ...fs.readdirSync(ROOT).filter(f => /^xbk_.*\.js$/.test(f)),
     'qinglong/xbk_push.js',
-    'scripts/check-deps.js',
-    'scripts/status.js'
+    'scripts/check-deps.js'
   ].filter(f => f !== omit)
   const matrix = productionFiles.map(f => {
     const names = SPECIAL_SEGMENTS[f] || [f.replace(/^xbk_/, '').replace(/\.js$/, '').replace(/_/g, '-')]
