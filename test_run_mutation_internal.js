@@ -306,8 +306,9 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       const modified = fs.readFileSync(fixture, 'utf8')
       assert.ok(modified === 'if (a<b) { c() }' || modified === 'if (a>b) { c() }',
         `全量套用后应是合法单变异，实际 ${JSON.stringify(modified)}`)
-      // eslint-disable-next-line no-new-func -- 只是解析校验套用后的源码语法，不执行
-      assert.doesNotThrow(() => new Function(modified), '套用后的源码语法应合法')
+      // 上面的整串相等断言已强于「能解析」：两个允许值都是合法的单变异源码。
+      // 故不再额外做动态求值式语法校验（原 new Function 触发 Sonar S1523，
+      // 改 spawn node --check 又会引入对 process.execPath 的依赖，本地跑不动）。
     })
   } finally {
     fs.rmSync(projDir, { recursive: true, force: true })
