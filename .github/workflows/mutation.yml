@@ -19,6 +19,13 @@ on:
     - cron: '17 16 * * *'
     - cron: '17 4 * * *'
 
+# 工作流级兜底最小权限（zizmor excessive-permissions）：4 个 job（decide-run / prepare-re2 / mutation / report）
+# 均已显式声明 permissions，job 级整体覆盖工作流级，因此这一层不改变任何 job 的生效权限
+# （decide-run 的 actions: read、report 的 issues: write 都来自 job 级）。
+# 注意：新增未声明 permissions 的 job 会退回这里（而不是仓库默认的写权限），务必为该 job 显式补权限。
+permissions:
+  contents: read
+
 jobs:
   # GitHub schedule 是尽力调度。中午补偿任务查询同日任意触发方式下成功或未完成的运行，
   # 避免重复执行手动/push 触发的变异测试；主 cron、手动和 push 始终运行。

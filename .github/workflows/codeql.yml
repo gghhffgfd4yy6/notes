@@ -15,6 +15,12 @@ concurrency:
   group: codeql-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# 工作流级兜底最小权限（zizmor excessive-permissions）：GitHub 语义是 job 级 permissions 整体覆盖工作流级，
+# 本文件唯一的 analyze job 已显式声明（含 security-events: write），因此这一层不改变任何 job 的生效权限。
+# 注意：新增未声明 permissions 的 job 会退回这里（而不是仓库默认的写权限），务必为该 job 显式补权限。
+permissions:
+  contents: read
+
 jobs:
   analyze:
     name: Analyze
