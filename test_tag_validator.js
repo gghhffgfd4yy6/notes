@@ -221,6 +221,8 @@ function runBlock (block, tag, files) {
 const pkgJson = JSON.parse(fs.readFileSync('package.json', 'utf8'))
 const pkgCore = String(pkgJson.version).split('-')[0].split('+')[0]
 const pkgBase = pkgCore.split('.').slice(0, 2).join('.')
+// pkgBase 含 `.`（正则会当通配符），用于首行判定前必须转义
+const escBase = pkgBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 // ① notes 必须包含 CHANGELOG 的要点正文，不能只有标题行
 //    （回归点：match 正则带 'm' 时结尾的 $ 在行尾成立 → 惰性匹配止于标题行）
@@ -228,8 +230,11 @@ const notesBlock = extractRunBlock(releaseYml, '提取 Release Notes')
 const notesRun = runBlock(notesBlock, pkgBase,
   { 'CHANGELOG.md': fs.readFileSync('CHANGELOG.md', 'utf8') })
 assert.strictEqual(notesRun.status, 0, 'notes 提取应成功（stderr: ' + notesRun.stderr + '）')
-assert.ok(notesRun.notes && notesRun.notes.startsWith('## v' + pkgBase),
-  'Release Notes 应以 ## v' + pkgBase + ' 开头，实际: ' + JSON.stringify(notesRun.notes))
+// 首行不得只做前缀匹配：`'## v3.272.1…'.startsWith('## v3.272')` 为真，用 startsWith 时「取错三位标题
+// 那一节」照样绿。改为「两段版本 + 其后不是 .数字」，既挡住三位续写，又保留 `## v3.272（日期）`、
+// `## v3.272 摘要` 这类 release.yml 明确容忍的合法形态（下方夹具 A 亦按整行相等收紧）。
+assert.ok(new RegExp('^## v' + escBase + '(?!\\.\\d)').test(String(notesRun.notes).split('\n')[0]),
+  'Release Notes 首行应为 ## v' + pkgBase + '（不得只做前缀匹配、不得取三位标题节），实际: ' + JSON.stringify(notesRun.notes))
 assert.ok(String(notesRun.notes).split('\n').filter(l => l.startsWith('- ')).length > 0,
   'Release Notes 必须含 CHANGELOG 要点正文（行首 -），不能只有标题行；实际: ' + JSON.stringify(notesRun.notes))
 
@@ -253,8 +258,10 @@ const decoyBefore = runBlock(notesBlock, pkgBase, {
   ].join('\n')
 })
 assert.strictEqual(decoyBefore.status, 0, '夹具 A 应成功（stderr: ' + decoyBefore.stderr + '）')
-assert.ok(decoyBefore.notes && decoyBefore.notes.startsWith(realTitle),
-  '夹具 A：三位标题在前时 notes 仍须以「' + realTitle + '」开头（不得取错节），实际: ' + JSON.stringify(decoyBefore.notes))
+// 标题必须**整行相等**、不能只 startsWith：`'## v3.272.1…'.startsWith('## v3.272')` 为真，
+// 用 startsWith 的话「取错节」照样绿——这正是本夹具要抓的失效，断言本身不能留同一个坑。
+assert.strictEqual(String(decoyBefore.notes).split('\n')[0], realTitle,
+  '夹具 A：三位标题在前时 notes 首行仍须是「' + realTitle + '」（不得取错节），实际: ' + JSON.stringify(decoyBefore.notes))
 assert.ok(String(decoyBefore.notes).includes(realBody), '夹具 A：notes 必须含两段标题节的正文')
 assert.ok(!String(decoyBefore.notes).includes(decoyBody),
   '夹具 A：notes 不得混入三位标题节的内容，实际: ' + JSON.stringify(decoyBefore.notes))
