@@ -104,8 +104,9 @@ try {
 
 if (current === HOOKS_DIR) {
   if (!verifyHooks(resolvedHooksDir)) {
-    console.warn(`[hooks] ⚠️  core.hooksPath 已指向 ${HOOKS_DIR}，但门禁未生效（见上方告警）；修复后重跑本脚本可自检。`)
-    process.exit(0)
+    // PR 评审 #140：门禁实际未生效时不得以 0 退出（否则 CI/自动化会把「配置已存在」当成成功）
+    console.error(`[hooks] ❌ core.hooksPath 已指向 ${HOOKS_DIR}，但门禁未生效（见上方告警）；修复后重跑本脚本可自检。`)
+    process.exit(1)
   }
   console.log(`[hooks] 已就绪：core.hooksPath=${HOOKS_DIR}`)
   process.exit(0)
@@ -115,7 +116,12 @@ if (current) {
   process.exit(0)
 }
 
-const hooksUsable = verifyHooks(resolvedHooksDir)
+// PR 评审 #140：钩子不可执行时（如 noexec 文件系统上 chmod 静默无效）不写配置、也不以 0 退出——
+// 先在写之前核验，失败即退出 1，避免「门禁不生效却报告安装成功」。
+if (!verifyHooks(resolvedHooksDir)) {
+  console.error('[hooks] ❌ 钩子不可执行，未写入 core.hooksPath（提交门禁不会生效）。')
+  process.exit(1)
+}
 
 try {
   git(['config', 'core.hooksPath', HOOKS_DIR])
@@ -124,8 +130,4 @@ try {
   process.exit(1)
 }
 
-if (hooksUsable) {
-  console.log(`[hooks] 已注册：core.hooksPath=${HOOKS_DIR}`)
-} else {
-  console.warn(`[hooks] 配置已写入 core.hooksPath=${HOOKS_DIR}，但提交门禁未生效（见上方告警）。`)
-}
+console.log(`[hooks] 已注册：core.hooksPath=${HOOKS_DIR}`)
