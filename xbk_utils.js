@@ -18,10 +18,6 @@ const MAX_CODE_POINT = 0x10FFFF // Unicode 最大码点
 const SURROGATE_LO = 0xD800 // 代理区起点
 const SURROGATE_HI = 0xDFFF // 代理区终点
 const DEFAULT_MAX_SIZE = 10000 // 缓存默认上限（v3.120：100 → 10000）
-// P2-01 修复：_protectAttrPairs 逐属性对判断「是否在标签内」时的回扫上限。属性对可达数万，
-// 逐个无上限回扫是 O(n²)（100k 实测 4.2s）；正常标签远短于该值，超限按不在标签内处理
-// （只多删文本，不放行事件属性）。
-const ATTR_TAG_SCAN_MAX = 4096
 // 状态/哈希文件体积上限：alert.state/report.state/filter.hash 均为数百字节级小文件，
 // 强制大小上限防止异常膨胀文件被整读入内存（readSafeTextResult 的 maxBytes 兜底）。
 const STATE_TEXT_MAX_BYTES = 64 * 1024
@@ -433,14 +429,10 @@ function createUtils (options = {}) {
   // v3.260：判断 pos 是否位于 HTML 标签内（线性回扫，尊重引号属性）
   // 引号内 > 不算标签结束（`<a title=">" href=...` 的 > 是属性值）；
   // 未引号的 > 标签已结束；< 即标签开始；越界视为普通文本。
-  // maxScan（可选）：回扫长度上限。P2-01 修复的调用点逐属性对回调本函数，无上限时在
-  // 长纯文本/超长标签上呈 O(n²)（100k 实测 4.2s，修复前 28ms）；超限按「不在标签内」处理
-  // ——宁可少保护（多删文本）也不放行事件属性，方向安全。其他调用点不传即保持原语义。
-  _isInHtmlTag (html, pos, maxScan) {
+  _isInHtmlTag (html, pos) {
     let i = pos - 1
-    const stop = typeof maxScan === 'number' ? Math.max(-1, pos - 1 - maxScan) : -1
     let quote = ''
-    while (i > stop) {
+    while (i >= 0) {
       const ch = html[i]
       if (quote) {
         if (ch === quote) quote = ''
@@ -454,6 +446,39 @@ function createUtils (options = {}) {
       i--
     }
     return false
+  },
+
+  // PR 评审 #140（_protectAttrPairs 的「是否在标签内」判定）：逐属性对回扫是 O(n²)（100k 实测 4.2s），
+  // 而给回扫加固定长度上限会把「超过上限的长标签内的合法属性」误判成标签外——该属性值里的
+  // on* 字样会被 _stripEventAttrs 误删并吞掉闭合引号，产出畸形 HTML（评审给出的真实反例）。
+  // 改为一次线性正扫预计算标签区间，之后按位置指针推进查询：尊重引号（引号内 > 不结束标签），
+  // 未闭合标签延伸到下一个 < 或串尾，与 _isInHtmlTag 同语义，任意长度标签都能正确判定。
+  _htmlTagSpans (html) {
+    const spans = []
+    const n = html.length
+    let i = 0
+    while (i < n) {
+      if (html[i] !== '<') { i++; continue }
+      const start = i
+      i++
+      let quote = ''
+      while (i < n) {
+        const ch = html[i]
+        if (quote) {
+          if (ch === quote) quote = ''
+        } else if (ch === '"' || ch === "'") {
+          quote = ch
+        } else if (ch === '>') {
+          i++
+          break
+        } else if (ch === '<') {
+          break
+        }
+        i++
+      }
+      spans.push([start, i])
+    }
+    return spans
   },
 
   /** CSS 转义全量解码：十六进制（\\XXXXXX）、\\uXXXX 兼容形态、行延续（\\换行）与恒等转义
@@ -543,10 +568,15 @@ function createUtils (options = {}) {
   _protectAttrPairs (html) {
     const attrStore = []
     const attrValueRe = safeRe(String.raw`=\s*(["'])`, 'gi')
+    const tagSpans = this._htmlTagSpans(html)
+    let spanIdx = 0
     let attrOut = ''
     let attrPos = 0
     let attrM
     while ((attrM = attrValueRe.exec(html)) !== null) {
+      // 属性匹配按位置单调递增，标签区间指针只需向前推进（整体 O(n)，无逐次回扫）
+      while (spanIdx < tagSpans.length && tagSpans[spanIdx][1] <= attrM.index) spanIdx++
+      const inTag = spanIdx < tagSpans.length && attrM.index >= tagSpans[spanIdx][0]
       const valueStart = attrValueRe.lastIndex
       const seg = this._attrSegAt(html, attrM, valueStart)
       if (seg === null) {
@@ -563,7 +593,7 @@ function createUtils (options = {}) {
       // 存活的 on* 一并占位，使 _stripEventAttrs 失效。非法形态走与 on* 相同的原样保留分支
       // （下方 else），照旧推进 attrPos/lastIndex，避免死循环。
       const atBoundary = seg.segStart === 0 || /[\s/<>"']/.test(html[seg.segStart - 1])
-      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name) && atBoundary && this._isInHtmlTag(html, attrM.index, ATTR_TAG_SCAN_MAX)) {
+      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name) && atBoundary && inTag) {
         attrStore.push(segText)
         attrOut += html.slice(attrPos, seg.segStart) + '\u0001' + (attrStore.length - 1) + '\u0001'
       } else {

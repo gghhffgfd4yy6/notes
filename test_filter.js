@@ -8413,6 +8413,21 @@ console.log('========================================\n');
     }
   })
 
+  await test('sanitizeDecodedHtml 超长标签内的合法属性值仍受保护（PR 评审 #140）', () => {
+    // 修复前：_protectAttrPairs 的「是否在标签内」判定带 4096 长回扫上限，长于上限的标签内
+    // 属性被判成标签外 → 值内 on* 字样被 _stripEventAttrs 误删并吞掉闭合引号，输出畸形 HTML。
+    // 修复后改为线性正扫预计算标签区间，任意长度标签都能正确保护。
+    const long = 'x'.repeat(5000)
+    const html = '<div data-big="' + long + '" title="see onerror=x">t</div>'
+    const r = sanitizeDecodedHtml(html)
+    assertEqual(r.includes('onerror=x'), true, `长标签内合法属性值不应被误删: ${r.slice(0, 80)}…`)
+    assertEqual(r.includes('data-big="' + long + '"'), true, '长属性值应原样保留')
+    assertEqual(r, html, '全部属性均合法、无危险内容时应逐字节不变')
+    // 安全方向不回归：真正的 on* 事件属性（非引号值内的字面文本）仍必须清除
+    const evil = '<div data-big="' + long + '" onerror="alert(1)">t</div>'
+    assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(sanitizeDecodedHtml(evil)), false, '超长标签内的真事件属性仍应清除')
+  })
+
   await test('sanitizeDecodedHtml 嵌套引号 script 内容被移除（Round2 C002）', () => {
     const cases = [
       '前<script>var s = "<img src=x onerror=alert(1)>";</script>后',
