@@ -95,6 +95,21 @@ const { generateMutants, extractTestSummary, collectMutants } = require('./run_m
   assert.strictEqual(mAfterTemplate.length, 1, '模板串之后的代码区变异点不得丢失')
   assert.strictEqual(mAfterTemplate[0].line, 2, '应定位到模板之后的第 2 行')
 
+  // ===== generateMutants：除号与正则字面量的歧义（PR 评审 #140） =====
+  // '}' 既可能是语句块结尾（可跟正则），也可能是对象字面量结尾（后面是除号）。原判定把 '}' 一律
+  // 当作「可跟正则」，`({a:1} / q === r / s)` 的中间 === 会被整段当作正则吞掉（漏变异）。
+  const mObjDiv = generateMutants('test.js', 'const o = ({ a: 1 } / q === r / s)')
+  assert.strictEqual(mObjDiv.length, 1, '对象字面量后的除号不应吞掉中间的 ===')
+  assert.strictEqual(mObjDiv[0].original, '===')
+  // 反过来，除号右侧可以是正则字面量（`a / /x<y/.source`）：原判定不认正则，会为正则体内的 < 生成
+  // 伪变异（源码语义里并不存在这个运算符）。
+  assert.strictEqual(generateMutants('test.js', 'const t = a / /x<y/.source').length, 0,
+    '除号右侧的正则字面量体不应生成伪变异')
+  // 对照：正则之后的真实代码区运算符仍必须生成
+  const mAfterDivRegex = generateMutants('test.js', 'const t = a / /x<y/.source === b')
+  assert.strictEqual(mAfterDivRegex.length, 1, '正则之后的 === 仍应生成变异')
+  assert.strictEqual(mAfterDivRegex[0].original, '===')
+
   // ===== generateMutants：代码+注释混合，只在代码区生成 =====
   const m5 = generateMutants('test.js', 'a === b // comment === c')
   assert.strictEqual(m5.length, 1, '代码区运算符应生成变异，注释区应跳过')

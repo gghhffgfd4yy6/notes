@@ -44,7 +44,13 @@ function isWs (ch) { return ch === ' ' || ch === '\t' || ch === '\n' || ch === '
 // 该文件尾部 86 个变异点（含 sendNotify 推送结果统计等高风险逻辑）被静默丢弃；正则体内的 < > 还会
 // 生成伪变异（如 (?<![0-9]) → (?<=[0-9]) 的语义反转）。判定取保守口径：只有「前一有效 token 处于
 // 表达式位置」才按正则处理，拿不准时仍按除号处理——宁可少认一个正则，也不吞掉后面代码区的变异点。
-const REGEX_PREFIX_CHARS = '(,=:[!&|?{};+-*%^<>~'
+// PR 评审 #140 两处修正：
+//   - 移除 '}'：它既可能是语句块结尾（可跟正则），也可能是对象字面量结尾（后面是除号）。
+//     `({a:1} / q === r / s)` 里前一 '/' 是除号，原判分会误当正则并把中间的 === 一起吞掉（漏变异）。
+//     歧义时按除号处理，与本判定的保守口径一致。
+//   - 加入 '/'：除号右侧可以是正则字面量（`a / /x<y/.source`）。原判定不认，会把正则体当代码扫描，
+//     为其中的 < > 生成并不存在于源码语义里的伪变异（虚增 killed）。
+const REGEX_PREFIX_CHARS = '(,=:[!&|?{;+-*%^<>~/'
 const REGEX_PREFIX_WORDS = new Set(['return', 'typeof', 'case', 'in', 'of', 'new', 'delete', 'void', 'await', 'yield', 'do', 'else', 'instanceof'])
 
 function regexAllowed (prevChar, prevWord) {
