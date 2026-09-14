@@ -980,7 +980,10 @@ function createMessageStore ({
       const urlOnlyMap = new Map()
       const identityMap = new Map()
       // 身份登记唯一入口：identOf 缓存与四类索引在此一并更新（不写 messages），
-      // 避免各处各写一遍导致「缓存与 messages 漂移」。
+      // 避免各处各写一遍导致「缓存与 messages 漂移」。承诺边界须收窄到「identOf 必须与 messages
+      // 同步」这条真正承重的不变量（回归用例锁定的也只有它）；四类索引只是查询加速器——删除路径
+      // 漏删留下的陈旧候选会被 firstIndex 回调里按 identOf 的复检滤掉，属可自愈的性能问题、
+      // 行为不可观测，故不为「索引陈旧」补行为断言（那种断言只能靠耦合私有实现才咬得住）。
       const addIdentityIndexes = (message, i) => {
         const identity = Utils.getMessageIdentity(message)
         identOf[i] = identity
@@ -1005,8 +1008,18 @@ function createMessageStore ({
       // [PERF-C1] 删除索引所需身份直接取调用点已缓存的位置身份：不变量保证 identOf[i] 与
       // getMessageIdentity(messages[i]) 等价，不再重算（免去对同一条存量消息第二次走最贵的
       // validUrl 校验链）。缓存对象只被读（valid/key/idKey/url/kind），不被修改。
+      // 合法调用点不可能命中下方守卫：i 恒落在 [0, messages.length)——存量位置由下方 messages.forEach
+      // 全量登记、批内改写位置由 setPosition/pushRegistered 重新登记，且 getMessageIdentity 恒返回
+      // 对象，故 identOf[i] 要么是「已登记的身份对象」，要么就是登记路径被改坏后的 undefined，
+      // 没有第三种（messages 来自 JSON.parse 与构造写入，不存在空洞位置）。
+      // 显式守卫而不兜底（identOf[i] || {}、?? {}）：兜底会把「漏登记」静默降级成「按无效身份跳过
+      // 删索引」，让 test_filter.js「同批内身份缓存同步（identOf 漂移必失败）」用例失去咬合力——
+      // 身份缓存漏刷新不再是响亮失败，而是静默误判为「新消息」重复收录，正是本项目明确要避免的
+      // 「静默兜底导致假绿」形态。故此处须响亮失败，且错误信息指向不变量本身：否则抛出的 TypeError
+      // 堆栈会停在 removeIdentityIndexes 内部，把排查方向引偏。
       const removeIdentityIndexes = (i) => {
         const identity = identOf[i]
+        if (!identity) throw new Error('[PERF-C1] identOf 与 messages 不同步：位置 ' + i + ' 缺少身份缓存')
         if (!identity.valid) return
         const del = (map, key) => {
           const s = map.get(key)
