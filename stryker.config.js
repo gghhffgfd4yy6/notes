@@ -22,7 +22,9 @@ module.exports = {
     //   - SKIP_SUITES 被 shell 继承时，run_unit_tests.js 会静默少跑套件（分数与 CI/日报不可比）；
     //   - 缺 XBK_MUTATION_CHILD=1 时 run_unit_tests.js 的防重入守卫失效，test_run_mutation_cli.js /
     //     test_run_mutation_race.js 会在每个变异体里再执行一整轮嵌套单元测试（120s 超时）与 2.2s 时序断言。
-    command: 'XBK_MUTATION_CHILD=1 SKIP_SUITES= PERF_MS=3000 node run_unit_tests.js'
+    // 跨平台（PR 评审 #140）：不用 POSIX 内联赋值（Windows cmd 下会把 XBK_MUTATION_CHILD=1 当成可执行名），
+    // 改由 scripts/mutation-child.js 在 process.env 上设置同样三个变量后加载 run_unit_tests.js。
+    command: 'node scripts/mutation-child.js'
   },
   mutate: [
     'xbk_function_v3.js',
