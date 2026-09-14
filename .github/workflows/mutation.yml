@@ -136,13 +136,13 @@ jobs:
           - name: utils
             src: "xbk_utils.js"
             mutate: "xbk_utils.js"
-          # sendnotify（1473 行）拆 2 段
+          # sendnotify（1465 行）拆 2 段
           - name: sendnotify-part1
             src: "xbk_sendNotify_slim.js"
             mutate: "xbk_sendNotify_slim.js:1-750"
           - name: sendnotify-part2
             src: "xbk_sendNotify_slim.js"
-            mutate: "xbk_sendNotify_slim.js:751-1473"
+            mutate: "xbk_sendNotify_slim.js:751-1465"
           # 小文件各一任务
           - name: failure-policy
             src: "xbk_failure_policy.js"
@@ -165,6 +165,9 @@ jobs:
           - name: check-deps
             src: "scripts/check-deps.js"
             mutate: "scripts/check-deps.js"
+          - name: status
+            src: "scripts/status.js"
+            mutate: "scripts/status.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
