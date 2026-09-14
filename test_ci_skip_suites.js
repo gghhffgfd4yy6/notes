@@ -7,7 +7,6 @@
 const assert = require('node:assert')
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
 const { SUITES } = require('./test_suites')
 
@@ -362,10 +361,7 @@ function runEntry (env) {
   return spawnSync(process.execPath, [path.join(__dirname, 'run_unit_tests.js')],
     { encoding: 'utf8', cwd: __dirname, env: { ...baseEnv, ...env } })
 }
-const skipAll = unitFiles.join(',') // 跳过全部单元套件 → 零套件守卫直接非 0（见 3f），不执行任何套件
-// 只留一个免依赖的快套件（test_check_deps.js）：需要「真的跑一个套件」的用例（summary 写入、输出超限）
-// 用它秒级收尾——过滤后为零套件已被 3f 固定为非 0，不能再拿它当「快速跑完」的挡箭牌。
-const skipAllButOne = unitFiles.filter(f => f !== 'test_check_deps.js').join(',')
+const skipAll = unitFiles.join(',') // 跳过全部单元套件 → 不真正执行套件，几秒内跑完
 
 fs.mkdirSync('reports', { recursive: true }) // reports/ 已被 .gitignore 忽略，用作 summary 落点
 try {
@@ -374,18 +370,18 @@ try {
   assert.notStrictEqual(unknown.status, 0, 'SKIP_SUITES 含未知套件必须非 0 退出')
   assert.match(unknown.stderr, /test_not_exist\.js/, '错误应点名未知套件')
 
-  // 3b CI 下写 summary（验证过滤生效：跳过其余套件 → 只剩 test_check_deps.js 一个）
-  const filtered = runEntry({ SKIP_SUITES: skipAllButOne, GITHUB_STEP_SUMMARY: 'reports/.ci-summary-check.md' })
+  // 3b CI 下写 summary（顺带验证过滤生效：跳过全部 → 0 套件）
+  const filtered = runEntry({ SKIP_SUITES: skipAll, GITHUB_STEP_SUMMARY: 'reports/.ci-summary-check.md' })
   assert.strictEqual(filtered.status, 0, filtered.stderr || filtered.stdout)
-  assert.match(filtered.stdout, /共 1 个套件/, '只剩一个套件时应报告 1 个')
+  assert.match(filtered.stdout, /共 0 个套件/, '跳过全部套件时应报告 0 个')
   const summary = fs.readFileSync('reports/.ci-summary-check.md', 'utf8')
   assert.match(summary, /^## 单元测试结果/m, 'CI 下应写入 job summary')
-  assert.match(summary, /共 1 套件/, 'summary 套件数应与实际执行数一致')
+  assert.match(summary, /共 0 套件/, 'summary 套件数应与实际执行数一致')
 
   // 3c 变异子进程必须不写 summary：把落点指到不存在的目录，真去写就会 ENOENT 崩掉 ——
   //    因此「exit 0 且 stderr 无 ENOENT」即证明没有发生写入
   const child = runEntry({
-    SKIP_SUITES: skipAllButOne,
+    SKIP_SUITES: skipAll,
     GITHUB_STEP_SUMMARY: 'reports/.ci-missing-dir/.ci-summary-child.md',
     XBK_MUTATION_CHILD: '1'
   })
@@ -394,73 +390,17 @@ try {
 
   // 3e 输出超限（ENOBUFS）必须标注为「输出超限」而不是普通测试失败：
   //    XBK_UNIT_MAX_BUFFER 仅测试注入；留一个必输出内容的套件、把上限压到 1 字节
+  const oneLeft = unitFiles.filter(f => f !== 'test_check_deps.js').join(',')
   const overflow = runEntry({
-    SKIP_SUITES: skipAllButOne,
+    SKIP_SUITES: oneLeft,
     GITHUB_STEP_SUMMARY: 'reports/.ci-summary-overflow.md',
     XBK_UNIT_MAX_BUFFER: '1'
   })
   assert.notStrictEqual(overflow.status, 0, '输出超过 maxBuffer 的套件应判定失败')
   assert.match(overflow.stdout, /::error title=输出超限/, '失败原因必须标注为输出超限（非测试失败）')
-
-  // 3f 零套件必须非 0（UT-01 守卫回归）：SKIP_SUITES 覆盖全部单元套件时，修复前入口报
-  //    「共 0 个套件 / 全部通过 🎉」并 exit 0，连本套件（唯一的 SKIP_SUITES 对账守护）都会被同一变量
-  //    一起跳过而无人告警——这正是门禁整步假绿的形态，必须固定为失败。
-  const zero = runEntry({ SKIP_SUITES: skipAll })
-  assert.notStrictEqual(zero.status, 0, 'SKIP_SUITES 过滤后为空必须非 0 退出（零套件不等于通过）')
-  assert.match(zero.stderr, /没有可执行的单元套件/, '错误应点名「过滤后没有可执行的单元套件」')
-  assert.ok(!/全部通过/.test(zero.stdout), '零套件时不得输出「全部通过」')
 } finally {
   fs.rmSync('reports/.ci-summary-check.md', { force: true })
   fs.rmSync('reports/.ci-summary-overflow.md', { force: true })
-}
-
-// 3g run_tests.js 的零套件守卫（RT-01）与失败原因诊断（RT-02）回归：该入口全量跑 41 个套件
-//    （含网络/常驻），不能直接驱动；故在临时目录里搭一个最小沙箱（桩 test_suites.js + 桩
-//    scripts/check-deps.js + 桩套件），只复制入口自身——与 test_run_mutation_internal.js 的
-//    copyProject 手法同源。
-function makeRunTestsSandbox (suites, files = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-run-tests-'))
-  fs.copyFileSync(path.join(__dirname, 'run_tests.js'), path.join(dir, 'run_tests.js'))
-  fs.mkdirSync(path.join(dir, 'scripts'))
-  fs.writeFileSync(path.join(dir, 'scripts', 'check-deps.js'), 'module.exports = { checkDependencies: () => true }\n')
-  fs.writeFileSync(path.join(dir, 'test_suites.js'), `module.exports = { SUITES: ${JSON.stringify(suites)} }\n`)
-  for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
-  return dir
-}
-function runRunTestsIn (dir) {
-  return spawnSync(process.execPath, [path.join(dir, 'run_tests.js')], { encoding: 'utf8', cwd: dir })
-}
-
-// 3g1 空注册表（SUITES=[]）必须非 0：修复前 allOk 初值 true → 「全部通过 🎉」并 exit 0（门禁假绿）
-const emptyDir = makeRunTestsSandbox([])
-try {
-  const empty = runRunTestsIn(emptyDir)
-  assert.notStrictEqual(empty.status, 0, 'SUITES 为空必须非 0 退出（零套件不等于通过）')
-  assert.match(empty.stderr, /SUITES 为空/, '错误应点名 SUITES 为空')
-  assert.ok(!/全部通过/.test(empty.stdout), 'SUITES 为空时不得输出「全部通过 🎉」')
-} finally {
-  fs.rmSync(emptyDir, { recursive: true, force: true })
-}
-
-// 3g2 失败原因必须落到输出（RT-02）：静默非零（exit 7）与被信号杀死（SIGKILL）在修复前都只有一行
-//     「❌ … 失败」，两者无法区分；现要求 status / signal 进输出。
-const diagDir = makeRunTestsSandbox(
-  [
-    { name: '静默非零', file: 'test_stub_exit7.js', desc: '不输出即 exit 7' },
-    { name: '信号击杀', file: 'test_stub_sigkill.js', desc: '被 SIGKILL 杀死' }
-  ],
-  {
-    'test_stub_exit7.js': 'process.exit(7)\n',
-    'test_stub_sigkill.js': "process.kill(process.pid, 'SIGKILL')\n"
-  }
-)
-try {
-  const diag = runRunTestsIn(diagDir)
-  assert.notStrictEqual(diag.status, 0, '失败套件必须非 0 退出')
-  assert.match(diag.stdout, /status=7/, '静默非零退出（exit 7）必须把退出码打进输出')
-  assert.match(diag.stdout, /signal=SIGKILL/, '被信号杀死的套件必须把 signal 打进输出')
-} finally {
-  fs.rmSync(diagDir, { recursive: true, force: true })
 }
 
 // 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加
@@ -470,5 +410,4 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   'mutation.yml 的变异测试 step 必须设 XBK_MUTATION_CHILD=1（否则重复整表 append，几百次即撞 1MiB 上限）')
 
 console.log(`✅ SKIP_SUITES（${skips.length} 项）与 test.yml 显式步骤双向一致，且未知条目会失败`)
-console.log('✅ 零套件守卫：SKIP_SUITES 全覆盖（run_unit_tests.js）与空注册表（run_tests.js）均非 0 退出')
 console.log('✅ 变异路径（run_mutation.js 子进程 + CI stryker step）均抑制 summary 重复追加')

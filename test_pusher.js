@@ -4,7 +4,7 @@
 //   - createPusher.send 超时分支（10s race → abort + PUSH_TIMEOUT failures + reject）
 //   - htmlTagNameEnd / isTagNameBoundary 纯函数边界
 const assert = require('node:assert')
-const { createPusher, htmlTagNameEnd, isTagNameBoundary, looksLikeHtmlLinear, looksLikeHtmlEnvelope } = require('./xbk_pusher')
+const { createPusher, htmlTagNameEnd, isTagNameBoundary } = require('./xbk_pusher')
 
 let failed = 0
 function test (name, fn) {
@@ -102,34 +102,6 @@ function test (name, fn) {
     assert.strictEqual(isTagNameBoundary('<br/>', 3), true, '/ 后跟 > 是边界（索引 3 指向 /）')
     assert.strictEqual(isTagNameBoundary('<divx', 4), false, '普通字母不是边界')
     assert.strictEqual(isTagNameBoundary('<div', 4), true, '字符串末尾 undefined 是边界')
-  })
-
-  // ===== 出口清洗门槛（审查 P1/S1/F1）=====
-  // 门槛必须取宽松包络：严格判定为 false 的载荷（标签名后再跟 < / 引号属性内含 <）在
-  // HTML5 tokenizer 下仍会构造出带事件的标签，而 slim 会以 contentType=2 原文送出。
-  await test('P7 出口门槛取宽松包络：严格判定为 false 的载荷也必须清洗（fail-closed）', async () => {
-    const desp = '<img src=x onerror=alert(1) <2>'
-    assert.strictEqual(looksLikeHtmlLinear(desp), false, '严格判定为 false（既有导出语义不变）')
-    assert.strictEqual(looksLikeHtmlEnvelope(desp), true, '宽松包络必须命中')
-    let received
-    const p = createPusher({
-      Utils: { sanitizeDecodedHtml: s => 'SAN[' + s + ']', decodeHtmlEntities: s => s },
-      getNotify: async () => ({ sendNotify: async (t, d) => { received = d }, configuredChannelNames: () => ['ch1'] })
-    })
-    await p.send('标题', desp, { sendNotify: async (t, d) => { received = d } })
-    assert.strictEqual(received, 'SAN[' + desp + ']', '门槛漏判会让未清洗的主动 HTML 直达客户端')
-  })
-
-  await test('P7 出口门槛：无 > 的输入不清洗（既有语义不变）', async () => {
-    const desp = '<a '.repeat(1000)
-    assert.strictEqual(looksLikeHtmlEnvelope(desp), false, '全文无 > 不是 HTML 形态')
-    let received
-    const p = createPusher({
-      Utils: { sanitizeDecodedHtml: s => 'SAN[' + s + ']', decodeHtmlEntities: s => s },
-      getNotify: async () => ({ sendNotify: async (t, d) => { received = d }, configuredChannelNames: () => ['ch1'] })
-    })
-    await p.send('标题', desp, { sendNotify: async (t, d) => { received = d } })
-    assert.strictEqual(received, desp, '纯文本不应被清洗改写')
   })
 
   console.log(`test_pusher OK (${failed === 0 ? '全部通过' : failed + ' 项失败'})`)

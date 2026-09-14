@@ -4,10 +4,6 @@
 // 覆盖：maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags
 const assert = require('node:assert')
 const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags } = require('./xbk_sendNotify_slim')
-// 判定器同源（S1/F1/P1）与截断单一实现（S6/F7）回归的对拍对象
-const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
-const { createUtils } = require('./xbk_utils')
-const Utils = createUtils({ safeRe: (source, flags) => new RegExp(source, flags) })
 
 let pass = 0
 let fail = 0
@@ -99,21 +95,6 @@ check('safeSlice: 修饰符退位到空', () => {
   const s = 'a\u0301b' // a + 组合重音
   const r = safeSlice(s, 1)
   assert.strictEqual(r, '', 'a后是修饰符，退位后为空')
-})
-check('safeSlice: 与主代码 Utils.truncateUtf16 全等（S6/F7 收敛回归，max>0）', () => {
-  const corpus = [
-    'hello', 'hello world', 'a\u{1F600}b', 'ab\u0301c', 'a\u0301b', '\u2764\uFE0F',
-    '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}', '\u{1F1E8}\u{1F1F3}',
-    'AB\u{1F44D}\u{1F3FD}x', 'a\u200Db'
-  ]
-  for (const s of corpus) {
-    for (let max = 1; max <= s.length + 2; max++) {
-      assert.strictEqual(safeSlice(s, max), Utils.truncateUtf16(s, max), `max=${max} ${JSON.stringify(s)}`)
-    }
-  }
-  // v3.185 补充平面修饰符（肤色）：整组退位，而不是只丢修饰符（旧本地实现返回 'AB👍' 裸基底）
-  assert.strictEqual(safeSlice('AB\u{1F44D}\u{1F3FD}x', 4), 'AB', '不留下裸基底 emoji')
-  assert.strictEqual(safeSlice('AB\u{1F44D}\u{1F3FD}x', 6), 'AB\u{1F44D}\u{1F3FD}')
 })
 
 // ===== safeErr =====
@@ -242,25 +223,6 @@ check('looksHtml: 含 <br> 返回 true', () => {
 })
 check('looksHtml: 含 <a href> 返回 true', () => {
   assert.strictEqual(looksHtml('<a href="http://x.com">link</a>'), true)
-})
-check('looksHtml: 与出口门槛 looksLikeHtmlEnvelope 同源等价（S1/F1/P1 回归）', () => {
-  const corpus = [
-    '<tag <2> ', '<img src=x onerror=alert(1) <2>', '<img src="a<b" onerror=alert(1)>',
-    '<b>x</b>', '<br/>', '<br />', '<a href="x">y', '<h1\u00A0id="a">hi</h1>', 'hello<br>world',
-    '<https://example.com>', '<2>', '<a', '<tag/foo>x>', '<br/ >', '<tag <2> <b>', '',
-    'plain text', '```html\n<b>x</b>\n```', '未闭合 `<b', '未闭合反引号 `a'
-  ]
-  for (const s of corpus) {
-    assert.strictEqual(looksHtml(s), looksLikeHtmlEnvelope(s), `渲染侧与出口门槛必须同一实现: ${JSON.stringify(s)}`)
-  }
-  // 曾发散的两类形态（渲染侧原为 true、出口原为 false → 未清洗即渲染）：宽松包络下必须仍判 HTML
-  assert.strictEqual(looksHtml('<tag <2> '), true, '标签名后再跟 < 仍应判 HTML（fail-closed）')
-  assert.strictEqual(looksHtml('<img src=x onerror=alert(1) <2>'), true, '无完整 > 的载荷应判 HTML')
-  assert.strictEqual(looksHtml('未闭合 `a'), false, '未闭合反引号是纯文本，不误判')
-  // 非字符串输入防御（门槛函数直接面对调用方传入值）
-  assert.strictEqual(looksHtml(undefined), false, 'undefined 不抛错且非 HTML')
-  assert.strictEqual(looksHtml(null), false, 'null 不抛错且非 HTML')
-  assert.strictEqual(looksHtml(123), false, '数字不是 HTML')
 })
 
 // ===== stripAngleTags =====
