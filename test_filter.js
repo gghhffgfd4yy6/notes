@@ -6710,7 +6710,9 @@ console.log('========================================\n');
     const path = require('path')
     const main = fs.readFileSync(path.join(__dirname, 'xbk_function_v3.js'), 'utf8')
     const changelog = fs.readFileSync(path.join(__dirname, 'CHANGELOG.md'), 'utf8')
-    const m = main.match(/v(\d+\.\d+)/)
+    // 只认文件头第一行：全文 match 会命中正文历史版本注释（xbk_function_v3.js:103 v3.235 等），
+    // 与 check-version.js 保持同一口径，文件头整行缺失时必须红
+    const m = main.split('\n', 1)[0].match(/v(\d+\.\d+)/)
     // v3.123：CHANGELOG 改为正序（最新在最下面）——取最后一个版本号
     const all = changelog.match(/^## v(\d+\.\d+)/gm)
     const c = all ? all[all.length - 1].match(/v(\d+\.\d+)/) : null
