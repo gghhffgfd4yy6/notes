@@ -7,9 +7,17 @@
 
 const got = require('got')
 const { baseRequestOptions, invalidateDnsForError, profileMs } = require('./xbk_agents')
-const { trimTrailingSlashes } = require('./xbk_utils')
+const { trimTrailingSlashes, createUtils } = require('./xbk_utils')
+const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
 const timeout = 15000
 const REQUEST_OPTIONS = baseRequestOptions()
+
+// Utils 最小实例（审查 S2/F2、S6/F7）：slim 由组合根（xbk_function_v3）延迟加载，拿不到它注入的
+// 共享 Utils 单例；为复用主代码的 sanitizeDecodedHtml / truncateUtf16（不再保留第二份实现），
+// 按 xbk_utils.createUtils 的契约自建实例。safeRe 用原生 RegExp：RE2 优先的注入策略属于组合根
+// 职责（xbk_utils 只要求「可用的 safeRe 函数」）；被复用的两个方法内部都有 100k 截断与线性预检，
+// 最坏耗时有界，且清洗链正则均为 RE2 兼容写法。
+const Utils = createUtils({ safeRe: (source, flags) => new RegExp(source, flags) })
 
 const requestExtras = (params) => {
   try { return params && params.signal ? { signal: params.signal } : {} } catch (e) { return {} }
@@ -39,30 +47,18 @@ function maskUrl (u) {
 }
 // 代理对安全截断（v3.147）：按码元截断但不切断 emoji——末尾高代理退一位、孤立低代理退一位
 // （Server酱 v3.126 只处理高代理；此处统一高/低代理，wxpusher summary 复用）
-// v3.178：与主代码 truncateUtf16 对齐——补 ZWJ/变体选择符/组合字符退位（wxpusher summary/TG 截断
+// v3.273（审查 S6/F7）：本文件不再保留第二份截断实现，收敛为薄封装主代码 Utils.truncateUtf16——
+// 此前注释声称「已对齐」，实际缺 v3.185 的补充平面修饰符退位（肤色 U+1F3FB-1F3FF、VS17 U+E0100-E01EF）
+// 且用 charCodeAt 读截断点后的码元，实测 safeSlice('AB👍🏽x', 4)='AB👍' 而主实现为 'AB'（裸基底 emoji）。
+// 现有单测锁定 max=0 → ''，与 truncateUtf16 的「非法 max 不截断」不同，故保留那一行显式守卫。
+// v3.178：主代码 truncateUtf16 补 ZWJ/变体选择符/组合字符退位（wxpusher summary/TG 截断
 // 曾拆散 👨👩👧👦 家庭 emoji、❤️ 丢 VS16；§12-2 重复实现收敛）
 function safeSlice (s, max) {
   let str
   try { str = String(s === undefined || s === null ? '' : s) } catch (e) { str = '' }
   if (str.length <= max) return str
-  let cut = str.slice(0, max)
-  const isModifier = (c) => c === 0x200D || (c >= 0xFE00 && c <= 0xFE0F) ||
-        (c >= 0x0300 && c <= 0x036F) || (c >= 0x1AB0 && c <= 0x1AFF) || (c >= 0x1DC0 && c <= 0x1DFF) ||
-        (c >= 0x20D0 && c <= 0x20FF) || (c >= 0xFE20 && c <= 0xFE2F)
-  while (cut.length > 0) {
-    const last = cut.charCodeAt(cut.length - 1)
-    if (last >= 0xD800 && last <= 0xDBFF) { cut = cut.slice(0, -1); continue } // 孤立高代理
-    if (last >= 0xDC00 && last <= 0xDFFF) {
-      const prev = cut.charCodeAt(cut.length - 2)
-      if (!(prev >= 0xD800 && prev <= 0xDBFF)) { cut = cut.slice(0, -1); continue } // 孤立低代理
-      break // 配对完整
-    }
-    if (last === 0x200D) { cut = cut.slice(0, -1); continue } // 末尾孤立 ZWJ
-    const next = str.charCodeAt(cut.length)
-    if (isModifier(next)) { cut = cut.slice(0, -1); continue } // 截断点后是修饰符 → 退位
-    break
-  }
-  return cut
+  if (max === 0) return '' // 单一实现：主代码 Utils.truncateUtf16 对非法 max 是「不截断」，故保留既有语义
+  return Utils.truncateUtf16(str, max)
 }
 // 错误摘要（v3.75）：失败日志统一打摘要而非整个 err 对象——
 // $.post 回调的 err 是 err.response.body（API 异常响应体，可能回显请求参数含密钥），
@@ -283,12 +279,21 @@ if (fs.existsSync(localPath)) {
 
 // 青龙面板环境变量覆盖本地配置：本地开发可用 push_config.local.js，
 // 青龙无需把密钥写进仓库，直接在环境变量中配置即可。
+// v3.273（审查 S9）：补齐 Bark 扩展参数与 QYWX_ORIGIN——这些键此前只认 push_config.local.js，
+// 从青龙 env 配置会被静默忽略（推送仍「成功」但存档/分组/声音/时效/跳转/代理全部落空）。
 const ENV_ALIASES = {
   PUSH_PLUS_TOKEN: ['PUSH_PLUS_TOKEN'],
   PUSH_PLUS_USER: ['PUSH_PLUS_USER'],
   PUSH_KEY: ['PUSH_KEY'],
   BARK_PUSH: ['BARK_PUSH'],
+  BARK_ARCHIVE: ['BARK_ARCHIVE'],
+  BARK_GROUP: ['BARK_GROUP'],
+  BARK_SOUND: ['BARK_SOUND'],
+  BARK_ICON: ['BARK_ICON'],
+  BARK_LEVEL: ['BARK_LEVEL'],
+  BARK_URL: ['BARK_URL'],
   QYWX_KEY: ['QYWX_KEY'],
+  QYWX_ORIGIN: ['QYWX_ORIGIN'],
   WX_pusher_appToken: ['WX_pusher_appToken', 'WX_PUSHER_APP_TOKEN'],
   WX_pusher_topicIds: ['WX_pusher_topicIds', 'WX_PUSHER_TOPIC_IDS'],
   WX_pusher_channels: ['WX_pusher_channels', 'WX_PUSHER_CHANNELS'],
@@ -315,7 +320,10 @@ for (const [configKey, names] of Object.entries(ENV_ALIASES)) {
 async function one () {
   const url = 'https://v1.hitokoto.cn/'
   // v3.151：3s 短超时——一言是推送装饰，API 慢/挂时不应阻塞推送（曾默认 15s，启用 HITOKOTO 用户每次推送延迟）
-  const res = await got.get(url, { ...REQUEST_OPTIONS, timeout: 3000 })
+  // v3.273（审查 S4）：显式关闭 got 内置重试（与 xbk_network/xbk_agents.prewarmTls 同口径）——
+  // got 默认对 GET 重试（limit=2，退避约 1s/2s），单次一言最坏 ≈ 3×3s+3s ≈ 12s，会吃满 pusher 的
+  // 10s 整体预算（Promise.race 先超时 → abort → 本轮全部通道取消 → 不写缓存、每轮重来）。
+  const res = await got.get(url, { ...REQUEST_OPTIONS, timeout: 3000, retry: { limit: 0 } })
   // body 兼容：官方 got 已自动解析 JSON；字符串响应时保留原文
   const body = typeof res.body === 'string' ? JSON.parse(res.body) : res.body
   // 防御（v3.86）：响应结构异常（缺 hitokoto/from）→ 抛错走 sendNotify 的 catch 跳过，
@@ -375,6 +383,12 @@ function pushPlusNotify (text, desp, params = {}) {
     const { PUSH_PLUS_TOKEN, PUSH_PLUS_USER } = push_config
     if (PUSH_PLUS_TOKEN) {
       desp = mdToPlain(desp) // v3.128：Push+ 默认 html，markdown 符号会原样显示
+      // v3.273（审查 S2/F2）：mdToPlain 先剥标签、后解码实体，实体编码的主动 HTML
+      // （&lt;img src=x onerror=alert(1)&gt;）会被还原成活标签直接进 Push+ 的 HTML 正文。
+      // PushPlus 的 content 是 HTML，故解码后、拼 <br> 前再走一次统一清洗（与主流程出口
+      // Pusher.send 同一个 Utils.sanitizeDecodedHtml）——Markdown/纯文本通道（Bark 等）语义不变，
+      // mdToPlain 本身也不改（其「解码出字面 <」的语义被单测锁定）。
+      desp = Utils.sanitizeDecodedHtml(desp)
       // v3.262：先归一化 \r\n → \n，避免 Windows 换行被逐字符替换成两个 <br>（多余空行）
       desp = desp.replaceAll('\r\n', '\n').replaceAll('\n', '<br>').replaceAll('\r', '<br>') // 默认为html, 不支持plaintext
       const body = {
@@ -485,7 +499,7 @@ function serverNotify (text, desp, params = {}) {
               ? 0
               : (rawErrno === '1024' || rawErrno === 1024 ? 1024 : rawErrno)
             if (errno === 0) {
-              console.log('Server 酱发送通知消息成功🎉\\n')
+              console.log('Server 酱发送通知消息成功🎉\n')
             } else if (errno === 1024) {
               // 一分钟内发送相同的内容会触发（内容已送达，视为成功不重试）
               console.log(`Server 酱发送通知消息异常 ${safeErr(data && data.errmsg)}\n`)
@@ -749,46 +763,15 @@ function qywxBotNotify (text, desp, params = {}) {
 
 // v3.159：wxpusher 内容类型自适应——contentType=3(Markdown) 不渲染 HTML 源码（{Html内容} 模板时内容裸露 <br>/<a href>）
 // 含真实 HTML 标签时自动切 contentType=2(HTML 渲染)；标签白名单避免误判 Markdown 的 <https://...> autolink
+// v3.273（审查 S1/F1/P1）：本文件不再保留第二份判定实现——收敛到 xbk_pusher 的
+// looksLikeHtmlEnvelope（与 Pusher 出口清洗门槛同一个函数）。此前的本地实现只看「标签名之后整串
+// 是否还有 >」，比出口的 looksLikeHtmlLinear 更宽（后者遇到 < 就跳过），于是出现
+// 「本通道判 HTML 渲染（contentType=2 原文送出）而出口判非 HTML 不清洗」的组合：
+// <img src=x onerror=alert(1) <2> 这类载荷未经清洗即被渲染（统一安全入口被绕过）。
+// 现渲染侧与清洗侧同源，contentType=2 当且仅当出口已执行 sanitizeDecodedHtml；
+// 门槛取宽松包络（fail-closed），不会反向收敛到渲染侧的严格判定。
 function looksHtml (s) {
-  if (!s || typeof s !== 'string') return false
-  // 与主流程 Pusher 的最终出口保持同一口径：不能只识别有限白名单，
-  // 否则 input/form 等真实 HTML 会被当 Markdown 原样发送。
-  // S8786：原 /<\s*\/?\s*[A-Za-z][A-Za-z0-9-]*(?=\s|\/?>)[^>]*>/i 在大量 "<tag" 且无 ">"
-  // 的对抗输入上呈 O(n²) 回溯；改为线性扫描：< → 可选空白/斜杠 → 字母开头标签名 →
-  // 名字后须跟空白、> 或 />（排除 <https://...> autolink）→ 其后存在 > 即判定为 HTML。
-  let i = 0
-  while (i < s.length) {
-    const lt = s.indexOf('<', i)
-    if (lt === -1) return false
-    const k = looksHtmlTagAt(s, lt) // 标签名结束位；-1 表示本处非完整标签
-    if (k === -1) { i = lt + 1; continue }
-    if (s.includes('>', k)) return true
-    return false // 本处起剩余串无 >：完整标签必然需要结束 >，后续不可能再命中
-  }
-  return false
-}
-
-// < 后可选空白/斜杠 → 字母开头标签名 → 名字后跟空白、> 或 />（排除 autolink）→ 其后存在 >
-// 返回标签名结束位 k（数字）；本处非完整标签返回 -1（继续找下一个 <）。调用方检查 k 之后
-// 是否存在 >：有则命中 HTML，无则剩余串再无 >，可直接判定非 HTML——避免每个 < 位置都对
-// 剩余串重复 includes 全扫，回到 O(n²)（S3516：统一返回数字类型，避免 bool/string 混用）
-function looksHtmlTagAt (s, lt) {
-  const n = s.length
-  // \s 语义（含 U+00A0 等 Unicode 空白）——与原 /<\s*.../ 正则口径一致（CodeRabbit 完整审核）
-  const isWs = (ch) => /\s/.test(ch)
-  const isNameChar = (ch) => /[A-Za-z0-9-]/.test(ch)
-  let j = lt + 1
-  while (j < n && isWs(s[j])) j++
-  if (j < n && s[j] === '/') {
-    j++
-    while (j < n && isWs(s[j])) j++
-  }
-  if (j >= n || !/[A-Za-z]/.test(s[j])) return -1
-  let k = j + 1
-  while (k < n && isNameChar(s[k])) k++
-  const c = k < n ? s[k] : ''
-  const nameOk = isWs(c) || c === '>' || (c === '/' && s[k + 1] === '>')
-  return nameOk ? k : -1
+  return looksLikeHtmlEnvelope(s)
 }
 
 // WxPusher 默认窗口：每个 appToken 单独维护，避免多应用分流时把两个额度混成一个。
@@ -841,34 +824,42 @@ function parseWxPusherChannels () {
   return wxPusherParsedChannels
 }
 
+// 配置值「已配置」判定（审查 S7/F3）：sendNotify / configuredChannelCount / configuredChannelNames
+// 曾各有一份口径（truthy / String(v).trim()!=='' / 两者混用），在 0/false/空白值下分裂——
+// BARK_PUSH='   ' 时自检报「1 个可用通道」而主流程抛 NO_CHANNEL_CONFIG（QingLong 自检假绿 → 全程漏推
+// 且零告警），PUSHME_KEY=0 时超时归因又把从未尝试的通道列为失败。统一为 sendNotify 实际尝试通道
+// 所用的两个谓词：0/false/空白 → 未配置；'0'/'false' 等非空字符串仍算已配置（历史行为不变）。
+function nonEmpty (v) {
+  if (!v) return false
+  try { return String(v).trim() !== '' } catch (e) { return false }
+}
+function delimitedNonEmpty (v) {
+  if (!v) return false
+  try { return String(v).split('#').some(s => s.trim() !== '') } catch (e) { return false }
+}
+
 function configuredChannelCount () {
   const c = push_config
   let count = 0
-  if (c.PUSH_PLUS_TOKEN) count++
-  if (c.PUSH_KEY) count++
-  if (c.BARK_PUSH) count++
-  if (c.QYWX_KEY) count++
+  if (nonEmpty(c.PUSH_PLUS_TOKEN)) count++
+  if (nonEmpty(c.PUSH_KEY)) count++
+  if (delimitedNonEmpty(c.BARK_PUSH)) count++
+  if (nonEmpty(c.QYWX_KEY)) count++
   if (hasWxPusherConfigured()) count++
-  if (c.WX_XIZHI_KEY) count++
-  if (c.DEER_KEY) count++
-  if (c.PUSHME_KEY) count++
-  if (c.TG_BOT_TOKEN && c.TG_USER_ID) count++
+  if (nonEmpty(c.WX_XIZHI_KEY)) count++
+  if (nonEmpty(c.DEER_KEY)) count++
+  if (delimitedNonEmpty(c.PUSHME_KEY)) count++
+  if (nonEmpty(c.TG_BOT_TOKEN) && nonEmpty(c.TG_USER_ID)) count++
   return count
 }
 
 function configuredChannelNames () {
   const c = push_config
-  const nonEmpty = (v) => {
-    try { return v !== undefined && v !== null && String(v).trim() !== '' } catch (e) { return false }
-  }
-  const delimited = (v) => {
-    try { return nonEmpty(v) && String(v).split('#').some(s => s.trim() !== '') } catch (e) { return false }
-  }
   return [
     [nonEmpty(c.PUSH_PLUS_TOKEN), 'pushplus'], [nonEmpty(c.PUSH_KEY), 'server酱'],
-    [delimited(c.BARK_PUSH), 'bark'], [nonEmpty(c.QYWX_KEY), '企业微信'],
+    [delimitedNonEmpty(c.BARK_PUSH), 'bark'], [nonEmpty(c.QYWX_KEY), '企业微信'],
     [hasWxPusherConfigured(), 'wxpusher'], [nonEmpty(c.WX_XIZHI_KEY), '息知'],
-    [nonEmpty(c.DEER_KEY), 'pushdeer'], [delimited(c.PUSHME_KEY), 'pushme'],
+    [nonEmpty(c.DEER_KEY), 'pushdeer'], [delimitedNonEmpty(c.PUSHME_KEY), 'pushme'],
     [nonEmpty(c.TG_BOT_TOKEN) && nonEmpty(c.TG_USER_ID), 'telegram']
   ].filter(([enabled]) => enabled).map(([, name]) => name)
 }
@@ -959,6 +950,10 @@ async function acquireWxPusherSlot (channels, tried, signal = null) {
 }
 
 function wxPusherRateLimited (err) {
+  // v3.273（审查 F8）：取消（ABORT_ERR）不是限频——本模块自己的取消消息是
+  // 'WxPusher 限频等待已取消'，含「限频」二字，会被下面的文本规则自匹配，使取消路径继续
+  // 逐个尝试剩余应用（每次立即再抛）。短路后取消直接上抛，最终错误类型不变（仍为 ABORT_ERR）。
+  if (err && (err.code === 'ABORT_ERR' || err.name === 'AbortError')) return false
   if (err && (err.code === 1001 || err.code === '1001')) return true
   const text = safeString(err && err.message ? err.message : err)
   return /1001|速度太快|10秒内访问超过20次|限流|限频/i.test(text)
@@ -1386,14 +1381,8 @@ async function sendNotify (text, desp, params = {}) {
   // 注意：这里必须与下方 Promise.all 实际调用的通道一一对应，漏一个就会让已配置的通道静默失效。
   // 分隔型配置（Bark/PushMe）还要排除只有分隔符/空白的值，否则通道函数会无请求地 resolve，
   // configuredFlags 又把它计为已配置，最终出现「无实际设备却虚假成功」的 P1。
-  const nonEmpty = (v) => {
-    if (!v) return false
-    try { return String(v).trim() !== '' } catch (e) { return false }
-  }
-  const delimitedNonEmpty = (v) => {
-    if (!v) return false
-    try { return String(v).split('#').some(s => s.trim() !== '') } catch (e) { return false }
-  }
+  // v3.273（审查 S7/F3）：谓词提升到模块级（上方 nonEmpty/delimitedNonEmpty），
+  // 供 configuredChannelCount / configuredChannelNames 共用同一口径——三处曾各有一份实现。
   const configuredFlags = [
     nonEmpty(push_config.PUSH_PLUS_TOKEN), nonEmpty(push_config.PUSH_KEY), delimitedNonEmpty(push_config.BARK_PUSH),
     nonEmpty(push_config.QYWX_KEY), parseWxPusherChannels().length > 0, nonEmpty(push_config.WX_XIZHI_KEY),
@@ -1411,7 +1400,10 @@ async function sendNotify (text, desp, params = {}) {
         (typeof push_config.HITOKOTO === 'string' && push_config.HITOKOTO.toLowerCase() === 'true')
   if (hitokotoEnabled) {
     if (typeof one === 'function') {
-      try { desp += '\n\n' + (await one()) } catch (e) { console.log('一言获取失败，跳过:', e && e.message ? e.message : String(e)) }
+      // v3.273（审查 S8）：一言文本在入口 cleanSurrogates 之后拼接，其 JSON 里可能带转义孤立代理
+      // （\ud800 类）→ 下游 serverNotify/pushDeerNotify 直接 encodeURIComponent 会抛 URIError，
+      // 该通道每轮确定性失败。拼接后再清洗一次，与入口「推送前统一处理孤立代理」一致。
+      try { desp = cleanSurrogates(desp + '\n\n' + (await one())) } catch (e) { console.log('一言获取失败，跳过:', e && e.message ? e.message : String(e)) }
     }
   }
   // 只启动已配置通道：未配置通道原本虽会立即 resolve，但每条消息仍会创建函数/Promise/对象。
