@@ -7,23 +7,20 @@
 
 const got = require('got')
 const { baseRequestOptions, invalidateDnsForError, profileMs } = require('./xbk_agents')
-const { trimTrailingSlashes, createUtils } = require('./xbk_utils')
+const { trimTrailingSlashes } = require('./xbk_utils')
 const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
 const timeout = 15000
 const REQUEST_OPTIONS = baseRequestOptions()
 
-// Utils 最小实例（审查 S2/F2、S6/F7）：slim 由组合根（xbk_function_v3）延迟加载，拿不到它注入的
-// 共享 Utils 单例；为复用主代码的 sanitizeDecodedHtml / truncateUtf16（不再保留第二份实现），
-// 按 xbk_utils.createUtils 的契约自建实例。safeRe 用原生 RegExp：RE2 优先的注入策略属于组合根
-// 职责（xbk_utils 只要求「可用的 safeRe 函数」）；被复用的两个方法内部都有 100k 截断与线性预检，
-// 最坏耗时有界，且清洗链正则均为 RE2 兼容写法。
-// 静态告警说明（Codacy/Opengrep `detect-non-literal-regexp`，confidence: LOW）：该规则是
-// 「函数形参 → RegExp」的污点启发式，命中本行是因为 safeRe 的 pattern 恰好是形参；实际 pattern
-// 全部来自本模块内的字面量模板常量（清洗链固定写法），无任何外部净输入，属误报。
-// `// nosemgrep` 行内登记对本仓库的 Codacy 引擎不生效（配置层也不支持按规则忽略），已在 PR 中
-// 记录为唯一残留告警；如需清零，只能改为复用组合根的 RE2 优先 safeRe（需先把 safeRe 从
-// xbk_function_v3 导出并注入本模块），或在 Codacy 网页端把该条 Ignore（作用于仓库级 issue 列表）。
-const Utils = createUtils({ safeRe: (source, flags) => new RegExp(source, flags) })
+// 复用主代码的 sanitizeDecodedHtml / truncateUtf16（审查 S2/F2、S6/F7：不再保留第二份实现）。
+// 组合根（xbk_function_v3）已把这两个 Utils 方法绑定导出，这里直接复用——此前 slim 用 createUtils
+// 自建实例并自留裸 `new RegExp` 兜底：既拿不到组合根的 RE2 与正则缓存（ReDoS 防护弱一档），又被
+// Codacy/Opengrep 的 `detect-non-literal-regexp`（「函数形参 → RegExp」污点启发式，confidence: LOW）
+// 判为新告警。
+// 惰性 require 是刻意的：slim 的加载序可能早于组合根（test_app.js 就先 require slim，之后才替换
+// got/notify 的 require.cache 条目），初始化期拉起组合根会提前固化下游依赖、破坏测试注入；而这两个
+// 方法只在真正推送时才被调用。
+const shared = () => require('./xbk_function_v3.js')
 
 const requestExtras = (params) => {
   try { return params && params.signal ? { signal: params.signal } : {} } catch (e) { return {} }
@@ -64,7 +61,7 @@ function safeSlice (s, max) {
   try { str = String(s === undefined || s === null ? '' : s) } catch (e) { str = '' }
   if (str.length <= max) return str
   if (max === 0) return '' // 单一实现：主代码 Utils.truncateUtf16 对非法 max 是「不截断」，故保留既有语义
-  return Utils.truncateUtf16(str, max)
+  return shared().truncateUtf16(str, max)
 }
 // 错误摘要（v3.75）：失败日志统一打摘要而非整个 err 对象——
 // $.post 回调的 err 是 err.response.body（API 异常响应体，可能回显请求参数含密钥），
@@ -394,7 +391,7 @@ function pushPlusNotify (text, desp, params = {}) {
       // PushPlus 的 content 是 HTML，故解码后、拼 <br> 前再走一次统一清洗（与主流程出口
       // Pusher.send 同一个 Utils.sanitizeDecodedHtml）——Markdown/纯文本通道（Bark 等）语义不变，
       // mdToPlain 本身也不改（其「解码出字面 <」的语义被单测锁定）。
-      desp = Utils.sanitizeDecodedHtml(desp)
+      desp = shared().sanitizeDecodedHtml(desp)
       // v3.262：先归一化 \r\n → \n，避免 Windows 换行被逐字符替换成两个 <br>（多余空行）
       desp = desp.replaceAll('\r\n', '\n').replaceAll('\n', '<br>').replaceAll('\r', '<br>') // 默认为html, 不支持plaintext
       const body = {
