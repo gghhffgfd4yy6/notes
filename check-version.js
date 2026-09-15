@@ -110,7 +110,10 @@ function checkVersion () {
 if (require.main === module) {
   const result = checkVersion()
   for (const line of result.messages) (result.ok ? console.log(line) : console.error(line))
-  if (!result.ok) process.exit(1)
+  // F8：失败时置 process.exitCode 而非 process.exit(1)——后者会立刻终止进程，丢弃尚未 flush 的
+  // stdout/stderr，管道（如 CI `node check-version.js | tee`）最后一次 stderr 写可能被截断；
+  // 此处无其它活动句柄，事件循环排空后自然退出，退出码语义不变（失败仍为 1）。
+  if (!result.ok) process.exitCode = 1
 }
 
 module.exports = { baseVersion, patchOf, checkVersionValues, checkVersion }
