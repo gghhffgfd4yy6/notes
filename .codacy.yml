@@ -65,7 +65,7 @@
 # scripts/install-hooks.js 是 git hooks 安装/自检工具（仓库开发者脚本）：
 # fs.statSync / fs.existsSync / fs.chmodSync 的目标只由 HOOKS_DIR 常量（'.githooks'）与静态
 # HOOK_FILES 清单拼成，无外部净输入，动态路径注入告警属误报（SonarCloud 侧同类误报 S4036
-# 已由 sonar-project.properties 的 e1 条目登记）。
+# 已由 .sonarcloud.properties 的 e1 条目登记）。
 #
 # test_ci_skip_suites.js 的 makeRunTestsSandbox 在 fs.mkdtempSync(os.tmpdir() + 固定前缀) 生成的
 # 临时目录下，用测试硬编码的文件名搭最小沙箱（桩 test_suites.js / scripts/check-deps.js / 套件），

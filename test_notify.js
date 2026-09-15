@@ -452,8 +452,8 @@ console.log('========================================\n');
     assert(!content.includes('onerror'), `onerror 应被清除: ${content}`)
     // S1523 门槛修复（#140/#141 撤销的直接原因）：危险协议用拼接构造，源码里不出现可被静态规则
     // 直接命中的 `javascript:` 字面量——运行时字符串与原来逐字节一致，断言强度不变。
-    // sonar-project.properties 的 e2 忽略条目保留为第二道保险：它只对「本次分析中重新扫描的文件」
-    // 生效，issue 已存在时不会回溯关闭（8941a64 分析实测），故不能只依赖它。
+    // （.sonarcloud.properties 里为 test_notify.js 保留了 S1523 忽略条目作第二道保险；此前同名
+    //  配置写在 sonar-project.properties，而自动分析只读 .sonarcloud.properties，故一直没生效。）
     const JS_PROTO = 'java' + 'script:'
     await notify.sendNotify('标题', '&lt;a href=' + JS_PROTO + 'alert(1)&gt;点我&lt;/a&gt;')
     const content2 = JSON.parse(gotCalls[1].options.body).content
