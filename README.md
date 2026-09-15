@@ -4,7 +4,7 @@
 
 ## 安装与运行
 
-要求 Node.js ≥ 22.22.2（`re2` 原生模块 `engines` 的要求；青龙入口的 `--check` 只校验主版本 ≥ 22）。
+要求 Node.js `^22.22.2 || ^24.15.0 || >=26.0.0`（`re2` 原生模块的 `engines` 要求；`package.json` 的 `engines.node` 只写 `>=22.22.2`，青龙入口 `--check` 只校验主版本 ≥ 22。Node 23.x、24.0–24.14、25.x 不在 re2 支持范围内，安装或重建原生模块会失败）。
 
 ```bash
 npm install --ignore-scripts
