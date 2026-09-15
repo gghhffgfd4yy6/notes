@@ -9625,5 +9625,130 @@ console.log('========================================\n');
     assertEqual(len, 100000, '超过 100000 的 desp 应截断')
   })
 
+  // ============================================================
+  // 补测（qodo PR #147 复审 / 主代理新修）：xbk_filter.js
+  //   ① FILTER-03 形状守卫（_passIfMissing 字段级 _type / checkFields __compiled）
+  //   ② FILTER-06 _legacyListfilter 编译失败告警留痕（原先 catch 静默 return true）
+  //   ③ qodo #147-6 catch 中异常值为 Symbol 时不得再抛（保守放行 + 告警）
+  //   ④ whitelistFilter 非字符串字段值统一 String() 口径（与 matchesCompiled 同源）
+  // 本区块为文末追加，不改动上方任何既有断言。
+  // ============================================================
+  console.log('\n📂 补测：xbk_filter 形状守卫 / 编译失败告警 / 非字符串值口径')
+
+  const { createFilterEngine: _createFilterEngine } = require('./xbk_filter')
+  // 直测 xbk_filter 内部 _passIfMissing（主入口未导出 FilterEngine，故就地构造最小引擎）
+  const _shapeProbeEngine = _createFilterEngine({
+    Utils: { safeGet: (obj, key) => (obj ? obj[key] : undefined) },
+    RuleEngine: {},
+    FILTER_FIELDS: ['pingbifenlei'],
+    compileUserRegex: () => null
+  })
+  // 捕获 console.warn 且不吞异常（沿用文件既有 try/finally 手法）：返回 value/error/warnings
+  const _captureWarn = (fn) => {
+    const warnings = []
+    const originalWarn = console.warn
+    let value
+    let error = null
+    try {
+      console.warn = (...args) => warnings.push(args.join(' '))
+      try { value = fn() } catch (e) { error = e }
+    } finally {
+      console.warn = originalWarn
+    }
+    return { value, error, warnings }
+  }
+
+  await test('补测 FILTER-03：_passIfMissing 收到非字段级形状 compiled → 告警并先于 checkFn 保守放行', () => {
+    let checkFnCalls = 0
+    const { value, error, warnings } = _captureWarn(() =>
+      _shapeProbeEngine._passIfMissing({ probe: 'x' }, 'probe', { _type: 123 }, () => { checkFnCalls++; return true })
+    )
+    assertEqual(error, null, '形状守卫路径不得抛异常')
+    assertEqual(value, true, '非字段级形状（_type 非字符串）必须保守放行')
+    assertEqual(checkFnCalls, 0, '形状守卫应在调用 checkFn 之前短路')
+    assertEqual(warnings.some(m => m.includes('过滤检查收到未编译的规则对象')), true, '必须显式告警留痕')
+  })
+
+  await test('补测 FILTER-03：checkCategory/checkRegisterTime 收到原始配置 → 告警且仍放行', () => {
+    const cat = _captureWarn(() => checkCategory({ catename: '微博' }, { pingbifenlei: '微博' }))
+    assertEqual(cat.error, null, '不得抛异常')
+    assertEqual(cat.value, true, '原始配置非字段级规则 → 保守放行')
+    assertEqual(cat.warnings.some(m => m.includes('过滤检查收到未编译的规则对象')), true, '必须告警留痕')
+
+    const time = _captureWarn(() => checkRegisterTime({ louzhuregtime: daysAgo(2) }, { pingbitime: '5' }))
+    assertEqual(time.error, null, '不得抛异常')
+    assertEqual(time.value, true, '原始配置非字段级规则 → 保守放行')
+    assertEqual(time.warnings.some(m => m.includes('过滤检查收到未编译的规则对象')), true, '必须告警留痕')
+  })
+
+  await test('补测 FILTER-03：合法字段级规则不受形状守卫影响（不告警，拦截语义不变）', () => {
+    const compiled = compileRules({ pingbifenlei: '微博' })
+    const hit = _captureWarn(() => checkCategory({ catename: '微博' }, compiled.pingbifenlei))
+    assertEqual(hit.value, false, '合法规则命中仍拦截')
+    assertEqual(hit.warnings.length, 0, '合法输入不得产生形状告警')
+
+    const missing = _captureWarn(() => checkRegisterTime({ louzhuregtime: daysAgo(2) }, null))
+    assertEqual(missing.value, true, 'compiled 缺失沿用放行')
+    assertEqual(missing.warnings.length, 0, '「缺失」不是错形状，不得告警')
+  })
+
+  await test('补测 FILTER-03：checkFields 收到非 __compiled 产物 → 告警并保守放行', () => {
+    const group = { louzhu: 'x', title: '屏蔽词', content: 'y' }
+    // 原始字符串配置：无守卫时下游 matchesCompiled 对未知 _type 静默返回 false →「全放行且无留痕」
+    const rawStr = _captureWarn(() => checkFields(group, { pingbibiaoti: '屏蔽词' }))
+    assertEqual(rawStr.error, null, '不得抛异常')
+    assertEqual(rawStr.value, true, '原始配置应保守放行')
+    assertEqual(rawStr.warnings.some(m => m.includes('checkFields 收到未编译的配置')), true, '必须告警留痕')
+    // 原始配置里嵌套字段级规则：无守卫时会被当作 blockCfg 直接拦截（false）——锁定守卫先于匹配短路
+    const nested = _captureWarn(() => checkFields(group, { pingbibiaoti: { _type: 're', re: /屏蔽/ } }))
+    assertEqual(nested.error, null, '不得抛异常')
+    assertEqual(nested.value, true, '非 __compiled 产物必须先于字段匹配短路放行')
+    assertEqual(nested.warnings.some(m => m.includes('checkFields 收到未编译的配置')), true, '必须告警留痕')
+    // 负例：compiled 缺失（falsy）不告警，沿用放行
+    const missing = _captureWarn(() => checkFields(group, undefined))
+    assertEqual(missing.value, true, 'compiled 缺失沿用放行')
+    assertEqual(missing.warnings.length, 0, 'falsy 参数不算错形状，不得告警')
+  })
+
+  await test('补测 FILTER-06：_legacyListfilter 编译失败改为告警，而非静默放行', () => {
+    const cfg = { pingbibiaoti: 'error-catch-probe-unique-2' }
+    Object.defineProperty(cfg, 'pingbifenlei', { get () { throw new Error('模拟配置读取异常') } })
+    const { value, error, warnings } = _captureWarn(() =>
+      listfilter(makeItem({ catename: 'x', louzhu: 'u', title: 't', content: 'c' }), cfg)
+    )
+    assertEqual(error, null, '编译失败不得冒泡')
+    assertEqual(value, true, '编译失败必须保守放行')
+    assertEqual(warnings.some(m => m.includes('过滤规则编译失败')), true, '编译失败必须告警留痕（原先 catch 静默 return true）')
+    assertEqual(warnings.some(m => m.includes('模拟配置读取异常')), true, '告警应携带异常信息')
+  })
+
+  await test('补测 qodo #147-6：catch 中异常值为 Symbol 时不得再抛（保守放行 + 告警）', () => {
+    const cfg = { pingbibiaoti: 'symbol-catch-probe-unique-1' }
+    Object.defineProperty(cfg, 'pingbifenlei', { get () { throw Symbol('boom') } })
+    const { value, error, warnings } = _captureWarn(() =>
+      listfilter(makeItem({ catename: 'x', louzhu: 'u', title: 't', content: 'c' }), cfg)
+    )
+    assertEqual(error, null, '模板插值 Symbol 会在 catch 内再抛 TypeError——异常值必须用 String() 安全取值')
+    assertEqual(value, true, '编译失败必须保守放行')
+    assertEqual(warnings.some(m => m.includes('过滤规则编译失败')), true, '必须告警留痕')
+  })
+
+  await test('补测 whitelistFilter 非字符串字段值：统一 String() 口径（数字/对象/函数）', () => {
+    // 数字：String() 与旧 safeText 对数字一致，锁定行为不变
+    assertEqual(whitelistFilter({ title: 12345 }, 'title', '234'), true, '数字字段值应参与匹配')
+    assertEqual(whitelistFilter({ title: 12345 }, 'title', '999'), false, '数字字段值不命中仍不匹配')
+    // 对象：String() 化 → "[object Object]"，而非旧 safeText 的 JSON.stringify
+    assertEqual(whitelistFilter({ title: { a: 1 } }, 'title', 'object Object'), true, '对象字段值 String() 化后应命中')
+    assertEqual(whitelistFilter({ title: { a: 1 } }, 'title', 'a'),
+      matchesCompiled(compileRules({ pingbibiaoti: 'a' }).pingbibiaoti, { a: 1 }, 'cat'),
+      'JSON 键不再被序列化命中——与 matchesCompiled 同口径')
+    // 自定义 toString：String() 取其文本（旧 safeText 走 JSON → "{}" → 不命中）
+    assertEqual(whitelistFilter({ title: { toString: () => '京东神券' } }, 'title', '京东'), true, '自定义 toString 文本应参与匹配')
+    // 函数：String() 取源码（旧 safeText 对函数返回空串 → 永不命中）
+    const probe = function 京东 () {}
+    assertEqual(whitelistFilter({ title: probe }, 'title', '京东'), true, '函数字段值 String() 源码应参与匹配')
+    assertEqual(matchesCompiled(compileRules({ pingbibiaoti: '京东' }).pingbibiaoti, probe, 'cat'), true, 'matchesCompiled 同口径命中')
+  })
+
   process.exit(failed > 0 ? 1 : 0)
 })()

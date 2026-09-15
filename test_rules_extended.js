@@ -78,6 +78,39 @@ check('compileRules: 值为空跳过（避免永真规则）', () => {
   assert.ok(r, '空值应被跳过')
 })
 
+// ===== compileRules: pingbitime 上限 / 抛错 getter（qodo #147-3）=====
+check('compileRules: pingbitime 简单形态超上限置 null 并告警（规则被忽略）', () => {
+  const origWarn = console.warn
+  const warns = []
+  let r
+  try {
+    console.warn = (...args) => warns.push(args.join(' '))
+    r = engine.compileRules({ pingbitime: '3650001' })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(r.pingbitime, null, '超上限应置 null（不编译该规则）')
+  assert.ok(warns.some(w => w.includes('超过上限')), '应 console.warn 提示超上限')
+})
+
+check('compileRules: pingbitime 多行形态超上限行被忽略（仅保留合法行）', () => {
+  const origWarn = console.warn
+  let r
+  try {
+    console.warn = () => {}
+    r = engine.compileRules({ pingbitime: 'cat###3650001\ncat###5' })
+  } finally { console.warn = origWarn }
+  assert.ok(r.pingbitime && r.pingbitime._type === 'timeMulti', '应编译为多行时间规则')
+  assert.strictEqual(r.pingbitime.rules.length, 1, '超上限行应被忽略，仅保留合法行')
+  assert.strictEqual(r.pingbitime.rules[0].value, 5, '保留的应为合法行 5')
+})
+
+check('compileRules: pingbitime 抛错 getter 不抛穿且规则置空', () => {
+  const cfg = {}
+  Object.defineProperty(cfg, 'pingbitime', { get () { throw new Error('boom-pingbitime') } })
+  let r
+  assert.doesNotThrow(() => { r = engine.compileRules(cfg) }, '抛错 getter 不得抛穿 compileRules')
+  assert.strictEqual(r.pingbitime, null, 'getter 抛错应视为无该字段')
+})
+
 // ===== matchesCompiled =====
 check('matchesCompiled: 匹配成功返回 true', () => {
   const compiled = engine.compileRules({ keyword: 'cat###abc' })
@@ -209,6 +242,65 @@ check('validateConfig: pingbitime 非数字告警', () => {
 check('validateConfig: 正常配置无警告', () => {
   const warnings = engine.validateConfig({ keyword: 'cat###abc' })
   assert.strictEqual(warnings.length, 0, '正常配置应无警告')
+})
+
+// ===== validateConfig: RULES-02/03/04（qodo #147-3）=====
+check('validateConfig: 过滤字段抛错 getter 只告警不抛穿（RULES-04）', () => {
+  const cfg = {}
+  Object.defineProperty(cfg, 'keyword', { enumerable: true, get () { throw new Error('boom-keyword') } })
+  let warnings
+  assert.doesNotThrow(() => { warnings = engine.validateConfig(cfg) }, '抛错 getter 不得抛穿 validateConfig')
+  assert.ok(warnings.some(w => w.includes('读取失败') && w.includes('keyword')), '应告警该字段读取失败')
+  assert.ok(warnings.some(w => w.includes('已忽略该字段过滤')), '应按「无该字段」处理（跳过而非中断）')
+})
+
+check('validateConfig: zkt_gjc 抛错 getter 只告警不抛穿（RULES-04）', () => {
+  const cfg = {}
+  Object.defineProperty(cfg, 'zkt_gjc', { get () { throw new Error('boom-zkt') } })
+  let warnings
+  assert.doesNotThrow(() => { warnings = engine.validateConfig(cfg) }, '抛错 getter 不得抛穿 validateConfig')
+  assert.ok(warnings.some(w => w.includes('读取失败') && w.includes('zkt_gjc')), '应告警 zkt_gjc 读取失败')
+})
+
+check('validateConfig: pingbifenlei 抛错 getter 只告警不抛穿（RULES-04）', () => {
+  const cfg = {}
+  Object.defineProperty(cfg, 'pingbifenlei', { get () { throw new Error('boom-pbfl') } })
+  let warnings
+  assert.doesNotThrow(() => { warnings = engine.validateConfig(cfg) }, '抛错 getter 不得抛穿 validateConfig')
+  assert.ok(warnings.some(w => w.includes('读取失败') && w.includes('pingbifenlei')), '应告警 pingbifenlei 读取失败')
+})
+
+check('validateConfig: pingbitime 抛错 getter 只告警不抛穿', () => {
+  const cfg = {}
+  Object.defineProperty(cfg, 'pingbitime', { get () { throw new Error('boom-pb') } })
+  let warnings
+  assert.doesNotThrow(() => { warnings = engine.validateConfig(cfg) }, '抛错 getter 不得抛穿 validateConfig')
+  assert.ok(warnings.some(w => w.includes('无法转换为字符串')), '应告警 pingbitime 无法转换为字符串')
+})
+
+check('validateConfig: 模式含零宽字符（U+200B-200D/U+FEFF）告警（RULES-02）', () => {
+  for (const c of ['\u200B', '\u200C', '\u200D', '\uFEFF']) {
+    const code = 'U+' + c.codePointAt(0).toString(16).toUpperCase()
+    const warnings = engine.validateConfig({ keyword: `cat###a${c}b` })
+    assert.ok(warnings.some(w => w.includes('零宽字符')), `模式含零宽 ${code} 应告警`)
+  }
+  const simple = engine.validateConfig({ keyword: 'a\u200Bb' })
+  assert.ok(simple.some(w => w.includes('零宽字符')), '简单模式（无 ###）零宽也应告警')
+})
+
+check('validateConfig: pingbitime 简单形态超上限告警（RULES-03）', () => {
+  const warnings = engine.validateConfig({ pingbitime: '3650001' })
+  assert.ok(warnings.some(w => w.includes('超过上限') && w.includes('已忽略')), '简单形态超上限应告警')
+})
+
+check('validateConfig: pingbitime 恰为上限 3650000 不告警（边界）', () => {
+  const warnings = engine.validateConfig({ pingbitime: '3650000' })
+  assert.strictEqual(warnings.length, 0, '恰为上限不应告警')
+})
+
+check('validateConfig: pingbitime 多行形态超上限告警', () => {
+  const warnings = engine.validateConfig({ pingbitime: 'cat###3650001' })
+  assert.ok(warnings.some(w => w.includes('超过上限') && w.includes('天数值')), '多行形态超上限应告警')
 })
 
 // 夹具契约：mockUtils.parseTime 必须与生产 Utils.parseTime 同语义。
