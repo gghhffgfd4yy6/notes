@@ -13,13 +13,27 @@ function createApp ({
     try { return typeof crypto?.timingSafeEqual === 'function' && crypto.timingSafeEqual(actualBytes, expectedBytes) } catch (e) { return false }
   }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
+  // APP-05：日志/台账时间戳与日报（_reportToday）/告警统一到硬编码 Asia/Shanghai，避免进程
+  // 本地时区（如 CI runner 的 UTC）使同一时刻的 run.log 行与日报日界错位一天。sv-SE + 24 小时制
+  // 恰好输出 YYYY-MM-DD HH:mm:ss，与历史格式逐字符一致（不破坏日志解析）。中国无夏令时，日界稳定。
+  const shanghaiStampFormatter = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  })
 
   const App = {
-  // v3.176：运行日志时间戳本地化（与日报/告警本地口径一致）——曾 toISOString（UTC），
-  // UTC+8 用户凌晨 cron 排查时 UTC 行与本地日期混排易误判（系统审查 #9）
+  // v3.176：运行日志时间戳本地化——曾 toISOString（UTC），UTC+8 用户凌晨 cron 排查时
+  // UTC 行与本地日期混排易误判（系统审查 #9）。
+  // APP-05：修正口径不一致——原先用 getHours 等进程本地时区，注释却称与日报/告警「本地口径
+  // 一致」（_reportToday 硬编码 Asia/Shanghai）；现统一为同一 Asia/Shanghai 口径，格式不变。
     _localStamp () {
-      const d = new Date()
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
+      return shanghaiStampFormatter.format(new Date())
     },
 
     // 文件级安全检查：缓存目录安全并不等于目录内的单个文件安全。
@@ -1265,6 +1279,10 @@ function createApp ({
         const contentMax = (() => { const v = Math.floor(Utils.num(Config.push.contentMax, 3000)); return v > 0 ? v : 3000 })()
 
         // 单条推送（两种模式共用）：成功返回 {ok:true} 并记录；失败警告且不写缓存(下次重试)
+        // APP-06（已知缺口，未收紧）：模板渲染段（safeObjectCopy/urlOf/Formatter.tuisong_replace/
+        // sanitizeSurrogates/truncateUtf16/链接保留）仍在下方 try 之外，渲染期异常会冒泡中止整轮
+        // （并行模式 Promise.all 直接 reject、saveBatch 不执行）。收紧需重排 pushOne 的 try 边界并
+        // 定义渲染异常的成功/失败归类与缓存写入时机，属推送结果判定语义，留待专门变更处理。
         const pushOne = async (item, notifyModule) => {
         // 推送内容截断：避免超长标题/内容被推送 API 拒绝（长度可配置，默认 100/3000）
         // 用 UTF-16 安全截断（不切断 emoji 代理对）
@@ -1323,6 +1341,9 @@ function createApp ({
         }
 
         // v3.223：推送模块（含 got）已与接口并行加载，首推前确保完成（接口快时最多等剩余加载时间）
+        // APP2-04（已知缺口，未收紧）：dry-run 仍在此 await getNotify()，且上方预热 Promise 也调用
+        // getNotify()，故 dry-run 依旧依赖推送模块可加载（.then 内只是跳过 DNS/TLS 预热）。改为按需
+        // 加载需同步重排预热 Promise/checkpoint/PROFILE3 摘要（notifyModule 也可能为 null），留待专门变更。
         const notifyModule = await getNotify()
         checkpoint('notify-module-loaded')
 
@@ -1391,6 +1412,11 @@ function createApp ({
           }
           if (sent && Array.isArray(sent.failures)) channelFailures.push(...sent.failures)
           if (result.failure) {
+            // APP2-03：此 successfulChannels 分支当前不可达——result.failure 的唯一来源是
+            // summarizeError(e)（xbk_failure_policy.js），其 info 只透传 code/name/statusCode/
+            // providerCode/channel/message(+条件性 failureKind/failureReason/failures)，从不含
+            // successfulChannels；投递层也只在「全部通道失败」时才抛，此时该数组恒为空。
+            // 保留以便 summarizeError 未来透出该字段时自动生效；补齐需改 failure_policy（跨文件）。
             if (Array.isArray(result.failure.successfulChannels)) {
               for (const channel of result.failure.successfulChannels) channelSuccessful.add(channel)
             }

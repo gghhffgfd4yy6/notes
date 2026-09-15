@@ -11,18 +11,36 @@ const fs = require('fs')
 const path = require('path')
 
 const root = path.resolve(__dirname, '..')
-// 环境注入用 ?? 而非 ||（#136 review F7）：夹具显式传空串时，|| 会静默回退去读真实 mutation.yml，
-// 把「空输入」变成假绿（实测旧实现 MUTATION_WORKFLOW_TEXT="" 时 exit 0，且校验的是真实文件）。
+// 环境注入用「!== undefined」判空而非 ||（#136 review F7）：夹具显式传空串时，|| 会静默回退去读真实
+// mutation.yml，把「空输入」变成假绿（实测旧实现 MUTATION_WORKFLOW_TEXT="" 时 exit 0，且校验的是真实
+// 文件）。故只要 TEXT 出现过（含空串）就以它为准，空串随后因零条目 fail-loud。
+const workflowTextEnv = process.env.MUTATION_WORKFLOW_TEXT
 const workflowPathEnv = process.env.MUTATION_WORKFLOW_PATH
-// 空/仅空白的路径必须显式拦下：path.resolve('') = cwd，readFileSync(目录) 抛裸 EISDIR 堆栈（不可读），
-// 只报错、不回退真实路径——回退就违背「显式传空串」的用意（?? 语义见上）；失败收场照旧收敛到
-// exitIfDirectRun（直跑 exit 1、被 require 则 throw），与本文件其他提前退出一致。
-if (workflowPathEnv !== undefined && workflowPathEnv.trim() === '') {
+// 空/仅空白的路径只在「没有 TEXT 注入、真的要读文件」时拦下（F-04）：path.resolve('') = cwd，
+// readFileSync(目录) 抛裸 EISDIR 堆栈（不可读）。TEXT 已给出时该路径根本不参与读取，此时仍按空路径
+// 退出，等于让一个被忽略的输入否掉有效注入（实测 PATH="" + 合法 TEXT 直接 exit 1，yml 压根没校验）。
+// 失败收场照旧收敛到 exitIfDirectRun（直跑 exit 1、被 require 则 throw），与本文件其他提前退出一致。
+if (workflowTextEnv === undefined && workflowPathEnv !== undefined && workflowPathEnv.trim() === '') {
   console.error('❌ MUTATION_WORKFLOW_PATH 不能为空（应指向 mutation.yml；不设置才会读仓库默认路径）')
   exitIfDirectRun(1)
 }
 const workflowPath = path.resolve(workflowPathEnv ?? path.join(root, '.github/workflows/mutation.yml'))
-const yml = process.env.MUTATION_WORKFLOW_TEXT ?? fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
+// 注入文本与真实读取必须在输出里可区分（F-04）：此前 TEXT 会无提示地整体替换掉真实 mutation.yml，
+// 一次「看起来全绿」的校验实际校验的是注入文本。此告警只改可观测性，不改任何判定。
+let yml
+if (workflowTextEnv !== undefined) {
+  console.warn('⚠️ 使用 MUTATION_WORKFLOW_TEXT 注入文本校验（未读取真实 mutation.yml）')
+  yml = workflowTextEnv
+} else {
+  // 读不到 mutation.yml（路径写错/文件缺失/权限）必须转成可读的失败，而不是裸 ENOENT 堆栈——
+  // 与下方正文文件的读取失败处理（fileRanges 循环里的 try/catch）同口径。
+  try {
+    yml = fs.readFileSync(workflowPath, 'utf8') // nosemgrep（仓库内固定路径，非用户输入）
+  } catch (err) {
+    console.error(`❌ 无法读取 mutation.yml（${workflowPath}）：${err.message}`)
+    exitIfDirectRun(1)
+  }
+}
 
 // matrix include 的唯一解析器：`- name:` / `- src:` / `- mutate:` 任一开头都算新条目，
 // 引号（单/双）与缩进放宽，字段值停在空白或 #。
@@ -146,6 +164,31 @@ for (const bad of malformedRanges) {
 // 明说出来——否则下面的 ✅ 行段清单会被误读成「矩阵每一条都校验过行段」。
 if (fullFileTargets.size) {
   console.warn(`⚠️ ${fullFileTargets.size} 个 mutate 目标未带行段（按全文件变异处理，不参与行段连续性/尾部校验）：${[...fullFileTargets].join(', ')}`)
+}
+
+// 全文件条目与带行段条目走同一套「引用目标必须真实存在于仓库内且可读」的校验（F-02）：此前
+// 存在性/可读性检查只写在下方 fileRanges 循环里，全文件目标只登记进 fullFileTargets、仅被上一行
+// 打成一条 ⚠️，于是把矩阵里的真实目标换成不存在的幽灵（如 scripts/ghost-nonexistent.js）既不报错
+// 也不影响退出码——「矩阵里有这一条」被读成「它被校验过了」。这里补齐同一口径（只做存在性/可读性，
+// 全文件条目不参与行数/行段校验）。
+for (const file of fullFileTargets) {
+  const filePath = path.resolve(root, file)
+  if (!filePath.startsWith(root + path.sep)) {
+    console.error(`❌ ${file}: 路径越出仓库根目录，拒绝处理`)
+    failed = true
+    continue
+  }
+  if (!fs.existsSync(filePath)) { // nosemgrep（filePath 已做 resolve + 仓库根前缀校验，运行时防护到位）
+    console.error(`❌ ${file}: mutation.yml 引用的文件不存在`)
+    failed = true
+    continue
+  }
+  try {
+    fs.readFileSync(filePath, 'utf8') // nosemgrep（filePath 已做 resolve + 仓库根前缀校验；此处仅验证可读性）
+  } catch (err) {
+    console.error(`❌ ${file}: 读取失败 —— ${err.message}`)
+    failed = true
+  }
 }
 
 // 早退守卫的真实意图：拦「解析压根没产出任何 mutate 目标」——矩阵为空、每条 mutate 都缺失、
@@ -404,6 +447,25 @@ for (const [file, ranges] of fileRanges) {
   }
   const actualLines = raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
   const sorted = ranges.slice().sort((a, b) => a.start - b.start)
+
+  // 校验 0：行段自身必须有序（start <= end）。此前只校验首段起点、相邻连续与末段终点，于是
+  // 「1-2000, 2001-1470」（文件实际 1470 行）能被拼成「连续」（2001 === 2000+1）、且末段终点恰好
+  // 等于实际行数，门禁打印「✅ ... 2 段全覆盖 [1-2000, 2001-1470]」并 exit 0（F-03 实测）。
+  for (const range of sorted) {
+    if (range.start > range.end) {
+      console.error(`❌ ${file}: 行段 ${range.start}-${range.end} 起止颠倒（start > end），不是合法行段`)
+      fileFailed = true
+    }
+  }
+
+  // 校验 3 的前置：非末段同样不得越过 EOF。只查末段终点时，「1-150, 151-200」（文件 100 行）里
+  // 越界的非末段只会被末段那条模糊带过（F-03）；按行段显式兜一层，报错点名越界的到底是哪一段。
+  for (const range of sorted.slice(0, -1)) {
+    if (range.end > actualLines) {
+      console.error(`❌ ${file}: 非末段行段止于 ${range.end}，超过文件实际行数 ${actualLines}`)
+      fileFailed = true
+    }
+  }
 
   // 校验 1：首段必须从第 1 行开始（防头部静默漏测）
   if (sorted[0].start !== 1) {

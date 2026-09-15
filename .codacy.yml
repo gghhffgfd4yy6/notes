@@ -76,12 +76,26 @@
 # 不接受任何入参参与路径构造，无外部净输入——「动态构造文件/路径信息」「非字面量 require」等
 # 静态告警属误报（与 run_mutation.js / scripts/check-mutation-ranges.js 同类工具脚本同一处理）。
 # 注：本次收口只加了补丁段校验；判定逻辑已收敛为纯函数 checkVersionValues() 供 test_check_version.js
-# 直接断言（该测试不碰文件系统，故无需登记）。
+# 直接断言。
+#
+# test_check_version.js 的 CLI 契约用例（v3.274 新增）用 fs.mkdtempSync(os.tmpdir() + 固定前缀 'cvcli-')
+# 建临时目录，把 check-version.js 复制进去并写入测试硬编码的 xbk_function_v3.js / CHANGELOG.md /
+# package.json / exit-spy.js 夹具，再以 spawnSync 在 cwd=临时目录 下跑该副本；路径全部由
+# mkdtemp 结果 + 测试硬编码文件名（与 __dirname 常量）拼成，无任何外部净输入参与路径构造，
+# 静态路径注入告警属误报。（本条说明同时取代上方 check-version.js 条目里「该测试不碰文件系统」的旧口径。）
+#
+# scripts/mutation-json.js 是变异报告 JSON 读取工具（本地/CI 工具，不进入生产运行时）：
+# readReportJson(reportPath) 的 reportPath 来自 analyze() 对 CLI 传入目录的 readdir 枚举、
+# 或测试夹具，非不可信输入；函数内已做 path.resolve() 防御性归一，并以 try/catch 把读取失败
+# 转成带路径上下文的可读错误。公开 export 仅为测试复用，不面向不可信输入——
+# 「动态构造文件/路径信息」告警在以上调用链上不成立，属误报（与 run_mutation.js /
+# scripts/check-mutation-ranges.js / scripts/install-hooks.js 同类工具脚本同一处理）。
 exclude_paths:
   - ".github/analyze-artifacts.js"
   - "check-version.js"
   - "scripts/check-mutation-ranges.js"
   - "scripts/install-hooks.js"
+  - "scripts/mutation-json.js"
   - "test_ci_skip_suites.js"
   - "run_mutation.js"
   - "test_storage.js"
@@ -99,3 +113,4 @@ exclude_paths:
   - "test_sendnotify_pure.js"
   - "test_suite_registry.js"
   - "test_tag_validator.js"
+  - "test_check_version.js"

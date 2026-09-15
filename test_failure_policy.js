@@ -283,6 +283,190 @@ function error (message, code) {
     failures: [{ failureKind: 'permanent', failureReason: 'EXPLICIT_X', message: 'm' }]
   }).kind, 'permanent')
 
+  // ============ 补测：失败摘要递归防护（自引用 / 深度上限 / 兄弟重复）+ failureInfo 脱敏 ============
+  const summarizeError = require('./xbk_failure_policy').summarizeError
+  const TRUNCATED_FAILURE_MESSAGE = '[嵌套失败结构过深或自引用，已截断]'
+
+  // [自引用·常规路径] 本模块契约“不抛异常”：failures 指向自身必须截断为标记，而不是无限递归栈溢出。
+  // 反例（改动前）：summarizeError({message, failures:[self]}) 抛 RangeError: Maximum call stack size exceeded。
+  const selfRefError = { message: 'self', code: 'HTTP_500' }
+  selfRefError.failures = [selfRefError]
+  let selfRefSummary
+  assert.doesNotThrow(() => { selfRefSummary = summarizeError(selfRefError) }, '自引用失败结构不得抛 RangeError')
+  assert.strictEqual(selfRefSummary.failures.length, 1)
+  assert.strictEqual(selfRefSummary.failures[0].message, TRUNCATED_FAILURE_MESSAGE,
+    '自引用子项应截断为标记而非继续递归')
+  assert.strictEqual(Array.isArray(selfRefSummary.failures[0].failures), false, '截断标记不应再带子失败')
+  // 截断标记只落进 UNKNOWN → 可重试，绝不因“结构异常”误判永久（宁可重复，不可丢失）
+  assert.doesNotThrow(() => classifyFailure(selfRefError), 'classifyFailure 不得因自引用结构抛栈溢出')
+  assert.strictEqual(classifyFailure(selfRefError).kind, 'retryable', '自引用截断后应保守判为可重试')
+
+  // [深度上限] MAX_FAILURE_DEPTH=5：第 1..5 层完整展开，第 6 层截断。
+  // 反例（改动前无上限）：7 节点深链被完整保留，第 5 层的子节点仍是原始对象而非截断标记。
+  const deepChainNodes = []
+  for (let i = 0; i < 7; i++) deepChainNodes.push({ message: `L${i}` })
+  for (let i = 0; i < 6; i++) deepChainNodes[i].failures = [deepChainNodes[i + 1]]
+  const deepSummary = summarizeError(deepChainNodes[0])
+  assert.strictEqual(deepSummary.message, 'L0')
+  let deepCursor = deepSummary
+  for (let i = 1; i <= 5; i++) {
+    assert(deepCursor.failures && deepCursor.failures.length === 1, `第 ${i} 层应有唯一子失败`)
+    deepCursor = deepCursor.failures[0]
+    assert(deepCursor, `第 ${i} 层应存在：MAX_FAILURE_DEPTH=5 允许展开到第 5 层`)
+    assert.strictEqual(deepCursor.message, `L${i}`, `第 ${i} 层不应被截断`)
+  }
+  assert.strictEqual(deepCursor.failures[0].message, TRUNCATED_FAILURE_MESSAGE,
+    '第 6 层超过 MAX_FAILURE_DEPTH=5 应截断为标记')
+
+  // [兄弟重复不是环] 祖先集合按路径复制：同一子对象作为兄弟重复出现时必须完整展开。
+  // 用“自带子失败的共享分支”而非纯叶子——只有会进入 failures 分支的节点才会被加入祖先集合，
+  // 任何共享可变集合的实现都会让第二处误判为自引用并截断（纯叶子对象触发不到该缺陷）。
+  const sharedBranch = { message: 'branch', failures: [{ message: 'leaf' }] }
+  const siblingSummary = summarizeError({ message: 'root', failures: [sharedBranch, sharedBranch] })
+  assert.strictEqual(siblingSummary.failures.length, 2)
+  assert.deepStrictEqual(
+    siblingSummary.failures.map(f => f.failures && f.failures[0] && f.failures[0].message),
+    ['leaf', 'leaf'],
+    '同一带子失败的对象重复作为兄弟出现不得被判为自引用'
+  )
+  const nestedSiblingSummary = summarizeError({
+    message: 'root',
+    failures: [{ message: 'p1', failures: [sharedBranch] }, { message: 'p2', failures: [sharedBranch] }]
+  })
+  assert.deepStrictEqual(
+    nestedSiblingSummary.failures.map(f => f.failures[0].failures[0].message),
+    ['leaf', 'leaf'],
+    '不同父路径下的同一子对象也应完整展开'
+  )
+
+  // [深度上限·failureInfo 路径] failureInfo 内的失败链与常规路径同口径：
+  // 反例（改动前是整对象浅拷贝）：深链原样带出，不截断。
+  const fiDeepSummary = summarizeError({ failureInfo: deepChainNodes[0] })
+  assert.strictEqual(fiDeepSummary.failures.length, 1)
+  let fiDeepCursor = fiDeepSummary
+  for (let i = 1; i <= 5; i++) {
+    assert(fiDeepCursor.failures && fiDeepCursor.failures.length === 1, `failureInfo 第 ${i} 层应有唯一子失败`)
+    fiDeepCursor = fiDeepCursor.failures[0]
+    assert(fiDeepCursor, `failureInfo 第 ${i} 层应完整展开`)
+  }
+  assert.strictEqual(fiDeepCursor.failures[0].message, TRUNCATED_FAILURE_MESSAGE,
+    'failureInfo 内第 6 层应截断为标记')
+
+  // [reason 细分] 全部子项可重试并非“原因混合”：kind 仍 retryable，reason 改为 ALL_CHANNELS_RETRYABLE。
+  // 反例（改动前）：此分支恒返回 MIXED_CHANNEL_FAILURES，诊断失真。
+  const allRetryable = classifyFailure({
+    message: 'agg',
+    failures: [{ code: 'ETIMEDOUT', message: 'a' }, { code: 'ECONNRESET', message: 'b' }]
+  })
+  assert.strictEqual(allRetryable.kind, 'retryable')
+  assert.strictEqual(allRetryable.reason, 'ALL_CHANNELS_RETRYABLE', '全部子项可重试时不应标成原因混合')
+  // 只要存在永久子项就必须仍是 MIXED：挡住把上面“全可重试”判定泛化成“任一可重试”的错误实现。
+  const mixedAggregate = classifyFailure({
+    message: 'agg',
+    failures: [{ code: 'HTTP_401', message: 'a' }, { code: 'ETIMEDOUT', message: 'b' }]
+  })
+  assert.strictEqual(mixedAggregate.kind, 'retryable')
+  assert.strictEqual(mixedAggregate.reason, 'MIXED_CHANNEL_FAILURES', '存在永久子项时仍为原因混合')
+
+  // [failureInfo 脱敏] failureInfo 不再是原样浅拷贝，字符串字段与常规路径同口径清洗。
+  // 反例（改动前）：{...failureInfo} 让 message 原样带出 token=SECRET123。
+  assert.strictEqual(summarizeError({ failureInfo: { message: 'token=SECRET123' } }).message, 'token=***',
+    'failureInfo.message 必须脱敏，不得原样带出凭据')
+  assert.strictEqual(summarizeError({ failureInfo: { detail: 'token=SECRET123' } }).detail, 'token=***',
+    'failureInfo 的任意字符串字段都应脱敏')
+  assert.strictEqual(summarizeError({ failureInfo: { message: 'l1\nl2' } }).message, 'l1 l2',
+    'failureInfo.message 应与常规路径一致折叠换行')
+  // 非字符串字段原样保留，脱敏不改变结构语义
+  const fiStructured = summarizeError({ failureInfo: { code: 'HTTP_500', statusCode: 500, message: 'ok' } })
+  assert.strictEqual(fiStructured.code, 'HTTP_500')
+  assert.strictEqual(fiStructured.statusCode, 500)
+  // failureInfo 自引用：不得抛异常，子项截断为标记（改动前浅拷贝保留了自引用结构）
+  const fiSelfRef = {}
+  fiSelfRef.failures = [fiSelfRef]
+  let fiSelfRefSummary
+  assert.doesNotThrow(() => { fiSelfRefSummary = summarizeError({ failureInfo: fiSelfRef }) }, 'failureInfo 自引用不得抛异常')
+  assert.strictEqual(fiSelfRefSummary.failures[0].message, TRUNCATED_FAILURE_MESSAGE,
+    'failureInfo 内的自引用应截断为标记')
+
+  // ============ 补测：failureInfo.failures 敌意对象（qodo #147-11：revoked proxy / 抛错索引 getter） ============
+  // 契约：failureInfo 分支同样「绝不抛」。Array.isArray 对 revoked proxy 会抛 TypeError，
+  // 索引 getter 抛错的数组在取元素时会抛——二者都必须被挡在 try 内，失败即退回原值透传（不遍历）。
+
+  // [revoked proxy] 关键点：Array.isArray(revoked) 自身就抛，所以判定必须在 try 里。
+  // 反例（qodo 修复前，HEAD 45a63b8 的 `key === 'failures' && Array.isArray(value)`）：判定裸写在 try 外，
+  // summarizeError({failureInfo:{failures:revoked}}) 直接抛 TypeError，破坏本模块的不抛契约。
+  const revocableFailures = Proxy.revocable([], {})
+  revocableFailures.revoke()
+  const revokedFailures = revocableFailures.proxy
+  assert.throws(() => Array.isArray(revokedFailures), TypeError, '前置条件：Array.isArray 对 revoked proxy 必须抛 TypeError')
+  let revokedFailuresSummary
+  assert.doesNotThrow(
+    () => {
+      revokedFailuresSummary = summarizeError({ failureInfo: { code: 'HTTP_500', message: 'agg', failures: revokedFailures } })
+    },
+    'failureInfo.failures 为 revoked proxy 时 summarizeError 不得抛 TypeError'
+  )
+  assert.strictEqual(revokedFailuresSummary.failures, revokedFailures, '取元素失败时 failures 应原值透传，不得遍历或替换')
+  assert.strictEqual(revokedFailuresSummary.code, 'HTTP_500', '同一 failureInfo 内的正常字段仍应照常归一')
+
+  // [抛错索引 getter] Array.isArray 为 true，但读第 0 项即抛。
+  // 反例（qodo 修复前）：`value.map(...)` 遍历索引 → summarizeError 抛 'index getter boom'。
+  const hostileIndexFailures = []
+  Object.defineProperty(hostileIndexFailures, 0, {
+    get () { throw new Error('index getter boom') },
+    enumerable: true,
+    configurable: true
+  })
+  assert.strictEqual(hostileIndexFailures.length, 1, '前置条件：定义索引 0 的 getter 后数组长度为 1')
+  assert.strictEqual(Array.isArray(hostileIndexFailures), true, '前置条件：带索引 getter 的对象仍是数组')
+  assert.throws(() => hostileIndexFailures.map(item => item), /index getter boom/, '前置条件：遍历该数组必然抛错')
+  let hostileIndexSummary
+  assert.doesNotThrow(
+    () => {
+      hostileIndexSummary = summarizeError({ failureInfo: { message: 'kept', failures: hostileIndexFailures } })
+    },
+    'failures 数组元素 getter 抛错时 summarizeError 不得抛出'
+  )
+  assert.strictEqual(hostileIndexSummary.failures, hostileIndexFailures, '遍历失败时 failures 应原值透传，不得降级为空数组')
+  assert.strictEqual(hostileIndexSummary.message, 'kept', '同一 failureInfo 内的正常字符串字段仍应照常归一')
+
+  // [不回归] 正常 failureInfo.failures 仍逐项递归归一：子项走 summarizeError 全量清洗，
+  // 挡住把上面的兜底误写成「任何 failures 都原值透传」的实现（那样子项凭据会绕过脱敏）。
+  const normalFiFailures = [
+    { code: 'HTTP_401', message: 'bad key' },
+    { code: 'ETIMEDOUT', message: 'token=SECRET9\nnext', failures: [{ code: 'ECONNRESET', message: 'reset' }] }
+  ]
+  const normalFiSummary = summarizeError({ failureInfo: { message: 'agg', failures: normalFiFailures } })
+  assert.strictEqual(normalFiSummary.failures.length, 2, '正常 failures 数组仍应逐项归一')
+  assert.notStrictEqual(normalFiSummary.failures, normalFiFailures, '正常 failures 必须是归一化后的新副本，不是原值透传')
+  assert.strictEqual(normalFiSummary.failures[0].code, 'HTTP_401')
+  assert.strictEqual(normalFiSummary.failures[1].code, 'ETIMEDOUT')
+  assert.strictEqual(normalFiSummary.failures[1].message, 'token=*** next', 'failureInfo 子项的 message 仍应脱敏并折叠换行')
+  assert.strictEqual(normalFiSummary.failures[1].failures[0].code, 'ECONNRESET', 'failureInfo 子项的下级 failures 仍应递归归一')
+
+  // [顶层 failures 同一收口 —— 主代理在 qodo 复核后补的第二轮]
+  // 反例（只保住 failureInfo 分支时）：summarizeError 常规路径的 `Array.isArray(failures)`、
+  // classifyOne 的 `Array.isArray(info.failures)`、classifyFailure 的 `Array.isArray(nested)`、
+  // classifySummary 的 `Array.isArray(summary.failures)` 都裸写在 try 外——敌意数组挂在**顶层** failures
+  // （或经 failureInfo 透传后被 classifyOne 再读一次）时仍会抛，等于异常只是被推迟了一层。
+  // 现统一经 safeArray 取值，以下四条锁定这条口径。
+  assert.doesNotThrow(() => summarizeError({ message: 'x', failures: revokedFailures }),
+    '顶层 failures 为 revoked proxy 时 summarizeError 不得抛 TypeError')
+  assert.doesNotThrow(() => summarizeError({ message: 'x', failures: hostileIndexFailures }),
+    '顶层 failures 带抛错索引 getter 时 summarizeError 不得抛')
+  assert.doesNotThrow(() => classifyFailure({ failureInfo: { failures: revokedFailures } }),
+    'classifyFailure 对透传下来的敌意 failures 不得再抛（此前异常只是被推迟一层）')
+  assert.doesNotThrow(() => classifyFailure({ message: 'x', failures: hostileIndexFailures }),
+    'classifyFailure 对顶层索引 getter 抛错的 failures 不得再抛')
+  assert.doesNotThrow(() => classifySummary({ total: 2, failed: 1, failures: revokedFailures }),
+    'classifySummary 读取敌意 failures 时不得抛')
+  // [不回归] 顶层正常 failures 仍逐项递归归一（挡住「任何 failures 都当空处理」的实现）
+  const normalTopFailures = summarizeError({ message: 'agg', failures: [{ code: 'ETIMEDOUT' }, { code: 'HTTP_401' }] })
+  assert.strictEqual(normalTopFailures.failures.length, 2, '顶层正常 failures 仍应逐项归一')
+  assert.strictEqual(normalTopFailures.failures[0].code, 'ETIMEDOUT')
+  assert.strictEqual(classifyFailure({ failures: [{ code: 'ETIMEDOUT' }] }).kind, 'retryable',
+    '顶层可重试子项仍应让整体判 retryable')
+
   console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分成功不熔断、成功后恢复')
 })().catch(error => {
   console.error(error)

@@ -8,6 +8,9 @@ const { classifyFailure, classifySummary, summarizeError } = require('../xbk_fai
 
 const ROOT = path.resolve(__dirname, '..')
 const ARGS = new Set(process.argv.slice(2))
+// 入口只识别这三个参数；其余参数（例如拼错的 --dryrun）此前会被静默忽略并直接进入真实推送的
+// 常驻模式，故先补显式告警（QX-09）；是否改为拒绝启动属产品决策（需同步未来参数口径），见 defer。
+const KNOWN_ARGS = new Set(['--status', '--check', '--dry-run'])
 
 function hasArg (name) {
   return ARGS.has(name)
@@ -21,6 +24,21 @@ function loadApp () {
   }
 }
 
+// 与 package.json engines.node（>=22.22.2）对齐的版本下界，仅用于提示；见下方 runCheck 的告警分支。
+const MIN_NODE_VERSION = [22, 22, 2]
+
+function isBelowMinNodeVersion (version = process.versions.node, min = MIN_NODE_VERSION) {
+  const parts = String(version).split('.').map(part => {
+    const n = Number.parseInt(part, 10)
+    return Number.isFinite(n) ? n : 0
+  })
+  for (let i = 0; i < min.length; i += 1) {
+    const value = parts[i] || 0
+    if (value !== min[i]) return value < min[i]
+  }
+  return false
+}
+
 function runCheck (app) {
   const checks = []
   const add = (name, ok, detail) => {
@@ -28,17 +46,23 @@ function runCheck (app) {
     console.log(`${ok ? '✅' : '❌'} ${name}${detail ? `：${detail}` : ''}`)
   }
   add('Node.js 版本', Number(process.versions.node.split('.')[0]) >= 22, process.version)
+  // 该闸门只看主版本（major>=22），与 package.json engines（>=22.22.2）口径不一致；
+  // 收紧为完整版本比较会改红 test_qinglong_runcheck.js 用 '22.0.0' 伪装的健康环境用例，
+  // 故此处只把差异显式告警出来，不改变既有通过条件（QX-06 仅取零风险的一半）。
+  if (Number(process.versions.node.split('.')[0]) >= 22 && isBelowMinNodeVersion()) {
+    console.warn(`⚠️ 当前 Node ${process.versions.node} 低于 package.json engines 要求（>=22.22.2），re2 等原生依赖可能不可用`)
+  }
   try {
     require('got')
     add('got 依赖', true, '可加载')
-  } catch (e) { add('got 依赖', false, '不可加载') }
+  } catch (e) { add('got 依赖', false, `不可加载：${e && e.message ? e.message : String(e)}`) }
   try {
     const RE2 = require('re2')
     const probe = new RE2('^ok$')
     add('re2 原生模块', probe.test('ok'), '可加载且匹配正常')
-  } catch (e) { add('re2 原生模块', false, '不可加载，过滤正则不会安全执行') }
+  } catch (e) { add('re2 原生模块', false, `不可加载，过滤正则不会安全执行：${e && e.message ? e.message : String(e)}`) }
   const warnings = app.validateConfig({ ...app.Config.filter, zkt_gjc: app.Config.keyword.zkt_gjc })
-  add('过滤配置', warnings.length === 0, warnings.length ? `${warnings.length} 条警告` : '合法')
+  add('过滤配置', warnings.length === 0, warnings.length ? `${warnings.length} 条警告：${warnings.join('；')}` : '合法')
   try {
     app.init()
     add('缓存目录', true, app.Config.cache.dir)
@@ -77,14 +101,14 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
   if (!isRecoverable(initialError)) throw initialError
   if (!shouldAutoInstallDependencies(env)) {
     const failed = initial.got ? 'got' : 're2'
-    throw new Error(`检测到 ${failed} 依赖或原生模块未完整安装；请在部署阶段依次执行：npm ci --omit=dev --ignore-scripts && npm run rebuild --prefix node_modules/re2。如确需在本次运行时安装，请显式设置 XBK_AUTO_INSTALL_DEPS=1`)
+    throw new Error(`检测到 ${failed} 依赖或原生模块未完整安装；请在部署阶段依次执行：npm ci --omit=dev --ignore-scripts && npm run rebuild --prefix node_modules/re2。如确需在本次运行时安装，请显式设置 XBK_AUTO_INSTALL_DEPS=1。（本入口刻意把 re2 定为必需依赖：缺 re2 时不会带着“过滤正则被跳过”的状态进入常驻；主应用的缺 re2 降级 + 每日提醒通道不适用于本常驻入口，需要时请改用单轮入口。）`)
   }
   console.warn('检测到 Node.js 依赖或 re2 原生模块未完整安装，已按 XBK_AUTO_INSTALL_DEPS=1 执行恢复...')
 
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
   const install = spawnSyncFn(npm, [
     'install',
-    '--production',
+    '--omit=dev', // --production 的现行等价写法（已弃用别名，语义不变）
     '--ignore-scripts',
     '--no-audit',
     '--no-fund',
@@ -136,15 +160,18 @@ async function refreshConnections (app, signal) {
   })()
   const wxHost = 'wxpusher.zjiecode.com'
   const tasks = []
-  if (apiHost) tasks.push(agents.prewarmDns(apiHost, signal))
+  // 任务类型必须与 promise 显式绑定：prewarmTls 的返回值同样带 hostname（见 xbk_agents.prewarmTls），
+  // 若按 hostname 猜测类型会把 TLS 结果误计入 DNS 分子/分母（QX-03）。promise 仍在 push 处即时发起，
+  // 与原先同时启动、并发等待的时序一致。
+  if (apiHost) tasks.push({ kind: 'dns', result: agents.prewarmDns(apiHost, signal) })
   if (hasWxPusher) {
-    tasks.push(agents.prewarmDns(wxHost, signal))
-    tasks.push(agents.prewarmTls(wxHost, 5000, refreshCount(app), signal))
+    tasks.push({ kind: 'dns', result: agents.prewarmDns(wxHost, signal) })
+    tasks.push({ kind: 'tls', result: agents.prewarmTls(wxHost, 5000, refreshCount(app), signal) })
   }
-  const results = await Promise.all(tasks)
+  const results = await Promise.all(tasks.map(task => task.result))
   if (!(signal && signal.aborted)) {
-    const dnsResults = results.filter(r => r && Object.prototype.hasOwnProperty.call(r, 'hostname'))
-    const tls = results.find(r => r && Object.prototype.hasOwnProperty.call(r, 'okCount'))
+    const dnsResults = results.filter((r, i) => r && tasks[i].kind === 'dns')
+    const tls = results.find((r, i) => r && tasks[i].kind === 'tls')
     console.log(`常驻连接刷新完成：DNS ${dnsResults.filter(r => r.ok).length}/${dnsResults.length}，TLS ${tls ? `${tls.okCount}/${tls.count}` : '跳过'}`)
   }
 }
@@ -162,6 +189,26 @@ function retryBackoffMs (count, env = process.env) {
   return Math.min(cap, 1000 * (2 ** (Math.min(count, 31) - 1)))
 }
 
+// classifySummary/classifyFailure 的聚合 info 形如 { failures: [子 info] } 且没有 message 字段；
+// 只取 info.message/error.message 会把通道/供应商级原因（code、statusCode、channel）整块丢弃（QX-05）。
+function describeFailure (info, error) {
+  const parts = []
+  if (info && info.message) parts.push(String(info.message))
+  if (info && Array.isArray(info.failures)) {
+    for (const item of info.failures) {
+      if (!item) continue
+      const reason = item.message || item.code || item.providerCode
+      if (!reason) continue
+      const channel = item.channel ? `${item.channel}：` : ''
+      const status = item.statusCode ? `（HTTP ${item.statusCode}）` : ''
+      parts.push(`${channel}${reason}${status}`)
+    }
+  }
+  if (parts.length === 0 && error && error.message) parts.push(String(error.message))
+  if (parts.length === 0) parts.push(String(error))
+  return parts.join('；')
+}
+
 async function runResident (app, controller) {
   residentExitCode = 0
   consecutiveRetryableFailures = 0
@@ -175,7 +222,6 @@ async function runResident (app, controller) {
       error.failureKind = resultFailure.kind
       error.failureReason = resultFailure.reason
       error.failureInfo = resultFailure.info
-      error.summary = summary
       throw error
     }
     consecutiveRetryableFailures = 0
@@ -185,7 +231,7 @@ async function runResident (app, controller) {
   const handleFailure = async (error) => {
     const decision = classifyFailure(error)
     const info = decision.info || summarizeError(error)
-    const detail = info.message || (error && error.message) || String(error)
+    const detail = describeFailure(info, error)
     if (decision.kind === 'permanent') {
       residentExitCode = 1
       console.error(`本轮遇到不可恢复错误（${decision.reason}），停止常驻：${detail}`)
@@ -220,7 +266,12 @@ function statusCacheDir () {
   // --status 不加载主应用，避免缺少 got/re2 时诊断命令反而不可用。
   // 仅允许绝对路径覆盖，避免环境变量把状态读取重定向到项目目录外的任意相对位置。
   const configured = process.env.XBK_CACHE_DIR
-  return configured && path.isAbsolute(configured) ? configured : path.join(ROOT, 'xianbaoku_cache')
+  const fallback = path.join(ROOT, 'xianbaoku_cache')
+  if (configured && !path.isAbsolute(configured)) {
+    // 相对路径此前被静默忽略并回退默认目录，可能让 --status 读到与预期不同的目录（QX-08）。
+    console.warn(`⚠️ XBK_CACHE_DIR 不是绝对路径（${configured}），已忽略并回退默认缓存目录：${fallback}`)
+  }
+  return configured && path.isAbsolute(configured) ? configured : fallback
 }
 
 function runStatus () {
@@ -230,6 +281,11 @@ function runStatus () {
 }
 
 async function main () {
+  const unknownArgs = [...ARGS].filter(arg => !KNOWN_ARGS.has(arg))
+  if (unknownArgs.length > 0) {
+    // 只告警不改行为：拒绝未知参数会改变既有命令行契约，需产品决策（QX-09 的 defer 部分）。
+    console.warn(`⚠️ 未识别参数已忽略：${unknownArgs.join(' ')}（可用参数：--status / --check / --dry-run）`)
+  }
   if (hasArg('--status')) {
     try { process.exitCode = runStatus() } catch (error) {
       console.error(`❌ 状态读取失败：${error.message}`)

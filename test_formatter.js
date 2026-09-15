@@ -244,6 +244,39 @@ check('url 为空串 → 不追加原文链接', () => {
   assert.ok(!r.includes('原文链接'), '空 url 不应追加原文链接')
 })
 
+// ===== 9b. {Html内容} 原文链接分支（审查 2026-09-14 F-07）=====
+// 回归：safeUrl 过滤掉 url 后，原实现仍无条件拼接尾部「原文链接：」——
+// 无 url 时输出悬空的提示，与 Markdown 路径（mdUrl 为假则整段不追加）口径不一致。
+// 判定必须区分「本来就没有 url」（整段不追加）与「有 url 但被安全过滤」（保留纯文本提示、不生成 href）。
+check('{Html内容} 无 url 字段 → 整段不追加原文链接（不再悬空）', () => {
+  const r = formatter.tuisong_replace('{Html内容}', { content_html: '<p>正文</p>' })
+  assert.strictEqual(r, '<p>正文</p>')
+  assert.ok(!r.includes('原文链接'), `无 url 不应出现原文链接提示，实际: ${JSON.stringify(r)}`)
+})
+
+check('{Html内容} url 为空串 → 整段不追加原文链接', () => {
+  assert.strictEqual(formatter.tuisong_replace('{Html内容}', { content_html: '正文', url: '' }), '正文')
+})
+
+check('{Html内容} url 为非字符串（数字/null/对象）→ 整段不追加原文链接', () => {
+  assert.strictEqual(formatter.tuisong_replace('{Html内容}', { content_html: '正文', url: 123 }), '正文')
+  assert.strictEqual(formatter.tuisong_replace('{Html内容}', { content_html: '正文', url: null }), '正文')
+  assert.strictEqual(formatter.tuisong_replace('{Html内容}', { content_html: '正文', url: { href: 'https://x' } }), '正文')
+})
+
+check('{Html内容} 危险协议 url → 保留纯文本提示但不生成 href（对照无 url 分支）', () => {
+  const r = formatter.tuisong_replace('{Html内容}', { content_html: '<p>x</p>', url: 'javascript:alert(1)' })
+  assert.ok(r.includes('原文链接：'), `危险 url（原始值非空）仍应保留纯文本提示，实际: ${JSON.stringify(r)}`)
+  assert.ok(!/href\s*=/.test(r), '危险 url 不应生成 href')
+  assert.ok(!r.includes('javascript:'), '危险协议原文不应出现在输出里')
+})
+
+check('{Html内容} 合法 url → 仍生成可点击原文链接（对照，首分支不变）', () => {
+  const r = formatter.tuisong_replace('{Html内容}', { content_html: '正文', url: 'https://example.com/a' })
+  assert.strictEqual(r,
+    '正文<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="https://example.com/a" target="_blank">https://example.com/a</a><br>&nbsp;<br>&nbsp;<br>')
+})
+
 // ===== 10. 复杂混合 HTML =====
 check('混合 HTML：标题 + 链接 + 粗体', () => {
   const html = '<h1>标题</h1><p>这是<b>粗体</b>和<a href="https://x.com">链接</a></p>'

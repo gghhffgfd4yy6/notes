@@ -148,7 +148,36 @@ for (const tag of invalidTags) {
   assert.strictEqual(isValidVersion(version), false, `非法 tag ${tag} 不应通过校验`)
 }
 
+// ── isValidVersion 的类型守卫（audit low/info：`typeof version !== 'string'` 早退）────────────
+// RegExp.test 会先把非字符串入参 String() 化（1.2 → '1.2'、['1.2.3'] → '1.2.3'、带 toString 的对象
+// 同理），于是「类型非法」被静默判成「版本号合法」：CI 里 version 来自 shell 变量（恒为字符串）时无感，
+// 但本模块是被 require 的库（注释里写明「供 test_tag_validator.js 直接 require 断言」），调用方喂错类型
+// 就是一处静默放行。生产改动加了 `if (typeof version !== 'string') return false`，这里逐类型钉死。
+// 反证（本机实测）：删掉该守卫后，下面带 ★ 的四条会红——String() 化分别得到 '1.2' / '3.272' /
+// '1.2.3' / '1.2.3'，个个命中 SEMVER_RE。
+const nonStringInputs = [
+  { label: 'null', value: null },
+  { label: 'undefined', value: undefined },
+  { label: '数字 1.2', value: 1.2 }, // ★ String() → '1.2'
+  { label: '数字 3.272', value: 3.272 }, // ★ String() → '3.272'
+  { label: '0', value: 0 },
+  { label: '布尔 true', value: true },
+  { label: '布尔 false', value: false },
+  { label: '数组 ["1.2.3"]', value: ['1.2.3'] }, // ★ String() → '1.2.3'
+  { label: '数组 [3, 272]', value: [3, 272] }, // String() → '3,272'（本来就不匹配）
+  { label: '带 toString 的对象', value: { toString () { return '1.2.3' } } }, // ★ String() → '1.2.3'
+  { label: '普通对象 {}', value: {} }
+]
+for (const { label, value } of nonStringInputs) {
+  assert.strictEqual(isValidVersion(value), false,
+    `非字符串入参 ${label} 必须返回 false（不得 String() 化后当成合法版本号放行）`)
+}
+// 守卫不得误伤合法字符串入参：上面的 validTags 循环已覆盖 6 种合法形态，此处再补一个「守卫加在
+// RegExp.test 之前、不改变字符串分支行为」的直证（合法字符串仍须 true）。
+assert.strictEqual(isValidVersion('3.272.0'), true, '字符串入参 3.272.0 必须仍判合法（类型守卫不得误伤字符串分支）')
+
 console.log(`✅ tag 校验通过：${validTags.length} 个合法 / ${invalidTags.length} 个非法（与 release.yml 同源）`)
+console.log(`✅ isValidVersion 类型守卫通过：${nonStringInputs.length} 个非字符串入参全部拒绝`)
 
 // ── release.yml 步骤级回归（#136 review）─────────────────────────────────────────
 // 教训：只断言 exit code 会漏掉「内容类」错误 —— notes 步骤曾 exit 0 却只写出标题行（9 字节），
@@ -295,3 +324,39 @@ for (const c of gateCases) {
 }
 
 console.log('✅ release.yml 步骤级回归通过：notes 含要点正文 + 章节边界诱饵夹具 2 组；闸门 ' + gateCases.length + ' 组用例全部符合预期')
+
+// ── CLI 文案/退出码回归（audit low/info：文案不再无条件加 v 前缀）──────────────────────────
+// 旧实现把两处文案都写成 `v${version}`（version = 去掉 v 后的裸版本号）：入参自带 v 时看不出差别
+// （'v3.272' 的 version 是 '3.272'，拼回去恰好等于入参），但 CLI 明确接受**无 v 前缀**的裸版本号
+// （见 validate-release-tag.js 的 `tag.startsWith('v') ? tag.slice(1) : tag`），此时旧文案会凭空补一个 v
+// ——打印的 tag 与真实入参不符（'3.272' 打成 'v3.272'、'01.2.3' 打成 'v01.2.3'）。
+// 故鉴别力全在「裸版本号」这组入参上；带 v 的入参两版实现输出相同，只作「回显的是 tag 原文」的补充。
+// 本文件已有的 spawnSync 跑的是 release.yml 里的 node 载荷，本 CLI 分支另无覆盖，故此处直接以子进程
+// 跑 scripts/validate-release-tag.js（cwd 固定 __dirname，不写绝对路径）。
+const TAG_CLI = path.join(__dirname, 'scripts', 'validate-release-tag.js')
+function runTagCli (tag) {
+  const res = spawnSync(process.execPath, [TAG_CLI, tag], { cwd: __dirname, encoding: 'utf8', timeout: 20000 })
+  assert.strictEqual(res.error, undefined,
+    'tag CLI 子进程应能启动（本机需 NODE_OPTIONS=--require .local/execpath-shim.js）：' + (res.error && res.error.message))
+  return { status: res.status, stdout: res.stdout, stderr: res.stderr }
+}
+
+// ① 合法裸版本号（无 v）：成功文案必须原样回显入参；旧实现此处打成 v3.272
+const barePass = runTagCli('3.272')
+assert.strictEqual(barePass.status, 0,
+  '裸版本号 3.272 合法，应 exit 0，实际 ' + barePass.status + '（stderr: ' + JSON.stringify(barePass.stderr) + '）')
+assert.strictEqual(barePass.stdout.trim(), '版本号格式校验通过：3.272',
+  '成功文案必须原样回显入参 tag（旧实现写 v + version，这里会打成「版本号格式校验通过：v3.272」），实际: ' + JSON.stringify(barePass.stdout))
+
+// ② 非法裸版本号（无 v）：失败文案里的 tag 名同样不得补 v；旧实现此处打成 v01.2.3
+const bareFail = runTagCli('01.2.3')
+assert.strictEqual(bareFail.status, 1,
+  '非法 tag 01.2.3 应 exit 1，实际 ' + bareFail.status + '（stderr: ' + JSON.stringify(bareFail.stderr) + '）')
+assert.ok(bareFail.stderr.startsWith("❌ tag 名称 '01.2.3' 不是合法版本号"),
+  '失败文案必须原样回显入参 tag（旧实现写 v + version，这里会打成「tag 名称 \'v01.2.3\'」），实际 stderr: ' + JSON.stringify(bareFail.stderr))
+
+// ③ 带 v 入参仍原样回显：钉住「回显的是 tag 原文」而非别的变量（若实现改成回显 version，此处会红）
+assert.strictEqual(runTagCli('v3.272').stdout.trim(), '版本号格式校验通过：v3.272',
+  '带 v 的入参应原样回显（回显 tag 原文，而非去掉 v 的 version）')
+
+console.log('✅ validate-release-tag.js CLI 回归通过：裸版本号不补 v（成功/失败两处文案）+ 带 v 原样回显')

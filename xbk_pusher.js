@@ -19,8 +19,19 @@ function createPusher ({ Utils, getNotify }) {
       // Round2 C030：将 100k 截断提升到入口统一——检测与清洗作用于同一份（截断后的）desp，
       // 消除“检测截断、清洗不截断”导致第 100k 后的 HTML 绕过出口清洗的行为回归。
       // 超长 desp 截断为已知边界（与全局 htmlToMarkdown/sanitizeDecodedHtml 截断策略一致）。
+      // P4（审查 2026-08-15）：此前静默 slice——用户 push.contentMax > 100000 时配置与行为不一致却无任何提示；
+      // 且 slice 按 UTF-16 码元切分会在代理对中间切断，产生孤立代理（半个 emoji 乱码）。
+      // 改为复用 Utils.truncateUtf16（与 xbk_formatter 同一 100k 上限同一口径，代理对/ZWJ 安全），
+      // 并补一条告警让「配置被硬上限覆盖」可观测。注意：Utils 为注入依赖，测试替身可能未提供
+      // truncateUtf16 → 退回 slice（与旧实现逐字符等价，不改既有语义）。
       const HTML_LIKE_MAX_LEN = 100000
-      if (desp.length > HTML_LIKE_MAX_LEN) desp = desp.slice(0, HTML_LIKE_MAX_LEN)
+      if (desp.length > HTML_LIKE_MAX_LEN) {
+        console.warn(`[Pusher] desp 长度 ${desp.length} 超过硬上限 ${HTML_LIKE_MAX_LEN}，已截断；` +
+          `若 push.contentMax > ${HTML_LIKE_MAX_LEN}，实际推送内容不会超过该上限`)
+        desp = Utils && typeof Utils.truncateUtf16 === 'function'
+          ? Utils.truncateUtf16(desp, HTML_LIKE_MAX_LEN)
+          : desp.slice(0, HTML_LIKE_MAX_LEN)
+      }
       // 审查 P1/S1/F1：门槛收敛为 looksLikeHtmlEnvelope——与渲染侧（slim 的 contentType 判定）
       // 同一实现，且取宽松包络。此前注入的 looksLikeHtmlLinear 更严：
       // <img src=x onerror=alert(1) <2> 判 false 不清洗，而 slim 仍以 contentType=2 原文送出
@@ -52,7 +63,17 @@ function createPusher ({ Utils, getNotify }) {
             timer = setTimeout(() => {
               if (controller) controller.abort()
               const error = new Error('推送超时(10s)')
+              // P3（审查 2026-08-15）零风险半边①：补顶层 code。此前只有 error.failures[].code，
+              // 顶层错误对象无法自描述（failures 为空时更无从判断是超时）。归类语义不变：
+              // xbk_failure_policy 只用 message/statusCode/providerCode/failures 归类，
+              // 且 PUSH_TIMEOUT 不在 RETRYABLE_CODES/PERMANENT_CODES 内 → 仍按 message「超时」→ retryable。
+              error.code = 'PUSH_TIMEOUT'
               const names = notifyMod && typeof notifyMod.configuredChannelNames === 'function' ? notifyMod.configuredChannelNames() : []
+              // P3 零风险半边②：注入模块未提供 configuredChannelNames 时 failures 静默为空
+              // （超时归因整体缺失）→ 补告警使其可观测。
+              // 未修的一半：「按仍在跑的通道归因」需要投递层暴露在飞通道状态（跨文件契约），
+              // 且 test_pusher.js:63 与 test_app.js:1825 已锁定「配置通道全量列出」的现有语义 → defer。
+              if (names.length === 0) console.warn('[Pusher] 推送超时，但无法获取已配置通道清单（configuredChannelNames 缺失），failures 为空')
               error.failures = names.map(channel => ({ channel, code: 'PUSH_TIMEOUT', message: '推送超时(10s)' }))
               reject(error)
             }, 10000)

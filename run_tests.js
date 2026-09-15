@@ -1,6 +1,6 @@
 'use strict'
 // ============================================================
-// 统一测试入口：一键执行三套测试 + 汇总报告 + 退出码
+// 统一测试入口：按 test_suites.js 注册表执行全部套件（含 integration，非「三套」）+ 汇总报告 + 退出码
 // 用法：node run_tests.js   （或 npm test）
 // 退出码：0 = 全部通过，非 0 = 有失败（CI/调度可感知）
 // ============================================================
@@ -9,6 +9,18 @@ const path = require('path')
 const { checkDependencies } = require('./scripts/check-deps')
 
 const { SUITES } = require('./test_suites')
+
+// 汇总表按终端显示宽度对齐（与 run_unit_tests.js 同口径）：String.prototype.padEnd 按 UTF-16 码元计数，
+// 中文每字占 2 列、文件名长度不一，直接 padEnd 会让列错位；此处按实测最大显示宽度补齐。
+const WIDE_RE = /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/
+function displayWidth (str) {
+  let width = 0
+  for (const ch of str) width += WIDE_RE.test(ch) ? 2 : 1
+  return width
+}
+function padEndWidth (str, width) {
+  return str + ' '.repeat(Math.max(0, width - displayWidth(str)))
+}
 
 const results = []
 console.log('══════════════════════════════════════════════')
@@ -56,9 +68,11 @@ console.log('══════════════════════�
 console.log('  汇总报告')
 console.log('══════════════════════════════════════════════')
 let allOk = true
+const nameWidth = results.reduce((max, r) => Math.max(max, displayWidth(r.name)), 6)
+const fileWidth = results.reduce((max, r) => Math.max(max, displayWidth(r.file)), 18)
 for (const r of results) {
   const mark = r.ok ? '✅' : '❌'
-  console.log(`  ${mark} ${r.name.padEnd(6)} ${r.file.padEnd(18)} ${(r.ms / 1000).toFixed(1)}s  ${r.desc}`)
+  console.log(`  ${mark} ${padEndWidth(r.name, nameWidth)} ${padEndWidth(r.file, fileWidth)} ${(r.ms / 1000).toFixed(1)}s  ${r.desc}`)
   if (!r.ok) allOk = false
 }
 const totalMs = results.reduce((a, r) => a + r.ms, 0)

@@ -24,10 +24,13 @@ function validCounter (value) {
 }
 
 function validReport (value) {
+  // 与生产侧 xbk_app 读取口径对齐：七项计数只在字段存在时校验非负安全整数，
+  // 缺失视为未累计（生产侧 _normalizeReportState 会归一化为 0），不再整份判 invalid。
   return value && typeof value.date === 'string' &&
-    ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'].every(key => validCounter(value[key]))
+    ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'].every(key => value[key] === undefined || validCounter(value[key]))
 }
 
+// 全表口径：任一条目不合格即整表 invalid（逐条容错需同步调整 parseJson 返回契约与 formatStatus）。
 function validChannels (value) {
   return Object.values(value).every(entry => entry && typeof entry === 'object' && !Array.isArray(entry) &&
     validCounter(entry.consecutiveFailures) && validCounter(entry.lastFailureAt) && validCounter(entry.lastAlertAt))
@@ -47,8 +50,14 @@ function parseLastRun (read) {
   if (read.status !== 'ok') return { status: read.status }
   const lines = read.value.trim().split('\n').filter(Boolean)
   for (let i = lines.length - 1; i >= 0; i--) {
-    const match = /total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=([^\s]+)/.exec(lines[i])
-    if (match) return result('ok', { total: Number(match[1]), dedup: Number(match[2]), filtered: Number(match[3]), truncated: Number(match[4]), pushed: Number(match[5]), failed: Number(match[6]), elapsed: match[7] })
+    // 行首锚定：摘要行只可能是「时间戳（本地 YYYY-MM-DD HH:MM:SS 或历史 ISO）+ total=」或裸 total=，
+    // 避免 ERROR/ALERT 行文本里恰好含 total=… 子串时被误取。
+    const match = /^(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S* )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=([^\s]+)/.exec(lines[i])
+    if (!match) continue
+    // 与 parseDiagnostics 同口径：六项计数必须是非负安全整数（超长数字经 Number 得 Infinity/超界，直接跳过该行）
+    const counters = match.slice(1, 7).map(Number)
+    if (!counters.every(validCounter)) continue
+    return result('ok', { total: counters[0], dedup: counters[1], filtered: counters[2], truncated: counters[3], pushed: counters[4], failed: counters[5], elapsed: match[7] })
   }
   return result('invalid')
 }
@@ -71,6 +80,8 @@ function parseDiagnostics (read) {
 function readStatus (dir, { now = Date.now() } = {}) {
   const report = parseJson(readText(dir, FILES.report, 64 * 1024), validReport)
   const channels = parseJson(readText(dir, FILES.channels, 64 * 1024), validChannels)
+  // run.log / filter-diagnostics 走默认 1MB 上限（与写入侧 xbk_app 的 LIMIT 同为 1MB）：
+  // 超限时 xbk_storage 只返回 tooLarge、不读尾部，fail-open 场景下这两个部件会整体不可见。
   const run = parseLastRun(readText(dir, FILES.run))
   const diagnostics = parseDiagnostics(readText(dir, FILES.diagnostics))
   return { generatedAt: now, report, channels, run, diagnostics }
@@ -83,9 +94,9 @@ function describe (part) {
 function formatStatus (status) {
   const lines = [`📊 xbk-push 运行状态（${new Date(status.generatedAt).toISOString()}）`]
   const report = status.report.value
-  lines.push(`日报：${describe(status.report)}${report ? ` | ${report.date || '无日期'} | ${report.runs || 0} 轮 | 推送成功：${report.pushed || 0} 条 | 失败：${report.failed || 0} 条` : ''}`)
+  lines.push(`日报：${describe(status.report)}${report ? ` | ${report.date || '无日期'} | ${report.runs || 0} 轮 | 推送成功：${report.pushed || 0} 条 | 失败：${report.failed || 0} 条 | 待推送（截断）：${report.truncated || 0} 条` : ''}`)
   const run = status.run.value
-  lines.push(`最近一轮：${describe(status.run)}${run ? ` | 获取 ${run.total} | 去重 ${run.dedup} | 过滤 ${run.filtered} | 推送 ${run.pushed} | 失败 ${run.failed}` : ''}`)
+  lines.push(`最近一轮：${describe(status.run)}${run ? ` | 获取 ${run.total} | 去重 ${run.dedup} | 过滤 ${run.filtered} | 推送 ${run.pushed} | 失败 ${run.failed} | 截断 ${run.truncated}${run.truncated > 0 ? ' ⚠️' : ''} | 耗时 ${run.elapsed}` : ''}`)
   const channels = status.channels.value
   if (channels) {
     const entries = Object.entries(channels).filter(([, value]) => value && typeof value === 'object')

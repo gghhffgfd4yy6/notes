@@ -2,7 +2,9 @@
 
 // 注册仓库本地 git hooks（.githooks）。
 // 设计原则（回应 code review）：
-//   - 仅当 core.hooksPath 未配置时才设置；已有配置（无论指向何处）一律不覆盖；
+//   - 仅当 core.hooksPath 未配置时才设置；已有配置（无论指向何处、即使是空串）一律不覆盖；
+//   - 「未配置」只认 git config --get 的退出码 1（键不存在）；其它失败视为「读取失败」，
+//     无法确认是否已有配置时按「不覆盖」处理并以非零退出码报错（fail-closed）；
 //   - git 不可用 / 非 git 工作树时给出告警并正常退出，不阻断安装；
 //   - 配置写入失败时以非零退出码报错（不静默吞掉）；
 //   - 不只写配置：安装前后核验钩子真实可用（存在 + 可执行）。目录/文件缺失时
@@ -16,9 +18,30 @@ const HOOKS_DIR = '.githooks'
 // 受版本控制的提交门禁；新增钩子文件时同步此列表以便核验
 const HOOK_FILES = ['pre-commit', 'commit-msg']
 
+// git config --get 的退出码语义：0 = 键存在（值可能是空串）、1 = 键不存在、其它 = 读取失败。
+const GIT_CONFIG_KEY_MISSING = 1
+
 function git (args) {
   // 跨平台工具脚本需按名调用系统 git（依赖 PATH），非命令注入面 —— 对 SonarCloud S4036 免检
-  return execFileSync('git', args, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() // NOSONAR
+  // stderr 必须 pipe 而不是 ignore：否则 git 的 fatal/error 行不会进入 e.stderr，报错只剩
+  // 「Command failed: ...」，看不到真实原因（PR 评审 F5）。
+  return execFileSync('git', args, { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() // NOSONAR
+}
+
+// 取 execFileSync 错误里的 stderr（execFileSync 默认 encoding 为 buffer，可能是 Buffer）。
+function gitStderr (e) {
+  const raw = e && e.stderr
+  if (!raw) return ''
+  return (Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw)).trim()
+}
+
+// 打印失败原因：git 自己的诊断（stderr）比 Node 的 e.message 更有信息量。
+function reportGitFailure (prefix, e) {
+  const message = String((e && e.message) || e)
+  const detail = gitStderr(e)
+  console.error(`${prefix}${message}`)
+  // 较新的 Node 已把 stderr 拼进 e.message；仅在其缺失时补打，避免重复刷屏
+  if (detail && !message.includes(detail)) console.error(`[hooks]    git: ${detail}`)
 }
 
 function isDirectory (target) {
@@ -76,14 +99,21 @@ function verifyHooks (dir) {
 }
 
 let insideRepo = false
+let repoCheckError = null
 try {
   insideRepo = git(['rev-parse', '--is-inside-work-tree']) === 'true'
 } catch (e) {
   insideRepo = false
+  repoCheckError = e
 }
 
 if (!insideRepo) {
-  console.warn('[hooks] 跳过：当前不在 git 工作树内（或 git 不可用）')
+  // 跳过 ≠ 门禁已生效：本路径按设计以 0 退出（非工作树无需安装），自动化不得据此判定已装好。
+  console.warn('[hooks] 跳过：当前不在 git 工作树内（或 git 不可用）；按设计以 0 退出，不代表提交门禁已生效。')
+  if (repoCheckError) {
+    const detail = gitStderr(repoCheckError)
+    console.warn(`[hooks]    诊断：${detail || repoCheckError.message}`)
+  }
   process.exit(0)
 }
 
@@ -94,14 +124,31 @@ try {
   repoRoot = git(['rev-parse', '--show-toplevel']) || repoRoot
 } catch (e) {
   // 退回 cwd：verifyHooks 会如实报告钩子目录缺失
+  const detail = gitStderr(e)
+  console.warn(`[hooks] ⚠️  无法解析工作树根目录，退回当前目录 ${repoRoot}：${detail || e.message}`)
 }
 const resolvedHooksDir = path.join(repoRoot, HOOKS_DIR)
 
+// PR 评审 F4：只有退出码 1（键不存在）才算「未配置」。其它失败（配置损坏、git 异常等）
+// 不能当成「未配置」——那会在已有配置的情况下把它覆盖掉，违反 :5 的硬保证。
 let current = ''
+let hooksPathConfigured = false
 try {
   current = git(['config', '--get', 'core.hooksPath'])
+  // 退出码 0 即键存在；但**值为空串**（core.hooksPath=""）时 git 会退回默认 hooks 目录，
+  // 本仓库门禁并不生效——语义上等同「未配置」，仍走下方安装分支。
+  // qodo #147-1：此前把空串也算「已配置」→ 只告警并 exit 0，自动化会误判「安装成功」，
+  // 而门禁其实从未生效（本文件 :5 的硬保证要求不得出现这种假成功）。
+  hooksPathConfigured = current !== ''
 } catch (e) {
-  current = ''
+  if (e.status === GIT_CONFIG_KEY_MISSING) {
+    hooksPathConfigured = false
+  } else {
+    console.error('[hooks] ❌ 读取 core.hooksPath 失败，无法确认是否已有配置。')
+    reportGitFailure('[hooks]    原因：', e)
+    console.error('[hooks]    为避免覆盖既有配置，未写入任何配置；请先修复 git 配置后重跑本脚本。')
+    process.exit(1)
+  }
 }
 
 if (current === HOOKS_DIR) {
@@ -113,9 +160,12 @@ if (current === HOOKS_DIR) {
   console.log(`[hooks] 已就绪：core.hooksPath=${HOOKS_DIR}`)
   process.exit(0)
 }
-if (current) {
-  console.warn(`[hooks] 已存在 core.hooksPath=${current}，未覆盖。如需改用本仓库钩子：git config core.hooksPath ${HOOKS_DIR}`)
+if (hooksPathConfigured) {
+  console.warn(`[hooks] 已存在 core.hooksPath=${current}，未覆盖；本仓库提交门禁不会生效。如需改用本仓库钩子：git config core.hooksPath ${HOOKS_DIR}`)
   process.exit(0)
+}
+if (current === '') {
+  console.warn('[hooks] 检测到 core.hooksPath 为空串（git 退回默认 hooks 目录，本仓库门禁不生效），按未配置处理并写入本仓库钩子。')
 }
 
 // PR 评审 #140：钩子不可执行时（如 noexec 文件系统上 chmod 静默无效）不写配置、也不以 0 退出——
@@ -128,7 +178,8 @@ if (!verifyHooks(resolvedHooksDir)) {
 try {
   git(['config', 'core.hooksPath', HOOKS_DIR])
 } catch (e) {
-  console.error(`[hooks] 注册失败：${e.message}`)
+  // PR 评审 F5：带上 git 自己的 stderr（fatal/error 行），否则只剩「Command failed: ...」
+  reportGitFailure('[hooks] 注册失败：', e)
   process.exit(1)
 }
 

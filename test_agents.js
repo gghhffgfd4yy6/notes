@@ -133,5 +133,10 @@ dns.lookup = (hostname, options, callback) => {
   assert.strictEqual(abortedResult.ok, false, 'aborted 时 ok 应为 false')
   assert.ok(abortedResult.error?.includes('abort') || abortedResult.cancelled === true, 'aborted 时应包含取消信息')
 
+  // ===== module.exports：不再导出死值 DNS_CACHE（AGENTS-08）=====
+  // 旧导出含 `DNS_CACHE: null`（无任何读取方）；若回退该行，`in` 判定为 true 即红。
+  const agentsExports = require('./xbk_agents')
+  assert.ok(!('DNS_CACHE' in agentsExports), 'module.exports 不应再包含 DNS_CACHE')
+
   console.log('test_agents OK')
 })().catch((e) => { console.error(e); process.exit(1) })

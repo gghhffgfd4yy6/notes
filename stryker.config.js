@@ -77,6 +77,17 @@ module.exports = {
   // （见上方 timeoutMS 注释），阈值边界上只会误红；CI 侧同样只出日报（mutation.yml 的 report job
   // 不设阈值）。若要改为真正的门禁，请先按当前真实基线取 break 值再开。
   thresholds: { high: 80, low: 60, break: null },
+  // reporters：'json' 是报告链的硬依赖，不可随手删——scripts/mutation-report.js 经 scripts/mutation-json.js
+  // 读 reports/mutation/mutation.json。本文件刻意不写 jsonReporter.fileName/htmlReporter.fileName，靠
+  // Stryker 默认值（reports/mutation/mutation.json、reports/mutation.html）与 mutation.yml 的 artifact
+  // 路径、scripts/mutation-report.js 的查找口径隐式对齐；'clear-text' 供 CI 日志阅读。
+  // 代价（审查 F-04，low）：command runner 把每个变异体的整段测试输出写进 statusReason，单个
+  // mutation.json 可达 500MB+（见 scripts/mutation-json.js:2-6 的自述），而 .github/workflows/mutation.yml
+  // 仍把整个 reports/ 当缓存（「恢复增量缓存」step 的 path: reports）与 artifact（「上传变异报告」step 的
+  // path: reports/）的载体——18 段各自 restore/save/上传数百 MB，拖慢归档并挤压同仓库其它缓存。
+  // 真正的体积收敛必须改 workflow（缓存只留 reports/inc-*.json，或在缓存/上传前先接入
+  // scripts/mutation-json.js 的现成剥离实现），属跨文件改动，本次未落地；此处只把「json reporter 不可删」
+  // 的耦合与已知代价写明，避免后人误删 reporter，或误以为体积问题与 reporter 选择无关。
   reporters: ['clear-text', 'html', 'json'],
   tempDirName: '.stryker-tmp',
   cleanTempDir: 'always',
