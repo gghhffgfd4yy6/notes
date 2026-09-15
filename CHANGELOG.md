@@ -35,3 +35,18 @@
 - 稳定性：一言请求关闭 got 内置重试（不再吃满 10 秒推送预算导致整轮取消）；一言文本拼接后再清洗孤立代理（避免通道每轮 URIError）；WxPusher 取消不再被误判为限频逐个重试；emoji 修饰符截断与主实现对齐。
 - 可观测性：dry-run 不再报「N 条失败，下次运行重试」（未推送条数另记）；身份无效条目单独计数（终端与 `run.log`）；`run.log` 回显清洗控制字符，防止接口字段伪造日志行；一言获取失败的日志改经 `safeErr` 脱敏（不再原样打印异常 message）；日报/通道健康整体异常补 WARN 留痕；告警留痕的版本号改为入口注入（缺 `package.json` 的部署不再静默失效）。
 - 性能：HTML 转 Markdown 的未知标签闭合探测与 URL 归一化改为线性算法/单次预扫描，消除单条长消息可触发的 O(n²) 阻塞。
+
+## v3.274
+
+- 时间口径：运行日志与台账时间戳固定为 `Asia/Shanghai`（格式不变），不再随部署时区变化，与日报日界统一（此前 CI/容器以 UTC 运行时，日志行日期可能比日报早一天）。
+- 接口超时钳制：`api.timeout` 统一取整并钳到 `[1, 2147483647]` 毫秒（小数向上取整），非正或非法值回落默认 5000；此前 `0.5` 或超界值会被 Node 定时器归一到约 1ms，导致每次请求瞬间超时。
+- 缓存安全：空字符串路径显式判为不安全并拒绝写入（此前会在进程 CWD 落一个含内容的临时文件）；`readSafeText(filePath, maxBytes)` 支持透传读取上限。
+- 过滤：白名单过滤对非字符串字段值统一 `String()` 化（与 `matchesCompiled` 同口径，不再按对象 JSON 化/函数置空）；`checkFields`/`checkCategory`/`checkRegisterTime` 收到未编译或错形状参数时显式告警并保守放行，规则编译失败同样补告警；配置校验对含零宽字符的正则与超上限的 `pingbitime` 补告警，并改为逐字段安全读取（抛错 getter 只告警并跳过该字段，不再中断整轮校验）。
+- 推送：HTML 正文超过 100000 字符改用 UTF-16 安全截断（不再按码元切出半个 emoji）并打告警；整体超时的错误对象顶层补 `code='PUSH_TIMEOUT'`，配置通道清单不可得时告警留痕。
+- 模板与清洗：`{Html内容}` 在无 url 时不再输出悬空的「原文链接：」，url 被 `safeUrl` 过滤但原始值非空时保留纯文本提示、不生成 href；Markdown 链接/图片的闭合点按 `(…)` 配平扫描（URL 内含 `)` 不再残留 `.jpg)`），配平失败回退「首个 `)`」而不是放弃整段。
+- 常驻循环与失败归类：未传 `onError`/`onIntervalError` 时分别由独立默认处理器打诊断日志（单轮失败与性能预热失败不再互相误标、也不再静默吞错）；`summarizeError` 递归加祖先环守卫与深度上限（自引用结构不再抛 `RangeError`），`failureInfo` 透传前同样脱敏/折叠换行/截断，全部通道可重试时聚合原因细分标为 `ALL_CHANNELS_RETRYABLE`。
+- 预热与墓碑缓存：`prewarmTls` 的 `count` 非有限值钳为 1（此前 NaN 静默报成功、Infinity 抛 `RangeError`）；墓碑淘汰在无法达标时返回 `null` 并放弃持久化（此前死循环挂起进程），墓碑读取失败与写入门径失败补告警。
+- 清理：移除死代码——`xbk_agents` 的 `DNS_CACHE` 死导出、`xbk_rules` 未被调用的正则编译包装、`xbk_utils._parseFallback` 不可达的 `/` 分隔日期分支、`xbk_message_store` 的死状态 `_nowInc`。
+- 接口响应：带 UTF-8 BOM 的合法 JSON 不再被判 `ERR_BODY_NOT_JSON`（此前会让常驻循环按永久错误停推）；`XBK_PROFILE=3` 的请求日志 URL 只保留 origin（非末段密钥不再进日志）；响应体非法时不再回显响应体内容、只报长度。
+- 入口与状态：青龙入口未识别参数、`XBK_CACHE_DIR` 非绝对路径、Node 低于 `engines` 要求均补告警（不再静默），依赖恢复改用现行等价的 `--omit=dev`，`--check` 失败项带上原因、DNS/TLS 预热统计按任务类型绑定（TLS 不再计入 DNS 计数）；`--status` 的 `run.log` 摘要解析锚定行首（噪声行不再误命中）、`report.state` 缺字段不再整表判 invalid，输出补「待推送（截断）」「截断」「耗时」。
+- 门禁与工具链：单元入口新增每套件硬超时 `XBK_UNIT_TIMEOUT`（默认 10 分钟，超时 SIGKILL 并按失败结算）；`check-version.js` / `run_unit_tests.js` 改用 `process.exitCode` 收尾（管道场景不丢错误详情）；变异日报对预期之外/重复分段 fail-loud、报告顶层非对象时报带上下文的错误；行段校验补 `start > end`、非末段越过 EOF 与全文件形式的幽灵目标三类 fail-loud，对 `MUTATION_WORKFLOW_TEXT` 注入打告警（区分注入与真实文件读取），变异报告 JSON 读取失败补路径上下文；`install-hooks.js` 读取 `core.hooksPath` 出错时 exit 1 且不写配置（保留 git 的 stderr）；`isValidVersion` 补 `typeof` 守卫；`xbk_sendNotify_slim.js` 段二行段同步为 `751-1479`。

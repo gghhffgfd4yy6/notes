@@ -53,7 +53,7 @@ XBK_CACHE_DIR=/path/to/cache node qinglong/xbk_push.js --status
 
 相对路径会被忽略。`XBK_CACHE_DIR` 只影响 `--status`；常驻/单轮运行的缓存目录由 `Config.cache.dir` 决定，且必须位于项目根内（绝对路径、`..` 或符号链接逃逸会被拒绝并回退默认目录）。
 
-`--status` 只读取缓存目录中的状态文件，不加载推送依赖、不抓取、不推送、不修复或写入任何文件。
+`--status` 只读取缓存目录中的状态文件，不加载推送依赖、不抓取、不推送、不修复或写入任何文件。输出含日报的「待推送（截断）」及最近一轮的「截断」「耗时」字段；`report.state` 缺字段按「未累计」处理（不整表判 invalid）。
 
 调整过滤规则时可运行抓取和处理流程但不调用通知接口，也不写成功缓存：
 
@@ -80,8 +80,9 @@ node qinglong/xbk_push.js --dry-run
 | `XBK_AUTO_INSTALL_DEPS=1` | 仅青龙入口：依赖缺失时自动安装并重建 re2 |
 | `XBK_PROFILE` | `1` 输出每轮耗时剖面，`2` 追加预热/预处理明细，`3` 再追加启动与运行检查点 |
 | `XBK_DNS_FAMILY` | `4`/`6` 强制 DNS 预热与解析走 IPv4/IPv6，默认 auto |
+| `XBK_UNIT_TIMEOUT` | 仅 `npm run test:unit`（`run_unit_tests.js`）：每套件硬超时毫秒数（默认 600000），正整数，非法值回退默认；超时以 `SIGKILL` 强杀并按失败结算 |
 
-`--check` / `--status` / `--dry-run` 之外的参数会被静默忽略。
+`--check` / `--status` / `--dry-run` 之外的参数会被忽略并告警（不改变启动行为）。
 
 ## 配置
 
@@ -96,7 +97,7 @@ node qinglong/xbk_push.js --dry-run
 | 配置段 | 字段（默认值） | 说明 |
 |---|---|---|
 | `domain` | `'https://new.ixbk.net'` | 接口域名，`api.pushUrl` 由其拼出 |
-| `api` | `timeout: 5000`、`retry: 2` | 接口超时与重试次数 |
+| `api` | `timeout: 5000`、`retry: 2` | 接口超时与重试次数（超时取整并钳到 1~2147483647 毫秒，小数向上取整，非正或非法值回落 5000） |
 | `filter` | 全部 `''`，`pingbitime: '5'` | 过滤规则；变更会失效「过滤写入」缓存并重评 |
 | `keyword` | `zkt_gjc: ''` | 只看它关键词 |
 | `timing` | `pushInterval: 0`、`finalWait: 0` | 推送间隔与收尾等待（毫秒） |
