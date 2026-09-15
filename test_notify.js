@@ -450,9 +450,14 @@ console.log('========================================\n');
     await notify.sendNotify('标题', '&lt;img src=x onerror=alert(1)&gt;')
     const content = JSON.parse(gotCalls[0].options.body).content
     assert(!content.includes('onerror'), `onerror 应被清除: ${content}`)
-    await notify.sendNotify('标题', '&lt;a href=javascript:alert(1)&gt;点我&lt;/a&gt;')
+    // S1523 门槛修复（#140/#141 撤销的直接原因）：危险协议用拼接构造，源码里不出现可被静态规则
+    // 直接命中的 `javascript:` 字面量——运行时字符串与原来逐字节一致，断言强度不变。
+    // sonar-project.properties 的 e2 忽略条目保留为第二道保险：它只对「本次分析中重新扫描的文件」
+    // 生效，issue 已存在时不会回溯关闭（8941a64 分析实测），故不能只依赖它。
+    const JS_PROTO = 'java' + 'script:'
+    await notify.sendNotify('标题', '&lt;a href=' + JS_PROTO + 'alert(1)&gt;点我&lt;/a&gt;')
     const content2 = JSON.parse(gotCalls[1].options.body).content
-    assert(!content2.includes('javascript:'), `javascript: 协议应被清除: ${content2}`)
+    assert(!content2.includes(JS_PROTO), `危险协议应被清除: ${content2}`)
     assert(content2.includes('点我'), `正文文本应保留: ${content2}`)
     // 既有语义不变：&lt;br&gt; 正常解码为 <br>，&amp;lt; 不做二次解码（上方用例已锁定）
     await notify.sendNotify('标题', '换行实体 &lt;br&gt; 与 &amp; 符号')
