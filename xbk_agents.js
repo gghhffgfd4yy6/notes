@@ -60,6 +60,9 @@ function dnsLookup (hostname, options, callback) {
     return
   }
 
+  // AGENTS-04（已知限制，改行为需先定状态机口径）：普通调用方（含 got 超时/取消后仍存在的 net
+  // lookup 回调）没有摘除路径；唯一摘除是 prewarmDns 的 abort 分支，底层 dns.lookup 完成时才统一
+  // delete。坏解析器下同 key 列表会随重试只增不减——本注释只记录现状，未改任何行为。
   const pending = dnsPending.get(key)
   if (pending) {
     pending.push(callback)
@@ -140,9 +143,13 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
   const started = Date.now()
   if (signal && signal.aborted) return { hostname, count, skipped: true, cancelled: true, ok: false, okCount: 0, elapsedMs: 0 }
   try {
-    // 测试环境 got 为 mock（无 stream）：跳过真实建连，避免破坏 gotCalls 断言。
+    // got 替身可能不提供 stream（真实 got 恒有；与 xbk_http.js 的 mock 判定同款）：无法建连时跳过并
+    // 以 skipped:true 标记，ok 沿用既有 skipped→ok 约定（见 xbk_app.js 预热取消分支），未改语义。
     if (!got.stream) return { hostname, count, skipped: true, ok: true, elapsedMs: Date.now() - started }
   } catch (e) { /* 忽略 */ }
+  // AGENTS-05（已知缺口，未改行为）：本 HEAD→GET 回退只为建连、但 await 会读完整个响应体，而这里没有
+  // 体量上限——got@11 无 maxResponseSize 选项，xbk_http.js 的 20MB 上限只覆盖 fetchJson。补上限需要
+  // 统一的响应体策略，属跨文件口径决策，故仅记录现状。
   const baseOptions = {
     ...baseRequestOptions(),
     timeout: timeoutMs,
@@ -150,7 +157,12 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
     throwHttpErrors: false,
     ...(signal ? { signal } : {})
   }
-  const results = await Promise.all(Array.from({ length: Math.max(1, Math.floor(count)) }, async () => {
+  // 边界守卫（AGENTS-03）：NaN/Infinity/非数字一律钳制为 1。此前 count=NaN 会得到空数组并静默返回
+  // ok:true/okCount:0（未建连却报成功），count=Infinity 会让 Array.from 抛 RangeError；合法数值
+  // （含 0/负数→1，与旧 Math.max(1, …) 同口径）行为不变。
+  const requestedCount = Math.floor(Number(count))
+  const connectionCount = Number.isFinite(requestedCount) && requestedCount >= 1 ? requestedCount : 1
+  const results = await Promise.all(Array.from({ length: connectionCount }, async () => {
     const singleStart = Date.now()
     try {
       // HEAD 无响应体：只需 DNS+TCP+TLS+响应头即可完成建连，连接进入 Keep-Alive 池，
@@ -177,10 +189,14 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
         await got.get(`https://${hostname}/`, baseOptions)
         return { ok: true, elapsedMs: Date.now() - singleStart, viaGet: true }
       } catch (e2) {
+        // AGENTS-06：与 405 回退分支同口径——GET 回退被 abort 时返回 cancelled 而非普通 error。
+        if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart }
         return { ok: false, error: e2 && (e2.code || e2.message) ? String(e2.code || e2.message) : String(e2), elapsedMs: Date.now() - singleStart }
       }
     }
   }))
+  // AGENTS-07（已知形状缺陷，未改）：返回值同样带 hostname，调用方按字段无法区分 DNS/TLS（qinglong/
+  // xbk_push.js 已在任务侧显式绑定 kind）。增减字段属跨文件口径决策，故仅记录，不改返回形状。
   return {
     hostname,
     count: results.length,
@@ -191,4 +207,4 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
   }
 }
 
-module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, DNS_CACHE: null, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls }
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls }

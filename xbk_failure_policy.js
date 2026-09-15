@@ -54,11 +54,54 @@ function codeOf (error) {
   return typeof code === 'string' || typeof code === 'number' ? String(code).toUpperCase() : ''
 }
 
-function summarizeError (error) {
-  if (readProp(error, 'failureInfo') && typeof readProp(error, 'failureInfo') === 'object') {
-    return { ...readProp(error, 'failureInfo') }
+// 聚合失败的子结构可能来自外部上报或通道适配器拼接，既可能自引用也可能极深。
+// 本模块对调用方承诺“不抛异常”，因此递归统一带上祖先集合 + 深度上限：
+// 命中环或超深时截断为可读标记（标记本身只会落进 UNKNOWN → retryable，不会误判永久）。
+const MAX_FAILURE_DEPTH = 5
+const TRUNCATED_FAILURE_MESSAGE = '[嵌套失败结构过深或自引用，已截断]'
+
+function depthExceeded (value, ancestors, depth) {
+  if (depth > MAX_FAILURE_DEPTH) return true
+  return Boolean(ancestors && ancestors.has(value))
+}
+
+// XFP-05/XFP-06：failureInfo 透传前与常规路径同口径清洗（脱敏 + 折叠换行 + 截断），
+// 而不是直接浅拷贝——否则 failureInfo 里的凭据会绕过清洗链原样带出，
+// 且自引用结构会抛 RangeError 破坏本模块的“不抛”契约。
+// 逐字段用 readProp 读取，getter/proxy 抛错时降级为 undefined，不让摘要读取把调用方带崩。
+function sanitizeFailureInfo (info, ancestors, depth) {
+  if (depthExceeded(info, ancestors, depth)) return { message: TRUNCATED_FAILURE_MESSAGE }
+  const sanitized = {}
+  let keys = []
+  try { keys = Object.keys(info) } catch (e) { keys = [] }
+  for (const key of keys) {
+    const value = readProp(info, key)
+    if (key === 'failures' && Array.isArray(value)) {
+      const childAncestors = new Set(ancestors || [])
+      childAncestors.add(info)
+      sanitized.failures = value.map(item => summarizeError(item, childAncestors, depth + 1))
+      continue
+    }
+    if (typeof value !== 'string') {
+      sanitized[key] = value
+      continue
+    }
+    // message/reason 与常规路径一致：折叠换行并截断；其余字符串只做脱敏，保留原值语义。
+    sanitized[key] = key === 'message' || key === 'reason' || key === 'failureReason'
+      ? redact(value).replace(/[\r\n]+/g, ' ').slice(0, 500)
+      : redact(value)
+  }
+  return sanitized
+}
+
+function summarizeError (error, ancestors, depth) {
+  const level = Number.isInteger(depth) && depth > 0 ? depth : 0
+  const failureInfo = readProp(error, 'failureInfo')
+  if (failureInfo && typeof failureInfo === 'object') {
+    return sanitizeFailureInfo(failureInfo, ancestors, level)
   }
   const source = error && typeof error === 'object' ? error : { message: error }
+  if (depthExceeded(source, ancestors, level)) return { message: TRUNCATED_FAILURE_MESSAGE }
   const rawProviderCode = readProp(source, 'providerCode')
   const rawChannel = readProp(source, 'channel')
   const rawName = readProp(source, 'name')
@@ -78,7 +121,10 @@ function summarizeError (error) {
   }
   const failures = readProp(source, 'failures')
   if (Array.isArray(failures)) {
-    info.failures = failures.map(summarizeError)
+    // 祖先集合按路径复制（不是共享可变集合），保证同一子对象作为兄弟节点重复出现时仍完整展开。
+    const childAncestors = new Set(ancestors || [])
+    childAncestors.add(source)
+    info.failures = failures.map(item => summarizeError(item, childAncestors, level + 1))
   }
   return info
 }
@@ -95,11 +141,12 @@ function classifyOne (error) {
   if (Array.isArray(info.failures) && info.failures.length > 0) {
     const nested = info.failures.map(classifyOne)
     if (nested.some(x => x.kind === 'retryable')) {
-      return { kind: 'retryable', reason: 'MIXED_CHANNEL_FAILURES', info }
+      // 全部子项都可重试时并非“原因混合”，标成 MIXED 会让诊断失真；kind 不变，只分清 reason。
+      const allRetryable = nested.every(x => x.kind === 'retryable')
+      return { kind: 'retryable', reason: allRetryable ? 'ALL_CHANNELS_RETRYABLE' : 'MIXED_CHANNEL_FAILURES', info }
     }
-    if (nested.some(x => x.kind !== 'permanent')) {
-      return { kind: 'retryable', reason: 'UNKNOWN_CHANNEL_FAILURE', info }
-    }
+    // classifyOne 只返回 retryable|permanent：走到这里说明不存在 retryable 子项，即全永久。
+    // 原 UNKNOWN_CHANNEL_FAILURE 分支（nested.some(x => x.kind !== 'permanent')）恒 false，已移除。
     return { kind: 'permanent', reason: 'ALL_CHANNELS_PERMANENT', info }
   }
 
