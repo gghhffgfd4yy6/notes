@@ -16,9 +16,14 @@ const REQUEST_OPTIONS = baseRequestOptions()
 // 共享 Utils 单例；为复用主代码的 sanitizeDecodedHtml / truncateUtf16（不再保留第二份实现），
 // 按 xbk_utils.createUtils 的契约自建实例。safeRe 用原生 RegExp：RE2 优先的注入策略属于组合根
 // 职责（xbk_utils 只要求「可用的 safeRe 函数」）；被复用的两个方法内部都有 100k 截断与线性预检，
-// 最坏耗时有界，且清洗链正则均为 RE2 兼容写法。构造器入参只来自本模块内的字面量模板字符串，
-// 不含任何外部净输入（见下方行内 nosemgrep 说明）。
-const Utils = createUtils({ safeRe: (source, flags) => new RegExp(source, flags) }) // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp（pattern 全为模块内字面量常量，非用户输入）
+// 最坏耗时有界，且清洗链正则均为 RE2 兼容写法。
+// 静态告警说明（Codacy/Opengrep `detect-non-literal-regexp`，confidence: LOW）：该规则是
+// 「函数形参 → RegExp」的污点启发式，命中本行是因为 safeRe 的 pattern 恰好是形参；实际 pattern
+// 全部来自本模块内的字面量模板常量（清洗链固定写法），无任何外部净输入，属误报。
+// `// nosemgrep` 行内登记对本仓库的 Codacy 引擎不生效（配置层也不支持按规则忽略），已在 PR 中
+// 记录为唯一残留告警；如需清零，只能改为复用组合根的 RE2 优先 safeRe（需先把 safeRe 从
+// xbk_function_v3 导出并注入本模块），或在 Codacy 网页端把该条 Ignore（作用于仓库级 issue 列表）。
+const Utils = createUtils({ safeRe: (source, flags) => new RegExp(source, flags) })
 
 const requestExtras = (params) => {
   try { return params && params.signal ? { signal: params.signal } : {} } catch (e) { return {} }
