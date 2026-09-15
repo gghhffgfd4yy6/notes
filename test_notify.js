@@ -12,6 +12,7 @@ require(gotPath)
 
 let gotCalls = []
 let failHitokoto = false // 一言接口失败开关（v3.73：验证 sendNotify 兜底跳过不崩）
+let failHitokotoMsg = '' // 一言失败时的自定义异常文案（v3.273：断言失败日志经 safeErr 脱敏）
 let failHitokotoStruct = false // 一言响应结构异常开关（v3.86：缺 hitokoto 字段）
 let failPost = false // got.post 失败开关（v3.75：验证失败日志不泄露密钥）
 let failWxpusher = false // wxpusher API 失败开关（v3.154：code≠1000 应 reject 不静默）
@@ -28,7 +29,7 @@ let syncPostThrow = false // got.post 同步构造异常
 require.cache[gotPath].exports = (url, options) => {
   gotCalls.push({ url, options })
   // 一言接口失败模拟：抛 Error（网络异常路径）
-  if (failHitokoto && String(url).includes('hitokoto.cn')) throw new Error('一言服务不可用')
+  if (failHitokoto && String(url).includes('hitokoto.cn')) throw new Error(failHitokotoMsg || '一言服务不可用')
   // 一言接口返回对象 body（模拟真实 got 自动 JSON 解析），其余返回字符串
   const body = String(url).includes('hitokoto.cn')
     ? (failHitokotoStruct ? { hitokoto: 'x' } : { hitokoto: '测试一言', from: '源' }) // 结构异常=缺 from（v3.87）
@@ -595,6 +596,27 @@ console.log('========================================\n');
       assert(!desp.includes('测试一言'), '一言失败时内容不应追加一言')
     } finally {
       failHitokoto = false
+    }
+  }))
+
+  // v3.273：一言失败日志曾直接打印 e.message/String(e)（未过 safeErr），
+  // 与「异常摘要经脱敏再落日志」的口径不符（评审 CodeRabbit 于 PR #145 发现）。
+  await test('一言失败日志经 safeErr 脱敏，不泄露配置密钥（v3.273）', () => withChannels(async () => {
+    cfg.PUSH_KEY = 'SCT123456'
+    cfg.HITOKOTO = 'true'
+    failHitokoto = true
+    failHitokotoMsg = '一言请求失败 SCT123456'
+    const logs = []; const oldLog = console.log
+    console.log = (...args) => logs.push(args.join(' '))
+    try {
+      await notify.sendNotify('标题', '内容')
+      const out = logs.join('\n')
+      assert(out.includes('一言获取失败'), `应保留可读的失败日志: ${out}`)
+      assert(!out.includes('SCT123456'), `失败日志不得泄露配置密钥: ${out}`)
+    } finally {
+      console.log = oldLog
+      failHitokoto = false
+      failHitokotoMsg = ''
     }
   }))
 

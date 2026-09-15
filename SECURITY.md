@@ -9,7 +9,7 @@
 
 ## 安全承诺
 
-- 推送通道的密钥与 URL 经 `maskKey`/`maskUrl` 脱敏，通道异常摘要经 `safeErr` 脱敏后再落日志；其余诊断（本地文件、依赖、一言等）按原样记录错误 `message`，不做统一脱敏。
+- 推送通道的密钥与 URL 经 `maskKey`/`maskUrl` 脱敏，通道异常摘要与一言获取失败经 `safeErr` 脱敏（按已配置密钥表替换 + 截断 200 字符）后再落日志；其余诊断（本地文件、依赖等）按原样记录错误 `message`，不做统一脱敏。
 - 推送密钥只存放于本地 `push_config.local.js`（已被 `.gitignore` 忽略，不入库）或青龙环境变量；CI 不使用推送密钥，仅使用 Actions 自动签发的 `GITHUB_TOKEN`（最小权限）。
 - 依赖更新由 Dependabot 自动开 PR（`.github/dependabot.yml`）；安全门禁由 PR 上的 Dependency Review（`fail-on-severity: high`）、CodeQL、`npm audit --audit-level=high --omit=dev` 与 `quality-gate` 负责，**人工审查后合并——当前未配置自动合并**。
 
