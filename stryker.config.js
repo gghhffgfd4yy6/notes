@@ -17,7 +17,14 @@ module.exports = {
     // 开销会拖慢执行，不放宽则性能断言会因沙箱开销误失败（并可能触发 commandRunner 超时），
     // 使初始/变异运行无法建立基线。注意：它规避的是沙箱内的误失败/超时，与变异体 Killed 判定无关
     // （Killed 取决于断言能否捕获行为差异，而非性能计时）。
-    command: 'PERF_MS=3000 node run_unit_tests.js'
+    // XBK_MUTATION_CHILD=1 / SKIP_SUITES=：必须与 CI（mutation.yml 的 step env）及 run_mutation.js 的
+    // spawn 同口径，否则本地 `npm run test:mutation` 与 CI 变异路径不等价：
+    //   - SKIP_SUITES 被 shell 继承时，run_unit_tests.js 会静默少跑套件（分数与 CI/日报不可比）；
+    //   - 缺 XBK_MUTATION_CHILD=1 时 run_unit_tests.js 的防重入守卫失效，test_run_mutation_cli.js /
+    //     test_run_mutation_race.js 会在每个变异体里再执行一整轮嵌套单元测试（120s 超时）与 2.2s 时序断言。
+    // 跨平台（PR 评审 #140）：不用 POSIX 内联赋值（Windows cmd 下会把 XBK_MUTATION_CHILD=1 当成可执行名），
+    // 改由 scripts/mutation-child.js 在 process.env 上设置同样三个变量后加载 run_unit_tests.js。
+    command: 'node scripts/mutation-child.js'
   },
   mutate: [
     'xbk_function_v3.js',
@@ -36,7 +43,11 @@ module.exports = {
     'xbk_loop.js',
     'xbk_failure_policy.js',
     'qinglong/xbk_push.js',
-    'scripts/check-deps.js'
+    'scripts/check-deps.js',
+    // scripts/status.js 是运行时生产模块：被 qinglong/xbk_push.js 顶层无条件 require
+    // （--status 诊断与常驻入口的加载链上都会执行）。此前漏列 → 该文件零变异覆盖，且与
+    // scripts/check-mutation-ranges.js 的 productionFiles 缺口同源（审查 F-01）。
+    'scripts/status.js'
   ],
   coverageAnalysis: 'off',
   // 纯 JS 项目无需类型检查注入。CI run #120 根因：ranges 行数元校验
@@ -61,6 +72,11 @@ module.exports = {
   // 值维持 300000ms（300s）：作为加法偏移给多套件 + 插桩场景留足余量，无需下调。
   // 历史：90s → 180s（v3.273 切全量单元入口）→ 300s。
   timeoutMS: 300000,
+  // thresholds：显式写出取值，避免读者误以为「没有该项 = 有门禁」。break 刻意保持 null——本仓库
+  // `npm run test:mutation` 定位为本地观察项而非门禁，且 (killed + timeout) 的计分口径会虚增分数
+  // （见上方 timeoutMS 注释），阈值边界上只会误红；CI 侧同样只出日报（mutation.yml 的 report job
+  // 不设阈值）。若要改为真正的门禁，请先按当前真实基线取 break 值再开。
+  thresholds: { high: 80, low: 60, break: null },
   reporters: ['clear-text', 'html', 'json'],
   tempDirName: '.stryker-tmp',
   cleanTempDir: 'always',

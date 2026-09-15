@@ -17,6 +17,14 @@ console.log('══════════════════════�
 
 if (!checkDependencies()) process.exit(1)
 
+// 零套件不等于通过：注册表为空（或将来被过滤成空）时循环体一次都不执行，results 为空 → allOk 初值 true
+// → 打印「全部通过 🎉」并 exit 0，门禁整步假绿。注意 test_suite_registry.js 的「SUITES 不应为空」断言
+// 本身就在 SUITES 的一个成员里，空注册表时根本不会执行（自指盲区），救不了这个场景。
+if (!SUITES.length) {
+  console.error('❌ SUITES 为空：test_suites.js 注册表损坏，拒绝以「全部通过」收场')
+  process.exit(1)
+}
+
 for (const s of SUITES) {
   const file = path.join(__dirname, s.file)
   const t0 = Date.now()
@@ -29,8 +37,19 @@ for (const s of SUITES) {
   } catch (e) {
     const ms = Date.now() - t0
     results.push({ ...s, ok: false, ms })
-    console.log(`\n  ❌ ${s.name} 失败（${(ms / 1000).toFixed(1)}s）\n`)
+    // 静默非零退出/被信号杀死的套件在子进程侧可能零输出——父进程必须补上退出原因，
+    // 否则 exit 7 与「被 OOM 杀掉」在输出上完全不可区分（e.status/e.signal/e.code/e.message）。
+    const why = `code=${e.code ?? '-'} status=${e.status ?? '-'} signal=${e.signal ?? '-'}`
+    console.log(`\n  ❌ ${s.name} 失败（${(ms / 1000).toFixed(1)}s｜${why}）`)
+    if (e.message) console.log(`     ${String(e.message).split('\n')[0]}`)
+    console.log('')
   }
+}
+
+// 防御「全部条目被跳过」的未来形态：结果为空同样不得以「全部通过」收场。
+if (!results.length) {
+  console.error('❌ 未执行任何测试套件，拒绝以「全部通过」收场')
+  process.exit(1)
 }
 
 console.log('══════════════════════════════════════════════')
