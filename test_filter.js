@@ -8766,7 +8766,10 @@ console.log('========================================\n');
     } catch (e) {
       threw = true
     }
-    require('fs').chmodSync(CACHE, 0o755) // 无论如何先恢复权限
+    // 无论如何先恢复权限：0o700（属主 rwx）足够本用例后续读写，不用 0o755——
+    // 组/其他用户无需访问该测试缓存目录，且 0o755 会被 SonarCloud S2612 判为过宽权限
+    // （本行一旦被某个 PR 改动就会变成「新代码」告警，正是 #140 门禁变红的同款触发方式）。
+    require('fs').chmodSync(CACHE, 0o700)
     try { require('fs').unlinkSync(p) } catch (e) { /* 清理容错: 只读目录下文件未创建 */ }
     assertEqual(threw, false, '恢复写入抛错时 readMessages 不得抛出（v3.236 降级）')
     assertEqual(Array.isArray(result) && result.length === 1 && result[0].id === 'restore-ok', true, '应返回内存快照而非清空')
