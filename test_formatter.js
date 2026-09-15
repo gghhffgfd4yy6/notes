@@ -127,6 +127,70 @@ check('<a href="data:text/html,...">x</a> → data 协议剥离', () => {
   )
 })
 
+// 审查 2026-09-14 F-04：闭合标签名后允许空白（HTML5 合法），此前 </a > 不被识别导致链接静默丢失
+check('<a> 闭合标签带空格（</a >）→ 仍转换为链接', () => {
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: '<a href="https://ok.com/1">t</a > tail' }),
+    '[t](https://ok.com/1) tail'
+  )
+})
+
+check('<a> 闭合标签含换行（</a\\n>）→ 仍转换为链接', () => {
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: '<a href="https://ok.com/1">t</a\n> tail' }),
+    '[t](https://ok.com/1) tail'
+  )
+})
+
+check('<h1>x</h1 > → # 标题（标题闭合标签带空白）', () => {
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<h1>x</h1 >tail' }), '# x\n\ntail')
+})
+
+// 审查 2026-09-14 F-05：锚点 href 与同函数 mdUrl 统一口径——含空白/括号用 <> 包裹
+check('<a> href 含空格 → 目标用 <> 包裹（与原文链接口径一致）', () => {
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: '<a href="https://ok.com/x y">t</a>' }),
+    '[t](<https://ok.com/x y>)'
+  )
+})
+
+check('<a> href 含左括号 → 目标用 <> 包裹', () => {
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: '<a href="https://ok.com/a(b">t</a>' }),
+    '[t](<https://ok.com/a(b>)'
+  )
+})
+
+check('<a> href 无特殊字符 → 不加 <>（对照）', () => {
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: '<a href="https://ok.com/e">t</a>' }),
+    '[t](https://ok.com/e)'
+  )
+})
+
+// PR 评审 #143-1：safeUrl 放行角括号，而角括号形式的 Markdown 目标内不允许未转义的 < / >——
+// 不编码时 `https://x/a(b)>c` 会产出 `[t](<https://x/a(b)>c>)`，内嵌 > 提前终止目标、链接失效。
+check('<a> href 含括号且含 > → 角括号编码，目标不被提前截断（#143）', () => {
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: '<a href="https://x/a(b)>c">t</a>' }),
+    '[t](<https://x/a(b)%3Ec>)'
+  )
+})
+
+check('<a> href 含空格且含 < → 角括号编码（#143）', () => {
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: '<a href="https://x/a<b c">t</a>' }),
+    '[t](<https://x/a%3Cb c>)'
+  )
+})
+
+check('{链接} 占位符同口径：含角括号也编码（#143）', () => {
+  assert.strictEqual(
+    formatter.tuisong_replace('{链接}', { url: 'https://x/a(b)>c' }),
+    '<https://x/a(b)%3Ec>'
+  )
+})
+
 // ===== 5. 粗体 <b>/<strong> =====
 check('<b>text</b> → **text**', () => {
   assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<b>粗体</b>' }), '**粗体**')
@@ -189,6 +253,25 @@ check('混合 HTML：标题 + 链接 + 粗体', () => {
   assert.ok(r.includes('[链接](https://x.com)'), '应包含链接')
 })
 
+// ===== 10b. 未知标签闭合探测：二次方防护与语义保持（审查 2026-09-14 F-02）=====
+check('未知标签堆叠：10 万个 <x> 的耗时上界（原实现单串全扫实测 ~9.9s）', () => {
+  const t0 = Date.now()
+  formatter.htmlToMarkdown({ content_html: '<x>'.repeat(100000) })
+  const dt = Date.now() - t0
+  // 入口 100k 截断后仍有 33333 个未知开标签：建表 + 二分查询应远快于旧的逐标签全串 indexOf
+  assert.ok(dt < 2000, `耗时 ${dt}ms 应在 2000ms 内`)
+})
+
+check('未知标签配对：同名闭合整体剥离，错配/未闭合仍原样保留', () => {
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<x>a</x>' }), 'a')
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<x>a</y>b</x>' }), 'a</y>b')
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: 'a </world> b' }), 'a </world> b')
+})
+
+check('未知标签闭合：属性值内的 </font 不算配对闭合', () => {
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<font title="</font>">a</font>' }), 'a')
+})
+
 // ===== 11. formatTemplate 模板替换 =====
 check('formatTemplate: {标题} 替换', () => {
   const r = formatter.tuisong_replace('标题：{标题}', { title: '测试标题' })
@@ -229,6 +312,34 @@ check('formatTemplate: 占位符值为 undefined → 空串', () => {
 check('formatTemplate: 无占位符 → 原样返回', () => {
   const r = formatter.tuisong_replace('纯文本无占位符', { title: 'x' })
   assert.strictEqual(r, '纯文本无占位符')
+})
+
+// 审查 2026-09-14 F-01：单趟替换——插入的数据值不再被后续占位符二次扫描
+check('formatTemplate: 数据值里的字面占位符 → 原样保留（不静默删字）', () => {
+  assert.strictEqual(formatter.tuisong_replace('[{内容}]', { content: 'a{Html内容}b' }), '[a{Html内容}b]')
+})
+
+check('formatTemplate: 正文含后续占位符 → 不被其它字段值替换', () => {
+  const r = formatter.tuisong_replace('[{内容}]|{链接}', { content: 'a{链接}b', url: 'https://ok.com/1' })
+  assert.strictEqual(r, '[a{链接}b]|https://ok.com/1')
+})
+
+check('formatTemplate: {标题} 值含 {内容} → 不平铺进正文', () => {
+  const r = formatter.tuisong_replace('[{标题}]|[{内容}]', { title: 'T{内容}', content: 'C' })
+  assert.strictEqual(r, '[T{内容}]|[C]')
+})
+
+check('formatTemplate: 正文占位符序列不被清空（模板未用 {Html内容} 时原样保留）', () => {
+  const content = '{Html内容}'.repeat(2000)
+  const r = formatter.tuisong_replace('{内容}', { content, content_html: 'H'.repeat(100000) })
+  assert.strictEqual(r, content)
+})
+
+check('formatTemplate: {内容}+{Html内容} 同时使用 → 输出长度受控不放大', () => {
+  const content = '{Html内容}'.repeat(2000)
+  const r = formatter.tuisong_replace('{内容}|{Html内容}', { content, content_html: 'H'.repeat(100000) })
+  // 旧实现先插入 content、再让 2000 处字面 {Html内容} 各展开 10 万字符 → 2 亿字符并可能抛 RangeError
+  assert.ok(r.length < 150000, `输出长度应受控，实际 ${r.length}`)
 })
 
 // ===== 12. 内部方法边界测试（提升变异分数）=====

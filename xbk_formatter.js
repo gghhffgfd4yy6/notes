@@ -4,6 +4,9 @@
 // Formatter extracted verbatim; integration remains the main entrypoint's responsibility.
 function createFormatter ({ Utils, safeRe }) {
   if (!Utils || typeof safeRe !== 'function') throw new TypeError('createFormatter requires Utils and safeRe')
+  // 模板占位符全集（与 xbk_app.js SUPPORTED_TPL_KEYS 及 tuisong_replace 的 map 键一致）：单趟
+  // 替换用固定字面量正则，无回溯风险（同 _finalizeMd 的固定正则，无需 safeRe）。
+  const TPL_PLACEHOLDER_RE = /\{标题\}|\{内容\}|\{Html内容\}|\{Markdown内容\}|\{分类名\}|\{分类ID\}|\{链接\}|\{日期\}|\{时间\}|\{楼主\}|\{类目\}|\{价格\}|\{商城\}|\{品牌\}|\{图片\}/g
   const Formatter = {
   /** Markdown 收尾：合并连续换行 + 去首尾空白（短路与正常路径共用） */
   _finalizeMd (s) {
@@ -13,6 +16,17 @@ function createFormatter ({ Utils, safeRe }) {
     if (s === undefined || s === null || s === '') return ''
     try { s = String(s) } catch (e) { return '' }
     return s.replace(/\n{3,}/g, '\n\n').trim()
+  },
+
+  /** Markdown 链接目标包裹：含空白/括号/] 时用 <> 包裹（mdUrl 与锚点 href 统一口径，
+   *  审查 2026-09-14 F-05——此前锚点 href 未包裹，含空格/未配平括号时链接目标失效）。
+   *  PR 评审 #143-1：角括号目标内不允许未转义的 < / >（safeUrl 只挡控制字符与危险协议，
+   *  放行角括号），URL 自带 > 会提前终止目标——`https://x/a(b)>c` 曾产出
+   *  `[t](<https://x/a(b)>c>)`，收件人拿不到链接。故包裹前先按 URL 编码转义角括号。 */
+  _mdDestination (url) {
+    if (!url) return url
+    const escaped = url.replace(/[<>]/g, (c) => (c === '<' ? '%3C' : '%3E'))
+    return /[\s()[\]]/.test(escaped) ? `<${escaped}>` : escaped
   },
 
   /** 从 from 起引号感知扫描定位标签结束 >：引号值内 > 不算结束（与原属性扫描正则口径一致），
@@ -89,7 +103,8 @@ function createFormatter ({ Utils, safeRe }) {
    * @param {RegExp} openRe 全局开标签正则（仅匹配标签名前缀，不含属性扫描；首捕获组 [1] 供
    *   closeOf/buildReplacement 使用；标签结束 > 由函数内引号感知扫描定位，杜绝属性扫描回溯）
    * @param {(m: RegExpExecArray, content: string, openTag: string) => string} buildReplacement 构建替换文本
-   * @param {(m: RegExpExecArray) => string} closeOf 计算闭合标签（小写）
+   * @param {(m: RegExpExecArray) => string} closeOf 计算闭合标签正则源码（小写；标签名后可跟 \s*，
+   *   审查 2026-09-14 F-04：</a >/</a\n> 等合法 HTML 结束标签须仍能识别）
    */
   _replaceTagged (html, openRe, buildReplacement, closeOf) {
     // v3.263（CodeAnt）：先标记引号属性值区间——<a>/<h> 若位于另一标签的引号属性值内则不转换
@@ -113,6 +128,7 @@ function createFormatter ({ Utils, safeRe }) {
       // v3.263：闭合搜索改用原串上的 i 标志正则——toLowerCase 在 İ(U+0130) 等字符上会展开为
       // 2 个码元，导致 lower 的索引相对原串错位（锚点/标题内容尾部多出 <、script 后内容丢首字符）。
       // lastIndex 线性推进，全程 O(n)，索引与 html 严格对齐。
+      // 审查 2026-09-14 F-04：closeTag 为正则源码（允许标签名后空白），闭合长度取实际匹配值。
       const closeRe = safeRe(closeTag, 'gi')
       closeRe.lastIndex = openEnd
       const closeM = closeRe.exec(html)
@@ -123,7 +139,7 @@ function createFormatter ({ Utils, safeRe }) {
         break
       }
       const closeRel = closeM.index
-      const closeEnd = closeRel + closeTag.length
+      const closeEnd = closeRel + closeM[0].length
       const content = html.slice(openEnd, closeRel)
       const openTag = html.slice(m.index, openEnd)
       out += html.slice(pos, m.index) + buildReplacement(m, content, openTag)
@@ -187,8 +203,8 @@ function createFormatter ({ Utils, safeRe }) {
     // URL 文本/目标统一使用 safeUrl：非字符串、空值、伪 URL、危险协议和换行都不生成 Markdown 链接。
     const urlText = Utils.safeUrl(shuju && shuju.url)
     const safeUrl = urlText
-    // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）
-    const mdUrl = safeUrl && /[\s()[\]]/.test(safeUrl) ? `<${safeUrl}>` : safeUrl
+    // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）；锚点 href 同口径
+    const mdUrl = this._mdDestination(safeUrl)
     // 显示文本转义：urlText 原样插入 [] 会被 Markdown 特殊字符(] [ \\)破坏，转义后与 mdUrl 口径一致
     const mdLinkText = urlText ? urlText.replace(/[[\]\\]/g, '\\$&') : urlText
     // 无标签内容短路：跳过整个替换链（性能优化）
@@ -233,7 +249,7 @@ function createFormatter ({ Utils, safeRe }) {
     }
     html = this._replaceTagged(html, /<h([1-6])/gi,
       (m, c) => '#'.repeat(Number(m[1])) + ' ' + c + '\n\n',
-      (m) => '</h' + m[1] + '>')
+      (m) => String.raw`</h${m[1]}\s*>`)
     // P1（审查 2026-08-15）：href 引号/无引号两形态合并——开标签正则仅匹配 <a 前缀（无属性扫描
     // 无回溯），href 值从开标签段内引号感知提取；原两正则语义一致（<ahref 无空格形态除外，
     // 非合法 HTML 不再转换，由下方扫描器按普通标签剥离）。v3.263：<a 后仅接受空白/紧接 >/href=
@@ -242,9 +258,9 @@ function createFormatter ({ Utils, safeRe }) {
     html = this._replaceTagged(html, /<a(?=[\s>]|href\s*=)/gi,
       (m, txt, openTag) => {
         const cleanHref = Utils.safeUrl(this._getTagAttr(openTag, 'href'))
-        return cleanHref ? `[${anchorText(txt)}](${cleanHref})` : anchorText(txt)
+        return cleanHref ? `[${anchorText(txt)}](${this._mdDestination(cleanHref)})` : anchorText(txt)
       },
-      () => '</a>')
+      () => String.raw`</a\s*>`)
     // 线性标签转换/剥离（v3.262）：两阶段单趟扫描替代原 11 个 replace 链 + 通用剥离 + script/style 区域移除。
     // 原正则链在「大量同前缀标签且无闭合 >」的输入上逐位重扫呈 O(n²)——<p 重复 28600 次实测 ~6s、
     // <h1 重复 ~9s、<td 重复 ~10s，单条外部消息即可触发 DoS（入口 100k 截断只能压到有界常数）。
@@ -332,18 +348,36 @@ function createFormatter ({ Utils, safeRe }) {
         let pos = 0
         const knownTags = new Set(['a', 'br', 'p', 'div', 'li', 'ul', 'ol', 'b', 'strong', 'i', 'em', 'img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'td', 'th', 'tr', 'table', 'script', 'style', 'input', 'link', 'blockquote'])
         const unknownPairs = []
-        const lowerStr = str.replace(/[A-Z]/g, c => c.toLowerCase())
         const quotedAttrSpans = this._quotedAttrSpans(str)
+        // 审查 2026-09-14 F-02：预扫描一次建立「未知标签名 → 合法闭合位置（升序）」索引。
+        // 原实现对每个未知开标签各做一次全串 indexOf 探测（k 个开标签 × O(n) ⇒ 二次方；
+        // 单条 10 万字符的 <x> 堆叠实测阻塞主线程 9.9s）。改为建表 + 二分查询，语义不变：
+        // 仍要求闭合标签名后仅空白再 >，属性值区间内的 </name 仍被跳过（错配/未闭合仍原样保留）。
+        const closeIndex = new Map()
+        const closeScanRe = /<\/[a-zA-Z][a-zA-Z0-9-]*/g
+        let closeScanM
+        while ((closeScanM = closeScanRe.exec(str)) !== null) {
+          const at = closeScanM.index
+          if (quotedAttrSpans.has(at)) continue
+          let j = at + closeScanM[0].length
+          while (j < str.length && /\s/.test(str[j])) j++
+          if (str[j] !== '>') continue
+          const closeName = closeScanM[0].slice(2).toLowerCase()
+          const positions = closeIndex.get(closeName)
+          if (positions === undefined) closeIndex.set(closeName, [at])
+          else positions.push(at)
+        }
         const findUnknownClose = (name, from) => {
-          const needle = `</${name}`
-          for (let i = lowerStr.indexOf(needle, from); i !== -1; i = lowerStr.indexOf(needle, i + 1)) {
-            if (quotedAttrSpans.has(i)) continue
-            const end = i + needle.length
-            let j = end
-            while (j < str.length && /\s/.test(str[j])) j++
-            if (str[j] === '>') return i
+          const positions = closeIndex.get(name)
+          if (positions === undefined) return -1
+          let lo = 0
+          let hi = positions.length
+          while (lo < hi) {
+            const mid = (lo + hi) >> 1
+            if (positions[mid] < from) lo = mid + 1
+            else hi = mid
           }
-          return -1
+          return lo < positions.length ? positions[lo] : -1
         }
         while (pos < str.length) {
           const lt = str.indexOf('<', pos)
@@ -440,12 +474,10 @@ function createFormatter ({ Utils, safeRe }) {
       rawHtml = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(raw))
     }
     // {链接} 占位符 Markdown 安全化（v3.74）：与 htmlToMarkdown 的 mdUrl 同口径——
-    // 含空格/括号/] 用 <> 包裹、剥离换行（原样输出会在 Markdown 链接场景破坏）
-    const linkText = () => {
-      // R6-1：非字符串视为无链接（与 htmlToMarkdown urlText 同口径）
-      const u = Utils.safeUrl(Utils.safeGet(data, 'url'))
-      return u && /[\s()[\]]/.test(u) ? `<${u}>` : u
-    }
+    // 含空格/括号/] 用 <> 包裹、剥离换行（原样输出会在 Markdown 链接场景破坏）。
+    // PR 评审 #143-1：改为直接调用 _mdDestination，不再自留第二份包裹实现——那份漏了角括号编码，
+    // 与锚点路径行为分叉（`https://x/a(b)>c` 会产出 `<https://x/a(b)>c>` 被提前截断）。
+    const linkText = () => this._mdDestination(Utils.safeUrl(Utils.safeGet(data, 'url')))
     const getContentHtml = () => safeHtmlUrl
       ? `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`
       : `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：${escUrl}<br>&nbsp;<br>&nbsp;<br>`
@@ -470,12 +502,11 @@ function createFormatter ({ Utils, safeRe }) {
       '{图片}': Utils.safeUrl(Utils.safeGet(data, 'pic'))
     }
 
-    for (const [key, val] of Object.entries(map)) {
-      // v3.237：字面量替换（split/join）替代 new RegExp(key)——占位符是固定文本而非正则模式，
-      // 避免每次调用重建 14 个正则对象 + 消除占位符含正则元字符（$ ( [ 等）时的隐式陷阱。
-      // 语义等价：replace(/X/g, fn) 对字面量 X ≡ split('X').join(fn())。
-      text = text.split(key).join(Utils.safeText(val))
-    }
+    // 审查 2026-09-14 F-01：单趟替换——一次正则匹配模板里的所有占位符，回调查表取值拼接。
+    // 原按 map 顺序逐条 split/join 时，前一条的替换结果会留在 text 里参与后续所有替换：数据值
+    // 中的字面占位符会被再次替换（静默删字），甚至把 {Html内容} 序列放大到 GB 级并抛
+    // RangeError 中断整轮推送。map 在替换前构建，故「模板用到某占位符才计算/启用」的语义不变。
+    text = text.replace(TPL_PLACEHOLDER_RE, (key) => Utils.safeText(map[key]))
     // v3.110：输出统一清洗孤立代理（encodeURIComponent 会崩；所有模板路径受益）
     return Utils.sanitizeSurrogates(text)
   }

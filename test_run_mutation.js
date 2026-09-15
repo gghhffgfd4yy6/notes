@@ -1,7 +1,7 @@
 'use strict'
 
 const assert = require('assert')
-const { generateMutants, extractTestSummary, collectMutants } = require('./run_mutation')
+const { generateMutants, extractTestSummary, collectMutants, buildBatches } = require('./run_mutation')
 
 ;(async () => {
   // ===== generateMutants：比较运算符 =====
@@ -29,7 +29,16 @@ const { generateMutants, extractTestSummary, collectMutants } = require('./run_m
   assert.strictEqual(m4.length, 1, 'true 应生成 1 个变异')
   assert.strictEqual(m4[0].original, 'true')
   assert.strictEqual(m4[0].replacement, 'false')
-  assert.strictEqual(m4[0].kind, 'operator')
+  // review F10：true/false 移出 OPS 后走完整标识符分支，kind 由 'operator' 修正为 'boolean'
+  // （此前 'boolean' 分支永远不可达，且 trueCount 一类标识符会被 startsWith 改名）。
+  assert.strictEqual(m4[0].kind, 'boolean')
+
+  // ===== generateMutants：布尔标识符边界（review F10） =====
+  assert.deepStrictEqual(generateMutants('test.js', 'trueCount = 1'), [], 'trueCount 这类标识符不得被改名为 falseCount')
+  assert.deepStrictEqual(generateMutants('test.js', 'falsePositive = 2'), [], 'falsePositive 这类标识符不得被改名')
+  const mBool = generateMutants('test.js', 'x = true; y = false')
+  assert.strictEqual(mBool.length, 2, '独立 true/false 字面量仍应各生成一个变异')
+  assert.ok(mBool.every(m => m.kind === 'boolean'), '布尔字面量的 kind 应为 boolean')
 
   // ===== generateMutants：跳过注释 =====
   assert.strictEqual(generateMutants('test.js', '// a === b').length, 0, '行注释中运算符不应生成变异')
@@ -43,6 +52,63 @@ const { generateMutants, extractTestSummary, collectMutants } = require('./run_m
 
   // 字符串转义不提前结束
   assert.strictEqual(generateMutants('test.js', "const s = 'a \\' === b'").length, 0, '含转义引号的字符串中运算符不应生成变异')
+
+  // ===== generateMutants：正则字面量（review F2） =====
+  // 正则字面量此前完全未被建模：正则体内的引号/反引号会劫持词法状态。xbk_sendNotify_slim.js:1366 的
+  // /`([^`]+)`/g 使状态机进入永不闭合的模板串，令该文件尾部 86 个变异点被静默丢弃（含 sendNotify
+  // 推送结果统计这类高风险逻辑）；正则体内的 < > 还会生成伪变异（(?<![0-9]) → (?<=[0-9]) 语义反转）。
+  assert.strictEqual(generateMutants('test.js', "const s = x.replace(/`([^`]+)`/g, '$1')").length, 0,
+    '反引号正则体内不应生成变异')
+  const mAfterRegex = generateMutants('test.js', 'const s = x.replace(/`([^`]+)`/g, `y`)\nconst t = a === b')
+  assert.strictEqual(mAfterRegex.length, 1, '反引号正则之后的代码区变异点不得被静默丢弃')
+  assert.strictEqual(mAfterRegex[0].original, '===')
+  assert.strictEqual(mAfterRegex[0].line, 2, '变异点应定位到正则之后的第 2 行')
+  assert.strictEqual(generateMutants('test.js', "x.replace(/</g, 'a').replace(/>/g, 'b')").length, 0,
+    '正则体内的 < > 不得生成变异')
+  assert.strictEqual(generateMutants('test.js', 'const r = /(?<![0-9])\\*([^*\\n]+?)(?<![0-9])\\*/g').length, 0,
+    '正则体内的 (?<! 不得被变异为 (?<=（语义反转）')
+  // 除号不得被误判为正则起始（否则会吞掉同行后续代码区的变异点）
+  const mDiv = generateMutants('test.js', 'const z = a / b === c / d')
+  assert.strictEqual(mDiv.length, 1, '除号不得被误判为正则：=== 必须仍被生成')
+  assert.strictEqual(mDiv[0].original, '===')
+  const mIncr = generateMutants('test.js', 'i++ / b === c / d')
+  assert.strictEqual(mIncr.length, 1, '自增后的 / 是除号，不得吞掉同行的 ===')
+  // 扫描状态错乱（未闭合引号/模板串）必须响亮失败并给出文件与行号，不得静默丢弃尾部变异点
+  assert.throws(() => generateMutants('test.js', 'const a = 1\nconst s = `abc'), /第 2 行有未闭合的/,
+    '未闭合模板串应响亮失败（含文件与行号）')
+
+  // ===== generateMutants：模板串 ${} 内是代码（review F2） =====
+  // 模板文本要跳过，但 ${...} 内是代码；且模板可嵌套（xbk_app.js:1442 的 `${x ? `${a}/${b}` : 'n/a'}`），
+  // 内层反引号不得把词法状态带偏。
+  /* eslint-disable no-template-curly-in-string -- 夹具字符串必须原样包含 ${} 模板占位符才能验证词法状态机 */
+  assert.strictEqual(generateMutants('test.js', 'const s = `a < b`').length, 0, '模板文本中的运算符不应生成变异')
+  const mSubst = generateMutants('test.js', 'const s = `v=${a === b}`')
+  assert.strictEqual(mSubst.length, 1, '${} 内的 === 应生成变异')
+  assert.strictEqual(mSubst[0].original, '===')
+  const mNested = generateMutants('test.js', "const t = `x${a ? `y${b === c}` : ''}z`")
+  assert.strictEqual(mNested.length, 1, '嵌套模板内的 === 应生成变异（内层反引号不得让状态失配）')
+  assert.strictEqual(mNested[0].original, '===')
+  assert.strictEqual(generateMutants('test.js', 'const o = `v=${({ a: 1 }).a && b}`').length, 1,
+    '${} 内对象字面量的花括号应配平，&& 应生成变异')
+  const mAfterTemplate = generateMutants('test.js', 'const s = `v=${a}`\nconst t = x === y')
+  /* eslint-enable no-template-curly-in-string */
+  assert.strictEqual(mAfterTemplate.length, 1, '模板串之后的代码区变异点不得丢失')
+  assert.strictEqual(mAfterTemplate[0].line, 2, '应定位到模板之后的第 2 行')
+
+  // ===== generateMutants：除号与正则字面量的歧义（PR 评审 #140） =====
+  // '}' 既可能是语句块结尾（可跟正则），也可能是对象字面量结尾（后面是除号）。原判定把 '}' 一律
+  // 当作「可跟正则」，`({a:1} / q === r / s)` 的中间 === 会被整段当作正则吞掉（漏变异）。
+  const mObjDiv = generateMutants('test.js', 'const o = ({ a: 1 } / q === r / s)')
+  assert.strictEqual(mObjDiv.length, 1, '对象字面量后的除号不应吞掉中间的 ===')
+  assert.strictEqual(mObjDiv[0].original, '===')
+  // 反过来，除号右侧可以是正则字面量（`a / /x<y/.source`）：原判定不认正则，会为正则体内的 < 生成
+  // 伪变异（源码语义里并不存在这个运算符）。
+  assert.strictEqual(generateMutants('test.js', 'const t = a / /x<y/.source').length, 0,
+    '除号右侧的正则字面量体不应生成伪变异')
+  // 对照：正则之后的真实代码区运算符仍必须生成
+  const mAfterDivRegex = generateMutants('test.js', 'const t = a / /x<y/.source === b')
+  assert.strictEqual(mAfterDivRegex.length, 1, '正则之后的 === 仍应生成变异')
+  assert.strictEqual(mAfterDivRegex[0].original, '===')
 
   // ===== generateMutants：代码+注释混合，只在代码区生成 =====
   const m5 = generateMutants('test.js', 'a === b // comment === c')
@@ -103,6 +169,44 @@ const { generateMutants, extractTestSummary, collectMutants } = require('./run_m
 
   // 不存在的文件 → 抛错
   assert.throws(() => collectMutants(['nonexistent_file_xyz.js']), /ENOENT|no such file/, '不存在的文件应抛错')
+
+  // ===== buildBatches：同区间候选不得同批（PR 评审 #143-2） =====
+  // 'a < b' 生成两个同区间候选 ['<=', '>']；若进同一批，applyMutants 只套用一个，
+  // 而批级 pass/killed 会被记到两个候选头上——「第一个通过、第二个本会失败」时
+  // 被杀死的变异会被记成存活（分数虚高）。批次必须保证批内区间互不重叠。
+  const overlap = generateMutants('t.js', 'a < b') // 两个候选，同 [2,3)
+  assert.strictEqual(overlap.length, 2, '夹具应生成两个同区间候选')
+  const ob = buildBatches(overlap, 50)
+  assert.strictEqual(ob.length, 2, '同区间候选必须拆成两批（不得共享批级结果）')
+  assert.ok(ob.every(b => b.length === 1), '每批只应有一个互斥候选')
+
+  // 不重叠的候选仍应合批（效率不应因修复退化）
+  const disjoint = [
+    { file: 't.js', start: 2, end: 4, id: 1 },
+    { file: 't.js', start: 7, end: 9, id: 2 },
+    { file: 't.js', start: 12, end: 14, id: 3 }
+  ]
+  const dj = buildBatches(disjoint, 50)
+  assert.strictEqual(dj.length, 1, '互不重叠的候选应合入同一批')
+  assert.strictEqual(dj[0].length, 3, '同一批应含全部三个候选')
+
+  // batchSize 上限与「跨文件不混批」仍然成立
+  const many = Array.from({ length: 5 }, (_, i) => ({ file: 't.js', start: i * 10, end: i * 10 + 1, id: i + 1 }))
+  assert.strictEqual(buildBatches(many, 2).length, 3, 'batchSize=2 时 5 个候选应切成 3 批')
+  const twoFiles = [
+    { file: 'a.js', start: 0, end: 1, id: 1 },
+    { file: 'b.js', start: 0, end: 1, id: 2 }
+  ]
+  assert.strictEqual(buildBatches(twoFiles, 50).length, 2, '不同文件的候选不混批')
+  // 批内区间必须两两不重叠（不变量）
+  for (const b of buildBatches(collectMutants(['xbk_utils.js', 'xbk_agents.js']), 8)) {
+    const byFile = new Map()
+    for (const m of b) {
+      const prevEnd = byFile.get(m.file)
+      if (prevEnd !== undefined) assert.ok(m.start >= prevEnd, `批内区间不得重叠：${m.file}@${m.start} < ${prevEnd}`)
+      byFile.set(m.file, m.end)
+    }
+  }
 
   console.log('test_run_mutation OK')
 })().catch((e) => { console.error(e); process.exit(1) })

@@ -351,6 +351,114 @@ console.log('========================================\n');
     }
   })
 
+  // ==================== 1.1 #140 app 可观测性回归（评审 #143-3） ====================
+  // #140 改了 xbk_app 的 dry-run 台账、告警版本注入、身份无效对账与 stdout 回显清洗，
+  // 但当时没有对应断言——下面四条锁住这些行为，防止「改了没人发现」。
+  console.log('\n📂 1.1 #140 app 可观测性回归（评审 #143-3）')
+
+  await test('dry-run：终端「未推送」文案与 run.log 台账口径一致（APP2-04）', async () => {
+    reset()
+    setPushUrl('t03c_dry_run_account')
+    const previousDryRun = process.env.XBK_DRY_RUN
+    const logPath = path.join(CACHE_DIR, 'run.log')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    const logs = []
+    const originalLog = console.log
+    try {
+      process.env.XBK_DRY_RUN = '1'
+      fakeData = [makeItem({ id: 'dry-run-account-1' }), makeItem({ id: 'dry-run-account-2', title: '第二条' })]
+      console.log = (...args) => logs.push(args.join(' '))
+      const summary = await xbk.run()
+      assert(summary && summary.pushed === 0 && summary.failed === 0,
+        `dry-run 摘要必须 pushed=0/failed=0: ${JSON.stringify(summary)}`)
+      assert(logs.some(line => line.includes('推送:') && line.includes('dry-run 未推送 2 条')),
+        `终端应显示未推送条数: ${logs.filter(l => l.includes('推送:')).join(' | ')}`)
+      assert(!logs.some(line => line.includes('条失败，下次运行重试')), 'dry-run 不得共用真实失败文案')
+      const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
+      assert(/\sfailed=0\s/.test(` ${lastLine} `), `dry-run run.log 的 failed 应为 0: ${lastLine}`)
+      assert(lastLine.includes('dry-run未推送=2'), `run.log 应另记未推送条数: ${lastLine}`)
+    } finally {
+      console.log = originalLog
+      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = previousDryRun
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('身份无效条目单独对账（APP-04：终端 + run.log noidentity=）', async () => {
+    reset()
+    setPushUrl('t03d_no_identity')
+    const logPath = path.join(CACHE_DIR, 'run.log')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    const logs = []
+    const originalLog = console.log
+    try {
+      // 通过 isValidItem（对象）但 getMessageIdentity 判无效：无 id/有效 url 且身份来源字段全空
+      // （anonKey 退化成固定键 → 显式判无效，避免所有无标识消息互相吞掉）
+      fakeData = [{ title: '' }, makeItem({ id: 'noidentity-keep' })]
+      console.log = (...args) => logs.push(args.join(' '))
+      const summary = await xbk.run()
+      assert(summary && summary.total === 2 && summary.pushed === 1,
+        `身份无效条目仍应计入 total，正常条目应推送: ${JSON.stringify(summary)}`)
+      assert(logs.some(line => line.includes('身份无效:') && line.includes('1 条')),
+        `终端应单独统计身份无效条目: ${logs.filter(l => l.includes('身份无效')).join(' | ')}`)
+      const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
+      assert(lastLine.includes('noidentity=1'), `run.log 应记录 noidentity=1: ${lastLine}`)
+    } finally {
+      console.log = originalLog
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('告警留痕使用注入的 PKG_VERSION（APP-01）', async () => {
+    reset()
+    setPushUrl('t03e_alert_version')
+    const origAlert = Config.alert.enabled
+    const origInterval = Config.alert.intervalMs
+    const logPath = path.join(CACHE_DIR, 'run.log')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    // 防上一用例遗留的告警限频状态吞掉本次告警
+    try { fs.unlinkSync(path.join(CACHE_DIR, 'alert.state')) } catch (e) { /* 忽略 */ }
+    try {
+      Config.alert.enabled = true
+      Config.alert.intervalMs = 0
+      notifyFailAt = 1 // 第 1 次主推送失败触发告警，第 2 次（告警）成功
+      fakeData = [makeItem({ id: 'alert-version-1' })]
+      await xbk.run()
+      const log = fs.readFileSync(logPath, 'utf8')
+      const pkgVersion = require('./package.json').version
+      assert(log.includes(`ALERT [v${pkgVersion}]`),
+        `告警留痕应带注入的 PKG_VERSION(v${pkgVersion})：${log.split('\n').filter(l => l.includes('ALERT')).join(' | ')}`)
+      assert(!log.includes('[vundefined]'), '不得回落到 undefined 版本（缺 package.json 的部署场景）')
+    } finally {
+      Config.alert.enabled = origAlert
+      Config.alert.intervalMs = origInterval
+      notifyFailAt = -1
+      try { fs.unlinkSync(path.join(CACHE_DIR, 'alert.state')) } catch (e) { /* 忽略 */ }
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('stdout 回显清洗控制字符，防伪造日志行（APP2-07）', async () => {
+    reset()
+    setPushUrl('t03f_log_control_chars')
+    const logs = []
+    const originalLog = console.log
+    try {
+      // 接口脏数据：标题含换行/TAB/ANSI ESC——按行解析日志的青龙侧会被伪造出额外日志行
+      fakeData = [makeItem({ id: 'ctl-1', title: '前段\n伪造行\t尾段\u001b[31m红' })]
+      console.log = (...args) => logs.push(args.join(' '))
+      await xbk.run()
+      const itemLine = logs.find(l => l.includes('发现到新数据'))
+      assert(itemLine, `应输出「发现到新数据」回显行: ${logs.slice(0, 5).join(' | ')}`)
+      assert(!itemLine.includes('\n') && !itemLine.includes('\t') && !itemLine.includes('\u001b'),
+        `回显行不得含控制字符: ${JSON.stringify(itemLine)}`)
+      assert(itemLine.includes('前段 伪造行 尾段'), '控制字符应被替换为空格而非删除内容')
+    } finally {
+      console.log = originalLog
+    }
+  })
+
   await test('过滤诊断：只看它未命中写入白名单原因', async () => {
     reset()
     setPushUrl('t03_filter_diagnostics_keyword')

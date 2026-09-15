@@ -6710,7 +6710,9 @@ console.log('========================================\n');
     const path = require('path')
     const main = fs.readFileSync(path.join(__dirname, 'xbk_function_v3.js'), 'utf8')
     const changelog = fs.readFileSync(path.join(__dirname, 'CHANGELOG.md'), 'utf8')
-    const m = main.match(/v(\d+\.\d+)/)
+    // 只认文件头第一行：全文 match 会命中正文历史版本注释（xbk_function_v3.js:103 v3.235 等），
+    // 与 check-version.js 保持同一口径，文件头整行缺失时必须红
+    const m = main.split('\n', 1)[0].match(/v(\d+\.\d+)/)
     // v3.123：CHANGELOG 改为正序（最新在最下面）——取最后一个版本号
     const all = changelog.match(/^## v(\d+\.\d+)/gm)
     const c = all ? all[all.length - 1].match(/v(\d+\.\d+)/) : null
@@ -8411,6 +8413,21 @@ console.log('========================================\n');
     }
   })
 
+  await test('sanitizeDecodedHtml 超长标签内的合法属性值仍受保护（PR 评审 #140）', () => {
+    // 修复前：_protectAttrPairs 的「是否在标签内」判定带 4096 长回扫上限，长于上限的标签内
+    // 属性被判成标签外 → 值内 on* 字样被 _stripEventAttrs 误删并吞掉闭合引号，输出畸形 HTML。
+    // 修复后改为线性正扫预计算标签区间，任意长度标签都能正确保护。
+    const long = 'x'.repeat(5000)
+    const html = '<div data-big="' + long + '" title="see onerror=x">t</div>'
+    const r = sanitizeDecodedHtml(html)
+    assertEqual(r.includes('onerror=x'), true, `长标签内合法属性值不应被误删: ${r.slice(0, 80)}…`)
+    assertEqual(r.includes('data-big="' + long + '"'), true, '长属性值应原样保留')
+    assertEqual(r, html, '全部属性均合法、无危险内容时应逐字节不变')
+    // 安全方向不回归：真正的 on* 事件属性（非引号值内的字面文本）仍必须清除
+    const evil = '<div data-big="' + long + '" onerror="alert(1)">t</div>'
+    assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(sanitizeDecodedHtml(evil)), false, '超长标签内的真事件属性仍应清除')
+  })
+
   await test('sanitizeDecodedHtml 嵌套引号 script 内容被移除（Round2 C002）', () => {
     const cases = [
       '前<script>var s = "<img src=x onerror=alert(1)>";</script>后',
@@ -8508,6 +8525,93 @@ console.log('========================================\n');
     assertEqual(b.includes('https://u.jd.com/abc'), true, `合法链接应保留: ${b}`)
     const c = sanitizeDecodedHtml('<img src="javascript:alert(1)">')
     assertEqual(c.includes('javascript'), false, `未闭合 src javascript: 应清空: ${c}`)
+  })
+
+  await test('sanitizeDecodedHtml 纯文本属性对不屏蔽事件属性（P2-01 安全：占位保护需标签感知）', () => {
+    // 子代理审查（xbk_utils P2-01 critical）：_protectAttrPairs 无标签感知时，纯文本
+    // `name="…"` 会把段内存活的 <img onerror> 一并占位，_stripEventAttrs 失效 → XSS 直达推送客户端。
+    const cases = [
+      '说 a="太 <img src=x onerror=alert(1)> 了" 吧',
+      '讨论 XSS: a=\'y <img src=x onload=alert(2)>\' 吧',
+      '说明 b="z <input onfocus=alert(3)>" 完'
+    ]
+    for (const h of cases) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `纯文本引号内事件属性不应残留: ${h} → ${r}`)
+    }
+  })
+
+  await test('sanitizeDecodedHtml 未加引号值内引号不屏蔽事件属性（P2-01 安全：alt=a=" onerror="x）', () => {
+    // 浏览器词法：`<img alt=a=" onerror="alert(1)">` 中 alt 值是未加引号值 `a="`，
+    // 紧随其后的 onerror 是独立存活事件属性；保护机制曾把整段判为普通属性对而原样放行。
+    for (const h of [
+      '<img alt=a=" onerror="alert(1)">',
+      '<img y=a=" onerror="1">',
+      '<b x=a=" onmouseover="1">',
+      '<div data-x=a=" onerror="alert(1)">'
+    ]) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `未加引号值内引号形态事件属性不应残留: ${h} → ${r}`)
+    }
+    // 反向：标签内合法属性值里的 on 开头文本必须保留（保护语义不能被修坏）
+    const keep = sanitizeDecodedHtml('<img title="see onerror=x" src="y">')
+    assertEqual(keep.includes('title="see onerror=x"'), true, `标签内属性值不应被改写: ${keep}`)
+  })
+
+  await test('sanitizeDecodedHtml 未闭合引号不泄漏共享正则状态（P2-02：跨调用结果一致）', () => {
+    // safeRe 全局缓存同一正则对象：未闭合引号分支 break 前不复位 lastIndex 会污染下一次调用，
+    // 同一条输入的输出随「进程内此前处理过哪条消息」而变（本用例即为回归锁定）。
+    const dirty = '<img src=x y=a=" onerror=alert(1)>'
+    const target = '<img title="see onerror=x" src="y">'
+    const clean = sanitizeDecodedHtml(target)
+    sanitizeDecodedHtml(dirty)
+    assertEqual(sanitizeDecodedHtml(target), clean, `泄漏输入之后的输出应与干净态一致: ${sanitizeDecodedHtml(target)}`)
+  })
+
+  await test('sanitizeDecodedHtml 输入自带占位符字符被剥离（P2-06：防伪造占位符）', () => {
+    // U+0001/U+0002 是内部占位符字符；输入自带时会在还原阶段注入 undefined 或复读被保护属性文本。
+    for (const h of ['价格\u00010\u0001元', '<a title="T">x\u00010\u0001y</a>', 'a\u0002b']) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(r.includes('undefined'), false, `不应注入 undefined: ${JSON.stringify(h)} → ${JSON.stringify(r)}`)
+      assertEqual(/[\u0001\u0002]/.test(r), false, `不应残留占位符字符: ${JSON.stringify(r)}`)
+    }
+  })
+
+  await test('sanitizeDecodedHtml 未闭合引号主动标签不回溯（P1-03：引号分支歧义收紧）', () => {
+    // `<iframe` + 重复引号且无 `>`：字符分支含引号时与两个引号串分支歧义，逐位回溯呈指数级
+    // （40 个引号实测 3.6s、47 个 >100s）。收紧字符类后应即时返回。
+    const input = '<iframe' + '"'.repeat(40)
+    const start = Date.now()
+    sanitizeDecodedHtml(input)
+    const cost = Date.now() - start
+    assertEqual(cost < 500, true, `未闭合引号主动标签应 <500ms，实际 ${cost}ms（P1-03 回溯复活）`)
+  })
+
+  await test('parseTime 带空白日期仍按 UTC 零点（P1-02：trim 后不落宿主本地时区）', () => {
+    // 未 trim 时 '2026-08-01 ' 落空所有锚定分支 → _parseFallback 宿主本地解析，
+    // 东八区得到 2026-07-31T16:00Z（天数差 1，pingbitime 边界误拦）；须与无空白形态同值。
+    // 固定"今天"（与上方 daysComputed 用例同一手法）：daysComputed 是「距今自然日差」，
+    // 硬编码期望值会随真实日期逐日漂移——写入当天 44 对、次日起必红，并会把变异矩阵的
+    // 「基线首跑」门禁一并拖红（CI 实测：2026-09-15 起 quality/21 个变异分片全红）。
+    const origNow = Date.now
+    try {
+      Date.now = () => Date.UTC(2026, 7, 3, 6, 0) // 固定"今天"= 2026-08-03 06:00 UTC
+      const baseline = daysComputed('2026-08-01')
+      assertEqual(baseline, 2, '基准：无空白日期天数（8/1 → 8/3 自然日差）')
+      for (const v of ['2026-08-01 ', ' 2026-08-01', '2026-08-01\n', '2026-08-01\t', '2026/08/01 ']) {
+        assertEqual(daysComputed(v), baseline, `带空白日期应按 UTC 零点解析: ${JSON.stringify(v)}`)
+      }
+    } finally {
+      Date.now = origNow
+    }
+    // 数字类型不受 trim 影响（String(number) 本无空白）
+    assertEqual(daysComputed(1755300000), daysComputed('1755300000'), '数字与字符串时间戳口径一致')
+    assertEqual(new Date(Date.UTC(2026, 7, 1)).getTime(), Date.UTC(2026, 7, 1), 'UTC 零点常量自检')
+  })
+
+  await test('parseTime 全空白字符串 → 无效（P1-02：trim 后空串返回 null）', () => {
+    assertEqual(daysComputed('   '), 0, '全空白应视为无效日期')
+    assertEqual(daysComputed('\t\n'), 0, '全空白应视为无效日期')
   })
 
   // ==================== 真实数据形态性能基准（v3.260：v3.251 长 href ReDoS 教训） ====================

@@ -110,9 +110,25 @@ const cfg = slim.push_config
     assert.strictEqual(configuredChannelCount(), 3, 'TG 双字段齐全才计入')
     assert.deepStrictEqual(configuredChannelNames().includes('telegram'), true)
 
-    // BARK 分隔型配置：全空白分隔符在 names 中被排除（count 按 truthy 计）
+    // BARK 分隔型配置：全空白分隔符在 names 中被排除
     cfg.BARK_PUSH = '##'
     assert.strictEqual(configuredChannelNames().includes('bark'), false, '全空白分隔值不算已配置通道')
+
+    // v3.273（S7/F3 回归）：count/names 与 sendNotify 的 nonEmpty 同口径——
+    // 全空白/0/false 都不得计为「可用通道」，否则 QingLong 自检假绿而主流程抛 NO_CHANNEL_CONFIG
+    for (const k of Object.keys(cfg)) delete cfg[k]
+    cfg.BARK_PUSH = '   '
+    assert.strictEqual(configuredChannelCount(), 0, '全空白 Bark 不应计为可用通道（原 count 按 truthy 误计 1）')
+    assert.deepStrictEqual(configuredChannelNames(), [], '全空白 Bark 不应出现在通道名')
+    cfg.BARK_PUSH = ' # '
+    assert.strictEqual(configuredChannelCount(), 0, '只含分隔符/空白不应计为通道')
+    cfg.BARK_PUSH = ''
+    cfg.PUSHME_KEY = 0
+    cfg.PUSH_PLUS_TOKEN = false
+    assert.strictEqual(configuredChannelCount(), 0, '0/false 不应计为已配置')
+    assert.deepStrictEqual(configuredChannelNames(), [], '0/false 不应出现在通道名（原 names 会误报）')
+    cfg.PUSH_PLUS_TOKEN = '0' // 非空字符串仍算已配置（历史行为不变）
+    assert.deepStrictEqual(configuredChannelNames(), ['pushplus'], '非空字符串值保持既有语义')
   } finally {
     for (const k of Object.keys(cfg)) delete cfg[k]
     for (const [k, v] of Object.entries(saved)) cfg[k] = v

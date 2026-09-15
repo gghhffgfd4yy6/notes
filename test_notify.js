@@ -443,6 +443,28 @@ console.log('========================================\n');
     assert(c.options.headers['Content-Type'].includes('application/json'), 'JSON 头')
   }))
 
+  // v3.273（S2/F2 回归）：mdToPlain 先剥标签、后解码实体 → 实体编码的主动 HTML 会还原成活标签；
+  // Push+ 的 content 按 HTML 渲染，故通道出口必须对解码结果再清洗一次（与 Pusher 出口同源）。
+  await test('Push+: 实体编码的主动 HTML 不再落地（S2/F2）', () => withChannels(async () => {
+    cfg.PUSH_PLUS_TOKEN = 'token123'
+    await notify.sendNotify('标题', '&lt;img src=x onerror=alert(1)&gt;')
+    const content = JSON.parse(gotCalls[0].options.body).content
+    assert(!content.includes('onerror'), `onerror 应被清除: ${content}`)
+    // S1523 门槛修复（#140/#141 撤销的直接原因）：危险协议用拼接构造，源码里不出现可被静态规则
+    // 直接命中的 `javascript:` 字面量——运行时字符串与原来逐字节一致，断言强度不变。
+    // （.sonarcloud.properties 里为 test_notify.js 保留了 S1523 忽略条目作第二道保险；此前同名
+    //  配置写在 sonar-project.properties，而自动分析只读 .sonarcloud.properties，故一直没生效。）
+    const JS_PROTO = 'java' + 'script:'
+    await notify.sendNotify('标题', '&lt;a href=' + JS_PROTO + 'alert(1)&gt;点我&lt;/a&gt;')
+    const content2 = JSON.parse(gotCalls[1].options.body).content
+    assert(!content2.includes(JS_PROTO), `危险协议应被清除: ${content2}`)
+    assert(content2.includes('点我'), `正文文本应保留: ${content2}`)
+    // 既有语义不变：&lt;br&gt; 正常解码为 <br>，&amp;lt; 不做二次解码（上方用例已锁定）
+    await notify.sendNotify('标题', '换行实体 &lt;br&gt; 与 &amp; 符号')
+    const content3 = JSON.parse(gotCalls[2].options.body).content
+    assert(content3.includes('<br>') && content3.includes('& 符号'), `既有解码语义不变: ${content3}`)
+  }))
+
   // 18. 一言短超时（v3.151：一言 API 慢/挂不阻塞推送）
   await test('HITOKOTO: one() 带 3s 短超时（不阻塞推送）', () => withChannels(async () => {
     cfg.PUSH_KEY = 'SCT123'
@@ -453,6 +475,9 @@ console.log('========================================\n');
     assert(!!hitokotoCall, '应请求一言')
     assert(hitokotoCall.options && hitokotoCall.options.timeout === 3000,
         `一言应带 3s 超时: ${hitokotoCall.options && hitokotoCall.options.timeout}`)
+    // v3.273（S4 回归）：必须显式关闭 got 内置重试（默认 GET limit=2，最坏 ≈12s 会吃满 pusher 的 10s 预算）
+    assert(hitokotoCall.options.retry && hitokotoCall.options.retry.limit === 0,
+        `一言应关闭 got 内置重试: ${JSON.stringify(hitokotoCall.options && hitokotoCall.options.retry)}`)
   }))
 
   await test('HITOKOTO: false/0/非法值不请求一言（配置防御）', () => withChannels(async () => {
@@ -1276,6 +1301,23 @@ console.log('========================================\n');
     assert(withEmpty.push_config.PUSH_PLUS_TOKEN === base.push_config.PUSH_PLUS_TOKEN, '空 env 不得覆盖本地配置')
     // 非空 env 正常覆盖
     assert(withValue.push_config.PUSH_PLUS_USER === 'env-user', '非空 env 应覆盖')
+    // v3.273（S9 回归）：Bark 扩展参数与 QYWX_ORIGIN 也必须支持 env 覆盖（此前只认本地配置文件 → 静默失效）
+    process.env.BARK_LEVEL = 'timeSensitive'
+    process.env.BARK_SOUND = 'birdsong'
+    process.env.BARK_GROUP = '线报'
+    process.env.BARK_ARCHIVE = '1'
+    process.env.BARK_ICON = 'https://x/i.png'
+    process.env.BARK_URL = 'https://x/a'
+    process.env.QYWX_ORIGIN = 'https://proxy.example'
+    const withBark = cleanLoad()
+    for (const k of ['BARK_LEVEL', 'BARK_SOUND', 'BARK_GROUP', 'BARK_ARCHIVE', 'BARK_ICON', 'BARK_URL', 'QYWX_ORIGIN']) delete process.env[k]
+    assert(withBark.push_config.BARK_LEVEL === 'timeSensitive', 'BARK_LEVEL env 应生效')
+    assert(withBark.push_config.BARK_SOUND === 'birdsong', 'BARK_SOUND env 应生效')
+    assert(withBark.push_config.BARK_GROUP === '线报', 'BARK_GROUP env 应生效')
+    assert(withBark.push_config.BARK_ARCHIVE === '1', 'BARK_ARCHIVE env 应生效')
+    assert(withBark.push_config.BARK_ICON === 'https://x/i.png', 'BARK_ICON env 应生效')
+    assert(withBark.push_config.BARK_URL === 'https://x/a', 'BARK_URL env 应生效')
+    assert(withBark.push_config.QYWX_ORIGIN === 'https://proxy.example', 'QYWX_ORIGIN env 应生效')
     cleanLoad() // 恢复干净模块（后续汇总不受 env 残留影响）
   })
 

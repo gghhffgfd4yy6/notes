@@ -50,6 +50,14 @@ const UNIT_SUITES = SUITES.filter(s => !s.integration && !s.mutationSkip && !ski
 //   故在沙箱内跳过这两个元校验套件（① 的主修复）；它们仍由 npm test（run_tests.js 全量清单）
 //   逐个执行，CI 门禁不降级。② 另在 stryker.config.js 用 disableTypeChecks:false 关闭（双保险）。
 
+// 零套件不等于通过：SKIP_SUITES 覆盖全部套件（含 test_ci_skip_suites.js 这类守护对账套件自身）或注册表
+// 为空时，results 为空 → allOk 初值 true → 打印「全部通过 🎉」并 exit 0，门禁整步假绿且无人告警。
+if (!UNIT_SUITES.length) {
+  console.error(`❌ 过滤后没有可执行的单元套件（SKIP_SUITES=${skipSuites.size ? [...skipSuites].join(',') : '未设置'}）`)
+  console.error('   零套件不等于通过：请检查 SKIP_SUITES 是否覆盖过广，以及 test_suites.js 注册表是否为空')
+  process.exit(1)
+}
+
 const results = []
 console.log('══════════════════════════════════════════════')
 console.log('  xbk-push 单元测试入口（排除集成测试）')
@@ -70,7 +78,10 @@ for (const s of UNIT_SUITES) {
   // 的警告也保留），pipe 仅收 stdout 用于失败时打包重显；本地保持 inherit 逐行直出
   if (IN_CI) console.log(`::group::${s.name}（${s.file}）`)
   try {
-    const childOut = execFileSync(process.execPath, [file], { stdio: IN_CI ? ['ignore', 'pipe', 'inherit'] : 'inherit', maxBuffer: MAX_BUFFER })
+    // cwd 固定为 __dirname（与上面的 __dirname 定位套件同口径）：套件按 cwd 读 package.json /
+    // .github/workflows/*.yml / CHANGELOG.md（test_ci_skip_suites.js、test_tag_validator.js），
+    // 从非仓库根调用时不设 cwd 会假红，或在同构副本目录里对账到别的仓库而假绿。
+    const childOut = execFileSync(process.execPath, [file], { cwd: __dirname, stdio: IN_CI ? ['ignore', 'pipe', 'inherit'] : 'inherit', maxBuffer: MAX_BUFFER })
     if (IN_CI) {
       console.log(childOut.toString())
       console.log('::endgroup::')
