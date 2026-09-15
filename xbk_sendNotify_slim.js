@@ -1290,9 +1290,33 @@ function truncateBytes (s, maxBytes) {
 // 注意：失败路径必须推进或终止——配平扫描失败时回退「首个 )」（只放弃这一处构造，不整段 bail，
 // 否则其后本应正常剥离的链接会原样残留）；连 ")" 都没有时剩余串不可能再有完整链接，直接保留剩余并终止。
 // 若每块只推进到 "]" 就重扫 indexOf(')')，大量未闭合块会退化为 O(n²)（v3.264 修复）。
+// 从 '(' 之后的位置起，按 Markdown 语义找 destination 的闭合 ')'：
+//   · '(' / ')' 需配平；
+//   · 被反斜杠转义的括号是字面量、不参与配平（qodo #147-7：`[a](foo\() [b](bar))` 曾把后一条链接
+//     吞进前一个 destination）；
+//   · budget 是整次转换共享的扫描预算——畸形构造（未配平 '(' 且其后有 ')'）会让配平扫描一路走到串尾，
+//     没有预算时多个这类构造会重叠重扫、退化成 O(n²)（qodo #147-8，本文件 v3.264/S8786 修过同类问题）。
+//     预算耗尽即返回 -1，由调用方回落「首个 )」的旧口径；正常内容的 destination 都很短，远不会触顶。
+function findDestEnd (s, from, budget) {
+  if (s[from] === '<') {
+    const g = s.indexOf('>', from + 1)
+    budget.left -= (g === -1 ? s.length - from : g - from + 1)
+    if (g !== -1 && s[g + 1] === ')') return g + 1
+  }
+  for (let j = from, d = 1; j < s.length && d > 0; j++) {
+    if (budget.left <= 0) return -1
+    budget.left -= 1
+    if (s[j] === '\\') { j += 1; continue } // 转义：连同被转义的字符整体跳过
+    if (s[j] === '(') d += 1
+    else if (s[j] === ')' && (d -= 1) === 0) return j
+  }
+  return -1
+}
+
 function mdLinksToPlain (s) {
   let out = ''
   let i = 0
+  const destBudget = { left: s.length * 2 + 64 }
   while (i < s.length) {
     const open = s.indexOf('[', i)
     if (open === -1) { out += s.slice(i); break }
@@ -1300,11 +1324,9 @@ function mdLinksToPlain (s) {
     if (close === -1) { out += s.slice(i); break } // 未闭合 ]：剩余不可能再有完整链接
     const t = s.slice(open + 1, close)
     if (t === '' || s[close + 1] !== '(') { out += s.slice(i, close + 1); i = close + 1; continue }
-    let end = -1; if (s[close + 2] === '<') { const g = s.indexOf('>', close + 3); if (g !== -1 && s[g + 1] === ')') end = g + 1 }
-    if (end === -1) for (let j = close + 2, d = 1; j < s.length && d > 0; j++) { if (s[j] === '(') d++; else if (s[j] === ')' && --d === 0) end = j }
-    // 配平扫描失败（destination 内含未配平 '('）：回退到「首个 )」的旧口径，只放弃这一处构造，
-    // 不整段 bail——整段 bail 会把其后本应正常剥离的链接原样残留（回归）。回退仍只做一次 indexOf，
-    // 不改变整体线性复杂度。
+    let end = findDestEnd(s, close + 2, destBudget)
+    // 配平扫描失败（destination 内含未配平 '('，或预算耗尽）：回退到「首个 )」的旧口径，只放弃这一处构造，
+    // 不整段 bail——整段 bail 会把其后本应正常剥离的链接原样残留（回归）。回退仍只做一次 indexOf。
     if (end === -1) end = s.indexOf(')', close + 2)
     if (end === -1) { out += s.slice(i); break } // 连 ")" 都没有：剩余串不可能再有完整链接，原样保留并终止
     const u = s.slice(close + 2, end)
@@ -1321,6 +1343,7 @@ function mdLinksToPlain (s) {
 function mdImagesToPlain (s, emptyAlt = '') {
   let out = ''
   let i = 0
+  const destBudget = { left: s.length * 2 + 64 }
   while (i < s.length) {
     const bang = s.indexOf('![', i)
     if (bang === -1) { out += s.slice(i); break }
@@ -1328,9 +1351,8 @@ function mdImagesToPlain (s, emptyAlt = '') {
     if (close === -1) { out += s.slice(i); break } // 未闭合 ]：剩余不可能再有完整图片语法
     const alt = s.slice(bang + 2, close)
     if (s[close + 1] !== '(') { out += s.slice(i, close + 1); i = close + 1; continue }
-    let end = -1; if (s[close + 2] === '<') { const g = s.indexOf('>', close + 3); if (g !== -1 && s[g + 1] === ')') end = g + 1 }
-    if (end === -1) for (let j = close + 2, d = 1; j < s.length && d > 0; j++) { if (s[j] === '(') d++; else if (s[j] === ')' && --d === 0) end = j }
-    // 同 mdLinksToPlain：配平失败回退「首个 )」，不整段 bail（否则其后合法图片语法不再剥离）。
+    let end = findDestEnd(s, close + 2, destBudget)
+    // 同 mdLinksToPlain：配平失败（含预算耗尽）回退「首个 )」，不整段 bail（否则其后合法图片语法不再剥离）。
     if (end === -1) end = s.indexOf(')', close + 2)
     if (end === -1) { out += s.slice(i); break } // 连 ")" 都没有：剩余串不可能再有完整图片语法，原样保留并终止
     const u = s.slice(close + 2, end)

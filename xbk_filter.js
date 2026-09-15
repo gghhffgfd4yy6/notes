@@ -268,7 +268,11 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
       } catch (e) {
         // FILTER-06：与 explainFilter 的编译失败留痕口径一致（原先此处静默 return true，
         // 故障不可观测）；保守放行语义不变，仍避免异常冒泡与无限递归。
-        console.warn(`⚠️ 过滤规则编译失败，已保守放行：${e && e.message ? e.message : e}`)
+        // qodo #147-6：不得用模板插值 `${e}` ——配置 getter 抛出 Symbol/Symbol 包装值时会抛
+        // TypeError，等于在 catch 里再抛、中断过滤链而非保守放行。改为显式安全取值 + 拼接。
+        let detail = '(异常值无法转换为文本)'
+        try { detail = e && e.message ? String(e.message) : String(e) } catch (err) { /* 保持兜底文案 */ }
+        console.warn('⚠️ 过滤规则编译失败，已保守放行：' + detail)
         return true
       }
       if (!compiled || typeof compiled !== 'object' || !compiled.__compiled) return true

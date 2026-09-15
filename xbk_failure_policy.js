@@ -65,6 +65,13 @@ function depthExceeded (value, ancestors, depth) {
   return Boolean(ancestors && ancestors.has(value))
 }
 
+// qodo #147-11：failures 可能来自敌意对象——Array.isArray 对 **revoked proxy** 会抛 TypeError，
+// 索引 getter 抛错的数组在遍历时也会抛，二者都会让本模块的「绝不抛异常」契约失效。
+// 凡是「判定是否为数组 + 取元素」都统一走这里：任何一步失败即返回 null（调用方按「没有该数组」处理）。
+function safeArray (value) {
+  try { return Array.isArray(value) ? Array.prototype.slice.call(value) : null } catch (e) { return null }
+}
+
 // XFP-05/XFP-06：failureInfo 透传前与常规路径同口径清洗（脱敏 + 折叠换行 + 截断），
 // 而不是直接浅拷贝——否则 failureInfo 里的凭据会绕过清洗链原样带出，
 // 且自引用结构会抛 RangeError 破坏本模块的“不抛”契约。
@@ -76,11 +83,18 @@ function sanitizeFailureInfo (info, ancestors, depth) {
   try { keys = Object.keys(info) } catch (e) { keys = [] }
   for (const key of keys) {
     const value = readProp(info, key)
-    if (key === 'failures' && Array.isArray(value)) {
-      const childAncestors = new Set(ancestors || [])
-      childAncestors.add(info)
-      sanitized.failures = value.map(item => summarizeError(item, childAncestors, depth + 1))
-      continue
+    if (key === 'failures') {
+      // qodo #147-11：failures 可能来自敌意对象——Array.isArray 对 **revoked proxy** 会抛
+      // TypeError，索引 getter 抛错的数组在 .map 遍历时也会抛，二者都会让 summarizeError 逃逸，
+      // 违反本模块「绝不抛」契约（旧实现是浅拷贝，不遍历该数组，故无此风险）。
+      // 统一经 safeArray 取值：任何一步失败即退回原值透传（不遍历）。
+      const items = safeArray(value)
+      if (items !== null) {
+        const childAncestors = new Set(ancestors || [])
+        childAncestors.add(info)
+        sanitized.failures = items.map(item => summarizeError(item, childAncestors, depth + 1))
+        continue
+      }
     }
     if (typeof value !== 'string') {
       sanitized[key] = value
@@ -119,8 +133,8 @@ function summarizeError (error, ancestors, depth) {
     info.failureKind = sourceKind
     info.failureReason = readProp(source, 'failureReason') || ''
   }
-  const failures = readProp(source, 'failures')
-  if (Array.isArray(failures)) {
+  const failures = safeArray(readProp(source, 'failures'))
+  if (failures) {
     // 祖先集合按路径复制（不是共享可变集合），保证同一子对象作为兄弟节点重复出现时仍完整展开。
     const childAncestors = new Set(ancestors || [])
     childAncestors.add(source)
@@ -138,8 +152,9 @@ function classifyOne (error) {
 
   // 结构化聚合错误优先递归：顶层可能只保留“token 无效”等永久摘要，
   // 但子通道仍可能有超时/限流。只要任一子错误可重试，就必须保留重试机会。
-  if (Array.isArray(info.failures) && info.failures.length > 0) {
-    const nested = info.failures.map(classifyOne)
+  const nestedFailures = safeArray(info.failures)
+  if (nestedFailures && nestedFailures.length > 0) {
+    const nested = nestedFailures.map(classifyOne)
     if (nested.some(x => x.kind === 'retryable')) {
       // 全部子项都可重试时并非“原因混合”，标成 MIXED 会让诊断失真；kind 不变，只分清 reason。
       const allRetryable = nested.every(x => x.kind === 'retryable')
@@ -230,9 +245,9 @@ function classifyOne (error) {
 
 function classifyFailure (error) {
   const explicitKind = readProp(error, 'failureKind')
-  const nested = readProp(error, 'failures')
+  const nested = safeArray(readProp(error, 'failures'))
   // 聚合失败的子错误优先于父级预填标签，避免父级 permanent 覆盖子级 retryable。
-  if ((explicitKind === 'retryable' || explicitKind === 'permanent') && !(Array.isArray(nested) && nested.length > 0)) {
+  if ((explicitKind === 'retryable' || explicitKind === 'permanent') && !(nested && nested.length > 0)) {
     return { kind: explicitKind, reason: readProp(error, 'failureReason') || 'EXPLICIT', info: summarizeError(error) }
   }
   return classifyOne(error)
@@ -245,7 +260,7 @@ function classifySummary (summary) {
   const failed = Number(summary.failed) || 0
   // 有失败消息时进入分类；纯部分成功且剩余失败均为可重试/未知时继续，明确永久失败则停止。
   if (total <= 0 || failed <= 0) return null
-  const failures = Array.isArray(summary.failures) ? summary.failures : []
+  const failures = safeArray(readProp(summary, 'failures')) || []
   if (failures.length === 0) {
     return pushed > 0
       ? null

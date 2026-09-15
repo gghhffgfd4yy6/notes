@@ -135,8 +135,11 @@ let current = ''
 let hooksPathConfigured = false
 try {
   current = git(['config', '--get', 'core.hooksPath'])
-  // 退出码 0 即键存在；此时 stdout 可能是空串（core.hooksPath="" 是显式配置），同样算「已配置」
-  hooksPathConfigured = true
+  // 退出码 0 即键存在；但**值为空串**（core.hooksPath=""）时 git 会退回默认 hooks 目录，
+  // 本仓库门禁并不生效——语义上等同「未配置」，仍走下方安装分支。
+  // qodo #147-1：此前把空串也算「已配置」→ 只告警并 exit 0，自动化会误判「安装成功」，
+  // 而门禁其实从未生效（本文件 :5 的硬保证要求不得出现这种假成功）。
+  hooksPathConfigured = current !== ''
 } catch (e) {
   if (e.status === GIT_CONFIG_KEY_MISSING) {
     hooksPathConfigured = false
@@ -158,10 +161,11 @@ if (current === HOOKS_DIR) {
   process.exit(0)
 }
 if (hooksPathConfigured) {
-  // 空串值（core.hooksPath=""）也是显式配置：git 会退回默认 hooks 目录，覆盖它同样属于改配置。
-  const shown = current === '' ? '(空串)' : current
-  console.warn(`[hooks] 已存在 core.hooksPath=${shown}，未覆盖；本仓库提交门禁不会生效。如需改用本仓库钩子：git config core.hooksPath ${HOOKS_DIR}`)
+  console.warn(`[hooks] 已存在 core.hooksPath=${current}，未覆盖；本仓库提交门禁不会生效。如需改用本仓库钩子：git config core.hooksPath ${HOOKS_DIR}`)
   process.exit(0)
+}
+if (current === '') {
+  console.warn('[hooks] 检测到 core.hooksPath 为空串（git 退回默认 hooks 目录，本仓库门禁不生效），按未配置处理并写入本仓库钩子。')
 }
 
 // PR 评审 #140：钩子不可执行时（如 noexec 文件系统上 chmod 静默无效）不写配置、也不以 0 退出——
