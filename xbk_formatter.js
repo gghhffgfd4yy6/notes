@@ -19,9 +19,14 @@ function createFormatter ({ Utils, safeRe }) {
   },
 
   /** Markdown 链接目标包裹：含空白/括号/] 时用 <> 包裹（mdUrl 与锚点 href 统一口径，
-   *  审查 2026-09-14 F-05——此前锚点 href 未包裹，含空格/未配平括号时链接目标失效）。 */
+   *  审查 2026-09-14 F-05——此前锚点 href 未包裹，含空格/未配平括号时链接目标失效）。
+   *  PR 评审 #143-1：角括号目标内不允许未转义的 < / >（safeUrl 只挡控制字符与危险协议，
+   *  放行角括号），URL 自带 > 会提前终止目标——`https://x/a(b)>c` 曾产出
+   *  `[t](<https://x/a(b)>c>)`，收件人拿不到链接。故包裹前先按 URL 编码转义角括号。 */
   _mdDestination (url) {
-    return url && /[\s()[\]]/.test(url) ? `<${url}>` : url
+    if (!url) return url
+    const escaped = url.replace(/[<>]/g, (c) => (c === '<' ? '%3C' : '%3E'))
+    return /[\s()[\]]/.test(escaped) ? `<${escaped}>` : escaped
   },
 
   /** 从 from 起引号感知扫描定位标签结束 >：引号值内 > 不算结束（与原属性扫描正则口径一致），
@@ -469,12 +474,10 @@ function createFormatter ({ Utils, safeRe }) {
       rawHtml = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(raw))
     }
     // {链接} 占位符 Markdown 安全化（v3.74）：与 htmlToMarkdown 的 mdUrl 同口径——
-    // 含空格/括号/] 用 <> 包裹、剥离换行（原样输出会在 Markdown 链接场景破坏）
-    const linkText = () => {
-      // R6-1：非字符串视为无链接（与 htmlToMarkdown urlText 同口径）
-      const u = Utils.safeUrl(Utils.safeGet(data, 'url'))
-      return u && /[\s()[\]]/.test(u) ? `<${u}>` : u
-    }
+    // 含空格/括号/] 用 <> 包裹、剥离换行（原样输出会在 Markdown 链接场景破坏）。
+    // PR 评审 #143-1：改为直接调用 _mdDestination，不再自留第二份包裹实现——那份漏了角括号编码，
+    // 与锚点路径行为分叉（`https://x/a(b)>c` 会产出 `<https://x/a(b)>c>` 被提前截断）。
+    const linkText = () => this._mdDestination(Utils.safeUrl(Utils.safeGet(data, 'url')))
     const getContentHtml = () => safeHtmlUrl
       ? `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`
       : `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：${escUrl}<br>&nbsp;<br>&nbsp;<br>`

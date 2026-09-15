@@ -168,6 +168,29 @@ check('<a> href 无特殊字符 → 不加 <>（对照）', () => {
   )
 })
 
+// PR 评审 #143-1：safeUrl 放行角括号，而角括号形式的 Markdown 目标内不允许未转义的 < / >——
+// 不编码时 `https://x/a(b)>c` 会产出 `[t](<https://x/a(b)>c>)`，内嵌 > 提前终止目标、链接失效。
+check('<a> href 含括号且含 > → 角括号编码，目标不被提前截断（#143）', () => {
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: '<a href="https://x/a(b)>c">t</a>' }),
+    '[t](<https://x/a(b)%3Ec>)'
+  )
+})
+
+check('<a> href 含空格且含 < → 角括号编码（#143）', () => {
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: '<a href="https://x/a<b c">t</a>' }),
+    '[t](<https://x/a%3Cb c>)'
+  )
+})
+
+check('{链接} 占位符同口径：含角括号也编码（#143）', () => {
+  assert.strictEqual(
+    formatter.tuisong_replace('{链接}', { url: 'https://x/a(b)>c' }),
+    '<https://x/a(b)%3Ec>'
+  )
+})
+
 // ===== 5. 粗体 <b>/<strong> =====
 check('<b>text</b> → **text**', () => {
   assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<b>粗体</b>' }), '**粗体**')
