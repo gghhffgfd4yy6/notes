@@ -1286,9 +1286,10 @@ function truncateBytes (s, maxBytes) {
 // v3.136：剥 <url> autolink 尖括号（stripAngle 默认 true）；TG 传 false（保留 < > 给 HTML 转义）
 // v3.149：HTML 标签（含属性）整体剥空——{Html内容} 模板产物曾残留 'a href="..." target="_blank"' 垃圾文本；
 // S8786：原 /\[([^\]]+)\]\(([^)]+)\)/ 在大量未配对 "[" 上呈 O(n²) 回溯；线性扫描等价替换：
-// [text](url) → text (url)（text===url 原文链接只显示一次；text/url 空或未闭合保持原样）
-// 注意：失败路径必须推进或终止——`[text](` 后无 ")" 时剩余串不可能再有完整链接，直接保留
-// 剩余并终止；若每块只推进到 "]" 就重扫 indexOf(')')，大量未闭合块会退化为 O(n²)（v3.264 修复）。
+// [text](url) → text (url)（text===url 原文链接只显示一次；text/url 空或未闭合保持原样）；v3.274（F6）：目标段闭合点按 Markdown 合法形态解析——'(' 后首字符 '<' 时取 '>)'，否则按 '(' ')' 配平扫描；URL 内含 ')' 不再把首个 ')' 当闭合点（曾残留 '.jpg)' / '>)' 垃圾），mdImagesToPlain 同口径。
+// 注意：失败路径必须推进或终止——配平扫描失败时回退「首个 )」（只放弃这一处构造，不整段 bail，
+// 否则其后本应正常剥离的链接会原样残留）；连 ")" 都没有时剩余串不可能再有完整链接，直接保留剩余并终止。
+// 若每块只推进到 "]" 就重扫 indexOf(')')，大量未闭合块会退化为 O(n²)（v3.264 修复）。
 function mdLinksToPlain (s) {
   let out = ''
   let i = 0
@@ -1299,8 +1300,13 @@ function mdLinksToPlain (s) {
     if (close === -1) { out += s.slice(i); break } // 未闭合 ]：剩余不可能再有完整链接
     const t = s.slice(open + 1, close)
     if (t === '' || s[close + 1] !== '(') { out += s.slice(i, close + 1); i = close + 1; continue }
-    const end = s.indexOf(')', close + 2)
-    if (end === -1) { out += s.slice(i); break } // 未闭合 )：剩余串无 ")"，不可能再有完整 [text](url)
+    let end = -1; if (s[close + 2] === '<') { const g = s.indexOf('>', close + 3); if (g !== -1 && s[g + 1] === ')') end = g + 1 }
+    if (end === -1) for (let j = close + 2, d = 1; j < s.length && d > 0; j++) { if (s[j] === '(') d++; else if (s[j] === ')' && --d === 0) end = j }
+    // 配平扫描失败（destination 内含未配平 '('）：回退到「首个 )」的旧口径，只放弃这一处构造，
+    // 不整段 bail——整段 bail 会把其后本应正常剥离的链接原样残留（回归）。回退仍只做一次 indexOf，
+    // 不改变整体线性复杂度。
+    if (end === -1) end = s.indexOf(')', close + 2)
+    if (end === -1) { out += s.slice(i); break } // 连 ")" 都没有：剩余串不可能再有完整链接，原样保留并终止
     const u = s.slice(close + 2, end)
     if (u === '') { out += s.slice(i, end + 1); i = end + 1; continue } // url 空：原样保留
     out += s.slice(i, open) + (t === u ? t : `${t} (${u})`)
@@ -1310,8 +1316,8 @@ function mdLinksToPlain (s) {
 }
 
 // 线性剥离 Markdown 图片语法：![alt](url) → alt（url 至少 1 字符才成立；未闭合 ]/) 保持原样）。
-// 替代原 /!\[([^\]]*)\]\(([^)]+)\)/ 替换——该正则在大量未配对 "![" 上 O(n²) 回溯（v3.264 修复）。
-// emptyAlt：alt 为空时的替换文本（企微用 '(图片)'，mdToPlain 用 ''）
+// 替代原 /!\[([^\]]*)\]\(([^)]+)\)/ 替换——该正则在大量未配对 "![" 上 O(n²) 回溯（v3.264 修复）；emptyAlt：alt 为空时的替换文本（企微用 '(图片)'，mdToPlain 用 ''）。
+// v3.274（F6）：闭合点与 mdLinksToPlain 同口径（'<...>' 形态或 '(' ')' 配平），配平失败回退「首个 )」。
 function mdImagesToPlain (s, emptyAlt = '') {
   let out = ''
   let i = 0
@@ -1322,8 +1328,11 @@ function mdImagesToPlain (s, emptyAlt = '') {
     if (close === -1) { out += s.slice(i); break } // 未闭合 ]：剩余不可能再有完整图片语法
     const alt = s.slice(bang + 2, close)
     if (s[close + 1] !== '(') { out += s.slice(i, close + 1); i = close + 1; continue }
-    const end = s.indexOf(')', close + 2)
-    if (end === -1) { out += s.slice(i); break } // 未闭合 )：剩余串无 ")"，不可能再有完整图片语法
+    let end = -1; if (s[close + 2] === '<') { const g = s.indexOf('>', close + 3); if (g !== -1 && s[g + 1] === ')') end = g + 1 }
+    if (end === -1) for (let j = close + 2, d = 1; j < s.length && d > 0; j++) { if (s[j] === '(') d++; else if (s[j] === ')' && --d === 0) end = j }
+    // 同 mdLinksToPlain：配平失败回退「首个 )」，不整段 bail（否则其后合法图片语法不再剥离）。
+    if (end === -1) end = s.indexOf(')', close + 2)
+    if (end === -1) { out += s.slice(i); break } // 连 ")" 都没有：剩余串不可能再有完整图片语法，原样保留并终止
     const u = s.slice(close + 2, end)
     if (u === '') { out += s.slice(i, end + 1); i = end + 1; continue } // url 空：原样保留
     out += s.slice(i, bang) + (alt === '' ? emptyAlt : alt)
