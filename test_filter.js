@@ -6726,7 +6726,10 @@ console.log('========================================\n');
     const path = require('path')
     const main = fs.readFileSync(path.join(__dirname, 'xbk_function_v3.js'), 'utf8')
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'))
-    const m = main.match(/v(\d+)\.(\d+)/)
+    // 只认文件头第一行：与 check-version.js 及上方「文件头 ↔ CHANGELOG」用例同口径。
+    // 原为全文 main.match(...)：今天恰好只命中首行，但正文里一旦出现一次当前版本号注释，
+    // 文件头损坏时就会匹配到正文而误通过（该断言的本意是校验「文件头 ↔ package.json」）。
+    const m = main.split('\n', 1)[0].match(/v(\d+)\.(\d+)/)
     assertEqual(!!m, true, '主代码文件头应有版本号')
     const expected = `${m[1]}.${m[2]}.0`
     assertEqual(pkg.version, expected, `package.json 版本(${pkg.version})应与文件头(v${expected})一致`)
