@@ -8590,14 +8590,23 @@ console.log('========================================\n');
   await test('parseTime 带空白日期仍按 UTC 零点（P1-02：trim 后不落宿主本地时区）', () => {
     // 未 trim 时 '2026-08-01 ' 落空所有锚定分支 → _parseFallback 宿主本地解析，
     // 东八区得到 2026-07-31T16:00Z（天数差 1，pingbitime 边界误拦）；须与无空白形态同值。
-    const expect = new Date(Date.UTC(2026, 7, 1)).getTime()
-    assertEqual(daysComputed('2026-08-01'), 44, '基准：无空白日期天数')
-    for (const v of ['2026-08-01 ', ' 2026-08-01', '2026-08-01\n', '2026-08-01\t', '2026/08/01 ']) {
-      assertEqual(daysComputed(v), 44, `带空白日期应按 UTC 零点解析: ${JSON.stringify(v)}`)
+    // 固定"今天"（与上方 daysComputed 用例同一手法）：daysComputed 是「距今自然日差」，
+    // 硬编码期望值会随真实日期逐日漂移——写入当天 44 对、次日起必红，并会把变异矩阵的
+    // 「基线首跑」门禁一并拖红（CI 实测：2026-09-15 起 quality/21 个变异分片全红）。
+    const origNow = Date.now
+    try {
+      Date.now = () => Date.UTC(2026, 7, 3, 6, 0) // 固定"今天"= 2026-08-03 06:00 UTC
+      const baseline = daysComputed('2026-08-01')
+      assertEqual(baseline, 2, '基准：无空白日期天数（8/1 → 8/3 自然日差）')
+      for (const v of ['2026-08-01 ', ' 2026-08-01', '2026-08-01\n', '2026-08-01\t', '2026/08/01 ']) {
+        assertEqual(daysComputed(v), baseline, `带空白日期应按 UTC 零点解析: ${JSON.stringify(v)}`)
+      }
+    } finally {
+      Date.now = origNow
     }
     // 数字类型不受 trim 影响（String(number) 本无空白）
     assertEqual(daysComputed(1755300000), daysComputed('1755300000'), '数字与字符串时间戳口径一致')
-    assertEqual(expect, new Date(Date.UTC(2026, 7, 1)).getTime(), 'UTC 零点常量自检')
+    assertEqual(new Date(Date.UTC(2026, 7, 1)).getTime(), Date.UTC(2026, 7, 1), 'UTC 零点常量自检')
   })
 
   await test('parseTime 全空白字符串 → 无效（P1-02：trim 后空串返回 null）', () => {
