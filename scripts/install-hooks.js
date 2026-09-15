@@ -6,7 +6,7 @@
 //   - git 不可用 / 非 git 工作树时给出告警并正常退出，不阻断安装；
 //   - 配置写入失败时以非零退出码报错（不静默吞掉）；
 //   - 不只写配置：安装前后核验钩子真实可用（存在 + 可执行）。目录/文件缺失时
-//     git 会静默忽略全部钩子，必须非零退出；仅缺可执行位时尝试 chmod 0o755 修复，
+//     git 会静默忽略全部钩子，必须非零退出；仅缺可执行位时尝试 chmod 0o700 修复，
 //     修复不了（如 noexec 挂载）则醒目告警，绝不把「配置已写入」说成「门禁已生效」。
 const fs = require('node:fs')
 const path = require('node:path')
@@ -68,7 +68,7 @@ function verifyHooks (dir) {
   if (notExecutable.length > 0) {
     const list = notExecutable.map(name => `${HOOKS_DIR}/${name}`).join('、')
     console.warn(`[hooks] ⚠️  以下钩子不可执行，git 会静默跳过，提交门禁实际未生效：${list}`)
-    console.warn('[hooks]    已尝试 chmod 755 但仍无执行位，常见于 noexec 挂载（如 /storage/emulated）或 core.filemode=false 的检出。')
+    console.warn('[hooks]    已尝试 chmod 700 但仍无执行位，常见于 noexec 挂载（如 /storage/emulated）或 core.filemode=false 的检出。')
     console.warn(`[hooks]    请手动执行后重跑本脚本自检：chmod +x ${list.replace(/、/g, ' ')}`)
     return false
   }
