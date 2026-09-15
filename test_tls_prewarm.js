@@ -110,12 +110,15 @@ require.cache[gotPath] = { id: gotPath, filename: gotPath, loaded: true, exports
   assert.strictEqual(erroredAgg.ok, false, 'GET 回退普通失败时 aggregate ok 同样为 false')
   assert.strictEqual(erroredAgg.okCount, 0, 'GET 回退普通失败时 aggregate okCount 同样为 0')
   // ③ 现状记录：两条分支的公开结果逐字段一致
+  // 显式比较函数：键集比对需要确定性排序（SonarJS S2871 也要求 sort() 必须传比较函数）；
+  // 这里用码元序而非 localeCompare，避免测试结果随宿主 locale 变化。
+  const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
   assert.deepStrictEqual(
-    Object.keys(cancelledAgg).sort(),
+    Object.keys(cancelledAgg).sort(byCodeUnit),
     ['count', 'elapsedMs', 'hostname', 'ok', 'okCount', 'perConnectionMs'],
     'aggregate 公开形状（AGENTS-07 记录）：若新增 cancelled/error 等字段（即修 AGENTS-06），必须同步更新本测试'
   )
-  assert.deepStrictEqual(Object.keys(erroredAgg).sort(), Object.keys(cancelledAgg).sort(), 'cancelled 分支与 error 分支的公开结果键集应一致')
+  assert.deepStrictEqual(Object.keys(erroredAgg).sort(byCodeUnit), Object.keys(cancelledAgg).sort(byCodeUnit), 'cancelled 分支与 error 分支的公开结果键集应一致')
   assert.strictEqual(cancelledAgg.ok, erroredAgg.ok, 'cancelled 分支与 error 分支的 ok 应一致')
   assert.strictEqual(cancelledAgg.okCount, erroredAgg.okCount, 'cancelled 分支与 error 分支的 okCount 应一致')
   assert.strictEqual(cancelledAgg.count, erroredAgg.count, 'cancelled 分支与 error 分支的 count 应一致')

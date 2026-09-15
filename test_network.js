@@ -162,7 +162,7 @@ function makeNetwork (opts = {}) {
   // 11. net-3（xbk_network.js:62）：非正 / NaN / 非数字 timeout → 回落默认 5000
   // 注意 `!(n > 0)` 守卫：若改成无条件 Math.max(1, …)，-5/0 会传出 1 而非 5000 → 本块红。
   {
-    const cases = [[-5, '负数'], [0, '零'], [NaN, 'NaN'], ['abc', '非数字字符串'], ['', '空字符串']]
+    const cases = [[-5, '负数'], [0, '零'], [Number.NaN, 'NaN'], ['abc', '非数字字符串'], ['', '空字符串']]
     for (const [input, label] of cases) {
       const { net, getRequestOptions } = makeNetwork({ retry: 0, timeout: input })
       await net.fetchData()

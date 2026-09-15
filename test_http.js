@@ -208,7 +208,7 @@ function installMockStream (behavior) {
     const origWarn = console.warn
     console.warn = (...args) => { warns.push(args.join(' ')) }
     try {
-      for (const bad of [0, -1, NaN, Infinity, '10']) {
+      for (const bad of [0, -1, Number.NaN, Infinity, '10']) {
         const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"a":1}'] })
         try {
           const body = await fetchJson('https://api.example.com/x', {}, bad)
