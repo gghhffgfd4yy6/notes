@@ -32,9 +32,19 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     parts.push(['pingbitime', typeof pb, safeStr(pb)])
     return JSON.stringify(parts)
   },
-  /** 缺字段保守放行统一：compiled/group 缺失或字段缺失 → true；否则取反执行检查 */
+  /** 缺字段保守放行统一：compiled/group 缺失或字段缺失 → true；否则取反执行检查
+   *  参数形状：compiled 为 compileRules 产出的字段级规则对象（_type 为字符串） */
   _passIfMissing (group, field, compiled, checkFn) {
     if (!compiled || !group) return true
+    // FILTER-03：形状守卫——只接受 compileRules 产出的字段级规则（_type 为字符串）。
+    // 传原始配置/错形状参数时下游 matchesCompiled/checkTimeCompiled 会静默返回「不拦截」，
+    // 与同级入口 :131/:231/:246 的 __compiled 守卫口径分裂；此处显式告警后保守放行（合法输入行为不变）。
+    let ruleShape = false
+    try { ruleShape = typeof compiled === 'object' && typeof compiled._type === 'string' } catch (e) { ruleShape = false }
+    if (!ruleShape) {
+      console.warn('⚠️ 过滤检查收到未编译的规则对象（应为 compileRules 产物），已保守放行')
+      return true
+    }
     const v = Utils.safeGet(group, field)
     if (v === undefined || v === null || v === '') return true
     try {
@@ -44,13 +54,15 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     }
   },
 
-  /** 注册天数过滤（使用编译后的规则） */
+  /** 注册天数过滤（使用编译后的规则）
+   *  参数形状：compiled = compileRules().pingbitime（_type 'time'/'timeMulti'），null/缺失 → 放行 */
   checkRegisterTime (group, compiled) {
     // 显式判断缺失：0 时间戳(1970)视为有效，走 checkTimeCompiled 解析（口径统一）
     return this._passIfMissing(group, 'louzhuregtime', compiled, (c, g) => RuleEngine.checkTimeCompiled(c, g))
   },
 
-  /** 分类屏蔽（使用编译后的规则） */
+  /** 分类屏蔽（使用编译后的规则）
+   *  参数形状：compiled = compileRules().pingbifenlei（_type 're'/'multi'），null/缺失 → 放行 */
   checkCategory (group, compiled) {
     return this._passIfMissing(group, 'catename', compiled, (c, g) => {
       const catename = Utils.safeGet(g, 'catename')
@@ -72,8 +84,20 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
      *
      * 注意：楼主/标题的白名单会"越权"免疫后面字段的强化屏蔽，
      *       这是刻意设计，配置时需留意。
+     *
+     * 参数形状：compiled = compileRules(...) 的整份产物（__compiled === true），
+     *           与 checkCategory/checkRegisterTime 接收字段级规则（_type）不同；缺失 → 放行。
      */
   checkFields (group, compiled) {
+    // FILTER-03：形状守卫——本入口接收整份编译产物（__compiled === true）。传原始配置或错形状
+    // 参数时下游 matchesCompiled 对未知 _type 一律返回 false → 静默「全部放行」且无任何留痕；
+    // 此处与同级 __compiled 守卫口径统一：显式告警后保守放行（合法输入行为不变）。
+    let cfgShape = false
+    try { cfgShape = typeof compiled === 'object' && compiled !== null && compiled.__compiled === true } catch (e) { cfgShape = false }
+    if (!cfgShape) {
+      if (compiled) console.warn('⚠️ checkFields 收到未编译的配置或错形状参数，已保守放行')
+      return true
+    }
     const fieldStages = [
       { key: 'louzhu', getVal: (g) => Utils.safeGet(g, 'louzhu'), showCfg: compiled.zhanxianlouzhu, blockCfg: compiled.pingbilouzhu, plusCfg: compiled.pingbilouzhuplus, blockedBy: [] },
       { key: 'title', getVal: (g) => Utils.safeGet(g, 'title'), showCfg: compiled.zhanxianbiaoti, blockCfg: compiled.pingbibiaoti, plusCfg: compiled.pingbibiaotiplus, blockedBy: ['louzhu'] },
@@ -183,14 +207,12 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
       { key: 'content', label: 'content', getVal: (g) => Utils.safeGet(g, 'content'), showKey: 'zhanxianneirong', blockKey: 'pingbineirong', plusKey: 'pingbineirongplus', blockedBy: ['louzhu', 'title'] }
     ]
     const showFlags = {}
-    const showMatched = {}
     for (const stage of stages) {
       const value = stage.getVal(group)
       const rule = matchedRule(cfg[stage.showKey], value, category)
       if (cfg[stage.showKey] && value !== undefined && value !== null && value !== '' &&
         RuleEngine.matchesCompiled(cfg[stage.showKey], value, category)) {
         showFlags[stage.key] = true
-        showMatched[stage.key] = true
         passed.protections.push(reason(stage.label, 'show', stage.showKey, { matchedRule: rule }))
       }
     }
@@ -209,10 +231,9 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
         return blocked(reason(stage.label, 'block', stage.blockKey, { matchedRule: matchedRule(cfg[stage.blockKey], value, category) }))
       }
       if (cfg[stage.plusKey] && RuleEngine.matchesCompiled(cfg[stage.plusKey], value, category)) {
-        if (showMatched[stage.key]) {
-          showFlags[stage.key] = false
-          passed.protections = passed.protections.filter(entry => entry.configKey !== stage.showKey)
-        }
+        // FILTER-05：不再改写 passed.protections/showFlags——blocked() 会把 protections/skipped
+        // 整表清空，紧随其后的 return 丢弃所有改写（原为不可达死代码）；「保护被 plus 抵消」
+        // 由 reason.kind === 'plus' 承载（测试锁定同字段抵消后 protections 为空）。
         return blocked(reason(stage.label, 'plus', stage.plusKey, { matchedRule: matchedRule(cfg[stage.plusKey], value, category) }))
       }
       if (showFlags[stage.key] && cfg[stage.blockKey]) {
@@ -242,7 +263,14 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     const key = this._legacyCompileKey(rawCfg)
     compiled = this._legacyCompileCache.get(key)
     if (compiled === undefined) {
-      try { compiled = RuleEngine.compileRules(rawCfg) } catch (e) { return true }
+      try {
+        compiled = RuleEngine.compileRules(rawCfg)
+      } catch (e) {
+        // FILTER-06：与 explainFilter 的编译失败留痕口径一致（原先此处静默 return true，
+        // 故障不可观测）；保守放行语义不变，仍避免异常冒泡与无限递归。
+        console.warn(`⚠️ 过滤规则编译失败，已保守放行：${e && e.message ? e.message : e}`)
+        return true
+      }
       if (!compiled || typeof compiled !== 'object' || !compiled.__compiled) return true
       this._legacyCompileCache.set(key, compiled)
       // 超限淘汰最旧键（Map 保持插入序 ≈ LRU），防动态/外部配置无限增长。
@@ -291,12 +319,14 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
       }
     }
     if (re === null) return true // 缺少 RE2 或非法正则：放行（宁可多推不可少推）
-    // ReDoS 纵深防御：与 matchesCompiled 同口径，超长输入先截断再 .test()——即使关键词含
-    // 未被子嵌套量词检测覆盖的慢回溯形态（交替/前视/大字符类 × 超长输入），单次匹配最坏耗时也有界。
+    // ReDoS 纵深防御：与 matchesCompiled 同口径——字段值非字符串时统一 String() 化（不再走
+    // Utils.safeText 的「对象 JSON 化 / 函数置空」口径），输入仅由 _normalizeReInput 剥离零宽
+    // 字符、不做任何长度截断（v3.270 起长文本完整匹配；安全性由 RE2 线性时间 + 上方关键词
+    // hasNestedQuantifier 闸门保证，而非截断）。
     // v3.249：超长 keyword 的 V8 会把正则编译推迟到首次 .test()，此时抛 "Regular expression too
     // large"（new RegExp 不抛）——test 也需 try/catch，失败按放行处理（宁可多推不可少推）。
     try {
-      return re.test(RuleEngine._normalizeReInput(typeof value === 'string' ? value : Utils.safeText(value, '')))
+      return re.test(RuleEngine._normalizeReInput(typeof value === 'string' ? value : String(value)))
     } catch (e) { return true }
   }
   }

@@ -5,9 +5,8 @@
 // ============================================================
 function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Available }) {
   const RuleEngine = {
-  _compileUserRegex (source, flags = 'i') {
-    return compileUserRegex(source, flags)
-  },
+    // RULES-06：此处原有 _compileUserRegex 包装方法，全仓库（含测试）无任何调用者，
+    // 实际编译统一走依赖注入的 compileUserRegex 与 _compileCatRe，已删除（死方法清理）。
   /** 解析单行规则：split('###') + trim，返回 { cat, val, parts } */
     _parseLine (line) {
     // v3.245 P1：String(line) 对嵌套 Symbol 数组抛 TypeError——catch 兜底返回空规则。
@@ -24,6 +23,9 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
     _compileCatRe (cat) {
     // v3.245 P1：null/undefined 显式返回 null——此前 new RegExp(undefined) 隐式编译
     // /undefined/i 字面量正则，会静默匹配含 "undefined" 文本的字段，行为与预期不符。
+    // RULES-06：内部调用点（compileRules 编译分类处）均以 `if (cat)` 前置，且 _parseLine
+    // 恒返回 trim 后的字符串，故本分支在内网调用链上当前不可达；按「防御性守卫」保留——
+    // 它挡住的是直接调用方传入 null/undefined 时的字面量正则地雷（非死代码，勿删）。
       if (cat === null || cat === undefined) return null
       if (this.hasNestedQuantifier(cat)) return null // ReDoS 防护：嵌套量词直接跳过
       return compileUserRegex(String(cat), 'i')
@@ -121,6 +123,8 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
     _validateCatRe (cat, field, warnings) {
     // v3.246：null/undefined 显式警告并跳过——此前 new RegExp(null) 隐式编译 /null/i
     // 字面量正则，会静默匹配含 "null"/"undefined" 文本的字段且无警告，行为与预期不符。
+    // RULES-06：调用点均以 `if (cat)` 前置（同 _compileCatRe），本分支在内网调用链上
+    // 当前不可达；按「防御性守卫」保留，勿删（挡住直接调用方传 null/undefined 的静默地雷）。
       if (cat === null || cat === undefined) {
         warnings.push(`⚠️ 配置「${field}」分类正则为空，该行将被忽略`)
         return
@@ -158,6 +162,10 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       // 编译简单的正则字段（不含 ### 时）
       for (const field of FILTER_FIELDS) {
       // v3.108 fuzz：String(嵌套 Symbol 数组) 崩 → 该字段置 null（跳过）
+      // RULES-04（defer）：此处仍为裸读 rawCfg[field]——抛错 getter 会抛穿 compileRules，但
+      // xbk_filter.js 的 explainFilter/_legacyListfilter 会捕获该异常并「告警 + 保守放行」
+      // （test_filter.js 的「原始配置编译异常时告警并保守放行」锁定此契约）。在此吞掉异常会让
+      // 那条告警消失、该测试转红，故不修；要修需同步改 xbk_filter.js 与 test_filter.js 断言。
         let val = rawCfg[field]
         if (val === undefined || val === null || typeof val === 'symbol') {
           compiled[field] = null
@@ -368,20 +376,37 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
         if (v === undefined || v === null || typeof v === 'symbol') return ''
         try { return String(v) } catch (e) { return '' }
       }
+      // RULES-04：配置对象可能是抛错 getter 的 Proxy（脏配置/被污染对象），裸读会把异常抛穿
+      // 整轮 run。统一经 readField 读取：失败记一条告警并按「无该字段」处理，不再中断校验。
+      const readField = (field) => {
+        try { return { ok: true, value: cfg[field] } } catch (e) {
+          warnings.push(`⚠️ 配置「${field}」读取失败（${e && e.message ? e.message : String(e)}），已忽略该字段过滤`)
+          return { ok: false, value: undefined }
+        }
+      }
 
       // pingbifenlei 不支持 ### 多行分类语法，给明确警告
-      if (safeStr(cfg.pingbifenlei) && /###/.test(safeStr(cfg.pingbifenlei))) {
+      const pbfl = readField('pingbifenlei')
+      if (pbfl.ok && safeStr(pbfl.value) && /###/.test(safeStr(pbfl.value))) {
         warnings.push('⚠️ 配置「pingbifenlei」不支持 ### 多行分类语法，该规则将被忽略\n   如需按分类屏蔽，请直接写分类名正则，例如：微博|赚客吧')
       }
 
       for (const field of FILTER_FIELDS) {
       // 非字符串（对象/数组/数字等脏配置）→ 显式警告（String 化会把 '[object Object]' 当合法正则，静默怪行为），与 zkt_gjc 口径一致
-        if (cfg[field] !== undefined && cfg[field] !== null && typeof cfg[field] !== 'string') {
-          warnings.push(`⚠️ 配置「${field}」应为字符串，当前为 ${typeof cfg[field]}，已忽略该字段过滤`)
+        const raw = readField(field)
+        if (!raw.ok) continue
+        if (raw.value !== undefined && raw.value !== null && typeof raw.value !== 'string') {
+          warnings.push(`⚠️ 配置「${field}」应为字符串，当前为 ${typeof raw.value}，已忽略该字段过滤`)
           continue
         }
-        const val = safeStr(cfg[field])
+        const val = safeStr(raw.value)
         if (!val) continue
+        // RULES-02：模式侧零宽字符与输入侧不对称——匹配前待匹配文本已剥离零宽（_normalizeReInput），
+        // 而模式里的零宽（复制粘贴常见）原样编译，会让该规则极难命中，此前还零告警。
+        // 这里只补告警（零行为风险）：直接剥离模式中零宽会改变可选量词/字符类等结构语义，需产品决策。
+        if (/[\u200B-\u200D\uFEFF]/.test(val)) {
+          warnings.push(`⚠️ 配置「${field}」含零宽字符（U+200B-200D/U+FEFF）：匹配前文本会剥离零宽字符，该正则可能永不命中，建议删除模式中的零宽字符`)
+        }
         // pingbifenlei 不支持 ### 多行语法，已在上面给出明确警告，跳过以避免逐行告警（与 compileRules 口径一致）
         if (field === 'pingbifenlei' && /###/.test(val)) continue
         // 多行模式：逐行验证
@@ -430,23 +455,26 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
 
       // 验证 zkt_gjc（只看它关键词，与 App.run 预编译口径一致）
       // R11-1：非字符串（对象/数字等脏配置）→ 显式警告（String 化会把 '[object Object]' 当合法正则，静默怪行为）
-      if (cfg.zkt_gjc !== undefined && cfg.zkt_gjc !== null && typeof cfg.zkt_gjc !== 'string') {
-        warnings.push(`⚠️ 配置「zkt_gjc」应为字符串，当前为 ${typeof cfg.zkt_gjc}，已忽略只看它过滤`)
-      } else if (cfg.zkt_gjc && String(cfg.zkt_gjc).trim() === '') {
+      // RULES-04：同 readField——抛错 getter 时告警并跳过，不让异常抛穿整轮校验。
+      const zkt = readField('zkt_gjc')
+      const zktRaw = zkt.ok ? zkt.value : undefined
+      if (zktRaw !== undefined && zktRaw !== null && typeof zktRaw !== 'string') {
+        warnings.push(`⚠️ 配置「zkt_gjc」应为字符串，当前为 ${typeof zktRaw}，已忽略只看它过滤`)
+      } else if (zktRaw && String(zktRaw).trim() === '') {
       // 与 App.run 口径一致：纯空白关键词为误配置，显式告警并忽略只看它过滤
         warnings.push('⚠️ 配置「zkt_gjc」为空白字符，已忽略只看它过滤')
-      } else if (cfg.zkt_gjc && String(cfg.zkt_gjc).trim() !== '') {
+      } else if (zktRaw && String(zktRaw).trim() !== '') {
       // P2（审查 2026-08-15）：zkt_gjc 首尾空白地雷——hash 与 App.run 均按字面正则匹配（不能 trim，
       // 空白在正则语义中有意义），' abc' 与 'abc' 行为完全不同；「只看它」是白名单语义，误配空格会
       // 静默全量滤空且无告警（pingbitime 已有同款告警，此处补齐低成本保险）。
-        if (String(cfg.zkt_gjc) !== String(cfg.zkt_gjc).trim()) {
+        if (String(zktRaw) !== String(zktRaw).trim()) {
           warnings.push('⚠️ 配置「zkt_gjc」含首尾空白，将按字面正则匹配（不会被 trim）；若非有意配置请去除首尾空格')
         }
-        if (this.hasNestedQuantifier(cfg.zkt_gjc)) {
+        if (this.hasNestedQuantifier(zktRaw)) {
           warnings.push('⚠️ 配置「zkt_gjc」的正则含嵌套量词，可能导致灾难性回溯，已忽略只看它过滤')
         } else {
-          if (isRe2Available() && !compileUserRegex(cfg.zkt_gjc, 'i')) {
-            warnings.push(`⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式：「${cfg.zkt_gjc}」`)
+          if (isRe2Available() && !compileUserRegex(zktRaw, 'i')) {
+            warnings.push(`⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式：「${zktRaw}」`)
           }
         }
       }
@@ -462,8 +490,10 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
         warnings.push('⚠️ 配置「pingbitime」含首尾空白，已按去空格后的值处理')
       }
       if (pbStr.trim()) {
+        // RULES-03：上限常量提为两形态共用——简单形态此前缺上限告警（compileRules 已置 null 并告警，
+        // 校验侧却静默通过，两端口径不一致）。
+        const PINGBITIME_MAX_DAYS = 3650000 // 与 compileRules 口径一致：超过上限视为无效
         if (/###/.test(pbStr)) {
-          const PINGBITIME_MAX_DAYS = 3650000 // 与 compileRules 口径一致：超过上限视为无效
           const lines = pbStr.split(/<br\s*\/?>|\r\n|\r|\n/) // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
           for (const line of lines) {
             const { cat, val, parts } = this._parseLine(line)
@@ -492,6 +522,9 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
             warnings.push(`⚠️ 配置「pingbitime」的值「${pbStr}」不是有效数字（需 ≥0 的有限数）`)
           } else if (!Number.isInteger(tv)) {
             warnings.push(`⚠️ 配置「pingbitime」的值「${pbStr}」是小数，已按整数处理（建议使用整数天数）`)
+          } else if (tv > PINGBITIME_MAX_DAYS) {
+            // RULES-03：与 compileRules 简单形态（置 null + console.warn）对齐，此前此处静默通过。
+            warnings.push(`⚠️ 配置「pingbitime」的值「${pbStr}」超过上限 ${PINGBITIME_MAX_DAYS} 天，已忽略`)
           }
         }
       }
