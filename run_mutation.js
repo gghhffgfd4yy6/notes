@@ -248,6 +248,7 @@ function applyMutants (dir, mutants) {
     if (!grouped.has(m.file)) grouped.set(m.file, [])
     grouped.get(m.file).push(m)
   }
+  const applied = []
   for (const [file, list] of grouped) {
     const full = path.join(dir, file)
     let source = fs.readFileSync(full, 'utf8')
@@ -261,9 +262,39 @@ function applyMutants (dir, mutants) {
       if (m.end > appliedFrom) continue
       source = source.slice(0, m.start) + m.replacement + source.slice(m.end)
       appliedFrom = m.start
+      applied.push(m.id)
     }
     fs.writeFileSync(full, source, 'utf8')
   }
+  // 返回值（评审 #143-2）：只有这些候选真正进了沙箱，批级结果只对它们成立；
+  // 被跳过的重叠候选必须由调用方另行评估，不能继承同批结果。
+  return applied
+}
+
+// 批次构造（评审 #143-2）：同一文件内区间重叠的候选互斥，不能进同一批——applyMutants 只会套用
+// 其中一个，而批级结果（pass/killed）会被记到整批候选头上。典型场景：'<' 生成 '<=' 与 '>' 两个
+// 同区间候选，若第一个被套用后测试通过，而第二个本会失败，两者都会被记成 survived（killed 记 alive）。
+// 贪心装填：按 (file, start, end) 排序后取互不重叠的候选，单批上限 batchSize；不同文件不混批
+// （重叠判定是文件内概念，混批还会让偏移区间失去可比性）。
+function buildBatches (mutants, batchSize) {
+  const byFile = new Map()
+  for (const m of mutants) {
+    if (!byFile.has(m.file)) byFile.set(m.file, [])
+    byFile.get(m.file).push(m)
+  }
+  const batches = []
+  for (const list of byFile.values()) {
+    let cur = []
+    let curEnd = -Infinity
+    const flush = () => { if (cur.length) batches.push(cur); cur = []; curEnd = -Infinity }
+    for (const m of [...list].sort((a, b) => a.start - b.start || a.end - b.end)) {
+      if (cur.length && (m.start < curEnd || cur.length >= batchSize)) flush()
+      cur.push(m)
+      if (m.end > curEnd) curEnd = m.end
+    }
+    flush()
+  }
+  return batches
 }
 
 function runTests (dir, timeoutMs) {
@@ -402,9 +433,9 @@ async function evaluate (mutants, files, timeoutMs) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mutant-'))
   try {
     copyProject(dir, files)
-    applyMutants(dir, mutants)
+    const appliedIds = applyMutants(dir, mutants)
     const result = await runTests(dir, timeoutMs)
-    return { ...result, mutants: mutants.map(m => m.id) }
+    return { ...result, mutants: mutants.map(m => m.id), appliedIds }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -500,8 +531,7 @@ async function main (deps) {
   const survived = new Map((old && old.survived) || [])
   const compileErrors = new Map((old && old.compileErrors) || [])
   const resolved = new Set([...killed.keys(), ...survived.keys(), ...compileErrors.keys()].map(Number))
-  const allBatches = []
-  for (let i = 0; i < mutants.length; i += batchSize) allBatches.push(mutants.slice(i, i + batchSize))
+  const allBatches = buildBatches(mutants, batchSize)
   const pending = old && Array.isArray(old.pending)
     ? old.pending.map(ids => ids.map(Number).map(id => byId.get(id)).filter(Boolean)).filter(b => b.length)
     : allBatches
@@ -526,7 +556,19 @@ async function main (deps) {
       const result = results[i]
       const batch = round[i]
       if (result.status === 'pass') {
-        for (const m of batch) survived.set(m.id, { status: 'survived', batch: batch.map(x => x.id) })
+        // 只把 pass 记到真正参与本次运行的候选头上（评审 #143-2）：同区间候选互斥，被跳过者若照旧
+        // 记 survivor，会把「本会被杀死」的变异记成存活（分数虚高、假绿）。buildBatches 已保证批次
+        // 内无重叠，这里兜底外部注入的 evaluate（测试）或将来新增的重叠来源——未套用者重新入队。
+        const applied = new Set(Array.isArray(result.appliedIds) ? result.appliedIds : batch.map(m => m.id))
+        const skipped = []
+        for (const m of batch) {
+          if (applied.has(m.id)) survived.set(m.id, { status: 'survived', batch: batch.map(x => x.id) })
+          else skipped.push(m)
+        }
+        if (skipped.length) {
+          console.log(`批次含重叠候选：${skipped.length} 个未参与运行，重新入队`)
+          pending.push(skipped)
+        }
         continue
       }
       if (batch.length === 1) {
@@ -557,4 +599,4 @@ async function main (deps) {
 }
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1 })
-module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, runTests, evaluate }
+module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate }

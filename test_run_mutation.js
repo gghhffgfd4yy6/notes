@@ -1,7 +1,7 @@
 'use strict'
 
 const assert = require('assert')
-const { generateMutants, extractTestSummary, collectMutants } = require('./run_mutation')
+const { generateMutants, extractTestSummary, collectMutants, buildBatches } = require('./run_mutation')
 
 ;(async () => {
   // ===== generateMutants：比较运算符 =====
@@ -169,6 +169,44 @@ const { generateMutants, extractTestSummary, collectMutants } = require('./run_m
 
   // 不存在的文件 → 抛错
   assert.throws(() => collectMutants(['nonexistent_file_xyz.js']), /ENOENT|no such file/, '不存在的文件应抛错')
+
+  // ===== buildBatches：同区间候选不得同批（PR 评审 #143-2） =====
+  // 'a < b' 生成两个同区间候选 ['<=', '>']；若进同一批，applyMutants 只套用一个，
+  // 而批级 pass/killed 会被记到两个候选头上——「第一个通过、第二个本会失败」时
+  // 被杀死的变异会被记成存活（分数虚高）。批次必须保证批内区间互不重叠。
+  const overlap = generateMutants('t.js', 'a < b') // 两个候选，同 [2,3)
+  assert.strictEqual(overlap.length, 2, '夹具应生成两个同区间候选')
+  const ob = buildBatches(overlap, 50)
+  assert.strictEqual(ob.length, 2, '同区间候选必须拆成两批（不得共享批级结果）')
+  assert.ok(ob.every(b => b.length === 1), '每批只应有一个互斥候选')
+
+  // 不重叠的候选仍应合批（效率不应因修复退化）
+  const disjoint = [
+    { file: 't.js', start: 2, end: 4, id: 1 },
+    { file: 't.js', start: 7, end: 9, id: 2 },
+    { file: 't.js', start: 12, end: 14, id: 3 }
+  ]
+  const dj = buildBatches(disjoint, 50)
+  assert.strictEqual(dj.length, 1, '互不重叠的候选应合入同一批')
+  assert.strictEqual(dj[0].length, 3, '同一批应含全部三个候选')
+
+  // batchSize 上限与「跨文件不混批」仍然成立
+  const many = Array.from({ length: 5 }, (_, i) => ({ file: 't.js', start: i * 10, end: i * 10 + 1, id: i + 1 }))
+  assert.strictEqual(buildBatches(many, 2).length, 3, 'batchSize=2 时 5 个候选应切成 3 批')
+  const twoFiles = [
+    { file: 'a.js', start: 0, end: 1, id: 1 },
+    { file: 'b.js', start: 0, end: 1, id: 2 }
+  ]
+  assert.strictEqual(buildBatches(twoFiles, 50).length, 2, '不同文件的候选不混批')
+  // 批内区间必须两两不重叠（不变量）
+  for (const b of buildBatches(collectMutants(['xbk_utils.js', 'xbk_agents.js']), 8)) {
+    const byFile = new Map()
+    for (const m of b) {
+      const prevEnd = byFile.get(m.file)
+      if (prevEnd !== undefined) assert.ok(m.start >= prevEnd, `批内区间不得重叠：${m.file}@${m.start} < ${prevEnd}`)
+      byFile.set(m.file, m.end)
+    }
+  }
 
   console.log('test_run_mutation OK')
 })().catch((e) => { console.error(e); process.exit(1) })

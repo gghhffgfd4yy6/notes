@@ -310,6 +310,29 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       // 故不再额外做动态求值式语法校验（原 new Function 触发 Sonar S1523，
       // 改 spawn node --check 又会引入对 process.execPath 的依赖，本地跑不动）。
     })
+    await check('applyMutants 返回真正套用的候选 id（评审 #143-2：批级结果不得外溢）', () => {
+      // 同区间两个候选只有 1 个进沙箱，返回值必须只含它——调用方据此把批级 pass/killed 记到
+      // 正确候选头上，未套用者重新评估，否则 killed 会被记成 alive。
+      const fixture = path.join(projDir, 'fixture_overlap.js')
+      fs.writeFileSync(fixture, 'a < b', 'utf8')
+      const mutants = [
+        { file: 'fixture_overlap.js', start: 2, end: 3, original: '<', replacement: '<=', id: 101 },
+        { file: 'fixture_overlap.js', start: 2, end: 3, original: '<', replacement: '>', id: 102 }
+      ]
+      const applied = applyMutants(projDir, mutants)
+      assert.ok(Array.isArray(applied), 'applyMutants 应返回已套用候选 id 数组')
+      assert.strictEqual(applied.length, 1, `同区间只应套用 1 个候选，实际 ${JSON.stringify(applied)}`)
+      assert.ok(applied[0] === 101 || applied[0] === 102, '返回的 id 必须是入参候选之一')
+      // 全部互不重叠时，返回值应覆盖全部候选
+      const fixture2 = path.join(projDir, 'fixture_nooverlap.js')
+      fs.writeFileSync(fixture2, 'x && y && z', 'utf8')
+      const disjoint = [
+        { file: 'fixture_nooverlap.js', start: 2, end: 4, original: '&&', replacement: '||', id: 201 },
+        { file: 'fixture_nooverlap.js', start: 7, end: 9, original: '&&', replacement: '||', id: 202 }
+      ]
+      const applied2 = applyMutants(projDir, disjoint)
+      assert.deepStrictEqual([...applied2].sort((a, b) => a - b), [201, 202], '不重叠候选应全部套用')
+    })
   } finally {
     fs.rmSync(projDir, { recursive: true, force: true })
   }
