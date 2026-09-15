@@ -48,6 +48,7 @@ const SUITES = [
   { name: 'CI跳过清单对账', file: 'test_ci_skip_suites.js', desc: 'SKIP_SUITES ↔ test.yml 显式步骤双向一致 + 入口过滤/summary 行为' },
   { name: '注册表对账', file: 'test_suite_registry.js', desc: '根目录 test_*.js ↔ SUITES 双向一致（漏注册/幽灵条目/白名单陈旧）' },
   { name: 'Release tag 校验', file: 'test_tag_validator.js', desc: 'tag semver 正则与 release.yml 逐字同源断言' },
+  { name: '版本闸门', file: 'test_check_version.js', desc: 'check-version.js 三方一致性 + 补丁段必须 .0（qodo #143-4 回归，夹具驱动）' },
   // v3.172：集成测试走并行调度器（worker 独立缓存目录 + 失败片串行重跑）。
   // 需要完整串行验证时直接 node test_app.js（CI 即如此）
   { name: '集成测试', file: 'test_app_p.js', desc: 'App.run 完整主流程(并行调度,失败自动重跑)', integration: true },

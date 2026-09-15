@@ -70,11 +70,17 @@
 # test_ci_skip_suites.js 的 makeRunTestsSandbox 在 fs.mkdtempSync(os.tmpdir() + 固定前缀) 生成的
 # 临时目录下，用测试硬编码的文件名搭最小沙箱（桩 test_suites.js / scripts/check-deps.js / 套件），
 # 目录与文件名均为测试常量、无外部净输入，静态路径注入告警属误报。
+#
+# test_check_version.js 是 check-version.js 版本闸门的单元测试：
+# 用 fs.mkdtempSync(os.tmpdir() + 固定前缀) 建夹具目录，写入测试硬编码的
+# xbk_function_v3.js / CHANGELOG.md / package.json 夹具后调用纯函数 checkVersion(root)；
+# 目录前缀与文件内容全部是测试常量，无外部净输入，静态路径注入告警属误报。
 exclude_paths:
   - ".github/analyze-artifacts.js"
   - "scripts/check-mutation-ranges.js"
   - "scripts/install-hooks.js"
   - "test_ci_skip_suites.js"
+  - "test_check_version.js"
   - "run_mutation.js"
   - "test_storage.js"
   - "test_check_mutation_ranges.js"
