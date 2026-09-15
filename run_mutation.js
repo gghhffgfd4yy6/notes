@@ -202,15 +202,18 @@ function copyProject (dir, files) {
   //   - run_mutation.js 自身（test_filter.js / test_run_mutation*.js 等单元套件顶层 require 它）
   //   - package.json（版本一致性用例读取）
   //   - CHANGELOG.md（test_filter.js 的“文件头版本 ↔ CHANGELOG 最新”用例会 readFileSync 它）
+  //   - check-version.js（test_check_version.js 顶层 require 它）
   //   - scripts/ 与 qinglong/ 目录（部分测试依赖）
   // 此前只复制 test_filter.js 但运行 run_unit_tests.js，导致临时目录 MODULE_NOT_FOUND，
   // evaluate 恒返回 fail，行为断言无法建立（#15 根因）。
   // 注：漏拷 CHANGELOG.md 会使 test_filter.js 版本一致性用例 ENOENT → 同样令 evaluate 恒 fail，
-  // 故“测试会读取的项目根文件”须逐一纳入，切勿遗漏。
+  // 故“测试会读取的项目根文件”须逐一纳入，切勿遗漏（#143 补 check-version.js：漏拷会让
+  // test_check_version.js 在沙箱里 MODULE_NOT_FOUND，进而使 test_run_mutation_cli.js 的
+  // 「沙箱内单元测试应整体通过」断言失败）。
   const entries = fs.readdirSync(ROOT)
   const testFiles = entries.filter(f => /^test_.*\.js$/.test(f))
   const srcFiles = entries.filter(f => /^xbk_.*\.js$/.test(f))
-  const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md']
+  const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md', 'check-version.js']
   // 固定清单（extraTop + 调用方传入的 files + DEFAULT_FILES）属必选：缺失须响亮报错，不能静默 continue——
   // 漏拷文件会留下沙箱 MODULE_NOT_FOUND/ENOENT → evaluate 恒 fail 的不响亮回归（#120/#122 一类根因）。
   // DEFAULT_FILES 在此无条件纳入（D3）：main() 已不再 existsSync 预过滤，缺任一变异目标源文件时由本处响亮报错。

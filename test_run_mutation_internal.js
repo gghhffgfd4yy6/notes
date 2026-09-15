@@ -208,6 +208,9 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       assert.ok(fs.existsSync(path.join(projDir, 'xbk_utils.js')), 'xbk_utils.js 应复制')
       assert.ok(fs.existsSync(path.join(projDir, 'run_mutation.js')), 'run_mutation.js 应复制（多个单元套件顶层 require 它）')
       assert.ok(fs.existsSync(path.join(projDir, 'CHANGELOG.md')), 'CHANGELOG.md 应复制（test_filter.js 版本一致性用例读取它）')
+      // #143 回归：漏拷 check-version.js 会让 test_check_version.js 在沙箱里 MODULE_NOT_FOUND，
+      // 进而使 test_run_mutation_cli.js 的「沙箱内单元测试应整体通过」断言失败（沙箱整体红）
+      assert.ok(fs.existsSync(path.join(projDir, 'check-version.js')), 'check-version.js 应复制（test_check_version.js 顶层 require 它）')
       assert.ok(fs.existsSync(path.join(projDir, '.github/workflows/test.yml')), '.github/workflows/test.yml 应复制（test_ci_skip_suites.js 读取它与显式步骤对账）')
       const nmStat = fs.lstatSync(path.join(projDir, 'node_modules'))
       assert.ok(nmStat.isSymbolicLink(), 'node_modules 应为 symlink')
