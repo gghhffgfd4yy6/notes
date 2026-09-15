@@ -12,4 +12,6 @@ process.env.XBK_MUTATION_CHILD = '1'
 process.env.SKIP_SUITES = ''
 process.env.PERF_MS = '3000'
 
-require(require('path').join(__dirname, '..', 'run_unit_tests.js'))
+// 字面量 require：路径按模块解析规则相对本文件确定（scripts/ → 仓库根），
+// 既跨平台，也避开「非字面量 require / 动态拼接路径」两类静态误报（Codacy #140 告警项）。
+require('../run_unit_tests.js')

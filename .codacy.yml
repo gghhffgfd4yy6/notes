@@ -56,8 +56,25 @@
 # 建临时目录，写入测试硬编码的 package.json / CHANGELOG.md 夹具，执行 run: 块后读取产出的
 # release-notes.md；目录前缀、夹具文件名与内容全部是测试硬编码常量，无任何用户输入参与路径
 # 构造，静态路径注入告警属误报。
+#
+# .github/analyze-artifacts.js 是变异制品分析工具（仅 CI 运行，不进入生产运行时）：
+# walk() 用 fs.readdirSync(dir, { withFileTypes: true }) 的结果拼 path.join(dir, e.name)，
+# reportsRoot 由 path.resolve(__dirname, '..') 常量与「本地夹具核对」用的一次性 CLI 参数决定，
+# 无外部净输入参与路径构造，动态路径注入告警属误报。
+#
+# scripts/install-hooks.js 是 git hooks 安装/自检工具（仓库开发者脚本）：
+# fs.statSync / fs.existsSync / fs.chmodSync 的目标只由 HOOKS_DIR 常量（'.githooks'）与静态
+# HOOK_FILES 清单拼成，无外部净输入，动态路径注入告警属误报（SonarCloud 侧同类误报 S4036
+# 已由 sonar-project.properties 的 e1 条目登记）。
+#
+# test_ci_skip_suites.js 的 makeRunTestsSandbox 在 fs.mkdtempSync(os.tmpdir() + 固定前缀) 生成的
+# 临时目录下，用测试硬编码的文件名搭最小沙箱（桩 test_suites.js / scripts/check-deps.js / 套件），
+# 目录与文件名均为测试常量、无外部净输入，静态路径注入告警属误报。
 exclude_paths:
+  - ".github/analyze-artifacts.js"
   - "scripts/check-mutation-ranges.js"
+  - "scripts/install-hooks.js"
+  - "test_ci_skip_suites.js"
   - "run_mutation.js"
   - "test_storage.js"
   - "test_check_mutation_ranges.js"
