@@ -1406,7 +1406,9 @@ async function sendNotify (text, desp, params = {}) {
       // v3.273（审查 S8）：一言文本在入口 cleanSurrogates 之后拼接，其 JSON 里可能带转义孤立代理
       // （\ud800 类）→ 下游 serverNotify/pushDeerNotify 直接 encodeURIComponent 会抛 URIError，
       // 该通道每轮确定性失败。拼接后再清洗一次，与入口「推送前统一处理孤立代理」一致。
-      try { desp = cleanSurrogates(desp + '\n\n' + (await one())) } catch (e) { console.log('一言获取失败，跳过:', e && e.message ? e.message : String(e)) }
+      // v3.273（评审 CodeRabbit PR #145）：失败日志改走 safeErr——此前直接打印 e.message/String(e)，
+      // 会绕过本模块的密钥脱敏（redactSecrets），与「异常摘要经脱敏再落日志」口径不符。
+      try { desp = cleanSurrogates(desp + '\n\n' + (await one())) } catch (e) { console.log('一言获取失败，跳过:', safeErr(e)) }
     }
   }
   // 只启动已配置通道：未配置通道原本虽会立即 resolve，但每条消息仍会创建函数/Promise/对象。

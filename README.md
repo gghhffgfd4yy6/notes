@@ -4,18 +4,24 @@
 
 ## 安装与运行
 
+要求 Node.js `^22.22.2 || ^24.15.0 || >=26.0.0`（`re2` 原生模块的 `engines` 要求；`package.json` 的 `engines.node` 只写 `>=22.22.2`，青龙入口 `--check` 只校验主版本 ≥ 22。Node 23.x、24.0–24.14、25.x 不在 re2 支持范围内，安装或重建原生模块会失败）。
+
 ```bash
 npm install --ignore-scripts
 npm run hooks:install
 npm run rebuild --prefix node_modules/re2
-node -e "const RE2=require('re2'); if (!new RE2('^ok$').test('ok')) process.exit(1)"
+node -e 'const RE2=require("re2"); if (!(new RE2("^ok$")).test("ok")) process.exit(1)'
 cp push_config.local.js.example push_config.local.js
 npm start
 ```
 
-`npm run hooks:install` 会把 `core.hooksPath` 指向 `.githooks`（本地 `pre-commit` 快检 lint/版本/单测、`commit-msg` 校验提交信息）。因安装使用 `--ignore-scripts`（会跳过自动钩子注册），需在安装后显式执行一次；若你已配置过其它 `core.hooksPath`，该脚本不会覆盖。
+上面的 `node -e` 校验命令用单引号包裹：交互式 bash 会对双引号里的 `!new` 做历史展开（`bash: !new: event not found`）。
 
-`push_config.local.js` 含密钥，不能提交。可用环境变量覆盖配置。
+`npm run rebuild --prefix node_modules/re2` 走 node-gyp 源码构建，需要 python3 与 C/C++ 工具链；容器里缺工具链时改用 `npm rebuild re2`——它执行 re2 官方 install 脚本，优先使用带 SHA-256 校验的预编译包（与 CI 同路径），失败才回退源码构建。
+
+`npm run hooks:install` 会把 `core.hooksPath` 指向 `.githooks`：`pre-commit` 快检 lint / 版本闸门 / `npm run test:filter`，`commit-msg` 要求首行以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头且不超过 100 字符。npm 不会自动注册仓库钩子，需在安装后显式执行一次；若你已配置过其它 `core.hooksPath`，该脚本不会覆盖。钩子文件必须可执行：noexec 挂载或无执行位的检出会以非零码拒绝安装并提示。
+
+`push_config.local.js` 含密钥，已被 `.gitignore` 忽略。**通知通道**配置可用环境变量覆盖（见「配置」）；主配置（过滤、日报、通道健康、缓存目录等）不支持环境变量覆盖，需直接改 `xbk_function_v3.js`。
 
 ## 青龙
 
@@ -27,7 +33,7 @@ npm run rebuild --prefix node_modules/re2
 node qinglong/xbk_push.js
 ```
 
-启动前可只做环境诊断，不抓取也不推送：
+启动前可只做环境诊断，不抓取也不推送（会创建缓存目录）：
 
 ```bash
 node qinglong/xbk_push.js --check
@@ -39,11 +45,13 @@ node qinglong/xbk_push.js --check
 node qinglong/xbk_push.js --status
 ```
 
-默认读取 `xianbaoku_cache/`。如果部署时使用了自定义缓存目录，可通过**绝对路径**指定：
+`--status` 默认读取项目根目录下的 `xianbaoku_cache/`（与当前工作目录无关），四个状态文件都缺失时同样返回 0、只报「缺失」。若状态文件写在别处，可用**绝对路径**覆盖：
 
 ```bash
 XBK_CACHE_DIR=/path/to/cache node qinglong/xbk_push.js --status
 ```
+
+相对路径会被忽略。`XBK_CACHE_DIR` 只影响 `--status`；常驻/单轮运行的缓存目录由 `Config.cache.dir` 决定，且必须位于项目根内（绝对路径、`..` 或符号链接逃逸会被拒绝并回退默认目录）。
 
 `--status` 只读取缓存目录中的状态文件，不加载推送依赖、不抓取、不推送、不修复或写入任何文件。
 
@@ -53,23 +61,61 @@ XBK_CACHE_DIR=/path/to/cache node qinglong/xbk_push.js --status
 node qinglong/xbk_push.js --dry-run
 ```
 
-入口为常驻模式；只运行一个实例。`XBK_INTERVAL_MS` 可设置轮询间隔。只需执行一次时用 `npm start`。
+青龙入口下同样要求 `got`/`re2` 就绪；dry-run 仍会写 `run.log` 与过滤诊断日志，只是不写成功缓存、不发通知。主模块也认 `XBK_DRY_RUN=1`，可绕过青龙入口直接生效。
 
-可重试错误（网络/超时/上游 5xx/限流等）不会退出常驻，按指数退避持续重试，默认 30 分钟封顶（`XBK_RETRY_BACKOFF_CAP_MS` 毫秒可调），恢复后自动回到正常轮询；仅不可恢复错误（如配置错误、认证失败）才会停止。
+入口为常驻模式；只运行一个实例。`XBK_INTERVAL_MS` 可设置轮询间隔（毫秒，默认 10000，非法值回退 10000，`0` 表示不等待）。只需执行一次时用 `npm start`。
 
-`re2` 缺失时入口会退出，避免过滤规则失效后继续推送。
+可重试错误（网络/超时/上游 5xx/限流等）不会退出常驻，按指数退避持续重试，默认 30 分钟封顶（`XBK_RETRY_BACKOFF_CAP_MS` 毫秒可调，默认 1800000，小于 1 视为无效并回退默认），恢复后自动回到正常轮询；每次重试的实际等待 = 退避时间 + 轮询间隔。仅不可恢复错误（如配置错误、认证失败）才会停止。该语义只属于常驻入口；单轮 `npm start` 失败即以非零退出码结束。
+
+青龙常驻入口在 `got`/`re2` 缺失或原生模块不可加载时会直接退出并提示部署命令，设置 `XBK_AUTO_INSTALL_DEPS=1` 可改为运行期自动安装与重建。单轮入口 `npm start` 缺 `got` 会直接崩溃，缺 `re2` 时**不退出**——用户配置正则会被跳过（不回退 V8），仅每天最多告警一次。
+
+### 进阶环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `XBK_INTERVAL_MS` | 常驻轮询间隔（毫秒，默认 10000） |
+| `XBK_RETRY_BACKOFF_CAP_MS` | 可重试失败退避上限（毫秒，默认 1800000） |
+| `XBK_CACHE_DIR` | 仅 `--status`：状态文件所在目录（绝对路径） |
+| `XBK_DRY_RUN=1` | 等价 `--dry-run` |
+| `XBK_AUTO_INSTALL_DEPS=1` | 仅青龙入口：依赖缺失时自动安装并重建 re2 |
+| `XBK_PROFILE` | `1` 输出每轮耗时剖面，`2` 追加预热/预处理明细，`3` 再追加启动与运行检查点 |
+| `XBK_DNS_FAMILY` | `4`/`6` 强制 DNS 预热与解析走 IPv4/IPv6，默认 auto |
+
+`--check` / `--status` / `--dry-run` 之外的参数会被静默忽略。
 
 ## 配置
 
-主配置在 `xbk_function_v3.js` 顶部；本地密钥在 `push_config.local.js`。支持 Push+、Server酱、Bark、企业微信、WxPusher、息知、PushDeer、Telegram 等通道。
+主配置在 `xbk_function_v3.js` 顶部；本地密钥在 `push_config.local.js`。支持 Push+（PushPlus）、Server酱、Bark、PushMe、企业微信机器人、WxPusher、息知、PushDeer、Telegram 共 9 个通道。
 
 常用通知环境变量：`PUSH_PLUS_TOKEN`、`PUSH_KEY`、`BARK_PUSH`、`QYWX_KEY`、`WX_PUSHER_APP_TOKEN`、`WX_PUSHER_TOPIC_IDS`、`WX_XIZHI_KEY`、`DEER_KEY`、`PUSHME_KEY`、`TG_BOT_TOKEN`、`TG_USER_ID`。
 
+另有 `PUSH_PLUS_USER`、`WX_PUSHER_CHANNELS`（多应用分流）、`QYWX_ORIGIN`、`DEER_URL`、`PUSHME_URL`、`TG_API_HOST`、`HITOKOTO`，以及 Bark 扩展参数 `BARK_ARCHIVE`/`BARK_GROUP`/`BARK_SOUND`/`BARK_ICON`/`BARK_LEVEL`/`BARK_URL`（配置键原名 `WX_pusher_appToken`/`WX_pusher_topicIds`/`WX_pusher_channels` 同样可用）。同名环境变量存在但为空或纯空白时**不会**覆盖本地配置。
+
+### 配置项速查
+
+| 配置段 | 字段（默认值） | 说明 |
+|---|---|---|
+| `domain` | `'https://new.ixbk.net'` | 接口域名，`api.pushUrl` 由其拼出 |
+| `api` | `timeout: 5000`、`retry: 2` | 接口超时与重试次数 |
+| `filter` | 全部 `''`，`pingbitime: '5'` | 过滤规则；变更会失效「过滤写入」缓存并重评 |
+| `keyword` | `zkt_gjc: ''` | 只看它关键词 |
+| `timing` | `pushInterval: 0`、`finalWait: 0` | 推送间隔与收尾等待（毫秒） |
+| `push` | `mode: 'parallel'`、`parallelLimit: 10`、`titleMax: 100`、`contentMax: 3000`、`maxPerRun: 100` | 推送模式、并发、截断长度与单轮上限 |
+| `template` | `title: '【{分类名}】{标题}'`、`content: '{Markdown内容}'` | 推送模板 |
+| `cache` | `maxSize: 10000`、`dir: 'xianbaoku_cache'` | 去重缓存上限与目录（必须位于项目根内） |
+| `alert` | `enabled: true`、`intervalMs: 3600000` | 接口异常告警与限频 |
+| `report` | `enabled: true` | 运行日报开关 |
+| `channelHealth` | `enabled: true`、`consecutiveFailures: 3`、`intervalMs: 3600000` | 通道健康监测与告警限频 |
+| `diagnostics.filterLog` | `enabled: true`、`maxDetailsPerRun: 100`、`includePassed: false` | 过滤诊断日志 |
+| `storage` | `minFreeBytes: 52428800`（50 MiB） | 磁盘余量告警阈值（仅告警，不阻断推送） |
+
+模板占位符：`{分类名}` `{分类ID}` `{标题}` `{链接}` `{日期}` `{时间}` `{楼主}` `{类目}` `{内容}` `{价格}` `{商城}` `{品牌}` `{图片}` `{Html内容}` `{Markdown内容}`。
+
 ### 运行日报与通道健康
 
-默认日报会在跨天后的下一轮发送，包含运行轮数、获取、去重、过滤、待推送、成功和失败统计。`Config.report.enabled = false` 可关闭日报。
+默认日报会在跨天后的下一轮发送，包含运行轮数、获取、去重、过滤、待推送、成功和失败统计；仅当上一日累计计数非 0 时才发送，「待推送」只在被 `push.maxPerRun` 截断时出现。`Config.report.enabled = false` 可关闭日报。状态文件 `report.state` 损坏或读取失败时会跳过本轮更新以保留原文件。
 
-`Config.channelHealth` 默认开启：某个已配置通道连续失败 3 次时发一次异常提醒，恢复后发一次恢复提醒；同一通道异常默认限频 1 小时。健康状态写入 `channel-health.state`；告警本身不计入健康统计，且健康监测/告警失败绝不影响线报推送、成功缓存或重试语义。
+`Config.channelHealth` 默认开启：某个已配置通道连续失败 3 次（按运行轮计）时发一次异常提醒，恢复后发一次恢复提醒；同一通道异常默认限频 1 小时，恢复提醒不受限频约束。健康状态写入 `channel-health.state`；告警本身不计入健康统计，且健康监测/告警失败绝不影响线报推送、成功缓存或重试语义。
 
 ```js
 channelHealth: {
@@ -79,7 +125,7 @@ channelHealth: {
 }
 ```
 
-常用过滤配置：
+常用过滤配置示例（默认全部为空串，`pingbitime` 默认 `'5'`；v3.176 起不再内置个人规则，需自行配置）：
 
 ```js
 filter: {
@@ -94,7 +140,7 @@ filter: {
 
 默认会在缓存目录（默认 `xianbaoku_cache/`）追加 `filter-diagnostics.ndjson`。它是“一行一条 JSON”的多轮诊断日志：每次运行写一条 `type: "run"` 汇总，以及被过滤或被强制展现保护的条目明细，可用于查询每条为何屏蔽、命中了哪项配置及哪些后续规则被跳过。
 
-默认最多记录每轮 100 条明细，并在日志超过 1 MiB 时自动保留最新尾部。可在 `xbk_function_v3.js` 的 `diagnostics.filterLog` 中调整：
+默认最多记录每轮 100 条明细（配置上限 1000），并在文件超过 1 MiB 时自动保留最新尾部（约 512 KiB，按换行对齐）；`run.log` 使用同一截尾规则。可在 `xbk_function_v3.js` 的 `diagnostics.filterLog` 中调整：
 
 ```js
 diagnostics: {
@@ -108,13 +154,21 @@ diagnostics: {
 
 ## 测试
 
+`npm test` 顺序执行全部 42 个套件（30 个单元 + 10 个集成 + 2 个变异行段元校验），前置检查 `got` 与 `re2` 就绪，缺任一即退出；集成套件多数已 mock，个别仍可能受运行环境/网络影响。`npm run test:unit` 只跑 30 个单元套件。
+
 ```bash
+npm run check                 # 总门禁：lint → 版本三方一致 → 变异行段校验 → npm test
 npm test
+npm run test:unit
 npm run test:filter
-npm run test:app
+npm run test:app              # 集成测试并行调度（默认并发 8，失败片自动串行重跑）
+npm run test:app:serial       # 完整串行集成测试（并行失败兜底/定位问题时用）
 npm run test:notify
-npm run test:mutation
+npm run test:mutation         # Stryker 变异测试（需 devDependencies，耗时长）
+npm run test:mutation-ranges  # 单独校验 mutation.yml 行段覆盖
 ```
+
+定位单个集成用例：`node test_app.js --only=<名称子串>`。
 
 ## 维护
 

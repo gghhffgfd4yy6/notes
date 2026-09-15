@@ -27,13 +27,17 @@
 - [ ] 是否修改**配置兼容性**（配置项增删 / 默认值 / 语义变化）？如果是，说明迁移方式
 - [ ] 是否涉及**网络请求 / 正则 / 输入清洗**（ReDoS / XSS 风险区）？如果是，说明防护措施
 - [ ] 是否影响**常驻模式**（循环调度 / 失败策略 / DNS/TLS 预热 / 延迟加载）？
+- [ ] 是否改动**大文件行段**（`xbk_function_v3.js` / `xbk_sendNotify_slim.js`）？如果是，已同步重拆 `mutation.yml` 行段并运行 `node scripts/check-mutation-ranges.js`
+- [ ] 是否改动 `test.yml` 显式步骤、`test_suites.js` 或 `mutation.yml` matrix（`name` / `src` / `mutate`）？如果是，已同步 `SKIP_SUITES`、套件注册与 `scripts/mutation-report.js` 的段名
+- [ ] 是否影响**供应链 / 安全扫描**（依赖变更、工作流改动、CodeQL / Scorecard / Dependency Review）？
 
 ## 测试
 
-- [ ] 单元测试通过
+- [ ] 单元测试通过（`npm run test:unit`）
 - [ ] 集成测试通过（`npm test`，并行调度器）
-- [ ] 新增了针对本改动的测试
+- [ ] 新增了针对本改动的测试，且已注册到 `test_suites.js`
 - [ ] 涉及性能/安全：补充了变异测试或故障注入验证
+- [ ] `npm run check` 通过（lint + 版本三方一致 + 变异行段 + 全量测试）
 
 ## 安全检查
 
