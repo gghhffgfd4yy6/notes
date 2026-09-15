@@ -165,6 +165,26 @@ check('mdLinksToPlain: 多个链接', () => {
   assert.ok(r.includes('a (http://a.com)'), '应包含第一个链接')
   assert.ok(r.includes('b (http://b.com)'), '应包含第二个链接')
 })
+// v3.273（F6）：目标段闭合点按 Markdown 合法形态解析——'(' 后首字符 '<' 取 '>)'，否则 '(' ')' 配平扫描
+check('mdLinksToPlain: URL 内含 ")" 且 text===url 去重后完整保留（配平到最外层 ")"）', () => {
+  assert.strictEqual(
+    mdLinksToPlain('[https://x/a(b)c.jpg](https://x/a(b)c.jpg)'),
+    'https://x/a(b)c.jpg',
+    '若回退为首个 ")" 截断，会残留 " (https://x/a(b)c.jpg)" 重复串'
+  )
+})
+check('mdLinksToPlain: URL 内含 ")" 且 <...> 包裹 + text===url 去重后完整保留', () => {
+  assert.strictEqual(
+    mdLinksToPlain('[<https://x/a(b)c.jpg>](<https://x/a(b)c.jpg>)'),
+    '<https://x/a(b)c.jpg>',
+    '角括号形态同样要走配平扫描，不能把 URL 内的 ")" 当闭合点'
+  )
+})
+check('mdLinksToPlain: 简单形态不回归（配平扫描不改变基本输出）', () => {
+  assert.strictEqual(mdLinksToPlain('[Google](https://google.com)'), 'Google (https://google.com)')
+  assert.strictEqual(mdLinksToPlain('[t](https://x/a(b)c.jpg)'), 't (https://x/a(b)c.jpg)')
+  assert.strictEqual(mdLinksToPlain('[t](<https://x/y.jpg>)'), 't (<https://x/y.jpg>)')
+})
 
 // ===== mdImagesToPlain =====
 check('mdImagesToPlain: 正常图片转 alt', () => {
@@ -185,6 +205,38 @@ check('mdImagesToPlain: 未闭合 ] 原样返回', () => {
 check('mdImagesToPlain: 空 url 原样保留', () => {
   assert.strictEqual(mdImagesToPlain('![logo]()'), '![logo]()')
 })
+// v3.273（F6）：mdImagesToPlain 与 mdLinksToPlain 同口径（'<url>' / 配平扫描），URL 内含 ")" 不再残留 '.jpg)'
+check('mdImagesToPlain: URL 内含 ")" 时整图剥成 alt，不残留 ".jpg)"', () => {
+  assert.strictEqual(
+    mdImagesToPlain('![t](https://x/a(b)c.jpg)'),
+    't',
+    '若回退为首个 ")" 截断，会得到 "tc.jpg)" 垃圾串'
+  )
+})
+check('mdImagesToPlain: 空 alt + URL 内含 ")" 用 emptyAlt，不残留 ".jpg)"', () => {
+  assert.strictEqual(
+    mdImagesToPlain('![](https://x/a(b)c.jpg)', '(图片)'),
+    '(图片)',
+    '若回退为首个 ")" 截断，会得到 "(图片)c.jpg)"'
+  )
+})
+check('mdImagesToPlain: <...> 包裹 + URL 内含 ")" 正确闭合', () => {
+  assert.strictEqual(
+    mdImagesToPlain('![t](<https://x/a(b)c.jpg>)'),
+    't',
+    '若回退为首个 ")" 截断，会残留 "c.jpg>)"'
+  )
+})
+check('mdImagesToPlain: URL 嵌套括号配平到最外层 ")"', () => {
+  assert.strictEqual(mdImagesToPlain('![t](https://x/a(b(c)d)e.jpg)'), 't')
+})
+check('mdImagesToPlain: 首图 URL 带 ")" 不吞掉后续图片', () => {
+  assert.strictEqual(mdImagesToPlain('![a](https://x/a(b).jpg) ![b](https://y/d.png)'), 'a b')
+})
+check('mdImagesToPlain: 简单形态与 <...> 无括号形态不回归', () => {
+  assert.strictEqual(mdImagesToPlain('![logo](https://example.com/logo.png)'), 'logo')
+  assert.strictEqual(mdImagesToPlain('![t](<https://x/y.jpg>)'), 't')
+})
 
 // ===== mdToPlain =====
 check('mdToPlain: 粗体去除', () => {
@@ -204,6 +256,13 @@ check('mdToPlain: 链接转纯文本', () => {
 })
 check('mdToPlain: 图片转 alt', () => {
   assert.strictEqual(mdToPlain('![logo](https://example.com/logo.png)'), 'logo')
+})
+// v3.273（F6）：配平扫描贯穿出口 mdToPlain（图片先剥、链接按配平闭合）
+check('mdToPlain: URL 内含 ")" 的图片端到端剥成 alt，无 ".jpg)" 残留', () => {
+  assert.strictEqual(mdToPlain('![t](https://x/a(b)c.jpg)'), 't')
+})
+check('mdToPlain: URL 内含 ")" 的原文链接端到端只保留一次', () => {
+  assert.strictEqual(mdToPlain('[https://x/a(b)c.jpg](https://x/a(b)c.jpg)'), 'https://x/a(b)c.jpg')
 })
 check('mdToPlain: HTML 标签被剥离', () => {
   assert.strictEqual(mdToPlain('<b>bold</b>'), 'bold')

@@ -159,5 +159,85 @@ const { runLoop, sleep } = require('./xbk_loop')
   assert.ok(onIntervalStarted, 'onInterval 应确实被执行过（非预先 abort 路径）')
   assert.ok(abortErrors >= 1, `onInterval 运行期间 abort 应触发 ABORT_ERR，实际 ${abortErrors} 次`)
 
+  // ===== runLoop：未传 onError 时单轮异常必须留下默认诊断日志（XL-04）=====
+  // 生产改动 xbk_loop.js:71-73：默认 onError 由 `() => {}` 改为打印
+  //   "常驻循环单轮失败（调用方未提供 onError）: <message>"
+  // 捕获方式：同步打桩 process.stderr.write（console.error 持有同一 stderr 对象，
+  // 每次调用动态取 .write，因此打桩后写入会同步进入数组，不依赖 pipe 的异步刷新）。
+  const captureStderr = async fn => {
+    const chunks = []
+    const originalWrite = process.stderr.write
+    process.stderr.write = function (chunk) { chunks.push(String(chunk)); return true }
+    try { await fn() } finally { process.stderr.write = originalWrite }
+    return chunks.join('')
+  }
+  // 默认诊断行统一由「调用方未提供 on?Error」标记识别（onError 与 onIntervalError 各有独立默认处理器）
+  const defaultLogLines = text => text.split('\n').filter(line => line.includes('调用方未提供 on'))
+
+  const c10 = new AbortController()
+  let runs10 = 0
+  const stderr10 = await captureStderr(async () => {
+    await runLoop(async () => {
+      runs10 += 1
+      if (runs10 === 1) throw new Error('no-onError-probe')
+      c10.abort()
+    }, { intervalMs: 0, signal: c10.signal })
+  })
+  assert.strictEqual(runs10, 2, '默认 onError 记录日志后循环应继续到下一轮')
+  assert.deepStrictEqual(defaultLogLines(stderr10), ['常驻循环单轮失败（调用方未提供 onError）: no-onError-probe'],
+    '未传 onError 时单轮异常必须留下默认诊断日志（回退成空实现会静默吞掉）')
+
+  // 抛出非 Error 值：默认处理器不得打印 undefined，应回落到 String(error)
+  const c11 = new AbortController()
+  let runs11 = 0
+  const stderr11 = await captureStderr(async () => {
+    await runLoop(async () => {
+      runs11 += 1
+      if (runs11 === 1) throw 'plain-string-probe' // eslint-disable-line no-throw-literal -- 故意抛非 Error 值验证回落分支
+      c11.abort()
+    }, { intervalMs: 0, signal: c11.signal })
+  })
+  assert.deepStrictEqual(defaultLogLines(stderr11), ['常驻循环单轮失败（调用方未提供 onError）: plain-string-probe'],
+    '非 Error 抛值应回落 String(error)，不能打印 undefined')
+
+  // 传了 onError：调用调用方处理器，且不得打印默认诊断行
+  const c12 = new AbortController()
+  let runs12 = 0
+  const customOnErrorSeen = []
+  const stderr12 = await captureStderr(async () => {
+    await runLoop(async () => {
+      runs12 += 1
+      if (runs12 === 1) throw new Error('custom-onError-probe')
+      c12.abort()
+    }, {
+      intervalMs: 0,
+      signal: c12.signal,
+      onError: async error => { customOnErrorSeen.push(error.message) }
+    })
+  })
+  assert.deepStrictEqual(customOnErrorSeen, ['custom-onError-probe'], '传了 onError 应调用调用方的处理器')
+  assert.strictEqual(defaultLogLines(stderr12).length, 0, '传了 onError 时不得打印默认诊断行')
+
+  // 边界：未传 onIntervalError 时刷新失败由**独立**默认处理器留日志（不再回落到 onError——
+  // XL-05 要求解耦；且 onError 默认文案是「单轮失败」，用在预热失败上属错误归因）
+  const c13 = new AbortController()
+  let runs13 = 0
+  const stderr13 = await captureStderr(async () => {
+    await runLoop(async () => {
+      runs13 += 1
+      if (runs13 === 2) c13.abort()
+    }, {
+      intervalMs: 0,
+      refreshEvery: 1,
+      signal: c13.signal,
+      onInterval: async () => { throw new Error('refresh-default-probe') }
+    })
+  })
+  assert.strictEqual(runs13, 2, '默认 onIntervalError 记录日志后循环仍应继续')
+  assert.deepStrictEqual(defaultLogLines(stderr13), ['常驻循环性能预热失败（调用方未提供 onIntervalError）: refresh-default-probe'],
+    '未传 onIntervalError 时刷新失败应留下独立来源标注的诊断日志，不得误标为「单轮失败」')
+
+  console.log('✅ 常驻循环工具：未传 onError 时单轮异常留默认诊断日志，传了则不打印且仍调用调用方处理器；刷新失败走 onIntervalError 独立默认处理器（不与业务失败混淆）')
+
   console.log('test_loop_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })

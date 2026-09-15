@@ -44,6 +44,46 @@ const {
   assert.strictEqual(writeAtomic(nested, 'nested-ok'), true, '嵌套路径应自动创建父目录')
   assert.strictEqual(fs.readFileSync(nested, 'utf8'), 'nested-ok')
 
+  // ===== STG-03：空串路径必须显式拒绝（旧实现判为「ENOENT=缺失=安全」）=====
+  // 本机实测：lstatSync('') 抛 ENOENT，旧实现因此返回 true；空 filePath 会让 writeAtomic 在
+  // 进程 CWD 先落一个含 payload 的唯一临时文件（随后 renameSync(tmp,'') 才失败）。
+  assert.strictEqual(isRegularOrMissing(''), false, '空串路径应返回 false（非法路径，不是「缺失=安全」）')
+
+  // 观察窗：捕获告警/错误输出，并记录底层写动作——「拒绝写入」必须一次写都不发起。
+  const watchWrites = (fn) => {
+    const warns = []
+    const errors = []
+    const writes = []
+    const origWarn = console.warn
+    const origError = console.error
+    const origWrite = fs.writeFileSync
+    const origRename = fs.renameSync
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    console.error = (...args) => { errors.push(args.join(' ')) }
+    fs.writeFileSync = (...args) => { writes.push(args[0]); return origWrite.apply(fs, args) }
+    fs.renameSync = (...args) => { writes.push(args[1]); return origRename.apply(fs, args) }
+    let ret
+    try { ret = fn() } finally {
+      console.warn = origWarn
+      console.error = origError
+      fs.writeFileSync = origWrite
+      fs.renameSync = origRename
+    }
+    return { ret, warns, errors, writes }
+  }
+
+  const emptyAtomic = watchWrites(() => writeAtomic('', 'payload'))
+  assert.strictEqual(emptyAtomic.ret, false, 'writeAtomic(\'\') 应返回 false')
+  assert.ok(emptyAtomic.warns.some((w) => w.includes('为空串')), 'writeAtomic(\'\') 应告警空串路径')
+  assert.ok(emptyAtomic.errors.some((e) => e.includes('拒绝写入非普通文件')), 'writeAtomic(\'\') 应按「拒绝写入」报错（而非走到写入失败）')
+  assert.deepStrictEqual(emptyAtomic.writes, [], 'writeAtomic(\'\') 拒绝时不得发起任何写/重命名')
+
+  const emptyAbsent = watchWrites(() => writeAtomicIfAbsent('', 'payload'))
+  assert.strictEqual(emptyAbsent.ret, false, 'writeAtomicIfAbsent(\'\') 应返回 false')
+  assert.ok(emptyAbsent.warns.some((w) => w.includes('为空串')), 'writeAtomicIfAbsent(\'\') 应告警空串路径')
+  assert.ok(emptyAbsent.errors.some((e) => e.includes('拒绝写入非普通文件')), 'writeAtomicIfAbsent(\'\') 应按「拒绝写入」报错')
+  assert.deepStrictEqual(emptyAbsent.writes, [], 'writeAtomicIfAbsent(\'\') 拒绝时不得发起任何写')
+
   // ===== writeAtomicIfAbsent =====
   const a1 = make('absent1.txt')
   assert.strictEqual(writeAtomicIfAbsent(a1, 'first'), true, '文件不存在时应写入并返回 true')
@@ -97,6 +137,16 @@ const {
   assert.strictEqual(readSafeText(okFile), 'safe-content', 'ok 时应返回文本')
   assert.strictEqual(readSafeText(make('missing2.txt')), null, 'missing 时应返回 null')
   assert.strictEqual(readSafeText(dirPath), null, 'unsafe 时应返回 null')
+
+  // ===== STG-05：readSafeText 必须把 maxBytes 透传给 readSafeTextResult =====
+  // 旧实现 readSafeText(filePath) 恒不传第 2 参 → 上限被静默忽略，超限文件仍整读入内存。
+  assert.strictEqual(readSafeText(bigFile, 50), null, 'readSafeText 带 maxBytes 时超限应返回 null（tooLarge 按 null 处理）')
+  assert.strictEqual(readSafeText(bigFile, 99), null, 'maxBytes 差 1 字节仍应判超限（比 stat.size 小即 tooLarge）')
+  // 正向对照：带 maxBytes 且未超限仍须返回全文，否则上面的 null 无法区分 tooLarge 与「带参读取整体坏掉」
+  assert.strictEqual(readSafeText(okFile, 1024), 'safe-content', '未超限时带 maxBytes 应正常返回文本')
+  // 不传 / 传非正数 maxBytes 时保持旧行为「不设上限」，不得引入默认上限
+  assert.strictEqual(readSafeText(bigFile), 'x'.repeat(100), '不传 maxBytes 时应无上限，返回全文')
+  assert.strictEqual(readSafeText(bigFile, 0), 'x'.repeat(100), 'maxBytes=0 应视为不设限，返回全文')
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
   try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) {}

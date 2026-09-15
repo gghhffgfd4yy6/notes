@@ -283,6 +283,111 @@ function error (message, code) {
     failures: [{ failureKind: 'permanent', failureReason: 'EXPLICIT_X', message: 'm' }]
   }).kind, 'permanent')
 
+  // ============ 补测：失败摘要递归防护（自引用 / 深度上限 / 兄弟重复）+ failureInfo 脱敏 ============
+  const summarizeError = require('./xbk_failure_policy').summarizeError
+  const TRUNCATED_FAILURE_MESSAGE = '[嵌套失败结构过深或自引用，已截断]'
+
+  // [自引用·常规路径] 本模块契约“不抛异常”：failures 指向自身必须截断为标记，而不是无限递归栈溢出。
+  // 反例（改动前）：summarizeError({message, failures:[self]}) 抛 RangeError: Maximum call stack size exceeded。
+  const selfRefError = { message: 'self', code: 'HTTP_500' }
+  selfRefError.failures = [selfRefError]
+  let selfRefSummary
+  assert.doesNotThrow(() => { selfRefSummary = summarizeError(selfRefError) }, '自引用失败结构不得抛 RangeError')
+  assert.strictEqual(selfRefSummary.failures.length, 1)
+  assert.strictEqual(selfRefSummary.failures[0].message, TRUNCATED_FAILURE_MESSAGE,
+    '自引用子项应截断为标记而非继续递归')
+  assert.strictEqual(Array.isArray(selfRefSummary.failures[0].failures), false, '截断标记不应再带子失败')
+  // 截断标记只落进 UNKNOWN → 可重试，绝不因“结构异常”误判永久（宁可重复，不可丢失）
+  assert.doesNotThrow(() => classifyFailure(selfRefError), 'classifyFailure 不得因自引用结构抛栈溢出')
+  assert.strictEqual(classifyFailure(selfRefError).kind, 'retryable', '自引用截断后应保守判为可重试')
+
+  // [深度上限] MAX_FAILURE_DEPTH=5：第 1..5 层完整展开，第 6 层截断。
+  // 反例（改动前无上限）：7 节点深链被完整保留，第 5 层的子节点仍是原始对象而非截断标记。
+  const deepChainNodes = []
+  for (let i = 0; i < 7; i++) deepChainNodes.push({ message: `L${i}` })
+  for (let i = 0; i < 6; i++) deepChainNodes[i].failures = [deepChainNodes[i + 1]]
+  const deepSummary = summarizeError(deepChainNodes[0])
+  assert.strictEqual(deepSummary.message, 'L0')
+  let deepCursor = deepSummary
+  for (let i = 1; i <= 5; i++) {
+    assert(deepCursor.failures && deepCursor.failures.length === 1, `第 ${i} 层应有唯一子失败`)
+    deepCursor = deepCursor.failures[0]
+    assert(deepCursor, `第 ${i} 层应存在：MAX_FAILURE_DEPTH=5 允许展开到第 5 层`)
+    assert.strictEqual(deepCursor.message, `L${i}`, `第 ${i} 层不应被截断`)
+  }
+  assert.strictEqual(deepCursor.failures[0].message, TRUNCATED_FAILURE_MESSAGE,
+    '第 6 层超过 MAX_FAILURE_DEPTH=5 应截断为标记')
+
+  // [兄弟重复不是环] 祖先集合按路径复制：同一子对象作为兄弟重复出现时必须完整展开。
+  // 用“自带子失败的共享分支”而非纯叶子——只有会进入 failures 分支的节点才会被加入祖先集合，
+  // 任何共享可变集合的实现都会让第二处误判为自引用并截断（纯叶子对象触发不到该缺陷）。
+  const sharedBranch = { message: 'branch', failures: [{ message: 'leaf' }] }
+  const siblingSummary = summarizeError({ message: 'root', failures: [sharedBranch, sharedBranch] })
+  assert.strictEqual(siblingSummary.failures.length, 2)
+  assert.deepStrictEqual(
+    siblingSummary.failures.map(f => f.failures && f.failures[0] && f.failures[0].message),
+    ['leaf', 'leaf'],
+    '同一带子失败的对象重复作为兄弟出现不得被判为自引用'
+  )
+  const nestedSiblingSummary = summarizeError({
+    message: 'root',
+    failures: [{ message: 'p1', failures: [sharedBranch] }, { message: 'p2', failures: [sharedBranch] }]
+  })
+  assert.deepStrictEqual(
+    nestedSiblingSummary.failures.map(f => f.failures[0].failures[0].message),
+    ['leaf', 'leaf'],
+    '不同父路径下的同一子对象也应完整展开'
+  )
+
+  // [深度上限·failureInfo 路径] failureInfo 内的失败链与常规路径同口径：
+  // 反例（改动前是整对象浅拷贝）：深链原样带出，不截断。
+  const fiDeepSummary = summarizeError({ failureInfo: deepChainNodes[0] })
+  assert.strictEqual(fiDeepSummary.failures.length, 1)
+  let fiDeepCursor = fiDeepSummary
+  for (let i = 1; i <= 5; i++) {
+    assert(fiDeepCursor.failures && fiDeepCursor.failures.length === 1, `failureInfo 第 ${i} 层应有唯一子失败`)
+    fiDeepCursor = fiDeepCursor.failures[0]
+    assert(fiDeepCursor, `failureInfo 第 ${i} 层应完整展开`)
+  }
+  assert.strictEqual(fiDeepCursor.failures[0].message, TRUNCATED_FAILURE_MESSAGE,
+    'failureInfo 内第 6 层应截断为标记')
+
+  // [reason 细分] 全部子项可重试并非“原因混合”：kind 仍 retryable，reason 改为 ALL_CHANNELS_RETRYABLE。
+  // 反例（改动前）：此分支恒返回 MIXED_CHANNEL_FAILURES，诊断失真。
+  const allRetryable = classifyFailure({
+    message: 'agg',
+    failures: [{ code: 'ETIMEDOUT', message: 'a' }, { code: 'ECONNRESET', message: 'b' }]
+  })
+  assert.strictEqual(allRetryable.kind, 'retryable')
+  assert.strictEqual(allRetryable.reason, 'ALL_CHANNELS_RETRYABLE', '全部子项可重试时不应标成原因混合')
+  // 只要存在永久子项就必须仍是 MIXED：挡住把上面“全可重试”判定泛化成“任一可重试”的错误实现。
+  const mixedAggregate = classifyFailure({
+    message: 'agg',
+    failures: [{ code: 'HTTP_401', message: 'a' }, { code: 'ETIMEDOUT', message: 'b' }]
+  })
+  assert.strictEqual(mixedAggregate.kind, 'retryable')
+  assert.strictEqual(mixedAggregate.reason, 'MIXED_CHANNEL_FAILURES', '存在永久子项时仍为原因混合')
+
+  // [failureInfo 脱敏] failureInfo 不再是原样浅拷贝，字符串字段与常规路径同口径清洗。
+  // 反例（改动前）：{...failureInfo} 让 message 原样带出 token=SECRET123。
+  assert.strictEqual(summarizeError({ failureInfo: { message: 'token=SECRET123' } }).message, 'token=***',
+    'failureInfo.message 必须脱敏，不得原样带出凭据')
+  assert.strictEqual(summarizeError({ failureInfo: { detail: 'token=SECRET123' } }).detail, 'token=***',
+    'failureInfo 的任意字符串字段都应脱敏')
+  assert.strictEqual(summarizeError({ failureInfo: { message: 'l1\nl2' } }).message, 'l1 l2',
+    'failureInfo.message 应与常规路径一致折叠换行')
+  // 非字符串字段原样保留，脱敏不改变结构语义
+  const fiStructured = summarizeError({ failureInfo: { code: 'HTTP_500', statusCode: 500, message: 'ok' } })
+  assert.strictEqual(fiStructured.code, 'HTTP_500')
+  assert.strictEqual(fiStructured.statusCode, 500)
+  // failureInfo 自引用：不得抛异常，子项截断为标记（改动前浅拷贝保留了自引用结构）
+  const fiSelfRef = {}
+  fiSelfRef.failures = [fiSelfRef]
+  let fiSelfRefSummary
+  assert.doesNotThrow(() => { fiSelfRefSummary = summarizeError({ failureInfo: fiSelfRef }) }, 'failureInfo 自引用不得抛异常')
+  assert.strictEqual(fiSelfRefSummary.failures[0].message, TRUNCATED_FAILURE_MESSAGE,
+    'failureInfo 内的自引用应截断为标记')
+
   console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分成功不熔断、成功后恢复')
 })().catch(error => {
   console.error(error)
