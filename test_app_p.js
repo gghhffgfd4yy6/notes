@@ -17,7 +17,7 @@ const fs = require('fs')
 const path = require('path')
 
 const CONCURRENCY = (() => {
-  const c = parseInt(process.env.CONCURRENCY || '8', 10)
+  const c = Number.parseInt(process.env.CONCURRENCY || '8', 10)
   return Number.isInteger(c) && c > 0 ? c : 8
 })()
 const SRC = path.join(__dirname, 'test_app.js')
