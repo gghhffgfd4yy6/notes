@@ -467,6 +467,51 @@ function error (message, code) {
   assert.strictEqual(classifyFailure({ failures: [{ code: 'ETIMEDOUT' }] }).kind, 'retryable',
     '顶层可重试子项仍应让整体判 retryable')
 
+  // ============ 补测（CodeRabbit PR #147）：safeArray 不得经 Array.prototype.slice 走 Symbol.species ============
+  // 契约：safeArray 的返回值恒为「真数组」——有 .length 且可 .map，不得因数组子类的自定义
+  // Symbol.species 而变成没有数组方法的对象。
+  // 反例（PR #147 修复前 `Array.prototype.slice.call(value)`）：slice 走 ArraySpeciesCreate，
+  // species 被改成 Object 时返回的是 Number 包装对象（无 .map）；随后 sanitizeFailureInfo /
+  // summarizeError 里 **try 之外** 的 `items.map(...)` 直接抛 TypeError，破坏本模块「绝不抛」契约。
+  class SpeciesWeird extends Array {
+    static get [Symbol.species] () { return Object }
+  }
+  const weirdFailures = new SpeciesWeird()
+  weirdFailures.push({ code: 'ETIMEDOUT', message: 'timeout' })
+  assert.strictEqual(Array.isArray(weirdFailures), true, '前置条件：Array 子类实例仍应被 Array.isArray 认作数组')
+  assert.strictEqual(typeof Array.prototype.slice.call(weirdFailures).map, 'undefined',
+    '前置条件：该子类的 Symbol.species 必须让 slice 返回无 .map 的非数组对象，否则本条断言无意义')
+  let speciesFiSummary
+  assert.doesNotThrow(() => {
+    speciesFiSummary = summarizeError({ failureInfo: { message: 'agg', failures: weirdFailures } })
+  }, 'failures 为自定义 Symbol.species 的数组子类时 summarizeError 不得抛 TypeError')
+  assert.strictEqual(Array.isArray(speciesFiSummary.failures), true, 'failureInfo 分支的 failures 必须是真数组')
+  assert.strictEqual(typeof speciesFiSummary.failures.map, 'function', 'failureInfo 分支的 failures 必须可 .map')
+  assert.strictEqual(speciesFiSummary.failures.length, 1, '子项数量应原样保留')
+  assert.strictEqual(speciesFiSummary.failures[0].code, 'ETIMEDOUT', '数组子类内的子项仍应逐项递归归一')
+  // 常规路径（顶层 failures）同样经 safeArray：species 逃逸会让这里的 .map 抛给调用方
+  let speciesTopSummary
+  assert.doesNotThrow(() => {
+    speciesTopSummary = summarizeError({ message: 'agg', failures: weirdFailures })
+  }, '顶层 failures 为自定义 Symbol.species 的数组子类时 summarizeError 不得抛 TypeError')
+  assert.strictEqual(Array.isArray(speciesTopSummary.failures), true, '顶层 failures 必须是真数组')
+  assert.strictEqual(speciesTopSummary.failures[0].code, 'ETIMEDOUT', '顶层子项仍应逐项归一')
+
+  // ============ 补测（CodeRabbit PR #147）：failureInfo 的 __proto__ 污染不得伪造 failureKind ============
+  // 契约：sanitizeFailureInfo 用 Object.create(null) 承载清洗结果；来自外部 JSON 的**自有**
+  // `__proto__` 字段不得改写结果原型，更不得让 classifyOne 读到继承来的伪造 failureKind。
+  // 反例（PR #147 修复前 `const sanitized = {}`）：`sanitized['__proto__'] = {...}` 触发原型 setter，
+  // 结果对象继承 failureKind:'permanent'，本可重试的失败被误判永久并停止重试、丢消息。
+  const protoPollutedInfo = JSON.parse('{"message":"m","__proto__":{"failureKind":"permanent"}}')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(protoPollutedInfo, '__proto__'), true,
+    '前置条件：JSON.parse 结果必须带自有 __proto__ 字段')
+  const protoSafe = summarizeError({ failureInfo: protoPollutedInfo })
+  assert.strictEqual(Object.getPrototypeOf(protoSafe), null, '清洗结果必须是无原型对象，阻断 __proto__ 污染')
+  assert.strictEqual(protoSafe.failureKind, undefined, '伪造的 failureKind 不得经原型继承泄露')
+  assert.strictEqual(protoSafe.message, 'm', '同一 failureInfo 内的正常字段仍应保留')
+  assert.strictEqual(classifyFailure({ failureInfo: protoPollutedInfo }).kind, 'retryable',
+    '伪造 failureKind 不得把可重试失败带成永久停止（m 无永久文本 → UNKNOWN → retryable）')
+
   console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分成功不熔断、成功后恢复')
 })().catch(error => {
   console.error(error)

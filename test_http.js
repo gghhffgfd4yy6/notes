@@ -259,5 +259,38 @@ function installMockStream (behavior) {
     }
   }
 
+  // 13. maxBody 是「取值即抛错」的非法对象 → 告警路径必须先做安全转换。
+  //     CodeRabbit PR #147 #8：旧实现直接 `String(maxBody)` 插进模板串，抛错发生在 console.warn
+  //     之前 → fetchJson 返回的 Promise 直接 reject、一次告警都没有，且「非法上限一律钳制」契约被破坏。
+  //     覆盖两类不可字符串化对象：带抛错 toString 的对象、无原型的 null 原型对象。
+  {
+    const cases = [
+      ['toString 抛错的对象', { toString () { throw new Error('toString boom') } }],
+      ['无原型的 null 原型对象', Object.create(null)]
+    ]
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      for (const [label, bad] of cases) {
+        const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"ok":true}'] })
+        try {
+          let syncErr = null
+          let promise = null
+          try { promise = fetchJson('https://api.example.com/x', {}, bad) } catch (e) { syncErr = e }
+          assert.strictEqual(syncErr, null, `${label}：不得同步抛异常`)
+          assert.ok(promise instanceof Promise, `${label}：应返回 Promise`)
+          const body = await promise
+          assert.deepStrictEqual(body, { ok: true }, `${label}：非法 maxBody 仍应钳制到 DEFAULT_MAX_BODY 并正常解析（不因告警取值失败而 reject）`)
+        } finally { restore() }
+      }
+      assert.strictEqual(warns.length, cases.length, '每个非法 maxBody 都应告警一次（告警自身不得抛错）')
+      assert.ok(warns.every(w => w.includes('maxBody 非法') && w.includes('已钳制到') && w.includes('20971520')),
+        `告警应说明非法值与钳制目标 DEFAULT_MAX_BODY；实际 warns=${JSON.stringify(warns)}`)
+      assert.ok(warns.every(w => w.includes('无法转换')),
+        `取值失败时应回退到兜底文案，而不是把异常带进告警路径；实际 warns=${JSON.stringify(warns)}`)
+    } finally { console.warn = origWarn }
+  }
+
   console.log('test_http OK')
 })().catch((e) => { console.error(e); process.exit(1) })

@@ -227,6 +227,36 @@ check('mdLinksToPlain: 畸形构造不退化 O(n²)——配平扫描共享预�
     `畸形输入耗时不应相对同规模良性输入爆炸，实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（无预算实现约 1600-1800 倍）`
   )
 })
+// CodeRabbit PR #147：findDestEnd 的角括号分支必须先扣扫描预算——否则「有 '<' 但整串没有 '>'」的畸形构造
+// 每轮都会让 indexOf('>') 从该处一路扫到串尾（预算形同虚设），多个叠起来仍是 O(n²)。
+// 下面两类断言都直接针对「删掉 findDestEnd 顶部 `if (budget.left <= 0) return -1`」这一回退：
+//   · 确定性断言（不依赖机器快慢、不依赖计时）：预算被前序畸形构造耗尽后，角括号形态必须在预算耗尽处
+//     短路返回 -1、由调用方回落「首个 )」；回退守卫后它仍会执行 indexOf('>') 直接闭合，
+//     在 `[<u)v>](<u)v>)` 这类「destination 内含 ')' 的 <...> 形态」上产出文本不同（前者去重成 `<u)v>`）。
+//   · 计时断言（宽松）：畸形输入相对同规模良性输入不得爆炸；回退守卫后实测约 37-44 倍（阈值 10 倍）。
+check('mdLinksToPlain: 预算耗尽后角括号分支必须短路 + 畸形输入不退化（CodeRabbit #147）', () => {
+  // 前 6 段 `[a](() ` 每段净多一个 '('，配平扫描一路扫到尾：预算在到达末条链接前已被耗尽。
+  const exhausted = '[a](() '.repeat(6) + '[<u)v>](<u)v>)'
+  assert.strictEqual(
+    mdLinksToPlain(exhausted),
+    'a (() '.repeat(6) + '<u)v> (<u)v>)',
+    '预算耗尽后 <...> 形态也必须回落「首个 )」；若角括号分支先于预算检查执行，末条会得到去重后的 `<u)v>`'
+  )
+  // 「有 '<' 但整串无 '>'」的畸形构造：'[a](<x) ' 每段都以 '<' 开头、串中无任何 '>'，
+  // 末尾的 ')' 让外层 while 继续推进（否则首轮就 bail，退化不成立）。
+  const malformed = '[a](<x) '.repeat(20000)
+  assert.ok(!malformed.includes('>'), '用例前提：整串不得含 ">"')
+  const benign = '[a](https://e.com/p) '.repeat(8000) // 与畸形输入同为 160KB 量级
+  bestMs(() => mdLinksToPlain(malformed.slice(0, 2000))) // 预热，排除首次 JIT 编译
+  bestMs(() => mdLinksToPlain(benign.slice(0, 2000)))
+  const tMal = bestMs(() => mdLinksToPlain(malformed), 5)
+  const tBenign = bestMs(() => mdLinksToPlain(benign), 5)
+  assert.ok(tMal < 500, `160KB 畸形输入应在 500ms 内完成，实测 ${tMal.toFixed(1)}ms`)
+  assert.ok(
+    tMal <= 10 * tBenign,
+    `畸形输入不得相对同规模良性输入爆炸：实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（回退角括号预算守卫约 37-44 倍）`
+  )
+})
 
 // ===== mdImagesToPlain =====
 check('mdImagesToPlain: 正常图片转 alt', () => {
@@ -300,6 +330,28 @@ check('mdImagesToPlain: 畸形构造不退化 O(n²)——配平扫描共享预�
   assert.ok(
     tMal <= 25 * tBenign + 50,
     `畸形输入耗时不应相对同规模良性输入爆炸，实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（无预算实现约 1600 倍）`
+  )
+})
+// CodeRabbit PR #147：mdImagesToPlain 复用同一个 findDestEnd，角括号分支的预算守卫同样必须生效——
+// 两个循环各自独立初始化 destBudget，因此需要各自的覆盖（本用例与上面链接版同构，只是把 '[' 换成 '!['）。
+check('mdImagesToPlain: 预算耗尽后角括号分支必须短路 + 畸形输入不退化（CodeRabbit #147）', () => {
+  const exhausted = '![a](() '.repeat(6) + '![<u)v>](<u)v>)'
+  assert.strictEqual(
+    mdImagesToPlain(exhausted),
+    'a '.repeat(6) + '<u)v>v>)',
+    '预算耗尽后 <...> 形态也必须回落「首个 )」；若角括号分支先于预算检查执行，末图只会剩去重后的 `<u)v>`'
+  )
+  const malformed = '![a](<x) '.repeat(20000) // 每段都以 '<' 开头、整串无 '>'
+  assert.ok(!malformed.includes('>'), '用例前提：整串不得含 ">"')
+  const benign = '![a](https://e.com/p.png) '.repeat(7000) // 与畸形输入同为 180KB 量级
+  bestMs(() => mdImagesToPlain(malformed.slice(0, 2000)))
+  bestMs(() => mdImagesToPlain(benign.slice(0, 2000)))
+  const tMal = bestMs(() => mdImagesToPlain(malformed), 5)
+  const tBenign = bestMs(() => mdImagesToPlain(benign), 5)
+  assert.ok(tMal < 500, `180KB 畸形输入应在 500ms 内完成，实测 ${tMal.toFixed(1)}ms`)
+  assert.ok(
+    tMal <= 10 * tBenign,
+    `畸形输入不得相对同规模良性输入爆炸：实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（回退角括号预算守卫约 40-44 倍）`
   )
 })
 

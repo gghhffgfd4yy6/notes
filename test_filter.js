@@ -9666,19 +9666,19 @@ console.log('========================================\n');
     assertEqual(error, null, '形状守卫路径不得抛异常')
     assertEqual(value, true, '非字段级形状（_type 非字符串）必须保守放行')
     assertEqual(checkFnCalls, 0, '形状守卫应在调用 checkFn 之前短路')
-    assertEqual(warnings.some(m => m.includes('过滤检查收到未编译的规则对象')), true, '必须显式告警留痕')
+    assertEqual(warnings.some(m => m.includes('过滤检查收到与本调用方不匹配或缺载荷的规则对象')), true, '必须显式告警留痕')
   })
 
   await test('补测 FILTER-03：checkCategory/checkRegisterTime 收到原始配置 → 告警且仍放行', () => {
     const cat = _captureWarn(() => checkCategory({ catename: '微博' }, { pingbifenlei: '微博' }))
     assertEqual(cat.error, null, '不得抛异常')
     assertEqual(cat.value, true, '原始配置非字段级规则 → 保守放行')
-    assertEqual(cat.warnings.some(m => m.includes('过滤检查收到未编译的规则对象')), true, '必须告警留痕')
+    assertEqual(cat.warnings.some(m => m.includes('过滤检查收到与本调用方不匹配或缺载荷的规则对象')), true, '必须告警留痕')
 
     const time = _captureWarn(() => checkRegisterTime({ louzhuregtime: daysAgo(2) }, { pingbitime: '5' }))
     assertEqual(time.error, null, '不得抛异常')
     assertEqual(time.value, true, '原始配置非字段级规则 → 保守放行')
-    assertEqual(time.warnings.some(m => m.includes('过滤检查收到未编译的规则对象')), true, '必须告警留痕')
+    assertEqual(time.warnings.some(m => m.includes('过滤检查收到与本调用方不匹配或缺载荷的规则对象')), true, '必须告警留痕')
   })
 
   await test('补测 FILTER-03：合法字段级规则不受形状守卫影响（不告警，拦截语义不变）', () => {
@@ -9690,6 +9690,41 @@ console.log('========================================\n');
     const missing = _captureWarn(() => checkRegisterTime({ louzhuregtime: daysAgo(2) }, null))
     assertEqual(missing.value, true, 'compiled 缺失沿用放行')
     assertEqual(missing.warnings.length, 0, '「缺失」不是错形状，不得告警')
+  })
+
+  await test('补测 CodeRabbit #147：_passIfMissing 按调用方校验判别式/载荷，错配形状必须告警留痕', () => {
+    const timeShape = compileRules({ pingbitime: '3' }).pingbitime
+    const catShape = compileRules({ pingbifenlei: '微博|赚客吧' }).pingbifenlei
+    assertEqual(timeShape._type, 'time', '前置条件：pingbitime 编译产物应为 time 形状')
+    assertEqual(catShape._type, 're', '前置条件：pingbifenlei 编译产物应为 re 形状')
+    // 反例（修复前只判 `typeof _type === 'string'`）：两种错配都通过形状守卫，下游
+    // matchesCompiled/checkTimeCompiled 对不认识的 _type 一律返回 false，本函数取反成 true，
+    // 于是**静默全放行且无任何告警**（含内置的 `pingbitime` 被当分类规则等跨调用方误用）。
+    const catGotTime = _captureWarn(() => checkCategory({ catename: '微博' }, timeShape))
+    assertEqual(catGotTime.error, null, 'time 形状误传给分类检查不得抛异常')
+    assertEqual(catGotTime.value, true, '不匹配的形状必须保守放行')
+    assertEqual(catGotTime.warnings.some(m => m.includes('与本调用方不匹配或缺载荷')), true,
+      'time 形状误传给分类检查必须告警留痕（修复前静默放行）')
+
+    const timeGotCat = _captureWarn(() => checkRegisterTime({ louzhuregtime: daysAgo(2) }, catShape))
+    assertEqual(timeGotCat.error, null, '分类形状误传给天数检查不得抛异常')
+    assertEqual(timeGotCat.value, true, '不匹配的形状必须保守放行')
+    assertEqual(timeGotCat.warnings.some(m => m.includes('与本调用方不匹配或缺载荷')), true,
+      '分类形状误传给天数检查必须告警留痕（修复前静默放行）')
+
+    // 判别式对但载荷缺失（下游拿不到 re/rules/value）同样必须告警放行，不得静默
+    const noPayload = _captureWarn(() => checkCategory({ catename: '微博' }, { _type: 're', source: 'x' }))
+    assertEqual(noPayload.value, true, '判别式匹配但缺载荷必须保守放行')
+    assertEqual(noPayload.warnings.some(m => m.includes('与本调用方不匹配或缺载荷')), true,
+      '缺载荷必须告警留痕（修复前只看 _type 字符串，静默放行）')
+
+    // 不回归：正确形状仍拦截，且不得产生形状告警
+    const catOk = _captureWarn(() => checkCategory({ catename: '微博' }, catShape))
+    assertEqual(catOk.value, false, '正确 re 形状命中仍应拦截')
+    assertEqual(catOk.warnings.length, 0, '正确形状不得产生形状告警')
+    const timeOk = _captureWarn(() => checkRegisterTime({ louzhuregtime: daysAgo(2) }, timeShape))
+    assertEqual(timeOk.value, false, '正确 time 形状命中仍应拦截')
+    assertEqual(timeOk.warnings.length, 0, '正确形状不得产生形状告警')
   })
 
   await test('补测 FILTER-03：checkFields 收到非 __compiled 产物 → 告警并保守放行', () => {

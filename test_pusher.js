@@ -223,6 +223,35 @@ function test (name, fn) {
     assert.strictEqual(received, 'b'.repeat(100000), '缺 truncateUtf16 时须退回 slice，不能抛错或漏截断')
   })
 
+  // CodeRabbit PR #147 #9：退回分支必须自己做代理对安全截断，不能裸 slice。
+  // 跨边界载荷：99999 个 'a' + 代理对 emoji（总长 100001），硬上限 100000 恰落在代理对中间——
+  // 裸 slice(0, 100000) 会留下孤立高位代理（半个 emoji 乱码），违反 SYSTEM_CONTRACT 的 UTF-16 安全截断。
+  await test('P10b Utils 未提供 truncateUtf16 → 退回截断不得切断代理对（跨边界载荷）', async () => {
+    const desp = 'a'.repeat(99999) + '😀'
+    assert.strictEqual(desp.length, 100001, '载荷应总长 100001 码元（截断点落在代理对中间）')
+    let received
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const notifyMod = {
+        sendNotify: async (t, d) => { received = d },
+        configuredChannelNames: () => ['ch1']
+      }
+      const p = createPusher({
+        Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
+        getNotify: async () => notifyMod
+      })
+      await p.send('标题', desp, notifyMod)
+    } finally {
+      console.warn = originalWarn
+    }
+    assert.strictEqual(typeof received, 'string', '缺 truncateUtf16 时须退回本地截断，不能抛错或漏截断')
+    assert.strictEqual(received.length, 99999, '截断点落在代理对中间时须整体退一格，长度为 99999')
+    const lastCode = received.charCodeAt(received.length - 1)
+    assert.ok(!(lastCode >= 0xD800 && lastCode <= 0xDBFF),
+      `末位码元不得是孤立高位代理（实际 0x${lastCode.toString(16)}）——被切断的代理对会渲染成乱码`)
+  })
+
   // ===== 超时归因缺失告警（审查 2026-08-15 P3 零风险半边②）=====
   await test('P11 超时且 configuredChannelNames 缺失 → failures 为空并告警', async () => {
     const originalSetTimeout = global.setTimeout

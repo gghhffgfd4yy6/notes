@@ -6,6 +6,7 @@
 //   - parseLastRun 行首锚定：真实摘要行仍可解析、行中间内嵌 total= 不再误命中
 //   - parseDiagnostics 跳过损坏行找到有效记录
 //   - validReport 容忍缺失计数字段（存在的字段仍须校验）
+//   - validReport 容忍缺失 date 字段（date 存在时仍须为字符串，CodeRabbit PR #147）
 //   - formatStatus channels.value 为 null 时的降级分支
 const assert = require('node:assert')
 const fs = require('node:fs')
@@ -102,6 +103,25 @@ try {
 
     fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ date: '2026-09-08', pushed: 'x' }) + '\n')
     assert.strictEqual(readStatus(tmp).report.status, 'invalid', '已存在的计数字段仍须校验：非整数应 invalid')
+  })
+
+  // ===== validReport：date 缺失同样合法（CodeRabbit PR #147），但 date 存在时必须仍是字符串 =====
+  // 生产侧 _loadReportState 接受 raw.date === undefined、_normalizeReportState 归一化为 ''，
+  // 故合法的 {"runs":1} 不得被显示成「日报：不可读（invalid）」；修前该用例为 invalid。
+  test('S8 report.state 缺 date 字段 → ok（date 存在但非字符串仍 invalid）', () => {
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ runs: 1 }) + '\n')
+    const first = readStatus(tmp)
+    assert.strictEqual(first.report.status, 'ok', '仅有 runs、date 缺失的 report.state 应视为 ok（修前为 invalid）')
+    assert.strictEqual(first.report.value.runs, 1, 'value 应原样保留')
+
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({}) + '\n')
+    assert.strictEqual(readStatus(tmp).report.status, 'ok', '空对象（date 与七项计数全缺失）同样应视为 ok')
+
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ runs: 1, date: 123 }) + '\n')
+    assert.strictEqual(readStatus(tmp).report.status, 'invalid', 'date 存在但为数字仍须 invalid（校验不能整体放开）')
+
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ runs: 1, date: null }) + '\n')
+    assert.strictEqual(readStatus(tmp).report.status, 'invalid', 'date=null 不是 undefined、也不是字符串 → 仍 invalid')
   })
 
   // ===== formatStatus：channels.value 为 null（status ok 但 value null）时降级 =====

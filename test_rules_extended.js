@@ -8,6 +8,23 @@ const { createRuleEngine } = require('./xbk_rules')
 const mockUtils = {
   safeStr: (v) => (v === undefined || v === null || typeof v === 'symbol') ? '' : String(v),
   safeGet: (o, k) => o ? o[k] : undefined,
+  // CodeRabbit PR #147：xbk_rules 的 readField 恢复路径改用 Utils.safeErrorText 取值
+  // （避免读会抛的 e.message getter 在 catch 里再抛），故替身必须提供同等能力——
+  // 且这里必须自己吞掉读取异常（本 mock 的 safeGet 不做 try/catch）。
+  safeErrorText: (error, fallback = '') => {
+    try {
+      if (typeof error === 'string' && error.trim() !== '') return error
+      if (typeof error === 'number' || typeof error === 'boolean') return String(error)
+      if (typeof error === 'symbol') return Symbol.prototype.toString.call(error)
+      if (!error || typeof error !== 'object') return fallback
+      for (const key of ['message', 'code']) {
+        let v
+        try { v = error[key] } catch (e) { v = undefined }
+        if (v !== undefined && v !== null && v !== '') return String(v)
+      }
+      return fallback
+    } catch (e) { return fallback }
+  },
   parseTime: (t) => {
     if (typeof t === 'number' && t > 0) return t < 1e12 ? t * 1000 : t
     const d = new Date(t)
