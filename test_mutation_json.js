@@ -69,10 +69,12 @@ try {
       }
       assert.ok(err, '相对路径 + 损坏 JSON 应抛出错误')
       const msg = String(err.message)
-      // 取出 message 中所有 *.json 出现。原先用 /[^\s：:]+\.json/g，其字符类含 '.' 与尾部
-      // \.json 重叠（Sonar S8786 超线性回溯）：长点串输入下需指数级重试。改为按分隔符
-      // （空白/半角与全角冒号）切分再判后缀——线性，且比原式更严（要求整个 token 以 .json 结尾）。
-      const pathMatches = msg.split(/[\s：:]+/).filter(t => t.endsWith('.json'))
+      // 取出 message 中所有 *.json 出现。原先用 /[^\s：:]+\.json/g：该式只有一个重叠量词，
+      // 失配时每个起始位置都要把后缀整段重扫，长点串输入下是 O(n²)（二次，非指数）——即 S8786
+      // 判定的超线性回溯。改为按分隔符切分再判后缀：线性，且比原式更严（要求整个 token 以
+      // .json 结尾）。冒号仅在不后跟路径分隔符时才算分隔符，否则 Windows 盘符（C:\tmp\x.json）
+      // 会被切掉，剩下的 \tmp\x.json 又恰好被 path.win32.isAbsolute 判为绝对，断言就失去咬合力。
+      const pathMatches = msg.split(/[\s：]+|:(?![\\/])/).filter(t => t.endsWith('.json'))
       assert.ok(
         pathMatches.some(p => path.isAbsolute(p)),
         `错误信息应至少含一个绝对路径（防御性 path.resolve），实际：${msg}`
