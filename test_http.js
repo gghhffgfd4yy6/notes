@@ -277,7 +277,12 @@ function installMockStream (behavior) {
         try {
           let syncErr = null
           let promise = null
-          try { promise = fetchJson('https://api.example.com/x', {}, bad) } catch (e) { syncErr = e }
+          try {
+            promise = fetchJson('https://api.example.com/x', {}, bad)
+            // SonarJS S6544：try 内的 promise 必须被 await 或挂 catch 派生链。这里加一个空 catch
+            // 只为满足该规则，**不改变原 promise 语义**——下面仍 await 原始 promise 来断言解析结果。
+            promise.catch(() => {})
+          } catch (e) { syncErr = e }
           assert.strictEqual(syncErr, null, `${label}：不得同步抛异常`)
           assert.ok(promise instanceof Promise, `${label}：应返回 Promise`)
           const body = await promise

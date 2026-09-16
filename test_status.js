@@ -44,13 +44,23 @@ try {
   assert.strictEqual(degraded.channels.status, 'missing')
   assert.match(formatStatus(degraded), /不可读|缺失/)
 
+  // `{}`（无 date、无计数）在生产侧 _loadReportState 里是**合法**的空累计状态（_normalizeReportState
+  // 归一化为 blank：date→''、计数→0），故 --status 也必须显示正常。此前这里断言 invalid，
+  // 与生产口径冲突（CodeRabbit PR #147 指出 date 缺失同样应被接受）——修的是断言，不是放宽整个校验。
   writeReport('{}')
   writeChannels(JSON.stringify({ pushplus: { consecutiveFailures: 'two' } }))
   writeDiagnostics(JSON.stringify({ type: 'run' }) + '\n')
-  const malformed = readStatus('.')
-  assert.strictEqual(malformed.report.status, 'invalid', '缺字段 report.state 不应显示正常')
-  assert.strictEqual(malformed.channels.status, 'invalid', '通道失败次数必须是非负整数')
-  assert.strictEqual(malformed.diagnostics.status, 'invalid', '过滤汇总必须带计数对象')
+  const blankState = readStatus('.')
+  assert.strictEqual(blankState.report.status, 'ok', '{} 是合法空累计状态，应与生产 _loadReportState 同口径')
+  assert.strictEqual(blankState.channels.status, 'invalid', '通道失败次数必须是非负整数')
+  assert.strictEqual(blankState.diagnostics.status, 'invalid', '过滤汇总必须带计数对象')
+
+  // 真正非法的 report.state 仍必须判 invalid（证明不是把校验整段放开）：
+  // ① 计数为负 —— 生产侧同样判非法；② date 存在但类型错误。
+  writeReport(JSON.stringify({ runs: -1 }))
+  assert.strictEqual(readStatus('.').report.status, 'invalid', '负计数 report.state 必须判非法')
+  writeReport(JSON.stringify({ date: 123, runs: 1 }))
+  assert.strictEqual(readStatus('.').report.status, 'invalid', 'date 存在但非字符串必须判非法')
 
   fs.unlinkSync('run.log')
   fs.symlinkSync('/etc/passwd', 'run.log')
