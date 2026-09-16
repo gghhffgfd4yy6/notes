@@ -45,7 +45,9 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     // allowedTypes 校验判别式，并要求对应载荷字段存在（re→re / time→value / multi|timeMulti→rules）。
     let ruleShape = false
     try {
-      const type = typeof compiled === 'object' && compiled !== null ? compiled._type : null
+      // 注意：本函数开头已有 `if (!compiled || !group) return true`，故此处 compiled 必为真值，
+      // 不需要也不能再写 `compiled !== null`（恒真——CodeQL 会报 "Comparison between inconvertible types"）。
+      const type = typeof compiled === 'object' ? compiled._type : null
       const payloadKey = type === 're' ? 're' : type === 'time' ? 'value' : (type === 'multi' || type === 'timeMulti') ? 'rules' : null
       ruleShape = typeof type === 'string' && payloadKey !== null &&
         (allowedTypes === undefined || allowedTypes.includes(type)) &&
