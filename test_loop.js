@@ -124,5 +124,29 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
   assert.strictEqual(gotOnlyCommands[0][1][0], 'install')
   console.log('✅ 青龙入口：re2 缺失会阻止启动，自动恢复按实际失败依赖构建并复检')
 
+  // XL-04（xbk_loop.js:71-73）：未传 onError 时默认处理器必须每轮打印一行诊断日志且不中断循环。
+  // 这里验证「连续多轮失败 → 每轮一行」，与 test_loop_utils.js 的单轮/回落断言互补。
+  const controller4 = new AbortController()
+  const stderrChunks = []
+  const originalStderrWrite = process.stderr.write
+  process.stderr.write = function (chunk) { stderrChunks.push(String(chunk)); return true }
+  let runs4 = 0
+  try {
+    await runLoop(async () => {
+      runs4 += 1
+      if (runs4 <= 2) throw new Error(`default-log-${runs4}`)
+      controller4.abort()
+    }, { intervalMs: 0, signal: controller4.signal })
+  } finally {
+    process.stderr.write = originalStderrWrite
+  }
+  const defaultLogs = stderrChunks.join('').split('\n').filter(line => line.includes('调用方未提供 onError'))
+  assert.strictEqual(runs4, 3, '默认 onError 记录日志后常驻循环不应中断')
+  assert.deepStrictEqual(defaultLogs, [
+    '常驻循环单轮失败（调用方未提供 onError）: default-log-1',
+    '常驻循环单轮失败（调用方未提供 onError）: default-log-2'
+  ], '未传 onError 时每轮异常都应留下一条默认诊断日志')
+  console.log('✅ 常驻循环：未传 onError 时每轮异常留一行诊断日志且不中断')
+
   console.log('✅ 常驻循环：单轮异常不中断，停止信号在当前轮结束后生效，定期刷新与等待并行')
 })()

@@ -57,6 +57,18 @@ function validateSegments (results, expected = EXPECTED_SEGMENTS) {
   if (missing.length > 0) {
     throw new Error(`变异测试报告缺少分段：${missing.join(', ')}；拒绝发布不完整日报`)
   }
+  // F5：反向校验（对照 scripts/check-mutation-ranges.js 的 nameExtra 口径）——额外/陌生段目录
+  // （残留 artifact、矩阵与 EXPECTED_SEGMENTS 漂移）不得静默并入合计，否则分数口径失真。
+  const unexpected = [...actual].filter(seg => !expected.includes(seg))
+  if (unexpected.length > 0) {
+    throw new Error(`变异测试报告包含预期之外的分段：${unexpected.join(', ')}；拒绝发布口径不符的日报`)
+  }
+  // F5：重复分段检测——同一段被计两次会让合计静默翻倍。
+  const segs = results.map(result => result.seg)
+  const duplicated = [...new Set(segs.filter((seg, i) => segs.indexOf(seg) !== i))]
+  if (duplicated.length > 0) {
+    throw new Error(`变异测试报告分段重复：${duplicated.join(', ')}；拒绝发布重复计入的日报`)
+  }
   const errored = results.filter(result => result.error).map(result => result.seg)
   if (errored.length > 0) {
     throw new Error(`变异测试报告包含错误分段：${errored.join(', ')}；拒绝发布不完整日报`)
@@ -88,21 +100,27 @@ function findReportJson (dir) {
 
 // 解析单个段的 mutation-report.json（复杂度拆分：analyze 保持线性遍历）
 function analyzeSegment (dir, entry) {
+  const seg = entry.name.replace('mutation-report-', '')
   const reportPath = findReportJson(path.join(dir, entry.name))
-  if (!reportPath) return { seg: entry.name.replace('mutation-report-', ''), error: '缺 mutation-report.json' }
-  let report
-  try {
-    report = readReportJson(reportPath)
-  } catch (e) {
-    return { seg: entry.name.replace('mutation-report-', ''), error: String(e.message || e) }
-  }
+  if (!reportPath) return { seg, error: '缺 mutation-report.json' }
   const stats = { total: 0, killed: 0, survived: 0, noCoverage: 0, timeout: 0, survivedMutants: [] }
-  for (const [fileKey, file] of Object.entries(report.files || {})) {
-    for (const m of file.mutants || []) countMutant(stats, fileKey, m)
+  // F4：解析与聚合同处 try 内——报告顶层为 null（JSON 字面量 null）/原始值时显式失败并走段级隔离，
+  // 不抛 TypeError 逃出本函数（与上方注释「单段失败不中断整体」一致），也不把损坏报告伪装成
+  // 0 变异体的正常段；错误补上报告路径便于定位。
+  try {
+    const report = readReportJson(reportPath)
+    if (!report || typeof report !== 'object') {
+      throw new Error(`报告顶层结构非法（${report === null ? 'null' : typeof report}），无法读取 files`)
+    }
+    for (const [fileKey, file] of Object.entries(report.files || {})) {
+      for (const m of file.mutants || []) countMutant(stats, fileKey, m)
+    }
+  } catch (e) {
+    return { seg, error: `${String(e.message || e)}（报告：${reportPath}）` }
   }
   const score = stats.total > 0 ? ((stats.killed + stats.timeout) / stats.total) * 100 : 0 // 无数据不报 100%（机器人审查）
   return {
-    seg: entry.name.replace('mutation-report-', ''),
+    seg,
     total: stats.total,
     killed: stats.killed,
     survived: stats.survived,
@@ -176,6 +194,8 @@ function _renderSegmentTable (results) {
     lines.push(`| ${r.seg} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% |`)
   }
   // 口径与段分一致（超时计入已处理）；无数据报 0 而非 100（机器人审查）
+  // F6：本脚本刻意只汇总、不设分数/存活门禁——门禁口径见 stryker.config.js 的 thresholds 注释
+  // （break 保持 null ＝ 本地观察项）；改为真门禁需先按真实基线取 break 值，属产品决策。
   const overall = tTotal > 0 ? Math.round((((tKilled + tTimeout) / tTotal) * 100) * 100) / 100 : 0
   lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | | **${overall}%** |`)
   return lines
@@ -266,6 +286,10 @@ async function postIssue (body) {
       console.log('⏭️  当日日报已存在，跳过重复发布')
       return { number: existing.number, html_url: existing.html_url, skipped: true }
     }
+  } else {
+    // F7：列表查询非 2xx 时既有语义是「去重降级为直接新建」（已被单测固化，改动属判重口径），
+    // 这里只让静默降级可观测；fetch 超时/重试策略不在本文件单方面引入。
+    console.warn(`⚠️  日报列表查询失败（HTTP ${listRes.status}），跳过去重直接创建`)
   }
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: 'POST',

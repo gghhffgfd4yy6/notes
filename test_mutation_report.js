@@ -159,6 +159,25 @@ check('生产默认分段完整时允许生成日报', () => {
   assert.deepStrictEqual(validateSegments(results), results)
 })
 
+// ===== validateSegments 反向校验（F5）：额外/陌生段与重复段不得静默计入合计 =====
+check('validateSegments 出现预期之外的分段时拒绝发布', () => {
+  // 旧实现只做单向包含检查（missing），多余段被静默聚合进合计 → 分数口径失真
+  const results = [{ seg: 'v3-part1' }, { seg: 'v3-part2' }, { seg: 'rogue-residual' }]
+  assert.throws(
+    () => validateSegments(results, ['v3-part1', 'v3-part2']),
+    /预期之外的分段：rogue-residual/
+  )
+})
+
+check('validateSegments 分段重复时拒绝发布', () => {
+  // 同一段出现两次会让合计静默翻倍；该段本身在预期内，故与"预期之外"分支互不覆盖
+  const results = [{ seg: 'v3-part1' }, { seg: 'v3-part1' }, { seg: 'v3-part2' }]
+  assert.throws(
+    () => validateSegments(results, ['v3-part1', 'v3-part2']),
+    /分段重复：v3-part1/
+  )
+})
+
 // ===== escCell：Markdown 表格单元格转义 =====
 check('escCell 转义竖线/反斜杠/换行/反引号', () => {
   assert.strictEqual(escCell('hello'), 'hello')
@@ -243,6 +262,29 @@ try {
     assert.strictEqual(missing.error, '缺 mutation-report.json')
   })
 
+  // F4：报告顶层为 null/原始值时显式失败并走段级隔离。
+  // 旧实现 report.files 在 try 外求值 → 裸 TypeError 逃出 analyzeSegment，整份日报一起崩；
+  // 新实现把解析+聚合同处 try 内，返回带报告路径的 error（且不得伪装成 0 变异体的正常段）。
+  check('analyzeSegment 报告顶层为 null 时返回带上下文的 error（不抛 TypeError）', () => {
+    const d = path.join(tmp, 'mutation-report-null-report'); fs.mkdirSync(d, { recursive: true })
+    const reportPath = path.join(d, 'mutation.json')
+    fs.writeFileSync(reportPath, 'null')
+    const r = analyzeSegment(tmp, { name: 'mutation-report-null-report' })
+    assert.strictEqual(r.seg, 'null-report')
+    assert.ok(/报告顶层结构非法（null）/.test(r.error), `error 应说明顶层结构非法，实际：${r.error}`)
+    assert.ok(r.error.includes(reportPath), `error 应携带报告路径便于定位，实际：${r.error}`)
+    assert.strictEqual(r.total, undefined, '损坏报告不得伪装成 0 变异体的正常段')
+  })
+
+  check('analyzeSegment 报告顶层为原始值时返回带上下文的 error', () => {
+    const d = path.join(tmp, 'mutation-report-primitive-report'); fs.mkdirSync(d, { recursive: true })
+    fs.writeFileSync(path.join(d, 'mutation.json'), '42')
+    const r = analyzeSegment(tmp, { name: 'mutation-report-primitive-report' })
+    assert.strictEqual(r.seg, 'primitive-report')
+    assert.ok(/报告顶层结构非法（number）/.test(r.error), `error 应说明顶层结构非法，实际：${r.error}`)
+    assert.strictEqual(r.total, undefined, '损坏报告不得伪装成 0 变异体的正常段')
+  })
+
   check('analyze 遍历 mutation-report-* 子目录并跳过普通目录', () => {
     // 显式创建一个普通目录（非 mutation-report-* 前缀），验证被跳过
     const plainDir = path.join(tmp, 'reports')
@@ -259,6 +301,16 @@ try {
     assert.ok(segs.includes('utils'), '应包含 utils 段')
     // 普通目录（如 reports/）不应被包含——精确匹配 seg 名，而非宽松 includes
     assert.ok(!segs.includes('reports'), '应跳过非 mutation-report-* 目录（reports 不应出现在结果中）')
+  })
+
+  // F4：段级隔离——null 报告段以 error 形式隔离，其余段正常返回（旧实现整个 analyze 抛 TypeError）
+  check('analyze 遇损坏段只隔离该段，其余段仍正常返回', () => {
+    const results = analyze(tmp)
+    const broken = results.find(r => r.seg === 'null-report')
+    assert.ok(broken, 'null 报告段应出现在结果中')
+    assert.ok(/报告顶层结构非法/.test(broken.error), 'null 报告段应以 error 形式隔离')
+    const utils = results.find(r => r.seg === 'utils')
+    assert.ok(utils && utils.total === 4, '其余正常段（utils.total=4）不受损坏段影响')
   })
 
   check('analyze 空目录返回空数组', () => {
@@ -416,6 +468,27 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     mockFetch([listRes, createRes])
     const result = await postIssue('body')
     assert.strictEqual(result.number, 100, '列表失败时应直接创建')
+  })
+
+  // F7：列表查询非 2xx 的静默降级必须有可观测输出（console.warn + 真实状态码）
+  await acheck('postIssue 列表查询失败时输出可观测的降级 warn（含状态码）', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(false, 503, { message: 'unavailable' })
+    const createdIssue = { number: 101, html_url: 'https://github.com/owner/repo/issues/101' }
+    const createRes = makeRes(true, 201, createdIssue)
+    mockFetch([listRes, createRes])
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      const result = await postIssue('body')
+      assert.strictEqual(result.number, 101, '列表失败时仍应降级为直接创建')
+    } finally {
+      console.warn = origWarn
+    }
+    assert.strictEqual(warns.length, 1, `列表查询失败应恰好 warn 一次，实际 ${warns.length} 次`)
+    assert.ok(warns[0].includes('HTTP 503'), `warn 应携带真实状态码，实际：${warns[0]}`)
   })
 
   await acheck('postIssue 创建 Issue 失败时抛错', async () => {

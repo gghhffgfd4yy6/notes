@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.273 — 状态命令、过滤诊断与全量审查修复 *********
+//* ******* 线报酷推送脚本 v3.274 — 全量审查遗留（low/info）修复、门禁收紧与回归补强 *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -78,10 +78,9 @@ const { isRegularOrMissing, readSafeTextResult, writeAtomic, writeAtomicIfAbsent
 const { summarizeError, RETRYABLE_CODES } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'))
 const path = profile3Require('path', () => require('path'))
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
-// 缺 package.json 时回退 '3.x'（移植性防御）
+// 缺 package.json、坏 JSON 或 version 字段非法（null/空串/非字符串且非有限数值）时回退 '3.x'（移植性防御）
 let PKG_VERSION = '3.x'
-try { PKG_VERSION = profile3Require('package.json', () => require('./package.json')).version } catch (e) { /* package.json 缺失时用默认 */ }
-profile3BootMark('module-load-complete')
+try { const v = profile3Require('package.json', () => require('./package.json')).version; PKG_VERSION = (typeof v === 'string' && v.trim() !== '') ? v.trim() : (typeof v === 'number' && Number.isFinite(v) ? String(v) : '3.x') } catch (e) { /* package.json 缺失/坏 JSON 时用默认 */ }
 
 // 推送模块（xbk_sendNotify_slim → got）是启动最重的依赖（约 300ms）。
 // 主流程只在真正推送前才用到它——延迟到接口返回后再加载（首推前），
@@ -334,6 +333,7 @@ const App = createApp({
   trimTrailingSlashes,
   compileUserRegex
 })
+profile3BootMark('module-load-complete') // 时点：全部本地模块 require 与工厂构造之后（此前放在文件头版本兜底处，会让 boot 画像漏计这段装配耗时）
 
 async function runSingleEntry (app = App) {
   const summary = await app.run()

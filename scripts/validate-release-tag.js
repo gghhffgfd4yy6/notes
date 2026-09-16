@@ -1,11 +1,18 @@
 #!/usr/bin/env node
-// Release tag 版本号格式校验（semver 子集）。
+// Release tag 版本号格式校验（严格 semver 的**超集**，非子集；放宽项见下方「偏差登记」）。
 // 从 .github/workflows/release.yml 的「校验 tag 版本号格式（semver）」步骤里抽出为可复用模块：
-//   - workflow 的 bash 内联正则与本文件保持逐字一致（不强制改 release.yml，此处复用同一套判断）
+//   - workflow 的 bash 内联正则与本文件保持逐字一致（不强制改 release.yml，release.yml 保留自持的内联副本；
+//     一致性由 test_tag_validator.js 逐字断言，本模块当前**唯一调用点**就是该测试，pre-commit 不执行本文件：
+//     这里的「同一套判断」是防语义漂移的约束，尚不构成生产调用链）
 //   - 供 test_tag_validator.js 直接 require 断言合法/非法 tag 集合
 // 仓库版本格式：CHANGELOG 为 v3.272（两段）、package.json 为 3.272.0（三段），两种形式均接受；
 // 数字组件不允许前导零（03.2 非法，0.1.0 合法），后缀（prerelease/build）不允许空组件/以 . 结尾
 // （alpha.、alpha..1 非法，rc.1、build.5 合法）；正则无嵌套/相邻量词，线性安全（参考 #127 超线性正则教训）。
+// 与严格 semver 的偏差登记（本正则相对严格 semver 只放宽、不收紧，故是超集）：
+//   ① 接受两段式核心（3.272）——严格 semver 要求 major.minor.patch 三段。
+//   ② 后缀里**数字型标识符允许前导零**（实测 1.2.3-01、1.2.3-00 均判合法）——严格 semver 规定数字型
+//      标识符不得有前导零；本文件后缀统一按 [0-9A-Za-z-]+ 匹配、不区分数字型/字母型，故未拦下。
+//   注：核心段禁前导零、后缀组件非空两条**不是**对严格 semver 的放宽——严格 semver 同样拒绝，属共同约束。
 //
 // ⚠️ 正则语义交集约束（bash ERE ↔ JS RegExp）：本文件 SEMVER_RE 与 release.yml 的 bash 内联正则
 // 必须逐字一致（test_tag_validator.js 断言），但「逐字一致」只防文本漂移、不防语义分叉——bash ERE 与
@@ -22,18 +29,27 @@
 // 边界如实说明：黑名单强制的只是上面**已列出**的形态，它并不穷举 bash 与 JS 的全部方言差异
 // （例如 GNU 大小写算子 \l \U \L \E、排序/等价元素 [.ch.] [=a=] 等未列入），故新增写法前仍须按
 // 「两方言交集」人工判断——「CI 没红」不等价于「语义一定一致」。
+// 同类未列入的还有：字符类**范围**的 locale/校对序敏感性（[a-z] 一类在不同 LC_ALL/LC_COLLATE 下展开
+// 的字符集合可能不同）。本正则现用的范围只有 [0-9]、[1-9]、[0-9A-Za-z-] 三个，ASCII 下两方言展开一致；
+// 将来若引入依赖 locale 的范围，黑名单不会报红，必须人工复核（该风险为环境依赖的理论风险）。
 'use strict'
 
 const SEMVER_RE = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?([-][0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?([+][0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/
 
 // 判断一个「去掉 v 前缀后的版本号」（version）是否合法。
 // workflow 里 `${GITHUB_REF#refs/tags/v}` 得到的正是这个字符串；返回布尔值，供测试断言。
+// 入参必须是字符串：RegExp.test 会先把非字符串入参 String() 化（1.2 → '1.2'、['1.2.3'] → '1.2.3'），
+// 从而把非法类型静默判成「合法」；这里显式拒绝，合法字符串入参的行为不变。
 function isValidVersion (version) {
+  if (typeof version !== 'string') return false
   return SEMVER_RE.test(version)
 }
 
 // CLI 用法：node scripts/validate-release-tag.js <tag>  校验单个 tag（含 v 前缀则去掉）。
-// exit 0 = 合法；1 = 非法。供 workflow / 提交前钩子复用同一套判断。
+// exit 0 = 合法；1 = 非法；2 = 未提供 tag（用法错误，见下）。
+// 当前**无生产调用点**：release.yml 保留自持的内联副本，pre-commit 只跑 lint/版本闸门/test:filter、不执行本文件。
+// 本 CLI 分支也没有任何自动化覆盖（test_tag_validator.js 的 spawnSync 跑的是 release.yml 里的 node 载荷），
+// 故改动此处文案/退出码只能人工验证。
 if (require.main === module) {
   const tag = process.argv[2]
   if (tag === undefined) {
@@ -42,10 +58,10 @@ if (require.main === module) {
   }
   const version = tag.startsWith('v') ? tag.slice(1) : tag
   if (isValidVersion(version)) {
-    console.log(`版本号格式校验通过：v${version}`)
+    console.log(`版本号格式校验通过：${tag}`)
     process.exit(0)
   }
-  console.error(`❌ tag 名称 'v${version}' 不是合法版本号（应为 v数字.数字[.数字][-后缀] 形式，如 v3.272 / v3.272.0）`)
+  console.error(`❌ tag 名称 '${tag}' 不是合法版本号（应为 v数字.数字[.数字][-后缀] 形式，如 v3.272 / v3.272.0）`)
   process.exit(1)
 }
 

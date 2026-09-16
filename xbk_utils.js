@@ -225,13 +225,13 @@ function createUtils (options = {}) {
     return null
   },
 
-  // v3.259 提取：其他格式回退宿主解析（含 ISO 2026-08-01T00:00:00Z、/ 分隔等）
+  // v3.259 提取：其他格式回退宿主解析（含 ISO 2026-08-01T00:00:00Z 等；'YYYY/MM/DD' 由 _parseSlashDate 全量拦截）
   _parseFallback (s) {
-    // v3.115：无时区标记的本地语义字符串按 UTC 补 Z（纯日期已被上方分支拦截；此处为 'YYYY/MM/DD' 等）
+    // v3.115：无时区标记的本地语义字符串按 UTC 补 Z（纯日期已被上方分支拦截；此处为 ISO/空格分隔等）
+    // P1-07：原 'YYYY/MM/DD' 补 Z 分支已删除——_parseSlashDate 对同形输入恒返回 number|null，
+    // parseTime 在 _parseSlashDate 之后即返回，该分支不可达（test_utils.js 第 16/31 行注释亦如此锁定）。
     let t
-    if (!/[T Z]/.test(s) && /^\d{4}\/\d{1,2}\/\d{1,2}$/.test(s)) {
-      t = new Date(s.replace(/\//g, '-') + 'T00:00:00Z')
-    } else if (!/[Zz]/.test(s) && !/[+-]\d{2}:?\d{2}$/.test(s) && (s.includes('T') || /^\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{2}/.test(s))) {
+    if (!/[Zz]/.test(s) && !/[+-]\d{2}:?\d{2}$/.test(s) && (s.includes('T') || /^\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{2}/.test(s))) {
       // v3.131：ISO/空格分隔无时区标记（'2026-08-01T10:30:00' / '2026-08-01 10:30:00'）→ 补 Z
       // ——v3.115 只统一了纯日期和 / 分隔，此格式走本地解析致跨时区差 1 天（Honolulu 实测 0 vs UTC 1）
       t = new Date(s.replace(' ', 'T') + 'Z')
@@ -278,6 +278,13 @@ function createUtils (options = {}) {
     while (hi > lo && isTrimChar(value[hi - 1])) hi--
     return lo === 0 && hi === value.length ? value : value.slice(lo, hi)
   },
+  /**
+     * 归一化「带 scheme」URL 的主机大小写（scheme 一并小写），供 normUrl 判重使用。
+     * P1-08（已知取舍）：只匹配 `scheme://`，而 normUrl 在调用本函数前先经 _trimUrlEdges
+     * 剥掉前导 `/`，故协议相对 URL（`//Example.COM/P`）到不了这里，主机大小写不归一，
+     * 与 `http://example.com/P` 也不是同一判重键。补 `//host` 形态会改变既有判重键
+     * （跨运行缓存身份），属判重语义变更，见工单 defer。
+     */
   _normalizeUrlAuthority (value) {
     const m = /^[a-z][a-z0-9+.-]*:\/\//i.exec(value)
     if (!m) return value
@@ -379,6 +386,10 @@ function createUtils (options = {}) {
     // 输出 `<a href=""javascript:y>` 残留 javascript）。含 `<` 的"成对"实为未闭合，
     // 由下方 _cleanUnclosedUrlAttrs 线性处理（值内 `<` 是标签边界，合法 URL 值不含裸 `<`）。
     html = html.replace(/\b(href|src)\s*=\s*(["'])([^<]*?)\2/gi, (_, name, quote, value) => cleanAttr(name, quote, value))
+    // P1-04（RE2 回落，已知取舍）：本行与 _cleanNavAttrs / _cleanSrcsetAttrs / _cleanStyleAttrs 的
+    // 成对引号正则都用反向引用（\1/\2），Google RE2 不支持该语法 → safeRe（xbk_function_v3.js:27）
+    // 必然 catch 并静默回落 V8 RegExp，这几条模式不享有 RE2 的线性时间防护。
+    // 未就地改写为无反向引用形态：等价性需逐条验证，且会改动清洗链语义（见工单 defer）。
     html = html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
     // v3.251 P0(XSS)：未闭合引号属性绕过——`<a href="javascript:alert(1)` 无闭合引号时
     // 上面两个正则均不匹配（成对引号/无引号值），危险协议保留并被执行。这里单独处理
@@ -580,7 +591,10 @@ function createUtils (options = {}) {
       const valueStart = attrValueRe.lastIndex
       const seg = this._attrSegAt(html, attrM, valueStart)
       if (seg === null) {
-        // 无闭合引号：本处及之后不再有可完整保护的属性对，剩余原样保留（与原正则无匹配一致）
+        // 无闭合引号：本处及之后不再有可完整保护的属性对，剩余部分原样保留（与原正则无匹配一致）。
+        // P1-06（注释订正）：保护在此关闭后，剩余文本中*属性值内*的 on* 字样会暴露给 _stripEventAttrs
+        // 并被当作事件属性删空（`<img a="oops <b title="see onerror=x" src="y">` → 值内 onerror=x 丢失）。
+        // 彻底修需让 _stripEventAttrs 也做标签/引号上下文判定（清洗链语义变更，见工单 defer）。
         attrValueRe.lastIndex = 0 // P2-02：该正则取自 safeRe 全局缓存且带 g，break 前不复位会污染下一次调用
         attrOut += html.slice(attrPos)
         attrPos = html.length
@@ -660,7 +674,9 @@ function createUtils (options = {}) {
       })
       .replace(safeRe('\\bsrcset\\s*=\\s*([^\\s"\'<>`]+)', 'gi'), (_, value) => {
         const v = compact(value)
-        return /^(?:javascript|vbscript|data):/.test(v) ? 'srcset=""' : `srcset=${value}`
+        // P1-05：无引号值的候选同样以逗号分隔，检测口径与上方成对引号分支对齐（(?:^|[,])），
+        // 否则 `srcset=x.png,javascript:alert(1)` 这类后续候选危险协议会被原样保留。
+        return /(?:^|[,])(?:javascript|vbscript|data):/.test(v) ? 'srcset=""' : `srcset=${value}`
       })
   },
 
@@ -913,6 +929,10 @@ function createUtils (options = {}) {
     // 过滤空值：避免全空字段导致不同数据撞同一个 key
     // v3.108 fuzz 发现：String(Symbol()) 抛 TypeError——Symbol 字段视为无效过滤
     // str 只执行一次（原 filter 与 map 各跑一遍、每字段 3 次正则 replace 属轻微浪费，P3）
+    // XBK-UTILS-P2-05（已知前提/取舍）：非原始值（对象/数组）经下方 str() 的 String() 塌缩为
+    // '[object Object]'，故两个匿名条目若仅同一对象字段不同（getMessageIdentity 传入的 pic 等
+    // 接口字段可能是对象/数组）会撞同一身份、被判同一条。改走稳定序列化会改变历史 anon: 键，
+    // 使「历史匿名 id 降级」比对与既有缓存身份失效（判重/缓存身份语义），见工单 defer。
     const str = (p) => {
       if (typeof p === 'symbol') return ''
       try { return String(p).replace(safeRe('%', 'g'), '%25').replace(safeRe('\\\\', 'g'), '%5C').replace(safeRe('\\|', 'g'), '%7C') } catch (e) { return '' }

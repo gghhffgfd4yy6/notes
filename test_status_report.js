@@ -3,7 +3,10 @@
 // scripts/status.js 单元测试：
 //   - parseLastRun invalid 分支（run.log 无匹配行）
 //   - parseLastRun 多行取最后一行匹配
+//   - parseLastRun 行首锚定：真实摘要行仍可解析、行中间内嵌 total= 不再误命中
 //   - parseDiagnostics 跳过损坏行找到有效记录
+//   - validReport 容忍缺失计数字段（存在的字段仍须校验）
+//   - validReport 容忍缺失 date 字段（date 存在时仍须为字符串，CodeRabbit PR #147）
 //   - formatStatus channels.value 为 null 时的降级分支
 const assert = require('node:assert')
 const fs = require('node:fs')
@@ -56,6 +59,69 @@ try {
     assert.strictEqual(status.diagnostics.status, 'ok', '应跳过损坏行找到有效记录')
     assert.strictEqual(status.diagnostics.value.total, 20, '应返回最后有效记录的 total=20，而非第一条的 10')
     assert.deepStrictEqual(status.diagnostics.value.byReason, { title: 6, category: 2 }, '最后有效记录的 byReason 应完整保留')
+  })
+
+  // ===== parseLastRun 行首锚定：真实写入格式（时间戳前缀 + 尾部附加字段）仍可解析 =====
+  test('S5 run.log 真实摘要行（时间戳+尾部 dry-run/noidentity）+ 其后 ERROR 行内嵌 total= 子串 → 取真实摘要行', () => {
+    fs.writeFileSync(path.join(tmp, 'run.log'), [
+      '2026-09-08 10:00:00 total=42 dedup=5 filtered=7 truncated=2 pushed=28 failed=2 elapsed=3.4s dry-run未推送=3 noidentity=1',
+      '2026-09-08 10:05:00 ERROR [v3.999.0] ⚠️ xbk-push 运行异常 原因：HTTP 500 total=99 dedup=99 filtered=99 truncated=99 pushed=99 failed=99 elapsed=9.9s'
+    ].join('\n') + '\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.status, 'ok', '真实写入格式（时间戳前缀 total=… elapsed=…s）应被解析')
+    assert.strictEqual(status.run.value.total, 42, '应取真实摘要行的 total=42，而非其后 ERROR 行内嵌的 total=99')
+    assert.strictEqual(status.run.value.truncated, 2, 'truncated=2 应原样解析')
+    assert.strictEqual(status.run.value.pushed, 28, 'pushed=28 应原样解析')
+    assert.strictEqual(status.run.value.elapsed, '3.4s', 'elapsed 应原样保留（含尾部 s）')
+  })
+
+  // ===== parseLastRun 行首锚定：行中间内嵌的 total=… 不再被误命中 =====
+  test('S6 run.log 仅 ERROR 行内嵌 total=… 子串（行首为其它文字）→ invalid', () => {
+    fs.writeFileSync(path.join(tmp, 'run.log'), [
+      '2026-09-08 12:00:00 [ERROR] 运行异常 原因：bad response total=5 dedup=1 filtered=2 truncated=0 pushed=2 failed=0 elapsed=0.5s',
+      'ERROR 流水线中断 total=7 dedup=1 filtered=1 truncated=0 pushed=1 failed=1 elapsed=0.1s'
+    ].join('\n') + '\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.status, 'invalid', '行中间的 total= 不应被当作摘要行')
+    assert.strictEqual(status.run.value, undefined, 'invalid 时不应有 value')
+  })
+
+  // ===== validReport：缺失计数字段不再是整表 invalid，但已存在的字段仍须校验 =====
+  test('S7 report.state 缺失计数字段 → ok（date 必需）；已存在但非法的计数 → 仍 invalid', () => {
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ date: '2026-09-08' }) + '\n')
+    let status = readStatus(tmp)
+    assert.strictEqual(status.report.status, 'ok', '仅有 date、七项计数全缺失的 report.state 应视为 ok')
+    assert.strictEqual(status.report.value.date, '2026-09-08', 'value 应原样保留')
+
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ date: '2026-09-08', runs: 3, pushed: 9 }) + '\n')
+    status = readStatus(tmp)
+    assert.strictEqual(status.report.status, 'ok', '部分计数字段缺失时仍应视为 ok')
+    assert.strictEqual(status.report.value.pushed, 9, '已存在的计数字段应保留')
+
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ date: '2026-09-08', total: -1 }) + '\n')
+    assert.strictEqual(readStatus(tmp).report.status, 'invalid', '已存在的计数字段仍须校验：负数应 invalid')
+
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ date: '2026-09-08', pushed: 'x' }) + '\n')
+    assert.strictEqual(readStatus(tmp).report.status, 'invalid', '已存在的计数字段仍须校验：非整数应 invalid')
+  })
+
+  // ===== validReport：date 缺失同样合法（CodeRabbit PR #147），但 date 存在时必须仍是字符串 =====
+  // 生产侧 _loadReportState 接受 raw.date === undefined、_normalizeReportState 归一化为 ''，
+  // 故合法的 {"runs":1} 不得被显示成「日报：不可读（invalid）」；修前该用例为 invalid。
+  test('S8 report.state 缺 date 字段 → ok（date 存在但非字符串仍 invalid）', () => {
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ runs: 1 }) + '\n')
+    const first = readStatus(tmp)
+    assert.strictEqual(first.report.status, 'ok', '仅有 runs、date 缺失的 report.state 应视为 ok（修前为 invalid）')
+    assert.strictEqual(first.report.value.runs, 1, 'value 应原样保留')
+
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({}) + '\n')
+    assert.strictEqual(readStatus(tmp).report.status, 'ok', '空对象（date 与七项计数全缺失）同样应视为 ok')
+
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ runs: 1, date: 123 }) + '\n')
+    assert.strictEqual(readStatus(tmp).report.status, 'invalid', 'date 存在但为数字仍须 invalid（校验不能整体放开）')
+
+    fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ runs: 1, date: null }) + '\n')
+    assert.strictEqual(readStatus(tmp).report.status, 'invalid', 'date=null 不是 undefined、也不是字符串 → 仍 invalid')
   })
 
   // ===== formatStatus：channels.value 为 null（status ok 但 value null）时降级 =====

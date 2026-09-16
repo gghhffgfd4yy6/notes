@@ -394,6 +394,9 @@ function createFormatter ({ Utils, safeRe }) {
           const isTrackedUnknownClose = isClosing && unknownPairs.length > 0 && unknownPairs[unknownPairs.length - 1] === name
           if (gt === lt + 1 || !name || (!knownTags.has(name) && !looksLikeClosedUnknown && !isTrackedUnknownClose)) {
             // 未闭合的未知片段更可能是普通文本（如 `<world>`）；保留当前字符继续扫描。
+            // 审查 2026-09-14 F-06（明确保留现状，未收紧）：错配闭合（`<x>a</y>b</x>` 的 `</y>`）与
+            // 无 `>` 的未闭合前缀（`前 <a href="https://a`）同走此分支，按「更像普通文本」原样保留——
+            // 收紧会吞掉 `价格<100 元` 这类合法正文，且该语义已被 test_formatter.js:267-268 断言锁定。
             // `<<>>` 仍按历史语义丢弃首个尖括号，避免旧的畸形输入断言回归。
             if (!name && str[lt + 1] === '<') {
               out += str.slice(pos, lt)
@@ -454,7 +457,10 @@ function createFormatter ({ Utils, safeRe }) {
     // 避免像 App.run 里那样对同一条数据分别调用 tuisong_replace 生成 text/desp 时，
     // 没用到 Markdown 的那次也白白算一遍 htmlToMarkdown
     // url 做 HTML 转义，避免特殊字符破坏 <a href="..."> 结构；换行先剥离（v3.85，与 linkText 口径一致）；非字符串视为无链接（R6-1）
-    const rawUrl = Utils.safeUrl(Utils.safeGet(data, 'url'))
+    // 审查 2026-09-14 F-07 预备：保留 safeUrl 之前的原始值，用于区分「本来就没有 url」与
+    // 「有 url 但被安全过滤掉（危险协议/非字符串）」——前者不该输出悬空「原文链接：」。
+    const rawUrlInput = Utils.safeGet(data, 'url')
+    const rawUrl = Utils.safeUrl(rawUrlInput)
     const safeHtmlUrl = rawUrl
     const escUrl = safeHtmlUrl
       .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -478,9 +484,15 @@ function createFormatter ({ Utils, safeRe }) {
     // PR 评审 #143-1：改为直接调用 _mdDestination，不再自留第二份包裹实现——那份漏了角括号编码，
     // 与锚点路径行为分叉（`https://x/a(b)>c` 会产出 `<https://x/a(b)>c>` 被提前截断）。
     const linkText = () => this._mdDestination(Utils.safeUrl(Utils.safeGet(data, 'url')))
+    // 审查 2026-09-14 F-07：无 url 时不再输出悬空的「原文链接：」，与 Markdown 路径（:419
+    // mdUrl 为假则整段不追加）同口径。危险协议/非字符串 url 被 safeUrl 过滤后 rawUrlInput 仍非空，
+    // 保留纯文本提示且不生成 href（test_filter「危险 URL 仍保留原文链接文本提示」）。
+    const hasRawUrl = typeof rawUrlInput === 'string' && rawUrlInput.length > 0
     const getContentHtml = () => safeHtmlUrl
       ? `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="${escUrl}" target="_blank">${escUrl}</a><br>&nbsp;<br>&nbsp;<br>`
-      : `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：${escUrl}<br>&nbsp;<br>&nbsp;<br>`
+      : hasRawUrl
+        ? `${rawHtml}<br>&nbsp;<br>&nbsp;<br>原文链接：<br>&nbsp;<br>&nbsp;<br>`
+        : rawHtml
 
     const map = {
       '{标题}': data.title,

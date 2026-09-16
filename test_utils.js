@@ -55,6 +55,38 @@ const scriptOutput = Utils.sanitizeDecodedHtml(scriptInput)
 assert.ok(!scriptOutput.includes('alert(1)'), 'script 标签内容应被移除')
 assert.ok(scriptOutput.includes('before') && scriptOutput.includes('after'), '前后文本应保留')
 
+// ===== _cleanSrcsetAttrs：无引号多候选危险协议（P1-05，xbk_utils.js 无引号分支）=====
+// 无引号 srcset 的候选同样以逗号分隔。旧实现只检测「值首」协议 /^(?:javascript|vbscript|data):/，
+// 于是 `srcset=a.png,javascript:alert(1)` 的后续候选被原样保留；现口径与成对引号分支对齐为
+// /(?:^|[,])(?:javascript|vbscript|data):/ —— 任一候选命中即清空整个属性。
+const srcsetJs = Utils.sanitizeDecodedHtml('<img srcset=a.png,javascript:alert(1) src=x>')
+assert.strictEqual(srcsetJs, '<img srcset="" src=x>', '无引号 srcset 后续候选 javascript: 应清空整个属性')
+
+const srcsetVbs = Utils.sanitizeDecodedHtml('<img srcset=a.png,vbscript:x src=x>')
+assert.strictEqual(srcsetVbs, '<img srcset="" src=x>', '无引号 srcset 后续候选 vbscript: 应清空整个属性')
+
+const srcsetData = Utils.sanitizeDecodedHtml('<img srcset=a.png,data:text/html,x src=x>')
+assert.strictEqual(srcsetData, '<img srcset="" src=x>', '无引号 srcset 后续候选 data: 应清空整个属性')
+
+// compact() 先 toLowerCase：协议大小写混写同样命中
+const srcsetUpper = Utils.sanitizeDecodedHtml('<img srcset=a.png,JAVASCRIPT:alert(1) src=x>')
+assert.strictEqual(srcsetUpper, '<img srcset="" src=x>', '无引号 srcset 后续候选大小写混写 JAVASCRIPT: 也应清空')
+
+// 纯安全多候选（a.png,b.png）不命中危险协议 → 原样保留，不得误伤
+const srcsetSafe2 = Utils.sanitizeDecodedHtml('<img srcset=a.png,b.png src=x>')
+assert.strictEqual(srcsetSafe2, '<img srcset=a.png,b.png src=x>', '纯安全两候选 srcset 应原样保留')
+const srcsetSafe3 = Utils.sanitizeDecodedHtml('<img srcset=a.png,b.png,c.png src=x>')
+assert.strictEqual(srcsetSafe3, '<img srcset=a.png,b.png,c.png src=x>', '纯安全三候选 srcset 应原样保留')
+
+// 锚定语义：(?:^|[,]) 要求协议位于候选开头；候选内部出现的 javascript 字样不应触发清空
+// （防回归为无锚定的 /javascript:/ 而误伤合法路径）
+const srcsetInner = Utils.sanitizeDecodedHtml('<img srcset=a.png,bjavascript:x src=x>')
+assert.strictEqual(srcsetInner, '<img srcset=a.png,bjavascript:x src=x>', '候选内部（非候选开头）的 javascript 字样不应触发清空')
+
+// 对照：成对引号分支早已是同口径，锁定两分支一致
+const srcsetQuoted = Utils.sanitizeDecodedHtml('<img srcset="a.png,javascript:alert(1)" src=x>')
+assert.strictEqual(srcsetQuoted, '<img srcset="" src=x>', '带引号 srcset 后续候选 javascript: 应清空整个属性')
+
 // ===== safeErrorText：错误文本提取分支 =====
 // 行 697：error 有 code 属性（无 message）→ 返回 code
 const errWithCode = Utils.safeErrorText({ code: 'ENOENT' })

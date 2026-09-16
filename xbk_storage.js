@@ -10,6 +10,13 @@ function isRegularOrMissing (filePath) {
     console.warn(`isRegularOrMissing: filePath 非字符串(${typeof filePath})，视为不安全，拒绝`)
     return false
   }
+  // 空串是非法路径：lstatSync('') 抛 ENOENT 会被下面的 catch 判为「文件不存在=安全」，
+  // 从而让 writeAtomic 以空 filePath 在进程 CWD 落一个含 payload 的临时文件（审查 STG-03）。
+  // 显式拒绝，避免安全入口给出「可用」的假信号。
+  if (filePath === '') {
+    console.warn('isRegularOrMissing: filePath 为空串，视为不安全，拒绝')
+    return false
+  }
   try { return fs.lstatSync(filePath).isFile() } catch (e) {
     if (e && e.code === 'ENOENT') return true
     const detail = e && e.code ? `${e.code}` : (e && e.message ? e.message : String(e))
@@ -20,15 +27,23 @@ function isRegularOrMissing (filePath) {
 
 function ensureParent (filePath) {
   const dir = path.dirname(filePath)
+  // 已知口径差（审查 STG-06，记录不修）：不传 mode，目录权限随 umask（022 下为 0755），
+  // 与本模块文件强制 0o600 不一致；缓存目录首建即在此处，是否收紧到 0o700 属权限模型决策，
+  // 不在本轮范围。
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
 }
 
 function writeAtomic (filePath, text, label = '缓存文件') {
   // 已知取舍（审查 2026-08-15，记录不修）：isRegularOrMissing 检查与 renameSync 之间、以及
   // cacheDir 的 realpath 校验与每次写入之间均存在 TOCTOU 窗口（校验时是普通文件/目录，窗口内被替换
-  // 为符号链接时，rename 会替换链接本身不跟随，但中间目录若为链接可指向根外）。已属多层防御
-  // （basename 清洗 + O_NOFOLLOW 读 + 原子写 + 唯一 tmp），攻击者需先具备对项目根/缓存目录的写权限，
-  // 风险等级低，接受现状（单实例 cron 信任本地文件系统）。
+  // 为符号链接时，rename 会替换链接本身不跟随，但中间目录若为链接可指向根外）。本模块自身只提供
+  // 「末级 lstat + 唯一 tmp + 原子写」；basename 清洗在调用方（xbk_message_store.getFilePath /
+  // xbk_app._writeRunLog），O_NOFOLLOW 只作用于 readSafeTextResult 的读路径，写路径不做路径清洗
+  // 或目录包含校验（审查 STG-07：原注释把后两者记为本模块写路径的防御层，口径有误，已改正）。
+  //
+  // 另：写路径不含 fsync（文件与父目录），rename 的原子性只保证不出现半写文件，不保证掉电后持久性；
+  // 该取舍已在 SYSTEM_CONTRACT.md「原子写不含 fsync」记录（审查 STG-04，记录不修）。
+  // 攻击者需先具备对项目根/缓存目录的写权限，风险等级低，接受现状（单实例 cron 信任本地文件系统）。
   if (!isRegularOrMissing(filePath)) {
     console.error(`拒绝写入非普通文件 ${label} ${filePath}`)
     return false
@@ -71,8 +86,8 @@ function writeAtomicIfAbsent (filePath, text, label = '缓存初始化') {
   }
 }
 
-// 可选大小上限：maxBytes > 0 时，普通文件超过该字节数即判 tooLarge，避免异常膨胀
-// 文件被整读入内存（状态/哈希等小文件场景）。
+// 可选大小上限：maxBytes 为数字且 > 0 时，普通文件超过该字节数即判 tooLarge，避免异常膨胀
+// 文件被整读入内存（状态/哈希等小文件场景）。maxBytes 非数字或 ≤0 时按既有语义处理为「不设限」。
 function readSafeTextResult (filePath, maxBytes) {
   // 修复 TOCTOU：先以 O_NOFOLLOW 打开并 fstat 确认为普通文件，读取后复检路径仍指向
   // 同一 inode（dev+ino）的普通文件。路径读取（保持既有故障注入兼容）后若被替换成
@@ -114,8 +129,10 @@ function readSafeTextResult (filePath, maxBytes) {
   }
 }
 
-function readSafeText (filePath) {
-  const result = readSafeTextResult(filePath)
+// maxBytes 透传给 readSafeTextResult：不传时与旧行为完全一致（不设上限），
+// 调用方可据此对这条读取入口显式设限（审查 STG-05）。
+function readSafeText (filePath, maxBytes) {
+  const result = readSafeTextResult(filePath, maxBytes)
   return result.status === 'ok' ? result.text : null
 }
 

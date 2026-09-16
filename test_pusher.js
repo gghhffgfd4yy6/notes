@@ -132,6 +132,163 @@ function test (name, fn) {
     assert.strictEqual(received, desp, '纯文本不应被清洗改写')
   })
 
+  // ===== 超时顶层 code（审查 2026-08-15 P3）=====
+  // 回归：超时 reject 的 error 必须能自描述。改动前只有 error.failures[].code，
+  // 顶层 error.code 为 undefined（failures 为空时更无从判断失败原因是超时）。
+  await test('P8 超时 error 顶层 code = PUSH_TIMEOUT（不止 failures 内层）', async () => {
+    const originalSetTimeout = global.setTimeout
+    let watchdogTimer
+    const watchdog = new Promise((_resolve, reject) => {
+      watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未在预期时间内 settle')), 5000)
+    })
+    try {
+      global.setTimeout = (fn, ms, ...args) => {
+        if (ms === 10000) fn(...args)
+        return originalSetTimeout(() => {}, 0)
+      }
+      const notifyMod = {
+        sendNotify: () => new Promise(() => {}),
+        configuredChannelNames: () => ['ch1']
+      }
+      const p = createPusher({
+        Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
+        getNotify: async () => notifyMod
+      })
+      let err = null
+      try {
+        await Promise.race([p.send('text', 'desp', notifyMod), watchdog])
+      } catch (e) {
+        err = e
+      }
+      assert.ok(err && err.message.includes('超时'), `超时分支必须 reject 且 message 含"超时"，实际: ${err && err.message}`)
+      assert.strictEqual(err.code, 'PUSH_TIMEOUT', '顶层 error.code 应为 PUSH_TIMEOUT（回退 P3 后此处为 undefined）')
+    } finally {
+      clearTimeout(watchdogTimer)
+      global.setTimeout = originalSetTimeout
+    }
+  })
+
+  // ===== 超长 desp 截断（审查 2026-08-15 P4）=====
+  // 回归：>100000 时不得再静默 slice——必须走注入的 Utils.truncateUtf16（代理对/ZWJ 安全）
+  // 且补一条「配置被硬上限覆盖」告警；回退该改动后 truncateUtf16 不会被调用、也不会有告警。
+  await test('P9 desp 超 100000 → 调用 Utils.truncateUtf16 截断并告警（P4）', async () => {
+    const spy = { calls: [] }
+    const desp = 'a'.repeat(100001)
+    let received
+    const warns = []
+    const originalWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      const notifyMod = {
+        sendNotify: async (t, d) => { received = d },
+        configuredChannelNames: () => ['ch1']
+      }
+      const p = createPusher({
+        Utils: {
+          sanitizeDecodedHtml: s => s,
+          decodeHtmlEntities: s => s,
+          truncateUtf16: (s, max) => { spy.calls.push([s.length, max]); return s.slice(0, max) }
+        },
+        getNotify: async () => notifyMod
+      })
+      await p.send('标题', desp, notifyMod)
+    } finally {
+      console.warn = originalWarn
+    }
+    assert.deepStrictEqual(spy.calls, [[100001, 100000]],
+      '必须调用 Utils.truncateUtf16(desp, 100000)，而不是静默 slice')
+    assert.strictEqual(received, 'a'.repeat(100000), '推送内容应被截断到硬上限')
+    assert.ok(warns.some(w => w.includes('超过硬上限') && w.includes('100000')),
+      `截断必须告警（配置与行为不一致需可观测）；实际 warns=${JSON.stringify(warns)}`)
+  })
+
+  await test('P10 Utils 未提供 truncateUtf16 → 退回 slice（不抛错、仍截断）', async () => {
+    const desp = 'b'.repeat(100001)
+    let received
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const notifyMod = {
+        sendNotify: async (t, d) => { received = d },
+        configuredChannelNames: () => ['ch1']
+      }
+      const p = createPusher({
+        Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
+        getNotify: async () => notifyMod
+      })
+      await p.send('标题', desp, notifyMod)
+    } finally {
+      console.warn = originalWarn
+    }
+    assert.strictEqual(received, 'b'.repeat(100000), '缺 truncateUtf16 时须退回 slice，不能抛错或漏截断')
+  })
+
+  // CodeRabbit PR #147 #9：退回分支必须自己做代理对安全截断，不能裸 slice。
+  // 跨边界载荷：99999 个 'a' + 代理对 emoji（总长 100001），硬上限 100000 恰落在代理对中间——
+  // 裸 slice(0, 100000) 会留下孤立高位代理（半个 emoji 乱码），违反 SYSTEM_CONTRACT 的 UTF-16 安全截断。
+  await test('P10b Utils 未提供 truncateUtf16 → 退回截断不得切断代理对（跨边界载荷）', async () => {
+    const desp = 'a'.repeat(99999) + '😀'
+    assert.strictEqual(desp.length, 100001, '载荷应总长 100001 码元（截断点落在代理对中间）')
+    let received
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const notifyMod = {
+        sendNotify: async (t, d) => { received = d },
+        configuredChannelNames: () => ['ch1']
+      }
+      const p = createPusher({
+        Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
+        getNotify: async () => notifyMod
+      })
+      await p.send('标题', desp, notifyMod)
+    } finally {
+      console.warn = originalWarn
+    }
+    assert.strictEqual(typeof received, 'string', '缺 truncateUtf16 时须退回本地截断，不能抛错或漏截断')
+    assert.strictEqual(received.length, 99999, '截断点落在代理对中间时须整体退一格，长度为 99999')
+    const lastCode = received.charCodeAt(received.length - 1)
+    assert.ok(!(lastCode >= 0xD800 && lastCode <= 0xDBFF),
+      `末位码元不得是孤立高位代理（实际 0x${lastCode.toString(16)}）——被切断的代理对会渲染成乱码`)
+  })
+
+  // ===== 超时归因缺失告警（审查 2026-08-15 P3 零风险半边②）=====
+  await test('P11 超时且 configuredChannelNames 缺失 → failures 为空并告警', async () => {
+    const originalSetTimeout = global.setTimeout
+    let watchdogTimer
+    const watchdog = new Promise((_resolve, reject) => {
+      watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未在预期时间内 settle')), 5000)
+    })
+    const warns = []
+    const originalWarn = console.warn
+    try {
+      console.warn = (...args) => { warns.push(args.join(' ')) }
+      global.setTimeout = (fn, ms, ...args) => {
+        if (ms === 10000) fn(...args)
+        return originalSetTimeout(() => {}, 0)
+      }
+      const notifyMod = { sendNotify: () => new Promise(() => {}) } // 刻意不提供 configuredChannelNames
+      const p = createPusher({
+        Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
+        getNotify: async () => notifyMod
+      })
+      let err = null
+      try {
+        await Promise.race([p.send('text', 'desp', notifyMod), watchdog])
+      } catch (e) {
+        err = e
+      }
+      assert.ok(err && err.message.includes('超时'), `超时分支必须 reject，实际: ${err && err.message}`)
+      assert.deepStrictEqual(err.failures, [], '无法取得通道清单时 failures 为空（既有语义不变）')
+      assert.ok(warns.some(w => w.includes('configuredChannelNames')),
+        `归因整体缺失必须告警；实际 warns=${JSON.stringify(warns)}`)
+    } finally {
+      clearTimeout(watchdogTimer)
+      console.warn = originalWarn
+      global.setTimeout = originalSetTimeout
+    }
+  })
+
   console.log(`test_pusher OK (${failed === 0 ? '全部通过' : failed + ' 项失败'})`)
   process.exit(failed > 0 ? 1 : 0)
 })()

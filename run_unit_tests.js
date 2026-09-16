@@ -68,8 +68,45 @@ const IN_CI = Boolean(process.env.GITHUB_STEP_SUMMARY)
 const summaryLines = ['| 套件 | 文件 | 结果 | 耗时 |', '|---|---|---|---|']
 // CI 下 stdout 走 pipe 收进内存（失败时打包重显），故必须显式放大上限：execFileSync 默认 maxBuffer=1MiB，
 // 超限会抛 ENOBUFS——触发按失败处理（fail-loud，见下方 catch 的注解）；实测最大套件 test_filter.js 约 75KB，
-// 8MiB 上限余量充足，生产不会误触。XBK_UNIT_MAX_BUFFER 仅用于测试注入（构造超限场景），生产不设。
+// 8MiB 上限余量充足，「成功路径」不会误触。注意该上限并不约束失败回显：ENOBUFS 时 e.stdout 含触发块
+// （回显量约 MAX_BUFFER + 单块），故 catch 里统一用 clipForLog 按同一上限裁剪并标注省略量（UT-06）。
+// XBK_UNIT_MAX_BUFFER 仅用于测试注入（构造超限场景），生产不设。
 const MAX_BUFFER = Number(process.env.XBK_UNIT_MAX_BUFFER) || 8 * 1024 * 1024
+
+// 环境变量正整数解析（与 run_mutation.js 的 positiveIntEnv 同口径；不 require 该文件，避免把变异入口
+// 及其依赖拉进本进程）：非法值（NaN / 负数 / 非整数 / 空串）一律告警并回退默认。
+function positiveIntEnv (name, fallback) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 1) {
+    console.warn(`⚠️  环境变量 ${name}=${raw} 非法（应为正整数），已回退默认值 ${fallback}`)
+    return fallback
+  }
+  return value
+}
+
+// 每套件硬超时（UT-03）：套件挂死（死循环 / 等待不会到来的输入 / 遗留句柄）时 execFileSync 永不返回，
+// 本入口既不汇总也不退出，CI 只能等作业级超时——整步既无结论也无红测定位。此处补上与 run_mutation.js
+// 的 MUTATION_TIMEOUT 同口径的兜底；killSignal 用 SIGKILL（同 run_mutation.js），SIGTERM 可能被忽略。
+// 默认 600s：本机全量基线最慢单元套件实测 132.2s（test_run_mutation_cli.js），Stryker 插桩沙箱下需留
+// 足余量以免误杀（stryker.config.js 的 timeoutMS 亦按 300000 量级的加法偏移留量）。XBK_UNIT_TIMEOUT
+// 仅供测试注入/本机调参，生产不设。
+const UNIT_TIMEOUT = positiveIntEnv('XBK_UNIT_TIMEOUT', 10 * 60 * 1000)
+
+// 失败回显裁剪（UT-06）：失败时回显的是子进程 stdout，其唯一约束来自 maxBuffer，而 ENOBUFS 恰恰是
+// 「已超出该上限」——故超限路径的回显量并不受 MAX_BUFFER 约束（约 MAX_BUFFER + 单块）。此处按同一上限
+// 裁剪并显式标注省略量（不静默丢弃）；输出未超限的正常失败逐字保留，行为不变。
+// CodeRabbit PR #147：maxBuffer 是**字节**上限，而字符串 length 数的是 UTF-16 码元——多字节输出
+// （中文/emoji）可能在 length 未超限时字节已超限。故这里接收原始 Buffer，按字节裁剪，并在
+// 字节边界上回退到 UTF-8 字符起始处，避免把多字节字符切成半个（输出乱码）。
+function clipForLog (buf, limit) {
+  const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf == null ? '' : buf), 'utf8')
+  if (bytes.length <= limit) return bytes.toString('utf8')
+  let end = limit
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end-- // 回退到 UTF-8 字符首字节
+  return `${bytes.subarray(0, end).toString('utf8')}\n…（失败回显已省略 ${bytes.length - end} 字节：回显按 MAX_BUFFER=${limit} 上限裁剪，完整输出见套件自身日志）`
+}
 
 for (const s of UNIT_SUITES) {
   const file = path.join(__dirname, s.file)
@@ -81,7 +118,7 @@ for (const s of UNIT_SUITES) {
     // cwd 固定为 __dirname（与上面的 __dirname 定位套件同口径）：套件按 cwd 读 package.json /
     // .github/workflows/*.yml / CHANGELOG.md（test_ci_skip_suites.js、test_tag_validator.js），
     // 从非仓库根调用时不设 cwd 会假红，或在同构副本目录里对账到别的仓库而假绿。
-    const childOut = execFileSync(process.execPath, [file], { cwd: __dirname, stdio: IN_CI ? ['ignore', 'pipe', 'inherit'] : 'inherit', maxBuffer: MAX_BUFFER })
+    const childOut = execFileSync(process.execPath, [file], { cwd: __dirname, stdio: IN_CI ? ['ignore', 'pipe', 'inherit'] : 'inherit', maxBuffer: MAX_BUFFER, timeout: UNIT_TIMEOUT, killSignal: 'SIGKILL' })
     if (IN_CI) {
       console.log(childOut.toString())
       console.log('::endgroup::')
@@ -94,18 +131,23 @@ for (const s of UNIT_SUITES) {
     // 输出超限（ENOBUFS）按失败处理（fail-loud 有意设计）：超限本身不是测试断言失败，
     // 但流程仍以失败收尾（exit 1）——这里的区分只是给排查者的注解（「话多」红 ≠ 断言红），并非放行。
     const overflow = e.code === 'ENOBUFS' || /maxBuffer/i.test(String(e.message || ''))
+    // 超时由 execFileSync 抛 ETIMEDOUT（套件已按 killSignal=SIGKILL 强杀，见 UNIT_TIMEOUT）：与断言红
+    // 区分开，否则排查者只看到一行「失败」，不知道套件是被每套件上限掐掉的（UT-03）。
+    const timedOut = e.code === 'ETIMEDOUT' || /ETIMEDOUT/.test(String(e.message || ''))
     if (IN_CI) {
       // 失败必须全量炸出（默认组），拿回具体红测上下文（stderr 已直通，此处补 stdout）
       console.log('::endgroup::')
       console.log(overflow
         ? `::error title=输出超限：${s.name}::${s.file} 的 stdout 超过 ${MAX_BUFFER} 字节上限（输出超限按失败处理 fail-loud：超限本身非测试断言失败，但流程仍以 exit 1 收尾）`
-        : `::error title=失败套件：${s.name}::${s.file}`)
-      console.log((e.stdout || '').toString())
+        : timedOut
+          ? `::error title=套件超时：${s.name}::${s.file} 超过每套件上限 ${UNIT_TIMEOUT}ms（已按 killSignal=SIGKILL 强杀，按失败处理）`
+          : `::error title=失败套件：${s.name}::${s.file}`)
+      console.log(clipForLog(e.stdout, MAX_BUFFER))
     }
     const ms = Date.now() - t0
     results.push({ ...s, ok: false, ms })
     summaryLines.push(`| ${s.name} | \`${s.file}\` | ❌ | ${(ms / 1000).toFixed(1)}s |`)
-    console.log(`\n  ❌ ${s.name} 失败（${(ms / 1000).toFixed(1)}s）\n`)
+    console.log(`\n  ❌ ${s.name} 失败（${(ms / 1000).toFixed(1)}s${timedOut ? `，超过每套件上限 ${UNIT_TIMEOUT}ms 已强杀` : ''}）\n`)
   }
 }
 
@@ -121,6 +163,11 @@ for (const r of results) {
 }
 const totalMs = results.reduce((a, r) => a + r.ms, 0)
 console.log(`  总耗时: ${(totalMs / 1000).toFixed(1)}s`)
+// ⚠️ 汇总行格式是跨文件契约（UT-07）：run_mutation.js 的 extractTestSummary（:374-377）只认
+// 「全部通过！N/M」或「K 通过, M 失败, 共 N」三数字行，本行的「全部通过 🎉」不在其中——非 CI 下内层
+// 套件 stdout 直通同一捕获管道，逐变异体 summary 会命中内层套件的同名行而误归属。改本行格式需同步
+// run_tests.js 姊妹入口的同款输出与 run_mutation.js 的解析，并重跑变异基线验证，属跨文件口径统一，
+// 故本次只登记说明、不在此单文件内改（保持零行为风险）。
 console.log(`  结果:   ${allOk ? '全部通过 🎉' : '存在失败 ⚠️'}`)
 console.log('══════════════════════════════════════════════')
 
@@ -134,4 +181,8 @@ if (IN_CI && process.env.XBK_MUTATION_CHILD !== '1') {
     `## 单元测试结果（${allOk ? '全部通过 🎉' : '存在失败 ⚠️'}，共 ${results.length} 套件，${(totalMs / 1000).toFixed(1)}s）\n\n${summaryLines.join('\n')}\n`)
 }
 
-process.exit(allOk ? 0 : 1)
+// 用 process.exitCode 收尾而非 process.exit()（UT-04）：CI 下 stdout 是 pipe，process.exit() 不等待
+// 异步写入完成，汇总表/失败回显的尾部可能被截断丢失（管道写入是异步的）；置 exitCode 后事件循环自然
+// 结束，Node 会 flush 完管道再退出，退出码语义不变。此处无遗留句柄（execFileSync/appendFileSync 均为
+// 同步调用），不会把进程挂住。
+process.exitCode = allOk ? 0 : 1

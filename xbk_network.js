@@ -23,9 +23,10 @@ function createNetwork ({
       let lastErr
       // v3.223：延迟加载推送模块（含 got）——与接口请求并行，主流程不必先等模块加载完成
       getNotify().catch(() => { /* 加载失败由推送阶段真实报错，这里不阻塞接口 */ })
-      // 线报接口 DNS 与实际请求共用 xbk_agents.dnsLookup：提前启动解析，
-      // 若请求随后进入同一主机，dnsLookup 会合并到同一个 pending 查询，
-      // 不增加额外 HTTP 请求，也不阻塞请求启动。
+      // 线报接口 DNS 预热：与真实请求共用 xbk_agents.dnsLookup 缓存，提前启动解析、不阻塞请求启动。
+      // 注意（net-2）：dnsLookup 的缓存/pending key 含 host|family|hints|all|verbatim，本预热未传
+      // options，仅当 XBK_DNS_FAMILY=4/6（强制 family）时才与真实请求同 key；默认配置下两者不合并。
+      // net-6：本预热未接 AbortSignal（prewarmDns 的 signal 参数走不到），因此无法被取消。
       try {
         const apiHost = new URL(Config.api.pushUrl).hostname
         if (apiHost) {
@@ -46,16 +47,21 @@ function createNetwork ({
 
       // NaN → 意外只跑 1 次；小数 → 次数模糊。合法整数（默认 2）行为零变更
       // v3.158：Utils.num 转换——'5'(环境变量字符串) → 5（曾 Number.isFinite('5')=false 回退 2）
+      // net-4：上界 9999 配合 30s 退避封顶 → 单次 fetchData 最长约 3.5 天且无整体时限（是否收紧上界待产品决策）
       const maxRetry = (() => { const r = Utils.num(Config.api.retry, 2); return Number.isInteger(r) && r >= 0 ? Math.min(r, 9999) : 2 })()
       for (let attempt = 0; attempt <= maxRetry; attempt++) {
         if (PROFILE3) logger.log(`[profile api attempt] start=${attempt + 1}/${maxRetry + 1}`)
         try {
-          // retry: { limit: 0 } 关闭 got 内置重试，完全交给外层手写逻辑
+          // retry: { limit: 0 } 关闭 got 内置重试（连带 got 自带 Retry-After 处理一并失效），交给外层手写逻辑
+          // net-7：外层退避不读 Retry-After，429/408/425 统一按固定指数退避重试（是否遵守 Retry-After 待决策）
           const result = await fetchJson(Config.api.pushUrl, {
             timeout: (() => {
+              // net-3：got 把数值 timeout 直接交给定时器，小数/超 2^31-1 会被 Node 归一到约 1ms
+              // （每次请求瞬间超时）——统一钳到 [1, 2147483647] 整数；非正值沿用默认 5000
               const n = Utils.num(Config.api.timeout, 5000)
-              return n > 0 ? n : 5000
-            })(), // 非正 timeout 只告警不应传入 HTTP 层
+              if (!(n > 0)) return 5000
+              return Math.min(Math.max(1, Math.ceil(n)), 2147483647)
+            })(), // 非法 timeout 只告警不应原样传入 HTTP 层
             retry: { limit: 0 },
             headers: {
               'User-Agent': `xbk-push-script/${PKG_VERSION}`,
@@ -74,15 +80,16 @@ function createNetwork ({
             if (sc !== undefined && sc < 500 && !RETRYABLE_CODES.has('HTTP_' + sc)) throw e
           }
           if (attempt < maxRetry) { // v3.157：用兜底后的 maxRetry（曾用原始 Config.api.retry，非法类型时与实际重试不一致）
-            // 退避等待：1s、2s、4s、8s...指数退避（与 README「指数退避+随机抖动」声明一致；
-            // 封顶 30s 防长挂；0-500ms 随机抖动避免多实例同时重试）
+            // 退避等待：1s、2s、4s、8s...指数退避（注：README 未声明本函数退避口径，README:68 的
+            // 「指数退避」指常驻轮询入口）；封顶 30s 防长挂，+0-500ms 随机抖动避免多实例同时重试
             const wait = Math.min(1000 * 2 ** attempt, 30000) + crypto.randomInt(500)
             logger.log(`请求失败（${Utils.safeErrorText(e, 'unknown')}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）...`)
             await new Promise(resolve => setTimeout(resolve, wait))
           }
         }
       }
-      // 重试耗尽后抛出；防御 retry 为负等异常配置（循环可能一次都不执行 → lastErr undefined）
+      // 重试耗尽后抛出：maxRetry 已兜底为 [0,9999] 整数 → 循环至少执行一次且首轮失败即赋 lastErr，
+      // 故 `|| new Error(...)` 为不可达的防御性兜底（保留不删，避免日后改动失去保护）
       throw lastErr || new Error('请求失败（未知错误）')
     }
   }

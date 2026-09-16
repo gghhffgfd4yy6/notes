@@ -14,6 +14,17 @@ let fail = 0
 function check (name, fn) {
   try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { fail++; console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
 }
+// 计时取多次最小值：屏蔽单次 GC/调度抖动，只服务于「不得退化」的量级断言（阈值极宽松）
+function bestMs (fn, runs = 3) {
+  let best = Infinity
+  for (let k = 0; k < runs; k++) {
+    const t0 = process.hrtime.bigint()
+    fn()
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6
+    if (ms < best) best = ms
+  }
+  return best
+}
 
 console.log('=== xbk_sendNotify_slim.js 纯函数方法测试 ===')
 
@@ -165,6 +176,87 @@ check('mdLinksToPlain: 多个链接', () => {
   assert.ok(r.includes('a (http://a.com)'), '应包含第一个链接')
   assert.ok(r.includes('b (http://b.com)'), '应包含第二个链接')
 })
+// v3.273（F6）：目标段闭合点按 Markdown 合法形态解析——'(' 后首字符 '<' 取 '>)'，否则 '(' ')' 配平扫描
+check('mdLinksToPlain: URL 内含 ")" 且 text===url 去重后完整保留（配平到最外层 ")"）', () => {
+  assert.strictEqual(
+    mdLinksToPlain('[https://x/a(b)c.jpg](https://x/a(b)c.jpg)'),
+    'https://x/a(b)c.jpg',
+    '若回退为首个 ")" 截断，会残留 " (https://x/a(b)c.jpg)" 重复串'
+  )
+})
+check('mdLinksToPlain: URL 内含 ")" 且 <...> 包裹 + text===url 去重后完整保留', () => {
+  assert.strictEqual(
+    mdLinksToPlain('[<https://x/a(b)c.jpg>](<https://x/a(b)c.jpg>)'),
+    '<https://x/a(b)c.jpg>',
+    '角括号形态同样要走配平扫描，不能把 URL 内的 ")" 当闭合点'
+  )
+})
+check('mdLinksToPlain: 简单形态不回归（配平扫描不改变基本输出）', () => {
+  assert.strictEqual(mdLinksToPlain('[Google](https://google.com)'), 'Google (https://google.com)')
+  assert.strictEqual(mdLinksToPlain('[t](https://x/a(b)c.jpg)'), 't (https://x/a(b)c.jpg)')
+  assert.strictEqual(mdLinksToPlain('[t](<https://x/y.jpg>)'), 't (<https://x/y.jpg>)')
+})
+// v3.274（qodo #147-7）：destination 里被反斜杠转义的括号是字面量，不参与 '('/')' 配平；
+// 否则 '[a](foo\() [b](bar))' 的第一个 destination 会一路吞掉后一条链接。
+check('mdLinksToPlain: 反斜杠转义的括号不参与配平，后一条链接仍被转换（qodo #147-7）', () => {
+  assert.strictEqual(
+    mdLinksToPlain('[a](foo\\() [b](bar))'),
+    'a (foo\\() b (bar))',
+    '若转义的 "(" 参与配平，后一条 [b](bar) 会被吞进前一条 destination'
+  )
+})
+// 既有口径：配平失败（destination 含未配平 "("）只放弃这一处构造、回落「首个 )」，不整段 bail；
+// 若整段 bail，其后本应正常剥离的链接会原样残留。
+check('mdLinksToPlain: 配平失败回落首个 ")"，且不整段 bail 吞掉后续链接', () => {
+  assert.strictEqual(mdLinksToPlain('[t](https://x/a(b.jpg)'), 't (https://x/a(b.jpg)')
+  assert.strictEqual(mdLinksToPlain('[a](x(y) [b](bar)'), 'a (x(y) b (bar)', '整段 bail 会让后一条链接原样残留')
+})
+// v3.274（qodo #147-8）：配平扫描带「整次转换共享」的预算，畸形构造（未配平 "(" 后仍跟 ")"）不退化 O(n²)——
+// 无预算时每个这类构造都一路扫到串尾，N 个构造呈 O(n²)；预算耗尽即回落「首个 )」，整体保持线性。
+// 断言同时给绝对上界与「同规模良性输入（线性基线）」的相对上界，后者不随机器快慢漂移。
+check('mdLinksToPlain: 畸形构造不退化 O(n²)——配平扫描共享预算（qodo #147-8）', () => {
+  const malformed = (kb) => '[a](x() '.repeat(Math.floor(kb * 1024 / 8))
+  const benign = (kb) => '[a](https://e.com/p) '.repeat(Math.floor(kb * 1024 / 20))
+  bestMs(() => mdLinksToPlain(malformed(2))) // 预热，排除首次 JIT 编译
+  bestMs(() => mdLinksToPlain(benign(2)))
+  const tMal = bestMs(() => mdLinksToPlain(malformed(64)))
+  const tBenign = bestMs(() => mdLinksToPlain(benign(64)))
+  assert.ok(tMal < 1000, `64KB 畸形输入应在 1000ms 内完成，实测 ${tMal.toFixed(1)}ms（无预算实现约 1.5-2.3s）`)
+  assert.ok(
+    tMal <= 25 * tBenign + 50,
+    `畸形输入耗时不应相对同规模良性输入爆炸，实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（无预算实现约 1600-1800 倍）`
+  )
+})
+// CodeRabbit PR #147：findDestEnd 的角括号分支必须先扣扫描预算——否则「有 '<' 但整串没有 '>'」的畸形构造
+// 每轮都会让 indexOf('>') 从该处一路扫到串尾（预算形同虚设），多个叠起来仍是 O(n²)。
+// 下面两类断言都直接针对「删掉 findDestEnd 顶部 `if (budget.left <= 0) return -1`」这一回退：
+//   · 确定性断言（不依赖机器快慢、不依赖计时）：预算被前序畸形构造耗尽后，角括号形态必须在预算耗尽处
+//     短路返回 -1、由调用方回落「首个 )」；回退守卫后它仍会执行 indexOf('>') 直接闭合，
+//     在 `[<u)v>](<u)v>)` 这类「destination 内含 ')' 的 <...> 形态」上产出文本不同（前者去重成 `<u)v>`）。
+//   · 计时断言（宽松）：畸形输入相对同规模良性输入不得爆炸；回退守卫后实测约 37-44 倍（阈值 10 倍）。
+check('mdLinksToPlain: 预算耗尽后角括号分支必须短路 + 畸形输入不退化（CodeRabbit #147）', () => {
+  // 前 6 段 `[a](() ` 每段净多一个 '('，配平扫描一路扫到尾：预算在到达末条链接前已被耗尽。
+  const exhausted = '[a](() '.repeat(6) + '[<u)v>](<u)v>)'
+  assert.strictEqual(
+    mdLinksToPlain(exhausted),
+    'a (() '.repeat(6) + '<u)v> (<u)v>)',
+    '预算耗尽后 <...> 形态也必须回落「首个 )」；若角括号分支先于预算检查执行，末条会得到去重后的 `<u)v>`'
+  )
+  // 「有 '<' 但整串无 '>'」的畸形构造：'[a](<x) ' 每段都以 '<' 开头、串中无任何 '>'，
+  // 末尾的 ')' 让外层 while 继续推进（否则首轮就 bail，退化不成立）。
+  const malformed = '[a](<x) '.repeat(20000)
+  assert.ok(!malformed.includes('>'), '用例前提：整串不得含 ">"')
+  const benign = '[a](https://e.com/p) '.repeat(8000) // 与畸形输入同为 160KB 量级
+  bestMs(() => mdLinksToPlain(malformed.slice(0, 2000))) // 预热，排除首次 JIT 编译
+  bestMs(() => mdLinksToPlain(benign.slice(0, 2000)))
+  const tMal = bestMs(() => mdLinksToPlain(malformed), 5)
+  const tBenign = bestMs(() => mdLinksToPlain(benign), 5)
+  assert.ok(tMal < 500, `160KB 畸形输入应在 500ms 内完成，实测 ${tMal.toFixed(1)}ms`)
+  assert.ok(
+    tMal <= 10 * tBenign,
+    `畸形输入不得相对同规模良性输入爆炸：实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（回退角括号预算守卫约 37-44 倍）`
+  )
+})
 
 // ===== mdImagesToPlain =====
 check('mdImagesToPlain: 正常图片转 alt', () => {
@@ -185,6 +277,83 @@ check('mdImagesToPlain: 未闭合 ] 原样返回', () => {
 check('mdImagesToPlain: 空 url 原样保留', () => {
   assert.strictEqual(mdImagesToPlain('![logo]()'), '![logo]()')
 })
+// v3.273（F6）：mdImagesToPlain 与 mdLinksToPlain 同口径（'<url>' / 配平扫描），URL 内含 ")" 不再残留 '.jpg)'
+check('mdImagesToPlain: URL 内含 ")" 时整图剥成 alt，不残留 ".jpg)"', () => {
+  assert.strictEqual(
+    mdImagesToPlain('![t](https://x/a(b)c.jpg)'),
+    't',
+    '若回退为首个 ")" 截断，会得到 "tc.jpg)" 垃圾串'
+  )
+})
+check('mdImagesToPlain: 空 alt + URL 内含 ")" 用 emptyAlt，不残留 ".jpg)"', () => {
+  assert.strictEqual(
+    mdImagesToPlain('![](https://x/a(b)c.jpg)', '(图片)'),
+    '(图片)',
+    '若回退为首个 ")" 截断，会得到 "(图片)c.jpg)"'
+  )
+})
+check('mdImagesToPlain: <...> 包裹 + URL 内含 ")" 正确闭合', () => {
+  assert.strictEqual(
+    mdImagesToPlain('![t](<https://x/a(b)c.jpg>)'),
+    't',
+    '若回退为首个 ")" 截断，会残留 "c.jpg>)"'
+  )
+})
+check('mdImagesToPlain: URL 嵌套括号配平到最外层 ")"', () => {
+  assert.strictEqual(mdImagesToPlain('![t](https://x/a(b(c)d)e.jpg)'), 't')
+})
+check('mdImagesToPlain: 首图 URL 带 ")" 不吞掉后续图片', () => {
+  assert.strictEqual(mdImagesToPlain('![a](https://x/a(b).jpg) ![b](https://y/d.png)'), 'a b')
+})
+check('mdImagesToPlain: 简单形态与 <...> 无括号形态不回归', () => {
+  assert.strictEqual(mdImagesToPlain('![logo](https://example.com/logo.png)'), 'logo')
+  assert.strictEqual(mdImagesToPlain('![t](<https://x/y.jpg>)'), 't')
+})
+// v3.274（qodo #147-7）：mdImagesToPlain 与 mdLinksToPlain 共用 findDestEnd，转义括号同样不参与配平；
+// 若参与配平，第一张图的 destination 会一直配平到串尾的 ")"，把后一张 ![b](bar) 整个吞掉（只剩 "a"）。
+check('mdImagesToPlain: 反斜杠转义的括号不参与配平，后一张图片仍被剥离（qodo #147-7）', () => {
+  assert.strictEqual(
+    mdImagesToPlain('![a](foo\\() ![b](bar))'),
+    'a b)',
+    '若转义的 "(" 参与配平，后一张 ![b](bar) 会被吞进第一张图的 destination'
+  )
+})
+// v3.274（qodo #147-8）：mdImagesToPlain 的共享预算独立初始化，畸形图片构造同样不退化 O(n²)。
+check('mdImagesToPlain: 畸形构造不退化 O(n²)——配平扫描共享预算（qodo #147-8）', () => {
+  const malformed = (kb) => '![a](x() '.repeat(Math.floor(kb * 1024 / 9))
+  const benign = (kb) => '![a](https://e.com/p.png) '.repeat(Math.floor(kb * 1024 / 26))
+  bestMs(() => mdImagesToPlain(malformed(2)))
+  bestMs(() => mdImagesToPlain(benign(2)))
+  const tMal = bestMs(() => mdImagesToPlain(malformed(64)))
+  const tBenign = bestMs(() => mdImagesToPlain(benign(64)))
+  assert.ok(tMal < 1000, `64KB 畸形输入应在 1000ms 内完成，实测 ${tMal.toFixed(1)}ms（无预算实现约 1.5-1.8s）`)
+  assert.ok(
+    tMal <= 25 * tBenign + 50,
+    `畸形输入耗时不应相对同规模良性输入爆炸，实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（无预算实现约 1600 倍）`
+  )
+})
+// CodeRabbit PR #147：mdImagesToPlain 复用同一个 findDestEnd，角括号分支的预算守卫同样必须生效——
+// 两个循环各自独立初始化 destBudget，因此需要各自的覆盖（本用例与上面链接版同构，只是把 '[' 换成 '!['）。
+check('mdImagesToPlain: 预算耗尽后角括号分支必须短路 + 畸形输入不退化（CodeRabbit #147）', () => {
+  const exhausted = '![a](() '.repeat(6) + '![<u)v>](<u)v>)'
+  assert.strictEqual(
+    mdImagesToPlain(exhausted),
+    'a '.repeat(6) + '<u)v>v>)',
+    '预算耗尽后 <...> 形态也必须回落「首个 )」；若角括号分支先于预算检查执行，末图只会剩去重后的 `<u)v>`'
+  )
+  const malformed = '![a](<x) '.repeat(20000) // 每段都以 '<' 开头、整串无 '>'
+  assert.ok(!malformed.includes('>'), '用例前提：整串不得含 ">"')
+  const benign = '![a](https://e.com/p.png) '.repeat(7000) // 与畸形输入同为 180KB 量级
+  bestMs(() => mdImagesToPlain(malformed.slice(0, 2000)))
+  bestMs(() => mdImagesToPlain(benign.slice(0, 2000)))
+  const tMal = bestMs(() => mdImagesToPlain(malformed), 5)
+  const tBenign = bestMs(() => mdImagesToPlain(benign), 5)
+  assert.ok(tMal < 500, `180KB 畸形输入应在 500ms 内完成，实测 ${tMal.toFixed(1)}ms`)
+  assert.ok(
+    tMal <= 10 * tBenign,
+    `畸形输入不得相对同规模良性输入爆炸：实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（回退角括号预算守卫约 40-44 倍）`
+  )
+})
 
 // ===== mdToPlain =====
 check('mdToPlain: 粗体去除', () => {
@@ -204,6 +373,13 @@ check('mdToPlain: 链接转纯文本', () => {
 })
 check('mdToPlain: 图片转 alt', () => {
   assert.strictEqual(mdToPlain('![logo](https://example.com/logo.png)'), 'logo')
+})
+// v3.273（F6）：配平扫描贯穿出口 mdToPlain（图片先剥、链接按配平闭合）
+check('mdToPlain: URL 内含 ")" 的图片端到端剥成 alt，无 ".jpg)" 残留', () => {
+  assert.strictEqual(mdToPlain('![t](https://x/a(b)c.jpg)'), 't')
+})
+check('mdToPlain: URL 内含 ")" 的原文链接端到端只保留一次', () => {
+  assert.strictEqual(mdToPlain('[https://x/a(b)c.jpg](https://x/a(b)c.jpg)'), 'https://x/a(b)c.jpg')
 })
 check('mdToPlain: HTML 标签被剥离', () => {
   assert.strictEqual(mdToPlain('<b>bold</b>'), 'bold')

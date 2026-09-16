@@ -33,7 +33,9 @@ function stringEnd (buf, i) {
 }
 
 // 定位 idx 处 statusReason 字段的字符串值：返回值结束位置；非该字段/值非字符串时返回 -1
-// （原始未转义引号只会出现在字段位置，字符串值内不可能出现裸 "statusReason" 字节）
+// （indexOf 命中的未必是字段名：某字符串值的引号+内容也可能构成同一字节序列——
+//   如 {"replacement":"statusReason"} 命中于值位置；故须再校验紧随 KEY 的冒号
+//   才能确认是字段，冒号检查才是剥离正确性的依据，而非引号位置）
 function statusReasonValueEnd (buf, idx) {
   const afterKey = skipWhitespace(buf, idx + KEY.length)
   if (buf[afterKey] !== 0x3a /* : */) return -1
@@ -49,20 +51,33 @@ function readReportJson (reportPath) {
   // nosemgrep: 工具脚本按 CLI 传入路径读取报告，路径非用户净输入
   // Trust Model（v3.266 强化）：readReportJson 是内部 API，期望 reportPath
   //   来自已校验目录——scripts/mutation-report.js 链中 fs.statSync(dir)
-  //   + isDirectory() 是前置条件。公开 export 仅为测试复用与工具内嵌，
-  //   不是给不可信输入使用。Codacy CRITICAL 标"动态构造路径"在当前
-  //   三个调用方（mutation-report.js / analyze-artifacts.js / tests）
-  //   调用链上不成立——dir 入口已先校验。
+  //   + isDirectory() 是前置条件；.github/analyze-artifacts.js 只对 reportsRoot
+  //   做 existsSync 存在性检查（未校验 isDirectory），其报告路径来自该目录的
+  //   readdir 枚举（CI 仓库内目录，本地夹具可经 argv 覆盖），非不可信输入。
+  //   公开 export 仅为测试复用与工具内嵌，不是给不可信输入使用。Codacy CRITICAL
+  //   标"动态构造路径"在以上内部调用链上不成立（旧注释称"三个调用方 dir 入口
+  //   已先校验"对 analyze-artifacts.js 并不成立，此处据实修正口径）。
   // Codacy MEDIUM：path.resolve() 防御性 normalize（公开 API，不假设上游已校验）
   const abs = path.resolve(reportPath)
-  const buf = fs.readFileSync(abs) // Buffer 读取，绕开字符串长度上限
+  let buf
+  try {
+    buf = fs.readFileSync(abs) // Buffer 读取，绕开字符串长度上限
+  } catch (err) {
+    // 读取阶段失败（ENOENT/EACCES/EISDIR 等）原生异常消息不含被读路径，这里补上上下文
+    // （实测目录入参抛 EISDIR: illegal operation on a directory, read，无法定位是哪个报告）
+    throw new Error(`无法读取 ${abs}：${err.message}`)
+  }
   const chunks = []
   let pos = 0
+  // 剥离是无条件的：全 buffer 扫描，任意嵌套层级的字符串型 statusReason 一律置为 ""
+  // 返回值不携带「已改写」标记，调用方无法区分「被改写为空串」与「本来就是空串」
   let idx = buf.indexOf(KEY, pos)
   while (idx !== -1) {
     const valueEnd = statusReasonValueEnd(buf, idx)
     if (valueEnd === -1) {
-      chunks.push(buf.subarray(pos, idx + KEY.length)) // 非该字段（如 statusReason2）：KEY 原文保留
+      // 非字段命中一律原文保留：值非字符串（null/数字/对象/数组），或命中恰是内容为
+      // statusReason 的字符串值本身（相似键名 statusReason2 不含带引号的 KEY，不会命中）
+      chunks.push(buf.subarray(pos, idx + KEY.length))
       pos = idx + KEY.length
     } else {
       appendWithPlaceholder(chunks, buf, pos, idx)

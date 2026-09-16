@@ -108,5 +108,195 @@ function installMockStream (behavior) {
     }
   }
 
+  // 7. UTF-8 BOM 前缀的合法 JSON → 正常解析。旧实现直接 JSON.parse（对 BOM 抛错）→ 归成
+  //    ERR_BODY_NOT_JSON，而 xbk_failure_policy 把该码放进 PERMANENT 集合 → 常驻循环永久停推。
+  {
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['\uFEFF{"a":1}'] })
+    try {
+      const body = await fetchJson('https://api.example.com/x')
+      assert.deepStrictEqual(body, { a: 1 }, 'BOM 前缀的合法 JSON 应解析成功')
+    } finally { restore() }
+  }
+
+  // 8. 非 JSON → 错误消息只报长度，不回显响应体（防密钥/业务数据经日志与告警外泄）
+  {
+    const secret = 'sk-live-SECRET-1234567890'
+    const payload = `{"token":"${secret}"`
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: [payload] })
+    try {
+      let rejected = null
+      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
+      assert.ok(rejected, '非 JSON 应 reject')
+      assert.strictEqual(rejected.code, 'ERR_BODY_NOT_JSON')
+      assert.ok(rejected.message.includes(`body ${payload.length} chars`), '错误消息应只报响应体长度')
+      assert.ok(!rejected.message.includes(secret), '错误消息不得回显响应体内容')
+      assert.ok(!rejected.message.includes('sk-live'), '错误消息不得回显响应体片段')
+    } finally { restore() }
+  }
+
+  // 8b. 空响应体 → 报 'empty body'（旧实现输出 'Response is not JSON: ' + ''）
+  {
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: [] })
+    try {
+      let rejected = null
+      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
+      assert.strictEqual(rejected.code, 'ERR_BODY_NOT_JSON')
+      assert.ok(rejected.message.includes('empty body'), '空体应报 empty body')
+      assert.ok(!rejected.message.includes('body 0 chars'), '空体不应报 body 0 chars（两种语义分开）')
+    } finally { restore() }
+  }
+
+  // 8c. BOM + 非 JSON → 报的是剥离 BOM 后的长度，且仍不回显原文
+  {
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['\uFEFFnope'] })
+    try {
+      let rejected = null
+      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
+      assert.ok(rejected.message.includes('body 4 chars'), '应报剥离 BOM 后的长度 4')
+      assert.ok(!rejected.message.includes('nope'), '错误消息不得回显响应体内容')
+    } finally { restore() }
+  }
+
+  // 9. XBK_PROFILE=3 的 start 日志：URL 只保留 origin + '/***'，路径段里的密钥不得出现
+  //    （旧实现 replace(/\/[^/]+$/, '/***') 只遮蔽末段 → /SECRET/ 原样进日志）
+  {
+    const origProfile = process.env.XBK_PROFILE
+    process.env.XBK_PROFILE = '3'
+    const logs = []
+    const origLog = console.log
+    console.log = (...args) => { logs.push(args.join(' ')) }
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"ok":true}'] })
+    try {
+      const body = await fetchJson('https://api.example.com/SECRET/v1?token=abc')
+      assert.deepStrictEqual(body, { ok: true }, '脱敏不应影响请求本身')
+      const startLog = logs.find(l => l.includes('[profile api] start url='))
+      assert.ok(startLog, '应输出 start 日志')
+      assert.ok(startLog.includes('url=https://api.example.com/***'), 'URL 应只保留 origin + /***')
+      assert.ok(!startLog.includes('SECRET'), '非末段路径密钥不得进日志')
+      assert.ok(!startLog.includes('v1') && !startLog.includes('token=abc'), '路径/查询串不得进日志')
+    } finally {
+      restore()
+      console.log = origLog
+      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
+    }
+  }
+
+  // 10. 非法 URL → '<invalid-url>/***'（旧实现正则不匹配，整条 URL 原样进日志）
+  {
+    const origProfile = process.env.XBK_PROFILE
+    process.env.XBK_PROFILE = '3'
+    const logs = []
+    const origLog = console.log
+    console.log = (...args) => { logs.push(args.join(' ')) }
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"ok":true}'] })
+    try {
+      const body = await fetchJson('not-a-valid-url')
+      assert.deepStrictEqual(body, { ok: true })
+      const startLog = logs.find(l => l.includes('[profile api] start url='))
+      assert.ok(startLog && startLog.includes('url=<invalid-url>/***'), '非法 URL 应打 <invalid-url>/***')
+      assert.ok(!startLog.includes('not-a-valid-url'), '非法 URL 原串不得进日志')
+    } finally {
+      restore()
+      console.log = origLog
+      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
+    }
+  }
+
+  // 11. maxBody 非法（非数字/≤0/NaN/Infinity）→ 告警一次并钳制到 DEFAULT_MAX_BODY；合法值不告警
+  {
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      for (const bad of [0, -1, Number.NaN, Infinity, '10']) {
+        const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"a":1}'] })
+        try {
+          const body = await fetchJson('https://api.example.com/x', {}, bad)
+          assert.deepStrictEqual(body, { a: 1 }, `maxBody=${String(bad)} 应钳制到 DEFAULT_MAX_BODY（不因非法上限误杀正常体）`)
+        } finally { restore() }
+      }
+      assert.strictEqual(warns.length, 5, '每个非法 maxBody 都应告警一次')
+      assert.ok(warns.every(w => w.includes('maxBody 非法') && w.includes('已钳制到') && w.includes('20971520')), '告警应说明非法值与钳制目标 DEFAULT_MAX_BODY')
+      warns.length = 0
+      const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"a":1}'] })
+      try {
+        const body = await fetchJson('https://api.example.com/x', {}, 1024)
+        assert.deepStrictEqual(body, { a: 1 }, '合法 maxBody 不应改变解析行为')
+        assert.strictEqual(warns.length, 0, '合法 maxBody 不应告警')
+      } finally { restore() }
+    } finally { console.warn = origWarn }
+  }
+
+  // 12. responseAtMs 在 response 事件取值：timing 日志的 responseAt 必须等于 response 日志的
+  //     responseAtMs，且严格小于 downloadEnd（旧实现在 end 回调里重新取 Date.now()，恒 ≥ downloadEnd）。
+  //     注入单调递增假时钟使两处取值必然可区分——真实时钟下旧实现常因同一毫秒而蒙混过关。
+  {
+    const origProfile = process.env.XBK_PROFILE
+    const origNow = Date.now
+    process.env.XBK_PROFILE = '3'
+    const logs = []
+    const origLog = console.log
+    console.log = (...args) => { logs.push(args.join(' ')) }
+    let clock = 0
+    Date.now = () => { clock += 1000; return clock }
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"t":1}'] })
+    try {
+      const body = await fetchJson('https://api.example.com/x')
+      assert.deepStrictEqual(body, { t: 1 }, '假时钟下 JSON 解析应正常')
+      const respLog = logs.find(l => l.includes('[profile api] responseAtMs='))
+      const timingLog = logs.find(l => l.includes('[profile api timing]'))
+      assert.ok(respLog && timingLog, '应输出 response 与 timing 日志')
+      const respAt = Number(/responseAtMs=(\d+)/.exec(respLog)[1])
+      const timingAt = Number(/responseAt=(\d+)/.exec(timingLog)[1])
+      const downloadEnd = Number(/downloadEnd=(\d+)/.exec(timingLog)[1])
+      assert.strictEqual(timingAt, respAt, 'timing.responseAt 必须复用 response 事件的取值')
+      assert.ok(timingAt < downloadEnd, `responseAt(${timingAt}) 应严格小于 downloadEnd(${downloadEnd})`)
+    } finally {
+      restore()
+      console.log = origLog
+      Date.now = origNow
+      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
+    }
+  }
+
+  // 13. maxBody 是「取值即抛错」的非法对象 → 告警路径必须先做安全转换。
+  //     CodeRabbit PR #147 #8：旧实现直接 `String(maxBody)` 插进模板串，抛错发生在 console.warn
+  //     之前 → fetchJson 返回的 Promise 直接 reject、一次告警都没有，且「非法上限一律钳制」契约被破坏。
+  //     覆盖两类不可字符串化对象：带抛错 toString 的对象、无原型的 null 原型对象。
+  {
+    const cases = [
+      ['toString 抛错的对象', { toString () { throw new Error('toString boom') } }],
+      ['无原型的 null 原型对象', Object.create(null)]
+    ]
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      for (const [label, bad] of cases) {
+        const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"ok":true}'] })
+        try {
+          let syncErr = null
+          let promise = null
+          try {
+            promise = fetchJson('https://api.example.com/x', {}, bad)
+            // SonarJS S6544：try 内的 promise 必须被 await（它给的另一选项「挂 .catch()」经实测无效——
+            // 派生出的 promise 本身仍被判为悬空）。这里直接 await 一次：既满足规则，也把
+            // 「同步抛错」与「异步 reject」都收敛进 catch（非法 maxBody 应被钳制，两种都不该发生）。
+            await promise
+          } catch (e) { syncErr = e }
+          assert.strictEqual(syncErr, null, `${label}：不得同步抛异常，也不得 reject（非法 maxBody 应被钳制）`)
+          assert.ok(promise instanceof Promise, `${label}：应返回 Promise`)
+          const body = await promise
+          assert.deepStrictEqual(body, { ok: true }, `${label}：非法 maxBody 仍应钳制到 DEFAULT_MAX_BODY 并正常解析（不因告警取值失败而 reject）`)
+        } finally { restore() }
+      }
+      assert.strictEqual(warns.length, cases.length, '每个非法 maxBody 都应告警一次（告警自身不得抛错）')
+      assert.ok(warns.every(w => w.includes('maxBody 非法') && w.includes('已钳制到') && w.includes('20971520')),
+        `告警应说明非法值与钳制目标 DEFAULT_MAX_BODY；实际 warns=${JSON.stringify(warns)}`)
+      assert.ok(warns.every(w => w.includes('无法转换')),
+        `取值失败时应回退到兜底文案，而不是把异常带进告警路径；实际 warns=${JSON.stringify(warns)}`)
+    } finally { console.warn = origWarn }
+  }
+
   console.log('test_http OK')
 })().catch((e) => { console.error(e); process.exit(1) })

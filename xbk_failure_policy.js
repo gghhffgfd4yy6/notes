@@ -54,11 +54,79 @@ function codeOf (error) {
   return typeof code === 'string' || typeof code === 'number' ? String(code).toUpperCase() : ''
 }
 
-function summarizeError (error) {
-  if (readProp(error, 'failureInfo') && typeof readProp(error, 'failureInfo') === 'object') {
-    return { ...readProp(error, 'failureInfo') }
+// 聚合失败的子结构可能来自外部上报或通道适配器拼接，既可能自引用也可能极深。
+// 本模块对调用方承诺“不抛异常”，因此递归统一带上祖先集合 + 深度上限：
+// 命中环或超深时截断为可读标记（标记本身只会落进 UNKNOWN → retryable，不会误判永久）。
+const MAX_FAILURE_DEPTH = 5
+const TRUNCATED_FAILURE_MESSAGE = '[嵌套失败结构过深或自引用，已截断]'
+
+function depthExceeded (value, ancestors, depth) {
+  if (depth > MAX_FAILURE_DEPTH) return true
+  return Boolean(ancestors && ancestors.has(value))
+}
+
+// qodo #147-11：failures 可能来自敌意对象——Array.isArray 对 **revoked proxy** 会抛 TypeError，
+// 索引 getter 抛错的数组在遍历时也会抛，二者都会让本模块的「绝不抛异常」契约失效。
+// 凡是「判定是否为数组 + 取元素」都统一走这里：任何一步失败即返回 null（调用方按「没有该数组」处理）。
+// CodeRabbit PR #147：**不要用 Array.prototype.slice.call(value)** —— 它对数组子类会走 Symbol.species，
+// 自定义 species 可让它返回一个没有 .map 的对象，于是后续 .map(...) 在 try 之外抛 TypeError。
+// 改为在 try 内把元素逐个拷进一个新建的普通数组，确保返回值恒为真数组。
+function safeArray (value) {
+  try {
+    if (!Array.isArray(value)) return null
+    const copy = []
+    for (let i = 0; i < value.length; i++) copy.push(value[i])
+    return copy
+  } catch (e) { return null }
+}
+
+// XFP-05/XFP-06：failureInfo 透传前与常规路径同口径清洗（脱敏 + 折叠换行 + 截断），
+// 而不是直接浅拷贝——否则 failureInfo 里的凭据会绕过清洗链原样带出，
+// 且自引用结构会抛 RangeError 破坏本模块的“不抛”契约。
+// 逐字段用 readProp 读取，getter/proxy 抛错时降级为 undefined，不让摘要读取把调用方带崩。
+function sanitizeFailureInfo (info, ancestors, depth) {
+  if (depthExceeded(info, ancestors, depth)) return { message: TRUNCATED_FAILURE_MESSAGE }
+  // CodeRabbit PR #147：用无原型对象承载清洗结果——若 info 带一个可枚举的自有 `__proto__` 字段，
+  // 写进普通对象会改写原型，随后 classifyOne 读到的 `info.failureKind` / `code` 可能是**继承**来的
+  // 伪造值（例如伪造 failureKind:'permanent' 让本可重试的失败被误判为永久并停止重试）。
+  const sanitized = Object.create(null)
+  let keys = []
+  try { keys = Object.keys(info) } catch (e) { keys = [] }
+  for (const key of keys) {
+    const value = readProp(info, key)
+    if (key === 'failures') {
+      // qodo #147-11：failures 可能来自敌意对象——Array.isArray 对 **revoked proxy** 会抛
+      // TypeError，索引 getter 抛错的数组在 .map 遍历时也会抛，二者都会让 summarizeError 逃逸，
+      // 违反本模块「绝不抛」契约（旧实现是浅拷贝，不遍历该数组，故无此风险）。
+      // 统一经 safeArray 取值：任何一步失败即退回原值透传（不遍历）。
+      const items = safeArray(value)
+      if (items !== null) {
+        const childAncestors = new Set(ancestors || [])
+        childAncestors.add(info)
+        sanitized.failures = items.map(item => summarizeError(item, childAncestors, depth + 1))
+        continue
+      }
+    }
+    if (typeof value !== 'string') {
+      sanitized[key] = value
+      continue
+    }
+    // message/reason 与常规路径一致：折叠换行并截断；其余字符串只做脱敏，保留原值语义。
+    sanitized[key] = key === 'message' || key === 'reason' || key === 'failureReason'
+      ? redact(value).replace(/[\r\n]+/g, ' ').slice(0, 500)
+      : redact(value)
+  }
+  return sanitized
+}
+
+function summarizeError (error, ancestors, depth) {
+  const level = Number.isInteger(depth) && depth > 0 ? depth : 0
+  const failureInfo = readProp(error, 'failureInfo')
+  if (failureInfo && typeof failureInfo === 'object') {
+    return sanitizeFailureInfo(failureInfo, ancestors, level)
   }
   const source = error && typeof error === 'object' ? error : { message: error }
+  if (depthExceeded(source, ancestors, level)) return { message: TRUNCATED_FAILURE_MESSAGE }
   const rawProviderCode = readProp(source, 'providerCode')
   const rawChannel = readProp(source, 'channel')
   const rawName = readProp(source, 'name')
@@ -76,9 +144,12 @@ function summarizeError (error) {
     info.failureKind = sourceKind
     info.failureReason = readProp(source, 'failureReason') || ''
   }
-  const failures = readProp(source, 'failures')
-  if (Array.isArray(failures)) {
-    info.failures = failures.map(summarizeError)
+  const failures = safeArray(readProp(source, 'failures'))
+  if (failures) {
+    // 祖先集合按路径复制（不是共享可变集合），保证同一子对象作为兄弟节点重复出现时仍完整展开。
+    const childAncestors = new Set(ancestors || [])
+    childAncestors.add(source)
+    info.failures = failures.map(item => summarizeError(item, childAncestors, level + 1))
   }
   return info
 }
@@ -92,14 +163,16 @@ function classifyOne (error) {
 
   // 结构化聚合错误优先递归：顶层可能只保留“token 无效”等永久摘要，
   // 但子通道仍可能有超时/限流。只要任一子错误可重试，就必须保留重试机会。
-  if (Array.isArray(info.failures) && info.failures.length > 0) {
-    const nested = info.failures.map(classifyOne)
+  const nestedFailures = safeArray(info.failures)
+  if (nestedFailures && nestedFailures.length > 0) {
+    const nested = nestedFailures.map(classifyOne)
     if (nested.some(x => x.kind === 'retryable')) {
-      return { kind: 'retryable', reason: 'MIXED_CHANNEL_FAILURES', info }
+      // 全部子项都可重试时并非“原因混合”，标成 MIXED 会让诊断失真；kind 不变，只分清 reason。
+      const allRetryable = nested.every(x => x.kind === 'retryable')
+      return { kind: 'retryable', reason: allRetryable ? 'ALL_CHANNELS_RETRYABLE' : 'MIXED_CHANNEL_FAILURES', info }
     }
-    if (nested.some(x => x.kind !== 'permanent')) {
-      return { kind: 'retryable', reason: 'UNKNOWN_CHANNEL_FAILURE', info }
-    }
+    // classifyOne 只返回 retryable|permanent：走到这里说明不存在 retryable 子项，即全永久。
+    // 原 UNKNOWN_CHANNEL_FAILURE 分支（nested.some(x => x.kind !== 'permanent')）恒 false，已移除。
     return { kind: 'permanent', reason: 'ALL_CHANNELS_PERMANENT', info }
   }
 
@@ -183,9 +256,9 @@ function classifyOne (error) {
 
 function classifyFailure (error) {
   const explicitKind = readProp(error, 'failureKind')
-  const nested = readProp(error, 'failures')
+  const nested = safeArray(readProp(error, 'failures'))
   // 聚合失败的子错误优先于父级预填标签，避免父级 permanent 覆盖子级 retryable。
-  if ((explicitKind === 'retryable' || explicitKind === 'permanent') && !(Array.isArray(nested) && nested.length > 0)) {
+  if ((explicitKind === 'retryable' || explicitKind === 'permanent') && !(nested && nested.length > 0)) {
     return { kind: explicitKind, reason: readProp(error, 'failureReason') || 'EXPLICIT', info: summarizeError(error) }
   }
   return classifyOne(error)
@@ -198,7 +271,7 @@ function classifySummary (summary) {
   const failed = Number(summary.failed) || 0
   // 有失败消息时进入分类；纯部分成功且剩余失败均为可重试/未知时继续，明确永久失败则停止。
   if (total <= 0 || failed <= 0) return null
-  const failures = Array.isArray(summary.failures) ? summary.failures : []
+  const failures = safeArray(readProp(summary, 'failures')) || []
   if (failures.length === 0) {
     return pushed > 0
       ? null
