@@ -279,11 +279,12 @@ function installMockStream (behavior) {
           let promise = null
           try {
             promise = fetchJson('https://api.example.com/x', {}, bad)
-            // SonarJS S6544：try 内的 promise 必须被 await 或挂 catch 派生链。这里加一个空 catch
-            // 只为满足该规则，**不改变原 promise 语义**——下面仍 await 原始 promise 来断言解析结果。
-            promise.catch(() => {})
+            // SonarJS S6544：try 内的 promise 必须被 await（它给的另一选项「挂 .catch()」经实测无效——
+            // 派生出的 promise 本身仍被判为悬空）。这里直接 await 一次：既满足规则，也把
+            // 「同步抛错」与「异步 reject」都收敛进 catch（非法 maxBody 应被钳制，两种都不该发生）。
+            await promise
           } catch (e) { syncErr = e }
-          assert.strictEqual(syncErr, null, `${label}：不得同步抛异常`)
+          assert.strictEqual(syncErr, null, `${label}：不得同步抛异常，也不得 reject（非法 maxBody 应被钳制）`)
           assert.ok(promise instanceof Promise, `${label}：应返回 Promise`)
           const body = await promise
           assert.deepStrictEqual(body, { ok: true }, `${label}：非法 maxBody 仍应钳制到 DEFAULT_MAX_BODY 并正常解析（不因告警取值失败而 reject）`)
