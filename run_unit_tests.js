@@ -97,9 +97,15 @@ const UNIT_TIMEOUT = positiveIntEnv('XBK_UNIT_TIMEOUT', 10 * 60 * 1000)
 // 失败回显裁剪（UT-06）：失败时回显的是子进程 stdout，其唯一约束来自 maxBuffer，而 ENOBUFS 恰恰是
 // 「已超出该上限」——故超限路径的回显量并不受 MAX_BUFFER 约束（约 MAX_BUFFER + 单块）。此处按同一上限
 // 裁剪并显式标注省略量（不静默丢弃）；输出未超限的正常失败逐字保留，行为不变。
-function clipForLog (text, limit) {
-  if (text.length <= limit) return text
-  return `${text.slice(0, limit)}\n…（失败回显已省略 ${text.length - limit} 字符：回显按 MAX_BUFFER=${limit} 上限裁剪，完整输出见套件自身日志）`
+// CodeRabbit PR #147：maxBuffer 是**字节**上限，而字符串 length 数的是 UTF-16 码元——多字节输出
+// （中文/emoji）可能在 length 未超限时字节已超限。故这里接收原始 Buffer，按字节裁剪，并在
+// 字节边界上回退到 UTF-8 字符起始处，避免把多字节字符切成半个（输出乱码）。
+function clipForLog (buf, limit) {
+  const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf == null ? '' : buf), 'utf8')
+  if (bytes.length <= limit) return bytes.toString('utf8')
+  let end = limit
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end-- // 回退到 UTF-8 字符首字节
+  return `${bytes.subarray(0, end).toString('utf8')}\n…（失败回显已省略 ${bytes.length - end} 字节：回显按 MAX_BUFFER=${limit} 上限裁剪，完整输出见套件自身日志）`
 }
 
 for (const s of UNIT_SUITES) {
@@ -136,7 +142,7 @@ for (const s of UNIT_SUITES) {
         : timedOut
           ? `::error title=套件超时：${s.name}::${s.file} 超过每套件上限 ${UNIT_TIMEOUT}ms（已按 killSignal=SIGKILL 强杀，按失败处理）`
           : `::error title=失败套件：${s.name}::${s.file}`)
-      console.log(clipForLog((e.stdout || '').toString(), MAX_BUFFER))
+      console.log(clipForLog(e.stdout, MAX_BUFFER))
     }
     const ms = Date.now() - t0
     results.push({ ...s, ok: false, ms })

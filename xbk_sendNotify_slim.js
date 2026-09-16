@@ -1298,6 +1298,10 @@ function truncateBytes (s, maxBytes) {
 //     没有预算时多个这类构造会重叠重扫、退化成 O(n²)（qodo #147-8，本文件 v3.264/S8786 修过同类问题）。
 //     预算耗尽即返回 -1，由调用方回落「首个 )」的旧口径；正常内容的 destination 都很短，远不会触顶。
 function findDestEnd (s, from, budget) {
+  // CodeRabbit PR #147：<...> 形态的 indexOf('>') 也要先扣预算——否则 `[a](<` 这类
+  // 「有 '<' 但整串没有 '>'」的畸形构造每轮都会从头扫到串尾，多个叠起来仍然是 O(n²)，
+  // 预算形同虚设。预算耗尽即直接返回 -1（由调用方回落「首个 )」）。
+  if (budget.left <= 0) return -1
   if (s[from] === '<') {
     const g = s.indexOf('>', from + 1)
     budget.left -= (g === -1 ? s.length - from : g - from + 1)

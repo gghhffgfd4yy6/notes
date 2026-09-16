@@ -23,14 +23,26 @@ function createPusher ({ Utils, getNotify }) {
       // 且 slice 按 UTF-16 码元切分会在代理对中间切断，产生孤立代理（半个 emoji 乱码）。
       // 改为复用 Utils.truncateUtf16（与 xbk_formatter 同一 100k 上限同一口径，代理对/ZWJ 安全），
       // 并补一条告警让「配置被硬上限覆盖」可观测。注意：Utils 为注入依赖，测试替身可能未提供
-      // truncateUtf16 → 退回 slice（与旧实现逐字符等价，不改既有语义）。
+      // truncateUtf16 → 退回本地代理对安全截断（行为等价：都不切断代理对）。
       const HTML_LIKE_MAX_LEN = 100000
       if (desp.length > HTML_LIKE_MAX_LEN) {
         console.warn(`[Pusher] desp 长度 ${desp.length} 超过硬上限 ${HTML_LIKE_MAX_LEN}，已截断；` +
           `若 push.contentMax > ${HTML_LIKE_MAX_LEN}，实际推送内容不会超过该上限`)
+        // CodeRabbit PR #147：退回分支不能再裸 slice——它可能只留下跨边界 emoji 的高位代理，
+        // 违反 SYSTEM_CONTRACT「按 UTF-16 安全截断（不得切断代理对）」。这里本地做一次代理对回退，
+        // 与 Utils.truncateUtf16 的口径一致（截断点若落在低位代理上则整体退一格）。
+        const safeSlice = (text, max) => {
+          let endIdx = max
+          if (endIdx < text.length && endIdx > 0) {
+            const prev = text.charCodeAt(endIdx - 1)
+            const next = text.charCodeAt(endIdx)
+            if (prev >= 0xD800 && prev <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) endIdx -= 1
+          }
+          return text.slice(0, endIdx)
+        }
         desp = Utils && typeof Utils.truncateUtf16 === 'function'
           ? Utils.truncateUtf16(desp, HTML_LIKE_MAX_LEN)
-          : desp.slice(0, HTML_LIKE_MAX_LEN)
+          : safeSlice(desp, HTML_LIKE_MAX_LEN)
       }
       // 审查 P1/S1/F1：门槛收敛为 looksLikeHtmlEnvelope——与渲染侧（slim 的 contentType 判定）
       // 同一实现，且取宽松包络。此前注入的 looksLikeHtmlLinear 更严：

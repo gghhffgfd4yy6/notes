@@ -380,7 +380,9 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       // 整轮 run。统一经 readField 读取：失败记一条告警并按「无该字段」处理，不再中断校验。
       const readField = (field) => {
         try { return { ok: true, value: cfg[field] } } catch (e) {
-          warnings.push(`⚠️ 配置「${field}」读取失败（${e && e.message ? e.message : String(e)}），已忽略该字段过滤`)
+          // CodeRabbit PR #147：不要直接读 e.message——它可能是会抛的 getter，那会在 catch 里再抛、
+          // 让「读字段失败只告警并跳过」的恢复路径失效。统一走 Utils.safeErrorText（内部经 safeGet）。
+          warnings.push(`⚠️ 配置「${field}」读取失败（${Utils.safeErrorText(e, '未知错误')}），已忽略该字段过滤`)
           return { ok: false, value: undefined }
         }
       }

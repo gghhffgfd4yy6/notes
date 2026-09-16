@@ -33,16 +33,26 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     return JSON.stringify(parts)
   },
   /** 缺字段保守放行统一：compiled/group 缺失或字段缺失 → true；否则取反执行检查
-   *  参数形状：compiled 为 compileRules 产出的字段级规则对象（_type 为字符串） */
-  _passIfMissing (group, field, compiled, checkFn) {
+   *  参数形状：compiled 为 compileRules 产出的字段级规则对象；allowedTypes 由调用方给出该字段
+   *  合法的判别式集合（分类用 re/multi，天数用 time/timeMulti），载荷字段按判别式固定。 */
+  _passIfMissing (group, field, compiled, checkFn, allowedTypes) {
     if (!compiled || !group) return true
-    // FILTER-03：形状守卫——只接受 compileRules 产出的字段级规则（_type 为字符串）。
+    // FILTER-03：形状守卫——只接受 compileRules 产出的**匹配本调用方**的字段级规则。
     // 传原始配置/错形状参数时下游 matchesCompiled/checkTimeCompiled 会静默返回「不拦截」，
     // 与同级入口 :131/:231/:246 的 __compiled 守卫口径分裂；此处显式告警后保守放行（合法输入行为不变）。
+    // CodeRabbit PR #147：只判 `typeof _type === 'string'` 太宽——把 time/timeMulti 形状误传给分类检查
+    // （或反之）时下游返回 false、本函数取反成 true，会**静默全放行且无告警**；故按调用方给的
+    // allowedTypes 校验判别式，并要求对应载荷字段存在（re→re / time→value / multi|timeMulti→rules）。
     let ruleShape = false
-    try { ruleShape = typeof compiled === 'object' && typeof compiled._type === 'string' } catch (e) { ruleShape = false }
+    try {
+      const type = typeof compiled === 'object' && compiled !== null ? compiled._type : null
+      const payloadKey = type === 're' ? 're' : type === 'time' ? 'value' : (type === 'multi' || type === 'timeMulti') ? 'rules' : null
+      ruleShape = typeof type === 'string' && payloadKey !== null &&
+        (allowedTypes === undefined || allowedTypes.includes(type)) &&
+        compiled[payloadKey] !== undefined && compiled[payloadKey] !== null
+    } catch (e) { ruleShape = false }
     if (!ruleShape) {
-      console.warn('⚠️ 过滤检查收到未编译的规则对象（应为 compileRules 产物），已保守放行')
+      console.warn('⚠️ 过滤检查收到与本调用方不匹配或缺载荷的规则对象（应为 compileRules 产物），已保守放行')
       return true
     }
     const v = Utils.safeGet(group, field)
@@ -58,7 +68,7 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
    *  参数形状：compiled = compileRules().pingbitime（_type 'time'/'timeMulti'），null/缺失 → 放行 */
   checkRegisterTime (group, compiled) {
     // 显式判断缺失：0 时间戳(1970)视为有效，走 checkTimeCompiled 解析（口径统一）
-    return this._passIfMissing(group, 'louzhuregtime', compiled, (c, g) => RuleEngine.checkTimeCompiled(c, g))
+    return this._passIfMissing(group, 'louzhuregtime', compiled, (c, g) => RuleEngine.checkTimeCompiled(c, g), ['time', 'timeMulti'])
   },
 
   /** 分类屏蔽（使用编译后的规则）
@@ -69,7 +79,7 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
       // multi 型规则按行内「分类###值」匹配：分类判定与值判定都基于本条 catename，
       // 传入 null 会导致带分类限制的多行规则永不命中，分类屏蔽失效（P3 修复）。
       return RuleEngine.matchesCompiled(c, catename, catename)
-    })
+    }, ['re', 'multi'])
   },
 
   /**

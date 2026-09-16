@@ -68,8 +68,16 @@ function depthExceeded (value, ancestors, depth) {
 // qodo #147-11：failures 可能来自敌意对象——Array.isArray 对 **revoked proxy** 会抛 TypeError，
 // 索引 getter 抛错的数组在遍历时也会抛，二者都会让本模块的「绝不抛异常」契约失效。
 // 凡是「判定是否为数组 + 取元素」都统一走这里：任何一步失败即返回 null（调用方按「没有该数组」处理）。
+// CodeRabbit PR #147：**不要用 Array.prototype.slice.call(value)** —— 它对数组子类会走 Symbol.species，
+// 自定义 species 可让它返回一个没有 .map 的对象，于是后续 .map(...) 在 try 之外抛 TypeError。
+// 改为在 try 内把元素逐个拷进一个新建的普通数组，确保返回值恒为真数组。
 function safeArray (value) {
-  try { return Array.isArray(value) ? Array.prototype.slice.call(value) : null } catch (e) { return null }
+  try {
+    if (!Array.isArray(value)) return null
+    const copy = []
+    for (let i = 0; i < value.length; i++) copy.push(value[i])
+    return copy
+  } catch (e) { return null }
 }
 
 // XFP-05/XFP-06：failureInfo 透传前与常规路径同口径清洗（脱敏 + 折叠换行 + 截断），
@@ -78,7 +86,10 @@ function safeArray (value) {
 // 逐字段用 readProp 读取，getter/proxy 抛错时降级为 undefined，不让摘要读取把调用方带崩。
 function sanitizeFailureInfo (info, ancestors, depth) {
   if (depthExceeded(info, ancestors, depth)) return { message: TRUNCATED_FAILURE_MESSAGE }
-  const sanitized = {}
+  // CodeRabbit PR #147：用无原型对象承载清洗结果——若 info 带一个可枚举的自有 `__proto__` 字段，
+  // 写进普通对象会改写原型，随后 classifyOne 读到的 `info.failureKind` / `code` 可能是**继承**来的
+  // 伪造值（例如伪造 failureKind:'permanent' 让本可重试的失败被误判为永久并停止重试）。
+  const sanitized = Object.create(null)
   let keys = []
   try { keys = Object.keys(info) } catch (e) { keys = [] }
   for (const key of keys) {

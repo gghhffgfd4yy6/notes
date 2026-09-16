@@ -46,7 +46,13 @@ async function fetchJson (url, options = {}, maxBody = DEFAULT_MAX_BODY) {
   const limit = Number.isFinite(maxBody) && maxBody > 0 ? maxBody : DEFAULT_MAX_BODY
   // 非法 maxBody（非数字/NaN/Infinity/负数/0，如环境变量传来的字符串 '10'）静默替换成 20MB 会隐藏调用方笔误：
   // 显式告警，但钳制语义不变（合法数字的行为零变更）。
-  if (limit !== maxBody) console.warn(`[xbk_http] maxBody 非法(${String(maxBody)})，已钳制到 ${DEFAULT_MAX_BODY} 字节`)
+  // CodeRabbit PR #147：告警里的 String(maxBody) 本身可能抛（Object.create(null)、带抛错 toString 的对象），
+  // 那会让 fetchJson 直接失败、破坏「非法输入一律钳制」的契约；故先做安全转换再插值。
+  if (limit !== maxBody) {
+    let shown = '(无法转换为文本)'
+    try { shown = String(maxBody) } catch (e) { /* 保持兜底文案 */ }
+    console.warn(`[xbk_http] maxBody 非法(${shown})，已钳制到 ${DEFAULT_MAX_BODY} 字节`)
+  }
   return new Promise((resolve, reject) => {
     let response
     let responseAtMs = 0
