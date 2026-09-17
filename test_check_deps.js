@@ -7,7 +7,7 @@ const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { checkDependencies } = require('./scripts/check-deps')
+const { checkDependencies, satisfiesNodeRange } = require('./scripts/check-deps')
 
 // 沙箱：<dir>/package.json（可控声明清单）+ <dir>/scripts/check-deps.js（复制真实实现）
 // + <dir>/node_modules/<name>/{package.json,index.js}。ROOT 由实现自算为 <dir>。
@@ -233,6 +233,89 @@ test('F1 package.json 不可读 → 告警并退回内置清单，不静默零�
   if (ok !== true) throw new Error(`期望 true（内置清单两项都可用），实际 ${ok}`)
   if (probed.join(',') !== 'got,re2') throw new Error(`应退回内置清单 got/re2，实际探测: ${probed.join(',')}`)
   if (!warns.some(w => w.includes('package.json'))) throw new Error(`读失败必须告警，实际 warns=${JSON.stringify(warns)}`)
+})
+
+// F4 回归：此前完全没有 Node 版本判定（无 process.versions.node / engines 读取）。
+// 第一层是纯函数表：本仓库 engines `>=22.22.2` 与 README 明示的 re2 engines
+// `^22.22.2 || ^24.15.0 || >=26.0.0` ——后者更严，23.x / 24.0–24.14 / 25.x 都不在其支持范围内。
+test('F4 satisfiesNodeRange：repo engines 与 re2 更严的 engines 都按 npm 口径判定', () => {
+  const cases = [
+    ['22.22.2', '>=22.22.2', true],
+    ['22.22.1', '>=22.22.2', false],
+    ['24.18.0', '>=22.22.2', true],
+    // re2 的 engines：23.x / 24.0-24.14 / 25.x 均不被支持
+    ['22.22.2', '^22.22.2 || ^24.15.0 || >=26.0.0', true],
+    ['22.23.0', '^22.22.2 || ^24.15.0 || >=26.0.0', true],
+    ['23.5.0', '^22.22.2 || ^24.15.0 || >=26.0.0', false],
+    ['24.10.0', '^22.22.2 || ^24.15.0 || >=26.0.0', false],
+    ['24.15.0', '^22.22.2 || ^24.15.0 || >=26.0.0', true],
+    ['24.18.0', '^22.22.2 || ^24.15.0 || >=26.0.0', true],
+    ['25.0.0', '^22.22.2 || ^24.15.0 || >=26.0.0', false],
+    ['26.0.0', '^22.22.2 || ^24.15.0 || >=26.0.0', true],
+    // 带 prerelease 后缀/前导 v 的运行时版本仍可解析（只取前三段）
+    ['v24.18.0-nightly20250101', '>=22.22.2', true],
+    // 复合区间、^/~ 上界、精确匹配
+    ['24.18.0', '>=22.22.2 <25', true],
+    ['26.0.0', '>=22.22.2 <25', false],
+    ['0.2.9', '^0.2.3', true],
+    ['0.3.0', '^0.2.3', false],
+    ['1.2.9', '~1.2.3', true],
+    ['1.3.0', '~1.2.3', false],
+    ['24.18.0', '=24.18.0', true],
+    // 看不懂的写法返回 null（调用方降级告警，不误红）；可解析的候选区间先命中就先满足
+    ['24.18.0', 'latest', null],
+    ['24.18.0', '^24 || next', true],
+    ['24.18.0', 'next || ^24', null]
+  ]
+  for (const [version, range, expected] of cases) {
+    const actual = satisfiesNodeRange(version, range)
+    if (actual !== expected) throw new Error(`satisfiesNodeRange(${version}, ${range}) 期望 ${expected}，实际 ${actual}`)
+  }
+})
+
+// F4 回归（集成）：repo engines 不满足时必须判失败并输出要求与当前版本。
+test('F4 repo engines 不满足 → 返回 false 且输出要求', () => {
+  const out = captureErrorOutput(() => {
+    const ok = checkDependencies({
+      manifest: () => ({ dependencies: { got: '11.8.6' }, engines: { node: '>=99.0.0' } }),
+      resolve: () => '/mock/path',
+      load: () => fakeRe2Class()
+    })
+    if (ok !== false) throw new Error(`期望 false，实际 ${ok}`)
+  })
+  if (!out.includes('Node 版本不满足要求')) throw new Error(`必须报版本不满足: ${out}`)
+  if (!out.includes('>=99.0.0')) throw new Error(`必须给出 engines 要求: ${out}`)
+  if (!out.includes(process.version)) throw new Error(`必须给出当前版本: ${out}`)
+})
+
+// F4 兜底：engines 写法不认识 → 告警跳过，不得误红（也不得静默）
+test('F4 engines 写法无法解析 → 告警跳过而非误判失败', () => {
+  const warns = []
+  const originalWarn = console.warn
+  let ok
+  try {
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    ok = checkDependencies({
+      manifest: () => ({ dependencies: { got: '11.8.6' }, engines: { node: 'latest' } }),
+      resolve: () => '/mock/path',
+      load: () => fakeRe2Class()
+    })
+  } finally {
+    console.warn = originalWarn
+  }
+  if (ok !== true) throw new Error(`无法解析的范围不得判失败，实际 ${ok}`)
+  if (!warns.some(w => w.includes('无法解析') && w.includes('latest'))) {
+    throw new Error(`无法解析必须告警，实际 warns=${JSON.stringify(warns)}`)
+  }
+})
+
+// F4 生产路径：本机（CI 矩阵 22.22.2 / 24）应满足真实 engines，无参调用不得因此变红
+test('F4 真实 package.json engines 在本机运行时上通过（无参调用 → true）', () => {
+  const out = captureErrorOutput(() => {
+    const ok = checkDependencies()
+    if (ok !== true) throw new Error(`本机 ${process.version} 应满足真实 engines，实际 ${ok}`)
+  })
+  if (out !== '') throw new Error(`不应有错误输出，实际: ${out}`)
 })
 
 console.log('========================================')

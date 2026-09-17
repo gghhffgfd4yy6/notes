@@ -1,6 +1,8 @@
 'use strict'
 // 依赖预检：按 package.json 的运行时声明（dependencies + optionalDependencies）逐项探测，
 // 含 re2 原生绑定探针；区分「未安装」与「已安装但不可用」两种情况并输出对应修复指引与失败根因。
+// 另校验运行时 Node 版本是否满足 package.json 的 engines.node 与 re2 自身的 engines.node
+// （re2 的口径更严，见 README：23.x / 24.0–24.14 / 25.x 都不在其支持范围内）。
 // 支持注入 resolve/load/manifest 以便测试（默认使用 Node 的 require 体系与 ROOT/package.json）。
 // 已知口径缺口（本轮审查 F5/F6，暂不在此修）：
 //   - 默认参数即生产路径，只有 run_tests.js 的无参调用会走到；test_check_deps.js 每条用例都显式注入
@@ -39,18 +41,106 @@ function dependencyFailureReason (error) {
   return `${code}${message.split('\n')[0]}`
 }
 
+// ---- F4：Node 版本闸门 ----
+// 极简范围判定：只支持 `||` 分隔的候选区间 + 空白分隔的比较器（>= > <= < = ^ ~ 与裸版本）。
+// 本仓库 engines.node 与 re2 的 engines.node 都是这种写法（re2 为 `^22.22.2 || ^24.15.0 || >=26.0.0`），
+// 故不引入 semver 依赖；看不懂的写法一律返回 null，由调用方降级为告警（不误红）。
+function parseVersion (value) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(value).trim())
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null
+}
+
+function compareVersion (a, b) {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1
+  }
+  return 0
+}
+
+function satisfiesComparator (version, token) {
+  const m = /^(>=|<=|>|<|=|\^|~)?v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$/.exec(token)
+  if (!m) return null
+  const op = m[1] || '='
+  const low = [Number(m[2]), Number(m[3] || 0), Number(m[4] || 0)]
+  if (op === '>=') return compareVersion(version, low) >= 0
+  if (op === '>') return compareVersion(version, low) > 0
+  if (op === '<=') return compareVersion(version, low) <= 0
+  if (op === '<') return compareVersion(version, low) < 0
+  if (op === '=') return compareVersion(version, low) === 0
+  // ^ 与 ~ 的上界按 npm 口径：^1.2.3 → <2.0.0、^0.2.3 → <0.3.0、^0.0.3 → <0.0.4、~1.2.3 → <1.3.0
+  const high = op === '^'
+    ? (low[0] > 0 ? [low[0] + 1, 0, 0] : (low[1] > 0 ? [0, low[1] + 1, 0] : [0, 0, low[2] + 1]))
+    : [low[0], low[1] + 1, 0]
+  return compareVersion(version, low) >= 0 && compareVersion(version, high) < 0
+}
+
+// 返回 true（满足）/ false（不满足）/ null（范围写法不认识，调用方降级告警）
+function satisfiesNodeRange (versionText, range) {
+  const version = parseVersion(versionText)
+  if (!version) return null
+  const alternates = String(range).trim().split('||')
+  for (const alternate of alternates) {
+    const tokens = alternate.trim().split(/\s+/).filter(Boolean)
+    if (tokens.length === 0) return null
+    let matched = true
+    for (const token of tokens) {
+      const result = satisfiesComparator(version, token)
+      if (result === null) return null
+      if (!result) { matched = false; break }
+    }
+    if (matched) return true
+  }
+  return false
+}
+
+// re2 自身的 engines.node（比本仓库严）：re2 没装或没写 engines 时返回 null（缺失由依赖探测分支负责）
+function readNativeEngineRange () {
+  try {
+    const manifestPath = require.resolve(`${NATIVE_DEP}/package.json`, { paths: [ROOT] })
+    const nativePkg = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    return nativePkg && nativePkg.engines ? nativePkg.engines.node : null
+  } catch (error) {
+    return null
+  }
+}
+
+// 收集所有不满足的 Node 版本要求（repo engines + re2 engines）
+function nodeVersionProblems (pkg, currentVersion) {
+  const problems = []
+  if (!parseVersion(currentVersion)) return problems
+  const checks = [['package.json 的 engines.node', pkg && pkg.engines ? pkg.engines.node : null]]
+  const nativeRange = readNativeEngineRange()
+  if (nativeRange) checks.push([`${NATIVE_DEP} 的 engines.node`, nativeRange])
+  for (const [label, range] of checks) {
+    if (!range || typeof range !== 'string') continue
+    const satisfied = satisfiesNodeRange(currentVersion, range)
+    if (satisfied === null) {
+      console.warn(`⚠️ 无法解析 ${label} 的版本范围「${range}」，跳过该项 Node 版本闸门`)
+      continue
+    }
+    if (!satisfied) problems.push({ label, required: range })
+  }
+  return problems
+}
+
 function checkDependencies ({ resolve = require.resolve, load = require, manifest = readPackageManifest } = {}) {
   const missing = []
   const broken = []
+  const versionProblems = []
 
-  let declared = []
+  let pkg = null
   try {
-    declared = declaredRuntimeDependencies(manifest())
+    pkg = manifest()
   } catch (error) {
     // package.json 读不到/解析失败：如实告警并退回内置清单——预检本身不得因此退化成「零检查」
     console.warn(`⚠️ 无法读取 package.json（${dependencyFailureReason(error)}），退回内置清单 got/re2`)
   }
+  const declared = declaredRuntimeDependencies(pkg)
   const targets = declared.length > 0 ? declared : ['got', NATIVE_DEP]
+
+  // F4：此前完全不校验 Node 版本（无 process.versions.node / engines 判定），而 re2 的 engines
+  // 严于本仓库 engines——README 明示 Node 23.x、24.0–24.14、25.x 上装/重建 re2 必然失败。
+  versionProblems.push(...nodeVersionProblems(pkg, process.versions.node))
 
   for (const name of targets) {
     // F3：两段判定——resolve 失败才是「缺少」；resolve 成功而加载抛错（ERR_REQUIRE_ESM、
@@ -75,7 +165,14 @@ function checkDependencies ({ resolve = require.resolve, load = require, manifes
     }
   }
 
-  if (missing.length === 0 && broken.length === 0) return true
+  if (missing.length === 0 && broken.length === 0 && versionProblems.length === 0) return true
+
+  // F4：Node 版本不满足时先把要求摆出来（含 re2 更严的那一条），再报依赖问题，
+  // 避免用户在「re2 装不上」的现场先看到一堆与版本无关的指引。
+  if (versionProblems.length > 0) {
+    console.error(`❌ Node 版本不满足要求（当前 ${process.version}）：`)
+    for (const p of versionProblems) console.error(`  - ${p.label} 要求 ${p.required}`)
+  }
 
   if (missing.length > 0) {
     console.error(`❌ 缺少依赖：${missing.join(', ')}`)
@@ -90,8 +187,7 @@ function checkDependencies ({ resolve = require.resolve, load = require, manifes
     console.error(`❌ 依赖已安装但不可用：${broken.map(b => b.name).join(', ')}`)
     // F3：根因入输出——此前 catch 完全丢弃 error，只留下「缺少 got」这类误判文案。
     for (const b of broken) console.error(`  - ${b.name}: ${b.reason}`)
-    // 本预检不校验 Node 版本（re2 的 engines 严于本仓库 engines，口径未对齐，审查 F4），
-    // 故带上当前版本，让「切换 Node 版本」这条指引可直接对照。
+    // re2 的修复动作含「切换 Node 版本」（其 engines 比本仓库严，见上方版本闸门），故带上当前版本对照
     if (broken.some(b => b.name === NATIVE_DEP)) {
       console.error(`请重建原生模块或切换 Node 版本（当前 ${process.version}）：`)
       console.error(`  npm run rebuild --prefix node_modules/${NATIVE_DEP}`)
@@ -105,7 +201,7 @@ function checkDependencies ({ resolve = require.resolve, load = require, manifes
   return false
 }
 
-module.exports = { checkDependencies }
+module.exports = { checkDependencies, satisfiesNodeRange }
 
 // F2：此前没有 CLI 守卫——`node scripts/check-deps.js` 只加载模块、不执行任何检查，
 // 于是「直接执行」这个入口永远 exit 0 且零输出（fail-open：把它挂进脚本链/CI 步骤时会静默放行）。
