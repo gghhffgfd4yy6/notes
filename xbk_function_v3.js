@@ -20,11 +20,24 @@ const PROFILE3_BOOT_MARKS = []
 let RE2C = null
 try { RE2C = require('re2') } catch (e) { RE2C = null }
 const _reCache = new Map()
+// P1-04（收尾）：RE2 → V8 回落不再无声。safeRe 在生产热路径上被每条内部正则调用，逐条打印会刷屏，
+// 故进程内只在**首次**回落时告警一次，内容含模式源码与失败原因，运维据此定位哪条模式失去线性防护。
+// 通道沿用 RE2_MISSING_WARNING 的 console.warn；模式串与原因经既有脱敏通道
+// xbk_failure_policy.summarizeError（redact 屏蔽凭据 + 折叠换行 + 截断）后再输出。
+let _re2FallbackWarned = false
+function warnRe2Fallback (src, error) {
+  if (_re2FallbackWarned) return
+  _re2FallbackWarned = true
+  try {
+    const pick = (value) => { const info = summarizeError(value); return typeof info.message === 'string' ? info.message.slice(0, 200) : '' }
+    console.warn(`⚠️ RE2 编译失败，已回落 V8 原生 RegExp（RE2 的线性时间防护对该模式不成立）——模式：${pick(src)}；原因：${pick(error) || '未知原因'}`)
+  } catch (e) { /* 告警自身失败不得影响回落路径 */ }
+}
 const safeRe = (src, flags) => {
   const k = src + '\u0000' + flags
   let r = _reCache.get(k)
   if (r) return r
-  if (RE2C) { try { r = new RE2C(src, flags); _reCache.set(k, r); return r } catch (e) { /* 反向引用等不支持特性回落 */ } }
+  if (RE2C) { try { r = new RE2C(src, flags); _reCache.set(k, r); return r } catch (e) { warnRe2Fallback(src, e) /* 反向引用等不支持特性：回落 V8，但留一次告警 */ } }
   r = new RegExp(src, flags)
   _reCache.set(k, r)
   return r
