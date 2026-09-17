@@ -27,6 +27,7 @@ let catchRespLeak = false // logErr 修复后补充回归：响应结构异常�
 let failMDevSecond = false // v3.166：Bark/PushMe 多设备第 2 个失败（至少一个成功=通道成功不重试）
 let mdevCount = 0 // 多设备计数（failMDevSecond 时按调用序第 1 成功第 2 失败）
 let syncPostThrow = false // got.post 同步构造异常
+let hangWxpusher = false // P3：wxpusher 请求永不 settle（模拟「仍在飞」的通道）
 require.cache[gotPath].exports = (url, options) => {
   gotCalls.push({ url, options })
   // 一言接口失败模拟：抛 Error（网络异常路径）
@@ -40,6 +41,7 @@ require.cache[gotPath].exports = (url, options) => {
 require.cache[gotPath].exports.get = require.cache[gotPath].exports
 require.cache[gotPath].exports.post = (url, options) => {
   gotCalls.push({ url, options })
+  if (hangWxpusher && String(url).includes('wxpusher')) return { then: () => {} } // 永不 settle
   if (syncPostThrow) throw new Error('sync request construction failure')
   // 失败模拟（v3.75）：异步 reject 走 $.post 的 err 回调；response.body 含密钥回显（验证不再传给 callback）
   if (failPost) {
@@ -448,6 +450,50 @@ console.log('========================================\n');
     const apps2 = gotCalls.filter(c => c.url.includes('wxpusher')).map(c => c.options.json.appToken)
     assert(apps2.join(',') === 'APP_A,APP_B', `对照组合法应用应经轮转分别联系，实际 ${apps2.join(',')}`)
     assert(warns.length === 0, `对照组不得告警，实际 ${JSON.stringify(warns)}`)
+  }))
+
+  // P3（跨批协同，low）：slim 必须经 params.inFlightTracker 透出「在飞/已结算通道」状态
+  // （Pusher 超时归因的数据源）。已结算通道必须被移除，未结算通道必须保留。
+  await test('P3 slim 经 inFlightTracker 透出在飞通道并在结算时移除', () => withChannels(async () => {
+    cfg.BARK_PUSH = 'https://api.day.app/dev1'
+    cfg.WX_pusher_appToken = 'AT_HANG'
+    cfg.WX_pusher_topicIds = '1'
+    hangWxpusher = true
+    const tracker = {}
+    const pending = notify.sendNotify('标题', '内容', { inFlightTracker: tracker })
+    try {
+      await new Promise(resolve => setTimeout(resolve, 60)) // 让可结算的 bark 走完
+      assert(Array.isArray(tracker.pending), `必须回填 pending 数组: ${JSON.stringify(tracker.pending)}`)
+      assert(!tracker.pending.includes('bark'), `已结算通道必须被移除: ${JSON.stringify(tracker.pending)}`)
+      assert(tracker.pending.includes('wxpusher'), `在飞通道必须保留: ${JSON.stringify(tracker.pending)}`)
+    } finally {
+      hangWxpusher = false
+    }
+    assert(pending && typeof pending.then === 'function', 'sendNotify 仍返回 promise')
+  }))
+
+  // P3 端到端：真实 slim + 真实 Pusher（仅 got 被桩掉）。bark 已成功、wxpusher 仍在飞时整体超时，
+  // 归因必须只指向 wxpusher——修复前会把 bark 一起标成 PUSH_TIMEOUT（通道健康统计被污染）。
+  await test('P3 端到端：超时归因只指向在飞通道（已成功通道不得被标失败）', () => withChannels(async () => {
+    const xbk = require('./xbk_function_v3.js')
+    const originalSetTimeout = global.setTimeout
+    cfg.BARK_PUSH = 'https://api.day.app/dev1'
+    cfg.WX_pusher_appToken = 'AT_HANG'
+    cfg.WX_pusher_topicIds = '1'
+    hangWxpusher = true
+    // 只缩短 Pusher 的 10s 整体超时定时器，其余 setTimeout 语义原样保留
+    global.setTimeout = (fn, ms, ...args) => (ms === 10000 ? originalSetTimeout(fn, 60) : originalSetTimeout(fn, ms, ...args))
+    let err = null
+    try {
+      await xbk.Pusher.send('标题', '内容', notify)
+    } catch (e) { err = e } finally {
+      hangWxpusher = false
+      global.setTimeout = originalSetTimeout
+    }
+    assert(err && err.code === 'PUSH_TIMEOUT', `必须超时（code=PUSH_TIMEOUT）: ${err && err.message}`)
+    const chans = err.failures.map(f => f.channel)
+    assert(chans.includes('wxpusher'), `在飞通道应被归因: ${JSON.stringify(chans)}`)
+    assert(!chans.includes('bark'), `已成功结算的通道不得被标为超时失败: ${JSON.stringify(chans)}`)
   }))
 
   // 7. PushMe（修复后新接入）

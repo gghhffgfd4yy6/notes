@@ -1565,8 +1565,29 @@ async function sendNotify (text, desp, params = {}) {
     [configuredFlags[8], 'telegram', () => tgNotify(text, desp, params)]
   ]
   const enabledTasks = channelTasks.filter(([enabled]) => enabled)
+  // P3（跨批协同，low）：向调用方（Pusher）透出本次 sendNotify 的「在飞/已结算通道」状态。
+  // Pusher 的整体超时（10s race）会在 slim 的 Promise.allSettled 尚未 settle 时触发，此前只能按
+  // 静态配置清单把【所有】配置通道都标成 PUSH_TIMEOUT（含已成功通道）；有了在飞清单，超时归因
+  // 可以只指向真正未结算的通道。
+  // 契约：可选 params.inFlightTracker（对象）——启动通道任务前写入 pending（未结算通道名数组），
+  // 每个通道 settle 时从 pending 移除。不传 tracker 时零副作用（既有调用方行为逐字不变）。
+  // 同步抛错的通道保持既有语义（旧实现里会从 map 直接抛出），此时也把该通道从 pending 移除。
+  const inFlightTracker = params && params.inFlightTracker && typeof params.inFlightTracker === 'object'
+    ? params.inFlightTracker
+    : null
+  const pendingChannels = inFlightTracker ? enabledTasks.map(([, name]) => name) : null
+  if (inFlightTracker) inFlightTracker.pending = pendingChannels
+  const trackSettle = (name) => {
+    const idx = pendingChannels.indexOf(name)
+    if (idx !== -1) pendingChannels.splice(idx, 1)
+  }
   const results = await Promise.allSettled(
-    enabledTasks.map(([, , task]) => task())
+    enabledTasks.map(([, name, task]) => {
+      if (!pendingChannels) return task()
+      let running
+      try { running = task() } catch (e) { trackSettle(name); throw e }
+      return Promise.resolve(running).finally(() => trackSettle(name))
+    })
   )
   const normalizeFailure = (reason, channel) => {
     if (reason && typeof reason === 'object' && reason.channel === channel) return reason
