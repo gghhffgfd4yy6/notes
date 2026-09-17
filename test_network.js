@@ -9,6 +9,7 @@ function makeNetwork (opts = {}) {
   const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes } = opts
   let calls = 0
   const requestOptions = [] // net-3：捕获传给 HTTP 层的 option，供 timeout 钳制断言使用
+  const warnings = [] // net-3：捕获 logger.warn（配置非法时必须告警留痕）
   const fetchJson = async (_url, requestOpts) => {
     calls += 1
     requestOptions.push(requestOpts)
@@ -31,9 +32,15 @@ function makeNetwork (opts = {}) {
     getNotify: async () => 'notify-module',
     crypto: { randomInt: () => 0 }, // 抖动固定为 0，退避仅由 1000*2^attempt 决定
     RETRYABLE_CODES,
-    ...(permanentCodes === undefined ? {} : { PERMANENT_CODES: permanentCodes })
+    ...(permanentCodes === undefined ? {} : { PERMANENT_CODES: permanentCodes }),
+    logger: { log: () => {}, warn: (msg) => warnings.push(String(msg)) }
   })
-  return { net, getCalls: () => calls, getRequestOptions: () => requestOptions }
+  return {
+    net,
+    getCalls: () => calls,
+    getRequestOptions: () => requestOptions,
+    getWarnings: () => warnings
+  }
 }
 
 ;(async () => {
@@ -137,39 +144,67 @@ function makeNetwork (opts = {}) {
     assert.ok(logs.some(l => l.includes('dns-prewarm') && l.includes('skipped')), 'PROFILE3 应输出 skipped 日志')
   }
 
-  // 10. net-3（xbk_network.js:63）：timeout 钳到 [1, 2147483647] 的整数
-  // 旧实现 `n > 0 ? n : 5000` 会把 0.5 原样传出、1e12 原样传出——got 交给定时器后
-  // 被 Node 归一到约 1ms（每次请求瞬间超时）。回退该改动则本块前两行即红。
+  // 10. net-3（xbk_network.js resolveTimeoutMs）：只有「≥100ms 的整数」被采用，其余回落默认并告警
+  // 上一轮实现 `n > 0 ? ceil(clamp(n)) : 5000` 仍放过小数与单位误填的小值：0.5 → 1ms、5 → 5ms
+  // （用户想写 5 秒），现象是「请求超时」而不是「配置有问题」。回退本次改动 → 下面每条 case 立即变红。
   {
     const cases = [
-      [1, 1, '合法整数 1 不变'],
-      [0.5, 1, '0.5 向上取整为 1（曾原样传出 0.5）'],
-      [0.9, 1, '0.9 向上取整为 1（曾原样传出 0.9）'],
-      [1.2, 2, '1.2 向上取整为 2（曾原样传出 1.2）'],
-      [30000, 30000, '常规值不被钳制'],
-      [2147483646, 2147483646, '上界内最大值不变'],
-      [2147483647, 2147483647, '上界本身保持不变'],
-      [2147483647.5, 2147483647, '超上界小数取整后钳回 2147483647'],
-      [1e12, 2147483647, '1e12 钳到 2^31-1（曾原样传出 1e12）']
+      [30000, 30000, false, '常规值不被钳制'],
+      [100, 100, false, '下界本身（100ms）被采用'],
+      [99, 5000, true, '亚 100ms 判非法 → 回落默认（旧实现传出 99ms）'],
+      [5, 5000, true, '单位误填（想写 5 秒）→ 回落默认（旧实现传出 5ms 即超时）'],
+      [1, 5000, true, '1 同样按非法处理（旧实现传出 1ms）'],
+      [0.5, 5000, true, '小数不取整、判非法 → 回落默认（旧实现传出 1ms）'],
+      [1.2, 5000, true, '小数不取整（旧实现传出 2ms）'],
+      [2147483647, 2147483647, false, '上界本身保持'],
+      [2147483648, 2147483647, false, '超上界的整数钳到 2^31-1'],
+      [1e12, 2147483647, false, '1e12 是整数 → 钳到 2^31-1（旧实现原样传出，被 Node 归一到约 1ms）'],
+      [2147483647.5, 5000, true, '超上界的小数仍是非整数 → 回落默认（不猜用户意图）']
     ]
-    for (const [input, expected, msg] of cases) {
-      const { net, getRequestOptions } = makeNetwork({ retry: 0, timeout: input })
+    for (const [input, expected, expectWarn, msg] of cases) {
+      const { net, getRequestOptions, getWarnings } = makeNetwork({ retry: 0, timeout: input })
       await net.fetchData()
       const passed = getRequestOptions()[0].timeout
       assert.strictEqual(passed, expected, `timeout=${input} 应传出 ${expected}：${msg}`)
       assert.ok(Number.isInteger(passed), `timeout=${input} 传出的必须是整数（小数会被 Node 归一到约 1ms）`)
+      const warned = getWarnings().some(w => w.includes('api.timeout') && w.includes('已回落默认'))
+      assert.strictEqual(warned, expectWarn,
+        `timeout=${input} ${expectWarn ? '回落时必须告警留痕' : '合法值不得告警'}，实际告警=${JSON.stringify(getWarnings())}`)
     }
   }
 
-  // 11. net-3（xbk_network.js:62）：非正 / NaN / 非数字 timeout → 回落默认 5000
-  // 注意 `!(n > 0)` 守卫：若改成无条件 Math.max(1, …)，-5/0 会传出 1 而非 5000 → 本块红。
+  // 11. net-3：非正 / 空串 → 回落默认 5000 并告警（非数值经 Utils.num 已回落默认，与合法默认值不可区分，
+  // 保持原语义不告警——这是口径的一部分，不再假装它们被「检出」）。
   {
-    const cases = [[-5, '负数'], [0, '零'], [Number.NaN, 'NaN'], ['abc', '非数字字符串'], ['', '空字符串']]
-    for (const [input, label] of cases) {
-      const { net, getRequestOptions } = makeNetwork({ retry: 0, timeout: input })
+    const cases = [[-5, '负数', true], [0, '零', true], ['', '空字符串', true],
+      [Number.NaN, 'NaN', false], ['abc', '非数字字符串', false]]
+    for (const [input, label, expectWarn] of cases) {
+      const { net, getRequestOptions, getWarnings } = makeNetwork({ retry: 0, timeout: input })
       await net.fetchData()
       assert.strictEqual(getRequestOptions()[0].timeout, 5000, `timeout=${label} 应回落 5000（不得原样传出或钳成 1）`)
+      assert.strictEqual(getWarnings().some(w => w.includes('api.timeout')), expectWarn,
+        `timeout=${label} 的告警口径不符，实际告警=${JSON.stringify(getWarnings())}`)
     }
+  }
+
+  // 11b. net-3：注入的 logger 没有 warn（旧调用方形状）时不得抛错，回落语义不变
+  {
+    const requestOptions = []
+    const net = createNetwork({
+      Config: { api: { pushUrl: 'https://api.example.com/push', retry: 0, timeout: 5 } },
+      Utils: {
+        num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
+        safeErrorText: (e, d) => (e && e.message) || d
+      },
+      fetchJson: async (_url, requestOpts) => { requestOptions.push(requestOpts); return { ok: true } },
+      prewarmDns: async () => ({ ok: true }),
+      getNotify: async () => 'notify',
+      crypto: { randomInt: () => 0 },
+      RETRYABLE_CODES,
+      logger: { log: () => {} } // 无 warn：不得因告警而抛 TypeError
+    })
+    await net.fetchData()
+    assert.strictEqual(requestOptions[0].timeout, 5000, '无 warn 的 logger 仍应回落默认')
   }
 
   // 12. net-1（xbk_network.js:83-87）：不可重试判定不再只看 HTTP 状态码——无 response 的永久性错误码

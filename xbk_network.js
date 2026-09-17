@@ -13,6 +13,15 @@ const { PERMANENT_CODES: POLICY_PERMANENT_CODES } = require('./xbk_failure_polic
 // 故只在请求层单列，不改动失败分类模块的语义（常驻循环仍按策略归类决定下一轮）。
 const DETERMINISTIC_LOCAL_CODES = new Set(['EBODYLIMIT'])
 
+// net-3：请求超时的合法性口径——只有「≥100ms 的整数」才采用，其余一律回落默认 5000ms 并告警：
+//   * got 把数值 timeout 直接交给定时器，小数与超 2^31-1 的值会被 Node 归一到约 1ms（每次请求瞬间超时）；
+//   * 亚 100ms 的值几乎只可能来自「想写秒却按毫秒填」的单位误填（timeout:5 想表达 5 秒）——采用它等于
+//     每次请求必然超时，且现象是「请求超时」而非「配置有问题」，比回落默认值更糟；
+//   * 非整数不猜用户意图（不四舍五入/不向上取整），一律按非法配置处理。
+const MIN_TIMEOUT_MS = 100
+const MAX_TIMEOUT_MS = 2147483647
+const DEFAULT_TIMEOUT_MS = 5000
+
 function createNetwork ({
   Config,
   Utils,
@@ -26,6 +35,17 @@ function createNetwork ({
   PROFILE3 = false,
   logger = console
 }) {
+  // net-3：解析 api.timeout（口径见文件头 MIN_TIMEOUT_MS 说明）。被判非法的值不静默——告警留痕，便于把
+  // 「请求超时」定位回「配置有问题」（非数值输入经 Utils.num 已回落到默认，与合法填写的默认值不可区分，
+  // 保持原语义不告警）；注入的 logger 未提供 warn 时退化为不告警（不得因此抛错）。
+  const resolveTimeoutMs = () => {
+    const n = Utils.num(Config.api.timeout, DEFAULT_TIMEOUT_MS)
+    if (Number.isInteger(n) && n >= MIN_TIMEOUT_MS) return Math.min(n, MAX_TIMEOUT_MS)
+    if (typeof logger.warn === 'function') {
+      logger.warn(`[xbk_network] api.timeout=${String(Config.api.timeout)} 非法（须为 ≥${MIN_TIMEOUT_MS}ms 的整数），已回落默认 ${DEFAULT_TIMEOUT_MS}ms`)
+    }
+    return DEFAULT_TIMEOUT_MS
+  }
   return {
     /**
        * 拉取数据，失败自动重试
@@ -67,13 +87,7 @@ function createNetwork ({
           // retry: { limit: 0 } 关闭 got 内置重试（连带 got 自带 Retry-After 处理一并失效），交给外层手写逻辑
           // net-7：外层退避不读 Retry-After，429/408/425 统一按固定指数退避重试（是否遵守 Retry-After 待决策）
           const result = await fetchJson(Config.api.pushUrl, {
-            timeout: (() => {
-              // net-3：got 把数值 timeout 直接交给定时器，小数/超 2^31-1 会被 Node 归一到约 1ms
-              // （每次请求瞬间超时）——统一钳到 [1, 2147483647] 整数；非正值沿用默认 5000
-              const n = Utils.num(Config.api.timeout, 5000)
-              if (!(n > 0)) return 5000
-              return Math.min(Math.max(1, Math.ceil(n)), 2147483647)
-            })(), // 非法 timeout 只告警不应原样传入 HTTP 层
+            timeout: resolveTimeoutMs(), // net-3：非法 timeout 告警 + 回落默认，不得原样传入 HTTP 层
             retry: { limit: 0 },
             headers: {
               'User-Agent': `xbk-push-script/${PKG_VERSION}`,
