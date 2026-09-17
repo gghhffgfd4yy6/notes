@@ -188,31 +188,48 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
   // 场景 3b：超时必须杀整个进程组（F6）。只 kill 直接子进程时，它派生的孙进程（真实的套件进程）
   // 仍是孤儿并持有 stdout/stderr 管道 → 'close' 被推迟到 2000ms 兜底保险（超时被记 timeout 的同时
   // 孤儿继续跑）。本场景用真实进程验证：孙进程持续写心跳文件，超时后心跳必须停止、且 'close' 快速到达。
+  //
+  // 返工（V2 打回）：原夹具把「首心跳」完全交给孙进程，而本机实测两层 node 的首次心跳在 536/798/720ms，
+  // 与 800ms 预算同量级 —— 心跳晚于预算即整组被杀，断言 `孙进程应至少写入一次心跳` 在 HEAD 恒红
+  // （并连带阻断场景 4 的 F8 断言，CI 上从未跑到）。现按 V2 建议 (a)+(c) 解耦：
+  //   ① 直接子进程在 spawn 之前**同步**写一次 'P' —— 「夹具真的起来了」不再依赖孙进程启动速度；
+  //   ② 孙进程启动时立刻同步写一次 'g' 再按 20ms 心跳，缩短「已派生后代」的取证窗口；
+  //   ③ 预算 800ms → 3000ms（实测首心跳 <800ms，留 ≥3.75x 余量）；
+  //   ④ elapsed 判据改为**相对预算**：兜底定时器在 timeoutMs+2000 结算，故 < budget+1500ms
+  //      即证明 close 正常收敛（而不是落到兜底）。
   {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-groupkill-'))
     const marker = path.join(dir, 'orphan-heartbeat.log')
     const prevMarker = process.env.XBK_TEST_ORPHAN_MARKER
+    const budget = 3000
     try {
       process.env.XBK_TEST_ORPHAN_MARKER = marker
-      // 直接子进程：spawn 一个持续写心跳的孙进程（继承管道），自己挂住不退 —— 触发超时分支。
+      // 直接子进程：同步写首心跳 → spawn 一个持续写心跳的孙进程（继承管道）→ 自己挂住不退，触发超时分支。
       // 孙进程 15s 后自杀：即使修复被回退（孤儿存活）也不会留下无界进程。
       fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
         const { spawn } = require('child_process')
-        spawn(process.execPath, ['-e', "const fs=require('fs');const f=process.env.XBK_TEST_ORPHAN_MARKER;setInterval(()=>fs.appendFileSync(f,'x'),20);setTimeout(()=>process.exit(0),15000)"], { stdio: ['ignore', 'inherit', 'inherit'] })
+        const fs = require('fs')
+        const f = process.env.XBK_TEST_ORPHAN_MARKER
+        fs.appendFileSync(f, 'P')
+        spawn(process.execPath, ['-e', "const fs=require('fs');const f=process.env.XBK_TEST_ORPHAN_MARKER;fs.appendFileSync(f,'g');setInterval(()=>fs.appendFileSync(f,'g'),20);setTimeout(()=>process.exit(0),15000)"], { stdio: ['ignore', 'inherit', 'inherit'] })
         setInterval(() => {}, 1000)
       `)
       const t0 = Date.now()
-      const result = await runTests(dir, 800)
+      const result = await runTests(dir, budget)
       const elapsed = Date.now() - t0
       assert.strictEqual(result.status, 'timeout', '挂住的直接子进程应按超时结算')
-      assert.ok(fs.existsSync(marker), '孙进程应至少写入一次心跳（否则本回归没有判据：夹具未真正派生后代）')
+      // 首心跳由直接子进程同步写：这一步是确定性的（不依赖孙进程启动速度）
+      assert.ok(fs.existsSync(marker), '直接子进程必须留下首心跳（同步写入，不依赖孙进程启动速度）')
+      const content = fs.readFileSync(marker, 'utf8')
+      assert.ok(content.includes('g'),
+        `孙进程应至少写入一次心跳（否则本回归没有判据：夹具未真正派生后代），实际内容=${JSON.stringify(content)}`)
       const size1 = fs.statSync(marker).size
       await new Promise(resolve => setTimeout(resolve, 600))
       const size2 = fs.statSync(marker).size
       assert.strictEqual(size2, size1,
         `超时后孙进程仍在运行（心跳 ${size1} → ${size2} 字节）：进程组未被杀伤，孤儿继续跑`)
-      assert.ok(elapsed < 2000,
-        `孙进程被杀后管道应立即关闭、由 close 收敛（实测 ${elapsed}ms；>=2000ms 说明落到了兜底定时器）`)
+      assert.ok(elapsed < budget + 1500,
+        `孙进程被杀后管道应立即关闭、由 close 收敛（实测 ${elapsed}ms；>= ${budget + 2000}ms 说明落到了兜底定时器）`)
     } finally {
       if (prevMarker === undefined) delete process.env.XBK_TEST_ORPHAN_MARKER
       else process.env.XBK_TEST_ORPHAN_MARKER = prevMarker
