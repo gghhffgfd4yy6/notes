@@ -300,13 +300,32 @@ function buildBatches (mutants, batchSize) {
   return batches
 }
 
+function killTree (child) {
+  // 超时杀伤（F6）：子进程以 detached:true 起（setsid 自成进程组组长），可整组杀伤，连同后代
+  // （run_unit_tests.js 派生的套件进程）一起清掉。只 kill 直接子进程时，后代仍持有 stdout/stderr
+  // 管道 → 'close' 被推迟到 2000ms 兜底保险，本次超时以 timeout 结算，而孤儿后代继续跑（占 CPU、
+  // 残留端口与临时目录，污染后续批次乃至整轮分数）。
+  // 组不存在（ESRCH）/无权限（EPERM）时退回直接子进程，行为与修复前一致；fake child（测试注入，
+  // 无 pid）同样走退回分支。
+  if (Number.isInteger(child.pid) && child.pid > 0) {
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+      return
+    } catch (e) {
+      // 退回直接子进程
+    }
+  }
+  child.kill('SIGKILL')
+}
+
 function runTests (dir, timeoutMs) {
   return new Promise(resolve => {
     // 变异评估必须跑全量套件 —— 清除 SKIP_SUITES，防止 CI 显式步骤的跳过清单继承到子进程使变异分数失真。
     // PERF_MS='3000'（RT-F8）：与 stryker 路径（scripts/mutation-child.js:13 / mutation.yml step env）同口径，
     // 放宽 test_filter.js 的性能断言阈值（默认 500ms）。此前本入口不注入，默认最多 8 并发下套件间的
     // CPU 争抢与沙箱开销会让性能断言误失败 → 变异体被记 killed、分数虚高，且与 stryker 结果不可比。
-    const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, XBK_MUTATION_CHILD: '1', SKIP_SUITES: '', PERF_MS: '3000' } })
+    // detached:true（F6）：让子进程自成进程组，超时据此整组杀伤（见 killTree）。
+    const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: { ...process.env, XBK_MUTATION_CHILD: '1', SKIP_SUITES: '', PERF_MS: '3000' } })
     let output = ''
     // 超时竞态修复：此前 setTimeout 回调里 kill 后立即 resolve，但此时 close 尚未触发、closeSignal 必为 null，
     // 且 stdout/stderr 还在继续排空——resolve 时既拿不到真实 signal（竞态），也拿不到最终完整 output，
@@ -324,7 +343,7 @@ function runTests (dir, timeoutMs) {
     child.stderr.on('data', d => { output += d })
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill('SIGKILL')
+      killTree(child)
       // 兜底保险：kill 后若 close 迟迟不触发（极端情况），仍要 resolve 不让 Promise 悬空——
       // 用当前已 collect 的输出，signal 回退 'SIGKILL'（真实 close signal 已无从得知）。
       // 正常 kill 会在毫秒级触发 close，此保险不会与 close 的 resolve 竞争（close 到达即

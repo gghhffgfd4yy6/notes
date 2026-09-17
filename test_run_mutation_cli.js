@@ -99,6 +99,41 @@ const { runTests, evaluate, main } = require('./run_mutation')
     }
   }
 
+  // 场景 3b：超时必须杀整个进程组（F6）。只 kill 直接子进程时，它派生的孙进程（真实的套件进程）
+  // 仍是孤儿并持有 stdout/stderr 管道 → 'close' 被推迟到 2000ms 兜底保险（超时被记 timeout 的同时
+  // 孤儿继续跑）。本场景用真实进程验证：孙进程持续写心跳文件，超时后心跳必须停止、且 'close' 快速到达。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-groupkill-'))
+    const marker = path.join(dir, 'orphan-heartbeat.log')
+    const prevMarker = process.env.XBK_TEST_ORPHAN_MARKER
+    try {
+      process.env.XBK_TEST_ORPHAN_MARKER = marker
+      // 直接子进程：spawn 一个持续写心跳的孙进程（继承管道），自己挂住不退 —— 触发超时分支。
+      // 孙进程 15s 后自杀：即使修复被回退（孤儿存活）也不会留下无界进程。
+      fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
+        const { spawn } = require('child_process')
+        spawn(process.execPath, ['-e', "const fs=require('fs');const f=process.env.XBK_TEST_ORPHAN_MARKER;setInterval(()=>fs.appendFileSync(f,'x'),20);setTimeout(()=>process.exit(0),15000)"], { stdio: ['ignore', 'inherit', 'inherit'] })
+        setInterval(() => {}, 1000)
+      `)
+      const t0 = Date.now()
+      const result = await runTests(dir, 800)
+      const elapsed = Date.now() - t0
+      assert.strictEqual(result.status, 'timeout', '挂住的直接子进程应按超时结算')
+      assert.ok(fs.existsSync(marker), '孙进程应至少写入一次心跳（否则本回归没有判据：夹具未真正派生后代）')
+      const size1 = fs.statSync(marker).size
+      await new Promise(resolve => setTimeout(resolve, 600))
+      const size2 = fs.statSync(marker).size
+      assert.strictEqual(size2, size1,
+        `超时后孙进程仍在运行（心跳 ${size1} → ${size2} 字节）：进程组未被杀伤，孤儿继续跑`)
+      assert.ok(elapsed < 2000,
+        `孙进程被杀后管道应立即关闭、由 close 收敛（实测 ${elapsed}ms；>=2000ms 说明落到了兜底定时器）`)
+    } finally {
+      if (prevMarker === undefined) delete process.env.XBK_TEST_ORPHAN_MARKER
+      else process.env.XBK_TEST_ORPHAN_MARKER = prevMarker
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
   // 场景 4：runTests 必须清空 SKIP_SUITES，给子进程带 XBK_MUTATION_CHILD=1，并注入 PERF_MS
   // 原因：CI 显式步骤的 SKIP_SUITES 若继承进变异评估子进程，被跳过的套件不再参与变异判定 → 分数失真；
   // PERF_MS 必须与 stryker 沙箱同口径（scripts/mutation-child.js），否则 test_filter.js 的性能断言
