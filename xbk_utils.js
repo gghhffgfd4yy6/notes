@@ -385,11 +385,12 @@ function createUtils (options = {}) {
     // 会把中间标签吞掉并遗留危险文本（子代理审查发现：`<a href="javascript:x><b><a href="javascript:y>`
     // 输出 `<a href=""javascript:y>` 残留 javascript）。含 `<` 的"成对"实为未闭合，
     // 由下方 _cleanUnclosedUrlAttrs 线性处理（值内 `<` 是标签边界，合法 URL 值不含裸 `<`）。
-    html = html.replace(/\b(href|src)\s*=\s*(["'])([^<]*?)\2/gi, (_, name, quote, value) => cleanAttr(name, quote, value))
-    // P1-04（RE2 回落，已知取舍）：本行与 _cleanNavAttrs / _cleanSrcsetAttrs / _cleanStyleAttrs 的
-    // 成对引号正则都用反向引用（\1/\2），Google RE2 不支持该语法 → safeRe（xbk_function_v3.js:27）
-    // 必然 catch 并静默回落 V8 RegExp，这几条模式不享有 RE2 的线性时间防护。
-    // 未就地改写为无反向引用形态：等价性需逐条验证，且会改动清洗链语义（见工单 defer）。
+    // P1-04：反向引用是 Google RE2 不支持的语法，含它的模式会被 safeRe 静默回落 V8 RegExp，
+    // 清洗链就失去 RE2 的线性时间防护（本行原本还是原生字面量，根本不经过 RE2）。
+    // 改写为**无反向引用**的等价形态：把 `(["'])…\2` 拆成「双引号支 | 单引号支」——
+    // 同一位置只可能由其中一种引号开启，语言完全等价（同一个引号不可能既是开启又是闭合）。
+    html = html.replace(safeRe(String.raw`\b(href|src)\s*=\s*"([^<]*?)"|\b(href|src)\s*=\s*'([^<]*?)'`, 'gi'),
+      (_match, dName, dValue, sName, sValue) => cleanAttr(dName || sName, dName ? '"' : "'", dName ? dValue : sValue))
     html = html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
     // v3.251 P0(XSS)：未闭合引号属性绕过——`<a href="javascript:alert(1)` 无闭合引号时
     // 上面两个正则均不匹配（成对引号/无引号值），危险协议保留并被执行。这里单独处理
@@ -657,10 +658,17 @@ function createUtils (options = {}) {
 
   /** 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）清洗。 */
   _cleanNavAttrs (html) {
+    // P1-04：成对引号支拆成「双引号 | 单引号」两支，去掉 RE2 不支持的反向引用 \2（语义等价）。
+    const NAV = String.raw`xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc`
     return html
-      .replace(safeRe(String.raw`\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2`, 'gi'),
-        (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
-      .replace(safeRe(String.raw`\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*([^\s"'<>\`]+)`, 'gi'),
+      .replace(safeRe(String.raw`\b(${NAV})\s*=\s*"([\s\S]*?)"|\b(${NAV})\s*=\s*'([\s\S]*?)'`, 'gi'),
+        (_match, dName, dValue, sName, sValue) => {
+          const name = dName || sName
+          const quote = dName ? '"' : "'"
+          const value = dName ? dValue : sValue
+          return this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`
+        })
+      .replace(safeRe(String.raw`\b(${NAV})\s*=\s*([^\s"'<>\`]+)`, 'gi'),
         (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
   },
 
@@ -668,7 +676,10 @@ function createUtils (options = {}) {
   _cleanSrcsetAttrs (html) {
     const compact = (value) => this.decodeHtmlEntities(value).replace(safeRe(String.raw`[\u0000-\u0020]+`, 'g'), '').toLowerCase()
     return html
-      .replace(safeRe('\\bsrcset\\s*=\\s*(["\'])([\\s\\S]*?)\\1', 'gi'), (_, quote, value) => {
+      // P1-04：成对引号支拆成「双引号 | 单引号」两支，去掉 RE2 不支持的反向引用 \1（语义等价）。
+      .replace(safeRe(String.raw`\bsrcset\s*=\s*"([\s\S]*?)"|\bsrcset\s*=\s*'([\s\S]*?)'`, 'gi'), (_match, dValue, sValue) => {
+        const quote = dValue !== undefined ? '"' : "'"
+        const value = dValue !== undefined ? dValue : sValue
         const v = compact(value)
         return /(?:^|[,])(?:javascript|vbscript|data):/.test(v) ? `srcset=${quote}${quote}` : `srcset=${quote}${value}${quote}`
       })
@@ -689,7 +700,12 @@ function createUtils (options = {}) {
       return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
     }
     return html
-      .replace(safeRe(String.raw`\bstyle\s*=\s*(["'])([\s\S]*?)\1`, 'gi'), (_, quote, value) => unsafeStyle(value) ? `style=${quote}${quote}` : `style=${quote}${value}${quote}`)
+      // P1-04：成对引号支拆成「双引号 | 单引号」两支，去掉 RE2 不支持的反向引用 \1（语义等价）。
+      .replace(safeRe(String.raw`\bstyle\s*=\s*"([\s\S]*?)"|\bstyle\s*=\s*'([\s\S]*?)'`, 'gi'), (_match, dValue, sValue) => {
+        const quote = dValue !== undefined ? '"' : "'"
+        const value = dValue !== undefined ? dValue : sValue
+        return unsafeStyle(value) ? `style=${quote}${quote}` : `style=${quote}${value}${quote}`
+      })
       .replace(safeRe(String.raw`\bstyle\s*=\s*([^\s"'<>\x60]+)`, 'gi'), (_, value) => unsafeStyle(value) ? 'style=""' : `style=${value}`)
   },
 
