@@ -462,6 +462,34 @@ function error (message, code) {
   // 未闭合引号值同样必须抹掉（否则整段漏抹）
   assert.strictEqual(summarizeError({ message: 'token="x' }).message, 'token="***"', '未闭合引号值必须脱敏')
 
+  // ============ qodo PR #152 的 4 条（已逐条复现后修复）============
+  // #1 结构化值（数组/对象）：旧实现裸值分支遇 `,`/`}`/`]` 即停，凭据后半段残留。
+  assert.strictEqual(summarizeError({ message: 'token=[0,"SECRET"]' }).message, 'token=***',
+    '数组值必须整体脱敏（旧实现残留 ,"SECRET"]）')
+  assert.strictEqual(summarizeError({ message: 'token={"a":"SECRET"}' }).message, 'token=***',
+    '对象值必须整体脱敏（旧实现残留 } ）')
+  assert.strictEqual(summarizeError({ message: 'token=[1,2,3]' }).message, 'token=***', '无可疑内容的数组值同样按凭据整段抹掉')
+  // #2 裸 scheme 带引号：旧实现要求凭据首字符非引号 → 整体不命中，凭据原样出网。
+  assert.strictEqual(summarizeError({ message: 'Basic "YWJjOmRlZg=="' }).message, 'Basic ***',
+    '裸 Basic + 双引号值必须脱敏（旧实现整体漏抹）')
+  assert.strictEqual(summarizeError({ message: "Bearer 'SECRET123'" }).message, 'Bearer ***',
+    '裸 Bearer + 单引号值必须脱敏')
+  // #3 关键字边界：旧实现的关键字两侧无边界，`monkey`/`turkey` 的后缀 `key` 被当成凭据键，
+  //    把无关普通字段抹掉（可观测性损失）。
+  assert.strictEqual(summarizeError({ message: '{"monkey":"business"}' }).message, '{"monkey":"business"}',
+    'monkey 不得被当成 key 键脱敏（关键字需边界）')
+  assert.strictEqual(summarizeError({ message: '{"turkey":"dinner"}' }).message, '{"turkey":"dinner"}',
+    'turkey 不得被当成 key 键脱敏')
+  assert.strictEqual(summarizeError({ message: 'keynote: hello world' }).message, 'keynote: hello world',
+    'keynote 不得被当成 key 键脱敏')
+  // 反向：真正的 key 键与含关键字的混合 JSON 仍必须脱敏（边界不能把该抹的也放过）
+  assert.strictEqual(summarizeError({ message: '{"key":"v"}' }).message, '{"key":"***"}', '真正的 key 键仍须脱敏')
+  assert.strictEqual(summarizeError({ message: '{"monkey":"business","token":"SECRET123"}' }).message,
+    '{"monkey":"business","token":"***"}', '同一 JSON 里普通字段保留、凭据字段脱敏')
+  // 幂等：已脱敏输出再次经过脱敏不得继续变化（身份/日志可能重复经过多条清洗路径）
+  assert.strictEqual(summarizeError({ message: 'token=***' }).message, 'token=***', '脱敏必须幂等')
+  assert.strictEqual(summarizeError({ message: 'Basic ***' }).message, 'Basic ***', '裸 scheme 脱敏同样幂等')
+
   // 反向断言：无凭据文本不得被脱敏误改（防止把规则写成吞掉正常内容）
   assert.strictEqual(summarizeError({ message: 'request timed out after 5000ms' }).message,
     'request timed out after 5000ms', '无凭据文本不应被脱敏改动')

@@ -2086,9 +2086,15 @@ console.log('========================================\n');
       for (const d of markers) {
         try { fs.unlinkSync(path.join(CACHE_DIR, `${prefix}${d}`)) } catch (e) { /* 已删/不存在 */ }
       }
-      // 恢复被本用例的清理逻辑删掉的既有标记（内容与名称一并还原）
+      // 恢复被本用例的清理逻辑删掉的既有标记（内容与名称一并还原）。
+      // qodo PR #152-4：只有在路径仍「缺失」时才写回，避免覆盖**别的进程**在测试期间新建/更新的
+      // 同名标记（本机没有跨进程锁，测试与应用可能共用默认缓存目录；无条件写回会把它退回陈旧字节）。
+      // 缺失时才补，语义就是「撤销本用例的删除」，不会制造回退。
       for (const [name, content] of backup) {
-        try { fs.writeFileSync(path.join(CACHE_DIR, name), content) } catch (e) { /* 恢复失败不影响其它用例 */ }
+        const target = path.join(CACHE_DIR, name)
+        try {
+          if (!fs.existsSync(target)) fs.writeFileSync(target, content)
+        } catch (e) { /* 恢复失败不影响其它用例 */ }
       }
     }
   })
