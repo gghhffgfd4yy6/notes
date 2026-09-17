@@ -17,7 +17,8 @@ const DETERMINISTIC_LOCAL_CODES = new Set(['EBODYLIMIT'])
 //   * got 把数值 timeout 直接交给定时器，小数与超 2^31-1 的值会被 Node 归一到约 1ms（每次请求瞬间超时）；
 //   * 亚 100ms 的值几乎只可能来自「想写秒却按毫秒填」的单位误填（timeout:5 想表达 5 秒）——采用它等于
 //     每次请求必然超时，且现象是「请求超时」而非「配置有问题」，比回落默认值更糟；
-//   * 非整数不猜用户意图（不四舍五入/不向上取整），一律按非法配置处理。
+//   * 非整数不猜用户意图（不四舍五入/不向上取整），一律按非法配置处理；
+//   * 整数但越上界（1e12、2147483648…）钳到 2^31-1 并**告警留痕**（不静默）——钳制值语义不变。
 const MIN_TIMEOUT_MS = 100
 const MAX_TIMEOUT_MS = 2147483647
 const DEFAULT_TIMEOUT_MS = 5000
@@ -94,7 +95,15 @@ function createNetwork ({
   // 保持原语义不告警）；注入的 logger 未提供 warn 时退化为不告警（不得因此抛错）。
   const resolveTimeoutMs = () => {
     const n = Utils.num(Config.api.timeout, DEFAULT_TIMEOUT_MS)
-    if (Number.isInteger(n) && n >= MIN_TIMEOUT_MS) return Math.min(n, MAX_TIMEOUT_MS)
+    if (Number.isInteger(n) && n >= MIN_TIMEOUT_MS) {
+      // net-3 残留（V4 提示）：越上界的整数（1e12、2147483648…）此前是**静默钳制**——值与日志都看不出
+      // 「配置写了不可能生效的值」。这里只补告警留痕，钳制语义零变更（仍钳到 MAX_TIMEOUT_MS）。
+      // 文案与「已回落默认」区分：调用方与测试可据文案判断是钳制还是回落。
+      if (n > MAX_TIMEOUT_MS && typeof logger.warn === 'function') {
+        logger.warn(`[xbk_network] api.timeout=${String(Config.api.timeout)} 超过上界 ${MAX_TIMEOUT_MS}ms，已钳制到 ${MAX_TIMEOUT_MS}ms`)
+      }
+      return Math.min(n, MAX_TIMEOUT_MS)
+    }
     if (typeof logger.warn === 'function') {
       logger.warn(`[xbk_network] api.timeout=${String(Config.api.timeout)} 非法（须为 ≥${MIN_TIMEOUT_MS}ms 的整数），已回落默认 ${DEFAULT_TIMEOUT_MS}ms`)
     }

@@ -175,6 +175,29 @@ function makeNetwork (opts = {}) {
     }
   }
 
+  // 10b. net-3 残留（V4 提示）：整数但越上界此前是**静默钳制**——配置写了不可能生效的值，日志与告警
+  // 都看不出来。本块锁定「钳制值语义不变 + 补告警留痕」，并要求文案与「已回落默认」区分（不混用）。
+  {
+    const overBound = [2147483648, 1e12]
+    const legal = [2147483647, 30000, 100]
+    for (const input of overBound) {
+      const { net, getRequestOptions, getWarnings } = makeNetwork({ retry: 0, timeout: input })
+      await net.fetchData()
+      assert.strictEqual(getRequestOptions()[0].timeout, 2147483647, `timeout=${input} 仍应钳到 2^31-1（值语义零变更）`)
+      const warns = getWarnings()
+      assert.ok(warns.some(w => w.includes('api.timeout') && w.includes('超过上界') && w.includes('已钳制到')),
+        `timeout=${input} 越上界必须告警留痕（旧实现在此静默），实际告警=${JSON.stringify(warns)}`)
+      assert.ok(!warns.some(w => w.includes('已回落默认')),
+        `timeout=${input} 是钳制不是回落，文案不得混用「已回落默认」，实际告警=${JSON.stringify(warns)}`)
+    }
+    // 反向：上界本身与常规值合法 → 不得告警（防止把钳制告警挂到所有整数上）
+    for (const input of legal) {
+      const { net, getWarnings } = makeNetwork({ retry: 0, timeout: input })
+      await net.fetchData()
+      assert.strictEqual(getWarnings().length, 0, `timeout=${input} 合法（≤上界）不得告警，实际 ${JSON.stringify(getWarnings())}`)
+    }
+  }
+
   // 11. net-3：非正 / 空串 → 回落默认 5000 并告警（非数值经 Utils.num 已回落默认，与合法默认值不可区分，
   // 保持原语义不告警——这是口径的一部分，不再假装它们被「检出」）。
   {
