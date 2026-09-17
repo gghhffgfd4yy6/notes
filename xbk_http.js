@@ -5,6 +5,10 @@ const got = require('got')
 const { AGENTS, baseRequestOptions, invalidateDnsForError, profileMs } = require('./xbk_agents')
 
 const DEFAULT_MAX_BODY = 20 * 1024 * 1024
+// XHTTP-01：got@11 的默认 timeout 是 {}——即「不超时」，而 baseRequestOptions() 的共享 Agent 也不带
+// 超时。调用方不显式传 timeout 时，服务端半开（连上但不返回）会让请求永久挂起，常驻循环整轮卡死。
+// 这里兜底注入有限默认值；调用方显式给了 timeout（数字或 {request,socket,…} 对象）时原样透传。
+const DEFAULT_TIMEOUT_MS = 30000
 
 // 日志脱敏（XBK_PROFILE=3 专用）：URL 只保留 origin（协议+主机+端口），路径/查询/凭据整段遮蔽。
 // 旧实现 `String(url).replace(/\/[^/]+$/, '/***')` 只遮蔽最后一个路径段——非末段密钥（如 /SECRET/v1）
@@ -33,6 +37,8 @@ function parseJsonBody (text) {
 
 async function fetchJson (url, options = {}, maxBody = DEFAULT_MAX_BODY) {
   const requestOptions = { ...baseRequestOptions(), ...options }
+  // XHTTP-01：未显式给 timeout 时注入默认值（显式值优先，含 got 接受的对象形态）。
+  if (requestOptions.timeout === undefined) requestOptions.timeout = DEFAULT_TIMEOUT_MS
   const detailedProfile = process.env.XBK_PROFILE === '3'
   const started = Date.now()
   if (detailedProfile) console.log(`[profile api] start url=${redactUrlForLog(url)}`)
@@ -114,4 +120,4 @@ async function fetchJson (url, options = {}, maxBody = DEFAULT_MAX_BODY) {
   })
 }
 
-module.exports = { fetchJson, DEFAULT_MAX_BODY, AGENTS }
+module.exports = { fetchJson, DEFAULT_MAX_BODY, DEFAULT_TIMEOUT_MS, AGENTS }

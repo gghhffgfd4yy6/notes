@@ -3,13 +3,14 @@
 const assert = require('assert')
 const { EventEmitter } = require('node:events')
 const got = require('got')
-const { fetchJson } = require('./xbk_http')
+const { fetchJson, DEFAULT_TIMEOUT_MS } = require('./xbk_http')
 
 // 生产官方 got 提供 stream API；测试注入 mock stream（EventEmitter），
 // 走 fetchJson 的可限流真实路径（含响应体上限 / HTTP 错误 / JSON 解析）。
 function installMockStream (behavior) {
   const orig = got.stream
   got.stream = (url, opts) => {
+    if (behavior.onOptions) behavior.onOptions(url, opts)
     const s = new EventEmitter()
     s.timings = { phases: {} }
     s.destroy = (err) => { s.__destroyed = err || true }
@@ -296,6 +297,30 @@ function installMockStream (behavior) {
       assert.ok(warns.every(w => w.includes('无法转换')),
         `取值失败时应回退到兜底文案，而不是把异常带进告警路径；实际 warns=${JSON.stringify(warns)}`)
     } finally { console.warn = origWarn }
+  }
+
+  // 14. XHTTP-01：fetchJson 未显式传 timeout 时必须注入有限默认超时——got@11 默认 timeout:{}（不超时）
+  //     且 baseRequestOptions() 的共享 Agent 不带超时，服务端半开（连上不返回）会让请求永久挂起。
+  //     调用方显式传 timeout（数字或 got 支持的对象形态）时必须原样透传，语义零变更。
+  {
+    assert.ok(Number.isFinite(DEFAULT_TIMEOUT_MS) && DEFAULT_TIMEOUT_MS > 0, '默认超时必须是有限正数')
+    const captured = []
+    const restore = installMockStream({
+      response: { statusCode: 200, headers: {} },
+      chunks: ['{"a":1}'],
+      onOptions: (url, opts) => captured.push(opts)
+    })
+    try {
+      const body = await fetchJson('https://api.example.com/x')
+      assert.deepStrictEqual(body, { a: 1 }, '注入默认超时不应影响正常请求')
+      assert.strictEqual(captured[0].timeout, DEFAULT_TIMEOUT_MS, '未显式传 timeout 应注入默认超时（旧实现为 undefined，可永久挂起）')
+
+      await fetchJson('https://api.example.com/x', { timeout: 1234 })
+      assert.strictEqual(captured[1].timeout, 1234, '显式数字 timeout 必须优先于默认值')
+
+      await fetchJson('https://api.example.com/x', { timeout: { request: 4321 } })
+      assert.deepStrictEqual(captured[2].timeout, { request: 4321 }, 'got 对象形态 timeout 应原样透传（不被默认值覆盖）')
+    } finally { restore() }
   }
 
   console.log('test_http OK')

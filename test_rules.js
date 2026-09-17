@@ -35,4 +35,20 @@ const engine = createRuleEngine({
   assert.ok(warnings.some(w => w.includes('badline')), '警告应包含缺少分隔符的行')
 }
 
+// 4. RULES-01：取反字符类 [^...] 必须扫描到未转义的类结束符，类体不得被当普通模式解析
+{
+  const expectNested = (pattern, expected, message) => assert.strictEqual(engine.hasNestedQuantifier(pattern), expected, message)
+  // 误拦修复：整个 [^(a+)+] 是字符类，(a+)+ 只是类成员（旧实现只判 ^ 后一个字符，把类体
+  // 当模式解析 → 误判 true）
+  expectNested('[^(a+)+]x', false, '[^(a+)+] 是字符类，类内 (a+)+ 不是嵌套量词')
+  expectNested('[^(a+)+]', false, '[^(a+)+] 单独也是字符类')
+  // 漏检修复：'(x[^)]+)+' 的 ) 曾被吞进 [^)] 的类体 → 分组永不闭合（旧实现误判 false）；
+  // 类体扫描到 ] 后，「组内以无限量词结尾 + 组后无限量词」的既有判定应命中
+  expectNested('(x[^)]+)+', true, '(x[^)]+)+ 应判危险（组内无限量词 + 组后无限量词）')
+  // 既有语义不变
+  expectNested('[^](a+)+', true, '[^]（^ 后的 ] 是类成员）后的嵌套量词仍应检出')
+  expectNested('[^]', false, '[^] 本身是字符类，不判危险')
+  expectNested('[^a+]+', false, '取反类内量词 + 类后量词不构成嵌套分组')
+}
+
 console.log('test_rules OK')

@@ -53,6 +53,8 @@
 
 ## v3.275
 
+- ReDoS 防护 `hasNestedQuantifier`：取反字符类 `[^...]` 改为扫描到未转义的类结束符（此前只判 `^` 后一个字符，类体被当普通模式解析——`[^(a+)+]x` 被误拦、`(x[^)]+)+` 因 `)` 被吞进类体而漏检；`[^]` 非空字符类语义不变）。
+- HTTP 薄封装 `fetchJson`：调用方未显式传 `timeout` 时注入默认 30000 ms（显式值优先）——got@11 默认 `timeout:{}` 且共享 Agent 不带超时，此前服务端半开会让请求永久挂起。
 - 常驻循环 `sleep`：`signal` 加 `typeof` 守卫（此前传入非 AbortSignal 的真值对象会先抛 `TypeError`，定时器回调里再抛一次成为未捕获异常终止进程）；毫秒值统一经 `clampTimerMs` 钳到 `[0, 2147483647]` 再交给 `setTimeout`（此前 `1e12` 被 Node 静默降为 1ms，「等一天」变成立即返回）。
 - 失败归类：`classifySummary` 的「本轮有无失败」只由 `failed` 决定（此前 `total` 缺失/非数字时 `Number(total)||0` 使有失败的摘要返回 `null`，被调度器读成成功）；企业微信 `93000`（invalid webhook key）与文本兜底 `invalid [webhook|access|api] token|key|parameter` 判为永久配置错误（此前落 `UNKNOWN`，常驻对已失效 webhook 无限退避重试）。
 - 脱敏：`redact` 补齐 `Authorization: Bearer|basic <凭据>`、JSON 引号形态 `"appToken":"…"`、单引号/带引号关键字/非字符串 JSON 值/URL query 形态与裸 `Bearer|Basic <凭据>`，关键字表补 `password/pwd/session/cookie/credential`（此前这些形态的凭据原样进日志与告警，只抹掉 scheme）。凭据值以 `\s,;}&]` 为边界；裸 scheme 要求凭据 ≥8 字符，避免误抹普通英文句子（`the bearer of good news`）。
