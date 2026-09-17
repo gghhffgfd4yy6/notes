@@ -35,6 +35,7 @@ const SUITES = [
   { name: '规则引擎扩展', file: 'test_rules_extended.js', desc: 'xbk_rules.js compileRules/matchesCompiled/checkTimeCompiled/validateConfig 边界（提升变异分数）' },
   { name: '消息存储纯函数', file: 'test_message_store_utils.js', desc: 'xbk_message_store.js getFilePath/getFileName 路径安全与URL提取边界（提升变异分数）' },
   { name: '通知纯函数', file: 'test_sendnotify_pure.js', desc: 'xbk_sendNotify_slim.js maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags 纯函数边界（提升变异分数）' },
+  { name: '推送响应体上限', file: 'test_sendnotify_bodylimit.js', desc: 'xbk_sendNotify_slim.js $.post/$.get 流式响应体上限（EBODYLIMIT/销毁流）+ 无 stream 替身回退 promise 路径 + 官方 got 回环端到端' },
   { name: '单元测试', file: 'test_filter.js', desc: '主代码导出函数逐函数逻辑' },
   { name: '变异报告读取', file: 'test_mutation_json.js', desc: '超大 mutation.json 剥离 statusReason 解析（v3.264）' },
   { name: '变异报告渲染', file: 'test_mutation_report.js', desc: 'render 函数 markdown 输出快照（v3.266 重构验证）' },

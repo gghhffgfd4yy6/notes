@@ -337,9 +337,68 @@ async function one () {
   return `${body.hitokoto}    ----${body.from || ''}` // v3.87: from 缺失不输出 undefined 残尾
 }
 
+// 推送层响应体上限（审查 F5/S3）：got@11 没有 maxResponseSize（实测 11.8.6 无该选项），promise API 会把
+// 整个响应体读进内存并再 JSON.parse——20MB 上限此前只在 xbk_http.fetchJson 的流式路径生效，推送出口
+// （$.post/$.get）完全没有上限。这里取 xbk_http.DEFAULT_MAX_BODY 的同一口径（同为 20MB）：官方 got 走流式
+// 限长读取，超限报 EBODYLIMIT（与 fetchJson 同错误码）并销毁流；测试注入的 got 替身通常只提供 promise API
+// （见 test_notify.js），此时保持原 promise 路径不变（调用方行为零变更）。
+// 刻意不 require('./xbk_http') 取常量：test_app.js 会先 require 本模块、之后才替换 require.cache 里的 got
+// 条目，顶层多引入一条模块边会连带把 xbk_http 的 got 绑定也固化在替换之前（表现为集成测试打到真实网络）。
+// 两边的一致性由 test_sendnotify_bodylimit.js 断言（EBODYLIMIT 消息里的上限必须等于 xbk_http.DEFAULT_MAX_BODY）。
+const MAX_PUSH_BODY = 20 * 1024 * 1024
+
+function canStreamRequest (method) {
+  return Boolean(got.stream && typeof got.stream[method] === 'function')
+}
+
+function streamRequest (method, url, options, callback) {
+  const stream = got.stream[method](url, options)
+  const chunks = []
+  let response = null
+  let total = 0
+  let settled = false
+  const finish = (err, res, body, timings) => {
+    if (settled) return
+    settled = true
+    // v3.75：失败时传 Error 对象而非响应体——API 异常响应体可能回显请求参数（含密钥），
+    // 且各通道失败日志已统一 safeErr 摘要（打 message 不含响应内容）
+    callback(err, res, body, timings)
+  }
+  stream.once('response', (res) => { response = res })
+  stream.on('data', (chunk) => {
+    total += chunk.length
+    if (total > MAX_PUSH_BODY) {
+      const err = new Error(`响应体过大(超过 ${MAX_PUSH_BODY} 字节)`)
+      err.code = 'EBODYLIMIT'
+      stream.destroy(err)
+      finish(err, null, null, null)
+      return
+    }
+    chunks.push(chunk)
+  })
+  stream.once('error', (err) => {
+    invalidateDnsForError(err, url)
+    finish(err || new Error('请求失败'), null, null, err && err.timings)
+  })
+  stream.once('end', () => {
+    const text = Buffer.concat(chunks).toString('utf8')
+    let body = text
+    try {
+      body = JSON.parse(text)
+    } catch (error) {
+      // 预期路径：非 JSON 响应（HTML/文本）保留原始字符串，供各通道按需解析
+    }
+    finish(null, response, body, response && response.timings ? response.timings : stream.timings)
+  })
+}
+
 const $ = {
   post: (params, callback) => {
     const { url, ...others } = params
+    if (canStreamRequest('post')) {
+      streamRequest('post', url, others, callback)
+      return
+    }
     got.post(url, others).then(
       (res) => {
         let body = res.body
@@ -360,6 +419,10 @@ const $ = {
   },
   get: (params, callback) => {
     const { url, ...others } = params
+    if (canStreamRequest('get')) {
+      streamRequest('get', url, others, callback)
+      return
+    }
     got.get(url, others).then(
       (res) => {
         let body = res.body
@@ -803,8 +866,26 @@ function parseWxPusherChannels () {
   if (configKey === wxPusherParsedConfigKey) return wxPusherParsedChannels
 
   let raw = configuredRaw
+  // F4：多应用配置被丢弃时此前完全静默——用户看到「推送成功」，其余应用却一条没收到。
+  // 不改变解析口径（合法数组仍优先、仍回退旧字段），只把丢弃原因与条数打到日志，让配置失效可见。
+  const warnDropped = (reason) => {
+    console.warn(`⚠️ WX_pusher_channels ${reason}，已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）`)
+  }
+  // 「配置了值」判定：非空白字符串、或非 null 的其它类型（空串/纯空白视为未配置，沿用既有语义不告警）
+  const configuredText = typeof configuredRaw === 'string' ? configuredRaw.trim() : ''
+  const wxChannelsConfigured = configuredRaw !== null && configuredRaw !== undefined &&
+    (typeof configuredRaw !== 'string' || configuredText !== '')
   if (typeof raw === 'string') {
-    try { raw = JSON.parse(raw) } catch (e) { raw = [] }
+    if (configuredText === '') {
+      raw = []
+    } else {
+      try {
+        raw = JSON.parse(raw)
+      } catch (e) {
+        warnDropped('不是合法 JSON')
+        raw = []
+      }
+    }
   }
   const list = Array.isArray(raw) ? raw : []
   const channels = list.map((item) => {
@@ -818,6 +899,12 @@ function parseWxPusherChannels () {
     wxPusherParsedConfigKey = configKey
     wxPusherParsedChannels = channels
     return channels
+  }
+  if (wxChannelsConfigured) {
+    if (list.length) warnDropped(`的 ${list.length} 项均缺 appToken 或 topicIds`)
+    // 只有「配了值但不是数组」才提示形状错误（JSON 解析失败已在上面单独告警）；显式空数组（含 JSON '[]'）
+    // 是「明确不启用多应用」，回退旧字段属既有语义，不重复告警。
+    else if (!Array.isArray(raw)) warnDropped('不是数组（应为 [{ appToken, topicIds }]）')
   }
   const appToken = safeString(push_config.WX_pusher_appToken).trim()
   const topicIds = safeString(push_config.WX_pusher_topicIds).split(',').map(s => s.trim()).filter(Boolean)

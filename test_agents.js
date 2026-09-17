@@ -36,7 +36,12 @@ dns.lookup = (hostname, options, callback) => {
   assert.strictEqual(shouldInvalidateDns({ code: 'ECONNRESET' }), true, 'ECONNRESET 应失效 DNS')
   assert.strictEqual(shouldInvalidateDns({ code: 'EAI_AGAIN' }), true, 'EAI_AGAIN 应失效 DNS')
   assert.strictEqual(shouldInvalidateDns({ code: 'HTTP_500' }), false, 'HTTP 错误不应失效 DNS')
-  assert.strictEqual(shouldInvalidateDns({ code: 'ETIMEDOUT' }), false, '超时不应失效 DNS')
+  // AGENTS-02：超时（ETIMEDOUT）同样失效——重试窗口（got 1s/2s）远短于 60s TTL，超时很可能就是缓存
+  // 里那个地址已不可达，不清缓存则整个重试窗口反复复用同一失效地址。此处必为 true（旧口径 false）。
+  assert.strictEqual(shouldInvalidateDns({ code: 'ETIMEDOUT' }), true, '超时应失效 DNS（AGENTS-02）')
+  // AGENTS-08：证书主机名不匹配与「缓存里的 IP 已失效」无关（xbk_failure_policy 已按 PERMANENT 归类），
+  // 不得当 DNS 失效码——否则每次重试都白清一次缓存并重新解析，而问题依旧。此处必为 false（旧口径 true）。
+  assert.strictEqual(shouldInvalidateDns({ code: 'ERR_TLS_CERT_ALTNAME_INVALID' }), false, '证书主机名不匹配不应失效 DNS（AGENTS-08）')
   assert.strictEqual(shouldInvalidateDns({}), false, '无 code 不应失效')
   assert.strictEqual(shouldInvalidateDns(null), false, 'null 不应失效')
   assert.strictEqual(shouldInvalidateDns(undefined), false, 'undefined 不应失效')
@@ -70,6 +75,53 @@ dns.lookup = (hostname, options, callback) => {
   // ===== dnsLookup：缓存命中 + 缓存未命中 + 并发去重 =====
   // #19 修复：此前 dnsLookup 完全未被测试，导致 xbk_agents 分支覆盖率标称 100% 但实测 63-77%。
   const { dnsLookup } = require('./xbk_agents')
+
+  // AGENTS-02 行为断言：ETIMEDOUT 必须真的清掉缓存条目（不只是 shouldInvalidateDns 返回 true）——
+  // 先用 dnsLookup 填充，再用 ETIMEDOUT 失效，随后同一主机的 lookup 必须重新走底层解析（计数 +1）。
+  {
+    const timeoutHost = 'timeout-invalidate-probe.invalid'
+    let timeoutLookups = 0
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      timeoutLookups += 1
+      process.nextTick(() => cb(null, '192.0.2.9', 4))
+    }
+    await new Promise((resolve, reject) => dnsLookup(timeoutHost, {}, (e) => e ? reject(e) : resolve()))
+    assert.strictEqual(timeoutLookups, 1, '首次解析应走底层')
+    assert.strictEqual(invalidateDnsForError({ code: 'ETIMEDOUT' }, `https://${timeoutHost}/api`), true, 'ETIMEDOUT 应触发缓存失效（AGENTS-02）')
+    await new Promise((resolve, reject) => dnsLookup(timeoutHost, {}, (e) => e ? reject(e) : resolve()))
+    assert.strictEqual(timeoutLookups, 2, 'ETIMEDOUT 失效后同一主机应重新解析（旧口径此处仍为 1）')
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      process.nextTick(() => cb(null, '127.0.0.1', 4))
+    }
+    console.log('✅ AGENTS-02：ETIMEDOUT 清理 DNS 缓存后重试窗口重新解析')
+  }
+
+  // AGENTS-08 行为断言：证书主机名不匹配不得清 DNS 缓存（旧口径会把缓存清掉、重试白解析一次）
+  {
+    const certHost = 'cert-invalidate-probe.invalid'
+    let certLookups = 0
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      certLookups += 1
+      process.nextTick(() => cb(null, '192.0.2.11', 4))
+    }
+    await new Promise((resolve, reject) => dnsLookup(certHost, {}, (e) => e ? reject(e) : resolve()))
+    assert.strictEqual(certLookups, 1, '首次解析应走底层')
+    assert.strictEqual(
+      invalidateDnsForError({ code: 'ERR_TLS_CERT_ALTNAME_INVALID' }, `https://${certHost}/api`),
+      false,
+      '证书错误不应触发 DNS 失效（AGENTS-08）'
+    )
+    await new Promise((resolve, reject) => dnsLookup(certHost, {}, (e) => e ? reject(e) : resolve()))
+    assert.strictEqual(certLookups, 1, '证书错误后缓存应仍然有效（旧口径此处为 2）')
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      process.nextTick(() => cb(null, '127.0.0.1', 4))
+    }
+    console.log('✅ AGENTS-08：证书主机名不匹配不再清 DNS 缓存')
+  }
 
   // 场景 1：缓存未命中 → 真实解析后回调，且第二次调用命中缓存（更快）
   await new Promise((resolve, reject) => {
@@ -123,6 +175,9 @@ dns.lookup = (hostname, options, callback) => {
   // 场景 1：正常解析 → 返回 ok=true
   const prewarmResult = await prewarmDns('localhost')
   assert.strictEqual(prewarmResult.hostname, 'localhost', '应返回 hostname')
+  // AGENTS-07：DNS 预热结果带 kind:'dns'，与 prewarmTls 的 kind:'tls' 对称（两者都带 hostname，
+  // 此前调用方无法按字段区分）——去掉该字段本断言即红。
+  assert.strictEqual(prewarmResult.kind, 'dns', 'DNS 预热结果应带 kind=dns（AGENTS-07）')
   assert.ok(typeof prewarmResult.ok === 'boolean', 'ok 应为布尔值')
   assert.ok(typeof prewarmResult.elapsedMs === 'number', 'elapsedMs 应为数字')
 
@@ -132,6 +187,46 @@ dns.lookup = (hostname, options, callback) => {
   const abortedResult = await prewarmDns('localhost', ac.signal)
   assert.strictEqual(abortedResult.ok, false, 'aborted 时 ok 应为 false')
   assert.ok(abortedResult.error?.includes('abort') || abortedResult.cancelled === true, 'aborted 时应包含取消信息')
+
+  // ===== AGENTS-01：prewarmDns 必须与真实请求的 lookup 同 key（默认 DNS 模式预热才有效）=====
+  // 真实 net.connect 在 Node ≥20（autoSelectFamily 默认开启）下以 {hints: ADDRCONFIG(1024), all: true}
+  // 调用本 lookup（本机 Node v24 实测 {"hints":1024,"all":true}），而 prewarmDns 传的是 {}。
+  // 旧实现把 hints/all/verbatim 编进 key → 两者永不同 key，预热写进一个永不被读的条目，
+  // DNS 预热完全无效（本断言在旧代码下必红：底层次数为 2 而非 1）。现按 hostname+family 共享条目，
+  // 底层统一按 all:true 解析并缓存完整地址列表，回调形状在派发时按各调用方的 all 适配。
+  {
+    const keyProbeHost = 'prewarm-key-probe.invalid'
+    const keyCalls = []
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      const opts = typeof options === 'function' ? {} : (options || {})
+      keyCalls.push({ hostname, options: opts })
+      process.nextTick(() => cb(null, opts.all ? [{ address: '192.0.2.7', family: 4 }] : '192.0.2.7', 4))
+    }
+    const warm = await prewarmDns(keyProbeHost)
+    assert.strictEqual(warm.ok, true, '预热应成功')
+    assert.strictEqual(keyCalls.length, 1, '预热应发起 1 次底层解析')
+    assert.strictEqual(keyCalls[0].options.all, true, '底层应统一按 all:true 解析（缓存完整地址列表）')
+    // 真实请求形态：net 传 hints=ADDRCONFIG + all=true → 必须命中预热写入的缓存条目
+    const allHit = await new Promise((resolve, reject) => {
+      dnsLookup(keyProbeHost, { hints: 1024, all: true }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+    })
+    assert.strictEqual(keyCalls.length, 1, `预热后真实请求形态的 lookup 应命中同一缓存（旧 key 含 hints/all 时为 2），实际 ${keyCalls.length}`)
+    assert.ok(Array.isArray(allHit.address) && allHit.address[0] && allHit.address[0].address === '192.0.2.7', 'all:true 调用方应拿到地址数组')
+    // 同一缓存条目服务非 all 调用方：形状适配为标量
+    const scalarHit = await new Promise((resolve, reject) => {
+      dnsLookup(keyProbeHost, {}, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+    })
+    assert.strictEqual(keyCalls.length, 1, '非 all 调用方也应命中同一缓存条目，不应再发起解析')
+    assert.strictEqual(scalarHit.address, '192.0.2.7', '非 all 调用方应拿到标量地址')
+    assert.strictEqual(scalarHit.family, 4, '非 all 调用方应拿到地址族')
+    // 恢复文件头的确定性 mock（保持后续断言的既定语义）
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      process.nextTick(() => cb(null, '127.0.0.1', 4))
+    }
+    console.log('✅ AGENTS-01：prewarmDns 与真实请求同 key（hints/all 不再导致缓存错配）')
+  }
 
   // ===== module.exports：不再导出死值 DNS_CACHE（AGENTS-08）=====
   // 旧导出含 `DNS_CACHE: null`（无任何读取方）；若回退该行，`in` 判定为 true 即红。

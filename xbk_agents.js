@@ -18,9 +18,14 @@ const AGENTS = {
 // 使用 Node 原生 dns.lookup，不依赖网卡枚举，兼容受限 Android/沙箱环境。
 const DNS_TTL_MS = 60000
 const DNS_ERROR_TTL_MS = 1000
+// AGENTS-02：含 ETIMEDOUT——连接/请求超时（重试窗口 1s/2s 远短于 60s TTL）很可能就是缓存里那个地址
+// 已不可达，不清缓存会让整个重试窗口反复复用同一失效地址。失效代价只是下一次多一次系统解析。
+// AGENTS-08：不含 ERR_TLS_CERT_ALTNAME_INVALID——证书主机名不匹配是服务端证书/域名的确定性配置问题
+// （xbk_failure_policy.js 已把它按 PERMANENT 归类），与「缓存里的 IP 已失效」无关；把它当 DNS 失效码
+// 只会让每次重试白清一次缓存并重新解析，问题依旧。指示地址可能失效的是网络层错误码（连接/解析类）。
 const DNS_INVALIDATION_CODES = new Set([
   'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH',
-  'ENOTFOUND', 'EAI_AGAIN', 'ERR_SOCKET_CLOSED', 'ERR_TLS_CERT_ALTNAME_INVALID'
+  'ENOTFOUND', 'EAI_AGAIN', 'ERR_SOCKET_CLOSED', 'ETIMEDOUT'
 ])
 const dnsCache = new Map()
 const dnsPending = new Map()
@@ -50,13 +55,35 @@ function invalidateDnsForError (error, url) {
     return true
   } catch (e) { return false }
 }
+// AGENTS-01：缓存/pending key 只保留 hostname + family。
+// 真实 net.connect 传给 lookup 的选项随 Node 版本变化（Node ≥20 默认开启 autoSelectFamily，
+// 实测 Node v24 传 {"hints":1024,"all":true}），而 prewarmDns 只能给出自己构造的选项（默认 {}）。
+// 把 hints/all/verbatim 编进 key 会让「预热」与「真实请求」永不同 key——预热写进一个永不被读的
+// 条目，DNS 预热完全无效。hints/verbatim 只影响地址过滤与排序、不改变地址集合；all 只决定回调
+// 形状。故按 hostname+family 共享条目，底层统一按 all:true 解析并缓存完整地址列表，回调形状在
+// 派发时按各调用方的 all 适配（见 dispatchLookupResult）。
+function dnsCacheKey (hostname, options) {
+  const opts = options || {}
+  return [hostname, opts.family || 0].join('|')
+}
+
+// 按调用方的 all 适配回调形状：all:true 拿 [{address, family}]，其余拿标量（取列表首项）。
+// 非数组结果（测试替身未按 all 建模）原样透传，保持既有替身语义不变。
+function dispatchLookupResult (callback, wantAll, error, address, family) {
+  if (error || !Array.isArray(address)) { callback(error, address, family); return }
+  if (wantAll) { callback(null, address, family); return }
+  const first = address[0]
+  callback(null, first ? first.address : undefined, first ? first.family : family)
+}
+
 function dnsLookup (hostname, options, callback) {
   const opts = options || {}
-  const key = [hostname, opts.family || 0, opts.hints || 0, opts.all ? 1 : 0, opts.verbatim ? 1 : 0].join('|')
+  const wantAll = Boolean(opts.all)
+  const key = dnsCacheKey(hostname, opts)
   const now = Date.now()
   const cached = dnsCache.get(key)
   if (cached && cached.expiresAt > now) {
-    queueMicrotask(() => callback(cached.error, cached.address, cached.family))
+    queueMicrotask(() => dispatchLookupResult(callback, wantAll, cached.error, cached.address, cached.family))
     return
   }
 
@@ -65,12 +92,12 @@ function dnsLookup (hostname, options, callback) {
   // delete。坏解析器下同 key 列表会随重试只增不减——本注释只记录现状，未改任何行为。
   const pending = dnsPending.get(key)
   if (pending) {
-    pending.push(callback)
+    pending.push({ callback, all: wantAll })
     return
   }
-  const pendingList = [callback]
+  const pendingList = [{ callback, all: wantAll }]
   dnsPending.set(key, pendingList)
-  dns.lookup(hostname, opts, (error, address, family) => {
+  dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => {
     // v3.263（CodeAnt）：只派发并缓存本次记账列表——abort 摘除回调后若同一 key 已有新 lookup
     // 接管，旧 lookup 完成时不得清空/派发到新列表，也不得写缓存（接管等待期间新调用方会读到
     // 旧结果，且晚到的旧回调会覆盖更新的缓存条目；新 lookup 会缓存自己的结果）
@@ -78,7 +105,7 @@ function dnsLookup (hostname, options, callback) {
     dnsPending.delete(key)
     const ttl = error ? DNS_ERROR_TTL_MS : DNS_TTL_MS
     dnsCache.set(key, { error, address, family, expiresAt: Date.now() + ttl })
-    for (const cb of pendingList) cb(error, address, family)
+    for (const entry of pendingList) dispatchLookupResult(entry.callback, entry.all, error, address, family)
   })
 }
 
@@ -86,6 +113,9 @@ function prewarmDns (hostname, signal = null) {
   const options = DNS_LOOKUP_IP_VERSION === 'ipv4' ? { family: 4 } : DNS_LOOKUP_IP_VERSION === 'ipv6' ? { family: 6 } : {}
   const started = Date.now()
   const makeResult = (error, address, family) => ({
+    // AGENTS-07：预热结果带显式任务类型，调用方可按字段区分 DNS/TLS（两者都带 hostname），
+    // 不必靠每个调用点手工绑定 kind（qinglong/xbk_push.js 目前就是手工绑的）。
+    kind: 'dns',
     hostname,
     ok: !error,
     error: error ? error.code || error.message || String(error) : '',
@@ -100,8 +130,8 @@ function prewarmDns (hostname, signal = null) {
     // dnsPending 记账中摘除（不持有引用、再次预热会重新发起解析），并在解析完成时移除 abort 监听。
     // 契约：取消不保证进程立刻退出——底层解析仍可能后台完成，退出时机由调用方退出策略负责。
     let settled = false
-    // 与 dnsLookup 内部同构的 key：abort 时按 key 定位 dnsPending 中的本回调
-    const key = [hostname, options.family || 0, options.hints || 0, options.all ? 1 : 0, options.verbatim ? 1 : 0].join('|')
+    // 与 dnsLookup 内部同 key（AGENTS-01 起为 hostname+family）：abort 时按 key 定位 dnsPending 中的本回调
+    const key = dnsCacheKey(hostname, options)
     const done = (error, address, family) => { if (!settled) { settled = true; resolve(makeResult(error, address, family)) } }
     const callback = (error, address, family) => {
       if (signal) signal.removeEventListener('abort', onAbort)
@@ -110,7 +140,8 @@ function prewarmDns (hostname, signal = null) {
     const onAbort = () => {
       const pending = dnsPending.get(key)
       if (pending) {
-        const i = pending.indexOf(callback)
+        // dnsPending 条目是 { callback, all }（AGENTS-01）：按回调身份定位本记账项
+        const i = pending.findIndex(entry => entry.callback === callback)
         if (i !== -1) pending.splice(i, 1)
         if (pending.length === 0) dnsPending.delete(key)
       }
@@ -148,11 +179,14 @@ const MAX_PREWARM_TLS_CONNECTIONS = 64
 
 async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null) {
   const started = Date.now()
-  if (signal && signal.aborted) return { hostname, count, skipped: true, cancelled: true, ok: false, okCount: 0, elapsedMs: 0 }
+  // AGENTS-07：所有出口都带 kind，调用方可按字段区分 DNS/TLS（两条预热路径的返回值都带 hostname）
+  if (signal && signal.aborted) return { kind: 'tls', hostname, count, skipped: true, cancelled: true, ok: false, okCount: 0, elapsedMs: 0 }
   try {
-    // got 替身可能不提供 stream（真实 got 恒有；与 xbk_http.js 的 mock 判定同款）：无法建连时跳过并
-    // 以 skipped:true 标记，ok 沿用既有 skipped→ok 约定（见 xbk_app.js 预热取消分支），未改语义。
-    if (!got.stream) return { hostname, count, skipped: true, ok: true, elapsedMs: Date.now() - started }
+    // got 替身可能不提供 stream（真实 got 恒有；与 xbk_http.js 的 mock 判定同款）：无法建连 → skipped:true
+    // 且 ok:false（AGENTS-10）。ok 的语义是「是否真的建连成功」，未建连却报 ok:true 会让聚合预热统计假绿
+    // （okCount=0 却 ok=true）；skipped:true 保留既有「调用方按跳过展示、不计失败」的语义
+    // （xbk_app.js 先判 skipped 再报「跳过」，qinglong 只在 PROFILE3 打点）。
+    if (!got.stream) return { kind: 'tls', hostname, count, skipped: true, ok: false, okCount: 0, error: 'got.stream 不可用（未建连）', elapsedMs: Date.now() - started }
   } catch (e) { /* 忽略 */ }
   // AGENTS-05（已知缺口，未改行为）：本 HEAD→GET 回退只为建连、但 await 会读完整个响应体，而这里没有
   // 体量上限——got@11 无 maxResponseSize 选项，xbk_http.js 的 20MB 上限只覆盖 fetchJson。补上限需要
@@ -206,9 +240,11 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
       }
     }
   }))
-  // AGENTS-07（已知形状缺陷，未改）：返回值同样带 hostname，调用方按字段无法区分 DNS/TLS（qinglong/
-  // xbk_push.js 已在任务侧显式绑定 kind）。增减字段属跨文件口径决策，故仅记录，不改返回形状。
+  // AGENTS-07：返回值带显式 kind（与 prewarmDns 的 kind:'dns' 对称）——此前 DNS/TLS 两条预热结果都只
+  // 带 hostname，调用方无法按字段区分，常驻日志会把 TLS 计入 DNS 计数（qinglong 侧已改为任务显式绑
+  // kind；现在接口本身也可区分）。纯新增字段，既有调用方读 ok/okCount/count/elapsedMs 不受影响。
   return {
+    kind: 'tls',
     hostname,
     count: results.length,
     ok: results.every(r => r.ok),
