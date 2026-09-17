@@ -3,7 +3,9 @@
 const assert = require('assert')
 const {
   classifyFailure,
-  classifySummary
+  classifySummary,
+  RETRYABLE_CODES,
+  PERMANENT_CODES
 } = require('./xbk_failure_policy')
 const { runResident, shouldAutoInstallDependencies } = require('./qinglong/xbk_push')
 
@@ -37,6 +39,16 @@ function error (message, code) {
     'HTTP_410', 'HTTP_411', 'HTTP_413', 'HTTP_415', 'HTTP_422', 'HTTP_423', 'HTTP_426', 'HTTP_451']) {
     assert.strictEqual(classifyFailure(error(code, code)).kind, 'permanent', `${code} 应立即停止`)
   }
+  // XHTTP-05：空响应体（含纯空白体）单列可重试码——上游「连上后未写体即结束」是瞬时故障，
+  // 不得与「有内容但不是 JSON」（ERR_BODY_NOT_JSON，合约性永久错误）同判。旧实现两者同码，
+  // 而该码在 PERMANENT 集合 → 一次瞬时空体即永久停推（常驻循环漏推）。
+  assert.strictEqual(RETRYABLE_CODES.has('ERR_EMPTY_BODY'), true, '空体码必须显式列进 RETRYABLE_CODES（不得只靠 UNKNOWN 兜底）')
+  assert.strictEqual(PERMANENT_CODES.has('ERR_EMPTY_BODY'), false, '空体码不得进永久集合')
+  assert.strictEqual(PERMANENT_CODES.has('ERR_BODY_NOT_JSON'), true, '非 JSON 合约错误的永久语义不得被本修复放松')
+  assert.strictEqual(classifyFailure(error('Response is not JSON: empty body', 'ERR_EMPTY_BODY')).kind, 'retryable', '空体必须可重试')
+  assert.strictEqual(classifyFailure(error('Response is not JSON: empty body', 'ERR_EMPTY_BODY')).reason, 'ERR_EMPTY_BODY', '空体的归类理由必须是本码本身（不是 UNKNOWN）')
+  assert.strictEqual(classifyFailure(error('Response is not JSON: body 9 chars', 'ERR_BODY_NOT_JSON')).kind, 'permanent', '非 JSON 体仍判永久')
+
   assert.strictEqual(classifyFailure({ response: { statusCode: 500 }, message: 'server' }).kind, 'retryable')
   assert.strictEqual(classifyFailure({ response: { statusCode: 408 }, message: 'timeout' }).kind, 'retryable')
   assert.strictEqual(classifyFailure({ response: { statusCode: 400 }, message: 'bad request' }).kind, 'permanent')

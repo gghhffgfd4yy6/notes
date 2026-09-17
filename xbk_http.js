@@ -26,10 +26,18 @@ function parseJsonBody (text) {
   // 旧实现会归成 ERR_BODY_NOT_JSON（xbk_failure_policy 的 PERMANENT 集合）→ 常驻循环永久停推。
   // 这里先剥离 BOM 再解析；不带 BOM 的输入行为不变。
   const normalized = text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text
+  // XHTTP-05：空体（含剥离 BOM 后的空体、纯空白体）单列 ERR_EMPTY_BODY，并已显式列入
+  // xbk_failure_policy.RETRYABLE_CODES——上游「连上后未写体即结束」是典型瞬时故障，重试一次通常即可恢复；
+  // 旧实现把空体与「返回了内容但不是 JSON」共用一个码，而该码在 PERMANENT 集合里 → 一次瞬时空体即永久停推。
+  // 非空但非 JSON 仍是合约性错误（ERR_BODY_NOT_JSON，永久），两者语义分开、互不放松。
+  if (normalized.trim().length === 0) {
+    const err = new Error('Response is not JSON: empty body')
+    err.code = 'ERR_EMPTY_BODY'
+    throw err
+  }
   try { return JSON.parse(normalized) } catch {
-    // 不回显上游响应体内容（可能含密钥/业务数据），只报长度——避免经日志与告警外泄；
-    // 错误码保持 ERR_BODY_NOT_JSON，失败分类语义不变（区分空体需新增错误码并同步 xbk_failure_policy.js）。
-    const err = new Error('Response is not JSON: ' + (normalized.length === 0 ? 'empty body' : `body ${normalized.length} chars`))
+    // 不回显上游响应体内容（可能含密钥/业务数据），只报长度——避免经日志与告警外泄。
+    const err = new Error(`Response is not JSON: body ${normalized.length} chars`)
     err.code = 'ERR_BODY_NOT_JSON'
     throw err
   }

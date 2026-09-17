@@ -248,6 +248,16 @@ function makeNetwork (opts = {}) {
     assert.strictEqual(getCalls(), 1, '显式注入的 PERMANENT_CODES 必须生效')
   }
 
+  // 12d. XHTTP-05 反向守卫：空体码 ERR_EMPTY_BODY 已显式列入 RETRYABLE_CODES → 请求层必须按可重试处理；
+  // 旧口径（空体与「非 JSON」同为 ERR_BODY_NOT_JSON，属 PERMANENT）下该形态 calls=1 即永久停推，本块红。
+  {
+    const { net, getCalls } = makeNetwork({ retry: 2, statusCode: undefined, errorCode: 'ERR_EMPTY_BODY', failTimes: 5 })
+    let rejected = null
+    try { await net.fetchData() } catch (e) { rejected = e }
+    assert.strictEqual(rejected.code, 'ERR_EMPTY_BODY', '应抛出最后一次的 lastErr')
+    assert.strictEqual(getCalls(), 3, '空体必须按可重试处理（首次 + 2 次重试），不得首次即永久停推')
+  }
+
   // 13. net-7：Retry-After 解析（RFC 9110 的 delta-seconds 或 HTTP-date；其余形态一律 null 回落指数退避）
   {
     const now = Date.parse('2026-09-17T00:00:00.000Z')

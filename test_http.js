@@ -4,6 +4,7 @@ const assert = require('assert')
 const { EventEmitter } = require('node:events')
 const got = require('got')
 const { fetchJson, DEFAULT_TIMEOUT_MS } = require('./xbk_http')
+const { classifyFailure } = require('./xbk_failure_policy')
 
 // 生产官方 got 提供 stream API；测试注入 mock stream（EventEmitter），
 // 走 fetchJson 的可限流真实路径（含响应体上限 / HTTP 错误 / JSON 解析）。
@@ -135,16 +136,22 @@ function installMockStream (behavior) {
     } finally { restore() }
   }
 
-  // 8b. 空响应体 → 报 'empty body'（旧实现输出 'Response is not JSON: ' + ''）
+  // 8b. 空响应体（含 BOM-only 与纯空白体）→ ERR_EMPTY_BODY，归类必须可重试；与「有内容但非 JSON」的
+  //     ERR_BODY_NOT_JSON（永久）分开——旧实现两者同码且该码在 PERMANENT 集合 → 一次瞬时空体永久停推。
   {
-    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: [] })
-    try {
-      let rejected = null
-      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
-      assert.strictEqual(rejected.code, 'ERR_BODY_NOT_JSON')
-      assert.ok(rejected.message.includes('empty body'), '空体应报 empty body')
-      assert.ok(!rejected.message.includes('body 0 chars'), '空体不应报 body 0 chars（两种语义分开）')
-    } finally { restore() }
+    const cases = [[[], '空体'], [['\uFEFF'], 'BOM-only 体'], [['\n\t '], '纯空白体']]
+    for (const [chunks, label] of cases) {
+      const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks })
+      try {
+        let rejected = null
+        try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
+        assert.ok(rejected, `${label} 应 reject`)
+        assert.strictEqual(rejected.code, 'ERR_EMPTY_BODY', `${label} 应归成空体码（旧实现 ERR_BODY_NOT_JSON=永久停推）`)
+        assert.ok(rejected.message.includes('empty body'), `${label} 应报 empty body`)
+        assert.ok(!rejected.message.includes('body 0 chars'), `${label} 不应报 body 0 chars（两种语义分开）`)
+        assert.strictEqual(classifyFailure(rejected).kind, 'retryable', `${label} 的失败归类必须是可重试`)
+      } finally { restore() }
+    }
   }
 
   // 8c. BOM + 非 JSON → 报的是剥离 BOM 后的长度，且仍不回显原文
@@ -320,6 +327,42 @@ function installMockStream (behavior) {
 
       await fetchJson('https://api.example.com/x', { timeout: { request: 4321 } })
       assert.deepStrictEqual(captured[2].timeout, { request: 4321 }, 'got 对象形态 timeout 应原样透传（不被默认值覆盖）')
+    } finally { restore() }
+  }
+
+  // 15. XHTTP-05：**失败归类**端到端（mock 流 → fetchJson 抛错 → classifyFailure），不只断言错误码字符串。
+  //     覆盖「半开」与「空体」两类：半开（got 超时错误 shape：name=TimeoutError、code=ETIMEDOUT、
+  //     message="Timeout awaiting 'request' for 30000ms"，见 got 的 core/utils/timed-out.js）必须可重试；
+  //     空体必须可重试且理由是本码本身（旧实现按 ERR_BODY_NOT_JSON 判永久停推）。
+  {
+    const cases = [
+      // [chunks, 期望 kind, 期望 reason, 场景]
+      [[], 'retryable', 'ERR_EMPTY_BODY', '空响应体'],
+      [['\n\t '], 'retryable', 'ERR_EMPTY_BODY', '纯空白体'],
+      [['not json'], 'permanent', 'ERR_BODY_NOT_JSON', '非 JSON 合约错误（不得被空体修复一起放松）']
+    ]
+    for (const [chunks, kind, reason, label] of cases) {
+      const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks })
+      try {
+        let rejected = null
+        try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
+        assert.ok(rejected, `${label} 应 reject`)
+        const verdict = classifyFailure(rejected)
+        assert.strictEqual(verdict.kind, kind, `${label} 应归类为 ${kind}，实际 ${verdict.kind}（reason=${verdict.reason}）`)
+        assert.strictEqual(verdict.reason, reason, `${label} 的归类理由应为 ${reason}，实际 ${verdict.reason}`)
+      } finally { restore() }
+    }
+    const timeoutErr = new Error("Timeout awaiting 'request' for 30000ms")
+    timeoutErr.name = 'TimeoutError'
+    timeoutErr.code = 'ETIMEDOUT'
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, error: timeoutErr })
+    try {
+      let rejected = null
+      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
+      assert.ok(rejected, '半开（请求超时）应 reject')
+      const verdict = classifyFailure(rejected)
+      assert.strictEqual(verdict.kind, 'retryable', `半开超时必须可重试，实际 ${verdict.kind}（reason=${verdict.reason}）`)
+      assert.strictEqual(verdict.reason, 'ETIMEDOUT', `半开超时应按 ETIMEDOUT 归类，实际 ${verdict.reason}`)
     } finally { restore() }
   }
 
