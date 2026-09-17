@@ -5,6 +5,7 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+const crypto = require('crypto')
 const { spawn } = require('child_process')
 
 const ROOT = __dirname
@@ -176,6 +177,21 @@ function collectMutants (files) {
     for (const mutant of generateMutants(file, source)) all.push(mutant)
   }
   return all.map((m, index) => ({ ...m, id: index + 1 }))
+}
+
+// 变异集指纹（F4）：断点续跑只能按 id 恢复，而 id 是位置序号——源码一改（哪怕插入一行）全部 id
+// 平移，旧断点的 killed/survived 会被错记到别的候选头上。指纹覆盖每个候选的文件/区间/原文/替换串
+// （顺序敏感：id 即顺序），源码或变异集任何变化都会改变指纹 → 断点被丢弃。
+// 用 NUL/SOH 分隔并各自带长度前缀，避免不同字段拼接出同一串（边界歧义）。
+function mutantFingerprint (mutants) {
+  const hash = crypto.createHash('sha256')
+  for (const m of mutants) {
+    for (const field of [m.file, m.start, m.end, m.original, m.replacement]) {
+      const text = String(field)
+      hash.update(`${Buffer.byteLength(text)}\u0000${text}\u0001`)
+    }
+  }
+  return hash.digest('hex')
 }
 
 // node_modules 挂载（#136 review F3）：node_modules 属必选输入，symlinkSync 不校验目标是否存在，
@@ -551,7 +567,23 @@ async function main (deps) {
   }
   const mutants = collectMutants(files)
   const byId = new Map(mutants.map(m => [m.id, m]))
-  const old = loadCheckpoint(checkpointFile)
+  // 断点必须与当前源码/变异集绑定（F4）：id 只是位置序号（index+1），源码一旦改动（插入一行即可让
+  // 全部 id 平移），旧断点的 killed/survived 就会被错记到别的候选头上——既虚增分数，也让真正改动过
+  // 的代码免于变异。故在此记录变异集指纹（每个候选的 file/区间/原文/替换串），恢复时不一致即丢弃
+  // 旧断点并从零开始（响亮告警，不静默继承）。升级前的旧断点没有该字段，同样视为不可信。
+  const fingerprint = mutantFingerprint(mutants)
+  const loaded = loadCheckpoint(checkpointFile)
+  const staleReason = !loaded
+    ? null
+    : typeof loaded.fingerprint !== 'string'
+      ? '断点没有源码指纹（升级前格式）'
+      : loaded.fingerprint !== fingerprint
+        ? '断点指纹与当前源码/变异集不一致（源码已变更）'
+        : null
+  if (staleReason) {
+    console.warn(`⚠️  丢弃断点 ${checkpointFile}：${staleReason}；旧判定结果不可继承，本轮从零开始`)
+  }
+  const old = staleReason ? null : loaded
   const killed = new Map((old && old.killed) || [])
   const survived = new Map((old && old.survived) || [])
   const compileErrors = new Map((old && old.compileErrors) || [])
@@ -568,6 +600,7 @@ async function main (deps) {
   const persist = () => saveCheckpoint(checkpointFile, {
     total: mutants.length,
     batchSize,
+    fingerprint,
     killed: [...killed.entries()],
     survived: [...survived.entries()],
     compileErrors: [...compileErrors.entries()],
@@ -618,10 +651,21 @@ async function main (deps) {
   }
   const reportFile = path.join(ROOT, 'mutation-report.json')
   saveCheckpoint(reportFile, report)
+  // 未判定变异体（F4）：报告里 status='pending' 的候选从未被任何批次评估过（断点被截断/损坏，
+  // 或 killed/survived 记到了不存在的 id 上）。它们既不算 killed 也不算 survived，而退出码只看
+  // survived/timeout → 会以 0 收场（「跑完了、分数很高」的假绿）。此处改为响亮失败，并保留断点
+  // 文件供排查（不删），让「未判定」不可能被当成「已检出」。
+  const undetermined = mutants.filter(m => !killed.has(m.id) && !survived.has(m.id) && !compileErrors.has(m.id))
+  if (undetermined.length) {
+    console.error(`❌ 未判定变异体 ${undetermined.length}/${mutants.length} 个（未被任何批次覆盖）：分数不可信，按失败退出`)
+    console.error(`   断点文件保留在 ${checkpointFile}（确认后可删除并重跑）`)
+    process.exitCode = 1
+    return
+  }
   try { fs.unlinkSync(checkpointFile) } catch (e) { /* 完成后没有断点文件也不影响报告 */ }
   console.log(`完成：total=${report.total} killed=${report.killed} survived=${report.survived} timeout=${report.timeout}`)
   process.exitCode = report.survived || report.timeout ? 1 : 0
 }
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1 })
-module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate }
+module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate, DEFAULT_FILES, mutantFingerprint }

@@ -5,7 +5,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { runTests, evaluate, main } = require('./run_mutation')
+const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutants } = require('./run_mutation')
 
 ;(async () => {
   // 防重入：run_mutation.js 的 runTests 在临时目录内运行 run_unit_tests.js 时会设置
@@ -41,6 +41,92 @@ const { runTests, evaluate, main } = require('./run_mutation')
       if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
       else process.env.MUTATION_CHECKPOINT = originalCheckpoint
       fs.rmSync(ckpt, { force: true })
+    }
+  }
+
+  // ===== main：断点指纹（F4） =====
+  // 断点只按位置 id（序号）恢复，源码一改全部 id 平移，旧 killed/survived 会被错记到别的候选头上
+  // （分数虚高 + 真正改动过的代码免于变异）。指纹不匹配必须丢弃旧断点、从零重跑。
+  {
+    const originalExitCode = process.exitCode
+    const originalCheckpoint = process.env.MUTATION_CHECKPOINT
+    const ckpt = path.join(os.tmpdir(), `xbk-fingerprint-ckpt-${process.pid}.json`)
+    const reportFile = path.join(__dirname, 'mutation-report.json')
+    const hadReport = fs.existsSync(reportFile) ? fs.readFileSync(reportFile) : null
+    const calls = []
+    try {
+      process.env.MUTATION_CHECKPOINT = ckpt
+      // 伪造上一轮的断点：指纹与当前源码不一致 + 第 1 个变异体已判定 + pending 为空
+      fs.writeFileSync(ckpt, JSON.stringify({
+        total: 1,
+        batchSize: 50,
+        fingerprint: 'deadbeef',
+        killed: [[1, { status: 'killed' }]],
+        survived: [],
+        compileErrors: [],
+        pending: []
+      }))
+      await main({
+        evaluate: async (mutants) => {
+          calls.push(mutants.length)
+          return { status: 'pass', code: 0, signal: null, output: 'ok' }
+        }
+      })
+      assert.strictEqual(calls[0], 0, '先跑未套变异的基线')
+      assert.ok(calls.length > 1, '指纹不匹配的断点必须被丢弃并重新评估，不得直接继承旧结果收场')
+      assert.ok(calls.slice(1).some(n => n > 0), '丢弃断点后应真正进入批次循环评估变异体')
+    } finally {
+      process.exitCode = originalExitCode
+      if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
+      else process.env.MUTATION_CHECKPOINT = originalCheckpoint
+      fs.rmSync(ckpt, { force: true })
+      if (hadReport === null) fs.rmSync(reportFile, { force: true })
+      else fs.writeFileSync(reportFile, hadReport)
+    }
+  }
+
+  // ===== main：未判定变异体必须拉红（F4） =====
+  // 报告里 status='pending' 的候选从未被任何批次评估；退出码此前只看 survived/timeout → exit 0
+  // （「跑完了、分数很高」的假绿）。指纹匹配 + pending 为空即复现：第 1 个已判定、其余全部未判定。
+  {
+    const originalExitCode = process.exitCode
+    const originalCheckpoint = process.env.MUTATION_CHECKPOINT
+    const ckpt = path.join(os.tmpdir(), `xbk-undetermined-ckpt-${process.pid}.json`)
+    const reportFile = path.join(__dirname, 'mutation-report.json')
+    const hadReport = fs.existsSync(reportFile) ? fs.readFileSync(reportFile) : null
+    const calls = []
+    try {
+      process.env.MUTATION_CHECKPOINT = ckpt
+      const fingerprint = mutantFingerprint(collectMutants(DEFAULT_FILES))
+      assert.ok(fingerprint.length === 64, '变异集指纹应为 sha256 十六进制串')
+      fs.writeFileSync(ckpt, JSON.stringify({
+        total: 1,
+        batchSize: 50,
+        fingerprint,
+        killed: [[1, { status: 'killed' }]],
+        survived: [],
+        compileErrors: [],
+        pending: []
+      }))
+      await main({
+        evaluate: async (mutants) => {
+          calls.push(mutants.length)
+          return { status: 'pass', code: 0, signal: null, output: 'ok' }
+        }
+      })
+      assert.deepStrictEqual(calls, [0], '指纹匹配且 pending 为空时不应再跑任何批次')
+      assert.strictEqual(process.exitCode, 1, '存在未判定变异体必须非 0 退出（不得 survived=0 却 exit 0）')
+      const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'))
+      const pending = report.mutants.filter(m => m.result && m.result.status === 'pending').length
+      assert.ok(pending > 0, `报告应显式标出未判定（status=pending）的变异体，实际 ${pending} 个`)
+      assert.ok(fs.existsSync(ckpt), '存在未判定项时断点文件应保留（供排查），不得静默删除')
+    } finally {
+      process.exitCode = originalExitCode
+      if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
+      else process.env.MUTATION_CHECKPOINT = originalCheckpoint
+      fs.rmSync(ckpt, { force: true })
+      if (hadReport === null) fs.rmSync(reportFile, { force: true })
+      else fs.writeFileSync(reportFile, hadReport)
     }
   }
 
