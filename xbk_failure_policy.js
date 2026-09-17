@@ -206,6 +206,16 @@ function codeIs (code, set) {
   return Boolean(code && set.has(String(code).toUpperCase()))
 }
 
+// XFP-01：4xx 里这几类不是「请求本身有问题」，而是暂时性语义（408 请求超时 / 409 冲突 /
+// 425 过早 / 429 限流），与 RETRYABLE_CODES 里的 HTTP_408/409/425/429 是同一口径。
+// 数字 code 与 providerCode 落在同一数值区间时必须按同一语义裁决：若只按「400<=n<500 → permanent」
+// 无差别判定，同一 4xx 语义在不同承载字段下会分类相反，4xx 的限流/超时被误判永久而停止重试。
+const RETRYABLE_HTTP_STATUS = new Set([408, 409, 425, 429])
+
+function isRetryableHttpStatus (n) {
+  return RETRYABLE_HTTP_STATUS.has(n) || (n >= 500 && n <= 599)
+}
+
 function classifyOne (error) {
   const info = summarizeError(error)
 
@@ -266,7 +276,7 @@ function classifyOne (error) {
     return { kind: 'permanent', reason: 'CONFIG_OR_CONTRACT', info }
   }
   const numericCode = Number(code)
-  if (code === '1001' || code === '429' || (Number.isInteger(numericCode) && numericCode >= 500 && numericCode <= 599)) {
+  if (code === '1001' || (Number.isInteger(numericCode) && isRetryableHttpStatus(numericCode))) {
     return { kind: 'retryable', reason: `PROVIDER_${code}`, info }
   }
   if (Number.isInteger(numericCode) && numericCode >= 400 && numericCode < 500) {
@@ -276,11 +286,11 @@ function classifyOne (error) {
     return { kind: 'retryable', reason: 'PROVIDER_RATE_LIMIT', info }
   }
   const providerNumber = Number(providerCode)
+  if (Number.isInteger(providerNumber) && isRetryableHttpStatus(providerNumber)) {
+    return { kind: 'retryable', reason: `PROVIDER_${providerNumber}`, info }
+  }
   if (Number.isInteger(providerNumber) && providerNumber >= 400 && providerNumber < 500) {
     return { kind: 'permanent', reason: `PROVIDER_${providerNumber}`, info }
-  }
-  if (Number.isInteger(providerNumber) && providerNumber >= 500 && providerNumber <= 599) {
-    return { kind: 'retryable', reason: `PROVIDER_${providerNumber}`, info }
   }
   if (code.startsWith('HTTP_')) {
     const n = Number(code.slice(5))
@@ -304,9 +314,23 @@ function classifyOne (error) {
   return { kind: 'retryable', reason: 'UNKNOWN', info }
 }
 
+// XFP-05：聚合失败的子错误可以挂在两个位置上——错误对象自身（error.failures）或
+// failureInfo.failures（qinglong 适配器把子通道结果放进 failureInfo 上报）。父级标签的
+// 「子级可重试优先」仲裁必须对两者一视同仁，否则同一形状换个承载字段就分类相反：
+// {failureKind:'permanent', failures:[{code:'ETIMEDOUT'}]} → retryable，
+// 而 {failureKind:'permanent', failureInfo:{failures:[{code:'ETIMEDOUT'}]}} → permanent（停止重试、漏推）。
+function nestedFailuresOf (error) {
+  const direct = safeArray(readProp(error, 'failures'))
+  if (direct && direct.length > 0) return direct
+  const info = readProp(error, 'failureInfo')
+  if (!info || typeof info !== 'object') return null
+  const viaInfo = safeArray(readProp(info, 'failures'))
+  return viaInfo && viaInfo.length > 0 ? viaInfo : null
+}
+
 function classifyFailure (error) {
   const explicitKind = readProp(error, 'failureKind')
-  const nested = safeArray(readProp(error, 'failures'))
+  const nested = nestedFailuresOf(error)
   // 聚合失败的子错误优先于父级预填标签，避免父级 permanent 覆盖子级 retryable。
   if ((explicitKind === 'retryable' || explicitKind === 'permanent') && !(nested && nested.length > 0)) {
     return { kind: explicitKind, reason: readProp(error, 'failureReason') || 'EXPLICIT', info: summarizeError(error) }
