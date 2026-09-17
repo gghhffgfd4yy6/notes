@@ -415,6 +415,17 @@ function error (message, code) {
     '{"appToken":"***"}', 'JSON 引号形态的 appToken 必须脱敏')
   assert.strictEqual(summarizeError({ failureInfo: { detail: '{"secret":"SECRET123","n":1}' } }).detail,
     '{"secret":"***","n":1}', 'failureInfo 字符串字段的 JSON 引号形态凭据同样脱敏')
+  // ②b JSON 值内含转义序列：值匹配必须按 JSON 转义语义吃到真正的收尾引号。
+  // 反例（qodo PR #151-1）：`[^"]*` 把值内的 \" 当成收尾引号——'{"appToken":"abc\"SECRET"}' 只被抹掉
+  // 前半段、凭据后缀原样进日志/告警（脱敏是安全控制，漏抹即泄漏）。
+  assert.strictEqual(summarizeError({ message: '{"appToken":"abc\\"SECRET"}' }).message,
+    '{"appToken":"***"}', '值内含转义引号时凭据必须整体脱敏，不得残留后缀')
+  assert.ok(!summarizeError({ message: '{"appToken":"abc\\"SECRET"}' }).message.includes('SECRET'),
+    '转义引号形态不得残留凭据后缀')
+  assert.strictEqual(summarizeError({ message: '{"appToken":"a\\\\bSECRET"}' }).message,
+    '{"appToken":"***"}', '值内含转义反斜杠时凭据同样必须整体脱敏')
+  assert.ok(!summarizeError({ message: '{"token":"x\\"ySECRET"}' }).message.includes('SECRET'),
+    'token 关键字的转义引号形态同样不得残留')
   // ③ 裸 Bearer（无关键字前缀，如上游把 Authorization 头值回显进 message）
   assert.strictEqual(summarizeError({ message: 'upstream said: Bearer SECRET123 rejected' }).message,
     'upstream said: Bearer *** rejected', '裸 Bearer 凭据必须脱敏（保留原大小写）')

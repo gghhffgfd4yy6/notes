@@ -33,10 +33,13 @@ const SECRET_KEY = '(?:token|app[_-]?token|key|secret|authorization|pushkey)'
 //    `Authorization: *** SECRET123 x`，真正的凭据原样残留；这里把 bearer/basic 前缀并入本次匹配。
 // ② JSON/JS 引号形态 `"appToken":"SECRET123"`：关键字与冒号之间夹着引号，旧正则要求关键字后
 //    直接是 `=`/`:`，整体不命中，凭据原样出网（日志/告警/摘要），故单列一条带引号规则。
+//    值部分必须按 JSON 转义语义吃完整串（`(?:\\.|[^"\\])*`）而不能用 `[^"]*`：后者把值内
+//    的转义引号（如 `{"appToken":"abc\"SECRET"}`）当成收尾引号，只抹掉前半段、把 `SECRET"`
+//    这类后缀原样留在日志里（qodo PR #151-1，脱敏是安全控制，漏抹即凭据泄漏）。
 // ③ 裸 `Bearer <credential>`（无关键字前缀，例如上游把 Authorization 头值回显进 message）。
 // 脱敏方向上一律宁可多抹：误抹只是可读性损失，漏抹就是凭据泄漏。
 const SECRET_KV_RE = new RegExp(`(${SECRET_KEY}\\s*[=:]\\s*)(?:bearer\\s+|basic\\s+)?[^\\s,;]+`, 'gi')
-const SECRET_KV_QUOTED_RE = new RegExp(`("${SECRET_KEY}"\\s*:\\s*")[^"]*(")`, 'gi')
+const SECRET_KV_QUOTED_RE = new RegExp(`("${SECRET_KEY}"\\s*:\\s*")(?:\\\\.|[^"\\\\])*(")`, 'gi')
 const BEARER_RE = /\b(bearer)\s+[^\s,;]+/gi
 
 function redact (text) {

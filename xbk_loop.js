@@ -13,6 +13,20 @@ function clampTimerMs (ms, fallback = 10000) {
   return Math.min(MAX_TIMER_MS, Math.max(0, value))
 }
 
+// 单轮刷新超时错误：文案必须报**实际生效**的毫秒数（clampTimerMs 之后的定时器长度）。
+// 直接回显配置值会让运维看到「超过 1000000000000ms 未完成」而看门狗其实在 2147483647ms
+// 就响了——一个不可能发生的时长（qodo PR #151-4）。被钳制时额外标注配置请求值，便于定位误填。
+function refreshTimeoutError (requestedMs) {
+  const effectiveMs = clampTimerMs(requestedMs)
+  const error = new Error(
+    effectiveMs === requestedMs
+      ? `常驻刷新超过 ${effectiveMs}ms 未完成`
+      : `常驻刷新超过 ${effectiveMs}ms 未完成（配置请求 ${requestedMs}ms，超出 setTimeout 上限已钳制）`
+  )
+  error.code = 'INTERVAL_REFRESH_TIMEOUT'
+  return error
+}
+
 function runBounded (task, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
     let timer // eslint-disable-line prefer-const -- 声明与赋值分离（setTimeout 回填），let 语义清晰
@@ -42,9 +56,7 @@ function runBounded (task, timeoutMs, signal) {
     }
     timer = setTimeout(() => {
       relayAbort()
-      const error = new Error(`常驻刷新超过 ${timeoutMs}ms 未完成`)
-      error.code = 'INTERVAL_REFRESH_TIMEOUT'
-      finish(reject, error)
+      finish(reject, refreshTimeoutError(timeoutMs))
     }, clampTimerMs(timeoutMs))
     if (signal && typeof signal.addEventListener === 'function') {
       if (signal.aborted) return onAbort()
@@ -61,12 +73,15 @@ function runBounded (task, timeoutMs, signal) {
 // XL-06：run() 既无单轮超时也不接收 signal，单轮挂起时 runLoop 无法响应停止信号（进程无法优雅退出）。
 // 引入单轮看门狗会改变推送结果语义（可能产生半推/重复推），属设计决策，已登记 defer。
 function sleep (ms, signal) {
-  if (signal && signal.aborted) return Promise.resolve()
   // XL-01：signal 原先只做真值判断——非 AbortSignal 的真值对象（如 {}）会让下面的
   // addEventListener 抛 TypeError；定时器此刻已调度，回调里再调 removeEventListener 会
   // 二次抛错，成为定时器回调中的未捕获异常并终止进程（runBounded 早有 typeof 守卫，
   // 此处对齐）。守卫同时覆盖摘除侧，避免只堵一半。
   const canListen = !!signal && typeof signal.addEventListener === 'function'
+  // qodo PR #151-2：aborted 早退同样必须以 canListen 为前提。否则 `{ aborted: true }` 这种
+  // 「只有同名属性、没有可听接口」的形状会被当成「已取消」而整个跳过等待，调用方的重试/轮询
+  // 间隔凭空消失（常驻循环退化为空转）。真正的 AbortSignal 恒有 addEventListener，行为不变。
+  if (canListen && signal.aborted) return Promise.resolve()
   return new Promise(resolve => {
     const timer = setTimeout(done, clampTimerMs(ms))
     function done () {
@@ -120,4 +135,4 @@ async function runLoop (run, options = {}) {
   }
 }
 
-module.exports = { runLoop, sleep }
+module.exports = { runLoop, sleep, refreshTimeoutError }
