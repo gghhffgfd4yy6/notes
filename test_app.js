@@ -2465,6 +2465,41 @@ console.log('========================================\n');
     }
   })
 
+  await test('APP2-01：告警通道不可用时失败告警仍按 intervalMs 限频（按告警尝试计时）', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalFailures = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const originalInterval = Config.channelHealth && Config.channelHealth.intervalMs
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_alert_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    const statePath = path.join(stateDir, 'channel-health.state')
+    const origNotifyFail = notifyFail
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = true
+      Config.channelHealth.consecutiveFailures = 2
+      Config.channelHealth.intervalMs = 3600000
+      notifyFail = true // 告警通道本身不可用：告警发送必然失败
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      const afterAlert = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(afterAlert.telegram.lastAlertAt > 0, `告警尝试后应落盘 lastAlertAt（发送成功与否无关），实际 ${afterAlert.telegram.lastAlertAt}`)
+      notifyFail = false
+      pushCalls.length = 0
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      assert(!pushCalls.some(c => c.text.includes('通道异常')), '限频窗口内不得重复告警（即使上一轮发送失败）')
+    } finally {
+      notifyFail = origNotifyFail
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalFailures
+      Config.channelHealth.intervalMs = originalInterval
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('告警通道挂 → 不误报"已发送"（v3.145）', async () => {
     reset()
     setPushUrl('t59_alert_nofalse')

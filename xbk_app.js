@@ -765,8 +765,11 @@ function createApp ({
           const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
           const count = this._safeCounter(entry.consecutiveFailures) + 1
           const lastAlertAt = this._safeCounter(entry.lastAlertAt)
-          state[channel] = { consecutiveFailures: count, lastFailureAt: now, lastAlertAt }
-          if (count >= threshold && (!interval || now - lastAlertAt >= interval)) alerts.push({ type: 'failed', channel, count, failure })
+          // APP2-01：限频按「告警尝试」计时——告警通道本身不可用时发送必然失败，若只在发送成功后
+          // 回填 lastAlertAt，intervalMs（默认 1h）限频完全失效，每轮都重发。故在排入告警时即落盘。
+          const alertDue = count >= threshold && (!interval || now - lastAlertAt >= interval)
+          state[channel] = { consecutiveFailures: count, lastFailureAt: now, lastAlertAt: alertDue ? now : lastAlertAt }
+          if (alertDue) alerts.push({ type: 'failed', channel, count, failure })
         }
         if (!this._writeState(statePath, state)) return
         for (const alert of alerts) {
@@ -776,10 +779,8 @@ function createApp ({
               ? `通道：${alert.channel}\n\n已恢复正常推送。`
               : `通道：${alert.channel}\n\n连续失败：${alert.count} 次\n\n原因：${Utils.safeErrorText(alert.failure && alert.failure.message, '未知错误').slice(0, 300)}`
             await Pusher.send(text, desp)
-            if (alert.type === 'failed' && state[alert.channel]) {
-              state[alert.channel].lastAlertAt = Date.now()
-              this._writeState(statePath, state)
-            }
+            // APP2-01：失败告警的 lastAlertAt 已在排入告警时落盘（按尝试计时），此处不再回填，
+            // 避免发送成功与否改变限频口径。
           } catch (e) { /* 健康告警失败不得影响主推送、缓存或下一次重试 */ }
         }
       } catch (e) {
