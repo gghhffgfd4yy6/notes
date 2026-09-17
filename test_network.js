@@ -1,22 +1,23 @@
 'use strict'
 
 const assert = require('assert')
-const { createNetwork } = require('./xbk_network')
+const { createNetwork, parseRetryAfterMs } = require('./xbk_network')
 const { RETRYABLE_CODES } = require('./xbk_failure_policy')
 
 // fetchData 依赖全部注入：Config / Utils / fetchJson / prewarmDns / getNotify / crypto / RETRYABLE_CODES
 function makeNetwork (opts = {}) {
-  const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes } = opts
+  const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes, responseHeaders } = opts
   let calls = 0
   const requestOptions = [] // net-3：捕获传给 HTTP 层的 option，供 timeout 钳制断言使用
   const warnings = [] // net-3：捕获 logger.warn（配置非法时必须告警留痕）
+  const logs = [] // net-7：捕获退避日志（断言等待时长/是否按 Retry-After）
   const fetchJson = async (_url, requestOpts) => {
     calls += 1
     requestOptions.push(requestOpts)
     if (calls <= failTimes) {
       const e = new Error('fail ' + calls)
       if (errorCode !== undefined) e.code = errorCode // net-1：无 response 的永久性错误码
-      if (statusCode !== undefined) e.response = { statusCode }
+      if (statusCode !== undefined) e.response = { statusCode, headers: responseHeaders } // net-7：Retry-After 载体
       throw e
     }
     return { ok: true, calls }
@@ -33,13 +34,14 @@ function makeNetwork (opts = {}) {
     crypto: { randomInt: () => 0 }, // 抖动固定为 0，退避仅由 1000*2^attempt 决定
     RETRYABLE_CODES,
     ...(permanentCodes === undefined ? {} : { PERMANENT_CODES: permanentCodes }),
-    logger: { log: () => {}, warn: (msg) => warnings.push(String(msg)) }
+    logger: { log: (...args) => logs.push(args.join(' ')), warn: (msg) => warnings.push(String(msg)) }
   })
   return {
     net,
     getCalls: () => calls,
     getRequestOptions: () => requestOptions,
-    getWarnings: () => warnings
+    getWarnings: () => warnings,
+    getLogs: () => logs
   }
 }
 
@@ -244,6 +246,73 @@ function makeNetwork (opts = {}) {
     try { await net.fetchData() } catch (e) { rejected = e }
     assert.strictEqual(rejected.code, 'MY_PERMANENT', '应抛出注入集合里的错误')
     assert.strictEqual(getCalls(), 1, '显式注入的 PERMANENT_CODES 必须生效')
+  }
+
+  // 13. net-7：Retry-After 解析（RFC 9110 的 delta-seconds 或 HTTP-date；其余形态一律 null 回落指数退避）
+  {
+    const now = Date.parse('2026-09-17T00:00:00.000Z')
+    assert.strictEqual(parseRetryAfterMs('5', now), 5000, 'delta-seconds → 毫秒')
+    assert.strictEqual(parseRetryAfterMs('  7  ', now), 7000, '两侧空白应裁剪')
+    assert.strictEqual(parseRetryAfterMs('0', now), 0, '0 秒 → 立即重试')
+    assert.strictEqual(parseRetryAfterMs(120, now), 120000, '数值型秒数同样接受')
+    assert.strictEqual(parseRetryAfterMs('', now), null, '空串非法 → 回落指数退避')
+    assert.strictEqual(parseRetryAfterMs('1.5', now), null, "非 RFC 形态 '1.5' 非法（不猜小数秒）")
+    assert.strictEqual(parseRetryAfterMs('-5', now), null, '负数非法')
+    assert.strictEqual(parseRetryAfterMs('abc', now), null, '无日期的文本非法')
+    assert.strictEqual(parseRetryAfterMs(undefined, now), null, '缺失非法')
+    assert.strictEqual(parseRetryAfterMs(null, now), null, 'null 非法')
+    assert.strictEqual(parseRetryAfterMs('Wed, 21 Oct 2015 07:28:00 GMT', now), 0, '已过期 HTTP-date → 立即重试')
+    assert.strictEqual(parseRetryAfterMs(new Date(now + 3000).toUTCString(), now), 3000, '未来 HTTP-date → 剩余毫秒')
+  }
+
+  // 13b. net-7 端到端：429 + Retry-After: 0 → 按服务端指示立即重试，日志注明来源；
+  // 旧实现（退避只用 1000*2^attempt）此处会打印「1s 后重试」且没有「按 Retry-After」标记 → 本块红。
+  {
+    const { net, getCalls, getLogs } = makeNetwork({ retry: 1, statusCode: 429, failTimes: 1, responseHeaders: { 'retry-after': '0' } })
+    const r = await net.fetchData()
+    assert.strictEqual(r.calls, 2, '429 + Retry-After 应重试后成功')
+    assert.strictEqual(getCalls(), 2)
+    const retryLog = getLogs().find(l => l.includes('后重试'))
+    assert.ok(retryLog && retryLog.includes('0s 后重试'), `等待时长须取自 Retry-After（0s），实际：${JSON.stringify(getLogs())}`)
+    assert.ok(retryLog.includes('（按 Retry-After）'), `日志须注明退避来源，实际：${retryLog}`)
+  }
+
+  // 13c. 兼容 WHATWG Headers 形态（headers.get）——两条取头路径都要工作
+  {
+    const { net, getLogs } = makeNetwork({
+      retry: 1,
+      statusCode: 429,
+      failTimes: 1,
+      responseHeaders: { get: (name) => (name === 'retry-after' ? '0' : undefined) }
+    })
+    await net.fetchData()
+    const retryLog = getLogs().find(l => l.includes('后重试'))
+    assert.ok(retryLog && retryLog.includes('0s 后重试') && retryLog.includes('（按 Retry-After）'),
+      `Headers.get 形态同样应生效，实际：${JSON.stringify(getLogs())}`)
+  }
+
+  // 13d. 无 Retry-After（或非法值）→ 保持原指数退避（1s、2s…）且不出现来源标记
+  for (const [headers, label] of [[undefined, '无 headers'], [{ 'retry-after': '1.5' }, '非法 Retry-After']]) {
+    const { net, getLogs } = makeNetwork({ retry: 1, statusCode: 503, failTimes: 1, responseHeaders: headers })
+    await net.fetchData()
+    const retryLog = getLogs().find(l => l.includes('后重试'))
+    assert.ok(retryLog && retryLog.includes('1s 后重试'), `${label} 应回落指数退避（1s），实际：${JSON.stringify(getLogs())}`)
+    assert.ok(!retryLog.includes('按 Retry-After'), `${label} 不得标成按 Retry-After 退避，实际：${retryLog}`)
+  }
+
+  // 13e. 上限保护：Retry-After 给出超大等待（3600s）时钳到 30s（不得把单轮请求挂死）。
+  // 只把全局 setTimeout 替换成立即结算，断言落在日志里的等待值上（否则本用例要真等 30 秒）。
+  {
+    const realSetTimeout = global.setTimeout
+    global.setTimeout = (fn) => { fn(); return 0 }
+    try {
+      const { net, getLogs } = makeNetwork({ retry: 1, statusCode: 429, failTimes: 1, responseHeaders: { 'retry-after': '3600' } })
+      await net.fetchData()
+      assert.ok(getLogs().some(l => l.includes('30s 后重试') && l.includes('（按 Retry-After）')),
+        `超大 Retry-After 必须钳到 30s，实际：${JSON.stringify(getLogs())}`)
+    } finally {
+      global.setTimeout = realSetTimeout
+    }
   }
 
   console.log('test_network OK')

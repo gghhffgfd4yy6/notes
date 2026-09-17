@@ -22,6 +22,32 @@ const MIN_TIMEOUT_MS = 100
 const MAX_TIMEOUT_MS = 2147483647
 const DEFAULT_TIMEOUT_MS = 5000
 
+// net-7：重试退避上限（指数退避与 Retry-After 两条路径共用）。上游给出天文数字的等待时不得把单轮
+// fetchData 挂死；30s 也足以覆盖限流窗口内的常规 Retry-After。
+const RETRY_BACKOFF_CAP_MS = 30000
+
+// net-7：解析 Retry-After（RFC 9110：delta-seconds 非负整数，或 HTTP-date）→ 毫秒。
+// 只认这两种合法形态，其余（空串、'1.5'、'-5'、非日期文本）返回 null 交由指数退避兜底——
+// 不做宽松猜测，避免把笔误当成等待时长。HTTP-date 已过期 → 0（立即重试，语义同 RFC）。
+function parseRetryAfterMs (value, now = Date.now()) {
+  if (value === undefined || value === null) return null
+  const raw = String(value).trim()
+  if (raw === '') return null
+  if (/^[0-9]+$/.test(raw)) return Number(raw) * 1000
+  if (!/[A-Za-z]/.test(raw)) return null // delta-seconds 之外的数字/符号形态（-5、1.5、+3）一律非法
+  const at = Date.parse(raw)
+  if (!Number.isFinite(at)) return null
+  return Math.max(0, at - now)
+}
+
+// net-7：从错误对象上取 Retry-After。真实链路（xbk_http/got）给的是小写键的普通对象，兼容 WHATWG Headers。
+function readRetryAfterMs (e, now = Date.now()) {
+  const headers = e && e.response && e.response.headers
+  if (!headers) return null
+  const value = typeof headers.get === 'function' ? headers.get('retry-after') : headers['retry-after']
+  return parseRetryAfterMs(value, now)
+}
+
 function createNetwork ({
   Config,
   Utils,
@@ -111,10 +137,17 @@ function createNetwork ({
             if (sc !== undefined && sc < 500 && !RETRYABLE_CODES.has('HTTP_' + sc)) throw e
           }
           if (attempt < maxRetry) { // v3.157：用兜底后的 maxRetry（曾用原始 Config.api.retry，非法类型时与实际重试不一致）
-            // 退避等待：1s、2s、4s、8s...指数退避（注：README 未声明本函数退避口径，README:68 的
-            // 「指数退避」指常驻轮询入口）；封顶 30s 防长挂，+0-500ms 随机抖动避免多实例同时重试
-            const wait = Math.min(1000 * 2 ** attempt, 30000) + crypto.randomInt(500)
-            logger.log(`请求失败（${Utils.safeErrorText(e, 'unknown')}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）...`)
+            // net-7：服务端显式给了 Retry-After（429/408/425/503 常见）就按它等——外层手写退避曾完全不读它，
+            // 结果是在限流窗口内按固定指数退避反复撞墙；缺失/非法时回落指数退避（1s、2s、4s…）。
+            // 两条路径都受 RETRY_BACKOFF_CAP_MS 上限保护；Retry-After 是服务端给的回访时刻，不叠加抖动，
+            // 指数退避保留 +0-500ms 抖动避免多实例同时重试（注：README 未声明本函数退避口径，
+            // README:68 的「指数退避」指常驻轮询入口）。
+            const retryAfterMs = readRetryAfterMs(e)
+            const byServer = retryAfterMs !== null
+            const wait = byServer
+              ? Math.min(retryAfterMs, RETRY_BACKOFF_CAP_MS)
+              : Math.min(1000 * 2 ** attempt, RETRY_BACKOFF_CAP_MS) + crypto.randomInt(500)
+            logger.log(`请求失败（${Utils.safeErrorText(e, 'unknown')}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）${byServer ? '（按 Retry-After）' : ''}...`)
             await new Promise(resolve => setTimeout(resolve, wait))
           }
         }
@@ -126,4 +159,4 @@ function createNetwork ({
   }
 }
 
-module.exports = { createNetwork }
+module.exports = { createNetwork, parseRetryAfterMs }
