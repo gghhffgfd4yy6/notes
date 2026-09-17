@@ -6,10 +6,14 @@
 // 注意：整文件读入 + Buffer.concat 会短暂翻倍内存（600MB 级报告峰值约 1.2GB，CI 7GB 内存下安全）。
 const fs = require('node:fs')
 const path = require('node:path')
+const { constants: bufferConstants } = require('node:buffer')
 
 const KEY = Buffer.from('"statusReason"')
 const PLACEHOLDER = Buffer.from(':""')
 const MAX_STRING_LENGTH = 512 * 1024 * 1024 - 24 // V8 单字符串最大字符数（0x1fffffe8 ≈ 512MiB；表达式写法规避 Codacy PMD InnaccurateNumericLiteral 误报）
+// F1：读取前的护栏上限——Buffer 能表示的最大长度（超出时 readFileSync 抛 ERR_OUT_OF_RANGE，
+// 该异常既不带被读路径也不带实际大小）。与 maxStringLength 一样可由调用侧覆盖，供测试构造小夹具。
+const MAX_FILE_BYTES = bufferConstants.MAX_LENGTH
 const WHITESPACE = new Set([0x20, 0x09, 0x0a, 0x0d])
 
 // 从 i 起跳过空白，返回首个非空白位置
@@ -51,6 +55,8 @@ function readReportJson (reportPath, options = {}) {
   // F1：V8 字符串上限可被调用侧覆盖（默认 MAX_STRING_LENGTH）。生产调用方一律不传，
   // 该形参只为测试构造「剥离后仍超限」的输入——否则验证这条护栏需要一个 512MiB 级夹具。
   const maxStringLength = Number.isFinite(options && options.maxStringLength) ? options.maxStringLength : MAX_STRING_LENGTH
+  // F1：预读大小护栏上限，同样只由测试注入（生产默认即 Buffer 上限）。
+  const maxFileBytes = Number.isFinite(options && options.maxFileBytes) ? options.maxFileBytes : MAX_FILE_BYTES
   // nosemgrep: 工具脚本按 CLI 传入路径读取报告，路径非用户净输入
   // Trust Model（v3.266 强化）：readReportJson 是内部 API，期望 reportPath
   //   来自已校验目录——scripts/mutation-report.js 链中 fs.statSync(dir)
@@ -62,12 +68,29 @@ function readReportJson (reportPath, options = {}) {
   //   已先校验"对 analyze-artifacts.js 并不成立，此处据实修正口径）。
   // Codacy MEDIUM：path.resolve() 防御性 normalize（公开 API，不假设上游已校验）
   const abs = path.resolve(reportPath)
+  // F1：读取前的护栏——先 stat 拿到真实大小与文件类型，再决定是否整文件读入。
+  // 此前唯一的尺寸守卫（strippedLength > maxStringLength）落在 Buffer.concat 的分配峰值**之后**：
+  // 超限输入要先付出一次整份报告的分配才发现放不下；而且非普通文件（目录/FIFO/socket）会走
+  // readFileSync——目录抛不带路径的 EISDIR，FIFO 直接把进程挂在读上。
+  let stat
+  try {
+    stat = fs.statSync(abs)
+  } catch (err) {
+    throw new Error(`无法读取 ${abs}：${err.message}`)
+  }
+  if (!stat.isFile()) {
+    throw new Error(`无法读取 ${abs}：不是普通文件（目录/FIFO/socket 一律拒绝整文件读入）`)
+  }
+  if (stat.size > maxFileBytes) {
+    throw new Error(`报告文件 ${abs} 为 ${stat.size} 字节，超过预读上限 ${maxFileBytes} 字节：拒绝整文件读入`)
+  }
   let buf
   try {
     buf = fs.readFileSync(abs) // Buffer 读取，绕开字符串长度上限
   } catch (err) {
     // 读取阶段失败（ENOENT/EACCES/EISDIR 等）原生异常消息不含被读路径，这里补上上下文
     // （实测目录入参抛 EISDIR: illegal operation on a directory, read，无法定位是哪个报告）
+    // stat 与 read 之间文件仍可能被替换/删除（TOCTOU），故这段兜底保留。
     throw new Error(`无法读取 ${abs}：${err.message}`)
   }
   const chunks = []

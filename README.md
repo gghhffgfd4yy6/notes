@@ -4,7 +4,7 @@
 
 ## 安装与运行
 
-要求 Node.js `^22.22.2 || ^24.15.0 || >=26.0.0`（`re2` 原生模块的 `engines` 要求；`package.json` 的 `engines.node` 写 `>=22.22.2`，青龙入口 `--check` 的 Node 闸门按该下界完整比较——两段/三段版本都按数值比，低于下界即判红；常驻入口不硬拒启动，只在低于下界时告警。Node 23.x、24.0–24.14、25.x 不在 re2 支持范围内，安装或重建原生模块会失败）。
+要求 Node.js `^22.22.2 || ^24.15.0 || >=26.0.0`（`re2` 原生模块的 `engines` 要求；`package.json` 的 `engines.node` 写 `>=22.22.2`，青龙入口 `--check` 的 Node 闸门按该下界完整比较——两段/三段版本都按数值比，低于下界即判红；常驻入口不硬拒启动，只在低于下界时告警；测试前置的依赖预检 `scripts/check-deps.js` 同时校验仓库与 `re2` 两处 `engines`。Node 23.x、24.0–24.14、25.x 不在 re2 支持范围内，安装或重建原生模块会失败）。
 
 ```bash
 npm install --ignore-scripts
@@ -155,7 +155,7 @@ diagnostics: {
 
 ## 测试
 
-`npm test` 顺序执行全部 42 个套件（30 个单元 + 10 个集成 + 2 个变异行段元校验），前置检查 `got` 与 `re2` 就绪，缺任一即退出；集成套件多数已 mock，个别仍可能受运行环境/网络影响。`npm run test:unit` 只跑 30 个单元套件。
+`npm test` 顺序执行全部 42 个套件（30 个单元 + 10 个集成 + 2 个变异行段元校验），前置跑一遍依赖预检 `scripts/check-deps.js`：探测清单由 `package.json` 的 `dependencies`/`optionalDependencies` 派生（声明了却没装即失败，不再只认硬编码的 `got`/`re2`），区分「未安装」与「已安装但不可用」并输出根因，同时校验运行时 Node 版本是否满足 `engines.node` 与 `re2` 自身的（更严的）`engines.node`，任一不满足即退出；该脚本也可直接执行（`node scripts/check-deps.js`，按检查结果 exit 0/1）。集成套件多数已 mock，个别仍可能受运行环境/网络影响。`npm run test:unit` 只跑 30 个单元套件。
 
 ```bash
 npm run check                 # 总门禁：lint → 版本三方一致 → 变异行段校验 → npm test
