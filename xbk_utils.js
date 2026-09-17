@@ -471,9 +471,21 @@ function createUtils (options = {}) {
   // 旧实现把任意 `<` 当标签起始，未配对的 `<` 让区间一路延伸到串尾/下一个 `<`，把后方纯文本的
   // name="…" 判成「标签内属性」并整段占位，段内真实的 <img onerror> 随之绕过事件清洗直出网。
   //
-  // 返回 valueQuotes：正扫过程中处于「引号外」状态所遇到的各引号位置，即**真正开启一个属性值**
-  // 的引号。_protectAttrPairs 依赖它区分「属性值开启引号」与「未加引号值里的杂散引号」——
-  // 后者会把回扫出的伪属性对误判成可保护段，从而把后续真事件属性的属性名藏进占位符（P2-01）。
+  // 返回 valueQuotes：按 **HTML5 tag tokenizer 词法状态机**判定「真正开启一个属性值」的引号位置。
+  // _protectAttrPairs 依赖它区分「属性值开启引号」与「非赋值位置的杂散引号」——后者会把回扫出的
+  // 伪属性对误判成可保护段，从而把后续真事件属性的属性名藏进占位符（P2-01）。
+  //
+  // 旧实现是「标签内引号奇偶配对」启发式：把任何「处于引号外」状态遇到的引号都记成 value-open。
+  // 它有两类已实测失效（V1 打回）：
+  //   ① 未加引号属性值里的杂散引号：HTML5 在 attribute value (unquoted) 状态把 `"`/`'`/`<`/`=`
+  //      当普通字符 append 进值，它们**不开启引号值**。奇偶启发式下「偶数个」杂散引号让奇偶复原，
+  //      伪属性对的开启引号重新落回保护集（`<img foo=a"b"c=" onerror="alert(1)">` 修复后仍 LIVE）；
+  //   ② 未加引号属性值里的 `<`：HTML5 把它当普通字符（parse error 但 append 到值），
+  //      旧实现却 `break` 结束当前 span 并从该 `<` 重开一个，使 `<bar=" onerror="` 被当作标签内属性对
+  //      （P1-01：`<img foo=x<bar=" onerror="alert(1)">` 仍 LIVE）。
+  // 同时修掉旧启发式引入的假阳性：合法属性值内的 `on*` 文本被 `_stripEventAttrs` 误删
+  // （`<img a=x"b title="see onerror=x">` 的 title 值被截断）——状态机下 `title=` 后的引号
+  // 才是 value-open，整段被保护，值内文本不再暴露给事件清洗。
   _htmlTagSpans (html) {
     const spans = []
     const valueQuotes = new Set()
@@ -486,20 +498,71 @@ function createUtils (options = {}) {
       if (!/[A-Za-z/!?]/.test(html[i + 1] || '')) { i++; continue }
       const start = i
       i++
-      let quote = ''
+      // 简化状态机（只跟踪属性边界与引号状态，不解析属性名内容）：
+      //   tagName → beforeAttr → attrName → afterAttrName → beforeValue → valueDQ/valueSQ/valueUQ → afterValue
+      // 关键规则（均对照 HTML5 规范）：
+      //   · tagName：只有空白 / '/' 结束标签名；引号、'='、'<' 都是标签名字符；
+      //   · beforeAttr：空白/'/'保持；其余（含引号、'='）开启新属性名；
+      //   · attrName：空白→afterAttrName，'/'→beforeAttr，'='→beforeValue，其余（含引号/'<'）都是名字字符；
+      //   · afterAttrName：'='→beforeValue；其余非空白 → 重消费开启新属性名；
+      //   · beforeValue：跳过空白后，引号才是**真正的属性值开启引号**（记入 valueQuotes）；
+      //     非引号字符 → 未加引号值；
+      //   · valueUQ：空白结束值；'>' 结束标签；其余（含 '<'、'"'、'\''、'='）都是值的普通字符。
+      let state = 'tagName'
       while (i < n) {
         const ch = html[i]
-        if (quote) {
-          if (ch === quote) quote = ''
-        } else if (ch === '"' || ch === "'") {
-          quote = ch
-          valueQuotes.add(i)
-        } else if (ch === '>') {
+        if (state === 'valueDQ') {
+          if (ch === '"') state = 'afterValue'
           i++
-          break
-        } else if (ch === '<') {
-          break
+          continue
         }
+        if (state === 'valueSQ') {
+          if (ch === "'") state = 'afterValue'
+          i++
+          continue
+        }
+        if (state === 'valueUQ') {
+          if (ch === '>') { i++; break }
+          if (/\s/.test(ch)) state = 'beforeAttr'
+          i++
+          continue
+        }
+        if (ch === '>') { i++; break }
+        if (state === 'tagName') {
+          if (/\s/.test(ch) || ch === '/') state = 'beforeAttr'
+          i++
+          continue
+        }
+        if (state === 'beforeAttr') {
+          if (/\s/.test(ch) || ch === '/') { i++; continue }
+          state = 'attrName'
+          i++
+          continue
+        }
+        if (state === 'attrName') {
+          if (/\s/.test(ch)) state = 'afterAttrName'
+          else if (ch === '/') state = 'beforeAttr'
+          else if (ch === '=') state = 'beforeValue'
+          i++
+          continue
+        }
+        if (state === 'afterAttrName' || state === 'afterValue') {
+          if (/\s/.test(ch)) { i++; continue }
+          if (ch === '/') { state = 'beforeAttr'; i++; continue }
+          if (ch === '=' && state === 'afterAttrName') { state = 'beforeValue'; i++; continue }
+          state = 'attrName'
+          i++
+          continue
+        }
+        // state === 'beforeValue'
+        if (/\s/.test(ch)) { i++; continue }
+        if (ch === '"' || ch === "'") {
+          valueQuotes.add(i)
+          state = ch === '"' ? 'valueDQ' : 'valueSQ'
+          i++
+          continue
+        }
+        state = 'valueUQ'
         i++
       }
       spans.push([start, i])
