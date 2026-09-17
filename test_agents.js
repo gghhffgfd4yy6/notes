@@ -39,6 +39,9 @@ dns.lookup = (hostname, options, callback) => {
   // AGENTS-02：超时（ETIMEDOUT）同样失效——重试窗口（got 1s/2s）远短于 60s TTL，超时很可能就是缓存
   // 里那个地址已不可达，不清缓存则整个重试窗口反复复用同一失效地址。此处必为 true（旧口径 false）。
   assert.strictEqual(shouldInvalidateDns({ code: 'ETIMEDOUT' }), true, '超时应失效 DNS（AGENTS-02）')
+  // AGENTS-08：证书主机名不匹配与「缓存里的 IP 已失效」无关（xbk_failure_policy 已按 PERMANENT 归类），
+  // 不得当 DNS 失效码——否则每次重试都白清一次缓存并重新解析，而问题依旧。此处必为 false（旧口径 true）。
+  assert.strictEqual(shouldInvalidateDns({ code: 'ERR_TLS_CERT_ALTNAME_INVALID' }), false, '证书主机名不匹配不应失效 DNS（AGENTS-08）')
   assert.strictEqual(shouldInvalidateDns({}), false, '无 code 不应失效')
   assert.strictEqual(shouldInvalidateDns(null), false, 'null 不应失效')
   assert.strictEqual(shouldInvalidateDns(undefined), false, 'undefined 不应失效')
@@ -93,6 +96,31 @@ dns.lookup = (hostname, options, callback) => {
       process.nextTick(() => cb(null, '127.0.0.1', 4))
     }
     console.log('✅ AGENTS-02：ETIMEDOUT 清理 DNS 缓存后重试窗口重新解析')
+  }
+
+  // AGENTS-08 行为断言：证书主机名不匹配不得清 DNS 缓存（旧口径会把缓存清掉、重试白解析一次）
+  {
+    const certHost = 'cert-invalidate-probe.invalid'
+    let certLookups = 0
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      certLookups += 1
+      process.nextTick(() => cb(null, '192.0.2.11', 4))
+    }
+    await new Promise((resolve, reject) => dnsLookup(certHost, {}, (e) => e ? reject(e) : resolve()))
+    assert.strictEqual(certLookups, 1, '首次解析应走底层')
+    assert.strictEqual(
+      invalidateDnsForError({ code: 'ERR_TLS_CERT_ALTNAME_INVALID' }, `https://${certHost}/api`),
+      false,
+      '证书错误不应触发 DNS 失效（AGENTS-08）'
+    )
+    await new Promise((resolve, reject) => dnsLookup(certHost, {}, (e) => e ? reject(e) : resolve()))
+    assert.strictEqual(certLookups, 1, '证书错误后缓存应仍然有效（旧口径此处为 2）')
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      process.nextTick(() => cb(null, '127.0.0.1', 4))
+    }
+    console.log('✅ AGENTS-08：证书主机名不匹配不再清 DNS 缓存')
   }
 
   // 场景 1：缓存未命中 → 真实解析后回调，且第二次调用命中缓存（更快）

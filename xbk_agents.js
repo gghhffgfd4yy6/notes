@@ -20,9 +20,12 @@ const DNS_TTL_MS = 60000
 const DNS_ERROR_TTL_MS = 1000
 // AGENTS-02：含 ETIMEDOUT——连接/请求超时（重试窗口 1s/2s 远短于 60s TTL）很可能就是缓存里那个地址
 // 已不可达，不清缓存会让整个重试窗口反复复用同一失效地址。失效代价只是下一次多一次系统解析。
+// AGENTS-08：不含 ERR_TLS_CERT_ALTNAME_INVALID——证书主机名不匹配是服务端证书/域名的确定性配置问题
+// （xbk_failure_policy.js 已把它按 PERMANENT 归类），与「缓存里的 IP 已失效」无关；把它当 DNS 失效码
+// 只会让每次重试白清一次缓存并重新解析，问题依旧。指示地址可能失效的是网络层错误码（连接/解析类）。
 const DNS_INVALIDATION_CODES = new Set([
   'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH',
-  'ENOTFOUND', 'EAI_AGAIN', 'ERR_SOCKET_CLOSED', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ETIMEDOUT'
+  'ENOTFOUND', 'EAI_AGAIN', 'ERR_SOCKET_CLOSED', 'ETIMEDOUT'
 ])
 const dnsCache = new Map()
 const dnsPending = new Map()
