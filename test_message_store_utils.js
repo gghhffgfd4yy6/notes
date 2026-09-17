@@ -624,4 +624,80 @@ check('F-02: 批量未命中不得每次重建索引（每数组版本至多一�
   assert.ok(builds <= 2, `500 次未命中最多重建 1~2 次，实际 ${builds} 次（每次未命中都重建 = O(n²)，B8 实测打死热路径）`)
 })
 
+// ===== F-02 残留（R6：W2 实测 missVerified 跨数组版本粘滞）=====
+// 反例（W2，4 步）：① 预热索引 → ② 原位替换非首元素 → ③ 查一个不存在的身份（本数组版本**首次**
+// 未命中 ⇒ 全量复检并把 missVerified 置真）→ ④ 再原位替换同一位置、只查被替换者。
+// 修复前：index 命中候选复检落空、索引层不含新身份、missVerified 已粘滞为真 ⇒ 不再重建，
+// has() 对**数组里确实存在**的身份恒定返回 false，且此后永不恢复（自愈设计意图被破坏）。
+// 方向是「多推」侧（SYSTEM_CONTRACT 允许），但仍与线性扫描 oracle 不一致，故必须闭合。
+check('F-02 残留: 未命中重建后再原位替换非首元素，has 必须自愈（W2 4 步反例）', () => {
+  const arr = [{ id: 'w1' }, { id: 'w2' }, { id: 'w3' }]
+  const name = seedIdentityProbe(arr, 'f02_sticky.json')
+  assert.strictEqual(identityStore.has({ id: 'w1' }, name), true, '前置：预热索引')
+  arr[1] = { id: 'w2b' }
+  assert.strictEqual(identityStore.has({ id: 'zzz-absent' }, name), false, '第③步：不存在的身份判否（触发首次未命中复检，missVerified 置真）')
+  assert.strictEqual(identityStore.has({ id: 'w2b' }, name), true, '前置：替换后的身份可见')
+  arr[1] = { id: 'w2c' }
+  for (let round = 1; round <= 3; round++) {
+    const got = identityStore.has({ id: 'w2c' }, name)
+    const oracle = identityStore._indexHasIdentityDirect(arr, { id: 'w2c' })
+    assert.strictEqual(got, oracle, `第 ${round} 次查询 has()=${got} 必须等于 oracle=${oracle}（粘滞漏判即红）`)
+  }
+  assert.strictEqual(identityStore.has({ id: 'w2c' }, name), true, '数组里确实存在 w2c：不得恒定 false（粘滞未闭合）')
+})
+
+check('F-02 残留: 同族变体——字段级原位改写 + 首元素替换 + 扩容后只查新身份', () => {
+  const arr = [{ id: 'v1', url: 'https://v.example/1' }, { id: 'v2', url: 'https://v.example/2' }, { id: 'v3' }]
+  const name = seedIdentityProbe(arr, 'f02_sticky_forms.json')
+  assert.strictEqual(identityStore.has({ id: 'v1' }, name), true, '前置：预热索引')
+  assert.strictEqual(identityStore.has({ id: 'absent-1' }, name), false, '前置：先置 missVerified')
+  // 同族形态逐条对拍：字段级改写、首元素替换、长度不变的原位改写、追加
+  const forms = [
+    { label: 'arr[2].id 字段改写', mutate: (a) => { a[2].id = 'v3-new' }, probes: [{ id: 'v3-new' }, { id: 'v3' }] },
+    { label: 'arr[0] 首元素整体替换', mutate: (a) => { a[0] = { id: 'v1-new', url: 'https://v.example/1' } }, probes: [{ id: 'v1-new' }, { id: 'v1' }] },
+    { label: 'arr[1].url 字段改写', mutate: (a) => { a[1].url = 'https://v.example/2-new' }, probes: [{ url: 'https://v.example/2-new' }, { url: 'https://v.example/2' }] },
+    { label: 'push 追加（长度变化）', mutate: (a) => { a.push({ id: 'v9' }) }, probes: [{ id: 'v9' }] }
+  ]
+  for (const form of forms) {
+    form.mutate(arr)
+    for (const p of form.probes) {
+      const got = identityStore.has(p, name)
+      const oracle = identityStore._indexHasIdentityDirect(arr, p)
+      assert.strictEqual(got, oracle,
+        `${form.label}：has()=${got} 必须等于 oracle=${oracle}（probe=${JSON.stringify(p)}；true 侧不符即漏推）`)
+    }
+  }
+})
+
+check('F-02 残留: 大数组原位替换的自愈有上界（旋转抽查一轮内必须恢复，不得永不恢复）', () => {
+  const n = 200
+  const arr = []
+  for (let i = 0; i < n; i++) arr.push({ id: 'big-' + i })
+  const name = seedIdentityProbe(arr, 'f02_heal.json')
+  assert.strictEqual(identityStore.has({ id: 'big-0' }, name), true, '前置：索引已建立')
+  assert.strictEqual(identityStore.has({ id: 'absent-0' }, name), false, '前置：先置 missVerified（复现粘滞前提）')
+  const realBuild = identityStore._buildIdentityIndex
+  let builds = 0
+  identityStore._buildIdentityIndex = function (...args) { builds += 1; return realBuild.apply(this, args) }
+  try {
+    arr[100] = { id: 'big-100-new' } // 非首元素整体替换：引用/长度/首元素引用都看不出
+    // 引用层抽查窗宽 32 ⇒ 一轮 ceil(200/32)=7 次未命中即可覆盖到第 100 位，取 8 为硬上界
+    // （**写成字面量**：若写成 ceil(n/WINDOW) 而 WINDOW 被靶向改 0 会得到 Infinity，测试会挂死而不是变红）
+    const bound = 8
+    let healed = false
+    for (let k = 0; k < bound; k++) {
+      if (identityStore.has({ id: 'big-100-new' }, name)) { healed = true; break }
+    }
+    assert.ok(healed, `引用层抽查必须在 ${bound} 次未命中内自愈（否则粘滞未闭合；窗宽 32 ⇒ ceil(${n}/32)=7）`)
+    // 自愈代价必须仍是「每轮至多一次重建」，不能退化成每次未命中都重建
+    assert.ok(builds <= 3, `自愈过程的重建次数须有界（每轮抽查至多一次），实际 ${builds} 次`)
+  } finally {
+    identityStore._buildIdentityIndex = realBuild
+  }
+  for (const p of [{ id: 'big-100-new' }, { id: 'big-100' }, { id: 'big-0' }]) {
+    assert.strictEqual(identityStore.has(p, name), identityStore._indexHasIdentityDirect(arr, p),
+      `自愈后 has 仍须与线性扫描 oracle 一致（probe=${JSON.stringify(p)}）`)
+  }
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

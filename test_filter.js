@@ -9237,6 +9237,41 @@ console.log('========================================\n');
     assertEqual(builds <= 2, true, `1000 次未命中最多重建 1~2 次索引，实际 ${builds} 次（每次未命中都重建 = O(n²)，B8 实测打死热路径）`)
   })
 
+  // R6（W2 实测残留）：`missVerified` 跨数组版本**粘滞**——索引重建（未命中复检）之后再原位替换
+  // 非首元素、且只查被替换者时，索引层不含新身份、命中候选复检落空、missVerified 已为真 ⇒ 不再重建，
+  // has() 对**数组里确实存在**的身份恒定返回 false 且永不恢复（自愈设计意图被破坏；方向是多推侧，
+  // 但同样与线性扫描 oracle 不一致）。修法：未命中路径补两条旋转抽查窗（引用层 32 位置 / 身份层
+  // 2 位置；n <= 8 时覆盖全表 ⇒ 首次未命中即精确）。两条窗都停掉时本条真红。
+  await test('B8-F-02: 未命中重建后再原位替换非首元素，has 必须自愈（W2 粘滞反例）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f02_sticky.json'
+    const fp = getFilePath(name)
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    saveMessages(fp, [{ id: 'st-a' }, { id: 'st-b' }, { id: 'st-c' }])
+    const arr = readMessages(fp)
+    const oracle = (m) => MessageStore._indexHasIdentityDirect(arr, m)
+    try {
+      assertEqual(isMessageInFile({ id: 'st-a' }, name), true, '前置：预热索引')
+      arr[1] = { id: 'st-b2' }
+      assertEqual(isMessageInFile({ id: 'st-absent' }, name), false, '第③步：不存在的身份判否（触发首次未命中复检，missVerified 置真）')
+      assertEqual(isMessageInFile({ id: 'st-b2' }, name), true, '前置：替换后的身份可见')
+      arr[1] = { id: 'st-b3' }
+      for (let round = 1; round <= 3; round++) {
+        const got = isMessageInFile({ id: 'st-b3' }, name)
+        assertEqual(got, oracle({ id: 'st-b3' }), `第 ${round} 次查询 has()=${got} 必须等于 oracle（恒 false = 粘滞漏判，即 W2 反例）`)
+      }
+      // 同族变体：再次原位改写（含字段级改写）后仍须与 oracle 一致
+      arr[1] = { id: 'st-b4' }
+      arr[2] = { id: 'st-c', url: 'https://st.example/c2' }
+      for (const p of [{ id: 'st-b4' }, { id: 'st-b2' }, { id: 'st-c' }, { url: 'https://st.example/c2' }]) {
+        const got = isMessageInFile(p, name)
+        assertEqual(got, oracle(p), `probe=${JSON.stringify(p)}：has()=${got} 必须等于 oracle=${oracle(p)}`)
+      }
+    } finally {
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('B8-F7: getFileName 不给缓存目录生成隐藏文件（末段以点开头）', () => {
     assertEqual(getFileName('https://example.com/.hidden'), 'url_.hidden.json', '末段 .hidden 应加前缀，避免生成隐藏文件')
     assertEqual(getFileName('https://example.com/.json'), 'url_.json', '末段 .json 应加前缀')
