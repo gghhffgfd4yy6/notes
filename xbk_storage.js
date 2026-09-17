@@ -71,18 +71,33 @@ function writeAtomicIfAbsent (filePath, text, label = '缓存初始化') {
   // v3.263（CodeAnt）：独占创建（wx）——仅当文件不存在时才写入。writeAtomic 的 tmp+rename 会
   // 无条件替换目标文件，初始化场景若在检查与写入之间另一进程已创建有效缓存，会把新文件覆盖成
   // [] 丢失判重记录；wx 语义下并发创建只会得到 EEXIST，视为初始化成功不覆盖。
+  //
+  // 审查 STG-02：wx 直写真实路径没有原子提交点（无 tmp+rename），写入中断会在缓存路径留下半写
+  // 文件；而消费侧 xbk_message_store._ensureFileExists 以 existsSync 早退，残骸于是永久不自愈。
+  // 本机 FUSE 不支持硬链接（linkSync EACCES），无法用「tmp + link 提交」补齐原子性，故此处修
+  // 可控的一半：以 wx 打开确认「文件由本次调用创建」后，任何写失败都在 catch 里删除该残骸，
+  // 让下次调用（或下次 existsSync 判定）能重新初始化，而不是把坏文件当成「已初始化」。
   if (!isRegularOrMissing(filePath)) {
     console.error(`拒绝写入非普通文件 ${label} ${filePath}`)
     return false
   }
+  let fd = -1
   try {
     ensureParent(filePath)
-    fs.writeFileSync(filePath, text, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+    // wx 打开成功即证明该文件由本次调用创建；EEXIST 时 openSync 抛错、fd 仍为 -1，不会误删他人文件。
+    fd = fs.openSync(filePath, 'wx', 0o600)
+    fs.writeFileSync(fd, text, { encoding: 'utf8' })
     return true
   } catch (e) {
     if (e?.code === 'EEXIST') return true // 另一进程已创建：不覆盖，视为初始化成功
+    if (fd >= 0) {
+      // 清理半写残骸（可能是本次写入的部分内容，也可能是空文件）；失败只告警，不影响返回语义。
+      try { fs.unlinkSync(filePath) } catch (e2) { console.warn(`${label}半写残骸清理失败 ${filePath}:`, e2.message) }
+    }
     console.error(`${label}写入失败 ${filePath}:`, e.message)
     return false
+  } finally {
+    if (fd >= 0) { try { fs.closeSync(fd) } catch (e) { /* 忽略 */ } }
   }
 }
 

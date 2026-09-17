@@ -94,6 +94,27 @@ const {
   // 写入目录路径应失败
   assert.strictEqual(writeAtomicIfAbsent(dirPath, 'x'), false, '写入目录路径应返回 false')
 
+  // ===== STG-02：写失败必须清理本次调用创建的半写残骸 =====
+  // 旧实现 wx 直写真实路径，写中途失败（ENOSPC 等）把半写文件留在缓存路径；消费侧
+  // xbk_message_store._ensureFileExists 以 existsSync 早退，坏文件被当成「已初始化」→ 永久不自愈。
+  const partial = make('partial.txt')
+  const origWriteFileSync = fs.writeFileSync
+  fs.writeFileSync = (target, ...rest) => {
+    if (typeof target !== 'number') return origWriteFileSync(target, ...rest)
+    origWriteFileSync(target, 'half') // 模拟「已写入半份内容，随后设备写满」
+    throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+  }
+  let partialRet
+  try { partialRet = writeAtomicIfAbsent(partial, 'full-payload') } finally { fs.writeFileSync = origWriteFileSync }
+  assert.strictEqual(partialRet, false, '写失败应返回 false')
+  assert.strictEqual(fs.existsSync(partial), false, '写失败后不得留下半写残骸（否则 existsSync 早退使缓存永久不自愈）')
+
+  // 反向对照：EEXIST（另一进程已创建）不得被「清理残骸」误删——那是别人的有效缓存
+  const keep = make('keep.txt')
+  fs.writeFileSync(keep, 'first')
+  assert.strictEqual(writeAtomicIfAbsent(keep, 'second'), true, '已存在文件应返回 true（EEXIST 视为初始化成功）')
+  assert.strictEqual(fs.readFileSync(keep, 'utf8'), 'first', 'EEXIST 时不得清理/覆盖已存在的有效文件')
+
   // ===== readSafeTextResult =====
   // 不存在 → missing
   const r1 = readSafeTextResult(make('missing.txt'))
