@@ -89,3 +89,11 @@ function checkDependencies ({ resolve = require.resolve, load = require } = {}) 
 }
 
 module.exports = { checkDependencies }
+
+// F2：此前没有 CLI 守卫——`node scripts/check-deps.js` 只加载模块、不执行任何检查，
+// 于是「直接执行」这个入口永远 exit 0 且零输出（fail-open：把它挂进脚本链/CI 步骤时会静默放行）。
+// 直接执行时跑一次检查并把结果落到退出码（用 process.exitCode 而非 process.exit，管道场景不丢输出）；
+// 失败原因已由检查自身写到 stderr，成功路径保持静默（成功不产出噪声）。
+if (require.main === module) {
+  process.exitCode = checkDependencies() ? 0 : 1
+}

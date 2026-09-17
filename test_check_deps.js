@@ -1,7 +1,41 @@
 'use strict'
 // checkDependencies 单元测试：验证「缺少依赖」与「已安装但不可用」分支的判定与提示。
 // 通过注入 mock 的 resolve/load 模拟不同环境，不依赖本机实际安装状态。
+// 另有一组「直接执行脚本」的沙箱用例：在临时目录里复制真实实现 + 自造 node_modules，
+// 走默认参数（生产路径）与 CLI 退出码，不受本机依赖树影响。
+const { spawnSync } = require('node:child_process')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 const { checkDependencies } = require('./scripts/check-deps')
+
+// 沙箱：<dir>/package.json（可控声明清单）+ <dir>/scripts/check-deps.js（复制真实实现）
+// + <dir>/node_modules/<name>/{package.json,index.js}。ROOT 由实现自算为 <dir>。
+function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [] }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-deps-sandbox-'))
+  fs.mkdirSync(path.join(dir, 'scripts'))
+  fs.copyFileSync(path.join(__dirname, 'scripts', 'check-deps.js'), path.join(dir, 'scripts', 'check-deps.js'))
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(manifest))
+  for (const name of deps) {
+    const pkgDir = path.join(dir, 'node_modules', name)
+    fs.mkdirSync(pkgDir, { recursive: true })
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.js' }))
+    fs.writeFileSync(path.join(pkgDir, 'index.js'), 'module.exports = {}\n')
+  }
+  // brokenDeps：落在 <dir>/scripts/node_modules/ 下——同名包在「以 scripts/ 为基准」的
+  // 解析下会先命中且 require 即抛错，用于固定「解析基准必须与 resolve 同为项目根」这条契约。
+  for (const name of brokenDeps) {
+    const pkgDir = path.join(dir, 'scripts', 'node_modules', name)
+    fs.mkdirSync(pkgDir, { recursive: true })
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.js' }))
+    fs.writeFileSync(path.join(pkgDir, 'index.js'), 'throw new Error("BROKEN_IN_SCRIPTS_TREE")\n')
+  }
+  return dir
+}
+
+function runCheckDepsSandbox (dir) {
+  return spawnSync(process.execPath, [path.join(dir, 'scripts', 'check-deps.js')], { encoding: 'utf8', cwd: dir })
+}
 
 function fakeRe2Class ({ ok = true } = {}) {
   return class MockRE2 {
@@ -128,6 +162,24 @@ test('re2 探针匹配失败（test 返回 false）→ 归为 broken', () => {
     if (ok !== false) throw new Error(`期望 false，实际 ${ok}`)
   })
   if (!out.includes('依赖已安装但不可用：re2')) throw new Error(`探针失败应提示不可用: ${out}`)
+})
+
+// F2 回归：脚本此前没有 require.main 守卫——`node scripts/check-deps.js` 只加载模块、不跑检查，
+// 于是「直接执行」永远 exit 0 且零输出（挂进脚本链就是一条假绿步骤）。沙箱里的依赖名刻意不存在
+// （也不存在于任何祖先 node_modules），保证「缺依赖 → 非 0 退出 + stderr 有原因」可被确定性断言。
+test('F2 直接执行脚本：缺依赖必须非 0 退出并输出原因（此前恒 exit 0 且零输出）', () => {
+  const dir = makeCheckDepsSandbox({
+    manifest: { name: 'sandbox', version: '1.0.0', dependencies: { 'xbk-missing-dep-xyz': '1.0.0' } }
+  })
+  try {
+    const r = runCheckDepsSandbox(dir)
+    if (r.status === 0) throw new Error(`缺依赖必须非 0 退出（此前无守卫恒 0），实际 status=${r.status}`)
+    if (!String(r.stderr).includes('缺少依赖')) {
+      throw new Error(`stderr 必须给出缺失依赖的原因，实际: ${JSON.stringify(r.stderr)}`)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 console.log('========================================')
