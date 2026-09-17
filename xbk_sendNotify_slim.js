@@ -896,6 +896,12 @@ function parseWxPusherChannels () {
     return appToken && topicIds.length ? { appToken, topicIds } : null
   }).filter(Boolean)
   if (channels.length) {
+    // F4（V4 打回）：逐项过滤后只要还剩一项就提前返回——被过滤掉的项此前完全无留痕，
+    // 于是混合数组 [合法A, 缺 topicIds 的B] 只联系 APP_A 却 warn=0（对照：两个合法应用会被分别联系）。
+    // 此处把「被丢弃项数」纳入判据：部分丢弃同样必须告警。
+    if (list.length !== channels.length) {
+      console.warn(`⚠️ WX_pusher_channels 的 ${list.length - channels.length} 项缺 appToken 或 topicIds，已丢弃；仅启用其余 ${channels.length} 项`)
+    }
     wxPusherParsedConfigKey = configKey
     wxPusherParsedChannels = channels
     return channels
@@ -1533,6 +1539,18 @@ async function sendNotify (text, desp, params = {}) {
       try { desp = cleanSurrogates(desp + '\n\n' + (await one())) } catch (e) { console.log('一言获取失败，跳过:', safeErr(e)) }
     }
   }
+  // P1（跨批协同，high）：出口清洗门槛必须与内容渲染判定作用于【同一份】串。
+  // xbk_pusher.js 的出口清洗发生在 slim 追加一言【之前】，而渲染判定（looksHtml → wxpusher
+  // contentType=2）发生在追加【之后】：HITOKOTO=true 且一言文本含 HTML 形态时，出口门槛看到的是
+  // 拼接前的纯文本（判非 HTML ⇒ 不清洗），渲染侧看到的是拼接后的串（判 HTML ⇒ contentType=2），
+  // 未清洗的主动 HTML 原样出网。此处把同一门槛 + 同一清洗顺序（先解实体再清洗，与
+  // xbk_pusher.js:54 完全一致）下沉到「所有 desp 改写之后」——任何可能被渲染成 HTML 的串在进入
+  // 通道前都已清洗，从结构上消除两处判定不同步。纯文本/Markdown（无 HTML 形态）不受影响；
+  // pushplus 自己的清洗幂等且作用在 mdToPlain 之后，行为不变。
+  if (looksHtml(desp)) {
+    const utils = shared()
+    desp = utils.sanitizeDecodedHtml(utils.decodeHtmlEntities(desp))
+  }
   // 只启动已配置通道：未配置通道原本虽会立即 resolve，但每条消息仍会创建函数/Promise/对象。
   // 保持数组顺序与 configuredFlags 一致，便于失败统计和后续扩展。
   const channelTasks = [
@@ -1547,8 +1565,29 @@ async function sendNotify (text, desp, params = {}) {
     [configuredFlags[8], 'telegram', () => tgNotify(text, desp, params)]
   ]
   const enabledTasks = channelTasks.filter(([enabled]) => enabled)
+  // P3（跨批协同，low）：向调用方（Pusher）透出本次 sendNotify 的「在飞/已结算通道」状态。
+  // Pusher 的整体超时（10s race）会在 slim 的 Promise.allSettled 尚未 settle 时触发，此前只能按
+  // 静态配置清单把【所有】配置通道都标成 PUSH_TIMEOUT（含已成功通道）；有了在飞清单，超时归因
+  // 可以只指向真正未结算的通道。
+  // 契约：可选 params.inFlightTracker（对象）——启动通道任务前写入 pending（未结算通道名数组），
+  // 每个通道 settle 时从 pending 移除。不传 tracker 时零副作用（既有调用方行为逐字不变）。
+  // 同步抛错的通道保持既有语义（旧实现里会从 map 直接抛出），此时也把该通道从 pending 移除。
+  const inFlightTracker = params && params.inFlightTracker && typeof params.inFlightTracker === 'object'
+    ? params.inFlightTracker
+    : null
+  const pendingChannels = inFlightTracker ? enabledTasks.map(([, name]) => name) : null
+  if (inFlightTracker) inFlightTracker.pending = pendingChannels
+  const trackSettle = (name) => {
+    const idx = pendingChannels.indexOf(name)
+    if (idx !== -1) pendingChannels.splice(idx, 1)
+  }
   const results = await Promise.allSettled(
-    enabledTasks.map(([, , task]) => task())
+    enabledTasks.map(([, name, task]) => {
+      if (!pendingChannels) return task()
+      let running
+      try { running = task() } catch (e) { trackSettle(name); throw e }
+      return Promise.resolve(running).finally(() => trackSettle(name))
+    })
   )
   const normalizeFailure = (reason, channel) => {
     if (reason && typeof reason === 'object' && reason.channel === channel) return reason

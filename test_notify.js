@@ -11,6 +11,7 @@ const gotPath = require.resolve('got')
 require(gotPath)
 
 let gotCalls = []
+let hitokotoText = '测试一言' // 一言成功时的 hitokoto 文本（P1 回归：可注入 HTML 形态以复现「拼接后判 HTML」）
 let failHitokoto = false // 一言接口失败开关（v3.73：验证 sendNotify 兜底跳过不崩）
 let failHitokotoMsg = '' // 一言失败时的自定义异常文案（v3.273：断言失败日志经 safeErr 脱敏）
 let failHitokotoStruct = false // 一言响应结构异常开关（v3.86：缺 hitokoto 字段）
@@ -26,19 +27,21 @@ let catchRespLeak = false // logErr 修复后补充回归：响应结构异常�
 let failMDevSecond = false // v3.166：Bark/PushMe 多设备第 2 个失败（至少一个成功=通道成功不重试）
 let mdevCount = 0 // 多设备计数（failMDevSecond 时按调用序第 1 成功第 2 失败）
 let syncPostThrow = false // got.post 同步构造异常
+let hangWxpusher = false // P3：wxpusher 请求永不 settle（模拟「仍在飞」的通道）
 require.cache[gotPath].exports = (url, options) => {
   gotCalls.push({ url, options })
   // 一言接口失败模拟：抛 Error（网络异常路径）
   if (failHitokoto && String(url).includes('hitokoto.cn')) throw new Error(failHitokotoMsg || '一言服务不可用')
   // 一言接口返回对象 body（模拟真实 got 自动 JSON 解析），其余返回字符串
   const body = String(url).includes('hitokoto.cn')
-    ? (failHitokotoStruct ? { hitokoto: 'x' } : { hitokoto: '测试一言', from: '源' }) // 结构异常=缺 from（v3.87）
+    ? (failHitokotoStruct ? { hitokoto: 'x' } : { hitokoto: hitokotoText, from: '源' }) // 结构异常=缺 from（v3.87）
     : '{}'
   return { then: (res) => res({ body, statusCode: 200, headers: {} }) }
 }
 require.cache[gotPath].exports.get = require.cache[gotPath].exports
 require.cache[gotPath].exports.post = (url, options) => {
   gotCalls.push({ url, options })
+  if (hangWxpusher && String(url).includes('wxpusher')) return { then: () => {} } // 永不 settle
   if (syncPostThrow) throw new Error('sync request construction failure')
   // 失败模拟（v3.75）：异步 reject 走 $.post 的 err 回调；response.body 含密钥回显（验证不再传给 callback）
   if (failPost) {
@@ -421,6 +424,78 @@ console.log('========================================\n');
         `无HTML标签应保持Markdown(contentType=3): ${gotCalls[0].options.json.contentType}`)
   }))
 
+  // 6d. F4（V4 打回）：混合数组的部分丢弃必须留痕——被丢弃项先前完全静默。
+  // 端到端看「实际被联系的应用」：混合数组只应联系合法项，且必须恰好告警 1 次；
+  // 对照（两个合法项）会分别联系两个应用 —— 证明被丢弃项本应被联系，静默即缺陷。
+  await test('F4：WX_pusher_channels 混合数组部分丢弃 → 告警 1 次且只联系合法应用', () => withChannels(async () => {
+    const warns = []; const oldWarn = console.warn
+    console.warn = (...args) => warns.push(args.join(' '))
+    try {
+      cfg.WX_pusher_channels = JSON.stringify([{ appToken: 'APP_A', topicIds: '1' }, { appToken: 'APP_B' }])
+      await notify.sendNotify('标题', '内容')
+      await notify.sendNotify('标题2', '内容2')
+    } finally {
+      console.warn = oldWarn
+    }
+    const apps = gotCalls.filter(c => c.url.includes('wxpusher')).map(c => c.options.json.appToken)
+    assert(apps.join(',') === 'APP_A,APP_A', `只有合法应用可被联系，实际 ${apps.join(',')}`)
+    assert(warns.filter(w => w.includes('WX_pusher_channels')).length === 1,
+      `部分丢弃必须恰好告警 1 次（修复前为 0），实际 ${JSON.stringify(warns)}`)
+    // 对照组：两个合法应用经轮转被分别联系（证明 APP_B 本应被联系，静默丢弃即缺陷）
+    warns.length = 0
+    reset()
+    cfg.WX_pusher_channels = JSON.stringify([{ appToken: 'APP_A', topicIds: '1' }, { appToken: 'APP_B', topicIds: '2' }])
+    await notify.sendNotify('标题', '内容')
+    await notify.sendNotify('标题2', '内容2')
+    const apps2 = gotCalls.filter(c => c.url.includes('wxpusher')).map(c => c.options.json.appToken)
+    assert(apps2.join(',') === 'APP_A,APP_B', `对照组合法应用应经轮转分别联系，实际 ${apps2.join(',')}`)
+    assert(warns.length === 0, `对照组不得告警，实际 ${JSON.stringify(warns)}`)
+  }))
+
+  // P3（跨批协同，low）：slim 必须经 params.inFlightTracker 透出「在飞/已结算通道」状态
+  // （Pusher 超时归因的数据源）。已结算通道必须被移除，未结算通道必须保留。
+  await test('P3 slim 经 inFlightTracker 透出在飞通道并在结算时移除', () => withChannels(async () => {
+    cfg.BARK_PUSH = 'https://api.day.app/dev1'
+    cfg.WX_pusher_appToken = 'AT_HANG'
+    cfg.WX_pusher_topicIds = '1'
+    hangWxpusher = true
+    const tracker = {}
+    const pending = notify.sendNotify('标题', '内容', { inFlightTracker: tracker })
+    try {
+      await new Promise(resolve => setTimeout(resolve, 60)) // 让可结算的 bark 走完
+      assert(Array.isArray(tracker.pending), `必须回填 pending 数组: ${JSON.stringify(tracker.pending)}`)
+      assert(!tracker.pending.includes('bark'), `已结算通道必须被移除: ${JSON.stringify(tracker.pending)}`)
+      assert(tracker.pending.includes('wxpusher'), `在飞通道必须保留: ${JSON.stringify(tracker.pending)}`)
+    } finally {
+      hangWxpusher = false
+    }
+    assert(pending && typeof pending.then === 'function', 'sendNotify 仍返回 promise')
+  }))
+
+  // P3 端到端：真实 slim + 真实 Pusher（仅 got 被桩掉）。bark 已成功、wxpusher 仍在飞时整体超时，
+  // 归因必须只指向 wxpusher——修复前会把 bark 一起标成 PUSH_TIMEOUT（通道健康统计被污染）。
+  await test('P3 端到端：超时归因只指向在飞通道（已成功通道不得被标失败）', () => withChannels(async () => {
+    const xbk = require('./xbk_function_v3.js')
+    const originalSetTimeout = global.setTimeout
+    cfg.BARK_PUSH = 'https://api.day.app/dev1'
+    cfg.WX_pusher_appToken = 'AT_HANG'
+    cfg.WX_pusher_topicIds = '1'
+    hangWxpusher = true
+    // 只缩短 Pusher 的 10s 整体超时定时器，其余 setTimeout 语义原样保留
+    global.setTimeout = (fn, ms, ...args) => (ms === 10000 ? originalSetTimeout(fn, 60) : originalSetTimeout(fn, ms, ...args))
+    let err = null
+    try {
+      await xbk.Pusher.send('标题', '内容', notify)
+    } catch (e) { err = e } finally {
+      hangWxpusher = false
+      global.setTimeout = originalSetTimeout
+    }
+    assert(err && err.code === 'PUSH_TIMEOUT', `必须超时（code=PUSH_TIMEOUT）: ${err && err.message}`)
+    const chans = err.failures.map(f => f.channel)
+    assert(chans.includes('wxpusher'), `在飞通道应被归因: ${JSON.stringify(chans)}`)
+    assert(!chans.includes('bark'), `已成功结算的通道不得被标为超时失败: ${JSON.stringify(chans)}`)
+  }))
+
   // 7. PushMe（修复后新接入）
   await test('PushMe: 多 key # 分割 + type markdown', () => withChannels(async () => {
     cfg.PUSHME_KEY = 'k1#k2'
@@ -634,6 +709,62 @@ console.log('========================================\n');
     } finally {
       failHitokotoStruct = false
     }
+  }))
+
+  // P1（跨批协同，high）：一言在【Pusher 出口清洗之后】被拼接，导致两处判定不同步——
+  // Pusher 出口看到的 desp 是 'plain text'（判非 HTML ⇒ 不清洗），而 wxpusher 的 contentType 判定
+  // 看到的是拼接后的串（判 HTML ⇒ contentType=2）→ 未清洗的 onerror 原样出网。
+  // 端到端口径：真实 slim + 真实 Pusher（仅本文件桩掉 got），断言出网 JSON。
+  await test('P1 一言携带 HTML：清洗必须下沉到拼接之后（contentType=2 且 onerror 不存活）', () => withChannels(async () => {
+    const xbk = require('./xbk_function_v3.js')
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '1'
+    cfg.HITOKOTO = 'true'
+    hitokotoText = '<img src=x onerror=alert(1)>'
+    try {
+      await xbk.Pusher.send('标题', 'plain text', notify)
+    } finally {
+      hitokotoText = '测试一言'
+    }
+    const c = gotCalls.find(x => x.url.includes('wxpusher'))
+    assert(c, `应有 wxpusher 推送请求: ${JSON.stringify(gotCalls.map(x => x.url))}`)
+    const json = c.options.json
+    assert(json.contentType === 2, `渲染侧按拼接后的串判 HTML(contentType=2)，实际 ${JSON.stringify(json && json.contentType)}`)
+    assert(!json.content.includes('onerror'), `未清洗的事件属性不得出网: ${JSON.stringify(json.content)}`)
+  }))
+
+  // P1 同族反例（自造）：引号属性值内含 <——出口门槛的宽松包络正是为此存在；
+  // 一言把它带进拼接后的串，清洗同样必须发生在拼接之后。
+  await test('P1 同族反例：一言携带「引号属性内含 <」的标签也必须清洗', () => withChannels(async () => {
+    const xbk = require('./xbk_function_v3.js')
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '1'
+    cfg.HITOKOTO = 'true'
+    hitokotoText = '<img src="a<b" onerror=alert(1)>'
+    try {
+      await xbk.Pusher.send('标题', 'plain text', notify)
+    } finally {
+      hitokotoText = '测试一言'
+    }
+    const c = gotCalls.find(x => x.url.includes('wxpusher'))
+    assert(c, '应有 wxpusher 推送请求')
+    const json = c.options.json
+    assert(json.contentType === 2, `HTML 形态应保持 contentType=2: ${JSON.stringify(json && json.contentType)}`)
+    assert(!json.content.includes('onerror'), `同族载荷的事件属性不得出网: ${JSON.stringify(json.content)}`)
+  }))
+
+  // P1 对照：一言是纯文本时，下沉后的门槛必须【不】改写内容（不得过度清洗）。
+  await test('P1 对照：一言为纯文本时内容原样出网（门槛不误伤）', () => withChannels(async () => {
+    const xbk = require('./xbk_function_v3.js')
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '1'
+    cfg.HITOKOTO = 'true'
+    await xbk.Pusher.send('标题', 'plain text', notify)
+    const c = gotCalls.find(x => x.url.includes('wxpusher'))
+    assert(c, '应有 wxpusher 推送请求')
+    const json = c.options.json
+    assert(json.content === 'plain text\n\n测试一言    ----源', `纯文本一言不得被改写: ${JSON.stringify(json.content)}`)
+    assert(json.contentType === 3, `纯文本应保持 Markdown 类型(3)，实际 ${JSON.stringify(json && json.contentType)}`)
   }))
 
   // 11. 息知通道（曾从未被测试）
