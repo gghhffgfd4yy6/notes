@@ -50,7 +50,10 @@ console.log('══════════════════════�
 console.log('  xbk-push 统一测试入口')
 console.log('══════════════════════════════════════════════\n')
 
-if (!checkDependencies()) process.exit(1)
+// RT-08：前置门必须同时覆盖 devDependencies——注册套件 test_filter.js 裸 require('fast-check')
+// （devDependency），只探运行时清单时缺它要等套件运行时才炸（且报错点离根因很远）。includeDevDependencies
+// 只对测试入口打开（运行时调用方的语义不变）；devDependency 为 ESM-only 时只做 resolve 探测，不误报。
+if (!checkDependencies({ includeDevDependencies: true })) process.exit(1)
 
 // 零套件不等于通过：注册表为空（或将来被过滤成空）时循环体一次都不执行，results 为空 → allOk 初值 true
 // → 打印「全部通过 🎉」并 exit 0，门禁整步假绿。注意 test_suite_registry.js 的「SUITES 不应为空」断言

@@ -31,6 +31,15 @@ function declaredRuntimeDependencies (pkg) {
   return names
 }
 
+// RT-08：测试期依赖清单（devDependencies）。注册套件 test_filter.js 直接 require('fast-check')（裸
+// devDependency），缺它时套件在**运行时**才炸；而 run_tests.js 的前置门此前只覆盖运行时清单。
+// 只列名字（探测策略由调用方决定：devDependency 多为 ESM-only，见 checkDependencies 的 resolve-only 分支）。
+function declaredDevDependencies (pkg) {
+  const group = pkg && pkg.devDependencies
+  if (!group || typeof group !== 'object') return []
+  return Object.keys(group)
+}
+
 // F3：把被吞掉的根因提取成一行摘要（带 error.code），只取首行避免把 require 栈整段刷进输出。
 function dependencyFailureReason (error) {
   const message = error && error.message ? String(error.message) : String(error)
@@ -163,7 +172,7 @@ function loadFromRoot (name) {
   return require(require.resolve(name, { paths: [ROOT] }))
 }
 
-function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, manifest = readPackageManifest } = {}) {
+function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, manifest = readPackageManifest, includeDevDependencies = false } = {}) {
   const missing = []
   const broken = []
   const versionProblems = []
@@ -177,12 +186,17 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
   }
   const declared = declaredRuntimeDependencies(pkg)
   const targets = declared.length > 0 ? declared : ['got', NATIVE_DEP]
+  // RT-08：测试入口（run_tests.js）另需 devDependencies——注册套件 test_filter.js 裸
+  // require('fast-check')，缺它时是**运行时**才炸，前置门看不见。默认关闭（其它调用方的运行时语义
+  // 不变），只有测试入口显式打开；这些包多为 ESM-only（@stryker-mutator/core 等 require 必抛
+  // ERR_REQUIRE_ESM），故只做 resolve（装没装）不 load（否则正常安装会被误报「已安装但不可用」）。
+  const devTargets = includeDevDependencies ? declaredDevDependencies(pkg).filter(name => !targets.includes(name)) : []
 
   // F4：此前完全不校验 Node 版本（无 process.versions.node / engines 判定），而 re2 的 engines
   // 严于本仓库 engines——README 明示 Node 23.x、24.0–24.14、25.x 上装/重建 re2 必然失败。
   versionProblems.push(...nodeVersionProblems(pkg, process.versions.node))
 
-  for (const name of targets) {
+  for (const name of [...targets, ...devTargets]) {
     // F3：两段判定——resolve 失败才是「缺少」；resolve 成功而加载抛错（ERR_REQUIRE_ESM、
     // 内部依赖缺失、原生绑定损坏等）是「已安装但不可用」，此前一律按 missing 报「缺少 got」。
     try {
@@ -191,6 +205,7 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
       missing.push(name)
       continue
     }
+    if (devTargets.includes(name)) continue // RT-08：devDependency 只查「装没装」
 
     try {
       const mod = load(name)

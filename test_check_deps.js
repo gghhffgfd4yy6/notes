@@ -44,6 +44,30 @@ function runCheckDepsSandbox (dir, env = {}) {
   })
 }
 
+// RT-08 沙箱：复制**真实**run_tests.js + 真实 scripts/check-deps.js，配一个最小桩套件与可控的
+// devDependencies 清单——用真实入口（而不是读源码文本）证明前置门确实按 devDependencies 拦下缺失包。
+function makeRunTestsSandbox ({ dependencies, devDependencies, presentDeps = [] }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'run-tests-sandbox-'))
+  fs.mkdirSync(path.join(dir, 'scripts'))
+  fs.copyFileSync(path.join(__dirname, 'scripts', 'check-deps.js'), path.join(dir, 'scripts', 'check-deps.js'))
+  fs.copyFileSync(path.join(__dirname, 'run_tests.js'), path.join(dir, 'run_tests.js'))
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'sandbox', version: '1.0.0', dependencies, devDependencies }))
+  for (const name of presentDeps) {
+    const pkgDir = path.join(dir, 'node_modules', name)
+    fs.mkdirSync(pkgDir, { recursive: true })
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.js' }))
+    fs.writeFileSync(path.join(pkgDir, 'index.js'), 'module.exports = {}\n')
+  }
+  fs.writeFileSync(path.join(dir, 'test_suites.js'),
+    "module.exports = { SUITES: [{ name: '桩', file: 'stub_suite.js', desc: 'RT-08 沙箱桩套件' }] }\n")
+  fs.writeFileSync(path.join(dir, 'stub_suite.js'), "console.log('stub suite ok')\nprocess.exit(0)\n")
+  return dir
+}
+
+function runRunTestsSandbox (dir) {
+  return spawnSync(process.execPath, [path.join(dir, 'run_tests.js')], { encoding: 'utf8', cwd: dir })
+}
+
 function fakeRe2Class ({ ok = true } = {}) {
   return class MockRE2 {
     constructor (pattern) { this.pattern = pattern }
@@ -122,6 +146,85 @@ test('F3 got 可解析但加载抛错 → 归为 broken，输出根因与重装�
   if (!out.includes('require() of ES Module')) throw new Error(`根因 message 必须进入输出: ${out}`)
   if (!out.includes('npm ci --ignore-scripts')) throw new Error(`got 不可用应给重装指引: ${out}`)
   if (out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`got 不可用不应给 re2 的 rebuild 指引: ${out}`)
+})
+
+// RT-08：注册套件 test_filter.js 裸 require('fast-check')（devDependency），只探运行时清单时缺它
+// 要在套件运行时才炸。前置门可按需把 devDependencies 纳入探测——默认关闭（运行时调用方语义不变），
+// 只有测试入口显式打开。
+test('RT-08 includeDevDependencies 打开后必须发现缺失的 devDependency（默认关闭时不误报）', () => {
+  const pkg = { dependencies: { got: '11.8.6' }, devDependencies: { 'ghost-dev': '1.0.0' } }
+  const resolve = (name) => {
+    if (name === 'ghost-dev') throw new Error("Cannot find module 'ghost-dev'")
+    return '/mock/path'
+  }
+  const base = { manifest: () => pkg, resolve, load: () => fakeRe2Class() }
+  // 默认：运行时清单口径 —— devDependency 缺失不得让运行时预检变红
+  const defaultOut = captureErrorOutput(() => {
+    if (checkDependencies(base) !== true) throw new Error('默认不应把 devDependencies 计入运行时预检')
+  })
+  if (defaultOut.includes('ghost-dev')) throw new Error(`默认调用不得探测 devDependencies: ${defaultOut}`)
+  // 打开开关：缺失的 devDependency 必须被发现并点名
+  const out = captureErrorOutput(() => {
+    if (checkDependencies({ ...base, includeDevDependencies: true }) !== false) throw new Error('打开开关后必须报缺失')
+  })
+  if (!out.includes('缺少依赖：ghost-dev')) throw new Error(`必须点名缺失的 devDependency: ${out}`)
+})
+
+// RT-08：devDependency 里存在 ESM-only 包（@stryker-mutator/core 等）——require 必抛
+// ERR_REQUIRE_ESM。若对它们走 load，正常安装会被误报「已安装但不可用」→ 前置门假红。故只做 resolve。
+test('RT-08 devDependency 只做 resolve 探测：可解析但 require 抛错不得误报 broken', () => {
+  const out = captureErrorOutput(() => {
+    const ok = checkDependencies({
+      manifest: () => ({ dependencies: { got: '11.8.6' }, devDependencies: { 'esm-only-dev': '1.0.0' } }),
+      resolve: () => '/mock/path',
+      load: (name) => {
+        if (name === 'esm-only-dev') {
+          const err = new Error('require() of ES Module not supported')
+          err.code = 'ERR_REQUIRE_ESM'
+          throw err
+        }
+        return fakeRe2Class()
+      },
+      includeDevDependencies: true
+    })
+    if (ok !== true) throw new Error(`ESM-only devDependency 已安装不得判失败，实际 ${ok}`)
+  })
+  if (out.includes('不可用')) throw new Error(`不得把 devDependency 的 ESM-only 加载失败判为「已安装但不可用」: ${out}`)
+})
+
+// RT-08（接线，行为级）：用**真实入口** run_tests.js 验证它确实打开了 includeDevDependencies——
+// 读源码文本的断言不算；沙箱里复制真实 run_tests.js + 真实 scripts/check-deps.js，配一个最小桩套件，
+// 声明一个不存在的 devDependency：入口必须非 0 退出并点名它（回退那行接线 → 桩套件跑通 → exit 0 → 红）。
+test('RT-08 真实入口 run_tests.js 的前置门覆盖 devDependencies（缺 fast-check 类依赖必须拦下）', () => {
+  const ghost = 'xbk-ghost-dev-xyz'
+  const dir = makeRunTestsSandbox({
+    dependencies: { got: '11.8.6' },
+    devDependencies: { [ghost]: '1.0.0' },
+    presentDeps: ['got']
+  })
+  const ctl = makeRunTestsSandbox({
+    dependencies: { got: '11.8.6' },
+    devDependencies: { 'xbk-dev-present-xyz': '1.0.0' },
+    presentDeps: ['got', 'xbk-dev-present-xyz']
+  })
+  try {
+    const r = runRunTestsSandbox(dir)
+    if (r.status === 0) {
+      throw new Error(`devDependency 缺失时入口必须非 0 退出，实际 0；stdout=${JSON.stringify(r.stdout)}`)
+    }
+    if (!String(r.stderr).includes(ghost)) {
+      throw new Error(`stderr 必须点名缺失的 devDependency，实际: ${JSON.stringify(r.stderr)}`)
+    }
+    // 对照组：devDependencies 齐全时入口正常跑完（证明拦截来自缺失的 devDependency，而非别处）
+    const ok = runRunTestsSandbox(ctl)
+    if (ok.status !== 0) {
+      throw new Error(`devDependencies 齐全时入口应通过，实际 status=${ok.status}，stderr=${JSON.stringify(ok.stderr)}`)
+    }
+    if (!String(ok.stdout).includes('全部通过')) throw new Error(`对照组应跑完并汇总通过：${JSON.stringify(ok.stdout)}`)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+    fs.rmSync(ctl, { recursive: true, force: true })
+  }
 })
 
 test('re2 完全缺失（resolve 失败）→ 归为 missing，提示 npm ci + rebuild', () => {
