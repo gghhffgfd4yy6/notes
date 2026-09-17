@@ -305,6 +305,29 @@ check('未知标签闭合：属性值内的 </font 不算配对闭合', () => {
   assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<font title="</font>">a</font>' }), 'a')
 })
 
+// ===== 10b. 审查 2026-09-14 F-03：属性值引号语义 =====
+check('F-03：未加引号的属性值里的撇号不再吞掉后续 <a>/<h1>', () => {
+  // 未加引号的属性值（class=don't）里的撇号曾被当引号起点，把其后到串内下一个引号
+  // 之间的所有开标签都标成「属性值内」→ 链接/标题被跳过（对照 <div data-x=1> 同形态）。
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: "<div class=don't><a href=https://ok.com/1>t</a>" }),
+    '[t](https://ok.com/1)')
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: "<div class=don't><h1>H</h1>" }),
+    '# H')
+  assert.strictEqual(
+    formatter.htmlToMarkdown({ content_html: "it's <a href=https://ok.com/2>t</a>" }),
+    "it's [t](https://ok.com/2)")
+})
+
+check('F-03：= 之后的引号仍是属性值区间（对照：不回归 v3.263 属性值保护）', () => {
+  const spans = formatter._quotedAttrSpans('<div a="b">')
+  assert.ok(spans.has(8) && spans.size === 1, `= 后的引号应标记属性值区间，实际 ${JSON.stringify([...spans])}`)
+  assert.strictEqual(formatter._quotedAttrSpans("<div class=don't>").size, 0, '未加引号的属性值不产生区间')
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<font title="</font>">a</font>' }), 'a')
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<div data-x="<a href="https://x">text</a>' }), 'text')
+})
+
 // ===== 11. formatTemplate 模板替换 =====
 check('formatTemplate: {标题} 替换', () => {
   const r = formatter.tuisong_replace('标题：{标题}', { title: '测试标题' })

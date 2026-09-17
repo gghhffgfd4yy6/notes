@@ -151,16 +151,24 @@ function createFormatter ({ Utils, safeRe }) {
   },
 
   /** 引号属性值区间标记：返回 Set<index>，命中表示该位置位于某标签的引号属性值内。
-   *  与 _findTagEnd 同构的引号语义（跳到同引号下一次出现；未闭合引号视为延伸到串尾）。 */
+   *  引号只有在「属性值起点」才算定界符——即紧跟在 = 之后（中间允许空白），与
+   *  _readTagAttrValue 的取值口径一致；未加引号的属性值里的撇号（`class=don't`）不再被
+   *  当成引号起点，否则会把其后同串里最近的一个引号当作配对引号，吞掉两者之间的所有
+   *  <a>/<h1>（审查 2026-09-14 F-03）。定界符引号未闭合时仍按 HTML 语义延伸到串尾
+   *  （引号状态中的 > 不结束标签），与 _findTagEnd 的退化口径一致。 */
   _quotedAttrSpans (html) {
     const inside = new Set()
     let inTag = false
+    let lastNonWs = ''
     let i = 0
     while (i < html.length) {
       const c = html[i]
       if (!inTag) {
         const n = html[i + 1]
-        if (c === '<' && n && (n === '/' || /[a-zA-Z]/.test(n))) inTag = true
+        if (c === '<' && n && (n === '/' || /[a-zA-Z]/.test(n))) {
+          inTag = true
+          lastNonWs = ''
+        }
         i++
         continue
       }
@@ -169,10 +177,12 @@ function createFormatter ({ Utils, safeRe }) {
         i++
         continue
       }
-      if (c === '"' || c === "'") {
+      if ((c === '"' || c === "'") && lastNonWs === '=') {
         i = this._markQuotedSpan(html, c, i, inside)
+        lastNonWs = '' // 属性值消费完：闭合引号之后的字符重新起算，避免沿用旧的 =
         continue
       }
+      if (!/\s/.test(c)) lastNonWs = c
       i++
     }
     return inside
