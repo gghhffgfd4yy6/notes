@@ -3274,6 +3274,41 @@ console.log('========================================\n');
     }
   })
 
+  await test('saveBatch 落盘失败 → 摘要/日志可观测（APP-03）', async () => {
+    // 反例（改动前）：xbk_app.js 丢弃 MessageStore.saveBatch 的返回值，落盘失败时 summary 仍报
+    // 「成功」、run.log 无任何痕迹，运维看不到「本轮推送成功但成功记录没落盘」（下次运行会重推）。
+    // 本用例把真 saveBatch 打成返回 false（生产实现落盘失败时的返回值，见 xbk_message_store.js），
+    // 断言：① summary.cacheSaved === false；② 控制台告警；③ run.log 有 WARN 行 + cachesaved=0。
+    // 撤掉 app 侧消费（回到 `MessageStore.saveBatch(toCache, cacheName)` 裸调用）→ 三条断言全红。
+    reset()
+    setPushUrl('t_app03_cache_fail')
+    const origSaveBatch = xbk.MessageStore.saveBatch
+    const origWarn = console.warn
+    const warns = []
+    const runLogPath = path.join(CACHE_DIR, 'run.log')
+    try {
+      xbk.MessageStore.saveBatch = () => false
+      console.warn = (m) => warns.push(String(m))
+      try { fs.unlinkSync(runLogPath) } catch (e) { /* 首次无日志 */ }
+      fakeData = [makeItem({ id: 1 })]
+      const summary = await xbk.run()
+      assert(summary.cacheSaved === false, `落盘失败时 summary.cacheSaved 必须为 false，实际 ${JSON.stringify(summary.cacheSaved)}`)
+      assert(warns.some(w => w.includes('缓存落盘失败')), `落盘失败应告警，实际告警: ${warns.join(' | ')}`)
+      const log = fs.readFileSync(runLogPath, 'utf8')
+      assert(log.includes('WARN 缓存落盘失败'), `run.log 应含落盘失败 WARN 行: ${log.split('\n').slice(-3).join(' | ')}`)
+      assert(log.includes('cachesaved=0'), 'run.log 摘要行应含 cachesaved=0')
+    } finally {
+      xbk.MessageStore.saveBatch = origSaveBatch
+      console.warn = origWarn
+    }
+    // 对照：落盘成功时 summary.cacheSaved === true（防止断言恒真）
+    reset()
+    setPushUrl('t_app03_cache_ok')
+    fakeData = [makeItem({ id: 2 })]
+    const okSummary = await xbk.run()
+    assert(okSummary.cacheSaved === true, `落盘成功时 summary.cacheSaved 应为 true，实际 ${JSON.stringify(okSummary.cacheSaved)}`)
+  })
+
   await test('api.timeout 字符串配置生效（#8 v3.162）', async () => {
     reset()
     setPushUrl('t69_timeout_str')
