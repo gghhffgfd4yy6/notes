@@ -99,21 +99,30 @@ const { runTests, evaluate, main } = require('./run_mutation')
     }
   }
 
-  // 场景 4：runTests 必须清空 SKIP_SUITES，并给子进程带 XBK_MUTATION_CHILD=1
-  // 原因：CI 显式步骤的 SKIP_SUITES 若继承进变异评估子进程，被跳过的套件不再参与变异判定 → 分数失真。
+  // 场景 4：runTests 必须清空 SKIP_SUITES，给子进程带 XBK_MUTATION_CHILD=1，并注入 PERF_MS
+  // 原因：CI 显式步骤的 SKIP_SUITES 若继承进变异评估子进程，被跳过的套件不再参与变异判定 → 分数失真；
+  // PERF_MS 必须与 stryker 沙箱同口径（scripts/mutation-child.js），否则 test_filter.js 的性能断言
+  // 在默认最多 8 并发下误失败 → 变异体被记 killed、分数虚高，且两条变异路径不可比（F8）。
   {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-skip-'))
     const prev = process.env.SKIP_SUITES
     try {
       process.env.SKIP_SUITES = 'test_filter.js,test_storage.js'
       fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
-        console.log('SKIP=[' + (process.env.SKIP_SUITES || '') + '] MUT=[' + (process.env.XBK_MUTATION_CHILD || '') + ']')
+        console.log('SKIP=[' + (process.env.SKIP_SUITES || '') + '] MUT=[' + (process.env.XBK_MUTATION_CHILD || '') + '] PERF=[' + (process.env.PERF_MS || '') + ']')
         process.exit(0)
       `)
       const result = await runTests(dir, 10000)
       assert.strictEqual(result.status, 'pass', `应正常通过，output=${result.output}`)
       assert.match(result.output, /SKIP=\[\]/, 'runTests 必须清空 SKIP_SUITES（否则 CI 跳过清单会继承到变异评估）')
       assert.match(result.output, /MUT=\[1\]/, 'runTests 应标记 XBK_MUTATION_CHILD=1（防递归 + 抑制 summary 追加）')
+      // 与 stryker 沙箱同口径：预期值取自 scripts/mutation-child.js 的实际赋值（单一事实源），
+      // 任一侧被改动（去掉注入 / 改 mutation-child 的值）都会让本断言红。
+      const childScript = fs.readFileSync(path.join(__dirname, 'scripts', 'mutation-child.js'), 'utf8')
+      const perf = /process\.env\.PERF_MS\s*=\s*'(\d+)'/.exec(childScript)
+      assert.ok(perf, 'scripts/mutation-child.js 应显式设置 PERF_MS（stryker 沙箱性能阈值口径来源）')
+      assert.match(result.output, new RegExp(`PERF=\\[${perf[1]}\\]`),
+        `runTests 注入的 PERF_MS 必须与 stryker 沙箱同口径（scripts/mutation-child.js 的 ${perf[1]}）`)
     } finally {
       if (prev === undefined) delete process.env.SKIP_SUITES
       else process.env.SKIP_SUITES = prev

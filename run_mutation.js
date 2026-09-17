@@ -303,7 +303,10 @@ function buildBatches (mutants, batchSize) {
 function runTests (dir, timeoutMs) {
   return new Promise(resolve => {
     // 变异评估必须跑全量套件 —— 清除 SKIP_SUITES，防止 CI 显式步骤的跳过清单继承到子进程使变异分数失真。
-    const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, XBK_MUTATION_CHILD: '1', SKIP_SUITES: '' } })
+    // PERF_MS='3000'（RT-F8）：与 stryker 路径（scripts/mutation-child.js:13 / mutation.yml step env）同口径，
+    // 放宽 test_filter.js 的性能断言阈值（默认 500ms）。此前本入口不注入，默认最多 8 并发下套件间的
+    // CPU 争抢与沙箱开销会让性能断言误失败 → 变异体被记 killed、分数虚高，且与 stryker 结果不可比。
+    const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, XBK_MUTATION_CHILD: '1', SKIP_SUITES: '', PERF_MS: '3000' } })
     let output = ''
     // 超时竞态修复：此前 setTimeout 回调里 kill 后立即 resolve，但此时 close 尚未触发、closeSignal 必为 null，
     // 且 stdout/stderr 还在继续排空——resolve 时既拿不到真实 signal（竞态），也拿不到最终完整 output，
