@@ -11,7 +11,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
-const { readReportJson } = require('./scripts/mutation-json.js')
+const { readReportJson, resolveMaxReportBytes, DEFAULT_MAX_FILE_BYTES, MAX_BUFFER_BYTES } = require('./scripts/mutation-json.js')
 
 const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'mutation-json-test-'))
 
@@ -113,6 +113,35 @@ try {
     assert.strictEqual(statCalls > 0, true, '必须先 stat 取真实大小')
     assert.strictEqual(readCalls, 0, '超限必须在 readFileSync（分配峰值）之前判定，不得先整份读入再报错')
     console.log('✅ 预读大小护栏在 readFileSync 分配之前生效（含路径与真实大小）')
+    pass++
+  }
+
+  // ===== F1（返工）：预读大小护栏必须是**生产有语义的策略上限**，而不是 Buffer 边界改文案 =====
+  // 上一版默认 maxFileBytes = buffer.constants.MAX_LENGTH ≈ 8 PiB：任何真实文件系统都到不了，
+  // 且两个生产调用方都不注入 options ⇒ 该分支生产中恒假（独立验证 V3 打回）。返工后默认是 2 GiB
+  // 的显式策略值（报告按设计可达 500MB+，留足余量；病态输入在读入前失败而非把 runner 读 OOM），
+  // 并可由 XBK_MUTATION_REPORT_MAX_BYTES 覆盖。下列断言把「默认值必须是策略而非 Buffer 边界」
+  // 与「解析器不得把配置笔误变成无上限」钉死。
+  {
+    assert.ok(Number.isFinite(DEFAULT_MAX_FILE_BYTES) && DEFAULT_MAX_FILE_BYTES > 0, '默认预读上限必须是有限正值')
+    assert.ok(DEFAULT_MAX_FILE_BYTES < MAX_BUFFER_BYTES,
+      `默认预读上限必须是有生产意义的策略值（真实现约 500MB+ 的报告），而不是 buffer.constants.MAX_LENGTH（≈8 PiB，生产恒假）：实际 ${DEFAULT_MAX_FILE_BYTES}`)
+    assert.ok(DEFAULT_MAX_FILE_BYTES >= 1024 * 1024 * 1024,
+      `默认上限必须容得下文件头声明的 500MB+ 报告：实际 ${DEFAULT_MAX_FILE_BYTES}`)
+    assert.strictEqual(resolveMaxReportBytes(undefined), DEFAULT_MAX_FILE_BYTES, '缺省用策略默认值')
+    assert.strictEqual(resolveMaxReportBytes(''), DEFAULT_MAX_FILE_BYTES, '空串按缺省')
+    assert.strictEqual(resolveMaxReportBytes('1024'), 1024, '正整数覆盖生效')
+    assert.strictEqual(resolveMaxReportBytes(' 2048 '), 2048, '空白不敏感')
+    assert.strictEqual(resolveMaxReportBytes('off'), MAX_BUFFER_BYTES, 'off 显式退回 Buffer 边界（关闭策略上限）')
+    assert.strictEqual(resolveMaxReportBytes('OFF'), MAX_BUFFER_BYTES, 'off 大小写不敏感')
+    const badValues = ['abc', '-1', '0', 'NaN', 'Infinity', '-Infinity']
+    for (const bad of badValues) {
+      assert.strictEqual(resolveMaxReportBytes(bad), DEFAULT_MAX_FILE_BYTES,
+        `非法值 ${bad} 必须回落策略默认值——绝不静默变成「无上限」`)
+    }
+    assert.strictEqual(resolveMaxReportBytes(String(MAX_BUFFER_BYTES + 1)), MAX_BUFFER_BYTES,
+      '覆盖值不得越过 Buffer 能表示的边界（否则 readFileSync 会抛无上下文的 ERR_OUT_OF_RANGE）')
+    console.log('✅ 预读大小上限是生产有语义的策略值（默认 2 GiB / 可覆盖 / 非法值不变成无上限）')
     pass++
   }
 

@@ -308,6 +308,34 @@ try {
     assert.strictEqual(missing.reportMtimeMs, undefined, '缺报告的段不带时间（不参与新鲜度比较）')
   })
 
+  // F1（mutation-json 返工）：预读大小上限必须由**生产调用方**注入——本用例把生产入口
+  // analyzeSegment 的注入点钉死：设 XBK_MUTATION_REPORT_MAX_BYTES=4 时，7 字节的正常报告必须被
+  // 「超过预读上限」拒绝；不设时同一报告正常解析。若调用方退回 readReportJson(path)（V3 打回的
+  // 「护栏只在测试里成立」形态），前者会照常解析成功 → 本条红。
+  check('analyzeSegment 经 XBK_MUTATION_REPORT_MAX_BYTES 注入预读上限（生产调用方不得省略）', () => {
+    const d = path.join(tmp, 'mutation-report-cap-injection'); fs.mkdirSync(d, { recursive: true })
+    fs.writeFileSync(path.join(d, 'mutation.json'), JSON.stringify({
+      schemaVersion: '1.0',
+      thresholds: { high: 80, low: 60, break: null },
+      files: { 'cap.js': { language: 'javascript', source: 'x\n', mutants: [{ status: 'Killed' }] } }
+    }))
+    const prev = process.env.XBK_MUTATION_REPORT_MAX_BYTES
+    try {
+      delete process.env.XBK_MUTATION_REPORT_MAX_BYTES
+      const ok = analyzeSegment(tmp, { name: 'mutation-report-cap-injection' })
+      assert.strictEqual(ok.error, undefined, `默认上限下正常报告应解析成功，实际 ${ok.error}`)
+      assert.ok(ok.total > 0, '正常段应统计出变异体')
+      process.env.XBK_MUTATION_REPORT_MAX_BYTES = '4'
+      const capped = analyzeSegment(tmp, { name: 'mutation-report-cap-injection' })
+      assert.ok(capped.error && capped.error.includes('超过预读上限'),
+        `生产调用方必须把环境变量里的预读上限传下去（4 字节上限应拒绝 7 字节报告），实际 error=${capped.error}`)
+      assert.ok(capped.error.includes('4 字节'), `报错应带上限值，实际 ${capped.error}`)
+    } finally {
+      if (prev === undefined) delete process.env.XBK_MUTATION_REPORT_MAX_BYTES
+      else process.env.XBK_MUTATION_REPORT_MAX_BYTES = prev
+    }
+  })
+
   // F4：报告顶层为 null/原始值时显式失败并走段级隔离。
   // 旧实现 report.files 在 try 外求值 → 裸 TypeError 逃出 analyzeSegment，整份日报一起崩；
   // 新实现把解析+聚合同处 try 内，返回带报告路径的 error（且不得伪装成 0 变异体的正常段）。

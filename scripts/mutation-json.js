@@ -11,10 +11,27 @@ const { constants: bufferConstants } = require('node:buffer')
 const KEY = Buffer.from('"statusReason"')
 const PLACEHOLDER = Buffer.from(':""')
 const MAX_STRING_LENGTH = 512 * 1024 * 1024 - 24 // V8 单字符串最大字符数（0x1fffffe8 ≈ 512MiB；表达式写法规避 Codacy PMD InnaccurateNumericLiteral 误报）
-// F1：读取前的护栏上限——Buffer 能表示的最大长度（超出时 readFileSync 抛 ERR_OUT_OF_RANGE，
-// 该异常既不带被读路径也不带实际大小）。与 maxStringLength 一样可由调用侧覆盖，供测试构造小夹具。
-const MAX_FILE_BYTES = bufferConstants.MAX_LENGTH
+// F1（返工）：读取前的**策略**上限。上一版默认取 buffer.constants.MAX_LENGTH（≈8 PiB）——那不是策略，
+// 只是把 readFileSync 自己的 ERR_OUT_OF_RANGE 换了个带路径/尺寸的文案，而两个生产调用方
+// （scripts/mutation-report.js / .github/analyze-artifacts.js）都不注入 options，于是
+// `stat.size > maxFileBytes` 这条分支在生产中恒假（独立验证 V3 打回）。现在：
+//   * 默认 2 GiB：本文件头部声明的真实报告可达 500MB+（整段测试输出写进 statusReason），2 GiB 留足
+//     余量；同时对病态输入（未剥离的百 GB 级文件）在**付出整份分配之前**失败，而不是把 CI runner 读 OOM；
+//   * XBK_MUTATION_REPORT_MAX_BYTES 可覆盖（正整数；`off` = 只保留 Buffer 能表示的边界）；
+//   * 非法/非正值回落默认——绝不静默变成「无上限」（readReportJson 的 maxFileBytes 形参仍供测试注入小夹具）。
+const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
+const MAX_BUFFER_BYTES = bufferConstants.MAX_LENGTH
 const WHITESPACE = new Set([0x20, 0x09, 0x0a, 0x0d])
+
+// F1（返工）：策略上限解析是纯函数（不读环境变量 → 测试 hermetic）；调用点显式把环境变量传进来。
+function resolveMaxReportBytes (raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_MAX_FILE_BYTES
+  const text = String(raw).trim().toLowerCase()
+  if (text === 'off') return MAX_BUFFER_BYTES // 显式关闭策略上限：退回 Buffer 能表示的边界
+  const n = Number(text)
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_MAX_FILE_BYTES // 配置笔误不得把上限变成无穷
+  return Math.min(n, MAX_BUFFER_BYTES)
+}
 
 // 从 i 起跳过空白，返回首个非空白位置
 function skipWhitespace (buf, i) {
@@ -55,8 +72,9 @@ function readReportJson (reportPath, options = {}) {
   // F1：V8 字符串上限可被调用侧覆盖（默认 MAX_STRING_LENGTH）。生产调用方一律不传，
   // 该形参只为测试构造「剥离后仍超限」的输入——否则验证这条护栏需要一个 512MiB 级夹具。
   const maxStringLength = Number.isFinite(options && options.maxStringLength) ? options.maxStringLength : MAX_STRING_LENGTH
-  // F1：预读大小护栏上限，同样只由测试注入（生产默认即 Buffer 上限）。
-  const maxFileBytes = Number.isFinite(options && options.maxFileBytes) ? options.maxFileBytes : MAX_FILE_BYTES
+  // F1（返工）：预读大小上限默认取**生产策略值**（2 GiB，见 DEFAULT_MAX_FILE_BYTES）；生产调用方
+  // 经 XBK_MUTATION_REPORT_MAX_BYTES 注入，测试注入小夹具值。
+  const maxFileBytes = Number.isFinite(options && options.maxFileBytes) ? options.maxFileBytes : DEFAULT_MAX_FILE_BYTES
   // nosemgrep: 工具脚本按 CLI 传入路径读取报告，路径非用户净输入
   // Trust Model（v3.266 强化）：readReportJson 是内部 API，期望 reportPath
   //   来自已校验目录——scripts/mutation-report.js 链中 fs.statSync(dir)
@@ -131,4 +149,4 @@ function readReportJson (reportPath, options = {}) {
   }
 }
 
-module.exports = { readReportJson }
+module.exports = { readReportJson, resolveMaxReportBytes, DEFAULT_MAX_FILE_BYTES, MAX_BUFFER_BYTES }

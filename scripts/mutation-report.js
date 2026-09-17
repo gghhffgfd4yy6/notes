@@ -6,7 +6,7 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
-const { readReportJson } = require('./mutation-json.js')
+const { readReportJson, resolveMaxReportBytes } = require('./mutation-json.js')
 
 // 必须与 mutation.yml 的矩阵名称保持一致；缺段时禁止把部分结果伪装成完整日报。
 const EXPECTED_SEGMENTS = Object.freeze([
@@ -169,7 +169,10 @@ function analyzeSegment (dir, entry) {
   // 不抛 TypeError 逃出本函数（与上方注释「单段失败不中断整体」一致），也不把损坏报告伪装成
   // 0 变异体的正常段；错误补上报告路径便于定位。
   try {
-    const report = readReportJson(reportPath)
+    // F1（mutation-json 返工）：预读大小上限必须由**生产调用方**注入，否则护栏只在测试里成立
+    // （独立验证 V3：默认 8 PiB + 零生产调用方注入 ⇒ 该分支生产恒假）。默认 2 GiB 的生产策略值
+    // 由 resolveMaxReportBytes 给出，可用 XBK_MUTATION_REPORT_MAX_BYTES 覆盖。
+    const report = readReportJson(reportPath, { maxFileBytes: resolveMaxReportBytes(process.env.XBK_MUTATION_REPORT_MAX_BYTES) })
     if (!report || typeof report !== 'object') {
       throw new Error(`报告顶层结构非法（${report === null ? 'null' : typeof report}），无法读取 files`)
     }
