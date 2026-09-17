@@ -414,8 +414,8 @@ try {
   fs.rmSync('reports/.ci-summary-overflow.md', { force: true })
 }
 
-// 3g run_tests.js 的零套件守卫（RT-01）与失败原因诊断（RT-02）回归：该入口全量跑 41 个套件
-//    （含网络/常驻），不能直接驱动；故在临时目录里搭一个最小沙箱（桩 test_suites.js + 桩
+// 3g run_tests.js 的零套件守卫（RT-01）、失败原因诊断（RT-02）与每套件超时（RT-03）回归：该入口全量跑
+//    41 个套件（含网络/常驻），不能直接驱动；故在临时目录里搭一个最小沙箱（桩 test_suites.js + 桩
 //    scripts/check-deps.js + 桩套件），只复制入口自身——与 test_run_mutation_internal.js 的
 //    copyProject 手法同源。
 function makeRunTestsSandbox (suites, files = {}) {
@@ -427,8 +427,13 @@ function makeRunTestsSandbox (suites, files = {}) {
   for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
   return dir
 }
-function runRunTestsIn (dir) {
-  return spawnSync(process.execPath, [path.join(dir, 'run_tests.js')], { encoding: 'utf8', cwd: dir })
+function runRunTestsIn (dir, env = {}, extra = {}) {
+  return spawnSync(process.execPath, [path.join(dir, 'run_tests.js')], {
+    encoding: 'utf8',
+    cwd: dir,
+    env: { ...process.env, ...env },
+    ...extra
+  })
 }
 
 // 3g1 空注册表（SUITES=[]）必须非 0：修复前 allOk 初值 true → 「全部通过 🎉」并 exit 0（门禁假绿）
@@ -461,6 +466,28 @@ try {
   assert.match(diag.stdout, /signal=SIGKILL/, '被信号杀死的套件必须把 signal 打进输出')
 } finally {
   fs.rmSync(diagDir, { recursive: true, force: true })
+}
+
+// 3g3 每套件硬超时（RT-03）：套件挂死（死循环/等待不会到来的输入）时 execFileSync 永不返回，
+//     入口既不汇总也不退出——CI 只能等作业级超时且没有红测定位。现要求入口按 XBK_TEST_TIMEOUT
+//     强杀（killSignal=SIGKILL）并以失败收尾，且失败输出点名「超过每套件上限」（与断言红区分）。
+//     测试侧仍加 30s spawnSync 兜底：修复被回退（无超时）时子进程会永久挂住，必须让本断言失败
+//     而不是把整套件挂到作业级超时。
+const hangDir = makeRunTestsSandbox(
+  [{ name: '挂死套件', file: 'test_stub_hang.js', desc: '死循环永不退出' }],
+  { 'test_stub_hang.js': 'while (true) {}\n' }
+)
+try {
+  const t0 = Date.now()
+  const hang = runRunTestsIn(hangDir, { XBK_TEST_TIMEOUT: '300' }, { timeout: 30000 })
+  const elapsed = Date.now() - t0
+  assert.strictEqual(hang.signal, null,
+    '入口必须自行结束：被测试侧 30s 兜底杀掉（signal 非 null）说明每套件超时失效，入口仍在永久阻塞')
+  assert.notStrictEqual(hang.status, 0, '挂死套件必须让入口以非 0 退出（零假绿）')
+  assert.match(hang.stdout, /超过每套件上限 300ms 已强杀/, '失败输出必须点名每套件超时（与断言红区分）')
+  assert.ok(elapsed < 20000, `入口应在每套件上限后很快结束（实测 ${elapsed}ms）`)
+} finally {
+  fs.rmSync(hangDir, { recursive: true, force: true })
 }
 
 // 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加

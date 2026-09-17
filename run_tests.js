@@ -3,6 +3,8 @@
 // 统一测试入口：按 test_suites.js 注册表执行全部套件（含 integration，非「三套」）+ 汇总报告 + 退出码
 // 用法：node run_tests.js   （或 npm test）
 // 退出码：0 = 全部通过，非 0 = 有失败（CI/调度可感知）
+// 每套件硬超时：默认 600s（可经 XBK_TEST_TIMEOUT 覆盖），超时按失败处理并以 SIGKILL 强杀——
+// 套件挂死时入口仍能收敛出结论与退出码，不会永久阻塞（RT-03）。
 // ============================================================
 const { execFileSync } = require('child_process')
 const path = require('path')
@@ -21,6 +23,27 @@ function displayWidth (str) {
 function padEndWidth (str, width) {
   return str + ' '.repeat(Math.max(0, width - displayWidth(str)))
 }
+
+// 环境变量正整数解析（与 run_unit_tests.js / run_mutation.js 的 positiveIntEnv 同口径）：
+// 非法值（NaN / 负数 / 非整数 / 空串）一律告警并回退默认，绝不静默按非法值运行。
+function positiveIntEnv (name, fallback) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 1) {
+    console.warn(`⚠️  环境变量 ${name}=${raw} 非法（应为正整数），已回退默认值 ${fallback}`)
+    return fallback
+  }
+  return value
+}
+
+// 每套件硬超时（RT-03）：execFileSync 默认无 timeout，套件挂死（死循环 / 等待不会到来的输入 /
+// 遗留句柄）时父进程永久阻塞——既不汇总也不退出，「CI/调度可感知的退出码」承诺失效，CI 只能等
+// 作业级超时，且没有任何红测定位。姊妹入口 run_unit_tests.js:95 已有同款兜底（UNIT_TIMEOUT +
+// killSignal SIGKILL），此处按同一口径补齐。
+// 默认 600s：全量入口最慢的集成套件（test_app_p.js / test_notify.js）实测均在分钟级，留足余量
+// 以免误杀；超过 10 分钟无进展只可能是挂死。XBK_TEST_TIMEOUT 仅用于测试注入/本机调参，生产不设。
+const TEST_TIMEOUT = positiveIntEnv('XBK_TEST_TIMEOUT', 10 * 60 * 1000)
 
 const results = []
 console.log('══════════════════════════════════════════════')
@@ -41,18 +64,22 @@ for (const s of SUITES) {
   const file = path.join(__dirname, s.file)
   const t0 = Date.now()
   try {
-    // 继承 stdout/stderr（各套件自己的 ✅/❌ 输出直接透传），捕获退出码
-    execFileSync(process.execPath, [file], { stdio: 'inherit' })
+    // 继承 stdout/stderr（各套件自己的 ✅/❌ 输出直接透传），捕获退出码；
+    // timeout + killSignal 见 TEST_TIMEOUT（RT-03）：挂死套件强杀后走下方失败分支，不再永久阻塞。
+    execFileSync(process.execPath, [file], { stdio: 'inherit', timeout: TEST_TIMEOUT, killSignal: 'SIGKILL' })
     const ms = Date.now() - t0
     results.push({ ...s, ok: true, ms })
     console.log(`\n  ✅ ${s.name} 通过（${(ms / 1000).toFixed(1)}s）\n`)
   } catch (e) {
     const ms = Date.now() - t0
     results.push({ ...s, ok: false, ms })
+    // 超时（execFileSync 抛 ETIMEDOUT，套件已按 killSignal=SIGKILL 强杀）必须与断言红区分开：
+    // 否则排查者只看到一行「失败」，不知道套件是被每套件上限掐掉的（RT-03）。
+    const timedOut = e.code === 'ETIMEDOUT' || /ETIMEDOUT/.test(String(e.message || ''))
     // 静默非零退出/被信号杀死的套件在子进程侧可能零输出——父进程必须补上退出原因，
     // 否则 exit 7 与「被 OOM 杀掉」在输出上完全不可区分（e.status/e.signal/e.code/e.message）。
     const why = `code=${e.code ?? '-'} status=${e.status ?? '-'} signal=${e.signal ?? '-'}`
-    console.log(`\n  ❌ ${s.name} 失败（${(ms / 1000).toFixed(1)}s｜${why}）`)
+    console.log(`\n  ❌ ${s.name} 失败（${(ms / 1000).toFixed(1)}s${timedOut ? `｜超过每套件上限 ${TEST_TIMEOUT}ms 已强杀` : ''}｜${why}）`)
     if (e.message) console.log(`     ${String(e.message).split('\n')[0]}`)
     console.log('')
   }
