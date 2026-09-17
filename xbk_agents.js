@@ -182,9 +182,11 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
   // AGENTS-07：所有出口都带 kind，调用方可按字段区分 DNS/TLS（两条预热路径的返回值都带 hostname）
   if (signal && signal.aborted) return { kind: 'tls', hostname, count, skipped: true, cancelled: true, ok: false, okCount: 0, elapsedMs: 0 }
   try {
-    // got 替身可能不提供 stream（真实 got 恒有；与 xbk_http.js 的 mock 判定同款）：无法建连时跳过并
-    // 以 skipped:true 标记，ok 沿用既有 skipped→ok 约定（见 xbk_app.js 预热取消分支），未改语义。
-    if (!got.stream) return { kind: 'tls', hostname, count, skipped: true, ok: true, elapsedMs: Date.now() - started }
+    // got 替身可能不提供 stream（真实 got 恒有；与 xbk_http.js 的 mock 判定同款）：无法建连 → skipped:true
+    // 且 ok:false（AGENTS-10）。ok 的语义是「是否真的建连成功」，未建连却报 ok:true 会让聚合预热统计假绿
+    // （okCount=0 却 ok=true）；skipped:true 保留既有「调用方按跳过展示、不计失败」的语义
+    // （xbk_app.js 先判 skipped 再报「跳过」，qinglong 只在 PROFILE3 打点）。
+    if (!got.stream) return { kind: 'tls', hostname, count, skipped: true, ok: false, okCount: 0, error: 'got.stream 不可用（未建连）', elapsedMs: Date.now() - started }
   } catch (e) { /* 忽略 */ }
   // AGENTS-05（已知缺口，未改行为）：本 HEAD→GET 回退只为建连、但 await 会读完整个响应体，而这里没有
   // 体量上限——got@11 无 maxResponseSize 选项，xbk_http.js 的 20MB 上限只覆盖 fetchJson。补上限需要
