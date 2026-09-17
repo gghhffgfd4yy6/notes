@@ -27,9 +27,18 @@ const missingTarget = runChecker(dropLines(yml, ['- name: utils', 'src: "xbk_uti
 assert.notStrictEqual(missingTarget.status, 0, '遗漏生产模块的矩阵必须失败')
 assert.match(missingTarget.stderr, /xbk_utils\.js/, '错误应点名遗漏模块')
 
-const invalidRange = runChecker(yml.replace('xbk_function_v3.js:1-426', 'xbk_function_v3.js:1-427'))
+// 越界行段必须被拒：从矩阵里直接取出 v3 的段尾再 +1，不硬编码行数——
+// 硬编码会在文件增长后让本用例自身失效（v3.270/v3.275 两次都是文件增长先发生的）。
+const v3Range = /xbk_function_v3\.js:1-(\d+)/.exec(yml)
+assert.ok(v3Range, '矩阵里应存在 xbk_function_v3.js 的行段')
+const outOfBoundsTo = String(Number(v3Range[1]) + 1)
+const invalidRange = runChecker(yml.replace(`xbk_function_v3.js:1-${v3Range[1]}`, `xbk_function_v3.js:1-${outOfBoundsTo}`))
 assert.notStrictEqual(invalidRange.status, 0, '超过文件长度的行段必须失败')
-assert.match(invalidRange.stderr, /超过文件实际行数 426/, '错误应说明实际文件行数')
+// 错误文案里的「实际行数」同样从当前文件读取，不硬编码（文件增长时本用例不该失效）
+const v3Raw = fs.readFileSync('xbk_function_v3.js', 'utf8')
+// 与 scripts/check-mutation-ranges.js 的 actualLines 同口径（末行换行不计一行）
+const v3Lines = v3Raw.endsWith('\n') ? v3Raw.split('\n').length - 1 : v3Raw.split('\n').length
+assert.match(invalidRange.stderr, new RegExp(`超过文件实际行数 ${v3Lines}`), '错误应说明实际文件行数')
 
 // matrix 的 src 字段（actions/cache 指纹用）必须与 mutate 目标同文件：写错或缺行都不会让 CI 报错，
 // 只会悄悄让该段的缓存指纹失真
