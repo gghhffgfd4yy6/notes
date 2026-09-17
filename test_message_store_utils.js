@@ -433,4 +433,66 @@ check('resolveCacheDirInRoot: 并行 worker 分片名（xianbaoku_cache_p7）同
   assert.strictEqual(dir, path.join(FAKE_ROOT, 'xianbaoku_cache_p7'), '分片目录名应被根内校验放行')
 })
 
+// ===== F4（B8 回归；V6 实锤数据丢失）=====
+// 反例：_isResidualTombstoneLockName 旧实现第三条判据是 name.includes('.seen.cleanup.lock.')，
+// 于是**合法缓存文件** '<name>.seen.cleanup.lock.json'（上游 pushUrl 末段恰为 xxx.seen.cleanup.lock）
+// 也进了启动清理名单：mtime 陈旧 + 内容不是锁 token（PID 解析失败 → 判「进程已退出」）时被静默
+// unlink，整份判重记录丢失。两层锁定：① 纯函数名单；② 真实目录端到端回收。
+check('F4: 合法缓存文件 <name>.seen.cleanup.lock.json 不得进启动清理名单（数据丢失回归）', () => {
+  const legit = [
+    'v6probe.seen.cleanup.lock.json',
+    'push.json.seen.cleanup.lock.json',
+    'url_x.seen.cleanup.lock.json'
+  ]
+  for (const name of legit) {
+    assert.strictEqual(store._isResidualTombstoneLockName(name), false,
+      `合法缓存文件不得被判为残留锁（旧实现 includes('.seen.cleanup.lock.') 会误判 → 启动清理删盘丢判重记录）：${name}`)
+  }
+  // 反向：真正的残留锁与哨兵中间态必须仍在名单内（改窄不得静默漏回收）
+  for (const name of ['.seen.cleanup.lock', '.seen.cleanup.lock.4242.1700000000000.reclaim', 'push.json.seen.lock']) {
+    assert.strictEqual(store._isResidualTombstoneLockName(name), true, `真残留锁应仍在清理名单：${name}`)
+  }
+  // 近似但非法的形状不得进名单（子串包含式的判据会在这里全部误判）
+  for (const name of ['.seen.cleanup.lock.txt', 'seen.cleanup.lock', '.seen.cleanup.lock.', '.seen.cleanup.lock.x.1.reclaim', '.seen.cleanup.lock.1.2.reclaim.tmp']) {
+    assert.strictEqual(store._isResidualTombstoneLockName(name), false, `非精确形状不得进清理名单：${name}`)
+  }
+})
+
+check('F4: 启动清理真实回收 .reclaim 残留、且不动合法缓存文件（端到端）', () => {
+  const realFs = require('node:fs')
+  const crypto = require('node:crypto')
+  // 探针目录放在被 gitignore 的 xianbaoku_cache 之下：即使异常退出也不会污染 git status
+  const probeDir = path.join(__dirname, 'xianbaoku_cache', `.r4_f4_probe_${process.pid}`)
+  const storeReal = createMessageStore({
+    Config: { cache: { maxSize: 10000 } },
+    Utils: mockUtils,
+    fs: realFs,
+    path,
+    crypto,
+    normalize: () => {},
+    storage: {},
+    constants: { TOMBSTONE_LOCK_STALE_MS: 10000 }
+  })
+  const stale = new Date(Date.now() - 60_000)
+  const legitPath = path.join(probeDir, 'v6probe.seen.cleanup.lock.json')
+  const reclaimPath = path.join(probeDir, '.seen.cleanup.lock.999999.1700000000000.reclaim')
+  const legitBody = JSON.stringify([{ id: 'v6probe', title: '合法判重记录' }])
+  try {
+    realFs.mkdirSync(probeDir, { recursive: true })
+    realFs.writeFileSync(legitPath, legitBody)
+    realFs.writeFileSync(reclaimPath, '999999:0:dead-owner')
+    realFs.utimesSync(legitPath, stale, stale)
+    realFs.utimesSync(reclaimPath, stale, stale)
+    storeReal._tombstoneLocksCleaned.delete(probeDir)
+    storeReal._cleanupResidualTombstoneLocks(probeDir)
+    assert.strictEqual(realFs.existsSync(legitPath), true,
+      '合法缓存文件（URL 末段恰为 xxx.seen.cleanup.lock）必须保留：被启动清理删除即判重记录丢失')
+    assert.strictEqual(realFs.readFileSync(legitPath, 'utf8'), legitBody, '合法缓存文件内容不得被改动')
+    assert.strictEqual(realFs.existsSync(reclaimPath), false,
+      '陈旧且持有进程已退出的 .reclaim 残留必须被启动清理回收（这是本条的真正增量）')
+  } finally {
+    try { realFs.rmSync(probeDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+  }
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

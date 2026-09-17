@@ -295,10 +295,22 @@ function createMessageStore ({
     },
 
     /** 启动清理的候选名判定：覆盖单文件墓碑锁、目录级清理哨兵与其 .reclaim 中间态。
-   *  纯函数，供测试直接锁定名单（改窄会静默漏回收，见 F4）。 */
+   *  **只按精确形状匹配，绝不用子串包含**（F4 回归，V6 实锤）：旧实现第三条判据是
+   *  `name.includes('.seen.cleanup.lock.')`，于是**合法缓存文件** `<name>.seen.cleanup.lock.json`
+   *  （上游 pushUrl 末段恰为 `xxx.seen.cleanup.lock`，getFileName 只补 `.json` 后缀）也被当作残留锁；
+   *  它的 mtime 一旦陈旧、内容又不是锁 token（PID 解析失败 → 视为「进程已退出」），
+   *  就会被启动清理静默 unlink——直接丢失该 pushUrl 的整份判重记录，下一轮全量重推。
+   *  三条判据各自的形状来源：
+   *    1) `<缓存文件>.seen.lock` —— _acquireTombstoneLock 的锁路径；
+   *    2) `.seen.cleanup.lock` —— _acquireTombstoneCleanupGuard 的哨兵（精确相等）；
+   *    3) `.seen.cleanup.lock.<pid>.<ts>.reclaim` —— 同上哨兵的原子认领中间态（命名逐字段对齐：
+   *       十进制进程号 + 十进制毫秒时间戳 + 字面 .reclaim）。
+   *  纯函数，供测试直接锁定名单。 */
     _isResidualTombstoneLockName (name) {
       if (typeof name !== 'string') return false
-      return name.endsWith('.seen.lock') || name.endsWith('.seen.cleanup.lock') || name.includes('.seen.cleanup.lock.')
+      if (name.endsWith('.seen.lock')) return true
+      if (name === '.seen.cleanup.lock') return true
+      return /^\.seen\.cleanup\.lock\.\d+\.\d+\.reclaim$/.test(name)
     },
 
     /** 目录级非阻塞哨兵：串行化启动清理与墓碑锁创建，覆盖检查-删除竞态。 */

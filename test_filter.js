@@ -8928,6 +8928,50 @@ console.log('========================================\n');
     assertEqual(MessageStore._isResidualTombstoneLockName('.seen.cleanup.lock.123.456.reclaim'), true, '.reclaim 中间态应在名单内')
     assertEqual(MessageStore._isResidualTombstoneLockName('push.json'), false, '普通缓存文件不得进清理名单')
     assertEqual(MessageStore._isResidualTombstoneLockName('push.json.seen.json'), false, '墓碑数据文件不得进清理名单')
+    // R4（V6 数据丢失回归）：合法缓存文件的**完整产物**不得进名单。旧判据用子串包含
+    // includes('.seen.cleanup.lock.')，'<name>.seen.cleanup.lock.json' 会命中 → 启动清理静默 unlink。
+    assertEqual(MessageStore._isResidualTombstoneLockName('v6probe.seen.cleanup.lock.json'), false,
+      '合法缓存文件 <name>.seen.cleanup.lock.json（URL 末段恰为 xxx.seen.cleanup.lock）不得进清理名单')
+    assertEqual(MessageStore._isResidualTombstoneLockName('url_.seen.cleanup.lock.json'), false, '带 url_ 前缀的合法缓存文件同样不得进名单')
+    assertEqual(MessageStore._isResidualTombstoneLockName('push.json.seen.cleanup.lock.json'), false, '缓存文件 + 合法后缀同样不得进名单')
+  })
+
+  await test('B8-F4: 合法缓存文件 xxx.seen.cleanup.lock.json 不得被启动清理删除（V6 数据丢失回归）', () => {
+    const fsmod = require('node:fs')
+    const inner = 'v6probe' + Date.now() + '.seen.cleanup.lock'
+    const name = inner + '.json' // 即 getFileName('https://example.com/v6probe…seen.cleanup.lock') 的真实产物
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    const body = JSON.stringify([{ id: 'v6probe-legit', title: '合法判重记录' }])
+    const past = new Date(Date.now() - 60000)
+    fsmod.writeFileSync(fp, body)
+    fsmod.utimesSync(fp, past, past) // 陈旧 mtime：旧实现正是在这里被判残留锁后 unlink
+    MessageStore._tombstoneLocksCleaned.delete(dir)
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(fp), true, '合法缓存文件必须保留——被启动清理删除即整份判重记录丢失（下一轮全量重推）')
+      assertEqual(fsmod.readFileSync(fp, 'utf8'), body, '合法缓存文件内容不得被改动')
+    } finally {
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F4: 陈旧 .reclaim 残留必须被启动清理回收（B8 的真正增量；旧实现保留）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f4_reclaim_' + Date.now() + '.json'
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    const reclaimPath = path.join(dir, '.seen.cleanup.lock.999999.1700000000000.reclaim')
+    const past = new Date(Date.now() - 60000)
+    fsmod.writeFileSync(reclaimPath, '999999:0:dead-owner')
+    fsmod.utimesSync(reclaimPath, past, past)
+    MessageStore._tombstoneLocksCleaned.delete(dir)
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(reclaimPath), false, '陈旧且持有进程已退出的 .reclaim 残留应被回收（回退该判据即红）')
+    } finally {
+      try { fsmod.unlinkSync(reclaimPath) } catch (e) { /* 忽略 */ }
+    }
   })
 
   await test('B8-F5: 磁盘文件存在但读不到时写闸门拒绝覆写（现状契约锁定）', () => {
