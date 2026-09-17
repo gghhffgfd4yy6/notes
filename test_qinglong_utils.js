@@ -8,7 +8,8 @@ const {
   ensureDependencies,
   intervalMs,
   retryBackoffMs,
-  runDryRunOnce
+  runDryRunOnce,
+  nodeVersionWarning
 } = require('./qinglong/xbk_push')
 
 ;(async () => {
@@ -202,6 +203,12 @@ const {
   assert.match(pushSource, /if\s*\(\s*hasArg\(\s*['"]--dry-run['"]\s*\)\s*\)\s*\{[\s\S]*?runDryRunOnce\(app\)[\s\S]*?return\s*\}/,
     '--dry-run 必须接线到一次性 runDryRunOnce 并在其后 return（不得落入常驻循环）')
   assert.match(pushSource, /await\s+runResident\(app,\s*controller\)/, '常驻路径必须仍然存在（防"删掉常驻"式假修复）')
+
+  // ===== QX-06：常驻路径的 Node 版本告警文案 =====
+  assert.strictEqual(nodeVersionWarning('22.22.2'), null, '恰为 engines 下界不应告警')
+  assert.strictEqual(nodeVersionWarning('24.18.0'), null, '高于下界不应告警')
+  assert.match(String(nodeVersionWarning('22.21.0')), /低于 package\.json engines 要求（>=22\.22\.2）/, '低于下界应给出与 engines 对齐的告警')
+  assert.match(String(nodeVersionWarning('20.11.0')), /低于 package\.json engines 要求/, '主版本低于 22 同样应告警')
 
   console.log('test_qinglong_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })

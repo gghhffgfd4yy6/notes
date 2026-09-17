@@ -25,7 +25,8 @@ function loadApp () {
   }
 }
 
-// 与 package.json engines.node（>=22.22.2）对齐的版本下界，仅用于提示；见下方 runCheck 的告警分支。
+// 与 package.json engines.node（>=22.22.2）对齐的版本下界：--check 的硬闸门按它判定（QX-06），
+// 常驻主路径只据此告警——不硬拒启动，避免把「Node 略旧但 got/re2 都可用」的既有部署直接打断。
 const MIN_NODE_VERSION = [22, 22, 2]
 
 function isBelowMinNodeVersion (version = process.versions.node, min = MIN_NODE_VERSION) {
@@ -40,19 +41,25 @@ function isBelowMinNodeVersion (version = process.versions.node, min = MIN_NODE_
   return false
 }
 
+// QX-06：常驻主路径此前完全不看 Node 版本，低于 engines 的环境静默运行；这里给出与 --check
+// 同源的告警文案（返回 null 表示无需告警），由 main() 在进入常驻循环前打印。
+function nodeVersionWarning (version = process.versions.node) {
+  if (!isBelowMinNodeVersion(version)) return null
+  return `⚠️ 当前 Node ${version} 低于 package.json engines 要求（>=${MIN_NODE_VERSION.join('.')}），re2 等原生依赖可能不可用`
+}
+
 function runCheck (app) {
   const checks = []
   const add = (name, ok, detail) => {
     checks.push({ name, ok, detail })
     console.log(`${ok ? '✅' : '❌'} ${name}${detail ? `：${detail}` : ''}`)
   }
-  add('Node.js 版本', Number(process.versions.node.split('.')[0]) >= 22, process.version)
-  // 该闸门只看主版本（major>=22），与 package.json engines（>=22.22.2）口径不一致；
-  // 收紧为完整版本比较会改红 test_qinglong_runcheck.js 用 '22.0.0' 伪装的健康环境用例，
-  // 故此处只把差异显式告警出来，不改变既有通过条件（QX-06 仅取零风险的一半）。
-  if (Number(process.versions.node.split('.')[0]) >= 22 && isBelowMinNodeVersion()) {
-    console.warn(`⚠️ 当前 Node ${process.versions.node} 低于 package.json engines 要求（>=22.22.2），re2 等原生依赖可能不可用`)
-  }
+  // QX-06：闸门与 package.json engines（>=22.22.2）及 CI 矩阵（22.22.2 / 24）同口径。
+  // 旧实现只看主版本（major>=22），于是 Node 22.0.0 这类低于 engines 的环境会被 --check 放行。
+  const nodeOk = !isBelowMinNodeVersion()
+  add('Node.js 版本', nodeOk, nodeOk
+    ? process.version
+    : `${process.version}（低于 package.json engines 要求的 >=${MIN_NODE_VERSION.join('.')}）`)
   try {
     require('got')
     add('got 依赖', true, '可加载')
@@ -363,6 +370,8 @@ async function main () {
     }
     return
   }
+  const versionWarning = nodeVersionWarning()
+  if (versionWarning) console.warn(versionWarning)
   const controller = new AbortController()
   const stop = () => controller.abort()
   // v3.262：用 process.on 而非 once——once 在首次信号后移除监听，第二次信号会走 Node
@@ -389,4 +398,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { classifyFailure, classifySummary, runResident, runDryRunOnce, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs, runCheck, hasArg }
+module.exports = { classifyFailure, classifySummary, runResident, runDryRunOnce, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs, runCheck, hasArg, nodeVersionWarning }
