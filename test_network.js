@@ -383,5 +383,38 @@ function makeNetwork (opts = {}) {
     }
   }
 
+  // 17. net-2 注释口径锁定（V4 #3 注释漂移）：xbk_network.js 的 DNS 预热注释声明「缓存/pending key 只含
+  // hostname|family（AGENTS-01 起），故预热与真实请求三种 family 模式下同 key」。这里不靠读注释，直接
+  // 用 xbk_agents 的真实现断言：① 预热一次后用**真实请求形状**的 lookup 选项（含 hints/all，family 由
+  // baseRequestOptions 的 dnsLookupIpVersion 同源决定）再查 → 必须命中预热写入的缓存、不得二次解析；
+  // ② 反向：family 不同 → key 不同 → 必须重新解析。旧口径（key 含 hints/all/verbatim）下 ① 会二次解析。
+  {
+    const dns = require('dns')
+    const originalLookup = dns.lookup
+    let calls = 0
+    dns.lookup = (hostname, options, callback) => { calls += 1; callback(null, '192.0.2.1', 4) }
+    try {
+      delete require.cache[require.resolve('./xbk_agents')]
+      const { prewarmDns, dnsLookup, DNS_LOOKUP_IP_VERSION } = require('./xbk_agents')
+      const host = 'net2-key-probe.invalid'
+      const lookupOnce = (options) => new Promise((resolve, reject) => {
+        dnsLookup(host, options, (err, address, family) => (err ? reject(err) : resolve({ address, family })))
+      })
+      await prewarmDns(host)
+      assert.strictEqual(calls, 1, '前置：预热应发起一次解析')
+      // 真实请求形状：got 把 dnsLookupIpVersion 写进 requestOptions.family，net.connect 再传给 lookup；
+      // 未设 XBK_DNS_FAMILY 时 family 为 undefined（dnsCacheKey 归一为 0），强制时是 4/6。
+      const realFamily = DNS_LOOKUP_IP_VERSION === 'ipv4' ? 4 : DNS_LOOKUP_IP_VERSION === 'ipv6' ? 6 : undefined
+      const hit = await lookupOnce({ family: realFamily, hints: 1024, all: true })
+      assert.ok(hit.address, '真实请求形状的 lookup 应返回地址')
+      assert.strictEqual(calls, 1, '预热与真实请求必须同 key（hostname|family）→ 真实请求应命中预热条目（旧口径含 hints/all/verbatim，此处会二次解析）')
+      await lookupOnce({ family: realFamily === 6 ? 4 : 6 })
+      assert.strictEqual(calls, 2, '反向：family 不同 → key 不同 → 必须重新解析（key 只含 hostname|family）')
+    } finally {
+      dns.lookup = originalLookup
+      delete require.cache[require.resolve('./xbk_agents')]
+    }
+  }
+
   console.log('test_network OK')
 })().catch((e) => { console.error(e); process.exit(1) })
