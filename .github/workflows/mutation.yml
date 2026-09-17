@@ -205,6 +205,15 @@ jobs:
         run: |
           node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
 
+      # F1：缓存（path: reports）会把上一次运行的 reports/mutation/mutation.json 一并恢复，而 stryker 的
+      # json 报告不含任何时间戳（内容上无法与本次产出区分）。若本段 stryker 崩溃/被 6h 取消，这个陈旧报告
+      # 会被 artifact 原样带上、被日报当成「本次结果」发布。这里先删掉旧报告产物，让「本段没产出报告」表现
+      # 为「缺 mutation-report.json」——mutation-report.js 的完整性闸门会直接拒绝发布（不依赖文件时间，
+      # 是 mtime 不可靠时的兜底；scripts/mutation-report.js 的 validateFreshness 是另一层）。
+      # 只删报告产物目录，保留 reports/inc-<段>.json（--incremental 的断点续跑基线）。
+      - name: 清理缓存回填的旧报告
+        run: rm -rf reports/mutation reports/mutation.html
+
       - name: 变异测试（${{ matrix.name }}）
         run: npx stryker run --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 2
         env:

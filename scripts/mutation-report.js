@@ -25,6 +25,54 @@ const MUTANT_STATUSES = new Set([
 // F7：去重列表查询的整体超时（毫秒）——列表 API 只回答「当天是否已发过」，挂住不能拖死整个日报 job。
 const LIST_QUERY_TIMEOUT_MS = 15000
 
+// F1：新鲜度闸门阈值（缓存回填检测）。参考基准是「本批报告文件里最新的 mtime」：
+//   * 同一次 CI 运行内各段 matrix job 并行执行，单 job 默认上限 6h，正常产出的 mtime 跨度不可能超过 6h；
+//   * 段 job 崩溃/被 6h 取消时，actions/cache 恢复出来的上一次运行的 reports/mutation/mutation.json
+//     被原样带进 artifact——其 mtime 与当日其它段相差 ≥12h（日报每日一轮）。
+// 故默认 12h：远大于正常跨度、小于跨日缓存的陈旧跨度。可用 MUTATION_REPORT_MAX_SKEW_MS 覆盖
+// （单位毫秒；`off` 或 ≤0 关闭该闸门；无法解析的值回落到默认值，不静默关闭闸门）。
+const DEFAULT_MAX_SKEW_MS = 12 * 60 * 60 * 1000
+
+// 阈值解析是纯函数（不读环境变量 → 测试 hermetic）；调用点显式把环境变量传进来。
+function resolveMaxSkewMs (raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_MAX_SKEW_MS
+  if (String(raw).trim().toLowerCase() === 'off') return 0
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return DEFAULT_MAX_SKEW_MS // 配置笔误不得把闸门静默关掉
+  return n > 0 ? n : 0
+}
+
+/**
+ * F1：陈旧（缓存回填）报告闸门。
+ *
+ * 「某段 stryker 崩溃/被取消 → artifact 里是上一次运行的 mutation.json」这一形态在**内容**上与正常
+ * 报告无法区分（stryker 的 json reporter 不写任何时间戳，见 mutation-testing-report-schema 的顶层
+ * properties：config/schemaVersion/files/testFiles/thresholds/projectRoot/performance/framework/system），
+ * 因此只能看文件时间：与最新报告相差超过阈值即判为陈旧。
+ *
+ * fail-open 边界（如实登记）：若 artifact 上传/下载不保留 mtime（各段 mtime 被归一为下载时间），
+ * 本闸门不触发、也不会误红；该场景由 .github/workflows/mutation.yml 的「清理缓存回填的旧报告」步骤
+ * 兜底——崩溃段根本没有 mutation.json，走「缺 mutation-report.json」分支拒绝发布。
+ *
+ * @param {Array<{seg: string, error?: string, reportMtimeMs?: number}>} results 已分析的分段结果
+ * @param {number} [maxSkewMs] 允许的最大时间跨度（≤0 关闭闸门）；缺省读 `MUTATION_REPORT_MAX_SKEW_MS`
+ * @returns {Array<object>} 原始分段结果
+ * @throws {Error} 存在明显陈旧的报告时抛出
+ */
+function validateFreshness (results, maxSkewMs = resolveMaxSkewMs(process.env.MUTATION_REPORT_MAX_SKEW_MS)) {
+  if (!(maxSkewMs > 0)) return results
+  const dated = results.filter(r => !r.error && Number.isFinite(r.reportMtimeMs))
+  if (dated.length < 2) return results // 无可比较对象（单段/全为 error）：交由 validateSegments 判定
+  const newest = dated.reduce((a, b) => (a.reportMtimeMs >= b.reportMtimeMs ? a : b))
+  const stale = dated.filter(r => newest.reportMtimeMs - r.reportMtimeMs > maxSkewMs)
+  if (stale.length === 0) return results
+  const hours = (ms) => Math.round((ms / 3600000) * 10) / 10
+  const detail = stale
+    .map(r => `${r.seg}（报告文件时间比最新报告早 ${hours(newest.reportMtimeMs - r.reportMtimeMs)} 小时）`)
+    .join('；')
+  throw new Error(`变异测试报告疑似缓存回填（陈旧）：${detail}；拒绝发布口径不符的日报`)
+}
+
 function analyze (dir) {
   // S8707：CLI 参数显式校验（防 LLM/错误参数访问任意路径——先验证存在且是目录）
   let st
@@ -173,7 +221,22 @@ function analyzeSegment (dir, entry) {
     noCoverage: stats.noCoverage,
     timeout: stats.timeout,
     score: Math.round(score * 100) / 100,
-    survivedMutants: stats.survivedMutants
+    survivedMutants: stats.survivedMutants,
+    // F1：报告文件时间——内容层面无法区分「本次运行」与「缓存回填的陈旧报告」（stryker 的 json
+    // report 不含时间戳），新鲜度闸门（validateFreshness）据此比较各段跨度。stat 失败不单列分支：
+    // 上面已成功读到文件，取不到时间只说明文件被并发删除，此时 reportMtimeMs 为 undefined，
+    // 该段不参与新鲜度比较（不误红），缺段/损坏仍由 validateSegments 负责。
+    reportPath,
+    reportMtimeMs: readMtimeMs(reportPath)
+  }
+}
+
+// F1：读取报告文件的 mtime（毫秒）；读不到返回 undefined（该段退出新鲜度比较，不误判为陈旧）
+function readMtimeMs (filePath) {
+  try {
+    return fs.statSync(filePath).mtimeMs
+  } catch (e) {
+    return undefined
   }
 }
 
@@ -383,6 +446,7 @@ async function main () {
     process.exit(1)
   }
   const results = validateSegments(analyze(dir))
+  validateFreshness(results) // F1：内容齐全之后再看新鲜度（陈旧报告不得照发日报）
   const body = render(results)
   console.log(body)
   if (process.argv.includes('--issue')) {
@@ -406,4 +470,4 @@ if (require.main === module) {
 }
 
 // 导出供测试（不导出 main：依赖 CLI 副作用；postIssue 导出以便 mock fetch 测去重/错误处理逻辑）
-module.exports = { analyze, validateSegments, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate, postIssue, EXPECTED_SEGMENTS }
+module.exports = { analyze, validateSegments, validateFreshness, resolveMaxSkewMs, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate, postIssue, EXPECTED_SEGMENTS }

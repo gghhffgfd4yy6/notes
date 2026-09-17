@@ -64,4 +64,5 @@
 - 请求超时口径：`api.timeout` 只接受 ≥100ms 的整数并钳到 `[100, 2147483647]`，非整数、亚 100ms（单位误填，如按毫秒写「5 秒」）与非正值一律回落默认 5000 并告警——此前小数被向上取整、小值原样传出，会让每次请求瞬间超时且现象是「请求超时」而非「配置有问题」。
 - 重试退避遵守 `Retry-After`：接口请求在 429/408/425/503 返回该头（非负整数秒或 HTTP-date）时按服务端指示的时长等待（日志注明「按 Retry-After」），缺失/非法才回落指数退避；两条路径统一受 30s 上限保护（此前外层退避完全不读该头，限流窗口内按固定指数退避反复撞墙）。
 - 变异日报发布容错：同天去重的列表查询改为整体容错——非 2xx / 网络异常 / 200 但响应体非 JSON 一律按既有口径「跳过去重直接创建」并 warn 留痕（此前 `await listRes.json()` 未包 try，列表 API 返回 200 非 JSON 会让整个 run 失败、当天日报不发），并给列表查询加 15s `AbortSignal` 超时（此前无超时，列表接口挂住会拖死 report job）。
+- 变异日报补「陈旧（缓存回填）」闸门：段 job 崩溃/被 6h 取消时，artifact 里会是 actions/cache 回填的上一次运行的 `mutation.json`（内容合法、stryker 报告不含任何时间戳，旧实现只能照发日报）。新增 `validateFreshness`——以本批报告文件里最新的 mtime 为基准，偏差超过 `MUTATION_REPORT_MAX_SKEW_MS`（默认 12h，`off`/≤0 关闭）的段判为陈旧并拒绝发布，错误逐段给出偏差小时数；同时 `mutation.yml` 在跑 stryker 前删除缓存回填的 `reports/mutation`，让崩溃段表现为「缺 mutation-report.json」（这一层不依赖 artifact 是否保留 mtime）。
 

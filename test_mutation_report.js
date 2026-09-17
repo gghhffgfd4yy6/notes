@@ -8,7 +8,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const {
-  render, validateSegments, shanghaiDate, escCell, countMutant,
+  render, validateSegments, validateFreshness, resolveMaxSkewMs, shanghaiDate, escCell, countMutant,
   collectStats, findReportJson, analyzeSegment, analyze, postIssue
 } = require('./scripts/mutation-report.js')
 
@@ -178,6 +178,46 @@ check('validateSegments 分段重复时拒绝发布', () => {
   )
 })
 
+// ===== F1：新鲜度闸门（缓存回填的陈旧报告）=====
+// 报告内容与 stryker schema 完全合法，但文件时间远早于当日其它段——这正是「某段 stryker 崩溃/被 6h
+// 取消 → artifact 里是 actions/cache 恢复的上一次运行产物」的形态。旧实现只做名称级校验 → 照发日报。
+check('validateFreshness 正常跨度放行、陈旧段拒绝、可显式关闭', () => {
+  const H = 3600 * 1000
+  const now = Date.now()
+  const fresh = [{ seg: 'a', reportMtimeMs: now }, { seg: 'b', reportMtimeMs: now - 5.9 * H }]
+  assert.deepStrictEqual(validateFreshness(fresh), fresh, '6h 内的正常跨度（单 job 上限）必须放行')
+  const withinThreshold = [{ seg: 'a', reportMtimeMs: now }, { seg: 'b', reportMtimeMs: now - 11.9 * H }]
+  assert.deepStrictEqual(validateFreshness(withinThreshold), withinThreshold, '阈值内的跨度放行')
+  const stale = [{ seg: 'a', reportMtimeMs: now }, { seg: 'b', reportMtimeMs: now - 24 * H }]
+  assert.throws(
+    () => validateFreshness(stale),
+    /疑似缓存回填（陈旧）：b（报告文件时间比最新报告早 24 小时）/,
+    '跨日缓存回填（24h）必须拒绝发布并指出段名与偏差'
+  )
+  // 阈值确实在起作用（把窗口压到 1h，5.9h 的跨度即判陈旧）——证明结论来自阈值比较而非巧合
+  assert.throws(() => validateFreshness(fresh, 1 * H), /疑似缓存回填（陈旧）：b/)
+  // 可比对象不足 / error 段 / 缺 mtime 的段不得被当成「陈旧」误红（误红会阻断正常日报）
+  assert.deepStrictEqual(validateFreshness([{ seg: 'a', reportMtimeMs: now }]), [{ seg: 'a', reportMtimeMs: now }])
+  const mixed = [{ seg: 'a', reportMtimeMs: now }, { seg: 'b', error: '缺 mutation-report.json' }, { seg: 'c' }]
+  assert.deepStrictEqual(validateFreshness(mixed), mixed, 'error 段/无 mtime 段不参与比较')
+  // 显式关闭（≤0）
+  assert.deepStrictEqual(validateFreshness(stale, 0), stale, 'maxSkewMs=0 关闭闸门')
+})
+
+check('resolveMaxSkewMs 阈值解析（默认 12h / off 与 ≤0 关闭 / 非法值回落默认）', () => {
+  const DEFAULT = 12 * 3600 * 1000
+  assert.strictEqual(resolveMaxSkewMs(undefined), DEFAULT, '缺省 12h')
+  assert.strictEqual(resolveMaxSkewMs(null), DEFAULT, 'null 按缺省')
+  assert.strictEqual(resolveMaxSkewMs(''), DEFAULT, '空串按缺省')
+  assert.strictEqual(resolveMaxSkewMs('   '), DEFAULT, '全空白按缺省')
+  assert.strictEqual(resolveMaxSkewMs('off'), 0, 'off 关闭')
+  assert.strictEqual(resolveMaxSkewMs(' OFF '), 0, '大小写与空白不敏感')
+  assert.strictEqual(resolveMaxSkewMs('0'), 0, '0 关闭')
+  assert.strictEqual(resolveMaxSkewMs('-5'), 0, '负数关闭')
+  assert.strictEqual(resolveMaxSkewMs('3600000'), 3600000, '显式毫秒生效')
+  assert.strictEqual(resolveMaxSkewMs('abc'), DEFAULT, '无法解析 → 回落默认（不得静默关掉闸门）')
+})
+
 // ===== escCell：Markdown 表格单元格转义 =====
 check('escCell 转义竖线/反斜杠/换行/反引号', () => {
   assert.strictEqual(escCell('hello'), 'hello')
@@ -258,8 +298,14 @@ try {
     assert.strictEqual(r.killed, 1); assert.strictEqual(r.survived, 1)
     assert.strictEqual(r.noCoverage, 1); assert.strictEqual(r.timeout, 1)
     assert.strictEqual(r.score, 50)
+    // F1：正常段必须带上报告文件时间（新鲜度闸门的输入）；取不到时间的段会被排除在比较之外
+    assert.strictEqual(r.reportPath, path.join(d, 'mutation.json'), '正常段应返回报告路径')
+    assert.ok(Number.isFinite(r.reportMtimeMs), `正常段应返回可比较的 mtime，实际 ${r.reportMtimeMs}`)
+    assert.ok(Math.abs(r.reportMtimeMs - fs.statSync(path.join(d, 'mutation.json')).mtimeMs) < 1,
+      '返回的 mtime 必须是该报告文件自身的时间')
     const missing = analyzeSegment(tmp, { name: 'mutation-report-nonexist' })
     assert.strictEqual(missing.error, '缺 mutation-report.json')
+    assert.strictEqual(missing.reportMtimeMs, undefined, '缺报告的段不带时间（不参与新鲜度比较）')
   })
 
   // F4：报告顶层为 null/原始值时显式失败并走段级隔离。
