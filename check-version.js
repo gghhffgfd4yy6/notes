@@ -32,6 +32,27 @@ function patchOf (v) {
   return m[1] === undefined ? '0' : m[1]
 }
 
+// x.y 两段式版本比较（按数值而非字典序：3.100 > 3.99）。
+function compareBaseVersion (a, b) {
+  const pa = String(a).split('.')
+  const pb = String(b).split('.')
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const d = (Number.parseInt(pa[i], 10) || 0) - (Number.parseInt(pb[i], 10) || 0)
+    if (d !== 0) return d
+  }
+  return 0
+}
+
+// F5：CHANGELOG 的「最新」取版本号最大值，而不是文件里最后一条——文件顺序（正序/倒序/顶插）不再
+// 参与判定。旧实现按位置取末条，把新条目顶插到 `# Changelog` 之后时会误红（安全方向，但对正序
+// 约定之外的合法写法是假失败）。无版本条目时返回 null。
+function latestChangelogVersion (changelog) {
+  const versions = [...String(changelog === undefined || changelog === null ? '' : changelog)
+    .matchAll(/^##\s*v?(\d+\.\d+)/gm)].map(m => m[1])
+  if (!versions.length) return null
+  return versions.reduce((max, v) => (compareBaseVersion(v, max) > 0 ? v : max))
+}
+
 // 纯判定（无 I/O）：ok=false 时 messages 为要打印的错误行（含 ❌ 前缀）。
 function checkVersionValues ({ headLine, changelog, pkgVersion } = {}) {
   const messages = []
@@ -46,15 +67,11 @@ function checkVersionValues ({ headLine, changelog, pkgVersion } = {}) {
     return { ok: false, messages }
   }
 
-  const versions = [...String(changelog === undefined || changelog === null ? '' : changelog)
-    .matchAll(/^##\s*v?(\d+\.\d+)/gm)]
-  if (!versions.length) {
+  const latestCl = latestChangelogVersion(changelog)
+  if (!latestCl) {
     fail('CHANGELOG 未找到版本条目')
     return { ok: false, messages }
   }
-  // F5：隐式约定 CHANGELOG 为正序（v3.123 起，最新在底部），故取最后一条；若有人按常见习惯把
-  // 新条目顶插到 `# Changelog` 之后，这里会误红（安全方向），需人工确认顺序约定，这里不改成取最大版本。
-  const latestCl = versions[versions.length - 1][1]
 
   // 基准取自主文件头。F2：旧代码把 package.json 自身归一结果当基准、又把它放进 parts 自比，
   // package.json ≠ package.json 恒为假 → 那一项是永远进不了 bad 的死检查；现改为两侧各自独立
@@ -116,4 +133,4 @@ if (require.main === module) {
   if (!result.ok) process.exitCode = 1
 }
 
-module.exports = { baseVersion, patchOf, checkVersionValues, checkVersion }
+module.exports = { baseVersion, patchOf, compareBaseVersion, latestChangelogVersion, checkVersionValues, checkVersion }
