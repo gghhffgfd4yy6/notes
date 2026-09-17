@@ -103,8 +103,13 @@ for (const r of results) {
   if (!r.ok) allOk = false
 }
 const totalMs = results.reduce((a, r) => a + r.ms, 0)
+const passCount = results.filter(r => r.ok).length
+const failCount = results.length - passCount
 console.log(`\n  总耗时: ${(totalMs / 1000).toFixed(1)}s`)
-console.log(`  结果:   ${allOk ? '全部通过 🎉' : '存在失败 ⚠️'}`)
+// 汇总行格式与 run_unit_tests.js 同一跨文件契约（UT-07）：带「K 通过, M 失败, 共 N」三数字，
+// 才能被 run_mutation.js 的 extractTestSummary 识别为本入口的汇总（内层套件 stdout 直通时
+// 不被更早的同名行抢答）。改格式需同步 run_unit_tests.js 与 run_mutation.js 的解析口径。
+console.log(`  结果:   ${allOk ? '全部通过 🎉' : '存在失败 ⚠️'}｜${passCount} 通过, ${failCount} 失败, 共 ${results.length}`)
 console.log('══════════════════════════════════════════════')
 
 process.exit(allOk ? 0 : 1)

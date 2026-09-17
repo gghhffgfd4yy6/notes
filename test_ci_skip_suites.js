@@ -435,6 +435,9 @@ function runRunTestsIn (dir, env = {}, extra = {}) {
     ...extra
   })
 }
+// 汇总行 ↔ run_mutation.js 解析口径的跨文件契约（UT-07），3g2 与 3h 共用同一解析实现
+// （不另写一份正则，避免测试与生产口径漂移）。
+const { extractTestSummary } = require('./run_mutation')
 
 // 3g1 空注册表（SUITES=[]）必须非 0：修复前 allOk 初值 true → 「全部通过 🎉」并 exit 0（门禁假绿）
 const emptyDir = makeRunTestsSandbox([])
@@ -464,6 +467,10 @@ try {
   assert.notStrictEqual(diag.status, 0, '失败套件必须非 0 退出')
   assert.match(diag.stdout, /status=7/, '静默非零退出（exit 7）必须把退出码打进输出')
   assert.match(diag.stdout, /signal=SIGKILL/, '被信号杀死的套件必须把 signal 打进输出')
+  // RT-02/UT-07 同源锁定：run_tests.js 的汇总行也必须带「K 通过, M 失败, 共 N」三数字，
+  // 否则 extractTestSummary 会命中更早的内层行（此沙箱里没有诱饵，修复前返回空数组）。
+  assert.deepStrictEqual(extractTestSummary(diag.stdout), ['0', '2', '2'],
+    'run_tests.js 汇总行必须被 extractTestSummary 识别（0 通过, 2 失败, 共 2）')
 } finally {
   fs.rmSync(diagDir, { recursive: true, force: true })
 }
@@ -488,6 +495,35 @@ try {
   assert.ok(elapsed < 20000, `入口应在每套件上限后很快结束（实测 ${elapsed}ms）`)
 } finally {
   fs.rmSync(hangDir, { recursive: true, force: true })
+}
+
+// 3h run_unit_tests.js 的汇总行必须能被 run_mutation.js 的 extractTestSummary 识别（UT-07）：
+//    变异评估下内层套件 stdout 与本入口共用同一捕获管道，若本入口汇总行不含「K 通过, M 失败, 共 N」
+//    三数字，extractTestSummary 会继续向上扫描并命中内层套件的同名行（如 test_filter.js:8746 的
+//    「🎉 全部通过！785/785」）→ 逐变异体 summary 误归属内层套件。此处用诱饵行复现：内层桩套件打印
+//    「全部通过！7/7」，外层只跑 1 个套件，断言取到外层的 1/0/1 而不是诱饵的 7/7。
+function makeUnitTestsSandbox (suites, files = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-unit-tests-'))
+  fs.copyFileSync(path.join(__dirname, 'run_unit_tests.js'), path.join(dir, 'run_unit_tests.js'))
+  fs.writeFileSync(path.join(dir, 'test_suites.js'), `module.exports = { SUITES: ${JSON.stringify(suites)} }\n`)
+  for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
+  return dir
+}
+const summaryDir = makeUnitTestsSandbox(
+  [{ name: '内层诱饵', file: 'test_stub_decoy.js', desc: '打印可被 extractTestSummary 命中的诱饵行' }],
+  { 'test_stub_decoy.js': "console.log('🎉 全部通过！7/7  100%')\nprocess.exit(0)\n" }
+)
+try {
+  const unitEnv = { ...baseEnv }
+  delete unitEnv.GITHUB_STEP_SUMMARY
+  const unitRun = spawnSync(process.execPath, [path.join(summaryDir, 'run_unit_tests.js')],
+    { encoding: 'utf8', cwd: summaryDir, env: unitEnv })
+  assert.strictEqual(unitRun.status, 0, unitRun.stderr || unitRun.stdout)
+  assert.match(unitRun.stdout, /全部通过！7\/7/, '夹具自身应先出现内层诱饵行（否则本回归形同虚设）')
+  assert.deepStrictEqual(extractTestSummary(unitRun.stdout), ['1', '0', '1'],
+    '本入口汇总行必须被 extractTestSummary 识别为本入口的数字（1 套件全通过），不得被内层套件的「全部通过！7/7」抢答')
+} finally {
+  fs.rmSync(summaryDir, { recursive: true, force: true })
 }
 
 // 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加
