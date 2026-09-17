@@ -1506,11 +1506,16 @@ function createApp ({
           }
           if (sent && Array.isArray(sent.failures)) channelFailures.push(...sent.failures)
           if (result.failure) {
-            // APP2-03：此 successfulChannels 分支当前不可达——result.failure 的唯一来源是
-            // summarizeError(e)（xbk_failure_policy.js），其 info 只透传 code/name/statusCode/
-            // providerCode/channel/message(+条件性 failureKind/failureReason/failures)，从不含
-            // successfulChannels；投递层也只在「全部通道失败」时才抛，此时该数组恒为空。
-            // 保留以便 summarizeError 未来透出该字段时自动生效；补齐需改 failure_policy（跨文件）。
+            // APP2-03：result.failure 的来源是 summarizeError(e)（xbk_failure_policy.js）。投递层
+            // 只在「全部通道失败」时抛错（xbk_sendNotify_slim.js:1573 `okCount === 0`），此时
+            // successfulChannels 恒为空数组——该分支不可达。
+            // 返工结论（R1a）：① 删除该分支写不出可证伪断言（删死代码无行为差异）；
+            // ② 唯一可证伪的出路是让 summarizeError 透出 successfulChannels，但那要改
+            //    xbk_failure_policy.js（不在本代理白名单）；③ 更要紧的是它**不该**透出：
+            //    channelSuccessful/成功缓存已由上方 `sent.successfulChannels` 覆盖，而在
+            //    `okCount === 0` 的抛错路径上该数组恒空，透出只会把「全部失败」记录成
+            //    「部分成功」并污染 _updateChannelHealth 的通道健康统计。
+            // 故保留死分支 + 契约注释，不按清单建议①改（理由见 .local/reports/fix-r1a-REPORT.md）。
             if (Array.isArray(result.failure.successfulChannels)) {
               for (const channel of result.failure.successfulChannels) channelSuccessful.add(channel)
             }
