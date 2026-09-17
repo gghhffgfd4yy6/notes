@@ -66,5 +66,19 @@ const configDrift = runChecker(dropLines(yml, ['- name: check-deps', 'src: "scri
 assert.notStrictEqual(configDrift.status, 0, 'stryker.config.js 与矩阵文件集不一致必须失败')
 assert.match(configDrift.stderr, /stryker\.config\.js 的 mutate 含矩阵未覆盖的文件/, '应指出 config 多跑的文件')
 
+// run_mutation.js 的 DEFAULT_FILES ↔ stryker.config.js 的 mutate 必须完全一致（run_mutation F7）：
+// 本地调度器此前只覆盖 8/17 个 CI 目标且无任何对账——新增 mutate 目标后本地默认跑法静默漏掉它，
+// 形成「本地跑过 = CI 也覆盖」的错觉。矩阵 ↔ stryker.config.js 的一致性已由 check-mutation-ranges
+// 把守；这里补上 stryker.config.js ↔ DEFAULT_FILES 这条边，使三者形成闭环。
+const { mutate } = require('./stryker.config.js')
+const { DEFAULT_FILES } = require('./run_mutation')
+assert.deepStrictEqual([...DEFAULT_FILES].sort(), [...mutate].sort(),
+  'run_mutation.js 的 DEFAULT_FILES 必须与 stryker.config.js 的 mutate 目标完全一致（增删 mutate 目标时同步）')
+assert.strictEqual(new Set(DEFAULT_FILES).size, DEFAULT_FILES.length, 'DEFAULT_FILES 不得含重复项')
+for (const file of DEFAULT_FILES) {
+  assert.ok(fs.existsSync(file), `DEFAULT_FILES 里的 ${file} 不存在（变异目标必须可读）`)
+}
+
 console.log('✅ 遗漏生产模块或行段越界会使 mutation 范围校验失败')
 console.log('✅ 当前 mutation 矩阵覆盖全部生产模块')
+console.log('✅ run_mutation.js 的 DEFAULT_FILES 与 stryker.config.js 的 mutate 目标一致')

@@ -162,13 +162,16 @@ for (const r of results) {
   if (!r.ok) allOk = false
 }
 const totalMs = results.reduce((a, r) => a + r.ms, 0)
+const passCount = results.filter(r => r.ok).length
+const failCount = results.length - passCount
 console.log(`  总耗时: ${(totalMs / 1000).toFixed(1)}s`)
-// ⚠️ 汇总行格式是跨文件契约（UT-07）：run_mutation.js 的 extractTestSummary（:374-377）只认
-// 「全部通过！N/M」或「K 通过, M 失败, 共 N」三数字行，本行的「全部通过 🎉」不在其中——非 CI 下内层
-// 套件 stdout 直通同一捕获管道，逐变异体 summary 会命中内层套件的同名行而误归属。改本行格式需同步
-// run_tests.js 姊妹入口的同款输出与 run_mutation.js 的解析，并重跑变异基线验证，属跨文件口径统一，
-// 故本次只登记说明、不在此单文件内改（保持零行为风险）。
-console.log(`  结果:   ${allOk ? '全部通过 🎉' : '存在失败 ⚠️'}`)
+// ⚠️ 汇总行格式是跨文件契约（UT-07）：run_mutation.js 的 extractTestSummary（:374-383）逐行向上匹配
+// 「全部通过！N/M」或「K 通过, M 失败, 共 N」三数字行。此前本行是「全部通过 🎉」——两种格式都不匹配，
+// 于是非 CI 下内层套件 stdout 直通同一捕获管道时（如 test_filter.js:8746 的「🎉 全部通过！785/785」），
+// 逐变异体 summary 会命中内层套件的那一行而误归属到内层套件。现统一为三数字格式并保留人读文案；
+// run_tests.js 姊妹入口同步同款格式。该契约由 test_ci_skip_suites.js 的沙箱回归固定：内层桩套件打印
+// 诱饵「全部通过！7/7」，断言取到的是外层本入口自己的数字。
+console.log(`  结果:   ${allOk ? '全部通过 🎉' : '存在失败 ⚠️'}｜${passCount} 通过, ${failCount} 失败, 共 ${results.length}`)
 console.log('══════════════════════════════════════════════')
 
 // CI 下把套件结果表写入 $GITHUB_STEP_SUMMARY（run 页可直接看，失败一眼定位）

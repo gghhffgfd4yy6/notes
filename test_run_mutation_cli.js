@@ -5,7 +5,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { runTests, evaluate, main } = require('./run_mutation')
+const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutants } = require('./run_mutation')
 
 ;(async () => {
   // 防重入：run_mutation.js 的 runTests 在临时目录内运行 run_unit_tests.js 时会设置
@@ -41,6 +41,92 @@ const { runTests, evaluate, main } = require('./run_mutation')
       if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
       else process.env.MUTATION_CHECKPOINT = originalCheckpoint
       fs.rmSync(ckpt, { force: true })
+    }
+  }
+
+  // ===== main：断点指纹（F4） =====
+  // 断点只按位置 id（序号）恢复，源码一改全部 id 平移，旧 killed/survived 会被错记到别的候选头上
+  // （分数虚高 + 真正改动过的代码免于变异）。指纹不匹配必须丢弃旧断点、从零重跑。
+  {
+    const originalExitCode = process.exitCode
+    const originalCheckpoint = process.env.MUTATION_CHECKPOINT
+    const ckpt = path.join(os.tmpdir(), `xbk-fingerprint-ckpt-${process.pid}.json`)
+    const reportFile = path.join(__dirname, 'mutation-report.json')
+    const hadReport = fs.existsSync(reportFile) ? fs.readFileSync(reportFile) : null
+    const calls = []
+    try {
+      process.env.MUTATION_CHECKPOINT = ckpt
+      // 伪造上一轮的断点：指纹与当前源码不一致 + 第 1 个变异体已判定 + pending 为空
+      fs.writeFileSync(ckpt, JSON.stringify({
+        total: 1,
+        batchSize: 50,
+        fingerprint: 'deadbeef',
+        killed: [[1, { status: 'killed' }]],
+        survived: [],
+        compileErrors: [],
+        pending: []
+      }))
+      await main({
+        evaluate: async (mutants) => {
+          calls.push(mutants.length)
+          return { status: 'pass', code: 0, signal: null, output: 'ok' }
+        }
+      })
+      assert.strictEqual(calls[0], 0, '先跑未套变异的基线')
+      assert.ok(calls.length > 1, '指纹不匹配的断点必须被丢弃并重新评估，不得直接继承旧结果收场')
+      assert.ok(calls.slice(1).some(n => n > 0), '丢弃断点后应真正进入批次循环评估变异体')
+    } finally {
+      process.exitCode = originalExitCode
+      if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
+      else process.env.MUTATION_CHECKPOINT = originalCheckpoint
+      fs.rmSync(ckpt, { force: true })
+      if (hadReport === null) fs.rmSync(reportFile, { force: true })
+      else fs.writeFileSync(reportFile, hadReport)
+    }
+  }
+
+  // ===== main：未判定变异体必须拉红（F4） =====
+  // 报告里 status='pending' 的候选从未被任何批次评估；退出码此前只看 survived/timeout → exit 0
+  // （「跑完了、分数很高」的假绿）。指纹匹配 + pending 为空即复现：第 1 个已判定、其余全部未判定。
+  {
+    const originalExitCode = process.exitCode
+    const originalCheckpoint = process.env.MUTATION_CHECKPOINT
+    const ckpt = path.join(os.tmpdir(), `xbk-undetermined-ckpt-${process.pid}.json`)
+    const reportFile = path.join(__dirname, 'mutation-report.json')
+    const hadReport = fs.existsSync(reportFile) ? fs.readFileSync(reportFile) : null
+    const calls = []
+    try {
+      process.env.MUTATION_CHECKPOINT = ckpt
+      const fingerprint = mutantFingerprint(collectMutants(DEFAULT_FILES))
+      assert.ok(fingerprint.length === 64, '变异集指纹应为 sha256 十六进制串')
+      fs.writeFileSync(ckpt, JSON.stringify({
+        total: 1,
+        batchSize: 50,
+        fingerprint,
+        killed: [[1, { status: 'killed' }]],
+        survived: [],
+        compileErrors: [],
+        pending: []
+      }))
+      await main({
+        evaluate: async (mutants) => {
+          calls.push(mutants.length)
+          return { status: 'pass', code: 0, signal: null, output: 'ok' }
+        }
+      })
+      assert.deepStrictEqual(calls, [0], '指纹匹配且 pending 为空时不应再跑任何批次')
+      assert.strictEqual(process.exitCode, 1, '存在未判定变异体必须非 0 退出（不得 survived=0 却 exit 0）')
+      const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'))
+      const pending = report.mutants.filter(m => m.result && m.result.status === 'pending').length
+      assert.ok(pending > 0, `报告应显式标出未判定（status=pending）的变异体，实际 ${pending} 个`)
+      assert.ok(fs.existsSync(ckpt), '存在未判定项时断点文件应保留（供排查），不得静默删除')
+    } finally {
+      process.exitCode = originalExitCode
+      if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
+      else process.env.MUTATION_CHECKPOINT = originalCheckpoint
+      fs.rmSync(ckpt, { force: true })
+      if (hadReport === null) fs.rmSync(reportFile, { force: true })
+      else fs.writeFileSync(reportFile, hadReport)
     }
   }
 
@@ -99,21 +185,65 @@ const { runTests, evaluate, main } = require('./run_mutation')
     }
   }
 
-  // 场景 4：runTests 必须清空 SKIP_SUITES，并给子进程带 XBK_MUTATION_CHILD=1
-  // 原因：CI 显式步骤的 SKIP_SUITES 若继承进变异评估子进程，被跳过的套件不再参与变异判定 → 分数失真。
+  // 场景 3b：超时必须杀整个进程组（F6）。只 kill 直接子进程时，它派生的孙进程（真实的套件进程）
+  // 仍是孤儿并持有 stdout/stderr 管道 → 'close' 被推迟到 2000ms 兜底保险（超时被记 timeout 的同时
+  // 孤儿继续跑）。本场景用真实进程验证：孙进程持续写心跳文件，超时后心跳必须停止、且 'close' 快速到达。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-groupkill-'))
+    const marker = path.join(dir, 'orphan-heartbeat.log')
+    const prevMarker = process.env.XBK_TEST_ORPHAN_MARKER
+    try {
+      process.env.XBK_TEST_ORPHAN_MARKER = marker
+      // 直接子进程：spawn 一个持续写心跳的孙进程（继承管道），自己挂住不退 —— 触发超时分支。
+      // 孙进程 15s 后自杀：即使修复被回退（孤儿存活）也不会留下无界进程。
+      fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
+        const { spawn } = require('child_process')
+        spawn(process.execPath, ['-e', "const fs=require('fs');const f=process.env.XBK_TEST_ORPHAN_MARKER;setInterval(()=>fs.appendFileSync(f,'x'),20);setTimeout(()=>process.exit(0),15000)"], { stdio: ['ignore', 'inherit', 'inherit'] })
+        setInterval(() => {}, 1000)
+      `)
+      const t0 = Date.now()
+      const result = await runTests(dir, 800)
+      const elapsed = Date.now() - t0
+      assert.strictEqual(result.status, 'timeout', '挂住的直接子进程应按超时结算')
+      assert.ok(fs.existsSync(marker), '孙进程应至少写入一次心跳（否则本回归没有判据：夹具未真正派生后代）')
+      const size1 = fs.statSync(marker).size
+      await new Promise(resolve => setTimeout(resolve, 600))
+      const size2 = fs.statSync(marker).size
+      assert.strictEqual(size2, size1,
+        `超时后孙进程仍在运行（心跳 ${size1} → ${size2} 字节）：进程组未被杀伤，孤儿继续跑`)
+      assert.ok(elapsed < 2000,
+        `孙进程被杀后管道应立即关闭、由 close 收敛（实测 ${elapsed}ms；>=2000ms 说明落到了兜底定时器）`)
+    } finally {
+      if (prevMarker === undefined) delete process.env.XBK_TEST_ORPHAN_MARKER
+      else process.env.XBK_TEST_ORPHAN_MARKER = prevMarker
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // 场景 4：runTests 必须清空 SKIP_SUITES，给子进程带 XBK_MUTATION_CHILD=1，并注入 PERF_MS
+  // 原因：CI 显式步骤的 SKIP_SUITES 若继承进变异评估子进程，被跳过的套件不再参与变异判定 → 分数失真；
+  // PERF_MS 必须与 stryker 沙箱同口径（scripts/mutation-child.js），否则 test_filter.js 的性能断言
+  // 在默认最多 8 并发下误失败 → 变异体被记 killed、分数虚高，且两条变异路径不可比（F8）。
   {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-skip-'))
     const prev = process.env.SKIP_SUITES
     try {
       process.env.SKIP_SUITES = 'test_filter.js,test_storage.js'
       fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
-        console.log('SKIP=[' + (process.env.SKIP_SUITES || '') + '] MUT=[' + (process.env.XBK_MUTATION_CHILD || '') + ']')
+        console.log('SKIP=[' + (process.env.SKIP_SUITES || '') + '] MUT=[' + (process.env.XBK_MUTATION_CHILD || '') + '] PERF=[' + (process.env.PERF_MS || '') + ']')
         process.exit(0)
       `)
       const result = await runTests(dir, 10000)
       assert.strictEqual(result.status, 'pass', `应正常通过，output=${result.output}`)
       assert.match(result.output, /SKIP=\[\]/, 'runTests 必须清空 SKIP_SUITES（否则 CI 跳过清单会继承到变异评估）')
       assert.match(result.output, /MUT=\[1\]/, 'runTests 应标记 XBK_MUTATION_CHILD=1（防递归 + 抑制 summary 追加）')
+      // 与 stryker 沙箱同口径：预期值取自 scripts/mutation-child.js 的实际赋值（单一事实源），
+      // 任一侧被改动（去掉注入 / 改 mutation-child 的值）都会让本断言红。
+      const childScript = fs.readFileSync(path.join(__dirname, 'scripts', 'mutation-child.js'), 'utf8')
+      const perf = /process\.env\.PERF_MS\s*=\s*'(\d+)'/.exec(childScript)
+      assert.ok(perf, 'scripts/mutation-child.js 应显式设置 PERF_MS（stryker 沙箱性能阈值口径来源）')
+      assert.match(result.output, new RegExp(`PERF=\\[${perf[1]}\\]`),
+        `runTests 注入的 PERF_MS 必须与 stryker 沙箱同口径（scripts/mutation-child.js 的 ${perf[1]}）`)
     } finally {
       if (prev === undefined) delete process.env.SKIP_SUITES
       else process.env.SKIP_SUITES = prev

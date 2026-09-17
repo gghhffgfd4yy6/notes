@@ -414,8 +414,8 @@ try {
   fs.rmSync('reports/.ci-summary-overflow.md', { force: true })
 }
 
-// 3g run_tests.js 的零套件守卫（RT-01）与失败原因诊断（RT-02）回归：该入口全量跑 41 个套件
-//    （含网络/常驻），不能直接驱动；故在临时目录里搭一个最小沙箱（桩 test_suites.js + 桩
+// 3g run_tests.js 的零套件守卫（RT-01）、失败原因诊断（RT-02）与每套件超时（RT-03）回归：该入口全量跑
+//    41 个套件（含网络/常驻），不能直接驱动；故在临时目录里搭一个最小沙箱（桩 test_suites.js + 桩
 //    scripts/check-deps.js + 桩套件），只复制入口自身——与 test_run_mutation_internal.js 的
 //    copyProject 手法同源。
 function makeRunTestsSandbox (suites, files = {}) {
@@ -427,9 +427,17 @@ function makeRunTestsSandbox (suites, files = {}) {
   for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
   return dir
 }
-function runRunTestsIn (dir) {
-  return spawnSync(process.execPath, [path.join(dir, 'run_tests.js')], { encoding: 'utf8', cwd: dir })
+function runRunTestsIn (dir, env = {}, extra = {}) {
+  return spawnSync(process.execPath, [path.join(dir, 'run_tests.js')], {
+    encoding: 'utf8',
+    cwd: dir,
+    env: { ...process.env, ...env },
+    ...extra
+  })
 }
+// 汇总行 ↔ run_mutation.js 解析口径的跨文件契约（UT-07），3g2 与 3h 共用同一解析实现
+// （不另写一份正则，避免测试与生产口径漂移）。
+const { extractTestSummary } = require('./run_mutation')
 
 // 3g1 空注册表（SUITES=[]）必须非 0：修复前 allOk 初值 true → 「全部通过 🎉」并 exit 0（门禁假绿）
 const emptyDir = makeRunTestsSandbox([])
@@ -459,8 +467,63 @@ try {
   assert.notStrictEqual(diag.status, 0, '失败套件必须非 0 退出')
   assert.match(diag.stdout, /status=7/, '静默非零退出（exit 7）必须把退出码打进输出')
   assert.match(diag.stdout, /signal=SIGKILL/, '被信号杀死的套件必须把 signal 打进输出')
+  // RT-02/UT-07 同源锁定：run_tests.js 的汇总行也必须带「K 通过, M 失败, 共 N」三数字，
+  // 否则 extractTestSummary 会命中更早的内层行（此沙箱里没有诱饵，修复前返回空数组）。
+  assert.deepStrictEqual(extractTestSummary(diag.stdout), ['0', '2', '2'],
+    'run_tests.js 汇总行必须被 extractTestSummary 识别（0 通过, 2 失败, 共 2）')
 } finally {
   fs.rmSync(diagDir, { recursive: true, force: true })
+}
+
+// 3g3 每套件硬超时（RT-03）：套件挂死（死循环/等待不会到来的输入）时 execFileSync 永不返回，
+//     入口既不汇总也不退出——CI 只能等作业级超时且没有红测定位。现要求入口按 XBK_TEST_TIMEOUT
+//     强杀（killSignal=SIGKILL）并以失败收尾，且失败输出点名「超过每套件上限」（与断言红区分）。
+//     测试侧仍加 30s spawnSync 兜底：修复被回退（无超时）时子进程会永久挂住，必须让本断言失败
+//     而不是把整套件挂到作业级超时。
+const hangDir = makeRunTestsSandbox(
+  [{ name: '挂死套件', file: 'test_stub_hang.js', desc: '死循环永不退出' }],
+  { 'test_stub_hang.js': 'while (true) {}\n' }
+)
+try {
+  const t0 = Date.now()
+  const hang = runRunTestsIn(hangDir, { XBK_TEST_TIMEOUT: '300' }, { timeout: 30000 })
+  const elapsed = Date.now() - t0
+  assert.strictEqual(hang.signal, null,
+    '入口必须自行结束：被测试侧 30s 兜底杀掉（signal 非 null）说明每套件超时失效，入口仍在永久阻塞')
+  assert.notStrictEqual(hang.status, 0, '挂死套件必须让入口以非 0 退出（零假绿）')
+  assert.match(hang.stdout, /超过每套件上限 300ms 已强杀/, '失败输出必须点名每套件超时（与断言红区分）')
+  assert.ok(elapsed < 20000, `入口应在每套件上限后很快结束（实测 ${elapsed}ms）`)
+} finally {
+  fs.rmSync(hangDir, { recursive: true, force: true })
+}
+
+// 3h run_unit_tests.js 的汇总行必须能被 run_mutation.js 的 extractTestSummary 识别（UT-07）：
+//    变异评估下内层套件 stdout 与本入口共用同一捕获管道，若本入口汇总行不含「K 通过, M 失败, 共 N」
+//    三数字，extractTestSummary 会继续向上扫描并命中内层套件的同名行（如 test_filter.js:8746 的
+//    「🎉 全部通过！785/785」）→ 逐变异体 summary 误归属内层套件。此处用诱饵行复现：内层桩套件打印
+//    「全部通过！7/7」，外层只跑 1 个套件，断言取到外层的 1/0/1 而不是诱饵的 7/7。
+function makeUnitTestsSandbox (suites, files = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-unit-tests-'))
+  fs.copyFileSync(path.join(__dirname, 'run_unit_tests.js'), path.join(dir, 'run_unit_tests.js'))
+  fs.writeFileSync(path.join(dir, 'test_suites.js'), `module.exports = { SUITES: ${JSON.stringify(suites)} }\n`)
+  for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
+  return dir
+}
+const summaryDir = makeUnitTestsSandbox(
+  [{ name: '内层诱饵', file: 'test_stub_decoy.js', desc: '打印可被 extractTestSummary 命中的诱饵行' }],
+  { 'test_stub_decoy.js': "console.log('🎉 全部通过！7/7  100%')\nprocess.exit(0)\n" }
+)
+try {
+  const unitEnv = { ...baseEnv }
+  delete unitEnv.GITHUB_STEP_SUMMARY
+  const unitRun = spawnSync(process.execPath, [path.join(summaryDir, 'run_unit_tests.js')],
+    { encoding: 'utf8', cwd: summaryDir, env: unitEnv })
+  assert.strictEqual(unitRun.status, 0, unitRun.stderr || unitRun.stdout)
+  assert.match(unitRun.stdout, /全部通过！7\/7/, '夹具自身应先出现内层诱饵行（否则本回归形同虚设）')
+  assert.deepStrictEqual(extractTestSummary(unitRun.stdout), ['1', '0', '1'],
+    '本入口汇总行必须被 extractTestSummary 识别为本入口的数字（1 套件全通过），不得被内层套件的「全部通过！7/7」抢答')
+} finally {
+  fs.rmSync(summaryDir, { recursive: true, force: true })
 }
 
 // 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加
