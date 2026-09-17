@@ -117,6 +117,64 @@ for (const { re, desc } of FORBIDDEN_PATTERNS) {
   }
 }
 
+// ── 字符类范围强制登记（F5）：locale/校对序敏感性 ──────────────────────────────
+// 上面的黑名单覆盖的是「转义/构造形态」，唯独漏了字符类**范围** `[a-z]`：bash ERE 的范围按当前
+// LC_COLLATE 的校对序展开（某些 locale 下 [A-Z] 会匹配小写字母），JS RegExp 恒按码点展开——两方言
+// 可能分叉，而逐字断言与上面的黑名单都不会报红。改为**强制登记**：正则里出现任何未登记的范围即红，
+// 新增范围必须先人工复核 locale 敏感性并在此登记理由；登记表本身只允许 ASCII 端点（非 ASCII 范围
+// 的展开差异是实打实的风险，不能靠「登记」放行）。
+// 残留边界（如实登记）：登记的 ASCII 范围在非 C locale 下是否与 JS 完全一致，属环境依赖的理论风险
+// ——本测试只能保证「范围集合被显式枚举且理由在案」，不能证明 bash 侧任一 locale 下的展开。
+const REGISTERED_CHAR_RANGES = new Map([
+  ['0-9', 'ASCII 十进制数字（版本号核心/后缀）'],
+  ['1-9', 'ASCII 非零数字（禁前导零）'],
+  ['A-Z', 'ASCII 大写字母（后缀标识符）'],
+  ['a-z', 'ASCII 小写字母（后缀标识符）']
+])
+
+/**
+ * 从正则源码里提取所有字符类范围（`X-Y` 形态，X/Y 为单字符且非转义）；用于强制登记。
+ * @param {string} source 正则源码（不含分隔符）
+ * @returns {string[]} 形如 ['0-9','A-Z'] 的范围列表（按出现顺序）
+ */
+function charClassRanges (source) {
+  const ranges = []
+  for (const m of source.matchAll(/\[([^\]]*)\]/g)) {
+    const body = m[1]
+    for (let i = 0; i + 2 < body.length; i++) {
+      if (body[i + 1] === '-' && body[i] !== '\\') {
+        ranges.push(`${body[i]}-${body[i + 2]}`)
+        i += 2
+      }
+    }
+  }
+  return ranges
+}
+
+// 自检：提取器必须真的能识别未登记范围（否则「未登记即红」只是空承诺）。
+// 用非 ASCII 范围做样本，避免与生产正则撞车。
+assert.deepStrictEqual(charClassRanges('[a-z]'), ['a-z'], '提取器应识别单个范围')
+assert.deepStrictEqual(charClassRanges('[0-9A-Za-z-]'), ['0-9', 'A-Z', 'a-z'], '一个字符类里的多个范围都要提取（末尾字面 - 不算范围）')
+assert.deepStrictEqual(charClassRanges('[-+]'), [], '单一字面字符不构成范围')
+assert.deepStrictEqual(charClassRanges('[А-Я]'), ['А-Я'], '非 ASCII 范围同样要被提取出来（以便判红）')
+assert.deepStrictEqual(charClassRanges('[a-zA-Z]'), ['a-z', 'A-Z'])
+for (const [range, why] of REGISTERED_CHAR_RANGES) {
+  const [from, to] = range.split('-')
+  assert.ok(from.codePointAt(0) < 128 && to.codePointAt(0) < 128,
+    `登记表只应登记 ASCII 范围，${range}（${why}）不是——非 ASCII 范围的 locale 展开差异不得靠登记放行`)
+}
+
+// 生产正则（脚本 + release.yml 每一处内联副本）里的范围必须全部已登记
+for (const [label, source] of [
+  ['scripts/validate-release-tag.js 的 SEMVER_RE', scriptSource],
+  ...versionAsserts.map(({ index, bashRegexSource }) => [`${describeAt(index)} 的 bash 正则`, bashRegexSource])
+]) {
+  for (const range of charClassRanges(source)) {
+    assert.ok(REGISTERED_CHAR_RANGES.has(range),
+      `${label} 含未登记的字符类范围 [${range}]：bash ERE 的范围按 locale 校对序展开、可能与 JS RegExp 分叉——人工复核后登记到 REGISTERED_CHAR_RANGES 并写明理由，不得直接放行`)
+  }
+}
+
 // 合法 tag 集合（语义：v数字.数字[.数字][-prerelease][+build]；禁止前导零；后缀组件非空）
 const validTags = [
   'v3.272', // 两段（CHANGELOG 风格）
