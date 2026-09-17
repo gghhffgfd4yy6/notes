@@ -26,17 +26,45 @@ const DEFAULT_TIMEOUT_MS = 5000
 // fetchData 挂死；30s 也足以覆盖限流窗口内的常规 Retry-After。
 const RETRY_BACKOFF_CAP_MS = 30000
 
-// net-7：解析 Retry-After（RFC 9110：delta-seconds 非负整数，或 HTTP-date）→ 毫秒。
-// 只认这两种合法形态，其余（空串、'1.5'、'-5'、非日期文本）返回 null 交由指数退避兜底——
+// net-7：Retry-After 只认 RFC 9110 §10.2.1 明列的三种 HTTP-date 形态（诚实实现 MUST 接受全部三种）：
+//   IMF-fixdate   Sun, 06 Nov 1994 08:49:37 GMT
+//   rfc850-date   Sunday, 06-Nov-94 08:49:37 GMT        （obs-date）
+//   asctime-date  Sun Nov  6 08:49:37 1994              （obs-date）
+// 先把形态卡死再用 Date.parse 取值：Date.parse 的接受面太大（'5 Oct'、ISO-8601 '2026-09-17T00:00:00Z'
+// 都能解析），它们被当成「已过期」钳成 0 后，日志会输出「0s 后重试（按 Retry-After）」——谎报来源，
+// 而修前这些输入走指数退避 1s。故非上述形态一律 null，回落指数退避，不做宽松猜测。
+const IMF_FIXDATE_RE = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/
+const RFC850_DATE_RE = /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2} \d{2}:\d{2}:\d{2} GMT$/
+const ASCTIME_DATE_RE = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/
+// delta-seconds（RFC 9110 的 1*DIGIT）上界：超过 2^31-1 秒（≈68 年）不可能是真实回访时刻，
+// 按非法形态处理（Number 为 Infinity 的数字串同理），不把垃圾头当有效来源。
+const MAX_DELTA_SECONDS = 2147483647
+
+// net-7：解析 Retry-After（RFC 9110：delta-seconds 非负整数，或上述三种 HTTP-date）→ 毫秒。
+// 只认这两种合法形态，其余（空串、'1.5'、'-5'、非日期文本、ISO-8601）返回 null 交由指数退避兜底——
 // 不做宽松猜测，避免把笔误当成等待时长。HTTP-date 已过期 → 0（立即重试，语义同 RFC）。
 function parseRetryAfterMs (value, now = Date.now()) {
   if (value === undefined || value === null) return null
   const raw = String(value).trim()
   if (raw === '') return null
-  if (/^[0-9]+$/.test(raw)) return Number(raw) * 1000
-  if (!/[A-Za-z]/.test(raw)) return null // delta-seconds 之外的数字/符号形态（-5、1.5、+3）一律非法
-  const at = Date.parse(raw)
+  if (/^[0-9]+$/.test(raw)) {
+    const seconds = Number(raw)
+    if (!Number.isFinite(seconds) || seconds > MAX_DELTA_SECONDS) return null
+    return seconds * 1000
+  }
+  if (!IMF_FIXDATE_RE.test(raw) && !RFC850_DATE_RE.test(raw) && !ASCTIME_DATE_RE.test(raw)) return null
+  // asctime-date 无时区标记，Date.parse 会按**本地时区**解释（实测 UTC+8 下同一串差 8 小时）；
+  // RFC 9110 规定 HTTP-date 一律 GMT，故显式补 GMT 再解析，避免把服务端给出的回访时刻按本地时区算错。
+  const asctime = ASCTIME_DATE_RE.test(raw)
+  const at = Date.parse(asctime ? raw + ' GMT' : raw)
   if (!Number.isFinite(at)) return null
+  // 星期与日期必须一致（RFC 9110 的 HTTP-date 里 day-name 由日期导出）：
+  // IMF-fixdate / asctime 都是 4 位年、无歧义，交叉校验；rfc850 的 2 位年由引擎按 ECMAScript 的
+  // 50 年切点解释（yy=50..76 与 RFC 9110 的「不超 50 年未来」规则不同），不做交叉校验以免误拒。
+  if (!RFC850_DATE_RE.test(raw)) {
+    const actualName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(at).getUTCDay()]
+    if (raw.slice(0, 3) !== actualName) return null
+  }
   return Math.max(0, at - now)
 }
 

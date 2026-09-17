@@ -311,8 +311,15 @@ function makeNetwork (opts = {}) {
       `Headers.get 形态同样应生效，实际：${JSON.stringify(getLogs())}`)
   }
 
-  // 13d. 无 Retry-After（或非法值）→ 保持原指数退避（1s、2s…）且不出现来源标记
-  for (const [headers, label] of [[undefined, '无 headers'], [{ 'retry-after': '1.5' }, '非法 Retry-After']]) {
+  // 13d. 无 Retry-After（或非法值）→ 保持原指数退避（1s、2s…）且不出现来源标记。
+  // V5 打回反例纳入：'5 Oct' 与 ISO-8601 曾被 Date.parse 宽松接受 → 输出「0s 后重试（按 Retry-After）」，
+  // 既谎报来源又把修前的 1s 退避改成 0；本块对它们断言 1s + 无来源标记（旧实现直接红）。
+  for (const [headers, label] of [
+    [undefined, '无 headers'],
+    [{ 'retry-after': '1.5' }, '非法 Retry-After'],
+    [{ 'retry-after': '5 Oct' }, "非 HTTP-date（'5 Oct'）"],
+    [{ 'retry-after': '2026-09-17T00:00:00Z' }, 'ISO-8601（非 HTTP-date）']
+  ]) {
     const { net, getLogs } = makeNetwork({ retry: 1, statusCode: 503, failTimes: 1, responseHeaders: headers })
     await net.fetchData()
     const retryLog = getLogs().find(l => l.includes('后重试'))
@@ -332,6 +339,47 @@ function makeNetwork (opts = {}) {
         `超大 Retry-After 必须钳到 30s，实际：${JSON.stringify(getLogs())}`)
     } finally {
       global.setTimeout = realSetTimeout
+    }
+  }
+
+  // 13f. net-7 返工（V5 打回）：HTTP-date 分支改为严格 RFC 9110 白名单（IMF-fixdate / rfc850 / asctime）
+  // 的真值表。反例（旧实现）：Date.parse 宽松接受 '5 Oct'、ISO-8601、ISO 日期等非 HTTP-date，按「已过期」
+  // 钳成 0，日志却标「0s 后重试（按 Retry-After）」；修前这些输入走指数退避 1s ⇒ 修复引入的新口径缺口。
+  // 本块同时覆盖我自造的同族反例（星期与日期不一致、单位数小时、带时区后缀、非法日、越界数字串）。
+  {
+    const now = Date.parse('2026-09-17T00:00:00.000Z')
+    const table = [
+      // [输入, 期望, 说明]
+      ['120', 120000, '合法：delta-seconds'],
+      ['0', 0, '合法：delta-seconds 0（立即重试）'],
+      ['  120  ', 120000, '合法：两侧空白裁剪'],
+      [120, 120000, '合法：数值型 delta-seconds'],
+      ['Wed, 21 Oct 2026 07:28:00 GMT', Date.parse('2026-10-21T07:28:00.000Z') - now, '合法：IMF-fixdate（未来）'],
+      ['Wed, 21 Oct 2015 07:28:00 GMT', 0, '合法：IMF-fixdate（已过期 → 0，语义同 RFC）'],
+      ['Sunday, 06-Nov-94 08:49:37 GMT', 0, '合法：rfc850-date（obs-date，已过期 → 0）'],
+      ['Sun Nov  6 08:49:37 1994', 0, '合法：asctime-date（obs-date，已过期 → 0）'],
+      ['Thu Sep 17 00:00:03 2026', 3000, '合法：asctime 必须按 GMT 解释（按本地时区 UTC+8 会算成 8 小时前 → 0）'],
+      ['5 Oct', null, '非法：自然语言日期（Date.parse 宽松接受，V5 打回反例）'],
+      ['2026-09-17T00:00:00Z', null, '非法：ISO-8601 不是 HTTP-date（V5 打回反例）'],
+      ['2026-09-17', null, '非法：ISO 日期形态'],
+      ['Oct 5 2026', null, '非法：缺 day-name 的 asctime 变体'],
+      ['Mon, 21 Oct 2026 07:28:00 GMT', null, '同族反例：星期与日期不一致（2026-10-21 是 Wed）'],
+      ['Wed, 21 Oct 2026 7:28:00 GMT', null, '同族反例：小时非两位'],
+      ['Wed, 21 Oct 2026 07:28:00 GMT+00:00', null, '同族反例：带时区后缀（HTTP-date 必须是 GMT 字面量）'],
+      ['Sun, 32 Nov 2026 00:00:00 GMT', null, '同族反例：非法日（32）'],
+      ['-5', null, '非法：负数 delta-seconds'],
+      ['1.5', null, '非法：小数秒'],
+      ['+3', null, '非法：带符号整数'],
+      ['99999999999', null, '非法：delta-seconds 越 2^31-1 上界'],
+      ['9'.repeat(400), null, '非法：数字串溢出（Number → Infinity）'],
+      ['', null, '非法：空串'],
+      ['true', null, '非法：任意文本'],
+      [undefined, null, '非法：缺失'],
+      [null, null, '非法：null']
+    ]
+    for (const [input, expected, label] of table) {
+      const actual = parseRetryAfterMs(input, now)
+      assert.strictEqual(actual, expected, `${label}：parseRetryAfterMs(${JSON.stringify(input)}) 应为 ${expected}，实际 ${actual}`)
     }
   }
 
