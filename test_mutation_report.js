@@ -395,6 +395,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     global.fetch = async function (url, opts) {
       const r = responses[callIdx++]
       if (!r) throw new Error(`unexpected fetch call #${callIdx}: ${url}`)
+      if (r instanceof Error) throw r // F7：模拟网络异常/超时拒绝（不是响应对象）
       r.capturedUrl = url
       r.capturedOpts = opts
       return r
@@ -498,6 +499,70 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     const createRes = makeRes(false, 403, { message: 'Forbidden' })
     mockFetch([listRes, createRes])
     await assert.rejects(() => postIssue('body'), /发 Issue 失败，HTTP 状态码：403/)
+  })
+
+  // F7：列表 API 返回 200 但响应体非 JSON（代理页/限流说明页）——旧实现 `await listRes.json()` 未包 try，
+  // SyntaxError 逃出 postIssue，当天日报直接不发。现在必须降级为「跳过去重直接创建」并 warn 留痕，
+  // 且 warn 文本不得含换行（防伪造日志行）。
+  await acheck('postIssue 列表查询 200 非 JSON 时降级为直接创建并 warn（不再抛 SyntaxError）', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = {
+      ok: true,
+      status: 200,
+      json: async () => { throw new SyntaxError('Unexpected token <\nin JSON at position 0') },
+      text: async () => '<html>'
+    }
+    const createdIssue = { number: 102, html_url: 'https://github.com/owner/repo/issues/102' }
+    const createRes = makeRes(true, 201, createdIssue)
+    mockFetch([listRes, createRes])
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      const result = await postIssue('body')
+      assert.strictEqual(result.number, 102, '200 非 JSON 的列表响应应降级为直接创建')
+    } finally {
+      console.warn = origWarn
+    }
+    assert.strictEqual(warns.length, 1, `应恰好 warn 一次，实际 ${warns.length} 次：${JSON.stringify(warns)}`)
+    assert.ok(warns[0].includes('Unexpected token <'), `warn 应带根因，实际：${warns[0]}`)
+    assert.ok(!/[\r\n]/.test(warns[0]), `warn 文本不得含换行，实际：${JSON.stringify(warns[0])}`)
+  })
+
+  // F7：列表查询网络异常/超时——旧实现会让整个 postIssue 失败；现按同一口径降级为直接创建。
+  await acheck('postIssue 列表查询网络异常时降级为直接创建并 warn', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const timeoutErr = new Error('The operation was aborted due to timeout')
+    timeoutErr.name = 'TimeoutError'
+    const createdIssue = { number: 103, html_url: 'https://github.com/owner/repo/issues/103' }
+    const createRes = makeRes(true, 201, createdIssue)
+    mockFetch([timeoutErr, createRes])
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      const result = await postIssue('body')
+      assert.strictEqual(result.number, 103, '列表查询超时应降级为直接创建')
+    } finally {
+      console.warn = origWarn
+    }
+    assert.strictEqual(warns.length, 1, `应恰好 warn 一次，实际 ${warns.length} 次`)
+    assert.ok(warns[0].includes('aborted due to timeout'), `warn 应带根因，实际：${warns[0]}`)
+  })
+
+  // F7：去重列表查询必须带 AbortSignal 超时（旧实现 fetch 无超时，列表接口挂住会拖死整个 report job）。
+  await acheck('postIssue 列表查询携带 AbortSignal 超时', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(true, 200, [])
+    const createRes = makeRes(true, 201, { number: 104, html_url: 'https://github.com/owner/repo/issues/104' })
+    mockFetch([listRes, createRes])
+    await postIssue('body')
+    assert.ok(listRes.capturedOpts.signal instanceof AbortSignal,
+      '列表查询必须带 AbortSignal 超时（无超时会让日报 job 无限等待）')
+    assert.strictEqual(createRes.capturedOpts.signal, undefined, '发 Issue 请求不应被列表查询的超时信号绑住')
   })
 
   // 恢复原始环境变量和 fetch

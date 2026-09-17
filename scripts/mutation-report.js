@@ -22,6 +22,9 @@ const MUTANT_STATUSES = new Set([
   'Killed', 'Survived', 'NoCoverage', 'CompileError', 'RuntimeError', 'Timeout', 'Ignored', 'Pending'
 ])
 
+// F7：去重列表查询的整体超时（毫秒）——列表 API 只回答「当天是否已发过」，挂住不能拖死整个日报 job。
+const LIST_QUERY_TIMEOUT_MS = 15000
+
 function analyze (dir) {
   // S8707：CLI 参数显式校验（防 LLM/错误参数访问任意路径——先验证存在且是目录）
   let st
@@ -318,21 +321,32 @@ async function postIssue (body) {
   const repo = process.env.GITHUB_REPOSITORY || 'junhanw868-bot/notes'
   const today = shanghaiDate()
   const title = `🧬 变异测试日报 ${today}`
-  // 同天去重：当天已有日报则跳过（避免多次运行重复发 Issue）
-  const listRes = await fetch(`https://api.github.com/repos/${repo}/issues?state=all&per_page=100&creator=github-actions%5Bbot%5D`, {
-    headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'mutation-report' }
-  })
-  if (listRes.ok) {
-    const list = await listRes.json()
-    const existing = (list || []).find(i => i.title === title)
-    if (existing) {
-      console.log('⏭️  当日日报已存在，跳过重复发布')
-      return { number: existing.number, html_url: existing.html_url, skipped: true }
+  // 同天去重：当天已有日报则跳过（避免多次运行重复发 Issue）。
+  // F7：去重查询必须整体容错——非 2xx / 网络异常 / 超时 / 200 但响应体非 JSON，一律按既有口径
+  // 「跳过去重直接创建」并输出可观测 warn。旧实现有两条能吞掉当天日报的路径：
+  //   ① `await listRes.json()` 未包 try：列表 API 返回 200 + 非 JSON（代理页/限流说明页）时抛
+  //      SyntaxError，整个 run 失败，日报不发；
+  //   ② fetch 无超时：列表接口挂住会把 report job 一起拖死（GitHub API 偶发长时间无响应）。
+  // 只用本机异常文本拼 warn（非远端响应体），折叠换行/控制字符后截断，避免伪造日志行。
+  let existing
+  try {
+    const listRes = await fetch(`https://api.github.com/repos/${repo}/issues?state=all&per_page=100&creator=github-actions%5Bbot%5D`, {
+      headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'mutation-report' },
+      signal: AbortSignal.timeout(LIST_QUERY_TIMEOUT_MS)
+    })
+    if (!listRes.ok) {
+      console.warn(`⚠️  日报列表查询失败（HTTP ${listRes.status}），跳过去重直接创建`)
+    } else {
+      const list = await listRes.json()
+      existing = (list || []).find(i => i.title === title)
     }
-  } else {
-    // F7：列表查询非 2xx 时既有语义是「去重降级为直接新建」（已被单测固化，改动属判重口径），
-    // 这里只让静默降级可观测；fetch 超时/重试策略不在本文件单方面引入。
-    console.warn(`⚠️  日报列表查询失败（HTTP ${listRes.status}），跳过去重直接创建`)
+  } catch (e) {
+    const reason = String((e && e.message) || e || 'unknown').replace(/[\r\n]+/g, ' ').slice(0, 200)
+    console.warn(`⚠️  日报列表查询失败（${reason}），跳过去重直接创建`)
+  }
+  if (existing) {
+    console.log('⏭️  当日日报已存在，跳过重复发布')
+    return { number: existing.number, html_url: existing.html_url, skipped: true }
   }
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: 'POST',
