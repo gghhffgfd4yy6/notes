@@ -44,6 +44,29 @@ const {
   assert.strictEqual(writeAtomic(nested, 'nested-ok'), true, '嵌套路径应自动创建父目录')
   assert.strictEqual(fs.readFileSync(nested, 'utf8'), 'nested-ok')
 
+  // ===== STG-06：新建父目录必须显式 0o700，不得随 umask（022 下旧行为 0755）=====
+  // 旧实现 mkdirSync(dir, { recursive: true }) 不传 mode，目录权限由 umask 决定，与本模块
+  // 文件的 0o600 口径不一致。断言两路：① 传给 mkdirSync 的 mode 必须显式 0o700（本机 umask=077
+  // 会让「实际权限」断言在修前也成立，只有参数断言能证伪）；② 新建目录的实际权限位为 0700。
+  const mkdirCalls = []
+  const origMkdirSync = fs.mkdirSync
+  fs.mkdirSync = (target, options) => { mkdirCalls.push({ target, options }); return origMkdirSync.call(fs, target, options) }
+  let permRet
+  try { permRet = writeAtomic(make('perm/a/b/c.txt'), 'perm') } finally { fs.mkdirSync = origMkdirSync }
+  assert.strictEqual(permRet, true, '新目录下的写入应成功')
+  assert.ok(mkdirCalls.length > 0, '父目录不存在时必须调用 mkdirSync')
+  assert.ok(mkdirCalls.every((c) => c.options && c.options.mode === 0o700),
+    `mkdirSync 必须显式传 mode 0o700（旧实现不传；实际：${JSON.stringify(mkdirCalls.map((c) => c.options))}）`)
+  assert.strictEqual(fs.statSync(make('perm/a')).mode & 0o777, 0o700, '新建目录实际权限应为 0700')
+  assert.strictEqual(fs.statSync(make('perm/a/b')).mode & 0o777, 0o700, '递归新建的每一级目录都应为 0700')
+  // 已存在目录不得被 chmod（不改动部署侧既有权限）：预先建一个 0755 目录，再写入其下文件
+  const preexisting = make('preexist')
+  fs.mkdirSync(preexisting, { recursive: true, mode: 0o755 })
+  fs.chmodSync(preexisting, 0o755)
+  const beforeMode = fs.statSync(preexisting).mode & 0o777
+  assert.strictEqual(writeAtomic(make('preexist/f.txt'), 'x'), true, '已存在目录下的写入应成功')
+  assert.strictEqual(fs.statSync(preexisting).mode & 0o777, beforeMode, '已存在的目录不得被 chmod')
+
   // ===== STG-03：空串路径必须显式拒绝（旧实现判为「ENOENT=缺失=安全」）=====
   // 本机实测：lstatSync('') 抛 ENOENT，旧实现因此返回 true；空 filePath 会让 writeAtomic 在
   // 进程 CWD 先落一个含 payload 的唯一临时文件（随后 renameSync(tmp,'') 才失败）。

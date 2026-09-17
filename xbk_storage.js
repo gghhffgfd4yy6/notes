@@ -27,10 +27,11 @@ function isRegularOrMissing (filePath) {
 
 function ensureParent (filePath) {
   const dir = path.dirname(filePath)
-  // 已知口径差（审查 STG-06，记录不修）：不传 mode，目录权限随 umask（022 下为 0755），
-  // 与本模块文件强制 0o600 不一致；缓存目录首建即在此处，是否收紧到 0o700 属权限模型决策，
-  // 不在本轮范围。
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+  // 审查 STG-06：显式 0o700（旧实现不传 mode，权限随 umask——022 下为 0755，与文件强制 0o600
+  // 口径不一致；缓存目录首建即在此处，同机其他用户可进入目录并读取/替换缓存文件）。目录必须有
+  // 执行位才能访问其中文件，0700 即 0600 的等价目录形态；mode 只在新建目录时生效，已存在的
+  // 目录不做 chmod（不改动部署侧既有权限）。
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
 }
 
 // 尽力 fsync 父目录（审查 STG-04）：rename 的持久性要靠目录项的 fsync 才成立。
