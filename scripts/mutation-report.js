@@ -15,6 +15,13 @@ const EXPECTED_SEGMENTS = Object.freeze([
   'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push', 'check-deps', 'status'
 ])
 
+// stryker 报告的合法变异状态——权威来源是本仓已安装的 mutation-testing-report-schema 里
+// MutantStatus 的 enum。countMutant 只对其中 4 个计数，其余 4 个（CompileError/RuntimeError/
+// Ignored/Pending）只计入 total；校验必须按这个全集来，收窄成计数的 4 个会把正常报告整段拒掉。
+const MUTANT_STATUSES = new Set([
+  'Killed', 'Survived', 'NoCoverage', 'CompileError', 'RuntimeError', 'Timeout', 'Ignored', 'Pending'
+])
+
 function analyze (dir) {
   // S8707：CLI 参数显式校验（防 LLM/错误参数访问任意路径——先验证存在且是目录）
   let st
@@ -130,16 +137,18 @@ function analyzeSegment (dir, entry) {
       if (!Array.isArray(file.mutants)) {
         throw new Error(`files["${fileKey}"].mutants 缺失或非数组`)
       }
-      // CodeRabbit PR #151：只校验「是数组」不够。countMutant 先 total++ 再按已知状态分类，
-      // 于是 `{}` / 缺 status 的条目会绕过上面的「零变异体」护栏——total 被抬高、哪一个桶都
-      // 计不进去，分数被压低后照发。这里要求每条都是带非空字符串 status 的对象。
-      // **刻意不采用「只认 Killed/Survived/NoCoverage/Timeout」的白名单**：stryker 的合法状态
-      // 还有 RuntimeError / CompileError / Ignored / Pending，白名单会把正常报告整段拒掉
-      // （下方 CLI 场景 6 用 RuntimeError 锁定这一点）。未列入桶的合法状态仍只计入 total。
+      // CodeRabbit PR #151：只校验「是数组」不够。countMutant 先 total++ 再按状态分类，于是
+      // `{}` / 缺 status 的条目会绕过上面的「零变异体」护栏——total 被抬高、哪个桶都计不进去，
+      // 分数被压低后照发。这里要求每条的对象形状与 status 都在**厂商 schema 的取值域**内。
+      // 状态集合取权威 enum（node_modules/mutation-testing-report-schema 的 MutantStatus），
+      // **不是** countMutant 计数的那 4 个：CompileError/RuntimeError/Ignored/Pending 都是合法
+      // 状态，只认 4 个会把正常报告整段拒掉（CodeRabbit 原提议即此，其后续 review 亦确认不采用）。
+      // 用 enum 校验同时关掉「非空但未知的 status（如 'Bogus'）静默抬高 total」这类漏网
+      // （独立对抗审查 B 组反例：只要求非空字符串时 'Bogus' 被接受并计数）。
       for (const m of file.mutants) {
         const status = m && typeof m === 'object' && !Array.isArray(m) ? m.status : undefined
-        if (typeof status !== 'string' || status === '') {
-          throw new Error(`files["${fileKey}"].mutants 含缺失或非法 status 的条目（status=${JSON.stringify(status)}）`)
+        if (!MUTANT_STATUSES.has(status)) {
+          throw new Error(`files["${fileKey}"].mutants 含缺失或未知 status 的条目（status=${JSON.stringify(status)}）`)
         }
         countMutant(stats, fileKey, m)
       }

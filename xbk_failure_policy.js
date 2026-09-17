@@ -24,29 +24,57 @@ function safeString (value) {
   try { return String(value === undefined || value === null ? '' : value) } catch (e) { return '' }
 }
 
-// 凭据关键字（保持历史顺序，保证同形输入的命中位置与既有行为一致）
-const SECRET_KEY = '(?:token|app[_-]?token|key|secret|authorization|pushkey)'
+// XFP-04（含独立对抗审查 A 组与 qodo #152 的补漏）：脱敏必须**整体**抹掉凭据，且要覆盖写法差异。
+// 一条键值规则 + 一条裸 scheme 规则，比按形态堆多条正则更好推理，也不会出现「前一条把后一条的
+// 输入改掉」的耦合。
+//
+// 键值规则：`<关键字(可带引号)> < = | : > [scheme] <值>`，值四种形态（顺序即优先级）：
+//  ① `"(?:\.|[^"\\])*"?`  双引号值，按 JSON 转义语义吃完整串——用 `[^"]*` 会把值内的转义引号当
+//     收尾引号、只抹前半段（qodo #151-1：`{"appToken":"abc\"SECRET"}` 残留 `SECRET`）；收尾引号
+//     可选，未闭合的引号值同样被抹掉（否则 `token="x` 整段漏抹）。单引号形态同构。
+//  ② `'(?:\.|[^'\\])*'?`  单引号值（A 组反例：`{'token':'SECRET'}` 旧规则整体不命中）。
+//  ③ `\[(?:[^\]"']|"…"|'…')*\]` / `\{(?:[^\}"']|"…"|'…')*\}`  **结构化值**（数组/对象），含值内的
+//     引号串与逗号。qodo #152-1：旧规则的裸值分支遇 `,`/`}`/`]` 即停，`token=[0,"SECRET"]` 只抹到
+//     `token=***,"SECRET"]`、`token={"a":"SECRET"}` 只抹到 `token=***}`，凭据仍进日志。
+//     括号内的引号串按转义语义整段吞掉，括号配平由强制收尾括号保证；未闭合的（如 `token=[1,2`）
+//     落回下面的裸值分支，不会吞掉后续文本。
+//  ④ `[^\s,;}\]&]+`       裸值，含非字符串 JSON 值（`{"token":12345}`）。分隔符 `\s,;}\]&` 是
+//     **有意收窄**：逗号/分号/& 之后属于下一个参数（`?token=a,b` 只抹 `a`），该行为有断言锁定。
+//  值以引号开头时按原引号形态回填（`"***"` / `'***'`），保持 JSON/JS 结构可读；
+//  已脱敏值（`***`）不会被二次处理——回调按值重新生成，天然幂等。
+//
+// 关键字边界（qodo #152-3）：关键字两侧**必须**是字符串/文本边界，否则「关键字」可能只是更长字段名
+//   的后缀——`{"monkey":"business"}` 里的 `key`、`{"turkey":"dinner"}` 里的 `key` 都会被误当成凭据键，
+//   把无关的普通字段抹掉。边界 = 串首/串尾或非标识符字符（`[A-Za-z0-9_]`），关键字内部的 `_`/`-`
+//   仍照常匹配（`app_token`/`refresh-token`）。
+//
+// 裸 scheme 规则：无关键字的 `Bearer|Basic <凭据>`（如上游把 Authorization 头值回显进 message）。
+//  凭据可被引号包住（qodo #152-2：`Basic "YWJjOmRlZg=="` 旧规则整体不命中）；判定长度时剥掉引号，
+//  要求 ≥8 个凭据字符——否则普通英文句子 `the bearer of good news` 会被误抹（A 组反例）。
+const SECRET_KEY = '(?:app[_-]?token|access[_-]?token|refresh[_-]?token|api[_-]?key|pushkey|authorization|credential|password|passwd|pwd|session|cookie|token|key|secret)'
+// 关键字本身可能是引用形态（双引号 JSON / 单引号 JS 字面量），两侧加边界断言
+const SECRET_KEY_QUOTED = `(?:^|[^A-Za-z0-9_])["']?${SECRET_KEY}["']?(?![A-Za-z0-9_])`
+const DQ_VALUE = '"(?:\\\\.|[^"\\\\])*"?'
+const SQ_VALUE = "'(?:\\\\.|[^'\\\\])*'?"
+// 结构化值：数组/对象，允许值内的引号串（按转义语义吞掉）与逗号等分隔符
+const ARRAY_VALUE = `\\[(?:[^\\]"']|${DQ_VALUE}|${SQ_VALUE})*\\]`
+const OBJECT_VALUE = `\\{(?:[^}"']|${DQ_VALUE}|${SQ_VALUE})*\\}`
+const SECRET_KV_RE = new RegExp(
+  `(${SECRET_KEY_QUOTED}\\s*[=:]\\s*)(?:(?:bearer|basic)\\s+)?(${DQ_VALUE}|${SQ_VALUE}|${ARRAY_VALUE}|${OBJECT_VALUE}|[^\\s,;}\\]&]+)`,
+  'gi'
+)
+const SECRET_BARE_SCHEME_RE = /\b(bearer|basic)\s+("[A-Za-z0-9._~+/=-]{8,}"|'[A-Za-z0-9._~+/=-]{8,}'|[A-Za-z0-9._~+/=-]{8,})/gi
 
-// XFP-04：脱敏必须**整体**抹掉凭据，而不是只抹关键字后的第一个词。三条规则对应三类书写形态：
-// ① 键值形态 `<keyword> = <credential>`。Authorization 类头部写作 `<keyword>: <scheme> <credential>`，
-//    旧的 `[^\s,;]+` 只吃掉 scheme——`Authorization: Bearer SECRET123 x` 被脱成
-//    `Authorization: *** SECRET123 x`，真正的凭据原样残留；这里把 bearer/basic 前缀并入本次匹配。
-// ② JSON/JS 引号形态 `"appToken":"SECRET123"`：关键字与冒号之间夹着引号，旧正则要求关键字后
-//    直接是 `=`/`:`，整体不命中，凭据原样出网（日志/告警/摘要），故单列一条带引号规则。
-//    值部分必须按 JSON 转义语义吃完整串（`(?:\\.|[^"\\])*`）而不能用 `[^"]*`：后者把值内
-//    的转义引号（如 `{"appToken":"abc\"SECRET"}`）当成收尾引号，只抹掉前半段、把 `SECRET"`
-//    这类后缀原样留在日志里（qodo PR #151-1，脱敏是安全控制，漏抹即凭据泄漏）。
-// ③ 裸 `Bearer <credential>`（无关键字前缀，例如上游把 Authorization 头值回显进 message）。
-// 脱敏方向上一律宁可多抹：误抹只是可读性损失，漏抹就是凭据泄漏。
-const SECRET_KV_RE = new RegExp(`(${SECRET_KEY}\\s*[=:]\\s*)(?:bearer\\s+|basic\\s+)?[^\\s,;]+`, 'gi')
-const SECRET_KV_QUOTED_RE = new RegExp(`("${SECRET_KEY}"\\s*:\\s*")(?:\\\\.|[^"\\\\])*(")`, 'gi')
-const BEARER_RE = /\b(bearer)\s+[^\s,;]+/gi
+// 保持值原有的引号形态（`"abc"` → `"***"`、`'abc'` → `'***'`、裸值 → `***`）
+function maskSecretValue (value) {
+  const quote = value[0] === '"' ? '"' : value[0] === "'" ? "'" : ''
+  return quote ? `${quote}***${quote}` : '***'
+}
 
 function redact (text) {
   return safeString(text)
-    .replace(SECRET_KV_RE, '$1***')
-    .replace(SECRET_KV_QUOTED_RE, '$1***$2')
-    .replace(BEARER_RE, '$1 ***')
+    .replace(SECRET_KV_RE, (_match, prefix, value) => prefix + maskSecretValue(value))
+    .replace(SECRET_BARE_SCHEME_RE, '$1 ***')
     .replace(/\/bot[^/\s]+/gi, '/bot***')
 }
 
