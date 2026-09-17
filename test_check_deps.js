@@ -273,6 +273,65 @@ test('F4 satisfiesNodeRange：repo engines 与 re2 更严的 engines 都按 npm 
   }
 })
 
+// F4 返工：**缺段比较器的 npm X-range 真值表**。修复前的极简解析器只把缺失的段补 0 再比较，
+// 于是 `~1` 的上界算成 <1.1.0（npm: <2.0.0）、`~0` 算成 <0.1.0（npm: <1.0.0）、`^0` 算成 <0.0.1
+// （npm: <1.0.0）、`1` 被当成精确 =1.0.0（npm: >=1.0.0 <2.0.0）——对一个**自称支持**的写法静默错判。
+// 表内每一行的期望值由 semver@7 生成（`node -e "console.log(require('semver').satisfies(v,r))"`），
+// 不以本实现为口径。任一行不符即断言红。
+test('F4 返工 satisfiesNodeRange：缺段写法必须按 npm X-range 语义（真值表对照 semver@7）', () => {
+  const rows = [
+    // ~（仅主版本的 tilde 上界正是被打回的形态）
+    ['1.9.0', '~1', true], ['0.5.0', '~0', true], ['1.0.0', '~1', true], ['2.0.0', '~1', false],
+    ['1.2.9', '~1.2', true], ['1.3.0', '~1.2', false], ['0.2.5', '~0.2', true], ['0.3.0', '~0.2', false],
+    // ^（缺段按 X-range 展开：^0 是 <1.0.0 而不是 <0.0.1）
+    ['1.9.0', '^1', true], ['2.0.0', '^1', false], ['0.5.0', '^0', true], ['1.0.0', '^0', false],
+    ['0.0.9', '^0', true], ['0.5.0', '^0.2', false], ['0.2.9', '^0.2', true], ['0.0.3', '^0.0', true],
+    ['0.1.0', '^0.0', false], ['24.18.0', '^24.15.0', true], ['24.10.0', '^24.15.0', false],
+    // 裸版本 / = ：缺段是 X-range，不是精确单点
+    ['1.2.5', '=1.2', true], ['1.3.0', '=1.2', false], ['2.0.0', '=1', false], ['1.5.0', '=1', true],
+    // > / <= ：缺段时比较对象是 X-range 的边界
+    ['1.2.5', '>1.2', false], ['1.3.0', '>1.2', true], ['1.5.0', '>1', false], ['2.0.0', '>1', true],
+    ['1.2.5', '<=1.2', true], ['1.3.0', '<=1.2', false], ['1.5.0', '<=1', true], ['2.0.0', '<=1', false],
+    // < / >= 与 npm 同口径（缺段补 0）
+    ['1.2.0', '<1.2', false], ['1.1.9', '<1.2', true], ['2.0.0', '<1', false], ['0.9.9', '<1', true]
+  ]
+  for (const [version, range, expected] of rows) {
+    const actual = satisfiesNodeRange(version, range)
+    if (actual !== expected) throw new Error(`satisfiesNodeRange(${version}, ${JSON.stringify(range)}) 期望 ${expected}（npm 口径），实际 ${actual}`)
+  }
+})
+
+// F4 返工（分支覆盖）：re2 的 engines 比本仓库严，但本机 node_modules/re2 是 V8 替身（无 engines 字段），
+// 于是 readNativeEngineRange 的整条生产分支在仓库树上零覆盖。这里在沙箱里放一个自带 engines 的假 re2
+// （真实包形状：package.json.engines + 可构造的 RE2 类），直接驱动「re2 engines 更严 → 版本门禁拦下」。
+test('F4 返工：re2 自身 engines 更严时纳入版本门禁（沙箱假 re2 驱动该分支）', () => {
+  const dir = makeCheckDepsSandbox({
+    manifest: { name: 'sandbox', version: '1.0.0', dependencies: { re2: '1.0.0' } },
+    deps: ['re2']
+  })
+  const re2Dir = path.join(dir, 'node_modules', 're2')
+  try {
+    // 假 re2：可构造且探针通过，只有 engines 参与判定
+    fs.writeFileSync(path.join(re2Dir, 'index.js'), 'module.exports = class RE2 { constructor (p) { this.p = p } test () { return true } }\n')
+    fs.writeFileSync(path.join(re2Dir, 'package.json'),
+      JSON.stringify({ name: 're2', version: '1.0.0', main: 'index.js', engines: { node: '>99.0.0' } }))
+    const blocked = runCheckDepsSandbox(dir)
+    if (blocked.status === 0) throw new Error(`re2 engines 不满足必须非 0 退出，实际 status=0，stdout=${JSON.stringify(blocked.stdout)}`)
+    const err = String(blocked.stderr)
+    if (!err.includes('re2 的 engines.node') || !err.includes('>99.0.0')) {
+      throw new Error(`stderr 必须点名 re2 的 engines 要求，实际: ${JSON.stringify(err)}`)
+    }
+    // 对照组：同一份假 re2 换成当前运行时满足的区间 → 必须放行
+    // （证伪「拦截来自别的分支」：只有 engines 变了）
+    fs.writeFileSync(path.join(re2Dir, 'package.json'),
+      JSON.stringify({ name: 're2', version: '1.0.0', main: 'index.js', engines: { node: `>=${process.versions.node.replace(/^v/, '')}` } }))
+    const allowed = runCheckDepsSandbox(dir)
+    if (allowed.status !== 0) throw new Error(`engines 满足时必须放行，实际 status=${allowed.status}，stderr=${JSON.stringify(allowed.stderr)}`)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // F4 回归（集成）：repo engines 不满足时必须判失败并输出要求与当前版本。
 test('F4 repo engines 不满足 → 返回 false 且输出要求', () => {
   const out = captureErrorOutput(() => {

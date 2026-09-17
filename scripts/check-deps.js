@@ -54,20 +54,56 @@ function compareVersion (a, b) {
   return 0
 }
 
+// F4 返工：比较器语义必须与 npm semver 一致，**尤其是缺段写法**（`~1` / `^1` / `1` / `>1` / `<=1`）。
+// 它们不是「缺省段补 0 后做同级比较」，而是按 npm 的 X-range 展开：
+//   1      → >=1.0.0 <2.0.0      1.2    → >=1.2.0 <1.3.0      1.2.3 → =1.2.3
+//   ~1     → >=1.0.0 <2.0.0      ~1.2   → >=1.2.0 <1.3.0      ~0    → >=0.0.0 <1.0.0
+//   ^1     → >=1.0.0 <2.0.0      ^0     → >=0.0.0 <1.0.0      ^0.0  → >=0.0.0 <0.1.0
+//   >1     → >=2.0.0             >1.2   → >=1.3.0             <=1.2 → <1.3.0
+// 修复前 `~1`→<1.1.0、`~0`→<0.1.0（仅主版本 tilde 上界少升一级）对上界做了静默错判：
+// 将来 engines.node 写 `~24` 会在受支持的 Node 上误红。真值表（逐行对照 semver@7 的 satisfies）
+// 见 test_check_deps.js 的 F4 表；不认识的写法（`x`/`*` 通配等）一律返回 null，由调用方降级告警。
 function satisfiesComparator (version, token) {
   const m = /^(>=|<=|>|<|=|\^|~)?v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$/.exec(token)
   if (!m) return null
   const op = m[1] || '='
+  const hasMinor = m[3] !== undefined
+  const hasPatch = m[4] !== undefined
   const low = [Number(m[2]), Number(m[3] || 0), Number(m[4] || 0)]
   if (op === '>=') return compareVersion(version, low) >= 0
-  if (op === '>') return compareVersion(version, low) > 0
-  if (op === '<=') return compareVersion(version, low) <= 0
   if (op === '<') return compareVersion(version, low) < 0
-  if (op === '=') return compareVersion(version, low) === 0
-  // ^ 与 ~ 的上界按 npm 口径：^1.2.3 → <2.0.0、^0.2.3 → <0.3.0、^0.0.3 → <0.0.4、~1.2.3 → <1.3.0
-  const high = op === '^'
-    ? (low[0] > 0 ? [low[0] + 1, 0, 0] : (low[1] > 0 ? [0, low[1] + 1, 0] : [0, 0, low[2] + 1]))
-    : [low[0], low[1] + 1, 0]
+  // `>X` / `<=X`：X 缺段时比较对象是 X-range 的边界，不是补 0 后的单点
+  if (op === '>') {
+    if (!hasMinor) return compareVersion(version, [low[0] + 1, 0, 0]) >= 0
+    if (!hasPatch) return compareVersion(version, [low[0], low[1] + 1, 0]) >= 0
+    return compareVersion(version, low) > 0
+  }
+  if (op === '<=') {
+    if (!hasMinor) return compareVersion(version, [low[0] + 1, 0, 0]) < 0
+    if (!hasPatch) return compareVersion(version, [low[0], low[1] + 1, 0]) < 0
+    return compareVersion(version, low) <= 0
+  }
+  if (op === '=') {
+    if (!hasMinor) return compareVersion(version, low) >= 0 && compareVersion(version, [low[0] + 1, 0, 0]) < 0
+    if (!hasPatch) return compareVersion(version, low) >= 0 && compareVersion(version, [low[0], low[1] + 1, 0]) < 0
+    return compareVersion(version, low) === 0
+  }
+  let high
+  if (op === '~') {
+    // ~1 → <2.0.0（仅主版本时上界升主版本，不是升次版本）；~1.2 / ~1.2.3 → <1.3.0
+    high = hasMinor ? [low[0], low[1] + 1, 0] : [low[0] + 1, 0, 0]
+  } else if (!hasMinor) {
+    // ^1 → <2.0.0；^0 → <1.0.0（主版本为 0 且次版本缺失时上界是 1.0.0）
+    high = low[0] > 0 ? [low[0] + 1, 0, 0] : [1, 0, 0]
+  } else if (low[0] > 0) {
+    high = [low[0] + 1, 0, 0] // ^1.2 / ^1.2.3 → <2.0.0
+  } else if (!hasPatch) {
+    high = [0, low[1] + 1, 0] // ^0.0 → <0.1.0；^0.2 → <0.3.0
+  } else if (low[1] > 0) {
+    high = [0, low[1] + 1, 0] // ^0.2.3 → <0.3.0
+  } else {
+    high = [0, 0, low[2] + 1] // ^0.0.3 → <0.0.4
+  }
   return compareVersion(version, low) >= 0 && compareVersion(version, high) < 0
 }
 
