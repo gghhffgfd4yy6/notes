@@ -124,6 +124,37 @@ try {
     assert.strictEqual(readStatus(tmp).report.status, 'invalid', 'date=null 不是 undefined、也不是字符串 → 仍 invalid')
   })
 
+  // ===== SS-02：channel-health 单条损坏不得整表 invalid（健康通道信息必须保留）=====
+  // 旧实现 validChannels 是 Object.values(...).every(...) 全表口径：一条坏记录即整表 invalid，
+  // formatStatus 于是走 describe → 只显示「不可读（invalid）」，所有健康通道一并消失。
+  test('S9 channel-health 单条损坏 → 整表仍 ok，健康通道照常展示且明示被忽略条数', () => {
+    fs.writeFileSync(path.join(tmp, 'channel-health.state'), JSON.stringify({
+      good: { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0 },
+      pushplus: { consecutiveFailures: 3, lastFailureAt: 1000, lastAlertAt: 0 },
+      bad: { consecutiveFailures: 'x', lastFailureAt: 0, lastAlertAt: 0 }
+    }) + '\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.channels.status, 'ok', '存在健康条目时不得因一条损坏判整表 invalid（修前为 invalid）')
+    const output = formatStatus(status)
+    assert.match(output, /good：连续失败 0 次/, '健康通道 good 必须照常展示（修前整行丢失）')
+    assert.match(output, /pushplus：连续失败 3 次/, '健康通道 pushplus 必须照常展示')
+    assert.doesNotMatch(output, /bad/, '损坏条目本身不得被当作健康记录展示')
+    assert.match(output, /另有 1 条记录损坏已忽略/, '被忽略的损坏条数必须明示，不得静默丢弃')
+    assert.doesNotMatch(output, /通道健康：不可读/, '有健康条目时不得整体报不可读')
+  })
+
+  test('S10 channel-health 全部损坏 → 整表 invalid；空表 → ok 且显示暂无记录', () => {
+    fs.writeFileSync(path.join(tmp, 'channel-health.state'), JSON.stringify({
+      only: { consecutiveFailures: 'x' }
+    }) + '\n')
+    assert.strictEqual(readStatus(tmp).channels.status, 'invalid', '有记录且无一合格时整表判 invalid（不假装「暂无记录」）')
+
+    fs.writeFileSync(path.join(tmp, 'channel-health.state'), '{}\n')
+    const empty = readStatus(tmp)
+    assert.strictEqual(empty.channels.status, 'ok', '空表仍是合法状态（保持旧行为）')
+    assert.match(formatStatus(empty), /通道健康：暂无记录/, '空表应显示暂无记录')
+  })
+
   // ===== formatStatus：channels.value 为 null（status ok 但 value null）时降级 =====
   test('S4 formatStatus channels.value 为 null → 走 describe 降级分支', () => {
     const status = {

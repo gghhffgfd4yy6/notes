@@ -33,10 +33,20 @@ function validReport (value) {
     ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'].every(key => value[key] === undefined || validCounter(value[key]))
 }
 
-// 全表口径：任一条目不合格即整表 invalid（逐条容错需同步调整 parseJson 返回契约与 formatStatus）。
+// 单条通道记录的口径：必须是普通对象且三个计数均为非负安全整数（缺失/类型错即该条损坏）。
+function validChannelEntry (entry) {
+  return entry && typeof entry === 'object' && !Array.isArray(entry) &&
+    validCounter(entry.consecutiveFailures) && validCounter(entry.lastFailureAt) && validCounter(entry.lastAlertAt)
+}
+
+// 逐条容错（审查 SS-02）：旧实现 Object.values(value).every(...) 是「任一条目损坏即整表 invalid」，
+// 一条坏记录会让所有健康通道信息一并消失（--status 只显示「不可读（invalid）」）。现口径：
+//   - 空表（{}）→ ok，展示「暂无记录」；
+//   - 至少有一条合格记录 → ok，formatStatus 逐条过滤并报告被忽略的损坏条数；
+//   - 有记录且无一合格 → invalid（整表确实不可读，不假装「暂无记录」）。
 function validChannels (value) {
-  return Object.values(value).every(entry => entry && typeof entry === 'object' && !Array.isArray(entry) &&
-    validCounter(entry.consecutiveFailures) && validCounter(entry.lastFailureAt) && validCounter(entry.lastAlertAt))
+  const entries = Object.values(value)
+  return entries.length === 0 || entries.some(validChannelEntry)
 }
 
 function parseJson (read, validate) {
@@ -102,8 +112,14 @@ function formatStatus (status) {
   lines.push(`最近一轮：${describe(status.run)}${run ? ` | 获取 ${run.total} | 去重 ${run.dedup} | 过滤 ${run.filtered} | 推送 ${run.pushed} | 失败 ${run.failed} | 截断 ${run.truncated}${run.truncated > 0 ? ' ⚠️' : ''} | 耗时 ${run.elapsed}` : ''}`)
   const channels = status.channels.value
   if (channels) {
-    const entries = Object.entries(channels).filter(([, value]) => value && typeof value === 'object')
-    lines.push(`通道健康：${entries.length ? entries.map(([name, value]) => `${name}：连续失败 ${Number(value.consecutiveFailures) || 0} 次`).join('；') : '暂无记录'}`)
+    // 与 validChannels 同口径逐条过滤（审查 SS-02）：损坏条目单独计数并明示，健康通道照常展示。
+    const all = Object.entries(channels)
+    const entries = all.filter(([, value]) => validChannelEntry(value))
+    const dropped = all.length - entries.length
+    const body = entries.length
+      ? entries.map(([name, value]) => `${name}：连续失败 ${value.consecutiveFailures} 次`).join('；')
+      : '暂无记录'
+    lines.push(`通道健康：${body}${dropped > 0 ? `（另有 ${dropped} 条记录损坏已忽略）` : ''}`)
   } else lines.push(`通道健康：${describe(status.channels)}`)
   const diagnostics = status.diagnostics.value
   lines.push(`过滤诊断：${describe(status.diagnostics)}${diagnostics ? ` | 最近 ${diagnostics.at || '未知'} | 原因：${Object.entries(diagnostics.byReason || {}).map(([key, value]) => `${key}=${value}`).join('，') || '无'}` : ''}`)
