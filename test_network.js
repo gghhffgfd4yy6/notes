@@ -258,6 +258,16 @@ function makeNetwork (opts = {}) {
     assert.strictEqual(getCalls(), 3, '空体必须按可重试处理（首次 + 2 次重试），不得首次即永久停推')
   }
 
+  // 12e. XHTTP-06：终态 3xx（HTTP_304）是确定性重定向，请求层必须首次即抛、不得退避重试。
+  // 反向可证伪：若日后把 HTTP_3xx 放进 RETRYABLE_CODES（或去掉 `sc < 500` 的立即抛判定），本块 calls 变 3 → 红。
+  {
+    const { net, getCalls } = makeNetwork({ retry: 2, statusCode: 304, errorCode: 'HTTP_304', failTimes: 5 })
+    let rejected = null
+    try { await net.fetchData() } catch (e) { rejected = e }
+    assert.strictEqual(rejected.code, 'HTTP_304', '应抛出原错误（保留真实状态码）')
+    assert.strictEqual(getCalls(), 1, '终态 3xx 必须首次即抛，不得重试')
+  }
+
   // 13. net-7：Retry-After 解析（RFC 9110 的 delta-seconds 或 HTTP-date；其余形态一律 null 回落指数退避）
   {
     const now = Date.parse('2026-09-17T00:00:00.000Z')

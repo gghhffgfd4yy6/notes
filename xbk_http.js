@@ -105,10 +105,12 @@ async function fetchJson (url, options = {}, maxBody = DEFAULT_MAX_BODY) {
       if (settled) return
       const endedAt = Date.now()
       const text = Buffer.concat(chunks).toString('utf8')
-      // 只把 4xx/5xx 判为 HTTP 错误。终态 3xx/304（followRedirect:false 或响应无 Location 时可达）落到
-      // 下面的 JSON 解析报 ERR_BODY_NOT_JSON：改成 >= 300 会把错误码变成 HTTP_3xx，而 xbk_failure_policy
-      // 未对 3xx 归类（现在按 PERMANENT 处理，改后落 UNKNOWN/retryable）——需先跨文件统一口径，故此处不动。
-      if (response && response.statusCode >= 400) {
+      // XHTTP-06：终态 3xx/304（followRedirect:false、响应无 Location、或 304 Not Modified 时可达）与
+      // 4xx/5xx 一样是 HTTP 层错误，必须带真实状态码抛出——旧实现只看 >= 400，3xx 落进 JSON 解析分支报
+      // ERR_BODY_NOT_JSON：错误码既误导，又让同一条 3xx 因响应体不同而落到两个码（空体走空体码、HTML 体
+      // 走非 JSON 码）。3xx 的失败归类已在 xbk_failure_policy.classifyOne 显式归为 permanent（确定性重定向，
+      // 重试同一 URL 结果不变），不再借 ERR_BODY_NOT_JSON 的永久语义，也不会落 UNKNOWN=可重试。
+      if (response && response.statusCode >= 300) {
         const err = new Error(`HTTP ${response.statusCode}`)
         err.code = `HTTP_${response.statusCode}`
         err.response = { statusCode: response.statusCode, body: text, headers: response.headers }

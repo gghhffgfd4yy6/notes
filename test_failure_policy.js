@@ -125,6 +125,28 @@ function error (message, code) {
   assert.deepStrictEqual(kinds429, ['retryable', 'retryable', 'retryable', 'retryable'],
     `429 在四种承载形态下必须同判可重试，实际 ${JSON.stringify(kinds429)}`)
 
+  // XHTTP-06：终态 3xx 是确定性重定向（重试同一 URL 结果不变）→ 必须显式判永久，且四种承载字段一致。
+  // 反例（改动前）：3xx 在数字 code / providerCode / HTTP_ 前缀 / statusCode 下都落 UNKNOWN → 可重试，
+  // 而 HTTP 层把终态 3xx 归成 ERR_BODY_NOT_JSON（永久）——同一状态码在「错误码字符串」与「statusCode」
+  // 两条路径上分类相反。本块锁定按区间统一后的口径。
+  for (const n of [300, 301, 302, 303, 304, 307, 308, 399]) {
+    assert.strictEqual(classifyFailure({ code: `HTTP_${n}` }).kind, 'permanent', `HTTP_${n} 应判永久`)
+    assert.strictEqual(classifyFailure({ code: `HTTP_${n}` }).reason, `HTTP_${n}`, `HTTP_${n} 的 reason 应是码本身`)
+    assert.strictEqual(classifyFailure({ code: n }).kind, 'permanent', `数字 code ${n} 应判永久`)
+    assert.strictEqual(classifyFailure({ code: n }).reason, `PROVIDER_${n}`, `数字 code ${n} 的 reason 保持 PROVIDER_ 口径`)
+    assert.strictEqual(classifyFailure({ providerCode: n }).kind, 'permanent', `providerCode ${n} 应判永久`)
+    assert.strictEqual(classifyFailure({ providerCode: n }).reason, `PROVIDER_${n}`, `providerCode ${n} 的 reason 保持 PROVIDER_ 口径`)
+    assert.strictEqual(classifyFailure({ statusCode: n }).kind, 'permanent', `statusCode ${n} 应判永久`)
+    assert.strictEqual(classifyFailure({ statusCode: n }).reason, `HTTP_${n}`, `statusCode ${n} 的 reason 保持 HTTP_ 口径`)
+  }
+  // 反向守卫：3xx 区间之外不得被波及（边界写错会让 2xx/4xx/5xx 语义漂移）
+  assert.strictEqual(classifyFailure({ statusCode: 299 }).kind, 'retryable', '2xx 边界（299）仍按未知保守重试')
+  assert.strictEqual(classifyFailure({ code: 'HTTP_299' }).kind, 'retryable', 'HTTP_299 不在 3xx 区间，仍保守重试')
+  assert.strictEqual(classifyFailure({ code: 'HTTP_400' }).kind, 'permanent', '4xx 语义不得被 3xx 分支改写')
+  assert.strictEqual(classifyFailure({ code: 'HTTP_429' }).kind, 'retryable', '429 仍可重试')
+  assert.strictEqual(classifyFailure({ code: 'HTTP_503' }).kind, 'retryable', '5xx 仍可重试')
+  assert.strictEqual(classifyFailure({ statusCode: 400 }).kind, 'permanent', 'statusCode 400 仍判永久')
+
   // XFP-05：子错误挂在 failureInfo.failures 时，父级 permanent 同样不得覆盖子级 retryable。
   // 反例（改动前）：classifyFailure 只读 error.failures，qinglong 产生的形状
   // {failureKind:'permanent', failureInfo:{failures:[{code:'ETIMEDOUT'}]}} 直接按父标签判 permanent，

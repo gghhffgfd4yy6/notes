@@ -366,5 +366,26 @@ function installMockStream (behavior) {
     } finally { restore() }
   }
 
+  // 16. XHTTP-06：终态 3xx 带**真实状态码**抛出并归 permanent。反例（旧实现）：3xx 落进 JSON 解析分支，
+  //     空体 304 报 ERR_EMPTY_BODY、带体 302 报 ERR_BODY_NOT_JSON——同一条 3xx 因响应体不同而落到两个码；
+  //     且若只把判据扩到 >=300 而失败策略不认 3xx，错误码变 HTTP_3xx 后会落 UNKNOWN=可重试（静默翻转）。
+  {
+    const cases = [[304, [], '终态 304（空体）'], [302, ['<html>moved</html>'], '终态 302（带体）'], [300, ['{}'], '终态 300（合法 JSON 体）']]
+    for (const [status, chunks, label] of cases) {
+      const restore = installMockStream({ response: { statusCode: status, headers: {} }, chunks })
+      try {
+        let rejected = null
+        try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
+        assert.ok(rejected, `${label} 应 reject（不得因响应体是合法 JSON 就当成成功）`)
+        assert.strictEqual(rejected.code, `HTTP_${status}`, `${label} 必须带真实状态码（旧实现报体相关码）`)
+        assert.strictEqual(rejected.response.statusCode, status, `${label} 应附 statusCode`)
+        assert.strictEqual(rejected.response.body, chunks.join(''), `${label} 应附响应体`)
+        const verdict = classifyFailure(rejected)
+        assert.strictEqual(verdict.kind, 'permanent', `${label} 应判永久（确定性重定向），实际 ${verdict.kind}（reason=${verdict.reason}）`)
+        assert.strictEqual(verdict.reason, `HTTP_${status}`, `${label} 的归类理由应为 HTTP_${status}，实际 ${verdict.reason}`)
+      } finally { restore() }
+    }
+  }
+
   console.log('test_http OK')
 })().catch((e) => { console.error(e); process.exit(1) })
