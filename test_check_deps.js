@@ -174,12 +174,65 @@ test('F2 直接执行脚本：缺依赖必须非 0 退出并输出原因（此�
   try {
     const r = runCheckDepsSandbox(dir)
     if (r.status === 0) throw new Error(`缺依赖必须非 0 退出（此前无守卫恒 0），实际 status=${r.status}`)
-    if (!String(r.stderr).includes('缺少依赖')) {
-      throw new Error(`stderr 必须给出缺失依赖的原因，实际: ${JSON.stringify(r.stderr)}`)
+    if (!String(r.stderr).includes('缺少依赖：xbk-missing-dep-xyz')) {
+      throw new Error(`stderr 必须点名 package.json 里声明的缺失依赖，实际: ${JSON.stringify(r.stderr)}`)
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// F1 回归：探测清单此前硬编码（load('got') + resolve('re2')），与 package.json 的声明清单无关，
+// 于是「声明了但没装」的运行时依赖永远发现不了（依赖漂移零覆盖）。回退该改动 → 清单退回硬编码
+// → ghost-dep 不被探测 → 返回 true，本条变红。
+test('F1 探测清单由 package.json 派生：声明但未安装的依赖必须报缺失', () => {
+  const out = captureErrorOutput(() => {
+    const ok = checkDependencies({
+      manifest: () => ({ dependencies: { got: '11.8.6', 'ghost-dep': '1.0.0' } }),
+      resolve: (name) => {
+        if (name === 'ghost-dep') throw new Error("Cannot find module 'ghost-dep'")
+        return '/mock/path'
+      },
+      load: (name) => fakeRe2Class()
+    })
+    if (ok !== false) throw new Error(`期望 false，实际 ${ok}`)
+  })
+  if (!out.includes('缺少依赖：ghost-dep')) throw new Error(`声明清单里的缺失依赖必须被发现: ${out}`)
+})
+
+// F1 另一面：未被声明的依赖不参与探测（清单即口径，不靠硬编码猜）。
+test('F1 未被声明的依赖不参与探测', () => {
+  const probed = []
+  const ok = checkDependencies({
+    manifest: () => ({ dependencies: { 'only-dep': '1.0.0' } }),
+    resolve: (name) => { probed.push(`resolve:${name}`); return '/mock/path' },
+    load: (name) => { probed.push(`load:${name}`); return {} }
+  })
+  if (ok !== true) throw new Error(`期望 true，实际 ${ok}`)
+  if (probed.join(',') !== 'resolve:only-dep,load:only-dep') {
+    throw new Error(`只应探测声明清单里的依赖，实际探测序列: ${probed.join(',')}`)
+  }
+})
+
+// F1 兜底：package.json 读不到时不得退化成「零检查」（退回内置清单 got/re2 并告警）。
+test('F1 package.json 不可读 → 告警并退回内置清单，不静默零检查', () => {
+  const warns = []
+  const probed = []
+  const originalWarn = console.warn
+  let ok
+  try {
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    ok = checkDependencies({
+      manifest: () => { throw new Error('EACCES: permission denied') },
+      resolve: (name) => { probed.push(name); return '/mock/path' },
+      load: (name) => fakeRe2Class()
+    })
+  } finally {
+    console.warn = originalWarn
+  }
+  if (ok !== true) throw new Error(`期望 true（内置清单两项都可用），实际 ${ok}`)
+  if (probed.join(',') !== 'got,re2') throw new Error(`应退回内置清单 got/re2，实际探测: ${probed.join(',')}`)
+  if (!warns.some(w => w.includes('package.json'))) throw new Error(`读失败必须告警，实际 warns=${JSON.stringify(warns)}`)
 })
 
 console.log('========================================')
