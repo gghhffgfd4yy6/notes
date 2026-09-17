@@ -4,11 +4,8 @@
 // 另校验运行时 Node 版本是否满足 package.json 的 engines.node 与 re2 自身的 engines.node
 // （re2 的口径更严，见 README：23.x / 24.0–24.14 / 25.x 都不在其支持范围内）。
 // 支持注入 resolve/load/manifest 以便测试（默认使用 Node 的 require 体系与 ROOT/package.json）。
-// 已知口径缺口（本轮审查 F5/F6，暂不在此修）：
-//   - 默认参数即生产路径，只有 run_tests.js 的无参调用会走到；test_check_deps.js 每条用例都显式注入
-//     resolve/load，故默认分支零断言，默认值改动不会被单元套件发现。
-//   - resolve 以 ROOT 为基准，默认 load 却以本文件所在目录（scripts/）为基准；当前布局
-//     （scripts/ 无 package.json/node_modules）下两者同命中根 node_modules，属潜在而非现存不一致。
+// 已修的两条口径缺口（本轮审查 F5/F6）：默认 load 与 resolve 统一以 ROOT 为基准（scripts/ 下
+// 出现同名包不再可能「resolve 一个实例、require 另一个」）；默认参数（生产路径）已有沙箱断言。
 const path = require('path')
 const fs = require('fs')
 
@@ -123,7 +120,14 @@ function nodeVersionProblems (pkg, currentVersion) {
   return problems
 }
 
-function checkDependencies ({ resolve = require.resolve, load = require, manifest = readPackageManifest } = {}) {
+// F6：默认 load 也以 ROOT 为基准。此前默认值是裸 `require`（以本文件所在目录 scripts/ 为基准），
+// 与 probe 侧的 resolve(name, { paths: [ROOT] }) 口径不一致：scripts/ 下一旦出现同名包，
+// 就会「resolve 到一个实例、require 到另一个实例」，探针与真实加载各测一个（潜在不一致）。
+function loadFromRoot (name) {
+  return require(require.resolve(name, { paths: [ROOT] }))
+}
+
+function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, manifest = readPackageManifest } = {}) {
   const missing = []
   const broken = []
   const versionProblems = []

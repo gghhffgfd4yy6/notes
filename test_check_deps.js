@@ -318,6 +318,31 @@ test('F4 真实 package.json engines 在本机运行时上通过（无参调用 
   if (out !== '') throw new Error(`不应有错误输出，实际: ${out}`)
 })
 
+// F6 回归：默认解析基准必须统一到项目根。此前默认 load 是裸 `require`（以 scripts/ 为基准），
+// 而探测用的 resolve 以 ROOT 为基准——scripts/ 下出现同名包时会 resolve 到根树、require 到脚本树
+// （两个模块实例，探针判定与实际加载各测一个）。沙箱刻意造出这种「双树不同实例」：
+// <dir>/node_modules/<dep> 可用、<dir>/scripts/node_modules/<dep> require 即抛错。
+// 回退 F6 → 直接执行脚本时 require 命中脚本树 → 「依赖已安装但不可用」→ 非 0 退出，本条变红。
+test('F6 默认 load 以项目根为基准：scripts/ 下同名坏包不得影响判定', () => {
+  const dep = 'xbk-shadow-dep-xyz'
+  const dir = makeCheckDepsSandbox({
+    manifest: { name: 'sandbox', version: '1.0.0', dependencies: { [dep]: '1.0.0' } },
+    deps: [dep],
+    brokenDeps: [dep]
+  })
+  try {
+    const r = runCheckDepsSandbox(dir)
+    if (r.status !== 0) {
+      throw new Error(`应以项目根 node_modules 为准（status 0），实际 status=${r.status}，stderr=${JSON.stringify(r.stderr)}`)
+    }
+    if (String(r.stderr).includes('BROKEN_IN_SCRIPTS_TREE')) {
+      throw new Error(`不得加载 scripts/node_modules 下的同名包: ${JSON.stringify(r.stderr)}`)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 console.log('========================================')
 console.log('  🧪 依赖预检测试（checkDependencies）')
 console.log('========================================\n')
