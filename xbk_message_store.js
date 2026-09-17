@@ -2,6 +2,48 @@
 
 'use strict'
 
+// 缓存目录解析：项目根内校验 + 多级兜底。**生产 getter 与青龙 `--status` 命令共用本实现**（QX-08）：
+// `--status` 此前把默认目录硬编码成 path.join(ROOT, 'xianbaoku_cache')，于是生产会拒绝并回退的目录
+// （被普通文件占位、realpath 逃出根目录、已存在层级不是目录）仍被照读——状态其实写在备用目录时
+// `--status` 静默报「缺失」。抽成无副作用函数后两侧口径恒等；fs/path 由调用方注入，本模块因此
+// 不 require 任何模块，`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
+function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
+  const candidate = path.resolve(root, raw)
+  const realInsideRoot = (p) => {
+    const lexicalInside = p !== root && p.startsWith(root + path.sep)
+    if (!lexicalInside) return false
+    // 逐级回溯到已存在目录，再 realpath 校验；防止项目内符号链接指向项目外部。
+    let probe = p
+    try {
+      while (probe !== root && !fs.existsSync(probe)) probe = path.dirname(probe)
+      // 已存在的路径层级必须是目录；否则 cache.dir 指向普通文件时，
+      // 后续拼接缓存文件会得到 ENOTDIR，而校验却错误放行。
+      if (!fs.lstatSync(probe).isDirectory()) return false
+      const realProbe = fs.realpathSync(probe)
+      const resolved = path.resolve(realProbe, path.relative(probe, p))
+      return resolved !== root && resolved.startsWith(root + path.sep)
+    } catch (e) {
+      return false
+    }
+  }
+  // P2 防御：cache.dir 不能通过 ..、绝对路径或符号链接逃出项目根目录；越界配置回退默认目录。
+  if (realInsideRoot(candidate)) return candidate
+  const safeFallback = path.resolve(root, fallback)
+  if (realInsideRoot(safeFallback)) return safeFallback
+  // 默认目录本身若被替换成外部符号链接，也不能原样返回；使用项目根内的应急目录。
+  const emergencyFallback = path.join(root, '.xbk_cache_safe')
+  // C022：应急目录同样校验 realpath；被替换成外部符号链接时不能原样返回。
+  if (realInsideRoot(emergencyFallback)) return emergencyFallback
+  // 校验失败回退到根目录下唯一安全路径（固定新目录名，不跟随外部符号链接）。
+  // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换为
+  // 指向项目外的符号链接，写入会逃出根目录（前两级候选均先过 realInsideRoot，唯独此级曾直接返回）。
+  const internalFallback = path.join(root, '.xbk_cache_safe_internal')
+  if (realInsideRoot(internalFallback)) return internalFallback
+  // 所有候选目录（含应急目录）均不可用：说明项目根目录层级已被外部符号链接劫持，
+  // 继续返回任意路径都会逃出根目录——显式抛错，由 init()/App.run 的 try/catch 暴露，禁止静默写穿。
+  throw new Error('缓存目录安全检查失败：所有候选目录（含 .xbk_cache_safe_internal）均不可用，可能被符号链接劫持')
+}
+
 // 💾 MessageStore — 缓存管理层（从 xbk_function_v3.js 独立准备，暂不接入主入口）
 // 依赖全部由组合根注入；不反向 require 主入口，不复制共享单例。
 function createMessageStore ({
@@ -37,41 +79,9 @@ function createMessageStore ({
     get cacheDir () {
       const fallback = process.env.XBK_PARALLEL_ID ? `xianbaoku_cache_p${process.env.XBK_PARALLEL_ID}` : 'xianbaoku_cache'
       const raw = typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : fallback
-      const root = path.resolve(__dirname)
-      const candidate = path.resolve(root, raw)
-      const realInsideRoot = (p) => {
-        const lexicalInside = p !== root && p.startsWith(root + path.sep)
-        if (!lexicalInside) return false
-        // 逐级回溯到已存在目录，再 realpath 校验；防止项目内符号链接指向项目外部。
-        let probe = p
-        try {
-          while (probe !== root && !fs.existsSync(probe)) probe = path.dirname(probe)
-          // 已存在的路径层级必须是目录；否则 cache.dir 指向普通文件时，
-          // 后续拼接缓存文件会得到 ENOTDIR，而校验却错误放行。
-          if (!fs.lstatSync(probe).isDirectory()) return false
-          const realProbe = fs.realpathSync(probe)
-          const resolved = path.resolve(realProbe, path.relative(probe, p))
-          return resolved !== root && resolved.startsWith(root + path.sep)
-        } catch (e) {
-          return false
-        }
-      }
-      // P2 防御：cache.dir 不能通过 ..、绝对路径或符号链接逃出项目根目录；越界配置回退默认目录。
-      if (realInsideRoot(candidate)) return candidate
-      const safeFallback = path.resolve(root, fallback)
-      if (realInsideRoot(safeFallback)) return safeFallback
-      // 默认目录本身若被替换成外部符号链接，也不能原样返回；使用项目根内的应急目录。
-      const emergencyFallback = path.join(root, '.xbk_cache_safe')
-      // C022：应急目录同样校验 realpath；被替换成外部符号链接时不能原样返回。
-      if (realInsideRoot(emergencyFallback)) return emergencyFallback
-      // 校验失败回退到根目录下唯一安全路径（固定新目录名，不跟随外部符号链接）。
-      // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换为
-      // 指向项目外的符号链接，写入会逃出根目录（前两级候选均先过 realInsideRoot，唯独此级曾直接返回）。
-      const internalFallback = path.join(root, '.xbk_cache_safe_internal')
-      if (realInsideRoot(internalFallback)) return internalFallback
-      // 所有候选目录（含应急目录）均不可用：说明项目根目录层级已被外部符号链接劫持，
-      // 继续返回任意路径都会逃出根目录——显式抛错，由 init()/App.run 的 try/catch 暴露，禁止静默写穿。
-      throw new Error('缓存目录安全检查失败：所有候选目录（含 .xbk_cache_safe_internal）均不可用，可能被符号链接劫持')
+      // P2/P3/C022 的根内校验与多级兜底统一实现于模块顶部的 resolveCacheDirInRoot；
+      // 青龙 `--status` 复用同一函数（QX-08），两侧口径不再各写一份。
+      return resolveCacheDirInRoot({ fs, path, root: path.resolve(__dirname), raw, fallback })
     },
     _memoryCache: {},
     // 内存缓存实际键数（与 _memoryCache 同步维护，替代热路径上每次新键写都 Object.keys O(n)）
@@ -285,10 +295,22 @@ function createMessageStore ({
     },
 
     /** 启动清理的候选名判定：覆盖单文件墓碑锁、目录级清理哨兵与其 .reclaim 中间态。
-   *  纯函数，供测试直接锁定名单（改窄会静默漏回收，见 F4）。 */
+   *  **只按精确形状匹配，绝不用子串包含**（F4 回归，V6 实锤）：旧实现第三条判据是
+   *  `name.includes('.seen.cleanup.lock.')`，于是**合法缓存文件** `<name>.seen.cleanup.lock.json`
+   *  （上游 pushUrl 末段恰为 `xxx.seen.cleanup.lock`，getFileName 只补 `.json` 后缀）也被当作残留锁；
+   *  它的 mtime 一旦陈旧、内容又不是锁 token（PID 解析失败 → 视为「进程已退出」），
+   *  就会被启动清理静默 unlink——直接丢失该 pushUrl 的整份判重记录，下一轮全量重推。
+   *  三条判据各自的形状来源：
+   *    1) `<缓存文件>.seen.lock` —— _acquireTombstoneLock 的锁路径；
+   *    2) `.seen.cleanup.lock` —— _acquireTombstoneCleanupGuard 的哨兵（精确相等）；
+   *    3) `.seen.cleanup.lock.<pid>.<ts>.reclaim` —— 同上哨兵的原子认领中间态（命名逐字段对齐：
+   *       十进制进程号 + 十进制毫秒时间戳 + 字面 .reclaim）。
+   *  纯函数，供测试直接锁定名单。 */
     _isResidualTombstoneLockName (name) {
       if (typeof name !== 'string') return false
-      return name.endsWith('.seen.lock') || name.endsWith('.seen.cleanup.lock') || name.includes('.seen.cleanup.lock.')
+      if (name.endsWith('.seen.lock')) return true
+      if (name === '.seen.cleanup.lock') return true
+      return /^\.seen\.cleanup\.lock\.\d+\.\d+\.reclaim$/.test(name)
     },
 
     /** 目录级非阻塞哨兵：串行化启动清理与墓碑锁创建，覆盖检查-删除竞态。 */
@@ -407,14 +429,21 @@ function createMessageStore ({
         const f = safe.codePointAt(0)
         return safe.slice(0, f > 0xffff ? 2 : 1)
       })()
-      // 文件名超长截断：先尝试保留扩展名，保证总字节 <= 200
+      // 文件名超长截断：先尝试保留扩展名，保证总字节 <= 200。
+      // F7 回归（R4/V6）：单纯截断会让「仅第 200 字节之后不同」的两个长名映射到同一路径——
+      // 生产 cacheName 直接来自 getFileName(pushUrl)，两个不同 pushUrl 的判重缓存会互相覆盖。
+      // 因此截断结果附带**全名**的确定性摘要（anonKey 64 位拼接，只保留字母数字，不引入新的
+      // 路径保留字符），使「长名 → 路径」保持单射；不超过 200 字节的名字不进此分支，行为不变。
       if (Buffer.byteLength(safe, 'utf8') > 200) {
+        const digest = String(Utils.anonKey(safe)).replace(/[^0-9a-z]/gi, '')
         const dot = safe.lastIndexOf('.')
-        let ext = dot > 0 ? safe.slice(dot) : ''
-        let maxBase = 200 - Buffer.byteLength(ext, 'utf8')
-        if (maxBase < 1) { ext = ''; maxBase = 200 } // 扩展名本身超长：放弃保留扩展名
+        const ext = dot > 0 ? safe.slice(dot) : ''
+        let suffix = `-${digest}${ext}`
+        let maxBase = 200 - Buffer.byteLength(suffix, 'utf8')
+        if (maxBase < 1) { suffix = `-${digest}`; maxBase = 200 - Buffer.byteLength(suffix, 'utf8') } // 扩展名本身超长：放弃保留
+        if (maxBase < 1) { suffix = ''; maxBase = 200 } // 摘要超长（不可能发生）：退回纯截断
         const base = truncateByBytes(dot > 0 ? safe.slice(0, dot) : safe, maxBase)
-        safe = keepOne(base) + ext
+        safe = keepOne(base) + suffix
       }
       // 兜底校验：截断后仍可能超 200 字节（如扩展名超长且首字符为多字节、Math.max(1) 强保
       // 字符时），放弃扩展名整体再按字节截断，保证不变量成立。
@@ -961,25 +990,51 @@ function createMessageStore ({
       return idx
     },
 
-    /** 基于预计算身份索引的判重查询：精确复刻 sameMessageIdentity(cacheMsg, message) 的匹配关系 */
-    _indexHasIdentity (idx, message) {
+    /** 基于预计算身份索引的判重查询：精确复刻 sameMessageIdentity(cacheMsg, message) 的匹配关系。
+   *  F-02（V6 实锤，漏推方向）：索引只按「引用 / 长度 / 首元素引用」做 O(1) 失效检查，
+   *  调用方原地改写**非首元素**（换元素或改 id/url 字段）不会触发重建，旧索引会把已经不存在的
+   *  身份判为「已存在」→ 主流程跳过推送（漏推，与 SYSTEM_CONTRACT「宁可多推」相反）。
+   *  因此**传入 messages 时，索引层命中的每个候选下标都要按当前元素复算身份才算命中**
+   *  （复用 _indexPositionMatches，与 _indexHasIdentityDirect 的 oracle 逐位语义一致）。
+   *  成本只随命中候选数增长（通常 1 个），不做逐位全表复检（实测每次 ~20ms 会打死热路径）；
+   *  不传 messages 时退化为纯索引判定（仅供不需要复检的调用方）。 */
+    _indexHasIdentity (idx, message, messages) {
       const b = Utils.getMessageIdentity(message)
       if (!b.valid) return false
+      const hit = (sets) => {
+        for (const set of sets) {
+          if (!set || set.size === 0) continue
+          if (!messages) return true
+          for (const i of set) {
+            if (this._indexPositionMatches(messages, i, message, b)) return true
+          }
+        }
+        return false
+      }
       if (b.kind === 'id') {
       // id 查询：命中 id 缓存同 idKey；或纯 url 缓存同 url
-        return idx.idByKey.has(b.idKey) || (!!b.url && idx.urlOnly.has(b.url))
+        return hit([idx.idByKey.get(b.idKey), b.url ? idx.urlOnly.get(b.url) : null])
       }
       if (b.kind === 'url') {
       // url 查询：命中纯 url 缓存同 url；或带 url 的 id 缓存同 url
-        return (!!b.url && idx.urlOnly.has(b.url)) || (!!b.url && idx.idWithUrl.has(b.url))
+        return hit([b.url ? idx.urlOnly.get(b.url) : null, b.url ? idx.idWithUrl.get(b.url) : null])
       }
       // anon 查询：命中匿名合成键相同的 anon 缓存
-      return idx.anonByKey.has(b.key)
+      return hit([idx.anonByKey.get(b.key)])
+    },
+
+    /** 命中的索引下标必须用**当前**元素复算身份才算命中（F-02）：索引下标可能因调用方原地改写
+   *  而指向别的元素（越界/被换/字段被改）。与 _indexHasIdentityDirect 的同位逻辑逐行同构，
+   *  保证「索引判重」与「线性扫描 oracle」在同一输入下给出同一答案。 */
+    _indexPositionMatches (messages, i, message, b) {
+      if (!Number.isInteger(i) || i < 0 || i >= messages.length) return false
+      const a = Utils.getMessageIdentity(messages[i])
+      return Utils.sameMessageIdentity(messages[i], message, a, b)
     },
 
     /** 身份索引缓存失效检查（P3 审查 2026-09-15）。
-   *  缓存条目形如 { ref, head, len, idx }：ref 是权威数组引用、head 是首个元素引用、
-   *  len 是元素数、idx 是预计算身份索引。
+   *  缓存条目形如 { ref, head, len, idx, missVerified }：ref 是权威数组引用、head 是首个元素
+   *  引用、len 是元素数、idx 是预计算身份索引、missVerified 见 has 的「未命中复检」口径。
    *
    *  为什么不能只用「数组引用」作键：readMessages 返回的是内部权威数组的同一引用，
    *  调用方原地删改元素不会换引用，旧索引会让 has() 静默误判为「已存在」。
@@ -989,24 +1044,43 @@ function createMessageStore ({
    *  从 23ms 退化到 29s）。
    *
    *  为什么不能每次做「逐位置身份复检」：那要遍历索引里的每个下标并重算 getMessageIdentity，
-   *  实测每次约 20ms（3000 条缓存），同样把热路径打死。
+   *  实测每次约 20ms（3000 条缓存），同样把热路径打死。F-02 的替代方案见 _indexHasIdentity
+   *  （只复检命中的候选下标）与 has 的「首次未命中复检一次」。
    *
-   *  最终口径：O(1) 失效检查（引用 / 首元素 / 长度）+ 针对性的「下标越界加固」，
-   *  另提供 _indexHasIdentityDirect 作为零索引的正确性对照入口（慢路径 / 测试用）。 */
+   *  最终口径：O(1) 失效检查（引用 / 首元素 / 长度）+ 命中候选复检（F-02）+ 未命中每数组版本
+   *  复检一次 + 针对性的「下标越界加固」，另提供 _indexHasIdentityDirect 作为零索引的正确性
+   *  对照入口（慢路径 / 测试用）。 */
     _identityIndexIsStale (entry, messages) {
       if (!entry || entry.ref !== messages) return true
       if (entry.len !== messages.length) return true
       return entry.head !== messages[0]
     },
 
-    /** Ensure 预计算索引可用：命中且未失效直接复用，否则重建并写回。
-   *  重建时同时记录 ref/head/len 供下次 O(1) 失效检查。 */
-    _cachedIndexFor (messages) {
+    /** 取该权威数组当前可用的索引条目（必要时重建）。 */
+    _identityIndexEntry (messages) {
       const entry = this._identityIndex.get(messages)
-      if (!this._identityIndexIsStale(entry, messages)) return entry.idx
-      const idx = this._buildIdentityIndex(messages)
-      this._identityIndex.set(messages, { ref: messages, head: messages[0], len: messages.length, idx })
-      return idx
+      if (this._identityIndexIsStale(entry, messages)) return this._storeIdentityEntry(messages)
+      return entry
+    },
+
+    /** 从**当前**数组内容重建索引条目并写回 WeakMap（重建即与数组对齐）。 */
+    _storeIdentityEntry (messages) {
+      const entry = {
+        ref: messages,
+        head: messages[0],
+        len: messages.length,
+        idx: this._buildIdentityIndex(messages),
+        // 该数组版本是否已做过「未命中后的复检」：见 has。
+        missVerified: false
+      }
+      this._identityIndex.set(messages, entry)
+      return entry
+    },
+
+    /** Ensure 预计算索引可用：命中且未失效直接复用，否则重建并写回。
+   *  保留此入口（返回 idx）供既有调用方使用；需要未命中复检的调用方走 _identityIndexEntry。 */
+    _cachedIndexFor (messages) {
+      return this._identityIndexEntry(messages).idx
     },
 
     /** 判重正确性对照入口（无索引）：线性扫描 + 逐条身份比较，语义与 _indexHasIdentity 等价。
@@ -1028,10 +1102,20 @@ function createMessageStore ({
       if (!Utils.isValidItem(message)) return false
       const filePath = this.getFilePath(filename)
       const messages = this.readMessages(filePath)
-      // 预计算身份索引按「数组引用 + 首元素 + 长度」做 O(1) 失效检查：
-      // 数组被整体替换或首元素被换掉时自动重建（见 _identityIndexIsStale 注释口径）。
-      const idx = this._cachedIndexFor(messages)
-      if (this._indexHasIdentity(idx, message)) return true
+      // F-02：索引命中必须按**当前**元素复检（_indexHasIdentity 传 messages），否则调用方原地
+      // 改写非首元素后 has() 会把已不存在的身份判为「已存在」→ 漏推。
+      let entry = this._identityIndexEntry(messages)
+      if (this._indexHasIdentity(entry.idx, message, messages)) return true
+      // 索引层命中但候选复检失配 ⇒ 数组被原地改写、索引已陈旧：立刻重建（自愈），否则后续查询
+      // 会继续拿陈旧索引给答案；本数组版本**首次**未命中同样重建一次，覆盖另一侧陈旧
+      // （原地写入的新身份在旧索引里查不到，只会多推，但同样与线性扫描不一致）。
+      // 代价：每个数组版本至多一次 O(n) 重建（稳态查询仍 O(1)）。改为「每次未命中都重建」会让
+      // 5000 条批量判重退化成 O(n²)——即 B8 实测的打死热路径形态，故刻意不做。
+      if (this._indexHasIdentity(entry.idx, message) || !entry.missVerified) {
+        entry = this._storeIdentityEntry(messages)
+        entry.missVerified = true
+        if (this._indexHasIdentity(entry.idx, message, messages)) return true
+      }
       // P4（CodeAnt）：消息数组未命中时查墓碑——被裁剪记录的判重身份不丢
       return this._tombstoneHasIdentity(filePath, message)
     },
@@ -1253,7 +1337,13 @@ function createMessageStore ({
       // 排查易漏）。补前缀 'url_' 落地防护；这只改变这些 URL 的缓存文件名，不改判重语义
       // （判重身份来自消息内容/URL 本身，与缓存文件名无关），已存在的隐藏文件由启动清理
       // 的残留回收与下一次写入自然迁移。
-      if (name.startsWith('.')) name = 'url_' + name
+      // F7 回归（R4/V6）：只给「以点开头」的名字加前缀会与该前缀自身的合法名字撞名——
+      // getFileName('https://x/.json') 与 getFileName('https://x/url_.json') 都是 'url_.json'
+      // → 两个不同 pushUrl 共用同一缓存文件（互相覆盖判重记录）。两条前缀规则合并为
+      // 「以 . 或 url_ 开头 ⇒ 前置 url_」：该映射是单射——像集恒以 'url_' 开头，
+      // '.'-来源 → 'url_.' + …，'url_'-来源 → 'url_url_' + …，二者不相交，且不以 'url_'
+      // 开头的普通名字不会落进像集。
+      if (name.startsWith('.') || name.startsWith('url_')) name = 'url_' + name
       if (!name.endsWith('.json')) name += '.json'
       return name
     }
@@ -1262,4 +1352,4 @@ function createMessageStore ({
   return MessageStore
 }
 
-module.exports = { createMessageStore }
+module.exports = { createMessageStore, resolveCacheDirInRoot }

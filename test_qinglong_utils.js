@@ -3,6 +3,7 @@
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
+const { spawnSync } = require('child_process')
 const {
   shouldAutoInstallDependencies,
   ensureDependencies,
@@ -209,6 +210,63 @@ const {
   assert.strictEqual(nodeVersionWarning('24.18.0'), null, '高于下界不应告警')
   assert.match(String(nodeVersionWarning('22.21.0')), /低于 package\.json engines 要求（>=22\.22\.2）/, '低于下界应给出与 engines 对齐的告警')
   assert.match(String(nodeVersionWarning('20.11.0')), /低于 package\.json engines 要求/, '主版本低于 22 同样应告警')
+
+  // ===== QX-08：--status 的缓存目录必须与生产同源（不再硬编码 path.join(ROOT,'xianbaoku_cache')）=====
+  // 反例（改动前）：生产在默认目录被普通文件占位 / realpath 逃出根目录时会回退 .xbk_cache_safe，
+  // 而 --status 照读默认目录 → 状态实际写在备用目录时静默报「缺失」。这里用假 fs 不触碰真实文件
+  // 系统，直接对拍「--status 解析结果 === 生产 resolveCacheDirInRoot 结果」；把 resolveCacheDirInRoot
+  // 调用换成硬编码 join 后本断言必红。
+  const { resolveCacheDirInRoot } = require('./xbk_message_store')
+  const { statusCacheDir } = require('./qinglong/xbk_push')
+  const CACHE_ROOT = __dirname
+  const defaultCachePath = path.join(CACHE_ROOT, 'xianbaoku_cache')
+  const safeCachePath = path.join(CACHE_ROOT, '.xbk_cache_safe')
+  const makeStatusFs = (map) => ({
+    existsSync: (p) => Object.prototype.hasOwnProperty.call(map, p),
+    lstatSync: (p) => ({ isDirectory: () => map[p] === 'dir' }),
+    realpathSync: (p) => (map[p] && typeof map[p] === 'object' && map[p].real ? map[p].real : p)
+  })
+  const shared = (fsImpl) => resolveCacheDirInRoot({ fs: fsImpl, path, root: CACHE_ROOT, raw: 'xianbaoku_cache', fallback: 'xianbaoku_cache' })
+
+  // ① 未设置 XBK_CACHE_DIR：与生产同源（含「默认目录被文件占位 → 回退 .xbk_cache_safe」这一分支）
+  const shadowed = makeStatusFs({ [CACHE_ROOT]: 'dir', [defaultCachePath]: 'file' })
+  const statusShadowed = statusCacheDir({ env: {}, fs: shadowed, path, root: CACHE_ROOT })
+  assert.strictEqual(statusShadowed, safeCachePath, '默认目录被普通文件占位时 --status 应回退 .xbk_cache_safe（硬编码实现在此处返回默认目录）')
+  assert.strictEqual(statusShadowed, shared(shadowed), '--status 解析必须与生产同一实现逐值一致')
+  const normalFs = makeStatusFs({ [CACHE_ROOT]: 'dir', [defaultCachePath]: 'dir' })
+  assert.strictEqual(statusCacheDir({ env: {}, fs: normalFs, path, root: CACHE_ROOT }), defaultCachePath, '默认目录正常时仍读默认目录')
+  assert.strictEqual(statusCacheDir({ env: {}, fs: normalFs, path, root: CACHE_ROOT }), shared(normalFs), '正常路径同样必须与生产一致')
+
+  // ② XBK_CACHE_DIR 为绝对路径：文档契约（README「状态文件写在别处」）允许指向根外，原样采纳
+  const outside = path.join(path.sep, 'mnt', 'elsewhere', 'cache')
+  assert.strictEqual(statusCacheDir({ env: { XBK_CACHE_DIR: outside }, fs: normalFs, path, root: CACHE_ROOT }), outside,
+    '绝对路径覆盖必须原样采纳（不被根内校验改写）')
+
+  // ③ XBK_CACHE_DIR 为相对路径：告警 + 按同源规则解析默认目录（告警文案仍带生效目录）
+  const relativeFs = makeStatusFs({ [CACHE_ROOT]: 'dir', [defaultCachePath]: 'file' })
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => { warns.push(args.join(' ')) }
+  let relativeDir
+  try {
+    relativeDir = statusCacheDir({ env: { XBK_CACHE_DIR: 'relative/cache' }, fs: relativeFs, path, root: CACHE_ROOT })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(relativeDir, safeCachePath, '相对路径被忽略后应回退同源解析出的默认目录')
+  assert.ok(warns.some(w => w.includes('XBK_CACHE_DIR 不是绝对路径') && w.includes('relative/cache') && w.includes(safeCachePath)),
+    `相对路径应告警并带上生效目录，实际告警：${JSON.stringify(warns)}`)
+
+  // ④ CLI 端到端：未设置 XBK_CACHE_DIR 时 --status 必须成功（不加载 got/re2）并显式暴露生效目录，
+  //    避免 Config.cache.dir 指向其它根内目录时静默读错目录（QX-08 的后半的一半）。
+  {
+    const env = { ...process.env }
+    delete env.XBK_CACHE_DIR
+    const r = spawnSync(process.execPath, [path.join(__dirname, 'qinglong', 'xbk_push.js'), '--status'], {
+      cwd: __dirname, encoding: 'utf8', env
+    })
+    assert.strictEqual(r.status, 0, `--status 应独立于 got/re2 成功退出，实际 status=${r.status} stderr=${r.stderr}`)
+    assert.match(String(r.stdout), /缓存目录：\S+（未使用 XBK_CACHE_DIR；/, `--status 应显式暴露生效缓存目录与配置口径，实际 stdout=${r.stdout}`)
+    assert.match(String(r.stdout), /xbk-push 运行状态/, '--status 仍应输出状态面板')
+  }
 
   console.log('test_qinglong_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })

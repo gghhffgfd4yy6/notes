@@ -353,5 +353,61 @@ const { runLoop, sleep, refreshTimeoutError, isAbortable } = require('./xbk_loop
 
   console.log('✅ 常驻循环工具：未传 onError 时单轮异常留默认诊断日志，传了则不打印且仍调用调用方处理器；刷新失败走 onIntervalError 独立默认处理器（不与业务失败混淆）')
 
+  // ===== XL-06 反例锁定：停止信号不得中止在飞轮次，也不得开启新一轮（不强杀契约）=====
+  // 条目背景：XL-06 报「run() 无超时且不接收 signal，单轮挂起时 runLoop 无法响应停止信号」。
+  // 候选修法 A「把停止信号透传进单轮、让轮次内的等待可被取消」经 R4 探针实测**必然引入重复推**：
+  // 生产在轮末**一次性**写判重缓存（xbk_app.js:1524 `MessageStore.saveBatch(toCache, cacheName)`），
+  // 中途取消 ⇒ 本轮已推消息整批不入缓存 ⇒ 下一轮（或进程重启后）全部重推；取消在飞请求还会产生
+  // 「半推」（上游可能已收到、本地未记）。因此这里锁定既有契约：abort 后**当前轮必须跑完**
+  // （含轮末缓存写入）、且不得开始第二轮。轮次内等待按生产同构布置，覆盖用户要求的三种触发时点。
+  // 打齿方式（同族反例）：把 xbk_loop.js 的 `await run()` 改成 `await run(signal)`（路径 A）后，
+  // 下面 round 会响应信号截断 → pushed 不足 3 条 → 断言必红。
+  {
+    const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+    const waitStage = (ms, signal) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { cleanup(); resolve() }, ms)
+      const onAbort = () => { clearTimeout(timer); cleanup(); reject(Object.assign(new Error('轮次被停止信号取消'), { code: 'ABORT_ERR' })) }
+      function cleanup () { if (signal) signal.removeEventListener('abort', onAbort) }
+      if (signal) {
+        if (signal.aborted) return onAbort()
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+    })
+    const items = [1, 2, 3]
+    // 触发时点 → abort 毫秒数：轮次前置等待中 / 第 1 条推送后的间隔等待中 / 第 2 条推送在飞
+    const triggerPoints = [
+      { label: 'signal 在轮次前置等待中触发（尚未推送）', kind: 'pre-push', at: 10 },
+      { label: 'signal 在推送间隔等待中触发（已推 1 条）', kind: 'interval', at: 100 },
+      { label: 'signal 在推送在飞时触发（第 2 条）', kind: 'in-flight', at: 120 }
+    ]
+    for (const point of triggerPoints) {
+      const controller = new AbortController()
+      const log = { pushed: [], cached: false, rounds: 0, inFlight: null }
+      const round = async (signal) => {
+        log.rounds += 1
+        await waitStage(30, signal) // ① 拉取/过滤
+        for (const item of items) {
+          await waitStage(20, signal) // 推送间隔
+          log.inFlight = item
+          await waitStage(40, signal) // 推送在飞
+          log.inFlight = null
+          log.pushed.push(item)
+        }
+        log.cached = true // ③ 轮末一次性写判重缓存（xbk_app.js:1524 同构）
+      }
+      const loop = runLoop(round, { signal: controller.signal, intervalMs: 0 })
+      setTimeout(() => controller.abort(), point.at)
+      await withTimeout(loop, 3000, `XL-06 ${point.kind}`)
+      assert.deepStrictEqual(log.pushed, items,
+        `${point.label}：停止信号不得截断在飞轮次（截断即半推 + 已推未入缓存 → 下轮重复推）`)
+      assert.strictEqual(log.cached, true,
+        `${point.label}：轮末判重缓存必须写入，否则本轮已推消息下一轮会重复推`)
+      assert.strictEqual(log.rounds, 1,
+        `${point.label}：停止后不得开始新一轮（重复推）`)
+    }
+    console.log('✅ 常驻循环：停止信号不截断在飞轮次（三种时点），轮末缓存照写、不产生重复轮次（XL-06 探针结论锁定）')
+    await delay(0)
+  }
+
   console.log('test_loop_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })

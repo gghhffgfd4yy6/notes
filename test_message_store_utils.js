@@ -333,4 +333,295 @@ check('_saveTombstones: 可达标时正常序列化并交给 writeAtomic（对�
   assert.strictEqual(Buffer.byteLength(writes[0].text, 'utf8'), 53, '写入内容应为 53 字节空墓碑文本')
 })
 
+// ===== QX-08：缓存目录解析由生产与青龙 --status 共用同一实现 =====
+// 反例（改动前）：--status 把默认目录硬编码成 path.join(ROOT,'xianbaoku_cache')，生产却会在该目录
+// 被普通文件占位 / realpath 逃出根目录时回退 .xbk_cache_safe ⇒ 前者静默读错目录（状态实际写在
+// 备用目录时 --status 报「缺失」）。这里用假 fs（不触碰真实文件系统：/tmp 不可写、跨挂载点符号
+// 链接会被沙箱拒绝）对拍两侧结果：同一输入必须得到同一目录。把 --status 侧回退成硬编码后，
+// 「必须与生产一致」这条断言即红。
+const { resolveCacheDirInRoot } = require('./xbk_message_store')
+const { statusCacheDir } = require('./qinglong/xbk_push')
+
+// root 取真实模块根（生产 getter 用 path.resolve(__dirname)），但 exists/lstat/realpath 全部由
+// 假 fs 回答，测试不触碰真实文件系统。
+const FAKE_ROOT = __dirname
+
+// 假 fs：map 为「绝对路径 → 'dir' | 'file' | { kind, real }」，未登记路径视为不存在。
+function makeCacheFs (map) {
+  const entry = (p) => (Object.prototype.hasOwnProperty.call(map, p) ? map[p] : undefined)
+  const isDir = (p) => {
+    const e = entry(p)
+    if (e === 'dir') return true
+    if (e === 'file') return false
+    if (e && typeof e === 'object') return e.kind === 'dir'
+    return false
+  }
+  return {
+    existsSync: (p) => entry(p) !== undefined,
+    lstatSync: (p) => ({ isDirectory: () => isDir(p) }),
+    realpathSync: (p) => {
+      const e = entry(p)
+      return e && typeof e === 'object' && e.real ? e.real : p
+    }
+  }
+}
+
+function storeWithFs (fakeFs, cacheDir = 'xianbaoku_cache') {
+  return createMessageStore({
+    Config: { cache: { dir: cacheDir, maxSize: 10000 } },
+    Utils: mockUtils,
+    fs: fakeFs,
+    path,
+    crypto: { randomUUID: () => 'uuid' },
+    normalize: () => {},
+    storage: {},
+    constants: {}
+  })
+}
+
+const DEFAULT_DIR = path.join(FAKE_ROOT, 'xianbaoku_cache')
+const SAFE_DIR = path.join(FAKE_ROOT, '.xbk_cache_safe')
+const CACHE_FS_SCENARIOS = [
+  {
+    name: '默认目录是根内正常目录 → 原样使用',
+    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: 'dir' },
+    expect: DEFAULT_DIR
+  },
+  {
+    name: '默认目录从未创建（父级存在）→ 仍使用默认目录',
+    map: { [FAKE_ROOT]: 'dir' },
+    expect: DEFAULT_DIR
+  },
+  {
+    name: '默认目录被普通文件占位 → 回退 .xbk_cache_safe（生产口径）',
+    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: 'file' },
+    expect: SAFE_DIR
+  },
+  {
+    name: '默认目录是逃出根目录的符号链接 → 回退 .xbk_cache_safe（生产口径）',
+    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: { kind: 'dir', real: '/outside/xianbaoku_cache' } },
+    expect: SAFE_DIR
+  }
+]
+
+for (const scenario of CACHE_FS_SCENARIOS) {
+  check(`QX-08 同源解析：${scenario.name}（--status 必须与生产 getter 一致）`, () => {
+    const fakeFs = makeCacheFs(scenario.map)
+    const prod = storeWithFs(fakeFs).cacheDir
+    const status = statusCacheDir({ env: {}, fs: fakeFs, path, root: FAKE_ROOT })
+    assert.strictEqual(prod, scenario.expect, `生产缓存目录应为 ${scenario.expect}，实际 ${prod}`)
+    assert.strictEqual(status, prod, `--status 解析结果必须与生产一致（status=${status}，prod=${prod}）`)
+  })
+}
+
+check('resolveCacheDirInRoot: 所有候选都被根外 realpath 劫持 → 显式抛错（禁止静默写穿）', () => {
+  const hijacked = {
+    existsSync: () => true,
+    lstatSync: () => ({ isDirectory: () => true }),
+    realpathSync: (p) => '/outside' + p
+  }
+  assert.throws(() => resolveCacheDirInRoot({
+    fs: hijacked, path, root: FAKE_ROOT, raw: 'xianbaoku_cache', fallback: 'xianbaoku_cache'
+  }), /缓存目录安全检查失败/, '全部候选逃出根目录时必须抛错，而不是返回任意路径')
+})
+
+check('resolveCacheDirInRoot: 并行 worker 分片名（xianbaoku_cache_p7）同样走根内校验', () => {
+  const fakeFs = makeCacheFs({ [FAKE_ROOT]: 'dir' })
+  const dir = resolveCacheDirInRoot({
+    fs: fakeFs, path, root: FAKE_ROOT, raw: 'xianbaoku_cache_p7', fallback: 'xianbaoku_cache_p7'
+  })
+  assert.strictEqual(dir, path.join(FAKE_ROOT, 'xianbaoku_cache_p7'), '分片目录名应被根内校验放行')
+})
+
+// ===== F4（B8 回归；V6 实锤数据丢失）=====
+// 反例：_isResidualTombstoneLockName 旧实现第三条判据是 name.includes('.seen.cleanup.lock.')，
+// 于是**合法缓存文件** '<name>.seen.cleanup.lock.json'（上游 pushUrl 末段恰为 xxx.seen.cleanup.lock）
+// 也进了启动清理名单：mtime 陈旧 + 内容不是锁 token（PID 解析失败 → 判「进程已退出」）时被静默
+// unlink，整份判重记录丢失。两层锁定：① 纯函数名单；② 真实目录端到端回收。
+check('F4: 合法缓存文件 <name>.seen.cleanup.lock.json 不得进启动清理名单（数据丢失回归）', () => {
+  const legit = [
+    'v6probe.seen.cleanup.lock.json',
+    'push.json.seen.cleanup.lock.json',
+    'url_x.seen.cleanup.lock.json'
+  ]
+  for (const name of legit) {
+    assert.strictEqual(store._isResidualTombstoneLockName(name), false,
+      `合法缓存文件不得被判为残留锁（旧实现 includes('.seen.cleanup.lock.') 会误判 → 启动清理删盘丢判重记录）：${name}`)
+  }
+  // 反向：真正的残留锁与哨兵中间态必须仍在名单内（改窄不得静默漏回收）
+  for (const name of ['.seen.cleanup.lock', '.seen.cleanup.lock.4242.1700000000000.reclaim', 'push.json.seen.lock']) {
+    assert.strictEqual(store._isResidualTombstoneLockName(name), true, `真残留锁应仍在清理名单：${name}`)
+  }
+  // 近似但非法的形状不得进名单（子串包含式的判据会在这里全部误判）
+  for (const name of ['.seen.cleanup.lock.txt', 'seen.cleanup.lock', '.seen.cleanup.lock.', '.seen.cleanup.lock.x.1.reclaim', '.seen.cleanup.lock.1.2.reclaim.tmp']) {
+    assert.strictEqual(store._isResidualTombstoneLockName(name), false, `非精确形状不得进清理名单：${name}`)
+  }
+})
+
+check('F4: 启动清理真实回收 .reclaim 残留、且不动合法缓存文件（端到端）', () => {
+  const realFs = require('node:fs')
+  const crypto = require('node:crypto')
+  // 探针目录放在被 gitignore 的 xianbaoku_cache 之下：即使异常退出也不会污染 git status
+  const probeDir = path.join(__dirname, 'xianbaoku_cache', `.r4_f4_probe_${process.pid}`)
+  const storeReal = createMessageStore({
+    Config: { cache: { maxSize: 10000 } },
+    Utils: mockUtils,
+    fs: realFs,
+    path,
+    crypto,
+    normalize: () => {},
+    storage: {},
+    constants: { TOMBSTONE_LOCK_STALE_MS: 10000 }
+  })
+  const stale = new Date(Date.now() - 60_000)
+  const legitPath = path.join(probeDir, 'v6probe.seen.cleanup.lock.json')
+  const reclaimPath = path.join(probeDir, '.seen.cleanup.lock.999999.1700000000000.reclaim')
+  const legitBody = JSON.stringify([{ id: 'v6probe', title: '合法判重记录' }])
+  try {
+    realFs.mkdirSync(probeDir, { recursive: true })
+    realFs.writeFileSync(legitPath, legitBody)
+    realFs.writeFileSync(reclaimPath, '999999:0:dead-owner')
+    realFs.utimesSync(legitPath, stale, stale)
+    realFs.utimesSync(reclaimPath, stale, stale)
+    storeReal._tombstoneLocksCleaned.delete(probeDir)
+    storeReal._cleanupResidualTombstoneLocks(probeDir)
+    assert.strictEqual(realFs.existsSync(legitPath), true,
+      '合法缓存文件（URL 末段恰为 xxx.seen.cleanup.lock）必须保留：被启动清理删除即判重记录丢失')
+    assert.strictEqual(realFs.readFileSync(legitPath, 'utf8'), legitBody, '合法缓存文件内容不得被改动')
+    assert.strictEqual(realFs.existsSync(reclaimPath), false,
+      '陈旧且持有进程已退出的 .reclaim 残留必须被启动清理回收（这是本条的真正增量）')
+  } finally {
+    try { realFs.rmSync(probeDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+  }
+})
+
+// ===== F7（B8 回归；V6 实锤两处碰撞）=====
+// ① 名字层：末段以点开头加 'url_' 前缀会与「本身以 url_ 开头」的合法名撞名；
+// ② 路径层：getFilePath 的 200 字节截断会让「仅第 200 字节后不同」的长名映射到同一路径。
+// 生产 cacheName 直接来自 getFileName(pushUrl)，两者都意味着两个不同 pushUrl 共用缓存文件
+// （判重记录互相覆盖）。这里用**真实** Utils（xbk_utils.anonKey）做摘要，验证真实碰撞面。
+const { createUtils } = require('./xbk_utils')
+const longNameStore = createMessageStore({
+  Config: { cache: { maxSize: 10000 } },
+  Utils: createUtils({ fs: require('node:fs'), safeRe: (p, f) => new RegExp(p, f) }),
+  fs: makeCacheFs({ [FAKE_ROOT]: 'dir' }),
+  path,
+  crypto: { randomUUID: () => 'uuid' },
+  normalize: () => {},
+  storage: {},
+  constants: {}
+})
+
+check('F7: 末段以点开头 / 以 url_ 开头的名字不得撞同一缓存文件（getFileName 单射）', () => {
+  const dotted = store.getFileName('https://example.com/.json')
+  const prefixed = store.getFileName('https://example.com/url_.json')
+  assert.strictEqual(dotted, 'url_.json', '以点开头仍加 url_ 前缀（隐藏文件防护不得回退）')
+  assert.strictEqual(prefixed, 'url_url_.json', '以 url_ 开头必须转义前缀，避免与前一条撞名')
+  assert.notStrictEqual(dotted, prefixed, '两个不同 URL 不得映射到同一缓存文件名')
+  const urls = [
+    'https://e.example/.hidden', 'https://e.example/url_.hidden', 'https://e.example/url_x',
+    'https://e.example/x', 'https://e.example/.json', 'https://e.example/url_.json', 'https://e.example/data.json'
+  ]
+  const names = urls.map(u => store.getFileName(u))
+  assert.strictEqual(new Set(names).size, names.length, `不同 URL 不得撞名：${JSON.stringify(names)}`)
+})
+
+check('F7: 超长名截断必须保持单射（仅第 200 字节后不同的两条长名不得映射同一路径）', () => {
+  const a = 'u'.repeat(260) + 'aaaa.json' // 269 字节：与 b 仅在第 200 字节之后不同
+  const b = 'u'.repeat(260) + 'bbbb.json'
+  const pa = longNameStore.getFilePath(a)
+  const pb = longNameStore.getFilePath(b)
+  assert.notStrictEqual(pa, pb, `截断后仍必须区分不同长名（生产 cacheName 来自 getFileName(pushUrl)，同路径即判重记录互相覆盖）：${path.basename(pa)}`)
+  assert.ok(Buffer.byteLength(path.basename(pa)) <= 200 && Buffer.byteLength(path.basename(pb)) <= 200, '截断产物仍须 <= 200 字节')
+  assert.ok(pa.endsWith('.json') && pb.endsWith('.json'), '截断仍应保留扩展名')
+  assert.ok(!/[:*?"<>|]/.test(path.basename(pa)), `摘要不得引入路径保留字符：${path.basename(pa)}`)
+  assert.strictEqual(longNameStore.getFilePath(a), pa, '同一名字必须稳定映射到同一路径（缓存名要能跨轮复用）')
+})
+
+// ===== F-02（B8 回归；V6 实锤漏推方向）=====
+// 反例：_identityIndex 的 O(1) 失效检查只看「引用 / 长度 / 首元素引用」，调用方**原地改写非首元素**
+// （换元素或改 id/url 字段）不会触发重建，旧索引把已不存在的身份判为「已存在」→ has() 返回 true
+// → 主流程跳过推送（漏推，与 SYSTEM_CONTRACT「宁可多推」相反）。这里用真实 Utils + 假 fs +
+// 内存权威数组做单元级 oracle 对拍（oracle = _indexHasIdentityDirect 零索引线性扫描）。
+const identityStore = createMessageStore({
+  Config: { cache: { maxSize: 10000 } },
+  Utils: createUtils({ fs: require('node:fs'), safeRe: (p, f) => new RegExp(p, f) }),
+  fs: makeCacheFs({ [FAKE_ROOT]: 'dir' }),
+  path,
+  crypto: { randomUUID: () => 'uuid' },
+  normalize: () => {},
+  storage: {
+    readSafeTextResult: () => ({ status: 'missing' }), // 墓碑文件按「确认缺失」处理
+    writeAtomic: () => true,
+    writeAtomicIfAbsent: () => true
+  },
+  constants: {
+    DEFAULT_MAX_SIZE: 10000,
+    MESSAGE_CACHE_MAX_BYTES: 8388608,
+    TOMBSTONE_MAX_KEYS: 5000,
+    TOMBSTONE_MAX_BYTES: 262144,
+    TOMBSTONE_LOCK_STALE_MS: 10000
+  }
+})
+
+function seedIdentityProbe (messages, name) {
+  // 必须经 getFilePath 求路径：has(message, filename) 内部同样先 getFilePath(filename)，
+  // 直接塞绝对路径会让两次路径不一致、内存权威数组命不中。
+  const fp = identityStore.getFilePath(name)
+  identityStore._memoryCache[fp] = messages
+  identityStore._memoCount += 1
+  identityStore._verified.add(fp) // 跳过「内存命中未验证」的真实磁盘检查
+  return name
+}
+
+check('F-02: 原地改写非首元素后 has 必须与线性扫描 oracle 一致（漏推方向）', () => {
+  const forms = [
+    { label: 'arr[1] 整体替换（非首元素、长度不变）', mutate: (a) => { a[1] = { id: 'u2-new' } }, probes: [{ id: 'u2' }, { id: 'u2-new' }] },
+    { label: 'arr[2].id 字段改写', mutate: (a) => { a[2].id = 'u3-new' }, probes: [{ id: 'u3' }, { id: 'u3-new' }] },
+    { label: 'arr[0].id 字段改写（首元素字段级）', mutate: (a) => { a[0].id = 'u1-new' }, probes: [{ id: 'u1' }, { id: 'u1-new' }] },
+    { label: 'arr[2].url 字段改写', mutate: (a) => { a[2].url = 'https://u.example/changed' }, probes: [{ url: 'https://u.example/3' }, { url: 'https://u.example/changed' }] },
+    { label: '原地 push 追加（长度变化）', mutate: (a) => { a.push({ id: 'u9' }) }, probes: [{ id: 'u9' }, { id: 'u1' }] }
+  ]
+  for (const form of forms) {
+    const arr = [{ id: 'u1' }, { id: 'u2' }, { id: 'u3', url: 'https://u.example/3' }]
+    const name = seedIdentityProbe(arr, `f02_form_${form.probes.length}_${form.label.length}.json`)
+    assert.strictEqual(identityStore.has({ id: 'u1' }, name), true, `前置：${form.label} 前索引应已建立并命中`)
+    form.mutate(arr)
+    for (const p of form.probes) {
+      const indexed = identityStore.has(p, name)
+      const oracle = identityStore._indexHasIdentityDirect(arr, p)
+      assert.strictEqual(indexed, oracle,
+        `${form.label}：has()=${indexed} 必须等于 oracle=${oracle}（probe=${JSON.stringify(p)}；true 侧不符即漏推）`)
+    }
+  }
+})
+
+check('F-02: 原地改写的身份陈旧时 has 不得返回 true（无 oracle 的硬断言）', () => {
+  const arr = [{ id: 's1' }, { id: 's2' }, { id: 's3' }]
+  const name = seedIdentityProbe(arr, 'f02_stale.json')
+  assert.strictEqual(identityStore.has({ id: 's2' }, name), true, '前置：s2 命中')
+  arr[1] = { id: 's2-replaced' } // 非首元素替换：引用/长度/首元素引用三项失效检查都看不出
+  assert.strictEqual(identityStore.has({ id: 's2' }, name), false, '已被原地替换掉的 s2 不得再判为已存在（陈旧索引 → 漏推）')
+  assert.strictEqual(identityStore.has({ id: 's2-replaced' }, name), true, '原地写入的新身份应能查到（陈旧索引另一侧）')
+})
+
+check('F-02: 批量未命中不得每次重建索引（每数组版本至多一次 O(n) 复检）', () => {
+  const arr = []
+  for (let i = 0; i < 1000; i++) arr.push({ id: 'p' + i })
+  const name = seedIdentityProbe(arr, 'f02_perf.json')
+  assert.strictEqual(identityStore.has({ id: 'p0' }, name), true, '前置：索引已建立')
+  const realBuild = identityStore._buildIdentityIndex
+  let builds = 0
+  identityStore._buildIdentityIndex = function (...args) { builds += 1; return realBuild.apply(this, args) }
+  try {
+    for (let i = 0; i < 500; i++) {
+      assert.strictEqual(identityStore.has({ id: 'miss-' + i }, name), false, `不存在的身份必须判否（第 ${i} 个）`)
+    }
+  } finally {
+    identityStore._buildIdentityIndex = realBuild
+  }
+  assert.ok(builds >= 1, '首次未命中必须做一次全量复检，否则原地写入的新身份永远查不到（F-02 机制被删即红）')
+  assert.ok(builds <= 2, `500 次未命中最多重建 1~2 次，实际 ${builds} 次（每次未命中都重建 = O(n²)，B8 实测打死热路径）`)
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

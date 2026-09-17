@@ -8928,6 +8928,50 @@ console.log('========================================\n');
     assertEqual(MessageStore._isResidualTombstoneLockName('.seen.cleanup.lock.123.456.reclaim'), true, '.reclaim 中间态应在名单内')
     assertEqual(MessageStore._isResidualTombstoneLockName('push.json'), false, '普通缓存文件不得进清理名单')
     assertEqual(MessageStore._isResidualTombstoneLockName('push.json.seen.json'), false, '墓碑数据文件不得进清理名单')
+    // R4（V6 数据丢失回归）：合法缓存文件的**完整产物**不得进名单。旧判据用子串包含
+    // includes('.seen.cleanup.lock.')，'<name>.seen.cleanup.lock.json' 会命中 → 启动清理静默 unlink。
+    assertEqual(MessageStore._isResidualTombstoneLockName('v6probe.seen.cleanup.lock.json'), false,
+      '合法缓存文件 <name>.seen.cleanup.lock.json（URL 末段恰为 xxx.seen.cleanup.lock）不得进清理名单')
+    assertEqual(MessageStore._isResidualTombstoneLockName('url_.seen.cleanup.lock.json'), false, '带 url_ 前缀的合法缓存文件同样不得进名单')
+    assertEqual(MessageStore._isResidualTombstoneLockName('push.json.seen.cleanup.lock.json'), false, '缓存文件 + 合法后缀同样不得进名单')
+  })
+
+  await test('B8-F4: 合法缓存文件 xxx.seen.cleanup.lock.json 不得被启动清理删除（V6 数据丢失回归）', () => {
+    const fsmod = require('node:fs')
+    const inner = 'v6probe' + Date.now() + '.seen.cleanup.lock'
+    const name = inner + '.json' // 即 getFileName('https://example.com/v6probe…seen.cleanup.lock') 的真实产物
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    const body = JSON.stringify([{ id: 'v6probe-legit', title: '合法判重记录' }])
+    const past = new Date(Date.now() - 60000)
+    fsmod.writeFileSync(fp, body)
+    fsmod.utimesSync(fp, past, past) // 陈旧 mtime：旧实现正是在这里被判残留锁后 unlink
+    MessageStore._tombstoneLocksCleaned.delete(dir)
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(fp), true, '合法缓存文件必须保留——被启动清理删除即整份判重记录丢失（下一轮全量重推）')
+      assertEqual(fsmod.readFileSync(fp, 'utf8'), body, '合法缓存文件内容不得被改动')
+    } finally {
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F4: 陈旧 .reclaim 残留必须被启动清理回收（B8 的真正增量；旧实现保留）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f4_reclaim_' + Date.now() + '.json'
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    const reclaimPath = path.join(dir, '.seen.cleanup.lock.999999.1700000000000.reclaim')
+    const past = new Date(Date.now() - 60000)
+    fsmod.writeFileSync(reclaimPath, '999999:0:dead-owner')
+    fsmod.utimesSync(reclaimPath, past, past)
+    MessageStore._tombstoneLocksCleaned.delete(dir)
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(reclaimPath), false, '陈旧且持有进程已退出的 .reclaim 残留应被回收（回退该判据即红）')
+    } finally {
+      try { fsmod.unlinkSync(reclaimPath) } catch (e) { /* 忽略 */ }
+    }
   })
 
   await test('B8-F5: 磁盘文件存在但读不到时写闸门拒绝覆写（现状契约锁定）', () => {
@@ -9006,44 +9050,115 @@ console.log('========================================\n');
     const name = 'test_b8_f02_stale.json'
     const fp = getFilePath(name)
     try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
-    saveMessages(fp, [{ id: 'f02-a', title: 'A' }, { id: 'f02-b', title: 'B' }])
+    saveMessages(fp, [{ id: 'f02-a', title: 'A' }, { id: 'f02-b', title: 'B' }, { id: 'f02-c', title: 'C' }])
     const arr = readMessages(fp)
     // 先让 _identityIndex 建立并缓存该数组的索引
     assertEqual(isMessageInFile({ id: 'f02-b' }, name), true, '前置：f02-b 应已判重命中')
-    // 调用方原地改写权威数组（readMessages 返回同一引用）：把两个元素整体换掉
-    arr[0] = { id: 'f02-x', title: 'X' }
+    // R4（V6）：只改**非首元素**且长度不变——引用/长度/首元素引用三项 O(1) 失效检查全都看不出变化，
+    // 旧索引会把已被移除的 f02-b 判为「已存在」→ 漏推（与 SYSTEM_CONTRACT「宁可多推」相反）。
     arr[1] = { id: 'f02-y', title: 'Y' }
-    // 旧身份必须立刻判否（不得因陈旧索引静默误判为已存在）
-    assertEqual(isMessageInFile({ id: 'f02-a' }, name), false, '被原地移除的 f02-a 不得再判重命中（陈旧索引回归）')
-    assertEqual(isMessageInFile({ id: 'f02-b' }, name), false, '被原地移除的 f02-b 不得再判重命中（陈旧索引回归）')
-    // 新身份必须判是
-    assertEqual(isMessageInFile({ id: 'f02-x' }, name), true, '原地写入的新身份应判重命中')
+    assertEqual(isMessageInFile({ id: 'f02-b' }, name), false, '被原地移除的非首元素身份不得再判重命中（陈旧索引 → 漏推）')
     assertEqual(isMessageInFile({ id: 'f02-y' }, name), true, '原地写入的新身份应判重命中')
+    // 字段级改写（元素对象本身不变）同样必须被检出
+    arr[2].id = 'f02-changed'
+    assertEqual(isMessageInFile({ id: 'f02-c' }, name), false, '字段被改写的身份不得再判重命中（陈旧索引回归）')
+    assertEqual(isMessageInFile({ id: 'f02-changed' }, name), true, '字段改写出的新身份应判重命中')
+    // 首元素整体替换（原有 head 引用检查覆盖这条）
+    arr[0] = { id: 'f02-x', title: 'X' }
+    assertEqual(isMessageInFile({ id: 'f02-a' }, name), false, '被原地移除的首元素身份不得再判重命中（陈旧索引回归）')
+    assertEqual(isMessageInFile({ id: 'f02-x' }, name), true, '原地写入的首元素新身份应判重命中')
   })
 
-  await test('B8-F-02: has 走索引与线性扫描结果一致（等价性对照）', () => {
-    const name = 'test_b8_f02_equiv.json'
+  // R4：B8 原「等价性对照」全程不改写数组 → 任何实现都通过（零区分力），替换为**逐形态**的
+  // 原地改写 + 线性扫描 oracle 对拍。oracle = _indexHasIdentityDirect（零索引、独立实现）。
+  await test('B8-F-02: 原地改写各形态下索引判重必须与线性扫描 oracle 逐值一致', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f02_oracle.json'
     const fp = getFilePath(name)
-    try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
-    saveMessages(fp, [
-      { id: 'e1' },
-      { id: 'e2', url: 'https://e.example/2' },
-      { url: 'https://e.example/3' },
-      { title: '匿名内容 e4 足够长避免退化' }
-    ])
-    const messages = readMessages(fp)
-    const probes = [
-      { id: 'e1' }, { id: 'e2' }, { id: 'e3' },
-      { url: 'https://e.example/2' }, { url: 'https://e.example/3' }, { url: 'https://e.example/9' },
-      { title: '匿名内容 e4 足够长避免退化' }, { title: '匿名内容 eX 足够长避免退化' }
+    const seed = () => [
+      { id: 'f02-a', title: 'A' },
+      { id: 'f02-b', title: 'B' },
+      { id: 'f02-c', url: 'https://f02.example/c' },
+      { url: 'https://f02.example/only' },
+      { title: '匿名内容 f02 足够长避免退化' }
     ]
-    for (const p of probes) {
-      assertEqual(
-        isMessageInFile(p, name),
-        MessageStore._indexHasIdentityDirect(messages, p),
-        `索引判重与线性扫描应一致: ${JSON.stringify(p)}`
-      )
+    const forms = [
+      {
+        label: 'arr[1] 整体替换（非首元素、长度不变）',
+        mutate: (a) => { a[1] = { id: 'f02-y', title: 'Y' } },
+        probes: () => [{ id: 'f02-b' }, { id: 'f02-y' }, { id: 'f02-a' }]
+      },
+      {
+        label: 'arr[2].url 字段改写',
+        mutate: (a) => { a[2].url = 'https://f02.example/changed' },
+        probes: () => [{ url: 'https://f02.example/c' }, { url: 'https://f02.example/changed' }]
+      },
+      {
+        label: 'arr[0].id 字段改写（首元素、字段级）',
+        mutate: (a) => { a[0].id = 'f02-head' },
+        probes: () => [{ id: 'f02-a' }, { id: 'f02-head' }]
+      },
+      {
+        label: 'arr[3] 整体替换（纯 url 元素）',
+        mutate: (a) => { a[3] = { url: 'https://f02.example/other' } },
+        probes: () => [{ url: 'https://f02.example/only' }, { url: 'https://f02.example/other' }]
+      },
+      {
+        label: 'arr[4].title 字段改写（匿名身份）',
+        mutate: (a) => { a[4].title = '匿名内容 f02 已被改名且足够长' },
+        probes: () => [{ title: '匿名内容 f02 足够长避免退化' }, { title: '匿名内容 f02 已被改名且足够长' }]
+      },
+      {
+        label: '原地 push 追加（长度变化，O(1) 失效检查覆盖）',
+        mutate: (a) => { a.push({ id: 'f02-appended' }) },
+        probes: () => [{ id: 'f02-appended' }, { id: 'f02-b' }]
+      }
+    ]
+    try {
+      for (const form of forms) {
+        try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+        saveMessages(fp, seed())
+        const arr = readMessages(fp)
+        assertEqual(isMessageInFile({ id: 'f02-a' }, name), true, `前置：${form.label} 前索引必须已建立`)
+        form.mutate(arr)
+        for (const p of form.probes()) {
+          const indexed = isMessageInFile(p, name)
+          const oracle = MessageStore._indexHasIdentityDirect(arr, p)
+          assertEqual(indexed, oracle,
+            `${form.label}：has()=${indexed} 必须等于 oracle=${oracle}（probe=${JSON.stringify(p)}；不一致即索引陈旧：true/false 分别对应漏推/多推）`)
+        }
+      }
+    } finally {
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
     }
+  })
+
+  // R4 性能守位（B8 的取舍理由：逐位复检每次 ~20ms 会打死热路径）：修复只为「每个数组版本」
+  // 付一次未命中复检，之后稳态 O(1)。断言重建次数上界——把复检改成「每次未命中都重建」时必红。
+  await test('B8-F-02: 批量未命中不得每次重建索引（每数组版本至多一次 O(n) 复检）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f02_perf.json'
+    const fp = getFilePath(name)
+    const msgs = []
+    for (let i = 0; i < 2000; i++) msgs.push({ id: 'f02p-' + i })
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    saveMessages(fp, msgs)
+    const arr = readMessages(fp)
+    assertEqual(isMessageInFile({ id: 'f02p-0' }, name), true, '前置：索引已建立且命中')
+    assertEqual(Array.isArray(arr), true, '前置：readMessages 返回权威数组')
+    const realBuild = MessageStore._buildIdentityIndex
+    let builds = 0
+    MessageStore._buildIdentityIndex = function (...args) { builds++; return realBuild.apply(this, args) }
+    try {
+      for (let i = 0; i < 1000; i++) {
+        assertEqual(isMessageInFile({ id: 'f02p-miss-' + i }, name), false, `不存在的身份必须判否（第 ${i} 个）`)
+      }
+    } finally {
+      MessageStore._buildIdentityIndex = realBuild
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+    assertEqual(builds >= 1, true, '首次未命中必须做一次全量复检（否则原地写入的新身份查不到——F-02 修复机制被删即红）')
+    assertEqual(builds <= 2, true, `1000 次未命中最多重建 1~2 次索引，实际 ${builds} 次（每次未命中都重建 = O(n²)，B8 实测打死热路径）`)
   })
 
   await test('B8-F7: getFileName 不给缓存目录生成隐藏文件（末段以点开头）', () => {
@@ -9052,6 +9167,33 @@ console.log('========================================\n');
     assertEqual(getFileName('https://example.com/a.json'), 'a.json', '正常名字不受影响')
     const p = getFilePath(getFileName('https://example.com/.secret'))
     assertEqual(path.basename(p).startsWith('.'), false, `getFilePath 产物不得以点开头（隐藏文件）: ${path.basename(p)}`)
+  })
+
+  // R4（V6 实锤）：B8 的加前缀修法**引入了新碰撞**——'url_' 前缀本身也是合法末段，
+  // 于是 getFileName('https://x/.json') === getFileName('https://x/url_.json') === 'url_.json'，
+  // 两个不同 pushUrl 共用同一缓存文件（判重记录互相覆盖）。改为「以 . 或 url_ 开头 ⇒ 前置 url_」的单射映射。
+  await test('B8-F7: 隐藏文件防护不得与 url_ 前缀的合法名撞名（V6 新碰撞回归）', () => {
+    assertEqual(getFileName('https://x/.json'), 'url_.json', '以点开头仍加前缀（隐藏文件防护保持）')
+    assertEqual(getFileName('https://x/url_.json'), 'url_url_.json', '本身以 url_ 开头的名字必须转义前缀')
+    assertEqual(getFileName('https://x/.json') === getFileName('https://x/url_.json'), false,
+      '两个不同 URL 不得映射到同一缓存文件名（碰撞即判重记录互相覆盖）')
+    const urls = ['https://x/.hidden', 'https://x/url_.hidden', 'https://x/url_x', 'https://x/x', 'https://x/.json', 'https://x/url_.json', 'https://x/data.json']
+    const names = urls.map(getFileName)
+    assertEqual(new Set(names).size, names.length, `不同 URL 不得撞名：${JSON.stringify(names)}`)
+  })
+
+  // R4（V6 实锤）：F7 原条目另一半（getFilePath 截断碰撞）逐字未动——两条仅在**第 200 字节之后**
+  // 不同的长名会被截断成同一路径，而生产 cacheName 直接来自 getFileName(pushUrl)。
+  // 修法：截断结果附带全名摘要（anonKey 64 位，仅字母数字），保证「长名 → 路径」单射。
+  await test('B8-F7: 超长名截断必须保持单射（仅第 200 字节后不同的两条长名不得同路径）', () => {
+    const a = 'u'.repeat(260) + 'aaaa.json' // 269 字节
+    const b = 'u'.repeat(260) + 'bbbb.json' // 与 a 仅在第 200 字节之后不同
+    const pa = getFilePath(a)
+    const pb = getFilePath(b)
+    assertEqual(pa !== pb, true, `截断后仍必须区分不同长名（同路径即判重缓存互相覆盖）：${path.basename(pa)} vs ${path.basename(pb)}`)
+    assertEqual(Buffer.byteLength(path.basename(pa)) <= 200 && Buffer.byteLength(path.basename(pb)) <= 200, true, '截断产物仍须 <= 200 字节')
+    assertEqual(pa.endsWith('.json') && pb.endsWith('.json'), true, '截断仍应保留扩展名')
+    assertEqual(getFilePath(a) === pa, true, '同一名字必须稳定映射到同一路径（缓存名要能跨轮复用）')
   })
 
   // ============================================================
