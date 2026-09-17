@@ -114,4 +114,18 @@ const hashValid = Utils.filterHash({ pingbitime: '5' }, '')
 assert.ok(typeof hashValid === 'string' && hashValid.length > 0, '有效数字应返回非空哈希')
 assert.notStrictEqual(hashValid, hashInvalid, '有效数字与无效数字的哈希应不同')
 
+// ===== FILTER-01 / RULES-05：filterHash 折入「规则实际编译生效」维度 =====
+// 反例（改动前）：哈希只由配置**字节**驱动——同一份配置在 re2 缺失（compileUserRegex 恒返回 null）
+// 或规则被 ReDoS 守卫丢弃时过滤面变宽，但哈希不变 → App 的 _f 失效判定不触发 → 被过滤条目在
+// 缓存窗口内永不重评（改宽后静默漏推）。以下为纯函数层的可证伪断言。
+const hashNoCompile = Utils.filterHash({ pingbibiaoti: '京东' }, '', 're2=0,pingbibiaoti=null')
+const hashCompiled = Utils.filterHash({ pingbibiaoti: '京东' }, '', 're2=1,pingbibiaoti=re')
+assert.notStrictEqual(hashNoCompile, hashCompiled, '配置字节相同、编译生效维度不同 → 哈希必须不同（否则 _f 永不失效）')
+assert.strictEqual(hashCompiled, Utils.filterHash({ pingbibiaoti: '京东' }, '', 're2=1,pingbibiaoti=re'), '编译生效维度必须确定性参与哈希')
+assert.notStrictEqual(hashCompiled, Utils.filterHash({ pingbibiaoti: '京东' }, ''), '省略编译维度与显式维度必须可区分（旧调用点口径不混淆）')
+// 脏值不得抛穿：Symbol / 抛错 toString 一律按空维度处理（与 rawStr/safeStr 同口径）
+assert.strictEqual(Utils.filterHash({ pingbibiaoti: 'x' }, '', Symbol('s')), Utils.filterHash({ pingbibiaoti: 'x' }, ''), 'Symbol 编译维度应按空处理，不得抛穿')
+const throwingState = { toString () { throw new Error('boom-state') } }
+assert.strictEqual(Utils.filterHash({ pingbibiaoti: 'x' }, '', throwingState), Utils.filterHash({ pingbibiaoti: 'x' }, ''), '抛错 toString 的编译维度应按空处理，不得抛穿')
+
 console.log('test_utils OK')

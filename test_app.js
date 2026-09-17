@@ -3244,6 +3244,36 @@ console.log('========================================\n');
     }
   })
 
+  await test('filter.hash 折入「规则实际编译生效」维度（FILTER-01/RULES-05）', async () => {
+    // 反例（改动前）：filter.hash 只由配置字节驱动——re2 缺失或规则被 ReDoS 守卫丢弃时过滤面变宽
+    // 但哈希不变，已打 _f 的条目（上方 t68 场景）永不重评。本用例锚定「App 真的把编译生效维度
+    // 折进了写入磁盘的哈希」，且该维度在同一环境内稳定（不得每轮变化导致每轮清 _f）。
+    reset()
+    setPushUrl('t_compile_dim')
+    const hashPath = path.join(CACHE_DIR, 'filter.hash')
+    const origFilter = Config.filter.pingbibiaoti
+    try {
+      try { fs.unlinkSync(hashPath) } catch (e) { /* 首次运行无 hash */ }
+      Config.filter.pingbibiaoti = '不匹配任何标题的关键词'
+      fakeData = [makeItem({ id: 1, title: '普通标题' })]
+      await xbk.run()
+      const stored1 = fs.readFileSync(hashPath, 'utf8').trim().split('\n')[1]
+      assert(stored1 !== xbk.filterHash(Config.filter, Config.keyword.zkt_gjc),
+        'app 写入的 filter.hash 必须含配置字节之外的「编译生效」维度（两参哈希 != 落盘哈希）')
+      // 同配置重复运行：维度稳定（否则每轮 _f 全清、每轮全量重评）
+      reset()
+      setPushUrl('t_compile_dim')
+      Config.filter.pingbibiaoti = '不匹配任何标题的关键词'
+      fakeData = [makeItem({ id: 1, title: '普通标题' })]
+      await xbk.run()
+      const stored2 = fs.readFileSync(hashPath, 'utf8').trim().split('\n')[1]
+      assert(stored2 === stored1, `编译生效维度必须随环境稳定，实际 ${stored1} → ${stored2}`)
+    } finally {
+      Config.filter.pingbibiaoti = origFilter
+      try { fs.unlinkSync(hashPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('api.timeout 字符串配置生效（#8 v3.162）', async () => {
     reset()
     setPushUrl('t69_timeout_str')

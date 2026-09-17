@@ -1038,8 +1038,12 @@ function createApp ({
         const cacheName = MessageStore.getFileName(Config.api.pushUrl)
         // v3.159：过滤规则哈希比对——规则变更时失效「过滤写入」缓存（改宽过滤后旧条目重新评估/推送，
         // 无需手动清缓存；「推送成功」缓存不受影响，防重复推送）
+        // FILTER-01 / RULES-05：哈希除配置字节外还折入「规则实际编译生效」维度
+        // （RuleEngine.compileStateOf(compiledRules)：re2 可用性 + 各字段是否真的编译出规则）。
+        // 否则同一份配置下 re2 缺失/规则被 ReDoS 守卫丢弃时哈希不变，已打 _f 的条目永不重评、
+        // 改宽后静默漏推。该维度随环境稳定，不会每轮清 _f。
         {
-          const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc)
+          const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc, RuleEngine.compileStateOf(compiledRules))
           const hashPath = path.join(MessageStore.cacheDir, 'filter.hash')
           let lastFile = ''
           let lastHash = ''

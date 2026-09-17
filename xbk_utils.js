@@ -471,21 +471,9 @@ function createUtils (options = {}) {
   // 旧实现把任意 `<` 当标签起始，未配对的 `<` 让区间一路延伸到串尾/下一个 `<`，把后方纯文本的
   // name="…" 判成「标签内属性」并整段占位，段内真实的 <img onerror> 随之绕过事件清洗直出网。
   //
-  // 返回 valueQuotes：按 **HTML5 tag tokenizer 词法状态机**判定「真正开启一个属性值」的引号位置。
-  // _protectAttrPairs 依赖它区分「属性值开启引号」与「非赋值位置的杂散引号」——后者会把回扫出的
-  // 伪属性对误判成可保护段，从而把后续真事件属性的属性名藏进占位符（P2-01）。
-  //
-  // 旧实现是「标签内引号奇偶配对」启发式：把任何「处于引号外」状态遇到的引号都记成 value-open。
-  // 它有两类已实测失效（V1 打回）：
-  //   ① 未加引号属性值里的杂散引号：HTML5 在 attribute value (unquoted) 状态把 `"`/`'`/`<`/`=`
-  //      当普通字符 append 进值，它们**不开启引号值**。奇偶启发式下「偶数个」杂散引号让奇偶复原，
-  //      伪属性对的开启引号重新落回保护集（`<img foo=a"b"c=" onerror="alert(1)">` 修复后仍 LIVE）；
-  //   ② 未加引号属性值里的 `<`：HTML5 把它当普通字符（parse error 但 append 到值），
-  //      旧实现却 `break` 结束当前 span 并从该 `<` 重开一个，使 `<bar=" onerror="` 被当作标签内属性对
-  //      （P1-01：`<img foo=x<bar=" onerror="alert(1)">` 仍 LIVE）。
-  // 同时修掉旧启发式引入的假阳性：合法属性值内的 `on*` 文本被 `_stripEventAttrs` 误删
-  // （`<img a=x"b title="see onerror=x">` 的 title 值被截断）——状态机下 `title=` 后的引号
-  // 才是 value-open，整段被保护，值内文本不再暴露给事件清洗。
+  // 返回 valueQuotes：正扫过程中处于「引号外」状态所遇到的各引号位置，即**真正开启一个属性值**
+  // 的引号。_protectAttrPairs 依赖它区分「属性值开启引号」与「未加引号值里的杂散引号」——
+  // 后者会把回扫出的伪属性对误判成可保护段，从而把后续真事件属性的属性名藏进占位符（P2-01）。
   _htmlTagSpans (html) {
     const spans = []
     const valueQuotes = new Set()
@@ -1089,8 +1077,13 @@ function createUtils (options = {}) {
     set.add(i)
   },
 
-  /** v3.159：过滤规则稳定哈希（过滤字段固定顺序 + 只看它关键词）——规则变更时用于失效「过滤写入」缓存 */
-  filterHash (filterCfg, zktGjc) {
+  /** v3.159：过滤规则稳定哈希（过滤字段固定顺序 + 只看它关键词）——规则变更时用于失效「过滤写入」缓存。
+   *  FILTER-01 / RULES-05：第三参 compileState 是「规则实际编译生效」维度（RuleEngine.compileStateOf
+   *  产物：re2 可用性 + 各字段编译出的规则类型/条数）。此前哈希只由配置**字节**驱动，故「同一份配置、
+   *  不同环境」下 re2 缺失或规则被 ReDoS 守卫丢弃时哈希不变 → 缓存里已打 _f 的条目永不重评、改宽后
+   *  静默漏推。折入该维度后环境/编译结果一变，filter.hash 即变 → App 清 _f → 重新评估。
+   *  省略第三参时为 ''（旧调用点/旧测试语义不变，哈希仍确定）。 */
+  filterHash (filterCfg, zktGjc, compileState) {
     const parts = []
     const rawStr = (v) => {
       if (v === undefined || v === null || typeof v === 'symbol') return ''
@@ -1140,6 +1133,13 @@ function createUtils (options = {}) {
       try { return (typeof v === 'string' ? '' : typeof v + ':') + String(v) } catch (e) { return '' }
     }
     parts.push('zkt_gjc=' + typedRawStr(zktGjc))
+    // FILTER-01 / RULES-05：「规则实际编译生效」维度。String 化包 try/catch——脏配置/Proxy 的
+    // toString 抛错不得让整轮 run 崩（与上方 rawStr/safeStr 同口径）。缺省（旧调用点）= ''。
+    let compilePart = ''
+    if (compileState !== undefined && compileState !== null && typeof compileState !== 'symbol') {
+      try { compilePart = String(compileState) } catch (e) { compilePart = '' }
+    }
+    parts.push('compile=' + compilePart)
     // P3：pingbitime 天数过滤结果随注册天数增长（daysFrom 逐日 UTC 日期差）而变化，静态配置哈希不会变——
     // 已 _f 标记的旧条目因「缓存失效仅由静态哈希触发」而永不重评、长期漏推（老化过阈值后本应补推）。
     // pingbitime 启用时把当前 UTC 日期折进哈希：跨天即失效 _f 缓存 → 老化过阈值的条目被重新评估/推送；
