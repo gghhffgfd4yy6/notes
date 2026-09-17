@@ -203,7 +203,7 @@ function classifyOne (error) {
   const channel = String(info.channel || '').toLowerCase()
   const message = String(info.message || '').toLowerCase()
   const permanentMessage = /接口返回数据格式异常|未配置任何推送通道|invalid\s+url|module\s+not\s+found|证书.*(主机|域名)|主机名.*证书/.test(message) ||
-        /(?:unauthori[sz]ed|forbidden|bad request|not found|invalid\s+(?:token|key|parameter)|(?:token|key|密钥).*(?:invalid|invalidated|无效|错误|不存在|过期))/.test(message) ||
+        /(?:unauthori[sz]ed|forbidden|bad request|not found|invalid\s+(?:(?:webhook|access|api)\s+)?(?:token|key|parameter)|(?:token|key|密钥).*(?:invalid|invalidated|无效|错误|不存在|过期))/.test(message) ||
         /(?:参数|配置).*(?:错误|无效|非法)/.test(message) ||
         /(?:certificate has expired|certificate is not yet valid|self[- ]signed certificate|unable to verify the first certificate|unable to get (?:[a-z0-9_-]+\s+)*issuer certificate|certificate signature failure|certificate (?:has been )?revoked)/.test(message) ||
         /(?:证书(?:已)?(?:过期|失效|吊销)|证书尚未生效|自签名证书|无法获取(?:本地)?(?:颁发者证书|证书颁发者)|证书签名(?:校验)?失败)/.test(message)
@@ -225,7 +225,9 @@ function classifyOne (error) {
     }
     // v3.232：仅明确配置类错误判永久（key/token 无效、缺 token、无权限、webhook 未找到）；
     // 其余（如 500 系统繁忙）落回通用分类（5xx → retryable），防瞬时错误误判永久导致常驻停止重试、消息丢失
-    if (['40014', '41001', '42001', '45001', '130101'].includes(providerCode)) {
+    // XFP-02：补 93000（群机器人 invalid webhook key）——webhook key 无效是配置类永久错误，
+    // 落在 UNKNOWN 会让常驻永久退避重试同一个失效 webhook（每轮都失败且永不停止）。
+    if (['40014', '41001', '42001', '45001', '130101', '93000'].includes(providerCode)) {
       return { kind: 'permanent', reason: `QYWX_${providerCode}`, info }
     }
   }

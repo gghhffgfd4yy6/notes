@@ -73,6 +73,18 @@ function error (message, code) {
   assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 130101, message: 'webhook not found' }).kind, 'permanent')
   assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 41001, message: 'missing token' }).kind, 'permanent')
   assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 42001, message: 'token expired' }).kind, 'permanent')
+  // XFP-02：群机器人 webhook key 失效（errcode 93000）是配置类永久错误。反例（改动前）：
+  // 93000 不在永久清单、文本兜底要求 invalid 后紧跟 token|key|parameter 接不住 'invalid webhook
+  // key'（中间有 webhook），于是落回 UNKNOWN → retryable，常驻会对同一个失效 webhook 永久退避重试。
+  assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 93000, message: 'invalid webhook key' }).kind, 'permanent')
+  assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 93000, message: 'invalid webhook key' }).reason, 'QYWX_93000')
+  // 无 channel/providerCode 时由文本兜底接住（同一缺陷的另一条路径）
+  assert.strictEqual(classifyFailure({ message: 'invalid webhook key' }).kind, 'permanent')
+  assert.strictEqual(classifyFailure({ message: 'invalid webhook key' }).reason, 'CONFIG_OR_CONTRACT')
+  assert.strictEqual(classifyFailure({ message: 'invalid access token' }).kind, 'permanent')
+  // 反向断言：兜底放宽不能把正常业务错判永久——'invalid' 后不是凭据类词的仍走通用分类
+  assert.strictEqual(classifyFailure({ message: 'invalid response payload shape' }).kind, 'retryable')
+  assert.strictEqual(classifyFailure({ message: 'invalid state transition' }).kind, 'retryable')
   assert.strictEqual(classifyFailure(error('完全未知故障')).kind, 'retryable')
   assert.strictEqual(classifyFailure(Object.assign(new SyntaxError('代码解析失败'), { name: 'SyntaxError' })).kind, 'permanent')
 
