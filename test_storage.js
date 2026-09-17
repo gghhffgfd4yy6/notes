@@ -218,6 +218,33 @@ const {
   assert.strictEqual(readSafeText(bigFile), 'x'.repeat(100), '不传 maxBytes 时应无上限，返回全文')
   assert.strictEqual(readSafeText(bigFile, 0), 'x'.repeat(100), 'maxBytes=0 应视为不设限，返回全文')
 
+  // ===== STG-05（续）：非法 maxBytes 必须告警，不得静默按「不设限」读取 =====
+  // 旧实现：`typeof maxBytes === 'number' && maxBytes > 0` 为假即静默不设限——调用方传 '50'
+  // （字符串）或 -1 时，限长意图被悄悄变成整读入内存，没有任何信号。
+  const badWarns = []
+  const origWarn = console.warn
+  console.warn = (...args) => { badWarns.push(args.join(' ')) }
+  let badRet
+  try { badRet = readSafeTextResult(bigFile, '50') } finally { console.warn = origWarn }
+  assert.strictEqual(badRet.status, 'ok', '非法 maxBytes 沿用「不设限」语义（读取结果不变）')
+  assert.strictEqual(badRet.text, 'x'.repeat(100), '非法 maxBytes 仍返回全文')
+  assert.strictEqual(badWarns.length, 1, '非法 maxBytes 必须告警一次（旧实现完全静默）')
+  assert.match(badWarns[0], /maxBytes 非法/, '告警需指明 maxBytes 非法')
+  assert.match(badWarns[0], /按不设限读取/, '告警需说明实际按不设限处理')
+
+  // 对照：0 / -1 / NaN / Infinity 同样告警（「非正数」不是合法上限，只是历史语义）
+  for (const bad of [0, -1, NaN, Infinity]) {
+    const seen = []
+    console.warn = (...args) => { seen.push(args.join(' ')) }
+    try { readSafeTextResult(bigFile, bad) } finally { console.warn = origWarn }
+    assert.strictEqual(seen.length, 1, `maxBytes=${String(bad)} 应告警一次`)
+  }
+  // 反向对照：合法上限与不传（undefined）都不得告警，否则告警会变成噪声
+  const okWarns = []
+  console.warn = (...args) => { okWarns.push(args.join(' ')) }
+  try { readSafeTextResult(bigFile, 50); readSafeTextResult(okFile) } finally { console.warn = origWarn }
+  assert.deepStrictEqual(okWarns, [], '合法 maxBytes / 不传 maxBytes 时不得告警')
+
   // 清理：临时目录递归删除即可覆盖所有测试文件
   try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) {}
 

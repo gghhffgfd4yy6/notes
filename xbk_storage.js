@@ -148,12 +148,24 @@ function readFdRange (fd, start, length) {
   return Buffer.concat(chunks).toString('utf8')
 }
 
+// maxBytes 入口校验（审查 STG-05）：合法输入只有两种——undefined（保持旧行为「不设限」）与
+// 正的安全整数上限。其余（数字字符串、NaN、负数、0、Infinity、超安全整数）沿用「不设限」语义，
+// 但必须告警：静默不设限会把调用方的限长意图悄悄变成整读入内存（本函数是安全读取入口）。
+function resolveMaxBytes (maxBytes, filePath) {
+  if (maxBytes === undefined) return null
+  if (typeof maxBytes === 'number' && Number.isSafeInteger(maxBytes) && maxBytes > 0) return maxBytes
+  console.warn(`readSafeTextResult: maxBytes 非法（${typeof maxBytes} ${String(maxBytes)}），上限未生效，按不设限读取 ${filePath}`)
+  return null
+}
+
 // 可选大小上限：maxBytes 为数字且 > 0 时，普通文件超过该字节数即判 tooLarge，避免异常膨胀
-// 文件被整读入内存（状态/哈希等小文件场景）。maxBytes 非数字或 ≤0 时按既有语义处理为「不设限」。
+// 文件被整读入内存（状态/哈希等小文件场景）。maxBytes 非数字或 ≤0 时按既有语义处理为「不设限」
+// （但见 resolveMaxBytes：非法值一律告警，不再静默）。
 function readSafeTextResult (filePath, maxBytes) {
   // 修复 TOCTOU：先以 O_NOFOLLOW 打开并 fstat 确认为普通文件，读取内容后复检路径仍指向
   // 同一 inode（dev+ino）的普通文件。内容读取走同一 fd（readFdRange），读取期间路径被替换
   // 成符号链接/其他文件时，读后复检仍会将其判为 unsafe 并丢弃结果，不泄露任意文件内容。
+  const limit = resolveMaxBytes(maxBytes, filePath)
   const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
   let fd
   try {
@@ -166,8 +178,8 @@ function readSafeTextResult (filePath, maxBytes) {
   try {
     const stat = fs.fstatSync(fd)
     if (!stat.isFile()) return { status: 'unsafe', text: null, error: new Error('非普通文件') }
-    if (typeof maxBytes === 'number' && maxBytes > 0 && stat.size > maxBytes) {
-      return { status: 'tooLarge', text: null, error: new Error(`文件过大(${stat.size} 字节)，超过上限 ${maxBytes} 字节`) }
+    if (limit !== null && stat.size > limit) {
+      return { status: 'tooLarge', text: null, error: new Error(`文件过大(${stat.size} 字节)，超过上限 ${limit} 字节`) }
     }
     const text = readFdRange(fd, 0, stat.size)
     let reFd
@@ -192,7 +204,7 @@ function readSafeTextResult (filePath, maxBytes) {
 }
 
 // maxBytes 透传给 readSafeTextResult：不传时与旧行为完全一致（不设上限），
-// 调用方可据此对这条读取入口显式设限（审查 STG-05）。
+// 调用方可据此对这条读取入口显式设限（审查 STG-05：非法值由 readSafeTextResult 统一告警）。
 function readSafeText (filePath, maxBytes) {
   const result = readSafeTextResult(filePath, maxBytes)
   return result.status === 'ok' ? result.text : null
