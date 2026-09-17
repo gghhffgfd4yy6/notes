@@ -343,6 +343,28 @@ test('F6 默认 load 以项目根为基准：scripts/ 下同名坏包不得影�
   }
 })
 
+// F5 回归：默认参数就是生产路径（run_tests.js 的 checkDependencies() 无参调用），此前
+// test_check_deps.js 每条用例都显式注入 resolve/load，默认分支零断言。本条在隔离树上走
+// 完全无参的调用：默认 manifest（ROOT/package.json）→ 默认 resolve/load（ROOT 基准）→ 静默通过。
+// 默认值任一被改坏（清单退回硬编码、基准漂移、误判版本）都会让 status/输出变红。
+test('F5 无参调用（默认 manifest/resolve/load）在隔离依赖树上静默通过', () => {
+  const dir = makeCheckDepsSandbox({
+    manifest: { name: 'sandbox', version: '1.0.0', dependencies: { 'xbk-default-path-a': '1.0.0' }, optionalDependencies: { 'xbk-default-path-b': '1.0.0' } },
+    deps: ['xbk-default-path-a', 'xbk-default-path-b']
+  })
+  try {
+    const r = runCheckDepsSandbox(dir)
+    if (r.status !== 0) {
+      throw new Error(`无参调用应静默通过，实际 status=${r.status}，stderr=${JSON.stringify(r.stderr)}`)
+    }
+    if (String(r.stdout) !== '' || String(r.stderr) !== '') {
+      throw new Error(`成功路径应零输出，实际 stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 console.log('========================================')
 console.log('  🧪 依赖预检测试（checkDependencies）')
 console.log('========================================\n')
