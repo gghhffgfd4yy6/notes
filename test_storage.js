@@ -115,6 +115,40 @@ const {
   assert.strictEqual(writeAtomicIfAbsent(keep, 'second'), true, '已存在文件应返回 true（EEXIST 视为初始化成功）')
   assert.strictEqual(fs.readFileSync(keep, 'utf8'), 'first', 'EEXIST 时不得清理/覆盖已存在的有效文件')
 
+  // ===== STG-04：原子写必须在 rename 前 fsync 临时文件，并对父目录 fsync =====
+  // 旧实现直接 writeFileSync(tmp)+renameSync：rename 的原子性只对进程崩溃成立，掉电时目录项与
+  // 内容都可能丢失。修后顺序固定为 fsync(内容) → rename → fsync(父目录)。
+  const order = []
+  const origFsync = fs.fsyncSync
+  const origRename2 = fs.renameSync
+  fs.fsyncSync = (target) => { order.push(order.length === 0 ? 'fsync-file' : 'fsync'); return origFsync.call(fs, target) }
+  fs.renameSync = (a, b) => { order.push('rename'); return origRename2.call(fs, a, b) }
+  let durableOk
+  try { durableOk = writeAtomic(make('durable.txt'), 'durable') } finally { fs.fsyncSync = origFsync; fs.renameSync = origRename2 }
+  assert.strictEqual(durableOk, true, '补 fsync 后正常写入仍应成功')
+  assert.ok(order.includes('fsync-file'), 'writeAtomic 必须在 rename 前 fsync 临时文件（否则掉电可丢内容）')
+  assert.ok(order.indexOf('fsync-file') < order.indexOf('rename'), '文件 fsync 必须发生在 rename 之前（提交点唯一）')
+  assert.ok(order.lastIndexOf('fsync') > order.indexOf('rename'), 'rename 之后必须 fsync 父目录（否则掉电可丢目录项）')
+  assert.strictEqual(fs.readFileSync(make('durable.txt'), 'utf8'), 'durable', 'fsync 之后内容仍应是本次写入的')
+
+  // writeAtomicIfAbsent 走同一口径（无 rename 提交点，但内容同样要先落盘）
+  const order2 = []
+  fs.fsyncSync = (target) => { order2.push('fsync'); return origFsync.call(fs, target) }
+  let absentOk
+  try { absentOk = writeAtomicIfAbsent(make('durable2.txt'), 'durable2') } finally { fs.fsyncSync = origFsync }
+  assert.strictEqual(absentOk, true, '独占初始化写也应成功')
+  assert.ok(order2.includes('fsync'), 'writeAtomicIfAbsent 必须 fsync 后才视为初始化成功')
+
+  // 文件 fsync 失败必须 fail-closed：删 tmp、返回 false，不得留下「已提交」的假象
+  const origFsync3 = fs.fsyncSync
+  fs.fsyncSync = () => { throw Object.assign(new Error('EIO'), { code: 'EIO' }) }
+  const leftover = fs.readdirSync(tmp).filter((f) => f.startsWith('durable3.txt'))
+  let fsyncFailRet
+  try { fsyncFailRet = writeAtomic(make('durable3.txt'), 'nope') } finally { fs.fsyncSync = origFsync3 }
+  assert.strictEqual(fsyncFailRet, false, 'fsync 失败时不得报成功')
+  assert.strictEqual(fs.existsSync(make('durable3.txt')), false, 'fsync 失败时目标文件不得出现（未提交）')
+  assert.deepStrictEqual(fs.readdirSync(tmp).filter((f) => f.startsWith('durable3.txt')), leftover, 'fsync 失败时不得残留 .tmp')
+
   // ===== readSafeTextResult =====
   // 不存在 → missing
   const r1 = readSafeTextResult(make('missing.txt'))

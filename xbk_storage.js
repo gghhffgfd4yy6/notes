@@ -33,6 +33,22 @@ function ensureParent (filePath) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
 }
 
+// 尽力 fsync 父目录（审查 STG-04）：rename 的持久性要靠目录项的 fsync 才成立。
+// 目录 fsync 在部分平台/FUSE 上不被支持（EINVAL/EPERM/EBADF），此处只告警不失败——
+// 掉电持久性是尽力而为的加固，不应让一次成功的写入因目录 fsync 不可用而整体报失败。
+function fsyncDirBestEffort (filePath) {
+  const dir = path.dirname(filePath)
+  let dfd
+  try {
+    dfd = fs.openSync(dir, 'r')
+    fs.fsyncSync(dfd)
+  } catch (e) {
+    console.warn(`目录 fsync 失败（本次写入仍视为成功，掉电后可能丢失该次 rename）${dir}: ${e && e.code ? e.code : e.message}`)
+  } finally {
+    if (dfd !== undefined) { try { fs.closeSync(dfd) } catch (e) { /* 忽略 */ } }
+  }
+}
+
 function writeAtomic (filePath, text, label = '缓存文件') {
   // 已知取舍（审查 2026-08-15，记录不修）：isRegularOrMissing 检查与 renameSync 之间、以及
   // cacheDir 的 realpath 校验与每次写入之间均存在 TOCTOU 窗口（校验时是普通文件/目录，窗口内被替换
@@ -41,24 +57,32 @@ function writeAtomic (filePath, text, label = '缓存文件') {
   // xbk_app._writeRunLog），O_NOFOLLOW 只作用于 readSafeTextResult 的读路径，写路径不做路径清洗
   // 或目录包含校验（审查 STG-07：原注释把后两者记为本模块写路径的防御层，口径有误，已改正）。
   //
-  // 另：写路径不含 fsync（文件与父目录），rename 的原子性只保证不出现半写文件，不保证掉电后持久性；
-  // 该取舍已在 SYSTEM_CONTRACT.md「原子写不含 fsync」记录（审查 STG-04，记录不修）。
+  // 审查 STG-04：写路径补 fsync——rename 之前先 fsync 临时文件，rename 之后尽力 fsync 父目录，
+  // 使「原子写」在掉电场景也成立（此前只对进程崩溃成立）。fsync 失败不再静默：文件 fsync 失败
+  // 走 catch → 删除 tmp 并返回 false（fail-closed，避免假装持久），目录 fsync 失败只告警。
   // 攻击者需先具备对项目根/缓存目录的写权限，风险等级低，接受现状（单实例 cron 信任本地文件系统）。
   if (!isRegularOrMissing(filePath)) {
     console.error(`拒绝写入非普通文件 ${label} ${filePath}`)
     return false
   }
   let tmpFile = ''
+  let fd = -1
   try {
     ensureParent(filePath)
     // 每次使用唯一临时文件，避免预置/竞态 .tmp 符号链接；rename 替换目标本身不会跟随目标链接。
     // S2245：Math.random 伪随机可预测（临时文件路径防预置/竞态），改加密随机
     tmpFile = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`
-    fs.writeFileSync(tmpFile, text, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+    fd = fs.openSync(tmpFile, 'wx', 0o600)
+    fs.writeFileSync(fd, text, { encoding: 'utf8' })
+    fs.fsyncSync(fd) // 内容先落盘，再 rename 提交
+    fs.closeSync(fd)
+    fd = -1
     fs.renameSync(tmpFile, filePath)
     tmpFile = ''
+    fsyncDirBestEffort(filePath)
     return true
   } catch (e) {
+    if (fd >= 0) { try { fs.closeSync(fd) } catch (e2) { /* 忽略 */ } }
     if (tmpFile) {
       try { fs.unlinkSync(tmpFile) } catch (e2) { /* 忽略清理失败 */ }
     }
@@ -87,6 +111,7 @@ function writeAtomicIfAbsent (filePath, text, label = '缓存初始化') {
     // wx 打开成功即证明该文件由本次调用创建；EEXIST 时 openSync 抛错、fd 仍为 -1，不会误删他人文件。
     fd = fs.openSync(filePath, 'wx', 0o600)
     fs.writeFileSync(fd, text, { encoding: 'utf8' })
+    fs.fsyncSync(fd) // 与 writeAtomic 同口径：内容落盘后再视为初始化成功（审查 STG-04）
     return true
   } catch (e) {
     if (e?.code === 'EEXIST') return true // 另一进程已创建：不覆盖，视为初始化成功
