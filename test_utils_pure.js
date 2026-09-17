@@ -226,6 +226,23 @@ check('hasValidId: id 为空串无效', () => {
 check('hasValidId: null 对象无效', () => {
   assert.strictEqual(Utils.hasValidId(null), false)
 })
+check('hasValidId: 继承得到的 id 不算有效 id（XBK-UTILS-P2-04，与 getMessageIdentity 同口径）', () => {
+  // 反例（改动前）：hasValidId 直接 safeGet(m,'id') 无 hasOwnProperty 前提，
+  // Object.create({id:'abc'}) → true；而 getMessageIdentity 要求自有属性 → invalid。
+  // 同一对象上两个判重入口结论相反，据 hasValidId 走 id 路径的调用方会与身份索引对不上。
+  const inherited = Object.create({ id: 'abc' })
+  assert.strictEqual(Utils.hasValidId(inherited), false, '原型链上的 id 不得被 hasValidId 判为有 id')
+  assert.strictEqual(Utils.getMessageIdentity(inherited).valid, false, '前置：getMessageIdentity 对继承 id 判无效')
+  // 自有属性路径不得被一并收紧
+  assert.strictEqual(Utils.hasValidId({ id: 123 }), true, '自有数字 id 仍有效')
+  assert.strictEqual(Utils.hasValidId({ id: 'abc' }), true, '自有字符串 id 仍有效')
+  assert.strictEqual(Utils.hasValidId(Object.assign(Object.create({ id: 'x' }), { id: 0 })), true, '自有数字 id 0 仍有效')
+  // 两个入口对同一对象的结论必须一致（防再次分裂）
+  for (const m of [{ id: 'a' }, { id: 0 }, { id: '' }, { id: null }, {}, inherited, Object.create({ id: 'z' })]) {
+    assert.strictEqual(Utils.hasValidId(m), Utils.getMessageIdentity(m).valid,
+      `hasValidId 与 getMessageIdentity 必须同判（keys=${JSON.stringify(Object.keys(m))}）`)
+  }
+})
 
 // ===== anonKey：匿名键 =====
 check('anonKey: 单参数生成匿名键', () => {

@@ -950,6 +950,12 @@ function createUtils (options = {}) {
     // v3.107 fuzz 发现：m 本身缺失/非对象时 m.id 会抛 TypeError；异常 getter 也按无效 id 处理。
     // 与 isValidItem 口径一致：排除数组（带自定义 id 属性的数组不视为有效条目）。
     if (m === undefined || m === null || typeof m !== 'object' || Array.isArray(m)) return false
+    // XBK-UTILS-P2-04：与 getMessageIdentity 同口径——只有**本对象自有**的 id 才算这条消息的 id。
+    // 否则 Object.create({id:'abc'}) 被本函数判为「有 id」，getMessageIdentity 却判 invalid，
+    // 同一对象上两个判重入口结论相反：调用方据本函数走 id 判重路径时会与身份索引对不上而丢消息。
+    let ownId = false
+    try { ownId = Object.prototype.hasOwnProperty.call(m, 'id') } catch (e) { ownId = false }
+    if (!ownId) return false
     const id = this.safeGet(m, 'id')
     if (id === undefined || id === null) return false
     const t = typeof id
