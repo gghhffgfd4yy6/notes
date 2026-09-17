@@ -13,9 +13,12 @@ function createApp ({
     try { return typeof crypto?.timingSafeEqual === 'function' && crypto.timingSafeEqual(actualBytes, expectedBytes) } catch (e) { return false }
   }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
-  // APP-05：日志/台账时间戳与日报（_reportToday）/告警统一到硬编码 Asia/Shanghai，避免进程
-  // 本地时区（如 CI runner 的 UTC）使同一时刻的 run.log 行与日报日界错位一天。sv-SE + 24 小时制
-  // 恰好输出 YYYY-MM-DD HH:mm:ss，与历史格式逐字符一致（不破坏日志解析）。中国无夏令时，日界稳定。
+  // APP-05：所有「按天/按时刻」的呈现口径统一到硬编码 Asia/Shanghai——日志与台账时间戳
+  // （_localStamp）、日报日界（_reportToday）、运行异常告警正文的时间、RE2 标记保留期的 cutoff。
+  // 进程本地时区（如 CI runner 的 UTC）不参与其中：混用会让同一时刻的 run.log 行、日报日界与
+  // 告警时间互相错位一天/八小时。sv-SE + 24 小时制恰好输出 YYYY-MM-DD HH:mm:ss，与历史格式
+  // 逐字符一致（不破坏日志解析），其 YYYY-MM-DD 前缀同时是 RE2 标记名与 cutoff 的比较键。
+  // 中国无夏令时，日界稳定。
   const shanghaiStampFormatter = new Intl.DateTimeFormat('sv-SE', {
     timeZone: 'Asia/Shanghai',
     year: 'numeric',
@@ -265,7 +268,10 @@ function createApp ({
         const alertText = '⚠️ xbk-push 运行异常'
         const safeReason = Utils.safeErrorText(errMsg, '未知错误')
         // v3.159：段落分隔 \n\n（与主推送/日报口径一致）——wxpusher Markdown 渲染单个 \n 可能挤成一行
-        const alertDesp = `接口/推送异常，请检查。\n\n时间：${new Date().toLocaleString('zh-CN')}\n\n原因：${safeReason.slice(0, 500)}`
+        // APP-05：正文里的「时间」也必须是上海口径——同一轮里 run.log 时间戳（上海）与告警正文时间
+        // （原为进程本地）会错开 8 小时/一天，CI runner（TZ=UTC）上告警显示的日期比日志早一天。
+        // 保持 zh-CN 的人类可读格式不变，只补 timeZone。
+        const alertDesp = `接口/推送异常，请检查。\n\n时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n\n原因：${safeReason.slice(0, 500)}`
         // v3.156：发送成功才写状态+打印——曾先写 lastAt（发送失败也限频，60s 内挡住重试，信息丢失）
         // v3.157：走 Pusher.send（曾直接 notify.sendNotify——无 10s 超时、无 surrogate 清洗，与主推送不一致）
         // v3.164：返回 promise 供 App.run catch await——曾 fire-and-forget，接口异常时主入口同步 process.exit(1)
@@ -466,7 +472,12 @@ function createApp ({
         const cacheDir = MessageStore.cacheDir
         const prefix = RE2_WARN_STATE_FILE + '.'
         const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) // 保留 7 天
-        const cutoffStamp = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, '0')}-${String(cutoff.getDate()).padStart(2, '0')}`
+        // APP-05：cutoff 与标记名必须同用上海日界。标记名来自 _localStamp()（已是上海），
+        // 而这里原先用进程本地的 getFullYear/getMonth/getDate——修复只统一了标记名，
+        // 日界基准被拆成两个：TZ=UTC 时标记名按 09-16 命名、cutoff 按 09-15 计算，保留期判定
+        // 随之偏移一天（该删的留着、不该删的先删）。sv-SE 的 YYYY-MM-DD 前缀与标记名同格式，
+        // 故直接复用 shanghaiStampFormatter，字符串比较口径不变。
+        const cutoffStamp = shanghaiStampFormatter.format(cutoff).slice(0, 10)
         for (const name of fs.readdirSync(cacheDir)) {
           if (!name.startsWith(prefix)) continue
           const markerStamp = name.slice(prefix.length).split('.')[0] // 取日期段，忽略 .pid.time.reclaim 后缀
