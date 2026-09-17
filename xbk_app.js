@@ -1359,51 +1359,61 @@ function createApp ({
         const contentMax = (() => { const v = Math.floor(Utils.num(Config.push.contentMax, 3000)); return v > 0 ? v : 3000 })()
 
         // 单条推送（两种模式共用）：成功返回 {ok:true} 并记录；失败警告且不写缓存(下次重试)
-        // APP-06（已知缺口，未收紧）：模板渲染段（safeObjectCopy/urlOf/Formatter.tuisong_replace/
-        // sanitizeSurrogates/truncateUtf16/链接保留）仍在下方 try 之外，渲染期异常会冒泡中止整轮
-        // （并行模式 Promise.all 直接 reject、saveBatch 不执行）。收紧需重排 pushOne 的 try 边界并
-        // 定义渲染异常的成功/失败归类与缓存写入时机，属推送结果判定语义，留待专门变更处理。
+        // APP-06：渲染段（safeObjectCopy/urlOf/Formatter.tuisong_replace/sanitizeSurrogates/
+        // truncateUtf16/链接保留 + dry-run preview）与发送段一样受 try 保护——渲染期异常按「单条
+        // 推送失败」处理（警告、不写缓存、下次重试），不再冒泡中止整轮：并行模式 Promise.all 会
+        // 整体 reject，saveBatch 根本不执行，本轮所有新数据都会漏写缓存。
         const pushOne = async (item, notifyModule) => {
-        // 推送内容截断：避免超长标题/内容被推送 API 拒绝（长度可配置，默认 100/3000）
-        // 用 UTF-16 安全截断（不切断 emoji 代理对）
-        // R9：title/content 非字符串（对象等脏数据）→ 空标题占位/空内容（避免 '[object Object]' 泄漏）
-          const pushItem = {
-            ...Utils.safeObjectCopy(item),
-            url: urlOf(item),
-            // v3.110：孤立代理清洗（encodeURIComponent 对孤立代理抛 URIError → 推送失败）
-            // R9/审查9-C 语义保留：非字符串或空串 title → (无标题) 占位；content 空串置空
-            title: (() => {
-              const value = readItemField(item, 'title')
-              return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' && value !== '' ? value : '(无标题)'), titleMax)
-            })(),
-            content: (() => {
-              const value = readItemField(item, 'content')
-              return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' ? value : ''), contentMax)
-            })()
-          }
-          // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
-          // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
-          const text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, pushItem), titleMax)
-          // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
-          // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
-          // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
-          const rawDesp = Formatter.tuisong_replace(contentTpl, pushItem)
-          const rawClean = Utils.sanitizeSurrogates(rawDesp)
-          let desp = Utils.truncateUtf16(rawClean, contentMax)
-          // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
-          const safePushUrl = Utils.safeUrl(pushItem.url)
-          if (rawClean.includes('原文链接') && !desp.includes('原文链接') && safePushUrl) {
-            const link = `原文链接：[${safePushUrl}](<${safePushUrl}>)`
-            // 链接本身超过 contentMax 时不保留（尊重截断配置）；否则内容截短补链接（仍 ≤ contentMax）
-            // v3.177：边界修正——link 接近 contentMax 时 contentMax-link-2 曾 ≤0，truncateUtf16 对非正
-            // max 返回原串 → desp 全量+链接显著超限（系统验证反证 #3）；改为「链接+分隔符完整容纳
-            // 才补」+ keep≥1 保证总长 ≤ contentMax（link+2 == contentMax 时 keep=0 会触发上述缺陷）
-            if (link.length + 2 < contentMax) {
-              const keep = contentMax - link.length - 2
-              desp = Utils.truncateUtf16(desp, keep) + '\n\n' + link
+          let text = ''
+          let desp = ''
+          try {
+            // 推送内容截断：避免超长标题/内容被推送 API 拒绝（长度可配置，默认 100/3000）
+            // 用 UTF-16 安全截断（不切断 emoji 代理对）
+            // R9：title/content 非字符串（对象等脏数据）→ 空标题占位/空内容（避免 '[object Object]' 泄漏）
+            const pushItem = {
+              ...Utils.safeObjectCopy(item),
+              url: urlOf(item),
+              // v3.110：孤立代理清洗（encodeURIComponent 对孤立代理抛 URIError → 推送失败）
+              // R9/审查9-C 语义保留：非字符串或空串 title → (无标题) 占位；content 空串置空
+              title: (() => {
+                const value = readItemField(item, 'title')
+                return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' && value !== '' ? value : '(无标题)'), titleMax)
+              })(),
+              content: (() => {
+                const value = readItemField(item, 'content')
+                return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' ? value : ''), contentMax)
+              })()
             }
+            // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
+            // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
+            text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, pushItem), titleMax)
+            // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
+            // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
+            // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
+            const rawDesp = Formatter.tuisong_replace(contentTpl, pushItem)
+            const rawClean = Utils.sanitizeSurrogates(rawDesp)
+            desp = Utils.truncateUtf16(rawClean, contentMax)
+            // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
+            const safePushUrl = Utils.safeUrl(pushItem.url)
+            if (rawClean.includes('原文链接') && !desp.includes('原文链接') && safePushUrl) {
+              const link = `原文链接：[${safePushUrl}](<${safePushUrl}>)`
+              // 链接本身超过 contentMax 时不保留（尊重截断配置）；否则内容截短补链接（仍 ≤ contentMax）
+              // v3.177：边界修正——link 接近 contentMax 时 contentMax-link-2 曾 ≤0，truncateUtf16 对非正
+              // max 返回原串 → desp 全量+链接显著超限（系统验证反证 #3）；改为「链接+分隔符完整容纳
+              // 才补」+ keep≥1 保证总长 ≤ contentMax（link+2 == contentMax 时 keep=0 会触发上述缺陷）
+              if (link.length + 2 < contentMax) {
+                const keep = contentMax - link.length - 2
+                desp = Utils.truncateUtf16(desp, keep) + '\n\n' + link
+              }
+            }
+            if (preview(text, desp)) return { item, ok: false, preview: true }
+          } catch (e) {
+            // 非 Error 兜底（R1）：与发送段同口径，内容渲染异常不得中止整轮推送
+            const failure = summarizeError(e)
+            failureInfos.push(failure)
+            console.log(`⚠️ 推送失败（内容渲染异常，不写入缓存，下次运行重试）: ${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】 ${failure.message || Utils.safeText(e)}`)
+            return { item, ok: false, failure }
           }
-          if (preview(text, desp)) return { item, ok: false, preview: true }
           try {
             const sent = await Pusher.send(text, desp, notifyModule)
             pushedKeys.add(keyOf(item))

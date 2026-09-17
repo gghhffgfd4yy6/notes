@@ -385,6 +385,41 @@ console.log('========================================\n');
     }
   })
 
+  await test('APP-06：单条渲染异常不再中止整轮（按单条失败处理并继续其余条目）', async () => {
+    reset()
+    setPushUrl('t03e_render_fail')
+    const previousDryRun = process.env.XBK_DRY_RUN
+    const logPath = path.join(CACHE_DIR, 'run.log')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    const logs = []
+    const originalLog = console.log
+    let previewCalls = 0
+    try {
+      // dry-run 的 preview() 位于渲染段末端：把它做成可注入故障，等价于「渲染期抛错」
+      process.env.XBK_DRY_RUN = '1'
+      fakeData = [makeItem({ id: 'render-fail-1' }), makeItem({ id: 'render-fail-2', title: '第二条' })]
+      console.log = (...args) => {
+        const line = args.join(' ')
+        if (line.startsWith('🧪 预览')) {
+          previewCalls++
+          throw new Error('render boom')
+        }
+        logs.push(line)
+      }
+      const summary = await xbk.run()
+      assert(previewCalls === 2, `渲染异常不得中止整轮：两条都应走到预览，实际 ${previewCalls} 条`)
+      assert(summary && summary.failures.length === 2, `渲染异常应按单条失败计入摘要，实际 ${JSON.stringify(summary && summary.failures)}`)
+      assert(summary.pushed === 0 && summary.failed === 0, `dry-run 摘要口径不变: ${JSON.stringify(summary)}`)
+      assert(logs.some(l => l.includes('内容渲染异常')), '渲染异常应有明确的失败日志')
+    } finally {
+      console.log = originalLog
+      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = previousDryRun
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+      try { fs.unlinkSync(path.join(CACHE_DIR, 't03e_render_fail.json')) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('身份无效条目单独对账（APP-04：终端 + run.log noidentity=）', async () => {
     reset()
     setPushUrl('t03d_no_identity')
