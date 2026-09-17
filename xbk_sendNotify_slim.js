@@ -803,8 +803,26 @@ function parseWxPusherChannels () {
   if (configKey === wxPusherParsedConfigKey) return wxPusherParsedChannels
 
   let raw = configuredRaw
+  // F4：多应用配置被丢弃时此前完全静默——用户看到「推送成功」，其余应用却一条没收到。
+  // 不改变解析口径（合法数组仍优先、仍回退旧字段），只把丢弃原因与条数打到日志，让配置失效可见。
+  const warnDropped = (reason) => {
+    console.warn(`⚠️ WX_pusher_channels ${reason}，已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）`)
+  }
+  // 「配置了值」判定：非空白字符串、或非 null 的其它类型（空串/纯空白视为未配置，沿用既有语义不告警）
+  const configuredText = typeof configuredRaw === 'string' ? configuredRaw.trim() : ''
+  const wxChannelsConfigured = configuredRaw !== null && configuredRaw !== undefined &&
+    (typeof configuredRaw !== 'string' || configuredText !== '')
   if (typeof raw === 'string') {
-    try { raw = JSON.parse(raw) } catch (e) { raw = [] }
+    if (configuredText === '') {
+      raw = []
+    } else {
+      try {
+        raw = JSON.parse(raw)
+      } catch (e) {
+        warnDropped('不是合法 JSON')
+        raw = []
+      }
+    }
   }
   const list = Array.isArray(raw) ? raw : []
   const channels = list.map((item) => {
@@ -818,6 +836,12 @@ function parseWxPusherChannels () {
     wxPusherParsedConfigKey = configKey
     wxPusherParsedChannels = channels
     return channels
+  }
+  if (wxChannelsConfigured) {
+    if (list.length) warnDropped(`的 ${list.length} 项均缺 appToken 或 topicIds`)
+    // 只有「配了值但不是数组」才提示形状错误（JSON 解析失败已在上面单独告警）；显式空数组（含 JSON '[]'）
+    // 是「明确不启用多应用」，回退旧字段属既有语义，不重复告警。
+    else if (!Array.isArray(raw)) warnDropped('不是数组（应为 [{ appToken, topicIds }]）')
   }
   const appToken = safeString(push_config.WX_pusher_appToken).trim()
   const topicIds = safeString(push_config.WX_pusher_topicIds).split(',').map(s => s.trim()).filter(Boolean)
