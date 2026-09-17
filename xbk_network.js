@@ -152,7 +152,8 @@ function createNetwork ({
         if (PROFILE3) logger.log(`[profile api attempt] start=${attempt + 1}/${maxRetry + 1}`)
         try {
           // retry: { limit: 0 } 关闭 got 内置重试（连带 got 自带 Retry-After 处理一并失效），交给外层手写逻辑
-          // net-7：外层退避不读 Retry-After，429/408/425 统一按固定指数退避重试（是否遵守 Retry-After 待决策）
+          // net-7（返工订正）：外层退避**已**遵守 Retry-After——下方 catch 经 parseRetryAfterMs 取合法形态，
+          // 命中即按服务端指示等待、缺失/非法才回落指数退避，两条路径同受 RETRY_BACKOFF_CAP_MS 上限保护。
           const result = await fetchJson(Config.api.pushUrl, {
             timeout: resolveTimeoutMs(), // net-3：非法 timeout 告警 + 回落默认，不得原样传入 HTTP 层
             retry: { limit: 0 },

@@ -79,7 +79,7 @@ module.exports = {
   thresholds: { high: 80, low: 60, break: null },
   // reporters：'json' 是报告链的硬依赖，不可随手删——scripts/mutation-report.js 经 scripts/mutation-json.js
   // 读 reports/mutation/mutation.json。本文件刻意不写 jsonReporter.fileName/htmlReporter.fileName，靠
-  // Stryker 默认值（reports/mutation/mutation.json、reports/mutation.html）与 mutation.yml 的 artifact
+  // Stryker 默认值（reports/mutation/mutation.json、reports/mutation/mutation.html）与 mutation.yml 的 artifact
   // 路径、scripts/mutation-report.js 的查找口径隐式对齐；'clear-text' 供 CI 日志阅读。
   // 代价（审查 F-04，low）：command runner 把每个变异体的整段测试输出写进 statusReason，单个
   // mutation.json 可达 500MB+（见 scripts/mutation-json.js:2-6 的自述），而 .github/workflows/mutation.yml
