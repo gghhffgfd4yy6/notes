@@ -304,4 +304,51 @@ function schemaReport (seg, mutants) {
     'mutation.yml 的汇总步骤必须注入 MUTATION_RUN_STARTED_AT: ' + '${' + '{ github.run_started_at }}')
 }
 
+// 场景 12（F1 返工 · workflow 兜底层）：清理缓存回填的旧报告是 mtime 不可靠时**唯一不依赖文件时间**
+// 的防线（崩溃段没有 mutation.json → validateSegments 直接拒绝）。V4 打回的两个洞：
+//   ① 没有 `if: always()`：位于它之前、可能失败的步骤（npm ci / 下载+验证 re2）一旦失败，清理被跳过，
+//      而「上传变异报告」是 `if: always()` → 回填报告仍被上传。必须补 `if: always()` **并前置到
+//      缓存恢复之后**（两层才真正互补）；
+//   ② `rm -rf reports/mutation reports/mutation.html` 的第二个路径是死参数（stryker 默认
+//      reports/mutation/mutation.html，schema:754/766）→ 精简为只删目录。
+{
+  const yml = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'mutation.yml'), 'utf8')
+  const all = yml.split('\n')
+  // 只在 matrix job（`  mutation:` … 下一个顶层 job）里定位步骤：prepare-re2 也有「安装依赖」等同名步骤，
+  // 全文 findIndex 会命中上一个 job。
+  const jobStart = all.findIndex(l => /^ {2}mutation:\s*$/.test(l))
+  let jobEnd = all.length
+  for (let i = jobStart + 1; i < all.length; i++) {
+    if (/^ {2}\S/.test(all[i])) { jobEnd = i; break }
+  }
+  assert.ok(jobStart >= 0 && jobEnd > jobStart, 'mutation.yml 必须能定位 matrix job（  mutation: … 下一个顶层 job）')
+  const lines = all.slice(jobStart, jobEnd)
+  const stepStart = (name) => lines.findIndex(l => l.trim() === `- name: ${name}`)
+  const stepBlock = (name) => {
+    const start = stepStart(name)
+    assert.ok(start >= 0, `mutation.yml 必须存在步骤「${name}」`)
+    let end = lines.length
+    for (let i = start + 1; i < lines.length; i++) {
+      const t = lines[i].trim()
+      if (t.startsWith('- uses:') || t.startsWith('- name:') || t.startsWith('- id:')) { end = i; break }
+    }
+    return { text: lines.slice(start, end).join('\n'), start }
+  }
+  const cleanup = stepBlock('清理缓存回填的旧报告')
+  const restore = stepStart('恢复增量缓存')
+  const install = stepStart('安装依赖')
+  const stryker = stepStart('变异测试（' + '${' + '{ matrix.name }}）')
+  assert.ok(restore >= 0 && install >= 0 && stryker >= 0,
+    '矩阵 job 的步骤名必须可定位（恢复增量缓存 / 安装依赖 / 变异测试）')
+  assert.ok(/^\s*if: always\(\)\s*$/m.test(cleanup.text),
+    'F1 兜底：清理步骤必须带 if: always()（其前序步骤失败时不得被跳过，否则回填报告仍会被 if: always() 的上传步骤带上）')
+  assert.ok(cleanup.start > restore, 'F1 兜底：清理步骤必须前置在「恢复增量缓存」之后（否则缓存里的旧报告先被恢复、没人清）')
+  assert.ok(cleanup.start < install, 'F1 兜底：清理步骤必须在「安装依赖」等可能失败的步骤之前')
+  assert.ok(cleanup.start < stryker, 'F1 兜底：清理步骤必须在 stryker 之前（否则清掉的是本次产出）')
+  assert.ok(/run:\s*rm -rf reports\/mutation\s*$/m.test(cleanup.text),
+    `F1 兜底：清理命令必须恰为 rm -rf reports/mutation，实际：${JSON.stringify(cleanup.text)}`)
+  assert.ok(!cleanup.text.includes('reports/mutation.html'),
+    'reports/mutation.html 是死参数（stryker 实际默认 reports/mutation/mutation.html），必须精简掉')
+}
+
 console.log('test_mutation_report_cli OK')

@@ -192,6 +192,22 @@ jobs:
           restore-keys: |
             stryker-${{ matrix.name }}-
 
+      # F1：缓存（path: reports）会把上一次运行的 reports/mutation/mutation.json 一并恢复，而 stryker 的
+      # json 报告不含任何时间戳（内容上无法与本次产出区分）。若本段 stryker 崩溃/被 6h 取消，这个陈旧报告
+      # 会被 artifact 原样带上、被日报当成「本次结果」发布。这里先删掉旧报告产物，让「本段没产出报告」表现
+      # 为「缺 mutation-report.json」——mutation-report.js 的完整性闸门会直接拒绝发布（不依赖文件时间，
+      # 是 mtime 不可靠时的兜底；scripts/mutation-report.js 的 validateFreshness 是另一层）。
+      # 只删报告产物目录，保留 reports/inc-<段>.json（--incremental 的断点续跑基线）。
+      # 返工（V4 打回）：① 必须紧跟缓存恢复、且在「安装依赖 / 下载+验证 re2」等**可能失败的步骤之前**，
+      # 否则那一步失败时清理被跳过；② 必须带 `if: always()`——否则前序步骤失败时本步骤同样被跳过，而
+      # 「上传变异报告」是 `if: always()`，回填报告仍会被上传，此时唯一防线就剩 mtime 层（不可靠）。
+      # ③ 命令精简为只删 reports/mutation（stryker 默认 jsonReporter=reports/mutation/mutation.json、
+      # htmlReporter=reports/mutation/mutation.html，见 mutation-testing-report-schema:754/766；
+      # 原来的第二个路径 reports/mutation.html 是死参数）。
+      - name: 清理缓存回填的旧报告
+        if: always()
+        run: rm -rf reports/mutation
+
       - name: 安装依赖
         run: npm ci --ignore-scripts
 
@@ -204,15 +220,6 @@ jobs:
       - name: 验证 re2 原生模块
         run: |
           node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
-
-      # F1：缓存（path: reports）会把上一次运行的 reports/mutation/mutation.json 一并恢复，而 stryker 的
-      # json 报告不含任何时间戳（内容上无法与本次产出区分）。若本段 stryker 崩溃/被 6h 取消，这个陈旧报告
-      # 会被 artifact 原样带上、被日报当成「本次结果」发布。这里先删掉旧报告产物，让「本段没产出报告」表现
-      # 为「缺 mutation-report.json」——mutation-report.js 的完整性闸门会直接拒绝发布（不依赖文件时间，
-      # 是 mtime 不可靠时的兜底；scripts/mutation-report.js 的 validateFreshness 是另一层）。
-      # 只删报告产物目录，保留 reports/inc-<段>.json（--incremental 的断点续跑基线）。
-      - name: 清理缓存回填的旧报告
-        run: rm -rf reports/mutation reports/mutation.html
 
       - name: 变异测试（${{ matrix.name }}）
         run: npx stryker run --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 2
