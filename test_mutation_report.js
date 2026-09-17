@@ -8,7 +8,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const {
-  render, validateSegments, shanghaiDate, escCell, countMutant,
+  render, validateSegments, validateFreshness, resolveMaxSkewMs, shanghaiDate, escCell, countMutant,
   collectStats, findReportJson, analyzeSegment, analyze, postIssue
 } = require('./scripts/mutation-report.js')
 
@@ -178,6 +178,46 @@ check('validateSegments 分段重复时拒绝发布', () => {
   )
 })
 
+// ===== F1：新鲜度闸门（缓存回填的陈旧报告）=====
+// 报告内容与 stryker schema 完全合法，但文件时间远早于当日其它段——这正是「某段 stryker 崩溃/被 6h
+// 取消 → artifact 里是 actions/cache 恢复的上一次运行产物」的形态。旧实现只做名称级校验 → 照发日报。
+check('validateFreshness 正常跨度放行、陈旧段拒绝、可显式关闭', () => {
+  const H = 3600 * 1000
+  const now = Date.now()
+  const fresh = [{ seg: 'a', reportMtimeMs: now }, { seg: 'b', reportMtimeMs: now - 5.9 * H }]
+  assert.deepStrictEqual(validateFreshness(fresh), fresh, '6h 内的正常跨度（单 job 上限）必须放行')
+  const withinThreshold = [{ seg: 'a', reportMtimeMs: now }, { seg: 'b', reportMtimeMs: now - 11.9 * H }]
+  assert.deepStrictEqual(validateFreshness(withinThreshold), withinThreshold, '阈值内的跨度放行')
+  const stale = [{ seg: 'a', reportMtimeMs: now }, { seg: 'b', reportMtimeMs: now - 24 * H }]
+  assert.throws(
+    () => validateFreshness(stale),
+    /疑似缓存回填（陈旧）：b（报告文件时间比最新报告早 24 小时）/,
+    '跨日缓存回填（24h）必须拒绝发布并指出段名与偏差'
+  )
+  // 阈值确实在起作用（把窗口压到 1h，5.9h 的跨度即判陈旧）——证明结论来自阈值比较而非巧合
+  assert.throws(() => validateFreshness(fresh, 1 * H), /疑似缓存回填（陈旧）：b/)
+  // 可比对象不足 / error 段 / 缺 mtime 的段不得被当成「陈旧」误红（误红会阻断正常日报）
+  assert.deepStrictEqual(validateFreshness([{ seg: 'a', reportMtimeMs: now }]), [{ seg: 'a', reportMtimeMs: now }])
+  const mixed = [{ seg: 'a', reportMtimeMs: now }, { seg: 'b', error: '缺 mutation-report.json' }, { seg: 'c' }]
+  assert.deepStrictEqual(validateFreshness(mixed), mixed, 'error 段/无 mtime 段不参与比较')
+  // 显式关闭（≤0）
+  assert.deepStrictEqual(validateFreshness(stale, 0), stale, 'maxSkewMs=0 关闭闸门')
+})
+
+check('resolveMaxSkewMs 阈值解析（默认 12h / off 与 ≤0 关闭 / 非法值回落默认）', () => {
+  const DEFAULT = 12 * 3600 * 1000
+  assert.strictEqual(resolveMaxSkewMs(undefined), DEFAULT, '缺省 12h')
+  assert.strictEqual(resolveMaxSkewMs(null), DEFAULT, 'null 按缺省')
+  assert.strictEqual(resolveMaxSkewMs(''), DEFAULT, '空串按缺省')
+  assert.strictEqual(resolveMaxSkewMs('   '), DEFAULT, '全空白按缺省')
+  assert.strictEqual(resolveMaxSkewMs('off'), 0, 'off 关闭')
+  assert.strictEqual(resolveMaxSkewMs(' OFF '), 0, '大小写与空白不敏感')
+  assert.strictEqual(resolveMaxSkewMs('0'), 0, '0 关闭')
+  assert.strictEqual(resolveMaxSkewMs('-5'), 0, '负数关闭')
+  assert.strictEqual(resolveMaxSkewMs('3600000'), 3600000, '显式毫秒生效')
+  assert.strictEqual(resolveMaxSkewMs('abc'), DEFAULT, '无法解析 → 回落默认（不得静默关掉闸门）')
+})
+
 // ===== escCell：Markdown 表格单元格转义 =====
 check('escCell 转义竖线/反斜杠/换行/反引号', () => {
   assert.strictEqual(escCell('hello'), 'hello')
@@ -258,8 +298,14 @@ try {
     assert.strictEqual(r.killed, 1); assert.strictEqual(r.survived, 1)
     assert.strictEqual(r.noCoverage, 1); assert.strictEqual(r.timeout, 1)
     assert.strictEqual(r.score, 50)
+    // F1：正常段必须带上报告文件时间（新鲜度闸门的输入）；取不到时间的段会被排除在比较之外
+    assert.strictEqual(r.reportPath, path.join(d, 'mutation.json'), '正常段应返回报告路径')
+    assert.ok(Number.isFinite(r.reportMtimeMs), `正常段应返回可比较的 mtime，实际 ${r.reportMtimeMs}`)
+    assert.ok(Math.abs(r.reportMtimeMs - fs.statSync(path.join(d, 'mutation.json')).mtimeMs) < 1,
+      '返回的 mtime 必须是该报告文件自身的时间')
     const missing = analyzeSegment(tmp, { name: 'mutation-report-nonexist' })
     assert.strictEqual(missing.error, '缺 mutation-report.json')
+    assert.strictEqual(missing.reportMtimeMs, undefined, '缺报告的段不带时间（不参与新鲜度比较）')
   })
 
   // F4：报告顶层为 null/原始值时显式失败并走段级隔离。
@@ -395,6 +441,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     global.fetch = async function (url, opts) {
       const r = responses[callIdx++]
       if (!r) throw new Error(`unexpected fetch call #${callIdx}: ${url}`)
+      if (r instanceof Error) throw r // F7：模拟网络异常/超时拒绝（不是响应对象）
       r.capturedUrl = url
       r.capturedOpts = opts
       return r
@@ -498,6 +545,70 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     const createRes = makeRes(false, 403, { message: 'Forbidden' })
     mockFetch([listRes, createRes])
     await assert.rejects(() => postIssue('body'), /发 Issue 失败，HTTP 状态码：403/)
+  })
+
+  // F7：列表 API 返回 200 但响应体非 JSON（代理页/限流说明页）——旧实现 `await listRes.json()` 未包 try，
+  // SyntaxError 逃出 postIssue，当天日报直接不发。现在必须降级为「跳过去重直接创建」并 warn 留痕，
+  // 且 warn 文本不得含换行（防伪造日志行）。
+  await acheck('postIssue 列表查询 200 非 JSON 时降级为直接创建并 warn（不再抛 SyntaxError）', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = {
+      ok: true,
+      status: 200,
+      json: async () => { throw new SyntaxError('Unexpected token <\nin JSON at position 0') },
+      text: async () => '<html>'
+    }
+    const createdIssue = { number: 102, html_url: 'https://github.com/owner/repo/issues/102' }
+    const createRes = makeRes(true, 201, createdIssue)
+    mockFetch([listRes, createRes])
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      const result = await postIssue('body')
+      assert.strictEqual(result.number, 102, '200 非 JSON 的列表响应应降级为直接创建')
+    } finally {
+      console.warn = origWarn
+    }
+    assert.strictEqual(warns.length, 1, `应恰好 warn 一次，实际 ${warns.length} 次：${JSON.stringify(warns)}`)
+    assert.ok(warns[0].includes('Unexpected token <'), `warn 应带根因，实际：${warns[0]}`)
+    assert.ok(!/[\r\n]/.test(warns[0]), `warn 文本不得含换行，实际：${JSON.stringify(warns[0])}`)
+  })
+
+  // F7：列表查询网络异常/超时——旧实现会让整个 postIssue 失败；现按同一口径降级为直接创建。
+  await acheck('postIssue 列表查询网络异常时降级为直接创建并 warn', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const timeoutErr = new Error('The operation was aborted due to timeout')
+    timeoutErr.name = 'TimeoutError'
+    const createdIssue = { number: 103, html_url: 'https://github.com/owner/repo/issues/103' }
+    const createRes = makeRes(true, 201, createdIssue)
+    mockFetch([timeoutErr, createRes])
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      const result = await postIssue('body')
+      assert.strictEqual(result.number, 103, '列表查询超时应降级为直接创建')
+    } finally {
+      console.warn = origWarn
+    }
+    assert.strictEqual(warns.length, 1, `应恰好 warn 一次，实际 ${warns.length} 次`)
+    assert.ok(warns[0].includes('aborted due to timeout'), `warn 应带根因，实际：${warns[0]}`)
+  })
+
+  // F7：去重列表查询必须带 AbortSignal 超时（旧实现 fetch 无超时，列表接口挂住会拖死整个 report job）。
+  await acheck('postIssue 列表查询携带 AbortSignal 超时', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(true, 200, [])
+    const createRes = makeRes(true, 201, { number: 104, html_url: 'https://github.com/owner/repo/issues/104' })
+    mockFetch([listRes, createRes])
+    await postIssue('body')
+    assert.ok(listRes.capturedOpts.signal instanceof AbortSignal,
+      '列表查询必须带 AbortSignal 超时（无超时会让日报 job 无限等待）')
+    assert.strictEqual(createRes.capturedOpts.signal, undefined, '发 Issue 请求不应被列表查询的超时信号绑住')
   })
 
   // 恢复原始环境变量和 fetch

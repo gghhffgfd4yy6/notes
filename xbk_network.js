@@ -2,6 +2,52 @@
 
 // 🌐 Network — 网络请求层（从 xbk_function_v3.js 独立准备，暂不接入主入口）
 // 依赖全部由组合根注入，避免反向 require 主入口及重复单例。
+//
+// net-1：PERMANENT_CODES 目前组合根尚未接线（xbk_function_v3.js 只注入 RETRYABLE_CODES），缺省回落到
+// xbk_failure_policy 的同名导出——该模块是无状态常量/纯函数模块，直接 require 不产生反向依赖或重复
+// 单例；若日后组合根改为显式注入，注入值优先，语义不变。
+const { PERMANENT_CODES: POLICY_PERMANENT_CODES } = require('./xbk_failure_policy')
+
+// net-1：请求层本地「确定性失败」码——重试同一个请求不会改变结果（响应体超过 maxBody 是确定性的），
+// 但 xbk_failure_policy 未把该码列进 PERMANENT_CODES（该模块对未知码按「保守重试」处理，见其头部口径），
+// 故只在请求层单列，不改动失败分类模块的语义（常驻循环仍按策略归类决定下一轮）。
+const DETERMINISTIC_LOCAL_CODES = new Set(['EBODYLIMIT'])
+
+// net-3：请求超时的合法性口径——只有「≥100ms 的整数」才采用，其余一律回落默认 5000ms 并告警：
+//   * got 把数值 timeout 直接交给定时器，小数与超 2^31-1 的值会被 Node 归一到约 1ms（每次请求瞬间超时）；
+//   * 亚 100ms 的值几乎只可能来自「想写秒却按毫秒填」的单位误填（timeout:5 想表达 5 秒）——采用它等于
+//     每次请求必然超时，且现象是「请求超时」而非「配置有问题」，比回落默认值更糟；
+//   * 非整数不猜用户意图（不四舍五入/不向上取整），一律按非法配置处理。
+const MIN_TIMEOUT_MS = 100
+const MAX_TIMEOUT_MS = 2147483647
+const DEFAULT_TIMEOUT_MS = 5000
+
+// net-7：重试退避上限（指数退避与 Retry-After 两条路径共用）。上游给出天文数字的等待时不得把单轮
+// fetchData 挂死；30s 也足以覆盖限流窗口内的常规 Retry-After。
+const RETRY_BACKOFF_CAP_MS = 30000
+
+// net-7：解析 Retry-After（RFC 9110：delta-seconds 非负整数，或 HTTP-date）→ 毫秒。
+// 只认这两种合法形态，其余（空串、'1.5'、'-5'、非日期文本）返回 null 交由指数退避兜底——
+// 不做宽松猜测，避免把笔误当成等待时长。HTTP-date 已过期 → 0（立即重试，语义同 RFC）。
+function parseRetryAfterMs (value, now = Date.now()) {
+  if (value === undefined || value === null) return null
+  const raw = String(value).trim()
+  if (raw === '') return null
+  if (/^[0-9]+$/.test(raw)) return Number(raw) * 1000
+  if (!/[A-Za-z]/.test(raw)) return null // delta-seconds 之外的数字/符号形态（-5、1.5、+3）一律非法
+  const at = Date.parse(raw)
+  if (!Number.isFinite(at)) return null
+  return Math.max(0, at - now)
+}
+
+// net-7：从错误对象上取 Retry-After。真实链路（xbk_http/got）给的是小写键的普通对象，兼容 WHATWG Headers。
+function readRetryAfterMs (e, now = Date.now()) {
+  const headers = e && e.response && e.response.headers
+  if (!headers) return null
+  const value = typeof headers.get === 'function' ? headers.get('retry-after') : headers['retry-after']
+  return parseRetryAfterMs(value, now)
+}
+
 function createNetwork ({
   Config,
   Utils,
@@ -10,10 +56,22 @@ function createNetwork ({
   getNotify,
   crypto,
   RETRYABLE_CODES,
+  PERMANENT_CODES = POLICY_PERMANENT_CODES,
   PKG_VERSION = '3.x',
   PROFILE3 = false,
   logger = console
 }) {
+  // net-3：解析 api.timeout（口径见文件头 MIN_TIMEOUT_MS 说明）。被判非法的值不静默——告警留痕，便于把
+  // 「请求超时」定位回「配置有问题」（非数值输入经 Utils.num 已回落到默认，与合法填写的默认值不可区分，
+  // 保持原语义不告警）；注入的 logger 未提供 warn 时退化为不告警（不得因此抛错）。
+  const resolveTimeoutMs = () => {
+    const n = Utils.num(Config.api.timeout, DEFAULT_TIMEOUT_MS)
+    if (Number.isInteger(n) && n >= MIN_TIMEOUT_MS) return Math.min(n, MAX_TIMEOUT_MS)
+    if (typeof logger.warn === 'function') {
+      logger.warn(`[xbk_network] api.timeout=${String(Config.api.timeout)} 非法（须为 ≥${MIN_TIMEOUT_MS}ms 的整数），已回落默认 ${DEFAULT_TIMEOUT_MS}ms`)
+    }
+    return DEFAULT_TIMEOUT_MS
+  }
   return {
     /**
        * 拉取数据，失败自动重试
@@ -55,13 +113,7 @@ function createNetwork ({
           // retry: { limit: 0 } 关闭 got 内置重试（连带 got 自带 Retry-After 处理一并失效），交给外层手写逻辑
           // net-7：外层退避不读 Retry-After，429/408/425 统一按固定指数退避重试（是否遵守 Retry-After 待决策）
           const result = await fetchJson(Config.api.pushUrl, {
-            timeout: (() => {
-              // net-3：got 把数值 timeout 直接交给定时器，小数/超 2^31-1 会被 Node 归一到约 1ms
-              // （每次请求瞬间超时）——统一钳到 [1, 2147483647] 整数；非正值沿用默认 5000
-              const n = Utils.num(Config.api.timeout, 5000)
-              if (!(n > 0)) return 5000
-              return Math.min(Math.max(1, Math.ceil(n)), 2147483647)
-            })(), // 非法 timeout 只告警不应原样传入 HTTP 层
+            timeout: resolveTimeoutMs(), // net-3：非法 timeout 告警 + 回落默认，不得原样传入 HTTP 层
             retry: { limit: 0 },
             headers: {
               'User-Agent': `xbk-push-script/${PKG_VERSION}`,
@@ -72,6 +124,11 @@ function createNetwork ({
           return result
         } catch (e) {
           lastErr = e
+          // net-1：不可重试判定不能只看 HTTP 状态码——无 response 的错误（JSON 契约错误 ERR_BODY_NOT_JSON、
+          // 证书类 CERT_HAS_EXPIRED、URL/参数类 ERR_INVALID_URL 等）在 PERMANENT_CODES 里是明确的永久性
+          // 错误，旧实现会退避重试满 maxRetry 次（白白空转 1s+2s+4s…）；EBODYLIMIT 同理（确定性失败）。
+          // 未知错误码一律保持旧口径（继续重试），不因本改动扩大「不重试」的范围。
+          if (e.code && (PERMANENT_CODES.has(e.code) || DETERMINISTIC_LOCAL_CODES.has(e.code))) throw e
           // 4xx 客户端错误：重试也没用，直接抛出（限流/临时性状态码除外——408/409/425/429 可能瞬时，值得重试）
           // P2（审查 2026-08-15）：可重试状态码收敛到 xbk_failure_policy.RETRYABLE_CODES 单一来源，
           // 曾内联硬编码 429/408/409 漏掉 425（failure_policy 判 retryable 而 fetchData 立即抛，两份清单漂移）。
@@ -80,10 +137,17 @@ function createNetwork ({
             if (sc !== undefined && sc < 500 && !RETRYABLE_CODES.has('HTTP_' + sc)) throw e
           }
           if (attempt < maxRetry) { // v3.157：用兜底后的 maxRetry（曾用原始 Config.api.retry，非法类型时与实际重试不一致）
-            // 退避等待：1s、2s、4s、8s...指数退避（注：README 未声明本函数退避口径，README:68 的
-            // 「指数退避」指常驻轮询入口）；封顶 30s 防长挂，+0-500ms 随机抖动避免多实例同时重试
-            const wait = Math.min(1000 * 2 ** attempt, 30000) + crypto.randomInt(500)
-            logger.log(`请求失败（${Utils.safeErrorText(e, 'unknown')}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）...`)
+            // net-7：服务端显式给了 Retry-After（429/408/425/503 常见）就按它等——外层手写退避曾完全不读它，
+            // 结果是在限流窗口内按固定指数退避反复撞墙；缺失/非法时回落指数退避（1s、2s、4s…）。
+            // 两条路径都受 RETRY_BACKOFF_CAP_MS 上限保护；Retry-After 是服务端给的回访时刻，不叠加抖动，
+            // 指数退避保留 +0-500ms 抖动避免多实例同时重试（注：README 未声明本函数退避口径，
+            // README:68 的「指数退避」指常驻轮询入口）。
+            const retryAfterMs = readRetryAfterMs(e)
+            const byServer = retryAfterMs !== null
+            const wait = byServer
+              ? Math.min(retryAfterMs, RETRY_BACKOFF_CAP_MS)
+              : Math.min(1000 * 2 ** attempt, RETRY_BACKOFF_CAP_MS) + crypto.randomInt(500)
+            logger.log(`请求失败（${Utils.safeErrorText(e, 'unknown')}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）${byServer ? '（按 Retry-After）' : ''}...`)
             await new Promise(resolve => setTimeout(resolve, wait))
           }
         }
@@ -95,4 +159,4 @@ function createNetwork ({
   }
 }
 
-module.exports = { createNetwork }
+module.exports = { createNetwork, parseRetryAfterMs }
