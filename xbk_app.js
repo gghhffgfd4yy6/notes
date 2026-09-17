@@ -754,11 +754,24 @@ function createApp ({
         const now = Date.now()
         const alerts = []
         for (const channel of succeeded) {
-          const entry = state[channel]
-          if (entry && this._safeCounter(entry.consecutiveFailures) >= threshold) {
+          const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
+          const failures = this._safeCounter(entry.consecutiveFailures)
+          const recoverPending = entry.recoverAlertPending === true
+          if (failures >= threshold || recoverPending) {
+            // APP2-02：恢复告警只能在「确认送达」后清零计数——此处先保留失败计数与
+            // recoverAlertPending（发送成功后再于告警循环里清零落盘）。原实现发送前即清零点外写盘，
+            // 恢复通知一旦发送失败就永久丢失（后续轮次因计数已清零不再触发恢复告警）。
+            state[channel] = {
+              consecutiveFailures: failures,
+              lastFailureAt: this._safeCounter(entry.lastFailureAt),
+              lastAlertAt: this._safeCounter(entry.lastAlertAt),
+              lastRecoveredAt: now,
+              recoverAlertPending: true
+            }
             alerts.push({ type: 'recovered', channel })
+          } else {
+            state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: now }
           }
-          state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: now }
         }
         for (const [channel, failure] of failed) {
           if (succeeded.has(channel)) continue
@@ -781,6 +794,11 @@ function createApp ({
             await Pusher.send(text, desp)
             // APP2-01：失败告警的 lastAlertAt 已在排入告警时落盘（按尝试计时），此处不再回填，
             // 避免发送成功与否改变限频口径。
+            // APP2-02：恢复通知确认送达后才清零计数并落盘；发送失败走 catch，保留 pending 供下轮重发。
+            if (alert.type === 'recovered' && state[alert.channel] && state[alert.channel].recoverAlertPending) {
+              state[alert.channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: Date.now() }
+              this._writeState(statePath, state)
+            }
           } catch (e) { /* 健康告警失败不得影响主推送、缓存或下一次重试 */ }
         }
       } catch (e) {

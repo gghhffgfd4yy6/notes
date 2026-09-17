@@ -2465,6 +2465,49 @@ console.log('========================================\n');
     }
   })
 
+  await test('APP2-02：恢复告警发送失败不丢通知（保留 pending 并在下一轮重发）', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalFailures = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const originalInterval = Config.channelHealth && Config.channelHealth.intervalMs
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_recover_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    const statePath = path.join(stateDir, 'channel-health.state')
+    const origNotifyFail = notifyFail
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = true
+      Config.channelHealth.consecutiveFailures = 2
+      Config.channelHealth.intervalMs = 3600000
+      // 两轮失败让 telegram 达到阈值（失败告警正常送达）
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      // 通道恢复但告警通道挂：恢复通知发送失败，不得落盘清零
+      notifyFail = true
+      await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      let state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(state.telegram.consecutiveFailures === 2, `恢复通知未送达时应保留失败计数，实际 ${state.telegram.consecutiveFailures}`)
+      assert(state.telegram.recoverAlertPending === true, '恢复通知未送达时应保留 pending 标记')
+      // 告警通道恢复：下一轮必须重发恢复通知，送达后才清零
+      notifyFail = false
+      pushCalls.length = 0
+      await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      assert(pushCalls.some(c => c.text.includes('通道恢复')), '恢复通知应在下一轮重发')
+      state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(state.telegram.consecutiveFailures === 0, `送达后应清零，实际 ${state.telegram.consecutiveFailures}`)
+      assert(state.telegram.recoverAlertPending === undefined, '送达后应移除 pending 标记')
+    } finally {
+      notifyFail = origNotifyFail
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalFailures
+      Config.channelHealth.intervalMs = originalInterval
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('APP2-01：告警通道不可用时失败告警仍按 intervalMs 限频（按告警尝试计时）', async () => {
     reset()
     const originalCacheDir = Config.cache.dir
