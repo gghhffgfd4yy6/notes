@@ -8561,6 +8561,39 @@ console.log('========================================\n');
     assertEqual(keep.includes('title="see onerror=x"'), true, `标签内属性值不应被改写: ${keep}`)
   })
 
+  await test('sanitizeDecodedHtml 杂散引号伪属性对不得屏蔽后续事件属性（XBK-UTILS-P2-01 安全）', () => {
+    // 反例（改动前）：`<img foo=a"b=" onerror="alert(1)">` 中 foo 是**未加引号**值 `a"b="`，
+    // 所含杂散引号让回扫得到伪属性对 `b=" onerror="`——该段闭合引号其实是 onerror 值的**开启**引号。
+    // 整段占位后 onerror 的属性名被藏进占位符，_stripEventAttrs 匹配不到，事件处理器原样出网
+    // （改动前实测原样返回）。修复按正扫的引号状态判定：只有真正开启属性值的引号才允许整段保护。
+    for (const h of [
+      '<img foo=a"b=" onerror="alert(1)">',
+      '<img foo=a"b=" onerror=alert(1) title="z">',
+      "<img foo=a'b=' onerror='alert(1)'>"
+    ]) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `杂散引号伪属性对不应屏蔽其后事件属性: ${h} → ${r}`)
+    }
+    // 反向：引号确实开启属性值的合法属性对仍须整体保护（保护语义不能被修坏）
+    const keep2 = sanitizeDecodedHtml('<img title="see onerror=x" src="y">')
+    assertEqual(keep2.includes('title="see onerror=x"'), true, `合法属性值内的 on* 文本必须保留: ${keep2}`)
+  })
+
+  await test('sanitizeDecodedHtml 未配对尖括号不得把纯文本属性对判成标签内（P1-01 安全）', () => {
+    // 反例（改动前）：HTML5 数据态下 `1 < 2`、`价格 <100 元` 里的 `<` 只是普通文本，但旧
+    // _htmlTagSpans 把任意 `<` 当标签起始，未配对 `<` 让标签区间延伸到串尾，把后方纯文本的
+    // name="…" 判成「标签内属性」并整段占位，段内真实的 <img onerror> 绕过事件清洗直接出网
+    // （改动前三例的 onerror 全部原样残留）。修复后标签起始要求 '<' 后为标签名字符/`/`/`!`/`?`。
+    for (const h of [
+      '1 < 2 name="a <img src=y onerror=alert(1)>" b',
+      '价格 <100 元 name="a <img src=y onerror=alert(1)>" b',
+      'a <= b name="x <img src=y onerror=alert(1)>" c'
+    ]) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `未配对 < 后的纯文本属性对不得屏蔽事件属性: ${h} → ${r}`)
+    }
+  })
+
   await test('sanitizeDecodedHtml 未闭合引号不泄漏共享正则状态（P2-02：跨调用结果一致）', () => {
     // safeRe 全局缓存同一正则对象：未闭合引号分支 break 前不复位 lastIndex 会污染下一次调用，
     // 同一条输入的输出随「进程内此前处理过哪条消息」而变（本用例即为回归锁定）。

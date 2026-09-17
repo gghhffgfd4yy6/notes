@@ -385,11 +385,12 @@ function createUtils (options = {}) {
     // 会把中间标签吞掉并遗留危险文本（子代理审查发现：`<a href="javascript:x><b><a href="javascript:y>`
     // 输出 `<a href=""javascript:y>` 残留 javascript）。含 `<` 的"成对"实为未闭合，
     // 由下方 _cleanUnclosedUrlAttrs 线性处理（值内 `<` 是标签边界，合法 URL 值不含裸 `<`）。
-    html = html.replace(/\b(href|src)\s*=\s*(["'])([^<]*?)\2/gi, (_, name, quote, value) => cleanAttr(name, quote, value))
-    // P1-04（RE2 回落，已知取舍）：本行与 _cleanNavAttrs / _cleanSrcsetAttrs / _cleanStyleAttrs 的
-    // 成对引号正则都用反向引用（\1/\2），Google RE2 不支持该语法 → safeRe（xbk_function_v3.js:27）
-    // 必然 catch 并静默回落 V8 RegExp，这几条模式不享有 RE2 的线性时间防护。
-    // 未就地改写为无反向引用形态：等价性需逐条验证，且会改动清洗链语义（见工单 defer）。
+    // P1-04：反向引用是 Google RE2 不支持的语法，含它的模式会被 safeRe 静默回落 V8 RegExp，
+    // 清洗链就失去 RE2 的线性时间防护（本行原本还是原生字面量，根本不经过 RE2）。
+    // 改写为**无反向引用**的等价形态：把 `(["'])…\2` 拆成「双引号支 | 单引号支」——
+    // 同一位置只可能由其中一种引号开启，语言完全等价（同一个引号不可能既是开启又是闭合）。
+    html = html.replace(safeRe(String.raw`\b(href|src)\s*=\s*"([^<]*?)"|\b(href|src)\s*=\s*'([^<]*?)'`, 'gi'),
+      (_match, dName, dValue, sName, sValue) => cleanAttr(dName || sName, dName ? '"' : "'", dName ? dValue : sValue))
     html = html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
     // v3.251 P0(XSS)：未闭合引号属性绕过——`<a href="javascript:alert(1)` 无闭合引号时
     // 上面两个正则均不匹配（成对引号/无引号值），危险协议保留并被执行。这里单独处理
@@ -464,12 +465,25 @@ function createUtils (options = {}) {
   // on* 字样会被 _stripEventAttrs 误删并吞掉闭合引号，产出畸形 HTML（评审给出的真实反例）。
   // 改为一次线性正扫预计算标签区间，之后按位置指针推进查询：尊重引号（引号内 > 不结束标签），
   // 未闭合标签延伸到下一个 < 或串尾，与 _isInHtmlTag 同语义，任意长度标签都能正确判定。
+  //
+  // P1-01：标签区间只能从**真正的标签起始**开始。HTML5 数据态下 `<` 后紧跟非标签名字符
+  // （空白、数字、`=` 等）时它只是普通文本（`1 < 2 name="…"`、`价格 <100 元 name="…"`）；
+  // 旧实现把任意 `<` 当标签起始，未配对的 `<` 让区间一路延伸到串尾/下一个 `<`，把后方纯文本的
+  // name="…" 判成「标签内属性」并整段占位，段内真实的 <img onerror> 随之绕过事件清洗直出网。
+  //
+  // 返回 valueQuotes：正扫过程中处于「引号外」状态所遇到的各引号位置，即**真正开启一个属性值**
+  // 的引号。_protectAttrPairs 依赖它区分「属性值开启引号」与「未加引号值里的杂散引号」——
+  // 后者会把回扫出的伪属性对误判成可保护段，从而把后续真事件属性的属性名藏进占位符（P2-01）。
   _htmlTagSpans (html) {
     const spans = []
+    const valueQuotes = new Set()
     const n = html.length
     let i = 0
     while (i < n) {
       if (html[i] !== '<') { i++; continue }
+      // 标签起始判定：'<' 后须为 ASCII 字母（标签名）或 '/'、'!'、'?'（结束标签/声明/处理指令）。
+      // 其余形态（空白、数字、'=' 等）按 HTML5 数据态语义只是文本，不得开启标签区间。
+      if (!/[A-Za-z/!?]/.test(html[i + 1] || '')) { i++; continue }
       const start = i
       i++
       let quote = ''
@@ -479,6 +493,7 @@ function createUtils (options = {}) {
           if (ch === quote) quote = ''
         } else if (ch === '"' || ch === "'") {
           quote = ch
+          valueQuotes.add(i)
         } else if (ch === '>') {
           i++
           break
@@ -489,7 +504,7 @@ function createUtils (options = {}) {
       }
       spans.push([start, i])
     }
-    return spans
+    return { spans, valueQuotes }
   },
 
   /** CSS 转义全量解码：十六进制（\\XXXXXX）、\\uXXXX 兼容形态、行延续（\\换行）与恒等转义
@@ -579,7 +594,7 @@ function createUtils (options = {}) {
   _protectAttrPairs (html) {
     const attrStore = []
     const attrValueRe = safeRe(String.raw`=\s*(["'])`, 'gi')
-    const tagSpans = this._htmlTagSpans(html)
+    const { spans: tagSpans, valueQuotes } = this._htmlTagSpans(html)
     let spanIdx = 0
     let attrOut = ''
     let attrPos = 0
@@ -607,7 +622,14 @@ function createUtils (options = {}) {
       // 存活的 on* 一并占位，使 _stripEventAttrs 失效。非法形态走与 on* 相同的原样保留分支
       // （下方 else），照旧推进 attrPos/lastIndex，避免死循环。
       const atBoundary = seg.segStart === 0 || /[\s/<>"']/.test(html[seg.segStart - 1])
-      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name) && atBoundary && inTag) {
+      // P2-01（安全）：整段占位的前提是「该引号**真的开启了本属性值**」。反例：
+      // `<img foo=a"b=" onerror="alert(1)">` 里 foo 的未加引号值 `a"b="` 含一个杂散引号，
+      // 回扫会得到一个以它作「值引号」的伪属性对 `b=" onerror="`——该段的闭合引号其实是
+      // onerror 属性值的开启引号，整段占位后 onerror 的属性名被藏进占位符，_stripEventAttrs
+      // 匹配不到，事件处理器原样出网。valueQuotes 由正扫记录「引号外遇到的引号」，
+      // 杂散引号（处于引号状态内）不在其中；不在其中即原样保留，交给 _stripEventAttrs 清洗。
+      const quoteOpensValue = valueQuotes.has(valueStart - 1)
+      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name) && atBoundary && inTag && quoteOpensValue) {
         attrStore.push(segText)
         attrOut += html.slice(attrPos, seg.segStart) + '\u0001' + (attrStore.length - 1) + '\u0001'
       } else {
@@ -657,10 +679,17 @@ function createUtils (options = {}) {
 
   /** 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）清洗。 */
   _cleanNavAttrs (html) {
+    // P1-04：成对引号支拆成「双引号 | 单引号」两支，去掉 RE2 不支持的反向引用 \2（语义等价）。
+    const NAV = String.raw`xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc`
     return html
-      .replace(safeRe(String.raw`\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2`, 'gi'),
-        (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
-      .replace(safeRe(String.raw`\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*([^\s"'<>\`]+)`, 'gi'),
+      .replace(safeRe(String.raw`\b(${NAV})\s*=\s*"([\s\S]*?)"|\b(${NAV})\s*=\s*'([\s\S]*?)'`, 'gi'),
+        (_match, dName, dValue, sName, sValue) => {
+          const name = dName || sName
+          const quote = dName ? '"' : "'"
+          const value = dName ? dValue : sValue
+          return this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`
+        })
+      .replace(safeRe(String.raw`\b(${NAV})\s*=\s*([^\s"'<>\`]+)`, 'gi'),
         (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
   },
 
@@ -668,7 +697,10 @@ function createUtils (options = {}) {
   _cleanSrcsetAttrs (html) {
     const compact = (value) => this.decodeHtmlEntities(value).replace(safeRe(String.raw`[\u0000-\u0020]+`, 'g'), '').toLowerCase()
     return html
-      .replace(safeRe('\\bsrcset\\s*=\\s*(["\'])([\\s\\S]*?)\\1', 'gi'), (_, quote, value) => {
+      // P1-04：成对引号支拆成「双引号 | 单引号」两支，去掉 RE2 不支持的反向引用 \1（语义等价）。
+      .replace(safeRe(String.raw`\bsrcset\s*=\s*"([\s\S]*?)"|\bsrcset\s*=\s*'([\s\S]*?)'`, 'gi'), (_match, dValue, sValue) => {
+        const quote = dValue !== undefined ? '"' : "'"
+        const value = dValue !== undefined ? dValue : sValue
         const v = compact(value)
         return /(?:^|[,])(?:javascript|vbscript|data):/.test(v) ? `srcset=${quote}${quote}` : `srcset=${quote}${value}${quote}`
       })
@@ -689,7 +721,12 @@ function createUtils (options = {}) {
       return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
     }
     return html
-      .replace(safeRe(String.raw`\bstyle\s*=\s*(["'])([\s\S]*?)\1`, 'gi'), (_, quote, value) => unsafeStyle(value) ? `style=${quote}${quote}` : `style=${quote}${value}${quote}`)
+      // P1-04：成对引号支拆成「双引号 | 单引号」两支，去掉 RE2 不支持的反向引用 \1（语义等价）。
+      .replace(safeRe(String.raw`\bstyle\s*=\s*"([\s\S]*?)"|\bstyle\s*=\s*'([\s\S]*?)'`, 'gi'), (_match, dValue, sValue) => {
+        const quote = dValue !== undefined ? '"' : "'"
+        const value = dValue !== undefined ? dValue : sValue
+        return unsafeStyle(value) ? `style=${quote}${quote}` : `style=${quote}${value}${quote}`
+      })
       .replace(safeRe(String.raw`\bstyle\s*=\s*([^\s"'<>\x60]+)`, 'gi'), (_, value) => unsafeStyle(value) ? 'style=""' : `style=${value}`)
   },
 
@@ -913,6 +950,12 @@ function createUtils (options = {}) {
     // v3.107 fuzz 发现：m 本身缺失/非对象时 m.id 会抛 TypeError；异常 getter 也按无效 id 处理。
     // 与 isValidItem 口径一致：排除数组（带自定义 id 属性的数组不视为有效条目）。
     if (m === undefined || m === null || typeof m !== 'object' || Array.isArray(m)) return false
+    // XBK-UTILS-P2-04：与 getMessageIdentity 同口径——只有**本对象自有**的 id 才算这条消息的 id。
+    // 否则 Object.create({id:'abc'}) 被本函数判为「有 id」，getMessageIdentity 却判 invalid，
+    // 同一对象上两个判重入口结论相反：调用方据本函数走 id 判重路径时会与身份索引对不上而丢消息。
+    let ownId = false
+    try { ownId = Object.prototype.hasOwnProperty.call(m, 'id') } catch (e) { ownId = false }
+    if (!ownId) return false
     const id = this.safeGet(m, 'id')
     if (id === undefined || id === null) return false
     const t = typeof id

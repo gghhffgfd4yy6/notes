@@ -226,6 +226,23 @@ check('hasValidId: id 为空串无效', () => {
 check('hasValidId: null 对象无效', () => {
   assert.strictEqual(Utils.hasValidId(null), false)
 })
+check('hasValidId: 继承得到的 id 不算有效 id（XBK-UTILS-P2-04，与 getMessageIdentity 同口径）', () => {
+  // 反例（改动前）：hasValidId 直接 safeGet(m,'id') 无 hasOwnProperty 前提，
+  // Object.create({id:'abc'}) → true；而 getMessageIdentity 要求自有属性 → invalid。
+  // 同一对象上两个判重入口结论相反，据 hasValidId 走 id 路径的调用方会与身份索引对不上。
+  const inherited = Object.create({ id: 'abc' })
+  assert.strictEqual(Utils.hasValidId(inherited), false, '原型链上的 id 不得被 hasValidId 判为有 id')
+  assert.strictEqual(Utils.getMessageIdentity(inherited).valid, false, '前置：getMessageIdentity 对继承 id 判无效')
+  // 自有属性路径不得被一并收紧
+  assert.strictEqual(Utils.hasValidId({ id: 123 }), true, '自有数字 id 仍有效')
+  assert.strictEqual(Utils.hasValidId({ id: 'abc' }), true, '自有字符串 id 仍有效')
+  assert.strictEqual(Utils.hasValidId(Object.assign(Object.create({ id: 'x' }), { id: 0 })), true, '自有数字 id 0 仍有效')
+  // 两个入口对同一对象的结论必须一致（防再次分裂）
+  for (const m of [{ id: 'a' }, { id: 0 }, { id: '' }, { id: null }, {}, inherited, Object.create({ id: 'z' })]) {
+    assert.strictEqual(Utils.hasValidId(m), Utils.getMessageIdentity(m).valid,
+      `hasValidId 与 getMessageIdentity 必须同判（keys=${JSON.stringify(Object.keys(m))}）`)
+  }
+})
 
 // ===== anonKey：匿名键 =====
 check('anonKey: 单参数生成匿名键', () => {
@@ -295,6 +312,60 @@ check('safeErrorText: null 返回 fallback', () => {
 })
 check('safeErrorText: message 非字符串转字符串', () => {
   assert.strictEqual(Utils.safeErrorText({ message: 123 }), '123')
+})
+
+// ===== P1-04：清洗链内部正则必须是 RE2 兼容形态（不含反向引用）=====
+// 反例（改动前）：href/src、_cleanNavAttrs、_cleanSrcsetAttrs、_cleanStyleAttrs 的成对引号正则
+// 写成 `(["'])…\1`/`\2`（href/src 那条还是原生字面量，根本不经过 RE2）。Google RE2 不支持反向引用，
+// 含它的模式会被 safeRe 静默 catch 并回落 V8 RegExp，清洗链赖以自保的「线性时间」防护对这 4 条模式
+// 形同不存在。观测方式：注入记录全部 pattern 源码的 safeRe，跑一遍覆盖四类属性的清洗，断言没有任何
+// 被编译的内部模式含反向引用。本机 re2 是 V8 替身（不拒反向引用），所以断言写成源码级判定——
+// 它对「反向引用被重新写回」可本地证伪；CI 装真 re2 时这些模式会真正走 RE2 编译，本断言即其前置条件。
+check('P1-04: 清洗链内部正则不含反向引用（RE2 兼容）', () => {
+  const captured = []
+  const SpyUtils = createUtils({ safeRe: (src, flags) => { captured.push([src, flags]); return new RegExp(src, flags) } })
+  SpyUtils.sanitizeDecodedHtml('<a href="x" xlink:href="y" srcset="a" style="b" src="c" title="t">t</a>')
+  // 反向引用 = 奇数个反斜杠后紧跟 1-9；`\\1`（两个字面反斜杠 + '1'）与 `\u0001`/`\d` 都不算
+  const hasBackref = (src) => {
+    for (let i = src.indexOf('\\'); i !== -1;) {
+      let run = 0
+      while (src[i + run] === '\\') run++
+      const next = src[i + run]
+      if (run % 2 === 1 && next >= '1' && next <= '9') return true
+      i = src.indexOf('\\', i + run)
+    }
+    return false
+  }
+  assert.ok(captured.length > 0, '前置条件：清洗链必须经注入的 safeRe 编译内部正则')
+  assert.ok(captured.some(([src]) => src.includes('href|src')), '前置条件：href/src 成对引号模式必须已经过 safeRe 编译')
+  const offenders = captured.filter(([src]) => hasBackref(src)).map(([src]) => src)
+  assert.deepStrictEqual(offenders, [], `清洗链内部正则不得含反向引用（RE2 不支持 → 静默回落 V8，失去线性防护）: ${offenders.join(' | ')}`)
+  // 行为等价：拆成「双引号支 | 单引号支」后，两支仍各自清空危险协议、保留合法值
+  const cases = [
+    ['sanitizeHtmlUrls', '<a href="javascript:alert(1)">x</a>', /javascript/, false],
+    ['sanitizeHtmlUrls', "<a href='javascript:alert(1)'>x</a>", /javascript/, false],
+    ['sanitizeHtmlUrls', '<a href="https://u.jd.com/a">x</a>', /https:\/\/u\.jd\.com\/a/, true],
+    ['sanitizeHtmlUrls', "<a href='https://u.jd.com/a'>x</a>", /https:\/\/u\.jd\.com\/a/, true],
+    ['_cleanNavAttrs', '<div xlink:href="javascript:alert(1)">d</div>', /javascript/, false],
+    ['_cleanNavAttrs', "<div xlink:href='javascript:alert(1)'>d</div>", /javascript/, false],
+    ['_cleanNavAttrs', '<div poster="https://x/1.jpg">d</div>', /https:\/\/x\/1\.jpg/, true],
+    ['_cleanSrcsetAttrs', '<img srcset="a.png, javascript:alert(1)">', /javascript/, false],
+    ['_cleanSrcsetAttrs', "<img srcset='a.png, javascript:alert(1)'>", /javascript/, false],
+    ['_cleanSrcsetAttrs', '<img srcset="https://x/1.png 1x">', /https:\/\/x\/1\.png 1x/, true],
+    ['_cleanStyleAttrs', '<div style="background:url(javascript:x)">a</div>', /javascript/, false],
+    ['_cleanStyleAttrs', "<div style='background:url(javascript:x)'>a</div>", /javascript/, false],
+    ['_cleanStyleAttrs', '<div style="color:red">a</div>', /color:red/, true]
+  ]
+  for (const [fn, input, re, expected] of cases) {
+    assert.strictEqual(re.test(SpyUtils[fn](input)), expected, `${fn}(${input}) 的期望匹配状态应为 ${expected}`)
+  }
+  // 单双引号值内出现「另一种引号」时不得跨引号配对（拆分两支后的等价性边界）
+  assert.strictEqual(SpyUtils.sanitizeHtmlUrls('<a href="a\'b">x</a>').includes('a\'b'), true, '双引号值内的单引号应原样保留')
+  assert.strictEqual(SpyUtils.sanitizeHtmlUrls("<a href='a\"b'>x</a>").includes('a"b'), true, '单引号值内的双引号应原样保留')
+  assert.strictEqual(SpyUtils._cleanStyleAttrs('<div style="a\'b">x</div>').includes("a'b"), true, 'style 双引号值内的单引号应原样保留')
+  // 未闭合引号不得被跨行/跨标签配对消费（原 \1/\2 语义：无同型闭合引号即不匹配）
+  assert.strictEqual(SpyUtils.sanitizeHtmlUrls('<a href="javascript:x><b><a href="javascript:y>').includes('href="javascript:y"'), false,
+    '未闭合引号不得与后续属性引号跨标签配对')
 })
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
