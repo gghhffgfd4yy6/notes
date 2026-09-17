@@ -396,4 +396,70 @@ check('P1-04 同族: sanitizeSurrogates/safeText 内部正则不含 lookaround�
   assert.strictEqual(SpyUtils.sanitizeSurrogates('plain'), 'plain', '无代理字符时逐字节不变')
 })
 
+// ===== P1-04（收尾）：RE2 编译失败回落 V8 原生 RegExp 时必须留一次告警 =====
+// 反例（改动前）：safeRe 的 catch 是空的 `catch (e) { /* 反向引用等不支持特性回落 */ }`，RE2 因反向
+// 引用/lookbehind 等不支持的构造编译失败后静默回落 V8——「RE2 的线性时间防护对这条模式不成立」
+// 在运行日志里无声无息（未修复清单 P1-04 的第二句建议）。本机 re2 是 V8 替身（不拒任何语法），
+// 真 RE2 的编译结果本机不可验，故观测方式为子进程内把 require('re2') 换成「对清洗链内部模式抛错」
+// 的替身，驱动清洗链让多条内部模式依次落地到 catch，断言：
+//   ① 模块加载期不告警——回落告警只属于真正的编译失败路径；
+//   ② 首次回落恰好告警一次，其后（含新模式）不再刷屏——热路径每条内部正则都要过 safeRe；
+//   ③ 告警含回落模式源码与失败原因，且原因里的凭据已被既有脱敏通道遮蔽；
+//   ④ 回落行为不变：危险协议仍被清空、合法值仍保留。
+// 撤掉告警实现（catch 恢复为空）→ ② 立即变红。
+const execFileSync = require('node:child_process').execFileSync
+const fallbackProbe = String.raw`
+'use strict'
+const re2Path = require.resolve('re2')
+const warns = []
+const rejected = []
+console.warn = (...args) => { warns.push(args.map(v => String(v)).join(' ')) }
+// 替身 RE2：对清洗链内部模式（成对引号 href|src、srcset、style 与主动标签守卫）抛错，模拟真 RE2
+// 不支持这些构造；其余模式照常编译，保证模块加载期不误触发回落告警。
+const UNSUPPORTED = ['href|src', 'srcset', 'style']
+function FakeRe2 (src, flags) {
+  if (typeof src === 'string' && UNSUPPORTED.some(marker => src.includes(marker))) {
+    rejected.push(src)
+    throw new Error('invalid perl operator: unsupported construct (token=SUPERSECRETVALUE123456)')
+  }
+  return new RegExp(src, flags)
+}
+require.cache[re2Path] = { id: re2Path, filename: re2Path, loaded: true, exports: FakeRe2 }
+const xbk = require('./xbk_function_v3')
+const warnsAfterLoad = warns.length
+const outFirst = xbk.sanitizeDecodedHtml('<a href="javascript:alert(1)" srcset="a 1x" style="color:red" title="t">t</a>')
+const warnsAfterFirst = warns.length
+const outSecond = xbk.sanitizeDecodedHtml('<a href="https://u.jd.com/a">x</a>')
+const outThird = xbk.sanitizeDecodedHtml('<img src="javascript:x" srcset="b 2x, javascript:alert(1)">')
+process.stdout.write(JSON.stringify({
+  warnsAfterLoad,
+  warnsAfterFirst,
+  warnsAfterAll: warns.length,
+  warns,
+  rejectedCount: rejected.length,
+  outFirst,
+  outSecond,
+  outThird
+}))
+`
+
+check('P1-04 收尾: RE2 编译失败回落 V8 只告警一次（含模式与原因，凭据已脱敏）', () => {
+  const raw = execFileSync(process.execPath, ['-e', fallbackProbe], { cwd: __dirname, encoding: 'utf8' })
+  const out = JSON.parse(raw.trim().split(/\r?\n/).pop())
+  assert.strictEqual(out.warnsAfterLoad, 0, '模块加载期的内部模式不得触发回落告警')
+  assert.ok(out.rejectedCount >= 3, `前置条件：本轮清洗必须让 ≥3 条内部模式编译失败（实际 ${out.rejectedCount}）——否则「只告警一次」只是被 _reCache 挡住，测不到一次性标记`)
+  assert.strictEqual(out.warnsAfterFirst, 1, `首次回落必须告警且只告警一次（实际 ${out.warnsAfterFirst} 次）`)
+  assert.strictEqual(out.warnsAfterAll, 1, `后续调用（含新的失败模式）不得再告警刷屏（实际 ${out.warnsAfterAll} 次）`)
+  const warn = out.warns.join(' | ')
+  assert.ok(warn.includes('RE2'), `告警须点明 RE2 编译失败：${warn}`)
+  assert.ok(warn.includes('线性时间防护'), `告警须说明该模式失去 RE2 线性防护：${warn}`)
+  assert.ok(warn.includes('href|src'), `告警须含回落模式源码：${warn}`)
+  assert.ok(warn.includes('invalid perl operator'), `告警须含失败原因（e.message）：${warn}`)
+  assert.ok(!warn.includes('SUPERSECRETVALUE123456'), `告警须经既有脱敏通道遮蔽凭据：${warn}`)
+  assert.ok(warn.includes('token=***'), `凭据应按既有 redact 形态遮蔽为 ***：${warn}`)
+  assert.ok(!/javascript/i.test(out.outFirst) && out.outFirst.includes('href=""'), `回落行为不变：危险协议仍须清空（${out.outFirst}）`)
+  assert.ok(out.outSecond.includes('https://u.jd.com/a'), `回落行为不变：合法 href 仍须保留（${out.outSecond}）`)
+  assert.ok(!/javascript/i.test(out.outThird), `回落行为不变：src/srcset 清洗仍生效（${out.outThird}）`)
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
