@@ -85,6 +85,54 @@ try {
   console.log('✅ 解析失败报错包含文件路径与尺寸上下文')
   pass++
 
+  // ===== F1：预读大小护栏必须在 readFileSync（分配峰值）之前生效 =====
+  // 旧实现唯一的尺寸守卫在 Buffer.concat 之后；超限输入要先付一次整份报告的分配才发现放不下。
+  // 现改为读取前 statSync 预检大小与类型（上限可注入，避免构造 4GiB 级夹具）。
+  {
+    const file = path.join(tmpdir, 'oversize.json')
+    fs.writeFileSync(file, '{"a":1}') // 7 字节
+    const realReadFileSync = fs.readFileSync
+    let readCalls = 0
+    let statCalls = 0
+    const realStatSync = fs.statSync
+    fs.statSync = function (...args) { statCalls += 1; return realStatSync.apply(fs, args) }
+    fs.readFileSync = function (...args) { readCalls += 1; return realReadFileSync.apply(fs, args) }
+    let limitError = null
+    try {
+      readReportJson(file, { maxFileBytes: 4 })
+    } catch (e) {
+      limitError = e
+    } finally {
+      fs.readFileSync = realReadFileSync
+      fs.statSync = realStatSync
+    }
+    assert.ok(limitError, '超过预读上限必须抛错')
+    assert.ok(String(limitError.message).includes('oversize.json'), `预读超限报错必须带路径，实际：${limitError && limitError.message}`)
+    assert.ok(String(limitError.message).includes('7 字节'), `预读超限报错必须带真实大小，实际：${limitError && limitError.message}`)
+    assert.ok(String(limitError.message).includes('4 字节'), `预读超限报错必须带上限，实际：${limitError && limitError.message}`)
+    assert.strictEqual(statCalls > 0, true, '必须先 stat 取真实大小')
+    assert.strictEqual(readCalls, 0, '超限必须在 readFileSync（分配峰值）之前判定，不得先整份读入再报错')
+    console.log('✅ 预读大小护栏在 readFileSync 分配之前生效（含路径与真实大小）')
+    pass++
+  }
+
+  // F1：非普通文件（目录等）在读入前拒绝——readFileSync 对目录抛不带路径的 EISDIR，对 FIFO 会阻塞
+  {
+    let dirError = null
+    try {
+      readReportJson(tmpdir)
+    } catch (e) {
+      dirError = e
+    }
+    assert.ok(dirError, '目录入参必须抛错')
+    assert.ok(String(dirError.message).includes('不是普通文件'),
+      `目录必须被预读护栏拒绝，实际：${dirError && dirError.message}`)
+    assert.ok(String(dirError.message).includes(path.basename(tmpdir)),
+      `报错必须带路径上下文，实际：${dirError && dirError.message}`)
+    console.log('✅ 非普通文件在读入前被拒绝（带路径上下文）')
+    pass++
+  }
+
   // Codacy MEDIUM：传入相对路径时，错误信息中的路径应是绝对路径（path.resolve 防御性 normalize）
   // 当前实现（不加 path.resolve）错误信息会保留传入的相对路径 → 测试会红
   {
