@@ -333,4 +333,104 @@ check('_saveTombstones: 可达标时正常序列化并交给 writeAtomic（对�
   assert.strictEqual(Buffer.byteLength(writes[0].text, 'utf8'), 53, '写入内容应为 53 字节空墓碑文本')
 })
 
+// ===== QX-08：缓存目录解析由生产与青龙 --status 共用同一实现 =====
+// 反例（改动前）：--status 把默认目录硬编码成 path.join(ROOT,'xianbaoku_cache')，生产却会在该目录
+// 被普通文件占位 / realpath 逃出根目录时回退 .xbk_cache_safe ⇒ 前者静默读错目录（状态实际写在
+// 备用目录时 --status 报「缺失」）。这里用假 fs（不触碰真实文件系统：/tmp 不可写、跨挂载点符号
+// 链接会被沙箱拒绝）对拍两侧结果：同一输入必须得到同一目录。把 --status 侧回退成硬编码后，
+// 「必须与生产一致」这条断言即红。
+const { resolveCacheDirInRoot } = require('./xbk_message_store')
+const { statusCacheDir } = require('./qinglong/xbk_push')
+
+// root 取真实模块根（生产 getter 用 path.resolve(__dirname)），但 exists/lstat/realpath 全部由
+// 假 fs 回答，测试不触碰真实文件系统。
+const FAKE_ROOT = __dirname
+
+// 假 fs：map 为「绝对路径 → 'dir' | 'file' | { kind, real }」，未登记路径视为不存在。
+function makeCacheFs (map) {
+  const entry = (p) => (Object.prototype.hasOwnProperty.call(map, p) ? map[p] : undefined)
+  const isDir = (p) => {
+    const e = entry(p)
+    if (e === 'dir') return true
+    if (e === 'file') return false
+    if (e && typeof e === 'object') return e.kind === 'dir'
+    return false
+  }
+  return {
+    existsSync: (p) => entry(p) !== undefined,
+    lstatSync: (p) => ({ isDirectory: () => isDir(p) }),
+    realpathSync: (p) => {
+      const e = entry(p)
+      return e && typeof e === 'object' && e.real ? e.real : p
+    }
+  }
+}
+
+function storeWithFs (fakeFs, cacheDir = 'xianbaoku_cache') {
+  return createMessageStore({
+    Config: { cache: { dir: cacheDir, maxSize: 10000 } },
+    Utils: mockUtils,
+    fs: fakeFs,
+    path,
+    crypto: { randomUUID: () => 'uuid' },
+    normalize: () => {},
+    storage: {},
+    constants: {}
+  })
+}
+
+const DEFAULT_DIR = path.join(FAKE_ROOT, 'xianbaoku_cache')
+const SAFE_DIR = path.join(FAKE_ROOT, '.xbk_cache_safe')
+const CACHE_FS_SCENARIOS = [
+  {
+    name: '默认目录是根内正常目录 → 原样使用',
+    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: 'dir' },
+    expect: DEFAULT_DIR
+  },
+  {
+    name: '默认目录从未创建（父级存在）→ 仍使用默认目录',
+    map: { [FAKE_ROOT]: 'dir' },
+    expect: DEFAULT_DIR
+  },
+  {
+    name: '默认目录被普通文件占位 → 回退 .xbk_cache_safe（生产口径）',
+    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: 'file' },
+    expect: SAFE_DIR
+  },
+  {
+    name: '默认目录是逃出根目录的符号链接 → 回退 .xbk_cache_safe（生产口径）',
+    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: { kind: 'dir', real: '/outside/xianbaoku_cache' } },
+    expect: SAFE_DIR
+  }
+]
+
+for (const scenario of CACHE_FS_SCENARIOS) {
+  check(`QX-08 同源解析：${scenario.name}（--status 必须与生产 getter 一致）`, () => {
+    const fakeFs = makeCacheFs(scenario.map)
+    const prod = storeWithFs(fakeFs).cacheDir
+    const status = statusCacheDir({ env: {}, fs: fakeFs, path, root: FAKE_ROOT })
+    assert.strictEqual(prod, scenario.expect, `生产缓存目录应为 ${scenario.expect}，实际 ${prod}`)
+    assert.strictEqual(status, prod, `--status 解析结果必须与生产一致（status=${status}，prod=${prod}）`)
+  })
+}
+
+check('resolveCacheDirInRoot: 所有候选都被根外 realpath 劫持 → 显式抛错（禁止静默写穿）', () => {
+  const hijacked = {
+    existsSync: () => true,
+    lstatSync: () => ({ isDirectory: () => true }),
+    realpathSync: (p) => '/outside' + p
+  }
+  assert.throws(() => resolveCacheDirInRoot({
+    fs: hijacked, path, root: FAKE_ROOT, raw: 'xianbaoku_cache', fallback: 'xianbaoku_cache'
+  }), /缓存目录安全检查失败/, '全部候选逃出根目录时必须抛错，而不是返回任意路径')
+})
+
+check('resolveCacheDirInRoot: 并行 worker 分片名（xianbaoku_cache_p7）同样走根内校验', () => {
+  const fakeFs = makeCacheFs({ [FAKE_ROOT]: 'dir' })
+  const dir = resolveCacheDirInRoot({
+    fs: fakeFs, path, root: FAKE_ROOT, raw: 'xianbaoku_cache_p7', fallback: 'xianbaoku_cache_p7'
+  })
+  assert.strictEqual(dir, path.join(FAKE_ROOT, 'xianbaoku_cache_p7'), '分片目录名应被根内校验放行')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

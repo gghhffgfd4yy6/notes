@@ -2,6 +2,48 @@
 
 'use strict'
 
+// 缓存目录解析：项目根内校验 + 多级兜底。**生产 getter 与青龙 `--status` 命令共用本实现**（QX-08）：
+// `--status` 此前把默认目录硬编码成 path.join(ROOT, 'xianbaoku_cache')，于是生产会拒绝并回退的目录
+// （被普通文件占位、realpath 逃出根目录、已存在层级不是目录）仍被照读——状态其实写在备用目录时
+// `--status` 静默报「缺失」。抽成无副作用函数后两侧口径恒等；fs/path 由调用方注入，本模块因此
+// 不 require 任何模块，`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
+function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
+  const candidate = path.resolve(root, raw)
+  const realInsideRoot = (p) => {
+    const lexicalInside = p !== root && p.startsWith(root + path.sep)
+    if (!lexicalInside) return false
+    // 逐级回溯到已存在目录，再 realpath 校验；防止项目内符号链接指向项目外部。
+    let probe = p
+    try {
+      while (probe !== root && !fs.existsSync(probe)) probe = path.dirname(probe)
+      // 已存在的路径层级必须是目录；否则 cache.dir 指向普通文件时，
+      // 后续拼接缓存文件会得到 ENOTDIR，而校验却错误放行。
+      if (!fs.lstatSync(probe).isDirectory()) return false
+      const realProbe = fs.realpathSync(probe)
+      const resolved = path.resolve(realProbe, path.relative(probe, p))
+      return resolved !== root && resolved.startsWith(root + path.sep)
+    } catch (e) {
+      return false
+    }
+  }
+  // P2 防御：cache.dir 不能通过 ..、绝对路径或符号链接逃出项目根目录；越界配置回退默认目录。
+  if (realInsideRoot(candidate)) return candidate
+  const safeFallback = path.resolve(root, fallback)
+  if (realInsideRoot(safeFallback)) return safeFallback
+  // 默认目录本身若被替换成外部符号链接，也不能原样返回；使用项目根内的应急目录。
+  const emergencyFallback = path.join(root, '.xbk_cache_safe')
+  // C022：应急目录同样校验 realpath；被替换成外部符号链接时不能原样返回。
+  if (realInsideRoot(emergencyFallback)) return emergencyFallback
+  // 校验失败回退到根目录下唯一安全路径（固定新目录名，不跟随外部符号链接）。
+  // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换为
+  // 指向项目外的符号链接，写入会逃出根目录（前两级候选均先过 realInsideRoot，唯独此级曾直接返回）。
+  const internalFallback = path.join(root, '.xbk_cache_safe_internal')
+  if (realInsideRoot(internalFallback)) return internalFallback
+  // 所有候选目录（含应急目录）均不可用：说明项目根目录层级已被外部符号链接劫持，
+  // 继续返回任意路径都会逃出根目录——显式抛错，由 init()/App.run 的 try/catch 暴露，禁止静默写穿。
+  throw new Error('缓存目录安全检查失败：所有候选目录（含 .xbk_cache_safe_internal）均不可用，可能被符号链接劫持')
+}
+
 // 💾 MessageStore — 缓存管理层（从 xbk_function_v3.js 独立准备，暂不接入主入口）
 // 依赖全部由组合根注入；不反向 require 主入口，不复制共享单例。
 function createMessageStore ({
@@ -37,41 +79,9 @@ function createMessageStore ({
     get cacheDir () {
       const fallback = process.env.XBK_PARALLEL_ID ? `xianbaoku_cache_p${process.env.XBK_PARALLEL_ID}` : 'xianbaoku_cache'
       const raw = typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : fallback
-      const root = path.resolve(__dirname)
-      const candidate = path.resolve(root, raw)
-      const realInsideRoot = (p) => {
-        const lexicalInside = p !== root && p.startsWith(root + path.sep)
-        if (!lexicalInside) return false
-        // 逐级回溯到已存在目录，再 realpath 校验；防止项目内符号链接指向项目外部。
-        let probe = p
-        try {
-          while (probe !== root && !fs.existsSync(probe)) probe = path.dirname(probe)
-          // 已存在的路径层级必须是目录；否则 cache.dir 指向普通文件时，
-          // 后续拼接缓存文件会得到 ENOTDIR，而校验却错误放行。
-          if (!fs.lstatSync(probe).isDirectory()) return false
-          const realProbe = fs.realpathSync(probe)
-          const resolved = path.resolve(realProbe, path.relative(probe, p))
-          return resolved !== root && resolved.startsWith(root + path.sep)
-        } catch (e) {
-          return false
-        }
-      }
-      // P2 防御：cache.dir 不能通过 ..、绝对路径或符号链接逃出项目根目录；越界配置回退默认目录。
-      if (realInsideRoot(candidate)) return candidate
-      const safeFallback = path.resolve(root, fallback)
-      if (realInsideRoot(safeFallback)) return safeFallback
-      // 默认目录本身若被替换成外部符号链接，也不能原样返回；使用项目根内的应急目录。
-      const emergencyFallback = path.join(root, '.xbk_cache_safe')
-      // C022：应急目录同样校验 realpath；被替换成外部符号链接时不能原样返回。
-      if (realInsideRoot(emergencyFallback)) return emergencyFallback
-      // 校验失败回退到根目录下唯一安全路径（固定新目录名，不跟随外部符号链接）。
-      // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换为
-      // 指向项目外的符号链接，写入会逃出根目录（前两级候选均先过 realInsideRoot，唯独此级曾直接返回）。
-      const internalFallback = path.join(root, '.xbk_cache_safe_internal')
-      if (realInsideRoot(internalFallback)) return internalFallback
-      // 所有候选目录（含应急目录）均不可用：说明项目根目录层级已被外部符号链接劫持，
-      // 继续返回任意路径都会逃出根目录——显式抛错，由 init()/App.run 的 try/catch 暴露，禁止静默写穿。
-      throw new Error('缓存目录安全检查失败：所有候选目录（含 .xbk_cache_safe_internal）均不可用，可能被符号链接劫持')
+      // P2/P3/C022 的根内校验与多级兜底统一实现于模块顶部的 resolveCacheDirInRoot；
+      // 青龙 `--status` 复用同一函数（QX-08），两侧口径不再各写一份。
+      return resolveCacheDirInRoot({ fs, path, root: path.resolve(__dirname), raw, fallback })
     },
     _memoryCache: {},
     // 内存缓存实际键数（与 _memoryCache 同步维护，替代热路径上每次新键写都 Object.keys O(n)）
@@ -1262,4 +1272,4 @@ function createMessageStore ({
   return MessageStore
 }
 
-module.exports = { createMessageStore }
+module.exports = { createMessageStore, resolveCacheDirInRoot }

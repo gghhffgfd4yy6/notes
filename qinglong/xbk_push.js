@@ -5,6 +5,7 @@ const path = require('path')
 const fs = require('fs')
 const { spawnSync } = require('child_process')
 const { runLoop, sleep } = require('../xbk_loop')
+const { resolveCacheDirInRoot } = require('../xbk_message_store')
 const { classifyFailure, classifySummary, summarizeError } = require('../xbk_failure_policy')
 
 const ROOT = path.resolve(__dirname, '..')
@@ -291,20 +292,42 @@ async function runResident (app, controller) {
 
 const { readStatus, formatStatus } = require('../scripts/status')
 
-function statusCacheDir () {
-  // --status 不加载主应用，避免缺少 got/re2 时诊断命令反而不可用。
-  // 仅允许绝对路径覆盖，避免环境变量把状态读取重定向到项目目录外的任意相对位置。
-  const configured = process.env.XBK_CACHE_DIR
-  const fallback = path.join(ROOT, 'xianbaoku_cache')
-  if (configured && !path.isAbsolute(configured)) {
+// QX-08：未设置 XBK_CACHE_DIR 时不再硬编码 path.join(ROOT,'xianbaoku_cache')，而是复用生产的
+// 同源解析（xbk_message_store.resolveCacheDirInRoot，两侧同一实现，不再各写一份）。生产会拒绝并
+// 回退的目录（被普通文件占位、realpath 逃出根目录、已存在层级不是目录）--status 不再照读——否则
+// 状态其实写在 .xbk_cache_safe 时，--status 会静默报「缺失」。xbk_message_store 不 require 任何
+// 模块（依赖由组合根注入），因此该复用不违反「--status 缺 got/re2 也要可用」的设计。
+// 仍未覆盖的一点：Config.cache.dir 被改成其它根内目录时 --status 无从得知（不加载应用配置），
+// 由 runStatus 显式打印生效目录并指向已登记的覆盖手段 XBK_CACHE_DIR，不再静默。
+const DEFAULT_CACHE_DIR = 'xianbaoku_cache'
+
+function statusCacheDir ({ env = process.env, fs: fsImpl = fs, path: pathImpl = path, root = ROOT } = {}) {
+  const configured = env.XBK_CACHE_DIR
+  // 文档契约（README「若状态文件写在别处」）：XBK_CACHE_DIR 允许是项目目录之外的任意绝对路径。
+  if (configured && pathImpl.isAbsolute(configured)) return configured
+  const resolved = resolveCacheDirInRoot({
+    fs: fsImpl,
+    path: pathImpl,
+    root,
+    raw: DEFAULT_CACHE_DIR,
+    fallback: DEFAULT_CACHE_DIR
+  })
+  if (configured) {
     // 相对路径此前被静默忽略并回退默认目录，可能让 --status 读到与预期不同的目录（QX-08）。
-    console.warn(`⚠️ XBK_CACHE_DIR 不是绝对路径（${configured}），已忽略并回退默认缓存目录：${fallback}`)
+    console.warn(`⚠️ XBK_CACHE_DIR 不是绝对路径（${configured}），已忽略并回退默认缓存目录：${resolved}`)
   }
-  return configured && path.isAbsolute(configured) ? configured : fallback
+  return resolved
 }
 
 function runStatus () {
-  const status = readStatus(statusCacheDir())
+  const dir = statusCacheDir()
+  // QX-08：--status 刻意不加载应用配置（缺 got/re2 时仍要可用），故当 XBK_CACHE_DIR 未被采纳时
+  // 显式暴露「生效目录」与配置口径，避免 Config.cache.dir 指向其它根内目录时读错目录而不报错。
+  const configured = process.env.XBK_CACHE_DIR
+  if (!(configured && path.isAbsolute(configured))) {
+    console.log(`缓存目录：${dir}（未使用 XBK_CACHE_DIR；--status 不加载应用配置，若已自定义 Config.cache.dir，请用 XBK_CACHE_DIR 指向该绝对路径）`)
+  }
+  const status = readStatus(dir)
   console.log(formatStatus(status))
   return 0
 }
@@ -398,4 +421,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { classifyFailure, classifySummary, runResident, runDryRunOnce, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs, runCheck, hasArg, nodeVersionWarning }
+module.exports = { classifyFailure, classifySummary, runResident, runDryRunOnce, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs, runCheck, hasArg, nodeVersionWarning, statusCacheDir }
