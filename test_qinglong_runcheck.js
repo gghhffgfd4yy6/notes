@@ -18,10 +18,12 @@ function restoreNotify () {
   require.cache[notifyPath] = origNotify
 }
 
-// 环境探测 mock：runCheck 内部真实校验 Node 版本 / got / re2（qinglong/xbk_push.js:30-39），
-// 裸环境（Node<22 或缺 got/re2）下"全部通过"用例必然返回 1。这里临时伪装成健康环境，
+// 环境探测 mock：runCheck 内部真实校验 Node 版本 / got / re2（qinglong/xbk_push.js），
+// 裸环境（Node<engines 或缺 got/re2）下"全部通过"用例必然返回 1。这里临时伪装成健康环境，
 // 只覆盖 runCheck 的返回码聚合逻辑，使该用例在裸环境可确定性通过；返回后完整还原。
-function withHealthyEnv (fn) {
+// nodeVersion 默认 '22.22.2'：恰为 package.json engines 下界（QX-06 起 --check 按完整版本比较，
+// 旧 fixture '22.0.0' 已不再是"健康环境"）。
+function withHealthyEnv (fn, nodeVersion = '22.22.2') {
   const origRequire = Module.prototype.require
   const versionsDesc = Object.getOwnPropertyDescriptor(process, 'versions')
   Module.prototype.require = function (id, ...rest) {
@@ -29,7 +31,7 @@ function withHealthyEnv (fn) {
     if (id === 're2') return class { test () { return true } }
     return origRequire.call(this, id, ...rest)
   }
-  Object.defineProperty(process, 'versions', { value: { ...versionsDesc.value, node: '22.0.0' }, configurable: true })
+  Object.defineProperty(process, 'versions', { value: { ...versionsDesc.value, node: nodeVersion }, configurable: true })
   try {
     return fn()
   } finally {
@@ -69,6 +71,21 @@ function makeApp (overrides = {}) {
   mockNotify(1)
   const code0 = withHealthyEnv(() => runCheck(makeApp()))
   assert.strictEqual(code0, 0, '全部检查通过应返回 0')
+  restoreNotify()
+
+  // ===== QX-06 回归：Node 低于 package.json engines（>=22.22.2）→ 返回 1，且该项为 ❌ =====
+  // 旧实现只看主版本（Number(node.split('.')[0]) >= 22），22.21.0 会被放行（本用例必红）。
+  mockNotify(1)
+  const rNodeLow = withHealthyEnv(() => captureRunCheck(makeApp()), '22.21.0')
+  assert.strictEqual(rNodeLow.code, 1, 'Node 低于 engines 下界应返回 1')
+  assert.ok(rNodeLow.output.includes('❌ Node.js 版本'), '失败项应为"Node.js 版本"，输出应含 ❌ Node.js 版本')
+  assert.ok(rNodeLow.output.includes('>=22.22.2'), '失败详情应给出 engines 要求的 >=22.22.2')
+  restoreNotify()
+
+  // 边界对照：恰好下界 / 高于下界 → 该项通过（防"一律判红"让上面的断言失去鉴别力）
+  mockNotify(1)
+  assert.strictEqual(withHealthyEnv(() => runCheck(makeApp()), '22.22.2'), 0, '恰为 engines 下界应通过')
+  assert.strictEqual(withHealthyEnv(() => runCheck(makeApp()), '24.18.0'), 0, '高于下界应通过')
   restoreNotify()
 
   // ===== validateConfig 返回警告 → 返回 1，且输出中"过滤配置"为 ❌ =====

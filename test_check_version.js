@@ -10,7 +10,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
-const { checkVersionValues, baseVersion, patchOf } = require('./check-version')
+const { checkVersionValues, baseVersion, patchOf, compareBaseVersion, latestChangelogVersion } = require('./check-version')
 
 let pass = 0
 let fail = 0
@@ -69,6 +69,27 @@ check('CHANGELOG 落后于文件头 → 判红', () => {
   const r = checkVersionValues(values({ changelog: '# Changelog\n\n## v3.271\n' }))
   assert.strictEqual(r.ok, false, 'CHANGELOG 版本落后必须判红')
   assert.match(text(r), /CHANGELOG = 3\.271/)
+})
+
+// ── F5 回归：CHANGELOG 的「最新」按版本号最大值取值，不再按「文件中最后一条」的位置假设 ──────────
+check('F5 回归：CHANGELOG 倒序（新条目顶插）→ 通过', () => {
+  const r = checkVersionValues(values({ changelog: '# Changelog\n\n## v3.272\n\n## v3.271\n' }))
+  assert.strictEqual(r.ok, true, `顶插新条目不应误红（旧实现取末条 3.271 会判红）：${text(r)}`)
+})
+
+check('F5 回归：有更大版本号时取最大值（数值比较，非字典序）', () => {
+  assert.strictEqual(latestChangelogVersion('# Changelog\n\n## v3.99\n\n## v3.272\n\n## v3.100\n'), '3.272',
+    '应取最大版本号 3.272（末条是 3.100，字典序会误判 3.99/3.100）')
+  assert.strictEqual(latestChangelogVersion('# Changelog\n\n## v3.9\n\n## v3.100\n'), '3.100', '3.100 > 3.9（数值而非字典序）')
+  assert.strictEqual(latestChangelogVersion('# Changelog\n\n没有条目\n'), null, '无条目应返回 null')
+  assert.strictEqual(compareBaseVersion('3.100', '3.99') > 0, true, 'compareBaseVersion 按数值比较')
+  assert.strictEqual(compareBaseVersion('3.272', '3.272'), 0, '相同版本应返回 0')
+})
+
+check('F5 回归：CHANGELOG 缺最新（文件头高于所有条目）→ 仍判红', () => {
+  const r = checkVersionValues(values({ headLine: '// 线报酷推送脚本 v3.273', changelog: '# Changelog\n\n## v3.272\n\n## v3.271\n' }))
+  assert.strictEqual(r.ok, false, '文件头高于 CHANGELOG 全部条目必须判红（取最大不得变成永不红）')
+  assert.match(text(r), /CHANGELOG = 3\.272/)
 })
 
 check('package.json 版本非法/缺失 → 判红（不抛栈）', () => {
