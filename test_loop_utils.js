@@ -68,6 +68,18 @@ const { runLoop, sleep, refreshTimeoutError, isAbortable } = require('./xbk_loop
     assert.ok(bogusElapsed >= 5, `非信号真值 ${JSON.stringify(bogus)} 应仍按毫秒正常等待，实际 ${bogusElapsed}ms`)
   }
 
+  // ===== 独立对抗审查 A 组指出的咬合力缺口：sleep 的**摘除侧**守卫此前无断言 =====
+  // 鸭子 signal 只有 addEventListener、没有 removeEventListener：若 done() 不守卫 removeEventListener，
+  // 回调里抛 TypeError → resolve() 永不执行 → Promise 永久挂起。生产不可达（真 AbortSignal 两者俱全），
+  // 但注释里宣称的「守卫同时覆盖摘除侧」必须有断言支撑，否则被变异掉也不会有测试变红。
+  {
+    const duckNoRemove = { aborted: false, addEventListener: () => {} }
+    await Promise.race([
+      sleep(10, duckNoRemove),
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error('sleep 在缺 removeEventListener 的 signal 上挂死')), 2000))
+    ])
+  }
+
   // ===== CodeRabbit PR #151（outside-diff）：runLoop 与 sleep 必须共用同一套取消判定 =====
   // 旧实现 runLoop 写 `const signal = options.signal || null`，于是 `{ aborted: true }` 会让
   // `while (!(signal && signal.aborted))` 直接为假——整轮 run 一次都不跑；而同一对象在 sleep 里
@@ -116,6 +128,14 @@ const { runLoop, sleep, refreshTimeoutError, isAbortable } = require('./xbk_loop
     assert.ok(capped.message.includes('2147483647ms 未完成'), `超上限时应报生效值，实际：${capped.message}`)
     assert.ok(capped.message.includes('配置请求 1000000000000ms'), `应标注被钳制前的配置请求值，实际：${capped.message}`)
     assert.strictEqual(capped.code, 'INTERVAL_REFRESH_TIMEOUT', '钳制分支错误码同样不变')
+    // 归因正确性（独立对抗审查 A 组反例）：非有限值走的是**回落默认**、负值走的是**下界**，
+    // 都不是「超上限钳制」——旧文案把三种情况统一说成超出上限，属错误归因、误导运维。
+    const nanCase = refreshTimeoutError(Number.NaN)
+    assert.ok(nanCase.message.includes('回落默认 10000ms'), `NaN 应报回落默认，实际：${nanCase.message}`)
+    assert.ok(!nanCase.message.includes('上限'), `NaN 不得归因为超上限，实际：${nanCase.message}`)
+    const negCase = refreshTimeoutError(-5)
+    assert.ok(negCase.message.includes('已按 0 处理'), `负值应报按下界处理，实际：${negCase.message}`)
+    assert.ok(!negCase.message.includes('上限'), `负值不得归因为超上限，实际：${negCase.message}`)
   }
 
   // ===== XL-02 回归：毫秒值超过 setTimeout 上限（2^31-1）必须钳制后再交给 Node =====

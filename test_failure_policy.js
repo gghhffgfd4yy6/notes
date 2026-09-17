@@ -426,12 +426,49 @@ function error (message, code) {
     '{"appToken":"***"}', '值内含转义反斜杠时凭据同样必须整体脱敏')
   assert.ok(!summarizeError({ message: '{"token":"x\\"ySECRET"}' }).message.includes('SECRET'),
     'token 关键字的转义引号形态同样不得残留')
-  // ③ 裸 Bearer（无关键字前缀，如上游把 Authorization 头值回显进 message）
+  // ③ 裸 Bearer/Basic（无关键字前缀，如上游把 Authorization 头值回显进 message）
   assert.strictEqual(summarizeError({ message: 'upstream said: Bearer SECRET123 rejected' }).message,
     'upstream said: Bearer *** rejected', '裸 Bearer 凭据必须脱敏（保留原大小写）')
+  assert.strictEqual(summarizeError({ message: 'Basic YWJjOmRlZg==' }).message,
+    'Basic ***', '裸 Basic 与裸 Bearer 必须对称处理（A 组反例：旧实现只认 Bearer）')
+
+  // ============ 独立对抗审查 A 组补漏：同一凭据被引号包住/换引号种类/非字符串值 ============
+  // 反例（补漏前实测）：下面每一条都会把凭据原样留在日志里。脱敏是安全控制，漏抹即泄漏。
+  assert.strictEqual(summarizeError({ message: 'Authorization: "Bearer SECRET123"' }).message,
+    'Authorization: "***"', '值被双引号包住时凭据必须整体脱敏（含 scheme）')
+  assert.strictEqual(summarizeError({ message: 'Authorization:"Bearer SECRET123"' }).message,
+    'Authorization:"***"', '冒号后无空格 + 引号值同样必须脱敏')
+  assert.strictEqual(summarizeError({ message: 'Authorization="Bearer SECRET123"' }).message,
+    'Authorization="***"', '等号 + 引号值同样必须脱敏')
+  assert.strictEqual(summarizeError({ message: "Authorization: 'Bearer SECRET123'" }).message,
+    "Authorization: '***'", '单引号值同样必须脱敏')
+  assert.strictEqual(summarizeError({ message: "{'token':'SECRET123'}" }).message,
+    "{'token':'***'}", 'JS 单引号 JSON 形态必须脱敏（旧实现整体不命中）')
+  assert.strictEqual(summarizeError({ message: '{"token":12345}' }).message,
+    '{"token":***}', '非字符串 JSON 值同样必须脱敏')
+  assert.strictEqual(summarizeError({ message: '"token" = "SECRET123"' }).message,
+    '"token" = "***"', '带引号的关键字 + 等号形态必须脱敏')
+  assert.strictEqual(summarizeError({ message: '?appToken=SECRET123&x=1' }).message,
+    '?appToken=***&x=1', 'URL query 形态必须脱敏（& 之后的参数不受影响）')
+  // 关键字表扩充（A 组：password/session/cookie 等常见凭据键此前完全不在表内）
+  assert.strictEqual(summarizeError({ message: 'password=SECRET123' }).message, 'password=***', 'password 键必须脱敏')
+  assert.strictEqual(summarizeError({ message: '{"password":"SECRET123"}' }).message, '{"password":"***"}', 'JSON password 必须脱敏')
+  assert.strictEqual(summarizeError({ message: 'session: SECRET123' }).message, 'session: ***', 'session 键必须脱敏')
+  assert.strictEqual(summarizeError({ message: 'cookie=SECRET123' }).message, 'cookie=***', 'cookie 键必须脱敏')
+  assert.strictEqual(summarizeError({ message: 'refresh_token=SECRET123' }).message, 'refresh_token=***', 'refresh_token 键必须脱敏')
+  // 有意的边界：逗号/分号/& 视为「值结束」——`token=a,b` 只抹 a（b 属下一个参数）
+  assert.strictEqual(summarizeError({ message: 'token=a,b' }).message, 'token=***,b',
+    '逗号视为值分隔符（有意收窄，避免吞掉后续参数）——若改为吞到空白需同步改本条')
+  // 未闭合引号值同样必须抹掉（否则整段漏抹）
+  assert.strictEqual(summarizeError({ message: 'token="x' }).message, 'token="***"', '未闭合引号值必须脱敏')
+
   // 反向断言：无凭据文本不得被脱敏误改（防止把规则写成吞掉正常内容）
   assert.strictEqual(summarizeError({ message: 'request timed out after 5000ms' }).message,
     'request timed out after 5000ms', '无凭据文本不应被脱敏改动')
+  // A 组反例：本批前一版给裸 scheme 规则加了「任意长度凭据」匹配，把普通英文句子误抹。
+  // 现要求凭据部分 ≥8 个凭据字符，句子里的 `bearer of good news` 不再被误抹。
+  assert.strictEqual(summarizeError({ message: 'the bearer of good news' }).message,
+    'the bearer of good news', '普通英文句子里的 bearer 不得被误抹（凭据长度门槛）')
   assert.strictEqual(summarizeError({ failureInfo: { message: 'plain text 1\n2' } }).message, 'plain text 1 2',
     '无凭据文本的换行折叠口径不变')
   // 非字符串字段原样保留，脱敏不改变结构语义
