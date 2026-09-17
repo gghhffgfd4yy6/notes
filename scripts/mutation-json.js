@@ -47,7 +47,10 @@ function appendWithPlaceholder (chunks, buf, pos, idx) {
   chunks.push(buf.subarray(pos, idx), KEY, PLACEHOLDER)
 }
 
-function readReportJson (reportPath) {
+function readReportJson (reportPath, options = {}) {
+  // F1：V8 字符串上限可被调用侧覆盖（默认 MAX_STRING_LENGTH）。生产调用方一律不传，
+  // 该形参只为测试构造「剥离后仍超限」的输入——否则验证这条护栏需要一个 512MiB 级夹具。
+  const maxStringLength = Number.isFinite(options && options.maxStringLength) ? options.maxStringLength : MAX_STRING_LENGTH
   // nosemgrep: 工具脚本按 CLI 传入路径读取报告，路径非用户净输入
   // Trust Model（v3.266 强化）：readReportJson 是内部 API，期望 reportPath
   //   来自已校验目录——scripts/mutation-report.js 链中 fs.statSync(dir)
@@ -71,6 +74,10 @@ function readReportJson (reportPath) {
   let pos = 0
   // 剥离是无条件的：全 buffer 扫描，任意嵌套层级的字符串型 statusReason 一律置为 ""
   // 返回值不携带「已改写」标记，调用方无法区分「被改写为空串」与「本来就是空串」
+  // F1：边扫边累计剥离后的字节数。原先只在 Buffer.concat **之后**才比 MAX_STRING_LENGTH，
+  // 那时整份报告已被复制一遍（分配峰值）；累计长度让上限判定落在 concat 之前，
+  // 超限输入在读完之后、分配峰值之前就带路径快速失败。
+  let strippedLength = buf.length
   let idx = buf.indexOf(KEY, pos)
   while (idx !== -1) {
     const valueEnd = statusReasonValueEnd(buf, idx)
@@ -80,17 +87,19 @@ function readReportJson (reportPath) {
       chunks.push(buf.subarray(pos, idx + KEY.length))
       pos = idx + KEY.length
     } else {
+      // 丢弃 [idx+KEY.length, valueEnd) 共 (valueEnd-idx)-KEY.length 字节，改写为 2 字节占位
+      strippedLength -= (valueEnd - idx) - KEY.length - PLACEHOLDER.length
       appendWithPlaceholder(chunks, buf, pos, idx)
       pos = valueEnd
     }
     idx = buf.indexOf(KEY, pos)
   }
   chunks.push(buf.subarray(pos))
-  const stripped = Buffer.concat(chunks)
   // 剥离后仍超上限：快速失败并给出可行动报错（V8 原生异常不含文件上下文）
-  if (stripped.length > MAX_STRING_LENGTH) {
-    throw new Error(`JSON 剥离 statusReason 后仍为 ${stripped.length} 字节，超过 V8 字符串上限 ${MAX_STRING_LENGTH}：${abs}`)
+  if (strippedLength > maxStringLength) {
+    throw new Error(`JSON 剥离 statusReason 后仍为 ${strippedLength} 字节，超过 V8 字符串上限 ${maxStringLength}：${abs}`)
   }
+  const stripped = Buffer.concat(chunks)
   try {
     return JSON.parse(stripped.toString('utf8'))
   } catch (err) {

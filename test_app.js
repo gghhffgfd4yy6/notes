@@ -2002,18 +2002,37 @@ console.log('========================================\n');
     fakeData = []
     const origInterval = Config.alert.intervalMs
     const origEnabled = Config.alert.enabled
+    // APP-05：临时把进程时区设为 UTC，让「上海口径」与「进程本地口径」必然相差 8 小时。
+    // 本机默认 TZ=Asia/Shanghai 时两种实现渲染结果完全相同、断言对缺陷没有咬合力（CI runner 即 UTC）。
+    const savedTz = process.env.TZ
+    process.env.TZ = 'UTC'
     try {
       // ① 不限频 → 接口异常发告警
       Config.alert.enabled = true // reset() 默认关闭（v3.124），此处显式开启
       Config.alert.intervalMs = 0
       fail4xx = true // 404 不重试 → run 抛错
+      const tBefore = Date.now()
       let threw = false
       try { await xbk.run() } catch (e) { threw = true }
+      const tAfter = Date.now()
       assert(threw, '接口异常应抛错')
       const alert = pushCalls.find(c => c.text.includes('运行异常'))
       assert(!!alert, '应发送运行异常告警')
       assert(alert.desp.includes('Not Found'), `告警内容应含原因: ${alert.desp.slice(0, 80)}`)
       assert(alert.desp.includes('\n\n时间：'), `告警 desp 应用段落分隔 \\n\\n（v3.159，wxpusher Markdown 渲染单\\n可能挤行）: ${JSON.stringify(alert.desp.slice(0, 60))}`)
+      // APP-05：正文里的时间必须是上海口径。反例（改动前）：toLocaleString('zh-CN') 不带 timeZone，
+      // TZ=UTC 时渲染 UTC（比上海早 8 小时），与 run.log/日报的上海口径错开。
+      const alertStamp = (alert.desp.match(/时间：([^\n]+)/) || [])[1]
+      // 期望值用与应用**同一个**表达式求（toLocaleString 默认含日期+时间，而 Intl.DateTimeFormat
+      // 构造器默认只到日期，两者不可互替），只在 timeZone 上做对照。
+      const fmtZh = (tz, t) => new Date(t).toLocaleString('zh-CN', { timeZone: tz })
+      // CodeRabbit PR #151：告警时间被格式化到**整秒**，而 desp 构造发生在 run 中途——只要跨过
+      // 秒边界，渲染出的秒就可能既不是 tBefore 也不是 tAfter（旧写法只允许两个端点 → 偶发红）。
+      // 改为允许区间内每一个可能的渲染秒。
+      const allowedStamps = new Set()
+      for (let t = Math.floor(tBefore / 1000) * 1000; t <= tAfter; t += 1000) allowedStamps.add(fmtZh('Asia/Shanghai', t))
+      assert(allowedStamps.has(alertStamp),
+        `告警正文时间必须是 Asia/Shanghai 口径（进程 TZ=${process.env.TZ}；同一时刻的 UTC 渲染为 ${fmtZh('UTC', tBefore)}）：实际 ${alertStamp}`)
       // ② 限频生效：intervalMs 大 → 第二次异常不发（状态文件记录上次）
       Config.alert.intervalMs = 3600000
       reset()
@@ -2025,7 +2044,38 @@ console.log('========================================\n');
     } finally {
       Config.alert.intervalMs = origInterval
       Config.alert.enabled = origEnabled
+      if (savedTz === undefined) delete process.env.TZ
+      else process.env.TZ = savedTz
       try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('APP-05：RE2 标记保留期与标记名同用上海日界', async () => {
+    // 固定「现在」为 UTC 2026-09-15T20:00:00Z——此刻上海已是 2026-09-16，UTC 仍是 09-15，
+    // 两种口径的「7 天前」cutoff 必然差一天（上海 2026-09-09 vs UTC 2026-09-08），断言因此有判别力。
+    const FIXED_NOW = Date.parse('2026-09-15T20:00:00Z')
+    const savedTz = process.env.TZ
+    const realDateNow = Date.now
+    process.env.TZ = 'UTC'
+    Date.now = () => FIXED_NOW
+    const prefix = 're2warn.state.'
+    const markers = ['2026-09-08', '2026-09-09', '2026-09-10']
+    try {
+      fs.mkdirSync(CACHE_DIR, { recursive: true })
+      for (const d of markers) fs.writeFileSync(path.join(CACHE_DIR, `${prefix}${d}`), 'test')
+      xbk.App._cleanupStaleRe2WarnMarkers()
+      assert(fs.existsSync(path.join(CACHE_DIR, `${prefix}2026-09-08`)) === false,
+        '上海 cutoff=2026-09-09，故 09-08 必须删除（旧实现按进程本地 UTC 得 cutoff=09-08，会把它留下）')
+      assert(fs.existsSync(path.join(CACHE_DIR, `${prefix}2026-09-09`)) === true,
+        'cutoff 当天不算“严格早于”，必须保留')
+      assert(fs.existsSync(path.join(CACHE_DIR, `${prefix}2026-09-10`)) === true, '保留期内的标记必须保留')
+    } finally {
+      Date.now = realDateNow
+      if (savedTz === undefined) delete process.env.TZ
+      else process.env.TZ = savedTz
+      for (const d of markers) {
+        try { fs.unlinkSync(path.join(CACHE_DIR, `${prefix}${d}`)) } catch (e) { /* 已删/不存在 */ }
+      }
     }
   })
 

@@ -69,9 +69,12 @@ function validateSegments (results, expected = EXPECTED_SEGMENTS) {
   if (duplicated.length > 0) {
     throw new Error(`变异测试报告分段重复：${duplicated.join(', ')}；拒绝发布重复计入的日报`)
   }
-  const errored = results.filter(result => result.error).map(result => result.seg)
+  const errored = results.filter(result => result.error)
   if (errored.length > 0) {
-    throw new Error(`变异测试报告包含错误分段：${errored.join(', ')}；拒绝发布不完整日报`)
+    // F2：逐段带上原因。只报段名时无法区分「缺报告」「报告损坏」与「报告内容非法（缓存回填）」，
+    // 而 CI 日志里这条错误往往就是唯一线索——排查者据此才能判断要不要重跑该段。
+    const detail = errored.map(result => `${result.seg}（${result.error}）`).join('；')
+    throw new Error(`变异测试报告包含错误分段：${detail}；拒绝发布不完整日报`)
   }
   return results
 }
@@ -112,8 +115,39 @@ function analyzeSegment (dir, entry) {
     if (!report || typeof report !== 'object') {
       throw new Error(`报告顶层结构非法（${report === null ? 'null' : typeof report}），无法读取 files`)
     }
-    for (const [fileKey, file] of Object.entries(report.files || {})) {
-      for (const m of file.mutants || []) countMutant(stats, fileKey, m)
+    // F2：段内容校验——「报告能解析」不等于「报告是本次运行的产出」。stryker 的 json reporter 必定
+    // 写出 files 映射；files 缺失/非对象/为空只会让统计归 0、分数归 0，随后 render 走
+    // 「🎉 无存活变异体！」并 exit 0——把「artifact 里是上一次的缓存回填 / 上游未产出」伪装成满分日报。
+    // 这里逐层显式失败，错误进 validateSegments 的 errored 分支 → 拒绝发布不完整日报。
+    const files = report.files
+    if (!files || typeof files !== 'object' || Array.isArray(files)) {
+      throw new Error(`报告缺少 files 映射（实际 ${files === null ? 'null' : Array.isArray(files) ? 'array' : typeof files}），疑似非本次运行的报告`)
+    }
+    for (const [fileKey, file] of Object.entries(files)) {
+      if (!file || typeof file !== 'object' || Array.isArray(file)) {
+        throw new Error(`files["${fileKey}"] 结构非法（${file === null ? 'null' : typeof file}）`)
+      }
+      if (!Array.isArray(file.mutants)) {
+        throw new Error(`files["${fileKey}"].mutants 缺失或非数组`)
+      }
+      // CodeRabbit PR #151：只校验「是数组」不够。countMutant 先 total++ 再按已知状态分类，
+      // 于是 `{}` / 缺 status 的条目会绕过上面的「零变异体」护栏——total 被抬高、哪一个桶都
+      // 计不进去，分数被压低后照发。这里要求每条都是带非空字符串 status 的对象。
+      // **刻意不采用「只认 Killed/Survived/NoCoverage/Timeout」的白名单**：stryker 的合法状态
+      // 还有 RuntimeError / CompileError / Ignored / Pending，白名单会把正常报告整段拒掉
+      // （下方 CLI 场景 6 用 RuntimeError 锁定这一点）。未列入桶的合法状态仍只计入 total。
+      for (const m of file.mutants) {
+        const status = m && typeof m === 'object' && !Array.isArray(m) ? m.status : undefined
+        if (typeof status !== 'string' || status === '') {
+          throw new Error(`files["${fileKey}"].mutants 含缺失或非法 status 的条目（status=${JSON.stringify(status)}）`)
+        }
+        countMutant(stats, fileKey, m)
+      }
+    }
+    // files 非空但一个变异体都没有（如各文件 mutants 均为空数组）同样是「零内容报告」，
+    // 会照样渲染出 🎉 满分——一并按段级失败处理。
+    if (stats.total === 0) {
+      throw new Error('报告不含任何变异体（files 为空映射或各文件 mutants 均为空）')
     }
   } catch (e) {
     return { seg, error: `${String(e.message || e)}（报告：${reportPath}）` }

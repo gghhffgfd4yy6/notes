@@ -24,9 +24,29 @@ function safeString (value) {
   try { return String(value === undefined || value === null ? '' : value) } catch (e) { return '' }
 }
 
+// 凭据关键字（保持历史顺序，保证同形输入的命中位置与既有行为一致）
+const SECRET_KEY = '(?:token|app[_-]?token|key|secret|authorization|pushkey)'
+
+// XFP-04：脱敏必须**整体**抹掉凭据，而不是只抹关键字后的第一个词。三条规则对应三类书写形态：
+// ① 键值形态 `<keyword> = <credential>`。Authorization 类头部写作 `<keyword>: <scheme> <credential>`，
+//    旧的 `[^\s,;]+` 只吃掉 scheme——`Authorization: Bearer SECRET123 x` 被脱成
+//    `Authorization: *** SECRET123 x`，真正的凭据原样残留；这里把 bearer/basic 前缀并入本次匹配。
+// ② JSON/JS 引号形态 `"appToken":"SECRET123"`：关键字与冒号之间夹着引号，旧正则要求关键字后
+//    直接是 `=`/`:`，整体不命中，凭据原样出网（日志/告警/摘要），故单列一条带引号规则。
+//    值部分必须按 JSON 转义语义吃完整串（`(?:\\.|[^"\\])*`）而不能用 `[^"]*`：后者把值内
+//    的转义引号（如 `{"appToken":"abc\"SECRET"}`）当成收尾引号，只抹掉前半段、把 `SECRET"`
+//    这类后缀原样留在日志里（qodo PR #151-1，脱敏是安全控制，漏抹即凭据泄漏）。
+// ③ 裸 `Bearer <credential>`（无关键字前缀，例如上游把 Authorization 头值回显进 message）。
+// 脱敏方向上一律宁可多抹：误抹只是可读性损失，漏抹就是凭据泄漏。
+const SECRET_KV_RE = new RegExp(`(${SECRET_KEY}\\s*[=:]\\s*)(?:bearer\\s+|basic\\s+)?[^\\s,;]+`, 'gi')
+const SECRET_KV_QUOTED_RE = new RegExp(`("${SECRET_KEY}"\\s*:\\s*")(?:\\\\.|[^"\\\\])*(")`, 'gi')
+const BEARER_RE = /\b(bearer)\s+[^\s,;]+/gi
+
 function redact (text) {
   return safeString(text)
-    .replace(/((?:token|app[_-]?token|key|secret|authorization|pushkey)\s*[=:]\s*)[^\s,;]+/gi, '$1***')
+    .replace(SECRET_KV_RE, '$1***')
+    .replace(SECRET_KV_QUOTED_RE, '$1***$2')
+    .replace(BEARER_RE, '$1 ***')
     .replace(/\/bot[^/\s]+/gi, '/bot***')
 }
 
@@ -186,7 +206,7 @@ function classifyOne (error) {
   const channel = String(info.channel || '').toLowerCase()
   const message = String(info.message || '').toLowerCase()
   const permanentMessage = /接口返回数据格式异常|未配置任何推送通道|invalid\s+url|module\s+not\s+found|证书.*(主机|域名)|主机名.*证书/.test(message) ||
-        /(?:unauthori[sz]ed|forbidden|bad request|not found|invalid\s+(?:token|key|parameter)|(?:token|key|密钥).*(?:invalid|invalidated|无效|错误|不存在|过期))/.test(message) ||
+        /(?:unauthori[sz]ed|forbidden|bad request|not found|invalid\s+(?:(?:webhook|access|api)\s+)?(?:token|key|parameter)|(?:token|key|密钥).*(?:invalid|invalidated|无效|错误|不存在|过期))/.test(message) ||
         /(?:参数|配置).*(?:错误|无效|非法)/.test(message) ||
         /(?:certificate has expired|certificate is not yet valid|self[- ]signed certificate|unable to verify the first certificate|unable to get (?:[a-z0-9_-]+\s+)*issuer certificate|certificate signature failure|certificate (?:has been )?revoked)/.test(message) ||
         /(?:证书(?:已)?(?:过期|失效|吊销)|证书尚未生效|自签名证书|无法获取(?:本地)?(?:颁发者证书|证书颁发者)|证书签名(?:校验)?失败)/.test(message)
@@ -208,7 +228,9 @@ function classifyOne (error) {
     }
     // v3.232：仅明确配置类错误判永久（key/token 无效、缺 token、无权限、webhook 未找到）；
     // 其余（如 500 系统繁忙）落回通用分类（5xx → retryable），防瞬时错误误判永久导致常驻停止重试、消息丢失
-    if (['40014', '41001', '42001', '45001', '130101'].includes(providerCode)) {
+    // XFP-02：补 93000（群机器人 invalid webhook key）——webhook key 无效是配置类永久错误，
+    // 落在 UNKNOWN 会让常驻永久退避重试同一个失效 webhook（每轮都失败且永不停止）。
+    if (['40014', '41001', '42001', '45001', '130101', '93000'].includes(providerCode)) {
       return { kind: 'permanent', reason: `QYWX_${providerCode}`, info }
     }
   }
@@ -266,11 +288,13 @@ function classifyFailure (error) {
 
 function classifySummary (summary) {
   if (!summary || typeof summary !== 'object') return null
-  const total = Number(summary.total) || 0
   const pushed = Number(summary.pushed) || 0
   const failed = Number(summary.failed) || 0
-  // 有失败消息时进入分类；纯部分成功且剩余失败均为可重试/未知时继续，明确永久失败则停止。
-  if (total <= 0 || failed <= 0) return null
+  // XFP-03：「有没有失败」只由 failed 决定。旧条件写作 `total <= 0 || failed <= 0`，而
+  // total 来自 `Number(summary.total) || 0`——total 缺失、非数字（或恰好为 0）时即为 0，
+  // 于是一个「报了失败但没报 total / total 非数字」的摘要被判成「无失败」返回 null，
+  // 调度器据此读成成功（绿色），失败被静默吞掉。total 只描述本轮规模，不参与该判定。
+  if (failed <= 0) return null
   const failures = safeArray(readProp(summary, 'failures')) || []
   if (failures.length === 0) {
     return pushed > 0

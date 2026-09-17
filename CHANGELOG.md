@@ -50,3 +50,13 @@
 - 接口响应：带 UTF-8 BOM 的合法 JSON 不再被判 `ERR_BODY_NOT_JSON`（此前会让常驻循环按永久错误停推）；`XBK_PROFILE=3` 的请求日志 URL 只保留 origin（非末段密钥不再进日志）；响应体非法时不再回显响应体内容、只报长度。
 - 入口与状态：青龙入口未识别参数、`XBK_CACHE_DIR` 非绝对路径、Node 低于 `engines` 要求均补告警（不再静默），依赖恢复改用现行等价的 `--omit=dev`，`--check` 失败项带上原因、DNS/TLS 预热统计按任务类型绑定（TLS 不再计入 DNS 计数）；`--status` 的 `run.log` 摘要解析锚定行首（噪声行不再误命中）、`report.state` 缺字段不再整表判 invalid，输出补「待推送（截断）」「截断」「耗时」。
 - 门禁与工具链：单元入口新增每套件硬超时 `XBK_UNIT_TIMEOUT`（默认 10 分钟，超时 SIGKILL 并按失败结算）；`check-version.js` / `run_unit_tests.js` 改用 `process.exitCode` 收尾（管道场景不丢错误详情）；变异日报对预期之外/重复分段 fail-loud、报告顶层非对象时报带上下文的错误；行段校验补 `start > end`、非末段越过 EOF 与全文件形式的幽灵目标三类 fail-loud，对 `MUTATION_WORKFLOW_TEXT` 注入打告警（区分注入与真实文件读取），变异报告 JSON 读取失败补路径上下文；`install-hooks.js` 读取 `core.hooksPath` 出错时 exit 1 且不写配置（保留 git 的 stderr），空串值按未配置处理并写入 `.githooks`；`isValidVersion` 补 `typeof` 守卫；`xbk_sendNotify_slim.js` 段二行段随行数同步为 `751-1505`。
+
+## v3.275
+
+- 常驻循环 `sleep`：`signal` 加 `typeof` 守卫（此前传入非 AbortSignal 的真值对象会先抛 `TypeError`，定时器回调里再抛一次成为未捕获异常终止进程）；毫秒值统一经 `clampTimerMs` 钳到 `[0, 2147483647]` 再交给 `setTimeout`（此前 `1e12` 被 Node 静默降为 1ms，「等一天」变成立即返回）。
+- 失败归类：`classifySummary` 的「本轮有无失败」只由 `failed` 决定（此前 `total` 缺失/非数字时 `Number(total)||0` 使有失败的摘要返回 `null`，被调度器读成成功）；企业微信 `93000`（invalid webhook key）与文本兜底 `invalid [webhook|access|api] token|key|parameter` 判为永久配置错误（此前落 `UNKNOWN`，常驻对已失效 webhook 无限退避重试）。
+- 脱敏：`redact` 补齐 `Authorization: Bearer|basic <凭据>`、JSON 引号形态 `"appToken":"…"` 与裸 `Bearer <凭据>`（此前这些形态的凭据原样进日志与告警，只抹掉 scheme）。
+- TLS 预热：`prewarmTls` 的 `count` 补上界（钳到 64）——此前 `1e10`/`2^32` 让 `Array.from({length})` 抛 `RangeError` 整体 reject，略小的值则真的发起海量并发连接。
+- 时间口径：运行异常告警正文的时间、RE2 缺 re2 提醒标记的保留期 cutoff 统一 `Asia/Shanghai`（此前前者随进程时区，后者与标记名基准被拆开，CI 的 UTC 下与 run.log/日报错开一天）。
+- 变异工具链：报告 JSON 的 V8 字符串上限判定移到 `Buffer.concat` 之前（此前先付出分配峰值才发现放不下，且该护栏长期无法被测试触及）；变异日报段内容校验补 `files` 映射缺失/类型非法、`mutants` 非数组、零变异体三类 fail-loud（此前缓存回填的陈旧 artifact 会被当成 0 变异体的满分日报发布），`validateSegments` 的错误逐段带上原因；CLI 集成测试夹具改为真 stryker schema，断言收紧到合计/分段统计值。
+

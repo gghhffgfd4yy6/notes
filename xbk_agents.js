@@ -139,6 +139,13 @@ function invalidateDns (hostname) {
   return removed
 }
 
+// AGENTS-03（上界）：count 只设下界不够。1e10 / 2^32 这类值会让后面的 Array.from({ length })
+// 抛 RangeError（prewarmTls 整体 reject，且调用方通常只处理 ok/okCount，异常会变成未捕获拒绝）；
+// 略小一些的值则会真的发起海量并发连接，打爆目标站点与本进程的 fd/内存。
+// 上界取 64：仓内调用方全部远低于此（xbk_app.js 预热窗口 ≤10、qinglong 入口 ≤3），
+// 既要挡住误填，也不能收紧既有合法用途。
+const MAX_PREWARM_TLS_CONNECTIONS = 64
+
 async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null) {
   const started = Date.now()
   if (signal && signal.aborted) return { hostname, count, skipped: true, cancelled: true, ok: false, okCount: 0, elapsedMs: 0 }
@@ -157,11 +164,15 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
     throwHttpErrors: false,
     ...(signal ? { signal } : {})
   }
-  // 边界守卫（AGENTS-03）：NaN/Infinity/非数字一律钳制为 1。此前 count=NaN 会得到空数组并静默返回
-  // ok:true/okCount:0（未建连却报成功），count=Infinity 会让 Array.from 抛 RangeError；合法数值
-  // （含 0/负数→1，与旧 Math.max(1, …) 同口径）行为不变。
+  // 边界守卫（AGENTS-03）：NaN/Infinity/非数字一律钳制为 1，且整体收敛到
+  // [1, MAX_PREWARM_TLS_CONNECTIONS]。此前 count=NaN 会得到空数组并静默返回 ok:true/okCount:0
+  // （未建连却报成功），count=Infinity 会让 Array.from 抛 RangeError；而遗留的 1e10 / 2^32
+  // 仍会抛 RangeError（守卫只排除了非有限值，没设上界）。合法小数值（含 0/负数→1，与旧
+  // Math.max(1, …) 同口径）行为不变。
   const requestedCount = Math.floor(Number(count))
-  const connectionCount = Number.isFinite(requestedCount) && requestedCount >= 1 ? requestedCount : 1
+  const connectionCount = Number.isFinite(requestedCount) && requestedCount >= 1
+    ? Math.min(requestedCount, MAX_PREWARM_TLS_CONNECTIONS)
+    : 1
   const results = await Promise.all(Array.from({ length: connectionCount }, async () => {
     const singleStart = Date.now()
     try {

@@ -73,6 +73,18 @@ function error (message, code) {
   assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 130101, message: 'webhook not found' }).kind, 'permanent')
   assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 41001, message: 'missing token' }).kind, 'permanent')
   assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 42001, message: 'token expired' }).kind, 'permanent')
+  // XFP-02：群机器人 webhook key 失效（errcode 93000）是配置类永久错误。反例（改动前）：
+  // 93000 不在永久清单、文本兜底要求 invalid 后紧跟 token|key|parameter 接不住 'invalid webhook
+  // key'（中间有 webhook），于是落回 UNKNOWN → retryable，常驻会对同一个失效 webhook 永久退避重试。
+  assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 93000, message: 'invalid webhook key' }).kind, 'permanent')
+  assert.strictEqual(classifyFailure({ channel: '企业微信', providerCode: 93000, message: 'invalid webhook key' }).reason, 'QYWX_93000')
+  // 无 channel/providerCode 时由文本兜底接住（同一缺陷的另一条路径）
+  assert.strictEqual(classifyFailure({ message: 'invalid webhook key' }).kind, 'permanent')
+  assert.strictEqual(classifyFailure({ message: 'invalid webhook key' }).reason, 'CONFIG_OR_CONTRACT')
+  assert.strictEqual(classifyFailure({ message: 'invalid access token' }).kind, 'permanent')
+  // 反向断言：兜底放宽不能把正常业务错判永久——'invalid' 后不是凭据类词的仍走通用分类
+  assert.strictEqual(classifyFailure({ message: 'invalid response payload shape' }).kind, 'retryable')
+  assert.strictEqual(classifyFailure({ message: 'invalid state transition' }).kind, 'retryable')
   assert.strictEqual(classifyFailure(error('完全未知故障')).kind, 'retryable')
   assert.strictEqual(classifyFailure(Object.assign(new SyntaxError('代码解析失败'), { name: 'SyntaxError' })).kind, 'permanent')
 
@@ -259,6 +271,21 @@ function error (message, code) {
   // classifySummary：部分成功 + failures 空数组 → 保持成功，不熔断
   assert.strictEqual(classifySummary({ total: 2, pushed: 1, failed: 1, failures: [] }), null)
 
+  // [XFP-03] 「有没有失败」只由 failed 决定，不得被 total 的缺失/非数字带偏。
+  // 反例（改动前）：`Number(total)||0` 使 total<=0 成立 → 直接返回 null，一个有失败的摘要
+  // 被判成“无失败”即成功，调度器按绿色处理、失败被静默吞掉。
+  assert.strictEqual(classifySummary({ failed: 1, failures: [{ code: 'HTTP_401', message: 'unauthorized' }] }).kind, 'permanent',
+    'total 缺失但 failed>0 时必须进入分类，不能返回 null')
+  assert.strictEqual(classifySummary({ total: 'x', failed: 1, failures: [{ code: 'HTTP_401', message: 'unauthorized' }] }).kind, 'permanent',
+    'total 非数字但 failed>0 时必须进入分类，不能返回 null')
+  assert.strictEqual(classifySummary({ total: 0, failed: 2, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }] }).kind, 'retryable',
+    'total 为 0 但 failed>0 时必须进入分类（宁可重试，不可静默丢）')
+  // 反向断言：真正无失败/非法 failed 仍必须返回 null，不能被放宽成“一律失败”
+  assert.strictEqual(classifySummary({ total: 5, failed: 0 }), null, 'failed=0 仍为成功')
+  assert.strictEqual(classifySummary({ total: 5 }), null, 'failed 缺失仍为成功')
+  assert.strictEqual(classifySummary({ total: 5, failed: 'abc' }), null, 'failed 非数字仍为成功')
+  assert.strictEqual(classifySummary({ total: 5, failed: -1 }), null, 'failed 负数仍为成功')
+
   // code 数值 400-499（未命中 message/错误码集合）→ PROVIDER_xxx 永久
   assert.strictEqual(classifyFailure({ code: 450, message: 'server replied' }).kind, 'permanent')
   assert.strictEqual(classifyFailure({ code: 450, message: 'server replied' }).reason, 'PROVIDER_450')
@@ -376,6 +403,37 @@ function error (message, code) {
     'failureInfo 的任意字符串字段都应脱敏')
   assert.strictEqual(summarizeError({ failureInfo: { message: 'l1\nl2' } }).message, 'l1 l2',
     'failureInfo.message 应与常规路径一致折叠换行')
+
+  // [XFP-04 脱敏覆盖] 同一凭据换一种书写形态就不能漏抹——脱敏是「按形态」的，漏一种就是泄漏一种。
+  // ① Authorization 头形态：反例（改动前）只吃掉 scheme，凭据残留 → `Authorization: *** SECRET123 x`。
+  assert.strictEqual(summarizeError({ message: 'Authorization: Bearer SECRET123 x' }).message,
+    'Authorization: *** x', 'Authorization 头的凭据必须整体脱敏，不能只抹 Bearer')
+  assert.strictEqual(summarizeError({ message: 'authorization: basic YWJjOmRlZg==' }).message,
+    'authorization: ***', 'basic 认证串必须整体脱敏')
+  // ② JSON/JS 引号形态：反例（改动前）关键字与冒号之间夹引号 → 整体不命中，凭据原样带出。
+  assert.strictEqual(summarizeError({ message: '{"appToken":"SECRET123"}' }).message,
+    '{"appToken":"***"}', 'JSON 引号形态的 appToken 必须脱敏')
+  assert.strictEqual(summarizeError({ failureInfo: { detail: '{"secret":"SECRET123","n":1}' } }).detail,
+    '{"secret":"***","n":1}', 'failureInfo 字符串字段的 JSON 引号形态凭据同样脱敏')
+  // ②b JSON 值内含转义序列：值匹配必须按 JSON 转义语义吃到真正的收尾引号。
+  // 反例（qodo PR #151-1）：`[^"]*` 把值内的 \" 当成收尾引号——'{"appToken":"abc\"SECRET"}' 只被抹掉
+  // 前半段、凭据后缀原样进日志/告警（脱敏是安全控制，漏抹即泄漏）。
+  assert.strictEqual(summarizeError({ message: '{"appToken":"abc\\"SECRET"}' }).message,
+    '{"appToken":"***"}', '值内含转义引号时凭据必须整体脱敏，不得残留后缀')
+  assert.ok(!summarizeError({ message: '{"appToken":"abc\\"SECRET"}' }).message.includes('SECRET'),
+    '转义引号形态不得残留凭据后缀')
+  assert.strictEqual(summarizeError({ message: '{"appToken":"a\\\\bSECRET"}' }).message,
+    '{"appToken":"***"}', '值内含转义反斜杠时凭据同样必须整体脱敏')
+  assert.ok(!summarizeError({ message: '{"token":"x\\"ySECRET"}' }).message.includes('SECRET'),
+    'token 关键字的转义引号形态同样不得残留')
+  // ③ 裸 Bearer（无关键字前缀，如上游把 Authorization 头值回显进 message）
+  assert.strictEqual(summarizeError({ message: 'upstream said: Bearer SECRET123 rejected' }).message,
+    'upstream said: Bearer *** rejected', '裸 Bearer 凭据必须脱敏（保留原大小写）')
+  // 反向断言：无凭据文本不得被脱敏误改（防止把规则写成吞掉正常内容）
+  assert.strictEqual(summarizeError({ message: 'request timed out after 5000ms' }).message,
+    'request timed out after 5000ms', '无凭据文本不应被脱敏改动')
+  assert.strictEqual(summarizeError({ failureInfo: { message: 'plain text 1\n2' } }).message, 'plain text 1 2',
+    '无凭据文本的换行折叠口径不变')
   // 非字符串字段原样保留，脱敏不改变结构语义
   const fiStructured = summarizeError({ failureInfo: { code: 'HTTP_500', statusCode: 500, message: 'ok' } })
   assert.strictEqual(fiStructured.code, 'HTTP_500')

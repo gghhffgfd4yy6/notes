@@ -1,7 +1,8 @@
 'use strict'
 
 const assert = require('assert')
-const { runLoop, sleep } = require('./xbk_loop')
+const { spawnSync } = require('node:child_process')
+const { runLoop, sleep, refreshTimeoutError, isAbortable } = require('./xbk_loop')
 
 ;(async () => {
   // ===== sleep：正常等待 =====
@@ -51,6 +52,99 @@ const { runLoop, sleep } = require('./xbk_loop')
   const defaultElapsed = Date.now() - t3b
   assert.ok(defaultElapsed >= 40, `sleep(NaN) 应使用默认 10000ms 并在 50ms 后被 abort，实际 ${defaultElapsed}ms（若 <40ms 说明默认值未生效）`)
   assert.ok(defaultElapsed < 500, `sleep(NaN) 不应过度等待，实际 ${defaultElapsed}ms`)
+
+  // ===== XL-01 回归：非 AbortSignal 的真值 signal 不得抛错、更不得留下未捕获异常 =====
+  // 反例（改动前）：sleep(10, {}) 在 executor 里调 signal.addEventListener 抛 TypeError →
+  // Promise reject；而定时器已调度，10ms 后 done() 又调 signal.removeEventListener 二次抛错，
+  // 这次落在定时器回调里成为未捕获异常（uncaughtException）直接终止进程。
+  // 断言分两层：① await 不得 reject；② await 期间真实等到约 10ms（说明定时器正常走完，
+  // 反例里定时器回调抛错会让进程在 await 之后崩掉，即本套件整体变红）。
+  // `{ aborted: true }`（qodo PR #151-2）：只有同名属性、没有可听接口，不得被当成「已取消」
+  // 而跳过等待——否则调用方的重试/轮询间隔凭空消失，常驻循环退化为空转。
+  for (const bogus of [{}, { aborted: false }, { aborted: true }, 42, 'signal-string', { addEventListener: 1 }]) {
+    const tBogus = Date.now()
+    await sleep(10, bogus)
+    const bogusElapsed = Date.now() - tBogus
+    assert.ok(bogusElapsed >= 5, `非信号真值 ${JSON.stringify(bogus)} 应仍按毫秒正常等待，实际 ${bogusElapsed}ms`)
+  }
+
+  // ===== CodeRabbit PR #151（outside-diff）：runLoop 与 sleep 必须共用同一套取消判定 =====
+  // 旧实现 runLoop 写 `const signal = options.signal || null`，于是 `{ aborted: true }` 会让
+  // `while (!(signal && signal.aborted))` 直接为假——整轮 run 一次都不跑；而同一对象在 sleep 里
+  // 已被判为非信号（会正常等待）。两条路径的取消规则互相矛盾。
+  assert.strictEqual(isAbortable({ aborted: true }), false, '只有同名属性、无可听接口的对象不算信号')
+  assert.strictEqual(isAbortable({ aborted: false }), false, '非信号真值对象不算信号')
+  assert.strictEqual(isAbortable({ addEventListener: 1 }), false, 'addEventListener 非函数不算信号')
+  assert.strictEqual(isAbortable(null), false, 'null 不算信号')
+  assert.strictEqual(isAbortable(42), false, '原始值不算信号')
+  assert.strictEqual(isAbortable(new AbortController().signal), true, '真实 AbortSignal 必须算信号')
+  // 集成证据：非信号真值不得让 runLoop 跳过整轮 run。放子进程里跑并用 stdout 回调收尾——
+  // 归一为非信号后该循环不会再自行退出（旧实现则一次都不跑），父进程另设超时兜底防挂死。
+  {
+    const probe = `
+      const { runLoop } = require(${JSON.stringify(require.resolve('./xbk_loop'))})
+      let n = 0
+      runLoop(() => { n += 1; if (n === 3) process.stdout.write('RUNS=' + n + '\\n', () => process.exit(0)) },
+        { signal: { aborted: true }, intervalMs: 0 })
+    `
+    const r = spawnSync(process.execPath, ['-e', probe], { encoding: 'utf8', timeout: 5000 })
+    assert.ok(String(r.stdout || '').includes('RUNS=3'),
+      `非信号真值 {aborted:true} 不得让 runLoop 跳过整轮 run（stdout=${JSON.stringify(r.stdout)} signal=${r.signal} status=${r.status}）`)
+  }
+  // 反向断言：真正可监听的 signal（含鸭子类型）必须仍被接受——aborted 翻转后当轮结束即退出。
+  // 若 isAbortable 被写成恒 false，上面的子进程会通过，但这里会因循环不退出而被 withTimeout 判挂死。
+  {
+    const duck = { aborted: false, addEventListener: () => {}, removeEventListener: () => {} }
+    let duckRuns = 0
+    const withTimeoutDuck = (p, ms) => Promise.race([
+      p,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error(`runLoop(duck) 挂死超时（${ms}ms）`)), ms))
+    ])
+    await withTimeoutDuck(runLoop(async () => { duckRuns += 1; duck.aborted = true }, { signal: duck, intervalMs: 0 }), 2000)
+    assert.strictEqual(duckRuns, 1, '可监听 signal 的 aborted 翻转后应只跑一轮即退出')
+  }
+
+  // ===== qodo PR #151-4：单轮刷新超时文案必须报**生效**的毫秒数，而不是被钳制前的配置值 =====
+  // 反例（改动前）：配置 onIntervalTimeoutMs=10^12 时看门狗在 2^31-1 ms 就响，文案却写配置原值。
+  // 大数一律写成表达式而非裸字面量：规避 Codacy PMD「数值字面量在运行时会有不同取值」误报
+  // （与 xbk_loop.js 的 MAX_TIMER_MS / scripts/mutation-json.js 同款处理）。
+  {
+    const plain = refreshTimeoutError(5000)
+    assert.strictEqual(plain.message, '常驻刷新超过 5000ms 未完成', '未钳制时文案与既有格式逐字一致')
+    assert.strictEqual(plain.code, 'INTERVAL_REFRESH_TIMEOUT', '错误码不变')
+    const capped = refreshTimeoutError(10 ** 12)
+    assert.ok(capped.message.includes('2147483647ms 未完成'), `超上限时应报生效值，实际：${capped.message}`)
+    assert.ok(capped.message.includes('配置请求 1000000000000ms'), `应标注被钳制前的配置请求值，实际：${capped.message}`)
+    assert.strictEqual(capped.code, 'INTERVAL_REFRESH_TIMEOUT', '钳制分支错误码同样不变')
+  }
+
+  // ===== XL-02 回归：毫秒值超过 setTimeout 上限（2^31-1）必须钳制后再交给 Node =====
+  // 反例（改动前）：sleep(10^12) 把该值原样交给 setTimeout，Node 静默降为 1ms——
+  // 「等一天」变成立即返回，常驻间隔语义反转。这里以 setTimeout 实参为观测点。
+  {
+    const realSetTimeout = global.setTimeout
+    const capturedMs = []
+    const pendingBounds = []
+    global.setTimeout = function (fn, ms, ...rest) {
+      capturedMs.push(ms)
+      return realSetTimeout(fn, ms, ...rest)
+    }
+    try {
+      for (const huge of [10 ** 12, 2 ** 31, 2 ** 31 + 1, Number.MAX_SAFE_INTEGER]) {
+        const cUpper = new AbortController()
+        pendingBounds.push(sleep(huge, cUpper.signal))
+        cUpper.abort() // 立即取消，避免真的挂上 24.8 天的定时器
+      }
+    } finally {
+      global.setTimeout = realSetTimeout
+    }
+    await Promise.all(pendingBounds)
+    assert.deepStrictEqual(
+      capturedMs,
+      [2 ** 31 - 1, 2 ** 31 - 1, 2 ** 31 - 1, 2 ** 31 - 1],
+      `超上限毫秒值必须钳到 2^31-1 再交给 setTimeout，实际 ${JSON.stringify(capturedMs)}`
+    )
+  }
 
   // ===== runLoop：run 非函数返回 rejected Promise（async 函数）=====
   // timeout 保护：若守卫失效（如被变异删掉），runLoop 会进入无限循环挂死；
