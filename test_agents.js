@@ -133,6 +133,46 @@ dns.lookup = (hostname, options, callback) => {
   assert.strictEqual(abortedResult.ok, false, 'aborted 时 ok 应为 false')
   assert.ok(abortedResult.error?.includes('abort') || abortedResult.cancelled === true, 'aborted 时应包含取消信息')
 
+  // ===== AGENTS-01：prewarmDns 必须与真实请求的 lookup 同 key（默认 DNS 模式预热才有效）=====
+  // 真实 net.connect 在 Node ≥20（autoSelectFamily 默认开启）下以 {hints: ADDRCONFIG(1024), all: true}
+  // 调用本 lookup（本机 Node v24 实测 {"hints":1024,"all":true}），而 prewarmDns 传的是 {}。
+  // 旧实现把 hints/all/verbatim 编进 key → 两者永不同 key，预热写进一个永不被读的条目，
+  // DNS 预热完全无效（本断言在旧代码下必红：底层次数为 2 而非 1）。现按 hostname+family 共享条目，
+  // 底层统一按 all:true 解析并缓存完整地址列表，回调形状在派发时按各调用方的 all 适配。
+  {
+    const keyProbeHost = 'prewarm-key-probe.invalid'
+    const keyCalls = []
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      const opts = typeof options === 'function' ? {} : (options || {})
+      keyCalls.push({ hostname, options: opts })
+      process.nextTick(() => cb(null, opts.all ? [{ address: '192.0.2.7', family: 4 }] : '192.0.2.7', 4))
+    }
+    const warm = await prewarmDns(keyProbeHost)
+    assert.strictEqual(warm.ok, true, '预热应成功')
+    assert.strictEqual(keyCalls.length, 1, '预热应发起 1 次底层解析')
+    assert.strictEqual(keyCalls[0].options.all, true, '底层应统一按 all:true 解析（缓存完整地址列表）')
+    // 真实请求形态：net 传 hints=ADDRCONFIG + all=true → 必须命中预热写入的缓存条目
+    const allHit = await new Promise((resolve, reject) => {
+      dnsLookup(keyProbeHost, { hints: 1024, all: true }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+    })
+    assert.strictEqual(keyCalls.length, 1, `预热后真实请求形态的 lookup 应命中同一缓存（旧 key 含 hints/all 时为 2），实际 ${keyCalls.length}`)
+    assert.ok(Array.isArray(allHit.address) && allHit.address[0] && allHit.address[0].address === '192.0.2.7', 'all:true 调用方应拿到地址数组')
+    // 同一缓存条目服务非 all 调用方：形状适配为标量
+    const scalarHit = await new Promise((resolve, reject) => {
+      dnsLookup(keyProbeHost, {}, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+    })
+    assert.strictEqual(keyCalls.length, 1, '非 all 调用方也应命中同一缓存条目，不应再发起解析')
+    assert.strictEqual(scalarHit.address, '192.0.2.7', '非 all 调用方应拿到标量地址')
+    assert.strictEqual(scalarHit.family, 4, '非 all 调用方应拿到地址族')
+    // 恢复文件头的确定性 mock（保持后续断言的既定语义）
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      process.nextTick(() => cb(null, '127.0.0.1', 4))
+    }
+    console.log('✅ AGENTS-01：prewarmDns 与真实请求同 key（hints/all 不再导致缓存错配）')
+  }
+
   // ===== module.exports：不再导出死值 DNS_CACHE（AGENTS-08）=====
   // 旧导出含 `DNS_CACHE: null`（无任何读取方）；若回退该行，`in` 判定为 true 即红。
   const agentsExports = require('./xbk_agents')

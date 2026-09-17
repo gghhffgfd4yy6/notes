@@ -50,13 +50,35 @@ function invalidateDnsForError (error, url) {
     return true
   } catch (e) { return false }
 }
+// AGENTS-01：缓存/pending key 只保留 hostname + family。
+// 真实 net.connect 传给 lookup 的选项随 Node 版本变化（Node ≥20 默认开启 autoSelectFamily，
+// 实测 Node v24 传 {"hints":1024,"all":true}），而 prewarmDns 只能给出自己构造的选项（默认 {}）。
+// 把 hints/all/verbatim 编进 key 会让「预热」与「真实请求」永不同 key——预热写进一个永不被读的
+// 条目，DNS 预热完全无效。hints/verbatim 只影响地址过滤与排序、不改变地址集合；all 只决定回调
+// 形状。故按 hostname+family 共享条目，底层统一按 all:true 解析并缓存完整地址列表，回调形状在
+// 派发时按各调用方的 all 适配（见 dispatchLookupResult）。
+function dnsCacheKey (hostname, options) {
+  const opts = options || {}
+  return [hostname, opts.family || 0].join('|')
+}
+
+// 按调用方的 all 适配回调形状：all:true 拿 [{address, family}]，其余拿标量（取列表首项）。
+// 非数组结果（测试替身未按 all 建模）原样透传，保持既有替身语义不变。
+function dispatchLookupResult (callback, wantAll, error, address, family) {
+  if (error || !Array.isArray(address)) { callback(error, address, family); return }
+  if (wantAll) { callback(null, address, family); return }
+  const first = address[0]
+  callback(null, first ? first.address : undefined, first ? first.family : family)
+}
+
 function dnsLookup (hostname, options, callback) {
   const opts = options || {}
-  const key = [hostname, opts.family || 0, opts.hints || 0, opts.all ? 1 : 0, opts.verbatim ? 1 : 0].join('|')
+  const wantAll = Boolean(opts.all)
+  const key = dnsCacheKey(hostname, opts)
   const now = Date.now()
   const cached = dnsCache.get(key)
   if (cached && cached.expiresAt > now) {
-    queueMicrotask(() => callback(cached.error, cached.address, cached.family))
+    queueMicrotask(() => dispatchLookupResult(callback, wantAll, cached.error, cached.address, cached.family))
     return
   }
 
@@ -65,12 +87,12 @@ function dnsLookup (hostname, options, callback) {
   // delete。坏解析器下同 key 列表会随重试只增不减——本注释只记录现状，未改任何行为。
   const pending = dnsPending.get(key)
   if (pending) {
-    pending.push(callback)
+    pending.push({ callback, all: wantAll })
     return
   }
-  const pendingList = [callback]
+  const pendingList = [{ callback, all: wantAll }]
   dnsPending.set(key, pendingList)
-  dns.lookup(hostname, opts, (error, address, family) => {
+  dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => {
     // v3.263（CodeAnt）：只派发并缓存本次记账列表——abort 摘除回调后若同一 key 已有新 lookup
     // 接管，旧 lookup 完成时不得清空/派发到新列表，也不得写缓存（接管等待期间新调用方会读到
     // 旧结果，且晚到的旧回调会覆盖更新的缓存条目；新 lookup 会缓存自己的结果）
@@ -78,7 +100,7 @@ function dnsLookup (hostname, options, callback) {
     dnsPending.delete(key)
     const ttl = error ? DNS_ERROR_TTL_MS : DNS_TTL_MS
     dnsCache.set(key, { error, address, family, expiresAt: Date.now() + ttl })
-    for (const cb of pendingList) cb(error, address, family)
+    for (const entry of pendingList) dispatchLookupResult(entry.callback, entry.all, error, address, family)
   })
 }
 
@@ -100,8 +122,8 @@ function prewarmDns (hostname, signal = null) {
     // dnsPending 记账中摘除（不持有引用、再次预热会重新发起解析），并在解析完成时移除 abort 监听。
     // 契约：取消不保证进程立刻退出——底层解析仍可能后台完成，退出时机由调用方退出策略负责。
     let settled = false
-    // 与 dnsLookup 内部同构的 key：abort 时按 key 定位 dnsPending 中的本回调
-    const key = [hostname, options.family || 0, options.hints || 0, options.all ? 1 : 0, options.verbatim ? 1 : 0].join('|')
+    // 与 dnsLookup 内部同 key（AGENTS-01 起为 hostname+family）：abort 时按 key 定位 dnsPending 中的本回调
+    const key = dnsCacheKey(hostname, options)
     const done = (error, address, family) => { if (!settled) { settled = true; resolve(makeResult(error, address, family)) } }
     const callback = (error, address, family) => {
       if (signal) signal.removeEventListener('abort', onAbort)
@@ -110,7 +132,8 @@ function prewarmDns (hostname, signal = null) {
     const onAbort = () => {
       const pending = dnsPending.get(key)
       if (pending) {
-        const i = pending.indexOf(callback)
+        // dnsPending 条目是 { callback, all }（AGENTS-01）：按回调身份定位本记账项
+        const i = pending.findIndex(entry => entry.callback === callback)
         if (i !== -1) pending.splice(i, 1)
         if (pending.length === 0) dnsPending.delete(key)
       }
