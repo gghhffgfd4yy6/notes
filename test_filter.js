@@ -9293,6 +9293,31 @@ console.log('========================================\n');
     assertEqual(new Set(names).size, names.length, `不同 URL 不得撞名：${JSON.stringify(names)}`)
   })
 
+  // R6（W2 实锤）：R4 的「以 . 或 url_ 开头 ⇒ 前置 url_」仍是**非单射**——前置后再补 '.json' 后缀，
+  // 于是 getFileName('https://x/url_') → 'url_url_' → 'url_url_.json'，与
+  // getFileName('https://x/url_.json') → 'url_url_.json'（已带后缀不追加）**撞同一缓存文件**。
+  // 修法：'url_'-来源未带 .json 时插入分隔符 '#'（'#' 不可能出现在清洗后的末段里——末段先按 [?#] 截断）。
+  await test('B8-F7: url_ 前缀的合法名与补 .json 后缀不得撞名（W2 新碰撞回归）', () => {
+    assertEqual(getFileName('https://x/url_'), 'url_url_#.json', "'url_' 未带后缀：转义前缀 + '#' 分隔符再补后缀")
+    assertEqual(getFileName('https://x/url_.json'), 'url_url_.json', '既有产物不得改动（R4 断言钉死）')
+    assertEqual(getFileName('https://x/url_') === getFileName('https://x/url_.json'), false,
+      '两个不同 URL 不得映射到同一缓存文件名（W2 反例）')
+    assertEqual(getFileName('https://x/url_x') === getFileName('https://x/url_x.json'), false,
+      "同族变体：'url_x' 与 'url_x.json' 也不得撞名")
+    // 性质：'url_'-来源（转义类里唯一被二次改写的一支）严格单射——不同**清洗后**末段必不同名
+    // （'url_?q'/'url_#f' 与 'url_' 清洗后同为 'url_'，属文档化的 query/hash 剥离口径，故按清洗后比较）
+    const segs = ['url_', 'url_.json', 'url_x', 'url_x.json', 'url_.hidden', 'url_.hidden.json', 'url_url_', 'url_url_.json', 'url_?q', 'url_#f']
+    const got = segs.map(s => getFileName('https://x/' + s))
+    const cleaned = segs.map(s => { let n = s.split(/[?#]/)[0]; if (!n || /^\.+$/.test(n)) n = 'default'; return n })
+    const distinctCleaned = new Set(cleaned).size
+    assertEqual(new Set(got).size, distinctCleaned, `'url_'-来源必须严格单射（清洗后 ${distinctCleaned} 个不同末段）：${JSON.stringify(segs.map((s, i) => [s, got[i]]))}`)
+    assertEqual(got[0] === got[1], false, "'url_' 与 'url_.json' 清洗后不同名，必须映射到不同缓存名")
+    for (const n of got) {
+      assertEqual(n.startsWith('.'), false, `产物不得是隐藏文件：${n}`)
+      assertEqual(n.endsWith('.json'), true, `产物须保留 .json 后缀：${n}`)
+    }
+  })
+
   // R4（V6 实锤）：F7 原条目另一半（getFilePath 截断碰撞）逐字未动——两条仅在**第 200 字节之后**
   // 不同的长名会被截断成同一路径，而生产 cacheName 直接来自 getFileName(pushUrl)。
   // 修法：截断结果附带全名摘要（anonKey 64 位，仅字母数字），保证「长名 → 路径」单射。

@@ -1435,11 +1435,28 @@ function createMessageStore ({
       // 的残留回收与下一次写入自然迁移。
       // F7 回归（R4/V6）：只给「以点开头」的名字加前缀会与该前缀自身的合法名字撞名——
       // getFileName('https://x/.json') 与 getFileName('https://x/url_.json') 都是 'url_.json'
-      // → 两个不同 pushUrl 共用同一缓存文件（互相覆盖判重记录）。两条前缀规则合并为
-      // 「以 . 或 url_ 开头 ⇒ 前置 url_」：该映射是单射——像集恒以 'url_' 开头，
-      // '.'-来源 → 'url_.' + …，'url_'-来源 → 'url_url_' + …，二者不相交，且不以 'url_'
-      // 开头的普通名字不会落进像集。
-      if (name.startsWith('.') || name.startsWith('url_')) name = 'url_' + name
+      // → 两个不同 pushUrl 共用同一缓存文件（互相覆盖判重记录）。改为按来源分派到两个不相交的像集。
+      //
+      // F7 残留（R6/W2）：上一版把两类合并成同一条「前置 url_」再补 .json 后缀，于是
+      //   getFileName('https://x/url_') → 'url_url_' → 'url_url_.json'
+      //   getFileName('https://x/url_.json') → 'url_url_.json'（已带后缀不再追加）→ **仍然撞名**。
+      //   根因是「补 .json 后缀」与「前置 url_」两次改写叠加后像集相交。修法：
+      //     · '.'-来源 → 'url_' + 名字（原有隐藏文件防护，产物恒以 'url_.' 开头）；
+      //     · 'url_'-来源且**已带 .json** → 'url_' + 名字（保持既有产物 'url_url_.json' 不被改动）；
+      //     · 'url_'-来源且未带 .json → 追加分隔符 '#' 再补后缀（'url_url_#.json'）。
+      //   单射依据：'url_'-来源（无论哪种）产物恒以 'url_url_' 开头，与 '.'-来源的 'url_.' 不相交，
+      //   也与「不以 url_ 开头」的普通名字不相交；'#' **不可能出现在清洗后的末段里**——本函数先把
+      //   末段按 /[?#]/ 截断，故 'url_x#.json' 这类名字不可能再作为来源参与映射，'url_x' 与
+      //   'url_x.json' 这两个来源因此不再互相覆盖（'url_url_x#.json' ≠ 'url_url_x.json'）。
+      //   注：'a' 与 'a.json' 这一类「仅差 .json 后缀」的粗化是**既有且被断言钉住**的口径
+      //   （test_filter「abc → abc.json」「a.json → a.json」），不在本次改动范围。
+      if (name.startsWith('.')) {
+        name = 'url_' + name
+      } else if (name.startsWith('url_') && !name.endsWith('.json')) {
+        name = 'url_' + name + '#'
+      } else if (name.startsWith('url_')) {
+        name = 'url_' + name
+      }
       if (!name.endsWith('.json')) name += '.json'
       return name
     }

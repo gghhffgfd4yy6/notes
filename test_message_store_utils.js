@@ -538,6 +538,81 @@ check('F7: 超长名截断必须保持单射（仅第 200 字节后不同的两�
   assert.strictEqual(longNameStore.getFilePath(a), pa, '同一名字必须稳定映射到同一路径（缓存名要能跨轮复用）')
 })
 
+// ===== F7 残留（R6：getFileName「转义后名字集合」单射的**性质测试**）=====
+// W2 实测新碰撞：getFileName('https://x/url_') 与 getFileName('https://x/url_.json') 都是
+// 'url_url_.json'（先前置 'url_' 再补 '.json' 后缀，两次改写叠加后像集相交）。这里用**语料 + 性质**
+// 证明修法后「同缓存名 ⇒ 同 URL（等价）」成立，而不是只钉两三个例子。
+// 等价口径（与既有断言一致）：清洗阶段（剥离 query/hash、保留字符 → '_'、去控制字符、空/纯点串 →
+// 'default'）是**故意**的粗化；此外「仅差一个 .json 后缀」的粗化由既有断言钉死（test_filter 的
+// `'abc' → 'abc.json'` 与 `'a.json' → 'a.json'`、`'.hidden' → 'url_.hidden.json'`），不在本次范围。
+const relSeg = (seg) => {
+  // 与 getFileName 内部同序的清洗镜像：只用于构造「等价类」参照，不参与生产逻辑
+  const url = 'https://x/' + seg
+  const parts = url.split('/')
+  let name = parts[parts.length - 1].split(/[?#]/)[0]
+  if (!name || /^\.+$/.test(name)) name = 'default'
+  name = name.replace(/[\\/:*?"<>|]/g, '_').replace(/[\u0000-\u001f]/g, '')
+  return name || 'default'
+}
+const canonJson = (s) => (s.endsWith('.json') ? s.slice(0, -'.json'.length) : s)
+
+check('F7 残留: getFileName 性质测试——同名缓存文件必来自等价末段（语料级单射）', () => {
+  const segs = [
+    'x', 'x.json', 'x.JSON', '.json', '.hidden', '.hidden.json', '..', '.', '...',
+    'url_', 'url_.json', 'url_url_', 'url_url_.json', 'url_x', 'url_x.json',
+    'url_.hidden', 'url_.hidden.json', 'url_.json.json',
+    'a b', ' a ', '\t\n x', 'x\u0000y', 'a|b.json', 'c:1.json', 'a?b=1', 'a#frag',
+    '.json.json', 'a.json.json', '.secret', 'data.json', 'default', 'default.json',
+    'u'.repeat(260) + 'aaaa.json', 'u'.repeat(260) + 'bbbb.json', 'x'.repeat(300),
+    '[object Object]', 'seen.cleanup.lock', 'a/b', 'a\\b', 'a*b', 'a"b', '%20', 'a%5Cb'
+  ]
+  const names = segs.map(s => store.getFileName('https://x/' + s))
+  let pairs = 0
+  let escapePairs = 0
+  for (let i = 0; i < segs.length; i++) {
+    for (let j = i + 1; j < segs.length; j++) {
+      if (names[i] !== names[j]) continue
+      pairs += 1
+      const ci = relSeg(segs[i])
+      const cj = relSeg(segs[j])
+      // Q1：碰撞只能来自已完成文档化的两处粗化（清洗等价 / 仅差 .json 后缀）
+      assert.ok(ci === cj || canonJson(ci) === canonJson(cj),
+        `不同末段撞同一缓存名 ${names[i]}：${JSON.stringify(segs[i])} vs ${JSON.stringify(segs[j])}（清洗后 ${JSON.stringify(ci)} / ${JSON.stringify(cj)}）`)
+      // Q2：**转义类**（以 . 或 url_ 开头）必须严格单射——除「同以 . 开头且仅差 .json」（既有断言
+      // 钉死的隐藏文件前缀口径）外，不允许任何额外粗化。W2 的 'url_' vs 'url_.json' 落在这里。
+      const escI = ci.startsWith('.') || ci.startsWith('url_')
+      const escJ = cj.startsWith('.') || cj.startsWith('url_')
+      if (escI && escJ) {
+        escapePairs += 1
+        assert.ok(ci === cj || (ci.startsWith('.') && cj.startsWith('.') && canonJson(ci) === canonJson(cj)),
+          `转义类不得额外粗化：${JSON.stringify(segs[i])}(${ci}) 与 ${JSON.stringify(segs[j])}(${cj}) 撞成 ${names[i]}`)
+      }
+    }
+  }
+  assert.ok(segs.length >= 40, `语料规模须足够（实际 ${segs.length} 条末段）`)
+  // 修法后映射必须**至少与文档化口径一样细**：'url_'-来源不再与 'url_x.json' 型来源合并，
+  // 故不同缓存名的数量不得少于「清洗 + 仅差 .json 视为同一」的等价类数量。
+  const canonClasses = new Set(segs.map(s => canonJson(relSeg(s)))).size
+  assert.ok(new Set(names).size >= canonClasses,
+    `缓存名去重数 ${new Set(names).size} 不得少于文档化等价类数 ${canonClasses}（更粗即引入未文档化合并）`)
+  // Q3：'url_'-来源（转义类里唯一可能被「补 .json」二次改写的一支）必须**严格单射**——
+  // 不同清洗名 ⇒ 不同缓存名。'.'-来源仍受既有隐藏文件前缀断言约束（仅差 .json 视为同一）。
+  const escSegs = segs.filter(s => { const c = relSeg(s); return c.startsWith('.') || c.startsWith('url_') })
+  const escNames = escSegs.map(s => store.getFileName('https://x/' + s))
+  const escExpected = new Set(escSegs.map(s => { const c = relSeg(s); return c.startsWith('.') ? canonJson(c) : c })).size
+  assert.ok(new Set(escNames).size >= escExpected,
+    `转义类缓存名去重数 ${new Set(escNames).size} 不得少于清洗名去重数 ${escExpected}（'url_' 与 'url_.json' 这类必须分开）`)
+  // 显式反例：W2 的新碰撞必须消失，且不得回退既有两项修复
+  assert.notStrictEqual(store.getFileName('https://x/url_'), store.getFileName('https://x/url_.json'), "W2 反例：'url_' 与 'url_.json' 不得撞名")
+  assert.strictEqual(store.getFileName('https://x/url_.json'), 'url_url_.json', '既有产物不得改动（test_filter/test_message_store_utils 钉死）')
+  assert.strictEqual(store.getFileName('https://x/.json'), 'url_.json', '隐藏文件前缀防护不得回退')
+  for (const n of names) {
+    assert.ok(!n.startsWith('.'), `getFileName 产物不得是隐藏文件：${n}`)
+    assert.ok(n.endsWith('.json'), `getFileName 产物须保留 .json 后缀：${n}`)
+  }
+  console.log(`     （语料 ${segs.length} 条末段 / 撞名对数 ${pairs}，其中转义类 ${escapePairs}）`)
+})
+
 // ===== F-02（B8 回归；V6 实锤漏推方向）=====
 // 反例：_identityIndex 的 O(1) 失效检查只看「引用 / 长度 / 首元素引用」，调用方**原地改写非首元素**
 // （换元素或改 id/url 字段）不会触发重建，旧索引把已不存在的身份判为「已存在」→ has() 返回 true
