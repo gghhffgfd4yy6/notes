@@ -179,6 +179,32 @@ try {
     assert.match(formatStatus(status), /最近一轮：正常 \| 时间 无时间戳/, '无时间戳时明示「无时间戳」而不是假装有')
   })
 
+  // ===== SS-03：run.log / diagnostics 超过 1 MiB 时读尾部，而不是整体判 tooLarge =====
+  // 写入侧在拿不到日志锁时 fail-open（只追加不截尾），文件可真正超过 1 MiB；旧行为让这两个部件
+  // 在 --status 里整体显示「不可读（tooLarge）」——最近的记录其实唾手可得。
+  test('S15 run.log 超过 1 MiB → 读尾部并解析出最近一轮（修前 tooLarge）', () => {
+    const filler = '2026-09-08 09:00:00 [INFO] ' + 'x'.repeat(80) + '\n'
+    const body = filler.repeat(Math.ceil((1024 * 1024 + 2048) / filler.length))
+    fs.writeFileSync(path.join(tmp, 'run.log'), body + '2026-09-08 10:00:00 total=42 dedup=5 filtered=7 truncated=0 pushed=28 failed=2 elapsed=3.4s\n')
+    assert.ok(fs.statSync(path.join(tmp, 'run.log')).size > 1024 * 1024, '夹具必须真的超过 1 MiB（否则本用例失去意义）')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.status, 'ok', `超 1 MiB 的 run.log 必须读尾部解析（修前为 ${status.run.status}）`)
+    assert.strictEqual(status.run.value.total, 42, '尾部摘要行的计数必须解析正确')
+    assert.strictEqual(status.run.value.at, '2026-09-08 10:00:00', '尾部摘要行的时间戳同样要保留')
+  })
+
+  test('S16 filter-diagnostics.ndjson 超过 1 MiB → 读尾部并解析出最近汇总（修前 tooLarge）', () => {
+    const item = JSON.stringify({ type: 'item', id: 'x', pad: 'y'.repeat(80) }) + '\n'
+    const body = item.repeat(Math.ceil((1024 * 1024 + 2048) / item.length))
+    const summary = JSON.stringify({ type: 'run', at: '2026-09-08 10:00:00', total: 9, dedup: 2, filtered: 3, passed: 4, byReason: { title: 3 }, detailCount: 3 }) + '\n'
+    fs.writeFileSync(path.join(tmp, 'filter-diagnostics.ndjson'), body + summary)
+    assert.ok(fs.statSync(path.join(tmp, 'filter-diagnostics.ndjson')).size > 1024 * 1024, '夹具必须真的超过 1 MiB')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.diagnostics.status, 'ok', `超 1 MiB 的诊断文件必须读尾部解析（修前为 ${status.diagnostics.status}）`)
+    assert.strictEqual(status.diagnostics.value.total, 9, '尾部汇总的计数必须解析正确')
+    assert.deepStrictEqual(status.diagnostics.value.byReason, { title: 3 }, 'byReason 必须完整保留')
+  })
+
   // ===== SS-02：channel-health 单条损坏不得整表 invalid（健康通道信息必须保留）=====
   // 旧实现 validChannels 是 Object.values(...).every(...) 全表口径：一条坏记录即整表 invalid，
   // formatStatus 于是走 describe → 只显示「不可读（invalid）」，所有健康通道一并消失。

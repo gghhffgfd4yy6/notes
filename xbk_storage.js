@@ -162,11 +162,16 @@ function resolveMaxBytes (maxBytes, filePath) {
 // 可选大小上限：maxBytes 为数字且 > 0 时，普通文件超过该字节数即判 tooLarge，避免异常膨胀
 // 文件被整读入内存（状态/哈希等小文件场景）。maxBytes 非数字或 ≤0 时按既有语义处理为「不设限」
 // （但见 resolveMaxBytes：非法值一律告警，不再静默）。
-function readSafeTextResult (filePath, maxBytes) {
+// options.tail === true（审查 SS-03）：超限时读**尾部** maxBytes 字节而不是判 tooLarge——
+// 日志类消费方（scripts/status.js 的 run.log / filter-diagnostics.ndjson）只关心最近记录，
+// 而写入侧 fail-open 时日志可无上限增长，旧行为会让整个部件显示「不可读（tooLarge）」。
+// 尾部读取的结果附 truncated:true：首行可能是被切开的半行，调用方须按「逐行解析、坏行跳过」处理。
+function readSafeTextResult (filePath, maxBytes, options = {}) {
   // 修复 TOCTOU：先以 O_NOFOLLOW 打开并 fstat 确认为普通文件，读取内容后复检路径仍指向
   // 同一 inode（dev+ino）的普通文件。内容读取走同一 fd（readFdRange），读取期间路径被替换
   // 成符号链接/其他文件时，读后复检仍会将其判为 unsafe 并丢弃结果，不泄露任意文件内容。
   const limit = resolveMaxBytes(maxBytes, filePath)
+  const tail = !!(options && options.tail === true)
   const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
   let fd
   try {
@@ -179,10 +184,14 @@ function readSafeTextResult (filePath, maxBytes) {
   try {
     const stat = fs.fstatSync(fd)
     if (!stat.isFile()) return { status: 'unsafe', text: null, error: new Error('非普通文件') }
+    let start = 0
     if (limit !== null && stat.size > limit) {
-      return { status: 'tooLarge', text: null, error: new Error(`文件过大(${stat.size} 字节)，超过上限 ${limit} 字节`) }
+      if (!tail) {
+        return { status: 'tooLarge', text: null, error: new Error(`文件过大(${stat.size} 字节)，超过上限 ${limit} 字节`) }
+      }
+      start = stat.size - limit // 只读尾部 limit 字节（bound 仍由 fstat 观测值决定）
     }
-    const text = readFdRange(fd, 0, stat.size)
+    const text = readFdRange(fd, start, stat.size - start)
     let reFd
     try {
       reFd = fs.openSync(filePath, flags)
@@ -196,7 +205,7 @@ function readSafeTextResult (filePath, maxBytes) {
     } finally {
       if (reFd !== undefined) { try { fs.closeSync(reFd) } catch (e) { /* 忽略 */ } }
     }
-    return { status: 'ok', text, error: null }
+    return { status: 'ok', text, error: null, ...(start > 0 ? { truncated: true } : {}) }
   } catch (e) {
     return { status: 'ioError', text: null, error: e }
   } finally {
@@ -204,10 +213,11 @@ function readSafeTextResult (filePath, maxBytes) {
   }
 }
 
-// maxBytes 透传给 readSafeTextResult：不传时与旧行为完全一致（不设上限），
-// 调用方可据此对这条读取入口显式设限（审查 STG-05：非法值由 readSafeTextResult 统一告警）。
-function readSafeText (filePath, maxBytes) {
-  const result = readSafeTextResult(filePath, maxBytes)
+// maxBytes / options 透传给 readSafeTextResult：不传时与旧行为完全一致（不设上限、超限判 tooLarge），
+// 调用方可据此对这条读取入口显式设限（审查 STG-05：非法值由 readSafeTextResult 统一告警），
+// 或以 options.tail 只读尾部（审查 SS-03）。
+function readSafeText (filePath, maxBytes, options) {
+  const result = readSafeTextResult(filePath, maxBytes, options)
   return result.status === 'ok' ? result.text : null
 }
 

@@ -14,8 +14,15 @@ function result (status, value) {
   return { status, ...(value === undefined ? {} : { value }) }
 }
 
-function readText (dir, name, maxBytes = 1024 * 1024) {
-  const safe = readSafeTextResult(path.join(dir, name), maxBytes)
+// 日志类部件（run.log / filter-diagnostics.ndjson）的读取上限与取尾部选项（审查 SS-03）。
+// 上限与写入侧 xbk_app 的截尾阈值同为 1 MiB，但写入侧在拿不到日志锁时是 fail-open（只追加、
+// 不截尾），文件可以真正超过 1 MiB；旧行为对超限文件一律返回 tooLarge，于是「最近一轮」「过滤诊断」
+// 整体变成「不可读（tooLarge）」。日志消费方只关心最近的记录，故超限时读尾部 1 MiB。
+const LOG_MAX_BYTES = 1024 * 1024
+const LOG_READ_OPTIONS = { tail: true }
+
+function readText (dir, name, maxBytes = LOG_MAX_BYTES, options) {
+  const safe = readSafeTextResult(path.join(dir, name), maxBytes, options)
   return safe.status === 'ok' ? result('ok', safe.text) : result(safe.status)
 }
 
@@ -134,10 +141,11 @@ function parseDiagnostics (read) {
 function readStatus (dir, { now = Date.now() } = {}) {
   const report = parseJson(readText(dir, FILES.report, 64 * 1024), validReport)
   const channels = parseJson(readText(dir, FILES.channels, 64 * 1024), validChannels)
-  // run.log / filter-diagnostics 走默认 1MB 上限（与写入侧 xbk_app 的 LIMIT 同为 1MB）：
-  // 超限时 xbk_storage 只返回 tooLarge、不读尾部，fail-open 场景下这两个部件会整体不可见。
-  const run = parseLastRun(readText(dir, FILES.run))
-  const diagnostics = parseDiagnostics(readText(dir, FILES.diagnostics))
+  // report.state / channel-health 是「整份 JSON」，必须整读：超限仍判 tooLarge（读尾部只会得到
+  // 半个 JSON，假装可读更危险）。run.log / filter-diagnostics 是追加式日志，取尾部 1 MiB
+  // （审查 SS-03）：超限时旧行为让这两个部件整体不可见，而解析本来就是「从最后一行往前找」。
+  const run = parseLastRun(readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS))
+  const diagnostics = parseDiagnostics(readText(dir, FILES.diagnostics, LOG_MAX_BYTES, LOG_READ_OPTIONS))
   return { generatedAt: now, report, channels, run, diagnostics }
 }
 

@@ -226,6 +226,22 @@ const {
   const r5 = readSafeTextResult(dirPath)
   assert.strictEqual(r5.status, 'unsafe', '目录路径应返回 unsafe（fstat 非文件）')
 
+  // ===== SS-03：options.tail 超限时读尾部而不是判 tooLarge =====
+  // 追加式日志可超过上限（写入侧 fail-open），消费方只关心最近记录；旧行为一律 tooLarge，
+  // 整个部件在 --status 里变成「不可读」。
+  const tailFile = make('tail.txt')
+  fs.writeFileSync(tailFile, 'A'.repeat(400) + 'B'.repeat(100)) // 共 500 字节，尾部为 100 个 B
+  const tailMiss = readSafeTextResult(tailFile, 50)
+  assert.strictEqual(tailMiss.status, 'tooLarge', '默认（不传 tail）超限仍必须判 tooLarge，行为不得回归')
+  const tailHit = readSafeTextResult(tailFile, 100, { tail: true })
+  assert.strictEqual(tailHit.status, 'ok', 'tail=true 时超限应读尾部而不是 tooLarge（修前为 tooLarge）')
+  assert.strictEqual(tailHit.text, 'B'.repeat(100), 'tail=true 应返回最后 maxBytes 字节')
+  assert.strictEqual(tailHit.truncated, true, '尾部读取必须标记 truncated，调用方才知道首行可能是半行')
+  const tailWhole = readSafeTextResult(tailFile, 1024, { tail: true })
+  assert.strictEqual(tailWhole.text.length, 500, '未超限时 tail 选项不得改变结果（仍返回全文）')
+  assert.strictEqual(tailWhole.truncated, undefined, '未发生截断时不得标记 truncated')
+  assert.strictEqual(readSafeText(tailFile, 100, { tail: true }), 'B'.repeat(100), 'readSafeText 也必须透传 options')
+
   // ===== readSafeText（包装）=====
   assert.strictEqual(readSafeText(okFile), 'safe-content', 'ok 时应返回文本')
   assert.strictEqual(readSafeText(make('missing2.txt')), null, 'missing 时应返回 null')
