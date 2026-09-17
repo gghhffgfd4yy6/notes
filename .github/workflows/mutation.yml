@@ -1,7 +1,7 @@
 name: Mutation
 
 # 变异测试：全量生产代码覆盖。
-# 长文件按官方行范围语法（file:start-end）拆分防超时：V3 目前 1 段全覆盖（1-426），sendnotify 拆 2 段。
+# 长文件按官方行范围语法（file:start-end）拆分防超时：V3 目前 1 段全覆盖（1-429），sendnotify 拆 2 段。
 # ⚠️ v3.270 教训：行段硬编码曾静默漏测尾部新增代码（4495-4924 未变异）。
 # 修改大文件后必须同步重拆行段；AGENTS.md「大文件与变异行段」一节有具体步骤，改动前跑
 #   node scripts/check-mutation-ranges.js
@@ -111,7 +111,7 @@ jobs:
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
-            mutate: "xbk_function_v3.js:1-426"
+            mutate: "xbk_function_v3.js:1-429"
           - name: app
             src: "xbk_app.js"
             mutate: "xbk_app.js"
