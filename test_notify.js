@@ -422,6 +422,34 @@ console.log('========================================\n');
         `无HTML标签应保持Markdown(contentType=3): ${gotCalls[0].options.json.contentType}`)
   }))
 
+  // 6d. F4（V4 打回）：混合数组的部分丢弃必须留痕——被丢弃项先前完全静默。
+  // 端到端看「实际被联系的应用」：混合数组只应联系合法项，且必须恰好告警 1 次；
+  // 对照（两个合法项）会分别联系两个应用 —— 证明被丢弃项本应被联系，静默即缺陷。
+  await test('F4：WX_pusher_channels 混合数组部分丢弃 → 告警 1 次且只联系合法应用', () => withChannels(async () => {
+    const warns = []; const oldWarn = console.warn
+    console.warn = (...args) => warns.push(args.join(' '))
+    try {
+      cfg.WX_pusher_channels = JSON.stringify([{ appToken: 'APP_A', topicIds: '1' }, { appToken: 'APP_B' }])
+      await notify.sendNotify('标题', '内容')
+      await notify.sendNotify('标题2', '内容2')
+    } finally {
+      console.warn = oldWarn
+    }
+    const apps = gotCalls.filter(c => c.url.includes('wxpusher')).map(c => c.options.json.appToken)
+    assert(apps.join(',') === 'APP_A,APP_A', `只有合法应用可被联系，实际 ${apps.join(',')}`)
+    assert(warns.filter(w => w.includes('WX_pusher_channels')).length === 1,
+      `部分丢弃必须恰好告警 1 次（修复前为 0），实际 ${JSON.stringify(warns)}`)
+    // 对照组：两个合法应用经轮转被分别联系（证明 APP_B 本应被联系，静默丢弃即缺陷）
+    warns.length = 0
+    reset()
+    cfg.WX_pusher_channels = JSON.stringify([{ appToken: 'APP_A', topicIds: '1' }, { appToken: 'APP_B', topicIds: '2' }])
+    await notify.sendNotify('标题', '内容')
+    await notify.sendNotify('标题2', '内容2')
+    const apps2 = gotCalls.filter(c => c.url.includes('wxpusher')).map(c => c.options.json.appToken)
+    assert(apps2.join(',') === 'APP_A,APP_B', `对照组合法应用应经轮转分别联系，实际 ${apps2.join(',')}`)
+    assert(warns.length === 0, `对照组不得告警，实际 ${JSON.stringify(warns)}`)
+  }))
+
   // 7. PushMe（修复后新接入）
   await test('PushMe: 多 key # 分割 + type markdown', () => withChannels(async () => {
     cfg.PUSHME_KEY = 'k1#k2'

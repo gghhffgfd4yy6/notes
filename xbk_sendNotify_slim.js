@@ -896,6 +896,12 @@ function parseWxPusherChannels () {
     return appToken && topicIds.length ? { appToken, topicIds } : null
   }).filter(Boolean)
   if (channels.length) {
+    // F4（V4 打回）：逐项过滤后只要还剩一项就提前返回——被过滤掉的项此前完全无留痕，
+    // 于是混合数组 [合法A, 缺 topicIds 的B] 只联系 APP_A 却 warn=0（对照：两个合法应用会被分别联系）。
+    // 此处把「被丢弃项数」纳入判据：部分丢弃同样必须告警。
+    if (list.length !== channels.length) {
+      console.warn(`⚠️ WX_pusher_channels 的 ${list.length - channels.length} 项缺 appToken 或 topicIds，已丢弃；仅启用其余 ${channels.length} 项`)
+    }
     wxPusherParsedConfigKey = configKey
     wxPusherParsedChannels = channels
     return channels
