@@ -23,13 +23,33 @@ function validCounter (value) {
   return Number.isSafeInteger(value) && value >= 0
 }
 
+// 日报日期口径：与生产侧 xbk_app._isValidReportDate **语义一致**（审查 SS-04）。生产读路径
+// （_loadReportState）对存在且非法的 date 直接判「状态损坏、跳过本次日报更新」，而 --status 此前
+// 只校验类型，于是 '2026-13-45' 会被当成正常日报展示——同一份文件两处口径相反。此处补齐：
+//   - undefined / '' 合法（生产侧同样接受缺失与空串，_normalizeReportState 归一化为 ''）；
+//   - 存在的值必须是 YYYY-MM-DD 且月/日真实存在（含闰年天数）。
+// 口径以 xbk_app.js 的同名方法为准；两处是镜像实现（scripts/status.js 不引 xbk_app，避免只读命令
+// 拉起整个 App 依赖），修改任一处必须同步另一处。
+function isValidReportDate (value) {
+  if (value === '') return true
+  if (typeof value !== 'string') return false
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+  if (!m) return false
+  const year = Number(m[1]); const month = Number(m[2]); const day = Number(m[3])
+  if (year < 1 || month < 1 || month > 12 || day < 1) return false
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  return day <= days[month - 1]
+}
+
 function validReport (value) {
   // 与生产侧 xbk_app 读取口径对齐：七项计数只在字段存在时校验非负安全整数，
   // 缺失视为未累计（生产侧 _normalizeReportState 会归一化为 0），不再整份判 invalid。
   // CodeRabbit PR #147：date 同样要允许缺失——生产侧 _loadReportState 接受 raw.date === undefined，
   // _normalizeReportState 归一化为 ''，_updateReport 视其为首轮并补当前日期。此处原先要求
-  // typeof date === 'string'，会把合法的 {"runs":1} 显示成「日报：不可读（invalid）」；现值存在时仍校验类型。
-  return value && (value.date === undefined || typeof value.date === 'string') &&
+  // typeof date === 'string'，会把合法的 {"runs":1} 显示成「日报：不可读（invalid）」。
+  // 审查 SS-04：存在的 date 不只校验类型，还按 _isValidReportDate 语义校验真实日期。
+  return value && (value.date === undefined || isValidReportDate(value.date)) &&
     ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'].every(key => value[key] === undefined || validCounter(value[key]))
 }
 

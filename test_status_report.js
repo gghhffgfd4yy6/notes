@@ -124,6 +124,23 @@ try {
     assert.strictEqual(readStatus(tmp).report.status, 'invalid', 'date=null 不是 undefined、也不是字符串 → 仍 invalid')
   })
 
+  // ===== SS-04：date 必须按生产侧 _isValidReportDate 语义校验真实日期（反向漂移）=====
+  // 旧实现只看 typeof date === 'string'：'2026-13-45'（不存在的月份/日期）会被 --status 当正常日报
+  // 展示，而生产侧 _loadReportState 会判它损坏并跳过日报更新——同一份文件两处口径相反。
+  test('S11 report.state date 非法日期 → invalid，合法日期（含闰年）→ ok', () => {
+    const withDate = (date) => {
+      fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ date, runs: 1 }) + '\n')
+      return readStatus(tmp).report.status
+    }
+    assert.strictEqual(withDate('2026-13-45'), 'invalid', '月份 13/日期 45 必须判非法（生产侧同样拒绝）')
+    assert.strictEqual(withDate('2026-02-30'), 'invalid', '2 月 30 日必须判非法')
+    assert.strictEqual(withDate('2023-02-29'), 'invalid', '平年 2 月 29 日必须判非法（闰年判定不能只看月份表）')
+    assert.strictEqual(withDate('2024-02-29'), 'ok', '闰年 2 月 29 日合法（回归：不得把闰年一刀切判非法）')
+    assert.strictEqual(withDate('2026-9-8'), 'invalid', '非补零形态非法（生产侧正则要求 MM/DD 各两位）')
+    assert.strictEqual(withDate(''), 'ok', '空串合法（生产侧 _isValidReportDate 对 "" 返回 true）')
+    assert.strictEqual(withDate('2026-12-31'), 'ok', '合法日期应判 ok')
+  })
+
   // ===== SS-02：channel-health 单条损坏不得整表 invalid（健康通道信息必须保留）=====
   // 旧实现 validChannels 是 Object.values(...).every(...) 全表口径：一条坏记录即整表 invalid，
   // formatStatus 于是走 describe → 只显示「不可读（invalid）」，所有健康通道一并消失。
