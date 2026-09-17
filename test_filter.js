@@ -8812,6 +8812,244 @@ console.log('========================================\n');
   })
 
   // ============================================================
+  // B8 批次回归（未修复清单 114：message_store F3/F4/F5/F-02/F-05/F7）
+  // ============================================================
+
+  await test('B8-F3: 墓碑瞬时读失败不永久记忆——下次调用重试并恢复防重放身份', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f3_retry.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const seenPath = fp + '.seen.json'
+    // 先落一份含身份 'f3-retry-id' 的墓碑，再模拟「首次读盘瞬时失败」
+    MessageStore._saveTombstones(fp, {
+      id: new Map([['f3-retry-id', true]]),
+      urlOnly: new Map(),
+      idWithUrl: new Map(),
+      anon: new Map()
+    })
+    const realRead = MessageStore._readTombstoneData
+    let calls = 0
+    // 首次读盘返回 null（模拟 ioError/tooLarge 一类瞬时故障），并显式声明状态为 ioError
+    MessageStore._readTombstoneData = function (p) {
+      calls++
+      if (calls === 1) {
+        MessageStore._tombstoneLoadStatus[p] = 'ioError'
+        return null
+      }
+      return realRead.call(this, p)
+    }
+    try {
+      // 第一次加载：读失败 → 按空集，且**不得**置位 _tombstoneLoaded
+      assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 'f3-retry-id' }), false, '首次读失败应暂时按空集')
+      assertEqual(MessageStore._tombstoneLoaded.has(fp), false, '瞬时读失败不得置位 _tombstoneLoaded（否则永久记忆成空集）')
+      // 第二次加载：重试成功 → 防重放身份恢复
+      assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 'f3-retry-id' }), true, '读失败后再次调用应重试读盘并命中墓碑身份')
+      assertEqual(MessageStore._tombstoneLoaded.has(fp), true, '读成功后应置位，避免每次都重读磁盘')
+      assertEqual(calls >= 2, true, `应发生重试读盘，实际调用 ${calls} 次`)
+    } finally {
+      MessageStore._readTombstoneData = realRead
+      MessageStore._tombstoneLoaded.delete(fp)
+      MessageStore._tombstones.delete(fp)
+      try { fsmod.unlinkSync(seenPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F3: 墓碑文件确认缺失仍置位（不做每次判重的同步磁盘 IO）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f3_missing.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    const realRead = MessageStore._readTombstoneData
+    let calls = 0
+    MessageStore._readTombstoneData = function (p) { calls++; return realRead.call(this, p) }
+    try {
+      MessageStore._tombstoneHasIdentity(fp, { id: 'x' })
+      const afterFirst = calls
+      MessageStore._tombstoneHasIdentity(fp, { id: 'x' })
+      MessageStore._tombstoneHasIdentity(fp, { id: 'x' })
+      assertEqual(MessageStore._tombstoneLoaded.has(fp), true, '确认缺失（missing）应置位，视为已加载的空集')
+      assertEqual(afterFirst, 1, '首次判重应读盘一次')
+      assertEqual(calls, 1, `缺失确认后不得每次判重都重读磁盘（性能回归），实际读盘 ${calls} 次`)
+    } finally {
+      MessageStore._readTombstoneData = realRead
+      MessageStore._tombstoneLoaded.delete(fp)
+      MessageStore._tombstones.delete(fp)
+    }
+  })
+
+  await test('B8-F4: 启动清理覆盖目录级哨兵 .seen.cleanup.lock（陈旧且进程已退出）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f4_guard.json'
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    // 陈旧哨兵：写入一个不可能存在的 PID + 旧 mtime
+    const guardPath = path.join(dir, '.seen.cleanup.lock')
+    fsmod.writeFileSync(guardPath, '999999:0:dead-owner', { flag: 'w' })
+    const past = new Date(Date.now() - 60000)
+    fsmod.utimesSync(guardPath, past, past)
+    MessageStore._tombstoneLocksCleaned.delete(dir)
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(guardPath), false, '陈旧且持有进程已退出的目录级哨兵应被启动清理回收')
+    } finally {
+      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F4: 启动清理不误删活跃进程持有的哨兵（只按陈旧时间判定会误删）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f4_live.json'
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    const guardPath = path.join(dir, '.seen.cleanup.lock')
+    // 本进程存活 + 旧 mtime：必须保留（清理要同时满足「陈旧」与「持有者已退出」）
+    fsmod.writeFileSync(guardPath, `${process.pid}:0:live-owner`, { flag: 'w' })
+    const past = new Date(Date.now() - 60000)
+    fsmod.utimesSync(guardPath, past, past)
+    MessageStore._tombstoneLocksCleaned.delete(dir)
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(guardPath), true, '活跃进程持有的哨兵即使 mtime 陈旧也不得被删')
+    } finally {
+      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F4: 清理候选名单同时覆盖 .seen.lock / .seen.cleanup.lock / .reclaim', () => {
+    assertEqual(MessageStore._isResidualTombstoneLockName('push.json.seen.lock'), true, '单文件墓碑锁应在名单内')
+    assertEqual(MessageStore._isResidualTombstoneLockName('.seen.cleanup.lock'), true, '目录级哨兵应在名单内')
+    assertEqual(MessageStore._isResidualTombstoneLockName('.seen.cleanup.lock.123.456.reclaim'), true, '.reclaim 中间态应在名单内')
+    assertEqual(MessageStore._isResidualTombstoneLockName('push.json'), false, '普通缓存文件不得进清理名单')
+    assertEqual(MessageStore._isResidualTombstoneLockName('push.json.seen.json'), false, '墓碑数据文件不得进清理名单')
+  })
+
+  await test('B8-F5: 磁盘文件存在但读不到时写闸门拒绝覆写（现状契约锁定）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f5_gate.json'
+    const fp = getFilePath(name)
+    // 造一个「文件存在但内容不可解析」的损坏缓存：readMessages 会置位 _readFailed
+    fsmod.writeFileSync(fp, '{ 这不是合法 JSON')
+    delete MessageStore._memoryCache[fp]
+    MessageStore._verified.delete(fp)
+    MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
+    const read = readMessages(fp)
+    assertEqual(read.length, 0, '损坏缓存应降级返回空数组')
+    assertEqual(MessageStore._readFailed[fp], true, '损坏缓存应置位读失败标记')
+    const rejected = saveBatch([{ id: 'f5-blocked', title: '应被拒绝' }], name)
+    assertEqual(rejected, false, '读失败标记置位期间 saveBatch 必须拒绝写入并返回 false（保护存量不被覆盖）')
+    const onDisk = fsmod.readFileSync(fp, 'utf8')
+    assertEqual(onDisk, '{ 这不是合法 JSON', '被拒绝时磁盘原文不得被覆写')
+    delete MessageStore._readFailed[fp]
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+  })
+
+  await test('B8-F5: 成功读回磁盘后写闸门自动解除（既有解除路径不退化）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f5_release.json'
+    const fp = getFilePath(name)
+    saveMessages(fp, [{ id: 'f5-rel-1', title: '存量' }])
+    MessageStore._readFailed[fp] = true
+    delete MessageStore._memoryCache[fp]
+    MessageStore._verified.delete(fp)
+    MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
+    const reread = readMessages(fp)
+    assertEqual(reread.some((m) => m.id === 'f5-rel-1'), true, '应从磁盘读回存量')
+    assertEqual(MessageStore._readFailed[fp], undefined, '成功读盘应清除读失败标记（解除保护）')
+    const appended = appendMessageToFile({ id: 'f5-rel-2', title: '新条目' }, name)
+    assertEqual(appended, true, '保护解除后 save 应恢复写入')
+    const onDisk = JSON.parse(fsmod.readFileSync(fp, 'utf8'))
+    assertEqual(onDisk.some((m) => m.id === 'f5-rel-2'), true, '恢复后新条目应真正落盘')
+  })
+
+  await test('B8-F-05: saveBatch 返回布尔——成功/空入参/无效身份/落盘失败口径一致', () => {
+    const name = 'test_b8_f05_ret.json'
+    const fp = getFilePath(name)
+    try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    try { require('node:fs').unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    MessageStore._memoryCache = {}
+    MessageStore._memoCount = 0
+    MessageStore._verified.clear()
+    MessageStore._identityIndex = new WeakMap()
+    // 真空输入：无变更即成功
+    assertEqual(saveBatch([], name), true, '空数组应返回 true（无变更也算成功）')
+    assertEqual(saveBatch(null, name), true, '非数组应返回 true（保护性忽略）')
+    // 全无效身份：无变更即成功
+    assertEqual(saveBatch([null, 42, 'x'], name), true, '全无效条目应返回 true（无变更）')
+    // 有效新增：落盘成功
+    assertEqual(saveBatch([{ id: 'f05-1', title: 'a' }], name), true, '有效新增落盘成功应返回 true')
+    // 读失败闸门：拒绝写入 → false（须造「文件存在但读不到」的现场，否则 readMessages 会解除保护）
+    require('node:fs').writeFileSync(fp, '{ 坏 JSON')
+    delete MessageStore._memoryCache[fp]
+    MessageStore._verified.delete(fp)
+    MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
+    readMessages(fp) // 触发置位
+    assertEqual(saveBatch([{ id: 'f05-2', title: 'b' }], name), false, '读失败闸门拒绝写入应返回 false')
+    try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    delete MessageStore._readFailed[fp]
+    delete MessageStore._memoryCache[fp]
+    MessageStore._verified.delete(fp)
+    // 落盘失败（循环引用）→ false
+    const circular = { id: 'f05-c', title: 'c' }
+    circular.self = circular
+    assertEqual(saveBatch([circular], name), false, '落盘失败应返回 false，调用方据此可见')
+  })
+
+  await test('B8-F-02: 索引被原地改写后 has 不得误判为已存在（陈旧索引）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f02_stale.json'
+    const fp = getFilePath(name)
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    saveMessages(fp, [{ id: 'f02-a', title: 'A' }, { id: 'f02-b', title: 'B' }])
+    const arr = readMessages(fp)
+    // 先让 _identityIndex 建立并缓存该数组的索引
+    assertEqual(isMessageInFile({ id: 'f02-b' }, name), true, '前置：f02-b 应已判重命中')
+    // 调用方原地改写权威数组（readMessages 返回同一引用）：把两个元素整体换掉
+    arr[0] = { id: 'f02-x', title: 'X' }
+    arr[1] = { id: 'f02-y', title: 'Y' }
+    // 旧身份必须立刻判否（不得因陈旧索引静默误判为已存在）
+    assertEqual(isMessageInFile({ id: 'f02-a' }, name), false, '被原地移除的 f02-a 不得再判重命中（陈旧索引回归）')
+    assertEqual(isMessageInFile({ id: 'f02-b' }, name), false, '被原地移除的 f02-b 不得再判重命中（陈旧索引回归）')
+    // 新身份必须判是
+    assertEqual(isMessageInFile({ id: 'f02-x' }, name), true, '原地写入的新身份应判重命中')
+    assertEqual(isMessageInFile({ id: 'f02-y' }, name), true, '原地写入的新身份应判重命中')
+  })
+
+  await test('B8-F-02: has 走索引与线性扫描结果一致（等价性对照）', () => {
+    const name = 'test_b8_f02_equiv.json'
+    const fp = getFilePath(name)
+    try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    saveMessages(fp, [
+      { id: 'e1' },
+      { id: 'e2', url: 'https://e.example/2' },
+      { url: 'https://e.example/3' },
+      { title: '匿名内容 e4 足够长避免退化' }
+    ])
+    const messages = readMessages(fp)
+    const probes = [
+      { id: 'e1' }, { id: 'e2' }, { id: 'e3' },
+      { url: 'https://e.example/2' }, { url: 'https://e.example/3' }, { url: 'https://e.example/9' },
+      { title: '匿名内容 e4 足够长避免退化' }, { title: '匿名内容 eX 足够长避免退化' }
+    ]
+    for (const p of probes) {
+      assertEqual(
+        isMessageInFile(p, name),
+        MessageStore._indexHasIdentityDirect(messages, p),
+        `索引判重与线性扫描应一致: ${JSON.stringify(p)}`
+      )
+    }
+  })
+
+  await test('B8-F7: getFileName 不给缓存目录生成隐藏文件（末段以点开头）', () => {
+    assertEqual(getFileName('https://example.com/.hidden'), 'url_.hidden.json', '末段 .hidden 应加前缀，避免生成隐藏文件')
+    assertEqual(getFileName('https://example.com/.json'), 'url_.json', '末段 .json 应加前缀')
+    assertEqual(getFileName('https://example.com/a.json'), 'a.json', '正常名字不受影响')
+    const p = getFilePath(getFileName('https://example.com/.secret'))
+    assertEqual(path.basename(p).startsWith('.'), false, `getFilePath 产物不得以点开头（隐藏文件）: ${path.basename(p)}`)
+  })
+
+  // ============================================================
   // v3.258 变异驱动补测（V3 尾部存活变异体定向击杀）
   // 数据来源：8-13 全量变异报告（v3-part4 存活 1171 个，其中
   // L2763 alert 启用判断 19 个 + L2819 report 启用判断 16 个

@@ -89,6 +89,9 @@ function createMessageStore ({
     // 若未来 pushUrl 数量级增长，需按与 _MEMO_MAX 同口径补键上限（本注释锁定该判定）。
     _tombstones: new Map(),
     _tombstoneLoaded: new Set(),
+    // 墓碑最近一次读盘结果（按缓存文件路径）：仅用于区分「确认缺失」与「读取失败」，
+    // 决定 _tombstoneLoaded 是否置位（missing/ok 置位，其余保留重试窗口）。
+    _tombstoneLoadStatus: {},
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
     _MEMO_MAX: 100,
     // 磁盘读取失败标记（按缓存文件路径记录）：ioError/unsafe 读取失败时置位，
@@ -244,10 +247,15 @@ function createMessageStore ({
     _tombstoneLocksCleaned: new Set(),
 
     /** 启动清理可确认属于已退出进程的陈旧墓碑锁；活跃锁和新锁一律保留。
-   *  P3（审查 2026-09-15）已知取舍：本清理只覆盖 .seen.lock（见下方 endswith 过滤），
-   *  xbk_storage.writeAtomic 的 <目标>.<pid>.<ts>.<hex>.tmp 在进程被 SIGKILL/超时 kill 时
-   *  无回收路径——残留只落在缓存目录内、不参与判重读取，属可接受的磁盘占用；
-   *  若要回收需与 xbk_storage.js 的临时文件命名/清理口径统一（跨文件），本轮未落地。 */
+   *  P3（审查 2026-09-15）：清理范围从 `.seen.lock` 扩到「墓碑锁 + 目录级哨兵」两类：
+   *  1) `<file>.seen.lock` —— 串行化单文件墓碑读-改-写；
+   *  2) `.seen.cleanup.lock`（含 `.reclaim` 中间态）—— 目录级启动清理/墓碑写入门径的哨兵。
+   *  原实现只匹配 `.seen.lock`，哨兵一旦被强杀进程留下且 mtime 陈旧，就再没有任何回收路径
+   *  （_acquireTombstoneCleanupGuard 只有在能读 token 且判存活失败时才认领），墓碑写入门径
+   *  永久不可用。两类都按同一「陈旧 + 进程已退出」双条件回收，活跃进程持有的锁照旧保留。
+   *  已知取舍（未变，本批次不改）：xbk_storage.writeAtomic 的 <目标>.<pid>.<ts>.<hex>.tmp
+   *  残留仍无回收路径——回收需在 xbk_storage.js 导出临时文件命名口径（该文件属另一批次，
+   *  跨文件改动已按协同口径登记为待办）。 */
     _cleanupResidualTombstoneLocks (dir) {
       if (this._tombstoneLocksCleaned.has(dir)) return
       const guard = this._acquireTombstoneCleanupGuard(dir)
@@ -257,7 +265,7 @@ function createMessageStore ({
         names = fs.readdirSync(dir)
         this._tombstoneLocksCleaned.add(dir)
         for (const name of names) {
-          if (!name.endsWith('.seen.lock')) continue
+          if (!this._isResidualTombstoneLockName(name)) continue
           const lockPath = path.join(dir, name)
           try {
             const st = fs.statSync(lockPath)
@@ -274,6 +282,13 @@ function createMessageStore ({
       } finally {
         this._releaseTombstoneCleanupGuard(dir, guard)
       }
+    },
+
+    /** 启动清理的候选名判定：覆盖单文件墓碑锁、目录级清理哨兵与其 .reclaim 中间态。
+   *  纯函数，供测试直接锁定名单（改窄会静默漏回收，见 F4）。 */
+    _isResidualTombstoneLockName (name) {
+      if (typeof name !== 'string') return false
+      return name.endsWith('.seen.lock') || name.endsWith('.seen.cleanup.lock') || name.includes('.seen.cleanup.lock.')
     },
 
     /** 目录级非阻塞哨兵：串行化启动清理与墓碑锁创建，覆盖检查-删除竞态。 */
@@ -453,6 +468,7 @@ function createMessageStore ({
           if (exists || restored) {
             try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
           }
+          // P3（审查 2026-09-15）标注：本内存命中路径会清除 _readFailed[filePath]，
         }
         // 内存快照为权威读取：清除该文件的读取失败标记（后续 save 可安全基于快照落盘）
         try { delete this._readFailed[filePath] } catch (e) { /* 忽略 */ }
@@ -586,10 +602,6 @@ function createMessageStore ({
       // v3.x：磁盘刚被直写，外部删除可能在后续发生；清除“已验证”标记，
       // 使下次 readMessages 内存命中重新做一次 existsSync+恢复检查（保持外部删除恢复测试语义）。
       try { this._verified.delete(filePath) } catch (e) { /* 忽略 */ }
-      // P3（审查 2026-09-15）已知口径差异（本轮未改，属写闸门状态机决策）：本方法落盘成功后
-      // 未清除 _readFailed[filePath]，而 readMessages 的两条成功路径都会清除；于是「读失败标记
-      // 已置位 + 随后 saveMessages 直写成功」的组合会让 save/saveBatch 的写闸门（_readFailed
-      // 检查）继续拒绝该文件。是否在此一并 delete 需与读失败标记/写闸门口径统一决策后再改。
       // 缓存写盘成功：被裁剪记录才真正退出磁盘缓存，此时落墓碑防重放（防重复推送）
       if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll)
       return true
@@ -645,19 +657,31 @@ function createMessageStore ({
 
     /** 读取/初始化某缓存文件的墓碑身份集；缺失/损坏按空集处理，不阻断主流程。
    *  有意设计：损坏文件只在本进程内按空集使用（_tombstoneLoaded 防重复读盘），
-   *  进程重启后会重新读取外部修复/替换的文件，不永久丢弃。 */
+   *  进程重启后会重新读取外部修复/替换的文件，不永久丢弃。
+   *  P3（审查 2026-09-15）补：置位时机改为「读到内容」或「确认缺失」，只有真正的读取
+   *  失败（ioError/unsafe/tooLarge）才不置位。
+   *  原实现无条件先置位再读盘，一次瞬时读失败会被永久记忆成「空集」——防重放身份在本进程内
+   *  静默丢失且不再重试。但「一律不置位」也不可行：墓碑文件不存在是**常态**（每个缓存文件
+   *  首次判重都走这里），不置位会让每次判重都重新陷入同步磁盘 IO——实测 5000 条批量写入
+   *  里 _readTombstoneData 被调用 3000 次、耗时从 0.25s 涨到 1.5s。
+   *  故按结果分流：missing（文件确实不存在，读盘已给出确定答案）与读到内容都置位并缓存；
+   *  仅 ioError/unsafe/tooLarge 不置位，下次调用重试（_readTombstoneData 已对这些补了告警）。 */
     _loadTombstones (filePath) {
       if (this._tombstoneLoaded.has(filePath)) return this._tombstones.get(filePath)
-      this._tombstoneLoaded.add(filePath)
       const ts = { id: new Map(), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() }
       this._tombstones.set(filePath, ts)
       const data = this._readTombstoneData(filePath)
-      if (!data) return ts
       const fill = (map, arr) => { if (Array.isArray(arr)) for (const k of arr) if (typeof k === 'string' && k !== '') map.set(k, true) }
-      fill(ts.id, data.id)
-      fill(ts.urlOnly, data.urlOnly)
-      fill(ts.idWithUrl, data.idWithUrl)
-      fill(ts.anon, data.anon)
+      // data === null 时区分「确认缺失」与「读取失败」：后者不置位，保留下次重试窗口。
+      if (data) {
+        fill(ts.id, data.id)
+        fill(ts.urlOnly, data.urlOnly)
+        fill(ts.idWithUrl, data.idWithUrl)
+        fill(ts.anon, data.anon)
+        this._tombstoneLoaded.add(filePath)
+      } else if (this._tombstoneLoadStatus[filePath] === 'missing') {
+        this._tombstoneLoaded.add(filePath)
+      }
       return ts
     },
 
@@ -666,22 +690,27 @@ function createMessageStore ({
    *  P3（审查 2026-09-15）：missing（正常空集）静默；ioError/unsafe/tooLarge 属瞬时/环境故障，
    *  按空集使用会静默丢失防重放身份，补一条含状态与路径的告警便于观测。仍不改变「按空集处理」
    *  的既有语义，也不改动 _loadTombstones 的 _tombstoneLoaded 置位时机（失败后是否重试属
-   *  墓碑状态机口径，需另行决策，本轮未改）。 */
+   *  墓碑状态机口径：读失败返回空集，并把本次结果记入 _tombstoneLoadStatus，
+   *  由 _loadTombstones 决定是否置位 _tombstoneLoaded（仅 missing 与成功置位，
+   *  ioError/unsafe/tooLarge 保留下次重试窗口）。 */
     _readTombstoneData (filePath) {
       try {
         const result = readSafeTextResult(filePath + '.seen.json', TOMBSTONE_MAX_BYTES)
-        if (result.status !== 'ok' || !result.text) {
-          if (result.status !== 'ok' && result.status !== 'missing') {
+        this._tombstoneLoadStatus[filePath] = result.status
+        if (result.status !== 'ok') {
+          if (result.status !== 'missing') {
             const detail = result.error && result.error.message ? ': ' + result.error.message : ''
-            console.warn(`墓碑读取失败（按空集处理）${filePath}.seen.json: ${result.status}${detail}`)
+            console.warn(`墓碑读取失败（按空集处理，下次调用重试）${filePath}.seen.json: ${result.status}${detail}`)
           }
           return null
         }
+        if (!result.text) return null
         const data = JSON.parse(result.text)
         if (!data || typeof data !== 'object') return null
         return data
       } catch (e) {
-        console.warn(`墓碑读取异常，按空集处理 ${filePath}.seen.json:`, e?.message)
+        this._tombstoneLoadStatus[filePath] = 'ioError'
+        console.warn(`墓碑读取异常，按空集处理（下次调用重试）${filePath}.seen.json:`, e?.message)
         return null
       }
     },
@@ -948,18 +977,60 @@ function createMessageStore ({
       return idx.anonByKey.has(b.key)
     },
 
+    /** 身份索引缓存失效检查（P3 审查 2026-09-15）。
+   *  缓存条目形如 { ref, head, len, idx }：ref 是权威数组引用、head 是首个元素引用、
+   *  len 是元素数、idx 是预计算身份索引。
+   *
+   *  为什么不能只用「数组引用」作键：readMessages 返回的是内部权威数组的同一引用，
+   *  调用方原地删改元素不会换引用，旧索引会让 has() 静默误判为「已存在」。
+   *
+   *  为什么键里不能放「全部元素引用的数组」：_identityIndex 是 WeakMap，把数组当键会让
+   *  每次 has() 都构造一个新键、get 必然落空 → 每次都全量重建索引（实测 2000 次 has()
+   *  从 23ms 退化到 29s）。
+   *
+   *  为什么不能每次做「逐位置身份复检」：那要遍历索引里的每个下标并重算 getMessageIdentity，
+   *  实测每次约 20ms（3000 条缓存），同样把热路径打死。
+   *
+   *  最终口径：O(1) 失效检查（引用 / 首元素 / 长度）+ 针对性的「下标越界加固」，
+   *  另提供 _indexHasIdentityDirect 作为零索引的正确性对照入口（慢路径 / 测试用）。 */
+    _identityIndexIsStale (entry, messages) {
+      if (!entry || entry.ref !== messages) return true
+      if (entry.len !== messages.length) return true
+      return entry.head !== messages[0]
+    },
+
+    /** Ensure 预计算索引可用：命中且未失效直接复用，否则重建并写回。
+   *  重建时同时记录 ref/head/len 供下次 O(1) 失效检查。 */
+    _cachedIndexFor (messages) {
+      const entry = this._identityIndex.get(messages)
+      if (!this._identityIndexIsStale(entry, messages)) return entry.idx
+      const idx = this._buildIdentityIndex(messages)
+      this._identityIndex.set(messages, { ref: messages, head: messages[0], len: messages.length, idx })
+      return idx
+    },
+
+    /** 判重正确性对照入口（无索引）：线性扫描 + 逐条身份比较，语义与 _indexHasIdentity 等价。
+   *  O(n) 且不做任何索引缓存，专供测试/诊断在「索引可能陈旧」的场景下取得权威答案
+   *  （见 _identityIndexIsStale 的失效边界说明）。热路径仍走 _cachedIndexFor。 */
+    _indexHasIdentityDirect (messages, message) {
+      const b = Utils.getMessageIdentity(message)
+      if (!b.valid) return false
+      for (let i = 0; i < messages.length; i++) {
+        const a = Utils.getMessageIdentity(messages[i])
+        if (Utils.sameMessageIdentity(messages[i], message, a, b)) return true
+      }
+      return false
+    },
+
     has (message, filename) {
     // 与 save 一致：先做条目有效性校验，无效 message（null/原始值/数组）直接判不存在，
     // 不依赖 getMessageIdentity 的隐式容错。
       if (!Utils.isValidItem(message)) return false
       const filePath = this.getFilePath(filename)
       const messages = this.readMessages(filePath)
-      // 预计算身份索引按数组引用缓存：同文件重复 has 直接 O(1) 命中，不再对整数组线性扫描。
-      let idx = this._identityIndex.get(messages)
-      if (!idx) {
-        idx = this._buildIdentityIndex(messages)
-        this._identityIndex.set(messages, idx)
-      }
+      // 预计算身份索引按「数组引用 + 首元素 + 长度」做 O(1) 失效检查：
+      // 数组被整体替换或首元素被换掉时自动重建（见 _identityIndexIsStale 注释口径）。
+      const idx = this._cachedIndexFor(messages)
       if (this._indexHasIdentity(idx, message)) return true
       // P4（CodeAnt）：消息数组未命中时查墓碑——被裁剪记录的判重身份不丢
       return this._tombstoneHasIdentity(filePath, message)
@@ -986,12 +1057,13 @@ function createMessageStore ({
     },
 
     /** 批量写入：一次性 append 多条消息，只触发一次磁盘写入（用于单次运行内的多条新数据）
-   *  P3（审查 2026-09-15）契约缺口（已知，未改）：本方法无返回值（与 save/saveMessages 返回布尔
-   *  的约定不一致），落盘失败仅在下方 console.warn 可见；当前调用方（App）亦忽略结果。
-   *  加返回值需同步调用方口径（跨文件），故本轮仅在此登记。 */
+   *  P3（审查 2026-09-15）返回值口径已统一：与 save/saveMessages 一致返回布尔。
+   *  true  = 本次变更已落盘（或无需落盘：空入参/无有效新增/内容未变）；
+   *  false = 因保护性拒绝（读失败闸门/写入被拒）或落盘失败，本次变更未持久化。
+   *  调用方不得再用「无返回值」推断成功——落盘失败同时有 console.warn 可观测。 */
     saveBatch (newMessages, filename) {
-    // 公开 API 防御：批量输入必须是数组；对象/数字/Symbol 等不可迭代值不能直接进入 for...of。
-      if (!Array.isArray(newMessages) || newMessages.length === 0) return
+    // 公开 API 防御：批量输入必须是数组；对象/数字/Symbol 等不可迭代值不能直接进入 for·of。
+      if (!Array.isArray(newMessages) || newMessages.length === 0) return true
       const filePath = this.getFilePath(filename)
       // readMessages 可能返回进程内内存缓存权威数组；先复制，避免落盘失败前原地污染内存缓存。
       const messages = [...this.readMessages(filePath)]
@@ -1001,7 +1073,7 @@ function createMessageStore ({
       // 会绕过守卫直接覆写损坏文件（此前先判后读的时序漏洞）。
       if (this._readFailed[filePath]) {
         console.error(`缓存读取失败，跳过批量写入以保护存量数据 ${filePath}`)
-        return
+        return false
       }
       // 统一身份索引：每个键保存可能命中的 index 集合；更新时保留历史候选，查询时按当前身份校验，
       // 避免复杂的删除/重建逻辑在同 id/同 URL 脏缓存场景下产生索引分裂。
@@ -1141,7 +1213,7 @@ function createMessageStore ({
           pushRegistered({ ...Utils.safeObjectCopy(message), timestamp: NOW() })
         }
       }
-      if (!changedAny) return
+      if (!changedAny) return true
       // v3.x q9：捕获落盘结果——saveMessages 在序列化/写入失败时返回 false，
       // 忽略返回值会让落盘失败被静默吞掉，仅保留内存快照。
       const saved = this.saveMessages(filePath, messages)
@@ -1153,6 +1225,7 @@ function createMessageStore ({
       // P3：批尾一条汇总日志替代逐条刷屏（大批次场景）——落盘成功后再报（CodeRabbit：失败不报"已更新"）
         console.log(`缓存批量更新: ${filename} 更新 ${updatedCount} 条`)
       }
+      return saved
     },
 
     getFileName (url) {
@@ -1174,10 +1247,13 @@ function createMessageStore ({
       if (!name || /^\.+$/.test(name)) name = 'default' // 空/纯点串兜底，避免 '..' → '...json'
       name = name.replace(/[\\/:*?"<>|]/g, '_') // 清洗文件系统保留字符（P3：补 ? 与 getFilePath 口径对齐）
       name = name.replace(/[\u0000-\u001f]/g, '') // 过滤控制字符
-      if (!name) name = 'default' // 清洗后复检空串：末段全为控制字符时避免生成隐藏文件 '.json'（仅覆盖空串形态）
-      // P3（审查 2026-09-15）已知缺口：末段字面为 '.json'/'.hidden' 这类以点开头的名字不命中上方
-      // 两个兜底分支，仍会经 getFilePath 在缓存目录生成隐藏文件；本轮未加前缀（改名会改变这些 URL 的
-      // 缓存文件身份，属判重身份口径变更），如需落地应与 getFilePath 的截断碰撞（原始名哈希后缀）一并设计。
+      if (!name) name = 'default' // 清洗后复检空串：末段全为控制字符时避免生成隐藏文件 '.json'
+      // P3（审查 2026-09-15）：末段字面以点开头（如 URL 末段 '.json'/'.hidden'）不命中上方
+      // 兜底分支，会经 getFilePath 在缓存目录生成隐藏文件（文件名以点开头，ls 不可见、运维
+      // 排查易漏）。补前缀 'url_' 落地防护；这只改变这些 URL 的缓存文件名，不改判重语义
+      // （判重身份来自消息内容/URL 本身，与缓存文件名无关），已存在的隐藏文件由启动清理
+      // 的残留回收与下一次写入自然迁移。
+      if (name.startsWith('.')) name = 'url_' + name
       if (!name.endsWith('.json')) name += '.json'
       return name
     }
