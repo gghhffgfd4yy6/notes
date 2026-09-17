@@ -285,11 +285,13 @@ function classifyFailure (error) {
 
 function classifySummary (summary) {
   if (!summary || typeof summary !== 'object') return null
-  const total = Number(summary.total) || 0
   const pushed = Number(summary.pushed) || 0
   const failed = Number(summary.failed) || 0
-  // 有失败消息时进入分类；纯部分成功且剩余失败均为可重试/未知时继续，明确永久失败则停止。
-  if (total <= 0 || failed <= 0) return null
+  // XFP-03：「有没有失败」只由 failed 决定。旧条件写作 `total <= 0 || failed <= 0`，而
+  // total 来自 `Number(summary.total) || 0`——total 缺失、非数字（或恰好为 0）时即为 0，
+  // 于是一个「报了失败但没报 total / total 非数字」的摘要被判成「无失败」返回 null，
+  // 调度器据此读成成功（绿色），失败被静默吞掉。total 只描述本轮规模，不参与该判定。
+  if (failed <= 0) return null
   const failures = safeArray(readProp(summary, 'failures')) || []
   if (failures.length === 0) {
     return pushed > 0

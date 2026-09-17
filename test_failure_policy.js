@@ -271,6 +271,21 @@ function error (message, code) {
   // classifySummary：部分成功 + failures 空数组 → 保持成功，不熔断
   assert.strictEqual(classifySummary({ total: 2, pushed: 1, failed: 1, failures: [] }), null)
 
+  // [XFP-03] 「有没有失败」只由 failed 决定，不得被 total 的缺失/非数字带偏。
+  // 反例（改动前）：`Number(total)||0` 使 total<=0 成立 → 直接返回 null，一个有失败的摘要
+  // 被判成“无失败”即成功，调度器按绿色处理、失败被静默吞掉。
+  assert.strictEqual(classifySummary({ failed: 1, failures: [{ code: 'HTTP_401', message: 'unauthorized' }] }).kind, 'permanent',
+    'total 缺失但 failed>0 时必须进入分类，不能返回 null')
+  assert.strictEqual(classifySummary({ total: 'x', failed: 1, failures: [{ code: 'HTTP_401', message: 'unauthorized' }] }).kind, 'permanent',
+    'total 非数字但 failed>0 时必须进入分类，不能返回 null')
+  assert.strictEqual(classifySummary({ total: 0, failed: 2, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }] }).kind, 'retryable',
+    'total 为 0 但 failed>0 时必须进入分类（宁可重试，不可静默丢）')
+  // 反向断言：真正无失败/非法 failed 仍必须返回 null，不能被放宽成“一律失败”
+  assert.strictEqual(classifySummary({ total: 5, failed: 0 }), null, 'failed=0 仍为成功')
+  assert.strictEqual(classifySummary({ total: 5 }), null, 'failed 缺失仍为成功')
+  assert.strictEqual(classifySummary({ total: 5, failed: 'abc' }), null, 'failed 非数字仍为成功')
+  assert.strictEqual(classifySummary({ total: 5, failed: -1 }), null, 'failed 负数仍为成功')
+
   // code 数值 400-499（未命中 message/错误码集合）→ PROVIDER_xxx 永久
   assert.strictEqual(classifyFailure({ code: 450, message: 'server replied' }).kind, 'permanent')
   assert.strictEqual(classifyFailure({ code: 450, message: 'server replied' }).reason, 'PROVIDER_450')
