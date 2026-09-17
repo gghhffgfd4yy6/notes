@@ -5992,26 +5992,29 @@ console.log('========================================\n');
 
   await test('故障注入: fs.readFileSync 抛错 → readMessages 返回空数组', () => {
     const fs = require('fs')
-    const orig = fs.readFileSync
-    fs.readFileSync = () => { throw new Error('IO错误') }
+    // STG-01：缓存内容改由 fd 有界读取（openSync + readSync），注入 readFileSync 已不再影响内容读取
+    // （会让本用例变成空断言）。注入点改为**任何读取都必须经过**的 openSync，断言口径不变。
+    const orig = fs.openSync
+    fs.openSync = () => { throw new Error('IO错误') }
     try {
       const r = readMessages(getFilePath('test_fault_read.json'))
       assertEqual(Array.isArray(r), true)
     } finally {
-      fs.readFileSync = orig
+      fs.openSync = orig
     }
   })
 
   await test('故障注入: 双故障(read+write都抛) → readMessages 不崩溃', () => {
     const fs = require('fs')
-    const origR = fs.readFileSync; const origW = fs.writeFileSync
-    fs.readFileSync = () => { throw new Error('IO读错误') }
+    // STG-01：读侧注入点改为 openSync（内容读取改 fd 有界读取后，注入 readFileSync 不再生效），写侧不变
+    const origR = fs.openSync; const origW = fs.writeFileSync
+    fs.openSync = () => { throw new Error('IO读错误') }
     fs.writeFileSync = () => { throw new Error('磁盘满写错误') }
     try {
       const r = readMessages(getFilePath('test_dual_fault.json'))
       assertEqual(Array.isArray(r), true, '双故障应仍返回数组')
     } finally {
-      fs.readFileSync = origR
+      fs.openSync = origR
       fs.writeFileSync = origW
     }
   })
@@ -6075,15 +6078,17 @@ console.log('========================================\n');
     const p = getFilePath(name)
     try { fs.unlinkSync(p) } catch (e) {}
     fs.writeFileSync(p, JSON.stringify([{ id: 993 }]), 'utf8')
-    const origRead = fs.readFileSync
-    fs.readFileSync = (filePath, ...args) => {
-      if (filePath === p) throw new Error('read 失败')
+    const origRead = fs.openSync
+    // STG-01：缓存内容改由 fd 有界读取（openSync + readSync），注入 readFileSync 不再影响内容读取；
+    // 注入点改为按路径判定的 openSync（仍是「这一个文件的读取失败」），断言口径不变。
+    fs.openSync = (filePath, ...args) => {
+      if (filePath === p) throw Object.assign(new Error('read 失败'), { code: 'EIO' })
       return origRead.call(fs, filePath, ...args)
     }
     try {
       assertEqual(readMessages(p).length, 0, '读取失败本次返回空数组但不能缓存')
     } finally {
-      fs.readFileSync = origRead
+      fs.openSync = origRead
     }
     const recovered = readMessages(p)
     assertEqual(recovered.some(m => m.id === 993), true, '读取恢复后必须重新读取文件')
