@@ -45,13 +45,13 @@ node qinglong/xbk_push.js --check
 node qinglong/xbk_push.js --status
 ```
 
-`--status` 默认读取项目根目录下的 `xianbaoku_cache/`（与当前工作目录无关），四个状态文件都缺失时同样返回 0、只报「缺失」。若状态文件写在别处，可用**绝对路径**覆盖：
+`--status` 默认读取项目根目录下的 `xianbaoku_cache/`（与当前工作目录无关），并与生产共用同一套根内解析与多级回退（默认目录不可用时落到 `.xbk_cache_safe`），**输出首行打印生效缓存目录**。四个状态文件都缺失时同样返回 0、只报「缺失」。若状态文件写在别处，可用**绝对路径**覆盖：
 
 ```bash
 XBK_CACHE_DIR=/path/to/cache node qinglong/xbk_push.js --status
 ```
 
-相对路径会被忽略。`XBK_CACHE_DIR` 只影响 `--status`；常驻/单轮运行的缓存目录由 `Config.cache.dir` 决定，且必须位于项目根内（绝对路径、`..` 或符号链接逃逸会被拒绝并回退默认目录）。
+相对路径会被忽略。`XBK_CACHE_DIR` 只影响 `--status`；常驻/单轮运行的缓存目录由 `Config.cache.dir` 决定，且必须位于项目根内（绝对路径、`..` 或符号链接逃逸会被拒绝并回退默认目录）。`--status` 刻意不加载应用配置（缺 `got`/`re2` 时仍要可用），因此把 `Config.cache.dir` 改成根内其它目录后，需用 `XBK_CACHE_DIR` 指向该绝对路径才能读到同一目录。
 
 `--status` 只读取缓存目录中的状态文件，不加载推送依赖、不抓取、不推送、不修复或写入任何文件。输出含日报的「待推送（截断）」及最近一轮的「截断」「耗时」字段；`report.state` 缺字段按「未累计」处理（不整表判 invalid）。
 
@@ -97,7 +97,7 @@ node qinglong/xbk_push.js --dry-run
 | 配置段 | 字段（默认值） | 说明 |
 |---|---|---|
 | `domain` | `'https://new.ixbk.net'` | 接口域名，`api.pushUrl` 由其拼出 |
-| `api` | `timeout: 5000`、`retry: 2` | 接口超时与重试次数（超时取整并钳到 1~2147483647 毫秒，小数向上取整，非正或非法值回落 5000） |
+| `api` | `timeout: 5000`、`retry: 2` | 接口超时与重试次数（超时只接受 ≥100ms 的整数并钳到 100~2147483647 毫秒；非整数、亚 100ms（疑似按毫秒填了秒）与非正值回落 5000 并告警。可重试请求在 429/408/425/503 且响应带合法的 `Retry-After` 时按其等待，否则指数退避，两条路径上限 30s） |
 | `filter` | 全部 `''`，`pingbitime: '5'` | 过滤规则；变更会失效「过滤写入」缓存并重评 |
 | `keyword` | `zkt_gjc: ''` | 只看它关键词 |
 | `timing` | `pushInterval: 0`、`finalWait: 0` | 推送间隔与收尾等待（毫秒） |
@@ -155,7 +155,7 @@ diagnostics: {
 
 ## 测试
 
-`npm test` 顺序执行全部 42 个套件（30 个单元 + 10 个集成 + 2 个变异行段元校验），前置跑一遍依赖预检 `scripts/check-deps.js`：探测清单由 `package.json` 的 `dependencies`/`optionalDependencies` 派生（声明了却没装即失败，不再只认硬编码的 `got`/`re2`），区分「未安装」与「已安装但不可用」并输出根因，同时校验运行时 Node 版本是否满足 `engines.node` 与 `re2` 自身的（更严的）`engines.node`，任一不满足即退出；该脚本也可直接执行（`node scripts/check-deps.js`，按检查结果 exit 0/1）。集成套件多数已 mock，个别仍可能受运行环境/网络影响。`npm run test:unit` 只跑 30 个单元套件。
+`npm test` 顺序执行全部 45 个套件（33 个单元 + 10 个集成 + 2 个变异行段元校验），前置跑一遍依赖预检 `scripts/check-deps.js`：探测清单由 `package.json` 的 `dependencies`/`optionalDependencies` 派生（声明了却没装即失败，不再只认硬编码的 `got`/`re2`），区分「未安装」与「已安装但不可用」并输出根因，同时校验运行时 Node 版本是否满足 `engines.node` 与 `re2` 自身的（更严的）`engines.node`，任一不满足即退出；该脚本也可直接执行（`node scripts/check-deps.js`，按检查结果 exit 0/1）。集成套件多数已 mock，个别仍可能受运行环境/网络影响。`npm run test:unit` 只跑 33 个单元套件（跳过集成与变异行段元校验）。
 
 ```bash
 npm run check                 # 总门禁：lint → 版本三方一致 → 变异行段校验 → npm test
@@ -168,6 +168,8 @@ npm run test:notify
 npm run test:mutation         # Stryker 变异测试（需 devDependencies，耗时长）
 npm run test:mutation-ranges  # 单独校验 mutation.yml 行段覆盖
 ```
+
+测试与变异链路的环境变量：`XBK_TEST_TIMEOUT`（`run_tests.js` 的每套件硬超时毫秒数，默认 600000，超时以 `SIGKILL` 强杀并按失败结算）、`XBK_MUTATION_REPORT_MAX_BYTES`（`scripts/mutation-json.js` 读取 `mutation.json` 前的预读上限，默认 2 GiB，`off` 表示只保留 Buffer 能表示的边界）、`MUTATION_REPORT_MAX_SKEW_MS`（`scripts/mutation-report.js` 的陈旧（缓存回填）报告闸门阈值，默认 12h，`off`/`≤0` 关闭）。
 
 定位单个集成用例：`node test_app.js --only=<名称子串>`。
 
