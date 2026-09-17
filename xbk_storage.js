@@ -86,12 +86,34 @@ function writeAtomicIfAbsent (filePath, text, label = '缓存初始化') {
   }
 }
 
+// 从已打开的 fd 读取 [start, start+length) 区间（审查 STG-01）。
+// 旧实现对 fd 只做 fstat/复检，内容却按路径 readFileSync(filePath) 整读——检查看到的 size 与
+// 实际读到的字节数没有任何约束关系（同 inode 就地 append 即可在读窗口内绕过 maxBytes，
+// 路径被换成更大的文件时也会先整读进内存）。改为同一 fd 上有界读取：读取长度由调用方按
+// fstat 观测值算出，读到的字节数永远不超过检查时看到的大小。
+function readFdRange (fd, start, length) {
+  const chunks = []
+  const CHUNK = 64 * 1024
+  let pos = start
+  let remaining = length
+  while (remaining > 0) {
+    const size = Math.min(CHUNK, remaining)
+    const buf = Buffer.allocUnsafe(size)
+    const read = fs.readSync(fd, buf, 0, size, pos)
+    if (read <= 0) break
+    chunks.push(buf.subarray(0, read))
+    pos += read
+    remaining -= read
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 // 可选大小上限：maxBytes 为数字且 > 0 时，普通文件超过该字节数即判 tooLarge，避免异常膨胀
 // 文件被整读入内存（状态/哈希等小文件场景）。maxBytes 非数字或 ≤0 时按既有语义处理为「不设限」。
 function readSafeTextResult (filePath, maxBytes) {
-  // 修复 TOCTOU：先以 O_NOFOLLOW 打开并 fstat 确认为普通文件，读取后复检路径仍指向
-  // 同一 inode（dev+ino）的普通文件。路径读取（保持既有故障注入兼容）后若被替换成
-  // 符号链接/其他文件，读后复检会将其判为 unsafe 并丢弃结果，不再泄露任意文件内容。
+  // 修复 TOCTOU：先以 O_NOFOLLOW 打开并 fstat 确认为普通文件，读取内容后复检路径仍指向
+  // 同一 inode（dev+ino）的普通文件。内容读取走同一 fd（readFdRange），读取期间路径被替换
+  // 成符号链接/其他文件时，读后复检仍会将其判为 unsafe 并丢弃结果，不泄露任意文件内容。
   const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
   let fd
   try {
@@ -107,7 +129,7 @@ function readSafeTextResult (filePath, maxBytes) {
     if (typeof maxBytes === 'number' && maxBytes > 0 && stat.size > maxBytes) {
       return { status: 'tooLarge', text: null, error: new Error(`文件过大(${stat.size} 字节)，超过上限 ${maxBytes} 字节`) }
     }
-    const text = fs.readFileSync(filePath, 'utf8')
+    const text = readFdRange(fd, 0, stat.size)
     let reFd
     try {
       reFd = fs.openSync(filePath, flags)

@@ -129,6 +129,21 @@ const {
   const r4b = readSafeTextResult(bigFile, 0)
   assert.strictEqual(r4b.status, 'ok', 'maxBytes=0 应不限制大小')
 
+  // ===== STG-01：上限必须约束真正的读取（fstat 与内容读取同一 fd、同一字节区间）=====
+  // 旧实现：fstat(fd) 只用来看 size，内容却按路径 readFileSync(filePath) 整读——检查值与实际
+  // 读到的字节数之间没有任何约束，同一 inode 就地 append 即可在窗口内绕过 maxBytes（把整份
+  // 膨胀文件读进内存）。修后按 fd 有界读取，返回内容不可能超过 fstat 观测到的字节数。
+  const grown = make('grown.txt')
+  fs.writeFileSync(grown, 'y'.repeat(100))
+  const origFstat = fs.fstatSync
+  const fakeStat = (s) => ({ isFile: () => s.isFile(), size: 50, dev: s.dev, ino: s.ino })
+  fs.fstatSync = (target) => fakeStat(origFstat.call(fs, target))
+  let raced
+  try { raced = readSafeTextResult(grown, 50) } finally { fs.fstatSync = origFstat }
+  assert.strictEqual(raced.status, 'ok', 'size 观测值未超上限时应判 ok（growth 发生在检查之后）')
+  assert.strictEqual(raced.text.length, 50, '读取长度必须受 fstat 观测值约束（旧实现按路径整读，返回 100 字节）')
+  assert.strictEqual(raced.text, 'y'.repeat(50), '有界读取应返回文件前缀而非截断后的其它内容')
+
   // 目录路径打开后 fstat 非文件 → unsafe
   const r5 = readSafeTextResult(dirPath)
   assert.strictEqual(r5.status, 'unsafe', '目录路径应返回 unsafe（fstat 非文件）')
