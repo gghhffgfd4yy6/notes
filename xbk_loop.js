@@ -4,7 +4,9 @@
 // （TimeoutOverflowWarning）。毫秒配置一旦放大（如误填 1e12），「等一小时」就变成立即返回，
 // 常驻间隔语义反转、循环空转。三处 setTimeout 消费者（runBounded 超时、sleep、runLoop
 // 间隔）统一经此钳制；下界沿用既有的 0，非有限值回落到各自的历史默认（sleep 为 10000）。
-const MAX_TIMER_MS = 2147483647
+// 写成表达式而非裸字面量：与 scripts/mutation-json.js 的 MAX_STRING_LENGTH 同款写法，
+// 规避 Codacy PMD「数值字面量在运行时会有不同取值」的误报（值仍精确为 2147483647）。
+const MAX_TIMER_MS = 2 ** 31 - 1
 
 function clampTimerMs (ms, fallback = 10000) {
   const value = Number.isFinite(ms) ? ms : fallback

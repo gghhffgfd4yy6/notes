@@ -15,11 +15,11 @@ const { readReportJson } = require('./scripts/mutation-json.js')
 
 const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'mutation-json-test-'))
 
-function parseJson (json) {
+function parseJson (json, options) {
   const file = path.join(tmpdir, 'case.json')
   // nosemgrep: 测试临时文件路径由代码生成，非外部输入
   fs.writeFileSync(file, json)
-  return readReportJson(file)
+  return readReportJson(file, options)
 }
 
 const cases = [
@@ -49,13 +49,12 @@ try {
   // ===== F1：字符串上限守卫必须在 Buffer.concat（分配峰值）之前生效 =====
   // 旧实现先整份 concat（内存翻倍）再比 MAX_STRING_LENGTH——超限输入要先付出分配峰值才发现
   // 放不下。现改为边扫边累计剥离后字节数，判定落在 concat 之前。
+  // 夹具经既有的 parseJson（固定文件名 case.json）落盘，不另建动态路径写法。
   {
-    const limitFile = path.join(tmpdir, 'limit.json')
-    // nosemgrep: 测试临时文件路径由代码生成，非外部输入
-    fs.writeFileSync(limitFile, '{"a":1,"statusReason":"hello world","b":2}')
+    const limitJson = '{"a":1,"statusReason":"hello world","b":2}'
     const strippedBytes = Buffer.byteLength('{"a":1,"statusReason":"","b":2}')
     // ① 长度算术必须精确：上限恰等于剥离后长度时不得误报（多算 1 字节即会误杀合法报告）
-    assert.deepStrictEqual(readReportJson(limitFile, { maxStringLength: strippedBytes }),
+    assert.deepStrictEqual(parseJson(limitJson, { maxStringLength: strippedBytes }),
       { a: 1, statusReason: '', b: 2 }, '上限恰等于剥离后长度时不应误报')
     // ② 少 1 字节必须报错，且报错里的字节数是真实剥离后长度（证明累计值没有算偏）
     const realConcat = Buffer.concat
@@ -66,7 +65,7 @@ try {
       return realConcat.apply(Buffer, args)
     }
     try {
-      readReportJson(limitFile, { maxStringLength: strippedBytes - 1 })
+      parseJson(limitJson, { maxStringLength: strippedBytes - 1 })
     } catch (e) {
       limitError = e
     } finally {
@@ -75,7 +74,7 @@ try {
     assert.ok(limitError, '剥离后超过上限必须抛错')
     assert.ok(String(limitError.message).includes(`仍为 ${strippedBytes} 字节`),
       `报错必须给出真实剥离后字节数（先算后分的算术不能偏），实际：${limitError && limitError.message}`)
-    assert.ok(String(limitError.message).includes('limit.json'), '超限报错必须带报告路径')
+    assert.ok(String(limitError.message).includes('case.json'), '超限报错必须带报告路径')
     assert.strictEqual(concatCalls, 0, '超限必须在 Buffer.concat（分配峰值）之前判定，不得先分配再报错')
     console.log('✅ 字符串上限守卫在 Buffer.concat 分配峰值之前生效')
     pass++
