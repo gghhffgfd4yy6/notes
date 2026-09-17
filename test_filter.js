@@ -8599,6 +8599,82 @@ console.log('========================================\n');
     }
   })
 
+  await test('sanitizeDecodedHtml 偶数个杂散引号不得屏蔽事件属性（P2-01 返工：HTML5 词法状态机）', () => {
+    // V1 打回（critical）：旧实现是「标签内引号奇偶配对」启发式——未加引号属性值里的杂散引号在
+    // HTML5 下只是普通字符（attribute value (unquoted) 状态），但奇偶启发式在**偶数个**杂散引号
+    // 下奇偶复原，伪属性对（`c=" onerror="`）的开启引号重新落回保护集、整段被占位，onerror 的
+    // 属性名被藏进占位符 → _stripEventAttrs 匹配不到 → 事件处理器原样出网。
+    // 返工改为 HTML5 tag tokenizer 状态机：只有 before attribute value 状态遇到的引号才算
+    // 「真正开启属性值」。以下载荷修复前经独立解析器 domino@2.2.0 均判 img[onerror=alert(1)] LIVE。
+    const cases = [
+      '<img foo=a"b"c=" onerror="alert(1)">', // V1 反例（偶数杂散引号）
+      '<img foo=a""b=" onerror="alert(1)">', // V1 反例
+      "<img foo=a''b=' onerror='alert(1)'>", // V1 反例（单引号族）
+      '<img foo=a""b=""c=" onerror="alert(1)">', // R1a 自造同族（更多偶数杂散引号）
+      '<img src=x foo=a"b"c=" onerror="alert(1)">', // R1a 自造同族（前置合法属性）
+      '<div foo=a"b"c=" onmouseover="alert(1)">x</div>' // R1a 自造同族（非 img 标签）
+    ]
+    const expected = [
+      '<img foo=a"b"c=" >',
+      '<img foo=a""b=" >',
+      "<img foo=a''b=' >",
+      '<img foo=a""b=""c=" >',
+      '<img src=x foo=a"b"c=" >',
+      '<div foo=a"b"c=" >x</div>'
+    ]
+    cases.forEach((h, i) => {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `偶数杂散引号伪属性对不应屏蔽其后事件属性: ${h} → ${r}`)
+      assertEqual(r, expected[i], `清洗输出须与 HTML5 词法一致（on* 清空、原值文本保留）: ${h} → ${r}`)
+    })
+    // 反向：合法属性值内的 on* 文本必须逐字节保留——旧启发式引入的假阳性回归
+    // （V1 实测 `<img a=x"b title="see onerror=x">` 的 title 值被截成 `see ）必须修掉。
+    const keepCases = [
+      '<img a=x"b title="see onerror=x">',
+      '<img title="see onerror=x" src="y">',
+      '<img data-a="x" title="a onerror=b">'
+    ]
+    for (const h of keepCases) {
+      assertEqual(sanitizeDecodedHtml(h), h, `合法属性值内的 on* 文本不得被误删（假阳性回归）: ${h}`)
+    }
+  })
+
+  await test('sanitizeDecodedHtml 未加引号属性值内的 < 不得切分标签区间（P1-01 返工：HTML5 词法状态机）', () => {
+    // V1 打回（high）：旧 _htmlTagSpans 在标签扫描中遇到「未加引号属性值里的 <」就 break 结束
+    // 当前 span 并从该 < 重开一个，而 HTML5 在 attribute value (unquoted) 状态把 < 当普通字符
+    // （parse error 但 append 进值），它不是新标签起点。于是 `<bar=" onerror="` 被当成标签内
+    // 合法属性对被整段占位，onerror 原样出网。修复前以下载荷经 domino 均判 LIVE。
+    const cases = [
+      '<img foo=x<bar=" onerror="alert(1)">', // V1 反例
+      '<img a=1<b=" onerror="alert(1)">', // V1 反例
+      '<img foo=a"b<c=" onerror="alert(1)">', // R1a 自造同族（杂散引号 + 值内 <）
+      '<img data-a=x<y"z=" onerror="alert(1)">' // R1a 自造同族
+    ]
+    const expected = [
+      '<img foo=x<bar=" >',
+      '<img a=1<b=" >',
+      '<img foo=a"b<c=" >',
+      '<img data-a=x<y"z=" >'
+    ]
+    cases.forEach((h, i) => {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `未加引号值内的 < 不得切分标签区间而屏蔽事件属性: ${h} → ${r}`)
+      assertEqual(r, expected[i], `清洗输出须与 HTML5 词法一致: ${h} → ${r}`)
+    })
+    // 非回归：清单原声明用例（未配对 < 后的纯文本属性对）仍必须清除事件属性
+    for (const h of ['1 < 2 name="a <img src=y onerror=alert(1)>" b', '价格 <100 元 name="a <img src=y onerror=alert(1)>" b']) {
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(sanitizeDecodedHtml(h)), false, `未配对 < 后的纯文本属性对不得屏蔽事件属性: ${h}`)
+    }
+    // 状态机不得把「标签名里的 '='」误当属性赋值（R1a 自造同族：HTML5 视整段为标签名，
+    // onerror 是紧随其后的真实属性，必须清除）
+    const tagNameEq = '<a"b= " onerror="alert(1)">'
+    assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(sanitizeDecodedHtml(tagNameEq)), false, `标签名里的 = 不得被当作属性赋值: ${tagNameEq}`)
+    // R1a 自造同族：标签名里出现 '=' 后又用引号开值——HTML5 视引号为标签名字符（tag name 状态
+    // 下引号不是值引号），标签在引号处遇到 '>' 结束，onerror 仍是紧随其后的真实属性。
+    const tagNameQuoted = "<a=b'c' onerror='alert(1)'>"
+    assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(sanitizeDecodedHtml(tagNameQuoted)), false, `标签名里的引号不得开启属性值: ${tagNameQuoted}`)
+  })
+
   await test('sanitizeDecodedHtml 未闭合引号不泄漏共享正则状态（P2-02：跨调用结果一致）', () => {
     // safeRe 全局缓存同一正则对象：未闭合引号分支 break 前不复位 lastIndex 会污染下一次调用，
     // 同一条输入的输出随「进程内此前处理过哪条消息」而变（本用例即为回归锁定）。

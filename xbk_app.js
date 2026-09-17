@@ -1038,8 +1038,12 @@ function createApp ({
         const cacheName = MessageStore.getFileName(Config.api.pushUrl)
         // v3.159：过滤规则哈希比对——规则变更时失效「过滤写入」缓存（改宽过滤后旧条目重新评估/推送，
         // 无需手动清缓存；「推送成功」缓存不受影响，防重复推送）
+        // FILTER-01 / RULES-05：哈希除配置字节外还折入「规则实际编译生效」维度
+        // （RuleEngine.compileStateOf(compiledRules)：re2 可用性 + 各字段是否真的编译出规则）。
+        // 否则同一份配置下 re2 缺失/规则被 ReDoS 守卫丢弃时哈希不变，已打 _f 的条目永不重评、
+        // 改宽后静默漏推。该维度随环境稳定，不会每轮清 _f。
         {
-          const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc)
+          const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc, RuleEngine.compileStateOf(compiledRules))
           const hashPath = path.join(MessageStore.cacheDir, 'filter.hash')
           let lastFile = ''
           let lastHash = ''
@@ -1502,11 +1506,16 @@ function createApp ({
           }
           if (sent && Array.isArray(sent.failures)) channelFailures.push(...sent.failures)
           if (result.failure) {
-            // APP2-03：此 successfulChannels 分支当前不可达——result.failure 的唯一来源是
-            // summarizeError(e)（xbk_failure_policy.js），其 info 只透传 code/name/statusCode/
-            // providerCode/channel/message(+条件性 failureKind/failureReason/failures)，从不含
-            // successfulChannels；投递层也只在「全部通道失败」时才抛，此时该数组恒为空。
-            // 保留以便 summarizeError 未来透出该字段时自动生效；补齐需改 failure_policy（跨文件）。
+            // APP2-03：result.failure 的来源是 summarizeError(e)（xbk_failure_policy.js）。投递层
+            // 只在「全部通道失败」时抛错（xbk_sendNotify_slim.js:1573 `okCount === 0`），此时
+            // successfulChannels 恒为空数组——该分支不可达。
+            // 返工结论（R1a）：① 删除该分支写不出可证伪断言（删死代码无行为差异）；
+            // ② 唯一可证伪的出路是让 summarizeError 透出 successfulChannels，但那要改
+            //    xbk_failure_policy.js（不在本代理白名单）；③ 更要紧的是它**不该**透出：
+            //    channelSuccessful/成功缓存已由上方 `sent.successfulChannels` 覆盖，而在
+            //    `okCount === 0` 的抛错路径上该数组恒空，透出只会把「全部失败」记录成
+            //    「部分成功」并污染 _updateChannelHealth 的通道健康统计。
+            // 故保留死分支 + 契约注释，不按清单建议①改（理由见 .local/reports/fix-r1a-REPORT.md）。
             if (Array.isArray(result.failure.successfulChannels)) {
               for (const channel of result.failure.successfulChannels) channelSuccessful.add(channel)
             }
@@ -1521,8 +1530,17 @@ function createApp ({
           ? []
           : newMessages.filter(m => !truncatedKeys.has(keyOf(m)) && (!itemsKeys.has(keyOf(m)) || pushedKeys.has(keyOf(m))))
         const cacheStart = Date.now()
-        MessageStore.saveBatch(toCache, cacheName)
+        // APP-03：落盘结果必须可观测——saveBatch 的返回值（xbk_message_store.js 已随 B8 改为
+        // 返回 true/false）此前被丢弃，缓存落盘失败时摘要与退出码仍报成功，运维看不到「本轮
+        // 推送成功但成功记录没落盘」（下次运行会重推）。这里接住失败并写 run.log 告警；
+        // result.cacheSaved 同时进摘要（false 表示本轮缓存未落盘）。
+        let cacheSaved = true
+        try { cacheSaved = MessageStore.saveBatch(toCache, cacheName) !== false } catch (e) { cacheSaved = false } // 契约：undefined 视为成功（兼容旧实现）
         cacheMs = Date.now() - cacheStart
+        if (!cacheSaved) {
+          this._writeRunLog(`${this._localStamp()} WARN 缓存落盘失败：本轮 ${toCache.length} 条记录未能写入 ${cacheName}，下次运行将对它们重新判重（可能重复推送）\n`)
+          console.warn(`⚠️ 缓存落盘失败：本轮 ${toCache.length} 条记录未写入缓存文件（下次运行会重新推送）`)
+        }
         checkpoint('cache-write-complete', `cached=${toCache.length} cacheMs=${cacheMs}`)
         await this._updateChannelHealth({ successfulChannels: [...channelSuccessful], failures: channelFailures })
 
@@ -1547,6 +1565,7 @@ function createApp ({
           ? (items.length > successCount ? `（dry-run 未推送 ${items.length - successCount} 条）` : '')
           : (successCount < items.length ? `（${items.length - successCount} 条失败，下次运行重试）` : '')
         console.log(`  推送:     ${successCount} 条${pushResultText}`)
+        if (!cacheSaved) console.log(`  缓存:     落盘失败（${toCache.length} 条未写入缓存，下次运行会重新推送）`)
         console.log(`  耗时:     ${elapsed}s`)
         if (process.env.XBK_PROFILE === '1' || detailedProfile) {
           const totalMs = Date.now() - runStart
@@ -1574,7 +1593,7 @@ function createApp ({
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
         // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
-        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}\n`)
+        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}\n`)
 
         // v3.125：运行日报（跨天发昨日汇总 + 当天累加；静默）
         const summary = {
@@ -1584,6 +1603,8 @@ function createApp ({
           truncated: truncatedCount, // v3.145：截断数（下次推送）
           pushed: successCount,
           failed: dryRun ? 0 : items.length - successCount,
+          // APP-03：缓存落盘可观测（false = 本轮成功记录未落盘，下次运行将重推）
+          cacheSaved,
           failures: failureInfos
         }
         if (!dryRun) await this._updateReport(summary)

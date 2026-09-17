@@ -368,4 +368,32 @@ check('P1-04: 清洗链内部正则不含反向引用（RE2 兼容）', () => {
     '未闭合引号不得与后续属性引号跨标签配对')
 })
 
+// ===== P1-04（同族）：清洗/规范化热路径内部正则不得含 lookaround（RE2 兼容）=====
+// 反例（改动前）：xbk_utils.js sanitizeSurrogates 把
+// `[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]` 交给 safeRe——
+// 含 lookahead `(?!` 与 lookbehind `(?<!`，真 RE2 均不支持，编译失败后会被 safeRe 静默 catch
+// 回落 V8 RegExp，线性时间防护丢失。该方法在**生产热路径**上（safeText；xbk_app 每条推送的
+// 标题/正文都经它），与上方 4 条反向引用是同一「静默回落」通道。观测方式：注入记录全部 pattern
+// 源码的 safeRe，跑一遍 safeText/sanitizeSurrogates/sanitizeDecodedHtml，断言没有任何被编译的
+// 内部模式含 lookaround。本机 re2 是 V8 替身（不拒 lookaround），故断言写成源码级判定——
+// 它对「lookaround 被重新写回」可本地证伪；CI 装真 re2 时本断言即其前置条件。
+check('P1-04 同族: sanitizeSurrogates/safeText 内部正则不含 lookaround（RE2 兼容）', () => {
+  const captured = []
+  const SpyUtils = createUtils({ safeRe: (src, flags) => { captured.push([src, flags]); return new RegExp(src, flags) } })
+  SpyUtils.safeText('a\uD800b\uDC00c\uD83D\uDE00') // 孤立高/低代理 + 完整代理对
+  SpyUtils.sanitizeSurrogates('\uD800')
+  SpyUtils.sanitizeDecodedHtml('<a href="x" title="t">t</a>')
+  assert.ok(captured.length > 0, '前置条件：规范化/清洗链必须经注入的 safeRe 编译内部正则')
+  const isLookaround = (src) => ['(?=', '(?!', '(?<=', '(?<!'].some(t => src.includes(t))
+  const offenders = captured.map(([src]) => src).filter(isLookaround)
+  assert.deepStrictEqual(offenders, [], `内部正则不得含 lookaround（RE2 不支持 → 静默回落 V8，失去线性防护）: ${offenders.join(' | ')}`)
+  // 行为等价：孤立代理 → U+FFFD，完整代理对整体保留，无代理字符逐字节不变
+  assert.strictEqual(SpyUtils.sanitizeSurrogates('a\uD800b'), 'a\uFFFDb', '孤立高代理应替换为 U+FFFD')
+  assert.strictEqual(SpyUtils.sanitizeSurrogates('a\uDC00b'), 'a\uFFFDb', '孤立低代理应替换为 U+FFFD')
+  assert.strictEqual(SpyUtils.sanitizeSurrogates('a\uD83D\uDE00b'), 'a\uD83D\uDE00b', '完整代理对必须原样保留')
+  assert.strictEqual(SpyUtils.sanitizeSurrogates('\uD800\uDC00\uD800'), '\uD800\uDC00\uFFFD', '配对保对、尾部孤立高代理替换')
+  assert.strictEqual(SpyUtils.sanitizeSurrogates('\uDC00\uD800'), '\uFFFD\uFFFD', '连续孤立低+高代理各自替换')
+  assert.strictEqual(SpyUtils.sanitizeSurrogates('plain'), 'plain', '无代理字符时逐字节不变')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

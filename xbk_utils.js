@@ -486,20 +486,71 @@ function createUtils (options = {}) {
       if (!/[A-Za-z/!?]/.test(html[i + 1] || '')) { i++; continue }
       const start = i
       i++
-      let quote = ''
+      // 简化状态机（只跟踪属性边界与引号状态，不解析属性名内容）：
+      //   tagName → beforeAttr → attrName → afterAttrName → beforeValue → valueDQ/valueSQ/valueUQ → afterValue
+      // 关键规则（均对照 HTML5 规范）：
+      //   · tagName：只有空白 / '/' 结束标签名；引号、'='、'<' 都是标签名字符；
+      //   · beforeAttr：空白/'/'保持；其余（含引号、'='）开启新属性名；
+      //   · attrName：空白→afterAttrName，'/'→beforeAttr，'='→beforeValue，其余（含引号/'<'）都是名字字符；
+      //   · afterAttrName：'='→beforeValue；其余非空白 → 重消费开启新属性名；
+      //   · beforeValue：跳过空白后，引号才是**真正的属性值开启引号**（记入 valueQuotes）；
+      //     非引号字符 → 未加引号值；
+      //   · valueUQ：空白结束值；'>' 结束标签；其余（含 '<'、'"'、'\''、'='）都是值的普通字符。
+      let state = 'tagName'
       while (i < n) {
         const ch = html[i]
-        if (quote) {
-          if (ch === quote) quote = ''
-        } else if (ch === '"' || ch === "'") {
-          quote = ch
-          valueQuotes.add(i)
-        } else if (ch === '>') {
+        if (state === 'valueDQ') {
+          if (ch === '"') state = 'afterValue'
           i++
-          break
-        } else if (ch === '<') {
-          break
+          continue
         }
+        if (state === 'valueSQ') {
+          if (ch === "'") state = 'afterValue'
+          i++
+          continue
+        }
+        if (state === 'valueUQ') {
+          if (ch === '>') { i++; break }
+          if (/\s/.test(ch)) state = 'beforeAttr'
+          i++
+          continue
+        }
+        if (ch === '>') { i++; break }
+        if (state === 'tagName') {
+          if (/\s/.test(ch) || ch === '/') state = 'beforeAttr'
+          i++
+          continue
+        }
+        if (state === 'beforeAttr') {
+          if (/\s/.test(ch) || ch === '/') { i++; continue }
+          state = 'attrName'
+          i++
+          continue
+        }
+        if (state === 'attrName') {
+          if (/\s/.test(ch)) state = 'afterAttrName'
+          else if (ch === '/') state = 'beforeAttr'
+          else if (ch === '=') state = 'beforeValue'
+          i++
+          continue
+        }
+        if (state === 'afterAttrName' || state === 'afterValue') {
+          if (/\s/.test(ch)) { i++; continue }
+          if (ch === '/') { state = 'beforeAttr'; i++; continue }
+          if (ch === '=' && state === 'afterAttrName') { state = 'beforeValue'; i++; continue }
+          state = 'attrName'
+          i++
+          continue
+        }
+        // state === 'beforeValue'
+        if (/\s/.test(ch)) { i++; continue }
+        if (ch === '"' || ch === "'") {
+          valueQuotes.add(i)
+          state = ch === '"' ? 'valueDQ' : 'valueSQ'
+          i++
+          continue
+        }
+        state = 'valueUQ'
         i++
       }
       spans.push([start, i])
@@ -810,10 +861,32 @@ function createUtils (options = {}) {
   },
 
   // 清洗孤立代理（v3.110 fuzz 发现）：encodeURIComponent 对孤立代理抛 URIError → 推送失败。
-  // 孤立高/低代理替换为 U+FFFD（完整代理对保留）；脏数据/截断 emoji 的真实防御
+  // 孤立高/低代理替换为 U+FFFD（完整代理对保留）；脏数据/截断 emoji 的真实防御。
+  //
+  // P1-04（同族）：原实现把 `[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]`
+  // 交给 safeRe——含 lookahead `(?!` 与 lookbehind `(?<!`，两者都是 Google RE2 不支持的构造，
+  // 真 RE2 会编译失败并被 safeRe 静默 catch 回落 V8 RegExp（清洗链失去线性时间防护）。而本方法在
+  // 生产热路径上（safeText / xbk_app 每条推送标题与正文都过），回落窗口最大。
+  // 改为一次线性扫描：语义与旧正则逐字节等价（完整代理对整体保留，孤立高/低代理各替换为 U+FFFD）。
   sanitizeSurrogates (s) {
     try { s = String(s === undefined || s === null ? '' : s) } catch (e) { return '' }
-    return s.replace(safeRe('[\\uD800-\\uDBFF](?![\\uDC00-\\uDFFF])|(?<![\\uD800-\\uDBFF])[\\uDC00-\\uDFFF]', 'g'), '\uFFFD')
+    const HI_LO = 0xD800 // 高代理区起点（SURROGATE_LO）
+    const HI_HI = 0xDBFF // 高代理区终点
+    const LO_LO = 0xDC00 // 低代理区起点
+    const LO_HI = 0xDFFF // 低代理区终点（SURROGATE_HI）
+    let out = ''
+    let changed = false
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i)
+      if (c >= HI_LO && c <= HI_HI) {
+        const next = s.charCodeAt(i + 1)
+        if (next >= LO_LO && next <= LO_HI) { out += s[i] + s[i + 1]; i++; continue } // 完整代理对保留
+        out += '\uFFFD'; changed = true; continue // 孤立高代理
+      }
+      if (c >= LO_LO && c <= LO_HI) { out += '\uFFFD'; changed = true; continue } // 孤立低代理
+      out += s[i]
+    }
+    return changed ? out : s
   },
 
   /** 数字实体解码统一：NUL 过滤 / 代理区与超范围保留原文 */
@@ -1004,8 +1077,13 @@ function createUtils (options = {}) {
     set.add(i)
   },
 
-  /** v3.159：过滤规则稳定哈希（过滤字段固定顺序 + 只看它关键词）——规则变更时用于失效「过滤写入」缓存 */
-  filterHash (filterCfg, zktGjc) {
+  /** v3.159：过滤规则稳定哈希（过滤字段固定顺序 + 只看它关键词）——规则变更时用于失效「过滤写入」缓存。
+   *  FILTER-01 / RULES-05：第三参 compileState 是「规则实际编译生效」维度（RuleEngine.compileStateOf
+   *  产物：re2 可用性 + 各字段编译出的规则类型/条数）。此前哈希只由配置**字节**驱动，故「同一份配置、
+   *  不同环境」下 re2 缺失或规则被 ReDoS 守卫丢弃时哈希不变 → 缓存里已打 _f 的条目永不重评、改宽后
+   *  静默漏推。折入该维度后环境/编译结果一变，filter.hash 即变 → App 清 _f → 重新评估。
+   *  省略第三参时为 ''（旧调用点/旧测试语义不变，哈希仍确定）。 */
+  filterHash (filterCfg, zktGjc, compileState) {
     const parts = []
     const rawStr = (v) => {
       if (v === undefined || v === null || typeof v === 'symbol') return ''
@@ -1055,6 +1133,13 @@ function createUtils (options = {}) {
       try { return (typeof v === 'string' ? '' : typeof v + ':') + String(v) } catch (e) { return '' }
     }
     parts.push('zkt_gjc=' + typedRawStr(zktGjc))
+    // FILTER-01 / RULES-05：「规则实际编译生效」维度。String 化包 try/catch——脏配置/Proxy 的
+    // toString 抛错不得让整轮 run 崩（与上方 rawStr/safeStr 同口径）。缺省（旧调用点）= ''。
+    let compilePart = ''
+    if (compileState !== undefined && compileState !== null && typeof compileState !== 'symbol') {
+      try { compilePart = String(compileState) } catch (e) { compilePart = '' }
+    }
+    parts.push('compile=' + compilePart)
     // P3：pingbitime 天数过滤结果随注册天数增长（daysFrom 逐日 UTC 日期差）而变化，静态配置哈希不会变——
     // 已 _f 标记的旧条目因「缓存失效仅由静态哈希触发」而永不重评、长期漏推（老化过阈值后本应补推）。
     // pingbitime 启用时把当前 UTC 日期折进哈希：跨天即失效 _f 缓存 → 老化过阈值的条目被重新评估/推送；
