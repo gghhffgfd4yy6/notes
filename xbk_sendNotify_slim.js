@@ -1533,6 +1533,18 @@ async function sendNotify (text, desp, params = {}) {
       try { desp = cleanSurrogates(desp + '\n\n' + (await one())) } catch (e) { console.log('一言获取失败，跳过:', safeErr(e)) }
     }
   }
+  // P1（跨批协同，high）：出口清洗门槛必须与内容渲染判定作用于【同一份】串。
+  // xbk_pusher.js 的出口清洗发生在 slim 追加一言【之前】，而渲染判定（looksHtml → wxpusher
+  // contentType=2）发生在追加【之后】：HITOKOTO=true 且一言文本含 HTML 形态时，出口门槛看到的是
+  // 拼接前的纯文本（判非 HTML ⇒ 不清洗），渲染侧看到的是拼接后的串（判 HTML ⇒ contentType=2），
+  // 未清洗的主动 HTML 原样出网。此处把同一门槛 + 同一清洗顺序（先解实体再清洗，与
+  // xbk_pusher.js:54 完全一致）下沉到「所有 desp 改写之后」——任何可能被渲染成 HTML 的串在进入
+  // 通道前都已清洗，从结构上消除两处判定不同步。纯文本/Markdown（无 HTML 形态）不受影响；
+  // pushplus 自己的清洗幂等且作用在 mdToPlain 之后，行为不变。
+  if (looksHtml(desp)) {
+    const utils = shared()
+    desp = utils.sanitizeDecodedHtml(utils.decodeHtmlEntities(desp))
+  }
   // 只启动已配置通道：未配置通道原本虽会立即 resolve，但每条消息仍会创建函数/Promise/对象。
   // 保持数组顺序与 configuredFlags 一致，便于失败统计和后续扩展。
   const channelTasks = [

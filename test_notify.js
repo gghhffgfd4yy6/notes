@@ -11,6 +11,7 @@ const gotPath = require.resolve('got')
 require(gotPath)
 
 let gotCalls = []
+let hitokotoText = '测试一言' // 一言成功时的 hitokoto 文本（P1 回归：可注入 HTML 形态以复现「拼接后判 HTML」）
 let failHitokoto = false // 一言接口失败开关（v3.73：验证 sendNotify 兜底跳过不崩）
 let failHitokotoMsg = '' // 一言失败时的自定义异常文案（v3.273：断言失败日志经 safeErr 脱敏）
 let failHitokotoStruct = false // 一言响应结构异常开关（v3.86：缺 hitokoto 字段）
@@ -32,7 +33,7 @@ require.cache[gotPath].exports = (url, options) => {
   if (failHitokoto && String(url).includes('hitokoto.cn')) throw new Error(failHitokotoMsg || '一言服务不可用')
   // 一言接口返回对象 body（模拟真实 got 自动 JSON 解析），其余返回字符串
   const body = String(url).includes('hitokoto.cn')
-    ? (failHitokotoStruct ? { hitokoto: 'x' } : { hitokoto: '测试一言', from: '源' }) // 结构异常=缺 from（v3.87）
+    ? (failHitokotoStruct ? { hitokoto: 'x' } : { hitokoto: hitokotoText, from: '源' }) // 结构异常=缺 from（v3.87）
     : '{}'
   return { then: (res) => res({ body, statusCode: 200, headers: {} }) }
 }
@@ -634,6 +635,62 @@ console.log('========================================\n');
     } finally {
       failHitokotoStruct = false
     }
+  }))
+
+  // P1（跨批协同，high）：一言在【Pusher 出口清洗之后】被拼接，导致两处判定不同步——
+  // Pusher 出口看到的 desp 是 'plain text'（判非 HTML ⇒ 不清洗），而 wxpusher 的 contentType 判定
+  // 看到的是拼接后的串（判 HTML ⇒ contentType=2）→ 未清洗的 onerror 原样出网。
+  // 端到端口径：真实 slim + 真实 Pusher（仅本文件桩掉 got），断言出网 JSON。
+  await test('P1 一言携带 HTML：清洗必须下沉到拼接之后（contentType=2 且 onerror 不存活）', () => withChannels(async () => {
+    const xbk = require('./xbk_function_v3.js')
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '1'
+    cfg.HITOKOTO = 'true'
+    hitokotoText = '<img src=x onerror=alert(1)>'
+    try {
+      await xbk.Pusher.send('标题', 'plain text', notify)
+    } finally {
+      hitokotoText = '测试一言'
+    }
+    const c = gotCalls.find(x => x.url.includes('wxpusher'))
+    assert(c, `应有 wxpusher 推送请求: ${JSON.stringify(gotCalls.map(x => x.url))}`)
+    const json = c.options.json
+    assert(json.contentType === 2, `渲染侧按拼接后的串判 HTML(contentType=2)，实际 ${JSON.stringify(json && json.contentType)}`)
+    assert(!json.content.includes('onerror'), `未清洗的事件属性不得出网: ${JSON.stringify(json.content)}`)
+  }))
+
+  // P1 同族反例（自造）：引号属性值内含 <——出口门槛的宽松包络正是为此存在；
+  // 一言把它带进拼接后的串，清洗同样必须发生在拼接之后。
+  await test('P1 同族反例：一言携带「引号属性内含 <」的标签也必须清洗', () => withChannels(async () => {
+    const xbk = require('./xbk_function_v3.js')
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '1'
+    cfg.HITOKOTO = 'true'
+    hitokotoText = '<img src="a<b" onerror=alert(1)>'
+    try {
+      await xbk.Pusher.send('标题', 'plain text', notify)
+    } finally {
+      hitokotoText = '测试一言'
+    }
+    const c = gotCalls.find(x => x.url.includes('wxpusher'))
+    assert(c, '应有 wxpusher 推送请求')
+    const json = c.options.json
+    assert(json.contentType === 2, `HTML 形态应保持 contentType=2: ${JSON.stringify(json && json.contentType)}`)
+    assert(!json.content.includes('onerror'), `同族载荷的事件属性不得出网: ${JSON.stringify(json.content)}`)
+  }))
+
+  // P1 对照：一言是纯文本时，下沉后的门槛必须【不】改写内容（不得过度清洗）。
+  await test('P1 对照：一言为纯文本时内容原样出网（门槛不误伤）', () => withChannels(async () => {
+    const xbk = require('./xbk_function_v3.js')
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '1'
+    cfg.HITOKOTO = 'true'
+    await xbk.Pusher.send('标题', 'plain text', notify)
+    const c = gotCalls.find(x => x.url.includes('wxpusher'))
+    assert(c, '应有 wxpusher 推送请求')
+    const json = c.options.json
+    assert(json.content === 'plain text\n\n测试一言    ----源', `纯文本一言不得被改写: ${JSON.stringify(json.content)}`)
+    assert(json.contentType === 3, `纯文本应保持 Markdown 类型(3)，实际 ${JSON.stringify(json && json.contentType)}`)
   }))
 
   // 11. 息知通道（曾从未被测试）
