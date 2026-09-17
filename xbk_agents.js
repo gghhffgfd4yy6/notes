@@ -18,9 +18,11 @@ const AGENTS = {
 // 使用 Node 原生 dns.lookup，不依赖网卡枚举，兼容受限 Android/沙箱环境。
 const DNS_TTL_MS = 60000
 const DNS_ERROR_TTL_MS = 1000
+// AGENTS-02：含 ETIMEDOUT——连接/请求超时（重试窗口 1s/2s 远短于 60s TTL）很可能就是缓存里那个地址
+// 已不可达，不清缓存会让整个重试窗口反复复用同一失效地址。失效代价只是下一次多一次系统解析。
 const DNS_INVALIDATION_CODES = new Set([
   'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH',
-  'ENOTFOUND', 'EAI_AGAIN', 'ERR_SOCKET_CLOSED', 'ERR_TLS_CERT_ALTNAME_INVALID'
+  'ENOTFOUND', 'EAI_AGAIN', 'ERR_SOCKET_CLOSED', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ETIMEDOUT'
 ])
 const dnsCache = new Map()
 const dnsPending = new Map()

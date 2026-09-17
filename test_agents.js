@@ -36,7 +36,9 @@ dns.lookup = (hostname, options, callback) => {
   assert.strictEqual(shouldInvalidateDns({ code: 'ECONNRESET' }), true, 'ECONNRESET 应失效 DNS')
   assert.strictEqual(shouldInvalidateDns({ code: 'EAI_AGAIN' }), true, 'EAI_AGAIN 应失效 DNS')
   assert.strictEqual(shouldInvalidateDns({ code: 'HTTP_500' }), false, 'HTTP 错误不应失效 DNS')
-  assert.strictEqual(shouldInvalidateDns({ code: 'ETIMEDOUT' }), false, '超时不应失效 DNS')
+  // AGENTS-02：超时（ETIMEDOUT）同样失效——重试窗口（got 1s/2s）远短于 60s TTL，超时很可能就是缓存
+  // 里那个地址已不可达，不清缓存则整个重试窗口反复复用同一失效地址。此处必为 true（旧口径 false）。
+  assert.strictEqual(shouldInvalidateDns({ code: 'ETIMEDOUT' }), true, '超时应失效 DNS（AGENTS-02）')
   assert.strictEqual(shouldInvalidateDns({}), false, '无 code 不应失效')
   assert.strictEqual(shouldInvalidateDns(null), false, 'null 不应失效')
   assert.strictEqual(shouldInvalidateDns(undefined), false, 'undefined 不应失效')
@@ -70,6 +72,28 @@ dns.lookup = (hostname, options, callback) => {
   // ===== dnsLookup：缓存命中 + 缓存未命中 + 并发去重 =====
   // #19 修复：此前 dnsLookup 完全未被测试，导致 xbk_agents 分支覆盖率标称 100% 但实测 63-77%。
   const { dnsLookup } = require('./xbk_agents')
+
+  // AGENTS-02 行为断言：ETIMEDOUT 必须真的清掉缓存条目（不只是 shouldInvalidateDns 返回 true）——
+  // 先用 dnsLookup 填充，再用 ETIMEDOUT 失效，随后同一主机的 lookup 必须重新走底层解析（计数 +1）。
+  {
+    const timeoutHost = 'timeout-invalidate-probe.invalid'
+    let timeoutLookups = 0
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      timeoutLookups += 1
+      process.nextTick(() => cb(null, '192.0.2.9', 4))
+    }
+    await new Promise((resolve, reject) => dnsLookup(timeoutHost, {}, (e) => e ? reject(e) : resolve()))
+    assert.strictEqual(timeoutLookups, 1, '首次解析应走底层')
+    assert.strictEqual(invalidateDnsForError({ code: 'ETIMEDOUT' }, `https://${timeoutHost}/api`), true, 'ETIMEDOUT 应触发缓存失效（AGENTS-02）')
+    await new Promise((resolve, reject) => dnsLookup(timeoutHost, {}, (e) => e ? reject(e) : resolve()))
+    assert.strictEqual(timeoutLookups, 2, 'ETIMEDOUT 失效后同一主机应重新解析（旧口径此处仍为 1）')
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      process.nextTick(() => cb(null, '127.0.0.1', 4))
+    }
+    console.log('✅ AGENTS-02：ETIMEDOUT 清理 DNS 缓存后重试窗口重新解析')
+  }
 
   // 场景 1：缓存未命中 → 真实解析后回调，且第二次调用命中缓存（更快）
   await new Promise((resolve, reject) => {
