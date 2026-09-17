@@ -376,6 +376,26 @@ function error (message, code) {
     'failureInfo 的任意字符串字段都应脱敏')
   assert.strictEqual(summarizeError({ failureInfo: { message: 'l1\nl2' } }).message, 'l1 l2',
     'failureInfo.message 应与常规路径一致折叠换行')
+
+  // [XFP-04 脱敏覆盖] 同一凭据换一种书写形态就不能漏抹——脱敏是「按形态」的，漏一种就是泄漏一种。
+  // ① Authorization 头形态：反例（改动前）只吃掉 scheme，凭据残留 → `Authorization: *** SECRET123 x`。
+  assert.strictEqual(summarizeError({ message: 'Authorization: Bearer SECRET123 x' }).message,
+    'Authorization: *** x', 'Authorization 头的凭据必须整体脱敏，不能只抹 Bearer')
+  assert.strictEqual(summarizeError({ message: 'authorization: basic YWJjOmRlZg==' }).message,
+    'authorization: ***', 'basic 认证串必须整体脱敏')
+  // ② JSON/JS 引号形态：反例（改动前）关键字与冒号之间夹引号 → 整体不命中，凭据原样带出。
+  assert.strictEqual(summarizeError({ message: '{"appToken":"SECRET123"}' }).message,
+    '{"appToken":"***"}', 'JSON 引号形态的 appToken 必须脱敏')
+  assert.strictEqual(summarizeError({ failureInfo: { detail: '{"secret":"SECRET123","n":1}' } }).detail,
+    '{"secret":"***","n":1}', 'failureInfo 字符串字段的 JSON 引号形态凭据同样脱敏')
+  // ③ 裸 Bearer（无关键字前缀，如上游把 Authorization 头值回显进 message）
+  assert.strictEqual(summarizeError({ message: 'upstream said: Bearer SECRET123 rejected' }).message,
+    'upstream said: Bearer *** rejected', '裸 Bearer 凭据必须脱敏（保留原大小写）')
+  // 反向断言：无凭据文本不得被脱敏误改（防止把规则写成吞掉正常内容）
+  assert.strictEqual(summarizeError({ message: 'request timed out after 5000ms' }).message,
+    'request timed out after 5000ms', '无凭据文本不应被脱敏改动')
+  assert.strictEqual(summarizeError({ failureInfo: { message: 'plain text 1\n2' } }).message, 'plain text 1 2',
+    '无凭据文本的换行折叠口径不变')
   // 非字符串字段原样保留，脱敏不改变结构语义
   const fiStructured = summarizeError({ failureInfo: { code: 'HTTP_500', statusCode: 500, message: 'ok' } })
   assert.strictEqual(fiStructured.code, 'HTTP_500')
