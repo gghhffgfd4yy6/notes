@@ -465,12 +465,25 @@ function createUtils (options = {}) {
   // on* 字样会被 _stripEventAttrs 误删并吞掉闭合引号，产出畸形 HTML（评审给出的真实反例）。
   // 改为一次线性正扫预计算标签区间，之后按位置指针推进查询：尊重引号（引号内 > 不结束标签），
   // 未闭合标签延伸到下一个 < 或串尾，与 _isInHtmlTag 同语义，任意长度标签都能正确判定。
+  //
+  // P1-01：标签区间只能从**真正的标签起始**开始。HTML5 数据态下 `<` 后紧跟非标签名字符
+  // （空白、数字、`=` 等）时它只是普通文本（`1 < 2 name="…"`、`价格 <100 元 name="…"`）；
+  // 旧实现把任意 `<` 当标签起始，未配对的 `<` 让区间一路延伸到串尾/下一个 `<`，把后方纯文本的
+  // name="…" 判成「标签内属性」并整段占位，段内真实的 <img onerror> 随之绕过事件清洗直出网。
+  //
+  // 返回 valueQuotes：正扫过程中处于「引号外」状态所遇到的各引号位置，即**真正开启一个属性值**
+  // 的引号。_protectAttrPairs 依赖它区分「属性值开启引号」与「未加引号值里的杂散引号」——
+  // 后者会把回扫出的伪属性对误判成可保护段，从而把后续真事件属性的属性名藏进占位符（P2-01）。
   _htmlTagSpans (html) {
     const spans = []
+    const valueQuotes = new Set()
     const n = html.length
     let i = 0
     while (i < n) {
       if (html[i] !== '<') { i++; continue }
+      // 标签起始判定：'<' 后须为 ASCII 字母（标签名）或 '/'、'!'、'?'（结束标签/声明/处理指令）。
+      // 其余形态（空白、数字、'=' 等）按 HTML5 数据态语义只是文本，不得开启标签区间。
+      if (!/[A-Za-z/!?]/.test(html[i + 1] || '')) { i++; continue }
       const start = i
       i++
       let quote = ''
@@ -480,6 +493,7 @@ function createUtils (options = {}) {
           if (ch === quote) quote = ''
         } else if (ch === '"' || ch === "'") {
           quote = ch
+          valueQuotes.add(i)
         } else if (ch === '>') {
           i++
           break
@@ -490,7 +504,7 @@ function createUtils (options = {}) {
       }
       spans.push([start, i])
     }
-    return spans
+    return { spans, valueQuotes }
   },
 
   /** CSS 转义全量解码：十六进制（\\XXXXXX）、\\uXXXX 兼容形态、行延续（\\换行）与恒等转义
@@ -580,7 +594,7 @@ function createUtils (options = {}) {
   _protectAttrPairs (html) {
     const attrStore = []
     const attrValueRe = safeRe(String.raw`=\s*(["'])`, 'gi')
-    const tagSpans = this._htmlTagSpans(html)
+    const { spans: tagSpans, valueQuotes } = this._htmlTagSpans(html)
     let spanIdx = 0
     let attrOut = ''
     let attrPos = 0
@@ -608,7 +622,14 @@ function createUtils (options = {}) {
       // 存活的 on* 一并占位，使 _stripEventAttrs 失效。非法形态走与 on* 相同的原样保留分支
       // （下方 else），照旧推进 attrPos/lastIndex，避免死循环。
       const atBoundary = seg.segStart === 0 || /[\s/<>"']/.test(html[seg.segStart - 1])
-      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name) && atBoundary && inTag) {
+      // P2-01（安全）：整段占位的前提是「该引号**真的开启了本属性值**」。反例：
+      // `<img foo=a"b=" onerror="alert(1)">` 里 foo 的未加引号值 `a"b="` 含一个杂散引号，
+      // 回扫会得到一个以它作「值引号」的伪属性对 `b=" onerror="`——该段的闭合引号其实是
+      // onerror 属性值的开启引号，整段占位后 onerror 的属性名被藏进占位符，_stripEventAttrs
+      // 匹配不到，事件处理器原样出网。valueQuotes 由正扫记录「引号外遇到的引号」，
+      // 杂散引号（处于引号状态内）不在其中；不在其中即原样保留，交给 _stripEventAttrs 清洗。
+      const quoteOpensValue = valueQuotes.has(valueStart - 1)
+      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name) && atBoundary && inTag && quoteOpensValue) {
         attrStore.push(segText)
         attrOut += html.slice(attrPos, seg.segStart) + '\u0001' + (attrStore.length - 1) + '\u0001'
       } else {
