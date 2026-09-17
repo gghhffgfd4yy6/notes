@@ -2026,8 +2026,12 @@ console.log('========================================\n');
       // 期望值用与应用**同一个**表达式求（toLocaleString 默认含日期+时间，而 Intl.DateTimeFormat
       // 构造器默认只到日期，两者不可互替），只在 timeZone 上做对照。
       const fmtZh = (tz, t) => new Date(t).toLocaleString('zh-CN', { timeZone: tz })
-      const allowedStamps = [fmtZh('Asia/Shanghai', tBefore), fmtZh('Asia/Shanghai', tAfter)]
-      assert(allowedStamps.includes(alertStamp),
+      // CodeRabbit PR #151：告警时间被格式化到**整秒**，而 desp 构造发生在 run 中途——只要跨过
+      // 秒边界，渲染出的秒就可能既不是 tBefore 也不是 tAfter（旧写法只允许两个端点 → 偶发红）。
+      // 改为允许区间内每一个可能的渲染秒。
+      const allowedStamps = new Set()
+      for (let t = Math.floor(tBefore / 1000) * 1000; t <= tAfter; t += 1000) allowedStamps.add(fmtZh('Asia/Shanghai', t))
+      assert(allowedStamps.has(alertStamp),
         `告警正文时间必须是 Asia/Shanghai 口径（进程 TZ=${process.env.TZ}；同一时刻的 UTC 渲染为 ${fmtZh('UTC', tBefore)}）：实际 ${alertStamp}`)
       // ② 限频生效：intervalMs 大 → 第二次异常不发（状态文件记录上次）
       Config.alert.intervalMs = 3600000

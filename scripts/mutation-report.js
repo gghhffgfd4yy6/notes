@@ -130,7 +130,19 @@ function analyzeSegment (dir, entry) {
       if (!Array.isArray(file.mutants)) {
         throw new Error(`files["${fileKey}"].mutants 缺失或非数组`)
       }
-      for (const m of file.mutants) countMutant(stats, fileKey, m)
+      // CodeRabbit PR #151：只校验「是数组」不够。countMutant 先 total++ 再按已知状态分类，
+      // 于是 `{}` / 缺 status 的条目会绕过上面的「零变异体」护栏——total 被抬高、哪一个桶都
+      // 计不进去，分数被压低后照发。这里要求每条都是带非空字符串 status 的对象。
+      // **刻意不采用「只认 Killed/Survived/NoCoverage/Timeout」的白名单**：stryker 的合法状态
+      // 还有 RuntimeError / CompileError / Ignored / Pending，白名单会把正常报告整段拒掉
+      // （下方 CLI 场景 6 用 RuntimeError 锁定这一点）。未列入桶的合法状态仍只计入 total。
+      for (const m of file.mutants) {
+        const status = m && typeof m === 'object' && !Array.isArray(m) ? m.status : undefined
+        if (typeof status !== 'string' || status === '') {
+          throw new Error(`files["${fileKey}"].mutants 含缺失或非法 status 的条目（status=${JSON.stringify(status)}）`)
+        }
+        countMutant(stats, fileKey, m)
+      }
     }
     // files 非空但一个变异体都没有（如各文件 mutants 均为空数组）同样是「零内容报告」，
     // 会照样渲染出 🎉 满分——一并按段级失败处理。

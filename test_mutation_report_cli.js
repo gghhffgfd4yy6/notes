@@ -133,4 +133,63 @@ function runCli (args, opts = {}) {
   }
 }
 
+// 场景 6（CodeRabbit PR #151）：**合法但不在 4 个计数桶里**的状态（RuntimeError / CompileError /
+// Ignored / Pending）必须被接受并计入 total，不得因为「只认 Killed/Survived/NoCoverage/Timeout」
+// 的白名单而把正常报告整段拒掉。每个段：1 Killed + 1 RuntimeError（total=2、killed=1、survived=0）。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-runtimeerr-'))
+  try {
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify({
+        schemaVersion: '1.0',
+        files: {
+          [`${seg}.js`]: {
+            language: 'javascript',
+            mutants: [
+              { id: '0', mutatorName: 'BlockStatement', replacement: '{}', status: 'Killed', location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } } },
+              { id: '1', mutatorName: 'ArrayLiteral', replacement: '[]', status: 'RuntimeError', statusReason: 'boom', location: { start: { line: 2, column: 1 }, end: { line: 2, column: 2 } } }
+            ]
+          }
+        }
+      }))
+    }
+    const r = runCli([tmp])
+    assert.strictEqual(r.code, 0, `含 RuntimeError 的合法报告必须照常发布，stderr: ${r.stderr}`)
+    const segCount = REQUIRED_SEGS.length
+    assert.ok(r.stdout.includes(`| **合计** | **${segCount * 2}** | **${segCount}** | **0** | **0** | | **50%** |`),
+      `RuntimeError 应计入 total（${segCount * 2} 个、仅 ${segCount} 个被杀、50%）：\n${r.stdout}`)
+    assert.ok(r.stdout.includes('🎉 无存活变异体'), '该夹具无存活变异体，应走 🎉 分支')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 场景 7（CodeRabbit PR #151）：条目缺 status（如 `{}`）会让 countMutant 先 total++ 再什么都计不进去——
+// 零变异体护栏被绕过、分数被压低后照发。必须按段级失败拒绝发布。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-nostatus-'))
+  try {
+    const badSeg = REQUIRED_SEGS[0]
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      const mutants = seg === badSeg
+        ? [{ id: '0', mutatorName: 'BlockStatement', replacement: '{}' }] // 缺 status
+        : [{ id: '0', mutatorName: 'BlockStatement', replacement: '{}', status: 'Killed', location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } } }]
+      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify({
+        files: { [`${seg}.js`]: { language: 'javascript', mutants } }
+      }))
+    }
+    const r = runCli([tmp])
+    assert.notStrictEqual(r.code, 0, '含缺 status 条目的报告必须拒绝发布（exit 非 0）')
+    assert.ok(r.stderr.includes('缺失或非法 status'), `错误应指出根因是条目缺 status，实际 stderr：${r.stderr}`)
+    assert.ok(r.stderr.includes(badSeg), '错误应指出是哪个分段，便于只重跑该段')
+    assert.ok(!r.stdout.includes('🧬 变异测试日报'), '拒绝发布时不得输出日报正文')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
 console.log('test_mutation_report_cli OK')

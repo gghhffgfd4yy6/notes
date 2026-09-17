@@ -1,7 +1,8 @@
 'use strict'
 
 const assert = require('assert')
-const { runLoop, sleep, refreshTimeoutError } = require('./xbk_loop')
+const { spawnSync } = require('node:child_process')
+const { runLoop, sleep, refreshTimeoutError, isAbortable } = require('./xbk_loop')
 
 ;(async () => {
   // ===== sleep：正常等待 =====
@@ -65,6 +66,42 @@ const { runLoop, sleep, refreshTimeoutError } = require('./xbk_loop')
     await sleep(10, bogus)
     const bogusElapsed = Date.now() - tBogus
     assert.ok(bogusElapsed >= 5, `非信号真值 ${JSON.stringify(bogus)} 应仍按毫秒正常等待，实际 ${bogusElapsed}ms`)
+  }
+
+  // ===== CodeRabbit PR #151（outside-diff）：runLoop 与 sleep 必须共用同一套取消判定 =====
+  // 旧实现 runLoop 写 `const signal = options.signal || null`，于是 `{ aborted: true }` 会让
+  // `while (!(signal && signal.aborted))` 直接为假——整轮 run 一次都不跑；而同一对象在 sleep 里
+  // 已被判为非信号（会正常等待）。两条路径的取消规则互相矛盾。
+  assert.strictEqual(isAbortable({ aborted: true }), false, '只有同名属性、无可听接口的对象不算信号')
+  assert.strictEqual(isAbortable({ aborted: false }), false, '非信号真值对象不算信号')
+  assert.strictEqual(isAbortable({ addEventListener: 1 }), false, 'addEventListener 非函数不算信号')
+  assert.strictEqual(isAbortable(null), false, 'null 不算信号')
+  assert.strictEqual(isAbortable(42), false, '原始值不算信号')
+  assert.strictEqual(isAbortable(new AbortController().signal), true, '真实 AbortSignal 必须算信号')
+  // 集成证据：非信号真值不得让 runLoop 跳过整轮 run。放子进程里跑并用 stdout 回调收尾——
+  // 归一为非信号后该循环不会再自行退出（旧实现则一次都不跑），父进程另设超时兜底防挂死。
+  {
+    const probe = `
+      const { runLoop } = require(${JSON.stringify(require.resolve('./xbk_loop'))})
+      let n = 0
+      runLoop(() => { n += 1; if (n === 3) process.stdout.write('RUNS=' + n + '\\n', () => process.exit(0)) },
+        { signal: { aborted: true }, intervalMs: 0 })
+    `
+    const r = spawnSync(process.execPath, ['-e', probe], { encoding: 'utf8', timeout: 5000 })
+    assert.ok(String(r.stdout || '').includes('RUNS=3'),
+      `非信号真值 {aborted:true} 不得让 runLoop 跳过整轮 run（stdout=${JSON.stringify(r.stdout)} signal=${r.signal} status=${r.status}）`)
+  }
+  // 反向断言：真正可监听的 signal（含鸭子类型）必须仍被接受——aborted 翻转后当轮结束即退出。
+  // 若 isAbortable 被写成恒 false，上面的子进程会通过，但这里会因循环不退出而被 withTimeout 判挂死。
+  {
+    const duck = { aborted: false, addEventListener: () => {}, removeEventListener: () => {} }
+    let duckRuns = 0
+    const withTimeoutDuck = (p, ms) => Promise.race([
+      p,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error(`runLoop(duck) 挂死超时（${ms}ms）`)), ms))
+    ])
+    await withTimeoutDuck(runLoop(async () => { duckRuns += 1; duck.aborted = true }, { signal: duck, intervalMs: 0 }), 2000)
+    assert.strictEqual(duckRuns, 1, '可监听 signal 的 aborted 翻转后应只跑一轮即退出')
   }
 
   // ===== qodo PR #151-4：单轮刷新超时文案必须报**生效**的毫秒数，而不是被钳制前的配置值 =====

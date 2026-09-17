@@ -13,6 +13,15 @@ function clampTimerMs (ms, fallback = 10000) {
   return Math.min(MAX_TIMER_MS, Math.max(0, value))
 }
 
+// 取消信号的唯一判定：只有**真正可监听**（有函数型 addEventListener）的值才算 signal。
+// 非信号的普通真值对象（如 `{ aborted: true }`、`{ aborted: false }`）一律视为「未提供取消信号」。
+// 这是三处消费者（runBounded / sleep / runLoop）必须共用的同一口径：若某处凭同名属性判定，
+// 就会出现「sleep 忽略它、runLoop 却因它跳过整轮 run」这类互相矛盾的行为
+// （qodo PR #151-2 / CodeRabbit PR #151 outside-diff）。
+function isAbortable (value) {
+  return !!value && typeof value.addEventListener === 'function'
+}
+
 // 单轮刷新超时错误：文案必须报**实际生效**的毫秒数（clampTimerMs 之后的定时器长度）。
 // 直接回显配置值会让运维看到「超过 1000000000000ms 未完成」而看门狗其实在 2147483647ms
 // 就响了——一个不可能发生的时长（qodo PR #151-4）。被钳制时额外标注配置请求值，便于定位误填。
@@ -58,7 +67,7 @@ function runBounded (task, timeoutMs, signal) {
       relayAbort()
       finish(reject, refreshTimeoutError(timeoutMs))
     }, clampTimerMs(timeoutMs))
-    if (signal && typeof signal.addEventListener === 'function') {
+    if (isAbortable(signal)) {
       if (signal.aborted) return onAbort()
       signal.addEventListener('abort', onAbort, { once: true })
     }
@@ -77,7 +86,7 @@ function sleep (ms, signal) {
   // addEventListener 抛 TypeError；定时器此刻已调度，回调里再调 removeEventListener 会
   // 二次抛错，成为定时器回调中的未捕获异常并终止进程（runBounded 早有 typeof 守卫，
   // 此处对齐）。守卫同时覆盖摘除侧，避免只堵一半。
-  const canListen = !!signal && typeof signal.addEventListener === 'function'
+  const canListen = isAbortable(signal)
   // qodo PR #151-2：aborted 早退同样必须以 canListen 为前提。否则 `{ aborted: true }` 这种
   // 「只有同名属性、没有可听接口」的形状会被当成「已取消」而整个跳过等待，调用方的重试/轮询
   // 间隔凭空消失（常驻循环退化为空转）。真正的 AbortSignal 恒有 addEventListener，行为不变。
@@ -95,7 +104,12 @@ function sleep (ms, signal) {
 
 async function runLoop (run, options = {}) {
   if (typeof run !== 'function') throw new TypeError('runLoop 需要函数作为 run 参数')
-  const signal = options.signal || null
+  // CodeRabbit PR #151（outside-diff）：入口就把 options.signal 归一成「真信号或 null」。
+  // 否则 `{ aborted: true }` 这类非信号真值对象会让 `while (!(signal && signal.aborted))`
+  // 直接为假——整轮 run 一次都不跑；而同一对象在 sleep 里已被判为非信号（会正常等待），
+  // 两条路径的取消规则互相矛盾。归一后全函数（while 条件、break、传给 sleep/runBounded）
+  // 只看同一个值，口径与 isAbortable 一致；真实 AbortSignal 行为不变。
+  const signal = isAbortable(options.signal) ? options.signal : null
   const intervalMs = Number.isFinite(options.intervalMs) && options.intervalMs >= 0 ? options.intervalMs : 10000
   const refreshEvery = Number.isInteger(options.refreshEvery) && options.refreshEvery > 0 ? options.refreshEvery : 10
   // XL-04：调用方漏传 onError 时，单轮异常不能被空实现静默吞掉（常驻模式下即为无声漏推）。
@@ -135,4 +149,4 @@ async function runLoop (run, options = {}) {
   }
 }
 
-module.exports = { runLoop, sleep, refreshTimeoutError }
+module.exports = { runLoop, sleep, refreshTimeoutError, isAbortable }
