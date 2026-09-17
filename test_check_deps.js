@@ -42,17 +42,45 @@ test('全部依赖正常 → 返回 true 且无错误输出', () => {
 test('got 缺失 → 归为 missing，仅提示 npm ci，不提示 rebuild', () => {
   const out = captureErrorOutput(() => {
     const ok = checkDependencies({
-      resolve: () => '/mock/path',
-      load: (name) => {
-        if (name === 'got') throw new Error('MODULE_NOT_FOUND: got')
-        return fakeRe2Class()
-      }
+      // F3：缺失的判定口径是「resolve 不到」——真的没装 got 时 require.resolve 先失败，
+      // 夹具必须复刻这一点（此前夹具让 resolve 成功、只让 load 抛错，那其实是「已安装但不可用」）。
+      resolve: (name, opts) => {
+        if (name === 'got') throw new Error("Cannot find module 'got'")
+        return '/mock/path'
+      },
+      load: (name) => fakeRe2Class()
     })
     if (ok !== false) throw new Error(`期望 false，实际 ${ok}`)
   })
   if (!out.includes('缺少依赖：got')) throw new Error(`应提示缺少 got: ${out}`)
   if (!out.includes('npm ci --ignore-scripts')) throw new Error(`应提示 npm ci: ${out}`)
   if (out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`仅缺 got 时不应提示 rebuild: ${out}`)
+})
+
+// F3 回归：got「已安装但不可用」（got 12+ 为 ESM、内部依赖缺失、包损坏等）此前被 catch 一律
+// 归入 missing → 输出「缺少 got」并只给 npm ci，根因（ERR_REQUIRE_ESM 等）被整个吞掉。
+// 回退该改动后本条变红：输出会变成「缺少依赖：got」且不含 ERR_REQUIRE_ESM。
+test('F3 got 可解析但加载抛错 → 归为 broken，输出根因与重装指引（不误报“缺少”）', () => {
+  const out = captureErrorOutput(() => {
+    const ok = checkDependencies({
+      resolve: () => '/mock/path',
+      load: (name) => {
+        if (name === 'got') {
+          const err = new Error('require() of ES Module /x/node_modules/got/dist/source/index.js not supported')
+          err.code = 'ERR_REQUIRE_ESM'
+          throw err
+        }
+        return fakeRe2Class()
+      }
+    })
+    if (ok !== false) throw new Error(`期望 false，实际 ${ok}`)
+  })
+  if (out.includes('缺少依赖')) throw new Error(`「已安装但不可用」不得报成缺少依赖: ${out}`)
+  if (!out.includes('依赖已安装但不可用：got')) throw new Error(`应提示不可用: ${out}`)
+  if (!out.includes('ERR_REQUIRE_ESM')) throw new Error(`根因 error.code 必须进入输出: ${out}`)
+  if (!out.includes('require() of ES Module')) throw new Error(`根因 message 必须进入输出: ${out}`)
+  if (!out.includes('npm ci --ignore-scripts')) throw new Error(`got 不可用应给重装指引: ${out}`)
+  if (out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`got 不可用不应给 re2 的 rebuild 指引: ${out}`)
 })
 
 test('re2 完全缺失（resolve 失败）→ 归为 missing，提示 npm ci + rebuild', () => {

@@ -11,14 +11,33 @@ const path = require('path')
 
 const ROOT = path.join(__dirname, '..')
 
+// F3：把被吞掉的根因提取成一行摘要（带 error.code），只取首行避免把 require 栈整段刷进输出。
+function dependencyFailureReason (error) {
+  const message = error && error.message ? String(error.message) : String(error)
+  const code = error && error.code ? `${error.code}: ` : ''
+  return `${code}${message.split('\n')[0]}`
+}
+
 function checkDependencies ({ resolve = require.resolve, load = require } = {}) {
   const missing = []
   const broken = []
 
+  // F3：两段判定——resolve 失败才是「缺少」；resolve 成功而加载抛错（ERR_REQUIRE_ESM、
+  // 内部依赖缺失、原生绑定损坏等）是「已安装但不可用」，此前一律按 missing 报「缺少 got」。
+  let gotResolvable = false
   try {
-    load('got')
+    resolve('got', { paths: [ROOT] })
+    gotResolvable = true
   } catch (error) {
     missing.push('got')
+  }
+
+  if (gotResolvable) {
+    try {
+      load('got')
+    } catch (error) {
+      broken.push({ name: 'got', reason: dependencyFailureReason(error) })
+    }
   }
 
   let re2Resolvable = false
@@ -35,7 +54,7 @@ function checkDependencies ({ resolve = require.resolve, load = require } = {}) 
       const probe = new RE2('^re2$')
       if (!probe.test('re2')) throw new Error('re2 native binding probe failed')
     } catch (error) {
-      broken.push('re2')
+      broken.push({ name: 're2', reason: dependencyFailureReason(error) })
     }
   }
 
@@ -51,11 +70,20 @@ function checkDependencies ({ resolve = require.resolve, load = require } = {}) 
     }
   }
   if (broken.length > 0) {
-    console.error(`❌ 依赖已安装但不可用：${broken.join(', ')}`)
+    console.error(`❌ 依赖已安装但不可用：${broken.map(b => b.name).join(', ')}`)
+    // F3：根因入输出——此前 catch 完全丢弃 error，只留下「缺少 got」这类误判文案。
+    for (const b of broken) console.error(`  - ${b.name}: ${b.reason}`)
     // 本预检不校验 Node 版本（re2 的 engines 严于本仓库 engines，口径未对齐，审查 F4），
     // 故带上当前版本，让「切换 Node 版本」这条指引可直接对照。
-    console.error(`请重建原生模块或切换 Node 版本（当前 ${process.version}）：`)
-    console.error('  npm run rebuild --prefix node_modules/re2')
+    if (broken.some(b => b.name === 're2')) {
+      console.error(`请重建原生模块或切换 Node 版本（当前 ${process.version}）：`)
+      console.error('  npm run rebuild --prefix node_modules/re2')
+    }
+    // 指引按实际不可用的依赖给出：非原生依赖（got）走重装，rebuild re2 对它没有意义。
+    if (broken.some(b => b.name !== 're2')) {
+      console.error(`请重新安装依赖（当前 ${process.version}）：`)
+      console.error('  npm ci --ignore-scripts')
+    }
   }
   return false
 }
