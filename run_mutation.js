@@ -9,11 +9,16 @@ const crypto = require('crypto')
 const { spawn } = require('child_process')
 
 const ROOT = __dirname
+// 本地调度器的默认变异目标（F7）：必须与 CI 变异矩阵/ stryker.config.js 的 mutate 完全一致——
+// 此前这里只列了 8 个文件（CI 矩阵有 17 个），新增 mutate 目标时本地默认跑法会静默漏掉它，形成
+// 「本地跑过 = CI 也覆盖」的错觉，且没有任何门禁对账。该一致性现由 test_mutation_ranges.js 固定
+// （双向集合相等 + 每个目标可读），改 stryker.config.js 的 mutate 时必须同步本清单。
 const DEFAULT_FILES = [
-  'xbk_function_v3.js', 'xbk_agents.js', 'xbk_http.js',
-  'xbk_sendNotify_slim.js', 'xbk_storage.js', 'xbk_loop.js',
-  'xbk_failure_policy.js',
-  'qinglong/xbk_push.js'
+  'xbk_function_v3.js', 'xbk_app.js', 'xbk_filter.js', 'xbk_formatter.js',
+  'xbk_message_store.js', 'xbk_network.js', 'xbk_pusher.js', 'xbk_rules.js',
+  'xbk_utils.js', 'xbk_agents.js', 'xbk_http.js', 'xbk_sendNotify_slim.js',
+  'xbk_storage.js', 'xbk_loop.js', 'xbk_failure_policy.js', 'qinglong/xbk_push.js',
+  'scripts/check-deps.js', 'scripts/status.js'
 ]
 // 变异测试使用全量单元测试入口（覆盖全部未标记 integration/mutationSkip 的单元测试套件），而非仅 test_filter.js——
 // 此前只跑 test_filter.js 导致 #100/#101 新增的 1400+ 行测试对变异分数完全无效。
