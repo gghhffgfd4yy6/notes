@@ -2,7 +2,7 @@
 // 解析全部 mutation artifact 的 mutation.json，统计存活变异体分布
 const fs = require('fs')
 const path = require('path')
-const { readReportJson } = require('../scripts/mutation-json.js')
+const { readReportJson, resolveMaxReportBytes } = require('../scripts/mutation-json.js')
 
 const REPO_ROOT = path.resolve(__dirname, '..')
 // 报告目录默认相对仓库根解析（不再依赖 cwd）；命令行参数可覆盖（本地用夹具核对时）。
@@ -48,10 +48,17 @@ const allSurvivors = []
 const byFileStatus = {}
 const skipped = []
 
+// F1（R6 收尾）：预读上限必须由**每个生产调用方**显式注入，否则护栏只在测试里成立。此前只有
+// scripts/mutation-report.js 注入，本脚本仍调 readReportJson(f)（零 options）——该生产路径只能拿到
+// 默认 2 GiB，运维既不能收紧也不能关闭（独立验证 W2：#7 只闭了一半）。这里与 mutation-report.js
+// **同源**：同一个环境变量 XBK_MUTATION_REPORT_MAX_BYTES + 同一个默认值/回落口径（resolveMaxReportBytes
+// 是纯函数：缺省/空白/非法/非正值 → DEFAULT_MAX_FILE_BYTES；`off` → Buffer 上限）。
+const maxReportBytes = resolveMaxReportBytes(process.env.XBK_MUTATION_REPORT_MAX_BYTES)
+
 for (const f of reportFiles) {
   // 解析失败与结构异常（合法 JSON 但形状非预期）都计入 skipped，不中断其余报告
   try {
-    const d = readReportJson(f)
+    const d = readReportJson(f, { maxFileBytes: maxReportBytes })
     if (!d || typeof d !== 'object' || Array.isArray(d)) throw new Error('报告顶层不是 JSON 对象')
     // PR 评审 #140：files 缺失本身是结构不完整（截断/半写产物），不能当成「空报告」静默放行
     if (!d.files || typeof d.files !== 'object' || Array.isArray(d.files)) throw new Error('报告缺少 files 对象')

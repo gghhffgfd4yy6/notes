@@ -9237,6 +9237,41 @@ console.log('========================================\n');
     assertEqual(builds <= 2, true, `1000 次未命中最多重建 1~2 次索引，实际 ${builds} 次（每次未命中都重建 = O(n²)，B8 实测打死热路径）`)
   })
 
+  // R6（W2 实测残留）：`missVerified` 跨数组版本**粘滞**——索引重建（未命中复检）之后再原位替换
+  // 非首元素、且只查被替换者时，索引层不含新身份、命中候选复检落空、missVerified 已为真 ⇒ 不再重建，
+  // has() 对**数组里确实存在**的身份恒定返回 false 且永不恢复（自愈设计意图被破坏；方向是多推侧，
+  // 但同样与线性扫描 oracle 不一致）。修法：未命中路径补两条旋转抽查窗（引用层 32 位置 / 身份层
+  // 2 位置；n <= 8 时覆盖全表 ⇒ 首次未命中即精确）。两条窗都停掉时本条真红。
+  await test('B8-F-02: 未命中重建后再原位替换非首元素，has 必须自愈（W2 粘滞反例）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f02_sticky.json'
+    const fp = getFilePath(name)
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    saveMessages(fp, [{ id: 'st-a' }, { id: 'st-b' }, { id: 'st-c' }])
+    const arr = readMessages(fp)
+    const oracle = (m) => MessageStore._indexHasIdentityDirect(arr, m)
+    try {
+      assertEqual(isMessageInFile({ id: 'st-a' }, name), true, '前置：预热索引')
+      arr[1] = { id: 'st-b2' }
+      assertEqual(isMessageInFile({ id: 'st-absent' }, name), false, '第③步：不存在的身份判否（触发首次未命中复检，missVerified 置真）')
+      assertEqual(isMessageInFile({ id: 'st-b2' }, name), true, '前置：替换后的身份可见')
+      arr[1] = { id: 'st-b3' }
+      for (let round = 1; round <= 3; round++) {
+        const got = isMessageInFile({ id: 'st-b3' }, name)
+        assertEqual(got, oracle({ id: 'st-b3' }), `第 ${round} 次查询 has()=${got} 必须等于 oracle（恒 false = 粘滞漏判，即 W2 反例）`)
+      }
+      // 同族变体：再次原位改写（含字段级改写）后仍须与 oracle 一致
+      arr[1] = { id: 'st-b4' }
+      arr[2] = { id: 'st-c', url: 'https://st.example/c2' }
+      for (const p of [{ id: 'st-b4' }, { id: 'st-b2' }, { id: 'st-c' }, { url: 'https://st.example/c2' }]) {
+        const got = isMessageInFile(p, name)
+        assertEqual(got, oracle(p), `probe=${JSON.stringify(p)}：has()=${got} 必须等于 oracle=${oracle(p)}`)
+      }
+    } finally {
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('B8-F7: getFileName 不给缓存目录生成隐藏文件（末段以点开头）', () => {
     assertEqual(getFileName('https://example.com/.hidden'), 'url_.hidden.json', '末段 .hidden 应加前缀，避免生成隐藏文件')
     assertEqual(getFileName('https://example.com/.json'), 'url_.json', '末段 .json 应加前缀')
@@ -9256,6 +9291,31 @@ console.log('========================================\n');
     const urls = ['https://x/.hidden', 'https://x/url_.hidden', 'https://x/url_x', 'https://x/x', 'https://x/.json', 'https://x/url_.json', 'https://x/data.json']
     const names = urls.map(getFileName)
     assertEqual(new Set(names).size, names.length, `不同 URL 不得撞名：${JSON.stringify(names)}`)
+  })
+
+  // R6（W2 实锤）：R4 的「以 . 或 url_ 开头 ⇒ 前置 url_」仍是**非单射**——前置后再补 '.json' 后缀，
+  // 于是 getFileName('https://x/url_') → 'url_url_' → 'url_url_.json'，与
+  // getFileName('https://x/url_.json') → 'url_url_.json'（已带后缀不追加）**撞同一缓存文件**。
+  // 修法：'url_'-来源未带 .json 时插入分隔符 '#'（'#' 不可能出现在清洗后的末段里——末段先按 [?#] 截断）。
+  await test('B8-F7: url_ 前缀的合法名与补 .json 后缀不得撞名（W2 新碰撞回归）', () => {
+    assertEqual(getFileName('https://x/url_'), 'url_url_#.json', "'url_' 未带后缀：转义前缀 + '#' 分隔符再补后缀")
+    assertEqual(getFileName('https://x/url_.json'), 'url_url_.json', '既有产物不得改动（R4 断言钉死）')
+    assertEqual(getFileName('https://x/url_') === getFileName('https://x/url_.json'), false,
+      '两个不同 URL 不得映射到同一缓存文件名（W2 反例）')
+    assertEqual(getFileName('https://x/url_x') === getFileName('https://x/url_x.json'), false,
+      "同族变体：'url_x' 与 'url_x.json' 也不得撞名")
+    // 性质：'url_'-来源（转义类里唯一被二次改写的一支）严格单射——不同**清洗后**末段必不同名
+    // （'url_?q'/'url_#f' 与 'url_' 清洗后同为 'url_'，属文档化的 query/hash 剥离口径，故按清洗后比较）
+    const segs = ['url_', 'url_.json', 'url_x', 'url_x.json', 'url_.hidden', 'url_.hidden.json', 'url_url_', 'url_url_.json', 'url_?q', 'url_#f']
+    const got = segs.map(s => getFileName('https://x/' + s))
+    const cleaned = segs.map(s => { let n = s.split(/[?#]/)[0]; if (!n || /^\.+$/.test(n)) n = 'default'; return n })
+    const distinctCleaned = new Set(cleaned).size
+    assertEqual(new Set(got).size, distinctCleaned, `'url_'-来源必须严格单射（清洗后 ${distinctCleaned} 个不同末段）：${JSON.stringify(segs.map((s, i) => [s, got[i]]))}`)
+    assertEqual(got[0] === got[1], false, "'url_' 与 'url_.json' 清洗后不同名，必须映射到不同缓存名")
+    for (const n of got) {
+      assertEqual(n.startsWith('.'), false, `产物不得是隐藏文件：${n}`)
+      assertEqual(n.endsWith('.json'), true, `产物须保留 .json 后缀：${n}`)
+    }
   })
 
   // R4（V6 实锤）：F7 原条目另一半（getFilePath 截断碰撞）逐字未动——两条仅在**第 200 字节之后**

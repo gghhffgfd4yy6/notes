@@ -17,9 +17,9 @@ const ROOT = path.resolve(__dirname)
 const SCRIPT = path.join(ROOT, '.github', 'analyze-artifacts.js')
 const V3 = path.join(ROOT, 'xbk_function_v3.js')
 
-function run (dir) {
+function run (dir, env) {
   // process.execPath 由运行环境决定（CI 为 node 本体；本机经 execpath-shim 覆写为真实 node 二进制）
-  const r = spawnSync(process.execPath, [SCRIPT, dir], { cwd: ROOT, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [SCRIPT, dir], { cwd: ROOT, encoding: 'utf8', env: env ? { ...process.env, ...env } : process.env })
   return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || '' }
 }
 
@@ -114,6 +114,48 @@ try {
     assert.strictEqual(r.status, 1, '两份结构异常报告都必须被记为未纳入统计')
     assert.match(r.stderr, /未纳入统计的报告: 2\/2/, '两份坏报告都要出现在 skipped 列表')
     assert.match(r.stderr, /报告顶层不是 JSON 对象|报告缺少 files 对象/, 'skipped 原因必须可读')
+  })
+
+  // R6（F1 收尾）：该脚本此前调 readReportJson(f)（零 options）且不读 XBK_MUTATION_REPORT_MAX_BYTES，
+  // 于是「两个生产调用方都注入上限」的声称只闭了一半——这条生产路径只能拿默认 2 GiB，运维无法收紧/关闭。
+  // 下列断言把「显式注入 + 与 mutation-report.js 同源口径」钉死：极小值必须按**超限**处理（计入 skipped、
+  // 不静默整读），非法值回落默认值而非变成无上限，`off` 才关闭策略上限。
+  check('A8 XBK_MUTATION_REPORT_MAX_BYTES 注入生效：极小上限必须按超限拒绝（不得静默整读）', () => {
+    const dir = path.join(tmp, 'cap')
+    writeReport(dir, 'a', { files: { 'xbk_function_v3.js': { mutants: [mutant(1, 'Survived', 10)] } } })
+    const normal = run(dir)
+    assert.strictEqual(normal.status, 0, `不设环境变量时合法报告必须正常统计（stderr: ${normal.stderr.trim()}）`)
+    assert.match(normal.stdout, /存活变异体总数: 1/, '不设上限时报告应被正常读入')
+    // ① 极小上限 → 该报告超限：计入 skipped、非零退出、原因可读；绝不能照常统计
+    const capped = run(dir, { XBK_MUTATION_REPORT_MAX_BYTES: '4' })
+    assert.strictEqual(capped.status, 1, '设了极小上限后超限报告必须非零退出（绿灯 = 上限未注入）')
+    assert.match(capped.stderr, /未纳入统计的报告: 1\/1/, '超限报告必须出现在 skipped 列表（而非被静默整读）')
+    assert.match(capped.stderr, /超过预读上限/, `skipped 原因必须指名超限（实际：${capped.stderr.trim().slice(0, 200)}）`)
+    assert.doesNotMatch(capped.stdout, /存活变异体总数: 1/, '超限报告不得照常计入统计')
+    // ② 非法值回落默认策略值（绝不变成无上限）：同一报告重新被正常读入
+    for (const bad of ['abc', '-1', '0']) {
+      const r = run(dir, { XBK_MUTATION_REPORT_MAX_BYTES: bad })
+      assert.strictEqual(r.status, 0, `非法值 ${bad} 必须回落默认上限（不得把上限变成无穷）`)
+      assert.match(r.stdout, /存活变异体总数: 1/, `非法值 ${bad} 回落默认后应正常统计`)
+    }
+    // ③ off 关闭策略上限（退回 Buffer 边界）：同一报告仍应正常读入
+    const off = run(dir, { XBK_MUTATION_REPORT_MAX_BYTES: 'off' })
+    assert.strictEqual(off.status, 0, 'off 应关闭策略上限而非拒绝一切报告')
+    assert.match(off.stdout, /存活变异体总数: 1/, 'off 后报告正常统计')
+  })
+
+  check('A9 上限注入不得改坏既有口径：混合目录仍逐份统计 / 坏报告不中断其余', () => {
+    const dir = path.join(tmp, 'cap-mixed')
+    writeReport(dir, 'bad', { files: 'not-an-object' })
+    writeReport(dir, 'good', { files: { 'xbk_sendNotify_slim.js': { mutants: [mutant(1, 'Survived', 5)] } } })
+    const r = run(dir, { XBK_MUTATION_REPORT_MAX_BYTES: '1048576' })
+    assert.strictEqual(r.status, 1, '存在未纳入统计的报告仍须非零退出（skipped 统计未被改坏）')
+    assert.match(r.stderr, /未纳入统计的报告: 1\/2/, 'skipped 计数口径不变')
+    assert.match(r.stdout, /存活变异体总数: 1/, '同目录合法报告仍被统计（不中断其余）')
+    // 极小上限 → 两份都超限：skipped 2/2，且不得因「全部超限」而崩溃/静默
+    const tiny = run(dir, { XBK_MUTATION_REPORT_MAX_BYTES: '4' })
+    assert.strictEqual(tiny.status, 1, '全部超限时仍须非零退出')
+    assert.match(tiny.stderr, /未纳入统计的报告: 2\/2/, `两份超限报告都要进 skipped（实际：${tiny.stderr.trim().slice(0, 200)}）`)
   })
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true })

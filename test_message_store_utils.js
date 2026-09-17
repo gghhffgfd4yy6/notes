@@ -538,6 +538,81 @@ check('F7: 超长名截断必须保持单射（仅第 200 字节后不同的两�
   assert.strictEqual(longNameStore.getFilePath(a), pa, '同一名字必须稳定映射到同一路径（缓存名要能跨轮复用）')
 })
 
+// ===== F7 残留（R6：getFileName「转义后名字集合」单射的**性质测试**）=====
+// W2 实测新碰撞：getFileName('https://x/url_') 与 getFileName('https://x/url_.json') 都是
+// 'url_url_.json'（先前置 'url_' 再补 '.json' 后缀，两次改写叠加后像集相交）。这里用**语料 + 性质**
+// 证明修法后「同缓存名 ⇒ 同 URL（等价）」成立，而不是只钉两三个例子。
+// 等价口径（与既有断言一致）：清洗阶段（剥离 query/hash、保留字符 → '_'、去控制字符、空/纯点串 →
+// 'default'）是**故意**的粗化；此外「仅差一个 .json 后缀」的粗化由既有断言钉死（test_filter 的
+// `'abc' → 'abc.json'` 与 `'a.json' → 'a.json'`、`'.hidden' → 'url_.hidden.json'`），不在本次范围。
+const relSeg = (seg) => {
+  // 与 getFileName 内部同序的清洗镜像：只用于构造「等价类」参照，不参与生产逻辑
+  const url = 'https://x/' + seg
+  const parts = url.split('/')
+  let name = parts[parts.length - 1].split(/[?#]/)[0]
+  if (!name || /^\.+$/.test(name)) name = 'default'
+  name = name.replace(/[\\/:*?"<>|]/g, '_').replace(/[\u0000-\u001f]/g, '')
+  return name || 'default'
+}
+const canonJson = (s) => (s.endsWith('.json') ? s.slice(0, -'.json'.length) : s)
+
+check('F7 残留: getFileName 性质测试——同名缓存文件必来自等价末段（语料级单射）', () => {
+  const segs = [
+    'x', 'x.json', 'x.JSON', '.json', '.hidden', '.hidden.json', '..', '.', '...',
+    'url_', 'url_.json', 'url_url_', 'url_url_.json', 'url_x', 'url_x.json',
+    'url_.hidden', 'url_.hidden.json', 'url_.json.json',
+    'a b', ' a ', '\t\n x', 'x\u0000y', 'a|b.json', 'c:1.json', 'a?b=1', 'a#frag',
+    '.json.json', 'a.json.json', '.secret', 'data.json', 'default', 'default.json',
+    'u'.repeat(260) + 'aaaa.json', 'u'.repeat(260) + 'bbbb.json', 'x'.repeat(300),
+    '[object Object]', 'seen.cleanup.lock', 'a/b', 'a\\b', 'a*b', 'a"b', '%20', 'a%5Cb'
+  ]
+  const names = segs.map(s => store.getFileName('https://x/' + s))
+  let pairs = 0
+  let escapePairs = 0
+  for (let i = 0; i < segs.length; i++) {
+    for (let j = i + 1; j < segs.length; j++) {
+      if (names[i] !== names[j]) continue
+      pairs += 1
+      const ci = relSeg(segs[i])
+      const cj = relSeg(segs[j])
+      // Q1：碰撞只能来自已完成文档化的两处粗化（清洗等价 / 仅差 .json 后缀）
+      assert.ok(ci === cj || canonJson(ci) === canonJson(cj),
+        `不同末段撞同一缓存名 ${names[i]}：${JSON.stringify(segs[i])} vs ${JSON.stringify(segs[j])}（清洗后 ${JSON.stringify(ci)} / ${JSON.stringify(cj)}）`)
+      // Q2：**转义类**（以 . 或 url_ 开头）必须严格单射——除「同以 . 开头且仅差 .json」（既有断言
+      // 钉死的隐藏文件前缀口径）外，不允许任何额外粗化。W2 的 'url_' vs 'url_.json' 落在这里。
+      const escI = ci.startsWith('.') || ci.startsWith('url_')
+      const escJ = cj.startsWith('.') || cj.startsWith('url_')
+      if (escI && escJ) {
+        escapePairs += 1
+        assert.ok(ci === cj || (ci.startsWith('.') && cj.startsWith('.') && canonJson(ci) === canonJson(cj)),
+          `转义类不得额外粗化：${JSON.stringify(segs[i])}(${ci}) 与 ${JSON.stringify(segs[j])}(${cj}) 撞成 ${names[i]}`)
+      }
+    }
+  }
+  assert.ok(segs.length >= 40, `语料规模须足够（实际 ${segs.length} 条末段）`)
+  // 修法后映射必须**至少与文档化口径一样细**：'url_'-来源不再与 'url_x.json' 型来源合并，
+  // 故不同缓存名的数量不得少于「清洗 + 仅差 .json 视为同一」的等价类数量。
+  const canonClasses = new Set(segs.map(s => canonJson(relSeg(s)))).size
+  assert.ok(new Set(names).size >= canonClasses,
+    `缓存名去重数 ${new Set(names).size} 不得少于文档化等价类数 ${canonClasses}（更粗即引入未文档化合并）`)
+  // Q3：'url_'-来源（转义类里唯一可能被「补 .json」二次改写的一支）必须**严格单射**——
+  // 不同清洗名 ⇒ 不同缓存名。'.'-来源仍受既有隐藏文件前缀断言约束（仅差 .json 视为同一）。
+  const escSegs = segs.filter(s => { const c = relSeg(s); return c.startsWith('.') || c.startsWith('url_') })
+  const escNames = escSegs.map(s => store.getFileName('https://x/' + s))
+  const escExpected = new Set(escSegs.map(s => { const c = relSeg(s); return c.startsWith('.') ? canonJson(c) : c })).size
+  assert.ok(new Set(escNames).size >= escExpected,
+    `转义类缓存名去重数 ${new Set(escNames).size} 不得少于清洗名去重数 ${escExpected}（'url_' 与 'url_.json' 这类必须分开）`)
+  // 显式反例：W2 的新碰撞必须消失，且不得回退既有两项修复
+  assert.notStrictEqual(store.getFileName('https://x/url_'), store.getFileName('https://x/url_.json'), "W2 反例：'url_' 与 'url_.json' 不得撞名")
+  assert.strictEqual(store.getFileName('https://x/url_.json'), 'url_url_.json', '既有产物不得改动（test_filter/test_message_store_utils 钉死）')
+  assert.strictEqual(store.getFileName('https://x/.json'), 'url_.json', '隐藏文件前缀防护不得回退')
+  for (const n of names) {
+    assert.ok(!n.startsWith('.'), `getFileName 产物不得是隐藏文件：${n}`)
+    assert.ok(n.endsWith('.json'), `getFileName 产物须保留 .json 后缀：${n}`)
+  }
+  console.log(`     （语料 ${segs.length} 条末段 / 撞名对数 ${pairs}，其中转义类 ${escapePairs}）`)
+})
+
 // ===== F-02（B8 回归；V6 实锤漏推方向）=====
 // 反例：_identityIndex 的 O(1) 失效检查只看「引用 / 长度 / 首元素引用」，调用方**原地改写非首元素**
 // （换元素或改 id/url 字段）不会触发重建，旧索引把已不存在的身份判为「已存在」→ has() 返回 true
@@ -622,6 +697,82 @@ check('F-02: 批量未命中不得每次重建索引（每数组版本至多一�
   }
   assert.ok(builds >= 1, '首次未命中必须做一次全量复检，否则原地写入的新身份永远查不到（F-02 机制被删即红）')
   assert.ok(builds <= 2, `500 次未命中最多重建 1~2 次，实际 ${builds} 次（每次未命中都重建 = O(n²)，B8 实测打死热路径）`)
+})
+
+// ===== F-02 残留（R6：W2 实测 missVerified 跨数组版本粘滞）=====
+// 反例（W2，4 步）：① 预热索引 → ② 原位替换非首元素 → ③ 查一个不存在的身份（本数组版本**首次**
+// 未命中 ⇒ 全量复检并把 missVerified 置真）→ ④ 再原位替换同一位置、只查被替换者。
+// 修复前：index 命中候选复检落空、索引层不含新身份、missVerified 已粘滞为真 ⇒ 不再重建，
+// has() 对**数组里确实存在**的身份恒定返回 false，且此后永不恢复（自愈设计意图被破坏）。
+// 方向是「多推」侧（SYSTEM_CONTRACT 允许），但仍与线性扫描 oracle 不一致，故必须闭合。
+check('F-02 残留: 未命中重建后再原位替换非首元素，has 必须自愈（W2 4 步反例）', () => {
+  const arr = [{ id: 'w1' }, { id: 'w2' }, { id: 'w3' }]
+  const name = seedIdentityProbe(arr, 'f02_sticky.json')
+  assert.strictEqual(identityStore.has({ id: 'w1' }, name), true, '前置：预热索引')
+  arr[1] = { id: 'w2b' }
+  assert.strictEqual(identityStore.has({ id: 'zzz-absent' }, name), false, '第③步：不存在的身份判否（触发首次未命中复检，missVerified 置真）')
+  assert.strictEqual(identityStore.has({ id: 'w2b' }, name), true, '前置：替换后的身份可见')
+  arr[1] = { id: 'w2c' }
+  for (let round = 1; round <= 3; round++) {
+    const got = identityStore.has({ id: 'w2c' }, name)
+    const oracle = identityStore._indexHasIdentityDirect(arr, { id: 'w2c' })
+    assert.strictEqual(got, oracle, `第 ${round} 次查询 has()=${got} 必须等于 oracle=${oracle}（粘滞漏判即红）`)
+  }
+  assert.strictEqual(identityStore.has({ id: 'w2c' }, name), true, '数组里确实存在 w2c：不得恒定 false（粘滞未闭合）')
+})
+
+check('F-02 残留: 同族变体——字段级原位改写 + 首元素替换 + 扩容后只查新身份', () => {
+  const arr = [{ id: 'v1', url: 'https://v.example/1' }, { id: 'v2', url: 'https://v.example/2' }, { id: 'v3' }]
+  const name = seedIdentityProbe(arr, 'f02_sticky_forms.json')
+  assert.strictEqual(identityStore.has({ id: 'v1' }, name), true, '前置：预热索引')
+  assert.strictEqual(identityStore.has({ id: 'absent-1' }, name), false, '前置：先置 missVerified')
+  // 同族形态逐条对拍：字段级改写、首元素替换、长度不变的原位改写、追加
+  const forms = [
+    { label: 'arr[2].id 字段改写', mutate: (a) => { a[2].id = 'v3-new' }, probes: [{ id: 'v3-new' }, { id: 'v3' }] },
+    { label: 'arr[0] 首元素整体替换', mutate: (a) => { a[0] = { id: 'v1-new', url: 'https://v.example/1' } }, probes: [{ id: 'v1-new' }, { id: 'v1' }] },
+    { label: 'arr[1].url 字段改写', mutate: (a) => { a[1].url = 'https://v.example/2-new' }, probes: [{ url: 'https://v.example/2-new' }, { url: 'https://v.example/2' }] },
+    { label: 'push 追加（长度变化）', mutate: (a) => { a.push({ id: 'v9' }) }, probes: [{ id: 'v9' }] }
+  ]
+  for (const form of forms) {
+    form.mutate(arr)
+    for (const p of form.probes) {
+      const got = identityStore.has(p, name)
+      const oracle = identityStore._indexHasIdentityDirect(arr, p)
+      assert.strictEqual(got, oracle,
+        `${form.label}：has()=${got} 必须等于 oracle=${oracle}（probe=${JSON.stringify(p)}；true 侧不符即漏推）`)
+    }
+  }
+})
+
+check('F-02 残留: 大数组原位替换的自愈有上界（旋转抽查一轮内必须恢复，不得永不恢复）', () => {
+  const n = 200
+  const arr = []
+  for (let i = 0; i < n; i++) arr.push({ id: 'big-' + i })
+  const name = seedIdentityProbe(arr, 'f02_heal.json')
+  assert.strictEqual(identityStore.has({ id: 'big-0' }, name), true, '前置：索引已建立')
+  assert.strictEqual(identityStore.has({ id: 'absent-0' }, name), false, '前置：先置 missVerified（复现粘滞前提）')
+  const realBuild = identityStore._buildIdentityIndex
+  let builds = 0
+  identityStore._buildIdentityIndex = function (...args) { builds += 1; return realBuild.apply(this, args) }
+  try {
+    arr[100] = { id: 'big-100-new' } // 非首元素整体替换：引用/长度/首元素引用都看不出
+    // 引用层抽查窗宽 32 ⇒ 一轮 ceil(200/32)=7 次未命中即可覆盖到第 100 位，取 8 为硬上界
+    // （**写成字面量**：若写成 ceil(n/WINDOW) 而 WINDOW 被靶向改 0 会得到 Infinity，测试会挂死而不是变红）
+    const bound = 8
+    let healed = false
+    for (let k = 0; k < bound; k++) {
+      if (identityStore.has({ id: 'big-100-new' }, name)) { healed = true; break }
+    }
+    assert.ok(healed, `引用层抽查必须在 ${bound} 次未命中内自愈（否则粘滞未闭合；窗宽 32 ⇒ ceil(${n}/32)=7）`)
+    // 自愈代价必须仍是「每轮至多一次重建」，不能退化成每次未命中都重建
+    assert.ok(builds <= 3, `自愈过程的重建次数须有界（每轮抽查至多一次），实际 ${builds} 次`)
+  } finally {
+    identityStore._buildIdentityIndex = realBuild
+  }
+  for (const p of [{ id: 'big-100-new' }, { id: 'big-100' }, { id: 'big-0' }]) {
+    assert.strictEqual(identityStore.has(p, name), identityStore._indexHasIdentityDirect(arr, p),
+      `自愈后 has 仍须与线性扫描 oracle 一致（probe=${JSON.stringify(p)}）`)
+  }
 })
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

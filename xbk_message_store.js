@@ -44,6 +44,21 @@ function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   throw new Error('缓存目录安全检查失败：所有候选目录（含 .xbk_cache_safe_internal）均不可用，可能被符号链接劫持')
 }
 
+// F-02 残留闭合（R6）：稳态未命中路径的**有界**自愈抽查（实现见 MessageStore._probeIndexMiss）。
+// 索引的 O(1) 失效检查只看「引用 / 长度 / 首元素引用」，调用方**在原地**改写非首元素它看不见：
+// 「每个数组版本首次未命中重建一次」只覆盖那一刻，之后再原地写入的新身份会永久查不到
+// （missVerified 粘滞，R6 实测 `has()` 恒定 false 且不再自愈）。故未命中路径补两条旋转抽查窗：
+//   · 引用层宽窗（纯指针比较，~ns/位置）：原位换成**另一个元素对象**——V6/W2 反例的主要形态，
+//     新身份在索引里根本没有下标；宽窗几乎不花钱，自愈上界 ceil(n/REF_WINDOW) 次未命中。
+//   · 身份层窄窗（每个位置要重算 getMessageIdentity，~µs/位置）：同一对象上改 id/url 字段
+//     （引用不变）；窄窗宽度直接决定每次未命中的额外代价，自愈上界 ceil(n/IDENTITY_WINDOW)。
+// 两条窗都是 O(1) 位置数，不做 O(n) 全表扫描——「每次未命中都全量复检」实测把热路径打成 O(n²)。
+const IDENTITY_INDEX_REF_PROBE_WINDOW = 32
+const IDENTITY_INDEX_IDENTITY_PROBE_WINDOW = 2
+// n 不超过该阈值时两条窗都覆盖全表：抽查等价于全量复检，**首次未命中即精确**（测试与真实缓存的小
+// 数组都落在这里），代价上界 8 个位置；更大的数组才退回固定窗口（代价与 n 无关，有界自愈）。
+const IDENTITY_INDEX_PROBE_FULL_MAX = 8
+
 // 💾 MessageStore — 缓存管理层（从 xbk_function_v3.js 独立准备，暂不接入主入口）
 // 依赖全部由组合根注入；不反向 require 主入口，不复制共享单例。
 function createMessageStore ({
@@ -1033,8 +1048,9 @@ function createMessageStore ({
     },
 
     /** 身份索引缓存失效检查（P3 审查 2026-09-15）。
-   *  缓存条目形如 { ref, head, len, idx, missVerified }：ref 是权威数组引用、head 是首个元素
-   *  引用、len 是元素数、idx 是预计算身份索引、missVerified 见 has 的「未命中复检」口径。
+   *  缓存条目形如 { ref, head, len, idx, missVerified, posRefs, refCursor, identityCursor }：ref 是权威
+   *  数组引用、head 是首个元素引用、len 是元素数、idx 是预计算身份索引、missVerified 与 posRefs /
+   *  refCursor / identityCursor 见 has 的「未命中复检/抽查」口径与 _probeIndexMiss。
    *
    *  为什么不能只用「数组引用」作键：readMessages 返回的是内部权威数组的同一引用，
    *  调用方原地删改元素不会换引用，旧索引会让 has() 静默误判为「已存在」。
@@ -1045,11 +1061,12 @@ function createMessageStore ({
    *
    *  为什么不能每次做「逐位置身份复检」：那要遍历索引里的每个下标并重算 getMessageIdentity，
    *  实测每次约 20ms（3000 条缓存），同样把热路径打死。F-02 的替代方案见 _indexHasIdentity
-   *  （只复检命中的候选下标）与 has 的「首次未命中复检一次」。
+   *  （只复检命中的候选下标）、has 的「首次未命中复检一次」与 _probeIndexMiss 的两条旋转抽查窗。
    *
-   *  最终口径：O(1) 失效检查（引用 / 首元素 / 长度）+ 命中候选复检（F-02）+ 未命中每数组版本
-   *  复检一次 + 针对性的「下标越界加固」，另提供 _indexHasIdentityDirect 作为零索引的正确性
-   *  对照入口（慢路径 / 测试用）。 */
+   *  最终口径：O(1) 失效检查（引用 / 首元素 / 长度）+ 命中候选复检（F-02）+ 未命中抽查（每数组
+   *  版本首次未命中重建一次 + 每次未命中旋转抽查引用层 32 个 / 身份层 2 个位置）+
+   *  针对性的「下标越界加固」，另提供 _indexHasIdentityDirect 作为零索引的正确性对照入口
+   *  （慢路径 / 测试用）。 */
     _identityIndexIsStale (entry, messages) {
       if (!entry || entry.ref !== messages) return true
       if (entry.len !== messages.length) return true
@@ -1070,11 +1087,84 @@ function createMessageStore ({
         head: messages[0],
         len: messages.length,
         idx: this._buildIdentityIndex(messages),
-        // 该数组版本是否已做过「未命中后的复检」：见 has。
-        missVerified: false
+        // 该数组版本是否已做过「未命中后的全量复检」：见 has。
+        missVerified: false,
+        // 元素引用快照（_probeIndexMiss 引用层宽窗用；只存引用，不复制元素内容）。
+        posRefs: messages.slice(),
+        // 两条旋转抽查游标（该数组版本内单调推进，重建即归零）。
+        refCursor: 0,
+        identityCursor: 0
       }
       this._identityIndex.set(messages, entry)
       return entry
+    },
+
+    /** 抽查用：位置 i 是否在索引里按 ident 的**全部**维度登记。
+   *  与 _buildIdentityIndex 的写入维度一一对应（id → idByKey，另带 url 时 → idWithUrl；纯 url →
+   *  urlOnly；anon → anonByKey）。任一应登记的维度缺位即说明「当前元素」与索引不一致——调用方
+   *  在原位置换了元素或改了 id/url 字段，而索引还是旧的。 */
+    _indexHasPosition (idx, ident, i) {
+      const at = (set) => !!set && set.has(i)
+      if (ident.kind === 'id') return at(idx.idByKey.get(ident.idKey)) && (!ident.url || at(idx.idWithUrl.get(ident.url)))
+      if (ident.kind === 'url') return at(idx.urlOnly.get(ident.url))
+      return at(idx.anonByKey.get(ident.key))
+    },
+
+    /** 未命中后的**有界**抽查（F-02 残留闭合，R6）：数组被调用方原地改写（换元素 / 改 id、url
+   *  字段）时引用、长度、首元素引用都不变，O(1) 失效检查与「命中候选复检」都看不见——索引里根本
+   *  没有新身份的下标，候选集为空。这里用两条旋转游标窗，每窗位置数恒定（**不做** O(n) 全表扫描）：
+   *    · 引用层宽窗（IDENTITY_INDEX_REF_PROBE_WINDOW，纯指针比较 ~ns）：原位换成另一个元素对象，
+   *      此时索引里的下标指向的是**旧对象**、新身份根本没登记 ⇒ diverged；
+   *    · 身份层窄窗（IDENTITY_INDEX_IDENTITY_PROBE_WINDOW，每位置重算 getMessageIdentity ~µs）：
+   *      同一对象上改 id/url 字段（引用不变）；同时兼任正命中通道（与 _indexHasIdentityDirect
+   *      同序调用 sameMessageIdentity，命中即真）。
+   *  自愈上界：引用层 ceil(n/REF)、身份层 ceil(n/IDENTITY) 次未命中走完一轮抽查；两条窗都覆盖 n
+   *  时（小数组）首次未命中即精确。期间方向为「多推」（SYSTEM_CONTRACT 允许），且不会比修复前更差。
+   *  安全性：本函数只可能**触发重建**（重建即与当前数组对齐、答案仍由逐候选复检给出）或直接给出
+   *  正命中，因此不会让 has() 返回与线性扫描 oracle 相反的答案。 */
+    _probeIndexMiss (entry, messages, message) {
+      const n = messages.length
+      if (n === 0) return { hit: false, diverged: false }
+      const b = Utils.getMessageIdentity(message)
+      if (!b.valid) return { hit: false, diverged: false }
+      // ① 引用层宽窗：廉价，先跑（一次指针比较就能发现整块换元素）。
+      const refs = entry.posRefs
+      const full = n <= IDENTITY_INDEX_PROBE_FULL_MAX
+      if (refs && refs.length === n) {
+        const width = full ? n : Math.min(n, IDENTITY_INDEX_REF_PROBE_WINDOW)
+        const from = this._probeCursorOf(entry, 'refCursor', n)
+        for (let step = 0; step < width; step++) {
+          const i = (from + step) % n
+          if (messages[i] !== refs[i]) {
+            entry.refCursor = (i + 1) % n
+            return { hit: false, diverged: true }
+          }
+        }
+        entry.refCursor = (from + width) % n
+      }
+      // ② 身份层窄窗：需重算身份，宽度决定每次未命中的额外代价。
+      const width = full ? n : Math.min(n, IDENTITY_INDEX_IDENTITY_PROBE_WINDOW)
+      const from = this._probeCursorOf(entry, 'identityCursor', n)
+      for (let step = 0; step < width; step++) {
+        const i = (from + step) % n
+        const a = Utils.getMessageIdentity(messages[i])
+        if (Utils.sameMessageIdentity(messages[i], message, a, b)) {
+          entry.identityCursor = (i + 1) % n
+          return { hit: true, diverged: false }
+        }
+        if (a.valid && !this._indexHasPosition(entry.idx, a, i)) {
+          entry.identityCursor = (i + 1) % n
+          return { hit: false, diverged: true }
+        }
+      }
+      entry.identityCursor = (from + width) % n
+      return { hit: false, diverged: false }
+    },
+
+    /** 读旋转抽查游标（缺失/越界/非整数一律归零，便于重建后从 0 起扫）。 */
+    _probeCursorOf (entry, key, n) {
+      const v = entry[key]
+      return (Number.isInteger(v) && v >= 0 && v < n) ? v : 0
     },
 
     /** Ensure 预计算索引可用：命中且未失效直接复用，否则重建并写回。
@@ -1106,12 +1196,18 @@ function createMessageStore ({
       // 改写非首元素后 has() 会把已不存在的身份判为「已存在」→ 漏推。
       let entry = this._identityIndexEntry(messages)
       if (this._indexHasIdentity(entry.idx, message, messages)) return true
-      // 索引层命中但候选复检失配 ⇒ 数组被原地改写、索引已陈旧：立刻重建（自愈），否则后续查询
-      // 会继续拿陈旧索引给答案；本数组版本**首次**未命中同样重建一次，覆盖另一侧陈旧
-      // （原地写入的新身份在旧索引里查不到，只会多推，但同样与线性扫描不一致）。
-      // 代价：每个数组版本至多一次 O(n) 重建（稳态查询仍 O(1)）。改为「每次未命中都重建」会让
+      // 未命中：先做**有界抽查**（_probeIndexMiss，O(min(n, W))）。命中候选复检只覆盖「索引里仍
+      // 登记着的」身份；「原地写入的新身份」在索引里没有下标（候选集为空），只能靠抽查/重建兜住。
+      const probe = this._probeIndexMiss(entry, messages, message)
+      if (probe.hit) return true
+      // 索引层命中但候选复检失配、或抽查发现当前元素与索引不一致（diverged）⇒ 数组被原地改写、
+      // 索引已陈旧：立刻重建（自愈），否则后续查询会继续拿陈旧索引给答案；本数组版本**首次**未命中
+      // 同样重建一次，覆盖另一侧陈旧（原地写入的新身份在旧索引里查不到，只会多推，但同样与线性
+      // 扫描不一致）。
+      // 代价：每个数组版本至多一次 O(n) 重建 + 每次未命中一次 O(W) 抽查（重建次数上界由
+      // test_filter/test_message_store_utils 的 builds <= 2 守位）。改为「每次未命中都重建」会让
       // 5000 条批量判重退化成 O(n²)——即 B8 实测的打死热路径形态，故刻意不做。
-      if (this._indexHasIdentity(entry.idx, message) || !entry.missVerified) {
+      if (probe.diverged || this._indexHasIdentity(entry.idx, message) || !entry.missVerified) {
         entry = this._storeIdentityEntry(messages)
         entry.missVerified = true
         if (this._indexHasIdentity(entry.idx, message, messages)) return true
@@ -1339,11 +1435,28 @@ function createMessageStore ({
       // 的残留回收与下一次写入自然迁移。
       // F7 回归（R4/V6）：只给「以点开头」的名字加前缀会与该前缀自身的合法名字撞名——
       // getFileName('https://x/.json') 与 getFileName('https://x/url_.json') 都是 'url_.json'
-      // → 两个不同 pushUrl 共用同一缓存文件（互相覆盖判重记录）。两条前缀规则合并为
-      // 「以 . 或 url_ 开头 ⇒ 前置 url_」：该映射是单射——像集恒以 'url_' 开头，
-      // '.'-来源 → 'url_.' + …，'url_'-来源 → 'url_url_' + …，二者不相交，且不以 'url_'
-      // 开头的普通名字不会落进像集。
-      if (name.startsWith('.') || name.startsWith('url_')) name = 'url_' + name
+      // → 两个不同 pushUrl 共用同一缓存文件（互相覆盖判重记录）。改为按来源分派到两个不相交的像集。
+      //
+      // F7 残留（R6/W2）：上一版把两类合并成同一条「前置 url_」再补 .json 后缀，于是
+      //   getFileName('https://x/url_') → 'url_url_' → 'url_url_.json'
+      //   getFileName('https://x/url_.json') → 'url_url_.json'（已带后缀不再追加）→ **仍然撞名**。
+      //   根因是「补 .json 后缀」与「前置 url_」两次改写叠加后像集相交。修法：
+      //     · '.'-来源 → 'url_' + 名字（原有隐藏文件防护，产物恒以 'url_.' 开头）；
+      //     · 'url_'-来源且**已带 .json** → 'url_' + 名字（保持既有产物 'url_url_.json' 不被改动）；
+      //     · 'url_'-来源且未带 .json → 追加分隔符 '#' 再补后缀（'url_url_#.json'）。
+      //   单射依据：'url_'-来源（无论哪种）产物恒以 'url_url_' 开头，与 '.'-来源的 'url_.' 不相交，
+      //   也与「不以 url_ 开头」的普通名字不相交；'#' **不可能出现在清洗后的末段里**——本函数先把
+      //   末段按 /[?#]/ 截断，故 'url_x#.json' 这类名字不可能再作为来源参与映射，'url_x' 与
+      //   'url_x.json' 这两个来源因此不再互相覆盖（'url_url_x#.json' ≠ 'url_url_x.json'）。
+      //   注：'a' 与 'a.json' 这一类「仅差 .json 后缀」的粗化是**既有且被断言钉住**的口径
+      //   （test_filter「abc → abc.json」「a.json → a.json」），不在本次改动范围。
+      if (name.startsWith('.')) {
+        name = 'url_' + name
+      } else if (name.startsWith('url_') && !name.endsWith('.json')) {
+        name = 'url_' + name + '#'
+      } else if (name.startsWith('url_')) {
+        name = 'url_' + name
+      }
       if (!name.endsWith('.json')) name += '.json'
       return name
     }
@@ -1352,4 +1465,9 @@ function createMessageStore ({
   return MessageStore
 }
 
-module.exports = { createMessageStore, resolveCacheDirInRoot }
+module.exports = {
+  createMessageStore,
+  resolveCacheDirInRoot,
+  IDENTITY_INDEX_REF_PROBE_WINDOW,
+  IDENTITY_INDEX_IDENTITY_PROBE_WINDOW
+}
