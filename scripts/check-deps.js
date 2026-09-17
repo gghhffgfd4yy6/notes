@@ -31,6 +31,15 @@ function declaredRuntimeDependencies (pkg) {
   return names
 }
 
+// RT-08：测试期依赖清单（devDependencies）。注册套件 test_filter.js 直接 require('fast-check')（裸
+// devDependency），缺它时套件在**运行时**才炸；而 run_tests.js 的前置门此前只覆盖运行时清单。
+// 只列名字（探测策略由调用方决定：devDependency 多为 ESM-only，见 checkDependencies 的 resolve-only 分支）。
+function declaredDevDependencies (pkg) {
+  const group = pkg && pkg.devDependencies
+  if (!group || typeof group !== 'object') return []
+  return Object.keys(group)
+}
+
 // F3：把被吞掉的根因提取成一行摘要（带 error.code），只取首行避免把 require 栈整段刷进输出。
 function dependencyFailureReason (error) {
   const message = error && error.message ? String(error.message) : String(error)
@@ -54,20 +63,56 @@ function compareVersion (a, b) {
   return 0
 }
 
+// F4 返工：比较器语义必须与 npm semver 一致，**尤其是缺段写法**（`~1` / `^1` / `1` / `>1` / `<=1`）。
+// 它们不是「缺省段补 0 后做同级比较」，而是按 npm 的 X-range 展开：
+//   1      → >=1.0.0 <2.0.0      1.2    → >=1.2.0 <1.3.0      1.2.3 → =1.2.3
+//   ~1     → >=1.0.0 <2.0.0      ~1.2   → >=1.2.0 <1.3.0      ~0    → >=0.0.0 <1.0.0
+//   ^1     → >=1.0.0 <2.0.0      ^0     → >=0.0.0 <1.0.0      ^0.0  → >=0.0.0 <0.1.0
+//   >1     → >=2.0.0             >1.2   → >=1.3.0             <=1.2 → <1.3.0
+// 修复前 `~1`→<1.1.0、`~0`→<0.1.0（仅主版本 tilde 上界少升一级）对上界做了静默错判：
+// 将来 engines.node 写 `~24` 会在受支持的 Node 上误红。真值表（逐行对照 semver@7 的 satisfies）
+// 见 test_check_deps.js 的 F4 表；不认识的写法（`x`/`*` 通配等）一律返回 null，由调用方降级告警。
 function satisfiesComparator (version, token) {
   const m = /^(>=|<=|>|<|=|\^|~)?v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$/.exec(token)
   if (!m) return null
   const op = m[1] || '='
+  const hasMinor = m[3] !== undefined
+  const hasPatch = m[4] !== undefined
   const low = [Number(m[2]), Number(m[3] || 0), Number(m[4] || 0)]
   if (op === '>=') return compareVersion(version, low) >= 0
-  if (op === '>') return compareVersion(version, low) > 0
-  if (op === '<=') return compareVersion(version, low) <= 0
   if (op === '<') return compareVersion(version, low) < 0
-  if (op === '=') return compareVersion(version, low) === 0
-  // ^ 与 ~ 的上界按 npm 口径：^1.2.3 → <2.0.0、^0.2.3 → <0.3.0、^0.0.3 → <0.0.4、~1.2.3 → <1.3.0
-  const high = op === '^'
-    ? (low[0] > 0 ? [low[0] + 1, 0, 0] : (low[1] > 0 ? [0, low[1] + 1, 0] : [0, 0, low[2] + 1]))
-    : [low[0], low[1] + 1, 0]
+  // `>X` / `<=X`：X 缺段时比较对象是 X-range 的边界，不是补 0 后的单点
+  if (op === '>') {
+    if (!hasMinor) return compareVersion(version, [low[0] + 1, 0, 0]) >= 0
+    if (!hasPatch) return compareVersion(version, [low[0], low[1] + 1, 0]) >= 0
+    return compareVersion(version, low) > 0
+  }
+  if (op === '<=') {
+    if (!hasMinor) return compareVersion(version, [low[0] + 1, 0, 0]) < 0
+    if (!hasPatch) return compareVersion(version, [low[0], low[1] + 1, 0]) < 0
+    return compareVersion(version, low) <= 0
+  }
+  if (op === '=') {
+    if (!hasMinor) return compareVersion(version, low) >= 0 && compareVersion(version, [low[0] + 1, 0, 0]) < 0
+    if (!hasPatch) return compareVersion(version, low) >= 0 && compareVersion(version, [low[0], low[1] + 1, 0]) < 0
+    return compareVersion(version, low) === 0
+  }
+  let high
+  if (op === '~') {
+    // ~1 → <2.0.0（仅主版本时上界升主版本，不是升次版本）；~1.2 / ~1.2.3 → <1.3.0
+    high = hasMinor ? [low[0], low[1] + 1, 0] : [low[0] + 1, 0, 0]
+  } else if (!hasMinor) {
+    // ^1 → <2.0.0；^0 → <1.0.0（主版本为 0 且次版本缺失时上界是 1.0.0）
+    high = low[0] > 0 ? [low[0] + 1, 0, 0] : [1, 0, 0]
+  } else if (low[0] > 0) {
+    high = [low[0] + 1, 0, 0] // ^1.2 / ^1.2.3 → <2.0.0
+  } else if (!hasPatch) {
+    high = [0, low[1] + 1, 0] // ^0.0 → <0.1.0；^0.2 → <0.3.0
+  } else if (low[1] > 0) {
+    high = [0, low[1] + 1, 0] // ^0.2.3 → <0.3.0
+  } else {
+    high = [0, 0, low[2] + 1] // ^0.0.3 → <0.0.4
+  }
   return compareVersion(version, low) >= 0 && compareVersion(version, high) < 0
 }
 
@@ -127,7 +172,7 @@ function loadFromRoot (name) {
   return require(require.resolve(name, { paths: [ROOT] }))
 }
 
-function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, manifest = readPackageManifest } = {}) {
+function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, manifest = readPackageManifest, includeDevDependencies = false } = {}) {
   const missing = []
   const broken = []
   const versionProblems = []
@@ -141,12 +186,17 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
   }
   const declared = declaredRuntimeDependencies(pkg)
   const targets = declared.length > 0 ? declared : ['got', NATIVE_DEP]
+  // RT-08：测试入口（run_tests.js）另需 devDependencies——注册套件 test_filter.js 裸
+  // require('fast-check')，缺它时是**运行时**才炸，前置门看不见。默认关闭（其它调用方的运行时语义
+  // 不变），只有测试入口显式打开；这些包多为 ESM-only（@stryker-mutator/core 等 require 必抛
+  // ERR_REQUIRE_ESM），故只做 resolve（装没装）不 load（否则正常安装会被误报「已安装但不可用」）。
+  const devTargets = includeDevDependencies ? declaredDevDependencies(pkg).filter(name => !targets.includes(name)) : []
 
   // F4：此前完全不校验 Node 版本（无 process.versions.node / engines 判定），而 re2 的 engines
   // 严于本仓库 engines——README 明示 Node 23.x、24.0–24.14、25.x 上装/重建 re2 必然失败。
   versionProblems.push(...nodeVersionProblems(pkg, process.versions.node))
 
-  for (const name of targets) {
+  for (const name of [...targets, ...devTargets]) {
     // F3：两段判定——resolve 失败才是「缺少」；resolve 成功而加载抛错（ERR_REQUIRE_ESM、
     // 内部依赖缺失、原生绑定损坏等）是「已安装但不可用」，此前一律按 missing 报「缺少 got」。
     try {
@@ -155,6 +205,7 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
       missing.push(name)
       continue
     }
+    if (devTargets.includes(name)) continue // RT-08：devDependency 只查「装没装」
 
     try {
       const mod = load(name)

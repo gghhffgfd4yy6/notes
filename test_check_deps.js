@@ -11,7 +11,10 @@ const { checkDependencies, satisfiesNodeRange } = require('./scripts/check-deps'
 
 // 沙箱：<dir>/package.json（可控声明清单）+ <dir>/scripts/check-deps.js（复制真实实现）
 // + <dir>/node_modules/<name>/{package.json,index.js}。ROOT 由实现自算为 <dir>。
-function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [] }) {
+// marker（F5 返工）：给每个依赖的 index.js 注入「被加载即记账」——在隔离树上取证「检查真的跑了、
+// 且经 ROOT 基准解析并加载了声明清单里的包」。只断言「status 0 且零输出」时，基线源码（无
+// require.main 守卫、直接执行只加载模块）的空跑也恰好满足该条件（不可证伪）。
+function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [], marker = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-deps-sandbox-'))
   fs.mkdirSync(path.join(dir, 'scripts'))
   fs.copyFileSync(path.join(__dirname, 'scripts', 'check-deps.js'), path.join(dir, 'scripts', 'check-deps.js'))
@@ -20,7 +23,9 @@ function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [] }) {
     const pkgDir = path.join(dir, 'node_modules', name)
     fs.mkdirSync(pkgDir, { recursive: true })
     fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.js' }))
-    fs.writeFileSync(path.join(pkgDir, 'index.js'), 'module.exports = {}\n')
+    fs.writeFileSync(path.join(pkgDir, 'index.js'), marker
+      ? `require('node:fs').appendFileSync(${JSON.stringify(marker)}, ${JSON.stringify(name)} + '\\n')\nmodule.exports = {}\n`
+      : 'module.exports = {}\n')
   }
   // brokenDeps：落在 <dir>/scripts/node_modules/ 下——同名包在「以 scripts/ 为基准」的
   // 解析下会先命中且 require 即抛错，用于固定「解析基准必须与 resolve 同为项目根」这条契约。
@@ -33,8 +38,34 @@ function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [] }) {
   return dir
 }
 
-function runCheckDepsSandbox (dir) {
-  return spawnSync(process.execPath, [path.join(dir, 'scripts', 'check-deps.js')], { encoding: 'utf8', cwd: dir })
+function runCheckDepsSandbox (dir, env = {}) {
+  return spawnSync(process.execPath, [path.join(dir, 'scripts', 'check-deps.js')], {
+    encoding: 'utf8', cwd: dir, env: { ...process.env, ...env }
+  })
+}
+
+// RT-08 沙箱：复制**真实**run_tests.js + 真实 scripts/check-deps.js，配一个最小桩套件与可控的
+// devDependencies 清单——用真实入口（而不是读源码文本）证明前置门确实按 devDependencies 拦下缺失包。
+function makeRunTestsSandbox ({ dependencies, devDependencies, presentDeps = [] }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'run-tests-sandbox-'))
+  fs.mkdirSync(path.join(dir, 'scripts'))
+  fs.copyFileSync(path.join(__dirname, 'scripts', 'check-deps.js'), path.join(dir, 'scripts', 'check-deps.js'))
+  fs.copyFileSync(path.join(__dirname, 'run_tests.js'), path.join(dir, 'run_tests.js'))
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'sandbox', version: '1.0.0', dependencies, devDependencies }))
+  for (const name of presentDeps) {
+    const pkgDir = path.join(dir, 'node_modules', name)
+    fs.mkdirSync(pkgDir, { recursive: true })
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.js' }))
+    fs.writeFileSync(path.join(pkgDir, 'index.js'), 'module.exports = {}\n')
+  }
+  fs.writeFileSync(path.join(dir, 'test_suites.js'),
+    "module.exports = { SUITES: [{ name: '桩', file: 'stub_suite.js', desc: 'RT-08 沙箱桩套件' }] }\n")
+  fs.writeFileSync(path.join(dir, 'stub_suite.js'), "console.log('stub suite ok')\nprocess.exit(0)\n")
+  return dir
+}
+
+function runRunTestsSandbox (dir) {
+  return spawnSync(process.execPath, [path.join(dir, 'run_tests.js')], { encoding: 'utf8', cwd: dir })
 }
 
 function fakeRe2Class ({ ok = true } = {}) {
@@ -115,6 +146,85 @@ test('F3 got 可解析但加载抛错 → 归为 broken，输出根因与重装�
   if (!out.includes('require() of ES Module')) throw new Error(`根因 message 必须进入输出: ${out}`)
   if (!out.includes('npm ci --ignore-scripts')) throw new Error(`got 不可用应给重装指引: ${out}`)
   if (out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`got 不可用不应给 re2 的 rebuild 指引: ${out}`)
+})
+
+// RT-08：注册套件 test_filter.js 裸 require('fast-check')（devDependency），只探运行时清单时缺它
+// 要在套件运行时才炸。前置门可按需把 devDependencies 纳入探测——默认关闭（运行时调用方语义不变），
+// 只有测试入口显式打开。
+test('RT-08 includeDevDependencies 打开后必须发现缺失的 devDependency（默认关闭时不误报）', () => {
+  const pkg = { dependencies: { got: '11.8.6' }, devDependencies: { 'ghost-dev': '1.0.0' } }
+  const resolve = (name) => {
+    if (name === 'ghost-dev') throw new Error("Cannot find module 'ghost-dev'")
+    return '/mock/path'
+  }
+  const base = { manifest: () => pkg, resolve, load: () => fakeRe2Class() }
+  // 默认：运行时清单口径 —— devDependency 缺失不得让运行时预检变红
+  const defaultOut = captureErrorOutput(() => {
+    if (checkDependencies(base) !== true) throw new Error('默认不应把 devDependencies 计入运行时预检')
+  })
+  if (defaultOut.includes('ghost-dev')) throw new Error(`默认调用不得探测 devDependencies: ${defaultOut}`)
+  // 打开开关：缺失的 devDependency 必须被发现并点名
+  const out = captureErrorOutput(() => {
+    if (checkDependencies({ ...base, includeDevDependencies: true }) !== false) throw new Error('打开开关后必须报缺失')
+  })
+  if (!out.includes('缺少依赖：ghost-dev')) throw new Error(`必须点名缺失的 devDependency: ${out}`)
+})
+
+// RT-08：devDependency 里存在 ESM-only 包（@stryker-mutator/core 等）——require 必抛
+// ERR_REQUIRE_ESM。若对它们走 load，正常安装会被误报「已安装但不可用」→ 前置门假红。故只做 resolve。
+test('RT-08 devDependency 只做 resolve 探测：可解析但 require 抛错不得误报 broken', () => {
+  const out = captureErrorOutput(() => {
+    const ok = checkDependencies({
+      manifest: () => ({ dependencies: { got: '11.8.6' }, devDependencies: { 'esm-only-dev': '1.0.0' } }),
+      resolve: () => '/mock/path',
+      load: (name) => {
+        if (name === 'esm-only-dev') {
+          const err = new Error('require() of ES Module not supported')
+          err.code = 'ERR_REQUIRE_ESM'
+          throw err
+        }
+        return fakeRe2Class()
+      },
+      includeDevDependencies: true
+    })
+    if (ok !== true) throw new Error(`ESM-only devDependency 已安装不得判失败，实际 ${ok}`)
+  })
+  if (out.includes('不可用')) throw new Error(`不得把 devDependency 的 ESM-only 加载失败判为「已安装但不可用」: ${out}`)
+})
+
+// RT-08（接线，行为级）：用**真实入口** run_tests.js 验证它确实打开了 includeDevDependencies——
+// 读源码文本的断言不算；沙箱里复制真实 run_tests.js + 真实 scripts/check-deps.js，配一个最小桩套件，
+// 声明一个不存在的 devDependency：入口必须非 0 退出并点名它（回退那行接线 → 桩套件跑通 → exit 0 → 红）。
+test('RT-08 真实入口 run_tests.js 的前置门覆盖 devDependencies（缺 fast-check 类依赖必须拦下）', () => {
+  const ghost = 'xbk-ghost-dev-xyz'
+  const dir = makeRunTestsSandbox({
+    dependencies: { got: '11.8.6' },
+    devDependencies: { [ghost]: '1.0.0' },
+    presentDeps: ['got']
+  })
+  const ctl = makeRunTestsSandbox({
+    dependencies: { got: '11.8.6' },
+    devDependencies: { 'xbk-dev-present-xyz': '1.0.0' },
+    presentDeps: ['got', 'xbk-dev-present-xyz']
+  })
+  try {
+    const r = runRunTestsSandbox(dir)
+    if (r.status === 0) {
+      throw new Error(`devDependency 缺失时入口必须非 0 退出，实际 0；stdout=${JSON.stringify(r.stdout)}`)
+    }
+    if (!String(r.stderr).includes(ghost)) {
+      throw new Error(`stderr 必须点名缺失的 devDependency，实际: ${JSON.stringify(r.stderr)}`)
+    }
+    // 对照组：devDependencies 齐全时入口正常跑完（证明拦截来自缺失的 devDependency，而非别处）
+    const ok = runRunTestsSandbox(ctl)
+    if (ok.status !== 0) {
+      throw new Error(`devDependencies 齐全时入口应通过，实际 status=${ok.status}，stderr=${JSON.stringify(ok.stderr)}`)
+    }
+    if (!String(ok.stdout).includes('全部通过')) throw new Error(`对照组应跑完并汇总通过：${JSON.stringify(ok.stdout)}`)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+    fs.rmSync(ctl, { recursive: true, force: true })
+  }
 })
 
 test('re2 完全缺失（resolve 失败）→ 归为 missing，提示 npm ci + rebuild', () => {
@@ -273,6 +383,65 @@ test('F4 satisfiesNodeRange：repo engines 与 re2 更严的 engines 都按 npm 
   }
 })
 
+// F4 返工：**缺段比较器的 npm X-range 真值表**。修复前的极简解析器只把缺失的段补 0 再比较，
+// 于是 `~1` 的上界算成 <1.1.0（npm: <2.0.0）、`~0` 算成 <0.1.0（npm: <1.0.0）、`^0` 算成 <0.0.1
+// （npm: <1.0.0）、`1` 被当成精确 =1.0.0（npm: >=1.0.0 <2.0.0）——对一个**自称支持**的写法静默错判。
+// 表内每一行的期望值由 semver@7 生成（`node -e "console.log(require('semver').satisfies(v,r))"`），
+// 不以本实现为口径。任一行不符即断言红。
+test('F4 返工 satisfiesNodeRange：缺段写法必须按 npm X-range 语义（真值表对照 semver@7）', () => {
+  const rows = [
+    // ~（仅主版本的 tilde 上界正是被打回的形态）
+    ['1.9.0', '~1', true], ['0.5.0', '~0', true], ['1.0.0', '~1', true], ['2.0.0', '~1', false],
+    ['1.2.9', '~1.2', true], ['1.3.0', '~1.2', false], ['0.2.5', '~0.2', true], ['0.3.0', '~0.2', false],
+    // ^（缺段按 X-range 展开：^0 是 <1.0.0 而不是 <0.0.1）
+    ['1.9.0', '^1', true], ['2.0.0', '^1', false], ['0.5.0', '^0', true], ['1.0.0', '^0', false],
+    ['0.0.9', '^0', true], ['0.5.0', '^0.2', false], ['0.2.9', '^0.2', true], ['0.0.3', '^0.0', true],
+    ['0.1.0', '^0.0', false], ['24.18.0', '^24.15.0', true], ['24.10.0', '^24.15.0', false],
+    // 裸版本 / = ：缺段是 X-range，不是精确单点
+    ['1.2.5', '=1.2', true], ['1.3.0', '=1.2', false], ['2.0.0', '=1', false], ['1.5.0', '=1', true],
+    // > / <= ：缺段时比较对象是 X-range 的边界
+    ['1.2.5', '>1.2', false], ['1.3.0', '>1.2', true], ['1.5.0', '>1', false], ['2.0.0', '>1', true],
+    ['1.2.5', '<=1.2', true], ['1.3.0', '<=1.2', false], ['1.5.0', '<=1', true], ['2.0.0', '<=1', false],
+    // < / >= 与 npm 同口径（缺段补 0）
+    ['1.2.0', '<1.2', false], ['1.1.9', '<1.2', true], ['2.0.0', '<1', false], ['0.9.9', '<1', true]
+  ]
+  for (const [version, range, expected] of rows) {
+    const actual = satisfiesNodeRange(version, range)
+    if (actual !== expected) throw new Error(`satisfiesNodeRange(${version}, ${JSON.stringify(range)}) 期望 ${expected}（npm 口径），实际 ${actual}`)
+  }
+})
+
+// F4 返工（分支覆盖）：re2 的 engines 比本仓库严，但本机 node_modules/re2 是 V8 替身（无 engines 字段），
+// 于是 readNativeEngineRange 的整条生产分支在仓库树上零覆盖。这里在沙箱里放一个自带 engines 的假 re2
+// （真实包形状：package.json.engines + 可构造的 RE2 类），直接驱动「re2 engines 更严 → 版本门禁拦下」。
+test('F4 返工：re2 自身 engines 更严时纳入版本门禁（沙箱假 re2 驱动该分支）', () => {
+  const dir = makeCheckDepsSandbox({
+    manifest: { name: 'sandbox', version: '1.0.0', dependencies: { re2: '1.0.0' } },
+    deps: ['re2']
+  })
+  const re2Dir = path.join(dir, 'node_modules', 're2')
+  try {
+    // 假 re2：可构造且探针通过，只有 engines 参与判定
+    fs.writeFileSync(path.join(re2Dir, 'index.js'), 'module.exports = class RE2 { constructor (p) { this.p = p } test () { return true } }\n')
+    fs.writeFileSync(path.join(re2Dir, 'package.json'),
+      JSON.stringify({ name: 're2', version: '1.0.0', main: 'index.js', engines: { node: '>99.0.0' } }))
+    const blocked = runCheckDepsSandbox(dir)
+    if (blocked.status === 0) throw new Error(`re2 engines 不满足必须非 0 退出，实际 status=0，stdout=${JSON.stringify(blocked.stdout)}`)
+    const err = String(blocked.stderr)
+    if (!err.includes('re2 的 engines.node') || !err.includes('>99.0.0')) {
+      throw new Error(`stderr 必须点名 re2 的 engines 要求，实际: ${JSON.stringify(err)}`)
+    }
+    // 对照组：同一份假 re2 换成当前运行时满足的区间 → 必须放行
+    // （证伪「拦截来自别的分支」：只有 engines 变了）
+    fs.writeFileSync(path.join(re2Dir, 'package.json'),
+      JSON.stringify({ name: 're2', version: '1.0.0', main: 'index.js', engines: { node: `>=${process.versions.node.replace(/^v/, '')}` } }))
+    const allowed = runCheckDepsSandbox(dir)
+    if (allowed.status !== 0) throw new Error(`engines 满足时必须放行，实际 status=${allowed.status}，stderr=${JSON.stringify(allowed.stderr)}`)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // F4 回归（集成）：repo engines 不满足时必须判失败并输出要求与当前版本。
 test('F4 repo engines 不满足 → 返回 false 且输出要求', () => {
   const out = captureErrorOutput(() => {
@@ -343,14 +512,19 @@ test('F6 默认 load 以项目根为基准：scripts/ 下同名坏包不得影�
   }
 })
 
-// F5 回归：默认参数就是生产路径（run_tests.js 的 checkDependencies() 无参调用），此前
-// test_check_deps.js 每条用例都显式注入 resolve/load，默认分支零断言。本条在隔离树上走
-// 完全无参的调用：默认 manifest（ROOT/package.json）→ 默认 resolve/load（ROOT 基准）→ 静默通过。
-// 默认值任一被改坏（清单退回硬编码、基准漂移、误判版本）都会让 status/输出变红。
-test('F5 无参调用（默认 manifest/resolve/load）在隔离依赖树上静默通过', () => {
+// F5 回归（返工）：默认参数就是生产路径（run_tests.js 的 checkDependencies() 无参调用），此前
+// test_check_deps.js 每条用例都显式注入 resolve/load，默认分支零断言。上一版只断言「无参调用
+// status 0 且 stdout/stderr 为空」——但基线源码没有 require.main 守卫，直接执行只加载模块、什么
+// 都不检查，也恰好满足这两条（空跑假绿，独立验证 V3 实测在基线上仍绿）。
+// 返工后断言锚定「检查真的跑了」：每个依赖的 index.js 在被**加载**时往记账文件追加自己的名字，
+// 只有真正走完「默认 manifest → 默认 resolve/load（ROOT 基准）」的检查才会留下两条记账。
+// → 靶向移除 CLI 守卫（= 基线形态）或让清单退回硬编码，本条立刻红。
+test('F5 无参调用（默认 manifest/resolve/load）在隔离依赖树上真的完成检查且静默通过', () => {
+  const marker = path.join(os.tmpdir(), `check-deps-run-marker-${process.pid}-${Date.now()}.log`)
   const dir = makeCheckDepsSandbox({
     manifest: { name: 'sandbox', version: '1.0.0', dependencies: { 'xbk-default-path-a': '1.0.0' }, optionalDependencies: { 'xbk-default-path-b': '1.0.0' } },
-    deps: ['xbk-default-path-a', 'xbk-default-path-b']
+    deps: ['xbk-default-path-a', 'xbk-default-path-b'],
+    marker
   })
   try {
     const r = runCheckDepsSandbox(dir)
@@ -360,8 +534,19 @@ test('F5 无参调用（默认 manifest/resolve/load）在隔离依赖树上静�
     if (String(r.stdout) !== '' || String(r.stderr) !== '') {
       throw new Error(`成功路径应零输出，实际 stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`)
     }
+    // 关键的证伪锚点：默认路径真的加载了声明清单里的两个包（不检查就没有记账）
+    if (!fs.existsSync(marker)) {
+      throw new Error('默认参数的检查没有真正执行：依赖一次都没被加载（基线无 CLI 守卫时的空跑形态——silent exit 0 会被空跑满足）')
+    }
+    const ran = fs.readFileSync(marker, 'utf8')
+    for (const name of ['xbk-default-path-a', 'xbk-default-path-b']) {
+      if (!ran.includes(name)) {
+        throw new Error(`默认清单漏探了 ${name}（依赖漂移零覆盖）：实际记账=${JSON.stringify(ran)}`)
+      }
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+    fs.rmSync(marker, { force: true })
   }
 })
 

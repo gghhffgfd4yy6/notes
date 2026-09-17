@@ -6,7 +6,7 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
-const { readReportJson } = require('./mutation-json.js')
+const { readReportJson, resolveMaxReportBytes } = require('./mutation-json.js')
 
 // 必须与 mutation.yml 的矩阵名称保持一致；缺段时禁止把部分结果伪装成完整日报。
 const EXPECTED_SEGMENTS = Object.freeze([
@@ -25,13 +25,19 @@ const MUTANT_STATUSES = new Set([
 // F7：去重列表查询的整体超时（毫秒）——列表 API 只回答「当天是否已发过」，挂住不能拖死整个日报 job。
 const LIST_QUERY_TIMEOUT_MS = 15000
 
-// F1：新鲜度闸门阈值（缓存回填检测）。参考基准是「本批报告文件里最新的 mtime」：
+// F1：新鲜度闸门阈值（缓存回填检测）。修复前的参考基准只有「本批报告文件里最新的 mtime」：
 //   * 同一次 CI 运行内各段 matrix job 并行执行，单 job 默认上限 6h，正常产出的 mtime 跨度不可能超过 6h；
 //   * 段 job 崩溃/被 6h 取消时，actions/cache 恢复出来的上一次运行的 reports/mutation/mutation.json
 //     被原样带进 artifact——其 mtime 与当日其它段相差 ≥12h（日报每日一轮）。
 // 故默认 12h：远大于正常跨度、小于跨日缓存的陈旧跨度。可用 MUTATION_REPORT_MAX_SKEW_MS 覆盖
 // （单位毫秒；`off` 或 ≤0 关闭该闸门；无法解析的值回落到默认值，不静默关闭闸门）。
+// 返工（V4 打回）：只用「本批最新者」当基准会漏掉两种**回填同族**——全体回填（所有段 mtime 都很旧、
+// 互差≈0）与跨轮同日回填（<12h、互差≈0）。故该阈值同时用作「相对现在的年龄上限」，并另加一层
+// 以本轮 workflow 运行起点（MUTATION_RUN_STARTED_AT = github.run_started_at）为下界的判定。
 const DEFAULT_MAX_SKEW_MS = 12 * 60 * 60 * 1000
+
+// F1（返工）：本轮运行起点下界的容差——工件落盘/时钟分辨率的余量（CI 内各 job 同钟，无需大余量）。
+const RUN_START_SLACK_MS = 5 * 60 * 1000
 
 // 阈值解析是纯函数（不读环境变量 → 测试 hermetic）；调用点显式把环境变量传进来。
 function resolveMaxSkewMs (raw) {
@@ -42,35 +48,73 @@ function resolveMaxSkewMs (raw) {
   return n > 0 ? n : 0
 }
 
+// F1（返工）：解析本轮 workflow 的 run_started_at（mutation.yml 的 report 步骤注入
+// MUTATION_RUN_STARTED_AT: ${{ github.run_started_at }}）。无法解析/未提供 → undefined（跳过该层，
+// 不误红也不假绿；本地手工跑日报时该层自然不生效）。
+function resolveRunStartedAtMs (raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return undefined
+  const ms = Date.parse(String(raw).trim())
+  return Number.isFinite(ms) ? ms : undefined
+}
+
 /**
- * F1：陈旧（缓存回填）报告闸门。
+ * F1：陈旧（缓存回填）报告闸门（三层）。
  *
  * 「某段 stryker 崩溃/被取消 → artifact 里是上一次运行的 mutation.json」这一形态在**内容**上与正常
  * 报告无法区分（stryker 的 json reporter 不写任何时间戳，见 mutation-testing-report-schema 的顶层
  * properties：config/schemaVersion/files/testFiles/thresholds/projectRoot/performance/framework/system），
- * 因此只能看文件时间：与最新报告相差超过阈值即判为陈旧。
+ * 因此只能看文件时间。三层判据（任一层命中即拒绝发布）：
+ *   ① 跨段偏斜：与**本批最新报告**相差超过阈值 → 部分段回填（原有语义）；
+ *   ② 年龄上限：与**现在**相差超过阈值 → 全体回填（所有段互差≈0 时 ① 看不见）；
+ *   ③ 本轮起点下界：早于 run_started_at（减去容差）→ 同日跨轮回填（①②都看不见，例如全体 11h 前）。
  *
  * fail-open 边界（如实登记）：若 artifact 上传/下载不保留 mtime（各段 mtime 被归一为下载时间），
- * 本闸门不触发、也不会误红；该场景由 .github/workflows/mutation.yml 的「清理缓存回填的旧报告」步骤
- * 兜底——崩溃段根本没有 mutation.json，走「缺 mutation-report.json」分支拒绝发布。
+ * ①②③ 都不触发、也不会误红；该场景由 .github/workflows/mutation.yml 的「清理缓存回填的旧报告」步骤
+ * 兜底（该步骤已加 `if: always()` 并前置到缓存恢复之后，见 mutation.yml）——崩溃段根本没有
+ * mutation.json，走「缺 mutation-report.json」分支拒绝发布。
  *
  * @param {Array<{seg: string, error?: string, reportMtimeMs?: number}>} results 已分析的分段结果
- * @param {number} [maxSkewMs] 允许的最大时间跨度（≤0 关闭闸门）；缺省读 `MUTATION_REPORT_MAX_SKEW_MS`
+ * @param {number} [maxSkewMs] 允许的最大跨段跨度/年龄（≤0 关闭闸门）；缺省读 `MUTATION_REPORT_MAX_SKEW_MS`
+ * @param {number} [runStartedAtMs] 本轮运行起点（毫秒）；缺省读 `MUTATION_RUN_STARTED_AT`
  * @returns {Array<object>} 原始分段结果
  * @throws {Error} 存在明显陈旧的报告时抛出
  */
-function validateFreshness (results, maxSkewMs = resolveMaxSkewMs(process.env.MUTATION_REPORT_MAX_SKEW_MS)) {
+function validateFreshness (results, maxSkewMs = resolveMaxSkewMs(process.env.MUTATION_REPORT_MAX_SKEW_MS), runStartedAtMs = resolveRunStartedAtMs(process.env.MUTATION_RUN_STARTED_AT)) {
   if (!(maxSkewMs > 0)) return results
   const dated = results.filter(r => !r.error && Number.isFinite(r.reportMtimeMs))
-  if (dated.length < 2) return results // 无可比较对象（单段/全为 error）：交由 validateSegments 判定
-  const newest = dated.reduce((a, b) => (a.reportMtimeMs >= b.reportMtimeMs ? a : b))
-  const stale = dated.filter(r => newest.reportMtimeMs - r.reportMtimeMs > maxSkewMs)
-  if (stale.length === 0) return results
+  if (dated.length === 0) return results // 无可比较对象：交由 validateSegments 判定
   const hours = (ms) => Math.round((ms / 3600000) * 10) / 10
-  const detail = stale
-    .map(r => `${r.seg}（报告文件时间比最新报告早 ${hours(newest.reportMtimeMs - r.reportMtimeMs)} 小时）`)
-    .join('；')
-  throw new Error(`变异测试报告疑似缓存回填（陈旧）：${detail}；拒绝发布口径不符的日报`)
+  // ① 跨段偏斜（原有语义，先判以保留「比最新报告早 N 小时」的定位口径）
+  if (dated.length >= 2) {
+    const newest = dated.reduce((a, b) => (a.reportMtimeMs >= b.reportMtimeMs ? a : b))
+    const stale = dated.filter(r => newest.reportMtimeMs - r.reportMtimeMs > maxSkewMs)
+    if (stale.length > 0) {
+      const detail = stale
+        .map(r => `${r.seg}（报告文件时间比最新报告早 ${hours(newest.reportMtimeMs - r.reportMtimeMs)} 小时）`)
+        .join('；')
+      throw new Error(`变异测试报告疑似缓存回填（陈旧）：${detail}；拒绝发布口径不符的日报`)
+    }
+  }
+  // ② 年龄上限：全体回填时各段互差≈0，① 恒不命中；以 wall-clock 为基准的年龄才是判据
+  const now = Date.now()
+  const tooOld = dated.filter(r => now - r.reportMtimeMs > maxSkewMs)
+  if (tooOld.length > 0) {
+    const detail = tooOld
+      .map(r => `${r.seg}（报告文件时间距今 ${hours(now - r.reportMtimeMs)} 小时）`)
+      .join('；')
+    throw new Error(`变异测试报告疑似缓存回填（全体陈旧，超出本轮最大跨度 ${hours(maxSkewMs)} 小时）：${detail}；拒绝发布口径不符的日报`)
+  }
+  // ③ 本轮起点下界：本批产物必须产自本轮 workflow（同一次运行内 matrix job 必然晚于 run_started_at）
+  if (Number.isFinite(runStartedAtMs)) {
+    const beforeRun = dated.filter(r => r.reportMtimeMs < runStartedAtMs - RUN_START_SLACK_MS)
+    if (beforeRun.length > 0) {
+      const detail = beforeRun
+        .map(r => `${r.seg}（报告文件时间早于本轮运行起点 ${hours(runStartedAtMs - r.reportMtimeMs)} 小时）`)
+        .join('；')
+      throw new Error(`变异测试报告疑似缓存回填（早于本轮运行起点）：${detail}；拒绝发布口径不符的日报`)
+    }
+  }
+  return results
 }
 
 function analyze (dir) {
@@ -169,7 +213,10 @@ function analyzeSegment (dir, entry) {
   // 不抛 TypeError 逃出本函数（与上方注释「单段失败不中断整体」一致），也不把损坏报告伪装成
   // 0 变异体的正常段；错误补上报告路径便于定位。
   try {
-    const report = readReportJson(reportPath)
+    // F1（mutation-json 返工）：预读大小上限必须由**生产调用方**注入，否则护栏只在测试里成立
+    // （独立验证 V3：默认 8 PiB + 零生产调用方注入 ⇒ 该分支生产恒假）。默认 2 GiB 的生产策略值
+    // 由 resolveMaxReportBytes 给出，可用 XBK_MUTATION_REPORT_MAX_BYTES 覆盖。
+    const report = readReportJson(reportPath, { maxFileBytes: resolveMaxReportBytes(process.env.XBK_MUTATION_REPORT_MAX_BYTES) })
     if (!report || typeof report !== 'object') {
       throw new Error(`报告顶层结构非法（${report === null ? 'null' : typeof report}），无法读取 files`)
     }
@@ -470,4 +517,4 @@ if (require.main === module) {
 }
 
 // 导出供测试（不导出 main：依赖 CLI 副作用；postIssue 导出以便 mock fetch 测去重/错误处理逻辑）
-module.exports = { analyze, validateSegments, validateFreshness, resolveMaxSkewMs, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate, postIssue, EXPECTED_SEGMENTS }
+module.exports = { analyze, validateSegments, validateFreshness, resolveMaxSkewMs, resolveRunStartedAtMs, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate, postIssue, EXPECTED_SEGMENTS }
