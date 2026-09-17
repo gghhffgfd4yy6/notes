@@ -1,5 +1,16 @@
 'use strict'
 
+// 定时器毫秒上界（XL-02）：Node 的 setTimeout 上限是 2^31-1，超界会被静默降为 1ms
+// （TimeoutOverflowWarning）。毫秒配置一旦放大（如误填 1e12），「等一小时」就变成立即返回，
+// 常驻间隔语义反转、循环空转。三处 setTimeout 消费者（runBounded 超时、sleep、runLoop
+// 间隔）统一经此钳制；下界沿用既有的 0，非有限值回落到各自的历史默认（sleep 为 10000）。
+const MAX_TIMER_MS = 2147483647
+
+function clampTimerMs (ms, fallback = 10000) {
+  const value = Number.isFinite(ms) ? ms : fallback
+  return Math.min(MAX_TIMER_MS, Math.max(0, value))
+}
+
 function runBounded (task, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
     let timer // eslint-disable-line prefer-const -- 声明与赋值分离（setTimeout 回填），let 语义清晰
@@ -32,7 +43,7 @@ function runBounded (task, timeoutMs, signal) {
       const error = new Error(`常驻刷新超过 ${timeoutMs}ms 未完成`)
       error.code = 'INTERVAL_REFRESH_TIMEOUT'
       finish(reject, error)
-    }, timeoutMs)
+    }, clampTimerMs(timeoutMs))
     if (signal && typeof signal.addEventListener === 'function') {
       if (signal.aborted) return onAbort()
       signal.addEventListener('abort', onAbort, { once: true })
@@ -49,14 +60,19 @@ function runBounded (task, timeoutMs, signal) {
 // 引入单轮看门狗会改变推送结果语义（可能产生半推/重复推），属设计决策，已登记 defer。
 function sleep (ms, signal) {
   if (signal && signal.aborted) return Promise.resolve()
+  // XL-01：signal 原先只做真值判断——非 AbortSignal 的真值对象（如 {}）会让下面的
+  // addEventListener 抛 TypeError；定时器此刻已调度，回调里再调 removeEventListener 会
+  // 二次抛错，成为定时器回调中的未捕获异常并终止进程（runBounded 早有 typeof 守卫，
+  // 此处对齐）。守卫同时覆盖摘除侧，避免只堵一半。
+  const canListen = !!signal && typeof signal.addEventListener === 'function'
   return new Promise(resolve => {
-    const timer = setTimeout(done, Math.max(0, Number.isFinite(ms) ? ms : 10000))
+    const timer = setTimeout(done, clampTimerMs(ms))
     function done () {
       clearTimeout(timer)
-      if (signal) signal.removeEventListener('abort', done)
+      if (canListen && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', done)
       resolve()
     }
-    if (signal) signal.addEventListener('abort', done, { once: true })
+    if (canListen) signal.addEventListener('abort', done, { once: true })
   })
 }
 

@@ -52,6 +52,47 @@ const { runLoop, sleep } = require('./xbk_loop')
   assert.ok(defaultElapsed >= 40, `sleep(NaN) 应使用默认 10000ms 并在 50ms 后被 abort，实际 ${defaultElapsed}ms（若 <40ms 说明默认值未生效）`)
   assert.ok(defaultElapsed < 500, `sleep(NaN) 不应过度等待，实际 ${defaultElapsed}ms`)
 
+  // ===== XL-01 回归：非 AbortSignal 的真值 signal 不得抛错、更不得留下未捕获异常 =====
+  // 反例（改动前）：sleep(10, {}) 在 executor 里调 signal.addEventListener 抛 TypeError →
+  // Promise reject；而定时器已调度，10ms 后 done() 又调 signal.removeEventListener 二次抛错，
+  // 这次落在定时器回调里成为未捕获异常（uncaughtException）直接终止进程。
+  // 断言分两层：① await 不得 reject；② await 期间真实等到约 10ms（说明定时器正常走完，
+  // 反例里定时器回调抛错会让进程在 await 之后崩掉，即本套件整体变红）。
+  for (const bogus of [{}, { aborted: false }, 42, 'signal-string', { addEventListener: 1 }]) {
+    const tBogus = Date.now()
+    await sleep(10, bogus)
+    const bogusElapsed = Date.now() - tBogus
+    assert.ok(bogusElapsed >= 5, `非信号真值 ${JSON.stringify(bogus)} 应仍按毫秒正常等待，实际 ${bogusElapsed}ms`)
+  }
+
+  // ===== XL-02 回归：毫秒值超过 setTimeout 上限（2^31-1）必须钳制后再交给 Node =====
+  // 反例（改动前）：sleep(1e12) 把 1e12 原样交给 setTimeout，Node 静默降为 1ms——
+  // 「等一天」变成立即返回，常驻间隔语义反转。这里以 setTimeout 实参为观测点。
+  {
+    const realSetTimeout = global.setTimeout
+    const capturedMs = []
+    const pendingBounds = []
+    global.setTimeout = function (fn, ms, ...rest) {
+      capturedMs.push(ms)
+      return realSetTimeout(fn, ms, ...rest)
+    }
+    try {
+      for (const huge of [1e12, 2 ** 31, 2 ** 31 + 1, Number.MAX_SAFE_INTEGER]) {
+        const cUpper = new AbortController()
+        pendingBounds.push(sleep(huge, cUpper.signal))
+        cUpper.abort() // 立即取消，避免真的挂上 24.8 天的定时器
+      }
+    } finally {
+      global.setTimeout = realSetTimeout
+    }
+    await Promise.all(pendingBounds)
+    assert.deepStrictEqual(
+      capturedMs,
+      [2147483647, 2147483647, 2147483647, 2147483647],
+      `超上限毫秒值必须钳到 2^31-1 再交给 setTimeout，实际 ${JSON.stringify(capturedMs)}`
+    )
+  }
+
   // ===== runLoop：run 非函数返回 rejected Promise（async 函数）=====
   // timeout 保护：若守卫失效（如被变异删掉），runLoop 会进入无限循环挂死；
   // 用 Promise.race 确保 2s 内必须 reject，否则判定为挂死失败。
