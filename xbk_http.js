@@ -26,10 +26,18 @@ function parseJsonBody (text) {
   // 旧实现会归成 ERR_BODY_NOT_JSON（xbk_failure_policy 的 PERMANENT 集合）→ 常驻循环永久停推。
   // 这里先剥离 BOM 再解析；不带 BOM 的输入行为不变。
   const normalized = text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text
+  // XHTTP-05：空体（含剥离 BOM 后的空体、纯空白体）单列 ERR_EMPTY_BODY，并已显式列入
+  // xbk_failure_policy.RETRYABLE_CODES——上游「连上后未写体即结束」是典型瞬时故障，重试一次通常即可恢复；
+  // 旧实现把空体与「返回了内容但不是 JSON」共用一个码，而该码在 PERMANENT 集合里 → 一次瞬时空体即永久停推。
+  // 非空但非 JSON 仍是合约性错误（ERR_BODY_NOT_JSON，永久），两者语义分开、互不放松。
+  if (normalized.trim().length === 0) {
+    const err = new Error('Response is not JSON: empty body')
+    err.code = 'ERR_EMPTY_BODY'
+    throw err
+  }
   try { return JSON.parse(normalized) } catch {
-    // 不回显上游响应体内容（可能含密钥/业务数据），只报长度——避免经日志与告警外泄；
-    // 错误码保持 ERR_BODY_NOT_JSON，失败分类语义不变（区分空体需新增错误码并同步 xbk_failure_policy.js）。
-    const err = new Error('Response is not JSON: ' + (normalized.length === 0 ? 'empty body' : `body ${normalized.length} chars`))
+    // 不回显上游响应体内容（可能含密钥/业务数据），只报长度——避免经日志与告警外泄。
+    const err = new Error(`Response is not JSON: body ${normalized.length} chars`)
     err.code = 'ERR_BODY_NOT_JSON'
     throw err
   }
@@ -97,10 +105,12 @@ async function fetchJson (url, options = {}, maxBody = DEFAULT_MAX_BODY) {
       if (settled) return
       const endedAt = Date.now()
       const text = Buffer.concat(chunks).toString('utf8')
-      // 只把 4xx/5xx 判为 HTTP 错误。终态 3xx/304（followRedirect:false 或响应无 Location 时可达）落到
-      // 下面的 JSON 解析报 ERR_BODY_NOT_JSON：改成 >= 300 会把错误码变成 HTTP_3xx，而 xbk_failure_policy
-      // 未对 3xx 归类（现在按 PERMANENT 处理，改后落 UNKNOWN/retryable）——需先跨文件统一口径，故此处不动。
-      if (response && response.statusCode >= 400) {
+      // XHTTP-06：终态 3xx/304（followRedirect:false、响应无 Location、或 304 Not Modified 时可达）与
+      // 4xx/5xx 一样是 HTTP 层错误，必须带真实状态码抛出——旧实现只看 >= 400，3xx 落进 JSON 解析分支报
+      // ERR_BODY_NOT_JSON：错误码既误导，又让同一条 3xx 因响应体不同而落到两个码（空体走空体码、HTML 体
+      // 走非 JSON 码）。3xx 的失败归类已在 xbk_failure_policy.classifyOne 显式归为 permanent（确定性重定向，
+      // 重试同一 URL 结果不变），不再借 ERR_BODY_NOT_JSON 的永久语义，也不会落 UNKNOWN=可重试。
+      if (response && response.statusCode >= 300) {
         const err = new Error(`HTTP ${response.statusCode}`)
         err.code = `HTTP_${response.statusCode}`
         err.response = { statusCode: response.statusCode, body: text, headers: response.headers }

@@ -6,7 +6,13 @@
 const RETRYABLE_CODES = new Set([
   'ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EPIPE',
   'EHOSTUNREACH', 'ENETUNREACH', 'ENETRESET', 'EAI_AGAIN', 'ERR_SOCKET_CLOSED',
-  'ABORT_ERR', 'HTTP_408', 'HTTP_409', 'HTTP_425', 'HTTP_429'
+  'ABORT_ERR', 'HTTP_408', 'HTTP_409', 'HTTP_425', 'HTTP_429',
+  // XHTTP-05：空响应体（含剥离 BOM 后的空体、纯空白体）单列可重试码。上游「连上后未写体即结束」是
+  // 典型瞬时故障（网关/后端抖动），重试一次通常即可恢复；而「返回了内容但不是 JSON」是合约性错误
+  // （ERR_BODY_NOT_JSON，仍在 PERMANENT_CODES）。旧实现两者共用一个码 → 一次瞬时空体被判永久停推。
+  // 显式列进本集合（而不是留空让它落 UNKNOWN）是为了让口径可审计：归类理由即本码本身，
+  // 不依赖「未知默认保守重试」的兜底，避免日后有人收紧兜底时语义被静默翻转。
+  'ERR_EMPTY_BODY'
 ])
 
 const PERMANENT_CODES = new Set([
@@ -275,9 +281,18 @@ function classifyOne (error) {
   if (permanentMessage) {
     return { kind: 'permanent', reason: 'CONFIG_OR_CONTRACT', info }
   }
+  // XHTTP-06：终态 3xx 是**确定性**结果——got 默认跟随重定向，外层还能看到终态 3xx 只有三种可能：
+  // followRedirect:false、3xx 不带 Location、或 304 Not Modified；重试同一个 URL 仍会得到同一个 3xx，
+  // 故归 permanent（配置/契约类），与 4xx 同侧。此前它在四种承载字段（数字 code、providerCode、
+  // HTTP_ 前缀、statusCode）下都落 UNKNOWN → 可重试，而 HTTP 层把终态 3xx 归成 ERR_BODY_NOT_JSON（永久）
+  // ——同一状态码在「错误码字符串」与「statusCode」两条路径上分类相反。这里按区间统一，不逐条枚举
+  // （HTTP_300-399 共 100 项）。
   const numericCode = Number(code)
   if (code === '1001' || (Number.isInteger(numericCode) && isRetryableHttpStatus(numericCode))) {
     return { kind: 'retryable', reason: `PROVIDER_${code}`, info }
+  }
+  if (Number.isInteger(numericCode) && numericCode >= 300 && numericCode < 400) {
+    return { kind: 'permanent', reason: `PROVIDER_${code}`, info }
   }
   if (Number.isInteger(numericCode) && numericCode >= 400 && numericCode < 500) {
     return { kind: 'permanent', reason: `PROVIDER_${code}`, info }
@@ -289,6 +304,9 @@ function classifyOne (error) {
   if (Number.isInteger(providerNumber) && isRetryableHttpStatus(providerNumber)) {
     return { kind: 'retryable', reason: `PROVIDER_${providerNumber}`, info }
   }
+  if (Number.isInteger(providerNumber) && providerNumber >= 300 && providerNumber < 400) {
+    return { kind: 'permanent', reason: `PROVIDER_${providerNumber}`, info }
+  }
   if (Number.isInteger(providerNumber) && providerNumber >= 400 && providerNumber < 500) {
     return { kind: 'permanent', reason: `PROVIDER_${providerNumber}`, info }
   }
@@ -297,12 +315,14 @@ function classifyOne (error) {
     if (n === 408 || n === 409 || n === 425 || n === 429 || n >= 500) {
       return { kind: 'retryable', reason: code, info }
     }
+    if (n >= 300 && n < 400) return { kind: 'permanent', reason: code, info }
     if (n >= 400 && n < 500) return { kind: 'permanent', reason: code, info }
   }
   if (status !== null) {
     if (status === 408 || status === 409 || status === 425 || status === 429 || status >= 500) {
       return { kind: 'retryable', reason: `HTTP_${status}`, info }
     }
+    if (status >= 300 && status < 400) return { kind: 'permanent', reason: `HTTP_${status}`, info }
     if (status >= 400 && status < 500) return { kind: 'permanent', reason: `HTTP_${status}`, info }
   }
 

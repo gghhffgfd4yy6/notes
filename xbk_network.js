@@ -17,7 +17,8 @@ const DETERMINISTIC_LOCAL_CODES = new Set(['EBODYLIMIT'])
 //   * got 把数值 timeout 直接交给定时器，小数与超 2^31-1 的值会被 Node 归一到约 1ms（每次请求瞬间超时）；
 //   * 亚 100ms 的值几乎只可能来自「想写秒却按毫秒填」的单位误填（timeout:5 想表达 5 秒）——采用它等于
 //     每次请求必然超时，且现象是「请求超时」而非「配置有问题」，比回落默认值更糟；
-//   * 非整数不猜用户意图（不四舍五入/不向上取整），一律按非法配置处理。
+//   * 非整数不猜用户意图（不四舍五入/不向上取整），一律按非法配置处理；
+//   * 整数但越上界（1e12、2147483648…）钳到 2^31-1 并**告警留痕**（不静默）——钳制值语义不变。
 const MIN_TIMEOUT_MS = 100
 const MAX_TIMEOUT_MS = 2147483647
 const DEFAULT_TIMEOUT_MS = 5000
@@ -26,17 +27,45 @@ const DEFAULT_TIMEOUT_MS = 5000
 // fetchData 挂死；30s 也足以覆盖限流窗口内的常规 Retry-After。
 const RETRY_BACKOFF_CAP_MS = 30000
 
-// net-7：解析 Retry-After（RFC 9110：delta-seconds 非负整数，或 HTTP-date）→ 毫秒。
-// 只认这两种合法形态，其余（空串、'1.5'、'-5'、非日期文本）返回 null 交由指数退避兜底——
+// net-7：Retry-After 只认 RFC 9110 §10.2.1 明列的三种 HTTP-date 形态（诚实实现 MUST 接受全部三种）：
+//   IMF-fixdate   Sun, 06 Nov 1994 08:49:37 GMT
+//   rfc850-date   Sunday, 06-Nov-94 08:49:37 GMT        （obs-date）
+//   asctime-date  Sun Nov  6 08:49:37 1994              （obs-date）
+// 先把形态卡死再用 Date.parse 取值：Date.parse 的接受面太大（'5 Oct'、ISO-8601 '2026-09-17T00:00:00Z'
+// 都能解析），它们被当成「已过期」钳成 0 后，日志会输出「0s 后重试（按 Retry-After）」——谎报来源，
+// 而修前这些输入走指数退避 1s。故非上述形态一律 null，回落指数退避，不做宽松猜测。
+const IMF_FIXDATE_RE = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/
+const RFC850_DATE_RE = /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2} \d{2}:\d{2}:\d{2} GMT$/
+const ASCTIME_DATE_RE = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/
+// delta-seconds（RFC 9110 的 1*DIGIT）上界：超过 2^31-1 秒（≈68 年）不可能是真实回访时刻，
+// 按非法形态处理（Number 为 Infinity 的数字串同理），不把垃圾头当有效来源。
+const MAX_DELTA_SECONDS = 2147483647
+
+// net-7：解析 Retry-After（RFC 9110：delta-seconds 非负整数，或上述三种 HTTP-date）→ 毫秒。
+// 只认这两种合法形态，其余（空串、'1.5'、'-5'、非日期文本、ISO-8601）返回 null 交由指数退避兜底——
 // 不做宽松猜测，避免把笔误当成等待时长。HTTP-date 已过期 → 0（立即重试，语义同 RFC）。
 function parseRetryAfterMs (value, now = Date.now()) {
   if (value === undefined || value === null) return null
   const raw = String(value).trim()
   if (raw === '') return null
-  if (/^[0-9]+$/.test(raw)) return Number(raw) * 1000
-  if (!/[A-Za-z]/.test(raw)) return null // delta-seconds 之外的数字/符号形态（-5、1.5、+3）一律非法
-  const at = Date.parse(raw)
+  if (/^[0-9]+$/.test(raw)) {
+    const seconds = Number(raw)
+    if (!Number.isFinite(seconds) || seconds > MAX_DELTA_SECONDS) return null
+    return seconds * 1000
+  }
+  if (!IMF_FIXDATE_RE.test(raw) && !RFC850_DATE_RE.test(raw) && !ASCTIME_DATE_RE.test(raw)) return null
+  // asctime-date 无时区标记，Date.parse 会按**本地时区**解释（实测 UTC+8 下同一串差 8 小时）；
+  // RFC 9110 规定 HTTP-date 一律 GMT，故显式补 GMT 再解析，避免把服务端给出的回访时刻按本地时区算错。
+  const asctime = ASCTIME_DATE_RE.test(raw)
+  const at = Date.parse(asctime ? raw + ' GMT' : raw)
   if (!Number.isFinite(at)) return null
+  // 星期与日期必须一致（RFC 9110 的 HTTP-date 里 day-name 由日期导出）：
+  // IMF-fixdate / asctime 都是 4 位年、无歧义，交叉校验；rfc850 的 2 位年由引擎按 ECMAScript 的
+  // 50 年切点解释（yy=50..76 与 RFC 9110 的「不超 50 年未来」规则不同），不做交叉校验以免误拒。
+  if (!RFC850_DATE_RE.test(raw)) {
+    const actualName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(at).getUTCDay()]
+    if (raw.slice(0, 3) !== actualName) return null
+  }
   return Math.max(0, at - now)
 }
 
@@ -66,7 +95,15 @@ function createNetwork ({
   // 保持原语义不告警）；注入的 logger 未提供 warn 时退化为不告警（不得因此抛错）。
   const resolveTimeoutMs = () => {
     const n = Utils.num(Config.api.timeout, DEFAULT_TIMEOUT_MS)
-    if (Number.isInteger(n) && n >= MIN_TIMEOUT_MS) return Math.min(n, MAX_TIMEOUT_MS)
+    if (Number.isInteger(n) && n >= MIN_TIMEOUT_MS) {
+      // net-3 残留（V4 提示）：越上界的整数（1e12、2147483648…）此前是**静默钳制**——值与日志都看不出
+      // 「配置写了不可能生效的值」。这里只补告警留痕，钳制语义零变更（仍钳到 MAX_TIMEOUT_MS）。
+      // 文案与「已回落默认」区分：调用方与测试可据文案判断是钳制还是回落。
+      if (n > MAX_TIMEOUT_MS && typeof logger.warn === 'function') {
+        logger.warn(`[xbk_network] api.timeout=${String(Config.api.timeout)} 超过上界 ${MAX_TIMEOUT_MS}ms，已钳制到 ${MAX_TIMEOUT_MS}ms`)
+      }
+      return Math.min(n, MAX_TIMEOUT_MS)
+    }
     if (typeof logger.warn === 'function') {
       logger.warn(`[xbk_network] api.timeout=${String(Config.api.timeout)} 非法（须为 ≥${MIN_TIMEOUT_MS}ms 的整数），已回落默认 ${DEFAULT_TIMEOUT_MS}ms`)
     }
@@ -82,8 +119,12 @@ function createNetwork ({
       // v3.223：延迟加载推送模块（含 got）——与接口请求并行，主流程不必先等模块加载完成
       getNotify().catch(() => { /* 加载失败由推送阶段真实报错，这里不阻塞接口 */ })
       // 线报接口 DNS 预热：与真实请求共用 xbk_agents.dnsLookup 缓存，提前启动解析、不阻塞请求启动。
-      // 注意（net-2）：dnsLookup 的缓存/pending key 含 host|family|hints|all|verbatim，本预热未传
-      // options，仅当 XBK_DNS_FAMILY=4/6（强制 family）时才与真实请求同 key；默认配置下两者不合并。
+      // 注意（net-2，AGENTS-01 后订正）：缓存/pending key 只含 hostname|family（xbk_agents.js:dnsCacheKey），
+      // hints/all/verbatim 已不再进 key——hints/verbatim 只影响地址过滤与排序、不改变地址集合，all 只决定
+      // 回调形状（由 dispatchLookupResult 适配）。本预热未传 options 时 family=0、XBK_DNS_FAMILY=4/6 时为
+      // 4/6；真实请求的 family 同源（baseRequestOptions 的 dnsLookupIpVersion 同样只由 XBK_DNS_FAMILY 决定，
+      // got 把它写进 requestOptions.family），故三种模式下预热与真实请求的 key 一致，预热条目可被真实请求
+      // 命中。旧的「key 含 host|family|hints|all|verbatim、默认配置下两者不合并」口径已随 AGENTS-01 作废。
       // net-6：本预热未接 AbortSignal（prewarmDns 的 signal 参数走不到），因此无法被取消。
       try {
         const apiHost = new URL(Config.api.pushUrl).hostname
