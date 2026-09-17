@@ -66,6 +66,7 @@
 - 清洗链按 HTML5 词法状态判定（`xbk_utils._htmlTagSpans`）：只在 `<` 后紧跟字母、`/`、`!` 或 `?` 时才开启标签区间——此前未配对的 `<`（`1 < 2`、`价格 <100 元`）会把区间一直延伸到串尾，把后方纯文本里的 `name="…"` 误判成「标签内属性」；同时增记 `valueQuotes`（正扫时处于引号外状态遇到的引号位置），只有真正开启属性值的引号才允许整段占位，杂散引号拼出的伪属性对不再屏蔽其后的 `on*` 事件属性（安全缺口）。
 - 属性值引号只在 `=` 之后定界（`xbk_formatter._quotedAttrSpans`，与 `_readTagAttrValue` 同口径）：未加引号的属性值里的撇号（`<img alt=it's>`）不再被当成引号起点、吞掉其后的 `<a>`/`<h1>`；`=` 之后（可含空白）的引号仍是属性值区间。
 - 清洗链内部正则 RE2 兼容：href/src、`_cleanNavAttrs`、`_cleanSrcsetAttrs`、`_cleanStyleAttrs` 四处含反向引用（`\1`/`\2`）的成对引号正则改写为「双引号支 | 单引号支」等价形态（href/src 一并改经 `safeRe` 编译），`sanitizeSurrogates` 去掉 lookaround——此前这些内部模式在 RE2 下不被支持，清洗会在启用 re2 的部署上降级。
+- `safeRe` 回落留痕：`new RE2(...)` 编译失败回落原生 `RegExp` 时按**进程一次**告警（模式串与失败原因都经既有 `summarizeError` 脱敏/截断）——此前该分支是空 `catch`，「RE2 静默降级」与「线性防护对该模式不成立」这件事在日志里没有任何痕迹。同一进程只报一次（热路径内部正则都过 `safeRe`，逐条打印会刷屏）。
 - ReDoS 防护 `hasNestedQuantifier`：取反字符类 `[^...]` 改为扫描到未转义的类结束符（此前只判 `^` 后一个字符，类体被当普通模式解析——`[^(a+)+]x` 被误拦、`(x[^)]+)+` 因 `)` 被吞进类体而漏检；`[^]` 非空字符类语义不变）。
 - 出口清洗时序：一言文本拼接后再补一次出口清洗，消除「清洗作用于 append 之前、`contentType` 判定作用于 append 之后」的不同步——此前 slim 追加的一段一言 HTML 未经清洗即出网。
 - 推送出口响应体上限：slim 的 `$.post`/`$.get` 补 20MB 流式响应体上限（复用 `xbk_http.DEFAULT_MAX_BODY`：官方 got 走流式限长读取、超限报 `EBODYLIMIT` 并销毁流，无 `stream` 的 got 替身仍走原 promise 路径），此前会把整段响应体读进内存。
