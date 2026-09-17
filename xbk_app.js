@@ -92,13 +92,16 @@ function createApp ({
         const lockPath = logPath + '.lock'
         let lockFd = -1
         try {
-        // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠 mtime 超龄抢占
+        // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠「mtime 超龄
+        // 且持有进程已退出」抢占（APP-02：写入 pid:starttime 令牌供存活复核与 PID 复用判别）
           const LOCK_STALE_MS = 10000
           const lockDeadline = Date.now() + 3000
           for (;;) {
             try {
               lockFd = fs.openSync(lockPath, 'wx')
-              try { fs.writeSync(lockFd, `${process.pid}\n`) } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
+              try {
+                fs.writeSync(lockFd, `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`)
+              } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
               break
             } catch (e) {
               if (e.code !== 'EEXIST') break // 权限等异常：拿不到锁也继续（fail-open，只追加）
@@ -107,7 +110,10 @@ function createApp ({
                 const ls = fs.statSync(lockPath)
                 stale = Date.now() - ls.mtimeMs > LOCK_STALE_MS
               } catch (e2) { stale = true } // 锁文件刚被释放/删除：当作空位重试
-              if (stale) {
+              // APP-02：mtime 超龄只说明「可能陈旧」，还须持有进程已确认退出才可回收（与 RE2 锁同口径）。
+              // 进程仍存活（如被暂停 >10s）时绝不抢占——否则双进程同时进入临界区，截尾读改写会冲掉
+              // 并发追加的行；此时按拿不到锁处理（fail-open，仅追加不截尾）。
+              if (stale && !MessageStore._isTombstoneLockProcessAlive(lockPath)) {
                 try { fs.unlinkSync(lockPath) } catch (e2) { /* 抢占失败则下一轮重试 */ }
                 continue
               }
@@ -704,28 +710,75 @@ function createApp ({
       }
     },
 
+    /** 通道健康状态锁：O_EXCL 独占创建，陈旧判定与 run.log / RE2 锁同口径——mtime 超龄且持有
+     *  进程已确认退出（含损坏/无主锁）才回收，进程仍存活（如被暂停 >10s）绝不抢占（APP-02；
+     *  锁内写入 pid:starttime 令牌供存活复核与 PID 复用判别）。返回 lockFd，-1 表示本轮未取得。 */
+    _tryAcquireChannelHealthLock (lockPath) {
+      const writeToken = (fd) => {
+        try {
+          fs.writeSync(fd, `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`)
+        } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
+      }
+      try {
+        const fd = fs.openSync(lockPath, 'wx')
+        writeToken(fd)
+        return fd
+      } catch (e) {
+        if (!e || e.code !== 'EEXIST') return -1
+        let stale = false
+        try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 10000 } catch (e2) { stale = true }
+        if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return -1
+        try { fs.unlinkSync(lockPath) } catch (e2) { return -1 } // 竞争者已接管/无权限，按跳过处理
+        try {
+          const fd = fs.openSync(lockPath, 'wx')
+          writeToken(fd)
+          return fd
+        } catch (e2) { return -1 }
+      }
+    },
+
+    _releaseChannelHealthLock (lockPath, lockFd) {
+      if (typeof lockFd === 'number' && lockFd >= 0) {
+        try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
+        try { fs.unlinkSync(lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
+      }
+    },
+
+    /** 恢复告警确认送达后清零该通道健康状态（重新加锁读改写；APP2-02）。加锁失败或状态不可读时
+     *  保持 pending 不动，下一轮仍会重发恢复告警。 */
+    _clearChannelRecoverPending (statePath, channel) {
+      const lockPath = statePath + '.lock'
+      const lockFd = this._tryAcquireChannelHealthLock(lockPath)
+      if (lockFd < 0) return
+      try {
+        const stateResult = this._readSafeState(statePath)
+        if (stateResult.status !== 'ok') return
+        let state
+        try { state = JSON.parse(stateResult.text) } catch (e) { return }
+        if (!state || typeof state !== 'object' || Array.isArray(state)) return
+        const entry = state[channel]
+        if (!entry || typeof entry !== 'object' || entry.recoverAlertPending !== true) return
+        state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: Date.now() }
+        this._writeState(statePath, state)
+      } catch (e) { /* 清零失败：保留 pending，下一轮重发 */ } finally {
+        this._releaseChannelHealthLock(lockPath, lockFd)
+      }
+    },
+
     async _updateChannelHealth (outcome) {
       let lockFd = -1
       let lockPath = ''
+      let statePath = ''
+      const pendingAlerts = []
       try {
         if (!this._enabledFlag(Config.channelHealth)) return
-        const statePath = path.join(MessageStore.cacheDir, 'channel-health.state')
+        statePath = path.join(MessageStore.cacheDir, 'channel-health.state')
         lockPath = statePath + '.lock'
-        try {
-          lockFd = fs.openSync(lockPath, 'wx')
-        } catch (e) {
-          let stale = false
-          if (e && e.code === 'EEXIST') {
-            try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 10000 } catch (e2) { stale = true }
-          }
-          if (stale) {
-            try { fs.unlinkSync(lockPath); lockFd = fs.openSync(lockPath, 'wx') } catch (e2) { /* 竞争者已接管，按跳过处理 */ }
-          }
-          if (lockFd < 0) {
-          // 单实例仍可能因手工重复启动/重叠 cron 短暂重入；宁可本轮跳过健康观测，也不能覆盖另一轮状态。
-            console.warn(`通道健康状态正由另一轮更新，跳过本轮健康更新 ${statePath}`)
-            return
-          }
+        lockFd = this._tryAcquireChannelHealthLock(lockPath)
+        if (lockFd < 0) {
+        // 单实例仍可能因手工重复启动/重叠 cron 短暂重入；宁可本轮跳过健康观测，也不能覆盖另一轮状态。
+          console.warn(`通道健康状态正由另一轮更新，跳过本轮健康更新 ${statePath}`)
+          return
         }
         const stateResult = this._readSafeState(statePath)
         if (stateResult.status !== 'ok' && stateResult.status !== 'missing') {
@@ -785,30 +838,27 @@ function createApp ({
           if (alertDue) alerts.push({ type: 'failed', channel, count, failure })
         }
         if (!this._writeState(statePath, state)) return
-        for (const alert of alerts) {
-          try {
-            const text = alert.type === 'recovered' ? '✅ xbk-push 通道恢复' : '⚠️ xbk-push 通道异常'
-            const desp = alert.type === 'recovered'
-              ? `通道：${alert.channel}\n\n已恢复正常推送。`
-              : `通道：${alert.channel}\n\n连续失败：${alert.count} 次\n\n原因：${Utils.safeErrorText(alert.failure && alert.failure.message, '未知错误').slice(0, 300)}`
-            await Pusher.send(text, desp)
-            // APP2-01：失败告警的 lastAlertAt 已在排入告警时落盘（按尝试计时），此处不再回填，
-            // 避免发送成功与否改变限频口径。
-            // APP2-02：恢复通知确认送达后才清零计数并落盘；发送失败走 catch，保留 pending 供下轮重发。
-            if (alert.type === 'recovered' && state[alert.channel] && state[alert.channel].recoverAlertPending) {
-              state[alert.channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: Date.now() }
-              this._writeState(statePath, state)
-            }
-          } catch (e) { /* 健康告警失败不得影响主推送、缓存或下一次重试 */ }
-        }
+        for (const alert of alerts) pendingAlerts.push(alert)
       } catch (e) {
       // APP2-06：「仅作观测」不等于隐身——整体异常留一行 WARN，避免通道健康状态永久不更新却一切「正常」。
         try { this._writeRunLog(`${this._localStamp()} WARN 通道健康更新异常: ${Utils.safeErrorText(e, '未知错误').replace(/[\r\n]+/g, ' ')}\n`) } catch (logError) { /* 留痕失败静默 */ }
       } finally {
-        if (typeof lockFd === 'number' && lockFd >= 0) {
-          try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
-          try { fs.unlinkSync(lockPath) } catch (e) { /* 忽略 */ }
-        }
+        this._releaseChannelHealthLock(lockPath, lockFd)
+      }
+      // APP-02：告警发送（网络 await，可能长阻塞）必须在跨进程锁之外——否则发送期间其他轮次
+      // 全部被锁挡在门外并跳过本轮健康更新（原实现把 await Pusher.send 放在持锁临界区内）。
+      for (const alert of pendingAlerts) {
+        try {
+          const text = alert.type === 'recovered' ? '✅ xbk-push 通道恢复' : '⚠️ xbk-push 通道异常'
+          const desp = alert.type === 'recovered'
+            ? `通道：${alert.channel}\n\n已恢复正常推送。`
+            : `通道：${alert.channel}\n\n连续失败：${alert.count} 次\n\n原因：${Utils.safeErrorText(alert.failure && alert.failure.message, '未知错误').slice(0, 300)}`
+          await Pusher.send(text, desp)
+          // APP2-01：失败告警的 lastAlertAt 已在排入告警时落盘（按尝试计时），此处不再回填，
+          // 避免发送成功与否改变限频口径。
+          // APP2-02：恢复通知确认送达后才清零计数并落盘；发送失败走 catch，保留 pending 供下轮重发。
+          if (alert.type === 'recovered') this._clearChannelRecoverPending(statePath, alert.channel)
+        } catch (e) { /* 健康告警失败不得影响主推送、缓存或下一次重试 */ }
       }
     },
 
