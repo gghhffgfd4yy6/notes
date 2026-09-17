@@ -58,6 +58,31 @@ require.cache[gotPath] = { id: gotPath, filename: gotPath, loaded: true, exports
 
   console.log('✅ TLS 预热 count 边界钳制（NaN/Infinity/非数字 → 1）')
 
+  // ===== AGENTS-03 上界：超大 count 必须钳到上界，而不是抛 RangeError（更不能真开海量连接）=====
+  // 旧行为（改动前）：守卫只排除了非有限值，1e10 / 2^32 原样传给 Array.from({ length }) →
+  //   RangeError: Invalid array length，prewarmTls 整体 reject（调用方按 ok/okCount 取值，
+  //   异常会变成未处理的 rejection）。
+  for (const huge of [1e10, 4294967296, Number.MAX_SAFE_INTEGER]) {
+    let hugeError = null
+    let hugeResult = null
+    try {
+      hugeResult = await prewarmTls('tls-probe.invalid', 100, huge)
+    } catch (error) {
+      hugeError = error
+    }
+    assert.strictEqual(hugeError, null, `count=${huge} 不应抛 RangeError（应钳到上界后再建连）`)
+    assert.strictEqual(hugeResult && hugeResult.count, 64, `count=${huge} 应钳到上界 64`)
+    assert.strictEqual(hugeResult && hugeResult.okCount, 64, `count=${huge} 应实际完成 64 条连接`)
+    assert.strictEqual(hugeResult && hugeResult.perConnectionMs.length, 64, `count=${huge} 只应有 64 条连接耗时`)
+  }
+  // 反向断言：上界不能顺手收紧既有合法用途（仓内调用方 window ≤10、qinglong ≤3）
+  const exactUpper = await prewarmTls('tls-probe.invalid', 100, 64)
+  assert.strictEqual(exactUpper.count, 64, 'count=64 恰为上界时应原样采用（边界取闭区间）')
+  const withinWindow = await prewarmTls('tls-probe.invalid', 100, 10)
+  assert.strictEqual(withinWindow.count, 10, '仓内调用方的 count=10 不得被上界影响')
+  assert.strictEqual(withinWindow.okCount, 10, 'count=10 应实际完成 10 条连接')
+  console.log('✅ TLS 预热 count 上界钳制（1e10/2^32/MAX_SAFE_INTEGER → 64，且不收紧 ≤64 的合法值）')
+
   // ===== AGENTS-06：GET 回退被 abort 的 cancelled 分支 —— 可执行覆盖 + 公开契约特征化 =====
   // xbk_agents.js:193（外层 catch 的 GET 回退分支里新增的 signal.aborted 判断）只在下面这种时序被走到：
   // HEAD 抛错（进入外层 catch）时 signal 尚未 abort（:186 为假），随后 GET 回退期间才 abort 并抛错
