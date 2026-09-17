@@ -113,6 +113,9 @@ function prewarmDns (hostname, signal = null) {
   const options = DNS_LOOKUP_IP_VERSION === 'ipv4' ? { family: 4 } : DNS_LOOKUP_IP_VERSION === 'ipv6' ? { family: 6 } : {}
   const started = Date.now()
   const makeResult = (error, address, family) => ({
+    // AGENTS-07：预热结果带显式任务类型，调用方可按字段区分 DNS/TLS（两者都带 hostname），
+    // 不必靠每个调用点手工绑定 kind（qinglong/xbk_push.js 目前就是手工绑的）。
+    kind: 'dns',
     hostname,
     ok: !error,
     error: error ? error.code || error.message || String(error) : '',
@@ -176,11 +179,12 @@ const MAX_PREWARM_TLS_CONNECTIONS = 64
 
 async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null) {
   const started = Date.now()
-  if (signal && signal.aborted) return { hostname, count, skipped: true, cancelled: true, ok: false, okCount: 0, elapsedMs: 0 }
+  // AGENTS-07：所有出口都带 kind，调用方可按字段区分 DNS/TLS（两条预热路径的返回值都带 hostname）
+  if (signal && signal.aborted) return { kind: 'tls', hostname, count, skipped: true, cancelled: true, ok: false, okCount: 0, elapsedMs: 0 }
   try {
     // got 替身可能不提供 stream（真实 got 恒有；与 xbk_http.js 的 mock 判定同款）：无法建连时跳过并
     // 以 skipped:true 标记，ok 沿用既有 skipped→ok 约定（见 xbk_app.js 预热取消分支），未改语义。
-    if (!got.stream) return { hostname, count, skipped: true, ok: true, elapsedMs: Date.now() - started }
+    if (!got.stream) return { kind: 'tls', hostname, count, skipped: true, ok: true, elapsedMs: Date.now() - started }
   } catch (e) { /* 忽略 */ }
   // AGENTS-05（已知缺口，未改行为）：本 HEAD→GET 回退只为建连、但 await 会读完整个响应体，而这里没有
   // 体量上限——got@11 无 maxResponseSize 选项，xbk_http.js 的 20MB 上限只覆盖 fetchJson。补上限需要
@@ -234,9 +238,11 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
       }
     }
   }))
-  // AGENTS-07（已知形状缺陷，未改）：返回值同样带 hostname，调用方按字段无法区分 DNS/TLS（qinglong/
-  // xbk_push.js 已在任务侧显式绑定 kind）。增减字段属跨文件口径决策，故仅记录，不改返回形状。
+  // AGENTS-07：返回值带显式 kind（与 prewarmDns 的 kind:'dns' 对称）——此前 DNS/TLS 两条预热结果都只
+  // 带 hostname，调用方无法按字段区分，常驻日志会把 TLS 计入 DNS 计数（qinglong 侧已改为任务显式绑
+  // kind；现在接口本身也可区分）。纯新增字段，既有调用方读 ok/okCount/count/elapsedMs 不受影响。
   return {
+    kind: 'tls',
     hostname,
     count: results.length,
     ok: results.every(r => r.ok),

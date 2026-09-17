@@ -141,9 +141,12 @@ require.cache[gotPath] = { id: gotPath, filename: gotPath, loaded: true, exports
   const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
   assert.deepStrictEqual(
     Object.keys(cancelledAgg).sort(byCodeUnit),
-    ['count', 'elapsedMs', 'hostname', 'ok', 'okCount', 'perConnectionMs'],
-    'aggregate 公开形状（AGENTS-07 记录）：若新增 cancelled/error 等字段（即修 AGENTS-06），必须同步更新本测试'
+    ['count', 'elapsedMs', 'hostname', 'kind', 'ok', 'okCount', 'perConnectionMs'],
+    'aggregate 公开形状（AGENTS-07 已补 kind）：若新增 cancelled/error 等字段（即修 AGENTS-06），必须同步更新本测试'
   )
+  // AGENTS-07：aggregate 必须带显式任务类型 kind:'tls'（调用方按字段即可区分 DNS/TLS 预热结果）
+  assert.strictEqual(cancelledAgg.kind, 'tls', 'aggregate 应带 kind=tls（AGENTS-07）')
+  assert.strictEqual(erroredAgg.kind, 'tls', 'aggregate 应带 kind=tls（AGENTS-07）')
   assert.deepStrictEqual(Object.keys(erroredAgg).sort(byCodeUnit), Object.keys(cancelledAgg).sort(byCodeUnit), 'cancelled 分支与 error 分支的公开结果键集应一致')
   assert.strictEqual(cancelledAgg.ok, erroredAgg.ok, 'cancelled 分支与 error 分支的 ok 应一致')
   assert.strictEqual(cancelledAgg.okCount, erroredAgg.okCount, 'cancelled 分支与 error 分支的 okCount 应一致')

@@ -175,6 +175,9 @@ dns.lookup = (hostname, options, callback) => {
   // 场景 1：正常解析 → 返回 ok=true
   const prewarmResult = await prewarmDns('localhost')
   assert.strictEqual(prewarmResult.hostname, 'localhost', '应返回 hostname')
+  // AGENTS-07：DNS 预热结果带 kind:'dns'，与 prewarmTls 的 kind:'tls' 对称（两者都带 hostname，
+  // 此前调用方无法按字段区分）——去掉该字段本断言即红。
+  assert.strictEqual(prewarmResult.kind, 'dns', 'DNS 预热结果应带 kind=dns（AGENTS-07）')
   assert.ok(typeof prewarmResult.ok === 'boolean', 'ok 应为布尔值')
   assert.ok(typeof prewarmResult.elapsedMs === 'number', 'elapsedMs 应为数字')
 
