@@ -96,10 +96,13 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
       if (args[0] === 'run' && args[1] === 'rebuild') re2Ready = true
       return { status: 0 }
     },
-    env: { XBK_AUTO_INSTALL_DEPS: '1' }
+    env: { XBK_AUTO_INSTALL_DEPS: '1' },
+    // QX-04：恢复命令按「仓库根是否有 package-lock.json」选择 ci/install。这里显式注入，
+    // 使断言不依赖跑测试时工作区是否存在锁文件（变异沙箱不复制 package-lock.json）。
+    lockExists: () => true
   })
   assert.strictEqual(commands.length, 2, '缺模块或 ABI 不匹配时，自动恢复应先安装依赖，再构建 re2 原生模块')
-  assert.strictEqual(commands[0][1][0], 'install')
+  assert.strictEqual(commands[0][1][0], 'ci', '有 package-lock.json 时恢复必须用冻结安装 npm ci（QX-04）')
   assert.deepStrictEqual(commands[1][1].slice(0, 3), ['run', 'rebuild', '--prefix'])
 
   const gotOnlyCommands = []
@@ -115,13 +118,14 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
     },
     spawnSyncFn: (cmd, args) => {
       gotOnlyCommands.push([cmd, args])
-      if (args[0] === 'install') gotReady = true
+      if (args[0] === 'ci') gotReady = true
       return { status: 0 }
     },
-    env: { XBK_AUTO_INSTALL_DEPS: '1' }
+    env: { XBK_AUTO_INSTALL_DEPS: '1' },
+    lockExists: () => true
   })
   assert.strictEqual(gotOnlyCommands.length, 1, '仅 got 缺失且 re2 可用时不得触发无关的 re2 构建')
-  assert.strictEqual(gotOnlyCommands[0][1][0], 'install')
+  assert.strictEqual(gotOnlyCommands[0][1][0], 'ci', '有 package-lock.json 时恢复必须用冻结安装 npm ci（QX-04）')
   console.log('✅ 青龙入口：re2 缺失会阻止启动，自动恢复按实际失败依赖构建并复检')
 
   // XL-04（xbk_loop.js:71-73）：未传 onError 时默认处理器必须每轮打印一行诊断日志且不中断循环。
