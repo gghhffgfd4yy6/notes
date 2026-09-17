@@ -538,4 +538,90 @@ check('F7: 超长名截断必须保持单射（仅第 200 字节后不同的两�
   assert.strictEqual(longNameStore.getFilePath(a), pa, '同一名字必须稳定映射到同一路径（缓存名要能跨轮复用）')
 })
 
+// ===== F-02（B8 回归；V6 实锤漏推方向）=====
+// 反例：_identityIndex 的 O(1) 失效检查只看「引用 / 长度 / 首元素引用」，调用方**原地改写非首元素**
+// （换元素或改 id/url 字段）不会触发重建，旧索引把已不存在的身份判为「已存在」→ has() 返回 true
+// → 主流程跳过推送（漏推，与 SYSTEM_CONTRACT「宁可多推」相反）。这里用真实 Utils + 假 fs +
+// 内存权威数组做单元级 oracle 对拍（oracle = _indexHasIdentityDirect 零索引线性扫描）。
+const identityStore = createMessageStore({
+  Config: { cache: { maxSize: 10000 } },
+  Utils: createUtils({ fs: require('node:fs'), safeRe: (p, f) => new RegExp(p, f) }),
+  fs: makeCacheFs({ [FAKE_ROOT]: 'dir' }),
+  path,
+  crypto: { randomUUID: () => 'uuid' },
+  normalize: () => {},
+  storage: {
+    readSafeTextResult: () => ({ status: 'missing' }), // 墓碑文件按「确认缺失」处理
+    writeAtomic: () => true,
+    writeAtomicIfAbsent: () => true
+  },
+  constants: {
+    DEFAULT_MAX_SIZE: 10000,
+    MESSAGE_CACHE_MAX_BYTES: 8388608,
+    TOMBSTONE_MAX_KEYS: 5000,
+    TOMBSTONE_MAX_BYTES: 262144,
+    TOMBSTONE_LOCK_STALE_MS: 10000
+  }
+})
+
+function seedIdentityProbe (messages, name) {
+  // 必须经 getFilePath 求路径：has(message, filename) 内部同样先 getFilePath(filename)，
+  // 直接塞绝对路径会让两次路径不一致、内存权威数组命不中。
+  const fp = identityStore.getFilePath(name)
+  identityStore._memoryCache[fp] = messages
+  identityStore._memoCount += 1
+  identityStore._verified.add(fp) // 跳过「内存命中未验证」的真实磁盘检查
+  return name
+}
+
+check('F-02: 原地改写非首元素后 has 必须与线性扫描 oracle 一致（漏推方向）', () => {
+  const forms = [
+    { label: 'arr[1] 整体替换（非首元素、长度不变）', mutate: (a) => { a[1] = { id: 'u2-new' } }, probes: [{ id: 'u2' }, { id: 'u2-new' }] },
+    { label: 'arr[2].id 字段改写', mutate: (a) => { a[2].id = 'u3-new' }, probes: [{ id: 'u3' }, { id: 'u3-new' }] },
+    { label: 'arr[0].id 字段改写（首元素字段级）', mutate: (a) => { a[0].id = 'u1-new' }, probes: [{ id: 'u1' }, { id: 'u1-new' }] },
+    { label: 'arr[2].url 字段改写', mutate: (a) => { a[2].url = 'https://u.example/changed' }, probes: [{ url: 'https://u.example/3' }, { url: 'https://u.example/changed' }] },
+    { label: '原地 push 追加（长度变化）', mutate: (a) => { a.push({ id: 'u9' }) }, probes: [{ id: 'u9' }, { id: 'u1' }] }
+  ]
+  for (const form of forms) {
+    const arr = [{ id: 'u1' }, { id: 'u2' }, { id: 'u3', url: 'https://u.example/3' }]
+    const name = seedIdentityProbe(arr, `f02_form_${form.probes.length}_${form.label.length}.json`)
+    assert.strictEqual(identityStore.has({ id: 'u1' }, name), true, `前置：${form.label} 前索引应已建立并命中`)
+    form.mutate(arr)
+    for (const p of form.probes) {
+      const indexed = identityStore.has(p, name)
+      const oracle = identityStore._indexHasIdentityDirect(arr, p)
+      assert.strictEqual(indexed, oracle,
+        `${form.label}：has()=${indexed} 必须等于 oracle=${oracle}（probe=${JSON.stringify(p)}；true 侧不符即漏推）`)
+    }
+  }
+})
+
+check('F-02: 原地改写的身份陈旧时 has 不得返回 true（无 oracle 的硬断言）', () => {
+  const arr = [{ id: 's1' }, { id: 's2' }, { id: 's3' }]
+  const name = seedIdentityProbe(arr, 'f02_stale.json')
+  assert.strictEqual(identityStore.has({ id: 's2' }, name), true, '前置：s2 命中')
+  arr[1] = { id: 's2-replaced' } // 非首元素替换：引用/长度/首元素引用三项失效检查都看不出
+  assert.strictEqual(identityStore.has({ id: 's2' }, name), false, '已被原地替换掉的 s2 不得再判为已存在（陈旧索引 → 漏推）')
+  assert.strictEqual(identityStore.has({ id: 's2-replaced' }, name), true, '原地写入的新身份应能查到（陈旧索引另一侧）')
+})
+
+check('F-02: 批量未命中不得每次重建索引（每数组版本至多一次 O(n) 复检）', () => {
+  const arr = []
+  for (let i = 0; i < 1000; i++) arr.push({ id: 'p' + i })
+  const name = seedIdentityProbe(arr, 'f02_perf.json')
+  assert.strictEqual(identityStore.has({ id: 'p0' }, name), true, '前置：索引已建立')
+  const realBuild = identityStore._buildIdentityIndex
+  let builds = 0
+  identityStore._buildIdentityIndex = function (...args) { builds += 1; return realBuild.apply(this, args) }
+  try {
+    for (let i = 0; i < 500; i++) {
+      assert.strictEqual(identityStore.has({ id: 'miss-' + i }, name), false, `不存在的身份必须判否（第 ${i} 个）`)
+    }
+  } finally {
+    identityStore._buildIdentityIndex = realBuild
+  }
+  assert.ok(builds >= 1, '首次未命中必须做一次全量复检，否则原地写入的新身份永远查不到（F-02 机制被删即红）')
+  assert.ok(builds <= 2, `500 次未命中最多重建 1~2 次，实际 ${builds} 次（每次未命中都重建 = O(n²)，B8 实测打死热路径）`)
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

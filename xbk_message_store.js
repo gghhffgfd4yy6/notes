@@ -990,25 +990,51 @@ function createMessageStore ({
       return idx
     },
 
-    /** 基于预计算身份索引的判重查询：精确复刻 sameMessageIdentity(cacheMsg, message) 的匹配关系 */
-    _indexHasIdentity (idx, message) {
+    /** 基于预计算身份索引的判重查询：精确复刻 sameMessageIdentity(cacheMsg, message) 的匹配关系。
+   *  F-02（V6 实锤，漏推方向）：索引只按「引用 / 长度 / 首元素引用」做 O(1) 失效检查，
+   *  调用方原地改写**非首元素**（换元素或改 id/url 字段）不会触发重建，旧索引会把已经不存在的
+   *  身份判为「已存在」→ 主流程跳过推送（漏推，与 SYSTEM_CONTRACT「宁可多推」相反）。
+   *  因此**传入 messages 时，索引层命中的每个候选下标都要按当前元素复算身份才算命中**
+   *  （复用 _indexPositionMatches，与 _indexHasIdentityDirect 的 oracle 逐位语义一致）。
+   *  成本只随命中候选数增长（通常 1 个），不做逐位全表复检（实测每次 ~20ms 会打死热路径）；
+   *  不传 messages 时退化为纯索引判定（仅供不需要复检的调用方）。 */
+    _indexHasIdentity (idx, message, messages) {
       const b = Utils.getMessageIdentity(message)
       if (!b.valid) return false
+      const hit = (sets) => {
+        for (const set of sets) {
+          if (!set || set.size === 0) continue
+          if (!messages) return true
+          for (const i of set) {
+            if (this._indexPositionMatches(messages, i, message, b)) return true
+          }
+        }
+        return false
+      }
       if (b.kind === 'id') {
       // id 查询：命中 id 缓存同 idKey；或纯 url 缓存同 url
-        return idx.idByKey.has(b.idKey) || (!!b.url && idx.urlOnly.has(b.url))
+        return hit([idx.idByKey.get(b.idKey), b.url ? idx.urlOnly.get(b.url) : null])
       }
       if (b.kind === 'url') {
       // url 查询：命中纯 url 缓存同 url；或带 url 的 id 缓存同 url
-        return (!!b.url && idx.urlOnly.has(b.url)) || (!!b.url && idx.idWithUrl.has(b.url))
+        return hit([b.url ? idx.urlOnly.get(b.url) : null, b.url ? idx.idWithUrl.get(b.url) : null])
       }
       // anon 查询：命中匿名合成键相同的 anon 缓存
-      return idx.anonByKey.has(b.key)
+      return hit([idx.anonByKey.get(b.key)])
+    },
+
+    /** 命中的索引下标必须用**当前**元素复算身份才算命中（F-02）：索引下标可能因调用方原地改写
+   *  而指向别的元素（越界/被换/字段被改）。与 _indexHasIdentityDirect 的同位逻辑逐行同构，
+   *  保证「索引判重」与「线性扫描 oracle」在同一输入下给出同一答案。 */
+    _indexPositionMatches (messages, i, message, b) {
+      if (!Number.isInteger(i) || i < 0 || i >= messages.length) return false
+      const a = Utils.getMessageIdentity(messages[i])
+      return Utils.sameMessageIdentity(messages[i], message, a, b)
     },
 
     /** 身份索引缓存失效检查（P3 审查 2026-09-15）。
-   *  缓存条目形如 { ref, head, len, idx }：ref 是权威数组引用、head 是首个元素引用、
-   *  len 是元素数、idx 是预计算身份索引。
+   *  缓存条目形如 { ref, head, len, idx, missVerified }：ref 是权威数组引用、head 是首个元素
+   *  引用、len 是元素数、idx 是预计算身份索引、missVerified 见 has 的「未命中复检」口径。
    *
    *  为什么不能只用「数组引用」作键：readMessages 返回的是内部权威数组的同一引用，
    *  调用方原地删改元素不会换引用，旧索引会让 has() 静默误判为「已存在」。
@@ -1018,24 +1044,43 @@ function createMessageStore ({
    *  从 23ms 退化到 29s）。
    *
    *  为什么不能每次做「逐位置身份复检」：那要遍历索引里的每个下标并重算 getMessageIdentity，
-   *  实测每次约 20ms（3000 条缓存），同样把热路径打死。
+   *  实测每次约 20ms（3000 条缓存），同样把热路径打死。F-02 的替代方案见 _indexHasIdentity
+   *  （只复检命中的候选下标）与 has 的「首次未命中复检一次」。
    *
-   *  最终口径：O(1) 失效检查（引用 / 首元素 / 长度）+ 针对性的「下标越界加固」，
-   *  另提供 _indexHasIdentityDirect 作为零索引的正确性对照入口（慢路径 / 测试用）。 */
+   *  最终口径：O(1) 失效检查（引用 / 首元素 / 长度）+ 命中候选复检（F-02）+ 未命中每数组版本
+   *  复检一次 + 针对性的「下标越界加固」，另提供 _indexHasIdentityDirect 作为零索引的正确性
+   *  对照入口（慢路径 / 测试用）。 */
     _identityIndexIsStale (entry, messages) {
       if (!entry || entry.ref !== messages) return true
       if (entry.len !== messages.length) return true
       return entry.head !== messages[0]
     },
 
-    /** Ensure 预计算索引可用：命中且未失效直接复用，否则重建并写回。
-   *  重建时同时记录 ref/head/len 供下次 O(1) 失效检查。 */
-    _cachedIndexFor (messages) {
+    /** 取该权威数组当前可用的索引条目（必要时重建）。 */
+    _identityIndexEntry (messages) {
       const entry = this._identityIndex.get(messages)
-      if (!this._identityIndexIsStale(entry, messages)) return entry.idx
-      const idx = this._buildIdentityIndex(messages)
-      this._identityIndex.set(messages, { ref: messages, head: messages[0], len: messages.length, idx })
-      return idx
+      if (this._identityIndexIsStale(entry, messages)) return this._storeIdentityEntry(messages)
+      return entry
+    },
+
+    /** 从**当前**数组内容重建索引条目并写回 WeakMap（重建即与数组对齐）。 */
+    _storeIdentityEntry (messages) {
+      const entry = {
+        ref: messages,
+        head: messages[0],
+        len: messages.length,
+        idx: this._buildIdentityIndex(messages),
+        // 该数组版本是否已做过「未命中后的复检」：见 has。
+        missVerified: false
+      }
+      this._identityIndex.set(messages, entry)
+      return entry
+    },
+
+    /** Ensure 预计算索引可用：命中且未失效直接复用，否则重建并写回。
+   *  保留此入口（返回 idx）供既有调用方使用；需要未命中复检的调用方走 _identityIndexEntry。 */
+    _cachedIndexFor (messages) {
+      return this._identityIndexEntry(messages).idx
     },
 
     /** 判重正确性对照入口（无索引）：线性扫描 + 逐条身份比较，语义与 _indexHasIdentity 等价。
@@ -1057,10 +1102,20 @@ function createMessageStore ({
       if (!Utils.isValidItem(message)) return false
       const filePath = this.getFilePath(filename)
       const messages = this.readMessages(filePath)
-      // 预计算身份索引按「数组引用 + 首元素 + 长度」做 O(1) 失效检查：
-      // 数组被整体替换或首元素被换掉时自动重建（见 _identityIndexIsStale 注释口径）。
-      const idx = this._cachedIndexFor(messages)
-      if (this._indexHasIdentity(idx, message)) return true
+      // F-02：索引命中必须按**当前**元素复检（_indexHasIdentity 传 messages），否则调用方原地
+      // 改写非首元素后 has() 会把已不存在的身份判为「已存在」→ 漏推。
+      let entry = this._identityIndexEntry(messages)
+      if (this._indexHasIdentity(entry.idx, message, messages)) return true
+      // 索引层命中但候选复检失配 ⇒ 数组被原地改写、索引已陈旧：立刻重建（自愈），否则后续查询
+      // 会继续拿陈旧索引给答案；本数组版本**首次**未命中同样重建一次，覆盖另一侧陈旧
+      // （原地写入的新身份在旧索引里查不到，只会多推，但同样与线性扫描不一致）。
+      // 代价：每个数组版本至多一次 O(n) 重建（稳态查询仍 O(1)）。改为「每次未命中都重建」会让
+      // 5000 条批量判重退化成 O(n²)——即 B8 实测的打死热路径形态，故刻意不做。
+      if (this._indexHasIdentity(entry.idx, message) || !entry.missVerified) {
+        entry = this._storeIdentityEntry(messages)
+        entry.missVerified = true
+        if (this._indexHasIdentity(entry.idx, message, messages)) return true
+      }
       // P4（CodeAnt）：消息数组未命中时查墓碑——被裁剪记录的判重身份不丢
       return this._tombstoneHasIdentity(filePath, message)
     },
