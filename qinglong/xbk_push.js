@@ -302,6 +302,24 @@ function runStatus () {
   return 0
 }
 
+// QX-02：--dry-run 是「跑一轮看过滤效果」的一次性诊断（README 的调参用法），返回退出码：
+// 0 = 单轮成功；1 = 单轮失败。与常驻路径不同，一次性执行不做退避重试——诊断用法需要立刻拿到
+// 结果与退出码，而不是落进永不退出的循环里。
+async function runDryRunOnce (app) {
+  const summary = await app.run()
+  const resultFailure = classifySummary(summary)
+  if (!resultFailure) {
+    const total = Number(summary && summary.total) || 0
+    const filtered = Number(summary && summary.filtered) || 0
+    console.log(`dry-run 单轮完成：共 ${total} 条，过滤 ${filtered} 条，未推送、未写成功缓存`)
+    return 0
+  }
+  const info = resultFailure.info || {}
+  const detail = describeFailure(info, new Error(resultFailure.reason || 'dry-run 单轮失败'))
+  console.error(`dry-run 单轮失败（${resultFailure.reason}）：${detail}`)
+  return 1
+}
+
 async function main () {
   const unknownArgs = [...ARGS].filter(arg => !KNOWN_ARGS.has(arg))
   if (unknownArgs.length > 0) {
@@ -333,6 +351,18 @@ async function main () {
   if (hasArg('--dry-run')) process.env.XBK_DRY_RUN = '1'
   ensureDependencies()
   const app = loadApp()
+  // QX-02：带 --dry-run 时只跑一轮即退出（一次性诊断）。旧实现只是设置 XBK_DRY_RUN 后就落到
+  // 常驻循环（进程永不退出、看起来像卡死）。需要「常驻但不推送」时改用环境变量 XBK_DRY_RUN=1
+  // （不带本参数），该路径的常驻语义保持不变。
+  if (hasArg('--dry-run')) {
+    try {
+      process.exitCode = await runDryRunOnce(app)
+    } catch (error) {
+      console.error('dry-run 单轮执行失败:', error && error.message ? error.message : String(error))
+      process.exitCode = 1
+    }
+    return
+  }
   const controller = new AbortController()
   const stop = () => controller.abort()
   // v3.262：用 process.on 而非 once——once 在首次信号后移除监听，第二次信号会走 Node
@@ -359,4 +389,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { classifyFailure, classifySummary, runResident, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs, runCheck, hasArg }
+module.exports = { classifyFailure, classifySummary, runResident, runDryRunOnce, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs, runCheck, hasArg }

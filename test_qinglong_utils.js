@@ -1,12 +1,14 @@
 'use strict'
 
 const assert = require('assert')
+const fs = require('fs')
 const path = require('path')
 const {
   shouldAutoInstallDependencies,
   ensureDependencies,
   intervalMs,
-  retryBackoffMs
+  retryBackoffMs,
+  runDryRunOnce
 } = require('./qinglong/xbk_push')
 
 ;(async () => {
@@ -173,6 +175,33 @@ const {
   assert.strictEqual(ensureDependencies(noLockMock), undefined, '无锁文件时退回 install 也应能恢复')
   assert.strictEqual(noLockMock.calls[0].args[0], 'install', '无锁文件时退回 npm install')
   assert.ok(noLockMock.calls[0].args.includes('--no-package-lock'), '退回 install 时必须带 --no-package-lock（不再在部署目录生成/改写锁文件）')
+
+  // ===== QX-02：--dry-run 一次性执行 =====
+  // runDryRunOnce 只跑一轮：成功 → 0，全失败 → 1（不做常驻退避重试）。
+  const origLog = console.log
+  const origErr = console.error
+  console.log = () => {}
+  console.error = () => {}
+  let dryRunCalls = 0
+  let dryRunCode
+  let dryRunFailCode
+  try {
+    dryRunCode = await runDryRunOnce({ run: async () => { dryRunCalls += 1; return { total: 3, filtered: 1, pushed: 0, failed: 0 } } })
+    dryRunFailCode = await runDryRunOnce({ run: async () => ({ total: 1, pushed: 0, failed: 1, failures: [{ code: 'E_NET', statusCode: 503 }] }) })
+  } finally {
+    console.log = origLog
+    console.error = origErr
+  }
+  assert.strictEqual(dryRunCalls, 1, 'dry-run 只能调用 app.run() 一次（一次性执行）')
+  assert.strictEqual(dryRunCode, 0, '单轮成功应返回退出码 0')
+  assert.strictEqual(dryRunFailCode, 1, '单轮全失败应返回退出码 1')
+
+  // 接线断言（与 test_cli.js:31 同一种源码级手法）：main() 的 --dry-run 分支必须调用 runDryRunOnce
+  // 并 return，绝不能继续落到 runResident(...)。回退旧行为（只设 XBK_DRY_RUN=1 即常驻）时本断言必红。
+  const pushSource = fs.readFileSync(path.join(__dirname, 'qinglong', 'xbk_push.js'), 'utf8')
+  assert.match(pushSource, /if\s*\(\s*hasArg\(\s*['"]--dry-run['"]\s*\)\s*\)\s*\{[\s\S]*?runDryRunOnce\(app\)[\s\S]*?return\s*\}/,
+    '--dry-run 必须接线到一次性 runDryRunOnce 并在其后 return（不得落入常驻循环）')
+  assert.match(pushSource, /await\s+runResident\(app,\s*controller\)/, '常驻路径必须仍然存在（防"删掉常驻"式假修复）')
 
   console.log('test_qinglong_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })

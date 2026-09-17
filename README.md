@@ -61,7 +61,7 @@ XBK_CACHE_DIR=/path/to/cache node qinglong/xbk_push.js --status
 node qinglong/xbk_push.js --dry-run
 ```
 
-青龙入口下同样要求 `got`/`re2` 就绪；dry-run 仍会写 `run.log` 与过滤诊断日志，只是不写成功缓存、不发通知。主模块也认 `XBK_DRY_RUN=1`，可绕过青龙入口直接生效。
+青龙入口下同样要求 `got`/`re2` 就绪；dry-run 仍会写 `run.log` 与过滤诊断日志，只是不写成功缓存、不发通知。`--dry-run` 是**一次性**执行：跑完一轮即退出（退出码 0 表示该轮成功、1 表示该轮失败），不进入常驻循环；需要「常驻但不推送」时改用环境变量 `XBK_DRY_RUN=1`（不带 `--dry-run` 参数），主模块也认该变量，可绕过青龙入口直接生效。
 
 入口为常驻模式；只运行一个实例。`XBK_INTERVAL_MS` 可设置轮询间隔（毫秒，默认 10000，非法值回退 10000，`0` 表示不等待）。只需执行一次时用 `npm start`。
 
@@ -76,7 +76,7 @@ node qinglong/xbk_push.js --dry-run
 | `XBK_INTERVAL_MS` | 常驻轮询间隔（毫秒，默认 10000） |
 | `XBK_RETRY_BACKOFF_CAP_MS` | 可重试失败退避上限（毫秒，默认 1800000） |
 | `XBK_CACHE_DIR` | 仅 `--status`：状态文件所在目录（绝对路径） |
-| `XBK_DRY_RUN=1` | 等价 `--dry-run` |
+| `XBK_DRY_RUN=1` | 常驻干跑：不推送、不写成功缓存（`--dry-run` 参数则是一次性单轮后退出） |
 | `XBK_AUTO_INSTALL_DEPS=1` | 仅青龙入口：依赖缺失时自动安装并重建 re2 |
 | `XBK_PROFILE` | `1` 输出每轮耗时剖面，`2` 追加预热/预处理明细，`3` 再追加启动与运行检查点 |
 | `XBK_DNS_FAMILY` | `4`/`6` 强制 DNS 预热与解析走 IPv4/IPv6，默认 auto |
