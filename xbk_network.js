@@ -2,6 +2,17 @@
 
 // 🌐 Network — 网络请求层（从 xbk_function_v3.js 独立准备，暂不接入主入口）
 // 依赖全部由组合根注入，避免反向 require 主入口及重复单例。
+//
+// net-1：PERMANENT_CODES 目前组合根尚未接线（xbk_function_v3.js 只注入 RETRYABLE_CODES），缺省回落到
+// xbk_failure_policy 的同名导出——该模块是无状态常量/纯函数模块，直接 require 不产生反向依赖或重复
+// 单例；若日后组合根改为显式注入，注入值优先，语义不变。
+const { PERMANENT_CODES: POLICY_PERMANENT_CODES } = require('./xbk_failure_policy')
+
+// net-1：请求层本地「确定性失败」码——重试同一个请求不会改变结果（响应体超过 maxBody 是确定性的），
+// 但 xbk_failure_policy 未把该码列进 PERMANENT_CODES（该模块对未知码按「保守重试」处理，见其头部口径），
+// 故只在请求层单列，不改动失败分类模块的语义（常驻循环仍按策略归类决定下一轮）。
+const DETERMINISTIC_LOCAL_CODES = new Set(['EBODYLIMIT'])
+
 function createNetwork ({
   Config,
   Utils,
@@ -10,6 +21,7 @@ function createNetwork ({
   getNotify,
   crypto,
   RETRYABLE_CODES,
+  PERMANENT_CODES = POLICY_PERMANENT_CODES,
   PKG_VERSION = '3.x',
   PROFILE3 = false,
   logger = console
@@ -72,6 +84,11 @@ function createNetwork ({
           return result
         } catch (e) {
           lastErr = e
+          // net-1：不可重试判定不能只看 HTTP 状态码——无 response 的错误（JSON 契约错误 ERR_BODY_NOT_JSON、
+          // 证书类 CERT_HAS_EXPIRED、URL/参数类 ERR_INVALID_URL 等）在 PERMANENT_CODES 里是明确的永久性
+          // 错误，旧实现会退避重试满 maxRetry 次（白白空转 1s+2s+4s…）；EBODYLIMIT 同理（确定性失败）。
+          // 未知错误码一律保持旧口径（继续重试），不因本改动扩大「不重试」的范围。
+          if (e.code && (PERMANENT_CODES.has(e.code) || DETERMINISTIC_LOCAL_CODES.has(e.code))) throw e
           // 4xx 客户端错误：重试也没用，直接抛出（限流/临时性状态码除外——408/409/425/429 可能瞬时，值得重试）
           // P2（审查 2026-08-15）：可重试状态码收敛到 xbk_failure_policy.RETRYABLE_CODES 单一来源，
           // 曾内联硬编码 429/408/409 漏掉 425（failure_policy 判 retryable 而 fetchData 立即抛，两份清单漂移）。

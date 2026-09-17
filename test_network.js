@@ -6,7 +6,7 @@ const { RETRYABLE_CODES } = require('./xbk_failure_policy')
 
 // fetchData 依赖全部注入：Config / Utils / fetchJson / prewarmDns / getNotify / crypto / RETRYABLE_CODES
 function makeNetwork (opts = {}) {
-  const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0 } = opts
+  const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes } = opts
   let calls = 0
   const requestOptions = [] // net-3：捕获传给 HTTP 层的 option，供 timeout 钳制断言使用
   const fetchJson = async (_url, requestOpts) => {
@@ -14,6 +14,7 @@ function makeNetwork (opts = {}) {
     requestOptions.push(requestOpts)
     if (calls <= failTimes) {
       const e = new Error('fail ' + calls)
+      if (errorCode !== undefined) e.code = errorCode // net-1：无 response 的永久性错误码
       if (statusCode !== undefined) e.response = { statusCode }
       throw e
     }
@@ -29,7 +30,8 @@ function makeNetwork (opts = {}) {
     prewarmDns: async () => ({ ok: true, elapsedMs: 1, family: 'ipv4' }),
     getNotify: async () => 'notify-module',
     crypto: { randomInt: () => 0 }, // 抖动固定为 0，退避仅由 1000*2^attempt 决定
-    RETRYABLE_CODES
+    RETRYABLE_CODES,
+    ...(permanentCodes === undefined ? {} : { PERMANENT_CODES: permanentCodes })
   })
   return { net, getCalls: () => calls, getRequestOptions: () => requestOptions }
 }
@@ -168,6 +170,45 @@ function makeNetwork (opts = {}) {
       await net.fetchData()
       assert.strictEqual(getRequestOptions()[0].timeout, 5000, `timeout=${label} 应回落 5000（不得原样传出或钳成 1）`)
     }
+  }
+
+  // 12. net-1（xbk_network.js:83-87）：不可重试判定不再只看 HTTP 状态码——无 response 的永久性错误码
+  // （PERMANENT_CODES 里的 ERR_BODY_NOT_JSON / CERT_HAS_EXPIRED / ERR_INVALID_URL 等 + 请求层单列的
+  // 确定性失败码 EBODYLIMIT）必须立即抛出、不得退避重试满 maxRetry；旧实现对这些错误一律重试
+  // （retry=2 → 3 次尝试 + 1s/2s 退避）。本块**不传** PERMANENT_CODES：缺省由 xbk_network 回落到
+  // xbk_failure_policy 的同一导出（组合根尚未接线），故回退该改动即 calls=3、本块变红。
+  for (const code of ['ERR_BODY_NOT_JSON', 'CERT_HAS_EXPIRED', 'ERR_INVALID_URL', 'EBODYLIMIT']) {
+    const { net, getCalls } = makeNetwork({ retry: 2, statusCode: undefined, errorCode: code, failTimes: 5 })
+    let rejected = null
+    try { await net.fetchData() } catch (e) { rejected = e }
+    assert.ok(rejected, `${code} 应立即抛出`)
+    assert.strictEqual(rejected.code, code, `应抛出原错误（保留 code），实际 ${rejected.code}`)
+    assert.strictEqual(getCalls(), 1, `${code} 属不可重试错误，不得重试（旧实现会重试到 maxRetry）`)
+  }
+
+  // 12b. 反向守卫：不在 PERMANENT_CODES / 本地确定性集合里的未知错误码仍按旧口径重试
+  // （防止「凡带 code 就不重试」式一刀切把瞬时错误的挽回机会一起砍掉）
+  {
+    const { net, getCalls } = makeNetwork({ retry: 2, statusCode: undefined, errorCode: 'ERR_UNKNOWN_XYZ', failTimes: 5 })
+    let rejected = null
+    try { await net.fetchData() } catch (e) { rejected = e }
+    assert.strictEqual(rejected.code, 'ERR_UNKNOWN_XYZ', '应抛出最后一次的 lastErr')
+    assert.strictEqual(getCalls(), 3, '未知错误码应保持重试语义（首次 + 2 次重试）')
+  }
+
+  // 12c. PERMANENT_CODES 注入优先：显式注入的自定义集合以注入值为准（组合根日后接线该参数的接口已生效）
+  {
+    const { net, getCalls } = makeNetwork({
+      retry: 2,
+      statusCode: undefined,
+      errorCode: 'MY_PERMANENT',
+      failTimes: 5,
+      permanentCodes: new Set(['MY_PERMANENT'])
+    })
+    let rejected = null
+    try { await net.fetchData() } catch (e) { rejected = e }
+    assert.strictEqual(rejected.code, 'MY_PERMANENT', '应抛出注入集合里的错误')
+    assert.strictEqual(getCalls(), 1, '显式注入的 PERMANENT_CODES 必须生效')
   }
 
   console.log('test_network OK')

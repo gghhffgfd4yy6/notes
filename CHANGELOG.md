@@ -60,4 +60,5 @@
 - 时间口径：运行异常告警正文的时间、RE2 缺 re2 提醒标记的保留期 cutoff 统一 `Asia/Shanghai`（此前前者随进程时区，后者与标记名基准被拆开，CI 的 UTC 下与 run.log/日报错开一天）。
 - 变异工具链：报告 JSON 的 V8 字符串上限判定移到 `Buffer.concat` 之前（此前先付出分配峰值才发现放不下，且该护栏长期无法被测试触及）；变异日报段内容校验补 `files` 映射缺失/类型非法、`mutants` 非数组、零变异体三类 fail-loud（此前缓存回填的陈旧 artifact 会被当成 0 变异体的满分日报发布），`validateSegments` 的错误逐段带上原因；CLI 集成测试夹具改为真 stryker schema（补齐 `schemaVersion`/`thresholds`/`source`，并用 ajv 对齐厂商 schema 逐条自校），断言收紧到合计/分段统计值。
 - 独立对抗审查跟进：脱敏再补引号包裹/带引号关键字/单引号/非字符串 JSON 值/URL query 等漏抹形态与关键字表（`password/pwd/session/cookie/credential`），并收掉本批新引入的 `the bearer of good news` 假阳性；变异体 `status` 改按厂商 schema 的 `MutantStatus` enum 校验（此前只要求「非空字符串」，`'Bogus'` 会被静默计入 `total`）；`refreshTimeoutError` 的归因按实际分支改写（NaN→回落默认、负值→按下界，不再一律说成「超出上限钳制」）；`sleep` 摘除侧守卫补断言（此前后变异掉也不会变红）；APP-05 用例改为快照-恢复，不再删掉共享缓存目录里的既有 `re2warn.state.*` 标记。
+- 请求层重试：不可重试判定补错误码维度——`PERMANENT_CODES`（JSON 契约/证书/URL 参数类）与请求层单列的确定性失败码 `EBODYLIMIT`（响应体超限）首次失败即抛，不再退避重试满 `api.retry`（此前只认 HTTP 状态码，这类错误白跑 1s+2s+… 退避）；未知错误码保持保守重试口径。
 
