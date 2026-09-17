@@ -331,11 +331,11 @@ console.log('✅ release.yml 步骤级回归通过：notes 含要点正文 + 章
 // （见 validate-release-tag.js 的 `tag.startsWith('v') ? tag.slice(1) : tag`），此时旧文案会凭空补一个 v
 // ——打印的 tag 与真实入参不符（'3.272' 打成 'v3.272'、'01.2.3' 打成 'v01.2.3'）。
 // 故鉴别力全在「裸版本号」这组入参上；带 v 的入参两版实现输出相同，只作「回显的是 tag 原文」的补充。
-// 本文件已有的 spawnSync 跑的是 release.yml 里的 node 载荷，本 CLI 分支另无覆盖，故此处直接以子进程
-// 跑 scripts/validate-release-tag.js（cwd 固定 __dirname，不写绝对路径）。
+// 本文件已有的 spawnSync 跑的是 release.yml 里的 node 载荷；本 CLI 分支由下面这段直接以子进程覆盖
+// （cwd 固定 __dirname，不写绝对路径），覆盖 exit 0/1/2 三个退出码与两处文案。
 const TAG_CLI = path.join(__dirname, 'scripts', 'validate-release-tag.js')
-function runTagCli (tag) {
-  const res = spawnSync(process.execPath, [TAG_CLI, tag], { cwd: __dirname, encoding: 'utf8', timeout: 20000 })
+function runTagCli (...args) {
+  const res = spawnSync(process.execPath, [TAG_CLI, ...args], { cwd: __dirname, encoding: 'utf8', timeout: 20000 })
   assert.strictEqual(res.error, undefined,
     'tag CLI 子进程应能启动（本机需 NODE_OPTIONS=--require .local/execpath-shim.js）：' + (res.error && res.error.message))
   return { status: res.status, stdout: res.stdout, stderr: res.stderr }
@@ -359,4 +359,13 @@ assert.ok(bareFail.stderr.startsWith("❌ tag 名称 '01.2.3' 不是合法版本
 assert.strictEqual(runTagCli('v3.272').stdout.trim(), '版本号格式校验通过：v3.272',
   '带 v 的入参应原样回显（回显 tag 原文，而非去掉 v 的 version）')
 
-console.log('✅ validate-release-tag.js CLI 回归通过：裸版本号不补 v（成功/失败两处文案）+ 带 v 原样回显')
+// ④ 无参（用法错误）：exit 2 + 用法提示，且不得输出成功文案。
+// audit 指出该分支此前没有任何断言（改错退出码/删掉用法提示都不会被发现）。
+const noArg = runTagCli()
+assert.strictEqual(noArg.status, 2,
+  '未提供 tag 应 exit 2（用法错误，与「非法 tag」的 exit 1 区分），实际 ' + noArg.status)
+assert.ok(noArg.stderr.includes('用法') && noArg.stderr.includes('validate-release-tag.js'),
+  '无参应输出用法提示，实际 stderr: ' + JSON.stringify(noArg.stderr))
+assert.strictEqual(noArg.stdout, '', '无参不得输出成功文案，实际 stdout: ' + JSON.stringify(noArg.stdout))
+
+console.log('✅ validate-release-tag.js CLI 回归通过：裸版本号不补 v（成功/失败两处文案）+ 带 v 原样回显 + 无参 exit 2')

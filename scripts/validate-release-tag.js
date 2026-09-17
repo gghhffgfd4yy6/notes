@@ -47,9 +47,10 @@ function isValidVersion (version) {
 
 // CLI 用法：node scripts/validate-release-tag.js <tag>  校验单个 tag（含 v 前缀则去掉）。
 // exit 0 = 合法；1 = 非法；2 = 未提供 tag（用法错误，见下）。
-// 当前**无生产调用点**：release.yml 保留自持的内联副本，pre-commit 只跑 lint/版本闸门/test:filter、不执行本文件。
-// 本 CLI 分支也没有任何自动化覆盖（test_tag_validator.js 的 spawnSync 跑的是 release.yml 里的 node 载荷），
-// 故改动此处文案/退出码只能人工验证。
+// 当前**无生产调用点**：release.yml 保留自持的内联副本（与本文件逐字一致由 test_tag_validator.js 断言），
+// pre-commit 只跑 lint/版本闸门/test:filter、不执行本文件。
+// CLI 分支本身**有**自动化覆盖：test_tag_validator.js 的「CLI 文案/退出码回归」段以子进程直接跑本文件，
+// 断言 exit 0/1/2 与两处文案逐字回显入参原文（不带 v 的裸版本号不得被补成 v），改这里前先看该段。
 if (require.main === module) {
   const tag = process.argv[2]
   if (tag === undefined) {
