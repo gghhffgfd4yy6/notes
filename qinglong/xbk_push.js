@@ -2,6 +2,7 @@
 
 // 青龙面板直接执行入口：不依赖当前工作目录，配置/缓存仍统一放在项目根目录。
 const path = require('path')
+const fs = require('fs')
 const { spawnSync } = require('child_process')
 const { runLoop, sleep } = require('../xbk_loop')
 const { classifyFailure, classifySummary, summarizeError } = require('../xbk_failure_policy')
@@ -80,21 +81,31 @@ function shouldAutoInstallDependencies (env = process.env) {
 // got 是主 HTTP 依赖；re2 则是用户过滤规则的安全执行引擎。
 // 安装命令刻意使用 --ignore-scripts 防供应链风险，但这也会跳过 re2 原生模块构建；
 // 因此必须显式构建并加载校验，不能只因 got 可用就带着“所有正则规则被跳过”的状态启动。
-function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env = process.env } = {}) {
-  // 固定依赖路径：入口不会将外部输入拼入模块或构建路径。
-  const gotPath = path.join(ROOT, 'node_modules', 'got')
-  const re2Path = path.join(ROOT, 'node_modules', 're2')
-  const load = (name, modulePath) => {
+function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env = process.env, lockExists = () => fs.existsSync(path.join(ROOT, 'package-lock.json')) } = {}) {
+  // 固定依赖路径只作为兜底：入口不会将外部输入拼入模块或构建路径（两个模块名都是本文件字面量）。
+  const fixedPath = (name) => path.join(ROOT, 'node_modules', name)
+  const re2Path = fixedPath('re2')
+  // QX-01：先按 Node 常规解析（与 --check 的 require('got')、xbk_agents.js 的 require('got') 同口径），
+  // 只有解析不到时才回退固定路径。旧实现只用固定路径探测，会出现「--check 通过但应用侧解析失败」
+  // 或「解析本可命中却重复安装」两套口径分裂。
+  const load = (name) => {
     try {
       // 不只检查 require.resolve：got 的传递依赖、re2 的原生 .node 缺失时，真正 require 才能发现。
-      requireFn(modulePath)
+      requireFn(name)
       return null
     } catch (error) {
-      return error
+      // 仅「模块本身找不到」才回退固定路径；ERR_DLOPEN_FAILED 等说明模块已定位，回退只会得到同样结果。
+      if (!error || error.code !== 'MODULE_NOT_FOUND') return error
+      try {
+        requireFn(fixedPath(name))
+        return null
+      } catch (fallbackError) {
+        return fallbackError
+      }
     }
   }
   const isRecoverable = (error) => error && (error.code === 'MODULE_NOT_FOUND' || error.code === 'ERR_DLOPEN_FAILED')
-  const initial = { got: load('got', gotPath), re2: load('re2', re2Path) }
+  const initial = { got: load('got'), re2: load('re2') }
   if (!initial.got && !initial.re2) return
   const initialError = initial.got || initial.re2
   // 缺模块与原生 ABI/平台不匹配都可通过重新安装/构建恢复；其余运行时错误不掩盖。
@@ -106,19 +117,30 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
   console.warn('检测到 Node.js 依赖或 re2 原生模块未完整安装，已按 XBK_AUTO_INSTALL_DEPS=1 执行恢复...')
 
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  const install = spawnSyncFn(npm, [
-    'install',
+  // QX-04：恢复命令与 :104 的提示及 README:70 的部署口径统一——有 package-lock.json 时用冻结安装
+  // （npm ci，不再生成/改写 package-lock.json，也不会把部署目录的依赖版本漂移到锁文件之外）；
+  // 缺锁文件的部署（非 npm ci 流程拷贝出来的目录）退回 install，但显式 --no-package-lock，
+  // 不再顺手在部署目录里写出一份新锁文件。
+  const useCi = Boolean(lockExists())
+  const installVerb = useCi ? 'ci' : 'install'
+  if (!useCi) {
+    console.warn('未找到 package-lock.json，退化为 npm install --no-package-lock（建议按 README 用 npm ci 部署以冻结依赖版本）')
+  }
+  const installArgs = [
+    installVerb,
     '--omit=dev', // --production 的现行等价写法（已弃用别名，语义不变）
     '--ignore-scripts',
     '--no-audit',
     '--no-fund',
     '--prefix', ROOT
-  ], { cwd: ROOT, stdio: 'inherit', timeout: 120000 })
+  ]
+  if (!useCi) installArgs.push('--no-package-lock')
+  const install = spawnSyncFn(npm, installArgs, { cwd: ROOT, stdio: 'inherit', timeout: 120000 })
   if (install.error) throw install.error
-  if (install.status !== 0) throw new Error(`npm install 失败，退出码 ${install.status}`)
+  if (install.status !== 0) throw new Error(`npm ${installVerb} 失败，退出码 ${install.status}`)
 
   // 仅当安装后 re2 仍无法加载才构建：单纯 got 缺失但 re2 正常时，不要求无关的 C++ 构建环境。
-  const re2AfterInstall = load('re2', re2Path)
+  const re2AfterInstall = load('re2')
   if (re2AfterInstall) {
     if (!isRecoverable(re2AfterInstall)) throw re2AfterInstall
     const rebuild = spawnSyncFn(npm, [
@@ -128,7 +150,7 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
     if (rebuild.status !== 0) throw new Error(`re2 原生模块构建失败，退出码 ${rebuild.status}`)
   }
 
-  const recovered = { got: load('got', gotPath), re2: load('re2', re2Path) }
+  const recovered = { got: load('got'), re2: load('re2') }
   if (recovered.got || recovered.re2) {
     const failed = recovered.got ? 'got' : 're2'
     const error = recovered[failed]
