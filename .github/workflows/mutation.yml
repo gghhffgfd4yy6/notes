@@ -263,3 +263,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # F1（返工）：本轮运行起点——validateFreshness 的第三层据此拦截「同日跨轮回填」（全体段
+          # mtime 互差≈0 且都在 12h 阈值内时，只比较本批最新报告看不见）。matrix job 必然晚于该时刻。
+          MUTATION_RUN_STARTED_AT: ${{ github.run_started_at }}

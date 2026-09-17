@@ -8,7 +8,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const {
-  render, validateSegments, validateFreshness, resolveMaxSkewMs, shanghaiDate, escCell, countMutant,
+  render, validateSegments, validateFreshness, resolveMaxSkewMs, resolveRunStartedAtMs, shanghaiDate, escCell, countMutant,
   collectStats, findReportJson, analyzeSegment, analyze, postIssue
 } = require('./scripts/mutation-report.js')
 
@@ -216,6 +216,57 @@ check('resolveMaxSkewMs 阈值解析（默认 12h / off 与 ≤0 关闭 / 非法
   assert.strictEqual(resolveMaxSkewMs('-5'), 0, '负数关闭')
   assert.strictEqual(resolveMaxSkewMs('3600000'), 3600000, '显式毫秒生效')
   assert.strictEqual(resolveMaxSkewMs('abc'), DEFAULT, '无法解析 → 回落默认（不得静默关掉闸门）')
+})
+
+// ===== F1 返工（V4 打回）：同族反例——全体回填 + 跨轮同日回填 =====
+// 打回现场：闸门基准是「本批最新报告」而非 wall-clock，于是
+//   ① 全体回填（所有段 mtime 都很旧、互差≈0）→ 跨段偏斜恒为 0 → 放行并照发日报；
+//   ② 跨轮 <12h 的同日回填（实测 11h）→ 同样互差≈0 → 照发。
+// 返工后 ① 由「相对现在的年龄」层拦下，② 由「本轮运行起点（CI 注入 github.run_started_at）」层拦下。
+check('F1 返工：全体回填（互差≈0、全体 26h 前）必须拒绝；全新鲜/边界必须放行', () => {
+  const H = 3600 * 1000
+  const now = Date.now()
+  const backfilled = [1, 2, 3, 4].map(i => ({ seg: 'seg' + i, reportMtimeMs: now - 26 * H }))
+  // 跨段互差恰为 0 —— 旧实现（只看 skew）在此恒放行
+  assert.throws(
+    () => validateFreshness(backfilled),
+    /疑似缓存回填.*全体陈旧.*超出本轮最大跨度 12 小时.*seg1（报告文件时间距今 26 小时）/,
+    '全体回填必须被年龄层拒绝，并点名段名与距今小时数'
+  )
+  // 反向：同样「互差≈0」但全部新鲜 → 必须放行（证明拒绝来自年龄，而不是「互差≈0」本身）
+  const allFresh = [1, 2, 3, 4].map(i => ({ seg: 'seg' + i, reportMtimeMs: now }))
+  assert.deepStrictEqual(validateFreshness(allFresh), allFresh, '互差为 0 的全新鲜报告必须放行')
+  // 边界：阈值内（11.9h）放行、超阈值（12.1h）拒绝
+  const justInside = [{ seg: 'a', reportMtimeMs: now }, { seg: 'b', reportMtimeMs: now - 11.9 * H }]
+  assert.deepStrictEqual(validateFreshness(justInside), justInside, '阈值内的年龄跨度必须放行')
+  const justOver = [{ seg: 'a', reportMtimeMs: now }, { seg: 'b', reportMtimeMs: now - 12.1 * H }]
+  assert.throws(() => validateFreshness(justOver), /疑似缓存回填/, '超出年龄上限必须拒绝')
+  // 单个极旧段（无别的段可比）同样必须被年龄层拦下——旧实现在 dated.length<2 时直接 return
+  assert.throws(() => validateFreshness([{ seg: 'only', reportMtimeMs: now - 30 * H }]), /全体陈旧/,
+    '单段且极旧时不得因「无可比较对象」直接放行')
+})
+
+check('F1 返工：跨轮同日回填（互差≈0、全体 11h 前）须由本轮运行起点拦下', () => {
+  const H = 3600 * 1000
+  const now = Date.now()
+  const sameDayBackfill = [1, 2, 3].map(i => ({ seg: 'seg' + i, reportMtimeMs: now - 11 * H }))
+  // ① 无本轮起点（本地手工运行日报）：11h 在 12h 阈值内、互差≈0 → 放行（不得误红）
+  assert.deepStrictEqual(validateFreshness(sameDayBackfill, 12 * H, undefined), sameDayBackfill,
+    '未提供本轮起点时该层不生效')
+  // ② 提供本轮起点（= 现在）→ 报告早于起点 11h → 必须拒绝（CI 形态）
+  assert.throws(
+    () => validateFreshness(sameDayBackfill, 12 * H, now),
+    /疑似缓存回填.*早于本轮运行起点.*seg1（报告文件时间早于本轮运行起点 11 小时）/,
+    '同日跨轮回填必须被运行起点层拒绝，并给出折算小时数'
+  )
+  // ③ 本轮真实产物（晚于起点）必须放行
+  const producedThisRun = [{ seg: 'a', reportMtimeMs: now + 60 * 1000 }]
+  assert.deepStrictEqual(validateFreshness(producedThisRun, 12 * H, now), producedThisRun,
+    '本轮产出（晚于起点）必须放行')
+  // ④ 起点解析：只有可解析的时间才启用该层
+  assert.strictEqual(resolveRunStartedAtMs('2026-09-17T04:17:00Z'), Date.parse('2026-09-17T04:17:00Z'))
+  assert.strictEqual(resolveRunStartedAtMs(''), undefined, '空串 → 该层不生效')
+  assert.strictEqual(resolveRunStartedAtMs('昨天'), undefined, '不可解析 → 该层不生效（不误红）')
 })
 
 // ===== escCell：Markdown 表格单元格转义 =====

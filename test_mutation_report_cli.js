@@ -236,4 +236,72 @@ function schemaReport (seg, mutants) {
   }
 }
 
+// 场景 9（F1 返工 · 同族反例①）：**全体回填**——所有段的报告都来自上一次运行（互差≈0、26h 前）。
+// 打回现场：旧闸门只比较「本批最新的那一份」，互差为 0 时恒放行 → 回填的旧报告被当成今日日报发布。
+// 现必须按 wall-clock 年龄拒绝；同一夹具把闸门关掉（MUTATION_REPORT_MAX_SKEW_MS=0）后必须放行，
+// 证明拒绝确实来自本闸门。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-allbackfill-'))
+  try {
+    const staleAt = new Date(Date.now() - 26 * 3600 * 1000)
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      const reportPath = path.join(segDir, 'mutation.json')
+      fs.writeFileSync(reportPath, JSON.stringify(schemaReport(seg, [mutantOf()])))
+      fs.utimesSync(reportPath, staleAt, staleAt) // 全体同刻：跨段偏斜为 0
+    }
+    const r = runCli([tmp])
+    assert.notStrictEqual(r.code, 0, '全体回填的日报必须拒绝发布（exit 非 0）')
+    assert.ok(r.stderr.includes('疑似缓存回填'), `错误应指出根因是缓存回填，实际 stderr：${r.stderr}`)
+    assert.ok(r.stderr.includes('全体陈旧'), `错误应点名「全体陈旧」这一形态，实际 stderr：${r.stderr}`)
+    assert.ok(r.stderr.includes(REQUIRED_SEGS[0]) && r.stderr.includes('26 小时'),
+      `错误应逐段给出距今小时数，实际 stderr：${r.stderr}`)
+    assert.ok(!r.stdout.includes('🧬 变异测试日报'), '拒绝发布时不得输出日报正文')
+
+    const rOff = runCli([tmp], { env: { ...process.env, MUTATION_REPORT_MAX_SKEW_MS: '0' } })
+    assert.strictEqual(rOff.code, 0, `关闭闸门后同一夹具应放行（排除别处顺手拦下），stderr：${rOff.stderr}`)
+    assert.ok(rOff.stdout.includes('🧬 变异测试日报'), '闸门关闭时应正常输出日报正文')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 场景 10（F1 返工 · 同族反例②）：**跨轮 <12h 的同日回填**——全部段都来自同一天的上一次运行
+// （互差≈0、11h 前）。年龄层看不见（11h < 12h 阈值），只有「本轮运行起点」层能拦下：CI 由
+// mutation.yml 注入 MUTATION_RUN_STARTED_AT=github.run_started_at。不注入时必须放行（本地手工运行
+// 日报不得误红）——两条一起构成「该层真的在起作用」的证据。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-sameday-'))
+  try {
+    const staleAt = new Date(Date.now() - 11 * 3600 * 1000)
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      const reportPath = path.join(segDir, 'mutation.json')
+      fs.writeFileSync(reportPath, JSON.stringify(schemaReport(seg, [mutantOf()])))
+      fs.utimesSync(reportPath, staleAt, staleAt)
+    }
+    const noRunStart = runCli([tmp])
+    assert.strictEqual(noRunStart.code, 0,
+      `未注入本轮起点时 11h 的全体报告在阈值内，必须放行（否则本地手工运行日报会误红），stderr：${noRunStart.stderr}`)
+
+    const r = runCli([tmp], { env: { ...process.env, MUTATION_RUN_STARTED_AT: new Date().toISOString() } })
+    assert.notStrictEqual(r.code, 0, '注入本轮运行起点后，同日跨轮回填必须拒绝发布')
+    assert.ok(r.stderr.includes('早于本轮运行起点'), `错误应点名「早于本轮运行起点」，实际 stderr：${r.stderr}`)
+    assert.ok(r.stderr.includes('11 小时'), `错误应给出折算小时数，实际 stderr：${r.stderr}`)
+    assert.ok(!r.stdout.includes('🧬 变异测试日报'), '拒绝发布时不得输出日报正文')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 场景 11（F1 返工 · 接线）：report job 必须把本轮运行起点喂给闸门——否则第三层在 CI 里永不生效
+// （本机无法执行 Actions，只能对 workflow 文本做结构断言）。
+{
+  const yml = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'mutation.yml'), 'utf8')
+  assert.ok(/MUTATION_RUN_STARTED_AT:\s*\$\{\{\s*github\.run_started_at\s*\}\}/.test(yml),
+    'mutation.yml 的汇总步骤必须注入 MUTATION_RUN_STARTED_AT: ' + '${' + '{ github.run_started_at }}')
+}
+
 console.log('test_mutation_report_cli OK')
