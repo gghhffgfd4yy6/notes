@@ -55,8 +55,9 @@
 
 - 常驻循环 `sleep`：`signal` 加 `typeof` 守卫（此前传入非 AbortSignal 的真值对象会先抛 `TypeError`，定时器回调里再抛一次成为未捕获异常终止进程）；毫秒值统一经 `clampTimerMs` 钳到 `[0, 2147483647]` 再交给 `setTimeout`（此前 `1e12` 被 Node 静默降为 1ms，「等一天」变成立即返回）。
 - 失败归类：`classifySummary` 的「本轮有无失败」只由 `failed` 决定（此前 `total` 缺失/非数字时 `Number(total)||0` 使有失败的摘要返回 `null`，被调度器读成成功）；企业微信 `93000`（invalid webhook key）与文本兜底 `invalid [webhook|access|api] token|key|parameter` 判为永久配置错误（此前落 `UNKNOWN`，常驻对已失效 webhook 无限退避重试）。
-- 脱敏：`redact` 补齐 `Authorization: Bearer|basic <凭据>`、JSON 引号形态 `"appToken":"…"` 与裸 `Bearer <凭据>`（此前这些形态的凭据原样进日志与告警，只抹掉 scheme）。
+- 脱敏：`redact` 补齐 `Authorization: Bearer|basic <凭据>`、JSON 引号形态 `"appToken":"…"`、单引号/带引号关键字/非字符串 JSON 值/URL query 形态与裸 `Bearer|Basic <凭据>`，关键字表补 `password/pwd/session/cookie/credential`（此前这些形态的凭据原样进日志与告警，只抹掉 scheme）。凭据值以 `\s,;}&]` 为边界；裸 scheme 要求凭据 ≥8 字符，避免误抹普通英文句子（`the bearer of good news`）。
 - TLS 预热：`prewarmTls` 的 `count` 补上界（钳到 64）——此前 `1e10`/`2^32` 让 `Array.from({length})` 抛 `RangeError` 整体 reject，略小的值则真的发起海量并发连接。
 - 时间口径：运行异常告警正文的时间、RE2 缺 re2 提醒标记的保留期 cutoff 统一 `Asia/Shanghai`（此前前者随进程时区，后者与标记名基准被拆开，CI 的 UTC 下与 run.log/日报错开一天）。
-- 变异工具链：报告 JSON 的 V8 字符串上限判定移到 `Buffer.concat` 之前（此前先付出分配峰值才发现放不下，且该护栏长期无法被测试触及）；变异日报段内容校验补 `files` 映射缺失/类型非法、`mutants` 非数组、零变异体三类 fail-loud（此前缓存回填的陈旧 artifact 会被当成 0 变异体的满分日报发布），`validateSegments` 的错误逐段带上原因；CLI 集成测试夹具改为真 stryker schema，断言收紧到合计/分段统计值。
+- 变异工具链：报告 JSON 的 V8 字符串上限判定移到 `Buffer.concat` 之前（此前先付出分配峰值才发现放不下，且该护栏长期无法被测试触及）；变异日报段内容校验补 `files` 映射缺失/类型非法、`mutants` 非数组、零变异体三类 fail-loud（此前缓存回填的陈旧 artifact 会被当成 0 变异体的满分日报发布），`validateSegments` 的错误逐段带上原因；CLI 集成测试夹具改为真 stryker schema（补齐 `schemaVersion`/`thresholds`/`source`，并用 ajv 对齐厂商 schema 逐条自校），断言收紧到合计/分段统计值。
+- 独立对抗审查跟进：脱敏再补引号包裹/带引号关键字/单引号/非字符串 JSON 值/URL query 等漏抹形态与关键字表（`password/pwd/session/cookie/credential`），并收掉本批新引入的 `the bearer of good news` 假阳性；变异体 `status` 改按厂商 schema 的 `MutantStatus` enum 校验（此前只要求「非空字符串」，`'Bogus'` 会被静默计入 `total`）；`refreshTimeoutError` 的归因按实际分支改写（NaN→回落默认、负值→按下界，不再一律说成「超出上限钳制」）；`sleep` 摘除侧守卫补断言（此前后变异掉也不会变红）；APP-05 用例改为快照-恢复，不再删掉共享缓存目录里的既有 `re2warn.state.*` 标记。
 

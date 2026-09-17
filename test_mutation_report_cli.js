@@ -28,6 +28,31 @@ function runCli (args, opts = {}) {
   }
 }
 
+// stryker json reporter 的必填字段（权威来源：本仓已安装的 mutation-testing-report-schema）：
+//   顶层 schemaVersion / thresholds / files；FileResult language / source / mutants；
+//   MutantResult id / mutatorName / location / status（取值见 MutantStatus enum）。
+// 夹具一律按真 schema 构造——否则「夹具算不算真报告」本身就成了未验证假设：本批前一版夹具缺
+// thresholds/source，注释却声称「夹具必须是真 stryker schema」，被独立对抗审查 B 组当场证伪。
+const SCHEMA_VERSION = '1.0'
+const THRESHOLDS = { high: 80, low: 60, break: null }
+function mutantOf (over = {}) {
+  return {
+    id: '0',
+    mutatorName: 'BlockStatement',
+    replacement: '{}',
+    status: 'Killed',
+    location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } },
+    ...over
+  }
+}
+function schemaReport (seg, mutants) {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    thresholds: THRESHOLDS,
+    files: { [`${seg}.js`]: { language: 'javascript', source: 'const x = 1\n', mutants } }
+  }
+}
+
 // 场景 1：无参数 → exit 1 + 用法提示
 {
   const r = runCli([])
@@ -46,24 +71,15 @@ function runCli (args, opts = {}) {
 {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-'))
   try {
-    // F3：夹具必须是**真 stryker schema**。json reporter 的形状是
-    // { schemaVersion, files: { "<path>": { language, mutants: [...] } } }；旧夹具写成顶层 mutants
+    // F3：夹具必须是**真 stryker schema**（见文件头 schemaReport 的说明）。旧夹具写成顶层 mutants
     // （无 files）——既不是 stryker 的产出，也正好掩盖了「files 缺失被当成 0 变异体」的 F2 缺陷。
     for (const seg of REQUIRED_SEGS) {
       const segDir = path.join(tmp, 'mutation-report-' + seg)
       fs.mkdirSync(segDir, { recursive: true })
-      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify({
-        schemaVersion: '1.0',
-        files: {
-          [`${seg}.js`]: {
-            language: 'javascript',
-            mutants: [
-              { id: '0', mutatorName: 'BlockStatement', replacement: '{}', status: 'Killed', location: { start: { line: 3, column: 1 }, end: { line: 3, column: 2 } }, killedBy: ['test.js'] },
-              { id: '1', mutatorName: 'BooleanLiteral', replacement: 'false', status: 'Survived', location: { start: { line: 7, column: 1 }, end: { line: 7, column: 2 } } }
-            ]
-          }
-        }
-      }))
+      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify(schemaReport(seg, [
+        mutantOf({ id: '0', mutatorName: 'BlockStatement', replacement: '{}', status: 'Killed', location: { start: { line: 3, column: 1 }, end: { line: 3, column: 2 } }, killedBy: ['test.js'] }),
+        mutantOf({ id: '1', mutatorName: 'BooleanLiteral', replacement: 'false', status: 'Survived', location: { start: { line: 7, column: 1 }, end: { line: 7, column: 2 } } })
+      ])))
     }
 
     const r = runCli([tmp])
@@ -94,8 +110,8 @@ function runCli (args, opts = {}) {
       const segDir = path.join(tmp, 'mutation-report-' + seg)
       fs.mkdirSync(segDir, { recursive: true })
       const payload = seg === staleSeg
-        ? { mutants: [{ id: 1, status: 'Killed' }], testFiles: ['test.js'] } // 上一次运行/旧格式的残留
-        : { files: { [`${seg}.js`]: { mutants: [{ status: 'Killed' }] } } }
+        ? { mutants: [mutantOf()], testFiles: ['test.js'] } // 上一次运行/旧格式的残留（刻意非 schema）
+        : schemaReport(seg, [mutantOf()])
       fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify(payload))
     }
     const r = runCli([tmp])
@@ -117,11 +133,13 @@ function runCli (args, opts = {}) {
     for (const seg of REQUIRED_SEGS) {
       const segDir = path.join(tmp, 'mutation-report-' + seg)
       fs.mkdirSync(segDir, { recursive: true })
-      // 交替两种零内容形态：空 files 映射 / files 非空但 mutants 为空数组
+      // 交替两种零内容形态：空 files 映射 / files 非空但 mutants 为空数组。
+      // 两种都是 **schema 合法**的形状（files 可为空对象、mutants 可为空数组）——正因如此才需要这道
+      // 闸门：schema 允许「没有变异体」，但日报不能把「没有数据」渲染成 🎉 满分。
       const emptyFiles = REQUIRED_SEGS.indexOf(seg) % 2 === 0
       const payload = emptyFiles
-        ? { files: {} }
-        : { files: { [`${seg}.js`]: { language: 'javascript', mutants: [] } } }
+        ? { schemaVersion: SCHEMA_VERSION, thresholds: THRESHOLDS, files: {} }
+        : schemaReport(seg, [])
       fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify(payload))
     }
     const r = runCli([tmp])
@@ -142,18 +160,10 @@ function runCli (args, opts = {}) {
     for (const seg of REQUIRED_SEGS) {
       const segDir = path.join(tmp, 'mutation-report-' + seg)
       fs.mkdirSync(segDir, { recursive: true })
-      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify({
-        schemaVersion: '1.0',
-        files: {
-          [`${seg}.js`]: {
-            language: 'javascript',
-            mutants: [
-              { id: '0', mutatorName: 'BlockStatement', replacement: '{}', status: 'Killed', location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } } },
-              { id: '1', mutatorName: 'ArrayLiteral', replacement: '[]', status: 'RuntimeError', statusReason: 'boom', location: { start: { line: 2, column: 1 }, end: { line: 2, column: 2 } } }
-            ]
-          }
-        }
-      }))
+      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify(schemaReport(seg, [
+        mutantOf({ id: '0' }),
+        mutantOf({ id: '1', mutatorName: 'ArrayLiteral', replacement: '[]', status: 'RuntimeError', statusReason: 'boom', location: { start: { line: 2, column: 1 }, end: { line: 2, column: 2 } } })
+      ])))
     }
     const r = runCli([tmp])
     assert.strictEqual(r.code, 0, `含 RuntimeError 的合法报告必须照常发布，stderr: ${r.stderr}`)
@@ -166,26 +176,27 @@ function runCli (args, opts = {}) {
   }
 }
 
-// 场景 7（CodeRabbit PR #151）：条目缺 status（如 `{}`）会让 countMutant 先 total++ 再什么都计不进去——
-// 零变异体护栏被绕过、分数被压低后照发。必须按段级失败拒绝发布。
+// 场景 7（CodeRabbit PR #151 + 独立对抗审查 B 组）：**缺 status**（`{}`）与**未知 status**（`'Bogus'`）
+// 都会让 countMutant 先 total++ 再什么都计不进去——零变异体护栏被绕过、分数被压低后照发，两者都必须
+// 按段级失败拒绝。B 组反例：本批前一版只要求「非空字符串」，于是 'Bogus' 被接受并计入 total。
 {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-nostatus-'))
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-badstatus-'))
   try {
-    const badSeg = REQUIRED_SEGS[0]
+    const missingSeg = REQUIRED_SEGS[0]
+    const bogusSeg = REQUIRED_SEGS[1]
     for (const seg of REQUIRED_SEGS) {
       const segDir = path.join(tmp, 'mutation-report-' + seg)
       fs.mkdirSync(segDir, { recursive: true })
-      const mutants = seg === badSeg
-        ? [{ id: '0', mutatorName: 'BlockStatement', replacement: '{}' }] // 缺 status
-        : [{ id: '0', mutatorName: 'BlockStatement', replacement: '{}', status: 'Killed', location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } } }]
-      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify({
-        files: { [`${seg}.js`]: { language: 'javascript', mutants } }
-      }))
+      let mutants = [mutantOf()]
+      if (seg === missingSeg) mutants = [{ id: '0', mutatorName: 'BlockStatement', replacement: '{}' }] // 缺 status
+      if (seg === bogusSeg) mutants = [mutantOf({ status: 'Bogus' })] // 非空但不在 MutantStatus enum 内
+      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify(schemaReport(seg, mutants)))
     }
     const r = runCli([tmp])
-    assert.notStrictEqual(r.code, 0, '含缺 status 条目的报告必须拒绝发布（exit 非 0）')
-    assert.ok(r.stderr.includes('缺失或非法 status'), `错误应指出根因是条目缺 status，实际 stderr：${r.stderr}`)
-    assert.ok(r.stderr.includes(badSeg), '错误应指出是哪个分段，便于只重跑该段')
+    assert.notStrictEqual(r.code, 0, '含缺/未知 status 条目的报告必须拒绝发布（exit 非 0）')
+    assert.ok(r.stderr.includes('缺失或未知 status'), `错误应指出根因是条目 status 缺失/未知，实际 stderr：${r.stderr}`)
+    assert.ok(r.stderr.includes(missingSeg), '错误应指出缺 status 的分段，便于只重跑该段')
+    assert.ok(r.stderr.includes(bogusSeg), '错误应指出未知 status 的分段')
     assert.ok(!r.stdout.includes('🧬 变异测试日报'), '拒绝发布时不得输出日报正文')
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })

@@ -2053,6 +2053,7 @@ console.log('========================================\n');
   await test('APP-05：RE2 标记保留期与标记名同用上海日界', async () => {
     // 固定「现在」为 UTC 2026-09-15T20:00:00Z——此刻上海已是 2026-09-16，UTC 仍是 09-15，
     // 两种口径的「7 天前」cutoff 必然差一天（上海 2026-09-09 vs UTC 2026-09-08），断言因此有判别力。
+    // 注意：该固定时刻只用于让边界可判定；真实墙钟下删除窗口与生产不同，故下面必须做快照恢复。
     const FIXED_NOW = Date.parse('2026-09-15T20:00:00Z')
     const savedTz = process.env.TZ
     const realDateNow = Date.now
@@ -2060,8 +2061,17 @@ console.log('========================================\n');
     Date.now = () => FIXED_NOW
     const prefix = 're2warn.state.'
     const markers = ['2026-09-08', '2026-09-09', '2026-09-10']
+    // hermetic（独立对抗审查 B 组实测：本用例会删掉别的运行留在缓存目录里的旧标记——
+    // 它调用的正是真实的保留期清理逻辑，凡早于 cutoff 的既有标记都会被删）。故先快照、finally 原样恢复：
+    // 依赖「测试目录里没有旧标记」是不可靠的假设，而恢复才能真正保证不污染共享缓存目录。
+    const preExisting = []
+    let backup = []
     try {
       fs.mkdirSync(CACHE_DIR, { recursive: true })
+      for (const name of fs.readdirSync(CACHE_DIR)) {
+        if (name.startsWith(prefix)) preExisting.push(name)
+      }
+      backup = preExisting.map(name => [name, fs.readFileSync(path.join(CACHE_DIR, name))])
       for (const d of markers) fs.writeFileSync(path.join(CACHE_DIR, `${prefix}${d}`), 'test')
       xbk.App._cleanupStaleRe2WarnMarkers()
       assert(fs.existsSync(path.join(CACHE_DIR, `${prefix}2026-09-08`)) === false,
@@ -2075,6 +2085,16 @@ console.log('========================================\n');
       else process.env.TZ = savedTz
       for (const d of markers) {
         try { fs.unlinkSync(path.join(CACHE_DIR, `${prefix}${d}`)) } catch (e) { /* 已删/不存在 */ }
+      }
+      // 恢复被本用例的清理逻辑删掉的既有标记（内容与名称一并还原）。
+      // qodo PR #152-4：只有在路径仍「缺失」时才写回，避免覆盖**别的进程**在测试期间新建/更新的
+      // 同名标记（本机没有跨进程锁，测试与应用可能共用默认缓存目录；无条件写回会把它退回陈旧字节）。
+      // 缺失时才补，语义就是「撤销本用例的删除」，不会制造回退。
+      for (const [name, content] of backup) {
+        const target = path.join(CACHE_DIR, name)
+        try {
+          if (!fs.existsSync(target)) fs.writeFileSync(target, content)
+        } catch (e) { /* 恢复失败不影响其它用例 */ }
       }
     }
   })

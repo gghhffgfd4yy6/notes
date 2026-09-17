@@ -27,11 +27,17 @@ function isAbortable (value) {
 // 就响了——一个不可能发生的时长（qodo PR #151-4）。被钳制时额外标注配置请求值，便于定位误填。
 function refreshTimeoutError (requestedMs) {
   const effectiveMs = clampTimerMs(requestedMs)
-  const error = new Error(
-    effectiveMs === requestedMs
-      ? `常驻刷新超过 ${effectiveMs}ms 未完成`
-      : `常驻刷新超过 ${effectiveMs}ms 未完成（配置请求 ${requestedMs}ms，超出 setTimeout 上限已钳制）`
-  )
+  // 归因必须与实际发生的事一致：非有限值走的是**回落默认**、负值走的是**下界**，都不是「超上限钳制」。
+  // 旧文案把三种情况统一写成「超出 setTimeout 上限已钳制」，属错误归因（独立对抗审查 A 组反例）。
+  let note = ''
+  if (!Number.isFinite(requestedMs)) {
+    note = `（配置值 ${String(requestedMs)} 非法，已回落默认 ${effectiveMs}ms）`
+  } else if (requestedMs > MAX_TIMER_MS) {
+    note = `（配置请求 ${requestedMs}ms，超出 setTimeout 上限已钳制）`
+  } else if (requestedMs < 0) {
+    note = `（配置值 ${requestedMs}ms 非法，已按 0 处理）`
+  }
+  const error = new Error(`常驻刷新超过 ${effectiveMs}ms 未完成${note}`)
   error.code = 'INTERVAL_REFRESH_TIMEOUT'
   return error
 }
