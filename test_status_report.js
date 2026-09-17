@@ -141,6 +141,44 @@ try {
     assert.strictEqual(withDate('2026-12-31'), 'ok', '合法日期应判 ok')
   })
 
+  // ===== SS-01：摘要行时间戳必须保留并展示；摘要行之后的 ERROR 不得再渲染成「正常」=====
+  // 旧实现：时间戳在正则里是非捕获组（只作锚定），parseLastRun 的返回值没有任何时间字段；
+  // formatStatus 也不读它，于是「这一轮何时跑的」不可见，崩溃轮与正常轮显示完全一致。
+  test('S12 run.log 摘要行时间戳 → 捕获进 value.at 并在输出中展示', () => {
+    fs.writeFileSync(path.join(tmp, 'run.log'), '2026-09-08 10:00:00 total=42 dedup=5 filtered=7 truncated=0 pushed=28 failed=2 elapsed=3.4s\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.value.at, '2026-09-08 10:00:00', '时间戳必须被捕获（修前 value 无任何时间字段）')
+    assert.strictEqual(status.run.value.interrupted, false, '摘要行之后没有错误行时不得标记中断')
+    assert.strictEqual(status.run.value.total, 42, '计数解析不得因新增捕获组而错位')
+    assert.match(formatStatus(status), /最近一轮：正常 \| 时间 2026-09-08 10:00:00/, '输出必须展示这一轮的摘要时间戳')
+  })
+
+  test('S13 摘要行之后出现 ERROR → 不再渲染「正常」，标记上一轮未正常结束', () => {
+    fs.writeFileSync(path.join(tmp, 'run.log'), [
+      '2026-09-08 10:00:00 total=42 dedup=5 filtered=7 truncated=0 pushed=28 failed=2 elapsed=3.4s',
+      '2026-09-08 10:05:00 ERROR [v3.275.0] 运行异常 原因：HTTP 500'
+    ].join('\n') + '\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.status, 'ok', '自摘要行向前最近的一条完整摘要仍应解析成功')
+    assert.strictEqual(status.run.value.interrupted, true, '摘要行之后有 ERROR 行必须标记该轮中断（修前无此字段）')
+    const output = formatStatus(status)
+    assert.match(output, /最近一轮：⚠️ 上一轮未正常结束/, '崩溃轮必须与正常轮显示不同')
+    assert.doesNotMatch(output, /最近一轮：正常/, '中断轮不得渲染成「正常」')
+    assert.match(output, /时间 2026-09-08 10:00:00/, '中断轮仍要展示最近一条摘要的时间（陈旧程度可见）')
+  })
+
+  test('S14 普通 ALERT 行不参与中断判定；无时间戳的裸摘要行仍可解析', () => {
+    fs.writeFileSync(path.join(tmp, 'run.log'), [
+      'total=3 dedup=1 filtered=1 truncated=0 pushed=1 failed=0 elapsed=0.2s',
+      '2026-09-08 11:00:00 ALERT [v3.275.0] ⚠️ 磁盘剩余空间不足 原因：< 50MB'
+    ].join('\n') + '\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.status, 'ok', '裸 total= 摘要行（无时间戳）仍须可解析')
+    assert.strictEqual(status.run.value.at, '', '无时间戳时 at 为空串')
+    assert.strictEqual(status.run.value.interrupted, false, '普通 ALERT（低磁盘等）不得被当成中断')
+    assert.match(formatStatus(status), /最近一轮：正常 \| 时间 无时间戳/, '无时间戳时明示「无时间戳」而不是假装有')
+  })
+
   // ===== SS-02：channel-health 单条损坏不得整表 invalid（健康通道信息必须保留）=====
   // 旧实现 validChannels 是 Object.values(...).every(...) 全表口径：一条坏记录即整表 invalid，
   // formatStatus 于是走 describe → 只显示「不可读（invalid）」，所有健康通道一并消失。

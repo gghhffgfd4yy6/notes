@@ -79,18 +79,39 @@ function parseJson (read, validate) {
   } catch (error) { return result('invalid') }
 }
 
+// 摘要行之后的日志行是否说明「这一轮没正常走完」（审查 SS-01）。生产侧写日志的顺序是
+// 「先写 total=… 摘要、再在异常分支写 ERROR / ALERT 运行异常」（xbk_app.js:1498 → :1526/:314），
+// 所以摘要行之后出现 ERROR 或「运行异常」即代表该轮在其后中断。只认这两种强信号，
+// 普通 ALERT（低磁盘/日报更新失败等）不参与判定，避免把成功的轮次误报成异常。
+function looksLikeRoundFailure (line) {
+  return /(?:^|\s)ERROR(?:\s|$)|运行异常/.test(line)
+}
+
 function parseLastRun (read) {
   if (read.status !== 'ok') return { status: read.status }
   const lines = read.value.trim().split('\n').filter(Boolean)
   for (let i = lines.length - 1; i >= 0; i--) {
     // 行首锚定：摘要行只可能是「时间戳（本地 YYYY-MM-DD HH:MM:SS 或历史 ISO）+ total=」或裸 total=，
     // 避免 ERROR/ALERT 行文本里恰好含 total=… 子串时被误取。
-    const match = /^(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S* )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=([^\s]+)/.exec(lines[i])
+    // 审查 SS-01：时间戳由非捕获组改为捕获组（旧实现只用来锚定，结果里没有任何时间字段，
+    // 输出无法判断这一轮是何时跑的、也看不出日志已经很久没更新）。
+    const match = /^((?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*) )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=([^\s]+)/.exec(lines[i])
     if (!match) continue
     // 与 parseDiagnostics 同口径：六项计数必须是非负安全整数（超长数字经 Number 得 Infinity/超界，直接跳过该行）
-    const counters = match.slice(1, 7).map(Number)
+    const counters = match.slice(2, 8).map(Number)
     if (!counters.every(validCounter)) continue
-    return result('ok', { total: counters[0], dedup: counters[1], filtered: counters[2], truncated: counters[3], pushed: counters[4], failed: counters[5], elapsed: match[7] })
+    const interrupted = lines.slice(i + 1).some(looksLikeRoundFailure)
+    return result('ok', {
+      at: match[1] ? match[1].trim() : '',
+      total: counters[0],
+      dedup: counters[1],
+      filtered: counters[2],
+      truncated: counters[3],
+      pushed: counters[4],
+      failed: counters[5],
+      elapsed: match[8],
+      interrupted
+    })
   }
   return result('invalid')
 }
@@ -129,7 +150,11 @@ function formatStatus (status) {
   const report = status.report.value
   lines.push(`日报：${describe(status.report)}${report ? ` | ${report.date || '无日期'} | ${report.runs || 0} 轮 | 推送成功：${report.pushed || 0} 条 | 失败：${report.failed || 0} 条 | 待推送（截断）：${report.truncated || 0} 条` : ''}`)
   const run = status.run.value
-  lines.push(`最近一轮：${describe(status.run)}${run ? ` | 获取 ${run.total} | 去重 ${run.dedup} | 过滤 ${run.filtered} | 推送 ${run.pushed} | 失败 ${run.failed} | 截断 ${run.truncated}${run.truncated > 0 ? ' ⚠️' : ''} | 耗时 ${run.elapsed}` : ''}`)
+  // 审查 SS-01：① 展示摘要行时间戳（旧实现把时间戳丢弃，输出里看不出这一轮是何时跑的、是否已陈旧）；
+  // ② 「文件可读」不等于「这一轮正常」——摘要行之后还有 ERROR/运行异常行时说明该轮中断退出，
+  //    不再一律渲染成「正常」（崩溃轮此前与正常轮显示完全一致）。
+  const runState = run && run.interrupted ? '⚠️ 上一轮未正常结束' : describe(status.run)
+  lines.push(`最近一轮：${runState}${run ? ` | 时间 ${run.at || '无时间戳'} | 获取 ${run.total} | 去重 ${run.dedup} | 过滤 ${run.filtered} | 推送 ${run.pushed} | 失败 ${run.failed} | 截断 ${run.truncated}${run.truncated > 0 ? ' ⚠️' : ''} | 耗时 ${run.elapsed}` : ''}`)
   const channels = status.channels.value
   if (channels) {
     // 与 validChannels 同口径逐条过滤（审查 SS-02）：损坏条目单独计数并明示，健康通道照常展示。
