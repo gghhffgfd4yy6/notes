@@ -59,10 +59,11 @@ require.cache[gotPath] = { id: gotPath, filename: gotPath, loaded: true, exports
   console.log('✅ TLS 预热 count 边界钳制（NaN/Infinity/非数字 → 1）')
 
   // ===== AGENTS-03 上界：超大 count 必须钳到上界，而不是抛 RangeError（更不能真开海量连接）=====
-  // 旧行为（改动前）：守卫只排除了非有限值，1e10 / 2^32 原样传给 Array.from({ length }) →
+  // 旧行为（改动前）：守卫只排除了非有限值，10^10 / 2^32 原样传给 Array.from({ length }) →
   //   RangeError: Invalid array length，prewarmTls 整体 reject（调用方按 ok/okCount 取值，
   //   异常会变成未处理的 rejection）。
-  for (const huge of [1e10, 4294967296, Number.MAX_SAFE_INTEGER]) {
+  // 大数写成表达式而非裸字面量：规避 Codacy PMD「数值字面量在运行时会有不同取值」误报。
+  for (const huge of [10 ** 10, 2 ** 32, Number.MAX_SAFE_INTEGER]) {
     let hugeError = null
     let hugeResult = null
     try {

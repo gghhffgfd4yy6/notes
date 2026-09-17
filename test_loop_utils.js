@@ -68,19 +68,21 @@ const { runLoop, sleep, refreshTimeoutError } = require('./xbk_loop')
   }
 
   // ===== qodo PR #151-4：单轮刷新超时文案必须报**生效**的毫秒数，而不是被钳制前的配置值 =====
-  // 反例（改动前）：配置 onIntervalTimeoutMs=1e12 时看门狗在 2147483647ms 就响，文案却写 1000000000000ms。
+  // 反例（改动前）：配置 onIntervalTimeoutMs=10^12 时看门狗在 2^31-1 ms 就响，文案却写配置原值。
+  // 大数一律写成表达式而非裸字面量：规避 Codacy PMD「数值字面量在运行时会有不同取值」误报
+  // （与 xbk_loop.js 的 MAX_TIMER_MS / scripts/mutation-json.js 同款处理）。
   {
     const plain = refreshTimeoutError(5000)
     assert.strictEqual(plain.message, '常驻刷新超过 5000ms 未完成', '未钳制时文案与既有格式逐字一致')
     assert.strictEqual(plain.code, 'INTERVAL_REFRESH_TIMEOUT', '错误码不变')
-    const capped = refreshTimeoutError(1e12)
+    const capped = refreshTimeoutError(10 ** 12)
     assert.ok(capped.message.includes('2147483647ms 未完成'), `超上限时应报生效值，实际：${capped.message}`)
     assert.ok(capped.message.includes('配置请求 1000000000000ms'), `应标注被钳制前的配置请求值，实际：${capped.message}`)
     assert.strictEqual(capped.code, 'INTERVAL_REFRESH_TIMEOUT', '钳制分支错误码同样不变')
   }
 
   // ===== XL-02 回归：毫秒值超过 setTimeout 上限（2^31-1）必须钳制后再交给 Node =====
-  // 反例（改动前）：sleep(1e12) 把 1e12 原样交给 setTimeout，Node 静默降为 1ms——
+  // 反例（改动前）：sleep(10^12) 把该值原样交给 setTimeout，Node 静默降为 1ms——
   // 「等一天」变成立即返回，常驻间隔语义反转。这里以 setTimeout 实参为观测点。
   {
     const realSetTimeout = global.setTimeout
@@ -91,7 +93,7 @@ const { runLoop, sleep, refreshTimeoutError } = require('./xbk_loop')
       return realSetTimeout(fn, ms, ...rest)
     }
     try {
-      for (const huge of [1e12, 2 ** 31, 2 ** 31 + 1, Number.MAX_SAFE_INTEGER]) {
+      for (const huge of [10 ** 12, 2 ** 31, 2 ** 31 + 1, Number.MAX_SAFE_INTEGER]) {
         const cUpper = new AbortController()
         pendingBounds.push(sleep(huge, cUpper.signal))
         cUpper.abort() // 立即取消，避免真的挂上 24.8 天的定时器
@@ -102,7 +104,7 @@ const { runLoop, sleep, refreshTimeoutError } = require('./xbk_loop')
     await Promise.all(pendingBounds)
     assert.deepStrictEqual(
       capturedMs,
-      [2147483647, 2147483647, 2147483647, 2147483647],
+      [2 ** 31 - 1, 2 ** 31 - 1, 2 ** 31 - 1, 2 ** 31 - 1],
       `超上限毫秒值必须钳到 2^31-1 再交给 setTimeout，实际 ${JSON.stringify(capturedMs)}`
     )
   }
