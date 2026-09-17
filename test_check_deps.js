@@ -11,7 +11,10 @@ const { checkDependencies, satisfiesNodeRange } = require('./scripts/check-deps'
 
 // 沙箱：<dir>/package.json（可控声明清单）+ <dir>/scripts/check-deps.js（复制真实实现）
 // + <dir>/node_modules/<name>/{package.json,index.js}。ROOT 由实现自算为 <dir>。
-function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [] }) {
+// marker（F5 返工）：给每个依赖的 index.js 注入「被加载即记账」——在隔离树上取证「检查真的跑了、
+// 且经 ROOT 基准解析并加载了声明清单里的包」。只断言「status 0 且零输出」时，基线源码（无
+// require.main 守卫、直接执行只加载模块）的空跑也恰好满足该条件（不可证伪）。
+function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [], marker = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-deps-sandbox-'))
   fs.mkdirSync(path.join(dir, 'scripts'))
   fs.copyFileSync(path.join(__dirname, 'scripts', 'check-deps.js'), path.join(dir, 'scripts', 'check-deps.js'))
@@ -20,7 +23,9 @@ function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [] }) {
     const pkgDir = path.join(dir, 'node_modules', name)
     fs.mkdirSync(pkgDir, { recursive: true })
     fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.js' }))
-    fs.writeFileSync(path.join(pkgDir, 'index.js'), 'module.exports = {}\n')
+    fs.writeFileSync(path.join(pkgDir, 'index.js'), marker
+      ? `require('node:fs').appendFileSync(${JSON.stringify(marker)}, ${JSON.stringify(name)} + '\\n')\nmodule.exports = {}\n`
+      : 'module.exports = {}\n')
   }
   // brokenDeps：落在 <dir>/scripts/node_modules/ 下——同名包在「以 scripts/ 为基准」的
   // 解析下会先命中且 require 即抛错，用于固定「解析基准必须与 resolve 同为项目根」这条契约。
@@ -33,8 +38,10 @@ function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [] }) {
   return dir
 }
 
-function runCheckDepsSandbox (dir) {
-  return spawnSync(process.execPath, [path.join(dir, 'scripts', 'check-deps.js')], { encoding: 'utf8', cwd: dir })
+function runCheckDepsSandbox (dir, env = {}) {
+  return spawnSync(process.execPath, [path.join(dir, 'scripts', 'check-deps.js')], {
+    encoding: 'utf8', cwd: dir, env: { ...process.env, ...env }
+  })
 }
 
 function fakeRe2Class ({ ok = true } = {}) {
@@ -402,14 +409,19 @@ test('F6 默认 load 以项目根为基准：scripts/ 下同名坏包不得影�
   }
 })
 
-// F5 回归：默认参数就是生产路径（run_tests.js 的 checkDependencies() 无参调用），此前
-// test_check_deps.js 每条用例都显式注入 resolve/load，默认分支零断言。本条在隔离树上走
-// 完全无参的调用：默认 manifest（ROOT/package.json）→ 默认 resolve/load（ROOT 基准）→ 静默通过。
-// 默认值任一被改坏（清单退回硬编码、基准漂移、误判版本）都会让 status/输出变红。
-test('F5 无参调用（默认 manifest/resolve/load）在隔离依赖树上静默通过', () => {
+// F5 回归（返工）：默认参数就是生产路径（run_tests.js 的 checkDependencies() 无参调用），此前
+// test_check_deps.js 每条用例都显式注入 resolve/load，默认分支零断言。上一版只断言「无参调用
+// status 0 且 stdout/stderr 为空」——但基线源码没有 require.main 守卫，直接执行只加载模块、什么
+// 都不检查，也恰好满足这两条（空跑假绿，独立验证 V3 实测在基线上仍绿）。
+// 返工后断言锚定「检查真的跑了」：每个依赖的 index.js 在被**加载**时往记账文件追加自己的名字，
+// 只有真正走完「默认 manifest → 默认 resolve/load（ROOT 基准）」的检查才会留下两条记账。
+// → 靶向移除 CLI 守卫（= 基线形态）或让清单退回硬编码，本条立刻红。
+test('F5 无参调用（默认 manifest/resolve/load）在隔离依赖树上真的完成检查且静默通过', () => {
+  const marker = path.join(os.tmpdir(), `check-deps-run-marker-${process.pid}-${Date.now()}.log`)
   const dir = makeCheckDepsSandbox({
     manifest: { name: 'sandbox', version: '1.0.0', dependencies: { 'xbk-default-path-a': '1.0.0' }, optionalDependencies: { 'xbk-default-path-b': '1.0.0' } },
-    deps: ['xbk-default-path-a', 'xbk-default-path-b']
+    deps: ['xbk-default-path-a', 'xbk-default-path-b'],
+    marker
   })
   try {
     const r = runCheckDepsSandbox(dir)
@@ -419,8 +431,19 @@ test('F5 无参调用（默认 manifest/resolve/load）在隔离依赖树上静�
     if (String(r.stdout) !== '' || String(r.stderr) !== '') {
       throw new Error(`成功路径应零输出，实际 stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`)
     }
+    // 关键的证伪锚点：默认路径真的加载了声明清单里的两个包（不检查就没有记账）
+    if (!fs.existsSync(marker)) {
+      throw new Error('默认参数的检查没有真正执行：依赖一次都没被加载（基线无 CLI 守卫时的空跑形态——silent exit 0 会被空跑满足）')
+    }
+    const ran = fs.readFileSync(marker, 'utf8')
+    for (const name of ['xbk-default-path-a', 'xbk-default-path-b']) {
+      if (!ran.includes(name)) {
+        throw new Error(`默认清单漏探了 ${name}（依赖漂移零覆盖）：实际记账=${JSON.stringify(ran)}`)
+      }
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+    fs.rmSync(marker, { force: true })
   }
 })
 
