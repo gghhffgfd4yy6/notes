@@ -8669,6 +8669,10 @@ console.log('========================================\n');
     // onerror 是紧随其后的真实属性，必须清除）
     const tagNameEq = '<a"b= " onerror="alert(1)">'
     assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(sanitizeDecodedHtml(tagNameEq)), false, `标签名里的 = 不得被当作属性赋值: ${tagNameEq}`)
+    // R1a 自造同族：标签名里出现 '=' 后又用引号开值——HTML5 视引号为标签名字符（tag name 状态
+    // 下引号不是值引号），标签在引号处遇到 '>' 结束，onerror 仍是紧随其后的真实属性。
+    const tagNameQuoted = "<a=b'c' onerror='alert(1)'>"
+    assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(sanitizeDecodedHtml(tagNameQuoted)), false, `标签名里的引号不得开启属性值: ${tagNameQuoted}`)
   })
 
   await test('sanitizeDecodedHtml 未闭合引号不泄漏共享正则状态（P2-02：跨调用结果一致）', () => {
