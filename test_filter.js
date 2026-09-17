@@ -9098,6 +9098,33 @@ console.log('========================================\n');
     assertEqual(path.basename(p).startsWith('.'), false, `getFilePath 产物不得以点开头（隐藏文件）: ${path.basename(p)}`)
   })
 
+  // R4（V6 实锤）：B8 的加前缀修法**引入了新碰撞**——'url_' 前缀本身也是合法末段，
+  // 于是 getFileName('https://x/.json') === getFileName('https://x/url_.json') === 'url_.json'，
+  // 两个不同 pushUrl 共用同一缓存文件（判重记录互相覆盖）。改为「以 . 或 url_ 开头 ⇒ 前置 url_」的单射映射。
+  await test('B8-F7: 隐藏文件防护不得与 url_ 前缀的合法名撞名（V6 新碰撞回归）', () => {
+    assertEqual(getFileName('https://x/.json'), 'url_.json', '以点开头仍加前缀（隐藏文件防护保持）')
+    assertEqual(getFileName('https://x/url_.json'), 'url_url_.json', '本身以 url_ 开头的名字必须转义前缀')
+    assertEqual(getFileName('https://x/.json') === getFileName('https://x/url_.json'), false,
+      '两个不同 URL 不得映射到同一缓存文件名（碰撞即判重记录互相覆盖）')
+    const urls = ['https://x/.hidden', 'https://x/url_.hidden', 'https://x/url_x', 'https://x/x', 'https://x/.json', 'https://x/url_.json', 'https://x/data.json']
+    const names = urls.map(getFileName)
+    assertEqual(new Set(names).size, names.length, `不同 URL 不得撞名：${JSON.stringify(names)}`)
+  })
+
+  // R4（V6 实锤）：F7 原条目另一半（getFilePath 截断碰撞）逐字未动——两条仅在**第 200 字节之后**
+  // 不同的长名会被截断成同一路径，而生产 cacheName 直接来自 getFileName(pushUrl)。
+  // 修法：截断结果附带全名摘要（anonKey 64 位，仅字母数字），保证「长名 → 路径」单射。
+  await test('B8-F7: 超长名截断必须保持单射（仅第 200 字节后不同的两条长名不得同路径）', () => {
+    const a = 'u'.repeat(260) + 'aaaa.json' // 269 字节
+    const b = 'u'.repeat(260) + 'bbbb.json' // 与 a 仅在第 200 字节之后不同
+    const pa = getFilePath(a)
+    const pb = getFilePath(b)
+    assertEqual(pa !== pb, true, `截断后仍必须区分不同长名（同路径即判重缓存互相覆盖）：${path.basename(pa)} vs ${path.basename(pb)}`)
+    assertEqual(Buffer.byteLength(path.basename(pa)) <= 200 && Buffer.byteLength(path.basename(pb)) <= 200, true, '截断产物仍须 <= 200 字节')
+    assertEqual(pa.endsWith('.json') && pb.endsWith('.json'), true, '截断仍应保留扩展名')
+    assertEqual(getFilePath(a) === pa, true, '同一名字必须稳定映射到同一路径（缓存名要能跨轮复用）')
+  })
+
   // ============================================================
   // v3.258 变异驱动补测（V3 尾部存活变异体定向击杀）
   // 数据来源：8-13 全量变异报告（v3-part4 存活 1171 个，其中

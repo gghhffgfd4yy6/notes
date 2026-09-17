@@ -429,14 +429,21 @@ function createMessageStore ({
         const f = safe.codePointAt(0)
         return safe.slice(0, f > 0xffff ? 2 : 1)
       })()
-      // 文件名超长截断：先尝试保留扩展名，保证总字节 <= 200
+      // 文件名超长截断：先尝试保留扩展名，保证总字节 <= 200。
+      // F7 回归（R4/V6）：单纯截断会让「仅第 200 字节之后不同」的两个长名映射到同一路径——
+      // 生产 cacheName 直接来自 getFileName(pushUrl)，两个不同 pushUrl 的判重缓存会互相覆盖。
+      // 因此截断结果附带**全名**的确定性摘要（anonKey 64 位拼接，只保留字母数字，不引入新的
+      // 路径保留字符），使「长名 → 路径」保持单射；不超过 200 字节的名字不进此分支，行为不变。
       if (Buffer.byteLength(safe, 'utf8') > 200) {
+        const digest = String(Utils.anonKey(safe)).replace(/[^0-9a-z]/gi, '')
         const dot = safe.lastIndexOf('.')
-        let ext = dot > 0 ? safe.slice(dot) : ''
-        let maxBase = 200 - Buffer.byteLength(ext, 'utf8')
-        if (maxBase < 1) { ext = ''; maxBase = 200 } // 扩展名本身超长：放弃保留扩展名
+        const ext = dot > 0 ? safe.slice(dot) : ''
+        let suffix = `-${digest}${ext}`
+        let maxBase = 200 - Buffer.byteLength(suffix, 'utf8')
+        if (maxBase < 1) { suffix = `-${digest}`; maxBase = 200 - Buffer.byteLength(suffix, 'utf8') } // 扩展名本身超长：放弃保留
+        if (maxBase < 1) { suffix = ''; maxBase = 200 } // 摘要超长（不可能发生）：退回纯截断
         const base = truncateByBytes(dot > 0 ? safe.slice(0, dot) : safe, maxBase)
-        safe = keepOne(base) + ext
+        safe = keepOne(base) + suffix
       }
       // 兜底校验：截断后仍可能超 200 字节（如扩展名超长且首字符为多字节、Math.max(1) 强保
       // 字符时），放弃扩展名整体再按字节截断，保证不变量成立。
@@ -1275,7 +1282,13 @@ function createMessageStore ({
       // 排查易漏）。补前缀 'url_' 落地防护；这只改变这些 URL 的缓存文件名，不改判重语义
       // （判重身份来自消息内容/URL 本身，与缓存文件名无关），已存在的隐藏文件由启动清理
       // 的残留回收与下一次写入自然迁移。
-      if (name.startsWith('.')) name = 'url_' + name
+      // F7 回归（R4/V6）：只给「以点开头」的名字加前缀会与该前缀自身的合法名字撞名——
+      // getFileName('https://x/.json') 与 getFileName('https://x/url_.json') 都是 'url_.json'
+      // → 两个不同 pushUrl 共用同一缓存文件（互相覆盖判重记录）。两条前缀规则合并为
+      // 「以 . 或 url_ 开头 ⇒ 前置 url_」：该映射是单射——像集恒以 'url_' 开头，
+      // '.'-来源 → 'url_.' + …，'url_'-来源 → 'url_url_' + …，二者不相交，且不以 'url_'
+      // 开头的普通名字不会落进像集。
+      if (name.startsWith('.') || name.startsWith('url_')) name = 'url_' + name
       if (!name.endsWith('.json')) name += '.json'
       return name
     }

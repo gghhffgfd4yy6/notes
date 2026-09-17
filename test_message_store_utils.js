@@ -495,4 +495,47 @@ check('F4: 启动清理真实回收 .reclaim 残留、且不动合法缓存文�
   }
 })
 
+// ===== F7（B8 回归；V6 实锤两处碰撞）=====
+// ① 名字层：末段以点开头加 'url_' 前缀会与「本身以 url_ 开头」的合法名撞名；
+// ② 路径层：getFilePath 的 200 字节截断会让「仅第 200 字节后不同」的长名映射到同一路径。
+// 生产 cacheName 直接来自 getFileName(pushUrl)，两者都意味着两个不同 pushUrl 共用缓存文件
+// （判重记录互相覆盖）。这里用**真实** Utils（xbk_utils.anonKey）做摘要，验证真实碰撞面。
+const { createUtils } = require('./xbk_utils')
+const longNameStore = createMessageStore({
+  Config: { cache: { maxSize: 10000 } },
+  Utils: createUtils({ fs: require('node:fs'), safeRe: (p, f) => new RegExp(p, f) }),
+  fs: makeCacheFs({ [FAKE_ROOT]: 'dir' }),
+  path,
+  crypto: { randomUUID: () => 'uuid' },
+  normalize: () => {},
+  storage: {},
+  constants: {}
+})
+
+check('F7: 末段以点开头 / 以 url_ 开头的名字不得撞同一缓存文件（getFileName 单射）', () => {
+  const dotted = store.getFileName('https://example.com/.json')
+  const prefixed = store.getFileName('https://example.com/url_.json')
+  assert.strictEqual(dotted, 'url_.json', '以点开头仍加 url_ 前缀（隐藏文件防护不得回退）')
+  assert.strictEqual(prefixed, 'url_url_.json', '以 url_ 开头必须转义前缀，避免与前一条撞名')
+  assert.notStrictEqual(dotted, prefixed, '两个不同 URL 不得映射到同一缓存文件名')
+  const urls = [
+    'https://e.example/.hidden', 'https://e.example/url_.hidden', 'https://e.example/url_x',
+    'https://e.example/x', 'https://e.example/.json', 'https://e.example/url_.json', 'https://e.example/data.json'
+  ]
+  const names = urls.map(u => store.getFileName(u))
+  assert.strictEqual(new Set(names).size, names.length, `不同 URL 不得撞名：${JSON.stringify(names)}`)
+})
+
+check('F7: 超长名截断必须保持单射（仅第 200 字节后不同的两条长名不得映射同一路径）', () => {
+  const a = 'u'.repeat(260) + 'aaaa.json' // 269 字节：与 b 仅在第 200 字节之后不同
+  const b = 'u'.repeat(260) + 'bbbb.json'
+  const pa = longNameStore.getFilePath(a)
+  const pb = longNameStore.getFilePath(b)
+  assert.notStrictEqual(pa, pb, `截断后仍必须区分不同长名（生产 cacheName 来自 getFileName(pushUrl)，同路径即判重记录互相覆盖）：${path.basename(pa)}`)
+  assert.ok(Buffer.byteLength(path.basename(pa)) <= 200 && Buffer.byteLength(path.basename(pb)) <= 200, '截断产物仍须 <= 200 字节')
+  assert.ok(pa.endsWith('.json') && pb.endsWith('.json'), '截断仍应保留扩展名')
+  assert.ok(!/[:*?"<>|]/.test(path.basename(pa)), `摘要不得引入路径保留字符：${path.basename(pa)}`)
+  assert.strictEqual(longNameStore.getFilePath(a), pa, '同一名字必须稳定映射到同一路径（缓存名要能跨轮复用）')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
