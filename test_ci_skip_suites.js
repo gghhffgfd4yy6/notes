@@ -719,6 +719,98 @@ assert.ok(strykerIdx > 0, 'mutation.yml 应包含 stryker 运行步骤')
 assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHILD:\s*'1'/,
   'mutation.yml 的变异测试 step 必须设 XBK_MUTATION_CHILD=1（否则重复整表 append，几百次即撞 1MiB 上限）')
 
+// 3e PR #156 返工的三条 CI 硬约束：① 缓存 key 与 restore-keys 前缀必须含测试指纹；
+//    ② 剥离步不得再碰 reports/inc-*.json；③ artifact 收窄到 reports/mutation/ 并 fail-loud。
+// 三处都是 Qodo 评审判定为真问题的位置，靠注释兜不住——每条都做成「改回旧形态立刻红」的靶向断言。
+// 断言只读**真实 YAML 行**（剔除注释行）：否则把证据写进注释、代码改回去也能骗过门禁，等于没修。
+{
+  const indentOf = line => line.length - line.trimStart().length
+  const yamlOnly = text => text.split('\n').filter(l => !l.trim().startsWith('#'))
+  // 从一个 step 的文本里取出 `run: |` 之后的 shell 正文（缩进深于 run: 的行），注释一律不算证据
+  const shellBodyOf = (stepText) => {
+    const lines = stepText.split('\n')
+    const runAt = lines.findIndex(l => l.trim() === 'run: |')
+    if (runAt < 0) return null
+    const runIndent = indentOf(lines[runAt])
+    const body = []
+    for (let i = runAt + 1; i < lines.length; i++) {
+      if (lines[i].trim() === '' || indentOf(lines[i]) <= runIndent) break
+      body.push(lines[i])
+    }
+    return body.join('\n')
+  }
+  const stepEndAfter = (at, nameLen) => {
+    const next = mutationYml.indexOf('\n      - name: ', at + nameLen)
+    return next > 0 ? next : mutationYml.length
+  }
+
+  // (1) 「恢复增量缓存」：主 key 与 restore-keys 都必须含测试指纹，且不得再有裸兜底前缀。
+  //     coverageAnalysis:'off' 下 incremental-differ 感知不到测试变化，会拿**旧 killed/survived** 去喂
+  //     stryker.config.js 的 thresholds.break=65 分数门禁 ⇒ 测试指纹不进 key（及 restore-keys 前缀），
+  //     「源码没动、只改/只删测试」就能用旧分数过门禁。actions/cache 的 restore-keys 只有**前缀**语义，
+  //     故测试段还必须排在源段之前；原来那条无条件的裸兜底 stryker-${{ matrix.name }}- 必须删除。
+  const cacheAt = mutationYml.indexOf('- name: 恢复增量缓存')
+  assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（缓存策略无从核对即视为回归）')
+  const cacheEnd = mutationYml.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
+  assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
+  const cacheLines = yamlOnly(mutationYml.slice(cacheAt, cacheEnd))
+  const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
+  assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
+  assert.ok(/-tests-\$\{\{ hashFiles\(/.test(keyLine),
+    '缓存 key 必须含测试指纹段 `-tests-' + '${' + '{ hashFiles(...) }}`：一旦改回不含测试的 `stryker-' + '${' + '{ matrix.name }}-' + '${' + '{ hashFiles(源) }}`，' +
+    '只改/只删测试就会命中旧基线，把旧 killed/survived 的分数喂给 thresholds.break=65 门禁（Qodo High）')
+  assert.ok(/-src-\$\{\{ hashFiles\(/.test(keyLine),
+    '缓存 key 的源指纹段 `-src-' + '${' + '{ hashFiles(...) }}` 不得被删掉（否则源码变化也不再换基线）')
+  const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
+  assert.ok(restoreIdx >= 0, '「恢复增量缓存」必须声明 restore-keys')
+  const restoreIndent = indentOf(cacheLines[restoreIdx])
+  const restoreKeys = []
+  for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
+    if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
+    restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
+  }
+  assert.ok(restoreKeys.length > 0, 'restore-keys 不得为空（增量基线需要兜底）')
+  const badRestore = restoreKeys.filter(k => !/^stryker-\$\{\{ matrix\.name \}\}-tests-\$\{\{ hashFiles\(/.test(k))
+  assert.deepStrictEqual(badRestore, [],
+    '每条 restore-key 都必须以 `stryker-' + '${' + '{ matrix.name }}-tests-' + '${' + '{ hashFiles(...) }}` 开头（限在同一测试指纹内兜底）：' +
+    'actions/cache 的 restore-keys 只有前缀匹配语义，改回裸的 `stryker-' + '${' + '{ matrix.name }}-` 会在主 key 落空后' +
+    '跨「不同测试状态」恢复旧基线，等于没修')
+
+  // (2) 剥离步不得再把 reports/inc-*.json 塞回去：inc 是**下一次运行** incremental-differ 的复用输入，
+  //     statusReason 会被原样透传进新产出的 JSON/HTML；在这里置空串，等于让「被复用的变异体为什么
+  //     存活/报错」永久丢失（与既有「不动 mutation.html」完全同一条理由）。只允许剥机器报告 mutation.json。
+  const stripName = '- name: 剥离报告中的 statusReason（artifact/缓存瘦身）'
+  const stripAt = mutationYml.indexOf(stripName)
+  assert.ok(stripAt >= 0, 'mutation.yml 必须存在「剥离报告中的 statusReason」步骤')
+  const stripStep = mutationYml.slice(stripAt, stepEndAfter(stripAt, stripName.length))
+  const stripScript = shellBodyOf(stripStep)
+  assert.ok(stripScript !== null, '剥离步骤必须以 `run: |` 执行 shell（否则无从核对剥离目标）')
+  assert.ok(stripScript.includes('reports/mutation/mutation.json'),
+    '剥离 shell 必须仍覆盖 `reports/mutation/mutation.json`（该字段的机器报告冗余照旧剥离，消费方语义零变化）')
+  assert.ok(!stripScript.includes('reports/inc-'),
+    '剥离 shell 不得再出现 `reports/inc-*.json`（重新塞回去即红）：inc 是下一次运行的增量复用输入，' +
+    '把 statusReason 置空会让被复用变异体的存活/报错原因永久丢失（Qodo Medium / Observability）')
+  assert.ok(stripScript.includes('node scripts/mutation-report.js --strip'),
+    '剥离必须经生产 CLI（node scripts/mutation-report.js --strip）执行，不得内联脚本')
+
+  // (3) 「上传变异报告」的 path 必须收窄为 reports/mutation/ 并 fail-loud：reports/ 会把**未剥离**的
+  //     inc-*.json 一起打包（artifact 侧无消费方，纯白带体积），而 stryker 没产出报告时还会静默上传一个
+  //     只含 inc 的 artifact，把「缺段」拖到汇总 job 才暴露。
+  const uploadName = '- name: 上传变异报告'
+  const uploadAt = mutationYml.indexOf(uploadName)
+  assert.ok(uploadAt >= 0, 'mutation.yml 必须存在「上传变异报告」步骤')
+  const uploadLines = yamlOnly(mutationYml.slice(uploadAt, stepEndAfter(uploadAt, uploadName.length)))
+  const uploadPath = uploadLines.find(l => /^\s*path:/.test(l))
+  assert.ok(uploadPath, '「上传变异报告」必须声明 path')
+  assert.strictEqual(uploadPath.trim(), 'path: reports/mutation/',
+    '「上传变异报告」的 path 必须是 `reports/mutation/`：改回 `reports/` 会把未剥离的 inc-*.json 一起打包' +
+    '（artifact 侧无消费方），同时失去「stryker 没产出报告 ⇒ 上传响亮变红」的 fail-loud 语义')
+  const noFiles = uploadLines.find(l => /^\s*if-no-files-found:/.test(l))
+  assert.ok(noFiles && noFiles.trim() === 'if-no-files-found: error',
+    '「上传变异报告」必须带 `if-no-files-found: error`：stryker 崩溃/未产出报告时不得静默上传一个只含 inc 的 artifact')
+}
+console.log('✅ mutation.yml：缓存 key/兜底前缀含测试指纹、剥离不含 inc、artifact 收窄为 reports/mutation/ 且 fail-loud')
+
 // ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────
 // 背景：test_app.js 的 `--only=<子串>` 曾**静默失效**——旧实现用 process.argv.indexOf('--only')
 // 定位，等号写法下没有独立的 '--only' 元素 → 返回 -1 → 不过滤、照跑全部用例；而 test_app_p.js

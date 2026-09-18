@@ -449,9 +449,15 @@ function schemaReport (seg, mutants) {
   }
 }
 
-// 场景 17（F-04 · 接线）：落盘剥离必须接在 CI 的「stryker 产出之后、上传 artifact 之前」——
-// 放在上传之后就只是白跑（artifact 早已带上剥离前的体积）；且必须 if: always()（与「清理缓存回填的
-// 旧报告」「上传变异报告」同口径）、覆盖 mutation.json 与 inc-*.json（两者实测各占 99.89% / 99.78%）。
+// 场景 17（F-04 · 接线；PR #156 返工后口径）：落盘剥离必须接在 CI 的「stryker 产出之后、上传 artifact
+// 之前」——放在上传之后就只是白跑（artifact 早已带上剥离前的体积）；必须 if: always()（与「清理缓存
+// 回填的旧报告」「上传变异报告」同口径）。**剥离范围自 PR #156 起收窄为只剥机器报告**：
+//   * reports/mutation/mutation.json —— 剥离（消费方 readReportJson 本就把该字段读成空串，语义零变化）；
+//   * reports/inc-*.json —— **不得剥离**：它是下一次运行 incremental-differ 的复用输入，statusReason 会被
+//     原样透传进新产出的 JSON/HTML，在这里置空串会让被复用变异体「为什么存活/报错」永久丢失
+//     （Qodo Medium / Observability）。
+// 另：断言只看 `run: |` 的 **shell 正文**（不认注释）——否则把剥离目标写进注释、代码改回去也能骗过
+// `text.includes(...)`，等于门禁被注释糊过去（本场景上一版正是这样：inc 断言只由注释满足）。
 {
   const yml = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'mutation.yml'), 'utf8')
   const all = yml.split('\n')
@@ -478,9 +484,22 @@ function schemaReport (seg, mutants) {
   const text = job.slice(stripAt, stepEnd).join('\n')
   assert.ok(text.split('\n').some(l => l.trim() === 'if: always()'),
     '剥离步骤必须带 if: always()（stryker 失败时不得被跳过；此时步骤内显式筛掉不存在的文件）')
-  assert.ok(text.includes('reports/mutation/mutation.json'), '剥离必须覆盖 stryker 的 mutation.json')
-  assert.ok(text.includes('reports/inc-*.json'), '剥离必须覆盖 --incremental 基线（同一 schema 的同一冗余）')
-  assert.ok(text.includes('node scripts/mutation-report.js --strip'), '剥离必须经生产 CLI 执行（不得内联脚本）')
+  // 取 `run: |` 之后的 shell 正文（缩进深于 run: 的行）作为唯一判据：注释不算证据。
+  const stepLines = text.split('\n')
+  const runAt = stepLines.findIndex(l => l.trim() === 'run: |')
+  assert.ok(runAt >= 0, '剥离步骤必须以 `run: |` 执行 shell（否则无从核对剥离目标）')
+  const runIndent = stepLines[runAt].length - stepLines[runAt].trimStart().length
+  const shellBody = []
+  for (let i = runAt + 1; i < stepLines.length; i++) {
+    if (stepLines[i].trim() === '' || (stepLines[i].length - stepLines[i].trimStart().length) <= runIndent) break
+    shellBody.push(stepLines[i])
+  }
+  const shell = shellBody.join('\n')
+  assert.ok(shell.includes('reports/mutation/mutation.json'), '剥离必须覆盖 stryker 的 mutation.json')
+  assert.ok(!shell.includes('reports/inc-'),
+    '剥离**不得**再覆盖 reports/inc-*.json（PR #156 返工，Qodo Medium）：inc 是下一次运行的增量复用输入，' +
+    '把 statusReason 置空会让被复用变异体的存活/报错原因永久丢失；只看 shell 正文，注释里写什么都不算证据')
+  assert.ok(shell.includes('node scripts/mutation-report.js --strip'), '剥离必须经生产 CLI 执行（不得内联脚本）')
 }
 
 console.log('test_mutation_report_cli OK')
