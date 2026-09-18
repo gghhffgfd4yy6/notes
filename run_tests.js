@@ -91,7 +91,12 @@ for (const s of SUITES) {
     // timeout + killSignal 见 TEST_TIMEOUT（RT-03）：挂死套件强杀后走下方失败分支，不再永久阻塞。
     // detached:true（F6）：套件自成进程组组长，超时后据此整组杀伤（见 killSuiteTree）——
     // 与 run_mutation.js 的 runTests 同口径。
-    execFileSync(process.execPath, [file], { stdio: 'inherit', timeout: TEST_TIMEOUT, killSignal: 'SIGKILL', detached: true })
+    // cwd 固定为 __dirname（与 run_unit_tests.js:121 同口径，该处注释给出全部理由）：
+    // test_ci_skip_suites.js / test_tag_validator.js 按 cwd 读 .github/workflows/test.yml /
+    // package.json / CHANGELOG.md，前者更是直接断言「请在仓库根目录运行本套件」——不固定 cwd 时
+    // 从子目录调用本入口会假红；cwd 落在同构副本目录时则会「对账到别的仓库」而假绿。
+    // 以仓库根为 cwd 的调用（npm test / CI）行为不变。
+    execFileSync(process.execPath, [file], { cwd: __dirname, stdio: 'inherit', timeout: TEST_TIMEOUT, killSignal: 'SIGKILL', detached: true })
     const ms = Date.now() - t0
     results.push({ ...s, ok: true, ms })
     console.log(`\n  ✅ ${s.name} 通过（${(ms / 1000).toFixed(1)}s）\n`)
