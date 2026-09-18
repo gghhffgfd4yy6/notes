@@ -6741,7 +6741,7 @@ console.log('========================================\n');
   })
 
   // v3.169：README 不再维护版本号（避免每次发布手动同步的过时源）——版本一致性收敛为
-  // 文件头 ↔ CHANGELOG 最新 ↔ package.json 三方自动校验；README 的版本信息指向 package.json/CHANGELOG
+  // 文件头 ↔ CHANGELOG 最新 ↔ package.json ↔ package-lock 根元数据 四方自动校验；README 的版本信息指向 package.json/CHANGELOG
 
   console.log('\n📂 102. 配置防御（v3.80）')
 
