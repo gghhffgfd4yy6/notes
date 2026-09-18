@@ -12,6 +12,28 @@ const {
   collectStats, findReportJson, analyzeSegment, analyze, postIssue
 } = require('./scripts/mutation-report.js')
 
+// CodeQL js/file-system-race（本仓库必需检查）：同一路径「先 statSync 检查、再 readFileSync 使用」是
+// check-then-use —— 检查与使用之间该路径可被换成另一个对象。与本仓 scripts/mutation-json.js 的
+// readGuardedBytes（STG-01 修法）同口径：这条路径只按路径「访问一次」（openSync('r')），之后只对 fd
+// 做 fstatSync/readSync —— 读到、量到的必然是同一个对象，路径二次查找（check-then-use）不再存在。
+// 返回 { bytes, size, mtimeMs }：分别等价于原先的 readFileSync(p) / statSync(p).size / statSync(p).mtimeMs。
+function readAllViaFd (p) {
+  const fd = fs.openSync(p, 'r')
+  try {
+    const st = fs.fstatSync(fd)
+    const buf = Buffer.allocUnsafe(st.size)
+    let off = 0
+    while (off < st.size) {
+      const n = fs.readSync(fd, buf, off, st.size - off, off)
+      if (n <= 0) break
+      off += n
+    }
+    return { bytes: buf.subarray(0, off), size: st.size, mtimeMs: st.mtimeMs }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
 // Fixture：3 段（正常 + 错误 + 全被杀）→ 覆盖全部 6 条核心分支
 //   1) 段汇总表（正常行）
 //   2) 段汇总表（error 行：含 ❌ 前缀）
@@ -513,12 +535,14 @@ try {
     const r = writeStrippedReport(p)
     assert.strictEqual(r.changed, true, '含非空 statusReason 时必须判定为已改写')
     assert.strictEqual(r.before, beforeBytes.length, 'before 必须等于剥离前的真实字节数')
-    assert.strictEqual(r.after, fs.statSync(p).size, 'after 必须等于落盘后的真实字节数')
+    // 落盘后的大小/字节一次按 fd 取回（同一对象），不再「statSync 检查 → readFileSync 使用」二次按路径查找
+    const afterRead = readAllViaFd(p)
+    const afterBytes = afterRead.bytes
+    assert.strictEqual(r.after, afterRead.size, 'after 必须等于落盘后的真实字节数')
     assert.strictEqual(r.saved, beforeBytes.length - r.after)
     assert.ok(r.after < beforeBytes.length / 100,
       `剥离后应缩到 1% 以下，实际 ${beforeBytes.length} → ${r.after}`)
 
-    const afterBytes = fs.readFileSync(p)
     assert.ok(!afterBytes.includes(Buffer.from(ESCAPED_REASON)), '落盘文件不得再含 statusReason 原文')
     assert.ok(!/"statusReason"\s*:\s*"[^"]/.test(afterBytes.toString('utf8')),
       '落盘文件不得含非空 statusReason 值')
@@ -532,7 +556,7 @@ try {
     // 幂等：已剥离的文件再剥一次必须是「不改写」（否则每次跑都会白刷 mtime）
     const again = writeStrippedReport(p)
     assert.strictEqual(again.changed, false, '已剥离文件重复剥离必须判定为无需改写')
-    assert.deepStrictEqual(fs.readFileSync(p), afterBytes, '幂等调用不得改动字节')
+    assert.deepStrictEqual(readAllViaFd(p).bytes, afterBytes, '幂等调用不得改动字节')
   })
 
   check('剥离前后 analyzeSegment 聚合结果逐字段一致（门禁输入语义零变化）', () => {
@@ -598,12 +622,13 @@ try {
     const p = path.join(stripTmp, 'no-reason.json')
     const payload = JSON.stringify(stripFixture(undefined)) // 值为 undefined ⇒ JSON.stringify 省略该键
     fs.writeFileSync(p, payload)
-    const before = fs.statSync(p)
+    const before = readAllViaFd(p)
     const r = writeStrippedReport(p)
     assert.strictEqual(r.changed, false, '无 statusReason 时必须判定为无需改写')
     assert.strictEqual(r.saved, 0)
-    assert.strictEqual(fs.readFileSync(p, 'utf8'), payload, '字节必须逐字不变')
-    assert.strictEqual(fs.statSync(p).mtimeMs, before.mtimeMs, '未改写时 mtime 必须不变')
+    const after = readAllViaFd(p)
+    assert.strictEqual(after.bytes.toString('utf8'), payload, '字节必须逐字不变')
+    assert.strictEqual(after.mtimeMs, before.mtimeMs, '未改写时 mtime 必须不变')
   })
 } finally {
   fs.rmSync(stripTmp, { recursive: true, force: true })
