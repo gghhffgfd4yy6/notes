@@ -11,13 +11,29 @@ const fs = require('fs')
 
 const ROOT = path.join(__dirname, '..')
 
+// QG2（Codacy/Opengrep 抑制说明——本文件三处告警均为**纯语法判定**，与真实风险无关）：
+//   1. pathtraversal-non-literal-fs-filename（「动态构造文件/路径信息」）：规则只放行字符串字面量
+//      首参（其 pattern-not 全是 `$MOD.fn("...", ...)`），而这里读的是 ROOT/package.json 与
+//      require.resolve 出来的依赖清单路径（模块常量 + 清单派生），无法用字面量表达；口径与
+//      check-version.js / run_mutation.js 等已排除的 CI 工具脚本一致：固定/派生路径，非用户输入。
+//   2. non-literal-require（两条规则命中同一行）：「require($X) 且 $X 非字符串字面量」同样是纯语法
+//      判定，**任何形参白名单校验都无法消除它**。取值域证据：name 只来自 package.json 的
+//      dependencies + optionalDependencies（declaredRuntimeDependencies，仓库自有清单；读不到清单时
+//      回落内置 ['got', NATIVE_DEP]），devDependencies 只走 resolve-only 分支、永不进入 load()；
+//      且 checkDependencies 先要求 resolve(name, { paths: [ROOT] }) 成功才会 load(name)。
+//      test_check_deps.js 的 F5/F6 沙箱用例把「默认清单真的被加载」「解析基准钉在 ROOT」两条钉死。
+// 故对三处逐行加 `// nosemgrep`（Semgrep 原生行内抑制；Codacy 的 opengrep wrapper 不传
+// --disable-nosem，且在解析 JSON 时显式跳过 extra.is_ignored 的结果，故抑制在 Codacy 侧同样生效）。
+// 不改成显式映射表 require('got')/require('re2')：那会退化 F1（探测清单必须来自 package.json），
+// 新增运行时依赖会被报成「缺少依赖」的假红，方向是削弱既有门禁而非加固。
+
 // re2 是唯一需要「重建原生绑定」这一步的依赖：它的修复指引与普通依赖不同（见输出分支）
 const NATIVE_DEP = 're2'
 
 // F1：探测清单必须来自 package.json 的运行时声明。此前清单硬编码在代码里
 // （load('got') + resolve('re2')），声明清单变化或新增运行时依赖时预检零覆盖（依赖漂移不可见）。
 function readPackageManifest () {
-  return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
+  return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')) // nosemgrep（见文件头：路径由模块常量组成，非用户输入）
 }
 
 // 运行时声明清单：dependencies + optionalDependencies（devDependencies 是测试/工具链，不参与运行时预检）
@@ -139,7 +155,7 @@ function satisfiesNodeRange (versionText, range) {
 function readNativeEngineRange () {
   try {
     const manifestPath = require.resolve(`${NATIVE_DEP}/package.json`, { paths: [ROOT] })
-    const nativePkg = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    const nativePkg = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) // nosemgrep（manifestPath 由 require.resolve 给出，非用户输入）
     return nativePkg && nativePkg.engines ? nativePkg.engines.node : null
   } catch (error) {
     return null
@@ -169,7 +185,7 @@ function nodeVersionProblems (pkg, currentVersion) {
 // 与 probe 侧的 resolve(name, { paths: [ROOT] }) 口径不一致：scripts/ 下一旦出现同名包，
 // 就会「resolve 到一个实例、require 到另一个实例」，探针与真实加载各测一个（潜在不一致）。
 function loadFromRoot (name) {
-  return require(require.resolve(name, { paths: [ROOT] }))
+  return require(require.resolve(name, { paths: [ROOT] })) // nosemgrep（name 取值域 = package.json 运行时声明清单，见文件头）
 }
 
 function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, manifest = readPackageManifest, includeDevDependencies = false } = {}) {

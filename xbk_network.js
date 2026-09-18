@@ -19,8 +19,11 @@ const DETERMINISTIC_LOCAL_CODES = new Set(['EBODYLIMIT'])
 //     每次请求必然超时，且现象是「请求超时」而非「配置有问题」，比回落默认值更糟；
 //   * 非整数不猜用户意图（不四舍五入/不向上取整），一律按非法配置处理；
 //   * 整数但越上界（1e12、2147483648…）钳到 2^31-1 并**告警留痕**（不静默）——钳制值语义不变。
+// 上界写成表达式而非裸字面量：2147483647 会被 Codacy 的 PMD InnaccurateNumericLiteral 判为
+// 「数值字面量在运行时会有不同取值」（同 xbk_loop.js MAX_TIMER_MS / scripts/mutation-json.js
+// MAX_STRING_LENGTH 的既有写法）。2 ** 31 - 1 的运行时值精确等于 2147483647（test_network.js 已钉）。
 const MIN_TIMEOUT_MS = 100
-const MAX_TIMEOUT_MS = 2147483647
+const MAX_TIMEOUT_MS = 2 ** 31 - 1
 const DEFAULT_TIMEOUT_MS = 5000
 
 // net-7：重试退避上限（指数退避与 Retry-After 两条路径共用）。上游给出天文数字的等待时不得把单轮
@@ -39,7 +42,8 @@ const RFC850_DATE_RE = /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Su
 const ASCTIME_DATE_RE = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/
 // delta-seconds（RFC 9110 的 1*DIGIT）上界：超过 2^31-1 秒（≈68 年）不可能是真实回访时刻，
 // 按非法形态处理（Number 为 Infinity 的数字串同理），不把垃圾头当有效来源。
-const MAX_DELTA_SECONDS = 2147483647
+// 同上：裸 2147483647 触发 PMD InnaccurateNumericLiteral，改写为等值表达式。
+const MAX_DELTA_SECONDS = 2 ** 31 - 1
 
 // net-7：解析 Retry-After（RFC 9110：delta-seconds 非负整数，或上述三种 HTTP-date）→ 毫秒。
 // 只认这两种合法形态，其余（空串、'1.5'、'-5'、非日期文本、ISO-8601）返回 null 交由指数退避兜底——

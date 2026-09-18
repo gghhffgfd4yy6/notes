@@ -1,6 +1,21 @@
 'use strict'
 
 // 统一安全文件入口：状态、日志和消息缓存都通过同一套普通文件检查与原子写入。
+//
+// Codacy/Opengrep「The application dynamically constructs file or path information」
+// （规则 pathtraversal-non-literal-fs-filename）在本模块是**结构性误报**：本模块就是「按调用方给出的
+// 路径做普通文件读写」的入口，fs.* 的首参按定义必然是变量，而该规则只放行字符串字面量
+// （其 pattern-not 全是 `$MOD.fn("...", ...)`），故本文件不可能在该规则下通过，且任何「改写」都只是
+// 换一种写法而不会降低真实风险。该规则要防的东西在本模块由运行期防线覆盖：
+//   · 入口类型闸门：isRegularOrMissing 的 lstatSync 普通文件校验（空串/非字符串直接拒绝）；
+//   · 写入：唯一 tmp 名（pid + 时间 + 12 位 crypto 随机）→ O_EXCL('wx') 创建 → fsync → 原子 rename，
+//     文件 0600、目录 0700，rename 替换目标本身不跟随符号链接；
+//   · 读取：readSafeTextResult 以 O_NOFOLLOW 打开 + fstat 复检 + 读后复检路径，
+//     readFdRange 只从已打开的 fd 有界读取。
+// 路径来源不是外部净输入：调用方 xbk_message_store.getFilePath / xbk_app._writeRunLog 已做 basename
+// 清洗，本模块的 filePath 只由这些内部调用点与部署常量构成。故对「本次改动触及的」动态路径调用点
+// 逐行加 `// nosemgrep`（Semgrep 原生行内抑制；Codacy 的 opengrep wrapper 不传 --disable-nosem，且
+// 解析 JSON 时显式跳过 extra.is_ignored 的结果，故抑制在 Codacy 侧同样生效）。
 const fs = require('fs')
 const path = require('path')
 const crypto = require('node:crypto')
@@ -31,7 +46,7 @@ function ensureParent (filePath) {
   // 口径不一致；缓存目录首建即在此处，同机其他用户可进入目录并读取/替换缓存文件）。目录必须有
   // 执行位才能访问其中文件，0700 即 0600 的等价目录形态；mode 只在新建目录时生效，已存在的
   // 目录不做 chmod（不改动部署侧既有权限）。
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 }) // nosemgrep
 }
 
 // 尽力 fsync 父目录（审查 STG-04）：rename 的持久性要靠目录项的 fsync 才成立。
@@ -41,7 +56,7 @@ function fsyncDirBestEffort (filePath) {
   const dir = path.dirname(filePath)
   let dfd
   try {
-    dfd = fs.openSync(dir, 'r')
+    dfd = fs.openSync(dir, 'r') // nosemgrep
     fs.fsyncSync(dfd)
   } catch (e) {
     console.warn(`目录 fsync 失败（本次写入仍视为成功，掉电后可能丢失该次 rename）${dir}: ${e && e.code ? e.code : e.message}`)
@@ -73,8 +88,8 @@ function writeAtomic (filePath, text, label = '缓存文件') {
     // 每次使用唯一临时文件，避免预置/竞态 .tmp 符号链接；rename 替换目标本身不会跟随目标链接。
     // S2245：Math.random 伪随机可预测（临时文件路径防预置/竞态），改加密随机
     tmpFile = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`
-    fd = fs.openSync(tmpFile, 'wx', 0o600)
-    fs.writeFileSync(fd, text, { encoding: 'utf8' })
+    fd = fs.openSync(tmpFile, 'wx', 0o600) // nosemgrep（tmpFile 由 filePath + pid + 时间 + crypto 随机构成）
+    fs.writeFileSync(fd, text, { encoding: 'utf8' }) // nosemgrep（首参是 fd 不是路径）
     fs.fsyncSync(fd) // 内容先落盘，再 rename 提交
     fs.closeSync(fd)
     fd = -1
@@ -110,15 +125,15 @@ function writeAtomicIfAbsent (filePath, text, label = '缓存初始化') {
   try {
     ensureParent(filePath)
     // wx 打开成功即证明该文件由本次调用创建；EEXIST 时 openSync 抛错、fd 仍为 -1，不会误删他人文件。
-    fd = fs.openSync(filePath, 'wx', 0o600)
-    fs.writeFileSync(fd, text, { encoding: 'utf8' })
+    fd = fs.openSync(filePath, 'wx', 0o600) // nosemgrep（filePath 已过 isRegularOrMissing 类型闸门）
+    fs.writeFileSync(fd, text, { encoding: 'utf8' }) // nosemgrep（首参是 fd 不是路径）
     fs.fsyncSync(fd) // 与 writeAtomic 同口径：内容落盘后再视为初始化成功（审查 STG-04）
     return true
   } catch (e) {
     if (e?.code === 'EEXIST') return true // 另一进程已创建：不覆盖，视为初始化成功
     if (fd >= 0) {
       // 清理半写残骸（可能是本次写入的部分内容，也可能是空文件）；失败只告警，不影响返回语义。
-      try { fs.unlinkSync(filePath) } catch (e2) { console.warn(`${label}半写残骸清理失败 ${filePath}:`, e2.message) }
+      try { fs.unlinkSync(filePath) } catch (e2) { console.warn(`${label}半写残骸清理失败 ${filePath}:`, e2.message) } // nosemgrep
     }
     console.error(`${label}写入失败 ${filePath}:`, e.message)
     return false

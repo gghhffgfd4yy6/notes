@@ -86,30 +86,53 @@ function readReportJson (reportPath, options = {}) {
   //   已先校验"对 analyze-artifacts.js 并不成立，此处据实修正口径）。
   // Codacy MEDIUM：path.resolve() 防御性 normalize（公开 API，不假设上游已校验）
   const abs = path.resolve(reportPath)
-  // F1：读取前的护栏——先 stat 拿到真实大小与文件类型，再决定是否整文件读入。
+  // F1：读取前的护栏——拿到真实大小与文件类型后才决定是否整文件读入。
   // 此前唯一的尺寸守卫（strippedLength > maxStringLength）落在 Buffer.concat 的分配峰值**之后**：
   // 超限输入要先付出一次整份报告的分配才发现放不下；而且非普通文件（目录/FIFO/socket）会走
   // readFileSync——目录抛不带路径的 EISDIR，FIFO 直接把进程挂在读上。
-  let stat
+  //
+  // TOCTOU（CodeQL js/file-system-race）：早先的实现是「statSync(abs) 判类型/大小 → readFileSync(abs)
+  // 按同一路径二次查找」。检查与使用之间文件可被替换（换 inode、换类型、或替换成更大/更小的文件），
+  // 于是「检查看到的」与「实际读到的」可以不是同一个文件。改为**一次 openSync + 只对 fd 判定与读取**：
+  // 路径到对象的绑定只发生一次，类型/大小判定与整份读取作用于同一个 inode，不存在「检查后被换」的窗口。
+  // O_NONBLOCK：FIFO 单独以 O_RDONLY 打开会阻塞到出现写端（旧实现用 statSync 先拒绝，不会阻塞）；
+  // 加 O_NONBLOCK 让 open 立即返回，随后 fstat 判为非常规文件而拒绝。对常规文件无副作用。
+  const openFlags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK
+  let fd
   try {
-    stat = fs.statSync(abs)
+    fd = fs.openSync(abs, openFlags)
   } catch (err) {
+    // open 阶段失败（ENOENT/EACCES/ENOTDIR 等）原生异常消息不含被读路径，这里补上上下文
     throw new Error(`无法读取 ${abs}：${err.message}`)
-  }
-  if (!stat.isFile()) {
-    throw new Error(`无法读取 ${abs}：不是普通文件（目录/FIFO/socket 一律拒绝整文件读入）`)
-  }
-  if (stat.size > maxFileBytes) {
-    throw new Error(`报告文件 ${abs} 为 ${stat.size} 字节，超过预读上限 ${maxFileBytes} 字节：拒绝整文件读入`)
   }
   let buf
   try {
-    buf = fs.readFileSync(abs) // Buffer 读取，绕开字符串长度上限
-  } catch (err) {
-    // 读取阶段失败（ENOENT/EACCES/EISDIR 等）原生异常消息不含被读路径，这里补上上下文
-    // （实测目录入参抛 EISDIR: illegal operation on a directory, read，无法定位是哪个报告）
-    // stat 与 read 之间文件仍可能被替换/删除（TOCTOU），故这段兜底保留。
-    throw new Error(`无法读取 ${abs}：${err.message}`)
+    let stat
+    try {
+      stat = fs.fstatSync(fd)
+    } catch (err) {
+      throw new Error(`无法读取 ${abs}：${err.message}`)
+    }
+    if (!stat.isFile()) {
+      throw new Error(`无法读取 ${abs}：不是普通文件（目录/FIFO/socket 一律拒绝整文件读入）`)
+    }
+    if (stat.size > maxFileBytes) {
+      // 上限语义与带路径/尺寸的报错口径保持不变（上限仍是策略值 maxFileBytes，尺寸取自同一个 fd）
+      throw new Error(`报告文件 ${abs} 为 ${stat.size} 字节，超过预读上限 ${maxFileBytes} 字节：拒绝整文件读入`)
+    }
+    try {
+      // 按 fd 读（不再按路径二次查找）：读到的就是上面 fstat 判定的那个对象，Buffer 读取绕开字符串长度上限
+      buf = fs.readFileSync(fd)
+    } catch (err) {
+      // 读取阶段失败（EACCES/EBADF 等）原生异常消息不含被读路径，这里补上上下文
+      throw new Error(`无法读取 ${abs}：${err.message}`)
+    }
+  } finally {
+    try {
+      fs.closeSync(fd)
+    } catch (err) {
+      // 关闭失败不得覆盖主流程的错误/结果；仅 fd 泄漏一种后果，且进程随后退出。
+    }
   }
   const chunks = []
   let pos = 0

@@ -50,7 +50,9 @@ function latestChangelogVersion (changelog) {
   const versions = [...String(changelog === undefined || changelog === null ? '' : changelog)
     .matchAll(/^##\s*v?(\d+\.\d+)/gm)].map(m => m[1])
   if (!versions.length) return null
-  return versions.reduce((max, v) => (compareBaseVersion(v, max) > 0 ? v : max))
+  // 显式初始值 = 首元素（上面已保证 versions 非空）：reduce 无初始值时本就以首元素起算，
+  // 故这与原写法逐元素等价，只是满足 SonarCloud S6959「reduce 必须给初始值」。
+  return versions.reduce((max, v) => (compareBaseVersion(v, max) > 0 ? v : max), versions[0])
 }
 
 // 纯判定（无 I/O）：ok=false 时 messages 为要打印的错误行（含 ❌ 前缀）。
