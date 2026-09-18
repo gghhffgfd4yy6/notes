@@ -258,6 +258,37 @@ jobs:
           # 同时被 run_mutation.js 与 test_run_mutation_cli.js 复用。
           XBK_MUTATION_CHILD: '1'
 
+      # F-04（落盘侧，REV-CI）：修掉 statusReason 的「纯废重」膨胀。stryker 的 command runner 把每个
+      # 变异体的整段测试输出写进 statusReason，实测占 mutation-report.json 的 99.89%
+      # （真实 artifact 实测：103,101,102 → 116,206 字节）；而全仓消费方只在**内存**里剥掉它、从不写回，
+      # 于是每份上传 artifact 与 reports/ 缓存都白背这份废重。这里在上传**之前**落盘剥离。
+      # 范围与理由：
+      #   * reports/mutation/mutation.json —— 机器报告；剥离后消费方（readReportJson）读到的对象逐字段不变
+      #     （它本来就把该字段置空串），门禁语义零变化；
+      #   * reports/inc-*.json —— --incremental 基线，**同一 schema、同一冗余**（实测 103,211,154 → 225,895）。
+      #     stryker 只把它当 `JSON.parse` 读入（project-reader.js readIncrementalReport，注释明写未做 schema
+      #     校验），statusReason 仅在 incremental-differ 里被原样透传（reuse 判定只看 status + 覆盖信息）⇒
+      #     置空串不改增量复用行为，同时把 actions/cache 里的 stryker-* 体积一起打下来；
+      #   * 不动 mutation.html —— 那是给人看的明细留档，剥掉它等于删掉「这个变异体为什么存活/报错」这条信息。
+      # 为什么在上传之前：artifact 取的就是此刻的磁盘状态（缓存保存是 job 结束后的 post 步骤，也取此刻状态）。
+      # 为什么 if: always()：与「清理缓存回填的旧报告」「上传变异报告」同口径；stryker 失败时本步只会看到
+      #   「无文件」并显式跳过——它**只重写已存在的文件、从不新建**，因此不会把崩溃段伪装成有报告，
+      #   validateSegments 的缺段判据与 validateFreshness 的 mtime 判据都不受影响（剥离只发生在 stryker
+      #   刚刚产出的文件上；缓存回填的报告在本 job 顶部已被 rm -rf 清掉）。
+      - name: 剥离报告中的 statusReason（artifact/缓存瘦身）
+        if: always()
+        run: |
+          shopt -s nullglob
+          targets=()
+          for f in reports/mutation/mutation.json reports/inc-*.json; do
+            if [ -f "$f" ]; then targets+=("$f"); fi
+          done
+          if [ ${#targets[@]} -eq 0 ]; then
+            echo "ℹ️  无报告产物可剥离（stryker 未产出报告），跳过"
+            exit 0
+          fi
+          node scripts/mutation-report.js --strip "${targets[@]}"
+
       # 明细报告留档（inc-*.json + mutation.json/html），artifact 有公开下载 API
       - name: 上传变异报告
         if: always()
