@@ -474,20 +474,59 @@ function createUtils (options = {}) {
   // 返回 valueQuotes：正扫过程中处于「引号外」状态所遇到的各引号位置，即**真正开启一个属性值**
   // 的引号。_protectAttrPairs 依赖它区分「属性值开启引号」与「未加引号值里的杂散引号」——
   // 后者会把回扫出的伪属性对误判成可保护段，从而把后续真事件属性的属性名藏进占位符（P2-01）。
+  //
+  // P1-01 续（审查 REV-P2 发现 A）：标签起始集合 [A-Za-z/!?] 太宽。HTML5 词法下 `</` 后跟
+  // 字母才是结束标签（Markup declaration open / end tag open），`<!`、`<?` 只可能是标记声明或
+  // 伪注释，三者都**不是**「属性在其中的普通标签」：它们各自以自己的规则消费到下一个 `>` 或不消费，
+  // 且其中的引号**不开启任何属性值**。旧实现把它们一律按普通起始标签跑属性状态机，于是
+  // `</x='><img src=x onerror=alert(1)>'` 里伪注释段内的 `'` 被记进 valueQuotes ⇒ 后续
+  // `_protectAttrPairs` 回扫出 `x='><img src=x onerror=alert(1)>'` 这个伪属性对，因
+  // quoteOpensValue=true 而整段占位 ⇒ 段内真实 <img> 的 onerror 未被 _stripEventAttrs 清洗、
+  // 原样出网（输出与输入逐字节相同）。四条载荷（`</x=`、`</ x=`、`<! x=`、`<? x=`）同源。
+  //
+  // 修复 = 把状态机补全到 HTML5 的三种「非普通标签起始」：标签起始（end tag open，`</`+字母
+  // 走 tagName）、端标签（`</`+非字母按 bogus comment 处理）、伪注释（`<!`/`<?` 非
+  // `<!--`、`<!DOCTYPE`、`<![CDATA[` → bogus comment 吃到下一个 `>`）。伪注释/端标签一律
+  // **不记 valueQuotes**，因此段内引号不再能伪造可保护属性对；同时它们已经走到 `>`，
+  // 区间也照旧覆盖该前缀（与旧实现一致，不影响 _protectAttrPairs 的 inTag 判定）。
   _htmlTagSpans (html) {
     const spans = []
     const valueQuotes = new Set()
     const n = html.length
+    // 大小写不敏感前缀比较（<!DOCTYPE 任意大小写，HTML5 同义）
+    const startsWithCI = (html, pos, word) => {
+      if (pos + word.length > html.length) return false
+      for (let k = 0; k < word.length; k++) {
+        const a = html.charCodeAt(pos + k) | 0x20
+        if (a !== word.charCodeAt(k)) return false
+      }
+      return true
+    }
     let i = 0
     while (i < n) {
       if (html[i] !== '<') { i++; continue }
-      // 标签起始判定：'<' 后须为 ASCII 字母（标签名）或 '/'、'!'、'?'（结束标签/声明/处理指令）。
-      // 其余形态（空白、数字、'=' 等）按 HTML5 数据态语义只是文本，不得开启标签区间。
-      if (!/[A-Za-z/!?]/.test(html[i + 1] || '')) { i++; continue }
+      // 标签起始判定（HTML5 数据态）：'<' 后须为 ASCII 字母（开始标签）或 '/'（结束标签）；
+      // '!'、'?'、空白、数字、'=' 等一律只是文本/标记声明，不进属性状态机、不记 valueQuotes。
+      const next = html[i + 1] || ''
+      if (!/[A-Za-z/]/.test(next)) { i++; continue }
+      let state
+      if (next === '/') {
+        // 结束标签：'</' + ASCII 字母 → 标签名态；'</' + 其它 → HTML5 bogus comment（吃到 '>'）
+        if (/[A-Za-z]/.test(html[i + 2] || '')) { state = 'tagName'; i += 2 } else { state = 'bogusComment'; i += 2 }
+      } else if (next === '!') {
+        // 标记声明起始：只有 <!--、<!DOCTYPE、<![CDATA[ 是合法声明；其余 → HTML5 bogus comment
+        state = (html.startsWith('<!--', i) || startsWithCI(html, i, '<!doctype') || html.startsWith('<![CDATA[', i))
+          ? 'markupDeclaration'
+          : 'bogusComment'
+        i += 2
+      } else {
+        state = 'tagName'
+        i++
+      }
       const start = i
-      i++
       // 简化状态机（只跟踪属性边界与引号状态，不解析属性名内容）：
       //   tagName → beforeAttr → attrName → afterAttrName → beforeValue → valueDQ/valueSQ/valueUQ → afterValue
+      //   markupDeclaration / bogusComment（无属性、无引号状态）
       // 关键规则（均对照 HTML5 规范）：
       //   · tagName：只有空白 / '/' 结束标签名；引号、'='、'<' 都是标签名字符；
       //   · beforeAttr：空白/'/'保持；其余（含引号、'='）开启新属性名；
@@ -495,10 +534,15 @@ function createUtils (options = {}) {
       //   · afterAttrName：'='→beforeValue；其余非空白 → 重消费开启新属性名；
       //   · beforeValue：跳过空白后，引号才是**真正的属性值开启引号**（记入 valueQuotes）；
       //     非引号字符 → 未加引号值；
-      //   · valueUQ：空白结束值；'>' 结束标签；其余（含 '<'、'"'、'\''、'='）都是值的普通字符。
-      let state = 'tagName'
+      //   · valueUQ：空白结束值；'>' 结束标签；其余（含 '<'、'"'、'\''、'='）都是值的普通字符；
+      //   · markupDeclaration / bogusComment：不解析属性，只在 '>' 处结束（与 HTML5 一致）。
       while (i < n) {
         const ch = html[i]
+        if (state === 'bogusComment' || state === 'markupDeclaration') {
+          i++
+          if (ch === '>') break
+          continue
+        }
         if (state === 'valueDQ') {
           if (ch === '"') state = 'afterValue'
           i++
