@@ -352,7 +352,10 @@ function canStreamRequest (method) {
 }
 
 function streamRequest (method, url, options, callback) {
-  const stream = got.stream[method](url, options)
+  // 白名单闸门（跟进 Codacy dynamic-method-invocation，PR #154）：调用点只传 'post'/'get' 两个字面量，
+  // 其余一律 fail-closed，避免「用非静态数据取对象方法再调用」这种形态。
+  if (method !== 'post' && method !== 'get') throw new Error('streamRequest: 不支持的 method: ' + method)
+  const stream = (method === 'post' ? got.stream.post : got.stream.get)(url, options)
   const chunks = []
   let response = null
   let total = 0

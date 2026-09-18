@@ -136,13 +136,13 @@ jobs:
           - name: utils
             src: "xbk_utils.js"
             mutate: "xbk_utils.js"
-          # sendnotify（1631 行）拆 2 段
+          # sendnotify（1634 行）拆 2 段
           - name: sendnotify-part1
             src: "xbk_sendNotify_slim.js"
             mutate: "xbk_sendNotify_slim.js:1-750"
           - name: sendnotify-part2
             src: "xbk_sendNotify_slim.js"
-            mutate: "xbk_sendNotify_slim.js:751-1631"
+            mutate: "xbk_sendNotify_slim.js:751-1634"
           # 小文件各一任务
           - name: failure-policy
             src: "xbk_failure_policy.js"
