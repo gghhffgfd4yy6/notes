@@ -135,6 +135,68 @@ const {
   try { partialRet = writeAtomicIfAbsent(partial, 'full-payload') } finally { fs.writeFileSync = origWriteFileSync }
   assert.strictEqual(partialRet, false, '写失败应返回 false')
   assert.strictEqual(fs.existsSync(partial), false, '写失败后不得留下半写残骸（否则 existsSync 早退使缓存永久不自愈）')
+  // 残骸若留下会怎样：下一次调用走 EEXIST 早退、返回 true，把**半写的坏内容**当成有效缓存。
+  // 这里断言修后能真正重新初始化出有效内容（半写残骸存在时该断言为红）。
+  assert.strictEqual(writeAtomicIfAbsent(partial, '[]'), true, '残骸清理后下一次初始化应成功')
+  assert.strictEqual(fs.readFileSync(partial, 'utf8'), '[]', '下一次初始化必须写入有效内容（残骸存在时 EEXIST 早退，坏内容永久残留）')
+
+  // ===== WIN-01（qodo #154 发现 1）：写失败清理必须先 close 再 unlink =====
+  // Windows 上「本进程仍持有句柄」的文件 unlink 会抛 EPERM/EBUSY，半写残骸于是留在缓存路径；
+  // 而消费侧 _ensureFileExists 以 existsSync 早退 → 坏文件被当成「已初始化」。旧实现在 catch 里
+  // 直接 unlinkSync，fd 要等到 finally 才关闭。
+  // 本机是 Linux/FUSE：unlink 已打开的 fd 本来就允许，**无法直接复现 Windows 内核行为**，故用
+  // 「Windows 语义替身」：跟踪 openSync 得到的 fd，unlinkSync 遇到仍打开的目标即抛 EPERM。据此
+  // 三条断言全部可在本机判定：① 失败路径的调用序列必须是 close → unlink，且同一 fd 只被关闭一次
+  // （关后置 fd = -1，finally 兜底不得重关）；② 残骸（Windows 语义下不可删的那个文件）已被移除；
+  // ③ 下一次调用能写出有效内容而不是 EEXIST 早退。
+  const winTarget = make('win-absent.txt')
+  const winEvents = []
+  const openFds = new Map() // 当前打开：fd → 路径（替身里 unlink 的准入判据）
+  const knownFds = new Map() // 本窗口内见过的所有 fd → 路径（识别对已关闭 fd 的重复 close）
+  const origOpenSyncW = fs.openSync
+  const origCloseSyncW = fs.closeSync
+  const origUnlinkSyncW = fs.unlinkSync
+  const origWriteFileSyncW = fs.writeFileSync
+  fs.openSync = (target, ...rest) => {
+    const f = origOpenSyncW.call(fs, target, ...rest)
+    if (typeof target === 'string') { openFds.set(f, target); knownFds.set(f, target) }
+    return f
+  }
+  fs.closeSync = (f) => {
+    if (typeof f === 'number' && knownFds.get(f) === winTarget) winEvents.push('close')
+    if (typeof f === 'number') openFds.delete(f)
+    return origCloseSyncW.call(fs, f)
+  }
+  fs.unlinkSync = (target) => {
+    if (target === winTarget) {
+      winEvents.push('unlink')
+      // Windows 语义：目标仍被本进程打开时 unlink 失败（旧实现正是踩在这里，fd 要等 finally 才关）
+      if ([...openFds.values()].includes(winTarget)) {
+        throw Object.assign(new Error('EPERM: operation not permitted, unlink'), { code: 'EPERM' })
+      }
+    }
+    return origUnlinkSyncW.call(fs, target)
+  }
+  fs.writeFileSync = (target, ...rest) => {
+    if (typeof target !== 'number') return origWriteFileSyncW.call(fs, target, ...rest)
+    origWriteFileSyncW.call(fs, target, 'half') // 半写内容先落盘，随后设备写满
+    throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+  }
+  let winRet
+  try { winRet = writeAtomicIfAbsent(winTarget, '[]') } finally {
+    fs.openSync = origOpenSyncW
+    fs.closeSync = origCloseSyncW
+    fs.unlinkSync = origUnlinkSyncW
+    fs.writeFileSync = origWriteFileSyncW
+  }
+  assert.strictEqual(winRet, false, '写失败应返回 false')
+  assert.deepStrictEqual(winEvents, ['close', 'unlink'],
+    `失败路径必须先 close 再 unlink，且同一 fd 只关一次（fd 未置 -1 时 finally 会重关）；实测序列 ${JSON.stringify(winEvents)}`)
+  assert.strictEqual(fs.existsSync(winTarget), false,
+    'Windows 语义下写失败后残骸必须已被移除（旧实现 fd 未关，unlink 抛 EPERM，残骸留在缓存路径）')
+  assert.strictEqual(writeAtomicIfAbsent(winTarget, '[]'), true, '残骸移除后下一次初始化应成功')
+  assert.strictEqual(fs.readFileSync(winTarget, 'utf8'), '[]',
+    '下一次初始化必须写入有效内容（残骸被当成「已初始化」时这里是半写的 half）')
 
   // 反向对照：EEXIST（另一进程已创建）不得被「清理残骸」误删——那是别人的有效缓存
   const keep = make('keep.txt')
