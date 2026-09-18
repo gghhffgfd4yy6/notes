@@ -4,6 +4,8 @@
 // 背景：test.yml 的 SKIP_SUITES 与「显式步骤」是两份必须手工同步的清单——
 //   漏写 = 重复跑（浪费），多写 = 漏跑（门禁盲区），拼错 = 静默失效（等于没跳过）。
 //   本套件把「清单 ↔ 显式步骤」的双向对账与入口行为固定在门禁里，防止再次回归。
+// 另含测试入口参数契约（EXEC-D T10）：test_app.js 的 `--only=<子串>` 必须真的过滤——
+//   过滤静默失效时，用户照并行调度器（test_app_p.js）的定位提示串行重跑，反而触发全量用例。
 const assert = require('node:assert')
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
@@ -354,6 +356,101 @@ const uncovered = excluded.filter(f => !explicitFiles.has(f))
 assert.deepStrictEqual(uncovered, [],
   `以下 integration/mutationSkip 套件没有 CI 显式步骤，脱离门禁：${uncovered.join(', ')}`)
 
+// ── 2c. test.yml 的 push `paths-ignore` 不得收缩门禁（EXEC-D T3）──────
+// 动机：docs-only push 此前也会跑满整条链（~6.5min × 2 runner）。放宽 push 触发范围可以让纯文档
+// 提交不再触发，但**硬约束**是：paths-ignore 只能放行「改了它也绝不可能影响测试结果」的路径。
+// 本仓库最容易被一刀切忽略掉的门禁输入是 CHANGELOG.md——`**/*.md` 会连它一起忽略，而它是
+// check-version.js 的版本一致性闸门、test_filter.js 第 101 章、test_tag_validator.js 的输入。
+// 故本段把口径固定为断言：任何门禁输入被 paths-ignore 覆盖即红（防后人顺手写回 `**/*.md`）。
+{
+  // 解析 `on.push.paths-ignore`（行式解析 + 响亮失败：排版一变就红，不会静默放行）
+  const lines = testYml.split('\n')
+  const pushIdx = lines.findIndex(l => l === '  push:')
+  assert.ok(pushIdx >= 0, 'test.yml 应声明 push 触发（缩进 2 空格的 `  push:`）')
+  let piIdx = -1
+  const pathsIgnore = []
+  for (let i = pushIdx + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trim() === '') continue
+    const indent = line.length - line.trimStart().length
+    if (indent <= 2) break // 离开 push 块
+    if (piIdx < 0) {
+      if (!line.trim().startsWith('paths-ignore:')) continue
+      piIdx = i
+      continue
+    }
+    const item = line.trim()
+    if (!item.startsWith('- ')) break // paths-ignore 列表结束
+    let val = item.slice(2).trim()
+    // 去行内注释与引号（路径里不会出现 '#' 或引号）
+    const hash = val.indexOf(' #')
+    if (hash > 0) val = val.slice(0, hash).trim()
+    val = val.replace(/^(['"])(.*)\1$/, '$2')
+    assert.ok(val !== '', `paths-ignore 条目不应为空: ${JSON.stringify(line)}`)
+    pathsIgnore.push(val)
+  }
+  assert.ok(pathsIgnore.length > 0, 'push 触发应有非空 paths-ignore（否则本断言失去守护对象）')
+
+  // gitignore/minimatch 子集匹配器（只需支持本仓库实际会用的形态：字面路径、`**/*.ext`、`dir/**`）
+  const toRe = (p) => {
+    let re = ''
+    for (let i = 0; i < p.length; i++) {
+      const c = p[i]
+      if (c === '*') {
+        if (p[i + 1] === '*') { // `**` → 任意层级
+          if (p[i + 2] === '/') { re += '(?:[^/]+/)*'; i += 2 } else { re += '.*'; i += 1 }
+        } else re += '[^/]*'
+      } else if (c === '?') re += '[^/]'
+      else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    }
+    return new RegExp('^' + re + '$')
+  }
+  const matchers = pathsIgnore.map(p => ({ p, re: toRe(p) }))
+  const matchedBy = (rel) => matchers.filter(m => m.re.test(rel)).map(m => m.p)
+
+  // 匹配器自身的正向对照（防恒假：判据必须能认出 `**/*.md` 会命中 CHANGELOG.md）
+  assert.deepStrictEqual(matchedBy('CHANGELOG.md'), [],
+    'paths-ignore 不得命中 CHANGELOG.md：它是 check-version.js 版本闸门与 test_filter.js 第 101 章的输入')
+  assert.ok(toRe('**/*.md').test('CHANGELOG.md') && toRe('**/*.md').test('docs/a.md'),
+    '匹配器对照：`**/*.md` 必须能命中 CHANGELOG.md（否则本断言恒真、形同虚设）')
+  assert.ok(!toRe('dir/**').test('dir') && toRe('dir/**').test('dir/a/b.js'), '匹配器对照：`dir/**` 应命中目录内部文件')
+
+  // 显式「允许被忽略」清单：纯文档（无任何脚本/测试读取）+ 未入库的本机目录 + 议题模板
+  const PROSE_DOCS = new Set([
+    'README.md', 'AGENTS.md', 'CONTRIBUTING.md', 'SECURITY.md', 'SYSTEM_CONTRACT.md',
+    '.github/pull_request_template.md'
+  ])
+  const ALLOWED_PREFIXES = ['.local/', '.github/ISSUE_TEMPLATE/']
+  // 允许出现的 paths-ignore 条目白名单：新增条目必须同时改这里（有意为之的 fail-loud）——
+  // 否则一个手滑的 `**/*.js` 会静默把整条门禁关掉。
+  const ALLOWED_PATTERNS = new Set([...PROSE_DOCS, '.github/ISSUE_TEMPLATE/**', '.local/**'])
+  for (const p of pathsIgnore) {
+    assert.ok(ALLOWED_PATTERNS.has(p),
+      `paths-ignore 出现未登记的条目 ${JSON.stringify(p)}：请先确认改了该路径不可能影响测试结果，` +
+      '并同步本套件的 ALLOWED_PATTERNS（源码/测试/工作流/门禁输入一律不得放行）')
+  }
+
+  // 遍历仓库文件（跳过依赖与运行产物），要求：**除允许清单外，没有任何文件被 paths-ignore 命中**
+  const SKIP_DIRS = new Set(['node_modules', '.git', 'reports', 'coverage', '.stryker-tmp', '.tools', '.ai'])
+  const walk = (dir, rel, out) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory()) {
+        if (SKIP_DIRS.has(e.name) || e.name.startsWith('xianbaoku_cache') || e.name.startsWith('.xbk_cache_safe')) continue
+        walk(path.join(dir, e.name), rel + e.name + '/', out)
+      } else if (e.isFile()) out.push(rel + e.name)
+    }
+    return out
+  }
+  const files = walk(__dirname, '', [])
+  assert.ok(files.includes('test_ci_skip_suites.js') && files.includes('CHANGELOG.md'),
+    '仓库遍历应包含已知门禁输入（遍历失败会让本断言恒真）')
+  const allowed = (f) => PROSE_DOCS.has(f) || ALLOWED_PREFIXES.some(pre => f.startsWith(pre))
+  const violators = files.filter(f => !allowed(f) && matchedBy(f).length > 0)
+  assert.deepStrictEqual(violators, [],
+    `paths-ignore 命中了非文档路径（门禁盲区）：${violators.slice(0, 10).map(f => `${f} ← ${matchedBy(f).join(',')}`).join(' | ')}`)
+  console.log(`✅ push paths-ignore（${pathsIgnore.length} 项）只覆盖纯文档/议题模板/本机目录，未命中任何门禁输入（${files.length} 个文件已核对）`)
+}
+
 // ── 3. 入口行为（子进程 + 跳过全部套件，秒级） ───────────────
 const baseEnv = { ...process.env }
 delete baseEnv.SKIP_SUITES
@@ -621,6 +718,46 @@ const strykerIdx = mutationYml.indexOf('npx stryker run')
 assert.ok(strykerIdx > 0, 'mutation.yml 应包含 stryker 运行步骤')
 assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHILD:\s*'1'/,
   'mutation.yml 的变异测试 step 必须设 XBK_MUTATION_CHILD=1（否则重复整表 append，几百次即撞 1MiB 上限）')
+
+// ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────
+// 背景：test_app.js 的 `--only=<子串>` 曾**静默失效**——旧实现用 process.argv.indexOf('--only')
+// 定位，等号写法下没有独立的 '--only' 元素 → 返回 -1 → 不过滤、照跑全部用例；而 test_app_p.js
+// 并行失败时打印的定位提示正是这个等号写法，于是「最需要快速定位的时刻」反而触发全量重跑。
+// 过滤失效此前无门禁可拦，是因为跳过同样计入 passed（passed 恒等于用例总数）⇒ 过滤静默失效时
+// 输出与「正常全量跑」完全同形。test_app.js 现已打印「实际执行 N 例，过滤跳过 M 例」，
+// 本段据此把契约固定为可证伪断言：等号形式**真的只跑匹配用例**，其余跳过且不计失败。
+{
+  const appSrc = fs.readFileSync('test_app.js', 'utf8')
+  // 期望值由 test_app.js 源码现算（与 test_app_p.js 同名提取口径），不写死用例数：
+  // 增删用例不会误红，而「--only 被忽略」会把实际执行数放大到 total → 立即红。
+  const allNames = [...appSrc.matchAll(/await test\((['"])(.*?)\1,/g)].map(m => m[2])
+  const FILTER = '空数据'
+  const matched = allNames.filter(n => n.includes(FILTER)).length
+  const total = allNames.length
+  assert.ok(total > 1, `test_app.js 应提取到多条用例（实得 ${total}）`)
+  assert.ok(matched >= 1, `作为过滤契约样本的子串「${FILTER}」必须至少匹配一条用例（消失即断言失去意义，需换样本）`)
+  assert.ok(matched < total, `过滤样本须非全体匹配（matched=${matched} / total=${total}），否则断言区分不出过滤是否生效`)
+  // XBK_PARALLEL_ID：让被测进程走独立缓存目录。`--only` 模式按设计跳过自清理（避免删掉并行进程
+  // 正在用的缓存），故必须在此收尾删除，避免污染仓库 xianbaoku_cache 影响后续套件。
+  const probeId = `only_probe_${process.pid}_${Date.now()}`
+  const probeCache = path.join(__dirname, `xianbaoku_cache_p${probeId}`)
+  let run
+  try {
+    run = spawnSync(process.execPath, [path.join(__dirname, 'test_app.js'), `--only=${FILTER}`],
+      { encoding: 'utf8', cwd: __dirname, timeout: 300000, env: { ...baseEnv, XBK_PARALLEL_ID: probeId } })
+  } finally {
+    fs.rmSync(probeCache, { recursive: true, force: true })
+  }
+  assert.ok(!run.error, `test_app.js --only= 子进程未能正常退出: ${run.error && run.error.message}`)
+  assert.strictEqual(run.status, 0,
+    `node test_app.js --only=${FILTER} 应 exit 0（其余用例跳过，不计失败）:\n${run.stdout}\n${run.stderr}`)
+  const stat = /实际执行 (\d+) 例，过滤跳过 (\d+) 例/.exec(run.stdout || '')
+  assert.ok(stat, '--only= 过滤未生效：输出缺少「实际执行 N 例，过滤跳过 M 例」统计' +
+    `（等号写法被忽略时会照跑全部 ${total} 例）:\n${(run.stdout || '').slice(-800)}`)
+  assert.strictEqual(Number(stat[1]), matched, `--only=${FILTER} 实际执行数应等于源码中匹配的用例数`)
+  assert.strictEqual(Number(stat[2]), total - matched, '过滤跳过数应为用例总数减匹配数')
+  console.log('✅ test_app.js `--only=<子串>` 过滤契约：等号形式只跑匹配用例，其余跳过不计失败')
+}
 
 console.log(`✅ SKIP_SUITES（${skips.length} 项）与 test.yml 显式步骤双向一致，且未知条目会失败`)
 console.log('✅ 零套件守卫：SKIP_SUITES 全覆盖（run_unit_tests.js）与空注册表（run_tests.js）均非 0 退出')

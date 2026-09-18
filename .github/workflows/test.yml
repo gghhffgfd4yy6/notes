@@ -9,6 +9,23 @@ on:
     - cron: "0 8 * * *"   # 每日冒烟，防环境漂移
   push:
     branches: [main]
+    # REV-CI（EXEC-D T3）：docs-only push 此前同样跑满整条链（实测 ~6.5min × 2 runner，白烧额度）。
+    # 这里只放行「改了它**绝不可能**影响测试结果」的路径：只改这些文件的 push 不触发本工作流。
+    #   · 刻意**不**用 `**/*.md` 一刀切：CHANGELOG.md 是**门禁输入**——check-version.js 的版本一致性
+    #     闸门、test_filter.js 第 101 章、test_tag_validator.js 都读它，忽略它等于给版本闸门开盲区；
+    #   · 也**不**给 pull_request 加 paths-ignore：quality-gate 是 Required Check，PR 上路径过滤会
+    #     让该 check 永远不出现（Expected — Waiting for status to be reported）→ PR 反而卡死。
+    # 新增条目先确认无任何脚本/测试读取它；test_ci_skip_suites.js 把这条口径固定成断言
+    # （任何门禁输入被 paths-ignore 覆盖即红）。
+    paths-ignore:
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'SYSTEM_CONTRACT.md'
+      - '.github/pull_request_template.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.local/**'   # 本机工作树/临时产物（未入库），不参与构建与测试
 
 permissions:
   contents: read
