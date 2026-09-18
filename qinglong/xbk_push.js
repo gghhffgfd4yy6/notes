@@ -86,12 +86,28 @@ function shouldAutoInstallDependencies (env = process.env) {
   return env && env.XBK_AUTO_INSTALL_DEPS === '1'
 }
 
+// 依赖名白名单清洗（QG2）：fixedPath 的 name 在生产调用链上只有 'got' / 're2' 两个字面量
+// （见 ensureDependencies 内 load('got') / load('re2') 三处调用），但函数形参在静态分析里被视为
+// 可能的输入（Codacy/Semgrep「Detected possible user input going into a path.join or path.resolve」）。
+// 这里按 npm 包名字符集做白名单判定：放行的值只含字母/数字/`. _ -`、不以 `.` 或 `-` 开头、且不含
+// `..` 上跳段——因此它不含任何路径分隔符，拼进 path.join 后必然是 ROOT/node_modules 下的直接子项，
+// 构造不出 ROOT 之外的路径。非法输入直接抛错（fail-closed），不静默降级成目录本身。
+const MODULE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+function sanitizeModuleName (name) {
+  const raw = String(name === undefined || name === null ? '' : name)
+  if (!MODULE_NAME_RE.test(raw) || raw.includes('..')) {
+    throw new Error(`依赖名不在白名单内，拒绝拼入固定依赖路径：${JSON.stringify(name)}`)
+  }
+  return raw
+}
+
 // got 是主 HTTP 依赖；re2 则是用户过滤规则的安全执行引擎。
 // 安装命令刻意使用 --ignore-scripts 防供应链风险，但这也会跳过 re2 原生模块构建；
 // 因此必须显式构建并加载校验，不能只因 got 可用就带着“所有正则规则被跳过”的状态启动。
 function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env = process.env, lockExists = () => fs.existsSync(path.join(ROOT, 'package-lock.json')) } = {}) {
-  // 固定依赖路径只作为兜底：入口不会将外部输入拼入模块或构建路径（两个模块名都是本文件字面量）。
-  const fixedPath = (name) => path.join(ROOT, 'node_modules', name)
+  // 固定依赖路径只作为兜底：入口不会将外部输入拼入模块或构建路径（两个模块名都是本文件字面量，
+  // 且经 sanitizeModuleName 白名单复核——见该函数注释）。
+  const fixedPath = (name) => path.join(ROOT, 'node_modules', sanitizeModuleName(name))
   const re2Path = fixedPath('re2')
   // QX-01：先按 Node 常规解析（与 --check 的 require('got')、xbk_agents.js 的 require('got') 同口径），
   // 只有解析不到时才回退固定路径。旧实现只用固定路径探测，会出现「--check 通过但应用侧解析失败」
