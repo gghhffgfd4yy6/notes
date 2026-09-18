@@ -1,0 +1,60 @@
+#!/bin/bash
+# pre-push 钩子：推送前跑单元测试门禁（`npm run test:filter`）。
+#
+# 为什么 test:filter 从 pre-commit 挪到这里（v3.276 钩子分层）：pre-commit 原先四道门禁合计
+# ≈82s（lint 22s + 版本闸门 0.33s + 变异行段 0.47s + test:filter 59s，test:filter 独占 72%）。
+# 82s 的提交前阻塞正是「懒得等、干脆绕过门禁」的温床——门禁一旦被习惯性绕过就等于没有。
+# 迁移**不减少覆盖，只改变拦截时机**：同一条命令、同一套退出码语义、同样的失败回显，
+# 仍然跑在本机、仍然在代码离开本机（推送）之前；pre-commit 只留 3 道快检（≈23s）。
+#
+# 失败回显沿用 pre-commit 的「成功安静、失败原样回显 + 逐门禁计时」风格：test_filter 一次
+# 打印约 460KB，成功路径不刷屏，失败路径逐字可见（stderr 已合并），修复者不必盲跑一次慢命令。
+#
+# stdin：git 经管道传入待推送的 refs 行（<local ref> <local sha> <remote ref> <remote sha>），
+# 每行一条。这里**先把 stdin 读完再执行门禁**：不消费 stdin 会让上游写入端拿到 EPIPE，也让
+# 「这一推推了什么」无从留痕。刻意**不做**「仅当推送涉及某类文件才跑」之类的条件化——那等于
+# 给门禁新增一个可绕过的维度（覆盖被削弱，与本次迁移的前提相悖）；且被推对象是提交快照、
+# 当前工作树未必等于它，条件化会制造「看起来跑了、其实没跑」的假绿灯。
+echo "🔍 pre-push 验证中..."
+set -e
+
+# 读干 stdin（仅在 stdin 是管道/重定向时；手工直接执行钩子时 stdin 是终端，跳过读取以免阻塞）。
+ref_lines=0
+if [ ! -t 0 ]; then
+  while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
+    if [ -z "$local_ref" ]; then
+      continue
+    fi
+    ref_lines=$((ref_lines + 1))
+    echo "   ↳ 待推送：${local_ref} → ${remote_ref}（${local_sha:0:8}）"
+  done
+fi
+if [ "$ref_lines" -gt 0 ]; then
+  echo "   已读完 ${ref_lines} 条 ref（stdin 消费干净，git 不会因写端 EPIPE 误判）"
+fi
+
+# run_gate <标签> <失败提示> <命令...>
+# 与 pre-commit 同款：逐门禁计时（让「谁在花时间」可见）+ 失败必须回显被检查命令的真实输出。
+run_gate () {
+  local label="$1" hint="$2"
+  shift 2
+  local out rc t0 t1
+  t0=$(date +%s)
+  out=$("$@" 2>&1) && rc=0 || rc=$?
+  t1=$(date +%s)
+  if [ "$rc" -ne 0 ]; then
+    echo "❌ ${label} 未通过（耗时 $((t1 - t0))s，退出码 ${rc}）${hint}"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out"
+    else
+      echo "   （该步骤未产生任何输出——请手动重跑：$*）"
+    fi
+    echo "   ↑ 以上为「$*」的完整输出（stderr 已合并）"
+    exit 1
+  fi
+  echo "✅ ${label} 通过（$((t1 - t0))s）"
+}
+
+echo "⏳ 单元测试 test:filter（本机实测约 60s，请稍候）..."
+run_gate "单元测试" "，先修复再推送（该门禁自 pre-commit 迁来，覆盖未减少）" npm run test:filter
+echo "✅ pre-push 全部通过"

@@ -12,7 +12,7 @@
 //   - 不只写配置：安装前后核验钩子真实可用（存在 + 可执行）。目录/文件缺失时
 //     git 会静默忽略全部钩子，必须非零退出；仅缺可执行位时尝试 chmod 0o700 修复，
 //     修复不了（如 noexec 挂载）则醒目告警，绝不把「配置已写入」说成「门禁已生效」。
-//   - --verify（审查 F6）：只读自检入口——回答「提交门禁此刻是否真的生效」，不写配置、不 chmod。
+//   - --verify（审查 F6）：只读自检入口——回答「提交/推送门禁此刻是否真的生效」，不写配置、不 chmod。
 //     生效则 exit 0，否则 exit 1 并说明原因；默认（无参数）路径中「跳过/未覆盖」按设计仍 exit 0
 //     （非工作树、已存在其它 hooksPath 等无需安装），自动化因此只能靠解析 stdout 区分「装上」与
 //     「跳过」，--verify 就是给自动化/CI 的显式查询入口。
@@ -21,8 +21,10 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 
 const HOOKS_DIR = '.githooks'
-// 受版本控制的提交门禁；新增钩子文件时同步此列表以便核验
-const HOOK_FILES = ['pre-commit', 'commit-msg']
+// 受版本控制的提交/推送门禁；新增钩子文件时同步此列表以便核验。
+// 三者缺一即门禁不完整：pre-commit（lint/版本闸门/变异行段）、commit-msg（提交信息格式）、
+// pre-push（npm run test:filter，v3.276 起从 pre-commit 迁来）。
+const HOOK_FILES = ['pre-commit', 'commit-msg', 'pre-push']
 
 // 只读自检模式（--verify）：不写 core.hooksPath、不 chmod、不创建/删除任何文件。
 const VERIFY_ONLY = process.argv.includes('--verify')
