@@ -1,6 +1,11 @@
 #!/bin/bash
 # pre-commit 钩子：提交前自动验证（可 git commit --no-verify 跳过）
-# 三道快检：lint → 版本闸门 → 单元测试
+# 四道快检：lint → 版本闸门 → 变异行段校验 → 单元测试（便宜的在前，最慢的在最后）
+#
+# 变异行段闸门（node scripts/check-mutation-ranges.js，本机实测 0.47s）：AGENTS.md:27-30 把
+# 「改动带行段的文件后重拆 mutation.yml 行段并校验」列为必做，`npm run check` 也含这一步，但提交
+# 时刻真正执行的 pre-commit 此前并不跑它——只依赖钩子的人永远不过这道门；v3.270 正是文件增长后
+# 行段未同步、尾部 430 行静默漏测。成本 0.5s 换掉这一类历史事故，净收益明确（新门禁，不外放）。
 #
 # 失败必须回显被检查命令的真实输出：旧版一律 `> /dev/null 2>&1`，失败只剩一行「未通过」，
 # 修复者必须把同一条慢命令（test:filter 本机实测 93.7s）再跑一遍才知道原因——这正是
@@ -35,6 +40,7 @@ run_gate () {
 
 run_gate "lint" "，修复后再提交（若提示某个可执行文件 not found，先 npm ci 装依赖）" npm run lint
 run_gate "版本闸门" "（文件头/CHANGELOG/package.json/package-lock 四方不一致），先同步再提交" node check-version.js
+run_gate "变异行段闸门" "（mutation.yml 行段未覆盖 xbk_function_v3.js / xbk_sendNotify_slim.js 实际行数），重拆行段后再提交" node scripts/check-mutation-ranges.js
 echo "⏳ 单元测试 test:filter（本机实测约 90s，请稍候）..."
 run_gate "单元测试" "，先修复再提交" npm run test:filter
 echo "✅ pre-commit 全部通过"
