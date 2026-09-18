@@ -62,7 +62,11 @@ const {
   // 已存在目录不得被 chmod（不改动部署侧既有权限）：预先建一个 0755 目录，再写入其下文件
   const preexisting = make('preexist')
   fs.mkdirSync(preexisting, { recursive: true, mode: 0o755 })
-  fs.chmodSync(preexisting, 0o755)
+  // NOSONAR（S2612 误报）：mkdir 的 mode 会被 umask 裁掉（本机 077 → 0700、CI 022 → 0755），
+  // 要拿到确定的 0755 夹具只能显式 chmod。该目录位于 mkdtempSync 建的私有临时目录内，0755
+  // 不含组/其他用户写位；且它正是下一行「既有目录权限不得被改动」断言的分母——改成 0700 会让
+  // 断言失去区分度（被测实现 chmod 成 0700 时无法证伪）。权限本身安全，故就地抑制。
+  fs.chmodSync(preexisting, 0o755) // NOSONAR
   const beforeMode = fs.statSync(preexisting).mode & 0o777
   assert.strictEqual(writeAtomic(make('preexist/f.txt'), 'x'), true, '已存在目录下的写入应成功')
   assert.strictEqual(fs.statSync(preexisting).mode & 0o777, beforeMode, '已存在的目录不得被 chmod')
@@ -271,8 +275,9 @@ const {
   assert.match(badWarns[0], /maxBytes 非法/, '告警需指明 maxBytes 非法')
   assert.match(badWarns[0], /按不设限读取/, '告警需说明实际按不设限处理')
 
-  // 对照：0 / -1 / NaN / Infinity 同样告警（「非正数」不是合法上限，只是历史语义）
-  for (const bad of [0, -1, NaN, Infinity]) {
+  // 对照：0 / -1 / Number.NaN / Infinity 同样告警（「非正数」不是合法上限，只是历史语义）
+  // （Sonar 建议：全局 NaN 改 Number.NaN；两者同为 IEEE-754 NaN，`String(bad)` 仍为 'NaN'，行为等价）
+  for (const bad of [0, -1, Number.NaN, Infinity]) {
     const seen = []
     console.warn = (...args) => { seen.push(args.join(' ')) }
     try { readSafeTextResult(bigFile, bad) } finally { console.warn = origWarn }
