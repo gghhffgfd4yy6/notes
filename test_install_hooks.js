@@ -363,7 +363,7 @@ function makePushFixture ({ commitGate = 'pass' } = {}) {
   mustGit(['remote', 'add', 'origin', remote], { cwd: work, env })
   // 与真仓库同款接线：core.hooksPath → hooks/pre-push（真钩子的逐字节副本，用例 A 里断言一致）
   fs.copyFileSync(REAL_PRE_PUSH, path.join(hooks, 'pre-push'))
-  fs.chmodSync(path.join(hooks, 'pre-push'), 0o755)
+  fs.chmodSync(path.join(hooks, 'pre-push'), 0o700)
   mustGit(['config', 'core.hooksPath', hooks], { cwd: work, env })
   return {
     dir,
@@ -432,10 +432,17 @@ function assertInFixtureTmp (fx, dir, label) {
   assert.ok(forms.has(path.dirname(dir)), `${label}：${dir} 应落在夹具 TMPDIR（= 隔离 worktree 的位置）下`)
 }
 
-// 无论成败都不许残留：git worktree list 不留条目、TMPDIR 不留目录。
+// 无论成败都不许残留：git worktree list 不留条目、TMPDIR 不留**本钩子**创建的隔离目录。
+// 判据只认钩子自己的命名（`mktemp -d "${TMPDIR:-/tmp}/xbk-prepush-XXXXXX"`）：TMPDIR 是共用目录，
+// npm/node/git 也会把各自的临时文件放进去（CI 上实测如此），把「整个 TMPDIR 必须为空」当判据会把
+// 无关临时文件误判成钩子泄漏——而钩子真正的泄漏（残留 xbk-prepush-* 目录）仍然会被这条抓住。
 function assertNoResidue (fx, label) {
   assert.strictEqual(worktreeCount(fx), 1, `${label}：git worktree list 不应残留临时 worktree`)
-  assert.deepStrictEqual(fs.readdirSync(fx.tmp), [], `${label}：临时目录不应残留隔离 worktree`)
+  const entries = fs.readdirSync(fx.tmp)
+  const leaked = entries.filter(name => name.startsWith('xbk-prepush-'))
+  const others = entries.filter(name => !name.startsWith('xbk-prepush-'))
+  assert.deepStrictEqual(leaked, [],
+    `${label}：TMPDIR 不得残留本钩子创建的隔离目录（泄漏：${leaked.join(', ') || '无'}；TMPDIR 内其它条目（非本钩子）：${others.join(', ') || '无'}）`)
 }
 
 // A) 快路径：干净工作树 + 推 HEAD → exit 0，且门禁只在当前工作树跑一次
@@ -521,7 +528,7 @@ function assertNoResidue (fx, label) {
     fs.mkdirSync(shim)
     fs.writeFileSync(path.join(shim, 'git'),
       '#!/bin/sh\ncase " $* " in *" worktree add "*) echo "shim: 注入故障——拒绝 worktree add" >&2; exit 128;; esac\nexec ' + GIT + ' "$@"\n')
-    fs.chmodSync(path.join(shim, 'git'), 0o755)
+    fs.chmodSync(path.join(shim, 'git'), 0o700)
     const r = driveHook(fx, refLine('refs/heads/main', headOf(fx), 'refs/heads/main'),
       { env: { PATH: shim + path.delimiter + fx.env.PATH } })
     assert.notStrictEqual(r.status, 0, `D：隔离路径建不起来必须非零退出（fail-closed）：${hookOut(r)}`)
@@ -567,7 +574,7 @@ function assertNoResidue (fx, label) {
     if (SCRIPT) {
       const wrapper = path.join(fx2.dir, 'drive-tty.sh')
       fs.writeFileSync(wrapper, '#!/bin/sh\nexec ' + BASH + " '" + path.join(fx2.hooks, 'pre-push') + "' origin '" + fx2.remote + "'\n")
-      fs.chmodSync(wrapper, 0o755)
+      fs.chmodSync(wrapper, 0o700)
       const rt = spawnSync(SCRIPT, ['-qec', "'" + wrapper + "'", '/dev/null'],
         { cwd: fx2.work, encoding: 'utf8', env: fx2.gateEnv, timeout: 180000 })
       assert.strictEqual(rt.status, 0, `E：stdin 是终端时钩子不应阻塞且应可用：${hookOut(rt)}`)

@@ -393,7 +393,12 @@ function schemaReport (seg, mutants) {
     const strip = runCli(['--strip', ...reportPaths])
     assert.strictEqual(strip.code, 0, `--strip 应 exit 0，stderr：${strip.stderr}`)
     assert.ok(strip.stdout.includes('🧹'), `应逐文件报告剥离动作，实际 stdout：${strip.stdout}`)
-    assert.ok(/\d+\.\d+%/.test(strip.stdout), `应报告缩小比例，实际 stdout：${strip.stdout}`)
+    // 不用正则判定「xx.x%」：`\d+\.\d+%` 会被 SonarCloud S8786 判为潜在超线性回溯（本场景是本 PR 新增代码），
+    // 改为按空白切 token 后逐项判断（线性、语义等价）：token 含 `%` 且 `parseFloat` 能解析出有限数字即算报告了比例
+    // （真实输出形如「…（省 370000，99.87%）」，百分比后还跟全角右括号，故不能用 endsWith('%')）。
+    const hasPercentRatio = strip.stdout.split(/\s+/).some(tok =>
+      tok.includes('%') && Number.isFinite(Number.parseFloat(tok)))
+    assert.ok(hasPercentRatio, `应报告缩小比例，实际 stdout：${strip.stdout}`)
 
     let shrunk = 0
     for (let i = 0; i < reportPaths.length; i++) {
