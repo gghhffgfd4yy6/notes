@@ -17,6 +17,7 @@ jobs:
   dispatch-hint:
     if: ${{ github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10   # REV-CI：纯 echo + exit 1，秒级（本工作流此前无任何 timeout-minutes）
     steps:
       - name: 明确报错：workflow_dispatch 必须在 v* tag 上运行
         run: |
@@ -31,6 +32,10 @@ jobs:
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    # REV-CI：release 跑 npm run check（= lint → 版本闸门 → 变异行段 → npm test 全量 41 套件），
+    # 是仓库最重的单 job；本工作流此前无任何 timeout-minutes。45min 与 test.yml 的 quality 同口径
+    # （test.yml 全量墙钟实测 3-18min，本 job 额外含全量 npm test，留 ≈2.5x 余量）。
+    timeout-minutes: 45
     steps:
       # 校验 tag 版本号格式（semver）：job 级 if 只保证 v* 前缀，vfoo 这类非版本 tag 也会被放行，
       # 必须在创建 Release 前显式失败并 exit 1，避免误建 Release。

@@ -19,6 +19,7 @@ permissions:
 jobs:
   stale:
     runs-on: ubuntu-latest
+    timeout-minutes: 15   # REV-CI：本工作流此前无 timeout-minutes；实测墙钟 ~26s（run 35301563744），余量充足
     permissions:
       issues: write
       pull-requests: write
