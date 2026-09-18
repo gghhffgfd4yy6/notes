@@ -81,13 +81,21 @@ module.exports = {
   //   （--mutate 见 stryker-cli.js 的 `-m, --mutate`，覆盖本文件的 mutate 数组），而上面那个 metrics
   //   来自本次运行的报告 files——只含该段被变异的文件 ⇒ 分数低于 65 的是**那一个段的 job**
   //   （fail-fast: false ⇒ 其余段照跑；artifact 上传与 report job 都是 if: always() ⇒ 日报照发）。
-  // 取值依据（2026-09-18 日报 gh issue #153）：合计 81.27%（13355 变异体 / 2502 存活），
-  //   最低段 message-store 69.38%，其后 status 70.77%、utils 72.36%、app 75.43%。
-  //   取 65 = 全段最低者之下再留 4.38 个百分点：按当前基线**没有任何一段会误红**，而任何一段真实
-  //   退化 4 个百分点以上就会红（退化绊线，不是质量棘轮——棘轮要等基线抬升后再逐步上调）。
-  //   余量只会更大不会更小：日报脚本的分数是 (killed+timeout)/total（total 含 RuntimeError/CompileError/
-  //   Ignored/Pending），stryker 的 mutationScore 是 (killed+timeout)/totalValid（totalValid 不含这四类），
-  //   分母更小 ⇒ 同一份报告在 stryker 侧的分 ≥ 日报侧的分（仅当四类状态都不出现时相等）。
+  // 取值依据（实测日报 gh issue 130/135/139/148/150/153，2026-09-13…09-18 六天）：
+  //   09-18 基线：合计 81.27%（13355 变异体 / 2502 存活），最低段 message-store 69.38%，
+  //   其后 status 70.77%、utils 72.36%、app 75.43%。
+  //   取 65 = 当前最低段之下再留 4.38 个百分点 ⇒ 按 09-18 基线**没有任何一段会误红**。
+  //   这六天里各段分数只随代码/测试变化，没有逐轮抖动：最弱段 message-store 全程 69.10%–69.42%
+  //   （极差 0.32pp），故 65 不会被单次运行的波动打穿。窗口内唯一一次低于 65 的是 status 的**首轮**
+  //   报告 62.14%（09-16：243 变异体 / 149 被杀 / 92 存活，该段当天才进入矩阵）——那是真弱不是抖动，
+  //   次日补测后已到 70.77%。即：本阈值会真红（门禁该有的样子），但红的是真实退化或新段的未覆盖代码。
+  //   不取更低（如 60）的理由：message-store 要再掉 9.1pp 才触发，门禁接近失效；且 60 已是 high/low 里的
+  //   low（配色语义），把 break 与它对齐会让两个语义混为一谈。
+  //   不贴着 69.38 取 69 的理由：该分数的计分口径把超时计入已检出（见上方 timeoutMS），贴边只会误红。
+  // 与日报脚本分数的关系：上述六份日报里每段都满足 total == killed+timeout+survived+noCoverage
+  //   （即没有 RuntimeError/CompileError/Ignored/Pending 变异体）⇒ 实跑中两个口径的分数相等；
+  //   一般情形下日报分数是 stryker 分数的**下界**（日报分母 total 含上述四类，stryker 的 totalValid 不含），
+  //   故按日报基线取的阈值在 stryker 侧只会更安全。
   // 回退：把 break 改回 null 即取消分数门禁，不涉及任何其它文件。
   // 已知局限（既有，与本门禁不冲突，勿据此认为门禁无效）：command runner 只支持 coverageAnalysis:'off'，
   //   增量模式下 incremental-differ 感知不到「测试变化」⇒ 本门禁拦得住「源码新增未被杀死的变异体」，
