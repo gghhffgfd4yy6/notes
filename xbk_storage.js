@@ -132,12 +132,22 @@ function writeAtomicIfAbsent (filePath, text, label = '缓存初始化') {
   } catch (e) {
     if (e?.code === 'EEXIST') return true // 另一进程已创建：不覆盖，视为初始化成功
     if (fd >= 0) {
+      // 审查 WIN-01（qodo #154 发现 1：Windows 缓存恢复留残骸）：必须在 unlink 之前显式关闭本进程
+      // 持有的 fd——Windows 上「文件句柄仍打开」时 unlink 抛 EPERM/EBUSY，半写残骸留在缓存路径，
+      // 而消费侧 _ensureFileExists 以 existsSync 早退 → 坏文件被当成「已初始化」永久不自愈。
+      // 关完置 fd = -1：下方 finally 退回兜底角色，且不得对同一 fd 重复 close（POSIX 上 fd 号会被
+      // 复用，二次 close 可能关掉无关 fd）。POSIX 允许 unlink 已打开的文件，本机（Linux/FUSE）无法
+      // 复现 Windows 内核行为，故回归断言以「close 先于 unlink 且只 close 一次」的顺序判定为准，
+      // 另加 Windows 语义替身（unlink 遇到仍打开的目标即抛 EPERM）——见 test_storage.js WIN-01 段。
+      try { fs.closeSync(fd) } catch (e2) { /* 关闭失败不阻止尽力清理残骸 */ }
+      fd = -1
       // 清理半写残骸（可能是本次写入的部分内容，也可能是空文件）；失败只告警，不影响返回语义。
       try { fs.unlinkSync(filePath) } catch (e2) { console.warn(`${label}半写残骸清理失败 ${filePath}:`, e2.message) } // nosemgrep
     }
     console.error(`${label}写入失败 ${filePath}:`, e.message)
     return false
   } finally {
+    // 兜底：成功路径（写完直接 return true）依赖这里关闭 fd；失败路径已置 -1，此处跳过。
     if (fd >= 0) { try { fs.closeSync(fd) } catch (e) { /* 忽略 */ } }
   }
 }
