@@ -72,11 +72,29 @@ module.exports = {
   // 值维持 300000ms（300s）：作为加法偏移给多套件 + 插桩场景留足余量，无需下调。
   // 历史：90s → 180s（v3.273 切全量单元入口）→ 300s。
   timeoutMS: 300000,
-  // thresholds：显式写出取值，避免读者误以为「没有该项 = 有门禁」。break 刻意保持 null——本仓库
-  // `npm run test:mutation` 定位为本地观察项而非门禁，且 (killed + timeout) 的计分口径会虚增分数
-  // （见上方 timeoutMS 注释），阈值边界上只会误红；CI 侧同样只出日报（mutation.yml 的 report job
-  // 不设阈值）。若要改为真正的门禁，请先按当前真实基线取 break 值再开。
-  thresholds: { high: 80, low: 60, break: null },
+  // thresholds：显式写出取值，避免读者误以为「没有该项 = 有门禁」。break=65 是**真门禁**（不再是观察项）。
+  // 判定与退出码路径（已安装的 @stryker-mutator/core@10.0.0 实证）：
+  //   reporters/mutation-test-report-helper.js 的 determineExitCode()——break 为数字且
+  //   mutationScore < break 时调用 objectUtils.setExitCode(1)（该 helper 只写 process.exitCode = 1，
+  //   stryker 进程随后以 1 退出；判定是**严格小于**，恰好等于阈值放行）。
+  // 判定范围是**按段**的：mutation.yml 每个矩阵 job 各自跑 `npx stryker run --mutate "<段>"`
+  //   （--mutate 见 stryker-cli.js 的 `-m, --mutate`，覆盖本文件的 mutate 数组），而上面那个 metrics
+  //   来自本次运行的报告 files——只含该段被变异的文件 ⇒ 分数低于 65 的是**那一个段的 job**
+  //   （fail-fast: false ⇒ 其余段照跑；artifact 上传与 report job 都是 if: always() ⇒ 日报照发）。
+  // 取值依据（2026-09-18 日报 gh issue #153）：合计 81.27%（13355 变异体 / 2502 存活），
+  //   最低段 message-store 69.38%，其后 status 70.77%、utils 72.36%、app 75.43%。
+  //   取 65 = 全段最低者之下再留 4.38 个百分点：按当前基线**没有任何一段会误红**，而任何一段真实
+  //   退化 4 个百分点以上就会红（退化绊线，不是质量棘轮——棘轮要等基线抬升后再逐步上调）。
+  //   余量只会更大不会更小：日报脚本的分数是 (killed+timeout)/total（total 含 RuntimeError/CompileError/
+  //   Ignored/Pending），stryker 的 mutationScore 是 (killed+timeout)/totalValid（totalValid 不含这四类），
+  //   分母更小 ⇒ 同一份报告在 stryker 侧的分 ≥ 日报侧的分（仅当四类状态都不出现时相等）。
+  // 回退：把 break 改回 null 即取消分数门禁，不涉及任何其它文件。
+  // 已知局限（既有，与本门禁不冲突，勿据此认为门禁无效）：command runner 只支持 coverageAnalysis:'off'，
+  //   增量模式下 incremental-differ 感知不到「测试变化」⇒ 本门禁拦得住「源码新增未被杀死的变异体」，
+  //   拦不住「只删/弱化测试」（见上方 commandRunner 与 mutation.yml 缓存 key 注释）。
+  //   另见上方 timeoutMS 注释：(killed + timeout) 把超时计入分子，慢到超时的存活体在分数上算「已检出」，
+  //   故该分数不是严格的漏检率——这也是把阈值放在最低段之下 4.38 个百分点、而不是贴着 69.38 的原因。
+  thresholds: { high: 80, low: 60, break: 65 },
   // reporters：'json' 是报告链的硬依赖，不可随手删——scripts/mutation-report.js 经 scripts/mutation-json.js
   // 读 reports/mutation/mutation.json。本文件刻意不写 jsonReporter.fileName/htmlReporter.fileName，靠
   // Stryker 默认值（reports/mutation/mutation.json、reports/mutation/mutation.html）与 mutation.yml 的 artifact

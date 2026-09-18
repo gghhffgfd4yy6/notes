@@ -34,7 +34,9 @@ function runCli (args, opts = {}) {
 // 夹具一律按真 schema 构造——否则「夹具算不算真报告」本身就成了未验证假设：本批前一版夹具缺
 // thresholds/source，注释却声称「夹具必须是真 stryker schema」，被独立对抗审查 B 组当场证伪。
 const SCHEMA_VERSION = '1.0'
-const THRESHOLDS = { high: 80, low: 60, break: null }
+// 与本仓 stryker.config.js 的 thresholds 同口径（真报告里 config.thresholds 就是被解析后的这些值）；
+// 本文件只做 schema 形状与统计值断言，不依赖这个数字。
+const THRESHOLDS = { high: 80, low: 60, break: 65 }
 function mutantOf (over = {}) {
   return {
     id: '0',

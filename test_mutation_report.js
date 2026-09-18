@@ -367,7 +367,7 @@ try {
     const d = path.join(tmp, 'mutation-report-cap-injection'); fs.mkdirSync(d, { recursive: true })
     fs.writeFileSync(path.join(d, 'mutation.json'), JSON.stringify({
       schemaVersion: '1.0',
-      thresholds: { high: 80, low: 60, break: null },
+      thresholds: { high: 80, low: 60, break: 65 },
       files: { 'cap.js': { language: 'javascript', source: 'x\n', mutants: [{ status: 'Killed' }] } }
     }))
     const prev = process.env.XBK_MUTATION_REPORT_MAX_BYTES

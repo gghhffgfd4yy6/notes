@@ -360,8 +360,10 @@ function _renderSegmentTable (results) {
     lines.push(`| ${r.seg} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% |`)
   }
   // 口径与段分一致（超时计入已处理）；无数据报 0 而非 100（机器人审查）
-  // F6：本脚本刻意只汇总、不设分数/存活门禁——门禁口径见 stryker.config.js 的 thresholds 注释
-  // （break 保持 null ＝ 本地观察项）；改为真门禁需先按真实基线取 break 值，属产品决策。
+  // F6：本脚本只汇总，**不设分数门禁**——分数门禁在 stryker 侧（stryker.config.js 的
+  // thresholds.break=65，由每个矩阵 job 各自按段判定，见该文件注释）。这里**有意**不再加一道：
+  // main() 是「先 validateSegments/validateFreshness 再 postIssue」，本脚本 throw 会让不达标时连
+  // 日报一起吞掉——而那正是最需要看到分数的时刻。故此处只保留完整性/新鲜度两道 throw。
   const overall = tTotal > 0 ? Math.round((((tKilled + tTimeout) / tTotal) * 100) * 100) / 100 : 0
   lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | | **${overall}%** |`)
   return lines

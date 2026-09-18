@@ -248,6 +248,12 @@ jobs:
         run: |
           node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
 
+      # 分数门禁在本步生效（stryker.config.js 的 thresholds.break=65）：--mutate 只跑本段，
+      # stryker 的 determineExitCode 用的就是本段报告的 mutationScore（按段，不是全量合计），
+      # 低于 65 时 stryker 以 exit 1 退出 ⇒ **本 job 红**。其余段不受影响（fail-fast: false），
+      # 产物上传与 report job 都是 if: always() ⇒ 日报照样发布（这正是把分数门禁放在 stryker 侧
+      # 而不是 report 侧的 report job 里的原因：后者先验证后发 Issue，会把不达标时的日报一起吞掉）。
+      # 为什么是 65 而不是贴着基线最低段（message-store 69.38%）取 69：见 stryker.config.js 的注释。
       - name: 变异测试（${{ matrix.name }}）
         run: npx stryker run --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 2
         env:
