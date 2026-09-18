@@ -200,17 +200,17 @@ const {
 
   // 接线断言（与 test_cli.js:31 同一种源码级手法）：main() 的 --dry-run 分支必须调用 runDryRunOnce
   // 并 return，绝不能继续落到 runResident(...)。回退旧行为（只设 XBK_DRY_RUN=1 即常驻）时本断言必红。
-  // 变异沙箱兼容（PR #154 实测）：Stryker 插桩会把条件改写成 `if (stryNS_9fa48() || hasArg('--dry-run'))`，
-  // 因此**不能**把 `if (` 与条件写死成紧邻（否则 qinglong-push 变异 job 的初始测试运行必红）。
-  // 用**索引判定**而不是正则表达咬合（正则里 `(?:(?!X)[\s\S])*?` 这类前瞻+惰性星形态可能被
-  // ReDoS 规则命中，而本 PR 刚清完那类告警）：要求「runDryRunOnce(app) 之前紧邻有 --dry-run 判定」
-  // 且「其后、遇到 runResident( 之前必须 return」。删掉该分支/那次调用/那个 return，或让它继续
-  // 落到常驻循环，本断言都会红；Stryker 对条件的任意包装都不影响这三处字符串定位。
+  // **变异沙箱兼容（PR #154，两次实测订正）**：Stryker 插桩会把条件改写成
+  // `if (stryNS_9fa48() || hasArg('--dry-run'))`，并会在语句之间插入**任意长度**的辅助代码。因此：
+  //   ① 不能要求 `if (` 与条件紧邻（第一版写法，沙箱必红）；
+  //   ② 也**不能设任何字符距离上限**（第二版写法 `oneShotIdx - guardIdx < 600`，沙箱里插桩后必然超限，
+  //      实测在 qinglong-push 变异 job 的初始测试运行里红）。
+  // 正确口径是「**只查存在性与顺序**，不设距离」：三处标记各自存在，且 `return` 出现在
+  // `runResident(` 之前。删掉该分支/那次调用/那个 return，或让它继续落到常驻循环，本断言仍会红。
   const pushSource = fs.readFileSync(path.join(__dirname, 'qinglong', 'xbk_push.js'), 'utf8')
+  assert.ok(pushSource.includes("hasArg('--dry-run')"), '必须存在 --dry-run 判定')
   const oneShotIdx = pushSource.indexOf('runDryRunOnce(app)')
   assert.ok(oneShotIdx >= 0, '--dry-run 分支必须调用一次性 runDryRunOnce(app)')
-  const guardIdx = pushSource.lastIndexOf("hasArg('--dry-run')", oneShotIdx)
-  assert.ok(guardIdx >= 0 && oneShotIdx - guardIdx < 600, '--dry-run 判定必须紧邻该一次性分支（不得落入常驻循环）')
   const tail = pushSource.slice(oneShotIdx)
   const retIdx = tail.indexOf('return')
   const residentIdx = tail.indexOf('runResident(')
