@@ -4,6 +4,8 @@
 // 背景：test.yml 的 SKIP_SUITES 与「显式步骤」是两份必须手工同步的清单——
 //   漏写 = 重复跑（浪费），多写 = 漏跑（门禁盲区），拼错 = 静默失效（等于没跳过）。
 //   本套件把「清单 ↔ 显式步骤」的双向对账与入口行为固定在门禁里，防止再次回归。
+// 另含测试入口参数契约（EXEC-D T10）：test_app.js 的 `--only=<子串>` 必须真的过滤——
+//   过滤静默失效时，用户照并行调度器（test_app_p.js）的定位提示串行重跑，反而触发全量用例。
 const assert = require('node:assert')
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
@@ -621,6 +623,46 @@ const strykerIdx = mutationYml.indexOf('npx stryker run')
 assert.ok(strykerIdx > 0, 'mutation.yml 应包含 stryker 运行步骤')
 assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHILD:\s*'1'/,
   'mutation.yml 的变异测试 step 必须设 XBK_MUTATION_CHILD=1（否则重复整表 append，几百次即撞 1MiB 上限）')
+
+// ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────
+// 背景：test_app.js 的 `--only=<子串>` 曾**静默失效**——旧实现用 process.argv.indexOf('--only')
+// 定位，等号写法下没有独立的 '--only' 元素 → 返回 -1 → 不过滤、照跑全部用例；而 test_app_p.js
+// 并行失败时打印的定位提示正是这个等号写法，于是「最需要快速定位的时刻」反而触发全量重跑。
+// 过滤失效此前无门禁可拦，是因为跳过同样计入 passed（passed 恒等于用例总数）⇒ 过滤静默失效时
+// 输出与「正常全量跑」完全同形。test_app.js 现已打印「实际执行 N 例，过滤跳过 M 例」，
+// 本段据此把契约固定为可证伪断言：等号形式**真的只跑匹配用例**，其余跳过且不计失败。
+{
+  const appSrc = fs.readFileSync('test_app.js', 'utf8')
+  // 期望值由 test_app.js 源码现算（与 test_app_p.js 同名提取口径），不写死用例数：
+  // 增删用例不会误红，而「--only 被忽略」会把实际执行数放大到 total → 立即红。
+  const allNames = [...appSrc.matchAll(/await test\((['"])(.*?)\1,/g)].map(m => m[2])
+  const FILTER = '空数据'
+  const matched = allNames.filter(n => n.includes(FILTER)).length
+  const total = allNames.length
+  assert.ok(total > 1, `test_app.js 应提取到多条用例（实得 ${total}）`)
+  assert.ok(matched >= 1, `作为过滤契约样本的子串「${FILTER}」必须至少匹配一条用例（消失即断言失去意义，需换样本）`)
+  assert.ok(matched < total, `过滤样本须非全体匹配（matched=${matched} / total=${total}），否则断言区分不出过滤是否生效`)
+  // XBK_PARALLEL_ID：让被测进程走独立缓存目录。`--only` 模式按设计跳过自清理（避免删掉并行进程
+  // 正在用的缓存），故必须在此收尾删除，避免污染仓库 xianbaoku_cache 影响后续套件。
+  const probeId = `only_probe_${process.pid}_${Date.now()}`
+  const probeCache = path.join(__dirname, `xianbaoku_cache_p${probeId}`)
+  let run
+  try {
+    run = spawnSync(process.execPath, [path.join(__dirname, 'test_app.js'), `--only=${FILTER}`],
+      { encoding: 'utf8', cwd: __dirname, timeout: 300000, env: { ...baseEnv, XBK_PARALLEL_ID: probeId } })
+  } finally {
+    fs.rmSync(probeCache, { recursive: true, force: true })
+  }
+  assert.ok(!run.error, `test_app.js --only= 子进程未能正常退出: ${run.error && run.error.message}`)
+  assert.strictEqual(run.status, 0,
+    `node test_app.js --only=${FILTER} 应 exit 0（其余用例跳过，不计失败）:\n${run.stdout}\n${run.stderr}`)
+  const stat = /实际执行 (\d+) 例，过滤跳过 (\d+) 例/.exec(run.stdout || '')
+  assert.ok(stat, '--only= 过滤未生效：输出缺少「实际执行 N 例，过滤跳过 M 例」统计' +
+    `（等号写法被忽略时会照跑全部 ${total} 例）:\n${(run.stdout || '').slice(-800)}`)
+  assert.strictEqual(Number(stat[1]), matched, `--only=${FILTER} 实际执行数应等于源码中匹配的用例数`)
+  assert.strictEqual(Number(stat[2]), total - matched, '过滤跳过数应为用例总数减匹配数')
+  console.log('✅ test_app.js `--only=<子串>` 过滤契约：等号形式只跑匹配用例，其余跳过不计失败')
+}
 
 console.log(`✅ SKIP_SUITES（${skips.length} 项）与 test.yml 显式步骤双向一致，且未知条目会失败`)
 console.log('✅ 零套件守卫：SKIP_SUITES 全覆盖（run_unit_tests.js）与空注册表（run_tests.js）均非 0 退出')

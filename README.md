@@ -171,7 +171,7 @@ npm run test:mutation-ranges  # 单独校验 mutation.yml 行段覆盖
 
 测试与变异链路的环境变量：`XBK_TEST_TIMEOUT`（`run_tests.js` 的每套件硬超时毫秒数，默认 600000，超时以 `SIGKILL` 强杀并按失败结算）、`XBK_MUTATION_REPORT_MAX_BYTES`（`scripts/mutation-json.js` 读取 `mutation.json` 前的预读上限，默认 2 GiB，`off` 表示只保留 Buffer 能表示的边界）、`MUTATION_REPORT_MAX_SKEW_MS`（`scripts/mutation-report.js` 的陈旧（缓存回填）报告闸门阈值，默认 12h，`off`/`≤0` 关闭）。
 
-定位单个集成用例：`node test_app.js --only <名称子串>`（`--only` 与子串以空格分隔；`--only=<子串>` 不生效，会照跑全部用例）。
+定位单个集成用例：`node test_app.js --only=<名称子串>`（也接受空格形式 `--only <子串>`）。只运行名称含该子串的用例，其余跳过且**不计失败**。输出末尾会打印「实际执行 N 例，过滤跳过 M 例」，用来确认过滤确实生效。（v3.276 前 `--only=<子串>` 写法不生效、会照跑全部用例，空格形式才生效。）
 
 ## 维护
 
