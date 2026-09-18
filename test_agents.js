@@ -268,8 +268,15 @@ dns.lookup = (hostname, options, callback) => {
       let list = resolverOrder.slice()
       if (opts.family === 4) list = list.filter(x => x.family === 4)
       else if (opts.family === 6) list = list.filter(x => x.family === 6)
-      if (opts.hints & dns.ADDRCONFIG) list = list.filter(x => x.family === 4)
-      const order = opts.order || (opts.verbatim === false ? 'ipv4first' : opts.verbatim === true ? 'verbatim' : 'verbatim')
+      // Sonar S1529：这里的位与是**有意**的位掩码判定（AI_ADDRCONFIG），不是写错的逻辑与；
+      // 显式与 0 比较即表达「该标志位被置位」，语义与原真值上下文完全一致（undefined & x === 0，
+      // 故 hints 缺失时同样为假），同时消除 S1529 告警（其规则只针对布尔上下文里的位运算）。
+      if ((opts.hints & dns.ADDRCONFIG) !== 0) list = list.filter(x => x.family === 4)
+      // Sonar S3923：原式 `verbatim === true ? 'verbatim' : 'verbatim'` 两个分支同值，是真冗余。
+      // 化简为等价形式：verbatim===false → 'ipv4first'，其余（true/未指定）→ 'verbatim'。对
+      // verbatim∈{true,false,undefined} 逐值等价；未指定时取 'verbatim' 是替身对进程默认顺序的建模
+      // （本机 dns.getDefaultResultOrder() === 'verbatim'；实现侧 dnsResultOrder 另有独立建模）。
+      const order = opts.order || (opts.verbatim === false ? 'ipv4first' : 'verbatim')
       if (order === 'ipv4first') list = list.slice().sort((a, b) => a.family - b.family)
       if (order === 'ipv6first') list = list.slice().sort((a, b) => b.family - a.family)
       process.nextTick(() => callback(null, opts.all === false ? list[0] : list, undefined))
