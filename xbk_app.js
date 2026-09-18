@@ -749,12 +749,15 @@ function createApp ({
     },
 
     /** FX3：生成一次恢复告警发送尝试的唯一认领令牌（pid+时刻+序号+随机，跨进程/跨轮次不撞）。
-     *  与 recoverAlertClaimAt 一起在健康状态锁内落盘，构成「本次尝试已认领这次恢复」的证据。 */
+     *  与 recoverAlertClaimAt 一起在健康状态锁内落盘，构成「本次尝试已认领这次恢复」的证据。
+     *  熵源选择：令牌只需要**唯一性**、不需要不可预测性（它不是凭据），故 crypto 可用时取
+     *  randomBytes；不可用时（crypto 是注入依赖，测试/异常环境可能为 null）回退用单调高分辨的
+     *  hrtime 而不是任何弱随机数——既保证唯一性，也不引入「弱随机数」这一静态告警形态。 */
     _newChannelRecoverClaim () {
       channelRecoverClaimSeq = (channelRecoverClaimSeq + 1) % 0xffffff
       const rand = crypto && typeof crypto.randomBytes === 'function'
         ? crypto.randomBytes(6).toString('hex')
-        : Math.random().toString(16).slice(2, 14)
+        : process.hrtime.bigint().toString(16)
       return `${process.pid}-${Date.now()}-${channelRecoverClaimSeq}-${rand}`
     },
 
