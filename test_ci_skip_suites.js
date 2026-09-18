@@ -527,20 +527,43 @@ const treeDir = makeRunTestsSandbox(
   }
 )
 const treeOutPath = path.join(treeDir, 'entry.stdout.txt')
-const treeOutFd = fs.openSync(treeOutPath, 'w')
+// CodeQL js/file-system-race（本仓库的**必需检查**）：同一条路径上「先 open（check）… 再按路径操作（use）」
+// 是 check-then-use —— 检查与使用之间该路径可被换成另一个对象。该查询的 use 集合显式含 open/openSync 本身
+// （见 codeql 查询 FileSystemRace.ql 的 FileUse：readFile(Sync)/writeFile(Sync)/appendFile(Sync)/open(Sync)），
+// 所以「关掉写端后再 openSync(path,'r') 按路径二次打开、然后按新 fd 读」仍构成同一对（只是告警位置前移），
+// 唯一清得掉判据的形态是：**全流程对这条路径只有一次按路径的访问**。故一次 open 用 'w+'（读写的同一个 fd）：
+// 子进程继承的 fd1 仍是**真实文件**（3g4 的「孙进程持有继承 fd1」前提不变），之后只对 fd 做 fstatSync/readSync
+// ——与 scripts/mutation-json.js 的「一次 open + 只对 fd 判定与读取」同口径。
+const treeOutFd = fs.openSync(treeOutPath, 'w+')
 const treeErrFd = fs.openSync(path.join(treeDir, 'entry.stderr.txt'), 'w')
 let treePid = 0
 try {
   let tree
+  let treeOut
   const t0 = Date.now()
   try {
     tree = runRunTestsIn(treeDir, { XBK_TEST_TIMEOUT: '1500' }, { timeout: 30000, stdio: ['ignore', treeOutFd, treeErrFd] })
   } finally {
-    fs.closeSync(treeOutFd)
-    fs.closeSync(treeErrFd)
+    // 子进程已退出且不再写：先按 fd 取真实大小，再从**位置 0** 显式读回。位置必须显式给 0——子进程继承的是
+    // 同一个打开文件描述（dup），写完共享偏移停在 EOF，readFileSync(fd) 会从当前位置读回空串（本机实测）。
+    // 分配量由 fstat 观测值决定、按 fd 有界读取，与 xbk_storage.js 的 readFdRange / scripts/mutation-json.js
+    // 同口径；写入方已全部退出，读到的就是完整输出（断言语义不变）。
+    try {
+      const treeOutSize = fs.fstatSync(treeOutFd).size
+      const treeOutBuf = Buffer.allocUnsafe(treeOutSize)
+      let treeOutRead = 0
+      while (treeOutRead < treeOutSize) {
+        const n = fs.readSync(treeOutFd, treeOutBuf, treeOutRead, treeOutSize - treeOutRead, treeOutRead)
+        if (n <= 0) break
+        treeOutRead += n
+      }
+      treeOut = treeOutBuf.subarray(0, treeOutRead).toString('utf8')
+    } finally {
+      fs.closeSync(treeOutFd)
+      fs.closeSync(treeErrFd)
+    }
   }
   const elapsed = Date.now() - t0
-  const treeOut = fs.readFileSync(treeOutPath, 'utf8')
   assert.strictEqual(tree.signal, null,
     `入口必须自行结束（被测试侧 30s 兜底杀掉说明入口未收敛，实测 ${elapsed}ms）`)
   assert.notStrictEqual(tree.status, 0, '超时的套件必须让入口以非 0 退出（fail-closed 语义不变）')
