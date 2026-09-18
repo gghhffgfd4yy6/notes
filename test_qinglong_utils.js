@@ -200,8 +200,12 @@ const {
 
   // 接线断言（与 test_cli.js:31 同一种源码级手法）：main() 的 --dry-run 分支必须调用 runDryRunOnce
   // 并 return，绝不能继续落到 runResident(...)。回退旧行为（只设 XBK_DRY_RUN=1 即常驻）时本断言必红。
+  // 变异沙箱兼容（PR #154 实测）：Stryker 插桩会把条件改写成 `if (stryNS_9fa48() || hasArg('--dry-run'))`，
+  // 因此**不能**把 `if (` 与条件写死成紧邻（否则 qinglong-push 变异 job 的初始测试运行必红）。
+  // 改为用否定前瞻表达真正的咬合：「runDryRunOnce(app) 之后、遇到 runResident( 之前必须 return」——
+  // 删掉该分支/那次调用/那个 return，或让它继续落到常驻循环，本断言都会红（不被 397 行那处单行 if 搭便车）。
   const pushSource = fs.readFileSync(path.join(__dirname, 'qinglong', 'xbk_push.js'), 'utf8')
-  assert.match(pushSource, /if\s*\(\s*hasArg\(\s*['"]--dry-run['"]\s*\)\s*\)\s*\{[\s\S]*?runDryRunOnce\(app\)[\s\S]*?return\s*\}/,
+  assert.match(pushSource, /hasArg\(\s*['"]--dry-run['"]\s*\)[\s\S]{0,600}?runDryRunOnce\(app\)(?:(?!runResident\()[\s\S])*?return/,
     '--dry-run 必须接线到一次性 runDryRunOnce 并在其后 return（不得落入常驻循环）')
   assert.match(pushSource, /await\s+runResident\(app,\s*controller\)/, '常驻路径必须仍然存在（防"删掉常驻"式假修复）')
 
