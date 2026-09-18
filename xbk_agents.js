@@ -55,16 +55,67 @@ function invalidateDnsForError (error, url) {
     return true
   } catch (e) { return false }
 }
-// AGENTS-01：缓存/pending key 只保留 hostname + family。
-// 真实 net.connect 传给 lookup 的选项随 Node 版本变化（Node ≥20 默认开启 autoSelectFamily，
-// 实测 Node v24 传 {"hints":1024,"all":true}），而 prewarmDns 只能给出自己构造的选项（默认 {}）。
-// 把 hints/all/verbatim 编进 key 会让「预热」与「真实请求」永不同 key——预热写进一个永不被读的
-// 条目，DNS 预热完全无效。hints/verbatim 只影响地址过滤与排序、不改变地址集合；all 只决定回调
-// 形状。故按 hostname+family 共享条目，底层统一按 all:true 解析并缓存完整地址列表，回调形状在
-// 派发时按各调用方的 all 适配（见 dispatchLookupResult）。
-function dnsCacheKey (hostname, options) {
+// AGENTS-01：预热必须与真实请求同 key，否则预热写进一个永不被读的条目、DNS 预热完全无效。
+// AGENTS-11（PR #154 评审 / qodo High-Correctness）：但「同 key」不能靠丢掉结果选择选项来换——
+// 缓存里存的是**解析器按调用方选项筛选/排序后**的地址。key 只含 hostname|family 时，用默认选项
+// 预热后，带地址筛选（hints）或排序（verbatim/order）的真实请求会在 TTL 内直接复用不匹配的地址：
+// 选择逻辑不再执行，还可能选中本应排除的地址（实测本机无默认网络 IPv6，平台的 AI_ADDRCONFIG 会
+// 剔除 AAAA）。故 key 收敛为 hostname|family|hints|order：任一影响结果选择的选项不同即不同条目，
+// 各自向底层解析器取真实结果——**不**在 JS 内复现 getaddrinfo 语义（实测 os.networkInterfaces()
+// 有全局 IPv6 240e:/2408:，而平台 AI_ADDRCONFIG 仍只返回 A：平台按默认网络/路由判断「本机已配置
+// 族」，JS 侧无法忠实复现）。all 不进 key：它只决定回调形状（由 dispatchLookupResult 适配）。
+// 预热有效性由「同源取值」保证：prewarmDns 用生产请求路径实测的选项（见 productionLookupOptions），
+// 与 net.connect 实际传给 lookup 的选项同 key。
+const DNS_MODELED_OPTION_KEYS = new Set(['all', 'family', 'hints', 'verbatim', 'order'])
+const DNS_RESULT_ORDERS = new Set(['verbatim', 'ipv4first', 'ipv6first'])
+
+// 生产请求路径（https.get → net.connect → lookup）实测于 Node v24.18.0：
+//   family 未指定 → {hints: dns.ADDRCONFIG}（autoSelectFamily 默认开启时另加 all:true）
+//   family 已指定 → {family: 4|6, hints: 0}
+// 分别对应默认 / XBK_DNS_FAMILY=4|6 两种部署；autoSelectFamily 关闭时只少一个 all:true，而 all 不
+// 进 key，故不影响命中。若将来 Node 改了这些选项，后果只是预热条目不再被请求命中（key 承载的始终
+// 是各调用方自己的选项，正确性不受影响），届时需同步本函数。
+const PRODUCTION_LOOKUP_HINTS = typeof dns.ADDRCONFIG === 'number' ? dns.ADDRCONFIG : 0
+
+function productionLookupOptions () {
+  const family = DNS_LOOKUP_IP_VERSION === 'ipv4' ? 4 : DNS_LOOKUP_IP_VERSION === 'ipv6' ? 6 : 0
+  return { family, hints: family === 0 ? PRODUCTION_LOOKUP_HINTS : 0 }
+}
+
+// 与 Node dns.lookup 同口径：order 优先于 verbatim；两者都未显式给出时才用进程级默认顺序
+// （可被 --dns-result-order / dns.setDefaultResultOrder 改写）。非法取值返回 null → 该调用不进缓存。
+function dnsResultOrder (opts) {
+  if (opts.order !== undefined) return DNS_RESULT_ORDERS.has(opts.order) ? opts.order : null
+  if (opts.verbatim !== undefined) {
+    if (typeof opts.verbatim !== 'boolean') return null
+    return opts.verbatim ? 'verbatim' : 'ipv4first'
+  }
+  try {
+    const fallback = typeof dns.getDefaultResultOrder === 'function' ? dns.getDefaultResultOrder() : 'verbatim'
+    return DNS_RESULT_ORDERS.has(fallback) ? fallback : 'verbatim'
+  } catch (e) { return 'verbatim' }
+}
+
+// 选项签名：只覆盖本模块建模到的、影响结果选择/排序的字段。
+// 返回 null = 选项超出建模范围（未知键、非法类型/取值）→ 该调用不进缓存，直接交给底层解析器：
+// 宁可这类调用方少一次缓存命中，也不能让它复用按别的选项筛选/排序过的地址。
+function dnsSelectionSignature (options) {
   const opts = options || {}
-  return [hostname, opts.family || 0].join('|')
+  for (const key of Object.keys(opts)) {
+    if (!DNS_MODELED_OPTION_KEYS.has(key)) return null
+  }
+  if (opts.family !== undefined && opts.family !== 0 && opts.family !== 4 && opts.family !== 6) return null
+  if (opts.hints !== undefined && (typeof opts.hints !== 'number' || !Number.isFinite(opts.hints))) return null
+  const order = dnsResultOrder(opts)
+  if (order === null) return null
+  return { family: opts.family || 0, hints: opts.hints || 0, order }
+}
+
+// 返回 null 表示该调用不走缓存（选项未建模），调用方需直接交给底层解析器。
+function dnsCacheKey (hostname, options) {
+  const sig = dnsSelectionSignature(options)
+  if (!sig) return null
+  return [hostname, sig.family, sig.hints, sig.order].join('|')
 }
 
 // 按调用方的 all 适配回调形状：all:true 拿 [{address, family}]，其余拿标量（取列表首项）。
@@ -80,6 +131,13 @@ function dnsLookup (hostname, options, callback) {
   const opts = options || {}
   const wantAll = Boolean(opts.all)
   const key = dnsCacheKey(hostname, opts)
+  // AGENTS-11：选项未建模（未知键/非法取值）→ 不读也不写缓存，按调用方原选项直接解析。
+  // 这类调用方（目前只有测试/未来扩展）失去缓存收益，换来的是「拿到的地址一定按自己的选项
+  // 筛选/排序过」，也不会污染同主机其它选项的缓存条目。
+  if (key === null) {
+    dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => dispatchLookupResult(callback, wantAll, error, address, family))
+    return
+  }
   const now = Date.now()
   const cached = dnsCache.get(key)
   if (cached && cached.expiresAt > now) {
@@ -110,7 +168,8 @@ function dnsLookup (hostname, options, callback) {
 }
 
 function prewarmDns (hostname, signal = null) {
-  const options = DNS_LOOKUP_IP_VERSION === 'ipv4' ? { family: 4 } : DNS_LOOKUP_IP_VERSION === 'ipv6' ? { family: 6 } : {}
+  // AGENTS-11：预热与真实请求同源取值（生产请求路径实测的 family/hints），否则 key 不同 → 预热失效。
+  const options = productionLookupOptions()
   const started = Date.now()
   const makeResult = (error, address, family) => ({
     // AGENTS-07：预热结果带显式任务类型，调用方可按字段区分 DNS/TLS（两者都带 hostname），
@@ -130,7 +189,9 @@ function prewarmDns (hostname, signal = null) {
     // dnsPending 记账中摘除（不持有引用、再次预热会重新发起解析），并在解析完成时移除 abort 监听。
     // 契约：取消不保证进程立刻退出——底层解析仍可能后台完成，退出时机由调用方退出策略负责。
     let settled = false
-    // 与 dnsLookup 内部同 key（AGENTS-01 起为 hostname+family）：abort 时按 key 定位 dnsPending 中的本回调
+    // 与 dnsLookup 内部同 key（AGENTS-11 起为 hostname+family+hints+order，见 dnsCacheKey）：
+    // abort 时按 key 定位 dnsPending 中的本回调。options 由本函数自建、必在建模范围内（key 非空），
+    // 这里仍按 null 兜底：key 为 null 时不做记账摘除（dnsLookup 也不会为该调用建记账）。
     const key = dnsCacheKey(hostname, options)
     const done = (error, address, family) => { if (!settled) { settled = true; resolve(makeResult(error, address, family)) } }
     const callback = (error, address, family) => {
@@ -138,9 +199,9 @@ function prewarmDns (hostname, signal = null) {
       done(error, address, family)
     }
     const onAbort = () => {
-      const pending = dnsPending.get(key)
+      const pending = key === null ? null : dnsPending.get(key)
       if (pending) {
-        // dnsPending 条目是 { callback, all }（AGENTS-01）：按回调身份定位本记账项
+        // dnsPending 条目是 { callback, all }：按回调身份定位本记账项
         const i = pending.findIndex(entry => entry.callback === callback)
         if (i !== -1) pending.splice(i, 1)
         if (pending.length === 0) dnsPending.delete(key)
