@@ -38,7 +38,9 @@ assert.notStrictEqual(invalidRange.status, 0, '超过文件长度的行段必须
 const v3Raw = fs.readFileSync('xbk_function_v3.js', 'utf8')
 // 与 scripts/check-mutation-ranges.js 的 actualLines 同口径（末行换行不计一行）
 const v3Lines = v3Raw.endsWith('\n') ? v3Raw.split('\n').length - 1 : v3Raw.split('\n').length
-assert.match(invalidRange.stderr, new RegExp(`超过文件实际行数 ${v3Lines}`), '错误应说明实际文件行数')
+// 用字符串包含断言替代 new RegExp(`…`)：插值只有十进制行数、不含正则元字符，语义等价；
+// 动态构造 RegExp 会被静态分析判为「非字面量 RegExp」（Codacy/ESLint security 族）。
+assert.ok(invalidRange.stderr.includes(`超过文件实际行数 ${v3Lines}`), '错误应说明实际文件行数')
 
 // matrix 的 src 字段（actions/cache 指纹用）必须与 mutate 目标同文件：写错或缺行都不会让 CI 报错，
 // 只会悄悄让该段的缓存指纹失真
@@ -72,7 +74,12 @@ assert.match(configDrift.stderr, /stryker\.config\.js 的 mutate 含矩阵未覆
 // 把守；这里补上 stryker.config.js ↔ DEFAULT_FILES 这条边，使三者形成闭环。
 const { mutate } = require('./stryker.config.js')
 const { DEFAULT_FILES } = require('./run_mutation')
-assert.deepStrictEqual([...DEFAULT_FILES].sort(), [...mutate].sort(),
+// 显式比较器（Sonar S2871 要求 sort 传比较函数）。这里刻意**不用** localeCompare：
+// ICU 排序会忽略 `.`/`/` 等变权重标点（"xbk_utils.js" vs "scripts/check-deps.js" 的相对次序
+// 与默认排序可能不同），而本断言只要求两侧以同一口径排序；按 UTF-16 码位比较与
+// Array.prototype.sort() 的默认行为逐字符等价，可保持既有比较语义不变。
+const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+assert.deepStrictEqual([...DEFAULT_FILES].sort(byCodeUnit), [...mutate].sort(byCodeUnit),
   'run_mutation.js 的 DEFAULT_FILES 必须与 stryker.config.js 的 mutate 目标完全一致（增删 mutate 目标时同步）')
 assert.strictEqual(new Set(DEFAULT_FILES).size, DEFAULT_FILES.length, 'DEFAULT_FILES 不得含重复项')
 for (const file of DEFAULT_FILES) {
