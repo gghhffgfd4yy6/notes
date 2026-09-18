@@ -26,6 +26,21 @@ on:
 permissions:
   contents: read
 
+# REV-CI：同一 ref 的 Mutation 运行必须串行——本工作流此前完全没有 concurrency，而 test.yml / codeql.yml
+# 都有；这是 21 个矩阵 job 互相饿死的实际来源。
+# 实测（gh api actions/runs + …/jobs，2026-09-18）：当日 12 次 Mutation 运行里最多 6 次同时 active，
+# 其中 5 次落在同一分支 fix/unresolved-114-batch2（01:19 / 01:28 / 02:53 / 03:00 / 03:09 起），
+# 每次 21 个 job ⇒ 峰值约 126 个 job 争抢并发额度。后果在 job 级排队时间上可见：
+# run 35302109509 的 rules / storage / http 三段各自只跑了 1.5 / 1.4 / 1.3 分钟，
+# 却分别排队 64.3 / 64.0 / 63.7 分钟（该 run 墙钟 272 分钟，绝大部分是排队不是计算）。
+# 按 ref 分组即可完全消除本观测到的重叠形态（重叠的 5 次同 ref），且不影响其它路径：
+#   - 主 cron 与分支 dispatch 的 ref 不同 ⇒ 不同组，日报不会被分支任务拖累；
+#   - cancel-in-progress: false 是有意为之——Mutation 单段可跑 3.5h（实测 check-deps 215.2min），
+#     取消在跑任务等于丢弃已完成的变异进度；这里只要「不重叠」，不要「抢最新」。
+#     GitHub 语义下同组内更早的 *pending* 运行会被新运行取代，这正好是我们要的同 ref 去重。
+concurrency:
+  group: mutation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   # GitHub schedule 是尽力调度。中午补偿任务查询同日任意触发方式下成功或未完成的运行，
   # 避免重复执行手动/push 触发的变异测试；主 cron、手动和 push 始终运行。
