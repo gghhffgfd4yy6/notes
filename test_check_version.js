@@ -1,5 +1,5 @@
 'use strict'
-// check-version.js（版本三方一致性闸门）回归测试。
+// check-version.js（版本四方一致性闸门：文件头/CHANGELOG/package.json/package-lock.json 根元数据）回归测试。
 // 覆盖 PR 评审 #143-4「Mismatched versions pass the gate」：原实现把补丁段整段丢弃，
 // package.json=3.272.5 这类漂移在闸门上判绿。
 // 只喂「已读到的值」给纯函数 checkVersionValues()——不建夹具目录、不碰文件系统，因此在 Stryker/变异
@@ -10,7 +10,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
-const { checkVersionValues, baseVersion, patchOf } = require('./check-version')
+const { checkVersionValues, baseVersion, patchOf, compareBaseVersion, latestChangelogVersion, lockRootVersions } = require('./check-version')
 
 let pass = 0
 let fail = 0
@@ -20,15 +20,22 @@ function check (name, fn) {
 
 const HEAD = '//* ******* 线报酷推送脚本 v3.272 — 版本更新 *********'
 const CHANGELOG = '# Changelog\n\n## v3.271\n\n## v3.272\n'
-const values = (over = {}) => Object.assign({ headLine: HEAD, changelog: CHANGELOG, pkgVersion: '3.272.0' }, over)
+// Q1（PR 评审 #154-3）：lock 两个根字段默认与 package.json 同值（一致态），漂移由用例单独 over。
+const values = (over = {}) => Object.assign({
+  headLine: HEAD,
+  changelog: CHANGELOG,
+  pkgVersion: '3.272.0',
+  lockVersion: '3.272.0',
+  lockRootPackageVersion: '3.272.0'
+}, over)
 const text = (r) => r.messages.join('\n')
 
 console.log('=== check-version.js 版本闸门测试 ===')
 
-check('三方一致（major.minor + 补丁段 .0）→ 通过', () => {
+check('四方一致（major.minor + 补丁段 .0 + lock 两处同值）→ 通过', () => {
   const r = checkVersionValues(values())
   assert.strictEqual(r.ok, true, text(r))
-  assert.match(text(r), /版本三方一致：v3\.272/)
+  assert.match(text(r), /版本四方一致：v3\.272/)
 })
 
 check('补丁段非 0（3.272.5）→ 判红并点名补丁段（qodo #143-4 回归）', () => {
@@ -53,6 +60,62 @@ check('预发布后缀（3.272.0-rc.1）→ 补丁段视为 0，通过', () => {
   assert.strictEqual(r.ok, true, text(r))
 })
 
+// ── Q1（PR 评审 #154-3「Release lock keeps old version」）：package-lock.json 根元数据两处纳入闸门 ──
+// 修前 lock 根本不参与判定（package.json 已到 3.276.0，lock 两处仍是 3.275.0 也判绿），锁文件元数据
+// 读者看到的是上一个版本，且下次再生 lock 会多出一处与本次变更无关的版本 diff。
+check('Q1：lock 顶层 version 落后 → 判红并点名该字段', () => {
+  const r = checkVersionValues(values({ lockVersion: '3.271.0' }))
+  assert.strictEqual(r.ok, false, 'lock 顶层 version 落后必须判红（修前该字段不参与判定）')
+  assert.match(text(r), /package-lock\.json 顶层 version = 3\.271/, `失败详情须点名 lock 顶层 version：${text(r)}`)
+})
+
+check('Q1：lock packages[""].version 落后 → 判红并点名该字段', () => {
+  const r = checkVersionValues(values({ lockRootPackageVersion: '3.271.0' }))
+  assert.strictEqual(r.ok, false, 'lock packages[""].version 落后必须判红')
+  assert.match(text(r), /package-lock\.json packages\[""\]\.version = 3\.271/, `失败详情须点名 packages[""].version：${text(r)}`)
+})
+
+check('Q1：lock 两处同时落后（#154 真实形态）→ 两行都报', () => {
+  const r = checkVersionValues(values({ lockVersion: '3.271.0', lockRootPackageVersion: '3.271.0' }))
+  assert.strictEqual(r.ok, false, '两处漂移必须判红')
+  assert.match(text(r), /package-lock\.json 顶层 version = 3\.271/)
+  assert.match(text(r), /package-lock\.json packages\[""\]\.version = 3\.271/)
+})
+
+check('Q1：lock 字段缺失/形态异常 → fail-closed 判红（不许「读不到就跳过」）', () => {
+  const cases = [
+    { lockVersion: undefined },
+    { lockRootPackageVersion: undefined },
+    { lockVersion: null },
+    { lockVersion: '' },
+    { lockVersion: 'v3.272.0' },
+    { lockVersion: 3272 },
+    { lockRootPackageVersion: {} }
+  ]
+  for (const over of cases) {
+    const r = checkVersionValues(values(over))
+    assert.strictEqual(r.ok, false, `lock 入参 ${JSON.stringify(over)} 必须判红（缺失即 fail-closed）`)
+    assert.match(text(r), /缺失或版本形态异常/, `应报『缺失或版本形态异常』：${text(r)}`)
+  }
+})
+
+check('Q1：lock 补丁段与 package.json 不一致（3.272.5）→ 判红', () => {
+  const r = checkVersionValues(values({ lockVersion: '3.272.5', lockRootPackageVersion: '3.272.5' }))
+  assert.strictEqual(r.ok, false, '同 base 不同 patch 的 lock 漂移必须判红')
+  assert.match(text(r), /补丁段与 package\.json 不一致/, `应点名补丁段：${text(r)}`)
+})
+
+check('Q1：lock 与 package.json 一致（含两段式）→ 通过（反向对照，防「恒红」掩盖上面各条）', () => {
+  const r = checkVersionValues(values({ pkgVersion: '3.272', lockVersion: '3.272', lockRootPackageVersion: '3.272' }))
+  assert.strictEqual(r.ok, true, text(r))
+  const fields = lockRootVersions({ lockVersion: '3.271.0', lockRootPackageVersion: '3.271.0' })
+  assert.strictEqual(fields.length, 2, 'lockRootVersions 必须覆盖 lock 的两个根版本字段')
+  assert.deepStrictEqual(lockRootVersions({}), [
+    ['package-lock.json 顶层 version', undefined],
+    ['package-lock.json packages[""].version', undefined]
+  ], 'lockRootVersions 的字段名必须自解释（失败详情直接引用）')
+})
+
 check('文件头首行缺版本号（正文历史注释不算数）→ 判红', () => {
   const r = checkVersionValues(values({ headLine: '// 无版本头' }))
   assert.strictEqual(r.ok, false, '文件头取不到版本号必须判红')
@@ -69,6 +132,27 @@ check('CHANGELOG 落后于文件头 → 判红', () => {
   const r = checkVersionValues(values({ changelog: '# Changelog\n\n## v3.271\n' }))
   assert.strictEqual(r.ok, false, 'CHANGELOG 版本落后必须判红')
   assert.match(text(r), /CHANGELOG = 3\.271/)
+})
+
+// ── F5 回归：CHANGELOG 的「最新」按版本号最大值取值，不再按「文件中最后一条」的位置假设 ──────────
+check('F5 回归：CHANGELOG 倒序（新条目顶插）→ 通过', () => {
+  const r = checkVersionValues(values({ changelog: '# Changelog\n\n## v3.272\n\n## v3.271\n' }))
+  assert.strictEqual(r.ok, true, `顶插新条目不应误红（旧实现取末条 3.271 会判红）：${text(r)}`)
+})
+
+check('F5 回归：有更大版本号时取最大值（数值比较，非字典序）', () => {
+  assert.strictEqual(latestChangelogVersion('# Changelog\n\n## v3.99\n\n## v3.272\n\n## v3.100\n'), '3.272',
+    '应取最大版本号 3.272（末条是 3.100，字典序会误判 3.99/3.100）')
+  assert.strictEqual(latestChangelogVersion('# Changelog\n\n## v3.9\n\n## v3.100\n'), '3.100', '3.100 > 3.9（数值而非字典序）')
+  assert.strictEqual(latestChangelogVersion('# Changelog\n\n没有条目\n'), null, '无条目应返回 null')
+  assert.strictEqual(compareBaseVersion('3.100', '3.99') > 0, true, 'compareBaseVersion 按数值比较')
+  assert.strictEqual(compareBaseVersion('3.272', '3.272'), 0, '相同版本应返回 0')
+})
+
+check('F5 回归：CHANGELOG 缺最新（文件头高于所有条目）→ 仍判红', () => {
+  const r = checkVersionValues(values({ headLine: '// 线报酷推送脚本 v3.273', changelog: '# Changelog\n\n## v3.272\n\n## v3.271\n' }))
+  assert.strictEqual(r.ok, false, '文件头高于 CHANGELOG 全部条目必须判红（取最大不得变成永不红）')
+  assert.match(text(r), /CHANGELOG = 3\.272/)
 })
 
 check('package.json 版本非法/缺失 → 判红（不抛栈）', () => {
@@ -101,9 +185,9 @@ check('baseVersion/patchOf 边界', () => {
 })
 
 // ── CLI 退出路径回归（audit low/info：失败路径 process.exit(1) → process.exitCode = 1）──────────────
-// 判定逻辑 checkVersionValues() 是纯函数，但「失败时怎么退出」只在 require.main 分支里（第 110-117 行），
-// 纯函数测不到。这里在临时目录里搭一套最小「版本三方源」夹具，并把 check-version.js **复制**过去执行——
-// 复制而非改写，仓库文件一个字节都不动；模块内三处路径全是 __dirname 常量（MAIN_FILE / CHANGELOG_FILE /
+// 判定逻辑 checkVersionValues() 是纯函数，但「失败时怎么退出」只在 check-version.js 末尾的 require.main 分支里，
+// 纯函数测不到。这里在临时目录里搭一套最小「版本四方源」夹具，并把 check-version.js **复制**过去执行——
+// 复制而非改写，仓库文件一个字节都不动；模块内四处路径全是 __dirname 常量（MAIN_FILE / CHANGELOG_FILE / LOCK_FILE /
 // require('./package.json')），故复制到别处即读到夹具，无需任何生产改动或环境变量注入。
 // 三种断言缺一不可：
 //   ① 退出码语义不变：版本不一致仍 exit 1（process.exitCode 与 process.exit 的外部退出码一致）；
@@ -125,18 +209,30 @@ const EXIT_SPY = [
 ].join('\n')
 
 // 搭夹具：主文件头 v3.272 / CHANGELOG 最新 v3.272 / package.json = 入参（与 HEAD、CHANGELOG 常量同源）
-function makeVersionCliFixture (pkgVersion) {
+// Q1：并写 package-lock.json（两个根版本字段默认与 package.json 同值）；omitLock 用于验证「锁文件读不到
+// 必须 fail-closed」，lockVersion / lockRootPackageVersion 用于注入漂移。
+function makeVersionCliFixture (pkgVersion, opts = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cvcli-'))
   fs.writeFileSync(path.join(dir, 'check-version.js'), fs.readFileSync(path.join(__dirname, 'check-version.js'), 'utf8'))
   fs.writeFileSync(path.join(dir, 'xbk_function_v3.js'), HEAD + '\n')
   fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), CHANGELOG)
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'check-version-fixture', version: pkgVersion }))
+  if (!opts.omitLock) {
+    const lockVersion = opts.lockVersion === undefined ? pkgVersion : opts.lockVersion
+    const lockRoot = opts.lockRootPackageVersion === undefined ? pkgVersion : opts.lockRootPackageVersion
+    fs.writeFileSync(path.join(dir, 'package-lock.json'), JSON.stringify({
+      name: 'check-version-fixture',
+      version: lockVersion,
+      lockfileVersion: 3,
+      packages: { '': { name: 'check-version-fixture', version: lockRoot } }
+    }, null, 2))
+  }
   fs.writeFileSync(path.join(dir, 'exit-spy.js'), EXIT_SPY)
   return dir
 }
 
-function runVersionCli (pkgVersion) {
-  const dir = makeVersionCliFixture(pkgVersion)
+function runVersionCli (pkgVersion, opts = {}) {
+  const dir = makeVersionCliFixture(pkgVersion, opts)
   try {
     const mark = path.join(dir, 'exit-spy-mark.txt')
     const res = spawnSync(process.execPath, ['--require', path.join(dir, 'exit-spy.js'), path.join(dir, 'check-version.js')], {
@@ -161,12 +257,31 @@ check('CLI 失败路径：版本不一致仍 exit 1 + 失败详情完整 + 不�
     `stderr 须完整到失败详情最后一行（package.json = 3.999），实际: ${JSON.stringify(r.stderr)}`)
 })
 
-check('CLI 成功路径：三方一致 exit 0 + 成功文案（对照，防「恒退 1」掩盖失败路径断言）', () => {
+check('CLI 成功路径：四方一致 exit 0 + 成功文案（对照，防「恒退 1」掩盖失败路径断言）', () => {
   const r = runVersionCli('3.272.0')
-  assert.strictEqual(r.status, 0, `三方一致时退出码必须为 0，实际 ${r.status}（stderr: ${JSON.stringify(r.stderr)}）`)
+  assert.strictEqual(r.status, 0, `四方一致时退出码必须为 0，实际 ${r.status}（stderr: ${JSON.stringify(r.stderr)}）`)
   assert.strictEqual(r.exitCalledWith, null, '成功路径同样不得调用 process.exit()')
-  assert.match(r.stdout, /版本三方一致：v3\.272/, `成功文案应报到 stdout，实际: ${JSON.stringify(r.stdout)}`)
+  assert.match(r.stdout, /版本四方一致：v3\.272/, `成功文案应如实反映「四方」（含 lock 两处），实际: ${JSON.stringify(r.stdout)}`)
   assert.strictEqual(r.stderr, '', `成功路径不得往 stderr 写内容，实际: ${JSON.stringify(r.stderr)}`)
+})
+
+check('CLI 失败路径：lock 落后于 package.json → exit 1 + 详情点名 lock 两处（Q1 回归）', () => {
+  const r = runVersionCli('3.272.0', { lockVersion: '3.271.0', lockRootPackageVersion: '3.271.0' })
+  assert.strictEqual(r.status, 1, `lock 漂移必须退出码 1，实际 ${r.status}（stderr: ${JSON.stringify(r.stderr)}）`)
+  assert.strictEqual(r.exitCalledWith, null, '失败路径不得调用 process.exit()')
+  assert.ok(r.stderr.includes('❌ 版本不一致（基准 = 主文件头 v3.272）'),
+    `stderr 应含失败结论行，实际: ${JSON.stringify(r.stderr)}`)
+  assert.ok(r.stderr.includes('package-lock.json 顶层 version = 3.271'),
+    `stderr 应点名 lock 顶层 version，实际: ${JSON.stringify(r.stderr)}`)
+  assert.ok(r.stderr.includes('package-lock.json packages[""].version = 3.271'),
+    `stderr 应点名 lock packages[""].version，实际: ${JSON.stringify(r.stderr)}`)
+})
+
+check('CLI 失败路径：package-lock.json 缺失 → fail-closed exit 1（不得静默少校验）', () => {
+  const r = runVersionCli('3.272.0', { omitLock: true })
+  assert.strictEqual(r.status, 1, `锁文件缺失必须判红，实际 ${r.status}（stderr: ${JSON.stringify(r.stderr)}）`)
+  assert.ok(r.stderr.includes('❌ package-lock.json 读取失败'),
+    `应报锁文件读取失败，实际: ${JSON.stringify(r.stderr)}`)
 })
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_check_version ${fail === 0 ? `全部通过（${pass} 项）` : `通过 ${pass}/${pass + fail} 项，失败 ${fail} 项`}`)

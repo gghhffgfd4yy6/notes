@@ -6,7 +6,7 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
-const { readReportJson } = require('./mutation-json.js')
+const { readReportJson, resolveMaxReportBytes } = require('./mutation-json.js')
 
 // 必须与 mutation.yml 的矩阵名称保持一致；缺段时禁止把部分结果伪装成完整日报。
 const EXPECTED_SEGMENTS = Object.freeze([
@@ -21,6 +21,103 @@ const EXPECTED_SEGMENTS = Object.freeze([
 const MUTANT_STATUSES = new Set([
   'Killed', 'Survived', 'NoCoverage', 'CompileError', 'RuntimeError', 'Timeout', 'Ignored', 'Pending'
 ])
+
+// F7：去重列表查询的整体超时（毫秒）——列表 API 只回答「当天是否已发过」，挂住不能拖死整个日报 job。
+const LIST_QUERY_TIMEOUT_MS = 15000
+
+// F1：新鲜度闸门阈值（缓存回填检测）。修复前的参考基准只有「本批报告文件里最新的 mtime」：
+//   * 同一次 CI 运行内各段 matrix job 并行执行，单 job 默认上限 6h，正常产出的 mtime 跨度不可能超过 6h；
+//   * 段 job 崩溃/被 6h 取消时，actions/cache 恢复出来的上一次运行的 reports/mutation/mutation.json
+//     被原样带进 artifact——其 mtime 与当日其它段相差 ≥12h（日报每日一轮）。
+// 故默认 12h：远大于正常跨度、小于跨日缓存的陈旧跨度。可用 MUTATION_REPORT_MAX_SKEW_MS 覆盖
+// （单位毫秒；`off` 或 ≤0 关闭该闸门；无法解析的值回落到默认值，不静默关闭闸门）。
+// 返工（V4 打回）：只用「本批最新者」当基准会漏掉两种**回填同族**——全体回填（所有段 mtime 都很旧、
+// 互差≈0）与跨轮同日回填（<12h、互差≈0）。故该阈值同时用作「相对现在的年龄上限」，并另加一层
+// 以本轮 workflow 运行起点（MUTATION_RUN_STARTED_AT = github.run_started_at）为下界的判定。
+const DEFAULT_MAX_SKEW_MS = 12 * 60 * 60 * 1000
+
+// F1（返工）：本轮运行起点下界的容差——工件落盘/时钟分辨率的余量（CI 内各 job 同钟，无需大余量）。
+const RUN_START_SLACK_MS = 5 * 60 * 1000
+
+// 阈值解析是纯函数（不读环境变量 → 测试 hermetic）；调用点显式把环境变量传进来。
+function resolveMaxSkewMs (raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_MAX_SKEW_MS
+  if (String(raw).trim().toLowerCase() === 'off') return 0
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return DEFAULT_MAX_SKEW_MS // 配置笔误不得把闸门静默关掉
+  return n > 0 ? n : 0
+}
+
+// F1（返工）：解析本轮 workflow 的 run_started_at（mutation.yml 的 report 步骤注入
+// MUTATION_RUN_STARTED_AT: ${{ github.run_started_at }}）。无法解析/未提供 → undefined（跳过该层，
+// 不误红也不假绿；本地手工跑日报时该层自然不生效）。
+function resolveRunStartedAtMs (raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return undefined
+  const ms = Date.parse(String(raw).trim())
+  return Number.isFinite(ms) ? ms : undefined
+}
+
+/**
+ * F1：陈旧（缓存回填）报告闸门（三层）。
+ *
+ * 「某段 stryker 崩溃/被取消 → artifact 里是上一次运行的 mutation.json」这一形态在**内容**上与正常
+ * 报告无法区分（stryker 的 json reporter 不写任何时间戳，见 mutation-testing-report-schema 的顶层
+ * properties：config/schemaVersion/files/testFiles/thresholds/projectRoot/performance/framework/system），
+ * 因此只能看文件时间。三层判据（任一层命中即拒绝发布）：
+ *   ① 跨段偏斜：与**本批最新报告**相差超过阈值 → 部分段回填（原有语义）；
+ *   ② 年龄上限：与**现在**相差超过阈值 → 全体回填（所有段互差≈0 时 ① 看不见）；
+ *   ③ 本轮起点下界：早于 run_started_at（减去容差）→ 同日跨轮回填（①②都看不见，例如全体 11h 前）。
+ *
+ * fail-open 边界（如实登记）：若 artifact 上传/下载不保留 mtime（各段 mtime 被归一为下载时间），
+ * ①②③ 都不触发、也不会误红；该场景由 .github/workflows/mutation.yml 的「清理缓存回填的旧报告」步骤
+ * 兜底（该步骤已加 `if: always()` 并前置到缓存恢复之后，见 mutation.yml）——崩溃段根本没有
+ * mutation.json，走「缺 mutation-report.json」分支拒绝发布。
+ *
+ * @param {Array<{seg: string, error?: string, reportMtimeMs?: number}>} results 已分析的分段结果
+ * @param {number} [maxSkewMs] 允许的最大跨段跨度/年龄（≤0 关闭闸门）；缺省读 `MUTATION_REPORT_MAX_SKEW_MS`
+ * @param {number} [runStartedAtMs] 本轮运行起点（毫秒）；缺省读 `MUTATION_RUN_STARTED_AT`
+ * @returns {Array<object>} 原始分段结果
+ * @throws {Error} 存在明显陈旧的报告时抛出
+ */
+function validateFreshness (results, maxSkewMs = resolveMaxSkewMs(process.env.MUTATION_REPORT_MAX_SKEW_MS), runStartedAtMs = resolveRunStartedAtMs(process.env.MUTATION_RUN_STARTED_AT)) {
+  if (!(maxSkewMs > 0)) return results
+  const dated = results.filter(r => !r.error && Number.isFinite(r.reportMtimeMs))
+  if (dated.length === 0) return results // 无可比较对象：交由 validateSegments 判定
+  const hours = (ms) => Math.round((ms / 3600000) * 10) / 10
+  // ① 跨段偏斜（原有语义，先判以保留「比最新报告早 N 小时」的定位口径）
+  if (dated.length >= 2) {
+    // 显式初始值 = 首元素（本分支已保证 dated.length >= 2）：reduce 无初始值时本就以首元素起算，
+    // 故这与原写法逐元素等价，只是满足 SonarCloud S6959「reduce 必须给初始值」。
+    const newest = dated.reduce((a, b) => (a.reportMtimeMs >= b.reportMtimeMs ? a : b), dated[0])
+    const stale = dated.filter(r => newest.reportMtimeMs - r.reportMtimeMs > maxSkewMs)
+    if (stale.length > 0) {
+      const detail = stale
+        .map(r => `${r.seg}（报告文件时间比最新报告早 ${hours(newest.reportMtimeMs - r.reportMtimeMs)} 小时）`)
+        .join('；')
+      throw new Error(`变异测试报告疑似缓存回填（陈旧）：${detail}；拒绝发布口径不符的日报`)
+    }
+  }
+  // ② 年龄上限：全体回填时各段互差≈0，① 恒不命中；以 wall-clock 为基准的年龄才是判据
+  const now = Date.now()
+  const tooOld = dated.filter(r => now - r.reportMtimeMs > maxSkewMs)
+  if (tooOld.length > 0) {
+    const detail = tooOld
+      .map(r => `${r.seg}（报告文件时间距今 ${hours(now - r.reportMtimeMs)} 小时）`)
+      .join('；')
+    throw new Error(`变异测试报告疑似缓存回填（全体陈旧，超出本轮最大跨度 ${hours(maxSkewMs)} 小时）：${detail}；拒绝发布口径不符的日报`)
+  }
+  // ③ 本轮起点下界：本批产物必须产自本轮 workflow（同一次运行内 matrix job 必然晚于 run_started_at）
+  if (Number.isFinite(runStartedAtMs)) {
+    const beforeRun = dated.filter(r => r.reportMtimeMs < runStartedAtMs - RUN_START_SLACK_MS)
+    if (beforeRun.length > 0) {
+      const detail = beforeRun
+        .map(r => `${r.seg}（报告文件时间早于本轮运行起点 ${hours(runStartedAtMs - r.reportMtimeMs)} 小时）`)
+        .join('；')
+      throw new Error(`变异测试报告疑似缓存回填（早于本轮运行起点）：${detail}；拒绝发布口径不符的日报`)
+    }
+  }
+  return results
+}
 
 function analyze (dir) {
   // S8707：CLI 参数显式校验（防 LLM/错误参数访问任意路径——先验证存在且是目录）
@@ -118,7 +215,10 @@ function analyzeSegment (dir, entry) {
   // 不抛 TypeError 逃出本函数（与上方注释「单段失败不中断整体」一致），也不把损坏报告伪装成
   // 0 变异体的正常段；错误补上报告路径便于定位。
   try {
-    const report = readReportJson(reportPath)
+    // F1（mutation-json 返工）：预读大小上限必须由**生产调用方**注入，否则护栏只在测试里成立
+    // （独立验证 V3：默认 8 PiB + 零生产调用方注入 ⇒ 该分支生产恒假）。默认 2 GiB 的生产策略值
+    // 由 resolveMaxReportBytes 给出，可用 XBK_MUTATION_REPORT_MAX_BYTES 覆盖。
+    const report = readReportJson(reportPath, { maxFileBytes: resolveMaxReportBytes(process.env.XBK_MUTATION_REPORT_MAX_BYTES) })
     if (!report || typeof report !== 'object') {
       throw new Error(`报告顶层结构非法（${report === null ? 'null' : typeof report}），无法读取 files`)
     }
@@ -170,7 +270,30 @@ function analyzeSegment (dir, entry) {
     noCoverage: stats.noCoverage,
     timeout: stats.timeout,
     score: Math.round(score * 100) / 100,
-    survivedMutants: stats.survivedMutants
+    survivedMutants: stats.survivedMutants,
+    // F1：报告文件时间——内容层面无法区分「本次运行」与「缓存回填的陈旧报告」（stryker 的 json
+    // report 不含时间戳），新鲜度闸门（validateFreshness）据此比较各段跨度。stat 失败不单列分支：
+    // 上面已成功读到文件，取不到时间只说明文件被并发删除，此时 reportMtimeMs 为 undefined，
+    // 该段不参与新鲜度比较（不误红），缺段/损坏仍由 validateSegments 负责。
+    reportPath,
+    reportMtimeMs: readMtimeMs(reportPath)
+  }
+}
+
+// F1：读取报告文件的 mtime（毫秒）；读不到返回 undefined（该段退出新鲜度比较，不误判为陈旧）
+// QG2：Codacy/Opengrep「动态构造文件/路径信息」（pathtraversal-non-literal-fs-filename）在此是纯语法
+// 误报——规则只放行字符串字面量首参，而 filePath 由 analyze() 的 dir 入参（CI 里是固定的
+// mutation-reports/ 目录，见 .github/workflows/mutation.yml 的调用）经 readdirSync 枚举 + 段名拼接而来，
+// 无法用字面量表达。信任模型与同族的 scripts/mutation-json.js 完全一致——后者已在 .codacy.yml 里按
+// 「变异报告读取工具：reportPath 来自 analyze() 对 CLI 传入目录的 readdir 枚举，非不可信输入」登记同一误报。
+// 故该行加 `// nosemgrep`：Semgrep 原生行内抑制（引擎对无 ids 的 nosemgrep 判定 is_ignored=true），
+// Codacy 的 opengrep wrapper 不传 --disable-nosem，且在解析 JSON 时显式跳过 extra.is_ignored 的结果，
+// 故抑制在 Codacy 侧同样生效。
+function readMtimeMs (filePath) {
+  try {
+    return fs.statSync(filePath).mtimeMs // nosemgrep（路径由 CLI 传入目录的 readdir 枚举 + 段名构成，同 mutation-json.js 口径）
+  } catch (e) {
+    return undefined
   }
 }
 
@@ -318,21 +441,32 @@ async function postIssue (body) {
   const repo = process.env.GITHUB_REPOSITORY || 'junhanw868-bot/notes'
   const today = shanghaiDate()
   const title = `🧬 变异测试日报 ${today}`
-  // 同天去重：当天已有日报则跳过（避免多次运行重复发 Issue）
-  const listRes = await fetch(`https://api.github.com/repos/${repo}/issues?state=all&per_page=100&creator=github-actions%5Bbot%5D`, {
-    headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'mutation-report' }
-  })
-  if (listRes.ok) {
-    const list = await listRes.json()
-    const existing = (list || []).find(i => i.title === title)
-    if (existing) {
-      console.log('⏭️  当日日报已存在，跳过重复发布')
-      return { number: existing.number, html_url: existing.html_url, skipped: true }
+  // 同天去重：当天已有日报则跳过（避免多次运行重复发 Issue）。
+  // F7：去重查询必须整体容错——非 2xx / 网络异常 / 超时 / 200 但响应体非 JSON，一律按既有口径
+  // 「跳过去重直接创建」并输出可观测 warn。旧实现有两条能吞掉当天日报的路径：
+  //   ① `await listRes.json()` 未包 try：列表 API 返回 200 + 非 JSON（代理页/限流说明页）时抛
+  //      SyntaxError，整个 run 失败，日报不发；
+  //   ② fetch 无超时：列表接口挂住会把 report job 一起拖死（GitHub API 偶发长时间无响应）。
+  // 只用本机异常文本拼 warn（非远端响应体），折叠换行/控制字符后截断，避免伪造日志行。
+  let existing
+  try {
+    const listRes = await fetch(`https://api.github.com/repos/${repo}/issues?state=all&per_page=100&creator=github-actions%5Bbot%5D`, {
+      headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'mutation-report' },
+      signal: AbortSignal.timeout(LIST_QUERY_TIMEOUT_MS)
+    })
+    if (!listRes.ok) {
+      console.warn(`⚠️  日报列表查询失败（HTTP ${listRes.status}），跳过去重直接创建`)
+    } else {
+      const list = await listRes.json()
+      existing = (list || []).find(i => i.title === title)
     }
-  } else {
-    // F7：列表查询非 2xx 时既有语义是「去重降级为直接新建」（已被单测固化，改动属判重口径），
-    // 这里只让静默降级可观测；fetch 超时/重试策略不在本文件单方面引入。
-    console.warn(`⚠️  日报列表查询失败（HTTP ${listRes.status}），跳过去重直接创建`)
+  } catch (e) {
+    const reason = String((e && e.message) || e || 'unknown').replace(/[\r\n]+/g, ' ').slice(0, 200)
+    console.warn(`⚠️  日报列表查询失败（${reason}），跳过去重直接创建`)
+  }
+  if (existing) {
+    console.log('⏭️  当日日报已存在，跳过重复发布')
+    return { number: existing.number, html_url: existing.html_url, skipped: true }
   }
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: 'POST',
@@ -369,6 +503,7 @@ async function main () {
     process.exit(1)
   }
   const results = validateSegments(analyze(dir))
+  validateFreshness(results) // F1：内容齐全之后再看新鲜度（陈旧报告不得照发日报）
   const body = render(results)
   console.log(body)
   if (process.argv.includes('--issue')) {
@@ -392,4 +527,4 @@ if (require.main === module) {
 }
 
 // 导出供测试（不导出 main：依赖 CLI 副作用；postIssue 导出以便 mock fetch 测去重/错误处理逻辑）
-module.exports = { analyze, validateSegments, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate, postIssue, EXPECTED_SEGMENTS }
+module.exports = { analyze, validateSegments, validateFreshness, resolveMaxSkewMs, resolveRunStartedAtMs, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate, postIssue, EXPECTED_SEGMENTS }

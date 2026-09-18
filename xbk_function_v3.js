@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.275 — 审查未修复清单批次一：循环/失败归类/脱敏/预热/时间口径/工具链 *********
+//* ******* 线报酷推送脚本 v3.276 — 未修复清单批次二：清洗链 HTML5 词法状态机/推送出口与失败归类/存储与入口/变异闸门与工具链 *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -20,11 +20,24 @@ const PROFILE3_BOOT_MARKS = []
 let RE2C = null
 try { RE2C = require('re2') } catch (e) { RE2C = null }
 const _reCache = new Map()
+// P1-04（收尾）：RE2 → V8 回落不再无声。safeRe 在生产热路径上被每条内部正则调用，逐条打印会刷屏，
+// 故进程内只在**首次**回落时告警一次，内容含模式源码与失败原因，运维据此定位哪条模式失去线性防护。
+// 通道沿用 RE2_MISSING_WARNING 的 console.warn；模式串与原因经既有脱敏通道
+// xbk_failure_policy.summarizeError（redact 屏蔽凭据 + 折叠换行 + 截断）后再输出。
+let _re2FallbackWarned = false
+function warnRe2Fallback (src, error) {
+  if (_re2FallbackWarned) return
+  _re2FallbackWarned = true
+  try {
+    const pick = (value) => { const info = summarizeError(value); return typeof info.message === 'string' ? info.message.slice(0, 200) : '' }
+    console.warn(`⚠️ RE2 编译失败，已回落 V8 原生 RegExp（RE2 的线性时间防护对该模式不成立）——模式：${pick(src)}；原因：${pick(error) || '未知原因'}`)
+  } catch (e) { /* 告警自身失败不得影响回落路径 */ }
+}
 const safeRe = (src, flags) => {
   const k = src + '\u0000' + flags
   let r = _reCache.get(k)
   if (r) return r
-  if (RE2C) { try { r = new RE2C(src, flags); _reCache.set(k, r); return r } catch (e) { /* 反向引用等不支持特性回落 */ } }
+  if (RE2C) { try { r = new RE2C(src, flags); _reCache.set(k, r); return r } catch (e) { warnRe2Fallback(src, e) /* 反向引用等不支持特性：回落 V8，但留一次告警 */ } }
   r = new RegExp(src, flags)
   _reCache.set(k, r)
   return r
@@ -234,32 +247,32 @@ const {
   trimTrailingSlashes,
   normalize,
   createUtils
-} = require('./xbk_utils')
+} = profile3Require('xbk_utils', () => require('./xbk_utils'))
 const Utils = createUtils({ fs, safeRe })
 // Utils 内部调用链（含 _decodeNumeric）由此单例承载；_decodeNumeric 仍由 Utils.decodeHtmlEntities 调用。
 
 // ============================================================
 // 🔄 Formatter — 格式化层（纯函数，不修改输入参数）
 // ============================================================
-const { createFormatter } = require('./xbk_formatter')
+const { createFormatter } = profile3Require('xbk_formatter', () => require('./xbk_formatter'))
 const Formatter = createFormatter({ Utils, safeRe })
 
 // ============================================================
 // 📐 RuleEngine — 规则引擎层
 // ============================================================
-const { createRuleEngine } = require('./xbk_rules')
+const { createRuleEngine } = profile3Require('xbk_rules', () => require('./xbk_rules'))
 const RuleEngine = createRuleEngine({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Available })
 
 // ============================================================
 // 🎯 FilterEngine — 过滤引擎层
 // ============================================================
-const { createFilterEngine } = require('./xbk_filter')
+const { createFilterEngine } = profile3Require('xbk_filter', () => require('./xbk_filter'))
 const FilterEngine = createFilterEngine({ Utils, RuleEngine, FILTER_FIELDS, compileUserRegex })
 
 // ============================================================
 // 💾 MessageStore — 缓存管理层
 // ============================================================
-const { createMessageStore } = require('./xbk_message_store')
+const { createMessageStore } = profile3Require('xbk_message_store', () => require('./xbk_message_store'))
 const MessageStore = createMessageStore({
   Config,
   Utils,
@@ -280,7 +293,7 @@ const MessageStore = createMessageStore({
 // ============================================================
 // 🌐 Network — 网络请求层
 // ============================================================
-const { createNetwork } = require('./xbk_network')
+const { createNetwork } = profile3Require('xbk_network', () => require('./xbk_network'))
 const Network = createNetwork({
   Config,
   Utils,
@@ -297,12 +310,12 @@ const Network = createNetwork({
 // ============================================================
 // 📤 Pusher — 推送层
 // ============================================================
-const { createPusher, looksLikeHtmlLinear } = require('./xbk_pusher')
+const { createPusher, looksLikeHtmlLinear } = profile3Require('xbk_pusher', () => require('./xbk_pusher'))
 const Pusher = createPusher({ Utils, getNotify, looksLikeHtmlLinear })
 // ============================================================
 // 🚀 App — 主流程层
 // ============================================================
-const { createApp } = require('./xbk_app')
+const { createApp } = profile3Require('xbk_app', () => require('./xbk_app'))
 const App = createApp({
   Config,
   Utils,
@@ -348,6 +361,9 @@ async function runSingleEntry (app = App) {
     }
   } catch (e) {
     // 失败分类模块异常时保守设置非零，避免全失败被静默吞掉。
+    // P3（审查 2026-09-15）：原实现只置非零、不输出任何信息，调度器只能看到「退出码 1
+    // 但日志里没有失败原因」，无法与「确实失败」区分。与非零退出码同点补一条诊断。
+    console.error('失败分类判定异常，保守置非零退出码:', Utils.safeErrorText(e, Utils.safeText(e, '未知错误')))
     process.exitCode = 1
   }
   return summary

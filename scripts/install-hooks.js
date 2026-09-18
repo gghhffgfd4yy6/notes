@@ -12,6 +12,10 @@
 //   - 不只写配置：安装前后核验钩子真实可用（存在 + 可执行）。目录/文件缺失时
 //     git 会静默忽略全部钩子，必须非零退出；仅缺可执行位时尝试 chmod 0o700 修复，
 //     修复不了（如 noexec 挂载）则醒目告警，绝不把「配置已写入」说成「门禁已生效」。
+//   - --verify（审查 F6）：只读自检入口——回答「提交门禁此刻是否真的生效」，不写配置、不 chmod。
+//     生效则 exit 0，否则 exit 1 并说明原因；默认（无参数）路径中「跳过/未覆盖」按设计仍 exit 0
+//     （非工作树、已存在其它 hooksPath 等无需安装），自动化因此只能靠解析 stdout 区分「装上」与
+//     「跳过」，--verify 就是给自动化/CI 的显式查询入口。
 const fs = require('node:fs')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
@@ -19,6 +23,9 @@ const { execFileSync } = require('node:child_process')
 const HOOKS_DIR = '.githooks'
 // 受版本控制的提交门禁；新增钩子文件时同步此列表以便核验
 const HOOK_FILES = ['pre-commit', 'commit-msg']
+
+// 只读自检模式（--verify）：不写 core.hooksPath、不 chmod、不创建/删除任何文件。
+const VERIFY_ONLY = process.argv.includes('--verify')
 
 // git config --get 的退出码语义：0 = 键存在（值可能是空串）、1 = 键不存在、其它 = 读取失败。
 const GIT_CONFIG_KEY_MISSING = 1
@@ -100,6 +107,28 @@ function verifyHooks (dir) {
   return true
 }
 
+// --verify 的只读核验：报告门禁此刻是否生效，不尝试 chmod（安装路径的 verifyHooks 会尝试修复）。
+// 返回 true = 钩子目录、文件、可执行位三者齐备。
+function reportHookGate (dir) {
+  if (!isDirectory(dir)) {
+    console.error(`[hooks] ❌ 门禁未生效：钩子目录不存在或不是目录：${dir}`)
+    return false
+  }
+  const missing = HOOK_FILES.filter(name => !fs.existsSync(path.join(dir, name)))
+  if (missing.length > 0) {
+    console.error(`[hooks] ❌ 门禁未生效：缺少钩子文件 ${missing.map(name => `${HOOKS_DIR}/${name}`).join('、')}`)
+    return false
+  }
+  const notExecutable = HOOK_FILES.filter(name => !isExecutable(path.join(dir, name)))
+  if (notExecutable.length > 0) {
+    console.error(`[hooks] ❌ 门禁未生效：钩子不可执行（git 会静默跳过）${notExecutable.map(name => `${HOOKS_DIR}/${name}`).join('、')}`)
+    console.error('[hooks]    --verify 只读，不尝试 chmod；请手动执行：chmod +x ' + notExecutable.map(name => `${HOOKS_DIR}/${name}`).join(' '))
+    return false
+  }
+  console.log(`[hooks] ✅ 门禁已生效：core.hooksPath=${HOOKS_DIR}，${HOOKS_DIR}/ 下 ${HOOK_FILES.join('、')} 存在且可执行`)
+  return true
+}
+
 let insideRepo = false
 let repoCheckError = null
 try {
@@ -111,6 +140,15 @@ try {
 
 if (!insideRepo) {
   // 跳过 ≠ 门禁已生效：本路径按设计以 0 退出（非工作树无需安装），自动化不得据此判定已装好。
+  // --verify 是显式查询「门禁是否生效」的入口，此时答案必然是否 → 非零退出（fail-closed）。
+  if (VERIFY_ONLY) {
+    console.error('[hooks] ❌ 门禁未生效：当前不在 git 工作树内（或 git 不可用）')
+    if (repoCheckError) {
+      const detail = gitStderr(repoCheckError)
+      console.error(`[hooks]    诊断：${detail || repoCheckError.message}`)
+    }
+    process.exit(1)
+  }
   console.warn('[hooks] 跳过：当前不在 git 工作树内（或 git 不可用）；按设计以 0 退出，不代表提交门禁已生效。')
   if (repoCheckError) {
     const detail = gitStderr(repoCheckError)
@@ -151,6 +189,16 @@ try {
     console.error('[hooks]    为避免覆盖既有配置，未写入任何配置；请先修复 git 配置后重跑本脚本。')
     process.exit(1)
   }
+}
+
+// --verify：只读自检，必须在任何写配置/chmod 之前返回（本分支不落到下面的安装逻辑）。
+if (VERIFY_ONLY) {
+  if (current !== HOOKS_DIR) {
+    console.error(`[hooks] ❌ 门禁未生效：core.hooksPath=${current === '' ? '(未设置或空串)' : current}，期望 ${HOOKS_DIR}`)
+    process.exit(1)
+  }
+  if (!reportHookGate(resolvedHooksDir)) process.exit(1)
+  process.exit(0)
 }
 
 if (current === HOOKS_DIR) {

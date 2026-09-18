@@ -385,6 +385,41 @@ console.log('========================================\n');
     }
   })
 
+  await test('APP-06：单条渲染异常不再中止整轮（按单条失败处理并继续其余条目）', async () => {
+    reset()
+    setPushUrl('t03e_render_fail')
+    const previousDryRun = process.env.XBK_DRY_RUN
+    const logPath = path.join(CACHE_DIR, 'run.log')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    const logs = []
+    const originalLog = console.log
+    let previewCalls = 0
+    try {
+      // dry-run 的 preview() 位于渲染段末端：把它做成可注入故障，等价于「渲染期抛错」
+      process.env.XBK_DRY_RUN = '1'
+      fakeData = [makeItem({ id: 'render-fail-1' }), makeItem({ id: 'render-fail-2', title: '第二条' })]
+      console.log = (...args) => {
+        const line = args.join(' ')
+        if (line.startsWith('🧪 预览')) {
+          previewCalls++
+          throw new Error('render boom')
+        }
+        logs.push(line)
+      }
+      const summary = await xbk.run()
+      assert(previewCalls === 2, `渲染异常不得中止整轮：两条都应走到预览，实际 ${previewCalls} 条`)
+      assert(summary && summary.failures.length === 2, `渲染异常应按单条失败计入摘要，实际 ${JSON.stringify(summary && summary.failures)}`)
+      assert(summary.pushed === 0 && summary.failed === 0, `dry-run 摘要口径不变: ${JSON.stringify(summary)}`)
+      assert(logs.some(l => l.includes('内容渲染异常')), '渲染异常应有明确的失败日志')
+    } finally {
+      console.log = originalLog
+      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = previousDryRun
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+      try { fs.unlinkSync(path.join(CACHE_DIR, 't03e_render_fail.json')) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('身份无效条目单独对账（APP-04：终端 + run.log noidentity=）', async () => {
     reset()
     setPushUrl('t03d_no_identity')
@@ -2465,6 +2500,339 @@ console.log('========================================\n');
     }
   })
 
+  await test('APP2-02：恢复告警发送失败不丢通知（保留 pending 并在下一轮重发）', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalFailures = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const originalInterval = Config.channelHealth && Config.channelHealth.intervalMs
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_recover_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    const statePath = path.join(stateDir, 'channel-health.state')
+    const origNotifyFail = notifyFail
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = true
+      Config.channelHealth.consecutiveFailures = 2
+      Config.channelHealth.intervalMs = 3600000
+      // 两轮失败让 telegram 达到阈值（失败告警正常送达）
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      // 通道恢复但告警通道挂：恢复通知发送失败，不得落盘清零
+      notifyFail = true
+      await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      let state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(state.telegram.consecutiveFailures === 2, `恢复通知未送达时应保留失败计数，实际 ${state.telegram.consecutiveFailures}`)
+      assert(state.telegram.recoverAlertPending === true, '恢复通知未送达时应保留 pending 标记')
+      // 告警通道恢复：下一轮必须重发恢复通知，送达后才清零
+      notifyFail = false
+      pushCalls.length = 0
+      await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      assert(pushCalls.some(c => c.text.includes('通道恢复')), '恢复通知应在下一轮重发')
+      state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(state.telegram.consecutiveFailures === 0, `送达后应清零，实际 ${state.telegram.consecutiveFailures}`)
+      assert(state.telegram.recoverAlertPending === undefined, '送达后应移除 pending 标记')
+    } finally {
+      notifyFail = origNotifyFail
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalFailures
+      Config.channelHealth.intervalMs = originalInterval
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('APP-02：通道健康锁陈旧判定须复核持有进程存活', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalFailures = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_lock_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    const statePath = path.join(stateDir, 'channel-health.state')
+    const lockPath = statePath + '.lock'
+    const origWarn = console.warn
+    const warnings = []
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = true
+      Config.channelHealth.consecutiveFailures = 1
+      console.warn = (...a) => warnings.push(a.join(' '))
+      const aged = new Date(Date.now() - 60000)
+      // 1) 超龄锁 + 持有进程存活（本进程）→ 不得抢占（否则双进程同时进入临界区）
+      fs.writeFileSync(lockPath, String(process.pid))
+      fs.utimesSync(lockPath, aged, aged)
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'timeout' }] })
+      assert(fs.existsSync(lockPath), '持有进程仍存活时不得抢占超龄健康锁')
+      assert(warnings.some(w => w.includes('正由另一轮更新')), `存活持有者应导致本轮跳过: ${warnings.join(' | ')}`)
+      assert(!fs.existsSync(statePath), '被锁跳过时不得写入健康状态')
+      // 2) 超龄锁 + 持有进程已确认退出 → 正常回收并更新
+      fs.writeFileSync(lockPath, '999999999')
+      fs.utimesSync(lockPath, aged, aged)
+      await xbk.App._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [] })
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(state.pushplus && state.pushplus.consecutiveFailures === 0, '持有进程已退出应收割超龄锁并正常更新')
+      assert(!fs.existsSync(lockPath), '更新完成后应释放锁')
+    } finally {
+      console.warn = origWarn
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalFailures
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('APP-02：run.log 锁陈旧判定须复核持有进程存活', async () => {
+    const originalCacheDir = Config.cache.dir
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_runlog_lock_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    const logPath = path.join(stateDir, 'run.log')
+    const lockPath = logPath + '.lock'
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      fs.writeFileSync(logPath, '存量\n')
+      const aged = new Date(Date.now() - 60000)
+      // 1) 超龄锁 + 持有进程存活 → 不得抢占，按 fail-open 只追加
+      fs.writeFileSync(lockPath, String(process.pid))
+      fs.utimesSync(lockPath, aged, aged)
+      xbk.App._writeRunLog('存活持有者期间追加\n')
+      assert(fs.existsSync(lockPath), '持有进程仍存活时不得抢占 run.log 锁')
+      assert(fs.readFileSync(logPath, 'utf8').includes('存活持有者期间追加'), '拿不到锁也应 fail-open 追加日志')
+      // 2) 超龄锁 + 持有进程已退出 → 回收并在结束后释放
+      fs.writeFileSync(lockPath, '999999999')
+      fs.utimesSync(lockPath, aged, aged)
+      xbk.App._writeRunLog('已退出持有者\n')
+      assert(!fs.existsSync(lockPath), '持有进程已退出应回收并释放 run.log 锁')
+    } finally {
+      Config.cache.dir = originalCacheDir
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('APP-02：通道健康告警发送期间不持有跨进程锁（并发的健康更新不被挡住）', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalFailures = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_sendlock_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    const statePath = path.join(stateDir, 'channel-health.state')
+    const origWarn = console.warn
+    const origDelay = notifyDelayMs
+    const warnings = []
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = true
+      Config.channelHealth.consecutiveFailures = 1
+      notifyDelayMs = 300 // 告警发送耗时 300ms：期间锁必须已释放
+      console.warn = (...a) => warnings.push(a.join(' '))
+      const first = xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'boom' }] })
+      await new Promise(r => setTimeout(r, 60)) // 此时第一次调用已进入告警发送阶段
+      await xbk.App._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [] })
+      assert(!warnings.some(w => w.includes('正由另一轮更新')), `告警发送期间不得持有跨进程锁: ${warnings.join(' | ')}`)
+      await first
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(state.pushplus, '并发的第二轮健康更新不应被告警发送挡住')
+      assert(state.telegram && state.telegram.consecutiveFailures === 1, '两轮更新应各自落盘且互不覆盖')
+    } finally {
+      notifyDelayMs = origDelay
+      console.warn = origWarn
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalFailures
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('FX3：重叠运行的恢复告警只发送一条（锁内原子认领 + 租约）', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalFailures = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const originalInterval = Config.channelHealth && Config.channelHealth.intervalMs
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_recover_race_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    const statePath = path.join(stateDir, 'channel-health.state')
+    const origSendNotify = notifyMock.sendNotify
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = true
+      Config.channelHealth.consecutiveFailures = 2
+      Config.channelHealth.intervalMs = 3600000
+      // 两轮失败把 telegram 抬到阈值
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      pushCalls.length = 0
+      // 可控闸门：把「第一次恢复发送」钉死在未完成状态，确定性制造两次运行的重叠
+      // （不依赖随机时序——第二次进入时第一次的锁已释放、发送仍未 resolve）
+      let enteredResolve
+      const entered = new Promise(r => { enteredResolve = r })
+      let releaseResolve
+      const release = new Promise(r => { releaseResolve = r })
+      let recoverSends = 0
+      notifyMock.sendNotify = async (text, desp) => {
+        pushCalls.push({ text, desp })
+        if (text.includes('通道恢复')) {
+          recoverSends++
+          if (recoverSends === 1) { enteredResolve(); await release }
+        }
+      }
+      const first = xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      await entered // 第一次已进入发送且仍挂起
+      const second = xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      await second // 第二次在首次告警未完成时跑完临界区
+      releaseResolve()
+      await first
+      const recovered = pushCalls.filter(c => c.text.includes('通道恢复'))
+      assert(recovered.length === 1, `重叠运行下同一次恢复只应发送一条恢复告警，实际 ${recovered.length} 条`)
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(state.telegram.recoverAlertPending === undefined, '送达后应移除 pending 标记')
+      assert(state.telegram.consecutiveFailures === 0, `送达后应清零，实际 ${state.telegram.consecutiveFailures}`)
+    } finally {
+      notifyMock.sendNotify = origSendNotify
+      require.cache[notifyPath].exports = notifyMock
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalFailures
+      Config.channelHealth.intervalMs = originalInterval
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('FX3：恢复告警发送失败即释放认领 → 下一轮立即重发（不丢）', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalFailures = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const originalInterval = Config.channelHealth && Config.channelHealth.intervalMs
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_recover_release_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    const statePath = path.join(stateDir, 'channel-health.state')
+    const origSendNotify = notifyMock.sendNotify
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = true
+      Config.channelHealth.consecutiveFailures = 2
+      Config.channelHealth.intervalMs = 3600000
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      let recoverFail = true
+      notifyMock.sendNotify = async (text, desp) => {
+        if (text.includes('通道恢复') && recoverFail) throw new Error('push boom')
+        pushCalls.push({ text, desp })
+      }
+      // 通道恢复但告警通道挂：恢复通知发送失败
+      await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      let state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(state.telegram.recoverAlertPending === true, '恢复通知未送达时应保留 pending 标记（不丢）')
+      assert(state.telegram.consecutiveFailures === 2, `未送达时不得清零，实际 ${state.telegram.consecutiveFailures}`)
+      // 告警通道恢复：下一轮必须立即重发——若认领未在失败时释放，这里会被自己的租约挡住（0 条）
+      recoverFail = false
+      pushCalls.length = 0
+      await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      assert(pushCalls.some(c => c.text.includes('通道恢复')), '发送失败后下一轮应立即重发恢复通知')
+      state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(state.telegram.recoverAlertPending === undefined && state.telegram.consecutiveFailures === 0,
+        `重发送达后应清零，实际 ${JSON.stringify(state.telegram)}`)
+    } finally {
+      notifyMock.sendNotify = origSendNotify
+      require.cache[notifyPath].exports = notifyMock
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalFailures
+      Config.channelHealth.intervalMs = originalInterval
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('FX3：租约内的活认领挡住重复重发；超租约陈旧认领可接管（有界可恢复）', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalFailures = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_recover_lease_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    const statePath = path.join(stateDir, 'channel-health.state')
+    const origSendNotify = notifyMock.sendNotify
+    const baseEntry = () => ({
+      consecutiveFailures: 2,
+      lastFailureAt: Date.now(),
+      lastAlertAt: Date.now(),
+      lastRecoveredAt: Date.now(),
+      recoverAlertPending: true
+    })
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = true
+      Config.channelHealth.consecutiveFailures = 2
+      notifyMock.sendNotify = async (text, desp) => { pushCalls.push({ text, desp }) }
+      // ① 持有方仍在发送（认领时间在租约内）→ 本轮不得重发
+      fs.writeFileSync(statePath, JSON.stringify({ telegram: { ...baseEntry(), recoverAlertClaim: 'live-token', recoverAlertClaimAt: Date.now() } }))
+      pushCalls.length = 0
+      await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      assert(!pushCalls.some(c => c.text.includes('通道恢复')), '租约内的活认领不得被重复认领重发')
+      const liveState = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(liveState.telegram.recoverAlertPending === true, '活认领期间 pending 必须原样保留')
+      // ② 持有方已崩溃（认领时间远超租约）→ 后续轮次必须接管重发，不得永久卡死
+      fs.writeFileSync(statePath, JSON.stringify({ telegram: { ...baseEntry(), recoverAlertClaim: 'crashed-token', recoverAlertClaimAt: Date.now() - 3600000 } }))
+      pushCalls.length = 0
+      await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
+      assert(pushCalls.some(c => c.text.includes('通道恢复')), '超租约的陈旧认领应被接管并重发（有界可恢复）')
+      const recoveredState = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(recoveredState.telegram.recoverAlertClaim !== 'crashed-token' || recoveredState.telegram.recoverAlertPending === undefined,
+        `接管后原崩溃令牌不得继续生效，实际 ${JSON.stringify(recoveredState.telegram)}`)
+    } finally {
+      notifyMock.sendNotify = origSendNotify
+      require.cache[notifyPath].exports = notifyMock
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalFailures
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('APP2-01：告警通道不可用时失败告警仍按 intervalMs 限频（按告警尝试计时）', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalFailures = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const originalInterval = Config.channelHealth && Config.channelHealth.intervalMs
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_alert_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    const statePath = path.join(stateDir, 'channel-health.state')
+    const origNotifyFail = notifyFail
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = true
+      Config.channelHealth.consecutiveFailures = 2
+      Config.channelHealth.intervalMs = 3600000
+      notifyFail = true // 告警通道本身不可用：告警发送必然失败
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      const afterAlert = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      assert(afterAlert.telegram.lastAlertAt > 0, `告警尝试后应落盘 lastAlertAt（发送成功与否无关），实际 ${afterAlert.telegram.lastAlertAt}`)
+      notifyFail = false
+      pushCalls.length = 0
+      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      assert(!pushCalls.some(c => c.text.includes('通道异常')), '限频窗口内不得重复告警（即使上一轮发送失败）')
+    } finally {
+      notifyFail = origNotifyFail
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalFailures
+      Config.channelHealth.intervalMs = originalInterval
+      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('告警通道挂 → 不误报"已发送"（v3.145）', async () => {
     reset()
     setPushUrl('t59_alert_nofalse')
@@ -3024,6 +3392,71 @@ console.log('========================================\n');
     } finally {
       Config.filter.pingbitime = origPb
     }
+  })
+
+  await test('filter.hash 折入「规则实际编译生效」维度（FILTER-01/RULES-05）', async () => {
+    // 反例（改动前）：filter.hash 只由配置字节驱动——re2 缺失或规则被 ReDoS 守卫丢弃时过滤面变宽
+    // 但哈希不变，已打 _f 的条目（上方 t68 场景）永不重评。本用例锚定「App 真的把编译生效维度
+    // 折进了写入磁盘的哈希」，且该维度在同一环境内稳定（不得每轮变化导致每轮清 _f）。
+    reset()
+    setPushUrl('t_compile_dim')
+    const hashPath = path.join(CACHE_DIR, 'filter.hash')
+    const origFilter = Config.filter.pingbibiaoti
+    try {
+      try { fs.unlinkSync(hashPath) } catch (e) { /* 首次运行无 hash */ }
+      Config.filter.pingbibiaoti = '不匹配任何标题的关键词'
+      fakeData = [makeItem({ id: 1, title: '普通标题' })]
+      await xbk.run()
+      const stored1 = fs.readFileSync(hashPath, 'utf8').trim().split('\n')[1]
+      assert(stored1 !== xbk.filterHash(Config.filter, Config.keyword.zkt_gjc),
+        'app 写入的 filter.hash 必须含配置字节之外的「编译生效」维度（两参哈希 != 落盘哈希）')
+      // 同配置重复运行：维度稳定（否则每轮 _f 全清、每轮全量重评）
+      reset()
+      setPushUrl('t_compile_dim')
+      Config.filter.pingbibiaoti = '不匹配任何标题的关键词'
+      fakeData = [makeItem({ id: 1, title: '普通标题' })]
+      await xbk.run()
+      const stored2 = fs.readFileSync(hashPath, 'utf8').trim().split('\n')[1]
+      assert(stored2 === stored1, `编译生效维度必须随环境稳定，实际 ${stored1} → ${stored2}`)
+    } finally {
+      Config.filter.pingbibiaoti = origFilter
+      try { fs.unlinkSync(hashPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('saveBatch 落盘失败 → 摘要/日志可观测（APP-03）', async () => {
+    // 反例（改动前）：xbk_app.js 丢弃 MessageStore.saveBatch 的返回值，落盘失败时 summary 仍报
+    // 「成功」、run.log 无任何痕迹，运维看不到「本轮推送成功但成功记录没落盘」（下次运行会重推）。
+    // 本用例把真 saveBatch 打成返回 false（生产实现落盘失败时的返回值，见 xbk_message_store.js），
+    // 断言：① summary.cacheSaved === false；② 控制台告警；③ run.log 有 WARN 行 + cachesaved=0。
+    // 撤掉 app 侧消费（回到 `MessageStore.saveBatch(toCache, cacheName)` 裸调用）→ 三条断言全红。
+    reset()
+    setPushUrl('t_app03_cache_fail')
+    const origSaveBatch = xbk.MessageStore.saveBatch
+    const origWarn = console.warn
+    const warns = []
+    const runLogPath = path.join(CACHE_DIR, 'run.log')
+    try {
+      xbk.MessageStore.saveBatch = () => false
+      console.warn = (m) => warns.push(String(m))
+      try { fs.unlinkSync(runLogPath) } catch (e) { /* 首次无日志 */ }
+      fakeData = [makeItem({ id: 1 })]
+      const summary = await xbk.run()
+      assert(summary.cacheSaved === false, `落盘失败时 summary.cacheSaved 必须为 false，实际 ${JSON.stringify(summary.cacheSaved)}`)
+      assert(warns.some(w => w.includes('缓存落盘失败')), `落盘失败应告警，实际告警: ${warns.join(' | ')}`)
+      const log = fs.readFileSync(runLogPath, 'utf8')
+      assert(log.includes('WARN 缓存落盘失败'), `run.log 应含落盘失败 WARN 行: ${log.split('\n').slice(-3).join(' | ')}`)
+      assert(log.includes('cachesaved=0'), 'run.log 摘要行应含 cachesaved=0')
+    } finally {
+      xbk.MessageStore.saveBatch = origSaveBatch
+      console.warn = origWarn
+    }
+    // 对照：落盘成功时 summary.cacheSaved === true（防止断言恒真）
+    reset()
+    setPushUrl('t_app03_cache_ok')
+    fakeData = [makeItem({ id: 2 })]
+    const okSummary = await xbk.run()
+    assert(okSummary.cacheSaved === true, `落盘成功时 summary.cacheSaved 应为 true，实际 ${JSON.stringify(okSummary.cacheSaved)}`)
   })
 
   await test('api.timeout 字符串配置生效（#8 v3.162）', async () => {

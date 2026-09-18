@@ -65,7 +65,14 @@ function createPusher ({ Utils, getNotify }) {
         // P2（审查 2026-08-15）：契约防御——第三方 sendNotify 必须返回 thenable；同步 undefined 会让
         // Promise.race 立即 resolve → 主流程误写缓存造成「未发送即成功」静默丢消息。真实模块为 async，
         // 此处防未来接入同步实现时静默成功（抛错由 pushOne catch → 不写缓存 → 下次重试）。
-        const sendResult = notifyMod.sendNotify(text, desp, controller ? { signal: controller.signal } : {})
+        // P3（跨批协同，low）：把在飞通道追踪器交给投递层（slim 契约见 xbk_sendNotify_slim 的
+        // params.inFlightTracker）；不支持该契约的模块会忽略它 → tracker.pending 保持 null → 超时归因
+        // 退回既有「按静态配置清单全量列出」语义（其口径被 test_pusher.js / test_app.js 双向锁定）。
+        const inFlight = { pending: null }
+        const sendParams = controller
+          ? { signal: controller.signal, inFlightTracker: inFlight }
+          : { inFlightTracker: inFlight }
+        const sendResult = notifyMod.sendNotify(text, desp, sendParams)
         if (!sendResult || typeof sendResult.then !== 'function') {
           throw new Error('推送模块 sendNotify 未返回 Promise，拒绝静默成功')
         }
@@ -80,12 +87,14 @@ function createPusher ({ Utils, getNotify }) {
               // xbk_failure_policy 只用 message/statusCode/providerCode/failures 归类，
               // 且 PUSH_TIMEOUT 不在 RETRYABLE_CODES/PERMANENT_CODES 内 → 仍按 message「超时」→ retryable。
               error.code = 'PUSH_TIMEOUT'
-              const names = notifyMod && typeof notifyMod.configuredChannelNames === 'function' ? notifyMod.configuredChannelNames() : []
-              // P3 零风险半边②：注入模块未提供 configuredChannelNames 时 failures 静默为空
+              // P3：优先按「仍在飞的通道」归因——已成功结算的通道不再被误标为 PUSH_TIMEOUT
+              // （旧行为：把静态配置清单里的每个通道都标为失败，含已送达通道 → 通道健康统计与
+              // 下轮重试判断被污染）。pending 为空数组是有效状态（全部已结算），必须区别于「无该能力」。
+              const pending = Array.isArray(inFlight.pending) ? inFlight.pending.slice() : null
+              const names = pending || (notifyMod && typeof notifyMod.configuredChannelNames === 'function' ? notifyMod.configuredChannelNames() : [])
+              // P3 零风险半边②：既无在飞清单、又未提供 configuredChannelNames 时 failures 静默为空
               // （超时归因整体缺失）→ 补告警使其可观测。
-              // 未修的一半：「按仍在跑的通道归因」需要投递层暴露在飞通道状态（跨文件契约），
-              // 且 test_pusher.js:63 与 test_app.js:1825 已锁定「配置通道全量列出」的现有语义 → defer。
-              if (names.length === 0) console.warn('[Pusher] 推送超时，但无法获取已配置通道清单（configuredChannelNames 缺失），failures 为空')
+              if (!pending && names.length === 0) console.warn('[Pusher] 推送超时，但无法获取已配置通道清单（configuredChannelNames 缺失），failures 为空')
               error.failures = names.map(channel => ({ channel, code: 'PUSH_TIMEOUT', message: '推送超时(10s)' }))
               reject(error)
             }, 10000)

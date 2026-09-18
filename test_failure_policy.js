@@ -3,7 +3,9 @@
 const assert = require('assert')
 const {
   classifyFailure,
-  classifySummary
+  classifySummary,
+  RETRYABLE_CODES,
+  PERMANENT_CODES
 } = require('./xbk_failure_policy')
 const { runResident, shouldAutoInstallDependencies } = require('./qinglong/xbk_push')
 
@@ -37,6 +39,16 @@ function error (message, code) {
     'HTTP_410', 'HTTP_411', 'HTTP_413', 'HTTP_415', 'HTTP_422', 'HTTP_423', 'HTTP_426', 'HTTP_451']) {
     assert.strictEqual(classifyFailure(error(code, code)).kind, 'permanent', `${code} 应立即停止`)
   }
+  // XHTTP-05：空响应体（含纯空白体）单列可重试码——上游「连上后未写体即结束」是瞬时故障，
+  // 不得与「有内容但不是 JSON」（ERR_BODY_NOT_JSON，合约性永久错误）同判。旧实现两者同码，
+  // 而该码在 PERMANENT 集合 → 一次瞬时空体即永久停推（常驻循环漏推）。
+  assert.strictEqual(RETRYABLE_CODES.has('ERR_EMPTY_BODY'), true, '空体码必须显式列进 RETRYABLE_CODES（不得只靠 UNKNOWN 兜底）')
+  assert.strictEqual(PERMANENT_CODES.has('ERR_EMPTY_BODY'), false, '空体码不得进永久集合')
+  assert.strictEqual(PERMANENT_CODES.has('ERR_BODY_NOT_JSON'), true, '非 JSON 合约错误的永久语义不得被本修复放松')
+  assert.strictEqual(classifyFailure(error('Response is not JSON: empty body', 'ERR_EMPTY_BODY')).kind, 'retryable', '空体必须可重试')
+  assert.strictEqual(classifyFailure(error('Response is not JSON: empty body', 'ERR_EMPTY_BODY')).reason, 'ERR_EMPTY_BODY', '空体的归类理由必须是本码本身（不是 UNKNOWN）')
+  assert.strictEqual(classifyFailure(error('Response is not JSON: body 9 chars', 'ERR_BODY_NOT_JSON')).kind, 'permanent', '非 JSON 体仍判永久')
+
   assert.strictEqual(classifyFailure({ response: { statusCode: 500 }, message: 'server' }).kind, 'retryable')
   assert.strictEqual(classifyFailure({ response: { statusCode: 408 }, message: 'timeout' }).kind, 'retryable')
   assert.strictEqual(classifyFailure({ response: { statusCode: 400 }, message: 'bad request' }).kind, 'permanent')
@@ -87,6 +99,71 @@ function error (message, code) {
   assert.strictEqual(classifyFailure({ message: 'invalid state transition' }).kind, 'retryable')
   assert.strictEqual(classifyFailure(error('完全未知故障')).kind, 'retryable')
   assert.strictEqual(classifyFailure(Object.assign(new SyntaxError('代码解析失败'), { name: 'SyntaxError' })).kind, 'permanent')
+
+  // XFP-01：同一 4xx 语义在不同承载字段下必须分类一致。反例（改动前）：数字 code/providerCode
+  // 落在 400-499 一律 permanent（providerCode 连 '429' 特判都没有），把 408/409/425/429 判为永久，
+  // 与 RETRYABLE_CODES 的 HTTP_408/409/425/429 及 statusCode 路径相反 → 限流/冲突/超时被永久停推。
+  for (const n of [408, 409, 425, 429]) {
+    assert.strictEqual(classifyFailure({ code: String(n) }).kind, 'retryable', `数字 code ${n} 应与 HTTP_${n} 同判可重试`)
+    assert.strictEqual(classifyFailure({ code: String(n) }).reason, `PROVIDER_${n}`, `数字 code ${n} 的 reason 保持 PROVIDER_ 口径`)
+    assert.strictEqual(classifyFailure({ code: n }).kind, 'retryable', `数字型 code ${n} 同样可重试`)
+    assert.strictEqual(classifyFailure({ providerCode: String(n) }).kind, 'retryable', `providerCode ${n} 应与 HTTP_${n} 同判可重试`)
+    assert.strictEqual(classifyFailure({ providerCode: String(n) }).reason, `PROVIDER_${n}`, `providerCode ${n} 的 reason 保持 PROVIDER_ 口径`)
+  }
+  // 反向：其余 4xx 必须仍判永久（不得为放过 408/409/425/429 而把整个 4xx 区间放宽）
+  for (const n of [400, 401, 403, 404, 405, 422, 451, 499]) {
+    assert.strictEqual(classifyFailure({ code: String(n) }).kind, 'permanent', `code ${n} 仍应判永久`)
+    assert.strictEqual(classifyFailure({ providerCode: String(n) }).kind, 'permanent', `providerCode ${n} 仍应判永久`)
+  }
+  // 跨承载字段一致性：同一 429 在 statusCode / 数字 code / HTTP_ 前缀三种形态下必须同判
+  const kinds429 = [
+    classifyFailure({ statusCode: 429 }).kind,
+    classifyFailure({ code: 429 }).kind,
+    classifyFailure({ providerCode: 429 }).kind,
+    classifyFailure({ code: 'HTTP_429' }).kind
+  ]
+  assert.deepStrictEqual(kinds429, ['retryable', 'retryable', 'retryable', 'retryable'],
+    `429 在四种承载形态下必须同判可重试，实际 ${JSON.stringify(kinds429)}`)
+
+  // XHTTP-06：终态 3xx 是确定性重定向（重试同一 URL 结果不变）→ 必须显式判永久，且四种承载字段一致。
+  // 反例（改动前）：3xx 在数字 code / providerCode / HTTP_ 前缀 / statusCode 下都落 UNKNOWN → 可重试，
+  // 而 HTTP 层把终态 3xx 归成 ERR_BODY_NOT_JSON（永久）——同一状态码在「错误码字符串」与「statusCode」
+  // 两条路径上分类相反。本块锁定按区间统一后的口径。
+  for (const n of [300, 301, 302, 303, 304, 307, 308, 399]) {
+    assert.strictEqual(classifyFailure({ code: `HTTP_${n}` }).kind, 'permanent', `HTTP_${n} 应判永久`)
+    assert.strictEqual(classifyFailure({ code: `HTTP_${n}` }).reason, `HTTP_${n}`, `HTTP_${n} 的 reason 应是码本身`)
+    assert.strictEqual(classifyFailure({ code: n }).kind, 'permanent', `数字 code ${n} 应判永久`)
+    assert.strictEqual(classifyFailure({ code: n }).reason, `PROVIDER_${n}`, `数字 code ${n} 的 reason 保持 PROVIDER_ 口径`)
+    assert.strictEqual(classifyFailure({ providerCode: n }).kind, 'permanent', `providerCode ${n} 应判永久`)
+    assert.strictEqual(classifyFailure({ providerCode: n }).reason, `PROVIDER_${n}`, `providerCode ${n} 的 reason 保持 PROVIDER_ 口径`)
+    assert.strictEqual(classifyFailure({ statusCode: n }).kind, 'permanent', `statusCode ${n} 应判永久`)
+    assert.strictEqual(classifyFailure({ statusCode: n }).reason, `HTTP_${n}`, `statusCode ${n} 的 reason 保持 HTTP_ 口径`)
+  }
+  // 反向守卫：3xx 区间之外不得被波及（边界写错会让 2xx/4xx/5xx 语义漂移）
+  assert.strictEqual(classifyFailure({ statusCode: 299 }).kind, 'retryable', '2xx 边界（299）仍按未知保守重试')
+  assert.strictEqual(classifyFailure({ code: 'HTTP_299' }).kind, 'retryable', 'HTTP_299 不在 3xx 区间，仍保守重试')
+  assert.strictEqual(classifyFailure({ code: 'HTTP_400' }).kind, 'permanent', '4xx 语义不得被 3xx 分支改写')
+  assert.strictEqual(classifyFailure({ code: 'HTTP_429' }).kind, 'retryable', '429 仍可重试')
+  assert.strictEqual(classifyFailure({ code: 'HTTP_503' }).kind, 'retryable', '5xx 仍可重试')
+  assert.strictEqual(classifyFailure({ statusCode: 400 }).kind, 'permanent', 'statusCode 400 仍判永久')
+
+  // XFP-05：子错误挂在 failureInfo.failures 时，父级 permanent 同样不得覆盖子级 retryable。
+  // 反例（改动前）：classifyFailure 只读 error.failures，qinglong 产生的形状
+  // {failureKind:'permanent', failureInfo:{failures:[{code:'ETIMEDOUT'}]}} 直接按父标签判 permanent，
+  // 与等价的 {failureKind:'permanent', failures:[...]} 分类相反 → 含可重试子通道的失败被永久停推。
+  const viaFailures = { failureKind: 'permanent', failures: [{ code: 'ETIMEDOUT' }] }
+  const viaFailureInfo = { failureKind: 'permanent', failureInfo: { failures: [{ code: 'ETIMEDOUT' }] } }
+  assert.strictEqual(classifyFailure(viaFailures).kind, 'retryable', '前置：error.failures 承载子错误时的既有仲裁')
+  assert.strictEqual(classifyFailure(viaFailureInfo).kind, 'retryable', 'failureInfo.failures 承载子错误时必须与 error.failures 同判')
+  assert.strictEqual(classifyFailure(viaFailureInfo).reason, classifyFailure(viaFailures).reason, '两个承载位置的 reason 口径也应一致')
+  // 反向：failureInfo.failures 全为永久子项时不得被放宽成可重试
+  assert.strictEqual(classifyFailure({ failureKind: 'retryable', failureInfo: { failures: [{ code: 'ERR_INVALID_URL' }] } }).kind, 'permanent',
+    'failureInfo.failures 全永久子项仍应以子项为准')
+  // 无子项时不改变既有行为：failureInfo 只有描述字段 / 空对象 → 父标签仍生效
+  assert.strictEqual(classifyFailure({ failureKind: 'permanent', failureInfo: { message: 'boom' } }).kind, 'permanent')
+  assert.strictEqual(classifyFailure({ failureKind: 'retryable', failureInfo: {} }).kind, 'retryable')
+  // failureInfo.failures 为空数组同样不构成「有子项」，父标签继续生效
+  assert.strictEqual(classifyFailure({ failureKind: 'permanent', failureInfo: { failures: [] } }).kind, 'permanent')
 
   // TLS / 证书分类：明确证书故障文本判 permanent，瞬时连接/超时/复合文本仍保持 retryable
   assert.strictEqual(classifyFailure(error('certificate has expired')).kind, 'permanent')

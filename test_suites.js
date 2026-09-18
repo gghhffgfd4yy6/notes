@@ -35,10 +35,13 @@ const SUITES = [
   { name: '规则引擎扩展', file: 'test_rules_extended.js', desc: 'xbk_rules.js compileRules/matchesCompiled/checkTimeCompiled/validateConfig 边界（提升变异分数）' },
   { name: '消息存储纯函数', file: 'test_message_store_utils.js', desc: 'xbk_message_store.js getFilePath/getFileName 路径安全与URL提取边界（提升变异分数）' },
   { name: '通知纯函数', file: 'test_sendnotify_pure.js', desc: 'xbk_sendNotify_slim.js maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags 纯函数边界（提升变异分数）' },
+  { name: '推送响应体上限', file: 'test_sendnotify_bodylimit.js', desc: 'xbk_sendNotify_slim.js $.post/$.get 流式响应体上限（EBODYLIMIT/销毁流）+ 无 stream 替身回退 promise 路径 + 官方 got 回环端到端' },
   { name: '单元测试', file: 'test_filter.js', desc: '主代码导出函数逐函数逻辑' },
   { name: '变异报告读取', file: 'test_mutation_json.js', desc: '超大 mutation.json 剥离 statusReason 解析（v3.264）' },
   { name: '变异报告渲染', file: 'test_mutation_report.js', desc: 'render 函数 markdown 输出快照（v3.266 重构验证）' },
   { name: '变异报告CLI', file: 'test_mutation_report_cli.js', desc: 'scripts/mutation-report.js main() 入口：无参数/不存在目录/有效目录 3种子进程场景' },
+  // 审查 F6：.github/analyze-artifacts.js 此前无任何测试/CI 覆盖，失效常量（硬编码行数阈值）无人守护
+  { name: '变异产物分析', file: 'test_analyze_artifacts.js', desc: '.github/analyze-artifacts.js 子进程：目录缺失/空目录/坏报告/合法报告 + V3 存活统计与实际行数' },
   { name: '变异调度器', file: 'test_run_mutation.js', desc: 'generateMutants 词法扫描/注释字符串跳过 + extractTestSummary 输出解析' },
   { name: '变异内部函数', file: 'test_run_mutation_internal.js', desc: 'lineColumn/isIdent/lineTriple/numberBefore/numberAfter/mapLimit/saveCheckpoint/loadCheckpoint/copyProject/applyMutants 11个内部函数' },
   { name: '变异运行时', file: 'test_run_mutation_cli.js', desc: 'run_mutation.js runTests（通过/失败/超时）+ evaluate（复制项目→应用变异→运行测试→清理）' },
@@ -47,8 +50,9 @@ const SUITES = [
   { name: '变异范围', file: 'test_mutation_ranges.js', desc: '生产模块及行段必须完整纳入 mutation 矩阵', mutationSkip: true },
   { name: 'CI跳过清单对账', file: 'test_ci_skip_suites.js', desc: 'SKIP_SUITES ↔ test.yml 显式步骤双向一致 + 入口过滤/summary 行为' },
   { name: '注册表对账', file: 'test_suite_registry.js', desc: '根目录 test_*.js ↔ SUITES 双向一致（漏注册/幽灵条目/白名单陈旧）' },
+  { name: 'Hooks 自检', file: 'test_install_hooks.js', desc: 'scripts/install-hooks.js --verify 只读自检（未生效 fail-closed / 生效 exit 0 / 不改配置不改权限）' },
   { name: 'Release tag 校验', file: 'test_tag_validator.js', desc: 'tag semver 正则与 release.yml 逐字同源断言' },
-  { name: '版本闸门', file: 'test_check_version.js', desc: 'check-version.js 三方一致性 + 补丁段必须 .0（qodo #143-4 回归，夹具驱动）' },
+  { name: '版本闸门', file: 'test_check_version.js', desc: 'check-version.js 四方一致性 + 补丁段必须 .0（qodo #143-4 回归，夹具驱动）' },
   // v3.172：集成测试走并行调度器（worker 独立缓存目录 + 失败片串行重跑）。
   // 需要完整串行验证时直接 node test_app.js（CI 即如此）
   { name: '集成测试', file: 'test_app_p.js', desc: 'App.run 完整主流程(并行调度,失败自动重跑)', integration: true },

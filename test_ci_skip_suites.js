@@ -414,8 +414,8 @@ try {
   fs.rmSync('reports/.ci-summary-overflow.md', { force: true })
 }
 
-// 3g run_tests.js 的零套件守卫（RT-01）与失败原因诊断（RT-02）回归：该入口全量跑 41 个套件
-//    （含网络/常驻），不能直接驱动；故在临时目录里搭一个最小沙箱（桩 test_suites.js + 桩
+// 3g run_tests.js 的零套件守卫（RT-01）、失败原因诊断（RT-02）与每套件超时（RT-03）回归：该入口全量跑
+//    41 个套件（含网络/常驻），不能直接驱动；故在临时目录里搭一个最小沙箱（桩 test_suites.js + 桩
 //    scripts/check-deps.js + 桩套件），只复制入口自身——与 test_run_mutation_internal.js 的
 //    copyProject 手法同源。
 function makeRunTestsSandbox (suites, files = {}) {
@@ -427,9 +427,17 @@ function makeRunTestsSandbox (suites, files = {}) {
   for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
   return dir
 }
-function runRunTestsIn (dir) {
-  return spawnSync(process.execPath, [path.join(dir, 'run_tests.js')], { encoding: 'utf8', cwd: dir })
+function runRunTestsIn (dir, env = {}, extra = {}) {
+  return spawnSync(process.execPath, [path.join(dir, 'run_tests.js')], {
+    encoding: 'utf8',
+    cwd: dir,
+    env: { ...process.env, ...env },
+    ...extra
+  })
 }
+// 汇总行 ↔ run_mutation.js 解析口径的跨文件契约（UT-07），3g2 与 3h 共用同一解析实现
+// （不另写一份正则，避免测试与生产口径漂移）。
+const { extractTestSummary } = require('./run_mutation')
 
 // 3g1 空注册表（SUITES=[]）必须非 0：修复前 allOk 初值 true → 「全部通过 🎉」并 exit 0（门禁假绿）
 const emptyDir = makeRunTestsSandbox([])
@@ -459,8 +467,153 @@ try {
   assert.notStrictEqual(diag.status, 0, '失败套件必须非 0 退出')
   assert.match(diag.stdout, /status=7/, '静默非零退出（exit 7）必须把退出码打进输出')
   assert.match(diag.stdout, /signal=SIGKILL/, '被信号杀死的套件必须把 signal 打进输出')
+  // RT-02/UT-07 同源锁定：run_tests.js 的汇总行也必须带「K 通过, M 失败, 共 N」三数字，
+  // 否则 extractTestSummary 会命中更早的内层行（此沙箱里没有诱饵，修复前返回空数组）。
+  assert.deepStrictEqual(extractTestSummary(diag.stdout), ['0', '2', '2'],
+    'run_tests.js 汇总行必须被 extractTestSummary 识别（0 通过, 2 失败, 共 2）')
 } finally {
   fs.rmSync(diagDir, { recursive: true, force: true })
+}
+
+// 3g3 每套件硬超时（RT-03）：套件挂死（死循环/等待不会到来的输入）时 execFileSync 永不返回，
+//     入口既不汇总也不退出——CI 只能等作业级超时且没有红测定位。现要求入口按 XBK_TEST_TIMEOUT
+//     强杀（killSignal=SIGKILL）并以失败收尾，且失败输出点名「超过每套件上限」（与断言红区分）。
+//     测试侧仍加 30s spawnSync 兜底：修复被回退（无超时）时子进程会永久挂住，必须让本断言失败
+//     而不是把整套件挂到作业级超时。
+const hangDir = makeRunTestsSandbox(
+  [{ name: '挂死套件', file: 'test_stub_hang.js', desc: '死循环永不退出' }],
+  { 'test_stub_hang.js': 'while (true) {}\n' }
+)
+try {
+  const t0 = Date.now()
+  const hang = runRunTestsIn(hangDir, { XBK_TEST_TIMEOUT: '300' }, { timeout: 30000 })
+  const elapsed = Date.now() - t0
+  assert.strictEqual(hang.signal, null,
+    '入口必须自行结束：被测试侧 30s 兜底杀掉（signal 非 null）说明每套件超时失效，入口仍在永久阻塞')
+  assert.notStrictEqual(hang.status, 0, '挂死套件必须让入口以非 0 退出（零假绿）')
+  assert.match(hang.stdout, /超过每套件上限 300ms 已强杀/, '失败输出必须点名每套件超时（与断言红区分）')
+  assert.ok(elapsed < 20000, `入口应在每套件上限后很快结束（实测 ${elapsed}ms）`)
+} finally {
+  fs.rmSync(hangDir, { recursive: true, force: true })
+}
+
+// 3g4 每套件超时后的「整组杀伤」（F6）：3g3 只保证入口自身收敛，不保证套件派生的后代也停下。
+//     桩套件 fork 一个继承 fd1 的孙进程（与 test_app_p.js 的并行调度同形：非 detached、stdio 继承 fd1），
+//     自身挂死触发每套件超时。修复前只 kill 直接子进程 → 孙进程存活并继续持有继承的 stdout/stderr：
+//     入口虽已退出，孤儿仍在跑（占 CPU / 端口 / 临时目录，污染后续套件），且**以管道捕获本入口**的调用方
+//     （CI runner 收输出、spawnSync('pipe')、其它入口以 stdio:'pipe' 拉起）要等这个孤儿退出才拿到 close
+//     ——实测父进程被拖到 30s 兜底才返回。故断言：入口退出后心跳文件不再增长（后代已被整组 SIGKILL 清掉）。
+//     本用例把入口的 stdout/stderr 接到**真实文件**而不是管道，原因有二：① 管道会被孤儿持有，本用例在
+//     修复前会挂到测试侧兜底超时（那是同一 bug 的另一个症状，但断言会退化成「超时」而非可读的失败）；
+//     ② 文件 fd 仍如实复现「孙进程持有继承的 fd1」这一前提。
+const treeDir = makeRunTestsSandbox(
+  [{ name: '挂死套件（带孙进程）', file: 'test_stub_tree.js', desc: 'fork 继承 fd1 的孙进程后自身挂死' }],
+  {
+    'test_stub_tree.js': [
+      "const { fork } = require('child_process')",
+      "const path = require('path')",
+      "fork(path.join(__dirname, 'stub_heartbeat.js'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })",
+      'setInterval(() => {}, 1000)',
+      ''
+    ].join('\n'),
+    'stub_heartbeat.js': [
+      "const fs = require('fs')",
+      "const path = require('path')",
+      "const out = path.join(__dirname, 'heartbeat.txt')",
+      "fs.writeFileSync(out, String(process.pid) + '\\n')",
+      "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+      ''
+    ].join('\n')
+  }
+)
+const treeOutPath = path.join(treeDir, 'entry.stdout.txt')
+// CodeQL js/file-system-race（本仓库的**必需检查**）：同一条路径上「先 open（check）… 再按路径操作（use）」
+// 是 check-then-use —— 检查与使用之间该路径可被换成另一个对象。该查询的 use 集合显式含 open/openSync 本身
+// （见 codeql 查询 FileSystemRace.ql 的 FileUse：readFile(Sync)/writeFile(Sync)/appendFile(Sync)/open(Sync)），
+// 所以「关掉写端后再 openSync(path,'r') 按路径二次打开、然后按新 fd 读」仍构成同一对（只是告警位置前移），
+// 唯一清得掉判据的形态是：**全流程对这条路径只有一次按路径的访问**。故一次 open 用 'w+'（读写的同一个 fd）：
+// 子进程继承的 fd1 仍是**真实文件**（3g4 的「孙进程持有继承 fd1」前提不变），之后只对 fd 做 fstatSync/readSync
+// ——与 scripts/mutation-json.js 的「一次 open + 只对 fd 判定与读取」同口径。
+const treeOutFd = fs.openSync(treeOutPath, 'w+')
+const treeErrFd = fs.openSync(path.join(treeDir, 'entry.stderr.txt'), 'w')
+let treePid = 0
+try {
+  let tree
+  let treeOut
+  const t0 = Date.now()
+  try {
+    tree = runRunTestsIn(treeDir, { XBK_TEST_TIMEOUT: '1500' }, { timeout: 30000, stdio: ['ignore', treeOutFd, treeErrFd] })
+  } finally {
+    // 子进程已退出且不再写：先按 fd 取真实大小，再从**位置 0** 显式读回。位置必须显式给 0——子进程继承的是
+    // 同一个打开文件描述（dup），写完共享偏移停在 EOF，readFileSync(fd) 会从当前位置读回空串（本机实测）。
+    // 分配量由 fstat 观测值决定、按 fd 有界读取，与 xbk_storage.js 的 readFdRange / scripts/mutation-json.js
+    // 同口径；写入方已全部退出，读到的就是完整输出（断言语义不变）。
+    try {
+      const treeOutSize = fs.fstatSync(treeOutFd).size
+      const treeOutBuf = Buffer.allocUnsafe(treeOutSize)
+      let treeOutRead = 0
+      while (treeOutRead < treeOutSize) {
+        const n = fs.readSync(treeOutFd, treeOutBuf, treeOutRead, treeOutSize - treeOutRead, treeOutRead)
+        if (n <= 0) break
+        treeOutRead += n
+      }
+      treeOut = treeOutBuf.subarray(0, treeOutRead).toString('utf8')
+    } finally {
+      fs.closeSync(treeOutFd)
+      fs.closeSync(treeErrFd)
+    }
+  }
+  const elapsed = Date.now() - t0
+  assert.strictEqual(tree.signal, null,
+    `入口必须自行结束（被测试侧 30s 兜底杀掉说明入口未收敛，实测 ${elapsed}ms）`)
+  assert.notStrictEqual(tree.status, 0, '超时的套件必须让入口以非 0 退出（fail-closed 语义不变）')
+  assert.deepStrictEqual(extractTestSummary(treeOut), ['0', '1', '1'],
+    '超时仍按失败结算：汇总三数字应与修复前一致（0 通过, 1 失败, 共 1）')
+  assert.match(treeOut, /超过每套件上限 1500ms 已强杀/, '失败输出必须仍点名每套件超时（RT-03 口径不变）')
+  const hb = path.join(treeDir, 'heartbeat.txt')
+  treePid = Number(fs.readFileSync(hb, 'utf8').split('\n')[0])
+  assert.ok(Number.isInteger(treePid) && treePid > 0, '孙进程应已写出自己的 pid（夹具自身生效的前提）')
+  const sizeAfterExit = fs.statSync(hb).size
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
+  const sizeLater = fs.statSync(hb).size
+  assert.strictEqual(sizeLater, sizeAfterExit,
+    `入口退出后孙进程仍在写心跳（${sizeAfterExit} → ${sizeLater} 字节）：每套件超时只杀了直接子进程，孤儿后代存活（F6）`)
+  console.log(`✅ 每套件超时的整组杀伤：入口 ${elapsed}ms 收敛，退出后孙进程（pid ${treePid}）心跳停在 ${sizeAfterExit} 字节`)
+} finally {
+  // 孙进程若仍存活（修复被回退时）必须由本用例清掉，否则会污染后续套件与整轮测试
+  if (treePid > 0) {
+    try { process.kill(treePid, 'SIGKILL') } catch (e) { /* 已随进程组退出（ESRCH）：正常路径 */ }
+  }
+  fs.rmSync(treeDir, { recursive: true, force: true })
+}
+
+// 3h run_unit_tests.js 的汇总行必须能被 run_mutation.js 的 extractTestSummary 识别（UT-07）：
+//    变异评估下内层套件 stdout 与本入口共用同一捕获管道，若本入口汇总行不含「K 通过, M 失败, 共 N」
+//    三数字，extractTestSummary 会继续向上扫描并命中内层套件的同名行（如 test_filter.js:8746 的
+//    「🎉 全部通过！785/785」）→ 逐变异体 summary 误归属内层套件。此处用诱饵行复现：内层桩套件打印
+//    「全部通过！7/7」，外层只跑 1 个套件，断言取到外层的 1/0/1 而不是诱饵的 7/7。
+function makeUnitTestsSandbox (suites, files = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-unit-tests-'))
+  fs.copyFileSync(path.join(__dirname, 'run_unit_tests.js'), path.join(dir, 'run_unit_tests.js'))
+  fs.writeFileSync(path.join(dir, 'test_suites.js'), `module.exports = { SUITES: ${JSON.stringify(suites)} }\n`)
+  for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
+  return dir
+}
+const summaryDir = makeUnitTestsSandbox(
+  [{ name: '内层诱饵', file: 'test_stub_decoy.js', desc: '打印可被 extractTestSummary 命中的诱饵行' }],
+  { 'test_stub_decoy.js': "console.log('🎉 全部通过！7/7  100%')\nprocess.exit(0)\n" }
+)
+try {
+  const unitEnv = { ...baseEnv }
+  delete unitEnv.GITHUB_STEP_SUMMARY
+  const unitRun = spawnSync(process.execPath, [path.join(summaryDir, 'run_unit_tests.js')],
+    { encoding: 'utf8', cwd: summaryDir, env: unitEnv })
+  assert.strictEqual(unitRun.status, 0, unitRun.stderr || unitRun.stdout)
+  assert.match(unitRun.stdout, /全部通过！7\/7/, '夹具自身应先出现内层诱饵行（否则本回归形同虚设）')
+  assert.deepStrictEqual(extractTestSummary(unitRun.stdout), ['1', '0', '1'],
+    '本入口汇总行必须被 extractTestSummary 识别为本入口的数字（1 套件全通过），不得被内层套件的「全部通过！7/7」抢答')
+} finally {
+  fs.rmSync(summaryDir, { recursive: true, force: true })
 }
 
 // 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加

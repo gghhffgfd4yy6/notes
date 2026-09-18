@@ -5,7 +5,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { runTests, evaluate, main } = require('./run_mutation')
+const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutants, generateMutants, judgingTestFiles } = require('./run_mutation')
 
 ;(async () => {
   // 防重入：run_mutation.js 的 runTests 在临时目录内运行 run_unit_tests.js 时会设置
@@ -41,6 +41,143 @@ const { runTests, evaluate, main } = require('./run_mutation')
       if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
       else process.env.MUTATION_CHECKPOINT = originalCheckpoint
       fs.rmSync(ckpt, { force: true })
+    }
+  }
+
+  // ===== main：断点指纹（F4） =====
+  // 断点只按位置 id（序号）恢复，源码一改全部 id 平移，旧 killed/survived 会被错记到别的候选头上
+  // （分数虚高 + 真正改动过的代码免于变异）。指纹不匹配必须丢弃旧断点、从零重跑。
+  {
+    const originalExitCode = process.exitCode
+    const originalCheckpoint = process.env.MUTATION_CHECKPOINT
+    // 私有临时目录 + 固定文件名：共享 tmpdir 里用可预测文件名建文件属「不安全临时文件」
+    // （CodeQL js/insecure-temporary-file）；mkdtempSync 出来的目录只有本用户可访问，文件名可固定。
+    const ckpt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-fingerprint-')), 'checkpoint.json')
+    const reportFile = path.join(__dirname, 'mutation-report.json')
+    // 直接读并只吞 ENOENT，取代 existsSync→（后面的）write 这对 check-then-use
+    // （CodeQL js/file-system-race）：语义不变（不存在仍记为 null，finally 里据此删除临时报告）。
+    let hadReport = null
+    try { hadReport = fs.readFileSync(reportFile) } catch (e) { if (e.code !== 'ENOENT') throw e }
+    const calls = []
+    try {
+      process.env.MUTATION_CHECKPOINT = ckpt
+      // 伪造上一轮的断点：指纹与当前源码不一致 + 第 1 个变异体已判定 + pending 为空
+      fs.writeFileSync(ckpt, JSON.stringify({
+        total: 1,
+        batchSize: 50,
+        fingerprint: 'deadbeef',
+        killed: [[1, { status: 'killed' }]],
+        survived: [],
+        compileErrors: [],
+        pending: []
+      }))
+      await main({
+        evaluate: async (mutants) => {
+          calls.push(mutants.length)
+          return { status: 'pass', code: 0, signal: null, output: 'ok' }
+        }
+      })
+      assert.strictEqual(calls[0], 0, '先跑未套变异的基线')
+      assert.ok(calls.length > 1, '指纹不匹配的断点必须被丢弃并重新评估，不得直接继承旧结果收场')
+      assert.ok(calls.slice(1).some(n => n > 0), '丢弃断点后应真正进入批次循环评估变异体')
+    } finally {
+      process.exitCode = originalExitCode
+      if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
+      else process.env.MUTATION_CHECKPOINT = originalCheckpoint
+      fs.rmSync(path.dirname(ckpt), { recursive: true, force: true })
+      if (hadReport === null) fs.rmSync(reportFile, { force: true })
+      else fs.writeFileSync(reportFile, hadReport)
+    }
+  }
+
+  // ===== main：未判定变异体必须拉红（F4） =====
+  // 报告里 status='pending' 的候选从未被任何批次评估；退出码此前只看 survived/timeout → exit 0
+  // （「跑完了、分数很高」的假绿）。指纹匹配 + pending 为空即复现：第 1 个已判定、其余全部未判定。
+  {
+    const originalExitCode = process.exitCode
+    const originalCheckpoint = process.env.MUTATION_CHECKPOINT
+    // 同上一块：私有临时目录 + 固定文件名（CodeQL js/insecure-temporary-file）
+    const ckpt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-undetermined-')), 'checkpoint.json')
+    const reportFile = path.join(__dirname, 'mutation-report.json')
+    // 同上一块：读失败只吞 ENOENT，消除 existsSync→write 的 check-then-use（CodeQL js/file-system-race）
+    let hadReport = null
+    try { hadReport = fs.readFileSync(reportFile) } catch (e) { if (e.code !== 'ENOENT') throw e }
+    const calls = []
+    try {
+      process.env.MUTATION_CHECKPOINT = ckpt
+      const fingerprint = mutantFingerprint(collectMutants(DEFAULT_FILES))
+      assert.ok(fingerprint.length === 64, '变异集指纹应为 sha256 十六进制串')
+      fs.writeFileSync(ckpt, JSON.stringify({
+        total: 1,
+        batchSize: 50,
+        fingerprint,
+        killed: [[1, { status: 'killed' }]],
+        survived: [],
+        compileErrors: [],
+        pending: []
+      }))
+      await main({
+        evaluate: async (mutants) => {
+          calls.push(mutants.length)
+          return { status: 'pass', code: 0, signal: null, output: 'ok' }
+        }
+      })
+      assert.deepStrictEqual(calls, [0], '指纹匹配且 pending 为空时不应再跑任何批次')
+      assert.strictEqual(process.exitCode, 1, '存在未判定变异体必须非 0 退出（不得 survived=0 却 exit 0）')
+      const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'))
+      const pending = report.mutants.filter(m => m.result && m.result.status === 'pending').length
+      assert.ok(pending > 0, `报告应显式标出未判定（status=pending）的变异体，实际 ${pending} 个`)
+      assert.ok(fs.existsSync(ckpt), '存在未判定项时断点文件应保留（供排查），不得静默删除')
+    } finally {
+      process.exitCode = originalExitCode
+      if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
+      else process.env.MUTATION_CHECKPOINT = originalCheckpoint
+      fs.rmSync(path.dirname(ckpt), { recursive: true, force: true })
+      if (hadReport === null) fs.rmSync(reportFile, { force: true })
+      else fs.writeFileSync(reportFile, hadReport)
+    }
+  }
+
+  // ===== 断点指纹必须覆盖源文件原文与测试文件内容（F5） =====
+  // 只哈希变异集（file/start/end/original/replacement）时，两类改动会让指纹原地不动、从而静默继承旧断点
+  // （0 个批次被评估、旧 killed/survived 原样重印、exit 0 且无告警）：
+  //   ① 等长且不触及变异 token 的源码改动（实测常量 1→9）：候选字段逐个相同；
+  //   ② 任何 test_*.js 改动：测试变更直接改变「哪些变异体被杀」。
+  // 此处用合成项目（注入 root/sourceFiles/testFiles）分别复现两类改动——不动真实工作区。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-fingerprint-inputs-'))
+    try {
+      const t1 = 'const a = 1\nif (a === 1) { module.exports = a }\n'
+      const t2 = 'const a = 9\nif (a === 1) { module.exports = a }\n'
+      const opts = { root: dir, sourceFiles: ['xbk_a.js'], testFiles: ['test_b.js'] }
+      fs.writeFileSync(path.join(dir, 'xbk_a.js'), t1)
+      fs.writeFileSync(path.join(dir, 'test_b.js'), 'console.log(1)\n')
+      const m1 = generateMutants('xbk_a.js', t1)
+      const fSource1 = mutantFingerprint(m1, opts)
+      // ① 等长源码改动：先断言候选字段完全不变（前提），再要求指纹必须变
+      fs.writeFileSync(path.join(dir, 'xbk_a.js'), t2)
+      const m2 = generateMutants('xbk_a.js', t2)
+      assert.deepStrictEqual(m2, m1, '等长源码改动（1→9，不触及变异 token）不应改变变异集（本条回归成立的前提）')
+      const fSource2 = mutantFingerprint(m2, opts)
+      assert.notStrictEqual(fSource2, fSource1,
+        '等长且未触及变异 token 的源码改动必须改变断点指纹（修前指纹不变 → 静默继承旧断点）')
+      // ② 仅改测试文件（等长 1→2）：变异集与源文件都不动，指纹仍必须变
+      fs.writeFileSync(path.join(dir, 'test_b.js'), 'console.log(2)\n')
+      const fTest = mutantFingerprint(m2, opts)
+      assert.notStrictEqual(fTest, fSource2,
+        '仅改测试文件（等长 1→2）必须改变断点指纹（测试改动会改变哪些变异体被杀）')
+      // ③ 生产调用路径（不传 options）必须真的把测试链纳入：清单含入口/注册表/单元套件，且不含不参与的套件
+      const judged = judgingTestFiles()
+      assert.ok(judged.includes('run_unit_tests.js') && judged.includes('test_suites.js'),
+        '参与判定的测试清单必须含测试入口与套件注册表（它们决定实际跑哪些套件）')
+      assert.ok(judged.includes('test_filter.js'), '参与判定的测试清单必须含单元套件文件本体')
+      assert.ok(!judged.includes('test_app_p.js') && !judged.includes('test_mutation_ranges.js'),
+        'integration / mutationSkip 套件不在变异评估里跑，不应进指纹（进了会让清单口径悄悄漂移）')
+      assert.strictEqual(mutantFingerprint(collectMutants(DEFAULT_FILES)).length, 64,
+        '生产调用路径（不传 options）应能直接算出 sha256 指纹')
+      console.log('✅ 断点指纹覆盖源文件原文与测试文件内容（等长源码改动 / 仅改测试文件均改变指纹）')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
     }
   }
 
@@ -99,21 +236,82 @@ const { runTests, evaluate, main } = require('./run_mutation')
     }
   }
 
-  // 场景 4：runTests 必须清空 SKIP_SUITES，并给子进程带 XBK_MUTATION_CHILD=1
-  // 原因：CI 显式步骤的 SKIP_SUITES 若继承进变异评估子进程，被跳过的套件不再参与变异判定 → 分数失真。
+  // 场景 3b：超时必须杀整个进程组（F6）。只 kill 直接子进程时，它派生的孙进程（真实的套件进程）
+  // 仍是孤儿并持有 stdout/stderr 管道 → 'close' 被推迟到 2000ms 兜底保险（超时被记 timeout 的同时
+  // 孤儿继续跑）。本场景用真实进程验证：孙进程持续写心跳文件，超时后心跳必须停止、且 'close' 快速到达。
+  //
+  // 返工（V2 打回）：原夹具把「首心跳」完全交给孙进程，而本机实测两层 node 的首次心跳在 536/798/720ms，
+  // 与 800ms 预算同量级 —— 心跳晚于预算即整组被杀，断言 `孙进程应至少写入一次心跳` 在 HEAD 恒红
+  // （并连带阻断场景 4 的 F8 断言，CI 上从未跑到）。现按 V2 建议 (a)+(c) 解耦：
+  //   ① 直接子进程在 spawn 之前**同步**写一次 'P' —— 「夹具真的起来了」不再依赖孙进程启动速度；
+  //   ② 孙进程启动时立刻同步写一次 'g' 再按 20ms 心跳，缩短「已派生后代」的取证窗口；
+  //   ③ 预算 800ms → 3000ms（实测首心跳 <800ms，留 ≥3.75x 余量）；
+  //   ④ elapsed 判据改为**相对预算**：兜底定时器在 timeoutMs+2000 结算，故 < budget+1500ms
+  //      即证明 close 正常收敛（而不是落到兜底）。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-groupkill-'))
+    const marker = path.join(dir, 'orphan-heartbeat.log')
+    const prevMarker = process.env.XBK_TEST_ORPHAN_MARKER
+    const budget = 3000
+    try {
+      process.env.XBK_TEST_ORPHAN_MARKER = marker
+      // 直接子进程：同步写首心跳 → spawn 一个持续写心跳的孙进程（继承管道）→ 自己挂住不退，触发超时分支。
+      // 孙进程 15s 后自杀：即使修复被回退（孤儿存活）也不会留下无界进程。
+      fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
+        const { spawn } = require('child_process')
+        const fs = require('fs')
+        const f = process.env.XBK_TEST_ORPHAN_MARKER
+        fs.appendFileSync(f, 'P')
+        spawn(process.execPath, ['-e', "const fs=require('fs');const f=process.env.XBK_TEST_ORPHAN_MARKER;fs.appendFileSync(f,'g');setInterval(()=>fs.appendFileSync(f,'g'),20);setTimeout(()=>process.exit(0),15000)"], { stdio: ['ignore', 'inherit', 'inherit'] })
+        setInterval(() => {}, 1000)
+      `)
+      const t0 = Date.now()
+      const result = await runTests(dir, budget)
+      const elapsed = Date.now() - t0
+      assert.strictEqual(result.status, 'timeout', '挂住的直接子进程应按超时结算')
+      // 首心跳由直接子进程同步写：这一步是确定性的（不依赖孙进程启动速度）
+      assert.ok(fs.existsSync(marker), '直接子进程必须留下首心跳（同步写入，不依赖孙进程启动速度）')
+      const content = fs.readFileSync(marker, 'utf8')
+      assert.ok(content.includes('g'),
+        `孙进程应至少写入一次心跳（否则本回归没有判据：夹具未真正派生后代），实际内容=${JSON.stringify(content)}`)
+      const size1 = fs.statSync(marker).size
+      await new Promise(resolve => setTimeout(resolve, 600))
+      const size2 = fs.statSync(marker).size
+      assert.strictEqual(size2, size1,
+        `超时后孙进程仍在运行（心跳 ${size1} → ${size2} 字节）：进程组未被杀伤，孤儿继续跑`)
+      assert.ok(elapsed < budget + 1500,
+        `孙进程被杀后管道应立即关闭、由 close 收敛（实测 ${elapsed}ms；>= ${budget + 2000}ms 说明落到了兜底定时器）`)
+    } finally {
+      if (prevMarker === undefined) delete process.env.XBK_TEST_ORPHAN_MARKER
+      else process.env.XBK_TEST_ORPHAN_MARKER = prevMarker
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // 场景 4：runTests 必须清空 SKIP_SUITES，给子进程带 XBK_MUTATION_CHILD=1，并注入 PERF_MS
+  // 原因：CI 显式步骤的 SKIP_SUITES 若继承进变异评估子进程，被跳过的套件不再参与变异判定 → 分数失真；
+  // PERF_MS 必须与 stryker 沙箱同口径（scripts/mutation-child.js），否则 test_filter.js 的性能断言
+  // 在默认最多 8 并发下误失败 → 变异体被记 killed、分数虚高，且两条变异路径不可比（F8）。
   {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtests-skip-'))
     const prev = process.env.SKIP_SUITES
     try {
       process.env.SKIP_SUITES = 'test_filter.js,test_storage.js'
       fs.writeFileSync(path.join(dir, 'run_unit_tests.js'), `
-        console.log('SKIP=[' + (process.env.SKIP_SUITES || '') + '] MUT=[' + (process.env.XBK_MUTATION_CHILD || '') + ']')
+        console.log('SKIP=[' + (process.env.SKIP_SUITES || '') + '] MUT=[' + (process.env.XBK_MUTATION_CHILD || '') + '] PERF=[' + (process.env.PERF_MS || '') + ']')
         process.exit(0)
       `)
       const result = await runTests(dir, 10000)
       assert.strictEqual(result.status, 'pass', `应正常通过，output=${result.output}`)
       assert.match(result.output, /SKIP=\[\]/, 'runTests 必须清空 SKIP_SUITES（否则 CI 跳过清单会继承到变异评估）')
       assert.match(result.output, /MUT=\[1\]/, 'runTests 应标记 XBK_MUTATION_CHILD=1（防递归 + 抑制 summary 追加）')
+      // 与 stryker 沙箱同口径：预期值取自 scripts/mutation-child.js 的实际赋值（单一事实源），
+      // 任一侧被改动（去掉注入 / 改 mutation-child 的值）都会让本断言红。
+      const childScript = fs.readFileSync(path.join(__dirname, 'scripts', 'mutation-child.js'), 'utf8')
+      const perf = /process\.env\.PERF_MS\s*=\s*'(\d+)'/.exec(childScript)
+      assert.ok(perf, 'scripts/mutation-child.js 应显式设置 PERF_MS（stryker 沙箱性能阈值口径来源）')
+      assert.match(result.output, new RegExp(`PERF=\\[${perf[1]}\\]`),
+        `runTests 注入的 PERF_MS 必须与 stryker 沙箱同口径（scripts/mutation-child.js 的 ${perf[1]}）`)
     } finally {
       if (prev === undefined) delete process.env.SKIP_SUITES
       else process.env.SKIP_SUITES = prev

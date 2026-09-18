@@ -7,6 +7,7 @@
 //   - parseDiagnostics 跳过损坏行找到有效记录
 //   - validReport 容忍缺失计数字段（存在的字段仍须校验）
 //   - validReport 容忍缺失 date 字段（date 存在时仍须为字符串，CodeRabbit PR #147）
+//   - validReport 的 pending 段与生产侧 _loadReportState 同口径（非法形状/计数 → invalid，SS-05）
 //   - formatStatus channels.value 为 null 时的降级分支
 const assert = require('node:assert')
 const fs = require('node:fs')
@@ -122,6 +123,143 @@ try {
 
     fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ runs: 1, date: null }) + '\n')
     assert.strictEqual(readStatus(tmp).report.status, 'invalid', 'date=null 不是 undefined、也不是字符串 → 仍 invalid')
+  })
+
+  // ===== SS-04：date 必须按生产侧 _isValidReportDate 语义校验真实日期（反向漂移）=====
+  // 旧实现只看 typeof date === 'string'：'2026-13-45'（不存在的月份/日期）会被 --status 当正常日报
+  // 展示，而生产侧 _loadReportState 会判它损坏并跳过日报更新——同一份文件两处口径相反。
+  test('S11 report.state date 非法日期 → invalid，合法日期（含闰年）→ ok', () => {
+    const withDate = (date) => {
+      fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify({ date, runs: 1 }) + '\n')
+      return readStatus(tmp).report.status
+    }
+    assert.strictEqual(withDate('2026-13-45'), 'invalid', '月份 13/日期 45 必须判非法（生产侧同样拒绝）')
+    assert.strictEqual(withDate('2026-02-30'), 'invalid', '2 月 30 日必须判非法')
+    assert.strictEqual(withDate('2023-02-29'), 'invalid', '平年 2 月 29 日必须判非法（闰年判定不能只看月份表）')
+    assert.strictEqual(withDate('2024-02-29'), 'ok', '闰年 2 月 29 日合法（回归：不得把闰年一刀切判非法）')
+    assert.strictEqual(withDate('2026-9-8'), 'invalid', '非补零形态非法（生产侧正则要求 MM/DD 各两位）')
+    assert.strictEqual(withDate(''), 'ok', '空串合法（生产侧 _isValidReportDate 对 "" 返回 true）')
+    assert.strictEqual(withDate('2026-12-31'), 'ok', '合法日期应判 ok')
+  })
+
+  // ===== SS-05：pending 段必须与生产侧 _loadReportState 同口径（反向漂移）=====
+  // 生产侧对非法 pending（非对象 / 数组 / 计数非法）会 throw → 判「状态损坏」并跳过本次日报更新；
+  // 旧 validReport 完全不看 pending，于是同一份 report.state，生产判损坏、--status 显示「日报：正常」。
+  test('S17 report.state pending 非法 → invalid；合法/缺失 pending → ok', () => {
+    const statusOf = (state) => {
+      fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify(state) + '\n')
+      return readStatus(tmp).report.status
+    }
+    // 合法：缺失 pending（生产侧 _normalizeReportState 归一化为全 0）、空对象、部分计数
+    assert.strictEqual(statusOf({ date: '2026-09-08', runs: 1 }), 'ok', 'pending 缺失合法（生产侧归一化为全 0）')
+    assert.strictEqual(statusOf({ pending: {} }), 'ok', '空 pending 对象合法（未累计任何字段）')
+    assert.strictEqual(statusOf({ pending: { runs: 1, pushed: 2 } }), 'ok', 'pending 部分计数合法')
+    // 非法：形状与计数口径逐条对齐生产侧 throw 的分支
+    assert.strictEqual(statusOf({ pending: 5 }), 'invalid', 'pending 非对象必须 invalid（生产侧 throw）')
+    assert.strictEqual(statusOf({ pending: null }), 'invalid', 'pending=null 必须 invalid（typeof null === object，不能只看 typeof）')
+    assert.strictEqual(statusOf({ pending: [] }), 'invalid', 'pending 为数组必须 invalid（生产侧显式排除数组）')
+    assert.strictEqual(statusOf({ pending: { runs: -1 } }), 'invalid', 'pending 计数为负必须 invalid')
+    assert.strictEqual(statusOf({ pending: { total: 1.5 } }), 'invalid', 'pending 计数非整数必须 invalid')
+    assert.strictEqual(statusOf({ pending: { pushed: '2' } }), 'invalid', 'pending 计数非数字必须 invalid')
+    assert.strictEqual(statusOf({ pending: { filtered: Number.MAX_SAFE_INTEGER + 1 } }), 'invalid',
+      'pending 计数超出安全整数范围必须 invalid')
+    // 顶级计数合法性与 pending 校验互不干扰：合法 pending + 非法顶级计数仍须 invalid（既有口径不放松）
+    assert.strictEqual(statusOf({ total: -1, pending: { runs: 1 } }), 'invalid', '顶层计数非法仍须 invalid')
+  })
+
+  // ===== SS-01：摘要行时间戳必须保留并展示；摘要行之后的 ERROR 不得再渲染成「正常」=====
+  // 旧实现：时间戳在正则里是非捕获组（只作锚定），parseLastRun 的返回值没有任何时间字段；
+  // formatStatus 也不读它，于是「这一轮何时跑的」不可见，崩溃轮与正常轮显示完全一致。
+  test('S12 run.log 摘要行时间戳 → 捕获进 value.at 并在输出中展示', () => {
+    fs.writeFileSync(path.join(tmp, 'run.log'), '2026-09-08 10:00:00 total=42 dedup=5 filtered=7 truncated=0 pushed=28 failed=2 elapsed=3.4s\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.value.at, '2026-09-08 10:00:00', '时间戳必须被捕获（修前 value 无任何时间字段）')
+    assert.strictEqual(status.run.value.interrupted, false, '摘要行之后没有错误行时不得标记中断')
+    assert.strictEqual(status.run.value.total, 42, '计数解析不得因新增捕获组而错位')
+    assert.match(formatStatus(status), /最近一轮：正常 \| 时间 2026-09-08 10:00:00/, '输出必须展示这一轮的摘要时间戳')
+  })
+
+  test('S13 摘要行之后出现 ERROR → 不再渲染「正常」，标记上一轮未正常结束', () => {
+    fs.writeFileSync(path.join(tmp, 'run.log'), [
+      '2026-09-08 10:00:00 total=42 dedup=5 filtered=7 truncated=0 pushed=28 failed=2 elapsed=3.4s',
+      '2026-09-08 10:05:00 ERROR [v3.275.0] 运行异常 原因：HTTP 500'
+    ].join('\n') + '\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.status, 'ok', '自摘要行向前最近的一条完整摘要仍应解析成功')
+    assert.strictEqual(status.run.value.interrupted, true, '摘要行之后有 ERROR 行必须标记该轮中断（修前无此字段）')
+    const output = formatStatus(status)
+    assert.match(output, /最近一轮：⚠️ 上一轮未正常结束/, '崩溃轮必须与正常轮显示不同')
+    assert.doesNotMatch(output, /最近一轮：正常/, '中断轮不得渲染成「正常」')
+    assert.match(output, /时间 2026-09-08 10:00:00/, '中断轮仍要展示最近一条摘要的时间（陈旧程度可见）')
+  })
+
+  test('S14 普通 ALERT 行不参与中断判定；无时间戳的裸摘要行仍可解析', () => {
+    fs.writeFileSync(path.join(tmp, 'run.log'), [
+      'total=3 dedup=1 filtered=1 truncated=0 pushed=1 failed=0 elapsed=0.2s',
+      '2026-09-08 11:00:00 ALERT [v3.275.0] ⚠️ 磁盘剩余空间不足 原因：< 50MB'
+    ].join('\n') + '\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.status, 'ok', '裸 total= 摘要行（无时间戳）仍须可解析')
+    assert.strictEqual(status.run.value.at, '', '无时间戳时 at 为空串')
+    assert.strictEqual(status.run.value.interrupted, false, '普通 ALERT（低磁盘等）不得被当成中断')
+    assert.match(formatStatus(status), /最近一轮：正常 \| 时间 无时间戳/, '无时间戳时明示「无时间戳」而不是假装有')
+  })
+
+  // ===== SS-03：run.log / diagnostics 超过 1 MiB 时读尾部，而不是整体判 tooLarge =====
+  // 写入侧在拿不到日志锁时 fail-open（只追加不截尾），文件可真正超过 1 MiB；旧行为让这两个部件
+  // 在 --status 里整体显示「不可读（tooLarge）」——最近的记录其实唾手可得。
+  test('S15 run.log 超过 1 MiB → 读尾部并解析出最近一轮（修前 tooLarge）', () => {
+    const filler = '2026-09-08 09:00:00 [INFO] ' + 'x'.repeat(80) + '\n'
+    const body = filler.repeat(Math.ceil((1024 * 1024 + 2048) / filler.length))
+    fs.writeFileSync(path.join(tmp, 'run.log'), body + '2026-09-08 10:00:00 total=42 dedup=5 filtered=7 truncated=0 pushed=28 failed=2 elapsed=3.4s\n')
+    assert.ok(fs.statSync(path.join(tmp, 'run.log')).size > 1024 * 1024, '夹具必须真的超过 1 MiB（否则本用例失去意义）')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.status, 'ok', `超 1 MiB 的 run.log 必须读尾部解析（修前为 ${status.run.status}）`)
+    assert.strictEqual(status.run.value.total, 42, '尾部摘要行的计数必须解析正确')
+    assert.strictEqual(status.run.value.at, '2026-09-08 10:00:00', '尾部摘要行的时间戳同样要保留')
+  })
+
+  test('S16 filter-diagnostics.ndjson 超过 1 MiB → 读尾部并解析出最近汇总（修前 tooLarge）', () => {
+    const item = JSON.stringify({ type: 'item', id: 'x', pad: 'y'.repeat(80) }) + '\n'
+    const body = item.repeat(Math.ceil((1024 * 1024 + 2048) / item.length))
+    const summary = JSON.stringify({ type: 'run', at: '2026-09-08 10:00:00', total: 9, dedup: 2, filtered: 3, passed: 4, byReason: { title: 3 }, detailCount: 3 }) + '\n'
+    fs.writeFileSync(path.join(tmp, 'filter-diagnostics.ndjson'), body + summary)
+    assert.ok(fs.statSync(path.join(tmp, 'filter-diagnostics.ndjson')).size > 1024 * 1024, '夹具必须真的超过 1 MiB')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.diagnostics.status, 'ok', `超 1 MiB 的诊断文件必须读尾部解析（修前为 ${status.diagnostics.status}）`)
+    assert.strictEqual(status.diagnostics.value.total, 9, '尾部汇总的计数必须解析正确')
+    assert.deepStrictEqual(status.diagnostics.value.byReason, { title: 3 }, 'byReason 必须完整保留')
+  })
+
+  // ===== SS-02：channel-health 单条损坏不得整表 invalid（健康通道信息必须保留）=====
+  // 旧实现 validChannels 是 Object.values(...).every(...) 全表口径：一条坏记录即整表 invalid，
+  // formatStatus 于是走 describe → 只显示「不可读（invalid）」，所有健康通道一并消失。
+  test('S9 channel-health 单条损坏 → 整表仍 ok，健康通道照常展示且明示被忽略条数', () => {
+    fs.writeFileSync(path.join(tmp, 'channel-health.state'), JSON.stringify({
+      good: { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0 },
+      pushplus: { consecutiveFailures: 3, lastFailureAt: 1000, lastAlertAt: 0 },
+      bad: { consecutiveFailures: 'x', lastFailureAt: 0, lastAlertAt: 0 }
+    }) + '\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.channels.status, 'ok', '存在健康条目时不得因一条损坏判整表 invalid（修前为 invalid）')
+    const output = formatStatus(status)
+    assert.match(output, /good：连续失败 0 次/, '健康通道 good 必须照常展示（修前整行丢失）')
+    assert.match(output, /pushplus：连续失败 3 次/, '健康通道 pushplus 必须照常展示')
+    assert.doesNotMatch(output, /bad/, '损坏条目本身不得被当作健康记录展示')
+    assert.match(output, /另有 1 条记录损坏已忽略/, '被忽略的损坏条数必须明示，不得静默丢弃')
+    assert.doesNotMatch(output, /通道健康：不可读/, '有健康条目时不得整体报不可读')
+  })
+
+  test('S10 channel-health 全部损坏 → 整表 invalid；空表 → ok 且显示暂无记录', () => {
+    fs.writeFileSync(path.join(tmp, 'channel-health.state'), JSON.stringify({
+      only: { consecutiveFailures: 'x' }
+    }) + '\n')
+    assert.strictEqual(readStatus(tmp).channels.status, 'invalid', '有记录且无一合格时整表判 invalid（不假装「暂无记录」）')
+
+    fs.writeFileSync(path.join(tmp, 'channel-health.state'), '{}\n')
+    const empty = readStatus(tmp)
+    assert.strictEqual(empty.channels.status, 'ok', '空表仍是合法状态（保持旧行为）')
+    assert.match(formatStatus(empty), /通道健康：暂无记录/, '空表应显示暂无记录')
   })
 
   // ===== formatStatus：channels.value 为 null（status ok 但 value null）时降级 =====

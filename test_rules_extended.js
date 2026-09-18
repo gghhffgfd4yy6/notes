@@ -330,4 +330,43 @@ check('mockUtils.parseTime：合法日期返回毫秒时间戳', () => {
   assert.strictEqual(mockUtils.parseTime('2026-01-01T00:00:00Z'), Date.parse('2026-01-01T00:00:00Z'))
 })
 
+// ===== FILTER-01 / RULES-05：规则「实际编译生效」指纹 =====
+// 反例（改动前）：filterHash 只由配置字节驱动。同一份配置在 re2 缺失（compileUserRegex 恒返回 null，
+// 见 xbk_function_v3.js 的 `if (!RE2C) return null`）或规则被 ReDoS 守卫丢弃时，过滤面变宽但哈希不变，
+// 缓存里已打 _f 的条目永不重评。compileStateOf 是折进 filterHash 的那个维度，本条断言它对
+// 「同一配置 × 不同编译结果」必须产出**不同且稳定**的指纹。
+check('compileStateOf: 同一配置在 re2 缺失/规则编译失败时指纹不同（驱动 _f 失效）', () => {
+  const noRe2 = createRuleEngine({
+    Utils: mockUtils,
+    FILTER_FIELDS: ['keyword'],
+    compileUserRegex: () => null, // 真环境 RE2 缺失时 compileUserRegex 恒 null
+    isRe2Available: () => false
+  })
+  const withRe2 = createRuleEngine({
+    Utils: mockUtils,
+    FILTER_FIELDS: ['keyword'],
+    compileUserRegex: (src, flags) => new RegExp(src, flags),
+    isRe2Available: () => true
+  })
+  const cfg = { keyword: 'abc' } // 配置字节完全相同
+  const sNo = noRe2.compileStateOf(noRe2.compileRules(cfg))
+  const sYes = withRe2.compileStateOf(withRe2.compileRules(cfg))
+  assert.notStrictEqual(sNo, sYes, '同一配置在 re2 不可用时的编译生效指纹必须不同（否则 filterHash 不变、_f 永不失效）')
+  assert.ok(sNo.includes('re2=0') && sNo.includes('keyword=null'), `re2 缺失应记 re2=0 且字段未编译: ${sNo}`)
+  assert.ok(sYes.includes('re2=1') && sYes.includes('keyword=re'), `re2 可用应记 re2=1 且字段已编译: ${sYes}`)
+  // 稳定性：同一环境内必须逐字节一致，否则 App 每轮都清 _f、每轮全量重评
+  assert.strictEqual(sNo, noRe2.compileStateOf(noRe2.compileRules(cfg)), '同一环境内指纹必须稳定')
+  assert.strictEqual(sYes, withRe2.compileStateOf(withRe2.compileRules(cfg)), '同一环境内指纹必须稳定')
+  // 多行规则条数纳入指纹（规则被逐行丢弃时条数变化 → 指纹变化）
+  assert.ok(withRe2.compileStateOf(withRe2.compileRules({ keyword: 'cat###a\ncat###b' })).includes('keyword=multi:2'),
+    '多行规则条数应纳入指纹')
+  // ReDoS 守卫丢弃（hasNestedQuantifier）与正常编译必须可区分
+  const guarded = withRe2.compileStateOf(withRe2.compileRules({ keyword: '(a+)+' }))
+  assert.ok(guarded.includes('keyword=null'), `被 ReDoS 守卫丢弃的规则应记为未编译: ${guarded}`)
+  assert.notStrictEqual(guarded, sYes, '丢弃与生效的指纹必须可区分（守卫口径变化也能驱动 _f 失效）')
+  // 脏输入不得抛穿
+  assert.strictEqual(withRe2.compileStateOf(null), withRe2.compileStateOf(undefined), '空编译结果应返回同一退化指纹')
+  assert.ok(withRe2.compileStateOf(null).includes('keyword=null'), '空编译结果的字段一律记为未编译')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_rules_extended.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

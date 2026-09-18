@@ -13,6 +13,10 @@ function createApp ({
     try { return typeof crypto?.timingSafeEqual === 'function' && crypto.timingSafeEqual(actualBytes, expectedBytes) } catch (e) { return false }
   }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
+  // FX3：通道恢复告警的「送达认领」租约。Pusher.send 自带 10s 超时（xbk_pusher.js），60s 留 6 倍
+  // 余量；认领超租约即视为持有方已崩溃/被挂起，允许后续轮次接管重发（有界可恢复，不永久卡死）。
+  const CHANNEL_RECOVER_CLAIM_LEASE_MS = 60000
+  let channelRecoverClaimSeq = 0 // 同进程内单调序号，配合 pid/时刻/随机数保证令牌唯一
   // APP-05：所有「按天/按时刻」的呈现口径统一到硬编码 Asia/Shanghai——日志与台账时间戳
   // （_localStamp）、日报日界（_reportToday）、运行异常告警正文的时间、RE2 标记保留期的 cutoff。
   // 进程本地时区（如 CI runner 的 UTC）不参与其中：混用会让同一时刻的 run.log 行、日报日界与
@@ -92,13 +96,16 @@ function createApp ({
         const lockPath = logPath + '.lock'
         let lockFd = -1
         try {
-        // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠 mtime 超龄抢占
+        // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠「mtime 超龄
+        // 且持有进程已退出」抢占（APP-02：写入 pid:starttime 令牌供存活复核与 PID 复用判别）
           const LOCK_STALE_MS = 10000
           const lockDeadline = Date.now() + 3000
           for (;;) {
             try {
               lockFd = fs.openSync(lockPath, 'wx')
-              try { fs.writeSync(lockFd, `${process.pid}\n`) } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
+              try {
+                fs.writeSync(lockFd, `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`)
+              } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
               break
             } catch (e) {
               if (e.code !== 'EEXIST') break // 权限等异常：拿不到锁也继续（fail-open，只追加）
@@ -107,7 +114,10 @@ function createApp ({
                 const ls = fs.statSync(lockPath)
                 stale = Date.now() - ls.mtimeMs > LOCK_STALE_MS
               } catch (e2) { stale = true } // 锁文件刚被释放/删除：当作空位重试
-              if (stale) {
+              // APP-02：mtime 超龄只说明「可能陈旧」，还须持有进程已确认退出才可回收（与 RE2 锁同口径）。
+              // 进程仍存活（如被暂停 >10s）时绝不抢占——否则双进程同时进入临界区，截尾读改写会冲掉
+              // 并发追加的行；此时按拿不到锁处理（fail-open，仅追加不截尾）。
+              if (stale && !MessageStore._isTombstoneLockProcessAlive(lockPath)) {
                 try { fs.unlinkSync(lockPath) } catch (e2) { /* 抢占失败则下一轮重试 */ }
                 continue
               }
@@ -704,28 +714,129 @@ function createApp ({
       }
     },
 
+    /** 通道健康状态锁：O_EXCL 独占创建，陈旧判定与 run.log / RE2 锁同口径——mtime 超龄且持有
+     *  进程已确认退出（含损坏/无主锁）才回收，进程仍存活（如被暂停 >10s）绝不抢占（APP-02；
+     *  锁内写入 pid:starttime 令牌供存活复核与 PID 复用判别）。返回 lockFd，-1 表示本轮未取得。 */
+    _tryAcquireChannelHealthLock (lockPath) {
+      const writeToken = (fd) => {
+        try {
+          fs.writeSync(fd, `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`)
+        } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
+      }
+      try {
+        const fd = fs.openSync(lockPath, 'wx')
+        writeToken(fd)
+        return fd
+      } catch (e) {
+        if (!e || e.code !== 'EEXIST') return -1
+        let stale = false
+        try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 10000 } catch (e2) { stale = true }
+        if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return -1
+        try { fs.unlinkSync(lockPath) } catch (e2) { return -1 } // 竞争者已接管/无权限，按跳过处理
+        try {
+          const fd = fs.openSync(lockPath, 'wx')
+          writeToken(fd)
+          return fd
+        } catch (e2) { return -1 }
+      }
+    },
+
+    _releaseChannelHealthLock (lockPath, lockFd) {
+      if (typeof lockFd === 'number' && lockFd >= 0) {
+        try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
+        try { fs.unlinkSync(lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
+      }
+    },
+
+    /** FX3：生成一次恢复告警发送尝试的唯一认领令牌（pid+时刻+序号+随机，跨进程/跨轮次不撞）。
+     *  与 recoverAlertClaimAt 一起在健康状态锁内落盘，构成「本次尝试已认领这次恢复」的证据。
+     *  熵源选择：令牌只需要**唯一性**、不需要不可预测性（它不是凭据），故 crypto 可用时取
+     *  randomBytes；不可用时（crypto 是注入依赖，测试/异常环境可能为 null）回退用单调高分辨的
+     *  hrtime 而不是任何弱随机数——既保证唯一性，也不引入「弱随机数」这一静态告警形态。 */
+    _newChannelRecoverClaim () {
+      channelRecoverClaimSeq = (channelRecoverClaimSeq + 1) % 0xffffff
+      const rand = crypto && typeof crypto.randomBytes === 'function'
+        ? crypto.randomBytes(6).toString('hex')
+        : process.hrtime.bigint().toString(16)
+      return `${process.pid}-${Date.now()}-${channelRecoverClaimSeq}-${rand}`
+    },
+
+    /** FX3：认领是否仍在租约内。缺字段/类型异常一律视为「已失效」——宁可重发一次，也不因
+     *  状态损坏让恢复通知永久卡住（与 APP-02 锁的「无主锁可回收」同向）。 */
+    _isChannelRecoverClaimAlive (entry, now) {
+      if (!entry || typeof entry !== 'object') return false
+      const claim = entry.recoverAlertClaim
+      if (typeof claim !== 'string' || !claim) return false
+      const claimedAt = this._safeCounter(entry.recoverAlertClaimAt)
+      return claimedAt > 0 && now - claimedAt < CHANNEL_RECOVER_CLAIM_LEASE_MS
+    },
+
+    /** 恢复告警确认送达后清零该通道健康状态（重新加锁读改写；APP2-02）。加锁失败或状态不可读时
+     *  保持 pending 不动，下一轮仍会重发恢复告警。
+     *  FX3：仅当认领仍属于本次尝试（claim 匹配）才允许清零——迟到的成功不得清掉后继尝试已
+     *  重新认领的 pending，否则后继发送失败时该恢复通知会被永久吞掉。 */
+    _clearChannelRecoverPending (statePath, channel, claim) {
+      const lockPath = statePath + '.lock'
+      const lockFd = this._tryAcquireChannelHealthLock(lockPath)
+      if (lockFd < 0) return
+      try {
+        const stateResult = this._readSafeState(statePath)
+        if (stateResult.status !== 'ok') return
+        let state
+        try { state = JSON.parse(stateResult.text) } catch (e) { return }
+        if (!state || typeof state !== 'object' || Array.isArray(state)) return
+        const entry = state[channel]
+        if (!entry || typeof entry !== 'object' || entry.recoverAlertPending !== true) return
+        if (typeof claim === 'string' && claim && entry.recoverAlertClaim !== claim) return
+        state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: Date.now() }
+        this._writeState(statePath, state)
+      } catch (e) { /* 清零失败：保留 pending，下一轮重发 */ } finally {
+        this._releaseChannelHealthLock(lockPath, lockFd)
+      }
+    },
+
+    /** FX3：发送失败时在锁内释放本次认领（保留 pending 与失败计数）——下一轮无需等租约到期即可
+     *  重发，守住 APP2-02「不丢」。认领已被后继尝试接管（令牌不匹配）时不动作。 */
+    _releaseChannelRecoverClaim (statePath, channel, claim) {
+      const lockPath = statePath + '.lock'
+      const lockFd = this._tryAcquireChannelHealthLock(lockPath)
+      if (lockFd < 0) return
+      try {
+        const stateResult = this._readSafeState(statePath)
+        if (stateResult.status !== 'ok') return
+        let state
+        try { state = JSON.parse(stateResult.text) } catch (e) { return }
+        if (!state || typeof state !== 'object' || Array.isArray(state)) return
+        const entry = state[channel]
+        if (!entry || typeof entry !== 'object' || entry.recoverAlertPending !== true) return
+        if (entry.recoverAlertClaim !== claim) return
+        state[channel] = {
+          consecutiveFailures: this._safeCounter(entry.consecutiveFailures),
+          lastFailureAt: this._safeCounter(entry.lastFailureAt),
+          lastAlertAt: this._safeCounter(entry.lastAlertAt),
+          lastRecoveredAt: this._safeCounter(entry.lastRecoveredAt),
+          recoverAlertPending: true
+        }
+        this._writeState(statePath, state)
+      } catch (e) { /* 释放失败：租约到期后由后续轮次接管，仍不会永久卡死 */ } finally {
+        this._releaseChannelHealthLock(lockPath, lockFd)
+      }
+    },
+
     async _updateChannelHealth (outcome) {
       let lockFd = -1
       let lockPath = ''
+      let statePath = ''
+      const pendingAlerts = []
       try {
         if (!this._enabledFlag(Config.channelHealth)) return
-        const statePath = path.join(MessageStore.cacheDir, 'channel-health.state')
+        statePath = path.join(MessageStore.cacheDir, 'channel-health.state')
         lockPath = statePath + '.lock'
-        try {
-          lockFd = fs.openSync(lockPath, 'wx')
-        } catch (e) {
-          let stale = false
-          if (e && e.code === 'EEXIST') {
-            try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 10000 } catch (e2) { stale = true }
-          }
-          if (stale) {
-            try { fs.unlinkSync(lockPath); lockFd = fs.openSync(lockPath, 'wx') } catch (e2) { /* 竞争者已接管，按跳过处理 */ }
-          }
-          if (lockFd < 0) {
-          // 单实例仍可能因手工重复启动/重叠 cron 短暂重入；宁可本轮跳过健康观测，也不能覆盖另一轮状态。
-            console.warn(`通道健康状态正由另一轮更新，跳过本轮健康更新 ${statePath}`)
-            return
-          }
+        lockFd = this._tryAcquireChannelHealthLock(lockPath)
+        if (lockFd < 0) {
+        // 单实例仍可能因手工重复启动/重叠 cron 短暂重入；宁可本轮跳过健康观测，也不能覆盖另一轮状态。
+          console.warn(`通道健康状态正由另一轮更新，跳过本轮健康更新 ${statePath}`)
+          return
         }
         const stateResult = this._readSafeState(statePath)
         if (stateResult.status !== 'ok' && stateResult.status !== 'missing') {
@@ -754,41 +865,78 @@ function createApp ({
         const now = Date.now()
         const alerts = []
         for (const channel of succeeded) {
-          const entry = state[channel]
-          if (entry && this._safeCounter(entry.consecutiveFailures) >= threshold) {
-            alerts.push({ type: 'recovered', channel })
+          const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
+          const failures = this._safeCounter(entry.consecutiveFailures)
+          const recoverPending = entry.recoverAlertPending === true
+          if (recoverPending && this._isChannelRecoverClaimAlive(entry, now)) {
+            // FX3：另一轮已认领这次恢复告警且租约未过期（它的发送还在飞）——本轮不得重复入队，
+            // 且必须原样保留认领字段，否则后继轮次会当成「无主认领」重复发送。
+            state[channel] = {
+              consecutiveFailures: failures,
+              lastFailureAt: this._safeCounter(entry.lastFailureAt),
+              lastAlertAt: this._safeCounter(entry.lastAlertAt),
+              lastRecoveredAt: this._safeCounter(entry.lastRecoveredAt),
+              recoverAlertPending: true,
+              recoverAlertClaim: entry.recoverAlertClaim,
+              recoverAlertClaimAt: this._safeCounter(entry.recoverAlertClaimAt)
+            }
+          } else if (failures >= threshold || recoverPending) {
+            // APP2-02：恢复告警只能在「确认送达」后清零计数——此处先保留失败计数与
+            // recoverAlertPending（发送成功后再于告警循环里清零落盘）。原实现发送前即清零点外写盘，
+            // 恢复通知一旦发送失败就永久丢失（后续轮次因计数已清零不再触发恢复告警）。
+            // FX3：入队的同时在锁内原子认领（令牌+租约），堵住「保持 pending → 释放锁 → 锁外发送」
+            // 期间第二个重叠运行看到同一 pending 而各发一条的重复通知竞态；陈旧认领超租约后可接管。
+            state[channel] = {
+              consecutiveFailures: failures,
+              lastFailureAt: this._safeCounter(entry.lastFailureAt),
+              lastAlertAt: this._safeCounter(entry.lastAlertAt),
+              lastRecoveredAt: now,
+              recoverAlertPending: true,
+              recoverAlertClaim: this._newChannelRecoverClaim(),
+              recoverAlertClaimAt: now
+            }
+            alerts.push({ type: 'recovered', channel, claim: state[channel].recoverAlertClaim })
+          } else {
+            state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: now }
           }
-          state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: now }
         }
         for (const [channel, failure] of failed) {
           if (succeeded.has(channel)) continue
           const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
           const count = this._safeCounter(entry.consecutiveFailures) + 1
           const lastAlertAt = this._safeCounter(entry.lastAlertAt)
-          state[channel] = { consecutiveFailures: count, lastFailureAt: now, lastAlertAt }
-          if (count >= threshold && (!interval || now - lastAlertAt >= interval)) alerts.push({ type: 'failed', channel, count, failure })
+          // APP2-01：限频按「告警尝试」计时——告警通道本身不可用时发送必然失败，若只在发送成功后
+          // 回填 lastAlertAt，intervalMs（默认 1h）限频完全失效，每轮都重发。故在排入告警时即落盘。
+          const alertDue = count >= threshold && (!interval || now - lastAlertAt >= interval)
+          state[channel] = { consecutiveFailures: count, lastFailureAt: now, lastAlertAt: alertDue ? now : lastAlertAt }
+          if (alertDue) alerts.push({ type: 'failed', channel, count, failure })
         }
         if (!this._writeState(statePath, state)) return
-        for (const alert of alerts) {
-          try {
-            const text = alert.type === 'recovered' ? '✅ xbk-push 通道恢复' : '⚠️ xbk-push 通道异常'
-            const desp = alert.type === 'recovered'
-              ? `通道：${alert.channel}\n\n已恢复正常推送。`
-              : `通道：${alert.channel}\n\n连续失败：${alert.count} 次\n\n原因：${Utils.safeErrorText(alert.failure && alert.failure.message, '未知错误').slice(0, 300)}`
-            await Pusher.send(text, desp)
-            if (alert.type === 'failed' && state[alert.channel]) {
-              state[alert.channel].lastAlertAt = Date.now()
-              this._writeState(statePath, state)
-            }
-          } catch (e) { /* 健康告警失败不得影响主推送、缓存或下一次重试 */ }
-        }
+        for (const alert of alerts) pendingAlerts.push(alert)
       } catch (e) {
       // APP2-06：「仅作观测」不等于隐身——整体异常留一行 WARN，避免通道健康状态永久不更新却一切「正常」。
         try { this._writeRunLog(`${this._localStamp()} WARN 通道健康更新异常: ${Utils.safeErrorText(e, '未知错误').replace(/[\r\n]+/g, ' ')}\n`) } catch (logError) { /* 留痕失败静默 */ }
       } finally {
-        if (typeof lockFd === 'number' && lockFd >= 0) {
-          try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
-          try { fs.unlinkSync(lockPath) } catch (e) { /* 忽略 */ }
+        this._releaseChannelHealthLock(lockPath, lockFd)
+      }
+      // APP-02：告警发送（网络 await，可能长阻塞）必须在跨进程锁之外——否则发送期间其他轮次
+      // 全部被锁挡在门外并跳过本轮健康更新（原实现把 await Pusher.send 放在持锁临界区内）。
+      for (const alert of pendingAlerts) {
+        try {
+          const text = alert.type === 'recovered' ? '✅ xbk-push 通道恢复' : '⚠️ xbk-push 通道异常'
+          const desp = alert.type === 'recovered'
+            ? `通道：${alert.channel}\n\n已恢复正常推送。`
+            : `通道：${alert.channel}\n\n连续失败：${alert.count} 次\n\n原因：${Utils.safeErrorText(alert.failure && alert.failure.message, '未知错误').slice(0, 300)}`
+          await Pusher.send(text, desp)
+          // APP2-01：失败告警的 lastAlertAt 已在排入告警时落盘（按尝试计时），此处不再回填，
+          // 避免发送成功与否改变限频口径。
+          // APP2-02：恢复通知确认送达后才清零计数并落盘；发送失败走 catch，保留 pending 供下轮重发。
+          if (alert.type === 'recovered') this._clearChannelRecoverPending(statePath, alert.channel, alert.claim)
+        } catch (e) {
+          // 健康告警失败不得影响主推送、缓存或下一次重试。
+          // FX3：恢复通知发送失败须释放本次认领（保留 pending），否则下一轮会被自己的租约挡到
+          // 租约到期才重发——APP2-02「不丢」的即时重试语义会被破坏。
+          if (alert.type === 'recovered') this._releaseChannelRecoverClaim(statePath, alert.channel, alert.claim)
         }
       }
     },
@@ -969,8 +1117,12 @@ function createApp ({
         const cacheName = MessageStore.getFileName(Config.api.pushUrl)
         // v3.159：过滤规则哈希比对——规则变更时失效「过滤写入」缓存（改宽过滤后旧条目重新评估/推送，
         // 无需手动清缓存；「推送成功」缓存不受影响，防重复推送）
+        // FILTER-01 / RULES-05：哈希除配置字节外还折入「规则实际编译生效」维度
+        // （RuleEngine.compileStateOf(compiledRules)：re2 可用性 + 各字段是否真的编译出规则）。
+        // 否则同一份配置下 re2 缺失/规则被 ReDoS 守卫丢弃时哈希不变，已打 _f 的条目永不重评、
+        // 改宽后静默漏推。该维度随环境稳定，不会每轮清 _f。
         {
-          const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc)
+          const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc, RuleEngine.compileStateOf(compiledRules))
           const hashPath = path.join(MessageStore.cacheDir, 'filter.hash')
           let lastFile = ''
           let lastHash = ''
@@ -1290,51 +1442,61 @@ function createApp ({
         const contentMax = (() => { const v = Math.floor(Utils.num(Config.push.contentMax, 3000)); return v > 0 ? v : 3000 })()
 
         // 单条推送（两种模式共用）：成功返回 {ok:true} 并记录；失败警告且不写缓存(下次重试)
-        // APP-06（已知缺口，未收紧）：模板渲染段（safeObjectCopy/urlOf/Formatter.tuisong_replace/
-        // sanitizeSurrogates/truncateUtf16/链接保留）仍在下方 try 之外，渲染期异常会冒泡中止整轮
-        // （并行模式 Promise.all 直接 reject、saveBatch 不执行）。收紧需重排 pushOne 的 try 边界并
-        // 定义渲染异常的成功/失败归类与缓存写入时机，属推送结果判定语义，留待专门变更处理。
+        // APP-06：渲染段（safeObjectCopy/urlOf/Formatter.tuisong_replace/sanitizeSurrogates/
+        // truncateUtf16/链接保留 + dry-run preview）与发送段一样受 try 保护——渲染期异常按「单条
+        // 推送失败」处理（警告、不写缓存、下次重试），不再冒泡中止整轮：并行模式 Promise.all 会
+        // 整体 reject，saveBatch 根本不执行，本轮所有新数据都会漏写缓存。
         const pushOne = async (item, notifyModule) => {
-        // 推送内容截断：避免超长标题/内容被推送 API 拒绝（长度可配置，默认 100/3000）
-        // 用 UTF-16 安全截断（不切断 emoji 代理对）
-        // R9：title/content 非字符串（对象等脏数据）→ 空标题占位/空内容（避免 '[object Object]' 泄漏）
-          const pushItem = {
-            ...Utils.safeObjectCopy(item),
-            url: urlOf(item),
-            // v3.110：孤立代理清洗（encodeURIComponent 对孤立代理抛 URIError → 推送失败）
-            // R9/审查9-C 语义保留：非字符串或空串 title → (无标题) 占位；content 空串置空
-            title: (() => {
-              const value = readItemField(item, 'title')
-              return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' && value !== '' ? value : '(无标题)'), titleMax)
-            })(),
-            content: (() => {
-              const value = readItemField(item, 'content')
-              return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' ? value : ''), contentMax)
-            })()
-          }
-          // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
-          // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
-          const text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, pushItem), titleMax)
-          // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
-          // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
-          // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
-          const rawDesp = Formatter.tuisong_replace(contentTpl, pushItem)
-          const rawClean = Utils.sanitizeSurrogates(rawDesp)
-          let desp = Utils.truncateUtf16(rawClean, contentMax)
-          // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
-          const safePushUrl = Utils.safeUrl(pushItem.url)
-          if (rawClean.includes('原文链接') && !desp.includes('原文链接') && safePushUrl) {
-            const link = `原文链接：[${safePushUrl}](<${safePushUrl}>)`
-            // 链接本身超过 contentMax 时不保留（尊重截断配置）；否则内容截短补链接（仍 ≤ contentMax）
-            // v3.177：边界修正——link 接近 contentMax 时 contentMax-link-2 曾 ≤0，truncateUtf16 对非正
-            // max 返回原串 → desp 全量+链接显著超限（系统验证反证 #3）；改为「链接+分隔符完整容纳
-            // 才补」+ keep≥1 保证总长 ≤ contentMax（link+2 == contentMax 时 keep=0 会触发上述缺陷）
-            if (link.length + 2 < contentMax) {
-              const keep = contentMax - link.length - 2
-              desp = Utils.truncateUtf16(desp, keep) + '\n\n' + link
+          let text = ''
+          let desp = ''
+          try {
+            // 推送内容截断：避免超长标题/内容被推送 API 拒绝（长度可配置，默认 100/3000）
+            // 用 UTF-16 安全截断（不切断 emoji 代理对）
+            // R9：title/content 非字符串（对象等脏数据）→ 空标题占位/空内容（避免 '[object Object]' 泄漏）
+            const pushItem = {
+              ...Utils.safeObjectCopy(item),
+              url: urlOf(item),
+              // v3.110：孤立代理清洗（encodeURIComponent 对孤立代理抛 URIError → 推送失败）
+              // R9/审查9-C 语义保留：非字符串或空串 title → (无标题) 占位；content 空串置空
+              title: (() => {
+                const value = readItemField(item, 'title')
+                return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' && value !== '' ? value : '(无标题)'), titleMax)
+              })(),
+              content: (() => {
+                const value = readItemField(item, 'content')
+                return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' ? value : ''), contentMax)
+              })()
             }
+            // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
+            // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
+            text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, pushItem), titleMax)
+            // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
+            // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
+            // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
+            const rawDesp = Formatter.tuisong_replace(contentTpl, pushItem)
+            const rawClean = Utils.sanitizeSurrogates(rawDesp)
+            desp = Utils.truncateUtf16(rawClean, contentMax)
+            // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
+            const safePushUrl = Utils.safeUrl(pushItem.url)
+            if (rawClean.includes('原文链接') && !desp.includes('原文链接') && safePushUrl) {
+              const link = `原文链接：[${safePushUrl}](<${safePushUrl}>)`
+              // 链接本身超过 contentMax 时不保留（尊重截断配置）；否则内容截短补链接（仍 ≤ contentMax）
+              // v3.177：边界修正——link 接近 contentMax 时 contentMax-link-2 曾 ≤0，truncateUtf16 对非正
+              // max 返回原串 → desp 全量+链接显著超限（系统验证反证 #3）；改为「链接+分隔符完整容纳
+              // 才补」+ keep≥1 保证总长 ≤ contentMax（link+2 == contentMax 时 keep=0 会触发上述缺陷）
+              if (link.length + 2 < contentMax) {
+                const keep = contentMax - link.length - 2
+                desp = Utils.truncateUtf16(desp, keep) + '\n\n' + link
+              }
+            }
+            if (preview(text, desp)) return { item, ok: false, preview: true }
+          } catch (e) {
+            // 非 Error 兜底（R1）：与发送段同口径，内容渲染异常不得中止整轮推送
+            const failure = summarizeError(e)
+            failureInfos.push(failure)
+            console.log(`⚠️ 推送失败（内容渲染异常，不写入缓存，下次运行重试）: ${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】 ${failure.message || Utils.safeText(e)}`)
+            return { item, ok: false, failure }
           }
-          if (preview(text, desp)) return { item, ok: false, preview: true }
           try {
             const sent = await Pusher.send(text, desp, notifyModule)
             pushedKeys.add(keyOf(item))
@@ -1423,11 +1585,16 @@ function createApp ({
           }
           if (sent && Array.isArray(sent.failures)) channelFailures.push(...sent.failures)
           if (result.failure) {
-            // APP2-03：此 successfulChannels 分支当前不可达——result.failure 的唯一来源是
-            // summarizeError(e)（xbk_failure_policy.js），其 info 只透传 code/name/statusCode/
-            // providerCode/channel/message(+条件性 failureKind/failureReason/failures)，从不含
-            // successfulChannels；投递层也只在「全部通道失败」时才抛，此时该数组恒为空。
-            // 保留以便 summarizeError 未来透出该字段时自动生效；补齐需改 failure_policy（跨文件）。
+            // APP2-03：result.failure 的来源是 summarizeError(e)（xbk_failure_policy.js）。投递层
+            // 只在「全部通道失败」时抛错（xbk_sendNotify_slim.js:1573 `okCount === 0`），此时
+            // successfulChannels 恒为空数组——该分支不可达。
+            // 返工结论（R1a）：① 删除该分支写不出可证伪断言（删死代码无行为差异）；
+            // ② 唯一可证伪的出路是让 summarizeError 透出 successfulChannels，但那要改
+            //    xbk_failure_policy.js（不在本代理白名单）；③ 更要紧的是它**不该**透出：
+            //    channelSuccessful/成功缓存已由上方 `sent.successfulChannels` 覆盖，而在
+            //    `okCount === 0` 的抛错路径上该数组恒空，透出只会把「全部失败」记录成
+            //    「部分成功」并污染 _updateChannelHealth 的通道健康统计。
+            // 故保留死分支 + 契约注释，不按清单建议①改（理由见 .local/reports/fix-r1a-REPORT.md）。
             if (Array.isArray(result.failure.successfulChannels)) {
               for (const channel of result.failure.successfulChannels) channelSuccessful.add(channel)
             }
@@ -1442,8 +1609,21 @@ function createApp ({
           ? []
           : newMessages.filter(m => !truncatedKeys.has(keyOf(m)) && (!itemsKeys.has(keyOf(m)) || pushedKeys.has(keyOf(m))))
         const cacheStart = Date.now()
-        MessageStore.saveBatch(toCache, cacheName)
+        // APP-03：落盘结果必须可观测——saveBatch 的返回值（xbk_message_store.js 已随 B8 改为
+        // 返回 true/false）此前被丢弃，缓存落盘失败时摘要与退出码仍报成功，运维看不到「本轮
+        // 推送成功但成功记录没落盘」（下次运行会重推）。这里接住失败并写 run.log 告警；
+        // result.cacheSaved 同时进摘要（false 表示本轮缓存未落盘）。
+        // APP-03 返工：不得给 cacheSaved 预设初值——下方 try 的成功分支与 catch 分支都必然赋值
+        // （saveBatch 抛错走 catch → false），预设的 `= true` 是死存储（CodeQL js/useless-assignment-to-local
+        // 实测命中：The initial value of cacheSaved is unused, since it is always overwritten）。
+        // 去掉初值不改语义：两分支覆盖后读取点（下方告警与摘要）拿到的仍是真实落盘结果。
+        let cacheSaved
+        try { cacheSaved = MessageStore.saveBatch(toCache, cacheName) !== false } catch (e) { cacheSaved = false } // 契约：undefined 视为成功（兼容旧实现）
         cacheMs = Date.now() - cacheStart
+        if (!cacheSaved) {
+          this._writeRunLog(`${this._localStamp()} WARN 缓存落盘失败：本轮 ${toCache.length} 条记录未能写入 ${cacheName}，下次运行将对它们重新判重（可能重复推送）\n`)
+          console.warn(`⚠️ 缓存落盘失败：本轮 ${toCache.length} 条记录未写入缓存文件（下次运行会重新推送）`)
+        }
         checkpoint('cache-write-complete', `cached=${toCache.length} cacheMs=${cacheMs}`)
         await this._updateChannelHealth({ successfulChannels: [...channelSuccessful], failures: channelFailures })
 
@@ -1468,6 +1648,7 @@ function createApp ({
           ? (items.length > successCount ? `（dry-run 未推送 ${items.length - successCount} 条）` : '')
           : (successCount < items.length ? `（${items.length - successCount} 条失败，下次运行重试）` : '')
         console.log(`  推送:     ${successCount} 条${pushResultText}`)
+        if (!cacheSaved) console.log(`  缓存:     落盘失败（${toCache.length} 条未写入缓存，下次运行会重新推送）`)
         console.log(`  耗时:     ${elapsed}s`)
         if (process.env.XBK_PROFILE === '1' || detailedProfile) {
           const totalMs = Date.now() - runStart
@@ -1495,7 +1676,7 @@ function createApp ({
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
         // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
-        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}\n`)
+        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}\n`)
 
         // v3.125：运行日报（跨天发昨日汇总 + 当天累加；静默）
         const summary = {
@@ -1505,6 +1686,8 @@ function createApp ({
           truncated: truncatedCount, // v3.145：截断数（下次推送）
           pushed: successCount,
           failed: dryRun ? 0 : items.length - successCount,
+          // APP-03：缓存落盘可观测（false = 本轮成功记录未落盘，下次运行将重推）
+          cacheSaved,
           failures: failureInfos
         }
         if (!dryRun) await this._updateReport(summary)

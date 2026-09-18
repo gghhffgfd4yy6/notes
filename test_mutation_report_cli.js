@@ -203,4 +203,155 @@ function schemaReport (seg, mutants) {
   }
 }
 
+// 场景 8（F1）：某段报告「内容完全合法但文件时间远早于其它段」——这正是段 job 崩溃/被 6h 取消时
+// actions/cache 回填上一次运行产物的形态。旧实现只做名称/内容级校验 → 陈旧报告照发日报；
+// 现必须拒绝发布并指出陈旧段，且把闸门关掉（MUTATION_REPORT_MAX_SKEW_MS=0）后同一夹具应放行
+// ——后者证明拒绝确实来自本闸门，而不是别的校验顺手拦下。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-stale-age-'))
+  try {
+    const staleSeg = REQUIRED_SEGS[2]
+    const staleAt = new Date(Date.now() - 30 * 3600 * 1000) // 30 小时前：跨日缓存回填
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      const reportPath = path.join(segDir, 'mutation.json')
+      fs.writeFileSync(reportPath, JSON.stringify(schemaReport(seg, [mutantOf()])))
+      if (seg === staleSeg) fs.utimesSync(reportPath, staleAt, staleAt)
+    }
+
+    const r = runCli([tmp])
+    assert.notStrictEqual(r.code, 0, '含陈旧（缓存回填）报告的日报必须拒绝发布（exit 非 0）')
+    assert.ok(r.stderr.includes('疑似缓存回填'), `错误应指出根因是缓存回填，实际 stderr：${r.stderr}`)
+    assert.ok(r.stderr.includes(staleSeg), '错误应指出陈旧的段名，便于只重跑该段')
+    assert.ok(r.stderr.includes('30 小时'), `错误应给出时间偏差便于判断，实际 stderr：${r.stderr}`)
+    assert.ok(!r.stdout.includes('🧬 变异测试日报'), '拒绝发布时不得输出日报正文')
+
+    // 同一夹具 + 关闭闸门 → 必须放行：排除「其它校验碰巧拦下」的假阳性解释
+    const rOff = runCli([tmp], { env: { ...process.env, MUTATION_REPORT_MAX_SKEW_MS: '0' } })
+    assert.strictEqual(rOff.code, 0, `关闭新鲜度闸门后同一夹具应放行，stderr：${rOff.stderr}`)
+    assert.ok(rOff.stdout.includes('🧬 变异测试日报'), '闸门关闭时应正常输出日报正文')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 场景 9（F1 返工 · 同族反例①）：**全体回填**——所有段的报告都来自上一次运行（互差≈0、26h 前）。
+// 打回现场：旧闸门只比较「本批最新的那一份」，互差为 0 时恒放行 → 回填的旧报告被当成今日日报发布。
+// 现必须按 wall-clock 年龄拒绝；同一夹具把闸门关掉（MUTATION_REPORT_MAX_SKEW_MS=0）后必须放行，
+// 证明拒绝确实来自本闸门。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-allbackfill-'))
+  try {
+    const staleAt = new Date(Date.now() - 26 * 3600 * 1000)
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      const reportPath = path.join(segDir, 'mutation.json')
+      fs.writeFileSync(reportPath, JSON.stringify(schemaReport(seg, [mutantOf()])))
+      fs.utimesSync(reportPath, staleAt, staleAt) // 全体同刻：跨段偏斜为 0
+    }
+    const r = runCli([tmp])
+    assert.notStrictEqual(r.code, 0, '全体回填的日报必须拒绝发布（exit 非 0）')
+    assert.ok(r.stderr.includes('疑似缓存回填'), `错误应指出根因是缓存回填，实际 stderr：${r.stderr}`)
+    assert.ok(r.stderr.includes('全体陈旧'), `错误应点名「全体陈旧」这一形态，实际 stderr：${r.stderr}`)
+    assert.ok(r.stderr.includes(REQUIRED_SEGS[0]) && r.stderr.includes('26 小时'),
+      `错误应逐段给出距今小时数，实际 stderr：${r.stderr}`)
+    assert.ok(!r.stdout.includes('🧬 变异测试日报'), '拒绝发布时不得输出日报正文')
+
+    const rOff = runCli([tmp], { env: { ...process.env, MUTATION_REPORT_MAX_SKEW_MS: '0' } })
+    assert.strictEqual(rOff.code, 0, `关闭闸门后同一夹具应放行（排除别处顺手拦下），stderr：${rOff.stderr}`)
+    assert.ok(rOff.stdout.includes('🧬 变异测试日报'), '闸门关闭时应正常输出日报正文')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 场景 10（F1 返工 · 同族反例②）：**跨轮 <12h 的同日回填**——全部段都来自同一天的上一次运行
+// （互差≈0、11h 前）。年龄层看不见（11h < 12h 阈值），只有「本轮运行起点」层能拦下：CI 由
+// mutation.yml 注入 MUTATION_RUN_STARTED_AT=github.run_started_at。不注入时必须放行（本地手工运行
+// 日报不得误红）——两条一起构成「该层真的在起作用」的证据。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-sameday-'))
+  try {
+    const staleAt = new Date(Date.now() - 11 * 3600 * 1000)
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      const reportPath = path.join(segDir, 'mutation.json')
+      fs.writeFileSync(reportPath, JSON.stringify(schemaReport(seg, [mutantOf()])))
+      fs.utimesSync(reportPath, staleAt, staleAt)
+    }
+    const noRunStart = runCli([tmp])
+    assert.strictEqual(noRunStart.code, 0,
+      `未注入本轮起点时 11h 的全体报告在阈值内，必须放行（否则本地手工运行日报会误红），stderr：${noRunStart.stderr}`)
+
+    const r = runCli([tmp], { env: { ...process.env, MUTATION_RUN_STARTED_AT: new Date().toISOString() } })
+    assert.notStrictEqual(r.code, 0, '注入本轮运行起点后，同日跨轮回填必须拒绝发布')
+    assert.ok(r.stderr.includes('早于本轮运行起点'), `错误应点名「早于本轮运行起点」，实际 stderr：${r.stderr}`)
+    assert.ok(r.stderr.includes('11 小时'), `错误应给出折算小时数，实际 stderr：${r.stderr}`)
+    assert.ok(!r.stdout.includes('🧬 变异测试日报'), '拒绝发布时不得输出日报正文')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 场景 11（F1 返工 · 接线）：report job 必须把本轮运行起点喂给闸门——否则第三层在 CI 里永不生效
+// （本机无法执行 Actions，只能对 workflow 文本做结构断言）。
+{
+  const yml = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'mutation.yml'), 'utf8')
+  assert.ok(/MUTATION_RUN_STARTED_AT:\s*\$\{\{\s*github\.run_started_at\s*\}\}/.test(yml),
+    'mutation.yml 的汇总步骤必须注入 MUTATION_RUN_STARTED_AT: ' + '${' + '{ github.run_started_at }}')
+}
+
+// 场景 12（F1 返工 · workflow 兜底层）：清理缓存回填的旧报告是 mtime 不可靠时**唯一不依赖文件时间**
+// 的防线（崩溃段没有 mutation.json → validateSegments 直接拒绝）。V4 打回的两个洞：
+//   ① 没有 `if: always()`：位于它之前、可能失败的步骤（npm ci / 下载+验证 re2）一旦失败，清理被跳过，
+//      而「上传变异报告」是 `if: always()` → 回填报告仍被上传。必须补 `if: always()` **并前置到
+//      缓存恢复之后**（两层才真正互补）；
+//   ② `rm -rf reports/mutation reports/mutation.html` 的第二个路径是死参数（stryker 默认
+//      reports/mutation/mutation.html，schema:754/766）→ 精简为只删目录。
+{
+  const yml = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'mutation.yml'), 'utf8')
+  const all = yml.split('\n')
+  // 只在 matrix job（`  mutation:` … 下一个顶层 job）里定位步骤：prepare-re2 也有「安装依赖」等同名步骤，
+  // 全文 findIndex 会命中上一个 job。
+  const jobStart = all.findIndex(l => /^ {2}mutation:\s*$/.test(l))
+  let jobEnd = all.length
+  for (let i = jobStart + 1; i < all.length; i++) {
+    if (/^ {2}\S/.test(all[i])) { jobEnd = i; break }
+  }
+  assert.ok(jobStart >= 0 && jobEnd > jobStart, 'mutation.yml 必须能定位 matrix job（  mutation: … 下一个顶层 job）')
+  const lines = all.slice(jobStart, jobEnd)
+  const stepStart = (name) => lines.findIndex(l => l.trim() === `- name: ${name}`)
+  const stepBlock = (name) => {
+    const start = stepStart(name)
+    assert.ok(start >= 0, `mutation.yml 必须存在步骤「${name}」`)
+    let end = lines.length
+    for (let i = start + 1; i < lines.length; i++) {
+      const t = lines[i].trim()
+      if (t.startsWith('- uses:') || t.startsWith('- name:') || t.startsWith('- id:')) { end = i; break }
+    }
+    return { text: lines.slice(start, end).join('\n'), start }
+  }
+  const cleanup = stepBlock('清理缓存回填的旧报告')
+  const restore = stepStart('恢复增量缓存')
+  const install = stepStart('安装依赖')
+  const stryker = stepStart('变异测试（' + '${' + '{ matrix.name }}）')
+  assert.ok(restore >= 0 && install >= 0 && stryker >= 0,
+    '矩阵 job 的步骤名必须可定位（恢复增量缓存 / 安装依赖 / 变异测试）')
+  // S8786（超线性回溯）：`^\s*if: always\(\)\s*$/m` 在 m 模式下 \s 可跨行，首尾两个空量词会对
+  // 同一串反复重扫，被静态分析判为 super-linear；改为「逐行 trim 后整行相等」的线性扫描，
+  // 语义等价——真实 yml 里该断言要的就是 if: always() 独占一行（允许缩进与行尾空白）。
+  assert.ok(cleanup.text.split('\n').some(line => line.trim() === 'if: always()'),
+    'F1 兜底：清理步骤必须带 if: always()（其前序步骤失败时不得被跳过，否则回填报告仍会被 if: always() 的上传步骤带上）')
+  assert.ok(cleanup.start > restore, 'F1 兜底：清理步骤必须前置在「恢复增量缓存」之后（否则缓存里的旧报告先被恢复、没人清）')
+  assert.ok(cleanup.start < install, 'F1 兜底：清理步骤必须在「安装依赖」等可能失败的步骤之前')
+  assert.ok(cleanup.start < stryker, 'F1 兜底：清理步骤必须在 stryker 之前（否则清掉的是本次产出）')
+  assert.ok(/run:\s*rm -rf reports\/mutation\s*$/m.test(cleanup.text),
+    `F1 兜底：清理命令必须恰为 rm -rf reports/mutation，实际：${JSON.stringify(cleanup.text)}`)
+  assert.ok(!cleanup.text.includes('reports/mutation.html'),
+    'reports/mutation.html 是死参数（stryker 实际默认 reports/mutation/mutation.html），必须精简掉')
+}
+
 console.log('test_mutation_report_cli OK')

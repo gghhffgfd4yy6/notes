@@ -385,11 +385,12 @@ function createUtils (options = {}) {
     // 会把中间标签吞掉并遗留危险文本（子代理审查发现：`<a href="javascript:x><b><a href="javascript:y>`
     // 输出 `<a href=""javascript:y>` 残留 javascript）。含 `<` 的"成对"实为未闭合，
     // 由下方 _cleanUnclosedUrlAttrs 线性处理（值内 `<` 是标签边界，合法 URL 值不含裸 `<`）。
-    html = html.replace(/\b(href|src)\s*=\s*(["'])([^<]*?)\2/gi, (_, name, quote, value) => cleanAttr(name, quote, value))
-    // P1-04（RE2 回落，已知取舍）：本行与 _cleanNavAttrs / _cleanSrcsetAttrs / _cleanStyleAttrs 的
-    // 成对引号正则都用反向引用（\1/\2），Google RE2 不支持该语法 → safeRe（xbk_function_v3.js:27）
-    // 必然 catch 并静默回落 V8 RegExp，这几条模式不享有 RE2 的线性时间防护。
-    // 未就地改写为无反向引用形态：等价性需逐条验证，且会改动清洗链语义（见工单 defer）。
+    // P1-04：反向引用是 Google RE2 不支持的语法，含它的模式会被 safeRe 静默回落 V8 RegExp，
+    // 清洗链就失去 RE2 的线性时间防护（本行原本还是原生字面量，根本不经过 RE2）。
+    // 改写为**无反向引用**的等价形态：把 `(["'])…\2` 拆成「双引号支 | 单引号支」——
+    // 同一位置只可能由其中一种引号开启，语言完全等价（同一个引号不可能既是开启又是闭合）。
+    html = html.replace(safeRe(String.raw`\b(href|src)\s*=\s*"([^<]*?)"|\b(href|src)\s*=\s*'([^<]*?)'`, 'gi'),
+      (_match, dName, dValue, sName, sValue) => cleanAttr(dName || sName, dName ? '"' : "'", dName ? dValue : sValue))
     html = html.replace(/\b(href|src)\s*=\s*([^\s"'<>`]+)/gi, (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
     // v3.251 P0(XSS)：未闭合引号属性绕过——`<a href="javascript:alert(1)` 无闭合引号时
     // 上面两个正则均不匹配（成对引号/无引号值），危险协议保留并被执行。这里单独处理
@@ -464,32 +465,141 @@ function createUtils (options = {}) {
   // on* 字样会被 _stripEventAttrs 误删并吞掉闭合引号，产出畸形 HTML（评审给出的真实反例）。
   // 改为一次线性正扫预计算标签区间，之后按位置指针推进查询：尊重引号（引号内 > 不结束标签），
   // 未闭合标签延伸到下一个 < 或串尾，与 _isInHtmlTag 同语义，任意长度标签都能正确判定。
+  //
+  // P1-01：标签区间只能从**真正的标签起始**开始。HTML5 数据态下 `<` 后紧跟非标签名字符
+  // （空白、数字、`=` 等）时它只是普通文本（`1 < 2 name="…"`、`价格 <100 元 name="…"`）；
+  // 旧实现把任意 `<` 当标签起始，未配对的 `<` 让区间一路延伸到串尾/下一个 `<`，把后方纯文本的
+  // name="…" 判成「标签内属性」并整段占位，段内真实的 <img onerror> 随之绕过事件清洗直出网。
+  //
+  // 返回 valueQuotes：正扫过程中处于「引号外」状态所遇到的各引号位置，即**真正开启一个属性值**
+  // 的引号。_protectAttrPairs 依赖它区分「属性值开启引号」与「未加引号值里的杂散引号」——
+  // 后者会把回扫出的伪属性对误判成可保护段，从而把后续真事件属性的属性名藏进占位符（P2-01）。
+  //
+  // P1-01 续（审查 REV-P2 发现 A）：标签起始集合 [A-Za-z/!?] 太宽。HTML5 词法下 `</` 后跟
+  // 字母才是结束标签（Markup declaration open / end tag open），`<!`、`<?` 只可能是标记声明或
+  // 伪注释，三者都**不是**「属性在其中的普通标签」：它们各自以自己的规则消费到下一个 `>` 或不消费，
+  // 且其中的引号**不开启任何属性值**。旧实现把它们一律按普通起始标签跑属性状态机，于是
+  // `</x='><img src=x onerror=alert(1)>'` 里伪注释段内的 `'` 被记进 valueQuotes ⇒ 后续
+  // `_protectAttrPairs` 回扫出 `x='><img src=x onerror=alert(1)>'` 这个伪属性对，因
+  // quoteOpensValue=true 而整段占位 ⇒ 段内真实 <img> 的 onerror 未被 _stripEventAttrs 清洗、
+  // 原样出网（输出与输入逐字节相同）。四条载荷（`</x=`、`</ x=`、`<! x=`、`<? x=`）同源。
+  //
+  // 修复 = 把状态机补全到 HTML5 的三种「非普通标签起始」：标签起始（end tag open，`</`+字母
+  // 走 tagName）、端标签（`</`+非字母按 bogus comment 处理）、伪注释（`<!`/`<?` 非
+  // `<!--`、`<!DOCTYPE`、`<![CDATA[` → bogus comment 吃到下一个 `>`）。伪注释/端标签一律
+  // **不记 valueQuotes**，因此段内引号不再能伪造可保护属性对；同时它们已经走到 `>`，
+  // 区间也照旧覆盖该前缀（与旧实现一致，不影响 _protectAttrPairs 的 inTag 判定）。
   _htmlTagSpans (html) {
     const spans = []
+    const valueQuotes = new Set()
     const n = html.length
+    // 大小写不敏感前缀比较（<!DOCTYPE 任意大小写，HTML5 同义）
+    const startsWithCI = (html, pos, word) => {
+      if (pos + word.length > html.length) return false
+      for (let k = 0; k < word.length; k++) {
+        const a = html.charCodeAt(pos + k) | 0x20
+        if (a !== word.charCodeAt(k)) return false
+      }
+      return true
+    }
     let i = 0
     while (i < n) {
       if (html[i] !== '<') { i++; continue }
+      // 标签起始判定（HTML5 数据态）：'<' 后须为 ASCII 字母（开始标签）或 '/'（结束标签）；
+      // '!'、'?'、空白、数字、'=' 等一律只是文本/标记声明，不进属性状态机、不记 valueQuotes。
+      const next = html[i + 1] || ''
+      if (!/[A-Za-z/]/.test(next)) { i++; continue }
+      let state
+      if (next === '/') {
+        // 结束标签：'</' + ASCII 字母 → 标签名态；'</' + 其它 → HTML5 bogus comment（吃到 '>'）
+        if (/[A-Za-z]/.test(html[i + 2] || '')) { state = 'tagName'; i += 2 } else { state = 'bogusComment'; i += 2 }
+      } else if (next === '!') {
+        // 标记声明起始：只有 <!--、<!DOCTYPE、<![CDATA[ 是合法声明；其余 → HTML5 bogus comment
+        state = (html.startsWith('<!--', i) || startsWithCI(html, i, '<!doctype') || html.startsWith('<![CDATA[', i))
+          ? 'markupDeclaration'
+          : 'bogusComment'
+        i += 2
+      } else {
+        state = 'tagName'
+        i++
+      }
       const start = i
-      i++
-      let quote = ''
+      // 简化状态机（只跟踪属性边界与引号状态，不解析属性名内容）：
+      //   tagName → beforeAttr → attrName → afterAttrName → beforeValue → valueDQ/valueSQ/valueUQ → afterValue
+      //   markupDeclaration / bogusComment（无属性、无引号状态）
+      // 关键规则（均对照 HTML5 规范）：
+      //   · tagName：只有空白 / '/' 结束标签名；引号、'='、'<' 都是标签名字符；
+      //   · beforeAttr：空白/'/'保持；其余（含引号、'='）开启新属性名；
+      //   · attrName：空白→afterAttrName，'/'→beforeAttr，'='→beforeValue，其余（含引号/'<'）都是名字字符；
+      //   · afterAttrName：'='→beforeValue；其余非空白 → 重消费开启新属性名；
+      //   · beforeValue：跳过空白后，引号才是**真正的属性值开启引号**（记入 valueQuotes）；
+      //     非引号字符 → 未加引号值；
+      //   · valueUQ：空白结束值；'>' 结束标签；其余（含 '<'、'"'、'\''、'='）都是值的普通字符；
+      //   · markupDeclaration / bogusComment：不解析属性，只在 '>' 处结束（与 HTML5 一致）。
       while (i < n) {
         const ch = html[i]
-        if (quote) {
-          if (ch === quote) quote = ''
-        } else if (ch === '"' || ch === "'") {
-          quote = ch
-        } else if (ch === '>') {
+        if (state === 'bogusComment' || state === 'markupDeclaration') {
           i++
-          break
-        } else if (ch === '<') {
-          break
+          if (ch === '>') break
+          continue
         }
+        if (state === 'valueDQ') {
+          if (ch === '"') state = 'afterValue'
+          i++
+          continue
+        }
+        if (state === 'valueSQ') {
+          if (ch === "'") state = 'afterValue'
+          i++
+          continue
+        }
+        if (state === 'valueUQ') {
+          if (ch === '>') { i++; break }
+          if (/\s/.test(ch)) state = 'beforeAttr'
+          i++
+          continue
+        }
+        if (ch === '>') { i++; break }
+        if (state === 'tagName') {
+          if (/\s/.test(ch) || ch === '/') state = 'beforeAttr'
+          i++
+          continue
+        }
+        if (state === 'beforeAttr') {
+          if (/\s/.test(ch) || ch === '/') { i++; continue }
+          state = 'attrName'
+          i++
+          continue
+        }
+        if (state === 'attrName') {
+          if (/\s/.test(ch)) state = 'afterAttrName'
+          else if (ch === '/') state = 'beforeAttr'
+          else if (ch === '=') state = 'beforeValue'
+          i++
+          continue
+        }
+        if (state === 'afterAttrName' || state === 'afterValue') {
+          if (/\s/.test(ch)) { i++; continue }
+          if (ch === '/') { state = 'beforeAttr'; i++; continue }
+          if (ch === '=' && state === 'afterAttrName') { state = 'beforeValue'; i++; continue }
+          state = 'attrName'
+          i++
+          continue
+        }
+        // state === 'beforeValue'
+        if (/\s/.test(ch)) { i++; continue }
+        if (ch === '"' || ch === "'") {
+          valueQuotes.add(i)
+          state = ch === '"' ? 'valueDQ' : 'valueSQ'
+          i++
+          continue
+        }
+        state = 'valueUQ'
         i++
       }
       spans.push([start, i])
     }
-    return spans
+    return { spans, valueQuotes }
   },
 
   /** CSS 转义全量解码：十六进制（\\XXXXXX）、\\uXXXX 兼容形态、行延续（\\换行）与恒等转义
@@ -579,7 +689,7 @@ function createUtils (options = {}) {
   _protectAttrPairs (html) {
     const attrStore = []
     const attrValueRe = safeRe(String.raw`=\s*(["'])`, 'gi')
-    const tagSpans = this._htmlTagSpans(html)
+    const { spans: tagSpans, valueQuotes } = this._htmlTagSpans(html)
     let spanIdx = 0
     let attrOut = ''
     let attrPos = 0
@@ -607,7 +717,14 @@ function createUtils (options = {}) {
       // 存活的 on* 一并占位，使 _stripEventAttrs 失效。非法形态走与 on* 相同的原样保留分支
       // （下方 else），照旧推进 attrPos/lastIndex，避免死循环。
       const atBoundary = seg.segStart === 0 || /[\s/<>"']/.test(html[seg.segStart - 1])
-      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name) && atBoundary && inTag) {
+      // P2-01（安全）：整段占位的前提是「该引号**真的开启了本属性值**」。反例：
+      // `<img foo=a"b=" onerror="alert(1)">` 里 foo 的未加引号值 `a"b="` 含一个杂散引号，
+      // 回扫会得到一个以它作「值引号」的伪属性对 `b=" onerror="`——该段的闭合引号其实是
+      // onerror 属性值的开启引号，整段占位后 onerror 的属性名被藏进占位符，_stripEventAttrs
+      // 匹配不到，事件处理器原样出网。valueQuotes 由正扫记录「引号外遇到的引号」，
+      // 杂散引号（处于引号状态内）不在其中；不在其中即原样保留，交给 _stripEventAttrs 清洗。
+      const quoteOpensValue = valueQuotes.has(valueStart - 1)
+      if (seg.name !== '' && !/^on[a-z]/i.test(seg.name) && atBoundary && inTag && quoteOpensValue) {
         attrStore.push(segText)
         attrOut += html.slice(attrPos, seg.segStart) + '\u0001' + (attrStore.length - 1) + '\u0001'
       } else {
@@ -657,10 +774,17 @@ function createUtils (options = {}) {
 
   /** 覆盖 href/src 之外的可导航/可加载属性（xlink:href、formaction、poster 等）清洗。 */
   _cleanNavAttrs (html) {
+    // P1-04：成对引号支拆成「双引号 | 单引号」两支，去掉 RE2 不支持的反向引用 \2（语义等价）。
+    const NAV = String.raw`xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc`
     return html
-      .replace(safeRe(String.raw`\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*(["'])([\s\S]*?)\2`, 'gi'),
-        (_, name, quote, value) => this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`)
-      .replace(safeRe(String.raw`\b(xlink:href|formaction|action|poster|cite|background|dynsrc|lowsrc)\s*=\s*([^\s"'<>\`]+)`, 'gi'),
+      .replace(safeRe(String.raw`\b(${NAV})\s*=\s*"([\s\S]*?)"|\b(${NAV})\s*=\s*'([\s\S]*?)'`, 'gi'),
+        (_match, dName, dValue, sName, sValue) => {
+          const name = dName || sName
+          const quote = dName ? '"' : "'"
+          const value = dName ? dValue : sValue
+          return this.isDangerousUrl(value) ? `${name}=${quote}${quote}` : `${name}=${quote}${value}${quote}`
+        })
+      .replace(safeRe(String.raw`\b(${NAV})\s*=\s*([^\s"'<>\`]+)`, 'gi'),
         (_, name, value) => this.isDangerousUrl(value) ? `${name}=""` : `${name}=${value}`)
   },
 
@@ -668,7 +792,10 @@ function createUtils (options = {}) {
   _cleanSrcsetAttrs (html) {
     const compact = (value) => this.decodeHtmlEntities(value).replace(safeRe(String.raw`[\u0000-\u0020]+`, 'g'), '').toLowerCase()
     return html
-      .replace(safeRe('\\bsrcset\\s*=\\s*(["\'])([\\s\\S]*?)\\1', 'gi'), (_, quote, value) => {
+      // P1-04：成对引号支拆成「双引号 | 单引号」两支，去掉 RE2 不支持的反向引用 \1（语义等价）。
+      .replace(safeRe(String.raw`\bsrcset\s*=\s*"([\s\S]*?)"|\bsrcset\s*=\s*'([\s\S]*?)'`, 'gi'), (_match, dValue, sValue) => {
+        const quote = dValue !== undefined ? '"' : "'"
+        const value = dValue !== undefined ? dValue : sValue
         const v = compact(value)
         return /(?:^|[,])(?:javascript|vbscript|data):/.test(v) ? `srcset=${quote}${quote}` : `srcset=${quote}${value}${quote}`
       })
@@ -689,7 +816,12 @@ function createUtils (options = {}) {
       return /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:/.test(v)
     }
     return html
-      .replace(safeRe(String.raw`\bstyle\s*=\s*(["'])([\s\S]*?)\1`, 'gi'), (_, quote, value) => unsafeStyle(value) ? `style=${quote}${quote}` : `style=${quote}${value}${quote}`)
+      // P1-04：成对引号支拆成「双引号 | 单引号」两支，去掉 RE2 不支持的反向引用 \1（语义等价）。
+      .replace(safeRe(String.raw`\bstyle\s*=\s*"([\s\S]*?)"|\bstyle\s*=\s*'([\s\S]*?)'`, 'gi'), (_match, dValue, sValue) => {
+        const quote = dValue !== undefined ? '"' : "'"
+        const value = dValue !== undefined ? dValue : sValue
+        return unsafeStyle(value) ? `style=${quote}${quote}` : `style=${quote}${value}${quote}`
+      })
       .replace(safeRe(String.raw`\bstyle\s*=\s*([^\s"'<>\x60]+)`, 'gi'), (_, value) => unsafeStyle(value) ? 'style=""' : `style=${value}`)
   },
 
@@ -773,10 +905,32 @@ function createUtils (options = {}) {
   },
 
   // 清洗孤立代理（v3.110 fuzz 发现）：encodeURIComponent 对孤立代理抛 URIError → 推送失败。
-  // 孤立高/低代理替换为 U+FFFD（完整代理对保留）；脏数据/截断 emoji 的真实防御
+  // 孤立高/低代理替换为 U+FFFD（完整代理对保留）；脏数据/截断 emoji 的真实防御。
+  //
+  // P1-04（同族）：原实现把 `[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]`
+  // 交给 safeRe——含 lookahead `(?!` 与 lookbehind `(?<!`，两者都是 Google RE2 不支持的构造，
+  // 真 RE2 会编译失败并被 safeRe 静默 catch 回落 V8 RegExp（清洗链失去线性时间防护）。而本方法在
+  // 生产热路径上（safeText / xbk_app 每条推送标题与正文都过），回落窗口最大。
+  // 改为一次线性扫描：语义与旧正则逐字节等价（完整代理对整体保留，孤立高/低代理各替换为 U+FFFD）。
   sanitizeSurrogates (s) {
     try { s = String(s === undefined || s === null ? '' : s) } catch (e) { return '' }
-    return s.replace(safeRe('[\\uD800-\\uDBFF](?![\\uDC00-\\uDFFF])|(?<![\\uD800-\\uDBFF])[\\uDC00-\\uDFFF]', 'g'), '\uFFFD')
+    const HI_LO = 0xD800 // 高代理区起点（SURROGATE_LO）
+    const HI_HI = 0xDBFF // 高代理区终点
+    const LO_LO = 0xDC00 // 低代理区起点
+    const LO_HI = 0xDFFF // 低代理区终点（SURROGATE_HI）
+    let out = ''
+    let changed = false
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i)
+      if (c >= HI_LO && c <= HI_HI) {
+        const next = s.charCodeAt(i + 1)
+        if (next >= LO_LO && next <= LO_HI) { out += s[i] + s[i + 1]; i++; continue } // 完整代理对保留
+        out += '\uFFFD'; changed = true; continue // 孤立高代理
+      }
+      if (c >= LO_LO && c <= LO_HI) { out += '\uFFFD'; changed = true; continue } // 孤立低代理
+      out += s[i]
+    }
+    return changed ? out : s
   },
 
   /** 数字实体解码统一：NUL 过滤 / 代理区与超范围保留原文 */
@@ -913,6 +1067,12 @@ function createUtils (options = {}) {
     // v3.107 fuzz 发现：m 本身缺失/非对象时 m.id 会抛 TypeError；异常 getter 也按无效 id 处理。
     // 与 isValidItem 口径一致：排除数组（带自定义 id 属性的数组不视为有效条目）。
     if (m === undefined || m === null || typeof m !== 'object' || Array.isArray(m)) return false
+    // XBK-UTILS-P2-04：与 getMessageIdentity 同口径——只有**本对象自有**的 id 才算这条消息的 id。
+    // 否则 Object.create({id:'abc'}) 被本函数判为「有 id」，getMessageIdentity 却判 invalid，
+    // 同一对象上两个判重入口结论相反：调用方据本函数走 id 判重路径时会与身份索引对不上而丢消息。
+    let ownId = false
+    try { ownId = Object.prototype.hasOwnProperty.call(m, 'id') } catch (e) { ownId = false }
+    if (!ownId) return false
     const id = this.safeGet(m, 'id')
     if (id === undefined || id === null) return false
     const t = typeof id
@@ -961,8 +1121,13 @@ function createUtils (options = {}) {
     set.add(i)
   },
 
-  /** v3.159：过滤规则稳定哈希（过滤字段固定顺序 + 只看它关键词）——规则变更时用于失效「过滤写入」缓存 */
-  filterHash (filterCfg, zktGjc) {
+  /** v3.159：过滤规则稳定哈希（过滤字段固定顺序 + 只看它关键词）——规则变更时用于失效「过滤写入」缓存。
+   *  FILTER-01 / RULES-05：第三参 compileState 是「规则实际编译生效」维度（RuleEngine.compileStateOf
+   *  产物：re2 可用性 + 各字段编译出的规则类型/条数）。此前哈希只由配置**字节**驱动，故「同一份配置、
+   *  不同环境」下 re2 缺失或规则被 ReDoS 守卫丢弃时哈希不变 → 缓存里已打 _f 的条目永不重评、改宽后
+   *  静默漏推。折入该维度后环境/编译结果一变，filter.hash 即变 → App 清 _f → 重新评估。
+   *  省略第三参时为 ''（旧调用点/旧测试语义不变，哈希仍确定）。 */
+  filterHash (filterCfg, zktGjc, compileState) {
     const parts = []
     const rawStr = (v) => {
       if (v === undefined || v === null || typeof v === 'symbol') return ''
@@ -1012,6 +1177,13 @@ function createUtils (options = {}) {
       try { return (typeof v === 'string' ? '' : typeof v + ':') + String(v) } catch (e) { return '' }
     }
     parts.push('zkt_gjc=' + typedRawStr(zktGjc))
+    // FILTER-01 / RULES-05：「规则实际编译生效」维度。String 化包 try/catch——脏配置/Proxy 的
+    // toString 抛错不得让整轮 run 崩（与上方 rawStr/safeStr 同口径）。缺省（旧调用点）= ''。
+    let compilePart = ''
+    if (compileState !== undefined && compileState !== null && typeof compileState !== 'symbol') {
+      try { compilePart = String(compileState) } catch (e) { compilePart = '' }
+    }
+    parts.push('compile=' + compilePart)
     // P3：pingbitime 天数过滤结果随注册天数增长（daysFrom 逐日 UTC 日期差）而变化，静态配置哈希不会变——
     // 已 _f 标记的旧条目因「缓存失效仅由静态哈希触发」而永不重评、长期漏推（老化过阈值后本应补推）。
     // pingbitime 启用时把当前 UTC 日期折进哈希：跨天即失效 _f 缓存 → 老化过阈值的条目被重新评估/推送；

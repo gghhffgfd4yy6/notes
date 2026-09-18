@@ -67,7 +67,16 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
           // 字符）。此前把 [^] 的 ] 当结束符跳过，会把后续 (a+)+ 整体吞进字符类而漏检 ReDoS。
           if (s[j] === '^') {
             j++
-            if (s[j] === ']') { j++; if (s[j] === ']') j++; else { /* [^] 已结束于第二个 ] */ } }
+            if (s[j] === ']') {
+              j++; if (s[j] === ']') j++ // [^]]：[^] 已结束于第二个 ]；否则类结束于此处
+            } else {
+            // RULES-01：取反类 [^...] 的类体同样要扫描到未转义的类结束符。此前只判 ^ 后的第一个
+            // 字符，类体被当作普通模式解析，同一根因造成双向错判：
+            //   误拦：'[^(a+)+]x' 的 (a+)+ 被当分组 → 判为嵌套量词（该类其实整体是字符类）；
+            //   漏检：'(x[^)]+)+' 的 ) 被吞进类体 → 分组永不闭合 → 真正的嵌套量词漏判。
+            // `[^]`（^ 后紧跟 ]）是特例，已在上面的分支按「非空字符类」处理，不走本扫描。
+              while (j < s.length && s[j] !== ']') { if (s[j] === '\\') j++; j++ }
+            }
           } else if (s[j] === ']') {
             j++ // 空类 ] 开头（[]] 场景），但 []] 中第一个 ] 是成员——严格说需再判断，保守按字符类整体跳过
             while (j < s.length && s[j] !== ']') { if (s[j] === '\\') j++; j++ }
@@ -286,6 +295,33 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
 
       compiled.__compiled = true
       return compiled
+    },
+
+    /** FILTER-01 / RULES-05：规则「实际编译生效」指纹。
+     *  filterHash 此前只由配置**字节**（FILTER_FIELDS + pingbitime + zkt_gjc + 可选 UTC 日期）驱动，
+     *  因此「同一份配置、不同环境/不同编译结果」时哈希不变：re2 缺失（compileUserRegex 恒返回 null，
+     *  xbk_rules.js 的简单模式置 null 分支）或规则被 ReDoS 守卫（hasNestedQuantifier）丢弃时过滤面
+     *  变宽，但缓存里已打 _f 的条目不会被失效、在缓存窗口内永不重评（改宽后静默漏推——与 C015 /
+     *  v3.161 pingbitime 同类疏漏）。
+     *  本方法把「re2 可用性 + 每个字段是否真的编译出规则（类型/条数）」折成一个稳定串，由 App 折进
+     *  filterHash：只要编译生效面变化，filter.hash 随之变化 → 清 _f → 重新评估。
+     *  刻意不含正则源码：源码已在 filterHash 的配置字段里，重复折入只会扩大哈希碰撞面、无新信息。
+     *  同一环境内必须稳定（否则每轮都清 _f、每轮全量重评）。 */
+    compileStateOf (compiled) {
+      const describe = (c) => {
+        if (!c || typeof c !== 'object') return 'null'
+        const t = Utils.safeGet(c, '_type')
+        if (t === 'multi' || t === 'timeMulti') {
+          const rules = Utils.safeGet(c, 'rules')
+          return t + ':' + (Array.isArray(rules) ? rules.length : 0)
+        }
+        if (t === 're' || t === 'time') return t
+        return 'null'
+      }
+      const parts = ['re2=' + (isRe2Available() ? '1' : '0')]
+      for (const f of FILTER_FIELDS) parts.push(f + '=' + describe(Utils.safeGet(compiled, f)))
+      parts.push('pingbitime=' + describe(Utils.safeGet(compiled, 'pingbitime')))
+      return parts.join(',')
     },
 
     // RE2 本身保证线性时间；完整匹配归一化后的输入，避免关键词位于长文本后半段时漏匹配。

@@ -5992,26 +5992,29 @@ console.log('========================================\n');
 
   await test('故障注入: fs.readFileSync 抛错 → readMessages 返回空数组', () => {
     const fs = require('fs')
-    const orig = fs.readFileSync
-    fs.readFileSync = () => { throw new Error('IO错误') }
+    // STG-01：缓存内容改由 fd 有界读取（openSync + readSync），注入 readFileSync 已不再影响内容读取
+    // （会让本用例变成空断言）。注入点改为**任何读取都必须经过**的 openSync，断言口径不变。
+    const orig = fs.openSync
+    fs.openSync = () => { throw new Error('IO错误') }
     try {
       const r = readMessages(getFilePath('test_fault_read.json'))
       assertEqual(Array.isArray(r), true)
     } finally {
-      fs.readFileSync = orig
+      fs.openSync = orig
     }
   })
 
   await test('故障注入: 双故障(read+write都抛) → readMessages 不崩溃', () => {
     const fs = require('fs')
-    const origR = fs.readFileSync; const origW = fs.writeFileSync
-    fs.readFileSync = () => { throw new Error('IO读错误') }
+    // STG-01：读侧注入点改为 openSync（内容读取改 fd 有界读取后，注入 readFileSync 不再生效），写侧不变
+    const origR = fs.openSync; const origW = fs.writeFileSync
+    fs.openSync = () => { throw new Error('IO读错误') }
     fs.writeFileSync = () => { throw new Error('磁盘满写错误') }
     try {
       const r = readMessages(getFilePath('test_dual_fault.json'))
       assertEqual(Array.isArray(r), true, '双故障应仍返回数组')
     } finally {
-      fs.readFileSync = origR
+      fs.openSync = origR
       fs.writeFileSync = origW
     }
   })
@@ -6075,15 +6078,17 @@ console.log('========================================\n');
     const p = getFilePath(name)
     try { fs.unlinkSync(p) } catch (e) {}
     fs.writeFileSync(p, JSON.stringify([{ id: 993 }]), 'utf8')
-    const origRead = fs.readFileSync
-    fs.readFileSync = (filePath, ...args) => {
-      if (filePath === p) throw new Error('read 失败')
+    const origRead = fs.openSync
+    // STG-01：缓存内容改由 fd 有界读取（openSync + readSync），注入 readFileSync 不再影响内容读取；
+    // 注入点改为按路径判定的 openSync（仍是「这一个文件的读取失败」），断言口径不变。
+    fs.openSync = (filePath, ...args) => {
+      if (filePath === p) throw Object.assign(new Error('read 失败'), { code: 'EIO' })
       return origRead.call(fs, filePath, ...args)
     }
     try {
       assertEqual(readMessages(p).length, 0, '读取失败本次返回空数组但不能缓存')
     } finally {
-      fs.readFileSync = origRead
+      fs.openSync = origRead
     }
     const recovered = readMessages(p)
     assertEqual(recovered.some(m => m.id === 993), true, '读取恢复后必须重新读取文件')
@@ -6213,7 +6218,7 @@ console.log('========================================\n');
 
   // 95-1. hasNestedQuantifier 检测正确性
   await test('ReDoS: hasNestedQuantifier 命中嵌套量词模式', () => {
-    for (const p of ['(a+)+', '(a*)*', '(a+)*', '(a*)+', '(?:a+)+', '((a+)+)', '((a)+)+', '(a+)+$', '(a{2,})+', '(a+)+(b+)+', '(a?)+', '(ab?)+', '(a?){2,}', '(\\d+)+']) {
+    for (const p of ['(a+)+', '(a*)*', '(a+)*', '(a*)+', '(?:a+)+', '((a+)+)', '((a)+)+', '(a+)+$', '(a{2,})+', '(a+)+(b+)+', '(a?)+', '(ab?)+', '(a?){2,}', '(\\d+)+', '(x[^)]+)+']) {
       assertEqual(hasNestedQuantifier(p), true, `应判定危险: ${p}`)
     }
     // v3.174：歧义交替 + 无限量词也判危险（(a|aa)+ 曾漏检——'^(a|aa)+b$' 对 30a 已 156ms/40a 2.5s 指数爆炸）
@@ -6223,7 +6228,7 @@ console.log('========================================\n');
   })
 
   await test('ReDoS: hasNestedQuantifier 放过安全模式', () => {
-    for (const p of ['(a+){1,3}', '(a+)?', '(ab)+', 'a+', 'a{2,}', '[()]+', '\\\\(a+\\\\)+', '', '(a+b)+', '(a+)b', '[a+]', '(a{2})+', '(a{2,3})+', '京东', '微博|赚客吧', 'a|b', '(a|b)', '(a|b){2,3}', '[a|b]+', 'colou?r', '(a|b)c']) {
+    for (const p of ['(a+){1,3}', '(a+)?', '(ab)+', 'a+', 'a{2,}', '[()]+', '\\\\(a+\\\\)+', '', '(a+b)+', '(a+)b', '[a+]', '(a{2})+', '(a{2,3})+', '京东', '微博|赚客吧', 'a|b', '(a|b)', '(a|b){2,3}', '[a|b]+', 'colou?r', '(a|b)c', '[^(a+)+]x']) {
       assertEqual(hasNestedQuantifier(p), false, `不应判定危险: ${p}`)
     }
   })
@@ -6736,7 +6741,7 @@ console.log('========================================\n');
   })
 
   // v3.169：README 不再维护版本号（避免每次发布手动同步的过时源）——版本一致性收敛为
-  // 文件头 ↔ CHANGELOG 最新 ↔ package.json 三方自动校验；README 的版本信息指向 package.json/CHANGELOG
+  // 文件头 ↔ CHANGELOG 最新 ↔ package.json ↔ package-lock 根元数据 四方自动校验；README 的版本信息指向 package.json/CHANGELOG
 
   console.log('\n📂 102. 配置防御（v3.80）')
 
@@ -8458,6 +8463,57 @@ console.log('========================================\n');
     }
   })
 
+  await test('sanitizeDecodedHtml 伪注释/端标签前缀不得吞掉后续真事件属性（REV-P2 发现 A）', () => {
+    // 载荷：伪注释（<! / <?）或端标签（</ ，含 `</ ` 与 `</x`）前缀自带一个不成对的引号，
+    // 旧状态机把整个前缀当普通起始标签跑属性状态机，于是前缀内的 `'` 被记成「开启了属性值」；
+    // 随后 _protectAttrPairs 回扫出 `x='><img src=x onerror=alert(1)>'` 这个伪属性对并整段占位，
+    // 段内真实 <img> 的 onerror 未进入 _stripEventAttrs，原样出网（输出与输入逐字节相同）。
+    // 修复：_htmlTagSpans 补上 HTML5 的端标签 / 伪注释状态，二者一律不记 valueQuotes。
+    //
+    // 判据刻意**不依赖字符串匹配**（改写成等价但不同字面的畸形标签就能骗过正则）：
+    // 这里用「HTML5 词法判决」做结构性判定——按词法走一遍清洗输出，只有 onerror 确实落在
+    // 某个标签**自身**的属性位上才算存活；引号值内的 onerror 字样不算。
+    const PAYLOADS = [
+      "</x='><img src=x onerror=alert(1)>'",
+      "</ x='><img src=x onerror=alert(1)>'",
+      "<! x='><img src=x onerror=alert(1)>'",
+      "<? x='><img src=x onerror=alert(1)>'"
+    ]
+    // 与 xbk_utils._htmlTagSpans 同源的最简标签词法：返回各标签区间的**段文本**。
+    const tagSpans = (s) => {
+      const spans = []
+      let i = 0
+      while (i < s.length) {
+        if (s[i] !== '<') { i++; continue }
+        const nx = s[i + 1] || ''
+        if (!/[A-Za-z/]/.test(nx)) { i++; continue }
+        let bogus = false
+        if (nx === '/') { bogus = !/[A-Za-z]/.test(s[i + 2] || ''); i += 2 } else if (nx === '!') { bogus = !s.startsWith('<!--', i); i += 2 } else i++
+        const start = i
+        while (i < s.length) {
+          if (bogus) { if (s[i] === '>') { i++; break } i++; continue }
+          if (s[i] === '"') { i++; while (i < s.length && s[i] !== '"') i++; i++; continue }
+          if (s[i] === "'") { i++; while (i < s.length && s[i] !== "'") i++; i++; continue }
+          if (s[i] === '>') { i++; break }
+          i++
+        }
+        spans.push(s.slice(start, i))
+      }
+      return spans
+    }
+    // 事件属性判据：onerror 位于标签**自身**的属性位（值引号之外、前面是空白 / '/' / 标签名边界）
+    const hasLiveHandler = (out) => tagSpans(out).some(seg => /(?:^|[\s/])onerror\s*=/i.test(seg))
+    for (const p of PAYLOADS) {
+      const out = sanitizeDecodedHtml(p)
+      assertEqual(out === p, false, `清洗器不得对该载荷恒等（${JSON.stringify(p)}）`)
+      assertEqual(hasLiveHandler(out), false, `输出的标签内不得残留 onerror（${JSON.stringify(p)} → ${JSON.stringify(out)}）`)
+    }
+    // 判据有效性对照（防「判据恒真 / 恒假」）：
+    assertEqual(hasLiveHandler('<img src=x onerror=alert(1)>'), true, '真事件属性必须被判为存活（判据有效性对照）')
+    assertEqual(hasLiveHandler('<img alt="onerror=x">'), false, '引号值内的 onerror 字样不是事件属性')
+    assertEqual(sanitizeDecodedHtml('<img alt="onerror=x">'), '<img alt="onerror=x">', '良性属性值不得被改动')
+  })
+
   await test('sanitizeDecodedHtml 未闭合引号跨标签不配对（子代理审查：残留 javascript P2）', () => {
     // 子代理发现：第一个 href 未闭合引号与第二个 href 引号跨标签配对，
     // 吞掉中间标签并遗留 `javascript:alert(2)>` 裸文本（`<a href=""javascript:alert(2)>`）
@@ -8559,6 +8615,115 @@ console.log('========================================\n');
     // 反向：标签内合法属性值里的 on 开头文本必须保留（保护语义不能被修坏）
     const keep = sanitizeDecodedHtml('<img title="see onerror=x" src="y">')
     assertEqual(keep.includes('title="see onerror=x"'), true, `标签内属性值不应被改写: ${keep}`)
+  })
+
+  await test('sanitizeDecodedHtml 杂散引号伪属性对不得屏蔽后续事件属性（XBK-UTILS-P2-01 安全）', () => {
+    // 反例（改动前）：`<img foo=a"b=" onerror="alert(1)">` 中 foo 是**未加引号**值 `a"b="`，
+    // 所含杂散引号让回扫得到伪属性对 `b=" onerror="`——该段闭合引号其实是 onerror 值的**开启**引号。
+    // 整段占位后 onerror 的属性名被藏进占位符，_stripEventAttrs 匹配不到，事件处理器原样出网
+    // （改动前实测原样返回）。修复按正扫的引号状态判定：只有真正开启属性值的引号才允许整段保护。
+    for (const h of [
+      '<img foo=a"b=" onerror="alert(1)">',
+      '<img foo=a"b=" onerror=alert(1) title="z">',
+      "<img foo=a'b=' onerror='alert(1)'>"
+    ]) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `杂散引号伪属性对不应屏蔽其后事件属性: ${h} → ${r}`)
+    }
+    // 反向：引号确实开启属性值的合法属性对仍须整体保护（保护语义不能被修坏）
+    const keep2 = sanitizeDecodedHtml('<img title="see onerror=x" src="y">')
+    assertEqual(keep2.includes('title="see onerror=x"'), true, `合法属性值内的 on* 文本必须保留: ${keep2}`)
+  })
+
+  await test('sanitizeDecodedHtml 未配对尖括号不得把纯文本属性对判成标签内（P1-01 安全）', () => {
+    // 反例（改动前）：HTML5 数据态下 `1 < 2`、`价格 <100 元` 里的 `<` 只是普通文本，但旧
+    // _htmlTagSpans 把任意 `<` 当标签起始，未配对 `<` 让标签区间延伸到串尾，把后方纯文本的
+    // name="…" 判成「标签内属性」并整段占位，段内真实的 <img onerror> 绕过事件清洗直接出网
+    // （改动前三例的 onerror 全部原样残留）。修复后标签起始要求 '<' 后为标签名字符/`/`/`!`/`?`。
+    for (const h of [
+      '1 < 2 name="a <img src=y onerror=alert(1)>" b',
+      '价格 <100 元 name="a <img src=y onerror=alert(1)>" b',
+      'a <= b name="x <img src=y onerror=alert(1)>" c'
+    ]) {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `未配对 < 后的纯文本属性对不得屏蔽事件属性: ${h} → ${r}`)
+    }
+  })
+
+  await test('sanitizeDecodedHtml 偶数个杂散引号不得屏蔽事件属性（P2-01 返工：HTML5 词法状态机）', () => {
+    // V1 打回（critical）：旧实现是「标签内引号奇偶配对」启发式——未加引号属性值里的杂散引号在
+    // HTML5 下只是普通字符（attribute value (unquoted) 状态），但奇偶启发式在**偶数个**杂散引号
+    // 下奇偶复原，伪属性对（`c=" onerror="`）的开启引号重新落回保护集、整段被占位，onerror 的
+    // 属性名被藏进占位符 → _stripEventAttrs 匹配不到 → 事件处理器原样出网。
+    // 返工改为 HTML5 tag tokenizer 状态机：只有 before attribute value 状态遇到的引号才算
+    // 「真正开启属性值」。以下载荷修复前经独立解析器 domino@2.2.0 均判 img[onerror=alert(1)] LIVE。
+    const cases = [
+      '<img foo=a"b"c=" onerror="alert(1)">', // V1 反例（偶数杂散引号）
+      '<img foo=a""b=" onerror="alert(1)">', // V1 反例
+      "<img foo=a''b=' onerror='alert(1)'>", // V1 反例（单引号族）
+      '<img foo=a""b=""c=" onerror="alert(1)">', // R1a 自造同族（更多偶数杂散引号）
+      '<img src=x foo=a"b"c=" onerror="alert(1)">', // R1a 自造同族（前置合法属性）
+      '<div foo=a"b"c=" onmouseover="alert(1)">x</div>' // R1a 自造同族（非 img 标签）
+    ]
+    const expected = [
+      '<img foo=a"b"c=" >',
+      '<img foo=a""b=" >',
+      "<img foo=a''b=' >",
+      '<img foo=a""b=""c=" >',
+      '<img src=x foo=a"b"c=" >',
+      '<div foo=a"b"c=" >x</div>'
+    ]
+    cases.forEach((h, i) => {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `偶数杂散引号伪属性对不应屏蔽其后事件属性: ${h} → ${r}`)
+      assertEqual(r, expected[i], `清洗输出须与 HTML5 词法一致（on* 清空、原值文本保留）: ${h} → ${r}`)
+    })
+    // 反向：合法属性值内的 on* 文本必须逐字节保留——旧启发式引入的假阳性回归
+    // （V1 实测 `<img a=x"b title="see onerror=x">` 的 title 值被截成 `see ）必须修掉。
+    const keepCases = [
+      '<img a=x"b title="see onerror=x">',
+      '<img title="see onerror=x" src="y">',
+      '<img data-a="x" title="a onerror=b">'
+    ]
+    for (const h of keepCases) {
+      assertEqual(sanitizeDecodedHtml(h), h, `合法属性值内的 on* 文本不得被误删（假阳性回归）: ${h}`)
+    }
+  })
+
+  await test('sanitizeDecodedHtml 未加引号属性值内的 < 不得切分标签区间（P1-01 返工：HTML5 词法状态机）', () => {
+    // V1 打回（high）：旧 _htmlTagSpans 在标签扫描中遇到「未加引号属性值里的 <」就 break 结束
+    // 当前 span 并从该 < 重开一个，而 HTML5 在 attribute value (unquoted) 状态把 < 当普通字符
+    // （parse error 但 append 进值），它不是新标签起点。于是 `<bar=" onerror="` 被当成标签内
+    // 合法属性对被整段占位，onerror 原样出网。修复前以下载荷经 domino 均判 LIVE。
+    const cases = [
+      '<img foo=x<bar=" onerror="alert(1)">', // V1 反例
+      '<img a=1<b=" onerror="alert(1)">', // V1 反例
+      '<img foo=a"b<c=" onerror="alert(1)">', // R1a 自造同族（杂散引号 + 值内 <）
+      '<img data-a=x<y"z=" onerror="alert(1)">' // R1a 自造同族
+    ]
+    const expected = [
+      '<img foo=x<bar=" >',
+      '<img a=1<b=" >',
+      '<img foo=a"b<c=" >',
+      '<img data-a=x<y"z=" >'
+    ]
+    cases.forEach((h, i) => {
+      const r = sanitizeDecodedHtml(h)
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(r), false, `未加引号值内的 < 不得切分标签区间而屏蔽事件属性: ${h} → ${r}`)
+      assertEqual(r, expected[i], `清洗输出须与 HTML5 词法一致: ${h} → ${r}`)
+    })
+    // 非回归：清单原声明用例（未配对 < 后的纯文本属性对）仍必须清除事件属性
+    for (const h of ['1 < 2 name="a <img src=y onerror=alert(1)>" b', '价格 <100 元 name="a <img src=y onerror=alert(1)>" b']) {
+      assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(sanitizeDecodedHtml(h)), false, `未配对 < 后的纯文本属性对不得屏蔽事件属性: ${h}`)
+    }
+    // 状态机不得把「标签名里的 '='」误当属性赋值（R1a 自造同族：HTML5 视整段为标签名，
+    // onerror 是紧随其后的真实属性，必须清除）
+    const tagNameEq = '<a"b= " onerror="alert(1)">'
+    assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(sanitizeDecodedHtml(tagNameEq)), false, `标签名里的 = 不得被当作属性赋值: ${tagNameEq}`)
+    // R1a 自造同族：标签名里出现 '=' 后又用引号开值——HTML5 视引号为标签名字符（tag name 状态
+    // 下引号不是值引号），标签在引号处遇到 '>' 结束，onerror 仍是紧随其后的真实属性。
+    const tagNameQuoted = "<a=b'c' onerror='alert(1)'>"
+    assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(sanitizeDecodedHtml(tagNameQuoted)), false, `标签名里的引号不得开启属性值: ${tagNameQuoted}`)
   })
 
   await test('sanitizeDecodedHtml 未闭合引号不泄漏共享正则状态（P2-02：跨调用结果一致）', () => {
@@ -8776,6 +8941,483 @@ console.log('========================================\n');
     try { require('fs').unlinkSync(p) } catch (e) { /* 清理容错: 只读目录下文件未创建 */ }
     assertEqual(threw, false, '恢复写入抛错时 readMessages 不得抛出（v3.236 降级）')
     assertEqual(Array.isArray(result) && result.length === 1 && result[0].id === 'restore-ok', true, '应返回内存快照而非清空')
+  })
+
+  // ============================================================
+  // B8 批次回归（未修复清单 114：message_store F3/F4/F5/F-02/F-05/F7）
+  // ============================================================
+
+  await test('B8-F3: 墓碑瞬时读失败不永久记忆——下次调用重试并恢复防重放身份', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f3_retry.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const seenPath = fp + '.seen.json'
+    // 先落一份含身份 'f3-retry-id' 的墓碑，再模拟「首次读盘瞬时失败」
+    MessageStore._saveTombstones(fp, {
+      id: new Map([['f3-retry-id', true]]),
+      urlOnly: new Map(),
+      idWithUrl: new Map(),
+      anon: new Map()
+    })
+    const realRead = MessageStore._readTombstoneData
+    let calls = 0
+    // 首次读盘返回 null（模拟 ioError/tooLarge 一类瞬时故障），并显式声明状态为 ioError
+    MessageStore._readTombstoneData = function (p) {
+      calls++
+      if (calls === 1) {
+        MessageStore._tombstoneLoadStatus[p] = 'ioError'
+        return null
+      }
+      return realRead.call(this, p)
+    }
+    try {
+      // 第一次加载：读失败 → 按空集，且**不得**置位 _tombstoneLoaded
+      assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 'f3-retry-id' }), false, '首次读失败应暂时按空集')
+      assertEqual(MessageStore._tombstoneLoaded.has(fp), false, '瞬时读失败不得置位 _tombstoneLoaded（否则永久记忆成空集）')
+      // 第二次加载：重试成功 → 防重放身份恢复
+      assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 'f3-retry-id' }), true, '读失败后再次调用应重试读盘并命中墓碑身份')
+      assertEqual(MessageStore._tombstoneLoaded.has(fp), true, '读成功后应置位，避免每次都重读磁盘')
+      assertEqual(calls >= 2, true, `应发生重试读盘，实际调用 ${calls} 次`)
+    } finally {
+      MessageStore._readTombstoneData = realRead
+      MessageStore._tombstoneLoaded.delete(fp)
+      MessageStore._tombstones.delete(fp)
+      try { fsmod.unlinkSync(seenPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F3: 墓碑文件确认缺失仍置位（不做每次判重的同步磁盘 IO）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f3_missing.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    const realRead = MessageStore._readTombstoneData
+    let calls = 0
+    MessageStore._readTombstoneData = function (p) { calls++; return realRead.call(this, p) }
+    try {
+      MessageStore._tombstoneHasIdentity(fp, { id: 'x' })
+      const afterFirst = calls
+      MessageStore._tombstoneHasIdentity(fp, { id: 'x' })
+      MessageStore._tombstoneHasIdentity(fp, { id: 'x' })
+      assertEqual(MessageStore._tombstoneLoaded.has(fp), true, '确认缺失（missing）应置位，视为已加载的空集')
+      assertEqual(afterFirst, 1, '首次判重应读盘一次')
+      assertEqual(calls, 1, `缺失确认后不得每次判重都重读磁盘（性能回归），实际读盘 ${calls} 次`)
+    } finally {
+      MessageStore._readTombstoneData = realRead
+      MessageStore._tombstoneLoaded.delete(fp)
+      MessageStore._tombstones.delete(fp)
+    }
+  })
+
+  await test('B8-F4: 启动清理覆盖目录级哨兵 .seen.cleanup.lock（陈旧且进程已退出）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f4_guard.json'
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    // 陈旧哨兵：写入一个不可能存在的 PID + 旧 mtime
+    const guardPath = path.join(dir, '.seen.cleanup.lock')
+    fsmod.writeFileSync(guardPath, '999999:0:dead-owner', { flag: 'w' })
+    const past = new Date(Date.now() - 60000)
+    fsmod.utimesSync(guardPath, past, past)
+    MessageStore._tombstoneLocksCleaned.delete(dir)
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(guardPath), false, '陈旧且持有进程已退出的目录级哨兵应被启动清理回收')
+    } finally {
+      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F4: 启动清理不误删活跃进程持有的哨兵（只按陈旧时间判定会误删）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f4_live.json'
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    const guardPath = path.join(dir, '.seen.cleanup.lock')
+    // 本进程存活 + 旧 mtime：必须保留（清理要同时满足「陈旧」与「持有者已退出」）。
+    // token 必须写成**生产真实形态** `<pid>:<真实启动时钟>:<uuid>`——即
+    // _newTombstoneLockToken 的产物；单独看 mtime 陈旧绝不构成删除依据。
+    // 反之，伪造一个生产上不会出现的 starttime（如 0）在 Linux 上会被 incarnation 比对
+    // 判成「PID 复用＝已退出」而回收，那测的是测试自己伪造的状态，不是清理逻辑误删
+    // （该 incarnation 比对自 62e7ca3 起就存在，非本轮引入）。
+    // 非 Linux / 读不到 /proc 时 start 为 null → 写成 `<pid>::<uuid>`，
+    // 走 _isTombstoneLockProcessAlive 的「无法验证 incarnation ⇒ 保守保留」分支。
+    const start = MessageStore._getTombstoneProcessStart(process.pid)
+    fsmod.writeFileSync(guardPath, `${process.pid}:${start || ''}:live-owner`, { flag: 'w' })
+    const past = new Date(Date.now() - 60000)
+    fsmod.utimesSync(guardPath, past, past)
+    MessageStore._tombstoneLocksCleaned.delete(dir)
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(guardPath), true, '活跃进程持有的哨兵即使 mtime 陈旧也不得被删')
+    } finally {
+      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  // 上一条只证明「真实 incarnation 的哨兵不被误删」，这里反向把既有语义钉住：
+  // token 带**错误数字 starttime** ⇒ 持有者 PID 已被复用（旧进程已退出）⇒ 应回收。
+  // 该分支仅在能读到真实启动时钟（Linux /proc）时成立；本机沙箱读不到 /proc，
+  // 故用打桩把「能读到」这一态显式造出来，让 CI 与本机跑同一条分支，
+  // 而不是写一条随环境漂移（CI 红/本机绿）的断言——读不到时该语义本就退化为保守保留。
+  await test('B8-F4: 错误 incarnation（PID 复用＝持有者已退出）的陈旧哨兵必须被回收', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f4_reincarnation.json'
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    const guardPath = path.join(dir, '.seen.cleanup.lock')
+    const realStart = MessageStore._getTombstoneProcessStart
+    // 打桩：本进程启动时钟固定为数字 '424242'，模拟 Linux 上 /proc/<pid>/stat 可读。
+    MessageStore._getTombstoneProcessStart = function (pid) {
+      return pid === process.pid ? '424242' : realStart.call(MessageStore, pid)
+    }
+    try {
+      fsmod.writeFileSync(guardPath, `${process.pid}:1:stale-owner`, { flag: 'w' })
+      const past = new Date(Date.now() - 60000)
+      fsmod.utimesSync(guardPath, past, past)
+      MessageStore._tombstoneLocksCleaned.delete(dir)
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(guardPath), false, 'starttime 与真实值不符（PID 复用）的陈旧哨兵应视为持有者已退出并回收')
+    } finally {
+      MessageStore._getTombstoneProcessStart = realStart
+      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F4: 清理候选名单同时覆盖 .seen.lock / .seen.cleanup.lock / .reclaim', () => {
+    assertEqual(MessageStore._isResidualTombstoneLockName('push.json.seen.lock'), true, '单文件墓碑锁应在名单内')
+    assertEqual(MessageStore._isResidualTombstoneLockName('.seen.cleanup.lock'), true, '目录级哨兵应在名单内')
+    assertEqual(MessageStore._isResidualTombstoneLockName('.seen.cleanup.lock.123.456.reclaim'), true, '.reclaim 中间态应在名单内')
+    assertEqual(MessageStore._isResidualTombstoneLockName('push.json'), false, '普通缓存文件不得进清理名单')
+    assertEqual(MessageStore._isResidualTombstoneLockName('push.json.seen.json'), false, '墓碑数据文件不得进清理名单')
+    // R4（V6 数据丢失回归）：合法缓存文件的**完整产物**不得进名单。旧判据用子串包含
+    // includes('.seen.cleanup.lock.')，'<name>.seen.cleanup.lock.json' 会命中 → 启动清理静默 unlink。
+    assertEqual(MessageStore._isResidualTombstoneLockName('v6probe.seen.cleanup.lock.json'), false,
+      '合法缓存文件 <name>.seen.cleanup.lock.json（URL 末段恰为 xxx.seen.cleanup.lock）不得进清理名单')
+    assertEqual(MessageStore._isResidualTombstoneLockName('url_.seen.cleanup.lock.json'), false, '带 url_ 前缀的合法缓存文件同样不得进名单')
+    assertEqual(MessageStore._isResidualTombstoneLockName('push.json.seen.cleanup.lock.json'), false, '缓存文件 + 合法后缀同样不得进名单')
+  })
+
+  await test('B8-F4: 合法缓存文件 xxx.seen.cleanup.lock.json 不得被启动清理删除（V6 数据丢失回归）', () => {
+    const fsmod = require('node:fs')
+    const inner = 'v6probe' + Date.now() + '.seen.cleanup.lock'
+    const name = inner + '.json' // 即 getFileName('https://example.com/v6probe…seen.cleanup.lock') 的真实产物
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    const body = JSON.stringify([{ id: 'v6probe-legit', title: '合法判重记录' }])
+    const past = new Date(Date.now() - 60000)
+    fsmod.writeFileSync(fp, body)
+    fsmod.utimesSync(fp, past, past) // 陈旧 mtime：旧实现正是在这里被判残留锁后 unlink
+    MessageStore._tombstoneLocksCleaned.delete(dir)
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(fp), true, '合法缓存文件必须保留——被启动清理删除即整份判重记录丢失（下一轮全量重推）')
+      assertEqual(fsmod.readFileSync(fp, 'utf8'), body, '合法缓存文件内容不得被改动')
+    } finally {
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F4: 陈旧 .reclaim 残留必须被启动清理回收（B8 的真正增量；旧实现保留）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f4_reclaim_' + Date.now() + '.json'
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    const reclaimPath = path.join(dir, '.seen.cleanup.lock.999999.1700000000000.reclaim')
+    const past = new Date(Date.now() - 60000)
+    fsmod.writeFileSync(reclaimPath, '999999:0:dead-owner')
+    fsmod.utimesSync(reclaimPath, past, past)
+    MessageStore._tombstoneLocksCleaned.delete(dir)
+    try {
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(reclaimPath), false, '陈旧且持有进程已退出的 .reclaim 残留应被回收（回退该判据即红）')
+    } finally {
+      try { fsmod.unlinkSync(reclaimPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F5: 磁盘文件存在但读不到时写闸门拒绝覆写（现状契约锁定）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f5_gate.json'
+    const fp = getFilePath(name)
+    // 造一个「文件存在但内容不可解析」的损坏缓存：readMessages 会置位 _readFailed
+    fsmod.writeFileSync(fp, '{ 这不是合法 JSON')
+    delete MessageStore._memoryCache[fp]
+    MessageStore._verified.delete(fp)
+    MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
+    const read = readMessages(fp)
+    assertEqual(read.length, 0, '损坏缓存应降级返回空数组')
+    assertEqual(MessageStore._readFailed[fp], true, '损坏缓存应置位读失败标记')
+    const rejected = saveBatch([{ id: 'f5-blocked', title: '应被拒绝' }], name)
+    assertEqual(rejected, false, '读失败标记置位期间 saveBatch 必须拒绝写入并返回 false（保护存量不被覆盖）')
+    const onDisk = fsmod.readFileSync(fp, 'utf8')
+    assertEqual(onDisk, '{ 这不是合法 JSON', '被拒绝时磁盘原文不得被覆写')
+    delete MessageStore._readFailed[fp]
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+  })
+
+  await test('B8-F5: 成功读回磁盘后写闸门自动解除（既有解除路径不退化）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f5_release.json'
+    const fp = getFilePath(name)
+    saveMessages(fp, [{ id: 'f5-rel-1', title: '存量' }])
+    MessageStore._readFailed[fp] = true
+    delete MessageStore._memoryCache[fp]
+    MessageStore._verified.delete(fp)
+    MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
+    const reread = readMessages(fp)
+    assertEqual(reread.some((m) => m.id === 'f5-rel-1'), true, '应从磁盘读回存量')
+    assertEqual(MessageStore._readFailed[fp], undefined, '成功读盘应清除读失败标记（解除保护）')
+    const appended = appendMessageToFile({ id: 'f5-rel-2', title: '新条目' }, name)
+    assertEqual(appended, true, '保护解除后 save 应恢复写入')
+    const onDisk = JSON.parse(fsmod.readFileSync(fp, 'utf8'))
+    assertEqual(onDisk.some((m) => m.id === 'f5-rel-2'), true, '恢复后新条目应真正落盘')
+  })
+
+  await test('B8-F-05: saveBatch 返回布尔——成功/空入参/无效身份/落盘失败口径一致', () => {
+    const name = 'test_b8_f05_ret.json'
+    const fp = getFilePath(name)
+    try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    try { require('node:fs').unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    MessageStore._memoryCache = {}
+    MessageStore._memoCount = 0
+    MessageStore._verified.clear()
+    MessageStore._identityIndex = new WeakMap()
+    // 真空输入：无变更即成功
+    assertEqual(saveBatch([], name), true, '空数组应返回 true（无变更也算成功）')
+    assertEqual(saveBatch(null, name), true, '非数组应返回 true（保护性忽略）')
+    // 全无效身份：无变更即成功
+    assertEqual(saveBatch([null, 42, 'x'], name), true, '全无效条目应返回 true（无变更）')
+    // 有效新增：落盘成功
+    assertEqual(saveBatch([{ id: 'f05-1', title: 'a' }], name), true, '有效新增落盘成功应返回 true')
+    // 读失败闸门：拒绝写入 → false（须造「文件存在但读不到」的现场，否则 readMessages 会解除保护）
+    require('node:fs').writeFileSync(fp, '{ 坏 JSON')
+    delete MessageStore._memoryCache[fp]
+    MessageStore._verified.delete(fp)
+    MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
+    readMessages(fp) // 触发置位
+    assertEqual(saveBatch([{ id: 'f05-2', title: 'b' }], name), false, '读失败闸门拒绝写入应返回 false')
+    try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    delete MessageStore._readFailed[fp]
+    delete MessageStore._memoryCache[fp]
+    MessageStore._verified.delete(fp)
+    // 落盘失败（循环引用）→ false
+    const circular = { id: 'f05-c', title: 'c' }
+    circular.self = circular
+    assertEqual(saveBatch([circular], name), false, '落盘失败应返回 false，调用方据此可见')
+  })
+
+  await test('B8-F-02: 索引被原地改写后 has 不得误判为已存在（陈旧索引）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f02_stale.json'
+    const fp = getFilePath(name)
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    saveMessages(fp, [{ id: 'f02-a', title: 'A' }, { id: 'f02-b', title: 'B' }, { id: 'f02-c', title: 'C' }])
+    const arr = readMessages(fp)
+    // 先让 _identityIndex 建立并缓存该数组的索引
+    assertEqual(isMessageInFile({ id: 'f02-b' }, name), true, '前置：f02-b 应已判重命中')
+    // R4（V6）：只改**非首元素**且长度不变——引用/长度/首元素引用三项 O(1) 失效检查全都看不出变化，
+    // 旧索引会把已被移除的 f02-b 判为「已存在」→ 漏推（与 SYSTEM_CONTRACT「宁可多推」相反）。
+    arr[1] = { id: 'f02-y', title: 'Y' }
+    assertEqual(isMessageInFile({ id: 'f02-b' }, name), false, '被原地移除的非首元素身份不得再判重命中（陈旧索引 → 漏推）')
+    assertEqual(isMessageInFile({ id: 'f02-y' }, name), true, '原地写入的新身份应判重命中')
+    // 字段级改写（元素对象本身不变）同样必须被检出
+    arr[2].id = 'f02-changed'
+    assertEqual(isMessageInFile({ id: 'f02-c' }, name), false, '字段被改写的身份不得再判重命中（陈旧索引回归）')
+    assertEqual(isMessageInFile({ id: 'f02-changed' }, name), true, '字段改写出的新身份应判重命中')
+    // 首元素整体替换（原有 head 引用检查覆盖这条）
+    arr[0] = { id: 'f02-x', title: 'X' }
+    assertEqual(isMessageInFile({ id: 'f02-a' }, name), false, '被原地移除的首元素身份不得再判重命中（陈旧索引回归）')
+    assertEqual(isMessageInFile({ id: 'f02-x' }, name), true, '原地写入的首元素新身份应判重命中')
+  })
+
+  // R4：B8 原「等价性对照」全程不改写数组 → 任何实现都通过（零区分力），替换为**逐形态**的
+  // 原地改写 + 线性扫描 oracle 对拍。oracle = _indexHasIdentityDirect（零索引、独立实现）。
+  await test('B8-F-02: 原地改写各形态下索引判重必须与线性扫描 oracle 逐值一致', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f02_oracle.json'
+    const fp = getFilePath(name)
+    const seed = () => [
+      { id: 'f02-a', title: 'A' },
+      { id: 'f02-b', title: 'B' },
+      { id: 'f02-c', url: 'https://f02.example/c' },
+      { url: 'https://f02.example/only' },
+      { title: '匿名内容 f02 足够长避免退化' }
+    ]
+    const forms = [
+      {
+        label: 'arr[1] 整体替换（非首元素、长度不变）',
+        mutate: (a) => { a[1] = { id: 'f02-y', title: 'Y' } },
+        probes: () => [{ id: 'f02-b' }, { id: 'f02-y' }, { id: 'f02-a' }]
+      },
+      {
+        label: 'arr[2].url 字段改写',
+        mutate: (a) => { a[2].url = 'https://f02.example/changed' },
+        probes: () => [{ url: 'https://f02.example/c' }, { url: 'https://f02.example/changed' }]
+      },
+      {
+        label: 'arr[0].id 字段改写（首元素、字段级）',
+        mutate: (a) => { a[0].id = 'f02-head' },
+        probes: () => [{ id: 'f02-a' }, { id: 'f02-head' }]
+      },
+      {
+        label: 'arr[3] 整体替换（纯 url 元素）',
+        mutate: (a) => { a[3] = { url: 'https://f02.example/other' } },
+        probes: () => [{ url: 'https://f02.example/only' }, { url: 'https://f02.example/other' }]
+      },
+      {
+        label: 'arr[4].title 字段改写（匿名身份）',
+        mutate: (a) => { a[4].title = '匿名内容 f02 已被改名且足够长' },
+        probes: () => [{ title: '匿名内容 f02 足够长避免退化' }, { title: '匿名内容 f02 已被改名且足够长' }]
+      },
+      {
+        label: '原地 push 追加（长度变化，O(1) 失效检查覆盖）',
+        mutate: (a) => { a.push({ id: 'f02-appended' }) },
+        probes: () => [{ id: 'f02-appended' }, { id: 'f02-b' }]
+      }
+    ]
+    try {
+      for (const form of forms) {
+        try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+        saveMessages(fp, seed())
+        const arr = readMessages(fp)
+        assertEqual(isMessageInFile({ id: 'f02-a' }, name), true, `前置：${form.label} 前索引必须已建立`)
+        form.mutate(arr)
+        for (const p of form.probes()) {
+          const indexed = isMessageInFile(p, name)
+          const oracle = MessageStore._indexHasIdentityDirect(arr, p)
+          assertEqual(indexed, oracle,
+            `${form.label}：has()=${indexed} 必须等于 oracle=${oracle}（probe=${JSON.stringify(p)}；不一致即索引陈旧：true/false 分别对应漏推/多推）`)
+        }
+      }
+    } finally {
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  // R4 性能守位（B8 的取舍理由：逐位复检每次 ~20ms 会打死热路径）：修复只为「每个数组版本」
+  // 付一次未命中复检，之后稳态 O(1)。断言重建次数上界——把复检改成「每次未命中都重建」时必红。
+  await test('B8-F-02: 批量未命中不得每次重建索引（每数组版本至多一次 O(n) 复检）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f02_perf.json'
+    const fp = getFilePath(name)
+    const msgs = []
+    for (let i = 0; i < 2000; i++) msgs.push({ id: 'f02p-' + i })
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    saveMessages(fp, msgs)
+    const arr = readMessages(fp)
+    assertEqual(isMessageInFile({ id: 'f02p-0' }, name), true, '前置：索引已建立且命中')
+    assertEqual(Array.isArray(arr), true, '前置：readMessages 返回权威数组')
+    const realBuild = MessageStore._buildIdentityIndex
+    let builds = 0
+    MessageStore._buildIdentityIndex = function (...args) { builds++; return realBuild.apply(this, args) }
+    try {
+      for (let i = 0; i < 1000; i++) {
+        assertEqual(isMessageInFile({ id: 'f02p-miss-' + i }, name), false, `不存在的身份必须判否（第 ${i} 个）`)
+      }
+    } finally {
+      MessageStore._buildIdentityIndex = realBuild
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+    assertEqual(builds >= 1, true, '首次未命中必须做一次全量复检（否则原地写入的新身份查不到——F-02 修复机制被删即红）')
+    assertEqual(builds <= 2, true, `1000 次未命中最多重建 1~2 次索引，实际 ${builds} 次（每次未命中都重建 = O(n²)，B8 实测打死热路径）`)
+  })
+
+  // R6（W2 实测残留）：`missVerified` 跨数组版本**粘滞**——索引重建（未命中复检）之后再原位替换
+  // 非首元素、且只查被替换者时，索引层不含新身份、命中候选复检落空、missVerified 已为真 ⇒ 不再重建，
+  // has() 对**数组里确实存在**的身份恒定返回 false 且永不恢复（自愈设计意图被破坏；方向是多推侧，
+  // 但同样与线性扫描 oracle 不一致）。修法：未命中路径补两条旋转抽查窗（引用层 32 位置 / 身份层
+  // 2 位置；n <= 8 时覆盖全表 ⇒ 首次未命中即精确）。两条窗都停掉时本条真红。
+  await test('B8-F-02: 未命中重建后再原位替换非首元素，has 必须自愈（W2 粘滞反例）', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f02_sticky.json'
+    const fp = getFilePath(name)
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    saveMessages(fp, [{ id: 'st-a' }, { id: 'st-b' }, { id: 'st-c' }])
+    const arr = readMessages(fp)
+    const oracle = (m) => MessageStore._indexHasIdentityDirect(arr, m)
+    try {
+      assertEqual(isMessageInFile({ id: 'st-a' }, name), true, '前置：预热索引')
+      arr[1] = { id: 'st-b2' }
+      assertEqual(isMessageInFile({ id: 'st-absent' }, name), false, '第③步：不存在的身份判否（触发首次未命中复检，missVerified 置真）')
+      assertEqual(isMessageInFile({ id: 'st-b2' }, name), true, '前置：替换后的身份可见')
+      arr[1] = { id: 'st-b3' }
+      for (let round = 1; round <= 3; round++) {
+        const got = isMessageInFile({ id: 'st-b3' }, name)
+        assertEqual(got, oracle({ id: 'st-b3' }), `第 ${round} 次查询 has()=${got} 必须等于 oracle（恒 false = 粘滞漏判，即 W2 反例）`)
+      }
+      // 同族变体：再次原位改写（含字段级改写）后仍须与 oracle 一致
+      arr[1] = { id: 'st-b4' }
+      arr[2] = { id: 'st-c', url: 'https://st.example/c2' }
+      for (const p of [{ id: 'st-b4' }, { id: 'st-b2' }, { id: 'st-c' }, { url: 'https://st.example/c2' }]) {
+        const got = isMessageInFile(p, name)
+        assertEqual(got, oracle(p), `probe=${JSON.stringify(p)}：has()=${got} 必须等于 oracle=${oracle(p)}`)
+      }
+    } finally {
+      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('B8-F7: getFileName 不给缓存目录生成隐藏文件（末段以点开头）', () => {
+    assertEqual(getFileName('https://example.com/.hidden'), 'url_.hidden.json', '末段 .hidden 应加前缀，避免生成隐藏文件')
+    assertEqual(getFileName('https://example.com/.json'), 'url_.json', '末段 .json 应加前缀')
+    assertEqual(getFileName('https://example.com/a.json'), 'a.json', '正常名字不受影响')
+    const p = getFilePath(getFileName('https://example.com/.secret'))
+    assertEqual(path.basename(p).startsWith('.'), false, `getFilePath 产物不得以点开头（隐藏文件）: ${path.basename(p)}`)
+  })
+
+  // R4（V6 实锤）：B8 的加前缀修法**引入了新碰撞**——'url_' 前缀本身也是合法末段，
+  // 于是 getFileName('https://x/.json') === getFileName('https://x/url_.json') === 'url_.json'，
+  // 两个不同 pushUrl 共用同一缓存文件（判重记录互相覆盖）。改为「以 . 或 url_ 开头 ⇒ 前置 url_」的单射映射。
+  await test('B8-F7: 隐藏文件防护不得与 url_ 前缀的合法名撞名（V6 新碰撞回归）', () => {
+    assertEqual(getFileName('https://x/.json'), 'url_.json', '以点开头仍加前缀（隐藏文件防护保持）')
+    assertEqual(getFileName('https://x/url_.json'), 'url_url_.json', '本身以 url_ 开头的名字必须转义前缀')
+    assertEqual(getFileName('https://x/.json') === getFileName('https://x/url_.json'), false,
+      '两个不同 URL 不得映射到同一缓存文件名（碰撞即判重记录互相覆盖）')
+    const urls = ['https://x/.hidden', 'https://x/url_.hidden', 'https://x/url_x', 'https://x/x', 'https://x/.json', 'https://x/url_.json', 'https://x/data.json']
+    const names = urls.map(getFileName)
+    assertEqual(new Set(names).size, names.length, `不同 URL 不得撞名：${JSON.stringify(names)}`)
+  })
+
+  // R6（W2 实锤）：R4 的「以 . 或 url_ 开头 ⇒ 前置 url_」仍是**非单射**——前置后再补 '.json' 后缀，
+  // 于是 getFileName('https://x/url_') → 'url_url_' → 'url_url_.json'，与
+  // getFileName('https://x/url_.json') → 'url_url_.json'（已带后缀不追加）**撞同一缓存文件**。
+  // 修法：'url_'-来源未带 .json 时插入分隔符 '#'（'#' 不可能出现在清洗后的末段里——末段先按 [?#] 截断）。
+  await test('B8-F7: url_ 前缀的合法名与补 .json 后缀不得撞名（W2 新碰撞回归）', () => {
+    assertEqual(getFileName('https://x/url_'), 'url_url_#.json', "'url_' 未带后缀：转义前缀 + '#' 分隔符再补后缀")
+    assertEqual(getFileName('https://x/url_.json'), 'url_url_.json', '既有产物不得改动（R4 断言钉死）')
+    assertEqual(getFileName('https://x/url_') === getFileName('https://x/url_.json'), false,
+      '两个不同 URL 不得映射到同一缓存文件名（W2 反例）')
+    assertEqual(getFileName('https://x/url_x') === getFileName('https://x/url_x.json'), false,
+      "同族变体：'url_x' 与 'url_x.json' 也不得撞名")
+    // 性质：'url_'-来源（转义类里唯一被二次改写的一支）严格单射——不同**清洗后**末段必不同名
+    // （'url_?q'/'url_#f' 与 'url_' 清洗后同为 'url_'，属文档化的 query/hash 剥离口径，故按清洗后比较）
+    const segs = ['url_', 'url_.json', 'url_x', 'url_x.json', 'url_.hidden', 'url_.hidden.json', 'url_url_', 'url_url_.json', 'url_?q', 'url_#f']
+    const got = segs.map(s => getFileName('https://x/' + s))
+    const cleaned = segs.map(s => { let n = s.split(/[?#]/)[0]; if (!n || /^\.+$/.test(n)) n = 'default'; return n })
+    const distinctCleaned = new Set(cleaned).size
+    assertEqual(new Set(got).size, distinctCleaned, `'url_'-来源必须严格单射（清洗后 ${distinctCleaned} 个不同末段）：${JSON.stringify(segs.map((s, i) => [s, got[i]]))}`)
+    assertEqual(got[0] === got[1], false, "'url_' 与 'url_.json' 清洗后不同名，必须映射到不同缓存名")
+    for (const n of got) {
+      assertEqual(n.startsWith('.'), false, `产物不得是隐藏文件：${n}`)
+      assertEqual(n.endsWith('.json'), true, `产物须保留 .json 后缀：${n}`)
+    }
+  })
+
+  // R4（V6 实锤）：F7 原条目另一半（getFilePath 截断碰撞）逐字未动——两条仅在**第 200 字节之后**
+  // 不同的长名会被截断成同一路径，而生产 cacheName 直接来自 getFileName(pushUrl)。
+  // 修法：截断结果附带全名摘要（anonKey 64 位，仅字母数字），保证「长名 → 路径」单射。
+  await test('B8-F7: 超长名截断必须保持单射（仅第 200 字节后不同的两条长名不得同路径）', () => {
+    const a = 'u'.repeat(260) + 'aaaa.json' // 269 字节
+    const b = 'u'.repeat(260) + 'bbbb.json' // 与 a 仅在第 200 字节之后不同
+    const pa = getFilePath(a)
+    const pb = getFilePath(b)
+    assertEqual(pa !== pb, true, `截断后仍必须区分不同长名（同路径即判重缓存互相覆盖）：${path.basename(pa)} vs ${path.basename(pb)}`)
+    assertEqual(Buffer.byteLength(path.basename(pa)) <= 200 && Buffer.byteLength(path.basename(pb)) <= 200, true, '截断产物仍须 <= 200 字节')
+    assertEqual(pa.endsWith('.json') && pb.endsWith('.json'), true, '截断仍应保留扩展名')
+    assertEqual(getFilePath(a) === pa, true, '同一名字必须稳定映射到同一路径（缓存名要能跨轮复用）')
   })
 
   // ============================================================

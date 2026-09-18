@@ -134,5 +134,75 @@ const cfg = slim.push_config
     for (const [k, v] of Object.entries(saved)) cfg[k] = v
   }
 
+  // ===== F4：WX_pusher_channels 配置被丢弃时必须告警（旧口径完全静默）=====
+  // 多应用数组里任一项缺 appToken/topicIds、或整串不是合法 JSON 时，旧实现直接回退旧字段且零日志——
+  // 用户看到「推送成功」，其余应用一条没收到。逐场景断言 console.warn 的出现/缺席。
+  {
+    const savedWx = {
+      channels: cfg.WX_pusher_channels,
+      appToken: cfg.WX_pusher_appToken,
+      topicIds: cfg.WX_pusher_topicIds
+    }
+    const originalWarn = console.warn
+    const warns = []
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      // ① 非法 JSON：告警 + 仍回退旧字段（行为不变）
+      cfg.WX_pusher_channels = '{not json'
+      cfg.WX_pusher_appToken = 'legacy-token'
+      cfg.WX_pusher_topicIds = '1'
+      warns.length = 0
+      assert.strictEqual(slim.hasWxPusherConfigured(), true, '非法 JSON 时应回退旧字段（行为不变）')
+      assert.strictEqual(warns.length, 1, '非法 JSON 应恰好告警 1 次')
+      assert.ok(warns[0].includes('不是合法 JSON'), `告警应说明解析失败，实际：${warns[0]}`)
+      // ② 数组项全缺 topicIds：告警 + 回退旧字段
+      cfg.WX_pusher_channels = JSON.stringify([{ appToken: 'a' }, { app_token: 'b' }])
+      warns.length = 0
+      assert.strictEqual(slim.hasWxPusherConfigured(), true, '全丢弃时应回退旧字段（行为不变）')
+      assert.strictEqual(warns.length, 1, '数组项全丢弃应恰好告警 1 次')
+      assert.ok(warns[0].includes('2 项均缺 appToken 或 topicIds'), `告警应带丢弃条数，实际：${warns[0]}`)
+      // ③ 配置值不是数组（对象）：告警
+      cfg.WX_pusher_channels = JSON.stringify({ appToken: 'a', topicIds: '1' })
+      warns.length = 0
+      assert.strictEqual(slim.hasWxPusherConfigured(), true, '非数组配置应回退旧字段')
+      assert.strictEqual(warns.length, 1, '非数组配置应告警 1 次')
+      assert.ok(warns[0].includes('不是数组'), `告警应说明形状错误，实际：${warns[0]}`)
+      // ④ 混合数组（部分丢弃）：被丢弃项必须留痕——修复前「只要还剩一项就提前返回」，丢弃项完全静默
+      // （V4 实测：warn=0 且 2 次推送只联系 APP_A；对照组两个合法应用会被分别联系）。
+      cfg.WX_pusher_channels = JSON.stringify([{ appToken: 'a', topicIds: '1' }, { app_token: 'b' }])
+      warns.length = 0
+      assert.strictEqual(slim.hasWxPusherConfigured(), true, '部分丢弃时应启用其余合法项（行为不变）')
+      assert.strictEqual(warns.length, 1, '混合数组必须恰好告警 1 次（修复前 warn=0）')
+      assert.ok(warns[0].includes('1 项') && warns[0].includes('已丢弃'), `告警应带丢弃条数，实际：${warns[0]}`)
+      // ④b 同族反例（自造）：非对象项（null/字符串）被过滤时同样属于「部分丢弃」，
+      // 不能只在「缺 appToken/topicIds 字段」这一种形态上告警。
+      cfg.WX_pusher_channels = JSON.stringify([{ appToken: 'a', topicIds: '1' }, null, 'x'])
+      warns.length = 0
+      assert.strictEqual(slim.hasWxPusherConfigured(), true, '非对象项应被过滤且保留合法项')
+      assert.strictEqual(warns.length, 1, '非对象项部分丢弃也必须告警 1 次')
+      assert.ok(warns[0].includes('2 项') && warns[0].includes('已丢弃'), `告警应带被丢弃条数 2，实际：${warns[0]}`)
+      // ⑤ 合法数组：采用多应用、不得告警
+      cfg.WX_pusher_channels = JSON.stringify([{ appToken: 'a', topicIds: '1,2' }])
+      warns.length = 0
+      assert.strictEqual(slim.hasWxPusherConfigured(), true, '合法数组应启用多应用')
+      assert.strictEqual(warns.length, 0, '合法数组不得告警')
+      // ⑥ 未配置/显式空数组：回退旧字段，不得告警（既有无配置语义）
+      cfg.WX_pusher_channels = '[]'
+      warns.length = 0
+      assert.strictEqual(slim.hasWxPusherConfigured(), true, '空数组应回退旧字段')
+      assert.strictEqual(warns.length, 0, '显式空数组不得告警')
+      cfg.WX_pusher_channels = ''
+      warns.length = 0
+      assert.strictEqual(slim.hasWxPusherConfigured(), true, '空串应回退旧字段')
+      assert.strictEqual(warns.length, 0, '未配置不得告警')
+    } finally {
+      console.warn = originalWarn
+      cfg.WX_pusher_channels = savedWx.channels
+      cfg.WX_pusher_appToken = savedWx.appToken
+      cfg.WX_pusher_topicIds = savedWx.topicIds
+    }
+    console.log('✅ F4：WX_pusher_channels 丢弃时告警（非法 JSON/全丢弃/非数组/部分丢弃），合法与空配置不告警')
+  }
+
   console.log('test_sendnotify_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })

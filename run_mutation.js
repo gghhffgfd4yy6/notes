@@ -5,14 +5,21 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+const crypto = require('crypto')
 const { spawn } = require('child_process')
+const { SUITES } = require('./test_suites')
 
 const ROOT = __dirname
+// 本地调度器的默认变异目标（F7）：必须与 CI 变异矩阵/ stryker.config.js 的 mutate 完全一致——
+// 此前这里只列了 8 个文件（CI 矩阵有 17 个），新增 mutate 目标时本地默认跑法会静默漏掉它，形成
+// 「本地跑过 = CI 也覆盖」的错觉，且没有任何门禁对账。该一致性现由 test_mutation_ranges.js 固定
+// （双向集合相等 + 每个目标可读），改 stryker.config.js 的 mutate 时必须同步本清单。
 const DEFAULT_FILES = [
-  'xbk_function_v3.js', 'xbk_agents.js', 'xbk_http.js',
-  'xbk_sendNotify_slim.js', 'xbk_storage.js', 'xbk_loop.js',
-  'xbk_failure_policy.js',
-  'qinglong/xbk_push.js'
+  'xbk_function_v3.js', 'xbk_app.js', 'xbk_filter.js', 'xbk_formatter.js',
+  'xbk_message_store.js', 'xbk_network.js', 'xbk_pusher.js', 'xbk_rules.js',
+  'xbk_utils.js', 'xbk_agents.js', 'xbk_http.js', 'xbk_sendNotify_slim.js',
+  'xbk_storage.js', 'xbk_loop.js', 'xbk_failure_policy.js', 'qinglong/xbk_push.js',
+  'scripts/check-deps.js', 'scripts/status.js'
 ]
 // 变异测试使用全量单元测试入口（覆盖全部未标记 integration/mutationSkip 的单元测试套件），而非仅 test_filter.js——
 // 此前只跑 test_filter.js 导致 #100/#101 新增的 1400+ 行测试对变异分数完全无效。
@@ -178,6 +185,64 @@ function collectMutants (files) {
   return all.map((m, index) => ({ ...m, id: index + 1 }))
 }
 
+// 参与判定的测试文件清单（F5）：变异分数由「跑的是哪条测试链、断言什么」决定，所以除变异集与源文件外，
+// 测试侧输入也必须进指纹——只改测试文件（哪怕等长）同样会改变「哪些变异体被杀」，不进指纹就会让中断续跑
+// 继承旧断点（0 个批次被评估、旧 killed/survived 原样重印、exit 0 且无告警）。
+// 范围取**本入口真正执行的那条测试链**，而不是「全仓所有文件」这种无界集合：
+//   ① run_unit_tests.js：DEFAULT_TEST 就是它（决定超时 / SKIP_SUITES 过滤 / 汇总口径）；
+//   ② test_suites.js：套件注册表，决定实际执行哪些套件；
+//   ③ SUITES 中会被 run_unit_tests.js 执行的套件（!integration && !mutationSkip）——integration 套件
+//      在变异评估里根本不跑、mutationSkip 在变异沙箱内被显式跳过，它们的改动不改变判定结果；
+//      SKIP_SUITES 也不参与：runTests 的 spawn 恒清空该变量，CLI 路径则由 mutation.yml 的 step env 设
+//      XBK_MUTATION_CHILD=1（见该处注释），都不经 SKIP_SUITES 过滤。
+// 有意不纳入的（口径边界，勿误读为「全仓都覆盖了」）：套件在运行期读盘的夹具与 CI 配置
+// （package.json / CHANGELOG.md / .github/workflows/*.yml / scripts/*.js 等）。把「测试运行期读到的
+// 一切」纳入会退化成无界集合（且 copyProject 已把它们列为必选输入，缺失即响亮报错）；此处只锚定
+// 「测试代码本身」这个有界、可枚举、与判定强相关的集合。夹具改动的残余口径缺口见 fix-fx6 报告。
+function judgingTestFiles () {
+  return ['run_unit_tests.js', 'test_suites.js',
+    ...SUITES.filter(s => !s.integration && !s.mutationSkip).map(s => s.file)]
+}
+
+// 单文件内容入哈希（F5）：文件名与内容各自带长度前缀——改名与「等长改内容」都会改变指纹。
+function hashFileContent (hash, root, file) {
+  const text = fs.readFileSync(path.join(root, file), 'utf8')
+  hash.update(`${Buffer.byteLength(file)}\u0000${file}\u0001`)
+  hash.update(`${Buffer.byteLength(text)}\u0000${text}\u0001`)
+}
+
+// 变异集指纹（F4/F5）：断点续跑只能按 id 恢复，而 id 是位置序号——源码一改（哪怕插入一行）全部 id
+// 平移，旧断点的 killed/survived 会被错记到别的候选头上。指纹覆盖三块输入，任一变化都会改变指纹 →
+// 断点被丢弃（响亮告警、从零重跑，不静默继承）：
+//   ① 每个候选的文件/区间/原文/替换串（顺序敏感：id 即顺序）；
+//   ② 被变异源文件的**原文**——等长且不触及变异 token 的改动（实测常量 1→9）不改变任何候选字段，
+//      却会改变判定结果；只哈希 ① 时这类改动会静默继承旧断点（与本函数原注释的声称相反）；
+//   ③ 参与判定的测试文件内容（见 judgingTestFiles）。
+// 用 NUL/SOH 分隔并各自带长度前缀，避免不同字段拼接出同一串（边界歧义）。
+// options（仅测试注入用，生产调用不传）：root / sourceFiles / testFiles 允许指向合成项目，
+// 使「仅改测试文件」与「等长源码改动」两条回归无需触碰真实工作区。
+function mutantFingerprint (mutants, options = {}) {
+  const root = options.root || ROOT
+  const sourceFiles = options.sourceFiles || DEFAULT_FILES
+  const testFiles = options.testFiles || judgingTestFiles()
+  const hash = crypto.createHash('sha256')
+  for (const m of mutants) {
+    for (const field of [m.file, m.start, m.end, m.original, m.replacement]) {
+      const text = String(field)
+      hash.update(`${Buffer.byteLength(text)}\u0000${text}\u0001`)
+    }
+  }
+  // 文件清单排序后入哈希：指纹锚定「集合与内容」，排序的**唯一目的**是消除调用方传入清单的顺序差异，
+  // 与比较方式无关（变异集自身仍按 id 顺序）。
+  // 显式码元序比较器（Sonar S2871：sort() 必须传比较函数）：Array.prototype.sort() 的默认行为就是逐
+  // UTF-16 码元比较，这里把它写实，取值语义一字不变；刻意**不用** localeCompare——它随宿主 locale 变序，
+  // 会让指纹跨机器漂移、破坏断点续跑（同 test_mutation_ranges.js / test_tls_prewarm.js 的 byCodeUnit 口径）。
+  const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+  for (const file of [...sourceFiles].sort(byCodeUnit)) hashFileContent(hash, root, file)
+  for (const file of [...testFiles].sort(byCodeUnit)) hashFileContent(hash, root, file)
+  return hash.digest('hex')
+}
+
 // node_modules 挂载（#136 review F3）：node_modules 属必选输入，symlinkSync 不校验目标是否存在，
 // 缺依赖时会留下悬空链接 → 沙箱内套件必然失败 → 每个变异体被判 killed → 分数虚高且 exit 0（不响亮的假绿）。
 // 从 copyProject 抽出为独立可调用点（dir = symlink 落点；sourceRoot = 依赖来源项目根，生产路径恒为 ROOT）：
@@ -300,10 +365,32 @@ function buildBatches (mutants, batchSize) {
   return batches
 }
 
+function killTree (child) {
+  // 超时杀伤（F6）：子进程以 detached:true 起（setsid 自成进程组组长），可整组杀伤，连同后代
+  // （run_unit_tests.js 派生的套件进程）一起清掉。只 kill 直接子进程时，后代仍持有 stdout/stderr
+  // 管道 → 'close' 被推迟到 2000ms 兜底保险，本次超时以 timeout 结算，而孤儿后代继续跑（占 CPU、
+  // 残留端口与临时目录，污染后续批次乃至整轮分数）。
+  // 组不存在（ESRCH）/无权限（EPERM）时退回直接子进程，行为与修复前一致；fake child（测试注入，
+  // 无 pid）同样走退回分支。
+  if (Number.isInteger(child.pid) && child.pid > 0) {
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+      return
+    } catch (e) {
+      // 退回直接子进程
+    }
+  }
+  child.kill('SIGKILL')
+}
+
 function runTests (dir, timeoutMs) {
   return new Promise(resolve => {
     // 变异评估必须跑全量套件 —— 清除 SKIP_SUITES，防止 CI 显式步骤的跳过清单继承到子进程使变异分数失真。
-    const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, XBK_MUTATION_CHILD: '1', SKIP_SUITES: '' } })
+    // PERF_MS='3000'（RT-F8）：与 stryker 路径（scripts/mutation-child.js:13 / mutation.yml step env）同口径，
+    // 放宽 test_filter.js 的性能断言阈值（默认 500ms）。此前本入口不注入，默认最多 8 并发下套件间的
+    // CPU 争抢与沙箱开销会让性能断言误失败 → 变异体被记 killed、分数虚高，且与 stryker 结果不可比。
+    // detached:true（F6）：让子进程自成进程组，超时据此整组杀伤（见 killTree）。
+    const child = spawn(DEFAULT_TEST[0], DEFAULT_TEST.slice(1), { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: { ...process.env, XBK_MUTATION_CHILD: '1', SKIP_SUITES: '', PERF_MS: '3000' } })
     let output = ''
     // 超时竞态修复：此前 setTimeout 回调里 kill 后立即 resolve，但此时 close 尚未触发、closeSignal 必为 null，
     // 且 stdout/stderr 还在继续排空——resolve 时既拿不到真实 signal（竞态），也拿不到最终完整 output，
@@ -321,7 +408,7 @@ function runTests (dir, timeoutMs) {
     child.stderr.on('data', d => { output += d })
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill('SIGKILL')
+      killTree(child)
       // 兜底保险：kill 后若 close 迟迟不触发（极端情况），仍要 resolve 不让 Promise 悬空——
       // 用当前已 collect 的输出，signal 回退 'SIGKILL'（真实 close signal 已无从得知）。
       // 正常 kill 会在毫秒级触发 close，此保险不会与 close 的 resolve 竞争（close 到达即
@@ -529,7 +616,24 @@ async function main (deps) {
   }
   const mutants = collectMutants(files)
   const byId = new Map(mutants.map(m => [m.id, m]))
-  const old = loadCheckpoint(checkpointFile)
+  // 断点必须与当前源码/变异集/测试链绑定（F4/F5）：id 只是位置序号（index+1），源码一旦改动（插入
+  // 一行即可让全部 id 平移），旧断点的 killed/survived 就会被错记到别的候选头上——既虚增分数，也让
+  // 真正改动过的代码免于变异。故在此记录指纹（每个候选的 file/区间/原文/替换串 + 被变异源文件原文 +
+  // 参与判定的测试文件内容，见 mutantFingerprint），恢复时不一致即丢弃旧断点并从零开始（响亮告警，
+  // 不静默继承）。升级前的旧断点没有该字段，同样视为不可信。
+  const fingerprint = mutantFingerprint(mutants)
+  const loaded = loadCheckpoint(checkpointFile)
+  const staleReason = !loaded
+    ? null
+    : typeof loaded.fingerprint !== 'string'
+      ? '断点没有源码指纹（升级前格式）'
+      : loaded.fingerprint !== fingerprint
+        ? '断点指纹与当前源码/变异集/测试链不一致（源码或测试已变更）'
+        : null
+  if (staleReason) {
+    console.warn(`⚠️  丢弃断点 ${checkpointFile}：${staleReason}；旧判定结果不可继承，本轮从零开始`)
+  }
+  const old = staleReason ? null : loaded
   const killed = new Map((old && old.killed) || [])
   const survived = new Map((old && old.survived) || [])
   const compileErrors = new Map((old && old.compileErrors) || [])
@@ -546,6 +650,7 @@ async function main (deps) {
   const persist = () => saveCheckpoint(checkpointFile, {
     total: mutants.length,
     batchSize,
+    fingerprint,
     killed: [...killed.entries()],
     survived: [...survived.entries()],
     compileErrors: [...compileErrors.entries()],
@@ -596,10 +701,21 @@ async function main (deps) {
   }
   const reportFile = path.join(ROOT, 'mutation-report.json')
   saveCheckpoint(reportFile, report)
+  // 未判定变异体（F4）：报告里 status='pending' 的候选从未被任何批次评估过（断点被截断/损坏，
+  // 或 killed/survived 记到了不存在的 id 上）。它们既不算 killed 也不算 survived，而退出码只看
+  // survived/timeout → 会以 0 收场（「跑完了、分数很高」的假绿）。此处改为响亮失败，并保留断点
+  // 文件供排查（不删），让「未判定」不可能被当成「已检出」。
+  const undetermined = mutants.filter(m => !killed.has(m.id) && !survived.has(m.id) && !compileErrors.has(m.id))
+  if (undetermined.length) {
+    console.error(`❌ 未判定变异体 ${undetermined.length}/${mutants.length} 个（未被任何批次覆盖）：分数不可信，按失败退出`)
+    console.error(`   断点文件保留在 ${checkpointFile}（确认后可删除并重跑）`)
+    process.exitCode = 1
+    return
+  }
   try { fs.unlinkSync(checkpointFile) } catch (e) { /* 完成后没有断点文件也不影响报告 */ }
   console.log(`完成：total=${report.total} killed=${report.killed} survived=${report.survived} timeout=${report.timeout}`)
   process.exitCode = report.survived || report.timeout ? 1 : 0
 }
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1 })
-module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate }
+module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate, DEFAULT_FILES, mutantFingerprint, judgingTestFiles }

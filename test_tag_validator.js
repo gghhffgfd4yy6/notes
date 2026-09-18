@@ -117,6 +117,81 @@ for (const { re, desc } of FORBIDDEN_PATTERNS) {
   }
 }
 
+// ── 字符类范围强制登记（F5）：locale/校对序敏感性 ──────────────────────────────
+// 上面的黑名单覆盖的是「转义/构造形态」，唯独漏了字符类**范围** `[a-z]`：bash ERE 的范围按当前
+// LC_COLLATE 的校对序展开（某些 locale 下 [A-Z] 会匹配小写字母），JS RegExp 恒按码点展开——两方言
+// 可能分叉，而逐字断言与上面的黑名单都不会报红。改为**强制登记**：正则里出现任何未登记的范围即红，
+// 新增范围必须先人工复核 locale 敏感性并在此登记理由；登记表本身只允许 ASCII 端点（非 ASCII 范围
+// 的展开差异是实打实的风险，不能靠「登记」放行）。
+// 残留边界（如实登记）：登记的 ASCII 范围在非 C locale 下是否与 JS 完全一致，属环境依赖的理论风险
+// ——本测试只能保证「范围集合被显式枚举且理由在案」，不能证明 bash 侧任一 locale 下的展开。
+const REGISTERED_CHAR_RANGES = new Map([
+  ['0-9', 'ASCII 十进制数字（版本号核心/后缀）'],
+  ['1-9', 'ASCII 非零数字（禁前导零）'],
+  ['A-Z', 'ASCII 大写字母（后缀标识符）'],
+  ['a-z', 'ASCII 小写字母（后缀标识符）']
+])
+
+/**
+ * 从正则源码里提取所有字符类范围（`X-Y` 形态，X/Y 为单字符且非转义）；用于强制登记。
+ * @param {string} source 正则源码（不含分隔符）
+ * @returns {string[]} 形如 ['0-9','A-Z'] 的范围列表（按出现顺序）
+ */
+function charClassRanges (source) {
+  const ranges = []
+  // S8786（超线性回溯）：原 /\[([^\]]*)\]/g 的 [^\]]* 对每个 '[' 都会一直扫到串尾，
+  // 在 `[[[[…` 这类未闭合输入上退化成 O(n²)；改为线性扫描——每个 '[' 只跳到其配对的首个
+  // ']'，其后从 ']' 之后继续找下一个 '['，与 matchAll 的非重叠匹配语义逐例等价（见下方自检）。
+  // S2310（循环计数器不得在循环体内被赋值）：原写法把 open 当 for 计数器、又在循环体末尾 `open = close`，
+  // 触发该规则。该赋值**不是死存储**——它被 for 的更新表达式 `open = indexOf('[', open + 1)` 读到，删掉
+  // 会退回从 '[' 之后重扫、破坏「不从匹配体内重扫」的口径（下面 `a][0-9]` 等自检会红），故不能按死存储
+  // 删除。这里也无需 NOSONAR 抑制：改用等价的 while 扫描后 open 不再是 for 计数器，规则前提本身消失。
+  // 语义映射：for 的 init/test/step 分别对应 while 前的初始化、while 条件、循环体末尾的推进，
+  // 且 for 的「先 step 再 test」与 while 的「先推进再回到条件」同序，逐例等价。
+  let open = source.indexOf('[')
+  while (open !== -1) {
+    const close = source.indexOf(']', open + 1)
+    if (close === -1) break // 其后不会再有闭合的字符类
+    const body = source.slice(open + 1, close)
+    for (let i = 0; i + 2 < body.length; i++) {
+      if (body[i + 1] === '-' && body[i] !== '\\') {
+        ranges.push(`${body[i]}-${body[i + 2]}`)
+        i += 2
+      }
+    }
+    open = source.indexOf('[', close + 1) // 已消费到闭合 ']'，与 matchAll 一样不从匹配体内重扫
+  }
+  return ranges
+}
+
+// 自检：提取器必须真的能识别未登记范围（否则「未登记即红」只是空承诺）。
+// 用非 ASCII 范围做样本，避免与生产正则撞车。
+assert.deepStrictEqual(charClassRanges('[a-z]'), ['a-z'], '提取器应识别单个范围')
+assert.deepStrictEqual(charClassRanges('[0-9A-Za-z-]'), ['0-9', 'A-Z', 'a-z'], '一个字符类里的多个范围都要提取（末尾字面 - 不算范围）')
+assert.deepStrictEqual(charClassRanges('[-+]'), [], '单一字面字符不构成范围')
+assert.deepStrictEqual(charClassRanges('[А-Я]'), ['А-Я'], '非 ASCII 范围同样要被提取出来（以便判红）')
+assert.deepStrictEqual(charClassRanges('[a-zA-Z]'), ['a-z', 'A-Z'])
+// 线性扫描改写（S8786）的边界锚点：未闭合 / 嵌套 '[' 的口径必须与原 matchAll 版一致
+assert.deepStrictEqual(charClassRanges('[[x]'), [], '嵌套未闭合的 [ 不产生范围（body=`[x`，与原 [^\\]]* 口径一致）')
+assert.deepStrictEqual(charClassRanges('[abc'), [], '没有闭合 ] 时不得提取（原正则同样无匹配）')
+assert.deepStrictEqual(charClassRanges('a][0-9]'), ['0-9'], '闭合 ] 之后的字符类仍要提取，且不从匹配体内重扫')
+for (const [range, why] of REGISTERED_CHAR_RANGES) {
+  const [from, to] = range.split('-')
+  assert.ok(from.codePointAt(0) < 128 && to.codePointAt(0) < 128,
+    `登记表只应登记 ASCII 范围，${range}（${why}）不是——非 ASCII 范围的 locale 展开差异不得靠登记放行`)
+}
+
+// 生产正则（脚本 + release.yml 每一处内联副本）里的范围必须全部已登记
+for (const [label, source] of [
+  ['scripts/validate-release-tag.js 的 SEMVER_RE', scriptSource],
+  ...versionAsserts.map(({ index, bashRegexSource }) => [`${describeAt(index)} 的 bash 正则`, bashRegexSource])
+]) {
+  for (const range of charClassRanges(source)) {
+    assert.ok(REGISTERED_CHAR_RANGES.has(range),
+      `${label} 含未登记的字符类范围 [${range}]：bash ERE 的范围按 locale 校对序展开、可能与 JS RegExp 分叉——人工复核后登记到 REGISTERED_CHAR_RANGES 并写明理由，不得直接放行`)
+  }
+}
+
 // 合法 tag 集合（语义：v数字.数字[.数字][-prerelease][+build]；禁止前导零；后缀组件非空）
 const validTags = [
   'v3.272', // 两段（CHANGELOG 风格）
@@ -331,11 +406,11 @@ console.log('✅ release.yml 步骤级回归通过：notes 含要点正文 + 章
 // （见 validate-release-tag.js 的 `tag.startsWith('v') ? tag.slice(1) : tag`），此时旧文案会凭空补一个 v
 // ——打印的 tag 与真实入参不符（'3.272' 打成 'v3.272'、'01.2.3' 打成 'v01.2.3'）。
 // 故鉴别力全在「裸版本号」这组入参上；带 v 的入参两版实现输出相同，只作「回显的是 tag 原文」的补充。
-// 本文件已有的 spawnSync 跑的是 release.yml 里的 node 载荷，本 CLI 分支另无覆盖，故此处直接以子进程
-// 跑 scripts/validate-release-tag.js（cwd 固定 __dirname，不写绝对路径）。
+// 本文件已有的 spawnSync 跑的是 release.yml 里的 node 载荷；本 CLI 分支由下面这段直接以子进程覆盖
+// （cwd 固定 __dirname，不写绝对路径），覆盖 exit 0/1/2 三个退出码与两处文案。
 const TAG_CLI = path.join(__dirname, 'scripts', 'validate-release-tag.js')
-function runTagCli (tag) {
-  const res = spawnSync(process.execPath, [TAG_CLI, tag], { cwd: __dirname, encoding: 'utf8', timeout: 20000 })
+function runTagCli (...args) {
+  const res = spawnSync(process.execPath, [TAG_CLI, ...args], { cwd: __dirname, encoding: 'utf8', timeout: 20000 })
   assert.strictEqual(res.error, undefined,
     'tag CLI 子进程应能启动（本机需 NODE_OPTIONS=--require .local/execpath-shim.js）：' + (res.error && res.error.message))
   return { status: res.status, stdout: res.stdout, stderr: res.stderr }
@@ -359,4 +434,13 @@ assert.ok(bareFail.stderr.startsWith("❌ tag 名称 '01.2.3' 不是合法版本
 assert.strictEqual(runTagCli('v3.272').stdout.trim(), '版本号格式校验通过：v3.272',
   '带 v 的入参应原样回显（回显 tag 原文，而非去掉 v 的 version）')
 
-console.log('✅ validate-release-tag.js CLI 回归通过：裸版本号不补 v（成功/失败两处文案）+ 带 v 原样回显')
+// ④ 无参（用法错误）：exit 2 + 用法提示，且不得输出成功文案。
+// audit 指出该分支此前没有任何断言（改错退出码/删掉用法提示都不会被发现）。
+const noArg = runTagCli()
+assert.strictEqual(noArg.status, 2,
+  '未提供 tag 应 exit 2（用法错误，与「非法 tag」的 exit 1 区分），实际 ' + noArg.status)
+assert.ok(noArg.stderr.includes('用法') && noArg.stderr.includes('validate-release-tag.js'),
+  '无参应输出用法提示，实际 stderr: ' + JSON.stringify(noArg.stderr))
+assert.strictEqual(noArg.stdout, '', '无参不得输出成功文案，实际 stdout: ' + JSON.stringify(noArg.stdout))
+
+console.log('✅ validate-release-tag.js CLI 回归通过：裸版本号不补 v（成功/失败两处文案）+ 带 v 原样回显 + 无参 exit 2')

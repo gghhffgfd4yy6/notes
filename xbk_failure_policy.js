@@ -6,7 +6,13 @@
 const RETRYABLE_CODES = new Set([
   'ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EPIPE',
   'EHOSTUNREACH', 'ENETUNREACH', 'ENETRESET', 'EAI_AGAIN', 'ERR_SOCKET_CLOSED',
-  'ABORT_ERR', 'HTTP_408', 'HTTP_409', 'HTTP_425', 'HTTP_429'
+  'ABORT_ERR', 'HTTP_408', 'HTTP_409', 'HTTP_425', 'HTTP_429',
+  // XHTTP-05：空响应体（含剥离 BOM 后的空体、纯空白体）单列可重试码。上游「连上后未写体即结束」是
+  // 典型瞬时故障（网关/后端抖动），重试一次通常即可恢复；而「返回了内容但不是 JSON」是合约性错误
+  // （ERR_BODY_NOT_JSON，仍在 PERMANENT_CODES）。旧实现两者共用一个码 → 一次瞬时空体被判永久停推。
+  // 显式列进本集合（而不是留空让它落 UNKNOWN）是为了让口径可审计：归类理由即本码本身，
+  // 不依赖「未知默认保守重试」的兜底，避免日后有人收紧兜底时语义被静默翻转。
+  'ERR_EMPTY_BODY'
 ])
 
 const PERMANENT_CODES = new Set([
@@ -206,6 +212,16 @@ function codeIs (code, set) {
   return Boolean(code && set.has(String(code).toUpperCase()))
 }
 
+// XFP-01：4xx 里这几类不是「请求本身有问题」，而是暂时性语义（408 请求超时 / 409 冲突 /
+// 425 过早 / 429 限流），与 RETRYABLE_CODES 里的 HTTP_408/409/425/429 是同一口径。
+// 数字 code 与 providerCode 落在同一数值区间时必须按同一语义裁决：若只按「400<=n<500 → permanent」
+// 无差别判定，同一 4xx 语义在不同承载字段下会分类相反，4xx 的限流/超时被误判永久而停止重试。
+const RETRYABLE_HTTP_STATUS = new Set([408, 409, 425, 429])
+
+function isRetryableHttpStatus (n) {
+  return RETRYABLE_HTTP_STATUS.has(n) || (n >= 500 && n <= 599)
+}
+
 function classifyOne (error) {
   const info = summarizeError(error)
 
@@ -265,9 +281,18 @@ function classifyOne (error) {
   if (permanentMessage) {
     return { kind: 'permanent', reason: 'CONFIG_OR_CONTRACT', info }
   }
+  // XHTTP-06：终态 3xx 是**确定性**结果——got 默认跟随重定向，外层还能看到终态 3xx 只有三种可能：
+  // followRedirect:false、3xx 不带 Location、或 304 Not Modified；重试同一个 URL 仍会得到同一个 3xx，
+  // 故归 permanent（配置/契约类），与 4xx 同侧。此前它在四种承载字段（数字 code、providerCode、
+  // HTTP_ 前缀、statusCode）下都落 UNKNOWN → 可重试，而 HTTP 层把终态 3xx 归成 ERR_BODY_NOT_JSON（永久）
+  // ——同一状态码在「错误码字符串」与「statusCode」两条路径上分类相反。这里按区间统一，不逐条枚举
+  // （HTTP_300-399 共 100 项）。
   const numericCode = Number(code)
-  if (code === '1001' || code === '429' || (Number.isInteger(numericCode) && numericCode >= 500 && numericCode <= 599)) {
+  if (code === '1001' || (Number.isInteger(numericCode) && isRetryableHttpStatus(numericCode))) {
     return { kind: 'retryable', reason: `PROVIDER_${code}`, info }
+  }
+  if (Number.isInteger(numericCode) && numericCode >= 300 && numericCode < 400) {
+    return { kind: 'permanent', reason: `PROVIDER_${code}`, info }
   }
   if (Number.isInteger(numericCode) && numericCode >= 400 && numericCode < 500) {
     return { kind: 'permanent', reason: `PROVIDER_${code}`, info }
@@ -276,23 +301,28 @@ function classifyOne (error) {
     return { kind: 'retryable', reason: 'PROVIDER_RATE_LIMIT', info }
   }
   const providerNumber = Number(providerCode)
-  if (Number.isInteger(providerNumber) && providerNumber >= 400 && providerNumber < 500) {
+  if (Number.isInteger(providerNumber) && isRetryableHttpStatus(providerNumber)) {
+    return { kind: 'retryable', reason: `PROVIDER_${providerNumber}`, info }
+  }
+  if (Number.isInteger(providerNumber) && providerNumber >= 300 && providerNumber < 400) {
     return { kind: 'permanent', reason: `PROVIDER_${providerNumber}`, info }
   }
-  if (Number.isInteger(providerNumber) && providerNumber >= 500 && providerNumber <= 599) {
-    return { kind: 'retryable', reason: `PROVIDER_${providerNumber}`, info }
+  if (Number.isInteger(providerNumber) && providerNumber >= 400 && providerNumber < 500) {
+    return { kind: 'permanent', reason: `PROVIDER_${providerNumber}`, info }
   }
   if (code.startsWith('HTTP_')) {
     const n = Number(code.slice(5))
     if (n === 408 || n === 409 || n === 425 || n === 429 || n >= 500) {
       return { kind: 'retryable', reason: code, info }
     }
+    if (n >= 300 && n < 400) return { kind: 'permanent', reason: code, info }
     if (n >= 400 && n < 500) return { kind: 'permanent', reason: code, info }
   }
   if (status !== null) {
     if (status === 408 || status === 409 || status === 425 || status === 429 || status >= 500) {
       return { kind: 'retryable', reason: `HTTP_${status}`, info }
     }
+    if (status >= 300 && status < 400) return { kind: 'permanent', reason: `HTTP_${status}`, info }
     if (status >= 400 && status < 500) return { kind: 'permanent', reason: `HTTP_${status}`, info }
   }
 
@@ -304,9 +334,23 @@ function classifyOne (error) {
   return { kind: 'retryable', reason: 'UNKNOWN', info }
 }
 
+// XFP-05：聚合失败的子错误可以挂在两个位置上——错误对象自身（error.failures）或
+// failureInfo.failures（qinglong 适配器把子通道结果放进 failureInfo 上报）。父级标签的
+// 「子级可重试优先」仲裁必须对两者一视同仁，否则同一形状换个承载字段就分类相反：
+// {failureKind:'permanent', failures:[{code:'ETIMEDOUT'}]} → retryable，
+// 而 {failureKind:'permanent', failureInfo:{failures:[{code:'ETIMEDOUT'}]}} → permanent（停止重试、漏推）。
+function nestedFailuresOf (error) {
+  const direct = safeArray(readProp(error, 'failures'))
+  if (direct && direct.length > 0) return direct
+  const info = readProp(error, 'failureInfo')
+  if (!info || typeof info !== 'object') return null
+  const viaInfo = safeArray(readProp(info, 'failures'))
+  return viaInfo && viaInfo.length > 0 ? viaInfo : null
+}
+
 function classifyFailure (error) {
   const explicitKind = readProp(error, 'failureKind')
-  const nested = safeArray(readProp(error, 'failures'))
+  const nested = nestedFailuresOf(error)
   // 聚合失败的子错误优先于父级预填标签，避免父级 permanent 覆盖子级 retryable。
   if ((explicitKind === 'retryable' || explicitKind === 'permanent') && !(nested && nested.length > 0)) {
     return { kind: explicitKind, reason: readProp(error, 'failureReason') || 'EXPLICIT', info: summarizeError(error) }

@@ -44,6 +44,33 @@ const {
   assert.strictEqual(writeAtomic(nested, 'nested-ok'), true, '嵌套路径应自动创建父目录')
   assert.strictEqual(fs.readFileSync(nested, 'utf8'), 'nested-ok')
 
+  // ===== STG-06：新建父目录必须显式 0o700，不得随 umask（022 下旧行为 0755）=====
+  // 旧实现 mkdirSync(dir, { recursive: true }) 不传 mode，目录权限由 umask 决定，与本模块
+  // 文件的 0o600 口径不一致。断言两路：① 传给 mkdirSync 的 mode 必须显式 0o700（本机 umask=077
+  // 会让「实际权限」断言在修前也成立，只有参数断言能证伪）；② 新建目录的实际权限位为 0700。
+  const mkdirCalls = []
+  const origMkdirSync = fs.mkdirSync
+  fs.mkdirSync = (target, options) => { mkdirCalls.push({ target, options }); return origMkdirSync.call(fs, target, options) }
+  let permRet
+  try { permRet = writeAtomic(make('perm/a/b/c.txt'), 'perm') } finally { fs.mkdirSync = origMkdirSync }
+  assert.strictEqual(permRet, true, '新目录下的写入应成功')
+  assert.ok(mkdirCalls.length > 0, '父目录不存在时必须调用 mkdirSync')
+  assert.ok(mkdirCalls.every((c) => c.options && c.options.mode === 0o700),
+    `mkdirSync 必须显式传 mode 0o700（旧实现不传；实际：${JSON.stringify(mkdirCalls.map((c) => c.options))}）`)
+  assert.strictEqual(fs.statSync(make('perm/a')).mode & 0o777, 0o700, '新建目录实际权限应为 0700')
+  assert.strictEqual(fs.statSync(make('perm/a/b')).mode & 0o777, 0o700, '递归新建的每一级目录都应为 0700')
+  // 已存在目录不得被 chmod（不改动部署侧既有权限）：预先建一个 0755 目录，再写入其下文件
+  const preexisting = make('preexist')
+  fs.mkdirSync(preexisting, { recursive: true, mode: 0o755 })
+  // NOSONAR（S2612 误报）：mkdir 的 mode 会被 umask 裁掉（本机 077 → 0700、CI 022 → 0755），
+  // 要拿到确定的 0755 夹具只能显式 chmod。该目录位于 mkdtempSync 建的私有临时目录内，0755
+  // 不含组/其他用户写位；且它正是下一行「既有目录权限不得被改动」断言的分母——改成 0700 会让
+  // 断言失去区分度（被测实现 chmod 成 0700 时无法证伪）。权限本身安全，故就地抑制。
+  fs.chmodSync(preexisting, 0o755) // NOSONAR
+  const beforeMode = fs.statSync(preexisting).mode & 0o777
+  assert.strictEqual(writeAtomic(make('preexist/f.txt'), 'x'), true, '已存在目录下的写入应成功')
+  assert.strictEqual(fs.statSync(preexisting).mode & 0o777, beforeMode, '已存在的目录不得被 chmod')
+
   // ===== STG-03：空串路径必须显式拒绝（旧实现判为「ENOENT=缺失=安全」）=====
   // 本机实测：lstatSync('') 抛 ENOENT，旧实现因此返回 true；空 filePath 会让 writeAtomic 在
   // 进程 CWD 先落一个含 payload 的唯一临时文件（随后 renameSync(tmp,'') 才失败）。
@@ -94,6 +121,123 @@ const {
   // 写入目录路径应失败
   assert.strictEqual(writeAtomicIfAbsent(dirPath, 'x'), false, '写入目录路径应返回 false')
 
+  // ===== STG-02：写失败必须清理本次调用创建的半写残骸 =====
+  // 旧实现 wx 直写真实路径，写中途失败（ENOSPC 等）把半写文件留在缓存路径；消费侧
+  // xbk_message_store._ensureFileExists 以 existsSync 早退，坏文件被当成「已初始化」→ 永久不自愈。
+  const partial = make('partial.txt')
+  const origWriteFileSync = fs.writeFileSync
+  fs.writeFileSync = (target, ...rest) => {
+    if (typeof target !== 'number') return origWriteFileSync(target, ...rest)
+    origWriteFileSync(target, 'half') // 模拟「已写入半份内容，随后设备写满」
+    throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+  }
+  let partialRet
+  try { partialRet = writeAtomicIfAbsent(partial, 'full-payload') } finally { fs.writeFileSync = origWriteFileSync }
+  assert.strictEqual(partialRet, false, '写失败应返回 false')
+  assert.strictEqual(fs.existsSync(partial), false, '写失败后不得留下半写残骸（否则 existsSync 早退使缓存永久不自愈）')
+  // 残骸若留下会怎样：下一次调用走 EEXIST 早退、返回 true，把**半写的坏内容**当成有效缓存。
+  // 这里断言修后能真正重新初始化出有效内容（半写残骸存在时该断言为红）。
+  assert.strictEqual(writeAtomicIfAbsent(partial, '[]'), true, '残骸清理后下一次初始化应成功')
+  assert.strictEqual(fs.readFileSync(partial, 'utf8'), '[]', '下一次初始化必须写入有效内容（残骸存在时 EEXIST 早退，坏内容永久残留）')
+
+  // ===== WIN-01（qodo #154 发现 1）：写失败清理必须先 close 再 unlink =====
+  // Windows 上「本进程仍持有句柄」的文件 unlink 会抛 EPERM/EBUSY，半写残骸于是留在缓存路径；
+  // 而消费侧 _ensureFileExists 以 existsSync 早退 → 坏文件被当成「已初始化」。旧实现在 catch 里
+  // 直接 unlinkSync，fd 要等到 finally 才关闭。
+  // 本机是 Linux/FUSE：unlink 已打开的 fd 本来就允许，**无法直接复现 Windows 内核行为**，故用
+  // 「Windows 语义替身」：跟踪 openSync 得到的 fd，unlinkSync 遇到仍打开的目标即抛 EPERM。据此
+  // 三条断言全部可在本机判定：① 失败路径的调用序列必须是 close → unlink，且同一 fd 只被关闭一次
+  // （关后置 fd = -1，finally 兜底不得重关）；② 残骸（Windows 语义下不可删的那个文件）已被移除；
+  // ③ 下一次调用能写出有效内容而不是 EEXIST 早退。
+  const winTarget = make('win-absent.txt')
+  const winEvents = []
+  const openFds = new Map() // 当前打开：fd → 路径（替身里 unlink 的准入判据）
+  const knownFds = new Map() // 本窗口内见过的所有 fd → 路径（识别对已关闭 fd 的重复 close）
+  const origOpenSyncW = fs.openSync
+  const origCloseSyncW = fs.closeSync
+  const origUnlinkSyncW = fs.unlinkSync
+  const origWriteFileSyncW = fs.writeFileSync
+  fs.openSync = (target, ...rest) => {
+    const f = origOpenSyncW.call(fs, target, ...rest)
+    if (typeof target === 'string') { openFds.set(f, target); knownFds.set(f, target) }
+    return f
+  }
+  fs.closeSync = (f) => {
+    if (typeof f === 'number' && knownFds.get(f) === winTarget) winEvents.push('close')
+    if (typeof f === 'number') openFds.delete(f)
+    return origCloseSyncW.call(fs, f)
+  }
+  fs.unlinkSync = (target) => {
+    if (target === winTarget) {
+      winEvents.push('unlink')
+      // Windows 语义：目标仍被本进程打开时 unlink 失败（旧实现正是踩在这里，fd 要等 finally 才关）
+      if ([...openFds.values()].includes(winTarget)) {
+        throw Object.assign(new Error('EPERM: operation not permitted, unlink'), { code: 'EPERM' })
+      }
+    }
+    return origUnlinkSyncW.call(fs, target)
+  }
+  fs.writeFileSync = (target, ...rest) => {
+    if (typeof target !== 'number') return origWriteFileSyncW.call(fs, target, ...rest)
+    origWriteFileSyncW.call(fs, target, 'half') // 半写内容先落盘，随后设备写满
+    throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+  }
+  let winRet
+  try { winRet = writeAtomicIfAbsent(winTarget, '[]') } finally {
+    fs.openSync = origOpenSyncW
+    fs.closeSync = origCloseSyncW
+    fs.unlinkSync = origUnlinkSyncW
+    fs.writeFileSync = origWriteFileSyncW
+  }
+  assert.strictEqual(winRet, false, '写失败应返回 false')
+  assert.deepStrictEqual(winEvents, ['close', 'unlink'],
+    `失败路径必须先 close 再 unlink，且同一 fd 只关一次（fd 未置 -1 时 finally 会重关）；实测序列 ${JSON.stringify(winEvents)}`)
+  assert.strictEqual(fs.existsSync(winTarget), false,
+    'Windows 语义下写失败后残骸必须已被移除（旧实现 fd 未关，unlink 抛 EPERM，残骸留在缓存路径）')
+  assert.strictEqual(writeAtomicIfAbsent(winTarget, '[]'), true, '残骸移除后下一次初始化应成功')
+  assert.strictEqual(fs.readFileSync(winTarget, 'utf8'), '[]',
+    '下一次初始化必须写入有效内容（残骸被当成「已初始化」时这里是半写的 half）')
+
+  // 反向对照：EEXIST（另一进程已创建）不得被「清理残骸」误删——那是别人的有效缓存
+  const keep = make('keep.txt')
+  fs.writeFileSync(keep, 'first')
+  assert.strictEqual(writeAtomicIfAbsent(keep, 'second'), true, '已存在文件应返回 true（EEXIST 视为初始化成功）')
+  assert.strictEqual(fs.readFileSync(keep, 'utf8'), 'first', 'EEXIST 时不得清理/覆盖已存在的有效文件')
+
+  // ===== STG-04：原子写必须在 rename 前 fsync 临时文件，并对父目录 fsync =====
+  // 旧实现直接 writeFileSync(tmp)+renameSync：rename 的原子性只对进程崩溃成立，掉电时目录项与
+  // 内容都可能丢失。修后顺序固定为 fsync(内容) → rename → fsync(父目录)。
+  const order = []
+  const origFsync = fs.fsyncSync
+  const origRename2 = fs.renameSync
+  fs.fsyncSync = (target) => { order.push(order.length === 0 ? 'fsync-file' : 'fsync'); return origFsync.call(fs, target) }
+  fs.renameSync = (a, b) => { order.push('rename'); return origRename2.call(fs, a, b) }
+  let durableOk
+  try { durableOk = writeAtomic(make('durable.txt'), 'durable') } finally { fs.fsyncSync = origFsync; fs.renameSync = origRename2 }
+  assert.strictEqual(durableOk, true, '补 fsync 后正常写入仍应成功')
+  assert.ok(order.includes('fsync-file'), 'writeAtomic 必须在 rename 前 fsync 临时文件（否则掉电可丢内容）')
+  assert.ok(order.indexOf('fsync-file') < order.indexOf('rename'), '文件 fsync 必须发生在 rename 之前（提交点唯一）')
+  assert.ok(order.lastIndexOf('fsync') > order.indexOf('rename'), 'rename 之后必须 fsync 父目录（否则掉电可丢目录项）')
+  assert.strictEqual(fs.readFileSync(make('durable.txt'), 'utf8'), 'durable', 'fsync 之后内容仍应是本次写入的')
+
+  // writeAtomicIfAbsent 走同一口径（无 rename 提交点，但内容同样要先落盘）
+  const order2 = []
+  fs.fsyncSync = (target) => { order2.push('fsync'); return origFsync.call(fs, target) }
+  let absentOk
+  try { absentOk = writeAtomicIfAbsent(make('durable2.txt'), 'durable2') } finally { fs.fsyncSync = origFsync }
+  assert.strictEqual(absentOk, true, '独占初始化写也应成功')
+  assert.ok(order2.includes('fsync'), 'writeAtomicIfAbsent 必须 fsync 后才视为初始化成功')
+
+  // 文件 fsync 失败必须 fail-closed：删 tmp、返回 false，不得留下「已提交」的假象
+  const origFsync3 = fs.fsyncSync
+  fs.fsyncSync = () => { throw Object.assign(new Error('EIO'), { code: 'EIO' }) }
+  const leftover = fs.readdirSync(tmp).filter((f) => f.startsWith('durable3.txt'))
+  let fsyncFailRet
+  try { fsyncFailRet = writeAtomic(make('durable3.txt'), 'nope') } finally { fs.fsyncSync = origFsync3 }
+  assert.strictEqual(fsyncFailRet, false, 'fsync 失败时不得报成功')
+  assert.strictEqual(fs.existsSync(make('durable3.txt')), false, 'fsync 失败时目标文件不得出现（未提交）')
+  assert.deepStrictEqual(fs.readdirSync(tmp).filter((f) => f.startsWith('durable3.txt')), leftover, 'fsync 失败时不得残留 .tmp')
+
   // ===== readSafeTextResult =====
   // 不存在 → missing
   const r1 = readSafeTextResult(make('missing.txt'))
@@ -129,9 +273,40 @@ const {
   const r4b = readSafeTextResult(bigFile, 0)
   assert.strictEqual(r4b.status, 'ok', 'maxBytes=0 应不限制大小')
 
+  // ===== STG-01：上限必须约束真正的读取（fstat 与内容读取同一 fd、同一字节区间）=====
+  // 旧实现：fstat(fd) 只用来看 size，内容却按路径 readFileSync(filePath) 整读——检查值与实际
+  // 读到的字节数之间没有任何约束，同一 inode 就地 append 即可在窗口内绕过 maxBytes（把整份
+  // 膨胀文件读进内存）。修后按 fd 有界读取，返回内容不可能超过 fstat 观测到的字节数。
+  const grown = make('grown.txt')
+  fs.writeFileSync(grown, 'y'.repeat(100))
+  const origFstat = fs.fstatSync
+  const fakeStat = (s) => ({ isFile: () => s.isFile(), size: 50, dev: s.dev, ino: s.ino })
+  fs.fstatSync = (target) => fakeStat(origFstat.call(fs, target))
+  let raced
+  try { raced = readSafeTextResult(grown, 50) } finally { fs.fstatSync = origFstat }
+  assert.strictEqual(raced.status, 'ok', 'size 观测值未超上限时应判 ok（growth 发生在检查之后）')
+  assert.strictEqual(raced.text.length, 50, '读取长度必须受 fstat 观测值约束（旧实现按路径整读，返回 100 字节）')
+  assert.strictEqual(raced.text, 'y'.repeat(50), '有界读取应返回文件前缀而非截断后的其它内容')
+
   // 目录路径打开后 fstat 非文件 → unsafe
   const r5 = readSafeTextResult(dirPath)
   assert.strictEqual(r5.status, 'unsafe', '目录路径应返回 unsafe（fstat 非文件）')
+
+  // ===== SS-03：options.tail 超限时读尾部而不是判 tooLarge =====
+  // 追加式日志可超过上限（写入侧 fail-open），消费方只关心最近记录；旧行为一律 tooLarge，
+  // 整个部件在 --status 里变成「不可读」。
+  const tailFile = make('tail.txt')
+  fs.writeFileSync(tailFile, 'A'.repeat(400) + 'B'.repeat(100)) // 共 500 字节，尾部为 100 个 B
+  const tailMiss = readSafeTextResult(tailFile, 50)
+  assert.strictEqual(tailMiss.status, 'tooLarge', '默认（不传 tail）超限仍必须判 tooLarge，行为不得回归')
+  const tailHit = readSafeTextResult(tailFile, 100, { tail: true })
+  assert.strictEqual(tailHit.status, 'ok', 'tail=true 时超限应读尾部而不是 tooLarge（修前为 tooLarge）')
+  assert.strictEqual(tailHit.text, 'B'.repeat(100), 'tail=true 应返回最后 maxBytes 字节')
+  assert.strictEqual(tailHit.truncated, true, '尾部读取必须标记 truncated，调用方才知道首行可能是半行')
+  const tailWhole = readSafeTextResult(tailFile, 1024, { tail: true })
+  assert.strictEqual(tailWhole.text.length, 500, '未超限时 tail 选项不得改变结果（仍返回全文）')
+  assert.strictEqual(tailWhole.truncated, undefined, '未发生截断时不得标记 truncated')
+  assert.strictEqual(readSafeText(tailFile, 100, { tail: true }), 'B'.repeat(100), 'readSafeText 也必须透传 options')
 
   // ===== readSafeText（包装）=====
   assert.strictEqual(readSafeText(okFile), 'safe-content', 'ok 时应返回文本')
@@ -147,6 +322,34 @@ const {
   // 不传 / 传非正数 maxBytes 时保持旧行为「不设上限」，不得引入默认上限
   assert.strictEqual(readSafeText(bigFile), 'x'.repeat(100), '不传 maxBytes 时应无上限，返回全文')
   assert.strictEqual(readSafeText(bigFile, 0), 'x'.repeat(100), 'maxBytes=0 应视为不设限，返回全文')
+
+  // ===== STG-05（续）：非法 maxBytes 必须告警，不得静默按「不设限」读取 =====
+  // 旧实现：`typeof maxBytes === 'number' && maxBytes > 0` 为假即静默不设限——调用方传 '50'
+  // （字符串）或 -1 时，限长意图被悄悄变成整读入内存，没有任何信号。
+  const badWarns = []
+  const origWarn = console.warn
+  console.warn = (...args) => { badWarns.push(args.join(' ')) }
+  let badRet
+  try { badRet = readSafeTextResult(bigFile, '50') } finally { console.warn = origWarn }
+  assert.strictEqual(badRet.status, 'ok', '非法 maxBytes 沿用「不设限」语义（读取结果不变）')
+  assert.strictEqual(badRet.text, 'x'.repeat(100), '非法 maxBytes 仍返回全文')
+  assert.strictEqual(badWarns.length, 1, '非法 maxBytes 必须告警一次（旧实现完全静默）')
+  assert.match(badWarns[0], /maxBytes 非法/, '告警需指明 maxBytes 非法')
+  assert.match(badWarns[0], /按不设限读取/, '告警需说明实际按不设限处理')
+
+  // 对照：0 / -1 / Number.NaN / Infinity 同样告警（「非正数」不是合法上限，只是历史语义）
+  // （Sonar 建议：全局 NaN 改 Number.NaN；两者同为 IEEE-754 NaN，`String(bad)` 仍为 'NaN'，行为等价）
+  for (const bad of [0, -1, Number.NaN, Infinity]) {
+    const seen = []
+    console.warn = (...args) => { seen.push(args.join(' ')) }
+    try { readSafeTextResult(bigFile, bad) } finally { console.warn = origWarn }
+    assert.strictEqual(seen.length, 1, `maxBytes=${String(bad)} 应告警一次`)
+  }
+  // 反向对照：合法上限与不传（undefined）都不得告警，否则告警会变成噪声
+  const okWarns = []
+  console.warn = (...args) => { okWarns.push(args.join(' ')) }
+  try { readSafeTextResult(bigFile, 50); readSafeTextResult(okFile) } finally { console.warn = origWarn }
+  assert.deepStrictEqual(okWarns, [], '合法 maxBytes / 不传 maxBytes 时不得告警')
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
   try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) {}

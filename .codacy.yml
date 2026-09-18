@@ -71,12 +71,14 @@
 # 临时目录下，用测试硬编码的文件名搭最小沙箱（桩 test_suites.js / scripts/check-deps.js / 套件），
 # 目录与文件名均为测试常量、无外部净输入，静态路径注入告警属误报。
 #
-# check-version.js 是版本三方一致性闸门（本地/CI 工具，不进入生产运行时）：
+# check-version.js 是版本四方一致性闸门（本地/CI 工具，不进入生产运行时）：
 # 读取路径只由模块常量（path.join(__dirname, '字面量')）组成，package.json 用字面量 require，
 # 不接受任何入参参与路径构造，无外部净输入——「动态构造文件/路径信息」「非字面量 require」等
 # 静态告警属误报（与 run_mutation.js / scripts/check-mutation-ranges.js 同类工具脚本同一处理）。
-# 注：本次收口只加了补丁段校验；判定逻辑已收敛为纯函数 checkVersionValues() 供 test_check_version.js
-# 直接断言。
+# 注：当前闸门是**版本四方一致性**——文件头 ↔ CHANGELOG 最新 ↔ package.json ↔ package-lock.json
+# 根元数据两处（顶层 version 与 packages[""].version，任一缺失/形态异常即 fail-closed）；补丁段必须
+# 为 .0 的校验同时在闸门内。判定逻辑已收敛为纯函数 checkVersionValues() 供 test_check_version.js
+# 直接断言（口径见 check-version.js 文件头；PR #154-3 把锁文件两处纳入硬门禁）。
 #
 # test_check_version.js 的 CLI 契约用例（v3.274 新增）用 fs.mkdtempSync(os.tmpdir() + 固定前缀 'cvcli-')
 # 建临时目录，把 check-version.js 复制进去并写入测试硬编码的 xbk_function_v3.js / CHANGELOG.md /
@@ -90,6 +92,40 @@
 # 转成带路径上下文的可读错误。公开 export 仅为测试复用，不面向不可信输入——
 # 「动态构造文件/路径信息」告警在以上调用链上不成立，属误报（与 run_mutation.js /
 # scripts/check-mutation-ranges.js / scripts/install-hooks.js 同类工具脚本同一处理）。
+#
+# test_analyze_artifacts.js 是 .github/analyze-artifacts.js 的子进程回归（R6 新增 A8/A9）：
+# writeReport() 在 fs.mkdtempSync(os.tmpdir() + 固定前缀) 建的私有临时目录下，用测试硬编码的
+# 子目录名（a / bad / good / lines / cap…）与文件名 mutation.json 拼 artifact 夹具路径；
+# 目录前缀、子目录名与文件名全部是测试常量，无任何外部净输入参与路径构造——
+# fs.mkdirSync / fs.readFileSync 等的「动态构造文件/路径信息」告警属误报（与 test_mutation_report.js
+# / test_status_report.js 同类夹具同一处理）。
+#
+# test_check_deps.js 是 scripts/check-deps.js 与 run_tests.js 前置依赖门的沙箱回归：
+# makeRunTestsSandbox() 在 fs.mkdtempSync(os.tmpdir() + 固定前缀) 下复制真实入口，再用测试硬编码的
+# package.json / test_suites.js / stub_suite.js 与 node_modules/<name>/… 搭最小沙箱，
+# 目录与文件名均为测试常量，无任何外部净输入参与路径构造——「动态构造文件/路径信息」告警
+# 在以上夹具调用链上不成立，属误报。
+#
+# test_install_hooks.js 是 scripts/install-hooks.js --verify 的只读自检回归：
+# makeCase()/writeHooks() 在 fs.mkdtempSync(os.tmpdir() + 固定前缀) 下用测试硬编码的钩子名
+# （pre-commit / commit-msg）与 .githooks 常量拼路径，git 一律以**绝对路径**调用（避免经 PATH
+# 解析可执行文件）；待检查的权限位也来自测试常量，无任何外部净输入参与路径构造——
+# 动态路径注入告警属误报（与上方 scripts/install-hooks.js 条目同一口径）。
+#
+# test_mutation_json.js 是 scripts/mutation-json.js 的单元测试：
+# 用 fs.mkdtempSync(os.tmpdir() + 固定前缀) 加测试硬编码文件名（oversize.json 等）构造报告夹具，
+# 并在用例内 monkeypatch fs.fstatSync / fs.readFileSync 计数以证明「先按 fd 取真实大小、再整读」；
+# 目录与文件名均为测试常量，无任何外部净输入参与路径构造——动态路径告警属误报。
+#
+# test_mutation_ranges.js 是 mutation 行段覆盖校验的回归：
+# 只读仓库内常量路径（.github/workflows/mutation.yml、xbk_function_v3.js）并对静态清单
+# DEFAULT_FILES 逐项做 fs.existsSync 存在性核对，路径不含任何外部输入——
+# 「动态构造文件/路径信息」告警属误报（与 scripts/check-mutation-ranges.js 只读仓库内文件同一口径）。
+#
+# test_qinglong_utils.js 是 qinglong/xbk_push.js 交付形态的回归：
+# fs.readFileSync(path.join(__dirname, 'qinglong', 'xbk_push.js')) 的目标只由模块常量 __dirname
+# 与仓库内硬编码相对路径拼成，无任何外部净输入参与路径构造——动态路径告警属误报
+# （与上方 test_check_version.js / scripts/check-mutation-ranges.js 同类处理）。
 exclude_paths:
   - ".github/analyze-artifacts.js"
   - "check-version.js"
@@ -114,3 +150,9 @@ exclude_paths:
   - "test_suite_registry.js"
   - "test_tag_validator.js"
   - "test_check_version.js"
+  - "test_analyze_artifacts.js"
+  - "test_check_deps.js"
+  - "test_install_hooks.js"
+  - "test_mutation_json.js"
+  - "test_mutation_ranges.js"
+  - "test_qinglong_utils.js"

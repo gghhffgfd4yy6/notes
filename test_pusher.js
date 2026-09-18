@@ -289,6 +289,89 @@ function test (name, fn) {
     }
   })
 
+  // ===== P3（跨批协同）超时按「仍在飞的通道」归因 =====
+  // 契约：Pusher 把 { inFlightTracker } 交给 sendNotify；投递层（slim）启动通道任务前回填
+  // tracker.pending（未结算通道名），每通道 settle 时移除。不支持该契约的模块（既有测试替身）
+  // 忽略它 → pending 保持 null → 退回「配置通道全量列出」的既有语义（P1/P11 已锁定）。
+  const withTimeoutNow = async (notifyMod, warns) => {
+    const originalSetTimeout = global.setTimeout
+    let watchdogTimer
+    const watchdog = new Promise((_resolve, reject) => {
+      watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未在预期时间内 settle')), 5000)
+    })
+    try {
+      global.setTimeout = (fn, ms, ...args) => {
+        if (ms === 10000) fn(...args)
+        return originalSetTimeout(() => {}, 0)
+      }
+      const p = createPusher({
+        Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
+        getNotify: async () => notifyMod
+      })
+      try {
+        await Promise.race([p.send('text', 'desp', notifyMod), watchdog])
+        return null
+      } catch (e) {
+        return e
+      }
+    } finally {
+      clearTimeout(watchdogTimer)
+      global.setTimeout = originalSetTimeout
+    }
+  }
+
+  await test('P12 归因只列在飞通道：已结算通道不得被标为 PUSH_TIMEOUT（P3）', async () => {
+    let trackerSeen = null
+    const notifyMod = {
+      sendNotify: (t, d, params) => {
+        trackerSeen = params && params.inFlightTracker
+        // 模拟 slim：ch1 已成功结算，ch2 仍在飞
+        if (trackerSeen) trackerSeen.pending = ['ch2']
+        return new Promise(() => {})
+      },
+      configuredChannelNames: () => ['ch1', 'ch2']
+    }
+    const err = await withTimeoutNow(notifyMod)
+    assert.ok(err && err.message.includes('超时'), '超时分支必须 reject')
+    assert.ok(trackerSeen && typeof trackerSeen === 'object', 'Pusher 必须把在飞追踪器交给 sendNotify（跨文件契约）')
+    assert.deepStrictEqual(err.failures.map(f => f.channel), ['ch2'],
+      `只应归因仍在飞的通道（ch1 已结算），实际 ${JSON.stringify(err.failures)}`)
+    assert.strictEqual(err.failures[0].code, 'PUSH_TIMEOUT')
+  })
+
+  await test('P13 在飞清单为空数组 → failures 为空且不得误报「清单缺失」告警（P3）', async () => {
+    const warns = []
+    const originalWarn = console.warn
+    try {
+      console.warn = (...args) => { warns.push(args.join(' ')) }
+      const notifyMod = {
+        sendNotify: (t, d, params) => {
+          if (params && params.inFlightTracker) params.inFlightTracker.pending = [] // 全部通道已结算
+          return new Promise(() => {})
+        },
+        configuredChannelNames: () => ['ch1', 'ch2'] // 有清单，但必须被在飞清单取代
+      }
+      const err = await withTimeoutNow(notifyMod)
+      assert.ok(err && err.message.includes('超时'), '超时分支必须 reject')
+      assert.deepStrictEqual(err.failures, [], '全部已结算时 failures 必须为空（不得回落静态清单）')
+      assert.ok(!warns.some(w => w.includes('configuredChannelNames')),
+        `有在飞清单时不得误报清单缺失；实际 warns=${JSON.stringify(warns)}`)
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  await test('P14 未支持该契约的模块 → 保持既有「配置通道全量列出」语义（P3 回退）', async () => {
+    const notifyMod = {
+      sendNotify: () => new Promise(() => {}), // 忽略 params（既有替身形态）
+      configuredChannelNames: () => ['pushplus', 'telegram']
+    }
+    const err = await withTimeoutNow(notifyMod)
+    assert.ok(err && err.message.includes('超时'), '超时分支必须 reject')
+    assert.deepStrictEqual(err.failures.map(f => f.channel), ['pushplus', 'telegram'],
+      '不支持在飞契约时必须退回既有语义（test_pusher P1 / test_app 锁定口径）')
+  })
+
   console.log(`test_pusher OK (${failed === 0 ? '全部通过' : failed + ' 项失败'})`)
   process.exit(failed > 0 ? 1 : 0)
 })()

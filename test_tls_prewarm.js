@@ -25,6 +25,21 @@ require.cache[gotPath] = { id: gotPath, filename: gotPath, loaded: true, exports
   assert.strictEqual(result.perConnectionMs.length, 2)
   console.log('✅ TLS 预热 aggregate ok 与 okCount 保持一致')
 
+  // ===== AGENTS-10：got 替身无 stream（无法建连）必须报 ok:false，不得 ok:true 假成功 =====
+  // 旧口径：`if (!got.stream) return { …, skipped: true, ok: true }` —— 一次请求都没发却报成功，
+  // 聚合统计（ok=true 而 okCount=0）自相矛盾。restore 后继续后续用例。
+  {
+    const savedStream = fakeGot.stream
+    delete fakeGot.stream
+    const noStream = await prewarmTls('tls-probe.invalid', 100, 2)
+    fakeGot.stream = savedStream
+    assert.strictEqual(noStream.skipped, true, '无 stream 时应标记 skipped')
+    assert.strictEqual(noStream.ok, false, '未建连必须报 ok:false（旧口径为 ok:true 假成功）')
+    assert.strictEqual(noStream.okCount, 0, '未建连时 okCount 应为 0')
+    assert.strictEqual(noStream.kind, 'tls', '应带 kind=tls（AGENTS-07）')
+    console.log('✅ AGENTS-10：got.stream 缺失时不建连，ok 为 false 而非假成功')
+  }
+
   // ===== AGENTS-03：count 边界钳制（NaN / Infinity / 非数字一律 ≥1）=====
   // 后续用例不再依赖上面按调用序返回 200/500 的 head：改为「HEAD 恒成功」，
   // 使 okCount 能直接反映实际建连条数（NaN 旧行为返回空数组 → ok:true/okCount:0）。
@@ -141,9 +156,12 @@ require.cache[gotPath] = { id: gotPath, filename: gotPath, loaded: true, exports
   const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
   assert.deepStrictEqual(
     Object.keys(cancelledAgg).sort(byCodeUnit),
-    ['count', 'elapsedMs', 'hostname', 'ok', 'okCount', 'perConnectionMs'],
-    'aggregate 公开形状（AGENTS-07 记录）：若新增 cancelled/error 等字段（即修 AGENTS-06），必须同步更新本测试'
+    ['count', 'elapsedMs', 'hostname', 'kind', 'ok', 'okCount', 'perConnectionMs'],
+    'aggregate 公开形状（AGENTS-07 已补 kind）：若新增 cancelled/error 等字段（即修 AGENTS-06），必须同步更新本测试'
   )
+  // AGENTS-07：aggregate 必须带显式任务类型 kind:'tls'（调用方按字段即可区分 DNS/TLS 预热结果）
+  assert.strictEqual(cancelledAgg.kind, 'tls', 'aggregate 应带 kind=tls（AGENTS-07）')
+  assert.strictEqual(erroredAgg.kind, 'tls', 'aggregate 应带 kind=tls（AGENTS-07）')
   assert.deepStrictEqual(Object.keys(erroredAgg).sort(byCodeUnit), Object.keys(cancelledAgg).sort(byCodeUnit), 'cancelled 分支与 error 分支的公开结果键集应一致')
   assert.strictEqual(cancelledAgg.ok, erroredAgg.ok, 'cancelled 分支与 error 分支的 ok 应一致')
   assert.strictEqual(cancelledAgg.okCount, erroredAgg.okCount, 'cancelled 分支与 error 分支的 okCount 应一致')
