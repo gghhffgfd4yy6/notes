@@ -356,6 +356,101 @@ const uncovered = excluded.filter(f => !explicitFiles.has(f))
 assert.deepStrictEqual(uncovered, [],
   `以下 integration/mutationSkip 套件没有 CI 显式步骤，脱离门禁：${uncovered.join(', ')}`)
 
+// ── 2c. test.yml 的 push `paths-ignore` 不得收缩门禁（EXEC-D T3）──────
+// 动机：docs-only push 此前也会跑满整条链（~6.5min × 2 runner）。放宽 push 触发范围可以让纯文档
+// 提交不再触发，但**硬约束**是：paths-ignore 只能放行「改了它也绝不可能影响测试结果」的路径。
+// 本仓库最容易被一刀切忽略掉的门禁输入是 CHANGELOG.md——`**/*.md` 会连它一起忽略，而它是
+// check-version.js 的版本一致性闸门、test_filter.js 第 101 章、test_tag_validator.js 的输入。
+// 故本段把口径固定为断言：任何门禁输入被 paths-ignore 覆盖即红（防后人顺手写回 `**/*.md`）。
+{
+  // 解析 `on.push.paths-ignore`（行式解析 + 响亮失败：排版一变就红，不会静默放行）
+  const lines = testYml.split('\n')
+  const pushIdx = lines.findIndex(l => l === '  push:')
+  assert.ok(pushIdx >= 0, 'test.yml 应声明 push 触发（缩进 2 空格的 `  push:`）')
+  let piIdx = -1
+  const pathsIgnore = []
+  for (let i = pushIdx + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trim() === '') continue
+    const indent = line.length - line.trimStart().length
+    if (indent <= 2) break // 离开 push 块
+    if (piIdx < 0) {
+      if (!line.trim().startsWith('paths-ignore:')) continue
+      piIdx = i
+      continue
+    }
+    const item = line.trim()
+    if (!item.startsWith('- ')) break // paths-ignore 列表结束
+    let val = item.slice(2).trim()
+    // 去行内注释与引号（路径里不会出现 '#' 或引号）
+    const hash = val.indexOf(' #')
+    if (hash > 0) val = val.slice(0, hash).trim()
+    val = val.replace(/^(['"])(.*)\1$/, '$2')
+    assert.ok(val !== '', `paths-ignore 条目不应为空: ${JSON.stringify(line)}`)
+    pathsIgnore.push(val)
+  }
+  assert.ok(pathsIgnore.length > 0, 'push 触发应有非空 paths-ignore（否则本断言失去守护对象）')
+
+  // gitignore/minimatch 子集匹配器（只需支持本仓库实际会用的形态：字面路径、`**/*.ext`、`dir/**`）
+  const toRe = (p) => {
+    let re = ''
+    for (let i = 0; i < p.length; i++) {
+      const c = p[i]
+      if (c === '*') {
+        if (p[i + 1] === '*') { // `**` → 任意层级
+          if (p[i + 2] === '/') { re += '(?:[^/]+/)*'; i += 2 } else { re += '.*'; i += 1 }
+        } else re += '[^/]*'
+      } else if (c === '?') re += '[^/]'
+      else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    }
+    return new RegExp('^' + re + '$')
+  }
+  const matchers = pathsIgnore.map(p => ({ p, re: toRe(p) }))
+  const matchedBy = (rel) => matchers.filter(m => m.re.test(rel)).map(m => m.p)
+
+  // 匹配器自身的正向对照（防恒假：判据必须能认出 `**/*.md` 会命中 CHANGELOG.md）
+  assert.deepStrictEqual(matchedBy('CHANGELOG.md'), [],
+    'paths-ignore 不得命中 CHANGELOG.md：它是 check-version.js 版本闸门与 test_filter.js 第 101 章的输入')
+  assert.ok(toRe('**/*.md').test('CHANGELOG.md') && toRe('**/*.md').test('docs/a.md'),
+    '匹配器对照：`**/*.md` 必须能命中 CHANGELOG.md（否则本断言恒真、形同虚设）')
+  assert.ok(!toRe('dir/**').test('dir') && toRe('dir/**').test('dir/a/b.js'), '匹配器对照：`dir/**` 应命中目录内部文件')
+
+  // 显式「允许被忽略」清单：纯文档（无任何脚本/测试读取）+ 未入库的本机目录 + 议题模板
+  const PROSE_DOCS = new Set([
+    'README.md', 'AGENTS.md', 'CONTRIBUTING.md', 'SECURITY.md', 'SYSTEM_CONTRACT.md',
+    '.github/pull_request_template.md'
+  ])
+  const ALLOWED_PREFIXES = ['.local/', '.github/ISSUE_TEMPLATE/']
+  // 允许出现的 paths-ignore 条目白名单：新增条目必须同时改这里（有意为之的 fail-loud）——
+  // 否则一个手滑的 `**/*.js` 会静默把整条门禁关掉。
+  const ALLOWED_PATTERNS = new Set([...PROSE_DOCS, '.github/ISSUE_TEMPLATE/**', '.local/**'])
+  for (const p of pathsIgnore) {
+    assert.ok(ALLOWED_PATTERNS.has(p),
+      `paths-ignore 出现未登记的条目 ${JSON.stringify(p)}：请先确认改了该路径不可能影响测试结果，` +
+      '并同步本套件的 ALLOWED_PATTERNS（源码/测试/工作流/门禁输入一律不得放行）')
+  }
+
+  // 遍历仓库文件（跳过依赖与运行产物），要求：**除允许清单外，没有任何文件被 paths-ignore 命中**
+  const SKIP_DIRS = new Set(['node_modules', '.git', 'reports', 'coverage', '.stryker-tmp', '.tools', '.ai'])
+  const walk = (dir, rel, out) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory()) {
+        if (SKIP_DIRS.has(e.name) || e.name.startsWith('xianbaoku_cache') || e.name.startsWith('.xbk_cache_safe')) continue
+        walk(path.join(dir, e.name), rel + e.name + '/', out)
+      } else if (e.isFile()) out.push(rel + e.name)
+    }
+    return out
+  }
+  const files = walk(__dirname, '', [])
+  assert.ok(files.includes('test_ci_skip_suites.js') && files.includes('CHANGELOG.md'),
+    '仓库遍历应包含已知门禁输入（遍历失败会让本断言恒真）')
+  const allowed = (f) => PROSE_DOCS.has(f) || ALLOWED_PREFIXES.some(pre => f.startsWith(pre))
+  const violators = files.filter(f => !allowed(f) && matchedBy(f).length > 0)
+  assert.deepStrictEqual(violators, [],
+    `paths-ignore 命中了非文档路径（门禁盲区）：${violators.slice(0, 10).map(f => `${f} ← ${matchedBy(f).join(',')}`).join(' | ')}`)
+  console.log(`✅ push paths-ignore（${pathsIgnore.length} 项）只覆盖纯文档/议题模板/本机目录，未命中任何门禁输入（${files.length} 个文件已核对）`)
+}
+
 // ── 3. 入口行为（子进程 + 跳过全部套件，秒级） ───────────────
 const baseEnv = { ...process.env }
 delete baseEnv.SKIP_SUITES
