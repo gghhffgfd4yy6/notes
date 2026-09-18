@@ -11,6 +11,8 @@
 // 用法：node test_app_p.js        （沙箱默认并发 8 稳定）
 //       CONCURRENCY=32 node test_app_p.js   （真机可调大）
 // 失败时用串行定位：node test_app.js --only=<测试名子串>
+//   （v3.276/EXEC-D T10 起 `--only=<子串>` 与空格形式 `--only <子串>` 均生效；
+//     此前只有空格形式生效，照本行提示抄等号形式会静默跑全量用例）
 // ============================================================
 const { fork } = require('child_process')
 const fs = require('fs')
@@ -90,7 +92,7 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
     process.exit(0)
   } else {
     for (const w of failedWorkers) console.log(`  ✗ worker#${w.i} 重跑后仍失败（涉及 ${chunks[w.i].length} 个测试）`)
-    console.log('  定位: node test_app.js --only=<测试名子串> 串行重跑')
+    console.log('  定位: node test_app.js --only=<测试名子串> 串行重跑（等号/空格两种写法均生效）')
     process.exit(1)
   }
 })()

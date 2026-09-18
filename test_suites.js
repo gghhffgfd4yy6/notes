@@ -48,7 +48,7 @@ const SUITES = [
   { name: '变异超时竞态', file: 'test_run_mutation_race.js', desc: 'runTests 超时兜底/close 透传注入式回归' },
   { name: '变异范围校验', file: 'test_check_mutation_ranges.js', desc: 'check-mutation-ranges.js 子进程：全覆盖/漏测/不连续/越界 exit code', mutationSkip: true },
   { name: '变异范围', file: 'test_mutation_ranges.js', desc: '生产模块及行段必须完整纳入 mutation 矩阵', mutationSkip: true },
-  { name: 'CI跳过清单对账', file: 'test_ci_skip_suites.js', desc: 'SKIP_SUITES ↔ test.yml 显式步骤双向一致 + 入口过滤/summary 行为' },
+  { name: 'CI跳过清单对账', file: 'test_ci_skip_suites.js', desc: 'SKIP_SUITES ↔ test.yml 显式步骤双向一致 + 入口过滤/summary 行为 + test_app.js --only 过滤契约' },
   { name: '注册表对账', file: 'test_suite_registry.js', desc: '根目录 test_*.js ↔ SUITES 双向一致（漏注册/幽灵条目/白名单陈旧）' },
   { name: 'Hooks 自检', file: 'test_install_hooks.js', desc: 'scripts/install-hooks.js --verify 只读自检（未生效 fail-closed / 生效 exit 0 / 不改配置不改权限）' },
   { name: 'Release tag 校验', file: 'test_tag_validator.js', desc: 'tag semver 正则与 release.yml 逐字同源断言' },
