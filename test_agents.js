@@ -268,10 +268,11 @@ dns.lookup = (hostname, options, callback) => {
       let list = resolverOrder.slice()
       if (opts.family === 4) list = list.filter(x => x.family === 4)
       else if (opts.family === 6) list = list.filter(x => x.family === 6)
-      // Sonar S1529：这里的位与是**有意**的位掩码判定（AI_ADDRCONFIG），不是写错的逻辑与；
-      // 显式与 0 比较即表达「该标志位被置位」，语义与原真值上下文完全一致（undefined & x === 0，
-      // 故 hints 缺失时同样为假），同时消除 S1529 告警（其规则只针对布尔上下文里的位运算）。
-      if ((opts.hints & dns.ADDRCONFIG) !== 0) list = list.filter(x => x.family === 4)
+      // 这里是有意的**位掩码判定**（AI_ADDRCONFIG 标志位），不是写错的逻辑与——Sonar 建议的 `&&`
+      // 会改变语义（已用 4 组取值反例证实）。CI 实测：**显式与 0 比较并不能消除 S1529**（该规则带
+      // `type-dependent` 标签，`opts.hints` 类型未知即告警），故按**误报**处理并在行内抑制。
+      // 行内抑制（只作用于下面那一行），理由：操作数是 getaddrinfo 的位掩码常量，位与是唯一正确语义。
+      if ((opts.hints & dns.ADDRCONFIG) !== 0) list = list.filter(x => x.family === 4) // NOSONAR: AI_ADDRCONFIG 位掩码判定，非逻辑与（改 && 会改语义）
       // Sonar S3923：原式 `verbatim === true ? 'verbatim' : 'verbatim'` 两个分支同值，是真冗余。
       // 化简为等价形式：verbatim===false → 'ipv4first'，其余（true/未指定）→ 'verbatim'。对
       // verbatim∈{true,false,undefined} 逐值等价；未指定时取 'verbatim' 是替身对进程默认顺序的建模
