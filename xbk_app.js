@@ -13,6 +13,10 @@ function createApp ({
     try { return typeof crypto?.timingSafeEqual === 'function' && crypto.timingSafeEqual(actualBytes, expectedBytes) } catch (e) { return false }
   }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
+  // FX3：通道恢复告警的「送达认领」租约。Pusher.send 自带 10s 超时（xbk_pusher.js），60s 留 6 倍
+  // 余量；认领超租约即视为持有方已崩溃/被挂起，允许后续轮次接管重发（有界可恢复，不永久卡死）。
+  const CHANNEL_RECOVER_CLAIM_LEASE_MS = 60000
+  let channelRecoverClaimSeq = 0 // 同进程内单调序号，配合 pid/时刻/随机数保证令牌唯一
   // APP-05：所有「按天/按时刻」的呈现口径统一到硬编码 Asia/Shanghai——日志与台账时间戳
   // （_localStamp）、日报日界（_reportToday）、运行异常告警正文的时间、RE2 标记保留期的 cutoff。
   // 进程本地时区（如 CI runner 的 UTC）不参与其中：混用会让同一时刻的 run.log 行、日报日界与
@@ -744,9 +748,31 @@ function createApp ({
       }
     },
 
+    /** FX3：生成一次恢复告警发送尝试的唯一认领令牌（pid+时刻+序号+随机，跨进程/跨轮次不撞）。
+     *  与 recoverAlertClaimAt 一起在健康状态锁内落盘，构成「本次尝试已认领这次恢复」的证据。 */
+    _newChannelRecoverClaim () {
+      channelRecoverClaimSeq = (channelRecoverClaimSeq + 1) % 0xffffff
+      const rand = crypto && typeof crypto.randomBytes === 'function'
+        ? crypto.randomBytes(6).toString('hex')
+        : Math.random().toString(16).slice(2, 14)
+      return `${process.pid}-${Date.now()}-${channelRecoverClaimSeq}-${rand}`
+    },
+
+    /** FX3：认领是否仍在租约内。缺字段/类型异常一律视为「已失效」——宁可重发一次，也不因
+     *  状态损坏让恢复通知永久卡住（与 APP-02 锁的「无主锁可回收」同向）。 */
+    _isChannelRecoverClaimAlive (entry, now) {
+      if (!entry || typeof entry !== 'object') return false
+      const claim = entry.recoverAlertClaim
+      if (typeof claim !== 'string' || !claim) return false
+      const claimedAt = this._safeCounter(entry.recoverAlertClaimAt)
+      return claimedAt > 0 && now - claimedAt < CHANNEL_RECOVER_CLAIM_LEASE_MS
+    },
+
     /** 恢复告警确认送达后清零该通道健康状态（重新加锁读改写；APP2-02）。加锁失败或状态不可读时
-     *  保持 pending 不动，下一轮仍会重发恢复告警。 */
-    _clearChannelRecoverPending (statePath, channel) {
+     *  保持 pending 不动，下一轮仍会重发恢复告警。
+     *  FX3：仅当认领仍属于本次尝试（claim 匹配）才允许清零——迟到的成功不得清掉后继尝试已
+     *  重新认领的 pending，否则后继发送失败时该恢复通知会被永久吞掉。 */
+    _clearChannelRecoverPending (statePath, channel, claim) {
       const lockPath = statePath + '.lock'
       const lockFd = this._tryAcquireChannelHealthLock(lockPath)
       if (lockFd < 0) return
@@ -758,9 +784,38 @@ function createApp ({
         if (!state || typeof state !== 'object' || Array.isArray(state)) return
         const entry = state[channel]
         if (!entry || typeof entry !== 'object' || entry.recoverAlertPending !== true) return
+        if (typeof claim === 'string' && claim && entry.recoverAlertClaim !== claim) return
         state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: Date.now() }
         this._writeState(statePath, state)
       } catch (e) { /* 清零失败：保留 pending，下一轮重发 */ } finally {
+        this._releaseChannelHealthLock(lockPath, lockFd)
+      }
+    },
+
+    /** FX3：发送失败时在锁内释放本次认领（保留 pending 与失败计数）——下一轮无需等租约到期即可
+     *  重发，守住 APP2-02「不丢」。认领已被后继尝试接管（令牌不匹配）时不动作。 */
+    _releaseChannelRecoverClaim (statePath, channel, claim) {
+      const lockPath = statePath + '.lock'
+      const lockFd = this._tryAcquireChannelHealthLock(lockPath)
+      if (lockFd < 0) return
+      try {
+        const stateResult = this._readSafeState(statePath)
+        if (stateResult.status !== 'ok') return
+        let state
+        try { state = JSON.parse(stateResult.text) } catch (e) { return }
+        if (!state || typeof state !== 'object' || Array.isArray(state)) return
+        const entry = state[channel]
+        if (!entry || typeof entry !== 'object' || entry.recoverAlertPending !== true) return
+        if (entry.recoverAlertClaim !== claim) return
+        state[channel] = {
+          consecutiveFailures: this._safeCounter(entry.consecutiveFailures),
+          lastFailureAt: this._safeCounter(entry.lastFailureAt),
+          lastAlertAt: this._safeCounter(entry.lastAlertAt),
+          lastRecoveredAt: this._safeCounter(entry.lastRecoveredAt),
+          recoverAlertPending: true
+        }
+        this._writeState(statePath, state)
+      } catch (e) { /* 释放失败：租约到期后由后续轮次接管，仍不会永久卡死 */ } finally {
         this._releaseChannelHealthLock(lockPath, lockFd)
       }
     },
@@ -810,18 +865,34 @@ function createApp ({
           const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
           const failures = this._safeCounter(entry.consecutiveFailures)
           const recoverPending = entry.recoverAlertPending === true
-          if (failures >= threshold || recoverPending) {
+          if (recoverPending && this._isChannelRecoverClaimAlive(entry, now)) {
+            // FX3：另一轮已认领这次恢复告警且租约未过期（它的发送还在飞）——本轮不得重复入队，
+            // 且必须原样保留认领字段，否则后继轮次会当成「无主认领」重复发送。
+            state[channel] = {
+              consecutiveFailures: failures,
+              lastFailureAt: this._safeCounter(entry.lastFailureAt),
+              lastAlertAt: this._safeCounter(entry.lastAlertAt),
+              lastRecoveredAt: this._safeCounter(entry.lastRecoveredAt),
+              recoverAlertPending: true,
+              recoverAlertClaim: entry.recoverAlertClaim,
+              recoverAlertClaimAt: this._safeCounter(entry.recoverAlertClaimAt)
+            }
+          } else if (failures >= threshold || recoverPending) {
             // APP2-02：恢复告警只能在「确认送达」后清零计数——此处先保留失败计数与
             // recoverAlertPending（发送成功后再于告警循环里清零落盘）。原实现发送前即清零点外写盘，
             // 恢复通知一旦发送失败就永久丢失（后续轮次因计数已清零不再触发恢复告警）。
+            // FX3：入队的同时在锁内原子认领（令牌+租约），堵住「保持 pending → 释放锁 → 锁外发送」
+            // 期间第二个重叠运行看到同一 pending 而各发一条的重复通知竞态；陈旧认领超租约后可接管。
             state[channel] = {
               consecutiveFailures: failures,
               lastFailureAt: this._safeCounter(entry.lastFailureAt),
               lastAlertAt: this._safeCounter(entry.lastAlertAt),
               lastRecoveredAt: now,
-              recoverAlertPending: true
+              recoverAlertPending: true,
+              recoverAlertClaim: this._newChannelRecoverClaim(),
+              recoverAlertClaimAt: now
             }
-            alerts.push({ type: 'recovered', channel })
+            alerts.push({ type: 'recovered', channel, claim: state[channel].recoverAlertClaim })
           } else {
             state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: now }
           }
@@ -857,8 +928,13 @@ function createApp ({
           // APP2-01：失败告警的 lastAlertAt 已在排入告警时落盘（按尝试计时），此处不再回填，
           // 避免发送成功与否改变限频口径。
           // APP2-02：恢复通知确认送达后才清零计数并落盘；发送失败走 catch，保留 pending 供下轮重发。
-          if (alert.type === 'recovered') this._clearChannelRecoverPending(statePath, alert.channel)
-        } catch (e) { /* 健康告警失败不得影响主推送、缓存或下一次重试 */ }
+          if (alert.type === 'recovered') this._clearChannelRecoverPending(statePath, alert.channel, alert.claim)
+        } catch (e) {
+          // 健康告警失败不得影响主推送、缓存或下一次重试。
+          // FX3：恢复通知发送失败须释放本次认领（保留 pending），否则下一轮会被自己的租约挡到
+          // 租约到期才重发——APP2-02「不丢」的即时重试语义会被破坏。
+          if (alert.type === 'recovered') this._releaseChannelRecoverClaim(statePath, alert.channel, alert.claim)
+        }
       }
     },
 
