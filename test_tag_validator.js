@@ -139,14 +139,20 @@ const REGISTERED_CHAR_RANGES = new Map([
  */
 function charClassRanges (source) {
   const ranges = []
-  for (const m of source.matchAll(/\[([^\]]*)\]/g)) {
-    const body = m[1]
+  // S8786（超线性回溯）：原 /\[([^\]]*)\]/g 的 [^\]]* 对每个 '[' 都会一直扫到串尾，
+  // 在 `[[[[…` 这类未闭合输入上退化成 O(n²)；改为线性扫描——每个 '[' 只跳到其配对的首个
+  // ']'，其后从 ']' 之后继续找下一个 '['，与 matchAll 的非重叠匹配语义逐例等价（见下方自检）。
+  for (let open = source.indexOf('['); open !== -1; open = source.indexOf('[', open + 1)) {
+    const close = source.indexOf(']', open + 1)
+    if (close === -1) break // 其后不会再有闭合的字符类
+    const body = source.slice(open + 1, close)
     for (let i = 0; i + 2 < body.length; i++) {
       if (body[i + 1] === '-' && body[i] !== '\\') {
         ranges.push(`${body[i]}-${body[i + 2]}`)
         i += 2
       }
     }
+    open = close // 已消费到闭合 ']'，与 matchAll 一样不从匹配体内重扫
   }
   return ranges
 }
@@ -158,6 +164,10 @@ assert.deepStrictEqual(charClassRanges('[0-9A-Za-z-]'), ['0-9', 'A-Z', 'a-z'], '
 assert.deepStrictEqual(charClassRanges('[-+]'), [], '单一字面字符不构成范围')
 assert.deepStrictEqual(charClassRanges('[А-Я]'), ['А-Я'], '非 ASCII 范围同样要被提取出来（以便判红）')
 assert.deepStrictEqual(charClassRanges('[a-zA-Z]'), ['a-z', 'A-Z'])
+// 线性扫描改写（S8786）的边界锚点：未闭合 / 嵌套 '[' 的口径必须与原 matchAll 版一致
+assert.deepStrictEqual(charClassRanges('[[x]'), [], '嵌套未闭合的 [ 不产生范围（body=`[x`，与原 [^\\]]* 口径一致）')
+assert.deepStrictEqual(charClassRanges('[abc'), [], '没有闭合 ] 时不得提取（原正则同样无匹配）')
+assert.deepStrictEqual(charClassRanges('a][0-9]'), ['0-9'], '闭合 ] 之后的字符类仍要提取，且不从匹配体内重扫')
 for (const [range, why] of REGISTERED_CHAR_RANGES) {
   const [from, to] = range.split('-')
   assert.ok(from.codePointAt(0) < 128 && to.codePointAt(0) < 128,
