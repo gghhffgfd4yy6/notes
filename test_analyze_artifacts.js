@@ -83,7 +83,9 @@ try {
     const text = fs.readFileSync(V3, 'utf8')
     const realLines = text.split('\n').length - (text.endsWith('\n') ? 1 : 0)
     const r = run(dir)
-    assert.match(r.stdout, new RegExp(`V3 存活\\(全文件 ${realLines} 行\\)`),
+    // 用字符串包含替代 new RegExp(`…`)：插值只有十进制行数，转义括号在 includes 里写回字面
+    // 「(全文件 N 行)」，语义等价；动态构造 RegExp 会被判为「非字面量 RegExp」（Codacy）。
+    assert.ok(r.stdout.includes(`V3 存活(全文件 ${realLines} 行)`),
       `输出必须使用实际行数 ${realLines}（旧实现硬编码 2701，v3.262 拆分后该段统计恒为空）`)
     assert.ok(realLines > 0, 'V3 文件必须可读出行数（读不到时脚本会置 exitCode=1）')
   })
