@@ -281,9 +281,17 @@ function analyzeSegment (dir, entry) {
 }
 
 // F1：读取报告文件的 mtime（毫秒）；读不到返回 undefined（该段退出新鲜度比较，不误判为陈旧）
+// QG2：Codacy/Opengrep「动态构造文件/路径信息」（pathtraversal-non-literal-fs-filename）在此是纯语法
+// 误报——规则只放行字符串字面量首参，而 filePath 由 analyze() 的 dir 入参（CI 里是固定的
+// mutation-reports/ 目录，见 .github/workflows/mutation.yml 的调用）经 readdirSync 枚举 + 段名拼接而来，
+// 无法用字面量表达。信任模型与同族的 scripts/mutation-json.js 完全一致——后者已在 .codacy.yml 里按
+// 「变异报告读取工具：reportPath 来自 analyze() 对 CLI 传入目录的 readdir 枚举，非不可信输入」登记同一误报。
+// 故该行加 `// nosemgrep`：Semgrep 原生行内抑制（引擎对无 ids 的 nosemgrep 判定 is_ignored=true），
+// Codacy 的 opengrep wrapper 不传 --disable-nosem，且在解析 JSON 时显式跳过 extra.is_ignored 的结果，
+// 故抑制在 Codacy 侧同样生效。
 function readMtimeMs (filePath) {
   try {
-    return fs.statSync(filePath).mtimeMs
+    return fs.statSync(filePath).mtimeMs // nosemgrep（路径由 CLI 传入目录的 readdir 枚举 + 段名构成，同 mutation-json.js 口径）
   } catch (e) {
     return undefined
   }
