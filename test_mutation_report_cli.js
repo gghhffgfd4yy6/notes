@@ -340,7 +340,10 @@ function schemaReport (seg, mutants) {
   const stryker = stepStart('变异测试（' + '${' + '{ matrix.name }}）')
   assert.ok(restore >= 0 && install >= 0 && stryker >= 0,
     '矩阵 job 的步骤名必须可定位（恢复增量缓存 / 安装依赖 / 变异测试）')
-  assert.ok(/^\s*if: always\(\)\s*$/m.test(cleanup.text),
+  // S8786（超线性回溯）：`^\s*if: always\(\)\s*$/m` 在 m 模式下 \s 可跨行，首尾两个空量词会对
+  // 同一串反复重扫，被静态分析判为 super-linear；改为「逐行 trim 后整行相等」的线性扫描，
+  // 语义等价——真实 yml 里该断言要的就是 if: always() 独占一行（允许缩进与行尾空白）。
+  assert.ok(cleanup.text.split('\n').some(line => line.trim() === 'if: always()'),
     'F1 兜底：清理步骤必须带 if: always()（其前序步骤失败时不得被跳过，否则回填报告仍会被 if: always() 的上传步骤带上）')
   assert.ok(cleanup.start > restore, 'F1 兜底：清理步骤必须前置在「恢复增量缓存」之后（否则缓存里的旧报告先被恢复、没人清）')
   assert.ok(cleanup.start < install, 'F1 兜底：清理步骤必须在「安装依赖」等可能失败的步骤之前')

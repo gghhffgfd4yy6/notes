@@ -469,7 +469,10 @@ console.log('========================================\n');
     } finally {
       hangWxpusher = false
     }
-    assert(pending && typeof pending.then === 'function', 'sendNotify 仍返回 promise')
+    // Sonar S6544：pending 是 Promise（真值恒真），把它直接写进 && 条件会被判为「Promise 用于布尔
+    // 上下文」。改为显式判空后取 .then——undefined/null 短路，其余 falsy 值（''/0/false）落到
+    // typeof 判定仍给出同一条断言失败信息，不会变成 TypeError，故与原先的 `pending && …` 等价。
+    assert(pending !== undefined && pending !== null && typeof pending.then === 'function', 'sendNotify 仍返回 promise')
   }))
 
   // P3 端到端：真实 slim + 真实 Pusher（仅 got 被桩掉）。bark 已成功、wxpusher 仍在飞时整体超时，
