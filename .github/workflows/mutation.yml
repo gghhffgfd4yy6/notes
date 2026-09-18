@@ -26,11 +26,31 @@ on:
 permissions:
   contents: read
 
+# REV-CI：同一 ref 的 Mutation 运行必须串行——本工作流此前完全没有 concurrency，而 test.yml / codeql.yml
+# 都有；这是 21 个矩阵 job 互相饿死的实际来源。
+# 实测（gh api actions/runs + …/jobs，2026-09-18）：当日 12 次 Mutation 运行里最多 6 次同时 active，
+# 其中 5 次落在同一分支 fix/unresolved-114-batch2（01:19 / 01:28 / 02:53 / 03:00 / 03:09 起），
+# 每次 21 个 job ⇒ 峰值约 126 个 job 争抢并发额度。后果在 job 级排队时间上可见：
+# run 35302109509 的 rules / storage / http 三段各自只跑了 1.5 / 1.4 / 1.3 分钟，
+# 却分别排队 64.3 / 64.0 / 63.7 分钟（该 run 墙钟 272 分钟，绝大部分是排队不是计算）。
+# 按 ref 分组即可完全消除本观测到的重叠形态（重叠的 5 次同 ref），且不影响其它路径：
+#   - 主 cron 与分支 dispatch 的 ref 不同 ⇒ 不同组，日报不会被分支任务拖累；
+#   - cancel-in-progress: false 是有意为之——Mutation 单段可跑 3.5h（实测 check-deps 215.2min），
+#     取消在跑任务等于丢弃已完成的变异进度；这里只要「不重叠」，不要「抢最新」。
+#     GitHub 语义下同组内更早的 *pending* 运行会被新运行取代，这正好是我们要的同 ref 去重。
+concurrency:
+  group: mutation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # GitHub schedule 是尽力调度。中午补偿任务查询同日任意触发方式下成功或未完成的运行，
   # 避免重复执行手动/push 触发的变异测试；主 cron、手动和 push 始终运行。
   decide-run:
     runs-on: ubuntu-latest
+    # REV-CI：全仓库此前没有任何 timeout-minutes（grep 命中 0 处），卡死的 job 只能等平台 6h 硬杀，
+    # 期间一直占并发额度。各 job 的取值都按下表实测耗时留 ≥3x 余量（gh api …/jobs 的 started→completed）：
+    #   decide-run 0.0-0.1min、prepare-re2 0.2-0.3min、report 0.5-0.9min、mutation 见该 job 注释。
+    timeout-minutes: 10
     permissions:
       actions: read
     outputs:
@@ -69,6 +89,7 @@ jobs:
     needs: decide-run
     if: needs.decide-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15   # 实测 0.2-0.3min；re2 回退源码构建也在数分钟内
     permissions:
       contents: read
     steps:
@@ -102,6 +123,12 @@ jobs:
     needs: [decide-run, prepare-re2]
     if: needs.decide-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    # REV-CI：350 分钟 = 平台 6h（360min）硬上限下留 10 分钟给下方 if: always() 的报告上传。
+    # 依据（gh api …/jobs 实测单段 started→completed 的最大值，非排队时间）：
+    #   check-deps 215.2min、utils 205.1min、message-store 194.6min、sendnotify-part2 91.7min，
+    #   其余 17 段 1.3-81.3min。350 高于任何实测值 ⇒ 不会新增误杀；而今天若某段挂死，
+    #   唯一的上界是平台 360min，本项只是把它显式化并把「最后 10 分钟」留给产物上传。
+    timeout-minutes: 350
     permissions:
       contents: read
     strategy:
@@ -240,11 +267,33 @@ jobs:
           path: reports/
           retention-days: 14
 
+      # REV-CI（落地 stryker.config.js 自述的 F-04）：缓存（path: reports）此前会把
+      # reports/mutation/{mutation.json,mutation.html} 一并保存——而这个目录正是本 job 最上方的
+      # 「清理缓存回填的旧报告」每次都要 `rm -rf` 掉的东西：保存 → 恢复 → 删除，纯浪费。
+      # 量化依据（gh api …/actions/caches，2026-09-18）：
+      #   * 仓库缓存共 519 条 / 4860MiB（= 10GiB 配额的 47.5%），其中 stryker-* 481 条占 4234MiB（87%）；
+      #   * 分段条目数 24-28 条/段（sendnotify 两段合计 62 条），同一段的近重复条目在持续堆积；
+      #   * 同目录 artifact 体积实测 avg 64MiB/段、最大 179MiB（mutation-report-app），
+      #     说明 reports/mutation/* 是 reports/ 里的绝对大头（磁盘上无法经 API 拆出 inc-*.json 的占比，
+      #     故此处不宣称具体节省量，只断言「本工作流明确删除的目录不再被缓存」这一事实）。
+      # 为什么放在「上传变异报告」之后：artifact 仍需要完整 reports/（report job 靠它汇总），
+      #   而 actions/cache 的保存在**job 全部步骤结束后**的 post 步骤执行 ⇒ 此处删除只影响缓存、不影响 artifact。
+      # 为什么 if: always()：与「清理缓存回填的旧报告」「上传变异报告」同一口径——stryker 失败/超时时，
+      #   缓存更不应该把半成品报告留下来。
+      # 与既有防线的关系：本步只关掉「写侧」，两条既有防线全部保留——
+      #   ① 上方的 `rm -rf reports/mutation`（恢复后立即清，带 if: always()）；
+      #   ② scripts/mutation-report.js 的 validateFreshness（mtime/运行起点）。
+      #   reports/inc-<段>.json（--incremental 的断点续跑基线）**不动**，增量能力不受影响。
+      - name: 清除本次将进入缓存的报告产物（保留增量断点）
+        if: always()
+        run: rm -rf reports/mutation
+
   # 汇总各段变异报告 → 发日报 Issue（每日定时自动汇报，手动触发也发）
   report:
     needs: [decide-run, mutation]
     if: always() && needs.decide-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15   # 实测 0.5-0.9min（下载全部 artifact + 汇总发日报）
     # 发日报 Issue 需要 issues: write（Actions 默认 GITHUB_TOKEN 可能 read-only → 403 失败）
     permissions:
       issues: write
