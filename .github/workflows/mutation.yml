@@ -41,6 +41,7 @@ permissions:
 concurrency:
   group: mutation-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
+
 jobs:
   # GitHub schedule 是尽力调度。中午补偿任务查询同日任意触发方式下成功或未完成的运行，
   # 避免重复执行手动/push 触发的变异测试；主 cron、手动和 push 始终运行。
@@ -265,6 +266,27 @@ jobs:
           name: mutation-report-${{ matrix.name }}
           path: reports/
           retention-days: 14
+
+      # REV-CI（落地 stryker.config.js 自述的 F-04）：缓存（path: reports）此前会把
+      # reports/mutation/{mutation.json,mutation.html} 一并保存——而这个目录正是本 job 最上方的
+      # 「清理缓存回填的旧报告」每次都要 `rm -rf` 掉的东西：保存 → 恢复 → 删除，纯浪费。
+      # 量化依据（gh api …/actions/caches，2026-09-18）：
+      #   * 仓库缓存共 519 条 / 4860MiB（= 10GiB 配额的 47.5%），其中 stryker-* 481 条占 4234MiB（87%）；
+      #   * 分段条目数 24-28 条/段（sendnotify 两段合计 62 条），同一段的近重复条目在持续堆积；
+      #   * 同目录 artifact 体积实测 avg 64MiB/段、最大 179MiB（mutation-report-app），
+      #     说明 reports/mutation/* 是 reports/ 里的绝对大头（磁盘上无法经 API 拆出 inc-*.json 的占比，
+      #     故此处不宣称具体节省量，只断言「本工作流明确删除的目录不再被缓存」这一事实）。
+      # 为什么放在「上传变异报告」之后：artifact 仍需要完整 reports/（report job 靠它汇总），
+      #   而 actions/cache 的保存在**job 全部步骤结束后**的 post 步骤执行 ⇒ 此处删除只影响缓存、不影响 artifact。
+      # 为什么 if: always()：与「清理缓存回填的旧报告」「上传变异报告」同一口径——stryker 失败/超时时，
+      #   缓存更不应该把半成品报告留下来。
+      # 与既有防线的关系：本步只关掉「写侧」，两条既有防线全部保留——
+      #   ① 上方的 `rm -rf reports/mutation`（恢复后立即清，带 if: always()）；
+      #   ② scripts/mutation-report.js 的 validateFreshness（mtime/运行起点）。
+      #   reports/inc-<段>.json（--incremental 的断点续跑基线）**不动**，增量能力不受影响。
+      - name: 清除本次将进入缓存的报告产物（保留增量断点）
+        if: always()
+        run: rm -rf reports/mutation
 
   # 汇总各段变异报告 → 发日报 Issue（每日定时自动汇报，手动触发也发）
   report:
