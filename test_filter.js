@@ -8985,8 +8985,16 @@ console.log('========================================\n');
     const fp = getFilePath(name)
     const dir = path.dirname(fp)
     const guardPath = path.join(dir, '.seen.cleanup.lock')
-    // 本进程存活 + 旧 mtime：必须保留（清理要同时满足「陈旧」与「持有者已退出」）
-    fsmod.writeFileSync(guardPath, `${process.pid}:0:live-owner`, { flag: 'w' })
+    // 本进程存活 + 旧 mtime：必须保留（清理要同时满足「陈旧」与「持有者已退出」）。
+    // token 必须写成**生产真实形态** `<pid>:<真实启动时钟>:<uuid>`——即
+    // _newTombstoneLockToken 的产物；单独看 mtime 陈旧绝不构成删除依据。
+    // 反之，伪造一个生产上不会出现的 starttime（如 0）在 Linux 上会被 incarnation 比对
+    // 判成「PID 复用＝已退出」而回收，那测的是测试自己伪造的状态，不是清理逻辑误删
+    // （该 incarnation 比对自 62e7ca3 起就存在，非本轮引入）。
+    // 非 Linux / 读不到 /proc 时 start 为 null → 写成 `<pid>::<uuid>`，
+    // 走 _isTombstoneLockProcessAlive 的「无法验证 incarnation ⇒ 保守保留」分支。
+    const start = MessageStore._getTombstoneProcessStart(process.pid)
+    fsmod.writeFileSync(guardPath, `${process.pid}:${start || ''}:live-owner`, { flag: 'w' })
     const past = new Date(Date.now() - 60000)
     fsmod.utimesSync(guardPath, past, past)
     MessageStore._tombstoneLocksCleaned.delete(dir)
@@ -8994,6 +9002,35 @@ console.log('========================================\n');
       MessageStore._cleanupResidualTombstoneLocks(dir)
       assertEqual(fsmod.existsSync(guardPath), true, '活跃进程持有的哨兵即使 mtime 陈旧也不得被删')
     } finally {
+      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  // 上一条只证明「真实 incarnation 的哨兵不被误删」，这里反向把既有语义钉住：
+  // token 带**错误数字 starttime** ⇒ 持有者 PID 已被复用（旧进程已退出）⇒ 应回收。
+  // 该分支仅在能读到真实启动时钟（Linux /proc）时成立；本机沙箱读不到 /proc，
+  // 故用打桩把「能读到」这一态显式造出来，让 CI 与本机跑同一条分支，
+  // 而不是写一条随环境漂移（CI 红/本机绿）的断言——读不到时该语义本就退化为保守保留。
+  await test('B8-F4: 错误 incarnation（PID 复用＝持有者已退出）的陈旧哨兵必须被回收', () => {
+    const fsmod = require('node:fs')
+    const name = 'test_b8_f4_reincarnation.json'
+    const fp = getFilePath(name)
+    const dir = path.dirname(fp)
+    const guardPath = path.join(dir, '.seen.cleanup.lock')
+    const realStart = MessageStore._getTombstoneProcessStart
+    // 打桩：本进程启动时钟固定为数字 '424242'，模拟 Linux 上 /proc/<pid>/stat 可读。
+    MessageStore._getTombstoneProcessStart = function (pid) {
+      return pid === process.pid ? '424242' : realStart.call(MessageStore, pid)
+    }
+    try {
+      fsmod.writeFileSync(guardPath, `${process.pid}:1:stale-owner`, { flag: 'w' })
+      const past = new Date(Date.now() - 60000)
+      fsmod.utimesSync(guardPath, past, past)
+      MessageStore._tombstoneLocksCleaned.delete(dir)
+      MessageStore._cleanupResidualTombstoneLocks(dir)
+      assertEqual(fsmod.existsSync(guardPath), false, 'starttime 与真实值不符（PID 复用）的陈旧哨兵应视为持有者已退出并回收')
+    } finally {
+      MessageStore._getTombstoneProcessStart = realStart
       try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
     }
   })
