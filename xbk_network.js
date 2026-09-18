@@ -123,12 +123,12 @@ function createNetwork ({
       // v3.223：延迟加载推送模块（含 got）——与接口请求并行，主流程不必先等模块加载完成
       getNotify().catch(() => { /* 加载失败由推送阶段真实报错，这里不阻塞接口 */ })
       // 线报接口 DNS 预热：与真实请求共用 xbk_agents.dnsLookup 缓存，提前启动解析、不阻塞请求启动。
-      // 注意（net-2，AGENTS-01 后订正）：缓存/pending key 只含 hostname|family（xbk_agents.js:dnsCacheKey），
-      // hints/all/verbatim 已不再进 key——hints/verbatim 只影响地址过滤与排序、不改变地址集合，all 只决定
-      // 回调形状（由 dispatchLookupResult 适配）。本预热未传 options 时 family=0、XBK_DNS_FAMILY=4/6 时为
-      // 4/6；真实请求的 family 同源（baseRequestOptions 的 dnsLookupIpVersion 同样只由 XBK_DNS_FAMILY 决定，
-      // got 把它写进 requestOptions.family），故三种模式下预热与真实请求的 key 一致，预热条目可被真实请求
-      // 命中。旧的「key 含 host|family|hints|all|verbatim、默认配置下两者不合并」口径已随 AGENTS-01 作废。
+      // 注意（net-2，AGENTS-11 后订正）：cache/pending key 现在包含**影响结果选择的选项**
+      // （hostname|family|hints|order，见 xbk_agents.js:dnsCacheKey）——曾一度收敛到只有 hostname|family，
+      // 会让选项不同的调用方互相复用地址（拿到按别人选项筛选/排序过的结果，AGENTS-11 / qodo #154-3）。
+      // prewarmDns 经 productionLookupOptions() 与真实请求**同源取值**（family 未指定时 hints=dns.ADDRCONFIG、
+      // 指定时 hints=0），因此三种模式下预热与真实请求仍同 key、预热条目可被命中；all 只决定回调形状
+      // （由 dispatchLookupResult 适配）、不进 key。
       // net-6：本预热未接 AbortSignal（prewarmDns 的 signal 参数走不到），因此无法被取消。
       try {
         const apiHost = new URL(Config.api.pushUrl).hostname

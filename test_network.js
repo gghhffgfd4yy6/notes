@@ -427,10 +427,12 @@ function makeNetwork (opts = {}) {
       assert.strictEqual(calls, 1, '前置：预热应发起一次解析')
       // 真实请求形状：got 把 dnsLookupIpVersion 写进 requestOptions.family，net.connect 再传给 lookup；
       // 未设 XBK_DNS_FAMILY 时 family 为 undefined（dnsCacheKey 归一为 0），强制时是 4/6。
+      // hints 同源：net 在 family 未指定时传 ADDRCONFIG(1024)、**指定 family 时传 0**（AGENTS-11 实测），
+      // 所以这里必须按 realFamily 取 hints，否则 key 与预热不同源、断言会假红。
       const realFamily = DNS_LOOKUP_IP_VERSION === 'ipv4' ? 4 : DNS_LOOKUP_IP_VERSION === 'ipv6' ? 6 : undefined
-      const hit = await lookupOnce({ family: realFamily, hints: 1024, all: true })
+      const hit = await lookupOnce({ family: realFamily, hints: realFamily ? 0 : 1024, all: true })
       assert.ok(hit.address, '真实请求形状的 lookup 应返回地址')
-      assert.strictEqual(calls, 1, '预热与真实请求必须同 key（hostname|family）→ 真实请求应命中预热条目（旧口径含 hints/all/verbatim，此处会二次解析）')
+      assert.strictEqual(calls, 1, '预热与真实请求必须同 key（hostname|family|hints|order）→ 真实请求应命中预热条目（旧口径含 hints/all/verbatim，或 key 不含 hints，此处都会偏离）')
       await lookupOnce({ family: realFamily === 6 ? 4 : 6 })
       assert.strictEqual(calls, 2, '反向：family 不同 → key 不同 → 必须重新解析（key 只含 hostname|family）')
     } finally {
