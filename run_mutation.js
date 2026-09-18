@@ -7,6 +7,7 @@ const path = require('path')
 const os = require('os')
 const crypto = require('crypto')
 const { spawn } = require('child_process')
+const { SUITES } = require('./test_suites')
 
 const ROOT = __dirname
 // 本地调度器的默认变异目标（F7）：必须与 CI 变异矩阵/ stryker.config.js 的 mutate 完全一致——
@@ -184,11 +185,46 @@ function collectMutants (files) {
   return all.map((m, index) => ({ ...m, id: index + 1 }))
 }
 
-// 变异集指纹（F4）：断点续跑只能按 id 恢复，而 id 是位置序号——源码一改（哪怕插入一行）全部 id
-// 平移，旧断点的 killed/survived 会被错记到别的候选头上。指纹覆盖每个候选的文件/区间/原文/替换串
-// （顺序敏感：id 即顺序），源码或变异集任何变化都会改变指纹 → 断点被丢弃。
+// 参与判定的测试文件清单（F5）：变异分数由「跑的是哪条测试链、断言什么」决定，所以除变异集与源文件外，
+// 测试侧输入也必须进指纹——只改测试文件（哪怕等长）同样会改变「哪些变异体被杀」，不进指纹就会让中断续跑
+// 继承旧断点（0 个批次被评估、旧 killed/survived 原样重印、exit 0 且无告警）。
+// 范围取**本入口真正执行的那条测试链**，而不是「全仓所有文件」这种无界集合：
+//   ① run_unit_tests.js：DEFAULT_TEST 就是它（决定超时 / SKIP_SUITES 过滤 / 汇总口径）；
+//   ② test_suites.js：套件注册表，决定实际执行哪些套件；
+//   ③ SUITES 中会被 run_unit_tests.js 执行的套件（!integration && !mutationSkip）——integration 套件
+//      在变异评估里根本不跑、mutationSkip 在变异沙箱内被显式跳过，它们的改动不改变判定结果；
+//      SKIP_SUITES 也不参与：runTests 的 spawn 恒清空该变量，CLI 路径则由 mutation.yml 的 step env 设
+//      XBK_MUTATION_CHILD=1（见该处注释），都不经 SKIP_SUITES 过滤。
+// 有意不纳入的（口径边界，勿误读为「全仓都覆盖了」）：套件在运行期读盘的夹具与 CI 配置
+// （package.json / CHANGELOG.md / .github/workflows/*.yml / scripts/*.js 等）。把「测试运行期读到的
+// 一切」纳入会退化成无界集合（且 copyProject 已把它们列为必选输入，缺失即响亮报错）；此处只锚定
+// 「测试代码本身」这个有界、可枚举、与判定强相关的集合。夹具改动的残余口径缺口见 fix-fx6 报告。
+function judgingTestFiles () {
+  return ['run_unit_tests.js', 'test_suites.js',
+    ...SUITES.filter(s => !s.integration && !s.mutationSkip).map(s => s.file)]
+}
+
+// 单文件内容入哈希（F5）：文件名与内容各自带长度前缀——改名与「等长改内容」都会改变指纹。
+function hashFileContent (hash, root, file) {
+  const text = fs.readFileSync(path.join(root, file), 'utf8')
+  hash.update(`${Buffer.byteLength(file)}\u0000${file}\u0001`)
+  hash.update(`${Buffer.byteLength(text)}\u0000${text}\u0001`)
+}
+
+// 变异集指纹（F4/F5）：断点续跑只能按 id 恢复，而 id 是位置序号——源码一改（哪怕插入一行）全部 id
+// 平移，旧断点的 killed/survived 会被错记到别的候选头上。指纹覆盖三块输入，任一变化都会改变指纹 →
+// 断点被丢弃（响亮告警、从零重跑，不静默继承）：
+//   ① 每个候选的文件/区间/原文/替换串（顺序敏感：id 即顺序）；
+//   ② 被变异源文件的**原文**——等长且不触及变异 token 的改动（实测常量 1→9）不改变任何候选字段，
+//      却会改变判定结果；只哈希 ① 时这类改动会静默继承旧断点（与本函数原注释的声称相反）；
+//   ③ 参与判定的测试文件内容（见 judgingTestFiles）。
 // 用 NUL/SOH 分隔并各自带长度前缀，避免不同字段拼接出同一串（边界歧义）。
-function mutantFingerprint (mutants) {
+// options（仅测试注入用，生产调用不传）：root / sourceFiles / testFiles 允许指向合成项目，
+// 使「仅改测试文件」与「等长源码改动」两条回归无需触碰真实工作区。
+function mutantFingerprint (mutants, options = {}) {
+  const root = options.root || ROOT
+  const sourceFiles = options.sourceFiles || DEFAULT_FILES
+  const testFiles = options.testFiles || judgingTestFiles()
   const hash = crypto.createHash('sha256')
   for (const m of mutants) {
     for (const field of [m.file, m.start, m.end, m.original, m.replacement]) {
@@ -196,6 +232,9 @@ function mutantFingerprint (mutants) {
       hash.update(`${Buffer.byteLength(text)}\u0000${text}\u0001`)
     }
   }
+  // 文件清单排序后入哈希：指纹锚定「集合与内容」，不随调用方传入的清单顺序漂移（变异集自身仍按 id 顺序）。
+  for (const file of [...sourceFiles].sort()) hashFileContent(hash, root, file)
+  for (const file of [...testFiles].sort()) hashFileContent(hash, root, file)
   return hash.digest('hex')
 }
 
@@ -572,10 +611,11 @@ async function main (deps) {
   }
   const mutants = collectMutants(files)
   const byId = new Map(mutants.map(m => [m.id, m]))
-  // 断点必须与当前源码/变异集绑定（F4）：id 只是位置序号（index+1），源码一旦改动（插入一行即可让
-  // 全部 id 平移），旧断点的 killed/survived 就会被错记到别的候选头上——既虚增分数，也让真正改动过
-  // 的代码免于变异。故在此记录变异集指纹（每个候选的 file/区间/原文/替换串），恢复时不一致即丢弃
-  // 旧断点并从零开始（响亮告警，不静默继承）。升级前的旧断点没有该字段，同样视为不可信。
+  // 断点必须与当前源码/变异集/测试链绑定（F4/F5）：id 只是位置序号（index+1），源码一旦改动（插入
+  // 一行即可让全部 id 平移），旧断点的 killed/survived 就会被错记到别的候选头上——既虚增分数，也让
+  // 真正改动过的代码免于变异。故在此记录指纹（每个候选的 file/区间/原文/替换串 + 被变异源文件原文 +
+  // 参与判定的测试文件内容，见 mutantFingerprint），恢复时不一致即丢弃旧断点并从零开始（响亮告警，
+  // 不静默继承）。升级前的旧断点没有该字段，同样视为不可信。
   const fingerprint = mutantFingerprint(mutants)
   const loaded = loadCheckpoint(checkpointFile)
   const staleReason = !loaded
@@ -583,7 +623,7 @@ async function main (deps) {
     : typeof loaded.fingerprint !== 'string'
       ? '断点没有源码指纹（升级前格式）'
       : loaded.fingerprint !== fingerprint
-        ? '断点指纹与当前源码/变异集不一致（源码已变更）'
+        ? '断点指纹与当前源码/变异集/测试链不一致（源码或测试已变更）'
         : null
   if (staleReason) {
     console.warn(`⚠️  丢弃断点 ${checkpointFile}：${staleReason}；旧判定结果不可继承，本轮从零开始`)
@@ -673,4 +713,4 @@ async function main (deps) {
 }
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1 })
-module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate, DEFAULT_FILES, mutantFingerprint }
+module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate, DEFAULT_FILES, mutantFingerprint, judgingTestFiles }

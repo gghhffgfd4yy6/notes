@@ -7,6 +7,7 @@
 //   - parseDiagnostics 跳过损坏行找到有效记录
 //   - validReport 容忍缺失计数字段（存在的字段仍须校验）
 //   - validReport 容忍缺失 date 字段（date 存在时仍须为字符串，CodeRabbit PR #147）
+//   - validReport 的 pending 段与生产侧 _loadReportState 同口径（非法形状/计数 → invalid，SS-05）
 //   - formatStatus channels.value 为 null 时的降级分支
 const assert = require('node:assert')
 const fs = require('node:fs')
@@ -139,6 +140,31 @@ try {
     assert.strictEqual(withDate('2026-9-8'), 'invalid', '非补零形态非法（生产侧正则要求 MM/DD 各两位）')
     assert.strictEqual(withDate(''), 'ok', '空串合法（生产侧 _isValidReportDate 对 "" 返回 true）')
     assert.strictEqual(withDate('2026-12-31'), 'ok', '合法日期应判 ok')
+  })
+
+  // ===== SS-05：pending 段必须与生产侧 _loadReportState 同口径（反向漂移）=====
+  // 生产侧对非法 pending（非对象 / 数组 / 计数非法）会 throw → 判「状态损坏」并跳过本次日报更新；
+  // 旧 validReport 完全不看 pending，于是同一份 report.state，生产判损坏、--status 显示「日报：正常」。
+  test('S17 report.state pending 非法 → invalid；合法/缺失 pending → ok', () => {
+    const statusOf = (state) => {
+      fs.writeFileSync(path.join(tmp, 'report.state'), JSON.stringify(state) + '\n')
+      return readStatus(tmp).report.status
+    }
+    // 合法：缺失 pending（生产侧 _normalizeReportState 归一化为全 0）、空对象、部分计数
+    assert.strictEqual(statusOf({ date: '2026-09-08', runs: 1 }), 'ok', 'pending 缺失合法（生产侧归一化为全 0）')
+    assert.strictEqual(statusOf({ pending: {} }), 'ok', '空 pending 对象合法（未累计任何字段）')
+    assert.strictEqual(statusOf({ pending: { runs: 1, pushed: 2 } }), 'ok', 'pending 部分计数合法')
+    // 非法：形状与计数口径逐条对齐生产侧 throw 的分支
+    assert.strictEqual(statusOf({ pending: 5 }), 'invalid', 'pending 非对象必须 invalid（生产侧 throw）')
+    assert.strictEqual(statusOf({ pending: null }), 'invalid', 'pending=null 必须 invalid（typeof null === object，不能只看 typeof）')
+    assert.strictEqual(statusOf({ pending: [] }), 'invalid', 'pending 为数组必须 invalid（生产侧显式排除数组）')
+    assert.strictEqual(statusOf({ pending: { runs: -1 } }), 'invalid', 'pending 计数为负必须 invalid')
+    assert.strictEqual(statusOf({ pending: { total: 1.5 } }), 'invalid', 'pending 计数非整数必须 invalid')
+    assert.strictEqual(statusOf({ pending: { pushed: '2' } }), 'invalid', 'pending 计数非数字必须 invalid')
+    assert.strictEqual(statusOf({ pending: { filtered: Number.MAX_SAFE_INTEGER + 1 } }), 'invalid',
+      'pending 计数超出安全整数范围必须 invalid')
+    // 顶级计数合法性与 pending 校验互不干扰：合法 pending + 非法顶级计数仍须 invalid（既有口径不放松）
+    assert.strictEqual(statusOf({ total: -1, pending: { runs: 1 } }), 'invalid', '顶层计数非法仍须 invalid')
   })
 
   // ===== SS-01：摘要行时间戳必须保留并展示；摘要行之后的 ERROR 不得再渲染成「正常」=====

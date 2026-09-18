@@ -39,6 +39,13 @@ const RETRY_BACKOFF_CAP_MS = 30000
 // 而修前这些输入走指数退避 1s。故非上述形态一律 null，回落指数退避，不做宽松猜测。
 const IMF_FIXDATE_RE = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/
 const RFC850_DATE_RE = /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2} \d{2}:\d{2}:\d{2} GMT$/
+// ⚠️ 已知遗留（工单 T2，本 PR 只标注、不改行为，勿误读为「已校验真实日历日」）：RFC850_DATE_RE 只卡
+// 形态，**不校验真实日历日**——'Sunday, 31-Feb-94 08:49:37 GMT'、'31-Apr-94'、'30-Feb-00'（2000 年
+// 2 月 30 日）这类不存在的日期由 Date.parse 按溢出滚动接受（实测分别落到 3 月 3 日 / 5 月 1 日 /
+// 3 月 1 日），又因早于 now 一律钳成 0ms，日志照旧上报「0s 后重试（按 Retry-After）」；rfc850 的
+// 星期与日期同样不做交叉校验（见下方分支注释），'Monday, 06-Nov-94 …'（真实为周日）也命中 0ms。
+// 实测三例（node 探针）：均为 0；修前这些输入本应回落指数退避。彻底修复需引入真实日历日校验
+// （含 2 位年 50 年切点口径），属既定遗留工单 T2，单独立单处理。
 const ASCTIME_DATE_RE = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/
 // delta-seconds（RFC 9110 的 1*DIGIT）上界：超过 2^31-1 秒（≈68 年）不可能是真实回访时刻，
 // 按非法形态处理（Number 为 Infinity 的数字串同理），不把垃圾头当有效来源。
@@ -66,6 +73,8 @@ function parseRetryAfterMs (value, now = Date.now()) {
   // 星期与日期必须一致（RFC 9110 的 HTTP-date 里 day-name 由日期导出）：
   // IMF-fixdate / asctime 都是 4 位年、无歧义，交叉校验；rfc850 的 2 位年由引擎按 ECMAScript 的
   // 50 年切点解释（yy=50..76 与 RFC 9110 的「不超 50 年未来」规则不同），不做交叉校验以免误拒。
+  // ⚠️ 已知遗留（工单 T2）：本分支因此**也不拦** rfc850 的「星期与日期不符」（如 'Monday,
+  // 06-Nov-94 …'，真实为周日），与上面的「非法日历日」同属既定遗留——只标注、不改行为。
   if (!RFC850_DATE_RE.test(raw)) {
     const actualName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(at).getUTCDay()]
     if (raw.slice(0, 3) !== actualName) return null

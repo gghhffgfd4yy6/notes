@@ -75,8 +75,10 @@
 # 读取路径只由模块常量（path.join(__dirname, '字面量')）组成，package.json 用字面量 require，
 # 不接受任何入参参与路径构造，无外部净输入——「动态构造文件/路径信息」「非字面量 require」等
 # 静态告警属误报（与 run_mutation.js / scripts/check-mutation-ranges.js 同类工具脚本同一处理）。
-# 注：本次收口只加了补丁段校验；判定逻辑已收敛为纯函数 checkVersionValues() 供 test_check_version.js
-# 直接断言。
+# 注：当前闸门是**版本四方一致性**——文件头 ↔ CHANGELOG 最新 ↔ package.json ↔ package-lock.json
+# 根元数据两处（顶层 version 与 packages[""].version，任一缺失/形态异常即 fail-closed）；补丁段必须
+# 为 .0 的校验同时在闸门内。判定逻辑已收敛为纯函数 checkVersionValues() 供 test_check_version.js
+# 直接断言（口径见 check-version.js 文件头；PR #154-3 把锁文件两处纳入硬门禁）。
 #
 # test_check_version.js 的 CLI 契约用例（v3.274 新增）用 fs.mkdtempSync(os.tmpdir() + 固定前缀 'cvcli-')
 # 建临时目录，把 check-version.js 复制进去并写入测试硬编码的 xbk_function_v3.js / CHANGELOG.md /

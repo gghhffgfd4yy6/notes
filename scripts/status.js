@@ -49,6 +49,23 @@ function isValidReportDate (value) {
   return day <= days[month - 1]
 }
 
+// 日报状态里的七项计数（与生产侧 xbk_app._loadReportState / _normalizeReportState 的字段清单逐一对应；
+// 两处是镜像实现，改任一处必须同步另一处）。
+const REPORT_COUNTERS = ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']
+
+// 日报「本轮待累计」段（pending）的口径：与生产侧 _loadReportState 的 `raw.pending` 分支**逐条对齐**
+// （xbk_app.js 的「日报状态 pending 字段无效」/「日报 pending 字段 … 无效」两处 throw）。生产侧遇到
+// 非法 pending 会判「状态损坏」并跳过本次日报更新，而 --status 此前完全不看 pending——同一份
+// report.state，生产判损坏、这里却显示「日报：正常」，两处口径相反（审查 SS-05）。此处补齐：
+//   - 缺失（undefined）合法：生产侧 _normalizeReportState 归一化为全 0 的 pending；
+//   - 存在时必须是普通对象（非 null、非数组），否则非法；
+//   - 七项计数存在时均为非负安全整数（缺失视为未累计，与 raw 顶层计数同口径）。
+function validPendingReport (value) {
+  if (value === undefined) return true
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  return REPORT_COUNTERS.every(key => value[key] === undefined || validCounter(value[key]))
+}
+
 function validReport (value) {
   // 与生产侧 xbk_app 读取口径对齐：七项计数只在字段存在时校验非负安全整数，
   // 缺失视为未累计（生产侧 _normalizeReportState 会归一化为 0），不再整份判 invalid。
@@ -56,8 +73,11 @@ function validReport (value) {
   // _normalizeReportState 归一化为 ''，_updateReport 视其为首轮并补当前日期。此处原先要求
   // typeof date === 'string'，会把合法的 {"runs":1} 显示成「日报：不可读（invalid）」。
   // 审查 SS-04：存在的 date 不只校验类型，还按 _isValidReportDate 语义校验真实日期。
+  // 审查 SS-05：pending 段与生产侧同口径校验（见 validPendingReport）——不校验时，生产判损坏的
+  // report.state 会在 --status 里显示成「日报：正常」。
   return value && (value.date === undefined || isValidReportDate(value.date)) &&
-    ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'].every(key => value[key] === undefined || validCounter(value[key]))
+    REPORT_COUNTERS.every(key => value[key] === undefined || validCounter(value[key])) &&
+    validPendingReport(value.pending)
 }
 
 // 单条通道记录的口径：必须是普通对象且三个计数均为非负安全整数（缺失/类型错即该条损坏）。
