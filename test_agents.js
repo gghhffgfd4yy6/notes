@@ -188,12 +188,16 @@ dns.lookup = (hostname, options, callback) => {
   assert.strictEqual(abortedResult.ok, false, 'aborted 时 ok 应为 false')
   assert.ok(abortedResult.error?.includes('abort') || abortedResult.cancelled === true, 'aborted 时应包含取消信息')
 
-  // ===== AGENTS-01：prewarmDns 必须与真实请求的 lookup 同 key（默认 DNS 模式预热才有效）=====
-  // 真实 net.connect 在 Node ≥20（autoSelectFamily 默认开启）下以 {hints: ADDRCONFIG(1024), all: true}
-  // 调用本 lookup（本机 Node v24 实测 {"hints":1024,"all":true}），而 prewarmDns 传的是 {}。
-  // 旧实现把 hints/all/verbatim 编进 key → 两者永不同 key，预热写进一个永不被读的条目，
-  // DNS 预热完全无效（本断言在旧代码下必红：底层次数为 2 而非 1）。现按 hostname+family 共享条目，
-  // 底层统一按 all:true 解析并缓存完整地址列表，回调形状在派发时按各调用方的 all 适配。
+  // ===== AGENTS-01 + AGENTS-11：prewarmDns 必须与真实请求的 lookup 同 key（默认 DNS 模式预热才有效），
+  // 但同 key 的口径是「同选项」，不是「同主机」 =====
+  // 真实 net.connect 实测（本机 Node v24.18.0）以 {hints: dns.ADDRCONFIG(1024)}（autoSelectFamily 默认
+  // 开启时另加 all:true）调用本 lookup；prewarmDns 必须同源取值才能同 key——旧实现预热传 {}，
+  // 与真实请求 hints 不同，预热写进一个永不被读的条目，DNS 预热完全无效（本断言在那种代码下必红：
+  // 底层次数为 2 而非 1）。
+  // AGENTS-11 追加口径：缓存键还必须区分**结果选择选项**（family/hints/verbatim/order）——旧键
+  // hostname|family 让选项不同的调用方互相复用地址，其中一个必然拿到按别人选项筛选/排序过的结果。
+  // 因此下面「非 all 调用方共享条目」的断言改用**与预热同选项**的调用方（形状适配语义不变），
+  // 另加断言：选项不同的调用方必须重新解析、拿到自己的结果（不是放松，而是把旧断言指向正确的目标）。
   {
     const keyProbeHost = 'prewarm-key-probe.invalid'
     const keyCalls = []
@@ -207,25 +211,128 @@ dns.lookup = (hostname, options, callback) => {
     assert.strictEqual(warm.ok, true, '预热应成功')
     assert.strictEqual(keyCalls.length, 1, '预热应发起 1 次底层解析')
     assert.strictEqual(keyCalls[0].options.all, true, '底层应统一按 all:true 解析（缓存完整地址列表）')
+    // 预热必须与生产请求同源取值：hints 必须等于 net 实测传的 ADDRCONFIG（family 未指定时）
+    assert.strictEqual(keyCalls[0].options.hints, dns.ADDRCONFIG, '预热应按生产请求选项取 hints=ADDRCONFIG')
     // 真实请求形态：net 传 hints=ADDRCONFIG + all=true → 必须命中预热写入的缓存条目
     const allHit = await new Promise((resolve, reject) => {
       dnsLookup(keyProbeHost, { hints: 1024, all: true }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
     })
-    assert.strictEqual(keyCalls.length, 1, `预热后真实请求形态的 lookup 应命中同一缓存（旧 key 含 hints/all 时为 2），实际 ${keyCalls.length}`)
+    assert.strictEqual(keyCalls.length, 1, `预热后真实请求形态的 lookup 应命中同一缓存（不同 key 时为 2），实际 ${keyCalls.length}`)
     assert.ok(Array.isArray(allHit.address) && allHit.address[0] && allHit.address[0].address === '192.0.2.7', 'all:true 调用方应拿到地址数组')
-    // 同一缓存条目服务非 all 调用方：形状适配为标量
+    // 同一缓存条目服务非 all 调用方：形状适配为标量（调用方选项与预热同源，故仍共享条目）
     const scalarHit = await new Promise((resolve, reject) => {
-      dnsLookup(keyProbeHost, {}, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+      dnsLookup(keyProbeHost, { hints: 1024 }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
     })
-    assert.strictEqual(keyCalls.length, 1, '非 all 调用方也应命中同一缓存条目，不应再发起解析')
+    assert.strictEqual(keyCalls.length, 1, '同选项的非 all 调用方也应命中同一缓存条目，不应再发起解析')
     assert.strictEqual(scalarHit.address, '192.0.2.7', '非 all 调用方应拿到标量地址')
     assert.strictEqual(scalarHit.family, 4, '非 all 调用方应拿到地址族')
+    // 选项不同的调用方（hints:0）语义不同，不得复用上面按 ADDRCONFIG 筛过的条目：必须自己解析
+    const plainHit = await new Promise((resolve, reject) => {
+      dnsLookup(keyProbeHost, {}, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+    })
+    assert.strictEqual(keyCalls.length, 2, 'hints:0 与预热的 hints:ADDRCONFIG 选项不同 → 必须重新解析（AGENTS-11）')
+    assert.ok(!keyCalls[1].options.hints, '重新解析必须把调用方自己的 hints（此处未指定）交给底层')
+    assert.strictEqual(plainHit.address, '192.0.2.7', 'hints:0 调用方应拿到自己那次解析的结果')
     // 恢复文件头的确定性 mock（保持后续断言的既定语义）
     dns.lookup = (hostname, options, callback) => {
       const cb = typeof options === 'function' ? options : callback
       process.nextTick(() => cb(null, '127.0.0.1', 4))
     }
-    console.log('✅ AGENTS-01：prewarmDns 与真实请求同 key（hints/all 不再导致缓存错配）')
+    console.log('✅ AGENTS-01/11：预热与真实请求同 key；选项不同（hints）不再互相复用条目')
+  }
+
+  // ===== AGENTS-11：缓存键覆盖 family/hints/verbatim/order（不同选项不得复用不匹配的地址）=====
+  // 替身按 Node dns.lookup 语义建模：family 过滤 → hints&ADDRCONFIG 过滤（本机默认网络无 IPv6，
+  // 平台 AI_ADDRCONFIG 会剔除 AAAA）→ order/verbatim 排序；解析器原始顺序固定 [v6, v4]。
+  // 这条同时守住两个不变量：① 任何调用方拿到的地址必须按**自己**的选项筛选/排序；
+  // ② 预热（生产选项）与真实请求形态仍共享条目、不重复解析。
+  {
+    const host = 'select-probe.invalid'
+    const calls = []
+    const resolverOrder = [{ address: '2001:db8::1', family: 6 }, { address: '192.0.2.7', family: 4 }]
+    dns.lookup = (hostname, options, callback) => {
+      const opts = options || {}
+      calls.push({ hostname, options: opts })
+      let list = resolverOrder.slice()
+      if (opts.family === 4) list = list.filter(x => x.family === 4)
+      else if (opts.family === 6) list = list.filter(x => x.family === 6)
+      if (opts.hints & dns.ADDRCONFIG) list = list.filter(x => x.family === 4)
+      const order = opts.order || (opts.verbatim === false ? 'ipv4first' : opts.verbatim === true ? 'verbatim' : 'verbatim')
+      if (order === 'ipv4first') list = list.slice().sort((a, b) => a.family - b.family)
+      if (order === 'ipv6first') list = list.slice().sort((a, b) => b.family - a.family)
+      process.nextTick(() => callback(null, opts.all === false ? list[0] : list, undefined))
+    }
+    const lookup = (options) => new Promise((resolve, reject) => {
+      dnsLookup(host, options, (err, address) => err ? reject(err) : resolve(address))
+    })
+    const families = (list) => list.map(x => x.family).join(',')
+    const warm = await prewarmDns(host)
+    assert.strictEqual(warm.ok, true, '预热应成功')
+    assert.strictEqual(calls.length, 1, '预热应发起 1 次底层解析')
+    // ① 生产请求形态（hints=ADDRCONFIG, all:true）命中预热条目，且不含本机未配置族的地址
+    const acHit = await lookup({ hints: dns.ADDRCONFIG, all: true })
+    assert.strictEqual(calls.length, 1, '生产请求形态应命中预热条目（预热仍有效）')
+    assert.strictEqual(families(acHit), '4', 'ADDRCONFIG 调用方不得拿到本机未配置族的 AAAA')
+    // ② 同一 hostname、选项不同 → 各自的条目与结果（TTL 内多次不同选项请求）
+    const plain = await lookup({ hints: 0, all: true })
+    assert.strictEqual(calls.length, 2, 'hints:0 与预热选项不同 → 应重新解析')
+    assert.strictEqual(families(plain), '6,4', 'hints:0 调用方应拿到完整地址集（不得复用 ADDRCONFIG 视图）')
+    // ③ 排序选项 verbatim:false（hints 0）→ 必须由解析器按 ipv4first 重新给出顺序
+    const vf = await lookup({ hints: 0, verbatim: false, all: true })
+    assert.strictEqual(calls.length, 3, 'verbatim:false 与 verbatim:true 顺序语义不同 → 应重新解析')
+    assert.strictEqual(vf[0].family, 4, 'verbatim:false 必须得到 IPv4 在前')
+    // ④ order 与 verbatim 归一：{order:'ipv4first'} 与 {verbatim:false} 语义相同 → 共享条目
+    const of = await lookup({ hints: 0, order: 'ipv4first', all: true })
+    assert.strictEqual(calls.length, 3, '{order:ipv4first} 与 {verbatim:false} 语义相同 → 应共享条目，不应再解析')
+    assert.strictEqual(families(of), families(vf), '归一后的两种写法应得到相同结果')
+    // ⑤ 非 all 调用方在同选项下共享条目（all 只决定回调形状）
+    const scalar = await lookup({ hints: 0, verbatim: false })
+    assert.strictEqual(calls.length, 3, '同选项的非 all 调用方应共享条目（形状适配）')
+    assert.strictEqual(scalar, '192.0.2.7', '非 all 调用方应拿到标量首地址')
+    // ⑥ family 4/6 各自条目
+    const v6 = await lookup({ family: 6, all: true })
+    const v4 = await lookup({ family: 4, all: true })
+    assert.strictEqual(calls.length, 5, 'family 4/6 语义不同 → 各自解析')
+    assert.strictEqual(families(v6), '6', 'family:6 只应拿到 AAAA')
+    assert.strictEqual(families(v4), '4', 'family:4 只应拿到 A')
+    // ⑦ 未建模的选项（未知键）→ 不读也不写缓存，按调用方原选项解析，且不污染同主机其它条目
+    const exotic = await lookup({ hints: dns.ADDRCONFIG, v6Only: true, all: true })
+    assert.strictEqual(calls.length, 6, '未知选项不得复用缓存条目，应直接解析')
+    assert.strictEqual(calls[5].options.v6Only, true, '未知选项应原样交给底层解析器')
+    assert.ok(Array.isArray(exotic), '未知选项调用方仍应按 all 形状拿到结果')
+    const acAgain = await lookup({ hints: dns.ADDRCONFIG, all: true })
+    assert.strictEqual(calls.length, 6, '未知选项的解析不得写回预热条目（不污染同主机其它选项的缓存）')
+    assert.strictEqual(families(acAgain), '4', '预热条目内容不应被未知选项调用改写')
+    // ⑦b 非法取值（family/hints/verbatim/order 的类型或取值超出建模范围）同样不进缓存 → 每次直接解析
+    for (const opts of [{ family: 5, all: true }, { family: 'IPv4', all: true }, { hints: '1024', all: true }, { hints: Number.NaN, all: true }, { hints: Infinity, all: true }, { verbatim: 'yes', all: true }, { order: 'ipv6only', all: true }]) {
+      const before = calls.length
+      await lookup(opts)
+      assert.strictEqual(calls.length, before + 1, `非法取值 ${JSON.stringify(opts)} 应直接解析`)
+    }
+    const notModeledBefore = calls.length
+    await lookup({ family: 5, all: true })
+    assert.strictEqual(calls.length, notModeledBefore + 1, '未建模选项的调用不得写缓存（同形状再查仍解析）')
+    // ⑧ 并发去重按选项分组：同选项合并 1 次解析，不同选项各自解析
+    const hangHost = 'select-pending.invalid'
+    const hanging = []
+    dns.lookup = (hostname, options, callback) => { hanging.push({ options, callback }) }
+    const p1 = new Promise((resolve, reject) => dnsLookup(hangHost, { hints: dns.ADDRCONFIG, all: true }, (e, a) => e ? reject(e) : resolve(a)))
+    const p2 = new Promise((resolve, reject) => dnsLookup(hangHost, { hints: dns.ADDRCONFIG, all: true }, (e, a) => e ? reject(e) : resolve(a)))
+    const p3 = new Promise((resolve, reject) => dnsLookup(hangHost, { hints: 0, all: true }, (e, a) => e ? reject(e) : resolve(a)))
+    await new Promise(resolve => setImmediate(resolve))
+    assert.strictEqual(hanging.length, 2, '并发去重应按选项分组：同选项合并、不同选项各自解析')
+    hanging[0].callback(null, [{ address: '192.0.2.7', family: 4 }], undefined)
+    hanging[1].callback(null, resolverOrder.slice(), undefined)
+    const [r1, r2, r3] = await Promise.all([p1, p2, p3])
+    assert.strictEqual(families(r1), '4', '同选项并发调用方应共享同一次解析结果')
+    assert.strictEqual(families(r2), '4', '同选项并发调用方应共享同一次解析结果')
+    assert.strictEqual(families(r3), '6,4', '不同选项的并发调用方应拿到自己那次解析的结果')
+    // 恢复文件头的确定性 mock（保持后续断言的既定语义）
+    dns.lookup = (hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      process.nextTick(() => cb(null, '127.0.0.1', 4))
+    }
+    console.log('✅ AGENTS-11：缓存键含 family/hints/verbatim(order)——不同选项不复用不匹配地址，同选项仍共享条目')
   }
 
   // ===== module.exports：不再导出死值 DNS_CACHE（AGENTS-08）=====
