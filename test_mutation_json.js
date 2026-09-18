@@ -87,15 +87,17 @@ try {
 
   // ===== F1：预读大小护栏必须在 readFileSync（分配峰值）之前生效 =====
   // 旧实现唯一的尺寸守卫在 Buffer.concat 之后；超限输入要先付一次整份报告的分配才发现放不下。
-  // 现改为读取前 statSync 预检大小与类型（上限可注入，避免构造 4GiB 级夹具）。
+  // 现改为「一次 openSync + **只对 fd** fstatSync 预检大小与类型，再按同一 fd 读」——判定与读取
+  // 作用于同一个 inode，不存在 statSync(路径)→readFileSync(路径) 的二次查找窗口
+  // （CodeQL js/file-system-race）。因此这里计数 fstatSync（fd 探测），上限可注入以免构造 4GiB 夹具。
   {
     const file = path.join(tmpdir, 'oversize.json')
     fs.writeFileSync(file, '{"a":1}') // 7 字节
     const realReadFileSync = fs.readFileSync
     let readCalls = 0
-    let statCalls = 0
-    const realStatSync = fs.statSync
-    fs.statSync = function (...args) { statCalls += 1; return realStatSync.apply(fs, args) }
+    let fstatCalls = 0
+    const realFstatSync = fs.fstatSync
+    fs.fstatSync = function (...args) { fstatCalls += 1; return realFstatSync.apply(fs, args) }
     fs.readFileSync = function (...args) { readCalls += 1; return realReadFileSync.apply(fs, args) }
     let limitError = null
     try {
@@ -104,15 +106,15 @@ try {
       limitError = e
     } finally {
       fs.readFileSync = realReadFileSync
-      fs.statSync = realStatSync
+      fs.fstatSync = realFstatSync
     }
     assert.ok(limitError, '超过预读上限必须抛错')
     assert.ok(String(limitError.message).includes('oversize.json'), `预读超限报错必须带路径，实际：${limitError && limitError.message}`)
     assert.ok(String(limitError.message).includes('7 字节'), `预读超限报错必须带真实大小，实际：${limitError && limitError.message}`)
     assert.ok(String(limitError.message).includes('4 字节'), `预读超限报错必须带上限，实际：${limitError && limitError.message}`)
-    assert.strictEqual(statCalls > 0, true, '必须先 stat 取真实大小')
+    assert.strictEqual(fstatCalls > 0, true, '必须先 fstat 取真实大小')
     assert.strictEqual(readCalls, 0, '超限必须在 readFileSync（分配峰值）之前判定，不得先整份读入再报错')
-    console.log('✅ 预读大小护栏在 readFileSync 分配之前生效（含路径与真实大小）')
+    console.log('✅ 预读大小护栏在 readFileSync 分配之前生效（含路径与真实大小，按 fd fstat 探测）')
     pass++
   }
 
