@@ -50,9 +50,14 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
   {
     const originalExitCode = process.exitCode
     const originalCheckpoint = process.env.MUTATION_CHECKPOINT
-    const ckpt = path.join(os.tmpdir(), `xbk-fingerprint-ckpt-${process.pid}.json`)
+    // 私有临时目录 + 固定文件名：共享 tmpdir 里用可预测文件名建文件属「不安全临时文件」
+    // （CodeQL js/insecure-temporary-file）；mkdtempSync 出来的目录只有本用户可访问，文件名可固定。
+    const ckpt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-fingerprint-')), 'checkpoint.json')
     const reportFile = path.join(__dirname, 'mutation-report.json')
-    const hadReport = fs.existsSync(reportFile) ? fs.readFileSync(reportFile) : null
+    // 直接读并只吞 ENOENT，取代 existsSync→（后面的）write 这对 check-then-use
+    // （CodeQL js/file-system-race）：语义不变（不存在仍记为 null，finally 里据此删除临时报告）。
+    let hadReport = null
+    try { hadReport = fs.readFileSync(reportFile) } catch (e) { if (e.code !== 'ENOENT') throw e }
     const calls = []
     try {
       process.env.MUTATION_CHECKPOINT = ckpt
@@ -79,7 +84,7 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
       process.exitCode = originalExitCode
       if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
       else process.env.MUTATION_CHECKPOINT = originalCheckpoint
-      fs.rmSync(ckpt, { force: true })
+      fs.rmSync(path.dirname(ckpt), { recursive: true, force: true })
       if (hadReport === null) fs.rmSync(reportFile, { force: true })
       else fs.writeFileSync(reportFile, hadReport)
     }
@@ -91,9 +96,12 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
   {
     const originalExitCode = process.exitCode
     const originalCheckpoint = process.env.MUTATION_CHECKPOINT
-    const ckpt = path.join(os.tmpdir(), `xbk-undetermined-ckpt-${process.pid}.json`)
+    // 同上一块：私有临时目录 + 固定文件名（CodeQL js/insecure-temporary-file）
+    const ckpt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-undetermined-')), 'checkpoint.json')
     const reportFile = path.join(__dirname, 'mutation-report.json')
-    const hadReport = fs.existsSync(reportFile) ? fs.readFileSync(reportFile) : null
+    // 同上一块：读失败只吞 ENOENT，消除 existsSync→write 的 check-then-use（CodeQL js/file-system-race）
+    let hadReport = null
+    try { hadReport = fs.readFileSync(reportFile) } catch (e) { if (e.code !== 'ENOENT') throw e }
     const calls = []
     try {
       process.env.MUTATION_CHECKPOINT = ckpt
@@ -124,7 +132,7 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
       process.exitCode = originalExitCode
       if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
       else process.env.MUTATION_CHECKPOINT = originalCheckpoint
-      fs.rmSync(ckpt, { force: true })
+      fs.rmSync(path.dirname(ckpt), { recursive: true, force: true })
       if (hadReport === null) fs.rmSync(reportFile, { force: true })
       else fs.writeFileSync(reportFile, hadReport)
     }
