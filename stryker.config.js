@@ -97,9 +97,15 @@ module.exports = {
   //   一般情形下日报分数是 stryker 分数的**下界**（日报分母 total 含上述四类，stryker 的 totalValid 不含），
   //   故按日报基线取的阈值在 stryker 侧只会更安全。
   // 回退：把 break 改回 null 即取消分数门禁，不涉及任何其它文件。
-  // 已知局限（既有，与本门禁不冲突，勿据此认为门禁无效）：command runner 只支持 coverageAnalysis:'off'，
-  //   增量模式下 incremental-differ 感知不到「测试变化」⇒ 本门禁拦得住「源码新增未被杀死的变异体」，
-  //   拦不住「只删/弱化测试」（见上方 commandRunner 与 mutation.yml 缓存 key 注释）。
+  // 与「测试被弱化」的关系（PR #156 返工，Qodo High / Correctness）：本门禁曾有一个真实缺口——
+  //   增量缓存 key 不含测试侧指纹，而 command runner 只支持 coverageAnalysis:'off'、incremental-differ
+  //   在拿不到覆盖信息时直接复用全部旧结果，于是「只删/弱化测试」会带着**按旧测试算出的** killed/survived
+  //   过门禁。该缺口已由 mutation.yml 的「恢复增量缓存」step 关闭：测试侧指纹（scripts/mutation-child.js /
+  //   run_unit_tests.js / test_suites.js / test_suite_registry.js / 全部 test_*.js）同时进 key 与
+  //   restore-keys 前缀（前缀语义决定了测试段必须排在源段之前）⇒ 测试一变就没有旧基线可复用，
+  //   必须全量重跑并按新测试重新计分。
+  //   残余边界（与缓存无关，属任何「分数门禁」的固有性质，勿据此认为门禁无效）：门禁判定的是**分数**，
+  //   若弱化测试后新跑一轮的分数仍 ≥ 65，门禁照样绿——它拦的是「分数真的掉下来」，不是「测试被人改过」。
   //   另见上方 timeoutMS 注释：(killed + timeout) 把超时计入分子，慢到超时的存活体在分数上算「已检出」，
   //   故该分数不是严格的漏检率——这也是把阈值放在最低段之下 4.38 个百分点、而不是贴着 69.38 的原因。
   thresholds: { high: 80, low: 60, break: 65 },
@@ -107,13 +113,14 @@ module.exports = {
   // 读 reports/mutation/mutation.json。本文件刻意不写 jsonReporter.fileName/htmlReporter.fileName，靠
   // Stryker 默认值（reports/mutation/mutation.json、reports/mutation/mutation.html）与 mutation.yml 的 artifact
   // 路径、scripts/mutation-report.js 的查找口径隐式对齐；'clear-text' 供 CI 日志阅读。
-  // 代价（审查 F-04，low）：command runner 把每个变异体的整段测试输出写进 statusReason，单个
-  // mutation.json 可达 500MB+（见 scripts/mutation-json.js:2-6 的自述），而 .github/workflows/mutation.yml
-  // 仍把整个 reports/ 当缓存（「恢复增量缓存」step 的 path: reports）与 artifact（「上传变异报告」step 的
-  // path: reports/）的载体——18 段各自 restore/save/上传数百 MB，拖慢归档并挤压同仓库其它缓存。
-  // 真正的体积收敛必须改 workflow（缓存只留 reports/inc-*.json，或在缓存/上传前先接入
-  // scripts/mutation-json.js 的现成剥离实现），属跨文件改动，本次未落地；此处只把「json reporter 不可删」
-  // 的耦合与已知代价写明，避免后人误删 reporter，或误以为体积问题与 reporter 选择无关。
+  // 体积（审查 F-04；PR #156 已落地处理）：command runner 把每个变异体的整段测试输出写进 statusReason，
+  // 单个 mutation.json 可达 500MB+（见 scripts/mutation-json.js:2-6 的自述）。该体积已在
+  // .github/workflows/mutation.yml 里收敛：上传前对 reports/mutation/mutation.json 落盘剥离
+  // statusReason（全仓消费方经 readReportJson 本就把该字段读成空串 ⇒ 门禁语义零变化），artifact 只带
+  // reports/mutation/（机器报告 + 给人看的 html），增量基线 reports/inc-*.json **刻意不剥离**、仍随
+  // actions/cache 保存——剥掉它会让被增量复用的变异体在后续运行的 JSON/HTML 里永远解释不了当初为什么
+  // 存活/报错（Qodo Medium / Observability，PR #156 返工）。此处只把「json reporter 不可删」的耦合与
+  // 体积口径写明，避免后人误删 reporter，或误以为体积问题与 reporter 选择无关。
   reporters: ['clear-text', 'html', 'json'],
   tempDirName: '.stryker-tmp',
   cleanTempDir: 'always',

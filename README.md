@@ -19,7 +19,7 @@ npm start
 
 `npm run rebuild --prefix node_modules/re2` 走 node-gyp 源码构建，需要 python3 与 C/C++ 工具链；容器里缺工具链时改用 `npm rebuild re2`——它执行 re2 官方 install 脚本，优先使用带 SHA-256 校验的预编译包（与 CI 同路径），失败才回退源码构建。
 
-`npm run hooks:install` 会把 `core.hooksPath` 指向 `.githooks`：`pre-commit` 跑 lint / 版本闸门 / 变异行段校验（约 20s），`pre-push` 跑 `npm run test:filter`（约 60s，推送前拦截），`commit-msg` 要求首行以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头且不超过 100 字符。npm 不会自动注册仓库钩子，需在安装后显式执行一次；若你已配置过其它 `core.hooksPath`，该脚本不会覆盖。钩子文件必须可执行：noexec 挂载或无执行位的检出会以非零码拒绝安装并提示。**装完请用 `npm run hooks:verify` 自检门禁是否真的生效**（只读：生效 exit 0，未生效 exit 1 并说明是配置缺失、钩子文件缺失还是无执行位）——`hooks:install` 对「跳过/不覆盖」场景按设计仍 exit 0，不能当作「装好了」的证据。
+`npm run hooks:install` 会把 `core.hooksPath` 指向 `.githooks`：`pre-commit` 跑 lint / 版本闸门 / 变异行段校验（约 20s），`pre-push` 跑 `npm run test:filter`（约 60s，推送前拦截）——门禁针对**被推提交的内容**：`local_sha == HEAD` 且已跟踪文件干净时在当前工作树跑（此时两者内容一致），否则在临时 worktree 里检出那个提交再跑、跑完清理，隔离环境建不起来就 fail-closed（不会拿工作树结果冒充被推提交），`commit-msg` 要求首行以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头且不超过 100 字符。npm 不会自动注册仓库钩子，需在安装后显式执行一次；若你已配置过其它 `core.hooksPath`，该脚本不会覆盖。钩子文件必须可执行：noexec 挂载或无执行位的检出会以非零码拒绝安装并提示。**装完请用 `npm run hooks:verify` 自检门禁是否真的生效**（只读：生效 exit 0，未生效 exit 1 并说明是配置缺失、钩子文件缺失还是无执行位）——`hooks:install` 对「跳过/不覆盖」场景按设计仍 exit 0，不能当作「装好了」的证据。
 
 `push_config.local.js` 含密钥，已被 `.gitignore` 忽略。**通知通道**配置可用环境变量覆盖（见「配置」）；主配置（过滤、日报、通道健康、缓存目录等）不支持环境变量覆盖，需直接改 `xbk_function_v3.js`。
 
