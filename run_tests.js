@@ -3,8 +3,8 @@
 // 统一测试入口：按 test_suites.js 注册表执行全部套件（含 integration，非「三套」）+ 汇总报告 + 退出码
 // 用法：node run_tests.js   （或 npm test）
 // 退出码：0 = 全部通过，非 0 = 有失败（CI/调度可感知）
-// 每套件硬超时：默认 600s（可经 XBK_TEST_TIMEOUT 覆盖），超时按失败处理并以 SIGKILL 强杀——
-// 套件挂死时入口仍能收敛出结论与退出码，不会永久阻塞（RT-03）。
+// 每套件硬超时：默认 600s（可经 XBK_TEST_TIMEOUT 覆盖），超时按失败处理并整组 SIGKILL 强杀——
+// 套件挂死时入口仍能收敛出结论与退出码，不会永久阻塞（RT-03）；套件派生的后代由整组杀伤一并清掉（F6）。
 // ============================================================
 const { execFileSync } = require('child_process')
 const path = require('path')
@@ -35,6 +35,26 @@ function positiveIntEnv (name, fallback) {
     return fallback
   }
   return value
+}
+
+// 超时后的整组杀伤（F6）：execFileSync 抛出的超时错误带 pid，而套件以 detached:true 启动（setsid），
+// pid 即进程组 id → kill(-pid) 连同套件派生的后代一起清掉。
+// 为什么必须有这一步：只 kill 直接子进程（修复前）时，套件 fork 出的孙进程（与 test_app_p.js 的
+// 并行调度同形：fork + stdio 继承 fd1）存活并继续持有继承的 stdout/stderr。入口自身被管道捕获时
+// （CI runner 收输出、spawnSync('pipe')、其它入口以 stdio:'pipe' 拉起本入口）管道的 close 会被推迟到
+// 孤儿后代退出才发生——实测父进程要等 30s 兜底才返回；且孤儿继续跑（占 CPU / 端口 / 临时目录，
+// 污染后续套件）。这与 run_mutation.js:324 的 killTree 是同一 bug 类、同一修法（见该处注释）。
+// 组不存在（子进程未及 setsid / 已被回收 → ESRCH）或无权限（EPERM）时静默退回：直接子进程已由
+// spawnSync 按 killSignal=SIGKILL 强杀（即修复前行为）。不抛错、不改结算口径——超时仍按失败处理、
+// 退出码仍为 1、汇总三数字不变（fail-closed 语义）。
+function killSuiteTree (err) {
+  if (!Number.isInteger(err && err.pid) || err.pid <= 0) return false
+  try {
+    process.kill(-err.pid, 'SIGKILL')
+    return true
+  } catch (e) {
+    return false
+  }
 }
 
 // 每套件硬超时（RT-03）：execFileSync 默认无 timeout，套件挂死（死循环 / 等待不会到来的输入 /
@@ -69,7 +89,9 @@ for (const s of SUITES) {
   try {
     // 继承 stdout/stderr（各套件自己的 ✅/❌ 输出直接透传），捕获退出码；
     // timeout + killSignal 见 TEST_TIMEOUT（RT-03）：挂死套件强杀后走下方失败分支，不再永久阻塞。
-    execFileSync(process.execPath, [file], { stdio: 'inherit', timeout: TEST_TIMEOUT, killSignal: 'SIGKILL' })
+    // detached:true（F6）：套件自成进程组组长，超时后据此整组杀伤（见 killSuiteTree）——
+    // 与 run_mutation.js 的 runTests 同口径。
+    execFileSync(process.execPath, [file], { stdio: 'inherit', timeout: TEST_TIMEOUT, killSignal: 'SIGKILL', detached: true })
     const ms = Date.now() - t0
     results.push({ ...s, ok: true, ms })
     console.log(`\n  ✅ ${s.name} 通过（${(ms / 1000).toFixed(1)}s）\n`)
@@ -79,6 +101,8 @@ for (const s of SUITES) {
     // 超时（execFileSync 抛 ETIMEDOUT，套件已按 killSignal=SIGKILL 强杀）必须与断言红区分开：
     // 否则排查者只看到一行「失败」，不知道套件是被每套件上限掐掉的（RT-03）。
     const timedOut = e.code === 'ETIMEDOUT' || /ETIMEDOUT/.test(String(e.message || ''))
+    // 超时后补一刀整组杀伤（F6）：直接子进程已死，但它的后代可能还活着（见 killSuiteTree 注释）。
+    if (timedOut) killSuiteTree(e)
     // 静默非零退出/被信号杀死的套件在子进程侧可能零输出——父进程必须补上退出原因，
     // 否则 exit 7 与「被 OOM 杀掉」在输出上完全不可区分（e.status/e.signal/e.code/e.message）。
     const why = `code=${e.code ?? '-'} status=${e.status ?? '-'} signal=${e.signal ?? '-'}`
