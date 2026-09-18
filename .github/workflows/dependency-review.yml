@@ -9,6 +9,7 @@ permissions:
 jobs:
   dependency-review:
     runs-on: ubuntu-latest
+    timeout-minutes: 15   # REV-CI：实测墙钟 ~7-16s（gh api …/runs，如 35344139339 = 7s），15min 余量充足
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

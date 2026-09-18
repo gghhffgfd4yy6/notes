@@ -25,6 +25,9 @@ jobs:
   analyze:
     name: Analyze
     runs-on: ubuntu-latest
+    # REV-CI：本工作流此前无 timeout-minutes。依据（gh api …/workflows/codeql.yml/runs）：
+    # 近期 run 墙钟 1.1-4.6min（如 35345072256 = 1.5min，35299124026 = 4.6min），30min 留 ≈6x 余量。
+    timeout-minutes: 30
     permissions:
       security-events: write   # CodeQL 上传扫描结果必需
       actions: read
