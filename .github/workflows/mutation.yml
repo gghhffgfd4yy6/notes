@@ -296,13 +296,16 @@ jobs:
           node scripts/mutation-report.js --strip "${targets[@]}"
 
       # 明细报告留档（inc-*.json + mutation.json/html），artifact 有公开下载 API
+      # 保留期 v3.276 起由 14 天改为 7 天（用户批准）：跨 run 消费者只有 .github/workflows/analyze-artifacts.yml
+      # （按 run-id 下载最近一次「成功」运行的 artifact），该工作流仅由自身变更 push 或手动 dispatch 触发，
+      # 故「连续 7 天无成功变异运行」才会让它失去输入；本 run 内的 report job 同 run 下载，不受影响。
       - name: 上传变异报告
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: mutation-report-${{ matrix.name }}
           path: reports/
-          retention-days: 14
+          retention-days: 7
 
       # REV-CI（落地 stryker.config.js 自述的 F-04）：缓存（path: reports）此前会把
       # reports/mutation/{mutation.json,mutation.html} 一并保存——而这个目录正是本 job 最上方的
