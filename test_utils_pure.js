@@ -344,8 +344,10 @@ check('P1-04: 清洗链内部正则不含反向引用（RE2 兼容）', () => {
   const cases = [
     ['sanitizeHtmlUrls', '<a href="javascript:alert(1)">x</a>', /javascript/, false],
     ['sanitizeHtmlUrls', "<a href='javascript:alert(1)'>x</a>", /javascript/, false],
-    ['sanitizeHtmlUrls', '<a href="https://u.jd.com/a">x</a>', /https:\/\/u\.jd\.com\/a/, true],
-    ['sanitizeHtmlUrls', "<a href='https://u.jd.com/a'>x</a>", /https:\/\/u\.jd\.com\/a/, true],
+    // CodeQL js/regex/missing-regexp-anchor：URL 形态的正则若不加锚点可匹配任意主机的前后缀；
+    // 这两条断言的是「合法值被原样保留」，改为锚定整串（^…$）后语义更强且不再有该告警。
+    ['sanitizeHtmlUrls', '<a href="https://u.jd.com/a">x</a>', /^<a href="https:\/\/u\.jd\.com\/a">x<\/a>$/, true],
+    ['sanitizeHtmlUrls', "<a href='https://u.jd.com/a'>x</a>", /^<a href='https:\/\/u\.jd\.com\/a'>x<\/a>$/, true],
     ['_cleanNavAttrs', '<div xlink:href="javascript:alert(1)">d</div>', /javascript/, false],
     ['_cleanNavAttrs', "<div xlink:href='javascript:alert(1)'>d</div>", /javascript/, false],
     ['_cleanNavAttrs', '<div poster="https://x/1.jpg">d</div>', /https:\/\/x\/1\.jpg/, true],
@@ -458,7 +460,10 @@ check('P1-04 收尾: RE2 编译失败回落 V8 只告警一次（含模式与原
   assert.ok(!warn.includes('SUPERSECRETVALUE123456'), `告警须经既有脱敏通道遮蔽凭据：${warn}`)
   assert.ok(warn.includes('token=***'), `凭据应按既有 redact 形态遮蔽为 ***：${warn}`)
   assert.ok(!/javascript/i.test(out.outFirst) && out.outFirst.includes('href=""'), `回落行为不变：危险协议仍须清空（${out.outFirst}）`)
-  assert.ok(out.outSecond.includes('https://u.jd.com/a'), `回落行为不变：合法 href 仍须保留（${out.outSecond}）`)
+  // CodeQL js/incomplete-url-substring-sanitization：对输出做 URL 子串判定不安全（任意主机可前后拼接），
+  // 改为解析出 href 属性值后整体比较——正是「合法 href 仍须保留」的精确形式，不再是 URL 子串检查。
+  const keptHref = /href="([^"]*)"/.exec(out.outSecond)
+  assert.ok(keptHref && keptHref[1] === 'https://u.jd.com/a', `回落行为不变：合法 href 仍须保留（${out.outSecond}）`)
   assert.ok(!/javascript/i.test(out.outThird), `回落行为不变：src/srcset 清洗仍生效（${out.outThird}）`)
 })
 
