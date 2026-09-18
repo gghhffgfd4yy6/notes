@@ -142,7 +142,14 @@ function charClassRanges (source) {
   // S8786（超线性回溯）：原 /\[([^\]]*)\]/g 的 [^\]]* 对每个 '[' 都会一直扫到串尾，
   // 在 `[[[[…` 这类未闭合输入上退化成 O(n²)；改为线性扫描——每个 '[' 只跳到其配对的首个
   // ']'，其后从 ']' 之后继续找下一个 '['，与 matchAll 的非重叠匹配语义逐例等价（见下方自检）。
-  for (let open = source.indexOf('['); open !== -1; open = source.indexOf('[', open + 1)) {
+  // S2310（循环计数器不得在循环体内被赋值）：原写法把 open 当 for 计数器、又在循环体末尾 `open = close`，
+  // 触发该规则。该赋值**不是死存储**——它被 for 的更新表达式 `open = indexOf('[', open + 1)` 读到，删掉
+  // 会退回从 '[' 之后重扫、破坏「不从匹配体内重扫」的口径（下面 `a][0-9]` 等自检会红），故不能按死存储
+  // 删除。这里也无需 NOSONAR 抑制：改用等价的 while 扫描后 open 不再是 for 计数器，规则前提本身消失。
+  // 语义映射：for 的 init/test/step 分别对应 while 前的初始化、while 条件、循环体末尾的推进，
+  // 且 for 的「先 step 再 test」与 while 的「先推进再回到条件」同序，逐例等价。
+  let open = source.indexOf('[')
+  while (open !== -1) {
     const close = source.indexOf(']', open + 1)
     if (close === -1) break // 其后不会再有闭合的字符类
     const body = source.slice(open + 1, close)
@@ -152,7 +159,7 @@ function charClassRanges (source) {
         i += 2
       }
     }
-    open = close // 已消费到闭合 ']'，与 matchAll 一样不从匹配体内重扫
+    open = source.indexOf('[', close + 1) // 已消费到闭合 ']'，与 matchAll 一样不从匹配体内重扫
   }
   return ranges
 }
