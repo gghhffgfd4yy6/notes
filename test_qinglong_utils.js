@@ -203,20 +203,24 @@ const {
   // **变异沙箱兼容（PR #154，两次实测订正）**：Stryker 插桩会把条件改写成
   // `if (stryNS_9fa48() || hasArg('--dry-run'))`，并会在语句之间插入**任意长度**的辅助代码。因此：
   //   ① 不能要求 `if (` 与条件紧邻（第一版写法，沙箱必红）；
-  //   ② 也**不能设任何字符距离上限**（第二版写法 `oneShotIdx - guardIdx < 600`，沙箱里插桩后必然超限，
-  //      实测在 qinglong-push 变异 job 的初始测试运行里红）。
-  // 正确口径是「**只查存在性与顺序**，不设距离」：三处标记各自存在，且 `return` 出现在
-  // `runResident(` 之前。删掉该分支/那次调用/那个 return，或让它继续落到常驻循环，本断言仍会红。
+  //   ② 也**不能设任何字符距离上限**（第二版写法 `oneShotIdx - guardIdx < 600`，沙箱里插桩后必然超限）；
+  //   ③ 更不能断言任何**带引号的字面量邻接**（第三版写法 `includes("hasArg('--dry-run')")`，沙箱必红）
+  //      —— Stryker 的 StringLiteral 变异器会把字符串字面量本身改写成
+  //      `(stryMutAct_9fa48(...) ? "" : "--dry-run")` 形态，于是 `hasArg('--dry-run')` 这种原文序列不复存在。
+  // 唯一稳定可用的是「**标识符/调用的存在性与相对顺序**」（标识符不被变异、语句间插入代码不影响 indexOf）：
+  // 要求 `runDryRunOnce(app)` 存在，且其后的 `return` 出现在 `runResident(` 之前。删掉该一次性分支、
+  // 删掉那个 return、或让它继续落到常驻循环，本断言都会红。
   const pushSource = fs.readFileSync(path.join(__dirname, 'qinglong', 'xbk_push.js'), 'utf8')
-  assert.ok(pushSource.includes("hasArg('--dry-run')"), '必须存在 --dry-run 判定')
   const oneShotIdx = pushSource.indexOf('runDryRunOnce(app)')
-  assert.ok(oneShotIdx >= 0, '--dry-run 分支必须调用一次性 runDryRunOnce(app)')
+  assert.ok(oneShotIdx >= 0, '--dry-run 分支必须调用一次性 runDryRunOnce(app)（不得落入常驻循环）')
   const tail = pushSource.slice(oneShotIdx)
   const retIdx = tail.indexOf('return')
   const residentIdx = tail.indexOf('runResident(')
   assert.ok(retIdx >= 0 && (residentIdx === -1 || retIdx < residentIdx),
     'runDryRunOnce(app) 之后必须在遇到 runResident( 之前 return（不得落入常驻循环）')
-  assert.match(pushSource, /await\s+runResident\(app,\s*controller\)/, '常驻路径必须仍然存在（防"删掉常驻"式假修复）')
+  // 常驻路径仍被调用（防"删掉常驻"式假修复）。用文本匹配而非正则：`runResident(app` 只命中**调用**
+  // （定义处是 `runResident (app, controller)`，带空格），且不受插桩插入代码/换行差异影响。
+  assert.ok(pushSource.includes('runResident(app'), '常驻路径必须仍然存在（防"删掉常驻"式假修复）')
 
   // ===== QX-06：常驻路径的 Node 版本告警文案 =====
   assert.strictEqual(nodeVersionWarning('22.22.2'), null, '恰为 engines 下界不应告警')
