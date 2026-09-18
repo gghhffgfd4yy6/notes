@@ -86,7 +86,9 @@ function validateFreshness (results, maxSkewMs = resolveMaxSkewMs(process.env.MU
   const hours = (ms) => Math.round((ms / 3600000) * 10) / 10
   // ① 跨段偏斜（原有语义，先判以保留「比最新报告早 N 小时」的定位口径）
   if (dated.length >= 2) {
-    const newest = dated.reduce((a, b) => (a.reportMtimeMs >= b.reportMtimeMs ? a : b))
+    // 显式初始值 = 首元素（本分支已保证 dated.length >= 2）：reduce 无初始值时本就以首元素起算，
+    // 故这与原写法逐元素等价，只是满足 SonarCloud S6959「reduce 必须给初始值」。
+    const newest = dated.reduce((a, b) => (a.reportMtimeMs >= b.reportMtimeMs ? a : b), dated[0])
     const stale = dated.filter(r => newest.reportMtimeMs - r.reportMtimeMs > maxSkewMs)
     if (stale.length > 0) {
       const detail = stale
