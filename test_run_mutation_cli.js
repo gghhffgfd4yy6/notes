@@ -5,7 +5,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutants } = require('./run_mutation')
+const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutants, generateMutants, judgingTestFiles } = require('./run_mutation')
 
 ;(async () => {
   // 防重入：run_mutation.js 的 runTests 在临时目录内运行 run_unit_tests.js 时会设置
@@ -135,6 +135,49 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
       fs.rmSync(path.dirname(ckpt), { recursive: true, force: true })
       if (hadReport === null) fs.rmSync(reportFile, { force: true })
       else fs.writeFileSync(reportFile, hadReport)
+    }
+  }
+
+  // ===== 断点指纹必须覆盖源文件原文与测试文件内容（F5） =====
+  // 只哈希变异集（file/start/end/original/replacement）时，两类改动会让指纹原地不动、从而静默继承旧断点
+  // （0 个批次被评估、旧 killed/survived 原样重印、exit 0 且无告警）：
+  //   ① 等长且不触及变异 token 的源码改动（实测常量 1→9）：候选字段逐个相同；
+  //   ② 任何 test_*.js 改动：测试变更直接改变「哪些变异体被杀」。
+  // 此处用合成项目（注入 root/sourceFiles/testFiles）分别复现两类改动——不动真实工作区。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-fingerprint-inputs-'))
+    try {
+      const t1 = 'const a = 1\nif (a === 1) { module.exports = a }\n'
+      const t2 = 'const a = 9\nif (a === 1) { module.exports = a }\n'
+      const opts = { root: dir, sourceFiles: ['xbk_a.js'], testFiles: ['test_b.js'] }
+      fs.writeFileSync(path.join(dir, 'xbk_a.js'), t1)
+      fs.writeFileSync(path.join(dir, 'test_b.js'), 'console.log(1)\n')
+      const m1 = generateMutants('xbk_a.js', t1)
+      const fSource1 = mutantFingerprint(m1, opts)
+      // ① 等长源码改动：先断言候选字段完全不变（前提），再要求指纹必须变
+      fs.writeFileSync(path.join(dir, 'xbk_a.js'), t2)
+      const m2 = generateMutants('xbk_a.js', t2)
+      assert.deepStrictEqual(m2, m1, '等长源码改动（1→9，不触及变异 token）不应改变变异集（本条回归成立的前提）')
+      const fSource2 = mutantFingerprint(m2, opts)
+      assert.notStrictEqual(fSource2, fSource1,
+        '等长且未触及变异 token 的源码改动必须改变断点指纹（修前指纹不变 → 静默继承旧断点）')
+      // ② 仅改测试文件（等长 1→2）：变异集与源文件都不动，指纹仍必须变
+      fs.writeFileSync(path.join(dir, 'test_b.js'), 'console.log(2)\n')
+      const fTest = mutantFingerprint(m2, opts)
+      assert.notStrictEqual(fTest, fSource2,
+        '仅改测试文件（等长 1→2）必须改变断点指纹（测试改动会改变哪些变异体被杀）')
+      // ③ 生产调用路径（不传 options）必须真的把测试链纳入：清单含入口/注册表/单元套件，且不含不参与的套件
+      const judged = judgingTestFiles()
+      assert.ok(judged.includes('run_unit_tests.js') && judged.includes('test_suites.js'),
+        '参与判定的测试清单必须含测试入口与套件注册表（它们决定实际跑哪些套件）')
+      assert.ok(judged.includes('test_filter.js'), '参与判定的测试清单必须含单元套件文件本体')
+      assert.ok(!judged.includes('test_app_p.js') && !judged.includes('test_mutation_ranges.js'),
+        'integration / mutationSkip 套件不在变异评估里跑，不应进指纹（进了会让清单口径悄悄漂移）')
+      assert.strictEqual(mutantFingerprint(collectMutants(DEFAULT_FILES)).length, 64,
+        '生产调用路径（不传 options）应能直接算出 sha256 指纹')
+      console.log('✅ 断点指纹覆盖源文件原文与测试文件内容（等长源码改动 / 仅改测试文件均改变指纹）')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
     }
   }
 
