@@ -497,6 +497,73 @@ try {
   fs.rmSync(hangDir, { recursive: true, force: true })
 }
 
+// 3g4 每套件超时后的「整组杀伤」（F6）：3g3 只保证入口自身收敛，不保证套件派生的后代也停下。
+//     桩套件 fork 一个继承 fd1 的孙进程（与 test_app_p.js 的并行调度同形：非 detached、stdio 继承 fd1），
+//     自身挂死触发每套件超时。修复前只 kill 直接子进程 → 孙进程存活并继续持有继承的 stdout/stderr：
+//     入口虽已退出，孤儿仍在跑（占 CPU / 端口 / 临时目录，污染后续套件），且**以管道捕获本入口**的调用方
+//     （CI runner 收输出、spawnSync('pipe')、其它入口以 stdio:'pipe' 拉起）要等这个孤儿退出才拿到 close
+//     ——实测父进程被拖到 30s 兜底才返回。故断言：入口退出后心跳文件不再增长（后代已被整组 SIGKILL 清掉）。
+//     本用例把入口的 stdout/stderr 接到**真实文件**而不是管道，原因有二：① 管道会被孤儿持有，本用例在
+//     修复前会挂到测试侧兜底超时（那是同一 bug 的另一个症状，但断言会退化成「超时」而非可读的失败）；
+//     ② 文件 fd 仍如实复现「孙进程持有继承的 fd1」这一前提。
+const treeDir = makeRunTestsSandbox(
+  [{ name: '挂死套件（带孙进程）', file: 'test_stub_tree.js', desc: 'fork 继承 fd1 的孙进程后自身挂死' }],
+  {
+    'test_stub_tree.js': [
+      "const { fork } = require('child_process')",
+      "const path = require('path')",
+      "fork(path.join(__dirname, 'stub_heartbeat.js'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })",
+      'setInterval(() => {}, 1000)',
+      ''
+    ].join('\n'),
+    'stub_heartbeat.js': [
+      "const fs = require('fs')",
+      "const path = require('path')",
+      "const out = path.join(__dirname, 'heartbeat.txt')",
+      "fs.writeFileSync(out, String(process.pid) + '\\n')",
+      "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+      ''
+    ].join('\n')
+  }
+)
+const treeOutPath = path.join(treeDir, 'entry.stdout.txt')
+const treeOutFd = fs.openSync(treeOutPath, 'w')
+const treeErrFd = fs.openSync(path.join(treeDir, 'entry.stderr.txt'), 'w')
+let treePid = 0
+try {
+  let tree
+  const t0 = Date.now()
+  try {
+    tree = runRunTestsIn(treeDir, { XBK_TEST_TIMEOUT: '1500' }, { timeout: 30000, stdio: ['ignore', treeOutFd, treeErrFd] })
+  } finally {
+    fs.closeSync(treeOutFd)
+    fs.closeSync(treeErrFd)
+  }
+  const elapsed = Date.now() - t0
+  const treeOut = fs.readFileSync(treeOutPath, 'utf8')
+  assert.strictEqual(tree.signal, null,
+    `入口必须自行结束（被测试侧 30s 兜底杀掉说明入口未收敛，实测 ${elapsed}ms）`)
+  assert.notStrictEqual(tree.status, 0, '超时的套件必须让入口以非 0 退出（fail-closed 语义不变）')
+  assert.deepStrictEqual(extractTestSummary(treeOut), ['0', '1', '1'],
+    '超时仍按失败结算：汇总三数字应与修复前一致（0 通过, 1 失败, 共 1）')
+  assert.match(treeOut, /超过每套件上限 1500ms 已强杀/, '失败输出必须仍点名每套件超时（RT-03 口径不变）')
+  const hb = path.join(treeDir, 'heartbeat.txt')
+  treePid = Number(fs.readFileSync(hb, 'utf8').split('\n')[0])
+  assert.ok(Number.isInteger(treePid) && treePid > 0, '孙进程应已写出自己的 pid（夹具自身生效的前提）')
+  const sizeAfterExit = fs.statSync(hb).size
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
+  const sizeLater = fs.statSync(hb).size
+  assert.strictEqual(sizeLater, sizeAfterExit,
+    `入口退出后孙进程仍在写心跳（${sizeAfterExit} → ${sizeLater} 字节）：每套件超时只杀了直接子进程，孤儿后代存活（F6）`)
+  console.log(`✅ 每套件超时的整组杀伤：入口 ${elapsed}ms 收敛，退出后孙进程（pid ${treePid}）心跳停在 ${sizeAfterExit} 字节`)
+} finally {
+  // 孙进程若仍存活（修复被回退时）必须由本用例清掉，否则会污染后续套件与整轮测试
+  if (treePid > 0) {
+    try { process.kill(treePid, 'SIGKILL') } catch (e) { /* 已随进程组退出（ESRCH）：正常路径 */ }
+  }
+  fs.rmSync(treeDir, { recursive: true, force: true })
+}
+
 // 3h run_unit_tests.js 的汇总行必须能被 run_mutation.js 的 extractTestSummary 识别（UT-07）：
 //    变异评估下内层套件 stdout 与本入口共用同一捕获管道，若本入口汇总行不含「K 通过, M 失败, 共 N」
 //    三数字，extractTestSummary 会继续向上扫描并命中内层套件的同名行（如 test_filter.js:8746 的
