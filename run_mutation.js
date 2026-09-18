@@ -232,9 +232,14 @@ function mutantFingerprint (mutants, options = {}) {
       hash.update(`${Buffer.byteLength(text)}\u0000${text}\u0001`)
     }
   }
-  // 文件清单排序后入哈希：指纹锚定「集合与内容」，不随调用方传入的清单顺序漂移（变异集自身仍按 id 顺序）。
-  for (const file of [...sourceFiles].sort()) hashFileContent(hash, root, file)
-  for (const file of [...testFiles].sort()) hashFileContent(hash, root, file)
+  // 文件清单排序后入哈希：指纹锚定「集合与内容」，排序的**唯一目的**是消除调用方传入清单的顺序差异，
+  // 与比较方式无关（变异集自身仍按 id 顺序）。
+  // 显式码元序比较器（Sonar S2871：sort() 必须传比较函数）：Array.prototype.sort() 的默认行为就是逐
+  // UTF-16 码元比较，这里把它写实，取值语义一字不变；刻意**不用** localeCompare——它随宿主 locale 变序，
+  // 会让指纹跨机器漂移、破坏断点续跑（同 test_mutation_ranges.js / test_tls_prewarm.js 的 byCodeUnit 口径）。
+  const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+  for (const file of [...sourceFiles].sort(byCodeUnit)) hashFileContent(hash, root, file)
+  for (const file of [...testFiles].sort(byCodeUnit)) hashFileContent(hash, root, file)
   return hash.digest('hex')
 }
 
