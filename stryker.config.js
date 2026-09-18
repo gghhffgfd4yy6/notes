@@ -72,11 +72,37 @@ module.exports = {
   // 值维持 300000ms（300s）：作为加法偏移给多套件 + 插桩场景留足余量，无需下调。
   // 历史：90s → 180s（v3.273 切全量单元入口）→ 300s。
   timeoutMS: 300000,
-  // thresholds：显式写出取值，避免读者误以为「没有该项 = 有门禁」。break 刻意保持 null——本仓库
-  // `npm run test:mutation` 定位为本地观察项而非门禁，且 (killed + timeout) 的计分口径会虚增分数
-  // （见上方 timeoutMS 注释），阈值边界上只会误红；CI 侧同样只出日报（mutation.yml 的 report job
-  // 不设阈值）。若要改为真正的门禁，请先按当前真实基线取 break 值再开。
-  thresholds: { high: 80, low: 60, break: null },
+  // thresholds：显式写出取值，避免读者误以为「没有该项 = 有门禁」。break=65 是**真门禁**（不再是观察项）。
+  // 判定与退出码路径（已安装的 @stryker-mutator/core@10.0.0 实证）：
+  //   reporters/mutation-test-report-helper.js 的 determineExitCode()——break 为数字且
+  //   mutationScore < break 时调用 objectUtils.setExitCode(1)（该 helper 只写 process.exitCode = 1，
+  //   stryker 进程随后以 1 退出；判定是**严格小于**，恰好等于阈值放行）。
+  // 判定范围是**按段**的：mutation.yml 每个矩阵 job 各自跑 `npx stryker run --mutate "<段>"`
+  //   （--mutate 见 stryker-cli.js 的 `-m, --mutate`，覆盖本文件的 mutate 数组），而上面那个 metrics
+  //   来自本次运行的报告 files——只含该段被变异的文件 ⇒ 分数低于 65 的是**那一个段的 job**
+  //   （fail-fast: false ⇒ 其余段照跑；artifact 上传与 report job 都是 if: always() ⇒ 日报照发）。
+  // 取值依据（实测日报 gh issue 130/135/139/148/150/153，2026-09-13…09-18 六天）：
+  //   09-18 基线：合计 81.27%（13355 变异体 / 2502 存活），最低段 message-store 69.38%，
+  //   其后 status 70.77%、utils 72.36%、app 75.43%。
+  //   取 65 = 当前最低段之下再留 4.38 个百分点 ⇒ 按 09-18 基线**没有任何一段会误红**。
+  //   这六天里各段分数只随代码/测试变化，没有逐轮抖动：最弱段 message-store 全程 69.10%–69.42%
+  //   （极差 0.32pp），故 65 不会被单次运行的波动打穿。窗口内唯一一次低于 65 的是 status 的**首轮**
+  //   报告 62.14%（09-16：243 变异体 / 149 被杀 / 92 存活，该段当天才进入矩阵）——那是真弱不是抖动，
+  //   次日补测后已到 70.77%。即：本阈值会真红（门禁该有的样子），但红的是真实退化或新段的未覆盖代码。
+  //   不取更低（如 60）的理由：message-store 要再掉 9.1pp 才触发，门禁接近失效；且 60 已是 high/low 里的
+  //   low（配色语义），把 break 与它对齐会让两个语义混为一谈。
+  //   不贴着 69.38 取 69 的理由：该分数的计分口径把超时计入已检出（见上方 timeoutMS），贴边只会误红。
+  // 与日报脚本分数的关系：上述六份日报里每段都满足 total == killed+timeout+survived+noCoverage
+  //   （即没有 RuntimeError/CompileError/Ignored/Pending 变异体）⇒ 实跑中两个口径的分数相等；
+  //   一般情形下日报分数是 stryker 分数的**下界**（日报分母 total 含上述四类，stryker 的 totalValid 不含），
+  //   故按日报基线取的阈值在 stryker 侧只会更安全。
+  // 回退：把 break 改回 null 即取消分数门禁，不涉及任何其它文件。
+  // 已知局限（既有，与本门禁不冲突，勿据此认为门禁无效）：command runner 只支持 coverageAnalysis:'off'，
+  //   增量模式下 incremental-differ 感知不到「测试变化」⇒ 本门禁拦得住「源码新增未被杀死的变异体」，
+  //   拦不住「只删/弱化测试」（见上方 commandRunner 与 mutation.yml 缓存 key 注释）。
+  //   另见上方 timeoutMS 注释：(killed + timeout) 把超时计入分子，慢到超时的存活体在分数上算「已检出」，
+  //   故该分数不是严格的漏检率——这也是把阈值放在最低段之下 4.38 个百分点、而不是贴着 69.38 的原因。
+  thresholds: { high: 80, low: 60, break: 65 },
   // reporters：'json' 是报告链的硬依赖，不可随手删——scripts/mutation-report.js 经 scripts/mutation-json.js
   // 读 reports/mutation/mutation.json。本文件刻意不写 jsonReporter.fileName/htmlReporter.fileName，靠
   // Stryker 默认值（reports/mutation/mutation.json、reports/mutation/mutation.html）与 mutation.yml 的 artifact
