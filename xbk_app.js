@@ -1534,7 +1534,11 @@ function createApp ({
         // 返回 true/false）此前被丢弃，缓存落盘失败时摘要与退出码仍报成功，运维看不到「本轮
         // 推送成功但成功记录没落盘」（下次运行会重推）。这里接住失败并写 run.log 告警；
         // result.cacheSaved 同时进摘要（false 表示本轮缓存未落盘）。
-        let cacheSaved = true
+        // APP-03 返工：不得给 cacheSaved 预设初值——下方 try 的成功分支与 catch 分支都必然赋值
+        // （saveBatch 抛错走 catch → false），预设的 `= true` 是死存储（CodeQL js/useless-assignment-to-local
+        // 实测命中：The initial value of cacheSaved is unused, since it is always overwritten）。
+        // 去掉初值不改语义：两分支覆盖后读取点（下方告警与摘要）拿到的仍是真实落盘结果。
+        let cacheSaved
         try { cacheSaved = MessageStore.saveBatch(toCache, cacheName) !== false } catch (e) { cacheSaved = false } // 契约：undefined 视为成功（兼容旧实现）
         cacheMs = Date.now() - cacheStart
         if (!cacheSaved) {
