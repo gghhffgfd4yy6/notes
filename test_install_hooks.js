@@ -14,6 +14,20 @@ const { spawnSync } = require('node:child_process')
 
 const INSTALL_HOOKS = path.join(__dirname, 'scripts', 'install-hooks.js')
 
+// git 一律以**绝对路径**调用：按名调用（spawnSync('git', …)）会让子进程经 PATH 解析可执行文件，
+// 静态分析按「命令解析依赖 PATH」判为 Sonar S4036（"PATH" 变量只应含固定目录；生产侧
+// scripts/install-hooks.js:37 的同类告警只能挂 NOSONAR，因为工具脚本必须跨平台按名调用）。
+// 这里用纯 JS 扫 PATH 解析（不额外 spawn 进程），绝对路径下无需 PATH 参与命令解析。
+// 解析不到 git 直接抛错：本套件依赖真实 git 建临时仓库，找不到必须 fail-closed 而不是静默跳过。
+const GIT = (process.env.PATH || '')
+  .split(path.delimiter)
+  .filter(Boolean)
+  .map(dir => path.join(dir, 'git'))
+  .find(candidate => {
+    try { fs.accessSync(candidate, fs.constants.X_OK); return true } catch { return false }
+  })
+assert.ok(GIT, '未能在 PATH 中找到可执行的 git（本套件依赖真实 git 建临时仓库）')
+
 // 沙箱化 git 环境：HOME/XDG 指向临时目录，禁用全局与系统 gitconfig——否则开发机上的
 // core.hooksPath 会泄漏进用例，让「未配置」用例假绿/假红。
 function sandboxEnv (home) {
@@ -29,11 +43,11 @@ function runPlugin (cwd, home, args) {
 }
 
 function gitConfig (cwd, home, key) {
-  return spawnSync('git', ['config', '--get', key], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
+  return spawnSync(GIT, ['config', '--get', key], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
 function initRepo (dir, home) {
-  const init = spawnSync('git', ['init', '-q'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+  const init = spawnSync(GIT, ['init', '-q'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
   assert.strictEqual(init.status, 0, `git init 失败：${init.stderr}`)
 }
 
@@ -91,7 +105,7 @@ function makeCase () {
   try {
     initRepo(dir, home)
     writeHooks(dir)
-    const set = spawnSync('git', ['config', 'core.hooksPath', '.githooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+    const set = spawnSync(GIT, ['config', 'core.hooksPath', '.githooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
     assert.strictEqual(set.status, 0, `git config 失败：${set.stderr}`)
     const r = runVerify(dir, home)
     assert.strictEqual(r.status, 0, `门禁齐备时 --verify 应 exit 0：${r.stderr || r.stdout}`)
@@ -107,7 +121,7 @@ function makeCase () {
   try {
     initRepo(dir, home)
     writeHooks(dir)
-    spawnSync('git', ['config', 'core.hooksPath', '.other-hooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+    spawnSync(GIT, ['config', 'core.hooksPath', '.other-hooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
     const r = runVerify(dir, home)
     assert.strictEqual(r.status, 1, 'hooksPath 指向别处时本仓库门禁不生效，--verify 必须非 0')
     assert.match(r.stderr, /core\.hooksPath=\.other-hooks/, '应回显指向别处的实际值')
@@ -123,7 +137,7 @@ function makeCase () {
   try {
     initRepo(dir, home)
     writeHooks(dir, ['pre-commit'])
-    spawnSync('git', ['config', 'core.hooksPath', '.githooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+    spawnSync(GIT, ['config', 'core.hooksPath', '.githooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
     const r = runVerify(dir, home)
     assert.strictEqual(r.status, 1, '缺钩子文件时门禁不生效，--verify 必须非 0')
     assert.match(r.stderr, /缺少钩子文件/, '应报告缺少钩子文件')
@@ -139,7 +153,7 @@ function makeCase () {
   try {
     initRepo(dir, home)
     writeHooks(dir, ['pre-commit', 'commit-msg'], 0o600)
-    spawnSync('git', ['config', 'core.hooksPath', '.githooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+    spawnSync(GIT, ['config', 'core.hooksPath', '.githooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
     const hook = path.join(dir, '.githooks', 'pre-commit')
     const before = fs.statSync(hook).mode & 0o777
     const r = runVerify(dir, home)
