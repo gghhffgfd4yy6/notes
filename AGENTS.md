@@ -31,7 +31,7 @@ npm run test:mutation-ranges  # 校验矩阵行段覆盖（改带行段的文件
 
 ## 测试与文档门禁
 
-- `npm run hooks:install` 注册 `.githooks`：`pre-commit` 跑 lint / 版本闸门 / `npm run test:filter`；`commit-msg` 要求首行以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头且不超过 100 字符。装完用 `npm run hooks:verify` 自检（只读：生效 exit 0，未生效 exit 1 并说明是配置缺失、钩子文件缺失还是无执行位）——npm 不会自动注册仓库钩子，新克隆不跑 `hooks:install` 就是**静默没有门禁**，而 `hooks:install` 对「跳过/未覆盖」场景按设计仍 exit 0，不能当作「装好了」的证据。
+- `npm run hooks:install` 注册 `.githooks`：`pre-commit` 跑 lint / 版本闸门 / 变异行段校验 / `npm run test:filter`；`commit-msg` 要求首行以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头且不超过 100 字符。装完用 `npm run hooks:verify` 自检（只读：生效 exit 0，未生效 exit 1 并说明是配置缺失、钩子文件缺失还是无执行位）——npm 不会自动注册仓库钩子，新克隆不跑 `hooks:install` 就是**静默没有门禁**，而 `hooks:install` 对「跳过/未覆盖」场景按设计仍 exit 0，不能当作「装好了」的证据。
 - 增删 `test_*.js` 或改 `.github/workflows/test.yml` 的显式步骤：同步 `test_suites.js` 与 `SKIP_SUITES`（由 `test_suite_registry.js`、`test_ci_skip_suites.js` 对账）。
 - 行为、配置或契约变化：同步更新 `README.md`、`SYSTEM_CONTRACT.md`、`CHANGELOG.md`，不让文档落后于代码。
 
