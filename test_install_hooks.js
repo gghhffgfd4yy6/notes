@@ -6,6 +6,9 @@
 // 只读查询：门禁此刻生效 → exit 0；否则 exit 1 并说明原因，且绝不写 core.hooksPath、绝不 chmod。
 // 全部用例在 os.tmpdir() 里自建 git 仓库（隔离 HOME/全局与系统 gitconfig），不依赖本仓库的钩子状态
 // （本机 /storage/emulated 是 noexec 挂载，本仓库的钩子本就没有执行位，不能作为夹具）。
+// v3.276 起 HOOK_FILES 增加 pre-push（test:filter 从 pre-commit 迁来）：用例 8/9 专门锁定
+// 「旧清单（缺 pre-push）必须红」「pre-push 无执行位必须红」——把 pre-push 从清单里去掉，
+// 这两条断言立刻失败（靶向回退已在报告里实测）。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -13,6 +16,10 @@ const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 
 const INSTALL_HOOKS = path.join(__dirname, 'scripts', 'install-hooks.js')
+
+// 与 scripts/install-hooks.js 的 HOOK_FILES 对齐：--verify 要求这三者全部存在且可执行。
+// 其中 pre-push 是 v3.276 新增（承载迁出 pre-commit 的 npm run test:filter 门禁）。
+const EXPECTED_HOOKS = ['pre-commit', 'commit-msg', 'pre-push']
 
 // git 一律以**绝对路径**调用：按名调用（spawnSync('git', …)）会让子进程经 PATH 解析可执行文件，
 // 静态分析按「命令解析依赖 PATH」判为 Sonar S4036（"PATH" 变量只应含固定目录；生产侧
@@ -51,7 +58,7 @@ function initRepo (dir, home) {
   assert.strictEqual(init.status, 0, `git init 失败：${init.stderr}`)
 }
 
-function writeHooks (dir, names = ['pre-commit', 'commit-msg'], mode = 0o700) {
+function writeHooks (dir, names = EXPECTED_HOOKS, mode = 0o700) {
   fs.mkdirSync(path.join(dir, '.githooks'), { recursive: true })
   for (const name of names) {
     const file = path.join(dir, '.githooks', name)
@@ -152,7 +159,7 @@ function makeCase () {
   const { dir, home } = makeCase()
   try {
     initRepo(dir, home)
-    writeHooks(dir, ['pre-commit', 'commit-msg'], 0o600)
+    writeHooks(dir, EXPECTED_HOOKS, 0o600)
     spawnSync(GIT, ['config', 'core.hooksPath', '.githooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
     const hook = path.join(dir, '.githooks', 'pre-commit')
     const before = fs.statSync(hook).mode & 0o777
@@ -177,4 +184,77 @@ function makeCase () {
   }
 }
 
-console.log('✅ install-hooks --verify 只读自检：未生效 fail-closed / 生效 exit 0 / 不改配置不改权限')
+// 8) 【v3.276 靶向断言】旧清单（只有 pre-commit + commit-msg，缺 pre-push）：--verify 必须非 0 并点名
+//    pre-push。把 HOOK_FILES 回退成迁移前的 ['pre-commit','commit-msg']，本用例必红：那版实现认为
+//    门禁齐备 → exit 0，而承载 test:filter 的 pre-push 实际不存在（提交/推送门禁被静默削弱）。
+{
+  const { dir, home } = makeCase()
+  try {
+    initRepo(dir, home)
+    writeHooks(dir, ['pre-commit', 'commit-msg'])
+    spawnSync(GIT, ['config', 'core.hooksPath', '.githooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+    const r = runVerify(dir, home)
+    assert.strictEqual(r.status, 1, '缺 pre-push 时 test:filter 门禁不在链上，--verify 必须非 0')
+    assert.match(r.stderr, /缺少钩子文件/, '应报告缺少钩子文件')
+    assert.match(r.stderr, /pre-push/, '应点名缺失的 pre-push（旧实现的 HOOK_FILES 里没有它）')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// 9) 【v3.276 靶向断言】仅 pre-push 无执行位（另两个钩子可执行）：--verify 必须非 0、点名 pre-push，
+//    且保持只读（不 chmod）。pre-push 不在清单里的旧实现会漏检 → exit 0，本用例即红。
+{
+  const { dir, home } = makeCase()
+  try {
+    initRepo(dir, home)
+    writeHooks(dir, ['pre-commit', 'commit-msg'], 0o700)
+    writeHooks(dir, ['pre-push'], 0o600)
+    spawnSync(GIT, ['config', 'core.hooksPath', '.githooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+    const hook = path.join(dir, '.githooks', 'pre-push')
+    const before = fs.statSync(hook).mode & 0o777
+    const r = runVerify(dir, home)
+    assert.strictEqual(r.status, 1, 'pre-push 不可执行时 git 会静默跳过 test:filter，--verify 必须非 0')
+    assert.match(r.stderr, /钩子不可执行/, '应报告不可执行（git 会静默跳过）')
+    assert.match(r.stderr, /pre-push/, '应点名不可执行的 pre-push')
+    assert.strictEqual(fs.statSync(hook).mode & 0o777, before, '--verify 只读：不得 chmod 修复')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// 10) 【v3.276 靶向断言】安装路径（无 --verify）同样把 pre-push 列进清单：缺 pre-push 时必须
+//     fail-closed——非 0 退出、点名缺哪个、且**不得**顺手写入 core.hooksPath（否则「配置已写入」
+//     会被当成「门禁已生效」）。旧实现（清单无 pre-push）在这里 exit 0 且写入配置 → 本用例红。
+{
+  const { dir, home } = makeCase()
+  try {
+    initRepo(dir, home)
+    writeHooks(dir, ['pre-commit', 'commit-msg'])
+    const r = runPlugin(dir, home, [])
+    assert.strictEqual(r.status, 1, '安装路径必须核验全部钩子：缺 pre-push 不得以 0 退出')
+    assert.match(r.stderr, /缺少钩子文件/, '应报告缺少钩子文件')
+    assert.match(r.stderr, /pre-push/, '应点名缺失的 pre-push')
+    assert.notStrictEqual(gitConfig(dir, home, 'core.hooksPath').status, 0, '核验失败时不得写入 core.hooksPath')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// 11) 安装路径正向：三个钩子齐备且可执行 → exit 0 并真的写入 core.hooksPath（pre-push 在清单内的
+//     正向证据；与用例 10 一起锁定「列入清单」而不是「忽略多余文件」）。
+{
+  const { dir, home } = makeCase()
+  try {
+    initRepo(dir, home)
+    writeHooks(dir, EXPECTED_HOOKS)
+    const r = runPlugin(dir, home, [])
+    assert.strictEqual(r.status, 0, `钩子齐备时安装应 exit 0：${r.stderr || r.stdout}`)
+    assert.match(r.stdout, /已注册/, '应报告已注册 core.hooksPath')
+    assert.strictEqual(gitConfig(dir, home, 'core.hooksPath').stdout.trim(), '.githooks', '应写入 .githooks')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+console.log('✅ install-hooks --verify 只读自检：未生效 fail-closed / 生效 exit 0 / 不改配置不改权限；pre-push（v3.276）列入清单且缺失/无执行位均被检出')
