@@ -451,6 +451,164 @@ try {
   fs.rmSync(tmp, { recursive: true, force: true })
 }
 
+// ===== F-04：落盘剥离 statusReason（writeStrippedReport）=====
+// 根因（REV-CI）：stryker 的 command runner 把每个变异体的**整段测试输出**写进 statusReason——真实
+// artifact 实测占 mutation-report.json 的 99.89%（103,101,102 字节 → 剥离后 116,206 字节）；而全仓两个
+// 消费方（本文件的聚合与闸门 / readReportJson）都只在**内存**里剥掉它、从不写回 ⇒ 每份上传 artifact 与
+// actions/cache 增量基线都白背这份废重。本组锁住「剥离后落盘」这一半的三条不变量：
+//   ① 落盘报告不再含非空 statusReason；② 消费方读到的对象与剥离前**逐字段一致**（否则等于改了门禁输入）；
+//   ③ 既有护栏（非普通文件拒绝 / 预读上限 / 绝不写半份报告）在写侧同样成立、不被绕过。
+const { writeStrippedReport, readReportJson } = require('./scripts/mutation-json.js')
+
+// 夹具：真 stryker schema 形状 + 量级贴近真实的「整段测试输出」（真实 avg 283,709 字节/条）。
+// reason 里刻意含转义引号/反斜杠/换行——字节扫描的 stringEnd 必须按转义跳读，否则会截错边界。
+const LONG_REASON = 'suite output "quoted" \\ backslash\nline\n'.repeat(10000) // ≈ 360 KB
+// 该 reason 在 JSON 文本里的**转义后**字节序列：断言「原文件带着它 / 落盘文件不再带它」必须比对它，
+// 直接比对未转义的 LONG_REASON 会因引号与换行被 JSON 转义而恒假（恒假断言等于没断言）。
+const ESCAPED_REASON = JSON.stringify(LONG_REASON).slice(1, -1)
+function stripFixture (reason) {
+  const mutant = (over) => ({
+    id: '0',
+    mutatorName: 'BlockStatement',
+    replacement: '{}',
+    status: 'Killed',
+    location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } },
+    ...over
+  })
+  return {
+    schemaVersion: '1.0',
+    thresholds: { high: 80, low: 60, break: null },
+    files: {
+      'xbk_strip.js': {
+        language: 'javascript',
+        source: 'const x = 1\n',
+        mutants: [
+          mutant({ id: '0', statusReason: reason }),
+          mutant({
+            id: '1',
+            mutatorName: 'BooleanLiteral',
+            replacement: 'false',
+            status: 'Survived',
+            statusReason: reason,
+            location: { start: { line: 3, column: 1 }, end: { line: 3, column: 2 } }
+          })
+        ]
+      }
+    }
+  }
+}
+
+const stripTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mr-strip-'))
+try {
+  check('writeStrippedReport 落盘报告不含 statusReason，且消费方读到的对象逐字段一致', () => {
+    assert.strictEqual(typeof writeStrippedReport, 'function',
+      'mutation-json.js 必须导出 writeStrippedReport（旧实现只在内存剥离、无写回 ⇒ 本条真红）')
+    const p = path.join(stripTmp, 'mutation.json')
+    fs.writeFileSync(p, JSON.stringify(stripFixture(LONG_REASON)))
+    const beforeBytes = fs.readFileSync(p)
+    // 消费方视角（经 readReportJson 内存剥离后的报告对象）：作为「语义未变」的比对基准
+    const beforeParsed = JSON.parse(JSON.stringify(readReportJson(p)))
+    assert.ok(beforeBytes.includes(Buffer.from(ESCAPED_REASON)), '夹具前提：原文件确实带着整段测试输出')
+
+    const r = writeStrippedReport(p)
+    assert.strictEqual(r.changed, true, '含非空 statusReason 时必须判定为已改写')
+    assert.strictEqual(r.before, beforeBytes.length, 'before 必须等于剥离前的真实字节数')
+    assert.strictEqual(r.after, fs.statSync(p).size, 'after 必须等于落盘后的真实字节数')
+    assert.strictEqual(r.saved, beforeBytes.length - r.after)
+    assert.ok(r.after < beforeBytes.length / 100,
+      `剥离后应缩到 1% 以下，实际 ${beforeBytes.length} → ${r.after}`)
+
+    const afterBytes = fs.readFileSync(p)
+    assert.ok(!afterBytes.includes(Buffer.from(ESCAPED_REASON)), '落盘文件不得再含 statusReason 原文')
+    assert.ok(!/"statusReason"\s*:\s*"[^"]/.test(afterBytes.toString('utf8')),
+      '落盘文件不得含非空 statusReason 值')
+    assert.strictEqual((afterBytes.toString('utf8').match(/"statusReason":""/g) || []).length, 2,
+      '两个 statusReason 字段都应保留为空串（不删字段，消费方逐字段一致）')
+    assert.doesNotThrow(() => JSON.parse(afterBytes.toString('utf8')), '落盘文件必须是合法 JSON')
+
+    // ①/②：消费方读到的对象逐字段一致（剥离前后同一读取路径）
+    assert.deepStrictEqual(readReportJson(p), beforeParsed, '剥离不得改变任何消费方读到的字段')
+
+    // 幂等：已剥离的文件再剥一次必须是「不改写」（否则每次跑都会白刷 mtime）
+    const again = writeStrippedReport(p)
+    assert.strictEqual(again.changed, false, '已剥离文件重复剥离必须判定为无需改写')
+    assert.deepStrictEqual(fs.readFileSync(p), afterBytes, '幂等调用不得改动字节')
+  })
+
+  check('剥离前后 analyzeSegment 聚合结果逐字段一致（门禁输入语义零变化）', () => {
+    const segName = 'mutation-report-strip'
+    const d = path.join(stripTmp, segName)
+    fs.mkdirSync(d, { recursive: true })
+    const p = path.join(d, 'mutation.json')
+    fs.writeFileSync(p, JSON.stringify(stripFixture(LONG_REASON)))
+    const before = analyzeSegment(stripTmp, { name: segName })
+    assert.strictEqual(before.error, undefined, `夹具必须能被正常解析，实际 error=${before.error}`)
+    assert.strictEqual(before.total, 2)
+    writeStrippedReport(p)
+    const after = analyzeSegment(stripTmp, { name: segName })
+    // reportMtimeMs 是唯一允许变化的字段：文件被原子替换，mtime 本就该是「本次改写时刻」——新鲜度闸门
+    // 只用它判「是否本轮产出」（剥离发生在 stryker 刚产出之后，仍晚于 run_started_at），其余字段必须逐字相同。
+    assert.deepStrictEqual({ ...after, reportMtimeMs: 0 }, { ...before, reportMtimeMs: 0 },
+      '聚合结果必须逐字段一致（仅 reportMtimeMs 因原子替换而变）')
+    assert.strictEqual(after.score, before.score, '分数必须一致')
+    assert.strictEqual(after.survivedMutants.length, before.survivedMutants.length, '存活清单条数必须一致')
+  })
+
+  check('写侧不得绕过护栏：非普通文件（目录/符号链接）一律拒写且目标不被破坏', () => {
+    const dir = path.join(stripTmp, 'a-dir'); fs.mkdirSync(dir, { recursive: true })
+    assert.throws(() => writeStrippedReport(dir), /不是普通文件/, '目录必须拒写')
+
+    // 符号链接：写回走同目录临时文件 + rename，跟随链接会「把链接换成普通文件而真实目标不变」——
+    // 那是静默写错对象，必须 fail-closed 拒绝（与「不是普通文件一律拒绝」同一口径）。
+    const target = path.join(stripTmp, 'link-target.json')
+    fs.writeFileSync(target, JSON.stringify(stripFixture(LONG_REASON)))
+    const beforeTarget = fs.readFileSync(target)
+    const link = path.join(stripTmp, 'link.json')
+    fs.symlinkSync(target, link)
+    assert.throws(() => writeStrippedReport(link), /不是普通文件/, '符号链接必须拒写')
+    assert.ok(fs.lstatSync(link).isSymbolicLink(), '拒写后链接必须仍是链接（不得被换成普通文件）')
+    assert.deepStrictEqual(fs.readFileSync(target), beforeTarget, '拒写后真实目标必须逐字节不变')
+  })
+
+  check('写侧不得绕过护栏：超过预读上限时拒绝且原文件不被改动', () => {
+    const p = path.join(stripTmp, 'capped.json')
+    fs.writeFileSync(p, JSON.stringify(stripFixture(LONG_REASON)))
+    const before = fs.readFileSync(p)
+    // 写侧复用 readGuardedBytes ⇒ 预读上限（默认 2 GiB，生产调用方经 XBK_MUTATION_REPORT_MAX_BYTES 注入）
+    // 与读侧同一条代码路径；这里给一个 1 KiB 的注入值钉死该分支。
+    assert.throws(() => writeStrippedReport(p, { maxFileBytes: 1024 }), /超过预读上限/,
+      '超过预读上限必须拒绝（写侧不得绕过大小守卫）')
+    assert.deepStrictEqual(fs.readFileSync(p), before, '拒绝后原文件必须逐字节不变')
+  })
+
+  check('fail-closed：剥离后 JSON 非法时绝不落盘（不留半份报告、无 .tmp 残留）', () => {
+    const p = path.join(stripTmp, 'corrupt.json')
+    // 含字符串型 statusReason 字段、但整体不是合法 JSON（截断）。写侧必须「发现了字段也不写」：
+    // 报告是 validateSegments/validateFreshness 的门禁输入，宁可显式失败也不能把不可解析的内容写到磁盘。
+    const corrupt = '{"statusReason":"' + 'X'.repeat(1000) + '"'
+    fs.writeFileSync(p, corrupt)
+    const before = fs.readFileSync(p)
+    assert.throws(() => writeStrippedReport(p), /拒绝落盘/, '剥离后 JSON 非法必须拒绝落盘')
+    assert.deepStrictEqual(fs.readFileSync(p), before, '原文件必须逐字节不变（不得写半份）')
+    assert.deepStrictEqual(fs.readdirSync(stripTmp).filter(f => f.startsWith('.corrupt.json')), [],
+      '失败路径不得残留临时文件')
+  })
+
+  check('无 statusReason 时不改写文件也不动 mtime（避免无谓刷新新鲜度判据）', () => {
+    const p = path.join(stripTmp, 'no-reason.json')
+    const payload = JSON.stringify(stripFixture(undefined)) // 值为 undefined ⇒ JSON.stringify 省略该键
+    fs.writeFileSync(p, payload)
+    const before = fs.statSync(p)
+    const r = writeStrippedReport(p)
+    assert.strictEqual(r.changed, false, '无 statusReason 时必须判定为无需改写')
+    assert.strictEqual(r.saved, 0)
+    assert.strictEqual(fs.readFileSync(p, 'utf8'), payload, '字节必须逐字不变')
+    assert.strictEqual(fs.statSync(p).mtimeMs, before.mtimeMs, '未改写时 mtime 必须不变')
+  })
+} finally {
+  fs.rmSync(stripTmp, { recursive: true, force: true })
+}
+
 // 回归测试：大数量截断分支——Top10 文件 / Top15 变异类型 / 30+ 存活变异体
 // 构造 31 个存活变异体，每个 file 和 mutator 都不同，一次覆盖三个截断边界。
 check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活变异体', () => {
