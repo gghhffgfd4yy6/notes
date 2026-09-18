@@ -8463,6 +8463,57 @@ console.log('========================================\n');
     }
   })
 
+  await test('sanitizeDecodedHtml 伪注释/端标签前缀不得吞掉后续真事件属性（REV-P2 发现 A）', () => {
+    // 载荷：伪注释（<! / <?）或端标签（</ ，含 `</ ` 与 `</x`）前缀自带一个不成对的引号，
+    // 旧状态机把整个前缀当普通起始标签跑属性状态机，于是前缀内的 `'` 被记成「开启了属性值」；
+    // 随后 _protectAttrPairs 回扫出 `x='><img src=x onerror=alert(1)>'` 这个伪属性对并整段占位，
+    // 段内真实 <img> 的 onerror 未进入 _stripEventAttrs，原样出网（输出与输入逐字节相同）。
+    // 修复：_htmlTagSpans 补上 HTML5 的端标签 / 伪注释状态，二者一律不记 valueQuotes。
+    //
+    // 判据刻意**不依赖字符串匹配**（改写成等价但不同字面的畸形标签就能骗过正则）：
+    // 这里用「HTML5 词法判决」做结构性判定——按词法走一遍清洗输出，只有 onerror 确实落在
+    // 某个标签**自身**的属性位上才算存活；引号值内的 onerror 字样不算。
+    const PAYLOADS = [
+      "</x='><img src=x onerror=alert(1)>'",
+      "</ x='><img src=x onerror=alert(1)>'",
+      "<! x='><img src=x onerror=alert(1)>'",
+      "<? x='><img src=x onerror=alert(1)>'"
+    ]
+    // 与 xbk_utils._htmlTagSpans 同源的最简标签词法：返回各标签区间的**段文本**。
+    const tagSpans = (s) => {
+      const spans = []
+      let i = 0
+      while (i < s.length) {
+        if (s[i] !== '<') { i++; continue }
+        const nx = s[i + 1] || ''
+        if (!/[A-Za-z/]/.test(nx)) { i++; continue }
+        let bogus = false
+        if (nx === '/') { bogus = !/[A-Za-z]/.test(s[i + 2] || ''); i += 2 } else if (nx === '!') { bogus = !s.startsWith('<!--', i); i += 2 } else i++
+        const start = i
+        while (i < s.length) {
+          if (bogus) { if (s[i] === '>') { i++; break } i++; continue }
+          if (s[i] === '"') { i++; while (i < s.length && s[i] !== '"') i++; i++; continue }
+          if (s[i] === "'") { i++; while (i < s.length && s[i] !== "'") i++; i++; continue }
+          if (s[i] === '>') { i++; break }
+          i++
+        }
+        spans.push(s.slice(start, i))
+      }
+      return spans
+    }
+    // 事件属性判据：onerror 位于标签**自身**的属性位（值引号之外、前面是空白 / '/' / 标签名边界）
+    const hasLiveHandler = (out) => tagSpans(out).some(seg => /(?:^|[\s/])onerror\s*=/i.test(seg))
+    for (const p of PAYLOADS) {
+      const out = sanitizeDecodedHtml(p)
+      assertEqual(out === p, false, `清洗器不得对该载荷恒等（${JSON.stringify(p)}）`)
+      assertEqual(hasLiveHandler(out), false, `输出的标签内不得残留 onerror（${JSON.stringify(p)} → ${JSON.stringify(out)}）`)
+    }
+    // 判据有效性对照（防「判据恒真 / 恒假」）：
+    assertEqual(hasLiveHandler('<img src=x onerror=alert(1)>'), true, '真事件属性必须被判为存活（判据有效性对照）')
+    assertEqual(hasLiveHandler('<img alt="onerror=x">'), false, '引号值内的 onerror 字样不是事件属性')
+    assertEqual(sanitizeDecodedHtml('<img alt="onerror=x">'), '<img alt="onerror=x">', '良性属性值不得被改动')
+  })
+
   await test('sanitizeDecodedHtml 未闭合引号跨标签不配对（子代理审查：残留 javascript P2）', () => {
     // 子代理发现：第一个 href 未闭合引号与第二个 href 引号跨标签配对，
     // 吞掉中间标签并遗留 `javascript:alert(2)>` 裸文本（`<a href=""javascript:alert(2)>`）
