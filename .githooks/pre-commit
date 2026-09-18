@@ -1,9 +1,40 @@
 #!/bin/bash
 # pre-commit 钩子：提交前自动验证（可 git commit --no-verify 跳过）
 # 三道快检：lint → 版本闸门 → 单元测试
+#
+# 失败必须回显被检查命令的真实输出：旧版一律 `> /dev/null 2>&1`，失败只剩一行「未通过」，
+# 修复者必须把同一条慢命令（test:filter 本机实测 93.7s）再跑一遍才知道原因——这正是
+# `--no-verify` 的诱因（门禁代价高 + 失败不给信息）。改为「成功安静、失败原样回显」：
+# 输出先收进变量，成功路径不刷屏（test_filter 一次打印约 460KB），失败路径 stderr 已合并、
+# 逐字可见。门禁范围与退出码语义不变（失败仍 exit 1）。
 echo "🔍 pre-commit 验证中..."
 set -e
-npm run lint > /dev/null 2>&1 || { echo "❌ lint 未通过，修复后再提交"; exit 1; }
-node check-version.js > /dev/null 2>&1 || { echo "❌ 版本四方不一致（文件头/CHANGELOG/package.json/package-lock），先同步再提交"; exit 1; }
-npm run test:filter > /dev/null 2>&1 || { echo "❌ 单元测试未通过，先修复再提交"; exit 1; }
+
+# run_gate <标签> <失败提示> <命令...>
+# 逐门禁计时：让「谁在花时间」可见（本机实测 lint 22s / 版本闸门 0.3s / test:filter 93.7s），
+# 为「要不要把某道门禁挪出 pre-commit」这类判断留下可测数据。
+run_gate () {
+  local label="$1" hint="$2"
+  shift 2
+  local out rc t0 t1
+  t0=$(date +%s)
+  out=$("$@" 2>&1) && rc=0 || rc=$?
+  t1=$(date +%s)
+  if [ "$rc" -ne 0 ]; then
+    echo "❌ ${label} 未通过（耗时 $((t1 - t0))s，退出码 ${rc}）${hint}"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out"
+    else
+      echo "   （该步骤未产生任何输出——请手动重跑：$*）"
+    fi
+    echo "   ↑ 以上为「$*」的完整输出（stderr 已合并）"
+    exit 1
+  fi
+  echo "✅ ${label} 通过（$((t1 - t0))s）"
+}
+
+run_gate "lint" "，修复后再提交（若提示某个可执行文件 not found，先 npm ci 装依赖）" npm run lint
+run_gate "版本闸门" "（文件头/CHANGELOG/package.json/package-lock 四方不一致），先同步再提交" node check-version.js
+echo "⏳ 单元测试 test:filter（本机实测约 90s，请稍候）..."
+run_gate "单元测试" "，先修复再提交" npm run test:filter
 echo "✅ pre-commit 全部通过"
