@@ -190,7 +190,7 @@ dns.lookup = (hostname, options, callback) => {
 
   // ===== AGENTS-01 + AGENTS-11：prewarmDns 必须与真实请求的 lookup 同 key（默认 DNS 模式预热才有效），
   // 但同 key 的口径是「同选项」，不是「同主机」 =====
-  // 真实 net.connect 实测（本机 Node v24.18.0）以 {hints: dns.ADDRCONFIG(1024)}（autoSelectFamily 默认
+  // 真实 net.connect 实测（本机 Node v24.18.0）以 {hints: dns.ADDRCONFIG}（autoSelectFamily 默认
   // 开启时另加 all:true）调用本 lookup；prewarmDns 必须同源取值才能同 key——旧实现预热传 {}，
   // 与真实请求 hints 不同，预热写进一个永不被读的条目，DNS 预热完全无效（本断言在那种代码下必红：
   // 底层次数为 2 而非 1）。
@@ -213,26 +213,38 @@ dns.lookup = (hostname, options, callback) => {
     assert.strictEqual(keyCalls[0].options.all, true, '底层应统一按 all:true 解析（缓存完整地址列表）')
     // 预热必须与生产请求同源取值：hints 必须等于 net 实测传的 ADDRCONFIG（family 未指定时）
     assert.strictEqual(keyCalls[0].options.hints, dns.ADDRCONFIG, '预热应按生产请求选项取 hints=ADDRCONFIG')
-    // 真实请求形态：net 传 hints=ADDRCONFIG + all=true → 必须命中预热写入的缓存条目
+    // 真实请求形态：net 传 hints=ADDRCONFIG + all=true → 必须命中预热写入的缓存条目。
+    // ⚠️ hints 必须与实现（xbk_agents 的 PRODUCTION_LOOKUP_HINTS）同源取 dns.ADDRCONFIG，不得把本机
+    // 观测到的 1024 写死：该常量是**平台相关**取值（本机 Linux 为 1024，个别平台可为 0）。写死会在
+    // 常量≠1024 的平台上构造出与预热不同的 key，把「同选项必须命中」这条断言变成平台专属假红
+    // （CI 实测：本机绿、CI 红，底层解析次数 2 而非 1）。
     const allHit = await new Promise((resolve, reject) => {
-      dnsLookup(keyProbeHost, { hints: 1024, all: true }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+      dnsLookup(keyProbeHost, { hints: dns.ADDRCONFIG, all: true }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
     })
     assert.strictEqual(keyCalls.length, 1, `预热后真实请求形态的 lookup 应命中同一缓存（不同 key 时为 2），实际 ${keyCalls.length}`)
     assert.ok(Array.isArray(allHit.address) && allHit.address[0] && allHit.address[0].address === '192.0.2.7', 'all:true 调用方应拿到地址数组')
     // 同一缓存条目服务非 all 调用方：形状适配为标量（调用方选项与预热同源，故仍共享条目）
     const scalarHit = await new Promise((resolve, reject) => {
-      dnsLookup(keyProbeHost, { hints: 1024 }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+      dnsLookup(keyProbeHost, { hints: dns.ADDRCONFIG }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
     })
     assert.strictEqual(keyCalls.length, 1, '同选项的非 all 调用方也应命中同一缓存条目，不应再发起解析')
     assert.strictEqual(scalarHit.address, '192.0.2.7', '非 all 调用方应拿到标量地址')
     assert.strictEqual(scalarHit.family, 4, '非 all 调用方应拿到地址族')
-    // 选项不同的调用方（hints:0）语义不同，不得复用上面按 ADDRCONFIG 筛过的条目：必须自己解析
-    const plainHit = await new Promise((resolve, reject) => {
-      dnsLookup(keyProbeHost, {}, (err, address, family) => err ? reject(err) : resolve({ address, family }))
-    })
-    assert.strictEqual(keyCalls.length, 2, 'hints:0 与预热的 hints:ADDRCONFIG 选项不同 → 必须重新解析（AGENTS-11）')
-    assert.ok(!keyCalls[1].options.hints, '重新解析必须把调用方自己的 hints（此处未指定）交给底层')
-    assert.strictEqual(plainHit.address, '192.0.2.7', 'hints:0 调用方应拿到自己那次解析的结果')
+    // 选项不同的调用方（未指定 hints）语义不同，不得复用上面按 ADDRCONFIG 筛过的条目：必须自己解析。
+    // ⚠️ 前提是 dns.ADDRCONFIG !== 0（同样是平台相关常量）：若该常量为 0，预热选项 hints 与未指定的 {}
+    // 在 xbk_agents 的 dnsSelectionSignature 里归一后同为 0（`opts.hints || 0`）——两者**就是同一个 key**，
+    // 「选项不同 ⇒ 必须重新解析」在数学上不可构造。这种平台上必须显式跳过并说明，不能留成恒假断言
+    // （也不改成恒真：跳过路径不产生任何通过记录）。非 0 平台照旧逐条断言，强度不变。
+    if (dns.ADDRCONFIG === 0) {
+      console.log('⏭ 跳过 AGENTS-11「不同 hints 必须重新解析」：本平台 dns.ADDRCONFIG === 0，{} 与预热选项同 key（差异不可构造）')
+    } else {
+      const plainHit = await new Promise((resolve, reject) => {
+        dnsLookup(keyProbeHost, {}, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+      })
+      assert.strictEqual(keyCalls.length, 2, 'hints:0 与预热的 hints:ADDRCONFIG 选项不同 → 必须重新解析（AGENTS-11）')
+      assert.ok(!keyCalls[1].options.hints, '重新解析必须把调用方自己的 hints（此处未指定）交给底层')
+      assert.strictEqual(plainHit.address, '192.0.2.7', 'hints:0 调用方应拿到自己那次解析的结果')
+    }
     // 恢复文件头的确定性 mock（保持后续断言的既定语义）
     dns.lookup = (hostname, options, callback) => {
       const cb = typeof options === 'function' ? options : callback
@@ -266,17 +278,29 @@ dns.lookup = (hostname, options, callback) => {
       dnsLookup(host, options, (err, address) => err ? reject(err) : resolve(address))
     })
     const families = (list) => list.map(x => x.family).join(',')
+    // 平台相关取值（与上面 hints 同源问题的延伸）：dns.ADDRCONFIG 是宿主机 libc 的 AI_ADDRCONFIG
+    // （本机 Android/bionic = 1024；CI 红反推 CI 平台 ≠ 1024；个别平台可为 0）。本块的替身按
+    // 「该掩码置位 → 剔除本机未配置族的 AAAA」建模，故**掩码为 0 的平台**上生产请求形态
+    // （hints=ADDRCONFIG=0）根本不会被剔除，正确期望就是完整地址集 '6,4'。这里用同一个常量推导
+    // 期望值，而不是把本机观测到的 '4' 写死成平台专属；非 0 平台上取值仍为 '4'，与本块原有断言逐字一致。
+    const addrconfigView = dns.ADDRCONFIG === 0 ? '6,4' : '4'
     const warm = await prewarmDns(host)
     assert.strictEqual(warm.ok, true, '预热应成功')
     assert.strictEqual(calls.length, 1, '预热应发起 1 次底层解析')
-    // ① 生产请求形态（hints=ADDRCONFIG, all:true）命中预热条目，且不含本机未配置族的地址
+    // ① 生产请求形态（hints=ADDRCONFIG, all:true）命中预热条目，且按本平台掩码拿到地址集
     const acHit = await lookup({ hints: dns.ADDRCONFIG, all: true })
     assert.strictEqual(calls.length, 1, '生产请求形态应命中预热条目（预热仍有效）')
-    assert.strictEqual(families(acHit), '4', 'ADDRCONFIG 调用方不得拿到本机未配置族的 AAAA')
-    // ② 同一 hostname、选项不同 → 各自的条目与结果（TTL 内多次不同选项请求）
-    const plain = await lookup({ hints: 0, all: true })
-    assert.strictEqual(calls.length, 2, 'hints:0 与预热选项不同 → 应重新解析')
-    assert.strictEqual(families(plain), '6,4', 'hints:0 调用方应拿到完整地址集（不得复用 ADDRCONFIG 视图）')
+    assert.strictEqual(families(acHit), addrconfigView, '生产请求形态应按本平台 ADDRCONFIG 掩码筛选（掩码非 0 时不得含本机未配置族的 AAAA）')
+    // ② 同一 hostname、选项不同 → 各自的条目与结果（TTL 内多次不同选项请求）。
+    // ⚠️ 平台相关：dns.ADDRCONFIG 为 0 时预热选项 hints 归一后就是 0，与 `{hints:0}` **同 key**，
+    // 「选项不同 ⇒ 重新解析」的前提消失（会变成恒假断言）。此处不用跳过、也不用恒真断言，而是改用
+    // 必然与预热不同的 hints（1 是有限数值、仍在实现建模范围内，见 dnsSelectionSignature）：该断言
+    // 仍可证伪——若实现忽略 hints 导致不同 hints 复用同一条目，calls 会停在 1 而红。非 0 平台上
+    // otherHints 恒为 0，与改前逐字一致。
+    const otherHints = dns.ADDRCONFIG === 0 ? 1 : 0
+    const plain = await lookup({ hints: otherHints, all: true })
+    assert.strictEqual(calls.length, 2, `hints:${otherHints} 与预热的 hints:${dns.ADDRCONFIG} 不同 → 应重新解析`)
+    assert.strictEqual(families(plain), '6,4', 'hints 不同的调用方应拿到完整地址集（不得复用 ADDRCONFIG 视图）')
     // ③ 排序选项 verbatim:false（hints 0）→ 必须由解析器按 ipv4first 重新给出顺序
     const vf = await lookup({ hints: 0, verbatim: false, all: true })
     assert.strictEqual(calls.length, 3, 'verbatim:false 与 verbatim:true 顺序语义不同 → 应重新解析')
@@ -302,7 +326,7 @@ dns.lookup = (hostname, options, callback) => {
     assert.ok(Array.isArray(exotic), '未知选项调用方仍应按 all 形状拿到结果')
     const acAgain = await lookup({ hints: dns.ADDRCONFIG, all: true })
     assert.strictEqual(calls.length, 6, '未知选项的解析不得写回预热条目（不污染同主机其它选项的缓存）')
-    assert.strictEqual(families(acAgain), '4', '预热条目内容不应被未知选项调用改写')
+    assert.strictEqual(families(acAgain), addrconfigView, '预热条目内容不应被未知选项调用改写（期望值与本平台 ADDRCONFIG 掩码一致）')
     // ⑦b 非法取值（family/hints/verbatim/order 的类型或取值超出建模范围）同样不进缓存 → 每次直接解析
     for (const opts of [{ family: 5, all: true }, { family: 'IPv4', all: true }, { hints: '1024', all: true }, { hints: Number.NaN, all: true }, { hints: Infinity, all: true }, { verbatim: 'yes', all: true }, { order: 'ipv6only', all: true }]) {
       const before = calls.length
@@ -313,12 +337,14 @@ dns.lookup = (hostname, options, callback) => {
     await lookup({ family: 5, all: true })
     assert.strictEqual(calls.length, notModeledBefore + 1, '未建模选项的调用不得写缓存（同形状再查仍解析）')
     // ⑧ 并发去重按选项分组：同选项合并 1 次解析，不同选项各自解析
+    // （第三个调用方的 hints 用 otherHints：ADDRCONFIG 为 0 的平台上传 0 会与前两个**同 key**并合并，
+    //   那样「不同选项各自解析」的前提就不成立；非 0 平台上 otherHints 恒为 0，与原断言逐字一致。）
     const hangHost = 'select-pending.invalid'
     const hanging = []
     dns.lookup = (hostname, options, callback) => { hanging.push({ options, callback }) }
     const p1 = new Promise((resolve, reject) => dnsLookup(hangHost, { hints: dns.ADDRCONFIG, all: true }, (e, a) => e ? reject(e) : resolve(a)))
     const p2 = new Promise((resolve, reject) => dnsLookup(hangHost, { hints: dns.ADDRCONFIG, all: true }, (e, a) => e ? reject(e) : resolve(a)))
-    const p3 = new Promise((resolve, reject) => dnsLookup(hangHost, { hints: 0, all: true }, (e, a) => e ? reject(e) : resolve(a)))
+    const p3 = new Promise((resolve, reject) => dnsLookup(hangHost, { hints: otherHints, all: true }, (e, a) => e ? reject(e) : resolve(a)))
     await new Promise(resolve => setImmediate(resolve))
     assert.strictEqual(hanging.length, 2, '并发去重应按选项分组：同选项合并、不同选项各自解析')
     hanging[0].callback(null, [{ address: '192.0.2.7', family: 4 }], undefined)
