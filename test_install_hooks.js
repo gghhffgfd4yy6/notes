@@ -9,12 +9,22 @@
 // v3.276 起 HOOK_FILES 增加 pre-push（test:filter 从 pre-commit 迁来）：用例 8/9 专门锁定
 // 「旧清单（缺 pre-push）必须红」「pre-push 无执行位必须红」——把 pre-push 从清单里去掉，
 // 这两条断言立刻失败（靶向回退已在报告里实测）。
-// v3.276+（Qodo 评审 PR #156）起另加 pre-push 的端到端用例 A–F（见文件末尾）：锁定「门禁必须对
-// **被推提交的内容**跑」——快路径（sha==HEAD 且已跟踪文件干净）/ 隔离 worktree（非当前 HEAD 或工作树脏）
-// / fail-closed（隔离建不起来绝不用工作树冒充）。用例 B 是本次修复的靶向反例：旧实现必红。
+// v3.276+（Qodo 评审 PR #156）起另加 pre-push 的端到端用例 A–H（见文件末尾）：锁定「门禁必须对
+// **被推提交的内容**跑」——快路径（sha==HEAD 且**整棵工作树干净**，未跟踪文件也算脏）/ 隔离 worktree
+// （非当前 HEAD 或工作树脏）/ fail-closed（隔离建不起来绝不用工作树冒充）。用例 B 是本次修复的靶向
+// 反例：旧实现必红。
 // 用例 F（PR #156 评审返工）锁定「一 sha 一清理」：一次推送两个**不同**的非 HEAD sha 时，两个临时
 // worktree 都必须被清掉——旧实现只清最后一个、第一个泄漏（WT_TMP 是单变量，成功路径不清理），
 // 而钩子照样 exit 0。旧实现下用例 F 必红（靶向回退已实测）。
+// 用例 G/H（PR #156 返工点②：未跟踪文件不是「只警告」）锁定快路径的**干净口径必须包含未跟踪文件**：
+//   G 是靶向反例——用扫描式夹具门禁（仿 test_filter.js 的 `readdirSync(...).filter(/^xbk_.*\.js$/)`
+//   + 跨文件符号计数 ≥2）造出「被推提交自身 fail、工作树里未跟踪文件补足后 pass」的局面，钩子必须
+//   仍给红、且门禁是在 xbk-prepush-* 隔离目录里跑的。旧口径
+//   （`git status --porcelain --untracked-files=no`：只要求已跟踪文件干净）在这里给出 exit 0 的假绿灯
+//   → 本用例在旧代码上必红（靶向回退已实测）。
+//   H 是语义变更的正向锁定——「HEAD == 被推提交 + 已跟踪文件干净，但工作树有未跟踪文件」必须走隔离
+//   路径（门禁 cwd 落在 xbk-prepush-*、跑完零残留、exit 0）；旧口径走的是「只警告」的快路径
+//   → H 的 cwd 断言必红。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -331,6 +341,29 @@ const FIXTURE_GATE_JS = [
   ''
 ].join('\n')
 
+// 扫描式夹具门禁（用例 G 专用）：与 test_filter.js 的可达性用例同构——按**目录扫描**取 `xbk_*.js`
+// （**未跟踪的文件也会被 readdirSync 列进来**），把标记符号的出现次数**跨文件相加**，断言要求 ≥2 次。
+// 因此「提交里只有 1 次」会被工作树里一个未跟踪的 `xbk_scratch_backup.js` 补到 2 次：提交口径 fail、
+// 工作树口径 pass——旧快路径口径（`--untracked-files=no`）正是在这个落差上给出假绿灯（用例 G 锁定它）。
+const FIXTURE_SCAN_GATE_JS = [
+  "'use strict'",
+  "const fs = require('node:fs')",
+  "const path = require('node:path')",
+  "const { execFileSync } = require('node:child_process')",
+  "let top = '(git 解析失败)'",
+  "try { top = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim() } catch { top = '(git 解析失败)' }",
+  'const files = fs.readdirSync(__dirname).filter(f => /^xbk_.*\\.js$/.test(f))',
+  'let hits = 0',
+  "for (const f of files) hits += (fs.readFileSync(path.join(__dirname, f), 'utf8').match(/XBK_MARKER/g) || []).length",
+  "const flag = hits >= 2 ? 'pass' : 'fail'",
+  'if (process.env.XBK_GATE_LOG) {',
+  "  fs.appendFileSync(process.env.XBK_GATE_LOG, JSON.stringify({ cwd: process.cwd(), top, flag, hits, files }) + '\\n')",
+  '}',
+  "process.stdout.write('GATE-FIXTURE[' + flag + '] cwd=' + process.cwd() + ' hits=' + hits + ' files=' + files.join(',') + '\\n')",
+  "process.exit(flag === 'pass' ? 0 : 1)",
+  ''
+].join('\n')
+
 // 绝对路径调用真实 git；失败即断言失败（夹具建不起来不能静默跳过）。
 function mustGit (args, opts, what) {
   const r = spawnSync(GIT, args, { encoding: 'utf8', ...opts })
@@ -339,7 +372,10 @@ function mustGit (args, opts, what) {
 }
 
 // commitGate：写进**提交**的 gate.txt 内容（决定被推提交本身是 pass 还是 fail）。
-function makePushFixture ({ commitGate = 'pass' } = {}) {
+// gateKind='scan'：改用扫描式门禁（FIXTURE_SCAN_GATE_JS）+ 提交里只放一个含 1 次 XBK_MARKER 的
+// `xbk_alpha.js`——该提交自身必然 fail（断言要求 ≥2 次），只有「工作树里另有未跟踪的 xbk_*.js」
+// 才能把**工作树口径**补成 pass（用例 G 的靶向落差）。
+function makePushFixture ({ commitGate = 'pass', gateKind = 'flag' } = {}) {
   const { dir, home } = makeCase()
   const remote = path.join(dir, 'remote.git')
   const work = path.join(dir, 'work')
@@ -357,8 +393,14 @@ function makePushFixture ({ commitGate = 'pass' } = {}) {
     private: true,
     scripts: { 'test:filter': 'node gate.js' }
   }, null, 2) + '\n')
-  fs.writeFileSync(path.join(work, 'gate.js'), FIXTURE_GATE_JS)
-  fs.writeFileSync(path.join(work, 'gate.txt'), commitGate + '\n')
+  if (gateKind === 'scan') {
+    fs.writeFileSync(path.join(work, 'gate.js'), FIXTURE_SCAN_GATE_JS)
+    // 提交里只有一个含 1 次标记的模块 → 提交口径必然 fail（门禁要求 ≥2 次）
+    fs.writeFileSync(path.join(work, 'xbk_alpha.js'), 'const XBK_MARKER = 1\n')
+  } else {
+    fs.writeFileSync(path.join(work, 'gate.js'), FIXTURE_GATE_JS)
+    fs.writeFileSync(path.join(work, 'gate.txt'), commitGate + '\n')
+  }
   mustGit(['config', 'user.email', 'fixture@example.invalid'], { cwd: work, env })
   mustGit(['config', 'user.name', 'fixture'], { cwd: work, env })
   mustGit(['add', '-A'], { cwd: work, env })
@@ -647,5 +689,62 @@ function assertNoResidue (fx, label) {
   }
 }
 
+// G) 【靶向本次修复②：未跟踪文件不得把被推提交的红读成绿】
+//    夹具是**扫描式**门禁（与 test_filter.js 的可达性用例同构：readdirSync 取全部 `xbk_*.js`，把
+//    XBK_MARKER 的出现次数跨文件相加，断言 ≥2 次）。提交里只有一个 `xbk_alpha.js`（1 次）→ **被推提交
+//    自身必然 fail**；工作树里再放一个**未跟踪**的 `xbk_scratch_backup.js`（1 次）→ 工作树口径 2 次 pass。
+//    旧口径（`git status --porcelain --untracked-files=no`：只要求已跟踪文件干净）在这个落差上走快路径、
+//    拿工作树冒充被推提交 → 钩子 exit 0 假绿，本用例的 `notStrictEqual(r.status, 0)` 必红（靶向回退已实测）。
+//    修复后必须走隔离路径：在 `xbk-prepush-*` 里按**提交内容**跑 → hits=1、files 只有 xbk_alpha.js → 真红。
+{
+  const fx = makePushFixture({ gateKind: 'scan' })
+  try {
+    fs.writeFileSync(path.join(fx.work, 'xbk_scratch_backup.js'), 'const XBK_MARKER = 2\n')
+    const head = headOf(fx)
+    const r = driveHook(fx, refLine('refs/heads/main', head, 'refs/heads/main'))
+    assert.notStrictEqual(r.status, 0,
+      `G（靶向）：被推提交自身门禁 fail，工作树里的未跟踪文件只属于工作树，绝不能假绿：${hookOut(r)}`)
+    assert.match(hookOut(r), /GATE-FIXTURE\[fail\]/, 'G：失败回显必须是**被推提交**的结论')
+    assert.doesNotMatch(hookOut(r), /GATE-FIXTURE\[pass\]/, 'G：绝不能出现工作树口径的通过结论')
+    const runs = gateRuns(fx)
+    assert.strictEqual(runs.length, 1, `G：门禁应只跑一次（在隔离 worktree 里），实际 ${runs.length} 次`)
+    assert.strictEqual(runs[0].flag, 'fail', 'G：跑的必须是被推提交的内容')
+    assert.strictEqual(runs[0].hits, 1, 'G：隔离检出里只有提交的 1 次标记（未跟踪文件不得被读进来）')
+    assert.deepStrictEqual(runs[0].files, ['xbk_alpha.js'],
+      'G：扫描到的必须只有提交内的 xbk_*.js——工作树里的 xbk_scratch_backup.js 不得出现')
+    assert.match(runs[0].cwd, /xbk-prepush-/, 'G：必须在钩子自建的隔离 worktree 里跑，不得拿工作树冒充')
+    assertInFixtureTmp(fx, runs[0].cwd, 'G')
+    assert.ok(!fs.existsSync(runs[0].cwd), 'G：临时 worktree 必须被清理（失败路径也不能残留）')
+    assertNoResidue(fx, 'G')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
+// H) 【语义变更：未跟踪文件不再「只警告」】HEAD == 被推提交、已跟踪文件干净（`git status --porcelain
+//    --untracked-files=no` 为空），但工作树里有未跟踪文件 → 旧口径走快路径（打印一条警告后 exit 0）；
+//    新口径必须与「已跟踪文件脏」同走隔离路径：门禁 cwd 落在 `xbk-prepush-*`、按被推提交内容判定
+//    （pass）、跑完零残留、exit 0。旧代码下门禁落在当前工作树 → 本用例的 cwd 断言必红。
+{
+  const fx = makePushFixture({ commitGate: 'pass' })
+  try {
+    fs.writeFileSync(path.join(fx.work, 'untracked-scratch.txt'), '未跟踪的临时文件（不属于被推提交）\n')
+    const head = headOf(fx)
+    const r = driveHook(fx, refLine('refs/heads/main', head, 'refs/heads/main'))
+    assert.strictEqual(r.status, 0, `H：被推提交内容通过时应 exit 0（隔离路径不改变门禁结论）：${hookOut(r)}`)
+    assert.doesNotMatch(hookOut(r), /工作树内容 === 被推提交内容/,
+      'H：工作树里有未跟踪文件时，不得再断言「工作树内容 === 被推提交内容」（那正是旧口径的假绿灯前提）')
+    const runs = gateRuns(fx)
+    assert.strictEqual(runs.length, 1, `H：门禁应只跑一次，实际 ${runs.length} 次`)
+    assert.match(runs[0].cwd, /xbk-prepush-/, 'H：有未跟踪文件时必须走隔离路径（旧口径只警告、仍在工作树跑）')
+    assertInFixtureTmp(fx, runs[0].cwd, 'H')
+    assert.strictEqual(runs[0].flag, 'pass', 'H：判定的应是被推提交的内容')
+    assert.ok(!fs.existsSync(runs[0].cwd), 'H：临时 worktree 必须被清理')
+    assertNoResidue(fx, 'H')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
 console.log('✅ install-hooks --verify 只读自检：未生效 fail-closed / 生效 exit 0 / 不改配置不改权限；pre-push（v3.276）列入清单且缺失/无执行位均被检出')
-console.log('✅ pre-push 门禁对象回归（PR #156）：快路径只跑一次 / 脏工作树按**被推提交内容**判定（旧实现必红）/ 非当前检出走隔离 worktree 且清理干净 / 隔离建不起来即 fail-closed 不跑工作树 / 去重+删除引用+非推送上下文 / 一次推多个非 HEAD sha 时每个隔离 worktree 都被清理（旧实现必红）')
+console.log('✅ pre-push 门禁对象回归（PR #156）：快路径只跑一次 / 脏工作树按**被推提交内容**判定（旧实现必红）/ 非当前检出走隔离 worktree 且清理干净 / 隔离建不起来即 fail-closed 不跑工作树 / 去重+删除引用+非推送上下文 / 一次推多个非 HEAD sha 时每个隔离 worktree 都被清理（旧实现必红）/ 未跟踪文件算脏：扫描式门禁下「提交 fail、工作树的未跟踪文件补绿」仍必须真红且门禁在隔离目录里跑（旧口径假绿，G 必红）+ 有未跟踪文件改走隔离路径（旧口径只警告仍走快路径，H 必红）')
