@@ -464,6 +464,27 @@ const skipAll = unitFiles.join(',') // 跳过全部单元套件 → 零套件守
 // 用它秒级收尾——过滤后为零套件已被 3f 固定为非 0，不能再拿它当「快速跑完」的挡箭牌。
 const skipAllButOne = unitFiles.filter(f => f !== 'test_check_deps.js').join(',')
 
+// ── 并发假杀隔离：summary 落点必须按进程唯一（PR #158）──────────────────────────
+// Stryker 一次 run 只建**一个**沙箱目录：`--concurrency 8` 时 8 个测试 worker 共用同一份 cwd，于是任何
+// **仓库相对**的共享可写路径都会被并发 worker 写→读→删互相踩。本段原先用固定的「reports/ + 固定名」做
+// summary 落点（子进程写入 → 本进程立即读回 → finally 删除），CI 实测（C=8）出现过：
+//   Error: ENOENT: no such file or directory, open '<那个固定落点>'（读回处）
+// 逐字成因：同族 worker 的 finally 删除落在本 worker 的「写完 → 读回」之间。套件因此崩、命令 runner 按
+// 退出码判 Killed，把与该变异体**无关**的结果打成假 Killed。
+// 修法与 test_filter.js / test_app.js 的 `xianbaoku_cache_p<XBK_PARALLEL_ID|pid>` 同源：落点按进程唯一。
+// **断言语义一字不改**——断的是「写入 → 读回 → 删除」的行为与内容（前缀 `## 单元测试结果`、`共 1 套件`），
+// 不是文件名；下面没有任何断言依赖固定文件名。「唯一后缀必须还在」这件事由本段末尾的并发回归 + 断言锁定。
+// 唯一化规则的**单点定义**：真实落点与下方并发回归夹具都从这一个模板派生——把 `.p<pid>` 去掉会让两边
+// 同时退回共享路径，回归因此真红。占位符用 `<stem>`/`<pid>` 而不是 `${…}`：后者写在字符串里会被 standard 的
+// no-template-curly-in-string 判红（不是靠 eslint-disable 压规则）。
+const CI_SUMMARY_PATH_TEMPLATE = 'reports/<stem>.p<pid>.md'
+const ciSummaryPath = (pid, stem) => CI_SUMMARY_PATH_TEMPLATE.replace('<stem>', stem).replace('<pid>', String(pid))
+const ciSummaryCheck = ciSummaryPath(process.pid, '.ci-summary-check') // reports/.ci-summary-check.p<pid>.md
+const ciSummaryOverflow = ciSummaryPath(process.pid, '.ci-summary-overflow') // reports/.ci-summary-overflow.p<pid>.md
+// 3c 的反面夹具要指到一个**不存在**的目录（真去写就 ENOENT）：同样带 pid 后缀——否则并发 worker 遗留的
+// 同名目录会让「没写」这条断言静默失去意义（夹具自身失效 ⇒ 断言恒真）。
+const ciMissingFile = `reports/.ci-missing-dir.p${process.pid}/.ci-summary-child.md`
+
 fs.mkdirSync('reports', { recursive: true }) // reports/ 已被 .gitignore 忽略，用作 summary 落点
 try {
   // 3a 拼错的条目必须炸（修复前是静默照跑全量）
@@ -472,18 +493,20 @@ try {
   assert.match(unknown.stderr, /test_not_exist\.js/, '错误应点名未知套件')
 
   // 3b CI 下写 summary（验证过滤生效：跳过其余套件 → 只剩 test_check_deps.js 一个）
-  const filtered = runEntry({ SKIP_SUITES: skipAllButOne, GITHUB_STEP_SUMMARY: 'reports/.ci-summary-check.md' })
+  const filtered = runEntry({ SKIP_SUITES: skipAllButOne, GITHUB_STEP_SUMMARY: ciSummaryCheck })
   assert.strictEqual(filtered.status, 0, filtered.stderr || filtered.stdout)
   assert.match(filtered.stdout, /共 1 个套件/, '只剩一个套件时应报告 1 个')
-  const summary = fs.readFileSync('reports/.ci-summary-check.md', 'utf8')
+  const summary = fs.readFileSync(ciSummaryCheck, 'utf8')
   assert.match(summary, /^## 单元测试结果/m, 'CI 下应写入 job summary')
   assert.match(summary, /共 1 套件/, 'summary 套件数应与实际执行数一致')
 
   // 3c 变异子进程必须不写 summary：把落点指到不存在的目录，真去写就会 ENOENT 崩掉 ——
   //    因此「exit 0 且 stderr 无 ENOENT」即证明没有发生写入
+  assert.ok(!fs.existsSync(path.dirname(ciMissingFile)),
+    `夹具前提：${path.dirname(ciMissingFile)} 不应存在（它存在就让「没写 summary」这条断言恒真）`)
   const child = runEntry({
     SKIP_SUITES: skipAllButOne,
-    GITHUB_STEP_SUMMARY: 'reports/.ci-missing-dir/.ci-summary-child.md',
+    GITHUB_STEP_SUMMARY: ciMissingFile,
     XBK_MUTATION_CHILD: '1'
   })
   assert.strictEqual(child.status, 0, child.stderr || child.stdout)
@@ -493,7 +516,7 @@ try {
   //    XBK_UNIT_MAX_BUFFER 仅测试注入；留一个必输出内容的套件、把上限压到 1 字节
   const overflow = runEntry({
     SKIP_SUITES: skipAllButOne,
-    GITHUB_STEP_SUMMARY: 'reports/.ci-summary-overflow.md',
+    GITHUB_STEP_SUMMARY: ciSummaryOverflow,
     XBK_UNIT_MAX_BUFFER: '1'
   })
   assert.notStrictEqual(overflow.status, 0, '输出超过 maxBuffer 的套件应判定失败')
@@ -507,8 +530,99 @@ try {
   assert.match(zero.stderr, /没有可执行的单元套件/, '错误应点名「过滤后没有可执行的单元套件」')
   assert.ok(!/全部通过/.test(zero.stdout), '零套件时不得输出「全部通过」')
 } finally {
-  fs.rmSync('reports/.ci-summary-check.md', { force: true })
-  fs.rmSync('reports/.ci-summary-overflow.md', { force: true })
+  // 只删**本进程自己的**落点（并发 worker 的落点文件名不同，互不可见）——清理不漏、也不误删别人
+  fs.rmSync(ciSummaryCheck, { force: true })
+  fs.rmSync(ciSummaryOverflow, { force: true })
+}
+
+// ── 3b-并发回归：共享落点的并发争抢必须被结构性排除（PR #158 的靶向锁）──────────────
+// 真并发：1 个编排进程同时拉起 4 个 hammer 进程，各自用**上面同一份唯一化模板** + 自己的 pid 展开落点，
+// 循环做「写 → 立即读回 → 删」（与本段 3b/finally 同构，只是轮次更多、窗口被抖动放大）：
+//   · 唯一化在位 ⇒ 每条路径只属于一个进程，读回必然拿到自己写的内容（确定性绿，与调度无关）；
+//   · 唯一化被去掉（模板退回共享路径）⇒ 4 个进程写/删同一条路径，读回撞上兄弟进程的删除 ⇒
+//     ENOENT / 内容被覆盖（靶向回退实测真红；与 CI 在 C=8 下的残余假杀同一成因）。
+// 不能用「同一进程内两份并发实例」：本套件是同步脚本、Node 单线程，同进程内做不出真并发；故用真实子进程。
+{
+  const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-ci-summary-probe-'))
+  try {
+    const hammer = [
+      "'use strict'",
+      "const fs = require('node:fs')",
+      'const spec = JSON.parse(process.env.XBK_CI_SUMMARY_PROBE)',
+      "const file = spec.template.replace('<stem>', spec.stem).replace('<pid>', String(process.pid))",
+      'let failures = 0',
+      'for (let i = 0; i < spec.rounds; i++) {',
+      '  fs.writeFileSync(file, "pid=" + process.pid + " round=" + i + "\\n") // ← 3b：写 summary',
+      '  // 抖动（相位按 pid 错开）：把「写完→读回」的窗口撑开，好让兄弟进程的删除/覆盖落进来',
+      '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, (i * 7 + (process.pid % 5)) % spec.jitterMs)',
+      '  try {',
+      "    const back = fs.readFileSync(file, 'utf8') // ← 3b：立即读回（共享路径下这里就是 ENOENT 现场）",
+      '    if (!back.startsWith("pid=" + process.pid + " ")) throw new Error("summary 被兄弟进程覆盖: " + back.trim())',
+      '  } catch (e) {',
+      '    failures++',
+      '    if (failures === 1) console.error("[probe pid=" + process.pid + " round=" + i + "] " + (e.code || "ERR") + " " + e.message)',
+      '  }',
+      '  fs.rmSync(file, { force: true }) // ← finally：删自己的落点',
+      '}',
+      'process.exit(failures === 0 ? 0 : 1)',
+      ''
+    ].join('\n')
+    fs.writeFileSync(path.join(probeDir, 'hammer.js'), hammer)
+    // 编排进程：同时拉起 4 个 hammer 并聚合退出码（本套件是同步脚本、无 top-level await，故由被 spawn 的
+    // 编排进程聚合）。hammer 走 process.execPath + 继承 env，与本文件其它 spawn 同口径。
+    const runner = [
+      "'use strict'",
+      "const { spawn } = require('node:child_process')",
+      'const procs = Number(process.env.XBK_CI_SUMMARY_PROCS) || 4',
+      "let left = procs, failed = 0, firstErr = ''",
+      'for (let k = 0; k < procs; k++) {',
+      "  const p = spawn(process.execPath, [process.argv[1]], { stdio: ['ignore', 'ignore', 'pipe'] })",
+      "  let err = ''",
+      "  p.stderr.on('data', d => { err += d })",
+      '  p.on("exit", (code, signal) => {',
+      '    if (code !== 0) { failed++; if (!firstErr) firstErr = err.trim() || ("exit=" + code + " signal=" + signal) }',
+      '    if (--left === 0) { if (firstErr) console.error(firstErr); process.exit(failed === 0 ? 0 : 1) }',
+      '  })',
+      '  p.on("error", e => { failed++; if (!firstErr) firstErr = e.message; if (--left === 0) process.exit(1) })',
+      '}',
+      ''
+    ].join('\n')
+    // rounds/jitter 取「回退必红、在位必绿」的最小成本档：本机实测共享路径下 5/5 真红（内容被覆盖或 ENOENT），
+    // 唯一路径下恒绿；成本主要是 4 个子进程的 node 启动，与轮次基本无关，故不放大轮次（stryker 逐变异体都跑本套件）。
+    const spec = JSON.stringify({ template: CI_SUMMARY_PATH_TEMPLATE, stem: '.ci-summary-check', rounds: 10, jitterMs: 2 })
+    const probeRun = spawnSync(process.execPath, ['-e', runner, path.join(probeDir, 'hammer.js')], {
+      encoding: 'utf8',
+      cwd: __dirname,
+      env: { ...baseEnv, XBK_CI_SUMMARY_PROBE: spec, XBK_CI_SUMMARY_PROCS: '4' }
+    })
+    assert.ok(!probeRun.error, `并发探针未能启动: ${probeRun.error && probeRun.error.message}`)
+    assert.strictEqual(probeRun.status, 0,
+      '多个并发进程在 summary 落点上发生争抢：落点必须按进程唯一。共享路径下的三种现场都算红——' +
+      '① 读回 ENOENT（兄弟进程删了它，CI 的原始假杀形态）；② 内容被兄弟进程覆盖；③ 读回时撞上并发 unlink ' +
+      '而崩（Node/libuv 在 ReadFileUtf8 上 abort，退出码非 0）\n' +
+      `${probeRun.stderr || probeRun.stdout}`)
+    assert.ok(!/ENOENT/.test(probeRun.stderr || ''), '并发争抢的现场证据里不得出现 ENOENT')
+    console.log('✅ 并发隔离：4 进程 × 10 轮「写→读回→删」，0 争抢（落点模板 ' + CI_SUMMARY_PATH_TEMPLATE + '）')
+  } finally {
+    fs.rmSync(probeDir, { recursive: true, force: true })
+  }
+  // 唯一性 + 静态双保险：真实落点必须带本进程 pid；固定共享字面量不得再出现（回退即红）。
+  assert.ok(ciSummaryCheck.includes(`.p${process.pid}.md`) && ciSummaryOverflow.includes(`.p${process.pid}.md`),
+    'summary 落点必须带 `.p<pid>.md` 唯一后缀（不带 = 退回共享路径 = 并发 worker 互相删读 ⇒ ENOENT 假 Killed）')
+  assert.notStrictEqual(ciSummaryCheck, ciSummaryOverflow, '同进程内两个落点也必须互不相同')
+  assert.ok(ciSummaryCheck !== ciSummaryPath(process.pid + 1, '.ci-summary-check'),
+    '落点必须随 pid 变化（把 pid 从模板里去掉会让这条断言与并发探针同时红）')
+  {
+    const selfSrc = fs.readFileSync(__filename, 'utf8')
+    // 拼出来而不是写字面量：否则「禁止的固定路径」会把自己所在的这一行判成违规（假红）
+    const fixedPaths = ['reports/.ci-summary-check', 'reports/.ci-summary-overflow'].map(p => p + '.md')
+    fixedPaths.push('reports/.ci-missing-dir' + '/')
+    for (const fixed of fixedPaths) {
+      assert.ok(!selfSrc.includes(fixed),
+        `summary 落点不得退回固定共享路径 \`${fixed}\`：Stryker 一个 run 只建一个沙箱、--concurrency 8 时 ` +
+        '8 个 worker 共用同一份 cwd，固定路径会被并发删读 ⇒ ENOENT 假 Killed')
+    }
+  }
 }
 
 // 3g run_tests.js 的零套件守卫（RT-01）、失败原因诊断（RT-02）与每套件超时（RT-03）回归：该入口全量跑
