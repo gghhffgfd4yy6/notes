@@ -9,9 +9,12 @@
 // v3.276 起 HOOK_FILES 增加 pre-push（test:filter 从 pre-commit 迁来）：用例 8/9 专门锁定
 // 「旧清单（缺 pre-push）必须红」「pre-push 无执行位必须红」——把 pre-push 从清单里去掉，
 // 这两条断言立刻失败（靶向回退已在报告里实测）。
-// v3.276+（Qodo 评审 PR #156）起另加 pre-push 的端到端用例 A–E（见文件末尾）：锁定「门禁必须对
+// v3.276+（Qodo 评审 PR #156）起另加 pre-push 的端到端用例 A–F（见文件末尾）：锁定「门禁必须对
 // **被推提交的内容**跑」——快路径（sha==HEAD 且已跟踪文件干净）/ 隔离 worktree（非当前 HEAD 或工作树脏）
 // / fail-closed（隔离建不起来绝不用工作树冒充）。用例 B 是本次修复的靶向反例：旧实现必红。
+// 用例 F（PR #156 评审返工）锁定「一 sha 一清理」：一次推送两个**不同**的非 HEAD sha 时，两个临时
+// worktree 都必须被清掉——旧实现只清最后一个、第一个泄漏（WT_TMP 是单变量，成功路径不清理），
+// 而钩子照样 exit 0。旧实现下用例 F 必红（靶向回退已实测）。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -589,5 +592,60 @@ function assertNoResidue (fx, label) {
   }
 }
 
+// F) 【靶向本次修复：一 sha 一清理】一次推送两个**不同**的非 HEAD sha（两者门禁内容都是 pass）
+//    → 钩子 exit 0；两个 sha 各建一个隔离 worktree、各跑一次门禁；跑完**两个**都必须被清理。
+//    旧实现：WT_TMP 是单变量，成功路径只重置 GATE_DIR/NODE_PATH 而不清理；第二个 sha 的 mktemp
+//    覆盖 WT_TMP，第一个 sha 的 worktree 从此失去引用（TMPDIR 里留着、`git worktree list` 里也留着），
+//    EXIT trap 只清得到最后一个，而钩子照样打印「✅ pre-push 全部通过」→ 本用例必红。
+//    注意与用例 E 的区别：E 的两个 ref 指向**同一个** sha（去重后只隔离一次），不构成多 sha 场景，
+//    不能替代本条（也正因如此，「一次推多个隔离 sha」的泄漏此前一直隐形）。
+{
+  const fx = makePushFixture({ commitGate: 'pass' })
+  try {
+    // 造两个都不是当前 HEAD 的提交：main（夹具初始提交）→ a → b，再把 HEAD 拨回 main。
+    mustGit(['checkout', '-q', '-b', 'a'], { cwd: fx.work, env: fx.env })
+    fs.writeFileSync(path.join(fx.work, 'a.txt'), 'a\n')
+    mustGit(['add', '-A'], { cwd: fx.work, env: fx.env })
+    mustGit(['commit', '-qm', 'fixture: A'], { cwd: fx.work, env: fx.env })
+    const shaA = headOf(fx, 'a')
+    mustGit(['checkout', '-q', '-b', 'b'], { cwd: fx.work, env: fx.env })
+    fs.writeFileSync(path.join(fx.work, 'b.txt'), 'b\n')
+    mustGit(['add', '-A'], { cwd: fx.work, env: fx.env })
+    mustGit(['commit', '-qm', 'fixture: B'], { cwd: fx.work, env: fx.env })
+    const shaB = headOf(fx, 'b')
+    mustGit(['checkout', '-q', 'main'], { cwd: fx.work, env: fx.env })
+    assert.notStrictEqual(shaA, shaB, 'F：前置条件——两个 sha 必须不同（相同会被去重，构不成多 sha 场景）')
+    assert.notStrictEqual(headOf(fx), shaA, 'F：前置条件——shaA 不能是当前 HEAD（否则走快路径，不建隔离 worktree）')
+    assert.notStrictEqual(headOf(fx), shaB, 'F：前置条件——shaB 不能是当前 HEAD')
+
+    const r = driveHook(fx,
+      refLine('refs/heads/a', shaA, 'refs/heads/a') +
+      refLine('refs/heads/b', shaB, 'refs/heads/b'))
+    assert.strictEqual(r.status, 0, `F（靶向）：两个非 HEAD sha 门禁都通过时钩子应 exit 0：${hookOut(r)}`)
+    assert.strictEqual((hookOut(r).match(/校验被推提交/g) || []).length, 2,
+      'F：两个不同 sha 必须各校验一次（不得被去重）')
+
+    const runs = gateRuns(fx)
+    assert.strictEqual(runs.length, 2, `F：两个 sha 各应在隔离 worktree 里跑一次门禁，实际 ${runs.length} 次`)
+    for (const run of runs) {
+      assert.match(run.cwd, /xbk-prepush-/, 'F：两次门禁都必须在钩子自建的临时 worktree 里跑')
+      assertInFixtureTmp(fx, run.cwd, 'F')
+      assert.strictEqual(run.flag, 'pass', 'F：两次读到的都是各自被推提交的内容')
+    }
+    assert.notStrictEqual(runs[0].cwd, runs[1].cwd, 'F：两个 sha 必须各建自己的隔离 worktree（不是同一个）')
+
+    // 核心断言：两个 sha 都校验完之后，**两个** worktree 都已清理。旧实现只清最后一个。
+    for (const run of runs) {
+      assert.ok(!fs.existsSync(run.cwd),
+        `F：临时 worktree 必须被清理（泄漏：${run.cwd}）——WT_TMP 被下一个 sha 覆盖后 ` +
+        'EXIT trap 再也定位不到它，成功路径必须显式清理（一 sha 一清理）')
+    }
+    // 沿用 assertNoResidue 的判据（git worktree list 只剩 1 条 + TMPDIR 无 xbk-prepush-* 残留）
+    assertNoResidue(fx, 'F')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
 console.log('✅ install-hooks --verify 只读自检：未生效 fail-closed / 生效 exit 0 / 不改配置不改权限；pre-push（v3.276）列入清单且缺失/无执行位均被检出')
-console.log('✅ pre-push 门禁对象回归（PR #156）：快路径只跑一次 / 脏工作树按**被推提交内容**判定（旧实现必红）/ 非当前检出走隔离 worktree 且清理干净 / 隔离建不起来即 fail-closed 不跑工作树 / 去重+删除引用+非推送上下文')
+console.log('✅ pre-push 门禁对象回归（PR #156）：快路径只跑一次 / 脏工作树按**被推提交内容**判定（旧实现必红）/ 非当前检出走隔离 worktree 且清理干净 / 隔离建不起来即 fail-closed 不跑工作树 / 去重+删除引用+非推送上下文 / 一次推多个非 HEAD sha 时每个隔离 worktree 都被清理（旧实现必红）')

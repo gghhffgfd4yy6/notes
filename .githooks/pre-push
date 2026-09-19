@@ -106,12 +106,20 @@ run_gate () {
 # 门禁命令与旧实现逐字相同：同一条命令、同样的退出码语义（迁移 pre-commit → pre-push 时承诺过）。
 gate_cmd=(npm run test:filter)
 
-# 供 EXIT trap 清理的临时 worktree（空 = 没有需要清理的）；root = 调用方仓库的工作树根。
+# 待清理的临时 worktree（单个变量，空 = 没有需要清理的；成功路径显式清理 + EXIT trap 兜失败路径，
+# 分工见 cleanup_isolation 上方注释）；root = 调用方仓库的工作树根。
 WT_TMP=""
 root=""
 
-# 无论成功失败（含 run_gate 的 exit 1）都清理临时 worktree：失败路径同样不能残留——残留会污染
-# 调用方的 `git worktree list`、占用磁盘。remove 失败再 rm -rf，最后 prune 兜底清元数据。
+# 清理临时 worktree：残留会污染调用方的 `git worktree list`、占用磁盘。remove 失败再 rm -rf，
+# 最后 prune 兜底清元数据。本函数永不返回非零（每步都 `|| true`），在 `set -e` 下可安全直接调用。
+#
+# 谁调用它、分工是什么（PR #156 评审返工点）：
+#   ① isolated_gate 的**成功路径**里显式调用一次（见该处注释）——这是「一 sha 一清理」不变量的
+#      执行者，缺了它就会泄漏（下面详细说明）；
+#   ② 下面的 EXIT trap——**只**兜失败路径：run_gate 失败会 `exit 1`（第 3 步的循环因此中断），
+#      建 worktree 失败也会 `exit 1`，这些路径根本走不到成功路径的显式清理，只能靠 trap 收尾。
+# trap 无法替代显式清理：它读的是**当前**的 $WT_TMP，而 WT_TMP 是单个变量。
 cleanup_isolation () {
   if [ -n "$WT_TMP" ]; then
     if [ -d "$WT_TMP" ]; then
@@ -217,6 +225,20 @@ isolated_gate () {
   NODE_PATH="$nm"
   export NODE_PATH
   run_gate "单元测试（被推提交 ${sha:0:8} 的隔离内容）" "，先修复再推送（该门禁自 pre-commit 迁来，覆盖未减少）" "${gate_cmd[@]}"
+
+  # ── 成功路径必须**显式**清理（PR #156 评审：一 sha 一清理）────────────────────────────
+  # run_gate 返回即「这个 sha 的门禁已通过」（失败会 exit 1，走 trap），所以此刻清理不会吞掉任何
+  # 失败信息。为什么不能只靠 EXIT trap：WT_TMP 是**单个**变量，而第 3 步会对本次推送的每个 sha
+  # 各调一次 isolated_gate。一次推送里若有 ≥2 个「各自走隔离路径」的 sha（典型：`git push origin A B`
+  # 且 A、B 都不是当前 HEAD），第二个 sha 的 mktemp 会**覆盖** WT_TMP——第一个 sha 的 detached
+  # worktree 就此失去引用：既不在 TMPDIR 里被删，也留在 `git worktree list` 注册表里。而 trap 用
+  # $WT_TMP 定位目录，退到 EXIT 时它只指向最后一个，于是钩子照样打印「✅ pre-push 全部通过」，
+  # 泄漏已经发生且无人察觉（旧实现正是如此）。
+  # 不变量：**isolated_gate 每次返回之前，它自己创建的临时 worktree 必须已经不存在**——成功走这里，
+  # 失败走 EXIT trap，两条路都收敛到 cleanup_isolation；WT_TMP 同时被置空，下一个 sha 的 mktemp /
+  # `git worktree add` 因此不受上一个 sha 影响（prune 只清「目录已消失」的陈旧元数据，不会误删新 worktree）。
+  cleanup_isolation
+
   GATE_DIR=""
   if [ "$node_path_was_set" -eq 1 ]; then
     NODE_PATH="$node_path_before"
