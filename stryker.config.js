@@ -72,43 +72,78 @@ module.exports = {
   // 值维持 300000ms（300s）：作为加法偏移给多套件 + 插桩场景留足余量，无需下调。
   // 历史：90s → 180s（v3.273 切全量单元入口）→ 300s。
   timeoutMS: 300000,
-  // thresholds：显式写出取值，避免读者误以为「没有该项 = 有门禁」。break=65 是**真门禁**（不再是观察项）。
-  // 判定与退出码路径（已安装的 @stryker-mutator/core@10.0.0 实证）：
-  //   reporters/mutation-test-report-helper.js 的 determineExitCode()——break 为数字且
+  // thresholds：显式写出取值，避免读者误以为「没有该项 = 有门禁」。
+  // break = null（**当前没有分数门禁**，这是诚实的现状，不是「忘了配」）：该值曾取 65，其依据已被实测证伪，
+  //   故撤回（2026-09-19）。下面写清「为什么撤回 / 什么时候可以重新标定 / 撤回后故障信号由谁承担」。
+  //
+  // 为什么撤回（三条独立证据）：
+  //   ① 分数在当前测试噪声下**不可复现**：同配置、同 commit、同段（storage，tap 口径）三轮实测
+  //      79.08% / 82.92% / 71.02%，极差 **11.90pp**；三轮的 noCoverage 均为 34、coveredBy 均为 285/285
+  //      一致 ⇒ 抖动不来自变异覆盖面变化，而来自测试自身（同一批变异体的判死/判活口径本身不稳定）。
+  //      11.9pp 的抖动大于任何「阈值与基线之间的余量」，固定阈值只会随噪声误红/误绿——那不是门禁。
+  //   ② 历史基线本身是虚高的：「六天窗口最低段 message-store 69.38%」以及「取 65 = 最低段之下再留
+  //      4.38 个百分点」这套等式**已证伪，勿再引用**。那些日报分数混入了三种污染：**陈旧增量复用**
+  //      （源码/测试未变时直接复用旧 killed/survived）、**无关套件误杀**、**共享缓存串扰**，并非同轮全量结果。
+  //      去掉污染后的真实全量为 v3-entry **47.81%**、storage **59.30%**——即按 65 判，这些段（很可能还有更多段）
+  //      本就会红；但红的原因是**分数口径不干净**，不是代码退化。故 65 既不是「安全下限」，也不是「真门禁」。
+  //   ③ 严格 `<` + NaN 假绿通道（见下）说明「分数门禁」在缺守卫时是**单向失效**的：既会误红，也会假绿。
+  //
+  // 什么时候可以重新标定（不要现在猜一个数补上去）：先治掉测试抖动（同一 commit、同段、多轮复现同一分数），
+  //   并完成 TAP runner 迁移——command runner 只支持 coverageAnalysis:'off'，会**静默退化**为「每个变异体
+  //   跑整套 32 个套件」；换 TAP runner 才能拿到 perTest 覆盖信息（实测快 34–37×，属下一个 PR）。届时按
+  //   **TAP 口径**重测一轮诚实基线，再据此取 break；在那之前 break 保持 null。
+  //
+  // 判定与退出码路径（已安装的 @stryker-mutator/core@10.0.0 实证；与取值无关，仍然成立）：
+  //   reporters/mutation-test-report-helper.js 的 determineExitCode()——break 为**数字**且
   //   mutationScore < break 时调用 objectUtils.setExitCode(1)（该 helper 只写 process.exitCode = 1，
-  //   stryker 进程随后以 1 退出；判定是**严格小于**，恰好等于阈值放行）。
-  // 判定范围是**按段**的：mutation.yml 每个矩阵 job 各自跑 `npx stryker run --mutate "<段>"`
-  //   （--mutate 见 stryker-cli.js 的 `-m, --mutate`，覆盖本文件的 mutate 数组），而上面那个 metrics
-  //   来自本次运行的报告 files——只含该段被变异的文件 ⇒ 分数低于 65 的是**那一个段的 job**
-  //   （fail-fast: false ⇒ 其余段照跑；artifact 上传与 report job 都是 if: always() ⇒ 日报照发）。
-  // 取值依据（实测日报 gh issue 130/135/139/148/150/153，2026-09-13…09-18 六天）：
-  //   09-18 基线：合计 81.27%（13355 变异体 / 2502 存活），最低段 message-store 69.38%，
-  //   其后 status 70.77%、utils 72.36%、app 75.43%。
-  //   取 65 = 当前最低段之下再留 4.38 个百分点 ⇒ 按 09-18 基线**没有任何一段会误红**。
-  //   这六天里各段分数只随代码/测试变化，没有逐轮抖动：最弱段 message-store 全程 69.10%–69.42%
-  //   （极差 0.32pp），故 65 不会被单次运行的波动打穿。窗口内唯一一次低于 65 的是 status 的**首轮**
-  //   报告 62.14%（09-16：243 变异体 / 149 被杀 / 92 存活，该段当天才进入矩阵）——那是真弱不是抖动，
-  //   次日补测后已到 70.77%。即：本阈值会真红（门禁该有的样子），但红的是真实退化或新段的未覆盖代码。
-  //   不取更低（如 60）的理由：message-store 要再掉 9.1pp 才触发，门禁接近失效；且 60 已是 high/low 里的
-  //   low（配色语义），把 break 与它对齐会让两个语义混为一谈。
-  //   不贴着 69.38 取 69 的理由：该分数的计分口径把超时计入已检出（见上方 timeoutMS），贴边只会误红。
-  // 与日报脚本分数的关系：上述六份日报里每段都满足 total == killed+timeout+survived+noCoverage
-  //   （即没有 RuntimeError/CompileError/Ignored/Pending 变异体）⇒ 实跑中两个口径的分数相等；
-  //   一般情形下日报分数是 stryker 分数的**下界**（日报分母 total 含上述四类，stryker 的 totalValid 不含），
-  //   故按日报基线取的阈值在 stryker 侧只会更安全。
-  // 回退：把 break 改回 null 即取消分数门禁，不涉及任何其它文件。
-  // 与「测试被弱化」的关系（PR #156 返工，Qodo High / Correctness）：本门禁曾有一个真实缺口——
-  //   增量缓存 key 不含测试侧指纹，而 command runner 只支持 coverageAnalysis:'off'、incremental-differ
-  //   在拿不到覆盖信息时直接复用全部旧结果，于是「只删/弱化测试」会带着**按旧测试算出的** killed/survived
-  //   过门禁。该缺口已由 mutation.yml 的「恢复增量缓存」step 关闭：测试侧指纹（scripts/mutation-child.js /
-  //   run_unit_tests.js / test_suites.js / test_suite_registry.js / 全部 test_*.js）同时进 key 与
-  //   restore-keys 前缀（前缀语义决定了测试段必须排在源段之前）⇒ 测试一变就没有旧基线可复用，
-  //   必须全量重跑并按新测试重新计分。
-  //   残余边界（与缓存无关，属任何「分数门禁」的固有性质，勿据此认为门禁无效）：门禁判定的是**分数**，
-  //   若弱化测试后新跑一轮的分数仍 ≥ 65，门禁照样绿——它拦的是「分数真的掉下来」，不是「测试被人改过」。
-  //   另见上方 timeoutMS 注释：(killed + timeout) 把超时计入分子，慢到超时的存活体在分数上算「已检出」，
-  //   故该分数不是严格的漏检率——这也是把阈值放在最低段之下 4.38 个百分点、而不是贴着 69.38 的原因。
-  thresholds: { high: 80, low: 60, break: 65 },
+  //   stryker 进程随后以 1 退出；判定是**严格小于**，恰好等于阈值放行）。break = null 时走 else 分支：
+  //   只记一条 debug 日志，**不因分数置退出码**（stryker 仍会因内部错误/崩溃非 0 退出）。
+  //   NaN 假绿通道（这正是必须补守卫的原因）：metrics 的 mutationScore 在 totalValid === 0 时是 **NaN**
+  //   （mutation-testing-metrics 的 calculateMetrics.js：`const DEFAULT_SCORE = NaN`、
+  //   `mutationScore: totalValid > 0 ? (totalDetected / totalValid) * 100 : DEFAULT_SCORE`，
+  //   其中 totalValid = killed + timeout + survived + noCoverage）。而门禁判据是
+  //   `if (mutationScore < breaking)` ⇒ `NaN < 65 === false` ⇒ **不置退出码 ⇒ job 假绿**。
+  //   触发条件：整段全 RuntimeError、整段全 CompileError、或报告里没有任何有效变异体（空报告）。
+  //   break = null 之后这条通道本身不再能造成假绿（已无分数门禁），但「全 RuntimeError / 空报告」仍是
+  //   必须响的故障信号 ⇒ 由 mutation.yml 的 fail-closed 守卫步骤承担（scripts/mutation-guard.js：
+  //   runtimeErrors > 0 或 totalValid === 0 即 exit 1；报告缺失/不可读同样 exit 1）。将来重新标定 break 时，
+  //   该守卫是分数门禁的**前置条件**，不得移除。
+  //
+  // 判定范围是**按段**的（结构事实，与取值无关）：mutation.yml 每个矩阵 job 各自跑
+  //   `npx stryker run --mutate "<段>"`（--mutate 见 stryker-cli.js 的 `-m, --mutate`，覆盖本文件的
+  //   mutate 数组），而上面那个 metrics 来自本次运行的报告 files——只含该段被变异的文件 ⇒ 将来恢复分数门禁时，
+  //   跌破的也只是**那一个段的 job**（fail-fast: false ⇒ 其余段照跑；artifact 上传与 report job 都是
+  //   if: always() ⇒ 日报照发）。
+  //   high/low（80/60）保留不动：它们只影响 reporter 的配色/日志分级，**不参与退出码**
+  //   （determineExitCode 只读 break），没有「随噪声误红」的问题。
+  //
+  // 与日报脚本分数的关系（口径差异仍然成立）：日报（scripts/mutation-report.js）的分母 total 含
+  //   RuntimeError/CompileError/Ignored/Pending，而 stryker 的 totalValid 不含 ⇒ 一般情形下日报分数是
+  //   stryker 分数的**下界**。注意这只说明两个口径的**相对**关系，不构成「日报基线可信」的理由——上面 ②
+  //   证伪的正是「拿日报基线当阈值依据」这件事。
+  // 另见上方 timeoutMS 注释：(killed + timeout) 把超时计入分子，慢到超时的存活体在分数上算「已检出」，
+  //   故该分数不是严格的漏检率——这是将来重新标定时必须复算的又一个理由（不因 break = null 而消失）。
+  //
+  // 与「测试被弱化」的关系（PR #156 返工 → **本 PR 已回退其缓存侧改动**，必须区分开看）：
+  //   PR #156 曾给增量缓存 key（及 restore-keys 前缀）加测试侧指纹，意图是「测试一变就无旧基线可复用」。
+  //   本 PR **回退了那处改动**（理由见 mutation.yml 的「恢复增量缓存」注释）：它拦不住真根因（假 Killed 来自
+  //   共享缓存的并发串扰，发生在**变异体运行期**、基线全程是绿的），且在真正全量下 app/utils/message-store
+  //   在 --concurrency 8 下仍需 ~7h/~6.5h/~4.5h、必撞「变异测试」step 的 330min，而失败段不保存缓存进度
+  //   ⇒ 那几段永久红。
+  //   因此下面这条缺口**重新敞开，且是有意接受的取舍**：coverageAnalysis:'off' 下 incremental-differ 拿不到
+  //   覆盖信息时会无条件复用全部旧结果（killed/survived 原样照搬）⇒「只删/弱化测试」可能带着按旧测试算出的
+  //   结果继续被复用。之所以接受：**当前没有分数门禁**（break = null）⇒ 复用不构成任何门禁风险，只影响日报数字。
+  //   将来重新标定 break 时**必须同时重新评估这一点**：要么恢复测试侧指纹（并先解决「真全量跑不完」），
+  //   要么等下一个 PR 的 TAP runner 迁移（届时全量只需几分钟，强制全量不再不可负担）。
+  //   另注意（与上面 ② 不是同一件事）：本段说的是「旧结果被复用」，② 说的是「分数口径本身不干净」——
+  //   两者都不能靠 break = null 之外的手段掩盖，本轮的处理是：撤回分数门禁 + 用 fail-closed 守卫兜住报告不可信。
+  //
+  // 与 scripts/mutation-report.js 的分工（保持原样，不得放宽）：分数门禁**不在**日报脚本里——它的 main() 是
+  //   先 validateSegments/validateFreshness 再发 Issue，加分数 throw 会在最需要看分数时把日报一起吞掉；
+  //   它对「缺段/多余段/重复段/陈旧报告」的 throw（完整性真门禁）保持不变。
+  // 回退/恢复路径：本项当前就处于「已回退」状态（break = null）。若要重新启用分数门禁，按上面「什么时候可以
+  //   重新标定」走完测试抖动治理 + TAP 迁移，再用 TAP 口径的诚实基线取值；不涉及其它文件的结构改动。
+  thresholds: { high: 80, low: 60, break: null },
   // reporters：'json' 是报告链的硬依赖，不可随手删——scripts/mutation-report.js 经 scripts/mutation-json.js
   // 读 reports/mutation/mutation.json。本文件刻意不写 jsonReporter.fileName/htmlReporter.fileName，靠
   // Stryker 默认值（reports/mutation/mutation.json、reports/mutation/mutation.html）与 mutation.yml 的 artifact
