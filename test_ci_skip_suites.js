@@ -719,9 +719,18 @@ assert.ok(strykerIdx > 0, 'mutation.yml 应包含 stryker 运行步骤')
 assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHILD:\s*'1'/,
   'mutation.yml 的变异测试 step 必须设 XBK_MUTATION_CHILD=1（否则重复整表 append，几百次即撞 1MiB 上限）')
 
-// 3e PR #156 返工的三条 CI 硬约束：① 缓存 key 与 restore-keys 前缀必须含测试指纹；
-//    ② 剥离步不得再碰 reports/inc-*.json；③ artifact 收窄到 reports/mutation/ 并 fail-loud。
-// 三处都是 Qodo 评审判定为真问题的位置，靠注释兜不住——每条都做成「改回旧形态立刻红」的靶向断言。
+// 3e 变异 job 的三条 CI 硬约束：① 缓存 key/restore-keys 必须是**回退后**的形态（PR #156 的「测试指纹
+//    强制全量」改动已于 2026-09-19 回退，用户拍板）；② 剥离步不得再碰 reports/inc-*.json；
+//    ③ artifact 收窄到 reports/mutation/ 并 fail-loud。
+// 三处都是评审判定为真问题的位置，靠注释兜不住——每条都做成「改回旧形态立刻红」的靶向断言。
+// ① 的方向已反转，理由（为什么回退；旧说法「测试一变就必须全量重跑」已不保留）：
+//    该改动 ⓐ **拦不住真根因**——假 Killed 来自**共享缓存的并发串扰**，发生在**变异体运行期**、基线全程是绿的；
+//    测试没变时测试指纹不变、主 key 依旧命中，故它对真根因完全无效。
+//    ⓑ **跑不完**——真正全量下 app(2651) / utils(2402) / message-store(1692) 在 --concurrency 8 下仍需
+//    ~7h / ~6.5h / ~4.5h，必然撞「变异测试」step 的 330min 被 杀；而 actions/cache 的保存是 post-if: success()
+//    ⇒ **失败段不保存进度** ⇒ 那几段每轮从零开始、永久红。
+//    ⓒ **前提已消失**——stryker.config.js 的 thresholds.break 已改 null（当前**无分数门禁**）⇒ 陈旧增量复用
+//    不再能误导任何门禁，「为保护分数门禁而强制全量」这个理由本身就不成立。这是**有意接受的取舍**，不是遗漏。
 // 断言只读**真实 YAML 行**（剔除注释行）：否则把证据写进注释、代码改回去也能骗过门禁，等于没修。
 {
   const indentOf = line => line.length - line.trimStart().length
@@ -749,37 +758,66 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   }
   const stepEndAfter = (at, nameLen) => stepEndIn(mutationYml, at, nameLen)
 
-  // (1) 「恢复增量缓存」：主 key 与 restore-keys 都必须含测试指纹，且不得再有裸兜底前缀。
-  //     coverageAnalysis:'off' 下 incremental-differ 感知不到测试变化，会拿**旧 killed/survived** 去喂
-  //     stryker.config.js 的 thresholds.break=65 分数门禁 ⇒ 测试指纹不进 key（及 restore-keys 前缀），
-  //     「源码没动、只改/只删测试」就能用旧分数过门禁。actions/cache 的 restore-keys 只有**前缀**语义，
-  //     故测试段还必须排在源段之前；原来那条无条件的裸兜底 stryker-${{ matrix.name }}- 必须删除。
-  const cacheAt = mutationYml.indexOf('- name: 恢复增量缓存')
-  assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（缓存策略无从核对即视为回归）')
-  const cacheEnd = mutationYml.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
-  assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
-  const cacheLines = yamlOnly(mutationYml.slice(cacheAt, cacheEnd))
-  const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
-  assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
-  assert.ok(/-tests-\$\{\{ hashFiles\(/.test(keyLine),
-    '缓存 key 必须含测试指纹段 `-tests-' + '${' + '{ hashFiles(...) }}`：一旦改回不含测试的 `stryker-' + '${' + '{ matrix.name }}-' + '${' + '{ hashFiles(源) }}`，' +
-    '只改/只删测试就会命中旧基线，把旧 killed/survived 的分数喂给 thresholds.break=65 门禁（Qodo High）')
-  assert.ok(/-src-\$\{\{ hashFiles\(/.test(keyLine),
-    '缓存 key 的源指纹段 `-src-' + '${' + '{ hashFiles(...) }}` 不得被删掉（否则源码变化也不再换基线）')
-  const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
-  assert.ok(restoreIdx >= 0, '「恢复增量缓存」必须声明 restore-keys')
-  const restoreIndent = indentOf(cacheLines[restoreIdx])
-  const restoreKeys = []
-  for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
-    if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
-    restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
+  // (1)「恢复增量缓存」：key 与 restore-keys 必须是**回退后**的形态——key 不含测试指纹段、兜底是裸的
+  //     stryker-<段>-（回到 PR #156 之前）。抽成函数是为了让紧随其后的反例在**同一套提取 + 断言代码**上
+  //     跑真实 workflow 的变异副本：把 key 改回含测试指纹的形态 ⇒ 必须立刻红。
+  const assertCacheStep = (ymlText) => {
+    const cacheAt = ymlText.indexOf('- name: 恢复增量缓存')
+    assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（缓存策略无从核对即视为回归）')
+    const cacheEnd = ymlText.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
+    assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
+    const cacheLines = yamlOnly(ymlText.slice(cacheAt, cacheEnd))
+    const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
+    assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
+    // key 必须逐字等于**回退后**的形态：stryker-<段>-<src 指纹>（源指纹固定用 matrix.src：mutate 里的范围
+    // 字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，会得到空指纹、使 range 段缓存永不过期）。
+    const open = '${'
+    assert.strictEqual(keyLine.trim(),
+      'key: stryker-' + open + '{ matrix.name }}-' + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}",
+      '缓存 key 必须是**回退后**的形态 stryker-<段>-<src 指纹>（不含 -tests- 测试指纹段）：PR #156 的' +
+      '「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发串扰，基线全程是绿的）、' +
+      '跑不完（app/utils/message-store 真全量在 --concurrency 8 下仍需 ~7h/~6.5h/~4.5h，必撞 step 330min，' +
+      '而失败段不保存缓存进度 ⇒ 永久红），且当前**无分数门禁** ⇒ 复用不构成门禁风险（有意接受的取舍）')
+    assert.ok(!keyLine.includes('-tests-') && !keyLine.includes('test_*.js'),
+      '缓存 key 不得再含测试指纹（`-tests-` / `test_*.js`）：一旦改回含指纹形态，本条断言立即红')
+    const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
+    assert.ok(restoreIdx >= 0, '「恢复增量缓存」必须声明 restore-keys')
+    const restoreIndent = indentOf(cacheLines[restoreIdx])
+    const restoreKeys = []
+    for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
+      if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
+      restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
+    }
+    assert.deepStrictEqual(restoreKeys, ['stryker-' + '${' + '{ matrix.name }}-'],
+      'restore-keys 必须是**回退后**的裸兜底前缀 `stryker-' + '${' + '{ matrix.name }}-`（回到 PR #156 之前）：' +
+      '旧形态把测试指纹写进兜底前缀（限在同一测试指纹内兜底），随本次回退一并撤销')
   }
-  assert.ok(restoreKeys.length > 0, 'restore-keys 不得为空（增量基线需要兜底）')
-  const badRestore = restoreKeys.filter(k => !/^stryker-\$\{\{ matrix\.name \}\}-tests-\$\{\{ hashFiles\(/.test(k))
-  assert.deepStrictEqual(badRestore, [],
-    '每条 restore-key 都必须以 `stryker-' + '${' + '{ matrix.name }}-tests-' + '${' + '{ hashFiles(...) }}` 开头（限在同一测试指纹内兜底）：' +
-    'actions/cache 的 restore-keys 只有前缀匹配语义，改回裸的 `stryker-' + '${' + '{ matrix.name }}-` 会在主 key 落空后' +
-    '跨「不同测试状态」恢复旧基线，等于没修')
+  assertCacheStep(mutationYml)
+
+  // (1 反例·靶向) 把 key/restore-keys 改回 PR #156 的含测试指纹形态 ⇒ 同一套提取 + 断言必须红。
+  // 这条反例是「断言方向真正反转了」的证据：若只把断言改宽（例如只断言「key 存在」），反例不会红。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-fingerprint-'))
+    try {
+      const fixture = path.join(dir, 'mutation.yml')
+      const open = '${'
+      const fingerprintKey = 'key: stryker-' + open + '{ matrix.name }}-tests-' + open + "{ hashFiles('test_*.js') }}-src-" + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}"
+      const fingerprintRestore = 'stryker-' + open + '{ matrix.name }}-tests-' + open + "{ hashFiles('test_*.js') }}-"
+      const reverted = mutationYml
+        .replace(/^([ \t]*)key: stryker-\$\{\{ matrix\.name \}\}-.*$/m, (m, ind) => ind + fingerprintKey)
+        .replace(/^([ \t]*)stryker-\$\{\{ matrix\.name \}\}-$/m, (m, ind) => ind + fingerprintRestore)
+      assert.notStrictEqual(reverted, mutationYml,
+        '反例夹具必须真的把 key 改成了含测试指纹的形态（没改成本回归形同虚设）')
+      assert.ok(/-tests-/.test(reverted) && reverted !== mutationYml,
+        '夹具中 key 必须带 -tests- 段（否则反例证明的不是「改回指纹形态会红」）')
+      fs.writeFileSync(fixture, reverted)
+      assert.throws(() => assertCacheStep(fs.readFileSync(fixture, 'utf8')),
+        /回退后/,
+        '把缓存 key 改回含测试指纹的形态后必须红：断言锁定的就是「回退后」这一形态')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
 
   // (2) 剥离步不得再把 reports/inc-*.json 塞回去：inc 是**下一次运行** incremental-differ 的复用输入，
   //     statusReason 会被原样透传进新产出的 JSON/HTML；在这里置空串，等于让「被复用的变异体为什么
@@ -840,8 +878,28 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   const noFiles = uploadLines.find(l => /^\s*if-no-files-found:/.test(l))
   assert.ok(noFiles && noFiles.trim() === 'if-no-files-found: error',
     '「上传变异报告」必须带 `if-no-files-found: error`：stryker 崩溃/未产出报告时不得静默上传一个只含 inc 的 artifact')
+
+  // (4) fail-closed 守卫 step 必须存在、带 if: always()、经生产 CLI 调用，且位于 stryker 之后、上传之前。
+  //     撤回分数门禁（thresholds.break = null）后，守卫是唯一的恒常判据：把它删掉/挪到上传之后/改成内联脚本，
+  //     都会让「全 RuntimeError / 空报告 / 报告缺失」重新变成静默假绿——而门禁自身没有门禁，所以在这里锁死。
+  {
+    const guardName = '- name: 变异报告 fail-closed 守卫（' + '${' + '{ matrix.name }}）'
+    const guardAt = mutationYml.indexOf(guardName)
+    assert.ok(guardAt >= 0,
+      'mutation.yml 必须存在「变异报告 fail-closed 守卫」step：它是撤回分数门禁后唯一的恒常判据，被删掉即静默假绿')
+    const guardText = mutationYml.slice(guardAt, stepEndAfter(guardAt, guardName.length))
+    const guardLines = yamlOnly(guardText)
+    assert.ok(guardLines.some(l => /^\s*if:\s*always\(\)/.test(l)),
+      '守卫 step 必须带 `if: always()`：stryker 失败/超时时同样要判一遍（否则最该判的场合反而不判）')
+    assert.ok(guardLines.some(l => l.includes('node scripts/mutation-guard.js')),
+      '守卫必须经生产 CLI `node scripts/mutation-guard.js` 调用，不得内联脚本（内联逻辑会与用例/文档漂移）')
+    assert.ok(/--segment\s+"?\$\{\{\s*matrix\.name\s*\}\}"?/.test(guardText),
+      '守卫必须带 --segment "$' + '{' + '{ matrix.name }}"：失败输出要能直接指出是哪一段')
+    assert.ok(guardAt > strykerIdx && guardAt < uploadAt,
+      '守卫必须位于 stryker step 之后、上传 artifact 之前（stryker 之前无报告可判；上传之后失败已无意义）')
+  }
 }
-console.log('✅ mutation.yml：缓存 key/兜底前缀含测试指纹、剥离不含 inc、artifact 收窄为 reports/mutation/ 且 fail-loud')
+console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（不含测试指纹；靶向反例已锁），剥离不含 inc，artifact 收窄为 reports/mutation/ 且 fail-loud')
 
 // ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────
 // 背景：test_app.js 的 `--only=<子串>` 曾**静默失效**——旧实现用 process.argv.indexOf('--only')

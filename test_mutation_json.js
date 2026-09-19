@@ -8,6 +8,7 @@
 // 超过 V8 字符串上限（0x1fffffe8）——readReportJson 按字节剥离 statusReason 后再解析。
 const assert = require('node:assert')
 const fs = require('node:fs')
+const { spawnSync } = require('node:child_process')
 const os = require('node:os')
 const path = require('node:path')
 
@@ -196,6 +197,194 @@ try {
       pass++
     } finally {
       process.chdir(origCwd)
+    }
+  }
+
+  // ===== fail-closed 守卫（scripts/mutation-guard.js）=====
+  // 背景：stryker 的分数门禁（thresholds.break）在 totalValid === 0 时 mutationScore 为 NaN，而判据是
+  // `NaN < break === false` ⇒ 不置退出码 ⇒ **job 假绿**。本 PR 撤回分数门禁（break 改回 null）后，由
+  // scripts/mutation-guard.js 承担恒常判据：runtimeErrors > 0 / totalValid === 0 / 报告缺失或不可读 /
+  // 报告结构非法 ⇒ exit 1。用例直接调用导出的 run()（注入 io 拿退出码与输出，不真结束进程），
+  // 并另用**子进程**锁住 CLI 接线（require.main === module → process.exitCode）。
+  {
+    const { run, countMutantsByStatus, MUTANT_STATUSES } = require('./scripts/mutation-guard.js')
+    const loc = { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } }
+    const mutant = (id, status) => ({ id, mutatorName: 'EqualityOperator', location: loc, status })
+    const report = (mutants) => ({
+      schemaVersion: '2',
+      thresholds: { high: 80, low: 60, break: null },
+      files: { 'xbk_storage.js': { language: 'javascript', source: 'x', mutants } }
+    })
+    const writeFixture = (name, obj) => {
+      const p = path.join(tmpdir, name)
+      fs.writeFileSync(p, JSON.stringify(obj))
+      return p
+    }
+    // 注入 io：退出码必须由 run() 返回（而不是真结束进程），env 传空对象保证 hermetic
+    // （不读宿主机的 XBK_MUTATION_REPORT_MAX_BYTES）。
+    const guardRun = (argv, env = {}) => {
+      let out = ''
+      let err = ''
+      const code = run(argv, {
+        stdout: { write: s => { out += s } },
+        stderr: { write: s => { err += s } },
+        env
+      })
+      return { code, out, err }
+    }
+
+    // 状态集合必须与 mutation-testing-report-schema 的 MutantStatus enum 同宽（8 个）：
+    // 收窄成 countMutant 计数的 4 个（Killed/Survived/NoCoverage/Timeout）会把正常报告整段拒掉。
+    assert.strictEqual(MUTANT_STATUSES.size, 8, '守卫的状态集合必须覆盖 schema enum 的 8 个状态')
+    for (const s of ['Killed', 'Survived', 'NoCoverage', 'CompileError', 'RuntimeError', 'Timeout', 'Ignored', 'Pending']) {
+      assert.ok(MUTANT_STATUSES.has(s), `守卫状态集合缺少 ${s}`)
+    }
+    // 计数口径直接钉死：runtimeErrors 只数 RuntimeError；totalValid 只含 4 个有效状态，
+    // 不含 CompileError/Ignored/Pending（与 stryker 的 toMetrics 逐字一致）。
+    {
+      const c = countMutantsByStatus(report([
+        mutant('1', 'RuntimeError'), mutant('2', 'CompileError'), mutant('3', 'Ignored'),
+        mutant('4', 'Pending'), mutant('5', 'Killed'), mutant('6', 'Timeout'),
+        mutant('7', 'Survived'), mutant('8', 'NoCoverage')
+      ]))
+      assert.strictEqual(c.runtimeErrors, 1, 'runtimeErrors 只数 RuntimeError（CompileError 另计）')
+      assert.strictEqual(c.compileErrors, 1, 'compileErrors 只数 CompileError')
+      assert.strictEqual(c.totalValid, 4, 'totalValid = killed+timeout+survived+noCoverage（不含 invalid/ignored/pending）')
+      assert.strictEqual(c.total, 8, 'total 计全部 8 个状态')
+      assert.strictEqual(c.totalInvalid, 2, 'totalInvalid = runtimeErrors + compileErrors')
+      console.log('✅ 守卫计数口径：runtimeErrors/compileErrors/totalValid/total 与 stryker toMetrics 一致')
+      pass++
+    }
+    console.log('✅ 守卫状态集合与 MutantStatus enum 同宽（8 个，未收窄成计数的 4 个）')
+    pass++
+
+    // ① 正常报告（killed/survived/timeout/noCoverage 混合）⇒ 绿，且计数口径与 stryker 的 toMetrics 一致
+    const goodPath = writeFixture('guard-good.json', report([
+      mutant('1', 'Killed'), mutant('2', 'Killed'), mutant('3', 'Timeout'),
+      mutant('4', 'Survived'), mutant('5', 'NoCoverage')
+    ]))
+    {
+      const r = guardRun(['--segment', 'storage', goodPath])
+      assert.strictEqual(r.code, 0, `正常报告必须 exit 0：\n${r.out}${r.err}`)
+      assert.ok(r.out.includes('守卫通过'), '正常报告应打印通过信息')
+      assert.strictEqual(r.err, '', `正常报告不应有 stderr 输出，实际：${r.err}`)
+      assert.ok(r.out.includes('killed=2 timeout=1 survived=1 noCoverage=1') && r.out.includes('totalValid=5 total=5'),
+        `计数口径必须与 stryker 的 toMetrics 一致（totalValid = killed+timeout+survived+noCoverage）：\n${r.out}`)
+      console.log('✅ 守卫：正常报告（killed/survived 混合）exit 0，计数口径与 stryker 一致')
+      pass++
+    }
+
+    // ② 全 RuntimeError ⇒ 该红（这是分数门禁看不见的那一类：totalValid > 0 时它照样可能绿）
+    const runtimePath = writeFixture('guard-all-runtime.json', report([
+      mutant('1', 'RuntimeError'), mutant('2', 'RuntimeError'), mutant('3', 'Killed')
+    ]))
+    {
+      const r = guardRun(['--segment', 'storage', runtimePath])
+      assert.strictEqual(r.code, 1, `全 RuntimeError 报告必须 exit 1：\n${r.out}${r.err}`)
+      assert.ok(r.err.includes('[storage]'), '失败输出必须带段名')
+      assert.ok(r.err.includes('runtimeErrors=2'), `失败输出必须给出各状态计数，实际：\n${r.err}`)
+      assert.ok(r.err.includes('RuntimeError'), '失败输出必须点明 RuntimeError')
+      assert.ok(r.err.includes('退出码 1'), '失败输出必须写明退出码')
+      assert.ok(!r.out.includes('守卫通过'), `失败报告不得打成 ✅（自相矛盾），实际 stdout：${r.out}`)
+      // 该段 totalValid = 1（Killed）> 0 ⇒ 只应命中「runtimeErrors > 0」这一条，而不是 NaN 通道
+      assert.ok(!r.err.includes('DEFAULT_SCORE'), '本例 totalValid > 0，不应命中 NaN 通道')
+      console.log('✅ 守卫：全 RuntimeError（含 1 个 Killed ⇒ 分数门禁看不见）exit 1')
+      pass++
+    }
+
+    // ③ 空报告 / totalValid = 0 ⇒ 该红（NaN 假绿通道）
+    {
+      const emptyFiles = writeFixture('guard-empty-files.json', {
+        schemaVersion: '2', thresholds: { high: 80, low: 60, break: null }, files: {}
+      })
+      const zeroValid = writeFixture('guard-zero-valid.json', report([mutant('1', 'CompileError'), mutant('2', 'Ignored')]))
+      for (const [name, p] of [['files 空映射', emptyFiles], ['全 CompileError/Ignored（totalValid=0）', zeroValid]]) {
+        const r = guardRun(['--segment', 'storage', p])
+        assert.strictEqual(r.code, 1, `${name} 必须 exit 1（否则 job 假绿）：\n${r.out}${r.err}`)
+        assert.ok(r.err.includes('totalValid'), `${name} 的失败输出必须给出 totalValid，实际：\n${r.err}`)
+        assert.ok(r.err.includes('NaN'), `${name} 的失败输出必须点明 NaN 假绿通道，实际：\n${r.err}`)
+        assert.ok(r.err.includes('退出码 1'), `${name} 的失败输出必须写明退出码`)
+      }
+      assert.ok(guardRun(['--segment', 'storage', emptyFiles]).err.includes('不含任何变异体'),
+        'files 空映射必须被描述为「不含任何变异体」')
+      assert.ok(guardRun(['--segment', 'storage', zeroValid]).err.includes('无有效变异体'),
+        '有变异体但全无效必须被描述为「无有效变异体」')
+      console.log('✅ 守卫：空报告 / totalValid=0（NaN 假绿通道）exit 1')
+      pass++
+    }
+
+    // ④ 报告缺失 / 不可读 ⇒ 该红（fail-closed），且措辞必须与「worker 未产出报告」的缺段判据区分开
+    {
+      const missing = path.join(tmpdir, 'guard-does-not-exist.json')
+      const r = guardRun(['--segment', 'storage', missing])
+      assert.strictEqual(r.code, 1, '报告缺失必须 exit 1（fail-closed）：\n' + r.out + r.err)
+      assert.ok(r.err.includes('报告缺失或不可读'), `失败输出必须点明「报告缺失或不可读」，实际：\n${r.err}`)
+      assert.ok(r.err.includes('validateSegments'), `措辞必须与「worker 未产出报告」的缺段判据区分（点明缺段由 validateSegments 负责），实际：\n${r.err}`)
+      assert.ok(!r.err.includes('RuntimeError'), '缺失报告不应被误报成 RuntimeError')
+      // 目录入参：证明复用了 mutation-json 的 readGuardedBytes（非普通文件在读入前拒绝），而不是自己 readFileSync
+      const dirR = guardRun(['--segment', 'storage', tmpdir])
+      assert.strictEqual(dirR.code, 1, '目录入参必须 exit 1')
+      assert.ok(dirR.err.includes('不是普通文件'), `必须复用 readGuardedBytes 的非普通文件拒绝，实际：\n${dirR.err}`)
+      console.log('✅ 守卫：报告缺失/不可读 exit 1（fail-closed，措辞与缺段判据区分，复用 readGuardedBytes）')
+      pass++
+    }
+
+    // ⑤ 报告存在但结构非法 ⇒ 该红（算不出来不许当通过）
+    {
+      const noFiles = writeFixture('guard-no-files.json', { schemaVersion: '2' })
+      const badStatus = writeFixture('guard-bad-status.json', report([mutant('1', 'Bogus')]))
+      for (const [name, p] of [['缺 files 映射', noFiles], ['未知 status', badStatus]]) {
+        const r = guardRun(['--segment', 'storage', p])
+        assert.strictEqual(r.code, 1, `${name} 必须 exit 1：\n${r.out}${r.err}`)
+        assert.ok(r.err.includes('结构非法') || r.err.includes('未知 status'), `${name} 必须以结构非法/未知 status 报错，实际：\n${r.err}`)
+      }
+      console.log('✅ 守卫：报告结构非法（缺 files / 未知 status）exit 1')
+      pass++
+    }
+
+    // ⑥ 上限口径必须复用 resolveMaxReportBytes + readReportJson 的预读护栏（不另写一份读取/上限逻辑）
+    {
+      const r = guardRun(['--segment', 'storage', goodPath], { XBK_MUTATION_REPORT_MAX_BYTES: '10' })
+      assert.strictEqual(r.code, 1, '注入极小 XBK_MUTATION_REPORT_MAX_BYTES 后必须 exit 1（证明上限来自 mutation-json）')
+      assert.ok(r.err.includes('超过预读上限'), `必须报出 mutation-json 的预读上限文案，实际：\n${r.err}`)
+      // 巨大 statusReason 必须能被剥离后正常判定（command runner 的真实报告可达 500MB+，raw JSON.parse 会炸）
+      const big = report([mutant('1', 'Killed')])
+      big.files['xbk_storage.js'].mutants[0].statusReason = 'x'.repeat(4 * 1024 * 1024)
+      const bigPath = writeFixture('guard-big-status-reason.json', big)
+      const rb = guardRun(['--segment', 'storage', bigPath])
+      assert.strictEqual(rb.code, 0, `4MB statusReason 必须经 readReportJson 剥离后正常判定：\n${rb.out}${rb.err}`)
+      console.log('✅ 守卫：读取与大小上限复用 mutation-json.js（预读上限生效 + 巨型 statusReason 可剥离）')
+      pass++
+    }
+
+    // ⑦ 参数/多报告语义：无路径、未知参数、缺取值、混合（一绿一红）一律 fail-closed
+    {
+      const cases = [
+        { name: '无报告路径', argv: [], hint: '没有给出任何报告路径' },
+        { name: '未知参数', argv: ['--segmnt', 'storage', goodPath], hint: '未知参数' },
+        { name: '--segment 缺取值', argv: ['--segment'], hint: '缺少取值' }
+      ]
+      for (const c of cases) {
+        const r = guardRun(c.argv)
+        assert.strictEqual(r.code, 1, `${c.name} 必须 exit 1`); assert.ok(r.err.includes(c.hint), `${c.name} 的报错应含「${c.hint}」，实际：${r.err}`)
+      }
+      const mixed = guardRun(['--segment', 'storage', goodPath, runtimePath])
+      assert.strictEqual(mixed.code, 1, '多报告中任一不合格 ⇒ 整体 exit 1')
+      assert.ok(mixed.out.includes('守卫通过'), '合格的那一份仍应打印通过信息（定位用）')
+      console.log('✅ 守卫：无路径/未知参数/缺取值/多报告混合 全部 fail-closed exit 1')
+      pass++
+    }
+
+    // ⑧ CLI 接线（子进程）：require.main === module 分支必须把 run() 的返回值写进 process.exitCode
+    {
+      const guardPath = path.join(__dirname, 'scripts', 'mutation-guard.js')
+      const green = spawnSync(process.execPath, [guardPath, '--segment', 'storage', goodPath], { encoding: 'utf8' })
+      assert.strictEqual(green.status, 0, `守卫 CLI 对正常报告应 exit 0：\n${green.stdout}\n${green.stderr}`)
+      const red = spawnSync(process.execPath, [guardPath, '--segment', 'storage', runtimePath], { encoding: 'utf8' })
+      assert.strictEqual(red.status, 1, `守卫 CLI 对含 RuntimeError 的报告应 exit 1：\n${red.stdout}\n${red.stderr}`)
+      assert.ok(String(red.stderr).includes('退出码 1'), `CLI 失败输出应写明退出码，实际 stderr：${red.stderr}`)
+      console.log('✅ 守卫 CLI 接线：子进程退出码 0/1 正确（run() 返回值 → process.exitCode）')
+      pass++
     }
   }
 } finally {
