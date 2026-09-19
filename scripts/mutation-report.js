@@ -360,8 +360,12 @@ function _renderSegmentTable (results) {
     lines.push(`| ${r.seg} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% |`)
   }
   // 口径与段分一致（超时计入已处理）；无数据报 0 而非 100（机器人审查）
-  // F6：本脚本只汇总，**不设分数门禁**——分数门禁在 stryker 侧（stryker.config.js 的
-  // thresholds.break=65，由每个矩阵 job 各自按段判定，见该文件注释）。这里**有意**不再加一道：
+  // F6：本脚本只汇总，**不设分数门禁**——分数门禁在 stryker 侧（stryker.config.js 的 thresholds，
+  // 由每个矩阵 job 各自按段判定，见该文件注释）。**当前 thresholds.break = null（分数不是门禁）**：
+  // 分数在测试抖动下不可复现（同配置同段三轮 storage 79.08/82.92/71.02%，极差 11.90pp），且历史
+  // 「最低段 69.38%」是含陈旧复用的虚高值、已证伪，故停用；撤回后「全 RuntimeError / 零有效变异体」
+  // 改由 mutation.yml 的 fail-closed 守卫（scripts/mutation-guard.js）承担，**不落回本脚本**。
+  // 这里**有意**不再加一道：
   // main() 是「先 validateSegments/validateFreshness 再 postIssue」，本脚本 throw 会让不达标时连
   // 日报一起吞掉——而那正是最需要看到分数的时刻。故此处只保留完整性/新鲜度两道 throw。
   const overall = tTotal > 0 ? Math.round((((tKilled + tTimeout) / tTotal) * 100) * 100) / 100 : 0
