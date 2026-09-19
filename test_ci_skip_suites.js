@@ -726,7 +726,10 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
 {
   const indentOf = line => line.length - line.trimStart().length
   const yamlOnly = text => text.split('\n').filter(l => !l.trim().startsWith('#'))
-  // 从一个 step 的文本里取出 `run: |` 之后的 shell 正文（缩进深于 run: 的行），注释一律不算证据
+  // 从一个 step 的文本里取出 `run: |` 之后的 shell 正文（缩进深于 run: 的行），注释一律不算证据。
+  // 注释行必须在这里剔除：只按缩进截断的话，把活动命令整行改成 `# node scripts/…` 后正文里仍带着
+  // 命令原文，`includes('node scripts/mutation-report.js --strip')` 会被注释满足——CI 实际不再剥离、
+  // 套件却全绿（本段旧实现正是如此，反例见下方 (2) 的端到端回归）。
   const shellBodyOf = (stepText) => {
     const lines = stepText.split('\n')
     const runAt = lines.findIndex(l => l.trim() === 'run: |')
@@ -735,14 +738,16 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
     const body = []
     for (let i = runAt + 1; i < lines.length; i++) {
       if (lines[i].trim() === '' || indentOf(lines[i]) <= runIndent) break
+      if (lines[i].trim().startsWith('#')) continue // shell 注释不是证据
       body.push(lines[i])
     }
     return body.join('\n')
   }
-  const stepEndAfter = (at, nameLen) => {
-    const next = mutationYml.indexOf('\n      - name: ', at + nameLen)
-    return next > 0 ? next : mutationYml.length
+  const stepEndIn = (text, at, nameLen) => {
+    const next = text.indexOf('\n      - name: ', at + nameLen)
+    return next > 0 ? next : text.length
   }
+  const stepEndAfter = (at, nameLen) => stepEndIn(mutationYml, at, nameLen)
 
   // (1) 「恢复增量缓存」：主 key 与 restore-keys 都必须含测试指纹，且不得再有裸兜底前缀。
   //     coverageAnalysis:'off' 下 incremental-differ 感知不到测试变化，会拿**旧 killed/survived** 去喂
@@ -779,19 +784,46 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   // (2) 剥离步不得再把 reports/inc-*.json 塞回去：inc 是**下一次运行** incremental-differ 的复用输入，
   //     statusReason 会被原样透传进新产出的 JSON/HTML；在这里置空串，等于让「被复用的变异体为什么
   //     存活/报错」永久丢失（与既有「不动 mutation.html」完全同一条理由）。只允许剥机器报告 mutation.json。
-  const stripName = '- name: 剥离报告中的 statusReason（artifact/缓存瘦身）'
-  const stripAt = mutationYml.indexOf(stripName)
-  assert.ok(stripAt >= 0, 'mutation.yml 必须存在「剥离报告中的 statusReason」步骤')
-  const stripStep = mutationYml.slice(stripAt, stepEndAfter(stripAt, stripName.length))
-  const stripScript = shellBodyOf(stripStep)
-  assert.ok(stripScript !== null, '剥离步骤必须以 `run: |` 执行 shell（否则无从核对剥离目标）')
-  assert.ok(stripScript.includes('reports/mutation/mutation.json'),
-    '剥离 shell 必须仍覆盖 `reports/mutation/mutation.json`（该字段的机器报告冗余照旧剥离，消费方语义零变化）')
-  assert.ok(!stripScript.includes('reports/inc-'),
-    '剥离 shell 不得再出现 `reports/inc-*.json`（重新塞回去即红）：inc 是下一次运行的增量复用输入，' +
-    '把 statusReason 置空会让被复用变异体的存活/报错原因永久丢失（Qodo Medium / Observability）')
-  assert.ok(stripScript.includes('node scripts/mutation-report.js --strip'),
-    '剥离必须经生产 CLI（node scripts/mutation-report.js --strip）执行，不得内联脚本')
+  //     抽成按文本取用的函数，是为了让紧随其后的反例在**同一套提取+断言代码**上跑真实 workflow 的变异副本。
+  const assertStripStep = (ymlText) => {
+    const stripName = '- name: 剥离报告中的 statusReason（artifact/缓存瘦身）'
+    const stripAt = ymlText.indexOf(stripName)
+    assert.ok(stripAt >= 0, 'mutation.yml 必须存在「剥离报告中的 statusReason」步骤')
+    const stripStep = ymlText.slice(stripAt, stepEndIn(ymlText, stripAt, stripName.length))
+    const stripScript = shellBodyOf(stripStep)
+    assert.ok(stripScript !== null, '剥离步骤必须以 `run: |` 执行 shell（否则无从核对剥离目标）')
+    assert.ok(stripScript.includes('reports/mutation/mutation.json'),
+      '剥离 shell 必须仍覆盖 `reports/mutation/mutation.json`（该字段的机器报告冗余照旧剥离，消费方语义零变化）')
+    assert.ok(!stripScript.includes('reports/inc-'),
+      '剥离 shell 不得再出现 `reports/inc-*.json`（重新塞回去即红）：inc 是下一次运行的增量复用输入，' +
+      '把 statusReason 置空会让被复用变异体的存活/报错原因永久丢失（Qodo Medium / Observability）')
+    assert.ok(stripScript.includes('node scripts/mutation-report.js --strip'),
+      '剥离必须经生产 CLI（node scripts/mutation-report.js --strip）执行，不得内联脚本')
+  }
+  assertStripStep(mutationYml)
+
+  // (2 反例·端到端) 注释不能当证据：把真实 mutation.yml 里**活动**的剥离命令整行改成 shell 注释
+  //     （注释文本原样保留命令），落成临时文件再读回，仍走上面同一套提取+断言 ⇒ 必须抛
+  //     「剥离必须经生产 CLI」。过滤注释的那一步若被去掉，本反例会变红（断言骗得过门禁）。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-strip-comment-'))
+    try {
+      const fixture = path.join(dir, 'mutation.yml')
+      const commented = mutationYml.replace(/(^[ \t]*)node scripts\/mutation-report\.js --strip/m,
+        '$1# node scripts/mutation-report.js --strip')
+      assert.notStrictEqual(commented, mutationYml,
+        '反例夹具必须真的把活动命令行改成了注释（没改成本回归形同虚设）')
+      assert.ok(/^[ \t]*# node scripts\/mutation-report\.js --strip/m.test(commented) &&
+        !/^[ \t]*node scripts\/mutation-report\.js --strip/m.test(commented),
+      '夹具中该命令应只剩注释形态（否则反例证明的不是「注释骗不过去」）')
+      fs.writeFileSync(fixture, commented)
+      assert.throws(() => assertStripStep(fs.readFileSync(fixture, 'utf8')),
+        /剥离必须经生产 CLI/,
+        '活动命令被改成注释后必须红：注释行不得再满足正向断言（旧实现只按缩进截断，注释里的命令原文照样入选）')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
 
   // (3) 「上传变异报告」的 path 必须收窄为 reports/mutation/ 并 fail-loud：reports/ 会把**未剥离**的
   //     inc-*.json 一起打包（artifact 侧无消费方，纯白带体积），而 stryker 没产出报告时还会静默上传一个
