@@ -12,15 +12,40 @@ const assert = require('assert')
 const slim = require('./xbk_sendNotify_slim.js')
 const { extractTestSummary } = require('./run_mutation.js')
 const path = require('path')
-// 缓存目录（基于 __dirname——v3.113 修复 /workspace 硬编码，仓库可移植）
-const CACHE = path.join(__dirname, 'xianbaoku_cache')
+// 生产默认缓存目录名（在下方隔离覆盖**之前**从生产模块捕获）：契约用例据此断言，
+// 保证「生产把默认目录改掉」仍然会红（不是拿被覆盖后的值自证）。
+const PROD_DEFAULT_CACHE_DIR = Config.cache.dir
+// ============================================================
+// 并发沙箱隔离（PR #156 复审：变异测试「假 Killed」真根因）
+// 背景（已用原始产物实证）：Stryker 一次 run 只建**一个**沙箱，而 mutation.yml 每段
+// --concurrency 2 ⇒ 同一份仓库副本里会**并发**跑两份 test_filter。本套件大量用例对同一份
+// __dirname/xianbaoku_cache 做 rmSync / mkdir / 写同名文件（最典型：「init 在目录不存在时
+// 自动创建」与「save 在目录不存在时自动创建」先 rmSync 整个目录），两个进程互删/互写同一个
+// 目录 ⇒ 💥 ENOTEMPTY, Directory not empty: …/xianbaoku_cache，并把同族「持久化用例」整族
+// 拖红 ⇒ 与该变异体毫不相干的 Killed（假 Killed）。
+// 隔离方式：复用**生产已支持**的分片口径——xbk_message_store.cacheDir 的 fallback 读
+// XBK_PARALLEL_ID → xianbaoku_cache_p<ID>（v3.172，test_app_p.js 同款）。本进程私有、仍以
+// xianbaoku_cache 起头 ⇒ .gitignore(xianbaoku_cache*) / stryker.config.js 的 ignorePatterns /
+// resolveCacheDirInRoot 根内校验口径全部不变，且不改生产代码。
+// 语义不变量：用例要测的正是「目录不存在 → init/save 自动创建」，进程首次运行时该目录必然
+// 不存在（名字含本进程唯一 ID），断言强度不变。
+const TEST_ISOLATION_ID = process.env.XBK_PARALLEL_ID || String(process.pid)
+const CACHE_DIR_NAME = `xianbaoku_cache_p${TEST_ISOLATION_ID}`
+const CACHE = path.join(__dirname, CACHE_DIR_NAME)
+// 自建（非被外部并行调度器分片）时退出前清掉私有目录，避免沙箱内逐进程累积
+const OWNS_CACHE_DIR = !process.env.XBK_PARALLEL_ID
+// 让生产侧落到同一目录：① Config.cache.dir 指向分片目录；② XBK_PARALLEL_ID 也必须设——
+// cache.dir 非法（普通文件/符号链接/根外路径）时生产回退走 fallback 分支，只设 ① 会让那些
+// 「非法配置回退」用例仍写进共享的 xianbaoku_cache（见「cache.dir 指向普通文件」等用例）。
+process.env.XBK_PARALLEL_ID = TEST_ISOLATION_ID
+Config.cache.dir = CACHE_DIR_NAME
 
 // CodeAnt R7 建议：运行前/后清理 test_ 前缀缓存残留（含 .seen.json/.seen.lock 与临时目录），
 // 避免上次异常中断残留影响本次结果；真实运行缓存 push.json 保留
 function cleanupTestCache () {
   try {
     const fs = require('node:fs')
-    const dir = path.join(__dirname, 'xianbaoku_cache')
+    const dir = CACHE // 本进程私有分片目录（隔离前是共享的 xianbaoku_cache：并发时会互删）
     if (fs.existsSync(dir)) {
       for (const f of fs.readdirSync(dir)) {
         if (!f.startsWith('test_')) continue
@@ -3259,6 +3284,29 @@ console.log('========================================\n');
     assertEqual(isMessageInFile({ id: 555 }, 'test_recreate.json'), true)
   })
 
+  // v3.277（PR #156 复审）并发隔离回归：**撤销隔离即真红**——锁的是「假 Killed 真根因」，
+  // 即并发沙箱里多份 test_filter 不得争抢同一份可写目录（上面两个用例正是先 rmSync 整目录的那两个）。
+  await test('并发隔离: 缓存目录按进程唯一，不与他进程共享 xianbaoku_cache', () => {
+    const pathMod = require('path')
+    const shared = pathMod.join(__dirname, 'xianbaoku_cache')
+    assertEqual(CACHE !== shared, true, `缓存目录不得是并发进程共享的 ${shared}（当前 ${CACHE}）`)
+    assertEqual(CACHE.startsWith(shared + '_'), true, '分片目录仍须以 xianbaoku_cache 起头（.gitignore/根内校验口径不变）')
+    assertEqual(CACHE_DIR_NAME.includes(String(TEST_ISOLATION_ID)), true, '分片目录名须含本进程唯一 ID')
+    assertEqual(Config.cache.dir, CACHE_DIR_NAME, 'Config.cache.dir 必须指向本进程私有分片目录')
+    assertEqual(pathMod.dirname(getFilePath('iso_probe.json')), CACHE, 'getFilePath 必须落在私有分片目录内')
+    assertEqual(MessageStore.cacheDir, CACHE, 'MessageStore.cacheDir 必须落在私有分片目录内')
+    // 非法 cache.dir（普通文件 → resolveCacheDirInRoot 拒绝）时生产回退走的也是同一私有目录：
+    // 只设 Config.cache.dir 不够，XBK_PARALLEL_ID 也必须设，否则回退分支仍写共享目录。
+    const orig = Config.cache.dir
+    try {
+      Config.cache.dir = 'package.json'
+      assertEqual(pathMod.dirname(getFilePath('iso_probe_fallback.json')), CACHE, '非法配置回退必须同样落在私有目录')
+      assertEqual(MessageStore.cacheDir, CACHE, '非法配置下 MessageStore.cacheDir 也必须落在私有目录')
+    } finally {
+      Config.cache.dir = orig
+    }
+  })
+
   // ==================== 42. 剩余缺口覆盖 ====================
   console.log('\n📂 42. 剩余缺口覆盖')
 
@@ -4819,7 +4867,7 @@ console.log('========================================\n');
   await test('getFilePath 路径逃逸防护（v3.22审查11）', () => {
     const { getFilePath } = require('./xbk_function_v3.js')
     const pathMod = require('path')
-    const cacheDir = pathMod.join(__dirname, 'xianbaoku_cache') + pathMod.sep
+    const cacheDir = CACHE + pathMod.sep // 生效缓存目录（本进程私有分片；断言强度不变：仍锁「不逃离缓存目录」）
     const p1 = getFilePath('../evil.json')
     assertEqual(p1.startsWith(cacheDir), true, `应留在缓存目录内: ${p1}`)
     const p2 = getFilePath('/etc/passwd')
@@ -6114,7 +6162,7 @@ console.log('========================================\n');
     try {
       // 模拟测试结尾清理逻辑（readdirSync 抛 → catch 吞）
       try {
-        const dir = require('path').join(__dirname, 'xianbaoku_cache')
+        const dir = CACHE // 与 cleanupTestCache 同口径（本进程私有分片，不再碰共享目录）
         if (fs.existsSync(dir)) {
           fs.readdirSync(dir).forEach(() => { /* 清理 */ })
         }
@@ -6187,7 +6235,10 @@ console.log('========================================\n');
     assertEqual(Config.timing.pushInterval, 0)
     assertEqual(Config.timing.finalWait, 0)
     assertEqual(Config.cache.maxSize, 10000)
-    assertEqual(Config.cache.dir, 'xianbaoku_cache')
+    // 生产默认目录：用隔离**之前**捕获的值断言（强度不变——生产把默认目录改掉这里仍会红）；
+    // 同时锁住本套件已把生效目录隔离到进程私有分片（撤销隔离即真红）。
+    assertEqual(PROD_DEFAULT_CACHE_DIR, 'xianbaoku_cache', '生产默认缓存目录必须仍是 xianbaoku_cache')
+    assertEqual(Config.cache.dir, CACHE_DIR_NAME, '生效缓存目录必须已隔离到本进程私有分片目录')
     assertEqual(Config.push.mode, 'parallel')
     assertEqual(Config.push.parallelLimit, 10)
     assertEqual(Config.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json')
@@ -10485,6 +10536,12 @@ console.log('========================================\n');
     assertEqual(whitelistFilter({ title: probe }, 'title', '京东'), true, '函数字段值 String() 源码应参与匹配')
     assertEqual(matchesCompiled(compileRules({ pingbibiaoti: '京东' }).pingbibiaoti, probe, 'cat'), true, 'matchesCompiled 同口径命中')
   })
+
+  // 并发隔离目录是本进程私有产物：退出前整体删除，避免 Stryker 沙箱内逐变异体累积
+  // （沙箱全生命周期只建一个，百级变异体会留下百级目录）。不碰共享的 xianbaoku_cache。
+  if (OWNS_CACHE_DIR) {
+    try { require('fs').rmSync(CACHE, { recursive: true, force: true }) } catch (e) { /* 清理失败不影响退出码 */ }
+  }
 
   process.exit(failed > 0 ? 1 : 0)
 })()
