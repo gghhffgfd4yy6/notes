@@ -19,7 +19,7 @@ permissions:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    # REV-CI：本工作流此前无 timeout-minutes。该 job 要把 21 个段（实测 avg 64MiB、最大 179MiB，
+    # REV-CI：本工作流此前无 timeout-minutes。该 job 要把 19 个段（实测 avg 64MiB、最大 179MiB，
     # 合计 ~1.3GiB）全量下载后再解析，20min 覆盖下载+解析且远低于平台 6h 默认。
     timeout-minutes: 20
     permissions:
