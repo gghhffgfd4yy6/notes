@@ -618,6 +618,33 @@ try {
       '失败路径不得残留临时文件')
   })
 
+  check('fail-closed：无 statusReason 的损坏报告（输入本身不是合法 JSON）同样响亮失败，不得当成「未改写」', () => {
+    const p = path.join(stripTmp, 'corrupt-no-reason.json')
+    // 截断的报告：没有任何字符串型 statusReason ⇒ strippedLength === buf.length，旧实现据此走「无变化」
+    // 快路径直接 return changed:false（不做任何 JSON 校验），CLI 于是 exit 0 并打印「无 statusReason 可剥」，
+    // 把「文件已损坏」谎报成「无须改写」的成功。报告是 validateSegments/validateFreshness 的门禁输入，
+    // 这种静默成功必须变成响亮失败。
+    const truncated = '{"schemaVersion":"1.0","files":{"a.js":{"mutants":['
+    fs.writeFileSync(p, truncated)
+    const before = readAllViaFd(p)
+    assert.throws(
+      () => writeStrippedReport(p),
+      (err) => {
+        assert.ok(/不是合法 JSON（无可剥离内容/.test(err.message),
+          `报错应说明「输入本身不是合法 JSON、无可剥离内容」，不得说「剥离后非法」（其实没剥离），实际：${err.message}`)
+        assert.ok(err.message.includes(p), `报错应携带文件路径便于定位，实际：${err.message}`)
+        assert.ok(err.message.includes(`原始 ${before.size} 字节`), `报错应携带原始尺寸，实际：${err.message}`)
+        return true
+      },
+      '无 statusReason 的损坏报告必须抛错（旧实现返回 changed:false ⇒ 本条真红）'
+    )
+    const after = readAllViaFd(p)
+    assert.deepStrictEqual(after.bytes, before.bytes, '失败路径必须逐字节不改动文件（不得改写损坏报告）')
+    assert.strictEqual(after.mtimeMs, before.mtimeMs, '失败路径不得触碰 mtime（新鲜度闸门判据）')
+    assert.deepStrictEqual(fs.readdirSync(stripTmp).filter(f => f.startsWith('.corrupt-no-reason.json')), [],
+      '失败路径不得残留 .tmp 临时文件')
+  })
+
   check('无 statusReason 时不改写文件也不动 mtime（避免无谓刷新新鲜度判据）', () => {
     const p = path.join(stripTmp, 'no-reason.json')
     const payload = JSON.stringify(stripFixture(undefined)) // 值为 undefined ⇒ JSON.stringify 省略该键

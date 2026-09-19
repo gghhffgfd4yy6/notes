@@ -205,13 +205,15 @@ function readReportJson (reportPath, options = {}) {
  *   * 复用 readGuardedBytes：预读上限（默认 2 GiB / XBK_MUTATION_REPORT_MAX_BYTES）与非普通文件拒绝
  *     与本文件读侧逐字一致，写侧无法绕过；
  *   * 落盘前先把剥离结果 JSON.parse 一遍（剥离后通常只剩几百 KB，代价可忽略），解析不过就**绝不写盘**；
+ *     这条校验对「有变化」与「无变化」两条路径**一视同仁**：无变化只说明没有可剥离的字节，不代表文件
+ *     本身是合法 JSON（见 writeStrippedReport 内联注释）；
  *   * 同目录临时文件 → fsync → renameSync 原子替换：中途失败清理临时文件并抛出，绝不留下半份报告
  *     （报告是 validateSegments / validateFreshness 的门禁输入，静默写出半份比直接失败危险得多）。
  *
  * @param {string} reportPath 待剥离的报告路径
  * @param {{maxStringLength?: number, maxFileBytes?: number}} [options] 仅供测试注入的护栏上限
  * @returns {{path: string, before: number, after: number, saved: number, changed: boolean}}
- * @throws {Error} 非普通文件 / 超过预读上限 / 剥离后 JSON 非法 / 写回或校验失败时抛出
+ * @throws {Error} 非普通文件 / 超过预读上限 / 输入本身不是合法 JSON（无可剥离内容）/ 剥离后 JSON 非法 / 写回或校验失败时抛出
  */
 function writeStrippedReport (reportPath, options = {}) {
   const maxStringLength = Number.isFinite(options && options.maxStringLength) ? options.maxStringLength : MAX_STRING_LENGTH
@@ -233,17 +235,30 @@ function writeStrippedReport (reportPath, options = {}) {
   if (strippedLength > maxStringLength) {
     throw new Error(`JSON 剥离 statusReason 后仍为 ${strippedLength} 字节，超过 V8 字符串上限 ${maxStringLength}：${abs}`)
   }
-  // 无需写回：占位符与原文逐字节等长（`"statusReason":""` 本就 17 字节），故 strippedLength === buf.length
-  // 当且仅当剥离结果与原文逐字相同（替换只会等长或变短）⇒ 既不落盘也不动 mtime（mtime 是新鲜度闸门的判据）。
-  if (strippedLength === buf.length) {
-    return { path: abs, before: buf.length, after: buf.length, saved: 0, changed: false }
-  }
-  const stripped = Buffer.concat(chunks)
-  // fail-closed：解析不过就不落盘——绝不把半份/损坏的报告写进磁盘
+  // 占位符与原文逐字节等长（`"statusReason":""` 本就 17 字节），故 strippedLength === buf.length
+  // 当且仅当剥离结果与原文逐字相同（替换只会等长或变短）⇒ 无变化时不落盘、不动 mtime
+  // （mtime 是新鲜度闸门的判据）。
+  const changed = strippedLength !== buf.length
+  // 无变化时不再 Buffer.concat：剥离结果与原文逐字节相同，直接校验输入 buf 本身即可（省掉一次整份分配）。
+  // 性能：走无变化分支的输入本就「没有可剥离的 statusReason」，而 stryker 报告里 statusReason 实测占
+  // 99.89% 字节 ⇒ 这类文件很小，多出的这次 JSON.parse 代价可忽略——这里省的不是校验，只是一次 concat。
+  const stripped = changed ? Buffer.concat(chunks) : buf
+  // fail-closed：解析不过就不落盘——绝不把半份/损坏的报告写进磁盘。
+  // 无变化路径**同样必须校验**：`strippedLength === buf.length` 只说明「没有可剥离的字节」，并不说明
+  // 文件本身是合法 JSON。损坏/截断的报告（如内容只有 `{`）里没有非空字符串 statusReason，于是
+  // strippedLength === buf.length —— 旧实现据此直接 return changed:false，CLI 打印「无 statusReason 可剥」
+  // 并 exit 0，把「文件已损坏」当成「无须改写」的成功。报告是 validateSegments / validateFreshness 的
+  // 门禁输入，静默放行一个不可解析的输入比直接失败危险得多，故两条路径同一口径：解析不过就抛出。
   try {
     JSON.parse(stripped.toString('utf8'))
   } catch (err) {
-    throw new Error(`剥离 ${abs} 后 JSON 非法，拒绝落盘（原始 ${buf.length} 字节，剥离后 ${stripped.length} 字节）：${err.message}`)
+    // 两条路径文案分开：无变化时并没有「剥离后」的东西，沿用同一句会误导排障方向
+    throw new Error(changed
+      ? `剥离 ${abs} 后 JSON 非法，拒绝落盘（原始 ${buf.length} 字节，剥离后 ${stripped.length} 字节）：${err.message}`
+      : `报告 ${abs} 不是合法 JSON（无可剥离内容，原始 ${buf.length} 字节）：拒绝按「无需改写」放行、不落盘：${err.message}`)
+  }
+  if (!changed) {
+    return { path: abs, before: buf.length, after: buf.length, saved: 0, changed: false }
   }
   // 原子替换：同目录（同一文件系统，rename 才是原子的）+ 隐藏随机名，避免与报告发现逻辑/并发调用撞名
   const tmpPath = path.join(path.dirname(abs), `.${path.basename(abs)}.strip-${process.pid}-${Date.now().toString(36)}.tmp`)
