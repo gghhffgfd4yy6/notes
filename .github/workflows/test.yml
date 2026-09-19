@@ -9,6 +9,23 @@ on:
     - cron: "0 8 * * *"   # 每日冒烟，防环境漂移
   push:
     branches: [main]
+    # REV-CI（EXEC-D T3）：docs-only push 此前同样跑满整条链（实测 ~6.5min × 2 runner，白烧额度）。
+    # 这里只放行「改了它**绝不可能**影响测试结果」的路径：只改这些文件的 push 不触发本工作流。
+    #   · 刻意**不**用 `**/*.md` 一刀切：CHANGELOG.md 是**门禁输入**——check-version.js 的版本一致性
+    #     闸门、test_filter.js 第 101 章、test_tag_validator.js 都读它，忽略它等于给版本闸门开盲区；
+    #   · 也**不**给 pull_request 加 paths-ignore：quality-gate 是 Required Check，PR 上路径过滤会
+    #     让该 check 永远不出现（Expected — Waiting for status to be reported）→ PR 反而卡死。
+    # 新增条目先确认无任何脚本/测试读取它；test_ci_skip_suites.js 把这条口径固定成断言
+    # （任何门禁输入被 paths-ignore 覆盖即红）。
+    paths-ignore:
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'SYSTEM_CONTRACT.md'
+      - '.github/pull_request_template.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.local/**'   # 本机工作树/临时产物（未入库），不参与构建与测试
 
 permissions:
   contents: read
@@ -22,6 +39,11 @@ concurrency:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    # REV-CI：本工作流此前没有任何 timeout-minutes，卡死只能等平台 6h 硬杀并一直占额度。
+    # 依据（gh api …/workflows/test.yml/runs，近 40 次）：push 成功 run 墙钟 6-8min（n=6，avg 6.5），
+    # PR 成功 3-18min（n=25，avg 4.2），最慢一次 18min（run 35302111822）。
+    # quality 是整条链里最重的 job（两档 Node × lint→版本→全量单测），45min ≈ 实测峰值 2.5x。
+    timeout-minutes: 45
     strategy:
       matrix:
         node-version: [22.22.2, 24]   # re2@1.26.1 要求 Node >=22.22.2
@@ -124,7 +146,7 @@ jobs:
         run: npm run test:status
 
       # mutationSkip 套件：被 run_unit_tests.js 跳过，必须在 CI 显式覆盖。
-      # 仅因 Stryker 沙箱插桩会行数膨胀跑不了而标记 mutationSkip，CI 可正常独立运行。
+      # 前两个仅因 Stryker 沙箱插桩会行数膨胀跑不了而标记 mutationSkip，CI 可正常独立运行。
       - name: 变异范围校验测试（test_check_mutation_ranges.js）
         run: npm run test:check-mutation-ranges
 
@@ -132,6 +154,13 @@ jobs:
       # test:mutation-ranges-unit 跑对它的单元测试 test_mutation_ranges.js。
       - name: 变异范围测试（test_mutation_ranges.js）
         run: npm run test:mutation-ranges-unit
+
+      # test_install_hooks.js（PR #156 起 mutationSkip）：它的 pre-push 端到端用例要读仓库的
+      # `.githooks/pre-push` 并真跑 npm + git worktree，而变异沙箱 copyProject 不复制 `.githooks/`
+      # （只复制 scripts/ qinglong/ .github/）⇒ 沙箱内必然 ENOENT；它也不覆盖任何被变异文件。
+      # 代价是它不再进入 run_unit_tests.js，故必须在此显式覆盖（对账由 test_ci_skip_suites.js 固定）。
+      - name: Hooks 自检测试（test_install_hooks.js）
+        run: npm run test:install-hooks
 
       # 单元测试兜底门禁：跑 run_unit_tests.js（覆盖全部未被 SKIP_SUITES 排除的未标记套件），
       # 确保新增测试文件不会因未单独列出而漏网（#100/#101 曾因此红测合入）。
@@ -194,6 +223,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: quality
     if: always()   # quality 失败也要执行，以产出正确的失败结论
+    timeout-minutes: 10   # 纯汇总步骤（needs.quality.result 判定），秒级
     steps:
       - name: 汇总 quality matrix 结果
         # 经 env 注入而非内联进 run（zizmor template-injection）
@@ -213,6 +243,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: quality-gate
     if: github.ref == 'refs/heads/main'
+    timeout-minutes: 45   # 全量 c8（npm run test:coverage，比 quality 的单元矩阵更重），同 quality 口径
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:

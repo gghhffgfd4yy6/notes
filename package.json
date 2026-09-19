@@ -34,12 +34,14 @@
     "test:status": "node test_status.js",
     "test:check-mutation-ranges": "node test_check_mutation_ranges.js",
     "test:mutation-ranges-unit": "node test_mutation_ranges.js",
+    "test:install-hooks": "node test_install_hooks.js",
     "test:mutation": "stryker run",
     "test:mutation-ranges": "node scripts/check-mutation-ranges.js",
     "test:coverage": "c8 --reporter=text --reporter=lcov --reporter=json-summary --exclude='test_*.js' --exclude='run_tests.js' node run_tests.js",
     "check": "npm run lint && node check-version.js && node scripts/check-mutation-ranges.js && npm test",
     "verify": "npm run check",
-    "hooks:install": "node scripts/install-hooks.js"
+    "hooks:install": "node scripts/install-hooks.js",
+    "hooks:verify": "node scripts/install-hooks.js --verify"
   },
   "dependencies": {
     "got": "11.8.6"

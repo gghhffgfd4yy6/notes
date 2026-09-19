@@ -1,0 +1,335 @@
+#!/bin/bash
+# pre-push 钩子：推送前跑单元测试门禁（`npm run test:filter`），并且**只对本次真正要推送的提交**跑。
+#
+# 为什么 test:filter 从 pre-commit 挪到这里（v3.276 钩子分层）：pre-commit 原先四道门禁合计
+# ≈82s（lint 22s + 版本闸门 0.33s + 变异行段 0.47s + test:filter 59s，test:filter 独占 72%）。
+# 82s 的提交前阻塞正是「懒得等、干脆绕过门禁」的温床——门禁一旦被习惯性绕过就等于没有。
+# 迁移**不减少覆盖，只改变拦截时机**：同一条命令、同一套退出码语义、同样的失败回显，
+# 仍然跑在本机、仍然在代码离开本机（推送）之前；pre-commit 只留 3 道快检（≈23s）。
+#
+# 为什么被推对象必须精确对应（Qodo 评审 PR #156 判定的真问题）：
+#   pre-push 的 stdin 给出「这一次要推哪些 ref」，其中的 local sha 才是本次的**被验证对象**。
+#   旧实现把 ref 读完只用于打印，然后无条件对**当前工作树**跑门禁，于是有两类假绿灯：
+#     ① `git push origin 别的分支`：当前工作树停在别的分支/提交上 → 验证的是**另一个提交**（推 A 测 B）；
+#     ② 工作树里有未提交修改：门禁测的是「提交 + 未提交改动」→ 未提交的修复会**掩盖**被推提交里的
+#        失败，绿灯属于工作树，不属于要推出去的提交。
+#   两者都是「看起来跑了、其实没跑」，正是本钩子要消灭的东西。所以：**门禁内容必须与被推提交精确
+#   对应**，做不到就 fail-closed（见下），绝不拿工作树冒充。
+#   判定：local sha == HEAD 且**整棵工作树干净**（未跟踪文件也算脏）→ 此时此刻工作树内容 === 被推提交
+#   内容，可断言，走快路径；否则在临时目录 `git worktree add --detach` 检出**那个 sha 的内容**，
+#   在里面跑同一条门禁。
+#
+# 为什么「干净」必须把**未跟踪文件**也算进来（Qodo 评审 PR #156 返工点②：旧口径的具体假绿灯）：
+#   这条门禁不是只读被推提交里的文件。`test_filter.js` 的可达性用例（约 5885 行）就是
+#   `readdirSync(__dirname).filter(f => /^xbk_.*\.js$/.test(f))`——它把**工作树里所有** `xbk_*.js`
+#   读进来做「内部 helper 被调用次数 ≥2」的断言，**未跟踪的也在内**。于是旧口径
+#   （`git status --porcelain --untracked-files=no`，只要求已跟踪文件干净）给出的
+#   「工作树内容 ≡ 被推提交内容」并不成立，且有可复现的假绿灯：
+#     ① 被推提交把 `_compileCatRe` 改名 → 门禁 rc=1（`_compileCatRe 应被调用(出现0次)`）；
+#     ② 同一份提交内容 + 工作树里放一个**未跟踪**的 `xbk_scratch_backup.js`（含该符号 ≥2 次）
+#        → 门禁回到 rc=0（符号出现次数被未跟踪文件补够，断言放行）。
+#   即「提交 fail / 工作树 pass」：旧实现把它当快路径放行，只打印一条警告承认「这一条『通过』对它
+#   不严格成立」——那条警告正是这个假绿灯的遮羞布，它给出的仍是绿灯的**假证据**（红灯的提交被放行）。
+#   所以判定改用整树口径 `git status --porcelain`（默认**不列**被 .gitignore 忽略的文件，无需额外开关：
+#   `.local/`、`xianbaoku_cache*`、`push_config.local.js`、`reports` 等都在 .gitignore 里，它们本就不参与
+#   门禁扫描），这类情形一律与「已跟踪文件脏」同走隔离路径：门禁在只含**被推提交内容**的临时 worktree
+#   里跑（那里没有工作树里的杂散 `xbk_*.js`），绿灯才真的属于被推提交。**不要**用 `--untracked-files=all`：
+#   那会把被忽略的文件也算成脏，正常开发机上快路径将永远走不到（代价白付）。
+#
+# 隔离路径的成本与失败口径：快路径与旧实现等价（无额外成本，绝大多数推送都走这条）。只有「非当前
+#   HEAD」或「工作树脏（含未跟踪文件）」时才多付一次 `git worktree add` checkout（本仓 ~105 个文件，
+#   秒级）+ 一次门禁（≈60s）；代价换来的是「绿灯真的属于被推提交」。如果隔离路径**建不起来**
+#   （`git worktree add` 失败、临时目录不可用、node/npm/git 不在 PATH 等），一律**非零退出**并说明
+#   原因——绝不允许降级成「拿当前工作树的结果冒充被推提交的验证」：那是把门禁换成安慰剂，比不跑更糟
+#   （它给出绿灯的**假证据**）。
+#
+# 失败回显沿用 pre-commit 的「成功安静、失败原样回显 + 逐门禁计时」风格：test_filter 一次
+# 打印约 460KB，成功路径不刷屏，失败路径逐字可见（stderr 已合并），修复者不必盲跑一次慢命令。
+#
+# stdin：git 经管道传入待推送的 refs 行（<local ref> <local sha> <remote ref> <remote sha>），
+# 每行一条。这里**先把 stdin 读完再执行门禁**：不消费 stdin 会让上游写入端拿到 EPIPE，也让
+# 「这一推推了什么」无从留痕。刻意**不做**「仅当推送涉及某类文件才跑」之类的条件化——那等于
+# 给门禁新增一个可绕过的维度（覆盖被削弱，与本次迁移的前提相悖），同样会制造假绿灯。
+echo "🔍 pre-push 验证中..."
+set -e
+
+# ── 1) 读干 stdin，收集本次要推送的提交 ────────────────────────────────────────
+# 只在 stdin 是管道/重定向时读；手工直接执行钩子时 stdin 是终端，跳过读取以免阻塞。
+ref_lines=0
+push_shas=""
+if [ ! -t 0 ]; then
+  while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
+    if [ -z "$local_ref" ]; then
+      continue
+    fi
+    ref_lines=$((ref_lines + 1))
+    echo "   ↳ 待推送：${local_ref} → ${remote_ref}（${local_sha:0:8}）"
+    # 删除引用：local_sha 全 0（sha1 40 位 / sha256 64 位同一规则）。没有要推出去的提交内容。
+    case "$local_sha" in
+      *[!0]*)
+        ;;
+      *)
+        echo "     ↳ 该 ref 是删除（local sha 全 0）：没有提交内容可校验，跳过"
+        continue
+        ;;
+    esac
+    # 去重：同一次推送里多个 ref 可以指向同一个提交。重复 checkout + 重复跑 60s 门禁没有信息增益。
+    case " $push_shas " in
+      *" $local_sha "*)
+        ;;
+      *)
+        push_shas="$push_shas $local_sha"
+        ;;
+    esac
+  done
+fi
+if [ "$ref_lines" -gt 0 ]; then
+  echo "   已读完 ${ref_lines} 条 ref（stdin 消费干净，git 不会因写端 EPIPE 误判）"
+fi
+
+# run_in_dir <目录> <命令...>：切到 <目录> 执行命令，并清掉 git 钩子导出的 GIT_* 环境变量。
+# 钩子里 git 会设置 GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE（都指向**调用方**仓库），不清掉的话
+# 隔离 worktree 里的任何 git 操作都会被指回调用方仓库。清掉的是钩子环境变量，不改变门禁命令语义。
+run_in_dir () {
+  local dir="$1"
+  shift
+  cd "$dir"
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+  "$@"
+}
+
+# run_gate <标签> <失败提示> <命令...>
+# 与 pre-commit 同款：逐门禁计时（让「谁在花时间」可见）+ 失败必须回显被检查命令的真实输出。
+# 工作目录取 $GATE_DIR（隔离路径指向临时 worktree；空 = 当前工作树）。
+GATE_DIR=""
+run_gate () {
+  local label="$1" hint="$2"
+  shift 2
+  local out rc t0 t1
+  t0=$(date +%s)
+  out=$(run_in_dir "${GATE_DIR:-.}" "$@" 2>&1) && rc=0 || rc=$?
+  t1=$(date +%s)
+  if [ "$rc" -ne 0 ]; then
+    echo "❌ ${label} 未通过（耗时 $((t1 - t0))s，退出码 ${rc}）${hint}"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out"
+    else
+      echo "   （该步骤未产生任何输出——请手动重跑：$*）"
+    fi
+    echo "   ↑ 以上为「$*」的完整输出（stderr 已合并）"
+    exit 1
+  fi
+  echo "✅ ${label} 通过（$((t1 - t0))s）"
+}
+
+# 门禁命令与旧实现逐字相同：同一条命令、同样的退出码语义（迁移 pre-commit → pre-push 时承诺过）。
+gate_cmd=(npm run test:filter)
+
+# 待清理的临时 worktree（单个变量，空 = 没有需要清理的；成功路径显式清理 + EXIT trap 兜失败路径，
+# 分工见 cleanup_isolation 上方注释）；root = 调用方仓库的工作树根。
+WT_TMP=""
+root=""
+
+# 清理临时 worktree：残留会污染调用方的 `git worktree list`、占用磁盘。remove 失败再 rm -rf，
+# 最后 prune 兜底清元数据。本函数永不返回非零（每步都 `|| true`），在 `set -e` 下可安全直接调用。
+#
+# 谁调用它、分工是什么（PR #156 评审返工点）：
+#   ① isolated_gate 的**成功路径**里显式调用一次（见该处注释）——这是「一 sha 一清理」不变量的
+#      执行者，缺了它就会泄漏（下面详细说明）；
+#   ② 下面的 EXIT trap——**只**兜失败路径：run_gate 失败会 `exit 1`（第 3 步的循环因此中断），
+#      建 worktree 失败也会 `exit 1`，这些路径根本走不到成功路径的显式清理，只能靠 trap 收尾。
+# trap 无法替代显式清理：它读的是**当前**的 $WT_TMP，而 WT_TMP 是单个变量。
+cleanup_isolation () {
+  if [ -n "$WT_TMP" ]; then
+    if [ -d "$WT_TMP" ]; then
+      { unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; git -C "$root" worktree remove --force "$WT_TMP" >/dev/null 2>&1; } || true
+      if [ -d "$WT_TMP" ]; then
+        rm -rf "$WT_TMP" || true
+      fi
+    fi
+    { unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; git -C "$root" worktree prune >/dev/null 2>&1; } || true
+    WT_TMP=""
+  fi
+}
+trap 'rc=$?; cleanup_isolation; exit $rc' EXIT
+
+# isolated_gate <sha>：对**被推提交的内容**做隔离校验（临时 detached worktree 里跑同一条门禁）。
+# 任何一步建不起来都 fail-closed（非零退出并说明），绝不退回当前工作树。
+isolated_gate () {
+  local sha="$1" target nm common main_root wt_out wt_rc got
+  local node_path_before="${NODE_PATH-}" node_path_was_set=0
+  if [ -n "${NODE_PATH+x}" ]; then
+    node_path_was_set=1
+  fi
+
+  # 被推对象可能是 tag 对象 sha：先 peel 到 commit（推出去的内容就是该提交的树）。否则
+  # `git worktree add` 会以「不是 commit」失败，把所有 tag 推送挡死——那是误报，不是 fail-closed。
+  target=$(git rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null || true)
+  if [ -z "$target" ]; then
+    echo "❌ 隔离校验失败（fail-closed）：${sha:0:8} 在本仓库里解析不出提交，无法取得它的内容"
+    echo "   ⛔ 不拿当前工作树冒充被推提交的验证。"
+    exit 1
+  fi
+
+  # 隔离路径同样要靠 node/npm 才真的跑了门禁：缺一个就直接 fail-closed，不留「假装跑了」的空间。
+  if ! command -v git >/dev/null 2>&1; then
+    echo "❌ 隔离校验失败（fail-closed）：PATH 里找不到 git"
+    echo "   ⛔ 不拿当前工作树冒充被推提交的验证。"
+    exit 1
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    echo "❌ 隔离校验失败（fail-closed）：PATH 里找不到 node（隔离 worktree 里无法执行门禁）"
+    echo "   ⛔ 不拿当前工作树冒充被推提交的验证。"
+    exit 1
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "❌ 隔离校验失败（fail-closed）：PATH 里找不到 npm（隔离 worktree 里无法执行门禁）"
+    echo "   ⛔ 不拿当前工作树冒充被推提交的验证。"
+    exit 1
+  fi
+
+  WT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/xbk-prepush-XXXXXX") || {
+    echo "❌ 隔离校验失败（fail-closed）：无法在临时目录 ${TMPDIR:-/tmp} 下创建目录"
+    echo "   ⛔ 不拿当前工作树冒充被推提交的验证。"
+    exit 1
+  }
+
+  # 临时 worktree 里没有 node_modules：把 NODE_PATH 指向**主检出的 node_modules**（test_filter.js
+  # 顶层 require 需要 got / fast-check 等）。禁止依赖符号链接把 node_modules 接过去——本机
+  # /storage/emulated 是 fuse 挂载（noexec，ln -s 直接 EACCES），只能用环境变量喂解析路径。
+  nm="$root/node_modules"
+  if [ ! -d "$nm" ]; then
+    # 从 linked worktree 推送时 $root 是那个 worktree（可能没有 node_modules）。主检出位置用
+    # git-common-dir（= 主仓库的 .git）反推，这样 `git worktree` 工作流下也能找到依赖。
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [ -z "$common" ]; then
+      common=$(git rev-parse --git-common-dir 2>/dev/null || true)
+    fi
+    case "$common" in
+      "") ;;
+      /*) ;;
+      *) common="$PWD/$common" ;;
+    esac
+    if [ -n "$common" ]; then
+      main_root=$(dirname "$common")
+      if [ -d "$main_root/node_modules" ]; then
+        nm="$main_root/node_modules"
+      fi
+    fi
+  fi
+  echo "     NODE_PATH=$nm（隔离 worktree 没有 node_modules，依赖从主检出解析）"
+
+  # --detach：不建分支、不动任何 ref（只读校验）。显式清掉钩子导出的 GIT_*（否则子目录里的 git
+  # 操作会被指回调用方仓库），并用 git -C 指定工作目录。
+  wt_rc=0
+  wt_out=$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; git -C "$root" worktree add --detach "$WT_TMP" "$target" 2>&1) || wt_rc=$?
+  if [ "$wt_rc" -ne 0 ]; then
+    echo "❌ 隔离校验失败（fail-closed）：git worktree add --detach 建不起来（退出码 ${wt_rc}）"
+    if [ -n "$wt_out" ]; then
+      printf '%s\n' "$wt_out"
+    fi
+    echo "   ↑ 以上为 git worktree 的完整输出"
+    echo "   ⛔ 绝不用当前工作树的结果冒充被推提交 ${sha:0:8} 的验证——请修复隔离环境（临时目录/磁盘/git worktree）后重推。"
+    exit 1
+  fi
+
+  got=$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; git -C "$WT_TMP" rev-parse HEAD 2>/dev/null || true)
+  if [ "$got" != "$target" ]; then
+    echo "❌ 隔离校验失败（fail-closed）：临时 worktree 的 HEAD 是 ${got:0:8}，不是被推提交 ${target:0:8}"
+    exit 1
+  fi
+  echo "     ✓ 已按被推提交 ${target:0:8} 的内容建好隔离 worktree（校验结束后必删）"
+
+  GATE_DIR="$WT_TMP"
+  NODE_PATH="$nm"
+  export NODE_PATH
+  run_gate "单元测试（被推提交 ${sha:0:8} 的隔离内容）" "，先修复再推送（该门禁自 pre-commit 迁来，覆盖未减少）" "${gate_cmd[@]}"
+
+  # ── 成功路径必须**显式**清理（PR #156 评审：一 sha 一清理）────────────────────────────
+  # run_gate 返回即「这个 sha 的门禁已通过」（失败会 exit 1，走 trap），所以此刻清理不会吞掉任何
+  # 失败信息。为什么不能只靠 EXIT trap：WT_TMP 是**单个**变量，而第 3 步会对本次推送的每个 sha
+  # 各调一次 isolated_gate。一次推送里若有 ≥2 个「各自走隔离路径」的 sha（典型：`git push origin A B`
+  # 且 A、B 都不是当前 HEAD），第二个 sha 的 mktemp 会**覆盖** WT_TMP——第一个 sha 的 detached
+  # worktree 就此失去引用：既不在 TMPDIR 里被删，也留在 `git worktree list` 注册表里。而 trap 用
+  # $WT_TMP 定位目录，退到 EXIT 时它只指向最后一个，于是钩子照样打印「✅ pre-push 全部通过」，
+  # 泄漏已经发生且无人察觉（旧实现正是如此）。
+  # 不变量：**isolated_gate 每次返回之前，它自己创建的临时 worktree 必须已经不存在**——成功走这里，
+  # 失败走 EXIT trap，两条路都收敛到 cleanup_isolation；WT_TMP 同时被置空，下一个 sha 的 mktemp /
+  # `git worktree add` 因此不受上一个 sha 影响（prune 只清「目录已消失」的陈旧元数据，不会误删新 worktree）。
+  cleanup_isolation
+
+  GATE_DIR=""
+  if [ "$node_path_was_set" -eq 1 ]; then
+    NODE_PATH="$node_path_before"
+  else
+    unset NODE_PATH
+  fi
+}
+
+# 当前 HEAD 与调用方工作树根：快路径的成立条件要用它们。
+head_sha=$(git rev-parse HEAD 2>/dev/null || true)
+root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+
+# ── 2) 非推送上下文（stdin 是终端的手工执行，或没有 ref 流）：保持可用，但显式声明证明力 ──────
+# 这条路径不是「推送前验证」，它只能证明当前工作树通过，不证明任何被推提交通过。打印出来，
+# 免得被当成推送门禁的证据。
+if [ "$ref_lines" -eq 0 ]; then
+  if [ -t 0 ]; then
+    echo "ℹ️ 非推送上下文：stdin 是终端（手工执行钩子，没有 ref 流）。"
+  else
+    echo "ℹ️ 非推送上下文：stdin 里没有待推送 ref（没有 ref 流）。"
+  fi
+  echo "   下面只对**当前工作树**跑门禁：它证明当前工作树通过，不证明任何被推提交通过。"
+  if [ -z "$head_sha" ]; then
+    echo "   ⚠️ 还解析不出当前 HEAD（git rev-parse HEAD 失败）：该结论与任何提交都没有对应关系。"
+  else
+    echo "   当前 HEAD：${head_sha:0:8}"
+  fi
+  echo "⏳ 单元测试 test:filter（本机实测约 60s，请稍候）..."
+  run_gate "单元测试" "，先修复再推送（该门禁自 pre-commit 迁来，覆盖未减少）" "${gate_cmd[@]}"
+  echo "✅ pre-push 通过（当前工作树；非推送上下文，未覆盖任何被推提交）"
+  exit 0
+fi
+
+if [ -z "$root" ]; then
+  echo "❌ 解析不出仓库根（git rev-parse --show-toplevel 失败）：无法确定被推提交属于哪个仓库，"
+  echo "   拒绝在未知上下文里跑门禁（fail-closed）。"
+  exit 1
+fi
+
+# 只有删除引用（local sha 全 0）：没有提交内容要校验。这里**不跑门禁**——跑就只能是「拿当前工作树
+# 冒充某个提交」，而这次推送根本没有要推出去的提交内容。显式说明，不给假证据。
+if [ -z "${push_shas# }" ]; then
+  echo "ℹ️ 本次推送只含删除引用：没有提交内容需要校验（门禁无对象可跑，不拿工作树冒充）"
+  exit 0
+fi
+
+# ── 3) 逐个校验被推提交的**内容** ─────────────────────────────────────────────
+for sha in $push_shas; do
+  echo "── 校验被推提交 ${sha:0:8} ──"
+  # 整棵工作树是否干净：默认口径 `git status --porcelain`——**未跟踪文件也算脏**（旧口径
+  # `--untracked-files=no` 正是本条修复的对象，假绿灯机制见文件头注释：门禁会扫描工作树里的
+  # `xbk_*.js`，未跟踪文件能把被推提交的红读成绿）。默认口径不列被 .gitignore 忽略的文件
+  # （`.local/`、`xianbaoku_cache*`、`push_config.local.js`、`reports` 等），不要改成
+  # `--untracked-files=all`——那会把忽略项也算成脏，快路径在正常开发机上永远走不到。
+  worktree_status=$(git status --porcelain 2>/dev/null || true)
+  if [ "$sha" = "$head_sha" ] && [ -z "$worktree_status" ]; then
+    # 快路径：被推对象就是当前 HEAD 且整棵工作树干净（无已跟踪改动、也无未跟踪文件）→
+    # 工作树内容 === 被推提交内容，可以断言。
+    echo "   ✓ 该提交就是当前 HEAD 且整棵工作树干净（未跟踪文件也参与判定）：工作树内容 === 被推提交内容 → 在当前工作树跑门禁（快路径）"
+    GATE_DIR=""
+    echo "⏳ 单元测试 test:filter（本机实测约 60s，请稍候）..."
+    run_gate "单元测试" "，先修复再推送（该门禁自 pre-commit 迁来，覆盖未减少）" "${gate_cmd[@]}"
+  else
+    if [ "$sha" = "$head_sha" ]; then
+      echo "   ⚠️ 当前 HEAD 与被推提交相同，但工作树有未提交内容（已跟踪改动或未跟踪文件）：工作树内容 ≠ 被推提交内容"
+      echo "      （未跟踪文件会参与门禁的目录扫描——它们能把这个提交里的失败读成通过；未提交的修复同理——"
+      echo "       旧实现正是把这两类都当快路径放行，给出假绿灯）"
+    else
+      echo "   ⚠️ 该提交不是当前 HEAD（当前 HEAD ${head_sha:0:8}）：工作树内容属于另一个提交，不能代表它"
+    fi
+    isolated_gate "$sha"
+  fi
+done
+
+echo "✅ pre-push 全部通过（被推提交已逐个按各自内容验证：${push_shas# }）"

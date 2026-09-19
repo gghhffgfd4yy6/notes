@@ -26,11 +26,31 @@ on:
 permissions:
   contents: read
 
+# REV-CI：同一 ref 的 Mutation 运行必须串行——本工作流此前完全没有 concurrency，而 test.yml / codeql.yml
+# 都有；这是矩阵 job（实测 19 段）互相饿死的实际来源。
+# 实测（gh api actions/runs + …/jobs，2026-09-18）：当日 12 次 Mutation 运行里最多 6 次同时 active，
+# 其中 5 次落在同一分支 fix/unresolved-114-batch2（01:19 / 01:28 / 02:53 / 03:00 / 03:09 起），
+# 每次 19 个 job（matrix.include 实测段数）⇒ 峰值约 114 个 job 争抢并发额度。后果在 job 级排队时间上可见：
+# run 35302109509 的 rules / storage / http 三段各自只跑了 1.5 / 1.4 / 1.3 分钟，
+# 却分别排队 64.3 / 64.0 / 63.7 分钟（该 run 墙钟 272 分钟，绝大部分是排队不是计算）。
+# 按 ref 分组即可完全消除本观测到的重叠形态（重叠的 5 次同 ref），且不影响其它路径：
+#   - 主 cron 与分支 dispatch 的 ref 不同 ⇒ 不同组，日报不会被分支任务拖累；
+#   - cancel-in-progress: false 是有意为之——Mutation 单段可跑 3.5h（实测 check-deps 215.2min），
+#     取消在跑任务等于丢弃已完成的变异进度；这里只要「不重叠」，不要「抢最新」。
+#     GitHub 语义下同组内更早的 *pending* 运行会被新运行取代，这正好是我们要的同 ref 去重。
+concurrency:
+  group: mutation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # GitHub schedule 是尽力调度。中午补偿任务查询同日任意触发方式下成功或未完成的运行，
   # 避免重复执行手动/push 触发的变异测试；主 cron、手动和 push 始终运行。
   decide-run:
     runs-on: ubuntu-latest
+    # REV-CI：全仓库此前没有任何 timeout-minutes（grep 命中 0 处），卡死的 job 只能等平台 6h 硬杀，
+    # 期间一直占并发额度。各 job 的取值都按下表实测耗时留 ≥3x 余量（gh api …/jobs 的 started→completed）：
+    #   decide-run 0.0-0.1min、prepare-re2 0.2-0.3min、report 0.5-0.9min、mutation 见该 job 注释。
+    timeout-minutes: 10
     permissions:
       actions: read
     outputs:
@@ -69,6 +89,7 @@ jobs:
     needs: decide-run
     if: needs.decide-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15   # 实测 0.2-0.3min；re2 回退源码构建也在数分钟内
     permissions:
       contents: read
     steps:
@@ -102,6 +123,19 @@ jobs:
     needs: [decide-run, prepare-re2]
     if: needs.decide-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    # REV-CI（PR #156 返工，Qodo Medium / Reliability）：360 分钟 = GitHub 平台的 6 小时硬上限，
+    # 这里只是把它**显式化**——它不是、也不能是「留给上传的窗口」。
+    # 旧写法 350 的注释声称「留 10 分钟给下方 if: always() 的报告上传」，那是错的：job 级
+    # timeout-minutes 会把**同一 job 里后续所有步骤一起杀掉**。Stryker 跑到 350 分钟时，
+    # 「剥离 + 上传 + 清理」三步根本没有机会执行 ⇒ 该段 artifact 永久丢失，而汇总 job 的
+    # validateSegments 会因缺段硬失败（把一次超时放大成整份日报发不出来）。
+    # 正确做法是把时限压在**变异测试那一步**上：step 级超时只杀那一步、job 继续跑，
+    # 下方 if: always() 的步骤仍有窗口（见该 step 的 timeout-minutes: 330）。
+    # 依据（gh api …/jobs 实测单段 started→completed 的最大值，非排队时间）：
+    #   check-deps 215.2min、utils 205.1min、message-store 194.6min、sendnotify-part2 91.7min，
+    #   其余 17 段 1.3-81.3min。step 级 330 高于任何实测段耗时 ⇒ 不会新增误杀；
+    #   而某步真挂死时，job 级 360（平台硬上限）仍是唯一的上界。
+    timeout-minutes: 360
     permissions:
       contents: read
     strategy:
@@ -181,16 +215,32 @@ jobs:
       - name: 恢复增量缓存
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
-          # 主 key 用源码+变异配置内容指纹（可命中）；src 单列（mutate 里的 1-750 段范围字面量不可作
-          # hashFiles 参数——按字面量找不到文件会返回空指纹，导致 range 段的缓存永不过期）。
-          # 注意：key 有意不含 test_*.js —— Stryker 的 command runner 只支持 coverageAnalysis:'off'，
-          # 无法感知「测试变化」（incremental-differ 在无覆盖信息时直接复用全部旧结果），把测试指纹并进 key
-          # 只会多存一份等价缓存、加剧缓存淘汰而不提质。
-          # restore-keys 兜底到该段任意最近缓存，作为增量基线（不是精确恢复）。
+          # PR #156 返工（Qodo High / Correctness）：缓存 key 必须把**测试侧指纹**钉死在前。
+          # 为什么测试指纹必须进 key：Stryker 的 command runner 只支持 coverageAnalysis:'off'，
+          # incremental-differ 在拿不到覆盖信息时会**直接复用全部旧结果**（killed/survived 原样照搬）。
+          # 于是「源码一字未动、只改/只删测试」时旧基线仍命中同一个 key，把**按旧测试算出的分数**喂给
+          # stryker.config.js 的 thresholds.break=65 分数门禁——新测试可能早已杀不死那些变异体，
+          # 门禁却照样绿。此前 key 有意不含测试指纹，正是本次要修的对象。
+          # 为什么测试指纹还必须进 restore-keys **前缀**：actions/cache 的 restore-keys 只有**前缀匹配**
+          # 语义（主 key 未命中时按前缀找最近条目）。若兜底前缀仍是裸的 stryker-<name>-，主 key 变了也
+          # 照样跨「不同测试状态」恢复旧基线 ⇒ 等于没修。
+          # 为什么测试段必须排在源段**之前**：同样是前缀语义——兜底前缀 = key 的前 N 段，把
+          # tests-<指纹>- 放前面、src-<指纹> 放后面，兜底就自然被限在「同一测试指纹、任意源指纹」，
+          # 正是我们要的粒度：测试一变就绝不复用，源码变才允许回退到同测试指纹的最近基线。
+          # 因此**删除**原来那条无条件的裸兜底 stryker-${{ matrix.name }}-：它会让新 key 落空后仍跨测试
+          # 状态恢复旧分数，等于没修。
+          # 测试侧输入（是谁）：stryker.config.js 的 commandRunner.command = 'node scripts/mutation-child.js'，
+          # scripts/mutation-child.js 再 require('../run_unit_tests.js')（并设 XBK_MUTATION_CHILD/SKIP_SUITES/
+          # PERF_MS），run_unit_tests.js 又引 test_suites.js / test_suite_registry.js ⇒ 测试侧入口链就是这
+          # 四个文件，再加上全部 test_*.js（用例正文）。
+          # 源段指纹沿用不变：src 单列（mutate 里的 1-750 段范围字面量不可作 hashFiles 参数——按字面量
+          # 找不到文件会返回空指纹，导致 range 段的缓存永不过期）。
+          # 兼容性（预期行为）：旧缓存条目形如 stryker-<name>-<srcHash>，新 key 带 -tests- 后自然不再命中
+          # ——旧基线是在**未知测试状态**下算出来的，本就不该被当作可信增量基线复用。
           path: reports
-          key: stryker-${{ matrix.name }}-${{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}
+          key: stryker-${{ matrix.name }}-tests-${{ hashFiles('scripts/mutation-child.js', 'run_unit_tests.js', 'test_suites.js', 'test_suite_registry.js', 'test_*.js') }}-src-${{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}
           restore-keys: |
-            stryker-${{ matrix.name }}-
+            stryker-${{ matrix.name }}-tests-${{ hashFiles('scripts/mutation-child.js', 'run_unit_tests.js', 'test_suites.js', 'test_suite_registry.js', 'test_*.js') }}-
 
       # F1：缓存（path: reports）会把上一次运行的 reports/mutation/mutation.json 一并恢复，而 stryker 的
       # json 报告不含任何时间戳（内容上无法与本次产出区分）。若本段 stryker 崩溃/被 6h 取消，这个陈旧报告
@@ -221,7 +271,18 @@ jobs:
         run: |
           node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
 
+      # 分数门禁在本步生效（stryker.config.js 的 thresholds.break=65）：--mutate 只跑本段，
+      # stryker 的 determineExitCode 用的就是本段报告的 mutationScore（按段，不是全量合计），
+      # 低于 65 时 stryker 以 exit 1 退出 ⇒ **本 job 红**。其余段不受影响（fail-fast: false），
+      # 产物上传与 report job 都是 if: always() ⇒ 日报照样发布（这正是把分数门禁放在 stryker 侧
+      # 而不是 report 侧的 report job 里的原因：后者先验证后发 Issue，会把不达标时的日报一起吞掉）。
+      # 为什么是 65 而不是贴着基线最低段（message-store 69.38%）取 69：见 stryker.config.js 的注释。
+      # 为什么时限加在**这一步**而不是靠 job 级的「留 10 分钟」（PR #156 返工）：job 级超时会把同一 job
+      # 后续所有步骤一起杀掉（详见 job 级 timeout-minutes 注释），step 级超时只杀这一步、job 继续跑 ⇒
+      # 下方 if: always() 的「剥离 / 上传 / 清理」仍有 30 分钟窗口。330 高于实测最大段耗时
+      # （check-deps 215.2min）⇒ 正常段落不会被误杀。
       - name: 变异测试（${{ matrix.name }}）
+        timeout-minutes: 330
         run: npx stryker run --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 2
         env:
           PERF_MS: 3000   # 宽松性能阈值（插桩开销）
@@ -231,20 +292,91 @@ jobs:
           # 同时被 run_mutation.js 与 test_run_mutation_cli.js 复用。
           XBK_MUTATION_CHILD: '1'
 
-      # 明细报告留档（inc-*.json + mutation.json/html），artifact 有公开下载 API
+      # F-04（落盘侧，REV-CI）：修掉 statusReason 的「纯废重」膨胀。stryker 的 command runner 把每个
+      # 变异体的整段测试输出写进 statusReason，实测占 mutation-report.json 的 99.89%
+      # （真实 artifact 实测：103,101,102 → 116,206 字节）；而全仓消费方只在**内存**里剥掉它、从不写回，
+      # 于是每份上传 artifact 都白背这份废重。这里在上传**之前**落盘剥离。
+      # 范围与理由（PR #156 返工，Qodo Medium / Observability：只剥机器报告，**不再碰 inc**）：
+      #   * reports/mutation/mutation.json —— 机器报告；剥离后消费方（readReportJson）读到的对象逐字段不变
+      #     （它本来就把该字段置空串），门禁语义零变化；
+      #   * reports/inc-*.json —— --incremental 基线，**本轮起明确不剥离**。它是下一次运行
+      #     incremental-differ 的**复用输入**：statusReason 会被原样透传进新产出的 JSON/HTML，一旦在这里
+      #     置空串，被复用的变异体就永远解释不了自己当初为什么存活/报错——与下方「不动 mutation.html」
+      #     完全同一条理由（那是诊断信息，剥掉等于删掉）。代价如实写明：放弃 inc 的体积收益
+      #     （实测 103,211,154 → 225,895 字节的那部分），换取「复用变异体的 reason 不会永久变空」。
+      #   * 不动 mutation.html —— 那是给人看的明细留档，剥掉它等于删掉「这个变异体为什么存活/报错」这条信息。
+      # 为什么 artifact 可以不含 inc（已核实，非推测）：reports/inc-*.json 在 artifact 侧**没有任何消费方**——
+      #   scripts/mutation-report.js 的 findReportJson/analyzeSegment 与 .github/analyze-artifacts.js 的
+      #   文件名匹配集都只认 mutation.json / mutation-report.json（递归查找这两个名字），report job 的
+      #   download-artifact 用的也是 pattern: mutation-report-*；inc 只被本 job 内 stryker
+      #   --incrementalFile 按路径直接读，从不经 artifact 流转 ⇒ 上传收窄到 reports/mutation/ 零影响。
+      # 为什么在上传之前：artifact 取的就是此刻的磁盘状态（缓存保存是 job 结束后的 post 步骤，也取此刻状态）。
+      # 为什么 if: always()：与「清理缓存回填的旧报告」「上传变异报告」同口径；stryker 失败时本步只会看到
+      #   「无文件」并显式跳过——它**只重写已存在的文件、从不新建**，因此不会把崩溃段伪装成有报告，
+      #   validateSegments 的缺段判据与 validateFreshness 的 mtime 判据都不受影响（剥离只发生在 stryker
+      #   刚刚产出的文件上；缓存回填的报告在本 job 顶部已被 rm -rf 清掉）。
+      # 注：step 名沿用旧名（左侧仍带「缓存」字样）以免与既有对账断言漂移——剥离对 reports/ 缓存的净影响
+      #   本就为零：reports/mutation 会在「清除本次将进入缓存的报告产物」里被整目录 rm -rf，从不进缓存。
+      - name: 剥离报告中的 statusReason（artifact/缓存瘦身）
+        if: always()
+        run: |
+          shopt -s nullglob
+          targets=()
+          for f in reports/mutation/mutation.json; do
+            if [ -f "$f" ]; then targets+=("$f"); fi
+          done
+          if [ ${#targets[@]} -eq 0 ]; then
+            echo "ℹ️  无报告产物可剥离（stryker 未产出报告），跳过"
+            exit 0
+          fi
+          node scripts/mutation-report.js --strip "${targets[@]}"
+
+      # 明细报告留档（reports/mutation/ 下的 mutation.json + mutation.html），artifact 有公开下载 API。
+      # PR #156 返工：path 由 reports/ 收窄为 reports/mutation/，并补 if-no-files-found: error。
+      #   ① 收窄：reports/ 会把**未剥离**的 reports/inc-*.json 一起打包，而 artifact 侧没有任何消费方
+      #      （核实结论见上方剥离步骤注释）⇒ 只是白带体积；
+      #   ② if-no-files-found: error：stryker 没产出报告（崩溃/被取消）时，原本会静默产出一个只含 inc 的
+      #      artifact，把「缺段」拖到汇总 job 才暴露；现在上传自身就响亮变红，故障点前移到段 job。
+      # 缓存（path: reports）不受影响：reports/inc-*.json 仍是未剥离的完整增量基线（这就是保诊断信息的代价）。
+      # 保留期 v3.276 起由 14 天改为 7 天（用户批准）：跨 run 消费者只有 .github/workflows/analyze-artifacts.yml
+      # （按 run-id 下载最近一次「成功」运行的 artifact），该工作流仅由自身变更 push 或手动 dispatch 触发，
+      # 故「连续 7 天无成功变异运行」才会让它失去输入；本 run 内的 report job 同 run 下载，不受影响。
       - name: 上传变异报告
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: mutation-report-${{ matrix.name }}
-          path: reports/
-          retention-days: 14
+          path: reports/mutation/
+          if-no-files-found: error
+          retention-days: 7
+
+      # REV-CI（落地 stryker.config.js 自述的 F-04）：缓存（path: reports）此前会把
+      # reports/mutation/{mutation.json,mutation.html} 一并保存——而这个目录正是本 job 最上方的
+      # 「清理缓存回填的旧报告」每次都要 `rm -rf` 掉的东西：保存 → 恢复 → 删除，纯浪费。
+      # 量化依据（gh api …/actions/caches，2026-09-18）：
+      #   * 仓库缓存共 519 条 / 4860MiB（= 10GiB 配额的 47.5%），其中 stryker-* 481 条占 4234MiB（87%）；
+      #   * 分段条目数 24-28 条/段（sendnotify 两段合计 62 条），同一段的近重复条目在持续堆积；
+      #   * 同目录 artifact 体积实测 avg 64MiB/段、最大 179MiB（mutation-report-app），
+      #     说明 reports/mutation/* 是 reports/ 里的绝对大头（磁盘上无法经 API 拆出 inc-*.json 的占比，
+      #     故此处不宣称具体节省量，只断言「本工作流明确删除的目录不再被缓存」这一事实）。
+      # 为什么放在「上传变异报告」之后：artifact 仍需要 reports/mutation/（report job 靠它汇总），
+      #   而 actions/cache 的保存在**job 全部步骤结束后**的 post 步骤执行 ⇒ 此处删除只影响缓存、不影响 artifact。
+      # 为什么 if: always()：与「清理缓存回填的旧报告」「上传变异报告」同一口径——stryker 失败/超时时，
+      #   缓存更不应该把半成品报告留下来。
+      # 与既有防线的关系：本步只关掉「写侧」，两条既有防线全部保留——
+      #   ① 上方的 `rm -rf reports/mutation`（恢复后立即清，带 if: always()）；
+      #   ② scripts/mutation-report.js 的 validateFreshness（mtime/运行起点）。
+      #   reports/inc-<段>.json（--incremental 的断点续跑基线）**不动**，增量能力不受影响。
+      - name: 清除本次将进入缓存的报告产物（保留增量断点）
+        if: always()
+        run: rm -rf reports/mutation
 
   # 汇总各段变异报告 → 发日报 Issue（每日定时自动汇报，手动触发也发）
   report:
     needs: [decide-run, mutation]
     if: always() && needs.decide-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15   # 实测 0.5-0.9min（下载全部 artifact + 汇总发日报）
     # 发日报 Issue 需要 issues: write（Actions 默认 GITHUB_TOKEN 可能 read-only → 403 失败）
     permissions:
       issues: write

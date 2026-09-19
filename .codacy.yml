@@ -108,7 +108,7 @@
 #
 # test_install_hooks.js 是 scripts/install-hooks.js --verify 的只读自检回归：
 # makeCase()/writeHooks() 在 fs.mkdtempSync(os.tmpdir() + 固定前缀) 下用测试硬编码的钩子名
-# （pre-commit / commit-msg）与 .githooks 常量拼路径，git 一律以**绝对路径**调用（避免经 PATH
+# （pre-commit / commit-msg / pre-push）与 .githooks 常量拼路径，git 一律以**绝对路径**调用（避免经 PATH
 # 解析可执行文件）；待检查的权限位也来自测试常量，无任何外部净输入参与路径构造——
 # 动态路径注入告警属误报（与上方 scripts/install-hooks.js 条目同一口径）。
 #

@@ -8463,46 +8463,103 @@ console.log('========================================\n');
     }
   })
 
-  await test('sanitizeDecodedHtml 伪注释/端标签前缀不得吞掉后续真事件属性（REV-P2 发现 A）', () => {
+  await test('sanitizeDecodedHtml 伪注释/端标签前缀不得吞掉后续真事件属性（REV-P2 发现 A / EXEC-D T11）', () => {
     // 载荷：伪注释（<! / <?）或端标签（</ ，含 `</ ` 与 `</x`）前缀自带一个不成对的引号，
     // 旧状态机把整个前缀当普通起始标签跑属性状态机，于是前缀内的 `'` 被记成「开启了属性值」；
     // 随后 _protectAttrPairs 回扫出 `x='><img src=x onerror=alert(1)>'` 这个伪属性对并整段占位，
     // 段内真实 <img> 的 onerror 未进入 _stripEventAttrs，原样出网（输出与输入逐字节相同）。
-    // 修复：_htmlTagSpans 补上 HTML5 的端标签 / 伪注释状态，二者一律不记 valueQuotes。
     //
-    // 判据刻意**不依赖字符串匹配**（改写成等价但不同字面的畸形标签就能骗过正则）：
-    // 这里用「HTML5 词法判决」做结构性判定——按词法走一遍清洗输出，只有 onerror 确实落在
-    // 某个标签**自身**的属性位上才算存活；引号值内的 onerror 字样不算。
+    // 真实修复机制（xbk_utils._htmlTagSpans）：守卫收窄到 [A-Za-z/] —— `</`+字母 / `<`+字母才进
+    // 属性状态机；`</`+非字母走 HTML5 bogus comment；`<!`、`<?` 前缀**按纯文本跳过**（不进属性
+    // 状态机、不记 valueQuotes、不产生标签区间）。
+    // ★ EXEC-D T11：`!` 前缀**不是**「标记声明 / bogus comment 三态」——那段分支在守卫收窄后
+    //   已不可达（连同 markupDeclaration 态、startsWithCI 一并删除的死代码），历史注释与
+    //   CHANGELOG 的描述与真实行为不符。故本用例只钉**行为**：清洗输出里不得留有活的事件属性，
+    //   无论实现把 `<!` 当文本跳过还是当标记声明消费。
+    //
+    // 判据刻意**不依赖字符串匹配**，也**不复用生产实现的守卫**（复用则改错守卫会连带改错判据，
+    // 判据恒真）——这里是一份独立的 HTML5 词法判据：按规范把输出切成令牌，只有 on* 落在某个
+    // **开始标签自身的属性名位**才算存活；引号值内的 onerror 字样不算。规范里 `<!`/`<?` 走
+    // bogus comment、生产实现按文本跳过，两者是不同代码路径 ⇒ 构成真正的交叉验证。
     const PAYLOADS = [
+      // 四条原载荷（审查 REV-P2 发现 A）
       "</x='><img src=x onerror=alert(1)>'",
       "</ x='><img src=x onerror=alert(1)>'",
       "<! x='><img src=x onerror=alert(1)>'",
-      "<? x='><img src=x onerror=alert(1)>'"
+      "<? x='><img src=x onerror=alert(1)>'",
+      // 扩展同族 5 条（EXEC-D T11 复核：<!x / <?x / <!--x / <![CDATA[x / <!doctype x）
+      "<!x='><img src=x onerror=alert(1)>'",
+      "<?x='><img src=x onerror=alert(1)>'",
+      "<!--x='><img src=x onerror=alert(1)>'",
+      "<![CDATA[x='><img src=x onerror=alert(1)>'",
+      "<!doctype x='><img src=x onerror=alert(1)>'"
     ]
-    // 与 xbk_utils._htmlTagSpans 同源的最简标签词法：返回各标签区间的**段文本**。
-    const tagSpans = (s) => {
-      const spans = []
-      let i = 0
-      while (i < s.length) {
-        if (s[i] !== '<') { i++; continue }
-        const nx = s[i + 1] || ''
-        if (!/[A-Za-z/]/.test(nx)) { i++; continue }
-        let bogus = false
-        if (nx === '/') { bogus = !/[A-Za-z]/.test(s[i + 2] || ''); i += 2 } else if (nx === '!') { bogus = !s.startsWith('<!--', i); i += 2 } else i++
-        const start = i
-        while (i < s.length) {
-          if (bogus) { if (s[i] === '>') { i++; break } i++; continue }
-          if (s[i] === '"') { i++; while (i < s.length && s[i] !== '"') i++; i++; continue }
-          if (s[i] === "'") { i++; while (i < s.length && s[i] !== "'") i++; i++; continue }
-          if (s[i] === '>') { i++; break }
-          i++
-        }
-        spans.push(s.slice(start, i))
-      }
-      return spans
+    // ---- 独立 HTML5 词法判据（按规范状态实现，不引用生产代码） ----
+    const isAlphaCh = (c) => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+    const isSpaceCh = (c) => c === '\t' || c === '\n' || c === '\f' || c === '\r' || c === ' '
+    // 消费到下一个 '>' 之后（bogus comment / doctype / CDATA 的共同动作）
+    const skipToGt = (s, from) => {
+      let j = from
+      while (j < s.length && s[j] !== '>') j++
+      return j + 1
     }
-    // 事件属性判据：onerror 位于标签**自身**的属性位（值引号之外、前面是空白 / '/' / 标签名边界）
-    const hasLiveHandler = (out) => tagSpans(out).some(seg => /(?:^|[\s/])onerror\s*=/i.test(seg))
+    // 返回全部**开始标签**令牌 [{ name, attrs:[属性名] }]：注释/doctype/CDATA/结束标签/文本都不产出
+    const startTags = (s) => {
+      const tags = []
+      const n = s.length
+      let i = 0
+      while (i < n) {
+        if (s[i] !== '<') { i++; continue }
+        const c = s[i + 1]
+        if (c === undefined) { i++; continue }
+        if (c === '!') { // markup declaration open
+          if (s.startsWith('<!--', i)) {
+            const e = s.indexOf('-->', i + 4)
+            i = e === -1 ? n : e + 3
+          } else if (s.slice(i, i + 9).toLowerCase() === '<!doctype') {
+            i = skipToGt(s, i + 2)
+          } else if (s.startsWith('<![CDATA[', i)) {
+            i = skipToGt(s, i + 9)
+          } else {
+            i = skipToGt(s, i + 2)
+          }
+          continue
+        }
+        if (c === '?' || c === '/') { // '?' → bogus comment；'/' 非字母 → bogus comment（字母是结束标签）
+          i = skipToGt(s, i + 2)
+          continue
+        }
+        if (!isAlphaCh(c)) { i++; continue } // data 态 '<' + 非标签名字符：只是文本，重新消费
+        i++ // tag name state
+        let name = ''
+        while (i < n && !isSpaceCh(s[i]) && s[i] !== '/' && s[i] !== '>') { name += s[i]; i++ }
+        const attrs = []
+        for (;;) {
+          while (i < n && (isSpaceCh(s[i]) || s[i] === '/')) i++
+          if (i >= n) break
+          if (s[i] === '>') { i++; break }
+          let an = ''
+          while (i < n && !isSpaceCh(s[i]) && s[i] !== '/' && s[i] !== '>' && s[i] !== '=') { an += s[i]; i++ }
+          while (i < n && isSpaceCh(s[i])) i++
+          if (i < n && s[i] === '=') {
+            i++
+            while (i < n && isSpaceCh(s[i])) i++
+            if (i < n && (s[i] === '"' || s[i] === "'")) {
+              const q = s[i]; i++
+              while (i < n && s[i] !== q) i++
+              i++
+            } else {
+              while (i < n && !isSpaceCh(s[i]) && s[i] !== '>') i++
+            }
+          }
+          if (an !== '') attrs.push(an.toLowerCase())
+        }
+        tags.push({ name: name.toLowerCase(), attrs })
+      }
+      return tags
+    }
+    // 事件属性判据：on* 必须落在开始标签**自身的属性名位**（引号值内的字样不算）
+    const hasLiveHandler = (out) => startTags(out).some(t => t.attrs.some(a => /^on[a-z]+$/.test(a)))
     for (const p of PAYLOADS) {
       const out = sanitizeDecodedHtml(p)
       assertEqual(out === p, false, `清洗器不得对该载荷恒等（${JSON.stringify(p)}）`)
@@ -8511,6 +8568,8 @@ console.log('========================================\n');
     // 判据有效性对照（防「判据恒真 / 恒假」）：
     assertEqual(hasLiveHandler('<img src=x onerror=alert(1)>'), true, '真事件属性必须被判为存活（判据有效性对照）')
     assertEqual(hasLiveHandler('<img alt="onerror=x">'), false, '引号值内的 onerror 字样不是事件属性')
+    assertEqual(hasLiveHandler('<!-- <img src=x onerror=alert(1)> -->'), false, '注释内的 onerror 不是活事件属性（词法判据不产开始标签）')
+    assertEqual(hasLiveHandler('<i onclick="x">y</i>'), true, 'onclick 同样必须被判为存活')
     assertEqual(sanitizeDecodedHtml('<img alt="onerror=x">'), '<img alt="onerror=x">', '良性属性值不得被改动')
   })
 

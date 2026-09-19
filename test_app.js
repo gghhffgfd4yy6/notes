@@ -104,13 +104,28 @@ const CACHE_DIR = path.join(__dirname, DEFAULT_CACHE_DIR)
 
 // ---------- 工具 ----------
 let passed = 0; let failed = 0
+// v3.276（EXEC-D T10）：跳过数与实跑数单独计数——只靠 passed 无法区分「真跑了」与「被过滤跳过」
+// （跳过同样计入 passed，故 passed 恒等于用例总数），门禁就写不出「过滤确实生效」的可证伪断言。
+let skipped = 0; let executed = 0
 const errors = []
 
 // v3.122：支持 --only=子串（并行调度用：只跑匹配测试，其余跳过不计失败）
+// v3.276（EXEC-D T10）：同时支持 `--only=<子串>` 与 `--only <子串>` 两种写法。
+// 旧实现用 process.argv.indexOf('--only') 定位，`=` 写法下没有独立的 '--only' 元素 → 返回 -1 →
+// 过滤静默失效、照跑全部用例（实测：`--only=FX3` 仍在跑全量，被 timeout 掐断）。
+// 危害被放大在「最需要快速定位的时刻」：test_app_p.js 并行失败时打印的定位提示正是
+// `--only=<测试名子串>`，用户照做却触发全量重跑。
 // 支持环境变量 QUICK=1（快测模式：pushInterval/finalWait 置 0，加速非 timing 测试）
 const onlyFilter = (() => {
-  const idx = process.argv.indexOf('--only')
-  return idx >= 0 ? process.argv[idx + 1] : null
+  const argv = process.argv
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i].startsWith('--only=')) {
+      // 空值（--only=）与旧实现 `--only ''` 同口径：视为未指定过滤，不得静默变成「匹配一切」
+      return argv[i].slice('--only='.length) || null
+    }
+    if (argv[i] === '--only') return argv[i + 1] ?? null
+  }
+  return null
 })()
 // v3.172：并行调度精确名单——--list-file=<json数组文件>，只跑名单内的测试（与 --only 子串互补，
 // 避免 --only 子串重叠/漏跑；worker 由 test_app_p.js 分片生成）
@@ -127,8 +142,9 @@ if (process.env.QUICK === '1') {
 }
 
 async function test (name, fn) {
-  if (onlyFilter && !name.includes(onlyFilter)) { passed++; return } // 跳过（并行调度用）
-  if (nameSet && !nameSet.has(name)) { passed++; return } // v3.172：名单外跳过（并行分片）
+  if (onlyFilter && !name.includes(onlyFilter)) { skipped++; passed++; return } // 跳过（并行调度用）
+  if (nameSet && !nameSet.has(name)) { skipped++; passed++; return } // v3.172：名单外跳过（并行分片）
+  executed++ // v3.276（EXEC-D T10）：真正进入 fn() 的用例数（passed 含跳过，无法反映过滤是否生效）
   const t0 = Date.now() // v3.122：耗时统计（识别慢测试供并行调度）
   try {
     await fn()
@@ -3890,10 +3906,16 @@ console.log('========================================\n');
     assert(aborted > 0, 'finally 应取消预热（warmupCancelled/abort 执行）')
   })
 
+  // v3.276（EXEC-D T10）：过滤是否生效必须可观测。跳过同样计入 passed，故 passed 恒等于用例总数——
+  // 过滤静默失效（--only 解析不到）时输出与「正常全量跑」完全同形，门禁无从察觉。
+  // 打印「实际执行 N 例，过滤跳过 M 例」把这一点变成可断言的事实；无过滤时保持原输出不变。
+  const filterNote = (onlyFilter || nameSet)
+    ? `（实际执行 ${executed} 例，过滤跳过 ${skipped} 例${onlyFilter ? `，--only=${onlyFilter}` : ''}）`
+    : ''
   if (failed === 0) {
-    console.log(`  🎉 集成测试全部通过！${passed}/${passed}`)
+    console.log(`  🎉 集成测试全部通过！${passed}/${passed}${filterNote}`)
   } else {
-    console.log(`  ⚠️   ${passed} 通过, ${failed} 失败`)
+    console.log(`  ⚠️   ${passed} 通过, ${failed} 失败${filterNote}`)
     errors.forEach(e => console.log(`    ${e}`))
   }
   console.log('========================================\n')

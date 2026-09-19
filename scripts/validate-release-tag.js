@@ -2,7 +2,7 @@
 // Release tag 版本号格式校验（严格 semver 的**超集**，非子集；放宽项见下方「偏差登记」）。
 // 从 .github/workflows/release.yml 的「校验 tag 版本号格式（semver）」步骤里抽出为可复用模块：
 //   - workflow 的 bash 内联正则与本文件保持逐字一致（不强制改 release.yml，release.yml 保留自持的内联副本；
-//     一致性由 test_tag_validator.js 逐字断言，本模块当前**唯一调用点**就是该测试，pre-commit 不执行本文件：
+//     一致性由 test_tag_validator.js 逐字断言，本模块当前**唯一调用点**就是该测试，pre-commit/pre-push 均不执行本文件（pre-commit 只跑 lint/版本闸门/变异行段校验，pre-push 只跑 test:filter）：
 //     这里的「同一套判断」是防语义漂移的约束，尚不构成生产调用链）
 //   - 供 test_tag_validator.js 直接 require 断言合法/非法 tag 集合
 // 仓库版本格式：CHANGELOG 为 v3.272（两段）、package.json 为 3.272.0（三段），两种形式均接受；
@@ -50,7 +50,7 @@ function isValidVersion (version) {
 // CLI 用法：node scripts/validate-release-tag.js <tag>  校验单个 tag（含 v 前缀则去掉）。
 // exit 0 = 合法；1 = 非法；2 = 未提供 tag（用法错误，见下）。
 // 当前**无生产调用点**：release.yml 保留自持的内联副本（与本文件逐字一致由 test_tag_validator.js 断言），
-// pre-commit 只跑 lint/版本闸门/test:filter、不执行本文件。
+// pre-commit 只跑 lint/版本闸门/变异行段校验、pre-push 只跑 test:filter，两者都不执行本文件。
 // CLI 分支本身**有**自动化覆盖：test_tag_validator.js 的「CLI 文案/退出码回归」段以子进程直接跑本文件，
 // 断言 exit 0/1/2 与两处文案逐字回显入参原文（不带 v 的裸版本号不得被补成 v），改这里前先看该段。
 if (require.main === module) {

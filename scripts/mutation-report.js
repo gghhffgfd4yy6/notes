@@ -6,7 +6,7 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
-const { readReportJson, resolveMaxReportBytes } = require('./mutation-json.js')
+const { readReportJson, writeStrippedReport, resolveMaxReportBytes } = require('./mutation-json.js')
 
 // 必须与 mutation.yml 的矩阵名称保持一致；缺段时禁止把部分结果伪装成完整日报。
 const EXPECTED_SEGMENTS = Object.freeze([
@@ -360,8 +360,10 @@ function _renderSegmentTable (results) {
     lines.push(`| ${r.seg} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% |`)
   }
   // 口径与段分一致（超时计入已处理）；无数据报 0 而非 100（机器人审查）
-  // F6：本脚本刻意只汇总、不设分数/存活门禁——门禁口径见 stryker.config.js 的 thresholds 注释
-  // （break 保持 null ＝ 本地观察项）；改为真门禁需先按真实基线取 break 值，属产品决策。
+  // F6：本脚本只汇总，**不设分数门禁**——分数门禁在 stryker 侧（stryker.config.js 的
+  // thresholds.break=65，由每个矩阵 job 各自按段判定，见该文件注释）。这里**有意**不再加一道：
+  // main() 是「先 validateSegments/validateFreshness 再 postIssue」，本脚本 throw 会让不达标时连
+  // 日报一起吞掉——而那正是最需要看到分数的时刻。故此处只保留完整性/新鲜度两道 throw。
   const overall = tTotal > 0 ? Math.round((((tKilled + tTimeout) / tTotal) * 100) * 100) / 100 : 0
   lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | | **${overall}%** |`)
   return lines
@@ -492,8 +494,55 @@ function shanghaiDate (now = new Date()) {
   }).format(now)
 }
 
+/**
+ * 剥离落盘报告里的 statusReason（artifact / 增量缓存瘦身）。
+ *
+ * 用法：`node scripts/mutation-report.js --strip <file...>`
+ * 与汇总模式完全独立：只重写**已存在**的文件，不发现目录、不解析汇总、不发 Issue、不改门禁。
+ * 只重写已存在的文件这一点是刻意的——它不会把「崩溃段根本没有报告」伪装成「有报告」，
+ * 因此 validateSegments（缺段拒绝）与 validateFreshness（mtime 判据）的语义都不受影响。
+ *
+ * 失败口径 fail-closed：任一文件失败（不存在/非普通文件/超过预读上限/剥离后 JSON 非法/写回失败）
+ * 都进 stderr 并 exit 1，绝不静默跳过——artifact 会不会瘦身是性能问题，但「以为剥了其实没剥」是门禁问题。
+ *
+ * @param {string[]} files 目标文件（由调用方筛掉不存在的路径，例如 CI 里的 nullglob + [ -f ]）
+ */
+function stripReportFiles (files) {
+  const maxFileBytes = resolveMaxReportBytes(process.env.XBK_MUTATION_REPORT_MAX_BYTES)
+  const failed = []
+  let saved = 0
+  for (const f of files) {
+    try {
+      const r = writeStrippedReport(f, { maxFileBytes })
+      saved += r.saved
+      console.log(r.changed
+        ? `🧹 ${r.path}：${r.before} → ${r.after} 字节（省 ${r.saved}，${(100 * r.saved / r.before).toFixed(2)}%）`
+        : `✅ ${r.path}：无 statusReason 可剥（${r.before} 字节，未改写、mtime 未动）`)
+    } catch (e) {
+      failed.push(`${f}（${String((e && e.message) || e)}）`)
+    }
+  }
+  if (failed.length > 0) {
+    console.error(`❌ 剥离失败 ${failed.length} 个文件：${failed.join('；')}`)
+    process.exit(1)
+  }
+  console.log(`✅ 已处理 ${files.length} 个文件，共省 ${saved} 字节`)
+}
+
 async function main () {
-  const dir = process.argv[2]
+  const args = process.argv.slice(2)
+  // 落盘剥离模式：必须在读 <reports-dir> 之前分流（否则 --strip 会被当成目录名走汇总路径）
+  const stripIdx = args.indexOf('--strip')
+  if (stripIdx !== -1) {
+    const files = args.filter(a => a !== '--strip')
+    if (files.length === 0) {
+      console.error('用法: node scripts/mutation-report.js --strip <file...>')
+      process.exit(1)
+    }
+    stripReportFiles(files)
+    return
+  }
+  const dir = args[0]
   if (!dir) {
     console.error('用法: node scripts/mutation-report.js <reports-dir> [--issue]')
     process.exit(1)

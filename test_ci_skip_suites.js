@@ -4,6 +4,8 @@
 // 背景：test.yml 的 SKIP_SUITES 与「显式步骤」是两份必须手工同步的清单——
 //   漏写 = 重复跑（浪费），多写 = 漏跑（门禁盲区），拼错 = 静默失效（等于没跳过）。
 //   本套件把「清单 ↔ 显式步骤」的双向对账与入口行为固定在门禁里，防止再次回归。
+// 另含测试入口参数契约（EXEC-D T10）：test_app.js 的 `--only=<子串>` 必须真的过滤——
+//   过滤静默失效时，用户照并行调度器（test_app_p.js）的定位提示串行重跑，反而触发全量用例。
 const assert = require('node:assert')
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
@@ -354,6 +356,101 @@ const uncovered = excluded.filter(f => !explicitFiles.has(f))
 assert.deepStrictEqual(uncovered, [],
   `以下 integration/mutationSkip 套件没有 CI 显式步骤，脱离门禁：${uncovered.join(', ')}`)
 
+// ── 2c. test.yml 的 push `paths-ignore` 不得收缩门禁（EXEC-D T3）──────
+// 动机：docs-only push 此前也会跑满整条链（~6.5min × 2 runner）。放宽 push 触发范围可以让纯文档
+// 提交不再触发，但**硬约束**是：paths-ignore 只能放行「改了它也绝不可能影响测试结果」的路径。
+// 本仓库最容易被一刀切忽略掉的门禁输入是 CHANGELOG.md——`**/*.md` 会连它一起忽略，而它是
+// check-version.js 的版本一致性闸门、test_filter.js 第 101 章、test_tag_validator.js 的输入。
+// 故本段把口径固定为断言：任何门禁输入被 paths-ignore 覆盖即红（防后人顺手写回 `**/*.md`）。
+{
+  // 解析 `on.push.paths-ignore`（行式解析 + 响亮失败：排版一变就红，不会静默放行）
+  const lines = testYml.split('\n')
+  const pushIdx = lines.findIndex(l => l === '  push:')
+  assert.ok(pushIdx >= 0, 'test.yml 应声明 push 触发（缩进 2 空格的 `  push:`）')
+  let piIdx = -1
+  const pathsIgnore = []
+  for (let i = pushIdx + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trim() === '') continue
+    const indent = line.length - line.trimStart().length
+    if (indent <= 2) break // 离开 push 块
+    if (piIdx < 0) {
+      if (!line.trim().startsWith('paths-ignore:')) continue
+      piIdx = i
+      continue
+    }
+    const item = line.trim()
+    if (!item.startsWith('- ')) break // paths-ignore 列表结束
+    let val = item.slice(2).trim()
+    // 去行内注释与引号（路径里不会出现 '#' 或引号）
+    const hash = val.indexOf(' #')
+    if (hash > 0) val = val.slice(0, hash).trim()
+    val = val.replace(/^(['"])(.*)\1$/, '$2')
+    assert.ok(val !== '', `paths-ignore 条目不应为空: ${JSON.stringify(line)}`)
+    pathsIgnore.push(val)
+  }
+  assert.ok(pathsIgnore.length > 0, 'push 触发应有非空 paths-ignore（否则本断言失去守护对象）')
+
+  // gitignore/minimatch 子集匹配器（只需支持本仓库实际会用的形态：字面路径、`**/*.ext`、`dir/**`）
+  const toRe = (p) => {
+    let re = ''
+    for (let i = 0; i < p.length; i++) {
+      const c = p[i]
+      if (c === '*') {
+        if (p[i + 1] === '*') { // `**` → 任意层级
+          if (p[i + 2] === '/') { re += '(?:[^/]+/)*'; i += 2 } else { re += '.*'; i += 1 }
+        } else re += '[^/]*'
+      } else if (c === '?') re += '[^/]'
+      else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    }
+    return new RegExp('^' + re + '$')
+  }
+  const matchers = pathsIgnore.map(p => ({ p, re: toRe(p) }))
+  const matchedBy = (rel) => matchers.filter(m => m.re.test(rel)).map(m => m.p)
+
+  // 匹配器自身的正向对照（防恒假：判据必须能认出 `**/*.md` 会命中 CHANGELOG.md）
+  assert.deepStrictEqual(matchedBy('CHANGELOG.md'), [],
+    'paths-ignore 不得命中 CHANGELOG.md：它是 check-version.js 版本闸门与 test_filter.js 第 101 章的输入')
+  assert.ok(toRe('**/*.md').test('CHANGELOG.md') && toRe('**/*.md').test('docs/a.md'),
+    '匹配器对照：`**/*.md` 必须能命中 CHANGELOG.md（否则本断言恒真、形同虚设）')
+  assert.ok(!toRe('dir/**').test('dir') && toRe('dir/**').test('dir/a/b.js'), '匹配器对照：`dir/**` 应命中目录内部文件')
+
+  // 显式「允许被忽略」清单：纯文档（无任何脚本/测试读取）+ 未入库的本机目录 + 议题模板
+  const PROSE_DOCS = new Set([
+    'README.md', 'AGENTS.md', 'CONTRIBUTING.md', 'SECURITY.md', 'SYSTEM_CONTRACT.md',
+    '.github/pull_request_template.md'
+  ])
+  const ALLOWED_PREFIXES = ['.local/', '.github/ISSUE_TEMPLATE/']
+  // 允许出现的 paths-ignore 条目白名单：新增条目必须同时改这里（有意为之的 fail-loud）——
+  // 否则一个手滑的 `**/*.js` 会静默把整条门禁关掉。
+  const ALLOWED_PATTERNS = new Set([...PROSE_DOCS, '.github/ISSUE_TEMPLATE/**', '.local/**'])
+  for (const p of pathsIgnore) {
+    assert.ok(ALLOWED_PATTERNS.has(p),
+      `paths-ignore 出现未登记的条目 ${JSON.stringify(p)}：请先确认改了该路径不可能影响测试结果，` +
+      '并同步本套件的 ALLOWED_PATTERNS（源码/测试/工作流/门禁输入一律不得放行）')
+  }
+
+  // 遍历仓库文件（跳过依赖与运行产物），要求：**除允许清单外，没有任何文件被 paths-ignore 命中**
+  const SKIP_DIRS = new Set(['node_modules', '.git', 'reports', 'coverage', '.stryker-tmp', '.tools', '.ai'])
+  const walk = (dir, rel, out) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory()) {
+        if (SKIP_DIRS.has(e.name) || e.name.startsWith('xianbaoku_cache') || e.name.startsWith('.xbk_cache_safe')) continue
+        walk(path.join(dir, e.name), rel + e.name + '/', out)
+      } else if (e.isFile()) out.push(rel + e.name)
+    }
+    return out
+  }
+  const files = walk(__dirname, '', [])
+  assert.ok(files.includes('test_ci_skip_suites.js') && files.includes('CHANGELOG.md'),
+    '仓库遍历应包含已知门禁输入（遍历失败会让本断言恒真）')
+  const allowed = (f) => PROSE_DOCS.has(f) || ALLOWED_PREFIXES.some(pre => f.startsWith(pre))
+  const violators = files.filter(f => !allowed(f) && matchedBy(f).length > 0)
+  assert.deepStrictEqual(violators, [],
+    `paths-ignore 命中了非文档路径（门禁盲区）：${violators.slice(0, 10).map(f => `${f} ← ${matchedBy(f).join(',')}`).join(' | ')}`)
+  console.log(`✅ push paths-ignore（${pathsIgnore.length} 项）只覆盖纯文档/议题模板/本机目录，未命中任何门禁输入（${files.length} 个文件已核对）`)
+}
+
 // ── 3. 入口行为（子进程 + 跳过全部套件，秒级） ───────────────
 const baseEnv = { ...process.env }
 delete baseEnv.SKIP_SUITES
@@ -621,6 +718,170 @@ const strykerIdx = mutationYml.indexOf('npx stryker run')
 assert.ok(strykerIdx > 0, 'mutation.yml 应包含 stryker 运行步骤')
 assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHILD:\s*'1'/,
   'mutation.yml 的变异测试 step 必须设 XBK_MUTATION_CHILD=1（否则重复整表 append，几百次即撞 1MiB 上限）')
+
+// 3e PR #156 返工的三条 CI 硬约束：① 缓存 key 与 restore-keys 前缀必须含测试指纹；
+//    ② 剥离步不得再碰 reports/inc-*.json；③ artifact 收窄到 reports/mutation/ 并 fail-loud。
+// 三处都是 Qodo 评审判定为真问题的位置，靠注释兜不住——每条都做成「改回旧形态立刻红」的靶向断言。
+// 断言只读**真实 YAML 行**（剔除注释行）：否则把证据写进注释、代码改回去也能骗过门禁，等于没修。
+{
+  const indentOf = line => line.length - line.trimStart().length
+  const yamlOnly = text => text.split('\n').filter(l => !l.trim().startsWith('#'))
+  // 从一个 step 的文本里取出 `run: |` 之后的 shell 正文（缩进深于 run: 的行），注释一律不算证据。
+  // 注释行必须在这里剔除：只按缩进截断的话，把活动命令整行改成 `# node scripts/…` 后正文里仍带着
+  // 命令原文，`includes('node scripts/mutation-report.js --strip')` 会被注释满足——CI 实际不再剥离、
+  // 套件却全绿（本段旧实现正是如此，反例见下方 (2) 的端到端回归）。
+  const shellBodyOf = (stepText) => {
+    const lines = stepText.split('\n')
+    const runAt = lines.findIndex(l => l.trim() === 'run: |')
+    if (runAt < 0) return null
+    const runIndent = indentOf(lines[runAt])
+    const body = []
+    for (let i = runAt + 1; i < lines.length; i++) {
+      if (lines[i].trim() === '' || indentOf(lines[i]) <= runIndent) break
+      if (lines[i].trim().startsWith('#')) continue // shell 注释不是证据
+      body.push(lines[i])
+    }
+    return body.join('\n')
+  }
+  const stepEndIn = (text, at, nameLen) => {
+    const next = text.indexOf('\n      - name: ', at + nameLen)
+    return next > 0 ? next : text.length
+  }
+  const stepEndAfter = (at, nameLen) => stepEndIn(mutationYml, at, nameLen)
+
+  // (1) 「恢复增量缓存」：主 key 与 restore-keys 都必须含测试指纹，且不得再有裸兜底前缀。
+  //     coverageAnalysis:'off' 下 incremental-differ 感知不到测试变化，会拿**旧 killed/survived** 去喂
+  //     stryker.config.js 的 thresholds.break=65 分数门禁 ⇒ 测试指纹不进 key（及 restore-keys 前缀），
+  //     「源码没动、只改/只删测试」就能用旧分数过门禁。actions/cache 的 restore-keys 只有**前缀**语义，
+  //     故测试段还必须排在源段之前；原来那条无条件的裸兜底 stryker-${{ matrix.name }}- 必须删除。
+  const cacheAt = mutationYml.indexOf('- name: 恢复增量缓存')
+  assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（缓存策略无从核对即视为回归）')
+  const cacheEnd = mutationYml.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
+  assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
+  const cacheLines = yamlOnly(mutationYml.slice(cacheAt, cacheEnd))
+  const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
+  assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
+  assert.ok(/-tests-\$\{\{ hashFiles\(/.test(keyLine),
+    '缓存 key 必须含测试指纹段 `-tests-' + '${' + '{ hashFiles(...) }}`：一旦改回不含测试的 `stryker-' + '${' + '{ matrix.name }}-' + '${' + '{ hashFiles(源) }}`，' +
+    '只改/只删测试就会命中旧基线，把旧 killed/survived 的分数喂给 thresholds.break=65 门禁（Qodo High）')
+  assert.ok(/-src-\$\{\{ hashFiles\(/.test(keyLine),
+    '缓存 key 的源指纹段 `-src-' + '${' + '{ hashFiles(...) }}` 不得被删掉（否则源码变化也不再换基线）')
+  const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
+  assert.ok(restoreIdx >= 0, '「恢复增量缓存」必须声明 restore-keys')
+  const restoreIndent = indentOf(cacheLines[restoreIdx])
+  const restoreKeys = []
+  for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
+    if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
+    restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
+  }
+  assert.ok(restoreKeys.length > 0, 'restore-keys 不得为空（增量基线需要兜底）')
+  const badRestore = restoreKeys.filter(k => !/^stryker-\$\{\{ matrix\.name \}\}-tests-\$\{\{ hashFiles\(/.test(k))
+  assert.deepStrictEqual(badRestore, [],
+    '每条 restore-key 都必须以 `stryker-' + '${' + '{ matrix.name }}-tests-' + '${' + '{ hashFiles(...) }}` 开头（限在同一测试指纹内兜底）：' +
+    'actions/cache 的 restore-keys 只有前缀匹配语义，改回裸的 `stryker-' + '${' + '{ matrix.name }}-` 会在主 key 落空后' +
+    '跨「不同测试状态」恢复旧基线，等于没修')
+
+  // (2) 剥离步不得再把 reports/inc-*.json 塞回去：inc 是**下一次运行** incremental-differ 的复用输入，
+  //     statusReason 会被原样透传进新产出的 JSON/HTML；在这里置空串，等于让「被复用的变异体为什么
+  //     存活/报错」永久丢失（与既有「不动 mutation.html」完全同一条理由）。只允许剥机器报告 mutation.json。
+  //     抽成按文本取用的函数，是为了让紧随其后的反例在**同一套提取+断言代码**上跑真实 workflow 的变异副本。
+  const assertStripStep = (ymlText) => {
+    const stripName = '- name: 剥离报告中的 statusReason（artifact/缓存瘦身）'
+    const stripAt = ymlText.indexOf(stripName)
+    assert.ok(stripAt >= 0, 'mutation.yml 必须存在「剥离报告中的 statusReason」步骤')
+    const stripStep = ymlText.slice(stripAt, stepEndIn(ymlText, stripAt, stripName.length))
+    const stripScript = shellBodyOf(stripStep)
+    assert.ok(stripScript !== null, '剥离步骤必须以 `run: |` 执行 shell（否则无从核对剥离目标）')
+    assert.ok(stripScript.includes('reports/mutation/mutation.json'),
+      '剥离 shell 必须仍覆盖 `reports/mutation/mutation.json`（该字段的机器报告冗余照旧剥离，消费方语义零变化）')
+    assert.ok(!stripScript.includes('reports/inc-'),
+      '剥离 shell 不得再出现 `reports/inc-*.json`（重新塞回去即红）：inc 是下一次运行的增量复用输入，' +
+      '把 statusReason 置空会让被复用变异体的存活/报错原因永久丢失（Qodo Medium / Observability）')
+    assert.ok(stripScript.includes('node scripts/mutation-report.js --strip'),
+      '剥离必须经生产 CLI（node scripts/mutation-report.js --strip）执行，不得内联脚本')
+  }
+  assertStripStep(mutationYml)
+
+  // (2 反例·端到端) 注释不能当证据：把真实 mutation.yml 里**活动**的剥离命令整行改成 shell 注释
+  //     （注释文本原样保留命令），落成临时文件再读回，仍走上面同一套提取+断言 ⇒ 必须抛
+  //     「剥离必须经生产 CLI」。过滤注释的那一步若被去掉，本反例会变红（断言骗得过门禁）。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-strip-comment-'))
+    try {
+      const fixture = path.join(dir, 'mutation.yml')
+      const commented = mutationYml.replace(/(^[ \t]*)node scripts\/mutation-report\.js --strip/m,
+        '$1# node scripts/mutation-report.js --strip')
+      assert.notStrictEqual(commented, mutationYml,
+        '反例夹具必须真的把活动命令行改成了注释（没改成本回归形同虚设）')
+      assert.ok(/^[ \t]*# node scripts\/mutation-report\.js --strip/m.test(commented) &&
+        !/^[ \t]*node scripts\/mutation-report\.js --strip/m.test(commented),
+      '夹具中该命令应只剩注释形态（否则反例证明的不是「注释骗不过去」）')
+      fs.writeFileSync(fixture, commented)
+      assert.throws(() => assertStripStep(fs.readFileSync(fixture, 'utf8')),
+        /剥离必须经生产 CLI/,
+        '活动命令被改成注释后必须红：注释行不得再满足正向断言（旧实现只按缩进截断，注释里的命令原文照样入选）')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // (3) 「上传变异报告」的 path 必须收窄为 reports/mutation/ 并 fail-loud：reports/ 会把**未剥离**的
+  //     inc-*.json 一起打包（artifact 侧无消费方，纯白带体积），而 stryker 没产出报告时还会静默上传一个
+  //     只含 inc 的 artifact，把「缺段」拖到汇总 job 才暴露。
+  const uploadName = '- name: 上传变异报告'
+  const uploadAt = mutationYml.indexOf(uploadName)
+  assert.ok(uploadAt >= 0, 'mutation.yml 必须存在「上传变异报告」步骤')
+  const uploadLines = yamlOnly(mutationYml.slice(uploadAt, stepEndAfter(uploadAt, uploadName.length)))
+  const uploadPath = uploadLines.find(l => /^\s*path:/.test(l))
+  assert.ok(uploadPath, '「上传变异报告」必须声明 path')
+  assert.strictEqual(uploadPath.trim(), 'path: reports/mutation/',
+    '「上传变异报告」的 path 必须是 `reports/mutation/`：改回 `reports/` 会把未剥离的 inc-*.json 一起打包' +
+    '（artifact 侧无消费方），同时失去「stryker 没产出报告 ⇒ 上传响亮变红」的 fail-loud 语义')
+  const noFiles = uploadLines.find(l => /^\s*if-no-files-found:/.test(l))
+  assert.ok(noFiles && noFiles.trim() === 'if-no-files-found: error',
+    '「上传变异报告」必须带 `if-no-files-found: error`：stryker 崩溃/未产出报告时不得静默上传一个只含 inc 的 artifact')
+}
+console.log('✅ mutation.yml：缓存 key/兜底前缀含测试指纹、剥离不含 inc、artifact 收窄为 reports/mutation/ 且 fail-loud')
+
+// ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────
+// 背景：test_app.js 的 `--only=<子串>` 曾**静默失效**——旧实现用 process.argv.indexOf('--only')
+// 定位，等号写法下没有独立的 '--only' 元素 → 返回 -1 → 不过滤、照跑全部用例；而 test_app_p.js
+// 并行失败时打印的定位提示正是这个等号写法，于是「最需要快速定位的时刻」反而触发全量重跑。
+// 过滤失效此前无门禁可拦，是因为跳过同样计入 passed（passed 恒等于用例总数）⇒ 过滤静默失效时
+// 输出与「正常全量跑」完全同形。test_app.js 现已打印「实际执行 N 例，过滤跳过 M 例」，
+// 本段据此把契约固定为可证伪断言：等号形式**真的只跑匹配用例**，其余跳过且不计失败。
+{
+  const appSrc = fs.readFileSync('test_app.js', 'utf8')
+  // 期望值由 test_app.js 源码现算（与 test_app_p.js 同名提取口径），不写死用例数：
+  // 增删用例不会误红，而「--only 被忽略」会把实际执行数放大到 total → 立即红。
+  const allNames = [...appSrc.matchAll(/await test\((['"])(.*?)\1,/g)].map(m => m[2])
+  const FILTER = '空数据'
+  const matched = allNames.filter(n => n.includes(FILTER)).length
+  const total = allNames.length
+  assert.ok(total > 1, `test_app.js 应提取到多条用例（实得 ${total}）`)
+  assert.ok(matched >= 1, `作为过滤契约样本的子串「${FILTER}」必须至少匹配一条用例（消失即断言失去意义，需换样本）`)
+  assert.ok(matched < total, `过滤样本须非全体匹配（matched=${matched} / total=${total}），否则断言区分不出过滤是否生效`)
+  // XBK_PARALLEL_ID：让被测进程走独立缓存目录。`--only` 模式按设计跳过自清理（避免删掉并行进程
+  // 正在用的缓存），故必须在此收尾删除，避免污染仓库 xianbaoku_cache 影响后续套件。
+  const probeId = `only_probe_${process.pid}_${Date.now()}`
+  const probeCache = path.join(__dirname, `xianbaoku_cache_p${probeId}`)
+  let run
+  try {
+    run = spawnSync(process.execPath, [path.join(__dirname, 'test_app.js'), `--only=${FILTER}`],
+      { encoding: 'utf8', cwd: __dirname, timeout: 300000, env: { ...baseEnv, XBK_PARALLEL_ID: probeId } })
+  } finally {
+    fs.rmSync(probeCache, { recursive: true, force: true })
+  }
+  assert.ok(!run.error, `test_app.js --only= 子进程未能正常退出: ${run.error && run.error.message}`)
+  assert.strictEqual(run.status, 0,
+    `node test_app.js --only=${FILTER} 应 exit 0（其余用例跳过，不计失败）:\n${run.stdout}\n${run.stderr}`)
+  const stat = /实际执行 (\d+) 例，过滤跳过 (\d+) 例/.exec(run.stdout || '')
+  assert.ok(stat, '--only= 过滤未生效：输出缺少「实际执行 N 例，过滤跳过 M 例」统计' +
+    `（等号写法被忽略时会照跑全部 ${total} 例）:\n${(run.stdout || '').slice(-800)}`)
+  assert.strictEqual(Number(stat[1]), matched, `--only=${FILTER} 实际执行数应等于源码中匹配的用例数`)
+  assert.strictEqual(Number(stat[2]), total - matched, '过滤跳过数应为用例总数减匹配数')
+  console.log('✅ test_app.js `--only=<子串>` 过滤契约：等号形式只跑匹配用例，其余跳过不计失败')
+}
 
 console.log(`✅ SKIP_SUITES（${skips.length} 项）与 test.yml 显式步骤双向一致，且未知条目会失败`)
 console.log('✅ 零套件守卫：SKIP_SUITES 全覆盖（run_unit_tests.js）与空注册表（run_tests.js）均非 0 退出')
