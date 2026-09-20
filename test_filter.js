@@ -3551,6 +3551,7 @@ console.log('========================================\n');
   // 合法输入照常分片（白名单不得把正常 ID 一起挡掉；worker1/纯数字是 test_app_p.js 与调度器口径）
   await test('Qodo #158: 合法 XBK_PARALLEL_ID 仍照常分片（白名单不误伤）', () => {
     const pathMod = require('path')
+    const fs = require('fs')
     for (const good of ['worker1', '12345', 'RUN_1_0', 'a-b_c-9', 'x'.repeat(CACHE_SHARD_ID_MAX)]) {
       const shard = buildCacheShard(good, __dirname, pathMod)
       assert.equal(shard.id, good, `合法 ID ${good} 不应被改写`)
@@ -3563,6 +3564,29 @@ console.log('========================================\n');
     // 未设置环境变量（真实单跑）时取 pid
     const pidShard = buildCacheShard(undefined, __dirname, pathMod)
     assert.equal(pidShard.dirName, `xianbaoku_cache_p${process.pid}`, '未设置时取进程 pid')
+    // 反向防漂移：test_app.js 里有一份**同源**的 sanitizeIsolationId/buildCacheShard 段（该文件
+    // 由 test.yml 显式步骤覆盖，不在 SUITES 里）。两边各自断言对方的同源段逐字符一致——只在一侧
+    // 加检查的话，改动 test_filter.js 而不同改 test_app.js 就没人拦。口径：先剥注释，从**行首**锚点
+    // 切到 buildCacheShard 之后的第一个顶层声明，再去空行/行首尾空白后比对。
+    const stripComments = (src) => src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n').filter(line => !/^\s*\//.test(line)).join('\n')
+    const extractBlock = (src) => {
+      const clean = stripComments(src)
+      const a = clean.indexOf('const CACHE_SHARD_ID_RE =')
+      const b = clean.indexOf('function buildCacheShard (rawId, root, pathMod) {')
+      if (a < 0 || b < 0) return ''
+      const m = /\n(function |const |\(async )/.exec(clean.slice(b))
+      if (!m) return clean.slice(a)
+      return clean.slice(a, b + m.index + 1)
+    }
+    const normalize = (text) => text.split('\n').map(line => line.trim()).filter(Boolean).join('\n')
+    const mine = normalize(extractBlock(fs.readFileSync(__filename, 'utf8')))
+    const other = normalize(extractBlock(fs.readFileSync(pathMod.join(__dirname, 'test_app.js'), 'utf8')))
+    assert.ok(mine.length > 200 && other.length > 200,
+      `同源块提取失败（自身 ${mine.length} / test_app ${other.length} 字符）——锚点注释失效`)
+    assert.strictEqual(mine, other,
+      'test_filter.js 与 test_app.js 的 sanitizeIsolationId/buildCacheShard 块必须逐字符相同（改一处必须同改另一处）')
   })
 
   // 收敛点自证：任何整体递归删除都必须经过 removeDirInRoot，且它拒绝仓库根之外的路径

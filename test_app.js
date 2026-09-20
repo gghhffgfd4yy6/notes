@@ -97,10 +97,90 @@ const fs = require('fs')
 const path = require('path')
 
 // v3.172：并行 worker 独立缓存目录——多进程共享同一缓存目录曾致沙箱 overlayfs IO 竞态(ENOENT)，
-// 每个 worker 用 xianbaoku_cache_p<N> 彻底隔离（缓存/run.log/state 全独立，无竞态）
-const PARALLEL_ID = process.env.XBK_PARALLEL_ID || ''
-const DEFAULT_CACHE_DIR = PARALLEL_ID ? `xianbaoku_cache_p${PARALLEL_ID}` : 'xianbaoku_cache'
+// 每个 worker 用 xianbaoku_cache_p<N> 彻底隔离（缓存/run.log/state 全独立，无竞态）。
+// Qodo PR #158（High / Security）后：ID 必须过白名单 + 根内校验，非法一律回退 pid 分片（fail-closed）；
+// `XBK_PARALLEL_ID` 在**推导之前**先写回归一值，保证 env / DEFAULT_CACHE_DIR / CACHE_DIR 三者同源
+// （否则生产 fallback 分支出的是另一个目录，测试断言与清理会指向不同落点）。
+// ============================================================
+// 缓存分片目录的「已验证路径」入口（Qodo PR #158 High / Security 修复）
+// ============================================================
+// 缺陷：本套件把 XBK_PARALLEL_ID 原样插值进 `xianbaoku_cache_p${ID}` 再 path.join(__dirname, …)，
+// 未校验分隔符/根内包含 ⇒ 含 `../` 的值会解析到仓库之外，而本套件有 10 处在 finally 里
+// `fs.rmSync(stateDir,{recursive:true,force:true})` 清理缓存派生目录，会被劫持到仓库外递归删除。
+// 生产侧 xbk_message_store.resolveCacheDirInRoot 虽有根内校验，但测试清理跑在它之前 ⇒ 校验形同虚设。
+//
+// ⚠️ 与 test_filter.js 的**同源代码块**（必须同步修改，锚点见本文件 :Qodo #158 同步断言）：
+//    本段（正则常量 → sanitizeIsolationId → buildCacheShard 的完整定义）与 test_filter.js 的同名段
+//    **代码逐字符相同**（仅注释措辞不同），并由两处断言锁死：① 本文件断言两段**源码**（剥注释后）
+//    normalize 相等；② 同时断言本文件除 removeDirInRoot 与其声明的外部目标豁免外无裸递归 rmSync。
+//    改一处忘改另一处，两边的门禁都会真红。
+const CACHE_SHARD_ID_RE = /^[A-Za-z0-9_-]+$/
+
+// 单层目录名硬上限（防超长环境变量造出 ENAMETOOLONG / 触发文件系统边界行为）
+const CACHE_SHARD_ID_MAX = 64
+
+// 把任意来源的 XBK_PARALLEL_ID 归一为一个**安全分片 ID**。
+// 非法（空串、含 `.` `/` `\` 或其它非白名单字符、超长）一律回退到 String(process.pid)。
+function sanitizeIsolationId (raw) {
+  const s = raw === undefined || raw === null ? '' : String(raw)
+  if (!CACHE_SHARD_ID_RE.test(s)) return String(process.pid)
+  if (s.length > CACHE_SHARD_ID_MAX) return String(process.pid)
+  return s
+}
+
+// 唯一的「分片目录」入口（最末兜底 ID 取内核分配的 pid，必然通过白名单与根内校验）：白名单 + 根内校验 + 一体化返回同源三元组
+// { id, dirName, cacheDir } —— 调用方必须用返回的 dirName/cacheDir 去设 Config.cache.dir 与
+// 环境变量，禁止各自重新拼一遍（否则会出现「生产写 A、测试断言 B」的分裂）。
+// 注：本函数是 `require(path)` 参数的接收者（不做模块级 require），既便于回归用例反复构造，
+// 也让 lint/static analysis 不把 `path` 当成被遮蔽的全局。
+function buildCacheShard (rawId, root, pathMod) {
+  const rootAbs = pathMod.resolve(root)
+  const id = sanitizeIsolationId(rawId)
+  const dirName = `xianbaoku_cache_p${id}`
+  const cacheDir = pathMod.join(rootAbs, dirName)
+  // ② 根内校验：resolve 后必须以 rootAbs + sep 起头，且不等于 rootAbs 本身。
+  // 用 path.resolve（词法规范化）而非 realpath：本套件的删除目标是自己刚构造的**新**目录，
+  // 越界向量只有 `..`（词法即可完全覆盖）；而 realpath 会把「仓库本身位于符号链接路径下」
+  // 这类合法部署判成越界，反而制造 fail-open（回退到共享目录）或误红。
+  const resolved = pathMod.resolve(cacheDir)
+  if (resolved !== rootAbs && resolved.startsWith(rootAbs + pathMod.sep)) {
+    return { id, dirName, cacheDir }
+  }
+  // 白名单下不可达；一旦可达说明拼接逻辑本身被改坏了——此时回退到 pid（仍根内），
+  // 并在 stderr 留痕，绝不返回越界路径。
+  const fallbackId = String(process.pid)
+  const fallbackDirName = `xianbaoku_cache_p${fallbackId}`
+  const fallbackCacheDir = pathMod.join(rootAbs, fallbackDirName)
+  console.warn(`[test_filter] 分片目录越出仓库根，已回退 pid 分片：raw=${JSON.stringify(rawId)} → ${fallbackDirName}`)
+  return { id: fallbackId, dirName: fallbackDirName, cacheDir: fallbackCacheDir }
+}
+
+const PARALLEL_ID = sanitizeIsolationId(process.env.XBK_PARALLEL_ID)
+process.env.XBK_PARALLEL_ID = PARALLEL_ID
+const DEFAULT_CACHE_DIR = `xianbaoku_cache_p${PARALLEL_ID}`
 const CACHE_DIR = path.join(__dirname, DEFAULT_CACHE_DIR)
+
+// Qodo #158 回归用的根内断言（与 test_filter.js 的 assertPathInRoot 同语义、无返回值）
+function assertPathInRoot (targetPath, root, msg) {
+  const rootAbs = path.resolve(root)
+  const t = path.resolve(targetPath)
+  assert(t !== rootAbs && t.startsWith(rootAbs + path.sep),
+    msg || `路径必须位于仓库根之内：${t} 不在 ${rootAbs}${path.sep} 之下`)
+  return t
+}
+
+// 收敛后的**唯一**递归删除入口（与 test_filter.js 同源、同语义）：先校验后删除。
+// 传入路径必须已由 buildCacheShard 产出或由用例在根内字面量构造；越界即抛错（fail-closed）。
+// 唯一声明的豁免是 :3737 的局部 removePath（目标含 os.tmpdir() 下的仓库外夹具），见其处注释。
+function removeDirInRoot (targetPath, root) {
+  const rootAbs = path.resolve(root)
+  const p = path.resolve(targetPath)
+  if (p === rootAbs || !p.startsWith(rootAbs + path.sep)) {
+    throw new Error(`拒绝递归删除仓库根之外的路径（fail-closed）：${p}`)
+  }
+  fs.rmSync(p, { recursive: true, force: true })
+  return p
+}
 
 // ---------- 工具 ----------
 let passed = 0; let failed = 0
@@ -160,6 +240,15 @@ async function test (name, fn) {
 
 function assert (cond, msg) {
   if (!cond) throw new Error(msg || '断言失败')
+}
+
+// Qodo PR #158 回归用：与 test_filter.js 的 assertEqual / assert.strictEqual 同口径的严格相等断言。
+// 单独命名（assertEqualStr/Num）以免与上面的布尔断言 assert 混淆，也不引入 node:assert。
+function assertEqualStr (actual, expected, msg) {
+  if (actual !== expected) throw new Error(msg || `期望=${expected}, 实际=${actual}`)
+}
+function assertEqualNum (actual, expected, msg) {
+  if (actual !== expected) throw new Error(msg || `期望=${expected}, 实际=${actual}`)
 }
 
 function setPushUrl (suffix) {
@@ -2350,7 +2439,7 @@ console.log('========================================\n');
       Config.cache.dir = originalCacheDir
       xbk.App._reportToday = originalToday
       xbk.App._reportMemoryStateByPath.clear()
-      try { require('fs').rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   }
 
@@ -2512,7 +2601,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
       Config.channelHealth.intervalMs = originalInterval
-      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   })
 
@@ -2555,7 +2644,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
       Config.channelHealth.intervalMs = originalInterval
-      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   })
 
@@ -2596,7 +2685,7 @@ console.log('========================================\n');
       Config.cache.dir = originalCacheDir
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
-      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   })
 
@@ -2624,7 +2713,7 @@ console.log('========================================\n');
       assert(!fs.existsSync(lockPath), '持有进程已退出应回收并释放 run.log 锁')
     } finally {
       Config.cache.dir = originalCacheDir
-      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   })
 
@@ -2660,7 +2749,7 @@ console.log('========================================\n');
       Config.cache.dir = originalCacheDir
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
-      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   })
 
@@ -2716,7 +2805,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
       Config.channelHealth.intervalMs = originalInterval
-      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   })
 
@@ -2763,7 +2852,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
       Config.channelHealth.intervalMs = originalInterval
-      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   })
 
@@ -2810,7 +2899,7 @@ console.log('========================================\n');
       Config.cache.dir = originalCacheDir
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
-      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   })
 
@@ -2845,7 +2934,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
       Config.channelHealth.intervalMs = originalInterval
-      try { fs.rmSync(stateDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   })
 
@@ -3676,6 +3765,10 @@ console.log('========================================\n');
     const externalTarget = path.join(os.tmpdir(), `xbk-cache-safe-${process.pid}`)
     const backupDefault = path.join(__dirname, `.xbk_cache_safe_default_${process.pid}.bak`)
     const origCacheDir = Config.cache.dir
+    // 声明的裸删除豁免（Qodo #158 收敛的唯一例外）：本局部 helper 的目标之一是 os.tmpdir() 下的
+    // **仓库外**夹具 externalTarget——把它改走 removeDirInRoot 会直接使该用例失败。它不接收任何由
+    // 环境变量派生的路径：三个调用点分别是仓库外夹具、仓库根的固定符号链接名、以及备份路径，
+    // 全部为本文件字面量构造。:Qodo #158 的「来源」断言按此豁免逐字放行。
     const removePath = (p) => { try { fs.rmSync(p, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } }
     try {
       removePath(backupDefault)
@@ -3874,7 +3967,7 @@ console.log('========================================\n');
     const origHasWx = notifyMock.hasWxPusherConfigured
     const origAbort = typeof AbortController !== 'undefined' ? AbortController.prototype.abort : null
     let aborted = 0
-    try { fs.rmSync(testDir, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+    try { removeDirInRoot(testDir, __dirname) } catch (e) { /* ignore */ }
     Config.cache.dir = testCacheDir
     notifyMock.hasWxPusherConfigured = () => true // 让预热路径创建 controller，用于观测 finally abort
     dnsMod.lookup = (host, opts, cb) => {
@@ -3900,7 +3993,7 @@ console.log('========================================\n');
       if (origHasWx === undefined) delete notifyMock.hasWxPusherConfigured
       else notifyMock.hasWxPusherConfigured = origHasWx
       if (origAbort) AbortController.prototype.abort = origAbort
-      try { fs.rmSync(testDir, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+      try { removeDirInRoot(testDir, __dirname) } catch (e) { /* ignore */ }
     }
     assert(threw, 'mkdirSync 抛错应使 run 抛错')
     assert(aborted > 0, 'finally 应取消预热（warmupCancelled/abort 执行）')
@@ -3909,6 +4002,154 @@ console.log('========================================\n');
   // v3.276（EXEC-D T10）：过滤是否生效必须可观测。跳过同样计入 passed，故 passed 恒等于用例总数——
   // 过滤静默失效（--only 解析不到）时输出与「正常全量跑」完全同形，门禁无从察觉。
   // 打印「实际执行 N 例，过滤跳过 M 例」把这一点变成可断言的事实；无过滤时保持原输出不变。
+  // ============================================================
+  // Qodo PR #158（High / Security）回归：XBK_PARALLEL_ID 路径穿越（test_filter.js 同族）
+  // ------------------------------------------------------------
+  // 缺陷面：PARALLEL_ID 曾直接取 process.env.XBK_PARALLEL_ID 且无校验 → DEFAULT_CACHE_DIR/CACHE_DIR
+  // 以及 10 处以 `DEFAULT_CACHE_DIR` 派生的 stateDir，都可能被含 `../` 的值劫持到仓库外，再被
+  // finally 里的递归 rmSync 删掉。生产 resolveCacheDirInRoot 有根内校验，但测试清理跑在它之前。
+  // 靶向回退：删掉 sanitizeIsolationId 的白名单 ⇒ 本用例第一条断言真红；还原 ⇒ 绿。
+  await test('Qodo #158: XBK_PARALLEL_ID 含 / 绝对路径 .. 一律回退 pid 分片（路径穿越防护）', async () => {
+    // 1) 模块级不变量：生效三元组必须同源、在根内、且已过白名单
+    assertPathInRoot(CACHE_DIR, __dirname, '生效 CACHE_DIR 必须位于仓库根之内')
+    assertEqualStr(CACHE_DIR, path.join(__dirname, DEFAULT_CACHE_DIR), 'CACHE_DIR 必须与 DEFAULT_CACHE_DIR 同源')
+    assertEqualStr(process.env.XBK_PARALLEL_ID, PARALLEL_ID, '写回环境的 XBK_PARALLEL_ID 必须与生效分片 ID 同源')
+    assertEqualStr(PARALLEL_ID, sanitizeIsolationId(PARALLEL_ID), '生效分片 ID 自身必须已通过白名单')
+    assert(CACHE_SHARD_ID_RE.test(PARALLEL_ID), `生效分片 ID 必须只含 [A-Za-z0-9_-]（实得 ${PARALLEL_ID}）`)
+    assert(DEFAULT_CACHE_DIR === `xianbaoku_cache_p${PARALLEL_ID}`,
+      `DEFAULT_CACHE_DIR 必须恒为分片目录名（实得 ${DEFAULT_CACHE_DIR}）`)
+
+    // 2) 三类恶意输入 + 等价变体：一律回退 pid 分片，构造结果必在仓库根内
+    const rootAbs = path.resolve(__dirname)
+    const malicious = [
+      ['含斜杠', 'abc/../../etc'],
+      ['含斜杠（多级）', 'a/b'],
+      ['绝对路径', '/etc/cron.d'],
+      ['绝对路径（仓库父目录）', path.resolve(__dirname, '..')],
+      ['父目录段', '..'],
+      ['父目录段（多级+分隔符）', '../../x'],
+      ['以点开头（含分隔符）', './a/../b'],
+      ['Windows 分隔符', '..\\..\\x'],
+      ['空串', ''],
+      ['URL 编码的穿越', '..%2f..%2fx'],
+      ['超长单段', 'a'.repeat(CACHE_SHARD_ID_MAX + 1)]
+    ]
+    for (const [label, raw] of malicious) {
+      const shard = buildCacheShard(raw, __dirname, path)
+      assertPathInRoot(shard.cacheDir, __dirname, `${label} 输入经构造后仍在仓库根内`)
+      assertEqualStr(path.resolve(shard.cacheDir), path.resolve(rootAbs, shard.dirName),
+        `${label}：cacheDir 必须就是 root+dirName（无多余路径段）`)
+      assertEqualStr(shard.dirName, `xianbaoku_cache_p${process.pid}`,
+        `${label}：非法 XBK_PARALLEL_ID=${JSON.stringify(raw)} 必须回退 pid 分片（实得 ${shard.dirName}）`)
+      assertEqualStr(shard.id, String(process.pid), `${label}：非法的归一 ID 必须是 pid`)
+    }
+
+    // 3) 恶意输入不得让任何**仓库外**路径被用于递归删除。
+    //    用「哨兵目录 + 断言未被删除」证明：哨兵在仓库根之外，若旧口径被用在派生路径上，
+    //    addSentinel 建的这棵树会被整棵删掉 ⇒ 断言真红。全程只新建/删除自己的哨兵，
+    //    绝不触碰任何真实敏感路径。
+    const victimDir = path.resolve(__dirname, '..', `xbk-o1-app-sentinel-${process.pid}`)
+    const victimFile = path.join(victimDir, 'leaf.json')
+    assert(!(victimDir === rootAbs || victimDir.startsWith(rootAbs + path.sep)),
+      `哨兵必须位于仓库根之外才有证明力（当前 ${victimDir}）`)
+    const addSentinel = () => {
+      fs.rmSync(victimDir, { recursive: true, force: true })
+      fs.mkdirSync(victimDir, { recursive: true })
+      fs.writeFileSync(victimFile, '{"sentinel":true}')
+    }
+    try {
+      for (const [label, raw] of malicious) {
+        const shard = buildCacheShard(raw, __dirname, path)
+        addSentinel()
+        removeDirInRoot(shard.cacheDir, __dirname) // 只允许删自己（根内的分片名）
+        assert(fs.existsSync(victimFile), `${label}：仓库外哨兵文件不得被递归删除（${victimDir}）`)
+        assert(fs.existsSync(victimDir), `${label}：仓库外哨兵目录不得被递归删除（${victimDir}）`)
+        assert(path.resolve(shard.cacheDir) !== path.resolve(victimDir),
+          `${label}：生效缓存目录不得落在仓库之外`)
+      }
+      // 4) 自证旧口径确实逃逸：raw='3×../<sentinel basename>' 时旧派生路径恰好等于哨兵目录
+      const escapeRaw = `../../../${path.basename(victimDir)}`
+      const escapeDerived = path.join(rootAbs, `xianbaoku_cache_p${escapeRaw}`)
+      assertEqualStr(path.resolve(escapeDerived), path.resolve(victimDir),
+        '构造自证失败：该输入应恰好派生到哨兵目录（否则本用例的证明力不成立）')
+      addSentinel()
+      const escapeShard = buildCacheShard(escapeRaw, __dirname, path)
+      assert(path.resolve(escapeShard.cacheDir) !== path.resolve(victimDir),
+        '穿越输入必须被拦下，不得把仓库外目录当作缓存目录')
+      let blocked = false
+      try { removeDirInRoot(victimDir, __dirname) } catch (e) { blocked = true }
+      assert(blocked, 'removeDirInRoot 必须拒绝仓库外路径（fail-closed）')
+      assert(fs.existsSync(victimFile), '穿越输入派生出的清理不得删掉仓库外哨兵')
+      removeDirInRoot(escapeShard.cacheDir, __dirname)
+      assert(fs.existsSync(victimFile), '穿越输入被回退后的清理也不得删掉仓库外哨兵')
+    } finally {
+      try { fs.rmSync(victimDir, { recursive: true, force: true }) } catch (e) { /* 清理哨兵 */ }
+    }
+  })
+
+  // 合法输入照常分片（白名单不得把正常 ID 一起挡掉；test_app_p.js 的 workerId 就是这两种形态）
+  await test('Qodo #158: 合法 XBK_PARALLEL_ID 仍照常分片（白名单不误伤）', async () => {
+    for (const good of ['worker1', '12345', '1234_5678901234_0', 'a-b_c-9', 'x'.repeat(CACHE_SHARD_ID_MAX)]) {
+      const shard = buildCacheShard(good, __dirname, path)
+      assertEqualStr(shard.id, good, `合法 ID ${good} 不应被改写`)
+      assertEqualStr(shard.dirName, `xianbaoku_cache_p${good}`, `合法 ID ${good} 必须照原样分片`)
+      assertPathInRoot(shard.cacheDir, __dirname, `合法 ID ${good} 的分片目录必须在仓库根内`)
+    }
+    // 与 test_app_p.js 的分片口径逐字符一致（workerId = `${pid}_${Date.now()}_${idx}`）
+    const workerLike = `${process.pid}_${Date.now()}_0`
+    assertEqualStr(buildCacheShard(workerLike, __dirname, path).cacheDir,
+      path.join(__dirname, `xianbaoku_cache_p${workerLike}`), '与 test_app_p.js 分片口径一致')
+    assertEqualStr(buildCacheShard(undefined, __dirname, path).dirName,
+      `xianbaoku_cache_p${process.pid}`, '未设置时取进程 pid')
+  })
+
+  // 收敛点自证（两条独立事实）：
+  //   ① 删除入口 removeDirInRoot 拒绝仓库根之外的路径（fail-closed）；
+  //   ② 本文件除 removeDirInRoot 内部与**声明的豁免**（:3737 局部 removePath，其目标含仓库外
+  //     夹具）外，不得再有裸的递归 rmSync；
+  //   ③ 与 test_filter.js 的同源 helper 代码块 normalize 后必须逐字符相同（防两边漂移）。
+  await test('Qodo #158: 删除入口收敛 + 与 test_filter.js 同源块未漂移', async () => {
+    let threw = false
+    try { removeDirInRoot(path.join(__dirname, '..'), __dirname) } catch (e) { threw = true }
+    assert(threw, '对仓库根之外的路径必须抛错拒绝，而不是照删')
+    threw = false
+    try { removeDirInRoot(__dirname, __dirname) } catch (e) { threw = true }
+    assert(threw, '不得把仓库根自身作为递归删除目标')
+
+    const stripComments = (src) => src
+      .replace(/\/\*[\s\S]*?\*\//g, '') // 块注释
+      .split('\n').filter(line => !/^\s*\//.test(line)).join('\n') // 整行注释
+
+    const selfSrc = stripComments(fs.readFileSync(__filename, 'utf8'))
+    // 允许恰好 4 处：removeDirInRoot 内部 1 处 + 声明的豁免 removePath 1 处
+    // + 本用例清理哨兵 2 处（addSentinel 前置清空 + finally 收尾，目标恒为仓库外自建哨兵）
+    const rawRecursiveRm = selfSrc.match(/rmSync\([^)]*recursive:\s*true/g) || []
+    assertEqualNum(rawRecursiveRm.length, 4,
+      `递归删除只能收敛到 removeDirInRoot + 1 处声明豁免 + 本用例哨兵（实得 ${rawRecursiveRm.length} 处）`)
+
+    // 两侧同源块逐字符比对（normalize：去整行注释、去空行、去行尾空白、行首空白）
+    // 提取口径：先剥注释（否则 indexOf 可能命中注释里形如代码的锚点串），再从**行首**锚点切到
+    // buildCacheShard 之后的第一个顶层声明。不能切到首个空行——函数体内也有空行（实测会截到 152 字符）。
+    const extractBlock = (src) => {
+      const clean = stripComments(src)
+      const a = clean.indexOf('const CACHE_SHARD_ID_RE =')
+      const b = clean.indexOf('function buildCacheShard (rawId, root, pathMod) {')
+      if (a < 0 || b < 0) return ''
+      const tail = clean.slice(b)
+      const m = /\n(function |const |\(async )/.exec(tail)
+      if (!m) return clean.slice(a)
+      return clean.slice(a, b + m.index + 1)
+    }
+    const normalize = (text) => text
+      .split('\n').map(line => line.trim()).filter(Boolean).join('\n')
+    const mine = normalize(extractBlock(fs.readFileSync(__filename, 'utf8')))
+    const other = normalize(extractBlock(fs.readFileSync(path.join(__dirname, 'test_filter.js'), 'utf8')))
+    assert(mine.length > 200 && other.length > 200,
+      `同源块提取失败（自身 ${mine.length} / test_filter ${other.length} 字符）——锚点注释失效`)
+    assertEqualStr(mine, other,
+      'test_app.js 与 test_filter.js 的 sanitizeIsolationId/buildCacheShard 块必须逐字符相同（改一处必须同改另一处）')
+  })
+
   const filterNote = (onlyFilter || nameSet)
     ? `（实际执行 ${executed} 例，过滤跳过 ${skipped} 例${onlyFilter ? `，--only=${onlyFilter}` : ''}）`
     : ''
