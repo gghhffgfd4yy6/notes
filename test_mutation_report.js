@@ -254,15 +254,27 @@ check('复用判定：自报数字形状异常 ⇒ unknown（不渲染成看似�
   }
 })
 
+// SonarCloud S1244（浮点精确相等）：复用比例与阈值都是 5/10、4/10 这类确定值，改用**区间**判定。
+// 容差 1e-9 远小于任何有意义的口径漂移（这些量都是 0.1 的整数倍），故契约强度不变：
+// 0.5 被改成 0.4 / 0.6、连 0.5000000001 都会被这条断言拦住。
+const RATIO_EPS = 1e-9
+function assertRatio (actual, expected, msg) {
+  assert.ok(Math.abs(actual - expected) < RATIO_EPS,
+    `${msg}（期望 ${expected}，实际 ${actual}，容差 ${RATIO_EPS}）`)
+}
+
 check('buildReuseMeta：阈值边界（复用比例高 = ≥50%）', () => {
   const at = buildReuseMeta('app', '\tResult:\t\t5 of 10 mutant result(s) are reused.\n')
   assert.strictEqual(at.mode, REUSE_MODE_PARTIAL)
-  assert.strictEqual(at.reuseRatio, 0.5)
+  assertRatio(at.reuseRatio, 0.5, '5/10 的复用比例必须是 0.5')
   assert.strictEqual(at.highReuse, true, '恰好 50% 应算「复用比例高」（阈值语义为 ≥）')
   const below = buildReuseMeta('app', '\tResult:\t\t4 of 10 mutant result(s) are reused.\n')
   assert.strictEqual(below.highReuse, false)
-  assert.strictEqual(below.reuseRatio, 0.4)
-  assert.strictEqual(HIGH_REUSE_RATIO, 0.5, '阈值本身也是契约的一部分（日报文案里逐字写着）')
+  assertRatio(below.reuseRatio, 0.4, '4/10 的复用比例必须是 0.4')
+  // 阈值本身也是契约的一部分（日报文案里逐字写着「≥50.00%」）：「逐字」那一半由本文件的 render 用例
+  // 单独锁定（`- \`app\`：复用 98/100（98.00%） ⚠️ **复用比例高**（≥50.00%）`），本行只需拦住阈值被改动，
+  // 区间判定足以做到（见上方 RATIO_EPS 注释），故同样不用浮点精确相等。
+  assertRatio(HIGH_REUSE_RATIO, 0.5, 'HIGH_REUSE_RATIO 必须是 0.5（日报逐字写 ≥50.00%）')
   const full = buildReuseMeta('app', REAL_FULL_LOG, { generatedAt: '2026-09-20T00:00:00.000Z' })
   assert.deepStrictEqual(full, {
     segment: 'app',

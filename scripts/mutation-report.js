@@ -168,15 +168,31 @@ const HIGH_REUSE_RATIO = 0.5
 // 实测 16 变异体 × 4 次运行 = 38 行 / 3593 字节。8MiB 留了三个数量级余量；超限一律按「未记录」处理
 // 并给出原因——绝不为了拿到一个数字而整份读入病态文件（例如有人改成 --fileLogLevel debug）。
 const REUSE_LOG_MAX_BYTES = 8 * 1024 * 1024
-// ANSI CSI 序列（含 SGR 颜色）。用 String.fromCharCode(27) 构造而非正则字面量里的 \u001B：
-// 后者会命中 eslint 的 no-control-regex（standard 启用），而这里的目的只是「剥掉转义序列」。
-const ANSI_ESCAPE_RE = new RegExp(String.fromCharCode(27) + '\\[[0-?]*[ -/]*[@-~]', 'g')
+// ANSI CSI 序列（含 SGR 颜色），形态为 ESC '[' [0-?]* [ -/]* [@-~]（ECMA-48 的 CSI 子集）。
+// 刻意**不用正则**实现——两种正则写法都得靠抑制注释才能过静态检查，而这里根本不需要正则：
+//   · 正则字面量要把 ESC 写成 \u001B/\x1b，命中 eslint 的 no-control-regex（standard 启用）；
+//   · new RegExp(拼接字符串) 又踩 Codacy 的「RegExp 构造函数传非字面量」告警（本文件此前正是这种写法）。
+// 手写扫描没有回溯面，剥离规则本身就是逐字符的定长状态机；行为与旧的 ANSI_ESCAPE_RE 逐字节等价
+// （由 test_mutation_report.js 的 stripAnsi 用例锁定：转义序列全部剥掉、且剥后可正常解析复用计数）。
+const ESC_CHAR = String.fromCharCode(27)
+function stripAnsi (text) {
+  const s = String(text)
+  if (s.indexOf(ESC_CHAR) === -1) return s // 常见形态（写进文件的那份 stryker.log）0 个 ESC 字节：原样返回
+  let out = ''
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) === 27 && s[i + 1] === '[') {
+      let j = i + 2
+      while (j < s.length && s[j] >= '0' && s[j] <= '?') j++ // 参数字节 [0-?]
+      while (j < s.length && s[j] >= ' ' && s[j] <= '/') j++ // 中间字节 [ -/]
+      if (j < s.length && s[j] >= '@' && s[j] <= '~') { i = j; continue } // 终止字节 [@-~]（缺终止字节则不是 CSI）
+    }
+    out += s[i]
+  }
+  return out
+}
+
 const FULL_RUN_LOG_RE = /No incremental result file found at .*?, a full mutation testing run will be performed\./g
 const REUSE_LOG_RE = /Result:\s+(\d+) of (\d+) mutant result\(s\) are reused\./g
-
-function stripAnsi (text) {
-  return String(text).replace(ANSI_ESCAPE_RE, '')
-}
 
 // 取**最后一次**匹配（全局正则逐次 exec；零宽匹配时手动推进 lastIndex，避免死循环）
 function lastMatch (re, text) {

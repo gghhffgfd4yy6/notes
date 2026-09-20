@@ -566,13 +566,24 @@ check('PERF_MS 缩放 ④: 生效上界必须来自本进程 PERF_MS，断言点
   // 缩放函数本身），而本机实测比值仅 2.4–3.0× ⇒ 套件静默变绿、沙箱假杀复现。故直接扫本文件源码：
   //   (i) 逐行锁定 4 个比值断言行（以 tMal 起头紧跟比较符的行）都必须调用 ratioBudget；
   //   (ii) 再全局禁止「倍数 乘 tBenign」的裸形式（含括号包裹变体，朴素紧邻匹配会漏掉它）。
-  const src = fs.readFileSync(__filename, 'utf8')
-  const ratioLines = src.split('\n').filter(l => /^\s*tMal\s*<=/.test(l))
+  // SonarCloud S8786（正则超线性回溯）：匹配前先做**归一**——去掉全部空白（replace(/\s+/g, '')）再
+  // 去掉括号（replace(/[()]/g, '')）。归一后的待测串里既没有空白也没有括号，两条模式就只剩
+  // 「字面量 + 单个量词 + 字面量」这一最简单形态：不再需要 \s*、不再需要可空的 `\(`/`\)`，
+  // 也不再需要「倍数在左 / tBenign 在左」的交替分支 ⇒ 匹配退化为确定的一趟线性扫描。
+  // 检测力不降：归一发生在匹配**之前**，且除逐行归一外还对整份源码归一并全局匹配一次
+  // （与旧实现的「整份源码 + 可跨行 \s*」覆盖面相同；括号在归一阶段消掉，故括号包裹变体照样命中）；
+  // 逐行那步只是额外把比率断言行单独挑出来核对。
+  const flatLines = fs.readFileSync(__filename, 'utf8').split('\n').map(l => l.replace(/\s+/g, ''))
+  const flatSrc = flatLines.join('') // 等价于 src.replace(/\s+/g, '')：行内空白与换行都被去掉
+  const ratioLines = flatLines.filter(l => l.startsWith('tMal<='))
   assert.strictEqual(ratioLines.length, 4, `应有 4 条比值断言行（2 条 10× + 2 条 25×），实际 ${ratioLines.length} 条`)
   for (const l of ratioLines) {
-    assert.match(l, /^\s*tMal\s*<=\s*ratioBudget\(/, `比值断言行必须走 ratioBudget 缩放，实际：${l.trim()}`)
+    assert.match(l, /^tMal<=ratioBudget\(/, `比值断言行必须走 ratioBudget 缩放，实际：${l}`)
   }
-  const bareRatio = src.match(/tMal\s*<=\s*\(?\s*(?:[\d.]+\s*\*\s*tBenign|tBenign\s*\*\s*[\d.]+)/g) || []
+  // 两条互不歧义的简单模式（各自都是线性的）：倍数在左 / 倍数在右；括号包裹变体已由上面的归一消掉
+  const bareSrc = flatSrc.replace(/[()]/g, '')
+  const bareRatioRes = [/tMal<=[0-9.]+\*tBenign/, /tMal<=tBenign\*[0-9.]+/]
+  const bareRatio = bareRatioRes.map(re => bareSrc.match(re)).filter(Boolean).map(m => m[0])
   assert.deepStrictEqual(bareRatio, [], `比值断言不得退回不含 PERF_SCALE 因子的裸形式，已发现：${bareRatio.join(' / ')}`)
 })
 
