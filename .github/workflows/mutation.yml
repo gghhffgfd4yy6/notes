@@ -227,7 +227,16 @@ jobs:
           #      陈旧增量复用不再能误导任何门禁，「为保护分数门禁而强制全量」这个理由本身就不成立了。
           # 裁剪措辞（有意为之，不是遗漏）：**当前无分数门禁 ⇒ 复用不构成门禁风险；这是有意接受的取舍。**
           #      代价如实写明：被复用的变异体沿用**旧测试状态**下的 killed/survived（不重算），若测试在此期间
-          #      变弱，旧基线不会自动失效——这一点在没有分数门禁时只影响日报数字，不影响任何门的红绿。
+          #      变弱，旧基线不会自动失效——这一点在没有分数门禁时不改变任何门的红绿。
+          # **但它在「呈现」这一层仍是真实缺陷（PR #158 Qodo Medium / Correctness 指出的那一层）**：
+          #      日报与 artifact 会把复用来的旧结果**当作本 commit 的结果**呈现，读者原本无法分辨。
+          #      本 PR 的处理是让复用**可见**（不改变量口径、不强制全量）：段 job 的「变异测试」step 带
+          #      `--fileLogLevel info` 落 stryker.log，紧随其后由「记录本段增量复用状态」step 解析出
+          #      「本轮全量 / 复用 N/M」写进 reports/mutation/reuse.json，随 artifact 到汇总 job，
+          #      日报据此逐段标注并在复用比例 ≥50% 时显式提示「该段未全部重算，分数/存活清单可能来自旧测试状态」。
+          #      残余边界（如实登记）：① 没读到日志/reuse.json 的段显示「未记录」，日报会另给一条
+          #      「不要假定它们是全量重算」的提示——不会被静默读成「全量」；② 分数本身仍是复用后的值
+          #      （本 PR 有意不改口径），真正的诚实全量重跑留到下一个 PR 的 TAP 迁移（届时全量只需几分钟）。
           # 仍然成立的技术事实（回退不改变它们，勿顺手删）：
           #   * matrix.src 是真实文件名，可直接作 hashFiles 参数；而 mutate 里的范围字面量（如
           #     "xbk_function_v3.js:1-442"）**不能**作 hashFiles 参数——按字面量找不到文件会返回空指纹，
@@ -291,9 +300,18 @@ jobs:
       # 后续所有步骤一起杀掉（详见 job 级 timeout-minutes 注释），step 级超时只杀这一步、job 继续跑 ⇒
       # 下方 if: always() 的「守卫 / 剥离 / 上传 / 清理」仍有窗口。330 高于实测最大段耗时
       # （check-deps 215.2min）⇒ 正常段落不会被误杀。
+      # --fileLogLevel info：把 stryker 的 INFO 日志同时写进 cwd 的 stryker.log（LoggingBackend 把
+      #   priority ≥ activeFileLevel 的事件写进该文件；默认 fileLogLevel 是 off ⇒ 不写文件）。
+      #   这是「复用状态可见」（PR #158 Qodo Medium / Correctness）的**唯一判定源**：报告本身没有复用标记
+      #   （mutation-testing-report-schema 的 MutantResult 无任何 reuse 维度，已核实），而 incremental-differ
+      #   只把「本轮复用了 N/M 个结果」写进 INFO 日志（`Result: N of M mutant result(s) are reused.`，
+      #   另见 fs/project-reader.js 的全量分支 `No incremental result file found at …`）。下方「记录本段增量
+      #   复用状态」step 读这个文件并落盘 reuse.json，随 artifact 到达汇总 job，日报据此逐段标注
+      #   「本轮全量 / 复用 N/M」。info 级**没有**逐变异体日志 ⇒ stryker.log 是 KB 级（实测 25 分钟段 3.9KB），
+      #   不构成 artifact/缓存体积问题；`/stryker.log` 也在 stryker 的 always-ignorePatterns 里，不进沙箱。
       - name: 变异测试（${{ matrix.name }}）
         timeout-minutes: 330
-        run: npx stryker run --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 8
+        run: npx stryker run --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 8 --fileLogLevel info
         env:
           PERF_MS: 3000   # 宽松性能阈值（插桩开销）
           # stryker 的 commandRunner 继承本 step 环境，反复 spawn run_unit_tests.js（初始运行 + 每个变异体），
@@ -317,6 +335,38 @@ jobs:
       - name: 变异报告 fail-closed 守卫（${{ matrix.name }}）
         if: always()
         run: node scripts/mutation-guard.js --segment "${{ matrix.name }}" reports/mutation/mutation.json
+
+      # 复用状态落盘（PR #158 Qodo Medium / Correctness）：本段本轮到底是「全量重算」还是「复用了 N/M 个
+      # 旧结果」，只有 stryker 日志知道（报告本身没有这个维度）。这一步把它固化成 reports/mutation/reuse.json，
+      # 随 artifact 到达汇总 job ⇒ 日报逐段标注「本轮全量 / 复用 N/M」，并在复用比例高时显式提示
+      # 「该段未全部重算，分数/存活清单可能来自旧测试状态」。**不改分数口径**（(killed+timeout)/total 不变）、
+      # **不改 EXPECTED_SEGMENTS 对账**、**不给日报加 throw**（日报 throw 会在最需要看分数时把日报吞掉）。
+      # 位置：stryker 之后（stryker.log 已写完）、上传 artifact 之前（reuse.json 必须进 artifact）。
+      # 为什么 if: always()：与守卫/剥离/上传同一口径——stryker 失败/超时时也要把「没判出来」如实落盘
+      #   （mode=unknown），绝不留给读者一个「看起来是全量」的空白。
+      # 为什么必须**在剥离之前**（本步位置满足）：剥离步会重写 reports/mutation/mutation.json（置空
+      #   statusReason），而本步的存在性闸门与内容都只看 stryker.log + 报告是否存在，与剥离无耦合；
+      #   但把本步放到剥离之后就与「上传前产物已定稿」这一顺序脱节，故统一前置。
+      # 为什么失败不置退出码（runReuseMode 恒返回 0，除参数非法）：复用状态是**可观测性**，不是门禁。
+      #   段 job 因「缺一个标注」变红会把「报告不可信」（守卫负责）与「报告少一个维度」混为一谈；
+      #   而 mode=unknown 在日报里显示为「未记录」，不会被伪装成「全量」。
+      # 与 if-no-files-found: error 的关系（**关键，不得放宽**）：本步只在 reports/mutation/mutation.json
+      #   已存在时才写 reuse.json。否则一个崩溃段会因多出 reuse.json 而让目录非空，上传步的
+      #   `if-no-files-found: error` 不再触发，「stryker 没产出报告 ⇒ 段 job 响亮变红」被降级成
+      #   「汇总 job 缺段才暴露」——那是 PR #156 有意前移的故障信号。该闸门由
+      #   test_mutation_report_cli.js 的「无报告不得写 reuse.json」用例锁定。
+      # 残余边界（本轮补，已实测复现）：`Result: N of M` 的 M 只统计**当前 --mutate 范围**内的变异体，
+      #   而 incremental-differ 的 sticky 分支会把旧增量报告中**已不在当前范围**的变异体原样并入报告
+      #   （status 沿用旧运行），且既不计入 N 也不计入 M ⇒ N/M 只是旧结果占比的**下界**。本仓可达：
+      #   缓存 key 是 `stryker-<段>-<hashFiles(…, matrix.src)>`、**不含 mutate 范围**，且 `restore-keys` 是
+      #   **裸前缀兜底 `stryker-<段>-`** ⇒ 主 key 未命中时也会恢复最近一条同前缀缓存；叠加 AGENTS.md 要求的
+      #   大文件增长时**重拆 mutate 行段** ⇒ 旧 inc 里落在新范围外的变异体被 sticky 分支并入。处理＝**只呈现、不改口径**：日报的
+      #   「♻️ 复用状态」小节对「报告变异体数 vs 日志口径 M」不一致的段单独点名（reuseUnaccountedCount，
+      #   纯显示层交叉校验，不加 throw、不新增第四态），并明说比例只是下界；`0 of M` 但计数对不上的段
+      #   不再被并进「全部全量重算 ⇒ 对应本 commit 的测试状态」这句结论。
+      - name: 记录本段增量复用状态（${{ matrix.name }}）
+        if: always()
+        run: node scripts/mutation-report.js --reuse --segment "${{ matrix.name }}" --log stryker.log --out reports/mutation/reuse.json
 
       # F-04（落盘侧，REV-CI）：修掉 statusReason 的「纯废重」膨胀。stryker 的 command runner 把每个
       # 变异体的整段测试输出写进 statusReason，实测占 mutation-report.json 的 99.89%
