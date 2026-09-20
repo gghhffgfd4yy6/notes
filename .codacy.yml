@@ -126,12 +126,31 @@
 # fs.readFileSync(path.join(__dirname, 'qinglong', 'xbk_push.js')) 的目标只由模块常量 __dirname
 # 与仓库内硬编码相对路径拼成，无任何外部净输入参与路径构造——动态路径告警属误报
 # （与上方 test_check_version.js / scripts/check-mutation-ranges.js 同类处理）。
+#
+# scripts/mutation-report.js 是变异日报汇总 / 复用状态落盘工具（本地/CI 工具，不进入生产运行时，
+# 与上方 scripts/mutation-json.js 同族同信任模型）：「读调用方给出的路径」正是它的本职工作——
+#   · `--reuse` 模式的 --log/--out 由 .github/workflows/mutation.yml 的「记录本段增量复用状态」step
+#     以固定字面量传入（node scripts/mutation-report.js --reuse --segment "${{ matrix.name }}"
+#     --log stryker.log --out reports/mutation/reuse.json）；
+#   · 汇总模式的 reports-dir 同样来自该 workflow（固定值 mutation-reports），且 analyze() 入口先
+#     statSync + isDirectory() 校验，不合法即 exit 1；
+#   · readLogText() 先 path.resolve() 归一，按「单次 openSync + 只对 fd 做 fstatSync/读取」访问路径
+#     （与本仓 scripts/mutation-json.js 的 readGuardedBytes 同口径，消除 check-then-use 竞态），
+#     非普通文件 / 超 REUSE_LOG_MAX_BYTES / 读失败一律抛错并由调用侧转成「未记录 + 原因」；
+#   · writeReuseMeta() 的 outPath 同样先 path.resolve()，且只在 mutation.json 已存在时才落盘。
+# 故本轮 Codacy 报在本文件的 6 处「动态构造文件/路径信息」告警——openSync（报作 :263）/
+# readFileSync(fd)（:271）/ readFileSync(reuse.json)（:341）/ existsSync（:388）/ mkdirSync（:391）/
+# writeFileSync（:392）〔行号按被分析的 a52e104 计；本提交改了本文件，行号会随之平移〕——在这条
+# 调用链上都不成立，属误报（规则本身只放行字符串字面量首参，而本工具的首参按设计必然是调用方给出的变量）。
+# 注：同文件 `:173` 的「RegExp 构造函数传非字面量」**不属于**本类——已改代码消除（stripAnsi 去掉
+# 正则与构造函数，见脚本内注释），不是靠这条排除压掉的；此处排除只针对上面 6 处动态路径误报。
 exclude_paths:
   - ".github/analyze-artifacts.js"
   - "check-version.js"
   - "scripts/check-mutation-ranges.js"
   - "scripts/install-hooks.js"
   - "scripts/mutation-json.js"
+  - "scripts/mutation-report.js"
   - "test_ci_skip_suites.js"
   - "run_mutation.js"
   - "test_storage.js"

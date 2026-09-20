@@ -538,4 +538,151 @@ function schemaReport (seg, mutants) {
   }
 }
 
+// 场景 18（PR #158 Qodo Medium / Correctness）：`--reuse` 落盘模式的端到端行为。
+// 三个契约：
+//   ① 有报告 + 有日志 ⇒ 落盘 reuse.json（段名/模式/复用数/总数/比例/原文证据齐全）；
+//   ② **无报告 ⇒ 一个字都不许写**（连目录都不建）——否则崩溃段因多出 reuse.json 让
+//      reports/mutation/ 非空，上传步的 `if-no-files-found: error` 失效，「stryker 没产出报告 ⇒
+//      段 job 响亮变红」被降级成「汇总 job 缺段才暴露」（PR #156 有意前移的故障信号）；
+//   ③ 参数非法 ⇒ exit 1（fail-closed，不得静默按默认值跑）。
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-reuse-cli-'))
+  try {
+    const log = path.join(dir, 'stryker.log')
+    // 实测日志原文（本机最小 stryker 工程 + @stryker-mutator/core@10.0.0）
+    fs.writeFileSync(log, '11:21:39 (9070) INFO IncrementalDiffer Incremental report:\n' +
+      '\tMutants:\t0 files changed (+0 -0)\n' +
+      '\tResult:\t\t10 of 13 mutant result(s) are reused.\n')
+    const out = path.join(dir, 'reports', 'mutation', 'reuse.json')
+
+    // ② 先测「无报告 ⇒ 不写」：此时目录还不存在
+    const skipped = runCli(['--reuse', '--segment', 'app', '--log', log, '--out', out])
+    assert.strictEqual(skipped.code, 0, `无报告时应跳过并 exit 0，stderr: ${skipped.stderr}`)
+    assert.ok(skipped.stdout.includes('跳过写复用状态'), '应打印跳过原因（否则「复用状态没落盘」在 CI 里无声无息）')
+    assert.strictEqual(fs.existsSync(out), false, '无 mutation.json 时不得写 reuse.json')
+    assert.strictEqual(fs.existsSync(path.dirname(out)), false, '无 mutation.json 时连目录都不该创建')
+
+    // ① 有报告 ⇒ 落盘
+    fs.mkdirSync(path.dirname(out), { recursive: true })
+    fs.writeFileSync(path.join(path.dirname(out), 'mutation.json'), '{"files":{}}')
+    const ok = runCli(['--reuse', '--segment', 'app', '--log', log, '--out', out])
+    assert.strictEqual(ok.code, 0, `有报告时应 exit 0，stderr: ${ok.stderr}`)
+    assert.ok(ok.stdout.includes('复用 10/13'), `stdout 应报出复用数：${ok.stdout}`)
+    const meta = JSON.parse(fs.readFileSync(out, 'utf8'))
+    assert.strictEqual(meta.segment, 'app')
+    assert.strictEqual(meta.mode, 'partial')
+    assert.strictEqual(meta.reused, 10)
+    assert.strictEqual(meta.total, 13)
+    assert.strictEqual(meta.highReuse, true)
+    assert.ok(meta.evidence.includes('Result:\t\t10 of 13 mutant result(s) are reused.'),
+      'evidence 必须留 stryker 日志原文（人工可复核判定源）')
+
+    // ③ 参数非法 ⇒ exit 1
+    for (const args of [['--reuse', '--segment', 'app'], ['--reuse', '--log', log], ['--reuse', '--segmnt', 'app', '--log', log]]) {
+      const bad = runCli(args)
+      assert.strictEqual(bad.code, 1, `参数非法应 exit 1：${args.join(' ')}`)
+      assert.ok(bad.stderr.includes('参数非法'), `应给出参数非法提示：${bad.stderr}`)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// 场景 19（PR #158 · 接线）：复用状态的**生产链路**必须接全，否则日报永远显示「未记录」而没人发现。
+// 链路三段（缺任一段，功能静默失效）：
+//   ① 「变异测试」step 必须带 `--fileLogLevel info` —— stryker 默认 fileLogLevel 是 off，不写 stryker.log；
+//      而报告本身没有复用维度（mutation-testing-report-schema 的 MutantResult 无任何 reuse 字段），
+//      日志是唯一判定源 ⇒ 少了这个 flag，「复用可见」整条链失效且**没有任何报错**；
+//   ② 必须存在「记录本段增量复用状态」step：if: always()、经生产 CLI `node scripts/mutation-report.js --reuse`、
+//      带 --segment/--log/--out 三个参数（不得内联脚本，否则与用例/文档漂移）；
+//   ③ 顺序：stryker → 本 step → 上传 artifact（在 stryker 之前没日志可读；在上传之后 reuse.json 进不了
+//      artifact，汇总 job 拿不到 ⇒ 日报照旧显示「未记录」）。
+// 断言只读**活动 YAML 行**（注释不算证据），并配两条靶向反例。
+{
+  const ymlPath = path.join(__dirname, '.github', 'workflows', 'mutation.yml')
+  const assertReuseContract = (ymlText) => {
+    const all = ymlText.split('\n')
+    const jobStart = all.findIndex(l => /^ {2}mutation:\s*$/.test(l))
+    let jobEnd = all.length
+    for (let i = jobStart + 1; i < all.length; i++) {
+      if (/^ {2}\S/.test(all[i])) { jobEnd = i; break }
+    }
+    assert.ok(jobStart >= 0 && jobEnd > jobStart, 'mutation.yml 必须能定位 matrix job')
+    const job = all.slice(jobStart, jobEnd)
+    const stepAt = (name) => job.findIndex(l => l.trim() === `- name: ${name}`)
+    const strykerAt = stepAt('变异测试（' + '${' + '{ matrix.name }}）')
+    const reuseAt = stepAt('记录本段增量复用状态（' + '${' + '{ matrix.name }}）')
+    const uploadAt = stepAt('上传变异报告')
+    assert.ok(strykerAt >= 0 && uploadAt >= 0, '必须能定位变异测试与上传变异报告步骤')
+    assert.ok(reuseAt >= 0, 'mutation.yml 必须存在「记录本段增量复用状态」step：' +
+      '它是「复用可见」（PR #158 Qodo Medium）的唯一落盘点，被删掉后日报会静默退回「未记录」而无人察觉')
+    // ① stryker 的**活动** run 行必须带 --fileLogLevel info（注释里写不算）
+    const strykerRun = (job.slice(strykerAt, reuseAt).find(l => l.trim().startsWith('run:')) || '').trim()
+    assert.ok(strykerRun.startsWith('run: npx stryker run'), '变异测试 step 的 run 行应是 stryker 命令')
+    assert.match(strykerRun, /--fileLogLevel info(\s|$)/,
+      'stryker 运行行必须带 `--fileLogLevel info`（默认 fileLogLevel=off ⇒ 不写 stryker.log ⇒ 复用状态永远「未记录」）')
+    // ② 本 step 的契约
+    let reuseEnd = job.length
+    for (let i = reuseAt + 1; i < job.length; i++) {
+      const t = job[i].trim()
+      if (t.startsWith('- uses:') || t.startsWith('- name:') || t.startsWith('- id:')) { reuseEnd = i; break }
+    }
+    const reuseStep = job.slice(reuseAt, reuseEnd)
+    assert.ok(reuseStep.some(l => l.trim() === 'if: always()'),
+      '复用状态 step 必须带 if: always()：stryker 失败/超时时也要把「没判出来」如实落盘（否则该段连「未记录」都没有）')
+    const reuseRun = (reuseStep.find(l => l.trim().startsWith('run:')) || '').trim()
+    assert.ok(reuseRun.includes('node scripts/mutation-report.js --reuse'),
+      '必须经生产 CLI `node scripts/mutation-report.js --reuse` 执行（内联脚本会与用例/文档漂移）')
+    assert.match(reuseRun, /--segment\s+"\$\{\{\s*matrix\.name\s*\}\}"/,
+      '必须带 --segment "$' + '{' + '{ matrix.name }}"（与 mutation.yml 的 matrix 变量同源）')
+    assert.match(reuseRun, /--log\s+stryker\.log(\s|$)/, '必须带 --log stryker.log（与 --fileLogLevel info 的落点一致）')
+    assert.match(reuseRun, /--out\s+reports\/mutation\/reuse\.json(\s|$)/,
+      '必须带 --out reports/mutation/reuse.json：只有这个目录会随 artifact 到汇总 job')
+    // ③ 顺序
+    assert.ok(reuseAt > strykerAt, '复用状态 step 必须在 stryker 之后（之前没有 stryker.log 可读）')
+    assert.ok(reuseAt < uploadAt, '复用状态 step 必须在上传 artifact 之前（之后写就进不了 artifact，日报拿不到）')
+  }
+  assertReuseContract(fs.readFileSync(ymlPath, 'utf8'))
+
+  // 反例 A（靶向）：只把**活动 run 行**上的 --fileLogLevel info 删掉 ⇒ 同一套提取+断言必须红。
+  // 必须锚在 `run: npx stryker run` 那一行：注释里也写着 `--fileLogLevel info`，若用宽松的
+  // `replace(/ --fileLogLevel info/m)`，被删掉的是注释里那处（活动行仍在）⇒ 反例根本不成立。
+  {
+    const real = fs.readFileSync(ymlPath, 'utf8')
+    const stripped = real.replace(/^( *run: npx stryker run .*?) --fileLogLevel info$/m, '$1')
+    assert.notStrictEqual(stripped, real, '反例夹具必须真的从活动 run 行删掉了 --fileLogLevel info（没改成本回归形同虚设）')
+    assert.ok(!/^ *run: npx stryker run .*--fileLogLevel info$/m.test(stripped), '夹具中活动 run 行应已不含该 flag')
+    assert.throws(() => assertReuseContract(stripped), /--fileLogLevel info/,
+      '去掉活动 run 行的 --fileLogLevel info 后必须红：否则「日志判定源」被静默切断而套件仍全绿')
+  }
+  // 反例 B（靶向）：把复用状态 step 挪到上传之后 ⇒ 必须红（artifact 里不会有 reuse.json）。
+  // 以**行**为单位搬移（按 6 空格缩进的 step 起点切块），不能按字符串首尾切片——那会把整块搬到文件末尾
+  // （跑到 report job 之后），断言红的原因就变成「找不到 step」而不是「顺序不对」，反例证明不了要证的事。
+  {
+    const real = fs.readFileSync(ymlPath, 'utf8')
+    const lines = real.split('\n')
+    const stepStartRe = /^ {6}- (?:name|uses|id):/
+    const blockEnd = (arr, at) => {
+      for (let i = at + 1; i < arr.length; i++) {
+        if (stepStartRe.test(arr[i])) return i
+      }
+      return arr.length
+    }
+    const reuseName = '记录本段增量复用状态（' + '${' + '{ matrix.name }}）'
+    const reuseAt = lines.findIndex(l => l.trim() === `- name: ${reuseName}`)
+    assert.ok(reuseAt > 0, '夹具必须能定位复用状态 step')
+    const block = lines.slice(reuseAt, blockEnd(lines, reuseAt))
+    const rest = [...lines.slice(0, reuseAt), ...lines.slice(blockEnd(lines, reuseAt))]
+    const upAt = rest.findIndex(l => l.trim() === '- name: 上传变异报告')
+    assert.ok(upAt > 0, '夹具必须能定位上传变异报告 step')
+    const upEnd = blockEnd(rest, upAt)
+    const moved = [...rest.slice(0, upEnd), ...block, ...rest.slice(upEnd)].join('\n')
+    assert.notStrictEqual(moved, real, '反例夹具必须真的挪动了 step')
+    assert.ok(moved.indexOf(`- name: ${reuseName}`) > moved.indexOf('- name: 上传变异报告'),
+      '夹具中复用状态 step 必须已排在上传之后（否则反例证明的不是「顺序错会红」）')
+    assert.throws(() => assertReuseContract(moved), /必须在上传 artifact 之前/,
+      '把复用状态 step 挪到上传之后必须红：否则 artifact 里没有 reuse.json，日报永远「未记录」而套件仍全绿')
+  }
+}
+
 console.log('test_mutation_report_cli OK')

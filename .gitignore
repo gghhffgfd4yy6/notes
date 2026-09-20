@@ -4,6 +4,9 @@ push_config.local.js
 .git.corrupt_backup
 .tools
 .stryker-tmp
+# mutation.yml 的「变异测试」step 带 --fileLogLevel info ⇒ stryker 把 INFO 日志写到 cwd 的 stryker.log
+# （本机手工跑同一命令也会产生）。它是复用状态的判定源、只进 artifact 旁的 reuse.json，本身不入库。
+stryker.log
 reports
 coverage
 mutation-progress.json

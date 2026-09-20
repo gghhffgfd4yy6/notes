@@ -119,6 +119,296 @@ function validateFreshness (results, maxSkewMs = resolveMaxSkewMs(process.env.MU
   return results
 }
 
+// ===== 复用状态（PR #158 评审 · Qodo Medium / Correctness）=============================
+// 问题：mutation.yml 的增量缓存 key **有意不含测试侧指纹**（本 PR 的取舍，理由见该文件「恢复增量缓存」
+//   注释），而 coverageAnalysis:'off' 下 incremental-differ 在拿不到覆盖信息时**无条件复用**旧结果
+//   （@stryker-mutator/core 的 mutants/incremental-differ.js：`if (!testCoverage.hasCoverage) return true`）
+//   ⇒ 被复用的变异体沿用**旧测试状态**下的 killed/survived。当前 thresholds.break = null（无分数门禁），
+//   故这不构成任何门禁风险；但**日报与 artifact 会把旧结果呈现为「本 commit 的结果」**，读者无法分辨。
+//   这一层是真实缺陷。本节的唯一目标：让「复用」在报告里**可见**——不改分数口径、不改 EXPECTED_SEGMENTS、
+//   不加任何 throw（日报 throw 会在最需要看分数时把日报一起吞掉，见 _renderSegmentTable 的注释）。
+//
+// 判定源（已实测，非推测）：stryker 把两种情形都写进 INFO 日志，而 mutation.yml 的「变异测试」step
+//   现在带 `--fileLogLevel info` ⇒ 同一份日志落进 cwd 的 `stryker.log`（LoggingBackend 把
+//   priority ≥ activeFileLevel 的事件写进该文件，见 @stryker-mutator/core 的 logging/logging-backend.js；
+//   两条目标行都是 logger.info，且 info 级**没有**逐变异体日志 ⇒ 日志是 KB 级）：
+//     * 全量：`No incremental result file found at <file>, a full mutation testing run will be performed.`
+//       （fs/project-reader.js 的 readIncrementalReport，读 inc 文件 ENOENT 分支）
+//     * 复用：`Result:\t\t<N> of <M> mutant result(s) are reused.`
+//       （mutants/incremental-differ.js 的 diff()，isInfoEnabled() 分支，随 `Incremental report:` 多行输出）
+//   实测证据（本机最小 stryker 工程 + 同版本 @stryker-mutator/core@10.0.0，`--incremental` 连跑三次，
+//   每次都带 `--fileLogLevel info`，三次运行的三行都落在同一份 stryker.log 里）：
+//     ① 无 inc 文件：`INFO ProjectReader No incremental result file found at inc.json, a full mutation testing run will be performed.`
+//     ② inc 文件在且源未变：`INFO IncrementalDiffer Incremental report:` / `\tMutants:\t0 files changed (+0 -0)` / `\tResult:\t\t10 of 10 mutant result(s) are reused.`
+//     ③ 改了源文件：`\tResult:\t\t10 of 13 mutant result(s) are reused.`
+//   **报告本身没有复用标记**：mutation-testing-report-schema 的 MutantResult 只有
+//   id/mutatorName/replacement/status/statusReason/location/coveredBy/killedBy/testsCompleted/static 等字段，
+//   没有任何 reuse 维度（已核对该包内的 schema JSON）⇒ 日志是唯一可用判定源，必须在**段 job 里**落盘成
+//   `reports/mutation/reuse.json` 才能随 artifact 到达汇总 job（汇总 job 只拿得到 reports/mutation/）。
+//
+// 实测坑（都会导致「读到的复用状态是错的」，必须防）：
+//   ① 日志文件以 `flags: 'a'` 打开 ⇒ 同一路径会累积多次运行的记录，**必须取最后一次事件**
+//      （实测：连跑 4 次后同一份 stryker.log 里有 1 条「全量」+ 3 条「复用」，取首个匹配会把第一次
+//      运行的「全量」当成结论）。
+//   ② 消息里的 ANSI 着色（**已实测核实，结论与直觉相反，勿照抄「必须剥」的说法**）：
+//      `chalk.yellowBright(reusedMutantCount)` 是在**消息构造时**着色的，CI 的 chalk.level>0 时消息
+//      确实带 `ESC[93m…ESC[39m`（本机 `FORCE_COLOR=1` 实测：stdout 上是 `^[[93m14^[[39m of 14 …`）。
+//      但**写进文件的那份日志是干净的**——文件走 `LoggingEvent.format()`，它显式
+//      `.replace(ansiRegex, '')`（@stryker-mutator/core 的 logging/logging-event.js），只有写 stdout 的
+//      `formatColorized()` 保留颜色。同一实验里 stryker.log 全文件 **0 个 ESC 字节**，`Result:` 行是纯文本。
+//      故 `stripAnsi` 是**纵深防御**（防 stryker 未来改掉 format()、或有人把 stdout 文本喂进本解析器），
+//      不是当前文件格式的必要条件；留着零成本，但注释与文档**不得**再宣称「CI 下文件日志带 ANSI」。
+const REUSE_MODE_FULL = 'full'
+const REUSE_MODE_PARTIAL = 'partial'
+const REUSE_MODE_UNKNOWN = 'unknown'
+// 「复用比例高」的阈值：过半结果取自旧运行 ⇒ 日报额外给一条显式提示（比例本身逐段照示，不靠阈值才可见）。
+const HIGH_REUSE_RATIO = 0.5
+// stryker.log 的策略读取上限。info 级**没有**逐变异体日志（逐变异体那条是 clear-text-reporter 的
+// `this.log.debug(input)`，debug 级不落 info 文件）⇒ 体积不随变异体数增长，只随「运行次数」线性增长：
+// 实测 16 变异体 × 4 次运行 = 38 行 / 3593 字节。8MiB 留了三个数量级余量；超限一律按「未记录」处理
+// 并给出原因——绝不为了拿到一个数字而整份读入病态文件（例如有人改成 --fileLogLevel debug）。
+const REUSE_LOG_MAX_BYTES = 8 * 1024 * 1024
+// ANSI CSI 序列（含 SGR 颜色），形态为 ESC '[' [0-?]* [ -/]* [@-~]（ECMA-48 的 CSI 子集）。
+// 刻意**不用正则**实现——两种正则写法都得靠抑制注释才能过静态检查，而这里根本不需要正则：
+//   · 正则字面量要把 ESC 写成 \u001B/\x1b，命中 eslint 的 no-control-regex（standard 启用）；
+//   · new RegExp(拼接字符串) 又踩 Codacy 的「RegExp 构造函数传非字面量」告警（本文件此前正是这种写法）。
+// 手写扫描没有回溯面，剥离规则本身就是逐字符的定长状态机；行为与旧的 ANSI_ESCAPE_RE 逐字节等价
+// （由 test_mutation_report.js 的 stripAnsi 用例锁定：转义序列全部剥掉、且剥后可正常解析复用计数）。
+const ESC_CHAR = String.fromCharCode(27)
+function stripAnsi (text) {
+  const s = String(text)
+  if (s.indexOf(ESC_CHAR) === -1) return s // 常见形态（写进文件的那份 stryker.log）0 个 ESC 字节：原样返回
+  let out = ''
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) === 27 && s[i + 1] === '[') {
+      let j = i + 2
+      while (j < s.length && s[j] >= '0' && s[j] <= '?') j++ // 参数字节 [0-?]
+      while (j < s.length && s[j] >= ' ' && s[j] <= '/') j++ // 中间字节 [ -/]
+      if (j < s.length && s[j] >= '@' && s[j] <= '~') { i = j; continue } // 终止字节 [@-~]（缺终止字节则不是 CSI）
+    }
+    out += s[i]
+  }
+  return out
+}
+
+const FULL_RUN_LOG_RE = /No incremental result file found at .*?, a full mutation testing run will be performed\./g
+const REUSE_LOG_RE = /Result:\s+(\d+) of (\d+) mutant result\(s\) are reused\./g
+
+// 取**最后一次**匹配（全局正则逐次 exec；零宽匹配时手动推进 lastIndex，避免死循环）
+function lastMatch (re, text) {
+  re.lastIndex = 0
+  let m
+  let last = null
+  while ((m = re.exec(text)) !== null) {
+    last = m
+    if (m.index === re.lastIndex) re.lastIndex++
+  }
+  return last
+}
+
+/**
+ * 从 stryker 日志文本判定**本轮**该段的复用状态（纯函数，便于测试注入任意日志夹具）。
+ *
+ * 两类事件取「位置靠后」的那一次：日志是追加写的，多次运行的记录会叠在同一份文件里，位置即时间序。
+ * 同一次运行内两者互斥（inc 文件缺失时 incremental-differ 根本不会被调用，见 mutant-test-planner 的
+ * `if (incrementalReport)`），所以这个比较不会把同一次运行的两个事件混起来。
+ *
+ * @param {string} logText stryker.log 文本（可含 ANSI 转义、CRLF）
+ * @returns {{mode: string, reused?: number, total?: number, evidence?: string, reason?: string, note?: string}}
+ *   mode ∈ full / partial / unknown；unknown 一定带 reason（绝不猜）
+ */
+function parseReuseFromLog (logText) {
+  const text = stripAnsi(logText === undefined || logText === null ? '' : logText)
+  const full = lastMatch(FULL_RUN_LOG_RE, text)
+  const reuse = lastMatch(REUSE_LOG_RE, text)
+  if (!full && !reuse) {
+    return {
+      mode: REUSE_MODE_UNKNOWN,
+      reason: '日志中既无「全量运行」也无「复用 N/M」记录（未开 --fileLogLevel info / 日志缺失 / 运行在差异判定之前就失败）'
+    }
+  }
+  if (full && (!reuse || full.index > reuse.index)) {
+    return { mode: REUSE_MODE_FULL, evidence: full[0] }
+  }
+  const reused = Number(reuse[1])
+  const total = Number(reuse[2])
+  // stryker 自报的数字也要过一遍形状校验：异常形状按「未记录」处理，不参与渲染成看似可信的比例。
+  if (!Number.isSafeInteger(reused) || !Number.isSafeInteger(total) || total <= 0 || reused < 0 || reused > total) {
+    return { mode: REUSE_MODE_UNKNOWN, reason: `复用记录形状异常（reused=${reuse[1]} total=${reuse[2]}）` }
+  }
+  // reused === 0：增量文件在，但没有任何结果可复用 ⇒ 语义上就是「本轮全量重算」。
+  return reused === 0
+    ? { mode: REUSE_MODE_FULL, reused, total, evidence: reuse[0], note: '增量运行无结果可复用' }
+    : { mode: REUSE_MODE_PARTIAL, reused, total, evidence: reuse[0] }
+}
+
+function reuseRatio (reused, total) {
+  return Math.round((reused / total) * 10000) / 10000
+}
+
+/**
+ * 组装某段的复用元信息（落盘成 reuse.json 的内容）。
+ * @param {string} segment 段名（mutation.yml 的 matrix.name）
+ * @param {string} logText stryker.log 文本
+ * @param {{generatedAt?: string}} [options]
+ * @returns {object} 可 JSON 序列化的元信息
+ */
+function buildReuseMeta (segment, logText, options = {}) {
+  const parsed = parseReuseFromLog(logText)
+  const meta = { segment: String(segment), mode: parsed.mode }
+  if (Number.isSafeInteger(parsed.reused) && Number.isSafeInteger(parsed.total) && parsed.total > 0) {
+    meta.reused = parsed.reused
+    meta.total = parsed.total
+    meta.reuseRatio = reuseRatio(parsed.reused, parsed.total)
+    meta.highReuse = meta.reuseRatio >= HIGH_REUSE_RATIO
+  }
+  if (parsed.reason) meta.reason = parsed.reason
+  if (parsed.note) meta.note = parsed.note
+  if (parsed.evidence) meta.evidence = parsed.evidence
+  if (options.generatedAt) meta.generatedAt = options.generatedAt
+  return meta
+}
+
+// 单次 open + 只对 fd 判定与读取（与 scripts/mutation-json.js 的 readGuardedBytes 同口径：消除
+// statSync→readFileSync 的 check-then-use 竞态）。非普通文件 / 超上限 / 读失败一律抛出，由调用侧转成
+// 「未记录 + 原因」——复用状态是**可观测性**，不该让段 job 因此变红，但也绝不静默伪装成全量。
+function readLogText (logPath, maxBytes = REUSE_LOG_MAX_BYTES) {
+  const abs = path.resolve(logPath)
+  let fd
+  try {
+    fd = fs.openSync(abs, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK)
+  } catch (err) {
+    throw new Error(`无法读取 ${abs}：${err.message}`)
+  }
+  try {
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFile()) throw new Error(`无法读取 ${abs}：不是普通文件`)
+    if (stat.size > maxBytes) throw new Error(`日志 ${abs} 为 ${stat.size} 字节，超过解析上限 ${maxBytes} 字节：按「未记录」处理（不整份读入）`)
+    return fs.readFileSync(fd, 'utf8')
+  } finally {
+    try {
+      fs.closeSync(fd)
+    } catch (err) {
+      // 关闭失败不覆盖主流程结果；仅 fd 泄漏一种后果，且进程随后退出。
+    }
+  }
+}
+
+// 递归查找 reuse.json（与 findReportJson 同口径：artifact 里是 mutation-reports/mutation-report-<段>/reports/mutation/）
+function findReuseJson (dir) {
+  let entries
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true }) // NOSONAR:S8707 报告目录树内递归（根目录已校验）
+  } catch (e) {
+    return null
+  }
+  for (const e of entries) {
+    const p = path.join(dir, e.name)
+    if (e.isDirectory()) {
+      const found = findReuseJson(p)
+      if (found) return found
+    } else if (e.name === 'reuse.json') {
+      return p
+    }
+  }
+  return null
+}
+
+// 把 reuse.json 的原始对象归一成渲染用形状；任何形状异常 → unknown + reason（不猜、不抛）
+function normalizeReuseMeta (raw, expectedSeg) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { mode: REUSE_MODE_UNKNOWN, reason: `reuse.json 顶层不是 JSON 对象（实际 ${raw === null ? 'null' : Array.isArray(raw) ? 'array' : typeof raw}）` }
+  }
+  // 段名交叉校验：artifact 被错标/串段时不得把别段的复用状态安到本段头上
+  if (raw.segment !== undefined && String(raw.segment) !== String(expectedSeg)) {
+    return { mode: REUSE_MODE_UNKNOWN, reason: `reuse.json 段名不一致（${raw.segment} ≠ ${expectedSeg}）` }
+  }
+  if (raw.mode === REUSE_MODE_FULL) {
+    const meta = { mode: REUSE_MODE_FULL }
+    if (Number.isSafeInteger(raw.reused) && Number.isSafeInteger(raw.total) && raw.total > 0) {
+      meta.reused = raw.reused
+      meta.total = raw.total
+      meta.ratio = reuseRatio(raw.reused, raw.total)
+    }
+    if (raw.note) meta.note = String(raw.note)
+    return meta
+  }
+  if (raw.mode === REUSE_MODE_PARTIAL) {
+    if (!Number.isSafeInteger(raw.reused) || !Number.isSafeInteger(raw.total) || raw.total <= 0 || raw.reused <= 0 || raw.reused > raw.total) {
+      return { mode: REUSE_MODE_UNKNOWN, reason: `reuse.json 的 partial 计数非法（reused=${JSON.stringify(raw.reused)} total=${JSON.stringify(raw.total)}）` }
+    }
+    const ratio = Number.isFinite(raw.reuseRatio) ? raw.reuseRatio : reuseRatio(raw.reused, raw.total)
+    return { mode: REUSE_MODE_PARTIAL, reused: raw.reused, total: raw.total, ratio, high: ratio >= HIGH_REUSE_RATIO }
+  }
+  return { mode: REUSE_MODE_UNKNOWN, reason: `reuse.json 的 mode 非法（${JSON.stringify(raw.mode)}）` }
+}
+
+/**
+ * 从某段的 artifact 目录读取复用状态（缺文件/坏 JSON/形状非法一律降级为「未记录 + 原因」）。
+ * @param {string} searchRoot 段目录（递归查找 reuse.json）
+ * @param {string} expectedSeg 期望的段名（与 reuse.json 的 segment 交叉校验）
+ * @returns {object} 归一后的复用状态（永远可渲染，不抛）
+ */
+function readReuseMeta (searchRoot, expectedSeg) {
+  const found = findReuseJson(searchRoot)
+  if (!found) return { mode: REUSE_MODE_UNKNOWN, reason: '缺 reuse.json（本轮未落盘复用状态）' }
+  let raw
+  try {
+    raw = JSON.parse(fs.readFileSync(found, 'utf8'))
+  } catch (e) {
+    return { mode: REUSE_MODE_UNKNOWN, reason: `reuse.json 无法解析：${String((e && e.message) || e)}` }
+  }
+  return normalizeReuseMeta(raw, expectedSeg)
+}
+
+// 表格单元格文案（「每段标注本轮全量 / 复用 N/M / 未记录」）。
+// reportTotal（报告的变异体数）是可选的第二参：`0 of M` 分支的「全量」只有在**报告数与日志口径 M 一致**时
+// 才敢这么写——计数对不上说明报告里还并入了 sticky 的旧变异体（见 reuseUnaccountedCount），
+// 此时标注「口径不符」，细节由「♻️ 复用状态」小节给出。绝不在这里把「有旧结果」写成「全量」。
+function formatReuseCell (reuse, reportTotal) {
+  if (!reuse || reuse.mode === REUSE_MODE_UNKNOWN) return '未记录'
+  if (reuse.mode === REUSE_MODE_PARTIAL) return `复用 ${reuse.reused}/${reuse.total}`
+  if (reuseUnaccountedCount({ total: reportTotal, reuse }) !== null) return '全量(口径不符)'
+  return '全量'
+}
+
+function formatRatio (ratio) {
+  return `${(ratio * 100).toFixed(2)}%`
+}
+
+/**
+ * 写本段的复用状态到 `reports/mutation/reuse.json`（mutation.yml 的「记录本段增量复用状态」step 调用）。
+ *
+ * 报告存在性闸门是**必须**的：`reports/mutation/` 里若只有 reuse.json，上传步骤的
+ * `if-no-files-found: error` 就不再触发，于是「stryker 未产出报告 ⇒ 该段 job 响亮变红」被降级成
+ * 「汇总 job 缺段才暴露」——那是 PR #156 有意前移的故障信号，不得回退。因此**只在 mutation.json 已存在时**
+ * 才落盘 reuse.json（同目录），否则只打一行提示、什么都不写。
+ *
+ * @param {{segment: string, logPath: string, outPath: string, now?: Date}} options
+ * @returns {{written: boolean, outPath: string, meta: object, reason?: string}}
+ */
+function writeReuseMeta (options) {
+  const { segment, logPath, outPath } = options
+  const now = options.now instanceof Date ? options.now : new Date()
+  const reportPath = path.join(path.dirname(path.resolve(outPath)), 'mutation.json')
+  let logText
+  let readError
+  try {
+    logText = readLogText(logPath)
+  } catch (e) {
+    readError = String((e && e.message) || e)
+  }
+  const meta = readError
+    ? { segment: String(segment), mode: REUSE_MODE_UNKNOWN, reason: `无法读取日志：${readError}`, generatedAt: now.toISOString() }
+    : buildReuseMeta(segment, logText, { generatedAt: now.toISOString() })
+  if (!fs.existsSync(reportPath)) {
+    return { written: false, outPath: path.resolve(outPath), meta, reason: `本段未产出 ${reportPath}（stryker 未完成/崩溃），跳过写 reuse.json：写下去会让上传步骤的 if-no-files-found: error 失效` }
+  }
+  fs.mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true })
+  fs.writeFileSync(path.resolve(outPath), JSON.stringify(meta, null, 2) + '\n')
+  return { written: true, outPath: path.resolve(outPath), meta }
+}
+
 function analyze (dir) {
   // S8707：CLI 参数显式校验（防 LLM/错误参数访问任意路径——先验证存在且是目录）
   let st
@@ -276,7 +566,11 @@ function analyzeSegment (dir, entry) {
     // 上面已成功读到文件，取不到时间只说明文件被并发删除，此时 reportMtimeMs 为 undefined，
     // 该段不参与新鲜度比较（不误红），缺段/损坏仍由 validateSegments 负责。
     reportPath,
-    reportMtimeMs: readMtimeMs(reportPath)
+    reportMtimeMs: readMtimeMs(reportPath),
+    // 复用状态（PR #158 Qodo Medium / Correctness）：段 job 落盘的 reports/mutation/reuse.json 随 artifact
+    // 到达这里。读不到/形状非法一律降级为「未记录 + 原因」——它是可观测性，不是门禁，故既不 throw 也不猜；
+    // 「未记录」在日报里必须与「全量」区分显示（读者不得把「没记录」读成「没复用」）。
+    reuse: readReuseMeta(path.dirname(reportPath), seg)
   }
 }
 
@@ -342,30 +636,148 @@ function collectStats (results) {
 function _renderSegmentTable (results) {
   // 段汇总表（含合计行）：正常段 + error 段分支
   const lines = []
-  lines.push('| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 |')
-  lines.push('|---|---|---|---|---|---|---|')
+  lines.push('| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | 复用 |')
+  lines.push('|---|---|---|---|---|---|---|---|')
   let tTotal = 0
   let tKilled = 0
   let tTimeout = 0
   let tSurvived = 0
+  let reusedSegs = 0
   for (const r of results) {
     if (r.error) {
-      lines.push(`| ${r.seg} | ❌ ${r.error} | - | - | - | - | - |`) // 7 列对齐表头（含 Timeout 列——CodeAnt P1）
+      lines.push(`| ${r.seg} | ❌ ${r.error} | - | - | - | - | - | - |`) // 8 列对齐表头（含 Timeout/复用列）
       continue
     }
     tTotal += r.total
     tKilled += r.killed
     tSurvived += r.survived
     tTimeout += r.timeout || 0
-    lines.push(`| ${r.seg} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% |`)
+    if (r.reuse && r.reuse.mode === REUSE_MODE_PARTIAL) reusedSegs++
+    lines.push(`| ${r.seg} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% | ${formatReuseCell(r.reuse, r.total)} |`)
   }
   // 口径与段分一致（超时计入已处理）；无数据报 0 而非 100（机器人审查）
-  // F6：本脚本只汇总，**不设分数门禁**——分数门禁在 stryker 侧（stryker.config.js 的
-  // thresholds.break=65，由每个矩阵 job 各自按段判定，见该文件注释）。这里**有意**不再加一道：
+  // F6：本脚本只汇总，**不设分数门禁**——分数门禁在 stryker 侧（stryker.config.js 的 thresholds，
+  // 由每个矩阵 job 各自按段判定，见该文件注释）。**当前 thresholds.break = null（分数不是门禁）**：
+  // 分数在测试抖动下不可复现（同配置同段三轮 storage 79.08/82.92/71.02%，极差 11.90pp），且历史
+  // 「最低段 69.38%」是含陈旧复用的虚高值、已证伪，故停用；撤回后「全 RuntimeError / 零有效变异体」
+  // 改由 mutation.yml 的 fail-closed 守卫（scripts/mutation-guard.js）承担，**不落回本脚本**。
+  // 这里**有意**不再加一道：
   // main() 是「先 validateSegments/validateFreshness 再 postIssue」，本脚本 throw 会让不达标时连
   // 日报一起吞掉——而那正是最需要看到分数的时刻。故此处只保留完整性/新鲜度两道 throw。
   const overall = tTotal > 0 ? Math.round((((tKilled + tTimeout) / tTotal) * 100) * 100) / 100 : 0
-  lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | | **${overall}%** |`)
+  lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | | **${overall}%** | **${reusedSegs} 段复用** |`)
+  return lines
+}
+
+/**
+ * 报告里的变异体数 vs 日志复用口径 `M` 的差值（可比且为 0 → null，即「口径一致」）。
+ *
+ * 为什么需要这个交叉校验（**实测**，不是推测）：`Result: N of M` 的 `M` 是
+ * `currentMutants.length`，即**当前 `--mutate` 范围**内生成的变异体数；而 incremental-differ 还有一条
+ * sticky 分支（mutants/incremental-differ.js 的 `if (!currentMutantKeys.has(mutantKey) &&
+ * !this.isInMutatedScope(...))`）会把**旧增量报告里、已不在当前 mutate 范围**的变异体
+ * `{...oldResult}` **原样并入**报告——它们的 status/statusReason 全部来自旧运行，却**既不计入 N
+ * 也不计入 M**。于是 `N/M` 只是「旧结果占比」的**下界**。
+ *
+ * 实测复现（本机最小 stryker 工程 + @stryker-mutator/core@10.0.0，同一份 src.js 内容不改）：
+ *   * 先 `--mutate "src.js:1-4"` 跑一次 ⇒ inc.json 含第 1-4 行的变异体；
+ *   * 再用 `--mutate "src.js:1-3"`（范围收窄、src 内容未变 ⇒ 缓存 key 不含范围、旧 inc 照旧命中）
+ *     ⇒ 日志 `Result:\t\t6 of 6 mutant result(s) are reused.`，**报告里却有 8 个变异体**：
+ *     多出的 2 个正是第 4 行（已不在当前范围）的旧变异体，status 沿用旧值。
+ *   * 对照组：删掉 inc.json 后用同一 `--mutate "src.js:1-3"` 全量跑 ⇒ 报告恰好 6 个。
+ * 该场景在本仓可达（两条机制叠加，**都不要求「源文件完全没变」**）：① `mutation.yml` 的缓存 key 是
+ * `stryker-<段>-<hashFiles(package-lock.json, stryker.config.js, run_mutation.js, matrix.src)>`，而
+ * `restore-keys` 是**裸前缀兜底 `stryker-<段>-`** ⇒ 主 key 未命中时（源文件变了、或 package-lock /
+ * stryker.config 变了）仍会恢复**最近一条**同前缀缓存，旧 `reports/inc-<段>.json` 照样回到工作树；
+ * ② 本仓要求大文件增长时**重拆 matrix 的 mutate 行段**（AGENTS.md）⇒ 旧 inc 里落在新范围之外的变异体
+ * 被 sticky 分支原样并入报告。
+ *
+ * @param {object} r analyzeSegment 的产物（含报告口径的 total 与复用口径的 total）
+ * @returns {number|null} 差值（>0 报告多、<0 报告少）；口径不可比或一致时 null
+ */
+function reuseUnaccountedCount (r) {
+  if (!r || !r.reuse || !Number.isSafeInteger(r.reuse.total) || r.reuse.total <= 0) return null
+  if (!Number.isSafeInteger(r.total)) return null
+  const delta = r.total - r.reuse.total
+  return delta === 0 ? null : delta
+}
+
+/**
+ * 复用状态说明段（PR #158 Qodo Medium / Correctness）。
+ *
+ * 为什么必须有这一段（而不只是表格里加一列）：Qodo 指出的缺陷是「**published segment scores and survivor
+ * list describe the old suite**」——读者拿到日报时无法分辨哪些数字来自旧测试状态。只加一列仍可能被略过，
+ * 故这里用独立小节把结论讲清楚，并且**每种情形都给结论**（全部全量 / 有复用 / 完全没记录 / 计数口径不符），
+ * 避免「没记录」被静默读成「没复用」、也避免「N/M 看着干净」被读成「旧结果占比就这么多」。
+ *
+ * 分数口径零变化：本函数只读 r.reuse 与 r.total（后者仅用于与复用口径比对，不参与任何统计），
+ * 不碰 killed/survived/score，也不产生任何 throw。
+ * @param {Array<object>} results analyzeSegment 的产物
+ * @returns {string[]} markdown 行
+ */
+function _renderReuseNotice (results) {
+  // error 段没有数据，不参与复用口径（它们由 validateSegments 的缺段/错误分支负责）
+  const usable = results.filter(r => !r.error)
+  if (usable.length === 0) return []
+  const partial = usable.filter(r => r.reuse && r.reuse.mode === REUSE_MODE_PARTIAL)
+  const unknown = usable.filter(r => !r.reuse || r.reuse.mode === REUSE_MODE_UNKNOWN)
+  // 计数口径不符（见 reuseUnaccountedCount）：N/M 是下界，必须单独点名，不能并进「全量重算」。
+  const unaccounted = usable.filter(r => reuseUnaccountedCount(r) !== null)
+  const lines = []
+  lines.push('## ♻️ 复用状态（结果是否对应当前测试状态）')
+  lines.push('')
+  if (partial.length === 0 && unknown.length === 0 && unaccounted.length === 0) {
+    lines.push(`本轮 ${usable.length} 段全部全量重算（无复用）⇒ 分数与存活清单对应本 commit 的测试状态。`)
+    lines.push('')
+    return lines
+  }
+  if (partial.length === 0 && unaccounted.length === 0) {
+    lines.push('⚠️ 本次日报**没有任何段的复用状态记录**（reuse.json 缺失或无法解析）⇒ 无法判定哪些段复用了旧结果；' +
+      '**不要把这些段的分数/存活清单当作「本 commit 测试状态」下的结果**。')
+    lines.push('')
+    lines.push(`未记录复用状态的段（${unknown.length}）：${unknown.map(r => `\`${r.seg}\``).join('、')}`)
+    lines.push('')
+    return lines
+  }
+  if (partial.length > 0) {
+    lines.push('⚠️ **本次日报含未重算的结果**：下列段的部分变异体直接复用了上一次运行的 killed/survived' +
+      '（`coverageAnalysis:\'off\'` 下 incremental-differ 拿不到覆盖信息时**无条件复用**），它们描述的是' +
+      '**旧测试状态**，不代表本 commit 的测试；存活清单同理。')
+    lines.push('')
+    for (const r of partial) {
+      const ratio = Number.isFinite(r.reuse.ratio) ? r.reuse.ratio : reuseRatio(r.reuse.reused, r.reuse.total)
+      const high = r.reuse.high !== undefined ? r.reuse.high : ratio >= HIGH_REUSE_RATIO
+      lines.push(`- \`${r.seg}\`：复用 ${r.reuse.reused}/${r.reuse.total}（${formatRatio(ratio)}）` +
+        (high ? ` ⚠️ **复用比例高**（≥${formatRatio(HIGH_REUSE_RATIO)}）` : ''))
+    }
+    lines.push('')
+  }
+  if (unaccounted.length > 0) {
+    lines.push('⚠️ **复用口径与报告不一致 ⇒ 上列/下列比例只是下界**：`Result: N of M` 的 `M` 只统计' +
+      '**当前 `--mutate` 范围**内的变异体，而 incremental-differ 会把旧增量报告中**已不在当前范围**的变异体' +
+      '（sticky 分支）**原样并入**报告——它们的 status/statusReason 沿用旧运行，却**不计入 N 也不计入 M**：')
+    lines.push('')
+    for (const r of unaccounted) {
+      const delta = reuseUnaccountedCount(r)
+      lines.push(`- \`${r.seg}\`：报告 ${r.total} 个变异体 vs 日志复用口径 ${r.reuse.total} 个` +
+        `（${delta > 0 ? `多 ${delta} 个未计入` : `少 ${-delta} 个`}）`)
+    }
+    lines.push('')
+  }
+  if (unknown.length > 0) {
+    lines.push(`⚠️ 另有 ${unknown.length} 段没有复用状态记录（reuse.json 缺失或无法解析）：` +
+      `${unknown.map(r => `\`${r.seg}\``).join('、')}；无法判定其是否复用，**不要假定它们是全量重算**。`)
+    lines.push('')
+  }
+  // 末行必须用**互斥**口径计数：partial 与 unknown 按 mode 天然互斥，但 unaccounted 会与 partial 重叠
+  // （一个段既可能「含复用」又「口径对不上」），直接相减会得到负数（本代理在端到端验证时实测到
+  // 「其余 -1 段」）。故只把「不在 partial 里的 unaccounted」单列，四类之和恒等于段数。
+  const partialSet = new Set(partial)
+  const unaccountedOnly = unaccounted.filter(r => !partialSet.has(r)).length
+  const cleanFull = usable.length - partial.length - unknown.length - unaccountedOnly
+  lines.push(`其余 ${cleanFull} 段本轮为全量重算（共 ${usable.length} 段：${partial.length} 段含复用、${unknown.length} 段未记录` +
+    (unaccountedOnly > 0 ? `、${unaccountedOnly} 段标为全量但复用口径与报告不一致` : '') + '）。')
+  lines.push('')
   return lines
 }
 
@@ -423,6 +835,7 @@ function render (results) {
     '',
     ..._renderSegmentTable(results),
     '',
+    ..._renderReuseNotice(results),
     ..._renderTopFiles(byFile),
     ..._renderTopKinds(byKind),
     ..._renderSurvivors(allSurvived),
@@ -529,8 +942,74 @@ function stripReportFiles (files) {
   console.log(`✅ 已处理 ${files.length} 个文件，共省 ${saved} 字节`)
 }
 
+/**
+ * 解析 `--reuse` 模式的参数（fail-closed：参数不明/缺取值一律抛错，不静默空转）。
+ * 用法：`node scripts/mutation-report.js --reuse --segment <段名> --log <stryker.log> [--out <reuse.json>]`
+ * @param {string[]} args 去掉 `--reuse` 之后的参数
+ * @returns {{segment: string, logPath: string, outPath: string}}
+ */
+function parseReuseArgs (args) {
+  const known = new Set(['--segment', '--log', '--out'])
+  const values = {}
+  for (let i = 0; i < args.length; i++) {
+    const a = String(args[i])
+    const eq = a.indexOf('=')
+    const name = eq > 0 ? a.slice(0, eq) : a
+    if (!known.has(name)) throw new Error(`未知参数 ${a}`)
+    const value = eq > 0 ? a.slice(eq + 1) : args[i + 1]
+    if (value === undefined || String(value).trim() === '') throw new Error(`${name} 缺少取值`)
+    values[name] = String(value)
+    if (eq <= 0) i++
+  }
+  for (const required of ['--segment', '--log']) {
+    if (!values[required]) throw new Error(`缺少必填参数 ${required}`)
+  }
+  return {
+    segment: values['--segment'],
+    logPath: values['--log'],
+    outPath: values['--out'] || path.join('reports', 'mutation', 'reuse.json')
+  }
+}
+
+// `--reuse` 模式的执行体：落盘本段的复用状态。可注入 io 以便测试拿到退出码（不真的结束进程）。
+function runReuseMode (argv, io = {}) {
+  const out = io.stdout || process.stdout
+  const err = io.stderr || process.stderr
+  const now = io.now instanceof Date ? io.now : new Date()
+  let parsed
+  try {
+    parsed = parseReuseArgs(argv)
+  } catch (e) {
+    err.write(`❌ 复用状态参数非法：${String((e && e.message) || e)}\n`)
+    err.write('   用法：node scripts/mutation-report.js --reuse --segment <段名> --log <stryker.log> [--out reports/mutation/reuse.json]\n')
+    return 1
+  }
+  const r = writeReuseMeta({ ...parsed, now })
+  if (!r.written) {
+    out.write(`ℹ️  跳过写复用状态：${r.reason}\n`)
+    return 0
+  }
+  const m = r.meta
+  const detail = m.mode === REUSE_MODE_PARTIAL
+    ? `复用 ${m.reused}/${m.total}（${formatRatio(m.reuseRatio)}${m.highReuse ? '，复用比例高' : ''}）`
+    : m.mode === REUSE_MODE_FULL ? '本轮全量重算' : `未记录（${m.reason || '原因未知'}）`
+  out.write(`✅ ${parsed.segment} 复用状态已写入 ${r.outPath}：${detail}\n`)
+  if (m.mode === REUSE_MODE_UNKNOWN) {
+    // 未记录必须留痕（否则「复用可见」这条链断了却没人知道），但**不置退出码**：它是可观测性，
+    // 让段 job 因它变红会把「报告不可信」与「报告缺一个标注」混为一谈（守卫负责前者）。
+    out.write('⚠️  未判定出复用状态 ⇒ 日报该段将显示「未记录」（不会被伪装成「全量」）\n')
+  }
+  return 0
+}
+
 async function main () {
   const args = process.argv.slice(2)
+  // 复用状态落盘模式：同样必须在读 <reports-dir> 之前分流（否则 --reuse 会被当成目录名走汇总路径）
+  const reuseIdx = args.indexOf('--reuse')
+  if (reuseIdx !== -1) {
+    process.exitCode = runReuseMode([...args.slice(0, reuseIdx), ...args.slice(reuseIdx + 1)])
+    return
+  }
   // 落盘剥离模式：必须在读 <reports-dir> 之前分流（否则 --strip 会被当成目录名走汇总路径）
   const stripIdx = args.indexOf('--strip')
   if (stripIdx !== -1) {
@@ -576,4 +1055,36 @@ if (require.main === module) {
 }
 
 // 导出供测试（不导出 main：依赖 CLI 副作用；postIssue 导出以便 mock fetch 测去重/错误处理逻辑）
-module.exports = { analyze, validateSegments, validateFreshness, resolveMaxSkewMs, resolveRunStartedAtMs, findReportJson, analyzeSegment, countMutant, escCell, collectStats, render, shanghaiDate, postIssue, EXPECTED_SEGMENTS }
+module.exports = {
+  analyze,
+  validateSegments,
+  validateFreshness,
+  resolveMaxSkewMs,
+  resolveRunStartedAtMs,
+  findReportJson,
+  analyzeSegment,
+  countMutant,
+  escCell,
+  collectStats,
+  render,
+  shanghaiDate,
+  postIssue,
+  EXPECTED_SEGMENTS,
+  // 复用状态（PR #158 Qodo Medium / Correctness）
+  parseReuseFromLog,
+  buildReuseMeta,
+  normalizeReuseMeta,
+  readReuseMeta,
+  findReuseJson,
+  writeReuseMeta,
+  parseReuseArgs,
+  runReuseMode,
+  formatReuseCell,
+  reuseUnaccountedCount,
+  stripAnsi,
+  REUSE_MODE_FULL,
+  REUSE_MODE_PARTIAL,
+  REUSE_MODE_UNKNOWN,
+  HIGH_REUSE_RATIO,
+  REUSE_LOG_MAX_BYTES
+}

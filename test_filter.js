@@ -12,22 +12,163 @@ const assert = require('assert')
 const slim = require('./xbk_sendNotify_slim.js')
 const { extractTestSummary } = require('./run_mutation.js')
 const path = require('path')
-// 缓存目录（基于 __dirname——v3.113 修复 /workspace 硬编码，仓库可移植）
-const CACHE = path.join(__dirname, 'xianbaoku_cache')
+// 生产默认缓存目录名（在下方隔离覆盖**之前**从生产模块捕获）：契约用例据此断言，
+// 保证「生产把默认目录改掉」仍然会红（不是拿被覆盖后的值自证）。
+const PROD_DEFAULT_CACHE_DIR = Config.cache.dir
+// ============================================================
+// 缓存分片目录的“已验证路径”入口（Qodo PR #158 High / Security 修复）
+// ============================================================
+// 缺陷：本套件把 XBK_PARALLEL_ID 原样插值进 `xianbaoku_cache_p${ID}` 再 path.join(__dirname, …)，
+// 未校验分隔符/根内包含 ⇒ 含 `../` 的值会解析到仓库之外（如 '../x' → 仓库父目录下的 x），
+// 而本套件在 :rmSync(CACHE,{recursive:true,force:true}) 与两处整体 rmSync 清理点会**递归删除**它。
+// 生产侧 xbk_message_store.resolveCacheDirInRoot 虽有根内校验，但测试清理跑在它之前 ⇒ 校验形同虚设。
+//
+// 防御纵深（两道，互为独立兜底）：
+//   ① 白名单：XBK_PARALLEL_ID 只接受 [A-Za-z0-9_-]+（不含路径分隔符 `.` `/` `\`），非法即回退 pid；
+//   ② 根内校验：构造后断言 path.resolve(路径) 必须位于 path.resolve(__dirname) 之下。
+// 之所以两道都要：① 让「值」本身不可能带出路径语义（可证明：符集内无分隔符 ⇒ 拼出的名字必是
+// 单层目录名）；② 让「拼接/规范化」环节出任何意外（未来改前缀、改 join 方式）也在删除前被拦下。
+//
+// fail-closed 选「回退到 process.pid」而不是「抛错」的理由见本文件模块头与报告：本套件是**测试
+// 工具**，环境变量脏（并行调度器传错值、复制粘贴残留、外部脚本污染）时应当照常隔离运行，
+// 而不是把 126 例门禁整体打成红；回退值 process.pid 是内核保证唯一、且必然落在根内的安全 ID，
+// 既保持「进程私有分片」这一并发隔离不变量，又保证绝不删到根外。真正的越界信号不是「值脏」
+// 而是「构造结果越界」——后者在白名单下已不可达，若哪天真的发生则抛 Error（见 buildCacheShard）。
+const CACHE_SHARD_ID_RE = /^[A-Za-z0-9_-]+$/
+
+// 单层目录名硬上限（防超长环境变量造出 ENAMETOOLONG / 触发文件系统边界行为）
+const CACHE_SHARD_ID_MAX = 64
+
+// 把任意来源的 XBK_PARALLEL_ID 归一为一个**安全分片 ID**。
+// 非法（空串、含 `.` `/` `\` 或其它非白名单字符、超长）一律回退到 String(process.pid)。
+function sanitizeIsolationId (raw) {
+  const s = raw === undefined || raw === null ? '' : String(raw)
+  if (!CACHE_SHARD_ID_RE.test(s)) return String(process.pid)
+  if (s.length > CACHE_SHARD_ID_MAX) return String(process.pid)
+  return s
+}
+
+// 唯一的「分片目录」入口（最末兜底 ID 取内核分配的 pid，必然通过白名单与根内校验）：白名单 + 根内校验 + 一体化返回同源三元组
+// { id, dirName, cacheDir } —— 调用方必须用返回的 dirName/cacheDir 去设 Config.cache.dir 与
+// 环境变量，禁止各自重新拼一遍（否则会出现「生产写 A、测试断言 B」的分裂）。
+// 注：本函数是 `require(path)` 参数的接收者（不做模块级 require），既便于回归用例反复构造，
+// 也让 lint/static analysis 不把 `path` 当成被遮蔽的全局。
+function buildCacheShard (rawId, root, pathMod) {
+  const rootAbs = pathMod.resolve(root)
+  const id = sanitizeIsolationId(rawId)
+  const dirName = `xianbaoku_cache_p${id}`
+  const cacheDir = pathMod.join(rootAbs, dirName)
+  // ② 根内校验：resolve 后必须以 rootAbs + sep 起头，且不等于 rootAbs 本身。
+  // 用 path.resolve（词法规范化）而非 realpath：本套件的删除目标是自己刚构造的**新**目录，
+  // 越界向量只有 `..`（词法即可完全覆盖）；而 realpath 会把「仓库本身位于符号链接路径下」
+  // 这类合法部署判成越界，反而制造 fail-open（回退到共享目录）或误红。
+  const resolved = pathMod.resolve(cacheDir)
+  if (resolved !== rootAbs && resolved.startsWith(rootAbs + pathMod.sep)) {
+    return { id, dirName, cacheDir }
+  }
+  // 白名单下不可达；一旦可达说明拼接逻辑本身被改坏了——此时回退到 pid（仍根内），
+  // 并在 stderr 留痕，绝不返回越界路径。
+  const fallbackId = String(process.pid)
+  const fallbackDirName = `xianbaoku_cache_p${fallbackId}`
+  const fallbackCacheDir = pathMod.join(rootAbs, fallbackDirName)
+  console.warn(`[test_filter] 分片目录越出仓库根，已回退 pid 分片：raw=${JSON.stringify(rawId)} → ${fallbackDirName}`)
+  return { id: fallbackId, dirName: fallbackDirName, cacheDir: fallbackCacheDir }
+}
+
+// ============================================================
+// 并发沙箱隔离（PR #156 复审：变异测试「假 Killed」真根因）
+// 背景（已用原始产物实证）：Stryker 一次 run 只建**一个**沙箱，而 mutation.yml 每段
+// --concurrency 2 ⇒ 同一份仓库副本里会**并发**跑两份 test_filter。本套件大量用例对同一份
+// __dirname/xianbaoku_cache 做 rmSync / mkdir / 写同名文件（最典型：「init 在目录不存在时
+// 自动创建」与「save 在目录不存在时自动创建」先 rmSync 整个目录），两个进程互删/互写同一个
+// 目录 ⇒ 💥 ENOTEMPTY, Directory not empty: …/xianbaoku_cache，并把同族「持久化用例」整族
+// 拖红 ⇒ 与该变异体毫不相干的 Killed（假 Killed）。
+// 隔离方式：复用**生产已支持**的分片口径——xbk_message_store.cacheDir 的 fallback 读
+// XBK_PARALLEL_ID → xianbaoku_cache_p<ID>（v3.172，test_app_p.js 同款）。本进程私有、仍以
+// xianbaoku_cache 起头 ⇒ .gitignore(xianbaoku_cache*) / stryker.config.js 的 ignorePatterns /
+// resolveCacheDirInRoot 根内校验口径全部不变，且不改生产代码。
+// 语义不变量：用例要测的正是「目录不存在 → init/save 自动创建」，进程首次运行时该目录必然
+// 不存在（名字含本进程唯一 ID），断言强度不变。
+// Qodo PR #158（High / Security）：此前 TEST_ISOLATION_ID 直接取 process.env.XBK_PARALLEL_ID，
+// 未校验分隔符/根内包含 ⇒ 含 `../` 的值经 path.join 会解析到仓库之外，而本套件有多处递归
+// rmSync(CACHE)。现在统一走 buildCacheShard：白名单 [A-Za-z0-9_-]+ + 根内校验，非法回退 pid。
+// 三者（TEST_ISOLATION_ID / CACHE_DIR_NAME / CACHE）必须同源——见 buildCacheShard 的返回值。
+// 注意 OWNS_CACHE_DIR 与「值是否合法」无关：它仍只回答「调用方有没有声明外部分片」，因为非法值
+// 已被本文件归一回退，外部调度器若真传了脏值也仍由它自己负责清理，本进程不自删以免与其竞态。
+const CACHE_SHARD = buildCacheShard(process.env.XBK_PARALLEL_ID, __dirname, path)
+const TEST_ISOLATION_ID = CACHE_SHARD.id
+const CACHE_DIR_NAME = CACHE_SHARD.dirName
+const CACHE = CACHE_SHARD.cacheDir
+// 自建（非被外部并行调度器分片）时退出前清掉私有目录，避免沙箱内逐进程累积。
+// 语义保持：仍只看「调用方有没有给出分片 ID」；非法值虽被回退成 pid 分片，但既然调用方
+// 声明的是一份（哪怕写错的）外部分片，就按原有约定不自删，避免与调度器清理竞态。
+const OWNS_CACHE_DIR = !process.env.XBK_PARALLEL_ID
+// 让生产侧落到同一目录：① Config.cache.dir 指向分片目录；② XBK_PARALLEL_ID 也必须设——
+// cache.dir 非法（普通文件/符号链接/根外路径）时生产回退走 fallback 分支，只设 ① 会让那些
+// 「非法配置回退」用例仍写进共享的 xianbaoku_cache（见「cache.dir 指向普通文件」等用例）。
+// 注意这里写回的是**归一后**的 ID（可能与环境变量原值不同）：生产 fallback 分支出的是
+// xianbaoku_cache_p<该值>，必须与本文件用的 CACHE_DIR_NAME 完全同源，断言才指向同一目录。
+process.env.XBK_PARALLEL_ID = TEST_ISOLATION_ID
+Config.cache.dir = CACHE_DIR_NAME
+
+// ============================================================
+// 墙钟断言的沙箱缩放（PERF_MS）—— 与并发沙箱下的「假 Killed」同一条判定链
+// 判定链：Stryker 的 command runner 只看**退出码**（core/dist/src/test-runner/command-test-runner.js：
+// exitCode===0 → Survived，否则 Killed），而 coverageAnalysis:'off' 下 incremental-differ 在拿不到
+// 覆盖信息时直接「return true」（复用全部旧结果）⇒ 本套件在并发负载下被**任何一条墙钟断言**打成红，
+// 都会让每个变异体被误判 Killed 并被长期冻结。故墙钟阈值必须在沙箱里按 PERF_MS 缩放
+// （mutation.yml 的 step env、scripts/mutation-child.js、run_mutation.js 的子进程都设 PERF_MS=3000）。
+//
+// 口径：生效阈值 = 默认阈值 × PERF_SCALE，PERF_SCALE = (PERF_MS / 500) × PERF_SANDBOX_HEADROOM
+//   · PERF_MS/500：仓库既有基准口径（saveBatch 基准一直用「PERF_MS || 500」，500 是历史基准值）；
+//   · PERF_SANDBOX_HEADROOM = 2：**实测依据**（本机 8 核、8 份并发 test_filter，原始日志
+//     .local/e1-raw/c8-*.log）——独占 → 8 并发：tuisong_replace 1000 次 127 → 1903ms（15.0×；
+//     父代理 CI 实测 76 → 1266ms = 16.7×）；htmlToMarkdown 1000 次 56 → 449ms；saveBatch 5000 条
+//     170 → 966ms。**单靠 PERF_MS/500（=6×）不够**：tuisong 预算 300×6=1800ms < 实测 1903ms，
+//     沙箱里仍会误报（这正是本改动被 8 并发实测顶出来的）。故再乘 2：沙箱内 12× ⇒
+//     tuisong 3600ms（覆盖 1903ms，余量 1.9×）、htmlToMarkdown/saveBatch 6000ms、
+//     10000 条 listfilter 36000ms、sanitize 未闭合堆叠 24000ms、ReDoS 族 12000ms、锁忙语义 1200ms。
+//   · **默认行为逐字节不变**：未设或设 500 时 PERF_SCALE 恰为 1，阈值仍是 300/500/1000/2000/3000ms；
+//     设 <500 时按比例**收紧**（不额外放宽）。
+//   · 语义代价（写明）：沙箱内这些断言退化为「只拦数量级退化」；**真正的性能门禁由不带 PERF_MS 的**
+//     常规运行承担（test.yml 的 npm test）——那里阈值未变，仍拦得住 saveBatch 回到 2475ms、ReDoS
+//     回到秒级这类回归（量级见各断言自带注释）。故用**倍率**而非把阈值直接换成 PERF_MS 绝对值。
+const PERF_BASE_MS = 500
+const PERF_SANDBOX_HEADROOM = 2
+function perfScaleFor (perfMs) {
+  const v = Number(perfMs)
+  const ratio = Number.isFinite(v) && v > 0 ? v / PERF_BASE_MS : 1
+  return ratio > 1 ? ratio * PERF_SANDBOX_HEADROOM : ratio
+}
+// 生效阈值：默认阈值 → 沙箱内放宽后的阈值（perfMs 显式传入，便于回归断言两个方向）
+function perfLimitWith (defaultMs, perfMs) {
+  return Math.round(defaultMs * perfScaleFor(perfMs))
+}
+function perfLimit (defaultMs) {
+  return perfLimitWith(defaultMs, process.env.PERF_MS)
+}
+const PERF_SCALE = perfScaleFor(process.env.PERF_MS)
+// 防灾难性回溯 / 防永久挂起 / 锁忙语义 —— 这些断言的**真实回归量级**是秒~百秒或永久挂起
+// （见各断言自带注释：40 个引号实测 3.6s、47 个 >100s；4 万字符 ~9.5s；80 万字符 3s），
+// 故按同一口径缩放后仍能拦住回归，而并发负载下的墙钟抖动不再误报。
+const PERF_REDOS_LIMIT = perfLimit(1000)
+const PERF_HANG_LIMIT = perfLimit(2000)
+const PERF_LOCK_BUSY_LIMIT = perfLimit(100)
 
 // CodeAnt R7 建议：运行前/后清理 test_ 前缀缓存残留（含 .seen.json/.seen.lock 与临时目录），
 // 避免上次异常中断残留影响本次结果；真实运行缓存 push.json 保留
 function cleanupTestCache () {
   try {
     const fs = require('node:fs')
-    const dir = path.join(__dirname, 'xianbaoku_cache')
+    const dir = CACHE // 本进程私有分片目录（隔离前是共享的 xianbaoku_cache：并发时会互删）
     if (fs.existsSync(dir)) {
       for (const f of fs.readdirSync(dir)) {
         if (!f.startsWith('test_')) continue
         const p = path.join(dir, f)
         try {
           const st = fs.statSync(p)
-          if (st.isDirectory()) fs.rmSync(p, { recursive: true })
+          // 递归删除统一走「已验证路径」入口（removeDirInRoot：拒绝仓库根之外的路径）
+          if (st.isDirectory()) removeDirInRoot(p, CACHE)
           else fs.unlinkSync(p)
         } catch (e) {
           console.warn(`清理测试残留失败 ${f}:`, e?.message) // 单个残留清理失败不影响测试结果
@@ -42,7 +183,10 @@ function cleanupTestCache () {
 let passed = 0
 let failed = 0
 const errors = []
-const TIMEOUT_MS = 3000
+// 每用例硬超时。沙箱内必须**严格大于**最大的内部墙钟阈值（10000 条 listfilter 基准 3000ms
+// → perfLimit 后 36000ms），否则「内部阈值还没到期、harness 先判超时」⇒ 上面的缩放等于白做
+// （3s 的 harness 会把任何 3s+ 的基准直接判红）。取 1.5× 余量。默认保持 3000ms 逐字节不变。
+const TIMEOUT_MS = PERF_SCALE > 1 ? Math.round(3000 * PERF_SCALE * 1.5) : 3000
 
 async function test (name, fn) {
   const start = Date.now()
@@ -75,6 +219,27 @@ function assertEqual (actual, expected, msg) {
     e.message = msg || `期望=${expected}, 实际=${actual}`
     throw e
   }
+}
+
+function assertPathInRoot (targetPath, root, msg) {
+  const rootAbs = path.resolve(root)
+  const t = path.resolve(targetPath)
+  assert.ok(t !== rootAbs && t.startsWith(rootAbs + path.sep),
+    msg || `递归删除目标必须位于仓库根之内：${t} 不在 ${rootAbs}${path.sep} 之下`)
+  return t
+}
+
+// 收敛后的**唯一**递归删除入口：任何整体 rmSync 必须经由它（先校验后删除）。
+// 传入路径本身必须已由 buildCacheShard 产出（其名字无分隔符 ⇒ 结果在根内），这里再次断言是
+// 第二道独立防线：即使调用方算错，也只是 assert 抛错（用例真红可见），不会删到根外。
+function removeDirInRoot (targetPath, root) {
+  const rootAbs = path.resolve(root)
+  const p = path.resolve(targetPath)
+  if (p === rootAbs || !p.startsWith(rootAbs + path.sep)) {
+    throw new Error(`拒绝递归删除仓库根之外的路径（fail-closed）：${p}`)
+  }
+  require('node:fs').rmSync(p, { recursive: true, force: true })
+  return p
 }
 
 // 输出中是否存在成链的 Markdown 危险链接 `[label](javascript:/vbscript:/data:)`。
@@ -1485,7 +1650,9 @@ console.log('========================================\n');
     const t0 = Date.now()
     MessageStore._tombstoneDropped(fp, [{ id: 1 }])
     // 运行中遇到锁立即放弃，不等待、不忙等，避免阻塞事件循环。
-    assertEqual(Date.now() - t0 < 100, true, `锁忙时应立即返回，实际 ${Date.now() - t0}ms`)
+    // 语义阈值：遇锁**立即放弃**、不忙等。真实忙等会等到锁过期（stale 20s / 运行中 1h 量级），
+    // 故沙箱内放宽到 perfLimit(100)=1200ms 仍能拦住「变成等待」的回归。
+    assertEqual(Date.now() - t0 < PERF_LOCK_BUSY_LIMIT, true, `锁忙时应立即返回，实际 ${Date.now() - t0}ms`)
     assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '锁忙时不得写墓碑文件')
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), false, '锁忙时墓碑不命中')
     fsmod.unlinkSync(fp + '.seen.lock')
@@ -2633,7 +2800,8 @@ console.log('========================================\n');
     const r = tuisong_replace('{标题}', { title: '测试', content_html: big })
     const dt = Date.now() - t0
     assertEqual(r, '测试')
-    assertEqual(dt < 500, true, `耗时 ${dt}ms 应 <500ms`)
+    const perfBudget = perfLimit(500) // 默认 500ms；沙箱按 PERF_MS 缩放（见文件头 PERF_MS 注释）
+    assertEqual(dt < perfBudget, true, `耗时 ${dt}ms 应 <${perfBudget}ms`)
   })
 
   await test('模板用Html内容 → 功能不回归', () => {
@@ -3244,8 +3412,8 @@ console.log('========================================\n');
   await test('init 在目录不存在时自动创建', () => {
     const fs = require('fs')
     const dir = CACHE
-    // 临时删除缓存目录
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true })
+    // 临时删除缓存目录（走已验证路径入口，禁止裸 rmSync 整体目录）
+    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
     init()
     assertEqual(fs.existsSync(dir), true)
   })
@@ -3253,10 +3421,198 @@ console.log('========================================\n');
   await test('save 在目录不存在时自动创建（_ensureFileExists）', () => {
     const fs = require('fs')
     const dir = CACHE
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true })
+    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
     appendMessageToFile({ id: 555 }, 'test_recreate.json')
     assertEqual(fs.existsSync(dir), true)
     assertEqual(isMessageInFile({ id: 555 }, 'test_recreate.json'), true)
+  })
+
+  // v3.277（PR #156 复审）并发隔离回归：**撤销隔离即真红**——锁的是「假 Killed 真根因」，
+  // 即并发沙箱里多份 test_filter 不得争抢同一份可写目录（上面两个用例正是先 rmSync 整目录的那两个）。
+  await test('并发隔离: 缓存目录按进程唯一，不与他进程共享 xianbaoku_cache', () => {
+    const pathMod = require('path')
+    const shared = pathMod.join(__dirname, 'xianbaoku_cache')
+    assertEqual(CACHE !== shared, true, `缓存目录不得是并发进程共享的 ${shared}（当前 ${CACHE}）`)
+    assertEqual(CACHE.startsWith(shared + '_'), true, '分片目录仍须以 xianbaoku_cache 起头（.gitignore/根内校验口径不变）')
+    assertEqual(CACHE_DIR_NAME.includes(String(TEST_ISOLATION_ID)), true, '分片目录名须含本进程唯一 ID')
+    assertEqual(Config.cache.dir, CACHE_DIR_NAME, 'Config.cache.dir 必须指向本进程私有分片目录')
+    assertEqual(pathMod.dirname(getFilePath('iso_probe.json')), CACHE, 'getFilePath 必须落在私有分片目录内')
+    assertEqual(MessageStore.cacheDir, CACHE, 'MessageStore.cacheDir 必须落在私有分片目录内')
+    // 非法 cache.dir（普通文件 → resolveCacheDirInRoot 拒绝）时生产回退走的也是同一私有目录：
+    // 只设 Config.cache.dir 不够，XBK_PARALLEL_ID 也必须设，否则回退分支仍写共享目录。
+    const orig = Config.cache.dir
+    try {
+      Config.cache.dir = 'package.json'
+      assertEqual(pathMod.dirname(getFilePath('iso_probe_fallback.json')), CACHE, '非法配置回退必须同样落在私有目录')
+      assertEqual(MessageStore.cacheDir, CACHE, '非法配置下 MessageStore.cacheDir 也必须落在私有目录')
+    } finally {
+      Config.cache.dir = orig
+    }
+  })
+
+  // ============================================================
+  // Qodo PR #158（High / Security）回归：XBK_PARALLEL_ID 路径穿越
+  // ------------------------------------------------------------
+  // 缺陷面：TEST_ISOLATION_ID 曾被原样插值进 `xianbaoku_cache_p${ID}` 再 path.join(__dirname, …)，
+  // 未校验分隔符/根内包含 ⇒ 含 `../` 的值解析到仓库之外，而本套件多处 rmSync(CACHE,{recursive:true})
+  // 会把它递归删掉。生产 resolveCacheDirInRoot 有根内校验，但测试清理跑在它之前。
+  // 本用例锁三件事：① 三类恶意输入都不再产生根外路径；② 恶意输入不会让任何**仓库外**路径被
+  // 用于递归删除（用不存在的哨兵目录证明，绝不真去删敏感路径）；③ 合法输入照常分片。
+  // 靶向回退：删掉 sanitizeIsolationId 的白名单（改回 `raw || String(process.pid)`）即真红。
+  await test('Qodo #158: XBK_PARALLEL_ID 含 / 绝对路径 .. 一律回退 pid 分片（路径穿越防护）', () => {
+    const pathMod = require('path')
+    const fsMod = require('fs')
+    // 1) 模块级不变量：本进程实际生效的三元组必须同源且落在仓库根内
+    assertPathInRoot(CACHE, __dirname, '生效 CACHE 必须位于仓库根之内')
+    assertEqual(CACHE, pathMod.join(__dirname, CACHE_DIR_NAME), 'CACHE 必须与 CACHE_DIR_NAME 同源')
+    assertEqual(Config.cache.dir, CACHE_DIR_NAME, 'Config.cache.dir 必须与 CACHE_DIR_NAME 同源')
+    assert.equal(process.env.XBK_PARALLEL_ID, TEST_ISOLATION_ID, '写回生产的 XBK_PARALLEL_ID 必须与生效分片 ID 同源')
+    assert.equal(TEST_ISOLATION_ID, sanitizeIsolationId(TEST_ISOLATION_ID), '生效分片 ID 自身必须已通过白名单')
+    assert.equal(CACHE_SHARD_ID_RE.test(TEST_ISOLATION_ID), true, `生效分片 ID 必须只含 [A-Za-z0-9_-]（实得 ${TEST_ISOLATION_ID}）`)
+
+    // 2) 三类恶意输入 + 若干等价变体：一律回退 pid ⇒ CACHE 仍是仓库根内的 xianbaoku_cache_p<pid>
+    const rootAbs = pathMod.resolve(__dirname)
+    const pidShard = { dirName: `xianbaoku_cache_p${process.pid}` }
+    const malicious = [
+      ['含斜杠', 'abc/../../etc'],
+      ['含斜杠（多级）', 'a/b'],
+      ['绝对路径', '/etc/cron.d'],
+      ['绝对路径（仓库父目录）', pathMod.resolve(__dirname, '..')],
+      ['父目录段', '..'],
+      ['父目录段（多级+分隔符）', '../../x'],
+      ['以点开头（含分隔符）', './a/../b'],
+      ['Windows 分隔符', '..\\..\\x'],
+      ['空串', ''],
+      ['URL 编码的穿越', '..%2f..%2fx'],
+      ['超长单段', 'a'.repeat(CACHE_SHARD_ID_MAX + 1)]
+    ]
+    for (const [label, raw] of malicious) {
+      const shard = buildCacheShard(raw, __dirname, pathMod)
+      // ② 构造结果的词法路径必须在仓库根之下（不是「碰巧没删」，是**路径本身**没出界）
+      assertPathInRoot(shard.cacheDir, __dirname, `${label} 输入经构造后仍在仓库根内`)
+      assert.equal(pathMod.resolve(shard.cacheDir), pathMod.resolve(rootAbs, shard.dirName),
+        `${label}：cacheDir 必须就是 root+dirName（无多余路径段）`)
+      // fail-closed：非法值回退 pid 分片，而不是照原样插值、也不是抛错
+      assert.equal(shard.dirName, pidShard.dirName,
+        `${label}：非法 XBK_PARALLEL_ID=${JSON.stringify(raw)} 必须回退 pid 分片（实得 ${shard.dirName}）`)
+      assert.equal(shard.id, String(process.pid), `${label}：非法的归一 ID 必须是 pid`)
+    }
+
+    // 3) 恶意输入不得让任何**仓库外**路径被递归删除。
+    //    用「哨兵目录 + 断言未被删除」来证明：哨兵位于仓库根之外（父目录），若旧实现（裸 rmSync）
+    //    被用在 rawId 派生的路径上，addSentinel 建的这棵树会被整棵删掉 ⇒ 断言真红。
+    //    全程只删自己新建的哨兵，绝不触碰任何真实敏感路径。
+    const victimDir = pathMod.resolve(__dirname, '..', `xbk-o1-sentinel-${process.pid}`)
+    const victimFile = pathMod.join(victimDir, 'leaf.json')
+    // 先自证哨兵确实在仓库根之外——否则「未被删除」这件事证明不了任何东西
+    assert.equal(victimDir === rootAbs || victimDir.startsWith(rootAbs + pathMod.sep), false,
+      `哨兵必须位于仓库根之外才有证明力（当前 ${victimDir}）`)
+    const addSentinel = () => {
+      fsMod.rmSync(victimDir, { recursive: true, force: true })
+      fsMod.mkdirSync(victimDir, { recursive: true })
+      fsMod.writeFileSync(victimFile, '{"sentinel":true}')
+    }
+    try {
+      for (const [label, raw] of malicious) {
+        const shard = buildCacheShard(raw, __dirname, pathMod)
+        addSentinel()
+        // ③ 用旧实现的口径模拟「派生路径 → 递归删除」：CACHE 由 raw 派生时本会指向哨兵
+        const derivedFromRaw = pathMod.join(rootAbs, `xianbaoku_cache_p${raw}`)
+        if (pathMod.resolve(derivedFromRaw) === pathMod.resolve(victimDir)) {
+          // 该输入确实是旧实现下的逃逸向量（派生路径 == 哨兵）——这正是必须被拦下的情形
+          assert.equal(pathMod.resolve(shard.cacheDir) === pathMod.resolve(victimDir), false,
+            `${label}：修缮后不得再把哨兵目录当作缓存目录`)
+        }
+        // 修缮后真正会被删除的是 shard.cacheDir；这里**不删哨兵**，只断言它还在
+        removeDirInRoot(shard.cacheDir, __dirname) // 允许删自己（根内、刚构造的分片名）
+        assert.equal(fsMod.existsSync(victimFile), true,
+          `${label}：仓库外哨兵目录不得被递归删除（${victimDir}）`)
+        assert.equal(fsMod.existsSync(victimDir), true,
+          `${label}：仓库外哨兵目录不得被递归删除（${victimDir}）`)
+        assert.notEqual(pathMod.resolve(shard.cacheDir), pathMod.resolve(victimDir),
+          `${label}：生效缓存目录不得落在仓库之外`)
+      }
+      // 4) 直接证明「旧实现会逃逸」：raw='../../x' 时旧派生路径就是哨兵本身
+      const escapeRaw = `../../../${pathMod.basename(victimDir)}`
+      const escapeDerived = pathMod.join(rootAbs, `xianbaoku_cache_p${escapeRaw}`)
+      assert.equal(pathMod.resolve(escapeDerived), pathMod.resolve(victimDir),
+        '构造自证失败：该输入应恰好派生到哨兵目录（否则本用例的证明力不成立）')
+      addSentinel()
+      const escapeShard = buildCacheShard(escapeRaw, __dirname, pathMod)
+      assert.notEqual(pathMod.resolve(escapeShard.cacheDir), pathMod.resolve(victimDir),
+        '穿越输入必须被拦下，不得把仓库外目录当作缓存目录')
+      removeDirInRoot(escapeShard.cacheDir, __dirname)
+      assert.equal(fsMod.existsSync(victimFile), true, '穿越输入的清理不得删掉仓库外哨兵')
+    } finally {
+      try { fsMod.rmSync(victimDir, { recursive: true, force: true }) } catch (e) { /* 清理哨兵 */ }
+    }
+  })
+
+  // 合法输入照常分片（白名单不得把正常 ID 一起挡掉；worker1/纯数字是 test_app_p.js 与调度器口径）
+  await test('Qodo #158: 合法 XBK_PARALLEL_ID 仍照常分片（白名单不误伤）', () => {
+    const pathMod = require('path')
+    const fs = require('fs')
+    for (const good of ['worker1', '12345', 'RUN_1_0', 'a-b_c-9', 'x'.repeat(CACHE_SHARD_ID_MAX)]) {
+      const shard = buildCacheShard(good, __dirname, pathMod)
+      assert.equal(shard.id, good, `合法 ID ${good} 不应被改写`)
+      assert.equal(shard.dirName, `xianbaoku_cache_p${good}`, `合法 ID ${good} 必须照原样分片`)
+      assertPathInRoot(shard.cacheDir, __dirname, `合法 ID ${good} 的分片目录必须在仓库根内`)
+    }
+    // 纯数字/worker 形态必须与 test_app_p.js 的构造口径逐字符一致
+    assert.equal(buildCacheShard('12345', __dirname, pathMod).cacheDir,
+      pathMod.join(__dirname, 'xianbaoku_cache_p12345'), '与 test_app_p.js 分片口径一致')
+    // 未设置环境变量（真实单跑）时取 pid
+    const pidShard = buildCacheShard(undefined, __dirname, pathMod)
+    assert.equal(pidShard.dirName, `xianbaoku_cache_p${process.pid}`, '未设置时取进程 pid')
+    // 反向防漂移：test_app.js 里有一份**同源**的 sanitizeIsolationId/buildCacheShard 段（该文件
+    // 由 test.yml 显式步骤覆盖，不在 SUITES 里）。两边各自断言对方的同源段逐字符一致——只在一侧
+    // 加检查的话，改动 test_filter.js 而不同改 test_app.js 就没人拦。口径：先剥注释，从**行首**锚点
+    // 切到 buildCacheShard 之后的第一个顶层声明，再去空行/行首尾空白后比对。
+    const stripComments = (src) => src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n').filter(line => !/^\s*\//.test(line)).join('\n')
+    const extractBlock = (src) => {
+      const clean = stripComments(src)
+      const a = clean.indexOf('const CACHE_SHARD_ID_RE =')
+      const b = clean.indexOf('function buildCacheShard (rawId, root, pathMod) {')
+      if (a < 0 || b < 0) return ''
+      const m = /\n(function |const |\(async )/.exec(clean.slice(b))
+      if (!m) return clean.slice(a)
+      return clean.slice(a, b + m.index + 1)
+    }
+    const normalize = (text) => text.split('\n').map(line => line.trim()).filter(Boolean).join('\n')
+    const mine = normalize(extractBlock(fs.readFileSync(__filename, 'utf8')))
+    const other = normalize(extractBlock(fs.readFileSync(pathMod.join(__dirname, 'test_app.js'), 'utf8')))
+    assert.ok(mine.length > 200 && other.length > 200,
+      `同源块提取失败（自身 ${mine.length} / test_app ${other.length} 字符）——锚点注释失效`)
+    assert.strictEqual(mine, other,
+      'test_filter.js 与 test_app.js 的 sanitizeIsolationId/buildCacheShard 块必须逐字符相同（改一处必须同改另一处）')
+  })
+
+  // 收敛点自证：任何整体递归删除都必须经过 removeDirInRoot，且它拒绝仓库根之外的路径
+  await test('Qodo #158: 递归删除入口 removeDirInRoot 拒绝仓库根之外的路径（fail-closed）', () => {
+    const pathMod = require('path')
+    const fsMod = require('fs')
+    let threw = false
+    try {
+      removeDirInRoot(pathMod.join(__dirname, '..'), __dirname) // 仓库父目录：必须拒绝
+    } catch (e) { threw = true }
+    assert.equal(threw, true, '对仓库根之外的路径必须抛错拒绝，而不是照删')
+    threw = false
+    try {
+      removeDirInRoot(__dirname, __dirname) // 仓库根自身：同样必须拒绝
+    } catch (e) { threw = true }
+    assert.equal(threw, true, '不得把仓库根自身作为递归删除目标')
+    // 源码自证：**非注释**的递归 rmSync 必须收敛到 removeDirInRoot 内部那一处
+    // （注释里出现 rmSync 字样不构成风险，先剥掉整行注释与块注释再统计）
+    const selfSrc = fsMod.readFileSync(__filename, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '') // 块注释
+      .split('\n').filter(line => !/^\s*\//.test(line)).join('\n') // 整行注释
+    const rawRecursiveRm = selfSrc.match(/rmSync\([^)]*recursive:\s*true/g) || []
+    // 允许 3 处：removeDirInRoot 内部 1 处（唯一生产性删除入口）+ 本用例自己清理哨兵用的 2 处
+    // （目标恒为仓库之外的自建哨兵 victimDir，与缓存分片路径无关）
+    assert.equal(rawRecursiveRm.length, 3,
+      `递归删除只能收敛到 removeDirInRoot + 本用例哨兵清理（实得 ${rawRecursiveRm.length} 处）`)
   })
 
   // ==================== 42. 剩余缺口覆盖 ====================
@@ -4819,7 +5175,7 @@ console.log('========================================\n');
   await test('getFilePath 路径逃逸防护（v3.22审查11）', () => {
     const { getFilePath } = require('./xbk_function_v3.js')
     const pathMod = require('path')
-    const cacheDir = pathMod.join(__dirname, 'xianbaoku_cache') + pathMod.sep
+    const cacheDir = CACHE + pathMod.sep // 生效缓存目录（本进程私有分片；断言强度不变：仍锁「不逃离缓存目录」）
     const p1 = getFilePath('../evil.json')
     assertEqual(p1.startsWith(cacheDir), true, `应留在缓存目录内: ${p1}`)
     const p2 = getFilePath('/etc/passwd')
@@ -4897,7 +5253,7 @@ console.log('========================================\n');
     const bad = '[x]('.repeat(200000)
     const tBad = Date.now()
     assertEqual(f(bad), bad, '未闭合 ) 应原样保留')
-    assert(Date.now() - tBad < 1000, `[x]( 对抗输入应 <1s，实际 ${Date.now() - tBad}ms`)
+    assert(Date.now() - tBad < PERF_REDOS_LIMIT, `[x]( 对抗输入应 <${PERF_REDOS_LIMIT}ms，实际 ${Date.now() - tBad}ms`)
   })
 
   await test('looksHtml/stripAngleTags 畸形输入线性等价（CodeAnt 建议回归）', () => {
@@ -4905,13 +5261,13 @@ console.log('========================================\n');
     const long = '<script'.repeat(20000)
     const t0 = Date.now()
     assertEqual(slim.looksHtml(long), false, '无 > 不应判 HTML')
-    assertEqual(Date.now() - t0 < 1000, true, `对抗输入应 <1s，实际 ${Date.now() - t0}ms`)
+    assertEqual(Date.now() - t0 < PERF_REDOS_LIMIT, true, `对抗输入应 <${PERF_REDOS_LIMIT}ms，实际 ${Date.now() - t0}ms`)
     // v3.264：`<tag `（名字后跟空格）形态会走 includes('>') 全扫剩余串——原实现每处重扫
     // 呈 O(n²)（80 万字符 3s）；此形态旧测试的 '<script'（后跟 '<'）未覆盖
     const long2 = '<h1 '.repeat(200000)
     const t1 = Date.now()
     assertEqual(slim.looksHtml(long2), false, '无 > 不应判 HTML')
-    assert(Date.now() - t1 < 1000, `对抗输入 <h1 应 <1s，实际 ${Date.now() - t1}ms`)
+    assert(Date.now() - t1 < PERF_REDOS_LIMIT, `对抗输入 <h1 应 <${PERF_REDOS_LIMIT}ms，实际 ${Date.now() - t1}ms`)
     assertEqual(slim.looksHtml('<b>hi</b>'), true, '正常 HTML 判定')
     assertEqual(slim.looksHtml('https://a.com/<b>x</b>'), true, '含 HTML 判定')
     assertEqual(slim.looksHtml('看看 <https://autolink>'), false, 'autolink 不算 HTML')
@@ -4943,7 +5299,7 @@ console.log('========================================\n');
     const bad = '![a'.repeat(200000)
     const t0 = Date.now()
     assertEqual(f(bad), bad, '未配对 ![ 应原样保留')
-    assert(Date.now() - t0 < 1000, `![ 对抗输入应 <1s，实际 ${Date.now() - t0}ms`)
+    assert(Date.now() - t0 < PERF_REDOS_LIMIT, `![ 对抗输入应 <${PERF_REDOS_LIMIT}ms，实际 ${Date.now() - t0}ms`)
   })
 
   // ==================== 71. 通读复查修复 ====================
@@ -5546,7 +5902,10 @@ console.log('========================================\n');
 
   // v3.175：基准测试负载容错——瞬时系统负载（CI 2核/并行残留进程）可能偶发超时误报，
   // 首次超时重跑一次（排除瞬时负载）；真实性能回归两次都超时仍会红（保留检测力）
-  function benchRetry (fn, limitMs, label) {
+  // limitMs 入参是**默认阈值**（500/300/…）；沙箱内由 perfLimit 按 PERF_MS 缩放为生效阈值
+  // （默认无 PERF_MS 时缩放恰为 1，阈值逐字节不变）。新增基准自动继承该口径，避免漏改。
+  function benchRetry (fn, defaultLimitMs, label) {
+    const limitMs = perfLimit(defaultLimitMs)
     let elapsed = Infinity
     for (let attempt = 0; attempt < 2; attempt++) {
       const t0 = Date.now()
@@ -5580,6 +5939,38 @@ console.log('========================================\n');
       const group = { catename: '微博线报', louzhu: '小明', title: '京东神券', content: '大促', louzhuregtime: '2026-01-01' }
       for (let i = 0; i < 5000; i++) listfilter(group, cfg)
     }, 500, '5000次listfilter')
+  })
+
+  // v3.278（PR #156 复审续）PERF_MS 缩放回归：**撤销缩放即真红**。
+  // 人造耗时 800ms：> 默认口径 300ms（必须判不合格 ⇒ 断言没被改死），
+  // < 沙箱口径 300×12=3600ms（必须放行 ⇒ 缩放真的生效）。两方向都在同一进程内断言，
+  // 因此本用例不依赖「本进程是否设了 PERF_MS」，在常规运行与沙箱里都可跑。
+  await test('PERF_MS 缩放: 默认口径拦下 800ms 人造耗时、沙箱口径放行（撤销缩放即真红）', () => {
+    const spinStart = Date.now()
+    while (Date.now() - spinStart < 800) { /* busy-spin：制造 800ms 墙钟耗时 */ }
+    const cost = Date.now() - spinStart
+    // ① 默认口径（未设 PERF_MS / 设 500）必须逐字节保持历史常量 —— 默认行为不变
+    assertEqual(perfLimitWith(300, 500), 300, '默认阈值必须仍是 300ms')
+    assertEqual(perfLimitWith(500, 500), 500, '默认阈值必须仍是 500ms')
+    assertEqual(perfLimitWith(1000, 500), 1000, '默认阈值必须仍是 1000ms')
+    assertEqual(perfLimitWith(2000, 500), 2000, '默认阈值必须仍是 2000ms')
+    assertEqual(perfLimitWith(3000, 500), 3000, '默认阈值必须仍是 3000ms')
+    // ② 默认口径下 800ms 人造耗时必须**不合格**（证明断言强度没被改死）
+    assertEqual(cost < perfLimitWith(300, 500), false, `默认口径应拦下 ${cost}ms 人造耗时`)
+    // ③ 沙箱口径（PERF_MS=3000）下同一人造耗时必须**合格**（证明缩放生效）
+    const sandboxBudget = perfLimitWith(300, 3000)
+    assertEqual(sandboxBudget > cost, true, `沙箱口径 ${sandboxBudget}ms 必须放行 ${cost}ms 人造耗时`)
+    // ④ 本进程生效阈值必须真的由 PERF_MS 推导（防「算了但没接上」）
+    assertEqual(perfLimit(300), perfLimitWith(300, process.env.PERF_MS), '生效阈值必须来自本进程 PERF_MS')
+    // ⑤ 沙箱预算必须覆盖**实测上界**（本机 8 并发 tuisong 1903ms；父代理 CI 8 并发 1266ms、
+    //    htmlToMarkdown 1210ms）—— 这正是 PERF_SANDBOX_HEADROOM=2 的存在理由：
+    //    去掉余量（12×→6×）时 tuisong 预算 1800ms < 1903ms，本行即真红。
+    assertEqual(perfLimitWith(300, 3000) > 1903, true, `沙箱 tuisong 预算须覆盖实测上界 1903ms，实际 ${perfLimitWith(300, 3000)}ms`)
+    assertEqual(perfLimitWith(500, 3000) > 1210, true, `沙箱 htmlToMarkdown 预算须覆盖 CI 实测上界 1210ms，实际 ${perfLimitWith(500, 3000)}ms`)
+    assertEqual(perfLimitWith(500, 3000) > 966, true, `沙箱 saveBatch 预算须覆盖实测上界 966ms，实际 ${perfLimitWith(500, 3000)}ms`)
+    // ⑥ 沙箱内 harness 超时必须严格大于最大内部阈值，否则缩放会被 harness 先掐死
+    assertEqual(PERF_SCALE === 1 || TIMEOUT_MS > perfLimit(3000), true, '沙箱内 harness 超时须严格大于最大内部阈值')
+    if (PERF_SCALE === 1) assertEqual(TIMEOUT_MS, 3000, '默认 harness 超时必须仍是 3000ms')
   })
 
   // ==================== 86. 分支覆盖显式验证(关键if两方向) ====================
@@ -6114,7 +6505,7 @@ console.log('========================================\n');
     try {
       // 模拟测试结尾清理逻辑（readdirSync 抛 → catch 吞）
       try {
-        const dir = require('path').join(__dirname, 'xianbaoku_cache')
+        const dir = CACHE // 与 cleanupTestCache 同口径（本进程私有分片，不再碰共享目录）
         if (fs.existsSync(dir)) {
           fs.readdirSync(dir).forEach(() => { /* 清理 */ })
         }
@@ -6187,7 +6578,10 @@ console.log('========================================\n');
     assertEqual(Config.timing.pushInterval, 0)
     assertEqual(Config.timing.finalWait, 0)
     assertEqual(Config.cache.maxSize, 10000)
-    assertEqual(Config.cache.dir, 'xianbaoku_cache')
+    // 生产默认目录：用隔离**之前**捕获的值断言（强度不变——生产把默认目录改掉这里仍会红）；
+    // 同时锁住本套件已把生效目录隔离到进程私有分片（撤销隔离即真红）。
+    assertEqual(PROD_DEFAULT_CACHE_DIR, 'xianbaoku_cache', '生产默认缓存目录必须仍是 xianbaoku_cache')
+    assertEqual(Config.cache.dir, CACHE_DIR_NAME, '生效缓存目录必须已隔离到本进程私有分片目录')
     assertEqual(Config.push.mode, 'parallel')
     assertEqual(Config.push.parallelLimit, 10)
     assertEqual(Config.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json')
@@ -6262,7 +6656,7 @@ console.log('========================================\n');
     const t0 = Date.now()
     const r = whitelistFilter({ title: 'a'.repeat(5000) }, 'title', '(a+)+$')
     assertEqual(r, true, '风险关键词应放行(与非法正则口径一致)')
-    assertEqual(Date.now() - t0 < 1000, true, '不应卡死')
+    assertEqual(Date.now() - t0 < PERF_REDOS_LIMIT, true, '不应卡死')
   })
 
   // 95-5. 端到端：listfilter 用编译结果不触发灾难性回溯
@@ -6271,7 +6665,7 @@ console.log('========================================\n');
     const t0 = Date.now()
     const r = listfilter({ catename: 'a', louzhu: 'b', title: 'a'.repeat(5000), content: 'c', louzhuregtime: '2026-01-01' }, c)
     assertEqual(typeof r === 'boolean', true)
-    assertEqual(Date.now() - t0 < 1000, true, '嵌套量词配置不应卡死')
+    assertEqual(Date.now() - t0 < PERF_REDOS_LIMIT, true, '嵌套量词配置不应卡死')
   })
 
   // ==================== 96. 一致性修复(配置解析口径) ====================
@@ -6441,7 +6835,7 @@ console.log('========================================\n');
       let caught = null
       try { await got(`http://127.0.0.1:${server.address().port}/x`, { timeout: 3000, retry: { limit: 0 } }) } catch (e) { caught = e }
       assertEqual(!!caught, true, '响应中断应 reject')
-      assertEqual(Date.now() - t0 < 2000, true, '应快速 reject 不挂起（曾永久挂起）')
+      assertEqual(Date.now() - t0 < PERF_HANG_LIMIT, true, '应快速 reject 不挂起（曾永久挂起）')
     } finally {
       await new Promise(r => server.close(r))
     }
@@ -6462,7 +6856,7 @@ console.log('========================================\n');
       try { await got(`http://127.0.0.1:${server.address().port}/x`, { timeout: 200, retry: { limit: 0 } }) } catch (e) { caught = e }
       // 总时长 = timeout×3 = 600ms 强制超时（间隔100ms<200ms 空闲超时不触发，曾无限拖）
       assertEqual(caught && caught.code === 'ETIMEDOUT', true, '慢流应总时长超时')
-      assertEqual(Date.now() - t0 < 2000, true, `应在总时长内 reject（曾无限拖），耗时 ${Date.now() - t0}ms`)
+      assertEqual(Date.now() - t0 < PERF_HANG_LIMIT, true, `应在总时长内 reject（曾无限拖），耗时 ${Date.now() - t0}ms`)
     } finally {
       await new Promise(r => server.close(r))
     }
@@ -6914,7 +7308,8 @@ console.log('========================================\n');
     }
     const ms = Date.now() - t0
     assertEqual(pushed + filtered, 10000, '10000 条应全部处理')
-    assertEqual(ms < 3000, true, `10000 条 listfilter 应 <3s，实际 ${ms}ms`)
+    const perfBudget = perfLimit(3000) // 默认 3000ms；沙箱按 PERF_MS 缩放（见文件头 PERF_MS 注释）
+    assertEqual(ms < perfBudget, true, `10000 条 listfilter 应 <${perfBudget}ms，实际 ${ms}ms`)
   })
 
   await test('Fuzz 回归: hasValidId 对缺失/非对象输入不崩（v3.107）', () => {
@@ -8005,7 +8400,8 @@ console.log('========================================\n');
     const t0 = Date.now()
     saveBatch(msgs, 'test_112_perf.json')
     const ms = Date.now() - t0
-    assertEqual(ms < Number(process.env.PERF_MS || 500), true, `5000 条 saveBatch 应 <${process.env.PERF_MS || 500}ms，实际 ${ms}ms`)
+    const perfBudget = perfLimit(500) // 默认 500ms；沙箱按 PERF_MS 缩放（见文件头 PERF_MS 注释）
+    assertEqual(ms < perfBudget, true, `5000 条 saveBatch 应 <${perfBudget}ms，实际 ${ms}ms`)
     try { require('fs').unlinkSync(getFilePath('test_112_perf.json')) } catch (e) { /* 忽略 */ }
   })
 
@@ -8597,7 +8993,8 @@ console.log('========================================\n');
     const out = sanitizeDecodedHtml(input)
     console.timeEnd('sanitizeDecodedHtml-20k')
     const cost = Date.now() - start
-    assertEqual(cost < 2000, true, `性能超时 ${cost}ms >= 2000ms`)
+    const perfBudget = perfLimit(2000) // 默认 2000ms；沙箱按 PERF_MS 缩放（见文件头 PERF_MS 注释）
+    assertEqual(cost < perfBudget, true, `性能超时 ${cost}ms >= ${perfBudget}ms`)
     assertEqual(out.length, 100000, '超长输入应按 100k 截断')
   })
 
@@ -8606,7 +9003,8 @@ console.log('========================================\n');
     const start = Date.now()
     const out = sanitizeDecodedHtml(evil)
     const cost = Date.now() - start
-    assertEqual(cost < 500, true, `长 href 输入应 <500ms，实际 ${cost}ms（v3.251 正则回溯复活）`)
+    const perfBudget = perfLimit(500) // 默认 500ms；沙箱按 PERF_MS 缩放（见文件头 PERF_MS 注释）
+    assertEqual(cost < perfBudget, true, `长 href 输入应 <${perfBudget}ms，实际 ${cost}ms（v3.251 正则回溯复活）`)
     assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(out), false, `事件属性不应残留: ${out.slice(0, 90)}`)
     assertEqual(out.includes('javascript'), false, '危险协议不应残留')
   })
@@ -8811,7 +9209,8 @@ console.log('========================================\n');
     const start = Date.now()
     sanitizeDecodedHtml(input)
     const cost = Date.now() - start
-    assertEqual(cost < 500, true, `未闭合引号主动标签应 <500ms，实际 ${cost}ms（P1-03 回溯复活）`)
+    const perfBudget = perfLimit(500) // 默认 500ms；沙箱按 PERF_MS 缩放（见文件头 PERF_MS 注释）
+    assertEqual(cost < perfBudget, true, `未闭合引号主动标签应 <${perfBudget}ms，实际 ${cost}ms（P1-03 回溯复活）`)
   })
 
   await test('parseTime 带空白日期仍按 UTC 零点（P1-02：trim 后不落宿主本地时区）', () => {
@@ -8853,6 +9252,7 @@ console.log('========================================\n');
     ['100k 截断边界 + 长 URL', ('<a href="https://u.jd.com/' + 'D'.repeat(5000) + '"><img src="x">').repeat(20)],
     ['on* 属性链 + style 危险值', ('<div onclick="x()" onmouseover="y()" style="background:url(javascript:alert(1))"><a href="https://x.com/a">t</a></div>').repeat(5)]
   ]
+  const sanitizePerfBudget = perfLimit(500) // 默认 500ms；沙箱按 PERF_MS 缩放（见文件头 PERF_MS 注释）
   for (const [name, input] of perfCases) {
     await test(`基准: sanitizeDecodedHtml ${name} <500ms（真实形态）`, () => {
       // 3 次测量取中位数——单次调度抖动不误报（CI 偶发 flaky），中位数保留真实回归灵敏度
@@ -8863,7 +9263,7 @@ console.log('========================================\n');
       }
       const runs = [measure(), measure(), measure()].sort((a, b) => a.cost - b.cost)
       const { cost, out } = runs[1]
-      assertEqual(cost < 500, true, `${name} 应 <500ms（3 次中位数），实际 ${cost}ms（真实数据 ReDoS 回归）`)
+      assertEqual(cost < sanitizePerfBudget, true, `${name} 应 <${sanitizePerfBudget}ms（3 次中位数），实际 ${cost}ms（真实数据 ReDoS 回归）`)
       assertEqual(/\bon[a-z][a-z0-9_-]*\s*=/i.test(out), false, `${name} 事件属性不应残留: ${out.slice(0, 60)}`)
       assertEqual(out.includes('javascript') || out.includes('vbscript') || out.includes('data:text/html'), false, `${name} 危险协议不应残留: ${out.slice(0, 60)}`)
     })
@@ -10060,7 +10460,7 @@ console.log('========================================\n');
     } catch (e) {
       threw = true
     } finally {
-      try { fsmod.rmSync(dir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+      try { removeDirInRoot(dir, __dirname) } catch (e) { /* 忽略 */ }
     }
     assertEqual(threw, false, '写目录路径不得抛出')
     assertEqual(ret, false, '写目录路径应返回 false')
@@ -10485,6 +10885,12 @@ console.log('========================================\n');
     assertEqual(whitelistFilter({ title: probe }, 'title', '京东'), true, '函数字段值 String() 源码应参与匹配')
     assertEqual(matchesCompiled(compileRules({ pingbibiaoti: '京东' }).pingbibiaoti, probe, 'cat'), true, 'matchesCompiled 同口径命中')
   })
+
+  // 并发隔离目录是本进程私有产物：退出前整体删除，避免 Stryker 沙箱内逐变异体累积
+  // （沙箱全生命周期只建一个，百级变异体会留下百级目录）。不碰共享的 xianbaoku_cache。
+  if (OWNS_CACHE_DIR) {
+    try { removeDirInRoot(CACHE, __dirname) } catch (e) { /* 清理失败不影响退出码 */ }
+  }
 
   process.exit(failed > 0 ? 1 : 0)
 })()

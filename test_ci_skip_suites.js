@@ -464,6 +464,27 @@ const skipAll = unitFiles.join(',') // 跳过全部单元套件 → 零套件守
 // 用它秒级收尾——过滤后为零套件已被 3f 固定为非 0，不能再拿它当「快速跑完」的挡箭牌。
 const skipAllButOne = unitFiles.filter(f => f !== 'test_check_deps.js').join(',')
 
+// ── 并发假杀隔离：summary 落点必须按进程唯一（PR #158）──────────────────────────
+// Stryker 一次 run 只建**一个**沙箱目录：`--concurrency 8` 时 8 个测试 worker 共用同一份 cwd，于是任何
+// **仓库相对**的共享可写路径都会被并发 worker 写→读→删互相踩。本段原先用固定的「reports/ + 固定名」做
+// summary 落点（子进程写入 → 本进程立即读回 → finally 删除），CI 实测（C=8）出现过：
+//   Error: ENOENT: no such file or directory, open '<那个固定落点>'（读回处）
+// 逐字成因：同族 worker 的 finally 删除落在本 worker 的「写完 → 读回」之间。套件因此崩、命令 runner 按
+// 退出码判 Killed，把与该变异体**无关**的结果打成假 Killed。
+// 修法与 test_filter.js / test_app.js 的 `xianbaoku_cache_p<XBK_PARALLEL_ID|pid>` 同源：落点按进程唯一。
+// **断言语义一字不改**——断的是「写入 → 读回 → 删除」的行为与内容（前缀 `## 单元测试结果`、`共 1 套件`），
+// 不是文件名；下面没有任何断言依赖固定文件名。「唯一后缀必须还在」这件事由本段末尾的并发回归 + 断言锁定。
+// 唯一化规则的**单点定义**：真实落点与下方并发回归夹具都从这一个模板派生——把 `.p<pid>` 去掉会让两边
+// 同时退回共享路径，回归因此真红。占位符用 `<stem>`/`<pid>` 而不是 `${…}`：后者写在字符串里会被 standard 的
+// no-template-curly-in-string 判红（不是靠 eslint-disable 压规则）。
+const CI_SUMMARY_PATH_TEMPLATE = 'reports/<stem>.p<pid>.md'
+const ciSummaryPath = (pid, stem) => CI_SUMMARY_PATH_TEMPLATE.replace('<stem>', stem).replace('<pid>', String(pid))
+const ciSummaryCheck = ciSummaryPath(process.pid, '.ci-summary-check') // reports/.ci-summary-check.p<pid>.md
+const ciSummaryOverflow = ciSummaryPath(process.pid, '.ci-summary-overflow') // reports/.ci-summary-overflow.p<pid>.md
+// 3c 的反面夹具要指到一个**不存在**的目录（真去写就 ENOENT）：同样带 pid 后缀——否则并发 worker 遗留的
+// 同名目录会让「没写」这条断言静默失去意义（夹具自身失效 ⇒ 断言恒真）。
+const ciMissingFile = `reports/.ci-missing-dir.p${process.pid}/.ci-summary-child.md`
+
 fs.mkdirSync('reports', { recursive: true }) // reports/ 已被 .gitignore 忽略，用作 summary 落点
 try {
   // 3a 拼错的条目必须炸（修复前是静默照跑全量）
@@ -472,18 +493,20 @@ try {
   assert.match(unknown.stderr, /test_not_exist\.js/, '错误应点名未知套件')
 
   // 3b CI 下写 summary（验证过滤生效：跳过其余套件 → 只剩 test_check_deps.js 一个）
-  const filtered = runEntry({ SKIP_SUITES: skipAllButOne, GITHUB_STEP_SUMMARY: 'reports/.ci-summary-check.md' })
+  const filtered = runEntry({ SKIP_SUITES: skipAllButOne, GITHUB_STEP_SUMMARY: ciSummaryCheck })
   assert.strictEqual(filtered.status, 0, filtered.stderr || filtered.stdout)
   assert.match(filtered.stdout, /共 1 个套件/, '只剩一个套件时应报告 1 个')
-  const summary = fs.readFileSync('reports/.ci-summary-check.md', 'utf8')
+  const summary = fs.readFileSync(ciSummaryCheck, 'utf8')
   assert.match(summary, /^## 单元测试结果/m, 'CI 下应写入 job summary')
   assert.match(summary, /共 1 套件/, 'summary 套件数应与实际执行数一致')
 
   // 3c 变异子进程必须不写 summary：把落点指到不存在的目录，真去写就会 ENOENT 崩掉 ——
   //    因此「exit 0 且 stderr 无 ENOENT」即证明没有发生写入
+  assert.ok(!fs.existsSync(path.dirname(ciMissingFile)),
+    `夹具前提：${path.dirname(ciMissingFile)} 不应存在（它存在就让「没写 summary」这条断言恒真）`)
   const child = runEntry({
     SKIP_SUITES: skipAllButOne,
-    GITHUB_STEP_SUMMARY: 'reports/.ci-missing-dir/.ci-summary-child.md',
+    GITHUB_STEP_SUMMARY: ciMissingFile,
     XBK_MUTATION_CHILD: '1'
   })
   assert.strictEqual(child.status, 0, child.stderr || child.stdout)
@@ -493,7 +516,7 @@ try {
   //    XBK_UNIT_MAX_BUFFER 仅测试注入；留一个必输出内容的套件、把上限压到 1 字节
   const overflow = runEntry({
     SKIP_SUITES: skipAllButOne,
-    GITHUB_STEP_SUMMARY: 'reports/.ci-summary-overflow.md',
+    GITHUB_STEP_SUMMARY: ciSummaryOverflow,
     XBK_UNIT_MAX_BUFFER: '1'
   })
   assert.notStrictEqual(overflow.status, 0, '输出超过 maxBuffer 的套件应判定失败')
@@ -507,8 +530,99 @@ try {
   assert.match(zero.stderr, /没有可执行的单元套件/, '错误应点名「过滤后没有可执行的单元套件」')
   assert.ok(!/全部通过/.test(zero.stdout), '零套件时不得输出「全部通过」')
 } finally {
-  fs.rmSync('reports/.ci-summary-check.md', { force: true })
-  fs.rmSync('reports/.ci-summary-overflow.md', { force: true })
+  // 只删**本进程自己的**落点（并发 worker 的落点文件名不同，互不可见）——清理不漏、也不误删别人
+  fs.rmSync(ciSummaryCheck, { force: true })
+  fs.rmSync(ciSummaryOverflow, { force: true })
+}
+
+// ── 3b-并发回归：共享落点的并发争抢必须被结构性排除（PR #158 的靶向锁）──────────────
+// 真并发：1 个编排进程同时拉起 4 个 hammer 进程，各自用**上面同一份唯一化模板** + 自己的 pid 展开落点，
+// 循环做「写 → 立即读回 → 删」（与本段 3b/finally 同构，只是轮次更多、窗口被抖动放大）：
+//   · 唯一化在位 ⇒ 每条路径只属于一个进程，读回必然拿到自己写的内容（确定性绿，与调度无关）；
+//   · 唯一化被去掉（模板退回共享路径）⇒ 4 个进程写/删同一条路径，读回撞上兄弟进程的删除 ⇒
+//     ENOENT / 内容被覆盖（靶向回退实测真红；与 CI 在 C=8 下的残余假杀同一成因）。
+// 不能用「同一进程内两份并发实例」：本套件是同步脚本、Node 单线程，同进程内做不出真并发；故用真实子进程。
+{
+  const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-ci-summary-probe-'))
+  try {
+    const hammer = [
+      "'use strict'",
+      "const fs = require('node:fs')",
+      'const spec = JSON.parse(process.env.XBK_CI_SUMMARY_PROBE)',
+      "const file = spec.template.replace('<stem>', spec.stem).replace('<pid>', String(process.pid))",
+      'let failures = 0',
+      'for (let i = 0; i < spec.rounds; i++) {',
+      '  fs.writeFileSync(file, "pid=" + process.pid + " round=" + i + "\\n") // ← 3b：写 summary',
+      '  // 抖动（相位按 pid 错开）：把「写完→读回」的窗口撑开，好让兄弟进程的删除/覆盖落进来',
+      '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, (i * 7 + (process.pid % 5)) % spec.jitterMs)',
+      '  try {',
+      "    const back = fs.readFileSync(file, 'utf8') // ← 3b：立即读回（共享路径下这里就是 ENOENT 现场）",
+      '    if (!back.startsWith("pid=" + process.pid + " ")) throw new Error("summary 被兄弟进程覆盖: " + back.trim())',
+      '  } catch (e) {',
+      '    failures++',
+      '    if (failures === 1) console.error("[probe pid=" + process.pid + " round=" + i + "] " + (e.code || "ERR") + " " + e.message)',
+      '  }',
+      '  fs.rmSync(file, { force: true }) // ← finally：删自己的落点',
+      '}',
+      'process.exit(failures === 0 ? 0 : 1)',
+      ''
+    ].join('\n')
+    fs.writeFileSync(path.join(probeDir, 'hammer.js'), hammer)
+    // 编排进程：同时拉起 4 个 hammer 并聚合退出码（本套件是同步脚本、无 top-level await，故由被 spawn 的
+    // 编排进程聚合）。hammer 走 process.execPath + 继承 env，与本文件其它 spawn 同口径。
+    const runner = [
+      "'use strict'",
+      "const { spawn } = require('node:child_process')",
+      'const procs = Number(process.env.XBK_CI_SUMMARY_PROCS) || 4',
+      "let left = procs, failed = 0, firstErr = ''",
+      'for (let k = 0; k < procs; k++) {',
+      "  const p = spawn(process.execPath, [process.argv[1]], { stdio: ['ignore', 'ignore', 'pipe'] })",
+      "  let err = ''",
+      "  p.stderr.on('data', d => { err += d })",
+      '  p.on("exit", (code, signal) => {',
+      '    if (code !== 0) { failed++; if (!firstErr) firstErr = err.trim() || ("exit=" + code + " signal=" + signal) }',
+      '    if (--left === 0) { if (firstErr) console.error(firstErr); process.exit(failed === 0 ? 0 : 1) }',
+      '  })',
+      '  p.on("error", e => { failed++; if (!firstErr) firstErr = e.message; if (--left === 0) process.exit(1) })',
+      '}',
+      ''
+    ].join('\n')
+    // rounds/jitter 取「回退必红、在位必绿」的最小成本档：本机实测共享路径下 5/5 真红（内容被覆盖或 ENOENT），
+    // 唯一路径下恒绿；成本主要是 4 个子进程的 node 启动，与轮次基本无关，故不放大轮次（stryker 逐变异体都跑本套件）。
+    const spec = JSON.stringify({ template: CI_SUMMARY_PATH_TEMPLATE, stem: '.ci-summary-check', rounds: 10, jitterMs: 2 })
+    const probeRun = spawnSync(process.execPath, ['-e', runner, path.join(probeDir, 'hammer.js')], {
+      encoding: 'utf8',
+      cwd: __dirname,
+      env: { ...baseEnv, XBK_CI_SUMMARY_PROBE: spec, XBK_CI_SUMMARY_PROCS: '4' }
+    })
+    assert.ok(!probeRun.error, `并发探针未能启动: ${probeRun.error && probeRun.error.message}`)
+    assert.strictEqual(probeRun.status, 0,
+      '多个并发进程在 summary 落点上发生争抢：落点必须按进程唯一。共享路径下的三种现场都算红——' +
+      '① 读回 ENOENT（兄弟进程删了它，CI 的原始假杀形态）；② 内容被兄弟进程覆盖；③ 读回时撞上并发 unlink ' +
+      '而崩（Node/libuv 在 ReadFileUtf8 上 abort，退出码非 0）\n' +
+      `${probeRun.stderr || probeRun.stdout}`)
+    assert.ok(!/ENOENT/.test(probeRun.stderr || ''), '并发争抢的现场证据里不得出现 ENOENT')
+    console.log('✅ 并发隔离：4 进程 × 10 轮「写→读回→删」，0 争抢（落点模板 ' + CI_SUMMARY_PATH_TEMPLATE + '）')
+  } finally {
+    fs.rmSync(probeDir, { recursive: true, force: true })
+  }
+  // 唯一性 + 静态双保险：真实落点必须带本进程 pid；固定共享字面量不得再出现（回退即红）。
+  assert.ok(ciSummaryCheck.includes(`.p${process.pid}.md`) && ciSummaryOverflow.includes(`.p${process.pid}.md`),
+    'summary 落点必须带 `.p<pid>.md` 唯一后缀（不带 = 退回共享路径 = 并发 worker 互相删读 ⇒ ENOENT 假 Killed）')
+  assert.notStrictEqual(ciSummaryCheck, ciSummaryOverflow, '同进程内两个落点也必须互不相同')
+  assert.ok(ciSummaryCheck !== ciSummaryPath(process.pid + 1, '.ci-summary-check'),
+    '落点必须随 pid 变化（把 pid 从模板里去掉会让这条断言与并发探针同时红）')
+  {
+    const selfSrc = fs.readFileSync(__filename, 'utf8')
+    // 拼出来而不是写字面量：否则「禁止的固定路径」会把自己所在的这一行判成违规（假红）
+    const fixedPaths = ['reports/.ci-summary-check', 'reports/.ci-summary-overflow'].map(p => p + '.md')
+    fixedPaths.push('reports/.ci-missing-dir' + '/')
+    for (const fixed of fixedPaths) {
+      assert.ok(!selfSrc.includes(fixed),
+        `summary 落点不得退回固定共享路径 \`${fixed}\`：Stryker 一个 run 只建一个沙箱、--concurrency 8 时 ` +
+        '8 个 worker 共用同一份 cwd，固定路径会被并发删读 ⇒ ENOENT 假 Killed')
+    }
+  }
 }
 
 // 3g run_tests.js 的零套件守卫（RT-01）、失败原因诊断（RT-02）与每套件超时（RT-03）回归：该入口全量跑
@@ -719,9 +833,18 @@ assert.ok(strykerIdx > 0, 'mutation.yml 应包含 stryker 运行步骤')
 assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHILD:\s*'1'/,
   'mutation.yml 的变异测试 step 必须设 XBK_MUTATION_CHILD=1（否则重复整表 append，几百次即撞 1MiB 上限）')
 
-// 3e PR #156 返工的三条 CI 硬约束：① 缓存 key 与 restore-keys 前缀必须含测试指纹；
-//    ② 剥离步不得再碰 reports/inc-*.json；③ artifact 收窄到 reports/mutation/ 并 fail-loud。
-// 三处都是 Qodo 评审判定为真问题的位置，靠注释兜不住——每条都做成「改回旧形态立刻红」的靶向断言。
+// 3e 变异 job 的三条 CI 硬约束：① 缓存 key/restore-keys 必须是**回退后**的形态（PR #156 的「测试指纹
+//    强制全量」改动已于 2026-09-19 回退，用户拍板）；② 剥离步不得再碰 reports/inc-*.json；
+//    ③ artifact 收窄到 reports/mutation/ 并 fail-loud。
+// 三处都是评审判定为真问题的位置，靠注释兜不住——每条都做成「改回旧形态立刻红」的靶向断言。
+// ① 的方向已反转，理由（为什么回退；旧说法「测试一变就必须全量重跑」已不保留）：
+//    该改动 ⓐ **拦不住真根因**——假 Killed 来自**共享缓存的并发串扰**，发生在**变异体运行期**、基线全程是绿的；
+//    测试没变时测试指纹不变、主 key 依旧命中，故它对真根因完全无效。
+//    ⓑ **跑不完**——真正全量下 app(2651) / utils(2402) / message-store(1692) 在 --concurrency 8 下仍需
+//    ~7h / ~6.5h / ~4.5h，必然撞「变异测试」step 的 330min 被 杀；而 actions/cache 的保存是 post-if: success()
+//    ⇒ **失败段不保存进度** ⇒ 那几段每轮从零开始、永久红。
+//    ⓒ **前提已消失**——stryker.config.js 的 thresholds.break 已改 null（当前**无分数门禁**）⇒ 陈旧增量复用
+//    不再能误导任何门禁，「为保护分数门禁而强制全量」这个理由本身就不成立。这是**有意接受的取舍**，不是遗漏。
 // 断言只读**真实 YAML 行**（剔除注释行）：否则把证据写进注释、代码改回去也能骗过门禁，等于没修。
 {
   const indentOf = line => line.length - line.trimStart().length
@@ -749,37 +872,66 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   }
   const stepEndAfter = (at, nameLen) => stepEndIn(mutationYml, at, nameLen)
 
-  // (1) 「恢复增量缓存」：主 key 与 restore-keys 都必须含测试指纹，且不得再有裸兜底前缀。
-  //     coverageAnalysis:'off' 下 incremental-differ 感知不到测试变化，会拿**旧 killed/survived** 去喂
-  //     stryker.config.js 的 thresholds.break=65 分数门禁 ⇒ 测试指纹不进 key（及 restore-keys 前缀），
-  //     「源码没动、只改/只删测试」就能用旧分数过门禁。actions/cache 的 restore-keys 只有**前缀**语义，
-  //     故测试段还必须排在源段之前；原来那条无条件的裸兜底 stryker-${{ matrix.name }}- 必须删除。
-  const cacheAt = mutationYml.indexOf('- name: 恢复增量缓存')
-  assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（缓存策略无从核对即视为回归）')
-  const cacheEnd = mutationYml.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
-  assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
-  const cacheLines = yamlOnly(mutationYml.slice(cacheAt, cacheEnd))
-  const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
-  assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
-  assert.ok(/-tests-\$\{\{ hashFiles\(/.test(keyLine),
-    '缓存 key 必须含测试指纹段 `-tests-' + '${' + '{ hashFiles(...) }}`：一旦改回不含测试的 `stryker-' + '${' + '{ matrix.name }}-' + '${' + '{ hashFiles(源) }}`，' +
-    '只改/只删测试就会命中旧基线，把旧 killed/survived 的分数喂给 thresholds.break=65 门禁（Qodo High）')
-  assert.ok(/-src-\$\{\{ hashFiles\(/.test(keyLine),
-    '缓存 key 的源指纹段 `-src-' + '${' + '{ hashFiles(...) }}` 不得被删掉（否则源码变化也不再换基线）')
-  const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
-  assert.ok(restoreIdx >= 0, '「恢复增量缓存」必须声明 restore-keys')
-  const restoreIndent = indentOf(cacheLines[restoreIdx])
-  const restoreKeys = []
-  for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
-    if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
-    restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
+  // (1)「恢复增量缓存」：key 与 restore-keys 必须是**回退后**的形态——key 不含测试指纹段、兜底是裸的
+  //     stryker-<段>-（回到 PR #156 之前）。抽成函数是为了让紧随其后的反例在**同一套提取 + 断言代码**上
+  //     跑真实 workflow 的变异副本：把 key 改回含测试指纹的形态 ⇒ 必须立刻红。
+  const assertCacheStep = (ymlText) => {
+    const cacheAt = ymlText.indexOf('- name: 恢复增量缓存')
+    assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（缓存策略无从核对即视为回归）')
+    const cacheEnd = ymlText.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
+    assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
+    const cacheLines = yamlOnly(ymlText.slice(cacheAt, cacheEnd))
+    const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
+    assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
+    // key 必须逐字等于**回退后**的形态：stryker-<段>-<src 指纹>（源指纹固定用 matrix.src：mutate 里的范围
+    // 字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，会得到空指纹、使 range 段缓存永不过期）。
+    const open = '${'
+    assert.strictEqual(keyLine.trim(),
+      'key: stryker-' + open + '{ matrix.name }}-' + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}",
+      '缓存 key 必须是**回退后**的形态 stryker-<段>-<src 指纹>（不含 -tests- 测试指纹段）：PR #156 的' +
+      '「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发串扰，基线全程是绿的）、' +
+      '跑不完（app/utils/message-store 真全量在 --concurrency 8 下仍需 ~7h/~6.5h/~4.5h，必撞 step 330min，' +
+      '而失败段不保存缓存进度 ⇒ 永久红），且当前**无分数门禁** ⇒ 复用不构成门禁风险（有意接受的取舍）')
+    assert.ok(!keyLine.includes('-tests-') && !keyLine.includes('test_*.js'),
+      '缓存 key 不得再含测试指纹（`-tests-` / `test_*.js`）：一旦改回含指纹形态，本条断言立即红')
+    const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
+    assert.ok(restoreIdx >= 0, '「恢复增量缓存」必须声明 restore-keys')
+    const restoreIndent = indentOf(cacheLines[restoreIdx])
+    const restoreKeys = []
+    for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
+      if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
+      restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
+    }
+    assert.deepStrictEqual(restoreKeys, ['stryker-' + '${' + '{ matrix.name }}-'],
+      'restore-keys 必须是**回退后**的裸兜底前缀 `stryker-' + '${' + '{ matrix.name }}-`（回到 PR #156 之前）：' +
+      '旧形态把测试指纹写进兜底前缀（限在同一测试指纹内兜底），随本次回退一并撤销')
   }
-  assert.ok(restoreKeys.length > 0, 'restore-keys 不得为空（增量基线需要兜底）')
-  const badRestore = restoreKeys.filter(k => !/^stryker-\$\{\{ matrix\.name \}\}-tests-\$\{\{ hashFiles\(/.test(k))
-  assert.deepStrictEqual(badRestore, [],
-    '每条 restore-key 都必须以 `stryker-' + '${' + '{ matrix.name }}-tests-' + '${' + '{ hashFiles(...) }}` 开头（限在同一测试指纹内兜底）：' +
-    'actions/cache 的 restore-keys 只有前缀匹配语义，改回裸的 `stryker-' + '${' + '{ matrix.name }}-` 会在主 key 落空后' +
-    '跨「不同测试状态」恢复旧基线，等于没修')
+  assertCacheStep(mutationYml)
+
+  // (1 反例·靶向) 把 key/restore-keys 改回 PR #156 的含测试指纹形态 ⇒ 同一套提取 + 断言必须红。
+  // 这条反例是「断言方向真正反转了」的证据：若只把断言改宽（例如只断言「key 存在」），反例不会红。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-fingerprint-'))
+    try {
+      const fixture = path.join(dir, 'mutation.yml')
+      const open = '${'
+      const fingerprintKey = 'key: stryker-' + open + '{ matrix.name }}-tests-' + open + "{ hashFiles('test_*.js') }}-src-" + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}"
+      const fingerprintRestore = 'stryker-' + open + '{ matrix.name }}-tests-' + open + "{ hashFiles('test_*.js') }}-"
+      const reverted = mutationYml
+        .replace(/^([ \t]*)key: stryker-\$\{\{ matrix\.name \}\}-.*$/m, (m, ind) => ind + fingerprintKey)
+        .replace(/^([ \t]*)stryker-\$\{\{ matrix\.name \}\}-$/m, (m, ind) => ind + fingerprintRestore)
+      assert.notStrictEqual(reverted, mutationYml,
+        '反例夹具必须真的把 key 改成了含测试指纹的形态（没改成本回归形同虚设）')
+      assert.ok(/-tests-/.test(reverted) && reverted !== mutationYml,
+        '夹具中 key 必须带 -tests- 段（否则反例证明的不是「改回指纹形态会红」）')
+      fs.writeFileSync(fixture, reverted)
+      assert.throws(() => assertCacheStep(fs.readFileSync(fixture, 'utf8')),
+        /回退后/,
+        '把缓存 key 改回含测试指纹的形态后必须红：断言锁定的就是「回退后」这一形态')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
 
   // (2) 剥离步不得再把 reports/inc-*.json 塞回去：inc 是**下一次运行** incremental-differ 的复用输入，
   //     statusReason 会被原样透传进新产出的 JSON/HTML；在这里置空串，等于让「被复用的变异体为什么
@@ -840,8 +992,28 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   const noFiles = uploadLines.find(l => /^\s*if-no-files-found:/.test(l))
   assert.ok(noFiles && noFiles.trim() === 'if-no-files-found: error',
     '「上传变异报告」必须带 `if-no-files-found: error`：stryker 崩溃/未产出报告时不得静默上传一个只含 inc 的 artifact')
+
+  // (4) fail-closed 守卫 step 必须存在、带 if: always()、经生产 CLI 调用，且位于 stryker 之后、上传之前。
+  //     撤回分数门禁（thresholds.break = null）后，守卫是唯一的恒常判据：把它删掉/挪到上传之后/改成内联脚本，
+  //     都会让「全 RuntimeError / 空报告 / 报告缺失」重新变成静默假绿——而门禁自身没有门禁，所以在这里锁死。
+  {
+    const guardName = '- name: 变异报告 fail-closed 守卫（' + '${' + '{ matrix.name }}）'
+    const guardAt = mutationYml.indexOf(guardName)
+    assert.ok(guardAt >= 0,
+      'mutation.yml 必须存在「变异报告 fail-closed 守卫」step：它是撤回分数门禁后唯一的恒常判据，被删掉即静默假绿')
+    const guardText = mutationYml.slice(guardAt, stepEndAfter(guardAt, guardName.length))
+    const guardLines = yamlOnly(guardText)
+    assert.ok(guardLines.some(l => /^\s*if:\s*always\(\)/.test(l)),
+      '守卫 step 必须带 `if: always()`：stryker 失败/超时时同样要判一遍（否则最该判的场合反而不判）')
+    assert.ok(guardLines.some(l => l.includes('node scripts/mutation-guard.js')),
+      '守卫必须经生产 CLI `node scripts/mutation-guard.js` 调用，不得内联脚本（内联逻辑会与用例/文档漂移）')
+    assert.ok(/--segment\s+"?\$\{\{\s*matrix\.name\s*\}\}"?/.test(guardText),
+      '守卫必须带 --segment "$' + '{' + '{ matrix.name }}"：失败输出要能直接指出是哪一段')
+    assert.ok(guardAt > strykerIdx && guardAt < uploadAt,
+      '守卫必须位于 stryker step 之后、上传 artifact 之前（stryker 之前无报告可判；上传之后失败已无意义）')
+  }
 }
-console.log('✅ mutation.yml：缓存 key/兜底前缀含测试指纹、剥离不含 inc、artifact 收窄为 reports/mutation/ 且 fail-loud')
+console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（不含测试指纹；靶向反例已锁），剥离不含 inc，artifact 收窄为 reports/mutation/ 且 fail-loud')
 
 // ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────
 // 背景：test_app.js 的 `--only=<子串>` 曾**静默失效**——旧实现用 process.argv.indexOf('--only')
