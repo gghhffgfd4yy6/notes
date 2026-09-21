@@ -757,9 +757,9 @@ function _renderSegmentTable (results) {
  *     多出的 2 个正是第 4 行（已不在当前范围）的旧变异体，status 沿用旧值。
  *   * 对照组：删掉 inc.json 后用同一 `--mutate "src.js:1-3"` 全量跑 ⇒ 报告恰好 6 个。
  * 该场景在本仓可达（两条机制叠加，**都不要求「源文件完全没变」**）：① `mutation.yml` 的缓存 key 是
- * `stryker-<段>-<hashFiles(package-lock.json, stryker.config.js, run_mutation.js, matrix.src)>`，而
+ * `stryker-<段>-<hashFiles(package-lock.json, stryker.config.js, stryker.tap.config.js, run_mutation.js, matrix.src)>`，而
  * `restore-keys` 是**裸前缀兜底 `stryker-<段>-`** ⇒ 主 key 未命中时（源文件变了、或 package-lock /
- * stryker.config 变了）仍会恢复**最近一条**同前缀缓存，旧 `reports/inc-<段>.json` 照样回到工作树；
+ * 任一份 stryker 配置变了）仍会恢复**最近一条**同前缀缓存，旧 `reports/inc-<段>.json` 照样回到工作树；
  * ② 本仓要求大文件增长时**重拆 matrix 的 mutate 行段**（AGENTS.md）⇒ 旧 inc 里落在新范围之外的变异体
  * 被 sticky 分支原样并入报告。
  *

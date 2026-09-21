@@ -1,6 +1,6 @@
 'use strict'
 // ============================================================
-// TAP 适配层（canary 分支 spike/tap-canary-http 专用，实验品，不进 main）
+// TAP 适配层（**CI 生产档**：mutation.yml 的 TAP 段由 stryker.tap.config.js 的 tap.nodeArgs 预加载）
 //
 // 目的：让本仓**零改动**的自定义 harness（run_unit_tests.js 那一族套件）在
 // @stryker-mutator/tap-runner 下产出合法 TAP，从而拿到 perTest 的「只跑覆盖被变异文件的测试文件」。
