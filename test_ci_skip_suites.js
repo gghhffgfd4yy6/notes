@@ -1018,6 +1018,133 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
 }
 console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（不含测试指纹；靶向反例已锁），剥离不含 inc，artifact 收窄为 reports/mutation/ 且 fail-loud')
 
+// 3i PR-1（CI 切 TAP 档）接线契约：报告路径 + 矩阵逐段 runner 档位。
+// 为什么必须锁死（不是形式主义）：tap 配置把报告路径**显式**写成 stryker 默认值（stryker.tap.config.js 的
+// jsonReporter/htmlReporter），而「报告 = reports/mutation/mutation.json|.html」是**五处**的共同前提——
+// mutation.yml 的 fail-closed 守卫、紧随缓存恢复的 `rm -rf reports/mutation`、「记录本段增量复用状态」的
+// reuse.json 落盘闸门、artifact（path: reports/mutation/ + if-no-files-found: error）与
+// .github/workflows/analyze-artifacts.yml。谁把 tap 配置的报告路径改成子目录（如 reports/mutation/tap/），
+// CI 会**静默**坏掉（守卫读不到报告 ⇒ 段 job 判红；artifact 变空 ⇒ 汇总缺段），而现有用例全绿
+// ⇒ 在门禁里锁住，并配靶向反例（改回去立刻红）。
+{
+  const TAP_CONFIG = 'stryker.tap.config.js'
+  const COMMAND_CONFIG = 'stryker.config.js'
+  const DEFAULT_JSON = 'reports/mutation/mutation.json'
+  const DEFAULT_HTML = 'reports/mutation/mutation.html'
+
+  // (1) tap 配置**解析后**必须指向 stryker 默认报告路径。逐字 strictEqual（不做前缀/包含判断）：
+  //     'reports/mutation/tap/mutation.json' 这类「默认路径的子目录」必须红——它正是 canary 专用形态，
+  //     带进生产会让上面那五处全部失配。
+  const assertReportPaths = (cfg) => {
+    assert.ok(cfg && typeof cfg === 'object', 'stryker.tap.config.js 必须导出配置对象')
+    assert.ok(cfg.jsonReporter && typeof cfg.jsonReporter.fileName === 'string',
+      'stryker.tap.config.js 必须显式声明 jsonReporter.fileName（不得依赖省略后的 schema 默认：路径是守卫/artifact/日报的共同前提，必须可见可断言）')
+    assert.strictEqual(cfg.jsonReporter.fileName, DEFAULT_JSON,
+      'tap 档的 json 报告必须落 stryker **默认路径** ' + DEFAULT_JSON +
+      '：mutation.yml 的 fail-closed 守卫与 artifact（path: reports/mutation/）按它对齐，改路径 ⇒ 守卫读不到报告/artifact 变空')
+    assert.ok(cfg.htmlReporter && typeof cfg.htmlReporter.fileName === 'string',
+      'stryker.tap.config.js 必须显式声明 htmlReporter.fileName（同上：路径必须可见可断言）')
+    assert.strictEqual(cfg.htmlReporter.fileName, DEFAULT_HTML,
+      'tap 档的 html 报告必须落 stryker **默认路径** ' + DEFAULT_HTML + '（给人看的明细留档，artifact 按它打包）')
+  }
+  assertReportPaths(require('./' + TAP_CONFIG))
+
+  // (1 反例·靶向) 把报告路径改成 canary 用的子目录形态 ⇒ 同一套断言必须红
+  //     （证明断言不是「只看有没有这个键」，而是真的锁住了默认路径本身）。
+  {
+    const cfg = require('./' + TAP_CONFIG)
+    const mutated = { ...cfg, jsonReporter: { fileName: 'reports/mutation/tap/mutation.json' } }
+    assert.notStrictEqual(mutated.jsonReporter.fileName, cfg.jsonReporter.fileName,
+      '反例夹具必须真的把报告路径改成了子目录形态（没改成本回归形同虚设）')
+    assert.throws(() => assertReportPaths(mutated), /默认路径/,
+      '把报告路径改成 reports/mutation/tap/ 后必须红：否则「路径必须默认」这条前提被静默破坏而套件仍全绿')
+  }
+
+  // (2)(3) 矩阵逐段 runner 档位：从**真实 YAML 行**解析（注释一律不算证据），
+  //     抽成函数是为了让紧随其后的两条反例在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本。
+  const parseMatrixConfigs = (ymlText) => {
+    const lines = ymlText.split('\n')
+    const includeAt = lines.findIndex(l => /^\s*include:\s*$/.test(l))
+    assert.ok(includeAt >= 0, 'mutation.yml 的 matrix 必须有 include 块（逐段 runner 档位无从核对即视为回归）')
+    const includeIndent = lines[includeAt].match(/^\s*/)[0].length
+    const entries = []
+    let cur = null
+    for (let i = includeAt + 1; i < lines.length; i++) {
+      const raw = lines[i]
+      if (raw.trim() === '') continue
+      const indent = raw.match(/^\s*/)[0].length
+      // include 块结束：回到 steps: 等同级键（缩进不深于 include:）
+      if (/^\s*[A-Za-z_][\w-]*:/.test(raw) && indent <= includeIndent) break
+      if (raw.trim().startsWith('#')) continue // 注释不是证据
+      let body = raw.trim()
+      if (body.startsWith('-')) {
+        const rest = body.slice(1).trim()
+        if (rest === '' || rest.startsWith('#')) continue
+        cur = { name: null, config: null }
+        entries.push(cur)
+        body = rest
+      }
+      if (!cur) continue
+      const colon = body.indexOf(':')
+      if (colon <= 0) continue
+      const key = body.slice(0, colon).trim()
+      if (key !== 'name' && key !== 'config') continue
+      let value = body.slice(colon + 1).trim()
+      if (value.startsWith('"') || value.startsWith("'")) value = value.slice(1, -1)
+      const hash = value.indexOf('#') // 裸标量：行内注释从 # 开始
+      if (hash !== -1) value = value.slice(0, hash).trim()
+      cur[key] = value
+    }
+    return entries
+  }
+
+  const assertMatrixConfigs = (ymlText) => {
+    const entries = parseMatrixConfigs(ymlText)
+    assert.ok(entries.length > 0, 'mutation.yml 的 matrix include 必须解析出条目')
+    const missing = entries.filter(e => !e.config).map(e => e.name || '(未命名)')
+    assert.deepStrictEqual(missing, [],
+      '矩阵每个条目都必须声明 config:（逐段选 runner）——缺字段时 stryker 会收到空配置名，job 启动即红')
+    // (2) config 值必须是仓库里真实存在的文件：写成不存在的配置名 ⇒ stryker 启动即失败，在这里提前拦下。
+    for (const e of entries) {
+      assert.ok(fs.existsSync(path.join(__dirname, e.config)),
+        '矩阵「' + e.name + '」的 config 指向不存在的文件：' + e.config + '（job 会在 npx stryker run 时立刻失败）')
+    }
+    // (3) 档位分布：**恰有一段**用 command 档，且必须是 storage；其余全部 TAP 档。
+    //     为什么锁分布而不是「至少有一段」：storage 段因 TAP runner 的**语义损失**刻意留在 command 档
+    //     （见 mutation.yml 的 matrix 注释与 AGENTS.md：xbk_storage.js 的 `fd = -1` 哨兵被 UnaryOperator
+    //     改成 `+1` ⇒ finally 里 closeSync(1) 关掉 stdout ⇒ TAP 档记 RuntimeError 而非 Killed）——
+    //     把它也切到 TAP 会让该段被 fail-closed 守卫判常红；反过来把别的段落到 command 档，则那段重新
+    //     变成「真全量跑不完 ⇒ 靠复用」的老问题而无人察觉。两个方向都要红。
+    assert.deepStrictEqual(entries.filter(e => e.config === COMMAND_CONFIG).map(e => e.name), ['storage'],
+      '必须**恰有** storage 段用 command 档 ' + COMMAND_CONFIG + '（TAP 档下变异体导致的进程崩溃被记成 RuntimeError ' +
+      '而非 Killed，见 mutation.yml matrix 注释与 AGENTS.md）；其余段必须走 TAP 档，否则回到「真全量跑不完 ⇒ 靠复用」的老问题')
+    const unknown = [...new Set(entries.map(e => e.config))].filter(c => c !== TAP_CONFIG && c !== COMMAND_CONFIG)
+    assert.deepStrictEqual(unknown, [],
+      '矩阵的 config 只允许 ' + TAP_CONFIG + '（TAP 档）或 ' + COMMAND_CONFIG + '（command 档）：多出第三档必须显式登记')
+  }
+  assertMatrixConfigs(mutationYml)
+
+  // (2 反例·靶向) 把某段 config 改成不存在的文件名 ⇒ 必须红
+  {
+    const mutated = mutationYml.replace(/^(\s*)config: "stryker\.tap\.config\.js"$/m,
+      '$1config: "stryker.typo.config.js"')
+    assert.notStrictEqual(mutated, mutationYml, '反例夹具必须真的改掉了某段的 config（没改成本回归形同虚设）')
+    assert.throws(() => assertMatrixConfigs(mutated), /不存在的文件/,
+      '把 config 改成不存在的文件名后必须红：否则矩阵写错配置名要等 CI job 启动才暴露')
+  }
+  // (3 反例·靶向) 把 storage 段也切到 TAP 档 ⇒ 档位分布断言必须红
+  {
+    const mutated = mutationYml.replace(/^(\s*)config: "stryker\.config\.js"$/m,
+      '$1config: "stryker.tap.config.js"')
+    assert.notStrictEqual(mutated, mutationYml, '反例夹具必须真的改掉了 storage 段的 config')
+    assert.deepStrictEqual(parseMatrixConfigs(mutated).filter(e => e.config === COMMAND_CONFIG).map(e => e.name), [],
+      '夹具中应已无 command 档条目（否则反例证明的不是「分布被锁住」）')
+    assert.throws(() => assertMatrixConfigs(mutated), /storage/,
+      '把 storage 段也切到 TAP 档后必须红：该段会被 fail-closed 守卫判常红，且分布漂移必须有人看见')
+  }
+}
+console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认（守卫/artifact/日报的共同前提；靶向反例已锁）；mutation.yml 矩阵逐段 config 齐备、文件真实存在、恰 storage 段 command 档')
+
 // ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────
 // 背景：test_app.js 的 `--only=<子串>` 曾**静默失效**——旧实现用 process.argv.indexOf('--only')
 // 定位，等号写法下没有独立的 '--only' 元素 → 返回 -1 → 不过滤、照跑全部用例；而 test_app_p.js

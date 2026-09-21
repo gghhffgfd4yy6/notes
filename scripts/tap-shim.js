@@ -29,14 +29,30 @@
 const fs = require('node:fs')
 const path = require('node:path')
 
-// TAP 写出口：必须在加载时把 stdout 复制到一个私有 fd。
-// 原因（实测，非推测）：xbk_storage.js 里有 let fd = -1 这类哨兵，UnaryOperator 变异体把它改成 +1
-// 后，finally 里的 closeSync(fd) 就变成 closeSync(1) —— 直接关掉 stdout。此时 shim 若写 fd 1 会抛
-// EBADF: bad file descriptor, write（在 process 'exit' 钩子里抛出，进程异常终止，TAP 点全丢），
-// 于是 tap-runner 按 tap-helper.ts 的规则判「退出码非 0 且无失败测试」，记 RuntimeError。
-// 实测：这就是 tap-storage 段 RuntimeError 的主要来源（dup 修复把 4 个降到 2 个）。
-// 复制出私有 fd 后，即使被测代码关掉 fd 1，TAP 点仍能正常写出（CI 下 stdout 是管道，
-// /proc/self/fd/1 可打开；本机直跑终端时可能 ENXIO，此时回落 fd 1）。
+// TAP 写出口：**需要一个** fd 1 之外的私有出口——原因（实测，非推测）：xbk_storage.js 里有
+// let fd = -1 这类哨兵，UnaryOperator 变异体把它改成 +1 后，finally 里的 closeSync(fd) 就变成
+// closeSync(1) —— 直接关掉 stdout。此时 shim 若只会写 fd 1 会抛 EBADF: bad file descriptor, write
+// （在 process 'exit' 钩子里抛出，进程异常终止，TAP 点全丢），于是 tap-runner 按 tap-helper.ts 的规则
+// 判「退出码非 0 且无失败测试」，记 RuntimeError。
+//
+// ⚠️ 但**下面这段复制私有 fd 的实现是 no-op，从未生效**（2026-09-21 实测证伪，见
+//   .local/storage-tap-RE-findings.md §3.4 与 §2.3）：
+//   * tap-runner 用 **socketpair** spawn 被测进程（`readlink /proc/self/fd/1` = `socket:[…]`），
+//     `fs.openSync('/proc/self/fd/1', 'a')` 直接 **ENXIO**（不是「本机终端才 ENXIO」——CI 下同样如此）
+//     ⇒ catch 分支恒定命中，TAP_FD **恒为 1**，即这段 try/catch 是死代码；
+//   * 独立旁证（CI 侧）：#134 的 TAP 点出现在 statusReason 的 `Stderr output:` 段里——若 dup 真生效，
+//     TAP 点必然出现在 stdout；两条证据一致。
+//   * 旧注释「dup 修复把 4 个降到 2 个」**不是** dup 生效的证据，该归因**未被证实**：canary 是 47 个
+//     测试文件、baseline 是 32 个，L124 在两者之间由 RE 变 Survived，差异至少有一部分来自测试集收窄
+//     + tap-parser 空流语义（见下）。
+//   * 因此 `say()` 的三级兜底 `[TAP_FD, 1, 2]` **实际只有 fd 1 → fd 2 两级**：fd 1 被 closeSync(1)
+//     关掉后写它会抛 EBADF，于是 TAP 点落到 **stderr**，而 tap-runner 只解析 stdout ⇒ 仍判 RuntimeError。
+//     （这正是 storage 段在 TAP 档记 RuntimeError、在 command 档记 Killed 的机制之一；见 AGENTS.md
+//     的「TAP 档已知限制」与 .local/storage-tap-RE-findings.md §3.2/§3.5。）
+//
+// 真正的修法是 shim 侧「中继子进程」（加载期 spawn 一个持有同一 stdout 管道的中继，退出时同步写其
+// stdin），**本轮不实现**（超出 PR-1 范围，且中继必须在 stdin EOF 后立即退出并带超时，否则 parseTap
+// 会挂死——比现在的 RE 更糟）。已登记为 PR-2 候选。
 let TAP_FD = 1
 try {
   TAP_FD = fs.openSync('/proc/self/fd/1', 'a')
@@ -46,8 +62,9 @@ try {
 
 function say (line) {
   const text = line + '\n'
-  // 逐个尝试：私有 dup、fd 1、fd 2。最后一个只是「不抛异常」的兜底（写到 stderr 时 TAP 解析器看不到，
-  // 仍会被判 RuntimeError，但至少不会因抛异常而改变退出码/掩盖真实失败原因）。
+  // 逐个尝试：[TAP_FD, 1, 2]。注意 TAP_FD **恒为 1**（上面的 dup 是 no-op，实测见文件顶部注释）
+  // ⇒ 实际只有 fd 1 → fd 2 两级；fd 1 被 closeSync(1) 关掉后，TAP 点会落到 stderr，TAP 解析器看不到，
+  // 仍被判 RuntimeError。最后一级只是「不抛异常」的兜底：至少不会因抛异常而改变退出码/掩盖真实失败原因。
   for (const fd of [TAP_FD, 1, 2]) {
     try {
       fs.writeSync(fd, text)
