@@ -262,8 +262,14 @@ jobs:
           #   hashFiles 参数——按字面量找不到文件会返回空指纹，导致 range 段的缓存永不过期，故源指纹一直是
           #   matrix.src 单列。
           # PR-1（CI 切 TAP 档）起 hashFiles 增列 stryker.tap.config.js：runner / tap.testFiles 清单 /
-          #   coverageAnalysis 这些**决定结果口径**的配置变了必须让缓存失效，否则 tap 档会命中 command 档
-          #   遗留的 reports/inc-*.json（旧口径的结果被当成本轮 tap 口径复用）。
+          #   coverageAnalysis 这些**决定结果口径**的配置变了必须让**主 key**失效。
+          #   ⚠️ 但这只对主 key 生效：`restore-keys` 仍是裸前缀兜底 `stryker-<段>-`，主 key 未命中时依然会
+          #   恢复上一条同前缀缓存（core 的 `readIncrementalReport()` 对 inc **零校验**，源码里留着
+          #   `// TODO: Validate against the schema or stryker version?`）⇒ **切档后的第一轮仍会继承旧档状态**。
+          #   实测（PR-1 首轮里程碑）：http 段 6/133 复用，其中 6 个本该是 NoCoverage 的变异体沿用了旧 command
+          #   档的 Survived ⇒ NC 由基线 13 降到 7。该继承在日报「♻️ 复用状态」里**可见**（比例 + 段级标注），
+          #   但**状态失真本身不可见**；第二轮起新 key 已有本档缓存，即为纯 TAP 结果。彻底解决（退役增量链路 /
+          #   runner 专属 restore-keys）留待后续 PR。
           # 为什么回退（旧说法「测试一变就必须全量重跑」不再保留，因为它既不成立也不可负担）：
           #   ① 它**拦不住真根因**：假 Killed 来自**共享缓存的并发串扰**，发生在**变异体运行期**，而基线全程是绿的；
           #      且测试没变时测试指纹不变、主 key 依旧命中 ⇒ 这条改动对真根因完全无效。

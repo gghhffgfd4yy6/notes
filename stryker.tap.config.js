@@ -125,9 +125,11 @@ const tapConfig = {
     // 沙箱，相对路径 './scripts/tap-shim.js' 会按沙箱 cwd 解析而找不到（实测，REPORT 坑 2）。
     // 绝对路径指向**真实仓库**的 shim，对「scripts/ 是否进沙箱」这一沙箱复制策略免疫。
     nodeArgs: ['-r', path.resolve(__dirname, 'scripts', 'tap-shim.js')],
-    // bail 语义由 tap-parser 的 config.bail 承担。生产档必须拿到**完整**结果（守卫按 runtimeErrors
-    // 判、日报按每段全量统计），且要与 command 档「每变异体跑全部相关套件、不因首个失败提前收工」
-    // 的语义对齐，故显式关掉「首个失败即终止」。
+    // forceBail 只传进**单个测试文件**的 tap-parser config.bail（unpkg dist/src/tap-helper.js 的
+    //   parseTap(tapProcess, forceBail) ⇒ new TapParser.Parser({ bail: forceBail }, …)）；**跨测试文件**
+    //   是否因首个失败提前收工由 Stryker 顶层的 disableBail 决定（默认 false ⇒ 不提前收工）。这里显式
+    //   写 false 是为了让「单文件内也不因首个失败而 bail」与 command 档「跑完全部相关套件、拿完整结果」
+    //   的语义对齐（守卫按 runtimeErrors 判、日报按每段全量统计，都需要完整结果）。
     forceBail: false
   }
 }
