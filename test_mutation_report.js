@@ -11,7 +11,8 @@ const {
   render, validateSegments, validateFreshness, resolveMaxSkewMs, resolveRunStartedAtMs, shanghaiDate, escCell, countMutant,
   collectStats, findReportJson, analyzeSegment, analyze, postIssue,
   parseReuseFromLog, buildReuseMeta, normalizeReuseMeta, readReuseMeta, writeReuseMeta, runReuseMode,
-  formatReuseCell, stripAnsi, reuseUnaccountedCount, REUSE_MODE_FULL, REUSE_MODE_PARTIAL, REUSE_MODE_UNKNOWN, HIGH_REUSE_RATIO
+  formatReuseCell, stripAnsi, reuseUnaccountedCount, REUSE_MODE_FULL, REUSE_MODE_PARTIAL, REUSE_MODE_UNKNOWN, HIGH_REUSE_RATIO,
+  coveredScore, coveredDenominator, formatCovered, NO_COVERAGE_PLACEHOLDER
 } = require('./scripts/mutation-report.js')
 
 // CodeQL js/file-system-race（本仓库必需检查）：同一路径「先 statSync 检查、再 readFileSync 使用」是
@@ -100,12 +101,15 @@ function check (name, fn) {
 check('render 输出快照（含 error 段 + 正常段 + 全被杀段）', () => {
   const expected = '## 🧬 变异测试日报\n' +
 '\n' +
-'| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | 复用 |\n' +
-'|---|---|---|---|---|---|---|---|\n' +
-'| part2 | 20 | 8 | 6 | 4 | 2 | 70% | 未记录 |\n' +
-'| part3-broken | ❌ 缺 mutation-report.json | - | - | - | - | - | - |\n' +
-'| part4-all-killed | 5 | 5 | 0 | 0 | 0 | 100% | 未记录 |\n' +
-'| **合计** | **25** | **13** | **6** | **4** | | **76%** | **0 段复用** |\n' +
+'| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | covered 口径 | 复用 |\n' +
+'|---|---|---|---|---|---|---|---|---|\n' +
+'| part2 | 20 | 8 | 6 | 4 | 2 | 70% | 77.78% | 未记录 |\n' +
+'| part3-broken | ❌ 缺 mutation-report.json | - | - | - | - | - | - | - |\n' +
+'| part4-all-killed | 5 | 5 | 0 | 0 | 0 | 100% | 100% | 未记录 |\n' +
+'| **合计** | **25** | **13** | **6** | **4** | **2** | **76%** | **82.61%** | **0 段复用** |\n' +
+'\n' +
+// PR-1 双口径：表下必须给出「两列为何不同」的口径说明（NoCoverage > 0 ⇒ covered 剔除该段 NoCoverage）。
+'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时两列必然不同（covered ≥ 分数，差距由该段 `无覆盖` 数决定）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
 '\n' +
 // PR #158 Qodo Medium / Correctness：夹具没带 reuse 元信息 ⇒ 必须走「没有任何段的复用状态记录」分支。
 // 这一段不能省：省掉之后「没记录」与「没复用」在日报里长得完全一样，正是 Qodo 指出的缺陷本身。
@@ -146,10 +150,12 @@ check('render 输出快照（含 error 段 + 正常段 + 全被杀段）', () =>
 check('render 输出快照（全被杀 → 🎉 无存活变异体分支）', () => {
   const expected = '## 🧬 变异测试日报\n' +
 '\n' +
-'| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | 复用 |\n' +
-'|---|---|---|---|---|---|---|---|\n' +
-'| clean | 3 | 3 | 0 | 0 | 0 | 100% | 未记录 |\n' +
-'| **合计** | **3** | **3** | **0** | **0** | | **100%** | **0 段复用** |\n' +
+'| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | covered 口径 | 复用 |\n' +
+'|---|---|---|---|---|---|---|---|---|\n' +
+'| clean | 3 | 3 | 0 | 0 | 0 | 100% | 100% | 未记录 |\n' +
+'| **合计** | **3** | **3** | **0** | **0** | **0** | **100%** | **100%** | **0 段复用** |\n' +
+'\n' +
+'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时两列必然不同（covered ≥ 分数，差距由该段 `无覆盖` 数决定）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
 '\n' +
 '## ♻️ 复用状态（结果是否对应当前测试状态）\n' +
 '\n' +
@@ -392,10 +398,10 @@ check('render：复用段逐段标注「复用 N/M」，高复用段给出显式
     { seg: 'utils', total: 10, killed: 5, survived: 5, noCoverage: 0, timeout: 0, score: 50, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } },
     { seg: 'rules', total: 4, killed: 2, survived: 2, noCoverage: 0, timeout: 0, score: 50, survivedMutants: [], reuse: { mode: REUSE_MODE_UNKNOWN, reason: '缺 reuse.json' } }
   ])
-  assert.ok(out.includes('| app | 100 | 50 | 5 | 45 | 0 | 55% | 复用 98/100 |'), `app 行应标注复用数：\n${out}`)
-  assert.ok(out.includes('| utils | 10 | 5 | 0 | 5 | 0 | 50% | 全量 |'), '全量段应标「全量」')
-  assert.ok(out.includes('| rules | 4 | 2 | 0 | 2 | 0 | 50% | 未记录 |'), '无元信息应标「未记录」')
-  assert.ok(out.includes('| **合计** | **114** | **57** | **5** | **52** | | **54.39%** | **1 段复用** |'), `合计行应给出复用段数：\n${out}`)
+  assert.ok(out.includes('| app | 100 | 50 | 5 | 45 | 0 | 55% | 55% | 复用 98/100 |'), `app 行应标注复用数：\n${out}`)
+  assert.ok(out.includes('| utils | 10 | 5 | 0 | 5 | 0 | 50% | 50% | 全量 |'), '全量段应标「全量」')
+  assert.ok(out.includes('| rules | 4 | 2 | 0 | 2 | 0 | 50% | 50% | 未记录 |'), '无元信息应标「未记录」')
+  assert.ok(out.includes('| **合计** | **114** | **57** | **5** | **52** | **0** | **54.39%** | **54.39%** | **1 段复用** |'), `合计行应给出复用段数：\n${out}`)
   assert.ok(out.includes('## ♻️ 复用状态（结果是否对应当前测试状态）'), '必须有独立的复用状态小节')
   assert.ok(out.includes('本次日报含未重算的结果'), '有复用段时必须给出显式警示')
   assert.ok(out.includes('- `app`：复用 98/100（98.00%） ⚠️ **复用比例高**（≥50.00%）'), '高复用段必须点名')
@@ -444,7 +450,7 @@ check('render：计数口径不符必须点名，且不得把该段并进「全�
     `末行计数必须互斥且不得为负：\n${out}`)
   assert.ok(!/其余 -\d+ 段/.test(out), '不得出现负数段数')
   // 表格：partial 段仍显示复用数（口径细节在小节里）；不新增第四态
-  assert.ok(out.includes('| app | 8 | 4 | 0 | 4 | 0 | 50% | 复用 6/6 |'), '表格保持三态')
+  assert.ok(out.includes('| app | 8 | 4 | 0 | 4 | 0 | 50% | 50% | 复用 6/6 |'), '表格保持三态')
 })
 
 check('render：**0 of M 且有未计入变异体**时不得宣称「全部全量重算」（前任会在这里给出假结论）', () => {
@@ -459,7 +465,7 @@ check('render：**0 of M 且有未计入变异体**时不得宣称「全部全�
   assert.ok(out.includes('- `rules`：报告 8 个变异体 vs 日志复用口径 6 个（多 2 个未计入）'), `必须点名：\n${out}`)
   assert.ok(out.includes('复用口径与报告不一致'), '必须出现口径不符小节')
   // 表格里这一格也**不得**写「全量」——报告里确实还有旧变异体，写「全量」就是本 PR 要消灭的那种误导
-  assert.ok(out.includes('| rules | 8 | 5 | 0 | 3 | 0 | 62.5% | 全量(口径不符) |'), `表格单元格必须标注口径不符：\n${out}`)
+  assert.ok(out.includes('| rules | 8 | 5 | 0 | 3 | 0 | 62.5% | 62.5% | 全量(口径不符) |'), `表格单元格必须标注口径不符：\n${out}`)
   assert.ok(out.includes('其余 0 段本轮为全量重算（共 1 段：0 段含复用、0 段未记录、1 段标为全量但复用口径与报告不一致）。'),
     `末行不得把该段算作全量重算：\n${out}`)
 })
@@ -474,8 +480,8 @@ check('render：口径不符**不改变**任何分数/统计口径（与只加�
   const a = render(base)
   const b = render(withMismatch)
   assert.strictEqual(rowOf(a, 'app'), rowOf(b, 'app'), '分数行不得因口径不符而变化')
-  assert.ok(a.includes('| **合计** | **10** | **6** | **0** | **4** | | **60%** |'), '合计统计值不得变化')
-  assert.ok(b.includes('| **合计** | **10** | **6** | **0** | **4** | | **60%** |'), '合计统计值不得变化')
+  assert.ok(a.includes('| **合计** | **10** | **6** | **0** | **4** | **0** | **60%** | **60%** |'), '合计统计值不得变化')
+  assert.ok(b.includes('| **合计** | **10** | **6** | **0** | **4** | **0** | **60%** | **60%** |'), '合计统计值不得变化')
 })
 
 check('render：复用元信息**不改变**任何分数/统计口径（只多一列）', () => {
@@ -490,8 +496,126 @@ check('render：复用元信息**不改变**任何分数/统计口径（只多�
   const b = render(withReuse)
   assert.strictEqual(rowOf(a, 'app'), rowOf(b, 'app'), '同一统计下分数行必须一致（复用只增加标注）')
   assert.strictEqual(rowOf(a, 'utils'), rowOf(b, 'utils'))
-  assert.ok(a.includes('| **合计** | **110** | **55** | **5** | **50** | | **54.55%** |'), '合计行统计值不得变化')
-  assert.ok(b.includes('| **合计** | **110** | **55** | **5** | **50** | | **54.55%** |'), '合计行统计值不得变化')
+  assert.ok(a.includes('| **合计** | **110** | **55** | **5** | **50** | **0** | **54.55%** | **54.55%** |'), '合计行统计值不得变化')
+  assert.ok(b.includes('| **合计** | **110** | **55** | **5** | **50** | **0** | **54.55%** | **54.55%** |'), '合计行统计值不得变化')
+})
+
+// ===== 双口径（PR-1 · A2 决策）：既有「分数」与新增「covered 口径」===============================
+// 背景：CI 从 command runner 切到 tap-runner（coverageAnalysis:'perTest'）后，日报里会首次出现大量
+// NoCoverage（19 段合计 4017/15302 ≈ 26%）。同一个段在两种口径下回答不同问题：
+//   `分数`（既有列，语义**一字不改**）= (killed+timeout)/total，total **含** NoCoverage；
+//   `covered 口径`（新增列）=(killed+timeout)/(killed+timeout+survived)，**剔除** NoCoverage。
+// 下列用例逐条锁定新列的边界；其中第 1/4/5 条同时是**破坏性反例**的靶子——把新列写错口径（换成
+// killed/total、或合计取各段百分比平均）或把 `分数` 列改成 covered 口径时，它们必须红（已实跑验证，
+// 见本工作流的收尾报告）。
+
+// 取 markdown 行的单元格（`| a | b |` → ['a','b']），便于按列断言而不是按整行字符串断言。
+function cellsOf (out, prefix) {
+  const line = out.split('\n').find(l => l.startsWith(prefix))
+  assert.ok(line, `未找到以 ${JSON.stringify(prefix)} 开头的行：\n${out}`)
+  return line.split('|').slice(1, -1).map(s => s.trim())
+}
+// 合计行的单元格带 `**` 加粗，取值前先剥掉。
+function numOf (cell) {
+  return parseFloat(String(cell).replaceAll('*', ''))
+}
+
+check('coveredScore/formatCovered：分母为 0（整段 NoCoverage）一律占位符，绝不产出 NaN/Infinity/0%', () => {
+  // 分母 killed+timeout+survived === 0 ⇒ 口径无定义：不得给 0（会把「整段没覆盖」读成「0% 检出」），
+  // 也不得让 0/0 漏成 NaN。
+  assert.strictEqual(coveredScore({ killed: 0, timeout: 0, survived: 0 }), null)
+  assert.strictEqual(formatCovered({ killed: 0, timeout: 0, survived: 0, noCoverage: 12 }), NO_COVERAGE_PLACEHOLDER)
+  assert.strictEqual(formatCovered({ killed: 0, timeout: 0, survived: 0 }), '—')
+  assert.strictEqual(coveredScore({}), null, '缺字段按分母 0 处理（不抛、不 NaN）')
+  assert.strictEqual(formatCovered({ killed: 0, timeout: 0, survived: 0, noCoverage: 0 }), NO_COVERAGE_PLACEHOLDER)
+  // 有定义时两位小数，与 TAP 基线表逐位一致（app：199+2 / (199+2+364) = 35.5750% → 35.58）
+  assert.strictEqual(coveredScore({ killed: 199, timeout: 2, survived: 364 }), 35.58)
+  assert.strictEqual(formatCovered({ killed: 106, timeout: 3, survived: 64 }), '63.01%')
+  assert.strictEqual(formatCovered({ killed: 5, timeout: 0, survived: 0 }), '100%')
+  // 计数求和后的合计对象走同一条判定（段行与合计行不得各写一份而漂移）
+  assert.strictEqual(coveredDenominator({ killed: 3, timeout: 1, survived: 2 }), 6)
+})
+
+check('render：NoCoverage > 0 的段 covered 口径 > 分数，且两列/NoCoverage 计数同时可见（破坏性反例靶子）', () => {
+  // app 段用 TAP 基线真实数字（.local/tap-baseline-REPORT.md）：2651 变异体、NC=2086、score 7.58%。
+  const out = render([
+    { seg: 'app', total: 2651, killed: 199, survived: 364, noCoverage: 2086, timeout: 2, score: 7.58, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } }
+  ])
+  assert.ok(out.includes('| 分数 | covered 口径 |'), '表头必须同时列出两个口径列（新增，不是替换）')
+  const cells = cellsOf(out, '| app |')
+  assert.strictEqual(cells[5], '2086', 'NoCoverage 计数必须与两个口径同排可见（读者据此看出两列为何不同）')
+  assert.strictEqual(cells[6], '7.58%', '既有分数列语义不变：含 NoCoverage 的 (199+2)/2651')
+  assert.strictEqual(cells[7], '35.58%', 'covered 口径 = (199+2)/(199+2+364)')
+  assert.ok(numOf(cells[7]) > numOf(cells[6]), 'NoCoverage > 0 时 covered 口径必须严格大于分数口径')
+  // 反例方向：若新列被写成 killed/total（199/2651=7.51%）或直接等于分数，上面的等式与不等关系都会红
+})
+
+check('render：NoCoverage = 0 的段两列相等（宽口径不产生假差异）', () => {
+  // loop 段（TAP 基线）：173 变异体、NC=0、106 被杀、3 超时、64 存活 ⇒ 两个口径分母相同。
+  const out = render([
+    { seg: 'loop', total: 173, killed: 106, survived: 64, noCoverage: 0, timeout: 3, score: 63.01, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } }
+  ])
+  const cells = cellsOf(out, '| loop |')
+  assert.strictEqual(cells[6], '63.01%')
+  assert.strictEqual(cells[7], '63.01%', 'NoCoverage = 0 ⇒ 两列必须相等（否则就是假差异）')
+  assert.strictEqual(cells[7], cells[6])
+})
+
+check('render：整段 NoCoverage ⇒ covered 列显示 —，表格里不得出现 NaN/Infinity/0%', () => {
+  const out = render([
+    { seg: 'all-nocov', total: 40, killed: 0, survived: 0, noCoverage: 40, timeout: 0, score: 0, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } }
+  ])
+  const cells = cellsOf(out, '| all-nocov |')
+  assert.strictEqual(cells[7], '—', `分母为 0 必须显式占位，实际 ${JSON.stringify(cells[7])}`)
+  // 只看表格行（表下的口径说明文字里**有意**提到 "NaN / 0%" 这两个词，不能把说明本身当成缺陷）
+  const table = out.split('\n').filter(l => l.startsWith('|')).join('\n')
+  assert.ok(!/NaN|Infinity/.test(table), '表格里不得出现 NaN / Infinity')
+  // 既有 `分数` 列仍是 0%（0/40）——「整段没被覆盖」与「已覆盖部分 0% 检出」是两件事，语义一字不改；
+  // 被显式处理成占位符的只有新增的 covered 口径列。
+  assert.strictEqual(cells[6], '0%')
+})
+
+check('render：整批全 NoCoverage ⇒ 合计的 covered 口径同样是占位符（不得算出 0%）', () => {
+  const out = render([
+    { seg: 'a1', total: 10, killed: 0, survived: 0, noCoverage: 10, timeout: 0, score: 0, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } },
+    { seg: 'a2', total: 5, killed: 0, survived: 0, noCoverage: 5, timeout: 0, score: 0, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } }
+  ])
+  const cells = cellsOf(out, '| **合计** |')
+  assert.strictEqual(cells[5], '**15**', '合计 NoCoverage = 各段计数求和')
+  assert.strictEqual(cells[7], '**—**', '合计分母为 0 时同样占位（NaN/0% 都不得出现）')
+})
+
+check('render：合计行按各段**计数求和后再算**口径（不是各段百分比的平均）', () => {
+  // 两段刻意让两种算法结果不同（破坏性反例靶子）：
+  //   按计数：分数 = (50+10)/110 = 54.55%；covered = (50+0+10+0)/(50+0+30+10+0+0) = 60/90 = 66.67%
+  //   按各段百分比平均：分数 = (50+100)/2 = 75%；covered = (62.5+100)/2 = 81.25%
+  const out = render([
+    { seg: 'big-half', total: 100, killed: 50, survived: 30, noCoverage: 20, timeout: 0, score: 50, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } },
+    { seg: 'small-full', total: 10, killed: 10, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } }
+  ])
+  const cells = cellsOf(out, '| **合计** |')
+  assert.strictEqual(cells[5], '**20**', '合计 NoCoverage = 20（计数求和）')
+  assert.strictEqual(numOf(cells[6]), 54.55, '合计分数 = 按计数求和后再算')
+  assert.strictEqual(numOf(cells[7]), 66.67, '合计 covered 口径 = 按计数求和后再算')
+  assert.notStrictEqual(numOf(cells[6]), 75, '不得取各段百分比的平均（75%）')
+  assert.notStrictEqual(numOf(cells[7]), 81.25, '不得取各段百分比的平均（81.25%）')
+  // 段级口径同时给（大段 50%/62.5%，小段 100%/100%）
+  assert.strictEqual(cellsOf(out, '| big-half |')[6], '50%')
+  assert.strictEqual(numOf(cellsOf(out, '| big-half |')[7]), 62.5)
+  assert.strictEqual(cellsOf(out, '| small-full |')[6], '100%')
+  assert.strictEqual(cellsOf(out, '| small-full |')[7], '100%')
+})
+
+check('render：既有「分数」列语义一字不改（含 NoCoverage 的 (被杀+超时)/全部）', () => {
+  // 破坏性反例靶子：若有人把 `分数` 列改成 covered 口径（本工作流明确禁止的「替换」），
+  // 期望值 25% 会变成 50% ⇒ 本用例立刻红。
+  const out = render([
+    { seg: 'score-keep', total: 100, killed: 20, survived: 25, noCoverage: 50, timeout: 5, score: 25, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } }
+  ])
+  const cells = cellsOf(out, '| score-keep |')
+  assert.strictEqual(cells[6], '25%', '分数 = (20+5)/100，分母含 50 个 NoCoverage')
+  assert.strictEqual(cells[7], '50%', 'covered 口径 = (20+5)/(20+5+25)')
+  assert.notStrictEqual(cells[6], cells[7], '两个口径在这一段本就不同（NC=50），不得被合并/替换')
 })
 
 check('formatReuseCell：三态文案 + 「0 of M 且计数对不上」不得写成「全量」', () => {

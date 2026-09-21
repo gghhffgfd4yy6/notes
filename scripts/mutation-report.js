@@ -633,27 +633,93 @@ function collectStats (results) {
   return { byFile, byKind, allSurvived }
 }
 
+// ===== 双口径：既有「分数」与新增「covered 口径」=================================================
+// 背景：CI 从 command runner 切到 tap-runner（coverageAnalysis:'perTest'）后，报告里会首次出现大量
+// NoCoverage（19 段合计 4017/15302 ≈ 26%）。同一个段在两种口径下回答的是不同问题：
+//   * `分数`（既有列，语义**一字不改**）= (killed + timeout) / total，total **含** NoCoverage
+//     ⇒ 保守口径：把「测试没覆盖到」的变异体留在分母里，反映「含未测区域」的真实风险；
+//   * `covered 口径`（本次**新增**列）= (killed + timeout) / (killed + timeout + survived)
+//     ⇒ 剔除 NoCoverage，只反映「已覆盖部分」的检出能力
+//     （与 .local/tap-baseline-REPORT.md 的 covered 口径逐位一致，便于与基线表对账）。
+// 两列**并列**是为了让读者能区分两种口径——不是替换任何一个列（尤其不是替换 `分数`）。
+//
+// 分母为 0（`killed + timeout + survived === 0`，即整段都是 NoCoverage）时**必须显式占位**：
+// JS 里 0/0 是 NaN（会渲染成 "NaN%"），而「无数据报 0」（score 列对 total === 0 的处理）在这里会把
+// 「整段没有覆盖」误读成「0% 检出」——两者都是误导，故一律显示占位符 `—`。**绝不**产出
+// NaN / Infinity / 0%。
+const NO_COVERAGE_PLACEHOLDER = '—'
+
+// covered 口径的分母（killed + timeout + survived）。独立成函数是为了让「整段 NoCoverage」这一边界
+// 在段行与合计行走**同一条**判定（合计必须按各段计数求和后再算，而不是各段百分比的平均）。
+function coveredDenominator (r) {
+  return (r.killed || 0) + (r.timeout || 0) + (r.survived || 0)
+}
+
+/**
+ * 计算 covered 口径（百分比，保留两位小数）。分母为 0 时返回 null，由 formatCovered 渲染成占位符。
+ * @param {{killed?: number, timeout?: number, survived?: number}} r 段统计（或计数求和后的合计对象）
+ * @returns {number|null} 百分比；口径无法定义（分母为 0）时为 null
+ */
+function coveredScore (r) {
+  const denom = coveredDenominator(r)
+  if (!(denom > 0)) return null
+  const value = ((r.killed || 0) + (r.timeout || 0)) / denom
+  return Math.round(value * 10000) / 100 // 与既有 score 的两位小数口径一致
+}
+
+/**
+ * covered 口径的单元格文案：有定义给 `N%`，分母为 0 给 `—`（见 NO_COVERAGE_PLACEHOLDER 的注释）。
+ * @param {{killed?: number, timeout?: number, survived?: number}} r 段统计
+ * @returns {string} 单元格文本
+ */
+function formatCovered (r) {
+  const value = coveredScore(r)
+  return value === null ? NO_COVERAGE_PLACEHOLDER : `${value}%`
+}
+
+/**
+ * 表下口径说明（双口径）。
+ *
+ * 为什么必须写在表下、而不只是靠表头两个字：两列只在一部分段上取值不同，读者看到
+ * `分数 7.58%` / `covered 口径 35.58%` 时必须能立刻知道差在哪——差就是同一行里被 covered 口径
+ * 剔出分母的 NoCoverage（`无覆盖` 列）。纯文本、无计算、无 throw。
+ * @returns {string[]} markdown 行
+ */
+function _renderCoveredScopeNote () {
+  return [
+    '',
+    '> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；' +
+    '`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。' +
+    '`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时两列必然不同（covered ≥ 分数，差距由该段 `无覆盖` 数决定）；' +
+    'NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；' +
+    '整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。'
+  ]
+}
+
 function _renderSegmentTable (results) {
   // 段汇总表（含合计行）：正常段 + error 段分支
+  // 双口径：`分数`（既有语义一字不改）与 `covered 口径`（新增列，见上方 coveredScore 注释）并列。
   const lines = []
-  lines.push('| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | 复用 |')
-  lines.push('|---|---|---|---|---|---|---|---|')
+  lines.push('| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | covered 口径 | 复用 |')
+  lines.push('|---|---|---|---|---|---|---|---|---|')
   let tTotal = 0
   let tKilled = 0
   let tTimeout = 0
   let tSurvived = 0
+  let tNoCoverage = 0
   let reusedSegs = 0
   for (const r of results) {
     if (r.error) {
-      lines.push(`| ${r.seg} | ❌ ${r.error} | - | - | - | - | - | - |`) // 8 列对齐表头（含 Timeout/复用列）
+      lines.push(`| ${r.seg} | ❌ ${r.error} | - | - | - | - | - | - | - |`) // 9 列对齐表头（含 covered 口径/复用列）
       continue
     }
     tTotal += r.total
     tKilled += r.killed
     tSurvived += r.survived
     tTimeout += r.timeout || 0
+    tNoCoverage += r.noCoverage || 0
     if (r.reuse && r.reuse.mode === REUSE_MODE_PARTIAL) reusedSegs++
-    lines.push(`| ${r.seg} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% | ${formatReuseCell(r.reuse, r.total)} |`)
+    lines.push(`| ${r.seg} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% | ${formatCovered(r)} | ${formatReuseCell(r.reuse, r.total)} |`)
   }
   // 口径与段分一致（超时计入已处理）；无数据报 0 而非 100（机器人审查）
   // F6：本脚本只汇总，**不设分数门禁**——分数门禁在 stryker 侧（stryker.config.js 的 thresholds，
@@ -665,7 +731,12 @@ function _renderSegmentTable (results) {
   // main() 是「先 validateSegments/validateFreshness 再 postIssue」，本脚本 throw 会让不达标时连
   // 日报一起吞掉——而那正是最需要看到分数的时刻。故此处只保留完整性/新鲜度两道 throw。
   const overall = tTotal > 0 ? Math.round((((tKilled + tTimeout) / tTotal) * 100) * 100) / 100 : 0
-  lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | | **${overall}%** | **${reusedSegs} 段复用** |`)
+  // 合计口径 = 各段**计数求和后**再算，绝不取各段百分比的平均（段大小悬殊时平均会被小段带偏：
+  // 例如 100 变异体 50% 与 10 变异体 100% ⇒ 按计数 54.55%，按平均 75%）。covered 口径同理；
+  // 整批 NoCoverage（分母为 0）时合计的 covered 同样显示 `—`。`无覆盖` 合计列由空白改为给出
+  // NoCoverage 计数汇总——这正是「两列差异」在全批层面的量级。
+  lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | **${tNoCoverage}** | **${overall}%** | **${formatCovered({ killed: tKilled, timeout: tTimeout, survived: tSurvived })}** | **${reusedSegs} 段复用** |`)
+  lines.push(..._renderCoveredScopeNote())
   return lines
 }
 
@@ -1082,6 +1153,11 @@ module.exports = {
   formatReuseCell,
   reuseUnaccountedCount,
   stripAnsi,
+  // 双口径（PR-1 · A2 决策）：既有「分数」与新增「covered 口径」并列
+  coveredDenominator,
+  coveredScore,
+  formatCovered,
+  NO_COVERAGE_PLACEHOLDER,
   REUSE_MODE_FULL,
   REUSE_MODE_PARTIAL,
   REUSE_MODE_UNKNOWN,

@@ -89,12 +89,15 @@ function schemaReport (seg, mutants) {
     // 断言必须咬住**统计值**：旧断言只查 stdout 含 '变异' 或 '#'，而标题「## 🧬 变异测试日报」
     // 恒含「变异」——统计全部归零、解析彻底失效也照样判绿（并因此把 F2 的缺陷锁成了"正确行为"）。
     const segCount = REQUIRED_SEGS.length
-    assert.ok(r.stdout.includes(`| **合计** | **${segCount * 2}** | **${segCount}** | **0** | **${segCount}** | | **50%** |`),
-      `合计行必须等于夹具统计（${segCount * 2} 变异体 / 各 ${segCount} 被杀与存活 / 50%）：\n${r.stdout}`)
+    // 合计行的 `无覆盖` 列由空白改为给出 NoCoverage 计数汇总（PR-1 双口径），covered 口径列随之在
+    // 分数列右侧出现：本夹具 NoCoverage = 0 ⇒ 两列相等（50%）。
+    assert.ok(r.stdout.includes(`| **合计** | **${segCount * 2}** | **${segCount}** | **0** | **${segCount}** | **0** | **50%** | **50%** |`),
+      `合计行必须等于夹具统计（${segCount * 2} 变异体 / 各 ${segCount} 被杀与存活 / NoCoverage 0 / 两口径均 50%）：\n${r.stdout}`)
     assert.ok(r.stdout.includes(`## 存活变异体（${segCount} 个）`), '应列出存活变异体总数')
     assert.ok(!r.stdout.includes('🎉 无存活变异体'), '夹具含存活变异体，不得走「无存活」分支')
     for (const seg of REQUIRED_SEGS) {
-      assert.ok(r.stdout.includes(`| ${seg} | 2 | 1 | 0 | 1 | 0 | 50% |`), `段 ${seg} 的统计行应正确，实际输出缺该行`)
+      // 段行也一并咬住新列（含末尾的复用列：无 reuse.json ⇒ 未记录）
+      assert.ok(r.stdout.includes(`| ${seg} | 2 | 1 | 0 | 1 | 0 | 50% | 50% | 未记录 |`), `段 ${seg} 的统计行应正确，实际输出缺该行`)
     }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
@@ -170,9 +173,60 @@ function schemaReport (seg, mutants) {
     const r = runCli([tmp])
     assert.strictEqual(r.code, 0, `含 RuntimeError 的合法报告必须照常发布，stderr: ${r.stderr}`)
     const segCount = REQUIRED_SEGS.length
-    assert.ok(r.stdout.includes(`| **合计** | **${segCount * 2}** | **${segCount}** | **0** | **0** | | **50%** |`),
-      `RuntimeError 应计入 total（${segCount * 2} 个、仅 ${segCount} 个被杀、50%）：\n${r.stdout}`)
+    // PR-1 双口径的一个**非 NoCoverage** 差异来源：RuntimeError 计入 total（分数口径分母）但**不在**
+    // covered 口径的分母（killed+timeout+survived）里 ⇒ 即使 NoCoverage = 0，两列也会不同
+    // （此处 50% vs 100%）。这是所给公式的直接推论，故意在此锁死，防止后人以为「NoCoverage=0 ⇒ 必定相等」。
+    assert.ok(r.stdout.includes(`| **合计** | **${segCount * 2}** | **${segCount}** | **0** | **0** | **0** | **50%** | **100%** |`),
+      `RuntimeError 应计入 total（${segCount * 2} 个、仅 ${segCount} 个被杀、分数 50%）；covered 口径因不含 RuntimeError 为 100%：\n${r.stdout}`)
     assert.ok(r.stdout.includes('🎉 无存活变异体'), '该夹具无存活变异体，应走 🎉 分支')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 场景 6b（PR-1 · 日报双口径）：**端到端**证明新列真的出现在子进程 stdout 里——
+// 「真 mutation.json → analyzeSegment → render → stdout」整条链，而不是直接构造 render 入参。
+// 两段刻意各占一个边界：
+//   * ncSeg：1 Killed + 2 Survived + 2 NoCoverage ⇒ 分数 = 1/5 = 20%（含 NoCoverage），
+//     covered = 1/(1+0+2) = 33.33%（剔除 NoCoverage）⇒ 两列必须不同且 covered > 分数；
+//   * allNcSeg：整段 1 个 NoCoverage（killed+timeout+survived === 0）⇒ covered 分母为 0，
+//     必须显示占位符 `—`，不得是 NaN / Infinity / 0%。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-dualscope-'))
+  try {
+    const ncSeg = REQUIRED_SEGS[0]
+    const allNcSeg = REQUIRED_SEGS[1]
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      let mutants = [
+        mutantOf({ id: '0' }),
+        mutantOf({ id: '1', mutatorName: 'BooleanLiteral', replacement: 'false', status: 'Survived', location: { start: { line: 7, column: 1 }, end: { line: 7, column: 2 } } }),
+        mutantOf({ id: '2', mutatorName: 'StringLiteral', replacement: '"x"', status: 'Survived', location: { start: { line: 9, column: 1 }, end: { line: 9, column: 2 } } })
+      ]
+      if (seg === ncSeg) {
+        mutants = mutants.concat([
+          mutantOf({ id: '3', mutatorName: 'ArrayLiteral', replacement: '[]', status: 'NoCoverage', location: { start: { line: 11, column: 1 }, end: { line: 11, column: 2 } } }),
+          mutantOf({ id: '4', mutatorName: 'ObjectLiteral', replacement: '{}', status: 'NoCoverage', location: { start: { line: 13, column: 1 }, end: { line: 13, column: 2 } } })
+        ])
+      }
+      if (seg === allNcSeg) {
+        mutants = [mutantOf({ id: '0', mutatorName: 'ArrayLiteral', replacement: '[]', status: 'NoCoverage', location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } } })]
+      }
+      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify(schemaReport(seg, mutants)))
+    }
+    const r = runCli([tmp])
+    assert.strictEqual(r.code, 0, `含 NoCoverage 的合法报告应照常发布，stderr: ${r.stderr}`)
+    assert.ok(r.stdout.includes('| 分数 | covered 口径 |'), '表头必须同时列出两个口径列（新增而非替换）')
+    const lineOf = (seg) => r.stdout.split('\n').find(l => l.startsWith(`| ${seg} |`))
+    // ncSeg 行（末尾复用列为「未记录」：夹具没有 reuse.json）
+    assert.strictEqual(lineOf(ncSeg), `| ${ncSeg} | 5 | 1 | 0 | 2 | 2 | 20% | 33.33% | 未记录 |`,
+      `NoCoverage>0 的段必须同排给出两个口径与 NoCoverage 计数：\n${r.stdout}`)
+    // 整段 NoCoverage 行：covered 列是占位符（分数列仍是既有的 0%，语义不改）
+    assert.strictEqual(lineOf(allNcSeg), `| ${allNcSeg} | 1 | 0 | 0 | 0 | 1 | 0% | — | 未记录 |`,
+      `分母为 0 时 covered 列必须是占位符：\n${r.stdout}`)
+    const table = r.stdout.split('\n').filter(l => l.startsWith('|')).join('\n')
+    assert.ok(!/NaN|Infinity/.test(table), `表格里不得出现 NaN / Infinity：\n${table}`)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }
