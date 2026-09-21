@@ -885,9 +885,12 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
     assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
     // key 必须逐字等于**回退后**的形态：stryker-<段>-<src 指纹>（源指纹固定用 matrix.src：mutate 里的范围
     // 字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，会得到空指纹、使 range 段缓存永不过期）。
+    // PR-1（CI 切 TAP 档，矩阵逐段可选 config）起 hashFiles 同时含 **stryker.config.js 与
+    // stryker.tap.config.js**：两档配置任一变化（runner / testFiles 清单 / coverageAnalysis）都必须让缓存
+    // 失效，否则 tap 档会命中 command 档遗留的 inc（旧口径结果被当本轮结果复用）。
     const open = '${'
     assert.strictEqual(keyLine.trim(),
-      'key: stryker-' + open + '{ matrix.name }}-' + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}",
+      'key: stryker-' + open + '{ matrix.name }}-' + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'stryker.tap.config.js', 'run_mutation.js', matrix.src) }}",
       '缓存 key 必须是**回退后**的形态 stryker-<段>-<src 指纹>（不含 -tests- 测试指纹段）：PR #156 的' +
       '「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发串扰，基线全程是绿的）、' +
       '跑不完（app/utils/message-store 真全量在 --concurrency 8 下仍需 ~7h/~6.5h/~4.5h，必撞 step 330min，' +
