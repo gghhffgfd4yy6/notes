@@ -12,15 +12,19 @@
 //   testRunner: 'tap' + coverageAnalysis: 'perTest'。perTest 是 TAP 提速的前提（实测 34-37 倍）；
 //   反之 command runner 只支持 coverageAnalysis:'off'，会**静默退化**成「每个变异体跑整套件」。
 //
-// 与 stryker.config.js 的差异只有三项（thresholds/break:null、timeoutMS、concurrency、ignorePatterns、
+// 与 stryker.config.js 的差异只有四项（thresholds/break:null、timeoutMS、concurrency、ignorePatterns、
 //   mutate、reporters、tempDirName 等全部继承现值）：
 //   1) testRunner: 'tap'、coverageAnalysis: 'perTest'；
 //   2) tap: { testFiles, nodeArgs, forceBail } —— 键名必须是 `tap`，不是 `tapRunner`（见下）；
 //   3) delete commandRunner —— 它只对 command runner 生效，留着会让读者误以为 tap 档还会跑
-//      scripts/mutation-child.js（tap 档由 tap-runner 逐文件 spawn node，环境变量来自 step env）。
+//      scripts/mutation-child.js（tap 档由 tap-runner 逐文件 spawn node，环境变量来自 step env）；
+//   4) jsonReporter/htmlReporter **显式写出 stryker 的默认路径**（取值与 schema 默认逐字相同，
+//      写出来只为让「报告必须落默认路径」这条硬约束在配置里可见、可断言）。
 //
-// 报告路径**必须保持 Stryker 默认值**（reports/mutation/mutation.json、reports/mutation/mutation.html），
-//   故本文件**刻意不写** jsonReporter.fileName / htmlReporter.fileName：
+// 报告路径**必须保持 Stryker 默认值**：reports/mutation/mutation.json、reports/mutation/mutation.html。
+//   本文件**显式写出这两个默认值**（而不是省略、依赖 schema 默认）：取值与
+//   @stryker-mutator/core/schema/stryker-schema.json:766 的 jsonReporterOptions.fileName.default 逐字相同，
+//   写出来只为让这条路径约束在配置里可见、可断言（require 本文件后可直接核对 fileName）。
 //   ⚠️ 不得改成子目录（例如 reports/mutation/tap/）。mutation.yml 的 fail-closed 守卫、紧随缓存恢复的
 //   `rm -rf reports/mutation`、「记录本段增量复用状态」的 reuse.json 落盘闸门、artifact
 //   （path: reports/mutation/ + if-no-files-found: error）与 .github/workflows/analyze-artifacts.yml
@@ -127,6 +131,11 @@ const tapConfig = {
     forceBail: false
   }
 }
+
+// 报告路径：显式写出 stryker 的**默认**值（不是改路径）。mutation.yml 的 fail-closed 守卫、清理步、
+// reuse.json 落盘闸门、artifact 与 analyze-artifacts 全部按这两个路径对齐，改这里等于断链。
+tapConfig.jsonReporter = { fileName: 'reports/mutation/mutation.json' }
+tapConfig.htmlReporter = { fileName: 'reports/mutation/mutation.html' }
 
 // commandRunner 只对 command runner 生效；tap 档显式删掉，避免读者误以为 tap 档还会跑
 // scripts/mutation-child.js（tap 档由 tap-runner 逐文件 spawn node，环境变量来自 step env）。
