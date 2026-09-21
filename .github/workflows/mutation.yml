@@ -11,7 +11,7 @@ name: Mutation
 # 可校验行段是否覆盖文件全量（含文件增长检测）。
 # 增量模式：每 job 独立缓存（reports/inc-*.json），首次全量、之后只跑 diff 部分（本轮原样保留，
 #   见「恢复增量缓存」step 的注释）。
-# 免费 runner 单任务上限 6h——TAP 档实测真全量 19 段并行 wall ≈1h47min、最慢段（utils）70min，余量充足。
+# 免费 runner 单任务上限 6h——TAP 档实测真全量 19 段并行 run 墙钟 ≈71min（瓶颈=最长段 utils 70.3min），余量充足。
 #   （旧 command 档在 --concurrency 8 下 app/utils/message-store 真全量仍需 ~7h/~6.5h/~4.5h，必撞 step 330min；
 #    这正是 CI 切 TAP 的原因，数据见 .local/tap-baseline-REPORT.md。）
 # 触发方式：workflow 文件变更 push、手动（Actions → Mutation → Run workflow）和每日自动。
@@ -271,7 +271,7 @@ jobs:
           #      ~7h / ~6.5h / ~4.5h，必然撞本工作流「变异测试」step 的 330min 超时被杀；而 actions/cache 的
           #      保存是 post-if: success()——**失败段不保存进度** ⇒ 这几段每轮从零开始、**永久红**。
           #      ⚠️ 现状更新（PR-1 起 CI 已切 TAP 档）：上面 ② 的「跑不完」是 **command 档** 的论证。TAP 档实测
-          #      真全量 19 段并行 wall ≈1h47min（最慢段 utils 70min，见 .local/tap-baseline-REPORT.md）⇒ 该前提
+          #      真全量 19 段并行 run 墙钟 ≈71min（瓶颈=最长段 utils 70.3min，见 .local/tap-baseline-REPORT.md）⇒ 该前提
           #      在 TAP 档下**已不成立**。本轮**仍按保守路径原样保留增量/复用链路**（cache、inc-*.json、
           #      reuse.json、日报复用小节一字未改）——不是因为它还「跑不完」，而是本轮不改复用口径、不把
           #      「换 runner」与「去增量」混在一次改动里。perTest 下 incremental-differ 能拿到覆盖信息
@@ -291,7 +291,7 @@ jobs:
           #      残余边界（如实登记）：① 没读到日志/reuse.json 的段显示「未记录」，日报会另给一条
           #      「不要假定它们是全量重算」的提示——不会被静默读成「全量」；② 分数本身仍是复用后的值
           #      （本 PR 有意不改口径）。**真正的诚实全量重跑**：TAP 档已由 PR-1 落地（CI 生效），
-          #      TAP 全量 19 段 wall ≈1h47min（最慢段 utils 70min）——去增量因此已「可负担」，
+          #      TAP 全量 19 段并行 run 墙钟 ≈71min（瓶颈=最长段 utils 70.3min）——去增量因此已「可负担」，
           #      但本轮**仍按保守路径不动增量链路**，去留留给后续 PR 用 CI 数据决定。
           # 仍然成立的技术事实（回退不改变它们，勿顺手删）：
           #   * matrix.src 是真实文件名，可直接作 hashFiles 参数；而 mutate 里的范围字面量（如
@@ -359,12 +359,12 @@ jobs:
       #   * 同档位 run-to-run 方差 ~6%，故不取更高：8 已把等待吃满，再高收益递减并放大资源争用；
       #   * stryker.config.js 的 concurrency 变量仍保留为本地默认（CLI 覆盖它），本行是 CI 的唯一生效值。
       #   注（PR-1 起 CI 走 TAP 档）：上面的 2→8 实测出自 **command 档**；TAP 档基线同样用 --concurrency 8，
-      #   19 段全部在 240min 内完成、无一被杀（.local/tap-baseline-REPORT.md §3）⇒ 该取值在 TAP 档下继续
+      #   19 段全部完成、无一被 timeout 杀死（基线 run 的 job 级 timeout 为 120/240min；见 .local/tap-baseline-REPORT.md §3）⇒ 该取值在 TAP 档下继续
       #   成立（未重测最优值）。storage 段仍走 command 档，沿用同一取值。
       # 为什么时限加在**这一步**而不是靠 job 级的「留 10 分钟」（PR #156 返工）：job 级超时会把同一 job
       # 后续所有步骤一起杀掉（详见 job 级 timeout-minutes 注释），step 级超时只杀这一步、job 继续跑 ⇒
       # 下方 if: always() 的「守卫 / 剥离 / 上传 / 清理」仍有窗口。330 高于实测最大段耗时
-      # （command 档 check-deps 215.2min；TAP 档最慢段 utils 70min）⇒ 正常段落不会被误杀。
+      # （command 档 check-deps 215.2min；TAP 档最慢段 utils 70.3min）⇒ 正常段落不会被误杀。
       # --fileLogLevel info：把 stryker 的 INFO 日志同时写进 cwd 的 stryker.log（LoggingBackend 把
       #   priority ≥ activeFileLevel 的事件写进该文件；默认 fileLogLevel 是 off ⇒ 不写文件）。
       #   这是「复用状态可见」（PR #158 Qodo Medium / Correctness）的**唯一判定源**：报告本身没有复用标记
