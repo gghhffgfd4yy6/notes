@@ -148,10 +148,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # runner 档位（PR-1）：每个条目用 `config` 指定 stryker 配置文件，18 段走 TAP 档
-          # （stryker.tap.config.js，coverageAnalysis: perTest），**storage 段单独留在 command 档**
-          # （stryker.config.js）。矩阵因此是**逐段可选 runner**，而不是「CI 一刀切换 runner」。
-          # storage 为什么不可迁移（根因已用原始 artifact 查清，不是「懒得改」）：
+          # runner 档位（PR-1）：每个条目用 `config` 指定 stryker 配置文件，**16 段走 TAP 档**
+          # （stryker.tap.config.js，coverageAnalysis: perTest），**3 段留在 command 档**
+          # （stryker.config.js：storage / qinglong-push / check-deps）。矩阵因此是**逐段可选 runner**，
+          # 而不是「CI 一刀切换 runner」——留下的每一段都有实测根因，不是「懒得改」：
+          #
+          # ① storage：TAP 档下「变异体导致被测进程崩溃」被记成 RuntimeError 而非 Killed（语义损失）
           #   xbk_storage.js 里有 `let fd = -1` 这类哨兵，UnaryOperator 变异体把它改成 `+1` 后，finally 里的
           #   closeSync(fd) 变成 closeSync(1)——**直接关掉 stdout**。TAP 档下这个副作用发生在写 TAP 点之前：
           #   #81 触发 libuv 断言 `uv__close: fd > STDERR_FILENO` 直接 SIGABRT（不可捕获），#134 的 TAP 点
@@ -162,8 +164,28 @@ jobs:
           #   真击杀变成 Survived，属于篡改判据。fail-closed 守卫（RuntimeError > 0 ⇒ exit 1）不放松、
           #   红色不隐藏；storage 段在 command 档下本身不产生 RuntimeError，故守卫对它照常绿。
           #   代价如实登记：storage 段仍走 command 档的整批套件（285 个变异体，`coverageAnalysis:'off'`，
-          #   未覆盖变异体计入 Survived 而非 NoCoverage）⇒ **它的 score 与其余 18 段不同口径，跨段比较
+          #   未覆盖变异体计入 Survived 而非 NoCoverage）⇒ **它的 score 与其余 16 段不同口径，跨段比较
           #   分数时必须排除该段**。证据：.local/tap-baseline-REPORT.md §3、.local/storage-tap-RE-findings.md。
+          #
+          # ② qinglong-push / check-deps：这两段存在**不产生覆盖的检出路径**，perTest 覆盖图看不见它们 ⇒
+          #   TAP 档判 **NoCoverage 且根本不运行任何测试**，那部分击杀被静默丢失（本 PR 评审 · qodo Medium）：
+          #   (a) **子进程执行**：`test_qinglong_utils.js` 用 spawnSync 跑 `qinglong/xbk_push.js --status`、
+          #       `test_check_deps.js` 用 spawnSync 跑复制进临时目录的 `scripts/check-deps.js`；而 tap-runner
+          #       的覆盖 hook 只预加载在**被 tap-runner spawn 的那个测试进程**里，测试自己再 spawn 的子进程
+          #       不带 hook ⇒ 子进程里执行到的行归因不到任何测试文件。
+          #   (b) **源文本断言**：`test_qinglong_utils.js:213` 用 `readFileSync(qinglong/xbk_push.js)` +
+          #       `indexOf` 断言「`runDryRunOnce(app)` 存在且其后 return 早于 `runResident(`」（该文件注释里
+          #       写明了为何只能用文本断言：插桩会改写字符串字面量、也插不进固定字符距离）。读文本**不产生
+          #       行覆盖**，但 command 档会为每个变异体跑整套件 ⇒ 这类断言能杀掉大量变异体。
+          #   TAP 基线实测 NC：qinglong-push 274/561、check-deps 15/445；check-deps 的 command 对照里
+          #   **3 个**（本可被击杀的）变异体落到 NoCoverage，qinglong-push 的 command 对照 artifact 本身是
+          #   100% 复用（陈旧、可能早于 #158 的假 Killed 修复）⇒ 其丢失量**无法干净量化**，故取保守路线。
+          #   （已审计同类模式：`test_filter.js` 读 `xbk_function_v3.js` 只断言**注释里的版本头**（注释不参与
+          #   变异）、`test_run_mutation_cli.js` 读 `xbk_utils.js` 仅作夹具 ⇒ 二者不构成击杀丢失。）
+          #   迁移前置＝让这两类检出也能被覆盖归因（子进程注入 hook / 把 `--status`、CLI 路径改为进程内调用，
+          #   文本断言改为行为断言），属后续 PR。
+          # 代价如实登记：这 3 段仍走 command 档的整批套件 ⇒ **它们的 score 与其余 16 段不同口径**，
+          #   跨段比较分数时必须排除。
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
@@ -234,11 +256,11 @@ jobs:
           - name: qinglong-push
             src: "qinglong/xbk_push.js"
             mutate: "qinglong/xbk_push.js"
-            config: "stryker.tap.config.js"
+            config: "stryker.config.js"
           - name: check-deps
             src: "scripts/check-deps.js"
             mutate: "scripts/check-deps.js"
-            config: "stryker.tap.config.js"
+            config: "stryker.config.js"
           - name: status
             src: "scripts/status.js"
             mutate: "scripts/status.js"
@@ -261,15 +283,21 @@ jobs:
           # 源指纹固定用 matrix.src：mutate 里的范围字面量（如 "xbk_function_v3.js:1-442"）**不能**作
           #   hashFiles 参数——按字面量找不到文件会返回空指纹，导致 range 段的缓存永不过期，故源指纹一直是
           #   matrix.src 单列。
-          # PR-1（CI 切 TAP 档）起 hashFiles 增列 stryker.tap.config.js：runner / tap.testFiles 清单 /
-          #   coverageAnalysis 这些**决定结果口径**的配置变了必须让**主 key**失效。
-          #   ⚠️ 但这只对主 key 生效：`restore-keys` 仍是裸前缀兜底 `stryker-<段>-`，主 key 未命中时依然会
-          #   恢复上一条同前缀缓存（core 的 `readIncrementalReport()` 对 inc **零校验**，源码里留着
-          #   `// TODO: Validate against the schema or stryker version?`）⇒ **切档后的第一轮仍会继承旧档状态**。
-          #   实测（PR-1 首轮里程碑）：http 段 6/133 复用，其中 6 个本该是 NoCoverage 的变异体沿用了旧 command
-          #   档的 Survived ⇒ NC 由基线 13 降到 7。该继承在日报「♻️ 复用状态」里**可见**（比例 + 段级标注），
-          #   但**状态失真本身不可见**；第二轮起新 key 已有本档缓存，即为纯 TAP 结果。彻底解决（退役增量链路 /
-          #   runner 专属 restore-keys）留待后续 PR。
+          # PR-1（CI 切 TAP 档）起 key 拆成**配置指纹 + 源指纹**两段，且兜底前缀带上配置指纹：
+          #   key:    stryker-<段>-cfg-<hashFiles(stryker.config.js, stryker.tap.config.js)>-src-<hashFiles(package-lock.json, run_mutation.js, matrix.src)>
+          #   兜底:   stryker-<段>-cfg-<同一配置指纹>-
+          # 为什么必须这样（本 PR 评审 · qodo High + sourcery）：切档前 key 是单段 `<hashFiles(...)>`、兜底是
+          #   **裸前缀** `stryker-<段>-`，而 core 的 `readIncrementalReport()` 对 inc **零校验**（源码里留着
+          #   `// TODO: Validate against the schema or stryker version?`）⇒ 主 key 未命中时会把**另一档 runner**
+          #   （command）遗留的 inc 恢复进来并被 TAP 运行复用，本该判 NoCoverage 的变异体沿用旧档状态
+          #   （实测：http 段 6/133 复用、NC 由基线 13 降到 7）。把**配置指纹**同时放进 key 与兜底前缀后：
+          #   同档配置内仍能跨 src 变更兜底复用（「保留进度」的初衷不变），但**跨档（runner / tap.testFiles /
+          #   coverageAnalysis 任一变化）不再互相继承**。
+          #   与 PR #156「测试指纹进兜底前缀」的区别（那版已回退）：测试文件变化频繁，把测试指纹写进前缀会让
+          #   兜底几乎永不命中、且拦不住真根因（假 Killed 来自共享缓存的并发串扰）；**配置**指纹只在 runner
+          #   配置本身变化时才变，既不牺牲兜底价值，又正好堵住跨档污染。
+          # 一次性代价（如实登记）：key 形态变更 ⇒ 历史缓存首次全部未命中，本轮各段为**真全量**
+          #   （19 段并行 ≈72min；command 档的 storage 段按 C=2 实测 2h33m 为上界、C=8 外推 ≈44min）。
           # 为什么回退（旧说法「测试一变就必须全量重跑」不再保留，因为它既不成立也不可负担）：
           #   ① 它**拦不住真根因**：假 Killed 来自**共享缓存的并发串扰**，发生在**变异体运行期**，而基线全程是绿的；
           #      且测试没变时测试指纹不变、主 key 依旧命中 ⇒ 这条改动对真根因完全无效。
@@ -310,9 +338,9 @@ jobs:
           # 去增量与重新标定 thresholds.break 都留到后续 PR（TAP 迁移已在本 PR 落地，break 仍 null）；
           #   在那之前，本条与分数门禁无关。
           path: reports
-          key: stryker-${{ matrix.name }}-${{ hashFiles('package-lock.json', 'stryker.config.js', 'stryker.tap.config.js', 'run_mutation.js', matrix.src) }}
+          key: stryker-${{ matrix.name }}-cfg-${{ hashFiles('stryker.config.js', 'stryker.tap.config.js') }}-src-${{ hashFiles('package-lock.json', 'run_mutation.js', matrix.src) }}
           restore-keys: |
-            stryker-${{ matrix.name }}-
+            stryker-${{ matrix.name }}-cfg-${{ hashFiles('stryker.config.js', 'stryker.tap.config.js') }}-
 
       # F1：缓存（path: reports）会把上一次运行的 reports/mutation/mutation.json 一并恢复，而 stryker 的
       # json 报告不含任何时间戳（内容上无法与本次产出区分）。若本段 stryker 崩溃/被 6h 取消，这个陈旧报告
@@ -380,7 +408,7 @@ jobs:
       #   复用状态」step 读这个文件并落盘 reuse.json，随 artifact 到达汇总 job，日报据此逐段标注
       #   「本轮全量 / 复用 N/M」。info 级**没有**逐变异体日志 ⇒ stryker.log 是 KB 级（实测 25 分钟段 3.9KB），
       #   不构成 artifact/缓存体积问题；`/stryker.log` 也在 stryker 的 always-ignorePatterns 里，不进沙箱。
-      # 配置文件逐段选择：matrix.config = stryker.tap.config.js（18 段）或 stryker.config.js（仅 storage 段）。
+      # 配置文件逐段选择：matrix.config = stryker.tap.config.js（16 段）或 stryker.config.js（storage / qinglong-push / check-deps 三段）。
       # Stryker 10 的 configFile 是**位置参数**（没有 --configFile 选项），故它写在 npx stryker run 之后。
       - name: 变异测试（${{ matrix.name }}）
         timeout-minutes: 330

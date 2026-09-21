@@ -109,7 +109,7 @@ check('render 输出快照（含 error 段 + 正常段 + 全被杀段）', () =>
 '| **合计** | **25** | **13** | **6** | **4** | **2** | **76%** | **82.61%** | **0 段复用** |\n' +
 '\n' +
 // PR-1 双口径：表下必须给出「两列为何不同」的口径说明（NoCoverage > 0 ⇒ covered 剔除该段 NoCoverage）。
-'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时两列必然不同（covered ≥ 分数，差距由该段 `无覆盖` 数决定）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
+'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
 '\n' +
 // PR #158 Qodo Medium / Correctness：夹具没带 reuse 元信息 ⇒ 必须走「没有任何段的复用状态记录」分支。
 // 这一段不能省：省掉之后「没记录」与「没复用」在日报里长得完全一样，正是 Qodo 指出的缺陷本身。
@@ -155,7 +155,7 @@ check('render 输出快照（全被杀 → 🎉 无存活变异体分支）', ()
 '| clean | 3 | 3 | 0 | 0 | 0 | 100% | 100% | 未记录 |\n' +
 '| **合计** | **3** | **3** | **0** | **0** | **0** | **100%** | **100%** | **0 段复用** |\n' +
 '\n' +
-'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时两列必然不同（covered ≥ 分数，差距由该段 `无覆盖` 数决定）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
+'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
 '\n' +
 '## ♻️ 复用状态（结果是否对应当前测试状态）\n' +
 '\n' +
@@ -517,7 +517,7 @@ function cellsOf (out, prefix) {
 }
 // 合计行的单元格带 `**` 加粗，取值前先剥掉。
 function numOf (cell) {
-  return parseFloat(String(cell).replaceAll('*', ''))
+  return Number.parseFloat(String(cell).replaceAll('*', ''))
 }
 
 check('coveredScore/formatCovered：分母为 0（整段 NoCoverage）一律占位符，绝不产出 NaN/Infinity/0%', () => {
@@ -529,7 +529,8 @@ check('coveredScore/formatCovered：分母为 0（整段 NoCoverage）一律占�
   assert.strictEqual(coveredScore({}), null, '缺字段按分母 0 处理（不抛、不 NaN）')
   assert.strictEqual(formatCovered({ killed: 0, timeout: 0, survived: 0, noCoverage: 0 }), NO_COVERAGE_PLACEHOLDER)
   // 有定义时两位小数，与 TAP 基线表逐位一致（app：199+2 / (199+2+364) = 35.5750% → 35.58）
-  assert.strictEqual(coveredScore({ killed: 199, timeout: 2, survived: 364 }), 35.58)
+  // 浮点比较一律给容差（Sonar S1244：不得对浮点做精确相等判定）
+  assert.ok(Math.abs(coveredScore({ killed: 199, timeout: 2, survived: 364 }) - 35.58) < 1e-9, 'covered 口径应为 35.58（app 段真实数字）')
   assert.strictEqual(formatCovered({ killed: 106, timeout: 3, survived: 64 }), '63.01%')
   assert.strictEqual(formatCovered({ killed: 5, timeout: 0, survived: 0 }), '100%')
   // 计数求和后的合计对象走同一条判定（段行与合计行不得各写一份而漂移）
@@ -595,13 +596,13 @@ check('render：合计行按各段**计数求和后再算**口径（不是各段
   ])
   const cells = cellsOf(out, '| **合计** |')
   assert.strictEqual(cells[5], '**20**', '合计 NoCoverage = 20（计数求和）')
-  assert.strictEqual(numOf(cells[6]), 54.55, '合计分数 = 按计数求和后再算')
-  assert.strictEqual(numOf(cells[7]), 66.67, '合计 covered 口径 = 按计数求和后再算')
-  assert.notStrictEqual(numOf(cells[6]), 75, '不得取各段百分比的平均（75%）')
-  assert.notStrictEqual(numOf(cells[7]), 81.25, '不得取各段百分比的平均（81.25%）')
+  assert.ok(Math.abs(numOf(cells[6]) - 54.55) < 1e-9, '合计分数 = 按计数求和后再算')
+  assert.ok(Math.abs(numOf(cells[7]) - 66.67) < 1e-9, '合计 covered 口径 = 按计数求和后再算')
+  assert.ok(Math.abs(numOf(cells[6]) - 75) > 1e-9, '不得取各段百分比的平均（75%）')
+  assert.ok(Math.abs(numOf(cells[7]) - 81.25) > 1e-9, '不得取各段百分比的平均（81.25%）')
   // 段级口径同时给（大段 50%/62.5%，小段 100%/100%）
   assert.strictEqual(cellsOf(out, '| big-half |')[6], '50%')
-  assert.strictEqual(numOf(cellsOf(out, '| big-half |')[7]), 62.5)
+  assert.ok(Math.abs(numOf(cellsOf(out, '| big-half |')[7]) - 62.5) < 1e-9, '大段 covered 口径 = 62.5')
   assert.strictEqual(cellsOf(out, '| small-full |')[6], '100%')
   assert.strictEqual(cellsOf(out, '| small-full |')[7], '100%')
 })

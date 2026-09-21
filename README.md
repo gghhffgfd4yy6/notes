@@ -166,7 +166,7 @@ npm run test:app              # 集成测试并行调度（默认并发 8，失�
 npm run test:app:serial       # 完整串行集成测试（并行失败兜底/定位问题时用）
 npm run test:notify
 npm run test:mutation         # Stryker 变异测试（需 devDependencies，耗时长；本地走 command 档 stryker.config.js）
-                              # CI 变异矩阵走 TAP 档 stryker.tap.config.js（18 段；storage 段保留 command 档，
+                              # CI 变异矩阵走 TAP 档 stryker.tap.config.js（16 段；storage / qinglong-push / check-deps 保留 command 档，
                               # 见 AGENTS.md）：TAP 档真全量 19 段并行 run 墙钟 ≈71min（瓶颈=最长段 utils 70.3min）。
 npm run test:mutation-ranges  # 单独校验 mutation.yml 行段覆盖
 ```

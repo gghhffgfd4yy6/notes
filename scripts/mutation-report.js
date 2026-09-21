@@ -690,7 +690,7 @@ function _renderCoveredScopeNote () {
     '',
     '> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；' +
     '`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。' +
-    '`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时两列必然不同（covered ≥ 分数，差距由该段 `无覆盖` 数决定）；' +
+    '`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；' +
     'NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；' +
     '整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。'
   ]

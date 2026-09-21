@@ -95,8 +95,10 @@ function resolveSkipReason (file) {
   let suites
   try {
     // 沙箱里本文件位于 <sandbox>/scripts/tap-shim.js，注册表在 <sandbox>/test_suites.js。
-    // 必须用绝对路径 require：'./test_suites' 会解析到 scripts/ 下（不存在）而静默失败。
-    suites = require(path.join(__dirname, '..', 'test_suites.js')).SUITES
+    // 用**字面量相对路径**（相对本模块文件解析 ⇒ <root>/test_suites.js）：既避免 './test_suites'
+    // 误解析到 scripts/ 下（不存在）而静默失败，也避免 `require(<变量>)` 触发静态分析告警
+    // （Codacy「dynamically import a module by calling require using a non-literal string」）。
+    suites = require('../test_suites.js').SUITES
   } catch (err) {
     // 读不到注册表就无法保证「跳过集合与 command 档一致」——fail-closed，不允许静默放行。
     return `无法读取 test_suites.js（${err.message}）；跳过集合无法与 command 档对齐`
