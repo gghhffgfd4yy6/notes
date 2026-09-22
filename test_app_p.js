@@ -24,6 +24,13 @@ const CONCURRENCY = (() => {
 })()
 const SRC = path.join(__dirname, 'test_app.js')
 // 同一目录内并发启动多个调度器时，临时名单和 worker 缓存必须互不碰撞。
+// ⚠️ workerId 必须始终由本文件**自造**，并在 runChunk 里以 `{ ...process.env, XBK_PARALLEL_ID: workerId }`
+// 的**覆盖**形式注入——那里 workerId 位于 spread 之后，故父进程即便已有同名变量也传不进子进程，
+// 隔离不依赖调用方守规矩。这不是洁癖：XBK_PARALLEL_ID 直接参与 `xianbaoku_cache_p<ID>` 的路径拼接
+// （生产侧 xbk_message_store.js，而测试侧有多处对该目录递归 rmSync——本文件的 worker 缓存清理
+// 与 test_filter.js 的缓存隔离用例），非受控值即越界删除向量
+//（test_filter.js 曾因此被报 Qodo PR #158 High/Security）。
+// ⇒ 不要改成 `process.env.XBK_PARALLEL_ID || workerId`，也不要把 spread 挪到后面。
 const RUN_ID = `${process.pid}_${Date.now()}`
 const workerIds = []
 
