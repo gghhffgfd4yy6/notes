@@ -14,6 +14,17 @@ const SCRIPT = path.join(__dirname, 'scripts', 'mutation-report.js')
 // 不再从源码文本正则解析——导出后文本解析既多余又脆弱）
 const REQUIRED_SEGS = require('./scripts/mutation-report.js').EXPECTED_SEGMENTS
 assert.ok(REQUIRED_SEGS.length > 0, '生产脚本 EXPECTED_SEGMENTS 不应为空')
+// F-2：段名单元格的 command 档标注——测试消费生产的标注常量与函数（不自造第二份逻辑），
+// 但「哪些段被标注」用字面断言咬住，不经过 formatSegmentLabel（见场景 3）。
+const { formatSegmentLabel, readMatrixRunnerConfigs, COMMAND_RUNNER_CONFIG, COMMAND_SEGMENT_MARK } = require('./scripts/mutation-report.js')
+const RUNNER_CONFIGS = readMatrixRunnerConfigs()
+assert.ok(RUNNER_CONFIGS.size > 0, '真实 mutation.yml 必须能解析出 runner 档位（否则下面的标注断言退化为恒真）')
+// F-2 靶向：日报披露的 command 档段必须正好是矩阵里 config=stryker.config.js 的那些段。这里把
+// 「真实矩阵的档位切分」钉成显式期望——若有人把某段在 TAP/command 之间挪动而不更新日报口径说明，
+// 本断言变红，迫使改动者显式确认披露语义。
+const COMMAND_SEGS = [...RUNNER_CONFIGS.entries()].filter(([, cfg]) => cfg === COMMAND_RUNNER_CONFIG).map(([seg]) => seg).sort()
+assert.deepStrictEqual(COMMAND_SEGS, ['check-deps', 'qinglong-push', 'storage'],
+  `command 档段必须正好是 check-deps / qinglong-push / storage，实际 ${COMMAND_SEGS.join('、')}`)
 
 function runCli (args, opts = {}) {
   try {
@@ -96,8 +107,16 @@ function schemaReport (seg, mutants) {
     assert.ok(r.stdout.includes(`## 存活变异体（${segCount} 个）`), '应列出存活变异体总数')
     assert.ok(!r.stdout.includes('🎉 无存活变异体'), '夹具含存活变异体，不得走「无存活」分支')
     for (const seg of REQUIRED_SEGS) {
-      // 段行也一并咬住新列（含末尾的复用列：无 reuse.json ⇒ 未记录）
-      assert.ok(r.stdout.includes(`| ${seg} | 2 | 1 | 0 | 1 | 0 | 50% | 50% | 未记录 |`), `段 ${seg} 的统计行应正确，实际输出缺该行`)
+      // 段行也一并咬住新列（含末尾的复用列：无 reuse.json ⇒ 未记录）；段名单元格按 mutation.yml 的
+      // 真实 runner 档位渲染（F-2：command 档段带「（command 档）」标注，TAP 档段不带）——用生产的
+      // formatSegmentLabel，避免测试自造一份标注逻辑而与实现漂移。
+      const label = formatSegmentLabel(seg, RUNNER_CONFIGS.get(seg))
+      assert.ok(r.stdout.includes(`| ${label} | 2 | 1 | 0 | 1 | 0 | 50% | 50% | 未记录 |`), `段 ${seg}（${label}）的统计行应正确，实际输出缺该行`)
+      // 标注的**存在/缺失**必须与矩阵档位一致——这一断言不经过 formatSegmentLabel（否则「标注函数被
+      // 改成恒等」时两边同时退化，断言恒真）。它直接咬住 CLI stdout 里的字面段名单元格。
+      const annotated = r.stdout.includes(`| ${seg}${COMMAND_SEGMENT_MARK} |`)
+      assert.strictEqual(annotated, RUNNER_CONFIGS.get(seg) === COMMAND_RUNNER_CONFIG,
+        `${seg} 的 command 档标注必须与 mutation.yml 的 config 一致（实际标注=${annotated}，config=${RUNNER_CONFIGS.get(seg)}）`)
     }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })

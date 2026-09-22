@@ -12,7 +12,8 @@ const {
   collectStats, findReportJson, analyzeSegment, analyze, postIssue,
   parseReuseFromLog, buildReuseMeta, normalizeReuseMeta, readReuseMeta, writeReuseMeta, runReuseMode,
   formatReuseCell, stripAnsi, reuseUnaccountedCount, REUSE_MODE_FULL, REUSE_MODE_PARTIAL, REUSE_MODE_UNKNOWN, HIGH_REUSE_RATIO,
-  coveredScore, coveredDenominator, formatCovered, NO_COVERAGE_PLACEHOLDER
+  coveredScore, coveredDenominator, formatCovered, NO_COVERAGE_PLACEHOLDER,
+  parseMatrixRunnerConfigs, readMatrixRunnerConfigs, formatSegmentLabel, scoreOf, COMMAND_RUNNER_CONFIG, COMMAND_SEGMENT_MARK
 } = require('./scripts/mutation-report.js')
 
 // CodeQL js/file-system-race（本仓库必需检查）：同一路径「先 statSync 检查、再 readFileSync 使用」是
@@ -109,7 +110,10 @@ check('render 输出快照（含 error 段 + 正常段 + 全被杀段）', () =>
 '| **合计** | **25** | **13** | **6** | **4** | **2** | **76%** | **82.61%** | **0 段复用** |\n' +
 '\n' +
 // PR-1 双口径：表下必须给出「两列为何不同」的口径说明（NoCoverage > 0 ⇒ covered 剔除该段 NoCoverage）。
-'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
+'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 **且存活 > 0** 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
+// 审查 A2 · F-2：夹具没带 runnerConfig ⇒ 走**通用**的 command 档说明（不带段名/计数），
+// 但这句话本身不得省略——「runner 看不见覆盖」必须在表下显式声明，否则新列会被读成「不存在未覆盖」。
+'> ⚠️ **command 档段（`coverageAnalysis:\'off\'`）的 `无覆盖` 恒为 0 是 runner 语义，不代表已全部覆盖**：这类段的 `covered 口径` 必然等于 `分数`，与 TAP 档段**不同口径**，**跨段比较必须排除**。\n' +
 '\n' +
 // PR #158 Qodo Medium / Correctness：夹具没带 reuse 元信息 ⇒ 必须走「没有任何段的复用状态记录」分支。
 // 这一段不能省：省掉之后「没记录」与「没复用」在日报里长得完全一样，正是 Qodo 指出的缺陷本身。
@@ -155,7 +159,10 @@ check('render 输出快照（全被杀 → 🎉 无存活变异体分支）', ()
 '| clean | 3 | 3 | 0 | 0 | 0 | 100% | 100% | 未记录 |\n' +
 '| **合计** | **3** | **3** | **0** | **0** | **0** | **100%** | **100%** | **0 段复用** |\n' +
 '\n' +
-'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
+'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 **且存活 > 0** 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
+// 审查 A2 · F-2：夹具没带 runnerConfig ⇒ 走**通用**的 command 档说明（不带段名/计数），
+// 但这句话本身不得省略——「runner 看不见覆盖」必须在表下显式声明，否则新列会被读成「不存在未覆盖」。
+'> ⚠️ **command 档段（`coverageAnalysis:\'off\'`）的 `无覆盖` 恒为 0 是 runner 语义，不代表已全部覆盖**：这类段的 `covered 口径` 必然等于 `分数`，与 TAP 档段**不同口径**，**跨段比较必须排除**。\n' +
 '\n' +
 '## ♻️ 复用状态（结果是否对应当前测试状态）\n' +
 '\n' +
@@ -628,6 +635,216 @@ check('formatReuseCell：三态文案 + 「0 of M 且计数对不上」不得写
   assert.strictEqual(formatReuseCell({ mode: REUSE_MODE_FULL, reused: 0, total: 6 }, 6), '全量', '口径一致 ⇒ 全量')
   assert.strictEqual(formatReuseCell({ mode: REUSE_MODE_FULL, reused: 0, total: 6 }, 8), '全量(口径不符)', '报告多 2 个 ⇒ 不得写全量')
   assert.strictEqual(formatReuseCell({ mode: REUSE_MODE_FULL, reused: 0, total: 6 }, undefined), '全量', '未传报告数时退回旧行为（纯展示函数）')
+})
+
+// ===== `分数` 的段行/合计行共用同一四舍五入口径（审查 A2 · 小建议）============================
+// 审查发现：`covered` 已抽成单一函数，`分数` 的四舍五入却在 analyzeSegment 与合计行**各写一份**——
+// 两条式子当前等价且有测试覆盖，但只改一处会静默漂移。抽成 scoreOf 后由本用例锁死「调用点必须
+// 走同一函数」：任一调用点换成另一条式子，渲染出的单元格就与 scoreOf 的结果不一致 ⇒ 红。
+check('scoreOf：段行与合计行共用同一 `分数` 四舍五入函数（防只改一处的静默漂移）', () => {
+  const segs = [
+    { seg: 'drift-a', total: 3, killed: 1, timeout: 0, survived: 1, noCoverage: 1 },
+    { seg: 'drift-b', total: 7, killed: 3, timeout: 1, survived: 2, noCoverage: 1 }
+  ]
+  const withScore = segs.map(s => ({ ...s, score: scoreOf(s), survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } }))
+  const out = render(withScore)
+  for (const s of withScore) {
+    assert.strictEqual(cellsOf(out, `| ${s.seg} |`)[6], `${scoreOf(s)}%`, `${s.seg} 的分数列必须等于 scoreOf 的结果`)
+  }
+  // 合计行（计数求和后再算）同样必须等于同一函数的结果——若合计行被换回另一条式子，此处红。
+  const totalCells = cellsOf(out, '| **合计** |')
+  assert.strictEqual(totalCells[6], `**${scoreOf({ total: 10, killed: 4, timeout: 1 })}%**`,
+    '合计行的分数必须等于共用函数（计数求和后）的结果')
+  // 反例方向：本夹具的段级分数是 33.33% / 57.14%，其平均 45.24% ≠ 计数求和 50% ⇒ 把合计改成
+  // 「各段百分比平均」会被上面这条等式当场判红（浮点比较给容差，S1244）。
+  const avgOfSegs = (scoreOf(segs[0]) + scoreOf(segs[1])) / 2
+  assert.ok(Math.abs(numOf(totalCells[6]) - avgOfSegs) > 1e-9, '合计不得取各段百分比的平均')
+  assert.ok(Math.abs(numOf(totalCells[6]) - 50) < 1e-9, '合计分数 = 计数求和 (1+0+3+1)/(3+7) = 50%')
+  // 真实数字与边界（字符串比较，避免浮点精确相等判定 S1244）
+  assert.strictEqual(`${scoreOf({ total: 285, killed: 166, timeout: 1 })}%`, '58.6%', 'storage 段真实分数')
+  assert.strictEqual(`${scoreOf({ total: 561, killed: 177, timeout: 9 })}%`, '33.16%', 'qinglong-push 段真实分数')
+  assert.strictEqual(`${scoreOf({ total: 0, killed: 0, timeout: 0 })}%`, '0%', '无数据不报 100%（total=0 ⇒ 0）')
+})
+
+// ===== 口径说明 ⇔ 行为 门禁（审查 A2 · F-5）===================================================
+// 为什么需要：口径说明是本 PR 的主要交付物之一，但此前只有「字符串快照」——只改文案不改实现时
+// 全套用例仍然全绿。历史上确有实例：`2a21ab0` 的文案写「某段 NoCoverage > 0 时两列**必然不同**」，
+// 而实现在 `{K:0,T:0,S:1,NC:1}` 下两列**都是 0%**（该版次实测 70/70 全绿，只把错误文案钉成期望值）。
+// 本用例把说明里每条可判定的断言**逐条对夹具**验证：夹具 → 真渲染出的两个单元格 → 断言是否成立。
+// 文案改错（含改回「必然不同」、或写无条件的「分子为 0 时两列都是 0%」）即红。
+const NOTE_FIXTURES = [
+  { id: 'nc-a', k: 199, t: 2, s: 364, nc: 2086, why: 'NC>0 且分子>0（TAP 真实数字 app）' },
+  { id: 'nc-c', k: 3, t: 1, s: 0, nc: 2, why: 'NC>0 且分子>0 且存活=0' },
+  { id: 'zero-mol', k: 0, t: 0, s: 1, nc: 1, why: 'NC>0 且分子=0 且存活>0' },
+  { id: 'all-nocov', k: 0, t: 0, s: 0, nc: 5, why: '分母=0（整段无覆盖）' },
+  { id: 'no-nc', k: 4, t: 0, s: 4, nc: 0, why: 'NC=0' }
+]
+
+check('口径说明 ⇔ 行为：说明里每条断言逐条对夹具验证（F-5 门禁，F-1 的靶子）', () => {
+  // 1) 夹具 → 真渲染。score 按口径公式**独立**复算（不消费生产 scoreOf），避免同源污染掩盖漂移。
+  for (const f of NOTE_FIXTURES) {
+    const total = f.k + f.t + f.s + f.nc
+    const score = Math.round((((f.k + f.t) / total) * 100) * 100) / 100
+    const out = render([{
+      seg: f.id,
+      total,
+      killed: f.k,
+      timeout: f.t,
+      survived: f.s,
+      noCoverage: f.nc,
+      score,
+      survivedMutants: [],
+      reuse: { mode: REUSE_MODE_FULL }
+    }])
+    const cells = cellsOf(out, `| ${f.id} |`)
+    f.cells = { nc: cells[5], score: cells[6], covered: cells[7] }
+    assert.strictEqual(f.cells.score, `${score}%`, `夹具 ${f.id} 的既有分数列必须等于独立复算值`)
+    assert.strictEqual(f.cells.nc, String(f.nc), `夹具 ${f.id} 的 NoCoverage 列必须可见（读者据此看出两列为何不同）`)
+  }
+  // 说明文本（表下的 `>` 行；排除页脚），后续断言句逐条对夹具验证。
+  const note = render([{
+    seg: 'note-src',
+    total: 1,
+    killed: 1,
+    timeout: 0,
+    survived: 0,
+    noCoverage: 0,
+    score: 100,
+    survivedMutants: [],
+    reuse: { mode: REUSE_MODE_FULL }
+  }]).split('\n').filter(l => l.startsWith('> ') && !l.includes('自动生成')).join('\n')
+  const CLAIMS = [
+    {
+      id: 'NC>0 且分子（被杀+超时）>0 ⇒ 两列不同',
+      note: /某段 NoCoverage > 0 时 covered ≥ 分数/,
+      when: f => f.nc > 0 && f.k + f.t > 0,
+      verify: f => assert.notStrictEqual(f.cells.score, f.cells.covered, `${f.id}（${f.why}）⇒ 两列必须不同`)
+    },
+    {
+      id: 'NC>0 且分子=0 且存活>0 ⇒ 两列同为 0%',
+      note: /为 0 \*\*且存活 > 0\*\* 时两列都是 0%/,
+      when: f => f.nc > 0 && f.k + f.t === 0 && f.s > 0,
+      verify: f => {
+        assert.strictEqual(f.cells.score, '0%', `${f.id}（${f.why}）⇒ 分数 0%`)
+        assert.strictEqual(f.cells.covered, '0%', `${f.id}（${f.why}）⇒ covered 同为 0%`)
+      }
+    },
+    {
+      id: '分母=0（整段无覆盖）⇒ covered 显示 —',
+      note: /整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`/,
+      when: f => f.k + f.t + f.s === 0,
+      verify: f => assert.strictEqual(f.cells.covered, '—', `${f.id}（${f.why}）⇒ 必须占位符，不得 0% 或 NaN`)
+    },
+    {
+      id: 'NC=0 且无其它未计入状态 ⇒ 两列相等',
+      note: /NoCoverage = 0 且无其它未计入状态（[^）]*）时两列相等/,
+      when: f => f.nc === 0,
+      verify: f => assert.strictEqual(f.cells.score, f.cells.covered, `${f.id}（${f.why}）⇒ 两列必须相等`)
+    }
+  ]
+  for (const c of CLAIMS) {
+    assert.ok(c.note.test(note), `口径说明必须给出这条断言：${c.id}`)
+    const matched = NOTE_FIXTURES.filter(c.when)
+    assert.ok(matched.length > 0, `夹具必须覆盖该断言的成立条件：${c.id}`)
+    for (const f of matched) c.verify(f)
+  }
+  // 2) 全称断言的反例（F-1）：「分子为 0」这一类里既有「两列都是 0%」（存活>0）又有 covered=—
+  //    （存活=0）⇒ 任何**无条件**的「分子为 0 时两列都是 0%」都与夹具矛盾；文案必须带「且存活 > 0」。
+  const zeroMolecule = NOTE_FIXTURES.filter(f => f.nc > 0 && f.k + f.t === 0)
+  assert.ok(zeroMolecule.some(f => f.cells.covered === '—'), '夹具必须含「分子=0 且存活=0 ⇒ —」的反例')
+  assert.ok(zeroMolecule.some(f => f.cells.covered === '0%'), '夹具必须含「分子=0 且存活>0 ⇒ 0%」')
+  assert.ok(!/为 0 时两列都是 0%/.test(note), '文案不得写无条件的「分子为 0 时两列都是 0%」（被 all-nocov 夹具证伪）')
+  // 3) 破坏性反例靶子：改回 2a21ab0 的「NoCoverage > 0 时两列必然不同」即失配（claim 1 的红通道）。
+  assert.ok(!/NoCoverage > 0 时两列必然不同/.test(note), '文案不得写「NoCoverage > 0 时两列必然不同」')
+})
+
+// ===== runner 档位逐段披露（审查 A2 · F-2）====================================================
+// 为什么必须：command 档段（`coverageAnalysis:'off'`）结构上**不产出 NoCoverage** ⇒ 该段「无覆盖」
+// 恒为 0、covered 必然等于分数。不披露 runner 会让读者（尤其是只看新列的读者）把「runner 看不见
+// 覆盖」读成「不存在未覆盖区域」——与本 PR 立意相反（CI 实例：qinglong-push 表内 0/33.16%，
+// 而同段 TAP 真报告是 NC 274/561、covered 59.58%）。
+check('parseMatrixRunnerConfigs：从 matrix include 解析逐段 config（含 steps 干扰与降级）', () => {
+  const yml = [
+    'jobs:',
+    '  mutation:',
+    '    strategy:',
+    '      matrix:',
+    '        include:',
+    '          # 注释行不参与解析',
+    '          - name: storage',
+    '            src: "xbk_storage.js"',
+    '            mutate: "xbk_storage.js"',
+    '            config: "stryker.config.js"',
+    '          - name: app',
+    '            src: "xbk_app.js"',
+    '            config: "stryker.tap.config.js"',
+    '      fail-fast: false',
+    '    steps:',
+    '      - name: 变异测试（$' + '{{ matrix.name }}）',
+    '        run: npx stryker run $' + '{{ matrix.config }}'
+  ].join('\n')
+  const map = parseMatrixRunnerConfigs(yml)
+  assert.strictEqual(map.get('storage'), COMMAND_RUNNER_CONFIG)
+  assert.strictEqual(map.get('app'), 'stryker.tap.config.js')
+  assert.strictEqual(map.size, 2, 'include 块之外的 steps/config 引用不得被当成矩阵条目')
+  // 降级：非字符串 / 空 / 无 include / 文件读不到 ⇒ 空 Map（调用侧据此不标注，绝不抛、绝不崩）
+  assert.strictEqual(parseMatrixRunnerConfigs('').size, 0)
+  assert.strictEqual(parseMatrixRunnerConfigs(undefined).size, 0)
+  assert.strictEqual(parseMatrixRunnerConfigs('jobs:\n  x:\n').size, 0, '没有 include: 块 ⇒ 空 Map')
+  assert.strictEqual(readMatrixRunnerConfigs(path.join(__dirname, 'no-such-mutation.yml')).size, 0, '读不到文件必须降级为空 Map')
+  // 单引号 + 行内注释（与 check-mutation-ranges.js 的标量口径一致）
+  const quoted = parseMatrixRunnerConfigs("include:\n  - name: s1\n    config: 'stryker.config.js' # command\n")
+  assert.strictEqual(quoted.get('s1'), COMMAND_RUNNER_CONFIG)
+})
+
+check('render/analyze：command 档段被标注、TAP 档段不被标注（F-2 靶向用例）', () => {
+  // 纯函数层
+  assert.strictEqual(formatSegmentLabel('storage', COMMAND_RUNNER_CONFIG), `storage${COMMAND_SEGMENT_MARK}`)
+  assert.strictEqual(formatSegmentLabel('app', 'stryker.tap.config.js'), 'app', 'TAP 档不得被标注')
+  assert.strictEqual(formatSegmentLabel('unknown-seg', undefined), 'unknown-seg', '未知 runner ⇒ 不标注')
+  // 端到端：真夹具树 + 真仓库 mutation.yml（analyze 自行读取矩阵）
+  const fixtureReport = (seg) => ({
+    schemaVersion: '1.0',
+    thresholds: { high: 80, low: 60, break: null },
+    files: {
+      [`${seg}.js`]: {
+        language: 'javascript',
+        source: 'const x = 1\n',
+        mutants: [
+          { id: '0', mutatorName: 'BlockStatement', replacement: '{}', status: 'Killed', location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } } },
+          { id: '1', mutatorName: 'BooleanLiteral', replacement: 'false', status: 'Survived', location: { start: { line: 2, column: 1 }, end: { line: 2, column: 2 } } }
+        ]
+      }
+    }
+  })
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runner-'))
+  try {
+    for (const seg of ['storage', 'qinglong-push', 'check-deps', 'app', 'utils']) {
+      const d = path.join(dir, `mutation-report-${seg}`, 'reports', 'mutation')
+      fs.mkdirSync(d, { recursive: true })
+      fs.writeFileSync(path.join(d, 'mutation.json'), JSON.stringify(fixtureReport(seg)))
+    }
+    const out = render(analyze(dir))
+    for (const seg of ['storage', 'qinglong-push', 'check-deps']) {
+      assert.ok(out.includes(`| ${seg}${COMMAND_SEGMENT_MARK} |`), `${seg} 是 command 档，必须被标注：\n${out}`)
+      assert.ok(out.includes(`\`${seg}\``), `表下说明必须点名 command 档段 ${seg}`)
+    }
+    for (const seg of ['app', 'utils']) {
+      assert.ok(out.includes(`| ${seg} |`), `${seg} 是 TAP 档，行不得被改动`)
+      assert.ok(!out.includes(`${seg}${COMMAND_SEGMENT_MARK}`), `${seg} 不得带 command 档标注`)
+    }
+    assert.ok(out.includes('本表已逐段标注'), '表下说明必须给出「已逐段标注」的结论')
+    assert.ok(out.includes('这 3 段的 score 与其余 2 段**不同口径**'), '说明必须由夹具推导出档位数（3 command / 2 TAP）')
+    // 降级：矩阵读不到 ⇒ 不标注，但日报照常渲染（不得崩），且通用口径说明不得整句消失
+    const degraded = render(analyze(dir, { matrixPath: path.join(dir, 'no-such-mutation.yml') }))
+    for (const seg of ['storage', 'qinglong-push', 'check-deps', 'app', 'utils']) {
+      assert.ok(!degraded.includes(`${seg}${COMMAND_SEGMENT_MARK}`), `矩阵不可读时必须降级为不标注：${seg}`)
+    }
+    assert.ok(degraded.includes('这类段的 `covered 口径` 必然等于 `分数`'), '降级时仍须给出通用口径说明')
+    assert.ok(!degraded.includes('本表已逐段标注'), '降级时不得声称已逐段标注')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 check('analyzeSegment：reuse.json 随报告目录被读入（含段名交叉校验）', () => {
