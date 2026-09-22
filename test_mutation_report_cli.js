@@ -19,12 +19,15 @@ assert.ok(REQUIRED_SEGS.length > 0, '生产脚本 EXPECTED_SEGMENTS 不应为空
 const { formatSegmentLabel, readMatrixRunnerConfigs, COMMAND_RUNNER_CONFIG, COMMAND_SEGMENT_MARK } = require('./scripts/mutation-report.js')
 const RUNNER_CONFIGS = readMatrixRunnerConfigs()
 assert.ok(RUNNER_CONFIGS.size > 0, '真实 mutation.yml 必须能解析出 runner 档位（否则下面的标注断言退化为恒真）')
-// F-2 靶向：日报披露的 command 档段必须正好是矩阵里 config=stryker.config.js 的那些段。这里把
-// 「真实矩阵的档位切分」钉成显式期望——若有人把某段在 TAP/command 之间挪动而不更新日报口径说明，
-// 本断言变红，迫使改动者显式确认披露语义。
+// F-2 靶向：日报必须披露矩阵里 config=stryker.config.js 的那些段。这里**不钉死总量**——矩阵是唯一
+// 权威（逐段披露的设计就是随矩阵自动跟随，例如将来某段从 TAP 挪到 command 时日报无需改代码），
+// 故只断言「PR-1 登记的保留段都在、且 command 档没有覆盖全部段（否则逐段披露失去对照面）」；
+// 场景 3 再逐段断言「stdout 里标注的有无 === 矩阵档位」，把标注机制本身咬住。
 const COMMAND_SEGS = [...RUNNER_CONFIGS.entries()].filter(([, cfg]) => cfg === COMMAND_RUNNER_CONFIG).map(([seg]) => seg).sort()
-assert.deepStrictEqual(COMMAND_SEGS, ['check-deps', 'qinglong-push', 'storage'],
-  `command 档段必须正好是 check-deps / qinglong-push / storage，实际 ${COMMAND_SEGS.join('、')}`)
+for (const must of ['check-deps', 'qinglong-push', 'storage']) {
+  assert.ok(COMMAND_SEGS.includes(must), `${must} 必须仍在 command 档（PR-1 登记：TAP 档下它会被记成 RuntimeError/丢检出），实际 command 档=${COMMAND_SEGS.join('、')}`)
+}
+assert.ok(COMMAND_SEGS.length < REQUIRED_SEGS.length, 'command 档不得覆盖全部段（否则「逐段披露 runner」没有对照面）')
 
 function runCli (args, opts = {}) {
   try {
