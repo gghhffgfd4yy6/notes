@@ -41,7 +41,7 @@ permissions:
 # 却分别排队 64.3 / 64.0 / 63.7 分钟（该 run 墙钟 272 分钟，绝大部分是排队不是计算）。
 # 按 ref 分组即可完全消除本观测到的重叠形态（重叠的 5 次同 ref），且不影响其它路径：
 #   - 主 cron 与分支 dispatch 的 ref 不同 ⇒ 不同组，日报不会被分支任务拖累；
-#   - cancel-in-progress: false 是有意为之——Mutation 单段可跑 3.5h（C=2 时代实测 check-deps 215.2min；C=8 后实测最长段为 qinglong-push 85.3min），
+#   - cancel-in-progress: false 是有意为之——Mutation 单段历史最长 3.5h（**C=2 时代**实测 check-deps 215.2min；**C=8 后**实测最长段为 command 档 qinglong-push 85.3min、TAP 档 utils 70.4min，口径与下方 job 级注释一致），
 #     取消在跑任务等于丢弃已完成的变异进度；这里只要「不重叠」，不要「抢最新」。
 #     GitHub 语义下同组内更早的 *pending* 运行会被新运行取代，这正好是我们要的同 ref 去重。
 concurrency:
