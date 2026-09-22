@@ -33,7 +33,9 @@
 // 增量/复用链路**原样保留**（保守路径的锁定决策）：本配置不设 `incremental` / `incrementalFile` 键，
 //   由工作流传 `--incremental --incrementalFile reports/inc-<段>.json`；缓存 key、reuse.json、日报
 //   「♻️ 复用状态」小节全部不动。注意 perTest 下 incremental-differ 能拿到覆盖信息（不再走
-//   `!testCoverage.hasCoverage ⇒ 无条件复用` 那条分支），但该交互**未在 CI 上实测过**，本轮不据此改口径。
+//   `!testCoverage.hasCoverage ⇒ 无条件复用` 那条分支）。该交互**已在 CI 实测**（`d34cf5b` / run 35639202819：
+//   恢复 inc 后 TAP 段 133/133、2651/2651、2402/2402、391/391 全部复用）——此前「未在 CI 上实测过」的表述不实，本轮更正；
+//   本轮仍不据此改分数口径。
 // ============================================================
 const path = require('node:path')
 const { SUITES } = require('./test_suites')
