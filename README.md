@@ -166,9 +166,11 @@ npm run test:app              # 集成测试并行调度（默认并发 8，失�
 npm run test:app:serial       # 完整串行集成测试（并行失败兜底/定位问题时用）
 npm run test:notify
 npm run test:mutation         # Stryker 变异测试（需 devDependencies，耗时长；本地走 command 档 stryker.config.js）
-                              # CI 变异矩阵走 TAP 档 stryker.tap.config.js（16 段；storage / qinglong-push / check-deps 保留 command 档，
-                              # 见 AGENTS.md）：全 19 段 TAP 基线（spike，run 35607440845）墙钟 ≈71min（瓶颈=utils 70.25min）；
-                              # 本矩阵（16 TAP + 3 command）实测墙钟 **86.0min**（run 35646992130，瓶颈=command 档 qinglong-push 85.3min）。
+                              # CI 变异矩阵走 TAP 档 stryker.tap.config.js（15 段；v3-entry / storage / qinglong-push / check-deps
+                              # 保留 command 档，见 AGENTS.md）：全 19 段 TAP 基线（spike，run 35607440845）墙钟 ≈71min（瓶颈=utils 70.25min）；
+                              # 本矩阵 16 TAP + 3 command 实测墙钟 **86.0min**（run 35646992130，瓶颈=command 档 qinglong-push 85.3min）；
+                              # 改为 15 TAP + 4 command（v3-entry 走 command：TAP 档实测丢 19 个击杀、command 档预估 ≈34min < 瓶颈）⇒ 墙钟不变。
+                              # 各段回退机制与实测代价见 AGENTS.md 的「TAP 档已知限制」。
 npm run test:mutation-ranges  # 单独校验 mutation.yml 行段覆盖
 ```
 
