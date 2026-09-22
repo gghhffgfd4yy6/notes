@@ -155,7 +155,7 @@ diagnostics: {
 
 ## 测试
 
-`npm test` 顺序执行全部 45 个套件（33 个单元 + 10 个集成 + 2 个变异行段元校验），前置跑一遍依赖预检 `scripts/check-deps.js`：探测清单由 `package.json` 的 `dependencies`/`optionalDependencies` 派生（声明了却没装即失败，不再只认硬编码的 `got`/`re2`），区分「未安装」与「已安装但不可用」并输出根因，同时校验运行时 Node 版本是否满足 `engines.node` 与 `re2` 自身的（更严的）`engines.node`，任一不满足即退出；该脚本也可直接执行（`node scripts/check-deps.js`，按检查结果 exit 0/1）。集成套件多数已 mock，个别仍可能受运行环境/网络影响。`npm run test:unit` 只跑 33 个单元套件（跳过集成与变异行段元校验）。
+`npm test` 顺序执行全部 45 个套件（32 个单元 + 10 个集成 + 3 个变异沙箱跳过：2 个变异行段元校验 + `test_install_hooks.js`），前置跑一遍依赖预检 `scripts/check-deps.js`：探测清单由 `package.json` 的 `dependencies`/`optionalDependencies` 派生（声明了却没装即失败，不再只认硬编码的 `got`/`re2`），区分「未安装」与「已安装但不可用」并输出根因，同时校验运行时 Node 版本是否满足 `engines.node` 与 `re2` 自身的（更严的）`engines.node`，任一不满足即退出；该脚本也可直接执行（`node scripts/check-deps.js`，按检查结果 exit 0/1）。集成套件多数已 mock，个别仍可能受运行环境/网络影响。`npm run test:unit` 只跑 32 个单元套件（跳过集成与 3 个变异沙箱跳过套件）。
 
 ```bash
 npm run check                 # 总门禁：lint → 版本四方一致 → 变异行段校验 → npm test
@@ -167,7 +167,8 @@ npm run test:app:serial       # 完整串行集成测试（并行失败兜底/�
 npm run test:notify
 npm run test:mutation         # Stryker 变异测试（需 devDependencies，耗时长；本地走 command 档 stryker.config.js）
                               # CI 变异矩阵走 TAP 档 stryker.tap.config.js（16 段；storage / qinglong-push / check-deps 保留 command 档，
-                              # 见 AGENTS.md）：TAP 档真全量 19 段并行 run 墙钟 ≈71min（瓶颈=最长段 utils 70.3min）。
+                              # 见 AGENTS.md）：全 19 段 TAP 基线（spike，run 35607440845）墙钟 ≈71min（瓶颈=utils 70.25min）；
+                              # 本矩阵（16 TAP + 3 command）实测墙钟 **86.0min**（run 35646992130，瓶颈=command 档 qinglong-push 85.3min）。
 npm run test:mutation-ranges  # 单独校验 mutation.yml 行段覆盖
 ```
 

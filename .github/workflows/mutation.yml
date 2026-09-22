@@ -1,7 +1,7 @@
 name: Mutation
 
 # 变异测试：全量生产代码覆盖。
-# runner（PR-1 起）：CI 走 **TAP 档** stryker.tap.config.js（testRunner: tap + coverageAnalysis: perTest，
+# runner（PR-1 起）：CI 走 **TAP 档** stryker.tap.config.js（16 段；storage / qinglong-push / check-deps 三段走 command 档）（testRunner: tap + coverageAnalysis: perTest，
 #   报告仍落 stryker 默认路径 reports/mutation/）；本地 `npm run test:mutation` 仍走 command 档
 #   stryker.config.js——两档测试集由 tap 配置的加载期断言强制对齐（不一致即配置加载失败）。
 # 长文件按官方行范围语法（file:start-end）拆分防超时：V3 目前 1 段全覆盖（1-442），sendnotify 拆 2 段。
@@ -11,7 +11,7 @@ name: Mutation
 # 可校验行段是否覆盖文件全量（含文件增长检测）。
 # 增量模式：每 job 独立缓存（reports/inc-*.json），首次全量、之后只跑 diff 部分（本轮原样保留，
 #   见「恢复增量缓存」step 的注释）。
-# 免费 runner 单任务上限 6h——TAP 档实测真全量 19 段并行 run 墙钟 ≈71min（瓶颈=最长段 utils 70.3min），余量充足。
+# 免费 runner 单任务上限 6h——全 19 段 TAP 基线（spike/tap-baseline，run 35607440845）墙钟 ≈71min（瓶颈=utils 70.25min）；本矩阵 16 TAP + 3 command 实测墙钟 86.0min（run 35646992130，瓶颈=command 档 qinglong-push 85.3min），余量充足。
 #   （旧 command 档在 --concurrency 8 下 app/utils/message-store 真全量仍需 ~7h/~6.5h/~4.5h，必撞 step 330min；
 #    这正是 CI 切 TAP 的原因，数据见 .local/tap-baseline-REPORT.md。）
 # 触发方式：workflow 文件变更 push、手动（Actions → Mutation → Run workflow）和每日自动。
@@ -41,7 +41,7 @@ permissions:
 # 却分别排队 64.3 / 64.0 / 63.7 分钟（该 run 墙钟 272 分钟，绝大部分是排队不是计算）。
 # 按 ref 分组即可完全消除本观测到的重叠形态（重叠的 5 次同 ref），且不影响其它路径：
 #   - 主 cron 与分支 dispatch 的 ref 不同 ⇒ 不同组，日报不会被分支任务拖累；
-#   - cancel-in-progress: false 是有意为之——Mutation 单段可跑 3.5h（实测 check-deps 215.2min），
+#   - cancel-in-progress: false 是有意为之——Mutation 单段可跑 3.5h（C=2 时代实测 check-deps 215.2min；C=8 后实测最长段为 qinglong-push 85.3min），
 #     取消在跑任务等于丢弃已完成的变异进度；这里只要「不重叠」，不要「抢最新」。
 #     GitHub 语义下同组内更早的 *pending* 运行会被新运行取代，这正好是我们要的同 ref 去重。
 concurrency:
@@ -138,8 +138,8 @@ jobs:
     # 正确做法是把时限压在**变异测试那一步**上：step 级超时只杀那一步、job 继续跑，
     # 下方 if: always() 的步骤仍有窗口（见该 step 的 timeout-minutes: 330）。
     # 依据（gh api …/jobs 实测单段 started→completed 的最大值，非排队时间）：
-    #   check-deps 215.2min、utils 205.1min、message-store 194.6min、sendnotify-part2 91.7min，
-    #   其余 17 段 1.3-81.3min。step 级 330 高于任何实测段耗时 ⇒ 不会新增误杀；
+    #   （C=2 时代）check-deps 215.2min、utils 205.1min、message-store 194.6min、sendnotify-part2 91.7min，
+    #   其余 15 段 1.3-81.3min。step 级 330 高于任何实测段耗时 ⇒ 不会新增误杀；
     #   而某步真挂死时，job 级 360（平台硬上限）仍是唯一的上界。
     timeout-minutes: 360
     permissions:
@@ -297,15 +297,16 @@ jobs:
           #   兜底几乎永不命中、且拦不住真根因（假 Killed 来自共享缓存的并发串扰）；**配置**指纹只在 runner
           #   配置本身变化时才变，既不牺牲兜底价值，又正好堵住跨档污染。
           # 一次性代价（如实登记）：key 形态变更 ⇒ 历史缓存首次全部未命中，本轮各段为**真全量**
-          #   （19 段并行 ≈72min；command 档的 storage 段按 C=2 实测 2h33m 为上界、C=8 外推 ≈44min）。
+          #   （19 段并行实测 **86.0min**（run 35646992130，head ca63e71）；瓶颈＝command 档 qinglong-push **85.3min**。command 档三段 C=8 实测：storage 42.6min / check-deps 64.2min / qinglong-push 85.3min；storage 的 C=2 上界 2h33m。）
           # 为什么回退（旧说法「测试一变就必须全量重跑」不再保留，因为它既不成立也不可负担）：
           #   ① 它**拦不住真根因**：假 Killed 来自**共享缓存的并发串扰**，发生在**变异体运行期**，而基线全程是绿的；
           #      且测试没变时测试指纹不变、主 key 依旧命中 ⇒ 这条改动对真根因完全无效。
           #   ② 它**跑不完**：真正全量下 app(2651) / utils(2402) / message-store(1692) 在 --concurrency 8 下仍需
           #      ~7h / ~6.5h / ~4.5h，必然撞本工作流「变异测试」step 的 330min 超时被杀；而 actions/cache 的
           #      保存是 post-if: success()——**失败段不保存进度** ⇒ 这几段每轮从零开始、**永久红**。
-          #      ⚠️ 现状更新（PR-1 起 CI 已切 TAP 档）：上面 ② 的「跑不完」是 **command 档** 的论证。TAP 档实测
-          #      真全量 19 段并行 run 墙钟 ≈71min（瓶颈=最长段 utils 70.3min，见 .local/tap-baseline-REPORT.md）⇒ 该前提
+          #      ⚠️ 现状更新（PR-1 起 CI 已切 TAP 档）：上面 ② 的「跑不完」是 **command 档** 的论证。全 19 段 TAP 基线
+          #      （spike/tap-baseline，run 35607440845）墙钟 ≈71min（瓶颈=utils 70.25min，见 .local/tap-baseline-REPORT.md）；
+          #      本矩阵 16 TAP + 3 command 实测墙钟 86.0min（run 35646992130，瓶颈=command 档 qinglong-push 85.3min）⇒ 该前提
           #      在 TAP 档下**已不成立**。本轮**仍按保守路径原样保留增量/复用链路**（cache、inc-*.json、
           #      reuse.json、日报复用小节一字未改）——不是因为它还「跑不完」，而是本轮不改复用口径、不把
           #      「换 runner」与「去增量」混在一次改动里。perTest 下 incremental-differ 能拿到覆盖信息
@@ -325,13 +326,13 @@ jobs:
           #      残余边界（如实登记）：① 没读到日志/reuse.json 的段显示「未记录」，日报会另给一条
           #      「不要假定它们是全量重算」的提示——不会被静默读成「全量」；② 分数本身仍是复用后的值
           #      （本 PR 有意不改口径）。**真正的诚实全量重跑**：TAP 档已由 PR-1 落地（CI 生效），
-          #      TAP 全量 19 段并行 run 墙钟 ≈71min（瓶颈=最长段 utils 70.3min）——去增量因此已「可负担」，
+          #      全 19 段 TAP 基线（spike/tap-baseline，run 35607440845）墙钟 ≈71min（瓶颈=utils 70.25min）；本矩阵 16 TAP + 3 command 实测墙钟 86.0min（run 35646992130，瓶颈=command 档 qinglong-push 85.3min）——去增量因此已「可负担」，
           #      但本轮**仍按保守路径不动增量链路**，去留留给后续 PR 用 CI 数据决定。
           # 仍然成立的技术事实（回退不改变它们，勿顺手删）：
           #   * matrix.src 是真实文件名，可直接作 hashFiles 参数；而 mutate 里的范围字面量（如
           #     "xbk_function_v3.js:1-442"）**不能**作 hashFiles 参数——按字面量找不到文件会返回空指纹，
           #     导致 range 段的缓存永不过期，故源指纹一直是 matrix.src 单列。
-          #   * **command 档**（当前只剩 storage 段）的 coverageAnalysis:'off' 下 incremental-differ 拿不到
+          #   * **command 档**（当前为 storage / qinglong-push / check-deps 三段）的 coverageAnalysis:'off' 下 incremental-differ 拿不到
           #     覆盖信息时**无条件复用**全部旧结果（killed/survived 原样照搬），这正是「复用」的语义——
           #     也是上面那条代价的来源。TAP 档是 perTest、有覆盖信息，不走这条分支（未在 CI 实测，见上）。
           #   * 回退后此前带 -tests- 的旧缓存条目自然不再命中（主 key 变了），属预期行为。
@@ -398,7 +399,7 @@ jobs:
       # 为什么时限加在**这一步**而不是靠 job 级的「留 10 分钟」（PR #156 返工）：job 级超时会把同一 job
       # 后续所有步骤一起杀掉（详见 job 级 timeout-minutes 注释），step 级超时只杀这一步、job 继续跑 ⇒
       # 下方 if: always() 的「守卫 / 剥离 / 上传 / 清理」仍有窗口。330 高于实测最大段耗时
-      # （command 档 check-deps 215.2min；TAP 档最慢段 utils 70.3min）⇒ 正常段落不会被误杀。
+      # （C=2 时代 command 档 check-deps 215.2min；C=8 实测最长段 command 档 qinglong-push 85.3min、TAP 档 utils 70.4min）⇒ 正常段落不会被误杀。
       # --fileLogLevel info：把 stryker 的 INFO 日志同时写进 cwd 的 stryker.log（LoggingBackend 把
       #   priority ≥ activeFileLevel 的事件写进该文件；默认 fileLogLevel 是 off ⇒ 不写文件）。
       #   这是「复用状态可见」（PR #158 Qodo Medium / Correctness）的**唯一判定源**：报告本身没有复用标记
@@ -464,8 +465,8 @@ jobs:
       # 残余边界（本轮补，已实测复现）：`Result: N of M` 的 M 只统计**当前 --mutate 范围**内的变异体，
       #   而 incremental-differ 的 sticky 分支会把旧增量报告中**已不在当前范围**的变异体原样并入报告
       #   （status 沿用旧运行），且既不计入 N 也不计入 M ⇒ N/M 只是旧结果占比的**下界**。本仓可达：
-      #   缓存 key 是 `stryker-<段>-<hashFiles(…, matrix.src)>`、**不含 mutate 范围**，且 `restore-keys` 是
-      #   **裸前缀兜底 `stryker-<段>-`** ⇒ 主 key 未命中时也会恢复最近一条同前缀缓存；叠加 AGENTS.md 要求的
+      #   缓存 key 是 `stryker-<段>-cfg-<配置指纹>-src-<hashFiles(…, matrix.src)>`、**不含 mutate 范围**，且 `restore-keys` 是
+      #   **带配置指纹的兜底前缀 `stryker-<段>-cfg-<配置指纹>-`** ⇒ 主 key 未命中时也会恢复**同档配置**的最近一条同前缀缓存；叠加 AGENTS.md 要求的
       #   大文件增长时**重拆 mutate 行段** ⇒ 旧 inc 里落在新范围外的变异体被 sticky 分支并入。处理＝**只呈现、不改口径**：日报的
       #   「♻️ 复用状态」小节对「报告变异体数 vs 日志口径 M」不一致的段单独点名（reuseUnaccountedCount，
       #   纯显示层交叉校验，不加 throw、不新增第四态），并明说比例只是下界；`0 of M` 但计数对不上的段
