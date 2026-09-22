@@ -23,7 +23,7 @@ assert.ok(RUNNER_CONFIGS.size > 0, '真实 mutation.yml 必须能解析出 runne
 // 权威（逐段披露的设计就是随矩阵自动跟随，例如将来某段从 TAP 挪到 command 时日报无需改代码），
 // 故只断言「PR-1 登记的保留段都在、且 command 档没有覆盖全部段（否则逐段披露失去对照面）」；
 // 场景 3 再逐段断言「stdout 里标注的有无 === 矩阵档位」，把标注机制本身咬住。
-const COMMAND_SEGS = [...RUNNER_CONFIGS.entries()].filter(([, cfg]) => cfg === COMMAND_RUNNER_CONFIG).map(([seg]) => seg).sort()
+const COMMAND_SEGS = [...RUNNER_CONFIGS.entries()].filter(([, cfg]) => cfg === COMMAND_RUNNER_CONFIG).map(([seg]) => seg).sort((a, b) => a.localeCompare(b))
 for (const must of ['check-deps', 'qinglong-push', 'storage']) {
   assert.ok(COMMAND_SEGS.includes(must), `${must} 必须仍在 command 档（PR-1 登记：TAP 档下它会被记成 RuntimeError/丢检出），实际 command 档=${COMMAND_SEGS.join('、')}`)
 }
