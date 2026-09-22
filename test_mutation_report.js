@@ -538,6 +538,12 @@ check('coveredScore/formatCovered：分母为 0（整段 NoCoverage）一律占�
   // 有定义时两位小数，与 TAP 基线表逐位一致（app：199+2 / (199+2+364) = 35.5750% → 35.58）
   // 浮点比较一律给容差（Sonar S1244：不得对浮点做精确相等判定）
   assert.ok(Math.abs(coveredScore({ killed: 199, timeout: 2, survived: 364 }) - 35.58) < 1e-9, 'covered 口径应为 35.58（app 段真实数字）')
+  // 类型断言（审查 A4-3 实测假绿）：容差比较**不能**替代类型校验——`Math.abs('35.58' - 35.58) === 0`
+  // 成立，故把实现误改成 `return String(...)`（违反 JSDoc `@returns {number|null}`）时，上面那条仍绿。
+  // 这里显式钉住返回类型；有定义时必须是 number，无定义时必须是 null（占位符语义由 formatCovered 承担）。
+  assert.strictEqual(typeof coveredScore({ killed: 199, timeout: 2, survived: 364 }), 'number',
+    'coveredScore 必须返回 number（容差比较不能把类型错误放过）')
+  assert.strictEqual(typeof coveredScore({ killed: 3, timeout: 1, survived: 2 }), 'number', 'coveredScore 的返回值必须是 number')
   assert.strictEqual(formatCovered({ killed: 106, timeout: 3, survived: 64 }), '63.01%')
   assert.strictEqual(formatCovered({ killed: 5, timeout: 0, survived: 0 }), '100%')
   // 计数求和后的合计对象走同一条判定（段行与合计行不得各写一份而漂移）
