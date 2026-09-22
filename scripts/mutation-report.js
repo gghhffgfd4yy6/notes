@@ -409,7 +409,128 @@ function writeReuseMeta (options) {
   return { written: true, outPath: path.resolve(outPath), meta }
 }
 
-function analyze (dir) {
+// ===== runner 档位：逐段披露「该段走哪个 stryker 配置」=========================================
+// 背景（独立审查 A2 · F-2）：PR-1 起 mutation.yml 的矩阵**逐段**用 `config` 选 runner——16 段走
+// `stryker.tap.config.js`（`coverageAnalysis:'perTest'`，会产出 NoCoverage），3 段留在
+// `stryker.config.js`（command 档，`coverageAnalysis:'off'`）。command 档**结构上不产出 NoCoverage**
+// （见 mutation.yml 的矩阵注释与 .local/cmd-arts 的同段对照：`{'Killed':369,'Survived':75,'Timeout':1}`
+// 里根本没有 NoCoverage 状态）⇒ 这 3 段的 `无覆盖` 恒为 0 是 **runner 的盲区**，不是「已全部覆盖」。
+// 不披露 runner 会怎样：这 3 段上新增的 `covered 口径` 必然等于 `分数`（分母相同），再配上表下
+// 「NC=0 ⇒ 两列相等」的说明，读者会把「runner 看不见覆盖」读成「不存在未覆盖区域」——与本 PR
+// 「让不诚实的可见性浮出来」的立意相反。故日报必须**逐段**披露 runner 档位。
+//
+// 数据源是 mutation.yml 本身（矩阵是唯一权威，不新增第二份硬编码清单）：
+//   * 解析失败（文件缺失/不可读/不是预期结构）一律**降级为「不标注」**——日报的价值在于即使 CI
+//     拓扑变了也要能发出来，绝不因为读不到 mutation.yml 而崩；
+//   * 解析口径与 scripts/check-mutation-ranges.js 的 include 解析器对齐（include 块边界 + `-` 开头
+//     的条目 + 字符串切片取值，避免 `\s*-?\s*` 这类相邻量词被判超线性 S8786）。
+const COMMAND_RUNNER_CONFIG = 'stryker.config.js'
+const COMMAND_SEGMENT_MARK = '（command 档）'
+
+// yml 标量取值（与 check-mutation-ranges.js 同口径）：引号内的 `#` 属于值、裸标量的 `#` 起行内注释。
+function ymlScalar (raw) {
+  let value = raw
+  const quote = value[0]
+  if (quote === '"' || quote === "'") {
+    // 连续两个相同引号折叠为一个（yml 转义）；未闭合时回退为去掉开引号取全部（防御性）
+    let out = ''
+    for (let i = 1; i < value.length; i++) {
+      const ch = value[i]
+      if (ch !== quote) { out += ch; continue }
+      if (value[i + 1] === quote) { out += quote; i++ } else break
+    }
+    value = out
+  } else {
+    const hash = value.indexOf('#')
+    if (hash !== -1) value = value.slice(0, hash)
+  }
+  return value.trim()
+}
+
+/**
+ * 从 mutation.yml 文本解析 matrix 每段的 `config`（runner 档位）。纯函数、**绝不抛**。
+ * @param {string} ymlText mutation.yml 文本
+ * @returns {Map<string, string>} 段名 → config 文件名；解析不出任何条目时返回空 Map
+ */
+function parseMatrixRunnerConfigs (ymlText) {
+  const map = new Map()
+  if (typeof ymlText !== 'string' || ymlText === '') return map
+  const lines = ymlText.split(/\r?\n/)
+  const includeIdx = lines.findIndex(line => /^\s*include:\s*$/.test(line))
+  if (includeIdx === -1) return map
+  const includeIndent = lines[includeIdx].match(/^\s*/)[0].length
+  let current = null
+  for (const line of lines.slice(includeIdx + 1)) {
+    const indent = line.match(/^\s*/)[0].length
+    if (/^\s*[A-Za-z_][\w-]*:/.test(line) && indent <= includeIndent) break // include 块结束
+    const trimmed = line.trim()
+    let body = trimmed
+    if (trimmed.startsWith('-')) {
+      const rest = trimmed.slice(1).trim()
+      if (rest === '' || rest.startsWith('#')) continue // `- # 注释` 不算新条目
+      current = { name: null, config: null }
+      body = rest
+    }
+    if (!current) continue
+    const colon = body.indexOf(':')
+    if (colon <= 0) continue
+    const key = body.slice(0, colon)
+    if (key !== 'name' && key !== 'config') continue
+    const value = ymlScalar(body.slice(colon + 1).trim())
+    if (!value) continue
+    current[key] = value
+    if (current.name && current.config) {
+      map.set(current.name, current.config)
+      current = null // 一条目只登记一次
+    }
+  }
+  return map
+}
+
+/**
+ * 读取仓库内的 mutation.yml 并解析 runner 档位；**任何失败都降级为空 Map**（不抛、不退出）。
+ * @param {string} [matrixPath] 显式矩阵路径（测试注入用）；缺省为 `<repo>/.github/workflows/mutation.yml`
+ * @returns {Map<string, string>} 段名 → config 文件名（读不到时为空的 Map ⇒ 调用侧不标注）
+ */
+function readMatrixRunnerConfigs (matrixPath) {
+  const resolved = matrixPath || path.join(__dirname, '..', '.github', 'workflows', 'mutation.yml')
+  let text
+  try {
+    text = fs.readFileSync(resolved, 'utf8') // nosemgrep（路径来自 __dirname 常量或测试注入，非不可信输入）
+  } catch (e) {
+    return new Map()
+  }
+  try {
+    return parseMatrixRunnerConfigs(text)
+  } catch (e) {
+    return new Map()
+  }
+}
+
+/**
+ * 段名单元格：command 档段显式标注，其余段原样（不改变任何既有列/数值语义，只加可见性）。
+ * @param {string} seg 段名
+ * @param {string} [runnerConfig] 该段的 config 文件名（来自矩阵；未知时 undefined）
+ * @returns {string} 单元格文本
+ */
+function formatSegmentLabel (seg, runnerConfig) {
+  return runnerConfig === COMMAND_RUNNER_CONFIG ? `${seg}${COMMAND_SEGMENT_MARK}` : String(seg)
+}
+
+/**
+ * 既有 `分数` 列的四舍五入（段行与合计行**共用同一函数**，防止只改一处静默漂移）。
+ * 与 covered 口径不同，分数的分母含 NoCoverage；`total <= 0` 时返回 0（无数据不报 100%，机器人审查）。
+ * @param {{total?: number, killed?: number, timeout?: number}} r 段统计（或计数求和后的合计对象）
+ * @returns {number} 百分比（两位小数）
+ */
+function scoreOf (r) {
+  const total = r && Number.isFinite(r.total) ? r.total : 0
+  if (!(total > 0)) return 0
+  const value = (((r.killed || 0) + (r.timeout || 0)) / total) * 100
+  return Math.round(value * 100) / 100
+}
+
+function analyze (dir, options = {}) {
   // S8707：CLI 参数显式校验（防 LLM/错误参数访问任意路径——先验证存在且是目录）
   let st
   try {
@@ -423,6 +544,8 @@ function analyze (dir) {
     process.exit(1)
   }
   const results = []
+  // runner 档位只读一次（每段共用一个解析结果）；读不到 ⇒ 空 Map ⇒ 全表不标注（见上方 F-2 说明）。
+  const runnerConfigs = readMatrixRunnerConfigs(options.matrixPath)
   let entries
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true }) // NOSONAR:S8707 报告目录处理（根目录已校验，工具合法用途）
@@ -433,7 +556,7 @@ function analyze (dir) {
   }
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith('mutation-report-')) continue
-    results.push(analyzeSegment(dir, entry))
+    results.push(analyzeSegment(dir, entry, runnerConfigs))
   }
   return results
 }
@@ -496,10 +619,12 @@ function findReportJson (dir) {
 }
 
 // 解析单个段的 mutation-report.json（复杂度拆分：analyze 保持线性遍历）
-function analyzeSegment (dir, entry) {
+function analyzeSegment (dir, entry, runnerConfigs) {
   const seg = entry.name.replace('mutation-report-', '')
+  // runner 档位（F-2）：该段在 mutation.yml 矩阵里的 `config`；读不到矩阵时为 undefined（不标注）。
+  const runnerConfig = runnerConfigs && typeof runnerConfigs.get === 'function' ? runnerConfigs.get(seg) : undefined
   const reportPath = findReportJson(path.join(dir, entry.name))
-  if (!reportPath) return { seg, error: '缺 mutation-report.json' }
+  if (!reportPath) return { seg, runnerConfig, error: '缺 mutation-report.json' }
   const stats = { total: 0, killed: 0, survived: 0, noCoverage: 0, timeout: 0, survivedMutants: [] }
   // F4：解析与聚合同处 try 内——报告顶层为 null（JSON 字面量 null）/原始值时显式失败并走段级隔离，
   // 不抛 TypeError 逃出本函数（与上方注释「单段失败不中断整体」一致），也不把损坏报告伪装成
@@ -549,17 +674,18 @@ function analyzeSegment (dir, entry) {
       throw new Error('报告不含任何变异体（files 为空映射或各文件 mutants 均为空）')
     }
   } catch (e) {
-    return { seg, error: `${String(e.message || e)}（报告：${reportPath}）` }
+    return { seg, runnerConfig, error: `${String(e.message || e)}（报告：${reportPath}）` }
   }
-  const score = stats.total > 0 ? ((stats.killed + stats.timeout) / stats.total) * 100 : 0 // 无数据不报 100%（机器人审查）
   return {
     seg,
+    runnerConfig,
     total: stats.total,
     killed: stats.killed,
     survived: stats.survived,
     noCoverage: stats.noCoverage,
     timeout: stats.timeout,
-    score: Math.round(score * 100) / 100,
+    // `分数` 的两位小数四舍五入与合计行共用 scoreOf（防止两处各写一份而静默漂移）。
+    score: scoreOf(stats),
     survivedMutants: stats.survivedMutants,
     // F1：报告文件时间——内容层面无法区分「本次运行」与「缓存回填的陈旧报告」（stryker 的 json
     // report 不含时间戳），新鲜度闸门（validateFreshness）据此比较各段跨度。stat 失败不单列分支：
@@ -633,27 +759,110 @@ function collectStats (results) {
   return { byFile, byKind, allSurvived }
 }
 
+// ===== 双口径：既有「分数」与新增「covered 口径」=================================================
+// 背景：CI 从 command runner 切到 tap-runner（coverageAnalysis:'perTest'）后，报告里会首次出现大量
+// NoCoverage（19 段合计 4017/15302 ≈ 26%）。同一个段在两种口径下回答的是不同问题：
+//   * `分数`（既有列，语义**一字不改**）= (killed + timeout) / total，total **含** NoCoverage
+//     ⇒ 保守口径：把「测试没覆盖到」的变异体留在分母里，反映「含未测区域」的真实风险；
+//   * `covered 口径`（本次**新增**列）= (killed + timeout) / (killed + timeout + survived)
+//     ⇒ 剔除 NoCoverage，只反映「已覆盖部分」的检出能力
+//     （与 .local/tap-baseline-REPORT.md 的 covered 口径逐位一致，便于与基线表对账）。
+// 两列**并列**是为了让读者能区分两种口径——不是替换任何一个列（尤其不是替换 `分数`）。
+//
+// 分母为 0（`killed + timeout + survived === 0`，即整段都是 NoCoverage）时**必须显式占位**：
+// JS 里 0/0 是 NaN（会渲染成 "NaN%"），而「无数据报 0」（score 列对 total === 0 的处理）在这里会把
+// 「整段没有覆盖」误读成「0% 检出」——两者都是误导，故一律显示占位符 `—`。**绝不**产出
+// NaN / Infinity / 0%。
+const NO_COVERAGE_PLACEHOLDER = '—'
+
+// covered 口径的分母（killed + timeout + survived）。独立成函数是为了让「整段 NoCoverage」这一边界
+// 在段行与合计行走**同一条**判定（合计必须按各段计数求和后再算，而不是各段百分比的平均）。
+function coveredDenominator (r) {
+  return (r.killed || 0) + (r.timeout || 0) + (r.survived || 0)
+}
+
+/**
+ * 计算 covered 口径（百分比，保留两位小数）。分母为 0 时返回 null，由 formatCovered 渲染成占位符。
+ * @param {{killed?: number, timeout?: number, survived?: number}} r 段统计（或计数求和后的合计对象）
+ * @returns {number|null} 百分比；口径无法定义（分母为 0）时为 null
+ */
+function coveredScore (r) {
+  const denom = coveredDenominator(r)
+  if (!(denom > 0)) return null
+  const value = ((r.killed || 0) + (r.timeout || 0)) / denom
+  return Math.round(value * 10000) / 100 // 与既有 score 的两位小数口径一致
+}
+
+/**
+ * covered 口径的单元格文案：有定义给 `N%`，分母为 0 给 `—`（见 NO_COVERAGE_PLACEHOLDER 的注释）。
+ * @param {{killed?: number, timeout?: number, survived?: number}} r 段统计
+ * @returns {string} 单元格文本
+ */
+function formatCovered (r) {
+  const value = coveredScore(r)
+  return value === null ? NO_COVERAGE_PLACEHOLDER : `${value}%`
+}
+
+/**
+ * 表下口径说明（双口径 + runner 档位）。
+ *
+ * 为什么必须写在表下、而不只是靠表头两个字：两列只在一部分段上取值不同，读者看到
+ * `分数 7.58%` / `covered 口径 35.58%` 时必须能立刻知道差在哪——差就是同一行里被 covered 口径
+ * 剔出分母的 NoCoverage（`无覆盖` 列）。纯文本、无计算、无 throw。
+ *
+ * 第二段（F-2）逐段披露 runner：command 档段（`coverageAnalysis:'off'`）结构上不产出 NoCoverage，
+ * 其 `无覆盖` 恒为 0 是 runner 语义、不代表已全部覆盖；这些段的 `covered 口径` 必然等于 `分数`，
+ * 与其他段**不同口径**，跨段比较必须排除。段名/计数从 results 的 runnerConfig **推导**（不硬编码
+ * 段名清单）：读不到矩阵时退化为不带段名/计数的通用表述，而不是把这段说明整句吞掉。
+ *
+ * @param {Array<object>} [results] analyzeSegment 的产物（带 runnerConfig 时给出段名与计数）
+ * @returns {string[]} markdown 行
+ */
+function _renderCoveredScopeNote (results) {
+  const usable = (Array.isArray(results) ? results : []).filter(r => r && !r.error)
+  const commandSegs = usable.filter(r => r.runnerConfig === COMMAND_RUNNER_CONFIG).map(r => r.seg)
+  const tapSegs = usable.filter(r => r.runnerConfig && r.runnerConfig !== COMMAND_RUNNER_CONFIG).length
+  const runnerNote = commandSegs.length > 0
+    ? '⚠️ **command 档段的 `无覆盖` 恒为 0 是 runner 语义**（`coverageAnalysis:\'off\'` 结构上不产出 NoCoverage），' +
+      `**不代表已全部覆盖**：本表已逐段标注（${commandSegs.map(s => `\`${s}\``).join('、')}）——` +
+      `这 ${commandSegs.length} 段的 score 与其余 ${tapSegs} 段**不同口径**，**跨段比较必须排除**。`
+    : '⚠️ **command 档段（`coverageAnalysis:\'off\'`）的 `无覆盖` 恒为 0 是 runner 语义，不代表已全部覆盖**：' +
+      '这类段的 `covered 口径` 必然等于 `分数`，与 TAP 档段**不同口径**，**跨段比较必须排除**。'
+  return [
+    '',
+    '> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；' +
+    '`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。' +
+    '`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 **且存活 > 0** 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；' +
+    'NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；' +
+    '整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。',
+    '> ' + runnerNote
+  ]
+}
+
 function _renderSegmentTable (results) {
   // 段汇总表（含合计行）：正常段 + error 段分支
+  // 双口径：`分数`（既有语义一字不改）与 `covered 口径`（新增列，见上方 coveredScore 注释）并列。
   const lines = []
-  lines.push('| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | 复用 |')
-  lines.push('|---|---|---|---|---|---|---|---|')
+  lines.push('| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | covered 口径 | 复用 |')
+  lines.push('|---|---|---|---|---|---|---|---|---|')
   let tTotal = 0
   let tKilled = 0
   let tTimeout = 0
   let tSurvived = 0
+  let tNoCoverage = 0
   let reusedSegs = 0
   for (const r of results) {
     if (r.error) {
-      lines.push(`| ${r.seg} | ❌ ${r.error} | - | - | - | - | - | - |`) // 8 列对齐表头（含 Timeout/复用列）
+      lines.push(`| ${formatSegmentLabel(r.seg, r.runnerConfig)} | ❌ ${r.error} | - | - | - | - | - | - | - |`) // 9 列对齐表头（含 covered 口径/复用列）；段名带 command 档标注
       continue
     }
     tTotal += r.total
     tKilled += r.killed
     tSurvived += r.survived
     tTimeout += r.timeout || 0
+    tNoCoverage += r.noCoverage || 0
     if (r.reuse && r.reuse.mode === REUSE_MODE_PARTIAL) reusedSegs++
-    lines.push(`| ${r.seg} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% | ${formatReuseCell(r.reuse, r.total)} |`)
+    lines.push(`| ${formatSegmentLabel(r.seg, r.runnerConfig)} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% | ${formatCovered(r)} | ${formatReuseCell(r.reuse, r.total)} |`)
   }
   // 口径与段分一致（超时计入已处理）；无数据报 0 而非 100（机器人审查）
   // F6：本脚本只汇总，**不设分数门禁**——分数门禁在 stryker 侧（stryker.config.js 的 thresholds，
@@ -664,8 +873,14 @@ function _renderSegmentTable (results) {
   // 这里**有意**不再加一道：
   // main() 是「先 validateSegments/validateFreshness 再 postIssue」，本脚本 throw 会让不达标时连
   // 日报一起吞掉——而那正是最需要看到分数的时刻。故此处只保留完整性/新鲜度两道 throw。
-  const overall = tTotal > 0 ? Math.round((((tKilled + tTimeout) / tTotal) * 100) * 100) / 100 : 0
-  lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | | **${overall}%** | **${reusedSegs} 段复用** |`)
+  // 合计行的 `分数` 与段行共用 scoreOf（同一四舍五入口径，防两处漂移）。
+  const overall = scoreOf({ total: tTotal, killed: tKilled, timeout: tTimeout })
+  // 合计口径 = 各段**计数求和后**再算，绝不取各段百分比的平均（段大小悬殊时平均会被小段带偏：
+  // 例如 100 变异体 50% 与 10 变异体 100% ⇒ 按计数 54.55%，按平均 75%）。covered 口径同理；
+  // 整批 NoCoverage（分母为 0）时合计的 covered 同样显示 `—`。`无覆盖` 合计列由空白改为给出
+  // NoCoverage 计数汇总——这正是「两列差异」在全批层面的量级。
+  lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | **${tNoCoverage}** | **${overall}%** | **${formatCovered({ killed: tKilled, timeout: tTimeout, survived: tSurvived })}** | **${reusedSegs} 段复用** |`)
+  lines.push(..._renderCoveredScopeNote(results))
   return lines
 }
 
@@ -686,9 +901,10 @@ function _renderSegmentTable (results) {
  *     多出的 2 个正是第 4 行（已不在当前范围）的旧变异体，status 沿用旧值。
  *   * 对照组：删掉 inc.json 后用同一 `--mutate "src.js:1-3"` 全量跑 ⇒ 报告恰好 6 个。
  * 该场景在本仓可达（两条机制叠加，**都不要求「源文件完全没变」**）：① `mutation.yml` 的缓存 key 是
- * `stryker-<段>-<hashFiles(package-lock.json, stryker.config.js, run_mutation.js, matrix.src)>`，而
- * `restore-keys` 是**裸前缀兜底 `stryker-<段>-`** ⇒ 主 key 未命中时（源文件变了、或 package-lock /
- * stryker.config 变了）仍会恢复**最近一条**同前缀缓存，旧 `reports/inc-<段>.json` 照样回到工作树；
+ * `stryker-<段>-cfg-<hashFiles(stryker.config.js, stryker.tap.config.js)>-src-<hashFiles(package-lock.json, run_mutation.js, matrix.src)>`
+ * （**不含 mutate 范围**），而 `restore-keys` 是带**同一配置指纹**的兜底前缀 `stryker-<段>-cfg-<配置指纹>-`
+ * ⇒ 主 key 未命中时（源文件变了、或 package-lock / run_mutation.js / matrix.src 变了）仍会恢复**同档
+ * 配置**的最近一条同前缀缓存，旧 `reports/inc-<段>.json` 照样回到工作树；
  * ② 本仓要求大文件增长时**重拆 matrix 的 mutate 行段**（AGENTS.md）⇒ 旧 inc 里落在新范围之外的变异体
  * 被 sticky 分支原样并入报告。
  *
@@ -1082,6 +1298,18 @@ module.exports = {
   formatReuseCell,
   reuseUnaccountedCount,
   stripAnsi,
+  // 双口径（PR-1 · A2 决策）：既有「分数」与新增「covered 口径」并列
+  coveredDenominator,
+  coveredScore,
+  formatCovered,
+  NO_COVERAGE_PLACEHOLDER,
+  // runner 档位逐段披露（PR-1 · 审查 A2 的 F-2）
+  parseMatrixRunnerConfigs,
+  readMatrixRunnerConfigs,
+  formatSegmentLabel,
+  scoreOf,
+  COMMAND_RUNNER_CONFIG,
+  COMMAND_SEGMENT_MARK,
   REUSE_MODE_FULL,
   REUSE_MODE_PARTIAL,
   REUSE_MODE_UNKNOWN,

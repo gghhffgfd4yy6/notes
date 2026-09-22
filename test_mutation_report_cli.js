@@ -14,6 +14,23 @@ const SCRIPT = path.join(__dirname, 'scripts', 'mutation-report.js')
 // 不再从源码文本正则解析——导出后文本解析既多余又脆弱）
 const REQUIRED_SEGS = require('./scripts/mutation-report.js').EXPECTED_SEGMENTS
 assert.ok(REQUIRED_SEGS.length > 0, '生产脚本 EXPECTED_SEGMENTS 不应为空')
+// F-2：段名单元格的 command 档标注——测试消费生产的标注常量与函数（不自造第二份逻辑），
+// 但「哪些段被标注」用字面断言咬住，不经过 formatSegmentLabel（见场景 3）。
+const { formatSegmentLabel, readMatrixRunnerConfigs, COMMAND_RUNNER_CONFIG, COMMAND_SEGMENT_MARK } = require('./scripts/mutation-report.js')
+const RUNNER_CONFIGS = readMatrixRunnerConfigs()
+assert.ok(RUNNER_CONFIGS.size > 0, '真实 mutation.yml 必须能解析出 runner 档位（否则下面的标注断言退化为恒真）')
+// F-2 靶向：日报必须披露矩阵里 config=stryker.config.js 的那些段。这里**不钉死总量**——矩阵是唯一
+// 权威（逐段披露的设计就是随矩阵自动跟随，例如将来某段从 TAP 挪到 command 时日报无需改代码），
+// 故只断言「PR-1 登记的保留段都在、且 command 档没有覆盖全部段（否则逐段披露失去对照面）」；
+// 场景 3 再逐段断言「stdout 里标注的有无 === 矩阵档位」，把标注机制本身咬住。
+const COMMAND_SEGS = [...RUNNER_CONFIGS.entries()].filter(([, cfg]) => cfg === COMMAND_RUNNER_CONFIG).map(([seg]) => seg).sort((a, b) => a.localeCompare(b))
+for (const must of ['check-deps', 'qinglong-push', 'storage']) {
+  assert.ok(COMMAND_SEGS.includes(must), `${must} 必须仍在 command 档（PR-1 登记：TAP 档下它会被记成 RuntimeError/丢检出），实际 command 档=${COMMAND_SEGS.join('、')}`)
+}
+assert.ok(COMMAND_SEGS.length < REQUIRED_SEGS.length, 'command 档不得覆盖全部段（否则「逐段披露 runner」没有对照面）')
+// 期望行的段名单元格按矩阵档位推导（规则与生产 formatSegmentLabel 相同，但**刻意不复用它**：若标注函数
+// 被改成恒等，复用会让期望与实现在同一处同时退化、断言恒真）。改成本函数恒等 ⇒ 场景 6c 必红（反例已实跑）。
+const labelOf = (seg) => (RUNNER_CONFIGS.get(seg) === COMMAND_RUNNER_CONFIG ? `${seg}${COMMAND_SEGMENT_MARK}` : seg)
 
 function runCli (args, opts = {}) {
   try {
@@ -89,12 +106,23 @@ function schemaReport (seg, mutants) {
     // 断言必须咬住**统计值**：旧断言只查 stdout 含 '变异' 或 '#'，而标题「## 🧬 变异测试日报」
     // 恒含「变异」——统计全部归零、解析彻底失效也照样判绿（并因此把 F2 的缺陷锁成了"正确行为"）。
     const segCount = REQUIRED_SEGS.length
-    assert.ok(r.stdout.includes(`| **合计** | **${segCount * 2}** | **${segCount}** | **0** | **${segCount}** | | **50%** |`),
-      `合计行必须等于夹具统计（${segCount * 2} 变异体 / 各 ${segCount} 被杀与存活 / 50%）：\n${r.stdout}`)
+    // 合计行的 `无覆盖` 列由空白改为给出 NoCoverage 计数汇总（PR-1 双口径），covered 口径列随之在
+    // 分数列右侧出现：本夹具 NoCoverage = 0 ⇒ 两列相等（50%）。
+    assert.ok(r.stdout.includes(`| **合计** | **${segCount * 2}** | **${segCount}** | **0** | **${segCount}** | **0** | **50%** | **50%** |`),
+      `合计行必须等于夹具统计（${segCount * 2} 变异体 / 各 ${segCount} 被杀与存活 / NoCoverage 0 / 两口径均 50%）：\n${r.stdout}`)
     assert.ok(r.stdout.includes(`## 存活变异体（${segCount} 个）`), '应列出存活变异体总数')
     assert.ok(!r.stdout.includes('🎉 无存活变异体'), '夹具含存活变异体，不得走「无存活」分支')
     for (const seg of REQUIRED_SEGS) {
-      assert.ok(r.stdout.includes(`| ${seg} | 2 | 1 | 0 | 1 | 0 | 50% |`), `段 ${seg} 的统计行应正确，实际输出缺该行`)
+      // 段行也一并咬住新列（含末尾的复用列：无 reuse.json ⇒ 未记录）；段名单元格按 mutation.yml 的
+      // 真实 runner 档位渲染（F-2：command 档段带「（command 档）」标注，TAP 档段不带）——用生产的
+      // formatSegmentLabel，避免测试自造一份标注逻辑而与实现漂移。
+      const label = formatSegmentLabel(seg, RUNNER_CONFIGS.get(seg))
+      assert.ok(r.stdout.includes(`| ${label} | 2 | 1 | 0 | 1 | 0 | 50% | 50% | 未记录 |`), `段 ${seg}（${label}）的统计行应正确，实际输出缺该行`)
+      // 标注的**存在/缺失**必须与矩阵档位一致——这一断言不经过 formatSegmentLabel（否则「标注函数被
+      // 改成恒等」时两边同时退化，断言恒真）。它直接咬住 CLI stdout 里的字面段名单元格。
+      const annotated = r.stdout.includes(`| ${seg}${COMMAND_SEGMENT_MARK} |`)
+      assert.strictEqual(annotated, RUNNER_CONFIGS.get(seg) === COMMAND_RUNNER_CONFIG,
+        `${seg} 的 command 档标注必须与 mutation.yml 的 config 一致（实际标注=${annotated}，config=${RUNNER_CONFIGS.get(seg)}）`)
     }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
@@ -170,9 +198,110 @@ function schemaReport (seg, mutants) {
     const r = runCli([tmp])
     assert.strictEqual(r.code, 0, `含 RuntimeError 的合法报告必须照常发布，stderr: ${r.stderr}`)
     const segCount = REQUIRED_SEGS.length
-    assert.ok(r.stdout.includes(`| **合计** | **${segCount * 2}** | **${segCount}** | **0** | **0** | | **50%** |`),
-      `RuntimeError 应计入 total（${segCount * 2} 个、仅 ${segCount} 个被杀、50%）：\n${r.stdout}`)
+    // PR-1 双口径的一个**非 NoCoverage** 差异来源：RuntimeError 计入 total（分数口径分母）但**不在**
+    // covered 口径的分母（killed+timeout+survived）里 ⇒ 即使 NoCoverage = 0，两列也会不同
+    // （此处 50% vs 100%）。这是所给公式的直接推论，故意在此锁死，防止后人以为「NoCoverage=0 ⇒ 必定相等」。
+    assert.ok(r.stdout.includes(`| **合计** | **${segCount * 2}** | **${segCount}** | **0** | **0** | **0** | **50%** | **100%** |`),
+      `RuntimeError 应计入 total（${segCount * 2} 个、仅 ${segCount} 个被杀、分数 50%）；covered 口径因不含 RuntimeError 为 100%：\n${r.stdout}`)
     assert.ok(r.stdout.includes('🎉 无存活变异体'), '该夹具无存活变异体，应走 🎉 分支')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 场景 6b（PR-1 · 日报双口径）：**端到端**证明新列真的出现在子进程 stdout 里——
+// 「真 mutation.json → analyzeSegment → render → stdout」整条链，而不是直接构造 render 入参。
+// 两段刻意各占一个边界，且**都取 TAP 档段**（`config !== stryker.config.js`）：
+//   * 语义要求：command 档段结构上不产出 NoCoverage（`coverageAnalysis:'off'`），一个 command 档段
+//     的 covered 口径 **必然等于** 分数——本用例注入 NoCoverage 去验证「两列不同」，只有放在 TAP 档
+//     段名上才自洽。历史上本用例取 `REQUIRED_SEGS[0]`（恰好是回退到 command 档的 `v3-entry`），
+//     一旦该段换档，夹具就在宣称「一个 command 档段有 NoCoverage」，与日报自己披露的语义矛盾；
+//     故改为**从 RUNNER_CONFIGS 推导 TAP 档段名**（任一段换档都不需要改测试）。
+//   * ncSeg：1 Killed + 2 Survived + 2 NoCoverage ⇒ 分数 = 1/5 = 20%（含 NoCoverage），
+//     covered = 1/(1+0+2) = 33.33%（剔除 NoCoverage）⇒ 两列必须不同且 covered > 分数；
+//   * allNcSeg：整段 1 个 NoCoverage（killed+timeout+survived === 0）⇒ covered 分母为 0，
+//     必须显示占位符 `—`，不得是 NaN / Infinity / 0%。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-dualscope-'))
+  try {
+    const tapSegs = REQUIRED_SEGS.filter(seg => RUNNER_CONFIGS.get(seg) && RUNNER_CONFIGS.get(seg) !== COMMAND_RUNNER_CONFIG)
+    assert.ok(tapSegs.length >= 2, `矩阵必须至少有两段 TAP 档（实际 ${tapSegs.length} 段），否则本用例的双口径边界取不到自洽的段名`)
+    const ncSeg = tapSegs[0]
+    const allNcSeg = tapSegs[1]
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      let mutants = [
+        mutantOf({ id: '0' }),
+        mutantOf({ id: '1', mutatorName: 'BooleanLiteral', replacement: 'false', status: 'Survived', location: { start: { line: 7, column: 1 }, end: { line: 7, column: 2 } } }),
+        mutantOf({ id: '2', mutatorName: 'StringLiteral', replacement: '"x"', status: 'Survived', location: { start: { line: 9, column: 1 }, end: { line: 9, column: 2 } } })
+      ]
+      if (seg === ncSeg) {
+        mutants = mutants.concat([
+          mutantOf({ id: '3', mutatorName: 'ArrayLiteral', replacement: '[]', status: 'NoCoverage', location: { start: { line: 11, column: 1 }, end: { line: 11, column: 2 } } }),
+          mutantOf({ id: '4', mutatorName: 'ObjectLiteral', replacement: '{}', status: 'NoCoverage', location: { start: { line: 13, column: 1 }, end: { line: 13, column: 2 } } })
+        ])
+      }
+      if (seg === allNcSeg) {
+        mutants = [mutantOf({ id: '0', mutatorName: 'ArrayLiteral', replacement: '[]', status: 'NoCoverage', location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } } })]
+      }
+      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify(schemaReport(seg, mutants)))
+    }
+    const r = runCli([tmp])
+    assert.strictEqual(r.code, 0, `含 NoCoverage 的合法报告应照常发布，stderr: ${r.stderr}`)
+    assert.ok(r.stdout.includes('| 分数 | covered 口径 |'), '表头必须同时列出两个口径列（新增而非替换）')
+    // 期望行的段名单元格走模块级 `labelOf`（按矩阵档位推导）：段名来自真实 mutation.yml（REQUIRED_SEGS），
+    // 而段名单元格由 runner 档位决定（command 档 ⇒ `v3-entry（command 档）`）⇒ 写死 `| ${seg} |` 会在任一段
+    // 换档时失配（实测：`v3-entry` 回退 command 后本行 received undefined）。
+    const lineOf = (seg) => r.stdout.split('\n').find(l => l.startsWith(`| ${labelOf(seg)} |`))
+    // ncSeg 行（末尾复用列为「未记录」：夹具没有 reuse.json）
+    assert.strictEqual(lineOf(ncSeg), `| ${labelOf(ncSeg)} | 5 | 1 | 0 | 2 | 2 | 20% | 33.33% | 未记录 |`,
+      `NoCoverage>0 的段必须同排给出两个口径与 NoCoverage 计数：\n${r.stdout}`)
+    // 整段 NoCoverage 行：covered 列是占位符（分数列仍是既有的 0%，语义不改）
+    assert.strictEqual(lineOf(allNcSeg), `| ${labelOf(allNcSeg)} | 1 | 0 | 0 | 0 | 1 | 0% | — | 未记录 |`,
+      `分母为 0 时 covered 列必须是占位符：\n${r.stdout}`)
+    const table = r.stdout.split('\n').filter(l => l.startsWith('|')).join('\n')
+    assert.ok(!/NaN|Infinity/.test(table), `表格里不得出现 NaN / Infinity：\n${table}`)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 场景 6c（F-2 · command 档语义）：日报对 command 档段（`coverageAnalysis:'off'`，**结构上不产出
+// NoCoverage**）的披露必须在 CLI 端到端链路上自洽——段名带 `（command 档）` 标注，且该段的 `covered 口径`
+// 与 `分数` **相等**（它的报告里没有 NoCoverage 可剔除）。这正是表下说明那句「command 档段的 `无覆盖`
+// 恒为 0 … `covered 口径` 必然等于 `分数`」的承诺。与场景 6b 的 TAP 档边界**分开成条**：把这两种口径
+// 塞进同一个用例会让「两列不同」与「两列相等」互相掩盖（段名同样从矩阵推导，随换档自动跟随）。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-cmdscope-'))
+  try {
+    const cmdSegs = REQUIRED_SEGS.filter(seg => RUNNER_CONFIGS.get(seg) === COMMAND_RUNNER_CONFIG)
+    assert.ok(cmdSegs.length > 0, '矩阵必须至少有一段 command 档，否则本用例失去对象')
+    const cmdSeg = cmdSegs[0]
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      // command 档段的真实报告形态：只有 Killed / Survived（无 NoCoverage 状态）
+      const mutants = seg === cmdSeg
+        ? [
+            mutantOf({ id: '0' }),
+            mutantOf({ id: '1', mutatorName: 'StringLiteral', replacement: '"x"', status: 'Killed', location: { start: { line: 3, column: 1 }, end: { line: 3, column: 2 } } }),
+            mutantOf({ id: '2', mutatorName: 'BooleanLiteral', replacement: 'false', status: 'Survived', location: { start: { line: 5, column: 1 }, end: { line: 5, column: 2 } } }),
+            mutantOf({ id: '3', mutatorName: 'ArrayLiteral', replacement: '[]', status: 'Survived', location: { start: { line: 7, column: 1 }, end: { line: 7, column: 2 } } }),
+            mutantOf({ id: '4', mutatorName: 'ObjectLiteral', replacement: '{}', status: 'Survived', location: { start: { line: 9, column: 1 }, end: { line: 9, column: 2 } } })
+          ]
+        : [mutantOf({ id: '0' })]
+      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify(schemaReport(seg, mutants)))
+    }
+    const r = runCli([tmp])
+    assert.strictEqual(r.code, 0, `合法报告应照常发布，stderr: ${r.stderr}`)
+    const line = r.stdout.split('\n').find(l => l.startsWith(`| ${labelOf(cmdSeg)} |`))
+    assert.ok(line, `${cmdSeg} 是 command 档，段名必须带「${COMMAND_SEGMENT_MARK}」标注：\n${r.stdout}`)
+    const cells = line.split('|').slice(1, -1).map(s => s.trim())
+    assert.strictEqual(cells[0], labelOf(cmdSeg), '段名单元格必须带 command 档标注')
+    assert.strictEqual(cells[5], '0', 'command 档段的 NoCoverage 必须为 0（runner 结构上不产出该状态）')
+    assert.strictEqual(cells[6], '40%', '分数 = (2 被杀 + 0 超时) / 5')
+    assert.strictEqual(cells[7], cells[6], 'command 档段无 NoCoverage ⇒ covered 口径必须恒等于分数（表下说明的承诺）')
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }

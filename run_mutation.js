@@ -268,6 +268,9 @@ function copyProject (dir, files) {
   //   - package.json（版本一致性用例读取）
   //   - CHANGELOG.md（test_filter.js 的“文件头版本 ↔ CHANGELOG 最新”用例会 readFileSync 它）
   //   - check-version.js（test_check_version.js 顶层 require 它）
+  //   - stryker.config.js / stryker.tap.config.js（test_ci_skip_suites.js 的矩阵 config 断言会读它们：
+  //     断言每个 config: 指向的文件真实存在且可解析 —— 漏拷即沙箱内该套件红，进而令本套件的
+  //     「沙箱内单元测试应整体通过」断言失败，与 #143 补 check-version.js 同类根因）
   //   - scripts/ 与 qinglong/ 目录（部分测试依赖）
   // 此前只复制 test_filter.js 但运行 run_unit_tests.js，导致临时目录 MODULE_NOT_FOUND，
   // evaluate 恒返回 fail，行为断言无法建立（#15 根因）。
@@ -278,7 +281,7 @@ function copyProject (dir, files) {
   const entries = fs.readdirSync(ROOT)
   const testFiles = entries.filter(f => /^test_.*\.js$/.test(f))
   const srcFiles = entries.filter(f => /^xbk_.*\.js$/.test(f))
-  const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md', 'check-version.js']
+  const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md', 'check-version.js', 'stryker.config.js', 'stryker.tap.config.js']
   // 固定清单（extraTop + 调用方传入的 files + DEFAULT_FILES）属必选：缺失须响亮报错，不能静默 continue——
   // 漏拷文件会留下沙箱 MODULE_NOT_FOUND/ENOENT → evaluate 恒 fail 的不响亮回归（#120/#122 一类根因）。
   // DEFAULT_FILES 在此无条件纳入（D3）：main() 已不再 existsSync 预过滤，缺任一变异目标源文件时由本处响亮报错。

@@ -872,9 +872,9 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   }
   const stepEndAfter = (at, nameLen) => stepEndIn(mutationYml, at, nameLen)
 
-  // (1)「恢复增量缓存」：key 与 restore-keys 必须是**回退后**的形态——key 不含测试指纹段、兜底是裸的
-  //     stryker-<段>-（回到 PR #156 之前）。抽成函数是为了让紧随其后的反例在**同一套提取 + 断言代码**上
-  //     跑真实 workflow 的变异副本：把 key 改回含测试指纹的形态 ⇒ 必须立刻红。
+  // (1)「恢复增量缓存」：key 与 restore-keys 必须是**回退后 + 带档位**的形态——不含测试指纹段，
+  //     而是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>`（PR-1 起）。抽成函数是为了让紧随其后的
+  //     反例在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本：把 key 改回含测试指纹的形态 ⇒ 必须立刻红。
   const assertCacheStep = (ymlText) => {
     const cacheAt = ymlText.indexOf('- name: 恢复增量缓存')
     assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（缓存策略无从核对即视为回归）')
@@ -883,15 +883,24 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
     const cacheLines = yamlOnly(ymlText.slice(cacheAt, cacheEnd))
     const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
     assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
-    // key 必须逐字等于**回退后**的形态：stryker-<段>-<src 指纹>（源指纹固定用 matrix.src：mutate 里的范围
-    // 字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，会得到空指纹、使 range 段缓存永不过期）。
+    // key 必须逐字等于**档位名 + 配置指纹 + 源指纹**三段形态：
+    //   stryker-<段>-cfg-<matrix.config 档位>-<两份 stryker 配置 + scripts/tap-shim.js 指纹>-src-<源指纹>。
+    // 源指纹固定用 matrix.src：mutate 里的范围字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，
+    // 会得到空指纹、使 range 段缓存永不过期。
+    // 配置指纹（stryker.config.js + stryker.tap.config.js + scripts/tap-shim.js）与**档位名 `matrix.config`** 都必须同时出现在
+    // key 与兜底前缀里：主 key 未命中时 core 会对恢复进来的 inc **零校验**，兜底前缀若不含配置指纹就会把
+    // 另一档 runner 的旧 inc 当本轮结果复用（qodo High / sourcery 评审发现，实测 http 段 6/133 复用、
+    // NC 13→7）；而**两份配置的 hashFiles 对 19 段是同一个常量**（档位只体现在各段的 `config:` 字段上），
+    // 故只放配置指纹还不够——某段只改 `config:` 而不动配置文件时 key 与兜底前缀会逐字节不变、跨档继承
+    // 从主 key 与兜底两条路径一起复活（审查 A1·D2）。档位名进 key/兜底后，`config:` 一变即换缓存身份。
     const open = '${'
     assert.strictEqual(keyLine.trim(),
-      'key: stryker-' + open + '{ matrix.name }}-' + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}",
-      '缓存 key 必须是**回退后**的形态 stryker-<段>-<src 指纹>（不含 -tests- 测试指纹段）：PR #156 的' +
-      '「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发串扰，基线全程是绿的）、' +
-      '跑不完（app/utils/message-store 真全量在 --concurrency 8 下仍需 ~7h/~6.5h/~4.5h，必撞 step 330min，' +
-      '而失败段不保存缓存进度 ⇒ 永久红），且当前**无分数门禁** ⇒ 复用不构成门禁风险（有意接受的取舍）')
+      'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + "{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-src-" + open + "{ hashFiles('package-lock.json', 'run_mutation.js', matrix.src) }}",
+      '缓存 key 必须逐字等于 stryker-<段>-cfg-<档位 matrix.config>-<配置指纹 = 两份 stryker 配置 + scripts/tap-shim.js>-src-<源指纹>（不含 -tests- ' +
+      '测试指纹段）：PR #156 的「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发' +
+      '串扰，基线全程是绿的）、跑不完（app/utils/message-store 真全量在 --concurrency 8 下仍需 ~7h/~6.5h/' +
+      '~4.5h，必撞 step 330min，而失败段不保存缓存进度 ⇒ 永久红），且当前**无分数门禁** ⇒ 复用不构成门禁' +
+      '风险（有意接受的取舍）')
     assert.ok(!keyLine.includes('-tests-') && !keyLine.includes('test_*.js'),
       '缓存 key 不得再含测试指纹（`-tests-` / `test_*.js`）：一旦改回含指纹形态，本条断言立即红')
     const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
@@ -902,34 +911,174 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
       if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
       restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
     }
-    assert.deepStrictEqual(restoreKeys, ['stryker-' + '${' + '{ matrix.name }}-'],
-      'restore-keys 必须是**回退后**的裸兜底前缀 `stryker-' + '${' + '{ matrix.name }}-`（回到 PR #156 之前）：' +
-      '旧形态把测试指纹写进兜底前缀（限在同一测试指纹内兜底），随本次回退一并撤销')
+    assert.deepStrictEqual(restoreKeys, ['stryker-' + '${' + '{ matrix.name }}-cfg-' + '${' + '{ matrix.config }}-' + '${' + "{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-"],
+      'restore-keys 必须是**带档位名 + 配置指纹**（含 scripts/tap-shim.js）的兜底前缀 `stryker-' + '${' + '{ matrix.name }}-cfg-<matrix.config 档位>-<配置指纹>-`：' +
+      '同档配置内可跨 src 变更兜底复用；跨档（runner / tap.testFiles / coverageAnalysis 变化，或只改某段的 ' +
+      'config:）不再互相继承——档位名与配置指纹都在前缀里，任一变化前缀即变；不含测试指纹（PR #156 那版已回退）')
   }
   assertCacheStep(mutationYml)
 
-  // (1 反例·靶向) 把 key/restore-keys 改回 PR #156 的含测试指纹形态 ⇒ 同一套提取 + 断言必须红。
-  // 这条反例是「断言方向真正反转了」的证据：若只把断言改宽（例如只断言「key 存在」），反例不会红。
+  // (1b) **档位名必须参与缓存身份**（审查 A1·D2）：key 与兜底前缀里都要有 `${{ matrix.config }}`。
+  //      为什么单靠「配置指纹」不够：两份配置文件的 hashFiles 对 19 段是**同一个常量**（实测 19 条 key 里
+  //      cfg 取值只有 1 个），档位只由各段自己的 `config:` 字段体现。于是「某段只改 `config:`、不动任何配置
+  //      文件」时 key 与兜底前缀**逐字节不变** ⇒ 该段仍会命中/恢复**旧档**的 inc（core 对 inc 零校验），
+  //      「跨档不再互相继承」被绕过。把档位名放进 key 与兜底后，`config:` 一变即换缓存身份。
+  //      抽成独立函数（而不是塞进 assertCacheStep）：assertCacheStep 的首条断言是 key 的逐字 strictEqual，
+  //      任何 key 变异都会先在那里红，这里的两个方向就永远走不到；独立后两条反例各由本函数自己拦截。
+  const assertCacheConfigIdentity = (ymlText) => {
+    const cacheAt = ymlText.indexOf('- name: 恢复增量缓存')
+    assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（档位缓存身份无从核对即视为回归）')
+    const cacheEnd = ymlText.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
+    assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
+    const cacheLines = yamlOnly(ymlText.slice(cacheAt, cacheEnd))
+    const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
+    const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
+    assert.ok(keyLine && restoreIdx >= 0, '「恢复增量缓存」必须同时声明 key 与 restore-keys')
+    assert.match(keyLine, /-cfg-\$\{\{\s*matrix\.config\s*\}\}-\$\{\{\s*hashFiles\(/,
+      '缓存 key 的档位段必须是 `-cfg-$' + '{' + '{ matrix.config }}-$' + '{' + '{ hashFiles(…`：配置指纹对 19 段' +
+      '是同一个常量，档位只由 matrix.config 体现；缺了它，只改某段的 config: 而**不动任何配置文件**时 key ' +
+      '逐字节不变 ⇒ 该段仍命中旧档 inc，跨档继承从主 key 路径复活（A1·D2）')
+    assert.match(keyLine, /hashFiles\('stryker\.config\.js', 'stryker\.tap\.config\.js', 'scripts\/tap-shim\.js'\)/,
+      '缓存 key 的配置指纹必须含 `scripts/tap-shim.js`（A6）：TAP 档的**覆盖归因结果**由 tap-shim 决定' +
+      '（stryker.tap.config.js 的 `tap.nodeArgs` 预加载它），只改 shim 而不动配置文件时旧 inc（按旧归因算出的' +
+      'killed/survived）会被当成新结果复用 ⇒ shim 必须与两份 stryker 配置在同一段 hashFiles 里')
+    const restoreIndent = indentOf(cacheLines[restoreIdx])
+    const restoreKeys = []
+    for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
+      if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
+      restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
+    }
+    assert.strictEqual(restoreKeys.length, 1,
+      '「恢复增量缓存」的 restore-keys 应恰有一条兜底前缀（多/少都视为缓存策略漂移）')
+    assert.match(restoreKeys[0], /-cfg-\$\{\{\s*matrix\.config\s*\}\}-\$\{\{\s*hashFiles\(/,
+      '兜底前缀的档位段必须是 `-cfg-$' + '{' + '{ matrix.config }}-$' + '{' + '{ hashFiles(…`：主 key 未命中时' +
+      '由兜底恢复 inc，只把档位名加进 key 不够——缺了它，只改 config: 时兜底前缀也逐字节不变 ⇒ 跨档继承从' +
+      '兜底路径复活（A1·D2）')
+    assert.match(restoreKeys[0], /hashFiles\('stryker\.config\.js', 'stryker\.tap\.config\.js', 'scripts\/tap-shim\.js'\)/,
+      '兜底前缀的配置指纹必须含 `scripts/tap-shim.js`（A6）：主 key 未命中时由兜底恢复 inc，只把 shim 加进 key' +
+      '不够——缺了它，shim 变更后兜底仍会把按旧归因算出的 inc 恢复进来复用')
+  }
+  assertCacheConfigIdentity(mutationYml)
+
+  // (1b 反例·正交两变体) 分别把 key / 兜底里的档位段去掉（只去 `${{ matrix.config }}-`，保留 `-cfg-` 与
+  //     配置指纹）⇒ assertCacheConfigIdentity 必须红。两个变体各自只动一行，且带「夹具真的改到了目标行」的前置断言。
   {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-fingerprint-'))
-    try {
-      const fixture = path.join(dir, 'mutation.yml')
-      const open = '${'
-      const fingerprintKey = 'key: stryker-' + open + '{ matrix.name }}-tests-' + open + "{ hashFiles('test_*.js') }}-src-" + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}"
-      const fingerprintRestore = 'stryker-' + open + '{ matrix.name }}-tests-' + open + "{ hashFiles('test_*.js') }}-"
-      const reverted = mutationYml
-        .replace(/^([ \t]*)key: stryker-\$\{\{ matrix\.name \}\}-.*$/m, (m, ind) => ind + fingerprintKey)
-        .replace(/^([ \t]*)stryker-\$\{\{ matrix\.name \}\}-$/m, (m, ind) => ind + fingerprintRestore)
-      assert.notStrictEqual(reverted, mutationYml,
-        '反例夹具必须真的把 key 改成了含测试指纹的形态（没改成本回归形同虚设）')
-      assert.ok(/-tests-/.test(reverted) && reverted !== mutationYml,
-        '夹具中 key 必须带 -tests- 段（否则反例证明的不是「改回指纹形态会红」）')
-      fs.writeFileSync(fixture, reverted)
-      assert.throws(() => assertCacheStep(fs.readFileSync(fixture, 'utf8')),
-        /回退后/,
-        '把缓存 key 改回含测试指纹的形态后必须红：断言锁定的就是「回退后」这一形态')
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true })
+    const cfgSeg = '${' + '{ matrix.config }}-'
+    // 变体 C：只去掉 key 里的档位段 ⇒ 「缓存 key 的档位段必须…」必须红
+    {
+      const keyOnly = mutationYml.replace(/^([ \t]*)key: (stryker-\$\{\{ matrix\.name \}\}-cfg-)\$\{\{ matrix\.config \}\}-/m, '$1key: $2')
+      assert.notStrictEqual(keyOnly, mutationYml,
+        '变体 C 夹具必须真的从 key 行去掉了档位段（没改成本回归形同虚设）')
+      const keyLineC = keyOnly.split('\n').find(l => /^[ \t]*key:\s/.test(l))
+      assert.ok(keyLineC && !keyLineC.includes(cfgSeg) && keyLineC.includes('-cfg-$' + '{' + '{ hashFiles('),
+        '变体 C 夹具中 key 行应已无档位段、但仍保留 -cfg- 与配置指纹（否则反例证明的不是「档位名被锁」）')
+      const restoreLineC = keyOnly.split('\n').find(l => /^[ \t]*stryker-\$\{\{ matrix\.name \}\}-cfg-/.test(l))
+      assert.ok(restoreLineC && restoreLineC.includes(cfgSeg),
+        '变体 C 夹具不得改动兜底前缀（否则它就不是「只动 key」的正交变体）')
+      assert.throws(() => assertCacheConfigIdentity(keyOnly), /缓存 key 的档位段必须是/,
+        '只从缓存 key 里去掉 matrix.config 档位段后必须红：否则只改 config: 时 key 逐字节不变、跨档继承复活')
+    }
+    // 变体 D：只去掉兜底前缀里的档位段 ⇒ 「兜底前缀的档位段必须…」必须红
+    {
+      const restoreOnly = mutationYml.replace(/^([ \t]*)(stryker-\$\{\{ matrix\.name \}\}-cfg-)\$\{\{ matrix\.config \}\}-/m, '$1$2')
+      assert.notStrictEqual(restoreOnly, mutationYml,
+        '变体 D 夹具必须真的从兜底前缀去掉了档位段（没改成本回归形同虚设）')
+      const restoreLineD = restoreOnly.split('\n').find(l => /^[ \t]*stryker-\$\{\{ matrix\.name \}\}-cfg-/.test(l))
+      assert.ok(restoreLineD && !restoreLineD.includes(cfgSeg) && restoreLineD.includes('-cfg-$' + '{' + '{ hashFiles('),
+        '变体 D 夹具中兜底前缀应已无档位段、但仍保留 -cfg- 与配置指纹')
+      const keyLineD = restoreOnly.split('\n').find(l => /^[ \t]*key:\s/.test(l))
+      assert.ok(keyLineD && keyLineD.includes(cfgSeg),
+        '变体 D 夹具不得改动 key 行（否则它就不是「只动兜底」的正交变体）')
+      assert.throws(() => assertCacheConfigIdentity(restoreOnly), /兜底前缀的档位段必须是/,
+        '只从兜底前缀里去掉 matrix.config 档位段后必须红：兜底路径同样会恢复另一档的 inc，只锁 key 不够')
+    }
+    // 变体 E：只去掉 key 指纹里的 `scripts/tap-shim.js` ⇒ 「缓存 key 的配置指纹必须含…」必须红
+    {
+      const SHIM = ", 'scripts/tap-shim.js'"
+      const lines = mutationYml.split('\n')
+      const ki = lines.findIndex(l => /^[ \t]*key: stryker-\$\{\{ matrix\.name \}\}-cfg-/.test(l))
+      assert.ok(ki >= 0, '变体 E 必须能在真实 mutation.yml 里定位到 key 行')
+      const keyNoShim = lines[ki].replace(SHIM, '')
+      assert.notStrictEqual(keyNoShim, lines[ki], '变体 E 夹具必须真的从 key 指纹里删掉了 scripts/tap-shim.js')
+      const linesE = lines.slice()
+      linesE[ki] = keyNoShim
+      const ymlE = linesE.join('\n')
+      assert.ok(ymlE.includes('scripts/tap-shim.js'), '变体 E 只动 key 行，兜底指纹仍应保留 shim（保证正交）')
+      assert.throws(() => assertCacheConfigIdentity(ymlE), /缓存 key 的配置指纹必须含/,
+        '只把 scripts/tap-shim.js 从 key 指纹里删掉后必须红：否则 shim 变更不会让缓存失效、旧覆盖归因被复用')
+    }
+    // 变体 F：只去掉兜底指纹里的 `scripts/tap-shim.js` ⇒ 「兜底前缀的配置指纹必须含…」必须红
+    {
+      const SHIM = ", 'scripts/tap-shim.js'"
+      const lines = mutationYml.split('\n')
+      const ri = lines.findIndex(l => /^[ \t]*stryker-\$\{\{ matrix\.name \}\}-cfg-.*hashFiles\(/.test(l))
+      assert.ok(ri >= 0, '变体 F 必须能在真实 mutation.yml 里定位到兜底前缀行')
+      const restoreNoShim = lines[ri].replace(SHIM, '')
+      assert.notStrictEqual(restoreNoShim, lines[ri], '变体 F 夹具必须真的从兜底指纹里删掉了 scripts/tap-shim.js')
+      const linesF = lines.slice()
+      linesF[ri] = restoreNoShim
+      const ymlF = linesF.join('\n')
+      assert.ok(ymlF.includes('scripts/tap-shim.js'), '变体 F 只动兜底行，key 指纹仍应保留 shim（保证正交）')
+      assert.throws(() => assertCacheConfigIdentity(ymlF), /兜底前缀的配置指纹必须含/,
+        '只把 scripts/tap-shim.js 从兜底指纹里删掉后必须红：主 key 未命中时兜底仍会恢复按旧归因算出的 inc')
+    }
+  }
+
+  // (1 反例·靶向) 拆成**两个正交变体**，各自只动一个目标行。为什么必须拆：旧夹具用一条
+  //     `/^([ \t]*)key: stryker-${{ matrix.name }}-.*$/m` 把 key 整行改写成 `-tests-` 形态（`-cfg-`
+  //     连同配置指纹一起被删掉），于是紧随其后那条 `^[ \t]*stryker-${{ matrix.name }}-cfg-.*$` 的兜底替换
+  //     **匹配不到**、夹具里兜底仍是原样；而 `assert.throws(…, /不含 -tests-/)` 靠 key 半边照样通过
+  //     ⇒ 那条反例只证明了 key 被锁、**没有**证明兜底被锁（兜底实际由正向 deepStrictEqual 兜住，
+  //     但「反例覆盖两个方向」这件事此前是假的）。拆开后每个变体都带「夹具真的改到了目标行」的前置断言。
+  {
+    const open = '${'
+    // 变体 A：**只**把 key 改回 PR #156 的含测试指纹形态 ⇒ key 断言必须红（兜底保持原样，保证正交）
+    {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-key-'))
+      try {
+        const fixture = path.join(dir, 'mutation.yml')
+        const fingerprintKey = 'key: stryker-' + open + '{ matrix.name }}-tests-' + open + "{ hashFiles('test_*.js') }}-src-" + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}"
+        const keyRegressed = mutationYml.replace(/^([ \t]*)key: stryker-\$\{\{ matrix\.name \}\}-.*$/m, (m, ind) => ind + fingerprintKey)
+        assert.notStrictEqual(keyRegressed, mutationYml,
+          '变体 A 夹具必须真的把 key 改成了含测试指纹的形态（没改成本回归形同虚设）')
+        const keyLineA = keyRegressed.split('\n').find(l => /^[ \t]*key:\s/.test(l))
+        assert.ok(keyLineA && keyLineA.includes('-tests-'),
+          '变体 A 夹具中 key 行必须带 -tests- 段（否则反例证明的不是「改回指纹形态会红」）')
+        const restoreLineA = keyRegressed.split('\n').find(l => /^[ \t]*stryker-\$\{\{ matrix\.name \}\}-cfg-/.test(l))
+        assert.ok(restoreLineA,
+          '变体 A 夹具不得改动兜底前缀（否则它就不是「只动 key」的正交变体，也就证明不了 key 半边被锁）')
+        fs.writeFileSync(fixture, keyRegressed)
+        assert.throws(() => assertCacheStep(fs.readFileSync(fixture, 'utf8')),
+          /不含 -tests-/,
+          '只把缓存 key 改回含测试指纹的形态后必须红：断言锁定的就是「key 不含测试指纹」这一形态')
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+    // 变体 B：**只**把兜底前缀退回裸 `stryker-<段>-` ⇒ 兜底 deepStrictEqual 必须红。
+    //           key 行保持不动 ⇒ 不可能再靠 key 半边的 `-tests-` 文案蒙混过关，这条反例只可能由兜底断言来红。
+    {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-restore-'))
+      try {
+        const fixture = path.join(dir, 'mutation.yml')
+        const bareRestore = 'stryker-' + open + '{ matrix.name }}-'
+        const restoreRegressed = mutationYml.replace(/^([ \t]*)stryker-\$\{\{ matrix\.name \}\}-cfg-.*$/m, (m, ind) => ind + bareRestore)
+        assert.notStrictEqual(restoreRegressed, mutationYml,
+          '变体 B 夹具必须真的把兜底前缀退回了裸前缀形态（没改成本回归形同虚设）')
+        const restoreLineB = restoreRegressed.split('\n').find(l => /^[ \t]*stryker-\$\{\{ matrix\.name \}\}-$/.test(l))
+        assert.ok(restoreLineB,
+          '变体 B 夹具中兜底前缀应是裸的 `stryker-$' + '{' + '{ matrix.name }}-`（否则反例证明的不是「兜底被锁」）')
+        const keyLineB = restoreRegressed.split('\n').find(l => /^[ \t]*key:\s/.test(l))
+        assert.ok(keyLineB && !keyLineB.includes('-tests-'),
+          '变体 B 夹具不得改动 key 行（否则 assert.throws 可能命中 key 的 `不含 -tests-` 文案，反例就不再证明兜底被锁）')
+        fs.writeFileSync(fixture, restoreRegressed)
+        assert.throws(() => assertCacheStep(fs.readFileSync(fixture, 'utf8')),
+          /restore-keys 必须是/,
+          '只把兜底前缀退回裸 `stryker-<段>-` 后必须红：裸前缀会让 TAP 段恢复 command 档遗留 inc（core 对 inc ' +
+          '零校验），而旧反例完全看不见这一方向——它把 key 一起改掉后，兜底替换根本匹配不到')
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
     }
   }
 
@@ -1014,6 +1163,234 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   }
 }
 console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（不含测试指纹；靶向反例已锁），剥离不含 inc，artifact 收窄为 reports/mutation/ 且 fail-loud')
+
+// 3i PR-1（CI 切 TAP 档）接线契约：报告路径 + 矩阵逐段 runner 档位。
+// 为什么必须锁死（不是形式主义）：tap 配置把报告路径**显式**写成 stryker 默认值（stryker.tap.config.js 的
+// jsonReporter/htmlReporter），而「报告 = reports/mutation/mutation.json|.html」是**五处**的共同前提——
+// mutation.yml 的 fail-closed 守卫、紧随缓存恢复的 `rm -rf reports/mutation`、「记录本段增量复用状态」的
+// reuse.json 落盘闸门、artifact（path: reports/mutation/ + if-no-files-found: error）与
+// .github/workflows/analyze-artifacts.yml。谁把 tap 配置的报告路径改成子目录（如 reports/mutation/tap/），
+// CI 会**静默**坏掉（守卫读不到报告 ⇒ 段 job 判红；artifact 变空 ⇒ 汇总缺段），而现有用例全绿
+// ⇒ 在门禁里锁住，并配靶向反例（改回去立刻红）。
+{
+  const TAP_CONFIG = 'stryker.tap.config.js'
+  const COMMAND_CONFIG = 'stryker.config.js'
+  const DEFAULT_JSON = 'reports/mutation/mutation.json'
+  const DEFAULT_HTML = 'reports/mutation/mutation.html'
+
+  // (1) tap 配置**解析后**必须指向 stryker 默认报告路径。逐字 strictEqual（不做前缀/包含判断）：
+  //     'reports/mutation/tap/mutation.json' 这类「默认路径的子目录」必须红——它正是 canary 专用形态，
+  //     带进生产会让上面那五处全部失配。
+  const assertReportPaths = (cfg) => {
+    assert.ok(cfg && typeof cfg === 'object', 'stryker.tap.config.js 必须导出配置对象')
+    assert.ok(cfg.jsonReporter && typeof cfg.jsonReporter.fileName === 'string',
+      'stryker.tap.config.js 必须显式声明 jsonReporter.fileName（不得依赖省略后的 schema 默认：路径是守卫/artifact/日报的共同前提，必须可见可断言）')
+    assert.strictEqual(cfg.jsonReporter.fileName, DEFAULT_JSON,
+      'tap 档的 json 报告必须落 stryker **默认路径** ' + DEFAULT_JSON +
+      '：mutation.yml 的 fail-closed 守卫与 artifact（path: reports/mutation/）按它对齐，改路径 ⇒ 守卫读不到报告/artifact 变空')
+    assert.ok(cfg.htmlReporter && typeof cfg.htmlReporter.fileName === 'string',
+      'stryker.tap.config.js 必须显式声明 htmlReporter.fileName（同上：路径必须可见可断言）')
+    assert.strictEqual(cfg.htmlReporter.fileName, DEFAULT_HTML,
+      'tap 档的 html 报告必须落 stryker **默认路径** ' + DEFAULT_HTML + '（给人看的明细留档，artifact 按它打包）')
+  }
+  assertReportPaths(require('./' + TAP_CONFIG))
+
+  // (1 反例·靶向) 把报告路径改成 canary 用的子目录形态 ⇒ 同一套断言必须红
+  //     （证明断言不是「只看有没有这个键」，而是真的锁住了默认路径本身）。
+  {
+    const cfg = require('./' + TAP_CONFIG)
+    const mutated = { ...cfg, jsonReporter: { fileName: 'reports/mutation/tap/mutation.json' } }
+    assert.notStrictEqual(mutated.jsonReporter.fileName, cfg.jsonReporter.fileName,
+      '反例夹具必须真的把报告路径改成了子目录形态（没改成本回归形同虚设）')
+    assert.throws(() => assertReportPaths(mutated), /默认路径/,
+      '把报告路径改成 reports/mutation/tap/ 后必须红：否则「路径必须默认」这条前提被静默破坏而套件仍全绿')
+  }
+
+  // (1b) tap 配置的 **runner 契约**（审查 A1·D5）：只锁报告路径不够——把 `testRunner` 换成 command、
+  //      把 `coverageAnalysis` 从 perTest 改成 off、或把 `tap` 键名写成 `tapRunner`，报告路径与矩阵声明都
+  //      照样成立，CI 却已经静默变了语义（分别退化成 command runner / 每变异体跑整套件 / testFiles 落回
+  //      默认 glob ⇒ dry run 0 文件、"No tests were executed"）。故这三项必须显式锁定。
+  //      `tap.testFiles` 的**内容与顺序**由 stryker.tap.config.js 的加载期断言对账 test_suites.js（不一致即
+  //      throw），本处只锁「tap 是对象且 testFiles 是非空数组」这一形状。
+  const assertTapRunnerContract = (cfg) => {
+    assert.ok(cfg && typeof cfg === 'object', 'stryker.tap.config.js 必须导出配置对象')
+    assert.strictEqual(cfg.testRunner, 'tap',
+      'stryker.tap.config.js 的 testRunner 必须是 \'tap\'：退回 command runner 后 perTest 不可用、' +
+      '每个变异体都要跑整套件（实测 34-37× 的提速与 CI 墙钟前提一起消失），而矩阵里 15 段的 config: 仍指向它')
+    assert.strictEqual(cfg.coverageAnalysis, 'perTest',
+      'stryker.tap.config.js 的 coverageAnalysis 必须是 \'perTest\'：command runner 只支持 \'off\'，' +
+      '静默退化成「每个变异体跑整套件」；这一项坏掉不会立刻红，只会让 CI 墙钟暴涨（晚些时候才炸）')
+    assert.ok(cfg.tap && typeof cfg.tap === 'object' && !Array.isArray(cfg.tap),
+      'stryker.tap.config.js 必须声明 `tap` 对象（键名必须逐字是 `tap`：tap-runner@10 读的是 options.tap.*，' +
+      '写成 `tapRunner` 会被 stryker 当未知选项**静默忽略**⇒ testFiles 落回默认 glob、dry run 0 文件）')
+    assert.ok(Array.isArray(cfg.tap.testFiles) && cfg.tap.testFiles.length > 0,
+      'stryker.tap.config.js 的 tap.testFiles 必须是非空数组（显式清单；内容/顺序与 test_suites.js 的对账由' +
+      '本文件的加载期断言负责，这里锁住「键名对了、清单在」这一形状）')
+  }
+  assertTapRunnerContract(require('./' + TAP_CONFIG))
+
+  // (1b 反例·靶向) 三个方向各跑一次：testRunner 退回 command、coverageAnalysis 退回 off、`tap` 键名写错
+  //     （`tapRunner`）⇒ 同一套断言必须各自红。每条都带「夹具真的改到了目标字段」的前置断言。
+  {
+    const real = require('./' + TAP_CONFIG)
+    const misspelled = { ...real }
+    misspelled.tapRunner = misspelled.tap
+    delete misspelled.tap
+    const variants = [
+      { name: 'testRunner 退回 command', mutated: { ...real, testRunner: 'command' }, want: /testRunner 必须是/, probe: c => c.testRunner },
+      { name: 'coverageAnalysis 退回 off', mutated: { ...real, coverageAnalysis: 'off' }, want: /coverageAnalysis 必须是/, probe: c => c.coverageAnalysis },
+      { name: 'tap 键名写成 tapRunner', mutated: misspelled, want: /必须声明 `tap` 对象/, probe: c => c.tap }
+    ]
+    for (const v of variants) {
+      assert.notStrictEqual(v.probe(v.mutated), v.probe(real),
+        '反例夹具（' + v.name + '）必须真的改掉了目标字段（没改成本回归形同虚设）')
+      assert.throws(() => assertTapRunnerContract(v.mutated), v.want,
+        v.name + ' 后必须红：否则 tap 档的语义静默退化（command runner / 整套件重跑 / testFiles 落回默认 glob）' +
+        '而报告路径与矩阵声明仍全绿')
+    }
+  }
+
+  // (2)(3) 矩阵逐段 runner 档位：从**真实 YAML 行**解析（注释一律不算证据），
+  //     抽成函数是为了让紧随其后的两条反例在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本。
+  const parseMatrixConfigs = (ymlText) => {
+    const lines = ymlText.split('\n')
+    const includeAt = lines.findIndex(l => /^\s*include:\s*$/.test(l))
+    assert.ok(includeAt >= 0, 'mutation.yml 的 matrix 必须有 include 块（逐段 runner 档位无从核对即视为回归）')
+    const includeIndent = lines[includeAt].match(/^\s*/)[0].length
+    const entries = []
+    let cur = null
+    for (let i = includeAt + 1; i < lines.length; i++) {
+      const raw = lines[i]
+      if (raw.trim() === '') continue
+      const indent = raw.match(/^\s*/)[0].length
+      // include 块结束：回到 steps: 等同级键（缩进不深于 include:）
+      if (/^\s*[A-Za-z_][\w-]*:/.test(raw) && indent <= includeIndent) break
+      if (raw.trim().startsWith('#')) continue // 注释不是证据
+      let body = raw.trim()
+      if (body.startsWith('-')) {
+        const rest = body.slice(1).trim()
+        if (rest === '' || rest.startsWith('#')) continue
+        cur = { name: null, config: null }
+        entries.push(cur)
+        body = rest
+      }
+      if (!cur) continue
+      const colon = body.indexOf(':')
+      if (colon <= 0) continue
+      const key = body.slice(0, colon).trim()
+      if (key !== 'name' && key !== 'config') continue
+      let value = body.slice(colon + 1).trim()
+      if (value.startsWith('"') || value.startsWith("'")) value = value.slice(1, -1)
+      const hash = value.indexOf('#') // 裸标量：行内注释从 # 开始
+      if (hash !== -1) value = value.slice(0, hash).trim()
+      cur[key] = value
+    }
+    return entries
+  }
+
+  const assertMatrixConfigs = (ymlText) => {
+    const entries = parseMatrixConfigs(ymlText)
+    assert.ok(entries.length > 0, 'mutation.yml 的 matrix include 必须解析出条目')
+    const missing = entries.filter(e => !e.config).map(e => e.name || '(未命名)')
+    assert.deepStrictEqual(missing, [],
+      '矩阵每个条目都必须声明 config:（逐段选 runner）——缺字段时 stryker 会收到空配置名，job 启动即红')
+    // (2) config 值必须是仓库里真实存在的文件：写成不存在的配置名 ⇒ stryker 启动即失败，在这里提前拦下。
+    for (const e of entries) {
+      assert.ok(fs.existsSync(path.join(__dirname, e.config)),
+        '矩阵「' + e.name + '」的 config 指向不存在的文件：' + e.config + '（job 会在 npx stryker run 时立刻失败）')
+    }
+    // (3) 档位分布：**恰有这 4 段**用 command 档，其余全部 TAP 档。顺序按矩阵 include 的实际顺序取值
+    //     （v3-entry 是矩阵第一条），所以这里写死的是**矩阵顺序**而非任意集合顺序。
+    //     为什么锁分布而不是「至少有一段」：留下的每一段都有实测根因（见 mutation.yml 的 matrix 注释
+    //     ①②③ 与 AGENTS.md）——① storage：TAP 档下「变异体导致被测进程崩溃」被记成 RuntimeError 而非
+    //     Killed（`fd = -1` 哨兵被 UnaryOperator 改成 `+1` ⇒ closeSync(1) 关掉 stdout）；② qinglong-push /
+    //     check-deps：变异目标只在子进程里执行、文本断言不产生覆盖 ⇒ perTest 归因不到 ⇒ NoCoverage 且不跑
+    //     任何测试；③ v3-entry：`test_utils_pure.js:449` 的 `execFileSync(node, ['-e', probe])` 同手法，
+    //     A5 逐变异体 replay 量化其 TAP 档丢 **19** 个击杀（旧 command 全量里全是 Killed）。把任一段挪回
+    //     TAP 会静默丢检出，把别的段落到 command 档则那段重新变成「真全量跑不完 ⇒ 靠复用」的老问题。
+    //     两个方向都要红；本断言与 mutation.yml 的 `readMatrixRunnerConfigs()` 消费方（日报档位标注）也一致。
+    assert.deepStrictEqual(entries.filter(e => e.config === COMMAND_CONFIG).map(e => e.name),
+      ['v3-entry', 'storage', 'qinglong-push', 'check-deps'],
+      '必须**恰有** v3-entry / storage / qinglong-push / check-deps 这 4 段（按矩阵顺序）用 command 档 ' +
+      COMMAND_CONFIG + '：① v3-entry：`test_utils_pure.js` 的 `-e` 子进程 probe 使 perTest 归因不到 ⇒ TAP 档' +
+      '静默丢 19 个击杀（A5 replay 量化）；② storage：TAP 档下变异体导致的进程崩溃被记成 RuntimeError 而非' +
+      'Killed；③ qinglong-push / check-deps：变异目标只在子进程里被执行，perTest 覆盖图看不见 ⇒ TAP 档判' +
+      'NoCoverage 且不运行任何测试，静默丢失检出能力。见 mutation.yml matrix 注释与 AGENTS.md；其余段必须' +
+      '走 TAP 档，否则回到「真全量跑不完 ⇒ 靠复用」的老问题')
+    const unknown = [...new Set(entries.map(e => e.config))].filter(c => c !== TAP_CONFIG && c !== COMMAND_CONFIG)
+    assert.deepStrictEqual(unknown, [],
+      '矩阵的 config 只允许 ' + TAP_CONFIG + '（TAP 档）或 ' + COMMAND_CONFIG + '（command 档）：多出第三档必须显式登记')
+  }
+  assertMatrixConfigs(mutationYml)
+
+  // (4) **消费点**：真正决定跑哪一档的不是 matrix 的 `config:` 字段（那只是声明），而是「变异测试」step 里
+  //     `npx stryker run <configFile>` 这一行——Stryker 10 的 configFile 是**位置参数**（无 --configFile 选项，
+  //     见 mutation.yml 该 step 上方注释）。只锁声明不锁消费 ⇒ 把这一行写死成 stryker.tap.config.js 时，
+  //     4 段 command 档全部静默走 TAP（正是本 PR 明令禁止的形态：v3-entry 的 `-e` 子进程 probe、storage 的
+  //     `fd = -1` 哨兵被改成 `+1` 后 closeSync(1) 关掉 stdout ⇒ 进程崩溃被 tap-runner 记 RuntimeError ⇒
+  //     该段被 fail-closed 守卫判常红；qinglong-push / check-deps 的变异目标只在子进程里执行、perTest 覆盖
+  //     图看不见 ⇒ NoCoverage 且**不运行任何测试**、静默丢检出），而当时整套门禁（含 3i 的矩阵声明断言）
+  //     **全绿**。故在门禁里逐字锁定消费点，并配「写死配置 ⇒ 红」的靶向反例。
+  const assertStrykerRunConsumption = (ymlText) => {
+    // 只认**活动**行：`run:` 前不允许出现 `#`，注释里写命令原文一律不算证据。
+    const active = ymlText.split('\n').filter(l => /^[ \t]*run:\s*npx stryker run\b/.test(l))
+    assert.strictEqual(active.length, 1,
+      'mutation.yml 必须有**且仅有**一行活动 `run: npx stryker run …`（注释不算证据）：它是逐段 runner 的' +
+      '唯一消费点，0 行（命令被删/被注释）或多行（多出一处没人核对的 stryker 调用）都必须红')
+    const rest = active[0].replace(/^[ \t]*run:\s*npx stryker run\b[ \t]*/, '')
+    assert.match(rest, /^\$\{\{\s*matrix\.config\s*\}\}([ \t]|$)/,
+      '变异测试 step 的 run 行必须逐字使用 matrix.config 作为 configFile 位置参数' +
+      '（`npx stryker run $' + '{' + '{ matrix.config }} …`）：matrix 的 config: 字段只是**声明**，真正决定' +
+      '跑哪一档的是这一行；把它写死（如 stryker.tap.config.js）会让 v3-entry/storage/qinglong-push/check-deps 的逐段' +
+      'runner 静默失效——v3-entry/storage 被 fail-closed 守卫判常红、另两段 NoCoverage 且不跑任何测试（静默丢检出）')
+  }
+  assertStrykerRunConsumption(mutationYml)
+
+  // (4 反例·靶向) 把消费点写死成 stryker.tap.config.js（= 4 段 command 档全部被 TAP 覆盖）⇒ 必须红。
+  //     这条反例就是该缺口的直接证据：修复前，同一处改动下 `node test_ci_skip_suites.js` 是 **exit 0 全绿**。
+  {
+    const hardcoded = mutationYml.replace(
+      /^([ \t]*)run: npx stryker run[ \t]+\$\{\{\s*matrix\.config\s*\}\}/m,
+      '$1run: npx stryker run stryker.tap.config.js')
+    assert.notStrictEqual(hardcoded, mutationYml,
+      '反例夹具必须真的把消费点的 configFile 参数写死（没改成本回归形同虚设）')
+    const fixtureRunLines = hardcoded.split('\n').filter(l => /^[ \t]*run:\s*npx stryker run\b/.test(l))
+    assert.strictEqual(fixtureRunLines.length, 1, '夹具中活动 run 行应恰有一行')
+    assert.ok(/stryker\.tap\.config\.js/.test(fixtureRunLines[0]) && !/matrix\.config/.test(fixtureRunLines[0]),
+      '夹具中活动 run 行应已写死 stryker.tap.config.js（否则反例证明的不是「消费点被锁」）')
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-stryker-consume-'))
+    try {
+      const fixture = path.join(dir, 'mutation.yml')
+      fs.writeFileSync(fixture, hardcoded)
+      assert.throws(() => assertStrykerRunConsumption(fs.readFileSync(fixture, 'utf8')),
+        /逐字使用 matrix\.config/,
+        '把消费点写死成某一档后必须红：否则矩阵的 config: 退化为纯装饰，CI 会静默用错档而整套门禁全绿')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // (2 反例·靶向) 把某段 config 改成不存在的文件名 ⇒ 必须红
+  {
+    const mutated = mutationYml.replace(/^([ \t]*)config: "stryker\.tap\.config\.js"[ \t]*$/m,
+      '$1config: "stryker.typo.config.js"')
+    assert.notStrictEqual(mutated, mutationYml, '反例夹具必须真的改掉了某段的 config（没改成本回归形同虚设）')
+    assert.throws(() => assertMatrixConfigs(mutated), /不存在的文件/,
+      '把 config 改成不存在的文件名后必须红：否则矩阵写错配置名要等 CI job 启动才暴露')
+  }
+  // (3 反例·靶向) 把 4 段 command 档（v3-entry / storage / qinglong-push / check-deps）全切到 TAP 档 ⇒ 分布断言必须红
+  {
+    const mutated = mutationYml.replace(/^([ \t]*)config: "stryker\.config\.js"[ \t]*$/gm,
+      '$1config: "stryker.tap.config.js"')
+    assert.notStrictEqual(mutated, mutationYml, '反例夹具必须真的改掉了 command 档条目的 config')
+    assert.deepStrictEqual(parseMatrixConfigs(mutated).filter(e => e.config === COMMAND_CONFIG).map(e => e.name), [],
+      '夹具中应已无 command 档条目（否则反例证明的不是「分布被锁住」）')
+    assert.throws(() => assertMatrixConfigs(mutated), /command 档/,
+      '把 command 档段全部切到 TAP 档后必须红：v3-entry/storage 会被 fail-closed 守卫判常红（语义损失）、' +
+      '另两段会静默丢检出，且分布漂移必须有人看见')
+  }
+}
+console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner 契约（testRunner=tap / coverageAnalysis=perTest / tap.testFiles 非空）均已锁（靶向反例已锁）；mutation.yml 矩阵逐段 config 齐备、文件真实存在、恰 v3-entry/storage/qinglong-push/check-deps 四段 command 档，且消费点逐字用 $' + '{' + '{ matrix.config }}（靶向反例已锁）')
 
 // ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────
 // 背景：test_app.js 的 `--only=<子串>` 曾**静默失效**——旧实现用 process.argv.indexOf('--only')
