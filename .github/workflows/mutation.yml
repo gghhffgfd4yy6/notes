@@ -284,15 +284,31 @@ jobs:
 
       - name: 恢复增量缓存
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        id: inc-cache
         with:
           # 增量缓存 key（PR #156 的「测试指纹强制全量」改动已于 2026-09-19 回退，用户拍板）：
-          #   key: stryker-<段>-<src 指纹>；兜底 restore-keys: stryker-<段>-（回到 PR #156 之前的形态）。
+          #   当前形态 = **三段身份：配置 / 依赖 / 源**（档位名 `matrix.config` 在配置段内）：
+          #   key:    stryker-<段>-cfg-<matrix.config 档位>-<hashFiles(stryker.config.js, stryker.tap.config.js, scripts/tap-shim.js)>-deps-<hashFiles(package-lock.json)>-src-<hashFiles(run_mutation.js, matrix.src)>
+          #   兜底:   stryker-<段>-cfg-<同一 matrix.config 档位>-<同一配置指纹>-deps-<同一依赖指纹>-
+          # 逐字口径（独立验证实测，勿按字面复算成「不变式没成立」）：兜底前缀 == key **截掉尾部 `-src-<源指纹>`
+          #   之后的前缀**（即保留 `-deps-<依赖指纹>` 的那个尾随 `-`）；`key.replace(/-src-.*$/,'')` 与兜底
+          #   **差恰一个尾随 `-`**——那是段分隔符，必须保留，不是不一致。
+          # 不变式（本次修复的核心，勿破坏）：**兜底前缀 = 缓存身份里除源指纹以外的全部段** ⇒ 兜底只允许跨
+          #   **源文件**变化复用（incremental-differ 按内容 diff，安全）；**配置 / tap-shim / 依赖 / 运行器**任何
+          #   变化都必须**同时**换掉主 key 与兜底身份，否则兜底会把按旧身份算出的 inc 原样送回、被无条件复用。
+          # 本次修掉的缺陷（实测坐实，非推测）：旧形态把 `package-lock.json` 放在 **src 段**、却**不在**兜底前缀里
+          #   （lockfile 只出现在主 key，兜底前缀在配置指纹之后就结束）⇒ 依赖版本一变，主 key 未命中，兜底却
+          #   **仍然命中**，把依赖升级前的旧 inc 复原；而 stryker 的 incremental-differ **只 diff 源码/测试内容、
+          #   不认识依赖版本** ⇒ 该段全部变异体照旧复用，**依赖升级从未重算**。
+          #   证据（run 35775812104）：dependabot 把 fast-check 4.10.0→4.10.1 后主 key 未命中，caches API 里
+          #   sendnotify-part1 的旧条目 `src-0f149467…` 在 19:45:51Z 被取用、19:47:09Z 又存下新条目
+          #   `src-046488c2…`，该轮 **19/19 段 100% 复用** —— 依赖升级被静默吞掉。
+          #   修法＝把 `package-lock.json` 从 src 段**移出**单列 **deps 段**，并让它**同时进兜底前缀**：依赖一变，
+          #   主 key 与兜底身份一起变 ⇒ 该段必然真全量重算；源码变化仍按新兜底前缀跨 src 复用（初衷不变）。
           # 源指纹固定用 matrix.src：mutate 里的范围字面量（如 "xbk_function_v3.js:1-442"）**不能**作
-          #   hashFiles 参数——按字面量找不到文件会返回空指纹，导致 range 段的缓存永不过期，故源指纹一直是
-          #   matrix.src 单列。
-          # PR-1（CI 切 TAP 档）起 key 拆成**档位名 + 配置指纹 + 源指纹**三段，且兜底前缀带上同样两段：
-          #   key:    stryker-<段>-cfg-<matrix.config 档位>-<hashFiles(stryker.config.js, stryker.tap.config.js, scripts/tap-shim.js)>-src-<hashFiles(package-lock.json, run_mutation.js, matrix.src)>
-          #   兜底:   stryker-<段>-cfg-<同一 matrix.config 档位>-<同一配置指纹>-
+          #   hashFiles 参数——按字面量找不到文件会返回空指纹，导致 range 段的缓存永不过期，故源指纹是
+          #   run_mutation.js + matrix.src 单列（`run_mutation.js` 这个**运行器**留在 src 段）。
+          # PR-1（CI 切 TAP 档）起 key 与兜底前缀都带**档位名 + 配置指纹**（当前形态下二者同在 cfg 段）：
           # 为什么必须这样（本 PR 评审 · qodo High + sourcery）：切档前 key 是单段 `<hashFiles(...)>`、兜底是
           #   **裸前缀** `stryker-<段>-`，而 core 的 `readIncrementalReport()` 对 inc **零校验**（源码里留着
           #   `// TODO: Validate against the schema or stryker version?`）⇒ 主 key 未命中时会把**另一档 runner**
@@ -315,8 +331,13 @@ jobs:
           #   与 PR #156「测试指纹进兜底前缀」的区别（那版已回退）：测试文件变化频繁，把测试指纹写进前缀会让
           #   兜底几乎永不命中、且拦不住真根因（假 Killed 来自共享缓存的并发串扰）；**配置**指纹只在 runner
           #   配置本身变化时才变，既不牺牲兜底价值，又正好堵住跨档污染。
-          # 一次性代价（如实登记）：key 形态变更 ⇒ 历史缓存首次全部未命中，本轮各段为**真全量**
-          #   （19 段并行实测 **86.0min**（run 35646992130，head ca63e71）；瓶颈＝command 档 qinglong-push **85.3min**。command 档三段 C=8 实测：storage 42.6min / check-deps 64.2min / qinglong-push 85.3min；storage 的 C=2 上界 2h33m。）
+          # 一次性代价（如实登记）：**key 形态本次再变一次**（新增 deps 段、lockfile 移出 src 段）⇒ 合并后首次运行
+          #   19 段**全部未命中** ⇒ **一次真全量**（19 段并行实测墙钟 **86.0min**（run 35646992130，head ca63e71）；
+          #   瓶颈＝command 档 qinglong-push **85.3min**。command 档三段 C=8 实测：storage 42.6min / check-deps
+          #   64.2min / qinglong-push 85.3min；storage 的 C=2 上界 2h33m）。
+          #   此后**每次 `package-lock.json` 变化各触发该段一次真全量**（dependabot 合并后由下一次 schedule 拾取，
+          #   不再像旧形态那样被兜底静默复用）；源码变化仍走兜底复用（本形态的价值所在）。
+          #   `package.json` 单改（如版本号）**不**使缓存失效——与现状一致，**有意保留**（本次不动这个口径）。
           # 为什么回退（旧说法「测试一变就必须全量重跑」不再保留，因为它既不成立也不可负担）：
           #   ① 它**拦不住真根因**：假 Killed 来自**共享缓存的并发串扰**，发生在**变异体运行期**，而基线全程是绿的；
           #      且测试没变时测试指纹不变、主 key 依旧命中 ⇒ 这条改动对真根因完全无效。
@@ -363,9 +384,9 @@ jobs:
           # 去增量与重新标定 thresholds.break 都留到后续 PR（TAP 迁移已在本 PR 落地，break 仍 null）；
           #   在那之前，本条与分数门禁无关。
           path: reports
-          key: stryker-${{ matrix.name }}-cfg-${{ matrix.config }}-${{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-src-${{ hashFiles('package-lock.json', 'run_mutation.js', matrix.src) }}
+          key: stryker-${{ matrix.name }}-cfg-${{ matrix.config }}-${{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-${{ hashFiles('package-lock.json') }}-src-${{ hashFiles('run_mutation.js', matrix.src) }}
           restore-keys: |
-            stryker-${{ matrix.name }}-cfg-${{ matrix.config }}-${{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-
+            stryker-${{ matrix.name }}-cfg-${{ matrix.config }}-${{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-${{ hashFiles('package-lock.json') }}-
 
       # F1：缓存（path: reports）会把上一次运行的 reports/mutation/mutation.json 一并恢复，而 stryker 的
       # json 报告不含任何时间戳（内容上无法与本次产出区分）。若本段 stryker 崩溃/被 6h 取消，这个陈旧报告
@@ -472,6 +493,9 @@ jobs:
       # 随 artifact 到达汇总 job ⇒ 日报逐段标注「本轮全量 / 复用 N/M」，并在复用比例高时显式提示
       # 「该段未全部重算，分数/存活清单可能来自旧测试状态」。**不改分数口径**（(killed+timeout)/total 不变）、
       # **不改 EXPECTED_SEGMENTS 对账**、**不给日报加 throw**（日报 throw 会在最需要看分数时把日报吞掉）。
+      # `--cache-hit`：三个取值来自 actions/cache 的 `cache-hit` output（`true` = 主 key 精确命中 / `false` =
+      #   命中 restore-keys 兜底 / 空值（主 key 与兜底都未恢复，上游有意不设置该 output）由本步归一为 `none`），
+      #   落进 reports/mutation/reuse.json，供日报区分「主 key 命中」与「兜底复原」。
       # 位置：stryker 之后（stryker.log 已写完）、上传 artifact 之前（reuse.json 必须进 artifact）。
       # 为什么 if: always()：与守卫/剥离/上传同一口径——stryker 失败/超时时也要把「没判出来」如实落盘
       #   （mode=unknown），绝不留给读者一个「看起来是全量」的空白。
@@ -489,15 +513,15 @@ jobs:
       # 残余边界（本轮补，已实测复现）：`Result: N of M` 的 M 只统计**当前 --mutate 范围**内的变异体，
       #   而 incremental-differ 的 sticky 分支会把旧增量报告中**已不在当前范围**的变异体原样并入报告
       #   （status 沿用旧运行），且既不计入 N 也不计入 M ⇒ N/M 只是旧结果占比的**下界**。本仓可达：
-      #   缓存 key 是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>-src-<hashFiles(…, matrix.src)>`、**不含 mutate 范围**，且 `restore-keys` 是
-      #   **带档位名与配置指纹的兜底前缀 `stryker-<段>-cfg-<同一档位>-<配置指纹>-`** ⇒ 主 key 未命中时也会恢复**同段同档配置**的最近一条同前缀缓存；叠加 AGENTS.md 要求的
+      #   缓存 key 是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>-deps-<依赖指纹>-src-<hashFiles(…, matrix.src)>`、**不含 mutate 范围**，且 `restore-keys` 是
+      #   **带档位名 + 配置指纹 + 依赖指纹的兜底前缀 `stryker-<段>-cfg-<同一档位>-<配置指纹>-deps-<同一依赖指纹>-`** ⇒ 主 key 未命中时也会恢复**同段同档配置**的最近一条同前缀缓存；叠加 AGENTS.md 要求的
       #   大文件增长时**重拆 mutate 行段** ⇒ 旧 inc 里落在新范围外的变异体被 sticky 分支并入。处理＝**只呈现、不改口径**：日报的
       #   「♻️ 复用状态」小节对「报告变异体数 vs 日志口径 M」不一致的段单独点名（reuseUnaccountedCount，
       #   纯显示层交叉校验，不加 throw、不新增第四态），并明说比例只是下界；`0 of M` 但计数对不上的段
       #   不再被并进「全部全量重算 ⇒ 对应本 commit 的测试状态」这句结论。
       - name: 记录本段增量复用状态（${{ matrix.name }}）
         if: always()
-        run: node scripts/mutation-report.js --reuse --segment "${{ matrix.name }}" --log stryker.log --out reports/mutation/reuse.json
+        run: node scripts/mutation-report.js --reuse --segment "${{ matrix.name }}" --log stryker.log --out reports/mutation/reuse.json --cache-hit ${{ steps.inc-cache.outputs.cache-hit || 'none' }}
 
       # F-04（落盘侧，REV-CI）：修掉 statusReason 的「纯废重」膨胀。stryker 的 command runner 把每个
       # 变异体的整段测试输出写进 statusReason（TAP 档只含覆盖该变异体的测试文件输出，体积小得多，但剥离

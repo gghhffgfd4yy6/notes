@@ -158,9 +158,28 @@ function validateFreshness (results, maxSkewMs = resolveMaxSkewMs(process.env.MU
 //      `formatColorized()` 保留颜色。同一实验里 stryker.log 全文件 **0 个 ESC 字节**，`Result:` 行是纯文本。
 //      故 `stripAnsi` 是**纵深防御**（防 stryker 未来改掉 format()、或有人把 stdout 文本喂进本解析器），
 //      不是当前文件格式的必要条件；留着零成本，但注释与文档**不得**再宣称「CI 下文件日志带 ANSI」。
+//
+// 溯源三态（v3.276 续 · issue #167）：上面这条链路只回答了「有没有复用」，回答不了「**为什么**复用」。
+//   实测案例 run 35775812104（issue #167）：19/19 段 100% 复用，其中 fast-check 4.10.0→4.10.1 的依赖变化
+//   被**兜底缓存**吞掉、从未重算，而日报完全看不出来。两种复用的可信度不同：
+//     * `primary` —— 主 key 命中 ⇒ hashFiles 覆盖的输入（package-lock.json / run_mutation.js / matrix.src /
+//       stryker 配置与 tap-shim）真的没变，复用是「输入未变」的直接推论；
+//     * `fallback` —— 主 key 未命中、由 `restore-keys` 兜底前缀恢复了同段同档配置的旧缓存 ⇒ 输入**已经变了**
+//       （或缓存过期/被逐出），而增量差分只保证「被复用变异体所在**文件内容**未变」，不保证依赖等全局输入未变；
+//     * `none` —— 主 key 与兜底都没恢复（等价于全新运行，正常应落回全量重算）。
+//   事实依据（勿把「空值」写成「参数漏传」的同义词）：`actions/cache` 在主 key 与兜底前缀**都没恢复**时
+//   **有意不设置** `cache-hit` 这个 output（上游 actions/cache issue #1466：无恢复 ≠ cache-hit=false）
+//   ⇒ 工作流必须用 `${{ steps.<id>.outputs.cache-hit || 'none' }}` 归一，故「空值」与「参数漏传」是两件事：
+//   空值经 `|| 'none'` 归一后是 `none`（明确的「没有缓存可复用」），而参数**缺席**才是「复用来源未记录」
+//   （旧 artifact / 其它调用方）——后者一律降级为 undefined，**绝不能被读成 `primary`**。
 const REUSE_MODE_FULL = 'full'
 const REUSE_MODE_PARTIAL = 'partial'
 const REUSE_MODE_UNKNOWN = 'unknown'
+// reuse.json 的 `cacheHit` 字段取值（溯源三态）；CLI 侧的 `--cache-hit` 只接受 true/false/none 三个**字符串**。
+const CACHE_HIT_PRIMARY = 'primary'
+const CACHE_HIT_FALLBACK = 'fallback'
+const CACHE_HIT_NONE = 'none'
+const CACHE_HIT_ARG_VALUES = Object.freeze(['true', 'false', 'none'])
 // 「复用比例高」的阈值：过半结果取自旧运行 ⇒ 日报额外给一条显式提示（比例本身逐段照示，不靠阈值才可见）。
 const HIGH_REUSE_RATIO = 0.5
 // stryker.log 的策略读取上限。info 级**没有**逐变异体日志（逐变异体那条是 clear-text-reporter 的
@@ -246,16 +265,34 @@ function reuseRatio (reused, total) {
   return Math.round((reused / total) * 10000) / 10000
 }
 
+// CLI 取值（'true'/'false'/'none'，来自 actions/cache 的 cache-hit output）→ reuse.json 的 `cacheHit` 字段。
+// 非法值（含 undefined 之外的任何东西）返回 undefined = 不写该字段；参数合法性在 parseReuseArgs 里 fail-closed。
+function mapCacheHitArg (raw) {
+  if (raw === 'true') return CACHE_HIT_PRIMARY
+  if (raw === 'false') return CACHE_HIT_FALLBACK
+  if (raw === 'none') return CACHE_HIT_NONE
+  return undefined
+}
+
+// reuse.json 的 `cacheHit` 字段 → 渲染用值：**只认三态**，字段缺失或取值非法一律降级为 undefined
+// （= 未记录）。这是**显示层交叉校验**，不是门禁：绝不抛、也不参与 mode 判定。
+function normalizeCacheHitField (raw) {
+  return raw === CACHE_HIT_PRIMARY || raw === CACHE_HIT_FALLBACK || raw === CACHE_HIT_NONE ? raw : undefined
+}
+
 /**
  * 组装某段的复用元信息（落盘成 reuse.json 的内容）。
  * @param {string} segment 段名（mutation.yml 的 matrix.name）
  * @param {string} logText stryker.log 文本
- * @param {{generatedAt?: string}} [options]
+ * @param {{generatedAt?: string, cacheHit?: string}} [options] cacheHit 为**已归一**的三态之一
+ *   （primary/fallback/none）；未传或非法 ⇒ 不写该字段（保持旧形状，向后兼容旧 artifact 读取方）
  * @returns {object} 可 JSON 序列化的元信息
  */
 function buildReuseMeta (segment, logText, options = {}) {
   const parsed = parseReuseFromLog(logText)
   const meta = { segment: String(segment), mode: parsed.mode }
+  const cacheHit = normalizeCacheHitField(options.cacheHit)
+  if (cacheHit) meta.cacheHit = cacheHit
   if (Number.isSafeInteger(parsed.reused) && Number.isSafeInteger(parsed.total) && parsed.total > 0) {
     meta.reused = parsed.reused
     meta.total = parsed.total
@@ -315,6 +352,8 @@ function findReuseJson (dir) {
 }
 
 // 把 reuse.json 的原始对象归一成渲染用形状；任何形状异常 → unknown + reason（不猜、不抛）
+// `cacheHit`（溯源三态）是**显示层交叉校验**、不是门禁：字段缺失或取值非法一律降级为 undefined（= 未记录），
+// 既不抛、也不影响 mode 判定（旧 artifact 没有该字段 ⇒ 渲染成「复用来源未记录」，绝不能被读成主 key 命中）。
 function normalizeReuseMeta (raw, expectedSeg) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { mode: REUSE_MODE_UNKNOWN, reason: `reuse.json 顶层不是 JSON 对象（实际 ${raw === null ? 'null' : Array.isArray(raw) ? 'array' : typeof raw}）` }
@@ -323,6 +362,7 @@ function normalizeReuseMeta (raw, expectedSeg) {
   if (raw.segment !== undefined && String(raw.segment) !== String(expectedSeg)) {
     return { mode: REUSE_MODE_UNKNOWN, reason: `reuse.json 段名不一致（${raw.segment} ≠ ${expectedSeg}）` }
   }
+  const cacheHit = normalizeCacheHitField(raw.cacheHit)
   if (raw.mode === REUSE_MODE_FULL) {
     const meta = { mode: REUSE_MODE_FULL }
     if (Number.isSafeInteger(raw.reused) && Number.isSafeInteger(raw.total) && raw.total > 0) {
@@ -330,6 +370,7 @@ function normalizeReuseMeta (raw, expectedSeg) {
       meta.total = raw.total
       meta.ratio = reuseRatio(raw.reused, raw.total)
     }
+    if (cacheHit) meta.cacheHit = cacheHit
     if (raw.note) meta.note = String(raw.note)
     return meta
   }
@@ -338,7 +379,9 @@ function normalizeReuseMeta (raw, expectedSeg) {
       return { mode: REUSE_MODE_UNKNOWN, reason: `reuse.json 的 partial 计数非法（reused=${JSON.stringify(raw.reused)} total=${JSON.stringify(raw.total)}）` }
     }
     const ratio = Number.isFinite(raw.reuseRatio) ? raw.reuseRatio : reuseRatio(raw.reused, raw.total)
-    return { mode: REUSE_MODE_PARTIAL, reused: raw.reused, total: raw.total, ratio, high: ratio >= HIGH_REUSE_RATIO }
+    const meta = { mode: REUSE_MODE_PARTIAL, reused: raw.reused, total: raw.total, ratio, high: ratio >= HIGH_REUSE_RATIO }
+    if (cacheHit) meta.cacheHit = cacheHit
+    return meta
   }
   return { mode: REUSE_MODE_UNKNOWN, reason: `reuse.json 的 mode 非法（${JSON.stringify(raw.mode)}）` }
 }
@@ -365,9 +408,13 @@ function readReuseMeta (searchRoot, expectedSeg) {
 // reportTotal（报告的变异体数）是可选的第二参：`0 of M` 分支的「全量」只有在**报告数与日志口径 M 一致**时
 // 才敢这么写——计数对不上说明报告里还并入了 sticky 的旧变异体（见 reuseUnaccountedCount），
 // 此时标注「口径不符」，细节由「♻️ 复用状态」小节给出。绝不在这里把「有旧结果」写成「全量」。
+// 溯源三态只影响**复用来源未变可信**的那一种：`partial + fallback`（主 key 未命中却仍在复用）加 `·兜底`
+// 后缀，其余情形（primary / none / 未记录 / full）一字不改。
 function formatReuseCell (reuse, reportTotal) {
   if (!reuse || reuse.mode === REUSE_MODE_UNKNOWN) return '未记录'
-  if (reuse.mode === REUSE_MODE_PARTIAL) return `复用 ${reuse.reused}/${reuse.total}`
+  if (reuse.mode === REUSE_MODE_PARTIAL) {
+    return reuse.cacheHit === CACHE_HIT_FALLBACK ? `复用 ${reuse.reused}/${reuse.total}·兜底` : `复用 ${reuse.reused}/${reuse.total}`
+  }
   if (reuseUnaccountedCount({ total: reportTotal, reuse }) !== null) return '全量(口径不符)'
   return '全量'
 }
@@ -384,12 +431,14 @@ function formatRatio (ratio) {
  * 「汇总 job 缺段才暴露」——那是 PR #156 有意前移的故障信号，不得回退。因此**只在 mutation.json 已存在时**
  * 才落盘 reuse.json（同目录），否则只打一行提示、什么都不写。
  *
- * @param {{segment: string, logPath: string, outPath: string, now?: Date}} options
+ * @param {{segment: string, logPath: string, outPath: string, cacheHit?: string, now?: Date}} options
+ *   cacheHit 是 CLI 的**原始取值**（'true'/'false'/'none'）；缺席 ⇒ reuse.json 不写 `cacheHit` 字段
  * @returns {{written: boolean, outPath: string, meta: object, reason?: string}}
  */
 function writeReuseMeta (options) {
   const { segment, logPath, outPath } = options
   const now = options.now instanceof Date ? options.now : new Date()
+  const cacheHit = mapCacheHitArg(options.cacheHit)
   const reportPath = path.join(path.dirname(path.resolve(outPath)), 'mutation.json')
   let logText
   let readError
@@ -400,7 +449,8 @@ function writeReuseMeta (options) {
   }
   const meta = readError
     ? { segment: String(segment), mode: REUSE_MODE_UNKNOWN, reason: `无法读取日志：${readError}`, generatedAt: now.toISOString() }
-    : buildReuseMeta(segment, logText, { generatedAt: now.toISOString() })
+    : buildReuseMeta(segment, logText, { generatedAt: now.toISOString(), cacheHit })
+  if (cacheHit) meta.cacheHit = cacheHit
   if (!fs.existsSync(reportPath)) {
     return { written: false, outPath: path.resolve(outPath), meta, reason: `本段未产出 ${reportPath}（stryker 未完成/崩溃），跳过写 reuse.json：写下去会让上传步骤的 if-no-files-found: error 失效` }
   }
@@ -919,12 +969,36 @@ function reuseUnaccountedCount (r) {
 }
 
 /**
+ * partial 段行尾的「复用来源」溯源后缀（三种，逐字）。纯显示层：不抛、不改任何统计。
+ *
+ * 三种取值与三种文案的对应（`cacheHit` 只有 primary/fallback/none 三个合法值，缺失或非法已由
+ * normalizeReuseMeta 降级为 undefined）：
+ *   * primary    ⇒ 主 key 命中：hashFiles 覆盖的输入未变（复用的可信来源）；
+ *   * fallback   ⇒ **兜底复原**：主 key 未命中，结果 = 旧缓存 + 按内容差分复用；
+ *   * 其余（none / 缺失）⇒ 复用来源未记录。`none` 在这里并入「未记录」是**有意**的：缓存层明确报告
+ *     「主 key 与兜底都没恢复」，于是这些复用到底从哪来就没有记录（接线坏了），由紧随其后的矛盾点名
+ *     说清；文案只有三种，不新增第四态。
+ * @param {object} reuse 归一后的复用元信息（partial）
+ * @returns {string} 逐字后缀
+ */
+function reuseOriginSuffix (reuse) {
+  if (reuse && reuse.cacheHit === CACHE_HIT_PRIMARY) return '（主 key 命中：hashFiles 覆盖的输入未变）'
+  if (reuse && reuse.cacheHit === CACHE_HIT_FALLBACK) return '（**兜底复原**：主 key 未命中，结果 = 旧缓存 + 按内容差分复用）'
+  return '（复用来源未记录）'
+}
+
+/**
  * 复用状态说明段（PR #158 Qodo Medium / Correctness）。
  *
  * 为什么必须有这一段（而不只是表格里加一列）：Qodo 指出的缺陷是「**published segment scores and survivor
  * list describe the old suite**」——读者拿到日报时无法分辨哪些数字来自旧测试状态。只加一列仍可能被略过，
  * 故这里用独立小节把结论讲清楚，并且**每种情形都给结论**（全部全量 / 有复用 / 完全没记录 / 计数口径不符），
  * 避免「没记录」被静默读成「没复用」、也避免「N/M 看着干净」被读成「旧结果占比就这么多」。
+ *
+ * 溯源三态（issue #167）：在「有复用」之上再回答「**为什么**复用」——partial 段逐条行尾追加
+ * primary / fallback / 未记录 三种后缀；存在 fallback 段时另起一段点名「主 key 未命中却仍在复用 ⇒
+ * 本段不是全量重算」；存在 `cache-hit=none` 却记录了复用的段时点名「接线可能坏了」。
+ * 全部是纯显示层交叉校验（风格对齐 reuseUnaccountedCount）：**不新增第四态、不加 throw**。
  *
  * 分数口径零变化：本函数只读 r.reuse 与 r.total（后者仅用于与复用口径比对，不参与任何统计），
  * 不碰 killed/survived/score，也不产生任何 throw。
@@ -939,6 +1013,11 @@ function _renderReuseNotice (results) {
   const unknown = usable.filter(r => !r.reuse || r.reuse.mode === REUSE_MODE_UNKNOWN)
   // 计数口径不符（见 reuseUnaccountedCount）：N/M 是下界，必须单独点名，不能并进「全量重算」。
   const unaccounted = usable.filter(r => reuseUnaccountedCount(r) !== null)
+  // 溯源三态（issue #167）：只有 partial 段才谈得上「复用来源」，故两个新分组都以 partial 为父集。
+  //   * fallback：主 key 未命中（输入已变）却仍在复用 ⇒ 本段不是全量重算，必须单独点名；
+  //   * contradiction：cache-hit=none 与「记录了复用 N/M」自相矛盾 ⇒ 接线可能坏了（纯显示层交叉校验）。
+  const fallback = partial.filter(r => r.reuse.cacheHit === CACHE_HIT_FALLBACK)
+  const contradiction = partial.filter(r => r.reuse.cacheHit === CACHE_HIT_NONE)
   const lines = []
   lines.push('## ♻️ 复用状态（结果是否对应当前测试状态）')
   lines.push('')
@@ -964,8 +1043,29 @@ function _renderReuseNotice (results) {
       const ratio = Number.isFinite(r.reuse.ratio) ? r.reuse.ratio : reuseRatio(r.reuse.reused, r.reuse.total)
       const high = r.reuse.high !== undefined ? r.reuse.high : ratio >= HIGH_REUSE_RATIO
       lines.push(`- \`${r.seg}\`：复用 ${r.reuse.reused}/${r.reuse.total}（${formatRatio(ratio)}）` +
-        (high ? ` ⚠️ **复用比例高**（≥${formatRatio(HIGH_REUSE_RATIO)}）` : ''))
+        (high ? ` ⚠️ **复用比例高**（≥${formatRatio(HIGH_REUSE_RATIO)}）` : '') +
+        reuseOriginSuffix(r.reuse))
     }
+    lines.push('')
+  }
+  // 溯源三态 · 兜底复原点名（issue #167 实测案例 run 35775812104）：主 key 未命中说明 `hashFiles` 覆盖的
+  // 输入（含依赖）已变化，而这些段仍在沿用旧缓存的 killed/survived ⇒ 必须明说「本段不是全量重算」，
+  // 否则读者会把「复用 N/M」当成「输入未变的直接推论」。纯显示层，不加 throw、不新增第四态。
+  if (fallback.length > 0) {
+    lines.push('⚠️ **下列段主 key 未命中却仍在复用 ⇒ 本段不是全量重算**：主 key 未命中说明 `hashFiles` 覆盖的输入已变化（或缓存已过期/被逐出），而这些段仍在沿用旧缓存的 killed/survived（增量差分只保证被复用变异体所在的**文件内容**未变，不保证依赖等全局输入未变；依赖已进兜底前缀 ⇒ 依赖变化不会再落到这里）：')
+    lines.push('')
+    for (const r of fallback) {
+      const ratio = Number.isFinite(r.reuse.ratio) ? r.reuse.ratio : reuseRatio(r.reuse.reused, r.reuse.total)
+      lines.push(`- \`${r.seg}\`：复用 ${r.reuse.reused}/${r.reuse.total}（${formatRatio(ratio)}）`)
+    }
+    lines.push('')
+  }
+  // 溯源三态 · 矛盾点名：cache-hit=none（缓存层明确报告「主 key 与兜底都没恢复」）却记录了复用 N/M
+  // ⇒ 只可能是接线坏了（参数没接上 / output 名写错 / 落到别的段）。纯显示层交叉校验，不加 throw。
+  if (contradiction.length > 0) {
+    lines.push('⚠️ 复用溯源与复用计数自相矛盾（cache-hit=none 却记录了复用 N/M）——接线可能坏了：')
+    lines.push('')
+    for (const r of contradiction) lines.push(`- \`${r.seg}\``)
     lines.push('')
   }
   if (unaccounted.length > 0) {
@@ -991,8 +1091,10 @@ function _renderReuseNotice (results) {
   const partialSet = new Set(partial)
   const unaccountedOnly = unaccounted.filter(r => !partialSet.has(r)).length
   const cleanFull = usable.length - partial.length - unknown.length - unaccountedOnly
+  // 溯源三态只在**兜底段数 > 0** 时追加一句（其余情形末行逐字不变）：四类互斥计数逻辑一字不改。
   lines.push(`其余 ${cleanFull} 段本轮为全量重算（共 ${usable.length} 段：${partial.length} 段含复用、${unknown.length} 段未记录` +
-    (unaccountedOnly > 0 ? `、${unaccountedOnly} 段标为全量但复用口径与报告不一致` : '') + '）。')
+    (unaccountedOnly > 0 ? `、${unaccountedOnly} 段标为全量但复用口径与报告不一致` : '') +
+    (fallback.length > 0 ? `、其中 ${fallback.length} 段由兜底缓存复原（主 key 未命中）` : '') + '）。')
   lines.push('')
   return lines
 }
@@ -1160,12 +1262,17 @@ function stripReportFiles (files) {
 
 /**
  * 解析 `--reuse` 模式的参数（fail-closed：参数不明/缺取值一律抛错，不静默空转）。
- * 用法：`node scripts/mutation-report.js --reuse --segment <段名> --log <stryker.log> [--out <reuse.json>]`
+ * 用法：`node scripts/mutation-report.js --reuse --segment <段名> --log <stryker.log> [--out <reuse.json>] [--cache-hit <true|false|none>]`
+ *
+ * `--cache-hit` 是**可选**参数，取值只接受 true / false / none 三个字符串（actions/cache 的 cache-hit
+ * output 经工作流 `|| 'none'` 归一后的形态）：
+ *   * 缺席 ⇒ 复用来源**未记录**（向后兼容旧 artifact / 其它调用方，不得报错）；
+ *   * 非空但非法 ⇒ 抛错（走 fail-closed：stderr 提示 + 返回 1 + **不写** reuse.json）。
  * @param {string[]} args 去掉 `--reuse` 之后的参数
- * @returns {{segment: string, logPath: string, outPath: string}}
+ * @returns {{segment: string, logPath: string, outPath: string, cacheHit?: string}}
  */
 function parseReuseArgs (args) {
-  const known = new Set(['--segment', '--log', '--out'])
+  const known = new Set(['--segment', '--log', '--out', '--cache-hit'])
   const values = {}
   for (let i = 0; i < args.length; i++) {
     const a = String(args[i])
@@ -1180,10 +1287,16 @@ function parseReuseArgs (args) {
   for (const required of ['--segment', '--log']) {
     if (!values[required]) throw new Error(`缺少必填参数 ${required}`)
   }
+  // fail-closed：非空但非法（如 `--cache-hit yes` / `--cache-hit 1`）一律抛错，不得静默当成「未记录」
+  // ——静默降级会把「接线写错」伪装成「旧 artifact」，正是 issue #167 要消灭的那类不可见。
+  if (values['--cache-hit'] !== undefined && !CACHE_HIT_ARG_VALUES.includes(values['--cache-hit'])) {
+    throw new Error(`--cache-hit 取值非法（${JSON.stringify(values['--cache-hit'])}）：只接受 ${CACHE_HIT_ARG_VALUES.join(' / ')}`)
+  }
   return {
     segment: values['--segment'],
     logPath: values['--log'],
-    outPath: values['--out'] || path.join('reports', 'mutation', 'reuse.json')
+    outPath: values['--out'] || path.join('reports', 'mutation', 'reuse.json'),
+    cacheHit: values['--cache-hit']
   }
 }
 
@@ -1197,7 +1310,7 @@ function runReuseMode (argv, io = {}) {
     parsed = parseReuseArgs(argv)
   } catch (e) {
     err.write(`❌ 复用状态参数非法：${String((e && e.message) || e)}\n`)
-    err.write('   用法：node scripts/mutation-report.js --reuse --segment <段名> --log <stryker.log> [--out reports/mutation/reuse.json]\n')
+    err.write('   用法：node scripts/mutation-report.js --reuse --segment <段名> --log <stryker.log> [--out reports/mutation/reuse.json] [--cache-hit <true|false|none>]\n')
     return 1
   }
   const r = writeReuseMeta({ ...parsed, now })
@@ -1297,6 +1410,7 @@ module.exports = {
   runReuseMode,
   formatReuseCell,
   reuseUnaccountedCount,
+  reuseOriginSuffix,
   stripAnsi,
   // 双口径（PR-1 · A2 决策）：既有「分数」与新增「covered 口径」并列
   coveredDenominator,
@@ -1314,5 +1428,12 @@ module.exports = {
   REUSE_MODE_PARTIAL,
   REUSE_MODE_UNKNOWN,
   HIGH_REUSE_RATIO,
-  REUSE_LOG_MAX_BYTES
+  REUSE_LOG_MAX_BYTES,
+  // 溯源三态（v3.276 续 · issue #167）
+  CACHE_HIT_PRIMARY,
+  CACHE_HIT_FALLBACK,
+  CACHE_HIT_NONE,
+  CACHE_HIT_ARG_VALUES,
+  mapCacheHitArg,
+  normalizeCacheHitField
 }

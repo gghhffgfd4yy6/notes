@@ -667,13 +667,17 @@ function schemaReport (seg, mutants) {
   }
 }
 
-// 场景 18（PR #158 Qodo Medium / Correctness）：`--reuse` 落盘模式的端到端行为。
-// 三个契约：
+// 场景 18（PR #158 Qodo Medium / Correctness + v3.276 续 issue #167）：`--reuse` 落盘模式的端到端行为。
+// 四个契约：
 //   ① 有报告 + 有日志 ⇒ 落盘 reuse.json（段名/模式/复用数/总数/比例/原文证据齐全）；
 //   ② **无报告 ⇒ 一个字都不许写**（连目录都不建）——否则崩溃段因多出 reuse.json 让
 //      reports/mutation/ 非空，上传步的 `if-no-files-found: error` 失效，「stryker 没产出报告 ⇒
 //      段 job 响亮变红」被降级成「汇总 job 缺段才暴露」（PR #156 有意前移的故障信号）；
-//   ③ 参数非法 ⇒ exit 1（fail-closed，不得静默按默认值跑）。
+//   ③ 参数非法 ⇒ exit 1（fail-closed，不得静默按默认值跑）；
+//   ④ 溯源三态（issue #167）：`--cache-hit true|false|none` ⇒ reuse.json 的 cacheHit 分别为
+//      primary/fallback/none；**缺席 ⇒ 不写该字段**（向后兼容旧 artifact / 其它调用方）；
+//      **非空但非法 ⇒ 非零退出且不产生 reuse.json**（不得静默降级成「未记录」，否则接线写错
+//      会被伪装成「旧 artifact」，正是 issue #167 要消灭的那类不可见）。
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-reuse-cli-'))
   try {
@@ -712,23 +716,52 @@ function schemaReport (seg, mutants) {
       assert.strictEqual(bad.code, 1, `参数非法应 exit 1：${args.join(' ')}`)
       assert.ok(bad.stderr.includes('参数非法'), `应给出参数非法提示：${bad.stderr}`)
     }
+
+    // ④ 溯源三态：--cache-hit 三值落盘映射（CLI 取值 → reuse.json 字段）
+    for (const [arg, want] of [['true', 'primary'], ['false', 'fallback'], ['none', 'none']]) {
+      const r = runCli(['--reuse', '--segment', 'app', '--log', log, '--out', out, '--cache-hit', arg])
+      assert.strictEqual(r.code, 0, `--cache-hit ${arg} 应 exit 0，stderr: ${r.stderr}`)
+      assert.strictEqual(JSON.parse(fs.readFileSync(out, 'utf8')).cacheHit, want, `--cache-hit ${arg} ⇒ cacheHit=${want}`)
+    }
+    // ④b 缺席 ⇒ 字段不存在（保持旧形状：旧 artifact / 其它调用方不得因缺参数被写进任何值）
+    const absent = runCli(['--reuse', '--segment', 'app', '--log', log, '--out', out])
+    assert.strictEqual(absent.code, 0, `不传 --cache-hit 应 exit 0，stderr: ${absent.stderr}`)
+    assert.ok(!('cacheHit' in JSON.parse(fs.readFileSync(out, 'utf8'))), '未传 --cache-hit 时不得写 cacheHit 字段')
+    // ④c 非空但非法 ⇒ 非零退出且**不产生** reuse.json（先删掉已有产物，证明没被重写）
+    fs.rmSync(out)
+    const badCacheHit = runCli(['--reuse', '--segment', 'app', '--log', log, '--out', out, '--cache-hit', 'yes'])
+    assert.strictEqual(badCacheHit.code, 1, '非法 --cache-hit 必须非零退出（fail-closed，不得静默当成「未记录」）')
+    assert.ok(badCacheHit.stderr.includes('参数非法'), `应给出参数非法提示：${badCacheHit.stderr}`)
+    assert.strictEqual(fs.existsSync(out), false, '非法 --cache-hit 不得写 reuse.json')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 }
 
-// 场景 19（PR #158 · 接线）：复用状态的**生产链路**必须接全，否则日报永远显示「未记录」而没人发现。
-// 链路三段（缺任一段，功能静默失效）：
+// 场景 19（PR #158 · 接线 + v3.276 续 issue #167 溯源三态）：复用状态的**生产链路**必须接全，否则日报
+// 永远显示「未记录」而没人发现。链路四段（缺任一段，功能静默失效）：
 //   ① 「变异测试」step 必须带 `--fileLogLevel info` —— stryker 默认 fileLogLevel 是 off，不写 stryker.log；
 //      而报告本身没有复用维度（mutation-testing-report-schema 的 MutantResult 无任何 reuse 字段），
 //      日志是唯一判定源 ⇒ 少了这个 flag，「复用可见」整条链失效且**没有任何报错**；
 //   ② 必须存在「记录本段增量复用状态」step：if: always()、经生产 CLI `node scripts/mutation-report.js --reuse`、
 //      带 --segment/--log/--out 三个参数（不得内联脚本，否则与用例/文档漂移）；
 //   ③ 顺序：stryker → 本 step → 上传 artifact（在 stryker 之前没日志可读；在上传之后 reuse.json 进不了
-//      artifact，汇总 job 拿不到 ⇒ 日报照旧显示「未记录」）。
-// 断言只读**活动 YAML 行**（注释不算证据），并配两条靶向反例。
+//      artifact，汇总 job 拿不到 ⇒ 日报照旧显示「未记录」）；
+//   ④ 溯源三态（issue #167）：「恢复增量缓存」step 必须带 `id:`，且复用状态 step 的**活动 run 行**必须带
+//      `--cache-hit` 并引用该 id 的 `cache-hit` output —— 少了 id 拿不到 output、少了 --cache-hit 则日报
+//      只剩「复用 N/M」，读者永远分不清「主 key 命中」与「兜底缓存复原」（实测 run 35775812104：19/19 段
+//      100% 复用，其中依赖 fast-check 4.10.0→4.10.1 的变化被兜底缓存吞掉、从未重算而日报看不出来）。
+// 断言只读**活动 YAML 行**（注释不算证据），并配四条靶向反例。
 {
   const ymlPath = path.join(__dirname, '.github', 'workflows', 'mutation.yml')
+  // 6 空格缩进的 step 起点（`- name:` / `- uses:` / `- id:`）⇒ 用于切出单个 step 的行范围。
+  const stepStartRe = /^ {6}- (?:name|uses|id):/
+  const blockEndOf = (arr, at) => {
+    for (let i = at + 1; i < arr.length; i++) {
+      if (stepStartRe.test(arr[i])) return i
+    }
+    return arr.length
+  }
   const assertReuseContract = (ymlText) => {
     const all = ymlText.split('\n')
     const jobStart = all.findIndex(l => /^ {2}mutation:\s*$/.test(l))
@@ -770,6 +803,24 @@ function schemaReport (seg, mutants) {
     // ③ 顺序
     assert.ok(reuseAt > strykerAt, '复用状态 step 必须在 stryker 之后（之前没有 stryker.log 可读）')
     assert.ok(reuseAt < uploadAt, '复用状态 step 必须在上传 artifact 之前（之后写就进不了 artifact，日报拿不到）')
+    // ④ 溯源三态接线：「恢复增量缓存」step 必须带 id（否则拿不到 cache-hit output）
+    const cacheAt = stepAt('恢复增量缓存')
+    assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」step：' +
+      '它是溯源三态（issue #167）的唯一数据源，被删掉后 cacheHit 恒为「未记录」而无人察觉')
+    const cacheStep = job.slice(cacheAt, blockEndOf(job, cacheAt))
+    const idLine = cacheStep.map(l => l.trim()).find(l => l.startsWith('id:'))
+    assert.ok(idLine, '「恢复增量缓存」step 必须带 id：' +
+      '没有 id 就拿不到 actions/cache 的 cache-hit output ⇒ --cache-hit 无法接线，日报只剩「复用 N/M」')
+    const cacheId = idLine.slice('id:'.length).trim()
+    assert.match(cacheId, /^[A-Za-z_][A-Za-z0-9_-]*$/, `「恢复增量缓存」step 的 id 形状非法：${JSON.stringify(cacheId)}`)
+    // ④b 复用状态 step 的**活动** run 行必须带 --cache-hit 且引用该 id 的 cache-hit output
+    assert.ok(reuseRun.includes('--cache-hit'),
+      '复用状态 step 的活动 run 行必须带 --cache-hit：' +
+      '否则日报只有「复用 N/M」，读者分不清「主 key 命中（输入未变）」与「兜底缓存复原（输入已变却复用）」（issue #167）')
+    const cacheHitRef = '$' + '{{ steps.' + cacheId + '.outputs.cache-hit'
+    assert.ok(reuseRun.includes(cacheHitRef),
+      `--cache-hit 必须引用「恢复增量缓存」step（id: ${cacheId}）的 cache-hit output（${cacheHitRef} ...），` +
+      '否则溯源恒为「未记录」，接线断了却没人发现')
   }
   assertReuseContract(fs.readFileSync(ymlPath, 'utf8'))
 
@@ -790,27 +841,50 @@ function schemaReport (seg, mutants) {
   {
     const real = fs.readFileSync(ymlPath, 'utf8')
     const lines = real.split('\n')
-    const stepStartRe = /^ {6}- (?:name|uses|id):/
-    const blockEnd = (arr, at) => {
-      for (let i = at + 1; i < arr.length; i++) {
-        if (stepStartRe.test(arr[i])) return i
-      }
-      return arr.length
-    }
     const reuseName = '记录本段增量复用状态（' + '${' + '{ matrix.name }}）'
     const reuseAt = lines.findIndex(l => l.trim() === `- name: ${reuseName}`)
     assert.ok(reuseAt > 0, '夹具必须能定位复用状态 step')
-    const block = lines.slice(reuseAt, blockEnd(lines, reuseAt))
-    const rest = [...lines.slice(0, reuseAt), ...lines.slice(blockEnd(lines, reuseAt))]
+    const block = lines.slice(reuseAt, blockEndOf(lines, reuseAt))
+    const rest = [...lines.slice(0, reuseAt), ...lines.slice(blockEndOf(lines, reuseAt))]
     const upAt = rest.findIndex(l => l.trim() === '- name: 上传变异报告')
     assert.ok(upAt > 0, '夹具必须能定位上传变异报告 step')
-    const upEnd = blockEnd(rest, upAt)
+    const upEnd = blockEndOf(rest, upAt)
     const moved = [...rest.slice(0, upEnd), ...block, ...rest.slice(upEnd)].join('\n')
     assert.notStrictEqual(moved, real, '反例夹具必须真的挪动了 step')
     assert.ok(moved.indexOf(`- name: ${reuseName}`) > moved.indexOf('- name: 上传变异报告'),
       '夹具中复用状态 step 必须已排在上传之后（否则反例证明的不是「顺序错会红」）')
     assert.throws(() => assertReuseContract(moved), /必须在上传 artifact 之前/,
       '把复用状态 step 挪到上传之后必须红：否则 artifact 里没有 reuse.json，日报永远「未记录」而套件仍全绿')
+  }
+  // 反例 C（靶向）：删掉「恢复增量缓存」step 的 id 行 ⇒ 同一套断言必须红（cache-hit output 无从引用）。
+  // 必须先断言夹具真的删到了**该 step 内**的 id 行（按 step 边界定位，不是文件里任意一个 `id:`）。
+  {
+    const real = fs.readFileSync(ymlPath, 'utf8')
+    const lines = real.split('\n')
+    const at = lines.findIndex(l => l.trim() === '- name: 恢复增量缓存')
+    assert.ok(at > 0, '夹具必须能定位恢复增量缓存 step')
+    const end = blockEndOf(lines, at)
+    const idAt = lines.slice(at, end).findIndex(l => l.trim().startsWith('id:'))
+    assert.ok(idAt >= 0, '夹具必须能在恢复增量缓存 step 内定位 id 行（否则反例形同虚设）')
+    const strippedLines = [...lines.slice(0, at + idAt), ...lines.slice(at + idAt + 1)]
+    const stripped = strippedLines.join('\n')
+    assert.notStrictEqual(stripped, real, '反例夹具必须真的删掉了 id 行')
+    assert.ok(!strippedLines.slice(at, blockEndOf(strippedLines, at)).some(l => l.trim().startsWith('id:')),
+      '夹具中该 step 应已无 id 行')
+    assert.throws(() => assertReuseContract(stripped), /「恢复增量缓存」step 必须带 id/,
+      '删掉 id 后必须红：否则 cache-hit output 拿不到，溯源恒为「未记录」而套件仍全绿')
+  }
+  // 反例 D（靶向）：只删掉**活动 run 行**上的 `--cache-hit ...` 片段 ⇒ 同一套断言必须红。
+  // 必须锚在 `run: node scripts/mutation-report.js --reuse` 那一行：文件注释里也写着 `--cache-hit`，
+  // 若用宽松的 `replace(/ --cache-hit.*$/m)`，被删掉的可能是注释里那处（活动行仍在）⇒ 反例根本不成立。
+  {
+    const real = fs.readFileSync(ymlPath, 'utf8')
+    const stripped = real.replace(/^( *run: node scripts\/mutation-report\.js --reuse .*?) --cache-hit \$?\{\{[^\n]*$/m, '$1')
+    assert.notStrictEqual(stripped, real, '反例夹具必须真的从活动 run 行删掉了 --cache-hit（没改成本回归形同虚设）')
+    const activeRun = stripped.split('\n').find(l => l.trim().startsWith('run: node scripts/mutation-report.js --reuse'))
+    assert.ok(activeRun && !activeRun.includes('--cache-hit'), '夹具中活动 run 行应已不含 --cache-hit')
+    assert.throws(() => assertReuseContract(stripped), /--cache-hit/,
+      '去掉活动 run 行的 --cache-hit 后必须红：否则日报只剩「复用 N/M」，issue #167 的兜底复原永远不可见')
   }
 }
 
