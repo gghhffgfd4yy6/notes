@@ -168,9 +168,9 @@ npm run test:notify
 npm run test:mutation         # Stryker 变异测试（需 devDependencies，耗时长；本地走 command 档 stryker.config.js）
                               # CI 变异矩阵走 TAP 档 stryker.tap.config.js（15 段；v3-entry / storage / qinglong-push / check-deps
                               # 保留 command 档，见 AGENTS.md）：全 19 段 TAP 基线（spike，run head `cb247c9`）墙钟 ≈71min（瓶颈=utils 70.25min；⚠️ 该基线 run 整体结论为 failure：`storage` 段按设计触发 fail-closed 守卫判红，非 timeout）；
-                              # PR-1（= PR #162，TAP 迁移落地提交 `b05e323`）当时的 16 TAP + 3 command 矩阵实测墙钟 **86.0min**（run `35646992130`，head `ca63e71`，分支 push；
+                              # PR-1（= PR #162，TAP 迁移落地提交 `b05e323`）当时的 16 TAP + 3 command 矩阵实测墙钟 **86.0min**（head `ca63e71` 的分支 push run，2026-09-21T19:47:10Z→21:13:12Z；
                               # 瓶颈=command 档 qinglong-push 85.3min）；改为 15 TAP + 4 command（v3-entry 走 command：TAP 档实测丢 19 个击杀、
-                              # command 档预估 ≈34min < 瓶颈）。该矩阵首跑实测（run `35827096127`，head `01c0ef89`）墙钟 **90.8min**、
+                              # command 档预估 ≈34min < 瓶颈）。该矩阵首跑实测（head `01c0ef89` 的 main push run，2026-09-23T06:30:47Z→08:01:34Z）墙钟 **90.8min**、
                               # 瓶颈 command 档 `qinglong-push` **90.1min**（v3-entry 实测 35.1min）⇒ 原先「墙钟不变」的预估不成立。
                               # 各段回退机制与实测代价见 AGENTS.md 的「TAP 档已知限制」。
 npm run test:mutation-ranges  # 单独校验 mutation.yml 行段覆盖
