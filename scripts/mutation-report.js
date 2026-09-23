@@ -460,12 +460,12 @@ function writeReuseMeta (options) {
 }
 
 // ===== runner 档位：逐段披露「该段走哪个 stryker 配置」=========================================
-// 背景（独立审查 A2 · F-2）：PR-1 起 mutation.yml 的矩阵**逐段**用 `config` 选 runner——16 段走
-// `stryker.tap.config.js`（`coverageAnalysis:'perTest'`，会产出 NoCoverage），3 段留在
+// 背景（独立审查 A2 · F-2）：PR-1 起 mutation.yml 的矩阵**逐段**用 `config` 选 runner——15 段走
+// `stryker.tap.config.js`（`coverageAnalysis:'perTest'`，会产出 NoCoverage），4 段留在
 // `stryker.config.js`（command 档，`coverageAnalysis:'off'`）。command 档**结构上不产出 NoCoverage**
 // （见 mutation.yml 的矩阵注释与 .local/cmd-arts 的同段对照：`{'Killed':369,'Survived':75,'Timeout':1}`
-// 里根本没有 NoCoverage 状态）⇒ 这 3 段的 `无覆盖` 恒为 0 是 **runner 的盲区**，不是「已全部覆盖」。
-// 不披露 runner 会怎样：这 3 段上新增的 `covered 口径` 必然等于 `分数`（分母相同），再配上表下
+// 里根本没有 NoCoverage 状态）⇒ 这 4 段的 `无覆盖` 恒为 0 是 **runner 的盲区**，不是「已全部覆盖」。
+// 不披露 runner 会怎样：这 4 段上新增的 `covered 口径` 必然等于 `分数`（分母相同），再配上表下
 // 「NC=0 ⇒ 两列相等」的说明，读者会把「runner 看不见覆盖」读成「不存在未覆盖区域」——与本 PR
 // 「让不诚实的可见性浮出来」的立意相反。故日报必须**逐段**披露 runner 档位。
 //
@@ -950,10 +950,12 @@ function _renderSegmentTable (results) {
  *     ⇒ 日志 `Result:\t\t6 of 6 mutant result(s) are reused.`，**报告里却有 8 个变异体**：
  *     多出的 2 个正是第 4 行（已不在当前范围）的旧变异体，status 沿用旧值。
  *   * 对照组：删掉 inc.json 后用同一 `--mutate "src.js:1-3"` 全量跑 ⇒ 报告恰好 6 个。
- * 该场景在本仓可达（两条机制叠加，**都不要求「源文件完全没变」**）：① `mutation.yml` 的缓存 key 是
- * `stryker-<段>-cfg-<hashFiles(stryker.config.js, stryker.tap.config.js)>-src-<hashFiles(package-lock.json, run_mutation.js, matrix.src)>`
- * （**不含 mutate 范围**），而 `restore-keys` 是带**同一配置指纹**的兜底前缀 `stryker-<段>-cfg-<配置指纹>-`
- * ⇒ 主 key 未命中时（源文件变了、或 package-lock / run_mutation.js / matrix.src 变了）仍会恢复**同档
+ * 该场景在本仓可达（两条机制叠加，**都不要求「源文件完全没变」**）：① `mutation.yml`「恢复增量缓存」
+ * step 的 `key:` / `restore-keys:`（该文件是唯一权威，此处不复述）——缓存 key 是
+ * `stryker-<段>-cfg-<matrix.config 档位>-<hashFiles(stryker.config.js, stryker.tap.config.js, scripts/tap-shim.js)>-deps-<hashFiles(package-lock.json)>-src-<hashFiles(run_mutation.js, matrix.src)>`
+ * （**不含 mutate 范围**），而 `restore-keys` 是带**同一档位名 + 同一配置指纹 + 同一依赖指纹**的兜底前缀
+ * `stryker-<段>-cfg-<同一档位>-<同一配置指纹>-deps-<同一依赖指纹>-`
+ * ⇒ 主 key 未命中时（源文件变了、或 run_mutation.js / matrix.src 变了）仍会恢复**同档
  * 配置**的最近一条同前缀缓存，旧 `reports/inc-<段>.json` 照样回到工作树；
  * ② 本仓要求大文件增长时**重拆 matrix 的 mutate 行段**（AGENTS.md）⇒ 旧 inc 里落在新范围之外的变异体
  * 被 sticky 分支原样并入报告。

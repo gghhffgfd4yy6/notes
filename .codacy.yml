@@ -131,7 +131,10 @@
 # 与上方 scripts/mutation-json.js 同族同信任模型）：「读调用方给出的路径」正是它的本职工作——
 #   · `--reuse` 模式的 --log/--out 由 .github/workflows/mutation.yml 的「记录本段增量复用状态」step
 #     以固定字面量传入（node scripts/mutation-report.js --reuse --segment "${{ matrix.name }}"
-#     --log stryker.log --out reports/mutation/reuse.json）；
+#     --log stryker.log --out reports/mutation/reuse.json --cache-hit "$CACHE_HIT"）；其中 --cache-hit 的
+#     值来自该 step 的 env（`CACHE_HIT: ${{ steps.inc-cache.outputs.cache-hit || 'none' }}`），属**外部输入**、
+#     与「路径参数由固定字面量传入」这一论证无关——该值的取值空间另由 CLI 的 fail-closed 校验限定为
+#     true/false/none（非空非法值直接 exit 1，不静默降级）；
 #   · 汇总模式的 reports-dir 同样来自该 workflow（固定值 mutation-reports），且 analyze() 入口先
 #     statSync + isDirectory() 校验，不合法即 exit 1；
 #   · readLogText() 先 path.resolve() 归一，按「单次 openSync + 只对 fd 做 fstatSync/读取」访问路径

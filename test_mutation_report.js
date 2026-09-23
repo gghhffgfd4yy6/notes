@@ -517,13 +517,15 @@ check('render：复用元信息**不改变**任何分数/统计口径（只多�
 // fallback 专用小节、none+partial 矛盾点名、末行兜底计数，以及「字段缺失 ≠ 主 key 命中」这条关键否定。
 
 check('mapCacheHitArg/normalizeCacheHitField：只认三态，缺失或非法一律 undefined（不抛）', () => {
-  assert.strictEqual(mapCacheHitArg('true'), CACHE_HIT_PRIMARY)
-  assert.strictEqual(mapCacheHitArg('false'), CACHE_HIT_FALLBACK)
-  assert.strictEqual(mapCacheHitArg('none'), CACHE_HIT_NONE)
+  // 期望值用**字面量**而非实现导出的 CACHE_HIT_* 常量（独立审查 R4-F8）：用常量做期望等于
+  // 「改常量即改契约」——常量到 'primary'/'fallback'/'none' 的映射只由另一个文件锁定。
+  assert.strictEqual(mapCacheHitArg('true'), 'primary')
+  assert.strictEqual(mapCacheHitArg('false'), 'fallback')
+  assert.strictEqual(mapCacheHitArg('none'), 'none')
   for (const bad of [undefined, null, '', 'yes', 'PRIMARY', 'True', 'primary', 1, true, 0]) {
     assert.strictEqual(mapCacheHitArg(bad), undefined, `CLI 取值 ${JSON.stringify(bad)} 不得映射成三态`)
   }
-  for (const v of [CACHE_HIT_PRIMARY, CACHE_HIT_FALLBACK, CACHE_HIT_NONE]) assert.strictEqual(normalizeCacheHitField(v), v)
+  for (const v of ['primary', 'fallback', 'none']) assert.strictEqual(normalizeCacheHitField(v), v)
   for (const bad of [undefined, null, '', 'yes', 'PRIMARY', 'True', 1, true, {}]) {
     assert.strictEqual(normalizeCacheHitField(bad), undefined, `reuse.json 的 cacheHit=${JSON.stringify(bad)} 必须降级为 undefined`)
   }
@@ -583,6 +585,44 @@ const partialSeg = (seg, cacheHit, over = {}) => ({
   ...over
 })
 
+// 低/边界复用比例夹具：**有意不写 `high` 字段** ⇒ 只能走 render 里的 `ratio >= HIGH_REUSE_RATIO`
+// **兜底分支**。该分支在生产路径上不可达——生产里 `reuse.high` 一律由 `normalizeReuseMeta` 给出
+// （`high: ratio >= HIGH_REUSE_RATIO`），故本夹具只锁「防御纵深」；阈值本身的**生产路径锁**是紧随其后的
+// normalizeReuseMeta 用例（独立审查 V2 · G1：把实现改成 `high: true` 时两侧曾都存活）。
+const lowRatioSeg = (seg, reused, total) => partialSeg(seg, undefined, {
+  reuse: { mode: REUSE_MODE_PARTIAL, reused, total, ratio: reused / total }
+})
+
+check('render：复用比例 <50% 不得打「复用比例高」，恰好 50% 必须打（阈值两侧都有判别力）', () => {
+  // 反例靶子（独立审查 R4-F4）：此前所有新夹具恒 80% 复用 ⇒ 把 `const high = true` 写死
+  // （低复用段也无条件打提示）的变异**全绿**。这里从阈值两侧各取一个反例。
+  // ⚠️ 本用例走的是 render 的**兜底分支**（夹具不写 `high`）；生产里 `high` 由 normalizeReuseMeta 决定
+  // ⇒ 阈值在生产路径上的判别力由下一条用例负责，别把这条读成生产路径的锁。
+  const low = render([lowRatioSeg('app', 2, 10)])
+  assert.ok(low.includes('- `app`：复用 2/10（20.00%）'), `低复用段必须照示真实比例：\n${low}`)
+  assert.ok(!low.includes('复用比例高'), `20% 复用不得打「复用比例高」提示：\n${low}`)
+  // 边界：恰好 50% 必须打（buildReuseMeta/normalizeReuseMeta 的口径同为 ≥）
+  const edge = render([lowRatioSeg('app', 5, 10)])
+  assert.ok(edge.includes('- `app`：复用 5/10（50.00%） ⚠️ **复用比例高**（≥50.00%）（复用来源未记录）'),
+    `恰好 50% 必须打「复用比例高」：\n${edge}`)
+})
+
+check('normalizeReuseMeta：复用比例高阈值（≥50%）的**生产路径**锁，两侧都可判别（独立审查 V2 · G1）', () => {
+  // 为什么必须单开一条：`render` 只在 `reuse.high` **缺失**时才回落到 `ratio >= HIGH_REUSE_RATIO`，
+  // 而生产里 `high` 一律由本函数给出（`scripts/mutation-report.js` 的 partial 分支）⇒ 只测 render
+  // 的兜底分支时，把该处写死成 `high: true`（或 `high: false`）两侧都存活（V2 实测）。
+  // 期望值用**字面量** `false`/`true`（R4-F8）：不得用实现常量或 `reused/total >= …` 之类的表达式复述实现。
+  const meta = (reused, total) => normalizeReuseMeta({ segment: 'app', mode: REUSE_MODE_PARTIAL, reused, total }, 'app')
+  assert.strictEqual(meta(2, 10).high, false, '20% ⇒ 不得标为复用比例高')
+  assert.strictEqual(meta(4, 10).high, false, '40%（贴边）⇒ 不得标为复用比例高')
+  assert.strictEqual(meta(5, 10).high, true, '恰好 50% ⇒ 必须标为复用比例高（阈值是 ≥）')
+  assert.strictEqual(meta(6, 10).high, true, '60%（贴边）⇒ 必须标为复用比例高')
+  // 阈值紧下侧再取一点：上面四点只把阈值夹在 (0.4, 0.5]，把比较写成区间内的魔数（如 `ratio >= 0.45`）
+  // 会全部存活（独立验证 V2b 实测）⇒ 补 49% 与另一种分母的 50% 两点，夹死 (0.4, 0.5) 区间。
+  assert.strictEqual(meta(49, 100).high, false, '49%（阈值紧下侧）⇒ 不得标为复用比例高')
+  assert.strictEqual(meta(50, 100).high, true, '恰好 50%（另一种分母）⇒ 必须标为复用比例高（阈值是 ≥）')
+})
+
 check('render 溯源三态 · primary：行尾标「主 key 命中」，无兜底小节/矛盾点名，末行逐字不变', () => {
   const out = render([partialSeg('app', CACHE_HIT_PRIMARY)])
   assert.ok(out.includes('- `app`：复用 8/10（80.00%） ⚠️ **复用比例高**（≥50.00%）（主 key 命中：hashFiles 覆盖的输入未变）'),
@@ -628,22 +668,71 @@ check('render 溯源三态 · 字段缺失：显示「复用来源未记录」�
 })
 
 check('render 溯源三态 · full 段即使带 cacheHit=fallback 也不得触发溯源渲染（只谈 partial）', () => {
-  const out = render([{ seg: 'app', total: 10, killed: 10, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL, cacheHit: CACHE_HIT_FALLBACK } }])
-  assert.ok(out.includes('| app | 10 | 10 | 0 | 0 | 0 | 100% | 100% | 全量 |'), 'full 段表格不得加后缀')
-  assert.ok(out.includes('本轮 1 段全部全量重算（无复用）⇒ 分数与存活清单对应本 commit 的测试状态。'), 'full 段不得被溯源文案干扰')
-  assert.ok(!out.includes('兜底'), 'full 段不得出现任何兜底溯源文案')
+  // 反例靶子（独立审查 R4-F1）：早期夹具**只有 1 个 full 段**，先命中「本轮 1 段全部全量重算（无复用）」
+  // 的早退分支 ⇒ `fallback` 分组根本走不到，把实现的 `partial.filter(...)` 改成 `usable.filter(...)`
+  // （变异 S）后本用例曾**全绿**（85/85）——断言结构上不可能红。现改为**混合夹具**：
+  // ① 一个 `mode:'full'` 且 `cacheHit:'fallback'` 的段；② 真的会触发兜底分组的 partial+fallback 段。
+  const fullFallback = { seg: 'app', total: 10, killed: 10, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL, cacheHit: CACHE_HIT_FALLBACK } }
+  const out = render([fullFallback, partialSeg('utils', CACHE_HIT_FALLBACK), partialSeg('rules', CACHE_HIT_PRIMARY)])
+  // ① full 段表格不得因 cacheHit 加「·兜底」后缀
+  assert.ok(out.includes('| app | 10 | 10 | 0 | 0 | 0 | 100% | 100% | 全量 |'), `full 段表格不得加后缀：\n${out}`)
+  assert.ok(!out.includes('全量·兜底'), 'full 段不得出现「全量·兜底」')
+  // ①′ **行级**锁（独立审查 V2 · Y2）：full 段的表格行里不得出现任何兜底溯源缀。
+  //     为何不用全输出级 `!out.includes('兜底')`：下方 partial 段的兜底小节**本来就含**「兜底」，
+  //     全输出级断言会被它误伤（HEAD 里被删的那条正是这种过宽写法，且换成正例表格行逐字后仍留逃逸：
+  //     在 full 段表格行尾追加 `reuseOriginSuffix(...)` 时曾 86/86 全绿）。故只钉 `app` 那一行。
+  assert.ok(!/\| app \|.*兜底/.test(out), `full 段表格行不得带任何兜底溯源缀：\n${out}`)
+  // ② full 段不得进「复用 N/M」逐段清单（复用小节与兜底小节都不行）；变异 S 下这里会多出 `app`
+  assert.ok(!out.includes('- `app`：复用'), `full 段不得被写进「复用 N/M」逐段清单：\n${out}`)
+  // ③ 兜底小节必须存在，且只能逐段点名 partial+fallback 的那一段
+  assert.ok(out.includes('⚠️ **下列段主 key 未命中却仍在复用 ⇒ 本段不是全量重算**'),
+    `partial+fallback 段必须触发兜底小节：\n${out}`)
+  assert.ok(out.includes('\n- `utils`：复用 8/10（80.00%）\n'), `兜底小节只能点名 partial+fallback 段：\n${out}`)
+  // ④ 末行兜底计数**只数 partial**（1 段，= utils）；变异 S 会把 full 段也算进去 ⇒ 变成 2
+  assert.ok(out.includes('其余 1 段本轮为全量重算（共 3 段：2 段含复用、0 段未记录、其中 1 段由兜底缓存复原（主 key 未命中））。'),
+    `末行兜底计数只数 partial：\n${out}`)
+  // ⑤ 变异 S 下的实际产物是「- `app`：复用 undefined/undefined（NaN%）」——整个输出里不得出现
+  assert.ok(!/undefined\/undefined|NaN%/.test(out), `不得出现未定义复用计数/NaN 比例：\n${out}`)
 })
 
 check('render 溯源三态 · cacheHit 不改变任何分数/统计口径（只多溯源标注）', () => {
-  const base = [partialSeg('app'), partialSeg('utils', CACHE_HIT_PRIMARY)]
-  const withFallback = [partialSeg('app', CACHE_HIT_FALLBACK), partialSeg('utils', CACHE_HIT_PRIMARY)]
+  // 夹具经**真实管线** normalizeReuseMeta 构造（生产里 render 拿到的 reuse 正是它的产物）：
+  // 这样「cacheHit 在归一层被丢弃/忽略」（改 normalizeCacheHitField 或 normalizeReuseMeta）也能被
+  // 下面方向二的整输出比较抓住——若夹具直接塞裸对象，那个原点上的变异就绕过了本用例（独立审查 R4-F2）。
+  const seg = (name, cacheHit) => partialSeg(name, undefined, {
+    reuse: normalizeReuseMeta({ segment: name, mode: REUSE_MODE_PARTIAL, reused: 8, total: 10, ...(cacheHit ? { cacheHit } : {}) }, name)
+  })
+  const base = [seg('app'), seg('utils', CACHE_HIT_PRIMARY)]
+  const withFallback = [seg('app', CACHE_HIT_FALLBACK), seg('utils', CACHE_HIT_PRIMARY)]
   const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|$/, ' |')
   const a = render(base)
   const b = render(withFallback)
+  // 方向一：数字列/合计行逐字相同（cacheHit **泄漏进统计** ⇒ 这里红）
   assert.strictEqual(rowOf(a, 'app'), rowOf(b, 'app'), '同一统计下分数行必须一致（溯源只增加标注）')
   assert.strictEqual(rowOf(a, 'utils'), rowOf(b, 'utils'))
   assert.ok(a.includes('| **合计** | **20** | **10** | **0** | **10** | **0** | **50%** | **50%** | **2 段复用** |'), '合计统计值不得变化')
   assert.ok(b.includes('| **合计** | **20** | **10** | **0** | **10** | **0** | **50%** | **50%** | **2 段复用** |'), '合计统计值不得变化')
+  // 方向二：cacheHit **必须**真的改变渲染产物（独立审查 R4-F2）：只做方向一时 rowOf 把末列整格剥掉、
+  // 两侧数字必然相同 ⇒ 「cacheHit 被完全忽略」的变异无一能击穿（31 个变异里无一能红）。
+  assert.notStrictEqual(a, b, 'cacheHit=fallback 必须让渲染产物真的不同（否则溯源标注形同虚设）')
+  // 且差异**只**允许落在四处：复用列「·兜底」后缀、行尾溯源后缀、兜底小节、末行兜底计数。
+  // 把这几处归一后两边必须逐字相同 ⇒ 任何其它行（尤其数字列）都不许被 cacheHit 影响。
+  const FALLBACK_HEAD = '⚠️ **下列段主 key 未命中却仍在复用'
+  const FALLBACK_SUFFIX = '（**兜底复原**：主 key 未命中，结果 = 旧缓存 + 按内容差分复用）'
+  const stripOrigin = (out) => {
+    const lines = out.split('\n')
+    const start = lines.findIndex(l => l.startsWith(FALLBACK_HEAD))
+    if (start !== -1) {
+      let end = start + 1
+      while (end < lines.length && (lines[end] === '' || lines[end].startsWith('- `'))) end++
+      lines.splice(start, end - start)
+    }
+    return lines.map(l => l
+      .replace('·兜底', '')
+      .replace(FALLBACK_SUFFIX, '（复用来源未记录）')
+      .replace('、其中 1 段由兜底缓存复原（主 key 未命中）', '')).join('\n')
+  }
+  assert.strictEqual(stripOrigin(b), stripOrigin(a), 'cacheHit 只允许影响复用列/溯源文案，不得渗进任何其它一行')
 })
 
 check('writeReuseMeta/runReuseMode：--cache-hit 三值落盘映射、缺席不写字段、非法 fail-closed 且不写 reuse.json', () => {
@@ -656,8 +745,8 @@ check('writeReuseMeta/runReuseMode：--cache-hit 三值落盘映射、缺席不�
     fs.writeFileSync(path.join(reportDir, 'mutation.json'), '{"files":{}}')
     const out = path.join(reportDir, 'reuse.json')
     const io = () => ({ stdout: { write: () => {} }, stderr: { write: () => {} } })
-    // 三值落盘映射（CLI 取值 → reuse.json 字段）
-    for (const [arg, want] of [['true', CACHE_HIT_PRIMARY], ['false', CACHE_HIT_FALLBACK], ['none', CACHE_HIT_NONE]]) {
+    // 三值落盘映射（CLI 取值 → reuse.json 字段）；期望值用字面量而非 CACHE_HIT_* 常量（R4-F8）
+    for (const [arg, want] of [['true', 'primary'], ['false', 'fallback'], ['none', 'none']]) {
       assert.strictEqual(runReuseMode(['--segment', 'app', '--log', log, '--out', out, '--cache-hit', arg], io()), 0, `--cache-hit ${arg} 应 exit 0`)
       const meta = JSON.parse(fs.readFileSync(out, 'utf8'))
       assert.strictEqual(meta.cacheHit, want, `--cache-hit ${arg} ⇒ cacheHit=${want}`)

@@ -73,10 +73,15 @@ function schemaReport (seg, mutants) {
 }
 
 // 场景 1：无参数 → exit 1 + 用法提示
+// R4-F7：断言必须要求**具体用法文案**（`用法:` / `用法：`），不能靠 `includes('mutation-report.js')`——
+// 本机 `process.execPath` 指向 linker64 时，子进程的 `bad ELF magic` 错误文本里带着脚本绝对路径
+// （其中含 `mutation-report.js`），旧写法在「CLI 根本没跑起来」的情形下照样判绿（假通过）。生产脚本在
+// 参数不合法时确实打印 `用法: node scripts/mutation-report.js <reports-dir> [--issue]`（用法分支两处：`:1349` 的 `--strip` 用法、`:1357` 的 `<reports-dir> [--issue]` 用法；行号按本 PR 落地的树给出——锚点＝`console.error('用法: node scripts/mutation-report.js`（裸用法分支仅 2 处；另 4 处是 `❌ …（用法: …）` 消息内嵌），别只钉数字），
+// 故收紧到该文案：只有脚本自己跑起来并打印了用法才可能满足。
 {
   const r = runCli([])
   assert.strictEqual(r.code, 1, '无参数应 exit 1')
-  assert.ok(r.stderr.includes('用法') || r.stderr.includes('mutation-report.js'), '应输出用法提示')
+  assert.match(r.stderr, /用法[:：]/, '应输出具体用法提示（不得靠错误文本里碰巧出现的脚本路径判绿）')
 }
 
 // 场景 2：不存在的目录 → exit 1 + 错误提示
@@ -747,11 +752,18 @@ function schemaReport (seg, mutants) {
 //      带 --segment/--log/--out 三个参数（不得内联脚本，否则与用例/文档漂移）；
 //   ③ 顺序：stryker → 本 step → 上传 artifact（在 stryker 之前没日志可读；在上传之后 reuse.json 进不了
 //      artifact，汇总 job 拿不到 ⇒ 日报照旧显示「未记录」）；
-//   ④ 溯源三态（issue #167）：「恢复增量缓存」step 必须带 `id:`，且复用状态 step 的**活动 run 行**必须带
-//      `--cache-hit` 并引用该 id 的 `cache-hit` output —— 少了 id 拿不到 output、少了 --cache-hit 则日报
-//      只剩「复用 N/M」，读者永远分不清「主 key 命中」与「兜底缓存复原」（实测 run 35775812104：19/19 段
-//      100% 复用，其中依赖 fast-check 4.10.0→4.10.1 的变化被兜底缓存吞掉、从未重算而日报看不出来）。
-// 断言只读**活动 YAML 行**（注释不算证据），并配四条靶向反例。
+//   ④ 溯源三态（issue #167）：链路两段缺一不可——①「恢复增量缓存」step 必须带 `id:`；②复用状态 step 必须把该
+//      id 的 `cache-hit` output **经 env 注入**（逐字 `CACHE_HIT: ${{ steps.<id>.outputs.cache-hit || 'none' }}`，
+//      **逐字**含 `|| 'none'` 归一），且活动 run 行**逐字**用 `--cache-hit "$CACHE_HIT"`。少了 id 拿不到 output；
+//      少了 env/归一则日报只剩「复用 N/M」，或（空值未归一时）CLI fail-closed 报「缺少取值」。未归一虽然
+//      fail-loud，但 AGENTS.md / CHANGELOG 把它当作**必须**的已锁定不变量 ⇒ 必须有门禁（R2-F5 / R4-F3）。
+//      **为什么走 env 而不内联**：`.github/workflows/test.yml:195-197` 明文约定步骤结果经 env 注入、不直接内联进
+//      `run:`（zizmor template-injection：脚本里出现模板展开时，表达式的值会被 shell 当代码解析，注入面随上游
+//      内容放大），本仓不得在 `run:` 里内联上游 step output（R1-02）。
+//      溯源要解决的是「读者永远分不清『主 key 命中（输入未变）』与『兜底缓存复原（输入已变却复用）』」
+//      （实测 run 35775812104：19/19 段 100% 复用，其中依赖 fast-check 4.10.0→4.10.1 的变化被兜底缓存吞掉、
+//      从未重算而日报看不出来）。
+// 断言只读**活动 YAML 行**（注释不算证据），并配六条靶向反例。
 {
   const ymlPath = path.join(__dirname, '.github', 'workflows', 'mutation.yml')
   // 6 空格缩进的 step 起点（`- name:` / `- uses:` / `- id:`）⇒ 用于切出单个 step 的行范围。
@@ -813,14 +825,25 @@ function schemaReport (seg, mutants) {
       '没有 id 就拿不到 actions/cache 的 cache-hit output ⇒ --cache-hit 无法接线，日报只剩「复用 N/M」')
     const cacheId = idLine.slice('id:'.length).trim()
     assert.match(cacheId, /^[A-Za-z_][A-Za-z0-9_-]*$/, `「恢复增量缓存」step 的 id 形状非法：${JSON.stringify(cacheId)}`)
-    // ④b 复用状态 step 的**活动** run 行必须带 --cache-hit 且引用该 id 的 cache-hit output
-    assert.ok(reuseRun.includes('--cache-hit'),
-      '复用状态 step 的活动 run 行必须带 --cache-hit：' +
-      '否则日报只有「复用 N/M」，读者分不清「主 key 命中（输入未变）」与「兜底缓存复原（输入已变却复用）」（issue #167）')
-    const cacheHitRef = '$' + '{{ steps.' + cacheId + '.outputs.cache-hit'
-    assert.ok(reuseRun.includes(cacheHitRef),
-      `--cache-hit 必须引用「恢复增量缓存」step（id: ${cacheId}）的 cache-hit output（${cacheHitRef} ...），` +
-      '否则溯源恒为「未记录」，接线断了却没人发现')
+    // ④b 复用状态 step：溯源值必须**经 env 注入**（R1-02），且归一必须**逐字**锁住（R2-F5 / R4-F3）。
+    // 先锁 run 行形态：**逐字** `--cache-hit "$CACHE_HIT"`——既不得把 output 表达式内联进 run（本仓约定），
+    // 也不得改名造成 env 与 run 漂移（改名后 shell 展开为空 ⇒ CLI fail-closed 报「缺少取值」）。
+    assert.ok(reuseRun.includes('--cache-hit "$CACHE_HIT"'),
+      '活动 run 行必须逐字用 `--cache-hit "$CACHE_HIT"`（与 env 变量名同源）：' +
+      '既不得把「恢复增量缓存」step 的 output 表达式内联进 run（本仓约定，见 .github/workflows/test.yml 的 ' +
+      'zizmor template-injection 说明），也不得改名造成 env 与 run 漂移（shell 展开为空 ⇒ CLI 报「缺少取值」）')
+    // 再锁 env 行**逐字**（含 `|| 'none'` 归一）。改前的断言只看 run 行 contains `--cache-hit` + 引用 output；
+    // 实测（.local/review-168）：把 `|| 'none'` 删掉后，改前的本文件对那份 mutation.yml 仍判 OK，
+    // 而 test_mutation_report.js 只读 mutation.yml 的矩阵 config:、不读本 step 的 run 行 ⇒ 门禁缺口（R2-F5 / R4-F3）。
+    const envHit = reuseStep.map(l => l.trim()).find(l => l.startsWith('CACHE_HIT:'))
+    assert.ok(envHit, '复用状态 step 必须用 env 注入 CACHE_HIT：' +
+      '本仓约定不把上游 step output 内联进 run（.github/workflows/test.yml 的 zizmor template-injection 说明）')
+    const expectedEnv = 'CACHE_HIT: ' + '$' + '{{ steps.' + cacheId + ".outputs.cache-hit || 'none' }}"
+    assert.strictEqual(envHit, expectedEnv,
+      `env 必须逐字等于 \`${expectedEnv}\`（含 \`|| 'none'\` 归一）：` +
+      'actions/cache 恢复失败时**有意不设置** cache-hit output（上游 issue #1466 ⇒ 无恢复 ≠ cache-hit=false），' +
+      '未归一时 shell 展开成空串、`--cache-hit` 变末参数、CLI 抛「参数非法/缺少取值」；这是 AGENTS.md / ' +
+      'CHANGELOG 当作必须项的已登记不变量，不得只靠「恰好 fail-loud」兜底')
   }
   assertReuseContract(fs.readFileSync(ymlPath, 'utf8'))
 
@@ -874,17 +897,48 @@ function schemaReport (seg, mutants) {
     assert.throws(() => assertReuseContract(stripped), /「恢复增量缓存」step 必须带 id/,
       '删掉 id 后必须红：否则 cache-hit output 拿不到，溯源恒为「未记录」而套件仍全绿')
   }
-  // 反例 D（靶向）：只删掉**活动 run 行**上的 `--cache-hit ...` 片段 ⇒ 同一套断言必须红。
+  // 反例 D（靶向）：只删掉**活动 run 行**上的 `--cache-hit "$CACHE_HIT"` 片段 ⇒ 同一套断言必须红。
   // 必须锚在 `run: node scripts/mutation-report.js --reuse` 那一行：文件注释里也写着 `--cache-hit`，
   // 若用宽松的 `replace(/ --cache-hit.*$/m)`，被删掉的可能是注释里那处（活动行仍在）⇒ 反例根本不成立。
   {
     const real = fs.readFileSync(ymlPath, 'utf8')
-    const stripped = real.replace(/^( *run: node scripts\/mutation-report\.js --reuse .*?) --cache-hit \$?\{\{[^\n]*$/m, '$1')
+    const stripped = real.replace(/^( *run: node scripts\/mutation-report\.js --reuse .*?) --cache-hit "\$CACHE_HIT"$/m, '$1')
     assert.notStrictEqual(stripped, real, '反例夹具必须真的从活动 run 行删掉了 --cache-hit（没改成本回归形同虚设）')
     const activeRun = stripped.split('\n').find(l => l.trim().startsWith('run: node scripts/mutation-report.js --reuse'))
     assert.ok(activeRun && !activeRun.includes('--cache-hit'), '夹具中活动 run 行应已不含 --cache-hit')
     assert.throws(() => assertReuseContract(stripped), /--cache-hit/,
       '去掉活动 run 行的 --cache-hit 后必须红：否则日报只剩「复用 N/M」，issue #167 的兜底复原永远不可见')
+  }
+  // 反例 E（靶向，R2-F5 / R4-F3）：把 env 行上的 `|| 'none'` 归一删掉 ⇒ 同一套断言必须红。
+  // 必须锚在 env 的 `CACHE_HIT: ${{ steps.<id>.outputs.cache-hit || 'none' }}` 那一行：文件注释里也写着这个
+  // 表达式，宽松 replace 可能改到注释而活动 env 行仍在 ⇒ 必须先断言夹具真的改到了目标 env 行。
+  {
+    const real = fs.readFileSync(ymlPath, 'utf8')
+    const mutated = real.replace(/^(\s*CACHE_HIT: \$\{\{ steps\.[A-Za-z0-9_-]+\.outputs\.cache-hit) \|\| 'none' \}\}$/m, '$1 }}')
+    assert.notStrictEqual(mutated, real, "反例夹具必须真的删掉了 env 的 `|| 'none'` 归一（没改成本回归形同虚设）")
+    const envLine = mutated.split('\n').map(l => l.trim()).find(l => l.startsWith('CACHE_HIT:'))
+    assert.ok(envLine && !envLine.includes("|| 'none'"), '夹具中 env 行应已不含归一')
+    assert.throws(() => assertReuseContract(mutated), /env 必须逐字等于[\s\S]*\|\| 'none'/,
+      "删掉 env 的 `|| 'none'` 归一后必须红（变异 Y4）：实测改前的本文件对「已删掉」的 mutation.yml 仍判 OK" +
+      '（test_mutation_report.js 只读矩阵 config:、不读本 step 的 run 行，同样不受影响）：' +
+      '未归一时 actions/cache 恢复失败（issue #1466 有意不设置该 output）会注入空串 ⇒ `--cache-hit` 变末参数、' +
+      'CLI 报「缺少取值」虽 fail-loud，但该不变量被 AGENTS.md / CHANGELOG 当作必须项，不得只靠碰巧响亮失败兜底')
+  }
+  // 反例 F（靶向，R1-02）：把活动 run 行的 `"$CACHE_HIT"` 换回**内联** `${{ ... }}` ⇒ 同一套断言必须红。
+  // 这正是本仓约定（test.yml 的 zizmor template-injection 说明）要防的形态：上游 step output 直接内联进 run
+  // （脚本里出现模板展开 ⇒ 表达式的值被 shell 当代码解析）。必须锚在活动 run 行，且断言夹具真的改到了那一行。
+  {
+    const real = fs.readFileSync(ymlPath, 'utf8')
+    const inline = '$' + "{{ steps.inc-cache.outputs.cache-hit || 'none' }}"
+    const mutated = real.replace(/^( *run: node scripts\/mutation-report\.js --reuse .*?) --cache-hit "\$CACHE_HIT"$/m,
+      `$1 --cache-hit ${inline}`)
+    assert.notStrictEqual(mutated, real, '反例夹具必须真的改到了活动 run 行（没改成本回归形同虚设）')
+    const activeRun = mutated.split('\n').find(l => l.trim().startsWith('run: node scripts/mutation-report.js --reuse'))
+    assert.ok(activeRun && activeRun.includes('--cache-hit $' + '{{') && !activeRun.includes('--cache-hit "$CACHE_HIT"'),
+      '夹具中活动 run 行应已把 env 变量换成内联模板表达式')
+    assert.throws(() => assertReuseContract(mutated), /--cache-hit "\$CACHE_HIT"/,
+      '把 run 行的 `"$CACHE_HIT"` 换回内联 `$' + '{{ ... }}` 后必须红：否则本仓「不内联上游 step output」的约定' +
+      '（R1-02）没有任何门禁，反例会随实现一起漂移')
   }
 }
 

@@ -20,6 +20,146 @@ const testYml = fs.readFileSync('.github/workflows/test.yml', 'utf8')
 const mutationYml = fs.readFileSync('.github/workflows/mutation.yml', 'utf8')
 const pkg = require('./package.json')
 
+// ── 缓存身份门禁：定义与正向调用**前移**到本文件顶部（审查 finding R3-F1 的修法）────────────
+// 为什么必须前移：下方 `try {` … `} finally {`（只有 finally、**没有 catch**）块里的失败是**致命**的——
+//   本机（Android/Termux）的 process.execPath 指向 linker64，凡 execFileSync(process.execPath, …) 形式的
+//   子进程调用必失败 ⇒ 该块的第一条断言（「SKIP_SUITES 含未知套件须点名」）在本机必然先炸、进程当场退出，
+//   其后的断言在本机**零覆盖**。而下面这两条门禁是**纯字符串**断言：只读已读入内存的 mutationYml，
+//   既不 spawn 子进程、也不依赖任何本机环境 ⇒ 前移到那条环境失败之前，缓存身份一旦被改坏，红的是
+//   **它自己**的断言文案，而不会被一个本机环境失败顶掉、无声无息地滑过去。
+// CI 行为不变：这两条断言原本就在同一条同步执行流上**无条件执行**，只是提前了几百行。
+// 边界（不得误读）：本机仍会在那条环境失败处退出，其后的断言（含下方 7 个靶向反例）在本机依旧零覆盖——
+//   本前移**没有**、也**不声称**扩大任何断言的覆盖范围。
+const indentOf = line => line.length - line.trimStart().length
+const yamlOnly = text => text.split('\n').filter(l => !l.trim().startsWith('#'))
+
+// (1)「恢复增量缓存」：key 与 restore-keys 必须是**回退后 + 带档位 + 带依赖**的形态——不含测试指纹段，
+//     而是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>-deps-<依赖指纹>`，源指纹只进主 key。
+//     抽成函数是为了让紧随其后的反例在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本：把 key
+//     改回含测试指纹的形态 ⇒ 必须立刻红。
+const assertCacheStep = (ymlText) => {
+  const cacheAt = ymlText.indexOf('- name: 恢复增量缓存')
+  assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（缓存策略无从核对即视为回归）')
+  const cacheEnd = ymlText.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
+  assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
+  const cacheLines = yamlOnly(ymlText.slice(cacheAt, cacheEnd))
+  const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
+  assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
+  // key 必须逐字等于**档位名 + 配置指纹 + 依赖指纹 + 源指纹**形态：
+  //   stryker-<段>-cfg-<matrix.config 档位>-<两份 stryker 配置 + scripts/tap-shim.js 指纹>-deps-<package-lock.json 指纹>-src-<源指纹>。
+  // 源指纹固定用 matrix.src + run_mutation.js：mutate 里的范围字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，
+  // 会得到空指纹、使 range 段缓存永不过期。
+  // 配置指纹（stryker.config.js + stryker.tap.config.js + scripts/tap-shim.js）与**档位名 `matrix.config`** 都必须同时出现在
+  // key 与兜底前缀里：主 key 未命中时 core 会对恢复进来的 inc **零校验**，兜底前缀若不含配置指纹就会把
+  // 另一档 runner 的旧 inc 当本轮结果复用（qodo High / sourcery 评审发现，实测 http 段 6/133 复用、
+  // NC 13→7）；而**两份配置的 hashFiles 对 19 段是同一个常量**（档位只体现在各段的 `config:` 字段上），
+  // 故只放配置指纹还不够——某段只改 `config:` 而不动配置文件时 key 与兜底前缀会逐字节不变、跨档继承
+  // 从主 key 与兜底两条路径一起复活（审查 A1·D2）。档位名进 key/兜底后，`config:` 一变即换缓存身份。
+  // **依赖指纹（package-lock.json）必须同时进主 key 与兜底前缀**（本轮新不变式：兜底前缀 = 缓存身份里
+  // 除源指纹以外的全部段 ⇒ 兜底只允许跨**源文件**变化）：缺陷实测（run 35775812104 / issue #167）——
+  // dependabot 把 fast-check 4.10.0→4.10.1 后 package-lock.json 变了、主 key 因含依赖指纹而未命中，但
+  // 旧形态把依赖只放在主 key 里、兜底前缀不含 deps ⇒ 兜底把旧 inc 原样复原，而 stryker 的
+  // incremental-differ 只按**文件内容** diff、不认识依赖版本 ⇒ 19/19 段 100% 复用，依赖升级从未重算。
+  const open = '${'
+  assert.strictEqual(keyLine.trim(),
+    'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + "{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-" + open + "{ hashFiles('package-lock.json') }}-src-" + open + "{ hashFiles('run_mutation.js', matrix.src) }}",
+    '缓存 key 必须逐字等于 stryker-<段>-cfg-<档位 matrix.config>-<配置指纹 = 两份 stryker 配置 + scripts/tap-shim.js>' +
+    '-deps-<依赖指纹 = package-lock.json>-src-<源指纹 = run_mutation.js + matrix.src>（不含 -tests- ' +
+    '测试指纹段）：PR #156 的「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发' +
+    '串扰，基线全程是绿的）、跑不完（app/utils/message-store 真全量在 --concurrency 8 下仍需 ~7h/~6.5h/' +
+    '~4.5h，必撞 step 330min，而失败段不保存缓存进度 ⇒ 永久红），且当前**无分数门禁** ⇒ 复用不构成门禁' +
+    '风险（有意接受的取舍）。依赖指纹必须进 key：dependabot 升 fast-check 4.10.0→4.10.1 时' +
+    'package-lock.json 变化必须换掉缓存身份，否则 19/19 段 100% 复用（实测 run 35775812104 / issue #167）')
+  assert.ok(!keyLine.includes('-tests-') && !keyLine.includes('test_*.js'),
+    '缓存 key 不得再含测试指纹（`-tests-` / `test_*.js`）：一旦改回含指纹形态，本条断言立即红')
+  const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
+  assert.ok(restoreIdx >= 0, '「恢复增量缓存」必须声明 restore-keys')
+  const restoreIndent = indentOf(cacheLines[restoreIdx])
+  const restoreKeys = []
+  for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
+    if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
+    restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
+  }
+  assert.deepStrictEqual(restoreKeys, ['stryker-' + '${' + '{ matrix.name }}-cfg-' + '${' + '{ matrix.config }}-' + '${' + "{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-" + '${' + "{ hashFiles('package-lock.json') }}-"],
+    'restore-keys 必须是**带档位名 + 配置指纹 + 依赖指纹**（含 scripts/tap-shim.js 与 package-lock.json）的兜底前缀 `stryker-' + '${' + '{ matrix.name }}-cfg-<matrix.config 档位>-<配置指纹>-deps-<package-lock.json 指纹>-`：' +
+    '同档配置内可跨 src 变更兜底复用；跨档（runner / tap.testFiles / coverageAnalysis 变化，或只改某段的 ' +
+    'config:）不再互相继承——档位名与配置指纹都在前缀里，任一变化前缀即变；不含测试指纹（PR #156 那版已回退）。' +
+    '**依赖指纹必须在兜底前缀里**（本轮新不变式：兜底前缀 = 缓存身份里除源指纹以外的**全部**段 ⇒ 兜底只允许' +
+    '跨源文件变化）：旧形态把 package-lock.json 只放在主 key 里，dependabot 升 fast-check 4.10.0→4.10.1 后' +
+    '主 key 未命中、兜底却把旧 inc 原样复原，而 incremental-differ 只按文件内容 diff、**不认识依赖版本** ⇒ ' +
+    '19/19 段 100% 复用、依赖升级从未重算（实测 run 35775812104 / issue #167）')
+}
+assertCacheStep(mutationYml)
+
+// (1b) **档位名 + 依赖指纹必须参与缓存身份**（档位审查 A1·D2；依赖 issue #167）：key 与兜底前缀里都要有
+//      `${{ matrix.config }}` 与 `-deps-${{ hashFiles('package-lock.json') }}-`，且兜底前缀不得含 `-src-`。
+//      为什么单靠「配置指纹」不够：两份配置文件的 hashFiles 对 19 段是**同一个常量**（实测 19 条 key 里
+//      cfg 取值只有 1 个），档位只由各段自己的 `config:` 字段体现。于是「某段只改 `config:`、不动任何配置
+//      文件」时 key 与兜底前缀**逐字节不变** ⇒ 该段仍会命中/恢复**旧档**的 inc（core 对 inc 零校验），
+//      「跨档不再互相继承」被绕过。把档位名放进 key 与兜底后，`config:` 一变即换缓存身份。
+//      为什么依赖必须同时在兜底里（本轮新不变式：兜底前缀 = 缓存身份里除源指纹以外的全部段 ⇒ 兜底**只**
+//      允许跨源文件变化）：dependabot 升 fast-check 4.10.0→4.10.1 后 package-lock.json 变化、主 key miss，
+//      但旧形态兜底前缀不含 deps ⇒ 旧 inc 被原样复原，而 incremental-differ 只按文件内容 diff、不认识依赖
+//      版本 ⇒ 19/19 段 100% 复用（实测 run 35775812104 / issue #167）。兜底前缀带 `-src-` 则另一极端：
+//      永不兜底或跨源继承。
+//      抽成独立函数（而不是塞进 assertCacheStep）：assertCacheStep 的首条断言是 key 的逐字 strictEqual，
+//      任何 key 变异都会先在那里红，这里的几个方向就永远走不到；独立后各条反例各由本函数自己拦截。
+const assertCacheConfigIdentity = (ymlText) => {
+  const cacheAt = ymlText.indexOf('- name: 恢复增量缓存')
+  assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（档位缓存身份无从核对即视为回归）')
+  const cacheEnd = ymlText.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
+  assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
+  const cacheLines = yamlOnly(ymlText.slice(cacheAt, cacheEnd))
+  const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
+  const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
+  assert.ok(keyLine && restoreIdx >= 0, '「恢复增量缓存」必须同时声明 key 与 restore-keys')
+  assert.match(keyLine, /-cfg-\$\{\{\s*matrix\.config\s*\}\}-\$\{\{\s*hashFiles\(/,
+    '缓存 key 的档位段必须是 `-cfg-$' + '{' + '{ matrix.config }}-$' + '{' + '{ hashFiles(…`：配置指纹对 19 段' +
+    '是同一个常量，档位只由 matrix.config 体现；缺了它，只改某段的 config: 而**不动任何配置文件**时 key ' +
+    '逐字节不变 ⇒ 该段仍命中旧档 inc，跨档继承从主 key 路径复活（A1·D2）')
+  assert.match(keyLine, /hashFiles\('stryker\.config\.js', 'stryker\.tap\.config\.js', 'scripts\/tap-shim\.js'\)/,
+    '缓存 key 的配置指纹必须含 `scripts/tap-shim.js`（A6）：TAP 档的**覆盖归因结果**由 tap-shim 决定' +
+    '（stryker.tap.config.js 的 `tap.nodeArgs` 预加载它），只改 shim 而不动配置文件时旧 inc（按旧归因算出的' +
+    'killed/survived）会被当成新结果复用 ⇒ shim 必须与两份 stryker 配置在同一段 hashFiles 里')
+  assert.match(keyLine, /-deps-\$\{\{\s*hashFiles\('package-lock\.json'\)\s*\}\}-/,
+    '缓存 key 必须含 `-deps-$' + '{' + '{ hashFiles(\'package-lock.json\') }}-` 依赖指纹段：dependabot 升 ' +
+    'fast-check 4.10.0→4.10.1 后依 package-lock.json 变化必须换掉缓存身份，否则主 key 未命中也会被兜底复原' +
+    '（实测 run 35775812104 / issue #167：19/19 段 100% 复用、依赖升级从未重算）')
+  const restoreIndent = indentOf(cacheLines[restoreIdx])
+  const restoreKeys = []
+  for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
+    if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
+    restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
+  }
+  assert.strictEqual(restoreKeys.length, 1,
+    '「恢复增量缓存」的 restore-keys 应恰有一条兜底前缀（多/少都视为缓存策略漂移）')
+  assert.match(restoreKeys[0], /-cfg-\$\{\{\s*matrix\.config\s*\}\}-\$\{\{\s*hashFiles\(/,
+    '兜底前缀的档位段必须是 `-cfg-$' + '{' + '{ matrix.config }}-$' + '{' + '{ hashFiles(…`：主 key 未命中时' +
+    '由兜底恢复 inc，只把档位名加进 key 不够——缺了它，只改 config: 时兜底前缀也逐字节不变 ⇒ 跨档继承从' +
+    '兜底路径复活（A1·D2）')
+  assert.match(restoreKeys[0], /hashFiles\('stryker\.config\.js', 'stryker\.tap\.config\.js', 'scripts\/tap-shim\.js'\)/,
+    '兜底前缀的配置指纹必须含 `scripts/tap-shim.js`（A6）：主 key 未命中时由兜底恢复 inc，只把 shim 加进 key' +
+    '不够——缺了它，shim 变更后兜底仍会把按旧归因算出的 inc 恢复进来复用')
+  assert.match(restoreKeys[0], /-deps-\$\{\{\s*hashFiles\('package-lock\.json'\)\s*\}\}-/,
+    '兜底前缀必须含与 key **同一个** `-deps-$' + '{' + '{ hashFiles(\'package-lock.json\') }}-` 依赖指纹段' +
+    '（本轮新不变式：兜底前缀 = 缓存身份里除源指纹以外的全部段 ⇒ 兜底只允许跨源文件变化）：旧形态只把 ' +
+    'package-lock.json 放进主 key，dependabot 升 fast-check 4.10.0→4.10.1 后主 key miss、兜底把旧 inc 复原，' +
+    '而 incremental-differ 只按文件内容 diff、不认识依赖版本 ⇒ 19/19 段 100% 复用（实测 run 35775812104 / issue #167）')
+  assert.ok(!restoreKeys[0].includes('-src-'),
+    '兜底前缀不得含 `-src-` 源指纹段：兜底存在的意义是**只**跨源文件变化复用（incremental-differ 按文件内容 diff），' +
+    '带上 src 段就等于永不兜底（主 key miss 时无可恢复）或按旧形态跨源继承；配置（matrix.config 档位 / ' +
+    'stryker.config.js / stryker.tap.config.js / scripts/tap-shim.js）与依赖（package-lock.json）的任何变化 ' +
+    '都必须同时换掉主 key 与兜底身份，即缓存身份里**除源指纹以外的全部段**都必须出现在兜底前缀里。' +
+    '`run_mutation.js` 是**本地**运行器：CI 的变异任务走 stryker（`scripts/mutation-child.js` → ' +
+    '`run_unit_tests.js`），**不经 run_mutation.js**（见 run_unit_tests.js 顶部说明），故它与 matrix.src ' +
+    '同属源指纹、只进主 key 不进兜底；测试侧文件（test_suites.js / run_unit_tests.js / scripts/mutation-child.js / ' +
+    'test_*.js）则**有意不入任何身份段**（PR #158 的取舍）⇒ 只改它们时缓存身份逐字节不变、command 档 4 段' +
+    '仍会复用旧结果（当前为 `thresholds.break = null`，无分数门禁；复用状态另有日报可视化兜住）')
+}
+assertCacheConfigIdentity(mutationYml)
+
+console.log('✅ 缓存身份门禁（assertCacheStep / assertCacheConfigIdentity）正向通过：纯字符串断言、不 spawn 子进程')
+
 // ── 1. 清单自身必须干净 ─────────────────────────────────────
 // 清单解析走字符串切片而非正则：`\S.*$` 这类重叠量词会被静态分析判为可回溯超线性（Sonar S8786）
 const skipLine = testYml.split('\n').map(line => line.trim()).find(line => line.startsWith('SKIP_SUITES:'))
@@ -847,8 +987,9 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
 //    不再能误导任何门禁，「为保护分数门禁而强制全量」这个理由本身就不成立。这是**有意接受的取舍**，不是遗漏。
 // 断言只读**真实 YAML 行**（剔除注释行）：否则把证据写进注释、代码改回去也能骗过门禁，等于没修。
 {
-  const indentOf = line => line.length - line.trimStart().length
-  const yamlOnly = text => text.split('\n').filter(l => !l.trim().startsWith('#'))
+  // 注：indentOf / yamlOnly 与 assertCacheStep / assertCacheConfigIdentity 的**定义与正向调用**已前移到本文件
+  //     顶部（见 `const mutationYml` 之后的「缓存身份门禁」段）——原因见那段注释：本机那条环境失败是致命的，
+  //     纯字符串门禁留在本块内永远跑不到。下方 7 个反例仍调用外层作用域里的同一个函数（断言语义一字未改）。
   // 从一个 step 的文本里取出 `run: |` 之后的 shell 正文（缩进深于 run: 的行），注释一律不算证据。
   // 注释行必须在这里剔除：只按缩进截断的话，把活动命令整行改成 `# node scripts/…` 后正文里仍带着
   // 命令原文，`includes('node scripts/mutation-report.js --strip')` 会被注释满足——CI 实际不再剥离、
@@ -871,125 +1012,6 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
     return next > 0 ? next : text.length
   }
   const stepEndAfter = (at, nameLen) => stepEndIn(mutationYml, at, nameLen)
-
-  // (1)「恢复增量缓存」：key 与 restore-keys 必须是**回退后 + 带档位 + 带依赖**的形态——不含测试指纹段，
-  //     而是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>-deps-<依赖指纹>`，源指纹只进主 key。
-  //     抽成函数是为了让紧随其后的反例在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本：把 key
-  //     改回含测试指纹的形态 ⇒ 必须立刻红。
-  const assertCacheStep = (ymlText) => {
-    const cacheAt = ymlText.indexOf('- name: 恢复增量缓存')
-    assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（缓存策略无从核对即视为回归）')
-    const cacheEnd = ymlText.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
-    assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
-    const cacheLines = yamlOnly(ymlText.slice(cacheAt, cacheEnd))
-    const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
-    assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
-    // key 必须逐字等于**档位名 + 配置指纹 + 依赖指纹 + 源指纹**形态：
-    //   stryker-<段>-cfg-<matrix.config 档位>-<两份 stryker 配置 + scripts/tap-shim.js 指纹>-deps-<package-lock.json 指纹>-src-<源指纹>。
-    // 源指纹固定用 matrix.src + run_mutation.js：mutate 里的范围字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，
-    // 会得到空指纹、使 range 段缓存永不过期。
-    // 配置指纹（stryker.config.js + stryker.tap.config.js + scripts/tap-shim.js）与**档位名 `matrix.config`** 都必须同时出现在
-    // key 与兜底前缀里：主 key 未命中时 core 会对恢复进来的 inc **零校验**，兜底前缀若不含配置指纹就会把
-    // 另一档 runner 的旧 inc 当本轮结果复用（qodo High / sourcery 评审发现，实测 http 段 6/133 复用、
-    // NC 13→7）；而**两份配置的 hashFiles 对 19 段是同一个常量**（档位只体现在各段的 `config:` 字段上），
-    // 故只放配置指纹还不够——某段只改 `config:` 而不动配置文件时 key 与兜底前缀会逐字节不变、跨档继承
-    // 从主 key 与兜底两条路径一起复活（审查 A1·D2）。档位名进 key/兜底后，`config:` 一变即换缓存身份。
-    // **依赖指纹（package-lock.json）必须同时进主 key 与兜底前缀**（本轮新不变式：兜底前缀 = 缓存身份里
-    // 除源指纹以外的全部段 ⇒ 兜底只允许跨**源文件**变化）：缺陷实测（run 35775812104 / issue #167）——
-    // dependabot 把 fast-check 4.10.0→4.10.1 后 package-lock.json 变了、主 key 因含依赖指纹而未命中，但
-    // 旧形态把依赖只放在主 key 里、兜底前缀不含 deps ⇒ 兜底把旧 inc 原样复原，而 stryker 的
-    // incremental-differ 只按**文件内容** diff、不认识依赖版本 ⇒ 19/19 段 100% 复用，依赖升级从未重算。
-    const open = '${'
-    assert.strictEqual(keyLine.trim(),
-      'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + "{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-" + open + "{ hashFiles('package-lock.json') }}-src-" + open + "{ hashFiles('run_mutation.js', matrix.src) }}",
-      '缓存 key 必须逐字等于 stryker-<段>-cfg-<档位 matrix.config>-<配置指纹 = 两份 stryker 配置 + scripts/tap-shim.js>' +
-      '-deps-<依赖指纹 = package-lock.json>-src-<源指纹 = run_mutation.js + matrix.src>（不含 -tests- ' +
-      '测试指纹段）：PR #156 的「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发' +
-      '串扰，基线全程是绿的）、跑不完（app/utils/message-store 真全量在 --concurrency 8 下仍需 ~7h/~6.5h/' +
-      '~4.5h，必撞 step 330min，而失败段不保存缓存进度 ⇒ 永久红），且当前**无分数门禁** ⇒ 复用不构成门禁' +
-      '风险（有意接受的取舍）。依赖指纹必须进 key：dependabot 升 fast-check 4.10.0→4.10.1 时' +
-      'package-lock.json 变化必须换掉缓存身份，否则 19/19 段 100% 复用（实测 run 35775812104 / issue #167）')
-    assert.ok(!keyLine.includes('-tests-') && !keyLine.includes('test_*.js'),
-      '缓存 key 不得再含测试指纹（`-tests-` / `test_*.js`）：一旦改回含指纹形态，本条断言立即红')
-    const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
-    assert.ok(restoreIdx >= 0, '「恢复增量缓存」必须声明 restore-keys')
-    const restoreIndent = indentOf(cacheLines[restoreIdx])
-    const restoreKeys = []
-    for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
-      if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
-      restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
-    }
-    assert.deepStrictEqual(restoreKeys, ['stryker-' + '${' + '{ matrix.name }}-cfg-' + '${' + '{ matrix.config }}-' + '${' + "{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-" + '${' + "{ hashFiles('package-lock.json') }}-"],
-      'restore-keys 必须是**带档位名 + 配置指纹 + 依赖指纹**（含 scripts/tap-shim.js 与 package-lock.json）的兜底前缀 `stryker-' + '${' + '{ matrix.name }}-cfg-<matrix.config 档位>-<配置指纹>-deps-<package-lock.json 指纹>-`：' +
-      '同档配置内可跨 src 变更兜底复用；跨档（runner / tap.testFiles / coverageAnalysis 变化，或只改某段的 ' +
-      'config:）不再互相继承——档位名与配置指纹都在前缀里，任一变化前缀即变；不含测试指纹（PR #156 那版已回退）。' +
-      '**依赖指纹必须在兜底前缀里**（本轮新不变式：兜底前缀 = 缓存身份里除源指纹以外的**全部**段 ⇒ 兜底只允许' +
-      '跨源文件变化）：旧形态把 package-lock.json 只放在主 key 里，dependabot 升 fast-check 4.10.0→4.10.1 后' +
-      '主 key 未命中、兜底却把旧 inc 原样复原，而 incremental-differ 只按文件内容 diff、**不认识依赖版本** ⇒ ' +
-      '19/19 段 100% 复用、依赖升级从未重算（实测 run 35775812104 / issue #167）')
-  }
-  assertCacheStep(mutationYml)
-
-  // (1b) **档位名 + 依赖指纹必须参与缓存身份**（档位审查 A1·D2；依赖 issue #167）：key 与兜底前缀里都要有
-  //      `${{ matrix.config }}` 与 `-deps-${{ hashFiles('package-lock.json') }}-`，且兜底前缀不得含 `-src-`。
-  //      为什么单靠「配置指纹」不够：两份配置文件的 hashFiles 对 19 段是**同一个常量**（实测 19 条 key 里
-  //      cfg 取值只有 1 个），档位只由各段自己的 `config:` 字段体现。于是「某段只改 `config:`、不动任何配置
-  //      文件」时 key 与兜底前缀**逐字节不变** ⇒ 该段仍会命中/恢复**旧档**的 inc（core 对 inc 零校验），
-  //      「跨档不再互相继承」被绕过。把档位名放进 key 与兜底后，`config:` 一变即换缓存身份。
-  //      为什么依赖必须同时在兜底里（本轮新不变式：兜底前缀 = 缓存身份里除源指纹以外的全部段 ⇒ 兜底**只**
-  //      允许跨源文件变化）：dependabot 升 fast-check 4.10.0→4.10.1 后 package-lock.json 变化、主 key miss，
-  //      但旧形态兜底前缀不含 deps ⇒ 旧 inc 被原样复原，而 incremental-differ 只按文件内容 diff、不认识依赖
-  //      版本 ⇒ 19/19 段 100% 复用（实测 run 35775812104 / issue #167）。兜底前缀带 `-src-` 则另一极端：
-  //      永不兜底或跨源继承。
-  //      抽成独立函数（而不是塞进 assertCacheStep）：assertCacheStep 的首条断言是 key 的逐字 strictEqual，
-  //      任何 key 变异都会先在那里红，这里的几个方向就永远走不到；独立后各条反例各由本函数自己拦截。
-  const assertCacheConfigIdentity = (ymlText) => {
-    const cacheAt = ymlText.indexOf('- name: 恢复增量缓存')
-    assert.ok(cacheAt >= 0, 'mutation.yml 必须存在「恢复增量缓存」步骤（档位缓存身份无从核对即视为回归）')
-    const cacheEnd = ymlText.indexOf('- name: 清理缓存回填的旧报告', cacheAt)
-    assert.ok(cacheEnd > cacheAt, '「恢复增量缓存」之后应紧跟「清理缓存回填的旧报告」步骤')
-    const cacheLines = yamlOnly(ymlText.slice(cacheAt, cacheEnd))
-    const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
-    const restoreIdx = cacheLines.findIndex(l => /^\s*restore-keys:/.test(l))
-    assert.ok(keyLine && restoreIdx >= 0, '「恢复增量缓存」必须同时声明 key 与 restore-keys')
-    assert.match(keyLine, /-cfg-\$\{\{\s*matrix\.config\s*\}\}-\$\{\{\s*hashFiles\(/,
-      '缓存 key 的档位段必须是 `-cfg-$' + '{' + '{ matrix.config }}-$' + '{' + '{ hashFiles(…`：配置指纹对 19 段' +
-      '是同一个常量，档位只由 matrix.config 体现；缺了它，只改某段的 config: 而**不动任何配置文件**时 key ' +
-      '逐字节不变 ⇒ 该段仍命中旧档 inc，跨档继承从主 key 路径复活（A1·D2）')
-    assert.match(keyLine, /hashFiles\('stryker\.config\.js', 'stryker\.tap\.config\.js', 'scripts\/tap-shim\.js'\)/,
-      '缓存 key 的配置指纹必须含 `scripts/tap-shim.js`（A6）：TAP 档的**覆盖归因结果**由 tap-shim 决定' +
-      '（stryker.tap.config.js 的 `tap.nodeArgs` 预加载它），只改 shim 而不动配置文件时旧 inc（按旧归因算出的' +
-      'killed/survived）会被当成新结果复用 ⇒ shim 必须与两份 stryker 配置在同一段 hashFiles 里')
-    assert.match(keyLine, /-deps-\$\{\{\s*hashFiles\('package-lock\.json'\)\s*\}\}-/,
-      '缓存 key 必须含 `-deps-$' + '{' + '{ hashFiles(\'package-lock.json\') }}-` 依赖指纹段：dependabot 升 ' +
-      'fast-check 4.10.0→4.10.1 后依 package-lock.json 变化必须换掉缓存身份，否则主 key 未命中也会被兜底复原' +
-      '（实测 run 35775812104 / issue #167：19/19 段 100% 复用、依赖升级从未重算）')
-    const restoreIndent = indentOf(cacheLines[restoreIdx])
-    const restoreKeys = []
-    for (let i = restoreIdx + 1; i < cacheLines.length; i++) {
-      if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
-      restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
-    }
-    assert.strictEqual(restoreKeys.length, 1,
-      '「恢复增量缓存」的 restore-keys 应恰有一条兜底前缀（多/少都视为缓存策略漂移）')
-    assert.match(restoreKeys[0], /-cfg-\$\{\{\s*matrix\.config\s*\}\}-\$\{\{\s*hashFiles\(/,
-      '兜底前缀的档位段必须是 `-cfg-$' + '{' + '{ matrix.config }}-$' + '{' + '{ hashFiles(…`：主 key 未命中时' +
-      '由兜底恢复 inc，只把档位名加进 key 不够——缺了它，只改 config: 时兜底前缀也逐字节不变 ⇒ 跨档继承从' +
-      '兜底路径复活（A1·D2）')
-    assert.match(restoreKeys[0], /hashFiles\('stryker\.config\.js', 'stryker\.tap\.config\.js', 'scripts\/tap-shim\.js'\)/,
-      '兜底前缀的配置指纹必须含 `scripts/tap-shim.js`（A6）：主 key 未命中时由兜底恢复 inc，只把 shim 加进 key' +
-      '不够——缺了它，shim 变更后兜底仍会把按旧归因算出的 inc 恢复进来复用')
-    assert.match(restoreKeys[0], /-deps-\$\{\{\s*hashFiles\('package-lock\.json'\)\s*\}\}-/,
-      '兜底前缀必须含与 key **同一个** `-deps-$' + '{' + '{ hashFiles(\'package-lock.json\') }}-` 依赖指纹段' +
-      '（本轮新不变式：兜底前缀 = 缓存身份里除源指纹以外的全部段 ⇒ 兜底只允许跨源文件变化）：旧形态只把 ' +
-      'package-lock.json 放进主 key，dependabot 升 fast-check 4.10.0→4.10.1 后主 key miss、兜底把旧 inc 复原，' +
-      '而 incremental-differ 只按文件内容 diff、不认识依赖版本 ⇒ 19/19 段 100% 复用（实测 run 35775812104 / issue #167）')
-    assert.ok(!restoreKeys[0].includes('-src-'),
-      '兜底前缀不得含 `-src-` 源指纹段：兜底存在的意义是**只**跨源文件变化复用（incremental-differ 按文件内容 diff），' +
-      '带上 src 段就等于永不兜底（主 key miss 时无可恢复）或按旧形态跨源继承；配置 / tap-shim / 依赖 / 运行器的' +
-      '任何变化都必须同时换掉主 key 与兜底身份。`run_mutation.js` 与 matrix.src 同属源指纹、只进主 key')
-  }
-  assertCacheConfigIdentity(mutationYml)
 
   // (1b 反例·正交多变体) 分别把 key / 兜底里的档位段、deps 段去掉，或把 src 段塞回兜底
   //     ⇒ assertCacheConfigIdentity 必须红。每个变体各自只动一行，且带「夹具真的改到了目标行」的前置断言；
