@@ -912,9 +912,24 @@ function schemaReport (seg, mutants) {
   // 反例 E（靶向，R2-F5 / R4-F3）：把 env 行上的 `|| 'none'` 归一删掉 ⇒ 同一套断言必须红。
   // 必须锚在 env 的 `CACHE_HIT: ${{ steps.<id>.outputs.cache-hit || 'none' }}` 那一行：文件注释里也写着这个
   // 表达式，宽松 replace 可能改到注释而活动 env 行仍在 ⇒ 必须先断言夹具真的改到了目标 env 行。
+  // **这里刻意不用正则做锚定**：原实现 /^(\s*CACHE_HIT: …)$/m 里的 `\s*` 能跨行，在整份 YAML 上退化成
+  // 二次方回溯（SonarCloud javascript:S8786 super-linear backtracking），改为按行取键名做逐字匹配——
+  // 对合法 YAML 与原锚定语义等价，且不依赖回溯。
   {
     const real = fs.readFileSync(ymlPath, 'utf8')
-    const mutated = real.replace(/^(\s*CACHE_HIT: \$\{\{ steps\.[A-Za-z0-9_-]+\.outputs\.cache-hit) \|\| 'none' \}\}$/m, '$1 }}')
+    const envPrefix = 'CACHE_HIT: ${{ steps.'
+    const envSuffix = ".outputs.cache-hit || 'none' }}"
+    const rawLines = real.split('\n')
+    const envIdxs = []
+    rawLines.forEach((l, i) => {
+      const t = l.trim()
+      if (t.startsWith(envPrefix) && t.endsWith(envSuffix)) envIdxs.push(i)
+    })
+    assert.strictEqual(envIdxs.length, 1,
+      '反例 E 的夹具锚定必须唯一命中那条 env 行（CACHE_HIT: ' + '$' + "{{ steps.<id>.outputs.cache-hit || 'none' }}）")
+    const mutatedLines = rawLines.slice()
+    mutatedLines[envIdxs[0]] = mutatedLines[envIdxs[0]].replace(" || 'none'", '')
+    const mutated = mutatedLines.join('\n')
     assert.notStrictEqual(mutated, real, "反例夹具必须真的删掉了 env 的 `|| 'none'` 归一（没改成本回归形同虚设）")
     const envLine = mutated.split('\n').map(l => l.trim()).find(l => l.startsWith('CACHE_HIT:'))
     assert.ok(envLine && !envLine.includes("|| 'none'"), '夹具中 env 行应已不含归一')
