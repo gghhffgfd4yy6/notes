@@ -10,8 +10,10 @@ const path = require('node:path')
 const {
   render, validateSegments, validateFreshness, resolveMaxSkewMs, resolveRunStartedAtMs, shanghaiDate, escCell, countMutant,
   collectStats, findReportJson, analyzeSegment, analyze, postIssue,
-  parseReuseFromLog, buildReuseMeta, normalizeReuseMeta, readReuseMeta, writeReuseMeta, runReuseMode,
-  formatReuseCell, stripAnsi, reuseUnaccountedCount, REUSE_MODE_FULL, REUSE_MODE_PARTIAL, REUSE_MODE_UNKNOWN, HIGH_REUSE_RATIO,
+  parseReuseFromLog, buildReuseMeta, normalizeReuseMeta, readReuseMeta, writeReuseMeta, runReuseMode, parseReuseArgs,
+  formatReuseCell, stripAnsi, reuseUnaccountedCount, reuseOriginSuffix,
+  REUSE_MODE_FULL, REUSE_MODE_PARTIAL, REUSE_MODE_UNKNOWN, HIGH_REUSE_RATIO,
+  CACHE_HIT_PRIMARY, CACHE_HIT_FALLBACK, CACHE_HIT_NONE, mapCacheHitArg, normalizeCacheHitField,
   coveredScore, coveredDenominator, formatCovered, NO_COVERAGE_PLACEHOLDER,
   parseMatrixRunnerConfigs, readMatrixRunnerConfigs, formatSegmentLabel, scoreOf, COMMAND_RUNNER_CONFIG, COMMAND_SEGMENT_MARK
 } = require('./scripts/mutation-report.js')
@@ -505,6 +507,186 @@ check('render：复用元信息**不改变**任何分数/统计口径（只多�
   assert.strictEqual(rowOf(a, 'utils'), rowOf(b, 'utils'))
   assert.ok(a.includes('| **合计** | **110** | **55** | **5** | **50** | **0** | **54.55%** | **54.55%** |'), '合计行统计值不得变化')
   assert.ok(b.includes('| **合计** | **110** | **55** | **5** | **50** | **0** | **54.55%** | **54.55%** |'), '合计行统计值不得变化')
+})
+
+// ===== 溯源三态（v3.276 续 · issue #167）=====================================================
+// 缺陷：日报只有「复用 N/M」，读者无法区分「主 key 命中（hashFiles 覆盖的输入真没变）」与
+// 「兜底缓存复原（输入变了却没重算）」。实测案例 run 35775812104（issue #167）：19/19 段 100% 复用，
+// 其中依赖 fast-check 4.10.0→4.10.1 的变化被兜底缓存吞掉、从未重算，而日报完全看不出来。
+// 下列用例逐条锁定：字段归一（缺失/非法一律 undefined）、表格后缀（只改 fallback）、渲染三种溯源后缀、
+// fallback 专用小节、none+partial 矛盾点名、末行兜底计数，以及「字段缺失 ≠ 主 key 命中」这条关键否定。
+
+check('mapCacheHitArg/normalizeCacheHitField：只认三态，缺失或非法一律 undefined（不抛）', () => {
+  assert.strictEqual(mapCacheHitArg('true'), CACHE_HIT_PRIMARY)
+  assert.strictEqual(mapCacheHitArg('false'), CACHE_HIT_FALLBACK)
+  assert.strictEqual(mapCacheHitArg('none'), CACHE_HIT_NONE)
+  for (const bad of [undefined, null, '', 'yes', 'PRIMARY', 'True', 'primary', 1, true, 0]) {
+    assert.strictEqual(mapCacheHitArg(bad), undefined, `CLI 取值 ${JSON.stringify(bad)} 不得映射成三态`)
+  }
+  for (const v of [CACHE_HIT_PRIMARY, CACHE_HIT_FALLBACK, CACHE_HIT_NONE]) assert.strictEqual(normalizeCacheHitField(v), v)
+  for (const bad of [undefined, null, '', 'yes', 'PRIMARY', 'True', 1, true, {}]) {
+    assert.strictEqual(normalizeCacheHitField(bad), undefined, `reuse.json 的 cacheHit=${JSON.stringify(bad)} 必须降级为 undefined`)
+  }
+})
+
+check('normalizeReuseMeta：cacheHit 缺失/非法降级为 undefined 且**不影响 mode 判定**', () => {
+  for (const raw of [CACHE_HIT_PRIMARY, CACHE_HIT_FALLBACK, CACHE_HIT_NONE]) {
+    const partial = normalizeReuseMeta({ segment: 'app', mode: REUSE_MODE_PARTIAL, reused: 9, total: 10, cacheHit: raw }, 'app')
+    assert.strictEqual(partial.mode, REUSE_MODE_PARTIAL, 'cacheHit 不得影响 mode 判定')
+    assert.strictEqual(partial.cacheHit, raw, '合法三态必须原样带出')
+  }
+  // 字段缺失 ⇒ 不得凭空补（保持旧形状，向后兼容旧 artifact）
+  const missing = normalizeReuseMeta({ segment: 'app', mode: REUSE_MODE_PARTIAL, reused: 9, total: 10 }, 'app')
+  assert.strictEqual(missing.mode, REUSE_MODE_PARTIAL)
+  assert.ok(!('cacheHit' in missing), '字段缺失时不得补出 cacheHit（否则旧 artifact 会被读成某个具体来源）')
+  // 非法取值 ⇒ undefined，但 mode/计数照旧（既不抛、也不影响 mode）
+  for (const bad of ['yes', 'PRIMARY', 'true', 'True', 1, true, {}, null, '']) {
+    const m = normalizeReuseMeta({ segment: 'app', mode: REUSE_MODE_PARTIAL, reused: 9, total: 10, cacheHit: bad }, 'app')
+    assert.strictEqual(m.mode, REUSE_MODE_PARTIAL, `cacheHit=${JSON.stringify(bad)} 不得影响 mode 判定`)
+    assert.strictEqual(m.cacheHit, undefined, `cacheHit=${JSON.stringify(bad)} 必须降级为 undefined`)
+  }
+  // full 分支同样只认三态
+  assert.strictEqual(normalizeReuseMeta({ mode: REUSE_MODE_FULL, cacheHit: CACHE_HIT_FALLBACK }, 'app').cacheHit, CACHE_HIT_FALLBACK)
+  assert.strictEqual(normalizeReuseMeta({ mode: REUSE_MODE_FULL, cacheHit: 'yes' }, 'app').cacheHit, undefined)
+})
+
+check('formatReuseCell：仅 partial+fallback 加「·兜底」，其余情形一字不改', () => {
+  const partial = (cacheHit) => ({ mode: REUSE_MODE_PARTIAL, reused: 8, total: 10, cacheHit })
+  assert.strictEqual(formatReuseCell(partial(CACHE_HIT_FALLBACK), 10), '复用 8/10·兜底')
+  assert.strictEqual(formatReuseCell(partial(CACHE_HIT_PRIMARY), 10), '复用 8/10')
+  assert.strictEqual(formatReuseCell(partial(CACHE_HIT_NONE), 10), '复用 8/10')
+  assert.strictEqual(formatReuseCell(partial(undefined), 10), '复用 8/10')
+  assert.strictEqual(formatReuseCell({ mode: REUSE_MODE_FULL, cacheHit: CACHE_HIT_FALLBACK }, 10), '全量', 'full 段不得因 cacheHit 改文案')
+  assert.strictEqual(formatReuseCell({ mode: REUSE_MODE_UNKNOWN, cacheHit: CACHE_HIT_FALLBACK }, 10), '未记录')
+  assert.strictEqual(formatReuseCell(null, 10), '未记录')
+})
+
+check('reuseOriginSuffix：三种溯源后缀逐字（primary / fallback / 其余）', () => {
+  assert.strictEqual(reuseOriginSuffix({ cacheHit: CACHE_HIT_PRIMARY }), '（主 key 命中：hashFiles 覆盖的输入未变）')
+  assert.strictEqual(reuseOriginSuffix({ cacheHit: CACHE_HIT_FALLBACK }), '（**兜底复原**：主 key 未命中，结果 = 旧缓存 + 按内容差分复用）')
+  assert.strictEqual(reuseOriginSuffix({ cacheHit: CACHE_HIT_NONE }), '（复用来源未记录）')
+  assert.strictEqual(reuseOriginSuffix({}), '（复用来源未记录）')
+  assert.strictEqual(reuseOriginSuffix(null), '（复用来源未记录）')
+})
+
+// partial 段夹具（复用 8/10、比例 80% ⇒ 触发「复用比例高」分支）；cacheHit 为 undefined 时**不写**该字段。
+const partialSeg = (seg, cacheHit, over = {}) => ({
+  seg,
+  total: 10,
+  killed: 5,
+  survived: 5,
+  noCoverage: 0,
+  timeout: 0,
+  score: 50,
+  survivedMutants: [],
+  reuse: { mode: REUSE_MODE_PARTIAL, reused: 8, total: 10, ratio: 0.8, high: true, ...(cacheHit === undefined ? {} : { cacheHit }) },
+  ...over
+})
+
+check('render 溯源三态 · primary：行尾标「主 key 命中」，无兜底小节/矛盾点名，末行逐字不变', () => {
+  const out = render([partialSeg('app', CACHE_HIT_PRIMARY)])
+  assert.ok(out.includes('- `app`：复用 8/10（80.00%） ⚠️ **复用比例高**（≥50.00%）（主 key 命中：hashFiles 覆盖的输入未变）'),
+    `primary 段行尾必须逐字给出主 key 命中溯源：\n${out}`)
+  assert.ok(!out.includes('主 key 未命中却仍在复用'), 'primary 段不得触发兜底小节')
+  assert.ok(!out.includes('复用溯源与复用计数自相矛盾'), 'primary 段不得触发矛盾点名')
+  assert.ok(!out.includes('由兜底缓存复原'), '无兜底段时末行不得追加兜底计数')
+  assert.ok(out.includes('其余 0 段本轮为全量重算（共 1 段：1 段含复用、0 段未记录）。'),
+    `无兜底段时末行必须逐字保持旧形状：\n${out}`)
+  assert.ok(out.includes('| app | 10 | 5 | 0 | 5 | 0 | 50% | 50% | 复用 8/10 |'), 'primary 段表格不得加后缀')
+})
+
+check('render 溯源三态 · fallback：专用小节点名 + 表格「·兜底」+ 末行兜底计数', () => {
+  const out = render([partialSeg('app', CACHE_HIT_FALLBACK), partialSeg('utils', CACHE_HIT_PRIMARY), partialSeg('rules')])
+  assert.ok(out.includes('- `app`：复用 8/10（80.00%） ⚠️ **复用比例高**（≥50.00%）（**兜底复原**：主 key 未命中，结果 = 旧缓存 + 按内容差分复用）'),
+    `fallback 段行尾必须逐字给出兜底复原溯源：\n${out}`)
+  assert.ok(out.includes('⚠️ **下列段主 key 未命中却仍在复用 ⇒ 本段不是全量重算**：主 key 未命中说明 `hashFiles` 覆盖的输入已变化（或缓存已过期/被逐出），而这些段仍在沿用旧缓存的 killed/survived（增量差分只保证被复用变异体所在的**文件内容**未变，不保证依赖等全局输入未变；依赖已进兜底前缀 ⇒ 依赖变化不会再落到这里）：'),
+    `fallback 段必须触发专用小节（首行逐字）：\n${out}`)
+  assert.ok(out.includes('\n- `app`：复用 8/10（80.00%）\n'), '兜底小节必须逐段点名（段名 + 复用 N/M（x%））')
+  assert.ok(out.includes('| app | 10 | 5 | 0 | 5 | 0 | 50% | 50% | 复用 8/10·兜底 |'), `表格必须加「·兜底」：\n${out}`)
+  assert.ok(out.includes('其余 0 段本轮为全量重算（共 3 段：3 段含复用、0 段未记录、其中 1 段由兜底缓存复原（主 key 未命中））。'),
+    `末行必须追加兜底计数且四类互斥计数不变：\n${out}`)
+})
+
+check('render 溯源三态 · none+partial：矛盾点名出现，且不得误触发兜底小节', () => {
+  const out = render([partialSeg('app', CACHE_HIT_NONE)])
+  assert.ok(out.includes('（复用来源未记录）'), 'none 段行尾给出「复用来源未记录」文案')
+  assert.ok(out.includes('⚠️ 复用溯源与复用计数自相矛盾（cache-hit=none 却记录了复用 N/M）——接线可能坏了：'),
+    `none+partial 必须触发矛盾点名（首行逐字）：\n${out}`)
+  assert.ok(out.includes('\n- `app`\n'), '矛盾点名必须逐段列出段名')
+  assert.ok(!out.includes('主 key 未命中却仍在复用'), 'none ≠ fallback ⇒ 不得触发兜底小节')
+  assert.ok(!out.includes('由兜底缓存复原'), 'none ≠ fallback ⇒ 末行不得追加兜底计数')
+})
+
+check('render 溯源三态 · 字段缺失：显示「复用来源未记录」，**不得**被读成「主 key 命中」', () => {
+  const out = render([partialSeg('app')])
+  assert.ok(out.includes('（复用来源未记录）'), '字段缺失必须显示「复用来源未记录」')
+  assert.ok(!out.includes('主 key 命中'), '字段缺失绝不能被渲染成主 key 命中（旧 artifact 兼容的关键否定）')
+  assert.ok(!out.includes('由兜底缓存复原'), '字段缺失不得被读成兜底复原')
+  assert.ok(!out.includes('复用溯源与复用计数自相矛盾'), '字段缺失不是 none ⇒ 不得触发矛盾点名')
+  // 旧 artifact（无 cacheHit）的表格文案必须与本次改动前逐字一致
+  assert.ok(out.includes('| app | 10 | 5 | 0 | 5 | 0 | 50% | 50% | 复用 8/10 |'), '字段缺失时表格文案不得变化')
+})
+
+check('render 溯源三态 · full 段即使带 cacheHit=fallback 也不得触发溯源渲染（只谈 partial）', () => {
+  const out = render([{ seg: 'app', total: 10, killed: 10, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL, cacheHit: CACHE_HIT_FALLBACK } }])
+  assert.ok(out.includes('| app | 10 | 10 | 0 | 0 | 0 | 100% | 100% | 全量 |'), 'full 段表格不得加后缀')
+  assert.ok(out.includes('本轮 1 段全部全量重算（无复用）⇒ 分数与存活清单对应本 commit 的测试状态。'), 'full 段不得被溯源文案干扰')
+  assert.ok(!out.includes('兜底'), 'full 段不得出现任何兜底溯源文案')
+})
+
+check('render 溯源三态 · cacheHit 不改变任何分数/统计口径（只多溯源标注）', () => {
+  const base = [partialSeg('app'), partialSeg('utils', CACHE_HIT_PRIMARY)]
+  const withFallback = [partialSeg('app', CACHE_HIT_FALLBACK), partialSeg('utils', CACHE_HIT_PRIMARY)]
+  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|$/, ' |')
+  const a = render(base)
+  const b = render(withFallback)
+  assert.strictEqual(rowOf(a, 'app'), rowOf(b, 'app'), '同一统计下分数行必须一致（溯源只增加标注）')
+  assert.strictEqual(rowOf(a, 'utils'), rowOf(b, 'utils'))
+  assert.ok(a.includes('| **合计** | **20** | **10** | **0** | **10** | **0** | **50%** | **50%** | **2 段复用** |'), '合计统计值不得变化')
+  assert.ok(b.includes('| **合计** | **20** | **10** | **0** | **10** | **0** | **50%** | **50%** | **2 段复用** |'), '合计统计值不得变化')
+})
+
+check('writeReuseMeta/runReuseMode：--cache-hit 三值落盘映射、缺席不写字段、非法 fail-closed 且不写 reuse.json', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-reuse-cachehit-'))
+  try {
+    const log = path.join(dir, 'stryker.log')
+    fs.writeFileSync(log, REAL_REUSE_LOG)
+    const reportDir = path.join(dir, 'reports', 'mutation')
+    fs.mkdirSync(reportDir, { recursive: true })
+    fs.writeFileSync(path.join(reportDir, 'mutation.json'), '{"files":{}}')
+    const out = path.join(reportDir, 'reuse.json')
+    const io = () => ({ stdout: { write: () => {} }, stderr: { write: () => {} } })
+    // 三值落盘映射（CLI 取值 → reuse.json 字段）
+    for (const [arg, want] of [['true', CACHE_HIT_PRIMARY], ['false', CACHE_HIT_FALLBACK], ['none', CACHE_HIT_NONE]]) {
+      assert.strictEqual(runReuseMode(['--segment', 'app', '--log', log, '--out', out, '--cache-hit', arg], io()), 0, `--cache-hit ${arg} 应 exit 0`)
+      const meta = JSON.parse(fs.readFileSync(out, 'utf8'))
+      assert.strictEqual(meta.cacheHit, want, `--cache-hit ${arg} ⇒ cacheHit=${want}`)
+      assert.strictEqual(meta.mode, REUSE_MODE_PARTIAL, 'cacheHit 不得影响 mode')
+    }
+    // 缺席 ⇒ 字段不存在（保持旧形状，向后兼容）
+    assert.strictEqual(runReuseMode(['--segment', 'app', '--log', log, '--out', out], io()), 0)
+    assert.ok(!('cacheHit' in JSON.parse(fs.readFileSync(out, 'utf8'))), '未传 --cache-hit 时不得写 cacheHit 字段')
+    // 非法 ⇒ fail-closed：exit 1 + stderr 提示 + **不写** reuse.json（先删掉上一次的产物，证明没被重写）
+    fs.rmSync(out)
+    for (const bad of ['yes', '1', 'TRUE', 'primary', 'false ']) {
+      const errs = []
+      const io2 = { stdout: { write: () => {} }, stderr: { write: (s) => errs.push(s) } }
+      assert.strictEqual(runReuseMode(['--segment', 'app', '--log', log, '--out', out, '--cache-hit', bad], io2), 1, `--cache-hit ${JSON.stringify(bad)} 必须 exit 1`)
+      assert.ok(errs.join('').includes('参数非法'), `必须给出参数非法提示：${errs.join('')}`)
+      assert.strictEqual(fs.existsSync(out), false, `--cache-hit ${JSON.stringify(bad)} 不得写 reuse.json`)
+    }
+    // 缺取值 / 未知参数 / 笔误照旧 fail-closed
+    assert.strictEqual(runReuseMode(['--segment', 'app', '--log', log, '--out', out, '--cache-hit'], io()), 1, '--cache-hit 缺取值应 exit 1')
+    assert.strictEqual(runReuseMode(['--segment', 'app', '--log', log, '--out', out, '--cache-hitt', 'true'], io()), 1, '参数笔误应 exit 1')
+    assert.strictEqual(fs.existsSync(out), false, '任何非法参数都不得写 reuse.json')
+    // parseReuseArgs 直接断言：缺席 ⇒ undefined（不是空串/布尔），三值原样，`=` 形式同样支持
+    assert.strictEqual(parseReuseArgs(['--segment', 'app', '--log', 'x']).cacheHit, undefined)
+    assert.strictEqual(parseReuseArgs(['--segment', 'app', '--log', 'x', '--cache-hit=true']).cacheHit, 'true')
+    assert.strictEqual(parseReuseArgs(['--segment', 'app', '--log', 'x', '--cache-hit', 'none']).cacheHit, 'none')
+    assert.throws(() => parseReuseArgs(['--segment', 'app', '--log', 'x', '--cache-hit', 'yes']), /取值非法/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // ===== 双口径（PR-1 · A2 决策）：既有「分数」与新增「covered 口径」===============================
