@@ -369,4 +369,67 @@ check('compileStateOf: 同一配置在 re2 缺失/规则编译失败时指纹不
   assert.ok(withRe2.compileStateOf(null).includes('keyword=null'), '空编译结果的字段一律记为未编译')
 })
 
+// === _validateCatRe（PlanA）：空值 / 嵌套量词 / re2 有效性三条分支 ===
+check('_validateCatRe：空分类（null/undefined）只产出一条空值警告并早退', () => {
+  const e = createRuleEngine({ Utils: {}, FILTER_FIELDS: ['keyword'], compileUserRegex: () => true, isRe2Available: () => false })
+  const w = []
+  assert.strictEqual(e._validateCatRe(null, 'keyword', w), undefined, '空分类不得返回非 undefined')
+  assert.strictEqual(w.length, 1, 'null 只产出一条警告')
+  assert.ok(w[0].endsWith('配置「keyword」分类正则为空，该行将被忽略'), `空值警告文本必须精确：${w[0]}`)
+  const w2 = []
+  e._validateCatRe(undefined, 'pingbitime', w2)
+  assert.strictEqual(w2.length, 1, 'undefined 与 null 走同一分支')
+  assert.ok(w2[0].endsWith('配置「pingbitime」分类正则为空，该行将被忽略'), `field 必须出现在警告里：${w2[0]}`)
+})
+
+check('_validateCatRe：嵌套量词/交替歧义分支优先于 re2 有效性检查', () => {
+  const e = createRuleEngine({ Utils: {}, FILTER_FIELDS: ['keyword'], compileUserRegex: () => true, isRe2Available: () => true })
+  const w = []
+  e._validateCatRe('(a+)+', 'keyword', w)
+  assert.strictEqual(w.length, 1, '嵌套量词必须恰好产出一条警告')
+  assert.ok(w[0].endsWith('配置「keyword」分类正则含嵌套量词，可能导致灾难性回溯，该行将被忽略：「(a+)+」'), `嵌套量词警告文本必须精确：${w[0]}`)
+  const w2 = []
+  e._validateCatRe('(a|aa)+', 'pingbitime', w2)
+  assert.strictEqual(w2.length, 1, '交替歧义同样命中嵌套量词分支')
+  assert.ok(w2[0].includes('「(a|aa)+」'), '警告必须回显被拦下的模式')
+  const w3 = []
+  e._validateCatRe('abc', 'keyword', w3)
+  assert.strictEqual(w3.length, 0, '合法分类正则不得产生任何警告（杀条件被强制为 true）')
+})
+
+check('_validateCatRe：仅当 re2 可用时才做正则有效性检查', () => {
+  const noRe2 = createRuleEngine({ Utils: {}, FILTER_FIELDS: ['keyword'], compileUserRegex: () => false, isRe2Available: () => false })
+  const w = []
+  noRe2._validateCatRe('BAD', 'keyword', w)
+  assert.strictEqual(w.length, 0, 're2 不可用时不得做有效性检查（否则不可编译模式被误报）')
+  const re2e = createRuleEngine({ Utils: {}, FILTER_FIELDS: ['keyword'], compileUserRegex: (p) => p !== 'BAD', isRe2Available: () => true })
+  const w2 = []
+  re2e._validateCatRe('GOOD', 'keyword', w2)
+  assert.strictEqual(w2.length, 0, 're2 可用且模式有效时不得告警')
+  const w3 = []
+  re2e._validateCatRe('BAD', 'pingbitime', w3)
+  assert.strictEqual(w3.length, 1, 're2 可用且模式无效时必须告警')
+  assert.ok(w3[0].endsWith('配置「pingbitime」分类正则无效：「BAD」'), `无效正则警告文本必须精确：${w3[0]}`)
+})
+
+check('_validateCatRe：有效性检查必须以 String(cat) 与固定 i 标志调用 compileUserRegex', () => {
+  // 反例（改动前）：三条分支用例只断言「有没有告警」，从没捕获 compileUserRegex 的实参——
+  // 于是 L145 的固定标志 'i'（StringLiteral）与 String(cat) 化都可被改掉而无人发现。
+  const seen = []
+  const e = createRuleEngine({
+    Utils: {},
+    FILTER_FIELDS: ['keyword'],
+    compileUserRegex: (p, f) => { seen.push([p, f]); return 'COMPILED' },
+    isRe2Available: () => true
+  })
+  e._validateCatRe('abc', 'keyword', [])
+  assert.deepStrictEqual(seen, [['abc', 'i']], '必须恰好以 (模式, 固定 i 标志) 调一次 compileUserRegex')
+  seen.length = 0
+  e._validateCatRe(42, 'keyword', [])
+  assert.deepStrictEqual(seen, [['42', 'i']], '非字符串分类必须先 String() 化再进编译（与 _compileCatRe 同口径）')
+  seen.length = 0
+  e._validateCatRe('(a+)+', 'keyword', [])
+  assert.deepStrictEqual(seen, [], '嵌套量词分支必须早退，不得进入编译')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_rules_extended.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
