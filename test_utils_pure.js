@@ -1354,4 +1354,309 @@ check('anonKey: 首字符参与哈希（h1 初值 5381 与首字符混入）', (
   assert.notStrictEqual(Utils.anonKey(''), Utils.anonKey('a'), '退化键与单字符键不同')
 })
 
+// ===== xbk_function_v3 顶层 / Config 口径 / RE2 闸门 / XBK_PROFILE=3 启动画像 / runSingleEntry =====
+// 观测方式沿用既有 P1-04：execFileSync(process.execPath, ['-e', probe]) 起子进程；子进程内先按需替
+// require.cache（re2 替身 / package.json 版本），再 require('./xbk_function_v3')，把观测到的事实以单行
+// PROBE_JSON 打到 stdout，父进程 JSON.parse 后做 strictEqual 精确断言（真假两侧都有）。
+// 必须子进程的原因：XBK_PROFILE 与 require.cache 都是进程级状态；本机 execPath 已由
+// .local/execpath-shim.js 归一到真 node（既有 P1-04 同路径在本 worktree 为绿）。
+const PROBE_PRELUDE = String.raw`
+'use strict'
+function spy (rel, key, rec) {
+  const p = require.resolve(rel)
+  const real = require(p)
+  const out = Object.assign({}, real)
+  rec[key + 'Args'] = rec[key + 'Args'] || []
+  out[key] = function () { rec[key] = arguments[0]; rec[key + 'Args'].push(arguments[0]); return real[key].apply(real, arguments) }
+  require.cache[p].exports = out
+}
+function rethrow (fn) { try { fn(); return 'NO_THROW' } catch (e) { return 'THREW:' + e.name } }
+const SPY_TARGETS = [['./xbk_utils', 'createUtils'], ['./xbk_formatter', 'createFormatter'], ['./xbk_rules', 'createRuleEngine'], ['./xbk_filter', 'createFilterEngine'], ['./xbk_message_store', 'createMessageStore'], ['./xbk_network', 'createNetwork'], ['./xbk_pusher', 'createPusher'], ['./xbk_app', 'createApp']]
+`
+const factsProbe = PROBE_PRELUDE + String.raw`
+const REC = {}
+const warns = []
+console.warn = (...a) => { warns.push(a.map(v => String(v)).join(' ')) }
+for (const t of SPY_TARGETS) spy(t[0], t[1], REC)
+const mod = require('./xbk_function_v3')
+const ca = REC.createApp
+const sr = REC.createUtils.safeRe
+const cu = REC.createRuleEngine.compileUserRegex
+const out = {}
+out.warnsAfterLoad = warns.length
+out.prof = ca.PROFILE3
+out.pk = ca.PKG_VERSION
+out.marksLen = ca.PROFILE3_BOOT_MARKS.length
+out.markFirstType = ca.PROFILE3_BOOT_MARKS.length ? typeof ca.PROFILE3_BOOT_MARKS[0] : 'EMPTY'
+out.re2MissingWarning = typeof ca.RE2_MISSING_WARNING === 'string' ? ca.RE2_MISSING_WARNING : String(ca.RE2_MISSING_WARNING)
+out.re2WarnStateFile = ca.RE2_WARN_STATE_FILE
+out.safeReIsFn = typeof sr
+out.safeReBasic = String(sr('aa', 'g')) + '|' + sr('aa', 'g').flags
+out.safeReCacheIdentity = sr('bb', 'g') === sr('bb', 'g')
+out.safeReKeyCollision = [sr('cc', 'i').flags, sr('cci', '').flags]
+out.safeReInvalid = rethrow(() => sr('c(', 'g'))
+out.warnsAfterInvalid = warns.length
+const cuStr = cu('a')
+out.cuString = cuStr === null ? 'null' : String(cuStr)
+const cuInvalid = cu('(')
+out.cuInvalid = cuInvalid === null ? 'null' : String(cuInvalid)
+out.netArgKeys = (REC.createNetworkArgs && REC.createNetworkArgs.length) ? Object.keys(REC.createNetworkArgs[0]).sort().join(',') : '(none)'
+out.pusherArgKeys = (REC.createPusherArgs && REC.createPusherArgs.length) ? Object.keys(REC.createPusherArgs[0]).sort().join(',') : '(none)'
+const cuNum = cu(123)
+out.cuNonString = cuNum === null ? 'null' : String(cuNum)
+const C = mod.Config
+out.pushUrlDefault = C.api.pushUrl
+const savedDomain = C.domain
+C.domain = '  https://x.example/  '
+out.pushUrlPadded = C.api.pushUrl
+C.domain = 'https://x.example///'
+out.pushUrlSlashes = C.api.pushUrl
+C.domain = 12345
+out.pushUrlNonString = C.api.pushUrl
+C.domain = savedDomain
+const xbkPath = require.resolve('./xbk_function_v3')
+const pkgPath = require.resolve('./package.json')
+out.versions = {}
+const rounds = [['padded', '  7.7.7  '], ['blank', '   '], ['null', null], ['nan', NaN], ['number', 42], ['trimObj', 'TRIM_OBJ'], ['throwPkg', 'THROW_PKG']]
+for (const r of rounds) {
+  delete require.cache[xbkPath]
+  const ver = r[1] === 'TRIM_OBJ' ? { trim: function () { return 'X' } } : r[1]
+  if (r[1] === 'THROW_PKG') {
+    // 让 require('./package.json') 抛错：preload 到 cache 的坏对象在 getter 上抛
+    require.cache[pkgPath] = { id: pkgPath, filename: pkgPath, loaded: true, get exports () { throw new Error('bad json') } }
+  } else {
+    require.cache[pkgPath] = { id: pkgPath, filename: pkgPath, loaded: true, exports: { version: ver } }
+  }
+  REC.createApp = null
+  require(xbkPath)
+  out.versions[r[0]] = REC.createApp ? String(REC.createApp.PKG_VERSION) : '(no-args)'
+}
+process.stdout.write('\nPROBE_JSON:' + JSON.stringify(out))
+`
+const profile3Probe = PROBE_PRELUDE + String.raw`
+const REC = {}
+for (const t of SPY_TARGETS) spy(t[0], t[1], REC)
+require('./xbk_function_v3')
+const ca = REC.createApp
+const marks = ca.PROFILE3_BOOT_MARKS
+process.stdout.write('\nPROBE_JSON:' + JSON.stringify({
+  prof: ca.PROFILE3,
+  names: marks.map(m => (m && typeof m === 'object') ? m.name : String(m)),
+  allObjects: marks.every(m => m && typeof m === 'object'),
+  allMsNumeric: marks.every(m => m && typeof m.ms === 'number')
+}))
+`
+const noRe2Probe = PROBE_PRELUDE + String.raw`
+const re2Path = require.resolve('re2')
+require.cache[re2Path] = { id: re2Path, filename: re2Path, loaded: true, exports: null }
+const REC = {}
+const warns = []
+console.warn = (...a) => { warns.push(a.map(v => String(v)).join(' ')) }
+for (const t of SPY_TARGETS) spy(t[0], t[1], REC)
+const mod = require('./xbk_function_v3')
+const ca = REC.createApp
+const sr = REC.createUtils.safeRe
+const cu = REC.createRuleEngine.compileUserRegex
+const r1 = cu('a')
+const invalid = rethrow(() => sr('c(', 'g'))
+process.stdout.write('\nPROBE_JSON:' + JSON.stringify({
+  re2cIsNull: ca.RE2C === null,
+  cuString: r1 === null ? 'null' : String(r1),
+  invalid,
+  warnsAfterInvalid: warns.length
+}))
+`
+const entryProbe = String.raw`
+'use strict'
+const xbk = require('./xbk_function_v3')
+const errs = []
+console.error = (...a) => { errs.push(a.map(v => String(v)).join(' ')) }
+const cases = [['ok', { pushed: 1, failed: 0 }], ['retryable', { failed: 1, pushed: 0 }], ['permanent', { failed: 1, pushed: 0, failures: [{ message: '接口返回数据格式异常' }] }]]
+;(async () => {
+  const out = {}
+  for (const c of cases) {
+    process.exitCode = undefined // 严格模式下 delete process.exitCode 会抛 TypeError
+    const before = errs.length
+    await xbk.runSingleEntry({ run: async () => c[1] })
+    out[c[0]] = { code: process.exitCode === undefined ? 'unset' : process.exitCode, err: errs.slice(before).join(' | ') }
+  }
+  process.exitCode = 0
+  process.stdout.write('\nPROBE_JSON:' + JSON.stringify(out))
+})()
+`
+const probeBaseEnv = Object.assign({}, process.env)
+delete probeBaseEnv.XBK_PROFILE
+const probeProfile3Env = Object.assign({}, probeBaseEnv, { XBK_PROFILE: '3' })
+function runProbe (src, env) {
+  const raw = execFileSync(process.execPath, ['-e', src], { cwd: __dirname, encoding: 'utf8', env, maxBuffer: 8 * 1024 * 1024 })
+  const lines = raw.trim().split(/\r?\n/)
+  const last = lines[lines.length - 1]
+  const at = last.indexOf('PROBE_JSON:')
+  if (at < 0) throw new Error(`探针未输出 PROBE_JSON（stdout 尾部）：${raw.slice(-200)}`)
+  return JSON.parse(last.slice(at + 'PROBE_JSON:'.length))
+}
+const probeCache = new Map()
+function cachedProbe (key, src, env) {
+  if (probeCache.has(key)) {
+    const v = probeCache.get(key)
+    if (v instanceof Error) throw v
+    return v
+  }
+  try { const out = runProbe(src, env); probeCache.set(key, out); return out } catch (e) { probeCache.set(key, e); throw e }
+}
+const getFacts = () => cachedProbe('facts', factsProbe, probeBaseEnv)
+const getProfile3 = () => cachedProbe('profile3', profile3Probe, probeProfile3Env)
+const getNoRe2 = () => cachedProbe('nore2', noRe2Probe, probeBaseEnv)
+const getEntry = () => cachedProbe('entry', entryProbe, probeBaseEnv)
+const MAIN = require('./xbk_function_v3')
+
+// 顶层/PROFILE3 三档口径：非 XBK_PROFILE=3 时不得收集启动画像（PROFILE3 常量与标记数组都被变异过）
+check('xbk_function_v3 顶层：XBK_PROFILE 未设置时 PROFILE3=false 且启动画像标记数组为空', () => {
+  const out = getFacts()
+  assert.strictEqual(out.prof, false, 'XBK_PROFILE 未设置时 PROFILE3 必须为 false')
+  assert.strictEqual(out.marksLen, 0, '非 XBK_PROFILE=3 时不得记录任何启动画像标记')
+  assert.strictEqual(out.markFirstType, 'EMPTY', '标记数组必须为空数组（不得被字面量变异填成 ["Stryker was here"]）')
+})
+
+// XBK_PROFILE=3 启动画像：15 个 require 画像点 + 收尾标记的名字必须精确（名字字面量被大量变异成 ""）
+check('XBK_PROFILE=3 启动画像：profile3Require 15 个画像点 + module-load-complete 收尾标记', () => {
+  const out = getProfile3()
+  assert.strictEqual(out.prof, true, 'XBK_PROFILE=3 时 PROFILE3 必须为 true（===／!== 与字面量 "3" 两侧都要卡）')
+  assert.strictEqual(out.allObjects, true, '每个画像标记必须是 {name,ms} 对象（数组字面量变异会注入字符串）')
+  assert.strictEqual(out.names[0], 'require:fs', '首个画像点必须是 require:fs')
+  for (const n of ['fs', 'xbk_http', 'xbk_agents', 'xbk_storage', 'xbk_failure_policy', 'path', 'package.json', 'xbk_utils', 'xbk_formatter', 'xbk_rules', 'xbk_filter', 'xbk_message_store', 'xbk_network', 'xbk_pusher', 'xbk_app']) {
+    assert.strictEqual(out.names.includes('require:' + n), true, `启动画像缺少 require:${n} 标记（实际：${out.names.join(',')}）`)
+  }
+  assert.deepStrictEqual(out.names.slice(-1), ['module-load-complete'], '收尾标记必须最后写入且名字精确')
+  assert.strictEqual(out.allMsNumeric, true, '每个标记的 ms 必须是数字（profile3NowMs 毫秒换算）')
+})
+
+// safeRe：缓存键必须含 src/flags 分隔符，同键必须命中同一对象，首条失败必须恰好告警一次
+check('safeRe 缓存键与 RE2 闸门：缺分隔符会串键；首条编译失败必须告警一次并仍回落 V8', () => {
+  const out = getFacts()
+  assert.strictEqual(out.safeReIsFn, 'function', 'createUtils 必须被注入 safeRe 函数')
+  assert.strictEqual(out.safeReBasic, '/aa/g|g', 'safeRe 必须返回带 flags 的正则（String|flags 精确值）')
+  assert.strictEqual(out.safeReCacheIdentity, true, '同 (src,flags) 必须命中同一缓存对象')
+  assert.deepStrictEqual(out.safeReKeyCollision, ['i', ''], '(cc,i) 与 (cci,) 是两种键，不得因缺少分隔符互相污染缓存')
+  assert.strictEqual(out.warnsAfterLoad, 0, '模块加载期的内部模式不得触发回落告警')
+  assert.strictEqual(out.safeReInvalid, 'THREW:SyntaxError', '无效模式在 V8 回落路径上仍必须抛出')
+  assert.strictEqual(out.warnsAfterInvalid, 1, '首次 RE2 编译失败必须恰好告警一次（_re2FallbackWarned 初值 false，且 catch 不得被清空）')
+})
+
+// 未装 re2 时不得走 RE2 分支（RE2C 为 null 仍尝试 new RE2C 会造出虚假回落告警），用户正则一律跳过
+check('safeRe/compileUserRegex：未装 re2 时直接走 V8、用户正则一律跳过且无回落告警', () => {
+  const out = getNoRe2()
+  assert.strictEqual(out.re2cIsNull, true, '前置条件：re2 替身缺失时注入的 RE2C 必须为 null')
+  assert.strictEqual(out.invalid, 'THREW:SyntaxError', '无效模式仍由 V8 抛出')
+  assert.strictEqual(out.warnsAfterInvalid, 0, 'RE2C 为 null 时不得触发回落告警（if (RE2C) 守卫被变异即会误报）')
+  assert.strictEqual(out.cuString, 'null', '未装 re2 时用户配置正则必须被跳过（不得回退 V8）')
+})
+
+// compileUserRegex：非字符串直接 null（typeof 守卫 + || 短路），字符串按注入的 RE2 编译且默认 flags=i
+check('compileUserRegex：数字输入直接 null，字符串按默认 flags=i 编译为可用正则', () => {
+  const out = getFacts()
+  assert.strictEqual(out.cuString, '/a/i', '字符串模式必须按默认 flags=i 编译（try 体被清空会返回 undefined）')
+  assert.strictEqual(out.cuNonString, 'null', '非字符串（数字）输入必须直接返回 null，不得落到 new RE2C')
+})
+
+// RE2 缺失提醒的两个常量口径（跨进程「按天一次」的状态文件名 + 文案尾部安装建议）
+check('RE2 缺失提醒常量：re2warn.state 状态文件名与「跳过 + npm install re2」文案', () => {
+  const out = getFacts()
+  assert.strictEqual(out.re2WarnStateFile, 're2warn.state', '按天命名的状态文件名必须精确')
+  assert.strictEqual(typeof out.re2MissingWarning === 'string' && out.re2MissingWarning.startsWith('⚠️'), true, '提醒文案必须以告警符号开头（字面量变异为空串即失败）')
+  assert.strictEqual(out.re2MissingWarning.endsWith('npm install re2'), true, '提醒文案必须给出安装建议')
+  assert.strictEqual(/跳过/.test(out.re2MissingWarning), true, '提醒文案必须说明用户过滤正则会被跳过')
+})
+
+// package.json 版本回退口径：字符串 trim、有限数值转字符串、非法值回退 3.x（五轮 mock + 真实包版本）
+check('PKG_VERSION 回退口径：trim、有限数值、null/NaN/带 trim 的脏对象一律回退 3.x', () => {
+  const out = getFacts()
+  const realVersion = require('./package.json').version
+  assert.strictEqual(out.pk, realVersion, `版本必须取 package.json 的 version（实际 ${out.pk}）`)
+  assert.strictEqual(out.versions.padded, '7.7.7', '字符串版本必须经过 trim')
+  assert.strictEqual(out.versions.null, '3.x', 'version=null 必须回退 3.x')
+  assert.strictEqual(out.versions.nan, '3.x', 'version=NaN（非有限数值）必须回退 3.x（Number.isFinite 守卫）')
+  assert.strictEqual(out.versions.number, '42', '有限数值版本必须转成字符串')
+  assert.strictEqual(out.versions.trimObj, '3.x', '带 trim 的非字符串脏对象不得被当成合法版本（typeof/&& 守卫）')
+  // 反例（改动前）：纯空白版本、以及 require('./package.json') 直接抛错两条路径都没覆盖——
+  // 前者只在 v.trim() !== '' 成立时才回退 3.x（==/去 trim/空串字面量三个变异体在此可区分），
+  // 后者只在 catch 分支回退初值 3.x（初值被改成 "" 时可区分）。
+  assert.strictEqual(out.versions.blank, '3.x', 'version 为纯空白串必须回退 3.x（v.trim() !== \'\' 守卫）')
+  assert.strictEqual(out.versions.throwPkg, '3.x', 'package.json 读取抛错时必须回退初值 3.x（catch 分支）')
+  assert.strictEqual(out.cuInvalid, 'null', 'compileUserRegex 对无效模式必须返回 null（catch 体不得被清空）')
+  assert.strictEqual(out.netArgKeys, 'Config,PKG_VERSION,PROFILE3,RETRYABLE_CODES,Utils,crypto,fetchJson,getNotify,logger,prewarmDns',
+    'createNetwork 必须收到完整的 10 键注入对象（ObjectLiteral 变 {} 或丢键即红）')
+  assert.strictEqual(out.pusherArgKeys, 'Utils,getNotify,looksLikeHtmlLinear',
+    'createPusher 必须收到完整的 3 键注入对象（ObjectLiteral 变 {} 或丢键即红）')
+})
+
+// Config 默认口径（README/SYSTEM_CONTRACT 配置节）：过滤默认全空、健康/日报/诊断/磁盘余量精确值
+check('Config 默认口径：过滤默认全空（v3.176）+ 告警/日报/通道健康/诊断/磁盘余量精确值', () => {
+  const C = MAIN.Config
+  assert.deepStrictEqual(C.filter, {
+    pingbifenlei: '',
+    pingbibiaoti: '',
+    zhanxianbiaoti: '',
+    pingbibiaotiplus: '',
+    pingbineirong: '',
+    zhanxianneirong: '',
+    pingbineirongplus: '',
+    pingbilouzhu: '',
+    zhanxianlouzhu: '',
+    pingbilouzhuplus: '',
+    pingbitime: '5'
+  }, 'v3.176 起默认过滤配置必须全空（不得回填个人配置，如 pingbibiaotiplus 等六个空串默认值）')
+  assert.strictEqual(C.keyword.zkt_gjc, '')
+  assert.deepStrictEqual(C.alert, { enabled: true, intervalMs: 3600000 }, '接口异常告警默认开启且限频 1 小时')
+  assert.deepStrictEqual(C.report, { enabled: true }, '运行日报默认开启')
+  assert.deepStrictEqual(C.channelHealth, { enabled: true, consecutiveFailures: 3, intervalMs: 3600000 }, '通道健康阈值与限频口径')
+  assert.deepStrictEqual(C.diagnostics, { filterLog: { enabled: true, maxDetailsPerRun: 100, includePassed: false } }, '过滤诊断默认口径')
+  assert.deepStrictEqual(C.storage, { minFreeBytes: 50 * 1024 * 1024 }, '磁盘余量阈值 50MiB（对象字面量与算术都要卡）')
+  assert.strictEqual(C.storage.minFreeBytes, 52428800, '50*1024*1024 必须精确等于 52428800')
+})
+
+// 其余 README 配置口径（通道超时、推送模式/截断、缓存、模板、时序）——顺序与并行模式的默认值
+check('Config 其余口径：通道超时/重试、推送模式与截断、缓存上限与目录、模板与推送间隔', () => {
+  const C = MAIN.Config
+  assert.strictEqual(C.api.timeout, 5000, '通道超时 5000ms')
+  assert.strictEqual(C.api.retry, 2, '通道重试 2 次')
+  assert.deepStrictEqual(C.push, { mode: 'parallel', parallelLimit: 10, titleMax: 100, contentMax: 3000, maxPerRun: 100 }, '推送默认并行模式与截断/单轮上限')
+  assert.deepStrictEqual(C.cache, { maxSize: 10000, dir: 'xianbaoku_cache' }, '缓存上限与目录（与 Config.cache.dir 同源）')
+  assert.deepStrictEqual(C.template, { title: '【{分类名}】{标题}', content: '{Markdown内容}' }, '推送模板默认值与历史硬编码一致')
+  assert.deepStrictEqual(C.timing, { pushInterval: 0, finalWait: 0 }, '顺序/并行补位间隔默认 0')
+})
+
+// pushUrl 拼接口径：domain trim + 去尾斜杠（v3.94 双斜杠 404 防御）+ 非字符串 domain 退化为空串（R2）
+check('pushUrl 拼接：domain 两端 trim、尾斜杠全去、非字符串 domain 退化为空串且不抛异常', () => {
+  const C = MAIN.Config
+  const saved = C.domain
+  try {
+    C.domain = 'https://new.ixbk.net'
+    assert.strictEqual(C.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json', 'README 契约路径 /plus/json/push.json')
+    C.domain = '  https://x.example/  '
+    assert.strictEqual(C.api.pushUrl, 'https://x.example/plus/json/push.json', 'domain 两端空白必须被 trim（丢 trim 会留下空白）')
+    C.domain = 'https://x.example///'
+    assert.strictEqual(C.api.pushUrl, 'https://x.example/plus/json/push.json', 'domain 尾斜杠必须全部去掉')
+    C.domain = 12345
+    assert.strictEqual(C.api.pushUrl, '/plus/json/push.json', 'domain 非字符串（脏配置）退化为空串，不得抛异常')
+    C.domain = { a: 1 }
+    assert.strictEqual(C.api.pushUrl, '/plus/json/push.json', 'domain 对象同样退化为空串')
+    C.domain = null
+    assert.strictEqual(C.api.pushUrl, '/plus/json/push.json', 'domain null 同样退化为空串')
+  } finally { C.domain = saved }
+  assert.strictEqual(C.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json', 'domain 已还原，默认 pushUrl 不得被上例污染')
+})
+
+// runSingleEntry 失败语义：决策为 null 不动退出码；retryable/permanent 置 1 且文案区分不可恢复/可重试
+check('runSingleEntry：无失败不动退出码；全失败置 1 且 retryable/permanent 文案与原因精确', () => {
+  const out = getEntry()
+  assert.strictEqual(out.ok.code, 'unset', '无失败摘要不得设置 process.exitCode（if (decision) 被变异即会误设）')
+  assert.strictEqual(out.ok.err, '', '无失败摘要不得输出任何失败文案')
+  assert.strictEqual(out.retryable.code, 1, '全部失败（原因未结构化）必须置非零退出码')
+  assert.strictEqual(out.retryable.err.startsWith('程序运行失败（ALL_PUSH_FAILED_UNKNOWN）：可重试'), true, `可重试文案与原因必须精确（实际：${out.retryable.err}）`)
+  assert.strictEqual(out.permanent.code, 1, '永久失败必须置非零退出码')
+  assert.strictEqual(out.permanent.err.startsWith('程序运行失败（') && out.permanent.err.includes('不可恢复'), true, `永久失败文案必须是「不可恢复」（实际：${out.permanent.err}）`)
+  assert.strictEqual(out.permanent.err.includes('可重试'), false, '永久失败不得被写成可重试（=== 被变异成 !== 即失败）')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
