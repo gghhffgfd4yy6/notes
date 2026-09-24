@@ -29,26 +29,26 @@ function check (name, fn) {
 // 桩：fs / readSafeTextResult 全部由本文件控制，不触碰真实缓存目录
 const stub = { exists: false, readResult: { status: 'missing', text: '' }, readCalls: 0, lastMax: null }
 
-function makeApp () {
+function makeApp (over = {}) {
   stub.exists = false
   stub.readResult = { status: 'missing', text: '' }
   stub.readCalls = 0
   stub.lastMax = null
   return createApp({
-    Config: {},
-    Utils: { safeErrorText: (e, d) => String((e && e.message) || d) },
+    Config: Object.assign({}, over.Config),
+    Utils: Object.assign({ safeErrorText: (e, d) => String((e && e.message) || d) }, over.Utils),
     Formatter: {},
     RuleEngine: {},
     FilterEngine: {},
-    MessageStore: {},
+    MessageStore: Object.assign({}, over.MessageStore),
     Network: {},
     Pusher: {},
-    fs: { existsSync: () => stub.exists },
+    fs: Object.assign({ existsSync: () => stub.exists }, over.fs),
     path,
     crypto,
     readSafeTextResult: (p, max) => { stub.readCalls++; stub.lastMax = max; return stub.readResult },
-    writeAtomic: () => true,
-    isRegularOrMissing: () => true,
+    writeAtomic: over.writeAtomic || (() => true),
+    isRegularOrMissing: over.isRegularOrMissing || (() => true),
     STATE_TEXT_MAX_BYTES: 262144,
     DEFAULT_MAX_SIZE: 1048576,
     RE2C: null,
@@ -368,6 +368,475 @@ check('_reportToday 用 Asia/Shanghai 日界，UTC 20:00 已跨到次日', () =>
   assert.strictEqual(got, '2024-03-16', '日界必须是 Asia/Shanghai（UTC 20:00 已进入上海次日）')
   assert.notStrictEqual(got, '2024-03-15', '不得使用 UTC/本地日界')
   assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(got), '格式必须为 sv-SE 的 YYYY-MM-DD')
+})
+
+// ============================================================
+// 追加：日志/状态写入簇（_writeRunLog / _warnLowDisk / _writeState /
+// _persistReportState / _writeTextAtomic / _isRegularOrMissing / _localStamp）
+// 全部经注入桩控制 fs / Utils / Config / MessageStore：不碰真实磁盘、真实余量、
+// 真实文件系统布局；时钟口径用固定时刻或相对偏移。
+// ============================================================
+const CACHE_DIR = '/vcache'
+const LOG_PATH = path.join(CACHE_DIR, 'run.log')
+const LOCK_PATH = LOG_PATH + '.lock'
+const KEEP = 512 * 1024
+const LIMIT = 1024 * 1024
+
+function makeLogFs (over = {}) {
+  const rec = { append: [], open: [], write: [], read: [], close: [], unlink: [], stat: [] }
+  const stub = {
+    existsSync: () => true,
+    openSync (p, flag) {
+      rec.open.push([p, flag])
+      if (over.openSync) return over.openSync(p, flag)
+      return flag === 'r+' ? 8 : 7
+    },
+    writeSync (fd, data) { rec.write.push([fd, String(data)]) },
+    appendFileSync (p, data, enc) {
+      if (over.appendThrows) throw new Error('append 失败')
+      rec.append.push([p, String(data), enc])
+    },
+    statSync (p) {
+      rec.stat.push(p)
+      if (over.statThrows) throw new Error('stat 失败')
+      return { size: over.size === undefined ? 0 : over.size, mtimeMs: over.mtimeMs === undefined ? Date.now() : over.mtimeMs }
+    },
+    readSync (fd, buf, off, len, pos) {
+      rec.read.push([fd, len, pos, buf.length])
+      if (over.tail !== undefined) Buffer.from(over.tail, 'utf8').copy(buf, off)
+      return len
+    },
+    closeSync (fd) { rec.close.push(fd) },
+    unlinkSync (p) { rec.unlink.push(p) }
+  }
+  return { rec, stub }
+}
+
+function makeUtils (over = {}) {
+  return Object.assign({
+    safeErrorText: (e, d) => String((e && e.message) || d),
+    num: (v, d) => (v !== null && v !== '' && Number.isFinite(Number(v)) ? Number(v) : d),
+    diskSpace: () => null,
+    truncateUtf16: (s, n) => s.slice(0, n)
+  }, over)
+}
+
+function makeLogApp (opts = {}) {
+  const cap = []
+  const app = makeApp({
+    Config: opts.Config,
+    MessageStore: opts.MessageStore || {
+      cacheDir: CACHE_DIR,
+      _getTombstoneProcessStart: () => 42,
+      _isTombstoneLockProcessAlive: () => false
+    },
+    fs: opts.rec ? opts.rec.stub : undefined,
+    writeAtomic: opts.writeAtomic || ((p, t) => { cap.push([p, t]); return opts.writeOk === undefined ? true : opts.writeOk }),
+    isRegularOrMissing: opts.isRegularOrMissing,
+    Utils: makeUtils(opts.Utils)
+  })
+  return { app, cap, rec: opts.rec ? opts.rec.rec : null }
+}
+
+function withFixedNow (now, fn) {
+  const RN = Date.now
+  Date.now = () => now
+  try { return fn() } finally { Date.now = RN }
+}
+
+// ----- _isRegularOrMissing / _writeTextAtomic：薄封装透传 -----
+check('_isRegularOrMissing 透传注入实现（true/false 两侧）', () => {
+  let flag = true
+  const { app } = makeLogApp({ isRegularOrMissing: () => flag })
+  assert.strictEqual(app._isRegularOrMissing('/x'), true)
+  flag = false
+  assert.strictEqual(app._isRegularOrMissing('/x'), false)
+})
+
+check('_writeTextAtomic 透传 (path,text,"缓存文件") 并原样返回 writeAtomic 结果', () => {
+  const args = []
+  let ret = true
+  const { app } = makeLogApp({ writeAtomic: (p, t, label) => { args.push([p, t, label]); return ret } })
+  assert.strictEqual(app._writeTextAtomic('/f.json', 'TXT'), true)
+  assert.deepStrictEqual(args, [['/f.json', 'TXT', '缓存文件']])
+  ret = false
+  assert.strictEqual(app._writeTextAtomic('/f.json', 'TXT'), false)
+})
+
+check('_writeTextAtomic writeAtomic 抛错 ⇒ 返回 false 不冒泡', () => {
+  const { app } = makeLogApp({ writeAtomic: () => { throw new Error('boom') } })
+  assert.strictEqual(app._writeTextAtomic('/f.json', 'TXT'), false)
+})
+
+// ----- _writeState：类型守卫 / 序列化异常 / 透传 -----
+check('_writeState 非对象入参 ⇒ 精确告警 + 拒绝写入（kind 口径）', () => {
+  for (const [v, kind] of [[undefined, 'undefined'], [null, 'null'], [42, 'number'], ['s', 'string']]) {
+    const { app, cap } = makeLogApp()
+    const r = withCapture('warn', () => app._writeState('/p/state.json', v))
+    assert.strictEqual(r.value, false, `${kind} 必须拒绝`)
+    assert.deepStrictEqual(r.msgs, [`_writeState: state 必须是非空对象, 实际为 ${kind}, 拒绝写入 /p/state.json`])
+    assert.strictEqual(cap.length, 0, `${kind} 不得落盘`)
+  }
+})
+
+check('_writeState 数组（typeof object）⇒ 同样拒绝，kind=array', () => {
+  const { app, cap } = makeLogApp()
+  const r = withCapture('warn', () => app._writeState('/p/state.json', [1, 2]))
+  assert.strictEqual(r.value, false)
+  assert.deepStrictEqual(r.msgs, ['_writeState: state 必须是非空对象, 实际为 array, 拒绝写入 /p/state.json'])
+  assert.strictEqual(cap.length, 0)
+})
+
+check('_writeState 序列化异常（循环引用）⇒ error 告警 + false，不调用 writeAtomic', () => {
+  const { app, cap } = makeLogApp()
+  const cyc = {}; cyc.self = cyc
+  const r = withCapture('error', () => app._writeState('/p/state.json', cyc))
+  assert.strictEqual(r.value, false)
+  assert.strictEqual(r.msgs.length, 1)
+  assert.ok(r.msgs[0].startsWith('状态序列化失败 /p/state.json:'), r.msgs[0])
+  assert.strictEqual(cap.length, 0)
+})
+
+check('_writeState 正常 ⇒ 落盘 JSON.stringify(state) 文本，返回值透传', () => {
+  const { app, cap } = makeLogApp({ writeOk: false })
+  assert.strictEqual(app._writeState('/p/s.json', { a: 1 }), false)
+  assert.deepStrictEqual(cap, [['/p/s.json', '{"a":1}']])
+})
+
+// ----- _localStamp：固定 Asia/Shanghai 口径 -----
+check('_localStamp 固定 UTC 时刻 ⇒ Asia/Shanghai 文本（不是 UTC/进程本地口径）', () => {
+  const RealDate = Date
+  const FIXED = RealDate.UTC(2024, 2, 15, 20, 0, 0)
+  class FakeDate extends RealDate {
+    constructor (...a) { if (a.length === 0) super(FIXED); else super(...a) }
+    static now () { return FIXED }
+  }
+  let got
+  global.Date = FakeDate
+  try { got = makeLogApp({ Config: {} }).app._localStamp() } finally { global.Date = RealDate }
+  assert.strictEqual(got, '2024-03-16 04:00:00')
+  assert.notStrictEqual(got, '2024-03-15 20:00:00')
+})
+
+// ----- _writeRunLog：拒绝非普通文件 / 文件名净化 -----
+check('_writeRunLog 非普通文件 ⇒ error 告警、拒绝追加、不抛（主流程不受影响）', () => {
+  const rec = makeLogFs()
+  const { app } = makeLogApp({ rec, isRegularOrMissing: () => false })
+  const r = withCapture('error', () => app._writeRunLog('x\n'))
+  assert.strictEqual(r.value, undefined)
+  assert.deepStrictEqual(r.msgs, [`拒绝写入非普通运行日志文件 ${LOG_PATH}`])
+  assert.strictEqual(rec.rec.append.length, 0)
+  assert.strictEqual(rec.rec.open.length, 0)
+})
+
+check('_writeRunLog filename 含路径分隔 ⇒ 回退 run.log（防 ../ 逃逸）', () => {
+  const rec = makeLogFs()
+  const seen = []
+  const { app } = makeLogApp({ rec, isRegularOrMissing: (p) => { seen.push(p); return true } })
+  app._writeRunLog('l\n', '../evil.log')
+  assert.deepStrictEqual(seen, [LOG_PATH])
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'l\n', 'utf8']])
+})
+
+check('_writeRunLog 合法基名保留：filter-diagnostics.ndjson', () => {
+  const rec = makeLogFs()
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('l\n', 'filter-diagnostics.ndjson')
+  assert.deepStrictEqual(rec.rec.append, [[path.join(CACHE_DIR, 'filter-diagnostics.ndjson'), 'l\n', 'utf8']])
+})
+
+// ----- _writeRunLog：锁语义 / 清理 / 失败静默 -----
+check('_writeRunLog 正常追加：默认 run.log、utf8、锁令牌 pid:start、锁清理', () => {
+  const rec = makeLogFs()
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('hello\n')
+  assert.deepStrictEqual(rec.rec.open, [[LOCK_PATH, 'wx']])
+  assert.deepStrictEqual(rec.rec.write, [[7, `${process.pid}:42`]])
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'hello\n', 'utf8']])
+  assert.deepStrictEqual(rec.rec.close, [7])
+  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
+})
+
+check('_writeRunLog 锁异常（EACCES）⇒ fail-open 仅追加；超限也不截尾（不得误当持锁）', () => {
+  const e = new Error('x'); e.code = 'EACCES'
+  const rec = makeLogFs({ openSync: (p, flag) => { if (flag === 'wx') throw e; return 8 }, size: 2 * LIMIT, tail: 'IGNORED' })
+  const { app, cap } = makeLogApp({ rec })
+  app._writeRunLog('data\n')
+  assert.deepStrictEqual(rec.rec.append.map((a) => a[1]), ['data\n'])
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx']) // 不得在无锁时开 r+
+  assert.strictEqual(rec.rec.read.length, 0)
+  assert.strictEqual(cap.length, 0)
+  assert.strictEqual(rec.rec.unlink.length, 0)
+  assert.strictEqual(rec.rec.close.length, 0)
+})
+
+check('_writeRunLog 陈旧锁且持有进程已退出 ⇒ 抢占 unlink 后重试成功', () => {
+  let n = 0
+  const rec = makeLogFs({
+    openSync: () => { if (n++ === 0) { const e = new Error('busy'); e.code = 'EEXIST'; throw e } return 7 },
+    mtimeMs: Date.now() - 20000
+  })
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('a\n')
+  assert.strictEqual(rec.rec.unlink.length, 2)
+  assert.strictEqual(rec.rec.unlink[0], LOCK_PATH)
+  assert.strictEqual(rec.rec.open.length, 2)
+  assert.strictEqual(rec.rec.append.length, 1)
+})
+
+check('_writeRunLog 陈旧锁但持有进程仍存活 ⇒ 不抢占，退避重试成功', () => {
+  let n = 0
+  const rec = makeLogFs({
+    openSync: () => { if (n++ === 0) { const e = new Error('busy'); e.code = 'EEXIST'; throw e } return 7 },
+    mtimeMs: Date.now() - 20000
+  })
+  const { app } = makeLogApp({ rec, MessageStore: { cacheDir: CACHE_DIR, _getTombstoneProcessStart: () => 42, _isTombstoneLockProcessAlive: () => true } })
+  app._writeRunLog('a\n')
+  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
+  assert.strictEqual(rec.rec.append.length, 1)
+})
+
+check('_writeRunLog 新鲜锁（mtime 未超龄）⇒ 查 mtime 后退避重试，不抢占', () => {
+  let n = 0
+  const rec = makeLogFs({
+    openSync: () => { if (n++ === 0) { const e = new Error('busy'); e.code = 'EEXIST'; throw e } return 7 },
+    mtimeMs: Date.now()
+  })
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('a\n')
+  assert.strictEqual(rec.rec.unlink.length, 1)
+  assert.strictEqual(rec.rec.stat.length, 2)
+  assert.strictEqual(rec.rec.append.length, 1)
+})
+
+check('_writeRunLog 追加失败 ⇒ 静默吞掉、不截尾，锁仍被清理', () => {
+  const rec = makeLogFs({ appendThrows: true, size: 2 * LIMIT })
+  const { app, cap } = makeLogApp({ rec })
+  assert.strictEqual(app._writeRunLog('x\n'), undefined)
+  assert.strictEqual(cap.length, 0)
+  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
+  assert.deepStrictEqual(rec.rec.close, [7])
+})
+
+check('_writeRunLog 追加后 statSync 失败 ⇒ 静默，锁清理不跳过', () => {
+  const rec = makeLogFs({ statThrows: true })
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('x\n')
+  assert.strictEqual(rec.rec.append.length, 1)
+  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
+})
+
+// ----- _writeRunLog：ERROR 行只截 errMsg 段 -----
+check('_writeRunLog ERROR 行超 512 ⇒ 仅 errMsg 段截到 512，前缀与尾换行保留', () => {
+  const rec = makeLogFs()
+  const seen = []
+  const { app } = makeLogApp({ rec, Utils: { truncateUtf16: (s, n) => { seen.push([s, n]); return s.slice(0, n) } } })
+  app._writeRunLog('2024-01-01 00:00:00 ERROR ' + 'E'.repeat(600) + '\n')
+  assert.deepStrictEqual(seen, [['E'.repeat(600), 512]])
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, '2024-01-01 00:00:00 ERROR ' + 'E'.repeat(512) + '\n', 'utf8']])
+})
+
+check('_writeRunLog ERROR 行恰好 512 字符 ⇒ 不截断（> 而非 >=）', () => {
+  const rec = makeLogFs()
+  let calls = 0
+  const { app } = makeLogApp({ rec, Utils: { truncateUtf16: (s) => { calls++; return s } } })
+  const line = ' ERROR ' + 'M'.repeat(505)
+  assert.strictEqual(line.length, 512)
+  app._writeRunLog(line)
+  assert.strictEqual(calls, 0)
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, line, 'utf8']])
+})
+
+check('_writeRunLog ERROR 在行首 ⇒ 前缀仍取完整 7 字符分隔符（errSep>=0）', () => {
+  const rec = makeLogFs()
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog(' ERROR ' + 'N'.repeat(600))
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, ' ERROR ' + 'N'.repeat(512), 'utf8']])
+})
+
+check('_writeRunLog 多个 " ERROR " ⇒ 按首个分隔（indexOf 而非 lastIndexOf）', () => {
+  const rec = makeLogFs()
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('A ERROR ' + 'X'.repeat(600) + ' ERROR ' + 'Y'.repeat(10))
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'A ERROR ' + 'X'.repeat(512), 'utf8']])
+})
+
+check('_writeRunLog 非 ERROR 长行 ⇒ 完全不截断', () => {
+  const rec = makeLogFs()
+  let calls = 0
+  const { app } = makeLogApp({ rec, Utils: { truncateUtf16: (s) => { calls++; return s } } })
+  const line = '2024-01-01 00:00:00 WARN ' + 'W'.repeat(600)
+  app._writeRunLog(line)
+  assert.strictEqual(calls, 0)
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, line, 'utf8']])
+})
+
+// ----- _writeRunLog：超 1MiB 截尾到 512KiB 且按换行对齐 -----
+check('_writeRunLog size === 1MiB ⇒ 不截尾（严格大于）', () => {
+  const rec = makeLogFs({ size: LIMIT, tail: 'IGNORED' })
+  const { app, cap } = makeLogApp({ rec })
+  app._writeRunLog('l\n')
+  assert.strictEqual(rec.rec.read.length, 0)
+  assert.strictEqual(cap.length, 0)
+})
+
+check('_writeRunLog size > 1MiB ⇒ 只读尾部 512KiB，按首个换行对齐后原子写回', () => {
+  const head = 'H'.repeat(1000) + '\n'
+  const rest = 'T'.repeat(KEEP - head.length)
+  const rec = makeLogFs({ size: 2 * LIMIT, tail: head + rest })
+  const { app, cap } = makeLogApp({ rec })
+  app._writeRunLog('l\n')
+  assert.deepStrictEqual(rec.rec.read, [[8, KEEP, 2 * LIMIT - KEEP, KEEP]])
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'])
+  assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
+})
+
+check('_writeRunLog 尾部无换行 ⇒ 整体写回（不得写空）', () => {
+  const tail = 'N'.repeat(100)
+  const rec = makeLogFs({ size: 2 * LIMIT, tail })
+  const { app, cap } = makeLogApp({ rec })
+  app._writeRunLog('l\n')
+  assert.deepStrictEqual(cap, [[LOG_PATH, tail + '\0'.repeat(KEEP - 100)]])
+})
+
+check('_writeRunLog 尾部多个换行 ⇒ 以首个换行为界（slice(nl+1)）', () => {
+  const rest = 'B'.repeat(100) + '\n' + 'C'.repeat(KEEP - 102)
+  const rec = makeLogFs({ size: 2 * LIMIT, tail: '\n' + rest })
+  const { app, cap } = makeLogApp({ rec })
+  app._writeRunLog('l\n')
+  assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
+})
+
+check('_writeRunLog filename 非字符串 ⇒ 回退 run.log（typeof 守卫不可省）', () => {
+  const rec = makeLogFs()
+  const seen = []
+  const { app } = makeLogApp({ rec, isRegularOrMissing: (p) => { seen.push(p); return true } })
+  app._writeRunLog('l\n', 42)
+  assert.deepStrictEqual(seen, [LOG_PATH])
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'l\n', 'utf8']])
+})
+
+check('_writeRunLog 锁 fd 为 0 仍是有效锁：超限时照样截尾（>=0 而非 >0）', () => {
+  const head = 'H'.repeat(10) + '\n'
+  const rest = 'T'.repeat(KEEP - head.length)
+  const rec = makeLogFs({ openSync: (p, flag) => (flag === 'wx' ? 0 : 9), size: 2 * LIMIT, tail: head + rest })
+  const { app, cap } = makeLogApp({ rec })
+  app._writeRunLog('l\n')
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'])
+  assert.strictEqual(rec.rec.read.length, 1)
+  assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
+})
+
+check('_writeRunLog 锁 fd 为 0 时 finally 仍释放（close/unlink），不得漏清理', () => {
+  const rec = makeLogFs({ openSync: (p, flag) => (flag === 'wx' ? 0 : 9) })
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('l\n')
+  assert.deepStrictEqual(rec.rec.write, [[0, `${process.pid}:42`]])
+  assert.deepStrictEqual(rec.rec.close, [0])
+  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
+})
+
+// ----- _warnLowDisk：阈值 / 只告警不阻断 / 限频 -----
+check('_warnLowDisk free < minFree ⇒ 精确告警一行（toFixed(1) 口径 + 阈值取 Config.storage.minFreeBytes）', () => {
+  const { app } = makeLogApp({ Config: { storage: { minFreeBytes: 32 * 1024 * 1024 } }, Utils: { diskSpace: () => ({ freeBytes: 1572864 }) } })
+  const now = 1700000000000
+  const r = withFixedNow(now, () => withCapture('warn', () => app._warnLowDisk()))
+  assert.strictEqual(r.value, undefined)
+  assert.deepStrictEqual(r.msgs, ['⚠️ 缓存所在磁盘余量不足：1.5 MiB（告警阈值 32.0 MiB），写入状态/缓存可能失败'])
+  assert.strictEqual(app._diskWarningAt, now)
+})
+
+check('_warnLowDisk free === minFree ⇒ 不告警（>= 而非 >），且不更新限频', () => {
+  const minFree = 33554432
+  let calls = 0
+  const { app } = makeLogApp({ Config: { storage: { minFreeBytes: minFree } }, Utils: { diskSpace: () => { calls++; return { freeBytes: minFree } } } })
+  const now = 1700000000000
+  const r = withFixedNow(now, () => withCapture('warn', () => app._warnLowDisk()))
+  assert.deepStrictEqual(r.msgs, [])
+  assert.strictEqual(calls, 1)
+  assert.strictEqual(app._diskWarningAt, 0)
+})
+
+check('_warnLowDisk freeBytes 非有限 / info 缺失 ⇒ 不告警也不记录限频', () => {
+  const cfg = { storage: { minFreeBytes: 1024 } }
+  for (const info of [null, { freeBytes: NaN }, { freeBytes: Infinity }]) {
+    const { app } = makeLogApp({ Config: cfg, Utils: { diskSpace: () => info } })
+    const r = withCapture('warn', () => app._warnLowDisk())
+    assert.deepStrictEqual(r.msgs, [])
+    assert.strictEqual(app._diskWarningAt, 0)
+  }
+})
+
+check('_warnLowDisk 限频边界 3600000ms：恰好到期告警、差 1ms 跳过', () => {
+  let calls = 0
+  const { app } = makeLogApp({ Config: { storage: { minFreeBytes: 33554432 } }, Utils: { diskSpace: () => { calls++; return { freeBytes: 1 } } } })
+  const now = 1700000000000
+  withFixedNow(now, () => {
+    app._diskWarningAt = now - 3600000
+    assert.strictEqual(withCapture('warn', () => app._warnLowDisk()).msgs.length, 1)
+    assert.strictEqual(app._diskWarningAt, now)
+    app._diskWarningAt = now - 3599999
+    const before = calls
+    assert.deepStrictEqual(withCapture('warn', () => app._warnLowDisk()).msgs, [])
+    assert.strictEqual(calls, before)
+    assert.strictEqual(app._diskWarningAt, now - 3599999)
+  })
+})
+
+check('_warnLowDisk/_diskMinFree：阈值非正 ⇒ 视为未配置，不查磁盘（minFree>0 守卫）', () => {
+  let calls = 0
+  const utils = { diskSpace: () => { calls++; return { freeBytes: 0 } } }
+  for (const v of [0, -1]) {
+    const { app } = makeLogApp({ Config: { storage: { minFreeBytes: v } }, Utils: utils })
+    assert.strictEqual(app._diskMinFree({ storage: { minFreeBytes: v } }), null, `${v} 应视为未配置`)
+    assert.deepStrictEqual(withCapture('warn', () => app._warnLowDisk()).msgs, [])
+  }
+  assert.strictEqual(calls, 0)
+})
+
+check('_warnLowDisk 默认阈值 50MiB（Config.storage 缺失）：上下两侧各一例', () => {
+  const base = 50 * 1024 * 1024
+  const a1 = makeLogApp({ Config: {}, Utils: { diskSpace: () => ({ freeBytes: base }) } }).app
+  assert.strictEqual(a1._diskMinFree({}), base)
+  assert.deepStrictEqual(withCapture('warn', () => a1._warnLowDisk()).msgs, [])
+  const a2 = makeLogApp({ Config: {}, Utils: { diskSpace: () => ({ freeBytes: base - 1 }) } }).app
+  assert.deepStrictEqual(withCapture('warn', () => a2._warnLowDisk()).msgs,
+    ['⚠️ 缓存所在磁盘余量不足：50.0 MiB（告警阈值 50.0 MiB），写入状态/缓存可能失败'])
+})
+
+check('_diskMinFree 阈值来自字符串配置（Utils.num 口径）', () => {
+  const { app } = makeLogApp({ Config: { storage: { minFreeBytes: '1048576' } } })
+  assert.strictEqual(app._diskMinFree({ storage: { minFreeBytes: '1048576' } }), 1048576)
+})
+
+// ----- _persistReportState：写成功才更新内存快照；失败保留内存 + 低磁盘告警 -----
+check('_persistReportState 写成功 ⇒ 落盘 normalize 后文本、内存快照 persisted:true、不告警', () => {
+  const { app, cap } = makeLogApp({ Config: {} })
+  const expected = Object.assign({}, blank, { date: '2024-01-05', runs: 9 })
+  const r = withCapture('warn', () => app._persistReportState('/p/r.json', { date: '2024-01-05', runs: 9 }))
+  assert.strictEqual(r.value, true)
+  assert.deepStrictEqual(r.msgs, [])
+  assert.deepStrictEqual(cap, [['/p/r.json', JSON.stringify(expected)]])
+  assert.deepStrictEqual(app._reportMemoryStateByPath.get('/p/r.json'), { state: expected, persisted: true })
+})
+
+check('_persistReportState 写失败 ⇒ 内存状态保留为 persisted:false、发低磁盘告警、返回 false', () => {
+  const { app } = makeLogApp({ Config: {} })
+  let lowDisk = 0
+  app._warnLowDisk = () => { lowDisk++ }
+  app._writeState = () => false
+  const expected = Object.assign({}, blank, { runs: 3 })
+  const r = withCapture('warn', () => app._persistReportState('/p/r.json', { runs: 3 }))
+  assert.strictEqual(r.value, false)
+  assert.strictEqual(lowDisk, 1)
+  assert.deepStrictEqual(r.msgs, ['⚠️ 日报发送/累计状态持久化失败；本进程将继续使用内存状态'])
+  assert.deepStrictEqual(app._reportMemoryStateByPath.get('/p/r.json'), { state: expected, persisted: false })
+})
+
+check('_persistReportState 落盘前先 normalize（字符串计数转数字、缺失字段补 0）', () => {
+  const { app, cap } = makeLogApp({ Config: {} })
+  app._persistReportState('/p/r.json', { runs: '9', total: 'abc' })
+  assert.deepStrictEqual(JSON.parse(cap[0][1]), Object.assign({}, blank, { runs: 9 }))
 })
 
 console.log(`通过 ${passed} / 失败 ${failed}`)
