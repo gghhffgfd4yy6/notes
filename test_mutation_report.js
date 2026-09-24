@@ -413,6 +413,10 @@ check('render：复用段逐段标注「复用 N/M」，高复用段给出显式
   assert.ok(out.includes('| **合计** | **114** | **57** | **5** | **52** | **0** | **54.39%** | **54.39%** | **1 段复用** |'), `合计行应给出复用段数：\n${out}`)
   assert.ok(out.includes('## ♻️ 复用状态（结果是否对应当前测试状态）'), '必须有独立的复用状态小节')
   assert.ok(out.includes('本次日报含未重算的结果'), '有复用段时必须给出显式警示')
+  // 机制括注必须限定到 command 档（独立复核发现：原措辞把 `coverageAnalysis:'off'` 的无条件复用说成通用机制，
+  // 而该警示会连同 TAP 段一起列出——TAP 是 perTest、有覆盖信息、不走这条分支，见 AGENTS.md/issue #170）。
+  assert.ok(out.includes('**command 档**才会在 `coverageAnalysis:\'off\'` 下'),
+    `机制括注必须限定到 command 档（TAP 段不走无条件复用）：\n${out}`)
   assert.ok(out.includes('- `app`：复用 98/100（98.00%） ⚠️ **复用比例高**（≥50.00%）'), '高复用段必须点名')
   assert.ok(out.includes('另有 1 段没有复用状态记录'), '未记录的段必须单独点名')
   assert.ok(out.includes('不要假定它们是全量重算'), '「未记录」不得被读者读成「全量」')

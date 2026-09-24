@@ -1038,7 +1038,8 @@ function _renderReuseNotice (results) {
   }
   if (partial.length > 0) {
     lines.push('⚠️ **本次日报含未重算的结果**：下列段的部分变异体直接复用了上一次运行的 killed/survived' +
-      '（`coverageAnalysis:\'off\'` 下 incremental-differ 拿不到覆盖信息时**无条件复用**），它们描述的是' +
+      '（复用来自增量差分对**文件内容未变**的变异体沿用旧结果；**command 档**才会在 `coverageAnalysis:\'off\'` 下' +
+      '拿不到覆盖信息时**无条件复用**——各段档位见表内标注），它们描述的是' +
       '**旧测试状态**，不代表本 commit 的测试；存活清单同理。')
     lines.push('')
     for (const r of partial) {

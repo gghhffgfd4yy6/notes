@@ -193,7 +193,7 @@ jobs:
           #   故回退 command 档：预估 ≈34min（低于当时的瓶颈）⇒ 15 TAP + 4 command 矩阵首跑实测墙钟 **90.8min**
           #   （run 35827096127，head 01c0ef89），其中 v3-entry 实测 **35.1min** ≈ 预估 34min；该矩阵瓶颈仍是
           #   command 档 qinglong-push，但它自身由 85.3min 升到 **90.1min**（+5.6%）——与该 job 的变异体集合
-          #   无关：`git diff --stat ca63e71 01c0ef8` 对源文件为空、只有 `package-lock.json` 变化；**成因未归因**
+          #   无关：**该 job 的 mutate 目标源文件未变**（`git diff --stat ca63e71 01c0ef8 -- qinglong/ xbk_function_v3.js` 为空）；但该区间另有 **14 个文件**变化，含 `package.json` 与 `stryker.tap.config.js`——后者**在缓存配置指纹里**，故不能把成因归给单一文件，**仍未归因**
           #   （runner 波动 vs 矩阵变化）。仍远低于 step 330min 与平台 6h/job。
           # 代价如实登记：这 4 段仍走 command 档的整批套件 ⇒ **它们的 score 与其余 15 段不同口径**，
           #   跨段比较分数时必须排除。
