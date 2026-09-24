@@ -61,7 +61,11 @@ const SUITES = [
   // v3.172：集成测试走并行调度器（worker 独立缓存目录 + 失败片串行重跑）。
   // 需要完整串行验证时直接 node test_app.js（CI 即如此）
   { name: '集成测试', file: 'test_app_p.js', desc: 'App.run 完整主流程(并行调度,失败自动重跑)', integration: true },
-  { name: '通道测试', file: 'test_notify.js', desc: '推送通道请求构造+脱敏', integration: true }
+  { name: '通道测试', file: 'test_notify.js', desc: '推送通道请求构造+脱敏', integration: true },
+  // v3.276 补：xbk_app.js 此前无任何单元套件（test_app.js 是集成套件、不进变异测试集），
+  // 其报告/状态簇的存活变异体无人认领。本套件在**进程内**用最小桩构造 createApp(...) 后直接
+  // 调用目标方法（不走子进程 ⇒ 可被变异测试的 perTest 覆盖归因）。
+  { name: '应用状态与日报单元', file: 'test_app_unit.js', desc: 'xbk_app.js 报告/状态簇：_isValidReportDate 闰年与月界、_loadReportState 缺文件/损坏/超限降级、_normalizeReportState 形状归一与 pending 占位告警' }
 ]
 
 module.exports = { SUITES }
