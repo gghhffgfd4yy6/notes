@@ -374,5 +374,57 @@ dns.lookup = (hostname, options, callback) => {
   const agentsExports = require('./xbk_agents')
   assert.ok(!('DNS_CACHE' in agentsExports), 'module.exports 不应再包含 DNS_CACHE')
 
+  // ===== 变异 replay 补强：DNS 失效码集合 / 失效前缀 / 选项建模 =====
+  // 杀 DNS_INVALIDATION_CODES 集合中 'ERR_SOCKET_CLOSED' 被置空：它是「指示地址可能已失效」的网络层
+  // 错误码，缺了它 socket 关闭后的重试窗口会一直复用失效地址。
+  assert.strictEqual(shouldInvalidateDns({ code: 'ERR_SOCKET_CLOSED' }), true,
+    'ERR_SOCKET_CLOSED 必须失效 DNS（AGENTS-02 网络层错误码）')
+  assert.strictEqual(shouldInvalidateDns({ code: 'ERR_TLS_CERT_ALTNAME_INVALID' }), false,
+    '证书主机名不匹配仍不得失效 DNS（AGENTS-08）')
+  // 无 hostname 的 URL（file://）⇒ 不得报告「已失效」（!hostname 分支必须早退，不得被常量化成继续）
+  assert.strictEqual(invalidateDnsForError({ code: 'ECONNRESET' }, 'file:///tmp/x'), false,
+    'file:// URL 的 hostname 为空串，必须返回 false 而不是「已失效」')
+
+  // invalidateDns 的 key 前缀必须是 `host + '|'`（既不是「删全部」，也不是裸 host 前缀）
+  const mrLookup = dns.lookup
+  let mrCalls = 0
+  dns.lookup = (hostname, options, callback) => {
+    mrCalls += 1
+    const cb = typeof options === 'function' ? options : callback
+    process.nextTick(() => cb(null, '127.0.0.1', 4))
+  }
+  const mrSettle = (p) => Promise.race([p, new Promise((_resolve, reject) => setTimeout(() => reject(new Error('dnsLookup 未在 2s 内 settle')), 2000))])
+  try {
+    await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-a.test', {}, (e) => e ? reject(e) : resolve())))
+    await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-a.test.sub', {}, (e) => e ? reject(e) : resolve())))
+    assert.strictEqual(mrCalls, 2, '前置：两个不同主机各解析一次')
+    assert.strictEqual(invalidateDns('mr-a.test'), 1,
+      '只应删除 hostname 完全匹配的一条（前缀必须是 host + "|"，且不得删全部）')
+    await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-a.test.sub', {}, (e) => e ? reject(e) : resolve())))
+    assert.strictEqual(mrCalls, 2, '前缀不匹配的 mr-a.test.sub 条目必须仍命中缓存（不得被误删）')
+    await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-a.test', {}, (e) => e ? reject(e) : resolve())))
+    assert.strictEqual(mrCalls, 3, '被失效的主机必须重新解析')
+  } finally { dns.lookup = mrLookup }
+
+  // 显式 order 的建模：合法取值必须仍进缓存（DNS_RESULT_ORDERS 被置空后全部退化为「不缓存」）
+  const mrLookup2 = dns.lookup
+  let mrCalls2 = 0
+  dns.lookup = (hostname, options, callback) => {
+    mrCalls2 += 1
+    const cb = typeof options === 'function' ? options : callback
+    process.nextTick(() => cb(null, '127.0.0.1', 4))
+  }
+  try {
+    await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-order.test', { order: 'verbatim' }, (e) => e ? reject(e) : resolve())))
+    await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-order.test', { order: 'verbatim' }, (e) => e ? reject(e) : resolve())))
+    assert.strictEqual(mrCalls2, 1, 'order=verbatim 属建模范围内取值，第二次必须命中缓存')
+    await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-order2.test', { order: 'ipv6first' }, (e) => e ? reject(e) : resolve())))
+    await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-order2.test', { order: 'ipv6first' }, (e) => e ? reject(e) : resolve())))
+    assert.strictEqual(mrCalls2, 2, 'order=ipv6first 同样必须在建模范围内并命中缓存')
+    await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-order3.test', { order: 'bogus' }, (e) => e ? reject(e) : resolve())))
+    await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-order3.test', { order: 'bogus' }, (e) => e ? reject(e) : resolve())))
+    assert.strictEqual(mrCalls2, 4, '未建模的 order 取值不得读写缓存（每次都必须真解析）')
+  } finally { dns.lookup = mrLookup2 }
+
   console.log('test_agents OK')
 })().catch((e) => { console.error(e); process.exit(1) })

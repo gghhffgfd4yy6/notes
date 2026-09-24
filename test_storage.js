@@ -351,6 +351,177 @@ const {
   try { readSafeTextResult(bigFile, 50); readSafeTextResult(okFile) } finally { console.warn = origWarn }
   assert.deepStrictEqual(okWarns, [], '合法 maxBytes / 不传 maxBytes 时不得告警')
 
+  // ===== 变异 replay 补强：告警文案 / 错误分支 / 句柄关闭（可观测副作用）=====
+  {
+    const mrDir = path.join(tmp, 'mr')
+    fs.mkdirSync(mrDir, { recursive: true })
+    const mrWarn = (fn) => {
+      const o = []
+      const w = console.warn
+      console.warn = (...a) => { o.push(a.join(' ')) }
+      try { fn() } finally { console.warn = w }
+      return o
+    }
+    // 非字符串：必须命中「非字符串」专用分支的原文案（杀掉条件常量化与告警文案置空两类变异体）
+    assert.strictEqual(isRegularOrMissing(123), false, '非字符串必须拒绝')
+    assert.deepStrictEqual(mrWarn(() => isRegularOrMissing(123)),
+      ['isRegularOrMissing: filePath 非字符串(number)，视为不安全，拒绝'],
+      '非字符串必须命中专用告警，不得落到 lstat 异常分支')
+    // 空串：契约要求显式拒绝，不得依赖 lstatSync("") 的 ENOENT 判成「不存在即安全」
+    assert.strictEqual(isRegularOrMissing(''), false, '空串路径必须显式拒绝')
+    assert.deepStrictEqual(mrWarn(() => isRegularOrMissing('')),
+      ['isRegularOrMissing: filePath 为空串，视为不安全，拒绝'], '空串必须命中专用告警')
+    // 读取异常（ENOTDIR：父级是普通文件）：必须判不安全，且 detail 取 e.code
+    const mrNotDir = path.join(regularFile, 'child')
+    assert.strictEqual(isRegularOrMissing(mrNotDir), false, 'ENOTDIR 必须判不安全，不得当成「不存在即安全」')
+    assert.deepStrictEqual(mrWarn(() => isRegularOrMissing(mrNotDir)),
+      [`isRegularOrMissing: 检查 ${mrNotDir} 读取异常(ENOTDIR)，视为不安全，拒绝`],
+      '必须命中异常分支、detail 取 e.code（ENOTDIR）、且返回 false（不得被常量化成 true）')
+    // 无 code 的异常：detail 必须回落 e.message（与上一条成对，锁住 code/message 三元两支）
+    const mrLstat = fs.lstatSync
+    fs.lstatSync = () => { throw new Error('boom-no-code') }
+    try {
+      assert.strictEqual(isRegularOrMissing(mrNotDir), false, '未知异常也必须拒绝')
+      assert.deepStrictEqual(mrWarn(() => isRegularOrMissing(mrNotDir)),
+        [`isRegularOrMissing: 检查 ${mrNotDir} 读取异常(boom-no-code)，视为不安全，拒绝`],
+        '无 code 时必须回落 e.message，不得输出 undefined')
+    } finally { fs.lstatSync = mrLstat }
+
+    // ===== 句柄必须在所有分支关闭（fd 泄漏是可观测副作用）=====
+    const mrHasProc = fs.existsSync('/proc/self/fd')
+    const mrFds = () => fs.readdirSync('/proc/self/fd').length
+    const mrLeakFile = path.join(mrDir, 'leak.txt')
+    if (mrHasProc) {
+      writeAtomic(mrLeakFile, 'warm') // 预热：排除首次调用的一次性分配
+      const mrBase = mrFds()
+      for (let i = 0; i < 40; i++) assert.strictEqual(writeAtomic(mrLeakFile, 'x' + i), true, '写入必须成功')
+      assert.ok(mrFds() - mrBase <= 2,
+        `writeAtomic 成功路径每次都必须关闭临时文件 fd 与父目录 fd（40 次后实际净增 ${mrFds() - mrBase}）`)
+    }
+    // 失败路径（fsync 抛错）：必须关闭已打开的 fd，且告警带默认 label 与完整文案
+    const mrFsync = fs.fsyncSync
+    const mrOpen = fs.openSync
+    const mrErrFile = path.join(mrDir, 'err.txt')
+    const mrErrs = []
+    const mrErr = console.error
+    console.error = (...a) => { mrErrs.push(a.join(' ')) }
+    try {
+      fs.fsyncSync = () => { throw new Error('fsync-boom') }
+      if (mrHasProc) {
+        const mrBase2 = mrFds()
+        for (let i = 0; i < 40; i++) assert.strictEqual(writeAtomic(mrErrFile, 'z'), false, 'fsync 失败必须 fail-closed 返回 false')
+        assert.ok(mrFds() - mrBase2 <= 2, `writeAtomic 失败路径必须关闭已打开的 fd（40 次后实际净增 ${mrFds() - mrBase2}）`)
+      } else { writeAtomic(mrErrFile, 'z') }
+    } finally { fs.fsyncSync = mrFsync; console.error = mrErr }
+    assert.deepStrictEqual(mrErrs.slice(-1), [`缓存文件写入失败 ${mrErrFile}: fsync-boom`],
+      '默认 label「缓存文件」与失败文案必须完整（不得置空）')
+
+    // ===== readSafeTextResult：每次调用必须关闭内容 fd 与复检 fd =====
+    const mrReadFile = path.join(mrDir, 'read.txt')
+    fs.writeFileSync(mrReadFile, 'hello-world')
+    assert.strictEqual(readSafeTextResult(mrReadFile).status, 'ok', '前置：读取必须成功')
+    if (mrHasProc) {
+      const mrBase3 = mrFds()
+      for (let i = 0; i < 40; i++) assert.strictEqual(readSafeTextResult(mrReadFile).status, 'ok', '读取必须成功')
+      assert.ok(mrFds() - mrBase3 <= 2,
+        `readSafeTextResult 每次调用都必须关闭内容 fd 与复检 fd（40 次后实际净增 ${mrFds() - mrBase3}）`)
+    }
+
+    // ===== 读后复检（契约）：dev/ino 或文件类型变化 ⇒ unsafe 且丢弃内容 =====
+    const mrRealFstat = fs.fstatSync
+    const mrRecheck = (second) => {
+      let n = 0
+      fs.fstatSync = (fd) => { n += 1; const s = mrRealFstat(fd); return n === 1 ? s : second(s) }
+      try { return readSafeTextResult(mrReadFile) } finally { fs.fstatSync = mrRealFstat }
+    }
+    const mrIno = mrRecheck((s) => ({ isFile: () => s.isFile(), dev: s.dev, ino: s.ino + 1 }))
+    assert.strictEqual(mrIno.status, 'unsafe', '复检 ino 变化 ⇒ 必须判 unsafe')
+    assert.strictEqual(mrIno.text, null, 'unsafe 不得返回内容')
+    assert.strictEqual(mrIno.error.message, '文件读取期间被替换', 'unsafe 原因必须是「读取期间被替换」')
+    const mrDev = mrRecheck((s) => ({ isFile: () => s.isFile(), dev: s.dev + 1, ino: s.ino }))
+    assert.strictEqual(mrDev.status, 'unsafe', '复检 dev 变化 ⇒ 必须判 unsafe')
+    const mrType = mrRecheck((s) => ({ isFile: () => false, dev: s.dev, ino: s.ino }))
+    assert.strictEqual(mrType.status, 'unsafe', '复检发现不再是普通文件 ⇒ 必须判 unsafe')
+
+    // ===== 打开失败的分类：非 ENOENT/ELOOP ⇒ ioError 且原样带出底层错误 =====
+    fs.openSync = () => { const e = new Error('open-boom'); e.code = 'EACCES'; throw e }
+    try {
+      const r = readSafeTextResult(path.join(mrDir, 'whatever.txt'))
+      assert.strictEqual(r.status, 'ioError', 'EACCES 必须归 ioError（不得常量化成 missing/unsafe）')
+      assert.strictEqual(r.text, null, 'ioError 不得带内容')
+      assert.strictEqual(r.error.code, 'EACCES', 'ioError 必须原样带出底层错误')
+    } finally { fs.openSync = mrOpen }
+    // 复检打开失败：ELOOP/ENOENT ⇒ unsafe「非普通文件」；其余 ⇒ ioError
+    const mrOpen2 = (code) => {
+      let n = 0
+      fs.openSync = (p, f, m) => { n += 1; if (n === 2) { const e = new Error('reopen'); e.code = code; throw e } return mrOpen(p, f, m) }
+      try { return readSafeTextResult(mrReadFile) } finally { fs.openSync = mrOpen }
+    }
+    const mrReIo = mrOpen2('EACCES')
+    assert.strictEqual(mrReIo.status, 'ioError', '复检打开失败且非 ELOOP/ENOENT ⇒ ioError，不得误判 unsafe')
+    assert.strictEqual(mrReIo.error.code, 'EACCES', '复检 ioError 必须原样带出底层错误')
+    const mrReLoop = mrOpen2('ELOOP')
+    assert.strictEqual(mrReLoop.status, 'unsafe', '复检打开 ELOOP ⇒ unsafe')
+    assert.strictEqual(mrReLoop.error.message, '非普通文件', '复检 unsafe 的原因文案必须是「非普通文件」')
+
+    // ===== tooLarge 文案完整 =====
+    const mrBig = path.join(mrDir, 'big.txt')
+    fs.writeFileSync(mrBig, 'x'.repeat(100))
+    const mrToo = readSafeTextResult(mrBig, 10)
+    assert.strictEqual(mrToo.status, 'tooLarge', '超过 maxBytes 必须判 tooLarge')
+    assert.strictEqual(mrToo.error.message,
+      `文件过大(${fs.statSync(mrBig).size} 字节)，超过上限 10 字节`, 'tooLarge 文案必须完整')
+
+    // ===== 读取期间被截短：必须按 read<=0 收手（不得死循环/补零）=====
+    const mrShort = path.join(mrDir, 'short.txt')
+    fs.writeFileSync(mrShort, 'abc')
+    fs.fstatSync = (fd) => { const s = mrRealFstat(fd); return { isFile: () => s.isFile(), dev: s.dev, ino: s.ino, size: s.size + 8 } }
+    try {
+      const r = readSafeTextResult(mrShort)
+      assert.strictEqual(r.status, 'ok', '截短场景仍应成功（按实际读到的字节返回）')
+      assert.strictEqual(r.text, 'abc', '越界不得补零或串入其他内容')
+    } finally { fs.fstatSync = mrRealFstat }
+
+    // ===== 符号链接：O_NOFOLLOW ⇒ ELOOP ⇒ unsafe「非普通文件」=====
+    const mrLink = path.join(mrDir, 'link.txt')
+    let mrLinked = false
+    try { fs.symlinkSync(mrReadFile, mrLink); mrLinked = true } catch (e) { console.log('（环境性跳过：本机沙箱不允许建符号链接）') }
+    if (mrLinked) {
+      const r = readSafeTextResult(mrLink)
+      assert.strictEqual(r.status, 'unsafe', '符号链接必须被 O_NOFOLLOW 拒绝为 unsafe')
+      assert.strictEqual(r.text, null, 'unsafe 不得返回目标内容')
+      assert.strictEqual(r.error.message, '非普通文件', 'unsafe 的原因文案必须是「非普通文件」')
+    }
+
+    // ===== writeAtomicIfAbsent：成功路径靠 finally 关 fd；失败路径不得删他人文件 =====
+    if (mrHasProc) {
+      const mrBase4 = mrFds()
+      for (let i = 0; i < 40; i++) {
+        assert.strictEqual(writeAtomicIfAbsent(path.join(mrDir, 'wai-' + i + '.txt'), 'x'), true, '独占创建必须成功')
+      }
+      assert.ok(mrFds() - mrBase4 <= 2,
+        `writeAtomicIfAbsent 成功路径必须由 finally 关闭 fd（40 次后实际净增 ${mrFds() - mrBase4}）`)
+    }
+    const mrForeign = path.join(mrDir, 'foreign.txt')
+    fs.writeFileSync(mrForeign, 'other-process-data')
+    fs.openSync = () => { const e = new Error('open-boom2'); e.code = 'EACCES'; throw e }
+    let mrWaiResult
+    try { mrWaiResult = writeAtomicIfAbsent(mrForeign, 'mine') } finally { fs.openSync = mrOpen }
+    assert.strictEqual(mrWaiResult, false, '非 EEXIST 的打开失败必须返回 false')
+    assert.strictEqual(fs.readFileSync(mrForeign, 'utf8'), 'other-process-data',
+      '本次未成功打开 fd 时绝不能 unlink 目标路径（否则会删掉他人文件）')
+    // 失败文案：默认 label「缓存初始化」必须完整
+    const mrErrs2 = []
+    console.error = (...a) => { mrErrs2.push(a.join(' ')) }
+    const mrWaiMsg = path.join(mrDir, 'wai-msg.txt')
+    try {
+      fs.fsyncSync = () => { throw new Error('fsync-boom2') }
+      assert.strictEqual(writeAtomicIfAbsent(mrWaiMsg, 'x'), false, 'fsync 失败必须 fail-closed 返回 false')
+    } finally { fs.fsyncSync = mrFsync; console.error = mrErr }
+    assert.deepStrictEqual(mrErrs2, [`缓存初始化写入失败 ${mrWaiMsg}: fsync-boom2`],
+      '默认 label「缓存初始化」与失败文案必须完整（不得置空）')
+  }
+
   // 清理：临时目录递归删除即可覆盖所有测试文件
   try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) {}
 

@@ -275,6 +275,183 @@ try {
     assert.match(output, /通道健康：正常/, 'channels status=ok 但 value=null 时应显示"正常"而非崩溃')
   })
 
+  // ============ 契约批次（回归）：formatStatus / parseDiagnostics / isValidReportDate / parseLastRun ============
+  const NOW = Date.UTC(2026, 8, 8, 10, 0, 0)
+  const scratch = (name) => {
+    const dir = path.join(tmp, name)
+    fs.rmSync(dir, { recursive: true, force: true })
+    fs.mkdirSync(dir, { recursive: true })
+    return dir
+  }
+  const put = (dir, name, body) => fs.writeFileSync(path.join(dir, name), body)
+  const HEAD = '📊 xbk-push 运行状态（2026-09-08T10:00:00.000Z）'
+  const RUN_OK = '2026-09-08 10:00:00 total=10 dedup=1 filtered=2 truncated=0 pushed=5 failed=0 elapsed=0.5s\n'
+  const DIAG_OK = JSON.stringify({ type: 'run', total: 10, dedup: 1, filtered: 2, passed: 8, detailCount: 2, at: '2026-09-08 10:00:00', byReason: { 关键词: 1, 正则: 2 } }) + '\n'
+  const CH_OK = JSON.stringify({ a: { consecutiveFailures: 2, lastFailureAt: 100, lastAlertAt: 200 }, b: { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0 } }) + '\n'
+  const REPORT_OK = JSON.stringify({ date: '2026-02-28', runs: 3, total: 10, dedup: 1, filtered: 2, pushed: 4, failed: 1, truncated: 2 }) + '\n'
+  const mk = (name, files) => {
+    const dir = scratch(name)
+    for (const f of Object.keys(files)) put(dir, f, files[f])
+    return readStatus(dir, { now: NOW })
+  }
+  const panel = { 'report.state': REPORT_OK, 'run.log': RUN_OK, 'channel-health.state': CH_OK, 'filter-diagnostics.ndjson': DIAG_OK }
+
+  // S11 全字段正常：逐行精确文案（杀 formatStatus 的 ArrayDeclaration/模板串清空/分隔符/条件与逻辑变异体）
+  test('S11 formatStatus 全字段正常 → 逐行精确文案', () => {
+    assert.strictEqual(formatStatus(mk('s11', panel)), [
+      HEAD,
+      '日报：正常 | 2026-02-28 | 3 轮 | 推送成功：4 条 | 失败：1 条 | 待推送（截断）：2 条',
+      '最近一轮：正常 | 时间 2026-09-08 10:00:00 | 获取 10 | 去重 1 | 过滤 2 | 推送 5 | 失败 0 | 截断 0 | 耗时 0.5s',
+      '通道健康：a：连续失败 2 次；b：连续失败 0 次',
+      '过滤诊断：正常 | 最近 2026-09-08 10:00:00 | 原因：关键词=1，正则=2'
+    ].join('\n'), '正常面板必须逐字符符合契约文案（含「；」「，」分隔符与 truncated=0 不加告警）')
+  })
+
+  // S12 四部件全缺失：只渲染「缺失」，run/diagnostics 无 value 时不得解引用（杀 describe 的「缺失」串与 ?: 常量化）
+  test('S12 formatStatus 四部件全缺失 → 只渲染「缺失」且不崩', () => {
+    assert.strictEqual(formatStatus(readStatus(scratch('s12'), { now: NOW })), [
+      HEAD, '日报：缺失', '最近一轮：缺失', '通道健康：缺失', '过滤诊断：缺失'
+    ].join('\n'))
+  })
+
+  // S13 降级分支：无日期/无时间戳/截断告警/损坏条目计数/空原因（杀对应 StringLiteral 与 dropped>0 判定）
+  test('S13 formatStatus 降级分支：无日期·无时间戳·截断告警·损坏条目·空原因', () => {
+    const out = formatStatus(mk('s13', {
+      'report.state': JSON.stringify({ date: '', runs: 0, pushed: 0, failed: 0, truncated: 0 }) + '\n',
+      'run.log': 'total=3 dedup=0 filtered=0 truncated=5 pushed=2 failed=1 elapsed=2s\n',
+      'channel-health.state': JSON.stringify({ broken: null, good: { consecutiveFailures: 2, lastFailureAt: 1, lastAlertAt: 2 } }) + '\n',
+      'filter-diagnostics.ndjson': JSON.stringify({ type: 'run', total: 1, dedup: 1, filtered: 1, passed: 1, detailCount: 1, byReason: {} }) + '\n'
+    }))
+    assert.strictEqual(out, [
+      HEAD,
+      '日报：正常 | 无日期 | 0 轮 | 推送成功：0 条 | 失败：0 条 | 待推送（截断）：0 条',
+      '最近一轮：正常 | 时间 无时间戳 | 获取 3 | 去重 0 | 过滤 0 | 推送 2 | 失败 1 | 截断 5 ⚠️ | 耗时 2s',
+      '通道健康：good：连续失败 2 次（另有 1 条记录损坏已忽略）',
+      '过滤诊断：正常 | 最近 未知 | 原因：无'
+    ].join('\n'), '缺失字段必须走「无日期/无时间戳/未知/无」回退，损坏条目单独计数')
+  })
+
+  // S14 describe 的 invalid 分支：非 ok/missing 必须显示「不可读（invalid）」（杀三元常量化与模板串清空）
+  test('S14 describe invalid 分支 → 「不可读（invalid）」而非「正常」', () => {
+    const status = mk('s14', { 'report.state': '[]\n', 'run.log': RUN_OK, 'channel-health.state': CH_OK, 'filter-diagnostics.ndjson': DIAG_OK })
+    assert.strictEqual(status.report.status, 'invalid')
+    assert.strictEqual(formatStatus(status).split('\n')[1], '日报：不可读（invalid）')
+  })
+
+  // S15 parseJson/result：缺文件精确返回 {status:'missing'} 且不带 value；非对象 JSON 一律 invalid
+  test('S15 parseJson/result：缺文件返回不带 value 的 missing；非对象 JSON 一律 invalid', () => {
+    const empty = readStatus(scratch('s15-empty'), { now: NOW })
+    // deepStrictEqual 才能区分「无 value 键」与「value: undefined」→ 杀 result() 的 ?: 常量化
+    assert.deepStrictEqual(empty.report, { status: 'missing' })
+    assert.deepStrictEqual(empty.channels, { status: 'missing' })
+    assert.deepStrictEqual(empty.run, { status: 'missing' })
+    assert.deepStrictEqual(empty.diagnostics, { status: 'missing' })
+    const bodies = ['[]', 'null', '"x"', '5', 'true', '{}']
+    for (let i = 0; i < bodies.length; i++) {
+      const body = bodies[i]
+      const dir = scratch('s15-' + i)
+      put(dir, 'report.state', body + '\n')
+      assert.strictEqual(readStatus(dir, { now: NOW }).report.status, body === '{}' ? 'ok' : 'invalid', 'report.state=' + body)
+    }
+  })
+
+  // S16 parseLastRun：两位数计数、毫秒 ISO 时间戳、摘要行之前的异常不算本轮中断（杀 \d+→\d、\S*→\s*、slice 边界）
+  test('S16 parseLastRun 两位数计数 + 毫秒时间戳 + 历史 ERROR 不算中断', () => {
+    // failed=17 也须走两位数解析（杀 failed=(\d+)→failed=(\d)）
+    const run = mk('s16', { 'run.log': '2026-09-08 09:00:00 运行异常：上一轮已退出\n2026-09-08T10:00:00.000Z total=100 dedup=12 filtered=13 truncated=14 pushed=15 failed=17 elapsed=1.5s\n' }).run
+    assert.strictEqual(run.status, 'ok', '两位数计数与带毫秒的 ISO 时间戳都必须能解析')
+    assert.strictEqual(run.value.at, '2026-09-08T10:00:00.000Z')
+    assert.strictEqual(run.value.dedup, 12)
+    assert.strictEqual(run.value.filtered, 13)
+    assert.strictEqual(run.value.truncated, 14)
+    assert.strictEqual(run.value.pushed, 15)
+    assert.strictEqual(run.value.interrupted, false, '摘要行之前的运行异常不得算作本轮中断')
+  })
+
+  // S17 parseLastRun 计数越界：超长数字非安全整数 → 整行跳过（杀 every→some 与 if(!…)→if(false)）
+  test('S17 parseLastRun 计数越界 → invalid 而非当成有效摘要', () => {
+    const status = mk('s17', { 'run.log': 'total=99999999999999999999 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s\n' })
+    assert.strictEqual(status.run.status, 'invalid')
+    // deepStrictEqual 才能区分「无 value 键」与「value: undefined」（杀 result() 的 ?: 常量化）
+    assert.deepStrictEqual(status.run, { status: 'invalid' })
+  })
+
+  // S18 looksLikeRoundFailure：行首/行尾/独立 ERROR 与「运行异常」为真，词内 ERROR 与普通 ALERT 为假
+  // （杀 ^|\s、\s|$ 两处字符类放宽与锚点收紧）
+  test('S18 只认行首·独立·行尾 ERROR 与「运行异常」', () => {
+    const cases = [
+      ['ERROR 启动失败', true],
+      ['2026-09-08 10:00:00 运行异常 退出', true],
+      ['2026-09-08 10:00:00 结束 ERROR', true],
+      ['xERROR 结束', false],
+      ['ERRORy 结束', false],
+      ['2026-09-08 10:00:00 ALERT 磁盘不足', false]
+    ]
+    for (let i = 0; i < cases.length; i++) {
+      const tail = cases[i][0]
+      const status = mk('s18-' + i, { 'run.log': 'total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s\n' + tail + '\n' })
+      assert.strictEqual(status.run.value.interrupted, cases[i][1], '尾部行：' + tail)
+    }
+  })
+
+  // S19 isValidReportDate：真实日历校验（闰年 100/400 规则、月日上下界、正则双锚、非字符串）
+  test('S19 isValidReportDate 真实日历与类型校验', () => {
+    const cases = [
+      ['', 'ok'], ['2026-02-28', 'ok'], ['2024-02-29', 'ok'], ['2000-02-29', 'ok'], ['2026-04-30', 'ok'], ['0001-01-01', 'ok'], ['2026-01-15', 'ok'],
+      ['2026-02-29', 'invalid'], ['1900-02-29', 'invalid'], ['2026-04-31', 'invalid'], ['2026-13-01', 'invalid'], ['2026-00-10', 'invalid'], ['2026-01-00', 'invalid'], ['0000-01-01', 'invalid'],
+      ['2026-1-01', 'invalid'], ['2026-01-01x', 'invalid'], ['x2026-01-01', 'invalid'], ['2026/01/01', 'invalid'],
+      [5, 'invalid'], [null, 'invalid'], [true, 'invalid'], [['2026-01-01'], 'invalid']
+    ]
+    for (let i = 0; i < cases.length; i++) {
+      const date = cases[i][0]
+      const status = mk('s19-' + i, { 'report.state': JSON.stringify({ date }) + '\n' })
+      assert.strictEqual(status.report.status, cases[i][1], 'date=' + JSON.stringify(date))
+    }
+  })
+
+  // S20 REPORT_COUNTERS 字段清单精确：七项计数各自存在时都必须校验（杀字段名字符串被清空）
+  test('S20 七项计数逐字段校验（dedup/failed/truncated/pushed 非计数 → invalid）', () => {
+    const bad = [{ dedup: 'x' }, { failed: -1 }, { truncated: 1.5 }, { pushed: '1' }]
+    for (let i = 0; i < bad.length; i++) {
+      const status = mk('s20-' + i, { 'report.state': JSON.stringify(bad[i]) + '\n' })
+      assert.strictEqual(status.report.status, 'invalid', JSON.stringify(bad[i]))
+    }
+  })
+
+  // S21 parseDiagnostics：有效记录原样返回；只有首行有效时也须找到（杀 i>=0→i>0）
+  test('S21 parseDiagnostics 首行有效即命中，有效记录原样返回', () => {
+    assert.deepStrictEqual(readStatus(scratch('s21-missing'), { now: NOW }).diagnostics, { status: 'missing' })
+    const first = scratch('s21-first')
+    put(first, 'filter-diagnostics.ndjson', DIAG_OK.trim() + '\n{ 坏行\n')
+    assert.strictEqual(readStatus(first, { now: NOW }).diagnostics.status, 'ok')
+    const ok = scratch('s21-ok')
+    put(ok, 'filter-diagnostics.ndjson', DIAG_OK)
+    assert.deepStrictEqual(readStatus(ok, { now: NOW }).diagnostics, { status: 'ok', value: JSON.parse(DIAG_OK) })
+  })
+
+  // S22 parseDiagnostics 逐项「只差一项」的近失配记录：每一条都必须整条 invalid
+  // （杀 152-155 的十处 &&→||、子链常量化 true、typeof 检查常量化 true 与 every→some）
+  test('S22 parseDiagnostics 十项近失配各自整条 invalid', () => {
+    const base = { type: 'run', total: 1, dedup: 1, filtered: 1, passed: 1, detailCount: 1, byReason: { a: 1 } }
+    const near = [
+      Object.assign({}, base, { type: 'other' }),
+      Object.assign({}, base, { total: 'x' }),
+      Object.assign({}, base, { dedup: -1 }),
+      Object.assign({}, base, { filtered: -1 }),
+      Object.assign({}, base, { passed: -1 }),
+      Object.assign({}, base, { detailCount: -1 }),
+      { type: 'run', total: 1, dedup: 1, filtered: 1, passed: 1, detailCount: 1 },
+      Object.assign({}, base, { byReason: 5 }),
+      Object.assign({}, base, { byReason: [] }),
+      Object.assign({}, base, { byReason: { a: 1, b: 'x' } })
+    ]
+    for (let i = 0; i < near.length; i++) {
+      const dir = scratch('s22-' + i)
+      put(dir, 'filter-diagnostics.ndjson', JSON.stringify(near[i]) + '\n')
+      assert.strictEqual(readStatus(dir, { now: NOW }).diagnostics.status, 'invalid', '近失配记录：' + JSON.stringify(near[i]))
+    }
+  })
+
   console.log(`test_status_report OK (${failed === 0 ? '全部通过' : failed + ' 项失败'})`)
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true })

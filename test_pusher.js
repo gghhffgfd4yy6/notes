@@ -372,6 +372,28 @@ function test (name, fn) {
       '不支持在飞契约时必须退回既有语义（test_pusher P1 / test_app 锁定口径）')
   })
 
+  // ===== htmlTagNameEnd / isTagNameBoundary 边界补强 =====
+  await test('P15 htmlTagNameEnd 必须跳过标签名前导空白（含闭合标签）', () => {
+    // 杀「跳过空白」循环的三类变异体：条件整体→false（等于不跳空白）、
+    // `j < s.length`→`j >= s.length`（一进循环即退出）、`j++`→`j--`（反向自增）。
+    assert.strictEqual(htmlTagNameEnd('< div>', 0), 5, '前导空白必须跳过，标签名 div 结束于 > 之前（=5）')
+    assert.strictEqual(htmlTagNameEnd('</\tdiv>', 0), 6, '闭合标签的空白（制表符）必须跳过（=6）')
+  })
+
+  await test('P16 htmlTagNameEnd 无分隔符时结束位恰好是字符串长度', () => {
+    // 杀名字扫描循环 `j < s.length`→`j <= s.length`：越界时 /[A-Za-z0-9-]/.test(undefined) 为真
+    // （'undefined' 全由字母组成），结束位会多推一格，返回值由 length 变成 length+1。
+    assert.strictEqual(htmlTagNameEnd('<div', 0), 4, '<div 的标签名结束位必须等于长度 4，不得是 5')
+    assert.strictEqual(htmlTagNameEnd('<b', 0), 2, '<b 同理必须是 2，不得是 3')
+  })
+
+  await test('P17 isTagNameBoundary 只有 / 才可能构成自闭合边界', () => {
+    // 杀 `ch === '/'`→true：左操作数被常量化后退化为「后继是 > 即边界」，
+    // 任意字母后跟 > 都会被误判为标签边界。
+    assert.strictEqual(isTagNameBoundary('ab>', 1), false, 'ch 是字母 b 时，即使 s[pos+1] 是 > 也不是边界')
+    assert.strictEqual(isTagNameBoundary('a/>', 1), true, 'ch 是 / 且后继是 > 才是自闭合边界')
+  })
+
   console.log(`test_pusher OK (${failed === 0 ? '全部通过' : failed + ' 项失败'})`)
   process.exit(failed > 0 ? 1 : 0)
 })()
