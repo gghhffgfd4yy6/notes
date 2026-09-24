@@ -443,5 +443,62 @@ function makeNetwork (opts = {}) {
     }
   }
 
+  // 18. net-7 精化：delta-seconds 上界是**闭区间**（只有 > MAX 才非法）——专杀 EqualityOperator
+  //     `seconds > MAX_DELTA_SECONDS` → `>=`（等值处把合法头误判非法）。
+  {
+    const now = Date.parse('2026-09-17T00:00:00.000Z')
+    const MAX = 2 ** 31 - 1
+    assert.strictEqual(parseRetryAfterMs(String(MAX), now), MAX * 1000, 'MAX_DELTA_SECONDS 本身合法（上界闭合）')
+    assert.strictEqual(parseRetryAfterMs(String(MAX + 1), now), null, 'MAX+1 必须非法（边界另一侧）')
+  }
+
+  // 19. net-7 精化：IMF-fixdate 的 day-name 交叉校验必须覆盖**全部 7 个名字**——专杀把
+  //     ['Sun','Mon','Tue','Wed',…] 数组元素改成 '' 的 StringLiteral 变异体（逐日一例，正反成对）。
+  {
+    const now = Date.parse('2026-09-17T00:00:00.000Z')
+    const base = Date.UTC(2033, 10, 6)
+    const wrongName = { Sun: 'Mon', Mon: 'Tue', Tue: 'Wed', Wed: 'Thu', Thu: 'Fri', Fri: 'Sat', Sat: 'Sun' }
+    const seen = new Set()
+    for (let i = 0; i < 7; i++) {
+      const future = base + i * 86400000
+      const gmt = new Date(future).toUTCString()
+      const name = gmt.slice(0, 3)
+      seen.add(name)
+      assert.strictEqual(parseRetryAfterMs(gmt, now), future - now, `${name} 的正确 IMF-fixdate 必须解析出剩余毫秒`)
+      assert.strictEqual(parseRetryAfterMs(wrongName[name] + gmt.slice(3), now), null, `${name} 日配错 day-name 必须拒（交叉校验生效）`)
+    }
+    assert.strictEqual(seen.size, 7, '前置：7 天必须覆盖 7 个不同 day-name')
+  }
+
+  // 20. net-7 精化：rfc850-date 是**例外**（遗留工单 T2），不交叉校验 day-name——专杀把
+  //     `if (!RFC850_DATE_RE.test(raw))` 改成 `if (true)`（对 rfc850 也交叉校验）。
+  {
+    const now = Date.parse('2026-09-17T00:00:00.000Z')
+    const sunday = parseRetryAfterMs('Sunday, 06-Nov-33 08:49:37 GMT', now)
+    assert.ok(Number.isFinite(sunday) && sunday > 0, `前置：rfc850 未来日必须解析出正数，实际 ${sunday}`)
+    assert.strictEqual(parseRetryAfterMs('Monday, 06-Nov-33 08:49:37 GMT', now), sunday, 'rfc850 的 day-name 不参与校验（例外面）')
+    assert.strictEqual(sunday, Date.UTC(2033, 10, 6, 8, 49, 37) - now, 'rfc850 的 2 位年按 50 年切点解释为 2033 年 GMT')
+  }
+
+  // 21. net-7 精化：asctime-date 无时区标记，必须**补 GMT** 解析——专杀 `' GMT'` 字面量被清空与
+  //     `asctime ? raw + ' GMT' : raw` 条件被固定为 false 的变异体（只有本地时区 ≠ UTC 才可观测，
+  //     故运行期切时区；Node 不支持切时区时该断言无法成立，显式跳过而不静默放宽）。
+  {
+    const now = Date.parse('2026-09-17T00:00:00.000Z')
+    const utc = new Date(Date.UTC(2033, 10, 6, 8, 49, 37)).toUTCString()
+    const [dn, rest] = utc.split(', ')
+    const [dd, mon, yyyy, hms] = rest.split(' ')
+    const asctime = `${dn} ${mon} ${(' ' + Number(dd)).slice(-2)} ${hms} ${yyyy}`
+    const origTZ = process.env.TZ
+    try {
+      process.env.TZ = 'Asia/Shanghai'
+      if (Date.parse(asctime) !== Date.UTC(2033, 10, 6, 8, 49, 37)) {
+        assert.strictEqual(parseRetryAfterMs(asctime, now), Date.UTC(2033, 10, 6, 8, 49, 37) - now, 'asctime 必须按 GMT 解析，不得按本地时区')
+      }
+    } finally {
+      if (origTZ === undefined) delete process.env.TZ; else process.env.TZ = origTZ
+    }
+  }
+
   console.log('test_network OK')
 })().catch((e) => { console.error(e); process.exit(1) })
