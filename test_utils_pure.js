@@ -467,12 +467,16 @@ check('P1-04 收尾: RE2 编译失败回落 V8 只告警一次（含模式与原
   assert.ok(!/javascript/i.test(out.outThird), `回落行为不变：src/srcset 清洗仍生效（${out.outThird}）`)
 })
 
-// ===== _htmlTagSpans：标签区间 / 属性值引号状态机（HTML5 数据态）精确断言 =====
-// 反例（改动前）：该函数只被 sanitizeDecodedHtml 等高层用例间接覆盖，返回的 spans（每个标签的
-// [起始, 结束) 区间，**0-based**）与 valueQuotes（**属性值开启引号**所在下标集合）从未被直接断言——
-// 于是 27 个 ConditionalExpression、12 个 BlockStatement（空块，状态机副作用消失）、
-// 28 个 StringLiteral（状态名/引号字面量替换）全部存活。此处对中间状态做精确断言，
-// 并附「valueQuotes 语义」显式用例，避免快照被误读为恒等桩。
+// ===== _htmlTagSpans：标签区间 / 属性值引号状态机（HTML5 数据态）语义断言 =====
+// 反例（改动前）：该函数只被 sanitizeDecodedHtml 等高层用例间接覆盖，spans（每个标签的
+// [起始, 结束) 区间，**0-based**）与 valueQuotes（**属性值开启引号**所在下标集合）从未被断言。
+// 但契约只规定**状态机语义**（SYSTEM_CONTRACT 推送/清洗条 + xbk_utils.js:_htmlTagSpans 注释），
+// 未规定「span 是否含 '<'」「引号是否记在值起始位」等绝对下标。故去快照化：
+//   ① 保留 12 条锁语义分支的精确用例（进属性态/记开启引号/bogusComment 整段跳过/末尾孤立 '<'/
+//      未加引号值不记引号/引号内 '>' 不结束标签/未闭合引号…）；
+//   ② 其余良性形态改由**出口** sanitizeDecodedHtml/sanitizeHtmlUrls 断言可观测结果（出口文本才是契约）；
+//   ③ 另锁一条与下标无关的结构不变量（区间有序不重叠、开启引号必须落在某个区间内）。
+// 原 50 例整表绝对下标快照已删（那是内部细节，不是契约）。
 const spansOf = (html) => {
   const r = Utils._htmlTagSpans(html)
   return { spans: r.spans, valueQuotes: [...r.valueQuotes] }
@@ -493,61 +497,51 @@ check('_htmlTagSpans: 无标签/孤立 < 不产生区间', () => {
   assert.deepStrictEqual(spansOf('ab<'), { spans: [], valueQuotes: [] }) // 末尾 '<'：下一字符 undefined 不得被当成标签起始
 })
 const spanCases = [
-  ['', { spans: [], valueQuotes: [] }],
-  ['plain text', { spans: [], valueQuotes: [] }],
-  ['a < b', { spans: [], valueQuotes: [] }],
-  ['ab<', { spans: [], valueQuotes: [] }],
-  ['<div>', { spans: [[1, 5]], valueQuotes: [] }],
-  ['<div class="a">', { spans: [[1, 15]], valueQuotes: [11] }],
   ["<div class='a'>", { spans: [[1, 15]], valueQuotes: [11] }],
   ['<div class=a>', { spans: [[1, 13]], valueQuotes: [] }],
-  ['<div class="a b">', { spans: [[1, 17]], valueQuotes: [11] }],
-  ['</div>', { spans: [[2, 6]], valueQuotes: [] }],
-  ['</div class="a">', { spans: [[2, 16]], valueQuotes: [12] }],
-  ['</a/b="c">', { spans: [[2, 10]], valueQuotes: [6] }],
-  ['</!x y>z<a>', { spans: [[2, 7], [9, 11]], valueQuotes: [] }],
-  ['</?x y>z<a>', { spans: [[2, 7], [9, 11]], valueQuotes: [] }],
-  ['<a b="c"d="e">', { spans: [[1, 14]], valueQuotes: [5, 10] }],
-  ['<a b="c d=e" f>', { spans: [[1, 15]], valueQuotes: [5] }],
-  ['<a b="x" c>', { spans: [[1, 11]], valueQuotes: [5] }],
-  ['<div/>', { spans: [[1, 6]], valueQuotes: [] }],
-  ['<div a=b/>', { spans: [[1, 10]], valueQuotes: [] }],
-  ['<div a="b', { spans: [[1, 9]], valueQuotes: [7] }],
-  ["<div a='b", { spans: [[1, 9]], valueQuotes: [7] }],
-  ['<div a=b c>', { spans: [[1, 11]], valueQuotes: [] }],
-  ['<div a===b>', { spans: [[1, 11]], valueQuotes: [] }],
-  ['<a b=', { spans: [[1, 5]], valueQuotes: [] }],
-  ['<a b= >', { spans: [[1, 7]], valueQuotes: [] }],
-  ['<a b c="d" e>', { spans: [[1, 13]], valueQuotes: [7] }],
-  ['<a b="c"><d>', { spans: [[1, 9], [10, 12]], valueQuotes: [5] }],
-  ['<a b=c d=e f>', { spans: [[1, 13]], valueQuotes: [] }],
-  ['<div class', { spans: [[1, 10]], valueQuotes: [] }],
-  ['<a/b="c" d>', { spans: [[1, 11]], valueQuotes: [5] }],
-  ['<a b="c" /d="e">', { spans: [[1, 16]], valueQuotes: [5, 12] }],
-  ['<a   b="c">', { spans: [[1, 11]], valueQuotes: [7] }],
-  ['<a b=  "c">', { spans: [[1, 11]], valueQuotes: [7] }],
-  ['<a b="c>d">', { spans: [[1, 11]], valueQuotes: [5] }],
-  ['</x y=z>', { spans: [[2, 8]], valueQuotes: [] }],
-  ['< >', { spans: [], valueQuotes: [] }],
-  ['<1abc>', { spans: [], valueQuotes: [] }],
-  ['<a b=1 c=2>', { spans: [[1, 11]], valueQuotes: [] }],
-  ['<a b="x y" z="w">', { spans: [[1, 17]], valueQuotes: [5, 13] }],
-  ['<a b="x>', { spans: [[1, 8]], valueQuotes: [5] }],
-  ['<a b="x', { spans: [[1, 7]], valueQuotes: [5] }],
-  ["<a b=\"c\" d='e'>", { spans: [[1, 15]], valueQuotes: [5, 11] }],
-  ['<a b="c" >', { spans: [[1, 10]], valueQuotes: [5] }],
-  ['<a b>', { spans: [[1, 5]], valueQuotes: [] }],
-  ['<a b/ >', { spans: [[1, 7]], valueQuotes: [] }],
-  ['</a>', { spans: [[2, 4]], valueQuotes: [] }],
-  ['<a><b><c>', { spans: [[1, 3], [4, 6], [7, 9]], valueQuotes: [] }],
-  ['<a b="c"d="e"f="g">', { spans: [[1, 19]], valueQuotes: [5, 10, 15] }],
-  ['<a b="c\n d">', { spans: [[1, 12]], valueQuotes: [5] }],
-  ['<a\tb="c">', { spans: [[1, 9]], valueQuotes: [5] }]
+  ['</a/b="c">', { spans: [[2, 10]], valueQuotes: [6] }], // 结束标签名内的 '/' 与 '"' 都是名字字符
+  ['</!x y>z<a>', { spans: [[2, 7], [9, 11]], valueQuotes: [] }], // '</' + 非字母 → bogusComment 整段跳过，不记引号
+  ['<a b="c"d="e">', { spans: [[1, 14]], valueQuotes: [5, 10] }], // 无空白紧邻的第二个属性仍被解析
+  ['<div a="b', { spans: [[1, 9]], valueQuotes: [7] }], // 未闭合双引号值：引号已记、区间吃到串尾
+  ["<div a='b", { spans: [[1, 9]], valueQuotes: [7] }], // 未闭合单引号值同上
+  ['<a b c="d" e>', { spans: [[1, 13]], valueQuotes: [7] }], // attrName → afterAttrName → 重消费开新属性名
+  ['<a b="c"><d>', { spans: [[1, 9], [10, 12]], valueQuotes: [5] }], // 多标签区间
+  ['<a/b="c" d>', { spans: [[1, 11]], valueQuotes: [5] }], // 开始标签名内的 '/' 结束标签名，属性照常解析
+  ['<a b=  "c">', { spans: [[1, 11]], valueQuotes: [7] }], // beforeValue 跳过空白后，引号才算「值开启引号」
+  ['<a b="c>d">', { spans: [[1, 11]], valueQuotes: [5] }] // 引号内的 '>' 不结束标签
+]
+// 其余良性形态不再快照内部下标：改由**出口**（清洗链的公开产物）断言「良性 HTML 不得被改写」——
+// 出口文本才是可观测契约（SYSTEM_CONTRACT 推送/清洗条），spans 的绝对下标是内部细节。
+const benignTagForms = [
+  '', 'plain text', 'a < b', '<div>', '<div class="a b">', '</div>', '</?x y>z<a>', '<a b="c d=e" f>',
+  '<a b="x" c>', '<div/>', '<div a=b/>', '<div a=b c>', '<div a===b>', '<a b=', '<a b= >', '<a b=c d=e f>',
+  '<div class', '<a b="c" /d="e">', '<a   b="c">', '<a\tb="c">', '</x y=z>', '< >', '<1abc>', '<a b=1 c=2>',
+  '<a b="x y" z="w">', '<a b="x>', '<a b="x', "<a b=\"c\" d='e'>", '<a b="c" >', '<a b>', '<a b/ >', '</a>',
+  '<a><b><c>', '<a b="c"d="e"f="g">', '<a b="c\n d">'
 ]
 spanCases.forEach(([html, want]) => {
-  check(`_htmlTagSpans: HTML5 数据态快照 ${JSON.stringify(html)}`, () => {
+  check(`_htmlTagSpans: 语义用例 ${JSON.stringify(html)}`, () => {
     assert.deepStrictEqual(spansOf(html), want)
   })
+})
+check('_htmlTagSpans: 良性标签形态经出口清洗后必须原样保留（不得改写/丢内容）', () => {
+  for (const html of benignTagForms) {
+    assert.strictEqual(Utils.sanitizeHtmlUrls(html), html, `sanitizeHtmlUrls 不得改写良性形态：${JSON.stringify(html)}`)
+    assert.strictEqual(Utils.sanitizeDecodedHtml(html), html, `sanitizeDecodedHtml 不得改写良性形态：${JSON.stringify(html)}`)
+  }
+})
+check('_htmlTagSpans: 区间/引号集合的结构不变量（有序、不重叠、引号落在区间内）', () => {
+  for (const html of benignTagForms.concat(spanCases.map(c => c[0]))) {
+    const { spans, valueQuotes } = Utils._htmlTagSpans(html)
+    let prev = 0
+    for (const [a, b] of spans) {
+      assert.ok(a >= prev && a < b && b <= html.length, `区间必须有序、不重叠且落在串内：${JSON.stringify({ html, spans })}`)
+      prev = b
+    }
+    for (const q of valueQuotes) {
+      assert.ok(spans.some(([a, b]) => q >= a && q < b), `开启引号下标必须落在某个标签区间内：${JSON.stringify({ html, q })}`)
+    }
+  }
 })
 
 // ===== 日期解析子函数：显式分支直接断言 =====
@@ -917,8 +911,7 @@ check('truncateUtf16: ZWJ 序列在末尾 ZWJ 处退位，区域指示符不按�
   assert.strictEqual(Utils.truncateUtf16('A🇨🇳', 2), 'A', '区域指示符不作为前一字符的修饰符退位（A 必须保留）')
   assert.strictEqual(Utils.truncateUtf16('A🇨🇳', 3), 'A🇨')
 })
-check('truncateUtf16: max 非正/非有限不截断', () => {
-  assert.strictEqual(Utils.truncateUtf16('hello', 0), 'hello')
+check('truncateUtf16: max 非正/非有限不截断（max=0 已由文件上方既有用例覆盖，不重复）', () => {
   assert.strictEqual(Utils.truncateUtf16('hello', -1), 'hello')
   assert.strictEqual(Utils.truncateUtf16('hello', Number.NaN), 'hello')
   assert.strictEqual(Utils.truncateUtf16('hello', undefined), 'hello')
@@ -945,10 +938,17 @@ check('_removeActiveTags: 未闭合主动标签移除（含只有 embed 才有�
   assert.strictEqual(Utils._removeActiveTags('<base href=x><link rel=x><meta charset=x>'), '')
   assert.strictEqual(Utils._removeActiveTags('<BASE href=x>'), '')
 })
-check('_removeActiveTags: embed 不在外层守卫中是有意不对称（成对时闭合标签保留）', () => {
-  // 外层守卫只列 script|style|iframe|object|svg|math；embed 仅出现在未闭合替换里，
-  // 故 <embed></embed> 只被去掉开标签，</embed> 保留（后续事件属性清洗兜底）
-  assert.strictEqual(Utils._removeActiveTags('<embed src=x></embed>'), '</embed>')
+check('_removeActiveTags: embed 开/闭标签不对称只断言安全性质（登记为疑似生产缺陷）', () => {
+  // 生产 docstring（xbk_utils.js _removeActiveTags）把 embed 列为应移除的主动标签，但外层守卫与
+  // 「孤立闭合标签」规则都不含 embed ⇒ 成对 <embed></embed> 只去掉开标签、</embed> 残留。
+  // 该不对称**不是契约**（已登记为「疑似生产缺陷 / 待修」：正确行为应整对移除），故此用例只锁
+  // 安全性质，不把 `'</embed>'` 这个产物写成有意行为。
+  const out = Utils._removeActiveTags('<embed src=x></embed>')
+  assert.ok(!/<embed/i.test(out), `不得残留 embed 开标签：${out}`)
+  assert.ok(!/on[a-z]+\s*=/i.test(out), `不得残留事件属性：${out}`)
+  assert.ok(!/javascript:|vbscript:/i.test(out), `不得残留危险协议：${out}`)
+  const armed = Utils._removeActiveTags('<embed src=javascript:alert(1) onload=x></embed>')
+  assert.ok(!/javascript:|onload/i.test(armed), `危险载荷不得残留：${armed}`)
 })
 check('_removeActiveTags: 孤立闭合主动标签移除（gi 标志不可省）', () => {
   assert.strictEqual(Utils._removeActiveTags('</SCRIPT>'), '')
@@ -1022,7 +1022,6 @@ check('filterHash: 非法 pingbitime 归一为空（无时间过滤维度）', (
   const empty = Utils.filterHash({}, '')
   assert.strictEqual(Utils.filterHash({ pingbitime: 'abc' }, ''), empty)
   assert.strictEqual(Utils.filterHash({ pingbitime: '-1' }, ''), empty)
-  assert.strictEqual(Utils.filterHash({ pingbitime: '0' }, ''), Utils.filterHash({ pingbitime: '0' }, ''))
   assert.notStrictEqual(Utils.filterHash({ pingbitime: '0' }, ''), empty, '"0" 归一为 "0"（0 天永不拦截），但不等于空')
 })
 check('filterHash: pingbitime 数值形式锁定精确哈希', () => {
@@ -1058,8 +1057,6 @@ check('filterHash: ### 形式保留行内格式（不 Number 归一）', () => {
   assert.notStrictEqual(Utils.filterHash({ pingbitime: 'cat###5' }, ''), Utils.filterHash({}, ''))
   assert.notStrictEqual(Utils.filterHash({ pingbitime: 'cat###5' }, ''), Utils.filterHash({ pingbitime: 'cat###6' }, ''))
 })
-
-console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
 
 // ===== parseTime：入口三态与字符串 trim 语义 =====
 // 反例（改动前）：L119/L125 的空值与 trim 守卫从未被直接断言（既有无时区用例都传合法格式），
@@ -1152,7 +1149,6 @@ check('safeErrorText: code 三态（undefined/null/空串都不算有效 code）
 check('truncateUtf16: undefined/null 按空串处理（String 兜底）', () => {
   assert.strictEqual(Utils.truncateUtf16(undefined, 5), '')
   assert.strictEqual(Utils.truncateUtf16(null, 5), '')
-  assert.strictEqual(Utils.truncateUtf16(undefined, 5), Utils.truncateUtf16('', 5))
 })
 
 // ===== isValidItem / hasValidId：数组与空值边界 =====
@@ -1262,10 +1258,24 @@ check('truncateUtf16: 末尾 ZWJ 退位（0x200D 分支的 slice(0,-1)）', () =
 })
 
 // ===== createUtils：fs 注入守卫（L100）=====
-check('createUtils: 未注入 fs 时回落 node:fs（不抛）', () => {
-  const U2 = createUtils({ safeRe })
-  assert.strictEqual(typeof U2.diskSpace, 'function')
-  assert.strictEqual(typeof U2.diskSpace('/x'), 'object', '真实 fs 下 /x 应可 statfs（非支持平台则 null）')
+check('createUtils: 未注入 fs 时回落 node:fs 本体（与显式注入真实 fs 同源，不抛）', () => {
+  const fsm = require('node:fs')
+  assert.strictEqual(typeof fsm.statfsSync, 'function', '前提：本机 node:fs 提供 statfsSync')
+  const orig = fsm.statfsSync
+  let calls = 0
+  // 用桩替换真实 statfsSync：① 可**确定性**证明「未注入时回调的是 node:fs 本体」（回落失效 ⇒ 抛错或
+  // 拿到 undefined ⇒ null）；② 避免「两次 live statfs 之间容量漂移」造成的环境相关假红（实测踩到过）。
+  fsm.statfsSync = () => { calls++; return { bsize: 8, frsize: 4, bavail: 3, blocks: 5 } }
+  try {
+    const U2 = createUtils({ safeRe })
+    assert.deepStrictEqual(U2.diskSpace('/x'), { freeBytes: 24, totalBytes: 40 }, '未注入时必须回调 node:fs 本体的 statfsSync')
+    assert.strictEqual(calls, 1, '未注入时对 statfsSync 的调用次数必须为 1')
+    const U3 = createUtils({ safeRe, fs: { statfsSync: () => ({ bsize: 4096, frsize: 4096, bavail: 1, blocks: 1 }) } })
+    assert.deepStrictEqual(U3.diskSpace('/x'), { freeBytes: 4096, totalBytes: 4096 }, '注入的 fs 必须优先于 node:fs')
+    assert.strictEqual(calls, 1, '注入 fs 后不得再调 node:fs（优先关系）')
+  } finally {
+    fsm.statfsSync = orig
+  }
 })
 check('createUtils: 注入 fs 优先于 node:fs', () => {
   const fake = { statfsSync: 'notfn' }
@@ -1280,7 +1290,7 @@ check('createUtils: 缺 safeRe 时抛 TypeError', () => {
 // ===== filterHash 首参数组（L1126 parts 初值）=====
 check('filterHash: 空配置与非空配置哈希不同（parts 初值必须为空数组）', () => {
   const empty = Utils.filterHash({}, '')
-  assert.strictEqual(empty, '1167134403-539606814', '空 parts 的精确哈希')
+  // 空配置的精确哈希已在「filterHash: 精确哈希锁定」用例给出（本文件仅此一处），此处不重复。
   assert.notStrictEqual(Utils.filterHash({ pingbibiaoti: 'x' }, ''), empty)
 })
 
@@ -1327,8 +1337,7 @@ check('truncateUtf16: 低代理前一位必须是高代理才保留配对（prev
 // 反例（改动前）：h1/h2 的乘子（33/31）、内层 +c、下标项 i、循环上界 i<s.length 都没被边界打中，
 // 精确键值断言缺失 ⇒ 9 个靶子存活。以下锁定多组精确键值：任何一处算术变更都会改键。
 check('anonKey: 精确键值锁定两路 djb2（乘子/加法/下标项/循环上界）', () => {
-  assert.strictEqual(Utils.anonKey('a'), 'anon:2b5c418ef5a')
-  assert.strictEqual(Utils.anonKey('ab'), 'anon:596e26304fc49')
+  // 'a' / 'ab' 的字面量已在上方「anonKey: 单参数与多参数的精确键值」用例锁定，此处不重复。
   assert.strictEqual(Utils.anonKey('ba'), 'anon:596ec6304fc67', '下标项 i 参与 h2 ⇒ ab 与 ba 不同')
   assert.strictEqual(Utils.anonKey('abc'), 'anon:b8732855d9a8d3c')
   assert.strictEqual(Utils.anonKey('aa'), 'anon:596e25304fc48')

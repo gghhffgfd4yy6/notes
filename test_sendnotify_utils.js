@@ -298,20 +298,27 @@ const cfg = slim.push_config
         }
       }
       // ③ 存在但为空/纯空白的 env 不得覆盖（v3.234：面板留空不得清掉已有配置）
+      // 相对断言（**不用**绝对默认值）：部署侧存在 push_config.local.js 时生效值来自本地配置，
+      // 绝对断言会在该环境下假红；这里先取「无任何 env 时」的生效值作基线，再断言空 env 不改动它。
       clearEnv()
+      const base = reload().push_config
+      const baseVals = { BARK_SOUND: base.BARK_SOUND, PUSH_KEY: base.PUSH_KEY, QYWX_ORIGIN: base.QYWX_ORIGIN }
       process.env.BARK_SOUND = '   '
       process.env.PUSH_KEY = ''
       process.env.QYWX_ORIGIN = '\t\n'
       const blank = reload()
-      assert.strictEqual(blank.push_config.BARK_SOUND, '', '纯空白 env 不得覆盖默认值')
-      assert.strictEqual(blank.push_config.PUSH_KEY, '', '空串 env 不得覆盖默认值')
-      assert.strictEqual(blank.push_config.QYWX_ORIGIN, 'https://qyapi.weixin.qq.com', '只含空白的 env 不得覆盖默认值')
+      assert.strictEqual(blank.push_config.BARK_SOUND, baseVals.BARK_SOUND, '纯空白 env 不得覆盖生效值')
+      assert.strictEqual(blank.push_config.PUSH_KEY, baseVals.PUSH_KEY, '空串 env 不得覆盖生效值')
+      assert.strictEqual(blank.push_config.QYWX_ORIGIN, baseVals.QYWX_ORIGIN, '只含空白的 env 不得覆盖生效值（默认域名或本地配置都不许被清）')
       // 对照组：同一批 env 里加一个非空值 → 只有它生效
       process.env.BARK_SOUND = ' ding '
       const withSound = reload()
       assert.strictEqual(withSound.push_config.BARK_SOUND, ' ding ', '非空 env（含首尾空白）必须原样覆盖')
-      assert.strictEqual(withSound.push_config.PUSH_KEY, '', '未设置的非空 env 键仍保持默认')
-      console.log('✅ 模块加载期配置契约：默认值逐键 + ENV_ALIASES 全别名覆盖 + 空白 env 不覆盖')
+      assert.strictEqual(withSound.push_config.PUSH_KEY, baseVals.PUSH_KEY, '空 env 键不得改动生效值')
+      // ✅ 文案按「真跑了默认值断言 / 因本地配置存在而跳过」分支化：跳过时不得宣称已验证。
+      console.log(hasLocal
+        ? '✅ 模块加载期配置契约：ENV_ALIASES 全别名覆盖 + 空白 env 不覆盖（默认值逐键断言因存在 push_config.local.js 而跳过）'
+        : '✅ 模块加载期配置契约：默认值逐键 + ENV_ALIASES 全别名覆盖 + 空白 env 不覆盖')
     } finally {
       for (const n of ALL_ENV) {
         if (savedEnv[n] === undefined) delete process.env[n]

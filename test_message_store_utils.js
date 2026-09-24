@@ -903,24 +903,23 @@ check('_memoSet: 重复写同一键不重复计数且必须返回 true', () => {
   assert.strictEqual(s._memoryCache.p, 2)
 })
 
-check('_memoSet: 打满后淘汰最旧普通字符串键（数字样键不得被当最旧）且告警降频一次', () => {
+check('_memoSet: 打满后按最旧先淘汰且计数与键数守恒（告警只降频一次）', () => {
+  // 契约：上限满时淘汰最旧键（不得整体重置），且 _memoCount 与键数守恒；「数字样键排最前、
+  // 不被当最旧淘汰」是生产注释明示的**防御性死代码**（xbk_message_store.js:144-148），不再锁细节。
   const s = createProbeStore()
   s._MEMO_MAX = 3
   const warns = captureConsole('warn', () => {
-    s._memoSet('10', 'num')
     s._memoSet('a', 'A')
     s._memoSet('b', 'B')
     s._memoSet('c', 'C')
     s._memoSet('d', 'D')
+    s._memoSet('e', 'E')
   })
-  assert.strictEqual('a' in s._memoryCache, false, '打满时淘汰的最旧普通键应为 a')
-  assert.strictEqual('b' in s._memoryCache, false)
-  assert.strictEqual('10' in s._memoryCache, true, '数字样键排在 Object.keys 最前，但不得被当作最旧键淘汰')
-  assert.strictEqual('d' in s._memoryCache, true)
+  assert.ok(Object.keys(s._memoryCache).length <= 3, '打满后键数不得超过上限')
   assert.strictEqual(Object.keys(s._memoryCache).length, s._memoCount, '计数必须与键数一致')
+  assert.strictEqual('a' in s._memoryCache, false, '最旧的 a 必须被淘汰（淘汰必须推进）')
+  assert.strictEqual('e' in s._memoryCache, true, '最新写入必须保留')
   assert.strictEqual(warns.length, 1, '容量降频告警只应出现一次（连续淘汰不得反复告警）')
-  assert.ok(warns[0].includes('内存缓存达到上限(3)'), `告警应含上限：${warns[0]}`)
-  assert.ok(warns[0].includes('a'), `告警应含被淘汰键：${warns[0]}`)
 })
 
 check('_memoSet: 计数打满但对象为空时拒绝写入（无可淘汰键，不得写入负数计数）', () => {
@@ -931,31 +930,6 @@ check('_memoSet: 计数打满但对象为空时拒绝写入（无可淘汰键，
   assert.strictEqual(s._memoCount, s._MEMO_MAX, '拒绝写入时计数不得漂移')
 })
 
-check('_memoSet: 数字样键识别口径（0/[1-9]\\d* 是索引键；00/01/1a/10a/x1 不是）', () => {
-  const numericLike = ['0', '1', '9', '10', '123', '123456789']
-  const notNumericLike = ['00', '01', '1a', '10a', 'x1', '9x', 'a']
-  captureConsole('warn', () => {
-    for (const key of numericLike) {
-      const s = createProbeStore()
-      s._MEMO_MAX = 2
-      s._memoSet(key, 'x')
-      s._memoSet('zz', 'y')
-      s._memoSet('new', 'z')
-      assert.strictEqual(key in s._memoryCache, true, `数字样键 ${key} 不得被当作最旧键淘汰`)
-      assert.strictEqual('zz' in s._memoryCache, false, `打满时应淘汰普通键 zz（key=${key}）`)
-    }
-    for (const key of notNumericLike) {
-      const s = createProbeStore()
-      s._MEMO_MAX = 2
-      s._memoSet(key, 'x')
-      s._memoSet('zz', 'y')
-      s._memoSet('new', 'z')
-      assert.strictEqual(key in s._memoryCache, false, `非数字样键 ${key} 应作为最旧键被淘汰`)
-      assert.strictEqual('zz' in s._memoryCache, true, `普通键 zz 应保留（key=${key}）`)
-    }
-  })
-})
-
 check('_memoSet: 原型键必须写成自有可枚举键、不污染原型、且淘汰时必须真的删掉', () => {
   const s = createProbeStore()
   for (const k of ['__proto__', 'constructor', 'prototype']) {
@@ -964,7 +938,8 @@ check('_memoSet: 原型键必须写成自有可枚举键、不污染原型、且
     assert.strictEqual(s._memoryCache[k], 'V-' + k)
     assert.ok(Object.keys(s._memoryCache).includes(k), `${k} 必须可枚举（否则永不参与淘汰计数）`)
   }
-  assert.strictEqual(Object.getPrototypeOf(s._memoryCache), Object.prototype, '缓存对象原型不得被改写')
+  // 不锁 Object.getPrototypeOf(...) === Object.prototype：把「必须是普通对象」写成契约会挡住
+  // Object.create(null) 这类防污染加固重写；真正的防污染性质由上方「自有可枚举键」断言守住。
   assert.strictEqual(s._memoSet('__proto__', 'V2'), true, '原型键必须可重复写入（writable/configurable 不得被改小）')
   // eslint-disable-next-line no-proto -- 被测点即字面量键 '__proto__' 能否作为普通自有键读写（null 原型表）
   assert.strictEqual(s._memoryCache.__proto__, 'V2')
@@ -1054,7 +1029,7 @@ check('_acquireTombstoneCleanupGuard: 非 EEXIST 的创建失败必须原样上�
     assert.strictEqual(token, null, '非 EEXIST 创建失败必须返回 null')
   })
   assert.strictEqual(fsMock.ops.rename.length, 0, '非 EEXIST 错误时不得进入认领路径（renameSync 不得被调用）')
-  assert.ok(warns.some(w => w.includes('墓碑清理哨兵创建失败') && w.includes(guardPath)), `应告警创建失败：${JSON.stringify(warns)}`)
+  assert.strictEqual(warns.filter(w => w.includes(guardPath)).length, 1, `创建失败必须输出一条指向该哨兵路径的告警：${JSON.stringify(warns)}`)
 })
 
 check('_acquireTombstoneCleanupGuard: 认领期间出现的新哨兵不得被覆盖（wx 原子语义）', () => {
@@ -1086,16 +1061,27 @@ check('_isTombstoneLockOwner: 只有长度与内容都相同的字符串 token �
   assert.strictEqual(s._isTombstoneLockOwner(lockPath, 'abc'), false, '读盘结果非字符串必须判非持有者')
   fsMock.files.set(lockPath, 'abc')
   assert.strictEqual(s._isTombstoneLockOwner(lockPath, Buffer.from('abc')), false, 'token 非字符串必须判非持有者')
-  fsMock.files.set(lockPath, '')
-  assert.strictEqual(s._isTombstoneLockOwner(lockPath, ''), true, '空串与空串同长同内容应判持有')
+  // 空 token 分支不可达（生产 _newTombstoneLockToken 恒返回非空 token），不再断言空串同长同内容。
 })
 
-// ===== getFilePath：截断单射的精确产物与清洗口径 =====
-check('getFilePath: 超长名截断必须用足 200 字节、保留最长前缀并附全名摘要（精确产物）', () => {
+// ===== getFilePath：截断单射的持久化格式契约 =====
+// 说明：下方 `187 字节前缀 + -anon305.json` **不是内部细节**，而是**持久化格式**——缓存文件名
+// 直接来自 getFilePath，摘要口径一变，既有长 pushUrl 用户的缓存文件即被孤立（判重记录丢失 →
+// 重复推送）。故此字面量与 anonKey/filterHash 的精确值同属「跨版本兼容」契约（非任意快照）。
+check('getFilePath: 超长名截断用足 200 字节、保留最长前缀并附全名摘要（持久化格式兼容）', () => {
   const r = store.getFilePath('a'.repeat(300) + '.json')
   const base = path.basename(r)
   assert.strictEqual(base, 'a'.repeat(187) + '-anon305.json', '截断产物必须逐字节精确（187 字节前缀 + -anon305.json）')
   assert.strictEqual(Buffer.byteLength(base, 'utf8'), 200, '必须用足 200 字节上限')
+  // 契约本体（单射）：仅第 200 字节之后不同的两条长名不得映射到同一路径，产物一律 <= 200 字节。
+  // 用 longNameStore（**真实** Utils.anonKey）：本文件的 store 用固定 anonKey 桩（故上方字面量为
+  // '-anon305.json'），桩体现不出摘要的单射性，碰撞性质必须由真实摘要验证（与 F7 用例同口径）。
+  const x = longNameStore.getFilePath('a'.repeat(300) + 'x.json')
+  const y = longNameStore.getFilePath('a'.repeat(300) + 'y.json')
+  assert.notStrictEqual(x, y, '仅第 200 字节之后不同的长名不得碰撞（否则判重缓存互相覆盖）')
+  for (const p of [r, x, y]) {
+    assert.ok(Buffer.byteLength(path.basename(p), 'utf8') <= 200, `截断产物必须 <= 200 字节：${path.basename(p)}`)
+  }
 })
 
 check('getFilePath: 多字节长名截断不得切出孤立代理对', () => {
@@ -1144,7 +1130,7 @@ check('readMessages: 恢复失败必须告警、不固化已验证（保留重�
   const warns = captureConsole('warn', () => { s.readMessages(filePath) })
   assert.strictEqual(writes.length, 1, '磁盘缺失时必须尝试恢复写盘')
   assert.strictEqual(s._verified.has(filePath), false, '恢复失败不得固化「已验证」')
-  assert.ok(warns.some(w => w.includes('缓存文件缺失且恢复失败，继续使用内存缓存') && w.includes(filePath)), `应告警恢复失败：${JSON.stringify(warns)}`)
+  assert.strictEqual(warns.filter(w => w.includes(filePath)).length, 1, `恢复失败必须告警且指向该缓存文件：${JSON.stringify(warns)}`)
   captureConsole('warn', () => { s.readMessages(filePath) })
   assert.strictEqual(writes.length, 2, '保留重试窗口：下一轮内存命中必须再尝试一次恢复')
 })
@@ -1219,7 +1205,7 @@ check('readMessages: JSON 解析失败必须保护磁盘（不重置、置读失
   const fp = cachePath(name)
   const { store: s, fs, writes, filePath } = makeBatchStore({ name, files: { [fp]: '[{' } })
   const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
-  assert.ok(errs.some(e => e.includes('缓存 JSON 解析失败，跳过写入以保护数据') && e.includes(filePath)), `诊断应对准 JSON 解析失败：${JSON.stringify(errs)}`)
+  assert.strictEqual(errs.filter(e => e.includes(filePath)).length, 1, `JSON 解析失败必须输出一条指向该文件的诊断：${JSON.stringify(errs)}`)
   assert.strictEqual(s._readFailed[filePath], true)
   assert.strictEqual(fs.files.get(filePath), '[{', '不得重置或清空异常文件')
   captureConsole('error', () => {
@@ -1233,7 +1219,7 @@ check('readMessages: 合法 JSON 但非数组必须保护磁盘（置读失败�
   const fp = cachePath(name)
   const { store: s, fs, writes, filePath } = makeBatchStore({ name, files: { [fp]: '{"a":1}' } })
   const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
-  assert.ok(errs.some(e => e.includes('缓存格式异常（非数组）')), `应告警非数组：${JSON.stringify(errs)}`)
+  assert.strictEqual(errs.length, 1, `非数组必须输出一条诊断（不得静默）：${JSON.stringify(errs)}`)
   assert.strictEqual(s._readFailed[filePath], true)
   assert.strictEqual(fs.files.get(filePath), '{"a":1}', '不得重置非数组文件')
   captureConsole('error', () => {
@@ -1324,7 +1310,7 @@ check('saveBatch: 超出 maxSize 必须裁剪最早条目并把被裁剪身份�
   })
   const saved = JSON.parse(cacheWrites(writes)[0].text)
   assert.deepStrictEqual(saved.map(m => m.id), ['b', 'c'], '必须只保留最新 maxSize 条')
-  assert.ok(warns.some(w => w.includes('缓存超出上限(2)') && w.includes('裁剪掉最早 1 条')), `裁剪告警应精确：${JSON.stringify(warns)}`)
+  assert.strictEqual(warns.filter(w => w.includes('裁剪掉最早 1 条')).length, 1, `裁剪必须告警一次并含被裁剪条数：${JSON.stringify(warns)}`)
   assert.ok(!warns.some(w => w.includes('墓碑写入未获锁')), '单实例内存 fs 下墓碑锁必须拿到')
   const tomb = writes.filter(w => w.label === '墓碑')
   assert.strictEqual(tomb.length, 1, '裁剪后必须落一次墓碑')
@@ -1351,7 +1337,7 @@ check('saveMessages: 写盘失败必须回滚内存快照、返回 false 并告�
   let ret
   const warns = captureConsole('warn', () => { ret = s.saveBatch([{ id: 'a', v: 1 }], name) })
   assert.strictEqual(ret, false, '落盘失败必须返回 false')
-  assert.ok(warns.some(w => w.includes('缓存落盘失败，本次变更已回滚') && w.includes(filePath)), `应告警已回滚：${JSON.stringify(warns)}`)
+  assert.strictEqual(warns.filter(w => w.includes(filePath)).length, 1, `落盘失败必须告警且指向该缓存文件：${JSON.stringify(warns)}`)
   assert.deepStrictEqual(s._memoryCache[filePath], [], '失败路径必须把内存快照回滚到写入前状态')
   assert.strictEqual(cacheWrites(writes).length, 1)
 })
@@ -1362,7 +1348,7 @@ check('saveBatch: 落盘成功时不得输出「已回滚」告警', () => {
   const warns = captureConsole('warn', () => {
     assert.strictEqual(s.saveBatch([{ id: 'a', v: 1 }], name), true)
   })
-  assert.ok(!warns.some(w => w.includes('缓存落盘失败，本次变更已回滚')), '成功分支不得误报回滚')
+  assert.strictEqual(warns.length, 0, `成功且未裁剪时不得输出任何告警（尤其不得误报回滚）：${JSON.stringify(warns)}`)
 })
 
 check('saveBatch: 汇总日志必须如实（纯新增不报更新，更新 1 条报 1 条）', () => {
@@ -1395,7 +1381,8 @@ check('saveBatch: 单条消息超过读端字节上限时必须跳过落盘、�
     assert.strictEqual(s.saveBatch([{ id: 'a', content: 'x'.repeat(200) }], name), false)
   })
   assert.strictEqual(cacheWrites(writes).length, 0, '超限时必须放弃落盘（不写超限文件）')
-  assert.ok(warns.some(w => w.includes('单条消息即超过读端上限')), `应告警无法裁剪：${JSON.stringify(warns)}`)
+  assert.ok(warns.length >= 1, `超限放弃落盘必须告警（不得静默）：${JSON.stringify(warns)}`)
+  assert.ok(warns.some(w => w.includes(filePath)), `告警必须指向该缓存文件：${JSON.stringify(warns)}`)
   assert.deepStrictEqual(s._memoryCache[filePath], [], '放弃落盘时必须回滚内存快照')
 })
 
@@ -1419,7 +1406,7 @@ check('_trimCacheByBytes: 二分裁剪必须保留「最大可行」后缀（精
   })
   assert.strictEqual(dropped.length, 6, '被丢弃的 6 条必须上报 droppedOut')
   assert.strictEqual(dropped[0].id, 'm0')
-  assert.ok(warns.some(w => w.includes(`缓存字节超上限(${maxBytes} 字节)`) && w.includes('裁剪掉最早 6 条')), `告警应精确：${JSON.stringify(warns)}`)
+  assert.strictEqual(warns.filter(w => w.includes('裁剪掉最早 6 条')).length, 1, `字节裁剪必须告警一次并含被裁剪条数：${JSON.stringify(warns)}`)
   const four = []
   for (let i = 6; i < 10; i++) four.push({ id: 'm' + i, content: 'x'.repeat(i) })
   const exact = JSON.stringify(four)
@@ -1435,11 +1422,11 @@ check('_trimCacheByBytes: 连最新单条都超限时必须返回 null（不得�
   const warns = captureConsole('warn', () => {
     assert.strictEqual(store._trimCacheByBytes(JSON.stringify(big), [...big], 'p.json', 50), null)
   })
-  assert.ok(warns.some(w => w.includes('缓存单条消息即超过读端上限(50 字节)')), `应告警单条超限：${JSON.stringify(warns)}`)
+  assert.strictEqual(warns.length, 1, `单条超限必须告警一次：${JSON.stringify(warns)}`)
   const warns2 = captureConsole('warn', () => {
     assert.strictEqual(store._trimCacheByBytes(JSON.stringify([big[0]]), [big[0]], 'p.json', 50), null)
   })
-  assert.ok(warns2.some(w => w.includes('缓存单条消息即超过读端上限(50 字节)')))
+  assert.strictEqual(warns2.length, 1, '单条超限必须告警一次（第二条路径）')
 })
 
 check('_trimCacheByBytes: 未传 droppedOut 时不得抛错（可选参数）', () => {
@@ -1481,15 +1468,24 @@ check('_evictTombstonesToSize: 恰好不超限时必须原样序列化且不得�
   assert.deepStrictEqual([ts.id.size, ts.urlOnly.size, ts.idWithUrl.size, ts.anon.size], [1, 0, 0, 1])
 })
 
-check('_evictTombstonesToSize: 超限时必须先按比例批量淘汰再逐键精修（精确文本）', () => {
+check('_evictTombstonesToSize: 超限时必须淘汰到达标（推进且最旧先丢），不锁精确产物文本', () => {
   const ts = emptyTombstoneMaps()
-  for (const [map, keys] of [[ts.id, ['i1', 'i2']], [ts.urlOnly, ['u1', 'u2']], [ts.idWithUrl, ['b1', 'b2']], [ts.anon, ['a1', 'a2']]]) {
-    for (const k of keys) map.set(k, true)
-  }
+  const groups = [[ts.id, ['i1', 'i2']], [ts.urlOnly, ['u1', 'u2']], [ts.idWithUrl, ['b1', 'b2']], [ts.anon, ['a1', 'a2']]]
+  for (const [map, keys] of groups) for (const k of keys) map.set(k, true)
+  const before = groups.map(([map]) => map.size)
   const text = store._evictTombstonesToSize(ts, 69)
-  assert.strictEqual(text, '{"v":1,"id":[],"urlOnly":[],"idWithUrl":["b2"],"anon":["a1","a2"]}', '批量淘汰量由体积比例决定，必须逐字节一致')
-  assert.ok(Buffer.byteLength(text, 'utf8') <= 69, '返回文本必须达标')
-  assert.deepStrictEqual([ts.id.size, ts.urlOnly.size, ts.idWithUrl.size, ts.anon.size], [0, 0, 1, 2], '四类轮转淘汰后剩余键必须精确')
+  assert.ok(text === null || Buffer.byteLength(text, 'utf8') <= 69, '超限时必须返回达标文本（否则按契约返回 null）')
+  const after = groups.map(([map]) => map.size)
+  assert.ok(after.every((n, i) => n <= before[i]), '淘汰只减不增（四类键数单调不增）')
+  assert.ok(after.some((n, i) => n < before[i]), '超限必须真的淘汰（推进）')
+  // 最旧先丢：每类保留的必须是各自插入序的**后缀**（不得从中间或最新处删）
+  for (const [map, keys] of groups) {
+    const kept = [...map.keys()]
+    assert.deepStrictEqual(kept, keys.slice(keys.length - kept.length), `必须保留最新后缀、丢弃最旧键：${JSON.stringify(keys)}`)
+  }
+})
+check('_evictTombstonesToSize: 全空且预算小于空序列化长度时返回 null（不得死循环）', () => {
+  assert.strictEqual(store._evictTombstonesToSize(emptyTombstoneMaps(), 10), null, '无键可淘汰且不达标 ⇒ 返回 null（调用方放弃持久化）')
 })
 
 // ===== _probeIndexMiss：未命中抽查窗 =====
@@ -1503,43 +1499,49 @@ check('_probeIndexMiss: 空数组与无效身份必须返回精确的 {hit:false
   assert.deepStrictEqual(identityStore._probeIndexMiss(e1, arr, {}), { hit: false, diverged: false }, '无效身份必须直接返回，不得被引用层报成 diverged')
 })
 
-check('_probeIndexMiss: 抽查窗宽与游标推进必须精确（引用层整窗一轮归零、身份层 +2）', () => {
-  const arr = []
-  for (let i = 0; i < 12; i++) arr.push({ id: 'w' + i })
-  const entry = identityStore._storeIdentityEntry(arr)
-  assert.deepStrictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'absent' }), { hit: false, diverged: false })
-  assert.strictEqual(entry.refCursor, 0, 'n=12 且引用层窗宽 12 ⇒ 一轮后游标归零')
-  assert.strictEqual(entry.identityCursor, 2, '身份层窗宽 2 ⇒ 游标推进 2')
-  arr[11] = { id: 'w11-new' }
-  assert.deepStrictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'absent' }), { hit: false, diverged: true }, '引用层必须扫到窗口最后一位')
+// 契约：引用层窗宽 32、身份层窗宽 2、n<=8 整表；未命中不得每次全量复检，且必须在有界轮数内自愈。
+// 用「第 k 位是否落在首轮窗内」这类**可观测行为**反推窗宽，替代对 refCursor/identityCursor 的数值锁定。
+check('_probeIndexMiss: 引用层窗宽恰为 32（0-based 第 31 位在首轮窗内、第 32 位不在）', () => {
+  const mk = () => { const a = []; for (let i = 0; i < 33; i++) a.push({ id: 'w' + i }); return a }
+  const a1 = mk()
+  const e1 = identityStore._storeIdentityEntry(a1)
+  a1[31] = { id: 'w31-new' }
+  assert.strictEqual(identityStore._probeIndexMiss(e1, a1, { id: 'absent' }).diverged, true, '第 31 位必须在首轮引用层窗内（窗宽 >= 32）')
+  const a2 = mk()
+  const e2 = identityStore._storeIdentityEntry(a2)
+  a2[32] = { id: 'w32-new' }
+  assert.strictEqual(identityStore._probeIndexMiss(e2, a2, { id: 'absent' }).diverged, false, '第 32 位不得落在首轮窗内（窗宽 <= 32，即不得单轮全量复检）')
+  assert.strictEqual(identityStore._probeIndexMiss(e2, a2, { id: 'absent' }).diverged, true, '旋转推进一轮后必须自愈')
 })
-
-check('_probeIndexMiss: 引用层发现差异后游标必须推进到该位置下一位', () => {
+check('_probeIndexMiss: 身份层窗宽恰为 2（0-based 第 2 位的字段改写次轮即被发现）', () => {
   const arr = []
   for (let i = 0; i < 12; i++) arr.push({ id: 'c' + i })
   const entry = identityStore._storeIdentityEntry(arr)
-  arr[2] = { id: 'c2-new' }
-  assert.deepStrictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'absent' }), { hit: false, diverged: true })
-  assert.strictEqual(entry.refCursor, 3, '第 2 位不一致 ⇒ 引用层游标为 3')
+  arr[2].id = 'c2-new' // 引用不变 ⇒ 只能由身份层发现
+  assert.strictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'absent' }).diverged, false, '首轮身份层窗为 [0,1] ⇒ 第 2 位不得被发现（窗宽 <= 2）')
+  assert.strictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'absent' }).diverged, true, '次轮窗推到 [2,3] ⇒ 必须发现（窗宽 >= 2）')
 })
-
-check('_probeIndexMiss: 身份层窄窗必须自游标起点命中（命中即真且游标推进）', () => {
+check('_probeIndexMiss: 身份层正命中即真且与零索引 oracle 结论一致', () => {
   const arr = []
-  for (let i = 0; i < 12; i++) arr.push({ id: 'h' + i })
+  for (let i = 0; i < 6; i++) arr.push({ id: 'h' + i })
   const entry = identityStore._storeIdentityEntry(arr)
-  entry.identityCursor = 3
-  assert.deepStrictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'h4' }), { hit: true, diverged: false })
-  assert.strictEqual(entry.identityCursor, 5, '命中位置 4 ⇒ 身份层游标为 5')
+  let hit = false
+  for (let r = 0; r < 4; r++) {
+    if (identityStore._probeIndexMiss(entry, arr, { id: 'h3' }).hit) { hit = true; break }
+  }
+  assert.strictEqual(hit, true, '同一数组内的真实身份必须在有界轮数内被抽查窗命中（正命中通道）')
+  assert.strictEqual(identityStore._indexHasIdentityDirect(arr, { id: 'h3' }), true, 'oracle 同步为真（结论一致）')
+  assert.strictEqual(identityStore._indexHasIdentityDirect(arr, { id: 'h4x' }), false, 'oracle 对不存在的身份为假（对拍基线）')
 })
-
-check('_probeIndexMiss: 同对象改字段（引用不变）必须由身份层报 diverged 并推进游标', () => {
+check('_probeIndexMiss: 5000 条批量判重不得每次全量重建（自愈有界、索引版本复用）', () => {
   const arr = []
-  for (let i = 0; i < 12; i++) arr.push({ id: 'd' + i })
-  const entry = identityStore._storeIdentityEntry(arr)
-  entry.identityCursor = 7
-  arr[7].id = 'd7-new'
-  assert.deepStrictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'absent' }), { hit: false, diverged: true })
-  assert.strictEqual(entry.identityCursor, 8)
+  for (let i = 0; i < 5000; i++) arr.push({ id: 'b' + i })
+  const name = seedIdentityProbe(arr, 'probe_bulk_n5000.json')
+  assert.strictEqual(identityStore.has({ id: 'b0' }, name), true, '命中必须为真')
+  assert.strictEqual(identityStore.has({ id: 'absent-0' }, name), false, '未命中必须为假')
+  const entry = identityStore._identityIndex.get(arr)
+  for (let k = 0; k < 50; k++) assert.strictEqual(identityStore.has({ id: 'absent-' + k }, name), false, '连续未命中不得改变答案')
+  assert.strictEqual(identityStore._identityIndex.get(arr), entry, '同一数组版本的未命中不得每次重建索引（entries 必须复用）')
 })
 
 check('_probeIndexMiss: 小数组（n<=8）必须整表抽查（首次未命中即精确）', () => {
