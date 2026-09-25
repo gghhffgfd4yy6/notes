@@ -631,10 +631,11 @@ function test (name, fn) {
     const r = await runSend({ sendNotify: () => undefined, configuredChannelNames: () => ['ch1'] })
     assert.ok(r.err, '同步 undefined 必须被拒绝，不得静默成功（主流程会误写缓存）')
     assert.strictEqual(r.err.message, '推送模块 sendNotify 未返回 Promise，拒绝静默成功', '拒绝原因原文')
-    // 伪 thenable（then 非函数）必须被拒绝。键用 fromCharCode 拼出：S7739 会把常量键
-    // 折叠后判为「给对象加 then」，而这里构造的是测试夹具、不参与任何 await 链。
-    const thenKey = String.fromCharCode(116, 104, 101, 110)
-    const r2 = await runSend({ sendNotify: () => ({ [thenKey]: 'nope' }), configuredChannelNames: () => ['ch1'] })
+    // 伪 thenable（then 非函数）必须被拒绝：用 defineProperty 而非对象字面量构造夹具。
+    // SonarCloud S7739 对「给对象加 then」一律报 bug，但此对象不参与任何 await 链 ⇒ 显式 NOSONAR。
+    const pseudo = {}
+    Object.defineProperty(pseudo, String.fromCharCode(116, 104, 101, 110), { value: 'nope', enumerable: true }) // NOSONAR
+    const r2 = await runSend({ sendNotify: () => pseudo, configuredChannelNames: () => ['ch1'] })
 
     assert.strictEqual(r2.err && r2.err.message, '推送模块 sendNotify 未返回 Promise，拒绝静默成功',
       'then 非函数的伪 thenable 同样必须拒绝')
