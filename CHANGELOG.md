@@ -152,3 +152,6 @@
  **为何等价**：10 个里 9 个落在 `rawStr` 的输入守卫 `if (v === undefined || v === null || typeof v === 'symbol') return ''`（L1128）上——该守卫的三个子条件任一被强制 true/false 后，相应输入仍会经 `try { String(v) }` 或 `catch` 落成同一个 `''`；剩下 1 个是 L1148 的 `.trim()` 被删（`MethodExpression`），而该处后续的 `safeStr` 会再次 `String(v).trim()` ⇒ 同样不可观测。这与第三十二/三十五批的 `getFilePath`、`parseTime` 守卫是**同一类：守卫被下游同判据吸收**。
  **方法学落地（这是本批的真正产出）**：把上一轮写下的教训（「先抽 1 个变异体做可行性探针，再决定是否展开」）**首次执行**，结果是**用 2 分钟避免了一整批无效用例**——对比上一轮（第三十五批）我先写完 3 个 check 才发现增量 0。今后**每一批都先探针**：`printf '<id>' > ids; replay …` 看是否 KILLED，再决定投入。
  **未改动任何测试文件**（`test_utils_pure.js` 无 diff）。
+- **可行性探针（第二批）：utils 剩余 416 个靶子的抽样探针，30/30 全部 SURVIVED**——据此判定**该段剩余靶子系统性等价**，本批不写测试、增量 0（据实登记）。做法：选剩余≥6 靶子的 8 个函数（`_htmlTagSpans` 43、`_parseDateTimeNoTz` 27、`_parseFallback` 23、`parseTime` 19、`_parseIsoZ` 18、`_stripEventAttrs` 18、`_parseSlashDate` 15、`_protectAttrPairs` 14），**每函数取头、尾两个位置各抽 1 个**（两个独立采样批次，共 30 个变异体），全部 SURVIVED。
+ **判据落点（与前三批同源，现可归纳为一句话）**：这些存活靶子绝大多数位于**分支守卫的第一个位置上**（`if (A || B || C)` 的 `A`），而该守卫的语义被**下游同判据**吸收——例如 `_parseXxx` 的 `undefined/null/''` 守卫删掉后，输入仍会在后续 `try { String(v) }`/`catch` 或 `_parseFallback` 里落成同一个 `null`/`''`；`_stripEventAttrs`/`_protectAttrPairs` 的引号状态守卫删掉后，仍有后续 `replace` 兜底。
+ **方法再确认**：探针法（本轮第二批）第二次证明其价值——**两批共 46 个变异体、约 6 分钟，就替代了本可能写 8 个函数整批用例的工作量**。第三十六批（filterHash）与本草均为**零测试改动**，只登记结论。
