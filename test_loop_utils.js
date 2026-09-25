@@ -410,7 +410,13 @@ const { runLoop, sleep, refreshTimeoutError, isAbortable } = require('./xbk_loop
   }
 
   // 本地小工具：把「该 settle 却永不 settle」的变异体转成快速失败，而不是只靠 900s 外部超时判负。
-  const withinSettle = (p, ms = 2000) => Promise.race([p, new Promise((_resolve, reject) => setTimeout(() => reject(new Error('未在期限内 settle')), ms))])
+  // 计时器必须在 race settle 后清掉：p 先 settle 时原写法仍留着定时器存活，
+  // 会把进程多留 ms 毫秒（反复的变异运行逐次累积这段空等）。见 PR #173 评审。
+  const withinSettle = (p, ms = 2000) => {
+    let timer
+    const deadline = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('未在期限内 settle')), ms) })
+    return Promise.race([p, deadline]).finally(() => clearTimeout(timer))
+  }
 
   // L1. clampTimerMs/refreshTimeoutError 的文案分支与上下界：专杀 EqualityOperator
   //     `requestedMs > MAX_TIMER_MS`→`>=`（上界等值被误报「已钳制」）与 `requestedMs < 0`→`<=`（0 被误报非法）。

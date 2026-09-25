@@ -393,7 +393,13 @@ dns.lookup = (hostname, options, callback) => {
     const cb = typeof options === 'function' ? options : callback
     process.nextTick(() => cb(null, '127.0.0.1', 4))
   }
-  const mrSettle = (p) => Promise.race([p, new Promise((_resolve, reject) => setTimeout(() => reject(new Error('dnsLookup 未在 2s 内 settle')), 2000))])
+  // 计时器必须在 race settle 后清掉：p 先 settle 时原写法仍留着定时器存活，
+  // 会把进程多留 ms 毫秒（反复的变异运行逐次累积这段空等）。见 PR #173 评审。
+  const mrSettle = (p) => {
+    let timer
+    const deadline = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('dnsLookup 未在 2s 内 settle')), 2000) })
+    return Promise.race([p, deadline]).finally(() => clearTimeout(timer))
+  }
   try {
     await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-a.test', {}, (e) => e ? reject(e) : resolve())))
     await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-a.test.sub', {}, (e) => e ? reject(e) : resolve())))
