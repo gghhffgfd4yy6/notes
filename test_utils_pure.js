@@ -2094,4 +2094,31 @@ check('PlanQ _isTrackingQueryName: 非跟踪名必须判否（不得用子串/�
   assert.strictEqual(f(''), false, '空串必须放行（不得因空串被误判跟踪）')
 })
 
+// ===== 补测 PlanR：parseTime 的输入守卫与字符串分支 =====
+// 反例（改动前）：PlanO 只断言了各格式的**解析值**，L119 的 undefined/null/'' 三连守卫、
+// L125 的 typeof 分支、L126 的 trim、L127 的「trim 后为空」全部未测 ⇒ 该区 25 个靶子存活。
+check('PlanR parseTime: undefined/null/空串/纯空白一律返回 null（三连守卫逐项）', () => {
+  const u = Utils
+  assert.strictEqual(u.parseTime(undefined), null, 'undefined 必须返回 null（缺该分支会继续走 String(undefined)）')
+  assert.strictEqual(u.parseTime(null), null, 'null 必须返回 null')
+  assert.strictEqual(u.parseTime(''), null, '空串必须返回 null')
+  assert.strictEqual(u.parseTime('   '), null, '纯空白必须返回 null（trim 后为空）')
+  assert.strictEqual(u.parseTime('abc'), null, '非日期文本必须返回 null')
+})
+
+check('PlanR parseTime: 字符串数字与数字的分支差异', () => {
+  const u = Utils
+  // 数字 0 是合法时间戳（1970 纪元）；但纯数字串走的是 /^-?\d+(\.\d+)?$/ 分支
+  assert.strictEqual(uc(u.parseTime(0)), '1970-01-01T00:00:00.000Z', '数字 0 必须解析为纪元（不得被守卫短路）')
+  assert.strictEqual(u.parseTime(123), null, '三位数字既非时间戳区间也非日期 ⇒ null')
+  assert.strictEqual(uc(u.parseTime('  2026-08-01  ')), '2026-08-01T00:00:00.000Z', '首尾空白必须被 trim 后仍能解析（trim 分支）')
+})
+
+check('PlanR parseTime: 布尔/对象等脏输入必须安全返回 null 不抛', () => {
+  const u = Utils
+  assert.strictEqual(u.parseTime(true), null, '布尔必须返回 null')
+  assert.strictEqual(u.parseTime({}), null, '对象必须返回 null（不得抛）')
+  assert.strictEqual(u.parseTime([]), null, '空数组必须返回 null')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
