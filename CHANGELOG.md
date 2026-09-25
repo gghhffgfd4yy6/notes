@@ -167,3 +167,9 @@
  **口径定义（已固化进 `.local/harness/census.py` 的文档字符串，生效条目中经逐一 grep 确认无禁用来源）**：每段只与该段**自己的、最终版**产物求交；**排除** ① 跨段文件（Mutant ID 是按文件编号的计数器，`utils`×`formatter` 的 Survived id 交集就有 62 个 ⇒ 混算会把 A 段击杀记到 B 段头上）；② `*-before.tsv`（返工前基线，非战果）；③ `fix1-scratch/*-after.tsv`（返工中间产物，其 `replay-utils-after.tsv` 的 399 含 **23 个被返工者自己撤回的假击杀**，诚实值是 `*-after-final` 的 376）。
  **本轮同时修正了一处路径归属错误**：我第一版把 `.local/tmp/http-all.out.tsv`、`.local/tmp/loop-all.out.tsv` 等**真实产物**当作「临时文件」排除，导致 http/loop/network 三段归零（合计误降为 1977）。经 `stat` 确认这些文件存在且内容完整（http 17、loop 47、storage 63 条 KILLED）⇒ 已改回采纳。**教训：排除来源要按「是否真实产物」判断，不能按目录名（`tmp/` 下也有正式结果）。**
  **可复算性**：连跑两次结果一致（2098/3888）。逐段数字：utils 421/828、message-store 224/557、sendnotify 285/445、rules 152/296、app 353/364、formatter 110/197、status 104/117、storage 63/85、v3-entry 81/86、qinglong-push 79/116、failure-policy 71/216、loop 47/64、check-deps 40/66、pusher 38/55、http 17/36、network 7/62、agents 6/78、filter 0/220（本机不可判，单独说明）。
+- **量化「测试专用导出」杠杆的实际价值（本轮结论：与我先前的建议不符，据实更正）**：
+ ① **`utils` 段：教训修正式结论——407 个剩余靶子里只有 1 个所在函数取不到** ⇒ 该段**不存在导出杠杆**；剩余全部是等价/不可观测（此前四批探针 80 个变异体仅 1 个 KILLED 已印证）。**我先前反复建议的「加导出可解锁 utils 内部函数」是错的**：查证发现 `_htmlTagSpans`/`_parseDateTimeNoTz`/`_parseFallback`/`parseTime`/`_parseIsoZ`/`_stripEventAttrs`/`_protectAttrPairs`/`hasValidId`/`filterHash`/`truncateUtf16` **早已能从 `createUtils(...)` 取到**（该工厂暴露 50 个成员）。
+ ② **`message-store`：317/333 位于模块表面取不到的函数**（`saveBatch` 59、`getFilePath` 29、`_trimCacheByBytes` 24…）⇒ 该段**确实有导出杠杆**。
+ ③ **`sendnotify`：136/161 取不到**（`cleanSurrogates` 35、`streamRequest` 21、`findDestEnd` 21…）⇒ 同样有杠杆。
+ **因此修正后的建议**：若要做测试专用导出，收益集中在 `message-store`（最多 317）与 `sendnotify`（最多 136），**不是 `utils`**；且必须注意其中相当一部分同时属于「等价/不可观测」（如 `getFilePath` 的 `<=`→`<` 已证等价、`cleanSurrogates` 的守卫被 `String()` 吸收），**实际可解锁数低于这两个上界**，需先探针估算再投入。
+ **方法坑（本轮踩到并修正）**：函数归属的正则把 `if`/`while`/`for` 等**控制关键字**当成了函数名，导致 `utils` 的「不可达」被虚报为 324（真值 1）。修正方式是排除关键字白名单；**该修正同时把结论从「utils 有杠杆」翻转为「utils 无杠杆」**。
