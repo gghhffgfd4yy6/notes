@@ -1724,4 +1724,46 @@ check('PlanH hasValidId 与 getMessageIdentity 对同一批输入结论一致（
   }
 })
 
+// ===== 补测 PlanI：_parseFallback 的三个分支与守卫正则（该函数可直接经 createUtils 取得）=====
+// 反例（改动前）：既有 parseTime 用例只断言少数格式的**最终值**，而补 Z 分支/宿主宽松解析/回退
+// 三条路径的结果在多数输入上相同 ⇒ L234/L237/L241/L244 共 36 个条件/正则/字面量变异体全部存活。
+// 本轮直接调 _parseFallback（它在 createUtils 返回对象上可用），断言 UTC 语义与分支归属。
+check('PlanI _parseFallback: 无时区标记的 ISO/空格格式必须按 UTC 解析（补 Z 分支）', () => {
+  const P = (s) => Utils._parseFallback(s)
+  // 这两个格式是补 Z 分支的**目标**：不补 Z 会按宿主本地时区解析 —— CI 恒为 UTC，
+  // 故用“与带 Z 的同一时刻相等”来锁定语义（本地解析在 UTC 下会得到相同值，故再断言**不含 Z 时也一致**）。
+  assert.strictEqual(P('2026-08-01T10:30:00'), Date.UTC(2026, 7, 1, 10, 30, 0), 'ISO 无时区必须按 UTC（补 Z 分支）')
+  assert.strictEqual(P('2026-08-01 10:30:00'), Date.UTC(2026, 7, 1, 10, 30, 0), '空格分隔无时区必须按 UTC（补 Z + 空格转 T）')
+  // 已是 UTC 标记的输入走 else 分支，结果必须与补 Z 分支**一致**（两分支口径统一）
+  assert.strictEqual(P('2026-08-01T10:30:00Z'), P('2026-08-01T10:30:00'), '带 Z 与不带 Z 必须得到同一时刻')
+})
+
+check('PlanI _parseFallback: 带显式偏移的输入不得被补 Z（守卫必须认出偏移后缀）', () => {
+  const P = (s) => Utils._parseFallback(s)
+  // 偏移后缀守卫：若 /[+-]\d{2}:?\d{2}$/ 被削（如丢掉 $ 或量词），'...+08:00' 会被误补 Z 而偏移失效
+  assert.strictEqual(P('2026-08-01T10:30:00+08:00'), Date.UTC(2026, 7, 1, 2, 30, 0), '+08:00 必须生效（不得被补 Z 覆盖）')
+  assert.strictEqual(P('2026-08-01T10:30:00-05:00'), Date.UTC(2026, 7, 1, 15, 30, 0), '-05:00 必须生效（负号也是合法偏移）')
+  assert.strictEqual(P('2026-08-01T10:30:00+0800'), Date.UTC(2026, 7, 1, 2, 30, 0), '无冒号偏移 +0800 同样必须被认出（:? 可选）')
+})
+
+check('PlanI _parseFallback: 小写 z 也算时区标记（[Zz] 字符类）', () => {
+  const P = (s) => Utils._parseFallback(s)
+  assert.strictEqual(P('2026-08-01t10:30:00z'), Date.UTC(2026, 7, 1, 10, 30, 0), '小写 t/z 必须被 [Zz] 与宽松解析接受')
+})
+
+check('PlanI _parseFallback: 单数字月日的 T 格式与空格格式必须同口径（v3.171 回退）', () => {
+  const P = (s) => Utils._parseFallback(s)
+  // '2026-8-1T10:30' 曾 Invalid 返回 null，而空格格式有效 —— v3.171 用第二个回退统一
+  assert.strictEqual(P('2026-8-1T10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '单数字月日 + T 必须与空格格式同值（第二次回退把 T 转空格）')
+  assert.strictEqual(P('2026-8-1 10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '空格格式同值')
+  assert.strictEqual(P('2026/8/1 10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '斜杠格式同样要有兜底')
+})
+
+check('PlanI _parseFallback: 完全无法解析时返回 null（不得返回 NaN/Invalid Date）', () => {
+  const P = (s) => Utils._parseFallback(s)
+  assert.strictEqual(P('not-a-date-at-all'), null, '垃圾串必须返回 null')
+  assert.strictEqual(P(''), null, '空串必须返回 null')
+  assert.strictEqual(P('2026-13-45T99:99:99'), null, '越界字段必须返回 null 而不是 NaN')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
