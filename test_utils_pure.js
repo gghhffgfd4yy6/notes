@@ -1766,4 +1766,68 @@ check('PlanI _parseFallback: 完全无法解析时返回 null（不得返回 NaN
   assert.strictEqual(P('2026-13-45T99:99:99'), null, '越界字段必须返回 null 而不是 NaN')
 })
 
+// ===== 补测 PlanJ：_attrSegAt / _protectAttrPairs（安全清洗链的「属性对定位与保护」）=====
+// 反例（改动前）：这两个函数可直接经 createUtils 取得，但既有用例只经 sanitizeDecodedHtml 间接覆盖，
+// 其**返回值形状**（name/segStart/closeEnd）与「保护/不保护」的分类从未被直接断言 ⇒ 28 个靶子存活。
+// 这两处是安全路径（SYSTEM_CONTRACT「推送」条：事件属性与危险 URL 的剥离必须在解码之后，
+// 且伪属性对不得占位真实 on* 属性），故断言按注释里记载的真实攻击载荷写。
+check('PlanJ _attrSegAt: 名称/段起点/闭合位置三字段必须精确', () => {
+  const u = Utils
+  // 调用约定（照 _protectAttrPairs 内部）：正则 /=\s*(["'])/gi 的 match，index 指向 '='，lastStart 指向值首字符
+  const html = '<a href="x">'
+  const re = /=\s*(["'])/gi
+  const m = re.exec(html)
+  assert.strictEqual(m.index, 7, '前置：等号在 index 7')
+  const seg = u._attrSegAt(html, m, re.lastIndex)
+  assert.strictEqual(seg.name, 'href', 'name 必须是等号左侧的属性名')
+  assert.strictEqual(html.slice(seg.segStart, seg.closeEnd), 'href="x"', 'segStart..closeEnd 必须恰好覆盖属性对（含闭合引号）')
+  assert.strictEqual(seg.closeEnd, html.indexOf('"', re.lastIndex) + 1, 'closeEnd 必须紧贴闭合引号之后')
+})
+
+check('PlanJ _attrSegAt: 无闭合引号必须返回 null（不得给出半截段）', () => {
+  const html = '<a href="x'
+  const re = /=\s*(["'])/gi
+  const m = re.exec(html)
+  assert.strictEqual(Utils._attrSegAt(html, m, re.lastIndex), null, '未闭合引号必须返回 null（调用方据此原样保留余下文本）')
+})
+
+check('PlanJ _attrSegAt: 属性名前的空白/分隔符不得进入段（runEnd 回退语义）', () => {
+  const html = '<a   data-x ="y">'
+  const re = /=\s*(["'])/gi
+  const m = re.exec(html)
+  const seg = Utils._attrSegAt(html, m, re.lastIndex)
+  assert.strictEqual(seg.name, 'data-x', '名称必须只含 [\\w:.-] 连续段（含连字符）')
+  assert.strictEqual(html[seg.segStart], 'd', '段起点必须落在名称首字符，不得含前置空白')
+  assert.strictEqual(html.slice(seg.segStart, seg.closeEnd), 'data-x ="y"', '段必须从名称首字符起到闭合引号止')
+})
+
+check('PlanJ _protectAttrPairs: 合法属性对被占位、on* 事件属性必须留在明文里', () => {
+  const u = Utils
+  const r = u._protectAttrPairs('<img src="a.png" onerror="alert(1)">')
+  // 返回 { html, attrStore }：普通属性对抽进 attrStore，html 里留 \u0001N\u0001 占位
+  assert.strictEqual(Array.isArray(r.attrStore), true, 'attrStore 必须是数组（存放被保护的属性对原文）')
+  assert.deepStrictEqual(r.attrStore, ['src="a.png"'], '普通属性对必须被整体保护进 attrStore（逐字）')
+  assert.strictEqual(r.html.includes('src="a.png"'), false, '被保护的属性对不得留在 html 明文里')
+  const SOH = String.fromCharCode(1) // 占位符定界符（避免在正则字面量里写控制字符，standard no-control-regex）
+  assert.strictEqual(r.html.includes(SOH + '0' + SOH), true, 'html 里必须留下 0 号占位符（形如 SOH+N+SOH）')
+  assert.strictEqual(r.html.includes('onerror="alert(1)"'), true, 'on* 属性必须**留在明文**（留给 _stripEventAttrs 删除）——被一并保护即清洗失效')
+})
+
+check('PlanJ _protectAttrPairs: 纯文本里的 name="…" 不得被当成标签内属性', () => {
+  const u = Utils
+  // P1-01 记载的真实缺口：未配对的 '<' 曾让区间延伸到串尾，把后方纯文本的属性判成标签内
+  const r = u._protectAttrPairs('1 < 2 name="fake" onerror=x')
+  assert.strictEqual(r.attrStore.length, 0, '文本区的 name="fake" 不得被保护（旧实现会把区间延伸到串尾）')
+  assert.strictEqual(r.html, '1 < 2 name="fake" onerror=x', '纯文本必须原样返回，on* 亦不得被占位')
+})
+
+check('PlanJ _protectAttrPairs: 伪注释/端标签前缀的杂散引号不得制造可保护段', () => {
+  const u = Utils
+  // REV-P2 发现 A 的真实载荷：前缀内的 ' 曾被记进 valueQuotes，回扫出伪属性对，把真 onerror 藏进占位符
+  const payload = "</x='><img src=x onerror=alert(1)>'"
+  const r = u._protectAttrPairs(payload)
+  assert.strictEqual(r.html.includes('onerror=alert(1)'), true,
+    '伪注释前缀不得让段内真实 onerror 被占位（该载荷是已修复的安全缺口，占位即回归）')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
