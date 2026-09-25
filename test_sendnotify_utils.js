@@ -596,5 +596,63 @@ const cfg = slim.push_config
     }
   }
 
+  // ===== 补测 PlanD：truncateBytes（经「企业微信」通道的 4096 字节截断观测）=====
+  // 反例（改动前）：truncateBytes 未导出，其 13 个靶子一直被登记为「不可达」——**该判断是错的**：
+  // 它经 qywxBotNotify 的 content 调用点可达，而企微通道已被本套件驱动（QYWX_KEY + got 替身）。
+  // 做法：把 got.stream.post 换成「记账即刻抛错」的最小 EventEmitter 探针捕获请求体（真实 got 带 stream ⇒ 通道走 streamRequest，不看 got.post），零 IO；再断言 markdown.content 的**字节级**形态。
+  {
+    const gotMod = require('got')
+    const captured = []
+    const saved = {}
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    // 真实 got 带 stream ⇒ 通道走 streamRequest（不看 got.post）。故替身必须装在 got.stream.post 上，
+    // 返回一个最小 EventEmitter：立刻 error，既捕获请求体、又保证零 IO 且不阻塞。
+    const { EventEmitter } = require('node:events')
+    const origStreamPost = gotMod.stream && gotMod.stream.post
+    gotMod.stream = gotMod.stream || {}
+    gotMod.stream.post = (url, opts) => {
+      captured.push({ url: String(url), body: opts && opts.json })
+      const em = new EventEmitter()
+      em.destroy = () => {}
+      setImmediate(() => em.emit('error', new Error('qywx-probe-no-io')))
+      return em
+    }
+    try {
+      // 只配企微通道，避免其它通道参与
+      clearCfg()
+      cfg.QYWX_KEY = 'probe-qywx-key'
+      // ① 短正文（中文 3 字节/字）：不得被截断，且必须原样出现在 content 里
+      captured.length = 0
+      await slim.sendNotify('短标题', '中文正文').catch(() => {})
+      assert.strictEqual(captured.length, 1, '只配企微时必须恰好发出一次请求（探针零 IO）')
+      assert.strictEqual(captured[0].body.msgtype, 'markdown', '企微必须走 markdown 形态')
+      assert.strictEqual(captured[0].body.markdown.content, '短标题\n\n中文正文', '短正文必须原样，不得被截断（≤4096 分支）')
+      // ② 超长正文（中文 4000 字 = 12000 字节 > 4096）：必须按**字节**截断到 ≤4096 且是合法 UTF-8
+      captured.length = 0
+      const longBody = '中'.repeat(4000)
+      await slim.sendNotify('T', longBody).catch(() => {})
+      const content = captured[0].body.markdown.content
+      const bytes = Buffer.byteLength(content, 'utf8')
+      assert.ok(bytes <= 4096, `超长正文必须截到 ≤4096 字节（实际 ${bytes}）——按「字符」或「不截断」的实现会在此变红`)
+      assert.ok(bytes > 3900, `截断必须尽量用满预算（实际 ${bytes}）——提前退出/预算算错会在此变红`)
+      assert.strictEqual(content, Buffer.from(content, 'utf8').toString('utf8'), '截断结果必须是合法 UTF-8（不得截出半个多字节字符）')
+      assert.strictEqual(/\uFFFD/.test(content), false, '不得出现替换字符（截在多字节字符中间会留下 U+FFFD）')
+      // ③ 代理对：末尾若正好落在 emoji 中间，必须整体退位（保留完整字符或彻底去掉，不得留孤立代理）
+      captured.length = 0
+      const emojiTail = 'a'.repeat(4090) + '\u{1F600}\u{1F600}'
+      await slim.sendNotify('T', emojiTail).catch(() => {})
+      const c3 = captured[0].body.markdown.content
+      assert.strictEqual(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(c3), false,
+        '截断不得留下孤立代理（代理对必须整体保留或整体丢弃）')
+      assert.ok(Buffer.byteLength(c3, 'utf8') <= 4096, '代理对场景同样不得超预算')
+      console.log('✅ PlanD truncateBytes：经企微通道观测字节级截断（短正文原样 / 超长 ≤4096 且合法 UTF-8 / 代理对不孤立）')
+    } finally {
+      if (origStreamPost) gotMod.stream.post = origStreamPost
+      clearCfg()
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
   console.log('test_sendnotify_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })
