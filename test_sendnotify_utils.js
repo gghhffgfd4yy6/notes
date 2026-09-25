@@ -421,5 +421,180 @@ const cfg = slim.push_config
     }
   }
 
+  // ===== sendNotify 包装函数：无通道配置必须响亮失败（错误码/消息逐字）=====
+  // 契约（SYSTEM_CONTRACT.md「推送」条）：无通道配置不得静默成功（否则主流程以为推送完成并写缓存）。
+  {
+    const saved = {}
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    try {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      // 错误码字面量与消息字面量都必须逐字（StringLiteral→"" 会在这里变红）
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文'),
+        (e) => {
+          assert.strictEqual(e.code, 'NO_CHANNEL_CONFIG', "error.code 必须逐字为 'NO_CHANNEL_CONFIG'")
+          assert.strictEqual(
+            e.message,
+            '未配置任何推送通道（Push+/Server酱/Bark/企业微信/wxpusher/息知/PushDeer/PushMe/Telegram）',
+            '错误消息必须逐字一致'
+          )
+          return true
+        }
+      )
+      // TG 是「token && user id」双字段：只配 user id 时不得算已配置
+      // （`&&` 被换成 `||` 会让 telegram 假成立：tgNotify 早退成 resolve ⇒ 不抛错）
+      cfg.TG_USER_ID = 'uid-only'
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文'),
+        (e) => e.code === 'NO_CHANNEL_CONFIG',
+        'TG 只有 user id 时必须按未配置处理（`&&` 不得放宽成 `||`）'
+      )
+      console.log('✅ sendNotify：无通道/只配 TG user id 时抛 NO_CHANNEL_CONFIG（码与消息逐字，零网络）')
+    } finally {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== sendNotify 包装函数：一言开关（HITOKOTO）逐格 =====
+  // 分支只在 hitokotoEnabled 为真时调用模块内 one()，而 one() 的唯一出口是 got.get('https://v1.hitokoto.cn/').
+  // 本轮禁止真实网络请求，故用仓库既有 got 替身口径（源码 L345 注释 / test_notify.js 已有先例）把共享 got 的
+  // get 换成「记账并即刻抛错」的探针：不建连、零 IO，却能逐字回答「这一格是否真的去取一言」。
+  // 判定口径（源码注释 v3.273）：仅显式 true 或字符串（忽略大小写）'true' 开启；false/0/'0'/undefined/1/'true ' 关闭。
+  {
+    const gotMod = require('got')
+    const origGet = gotMod.get
+    const seen = []
+    const saved = {}
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    const hits = () => seen.filter(u => u === 'https://v1.hitokoto.cn/').length
+    gotMod.get = (url) => { seen.push(String(url)); throw new Error('hitokoto-probe-no-io') }
+    try {
+      const cases = [
+        [true, true, 'HITOKOTO===true 必须取一言（===true 被改成 false / !== / 整体换成 false 会在此变红）'],
+        ['TRUE', true, "字符串 'TRUE' 必须取一言（大小写不敏感 + 'true' 字面量逐字 + typeof 判定）"],
+        ['True', true, "字符串 'True' 必须取一言"],
+        ['true', true, "字符串 'true' 必须取一言"],
+        ['true ', false, "带尾随空白的 'true ' 不得取一言（判定不做 trim）"],
+        ['false', false, "字符串 'false' 不得取一言"],
+        [false, false, '布尔 false 不得取一言'],
+        [0, false, '数字 0 不得取一言'],
+        ['0', false, "字符串 '0' 不得取一言"],
+        [undefined, false, 'undefined 不得取一言'],
+        [1, false, '数字 1 不得取一言（非 true、非字符串）']
+      ]
+      for (const [value, shouldFetch, why] of cases) {
+        clearCfg()
+        cfg.WX_XIZHI_KEY = '::::' // 唯一配置通道：非法 URL ⇒ got 在 new URL() 阶段抛错（不建连）
+        cfg.HITOKOTO = value
+        seen.length = 0
+        await slim.sendNotify('测试文本', '测试正文').catch(() => {})
+        assert.strictEqual(hits(), shouldFetch ? 1 : 0, why)
+      }
+      console.log('✅ sendNotify：一言开关逐格（true/TRUE/True/true → 取一次；true /false/0/0/undefined/1 → 不取）')
+    } finally {
+      gotMod.get = origGet
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== sendNotify 包装函数：channelTasks 逐通道取用与失败归因 =====
+  // 源码 channelTasks 每项为 [configuredFlags[i], '通道名', () => xxxNotify(...)]，只有「已配置」项会被启动。
+  // 契约：部分成功即本轮成功；全部通道失败必须响亮抛 ALL_CHANNELS_FAILED 并逐通道归因。
+  // 零网络观测法（不装桩、不造网）：①通道地址配置指向非法 URL ⇒ got 在 new URL() 阶段抛错、不建连；
+  // ②pushplus/server酱/wxpusher 的地址写死，改用调用方自带 params.signal（已 abort）——源码 requestExtras
+  // 把它透传给 got，请求在建立前即被取消。逐项断言「启动前同步写入的 tracker.pending 恰好是这一项且
+  // 通道名逐字」+「failure.channel 逐字」⇒ 数组→[]、名字串→""、箭头函数→() => undefined 三类全部变红。
+  {
+    const saved = {}
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    try {
+      const channelCases = []
+      if (typeof AbortSignal === 'function' && typeof AbortSignal.abort === 'function') {
+        const aborted = AbortSignal.abort()
+        channelCases.push(
+          ['pushplus', { PUSH_PLUS_TOKEN: 'probe-token' }, aborted],
+          ['server酱', { PUSH_KEY: 'probe-key' }, aborted],
+          ['wxpusher', { WX_pusher_channels: '[{"appToken":"AT_probe","topicIds":[1]}]' }, aborted]
+        )
+      }
+      channelCases.push(
+        ['息知', { WX_XIZHI_KEY: '::::' }, null],
+        ['pushdeer', { DEER_KEY: 'deer-key', DEER_URL: '::::' }, null],
+        ['pushme', { PUSHME_KEY: 'pushme-key', PUSHME_URL: '::::' }, null],
+        ['telegram', { TG_BOT_TOKEN: 'bot-token', TG_USER_ID: 'uid', TG_API_HOST: '::::' }, null]
+      )
+      for (const [name, conf, signal] of channelCases) {
+        clearCfg()
+        Object.assign(cfg, conf)
+        const tracker = {}
+        const params = signal ? { inFlightTracker: tracker, signal } : { inFlightTracker: tracker }
+        const pending = slim.sendNotify('测试文本', '测试正文', params)
+        // 同步观测：pending 在启动任务前写入 ⇒ 逐字证明该项存在、名字正确、且被判为「已启用」
+        assert.deepStrictEqual(tracker.pending, [name], `${name}：唯一配置的通道必须被取用且通道名逐字（数组→[] / 名字串→"" 会在此变红）`)
+        await assert.rejects(() => pending, (e) => {
+          assert.strictEqual(e.code, 'ALL_CHANNELS_FAILED', `${name}：全部通道失败必须响亮抛 ALL_CHANNELS_FAILED（箭头函数→undefined 会假成功、不抛）`)
+          assert.deepStrictEqual(e.successfulChannels, [], `${name}：不得出现虚假成功通道`)
+          assert.strictEqual(e.failures.length, 1, `${name}：失败清单必须恰好一项`)
+          assert.strictEqual(e.failures[0].channel, name, `${name}：failure.channel 必须逐字为通道名`)
+          return true
+        })
+      }
+      console.log('✅ sendNotify：channelTasks 逐通道取用 + 失败归因（7 通道，非法 URL / 已 abort 信号，零出网）')
+    } finally {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== sendNotify 包装函数：params.inFlightTracker 契约 =====
+  // 契约：可选 params.inFlightTracker（对象）——启动任务前同步写入 pending（未结算通道名），
+  // 每通道 settle 时移除；不传时不产生任何副作用（既有调用方行为逐字不变）。观测通道固定为
+  // 「息知 + 非法 URL」（零出网）。
+  {
+    const saved = {}
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    const onlyXiZhi = () => { for (const k of Object.keys(cfg)) delete cfg[k]; cfg.WX_XIZHI_KEY = '::::' }
+    try {
+      // ① 传对象 tracker：pending 在启动任务前同步写入本次将尝试的通道
+      onlyXiZhi()
+      const tracker = {}
+      const pending = slim.sendNotify('测试文本', '测试正文', { inFlightTracker: tracker })
+      assert.deepStrictEqual(tracker.pending, ['息知'], '传 tracker 时必须写入 pending（条件整体被换成 false 会在此变红）')
+      await assert.rejects(() => pending, (e) => e.code === 'ALL_CHANNELS_FAILED')
+      // ② 不传 tracker：对调用方 params 零副作用，也不得抛错（严格模式下条件被换成 true 会抛 TypeError）
+      onlyXiZhi()
+      const params = {}
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文', params),
+        (e) => e.code === 'ALL_CHANNELS_FAILED',
+        '不传 tracker 时行为必须与既有一致'
+      )
+      assert.deepStrictEqual(Object.keys(params), [], '不传 tracker 时不得给 params 添加任何字段')
+      // ③ params 为 null：`params && …` 必须短路成「无 tracker」，而不是去读 null.inFlightTracker（`&&`→`||`）
+      onlyXiZhi()
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文', null),
+        (e) => e.code === 'ALL_CHANNELS_FAILED' && e.failures[0].channel === '息知',
+        'params=null 必须短路为「无 tracker」而不是 TypeError'
+      )
+      // ④ 非对象 tracker（函数）：typeof 校验必须把它当作「无 tracker」，不得往它上面写 .pending
+      onlyXiZhi()
+      const probeFn = function () {}
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文', { inFlightTracker: probeFn }),
+        (e) => e.code === 'ALL_CHANNELS_FAILED'
+      )
+      assert.strictEqual(probeFn.pending, undefined, 'typeof 不是 object 的 tracker 不得被当作 tracker 写入')
+      console.log('✅ sendNotify：inFlightTracker 契约（同步写入 pending / 不传零副作用 / typeof 校验）')
+    } finally {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
   console.log('test_sendnotify_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })
