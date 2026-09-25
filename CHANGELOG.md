@@ -182,3 +182,8 @@
  **验证**：单靶 replay 成功产出判定（`2 → SURVIVED`，且基线闸门通过）；6 靶/2 靶批次因单次工具时限未跑完（每靶约 2.8 分钟，套件 824 项）。
  **意义**：`filter` 的 220 个 Survived 靶子**从「不可判」变为「可判但昂贵」**（全量约 10 小时）。故权威合计里 filter 计 0 **应标注为「未测（可测但成本高）」而非「不可判」**；若后续要推进，应优先用上述本地副本抽样取证。
  **同时登记一个环境限制**：后台作业（`run_in_background: true`）在本机本次**未能写入日志/产物**（`.local/tmp/f6.out.tsv` 与 `f6b.log` 均 ENOENT），故 filter 的长时 replay 只能用「小批前台」推进（每批 ≤2 靶）。
+- **`filter` 段实测启动（该段首次获得可判定的 replay 取证）**：用上一轮建的本地跳过副本 `test_filter_local.js`（只跳过 2 条 FUSE 依赖用例、**不放宽任何断言**），filter 段恢复判定力，**实测抽样 6 个靶子：1 KILLED / 4 SURVIVED / 1 ENGINE_MISSING（无效 id，不计）**。证据落盘 `.local/targets/filter-sample/sample.tsv`。
+ - **击杀例**：`500`（`ConditionalExpression@L264:8`，即 `if (!cfg.__compiled) return this._legacyListfilter(group, cfg)` 的条件）⇒ 该段**确实有可杀靶子**，与 utils/message-store/sendnotify 的「抽样全存活」形成对照。
+ - **成本**：套件实测 **92 秒/次**（我先前估的 2.8 分钟偏高）；故每靶约 1.5–2 分钟，全量 220 靶 ≈ 6–7 小时，超出单次工具时限 ⇒ 只能**小批前台**推进（每批 ≤2 靶）。
+ - **段状态更正**：`filter` 由「**本机不可判**」改为「**可判但昂贵**（已实测 1/5 有效样本可杀）」；**权威合计里 filter 仍计 0，但须标注为「未测（可测、成本高）」**，不再标「不可判」。
+ - **环境限制（本轮再次踩到）**：后台作业（`run_in_background: true`）本次**无法写入**其日志与产物（`.local/tmp/f6*.log`/`.out.tsv` 均 ENOENT）⇒ 长时任务只能用前台小批；另注意被工具时限 kill 的 replay 会**污染 worktree**（本轮已两次还原 `wt-filter/xbk_filter.js`），跑前跑后都要 `cmp` 核对。
