@@ -784,4 +784,90 @@ check('_quotedAttrSpans：标签外/标签后的 = 与引号不得开启属性�
   assert.strictEqual(formatter.htmlToMarkdown({ content_html: "='<h1></h1>" }), "='#")
 })
 
+// ===== 追加：击杀 xbk_formatter.js planB 未覆盖簇的 Survived 变异体 =====
+
+// ---- _tagOpFor：p/div 前缀匹配（无 \b）与闭合标签白名单 ----
+check('_tagOpFor：p 前缀（<pre>）仍映射 tagOps.p（无词边界）', () => {
+  assert.strictEqual(formatter._tagOpFor('pre', false, false, { p: 'P' }), 'P')
+})
+check('_tagOpFor：非 p 前缀名不得被 p 前缀规则吞并', () => {
+  assert.strictEqual(formatter._tagOpFor('map', false, false, { p: 'P' }), null)
+})
+check('_tagOpFor：div 前缀（<divx>）映射 tagOps.div', () => {
+  assert.strictEqual(formatter._tagOpFor('divx', false, false, { div: 'D' }), 'D')
+})
+check('_tagOpFor：非 div 前缀名不得被 div 前缀规则吞并', () => {
+  assert.strictEqual(formatter._tagOpFor('xdiv', false, false, { div: 'D' }), null)
+})
+check('_tagOpFor：未登记标签名返回 null 而非 undefined', () => {
+  assert.strictEqual(formatter._tagOpFor('x', false, false, { x: undefined }), null)
+})
+check('_tagOpFor：img/tr/table 仅开标签可转换，闭合标签一律 null', () => {
+  assert.strictEqual(formatter._tagOpFor('img', true, false, { img: 'I' }), null)
+  assert.strictEqual(formatter._tagOpFor('tr', true, false, { tr: 'T' }), null)
+  assert.strictEqual(formatter._tagOpFor('table', true, false, { table: 'B' }), null)
+  assert.strictEqual(formatter._tagOpFor('img', false, false, { img: 'I' }), 'I')
+})
+
+// ---- _replaceTagged：无 > / 无闭合时剩余原样保留，开标签段完整 ----
+check('_replaceTagged：无 > 的开标签起剩余原样保留', () => {
+  assert.strictEqual(formatter._replaceTagged('<b xx', /<b/gi, (m, c) => `[${c}]`, () => 'b'), '<b xx')
+})
+check('_replaceTagged：无闭合标签时剩余原样保留（不丢字/不重复整串）', () => {
+  assert.strictEqual(formatter._replaceTagged('<b>hi</b>zz<b>lo', /<b/gi, (m, c) => `[${c}]`, () => String.raw`</b\s*>`), '[hi]zz<b>lo')
+})
+check('_replaceTagged：buildReplacement 收到完整开标签段', () => {
+  assert.strictEqual(formatter._replaceTagged('<b>hi</b>', /<b/gi, (m, c, openTag) => openTag, () => String.raw`</b\s*>`), '<b>')
+})
+
+// ---- _finalizeMd：String() 兜底与空串短路 ----
+check('_finalizeMd：非字符串输入 String() 兜底（不抛 TypeError）', () => {
+  assert.strictEqual(formatter._finalizeMd(123), '123')
+  assert.strictEqual(formatter._finalizeMd(true), 'true')
+})
+check('_finalizeMd：字面量 Stryker was here! 不得被当空串短路', () => {
+  assert.strictEqual(formatter._finalizeMd('Stryker was here!'), 'Stryker was here!')
+  assert.strictEqual(formatter._finalizeMd(''), '')
+})
+
+// ---- _markQuotedSpan：区间端点与返回值 ----
+check('_markQuotedSpan：未闭合引号标记 from 之后全部字符（含末位）', () => {
+  const inside = new Set()
+  assert.strictEqual(formatter._markQuotedSpan('a="b', '"', 2, inside), 4)
+  assert.deepStrictEqual([...inside], [3])
+})
+check('_markQuotedSpan：闭合引号标记区间并返回闭合符后一位', () => {
+  const inside = new Set()
+  assert.strictEqual(formatter._markQuotedSpan('a="b"c', '"', 2, inside), 5)
+  assert.deepStrictEqual([...inside], [3])
+})
+
+// ---- readTagName（经 htmlToMarkdown）：wordAfter 语义 ----
+check('readTagName：名字后紧跟数字视为 wordAfter，<b1> 不按已知标签转换', () => {
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<b1>x</b1>' }), 'x')
+})
+check('readTagName：标签名延伸到串尾 wordAfter 为假，<script 无闭合整段丢弃', () => {
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<script' }), '')
+})
+
+// ---- tuisong_replace：模板字符串化兜底与 {分类ID} ----
+check('tuisong_replace：模板 String() 抛错时按空模板处理', () => {
+  const bad = { toString () { throw new Error('boom') } }
+  assert.strictEqual(formatter.tuisong_replace(bad, {}), '')
+})
+check('tuisong_replace：category_id → {分类ID}（修复恒空）', () => {
+  assert.strictEqual(formatter.tuisong_replace('{分类ID}', { category_id: '99' }), '99')
+})
+
+// ---- _mdDestination：假值原样返回 + 真值包裹口径 ----
+check('_mdDestination：假值原样返回，不调用 .replace', () => {
+  assert.strictEqual(formatter._mdDestination(''), '')
+  assert.strictEqual(formatter._mdDestination(undefined), undefined)
+  assert.strictEqual(formatter._mdDestination(null), null)
+})
+check('_mdDestination：含空白用 <> 包裹，角括号编码', () => {
+  assert.strictEqual(formatter._mdDestination('https://x/a b'), '<https://x/a b>')
+  assert.strictEqual(formatter._mdDestination('https://x/a>b'), 'https://x/a%3Eb')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_formatter.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
