@@ -11074,6 +11074,38 @@ console.log('========================================\n');
     assertEqual(listfilter(makeItem({ catename: '数码', louzhuregtime: daysAgo(1) }), cfg), true, 'listfilter 分类不匹配应放行')
   })
 
+  await test('PlanF timeMatchedRule：compiled._type 非 timeMulti 必须提前返回 null（不误用时间规则）', () => {
+    // 反例（改动前）：本函数两个**提前返回守卫**从未被直接断言 ——
+    // `if (!compiled || compiled._type !== 'timeMulti') return null` 与 `if (ms === null) return null`。
+    // 前者若被删，非时间类编译产物会被当作时间规则解析；后者若被删，非法时间会落到 daysFrom 误判。
+    const timeCfg = compileRules({ pingbitime: '5' })
+    assertEqual(explainFilter(makeItem({ louzhuregtime: daysAgo(4) }), timeCfg).passed, false, '对照组：时间规则确实生效')
+    // 伪造一个 _type 不是 timeMulti 的编译产物（模拟关键词类规则被误传入）
+    const fake = { _type: 'keyword', rules: [], source: 'x' }
+    const it = makeItem({ louzhuregtime: daysAgo(400) })
+    let threw = false
+    try { explainFilter(it, fake) } catch (e) { threw = true }
+    assertEqual(threw, false, '非 timeMulti 产物必须安全返回（不得抛）')
+    // 非法时间：必须走 ms === null 提前返回，而不是被当作 0 天
+    const bad = explainFilter(makeItem({ catename: '微博线报', louzhuregtime: 'not-a-date' }), compileRules({ pingbitime: '微博线报###5' }))
+    assertEqual(bad.passed, true, '非法时间必须提前返回、保守放行（不得按 0 天误拦）')
+    assertEqual(bad.reason, null, '提前返回不得给出拦截原因')
+  })
+
+  await test('PlanF listfilter：compiled.__compiled 缺失/伪造必须回退旧路径且不抛', () => {
+    // 反例（改动前）：`if (!cfg.__compiled) return this._legacyListfilter(group, cfg)` 从未被直接断言。
+    const g = makeItem({ catename: '微博线报', louzhuregtime: daysAgo(1) })
+    assertEqual(listfilter(g, { pingbitime: '5' }), false, '未编译配置：旧路径仍须按 5 天窗口拦截')
+    assertEqual(listfilter(makeItem({ catename: '微博线报', louzhuregtime: daysAgo(30) }), { pingbitime: '5' }), true,
+      '未编译配置：窗口外须放行')
+    let threw = false
+    try {
+      listfilter(g, { pingbitime: { __compiled: 1 } })
+      listfilter(g, { pingbitime: { __compiled: 'yes' } })
+    } catch (e) { threw = true }
+    assertEqual(threw, false, '__compiled 为伪造值时不得抛（fallback 路径须容错）')
+  })
+
   // 并发隔离目录是本进程私有产物：退出前整体删除，避免 Stryker 沙箱内逐变异体累积
   // （沙箱全生命周期只建一个，百级变异体会留下百级目录）。不碰共享的 xianbaoku_cache。
   if (OWNS_CACHE_DIR) {

@@ -196,3 +196,7 @@
  - **与其它段的反差得到加强**：utils/message-store/sendnotify 六批探针 ~100 个变异体仅 1 个「已被覆盖」的 KILLED；filter 10 个样本里 **2 个真新增可杀** ⇒ **filter 是本目标剩余唯一「测试缺口真实存在且可补」的段**。
  - **成本与节奏（实测）**：套件 92s/次 ⇒ **单靶前台 ≈2 分钟可靠完成**；**2 靶即超时限**（本轮第 190 位靶点连续两次被 kill）。故维持**单靶推进**。
  - **样本量说明**：n=10 的 20% 点估计**置信区间仍很宽**，不足以推断全段 220 个；要给出可用结论需 ≥25–30 个样本。**filter 在权威合计中仍计 0**（`.local/targets/filter-sample/sample.tsv` 为证据）。
+- 补测试第三十七批 · `test_filter.js` 的 `timeMatchedRule` / `listfilter` 两个**提前返回守卫**（**本目标首次给 filter 段补测**；纯测试改动、未动生产源文件）。该段此前被登记为「本机不可判」⇒ 计 0；第 162 轮查明其 rc=1 仅来自**两条 FUSE 依赖用例**，用「本地跳过副本」（只把这两条改为立即 `return`、**不放宽任何断言**；CI 仍跑完整套件）重建绿基线后恢复判定力。**抽样取证**：n=10、2 KILLED/8 SURVIVED，两个击杀均为**既有测试未覆盖的真实缺口**。本批针对其中一处补断言：
+ ① `timeMatchedRule`：`if (!compiled || compiled._type !== 'timeMulti') return null` —— 伪造 `_type` 非 `timeMulti` 的编译产物必须**安全提前返回**（不得被当作时间规则解析、不得抛）；`if (ms === null) return null` —— 非法注册时间必须**提前返回并保守放行**（`passed===true` 且 `reason===null`，不得按 0 天误拦）；含时间规则对照组证明用例确有时间维度。
+ ② `listfilter`：`if (!cfg.__compiled) return this._legacyListfilter(group, cfg)` —— 未编译配置必须回退旧路径且**窗口语义一致**（1 天拦 / 30 天放）、`__compiled` 为伪造值（`1` / `'yes'`）时**不得抛**。
+ **验证**：主仓 `test_filter.js` 实测 **0 失败**（本地跳过副本口径）；`standard` lint exit 0；版本四方闸门 ✅；并**手工施加 id=500 变异**（`if (!cfg.__compiled)` → `if (false)`）复核，套件如期变红（该靶点确由 `FILTER-06` 与新增 PlanF 共同锁定）。
