@@ -1659,4 +1659,69 @@ check('runSingleEntry：无失败不动退出码；全失败置 1 且 retryable/
   assert.strictEqual(out.permanent.err.includes('可重试'), false, '永久失败不得被写成可重试（=== 被变异成 !== 即失败）')
 })
 
+// ===== 补测 PlanH：hasValidId 的守卫与类型分支（父代理按 instrumenter 逐 id 定位后补齐）=====
+// 反例（改动前）：既有用例只覆盖了「有/无 id 字段、空串、null 对象、继承 id」，
+// L1064 的形状守卫（undefined/null/typeof/Array）与 L1072 的 undefined/null 判定、
+// 以及 typeof 分支的布尔/对象/Symbol 等脏数据全部没被测到 ⇒ 14 个条件/逻辑/布尔变异体存活。
+check('PlanH hasValidId: undefined 与各类非对象一律无效（typeof 守卫逐项）', () => {
+  assert.strictEqual(Utils.hasValidId(undefined), false, 'undefined 必须无效（缺 undefined 分支会被 safeGet 抛/误判）')
+  assert.strictEqual(Utils.hasValidId(42), false, '数字不是对象，必须无效')
+  assert.strictEqual(Utils.hasValidId('abc'), false, '字符串不是对象，必须无效')
+  assert.strictEqual(Utils.hasValidId(true), false, '布尔不是对象，必须无效')
+  assert.strictEqual(Utils.hasValidId(Symbol('s')), false, 'Symbol 不是对象，必须无效')
+  assert.strictEqual(Utils.hasValidId(() => {}), false, '函数不是对象（typeof function），必须无效')
+})
+
+check('PlanH hasValidId: 数组一律无效，即便带自定义 id 属性', () => {
+  assert.strictEqual(Utils.hasValidId([]), false, '空数组必须无效')
+  assert.strictEqual(Utils.hasValidId([1, 2]), false, '非空数组必须无效')
+  const arr = []
+  arr.id = 123 // 带自定义 id 属性的数组仍不算有效条目（与 isValidItem 同口径）
+  assert.strictEqual(Utils.hasValidId(arr), false, '带 id 属性的数组必须无效（Array.isArray 守卫）')
+})
+
+check('PlanH hasValidId: id 为 undefined/null 无效，但其它的假值（0/空格串）另有口径', () => {
+  assert.strictEqual(Utils.hasValidId({ id: undefined }), false, '自有但值为 undefined ⇒ 无效')
+  assert.strictEqual(Utils.hasValidId({ id: null }), false, '自有但值为 null ⇒ 无效')
+  assert.strictEqual(Utils.hasValidId({ id: 0 }), true, '数字 0 是有效 id（Number.isFinite(0) 为真）')
+  assert.strictEqual(Utils.hasValidId({ id: '   ' }), false, '纯空白串 trim 后为空 ⇒ 无效')
+  assert.strictEqual(Utils.hasValidId({ id: ' a ' }), true, '含内容的串 trim 后非空 ⇒ 有效')
+})
+
+check('PlanH hasValidId: 数字 id 只认有限值（NaN/Infinity 无效）', () => {
+  assert.strictEqual(Utils.hasValidId({ id: NaN }), false, 'NaN 不是有限数 ⇒ 无效')
+  assert.strictEqual(Utils.hasValidId({ id: Infinity }), false, 'Infinity 不是有限数 ⇒ 无效')
+  assert.strictEqual(Utils.hasValidId({ id: -Infinity }), false, '-Infinity 不是有限数 ⇒ 无效')
+  assert.strictEqual(Utils.hasValidId({ id: -1 }), true, '负整数仍是有限数 ⇒ 有效（语义依数据源）')
+  assert.strictEqual(Utils.hasValidId({ id: 1.5 }), true, '有限小数 ⇒ 有效')
+})
+
+check('PlanH hasValidId: 布尔/对象/数组/Symbol 等脏数据 id 一律无效', () => {
+  assert.strictEqual(Utils.hasValidId({ id: true }), false, '布尔 id 必须无效（typeof 分支的兜底 false）')
+  assert.strictEqual(Utils.hasValidId({ id: false }), false, '布尔 id 必须无效')
+  assert.strictEqual(Utils.hasValidId({ id: {} }), false, '对象 id 必须无效')
+  assert.strictEqual(Utils.hasValidId({ id: [] }), false, '数组 id 必须无效')
+  assert.strictEqual(Utils.hasValidId({ id: Symbol('x') }), false, 'Symbol id 必须无效')
+})
+
+check('PlanH hasValidId: 异常 id getter 必须按无效处理且不抛穿', () => {
+  const throwing = {}
+  Object.defineProperty(throwing, 'id', { get () { throw new Error('boom') }, enumerable: true, configurable: true })
+  let threw = false
+  let ret
+  try { ret = Utils.hasValidId(throwing) } catch (e) { threw = true }
+  assert.strictEqual(threw, false, 'getter 抛错不得冒泡（safeGet 必须兜住）')
+  assert.strictEqual(ret, false, '异常 getter 的 id 按无效处理')
+})
+
+check('PlanH hasValidId 与 getMessageIdentity 对同一批输入结论一致（防两入口分裂）', () => {
+  const cases = [undefined, null, 42, 'abc', true, [], { }, { id: '' }, { id: '   ' }, { id: 0 }, { id: NaN }, { id: 'abc' }, { id: 123 }]
+  for (const m of cases) {
+    const byId = Utils.hasValidId(m)
+    const ident = Utils.getMessageIdentity(m)
+    const byIdentity = ident.valid && ident.kind === 'id'
+    assert.strictEqual(byId, byIdentity, `同一输入两入口必须一致：${JSON.stringify(m)} ⇒ hasValidId=${byId} / identity.kind=${ident.kind}`)
+  }
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
