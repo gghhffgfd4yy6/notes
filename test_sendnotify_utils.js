@@ -654,5 +654,68 @@ const cfg = slim.push_config
     }
   }
 
+  // ===== 补测 PlanF：normalizeFailure 与失败聚合（经 sendNotify 的 failures 观测）=====
+  // 反例（改动前）：normalizeFailure 20 个靶子被登记为「不可达」——**该判断同样是错的**：
+  // 它在 channelResults 里被调用（L1612），而 sendNotify 在**全部通道失败**时把 failures 一路抛出。
+  // 做法：got.stream.post 替身让通道 reject 一个**带 code/statusCode/providerCode 的错误**，
+  // 零 IO 捕获 sendNotify 抛出的 error.failures，逐字段断言归一化结果。
+  {
+    const gotMod = require('got')
+    const { EventEmitter } = require('node:events')
+    const origStreamPost = gotMod.stream && gotMod.stream.post
+    const saved = {}
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    // 让通道以「自定义错误」失败：可注入 code/statusCode/providerCode
+    let mkErr = () => { const e = new Error('boom'); e.code = 'E_PROBE'; e.statusCode = 500; e.providerCode = 'PROV'; return e }
+    gotMod.stream = gotMod.stream || {}
+    gotMod.stream.post = () => {
+      const em = new EventEmitter()
+      em.destroy = () => {}
+      setImmediate(() => em.emit('error', mkErr()))
+      return em
+    }
+    try {
+      clearCfg()
+      cfg.QYWX_KEY = 'probe-key'
+      // ① channel 字段必须被归一化进来，且三个可选字段原样透传（'undefined' 判定被改坏会丢字段）
+      let err = null
+      try { await slim.sendNotify('T', 'D') } catch (e) { err = e }
+      assert.strictEqual(err && err.message, '所有推送通道失败: boom', '全部失败时的聚合消息必须逐字')
+      // 注意：failures 的元素是**归一化后的 Error 实例**（不是普通对象）——deepStrictEqual 对普通对象会因原型不同而红。
+      const f0 = err.failures[0]
+      assert.ok(f0 instanceof Error, '归一化结果必须是 Error 实例（不是普通对象字面量）')
+      assert.strictEqual(f0.message, 'boom', 'message 必须来自 safeErr 摘要')
+      assert.strictEqual(f0.code, 'E_PROBE', 'code 必须原样透传')
+      assert.strictEqual(f0.statusCode, 500, 'statusCode 必须原样透传')
+      assert.strictEqual(f0.providerCode, 'PROV', 'providerCode 必须原样透传')
+      assert.strictEqual(f0.channel, '企业微信', 'channel 必须回填')
+      // ② 错误对象**缺**可选字段时，不得凭空造出这些键（`!== undefined` 判定被放宽成恒真会在此变红）
+      mkErr = () => { const e = new Error('plain'); return e }
+      err = null
+      try { await slim.sendNotify('T', 'D') } catch (e) { err = e }
+      const b0 = err.failures[0]
+      assert.strictEqual(b0.channel, '企业微信', 'channel 必须回填')
+      assert.strictEqual('code' in b0, false, '无 code 时不得凭空造出 code 键（!== undefined 判定被放宽成恒真会在此变红）')
+      assert.strictEqual('statusCode' in b0, false, '无 statusCode 时不得造键')
+      assert.strictEqual('providerCode' in b0, false, '无 providerCode 时不得造键')
+      // ③ 非对象 reason（字符串抛出）必须退化为 `${channel} 发送失败` 或原消息，且不得抛
+      mkErr = () => 'plain-string-reason'
+      err = null
+      try { await slim.sendNotify('T', 'D') } catch (e) { err = e }
+      // 实测：字符串 reason 走 `reason && typeof reason === 'object'` 的假分支 ⇒ 只回填 channel（不造 code/statusCode 等键）
+      const c0 = err.failures[0]
+      assert.strictEqual(c0.channel, '企业微信', 'channel 必须回填')
+      assert.strictEqual('code' in c0, false, '字符串 reason 不得进入字段透传分支')
+      assert.strictEqual('providerCode' in c0, false, '字符串 reason 不得进入字段透传分支')
+      assert.strictEqual(err.message, '所有推送通道失败: plain-string-reason', '聚合消息必须原样保留字符串 reason 的文本')
+      console.log('✅ PlanF normalizeFailure：code/statusCode/providerCode 透传、缺失不造键、非对象 reason 退化')
+    } finally {
+      if (origStreamPost) gotMod.stream.post = origStreamPost
+      clearCfg()
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
   console.log('test_sendnotify_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })
