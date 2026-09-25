@@ -2025,4 +2025,46 @@ check('PlanN _htmlTagSpans: 标签名内引号/等号是名字字符；未闭合
   assert.strictEqual(nSpans('').n, 0, '空串零区间')
 })
 
+// ===== 补测 PlanO：日期解析家族（_parseDateTimeNoTz / parseTime / _parseIsoZ / _parseSlashDate / _parseNumericTime）=====
+// 五者均可直接经 createUtils 取得，合计 90 个存活靶子；既有用例只断言少数格式的**最终值**。
+const uc = (t) => t === null ? null : new Date(t).toISOString()
+
+check('PlanO _parseDateTimeNoTz: 无时区标记的日期时间必须按 UTC 解析', () => {
+  const u = Utils
+  assert.strictEqual(uc(u._parseDateTimeNoTz('2026-08-01 10:30')), '2026-08-01T10:30:00.000Z', '空格分隔须按 UTC')
+  assert.strictEqual(uc(u._parseDateTimeNoTz('2026-08-01T10:30')), '2026-08-01T10:30:00.000Z', 'T 分隔须按 UTC')
+  assert.strictEqual(uc(u._parseDateTimeNoTz('2026/08/01 10:30')), '2026-08-01T10:30:00.000Z', '斜杠分隔须按 UTC')
+  assert.strictEqual(uc(u._parseDateTimeNoTz('2026-8-1 10:30')), '2026-08-01T10:30:00.000Z', '单数字月日同样须按 UTC')
+  assert.strictEqual(u._parseDateTimeNoTz('2026-13-45 99:99'), null, '越界字段必须返回 null')
+})
+
+check('PlanO parseTime: 纯日期 / 时间戳 / 八位数字三条分支', () => {
+  const u = Utils
+  assert.strictEqual(uc(u.parseTime('2026-08-01')), '2026-08-01T00:00:00.000Z', '纯日期按 UTC 日粒度')
+  assert.strictEqual(uc(u.parseTime('2026/08/01')), '2026-08-01T00:00:00.000Z', '斜杠纯日期同口径')
+  assert.strictEqual(uc(u.parseTime('20260801')), '2026-08-01T00:00:00.000Z', '八位数字优先按 YYYYMMDD')
+  assert.strictEqual(uc(u.parseTime('1700000000')), '2023-11-14T22:13:20.000Z', '10 位秒级时间戳（×1000）')
+  assert.strictEqual(uc(u.parseTime('1700000000000')), '2023-11-14T22:13:20.000Z', '13 位毫秒级时间戳（原值）')
+  assert.strictEqual(uc(u.parseTime('0')), '1970-01-01T00:00:00.000Z', '时间戳 0 不得被短路（= 1970 纪元）')
+  assert.strictEqual(u.parseTime('not-a-date-at-all'), null, '垃圾串必须返回 null')
+})
+
+check('PlanO _parseIsoZ: 带 Z 的 ISO 必须原样解析（不额外补 Z）', () => {
+  const u = Utils
+  assert.strictEqual(uc(u._parseIsoZ('2026-08-01T10:30:00Z')), '2026-08-01T10:30:00.000Z', '带 Z 的 ISO 按 UTC')
+  assert.strictEqual(uc(u._parseIsoZ('2026-08-01T10:30:00.123Z')), '2026-08-01T10:30:00.123Z', '毫秒必须保留')
+  assert.strictEqual(uc(u._parseIsoZ('2026-08-01T10:30:00+08:00')), '2026-08-01T02:30:00.000Z', '显式偏移必须生效')
+  assert.strictEqual(u._parseIsoZ('2026-02-30T00:00:00Z'), null, '不存在的日历日必须返回 null')
+})
+
+check('PlanO _parseSlashDate / _parseNumericTime: 斜杠日期与数字时间', () => {
+  const u = Utils
+  assert.strictEqual(uc(u._parseSlashDate('2026/08/01')), '2026-08-01T00:00:00.000Z', '斜杠日期按 UTC')
+  assert.strictEqual(uc(u._parseSlashDate('2026/8/1')), '2026-08-01T00:00:00.000Z', '单数字月日同样解析')
+  assert.strictEqual(u._parseSlashDate('2026/13/45'), null, '越界斜杠日期必须 null')
+  assert.strictEqual(uc(u._parseNumericTime('20260801')), '2026-08-01T00:00:00.000Z', '八位 YYYYMMDD')
+  assert.strictEqual(u._parseNumericTime('20261332'), null, '非法八位日期必须 null（不得落入时间戳分支）')
+  assert.strictEqual(uc(u._parseNumericTime('1700000000')), '2023-11-14T22:13:20.000Z', '十位按秒级时间戳')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
