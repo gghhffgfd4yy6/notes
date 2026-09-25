@@ -1552,4 +1552,78 @@ check('_probeIndexMiss: 小数组（n<=8）必须整表抽查（首次未命中�
   assert.deepStrictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'absent' }), { hit: false, diverged: true }, 'n=8 必须整表抽查，第 5 位字段改写必须被看见')
 })
 
+// ===== 补测 PlanP：getFilePath / _getTombstoneProcessStart（message-store 未直测的方法）=====
+// 反例（改动前）：两者在既有 104 项里只经高层路径间接覆盖，其**消毒/回退/截断**与
+// **/proc 解析**的精确口径从未被直接断言 —— 本段用 createProbeStore 直接调用。
+{
+  const S = createProbeStore()
+  // —— getFilePath：路径安全（只取 basename + 清洗非法字符）——
+  check('PlanP getFilePath: 路径穿越必须被 basename 消除、非法字符被清洗', () => {
+    const p1 = S.getFilePath('../../etc/passwd')
+    // 注意：返回值是**完整缓存路径**（含目录分隔符），安全性体现在「basename 被消毒」上，
+    // 故断言必须落在 basename 而非整串（首版写成「整串不含 /」是错的）。
+    assert.strictEqual(path.basename(p1), 'passwd', '路径穿越必须被 basename 消除为末段')
+    assert.strictEqual(p1.includes('..'), false, '产物不得含 .. 片段')
+    assert.strictEqual(path.basename(S.getFilePath('a/b')), 'b', '多级路径同样只取末段')
+    const p2 = path.basename(S.getFilePath('a/b\\c:d*e?f"g<h>i|j.json'))
+    assert.strictEqual(/[\\/:*?"<>|]/.test(p2), false, '非法字符必须全部清洗（含 Windows 保留字符）——断言落在 basename')
+    const p3 = S.getFilePath('bad\u0000name.json')
+    assert.strictEqual(p3.includes('\u0000'), false, 'NUL 必须清洗（否则 fs 抛 ERR_INVALID_ARG_VALUE）')
+    const p4 = S.getFilePath('ctrl\u0001\u001F.json')
+    assert.strictEqual(/[\u0000-\u001F]/.test(p4), false, 'C0 控制字符同样清洗')
+  })
+
+  check('PlanP getFilePath: 非信息文件名必须回退 default.json', () => {
+    for (const bad of ['', '.', '..', '[object Object]', 'undefined', 'null', 'true', 'false']) {
+      const got = S.getFilePath(bad)
+      assert.strictEqual(got.includes('default.json'), true, `${JSON.stringify(bad)} 必须回退 default.json（曾产生 [object Object] 垃圾文件）`)
+    }
+    const ok = S.getFilePath('normal-name.json')
+    assert.strictEqual(ok.includes('normal-name.json'), true, '正常名不得被回退掉')
+  })
+
+  check('PlanP getFilePath: 带自定义 toString 的对象与非字符串必须可 String 化且不抛', () => {
+    let threw = false
+    try {
+      S.getFilePath({ toString () { return 'obj-name.json' } })
+      S.getFilePath(123)
+      S.getFilePath(Symbol('s'))
+    } catch (e) { threw = true }
+    assert.strictEqual(threw, false, 'String 化失败必须被兜住（Symbol 会抛 TypeError）')
+  })
+
+  // —— _getTombstoneProcessStart：/proc 解析的边界 ——
+  check('PlanP getFilePath: 超长名必须按 UTF-8 字节截到 200 且不切半代理对', () => {
+    // 驱动 getFilePath 的**字节截断分支**（L427-437）——首版用例只测了短名，故该分支 30 个靶子全存活。
+    const base = (nm) => path.basename(S.getFilePath(nm))
+    // 纯 ASCII 超长：截到 200 字节（含 .json 后缀与摘要段）
+    const ascii = base('x'.repeat(300) + '.json')
+    assert.strictEqual(Buffer.byteLength(ascii, 'utf8'), 200, '超长 ASCII 名必须恰好截到 200 字节')
+    // 多字节（中文 3 字节/字）：仍须 ≤200 且为合法 UTF-8（不得截出半个字符）
+    const cn = base('中'.repeat(80) + '.json')
+    assert.ok(Buffer.byteLength(cn, 'utf8') <= 200, '多字节名不得超 200 字节')
+    assert.strictEqual(cn, Buffer.from(cn, 'utf8').toString('utf8'), '截断结果必须是合法 UTF-8')
+    assert.strictEqual(cn.includes('\uFFFD'), false, '不得出现替换字符（切在多字节中间会留 U+FFFD）')
+    // 代理对（emoji 4 字节/个）：末位不得是孤立高代理 ⇒ 字节数会退到 198
+    const em = base('😀'.repeat(80) + '.json')
+    const last = em.charCodeAt(em.length - 1)
+    assert.strictEqual(last >= 0xd800 && last <= 0xdbff, false, '末位不得是孤立高代理（必须回退一格丢弃半个码点）')
+    assert.ok(Buffer.byteLength(em, 'utf8') <= 200, '代理对场景同样不得超 200 字节')
+    // 短名不受截断影响（反向对照）
+    assert.strictEqual(base('ok.json').startsWith('ok.json'), true, '短名不得被截断/加摘要')
+  })
+
+  check('PlanP _getTombstoneProcessStart: 非 Linux 返回 null、读取失败返回 null', () => {
+    const orig = process.platform
+    try {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true })
+      assert.strictEqual(S._getTombstoneProcessStart(1), null, '非 Linux 必须返回 null（调用方按保守口径处理）')
+      Object.defineProperty(process, 'platform', { value: 'linux', configurable: true })
+      assert.strictEqual(S._getTombstoneProcessStart(999999999), null, '不存在的 PID 读 /proc 失败 ⇒ null（不得抛）')
+    } finally {
+      Object.defineProperty(process, 'platform', { value: orig, configurable: true })
+    }
+  })
+}
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
