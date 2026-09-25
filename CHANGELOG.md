@@ -200,3 +200,8 @@
  ① `timeMatchedRule`：`if (!compiled || compiled._type !== 'timeMulti') return null` —— 伪造 `_type` 非 `timeMulti` 的编译产物必须**安全提前返回**（不得被当作时间规则解析、不得抛）；`if (ms === null) return null` —— 非法注册时间必须**提前返回并保守放行**（`passed===true` 且 `reason===null`，不得按 0 天误拦）；含时间规则对照组证明用例确有时间维度。
  ② `listfilter`：`if (!cfg.__compiled) return this._legacyListfilter(group, cfg)` —— 未编译配置必须回退旧路径且**窗口语义一致**（1 天拦 / 30 天放）、`__compiled` 为伪造值（`1` / `'yes'`）时**不得抛**。
  **验证**：主仓 `test_filter.js` 实测 **0 失败**（本地跳过副本口径）；`standard` lint exit 0；版本四方闸门 ✅；并**手工施加 id=500 变异**（`if (!cfg.__compiled)` → `if (false)`）复核，套件如期变红（该靶点确由 `FILTER-06` 与新增 PlanF 共同锁定）。
+- **filter 段补测的增量已实测确认（2/2 KILLED）**：用第 169 批新落地的 `test_filter.js` 用例（`planF`）对两个已确认缺口靶子做**正式 replay**（`replay.mjs`，含未变异基线闸门），结果 **`500` KILLED、`336` KILLED** —— 证据 `.local/targets/filter-wave/planF-500.tsv`、`planF-336.tsv`。
+ - `500` = `ConditionalExpression@L264:8`（`listfilter` 的 `if (!cfg.__compiled)` 守卫）
+ - `336` = `StringLiteral@L198:54`（`timeMatchedRule` 里 `safeGet(group, 'louzhuregime')` 的**字段名字面量**——改错即读错字段，属真实可观测缺陷）
+ **这两个是本目标**首次**在 filter 段取得的、经 replay 正式确认的击杀**（该段此前被误判为「本机不可判」而长期计 0）。
+ **过程记录**：单靶 filter replay 需 **≈4–5 分钟**（含基线），比先前的 ≈2 分钟估计更长——此前多次失败是把 `timeout` 设成 250–290s 所致；**提到 550s 后单靶稳定完成**。后续 filter 取证统一用 `timeout 550`。
