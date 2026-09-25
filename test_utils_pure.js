@@ -2067,4 +2067,31 @@ check('PlanO _parseSlashDate / _parseNumericTime: 斜杠日期与数字时间', 
   assert.strictEqual(uc(u._parseNumericTime('1700000000')), '2023-11-14T22:13:20.000Z', '十位按秒级时间戳')
 })
 
+// ===== 补测 PlanQ：_isTrackingQueryName 的全表与边界 =====
+// 反例（改动前）：`TRACKING_QUERY_NAMES` 是 10 项的 Set，既有用例只用 `normUrl` 测了 **fbclid 一个**，
+// 其余 9 项的字面量变异体全部存活（每个都只被「名字恰好为该项」时消费）。
+check('PlanQ _isTrackingQueryName: 10 个跟踪参数名逐一必须命中（Set 全表）', () => {
+  const f = Utils._isTrackingQueryName
+  for (const n of ['fbclid', 'gclid', 'dclid', 'msclkid', 'yclid', 'mc_cid', 'mc_eid', 'igshid', '_ga', '_gl']) {
+    assert.strictEqual(f(n), true, `${n} 必须判为跟踪参数（Set 成员被掏空即在此变红）`)
+  }
+})
+
+check('PlanQ _isTrackingQueryName: utm_ 前缀必须命中且大小写不敏感', () => {
+  const f = Utils._isTrackingQueryName
+  assert.strictEqual(f('utm_source'), true, 'utm_ 前缀必须命中')
+  assert.strictEqual(f('utm_medium'), true, 'utm_ 前缀（另一项）')
+  assert.strictEqual(f('UTM_CAMPAIGN'), true, '大小写不敏感（startsWith("utm_") 前已 toLowerCase）')
+  assert.strictEqual(f('utm_'), true, '仅前缀也算（startsWith 语义）')
+})
+
+check('PlanQ _isTrackingQueryName: 非跟踪名必须判否（不得用子串/宽松匹配）', () => {
+  const f = Utils._isTrackingQueryName
+  assert.strictEqual(f('name'), false, '普通参数名必须放行')
+  assert.strictEqual(f('fbclidX'), false, '前缀相同但不是全名（must be exact set membership）')
+  assert.strictEqual(f('x_ga'), false, '包含 _ga 但不是全名 ⇒ 放行（不得用 includes）')
+  assert.strictEqual(f('_g'), false, '_gl 的近似项必须放行')
+  assert.strictEqual(f(''), false, '空串必须放行（不得因空串被误判跟踪）')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
