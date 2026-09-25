@@ -1870,4 +1870,42 @@ check('PlanK _cleanStyleAttrs: 大小写与实体/转义都必须归一后才判
   assert.strictEqual(u._cleanStyleAttrs('<div style=color:red>'), '<div style=color:red>', '未加引号的安全值必须原样保留（第二个 replace 分支）')
 })
 
+// ===== 补测 PlanL：truncateUtf16 / sameMessageIdentity / filterHash =====
+check('PlanL truncateUtf16: 非正整数 max 与「恰等于 max」提前返回', () => {
+  const u = Utils
+  assert.strictEqual(u.truncateUtf16('abc', 0), 'abc', 'max=0 原样返回（不截成空串）')
+  assert.strictEqual(u.truncateUtf16('abc', -1), 'abc', 'max<0 原样返回')
+  assert.strictEqual(u.truncateUtf16('abc', 3), 'abc', 'length===max 提前返回')
+  assert.strictEqual(u.truncateUtf16('', 0), '', '空串返回空串')
+  assert.strictEqual(u.truncateUtf16('abc', 2), 'ab', '普通截断')
+})
+
+check('PlanL truncateUtf16: 代理对在截断点整体保留或整体退位', () => {
+  const u = Utils
+  assert.strictEqual(u.truncateUtf16('a\uD83D\uDE00', 2), 'a', '切在代理对中间 ⇒ 高代理退位')
+  assert.strictEqual(u.truncateUtf16('a\uD83D\uDE00', 3), 'a\uD83D\uDE00', '恰在代理对之后 ⇒ 整体保留')
+  assert.strictEqual(u.truncateUtf16('\uD800A', 2), '\uD800A', '长度恰为 max ⇒ 原样返回')
+  assert.strictEqual(u.truncateUtf16('\uD800A', 1), '', '孤立高代理在截断点 ⇒ 退位到空')
+})
+
+check('PlanL sameMessageIdentity: 同上身份等价，空/异类身份判否', () => {
+  const u = Utils
+  assert.strictEqual(u.sameMessageIdentity({ id: 'x' }, { id: 'x' }), true, '相同 id 等价')
+  assert.strictEqual(u.sameMessageIdentity({ id: 'x' }, { id: 'y' }), false, '不同 id 判否')
+  assert.strictEqual(u.sameMessageIdentity({ url: 'http://a' }, { url: 'http://a' }), true, '相同 url 等价')
+  assert.strictEqual(u.sameMessageIdentity({ id: 'a' }, { url: 'http://x' }), false, 'id 与 url 不得互相等价')
+  assert.strictEqual(u.sameMessageIdentity({}, {}), false, '皆无身份判否')
+  assert.strictEqual(u.sameMessageIdentity(null, null), false, 'null 判否且不抛')
+})
+
+check('PlanL filterHash: 稳定、re2 维度参与、空配置有确定值', () => {
+  const u = Utils
+  const a = u.filterHash({ pingbitime: '5' }, '0')
+  assert.strictEqual(typeof a, 'string', '必须返回字符串')
+  assert.strictEqual(a, u.filterHash({ pingbitime: '5' }, '0'), '同输入稳定（无随机/时间成分）')
+  assert.notStrictEqual(a, u.filterHash({ pingbitime: '5' }, '1'), 're2 维度必须参与哈希')
+  assert.notStrictEqual(a, u.filterHash({ pingbitime: '6' }, '0'), '配置值变化必须改哈希')
+  assert.notStrictEqual(u.filterHash({}, ''), u.filterHash({ pingbitime: '5' }, ''), '空/非空配置必须不同')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
