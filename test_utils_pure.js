@@ -1983,4 +1983,46 @@ check('PlanM2 isDangerousUrl: null/undefined 与不可 String 化的输入必须
   assert.strictEqual(u.isDangerousUrl(123), false, '数字转字符串后不含协议 ⇒ false')
 })
 
+// ===== 补测 PlanN：_htmlTagSpans 的标签起始判定与状态机分支 =====
+// 本区块**有意不锁绝对下标快照**（那类是审查要求去掉的脆弱断言），改锁语义判据：
+// 「哪些输入产生标签区间」「哪些位置被记为属性值开启引号」。
+const nSpans = (h) => { const r = Utils._htmlTagSpans(h); return { n: r.spans.length, vq: [...r.valueQuotes].length } }
+
+check('PlanN _htmlTagSpans: 标签起始必须是 < + 字母 或 </，其余一律是文本', () => {
+  assert.strictEqual(nSpans('<div>').n, 1, '<div> 是标签')
+  assert.strictEqual(nSpans('<1>').n, 0, '<1>：数字不是标签起始 ⇒ 无区间')
+  assert.strictEqual(nSpans('< div>').n, 0, '< div>：空白不是标签起始 ⇒ 无区间')
+  assert.strictEqual(nSpans('<!x y>').n, 0, '<! 是标记声明前缀 ⇒ 不进属性状态机')
+  assert.strictEqual(nSpans('<?x y>').n, 0, '<? 同样按文本处理')
+  assert.strictEqual(nSpans('1 < 2 name="x"').n, 0, '未配对的 < 不得开启标签区间（P1-01：否则把后方文本 name="…" 误判为标签内属性）')
+})
+
+check('PlanN _htmlTagSpans: </+字母 走标签态，</+非字母 走 bogusComment 且不记引号', () => {
+  assert.strictEqual(nSpans('</div>').n, 1, '</div> 是结束标签')
+  assert.strictEqual(nSpans('</x y>').n, 1, '</x y>：</+字母 仍是结束标签（可带属性）')
+  const bogus = Utils._htmlTagSpans("</x='><img src=x onerror=alert(1)>'")
+  assert.strictEqual([...bogus.valueQuotes].length, 0, '</+非字母 是 bogus comment：其中引号**不得**记为属性值开启引号（REV-P2 安全缺口）')
+})
+
+check('PlanN _htmlTagSpans: 只有「= 之后的引号」才是属性值开启引号', () => {
+  assert.strictEqual(nSpans('<div class="a">').vq, 1, 'class="a" 的引号是属性值开启引号')
+  assert.strictEqual(nSpans('<div a="b">').vq, 1, '单个属性值引号')
+  assert.strictEqual(nSpans('<div a="b"c="d">').vq, 2, '无空白分隔的相邻属性对，两个引号都要记')
+  assert.strictEqual(nSpans('<div a=b>').vq, 0, '未加引号的值：不记引号')
+  assert.strictEqual(nSpans('<div a>').vq, 0, '只有属性名、无值：不记引号')
+  assert.strictEqual(nSpans('<div a= >').vq, 0, '= 后仅空白：不记引号')
+  assert.strictEqual(nSpans('<div a==b>').vq, 0, '= = 连写：第二个 = 不开启值 ⇒ 不记引号')
+})
+
+check('PlanN _htmlTagSpans: 标签名内引号/等号是名字字符；未闭合引号延伸到串尾', () => {
+  const r = Utils._htmlTagSpans('<a b="c"d=e>')
+  assert.strictEqual([...r.valueQuotes].length, 1, 'b="c" 的引号要记；d=e 无引号 ⇒ 不产生第二个')
+  assert.strictEqual(nSpans('<div/ >').n, 1, '/ 在标签名后属自闭合标记，仍是同一标签')
+  const u = Utils._htmlTagSpans('<div a="b')
+  assert.strictEqual(u.spans.length, 1, '未闭合引号：仍是同一个标签区间')
+  assert.strictEqual([...u.valueQuotes].length, 1, '开启引号已记入（闭合引号不存在）')
+  assert.strictEqual(nSpans('plain text').n, 0, '纯文本零区间')
+  assert.strictEqual(nSpans('').n, 0, '空串零区间')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
