@@ -204,5 +204,519 @@ const cfg = slim.push_config
     console.log('✅ F4：WX_pusher_channels 丢弃时告警（非法 JSON/全丢弃/非数组/部分丢弃），合法与空配置不告警')
   }
 
+  // ===== 模块加载期配置契约：默认值 + 青龙环境变量覆盖（ENV_ALIASES，v3.234/v3.273）=====
+  // 这两条只在**模块加载期**成立（env 覆盖循环在顶层执行），因此必须重新加载模块才能观察：
+  // 这里在独立实例上断言，跑完把 require.cache 还原，后续用例看到的仍是本文件顶部的 slim/cfg 实例。
+  // 覆盖目标：默认配置被改坏（空串→"Stryker was here!"）、别名表被掏空（[]）、
+  // 「存在但为空的 env 不得覆盖本地配置」被写反（QingLong 面板留空/误删值 → 真实 token 被清空 → 漏推）。
+  {
+    const resolved = require.resolve('./xbk_sendNotify_slim')
+    const cached = require.cache[resolved]
+    // 与源码 ENV_ALIASES 逐键对应（顺序同源码）；每项 = [配置键, [env 名...]]
+    const ALIASES = [
+      ['PUSH_PLUS_TOKEN', ['PUSH_PLUS_TOKEN']],
+      ['PUSH_PLUS_USER', ['PUSH_PLUS_USER']],
+      ['PUSH_KEY', ['PUSH_KEY']],
+      ['BARK_PUSH', ['BARK_PUSH']],
+      ['BARK_ARCHIVE', ['BARK_ARCHIVE']],
+      ['BARK_GROUP', ['BARK_GROUP']],
+      ['BARK_SOUND', ['BARK_SOUND']],
+      ['BARK_ICON', ['BARK_ICON']],
+      ['BARK_LEVEL', ['BARK_LEVEL']],
+      ['BARK_URL', ['BARK_URL']],
+      ['QYWX_KEY', ['QYWX_KEY']],
+      ['QYWX_ORIGIN', ['QYWX_ORIGIN']],
+      ['WX_pusher_appToken', ['WX_pusher_appToken', 'WX_PUSHER_APP_TOKEN']],
+      ['WX_pusher_topicIds', ['WX_pusher_topicIds', 'WX_PUSHER_TOPIC_IDS']],
+      ['WX_pusher_channels', ['WX_pusher_channels', 'WX_PUSHER_CHANNELS']],
+      ['WX_XIZHI_KEY', ['WX_XIZHI_KEY']],
+      ['DEER_KEY', ['DEER_KEY']],
+      ['DEER_URL', ['DEER_URL']],
+      ['PUSHME_KEY', ['PUSHME_KEY']],
+      ['PUSHME_URL', ['PUSHME_URL']],
+      ['TG_BOT_TOKEN', ['TG_BOT_TOKEN']],
+      ['TG_USER_ID', ['TG_USER_ID']],
+      ['TG_API_HOST', ['TG_API_HOST']],
+      ['HITOKOTO', ['HITOKOTO']]
+    ]
+    const ALL_ENV = ALIASES.reduce((acc, [, names]) => acc.concat(names), [])
+    const savedEnv = {}
+    for (const n of ALL_ENV) savedEnv[n] = process.env[n]
+    const clearEnv = () => { for (const n of ALL_ENV) delete process.env[n] }
+    const reload = () => { delete require.cache[resolved]; return require('./xbk_sendNotify_slim') }
+    // 未配置时的默认值（青龙用户不写任何配置就依赖这些值；默认被改坏 = 静默改行为）
+    const DEFAULTS = {
+      HITOKOTO: 'false',
+      BARK_PUSH: '',
+      BARK_ARCHIVE: '',
+      BARK_GROUP: '',
+      BARK_SOUND: '',
+      BARK_ICON: '',
+      BARK_LEVEL: '',
+      BARK_URL: '',
+      PUSH_KEY: '',
+      DEER_KEY: '',
+      DEER_URL: '',
+      PUSH_PLUS_TOKEN: '',
+      PUSH_PLUS_USER: '',
+      WX_pusher_appToken: '',
+      WX_pusher_topicIds: '',
+      WX_XIZHI_KEY: '',
+      PUSHME_URL: 'https://push.i-i.me',
+      PUSHME_KEY: '',
+      QYWX_ORIGIN: 'https://qyapi.weixin.qq.com',
+      QYWX_KEY: '',
+      TG_BOT_TOKEN: '',
+      TG_USER_ID: '',
+      TG_API_HOST: 'https://api.telegram.org',
+      TG_PROXY_AUTH: '',
+      TG_PROXY_HOST: '',
+      TG_PROXY_PORT: ''
+    }
+    try {
+      // ① 默认值契约（清空全部别名 env 后重新加载）
+      clearEnv()
+      const fresh = reload()
+      // push_config.local.js 存在时按设计覆盖默认值（真实密钥），此时默认值本就不可观测
+      // 用 require.resolve（相对本模块解析，等价于 __dirname 拼接）判断存在性，
+      // 避免 Codacy 的「动态路径构造」误报（此处无任何用户输入参与）。
+      let hasLocal = true
+      try { require.resolve('./push_config.local.js') } catch (e) { hasLocal = false }
+      if (!hasLocal) {
+        for (const [k, v] of Object.entries(DEFAULTS)) {
+          assert.strictEqual(fresh.push_config[k], v, `未配置时 push_config.${k} 必须是默认值 ${JSON.stringify(v)}`)
+        }
+        assert.deepStrictEqual(fresh.push_config.WX_pusher_channels, [], '默认 WX_pusher_channels 必须是空数组（留空才回退单应用字段）')
+      }
+      // ② env 覆盖：逐个别名（含双名条目的每一个名字）都必须生效
+      for (const [key, names] of ALIASES) {
+        for (let i = 0; i < names.length; i++) {
+          clearEnv()
+          const value = `env-${key}-${i}`
+          process.env[names[i]] = value
+          const inst = reload()
+          assert.strictEqual(inst.push_config[key], value, `env ${names[i]} 必须覆盖 push_config.${key}`)
+        }
+      }
+      // ③ 存在但为空/纯空白的 env 不得覆盖（v3.234：面板留空不得清掉已有配置）
+      // 相对断言（**不用**绝对默认值）：部署侧存在 push_config.local.js 时生效值来自本地配置，
+      // 绝对断言会在该环境下假红；这里先取「无任何 env 时」的生效值作基线，再断言空 env 不改动它。
+      clearEnv()
+      const base = reload().push_config
+      const baseVals = { BARK_SOUND: base.BARK_SOUND, PUSH_KEY: base.PUSH_KEY, QYWX_ORIGIN: base.QYWX_ORIGIN }
+      process.env.BARK_SOUND = '   '
+      process.env.PUSH_KEY = ''
+      process.env.QYWX_ORIGIN = '\t\n'
+      const blank = reload()
+      assert.strictEqual(blank.push_config.BARK_SOUND, baseVals.BARK_SOUND, '纯空白 env 不得覆盖生效值')
+      assert.strictEqual(blank.push_config.PUSH_KEY, baseVals.PUSH_KEY, '空串 env 不得覆盖生效值')
+      assert.strictEqual(blank.push_config.QYWX_ORIGIN, baseVals.QYWX_ORIGIN, '只含空白的 env 不得覆盖生效值（默认域名或本地配置都不许被清）')
+      // 对照组：同一批 env 里加一个非空值 → 只有它生效
+      process.env.BARK_SOUND = ' ding '
+      const withSound = reload()
+      assert.strictEqual(withSound.push_config.BARK_SOUND, ' ding ', '非空 env（含首尾空白）必须原样覆盖')
+      assert.strictEqual(withSound.push_config.PUSH_KEY, baseVals.PUSH_KEY, '空 env 键不得改动生效值')
+      // ✅ 文案按「真跑了默认值断言 / 因本地配置存在而跳过」分支化：跳过时不得宣称已验证。
+      console.log(hasLocal
+        ? '✅ 模块加载期配置契约：ENV_ALIASES 全别名覆盖 + 空白 env 不覆盖（默认值逐键断言因存在 push_config.local.js 而跳过）'
+        : '✅ 模块加载期配置契约：默认值逐键 + ENV_ALIASES 全别名覆盖 + 空白 env 不覆盖')
+    } finally {
+      for (const n of ALL_ENV) {
+        if (savedEnv[n] === undefined) delete process.env[n]
+        else process.env[n] = savedEnv[n]
+      }
+      delete require.cache[resolved]
+      require.cache[resolved] = cached
+    }
+  }
+
+  // ===== configuredChannelCount / configuredChannelNames：九通道齐备时的精确清单 =====
+  // 逐字/逐序断言（数组元素个数与顺序都算契约）：谓词被写死 false、名称串被掏空、
+  // 数组声明被换成 []、TG 的 `&&` 被换成 `||` 都会在这里变红。
+  {
+    const saved = {}
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    try {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      cfg.PUSH_PLUS_TOKEN = 'pp-token'
+      cfg.PUSH_KEY = 'sk-key'
+      cfg.BARK_PUSH = 'bark-device-key'
+      cfg.QYWX_KEY = 'qy-key'
+      cfg.WX_pusher_appToken = 'wx-app-token'
+      cfg.WX_XIZHI_KEY = 'xz-key'
+      cfg.DEER_KEY = 'dd-key'
+      cfg.PUSHME_KEY = 'pm-key'
+      cfg.TG_BOT_TOKEN = 'bot-token'
+      cfg.TG_USER_ID = 'uid'
+      assert.strictEqual(configuredChannelCount(), 9, '九个通道全部配置时计数必须为 9')
+      assert.deepStrictEqual(
+        configuredChannelNames(),
+        ['pushplus', 'server酱', 'bark', '企业微信', 'wxpusher', '息知', 'pushdeer', 'pushme', 'telegram'],
+        '通道名清单与顺序必须逐字稳定'
+      )
+      // 分隔型通道只有分隔符/空白时既不计数也不出现（与 nonEmpty/delimitedNonEmpty 同口径）
+      cfg.BARK_PUSH = '###'
+      cfg.PUSHME_KEY = ' # '
+      assert.strictEqual(configuredChannelCount(), 7, '全分隔符 Bark/PushMe 必须从计数中剔除')
+      assert.strictEqual(configuredChannelNames().includes('bark'), false, '全分隔符 Bark 不得出现在通道名')
+      assert.strictEqual(configuredChannelNames().includes('pushme'), false, '全分隔符 PushMe 不得出现在通道名')
+      cfg.BARK_PUSH = 'bark-device-key'
+      cfg.PUSHME_KEY = 'pm-key'
+      // TG 必须 token 与 user id 同时非空：只有一项时不得出现 telegram（`&&` 被换成 `||` 会在此变红）
+      cfg.TG_USER_ID = ''
+      assert.strictEqual(configuredChannelNames().includes('telegram'), false, 'TG 只有 token 时不得出现 telegram')
+      assert.strictEqual(configuredChannelCount(), 8, 'TG 只有 token 时计数必须少 1')
+      cfg.TG_BOT_TOKEN = ''
+      cfg.TG_USER_ID = 'uid'
+      assert.strictEqual(configuredChannelNames().includes('telegram'), false, 'TG 只有 user id 时不得出现 telegram')
+      assert.strictEqual(configuredChannelCount(), 8, 'TG 只有 user id 时计数必须少 1')
+      cfg.TG_BOT_TOKEN = 'bot-token'
+      // 纯空白值必须算未配置（nonEmpty 的 String(v).trim() 口径）
+      cfg.WX_XIZHI_KEY = '   '
+      assert.strictEqual(configuredChannelCount(), 8, '全空白 WX_XIZHI_KEY 不得计为已配置')
+      assert.strictEqual(configuredChannelNames().includes('息知'), false, '全空白 WX_XIZHI_KEY 不得出现在通道名')
+      cfg.WX_XIZHI_KEY = 'xz-key'
+      // 真值非字符串按既有语义计为已配置（String(v).trim() 口径；0/false 仍被 !v 挡掉）
+      cfg.DEER_KEY = 7
+      assert.strictEqual(configuredChannelCount(), 9, '真值非字符串配置必须按 String(v) 口径计为已配置')
+      assert.strictEqual(configuredChannelNames().includes('pushdeer'), true)
+      cfg.DEER_KEY = 'dd-key'
+      // 分隔型配置带空段（首/尾分隔符）仍算已配置——判定是「任一非空段」，不是「所有段非空」
+      cfg.BARK_PUSH = 'bark-device-key#'
+      cfg.PUSHME_KEY = '#pm-key'
+      assert.strictEqual(configuredChannelCount(), 9, '分隔型配置含空段时仍必须计为已配置')
+      assert.strictEqual(configuredChannelNames().includes('bark'), true)
+      assert.strictEqual(configuredChannelNames().includes('pushme'), true)
+      console.log('✅ 通道统计：九通道齐备逐字清单 + 分隔型/空白/真值非字符串口径 + TG 双字段口径')
+    } finally {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== sendNotify：没有任何通道时必须响亮失败，不得「静默成功」=====
+  // 静默成功会让主流程以为推送完成并写缓存（消息永久丢失）。这里只走配置检查/短路分支，
+  // 不触碰任何网络：① 全空配置 → NO_CHANNEL_CONFIG；② 只配 TG_BOT_TOKEN（缺 TG_USER_ID）
+  // → configuredFlags 的 `&&` 必须判否，tgNotify 因缺 user id 直接 resolve，全程零请求。
+  {
+    const saved = {}
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    try {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文'),
+        (e) => e.code === 'NO_CHANNEL_CONFIG' &&
+          e.message === '未配置任何推送通道（Push+/Server酱/Bark/企业微信/wxpusher/息知/PushDeer/PushMe/Telegram）',
+        '未配置任何通道必须抛 NO_CHANNEL_CONFIG 且消息逐字一致'
+      )
+      cfg.TG_BOT_TOKEN = 'fake-bot-token-for-config-check' // 缺 TG_USER_ID
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文'),
+        (e) => e.code === 'NO_CHANNEL_CONFIG',
+        'TG 只有 token 时必须按未配置处理（`&&` 不得放宽成 `||`）'
+      )
+      console.log('✅ sendNotify：无通道/只配 TG token 时抛 NO_CHANNEL_CONFIG（不静默成功，零网络）')
+    } finally {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== sendNotify 包装函数：无通道配置必须响亮失败（错误码/消息逐字）=====
+  // 契约（SYSTEM_CONTRACT.md「推送」条）：无通道配置不得静默成功（否则主流程以为推送完成并写缓存）。
+  {
+    const saved = {}
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    try {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      // 错误码字面量与消息字面量都必须逐字（StringLiteral→"" 会在这里变红）
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文'),
+        (e) => {
+          assert.strictEqual(e.code, 'NO_CHANNEL_CONFIG', "error.code 必须逐字为 'NO_CHANNEL_CONFIG'")
+          assert.strictEqual(
+            e.message,
+            '未配置任何推送通道（Push+/Server酱/Bark/企业微信/wxpusher/息知/PushDeer/PushMe/Telegram）',
+            '错误消息必须逐字一致'
+          )
+          return true
+        }
+      )
+      // TG 是「token && user id」双字段：只配 user id 时不得算已配置
+      // （`&&` 被换成 `||` 会让 telegram 假成立：tgNotify 早退成 resolve ⇒ 不抛错）
+      cfg.TG_USER_ID = 'uid-only'
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文'),
+        (e) => e.code === 'NO_CHANNEL_CONFIG',
+        'TG 只有 user id 时必须按未配置处理（`&&` 不得放宽成 `||`）'
+      )
+      console.log('✅ sendNotify：无通道/只配 TG user id 时抛 NO_CHANNEL_CONFIG（码与消息逐字，零网络）')
+    } finally {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== sendNotify 包装函数：一言开关（HITOKOTO）逐格 =====
+  // 分支只在 hitokotoEnabled 为真时调用模块内 one()，而 one() 的唯一出口是 got.get('https://v1.hitokoto.cn/').
+  // 本轮禁止真实网络请求，故用仓库既有 got 替身口径（源码 L345 注释 / test_notify.js 已有先例）把共享 got 的
+  // get 换成「记账并即刻抛错」的探针：不建连、零 IO，却能逐字回答「这一格是否真的去取一言」。
+  // 判定口径（源码注释 v3.273）：仅显式 true 或字符串（忽略大小写）'true' 开启；false/0/'0'/undefined/1/'true ' 关闭。
+  {
+    const gotMod = require('got')
+    const origGet = gotMod.get
+    const seen = []
+    const saved = {}
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    const hits = () => seen.filter(u => u === 'https://v1.hitokoto.cn/').length
+    gotMod.get = (url) => { seen.push(String(url)); throw new Error('hitokoto-probe-no-io') }
+    try {
+      const cases = [
+        [true, true, 'HITOKOTO===true 必须取一言（===true 被改成 false / !== / 整体换成 false 会在此变红）'],
+        ['TRUE', true, "字符串 'TRUE' 必须取一言（大小写不敏感 + 'true' 字面量逐字 + typeof 判定）"],
+        ['True', true, "字符串 'True' 必须取一言"],
+        ['true', true, "字符串 'true' 必须取一言"],
+        ['true ', false, "带尾随空白的 'true ' 不得取一言（判定不做 trim）"],
+        ['false', false, "字符串 'false' 不得取一言"],
+        [false, false, '布尔 false 不得取一言'],
+        [0, false, '数字 0 不得取一言'],
+        ['0', false, "字符串 '0' 不得取一言"],
+        [undefined, false, 'undefined 不得取一言'],
+        [1, false, '数字 1 不得取一言（非 true、非字符串）']
+      ]
+      for (const [value, shouldFetch, why] of cases) {
+        clearCfg()
+        cfg.WX_XIZHI_KEY = '::::' // 唯一配置通道：非法 URL ⇒ got 在 new URL() 阶段抛错（不建连）
+        cfg.HITOKOTO = value
+        seen.length = 0
+        await slim.sendNotify('测试文本', '测试正文').catch(() => {})
+        assert.strictEqual(hits(), shouldFetch ? 1 : 0, why)
+      }
+      console.log('✅ sendNotify：一言开关逐格（true/TRUE/True/true → 取一次；true /false/0/0/undefined/1 → 不取）')
+    } finally {
+      gotMod.get = origGet
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== sendNotify 包装函数：channelTasks 逐通道取用与失败归因 =====
+  // 源码 channelTasks 每项为 [configuredFlags[i], '通道名', () => xxxNotify(...)]，只有「已配置」项会被启动。
+  // 契约：部分成功即本轮成功；全部通道失败必须响亮抛 ALL_CHANNELS_FAILED 并逐通道归因。
+  // 零网络观测法（不装桩、不造网）：①通道地址配置指向非法 URL ⇒ got 在 new URL() 阶段抛错、不建连；
+  // ②pushplus/server酱/wxpusher 的地址写死，改用调用方自带 params.signal（已 abort）——源码 requestExtras
+  // 把它透传给 got，请求在建立前即被取消。逐项断言「启动前同步写入的 tracker.pending 恰好是这一项且
+  // 通道名逐字」+「failure.channel 逐字」⇒ 数组→[]、名字串→""、箭头函数→() => undefined 三类全部变红。
+  {
+    const saved = {}
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    try {
+      const channelCases = []
+      if (typeof AbortSignal === 'function' && typeof AbortSignal.abort === 'function') {
+        const aborted = AbortSignal.abort()
+        channelCases.push(
+          ['pushplus', { PUSH_PLUS_TOKEN: 'probe-token' }, aborted],
+          ['server酱', { PUSH_KEY: 'probe-key' }, aborted],
+          ['wxpusher', { WX_pusher_channels: '[{"appToken":"AT_probe","topicIds":[1]}]' }, aborted]
+        )
+      }
+      channelCases.push(
+        ['息知', { WX_XIZHI_KEY: '::::' }, null],
+        ['pushdeer', { DEER_KEY: 'deer-key', DEER_URL: '::::' }, null],
+        ['pushme', { PUSHME_KEY: 'pushme-key', PUSHME_URL: '::::' }, null],
+        ['telegram', { TG_BOT_TOKEN: 'bot-token', TG_USER_ID: 'uid', TG_API_HOST: '::::' }, null]
+      )
+      for (const [name, conf, signal] of channelCases) {
+        clearCfg()
+        Object.assign(cfg, conf)
+        const tracker = {}
+        const params = signal ? { inFlightTracker: tracker, signal } : { inFlightTracker: tracker }
+        const pending = slim.sendNotify('测试文本', '测试正文', params)
+        // 同步观测：pending 在启动任务前写入 ⇒ 逐字证明该项存在、名字正确、且被判为「已启用」
+        assert.deepStrictEqual(tracker.pending, [name], `${name}：唯一配置的通道必须被取用且通道名逐字（数组→[] / 名字串→"" 会在此变红）`)
+        await assert.rejects(() => pending, (e) => {
+          assert.strictEqual(e.code, 'ALL_CHANNELS_FAILED', `${name}：全部通道失败必须响亮抛 ALL_CHANNELS_FAILED（箭头函数→undefined 会假成功、不抛）`)
+          assert.deepStrictEqual(e.successfulChannels, [], `${name}：不得出现虚假成功通道`)
+          assert.strictEqual(e.failures.length, 1, `${name}：失败清单必须恰好一项`)
+          assert.strictEqual(e.failures[0].channel, name, `${name}：failure.channel 必须逐字为通道名`)
+          return true
+        })
+      }
+      console.log('✅ sendNotify：channelTasks 逐通道取用 + 失败归因（7 通道，非法 URL / 已 abort 信号，零出网）')
+    } finally {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== sendNotify 包装函数：params.inFlightTracker 契约 =====
+  // 契约：可选 params.inFlightTracker（对象）——启动任务前同步写入 pending（未结算通道名），
+  // 每通道 settle 时移除；不传时不产生任何副作用（既有调用方行为逐字不变）。观测通道固定为
+  // 「息知 + 非法 URL」（零出网）。
+  {
+    const saved = {}
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    const onlyXiZhi = () => { for (const k of Object.keys(cfg)) delete cfg[k]; cfg.WX_XIZHI_KEY = '::::' }
+    try {
+      // ① 传对象 tracker：pending 在启动任务前同步写入本次将尝试的通道
+      onlyXiZhi()
+      const tracker = {}
+      const pending = slim.sendNotify('测试文本', '测试正文', { inFlightTracker: tracker })
+      assert.deepStrictEqual(tracker.pending, ['息知'], '传 tracker 时必须写入 pending（条件整体被换成 false 会在此变红）')
+      await assert.rejects(() => pending, (e) => e.code === 'ALL_CHANNELS_FAILED')
+      // ② 不传 tracker：对调用方 params 零副作用，也不得抛错（严格模式下条件被换成 true 会抛 TypeError）
+      onlyXiZhi()
+      const params = {}
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文', params),
+        (e) => e.code === 'ALL_CHANNELS_FAILED',
+        '不传 tracker 时行为必须与既有一致'
+      )
+      assert.deepStrictEqual(Object.keys(params), [], '不传 tracker 时不得给 params 添加任何字段')
+      // ③ params 为 null：`params && …` 必须短路成「无 tracker」，而不是去读 null.inFlightTracker（`&&`→`||`）
+      onlyXiZhi()
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文', null),
+        (e) => e.code === 'ALL_CHANNELS_FAILED' && e.failures[0].channel === '息知',
+        'params=null 必须短路为「无 tracker」而不是 TypeError'
+      )
+      // ④ 非对象 tracker（函数）：typeof 校验必须把它当作「无 tracker」，不得往它上面写 .pending
+      onlyXiZhi()
+      const probeFn = function () {}
+      await assert.rejects(
+        () => slim.sendNotify('测试文本', '测试正文', { inFlightTracker: probeFn }),
+        (e) => e.code === 'ALL_CHANNELS_FAILED'
+      )
+      assert.strictEqual(probeFn.pending, undefined, 'typeof 不是 object 的 tracker 不得被当作 tracker 写入')
+      console.log('✅ sendNotify：inFlightTracker 契约（同步写入 pending / 不传零副作用 / typeof 校验）')
+    } finally {
+      for (const k of Object.keys(cfg)) delete cfg[k]
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== 补测 PlanD：truncateBytes（经「企业微信」通道的 4096 字节截断观测）=====
+  // 反例（改动前）：truncateBytes 未导出，其 13 个靶子一直被登记为「不可达」——**该判断是错的**：
+  // 它经 qywxBotNotify 的 content 调用点可达，而企微通道已被本套件驱动（QYWX_KEY + got 替身）。
+  // 做法：把 got.stream.post 换成「记账即刻抛错」的最小 EventEmitter 探针捕获请求体（真实 got 带 stream ⇒ 通道走 streamRequest，不看 got.post），零 IO；再断言 markdown.content 的**字节级**形态。
+  {
+    const gotMod = require('got')
+    const captured = []
+    const saved = {}
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    // 真实 got 带 stream ⇒ 通道走 streamRequest（不看 got.post）。故替身必须装在 got.stream.post 上，
+    // 返回一个最小 EventEmitter：立刻 error，既捕获请求体、又保证零 IO 且不阻塞。
+    const { EventEmitter } = require('node:events')
+    const origStreamPost = gotMod.stream && gotMod.stream.post
+    gotMod.stream = gotMod.stream || {}
+    gotMod.stream.post = (url, opts) => {
+      captured.push({ url: String(url), body: opts && opts.json })
+      const em = new EventEmitter()
+      em.destroy = () => {}
+      setImmediate(() => em.emit('error', new Error('qywx-probe-no-io')))
+      return em
+    }
+    try {
+      // 只配企微通道，避免其它通道参与
+      clearCfg()
+      cfg.QYWX_KEY = 'probe-qywx-key'
+      // ① 短正文（中文 3 字节/字）：不得被截断，且必须原样出现在 content 里
+      captured.length = 0
+      await slim.sendNotify('短标题', '中文正文').catch(() => {})
+      assert.strictEqual(captured.length, 1, '只配企微时必须恰好发出一次请求（探针零 IO）')
+      assert.strictEqual(captured[0].body.msgtype, 'markdown', '企微必须走 markdown 形态')
+      assert.strictEqual(captured[0].body.markdown.content, '短标题\n\n中文正文', '短正文必须原样，不得被截断（≤4096 分支）')
+      // ② 超长正文（中文 4000 字 = 12000 字节 > 4096）：必须按**字节**截断到 ≤4096 且是合法 UTF-8
+      captured.length = 0
+      const longBody = '中'.repeat(4000)
+      await slim.sendNotify('T', longBody).catch(() => {})
+      const content = captured[0].body.markdown.content
+      const bytes = Buffer.byteLength(content, 'utf8')
+      assert.ok(bytes <= 4096, `超长正文必须截到 ≤4096 字节（实际 ${bytes}）——按「字符」或「不截断」的实现会在此变红`)
+      assert.ok(bytes > 3900, `截断必须尽量用满预算（实际 ${bytes}）——提前退出/预算算错会在此变红`)
+      assert.strictEqual(content, Buffer.from(content, 'utf8').toString('utf8'), '截断结果必须是合法 UTF-8（不得截出半个多字节字符）')
+      assert.strictEqual(/\uFFFD/.test(content), false, '不得出现替换字符（截在多字节字符中间会留下 U+FFFD）')
+      // ③ 代理对：末尾若正好落在 emoji 中间，必须整体退位（保留完整字符或彻底去掉，不得留孤立代理）
+      captured.length = 0
+      const emojiTail = 'a'.repeat(4090) + '\u{1F600}\u{1F600}'
+      await slim.sendNotify('T', emojiTail).catch(() => {})
+      const c3 = captured[0].body.markdown.content
+      assert.strictEqual(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(c3), false,
+        '截断不得留下孤立代理（代理对必须整体保留或整体丢弃）')
+      assert.ok(Buffer.byteLength(c3, 'utf8') <= 4096, '代理对场景同样不得超预算')
+      console.log('✅ PlanD truncateBytes：经企微通道观测字节级截断（短正文原样 / 超长 ≤4096 且合法 UTF-8 / 代理对不孤立）')
+    } finally {
+      if (origStreamPost) gotMod.stream.post = origStreamPost
+      clearCfg()
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== 补测 PlanF：normalizeFailure 与失败聚合（经 sendNotify 的 failures 观测）=====
+  // 反例（改动前）：normalizeFailure 20 个靶子被登记为「不可达」——**该判断同样是错的**：
+  // 它在 channelResults 里被调用（L1612），而 sendNotify 在**全部通道失败**时把 failures 一路抛出。
+  // 做法：got.stream.post 替身让通道 reject 一个**带 code/statusCode/providerCode 的错误**，
+  // 零 IO 捕获 sendNotify 抛出的 error.failures，逐字段断言归一化结果。
+  {
+    const gotMod = require('got')
+    const { EventEmitter } = require('node:events')
+    const origStreamPost = gotMod.stream && gotMod.stream.post
+    const saved = {}
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    // 让通道以「自定义错误」失败：可注入 code/statusCode/providerCode
+    let mkErr = () => { const e = new Error('boom'); e.code = 'E_PROBE'; e.statusCode = 500; e.providerCode = 'PROV'; return e }
+    gotMod.stream = gotMod.stream || {}
+    gotMod.stream.post = () => {
+      const em = new EventEmitter()
+      em.destroy = () => {}
+      setImmediate(() => em.emit('error', mkErr()))
+      return em
+    }
+    try {
+      clearCfg()
+      cfg.QYWX_KEY = 'probe-key'
+      // ① channel 字段必须被归一化进来，且三个可选字段原样透传（'undefined' 判定被改坏会丢字段）
+      let err = null
+      try { await slim.sendNotify('T', 'D') } catch (e) { err = e }
+      assert.strictEqual(err && err.message, '所有推送通道失败: boom', '全部失败时的聚合消息必须逐字')
+      // 注意：failures 的元素是**归一化后的 Error 实例**（不是普通对象）——deepStrictEqual 对普通对象会因原型不同而红。
+      const f0 = err.failures[0]
+      assert.ok(f0 instanceof Error, '归一化结果必须是 Error 实例（不是普通对象字面量）')
+      assert.strictEqual(f0.message, 'boom', 'message 必须来自 safeErr 摘要')
+      assert.strictEqual(f0.code, 'E_PROBE', 'code 必须原样透传')
+      assert.strictEqual(f0.statusCode, 500, 'statusCode 必须原样透传')
+      assert.strictEqual(f0.providerCode, 'PROV', 'providerCode 必须原样透传')
+      assert.strictEqual(f0.channel, '企业微信', 'channel 必须回填')
+      // ② 错误对象**缺**可选字段时，不得凭空造出这些键（`!== undefined` 判定被放宽成恒真会在此变红）
+      mkErr = () => { const e = new Error('plain'); return e }
+      err = null
+      try { await slim.sendNotify('T', 'D') } catch (e) { err = e }
+      const b0 = err.failures[0]
+      assert.strictEqual(b0.channel, '企业微信', 'channel 必须回填')
+      assert.strictEqual('code' in b0, false, '无 code 时不得凭空造出 code 键（!== undefined 判定被放宽成恒真会在此变红）')
+      assert.strictEqual('statusCode' in b0, false, '无 statusCode 时不得造键')
+      assert.strictEqual('providerCode' in b0, false, '无 providerCode 时不得造键')
+      // ③ 非对象 reason（字符串抛出）必须退化为 `${channel} 发送失败` 或原消息，且不得抛
+      mkErr = () => 'plain-string-reason'
+      err = null
+      try { await slim.sendNotify('T', 'D') } catch (e) { err = e }
+      // 实测：字符串 reason 走 `reason && typeof reason === 'object'` 的假分支 ⇒ 只回填 channel（不造 code/statusCode 等键）
+      const c0 = err.failures[0]
+      assert.strictEqual(c0.channel, '企业微信', 'channel 必须回填')
+      assert.strictEqual('code' in c0, false, '字符串 reason 不得进入字段透传分支')
+      assert.strictEqual('providerCode' in c0, false, '字符串 reason 不得进入字段透传分支')
+      assert.strictEqual(err.message, '所有推送通道失败: plain-string-reason', '聚合消息必须原样保留字符串 reason 的文本')
+      console.log('✅ PlanF normalizeFailure：code/statusCode/providerCode 透传、缺失不造键、非对象 reason 退化')
+    } finally {
+      if (origStreamPost) gotMod.stream.post = origStreamPost
+      clearCfg()
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
   console.log('test_sendnotify_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })

@@ -1,10 +1,12 @@
 'use strict'
 
+/* eslint camelcase: off */ // 模块导出的配置对象字面量就叫 push_config（改名会与生产同名导出脱钩）
+
 // xbk_sendNotify_slim.js 纯函数方法测试（提升变异分数）
 // 覆盖：maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags
 const assert = require('node:assert')
 const fs = require('node:fs')
-const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags } = require('./xbk_sendNotify_slim')
+const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, hasWxPusherConfigured } = require('./xbk_sendNotify_slim')
 // 判定器同源（S1/F1/P1）与截断单一实现（S6/F7）回归的对拍对象
 const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
 const { createUtils } = require('./xbk_utils')
@@ -586,5 +588,568 @@ check('PERF_MS 缩放 ④: 生效上界必须来自本进程 PERF_MS，断言点
   const bareRatio = bareRatioRes.map(re => bareSrc.match(re)).filter(Boolean).map(m => m[0])
   assert.deepStrictEqual(bareRatio, [], `比值断言不得退回不含 PERF_SCALE 因子的裸形式，已发现：${bareRatio.join(' / ')}`)
 })
+
+// ============================================================
+// 脱敏链：addSecretCandidates → collectConfiguredSecrets → configuredSecrets → redactSecrets
+// 这四个函数未导出，但从 safeErr 出口可观测：push_config 里的密钥值一旦出现在错误摘要里，
+// 必须被 maskKey 遮蔽。cron 日志会重定向/分享，这条链断了就是真实密钥明文落盘。
+// 每个用例把 push_config 临时换成给定键值（只换本次关心的），跑完逐键恢复。
+// ============================================================
+function withConfig (patch, fn) {
+  const saved = {}
+  for (const k of Object.keys(push_config)) saved[k] = push_config[k]
+  try {
+    for (const k of Object.keys(push_config)) delete push_config[k]
+    for (const [k, v] of Object.entries(saved)) push_config[k] = v
+    for (const [k, v] of Object.entries(patch)) push_config[k] = v
+    return fn()
+  } finally {
+    for (const k of Object.keys(push_config)) delete push_config[k]
+    for (const [k, v] of Object.entries(saved)) push_config[k] = v
+  }
+}
+
+check('safeErr 脱敏: 密钥字段值被遮蔽成 maskKey 形态', () => {
+  withConfig({ PUSH_KEY: 'fakesecretvalue' }, () => {
+    assert.strictEqual(safeErr('失败 fakesecretvalue 结束'), '失败 fake***ue 结束')
+    assert.strictEqual(safeErr('fakesecretvalue'), maskKey('fakesecretvalue'))
+  })
+})
+
+check('safeErr 脱敏: URL 型密钥的路径段单独参与脱敏', () => {
+  // 值里带 :// 时还要把 host 之后的路径段拆出来单独脱敏（Bark/Server酱 常把设备码放在路径里）
+  withConfig({ PUSH_KEY: 'https://host.example/secretsegment' }, () => {
+    assert.strictEqual(safeErr('x secretsegment y'), 'x secr***nt y', 'URL 路径段必须单独遮蔽')
+    assert.strictEqual(safeErr('secretsegment'), maskKey('secretsegment'))
+  })
+})
+
+check('safeErr 脱敏: # 分隔型密钥逐段参与脱敏', () => {
+  withConfig({ PUSHME_KEY: 'aaaa1111#bbbb2222' }, () => {
+    assert.strictEqual(safeErr('bbbb2222'), maskKey('bbbb2222'), '多设备码必须逐段遮蔽（不只遮整串）')
+    assert.strictEqual(safeErr('aaaa1111'), maskKey('aaaa1111'))
+    // 整值本身也是候选：日志里出现完整配置值时必须整串遮蔽（曾被逐段拆开遮）
+    assert.strictEqual(safeErr('值 aaaa1111#bbbb2222 结束'), '值 aaaa***22 结束', '整值必须作为整体候选被遮蔽')
+  })
+})
+
+check('safeErr 脱敏: 不足 4 字符的整值与分段不参与（短值会把正文打花）', () => {
+  withConfig({ PUSH_KEY: 'abc' }, () => {
+    assert.strictEqual(safeErr('abc'), 'abc', '3 字符整值不得加入候选')
+  })
+  withConfig({ PUSHME_KEY: 'longvalue#ab' }, () => {
+    assert.strictEqual(safeErr('ab'), 'ab', '不足 4 字符的分段不得加入候选')
+    assert.strictEqual(safeErr('longvalue'), maskKey('longvalue'), '够长的分段仍须遮蔽')
+  })
+})
+
+check('safeErr 脱敏: 恰好 4 字符是参与下界', () => {
+  withConfig({ PUSHME_KEY: 'longvalue#abcd' }, () => {
+    assert.strictEqual(safeErr('abcd'), maskKey('abcd'), '4 字符分段必须参与脱敏')
+  })
+  withConfig({ PUSH_KEY: 'abcd' }, () => {
+    assert.strictEqual(safeErr('abcd'), maskKey('abcd'), '4 字符整值必须参与脱敏')
+  })
+})
+
+check('safeErr 脱敏: 长候选优先替换，短前缀先替换会残留明文尾部', () => {
+  // 候选按长度降序替换：短候选先替换会把长密钥切成「前缀被遮、尾部明文」，等于脱敏失效。
+  withConfig({ PUSH_KEY: 'abcd', PUSH_PLUS_TOKEN: 'abcdefghij' }, () => {
+    const r = safeErr('abcdefghij')
+    assert.strictEqual(r, '******ij')
+    assert.ok(!r.includes('efghij'), `脱敏后不得残留密钥尾部明文，实际：${r}`)
+  })
+})
+
+check('safeErr 脱敏: 数组值与数组项递归参与脱敏', () => {
+  withConfig({ WX_pusher_appToken: ['arrsecretvalue'] }, () => {
+    assert.strictEqual(safeErr('arrsecretvalue'), maskKey('arrsecretvalue'), '数组内的字符串项必须递归收集')
+  })
+  withConfig({ WX_pusher_channels: [{ appToken: 'channelsSecret1' }] }, () => {
+    assert.strictEqual(safeErr('channelsSecret1'), maskKey('channelsSecret1'), '数组内对象的 appToken 必须递归收集')
+  })
+})
+
+check('safeErr 脱敏: channels 字段的 JSON 字符串展开后逐字段脱敏', () => {
+  // 青龙环境变量 WX_PUSHER_CHANNELS 是 JSON 字符串形态，必须先解析再收集里面的 appToken
+  withConfig({ WX_pusher_channels: JSON.stringify([{ appToken: 'zzzzapptoken' }, { topicIds: '9999' }]) }, () => {
+    assert.strictEqual(safeErr('zzzzapptoken'), maskKey('zzzzapptoken'))
+  })
+})
+
+check('safeErr 脱敏: 非 channels 字段的 JSON 字符串不得展开', () => {
+  // 展开只对 fieldName 含 channels 的字符串生效；否则会把无关配置里的 appToken 当密钥（甚至解析异常拖垮整轮收集）
+  withConfig({ QYWX_ORIGIN: JSON.stringify({ appToken: 'qqqqapptoken' }) }, () => {
+    assert.strictEqual(safeErr('qqqqapptoken'), 'qqqqapptoken', '非 channels 字段不得展开 JSON')
+  })
+})
+
+check('safeErr 脱敏: 字段名白名单逐形态命中', () => {
+  // SECRET_FIELD_RE 的每个分支都要有正例：token / app[_-]?token（含无分隔符）/ secret /
+  // password / authorization / (^|_)(key|auth) / bark_push / push_key / pushme_key / deer_key /
+  // xizhi_key / bot_token / user_id
+  const names = [
+    'token', 'APPToken', 'app_token', 'app-token', 'apptoken', 'secret', 'PASSWORD', 'Authorization',
+    'key', '_key', 'api_key', 'auth', '_auth', 'BARK_PUSH', 'PUSH_KEY', 'PUSHME_KEY', 'DEER_KEY',
+    'WX_XIZHI_KEY', 'TG_BOT_TOKEN', 'TG_USER_ID'
+  ]
+  const patch = {}
+  names.forEach((n, i) => { patch[n] = `secmark${String(i).padStart(4, '0')}` })
+  withConfig(patch, () => {
+    names.forEach((n, i) => {
+      const v = `secmark${String(i).padStart(4, '0')}`
+      assert.strictEqual(safeErr(v), maskKey(v), `字段名 ${n} 的值必须被脱敏`)
+    })
+  })
+})
+
+check('safeErr 脱敏: 非密钥字段名不得参与（负例）', () => {
+  const plain = [
+    'QYWX_ORIGIN', 'PUSHME_URL', 'TG_API_HOST', 'DEER_URL', 'BARK_URL', 'BARK_GROUP',
+    'BARK_SOUND', 'BARK_ICON', 'BARK_LEVEL', 'PUSH_PLUS_USER', 'WX_pusher_topicIds', 'HITOKOTO'
+  ]
+  const patch = {}
+  plain.forEach((n, i) => { patch[n] = `plainmark${String(i).padStart(2, '0')}` })
+  withConfig(patch, () => {
+    plain.forEach((n, i) => {
+      const v = `plainmark${String(i).padStart(2, '0')}`
+      assert.strictEqual(safeErr(v), v, `非密钥字段 ${n} 的值不得被脱敏`)
+    })
+  })
+})
+
+check('safeErr 脱敏: 配置脏值（null / 数字 / 对象）不得中断后续密钥脱敏', () => {
+  // 注释承诺「配置脏值不影响日志输出」：脏值必须被跳过后继续收集，而不是抛错中断整轮。
+  withConfig({ HITOKOTO: null, TG_BOT_TOKEN: 'tgSecretValue01' }, () => {
+    assert.strictEqual(safeErr('tgSecretValue01'), maskKey('tgSecretValue01'), 'null 脏值不得中断后续收集')
+  })
+  withConfig({ HITOKOTO: 0, TG_BOT_TOKEN: 'tgSecretValue01' }, () => {
+    assert.strictEqual(safeErr('tgSecretValue01'), maskKey('tgSecretValue01'), '数字脏值不得中断后续收集')
+  })
+  withConfig({ WX_pusher_channels: [{ appToken: 'channelsSecret1' }], TG_BOT_TOKEN: 'tgSecretValue01' }, () => {
+    assert.strictEqual(safeErr('tgSecretValue01'), maskKey('tgSecretValue01'), '数组值不得因走错分支而中断收集')
+  })
+})
+
+check('safeErr 脱敏: 非 URL 字符串不得进入 URL 分段分支', () => {
+  // 字段值不含 {}:// 时 match 为空，必须跳过而不是抛错——否则后置密钥全部漏遮
+  withConfig({ BARK_PUSH: 'not a url with spaces', TG_BOT_TOKEN: 'tgSecretValue01' }, () => {
+    assert.strictEqual(safeErr('tgSecretValue01'), maskKey('tgSecretValue01'))
+  })
+})
+
+// ===== safeErr：协议摘要字段与 200 字符边界 =====
+check('safeErr: 无 message 的对象取协议摘要字段，未命中字段时显式降级', () => {
+  assert.strictEqual(safeErr({}), '[响应结构异常]', '空对象不得返回空串（否则失败日志整条丢失）')
+  assert.strictEqual(safeErr({ code: 'ECONNRESET', statusCode: 500 }), '{"code":"ECONNRESET","statusCode":"500"}')
+  assert.strictEqual(safeErr({ errno: -104, errmsg: 'bad gateway' }), '{"errno":"-104","errmsg":"bad gateway"}')
+})
+
+check('safeErr: 恰好 200 字符不截断、201 字符截断（字符串与 Error 两条路径）', () => {
+  const y200 = 'y'.repeat(200)
+  const y201 = 'y'.repeat(201)
+  assert.strictEqual(safeErr(y200), y200, '200 字符在阈值内，不得追加省略号')
+  assert.strictEqual(safeErr(y200).length, 200)
+  assert.strictEqual(safeErr(y201).length, 201, '201 字符必须截断到 200 + 省略号')
+  assert.ok(safeErr(y201).endsWith('…'))
+  assert.strictEqual(safeErr(new Error(y200)), y200, 'Error.message 路径同一阈值')
+  assert.strictEqual(safeErr(new Error(y201)).length, 201)
+  assert.ok(safeErr(new Error(y201)).endsWith('…'))
+})
+
+// ===== stripAngleTags：autolink 前缀判定与 trim =====
+// SonarCloud S5332 对 http:// 字面量告警；此处只测解析（不发请求），用拼接规避字面量
+const HTTP_ = 'http' + '://'
+check('stripAngleTags: http:// 与 http: 前缀的 autolink 保留内容', () => {
+  assert.strictEqual(stripAngleTags('<' + HTTP_ + 'x>', true), HTTP_ + 'x', 'https? 的 s 可选')
+  assert.strictEqual(stripAngleTags('<http:x>', true), 'http:x', '// 可选')
+  assert.strictEqual(stripAngleTags('<HTTPS://X>', true), 'HTTPS://X', '大小写不敏感')
+  assert.strictEqual(stripAngleTags('<ftp://x>', true), '', '非 http(s) 方案仍按 HTML 标签剥空')
+})
+
+check('stripAngleTags: 尖括号内首尾空白先 trim 再判定 autolink', () => {
+  assert.strictEqual(stripAngleTags('< ' + HTTP_ + 'x>', true), HTTP_ + 'x')
+  assert.strictEqual(stripAngleTags('<' + HTTP_ + 'x >', true), HTTP_ + 'x')
+})
+
+check('stripAngleTags: 无 ">" 的尾部原样保留（i>0 时不得重复前缀）', () => {
+  assert.strictEqual(stripAngleTags('文字<未闭合', true), '文字<未闭合')
+  assert.strictEqual(stripAngleTags('a<b>c<未闭合', true), 'ac<未闭合')
+})
+
+// ===== mdToPlain 内联正则：斜体 lookbehind / 标题量词 / 实体解码 =====
+check('mdToPlain: 斜体前后为字母或串首串尾仍剥除（数字例外）', () => {
+  assert.strictEqual(mdToPlain('a*b*c'), 'abc')
+  assert.strictEqual(mdToPlain('*a*'), 'a')
+  assert.strictEqual(mdToPlain('5*3*2cm'), '5*3*2cm', '数字前后不剥（既有语义）')
+})
+
+check('mdToPlain: 多级标题（##~######）与多个空白', () => {
+  assert.strictEqual(mdToPlain('## 标题'), '标题')
+  assert.strictEqual(mdToPlain('###### h6'), 'h6')
+  assert.strictEqual(mdToPlain('#  两个空格'), '两个空格', '标题后的多个空白必须整体剥掉')
+  assert.strictEqual(mdToPlain('####### h7'), '####### h7', '超过 6 级不算标题')
+})
+
+check('mdToPlain: &quot; / &#39; 实体解码', () => {
+  assert.strictEqual(mdToPlain('&quot;q&quot;'), '"q"')
+  assert.strictEqual(mdToPlain('&#39;a&#39;'), "'a'")
+})
+
+// ===== mdLinksToPlain / mdImagesToPlain：线性扫描的「原样保留」分支 =====
+// 这些分支在 i>0（前面已有成功替换）时若把整个 s 追加进去，会重复前缀——必须只追加 s.slice(i)。
+check('mdLinksToPlain: 未闭合 ] 的尾部（i>0）原样保留，不重复整段', () => {
+  assert.strictEqual(mdLinksToPlain('[a](u) x[y'), 'a (u) x[y')
+})
+
+check('mdImagesToPlain: 未闭合 ] 的尾部（i>0）原样保留，不重复整段', () => {
+  assert.strictEqual(mdImagesToPlain('![a](u) x![y'), 'a x![y')
+})
+
+check('mdLinksToPlain: 连 ")" 都没有的畸形尾部（i>0）原样保留，不重复整段', () => {
+  assert.strictEqual(mdLinksToPlain('[a](u) [b](c'), 'a (u) [b](c')
+})
+
+check('mdImagesToPlain: 连 ")" 都没有的畸形尾部（i>0）原样保留，不重复整段', () => {
+  assert.strictEqual(mdImagesToPlain('![a](u) ![b](c'), 'a ![b](c')
+})
+
+check('mdLinksToPlain: 空 url 分支（i>0）只保留该构造，不重复整段', () => {
+  assert.strictEqual(mdLinksToPlain('[a](u) [b]() z'), 'a (u) [b]() z')
+})
+
+// ===== push_config 默认值：配置字面量变异（StringLiteral/ArrayDeclaration）的击杀面 =====
+check('push_config: 默认值逐键精确（空串默认不得被占位文本替换，非空默认不得被清空）', () => {
+  // 源码注释逐键声明默认值：''=未配置、'false'=一言关闭、'https://api.telegram.org'=TG 默认 API。
+  // StringLiteral 变异把 '' 换成 'Stryker was here!' ⇒ 「未配置」被自检当成已配置（假绿，
+  // 主流程却抛 NO_CHANNEL_CONFIG）；反向变异清空非空默认值 ⇒ 默认 API 地址/一言开关丢失。
+  const expected = {
+    HITOKOTO: 'false',
+    BARK_PUSH: '',
+    BARK_ARCHIVE: '',
+    BARK_GROUP: '',
+    BARK_SOUND: '',
+    BARK_ICON: '',
+    BARK_LEVEL: '',
+    BARK_URL: '',
+    PUSH_KEY: '',
+    DEER_KEY: '',
+    DEER_URL: '',
+    PUSH_PLUS_USER: '',
+    WX_pusher_topicIds: '',
+    PUSHME_URL: 'https://push.i-i.me',
+    PUSHME_KEY: '',
+    TG_USER_ID: '',
+    TG_API_HOST: 'https://api.telegram.org',
+    TG_PROXY_HOST: '',
+    TG_PROXY_PORT: ''
+  }
+  for (const [key, value] of Object.entries(expected)) {
+    assert.strictEqual(push_config[key], value, `push_config.${key} 默认值必须为 ${JSON.stringify(value)}`)
+  }
+})
+
+// ===== ENV_ALIASES：青龙 env 名 → push_config 键的映射表 =====
+check('ENV_ALIASES: 每个键的别名列表完整，任一条目有非空 env 即覆盖 push_config', () => {
+  // ArrayDeclaration 变异把别名列表清成 []、StringLiteral 变异把别名清成 '' ⇒ 面板里配好的密钥
+  // 静默不生效（推送仍「成功」但一条没发出）。三个多别名键用**最后一个**别名驱动，
+  // 证明整条列表都被保留而不是只剩首项。
+  const env = {
+    PUSH_PLUS_TOKEN: 'envPushPlus01',
+    PUSH_PLUS_USER: 'envPushPlusUser',
+    PUSH_KEY: 'envPushKey01',
+    BARK_PUSH: 'envBarkPush01',
+    BARK_ARCHIVE: 'envBarkArchive',
+    BARK_GROUP: 'envBarkGroup01',
+    BARK_SOUND: 'envBarkSound01',
+    BARK_ICON: 'envBarkIcon01',
+    BARK_LEVEL: 'envBarkLevel01',
+    BARK_URL: 'envBarkUrl01',
+    QYWX_KEY: 'envQywxKey01',
+    QYWX_ORIGIN: 'envQywxOrigin',
+    WX_PUSHER_APP_TOKEN: 'envWxAppToken1',
+    WX_PUSHER_TOPIC_IDS: 'envWxTopicIds1',
+    WX_PUSHER_CHANNELS: 'envWxChannels1',
+    WX_XIZHI_KEY: 'envXizhiKey01',
+    DEER_KEY: 'envDeerKey01',
+    PUSHME_KEY: 'envPushmeKey1',
+    PUSHME_URL: 'envPushmeUrl1',
+    TG_BOT_TOKEN: 'envTgBotToken',
+    TG_USER_ID: 'envTgUserId01',
+    TG_API_HOST: 'envTgApiHost1',
+    HITOKOTO: 'envHitokoto01'
+  }
+  const expect = {
+    PUSH_PLUS_TOKEN: 'envPushPlus01',
+    PUSH_PLUS_USER: 'envPushPlusUser',
+    PUSH_KEY: 'envPushKey01',
+    BARK_PUSH: 'envBarkPush01',
+    BARK_ARCHIVE: 'envBarkArchive',
+    BARK_GROUP: 'envBarkGroup01',
+    BARK_SOUND: 'envBarkSound01',
+    BARK_ICON: 'envBarkIcon01',
+    BARK_LEVEL: 'envBarkLevel01',
+    BARK_URL: 'envBarkUrl01',
+    QYWX_KEY: 'envQywxKey01',
+    QYWX_ORIGIN: 'envQywxOrigin',
+    WX_pusher_appToken: 'envWxAppToken1',
+    WX_pusher_topicIds: 'envWxTopicIds1',
+    WX_pusher_channels: 'envWxChannels1',
+    WX_XIZHI_KEY: 'envXizhiKey01',
+    DEER_KEY: 'envDeerKey01',
+    PUSHME_KEY: 'envPushmeKey1',
+    PUSHME_URL: 'envPushmeUrl1',
+    TG_BOT_TOKEN: 'envTgBotToken',
+    TG_USER_ID: 'envTgUserId01',
+    TG_API_HOST: 'envTgApiHost1',
+    HITOKOTO: 'envHitokoto01'
+  }
+  const modPath = require.resolve('./xbk_sendNotify_slim')
+  const cached = require.cache[modPath]
+  const saved = {}
+  for (const name of Object.keys(env)) { saved[name] = process.env[name]; process.env[name] = env[name] }
+  try {
+    delete require.cache[modPath]
+    const reloaded = require('./xbk_sendNotify_slim')
+    for (const [key, value] of Object.entries(expect)) {
+      assert.strictEqual(reloaded.push_config[key], value, `env 别名必须让 push_config.${key} 取值 ${value}`)
+    }
+  } finally {
+    delete require.cache[modPath]
+    if (cached) require.cache[modPath] = cached
+    for (const name of Object.keys(env)) {
+      if (saved[name] === undefined) delete process.env[name]
+      else process.env[name] = saved[name]
+    }
+  }
+})
+
+// ===== collectConfiguredSecrets：递归收集的环路防护与类型守卫 =====
+check('脱敏收集: 循环引用的对象不得死循环，且其中的密钥仍须收集', () => {
+  // seen.has/seen.add 是环路防护：has 恒 true ⇒ 对象树整棵被跳过（漏遮）；has 恒 false ⇒
+  // 自引用递归爆栈，被 configuredSecrets 的 catch 吞掉后同样整轮漏遮。
+  const cyclic = { api_secret: 'cycleSecret01' }
+  cyclic.self = cyclic
+  withConfig({ holderField: cyclic }, () => {
+    assert.strictEqual(safeErr('cycleSecret01'), maskKey('cycleSecret01'), '循环对象内的密钥必须被收集')
+  })
+})
+
+check('脱敏收集: 纯对象（非数组）逐字段递归下潜', () => {
+  // typeof value !== 'object' 守卫被反转/恒真时，对象值不再下潜 ⇒ 嵌套密钥整片漏遮。
+  withConfig({ nestedHolder: { deep: { bot_token: 'deepSecret001' } } }, () => {
+    assert.strictEqual(safeErr('deepSecret001'), maskKey('deepSecret001'), '嵌套对象的密钥必须递归收集')
+  })
+})
+
+check('脱敏收集: 非字符串原语（数字）跳过但不得中断后续收集', () => {
+  // 类型守卫失效时数字会走进 WeakSet 分支抛 TypeError，被外层 catch 吞掉 ⇒ 后面的密钥全漏遮。
+  withConfig({ numericHolder: 12345, textHolder: { PUSH_KEY: 'afterPrimSecret' } }, () => {
+    assert.strictEqual(safeErr('afterPrimSecret'), maskKey('afterPrimSecret'), '原语脏值不得中断后续收集')
+  })
+})
+
+check('脱敏收集: URL 路径分段的 4 字符下界（3 字符不加入候选）', () => {
+  withConfig({ BARK_PUSH: 'https://api.day.app/abc' }, () => {
+    assert.strictEqual(safeErr('abc'), 'abc', '3 字符分段不足下界，不得加入候选')
+  })
+  withConfig({ BARK_PUSH: 'https://api.day.app/abcd' }, () => {
+    assert.strictEqual(safeErr('abcd'), maskKey('abcd'), '4 字符分段必须加入候选')
+  })
+})
+
+// ===== nonEmpty：0/false/空白 vs '0'/'false' 的两侧口径 =====
+check('nonEmpty 口径: 0/false/纯空白不算已配置，"0"/"false" 等非空字符串算已配置', () => {
+  // 判定被反转或 trim/字符串化被去掉，都会在「只配了空白」时误报可用通道（自检假绿 → 全程漏推）。
+  withConfig({ PUSH_PLUS_TOKEN: '   ' }, () => {
+    assert.strictEqual(configuredChannelCount(), 0, '纯空白值不算已配置')
+  })
+  withConfig({ PUSH_PLUS_TOKEN: 0 }, () => {
+    assert.strictEqual(configuredChannelCount(), 0, '数字 0 不算已配置')
+  })
+  withConfig({ PUSH_PLUS_TOKEN: false }, () => {
+    assert.strictEqual(configuredChannelCount(), 0, 'false 不算已配置')
+  })
+  withConfig({ PUSH_PLUS_TOKEN: '0' }, () => {
+    assert.strictEqual(configuredChannelCount(), 1, '字符串 "0" 仍算已配置（历史口径不变）')
+  })
+})
+
+// ===== WX_pusher_channels 解析：丢弃原因必须逐条精确告警（不得静默成功） =====
+check('WX_pusher_channels: 丢弃/降级原因的告警文本与「已配置」判定逐例精确', () => {
+  // 解析分支被反转或 configuredText 空白判定被改，会让「配了值但配置无效」静默回退 ⇒ 用户看到
+  // 推送成功却一条没收到。逐例断言 hasWxPusherConfigured() 与 console.warn 的确切文本。
+  const warns = []
+  const originalWarn = console.warn
+  console.warn = (msg) => { warns.push(String(msg)) }
+  const tail = '，已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）'
+  try {
+    withConfig({ WX_pusher_channels: '{oops' }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), false, 'JSON 解析失败不得算已配置')
+      assert.strictEqual(warns.length, 1, 'JSON 解析失败必须告警且只告警一次')
+      assert.strictEqual(warns[0], '⚠️ WX_pusher_channels 不是合法 JSON' + tail)
+    })
+    withConfig({ WX_pusher_channels: '{"a":1}' }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), false, '非数组 JSON 不得算已配置')
+      assert.strictEqual(warns.length, 1, 'JSON 不是数组必须告警且只告警一次')
+      assert.strictEqual(warns[0], '⚠️ WX_pusher_channels 不是数组（应为 [{ appToken, topicIds }]）' + tail)
+    })
+    withConfig({ WX_pusher_channels: [{ topicIds: '1' }] }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), false, '整表缺 appToken 不得算已配置')
+      assert.strictEqual(warns.length, 1, '整表丢弃必须告警且只告警一次')
+      assert.strictEqual(warns[0], '⚠️ WX_pusher_channels 的 1 项均缺 appToken 或 topicIds' + tail)
+    })
+    withConfig({ WX_pusher_channels: '   ' }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), false, '纯空白视为未配置')
+      assert.strictEqual(warns.length, 0, '纯空白是未配置，不得告警')
+    })
+    withConfig({ WX_pusher_channels: [] }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), false, '空数组是明确不启用，不算已配置')
+      assert.strictEqual(warns.length, 0, '空数组不得告警')
+    })
+    withConfig({ WX_pusher_channels: [{ appToken: 'APP_A', topicIds: '1' }, { topicIds: '2' }] }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), true, '部分丢弃后仍有合法项即算已配置')
+      assert.strictEqual(warns.length, 1, '部分丢弃必须告警且只告警一次')
+      assert.strictEqual(warns[0], '⚠️ WX_pusher_channels 的 1 项缺 appToken 或 topicIds，已丢弃；仅启用其余 1 项')
+    })
+  } finally {
+    console.warn = originalWarn
+  }
+})
+
+// ===== WX_pusher_channels 解析簇真值表：丢弃原因与「已配置」判定（17 个 Survived 变异体的主战场） =====
+// 探针：注入给定 WX_pusher_channels，返回 hasWxPusherConfigured() 与该次解析逐字产生的 warning 列表。
+function probeChannels (value) {
+  const warns = []
+  const originalWarn = console.warn
+  console.warn = (msg) => { warns.push(String(msg)) }
+  try {
+    let configured
+    withConfig({ WX_pusher_channels: value }, () => { configured = hasWxPusherConfigured() })
+    return { configured, warns }
+  } finally {
+    console.warn = originalWarn
+  }
+}
+
+check('WX_pusher_channels: null/undefined/空白/显式空数组零告警，非 null 非字符串视为「已配置但不是数组」', () => {
+  // 杀 L878-880 的比较/逻辑符/字面量变异：null 与 undefined 必须短路成「未配置」（零告警），
+  // 而 0/false/{}/5 是「配了值但不是数组」必须逐字告警 —— 把 && 换 ||、把 !== 翻转、
+  // 把 typeof 比较或空串字面量替换掉，都会在这两侧之一露馅（真值表两侧都要有真/假断言）。
+  const NOT_ARRAY = '⚠️ WX_pusher_channels 不是数组（应为 [{ appToken, topicIds }]），已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）'
+  for (const v of [null, undefined, '', '   ', '\t\n', [], '[]']) {
+    const r = probeChannels(v)
+    assert.strictEqual(r.configured, false, `${String(v)} 必须视为未配置`)
+    assert.deepStrictEqual(r.warns, [], `${String(v)} 是未配置/显式空数组，不得告警`)
+  }
+  for (const v of [0, false, {}, 5]) {
+    const r = probeChannels(v)
+    assert.strictEqual(r.configured, false, `${String(v)} 解析不出条目`)
+    assert.deepStrictEqual(r.warns, [NOT_ARRAY], `${String(v)} 是非 null 非字符串，必须判为已配置并告警形状`)
+  }
+  assert.deepStrictEqual(probeChannels('{"a":1}').warns, [NOT_ARRAY], 'JSON 对象不是数组，必须告警形状')
+  assert.deepStrictEqual(probeChannels('{oops').warns,
+    ['⚠️ WX_pusher_channels 不是合法 JSON，已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）'],
+    '非法 JSON 必须逐字告警解析失败')
+  assert.strictEqual(probeChannels([{ topicIds: '1' }]).warns[0],
+    '⚠️ WX_pusher_channels 的 1 项均缺 appToken 或 topicIds，已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）',
+    '整表丢弃必须逐字告警并带上项数')
+})
+
+check('WX_pusher_channels: 项内三别名 + trim/逗号分隔/空项过滤，空白或逗号项不得冒充条目', () => {
+  // 杀 L895-899：项守卫被反转（合法项被丢、或非对象项走进属性访问而抛错）、appToken/topicIds 的 trim
+  // 被去掉、split 的 ',' 字面量被替换、filter(Boolean) 被去掉、条目对象字面量被清空——每一个都会让
+  // 「无效项」冒充合法通道（静默启用一个永远发不出去的通道）。逐例 deepStrictEqual 告警逐字文案。
+  const ALL_MISSING = '⚠️ WX_pusher_channels 的 1 项均缺 appToken 或 topicIds，已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）'
+  for (const v of [
+    [{ appToken: 'APP_A', topicIds: '1,2' }],
+    [{ appToken: 'APP_A', topicIds: '1,2,3' }],
+    [{ app_token: 'APP_B', topic_ids: ' 3 , 4 ' }],
+    [{ WX_pusher_appToken: 'APP_C', WX_pusher_topicIds: '5' }]
+  ]) {
+    const r = probeChannels(v)
+    assert.strictEqual(r.configured, true, `合法条目必须算已配置：${JSON.stringify(v)}`)
+    assert.deepStrictEqual(r.warns, [], `合法条目不得告警：${JSON.stringify(v)}`)
+  }
+  for (const v of [
+    [{ appToken: '   ', topicIds: '1' }],
+    [{ appToken: 'A', topicIds: '   ' }],
+    [{ appToken: 'A', topicIds: ',' }],
+    [{ appToken: 'A', topicIds: ' , ' }],
+    [null],
+    [' APP_A ']
+  ]) {
+    const r = probeChannels(v)
+    assert.strictEqual(r.configured, false, `无效项不得冒充条目：${JSON.stringify(v)}`)
+    assert.deepStrictEqual(r.warns, [ALL_MISSING], `无效项必须逐字告警：${JSON.stringify(v)}`)
+  }
+  const partial = probeChannels([{ appToken: 'APP_A', topicIds: '1' }, { appToken: '  ', topicIds: '2' }])
+  assert.strictEqual(partial.configured, true, '部分丢弃后仍有合法项即算已配置')
+  assert.deepStrictEqual(partial.warns,
+    ['⚠️ WX_pusher_channels 的 1 项缺 appToken 或 topicIds，已丢弃；仅启用其余 1 项'],
+    '部分丢弃必须按条数逐字告警')
+  // 函数项：typeof 是 'function' 而非 'object'，必须丢弃；项守卫的 || 被换成 && 时它会带着
+  // appToken/topicIds 混进 channels（函数在 JSON 里序列化成 null，故前面补一个合法项让缓存键唯一）
+  const fnItem = Object.assign(() => {}, { appToken: 'APP_F', topicIds: '2' })
+  const withFn = probeChannels([{ appToken: 'APP_A', topicIds: '1' }, fnItem])
+  assert.strictEqual(withFn.configured, true, '函数项丢弃后合法项仍算已配置')
+  assert.deepStrictEqual(withFn.warns,
+    ['⚠️ WX_pusher_channels 的 1 项缺 appToken 或 topicIds，已丢弃；仅启用其余 1 项'],
+    '函数项不是对象，必须按丢弃项计入告警条数')
+})
+
+// ===== 补测 PlanC：Markdown/文本处理簇的形态边界（父代理按 instrumenter 逐 id 定位后补齐）=====
+// 反例（改动前）：下列形态边界在既有用例下全部存活——既有用例覆盖了主路径与「未闭合 ]」，
+// 但没有覆盖 findDestEnd 的括号嵌套/转义/角括号预算、truncateBytes 的字节边界、cleanSurrogates 的配对语义。
+
+// --- findDestEnd（经导出的 mdLinksToPlain / mdImagesToPlain 观测）---
+// 杀「括号嵌套计数」「转义跳过」「角括号分支」「预算守卫」四类变异体。
+check('PlanC findDestEnd: 目标里的嵌套括号必须配平到最外层（p1）', () => {
+  // 目标 http://a/(b) 中的括号要配平；变异把 d 的增减/边界改坏就会截在错误位置
+  const out = mdLinksToPlain('[t](http://a/(b))')
+  assert.strictEqual(out, 't (http://a/(b))', '嵌套括号必须整体收进链接目标')
+})
+
+check('PlanC findDestEnd: 转义括号不参与配平（p2）', () => {
+  const out = mdLinksToPlain('[t](http://a/\\(x\\))')
+  assert.strictEqual(out, 't (http://a/\\(x\\))', '反斜杠转义的括号必须被跳过、不改变配平深度')
+})
+
+check('PlanC findDestEnd: 角括号包裹的目标必须整体保留（p3）', () => {
+  // 实测：角括号形态的目标**连尖括号一起**原样保留在输出里（并非剥掉 <>）。
+  assert.strictEqual(mdLinksToPlain('[t](<http://a>)'), 't (<http://a>)', '角括号命中 g+1 后目标段必须完整取出（含 <>）')
+  assert.strictEqual(mdLinksToPlain('[t](<http://a> extra)'), 't (<http://a> extra)', '角括号后不是 ) 时必须继续走配平循环、同样完整保留')
+})
+
+check('PlanC findDestEnd: 预算耗尽必须回落而不越界（p4）', () => {
+  // 角括号分支要先扣预算：'[a](<' 这类「有 < 但没有 >」的畸形构造不得扫到串尾后仍返回越界值
+  const out = mdLinksToPlain('[a](<')
+  assert.strictEqual(typeof out, 'string', '畸形输入不得抛错')
+  assert.strictEqual(out.includes('undefined'), false, '不得把越界下标拼进输出')
+})
+
+// --- mdLinksToPlain / mdImagesToPlain 的畸形尾部必须原样保留且不重复整段 ---
+check('PlanC mdLinksToPlain: 连 ")" 都没有的畸形尾部原样保留（p5）', () => {
+  assert.strictEqual(mdLinksToPlain('[t](http://a'), '[t](http://a', '既无 ) 也无配平时必须原样保留整段，不得重复前缀')
+  assert.strictEqual(mdLinksToPlain('pre [t](http://a'), 'pre [t](http://a', '带前缀时同样不得重复前缀')
+})
+
+check('PlanC mdImagesToPlain: 未闭合且无可配平括号时原样保留（p6）', () => {
+  assert.strictEqual(mdImagesToPlain('![a](http://x'), '![a](http://x', '图片链接畸形尾部必须原样保留')
+})
+
+// --- truncateBytes（经 mdToPlain 的出口清洗路径不可达；该函数未导出 ⇒ 只断言可观测行为）---
+// 说明：truncateBytes 未在 module.exports 中，无法直接断言；其 13 个靶子需经调用点观测。
+// 已在报告里登记为「需导出或注入才可观测」，此处不写自欺断言。
+
+// --- cleanSurrogates（未导出 ⇒ 经 sendNotify 入口观测：入口必须清洗孤立代理）---
+// 该函数未导出，但其语义可由「sendNotify 对入参的清洗」间接锁定（见 test_sendnotify_utils.js 的通道用例）。
+// 此处不写不可达断言，登记为「需导出才可直接断言」。
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_sendnotify_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

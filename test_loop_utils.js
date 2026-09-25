@@ -409,5 +409,247 @@ const { runLoop, sleep, refreshTimeoutError, isAbortable } = require('./xbk_loop
     await delay(0)
   }
 
+  // 本地小工具：把「该 settle 却永不 settle」的变异体转成快速失败，而不是只靠 900s 外部超时判负。
+  // 计时器必须在 race settle 后清掉：p 先 settle 时原写法仍留着定时器存活，
+  // 会把进程多留 ms 毫秒（反复的变异运行逐次累积这段空等）。见 PR #173 评审。
+  const withinSettle = (p, ms = 2000) => {
+    let timer
+    const deadline = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('未在期限内 settle')), ms) })
+    return Promise.race([p, deadline]).finally(() => clearTimeout(timer))
+  }
+
+  // L1. clampTimerMs/refreshTimeoutError 的文案分支与上下界：专杀 EqualityOperator
+  //     `requestedMs > MAX_TIMER_MS`→`>=`（上界等值被误报「已钳制」）与 `requestedMs < 0`→`<=`（0 被误报非法）。
+  {
+    const MAX = 2 ** 31 - 1
+    assert.strictEqual(refreshTimeoutError(MAX).message, `常驻刷新超过 ${MAX}ms 未完成`, '恰为上界不得出现「已钳制」文案')
+    assert.strictEqual(refreshTimeoutError(0).message, '常驻刷新超过 0ms 未完成', '0 是合法下界，不得报「已按 0 处理」')
+    assert.strictEqual(refreshTimeoutError(MAX + 1).message, `常驻刷新超过 ${MAX}ms 未完成（配置请求 ${MAX + 1}ms，超出 setTimeout 上限已钳制）`, '越上界必须报钳制')
+    assert.strictEqual(refreshTimeoutError(-5).message, '常驻刷新超过 0ms 未完成（配置值 -5ms 非法，已按 0 处理）', '负值必须报按下界处理')
+    assert.strictEqual(refreshTimeoutError(Number.POSITIVE_INFINITY).message, '常驻刷新超过 10000ms 未完成（配置值 Infinity 非法，已回落默认 10000ms）', '非有限值必须报回落默认')
+  }
+
+  // L2. runLoop 复用 sleep/runBounded 时的监听契约与 cycle 语义（duck signal 可观测）——一次覆盖：
+  //     注册的监听必须全部摘除（cleanup 未被清空 / 摘除守卫未被绕过）、事件名与 { once: true } 精确、
+  //     预热拿到的是 childController 的 signal（不是父 signal）、refreshEvery=2 只在 cycle 2 触发一次
+  //     （`cycle += 1`→`-= 1`、`onInterval && cycle % refreshEvery === 0`、onInterval 参数对象变异体）。
+  {
+    const added = []
+    const removed = []
+    const live = new Set()
+    const duck = {
+      aborted: false,
+      addEventListener (ev, fn, opts) { added.push([ev, fn, opts]); live.add(fn) },
+      removeEventListener (ev, fn) { removed.push([ev, fn]); live.delete(fn) }
+    }
+    const cycles = []
+    const childSignals = []
+    let runs = 0
+    const loop = runLoop(async () => {
+      runs += 1
+      if (runs >= 3) { duck.aborted = true; for (const fn of [...live]) fn() }
+    }, {
+      intervalMs: 0,
+      refreshEvery: 2,
+      signal: duck,
+      onInterval: async (ctx) => { cycles.push(ctx.cycle); childSignals.push(ctx.signal) }
+    })
+    await withinSettle(loop)
+    assert.strictEqual(runs, 3, '前置：应跑满 3 轮')
+    assert.deepStrictEqual(cycles, [2], 'refreshEvery=2 只在 cycle 2 触发一次（cycle 必须递增）')
+    assert.strictEqual(childSignals.length, 1, '预热只应触发一次')
+    assert.ok(childSignals[0] && childSignals[0] !== duck, '预热必须拿到 childController 的 signal，不得退化成父 signal')
+    assert.ok(added.length >= 3, `前置：至少应注册 3 次监听，实际 ${added.length}`)
+    assert.strictEqual(removed.length, added.length, '每个注册的监听都必须被摘除（cleanup 未被清空、摘除守卫未被绕过）')
+    for (const [ev, fn] of removed) assert.ok(added.some(([e2, f2]) => e2 === ev && f2 === fn), '摘除的必须是注册过的同一函数（事件名/函数被变异会失配）')
+    for (const [ev, , opts] of added) {
+      assert.strictEqual(ev, 'abort', '只允许注册 abort 事件（StringLiteral 变异体）')
+      assert.deepStrictEqual(opts, { once: true }, '监听必须带 { once: true }（ObjectLiteral/BooleanLiteral 变异体）')
+    }
+    assert.strictEqual(live.size, 0, '退出后不得残留监听')
+  }
+
+  // L3. 预热超时路径：错误码/文案精确、超时必须中继 abort 给子 signal、且超时不中断循环——专杀
+  //     relayAbort()/cleanup/finish/文案被清空的 CallExpression/BlockStatement/StringLiteral 变异体。
+  {
+    const ctrl = new AbortController()
+    let runs = 0
+    let err = null
+    let child = null
+    let intervalErrors = 0
+    const loop = runLoop(async () => { runs += 1; if (runs >= 2) ctrl.abort() }, {
+      intervalMs: 0,
+      refreshEvery: 1,
+      signal: ctrl.signal,
+      onIntervalTimeoutMs: 20,
+      onInterval: async (ctx) => { child = ctx.signal; return new Promise(() => {}) },
+      onIntervalError: async (e) => { intervalErrors += 1; err = e }
+    })
+    await withinSettle(loop, 4000)
+    assert.strictEqual(intervalErrors, 1, '预热超时必须触发 onIntervalError 一次')
+    assert.strictEqual(err && err.code, 'INTERVAL_REFRESH_TIMEOUT', '超时错误码须为 INTERVAL_REFRESH_TIMEOUT')
+    assert.strictEqual(err && err.message, '常驻刷新超过 20ms 未完成', '超时文案须报实际生效毫秒数')
+    assert.strictEqual(child && child.aborted, true, '超时必须把 abort 中继给子 signal')
+    assert.strictEqual(runs, 2, '超时不得中断循环（第 2 轮仍执行并由停止信号退出）')
+  }
+
+  // L4. 只带 addEventListener 的 duck signal 不得抛错（摘除守卫）——专杀把
+  //     `typeof signal.removeEventListener === 'function'` 改成 true/`!==`/'' 的变异体（会去调不存在的方法）。
+  {
+    const adds = []
+    const half = { aborted: false, addEventListener (ev, fn) { adds.push(fn) } }
+    let runs = 0
+    const loop = runLoop(async () => {
+      runs += 1
+      if (runs >= 2) { half.aborted = true; for (const fn of adds.slice()) fn() }
+    }, { intervalMs: 0, refreshEvery: 1, signal: half, onInterval: async () => {} })
+    await withinSettle(loop)
+    assert.strictEqual(runs, 2, '无 removeEventListener 的 duck signal 不得让循环抛错')
+  }
+
+  // L5. 没有 AbortController 全局时 runBounded 必须退化为「直接用父 signal」且超时路径照常——专杀
+  //     `childController && !childController.signal.aborted` 被改成 true / `||`（会读 null.signal 抛错）。
+  {
+    const saved = globalThis.AbortController
+    const ctrl = new AbortController()
+    let err = null
+    try {
+      globalThis.AbortController = undefined
+      let runs = 0
+      const loop = runLoop(async () => { runs += 1; if (runs >= 2) ctrl.abort() }, {
+        intervalMs: 0,
+        refreshEvery: 1,
+        signal: ctrl.signal,
+        onIntervalTimeoutMs: 20,
+        onInterval: async () => new Promise(() => {}),
+        onIntervalError: async (e) => { err = e }
+      })
+      await withinSettle(loop, 4000)
+      assert.strictEqual(runs, 2, '循环轮次不受影响')
+    } finally { globalThis.AbortController = saved }
+    assert.strictEqual(err && err.code, 'INTERVAL_REFRESH_TIMEOUT', '无 AbortController 全局时仍须按超时正常 reject')
+  }
+
+  // L6. sleep 的监听契约：事件名/options 精确、abort 必须唤醒、done() 必须摘除监听——专杀 sleep 里的
+  //     StringLiteral/ObjectLiteral/BooleanLiteral 与 executor/done body 被清空的变异体。
+  {
+    const added = []
+    const removed = []
+    const duck = {
+      aborted: false,
+      addEventListener (ev, fn, opts) { added.push([ev, fn, opts]); setTimeout(() => { duck.aborted = true; fn() }, 5) },
+      removeEventListener (ev, fn) { removed.push([ev, fn]) }
+    }
+    const t0 = Date.now()
+    await withinSettle(sleep(10000, duck), 900)
+    assert.ok(Date.now() - t0 < 900, 'abort 必须唤醒 sleep，不得等满 10000ms')
+    assert.strictEqual(added.length, 1, '只应注册一次监听')
+    assert.strictEqual(added[0][0], 'abort', '只注册 abort 事件')
+    assert.deepStrictEqual(added[0][2], { once: true }, '监听必须带 { once: true }')
+    assert.strictEqual(removed.length, 1, 'done() 必须摘除自己的监听（未被清空）')
+    assert.strictEqual(removed[0][1], added[0][1], '摘除同一函数')
+  }
+
+  // L7. sleep(0) 必须正常 settle（executor/done body 被清空类变异体会永久挂起）。
+  {
+    const t0 = Date.now()
+    await withinSettle(sleep(0), 600)
+    assert.ok(Date.now() - t0 < 600, 'sleep(0) 必须 resolve')
+  }
+
+  // L8. runLoop 参数归一：intervalMs=-1 必须回落默认 10000ms（60ms 内只跑 1 轮，不得空转成百上千轮）——
+  //     专杀 intervalMs 守卫的 LogicalOperator `&&`→`||` 与 `>= 0` 条件变异体。
+  {
+    const ctrl = new AbortController()
+    let runs = 0
+    const loop = runLoop(async () => { runs += 1 }, { intervalMs: -1, signal: ctrl.signal })
+    setTimeout(() => ctrl.abort(), 60)
+    await withinSettle(loop, 3000)
+    assert.strictEqual(runs, 1, `intervalMs=-1 必须回落默认 10000ms（60ms 内仅 1 轮），实际 ${runs} 轮`)
+  }
+
+  // L9. refreshEvery 非法值（1.5 / 0）必须回落默认 10：11 轮内仍只在 cycle 10 触发一次——专杀
+  //     `Number.isInteger(...)`/`> 0` 被改成 true / `>= 0` 的变异体（1.5 会在 3、9 轮触发；0 会永不触发）。
+  {
+    const invalidRefreshEvery = [1.5, 0]
+    for (const bad of invalidRefreshEvery) {
+      const ctrl = new AbortController()
+      let runs = 0
+      const cycles = []
+      const loop = runLoop(async () => { runs += 1; if (runs >= 11) ctrl.abort() }, {
+        intervalMs: 0,
+        refreshEvery: bad,
+        signal: ctrl.signal,
+        onInterval: async (ctx) => { cycles.push(ctx.cycle) }
+      })
+      await withinSettle(loop, 4000)
+      assert.deepStrictEqual(cycles, [10], `refreshEvery=${bad} 非法必须回落默认 10（只在 cycle 10 触发）`)
+    }
+  }
+
+  // L10. 未传 onError 时默认实现必须打印，且对非 Error 抛出物按 String 处理（不得读 .message）——专杀
+  //      默认文案里 `error && error.message` 的 LogicalOperator/ConditionalExpression 变异体。
+  {
+    const ctrl = new AbortController()
+    const origErr = console.error
+    const logged = []
+    console.error = (...a) => logged.push(a.join(' '))
+    try {
+      const nonErr = { code: 'NON_ERROR' }
+      let runs = 0
+      const loop = runLoop(async () => {
+        runs += 1
+        if (runs >= 2) ctrl.abort()
+        throw nonErr
+      }, { intervalMs: 0, signal: ctrl.signal })
+      await withinSettle(loop)
+    } finally { console.error = origErr }
+    assert.deepStrictEqual(logged, [
+      '常驻循环单轮失败（调用方未提供 onError）: [object Object]',
+      '常驻循环单轮失败（调用方未提供 onError）: [object Object]'
+    ], `未传 onError 的错误必须打印且非 Error 按 String 处理，实际 ${JSON.stringify(logged)}`)
+  }
+
+  // L11. onInterval 传非函数必须归一为「不预热」而不是被当真处理器调用——专杀
+  //      `typeof options.onInterval === 'function'`→true。
+  {
+    const ctrl = new AbortController()
+    let runs = 0
+    let intervalErrors = 0
+    const loop = runLoop(async () => { runs += 1; if (runs >= 2) ctrl.abort() }, {
+      intervalMs: 0,
+      refreshEvery: 1,
+      signal: ctrl.signal,
+      onInterval: 'not-a-function',
+      onIntervalError: async () => { intervalErrors += 1 }
+    })
+    await withinSettle(loop)
+    assert.strictEqual(intervalErrors, 0, 'onInterval 非函数必须归一为不预热（不得触发 onIntervalError）')
+    assert.strictEqual(runs, 2, '循环轮次不受影响')
+  }
+
+  // L12. onIntervalTimeoutMs 非法值（-1 / 0）必须回落默认 10000ms，而不是让预热立刻超时——专杀
+  //      `> 0`→`>= 0`、`&&`→`||` 两类变异体。
+  {
+    const invalidTimeoutMs = [-1, 0]
+    for (const bad of invalidTimeoutMs) {
+      const ctrl = new AbortController()
+      let runs = 0
+      let refreshed = 0
+      let intervalErrors = 0
+      const loop = runLoop(async () => { runs += 1; if (runs >= 2) ctrl.abort() }, {
+        intervalMs: 0,
+        refreshEvery: 1,
+        signal: ctrl.signal,
+        onIntervalTimeoutMs: bad,
+        onInterval: async () => { refreshed += 1; await sleep(20) },
+        onIntervalError: async () => { intervalErrors += 1 }
+      })
+      await withinSettle(loop, 4000)
+      assert.strictEqual(refreshed, 1, `onIntervalTimeoutMs=${bad} 时预热应正常完成一次（20ms 任务不得被判超时）`)
+      assert.strictEqual(intervalErrors, 0, `onIntervalTimeoutMs=${bad} 必须回落默认 10000ms`)
+    }
+  }
+
   console.log('test_loop_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })

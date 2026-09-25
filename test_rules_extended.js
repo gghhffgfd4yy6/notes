@@ -369,4 +369,164 @@ check('compileStateOf: 同一配置在 re2 缺失/规则编译失败时指纹不
   assert.ok(withRe2.compileStateOf(null).includes('keyword=null'), '空编译结果的字段一律记为未编译')
 })
 
+// === _validateCatRe（PlanA）：空值 / 嵌套量词 / re2 有效性三条分支 ===
+check('_validateCatRe：空分类（null/undefined）只产出一条空值警告并早退', () => {
+  const e = createRuleEngine({ Utils: {}, FILTER_FIELDS: ['keyword'], compileUserRegex: () => true, isRe2Available: () => false })
+  const w = []
+  assert.strictEqual(e._validateCatRe(null, 'keyword', w), undefined, '空分类不得返回非 undefined')
+  assert.strictEqual(w.length, 1, 'null 只产出一条警告')
+  assert.ok(w[0].endsWith('配置「keyword」分类正则为空，该行将被忽略'), `空值警告文本必须精确：${w[0]}`)
+  const w2 = []
+  e._validateCatRe(undefined, 'pingbitime', w2)
+  assert.strictEqual(w2.length, 1, 'undefined 与 null 走同一分支')
+  assert.ok(w2[0].endsWith('配置「pingbitime」分类正则为空，该行将被忽略'), `field 必须出现在警告里：${w2[0]}`)
+})
+
+check('_validateCatRe：嵌套量词/交替歧义分支优先于 re2 有效性检查', () => {
+  const e = createRuleEngine({ Utils: {}, FILTER_FIELDS: ['keyword'], compileUserRegex: () => true, isRe2Available: () => true })
+  const w = []
+  e._validateCatRe('(a+)+', 'keyword', w)
+  assert.strictEqual(w.length, 1, '嵌套量词必须恰好产出一条警告')
+  assert.ok(w[0].endsWith('配置「keyword」分类正则含嵌套量词，可能导致灾难性回溯，该行将被忽略：「(a+)+」'), `嵌套量词警告文本必须精确：${w[0]}`)
+  const w2 = []
+  e._validateCatRe('(a|aa)+', 'pingbitime', w2)
+  assert.strictEqual(w2.length, 1, '交替歧义同样命中嵌套量词分支')
+  assert.ok(w2[0].includes('「(a|aa)+」'), '警告必须回显被拦下的模式')
+  const w3 = []
+  e._validateCatRe('abc', 'keyword', w3)
+  assert.strictEqual(w3.length, 0, '合法分类正则不得产生任何警告（杀条件被强制为 true）')
+})
+
+check('_validateCatRe：仅当 re2 可用时才做正则有效性检查', () => {
+  const noRe2 = createRuleEngine({ Utils: {}, FILTER_FIELDS: ['keyword'], compileUserRegex: () => false, isRe2Available: () => false })
+  const w = []
+  noRe2._validateCatRe('BAD', 'keyword', w)
+  assert.strictEqual(w.length, 0, 're2 不可用时不得做有效性检查（否则不可编译模式被误报）')
+  const re2e = createRuleEngine({ Utils: {}, FILTER_FIELDS: ['keyword'], compileUserRegex: (p) => p !== 'BAD', isRe2Available: () => true })
+  const w2 = []
+  re2e._validateCatRe('GOOD', 'keyword', w2)
+  assert.strictEqual(w2.length, 0, 're2 可用且模式有效时不得告警')
+  const w3 = []
+  re2e._validateCatRe('BAD', 'pingbitime', w3)
+  assert.strictEqual(w3.length, 1, 're2 可用且模式无效时必须告警')
+  assert.ok(w3[0].endsWith('配置「pingbitime」分类正则无效：「BAD」'), `无效正则警告文本必须精确：${w3[0]}`)
+})
+
+check('_validateCatRe：有效性检查必须以 String(cat) 与固定 i 标志调用 compileUserRegex', () => {
+  // 反例（改动前）：三条分支用例只断言「有没有告警」，从没捕获 compileUserRegex 的实参——
+  // 于是 L145 的固定标志 'i'（StringLiteral）与 String(cat) 化都可被改掉而无人发现。
+  const seen = []
+  const e = createRuleEngine({
+    Utils: {},
+    FILTER_FIELDS: ['keyword'],
+    compileUserRegex: (p, f) => { seen.push([p, f]); return 'COMPILED' },
+    isRe2Available: () => true
+  })
+  e._validateCatRe('abc', 'keyword', [])
+  assert.deepStrictEqual(seen, [['abc', 'i']], '必须恰好以 (模式, 固定 i 标志) 调一次 compileUserRegex')
+  seen.length = 0
+  e._validateCatRe(42, 'keyword', [])
+  assert.deepStrictEqual(seen, [['42', 'i']], '非字符串分类必须先 String() 化再进编译（与 _compileCatRe 同口径）')
+  seen.length = 0
+  e._validateCatRe('(a+)+', 'keyword', [])
+  assert.deepStrictEqual(seen, [], '嵌套量词分支必须早退，不得进入编译')
+})
+
+// ===================== planB 追加（变异靶：compileStateOf / matchesCompiled / checkTimeCompiled / 规则迭代器）=====================
+// 时间替身刻意确定性（ms 视为「天刻度」），断言不依赖当前日期与时区；真假两侧成对。
+const r2xMake = (opts = {}) => {
+  const re2 = { on: opts.re2 === true }
+  const calls = []
+  const eng = createRuleEngine({
+    Utils: {
+      safeGet: (o, k) => (o === null || o === undefined ? undefined : o[k]),
+      safeErrorText: (err, dflt) => String((err && err.message) || dflt || ''),
+      parseTime: (t) => {
+        if (t === undefined || t === null || t === '') return null
+        const n = Number(t)
+        return Number.isFinite(n) ? n : null
+      },
+      daysFrom: (ms) => Math.floor(ms / 86400000)
+    },
+    FILTER_FIELDS: opts.fields || ['keyword'],
+    compileUserRegex: (src, flags) => { calls.push([String(src), flags]); return new RegExp(String(src), flags) },
+    isRe2Available: () => re2.on
+  })
+  return { eng, re2, calls }
+}
+
+check('compileStateOf：编译生效指纹的形状分派与拼接串必须精确', () => {
+  // 杀 compileStateOf L312/L314/L318/L323/L324：null/re/multi/time/timeMulti/未知类型分派与整串拼接
+  const { eng } = r2xMake({ re2: false })
+  assert.strictEqual(eng.compileStateOf({}), 're2=0,keyword=null,pingbitime=null')
+  assert.strictEqual(eng.compileStateOf({ keyword: { _type: 're', re: /x/ } }), 're2=0,keyword=re,pingbitime=null')
+  assert.strictEqual(eng.compileStateOf({ keyword: { _type: 'multi', rules: [1, 2, 3] } }), 're2=0,keyword=multi:3,pingbitime=null')
+  assert.strictEqual(eng.compileStateOf({ keyword: { _type: 'multi' } }), 're2=0,keyword=multi:0,pingbitime=null')
+  assert.strictEqual(eng.compileStateOf({ pingbitime: { _type: 'time' } }), 're2=0,keyword=null,pingbitime=time')
+  assert.strictEqual(eng.compileStateOf({ pingbitime: { _type: 'timeMulti', rules: [1] } }), 're2=0,keyword=null,pingbitime=timeMulti:1')
+  assert.strictEqual(eng.compileStateOf({ keyword: { _type: 'weird' } }), 're2=0,keyword=null,pingbitime=null')
+  const { eng: eng2 } = r2xMake({ re2: true })
+  assert.strictEqual(eng2.compileStateOf({}), 're2=1,keyword=null,pingbitime=null')
+})
+
+check('matchesCompiled：空输入/无效 re/空 multi 必须 false，re 与 multi 命中必须 true', () => {
+  // 杀 matchesCompiled L365/L371/L375/L377：形状守卫不得短路，_type 分派不得串档
+  const { eng } = r2xMake()
+  assert.strictEqual(eng.matchesCompiled(null, 'x'), false)
+  assert.strictEqual(eng.matchesCompiled({ _type: 're', re: /x/ }, undefined), false)
+  assert.strictEqual(eng.matchesCompiled({ _type: 're', re: /x/ }, null), false)
+  assert.strictEqual(eng.matchesCompiled({ _type: 're', re: /^$/ }, ''), false, '空字段值必须 false，不得让 /^$/ 命中')
+  assert.strictEqual(eng.matchesCompiled({ _type: 're', re: null }, 'x'), false)
+  assert.strictEqual(eng.matchesCompiled({ _type: 're', re: {} }, 'x'), false)
+  assert.strictEqual(eng.matchesCompiled({ _type: 're', re: /x/ }, 'x'), true)
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi' }, 'x'), false)
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi', rules: [] }, 'x'), false)
+  assert.strictEqual(eng.matchesCompiled({ _type: 'nope' }, 'x'), false)
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi', rules: [{ cat: null, val: /y/ }] }, 'y'), true)
+})
+
+check('_normalizeReInput：零宽字符剥离是精确契约（不可多剥、不可少剥）', () => {
+  // 杀 _normalizeReInput L330：U+200B-200D/U+FEFF 全部剥离，普通空白与制表符不得被剥离
+  const { eng } = r2xMake()
+  assert.strictEqual(eng._normalizeReInput('a\u200Bb\u200Cc\u200Dd\uFEFFe'), 'abcde')
+  assert.strictEqual(eng._normalizeReInput('a b\tc'), 'a b\tc')
+  assert.strictEqual(eng.matchesCompiled({ _type: 're', re: /^abc$/ }, 'a\u200Bb\uFEFFc'), true)
+})
+
+check('_catMatches / _anyRule / _firstMatchingRule：分类守卫、异常兜底与谓词语义', () => {
+  // 杀 L336/L338/L340/L347/L356/L358：catename 缺失必须 false（不得退化成字面 "undefined"/"null"）、test 抛错必须吞掉
+  const { eng } = r2xMake()
+  assert.strictEqual(eng._catMatches({ cat: null }, undefined), true, '无 cat 限制必须匹配所有')
+  assert.strictEqual(eng._catMatches({ cat: /undefined/ }, undefined), false)
+  assert.strictEqual(eng._catMatches({ cat: /^null$/ }, null), false)
+  assert.strictEqual(eng._catMatches({ cat: /^$/ }, ''), false)
+  assert.strictEqual(eng._catMatches({ cat: /^微博$/ }, '微博'), true)
+  assert.strictEqual(eng._catMatches({ cat: /^123$/ }, 123), true)
+  assert.strictEqual(eng._catMatches({ cat: { test () { throw new Error('boom') } } }, 'x'), false)
+  assert.strictEqual(eng._anyRule(null, 'x', () => true), false)
+  assert.strictEqual(eng._anyRule([{ cat: null, val: /a/ }], 'x', () => true), true)
+  assert.strictEqual(eng._anyRule([{ cat: /zzz/, val: /a/ }], 'x', () => true), false)
+  assert.strictEqual(eng._firstMatchingRule(null, 'x', () => true), null)
+  const rule = { cat: null, val: /a/ }
+  assert.strictEqual(eng._firstMatchingRule([rule], 'x', () => true), rule)
+  assert.strictEqual(eng._firstMatchingRule([{ cat: /zzz/, val: /a/ }], 'x', () => true), null)
+})
+
+check('checkTimeCompiled：不拦截(null) 与拦截(true/false) 两侧，阈值比较必须严格大于', () => {
+  // 杀 checkTimeCompiled L387/L391/L398/L399：缺失/非法注册时间放行，time 与 timeMulti 均不得用 >=
+  const { eng } = r2xMake()
+  assert.strictEqual(eng.checkTimeCompiled(null, { louzhuregtime: 1 }), null)
+  assert.strictEqual(eng.checkTimeCompiled({ _type: 'time', value: 10 }, { louzhuregtime: undefined }), null)
+  assert.strictEqual(eng.checkTimeCompiled({ _type: 'time', value: 10 }, { louzhuregtime: null }), null)
+  assert.strictEqual(eng.checkTimeCompiled({ _type: 'time', value: 10 }, { louzhuregtime: '' }), null)
+  assert.strictEqual(eng.checkTimeCompiled({ _type: 'time', value: 10 }, { louzhuregtime: 'not-a-date' }), null)
+  const fixed = { louzhuregtime: 10 * 86400000 }
+  assert.strictEqual(eng.checkTimeCompiled({ _type: 'time', value: 5 }, fixed), false)
+  assert.strictEqual(eng.checkTimeCompiled({ _type: 'time', value: 20 }, fixed), true)
+  assert.strictEqual(eng.checkTimeCompiled({ _type: 'time', value: 10 }, { louzhuregtime: 0 }), true, '0 时间戳视为有效（days=0）')
+  assert.strictEqual(eng.checkTimeCompiled({ _type: 'timeMulti', rules: [{ cat: null, value: 20 }] }, fixed), true)
+  assert.strictEqual(eng.checkTimeCompiled({ _type: 'timeMulti', rules: [{ cat: null, value: 10 }] }, fixed), false, '阈值等于天数必须不拦截')
+  assert.strictEqual(eng.checkTimeCompiled({ _type: 'timeMulti', rules: [{ cat: /zzz/, value: 20 }] }, { catename: 'x', louzhuregtime: 10 * 86400000 }), false)
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_rules_extended.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

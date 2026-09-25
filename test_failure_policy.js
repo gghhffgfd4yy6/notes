@@ -712,6 +712,246 @@ function error (message, code) {
   assert.strictEqual(classifyFailure({ failureInfo: protoPollutedInfo }).kind, 'retryable',
     '伪造 failureKind 不得把可重试失败带成永久停止（m 无永久文本 → UNKNOWN → retryable）')
 
+  // ================= 靶向补充：failure-planA 三簇（杀 Stryker Survived 变异体） =================
+  const check = (actual, expected, why) => assert.strictEqual(actual, expected, why)
+
+  // 【簇2 · 模块级常量 L26】5 个 HTTP_4xx 永久码必须是精确字面量：改成空串/近邻码即漏判永久停止。
+  for (const c of ['HTTP_415', 'HTTP_422', 'HTTP_423', 'HTTP_426', 'HTTP_451']) {
+    check(PERMANENT_CODES.has(c), true, `${c} 必须精确存在于 PERMANENT_CODES（字面量被改即漏判永久）`)
+  }
+  check(PERMANENT_CODES.has('HTTP_429'), false, 'HTTP_429 属可重试语义，不得混入永久表')
+  check(PERMANENT_CODES.has('HTTP_500'), false, '5xx 不得混入永久表')
+  check(RETRYABLE_CODES.has('HTTP_429'), true, 'HTTP_429 必须精确存在于可重试表（真假两侧对照）')
+
+  // 【簇1 · classifyOne 承载字段与区间】终态 3xx（300–399）永久、408/409/425/429 与 5xx 可重试，
+  // 四种承载字段（数字 code / providerCode / HTTP_ 前缀 / statusCode）口径必须一致；
+  // 同时给 300/399/499/500/599 等边界，杀区间比较、Equality/Logical 与“分支内返回常量”的变异体。
+  const carrierCases = [
+    ['数字 code 300 是 3xx 下界 → 永久', { code: '300' }, 'permanent', 'PROVIDER_300'],
+    ['数字 code 302 终态 3xx → 永久', { code: '302' }, 'permanent', 'PROVIDER_302'],
+    ['数字 code 399 是 3xx 上界 → 永久', { code: '399' }, 'permanent', 'PROVIDER_399'],
+    ['providerCode 302 → 永久', { providerCode: 302 }, 'permanent', 'PROVIDER_302'],
+    ['providerCode 399 → 永久', { providerCode: '399' }, 'permanent', 'PROVIDER_399'],
+    ['HTTP_ 前缀 302 → 永久', { code: 'HTTP_302' }, 'permanent', 'HTTP_302'],
+    ['HTTP_ 前缀 399 → 永久', { code: 'HTTP_399' }, 'permanent', 'HTTP_399'],
+    ['statusCode 302 → 永久', { statusCode: 302 }, 'permanent', 'HTTP_302'],
+    ['statusCode 399 → 永久', { statusCode: 399 }, 'permanent', 'HTTP_399'],
+    ['数字 code 408 可重试（同区间反向）', { code: '408' }, 'retryable', 'PROVIDER_408'],
+    ['数字 code 425 可重试', { code: '425' }, 'retryable', 'PROVIDER_425'],
+    ['数字 code 429 可重试', { code: '429' }, 'retryable', 'PROVIDER_429'],
+    ['数字 code 500 可重试（5xx 下界）', { code: '500' }, 'retryable', 'PROVIDER_500'],
+    ['数字 code 599 可重试（5xx 上界）', { code: '599' }, 'retryable', 'PROVIDER_599'],
+    ['数字 code 600 不在任何区间 → 保守重试', { code: '600', message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
+    ['providerCode 408 可重试', { providerCode: 408 }, 'retryable', 'PROVIDER_408'],
+    ['providerCode 409 可重试', { providerCode: '409' }, 'retryable', 'PROVIDER_409'],
+    ['providerCode 429 可重试', { providerCode: '429' }, 'retryable', 'PROVIDER_429'],
+    ['providerCode 500 可重试', { providerCode: '500' }, 'retryable', 'PROVIDER_500'],
+    ['providerCode 599 可重试', { providerCode: '599' }, 'retryable', 'PROVIDER_599'],
+    ['providerCode 600 → 保守重试', { providerCode: '600', message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
+    ['HTTP_408 可重试且 reason 即码本身', { code: 'HTTP_408' }, 'retryable', 'HTTP_408'],
+    ['HTTP_425 可重试', { code: 'HTTP_425' }, 'retryable', 'HTTP_425'],
+    ['HTTP_500 可重试（5xx 下界）', { code: 'HTTP_500' }, 'retryable', 'HTTP_500'],
+    ['HTTP_599 可重试', { code: 'HTTP_599' }, 'retryable', 'HTTP_599'],
+    ['HTTP_407 非枚举 4xx 仍须落 4xx 分支永久', { code: 'HTTP_407' }, 'permanent', 'HTTP_407'],
+    ['HTTP_450 非枚举 4xx 仍须永久', { code: 'HTTP_450' }, 'permanent', 'HTTP_450'],
+    ['HTTP_499 是 4xx 上界 → 永久', { code: 'HTTP_499' }, 'permanent', 'HTTP_499'],
+    ['HTTP_299 不得误入 3xx 永久', { code: 'HTTP_299', message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
+    ['statusCode 408 可重试', { statusCode: 408 }, 'retryable', 'HTTP_408'],
+    ['statusCode 409 可重试', { statusCode: 409 }, 'retryable', 'HTTP_409'],
+    ['statusCode 429 可重试', { statusCode: 429 }, 'retryable', 'HTTP_429'],
+    ['statusCode 500 可重试', { statusCode: 500 }, 'retryable', 'HTTP_500'],
+    ['statusCode 599 可重试', { statusCode: 599 }, 'retryable', 'HTTP_599'],
+    ['statusCode 404 永久', { statusCode: 404 }, 'permanent', 'HTTP_404'],
+    ['statusCode 499 是 4xx 上界 → 永久', { statusCode: 499 }, 'permanent', 'HTTP_499'],
+    ['statusCode 600 超出取值域 → 保守重试', { statusCode: 600, message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
+    ['providerCode 1001 是限流码 → 可重试', { providerCode: '1001' }, 'retryable', 'PROVIDER_RATE_LIMIT'],
+    ['数字 code 1001 走 provider 可重试分支', { code: '1001' }, 'retryable', 'PROVIDER_1001']
+  ]
+  for (const [why, e, kind, reason] of carrierCases) {
+    const r = classifyFailure(e)
+    check(r.kind, kind, `${why}（kind）`)
+    check(r.reason, reason, `${why}（reason）`)
+  }
+
+  // 【簇1 · permanentMessage 五条正则】每条只与“近邻但不命中”的负例成对出现，
+  // 杀 Regex / StringLiteral / LogicalOperator 的放宽与短路变异体。
+  const permanentTexts = [
+    '接口返回数据格式异常：期望数组', '未配置任何推送通道', 'Invalid URL', 'module not found in require',
+    '证书与主机不匹配', '主机名与证书不一致', 'UNAUTHORIZED REQUEST', 'Forbidden', 'Bad Request',
+    'resource Not Found', 'invalid webhook token', 'invalid access key', 'invalid parameter',
+    'token invalid', 'key 无效', '密钥已过期', 'token 不存在', '参数错误', '配置无效', '参数非法',
+    'certificate has expired', 'certificate is not yet valid', 'self-signed certificate', 'self signed certificate',
+    'unable to verify the first certificate', 'unable to get issuer certificate',
+    'unable to get local issuer certificate', 'certificate signature failure',
+    'certificate has been revoked', 'certificate revoked',
+    '证书已过期', '证书失效', '证书已吊销', '证书尚未生效', '自签名证书',
+    '无法获取颁发者证书', '无法获取本地证书颁发者', '证书签名校验失败', '证书签名失败'
+  ]
+  for (const m of permanentTexts) {
+    const r = classifyFailure(error(m, 'ZZZ_UNKNOWN'))
+    check(r.kind, 'permanent', `永久文本「${m}」必须判永久`)
+    check(r.reason, 'CONFIG_OR_CONTRACT', `永久文本「${m}」必须走 CONFIG_OR_CONTRACT`)
+  }
+  for (const m of ['upstream odd', 'nothing to do', 'no news from upstream']) {
+    const r = classifyFailure(error(m, 'ZZZ_UNKNOWN'))
+    check(r.kind, 'retryable', `非永久文本「${m}」不得被放宽的正则误判永久`)
+    check(r.reason, 'UNKNOWN', `非永久文本「${m}」应为 UNKNOWN 保守重试`)
+  }
+
+  // 【簇1 · 瞬态文本正则】命中 → TRANSIENT_TEXT 可重试；负例锁住“条件恒真”。
+  const transientTexts = [
+    'request timeout', 'timed out', '连接超时', 'econn reset by peer', 'eai_again',
+    'enet unreachable', 'ehost unreachable', 'epipe broken pipe', 'socket hang up',
+    '暂时无法处理', '服务暂时不可用', '服务繁忙', '连接失败', '连接被重置'
+  ]
+  for (const m of transientTexts) {
+    const r = classifyFailure(error(m, 'ZZZ_UNKNOWN'))
+    check(r.kind, 'retryable', `瞬态文本「${m}」必须可重试`)
+    check(r.reason, 'TRANSIENT_TEXT', `瞬态文本「${m}」必须走 TRANSIENT_TEXT`)
+  }
+  for (const m of ['接口限流', '限频', 'rate limit hit', 'rate-limit hit']) {
+    const r = classifyFailure({ providerCode: 'abc', message: m })
+    check(r.kind, 'retryable', `限流文本「${m}」必须可重试`)
+    check(r.reason, 'PROVIDER_RATE_LIMIT', `限流文本「${m}」必须走 PROVIDER_RATE_LIMIT 分支`)
+  }
+
+  // 【簇1 · wxpusher / 企业微信】providerCode 黑白名单 + && 与 || 的边界：
+  // 通道不匹配时带 providerCode 也必须走通用区间判定（杀 channel&&providerCode → ||）。
+  const channelCases = [
+    ['wxpusher 1001 限流码 → retryable', { channel: 'wxpusher', providerCode: '1001' }, 'retryable', 'WXPUSHER_RATE_LIMIT'],
+    ['wxpusher 大小写不敏感 + 速度太快文本', { channel: 'WxPusher', providerCode: '9999', message: '速度太快' }, 'retryable', 'WXPUSHER_RATE_LIMIT'],
+    ['wxpusher 其余 providerCode → 永久并回填码', { channel: 'wxpusher', providerCode: '500', message: 'upstream odd' }, 'permanent', 'WXPUSHER_500'],
+    ['wxpusher 无 providerCode 不得进该分支', { channel: 'wxpusher', message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
+    ['他通道带 providerCode 不得进 wxpusher 分支', { channel: 'serverchan', providerCode: '9999', message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
+    ['企业微信 45009 限流 → retryable', { channel: '企业微信推送', providerCode: '45009' }, 'retryable', 'QYWX_RATE_LIMIT'],
+    ['企业微信 40014 → 永久', { channel: '企业微信', providerCode: '40014' }, 'permanent', 'QYWX_40014'],
+    ['企业微信 41001 → 永久', { channel: '企业微信', providerCode: '41001' }, 'permanent', 'QYWX_41001'],
+    ['企业微信 42001 → 永久', { channel: '企业微信', providerCode: '42001' }, 'permanent', 'QYWX_42001'],
+    ['企业微信 45001 → 永久', { channel: '企业微信', providerCode: '45001' }, 'permanent', 'QYWX_45001'],
+    ['企业微信 130101 → 永久', { channel: '企业微信', providerCode: '130101' }, 'permanent', 'QYWX_130101'],
+    ['企业微信 93000（invalid webhook）→ 永久', { channel: '企业微信', providerCode: '93000' }, 'permanent', 'QYWX_93000'],
+    ['企业微信非白名单码回落通用 5xx → 可重试', { channel: '企业微信', providerCode: '500', message: 'upstream odd' }, 'retryable', 'PROVIDER_500'],
+    ['他通道带 45001 不得被企业微信白名单吞掉', { channel: 'other', providerCode: '45001', message: 'upstream odd' }, 'retryable', 'UNKNOWN']
+  ]
+  for (const [why, e, kind, reason] of channelCases) {
+    const r = classifyFailure(e)
+    check(r.kind, kind, `${why}（kind）`)
+    check(r.reason, reason, `${why}（reason）`)
+  }
+
+  // 【簇1 · 显式 failureKind】经 failureInfo 进入 classifyOne 的 failureKind 分支：
+  // 显式标签压过文本判定、非法值不生效、无 reason 时必须是精确字面量 EXPLICIT。
+  const explicitCases = [
+    ['显式 permanent 压过瞬态文本', { failureInfo: { failureKind: 'permanent', failureReason: 'CUSTOM_P', message: '连接超时' } }, 'permanent', 'CUSTOM_P'],
+    ['显式 retryable 压过永久文本', { failureInfo: { failureKind: 'retryable', failureReason: 'CUSTOM_R', message: '未配置任何推送通道' } }, 'retryable', 'CUSTOM_R'],
+    ['显式 retryable 无 reason → 字面量 EXPLICIT', { failureInfo: { failureKind: 'retryable' } }, 'retryable', 'EXPLICIT'],
+    ['显式 permanent 无 reason → 字面量 EXPLICIT', { failureInfo: { failureKind: 'permanent' } }, 'permanent', 'EXPLICIT'],
+    ['非法 failureKind 不生效（回落文本判定）', { failureInfo: { failureKind: 'bogus', message: '未配置任何推送通道' } }, 'permanent', 'CONFIG_OR_CONTRACT'],
+    ['非法 failureKind 且无永久文本 → 保守重试', { failureInfo: { failureKind: 'bogus', message: 'upstream odd' } }, 'retryable', 'UNKNOWN']
+  ]
+  for (const [why, e, kind, reason] of explicitCases) {
+    const r = classifyFailure(e)
+    check(r.kind, kind, `${why}（kind）`)
+    check(r.reason, reason, `${why}（reason）`)
+  }
+
+  // 【簇1 · 聚合子级仲裁】认 error.failures 与 failureInfo.failures 两种形状：
+  // 任一子级可重试即整体可重试（父级 permanent 标签不得压掉），空数组不算“有子级”。
+  const nestedCases = [
+    ['两种子级形状：error.failures 全可重试', { message: 'x', failures: [{ code: 'ETIMEDOUT' }, { code: 'HTTP_429' }] }, 'retryable', 'ALL_CHANNELS_RETRYABLE'],
+    ['单个可重试子级（杀 > 1 的边界变异）', { message: 'x', failures: [{ code: 'ETIMEDOUT' }] }, 'retryable', 'ALL_CHANNELS_RETRYABLE'],
+    ['可重试 + 永久混合 → 仍可重试但原因标 MIXED', { message: 'x', failures: [{ code: 'ETIMEDOUT' }, { code: 'HTTP_404' }] }, 'retryable', 'MIXED_CHANNEL_FAILURES'],
+    ['全部子级永久 → 永久', { message: 'x', failures: [{ code: 'HTTP_404' }, { code: 'HTTP_401' }] }, 'permanent', 'ALL_CHANNELS_PERMANENT'],
+    ['父级 permanent 标签不得压掉可重试子级', { failureKind: 'permanent', failures: [{ code: 'ETIMEDOUT' }] }, 'retryable', 'ALL_CHANNELS_RETRYABLE'],
+    ['failureInfo.failures 形状同样不得被父级压掉', { failureInfo: { failureKind: 'permanent', failures: [{ code: 'ETIMEDOUT' }] } }, 'retryable', 'ALL_CHANNELS_RETRYABLE'],
+    ['空 failures 数组不算有子级（不落子级仲裁）', { message: 'upstream odd', failures: [] }, 'retryable', 'UNKNOWN'],
+    ['空失败数组 + 父级 permanent → 仍认父级标签', { failureKind: 'permanent', failures: [] }, 'permanent', 'EXPLICIT']
+  ]
+  for (const [why, e, kind, reason] of nestedCases) {
+    const r = classifyFailure(e)
+    check(r.kind, kind, `${why}（kind）`)
+    check(r.reason, reason, `${why}（reason）`)
+  }
+
+  // 【簇1 · Error.name 分支】仅精确 SyntaxError/ReferenceError 判永久（大小写归一），其余名称不得触发。
+  check(classifyFailure({ name: 'SyntaxError', message: 'boom' }).kind, 'permanent', 'SyntaxError 必须判永久')
+  check(classifyFailure({ name: 'SyntaxError', message: 'boom' }).reason, 'SYNTAXERROR', 'SyntaxError 的 reason 必须是大写名称')
+  check(classifyFailure({ name: 'ReferenceError', message: 'boom' }).kind, 'permanent', 'ReferenceError 必须判永久')
+  check(classifyFailure({ name: 'ReferenceError', message: 'boom' }).reason, 'REFERENCEERROR', 'ReferenceError 的 reason 必须是大写名称')
+  check(classifyFailure({ name: 'TypeError', message: 'upstream odd' }).kind, 'retryable', '其他 Error 名称不得被判永久')
+
+  // 【簇3 · summarizeError】返回结构精确契约：字段归一、折叠换行、截断、缺省值，
+  // 杀 L177-204 的 ConditionalExpression / LogicalOperator / EqualityOperator / MethodExpression / StringLiteral 变异体。
+  check(summarizeError({ code: 'e1' }).code, 'E1', 'code 必须大写透出')
+  check(summarizeError({ name: 'httpError' }).name, 'HTTPERROR', 'name 必须大写透出')
+  check(summarizeError({}).name, '', 'name 缺省必须是空串而非 undefined')
+  check(summarizeError({ providerCode: 0 }).providerCode, '0', 'providerCode=0 是有效值，不得被当空值丢弃')
+  check(summarizeError({ providerCode: undefined }).providerCode, '', 'providerCode 缺省必须是空串')
+  check(summarizeError({}).providerCode, '', 'providerCode 缺失必须是空串')
+  check(summarizeError({ channel: 'c' }).channel, 'c', 'channel 原样透出')
+  check(summarizeError({}).channel, '', 'channel 缺省必须是空串')
+  check(summarizeError({ channel: 'x'.repeat(60) }).channel.length, 40, 'channel 必须截断到 40')
+  check(summarizeError({ message: 'first', reason: 'second' }).message, 'first', 'message 优先于 reason')
+  check(summarizeError({ reason: 'only-reason' }).message, 'only-reason', '缺 message 时回落 reason')
+  check(summarizeError({ message: 'a\nb\r\nc' }).message, 'a b c', 'message 必须折叠所有换行/回车')
+  check(summarizeError({ message: 'y'.repeat(600) }).message.length, 500, 'message 必须截断到 500')
+  check(summarizeError({ statusCode: 302 }).statusCode, 302, 'statusCode 按整数透出')
+  check(summarizeError({ statusCode: '302' }).statusCode, 302, '数字字符串 statusCode 归一为整数')
+  check(summarizeError({ failureKind: 'retryable' }).failureKind, 'retryable', '显式 retryable 必须透出')
+  check(summarizeError({ failureKind: 'permanent' }).failureKind, 'permanent', '显式 permanent 必须透出')
+  check(summarizeError({ failureKind: 'retryable' }).failureReason, '', '无 failureReason 时必须是空串')
+  check(summarizeError({ failureKind: 'retryable', failureReason: 'R' }).failureReason, 'R', 'failureReason 原样透出')
+  check(summarizeError({ failureKind: 'bogus' }).failureKind, undefined, '非白名单 failureKind 不得进入摘要')
+  check(summarizeError('boom').message, 'boom', '非对象入参按 message 承载')
+  check(summarizeError(42).message, '42', '数字入参按 message 承载')
+  check(summarizeError({ message: 'outer', failureInfo: { message: 'inner' } }).message, 'inner', 'failureInfo 优先于外层字段')
+  check(summarizeError({ message: 'outer', failureInfo: null }).message, 'outer', 'failureInfo 为 null 时必须走常规路径')
+  const withChild = summarizeError({ failures: [{ message: 'child' }] })
+  check(withChild.failures.length, 1, '子失败必须逐个摘要')
+  check(withChild.failures[0].message, 'child', '子失败的 message 必须保留')
+  check(summarizeError({ failures: 'nope' }).failures, undefined, '非数组 failures 不得透出')
+
+  // 【簇1 · 区间边界补齐】3xx/4xx 的下界/上界必须精确：杀 >=、< 被翻成 > / <= 后仍落同 reason 的变异体。
+  for (const [c, kind, reason] of [
+    ['299', 'retryable', 'UNKNOWN'],
+    ['300', 'permanent', 'PROVIDER_300'],
+    ['400', 'permanent', 'PROVIDER_400'],
+    ['499', 'permanent', 'PROVIDER_499']
+  ]) {
+    const r = classifyFailure({ code: c, message: 'upstream odd' })
+    check(r.kind, kind, `数字 code=${c} 的 kind（区间边界）`)
+    check(r.reason, reason, `数字 code=${c} 的 reason（区间边界）`)
+  }
+  for (const [pc, kind, reason] of [
+    ['299', 'retryable', 'UNKNOWN'],
+    ['300', 'permanent', 'PROVIDER_300'],
+    ['400', 'permanent', 'PROVIDER_400'],
+    ['499', 'permanent', 'PROVIDER_499']
+  ]) {
+    const r = classifyFailure({ providerCode: pc, message: 'upstream odd' })
+    check(r.kind, kind, `providerCode=${pc} 的 kind（区间边界）`)
+    check(r.reason, reason, `providerCode=${pc} 的 reason（区间边界）`)
+  }
+  check(classifyFailure({ statusCode: 300 }).kind, 'permanent', 'statusCode 300 是 3xx 下界 → 永久')
+  check(classifyFailure({ statusCode: 300 }).reason, 'HTTP_300', 'statusCode 300 的 reason 即归一码')
+  check(classifyFailure({ statusCode: 400 }).kind, 'permanent', 'statusCode 400 是 4xx 下界 → 永久')
+  check(classifyFailure({ statusCode: 400 }).reason, 'HTTP_400', 'statusCode 400 的 reason 即归一码')
+  check(classifyFailure({ code: 'HTTP_300' }).kind, 'permanent', 'HTTP_300 是 3xx 下界 → 永久')
+  check(classifyFailure({ code: 'HTTP_300' }).reason, 'HTTP_300', 'HTTP_300 的 reason 即码本身')
+  // 前缀必须精确：非 HTTP_ 前缀的码不得被按 HTTP 状态区间判永久（杀 'HTTP_' 字面量与前缀守卫被短路）。
+  const paddedCode = classifyFailure({ code: 'PAD__302', message: 'upstream odd' })
+  check(paddedCode.kind, 'retryable', '非 HTTP_ 前缀的码不得按状态区间判永久')
+  check(paddedCode.reason, 'UNKNOWN', '非 HTTP_ 前缀的码应落 UNKNOWN 保守重试')
+
+  // 【簇3 · 祖先环守卫】自引用子失败必须在**环处**截断，而不是靠深度上限兜底：
+  // 杀 childAncestors 的 `ancestors || []` 与空数组字面量变异体（丢祖先后第一层子项会被继续展开）。
+  const cyclicError = { message: 'root' }
+  cyclicError.failures = [cyclicError]
+  const cyclicSummary = summarizeError(cyclicError)
+  check(cyclicSummary.message, 'root', '自引用结构的根摘要仍应可读')
+  check(cyclicSummary.failures.length, 1, '自引用结构的子项仍应产出摘要')
+  check(cyclicSummary.failures[0].failures, undefined, '自引用子项必须在祖先环处截断，不得继续展开')
+
   console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分成功不熔断、成功后恢复')
 })().catch(error => {
   console.error(error)

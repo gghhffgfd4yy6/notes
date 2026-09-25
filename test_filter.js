@@ -10886,6 +10886,226 @@ console.log('========================================\n');
     assertEqual(matchesCompiled(compileRules({ pingbibiaoti: '京东' }).pingbibiaoti, probe, 'cat'), true, 'matchesCompiled 同口径命中')
   })
 
+  // ==================== 补测（PlanA）：timeMatchedRule / checkFields / _passIfMissing ====================
+  // 靶标：高价值存活变异簇（时间过滤判定 79 / 字段过滤入口 45 / 缺字段放行 26）。
+  // 断言一律对契约与注释意图，真假两侧成对，精确值断言，不依赖时区/遍历顺序。
+  console.log('🎯 补测（PlanA）：时间过滤判定 / checkFields 入口 / _passIfMissing')
+
+  // ---- _passIfMissing（检查缺字段与形状守卫；杀「守卫被短路 / 取反 / 恒真」类变异体）----
+  await test('PlanA _passIfMissing：compiled 或 group 缺失 → 一律放行且不告警', () => {
+    const t = _captureWarn(() => checkRegisterTime(makeItem({ louzhuregtime: daysAgo(4) }), undefined))
+    assertEqual(t.value, true, 'compiled 缺失必须放行')
+    assertEqual(t.warnings.length, 0, 'compiled 缺失沿用放行口径，不得告警')
+    const noGroup = _captureWarn(() => checkRegisterTime(undefined, compileRules({ pingbitime: '5' }).pingbitime))
+    assertEqual(noGroup.value, true, 'group 缺失必须放行')
+    assertEqual(noGroup.warnings.length, 0, 'group 缺失沿用放行口径，不得告警')
+    assertEqual(checkCategory(undefined, compileRules({ pingbifenlei: '赚客吧' }).pingbifenlei), true, '分类入口 group 缺失同样放行')
+  })
+
+  await test('PlanA _passIfMissing：字段缺失/空串/null 放行，非空值参与判定（真假两侧）', () => {
+    const rule = compileRules({ pingbitime: '5' }).pingbitime
+    assertEqual(checkRegisterTime(makeItem({ louzhuregtime: daysAgo(4) }), rule), false, '4 天 < 5 天应拦截')
+    assertEqual(checkRegisterTime(makeItem({ louzhuregtime: daysAgo(100) }), rule), true, '100 天不在窗口内应放行')
+    assertEqual(checkRegisterTime(makeItem({ louzhuregtime: undefined }), rule), true, '注册时间缺失应放行')
+    assertEqual(checkRegisterTime(makeItem({ louzhuregtime: null }), rule), true, '注册时间 null 应放行')
+    const empty = _captureWarn(() => checkRegisterTime(makeItem({ louzhuregtime: '' }), rule))
+    assertEqual(empty.value, true, '注册时间空串视为缺失放行')
+    assertEqual(empty.warnings.length, 0, '空串是合法缺失，不得产生形状告警')
+    assertEqual(checkRegisterTime(makeItem({ louzhuregtime: 0 }), rule), true, '0 时间戳(1970)视为有效值，超窗口放行且不得当缺失')
+  })
+
+  await test('PlanA _passIfMissing：错家族规则（re↔time）显式告警并保守放行', () => {
+    const g = makeItem({ catename: '赚客吧', louzhuregtime: daysAgo(1) })
+    const timeRule = compileRules({ pingbitime: '5' }).pingbitime
+    const reRule = compileRules({ pingbifenlei: '赚客吧' }).pingbifenlei
+    const cat = _captureWarn(() => checkCategory(g, reRule))
+    assertEqual(cat.value, false, '合法 re 规则命中分类应拦截（真假对照）')
+    assertEqual(cat.warnings.length, 0, '合法形状不得产生形状告警')
+    const wrongFamilyForDays = _captureWarn(() => checkRegisterTime(g, reRule))
+    assertEqual(wrongFamilyForDays.value, true, 're 规则传给天数检查必须保守放行（不得取反成拦截）')
+    assertEqual(wrongFamilyForDays.warnings.length, 1, '错家族必须显式告警留痕')
+    assertEqual(wrongFamilyForDays.warnings[0].includes('与本调用方不匹配或缺载荷'), true, '告警文案须点明不匹配')
+    const wrongFamilyForCat = _captureWarn(() => checkCategory(g, timeRule))
+    assertEqual(wrongFamilyForCat.value, true, 'time 规则传给分类检查必须保守放行')
+    assertEqual(wrongFamilyForCat.warnings.length, 1, '错家族必须显式告警留痕')
+  })
+
+  await test('PlanA _passIfMissing：载荷缺失或为 null → 告警放行（re/time/multi/timeMulti 四型）', () => {
+    const g = makeItem({ catename: '赚客吧', louzhuregtime: daysAgo(1) })
+    const badShapes = [
+      [{ _type: 're' }, 're 缺 re 载荷'],
+      [{ _type: 're', re: null }, 're 载荷为 null'],
+      [{ _type: 'time' }, 'time 缺 value 载荷'],
+      [{ _type: 'time', value: null }, 'time 载荷为 null'],
+      [{ _type: 'timeMulti' }, 'timeMulti 缺 rules 载荷'],
+      [{ _type: 'multi' }, 'multi 缺 rules 载荷']
+    ]
+    for (const [bad, label] of badShapes) {
+      const r = _captureWarn(() => checkRegisterTime(g, bad))
+      assertEqual(r.value, true, `${label} 必须保守放行`)
+      assertEqual(r.warnings.length, 1, `${label} 必须显式告警留痕`)
+      const c = _captureWarn(() => checkCategory(g, bad))
+      assertEqual(c.value, true, `分类入口 ${label} 亦须保守放行`)
+      assertEqual(c.warnings.length, 1, `分类入口 ${label} 亦须显式告警留痕`)
+    }
+  })
+
+  await test('PlanA _passIfMissing：检查过程抛异常 → 保守放行，不冒泡', () => {
+    const utils = { safeGet: (obj, key) => (obj ? obj[key] : undefined) }
+    const makeEngine = (ruleEngine) => _createFilterEngine({
+      Utils: utils,
+      RuleEngine: ruleEngine,
+      FILTER_FIELDS: ['pingbifenlei', 'pingbitime'],
+      compileUserRegex: () => null
+    })
+    const boom = _captureWarn(() => makeEngine({ matchesCompiled: () => { throw new Error('模拟匹配异常') } })
+      .checkCategory({ catename: 'x' }, { _type: 're', re: /x/, source: 'x' }))
+    assertEqual(boom.error, null, '匹配异常不得冒泡（否则整批 run 崩溃）')
+    assertEqual(boom.value, true, '匹配异常必须保守放行')
+    assertEqual(makeEngine({ matchesCompiled: () => true })
+      .checkCategory({ catename: 'x' }, { _type: 're', re: /x/, source: 'x' }), false,
+    'checkFn 命中须取反成拦截（锁定 `!checkFn(...)`）')
+    assertEqual(makeEngine({ matchesCompiled: () => false })
+      .checkCategory({ catename: 'x' }, { _type: 're', re: /x/, source: 'x' }), true,
+    'checkFn 未命中须放行')
+  })
+
+  // ---- checkFields（字段过滤入口：形状契约 + 三级优先级 + 缺失口径）----
+  await test('PlanA checkFields：非整份 __compiled 产物 → 告警并保守放行', () => {
+    const g = makeItem()
+    const falseFlag = _captureWarn(() => checkFields(g, { __compiled: false, pingbibiaoti: '京东' }))
+    assertEqual(falseFlag.value, true, '__compiled=false 必须保守放行')
+    assertEqual(falseFlag.warnings.length, 1, '__compiled=false 必须告警留痕')
+    const emptyObj = _captureWarn(() => checkFields(g, {}))
+    assertEqual(emptyObj.value, true, '空对象不是编译产物，必须保守放行')
+    assertEqual(emptyObj.warnings.length, 1, '空对象必须告警留痕')
+    const nullCfg = _captureWarn(() => checkFields(g, null))
+    assertEqual(nullCfg.value, true, 'null 缺省放行')
+    assertEqual(nullCfg.warnings.length, 0, 'falsy 参数不算错形状，不得告警')
+  })
+
+  await test('PlanA checkFields：楼主/标题/内容屏蔽命中与未命中成对', () => {
+    assertEqual(checkFields(makeItem(), compileRules({ pingbibiaoti: '京东' })), false, '标题命中屏蔽词应拦截')
+    assertEqual(checkFields(makeItem(), compileRules({ pingbibiaoti: '拼多多' })), true, '标题未命中应放行')
+    assertEqual(checkFields(makeItem(), compileRules({ pingbineirong: '抢购' })), false, '内容命中屏蔽词应拦截')
+    assertEqual(checkFields(makeItem(), compileRules({ pingbineirong: '拼多多' })), true, '内容未命中应放行')
+    assertEqual(checkFields(makeItem(), compileRules({ pingbilouzhu: '小明' })), false, '楼主命中屏蔽词应拦截')
+    assertEqual(checkFields(makeItem(), compileRules({ pingbilouzhu: '小红' })), true, '楼主未命中应放行')
+    assertEqual(checkFields(makeItem(), compileRules({ pingbineirongplus: '抢购' })), false, '内容强化屏蔽命中应拦截')
+    assertEqual(checkFields(makeItem(), compileRules({ pingbineirongplus: '拼多多' })), true, '内容强化屏蔽未命中应放行')
+  })
+
+  await test('PlanA checkFields：同字段展现优先于普通屏蔽，强化屏蔽可抵消展现', () => {
+    assertEqual(checkFields(makeItem(), compileRules({ zhanxianbiaoti: '京东', pingbibiaoti: '京东' })), true,
+      '同字段强制展现优先于普通屏蔽（锁定 !showFlags[stage.key] 守卫）')
+    assertEqual(checkFields(makeItem(), compileRules({ zhanxianbiaoti: '京东', pingbibiaotiplus: '京东' })), false,
+      '强化屏蔽可抵消同字段强制展现')
+    assertEqual(checkFields(makeItem(), compileRules({ zhanxianneirong: '抢购', pingbineirong: '抢购' })), true,
+      '内容展现优先于内容普通屏蔽')
+    assertEqual(checkFields(makeItem(), compileRules({ zhanxianlouzhu: '小明', pingbilouzhuplus: '小明' })), false,
+      '楼主强化屏蔽可抵消楼主展现')
+  })
+
+  await test('PlanA checkFields：blockedBy 保护链（楼主→标题/内容，标题→内容，不得越权）', () => {
+    assertEqual(checkFields(makeItem(), compileRules({ zhanxianlouzhu: '小明', pingbibiaoti: '京东' })), true, '楼主展现应免去标题屏蔽')
+    assertEqual(checkFields(makeItem(), compileRules({ zhanxianlouzhu: '小明', pingbineirong: '抢购' })), true, '楼主展现应免去内容屏蔽')
+    assertEqual(checkFields(makeItem(), compileRules({ zhanxianbiaoti: '京东', pingbineirong: '抢购' })), true, '标题展现应免去内容屏蔽')
+    assertEqual(checkFields(makeItem(), compileRules({ zhanxianbiaoti: '京东', pingbilouzhu: '小明' })), false, '标题展现不得免去楼主屏蔽（blockedBy 不得越权）')
+    assertEqual(checkFields(makeItem(), compileRules({ zhanxianneirong: '抢购', pingbineirong: '抢购', pingbibiaoti: '京东' })), false, '内容展现不得免去标题屏蔽')
+    assertEqual(checkFields(makeItem(), compileRules({ pingbilouzhu: '小明', pingbibiaoti: '京东' })), false, '楼主屏蔽无保护时应拦截')
+  })
+
+  await test('PlanA checkFields：分类限定多行规则按 catename 生效', () => {
+    const cfg = compileRules({ pingbibiaoti: '美妆###口红' })
+    assertEqual(checkFields(makeItem({ catename: '美妆', title: '口红' }), cfg), false, '分类命中应拦截')
+    assertEqual(checkFields(makeItem({ catename: '数码', title: '口红' }), cfg), true, '分类不匹配应放行')
+  })
+
+  await test('PlanA checkFields：0/false 是有效字段值（仅 undefined/null/空串视为缺失）', () => {
+    assertEqual(checkFields(makeItem({ title: 0 }), compileRules({ pingbibiaoti: '0' })), false, 'title=0 应参与屏蔽匹配（不得当缺失跳过）')
+    assertEqual(checkFields(makeItem({ title: false }), compileRules({ pingbibiaoti: 'false' })), false, 'title=false 应参与屏蔽匹配')
+    assertEqual(checkFields(makeItem({ title: 0 }), compileRules({ zhanxianbiaoti: '0', pingbibiaoti: '0' })), true, 'title=0 亦应能触发强制展现')
+    assertEqual(checkFields(makeItem({ title: undefined }), compileRules({ pingbibiaoti: '京东' })), true, 'title 缺失应跳过该字段')
+    assertEqual(checkFields(makeItem({ title: '' }), compileRules({ pingbibiaoti: '京东' })), true, 'title 空串应跳过该字段')
+  })
+
+  // ---- timeMatchedRule（经 explainFilter 的可观测出口 reason.rule 判定）----
+  await test('PlanA timeMatchedRule：多行天数规则记录实际命中行（分类限定不得串行）', () => {
+    const cfg = compileRules({ pingbitime: '微博线报###5<br>赚客吧###3' })
+    const r1 = explainFilter(makeItem({ catename: '微博线报', louzhuregtime: daysAgo(4) }), cfg)
+    assertEqual(r1.passed, false, '4 天落在「微博线报 5 天」窗口内应拦截')
+    assertEqual(r1.reason.stage, 'time', '时间过滤的 stage 应为 time')
+    assertEqual(r1.reason.kind, 'block', '时间过滤应为普通屏蔽')
+    assertEqual(r1.reason.configKey, 'pingbitime', '拦截原因应指向 pingbitime')
+    assertEqual(r1.reason.rule, '微博线报###5', '必须记录实际命中行（timeMulti 无 source 时回落为空串，故此处锁死命中行）')
+    const r2 = explainFilter(makeItem({ catename: '赚客吧', louzhuregtime: daysAgo(2) }), cfg)
+    assertEqual(r2.passed, false, '2 天落在「赚客吧 3 天」窗口内应拦截')
+    assertEqual(r2.reason.rule, '赚客吧###3', '分类限定下必须记录本分类命中的行，不得返回其他分类的首行')
+  })
+
+  await test('PlanA timeMatchedRule：窗口外/分类不匹配不拦截（真假成对）', () => {
+    const cfg = compileRules({ pingbitime: '微博线报###5<br>赚客吧###3' })
+    const outOfWindow = explainFilter(makeItem({ catename: '微博线报', louzhuregtime: daysAgo(10) }), cfg)
+    assertEqual(outOfWindow.passed, true, '超出天数窗口应放行')
+    assertEqual(outOfWindow.reason, null, '放行时不得给出拦截原因')
+    const catMismatch = explainFilter(makeItem({ catename: '数码', louzhuregtime: daysAgo(1) }), cfg)
+    assertEqual(catMismatch.passed, true, '分类不在配置内应放行')
+    assertEqual(catMismatch.reason, null, '放行时不得给出拦截原因')
+  })
+
+  await test('PlanA timeMatchedRule：单条 days 规则与边界（4 天拦 / 5 天放）', () => {
+    const cfg = compileRules({ pingbitime: '5' })
+    const blocked = explainFilter(makeItem({ louzhuregtime: daysAgo(4) }), cfg)
+    assertEqual(blocked.passed, false, '4 天 < 5 天应拦截')
+    assertEqual(blocked.reason.rule, '5', '单条 time 规则应回落到编译产物原文（source）')
+    const boundary = explainFilter(makeItem({ louzhuregtime: daysAgo(5) }), cfg)
+    assertEqual(boundary.passed, true, '恰好 5 天不满足严格小于窗口，应放行')
+    assertEqual(boundary.reason, null, '边界放行不得给出拦截原因')
+  })
+
+  await test('PlanA timeMatchedRule：非法/缺失注册时间不拦截（含多行分类与 listfilter 同口径）', () => {
+    const cfg = compileRules({ pingbitime: '微博线报###5' })
+    assertEqual(explainFilter(makeItem({ catename: '微博线报', louzhuregtime: 'not-a-date' }), cfg).passed, true,
+      '非法时间解析失败应放行（不得归 0 天当老号误拦）')
+    assertEqual(explainFilter(makeItem({ catename: '微博线报', louzhuregtime: '' }), cfg).passed, true, '缺失注册时间应放行')
+    assertEqual(explainFilter(makeItem({ catename: '微博线报', louzhuregtime: null }), cfg).passed, true, 'null 注册时间应放行')
+    assertEqual(listfilter(makeItem({ catename: '微博线报', louzhuregtime: daysAgo(30) }), cfg), true, 'listfilter 与 explainFilter 同口径放行')
+    assertEqual(listfilter(makeItem({ catename: '微博线报', louzhuregtime: daysAgo(1) }), cfg), false, 'listfilter 命中窗口应拦截')
+    assertEqual(listfilter(makeItem({ catename: '数码', louzhuregtime: daysAgo(1) }), cfg), true, 'listfilter 分类不匹配应放行')
+  })
+
+  await test('PlanF timeMatchedRule：compiled._type 非 timeMulti 必须提前返回 null（不误用时间规则）', () => {
+    // 反例（改动前）：本函数两个**提前返回守卫**从未被直接断言 ——
+    // `if (!compiled || compiled._type !== 'timeMulti') return null` 与 `if (ms === null) return null`。
+    // 前者若被删，非时间类编译产物会被当作时间规则解析；后者若被删，非法时间会落到 daysFrom 误判。
+    const timeCfg = compileRules({ pingbitime: '5' })
+    assertEqual(explainFilter(makeItem({ louzhuregtime: daysAgo(4) }), timeCfg).passed, false, '对照组：时间规则确实生效')
+    // 伪造一个 _type 不是 timeMulti 的编译产物（模拟关键词类规则被误传入）
+    const fake = { _type: 'keyword', rules: [], source: 'x' }
+    const it = makeItem({ louzhuregtime: daysAgo(400) })
+    let threw = false
+    try { explainFilter(it, fake) } catch (e) { threw = true }
+    assertEqual(threw, false, '非 timeMulti 产物必须安全返回（不得抛）')
+    // 非法时间：必须走 ms === null 提前返回，而不是被当作 0 天
+    const bad = explainFilter(makeItem({ catename: '微博线报', louzhuregtime: 'not-a-date' }), compileRules({ pingbitime: '微博线报###5' }))
+    assertEqual(bad.passed, true, '非法时间必须提前返回、保守放行（不得按 0 天误拦）')
+    assertEqual(bad.reason, null, '提前返回不得给出拦截原因')
+  })
+
+  await test('PlanF listfilter：compiled.__compiled 缺失/伪造必须回退旧路径且不抛', () => {
+    // 反例（改动前）：`if (!cfg.__compiled) return this._legacyListfilter(group, cfg)` 从未被直接断言。
+    const g = makeItem({ catename: '微博线报', louzhuregtime: daysAgo(1) })
+    assertEqual(listfilter(g, { pingbitime: '5' }), false, '未编译配置：旧路径仍须按 5 天窗口拦截')
+    assertEqual(listfilter(makeItem({ catename: '微博线报', louzhuregtime: daysAgo(30) }), { pingbitime: '5' }), true,
+      '未编译配置：窗口外须放行')
+    let threw = false
+    try {
+      listfilter(g, { pingbitime: { __compiled: 1 } })
+      listfilter(g, { pingbitime: { __compiled: 'yes' } })
+    } catch (e) { threw = true }
+    assertEqual(threw, false, '__compiled 为伪造值时不得抛（fallback 路径须容错）')
+  })
+
   // 并发隔离目录是本进程私有产物：退出前整体删除，避免 Stryker 沙箱内逐变异体累积
   // （沙箱全生命周期只建一个，百级变异体会留下百级目录）。不碰共享的 xianbaoku_cache。
   if (OWNS_CACHE_DIR) {

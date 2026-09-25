@@ -387,5 +387,147 @@ function installMockStream (behavior) {
     }
   }
 
+  // 本地小工具：把「该 settle 却永不 settle」的变异体转成快速失败，而不是只靠 900s 外部超时判负。
+  // 计时器必须在 race settle 后清掉：p 先 settle 时原写法仍留着定时器存活，
+  // 会把进程多留 ms 毫秒（反复的变异运行逐次累积这段空等）。见 PR #173 评审。
+  const withinSettle = (p, ms = 1500) => {
+    let timer
+    const deadline = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('fetchJson 未在期限内 settle')), ms) })
+    return Promise.race([p, deadline]).finally(() => clearTimeout(timer))
+  }
+
+  // H1. 默认环境（XBK_PROFILE 非 '3'）不得输出任何 [profile api] 日志——专杀
+  //     `process.env.XBK_PROFILE === '3'`→true 与 `if (detailedProfile)`→if(true) 两类变异体。
+  {
+    const origProfile = process.env.XBK_PROFILE
+    delete process.env.XBK_PROFILE
+    const logs = []
+    const origLog = console.log
+    console.log = (...a) => logs.push(a.join(' '))
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"a":1}'] })
+    try {
+      assert.deepStrictEqual(await withinSettle(fetchJson('https://api.example.com/x')), { a: 1 }, '默认环境仍应正常返回 JSON')
+    } finally {
+      restore()
+      console.log = origLog
+      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
+    }
+    assert.strictEqual(logs.filter(l => l.startsWith('[profile api')).length, 0, `默认环境不得输出 profile 日志，实际 ${JSON.stringify(logs)}`)
+  }
+
+  // H2. 详细 profile：错误路径必须打且只打一条 `[profile api] error`；默认环境一条都不打——专杀
+  //     `if (detailedProfile)` 的 true/false 两侧变异体（finishReject 内的日志分支）。
+  {
+    const profileModes = [true, false]
+    for (const profileOn of profileModes) {
+      const origProfile = process.env.XBK_PROFILE
+      if (profileOn) process.env.XBK_PROFILE = '3'; else delete process.env.XBK_PROFILE
+      const logs = []
+      const origLog = console.log
+      console.log = (...a) => logs.push(a.join(' '))
+      const boom = new Error('boom')
+      boom.code = 'ERR_BOOM'
+      const restore = installMockStream({ error: boom })
+      let rejected = null
+      try {
+        await withinSettle(fetchJson('https://api.example.com/x'))
+      } catch (e) { rejected = e } finally {
+        restore()
+        console.log = origLog
+        if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
+      }
+      assert.strictEqual(rejected, boom, '底层 error 必须原样 reject')
+      assert.strictEqual(logs.filter(l => l.includes('[profile api] error')).length, profileOn ? 1 : 0, `XBK_PROFILE=${profileOn ? "'3'" : '未设'} 时 error 日志条数不符：${JSON.stringify(logs)}`)
+    }
+  }
+
+  // H3. stream 路径必须显式 throwHttpErrors:false，且未传 timeout 时注入 DEFAULT_TIMEOUT_MS（30000）——专杀
+  //     BooleanLiteral `false`→true（got 会自行吞掉非 2xx 的响应体，状态码分支失效）。
+  {
+    let seen = null
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"ok":true}'], onOptions: (_u, opts) => { seen = opts } })
+    try {
+      assert.deepStrictEqual(await withinSettle(fetchJson('https://api.example.com/x')), { ok: true })
+    } finally { restore() }
+    assert.strictEqual(seen.throwHttpErrors, false, 'stream 路径必须显式 throwHttpErrors:false')
+    assert.strictEqual(seen.timeout, DEFAULT_TIMEOUT_MS, '未显式传 timeout 时必须注入默认 30000ms')
+  }
+
+  // H4. 响应体上限是**严格大于**才拒绝（total > limit）：恰好等于上限必须放行；超 1 字节必须拒绝且
+  //     错误码/文案精确、并真的把错误交给 stream.destroy——专杀 EqualityOperator `>=`、StringLiteral
+  //     文案清空、CallExpression `stream.destroy(err)` 被删三类变异体。
+  {
+    const body = '{"n":123}'
+    const limit = Buffer.byteLength(body)
+    const installExact = () => {
+      const orig = got.stream
+      let destroyed = null
+      got.stream = () => {
+        const s = new EventEmitter()
+        s.timings = { phases: {} }
+        s.destroy = (err) => { destroyed = err === undefined ? true : err }
+        setTimeout(() => {
+          s.emit('response', { statusCode: 200, headers: {} })
+          s.emit('data', Buffer.from(body))
+          s.emit('end')
+        }, 0)
+        return s
+      }
+      return { restore: () => { got.stream = orig }, destroyed: () => destroyed }
+    }
+    const a = installExact()
+    try {
+      assert.deepStrictEqual(await withinSettle(fetchJson('https://api.example.com/x', {}, limit)), { n: 123 }, '恰好等于上限（未超过）必须正常返回')
+    } finally { a.restore() }
+    const b = installExact()
+    let rejected = null
+    try {
+      await withinSettle(fetchJson('https://api.example.com/x', {}, limit - 1))
+    } catch (e) { rejected = e } finally { b.restore() }
+    assert.strictEqual(rejected && rejected.code, 'EBODYLIMIT', '超上限必须报 EBODYLIMIT')
+    assert.strictEqual(rejected && rejected.message, `响应体过大(超过 ${limit - 1} 字节)`, '错误文案必须报实际上限（StringLiteral 变异体）')
+    assert.strictEqual(b.destroyed() && b.destroyed().code, 'EBODYLIMIT', '超限必须把错误交给 stream.destroy（CallExpression 变异体）')
+  }
+
+  // H5. 终态 3xx 的错误文案必须带真实状态码，且必须在期限内 settle——专杀 StringLiteral 文案清空与
+  //     `finishReject(err)` / `if (settled) return` 被改成永不 settle 的变异体。
+  {
+    const restore = installMockStream({ response: { statusCode: 302, headers: {} }, chunks: ['<html>moved</html>'] })
+    let rejected = null
+    try {
+      await withinSettle(fetchJson('https://api.example.com/x'))
+    } catch (e) { rejected = e } finally { restore() }
+    assert.strictEqual(rejected && rejected.message, 'HTTP 302', '3xx 错误文案必须是 HTTP_<status>')
+    assert.strictEqual(rejected && rejected.code, 'HTTP_302')
+  }
+
+  // H6. profile timing 日志里的时间字段必须是**耗时差**（不得把绝对时间戳相加），firstDataAt 不得恒为
+  //     n/a——专杀 `firstDataAt - started` / `endedAt - started` / `Date.now() - endedAt` 等
+  //     ArithmeticOperator 变异体与 `if (!firstDataAt)` 的 BooleanLiteral 变异体。
+  {
+    const origProfile = process.env.XBK_PROFILE
+    process.env.XBK_PROFILE = '3'
+    const logs = []
+    const origLog = console.log
+    console.log = (...a) => logs.push(a.join(' '))
+    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"a":', '1}'] })
+    try {
+      assert.deepStrictEqual(await withinSettle(fetchJson('https://api.example.com/x')), { a: 1 })
+    } finally {
+      restore()
+      console.log = origLog
+      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
+    }
+    const timing = logs.find(l => l.includes('[profile api timing]'))
+    assert.ok(timing, `必须输出 timing 日志，实际 ${JSON.stringify(logs)}`)
+    for (const key of ['firstDataAt', 'downloadEnd', 'parse', 'total']) {
+      // 用切分 + 字面量正则取数字：new RegExp(变量) 会被 Codacy 判为「非字面量构造器」（本例为误报）
+      const tail = timing.split(key + '=')[1]
+      const m = tail === undefined ? null : /^(\d+)/.exec(tail)
+      assert.ok(m, `${key} 必须是数字耗时（恒为 n/a 说明首块未记录），实际日志：${timing}`)
+      assert.ok(Number(m[1]) < 3600000, `${key} 必须是耗时差而不是时间戳相加，实际 ${m[1]}`)
+    }
+  }
+
   console.log('test_http OK')
 })().catch((e) => { console.error(e); process.exit(1) })

@@ -287,3 +287,210 @@ const {
 
   console.log('test_qinglong_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })
+
+// ===== 追加：qinglong/xbk_push.js「入口」契约回归（QX-02/QX-04/QX-05/QX-08/QX-09）=====
+// 断言对着 SYSTEM_CONTRACT.md 的「入口」条：退出码语义、失败文案、可恢复判定、恢复命令、
+// 包名白名单 fail-closed、缓存目录口径。可观测输出（console 三路/退出码）一律在独立子进程取，
+// 避免与既有套件并发共享 console/process.stdout 造成捕获串扰；不依赖时区/网络/遍历顺序。
+;(async () => {
+  const ENTRY = path.join(__dirname, 'qinglong', 'xbk_push.js')
+  const CHILD = `'use strict'
+const path = require('path')
+const mod = require('./qinglong/xbk_push')
+const ROOT = path.resolve(__dirname)
+const NODE_MODULES = path.join(ROOT, 'node_modules')
+const OK_MSG = '检测到 Node.js 依赖或 re2 原生模块未完整安装，已按 XBK_AUTO_INSTALL_DEPS=1 执行恢复...'
+const brief = (e) => (e ? { message: e.message, code: e.code, name: e.name } : null)
+const cap = async (fn) => {
+  const logs = []
+  const warns = []
+  const errs = []
+  const rl = console.log
+  const rw = console.warn
+  const re = console.error
+  console.log = (...a) => logs.push(a.join(' '))
+  console.warn = (...a) => warns.push(a.join(' '))
+  console.error = (...a) => errs.push(a.join(' '))
+  let value = null
+  let thrown = null
+  try { value = await fn() } catch (e) { thrown = e } finally { console.log = rl; console.warn = rw; console.error = re }
+  return { value: value === undefined ? null : value, thrown: brief(thrown), logs: logs, warns: warns, errs: errs }
+}
+const mknf = (n) => Object.assign(new Error("Cannot find module '" + n + "'"), { code: 'MODULE_NOT_FOUND' })
+const mkdl = () => Object.assign(new Error('dlopen failed'), { code: 'ERR_DLOPEN_FAILED' })
+const mkspec = (v, k) => {
+  if (v === 'ok') return 'ok'
+  if (v === 'nf') return mknf(k)
+  if (v === 'dlopen') return mkdl()
+  return Object.assign(new Error(v.message), { code: v.code })
+}
+const deps = async (spec) => {
+  const calls = []
+  const spawns = []
+  let n = 0
+  const bare = {}
+  const fixed = {}
+  Object.keys(spec.bare || {}).forEach((k) => { bare[k] = mkspec(spec.bare[k], k) })
+  Object.keys(spec.fixed || {}).forEach((k) => { fixed[k] = mkspec(spec.fixed[k], k) })
+  const plan = spec.plan || []
+  const requireFn = (name) => {
+    if (spec.nullThrow) throw null
+    calls.push(name)
+    const sep = 'node_modules' + path.sep
+    const isFixed = name.indexOf(sep) >= 0
+    const key = isFixed ? name.split(sep).pop() : name
+    const table = isFixed ? fixed : bare
+    const hit = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined
+    if (hit === 'ok') return {}
+    throw hit || mknf(name)
+  }
+  const spawnSyncFn = (cmd, args, opts) => {
+    spawns.push({ cmd: cmd, args: args, cwd: opts && opts.cwd, stdio: opts && opts.stdio, timeout: opts && opts.timeout })
+    const step = plan[n] || {}
+    n += 1
+    if (step.after === 'eaccesGot') bare.got = { code: 'EACCES' }
+    return step.result || { status: 0 }
+  }
+  const r = await cap(() => mod.ensureDependencies({
+    requireFn: requireFn,
+    spawnSyncFn: spawnSyncFn,
+    env: { XBK_AUTO_INSTALL_DEPS: '1' },
+    lockExists: () => spec.lock !== false
+  }))
+  r.calls = calls
+  r.spawns = spawns
+  return r
+}
+;(async () => {
+  const okOf = (f, extra) => Object.assign({ failed: f.length || 1, pushed: 0, total: 1, failures: f }, extra || {})
+  const dryCases = [
+    { pushed: 1, failed: 0, total: 5, filtered: 2 },
+    { pushed: 1, failed: 0, total: 'abc' },
+    okOf([]),
+    okOf([{ message: 'M1', code: 'ECODE', providerCode: 'P1', statusCode: 403, channel: 'CH1' }]),
+    okOf([{ message: 'M2' }]),
+    okOf([{ channel: 'CH9', message: 'M3' }]),
+    okOf([{ statusCode: 502, message: 'M4' }]),
+    okOf([{ message: 'MA' }, { code: 'CODEONLY' }, { providerCode: 'PONLY' }]),
+    okOf([{ message: '', code: '' }])
+  ]
+  const out = { root: ROOT, nodeModules: NODE_MODULES, dry: [], deps: [], cache: [], backoff: [], version: [] }
+  for (let i = 0; i < dryCases.length; i += 1) out.dry.push(await cap(() => mod.runDryRunOnce({ run: async () => dryCases[i] })))
+  out.deps.push(await deps({ bare: { got: 'ok', re2: 'ok' } }))
+  out.deps.push(await deps({ bare: { got: 'nf', re2: 'nf' }, fixed: { got: 'ok', re2: 'ok' } }))
+  out.deps.push(await deps({ bare: { got: { code: 'ERR_DLOPEN_FAILED', message: 'dlopen failed' }, re2: 'ok' } }))
+  out.deps.push(await deps({ nullThrow: true }))
+  out.deps.push(await deps({ bare: { got: 'nf', re2: 'ok' } }))
+  out.deps.push(await deps({ bare: { got: 'nf', re2: 'ok' }, lock: false }))
+  out.deps.push(await deps({ bare: { got: 'ok', re2: 'dlopen' } }))
+  out.deps.push(await deps({ bare: { got: 'ok', re2: { code: 'EACCES', message: 'permission denied' } } }))
+  out.deps.push(await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { error: { message: 'EBOOM' } } }] }))
+  out.deps.push(await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { status: 7 } }] }))
+  out.deps.push(await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ after: 'eaccesGot' }] }))
+  out.cache.push(await cap(() => mod.statusCacheDir({ env: { XBK_CACHE_DIR: path.join(ROOT, 'abs-cache') } })))
+  out.cache.push(await cap(() => mod.statusCacheDir({ env: {} })))
+  out.cache.push(await cap(() => mod.statusCacheDir({ env: { XBK_CACHE_DIR: 'rel/cache' } })))
+  out.backoff.push(mod.retryBackoffMs(1, { XBK_RETRY_BACKOFF_CAP_MS: '1' }))
+  out.backoff.push(mod.retryBackoffMs(31, { XBK_RETRY_BACKOFF_CAP_MS: '1' }))
+  out.backoff.push(mod.retryBackoffMs(1, { XBK_RETRY_BACKOFF_CAP_MS: '0.5' }))
+  out.backoff.push(mod.retryBackoffMs(1, { XBK_RETRY_BACKOFF_CAP_MS: 'abc' }))
+  out.version.push(mod.nodeVersionWarning('22.22.2'))
+  out.version.push(mod.nodeVersionWarning('23.0.0'))
+  out.version.push(mod.nodeVersionWarning('22.22.1'))
+  out.version.push(mod.nodeVersionWarning('22'))
+  process.stdout.write(JSON.stringify(out))
+})().catch((e) => { process.stderr.write('CHILD_FAIL ' + (e && e.stack) + '\\n'); process.exit(1) })
+`
+  const probe = spawnSync(process.execPath, ['-'], {
+    input: CHILD,
+    encoding: 'utf8',
+    cwd: __dirname,
+    env: Object.assign({}, process.env, { TZ: 'UTC' }),
+    timeout: 120000
+  })
+  assert.strictEqual(probe.status, 0, `子进程探针必须成功退出：status=${probe.status} err=${probe.error && probe.error.message} stdout=${String(probe.stdout).slice(0, 400)} stderr=${String(probe.stderr).slice(0, 400)}`)
+  const d = JSON.parse(probe.stdout)
+  const OK_MSG = '检测到 Node.js 依赖或 re2 原生模块未完整安装，已按 XBK_AUTO_INSTALL_DEPS=1 执行恢复...'
+  const NODE_MODULES = d.nodeModules
+  const ROOT = d.root
+
+  // --- runDryRunOnce：退出码与一次性语义（--dry-run 单轮成功 0 / 失败 1，不做退避重试）---
+  assert.strictEqual(d.dry[0].value, 0, '--dry-run 单轮成功必须返回退出码 0')
+  assert.deepStrictEqual(d.dry[0].logs, ['dry-run 单轮完成：共 5 条，过滤 2 条，未推送、未写成功缓存'], '成功文案必须精确（杀 success 文案变异体）')
+  assert.deepStrictEqual(d.dry[0].errs, [], '成功轮不得输出错误')
+  assert.deepStrictEqual(d.dry[1].logs, ['dry-run 单轮完成：共 0 条，过滤 0 条，未推送、未写成功缓存'], 'total/filtered 非数值必须回退 0（杀 Number/||0 变异体）')
+  assert.strictEqual(d.dry[2].value, 1, '单轮失败必须返回退出码 1')
+  assert.deepStrictEqual(d.dry[2].logs, [], '失败轮不得落到成功分支（杀 !resultFailure 条件变异体）')
+
+  // --- describeFailure 文案分支（信息只能来自 info.message / info.failures 的子项）---
+  assert.deepStrictEqual(d.dry[2].errs, ['dry-run 单轮失败（ALL_PUSH_FAILED_UNKNOWN）：推送全部失败（原因未结构化）'], '聚合 info.message 必须落到文案')
+  assert.deepStrictEqual(d.dry[3].errs, ['dry-run 单轮失败（PUSH_HAS_ONLY_PERMANENT_FAILURES）：CH1：M1（HTTP 403）'], '通道/原因/HTTP 状态必须按 channel：reason（HTTP n）拼接')
+  assert.deepStrictEqual(d.dry[4].errs, ['dry-run 单轮失败（PUSH_HAS_RETRYABLE_FAILURE）：M2'], '仅有 message 的子失败不得被 || 变异体吞掉')
+  assert.deepStrictEqual(d.dry[5].errs, ['dry-run 单轮失败（PUSH_HAS_RETRYABLE_FAILURE）：CH9：M3'], '无 statusCode 时不得拼出状态段')
+  assert.deepStrictEqual(d.dry[6].errs, ['dry-run 单轮失败（PUSH_HAS_RETRYABLE_FAILURE）：M4（HTTP 502）'], '无 channel 时不得拼出通道段')
+  assert.deepStrictEqual(d.dry[7].errs, ['dry-run 单轮失败（PUSH_HAS_RETRYABLE_FAILURE）：MA；[object Object]；[object Object]'], '多条失败必须以；连接且逐条保留')
+  const mEmpty = /^dry-run 单轮失败（([^）]*)）：([\s\S]*)$/u.exec(d.dry[8].errs[0] || '')
+  assert.notStrictEqual(mEmpty, null, '失败文案必须符合「dry-run 单轮失败（原因）：详情」格式')
+  const emptyReason = mEmpty ? mEmpty[1] : ''
+  const emptyDetail = mEmpty ? mEmpty[2] : ''
+  for (const bad of ['', 'undefined', 'true', 'false', 'dry-run 单轮失败', `Error: ${emptyReason}`]) {
+    assert.notStrictEqual(emptyDetail, bad, `空 parts 兜底不得输出占位符 ${JSON.stringify(bad)}`)
+  }
+
+  // --- ensureDependencies：Node 解析口径优先，解析不到才回退固定 node_modules 子路径 ---
+  assert.strictEqual(d.deps[0].thrown, null, '依赖齐备不得抛错')
+  assert.deepStrictEqual(d.deps[0].calls, ['got', 're2'], '两模块均可解析时只做裸解析（与 --check 同口径）')
+  assert.deepStrictEqual(d.deps[0].spawns, [], '已完整安装时不得触发安装')
+  assert.strictEqual(d.deps[1].thrown, null, '固定路径解析成功即视为已恢复')
+  assert.deepStrictEqual(d.deps[1].calls, ['got', path.join(NODE_MODULES, 'got'), 're2', path.join(NODE_MODULES, 're2')], '裸解析失败后必须回退到固定 node_modules 直接子路径')
+  assert.deepStrictEqual(d.deps[1].spawns, [], '固定路径命中时不得安装')
+  assert.deepStrictEqual(d.deps[2].calls, ['got', 're2', 're2', 'got', 're2'], '非 MODULE_NOT_FOUND 说明模块已定位，不得回退固定路径')
+  assert.strictEqual(d.deps[2].spawns.length, 1, 'ERR_DLOPEN_FAILED 属可恢复，必须触发一次恢复安装')
+  assert.deepStrictEqual(d.deps[2].warns, [OK_MSG], '恢复前必须打印与 --check 同源的恢复告警')
+  assert.strictEqual(d.deps[3].thrown, null, 'load 的非模块错误判定必须先看 error 本身，不得解引用 null.code')
+  assert.strictEqual(d.deps[3].spawns.length, 0, '抛非对象错误时不得进入安装')
+
+  // --- 恢复命令：有锁文件用冻结 npm ci，缺锁文件退化为 install --no-package-lock，恢复后仍失败则忠实报错 ---
+  assert.strictEqual(d.deps[4].thrown && d.deps[4].thrown.message, `依赖恢复后 got 仍不可用：Cannot find module '${path.join(NODE_MODULES, 'got')}'`, '恢复后仍不可用必须抛出带失败模块名的错误')
+  assert.strictEqual(d.deps[4].spawns.length, 1, '缺 got 只安装一次，不得多余重建')
+  assert.strictEqual(d.deps[4].spawns[0].cmd, 'npm', '恢复命令必须是 npm（非 win32 平台）')
+  assert.deepStrictEqual(d.deps[4].spawns[0].args, ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT], '有 package-lock.json 时必须用冻结的 npm ci 且参数完整')
+  assert.strictEqual(d.deps[4].spawns[0].cwd, ROOT, '安装必须在项目根执行')
+  assert.strictEqual(d.deps[4].spawns[0].timeout, 120000, '安装必须有超时')
+  assert.deepStrictEqual(d.deps[4].warns, [OK_MSG], '有锁文件时不得输出退化 install 告警')
+  assert.deepStrictEqual(d.deps[5].warns, [OK_MSG, '未找到 package-lock.json，退化为 npm install --no-package-lock（建议按 README 用 npm ci 部署以冻结依赖版本）'], '缺锁文件必须显式告警退化')
+  assert.deepStrictEqual(d.deps[5].spawns[0].args, ['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT, '--no-package-lock'], '缺锁文件时必须 install 且不得生成新锁文件')
+  assert.strictEqual(d.deps[6].spawns.length, 2, 're2 安装后仍不可加载才构建，且只构建一次')
+  assert.deepStrictEqual(d.deps[6].spawns[1].args, ['run', 'rebuild', '--prefix', path.join(NODE_MODULES, 're2')], 're2 构建必须在固定 node_modules/re2 下执行重建')
+  assert.strictEqual(d.deps[6].thrown && d.deps[6].thrown.message, '依赖恢复后 re2 仍不可用：dlopen failed', 're2 仍不可用必须以 re2 忠实命名')
+  assert.strictEqual(d.deps[7].spawns.length, 0, '不可恢复错误不得进入恢复流程')
+  assert.deepStrictEqual(d.deps[7].warns, [], '未进入恢复流程不得打印恢复告警')
+  assert.strictEqual(d.deps[7].thrown && d.deps[7].thrown.code, 'EACCES', '不可恢复错误必须原样抛出（只认 MODULE_NOT_FOUND/ERR_DLOPEN_FAILED）')
+  assert.strictEqual(d.deps[8].thrown && d.deps[8].thrown.message, 'EBOOM', '重建子进程自身失败必须原样抛出')
+  assert.strictEqual(d.deps[9].thrown && d.deps[9].thrown.message, 're2 原生模块构建失败，退出码 7', '重建非零退出必须带真实退出码')
+  assert.strictEqual(d.deps[10].thrown && d.deps[10].thrown.message, '依赖恢复后 got 仍不可用：[object Object]', '无 message 的错误必须退化为 String(error)')
+
+  // --- retryBackoffMs / statusCacheDir / nodeVersionWarning ---
+  assert.deepStrictEqual(d.backoff, [1, 1, 1000, 1000], 'cap=1 是合法下界必须生效，非法 cap 回退默认 30 分钟封顶（1000 起步）')
+  assert.strictEqual(d.cache[0].value, path.join(ROOT, 'abs-cache'), '绝对路径的 XBK_CACHE_DIR 必须原样采纳')
+  assert.deepStrictEqual(d.cache[0].warns, [], '绝对路径不得告警')
+  assert.deepStrictEqual(d.cache[1].warns, [], '未配置 XBK_CACHE_DIR 时不得告警')
+  assert.strictEqual(path.isAbsolute(d.cache[1].value), true, '默认缓存目录必须是绝对路径')
+  assert.strictEqual(d.cache[2].value, d.cache[1].value, '相对路径必须回退到与未配置时相同的默认缓存目录')
+  assert.notStrictEqual(d.cache[2].value, 'rel/cache', '相对路径不得被当作生效目录')
+  assert.strictEqual(d.cache[2].warns.length, 1, '相对路径必须恰好告警一次')
+  assert.strictEqual(d.cache[2].warns[0].startsWith('⚠️ XBK_CACHE_DIR 不是绝对路径（rel/cache），已忽略并回退默认缓存目录：'), true, '相对路径告警文案必须精确并含被忽略的原始值')
+  assert.deepStrictEqual(d.version, [null, null, '⚠️ 当前 Node 22.22.1 低于 package.json engines 要求（>=22.22.2），re2 等原生依赖可能不可用', '⚠️ 当前 Node 22 低于 package.json engines 要求（>=22.22.2），re2 等原生依赖可能不可用'], 'engines 闸门按完整数值比较，缺段按 0 补齐')
+
+  // --- 入口参数白名单（KNOWN_ARGS）：已知参数不得告警；未知参数只告警不改变行为（QX-09）---
+  const env = Object.assign({}, process.env, { XBK_CACHE_DIR: ROOT, TZ: 'UTC' })
+  const known = spawnSync(process.execPath, [ENTRY, '--status'], { encoding: 'utf8', env, timeout: 120000 })
+  assert.strictEqual(known.status, 0, `--status 必须成功退出：${known.stderr}`)
+  assert.strictEqual(known.stderr, '', '--status 是已知参数，不得输出任何 stderr（含未识别参数告警）')
+  assert.strictEqual(known.stdout.length > 0, true, '--status 必须输出状态报告')
+  const unknown = spawnSync(process.execPath, [ENTRY, '--status', '--dryrun'], { encoding: 'utf8', env, timeout: 120000 })
+  assert.strictEqual(unknown.status, 0, '未知参数只告警不改变行为，--status 仍应成功退出')
+  assert.strictEqual(unknown.stderr, '⚠️ 未识别参数已忽略：--dryrun（可用参数：--status / --check / --dry-run）\n', '未知参数必须按精确文案告警')
+
+  console.log('test_qinglong_utils OK (entry contract)')
+})().catch((e) => { fs.writeSync(2, 'entry-contract FAIL: ' + (e && e.stack ? e.stack : String(e)) + '\n'); process.exit(1) })

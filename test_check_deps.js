@@ -551,6 +551,514 @@ test('F5 无参调用（默认 manifest/resolve/load）在隔离依赖树上真�
 })
 
 console.log('========================================')
+// ============================================================================
+// 补充回归测试（靶向 check-deps 存活变异体）。断言对准 README「测试」小节与
+// SYSTEM_CONTRACT.md「修改检查」的三条口径：
+//   ① 探测清单必须由 package.json 派生（dependencies + optionalDependencies）——F1；
+//   ② 必须区分「未安装（resolve 失败）」与「已安装但不可用（load 抛错）」——F3；
+//   ③ Node 版本闸门含 npm X-range 语义（`^`/`~`/`>=`/`<=`/`>`/`<`/精确与缺段写法）——F4。
+// 未导出的内部纯函数（parseVersion/compareVersion/satisfiesComparator/…）通过「读源码 +
+// 追加一行内部导出」在隔离 Module 中编译后直接断言——磁盘上的 scripts/check-deps.js 一字不动。
+// ============================================================================
+const Module = require('node:module')
+const { strictEqual, deepStrictEqual } = require('node:assert/strict')
+
+const NATIVE_NAME = 're2'
+const INTERNAL_EXPORTS = '\nmodule.exports.__internals = { parseVersion, compareVersion, satisfiesComparator, dependencyFailureReason, nodeVersionProblems, readNativeEngineRange, declaredRuntimeDependencies, declaredDevDependencies, readPackageManifest }\n'
+
+// 在独立 Module 中编译 check-deps.js 的**当前磁盘内容**（含变异体）+ 内部导出。
+// require.main 不等于该 Module ⇒ CLI 分支不触发（无副作用、不走 exitCode）。
+function internalsOf (rootDir) {
+  const filename = path.join(rootDir, 'scripts', 'check-deps.js')
+  const m = new Module(filename, null)
+  m.filename = filename
+  m.paths = Module._nodeModulePaths(path.dirname(filename))
+  m._compile(fs.readFileSync(filename, 'utf8') + INTERNAL_EXPORTS, filename)
+  return m.exports.__internals
+}
+
+// 内部函数沙箱：真实实现副本（ROOT = 临时目录）+ 可控 package.json + 可选 re2 清单/engines
+function makeInternalsSandbox ({ manifest, withRe2 = false, re2Engines }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-deps-internals-'))
+  fs.mkdirSync(path.join(dir, 'scripts'))
+  fs.copyFileSync(path.join(__dirname, 'scripts', 'check-deps.js'), path.join(dir, 'scripts', 'check-deps.js'))
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(manifest))
+  if (withRe2) {
+    const pkgDir = path.join(dir, 'node_modules', NATIVE_NAME)
+    fs.mkdirSync(pkgDir, { recursive: true })
+    const re2Pkg = { name: NATIVE_NAME, version: '1.0.0', main: 'index.js' }
+    if (re2Engines !== undefined) re2Pkg.engines = { node: re2Engines }
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify(re2Pkg))
+    fs.writeFileSync(path.join(pkgDir, 'index.js'), 'module.exports = {}\n')
+  }
+  return dir
+}
+
+// 同时捕获 stderr 与 warn（版本闸门告警走 console.warn，退清单告警也走 warn）
+function captureAllOutput (fn) {
+  const lines = []
+  const origError = console.error
+  const origWarn = console.warn
+  console.error = (...args) => { lines.push(args.join(' ')) }
+  console.warn = (...args) => { lines.push(args.join(' ')) }
+  try {
+    fn()
+  } finally {
+    console.error = origError
+    console.warn = origWarn
+  }
+  return lines.join('\n')
+}
+
+const A = internalsOf(__dirname)
+
+// ---- parseVersion / compareVersion ----
+// 杀 parseVersion 的条件表达式（true/false 两侧）、正则锚点（`^`）与三段判定；
+// 杀 compareVersion 的逐段比较与 -1/1 分支（`22.9.0` vs `22.22.2` 必须按数值，不是字典序）。
+test('F4 parseVersion：三段/两段、v 前缀与首尾空白、预发布后缀、非法写法为 null', () => {
+  deepStrictEqual(A.parseVersion('22.22.2'), [22, 22, 2])
+  deepStrictEqual(A.parseVersion('v24.15.0'), [24, 15, 0])
+  deepStrictEqual(A.parseVersion('  22.9.0  '), [22, 9, 0])
+  deepStrictEqual(A.parseVersion('22.22.2-beta.1'), [22, 22, 2])
+  strictEqual(A.parseVersion('22.9'), null)
+  strictEqual(A.parseVersion('x22.1.2'), null)
+  strictEqual(A.parseVersion(''), null)
+})
+
+test('F4 compareVersion：逐段数值比较、三态返回（-1/0/1）', () => {
+  strictEqual(A.compareVersion([22, 9, 0], [22, 22, 2]), -1)
+  strictEqual(A.compareVersion([22, 22, 2], [22, 9, 0]), 1)
+  strictEqual(A.compareVersion([22, 22, 2], [22, 22, 2]), 0)
+  strictEqual(A.compareVersion([1, 0, 0], [0, 9, 9]), 1)
+  strictEqual(A.compareVersion([0, 9, 9], [1, 0, 0]), -1)
+})
+
+// ---- satisfiesComparator ----
+// 每个比较器分支都给「边界三连」（n-1 / n / n+1）的真假两侧，杀条件表达式取反、
+// 比较符边界与 X-range 上界计算（`~1`→<2.0.0、`=1`→[1.0.0,2.0.0)、`>1`→>=2.0.0）。
+test('F4 satisfiesComparator：精确/>=/<=/>/< 的边界三连（n-1、n、n+1）', () => {
+  const t = (version, token, expected) => strictEqual(A.satisfiesComparator(A.parseVersion(version), token), expected, `${version} 应 ${expected} 于 ${token}`)
+  t('22.22.2', '22.22.2', true)
+  t('22.22.1', '22.22.2', false)
+  t('22.22.3', '22.22.2', false)
+  t('22.22.2', '=22.22.2', true)
+  t('22.22.3', '=22.22.2', false)
+  t('22.22.2', '>=22.22.2', true)
+  t('22.22.1', '>=22.22.2', false)
+  t('22.22.2', '<=22.22.2', true)
+  t('22.22.3', '<=22.22.2', false)
+  t('22.22.3', '>22.22.2', true)
+  t('22.22.2', '>22.22.2', false)
+  t('22.22.1', '<22.22.2', true)
+  t('22.22.2', '<22.22.2', false)
+})
+
+test('F4 satisfiesComparator：缺段写法是 X-range，不是补 0 单点（>=1.2 / <=1.2 / >1 / >1.2）', () => {
+  const t = (version, token, expected) => strictEqual(A.satisfiesComparator(A.parseVersion(version), token), expected, `${version} 应 ${expected} 于 ${token}`)
+  t('1.2.0', '>=1.2', true)
+  t('1.1.9', '>=1.2', false)
+  t('1.2.9', '<=1.2', true)
+  t('1.3.0', '<=1.2', false)
+  t('1.9.9', '>1', false)
+  t('2.0.0', '>1', true)
+  t('1.2.9', '>1.2', false)
+  t('1.3.0', '>1.2', true)
+  t('1.9.9', '<=1', true)
+  t('2.0.0', '<=1', false)
+})
+
+test('F4 satisfiesComparator：^ 的上界（含 0.x 三档）与 ~ 的上界（~1 → <2.0.0）', () => {
+  const t = (version, token, expected) => strictEqual(A.satisfiesComparator(A.parseVersion(version), token), expected, `${version} 应 ${expected} 于 ${token}`)
+  t('22.22.2', '^22.22.2', true)
+  t('22.99.0', '^22.22.2', true)
+  t('22.22.1', '^22.22.2', false)
+  t('23.0.0', '^22.22.2', false)
+  t('1.9.9', '^1', true)
+  t('2.0.0', '^1', false)
+  t('0.9.9', '^0', true)
+  t('1.0.0', '^0', false)
+  t('0.0.9', '^0.0', true)
+  t('0.1.0', '^0.0', false)
+  t('0.2.9', '^0.2', true)
+  t('0.3.0', '^0.2', false)
+  t('0.2.3', '^0.2.3', true)
+  t('0.2.99', '^0.2.3', true)
+  t('0.3.0', '^0.2.3', false)
+  t('0.0.3', '^0.0.3', true)
+  t('0.0.4', '^0.0.3', false)
+  t('1.9.9', '~1', true)
+  t('2.0.0', '~1', false)
+  t('0.9.9', '~0', true)
+  t('1.0.0', '~0', false)
+  t('1.2.0', '~1.2', true)
+  t('1.2.99', '~1.2', true)
+  t('1.3.0', '~1.2', false)
+  t('1.2.99', '~1.2.3', true)
+  t('1.3.0', '~1.2.3', false)
+})
+
+test('F4 satisfiesComparator：`=` 与裸版本按 X-range 语义（=1 → [1.0.0,2.0.0)），未知写法为 null', () => {
+  const t = (version, token, expected) => strictEqual(A.satisfiesComparator(A.parseVersion(version), token), expected, `${version} 应 ${expected} 于 ${token}`)
+  t('1.5.0', '=1', true)
+  t('1.9.9', '=1', true)
+  t('2.0.0', '=1', false)
+  t('0.9.0', '=1', false)
+  t('1.2.5', '=1.2', true)
+  t('1.3.0', '=1.2', false)
+  strictEqual(A.satisfiesComparator([22, 22, 2], '*'), null)
+  strictEqual(A.satisfiesComparator([22, 22, 2], 'latest'), null)
+  strictEqual(A.satisfiesComparator([22, 22, 2], ''), null)
+})
+
+// ---- 补测 PlanB：版本解析/比较的剩余存活靶子（父代理逐 id 定位后补齐）----
+// 反例（改动前）：下列 8 个变异体在既有用例下全部存活——既有用例覆盖了主路径，但这些「形态边界」没有对样例。
+
+// id 4 @L36 StringLiteral（readPackageManifest 里 fs.readFileSync 的 'utf8' → ''）
+// 只断言「读到了 package.json 且能解析出 version」不够——要证明**真的按 utf8 解码**：
+// 用沙箱 manifest 写一个含非 ASCII 的值，若编码参数被改成 ''（Buffer）则 JSON.parse 会拿到 Buffer 文本而抛/失真。
+test('PlanB readPackageManifest：必须以 utf8 读取（含非 ASCII 值仍能正确解析）', () => {
+  const I = internalsOf(makeInternalsSandbox({ manifest: { version: '1.0.0', 备注: '中文值' } }))
+  const pkg = I.readPackageManifest()
+  strictEqual(pkg.备注, '中文值', '非 ASCII 值必须按 utf8 正确解码（编码参数被改坏即红）')
+  strictEqual(pkg.version, '1.0.0')
+})
+
+// id 18 @L44 ConditionalExpression（`!group || typeof group !== 'object'` → false）
+// 杀「形状守卫被强制为 false」：live 的认非对象 group 会让 Object.keys 抛 TypeError。
+test('PlanB declaredRuntimeDependencies：非对象 group 必须跳过而非崩溃（形状守卫）', () => {
+  strictEqual(internalsOf(makeInternalsSandbox({ manifest: { dependencies: {} } })).declaredRuntimeDependencies({ dependencies: 'nope', optionalDependencies: 42 }).length, 0,
+    '字符串/数字形状的 group 必须被守卫跳过（守卫置 false 会 Object.keys 抛错）')
+  deepStrictEqual(internalsOf(makeInternalsSandbox({ manifest: {} })).declaredRuntimeDependencies({ dependencies: { got: '11' } }), ['got'],
+    '正常对象形状仍要正确取键（反向对照）')
+})
+
+// id 55 @L71 Regex（`/^v?(\d+)\.(\d+)\.(\d+)/` → 末段量词被削成 \d）
+// 杀「第三段只取一位」：`22.22.10` 与 `22.22.1` 必须区分。
+test('PlanB parseVersion：第三段必须完整取位（数字量词 + 而非单字符）', () => {
+  const P = A.parseVersion
+  deepStrictEqual(P('22.22.10'), [22, 22, 10], '第三段两位数必须整体取出')
+  deepStrictEqual(P('1.0.100'), [1, 0, 100], '第三段三位数同理')
+  deepStrictEqual(P('1.0.1'), [1, 0, 1], '反向对照：一位数')
+})
+
+// id 61 @L76 EqualityOperator（`i < 3` → `i <= 3`）
+// 杀「循环多跑一轮」：a/b 同为长度 3 时第 4 次比较 a[3]===b[3] 皆 undefined 而提前 return 0 ⇒ 不可观测，
+// 故必须构造**长度不同**的输入让越界可观测。
+test('PlanB compareVersion：长度不等时不得因越界比较而误判相等', () => {
+  const C = A.compareVersion
+  // 实测语义（已用纯函数独立复算核对）：某节为 undefined 时 `undefined < x` 恒 false ⇒ **两个方向都返回 1**，
+  // 这是该函数在「长度不等」上的固有不对称（X-range 语义由 satisfiesComparator 另行处理，不在此函数）。
+  // 本用例的可判别点因此只有一个：**不得返回 0**（`i <= 3` 的变异体会在越界那一轮把它读成相等）。
+  strictEqual(C([22, 22], [22, 22, 2]) !== 0, true, '缺段 vs 有值段不得被判为相等（i<=3 越界多跑一轮即会返回 0）')
+  strictEqual(C([22, 22, 2], [22, 22]) !== 0, true, '反向同样不得判相等')
+  strictEqual(C([1, 0], [1, 0, 0]), 1, '实测形态固定为 1（如需变更须连同本断言一起复核）')
+  strictEqual(C([1, 0, 0], [1, 0, 0]), 0, '反向对照：完全相等必须返回 0')
+})
+
+// id 70 @L77 EqualityOperator（`a[i] < b[i] ? -1 : 1` → `a[i] <= b[i] ? -1 : 1`）
+// 杀「等值分支被判成 -1」：必须让某一节**相等**才能区分——a[i]===b[i] 时正确实现返回 1（因为前面已排除 !==）。
+test('PlanB compareVersion：某一节相等时方向判定不得反转', () => {
+  const C = A.compareVersion
+  strictEqual(C([1, 5, 0], [1, 4, 0]), 1, '第二节更大 ⇒ 1（等号被改成 <= 会得 -1）')
+  strictEqual(C([1, 4, 0], [1, 5, 0]), -1, '反向')
+})
+
+// id 74/75/84 @L92 Regex（satisfiesComparator 的 token 正则三处变异）
+// 杀「锚点/可选段/字符类」被削：必须覆盖 `$` 锚点（尾随垃圾须不匹配）、三段的可选性、以及 `^`/`~` 字符类成员。
+test('PlanB satisfiesComparator：token 正则的锚点、可选段与字符类成员', () => {
+  const S = (v, token) => A.satisfiesComparator(A.parseVersion(v), token)
+  strictEqual(S('1.2.3', '>=1.2.3junk'), null, '尾随垃圾必须因 `$` 锚点而不匹配（锚点被删即红）')
+  strictEqual(S('1.2.3', '1.2.3'), true, '三段精确写法仍须匹配（可选段不得被削成必选）')
+  strictEqual(S('1.2.3', '~1.2'), true, '`~` 必须仍在字符类里（字符类被削即 return null）')
+  strictEqual(S('1.2.3', '^1.2'), true, '`^` 同理')
+  strictEqual(S('1.2.3', '<1.2'), false, '`<` 同理（反向对照）')
+})
+
+// ---- satisfiesNodeRange（公开导出）----
+// 杀 `||` 分隔、tokens 拆分、matched=false+break、`result === null` 降级与收尾 return false。
+test('F4 satisfiesNodeRange：|| 多段任一命中为真、全不命中为假、空/未知写法为 null', () => {
+  const R = '^22.22.2 || ^24.15.0 || >=26.0.0'
+  strictEqual(satisfiesNodeRange('22.22.2', R), true)
+  strictEqual(satisfiesNodeRange('24.15.0', R), true)
+  strictEqual(satisfiesNodeRange('26.0.0', R), true)
+  strictEqual(satisfiesNodeRange('27.3.1', R), true)
+  strictEqual(satisfiesNodeRange('22.22.1', R), false)
+  strictEqual(satisfiesNodeRange('23.0.0', R), false)
+  strictEqual(satisfiesNodeRange('24.14.9', R), false)
+  strictEqual(satisfiesNodeRange('25.9.9', R), false)
+  strictEqual(satisfiesNodeRange('22.22.2', '>=22.0.0 <23.0.0'), true)
+  strictEqual(satisfiesNodeRange('23.0.0', '>=22.0.0 <23.0.0'), false)
+  strictEqual(satisfiesNodeRange('21.9.9', '>=22.0.0 <23.0.0'), false)
+  strictEqual(satisfiesNodeRange('  v22.22.2  ', '  ^22.22.2  '), true)
+  strictEqual(satisfiesNodeRange('bad-version', '>=1.0.0'), null)
+  strictEqual(satisfiesNodeRange('22.22.2', ''), null)
+  strictEqual(satisfiesNodeRange('22.22.2', 'x'), null)
+})
+
+// ---- nodeVersionProblems / readNativeEngineRange ----
+// 杀 `!satisfied` 取反、`satisfied === null` 的降级告警、typeof 守卫、`pkg && pkg.engines`
+// 三元与 `if (nativeRange)` 块、以及 re2 更严闸门的 label 文案。
+test('F4 nodeVersionProblems：不满足时的精确 label/required、满足与不可解析时为空的降级路径', () => {
+  const I = internalsOf(makeInternalsSandbox({ manifest: {} }))
+  deepStrictEqual(I.nodeVersionProblems({ engines: { node: '>=22.0.0' } }, '22.22.2'), [])
+  deepStrictEqual(I.nodeVersionProblems({ engines: { node: '>=26.0.0' } }, '22.22.2'),
+    [{ label: 'package.json 的 engines.node', required: '>=26.0.0' }])
+  deepStrictEqual(I.nodeVersionProblems({ engines: { node: '^24.15.0' } }, '24.15.0'), [])
+  deepStrictEqual(I.nodeVersionProblems({ engines: { node: '^24.15.0' } }, '24.14.9'),
+    [{ label: 'package.json 的 engines.node', required: '^24.15.0' }])
+  deepStrictEqual(I.nodeVersionProblems({}, '22.22.2'), [])
+  deepStrictEqual(I.nodeVersionProblems(null, '22.22.2'), [])
+  deepStrictEqual(I.nodeVersionProblems({ engines: { node: 22 } }, '30.0.0'), [])
+  deepStrictEqual(I.nodeVersionProblems({ engines: { node: '>=26.0.0' } }, 'not-a-node'), [])
+  const out = captureAllOutput(() => {
+    deepStrictEqual(I.nodeVersionProblems({ engines: { node: 'garbage' } }, '22.22.2'), [])
+  })
+  if (!out.includes('无法解析 package.json 的 engines.node 的版本范围「garbage」')) throw new Error(`不可解析的范围应降级告警: ${out}`)
+})
+
+test('F4 readNativeEngineRange/nodeVersionProblems：re2 更严的 engines 进闸门并如实标注，缺失时为 null', () => {
+  const RE2_RANGE = '^22.22.2 || ^24.15.0 || >=26.0.0'
+  const I = internalsOf(makeInternalsSandbox({ manifest: {}, withRe2: true, re2Engines: RE2_RANGE }))
+  strictEqual(I.readNativeEngineRange(), RE2_RANGE)
+  deepStrictEqual(I.nodeVersionProblems({ engines: { node: '>=20.0.0' } }, '23.0.0'),
+    [{ label: 're2 的 engines.node', required: RE2_RANGE }])
+  deepStrictEqual(I.nodeVersionProblems({ engines: { node: '>=20.0.0' } }, '22.22.2'), [])
+  const noEngines = internalsOf(makeInternalsSandbox({ manifest: {}, withRe2: true }))
+  strictEqual(noEngines.readNativeEngineRange(), null)
+  deepStrictEqual(noEngines.nodeVersionProblems({ engines: { node: '>=20.0.0' } }, '23.0.0'), [])
+  strictEqual(internalsOf(makeInternalsSandbox({ manifest: {} })).readNativeEngineRange(), null)
+})
+
+// ---- 清单派生：readPackageManifest / declaredRuntimeDependencies / declaredDevDependencies ----
+// 杀 F1 的清单派生：字段来源（deps+optional，devDeps 不参与运行时）、Object.keys 顺序、
+// `!names.includes` 去重、`!group` 与 `typeof !== 'object'` 守卫、ROOT 路径拼接。
+test('F1 readPackageManifest：从 ROOT 读取并解析 package.json（探测清单的派生源）', () => {
+  const manifest = { name: 'internals-sandbox', version: '1.0.0', dependencies: { got: '^14.0.0' } }
+  deepStrictEqual(internalsOf(makeInternalsSandbox({ manifest })).readPackageManifest(), manifest)
+})
+
+test('F1/F3 declaredRuntimeDependencies/declaredDevDependencies：字段、顺序、去重与类型守卫', () => {
+  const I = internalsOf(makeInternalsSandbox({ manifest: {} }))
+  deepStrictEqual(I.declaredRuntimeDependencies({
+    dependencies: { got: '1' }, optionalDependencies: { re2: '1' }, devDependencies: { 'fast-check': '1' }
+  }), ['got', 're2'])
+  deepStrictEqual(I.declaredRuntimeDependencies({ dependencies: { a: '1' }, optionalDependencies: { a: '1', b: '1' } }), ['a', 'b'])
+  deepStrictEqual(I.declaredRuntimeDependencies({ optionalDependencies: { only: '1' } }), ['only'])
+  deepStrictEqual(I.declaredRuntimeDependencies({}), [])
+  deepStrictEqual(I.declaredRuntimeDependencies(null), [])
+  deepStrictEqual(I.declaredRuntimeDependencies({ dependencies: null, optionalDependencies: 5 }), [])
+  deepStrictEqual(I.declaredDevDependencies({ devDependencies: { a: '1', b: '1' } }), ['a', 'b'])
+  deepStrictEqual(I.declaredDevDependencies({ dependencies: { a: '1' } }), [])
+  deepStrictEqual(I.declaredDevDependencies({ devDependencies: null }), [])
+  deepStrictEqual(I.declaredDevDependencies({ devDependencies: 'ab' }), [])
+  deepStrictEqual(I.declaredDevDependencies(null), [])
+})
+
+// ---- dependencyFailureReason ----
+// 杀 error.code 前缀拼接、`error && error.message` 的双侧三元与 `&&`→`||`、首行截取与模板顺序。
+test('F3 dependencyFailureReason：error.code 前缀 + 仅首行摘要，非 Error 值如实降级', () => {
+  const I = internalsOf(makeInternalsSandbox({ manifest: {} }))
+  strictEqual(I.dependencyFailureReason(Object.assign(new Error('first line\nsecond line'), { code: 'ERR_REQUIRE_ESM' })), 'ERR_REQUIRE_ESM: first line')
+  strictEqual(I.dependencyFailureReason(new Error('plain\nsecond')), 'plain')
+  strictEqual(I.dependencyFailureReason(Object.assign(new Error('no code here'), { code: '' })), 'no code here')
+  strictEqual(I.dependencyFailureReason({ message: 'only message' }), 'only message')
+  strictEqual(I.dependencyFailureReason('boom'), 'boom')
+  strictEqual(I.dependencyFailureReason(null), 'null')
+  strictEqual(I.dependencyFailureReason(undefined), 'undefined')
+})
+
+// ---- checkDependencies（公开 API，注入 resolve/load/manifest）----
+test('F1/F3 checkDependencies：全部可解析可加载 → true 且零输出（fail-open 回归）', () => {
+  const out = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1', re2: '1' } }),
+      resolve: () => '/mock/path',
+      load: (name) => name === NATIVE_NAME ? fakeRe2Class({ ok: true }) : {}
+    }), true)
+  })
+  strictEqual(out, '')
+})
+
+test('F1/F3 checkDependencies：resolve 失败 → missing；仅 re2 缺失才提示 rebuild', () => {
+  const both = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1', re2: '1' } }),
+      resolve: (name) => { throw new Error(`Cannot find module '${name}'`) },
+      load: () => ({})
+    }), false)
+  })
+  deepStrictEqual(both.split('\n'), [
+    '❌ 缺少依赖：got, re2',
+    '请先在项目根目录执行：',
+    '  npm ci --ignore-scripts',
+    '  npm run rebuild --prefix node_modules/re2'
+  ])
+  const gotOnly = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1', re2: '1' } }),
+      resolve: (name) => { if (name === 'got') throw new Error('nope'); return '/mock/path' },
+      load: () => fakeRe2Class({ ok: true })
+    }), false)
+  })
+  if (!gotOnly.split('\n').includes('❌ 缺少依赖：got')) throw new Error(gotOnly)
+  if (gotOnly.includes('rebuild')) throw new Error(`仅缺 got 时不应提示 rebuild: ${gotOnly}`)
+})
+
+test('F3 checkDependencies：可解析但加载抛错 → broken（根因入输出），指引按原生/非原生分流', () => {
+  const gotBroken = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1', re2: '1' } }),
+      resolve: () => '/mock/path',
+      load: (name) => {
+        if (name === 'got') throw Object.assign(new Error('require() of ES Module\nmore detail'), { code: 'ERR_REQUIRE_ESM' })
+        return fakeRe2Class({ ok: true })
+      }
+    }), false)
+  })
+  if (!gotBroken.split('\n').includes('❌ 依赖已安装但不可用：got')) throw new Error(gotBroken)
+  if (!gotBroken.split('\n').includes('  - got: ERR_REQUIRE_ESM: require() of ES Module')) throw new Error(gotBroken)
+  if (!gotBroken.includes('请重新安装依赖')) throw new Error(gotBroken)
+  if (gotBroken.includes('请重建原生模块') || gotBroken.includes('缺少依赖')) throw new Error(gotBroken)
+  const re2Broken = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1', re2: '1' } }),
+      resolve: () => '/mock/path',
+      load: (name) => { if (name === NATIVE_NAME) throw new Error('binding missing'); return {} }
+    }), false)
+  })
+  if (!re2Broken.split('\n').includes('❌ 依赖已安装但不可用：re2')) throw new Error(re2Broken)
+  if (!re2Broken.includes('请重建原生模块或切换 Node 版本')) throw new Error(re2Broken)
+  if (re2Broken.includes('请重新安装依赖')) throw new Error(re2Broken)
+})
+
+test('F3 checkDependencies：re2 可加载但原生绑定探针不过 → broken；探针只对 re2 生效', () => {
+  const probeFail = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1', re2: '1' } }),
+      resolve: () => '/mock/path',
+      load: (name) => name === NATIVE_NAME ? fakeRe2Class({ ok: false }) : {}
+    }), false)
+  })
+  if (!probeFail.split('\n').includes('  - re2: re2 native binding probe failed')) throw new Error(probeFail)
+  const out = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1' } }),
+      resolve: () => '/mock/path',
+      load: () => fakeRe2Class({ ok: false })
+    }), true)
+  })
+  strictEqual(out, '')
+})
+
+test('F1 checkDependencies：manifest 读不到 → 告警并回落内置 got/re2（不得退化成零检查）', () => {
+  const out = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => { throw new Error('bad manifest') },
+      resolve: (name) => { throw new Error(`Cannot find module '${name}'`) },
+      load: () => ({})
+    }), false)
+  })
+  if (!out.includes('无法读取 package.json（bad manifest）')) throw new Error(out)
+  if (!out.includes('退回内置清单 got/re2')) throw new Error(out)
+  if (!out.split('\n').includes('❌ 缺少依赖：got, re2')) throw new Error(out)
+  const emptyDeclared = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: {} }),
+      resolve: (name) => { if (name === 'got') throw new Error('nope'); return '/mock/path' },
+      load: () => fakeRe2Class({ ok: true })
+    }), false)
+  })
+  if (!emptyDeclared.split('\n').includes('❌ 缺少依赖：got')) throw new Error(emptyDeclared)
+  const onlyGot = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1' } }),
+      resolve: () => { throw new Error('nope') },
+      load: () => ({})
+    }), false)
+  })
+  if (!onlyGot.split('\n').includes('❌ 缺少依赖：got')) throw new Error(onlyGot)
+  if (onlyGot.includes('re2')) throw new Error(`声明清单未含 re2 时不得探测 re2: ${onlyGot}`)
+})
+
+test('RT-08 checkDependencies：includeDevDependencies 只做 resolve，且不与运行时清单重复', () => {
+  const esmOnly = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1' }, devDependencies: { 'fast-check': '1' } }),
+      resolve: () => '/mock/path',
+      load: (name) => { if (name === 'fast-check') throw new Error('ERR_REQUIRE_ESM'); return {} },
+      includeDevDependencies: true
+    }), true)
+  })
+  strictEqual(esmOnly, '')
+  const missingDev = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1' }, devDependencies: { 'fast-check': '1' } }),
+      resolve: (name) => { if (name === 'fast-check') throw new Error('nope'); return '/mock/path' },
+      load: () => ({}),
+      includeDevDependencies: true
+    }), false)
+  })
+  if (!missingDev.split('\n').includes('❌ 缺少依赖：fast-check')) throw new Error(missingDev)
+  const devOff = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1' }, devDependencies: { 'fast-check': '1' } }),
+      resolve: (name) => { if (name === 'fast-check') throw new Error('nope'); return '/mock/path' },
+      load: () => ({})
+    }), true)
+  })
+  strictEqual(devOff, '')
+  const dup = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1' }, devDependencies: { got: '1' } }),
+      resolve: () => { throw new Error('nope') },
+      load: () => ({}),
+      includeDevDependencies: true
+    }), false)
+  })
+  if (!dup.split('\n').includes('❌ 缺少依赖：got')) throw new Error(`重复探测导致清单重复: ${dup}`)
+})
+
+test('F4 checkDependencies：Node 版本不满足 → false 并先报版本闸门（X-range 语义），满足时静默', () => {
+  const bad = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ engines: { node: '>=99.0.0' }, dependencies: { got: '1' } }),
+      resolve: () => '/mock/path',
+      load: () => ({})
+    }), false)
+  })
+  if (!bad.split('\n').includes('  - package.json 的 engines.node 要求 >=99.0.0')) throw new Error(bad)
+  if (!bad.split('\n').some(l => l.startsWith('❌ Node 版本不满足要求（当前 '))) throw new Error(bad)
+  const both = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ engines: { node: '>=99.0.0' }, dependencies: { got: '1' } }),
+      resolve: () => { throw new Error('nope') },
+      load: () => ({})
+    }), false)
+  })
+  if (both.indexOf('❌ Node 版本不满足要求') > both.indexOf('❌ 缺少依赖')) throw new Error(`版本问题应先于依赖问题: ${both}`)
+  const good = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ engines: { node: '>=0.0.1' }, dependencies: { got: '1' } }),
+      resolve: () => '/mock/path',
+      load: () => ({})
+    }), true)
+  })
+  strictEqual(good, '')
+})
+
+test('F3 checkDependencies：missing 与 broken 同时存在 → 两段文案都出（不是二选一）', () => {
+  const out = captureAllOutput(() => {
+    strictEqual(checkDependencies({
+      manifest: () => ({ dependencies: { got: '1', re2: '1' } }),
+      resolve: (name) => { if (name === 'got') throw new Error('nope'); return '/mock/path' },
+      load: (name) => { if (name === NATIVE_NAME) throw new Error('binding gone'); return {} }
+    }), false)
+  })
+  if (!out.split('\n').includes('❌ 缺少依赖：got')) throw new Error(out)
+  if (!out.split('\n').includes('❌ 依赖已安装但不可用：re2')) throw new Error(out)
+  if (!out.split('\n').includes('  - re2: binding gone')) throw new Error(out)
+})
+
 console.log('  🧪 依赖预检测试（checkDependencies）')
 console.log('========================================\n')
 
