@@ -1908,4 +1908,79 @@ check('PlanL filterHash: 稳定、re2 维度参与、空配置有确定值', () 
   assert.notStrictEqual(u.filterHash({}, ''), u.filterHash({ pingbitime: '5' }, ''), '空/非空配置必须不同')
 })
 
+// ===== 补测 PlanM：isDangerousUrl / sanitizeSurrogates / anonKey / num =====
+// 反例（改动前）：四者均可直接经 createUtils 取得，但既有用例只覆盖主路径或完全没测。
+check('PlanM isDangerousUrl: 危险协议必须识别、安全协议必须放行（大小写不敏感）', () => {
+  const u = Utils
+  assert.strictEqual(u.isDangerousUrl('javascript:alert(1)'), true, 'javascript: 必须判危险')
+  assert.strictEqual(u.isDangerousUrl('vbscript:x'), true, 'vbscript: 必须判危险')
+  assert.strictEqual(u.isDangerousUrl('data:text/html,x'), true, 'data: 必须判危险')
+  assert.strictEqual(u.isDangerousUrl('JAVASCRIPT:x'), true, '大小写不敏感（i 标志）')
+  assert.strictEqual(u.isDangerousUrl('http://ok'), false, 'http 必须放行')
+  assert.strictEqual(u.isDangerousUrl('mailto:a@b'), false, 'mailto 必须放行')
+  assert.strictEqual(u.isDangerousUrl(''), false, '空串必须放行（不得误判危险）')
+})
+
+check('PlanM sanitizeSurrogates: 孤立代理替换为 U+FFFD、完整代理对原样保留', () => {
+  const u = Utils
+  const SOH = String.fromCharCode(0xFFFD)
+  assert.strictEqual(u.sanitizeSurrogates('a\uD800b'), 'a' + SOH + 'b', '孤立高代理必须替换为 U+FFFD')
+  assert.strictEqual(u.sanitizeSurrogates('a\uDC00b'), 'a' + SOH + 'b', '孤立低代理同样替换')
+  assert.strictEqual(u.sanitizeSurrogates('a\uD83D\uDE00b'), 'a\uD83D\uDE00b', '完整代理对（emoji）必须原样保留')
+  assert.strictEqual(u.sanitizeSurrogates(''), '', '空串返回空串')
+})
+
+check('PlanM anonKey: 前缀与确定性，且不同输入必须给出不同键', () => {
+  const u = Utils
+  const k = u.anonKey('abc')
+  assert.strictEqual(typeof k, 'string', '必须返回字符串')
+  assert.strictEqual(k.startsWith('anon:'), true, '必须带 anon: 前缀')
+  assert.strictEqual(k, u.anonKey('abc'), '同输入必须稳定')
+  assert.notStrictEqual(u.anonKey('a'), u.anonKey('b'), '不同输入必须不同键')
+  assert.notStrictEqual(u.anonKey('ab'), u.anonKey('ba'), '顺序不同必须不同键（下标项参与哈希）')
+})
+
+check('PlanM num: 只做校验与回退默认，字符串数字按数值接受', () => {
+  const u = Utils
+  assert.strictEqual(u.num('5', 2), 5, "字符串 '5' 必须按数值接受（Utils.num 的核心用途）")
+  assert.strictEqual(u.num(5, 2), 5, '数字原样接受')
+  assert.strictEqual(u.num('x', 2), 2, '非数值串必须回退默认')
+  assert.strictEqual(u.num(NaN, 7), 7, 'NaN 必须回退默认')
+  assert.strictEqual(u.num('', 3), 3, '空串必须回退默认')
+  assert.strictEqual(u.num(null, 4), 4, 'null 必须回退默认')
+  assert.strictEqual(u.num(0, 9), 0, '0 是合法数值，不得回退（否则会把合法配置吞掉）')
+})
+
+check('PlanM2 isDangerousUrl: 命名实体/数字实体绕过必须被识破（v3.245 P0 / v3.258 C009）', () => {
+  const u = Utils
+  // 浏览器解析 href/src 时会解码命名实体：&colon;→':'、&Tab;→'\t'、&NewLine;→'\n'
+  // 若链路里不解码，'javascript&colon;alert(1)' 会绕过黑名单直出网（真实 XSS 载荷）
+  assert.strictEqual(u.isDangerousUrl('javascript&colon;alert(1)'), true, '&colon; 必须被解码后判定危险')
+  assert.strictEqual(u.isDangerousUrl('javascript&Tab;x'), true, '&Tab; 必须被解码（制表符同样可分隔协议）')
+  assert.strictEqual(u.isDangerousUrl('javascript&NewLine;x'), true, '&NewLine; 必须被解码')
+  assert.strictEqual(u.isDangerousUrl('&#106;avascript:x'), true, '数字实体 &#106; 必须经 decodeHtmlEntities 还原为 j')
+  // C009：命名实体查表必须大小写不敏感
+  assert.strictEqual(u.isDangerousUrl('javascript&COLON;alert(1)'), true, '&COLON; 大写变体同样必须被解码')
+  // 双编码防护：&amp;colon; → &colon; → ':'（一次解码后仍需再查一次）
+  assert.strictEqual(u.isDangerousUrl('&amp;colon;x'), false, '&amp;colon; 解码后是文本 "&colon;x"，无协议 ⇒ 不得误判为危险')
+})
+
+check('PlanM2 isDangerousUrl: 协议内部的控制空白必须被剥离后再判定', () => {
+  const u = Utils
+  assert.strictEqual(u.isDangerousUrl('java\tscript:x'), true, '制表符分隔必须识破（\\t 属控制空白）')
+  assert.strictEqual(u.isDangerousUrl('java\nscript:x'), true, '换行分隔必须识破')
+  assert.strictEqual(u.isDangerousUrl('java script:x'), true, '普通空格分隔必须识破')
+  assert.strictEqual(u.isDangerousUrl('java\u00A0script:x'), true, 'U+00A0 不换行空格同样必须剥离')
+  assert.strictEqual(u.isDangerousUrl('java\u200Bscript:x'), true, 'U+200B 零宽空格必须剥离（否则可绕过）')
+  assert.strictEqual(u.isDangerousUrl('http://example.com/a b'), false, '安全协议不得因剥离逻辑被误判')
+})
+
+check('PlanM2 isDangerousUrl: null/undefined 与不可 String 化的输入必须安全返回 false', () => {
+  const u = Utils
+  assert.strictEqual(u.isDangerousUrl(undefined), false, 'undefined 必须返回 false（不得抛）')
+  assert.strictEqual(u.isDangerousUrl(null), false, 'null 必须返回 false（不得抛）')
+  assert.strictEqual(u.isDangerousUrl(Symbol('s')), false, 'Symbol 无法 String 化 ⇒ 必须 catch 后返回 false')
+  assert.strictEqual(u.isDangerousUrl(123), false, '数字转字符串后不含协议 ⇒ false')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
