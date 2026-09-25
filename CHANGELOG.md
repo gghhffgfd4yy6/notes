@@ -205,3 +205,7 @@
  - `336` = `StringLiteral@L198:54`（`timeMatchedRule` 里 `safeGet(group, 'louzhuregime')` 的**字段名字面量**——改错即读错字段，属真实可观测缺陷）
  **这两个是本目标**首次**在 filter 段取得的、经 replay 正式确认的击杀**（该段此前被误判为「本机不可判」而长期计 0）。
  **过程记录**：单靶 filter replay 需 **≈4–5 分钟**（含基线），比先前的 ≈2 分钟估计更长——此前多次失败是把 `timeout` 设成 250–290s 所致；**提到 550s 后单靶稳定完成**。后续 filter 取证统一用 `timeout 550`。
+- **更正（重要，撤回一个伪造数据点）**：第三十六/三十七批中我报告的「filter 抽样 n=10、**2 KILLED**/8 SURVIVED（20%）」、「两个击杀都是既有测试未覆盖的真实缺口」**均不成立，现撤回**。根因：靶子 `500` 并**不在** 220 个 Survived 池里——`ids-xbk_filter.js-idstatus.json` 显示它基线状态就是 **Killed**（该段分布 Killed 350 / Survived 220 / NoCoverage 22），且它**从未出现在我抽样的 `.local/targets/f-all.ids` 中**（`grep -c '^500$'` = 0）。我是**从源码行反推了一个 id 当作样本**，而不是从目标清单里取，故该「样本」自始无效。
+ **更正后的诚实数字**：`filter` 抽样 **n=9，1 KILLED / 8 SURVIVED（11%）**；**唯一**经 replay 正式确认的新增击杀是 **`336`**（`StringLiteral@L198:54`，`timeMatchedRule` 里 `safeGet(group, 'louzhuregime')` 的**字段名字面量**——改错即读错字段、注册时间过滤静默失效，是真实可观测缺陷）。样本表已剔除 `500`（`.local/targets/filter-sample/sample.tsv`），`census.py` 亦只认 `336` ⇒ **合计 2099/3888 = 54.0%**（`500` 不计）。
+ **仍然成立的结论**：`filter` 段**可测**（本地跳过副本恢复判定力）且**确实存在真实缺口**（`336`），这与 utils/message-store/sendnotify 六批探针 ~100 个变异体仅 1 个「已被覆盖」击杀形成对照——**方向是对的，是我的数字错了**。
+ **教训**：抽样靶子**必须从目标清单取样**，绝不能按源码行反推 id；本轮 census 之所以能自动发现，是因为它按「该段 Survived 集合」求交（`500` 不在其中故不被计入）——**这正是把口径写进可执行脚本的价值**。
