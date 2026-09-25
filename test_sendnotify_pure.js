@@ -1021,4 +1021,85 @@ check('WX_pusher_channels: 丢弃/降级原因的告警文本与「已配置」�
   }
 })
 
+// ===== WX_pusher_channels 解析簇真值表：丢弃原因与「已配置」判定（17 个 Survived 变异体的主战场） =====
+// 探针：注入给定 WX_pusher_channels，返回 hasWxPusherConfigured() 与该次解析逐字产生的 warning 列表。
+function probeChannels (value) {
+  const warns = []
+  const originalWarn = console.warn
+  console.warn = (msg) => { warns.push(String(msg)) }
+  try {
+    let configured
+    withConfig({ WX_pusher_channels: value }, () => { configured = hasWxPusherConfigured() })
+    return { configured, warns }
+  } finally {
+    console.warn = originalWarn
+  }
+}
+
+check('WX_pusher_channels: null/undefined/空白/显式空数组零告警，非 null 非字符串视为「已配置但不是数组」', () => {
+  // 杀 L878-880 的比较/逻辑符/字面量变异：null 与 undefined 必须短路成「未配置」（零告警），
+  // 而 0/false/{}/5 是「配了值但不是数组」必须逐字告警 —— 把 && 换 ||、把 !== 翻转、
+  // 把 typeof 比较或空串字面量替换掉，都会在这两侧之一露馅（真值表两侧都要有真/假断言）。
+  const NOT_ARRAY = '⚠️ WX_pusher_channels 不是数组（应为 [{ appToken, topicIds }]），已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）'
+  for (const v of [null, undefined, '', '   ', '\t\n', [], '[]']) {
+    const r = probeChannels(v)
+    assert.strictEqual(r.configured, false, `${String(v)} 必须视为未配置`)
+    assert.deepStrictEqual(r.warns, [], `${String(v)} 是未配置/显式空数组，不得告警`)
+  }
+  for (const v of [0, false, {}, 5]) {
+    const r = probeChannels(v)
+    assert.strictEqual(r.configured, false, `${String(v)} 解析不出条目`)
+    assert.deepStrictEqual(r.warns, [NOT_ARRAY], `${String(v)} 是非 null 非字符串，必须判为已配置并告警形状`)
+  }
+  assert.deepStrictEqual(probeChannels('{"a":1}').warns, [NOT_ARRAY], 'JSON 对象不是数组，必须告警形状')
+  assert.deepStrictEqual(probeChannels('{oops').warns,
+    ['⚠️ WX_pusher_channels 不是合法 JSON，已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）'],
+    '非法 JSON 必须逐字告警解析失败')
+  assert.strictEqual(probeChannels([{ topicIds: '1' }]).warns[0],
+    '⚠️ WX_pusher_channels 的 1 项均缺 appToken 或 topicIds，已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）',
+    '整表丢弃必须逐字告警并带上项数')
+})
+
+check('WX_pusher_channels: 项内三别名 + trim/逗号分隔/空项过滤，空白或逗号项不得冒充条目', () => {
+  // 杀 L895-899：项守卫被反转（合法项被丢、或非对象项走进属性访问而抛错）、appToken/topicIds 的 trim
+  // 被去掉、split 的 ',' 字面量被替换、filter(Boolean) 被去掉、条目对象字面量被清空——每一个都会让
+  // 「无效项」冒充合法通道（静默启用一个永远发不出去的通道）。逐例 deepStrictEqual 告警逐字文案。
+  const ALL_MISSING = '⚠️ WX_pusher_channels 的 1 项均缺 appToken 或 topicIds，已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）'
+  for (const v of [
+    [{ appToken: 'APP_A', topicIds: '1,2' }],
+    [{ appToken: 'APP_A', topicIds: '1,2,3' }],
+    [{ app_token: 'APP_B', topic_ids: ' 3 , 4 ' }],
+    [{ WX_pusher_appToken: 'APP_C', WX_pusher_topicIds: '5' }]
+  ]) {
+    const r = probeChannels(v)
+    assert.strictEqual(r.configured, true, `合法条目必须算已配置：${JSON.stringify(v)}`)
+    assert.deepStrictEqual(r.warns, [], `合法条目不得告警：${JSON.stringify(v)}`)
+  }
+  for (const v of [
+    [{ appToken: '   ', topicIds: '1' }],
+    [{ appToken: 'A', topicIds: '   ' }],
+    [{ appToken: 'A', topicIds: ',' }],
+    [{ appToken: 'A', topicIds: ' , ' }],
+    [null],
+    [' APP_A ']
+  ]) {
+    const r = probeChannels(v)
+    assert.strictEqual(r.configured, false, `无效项不得冒充条目：${JSON.stringify(v)}`)
+    assert.deepStrictEqual(r.warns, [ALL_MISSING], `无效项必须逐字告警：${JSON.stringify(v)}`)
+  }
+  const partial = probeChannels([{ appToken: 'APP_A', topicIds: '1' }, { appToken: '  ', topicIds: '2' }])
+  assert.strictEqual(partial.configured, true, '部分丢弃后仍有合法项即算已配置')
+  assert.deepStrictEqual(partial.warns,
+    ['⚠️ WX_pusher_channels 的 1 项缺 appToken 或 topicIds，已丢弃；仅启用其余 1 项'],
+    '部分丢弃必须按条数逐字告警')
+  // 函数项：typeof 是 'function' 而非 'object'，必须丢弃；项守卫的 || 被换成 && 时它会带着
+  // appToken/topicIds 混进 channels（函数在 JSON 里序列化成 null，故前面补一个合法项让缓存键唯一）
+  const fnItem = Object.assign(() => {}, { appToken: 'APP_F', topicIds: '2' })
+  const withFn = probeChannels([{ appToken: 'APP_A', topicIds: '1' }, fnItem])
+  assert.strictEqual(withFn.configured, true, '函数项丢弃后合法项仍算已配置')
+  assert.deepStrictEqual(withFn.warns,
+    ['⚠️ WX_pusher_channels 的 1 项缺 appToken 或 topicIds，已丢弃；仅启用其余 1 项'],
+    '函数项不是对象，必须按丢弃项计入告警条数')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_sendnotify_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
