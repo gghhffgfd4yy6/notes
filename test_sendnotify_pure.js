@@ -6,7 +6,7 @@
 // 覆盖：maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags
 const assert = require('node:assert')
 const fs = require('node:fs')
-const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config } = require('./xbk_sendNotify_slim')
+const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, hasWxPusherConfigured } = require('./xbk_sendNotify_slim')
 // 判定器同源（S1/F1/P1）与截断单一实现（S6/F7）回归的对拍对象
 const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
 const { createUtils } = require('./xbk_utils')
@@ -814,6 +814,211 @@ check('mdImagesToPlain: 连 ")" 都没有的畸形尾部（i>0）原样保留，
 
 check('mdLinksToPlain: 空 url 分支（i>0）只保留该构造，不重复整段', () => {
   assert.strictEqual(mdLinksToPlain('[a](u) [b]() z'), 'a (u) [b]() z')
+})
+
+// ===== push_config 默认值：配置字面量变异（StringLiteral/ArrayDeclaration）的击杀面 =====
+check('push_config: 默认值逐键精确（空串默认不得被占位文本替换，非空默认不得被清空）', () => {
+  // 源码注释逐键声明默认值：''=未配置、'false'=一言关闭、'https://api.telegram.org'=TG 默认 API。
+  // StringLiteral 变异把 '' 换成 'Stryker was here!' ⇒ 「未配置」被自检当成已配置（假绿，
+  // 主流程却抛 NO_CHANNEL_CONFIG）；反向变异清空非空默认值 ⇒ 默认 API 地址/一言开关丢失。
+  const expected = {
+    HITOKOTO: 'false',
+    BARK_PUSH: '',
+    BARK_ARCHIVE: '',
+    BARK_GROUP: '',
+    BARK_SOUND: '',
+    BARK_ICON: '',
+    BARK_LEVEL: '',
+    BARK_URL: '',
+    PUSH_KEY: '',
+    DEER_KEY: '',
+    DEER_URL: '',
+    PUSH_PLUS_USER: '',
+    WX_pusher_topicIds: '',
+    PUSHME_URL: 'https://push.i-i.me',
+    PUSHME_KEY: '',
+    TG_USER_ID: '',
+    TG_API_HOST: 'https://api.telegram.org',
+    TG_PROXY_HOST: '',
+    TG_PROXY_PORT: ''
+  }
+  for (const [key, value] of Object.entries(expected)) {
+    assert.strictEqual(push_config[key], value, `push_config.${key} 默认值必须为 ${JSON.stringify(value)}`)
+  }
+})
+
+// ===== ENV_ALIASES：青龙 env 名 → push_config 键的映射表 =====
+check('ENV_ALIASES: 每个键的别名列表完整，任一条目有非空 env 即覆盖 push_config', () => {
+  // ArrayDeclaration 变异把别名列表清成 []、StringLiteral 变异把别名清成 '' ⇒ 面板里配好的密钥
+  // 静默不生效（推送仍「成功」但一条没发出）。三个多别名键用**最后一个**别名驱动，
+  // 证明整条列表都被保留而不是只剩首项。
+  const env = {
+    PUSH_PLUS_TOKEN: 'envPushPlus01',
+    PUSH_PLUS_USER: 'envPushPlusUser',
+    PUSH_KEY: 'envPushKey01',
+    BARK_PUSH: 'envBarkPush01',
+    BARK_ARCHIVE: 'envBarkArchive',
+    BARK_GROUP: 'envBarkGroup01',
+    BARK_SOUND: 'envBarkSound01',
+    BARK_ICON: 'envBarkIcon01',
+    BARK_LEVEL: 'envBarkLevel01',
+    BARK_URL: 'envBarkUrl01',
+    QYWX_KEY: 'envQywxKey01',
+    QYWX_ORIGIN: 'envQywxOrigin',
+    WX_PUSHER_APP_TOKEN: 'envWxAppToken1',
+    WX_PUSHER_TOPIC_IDS: 'envWxTopicIds1',
+    WX_PUSHER_CHANNELS: 'envWxChannels1',
+    WX_XIZHI_KEY: 'envXizhiKey01',
+    DEER_KEY: 'envDeerKey01',
+    PUSHME_KEY: 'envPushmeKey1',
+    PUSHME_URL: 'envPushmeUrl1',
+    TG_BOT_TOKEN: 'envTgBotToken',
+    TG_USER_ID: 'envTgUserId01',
+    TG_API_HOST: 'envTgApiHost1',
+    HITOKOTO: 'envHitokoto01'
+  }
+  const expect = {
+    PUSH_PLUS_TOKEN: 'envPushPlus01',
+    PUSH_PLUS_USER: 'envPushPlusUser',
+    PUSH_KEY: 'envPushKey01',
+    BARK_PUSH: 'envBarkPush01',
+    BARK_ARCHIVE: 'envBarkArchive',
+    BARK_GROUP: 'envBarkGroup01',
+    BARK_SOUND: 'envBarkSound01',
+    BARK_ICON: 'envBarkIcon01',
+    BARK_LEVEL: 'envBarkLevel01',
+    BARK_URL: 'envBarkUrl01',
+    QYWX_KEY: 'envQywxKey01',
+    QYWX_ORIGIN: 'envQywxOrigin',
+    WX_pusher_appToken: 'envWxAppToken1',
+    WX_pusher_topicIds: 'envWxTopicIds1',
+    WX_pusher_channels: 'envWxChannels1',
+    WX_XIZHI_KEY: 'envXizhiKey01',
+    DEER_KEY: 'envDeerKey01',
+    PUSHME_KEY: 'envPushmeKey1',
+    PUSHME_URL: 'envPushmeUrl1',
+    TG_BOT_TOKEN: 'envTgBotToken',
+    TG_USER_ID: 'envTgUserId01',
+    TG_API_HOST: 'envTgApiHost1',
+    HITOKOTO: 'envHitokoto01'
+  }
+  const modPath = require.resolve('./xbk_sendNotify_slim')
+  const cached = require.cache[modPath]
+  const saved = {}
+  for (const name of Object.keys(env)) { saved[name] = process.env[name]; process.env[name] = env[name] }
+  try {
+    delete require.cache[modPath]
+    const reloaded = require('./xbk_sendNotify_slim')
+    for (const [key, value] of Object.entries(expect)) {
+      assert.strictEqual(reloaded.push_config[key], value, `env 别名必须让 push_config.${key} 取值 ${value}`)
+    }
+  } finally {
+    delete require.cache[modPath]
+    if (cached) require.cache[modPath] = cached
+    for (const name of Object.keys(env)) {
+      if (saved[name] === undefined) delete process.env[name]
+      else process.env[name] = saved[name]
+    }
+  }
+})
+
+// ===== collectConfiguredSecrets：递归收集的环路防护与类型守卫 =====
+check('脱敏收集: 循环引用的对象不得死循环，且其中的密钥仍须收集', () => {
+  // seen.has/seen.add 是环路防护：has 恒 true ⇒ 对象树整棵被跳过（漏遮）；has 恒 false ⇒
+  // 自引用递归爆栈，被 configuredSecrets 的 catch 吞掉后同样整轮漏遮。
+  const cyclic = { api_secret: 'cycleSecret01' }
+  cyclic.self = cyclic
+  withConfig({ holderField: cyclic }, () => {
+    assert.strictEqual(safeErr('cycleSecret01'), maskKey('cycleSecret01'), '循环对象内的密钥必须被收集')
+  })
+})
+
+check('脱敏收集: 纯对象（非数组）逐字段递归下潜', () => {
+  // typeof value !== 'object' 守卫被反转/恒真时，对象值不再下潜 ⇒ 嵌套密钥整片漏遮。
+  withConfig({ nestedHolder: { deep: { bot_token: 'deepSecret001' } } }, () => {
+    assert.strictEqual(safeErr('deepSecret001'), maskKey('deepSecret001'), '嵌套对象的密钥必须递归收集')
+  })
+})
+
+check('脱敏收集: 非字符串原语（数字）跳过但不得中断后续收集', () => {
+  // 类型守卫失效时数字会走进 WeakSet 分支抛 TypeError，被外层 catch 吞掉 ⇒ 后面的密钥全漏遮。
+  withConfig({ numericHolder: 12345, textHolder: { PUSH_KEY: 'afterPrimSecret' } }, () => {
+    assert.strictEqual(safeErr('afterPrimSecret'), maskKey('afterPrimSecret'), '原语脏值不得中断后续收集')
+  })
+})
+
+check('脱敏收集: URL 路径分段的 4 字符下界（3 字符不加入候选）', () => {
+  withConfig({ BARK_PUSH: 'https://api.day.app/abc' }, () => {
+    assert.strictEqual(safeErr('abc'), 'abc', '3 字符分段不足下界，不得加入候选')
+  })
+  withConfig({ BARK_PUSH: 'https://api.day.app/abcd' }, () => {
+    assert.strictEqual(safeErr('abcd'), maskKey('abcd'), '4 字符分段必须加入候选')
+  })
+})
+
+// ===== nonEmpty：0/false/空白 vs '0'/'false' 的两侧口径 =====
+check('nonEmpty 口径: 0/false/纯空白不算已配置，"0"/"false" 等非空字符串算已配置', () => {
+  // 判定被反转或 trim/字符串化被去掉，都会在「只配了空白」时误报可用通道（自检假绿 → 全程漏推）。
+  withConfig({ PUSH_PLUS_TOKEN: '   ' }, () => {
+    assert.strictEqual(configuredChannelCount(), 0, '纯空白值不算已配置')
+  })
+  withConfig({ PUSH_PLUS_TOKEN: 0 }, () => {
+    assert.strictEqual(configuredChannelCount(), 0, '数字 0 不算已配置')
+  })
+  withConfig({ PUSH_PLUS_TOKEN: false }, () => {
+    assert.strictEqual(configuredChannelCount(), 0, 'false 不算已配置')
+  })
+  withConfig({ PUSH_PLUS_TOKEN: '0' }, () => {
+    assert.strictEqual(configuredChannelCount(), 1, '字符串 "0" 仍算已配置（历史口径不变）')
+  })
+})
+
+// ===== WX_pusher_channels 解析：丢弃原因必须逐条精确告警（不得静默成功） =====
+check('WX_pusher_channels: 丢弃/降级原因的告警文本与「已配置」判定逐例精确', () => {
+  // 解析分支被反转或 configuredText 空白判定被改，会让「配了值但配置无效」静默回退 ⇒ 用户看到
+  // 推送成功却一条没收到。逐例断言 hasWxPusherConfigured() 与 console.warn 的确切文本。
+  const warns = []
+  const originalWarn = console.warn
+  console.warn = (msg) => { warns.push(String(msg)) }
+  const tail = '，已忽略该多应用配置（回退 WX_pusher_appToken/WX_pusher_topicIds）'
+  try {
+    withConfig({ WX_pusher_channels: '{oops' }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), false, 'JSON 解析失败不得算已配置')
+      assert.strictEqual(warns.length, 1, 'JSON 解析失败必须告警且只告警一次')
+      assert.strictEqual(warns[0], '⚠️ WX_pusher_channels 不是合法 JSON' + tail)
+    })
+    withConfig({ WX_pusher_channels: '{"a":1}' }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), false, '非数组 JSON 不得算已配置')
+      assert.strictEqual(warns.length, 1, 'JSON 不是数组必须告警且只告警一次')
+      assert.strictEqual(warns[0], '⚠️ WX_pusher_channels 不是数组（应为 [{ appToken, topicIds }]）' + tail)
+    })
+    withConfig({ WX_pusher_channels: [{ topicIds: '1' }] }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), false, '整表缺 appToken 不得算已配置')
+      assert.strictEqual(warns.length, 1, '整表丢弃必须告警且只告警一次')
+      assert.strictEqual(warns[0], '⚠️ WX_pusher_channels 的 1 项均缺 appToken 或 topicIds' + tail)
+    })
+    withConfig({ WX_pusher_channels: '   ' }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), false, '纯空白视为未配置')
+      assert.strictEqual(warns.length, 0, '纯空白是未配置，不得告警')
+    })
+    withConfig({ WX_pusher_channels: [] }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), false, '空数组是明确不启用，不算已配置')
+      assert.strictEqual(warns.length, 0, '空数组不得告警')
+    })
+    withConfig({ WX_pusher_channels: [{ appToken: 'APP_A', topicIds: '1' }, { topicIds: '2' }] }, () => {
+      warns.length = 0
+      assert.strictEqual(hasWxPusherConfigured(), true, '部分丢弃后仍有合法项即算已配置')
+      assert.strictEqual(warns.length, 1, '部分丢弃必须告警且只告警一次')
+      assert.strictEqual(warns[0], '⚠️ WX_pusher_channels 的 1 项缺 appToken 或 topicIds，已丢弃；仅启用其余 1 项')
+    })
+  } finally {
+    console.warn = originalWarn
+  }
 })
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_sendnotify_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
