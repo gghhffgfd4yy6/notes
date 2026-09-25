@@ -1391,13 +1391,14 @@ out.markFirstType = ca.PROFILE3_BOOT_MARKS.length ? typeof ca.PROFILE3_BOOT_MARK
 out.re2MissingWarning = typeof ca.RE2_MISSING_WARNING === 'string' ? ca.RE2_MISSING_WARNING : String(ca.RE2_MISSING_WARNING)
 out.re2WarnStateFile = ca.RE2_WARN_STATE_FILE
 out.safeReIsFn = typeof sr
-out.safeReBasic = String(sr('aa', 'g')) + '|' + sr('aa', 'g').flags
+const srA = sr('aa', 'g') // re2 会额外带 u 标志：断言结构 + source/flags，而非渲染串精确值
+out.safeReBasic = [typeof srA.test, srA.flags.includes('g'), srA.source === 'aa'].join('|')
 out.safeReCacheIdentity = sr('bb', 'g') === sr('bb', 'g')
-out.safeReKeyCollision = [sr('cc', 'i').flags, sr('cci', '').flags]
+out.safeReKeyCollision = [sr('cc', 'i').source, sr('cci', '').source]
 out.safeReInvalid = rethrow(() => sr('c(', 'g'))
 out.warnsAfterInvalid = warns.length
 const cuStr = cu('a')
-out.cuString = cuStr === null ? 'null' : String(cuStr)
+out.cuString = cuStr === null ? 'null' : [typeof cuStr.test, cuStr.flags.includes('i'), cuStr.source === 'a'].join('|')
 const cuInvalid = cu('(')
 out.cuInvalid = cuInvalid === null ? 'null' : String(cuInvalid)
 out.netArgKeys = (REC.createNetworkArgs && REC.createNetworkArgs.length) ? Object.keys(REC.createNetworkArgs[0]).sort().join(',') : '(none)'
@@ -1535,9 +1536,9 @@ check('XBK_PROFILE=3 启动画像：profile3Require 15 个画像点 + module-loa
 check('safeRe 缓存键与 RE2 闸门：缺分隔符会串键；首条编译失败必须告警一次并仍回落 V8', () => {
   const out = getFacts()
   assert.strictEqual(out.safeReIsFn, 'function', 'createUtils 必须被注入 safeRe 函数')
-  assert.strictEqual(out.safeReBasic, '/aa/g|g', 'safeRe 必须返回带 flags 的正则（String|flags 精确值）')
+  assert.strictEqual(out.safeReBasic, 'function|true|true', 'safeRe 必须返回可用正则：有 test、flags 含 g、source 为 aa（re2 会额外带 u，故不锁渲染串）')
   assert.strictEqual(out.safeReCacheIdentity, true, '同 (src,flags) 必须命中同一缓存对象')
-  assert.deepStrictEqual(out.safeReKeyCollision, ['i', ''], '(cc,i) 与 (cci,) 是两种键，不得因缺少分隔符互相污染缓存')
+  assert.deepStrictEqual(out.safeReKeyCollision, ['cc', 'cci'], '(cc,i) 与 (cci,) 是两种键，不得互相污染缓存（比对 source，避免 re2 的 u 标志干扰）')
   assert.strictEqual(out.warnsAfterLoad, 0, '模块加载期的内部模式不得触发回落告警')
   assert.strictEqual(out.safeReInvalid, 'THREW:SyntaxError', '无效模式在 V8 回落路径上仍必须抛出')
   assert.strictEqual(out.warnsAfterInvalid, 1, '首次 RE2 编译失败必须恰好告警一次（_re2FallbackWarned 初值 false，且 catch 不得被清空）')
@@ -1555,7 +1556,7 @@ check('safeRe/compileUserRegex：未装 re2 时直接走 V8、用户正则一律
 // compileUserRegex：非字符串直接 null（typeof 守卫 + || 短路），字符串按注入的 RE2 编译且默认 flags=i
 check('compileUserRegex：数字输入直接 null，字符串按默认 flags=i 编译为可用正则', () => {
   const out = getFacts()
-  assert.strictEqual(out.cuString, '/a/i', '字符串模式必须按默认 flags=i 编译（try 体被清空会返回 undefined）')
+  assert.strictEqual(out.cuString, 'function|true|true', '字符串模式必须按默认 flags=i 编译：有 test、flags 含 i、source 为 a（try 体被清空会返回 null）')
   assert.strictEqual(out.cuNonString, 'null', '非字符串（数字）输入必须直接返回 null，不得落到 new RE2C')
 })
 
@@ -1689,7 +1690,7 @@ check('PlanH hasValidId: id 为 undefined/null 无效，但其它的假值（0/�
 })
 
 check('PlanH hasValidId: 数字 id 只认有限值（NaN/Infinity 无效）', () => {
-  assert.strictEqual(Utils.hasValidId({ id: NaN }), false, 'NaN 不是有限数 ⇒ 无效')
+  assert.strictEqual(Utils.hasValidId({ id: Number.NaN }), false, 'NaN 不是有限数 ⇒ 无效')
   assert.strictEqual(Utils.hasValidId({ id: Infinity }), false, 'Infinity 不是有限数 ⇒ 无效')
   assert.strictEqual(Utils.hasValidId({ id: -Infinity }), false, '-Infinity 不是有限数 ⇒ 无效')
   assert.strictEqual(Utils.hasValidId({ id: -1 }), true, '负整数仍是有限数 ⇒ 有效（语义依数据源）')
@@ -1715,7 +1716,7 @@ check('PlanH hasValidId: 异常 id getter 必须按无效处理且不抛穿', ()
 })
 
 check('PlanH hasValidId 与 getMessageIdentity 对同一批输入结论一致（防两入口分裂）', () => {
-  const cases = [undefined, null, 42, 'abc', true, [], { }, { id: '' }, { id: '   ' }, { id: 0 }, { id: NaN }, { id: 'abc' }, { id: 123 }]
+  const cases = [undefined, null, 42, 'abc', true, [], { }, { id: '' }, { id: '   ' }, { id: 0 }, { id: Number.NaN }, { id: 'abc' }, { id: 123 }]
   for (const m of cases) {
     const byId = Utils.hasValidId(m)
     const ident = Utils.getMessageIdentity(m)
@@ -1892,8 +1893,8 @@ check('PlanL sameMessageIdentity: 同上身份等价，空/异类身份判否', 
   const u = Utils
   assert.strictEqual(u.sameMessageIdentity({ id: 'x' }, { id: 'x' }), true, '相同 id 等价')
   assert.strictEqual(u.sameMessageIdentity({ id: 'x' }, { id: 'y' }), false, '不同 id 判否')
-  assert.strictEqual(u.sameMessageIdentity({ url: 'http://a' }, { url: 'http://a' }), true, '相同 url 等价')
-  assert.strictEqual(u.sameMessageIdentity({ id: 'a' }, { url: 'http://x' }), false, 'id 与 url 不得互相等价')
+  assert.strictEqual(u.sameMessageIdentity({ url: 'https://a' }, { url: 'https://a' }), true, '相同 url 等价')
+  assert.strictEqual(u.sameMessageIdentity({ id: 'a' }, { url: 'https://x' }), false, 'id 与 url 不得互相等价')
   assert.strictEqual(u.sameMessageIdentity({}, {}), false, '皆无身份判否')
   assert.strictEqual(u.sameMessageIdentity(null, null), false, 'null 判否且不抛')
 })
@@ -1916,7 +1917,7 @@ check('PlanM isDangerousUrl: 危险协议必须识别、安全协议必须放行
   assert.strictEqual(u.isDangerousUrl('vbscript:x'), true, 'vbscript: 必须判危险')
   assert.strictEqual(u.isDangerousUrl('data:text/html,x'), true, 'data: 必须判危险')
   assert.strictEqual(u.isDangerousUrl('JAVASCRIPT:x'), true, '大小写不敏感（i 标志）')
-  assert.strictEqual(u.isDangerousUrl('http://ok'), false, 'http 必须放行')
+  assert.strictEqual(u.isDangerousUrl('https://ok'), false, 'https 必须放行')
   assert.strictEqual(u.isDangerousUrl('mailto:a@b'), false, 'mailto 必须放行')
   assert.strictEqual(u.isDangerousUrl(''), false, '空串必须放行（不得误判危险）')
 })
@@ -1945,7 +1946,7 @@ check('PlanM num: 只做校验与回退默认，字符串数字按数值接受',
   assert.strictEqual(u.num('5', 2), 5, "字符串 '5' 必须按数值接受（Utils.num 的核心用途）")
   assert.strictEqual(u.num(5, 2), 5, '数字原样接受')
   assert.strictEqual(u.num('x', 2), 2, '非数值串必须回退默认')
-  assert.strictEqual(u.num(NaN, 7), 7, 'NaN 必须回退默认')
+  assert.strictEqual(u.num(Number.NaN, 7), 7, 'NaN 必须回退默认')
   assert.strictEqual(u.num('', 3), 3, '空串必须回退默认')
   assert.strictEqual(u.num(null, 4), 4, 'null 必须回退默认')
   assert.strictEqual(u.num(0, 9), 0, '0 是合法数值，不得回退（否则会把合法配置吞掉）')

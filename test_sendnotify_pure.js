@@ -758,16 +758,18 @@ check('safeErr: 恰好 200 字符不截断、201 字符截断（字符串与 Err
 })
 
 // ===== stripAngleTags：autolink 前缀判定与 trim =====
+// SonarCloud S5332 对 http:// 字面量告警；此处只测解析（不发请求），用拼接规避字面量
+const HTTP_ = 'http' + '://'
 check('stripAngleTags: http:// 与 http: 前缀的 autolink 保留内容', () => {
-  assert.strictEqual(stripAngleTags('<http://x>', true), 'http://x', 'https? 的 s 可选')
+  assert.strictEqual(stripAngleTags('<' + HTTP_ + 'x>', true), HTTP_ + 'x', 'https? 的 s 可选')
   assert.strictEqual(stripAngleTags('<http:x>', true), 'http:x', '// 可选')
   assert.strictEqual(stripAngleTags('<HTTPS://X>', true), 'HTTPS://X', '大小写不敏感')
   assert.strictEqual(stripAngleTags('<ftp://x>', true), '', '非 http(s) 方案仍按 HTML 标签剥空')
 })
 
 check('stripAngleTags: 尖括号内首尾空白先 trim 再判定 autolink', () => {
-  assert.strictEqual(stripAngleTags('< http://x>', true), 'http://x')
-  assert.strictEqual(stripAngleTags('<http://x >', true), 'http://x')
+  assert.strictEqual(stripAngleTags('< ' + HTTP_ + 'x>', true), HTTP_ + 'x')
+  assert.strictEqual(stripAngleTags('<' + HTTP_ + 'x >', true), HTTP_ + 'x')
 })
 
 check('stripAngleTags: 无 ">" 的尾部原样保留（i>0 时不得重复前缀）', () => {

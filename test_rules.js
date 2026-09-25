@@ -351,7 +351,7 @@ const r2Warn = (fn) => {
   const c = r2e.compileRules({ keyword: 'abc', pingbitime: 'pi###1' })
   assert.strictEqual(c.pingbitime.rules[0].value, 1)
   assert.deepStrictEqual([...new Set(r2Calls.map(x => x[1]))], ['i'], '所有用户正则编译必须带固定 i 标志（禁止 V8 回退）')
-  assert.deepStrictEqual([...new Set(r2Calls.map(x => x[0]))].sort(), ['a', 'abc', 'b', 'pi', 'z'])
+  assert.deepStrictEqual([...new Set(r2Calls.map(x => x[0]))].sort((a, b) => a.localeCompare(b)), ['a', 'abc', 'b', 'pi', 'z'])
   r2Re2.on = false
 }
 

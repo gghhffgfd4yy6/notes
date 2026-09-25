@@ -986,7 +986,7 @@ check('_getTombstoneProcessStart: 无右括号 / 字段缺失 / 字段非十进�
   const fields = (last) => Array.from({ length: 19 }, (_, i) => String(i)).concat(String(last)).join(' ')
   const cases = [
     { stat: fields(777), expect: null, why: '无 ")" 时不得把整串当字段区解析出数字' },
-    { stat: '1 (x) S ' + fields('abc'), expect: null, why: '第 20 字段非十进制应返回 null' },
+    { stat: '1 (x) ' + fields('abc'), expect: null, why: '第 20 字段非十进制应返回 null' },
     { stat: '1 (x) S 1 2 3', expect: null, why: '字段不足应返回 null' },
     { stat: ') ' + fields(555), expect: '555', why: '右括号落在第 0 列时后续字段仍应解析' }
   ]

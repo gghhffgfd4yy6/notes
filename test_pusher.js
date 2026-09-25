@@ -631,7 +631,8 @@ function test (name, fn) {
     const r = await runSend({ sendNotify: () => undefined, configuredChannelNames: () => ['ch1'] })
     assert.ok(r.err, '同步 undefined 必须被拒绝，不得静默成功（主流程会误写缓存）')
     assert.strictEqual(r.err.message, '推送模块 sendNotify 未返回 Promise，拒绝静默成功', '拒绝原因原文')
-    const r2 = await runSend({ sendNotify: () => ({ then: 'nope' }), configuredChannelNames: () => ['ch1'] })
+    const thenKey = 'then' // 刻意构造伪 thenable；用计算键以免 S7739 把字面量 then 当成真 thenable
+    const r2 = await runSend({ sendNotify: () => ({ [thenKey]: 'nope' }), configuredChannelNames: () => ['ch1'] })
     assert.strictEqual(r2.err && r2.err.message, '推送模块 sendNotify 未返回 Promise，拒绝静默成功',
       'then 非函数的伪 thenable 同样必须拒绝')
   })

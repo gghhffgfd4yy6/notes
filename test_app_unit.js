@@ -162,7 +162,7 @@ check('_safeCounter 拒绝负数 / 小数 / 超安全整数 / 布尔 / 非数字
   assert.strictEqual(app._safeCounter(null), 0)
   assert.strictEqual(app._safeCounter(undefined), 0)
   assert.strictEqual(app._safeCounter(Infinity), 0)
-  assert.strictEqual(app._safeCounter(NaN), 0)
+  assert.strictEqual(app._safeCounter(Number.NaN), 0)
 })
 check('_safeCounter(Symbol) 返回 0 而不抛 TypeError', () => {
   assert.strictEqual(app._safeCounter(Symbol('x')), 0)
@@ -759,7 +759,7 @@ check('_warnLowDisk free === minFree ⇒ 不告警（>= 而非 >），且不更�
 
 check('_warnLowDisk freeBytes 非有限 / info 缺失 ⇒ 不告警也不记录限频', () => {
   const cfg = { storage: { minFreeBytes: 1024 } }
-  for (const info of [null, { freeBytes: NaN }, { freeBytes: Infinity }]) {
+  for (const info of [null, { freeBytes: Number.NaN }, { freeBytes: Infinity }]) {
     const { app } = makeLogApp({ Config: cfg, Utils: { diskSpace: () => info } })
     const r = withCapture('warn', () => app._warnLowDisk())
     assert.deepStrictEqual(r.msgs, [])
@@ -945,7 +945,7 @@ check('_enabledFlag 真值表：原始 falsy/空白/false/0 变体一律关闭',
   assert.strictEqual(app._enabledFlag({ enabled: 0 }), false)
   assert.strictEqual(app._enabledFlag({ enabled: false }), false)
   assert.strictEqual(app._enabledFlag({ enabled: '' }), false)
-  assert.strictEqual(app._enabledFlag({ enabled: NaN }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: Number.NaN }), false)
   assert.strictEqual(app._enabledFlag({ enabled: null }), false)
   // 杀 s !== ''（纯空白）/ trim / toLowerCase 被删；也杀 && 被换成 ||（首项真、其余假）
   assert.strictEqual(app._enabledFlag({ enabled: ' ' }), false)
@@ -1008,7 +1008,7 @@ check('_accumulateReport 逐字段累加精确值（杀 += → -= 与各字段�
 
 check('_accumulateReport 负数钳为 0、数字字符串入账、非有限值钳为 0', () => {
   const st = { date: '', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-  app._accumulateReport(st, { total: -5, dedup: '7', filtered: NaN, pushed: Infinity, failed: undefined, truncated: null })
+  app._accumulateReport(st, { total: -5, dedup: '7', filtered: Number.NaN, pushed: Infinity, failed: undefined, truncated: null })
   // 杀 n >= 0 → n <= 0 与 && → ||：-5 必须被钳成 0 而不是原样写入
   assert.strictEqual(st.total, 0)
   // 杀 Number(v) 被删：'7' 走 Number 后为 7
