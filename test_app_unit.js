@@ -839,9 +839,799 @@ check('_persistReportState 落盘前先 normalize（字符串计数转数字、�
   assert.deepStrictEqual(JSON.parse(cap[0][1]), Object.assign({}, blank, { runs: 9 }))
 })
 
-console.log(`通过 ${passed} / 失败 ${failed}`)
-if (failed > 0) {
-  for (const f of failures) console.log(`  ❌ ${f}`)
-  process.exit(1)
+// ============================================================================
+// 报告 / 告警 / 模板校验簇（本段新增，全部对着 SYSTEM_CONTRACT.md「日报日界固定
+// Asia/Shanghai；告警/日报失败不得影响主流程」与 README「运行日报与通道健康」）
+// 断言纪律：strictEqual / deepStrictEqual 精确值，开关与边界真假两侧各一例。
+// 时间一律注入固定时钟（withFixedNowAsync / _localStamp 覆写），从不比较真实时钟。
+// ============================================================================
+
+const asyncChecks = []
+function checkAsync (name, fn) { asyncChecks.push([name, fn]) }
+
+async function withCaptureAsync (level, fn) {
+  const orig = console[level]
+  const msgs = []
+  console[level] = (...a) => msgs.push(a.map(String).join(' '))
+  try {
+    return { value: await fn(), msgs }
+  } finally {
+    console[level] = orig
+  }
 }
-process.exit(0)
+
+// 注入 Pusher 通知通道（记录每次 title/body）+ 注入 fs/writeAtomic/readSafeTextResult
+// 的可控 app；makeApp 不支持 over.Pusher，故此处直接调 createApp。
+function makeNotifyApp (opts = {}) {
+  const sent = []
+  const stateWrites = []
+  const runLogs = []
+  const app = createApp({
+    Config: opts.Config || {},
+    // safeErrorText 打桩对齐 xbk_utils.js 口径：字符串 error 直接返回内容（此前用简版桩
+    // 会把 '原因：boom' 误判成回退值「未知错误」，属于桩失真）
+    Utils: makeUtils(Object.assign({ safeErrorText: faithfulSafeErrorText }, opts.Utils)),
+    Formatter: {},
+    RuleEngine: {},
+    FilterEngine: {},
+    MessageStore: Object.assign({ cacheDir: CACHE_DIR }, opts.MessageStore),
+    Network: {},
+    Pusher: {
+      send: (text, desp) => {
+        sent.push([text, desp])
+        if (opts.sendThrows) throw opts.sendThrows
+        if (opts.sendError) return Promise.reject(opts.sendError)
+        return Promise.resolve(true)
+      }
+    },
+    fs: Object.assign({ existsSync: () => true, statfsSync: () => ({ bavail: 1 << 20, bsize: 4096 }) }, opts.fs),
+    path,
+    crypto,
+    readSafeTextResult: opts.readSafeTextResult || (() => ({ status: 'missing', text: '' })),
+    writeAtomic: (p, t) => { stateWrites.push([p, t]); return opts.writeOk === undefined ? true : opts.writeOk },
+    isRegularOrMissing: () => true,
+    STATE_TEXT_MAX_BYTES: 262144,
+    DEFAULT_MAX_SIZE: 1048576,
+    RE2C: null,
+    RE2_WARN_STATE_FILE: '',
+    RE2_MISSING_WARNING: '',
+    summarizeError: () => '',
+    PROFILE3: false,
+    PROFILE3_BOOT_MARKS: [],
+    prewarmDns: () => {},
+    prewarmTls: () => {},
+    getNotify: () => Promise.resolve({}),
+    PKG_VERSION: '1.2.3',
+    trimTrailingSlashes: (s) => s,
+    compileUserRegex: () => {}
+  })
+  // run.log 留痕：覆写为数组收集（_writeRunLog 不是本段被测目标，避免真实磁盘写入）
+  app._writeRunLog = (line) => { runLogs.push(line) }
+  app._localStamp = () => 'STAMP'
+  return { app, sent, stateWrites, runLogs }
+}
+
+function faithfulSafeErrorText (e, d) {
+  if (typeof e === 'string' && e.trim() !== '') return e
+  const m = e && e.message
+  return (m !== undefined && m !== null && m !== '') ? String(m) : d
+}
+
+// 不需要观测 console 的告警用例：吞掉 _sendAlert 的正向日志，保持套件输出干净
+async function silentAlert (app, errMsg) {
+  const r = await withCaptureAsync('log', () => app._sendAlert(errMsg))
+  return r.value
+}
+
+async function withFixedNowAsync (now, fn) {
+  const RN = Date.now
+  Date.now = () => now
+  try { return await fn() } finally { Date.now = RN }
+}
+
+const ALERT_PATH = path.join(CACHE_DIR, 'alert.state')
+const REPORT_PATH = path.join(CACHE_DIR, 'report.state')
+const TPL_SUPPORTED_TAIL = '{分类名} {分类ID} {标题} {链接} {日期} {时间} {楼主} {类目} {内容} {价格} {商城} {品牌} {图片} {Html内容} {Markdown内容}'
+const SUMMARY1 = { total: 1, dedup: 2, filtered: 3, pushed: 4, failed: 5, truncated: 6 }
+
+// ---------------------------------------------------------------- _enabledFlag
+check('_enabledFlag 真值表：原始 falsy/空白/false/0 变体一律关闭', () => {
+  // 杀 if (!cfg) 条件取反：缺失/假值配置必须返回 false
+  assert.strictEqual(app._enabledFlag(undefined), false)
+  assert.strictEqual(app._enabledFlag(null), false)
+  assert.strictEqual(app._enabledFlag(0), false)
+  assert.strictEqual(app._enabledFlag(''), false)
+  // 杀 Boolean(en) 合取项被删除：0/false/''/NaN 必须关闭
+  assert.strictEqual(app._enabledFlag({ enabled: 0 }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: false }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: '' }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: NaN }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: null }), false)
+  // 杀 s !== ''（纯空白）/ trim / toLowerCase 被删；也杀 && 被换成 ||（首项真、其余假）
+  assert.strictEqual(app._enabledFlag({ enabled: ' ' }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: '\t\n' }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: 'false' }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: 'FALSE' }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: ' False ' }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: '0' }), false)
+  assert.strictEqual(app._enabledFlag({ enabled: ' 0 ' }), false)
+  // 真值侧：任何非关闭值的原始真值都启用
+  assert.strictEqual(app._enabledFlag({ enabled: 1 }), true)
+  assert.strictEqual(app._enabledFlag({ enabled: true }), true)
+  assert.strictEqual(app._enabledFlag({ enabled: '1' }), true)
+  assert.strictEqual(app._enabledFlag({ enabled: 'true' }), true)
+  assert.strictEqual(app._enabledFlag({ enabled: 'yes' }), true)
+  assert.strictEqual(app._enabledFlag({ enabled: ' on ' }), true)
+})
+
+// ------------------------------------------------------------ _validateTplConfig
+check('_validateTplConfig 两个模板字段的非字符串各自独立告警（|| 而非 &&）', () => {
+  // 杀 || → &&：只坏一个字段时仍必须告警
+  const onlyTitle = makeApp({ Config: { template: { title: 123, content: '{标题}' } } })
+  assert.deepStrictEqual(onlyTitle._validateTplConfig(), ['⚠️ 配置「template.title/content」应为字符串，已回退默认模板'])
+  const onlyContent = makeApp({ Config: { template: { title: '{标题}', content: null } } })
+  assert.deepStrictEqual(onlyContent._validateTplConfig(), ['⚠️ 配置「template.title/content」应为字符串，已回退默认模板'])
+  const bothBad = makeApp({ Config: { template: { title: 1, content: 2 } } })
+  assert.deepStrictEqual(bothBad._validateTplConfig(), ['⚠️ 配置「template.title/content」应为字符串，已回退默认模板'])
+  // 真值侧：两侧都是字符串 ⇒ 零告警（杀 typeof !== 'string' 取反）
+  const bothOk = makeApp({ Config: { template: { title: '{标题}', content: '{内容}' } } })
+  assert.deepStrictEqual(bothOk._validateTplConfig(), [])
+})
+
+check('_validateTplConfig 支持清单完整、重复占位符去重、title/content 分别定位', () => {
+  // 同时锁：支持清单文本、template.{tplName} 名字、Set 去重、includes 方向、\{[^{}]+\} 正则
+  const a = makeApp({ Config: { template: { title: '{标题}{未知}{未知}', content: TPL_SUPPORTED_TAIL } } })
+  assert.deepStrictEqual(a._validateTplConfig(), [
+    `⚠️ 模板「template.title」含占位符「{未知}」——接口真实字段不提供该数据，将输出为空。支持占位符：${TPL_SUPPORTED_TAIL}`
+  ])
+  const c = makeApp({ Config: { template: { title: '{标题}', content: '{未知}' } } })
+  assert.deepStrictEqual(c._validateTplConfig(), [
+    `⚠️ 模板「template.content」含占位符「{未知}」——接口真实字段不提供该数据，将输出为空。支持占位符：${TPL_SUPPORTED_TAIL}`
+  ])
+  // 空占位符 {} 不匹配 [^{}]+（杀 + → * 的 Regex 变异体）
+  const empty = makeApp({ Config: { template: { title: '{}', content: '{标题}' } } })
+  assert.deepStrictEqual(empty._validateTplConfig(), [])
+  // 全部支持占位符 ⇒ 无告警（杀 includes → !includes）
+  const ok = makeApp({ Config: { template: { title: '{分类名}', content: '{Markdown内容}' } } })
+  assert.deepStrictEqual(ok._validateTplConfig(), [])
+})
+
+// ------------------------------------------------------------ _accumulateReport
+check('_accumulateReport 逐字段累加精确值（杀 += → -= 与各字段漏加/写错字段）', () => {
+  const st = { date: '2024-01-01', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+  app._accumulateReport(st, { total: 1, dedup: 2, filtered: 3, pushed: 4, failed: 5, truncated: 6 })
+  assert.deepStrictEqual(st, { date: '2024-01-01', runs: 1, total: 1, dedup: 2, filtered: 3, pushed: 4, failed: 5, truncated: 6 })
+  // 第二次累加：杀 runs += 1 → runs = 1、以及各字段被覆盖写（= 而非 +=）的变异体
+  app._accumulateReport(st, { total: 10, dedup: 20, filtered: 30, pushed: 40, failed: 50, truncated: 60 })
+  assert.deepStrictEqual(st, { date: '2024-01-01', runs: 2, total: 11, dedup: 22, filtered: 33, pushed: 44, failed: 55, truncated: 66 })
+})
+
+check('_accumulateReport 负数钳为 0、数字字符串入账、非有限值钳为 0', () => {
+  const st = { date: '', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+  app._accumulateReport(st, { total: -5, dedup: '7', filtered: NaN, pushed: Infinity, failed: undefined, truncated: null })
+  // 杀 n >= 0 → n <= 0 与 && → ||：-5 必须被钳成 0 而不是原样写入
+  assert.strictEqual(st.total, 0)
+  // 杀 Number(v) 被删：'7' 走 Number 后为 7
+  assert.strictEqual(st.dedup, 7)
+  assert.strictEqual(st.filtered, 0)
+  assert.strictEqual(st.pushed, 0)
+  assert.strictEqual(st.failed, 0)
+  assert.strictEqual(st.truncated, 0)
+  assert.deepStrictEqual(st, { date: '', runs: 1, total: 0, dedup: 7, filtered: 0, pushed: 0, failed: 0, truncated: 0 })
+  // 空 summary：杀 `? n : 0` 条件取反（会把 0/undefined 变成 NaN）
+  const st2 = { date: '', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+  app._accumulateReport(st2, {})
+  assert.deepStrictEqual(st2, { date: '', runs: 1, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 })
+})
+
+// -------------------------------------------------------- _sendCrossDayReport
+checkAsync('_sendCrossDayReport 完整路径：标题/正文逐字符精确 + 两次持久化顺序 + 成功日志', async () => {
+  const { app, sent, stateWrites, runLogs } = makeNotifyApp({ Config: {} })
+  const pending = { runs: 1, total: 2, dedup: 3, filtered: 4, pushed: 5, failed: 6, truncated: 7 }
+  const state = { date: '2024-01-01', runs: 3, total: 10, dedup: 2, filtered: 1, pushed: 5, failed: 1, truncated: 4, pending }
+  const summary = { total: 10, dedup: 20, filtered: 30, pushed: 40, failed: 50, truncated: 60 }
+  const { value, msgs } = await withCaptureAsync('log', () => app._sendCrossDayReport(REPORT_PATH, state, summary, '2024-01-02'))
+  assert.strictEqual(value, undefined)
+  // 杀标题/正文里全部字符串字面量与两个 ? : 分支（truncated 两侧都为真）
+  assert.deepStrictEqual(sent, [[
+    '📊 xbk-push 日报（2024-01-01）',
+    '运行 3 轮 | 推送 5 条 | 失败 1 条\n\n获取 10 | 去重 2 | 过滤 1 | 待推送 4\n\n今日待结转：运行 2 轮 | 推送 45 条 | 失败 56 条\n获取 12 | 去重 23 | 过滤 34 | 待推送 67'
+  ]])
+  // 先持久化 pendingState（累计到 pending），再持久化 nextState（结转 + today）
+  assert.deepStrictEqual(stateWrites.map(w => w[0]), [REPORT_PATH, REPORT_PATH])
+  assert.deepStrictEqual(JSON.parse(stateWrites[0][1]), {
+    date: '2024-01-01',
+    runs: 3,
+    total: 10,
+    dedup: 2,
+    filtered: 1,
+    pushed: 5,
+    failed: 1,
+    truncated: 4,
+    pending: { date: '', runs: 2, total: 12, dedup: 23, filtered: 34, pushed: 45, failed: 56, truncated: 67 }
+  })
+  assert.deepStrictEqual(JSON.parse(stateWrites[1][1]), {
+    date: '2024-01-02', runs: 2, total: 12, dedup: 23, filtered: 34, pushed: 45, failed: 56, truncated: 67
+  })
+  // 杀 `{...state, pending: {...pending}}` 的浅拷贝被删：原 state 的 pending 不得被累计修改
+  assert.deepStrictEqual(state.pending, pending)
+  assert.deepStrictEqual(msgs, ['已发送昨日运行日报'])
+  assert.deepStrictEqual(runLogs, [])
+})
+
+checkAsync('_sendCrossDayReport truncated=0 侧：状态与 pending 都不带「待推送」段', async () => {
+  const { app, sent, stateWrites } = makeNotifyApp({ Config: {} })
+  const state = {
+    date: '2024-02-29',
+    runs: 0,
+    total: 0,
+    dedup: 0,
+    filtered: 0,
+    pushed: 0,
+    failed: 0,
+    truncated: 0,
+    pending: { runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+  }
+  await withCaptureAsync('log', () => app._sendCrossDayReport(REPORT_PATH, state, {}, '2024-03-01'))
+  // pending.runs 经累计必为 1 ⇒ 结转块出现；两个 truncated 都为 0 ⇒ 两处「待推送」段都不出现。
+  // 同时杀第一个 || 被换成 &&（1 && 0 ⇒ 结转块整块消失）
+  assert.deepStrictEqual(sent, [[
+    '📊 xbk-push 日报（2024-02-29）',
+    '运行 0 轮 | 推送 0 条 | 失败 0 条\n\n获取 0 | 去重 0 | 过滤 0\n\n今日待结转：运行 1 轮 | 推送 0 条 | 失败 0 条\n获取 0 | 去重 0 | 过滤 0'
+  ]])
+  assert.deepStrictEqual(JSON.parse(stateWrites[1][1]), {
+    date: '2024-03-01', runs: 1, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0
+  })
+})
+
+checkAsync('_sendCrossDayReport 缺 pending ⇒ 以空累计起算（state.pending || blank）', async () => {
+  const { app, sent, stateWrites } = makeNotifyApp({ Config: {} })
+  const state = { date: '2024-01-01', runs: 1, total: 2, dedup: 0, filtered: 0, pushed: 3, failed: 0, truncated: 0 }
+  await withCaptureAsync('log', () => app._sendCrossDayReport(REPORT_PATH, state, { total: 4, pushed: 5 }, '2024-01-02'))
+  assert.deepStrictEqual(sent, [[
+    '📊 xbk-push 日报（2024-01-01）',
+    '运行 1 轮 | 推送 3 条 | 失败 0 条\n\n获取 2 | 去重 0 | 过滤 0\n\n今日待结转：运行 1 轮 | 推送 5 条 | 失败 0 条\n获取 4 | 去重 0 | 过滤 0'
+  ]])
+  assert.strictEqual(state.pending, undefined, '原 state 不得被凭空补上 pending')
+  assert.deepStrictEqual(JSON.parse(stateWrites[1][1]), {
+    date: '2024-01-02', runs: 1, total: 4, dedup: 0, filtered: 0, pushed: 5, failed: 0, truncated: 0
+  })
+})
+
+checkAsync('_sendCrossDayReport 持久化失败两侧：pending/next 各自告警，发送照旧', async () => {
+  const { app, sent, stateWrites } = makeNotifyApp({ Config: {}, writeOk: false })
+  const state = { date: '2024-01-01', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0, pending: { runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 } }
+  const { msgs } = await withCaptureAsync('warn', () => app._sendCrossDayReport(REPORT_PATH, state, {}, '2024-01-02'))
+  // 杀 if (!pendingSaved) 与 if (nextSaved) 的条件取反/else 归属错乱
+  assert.deepStrictEqual(msgs, [
+    '⚠️ 日报发送/累计状态持久化失败；本进程将继续使用内存状态',
+    '⚠️ 日报待发送状态未持久化，继续发送但失败时将保留旧状态',
+    '⚠️ 日报发送/累计状态持久化失败；本进程将继续使用内存状态',
+    '⚠️ 昨日日报已发送，但最终状态未持久化，重启后可能重复发送'
+  ])
+  assert.strictEqual(sent.length, 1, '持久化失败不得阻止日报发送')
+  assert.deepStrictEqual(stateWrites.map(w => w[0]), [REPORT_PATH, REPORT_PATH])
+})
+
+checkAsync('_sendCrossDayReport 发送失败：只留 pendingState、写 error 行、不抛不回滚状态', async () => {
+  const { app, sent, stateWrites } = makeNotifyApp({ Config: {}, sendError: new Error('HTTP 500 通道挂了') })
+  const state = { date: '2024-01-01', runs: 1, total: 1, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0, pending: { runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 } }
+  const { msgs } = await withCaptureAsync('error', () => app._sendCrossDayReport(REPORT_PATH, state, {}, '2024-01-02'))
+  // 杀 catch 块被整体删除 / 错误口径改变：失败保留旧日期与 pending 以便重试
+  assert.deepStrictEqual(msgs, ['发送昨日运行日报失败: HTTP 500 通道挂了'])
+  assert.strictEqual(sent.length, 1)
+  assert.strictEqual(stateWrites.length, 1, '发送失败时不得结转 nextState')
+  assert.strictEqual(JSON.parse(stateWrites[0][1]).date, '2024-01-01')
+})
+
+// --------------------------------------------------------------- _updateReport
+function makeReportApp (opts = {}) {
+  const calls = { load: 0, persist: [], cross: [] }
+  const base = makeNotifyApp(opts)
+  const app = base.app
+  app._reportToday = () => opts.today === undefined ? '2024-01-02' : opts.today
+  app._loadReportState = () => {
+    calls.load++
+    if (opts.loadThrows) throw opts.loadThrows
+    return opts.loadState
+  }
+  app._persistReportState = (p, s) => {
+    calls.persist.push([p, JSON.parse(JSON.stringify(s))])
+    return opts.persistOk === undefined ? true : opts.persistOk
+  }
+  app._sendCrossDayReport = async (...args) => { calls.cross.push(args) }
+  return { app, calls, sent: base.sent, stateWrites: base.stateWrites, runLogs: base.runLogs }
+}
+
+checkAsync('_updateReport 开关关闭 ⇒ 不读状态、不累计、不持久化（!enabledFlag 两侧）', async () => {
+  const off = makeReportApp({ Config: { report: { enabled: false } }, loadState: { date: '', runs: 0 } })
+  assert.strictEqual(await off.app._updateReport(SUMMARY1), undefined)
+  assert.strictEqual(off.calls.load, 0)
+  assert.deepStrictEqual(off.calls.persist, [])
+  assert.deepStrictEqual(off.calls.cross, [])
+  const on = makeReportApp({ Config: { report: { enabled: true } }, loadState: null })
+  await on.app._updateReport(SUMMARY1)
+  assert.strictEqual(on.calls.load, 1, '开关打开必须真的读状态')
+})
+
+checkAsync('_updateReport 状态读取失败（null）⇒ 跳过本轮，不覆盖原文件', async () => {
+  const { app, calls, runLogs } = makeReportApp({ Config: { report: { enabled: true } }, loadState: null })
+  assert.strictEqual(await app._updateReport(SUMMARY1), undefined)
+  assert.strictEqual(calls.load, 1)
+  assert.deepStrictEqual(calls.persist, [])
+  assert.deepStrictEqual(calls.cross, [])
+  assert.deepStrictEqual(runLogs, [])
+})
+
+checkAsync('_updateReport 同日 ⇒ 就地累加并持久化，日期不变（state.date !== today 取反）', async () => {
+  const start = { date: '2024-01-02', runs: 2, total: 10, dedup: 20, filtered: 30, pushed: 40, failed: 50, truncated: 60 }
+  const { app, calls } = makeReportApp({ Config: { report: { enabled: true } }, loadState: Object.assign({}, start) })
+  await app._updateReport(SUMMARY1)
+  assert.deepStrictEqual(calls.cross, [])
+  assert.deepStrictEqual(calls.persist, [[REPORT_PATH, {
+    date: '2024-01-02', runs: 3, total: 11, dedup: 22, filtered: 33, pushed: 44, failed: 55, truncated: 66
+  }]])
+})
+
+checkAsync('_updateReport date 为空 ⇒ 补上今日再累计（!state.date 取反）', async () => {
+  const { app, calls } = makeReportApp({
+    Config: { report: { enabled: true } },
+    loadState: { date: '', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+  })
+  await app._updateReport(SUMMARY1)
+  assert.deepStrictEqual(calls.cross, [])
+  assert.deepStrictEqual(calls.persist, [[REPORT_PATH, {
+    date: '2024-01-02', runs: 1, total: 1, dedup: 2, filtered: 3, pushed: 4, failed: 5, truncated: 6
+  }]])
+})
+
+checkAsync('_updateReport 跨天且有计数 ⇒ 调 _sendCrossDayReport(路径,state,summary,today) 后 return', async () => {
+  const state = { date: '2024-01-01', runs: 7, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+  const { app, calls } = makeReportApp({ Config: { report: { enabled: true } }, loadState: state })
+  await app._updateReport(SUMMARY1)
+  // 杀 hasCounters 判定与「发送后 return」缺失（否则会重复累计/持久化）
+  assert.deepStrictEqual(calls.persist, [], '跨天日报分支不得再走就地累计持久化')
+  assert.strictEqual(calls.cross.length, 1)
+  assert.strictEqual(calls.cross[0].length, 4)
+  assert.strictEqual(calls.cross[0][0], REPORT_PATH)
+  assert.deepStrictEqual(calls.cross[0][1], state)
+  assert.deepStrictEqual(calls.cross[0][2], SUMMARY1)
+  assert.strictEqual(calls.cross[0][3], '2024-01-02')
+})
+
+checkAsync('_updateReport 跨天但计数全 0 ⇒ 不发明报，结转后累计（value[k] > 0 而非 >= 0）', async () => {
+  const { app, calls } = makeReportApp({
+    Config: { report: { enabled: true } },
+    loadState: { date: '2024-01-01', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+  })
+  await app._updateReport(SUMMARY1)
+  // 杀 > 0 → >= 0：全 0 会被误判「有计数」而错发空日报
+  assert.deepStrictEqual(calls.cross, [])
+  assert.deepStrictEqual(calls.persist, [[REPORT_PATH, {
+    date: '2024-01-02', runs: 1, total: 1, dedup: 2, filtered: 3, pushed: 4, failed: 5, truncated: 6
+  }]])
+})
+
+checkAsync('_updateReport 跨天 state 无计数但 pending 有 ⇒ 仍发明报（hasCounters(state)||hasCounters(pending)）', async () => {
+  const { app, calls } = makeReportApp({
+    Config: { report: { enabled: true } },
+    loadState: {
+      date: '2024-01-01',
+      runs: 0,
+      total: 0,
+      dedup: 0,
+      filtered: 0,
+      pushed: 0,
+      failed: 0,
+      truncated: 0,
+      pending: { runs: 0, total: 9, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+    }
+  })
+  await app._updateReport(SUMMARY1)
+  // 杀 || → &&（两个 hasCounters 都是一个真一个假）
+  assert.strictEqual(calls.cross.length, 1)
+  assert.deepStrictEqual(calls.persist, [])
+})
+
+checkAsync('_updateReport 跨天结转 pending 各字段用 || 0 兜底（pending 假值不得串进计数器）', async () => {
+  // pending 为未归一化的假值 ''（'' || 0 === 0；若 || 被换成 && 则留下 ''，
+  // 随后 += 变成字符串拼接 ⇒ 精确断言立刻变红）
+  const { app, calls } = makeReportApp({
+    Config: { report: { enabled: true } },
+    loadState: {
+      date: '2024-01-01',
+      runs: 0,
+      total: 0,
+      dedup: 0,
+      filtered: 0,
+      pushed: 0,
+      failed: 0,
+      truncated: 0,
+      pending: { runs: '', total: '', dedup: '', filtered: '', pushed: '', failed: '', truncated: '' }
+    }
+  })
+  await app._updateReport(SUMMARY1)
+  assert.deepStrictEqual(calls.cross, [])
+  assert.deepStrictEqual(calls.persist, [[REPORT_PATH, {
+    date: '2024-01-02', runs: 1, total: 1, dedup: 2, filtered: 3, pushed: 4, failed: 5, truncated: 6
+  }]])
+})
+
+checkAsync('_updateReport 跨天有 pending 时把它当结转基数（Object.assign 七字段）', async () => {
+  const { app, calls } = makeReportApp({
+    Config: { report: { enabled: true } },
+    loadState: {
+      date: '2024-01-01',
+      runs: 0,
+      total: 0,
+      dedup: 0,
+      filtered: 0,
+      pushed: 0,
+      failed: 0,
+      truncated: 0,
+      pending: { runs: 5, total: 6, dedup: 7, filtered: 8, pushed: 9, failed: 10, truncated: 11 }
+    }
+  })
+  await app._updateReport(SUMMARY1)
+  // pending 有计数 ⇒ 走日报分支（不结转），确认分支选择没被 hasCounters 变异体颠倒
+  assert.strictEqual(calls.cross.length, 1)
+  assert.deepStrictEqual(calls.persist, [])
+})
+
+checkAsync('_updateReport 内部异常 ⇒ 写 WARN 留痕且不向主流程冒泡', async () => {
+  const { app, runLogs, calls } = makeReportApp({
+    Config: { report: { enabled: true } },
+    loadThrows: new Error('读取溃败\n第二行')
+  })
+  // 杀整体 try/catch 被删（会冒泡中断主流程）与 WARN 行格式/换行清洗变异体
+  assert.strictEqual(await app._updateReport(SUMMARY1), undefined)
+  assert.deepStrictEqual(runLogs, ['STAMP WARN 日报更新异常: 读取溃败 第二行\n'])
+  assert.deepStrictEqual(calls.persist, [])
+})
+
+// ------------------------------------------------------------------ _sendAlert
+checkAsync('_sendAlert 开关/配置缺失 ⇒ 直接跳过：无发送、无留痕、无状态写入', async () => {
+  const off = makeNotifyApp({ Config: { alert: { enabled: false } } })
+  assert.strictEqual(await off.app._sendAlert('boom'), undefined)
+  assert.deepStrictEqual(off.sent, [])
+  assert.deepStrictEqual(off.runLogs, [])
+  assert.deepStrictEqual(off.stateWrites, [])
+  const none = makeNotifyApp({ Config: {} })
+  assert.strictEqual(await none.app._sendAlert('boom'), undefined)
+  assert.deepStrictEqual(none.sent, [])
+})
+
+checkAsync('_sendAlert 成功路径：标题/正文分段/run.log 留痕/alert.state/返回值 true', async () => {
+  const now = 1700000000000
+  const { app, sent, stateWrites, runLogs } = makeNotifyApp({
+    Config: { alert: { enabled: true, intervalMs: 90000 } }
+  })
+  const { value, msgs } = await withFixedNowAsync(now, async () => {
+    return withCaptureAsync('log', () => app._sendAlert('boom'))
+  })
+  assert.strictEqual(value, true)
+  assert.strictEqual(sent.length, 1)
+  assert.strictEqual(sent[0][0], '⚠️ xbk-push 运行异常')
+  const parts = sent[0][1].split('\n\n')
+  // 杀 \n\n 段落分隔、正文前缀、「时间：」「原因：」字面量与原因拼接口径
+  assert.strictEqual(parts.length, 3)
+  assert.strictEqual(parts[0], '接口/推送异常，请检查。')
+  assert.strictEqual(parts[1].slice(0, 3), '时间：')
+  assert.strictEqual(parts[2], '原因：boom')
+  assert.deepStrictEqual(runLogs, ['STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：boom\n'])
+  assert.deepStrictEqual(stateWrites, [[ALERT_PATH, '{"lastAt":1700000000000}']])
+  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, persisted: true })
+  // 杀 Math.ceil 与 /60000 口径：90000ms ⇒ 2 分钟
+  assert.deepStrictEqual(msgs, ['已发送运行异常告警（限频 2 分钟）'])
+})
+
+checkAsync('_sendAlert 原因截断 500 与 safeErrorText 缺省（slice/回退字面量）', async () => {
+  const now = 1700000000000
+  const long = 'x'.repeat(600)
+  const { app, sent } = makeNotifyApp({ Config: { alert: { enabled: true } } })
+  await withFixedNowAsync(now, () => silentAlert(app, long))
+  assert.strictEqual(sent[0][1].split('\n\n')[2], '原因：' + 'x'.repeat(500))
+  const dflt = makeNotifyApp({ Config: { alert: { enabled: true } } })
+  await withFixedNowAsync(now, () => silentAlert(dflt.app, null))
+  assert.strictEqual(dflt.sent[0][1].split('\n\n')[2], '原因：未知错误')
+})
+
+async function alertWithLastAt (lastAt, intervalMs, now, extra = {}) {
+  const made = makeNotifyApp(Object.assign({
+    Config: { alert: { enabled: true, intervalMs } },
+    readSafeTextResult: () => ({ status: 'ok', text: JSON.stringify({ lastAt }) })
+  }, extra))
+  const value = await withFixedNowAsync(now, () => silentAlert(made.app, 'boom'))
+  return Object.assign({ value }, made)
+}
+
+checkAsync('_sendAlert 限频窗口：lastAt 恰好等于 now 判为未过期（<= 而非 <）', async () => {
+  const now = 1700000000000
+  const r = await alertWithLastAt(now, 5000, now)
+  // 杀 lastAt <= Date.now() → <：未来/相等时间戳不得被当成 0 而无限频重发
+  assert.strictEqual(r.value, undefined)
+  assert.deepStrictEqual(r.sent, [])
+  const stale = await alertWithLastAt(now - 5000, 5000, now)
+  // 杀 Date.now() - lastAt < interval → <=：恰好到期必须发送
+  assert.strictEqual(stale.value, true)
+  assert.strictEqual(stale.sent.length, 1)
+})
+
+checkAsync('_sendAlert 限频条件真假两侧（interval>0 && 未到期）', async () => {
+  const now = 1700000000000
+  const recent = await alertWithLastAt(now - 1000, 5000, now)
+  // 真侧：窗口内不重发
+  assert.strictEqual(recent.value, undefined)
+  assert.deepStrictEqual(recent.sent, [])
+  const old = await alertWithLastAt(now - 10000, 5000, now)
+  // 杀 && → ||：已过窗口必须发送
+  assert.strictEqual(old.value, true)
+  assert.strictEqual(old.sent.length, 1)
+  const future = await alertWithLastAt(now + 1000000, 5000, now)
+  // 杀 lastAt 校验里 && → ||：未来时间戳必须被归零后照常发送
+  assert.strictEqual(future.value, true)
+  assert.strictEqual(future.sent.length, 1)
+  const unlimited = await alertWithLastAt(now - 1000, 0, now)
+  // interval <= 0 = 不限频：杀区间判定取反
+  assert.strictEqual(unlimited.value, true)
+  assert.strictEqual(unlimited.sent.length, 1)
+})
+
+checkAsync('_sendAlert intervalMs 非法字符串回落默认 3600000（Utils.num 口径）', async () => {
+  const now = 1700000000000
+  const r = await alertWithLastAt(now - 1000, 'abc', now)
+  // 杀删除 Utils.num 回退：'abc' 会变成 NaN/0 ⇒ 不限频误发
+  assert.strictEqual(r.value, undefined)
+  assert.deepStrictEqual(r.sent, [])
+})
+
+checkAsync('_sendAlert 限频取内存与文件 lastAt 的较大值（Math.max 而非 min）', async () => {
+  const now = 1700000000000
+  const { app, sent } = makeNotifyApp({
+    Config: { alert: { enabled: true, intervalMs: 3600000 } },
+    readSafeTextResult: () => ({ status: 'ok', text: JSON.stringify({ lastAt: 0 }) })
+  })
+  app._alertLastAtByPath.set(ALERT_PATH, { lastAt: now, persisted: true })
+  const r = await withFixedNowAsync(now, () => silentAlert(app, 'boom'))
+  // 内存里更近的 lastAt 必须胜出；Math.min 会取 0 ⇒ 误发
+  assert.strictEqual(r, undefined)
+  assert.deepStrictEqual(sent, [])
+})
+
+checkAsync('_sendAlert 已持久化内存状态但文件被删 ⇒ 丢弃内存限频并重发', async () => {
+  const now = 1700000000000
+  const { app, sent } = makeNotifyApp({
+    Config: { alert: { enabled: true, intervalMs: 3600000 } },
+    fs: { existsSync: () => false }
+  })
+  app._alertLastAtByPath.set(ALERT_PATH, { lastAt: now - 1000, persisted: true })
+  const r = await withFixedNowAsync(now, () => silentAlert(app, 'boom'))
+  // 杀 `persisted && !fs.existsSync` 的条件取反：文件没了仍按内存限频 = 静默丢告警
+  assert.strictEqual(r, true)
+  assert.strictEqual(sent.length, 1)
+  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, persisted: true })
+})
+
+checkAsync('_sendAlert 未持久化的内存状态不因文件存在与否重置（persisted 合取项）', async () => {
+  const now = 1700000000000
+  const { app, sent } = makeNotifyApp({
+    Config: { alert: { enabled: true, intervalMs: 3600000 } },
+    fs: { existsSync: () => false }
+  })
+  app._alertLastAtByPath.set(ALERT_PATH, { lastAt: now - 1000, persisted: false })
+  const r = await withFixedNowAsync(now, () => silentAlert(app, 'boom'))
+  // 杀删除 persisted && ：仅写失败的内存状态不因文件缺失而被清零
+  assert.strictEqual(r, undefined)
+  assert.deepStrictEqual(sent, [])
+})
+
+checkAsync('_sendAlert 状态文件 ok 但 JSON 损坏 ⇒ 忽略（catch 不得消失）', async () => {
+  const now = 1700000000000
+  const { app, sent } = makeNotifyApp({
+    Config: { alert: { enabled: true } },
+    readSafeTextResult: () => ({ status: 'ok', text: 'not-json' })
+  })
+  // 杀 JSON.parse 的 try/catch 被删（会冒泡 ⇒ 返回 false 且不发送）
+  assert.strictEqual(await withFixedNowAsync(now, () => silentAlert(app, 'boom')), true)
+  assert.strictEqual(sent.length, 1)
+})
+
+checkAsync('_sendAlert 限频状态读取失败（ioError）⇒ 保守跳过并明示，不发送', async () => {
+  const now = 1700000000000
+  const { app, sent, runLogs, stateWrites } = makeNotifyApp({
+    Config: { alert: { enabled: true } },
+    readSafeTextResult: () => ({ status: 'ioError', text: '' })
+  })
+  const { value, msgs } = await withFixedNowAsync(now, async () => {
+    return withCaptureAsync('error', () => silentAlert(app, 'boom'))
+  })
+  // 杀 `status !== 'missing'` 取反与 console.error 文案：读失败不得当成「无状态」而重置限频
+  assert.strictEqual(value, undefined)
+  assert.deepStrictEqual(msgs, [`告警限频状态读取失败(ioError)，跳过本次告警以免限频被重置导致重复推送 ${ALERT_PATH}`])
+  assert.deepStrictEqual(sent, [])
+  assert.deepStrictEqual(runLogs, [])
+  assert.deepStrictEqual(stateWrites, [])
+})
+
+checkAsync('_sendAlert 发送失败 ⇒ 返回 false、补失败留痕、不写限频状态', async () => {
+  const now = 1700000000000
+  const { app, sent, stateWrites, runLogs } = makeNotifyApp({
+    Config: { alert: { enabled: true } },
+    sendError: new Error('通道 500\n第二行')
+  })
+  const r = await withFixedNowAsync(now, () => silentAlert(app, 'boom'))
+  // 杀 catch 分支被删 / 返回 true / 失败也写 lastAt（会导致 60s 内静默丢告警）
+  assert.strictEqual(r, false)
+  assert.strictEqual(sent.length, 1)
+  assert.deepStrictEqual(stateWrites, [])
+  assert.strictEqual(app._alertLastAtByPath.size, 0)
+  assert.deepStrictEqual(runLogs, [
+    'STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：boom\n',
+    'STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：通道 500 第二行\n'
+  ])
+})
+
+checkAsync('_sendAlert 持久化失败 ⇒ 仍返回 true 并告警，内存限频 persisted:false', async () => {
+  const now = 1700000000000
+  const { app, stateWrites } = makeNotifyApp({ Config: { alert: { enabled: true, intervalMs: 120000 } }, writeOk: false })
+  const { value, msgs } = await withFixedNowAsync(now, async () => {
+    return withCaptureAsync('warn', () => silentAlert(app, 'boom'))
+  })
+  // 杀 if (!persisted) 取反与 persisted 标记写错
+  assert.strictEqual(value, true)
+  assert.deepStrictEqual(msgs, ['⚠️ 运行异常告警已发送，但 alert.state 持久化失败；本进程将继续使用内存限频'])
+  assert.deepStrictEqual(stateWrites, [[ALERT_PATH, '{"lastAt":1700000000000}']])
+  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, persisted: false })
+})
+
+checkAsync('_sendAlert 同步异常（Pusher.send 抛出）⇒ 返回 false 且不冒泡', async () => {
+  const now = 1700000000000
+  const { app, runLogs, stateWrites } = makeNotifyApp({
+    Config: { alert: { enabled: true } },
+    sendThrows: new Error('syncboom')
+  })
+  // 杀外层 try/catch 被删（同步异常会中断主流程）与 F1 留痕文案
+  assert.strictEqual(await withFixedNowAsync(now, () => silentAlert(app, 'boom')), false)
+  assert.deepStrictEqual(runLogs, [
+    'STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：boom\n',
+    'STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：syncboom\n'
+  ])
+  assert.deepStrictEqual(stateWrites, [])
+})
+
+checkAsync('_sendAlert 留痕自身抛错 ⇒ 仍返回 false，不外泄（J1 内层 try/catch）', async () => {
+  const now = 1700000000000
+  const { app } = makeNotifyApp({ Config: { alert: { enabled: true } }, sendThrows: new Error('syncboom') })
+  app._writeRunLog = () => { throw new Error('disk full') }
+  // 杀 J1 内层 try/catch 被删：留痕失败会使调用方 await 中断
+  assert.strictEqual(await withFixedNowAsync(now, () => silentAlert(app, 'boom')), false)
+})
+
+// ============================================================================
+// 修复轮：针对第一轮 replay 的 20 个存活变异体逐条补杀（14 条可杀 + 6 条等价）
+// ============================================================================
+
+check('_validateTplConfig 非字符串模板不做占位符扫描（typeof 守卫的 continue 不可省）', () => {
+  // 324 ConditionalExpression：typeof tpl !== 'string' → false。守卫一旦短路，
+  // 下面 /\{([^{}]+)\}/g.exec(tpl) 会把对象/数组强转成字符串并误报占位符。
+  const a = makeApp({ Config: { template: { title: { toString: () => '{未知}' }, content: '{标题}' } } })
+  assert.deepStrictEqual(a._validateTplConfig(), ['⚠️ 配置「template.title/content」应为字符串，已回退默认模板'])
+  const b = makeApp({ Config: { template: { title: ['{未知}'], content: '{标题}' } } })
+  assert.deepStrictEqual(b._validateTplConfig(), ['⚠️ 配置「template.title/content」应为字符串，已回退默认模板'])
+})
+
+check('_accumulateReport 边界 ±0：n >= 0 对 -0 判真（>= 而非 >）', () => {
+  // 968 EqualityOperator：n >= 0 → n > 0。两者只在 n 为 ±0 时分叉：
+  // 原式 -0 >= 0 为真 ⇒ 原样返回 -0，-0 + -0 = -0；变异后 -0 > 0 为假 ⇒ 回退 0，-0 + 0 = +0。
+  // strictEqual 走 Object.is 口径，±0 可区分。
+  const st = { date: '', runs: 0, total: -0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+  app._accumulateReport(st, { total: -0 })
+  assert.strictEqual(st.total, -0)
+  assert.strictEqual(st.runs, 1)
+})
+
+checkAsync('_sendCrossDayReport 持久化成功时不得出现「未持久化」告警（!pendingSaved 取反）', async () => {
+  // 1006 ConditionalExpression：!pendingSaved → true。写成功时不得凭空告警。
+  const { app, sent } = makeNotifyApp({ Config: {} })
+  const state = { date: '2024-01-01', runs: 1, total: 1, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0, pending: { runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 } }
+  const cap = await withCaptureAsync('log', () => withCaptureAsync('warn', () => app._sendCrossDayReport(REPORT_PATH, state, {}, '2024-01-02')))
+  assert.deepStrictEqual(cap.value.msgs, [])
+  assert.strictEqual(sent.length, 1)
+})
+
+checkAsync('_sendCrossDayReport pending 计数全假值时不出「今日待结转」块（长 || 链不可换成 true）', async () => {
+  // 988 ConditionalExpression：整条 pendingState.pending.* || ... 链 → true。
+  // pending.runs 传入 -1，累计后为 0，七个字段全假 ⇒ 原实现不渲染结转块。
+  const { app, sent } = makeNotifyApp({ Config: {} })
+  const state = { date: '2024-01-01', runs: 1, total: 2, dedup: 0, filtered: 0, pushed: 3, failed: 0, truncated: 0, pending: { runs: -1, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 } }
+  await withCaptureAsync('log', () => app._sendCrossDayReport(REPORT_PATH, state, {}, '2024-01-02'))
+  assert.deepStrictEqual(sent, [[
+    '📊 xbk-push 日报（2024-01-01）',
+    '运行 1 轮 | 推送 3 条 | 失败 0 条\n\n获取 2 | 去重 0 | 过滤 0'
+  ]])
+})
+
+checkAsync('_updateReport 跨天 hasCounters 覆盖 reportKeys 余下 5 个字段（数组字面量逐项不可省）', async () => {
+  // 1061-1065 StringLiteral：'dedup'/'filtered'/'pushed'/'failed'/'truncated' → ""。
+  // 逐个字段单独置 1，任何一项被替换成空串都会漏判「有计数」而错走结转分支。
+  for (const key of ['dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+    const state = { date: '2024-01-01', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+    state[key] = 1
+    const { app, calls } = makeReportApp({ Config: { report: { enabled: true } }, loadState: state })
+    await app._updateReport(SUMMARY1)
+    assert.strictEqual(calls.cross.length, 1, `仅 ${key} > 0 时也必须走跨天日报分支`)
+    assert.deepStrictEqual(calls.persist, [], `仅 ${key} > 0 时不得走就地累计`)
+  }
+})
+
+checkAsync('_sendAlert 负 intervalMs 视为不限频且日志按 0 分钟口径（区间三元不可省）', async () => {
+  // 401 ConditionalExpression：intervalMs > 0 → true，interval 变成 -60000，
+  // 日志口径 Math.ceil(-60000/60000) = -1 ⇒ 「限频 -1 分钟」。
+  const now = 1700000000000
+  const { app, sent } = makeNotifyApp({ Config: { alert: { enabled: true, intervalMs: -60000 } } })
+  const { value, msgs } = await withFixedNowAsync(now, async () => {
+    return withCaptureAsync('log', () => app._sendAlert(new Error('boom')))
+  })
+  assert.strictEqual(value, true)
+  assert.strictEqual(sent.length, 1)
+  assert.deepStrictEqual(msgs, ['已发送运行异常告警（限频 0 分钟）'])
+})
+
+checkAsync('_sendAlert 正文时间固定 Asia/Shanghai（toLocaleString 的 timeZone 选项不可省）', async () => {
+  // 419 ObjectLiteral：{ timeZone: 'Asia/Shanghai' } → {}。冻结时钟后，丢失 timeZone
+  // 在 TZ=UTC 下会渲染成前一天的 22:13:20。
+  const now = 1700000000000
+  const RealDate = Date
+  class FixedDate extends RealDate {
+    constructor (...args) { if (args.length === 0) super(now); else super(...args) }
+    static now () { return now }
+  }
+  const { app, sent } = makeNotifyApp({ Config: { alert: { enabled: true } } })
+  let value
+  try {
+    global.Date = FixedDate
+    const cap = await withCaptureAsync('log', () => app._sendAlert(new Error('boom')))
+    value = cap.value
+  } finally {
+    global.Date = RealDate
+  }
+  assert.strictEqual(value, true)
+  // 1700000000000 = UTC 2023-11-14T22:13:20Z ⇒ 上海 2023/11/15 06:13:20
+  assert.strictEqual(sent[0][1].split('\n\n')[1], '时间：2023/11/15 06:13:20')
+})
+
+checkAsync('_sendAlert run.log 原因截断 200（slice 不可省）', async () => {
+  // 425 MethodExpression：safeReason.replace(...).slice(0, 200) → 去掉 .slice(0, 200)。
+  const now = 1700000000000
+  const { app, runLogs } = makeNotifyApp({ Config: { alert: { enabled: true } } })
+  await withFixedNowAsync(now, () => silentAlert(app, new Error('A'.repeat(250))))
+  assert.deepStrictEqual(runLogs, ['STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：' + 'A'.repeat(200) + '\n'])
+})
+
+checkAsync('_sendAlert 留痕把连续换行折叠成一个空格（+ 量词与替换串两侧）', async () => {
+  // 426 Regex：/[\r\n]+/g → /[\r\n]/g（每个换行各折叠一次 ⇒ 两个空格）；
+  // 428 StringLiteral：替换串 ' ' → ""（换行被删除而非折叠）。
+  const now = 1700000000000
+  const { app, runLogs } = makeNotifyApp({ Config: { alert: { enabled: true } } })
+  await withFixedNowAsync(now, () => silentAlert(app, new Error('前段\n\n后段')))
+  assert.deepStrictEqual(runLogs, ['STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：前段 后段\n'])
+})
+
+// ===== 异步用例执行（同步用例已在上方跑完）=====
+;(async () => {
+  for (const [name, fn] of asyncChecks) {
+    try {
+      await fn()
+      passed++
+    } catch (e) {
+      failed++
+      failures.push(`${name} :: ${e.message}`)
+    }
+  }
+  console.log(`通过 ${passed} / 失败 ${failed}`)
+  if (failed > 0) {
+    for (const f of failures) console.log(`  ❌ ${f}`)
+    process.exit(1)
+  }
+  process.exit(0)
+})()
