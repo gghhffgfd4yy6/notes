@@ -213,3 +213,6 @@
 - **`filter` 抽样（第六批）**：新增样本 `378`（先核验属 Survived 池 ✅ 再 replay）⇒ **SURVIVED**（`ConditionalExpression@L211:28`）。累计 **n=11、1 KILLED / 10 SURVIVED（9%）**，唯一击杀仍为 `336`。
  - **本轮踩到并处理了一次 fail-closed 闸门**：首次跑 `378` 时基线 rc=1，`replay.mjs` 按设计**拒绝产出结果**（红基线下任何变异体都会被误记 KILLED）。真因是**上一次被超时 kill 的 replay 把变异体留在了 worktree**（`.local/wt-filter/xbk_filter.js` 未还原）。处理：`cmp` 比对后从主仓还原 → 复跑套件确认 0 失败（绿基线）→ 重跑成功。**这印证了闸门的价值**：若没有它，这次会静默产出一个假 KILLED。**流程固化**：filter 段每轮 replay **跑前必 `cmp` 核对 worktree 源、跑后也必还原**。
  - **样本量**：n=11 仍不足以推断该段 220 个剩余；继续累积至 n≈25–30 再下结论。权威合计仍为 **2099/3888 = 54.0%**（filter 计 1）。
+- **`filter` 抽样（第七批）**：新增样本 `437`（从目标清单取、先核验属 Survived 池 ✅）⇒ **SURVIVED**（`StringLiteral@L225:83`）。累计 **n=12、1 KILLED / 11 SURVIVED（8%）**，唯一击杀仍为 `336`。
+ - **跑前跑后双 `cmp` 已固化为常规**（上一批假 KILLED 的补救）：本轮跑前确认 worktree 源干净、跑后确认已还原，两步均通过；replay 一次成功、未触发闸门。
+ - **样本量**：n=12 仍不足以推断该段 220 个剩余；继续累积至 n≈25–30。权威合计 **2099/3888 = 54.0%**（filter 计 1）。
