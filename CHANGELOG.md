@@ -173,3 +173,7 @@
  ③ **`sendnotify`：136/161 取不到**（`cleanSurrogates` 35、`streamRequest` 21、`findDestEnd` 21…）⇒ 同样有杠杆。
  **因此修正后的建议**：若要做测试专用导出，收益集中在 `message-store`（最多 317）与 `sendnotify`（最多 136），**不是 `utils`**；且必须注意其中相当一部分同时属于「等价/不可观测」（如 `getFilePath` 的 `<=`→`<` 已证等价、`cleanSurrogates` 的守卫被 `String()` 吸收），**实际可解锁数低于这两个上界**，需先探针估算再投入。
  **方法坑（本轮踩到并修正）**：函数归属的正则把 `if`/`while`/`for` 等**控制关键字**当成了函数名，导致 `utils` 的「不可达」被虚报为 324（真值 1）。修正方式是排除关键字白名单；**该修正同时把结论从「utils 有杠杆」翻转为「utils 无杠杆」**。
+- **导出杠杆的实测价值 ≈ 0（本目标最后一项待决事项已用证据关闭）**：对上一轮算出的「取不到的函数」上界（`message-store` 317、`sendnotify` 136）做**探针实测**——按函数抽 2 个共 18 个变异体（message-store: `saveBatch`/`getFilePath`/`_trimCacheByBytes`/`_loadTombstones`/`readMessages`；sendnotify: `cleanSurrogates`/`streamRequest`/`findDestEnd`/`stripAngleTags`），**18/18 SURVIVED**。
+ ⇒ **结论：这些靶子即便加上测试专用导出也仍不可杀**（差异要么在函数输入域内等价、要么落在那 21 个 `findDestEnd` 被调用点吸收的类别里、要么位于本机不可注入的路径），**我先前"导出可解锁数百个"的建议已被自己的探针证伪**。
+ **本目标的总账（最终）**：六个探针批次合计采样约 **100 个变异体**，**仅 1 个 KILLED 且已被覆盖**；据此判断「可杀的测试缝隙已闭合」不是印象而是抽样证据。
+ **因此对「是否要做测试专用导出」的最终建议：不做**——收益已被实测否定，而代价是改动生产文件、扩大导出面（与 `SYSTEM_CONTRACT.md` 的最小暴露面取向相悖）。若将来确有需要，上界仍是 `message-store` 317 / `sendnotify` 136，但须先按本轮方法探针估算真实收益。
