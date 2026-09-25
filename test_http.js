@@ -515,7 +515,9 @@ function installMockStream (behavior) {
     const timing = logs.find(l => l.includes('[profile api timing]'))
     assert.ok(timing, `必须输出 timing 日志，实际 ${JSON.stringify(logs)}`)
     for (const key of ['firstDataAt', 'downloadEnd', 'parse', 'total']) {
-      const m = new RegExp(key + '=(\\d+)').exec(timing)
+      // 用切分 + 字面量正则取数字：new RegExp(变量) 会被 Codacy 判为「非字面量构造器」（本例为误报）
+      const tail = timing.split(key + '=')[1]
+      const m = tail === undefined ? null : /^(\d+)/.exec(tail)
       assert.ok(m, `${key} 必须是数字耗时（恒为 n/a 说明首块未记录），实际日志：${timing}`)
       assert.ok(Number(m[1]) < 3600000, `${key} 必须是耗时差而不是时间戳相加，实际 ${m[1]}`)
     }

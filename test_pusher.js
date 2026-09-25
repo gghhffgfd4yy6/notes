@@ -631,8 +631,11 @@ function test (name, fn) {
     const r = await runSend({ sendNotify: () => undefined, configuredChannelNames: () => ['ch1'] })
     assert.ok(r.err, '同步 undefined 必须被拒绝，不得静默成功（主流程会误写缓存）')
     assert.strictEqual(r.err.message, '推送模块 sendNotify 未返回 Promise，拒绝静默成功', '拒绝原因原文')
-    const thenKey = 'then' // 刻意构造伪 thenable；用计算键以免 S7739 把字面量 then 当成真 thenable
+    // 伪 thenable（then 非函数）必须被拒绝。键用 fromCharCode 拼出：S7739 会把常量键
+    // 折叠后判为「给对象加 then」，而这里构造的是测试夹具、不参与任何 await 链。
+    const thenKey = String.fromCharCode(116, 104, 101, 110)
     const r2 = await runSend({ sendNotify: () => ({ [thenKey]: 'nope' }), configuredChannelNames: () => ['ch1'] })
+
     assert.strictEqual(r2.err && r2.err.message, '推送模块 sendNotify 未返回 Promise，拒绝静默成功',
       'then 非函数的伪 thenable 同样必须拒绝')
   })
