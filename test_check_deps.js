@@ -710,6 +710,70 @@ test('F4 satisfiesComparator：`=` 与裸版本按 X-range 语义（=1 → [1.0.
   strictEqual(A.satisfiesComparator([22, 22, 2], ''), null)
 })
 
+// ---- 补测 PlanB：版本解析/比较的剩余存活靶子（父代理逐 id 定位后补齐）----
+// 反例（改动前）：下列 8 个变异体在既有用例下全部存活——既有用例覆盖了主路径，但这些「形态边界」没有对样例。
+
+// id 4 @L36 StringLiteral（readPackageManifest 里 fs.readFileSync 的 'utf8' → ''）
+// 只断言「读到了 package.json 且能解析出 version」不够——要证明**真的按 utf8 解码**：
+// 用沙箱 manifest 写一个含非 ASCII 的值，若编码参数被改成 ''（Buffer）则 JSON.parse 会拿到 Buffer 文本而抛/失真。
+test('PlanB readPackageManifest：必须以 utf8 读取（含非 ASCII 值仍能正确解析）', () => {
+  const I = internalsOf(makeInternalsSandbox({ manifest: { version: '1.0.0', 备注: '中文值' } }))
+  const pkg = I.readPackageManifest()
+  strictEqual(pkg.备注, '中文值', '非 ASCII 值必须按 utf8 正确解码（编码参数被改坏即红）')
+  strictEqual(pkg.version, '1.0.0')
+})
+
+// id 18 @L44 ConditionalExpression（`!group || typeof group !== 'object'` → false）
+// 杀「形状守卫被强制为 false」：live 的认非对象 group 会让 Object.keys 抛 TypeError。
+test('PlanB declaredRuntimeDependencies：非对象 group 必须跳过而非崩溃（形状守卫）', () => {
+  strictEqual(internalsOf(makeInternalsSandbox({ manifest: { dependencies: {} } })).declaredRuntimeDependencies({ dependencies: 'nope', optionalDependencies: 42 }).length, 0,
+    '字符串/数字形状的 group 必须被守卫跳过（守卫置 false 会 Object.keys 抛错）')
+  deepStrictEqual(internalsOf(makeInternalsSandbox({ manifest: {} })).declaredRuntimeDependencies({ dependencies: { got: '11' } }), ['got'],
+    '正常对象形状仍要正确取键（反向对照）')
+})
+
+// id 55 @L71 Regex（`/^v?(\d+)\.(\d+)\.(\d+)/` → 末段量词被削成 \d）
+// 杀「第三段只取一位」：`22.22.10` 与 `22.22.1` 必须区分。
+test('PlanB parseVersion：第三段必须完整取位（数字量词 + 而非单字符）', () => {
+  const P = A.parseVersion
+  deepStrictEqual(P('22.22.10'), [22, 22, 10], '第三段两位数必须整体取出')
+  deepStrictEqual(P('1.0.100'), [1, 0, 100], '第三段三位数同理')
+  deepStrictEqual(P('1.0.1'), [1, 0, 1], '反向对照：一位数')
+})
+
+// id 61 @L76 EqualityOperator（`i < 3` → `i <= 3`）
+// 杀「循环多跑一轮」：a/b 同为长度 3 时第 4 次比较 a[3]===b[3] 皆 undefined 而提前 return 0 ⇒ 不可观测，
+// 故必须构造**长度不同**的输入让越界可观测。
+test('PlanB compareVersion：长度不等时不得因越界比较而误判相等', () => {
+  const C = A.compareVersion
+  // 实测语义（已用纯函数独立复算核对）：某节为 undefined 时 `undefined < x` 恒 false ⇒ **两个方向都返回 1**，
+  // 这是该函数在「长度不等」上的固有不对称（X-range 语义由 satisfiesComparator 另行处理，不在此函数）。
+  // 本用例的可判别点因此只有一个：**不得返回 0**（`i <= 3` 的变异体会在越界那一轮把它读成相等）。
+  strictEqual(C([22, 22], [22, 22, 2]) !== 0, true, '缺段 vs 有值段不得被判为相等（i<=3 越界多跑一轮即会返回 0）')
+  strictEqual(C([22, 22, 2], [22, 22]) !== 0, true, '反向同样不得判相等')
+  strictEqual(C([1, 0], [1, 0, 0]), 1, '实测形态固定为 1（如需变更须连同本断言一起复核）')
+  strictEqual(C([1, 0, 0], [1, 0, 0]), 0, '反向对照：完全相等必须返回 0')
+})
+
+// id 70 @L77 EqualityOperator（`a[i] < b[i] ? -1 : 1` → `a[i] <= b[i] ? -1 : 1`）
+// 杀「等值分支被判成 -1」：必须让某一节**相等**才能区分——a[i]===b[i] 时正确实现返回 1（因为前面已排除 !==）。
+test('PlanB compareVersion：某一节相等时方向判定不得反转', () => {
+  const C = A.compareVersion
+  strictEqual(C([1, 5, 0], [1, 4, 0]), 1, '第二节更大 ⇒ 1（等号被改成 <= 会得 -1）')
+  strictEqual(C([1, 4, 0], [1, 5, 0]), -1, '反向')
+})
+
+// id 74/75/84 @L92 Regex（satisfiesComparator 的 token 正则三处变异）
+// 杀「锚点/可选段/字符类」被削：必须覆盖 `$` 锚点（尾随垃圾须不匹配）、三段的可选性、以及 `^`/`~` 字符类成员。
+test('PlanB satisfiesComparator：token 正则的锚点、可选段与字符类成员', () => {
+  const S = (v, token) => A.satisfiesComparator(A.parseVersion(v), token)
+  strictEqual(S('1.2.3', '>=1.2.3junk'), null, '尾随垃圾必须因 `$` 锚点而不匹配（锚点被删即红）')
+  strictEqual(S('1.2.3', '1.2.3'), true, '三段精确写法仍须匹配（可选段不得被削成必选）')
+  strictEqual(S('1.2.3', '~1.2'), true, '`~` 必须仍在字符类里（字符类被削即 return null）')
+  strictEqual(S('1.2.3', '^1.2'), true, '`^` 同理')
+  strictEqual(S('1.2.3', '<1.2'), false, '`<` 同理（反向对照）')
+})
+
 // ---- satisfiesNodeRange（公开导出）----
 // 杀 `||` 分隔、tokens 拆分、matched=false+break、`result === null` 降级与收尾 return false。
 test('F4 satisfiesNodeRange：|| 多段任一命中为真、全不命中为假、空/未知写法为 null', () => {
