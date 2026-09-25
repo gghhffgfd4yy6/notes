@@ -172,4 +172,224 @@ const engine = createRuleEngine({
   nested('[]](a+)+', true, '空类 ] 开头写法跳过后仍须检出后续嵌套量词')
 }
 
+// ===================== planB 追加（变异靶：_splitLines / compileRules / validateConfig）=====================
+// 注入的 compileUserRegex / isRe2Available 用可变旗标，同一引擎覆盖「re2 可用 / 不可用」两侧；
+// 每次调用记录实参，锁死契约要求的固定 'i' 标志与 String() 化（re2 缺失时禁止回退 V8）。
+// 断言全部走精确值（strictEqual / deepStrictEqual），且尽可能真假两侧成对。
+const r2Re2 = { on: false }
+const r2Calls = []
+const r2Compile = (src, flags) => {
+  r2Calls.push([String(src), flags])
+  return /BAD/.test(String(src)) ? null : new RegExp(String(src), flags)
+}
+const r2Utils = {
+  safeGet: (o, k) => (o === null || o === undefined ? undefined : o[k]),
+  safeErrorText: (err, dflt) => String((err && err.message) || dflt || '')
+}
+const r2Make = (fields) => createRuleEngine({
+  Utils: r2Utils,
+  FILTER_FIELDS: fields,
+  compileUserRegex: r2Compile,
+  isRe2Available: () => r2Re2.on
+})
+const r2Warn = (fn) => {
+  const warns = []
+  const orig = console.warn
+  console.warn = (...a) => warns.push(a.join(' '))
+  try { fn() } finally { console.warn = orig }
+  return warns
+}
+
+// 杀 _splitLines L153/L155：undefined/null/Symbol 必须早退为空数组；String() 抛错走 catch 返回空数组（不得返回占位数组）；多行切分含 <br/>
+{
+  const r2e = r2Make(['keyword'])
+  assert.deepStrictEqual(r2e._splitLines(undefined), [])
+  assert.deepStrictEqual(r2e._splitLines(null), [])
+  assert.deepStrictEqual(r2e._splitLines(Symbol('r2')), [])
+  assert.deepStrictEqual(r2e._splitLines(''), [])
+  assert.deepStrictEqual(r2e._splitLines({ toString () { throw new Error('boom') } }), [])
+  assert.deepStrictEqual(r2e._splitLines('a###b<br/>c###d\r\ne###f'), ['a###b', 'c###d', 'e###f'])
+  assert.strictEqual(r2e._splitLines('no-delim'), null)
+}
+
+// 杀 compileRules L179/L183/L186/L191：非字符串（数字/布尔/函数/Symbol）与空串一律置 null，告警文本精确
+{
+  const r2e = r2Make(['keyword'])
+  assert.strictEqual(r2e.compileRules({ keyword: undefined }).keyword, null)
+  assert.strictEqual(r2e.compileRules({ keyword: null }).keyword, null)
+  assert.strictEqual(r2e.compileRules({ keyword: Symbol('r2') }).keyword, null)
+  assert.strictEqual(r2e.compileRules({ keyword: '' }).keyword, null)
+  assert.strictEqual(r2e.compileRules({ keyword: 123 }).keyword, null)
+  assert.strictEqual(r2e.compileRules({ keyword: true }).keyword, null)
+  assert.strictEqual(r2e.compileRules({ keyword: () => {} }).keyword, null)
+  const w = r2Warn(() => r2e.compileRules({ keyword: 123 }))
+  assert.deepStrictEqual(w, ['⚠️ 规则「keyword」的值必须为字符串（当前为 number），已跳过'])
+  assert.strictEqual(r2e.compileRules({}).__compiled, true)
+}
+
+// 杀 compileRules L207/L209/L211/L212/L226：仅多于两段才告警、空值行跳过、source 必须为 trim 后的行
+{
+  const r2e = r2Make(['keyword'])
+  const w1 = r2Warn(() => {
+    const c = r2e.compileRules({ keyword: 'a###b###c' })
+    assert.strictEqual(c.keyword._type, 'multi')
+    assert.strictEqual(c.keyword.rules.length, 1)
+    assert.strictEqual(c.keyword.rules[0].source, 'a###b###c')
+  })
+  assert.deepStrictEqual(w1, ['⚠️ 配置「keyword」行包含多个 ###，仅前两段生效：「a###b###c」'])
+  const w2 = r2Warn(() => {
+    assert.strictEqual(r2e.compileRules({ keyword: 'a###b<br>c###d' }).keyword.rules.length, 2)
+    assert.strictEqual(r2e.compileRules({ keyword: 'a###b<br>nodelim' }).keyword.rules.length, 1)
+  })
+  assert.deepStrictEqual(w2, [])
+  assert.deepStrictEqual(r2e.compileRules({ keyword: 'cat###' }).keyword.rules, [])
+  assert.strictEqual(r2e.compileRules({ keyword: ' cat ### val ' }).keyword.rules[0].source, 'cat ### val')
+}
+
+// 杀 compileRules L221/L222/L225/L240/L244：re2 可用时非法正则告警并跳过；re2 缺失时静默置 null 且不回退 V8
+{
+  const r2e = r2Make(['keyword'])
+  r2Re2.on = true
+  const w1 = r2Warn(() => {
+    assert.deepStrictEqual(r2e.compileRules({ keyword: 'cat###BAD' }).keyword.rules, [])
+  })
+  assert.deepStrictEqual(w1, ['⚠️ 规则「keyword」包含非法正则「BAD」，已跳过（v3.239 口径统一：validateConfig 与 compileRules 均告警）'])
+  const w2 = r2Warn(() => {
+    assert.strictEqual(r2e.compileRules({ keyword: 'BAD' }).keyword, null)
+  })
+  assert.deepStrictEqual(w2, ['⚠️ 规则「keyword」无法使用安全正则引擎，已跳过'])
+  r2Re2.on = false
+  const w3 = r2Warn(() => {
+    assert.deepStrictEqual(r2e.compileRules({ keyword: 'cat###BAD' }).keyword.rules, [])
+    assert.strictEqual(r2e.compileRules({ keyword: 'BAD' }).keyword, null)
+  })
+  assert.deepStrictEqual(w3, [])
+  assert.strictEqual(r2e.compileRules({ keyword: '  abc  ' }).keyword.source, 'abc')
+  assert.strictEqual(r2e.compileRules({ keyword: '   ' }).keyword, null)
+  const before = r2Calls.length
+  assert.strictEqual(r2e.compileRules({ keyword: '(a+)+' }).keyword, null)
+  assert.deepStrictEqual(r2Calls.slice(before), [], '嵌套量词必须在调用 compileUserRegex 之前早退')
+}
+
+// 杀 compileRules L255/L256/L263/L264/L271/L272/L273/L274/L283/L286：pingbitime 上下界含等号、超限告警文本精确、空值行跳过、source trim
+{
+  const r2e = r2Make(['keyword'])
+  assert.strictEqual(r2e.compileRules({}).pingbitime, null)
+  assert.strictEqual(r2e.compileRules({ pingbitime: '' }).pingbitime, null)
+  assert.deepStrictEqual(r2e.compileRules({ pingbitime: '5' }).pingbitime, { _type: 'time', value: 5, source: '5' })
+  assert.strictEqual(r2e.compileRules({ pingbitime: '0' }).pingbitime.value, 0)
+  assert.strictEqual(r2e.compileRules({ pingbitime: '3650000' }).pingbitime.value, 3650000)
+  const w1 = r2Warn(() => {
+    assert.strictEqual(r2e.compileRules({ pingbitime: '3650001' }).pingbitime, null)
+  })
+  assert.deepStrictEqual(w1, ['⚠️ 配置「pingbitime」的值「3650001」超过上限 3650000 天，已忽略'])
+  assert.deepStrictEqual(r2Warn(() => r2e.compileRules({ pingbitime: 'abc' })), [])
+  const pb = r2e.compileRules({ pingbitime: 'pi ### 5 ' }).pingbitime
+  assert.strictEqual(pb._type, 'timeMulti')
+  assert.deepStrictEqual(pb.rules, [{ cat: pb.rules[0].cat, value: 5, source: 'pi ### 5' }])
+  assert.deepStrictEqual(r2e.compileRules({ pingbitime: 'cat###' }).pingbitime.rules, [])
+  assert.deepStrictEqual(r2e.compileRules({ pingbitime: 'cat###-5' }).pingbitime.rules, [])
+  assert.strictEqual(r2e.compileRules({ pingbitime: 'cat###0' }).pingbitime.rules[0].value, 0)
+  assert.strictEqual(r2e.compileRules({ pingbitime: 'cat###3650000' }).pingbitime.rules[0].value, 3650000)
+  const w3 = r2Warn(() => {
+    assert.deepStrictEqual(r2e.compileRules({ pingbitime: 'cat###3650001' }).pingbitime.rules, [])
+  })
+  assert.deepStrictEqual(w3, ['⚠️ 配置「pingbitime」的天数值「3650001」超过上限 3650000 天，已忽略'])
+  assert.deepStrictEqual(r2Warn(() => r2e.compileRules({ pingbitime: 'cat###abc' })), [])
+}
+
+// 杀 validateConfig L412/L421/L422/L428/L435/L436/L449/L499：空/合法配置零告警、读取失败告警不抛穿、pingbifenlei ### 单一告警、zkt_gjc 非字符串告警
+{
+  const r2e = r2Make(['keyword', 'pingbifenlei'])
+  assert.deepStrictEqual(r2e.validateConfig({}), [])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: 'abc' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: undefined, pingbifenlei: null }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ zkt_gjc: 'abc' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: 123 }),
+    ['⚠️ 配置「keyword」应为字符串，当前为 number，已忽略该字段过滤'])
+  const boom = { get keyword () { throw new Error('boom') } }
+  assert.deepStrictEqual(r2e.validateConfig(boom), ['⚠️ 配置「keyword」读取失败（boom），已忽略该字段过滤'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbifenlei: 'a###b' }),
+    ['⚠️ 配置「pingbifenlei」不支持 ### 多行分类语法，该规则将被忽略\n   如需按分类屏蔽，请直接写分类名正则，例如：微博|赚客吧'])
+  assert.deepStrictEqual(r2e.validateConfig({ zkt_gjc: 123 }),
+    ['⚠️ 配置「zkt_gjc」应为字符串，当前为 number，已忽略只看它过滤'])
+  assert.deepStrictEqual(r2e.validateConfig({ zkt_gjc: '  ' }), ['⚠️ 配置「zkt_gjc」为空白字符，已忽略只看它过滤'])
+}
+
+// 杀 validateConfig L452/L454/L468/L473/L478/L483/L488/L514：多行切分口径、告警值必须 trim、无效/嵌套量词告警文本精确
+{
+  const r2e = r2Make(['keyword'])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: 'a###b<br/>c###d\r\ne###f' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: 'a###b<br>  nodelim  ' }),
+    ['⚠️ 配置「keyword」行缺少 ### 分隔符，该行将被忽略：「nodelim」'])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: 'a###b###c' }),
+    ['⚠️ 配置「keyword」行包含多个 ###，仅前两段生效：「a###b###c」'])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: 'a###' }),
+    ['⚠️ 配置「keyword」值正则为空，该行将被忽略（避免永真规则）：「a###」'])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: 'a###(b+)+' }),
+    ['⚠️ 配置「keyword」值正则含嵌套量词，可能导致灾难性回溯，该行将被忽略：「(b+)+」'])
+  r2Re2.on = true
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: 'cat###BAD' }),
+    ['⚠️ 配置「keyword」值正则无效或当前环境不支持：「BAD」'])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: '  BAD  ' }),
+    ['⚠️ 配置「keyword」包含无效或当前环境不支持的正则表达式：「BAD」'])
+  assert.deepStrictEqual(r2e.validateConfig({ zkt_gjc: 'BAD' }),
+    ['⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式：「BAD」'])
+  r2Re2.on = false
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: '   ' }),
+    ['⚠️ 配置「keyword」为空白字符，将被忽略'])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: '  (a+)+  ' }),
+    ['⚠️ 配置「keyword」的正则含嵌套量词，可能导致灾难性回溯，该规则将被忽略：「(a+)+」'])
+}
+
+// 杀各处固定 'i' 标志（StringLiteral→""）与 String() 化口径：所有用户正则编译必须带 'i'，且模式集合精确
+{
+  r2Re2.on = true
+  r2Calls.length = 0
+  const r2e = r2Make(['keyword', 'pingbifenlei'])
+  assert.deepStrictEqual(r2e.validateConfig({ keyword: 'a###b', zkt_gjc: 'z' }), [])
+  const c = r2e.compileRules({ keyword: 'abc', pingbitime: 'pi###1' })
+  assert.strictEqual(c.pingbitime.rules[0].value, 1)
+  assert.deepStrictEqual([...new Set(r2Calls.map(x => x[1]))], ['i'], '所有用户正则编译必须带固定 i 标志（禁止 V8 回退）')
+  assert.deepStrictEqual([...new Set(r2Calls.map(x => x[0]))].sort(), ['a', 'abc', 'b', 'pi', 'z'])
+  r2Re2.on = false
+}
+
+// 杀 validateConfig L522/L523/L527/L530/L539/L541/L545/L548/L549/L550/L552/L553/L559：pingbitime 数值校验的精确边界与告警文本
+{
+  const r2e = r2Make(['keyword'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: undefined }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: null }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: '5' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: '0' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: '3650000' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: ' 5 ' }),
+    ['⚠️ 配置「pingbitime」含首尾空白，已按去空格后的值处理'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: '   ' }),
+    ['⚠️ 配置「pingbitime」为空白字符，将被忽略'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: 'abc' }),
+    ['⚠️ 配置「pingbitime」的值「abc」不是有效数字（需 ≥0 的有限数）'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: '-1' }),
+    ['⚠️ 配置「pingbitime」的值「-1」不是有效数字（需 ≥0 的有限数）'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: '1.5' }),
+    ['⚠️ 配置「pingbitime」的值「1.5」是小数，已按整数处理（建议使用整数天数）'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: '3650001' }),
+    ['⚠️ 配置「pingbitime」的值「3650001」超过上限 3650000 天，已忽略'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: { toString () { throw new Error('x') } } }),
+    ['⚠️ 配置「pingbitime」无法转换为字符串，已忽略'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: 'a###5' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: 'a###0' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: 'a###3650000' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: 'a###5<br>   ' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: 'abc###5' }), [])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: 'a###' }),
+    ['⚠️ 配置「pingbitime」的行「a###」天数值为空，已忽略该行'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: 'a###-1' }),
+    ['⚠️ 配置「pingbitime」的天数值「-1」不是有效数字（需 ≥0 的有限数）'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: 'a###1.5' }),
+    ['⚠️ 配置「pingbitime」的天数值「1.5」是小数，已按整数处理（建议使用整数天数）'])
+  assert.deepStrictEqual(r2e.validateConfig({ pingbitime: 'a###3650001' }),
+    ['⚠️ 配置「pingbitime」的天数值「3650001」超过上限 3650000 天，已忽略'])
+}
+
 console.log('test_rules OK')
