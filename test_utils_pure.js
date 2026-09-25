@@ -1830,4 +1830,44 @@ check('PlanJ _protectAttrPairs: 伪注释/端标签前缀的杂散引号不得�
     '伪注释前缀不得让段内真实 onerror 被占位（该载荷是已修复的安全缺口，占位即回归）')
 })
 
+// ===== 补测 PlanK：_stripEventAttrs / _cleanStyleAttrs（出口清洗的两个直接入口）=====
+// 反例（改动前）：两者均可直接经 createUtils 取得，但既有用例只经 sanitizeDecodedHtml 间接覆盖，
+// 其「保留什么分隔符 / 什么算危险 style」的精确口径从未被直接断言 ⇒ 31 个靶子存活。
+check('PlanK _stripEventAttrs: 未加引号的事件属性被整体删除、前导分隔符保留为空格', () => {
+  const u = Utils
+  assert.strictEqual(u._stripEventAttrs('<img src=x onerror=alert(1)>'), '<img src=x >', 'onerror=… 必须删除，前导空格保留（HTML 语法需要分隔符）')
+  assert.strictEqual(u._stripEventAttrs('<div onerror = alert(1)>'), '<div >', '等号两侧空白同样必须命中（\\s*=\\s*）')
+  assert.strictEqual(u._stripEventAttrs('<a href="x" ONCLICK="y">t</a>'), '<a href="x" >t</a>', '属性名大小写不敏感（gi），且带引号值整体删除')
+})
+
+check('PlanK _stripEventAttrs: 相邻事件属性必须逐个删净（do-while 收敛）', () => {
+  const u = Utils
+  assert.strictEqual(u._stripEventAttrs('<img src=x onerror="a" onload="b">'), '<img src=x  >',
+    '相邻两个 on* 都必须删除（单次 replace 会连分隔引号一起消费而漏掉第二个 ⇒ 必须循环到收敛）')
+  assert.strictEqual(u._stripEventAttrs('<img src=x onerror="a" onload="b" onmouseover="c">'), '<img src=x   >',
+    '三个相邻同样要删净')
+})
+
+check('PlanK _stripEventAttrs: 属性名边界必须精确（on + 字母开头）', () => {
+  const u = Utils
+  assert.strictEqual(u._stripEventAttrs('<img src=x onX=1>'), '<img src=x >', 'onX：字母开始即算是事件属性（[a-z] 且 i 标志）')
+  assert.strictEqual(u._stripEventAttrs('<img src=x on-error=1>'), '<img src=x on-error=1>', "on-error：'on' 后是连字符而非字母 ⇒ 不得删除")
+  assert.strictEqual(u._stripEventAttrs('<img src=x on1=1>'), '<img src=x on1=1>', 'on1：数字开头不得删除（必须 [a-z]）')
+})
+
+check('PlanK _cleanStyleAttrs: 危险 style 值必须清空，安全值原样保留', () => {
+  const u = Utils
+  assert.strictEqual(u._cleanStyleAttrs('<div style="color:red">'), '<div style="color:red">', '安全值必须原样保留')
+  assert.strictEqual(u._cleanStyleAttrs('<div style="background:url(javascript:x)">'), '<div style="">', 'url( 必须清空')
+  assert.strictEqual(u._cleanStyleAttrs('<div style="-moz-binding:x">'), '<div style="">', '-moz-binding 必须清空')
+  assert.strictEqual(u._cleanStyleAttrs('<div STYLE=expression(alert(1))>'), '<div style="">', 'expression( 必须清空（未加引号分支）')
+})
+
+check('PlanK _cleanStyleAttrs: 大小写与实体/转义都必须归一后才判定', () => {
+  const u = Utils
+  assert.strictEqual(u._cleanStyleAttrs('<div style="BACKGROUND:URL(javascript:x)">'), '<div style="">', '大写 URL( 必须命中（toLowerCase 归一）')
+  assert.strictEqual(u._cleanStyleAttrs('<div style="behavior:url(x)">'), '<div style="">', 'behavior: 前导空白/位置变化仍须命中')
+  assert.strictEqual(u._cleanStyleAttrs('<div style=color:red>'), '<div style=color:red>', '未加引号的安全值必须原样保留（第二个 replace 分支）')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

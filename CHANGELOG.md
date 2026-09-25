@@ -126,3 +126,8 @@
  ① `_attrSegAt` 按**真实调用约定**（正则 `/=\s*(["'])/gi` 的 match：`index` 指向 `=`、`lastIndex` 指向值首字符）断言 `name`/`segStart`/`closeEnd` 三字段精确值、`closeEnd` 紧贴闭合引号、未闭合引号返回 `null`、属性名前的空白不得进入段（`runEnd` 回退语义，含连字符名 `data-x`）。
  ② `_protectAttrPairs` 按真实返回形状 **`{ html, attrStore }`** 断言：普通属性对被抽进 `attrStore` 且在 `html` 里留 `SOH+N+SOH` 占位符；**`on*` 事件属性必须留在明文**（被一并保护即 `_stripEventAttrs` 失效）；**纯文本区的 `name="…"` 不得被保护**（P1-01 记载的「未配对 `<` 让区间延伸到串尾」缺口）；**伪注释/端标签前缀载荷** `</x='><img src=x onerror=alert(1)>'` 里的真实 `onerror` 不得被占位（REV-P2 发现 A 的安全缺口，占位即回归）。
  **本轮踩到的两个坑（均已修正）**：① 我最初误以为 `_protectAttrPairs` 返回字符串（实际返回对象）⇒ 断言报 `includes is not a function`；② 我最初用 `/(["\'])/g` 并按引号位置设 `lastIndex` 构造 match，与生产调用约定不符 ⇒ `name` 恒为 `''`。另外 `standard` 的 `no-control-regex` 不允许在正则字面量里直接写 `\u0001`，已改用 `String.fromCharCode(1)` 拼接。余 22 个经逐条核对该函数输入域内等价。
+- 补测试第二十七批 · `xbk_utils.js` 的 `_stripEventAttrs` / `_cleanStyleAttrs`（同口径；纯测试改动、未动生产源文件）：两簇共 31 个存活靶子杀 **6**（`_stripEventAttrs` 1/19、`_cleanStyleAttrs` 5/12；父代理抽 6 个独立复现 6/6 KILLED）。二者同样可直接经 `createUtils(...)` 取得。新增用例：
+ ① `_stripEventAttrs`：未加引号事件属性整体删除且**前导分隔符保留为空格**（HTML 语法需要）、等号两侧空白（`\s*=\s*`）同样命中、**属性名大小写不敏感**、**相邻多个 `on*` 必须逐个删净**（do-while 收敛 —— 单次 replace 会连分隔引号一起消费而漏掉第二个）、**属性名边界**（`onX` 算、`on-error` 不算、`on1` 不算，即 `on[a-z]`）。
+ ② `_cleanStyleAttrs`：危险值（`url(` / `expression(` / `-moz-binding` / `behavior:`）必须清空为 `style=""`、安全值原样保留、**大小写归一**（`BACKGROUND:URL(` 必须命中，`toLowerCase` 语义）、未加引号分支的安全值同样保留。
+ 余 25 个经逐条核对该函数输入域内等价或以既有用例已覆盖的口径落点相同。
+ **本轮再次踩到 FUSE 静默写失败**：`cp` 报成功但 `cmp` 显示未变（主仓仍是 250 项而 worktree 是 255 项），且 lint 是在**旧文件**上通过的（假绿）。已改为「先 `cat` 出副本 → `cp -f` → `cmp -s` 复核 → 再 lint」，并把该流程固化进台账。
