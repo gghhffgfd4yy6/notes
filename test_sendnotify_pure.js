@@ -1102,4 +1102,52 @@ check('WX_pusher_channels: 项内三别名 + trim/逗号分隔/空项过滤，�
     '函数项不是对象，必须按丢弃项计入告警条数')
 })
 
+// ===== 补测 PlanC：Markdown/文本处理簇的形态边界（父代理按 instrumenter 逐 id 定位后补齐）=====
+// 反例（改动前）：下列形态边界在既有用例下全部存活——既有用例覆盖了主路径与「未闭合 ]」，
+// 但没有覆盖 findDestEnd 的括号嵌套/转义/角括号预算、truncateBytes 的字节边界、cleanSurrogates 的配对语义。
+
+// --- findDestEnd（经导出的 mdLinksToPlain / mdImagesToPlain 观测）---
+// 杀「括号嵌套计数」「转义跳过」「角括号分支」「预算守卫」四类变异体。
+check('PlanC findDestEnd: 目标里的嵌套括号必须配平到最外层（p1）', () => {
+  // 目标 http://a/(b) 中的括号要配平；变异把 d 的增减/边界改坏就会截在错误位置
+  const out = mdLinksToPlain('[t](http://a/(b))')
+  assert.strictEqual(out, 't (http://a/(b))', '嵌套括号必须整体收进链接目标')
+})
+
+check('PlanC findDestEnd: 转义括号不参与配平（p2）', () => {
+  const out = mdLinksToPlain('[t](http://a/\\(x\\))')
+  assert.strictEqual(out, 't (http://a/\\(x\\))', '反斜杠转义的括号必须被跳过、不改变配平深度')
+})
+
+check('PlanC findDestEnd: 角括号包裹的目标必须整体保留（p3）', () => {
+  // 实测：角括号形态的目标**连尖括号一起**原样保留在输出里（并非剥掉 <>）。
+  assert.strictEqual(mdLinksToPlain('[t](<http://a>)'), 't (<http://a>)', '角括号命中 g+1 后目标段必须完整取出（含 <>）')
+  assert.strictEqual(mdLinksToPlain('[t](<http://a> extra)'), 't (<http://a> extra)', '角括号后不是 ) 时必须继续走配平循环、同样完整保留')
+})
+
+check('PlanC findDestEnd: 预算耗尽必须回落而不越界（p4）', () => {
+  // 角括号分支要先扣预算：'[a](<' 这类「有 < 但没有 >」的畸形构造不得扫到串尾后仍返回越界值
+  const out = mdLinksToPlain('[a](<')
+  assert.strictEqual(typeof out, 'string', '畸形输入不得抛错')
+  assert.strictEqual(out.includes('undefined'), false, '不得把越界下标拼进输出')
+})
+
+// --- mdLinksToPlain / mdImagesToPlain 的畸形尾部必须原样保留且不重复整段 ---
+check('PlanC mdLinksToPlain: 连 ")" 都没有的畸形尾部原样保留（p5）', () => {
+  assert.strictEqual(mdLinksToPlain('[t](http://a'), '[t](http://a', '既无 ) 也无配平时必须原样保留整段，不得重复前缀')
+  assert.strictEqual(mdLinksToPlain('pre [t](http://a'), 'pre [t](http://a', '带前缀时同样不得重复前缀')
+})
+
+check('PlanC mdImagesToPlain: 未闭合且无可配平括号时原样保留（p6）', () => {
+  assert.strictEqual(mdImagesToPlain('![a](http://x'), '![a](http://x', '图片链接畸形尾部必须原样保留')
+})
+
+// --- truncateBytes（经 mdToPlain 的出口清洗路径不可达；该函数未导出 ⇒ 只断言可观测行为）---
+// 说明：truncateBytes 未在 module.exports 中，无法直接断言；其 13 个靶子需经调用点观测。
+// 已在报告里登记为「需导出或注入才可观测」，此处不写自欺断言。
+
+// --- cleanSurrogates（未导出 ⇒ 经 sendNotify 入口观测：入口必须清洗孤立代理）---
+// 该函数未导出，但其语义可由「sendNotify 对入参的清洗」间接锁定（见 test_sendnotify_utils.js 的通道用例）。
+// 此处不写不可达断言，登记为「需导出才可直接断言」。
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_sendnotify_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
