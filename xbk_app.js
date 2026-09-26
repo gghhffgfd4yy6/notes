@@ -50,7 +50,7 @@ function createApp ({
     },
 
     // 状态/哈希文件安全读取：保持 readSafeTextResult 的 status 区分（missing/ioError/
-    // unsafe/tooLarge），并强制大小上限，杜绝异常膨胀文件被整读入内存。
+    // unsafe/replaced/tooLarge），并强制大小上限，杜绝异常膨胀文件被整读入内存。
     _readSafeState (filePath) {
       return readSafeTextResult(filePath, STATE_TEXT_MAX_BYTES)
     },
@@ -1173,6 +1173,15 @@ function createApp ({
         // 等价性由属性测试证明（800 轮含缓存非空场景，0 失配）
         const cacheFilePath = MessageStore.getFilePath(cacheName)
         const cacheMsgs = MessageStore.readMessages(cacheFilePath)
+        // F1（P1）：读侧可能已把「坏/超限缓存」改名隔离并重建（只隔离不删除）。旧行为下这种情形走
+        // 下面的零推送闸门（run.log ERROR + 告警 + 非零退出码），修复后本轮照常推送——若不留痕，
+        // 磁盘上多出的 .corrupt.*.bak 与「未读到的旧身份未落墓碑 ⇒ 可能重推」就成了静默降级。
+        // 摘要/退出码口径刻意不动（APP-03 契约：cacheSaved 只说落盘，隔离不等于本轮失败），
+        // 只补 run.log 一行 WARN + 控制台告警。
+        for (const ev of MessageStore._drainRecoveryEvents()) {
+          this._writeRunLog(`${this._localStamp()} WARN 缓存${ev.label}：原件已改名隔离保留为 ${ev.backupPath}（重建 ${ev.recovered} 条、落墓碑 ${ev.dropped} 条；未读到的旧身份可能重推）\n`)
+          console.warn(`⚠️ 缓存${ev.label}：原件已隔离保留为 ${ev.backupPath}（重建 ${ev.recovered} 条，判错方向 = 可能重推）`)
+        }
         if (MessageStore._readFailed[cacheFilePath]) {
           console.error('缓存读取失败，跳过本轮推送以防重复轰炸')
           // P1（审查 2026-08-15）：此路径曾直接 return undefined——退出码 0 + 零告警 + 零日志，

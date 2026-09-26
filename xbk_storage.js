@@ -218,10 +218,14 @@ function readSafeTextResult (filePath, maxBytes, options = {}) {
       reFd = fs.openSync(filePath, flags)
       const reStat = fs.fstatSync(reFd)
       if (!reStat.isFile() || reStat.dev !== stat.dev || reStat.ino !== stat.ino) {
-        return { status: 'unsafe', text: null, error: new Error('文件读取期间被替换') }
+        // 读窗口内被替换/类型变化：**瞬时**并发竞态（另一进程原子写缓存 / 路径被改），判 replaced。
+        // 不能判 unsafe：消费侧对 unsafe 会「隔离 + 重建」，那会把对方刚写入的**有效**缓存搬走。
+        return { status: 'replaced', text: null, error: new Error('文件读取期间被替换') }
       }
     } catch (e) {
-      if (e && (e.code === 'ELOOP' || e.code === 'ENOENT')) return { status: 'unsafe', text: null, error: new Error('非普通文件') }
+      // 复检时路径已不是可读的普通文件（ELOOP/ENOENT）同样是读窗口内的瞬时变化 ⇒ replaced，
+      // 不是「这个文件本身是坏的非普通文件」（那种情形在 open/fstat 阶段就已经判 unsafe 了）。
+      if (e && (e.code === 'ELOOP' || e.code === 'ENOENT')) return { status: 'replaced', text: null, error: new Error('文件读取期间被替换或删除') }
       return { status: 'ioError', text: null, error: e }
     } finally {
       if (reFd !== undefined) { try { fs.closeSync(reFd) } catch (e) { /* 忽略 */ } }
@@ -234,6 +238,14 @@ function readSafeTextResult (filePath, maxBytes, options = {}) {
   }
 }
 
+// ⚠️ 状态契约（F1 返工 R1）：`unsafe` 只表示**确定性**「非普通文件」（open 时 ELOOP / fstat 非普通文件），
+// 而「读窗口内路径被替换/删除」是**瞬时并发竞态**（另一进程原子替换或删除缓存文件），单列 `replaced`：
+//   · 消费侧必须按 `ioError` 同口径处理（fail-closed：保持写闸门、返回空、绝不隔离坏件）——
+//     「读后被替换」在网络/文件存储语境下是瞬时故障，不是「这个文件本身不可恢复」；
+//   · 若把它并进 `unsafe`，任何按 unsafe 做「隔离并重建」的消费方都会把**另一进程刚写入的有效缓存**
+//     搬走并把在线路径清零（cron 重叠 / 常驻 loop + cron 实测可复现），属触发面越界。
+// 仍判 `unsafe`（确定性、可安全隔离）的只有两处：open 时 ELOOP、fstat 发现不是普通文件；
+// 读后复检的分支（dev/ino 变化、类型变化、复检 open ELOOP/ENOENT）一律判 `replaced`。
 // maxBytes / options 透传给 readSafeTextResult：不传时与旧行为完全一致（不设上限、超限判 tooLarge），
 // 调用方可据此对这条读取入口显式设限（审查 STG-05：非法值由 readSafeTextResult 统一告警），
 // 或以 options.tail 只读尾部（审查 SS-03）。

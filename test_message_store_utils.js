@@ -821,7 +821,8 @@ function makeMemFs (initial) {
     mkdirSync: (p) => dirs.add(p),
     lstatSync: (p) => {
       if (!files.has(p) && !dirs.has(p)) { const e = new Error('ENOENT: ' + p); e.code = 'ENOENT'; throw e }
-      return { isDirectory: () => dirs.has(p), isFile: () => files.has(p), isSymbolicLink: () => false }
+      // size 与真实 lstat 同口径（F1 的「仍超限」复核要读它）；目录/不存在时给 0
+      return { size: files.has(p) ? Buffer.byteLength(files.get(p), 'utf8') : 0, isDirectory: () => dirs.has(p), isFile: () => files.has(p), isSymbolicLink: () => false }
     },
     realpathSync: (p) => p,
     statSync: (p) => ({ isDirectory: () => dirs.has(p) })
@@ -832,11 +833,19 @@ function makeRecordingStorage (fsMock, opts = {}) {
   const writes = []
   return {
     writes,
-    readSafeTextResult: (p, maxBytes) => {
-      if (opts.readStatus) { const r = opts.readStatus(p, fsMock); if (r) return r }
+    readSafeTextResult: (p, maxBytes, options) => {
+      if (opts.readStatus) { const r = opts.readStatus(p, fsMock, options); if (r) return r }
       if (!fsMock.files.has(p)) return { status: 'missing' }
       const text = fsMock.files.get(p)
-      if (maxBytes && Buffer.byteLength(text, 'utf8') > maxBytes) return { status: 'tooLarge' }
+      const bytes = Buffer.byteLength(text, 'utf8')
+      if (maxBytes && bytes > maxBytes) {
+        // 与真实 readSafeTextResult 同口径：{tail:true} 读尾部 maxBytes 字节（不判 tooLarge）
+        if (options && options.tail === true) {
+          const buf = Buffer.from(text, 'utf8')
+          return { status: 'ok', text: buf.subarray(bytes - maxBytes).toString('utf8'), truncated: true }
+        }
+        return { status: 'tooLarge' }
+      }
       return { status: 'ok', text }
     },
     writeAtomic: (p, text, label) => {
@@ -1161,23 +1170,52 @@ check('readMessages: 内存权威命中必须清除读失败标记（否则后�
   assert.strictEqual(cacheWrites(writes).length, 1)
 })
 
-check('readMessages: ioError/unsafe/tooLarge 必须置读失败标记、按状态分流告警且拒绝后续覆写', () => {
-  const marker = { unsafe: '拒绝读取非普通缓存文件', ioError: '缓存读取失败', tooLarge: '缓存文件过大' }
-  for (const status of Object.keys(marker)) {
-    const name = `rm_${status}.json`
-    const fp = cachePath(name)
-    const { store: s, writes, filePath } = makeBatchStore({ name, files: { [fp]: '[]' }, readStatus: (p) => (p === fp ? { status } : null) })
-    const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
-    assert.strictEqual(s._readFailed[filePath], true, `${status} 必须置读失败标记`)
-    assert.ok(errs.some(e => e.includes(marker[status])), `${status} 应输出该分支的诊断：${JSON.stringify(errs)}`)
-    for (const other of Object.keys(marker)) {
-      if (other !== status) assert.ok(!errs.some(e => e.includes(marker[other])), `${status} 不得输出 ${other} 分支的诊断`)
-    }
-    captureConsole('error', () => {
-      assert.strictEqual(s.saveBatch([{ id: 'x', title: 't' }], name), false, `${status} 下 saveBatch 必须拒绝覆写`)
-    })
-    assert.strictEqual(cacheWrites(writes).length, 0, `${status} 下不得写缓存文件`)
+check('readMessages 守边界: ioError 必须置读失败标记、精确诊断且拒绝覆写（绝不触发隔离）', () => {
+  // 守边界（F1 的硬约束）：隔离/重建只允许在**确定性不可恢复**判据下触发；ioError 属瞬时/环境
+  // 故障，必须保持既有保守口径（等磁盘恢复自动重试），否则会把「一次抖动」升级成「重建空缓存 +
+  // 旧身份全部重推」。
+  const name = 'rm_ioerror.json'
+  const fp = cachePath(name)
+  const { store: s, fs, writes, filePath } = makeBatchStore({ name, files: { [fp]: '[]' }, readStatus: (p) => (p === fp ? { status: 'ioError' } : null) })
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
+  assert.strictEqual(s._readFailed[filePath], true, 'ioError 必须置读失败标记')
+  assert.ok(errs.some(e => e.includes('缓存读取失败')), `ioError 应输出该分支的诊断：${JSON.stringify(errs)}`)
+  assert.strictEqual(fs.ops.rename.length, 0, 'ioError 绝不得触发隔离改名')
+  assert.strictEqual(fs.ops.unlink.length, 0, 'ioError 绝不得删除任何文件')
+  // 返工 R1-C：跨分支诊断互斥（重复/串味诊断必须被发现）
+  for (const marker of ['缓存文件过大', '拒绝读取非普通缓存文件', '被替换', 'corrupt.']) {
+    assert.ok(!errs.some(e => e.includes(marker)), `ioError 不得输出其它分支的诊断（${marker}）：${JSON.stringify(errs)}`)
   }
+  captureConsole('error', () => {
+    assert.strictEqual(s.saveBatch([{ id: 'x', title: 't' }], name), false, 'ioError 下 saveBatch 必须拒绝覆写')
+  })
+  assert.strictEqual(cacheWrites(writes).length, 0, 'ioError 下不得写缓存文件')
+})
+
+check('readMessages 守边界: tooLarge 但尾部恢复失败（二次读取仍不可读）必须回退写闸门', () => {
+  // 恢复失败（尾部读不出可解析元素 / 单条即超限）时必须 fail-closed：不假装恢复成功，也不动原件。
+  // 夹具故意写成**真的超限**文件：F1 返工 R1 起，隔离前会复核「此刻仍是普通文件且确实超限」，
+  // 未超限的文件按瞬时替换处理而不会走到尾部恢复——本用例要覆盖的正是「仍超限但恢复失败」这条。
+  const name = 'rm_toolarge.json'
+  const fp = cachePath(name)
+  const { store: s, fs, writes, filePath } = makeBatchStore({
+    name,
+    files: { [fp]: '[' + 'x'.repeat(5000) },
+    constants: { MESSAGE_CACHE_MAX_BYTES: 4096 },
+    readStatus: (p) => (p === fp ? { status: 'tooLarge' } : null)
+  })
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
+  assert.strictEqual(s._readFailed[filePath], true, '恢复失败必须回退写闸门（fail-closed）')
+  assert.ok(errs.some(e => e.includes('缓存文件过大')), `必须保留 tooLarge 诊断：${JSON.stringify(errs)}`)
+  assert.ok(errs.some(e => e.includes('无法自动恢复')), `必须响亮报告恢复失败：${JSON.stringify(errs)}`)
+  assert.strictEqual(fs.ops.rename.length, 0, '恢复失败不得改名隔离')
+  assert.strictEqual(cacheWrites(writes).length, 0, '恢复失败不得写缓存文件')
+  for (const marker of ['缓存读取失败', '拒绝读取非普通缓存文件', '被替换', 'corrupt.']) {
+    assert.ok(!errs.some(e => e.includes(marker)), `超限恢复失败不得输出其它分支的诊断（${marker}）：${JSON.stringify(errs)}`)
+  }
+  captureConsole('error', () => {
+    assert.strictEqual(s.saveBatch([{ id: 'x', title: 't' }], name), false, '恢复失败下 saveBatch 必须拒绝覆写')
+  })
 })
 
 check('readMessages: 文件缺失且初始化失败必须置读失败标记（不得按空缓存放行全量重推）', () => {
@@ -1200,32 +1238,54 @@ check('readMessages: 文件缺失但初始化成功不得置读失败标记、�
   assert.strictEqual(cacheWrites(writes).length, 1)
 })
 
-check('readMessages: JSON 解析失败必须保护磁盘（不重置、置读失败标记、精确诊断）', () => {
+check('readMessages: JSON 解析失败 → 改名隔离 + 重建空缓存 + 解除写闸门（F1：绝不删除原件）', () => {
   const name = 'rm_badjson.json'
   const fp = cachePath(name)
   const { store: s, fs, writes, filePath } = makeBatchStore({ name, files: { [fp]: '[{' } })
   const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
-  assert.strictEqual(errs.filter(e => e.includes(filePath)).length, 1, `JSON 解析失败必须输出一条指向该文件的诊断：${JSON.stringify(errs)}`)
-  assert.strictEqual(s._readFailed[filePath], true)
-  assert.strictEqual(fs.files.get(filePath), '[{', '不得重置或清空异常文件')
+  // 返工 R1-C：恢复严格口径——恰好两条指向该文件的诊断（①分支诊断 ②隔离事件），
+  // 既防「重复诊断」也防「串味诊断」（旧写法 some(...) 两者都发现不了）。
+  const errsForFile = errs.filter(e => e.includes(filePath))
+  assert.strictEqual(errsForFile.length, 2, `解析失败必须恰好两条指向该文件的诊断：${JSON.stringify(errs)}`)
+  assert.ok(errsForFile.some(e => e.includes('JSON 解析失败')), `必须含解析失败诊断：${JSON.stringify(errs)}`)
+  assert.ok(errsForFile.some(e => e.includes('corrupt.')), `必须含隔离事件（点名备份路径）：${JSON.stringify(errs)}`)
+  for (const marker of ['缓存读取失败', '缓存文件过大', '拒绝读取非普通缓存文件', '被替换', '（非数组）']) {
+    assert.ok(!errs.some(e => e.includes(marker)), `解析失败不得输出其它分支的诊断（${marker}）：${JSON.stringify(errs)}`)
+  }
+  const renamed = fs.ops.rename.filter(([a]) => a === filePath)
+  assert.strictEqual(renamed.length, 1, `必须恰好一次改名隔离：${JSON.stringify(fs.ops.rename)}`)
+  assert.ok(/^.*\.corrupt\..*\.bak$/.test(renamed[0][1]), `备份名口径必须是 <name>.corrupt.<ISO时间戳>.bak：${renamed[0][1]}`)
+  assert.strictEqual(fs.files.get(renamed[0][1]), '[{', '原件必须逐字节保留在备份路径（绝不删除/清空）')
+  assert.strictEqual(fs.ops.unlink.length, 0, '绝不 unlink 任何文件')
+  assert.strictEqual(fs.files.get(filePath), '[]', '原路径必须重建为合法空缓存（判错方向 = 重推）')
+  assert.strictEqual(s._readFailed[filePath], undefined, '隔离重建成功后必须解除写闸门')
+  assert.strictEqual(writes.filter(w => w.label === '缓存重建').length, 1, '必须有一次重建写盘')
   captureConsole('error', () => {
-    assert.strictEqual(s.saveBatch([{ id: 'x', title: 't' }], name), false, '解析失败后必须拒绝覆写')
+    assert.strictEqual(s.saveBatch([{ id: 'x', title: 't' }], name), true, '解除闸门后写入必须放行')
   })
-  assert.strictEqual(cacheWrites(writes).length, 0)
 })
 
-check('readMessages: 合法 JSON 但非数组必须保护磁盘（置读失败标记并拒绝覆写）', () => {
+check('readMessages: 合法 JSON 但非数组 → 改名隔离 + 重建空缓存 + 解除写闸门（F1）', () => {
   const name = 'rm_obj.json'
   const fp = cachePath(name)
-  const { store: s, fs, writes, filePath } = makeBatchStore({ name, files: { [fp]: '{"a":1}' } })
+  const { store: s, fs, filePath } = makeBatchStore({ name, files: { [fp]: '{"a":1}' } })
   const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
-  assert.strictEqual(errs.length, 1, `非数组必须输出一条诊断（不得静默）：${JSON.stringify(errs)}`)
-  assert.strictEqual(s._readFailed[filePath], true)
-  assert.strictEqual(fs.files.get(filePath), '{"a":1}', '不得重置非数组文件')
+  // 返工 R1-C：恢复严格口径（旧写法 errs.length >= 1 抓不住重复/串味诊断）
+  assert.strictEqual(errs.length, 2, `非数组必须恰好两条诊断（分支 + 隔离事件）：${JSON.stringify(errs)}`)
+  assert.ok(errs.some(e => e.includes('缓存格式异常（非数组）')), `必须含非数组诊断：${JSON.stringify(errs)}`)
+  assert.ok(errs.some(e => e.includes('corrupt.')), `必须含隔离事件：${JSON.stringify(errs)}`)
+  for (const marker of ['缓存读取失败', '缓存文件过大', '拒绝读取非普通缓存文件', '被替换', 'JSON 解析失败']) {
+    assert.ok(!errs.some(e => e.includes(marker)), `非数组不得输出其它分支的诊断（${marker}）：${JSON.stringify(errs)}`)
+  }
+  const renamed = fs.ops.rename.filter(([a]) => a === filePath)
+  assert.strictEqual(renamed.length, 1, '必须改名隔离')
+  assert.strictEqual(fs.files.get(renamed[0][1]), '{"a":1}', '原件必须逐字节保留在备份路径')
+  assert.strictEqual(fs.ops.unlink.length, 0, '绝不 unlink')
+  assert.strictEqual(fs.files.get(filePath), '[]', '原路径必须重建为合法空缓存')
+  assert.strictEqual(s._readFailed[filePath], undefined, '隔离重建成功后必须解除写闸门')
   captureConsole('error', () => {
-    assert.strictEqual(s.saveBatch([{ id: 'x', title: 't' }], name), false)
+    assert.strictEqual(s.saveBatch([{ id: 'x', title: 't' }], name), true)
   })
-  assert.strictEqual(cacheWrites(writes).length, 0)
 })
 
 check('readMessages: 成功读取必须写入内存快照并固化已验证（后续命中不重读磁盘）', () => {
@@ -1240,6 +1300,330 @@ check('readMessages: 成功读取必须写入内存快照并固化已验证（�
   fs.files.delete(filePath)
   assert.deepStrictEqual(s.readMessages(filePath), [{ id: 'a' }])
   assert.strictEqual(writes.length, before, '已验证命中不得触发恢复写盘')
+})
+
+// ===== F1（P1）：「坏/超限缓存 → 只隔离不删除 + 重建」自愈回归（真实 fs + 真实 storage）=====
+// 为什么必须用真实 fs/storage：本缺陷的承重路径是 readSafeTextResult 的 {tail:true} 有界尾部读取、
+// rename 隔离、writeAtomic 原子重建——mock 掉其中任何一件，「从超限文件尾部恢复完整元素」都会变成
+// 测试自证（tail 语义由测试自己实现）。读端上限经 constants 注入缩到 4KiB，夹具文件因此只有
+// 几 KB，但走的是与生产 64MiB 完全相同的代码路径。
+const F1_DIR_NAME = `xianbaoku_cache_f1_${process.pid}`
+const F1_DIR = path.join(ROOT_DIR, F1_DIR_NAME)
+const F1_MAX_BYTES = 4096
+
+function makeRealStore (opts = {}) {
+  return createMessageStore({
+    Config: { cache: { dir: F1_DIR_NAME, maxSize: opts.maxSize === undefined ? 10000 : opts.maxSize } },
+    Utils: createUtils({ fs: REAL_FS, safeRe: (p, f) => new RegExp(p, f) }),
+    fs: REAL_FS,
+    path,
+    crypto: REAL_CRYPTO,
+    normalize: (o) => o,
+    storage: require('./xbk_storage'),
+    constants: {
+      DEFAULT_MAX_SIZE: 10000,
+      MESSAGE_CACHE_MAX_BYTES: opts.maxBytes === undefined ? F1_MAX_BYTES : opts.maxBytes,
+      TOMBSTONE_MAX_KEYS: 5000,
+      TOMBSTONE_MAX_BYTES: 262144,
+      TOMBSTONE_LOCK_STALE_MS: 10000
+    }
+  })
+}
+
+function cleanF1Dir () {
+  try { REAL_FS.rmSync(F1_DIR, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+}
+// 用例断言失败时最后的 cleanF1Dir() 不会执行（check 捕获异常），退场兜底再清一次，避免沙箱里逐进程累积。
+process.once('exit', cleanF1Dir)
+
+// 隔离备份名口径：<name>.corrupt.<ISO时间戳>.bak（见 xbk_message_store._corruptBackupPath）
+function corruptBackups (base) {
+  try {
+    return REAL_FS.readdirSync(F1_DIR).filter(n => n.startsWith(base + '.corrupt.') && n.endsWith('.bak'))
+  } catch (e) { return [] }
+}
+
+check('F1: tooLarge → 有界尾部恢复重建最新 N 条，原件改名隔离（绝不删除）且写闸门解除', () => {
+  cleanF1Dir()
+  const store = makeRealStore()
+  const name = 'f1_toolarge.json'
+  const fp = store.getFilePath(name)
+  const all = []
+  for (let i = 0; i < 40; i++) all.push({ id: `m${i}`, title: `线报${i}`, body: 'x'.repeat(160) })
+  const original = JSON.stringify(all)
+  assert.ok(Buffer.byteLength(original, 'utf8') > F1_MAX_BYTES, '夹具必须真的超过读端上限')
+  REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+  REAL_FS.writeFileSync(fp, original)
+  let recovered
+  const errs = captureConsole('error', () => { recovered = store.readMessages(fp) })
+  assert.ok(recovered.length > 0 && recovered.length < all.length,
+    `尾部恢复应恢复「部分最新」元素（0 < n < ${all.length}），实得 ${recovered.length}`)
+  const expectedIds = all.map(m => m.id).slice(-recovered.length)
+  assert.deepStrictEqual(recovered.map(m => m.id), expectedIds, '恢复集必须是原数组的连续后缀（最新 N 条，保序）')
+  assert.strictEqual(recovered[recovered.length - 1].id, `m${all.length - 1}`, '恢复集必须含最新一条')
+  assert.strictEqual(recovered[0].body, 'x'.repeat(160), '恢复元素必须完整（尾部字段也在）')
+  // 只隔离不删除：原件逐字节保留在 .bak（前端未读到的旧数据也不丢）
+  const baks = corruptBackups(name)
+  assert.strictEqual(baks.length, 1, `原件必须被改名隔离且只生成一份备份：${JSON.stringify(REAL_FS.readdirSync(F1_DIR))}`)
+  assert.strictEqual(REAL_FS.readFileSync(path.join(F1_DIR, baks[0]), 'utf8'), original,
+    '备份必须是原件的逐字节副本（绝不删除/截断）')
+  assert.ok(errs.some(e => e.includes('corrupt.') && e.includes(fp)),
+    `隔离事件必须响亮（console.error 点名备份路径）：${JSON.stringify(errs)}`)
+  // 重建后的原路径必须是合法可读缓存，且写闸门解除（F1 的「永久零推送」消失）
+  assert.deepStrictEqual(JSON.parse(REAL_FS.readFileSync(fp, 'utf8')).map(m => m.id), expectedIds)
+  assert.strictEqual(store._readFailed[fp], undefined, '隔离重建成功后必须解除写闸门')
+  assert.strictEqual(store.saveBatch([{ id: 'f1-new', title: '新条目' }], name), true,
+    '恢复后本轮的写入必须放行（否则仍是永久零推送）')
+  assert.ok(JSON.parse(REAL_FS.readFileSync(fp, 'utf8')).some(m => m.id === 'f1-new'), '恢复后新条目须真正落盘')
+  cleanF1Dir()
+})
+
+const F1_ISOLATION_CASES = [
+  { label: 'JSON 解析失败', slug: 'parse', raw: '[{ 坏 JSON', isDir: false },
+  { label: '合法 JSON 但非数组', slug: 'obj', raw: '{"a":1}', isDir: false },
+  { label: '非普通文件（目录占位）', slug: 'dir', raw: null, isDir: true }
+]
+
+for (const c of F1_ISOLATION_CASES) {
+  check(`F1: ${c.label} → 重命名隔离 + 重建空缓存 + 写闸门解除（原件保留）`, () => {
+    cleanF1Dir()
+    const store = makeRealStore()
+    const name = `f1_iso_${c.slug}.json`
+    const fp = store.getFilePath(name)
+    REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+    if (c.isDir) REAL_FS.mkdirSync(fp)
+    else REAL_FS.writeFileSync(fp, c.raw)
+    let msgs
+    const errs = captureConsole('error', () => { msgs = store.readMessages(fp) })
+    assert.deepStrictEqual(msgs, [], '隔离重建后本轮按空缓存处理（判错方向 = 重推而非永久零推送）')
+    const baks = corruptBackups(name)
+    assert.strictEqual(baks.length, 1, `原件必须被改名隔离：${JSON.stringify(REAL_FS.readdirSync(F1_DIR))}`)
+    const bakPath = path.join(F1_DIR, baks[0])
+    assert.strictEqual(REAL_FS.lstatSync(bakPath).isDirectory(), c.isDir,
+      '备份必须保留原件类型（目录仍是目录，绝不删除其内容）')
+    if (!c.isDir) assert.strictEqual(REAL_FS.readFileSync(bakPath, 'utf8'), c.raw, '备份必须是原件逐字节副本')
+    assert.ok(errs.some(e => e.includes('corrupt.')), `隔离事件必须响亮：${JSON.stringify(errs)}`)
+    // 返工 R1-C：恰好两条（分支诊断 + 隔离事件），且绝不串到其它分支/瞬时替换的诊断上
+    assert.strictEqual(errs.length, 2, `隔离路径必须恰好两条诊断：${JSON.stringify(errs)}`)
+    for (const marker of ['缓存读取失败', '缓存文件过大', '被替换']) {
+      assert.ok(!errs.some(e => e.includes(marker)), `不得输出其它分支的诊断（${marker}）：${JSON.stringify(errs)}`)
+    }
+    assert.strictEqual(store._readFailed[fp], undefined, '隔离重建成功后必须解除写闸门')
+    assert.strictEqual(REAL_FS.readFileSync(fp, 'utf8'), '[]', '原路径必须重建为合法的空缓存')
+    assert.strictEqual(store.saveBatch([{ id: 'iso-new', title: 't' }], name), true, '隔离后本轮必须恢复写入')
+    assert.ok(JSON.parse(REAL_FS.readFileSync(fp, 'utf8')).some(m => m.id === 'iso-new'))
+    cleanF1Dir()
+  })
+}
+
+check('F1 边界: ioError（超长路径 ENAMETOOLONG）不得触发隔离，保持写闸门且不动文件系统', () => {
+  cleanF1Dir()
+  const store = makeRealStore()
+  REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+  const tooLong = path.join(F1_DIR, 'x'.repeat(300) + '.json')
+  let msgs
+  const errs = captureConsole('error', () => { msgs = store.readMessages(tooLong) })
+  assert.deepStrictEqual(msgs, [])
+  assert.strictEqual(store._readFailed[tooLong], true, 'ioError 必须保持既有保守口径（瞬时故障等磁盘恢复）')
+  assert.strictEqual(REAL_FS.readdirSync(F1_DIR).filter(n => n.includes('.corrupt.')).length, 0,
+    'ioError 绝不得触发隔离（守边界：不动 _readFailed 的其它来源）')
+  assert.ok(errs.some(e => e.includes('缓存读取失败')), `ioError 分支仍须有诊断：${JSON.stringify(errs)}`)
+  cleanF1Dir()
+})
+
+check('F1 边界: 隔离改名失败必须 fail-closed（保持闸门、原件不动、不写盘）', () => {
+  const name = 'f1_renamefail.json'
+  const fp = cachePath(name)
+  const { store: s, fs: fsMock, writes, filePath } = makeBatchStore({ name, files: { [fp]: '[{ 坏 JSON' } })
+  // 让「改名隔离」失败，并把 mock 的文件状态回滚到改名之前（真实 rename 的原子性）
+  fsMock.hooks.afterRename = (a, b) => {
+    fsMock.files.set(a, fsMock.files.get(b))
+    fsMock.files.delete(b)
+    const e = new Error('EPERM: rename'); e.code = 'EPERM'; throw e
+  }
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
+  assert.strictEqual(s._readFailed[filePath], true, '隔离失败必须保持写闸门（fail-closed）')
+  assert.strictEqual(fsMock.files.get(filePath), '[{ 坏 JSON', '隔离失败不得改动/丢失原件')
+  assert.strictEqual(cacheWrites(writes).length, 0, '隔离失败不得写缓存文件')
+  assert.ok(errs.some(e => e.includes('隔离')), `隔离失败必须响亮：${JSON.stringify(errs)}`)
+  captureConsole('error', () => { assert.strictEqual(s.saveBatch([{ id: 'x', title: 't' }], name), false) })
+})
+
+check('F1: 恢复集超过 maxSize → 丢最旧的并落墓碑（防重放），恢复集本身可读写', () => {
+  cleanF1Dir()
+  const store = makeRealStore({ maxSize: 3, maxBytes: 1024 })
+  const name = 'f1_budget.json'
+  const fp = store.getFilePath(name)
+  const all = []
+  for (let i = 0; i < 40; i++) all.push({ id: `b${i}`, title: `t${i}` })
+  const original = JSON.stringify(all)
+  assert.ok(Buffer.byteLength(original, 'utf8') > 1024, '夹具必须超过读端上限')
+  REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+  REAL_FS.writeFileSync(fp, original)
+  let recovered
+  captureConsole('error', () => { recovered = store.readMessages(fp) })
+  assert.strictEqual(recovered.length, 3, `恢复集必须按 maxSize 裁剪（实得 ${recovered.length} 条）`)
+  assert.deepStrictEqual(recovered.map(m => m.id), ['b37', 'b38', 'b39'], '必须保留最新的 maxSize 条（保序）')
+  assert.deepStrictEqual(JSON.parse(REAL_FS.readFileSync(fp, 'utf8')).map(m => m.id), ['b37', 'b38', 'b39'])
+  // 「无法归入重建集的旧身份」必须走 _tombstoneDropped（防上游重放重复推送）
+  const ts = store._tombstones.get(fp)
+  assert.ok(ts, '墓碑必须已加载')
+  assert.ok(ts.id.size > 0, '无法归入重建集的旧身份必须落墓碑')
+  assert.ok(REAL_FS.existsSync(fp + '.seen.json'), '墓碑必须落盘')
+  assert.strictEqual(store._readFailed[fp], undefined, '恢复成功后必须解除写闸门')
+  cleanF1Dir()
+})
+
+// ===== F1 返工 R1：触发面复核（并发原子替换 ⇒ 瞬时读失败，绝不允许变成隔离/清零）=====
+check('F1 返工A: 读窗口内被并发原子替换的有效缓存绝不得被隔离（零 .bak、在线内容不变、闸门保持）', () => {
+  // 对抗性证伪 R1-A 的最小复现（移植自 .local/f1-verify/probe2.js）：在第二次 open（读后复检）之前，
+  // 用「写 tmp + rename」原子替换缓存——这正是另一进程（cron 重叠 / 常驻 loop + cron）刚写入**有效**
+  // 缓存的形态。修复前（把 unsafe 一律当确定性判据）会把这份有效新缓存搬进 .bak 并把在线路径置 []；
+  // 正确行为是把它当作**瞬时**读失败：保持写闸门、返回 []、绝不 rename、绝不建 .bak。
+  cleanF1Dir()
+  const store = makeRealStore()
+  const name = 'f1_toctou.json'
+  const fp = store.getFilePath(name)
+  REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+  const oldRaw = JSON.stringify([{ id: 'old-1', title: 'old' }])
+  const newRaw = JSON.stringify([{ id: 'writer-A', title: 'A' }, { id: 'writer-B', title: 'B' }])
+  REAL_FS.writeFileSync(fp, oldRaw)
+  const origOpen = REAL_FS.openSync
+  let opens = 0
+  REAL_FS.openSync = function (p) {
+    if (String(p) === fp) {
+      opens += 1
+      if (opens === 2) { // 第二次 open = readSafeTextResult 的读后复检
+        const t = path.join(F1_DIR, 'writer-other.tmp')
+        REAL_FS.writeFileSync(t, newRaw) // 另一进程的原子提交：写 tmp + rename（inode 变更）
+        REAL_FS.renameSync(t, fp)
+      }
+    }
+    return origOpen.apply(REAL_FS, arguments)
+  }
+  let msgs
+  let errs
+  try {
+    errs = captureConsole('error', () => { msgs = store.readMessages(fp) })
+  } finally { REAL_FS.openSync = origOpen }
+  assert.strictEqual(opens, 2, '夹具必须真的触发了读后复检那一次 open')
+  assert.deepStrictEqual(msgs, [], '瞬时替换只降级为空读，不得从被替换的文件里恢复内容')
+  assert.deepStrictEqual(corruptBackups(name), [], '瞬时替换绝不得生成任何 .bak（这是本用例的核心）')
+  assert.strictEqual(REAL_FS.readFileSync(fp, 'utf8'), newRaw,
+    '另一进程刚写入的有效缓存必须原样保留（不得被搬走、不得被置 []）')
+  assert.strictEqual(store._readFailed[fp], true, '瞬时读失败必须保持写闸门（fail-closed）')
+  assert.ok(errs.some(e => e.includes('被替换')), `诊断必须说明「读取期间被替换」：${JSON.stringify(errs)}`)
+  assert.ok(!errs.some(e => e.includes('拒绝读取非普通缓存文件')),
+    `瞬时替换绝不得被错标成「非普通缓存文件」：${JSON.stringify(errs)}`)
+  assert.ok(!errs.some(e => e.includes('corrupt.')), `不得输出隔离事件：${JSON.stringify(errs)}`)
+  // 瞬态消失后（同一进程内再次读取）必须正常读回另一进程写入的有效缓存并解除闸门
+  // ——这是「瞬时 vs 确定性」的分水岭：瞬时条件消失即自愈，不需要人工干预。
+  let again
+  captureConsole('error', () => { again = store.readMessages(fp) })
+  assert.deepStrictEqual(again.map(m => m.id), ['writer-A', 'writer-B'], '瞬时条件消失后必须读回有效缓存')
+  assert.strictEqual(store._readFailed[fp], undefined, '成功读回后闸门自动解除')
+  cleanF1Dir()
+})
+
+check('F1 返工A-守卫: unsafe 但此刻已是普通文件（复核发现被替换）绝不得隔离', () => {
+  // 第二道防线：即便存储层报了确定性的 unsafe，「隔离前复核 lstatSync(...).isFile() === false」也必须
+  // 拦住「读时非普通文件、真正 rename 前已被换成普通文件」的竞态（否则仍会搬走有效缓存）。
+  const name = 'rm_unsafe_swapped.json'
+  const fp = cachePath(name)
+  const raw = JSON.stringify([{ id: 'valid-after-swap', title: 'A' }])
+  const { store: s, fs, writes, filePath } = makeBatchStore({
+    name, files: { [fp]: raw }, readStatus: (p) => (p === fp ? { status: 'unsafe' } : null)
+  })
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
+  assert.strictEqual(fs.ops.rename.length, 0, '此刻是普通文件 ⇒ 绝不得 rename 隔离（否则搬走有效缓存）')
+  assert.strictEqual(fs.files.get(filePath), raw, '磁盘内容必须原样保留')
+  assert.strictEqual(s._readFailed[filePath], true, '按瞬时读失败处理：保持写闸门')
+  assert.strictEqual(writes.filter(w => w.label === '缓存重建').length, 0, '不得重建写盘')
+  assert.ok(errs.some(e => e.includes('拒绝读取非普通缓存文件')), `unsafe 分支仍须有诊断：${JSON.stringify(errs)}`)
+})
+
+check('F1 返工A-守卫2: 解析失败后复检发现已被写回有效缓存 ⇒ 不得隔离（不搬走有效缓存）', () => {
+  // 第三道防线：解析失败/非数组这两条「内容不可用」判据，在真正 rename 前必须重读复核——
+  // 若此刻内容已是合法数组（另一进程读窗口内写回有效缓存），前提不成立 ⇒ 按瞬时读失败处理。
+  const name = 'rm_parse_swapped.json'
+  const fp = cachePath(name)
+  const goodRaw = JSON.stringify([{ id: 'other-writer', title: 'W' }])
+  let reads = 0
+  const { store: s, fs, writes, filePath } = makeBatchStore({
+    name,
+    files: { [fp]: '[{' },
+    readStatus: (p, mockFs) => {
+      if (p !== fp) return null
+      reads += 1
+      if (reads === 2) mockFs.files.set(fp, goodRaw) // 模拟另一进程在读窗口内原子写回有效缓存
+      return null
+    }
+  })
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
+  assert.strictEqual(reads, 2, '夹具必须真的触发了一次复检重读')
+  assert.strictEqual(fs.ops.rename.length, 0, '复检发现内容已有效 ⇒ 绝不得 rename 隔离')
+  assert.strictEqual(fs.files.get(filePath), goodRaw, '对方写回的有效缓存必须原样保留（绝不得被置 []）')
+  assert.strictEqual(s._readFailed[filePath], true, '按瞬时读失败处理：保持写闸门')
+  assert.strictEqual(writes.filter(w => w.label === '缓存重建').length, 0, '不得重建写盘')
+  assert.ok(errs.some(e => e.includes('已被替换')), `必须响亮说明复核结论：${JSON.stringify(errs)}`)
+  assert.ok(!errs.some(e => e.includes('corrupt.')), `不得输出隔离事件：${JSON.stringify(errs)}`)
+  // 条件消失即自愈（与其它瞬时判据同口径）
+  let again
+  captureConsole('error', () => { again = s.readMessages(filePath) })
+  assert.deepStrictEqual(again.map(m => m.id), ['other-writer'], '复检后再次读取必须读回有效缓存')
+  assert.strictEqual(s._readFailed[filePath], undefined, '成功读回后闸门自动解除')
+})
+
+check('F1 返工A4: tooLarge 但文件此刻已不再超限（读窗口内被替换/截断）绝不得隔离', () => {
+  // tooLarge 的分支同理：读端按打开瞬间 fstat 的大小判定，与真正 rename 之间有窗口；
+  // 复核「此刻仍是普通文件且确实超限」不成立时按瞬时读失败处理（不隔离、不建 .bak）。
+  const name = 'rm_toolarge_swapped.json'
+  const fp = cachePath(name)
+  const raw = JSON.stringify([{ id: 'small-after-swap', title: 'A' }])
+  // 只把**首次整读**打成 tooLarge（模拟「打开时文件确实超限」），尾部读取走真实语义——
+  // 此刻文件已被并发替换成一份**小的有效缓存**，于是它会读成功，旧代码据此就把这份有效缓存隔离了。
+  let whole = 0
+  const { store: s, fs, writes, filePath } = makeBatchStore({
+    name,
+    files: { [fp]: raw },
+    constants: { MESSAGE_CACHE_MAX_BYTES: 4096 },
+    readStatus: (p, mockFs, options) => {
+      if (p !== fp || (options && options.tail === true)) return null
+      whole += 1
+      return whole === 1 ? { status: 'tooLarge' } : null
+    }
+  })
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(s.readMessages(filePath), []) })
+  assert.strictEqual(fs.ops.rename.length, 0, '此刻未超限 ⇒ 绝不得 rename 隔离')
+  assert.strictEqual(fs.files.get(filePath), raw, '磁盘内容必须原样保留（不得搬走这份有效小缓存）')
+  assert.strictEqual(s._readFailed[filePath], true, '按瞬时读失败处理：保持写闸门')
+  assert.strictEqual(writes.filter(w => w.label === '缓存重建').length, 0, '不得重建写盘')
+  assert.ok(errs.some(e => e.includes('已被替换/截断')), `必须响亮说明「已被替换/截断」：${JSON.stringify(errs)}`)
+  assert.ok(!errs.some(e => e.includes('corrupt.')), `不得输出隔离事件：${JSON.stringify(errs)}`)
+})
+
+// ===== F1 返工B：单条 save()（= appendMessageToFile）的读失败闸门（此前零覆盖，变异存活）=====
+check('F1 返工B: 写闸门置位期间单条 save() 必须返回 false 且绝不覆写磁盘', () => {
+  // 为什么必须单独立这条：save() 与 saveBatch() 各自有一份 `_readFailed` 闸门判断，删掉 save() 那份
+  // 之前没有任何测试会变红（对抗性证伪 R1-B 用变异实测：删掉后全仓仍 117/117 全绿）。
+  const name = 'rm_savegate.json'
+  const fp = cachePath(name)
+  const raw = JSON.stringify([{ id: 'keep-1', title: '存量' }])
+  const { store: s, fs, writes, filePath } = makeBatchStore({
+    name, files: { [fp]: raw }, readStatus: (p) => (p === fp ? { status: 'ioError' } : null)
+  })
+  const errs = captureConsole('error', () => {
+    assert.strictEqual(s.save({ id: 'blocked-2', title: '应被拒绝' }, name), false,
+      '读失败闸门置位期间单条 save 必须返回 false（删掉该闸门判断即变红）')
+  })
+  assert.ok(errs.some(e => e.includes('缓存读取失败，跳过写入以保护存量数据')),
+    `save 的闸门必须有专门诊断：${JSON.stringify(errs)}`)
+  assert.strictEqual(fs.files.get(filePath), raw, '闸门置位期间磁盘原文绝不得被覆写')
+  assert.strictEqual(cacheWrites(writes).length, 0, '闸门置位期间不得写盘')
+  // 反例对照（防断言恒真）：同夹具去掉读失败后，同一 save 必须放行并真正落盘
+  const ok = makeBatchStore({ name, files: { [fp]: raw } })
+  assert.strictEqual(ok.store.save({ id: 'ok-2', title: 't' }, name), true, '无读失败时 save 必须放行')
+  assert.ok(JSON.parse(ok.fs.files.get(fp)).some(m => m.id === 'ok-2'), '放行时新条目必须真正落盘')
 })
 
 // ===== saveBatch / saveMessages：索引判重、上限裁剪、墓碑、失败回滚 =====

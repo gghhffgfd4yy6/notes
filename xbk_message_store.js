@@ -119,9 +119,14 @@ function createMessageStore ({
     _tombstoneLoadStatus: {},
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
     _MEMO_MAX: 100,
-    // 磁盘读取失败标记（按缓存文件路径记录）：ioError/unsafe 读取失败时置位，
+    // 磁盘读取失败标记（按缓存文件路径记录）：ioError/unsafe/replaced 读取失败时置位，
     // 供 save 等写入口保守处理——不基于“未读到的空数组”全量覆写磁盘，避免覆盖丢失存量。
     _readFailed: {},
+    // F1（P1）隔离/恢复事件队列（有界，进程内）：坏/超限缓存被「隔离 + 重建」时入队，供调用方
+    // （xbk_app 的 run.log 留痕）drain。为什么必须有：修复后「整轮零推送 + ERROR + 告警」这条
+    // 最响亮的可观测信号消失了，若不另留痕，磁盘上多出的 .corrupt.*.bak 与「旧身份未落墓碑 ⇒
+    // 可能重推」就变成静默降级。
+    _recoveryEvents: [],
     // 磁盘已验证标记（按缓存文件路径记录）：内存命中时是否已对该文件做过一次 existsSync+恢复检查。
     // 消除热路径上每次内存命中都同步 stat 的磁盘 IO；saveMessages 直写后清除，使下次命中重新检查。
     _verified: new Set(),
@@ -528,12 +533,27 @@ function createMessageStore ({
       if (result.status !== 'ok') {
         const detail = result.error && result.error.message ? result.error.message : result.status
         if (result.status === 'unsafe') console.error(`拒绝读取非普通缓存文件 ${filePath}`)
+        else if (result.status === 'replaced') console.error(`缓存读取期间被替换/删除（按瞬时读失败处理，保持写闸门）${filePath}:`, detail)
         else if (result.status === 'ioError') console.error(`缓存读取失败 ${filePath}:`, detail)
         else if (result.status === 'tooLarge') console.error(`缓存文件过大，拒绝整读入内存 ${filePath}:`, detail)
-        // missing/ioError/unsafe/tooLarge 都不能缓存空数组；后续恢复后仍应重新读取磁盘。
-        // ioError/unsafe/tooLarge 读取失败时记录失败标记：返回 [] 供判重/调用方降级，但绝不允许
-        // 后续 save 据此全量覆写磁盘（会把未读到的存量数据覆盖丢失）。
-        if (result.status === 'ioError' || result.status === 'unsafe' || result.status === 'tooLarge') {
+        // F1（P1）自锁修复：**确定性不可恢复**判据下「隔离 + 重建」并当场解除写闸门，而不是让
+        // 写闸门永久占住（旧行为 = 每轮整轮零推送，只能人工删/改文件）。成功时直接返回重建集，
+        // 下面置 _readFailed 的保守口径只覆盖「恢复失败/不适用」的情形。
+        // ⚠️ 返工 R1（触发面）：只有 `unsafe`（确定性的非普通文件）与 `tooLarge` 才进入隔离；
+        // `replaced`（读窗口内被并发替换/删除）是**瞬时**竞态，必须与 ioError 同口径——见下。
+        if (result.status === 'tooLarge') {
+          const recovered = this._recoverOverlargeCache(filePath)
+          if (recovered) return recovered
+        } else if (result.status === 'unsafe') {
+          const rebuilt = this._stillNonRegular(filePath)
+            ? this._isolateAndRebuild(filePath, [], '[]', '非普通文件隔离重建')
+            : null
+          if (rebuilt) return rebuilt
+        }
+        // missing/ioError/unsafe/tooLarge/replaced 都不能缓存空数组；后续恢复后仍应重新读取磁盘。
+        // 读取失败时记录失败标记：返回 [] 供判重/调用方降级，但绝不允许后续 save 据此全量覆写磁盘
+        // （会把未读到的存量数据覆盖丢失）。replaced 与 ioError 同口径（瞬时故障，等下次读恢复）。
+        if (result.status === 'ioError' || result.status === 'replaced' || result.status === 'unsafe' || result.status === 'tooLarge') {
           try { this._readFailed[filePath] = true } catch (e) { /* 忽略 */ }
         }
         // P1（审查 2026-08-15）：缓存缺失且初始化写入失败（磁盘满/目录只读/EACCES）时与
@@ -549,10 +569,15 @@ function createMessageStore ({
       try {
         data = JSON.parse(result.text || '[]')
       } catch (e) {
-      // 不再重置文件为 []：那会销毁磁盘上的去重缓存，且未标记 _readFailed，
-      // 使 has() 误判 false 并放行同一条消息重复入库。改为与 ioError/unsafe 一致的
-      // 保守处理——保留异常文件供恢复，并标记 _readFailed 让 save() 拒绝覆写。
-        console.error(`缓存 JSON 解析失败，跳过写入以保护数据 ${filePath}:`, e.message)
+      // F1（P1）：不再只是「保留坏文件 + 拒绝覆写」——那条路会让整轮推送永久为零。改为
+      // 「重命名隔离（原件按字节保留，绝不删除）+ 重建空缓存 + 解除写闸门」：本轮恢复推送能力，
+      // 判错方向是「可能重推」（SYSTEM_CONTRACT「宁可多推」）而不是永久零推送。
+      // 隔离/重建失败（rename 或写盘失败）时退回既有保守处理：置 _readFailed 让 save() 拒绝覆写。
+        console.error(`缓存 JSON 解析失败，已尝试重命名隔离并重建空缓存 ${filePath}:`, e.message)
+        const rebuilt = this._stillUnparseable(filePath)
+          ? this._isolateAndRebuild(filePath, [], '[]', 'JSON 解析失败隔离重建')
+          : this._noteUnusableGone(filePath, 'JSON 解析失败')
+        if (rebuilt) return rebuilt
         try { this._readFailed[filePath] = true } catch (err) { /* 忽略 */ }
         return []
       }
@@ -567,11 +592,243 @@ function createMessageStore ({
         try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
         return clean
       }
-      // 合法 JSON 但非数组（对象等）→ 不再重置：保留原文件并标记读取失败，
-      // 避免误判空缓存导致同一条消息重复入库；save() 会因 _readFailed 拒绝覆写。
-      console.error(`缓存格式异常（非数组），跳过写入以保护数据 ${filePath}`)
+      // F1（P1）：合法 JSON 但非数组（对象等）同属确定性不可恢复判据——同样隔离原件并重建空缓存，
+      // 避免「误判空缓存重复入库」的自锁（旧行为）与「静默销毁判重记录」的反噬（B8 已否决）。
+      console.error(`缓存格式异常（非数组），已尝试重命名隔离并重建空缓存 ${filePath}`)
+      const rebuiltNonArray = this._stillUnparseable(filePath)
+        ? this._isolateAndRebuild(filePath, [], '[]', '非数组隔离重建')
+        : this._noteUnusableGone(filePath, '非数组')
+      if (rebuiltNonArray) return rebuiltNonArray
       try { this._readFailed[filePath] = true } catch (e) { /* 忽略 */ }
       return []
+    },
+
+    /** maxSize 归一（保存与 F1 尾部恢复共用一个口径，禁止两处各写一份）：
+     *  非正整数回退默认（R3-2 整数化——小数 2.5 会让 splice 的 ToInteger 截断产生模糊条数；
+     *  0/负值避免缓存被清空）；v3.176：Utils.num 口径——'5000'(环境变量字符串) 曾
+     *  Number.isInteger 判否 → 静默回退 10000（validateConfig 按 v3.175 口径判合法不警告 →
+     *  层间不一致，用户以为 5000 生效实际 10000）。 */
+    _resolveMaxSize () {
+      const v = Utils.num(Config.cache.maxSize, -1)
+      return Number.isInteger(v) && v > 0 ? v : DEFAULT_MAX_SIZE
+    },
+
+    // ===== F1（P1）：坏/超限缓存的「隔离 + 重建」自愈 =====
+    // 背景（AUDIT-2026-09-26 / F1，已确证）：缓存文件超限 / JSON 解析失败 / 非普通文件时，
+    // readMessages 置 _readFailed ⇒ save/saveBatch 拒绝覆写 ⇒ xbk_app 跳过整轮推送 ⇒ 每轮重复、
+    // 只能人工删/改文件才能恢复。B8 已实测否决两条改法（①落盘成功即清 _readFailed → 坏文件被 []
+    // 覆盖销毁；②不做保留件的自动重建 → 判错即静默销毁判重记录），故本实现守住三条：
+    //   · 只隔离、绝不删除：原件一律 rename 成 <name>.corrupt.<ISO时间戳>.bak 保留（rename 不复制
+    //     字节、不额外占空间），目录/符号链接等非普通文件同样只改名、不动其内容；
+    //   · 判错方向 = 重推：恢复不出来就按空缓存重建（方向是「可能重推」），绝不留在永久零推送；
+    //   · 触发面严格限定在确定性不可恢复判据（tooLarge / JSON 解析失败 / 合法 JSON 非数组 /
+    //     非普通文件）；ioError 与「缺失且初始化失败」这类瞬时/环境故障照旧保持写闸门（等磁盘/
+    //     权限恢复后自动重试），_readFailed 的其它来源（内存快照恢复路径等）一律不动。
+
+    /** 生成隔离备份路径 <filePath>.corrupt.<ISO时间戳>.bak。同一毫秒重复隔离（或目录里已有同名
+     *  备份）时追加序号——renameSync 会静默覆盖已存在的目标，而「备份」绝不能覆盖掉上一份备份。
+     *  100 次仍冲突返回 null（调用方 fail-closed，绝不复用可能被覆盖的名字）。 */
+    _corruptBackupPath (filePath) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      for (let n = 0; n < 100; n++) {
+        const candidate = n === 0 ? `${filePath}.corrupt.${stamp}.bak` : `${filePath}.corrupt.${stamp}.${n}.bak`
+        let exists = false
+        try { exists = fs.existsSync(candidate) } catch (e) { return candidate }
+        if (!exists) return candidate
+      }
+      return null
+    },
+
+    /** 反向、字符串感知的花括号配对：从 closeIdx（调用方保证是 '}'）向前找配对的 '{'，找不到返回 -1。
+     *  字符串内的括号/引号不参与计数；引号是否为字符串分隔符按「前面连续反斜杠个数的奇偶」判定
+     *  （反向扫描下这是唯一可靠的转义判定）。整体 O(元素长度)，不引入二次扫描。 */
+    _matchOpenBrace (text, closeIdx) {
+      let depth = 0
+      for (let i = closeIdx; i >= 0; i--) {
+        const c = text[i]
+        if (c === '"') {
+          let bs = 0
+          for (let k = i - 1; k >= 0 && text[k] === '\\'; k--) bs++
+          if (bs % 2 === 1) continue // 被转义的引号：字符串内容，不是分隔符
+          i-- // 跳到字符串内部，继续向前找这次字符串的起始引号
+          while (i >= 0) {
+            if (text[i] === '"') {
+              let bs2 = 0
+              for (let k = i - 1; k >= 0 && text[k] === '\\'; k--) bs2++
+              if (bs2 % 2 === 0) break // 找到起始引号
+            }
+            i--
+          }
+          continue
+        }
+        if (c === '}' || c === ']') depth++
+        else if (c === '{' || c === '[') {
+          depth--
+          if (depth === 0) return i
+        }
+      }
+      return -1
+    },
+
+    /** 从（可能被截断的）JSON 数组文本**尾部**反向收集完整顶层元素，返回「旧 → 新」顺序的对象数组。
+     *  只认顶层对象 `{...}`（本文件所有写入方都只写对象数组）；遇到被切断的元素、原始值或任何
+     *  解析失败立即停止收集——宁可少恢复（方向 = 可能重推），绝不猜测半个元素的内容。 */
+    _tailElements (text) {
+      if (typeof text !== 'string' || text === '') return []
+      const isWs = (c) => c === ' ' || c === '\n' || c === '\r' || c === '\t'
+      const elements = []
+      let i = text.length
+      while (i > 0 && isWs(text[i - 1])) i--
+      if (i > 0 && text[i - 1] === ']') i-- // 顶层数组的收尾括号（尾部窗口必然包含它）
+      while (i > 0) {
+        while (i > 0 && (isWs(text[i - 1]) || text[i - 1] === ',')) i--
+        if (i === 0 || text[i - 1] !== '}') break // 被切断的尾部元素/原始值：停止收集
+        const start = this._matchOpenBrace(text, i - 1)
+        if (start < 0) break // 该元素的 '{' 落在窗口之前：半截元素，丢弃
+        let parsed
+        try { parsed = JSON.parse(text.slice(start, i)) } catch (e) { break }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) break
+        elements.push(parsed)
+        i = start
+      }
+      elements.reverse()
+      return elements
+    },
+
+    /** 隔离前复核（返工 R1）：确认路径此刻**仍然是**非普通文件，只有确证非普通文件才允许隔离。
+     *  为什么必须复核：`unsafe` 的两个确定性来源（open 时 ELOOP / fstat 发现非普通文件）与真正执行
+     *  rename 之间存在窗口，另一进程若在此刻把**有效**缓存原子替换回该路径（cron 重叠 / 常驻 loop +
+     *  cron），直接隔离就会把这份有效新缓存搬进 .bak 并把在线路径清零——那是修复本身引入的回归
+     *  （对抗性证伪 probe2 实测）。此刻已是普通文件 ⇒ 按瞬时读失败处理（保持闸门、绝不动文件）。
+     *  拿不到 lstat 结论（异常/路径已消失）时同样返回 false（绝不隔离），交给写闸门兜住。 */
+    _stillNonRegular (filePath) {
+      try { return !fs.lstatSync(filePath).isFile() } catch (e) { return false }
+    },
+
+    /** 隔离前复核（返工 R1，解析失败/非数组分支）：**重读一次**确认「此刻的内容依然不可用」。
+     *  为什么必须复核：读成功与真正执行 rename 之间同样存在窗口，另一进程若在此刻把**有效**缓存
+     *  原子写回该路径，直接隔离就会把这份有效缓存搬走并把在线路径置 []（与 unsafe / tooLarge 两条
+     *  复核同源，三类隔离判据都必须复核自己的前提）。判定口径：
+     *    · 重读得到 ok 且内容仍不是合法数组（解析失败 / 非数组）⇒ 前提成立，允许隔离；
+     *    · 重读得到 ok 且已是合法数组（对方刚写回有效缓存）⇒ 前提不成立，按瞬时读失败处理；
+     *    · 重读不是 ok（消失/被替换/超限/非普通文件/IO 错误）⇒ 结论已变，交回常规路径各自处理，
+     *      绝不在这里隔离。
+     *  说明：这是缩小竞态窗口的纵深防御，不构成对 TOCTOU 的证明（隔离本身仍可能被更晚的替换抢先）。 */
+    _stillUnparseable (filePath) {
+      let again
+      try { again = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES) } catch (e) { return false }
+      if (!again || again.status !== 'ok') return false
+      try { return !Array.isArray(JSON.parse(again.text || '[]')) } catch (e) { return true }
+    },
+
+    /** tooLarge 的有界尾部恢复：从超限文件尾部（≤ MESSAGE_CACHE_MAX_BYTES 字节窗口）反向收集完整
+     *  顶层元素，重建「最新 N 条」并落盘，原件改名隔离。返回重建后的数组；无法恢复时返回 null
+     *  （调用方退回写闸门 = fail-closed，不假装恢复成功）。
+     *  为什么不直接覆写：窗口之前的**前端元素读不到**（整读超限文件正是读端拒绝的事），一旦覆写就
+     *  永久销毁——改名隔离后人工仍可取回，符合「只隔离、绝不删除」。
+     *  前端未读到的旧身份**无法解析 ⇒ 不落墓碑**：宁可重推（SYSTEM_CONTRACT「宁可多推」），
+     *  也绝不凭猜测把陌生身份登记成「已推送」而漏推；落到重建集之外的**已解析**元素才落墓碑。 */
+    _recoverOverlargeCache (filePath) {
+      // 隔离前复核（返工 R1）：读端判 tooLarge 依据的是打开瞬间 fstat 的大小，与真正执行 rename 之间
+      // 同样存在窗口。另一进程若在此期间原子替换/截断了该路径（瞬时并发），直接隔离就会搬走并清零一份
+      // **有效**缓存。此刻必须仍是普通文件且确实超限，否则按瞬时读失败处理（不隔离、保持写闸门）。
+      let stillOverlarge = false
+      try {
+        const st = fs.lstatSync(filePath)
+        stillOverlarge = st.isFile() && typeof st.size === 'number' && st.size > MESSAGE_CACHE_MAX_BYTES
+      } catch (e) {
+        stillOverlarge = false
+      }
+      if (!stillOverlarge) {
+        console.error(`缓存超限恢复：文件在读取期间已被替换/截断，按瞬时读失败处理（不隔离、保持写闸门）${filePath}`)
+        return null
+      }
+      const tail = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES, { tail: true })
+      if (!tail || tail.status !== 'ok' || typeof tail.text !== 'string') {
+        console.error(`缓存超限尾部读取失败，无法自动恢复（保持写闸门）${filePath}: ${tail && tail.status}`)
+        return null
+      }
+      const elements = this._tailElements(tail.text)
+      if (elements.length === 0) {
+        console.error(`缓存超限且尾部无任何完整元素，无法自动恢复（保持写闸门）${filePath}`)
+        return null
+      }
+      // 重建集必须同时满足「条数上限」与「字节上限」——两条都是 saveMessages 的既有口径，
+      // 超出的最旧元素走 _tombstoneDropped（它们已推送过，防上游重放重复推送）。
+      const maxSize = this._resolveMaxSize()
+      const dropped = []
+      if (elements.length > maxSize) {
+        console.warn(`缓存尾部恢复：完整元素 ${elements.length} 条超过条数上限(${maxSize})，裁剪掉最早 ${elements.length - maxSize} 条`)
+        dropped.push(...elements.splice(0, elements.length - maxSize))
+      }
+      let text
+      try {
+        text = this._trimCacheByBytes(JSON.stringify(elements), elements, filePath, MESSAGE_CACHE_MAX_BYTES, dropped)
+      } catch (e) {
+        console.error(`缓存尾部恢复裁剪异常，无法自动恢复（保持写闸门）${filePath}:`, e && e.message)
+        return null
+      }
+      if (text === null) {
+        console.error(`缓存尾部恢复：单条即超过读端上限，无法自动恢复（保持写闸门）${filePath}`)
+        return null
+      }
+      return this._isolateAndRebuild(filePath, elements, text, '超限尾部恢复', dropped)
+    },
+
+    /** 把不可读缓存改名隔离（绝不 unlink）后，在原路径原子重建（解析失败/非普通文件为空缓存，
+     *  超限为尾部恢复集）并解除写闸门。返回重建后的消息数组（已同步内存快照与「已验证」标记，
+     *  后续 save/saveBatch 因此放行）；隔离改名或重建写盘失败时返回 null —— 保持写闸门
+     *  （fail-closed），此时人工作业仍是最后手段。 */
+    _isolateAndRebuild (filePath, messages, text, label, dropped = []) {
+    // 已知残余竞态（返工 R1 登记，不修）：三条判据的「复核 → rename」之间、以及「rename 成功 →
+    // 重建 writeAtomic」之间仍有微秒级窗口。前一窗口若被并发写入抢先，会把对方刚写的有效缓存搬进
+    // .bak（复核已把它从「读窗口内的必然命中」缩到「复核与 rename 之间的极小概率」）；后一窗口若被
+    // 抢先，writeAtomic 的 tmp+rename 会覆盖对方新写的缓存（判错方向仍是重推，不会零推送，也不会
+    // 动到 .bak 里的原件）。彻底消除需要跨进程锁，而本项目是**单实例**契约（见 SYSTEM_CONTRACT
+    // 边界「多实例不保证最多推送一次」/ 缓存数据文件无跨进程锁），故按既有口径登记而不引入新锁。
+      const backupPath = this._corruptBackupPath(filePath)
+      if (!backupPath) {
+        console.error(`${label}：无法生成隔离备份名（同毫秒备份过多），保持写闸门 ${filePath}`)
+        return null
+      }
+      try {
+        fs.renameSync(filePath, backupPath) // 隔离：改名保留原件，绝不 unlink
+      } catch (e) {
+        console.error(`${label}：隔离改名失败，保持写闸门（原件未被改动）${filePath}:`, e && e.message)
+        return null
+      }
+      const saved = writeAtomic(filePath, text, '缓存重建')
+      if (!saved) {
+        // 重建写盘失败（磁盘满/只读/权限）：尽力把原件改回原路径，避免「原件被搬走 + 路径空着」
+        try { fs.renameSync(backupPath, filePath) } catch (e) { console.error(`${label}：重建失败且原件未能改回 ${backupPath}:`, e && e.message) }
+        console.error(`${label}：重建写盘失败，保持写闸门 ${filePath}`)
+        return null
+      }
+      try { delete this._readFailed[filePath] } catch (e) { /* 忽略 */ }
+      this._memoSet(filePath, messages)
+      try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
+      // 落墓碑放在写盘成功之后：与 saveMessages 同口径——未真正落盘就登记会把仍在磁盘上的身份
+      // 误判成「已推送」而漏推。
+      if (dropped.length > 0) this._tombstoneDropped(filePath, dropped)
+      this._recoveryEvents.push({ label, filePath, backupPath, recovered: messages.length, dropped: dropped.length })
+      if (this._recoveryEvents.length > 8) this._recoveryEvents.splice(0, this._recoveryEvents.length - 8)
+      console.error(`⚠️ 缓存${label}：不可读文件已改名隔离（只隔离不删除）${filePath} → ${backupPath}；` +
+        `重建 ${messages.length} 条、落墓碑 ${dropped.length} 条；未读到的旧身份不落墓碑（可能重推）`)
+      return messages
+    },
+
+    /** 复核发现「原不可用内容已不在」时的响亮诊断（返工 R1）：返回 null 让调用方继续走 fail-closed
+     *  写闸门路径（本轮跳过推送、不动文件），下一轮按常规路径重新读取。 */
+    _noteUnusableGone (filePath, what) {
+      console.error(`缓存${what}复核：原不可用内容已被替换，按瞬时读失败处理（不隔离、保持写闸门）${filePath}`)
+      return null
+    },
+
+    /** 取走并清空进程内「隔离/恢复」事件队列（xbk_app 据此写 run.log 留痕；有界 ≤8 条）。 */
+    _drainRecoveryEvents () {
+      const events = this._recoveryEvents.slice()
+      this._recoveryEvents.length = 0
+      return events
     },
 
     saveMessages (filePath, messages) {
@@ -593,9 +850,7 @@ function createMessageStore ({
       // 拷贝后再截断：不原地修改调用方传入的数组（外部复用场景）
       const toSave = [...messages]
       // maxSize 防御：非正整数回退默认（R3-2 整数化——小数 2.5 会让 splice 的 ToInteger 截断产生模糊条数；0/负值避免缓存被清空）
-      // v3.176：Utils.num 口径——'5000'(环境变量字符串) 曾 Number.isInteger 判否 → 静默回退 10000
-      // （validateConfig 按 v3.175 口径判合法不警告 → 层间不一致，用户以为 5000 生效实际 10000）
-      const maxSize = (() => { const v = Utils.num(Config.cache.maxSize, -1); return Number.isInteger(v) && v > 0 ? v : DEFAULT_MAX_SIZE })()
+      const maxSize = this._resolveMaxSize()
       // P4（CodeAnt Round2）：被裁剪记录先收集、缓存原子写盘成功后才统一落墓碑——
       // 写盘失败（序列化/单条超限/rename 失败）时记录并未真正从磁盘缓存移除，
       // 提前落墓碑会把仍在缓存中的身份误判为已判重（消息被永久跳过）。
@@ -622,7 +877,9 @@ function createMessageStore ({
       }
       // P1（审查 2026-08-15）：写端字节上限与读端 MESSAGE_CACHE_MAX_BYTES 对齐——此前仅按条数
       // （maxSize）裁剪，单条 >6.7KB（base64 图/长 HTML 常见）时 10000 条即可超 64MB，读端判
-      // tooLarge → 置 _readFailed → 写端被 _readFailed 拒绝覆写 → 永久自锁直至人工删文件。
+      // tooLarge → 置 _readFailed → 写端被 _readFailed 拒绝覆写 → 每轮整轮零推送、只能人工删文件。
+      // （F1/v3.277 起读端对该形态改走「有界尾部恢复 + 原件隔离」，不再永久自锁；但写端仍必须自己
+      //   不制造超限文件——多一轮恢复就多一次「旧身份重推」的代价，对齐上限仍是首选防线。）
       try {
         text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll)
       } catch (e) {

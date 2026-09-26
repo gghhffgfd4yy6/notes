@@ -3231,7 +3231,7 @@ console.log('========================================\n');
     const p = path.join(CACHE, 'test_oversized_single.json')
     const ok = saveMessages(p, [{ id: 0, body: 'x'.repeat(64 * 1024 * 1024 + 1024) }])
     assertEqual(ok, false, '单条超限应拒绝落盘')
-    assertEqual(fs.existsSync(p), false, '不应写出超限缓存文件（读端会置 _readFailed 永久自锁）')
+    assertEqual(fs.existsSync(p), false, '不应写出超限缓存文件（F1 后读端仍能尾部恢复，但会多一次「旧身份重推」的代价；写端不得自造超限件）')
     const ok2 = saveMessages(p, [{ id: 1 }, { id: 2 }])
     assertEqual(ok2, true, '正常写入不应受影响')
     assertEqual(readMessages(p).length, 2)
@@ -3326,30 +3326,46 @@ console.log('========================================\n');
     assertEqual(matchesCompiled(r.pingbilouzhu, '小红', '任意分类'), false)
   })
 
-  // readMessages JSON 损坏
-  await test('readMessages JSON损坏 → 保留文件并标记读取失败（不重置，防重复入库）', () => {
+  // readMessages JSON 损坏（F1：只隔离不删除 + 重建空缓存 + 恢复推送能力）
+  await test('readMessages JSON损坏 → 重命名隔离 + 重建空缓存 + 恢复判重写入（F1）', () => {
     const fs = require('fs')
-    const p = path.join(CACHE, 'test_corrupt.json')
-    fs.writeFileSync(p, '这不是合法JSON{{{', 'utf8')
-    // 清内存缓存
+    const name = 'test_corrupt.json'
+    const p = path.join(CACHE, name)
+    const raw = '这不是合法JSON{{{'
+    const cleanBaks = () => {
+      try { for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name + '.corrupt.')) fs.unlinkSync(path.join(CACHE, n)) } catch (e) { /* 忽略 */ }
+    }
+    cleanBaks()
+    try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+    delete MessageStore._memoryCache[p]
+    MessageStore._verified.delete(p)
+    MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
+    fs.writeFileSync(p, raw, 'utf8')
     const msgs = readMessages(p)
     assertEqual(Array.isArray(msgs), true)
-    assertEqual(msgs.length, 0)
-    // 文件应被保留（不被重置为 []），避免销毁去重缓存
-    assertEqual(fs.readFileSync(p, 'utf8'), '这不是合法JSON{{{')
-    // save() 应因 _readFailed 拒绝写入，防止同一条消息重复入库
-    assertEqual(appendMessageToFile({ id: 1 }, 'test_corrupt.json'), false)
-    // v3.249：saveBatch 首次调用也必须拒绝覆写损坏文件（先读后判的时序守卫）——
-    // 此前检查在读取之前，首次调用会绕过守卫直接覆写，销毁去重缓存。
-    const fs2 = require('fs')
-    const p2 = path.join(CACHE, 'test_corrupt_batch.json')
-    fs2.writeFileSync(p2, '这不是合法JSON{{{', 'utf8')
-    saveBatch([{ id: 9, title: 'x' }], 'test_corrupt_batch.json')
-    assertEqual(fs2.readFileSync(p2, 'utf8'), '这不是合法JSON{{{', 'saveBatch 首次调用应拒绝覆写损坏文件')
-    fs2.unlinkSync(p2)
-    // 恢复合法缓存后重新可读判重
-    fs.writeFileSync(p, JSON.stringify([{ id: 1 }]), 'utf8')
-    assertEqual(isMessageInFile({ id: 1 }, 'test_corrupt.json'), true)
+    assertEqual(msgs.length, 0, '损坏缓存按空缓存降级（判错方向 = 可能重推，而非永久零推送）')
+    // 原件必须被改名隔离保留（绝不 unlink/清空），原路径重建为合法空缓存
+    const baks = fs.readdirSync(CACHE).filter((n) => n.startsWith(name + '.corrupt.') && n.endsWith('.bak'))
+    assertEqual(baks.length, 1, `损坏缓存必须被改名隔离：${JSON.stringify(fs.readdirSync(CACHE).filter((n) => n.startsWith('test_corrupt')))}`)
+    assertEqual(fs.readFileSync(path.join(CACHE, baks[0]), 'utf8'), raw, '备份必须逐字节保留原件（只隔离不删除）')
+    assertEqual(MessageStore._readFailed[p], undefined, '隔离重建成功后写闸门必须解除（不再永久零推送）')
+    assertEqual(fs.readFileSync(p, 'utf8'), '[]', '原路径必须重建为合法空缓存')
+    // 本轮恢复写入能力：save 不再被拒（旧行为 = 永久拒绝直到人工删/改文件）
+    assertEqual(appendMessageToFile({ id: 1 }, name), true, '隔离后本轮 save 必须恢复写入')
+    assertEqual(isMessageInFile({ id: 1 }, name), true, '恢复后判重仍生效')
+    // saveBatch 同样解除（此前首次调用也会拒绝覆写损坏文件）
+    const name2 = 'test_corrupt_batch.json'
+    const p2 = path.join(CACHE, name2)
+    try { fs.unlinkSync(p2) } catch (e) { /* 忽略 */ }
+    delete MessageStore._memoryCache[p2]
+    MessageStore._verified.delete(p2)
+    MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
+    fs.writeFileSync(p2, raw, 'utf8')
+    assertEqual(saveBatch([{ id: 9, title: 'x' }], name2), true, '隔离重建后 saveBatch 必须可写')
+    assertEqual(JSON.parse(fs.readFileSync(p2, 'utf8')).some((m) => m.id === 9), true, 'saveBatch 新条目必须真正落盘')
+    for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name2 + '.corrupt.')) fs.unlinkSync(path.join(CACHE, n))
+    try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+    try { fs.unlinkSync(p2) } catch (e) { /* 忽略 */ }
   })
 
   // decodeHtmlEntities 未知实体 fallback
@@ -3752,10 +3768,13 @@ console.log('========================================\n');
     }
   })
 
-  await test('缓存符号链接 → 拒绝读取和写入外部目标', () => {
+  await test('缓存符号链接 → 拒绝读取/写入外部目标，且链接本身只改名隔离（F1：绝不删除）', () => {
     const fs = require('fs')
-    const p = path.join(CACHE, 'test_cache_symlink.json')
+    const name = 'test_cache_symlink.json'
+    const p = path.join(CACHE, name)
     const outside = path.join(process.env.TMPDIR || '/tmp', `xbk-cache-symlink-${process.pid}.json`)
+    const wipeBaks = () => { try { for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name + '.corrupt.')) fs.unlinkSync(path.join(CACHE, n)) } catch (e) { /* 忽略 */ } }
+    wipeBaks()
     try {
       fs.writeFileSync(outside, JSON.stringify([{ id: 9001 }]), 'utf8')
       try { fs.unlinkSync(p) } catch (e) { /* 不存在 */ }
@@ -3763,11 +3782,19 @@ console.log('========================================\n');
       const msgs = readMessages(p)
       assertEqual(msgs.length, 0)
       saveMessages(p, [{ id: 9002 }])
+      // 核心安全断言：外部目标绝不被写入/改坏（写的是隔离后新建的普通文件，不是链接目标）
       assertEqual(JSON.parse(fs.readFileSync(outside, 'utf8'))[0].id, 9001)
-      assertEqual(fs.lstatSync(p).isSymbolicLink(), true)
+      // F1：非普通文件走「重命名隔离 + 重建空缓存」——原符号链接被改名保留（绝不 unlink、绝不跟随），
+      // 原路径成为新建普通文件。旧行为（保留链接 + 永久占住写闸门）会让整轮推送永久为零。
+      const baks = fs.readdirSync(CACHE).filter((n) => n.startsWith(name + '.corrupt.') && n.endsWith('.bak'))
+      assertEqual(baks.length, 1, '符号链接本身必须被改名隔离保留（绝不删除）')
+      assertEqual(fs.lstatSync(path.join(CACHE, baks[0])).isSymbolicLink(), true, '备份必须仍是原符号链接（未跟随、未删除）')
+      assertEqual(fs.lstatSync(p).isSymbolicLink(), false, '原路径必须被重建为普通缓存文件')
+      assertEqual(MessageStore._readFailed[p], undefined, '隔离重建成功后写闸门必须解除')
     } finally {
       try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
       try { fs.unlinkSync(outside) } catch (e) { /* 忽略 */ }
+      wipeBaks()
     }
   })
 
@@ -5013,15 +5040,29 @@ console.log('========================================\n');
     assertEqual(decodeHtmlEntities('&euro;&times;'), '€×')
   })
 
-  await test('readMessages 非数组 JSON → 保留文件返回[]不崩溃（v3.21审查11）', () => {
-    const p = getFilePath('test_notarray.json')
+  await test('readMessages 非数组 JSON → 改名隔离 + 重建空缓存（F1：只隔离不删除）', () => {
+    const name = 'test_notarray.json'
+    const p = getFilePath(name)
     const fs = require('fs')
-    fs.writeFileSync(p, JSON.stringify({ foo: 'bar' }), 'utf8')
+    const dir = path.dirname(p)
+    const raw = JSON.stringify({ foo: 'bar' })
+    const wipeBaks = () => { try { for (const n of fs.readdirSync(dir)) if (n.startsWith(name + '.corrupt.')) fs.unlinkSync(path.join(dir, n)) } catch (e) { /* 忽略 */ } }
+    wipeBaks()
+    try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+    delete MessageStore._memoryCache[p]
+    MessageStore._verified.delete(p)
+    MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
+    fs.writeFileSync(p, raw, 'utf8')
     const r = readMessages(p)
     assertEqual(Array.isArray(r), true)
     assertEqual(r.length, 0)
-    // 非数组 JSON 不再被重置，原文件保留（供排查/恢复）
-    assertEqual(fs.readFileSync(p, 'utf8'), JSON.stringify({ foo: 'bar' }))
+    // F1：非数组同属确定性不可恢复判据——原件改名隔离保留（绝不 unlink/重置），原路径重建空缓存
+    const baks = fs.readdirSync(dir).filter((n) => n.startsWith(name + '.corrupt.') && n.endsWith('.bak'))
+    assertEqual(baks.length, 1, `非数组缓存必须被改名隔离：${JSON.stringify(fs.readdirSync(dir))}`)
+    assertEqual(fs.readFileSync(path.join(dir, baks[0]), 'utf8'), raw, '备份必须逐字节保留原件')
+    assertEqual(MessageStore._readFailed[p], undefined, '隔离重建成功后写闸门必须解除')
+    assertEqual(fs.readFileSync(p, 'utf8'), '[]', '原路径必须重建为合法空缓存')
+    wipeBaks()
   })
 
   await test('saveMessages 不原地修改传入数组（v3.21审查13）', () => {
@@ -9597,23 +9638,31 @@ console.log('========================================\n');
     }
   })
 
-  await test('B8-F5: 磁盘文件存在但读不到时写闸门拒绝覆写（现状契约锁定）', () => {
+  await test('B8-F5/F1: 损坏缓存 → 重命名隔离 + 重建空缓存 + 写闸门解除（只隔离不删除）', () => {
     const fsmod = require('node:fs')
     const name = 'test_b8_f5_gate.json'
     const fp = getFilePath(name)
-    // 造一个「文件存在但内容不可解析」的损坏缓存：readMessages 会置位 _readFailed
-    fsmod.writeFileSync(fp, '{ 这不是合法 JSON')
+    const dir = path.dirname(fp)
+    const raw = '{ 这不是合法 JSON'
+    const wipeBaks = () => { try { for (const n of fsmod.readdirSync(dir)) if (n.startsWith(name + '.corrupt.')) fsmod.unlinkSync(path.join(dir, n)) } catch (e) { /* 忽略 */ } }
+    wipeBaks()
+    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    // 造一个「文件存在但内容不可解析」的损坏缓存：readMessages 走 F1 隔离重建分支
+    fsmod.writeFileSync(fp, raw)
     delete MessageStore._memoryCache[fp]
     MessageStore._verified.delete(fp)
     MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
     const read = readMessages(fp)
     assertEqual(read.length, 0, '损坏缓存应降级返回空数组')
-    assertEqual(MessageStore._readFailed[fp], true, '损坏缓存应置位读失败标记')
-    const rejected = saveBatch([{ id: 'f5-blocked', title: '应被拒绝' }], name)
-    assertEqual(rejected, false, '读失败标记置位期间 saveBatch 必须拒绝写入并返回 false（保护存量不被覆盖）')
-    const onDisk = fsmod.readFileSync(fp, 'utf8')
-    assertEqual(onDisk, '{ 这不是合法 JSON', '被拒绝时磁盘原文不得被覆写')
-    delete MessageStore._readFailed[fp]
+    const baks = fsmod.readdirSync(dir).filter((n) => n.startsWith(name + '.corrupt.') && n.endsWith('.bak'))
+    assertEqual(baks.length, 1, `损坏缓存必须被改名隔离：${JSON.stringify(fsmod.readdirSync(dir))}`)
+    assertEqual(fsmod.readFileSync(path.join(dir, baks[0]), 'utf8'), raw, '备份必须逐字节保留原件（绝不 unlink/清空）')
+    assertEqual(MessageStore._readFailed[fp], undefined, '隔离重建成功后写闸门必须解除')
+    assertEqual(fsmod.readFileSync(fp, 'utf8'), '[]', '原路径必须重建为合法空缓存')
+    const accepted = saveBatch([{ id: 'f5-unblocked', title: '应放行' }], name)
+    assertEqual(accepted, true, '隔离重建后 saveBatch 必须放行（旧行为 = 永久拒绝 → 整轮零推送）')
+    assertEqual(JSON.parse(fsmod.readFileSync(fp, 'utf8')).some((m) => m.id === 'f5-unblocked'), true, '解除保护后新条目必须真正落盘')
+    wipeBaks()
     try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
   })
 
@@ -9651,13 +9700,20 @@ console.log('========================================\n');
     assertEqual(saveBatch([null, 42, 'x'], name), true, '全无效条目应返回 true（无变更）')
     // 有效新增：落盘成功
     assertEqual(saveBatch([{ id: 'f05-1', title: 'a' }], name), true, '有效新增落盘成功应返回 true')
-    // 读失败闸门：拒绝写入 → false（须造「文件存在但读不到」的现场，否则 readMessages 会解除保护）
+    // 解析失败（F1 起走「隔离 + 重建空缓存」）：不再返回 false —— 旧行为是永久拒绝写入
+    // ⇒ xbk_app 跳过整轮推送、只能人工删文件；新行为隔离原件后当场解除闸门，故这里必须返回 true。
+    // （写闸门本身的「置位即拒绝覆写」契约由 test_message_store_utils.js 的 ioError/恢复失败两条
+    //   守边界用例与 test_app.js 的零推送集成用例覆盖：真实 fs 上无法确定性构造 ioError。）
     require('node:fs').writeFileSync(fp, '{ 坏 JSON')
     delete MessageStore._memoryCache[fp]
     MessageStore._verified.delete(fp)
     MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
-    readMessages(fp) // 触发置位
-    assertEqual(saveBatch([{ id: 'f05-2', title: 'b' }], name), false, '读失败闸门拒绝写入应返回 false')
+    readMessages(fp) // 触发 F1 隔离重建
+    assertEqual(saveBatch([{ id: 'f05-2', title: 'b' }], name), true, '隔离重建后 saveBatch 必须放行')
+    assertEqual(MessageStore._readFailed[fp], undefined, '隔离重建后写闸门必须解除')
+    const f05Baks = require('node:fs').readdirSync(path.dirname(fp)).filter((n) => n.startsWith(name + '.corrupt.'))
+    assertEqual(f05Baks.length, 1, '解析失败必须留下隔离备份（只隔离不删除）')
+    for (const n of f05Baks) { try { require('node:fs').unlinkSync(path.join(path.dirname(fp), n)) } catch (e) { /* 忽略 */ } }
     try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
     delete MessageStore._readFailed[fp]
     delete MessageStore._memoryCache[fp]

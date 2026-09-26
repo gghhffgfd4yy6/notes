@@ -427,7 +427,10 @@ const {
         `readSafeTextResult 每次调用都必须关闭内容 fd 与复检 fd（40 次后实际净增 ${mrFds() - mrBase3}）`)
     }
 
-    // ===== 读后复检（契约）：dev/ino 或文件类型变化 ⇒ unsafe 且丢弃内容 =====
+    // ===== 读后复检（契约）：dev/ino 或文件类型变化 ⇒ **replaced**（瞬时，不是 unsafe）且丢弃内容 =====
+    // F1 返工 R1：读窗口内的变化是**瞬时并发竞态**（另一进程原子替换/删除缓存），必须与
+    // 「确定性非普通文件」的 unsafe 分开——消费侧只对 unsafe 做「隔离 + 重建」，若这里判 unsafe，
+    // 就会把另一进程刚写入的**有效**缓存搬进 .bak 并把在线路径清零（触发面越界，实测可复现）。
     const mrRealFstat = fs.fstatSync
     const mrRecheck = (second) => {
       let n = 0
@@ -435,13 +438,13 @@ const {
       try { return readSafeTextResult(mrReadFile) } finally { fs.fstatSync = mrRealFstat }
     }
     const mrIno = mrRecheck((s) => ({ isFile: () => s.isFile(), dev: s.dev, ino: s.ino + 1 }))
-    assert.strictEqual(mrIno.status, 'unsafe', '复检 ino 变化 ⇒ 必须判 unsafe')
-    assert.strictEqual(mrIno.text, null, 'unsafe 不得返回内容')
-    assert.strictEqual(mrIno.error.message, '文件读取期间被替换', 'unsafe 原因必须是「读取期间被替换」')
+    assert.strictEqual(mrIno.status, 'replaced', '复检 ino 变化 ⇒ 必须判 replaced（瞬时，不得判 unsafe）')
+    assert.strictEqual(mrIno.text, null, 'replaced 不得返回内容')
+    assert.strictEqual(mrIno.error.message, '文件读取期间被替换', 'replaced 原因必须是「读取期间被替换」')
     const mrDev = mrRecheck((s) => ({ isFile: () => s.isFile(), dev: s.dev + 1, ino: s.ino }))
-    assert.strictEqual(mrDev.status, 'unsafe', '复检 dev 变化 ⇒ 必须判 unsafe')
+    assert.strictEqual(mrDev.status, 'replaced', '复检 dev 变化 ⇒ 必须判 replaced')
     const mrType = mrRecheck((s) => ({ isFile: () => false, dev: s.dev, ino: s.ino }))
-    assert.strictEqual(mrType.status, 'unsafe', '复检发现不再是普通文件 ⇒ 必须判 unsafe')
+    assert.strictEqual(mrType.status, 'replaced', '复检发现不再是普通文件（读窗口内变化）⇒ 必须判 replaced')
 
     // ===== 打开失败的分类：非 ENOENT/ELOOP ⇒ ioError 且原样带出底层错误 =====
     fs.openSync = () => { const e = new Error('open-boom'); e.code = 'EACCES'; throw e }
@@ -451,18 +454,20 @@ const {
       assert.strictEqual(r.text, null, 'ioError 不得带内容')
       assert.strictEqual(r.error.code, 'EACCES', 'ioError 必须原样带出底层错误')
     } finally { fs.openSync = mrOpen }
-    // 复检打开失败：ELOOP/ENOENT ⇒ unsafe「非普通文件」；其余 ⇒ ioError
+    // 复检打开失败：ELOOP/ENOENT（读窗口内路径变了）⇒ **replaced**；其余 ⇒ ioError
     const mrOpen2 = (code) => {
       let n = 0
       fs.openSync = (p, f, m) => { n += 1; if (n === 2) { const e = new Error('reopen'); e.code = code; throw e } return mrOpen(p, f, m) }
       try { return readSafeTextResult(mrReadFile) } finally { fs.openSync = mrOpen }
     }
     const mrReIo = mrOpen2('EACCES')
-    assert.strictEqual(mrReIo.status, 'ioError', '复检打开失败且非 ELOOP/ENOENT ⇒ ioError，不得误判 unsafe')
+    assert.strictEqual(mrReIo.status, 'ioError', '复检打开失败且非 ELOOP/ENOENT ⇒ ioError，不得误判 unsafe/replaced')
     assert.strictEqual(mrReIo.error.code, 'EACCES', '复检 ioError 必须原样带出底层错误')
     const mrReLoop = mrOpen2('ELOOP')
-    assert.strictEqual(mrReLoop.status, 'unsafe', '复检打开 ELOOP ⇒ unsafe')
-    assert.strictEqual(mrReLoop.error.message, '非普通文件', '复检 unsafe 的原因文案必须是「非普通文件」')
+    assert.strictEqual(mrReLoop.status, 'replaced', '复检打开 ELOOP（路径读窗口内变链接）⇒ replaced（瞬时）')
+    assert.strictEqual(mrReLoop.error.message, '文件读取期间被替换或删除', 'replaced 的原因文案必须指向「期间被替换/删除」')
+    const mrReGone = mrOpen2('ENOENT')
+    assert.strictEqual(mrReGone.status, 'replaced', '复检打开 ENOENT（读窗口内被删除）⇒ replaced（瞬时）')
 
     // ===== tooLarge 文案完整 =====
     const mrBig = path.join(mrDir, 'big.txt')
