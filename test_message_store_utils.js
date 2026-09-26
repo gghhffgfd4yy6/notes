@@ -1555,7 +1555,12 @@ check('F1 返工A-守卫2: 解析失败后复检发现已被写回有效缓存 �
     readStatus: (p, mockFs) => {
       if (p !== fp) return null
       reads += 1
-      if (reads === 2) mockFs.files.set(fp, goodRaw) // 模拟另一进程在读窗口内原子写回有效缓存
+      if (reads === 2) {
+        mockFs.files.set(fp, goodRaw) // 模拟另一进程在读窗口内原子写回有效缓存
+        // 复检这一次直接读到刚写回的有效缓存：与下方 mock 兜底同值（语义等价），
+        // 同时让本 hook 有两个取值（避免 SonarCloud S3516「总是返回同一个值」）。
+        return { status: 'ok', text: goodRaw }
+      }
       return null
     }
   })
