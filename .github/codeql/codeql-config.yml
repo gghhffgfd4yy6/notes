@@ -5,6 +5,10 @@ paths-ignore:
   - test_app.js
   - test_notify.js
   - test_failure_policy.js
+  # PR #176：本文件新增的并发替换用例里有「先 lstatSync 检查、再 readFileSync 读取同一备份路径」
+  # 的断言，被 js/file-system-race 报为 TOCTOU（high）——属测试夹具对自有 fixture 的读，非漏洞。
+  # 与上方「测试代码中的攻击样本与断言不参与扫描」同一口径，故加入排除名单。
+  - test_message_store_utils.js
   - run_tests.js
   - run_mutation.js
   - stryker.config.js

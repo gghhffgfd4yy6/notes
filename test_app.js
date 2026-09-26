@@ -3822,11 +3822,20 @@ console.log('========================================\n');
         `占位符应替换且标题正常: ${pushCalls.map(c => JSON.stringify(c.desp.slice(0, 80))).join('|')}`)
   })
 
-  await test('损坏缓存文件 → 首次跳过推送防重复轰炸，修复后恢复推送（C005）', async () => {
+  await test('损坏缓存文件 → 重命名隔离 + 本轮恢复推送（F1：只隔离不删除，不再永久零推送）', async () => {
+    // 反例（改动前，F1 已确证）：损坏/超限缓存置 _readFailed → save/saveBatch 拒绝覆写 →
+    // xbk_app 跳过整轮推送 → 每轮重复，只能人工删/改文件才能恢复。
+    // 现在：原件改名隔离保留（绝不 unlink），原路径重建空缓存并当场解除闸门 → 本轮照常推送。
     reset()
     setPushUrl('t99_corrupt_cache')
-    const cachePath = path.join(CACHE_DIR, 't99_corrupt_cache.json')
-    fs.writeFileSync(cachePath, '{ invalid json', 'utf8')
+    const cacheName = 't99_corrupt_cache.json'
+    const cachePath = path.join(CACHE_DIR, cacheName)
+    const raw = '{ invalid json'
+    const wipeBaks = () => { try { for (const n of fs.readdirSync(CACHE_DIR)) if (n.startsWith(cacheName + '.corrupt.')) fs.unlinkSync(path.join(CACHE_DIR, n)) } catch (e) { /* 忽略 */ } }
+    wipeBaks()
+    try { fs.unlinkSync(cachePath) } catch (e) { /* 不存在 */ }
+    delete xbk.MessageStore._readFailed[cachePath]
+    fs.writeFileSync(cachePath, raw, 'utf8')
     fakeData = [makeItem({ id: 9001, title: '损坏缓存测试' })]
     const origErr = console.error
     const errs = []
@@ -3837,20 +3846,58 @@ console.log('========================================\n');
     } finally {
       console.error = origErr
     }
-    assert(pushCalls.length === 0, `损坏缓存首次运行不应推送，实际${pushCalls.length}`)
+    assert(pushCalls.length === 1, `损坏缓存隔离后本轮必须恢复推送，实际${pushCalls.length}`)
+    assert(errs.some(e => e.includes('corrupt.')), `必须响亮报告隔离事件（点名备份路径）: ${errs.join(' | ')}`)
+    assert(!errs.some(e => e.includes('缓存读取失败，跳过本轮推送以防重复轰炸')),
+        `不得再走「整轮零推送」闸门: ${errs.join(' | ')}`)
+    const baks = fs.readdirSync(CACHE_DIR).filter(n => n.startsWith(cacheName + '.corrupt.') && n.endsWith('.bak'))
+    assert(baks.length === 1, `原件必须被改名隔离且只留一份备份: ${fs.readdirSync(CACHE_DIR).join(',')}`)
+    assert(fs.readFileSync(path.join(CACHE_DIR, baks[0]), 'utf8') === raw, '备份必须逐字节保留原件（绝不删除/清空）')
+    // 隔离重建后原路径必须是**合法可读**缓存；本轮推送成功，故其中应含本轮记录（证明写入能力已恢复）
+    const rebuilt = JSON.parse(fs.readFileSync(cachePath, 'utf8'))
+    assert(Array.isArray(rebuilt) && rebuilt.some(m => String(m.id) === '9001'),
+        `原路径必须重建为合法缓存并记录本轮推送: ${fs.readFileSync(cachePath, 'utf8').slice(0, 200)}`)
+    assert(summary?.pushed === 1, `隔离后本轮推送成功语义不变，实际 ${JSON.stringify(summary)}`)
+    // 隔离事件必须进 run.log（否则「整轮零推送 + ERROR + 告警」这条旧信号消失后就成了静默降级）
+    const log = fs.readFileSync(path.join(CACHE_DIR, 'run.log'), 'utf8')
+    assert(log.includes('WARN 缓存JSON 解析失败隔离重建') || log.includes('缓存JSON 解析失败隔离重建'),
+        `run.log 必须留痕隔离事件: ${log.split('\n').slice(-4).join(' | ')}`)
+    assert(log.includes('.corrupt.'), `run.log 必须点名备份路径: ${log.split('\n').slice(-4).join(' | ')}`)
+    wipeBaks()
+  })
+
+  await test('缓存读闸门置位 → 跳过整轮推送 + 失败摘要 + 响亮（C005 闸门契约，F1 后仍保留）', async () => {
+    // 守边界：隔离/重建只覆盖确定性不可恢复判据；ioError / 缺失且初始化失败这类瞬时故障仍必须
+    // 走「跳过本轮推送」的保守闸门（防重复轰炸 + 非零退出码）。
+    // 为什么替换读失败生产者：真实 fs 上无法确定性构造 ioError（本机 FUSE 不强制权限位；
+    // ENOTDIR 被 resolveCacheDirInRoot 的根内校验挡在前面），故只替换「谁置位标记」，
+    // 被测的 app 闸门判定逻辑本身仍是真代码。
+    reset()
+    setPushUrl('t99_gate_cache')
+    const cachePath = xbk.MessageStore.getFilePath('t99_gate_cache.json')
+    try { fs.unlinkSync(cachePath) } catch (e) { /* 不存在 */ }
+    delete xbk.MessageStore._readFailed[cachePath]
+    fakeData = [makeItem({ id: 9101, title: '闸门测试' })]
+    const origRead = xbk.MessageStore.readMessages
+    const origErr = console.error
+    const errs = []
+    let summary
+    try {
+      xbk.MessageStore.readMessages = function (fp) { this._readFailed[fp] = true; return [] }
+      console.error = (m) => errs.push(String(m))
+      summary = await xbk.run()
+    } finally {
+      xbk.MessageStore.readMessages = origRead
+      console.error = origErr
+      delete xbk.MessageStore._readFailed[cachePath]
+    }
+    assert(pushCalls.length === 0, `缓存读失败必须跳过本轮推送，实际${pushCalls.length}`)
     assert(errs.some(e => e.includes('缓存读取失败，跳过本轮推送以防重复轰炸')),
         `应有跳过推送告警: ${errs.join(' | ')}`)
     // P1（审查 2026-08-15）：缓存读失败早退曾返回 undefined（退出码 0 + 零告警零日志，静默漏推）；
     // 修复后应返回带失败语义的摘要，使 classifySummary 判可重试失败 → runSingleEntry 置非零退出码
     assert(summary?.total === 1 && summary?.failed === 1 && summary?.pushed === 0,
         `缓存读失败应返回失败摘要(failed=待推送条数)，实际 ${JSON.stringify(summary)}`)
-    // 修复缓存（写合法 JSON 空数组）后恢复正常推送
-    reset()
-    setPushUrl('t99_corrupt_cache')
-    fs.writeFileSync(cachePath, '[]', 'utf8')
-    fakeData = [makeItem({ id: 9002, title: '修复后推送' })]
-    await xbk.run()
-    assert(pushCalls.length === 1, `修复缓存后应推送，实际${pushCalls.length}`)
   })
 
   await test('sendNotify 同步返回非 Promise → 拒绝静默成功（P2：契约防御，不写缓存）', async () => {
@@ -3895,13 +3942,23 @@ console.log('========================================\n');
     fakeData = [makeItem({ id: 1, title: '屏蔽词内容' })]
     await xbk.run()
     const h1 = fs.readFileSync(hashPath, 'utf8').trim()
-    // ② 规则改为 B + 切换到「从未读入内存」的损坏缓存文件（内存缓存会屏蔽磁盘损坏，须用新 cacheName）
+    // ② 规则改为 B + 制造「缓存读取失败」（内存缓存会屏蔽磁盘损坏，须用新 cacheName）
+    // 注意：v3.277 起「损坏 JSON」不再是读失败——F1 会把它改名隔离并重建空缓存（读是成功的、本轮
+    // 照常推送），故这里改用一个受控的读失败生产者。为什么不能造真实 ioError：本机 FUSE 不强制
+    // 权限位（chmod 000 仍可读）、不支持 unix socket（listen EACCES）、ENOTDIR 被
+    // resolveCacheDirInRoot 的根内校验挡在前面。被测的「读失败不得推进 filter.hash」判定仍是
+    // xbk_app 的真代码，只替换「谁置位 _readFailed」。
     reset()
     setPushUrl('t_p2_hash_broken') // 清残留
-    fs.writeFileSync(cachePath, '{ broken json', 'utf8')
-    Config.filter.pingbibiaoti = '新词'
-    fakeData = [makeItem({ id: 1, title: '屏蔽词内容' })]
-    await xbk.run()
+    const origReadP2 = xbk.MessageStore.readMessages
+    try {
+      xbk.MessageStore.readMessages = function (fp) { this._readFailed[fp] = true; return [] }
+      Config.filter.pingbibiaoti = '新词'
+      fakeData = [makeItem({ id: 1, title: '屏蔽词内容' })]
+      await xbk.run()
+    } finally {
+      xbk.MessageStore.readMessages = origReadP2
+    }
     const h3 = fs.readFileSync(hashPath, 'utf8').trim()
     assert(h3 === h1, `缓存读失败时 filter.hash 不应推进，期望 ${h1} 实际 ${h3}`)
     // ③ 修复缓存为空数组
