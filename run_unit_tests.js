@@ -132,9 +132,9 @@ function clipForLog (buf, limit) {
 // 成功/失败人读行、::error title= 失败归因（输出超限/套件超时/失败套件）、clipForLog 裁剪、汇总行三数字格式。
 function runSuite (s) {
   return new Promise((resolve) => {
-    // nosemgrep（Codacy opengrep wrapper 跳过行内抑制）：s.file 来自 test_suites.js 的静态
-    // SUITES 注册表（仓库自管，非用户输入），path.join 只拼出仓库根下既有测试文件
-    const file = path.join(__dirname, s.file)
+    // s.file 来自 test_suites.js 的静态 SUITES 注册表（仓库自管，非用户输入），
+    // path.join 只拼出仓库根下既有测试文件（Codacy Security 污点误报，行内抑制见下行）
+    const file = path.join(__dirname, s.file) // nosemgrep
     const t0 = Date.now()
     // CI（GITHUB_STEP_SUMMARY 存在）下 stdout/stderr 均 pipe 收集：并发套件完成时**一次性**
     // 输出完整 `::group::…::endgroup::`（组开/关不跨套件交错，避免 GitHub Actions 日志分组
