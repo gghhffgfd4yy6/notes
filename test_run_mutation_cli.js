@@ -227,7 +227,7 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
       const result = await runTests(dir, 500) // 500ms 超时
       assert.strictEqual(result.status, 'timeout', '超时的测试应返回 timeout')
       // 超时契约断言放在确定触发 timeout 的场景（死循环 500ms），而非 evaluate 分支——
-      // evaluate 用 120s 超时跑全量套件，CI 中几乎不会走到 timeout，那里的断言形同虚设（仅作防御保留）。
+      // evaluate 用 180s 超时跑全量套件，CI 中几乎不会走到 timeout，那里的断言形同虚设（仅作防御保留）。
       assert.strictEqual(result.code, null, '超时结果应显式返回 code: null（不是 undefined）')
       assert.strictEqual(result.signal, 'SIGKILL', '超时应记录 SIGKILL')
       assert.ok(Array.isArray(result.summary), '超时结果应返回 summary 数组（与正常运行路径契约对称）')
@@ -325,9 +325,12 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
   // 行为断言：验证 evaluate 真正执行了测试运行（而非因缺文件立即失败），output 含测试入口输出。
 
   // 场景 1：无变异（mutants=[]）→ evaluate 正常运行全量单元测试并返回结果
+  // ⚠️ 超时上限 180s：evaluate 内跑完整 run_unit_tests（含 test_network 的 ~45s 真实退避等待），
+  // 慢验证机（proot/手机）上全量可达 115-120s，120s 上限会因环境波动假红（新旧实现均实测撞边）；
+  // 该上限只是「沙箱挂死」的防御看门狗（真实挂死 180s 同样 SIGKILL 收敛），不改变任何断言语义。
   {
     const files = ['xbk_utils.js']
-    const result = await evaluate([], files, 120000)
+    const result = await evaluate([], files, 180000)
     // 行为断言 1：返回结构完整
     assert.ok(typeof result === 'object', 'evaluate 应返回对象')
     // 沙箱内整套必须真的通过：此前只断言 status ∈ {pass,fail,timeout}，copyProject 漏拷文件导致
@@ -352,21 +355,41 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
     // evaluate 的 finally 块会清理临时目录，无需额外断言
   }
 
-  // 场景 2：有变异体 → evaluate 应用变异后运行测试，mutants 数组包含变异体 ID
+  // 场景 2：有变异体 → applyMutants 真实改写沙箱源文件、变异体 ID 保持一致
+  // v3.278 优化：原实现再次 evaluate（copyProject + 全量单元测试 ≈ 60s）只为断言「应用变异后
+  // 测试仍真正运行」——该断言（管道真实执行）已由场景 1 的全量 evaluate 覆盖；此处改为直接
+  // copyProject + applyMutants + 源码级验证（秒级），覆盖「变异被真实应用」这一场景 2 的独有意义。
+  // evaluate 的「copyProject → applyMutants → runTests → finally 清理」组合语义已由场景 1 全量覆盖。
+  // ⚠️ 用 collectMutants 而非 generateMutants：id 由 collectMutants 统一补发（生产 main() 同源）；
+  //    generateMutants 的候选没有 id 字段（原实现用它导致「ID 一致」断言恒真通过、形同虚设）。
   {
-    const { generateMutants } = require('./run_mutation')
+    const { collectMutants, copyProject, applyMutants } = require('./run_mutation')
     const source = fs.readFileSync(path.join(__dirname, 'xbk_utils.js'), 'utf8')
-    const allMutants = generateMutants('xbk_utils.js', source)
+    const allMutants = collectMutants(['xbk_utils.js'])
     assert.ok(allMutants.length > 0, 'xbk_utils.js 应能生成变异体')
-    // 取第一个变异体（确定性），验证 evaluate 能应用并返回其 ID
+    // 取第一个变异体（确定性），验证 applyMutants 能应用并返回其 ID
     const oneMutant = allMutants[0]
-    const result = await evaluate([oneMutant], ['xbk_utils.js'], 120000)
-    assert.ok(Array.isArray(result.mutants), '应返回 mutants 数组')
-    assert.strictEqual(result.mutants.length, 1, '应包含 1 个变异体 ID')
-    assert.strictEqual(result.mutants[0], oneMutant.id, '变异体 ID 应一致')
-    // 行为断言：应用变异后测试仍真正运行（output 含测试入口输出或执行痕迹）
-    assert.ok(result.output.includes('单元测试入口') || result.output.includes('统一测试入口') || result.output.includes('通过') || result.output.includes('失败'),
-      '应用变异后测试应仍真正运行')
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-eval-apply-'))
+    try {
+      copyProject(dir, ['xbk_utils.js'])
+      const applied = applyMutants(dir, [oneMutant])
+      assert.ok(Array.isArray(applied), 'applyMutants 应返回数组')
+      assert.strictEqual(applied.length, 1, '应应用 1 个变异体')
+      assert.strictEqual(applied[0], oneMutant.id, '变异体 ID 应一致')
+      // 源码级验证：沙箱内 xbk_utils.js 确实被改写（替换已生效）。
+      // ⚠️ 不得断言「变异后模块可加载」：变异候选本身就是会被杀死的形态（如 `=>` → `=>=` 是
+      // 语法错误，正是变异测试要捕捉的 killed 体），require 成功与否均属合法结果；
+      // 也不得按原文件的 start/end 直接 slice 比对——替换会改变文件长度，后续偏移整体移动。
+      // 单候选场景下：替换前的前缀逐字节不变 + 起始偏移处正是替换文本 = 精确断言。
+      const mutated = fs.readFileSync(path.join(dir, 'xbk_utils.js'), 'utf8')
+      assert.notStrictEqual(mutated, source, 'applyMutants 应改写沙箱源文件')
+      assert.strictEqual(mutated.slice(0, oneMutant.start), source.slice(0, oneMutant.start),
+        '变异起点之前的内容应逐字节不变')
+      assert.strictEqual(mutated.slice(oneMutant.start, oneMutant.start + oneMutant.replacement.length), oneMutant.replacement,
+        '变异替换应在起始偏移处实际生效')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   }
 
   console.log('test_run_mutation_cli OK')
