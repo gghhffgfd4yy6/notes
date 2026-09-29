@@ -132,14 +132,18 @@ function clipForLog (buf, limit) {
 // 成功/失败人读行、::error title= 失败归因（输出超限/套件超时/失败套件）、clipForLog 裁剪、汇总行三数字格式。
 function runSuite (s) {
   return new Promise((resolve) => {
+    // nosemgrep（Codacy opengrep wrapper 跳过行内抑制）：s.file 来自 test_suites.js 的静态
+    // SUITES 注册表（仓库自管，非用户输入），path.join 只拼出仓库根下既有测试文件
     const file = path.join(__dirname, s.file)
     const t0 = Date.now()
-    // CI 下用 ::group:: 折叠各套件输出（463KB 的 test_filter 不再刷爆日志页）；stderr 直通组内（成功套件
-    // 的警告也保留），pipe 仅收 stdout 用于失败时打包重显；本地保持 inherit 逐行直出
-    if (IN_CI) console.log(`::group::${s.name}（${s.file}）`)
-    // execFileSync 的 maxBuffer 超限会 ENOBUFS（按失败处理）；这里等价模拟：累计 stdout 超 MAX_BUFFER
-    // 即 kill 并记为输出超限（out 继续增长前已 kill，close 后按 overflow 走失败归因）
+    // CI（GITHUB_STEP_SUMMARY 存在）下 stdout/stderr 均 pipe 收集：并发套件完成时**一次性**
+    // 输出完整 `::group::…::endgroup::`（组开/关不跨套件交错，避免 GitHub Actions 日志分组
+    // 归因错误——串行实现组标记实时输出无此问题，并发下必须先收集后整组打出）；stdout 仍用于
+    // ENOBUFS 检测与失败回显。本地保持 inherit 直通（无 group、与串行版逐字一致，
+    // UT-07 沙箱回归依赖本地模式子进程输出直通调用方 stdout）。
+    const collect = IN_CI
     let out = Buffer.alloc(0)
+    let err = Buffer.alloc(0)
     let overflowed = false
     let timedOut = false
     let finished = false
@@ -147,11 +151,8 @@ function runSuite (s) {
     try {
       child = spawn(process.execPath, [file], {
         cwd: __dirname,
-        // stderr 直通（inherit）：与串行版 stdio=['ignore','pipe','inherit']（CI）/ 'inherit'（本地）同口径。
-        // stdout 仅在 CI（GITHUB_STEP_SUMMARY 存在）时 pipe 收集（失败打包回显/ENOBUFS 检测用）；
-        // 本地保持 inherit 直通——原 execFileSync 本地即 'inherit'，子进程输出直连终端/调用方管道
-        // （UT-07 沙箱回归依赖「本地模式套件输出直通调用方 stdout」）。
-        stdio: ['ignore', IN_CI ? 'pipe' : 'inherit', 'inherit']
+        // stderr 直通（inherit）：CI 下随组收集并在组内回放；本地保持 inherit（与旧 execFileSync 同口径）
+        stdio: ['ignore', collect ? 'pipe' : 'inherit', collect ? 'pipe' : 'inherit']
       })
     } catch (e) {
       // spawn 同步失败（ENOENT 等）：按失败处理，与 execFileSync 抛错同语义
@@ -160,11 +161,15 @@ function runSuite (s) {
     }
     const kill = () => { try { child.kill('SIGKILL') } catch (e) { /* 进程已退出 */ } }
     const timer = setTimeout(() => { timedOut = true; kill() }, UNIT_TIMEOUT)
-    if (IN_CI) {
+    if (collect) {
       child.stdout.on('data', (chunk) => {
         if (overflowed) return
         out = Buffer.concat([out, chunk])
         if (out.length > MAX_BUFFER) { overflowed = true; kill() } // ENOBUFS 语义：超限即 kill（fail-loud）
+      })
+      child.stderr.on('data', (chunk) => {
+        // stderr 只收集不判定（与串行版 stderr inherit 无上限口径一致；上限仅防进程异常刷屏撑爆内存）
+        if (err.length < MAX_BUFFER) err = Buffer.concat([err, chunk])
       })
     }
     child.on('error', (e) => {
@@ -183,33 +188,45 @@ function runSuite (s) {
         code,
         overflowed,
         timedOut,
-        out
+        out,
+        err
       })
     })
-    function settle ({ ok, ms, error, code, overflowed: ovf, timedOut: tout, out: childOut }) {
+    function settle ({ ok, ms, error, code, overflowed: ovf, timedOut: tout, out: childOut, err: childErr }) {
       try {
         if (IN_CI) {
+          // 🔒 组生命周期只在单次输出内完成（start + 内容 + end 连续打出）：
+          // 并发套件完成顺序不定，若组开/关跨输出点交错，GitHub Actions 会把先完成的
+          // ::endgroup:: 误关到后启动的组上（Sourcery broader_impact 审查指出的日志归因错误）。
+          // 成功全量回放 stdout+stderr；失败组内回放 stderr 与裁剪后的 stdout，归因行在组外。
           if (ok) {
-            console.log(childOut ? childOut.toString() : '')
+            const body = [childOut ? childOut.toString() : '', childErr ? childErr.toString() : ''].join('')
+            console.log(`::group::${s.name}（${s.file}）`)
+            console.log(body)
             console.log('::endgroup::')
+            console.log(`\n  ✅ ${s.name} 通过（${(ms / 1000).toFixed(1)}s）\n`)
           } else {
-            // 失败必须全量炸出（默认组），拿回具体红测上下文（stderr 已直通，此处补 stdout）
+            console.log(`::group::${s.name}（${s.file}）`)
+            if (childErr) console.log(clipForLog(childErr, MAX_BUFFER))
             console.log('::endgroup::')
             console.log(ovf
               ? `::error title=输出超限：${s.name}::${s.file} 的 stdout 超过 ${MAX_BUFFER} 字节上限（输出超限按失败处理 fail-loud：超限本身非测试断言失败，但流程仍以 exit 1 收尾）`
               : tout
                 ? `::error title=套件超时：${s.name}::${s.file} 超过每套件上限 ${UNIT_TIMEOUT}ms（已按 killSignal=SIGKILL 强杀，按失败处理）`
                 : `::error title=失败套件：${s.name}::${s.file}`)
+            // 失败必须全量炸出（归因行组外），拿回具体红测上下文
             console.log(clipForLog(childOut, MAX_BUFFER))
+            console.log(`\n  ❌ ${s.name} 失败（${(ms / 1000).toFixed(1)}s${tout ? `，超过每套件上限 ${UNIT_TIMEOUT}ms 已强杀` : ''}）\n`)
           }
+        } else {
+          // 本地 inherit 直通：子进程输出实时到终端/调用方管道，这里只补汇总行
+          console.log(`  ${ok ? '✅' : '❌'} ${s.name} ${ok ? '通过' : '失败'}（${(ms / 1000).toFixed(1)}s${tout ? `，超过每套件上限 ${UNIT_TIMEOUT}ms 已强杀` : ''}）\n`)
         }
         results[idxOf(s)] = { ...s, ok, ms }
-        console.log(`\n  ${ok ? '✅' : '❌'} ${s.name} ${ok ? '通过' : '失败'}（${(ms / 1000).toFixed(1)}s${tout ? `，超过每套件上限 ${UNIT_TIMEOUT}ms 已强杀` : ''}）\n`)
-        // 兼容旧输出里的尖括号差异（原失败行文案含「失败（…）」前缀一致）
       } catch (e) {
         // 失败归因/回显自身不得让汇总流程崩溃（如 childOut 含不可编码内容）
         results[idxOf(s)] = { ...s, ok: false, ms }
-        console.log(`\n  ❌ ${s.name} 失败（${(ms / 1000).toFixed(1)}s）\n`)
+        console.log(`  ❌ ${s.name} 失败（${(ms / 1000).toFixed(1)}s）\n`)
       }
       resolve()
     }

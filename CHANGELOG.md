@@ -117,3 +117,4 @@
 - CI 效率：`run_unit_tests.js`（全量单元测试入口）由逐套件串行改为并发池执行——套件各自独立子进程，默认并发 8（`XBK_UNIT_CONCURRENCY` 可调），汇总/输出/失败归因/ENOBUFS/超时/`GITHUB_STEP_SUMMARY` 契约逐字不变；`XBK_MUTATION_CHILD=1`（stryker 与 `run_mutation.js` 的变异评估沙箱）时自动回退串行，保持变异评估的 `PERF_MS` 性能断言口径与既有并发模型（8 worker 共享沙箱）完全不变。CI 上「全量单元测试」步骤除最长套件之外的部分约 10s → 3s。
 - CI 效率：`test_run_mutation_cli.js` 的 evaluate 场景从「2 次全量单元测试」减为「1 次全量 + 秒级 applyMutants 轻量验证」——原先场景 2 为断言「应用变异后测试仍运行」再次 copyProject + 全量跑一遍（CI ≈ 60s，纯重复），现改为直接验证变异真实写改沙箱源文件、变异体 ID 一致、变异后模块可加载；「沙箱内全量应整体通过」的核心契约由场景 1 保留。CI 上该套件 125s → ~75s。
 - 防御性：evaluate 场景的全量沙箱看门狗上限 120s → 180s（慢验证机上全量实测 115-120s 紧贴旧上限，环境波动即假红；该上限只是挂死收敛兜底，不改变断言语义）。
+- 审查收尾（PR #181 复审）：CI 并发下 `::group::`/`::endgroup::` 改为「stdout+stderr 收集完成后一次性整组输出」——组开/关不再跨套件交错（Sourcery broader_impact：并发完成顺序不定时，先完成的 `::endgroup::` 会误关后启动的组，日志归因错乱）；`path.join(__dirname, s.file)` 补 `nosemgrep` 行内抑制（Codacy Security 污点误报：`s.file` 来自静态 SUITES 注册表，非用户输入）。
