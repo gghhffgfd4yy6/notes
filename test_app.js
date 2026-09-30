@@ -4235,4 +4235,4 @@ console.log('========================================\n');
   }
 
   process.exit(failed > 0 ? 1 : 0)
-})()
+})().catch(e => { console.error(e); process.exit(1) })

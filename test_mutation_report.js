@@ -1925,4 +1925,4 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
   // 汇总文案按真实失败计数条件化：存在失败项时不再谎报“全部通过”
   const failSuffix = fail > 0 ? ('，失败 ' + fail + ' 项') : '，全部通过'
   console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_mutation_report.js 通过 ${pass}/${pass + fail} 项${failSuffix}（含异步 ${asyncPass} 项）`)
-})()
+})().catch(e => { console.error(e); process.exit(1) })

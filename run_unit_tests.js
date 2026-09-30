@@ -245,7 +245,7 @@ const idxOf = (s) => UNIT_SUITES.indexOf(s)
   })
   await Promise.all(workers)
   finish()
-})()
+})().catch(e => { console.error(e); process.exit(1) })
 
 function finish () {
   console.log('══════════════════════════════════════════════')

@@ -102,4 +102,4 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
     console.log('  定位: node test_app.js --only=<测试名子串> 串行重跑（等号/空格两种写法均生效）')
     process.exit(1)
   }
-})()
+})().catch(e => { console.error(e); process.exit(1) })
