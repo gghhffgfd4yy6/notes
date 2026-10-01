@@ -1556,4 +1556,4 @@ console.log('========================================\n');
   }
   console.log('========================================\n')
   process.exit(failed > 0 ? 1 : 0)
-})()
+})().catch(e => { console.error(e); process.exitCode = 1 })

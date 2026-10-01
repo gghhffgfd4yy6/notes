@@ -57,6 +57,8 @@ for (let i = 0; i < sorted.length; i += chunkSize) {
 
 // ---------- 3. 并发 fork（独立缓存目录 + 精确名单 + QUICK 快测） ----------
 const t0 = Date.now()
+// 活跃子进程登记：setup 中途抛错（writeFileSync/fork）时顶层 catch 能终止已启动的 worker
+const activeChildren = new Set()
 
 // 跑一个分片：返回退出码。quick=true 时用 QUICK 快测；重跑时用非 QUICK 完整验证
 function runChunk (chunk, idx, quick) {
@@ -68,7 +70,12 @@ function runChunk (chunk, idx, quick) {
       env: { ...process.env, XBK_PARALLEL_ID: workerId, QUICK: quick ? '1' : '' },
       stdio: 'inherit'
     })
-    child.on('exit', (code) => { try { fs.unlinkSync(listFile) } catch (e) {} resolve(code) })
+    activeChildren.add(child)
+    child.on('exit', (code) => {
+      activeChildren.delete(child)
+      try { fs.unlinkSync(listFile) } catch (e) {}
+      resolve(code)
+    })
   })
 }
 
@@ -102,4 +109,8 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
     console.log('  定位: node test_app.js --only=<测试名子串> 串行重跑（等号/空格两种写法均生效）')
     process.exit(1)
   }
-})()
+})().catch(e => {
+  console.error(e)
+  for (const child of activeChildren) { try { child.kill() } catch (err) {} }
+  process.exitCode = 1
+})
