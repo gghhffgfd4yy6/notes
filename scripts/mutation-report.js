@@ -198,14 +198,22 @@ function stripAnsi (text) {
   const s = String(text)
   if (s.indexOf(ESC_CHAR) === -1) return s // 常见形态（写进文件的那份 stryker.log）0 个 ESC 字节：原样返回
   let out = ''
-  for (let i = 0; i < s.length; i++) {
+  let i = 0
+  while (i < s.length) {
+    let matched = false
     if (s.charCodeAt(i) === 27 && s[i + 1] === '[') {
       let j = i + 2
       while (j < s.length && s[j] >= '0' && s[j] <= '?') j++ // 参数字节 [0-?]
       while (j < s.length && s[j] >= ' ' && s[j] <= '/') j++ // 中间字节 [ -/]
-      if (j < s.length && s[j] >= '@' && s[j] <= '~') { i = j; continue } // 终止字节 [@-~]（缺终止字节则不是 CSI）
+      if (j < s.length && s[j] >= '@' && s[j] <= '~') { // 终止字节 [@-~]（缺终止字节则不是 CSI）
+        i = j + 1 // 整段剥掉（S2310：for 计数器不得在体内改写，改用 while）
+        matched = true
+      }
     }
-    out += s[i]
+    if (!matched) {
+      out += s[i]
+      i++
+    }
   }
   return out
 }

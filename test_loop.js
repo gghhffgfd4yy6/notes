@@ -153,4 +153,4 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
   console.log('✅ 常驻循环：未传 onError 时每轮异常留一行诊断日志且不中断')
 
   console.log('✅ 常驻循环：单轮异常不中断，停止信号在当前轮结束后生效，定期刷新与等待并行')
-})()
+})().catch(e => { console.error(e); process.exitCode = 1 })

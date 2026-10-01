@@ -127,6 +127,12 @@
 # 与仓库内硬编码相对路径拼成，无任何外部净输入参与路径构造——动态路径告警属误报
 # （与上方 test_check_version.js / scripts/check-mutation-ranges.js 同类处理）。
 #
+# test_app_p.js 是 test_app.js 的并行调度器（integration: true，仅本地/CI 测试入口）：
+# runChunk 的 listFile = path.join(__dirname, `.tmp_parallel_${workerId}.json`)，workerId 由
+# 模块常量 RUN_ID + 分片索引拼成，fs.writeFileSync/unlinkSync 的目标不含任何外部输入；
+# 缓存目录清理 path.join(__dirname, `xianbaoku_cache_p${workerId}`) 同源——
+# 「动态构造文件/路径信息」告警属误报（与上方 test_storage.js / test_check_version.js 等夹具同一口径）。
+#
 # scripts/mutation-report.js 是变异日报汇总 / 复用状态落盘工具（本地/CI 工具，不进入生产运行时，
 # 与上方 scripts/mutation-json.js 同族同信任模型）：「读调用方给出的路径」正是它的本职工作——
 #   · `--reuse` 模式的 --log/--out 由 .github/workflows/mutation.yml 的「记录本段增量复用状态」step
@@ -178,3 +184,4 @@ exclude_paths:
   - "test_mutation_json.js"
   - "test_mutation_ranges.js"
   - "test_qinglong_utils.js"
+  - "test_app_p.js"

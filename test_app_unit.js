@@ -1634,4 +1634,4 @@ checkAsync('_sendAlert 留痕把连续换行折叠成一个空格（+ 量词与�
     process.exit(1)
   }
   process.exit(0)
-})()
+})().catch(e => { console.error(e); process.exitCode = 1 })

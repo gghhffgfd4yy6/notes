@@ -643,4 +643,4 @@ function test (name, fn) {
 
   console.log(`test_pusher OK (${failed === 0 ? '全部通过' : failed + ' 项失败'})`)
   process.exit(failed > 0 ? 1 : 0)
-})()
+})().catch(e => { console.error(e); process.exitCode = 1 })
