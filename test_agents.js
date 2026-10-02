@@ -432,5 +432,25 @@ dns.lookup = (hostname, options, callback) => {
     assert.strictEqual(mrCalls2, 4, '未建模的 order 取值不得读写缓存（每次都必须真解析）')
   } finally { dns.lookup = mrLookup2 }
 
+  // ===== prewarmTls：abort 取消路径（唯一不触网的可测分支；此前该函数零覆盖）=====
+  // AGENTS-07：TLS 预热结果带 kind:'tls'。已 aborted 的 signal → 立即返回
+  // { kind:'tls', skipped:true, cancelled:true, ok:false, okCount:0 }，绝不发起 got 请求。
+  // 注意：不测非 aborted 路径——那会真实建连（触网），与套件「不依赖外网」约束冲突；
+  // 建连成功/失败/HEAD→GET 回退分支由常驻链路（test_qinglong_resident mock）与 CI 覆盖。
+  {
+    const { prewarmTls } = require('./xbk_agents')
+    const tlsAc = new AbortController()
+    tlsAc.abort()
+    const tlsAborted = await prewarmTls('example.invalid', 1000, 3, tlsAc.signal)
+    assert.strictEqual(tlsAborted.kind, 'tls', 'TLS 预热结果应带 kind=tls（AGENTS-07）')
+    assert.strictEqual(tlsAborted.hostname, 'example.invalid', '结果应带 hostname')
+    assert.strictEqual(tlsAborted.cancelled, true, '已 aborted 的 signal 必须立即返回 cancelled')
+    assert.strictEqual(tlsAborted.skipped, true, '取消属于跳过（未建连），调用方按「跳过」展示')
+    assert.strictEqual(tlsAborted.ok, false, '未建连时 ok 必须为 false（AGENTS-10：不得假绿）')
+    assert.strictEqual(tlsAborted.okCount, 0, '未建连时 okCount 必须为 0')
+    assert.strictEqual(tlsAborted.elapsedMs, 0, '取消应零耗时立即返回')
+    assert.strictEqual(tlsAborted.count, 3, 'count 应回显请求的连接数')
+  }
+
   console.log('test_agents OK')
 })().catch((e) => { console.error(e); process.exit(1) })

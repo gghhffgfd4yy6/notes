@@ -6,7 +6,7 @@
 const assert = require('node:assert')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
-const { createMessageStore } = require('./xbk_message_store')
+const { createMessageStore, IDENTITY_INDEX_REF_PROBE_WINDOW, IDENTITY_INDEX_IDENTITY_PROBE_WINDOW } = require('./xbk_message_store')
 
 const mockUtils = {
   anonKey: (s) => 'anon' + String(s).length,
@@ -2014,5 +2014,52 @@ check('_probeIndexMiss: 小数组（n<=8）必须整表抽查（首次未命中�
     }
   })
 }
+
+// --- 已导出的身份索引探测窗常量（此前无任何守护断言）---
+// 这两个常量直接控制 _evictTombstonesToSize/身份索引自检的探测窗口宽度：
+// 被调大 → 大列表下身份层探测按位置重算 getMessageIdentity（~µs/位置）退化为 O(n) 热路径；
+// 被调小 → 引用层/身份层探测窗覆盖不足，自检可能漏检原位替换。锁死当前契约值。
+check('IDENTITY_INDEX_REF_PROBE_WINDOW: 契约值锁定 32（引用层宽窗，纯指针比较）', () => {
+  assert.strictEqual(IDENTITY_INDEX_REF_PROBE_WINDOW, 32, '引用层宽窗被改动：确认性能/正确性权衡后再改此断言')
+})
+check('IDENTITY_INDEX_IDENTITY_PROBE_WINDOW: 契约值锁定 2（身份层窄窗，每位置重算 ~µs）', () => {
+  assert.strictEqual(IDENTITY_INDEX_IDENTITY_PROBE_WINDOW, 2, '身份层窄窗被改动：该值直接决定 O(窗宽) 重算成本')
+  assert.ok(IDENTITY_INDEX_IDENTITY_PROBE_WINDOW < IDENTITY_INDEX_REF_PROBE_WINDOW, '身份层窄窗必须严格小于引用层宽窗（窄窗逐位置重算、成本更高）')
+})
+
+// --- _releaseTombstoneLock（此前零覆盖）---
+// 语义：锁内容仍是自己写入的 token（等长且 timingSafeEqual 相同）才 unlink；ENOENT 静默；
+// 其余读盘错误同样忽略（锁清理非关键，不得抛出影响主流程）。
+check('_releaseTombstoneLock: 自己的 token 才删锁、他人 token 不删、ENOENT 与读盘错误均静默', () => {
+  const lockPath = '/mem/seen.release.lock'
+  const fsMock = makeMemFs()
+  let readShouldThrow = null
+  fsMock.readFileSync = (p) => {
+    if (readShouldThrow) throw readShouldThrow
+    if (!fsMock.files.has(p)) { const e = new Error('ENOENT: ' + p); e.code = 'ENOENT'; throw e }
+    return fsMock.files.get(p)
+  }
+  const { store: s } = makeBatchStore({ fsMock })
+  // 自己的 token → 删除
+  fsMock.files.set(lockPath, 'tok-1')
+  s._releaseTombstoneLock(lockPath, 'tok-1')
+  assert.strictEqual(fsMock.files.has(lockPath), false, '持有者释放必须删除锁文件')
+  assert.strictEqual(fsMock.ops.unlink.filter(p => p === lockPath).length, 1, '应恰好调用一次 unlinkSync')
+  // 他人 token → 不删（锁仍归原持有者，不得误清竞争者的锁）
+  fsMock.files.set(lockPath, 'other-holder')
+  s._releaseTombstoneLock(lockPath, 'tok-1')
+  assert.strictEqual(fsMock.files.get(lockPath), 'other-holder', 'token 不匹配不得删除他人锁')
+  assert.strictEqual(fsMock.ops.unlink.filter(p => p === lockPath).length, 1, 'token 不匹配时不得新增 unlink 调用')
+  // ENOENT → 静默（锁已被对方清理是正常竞态）
+  fsMock.files.delete(lockPath)
+  let threw = false
+  try { s._releaseTombstoneLock(lockPath, 'tok-1') } catch (e) { threw = true }
+  assert.strictEqual(threw, false, '锁已不存在必须静默返回')
+  // 其余读盘错误（如 EACCES）→ 同样静默，不得抛出阻塞主流程
+  readShouldThrow = Object.assign(new Error('EACCES: ' + lockPath), { code: 'EACCES' })
+  threw = false
+  try { s._releaseTombstoneLock(lockPath, 'tok-1') } catch (e) { threw = true }
+  assert.strictEqual(threw, false, '非 ENOENT 读盘错误也必须静默（锁清理非关键路径）')
+})
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

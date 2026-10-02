@@ -132,6 +132,29 @@ function test (name, fn) {
     assert.strictEqual(received, desp, '纯文本不应被清洗改写')
   })
 
+  // ===== R4-2/P3 非字符串归一（此前零覆盖）=====
+  // send() 入口对 text/desp 做 String() 归一：undefined/null → 空串（避免模板串输出 'undefined'）；
+  // Symbol/抛错 toString → try/catch 兜底为 ''。脏输入不得让推送主流程抛 TypeError。
+  await test('P3 send 非字符串归一：undefined/null → 空串，数字/对象 String() 化，Symbol 不抛', async () => {
+    let receivedText, receivedDesp
+    const p = createPusher({
+      Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
+      getNotify: async () => ({ sendNotify: async (t, d) => { receivedText = t; receivedDesp = d } })
+    })
+    await p.send(undefined, null)
+    assert.strictEqual(receivedText, '', 'undefined text 必须归一为空串（不得输出 "undefined"）')
+    assert.strictEqual(receivedDesp, '', 'null desp 必须归一为空串')
+    await p.send(123, { toString: () => 'obj-desp' })
+    assert.strictEqual(receivedText, '123', '数字按 String() 语义归一')
+    assert.strictEqual(receivedDesp, 'obj-desp', '对象保持 String() 语义（走 toString）')
+    const sym = Symbol('s')
+    await p.send(sym, { toString () { throw new Error('no') } })
+    // Symbol 的 String() 会得到 'Symbol(s)'（不抛）——契约是「不得抛 TypeError 中断主流程」，
+    // 而非归一为空串；抛错 toString 的 desp 才落到 catch 的空串兜底。
+    assert.strictEqual(receivedText, 'Symbol(s)', 'Symbol 经 String() 归一为可读文本（不抛错即可）')
+    assert.strictEqual(receivedDesp, '', '抛错 toString 的 desp 必须归一为空串')
+  })
+
   // ===== 超时顶层 code（审查 2026-08-15 P3）=====
   // 回归：超时 reject 的 error 必须能自描述。改动前只有 error.failures[].code，
   // 顶层 error.code 为 undefined（failures 为空时更无从判断失败原因是超时）。

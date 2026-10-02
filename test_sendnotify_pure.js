@@ -6,7 +6,7 @@
 // 覆盖：maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags
 const assert = require('node:assert')
 const fs = require('node:fs')
-const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, hasWxPusherConfigured } = require('./xbk_sendNotify_slim')
+const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, hasWxPusherConfigured, getWxPusherProfileSummary } = require('./xbk_sendNotify_slim')
 // 判定器同源（S1/F1/P1）与截断单一实现（S6/F7）回归的对拍对象
 const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
 const { createUtils } = require('./xbk_utils')
@@ -1151,5 +1151,45 @@ check('PlanC mdImagesToPlain: 未闭合且无可配平括号时原样保留（p6
 // --- cleanSurrogates（未导出 ⇒ 经 sendNotify 入口观测：入口必须清洗孤立代理）---
 // 该函数未导出，但其语义可由「sendNotify 对入参的清洗」间接锁定（见 test_sendnotify_utils.js 的通道用例）。
 // 此处不写不可达断言，登记为「需导出才可直接断言」。
+
+// --- getWxPusherProfileSummary（此前无任何测试覆盖）---
+// 语义：XBK_PROFILE!=='3' 时返回空数组；='3' 时返回内部统计 Map 的浅拷贝快照（对象隔离，不暴露内部引用）。
+// 注意：stats Map 为模块级单例，仅在 XBK_PROFILE='3' 时经 wxPusherProfileStat 填充，
+// 测试环境默认未设置该变量 → 只断言「非 profile 模式返回 []」与「开启后返回的是全新对象数组」，
+// 不依赖 Map 内历史内容（其他套件曾在子进程设置过 XBK_PROFILE 也不会影响本进程）。
+check('getWxPusherProfileSummary: XBK_PROFILE 未设置/非3 时返回空数组（profile 功能关闭）', () => {
+  const orig = process.env.XBK_PROFILE
+  try {
+    delete process.env.XBK_PROFILE
+    assert.deepStrictEqual(getWxPusherProfileSummary(), [], '未开启 profile 必须返回空数组')
+    process.env.XBK_PROFILE = '2'
+    assert.deepStrictEqual(getWxPusherProfileSummary(), [], "XBK_PROFILE='2' 不属于 summary 档（只有 '3' 汇总）")
+  } finally {
+    if (orig === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = orig
+  }
+})
+
+check('getWxPusherProfileSummary: 开启时返回快照且与内部状态对象隔离（返回 {...stat} 浅拷贝）', () => {
+  const orig = process.env.XBK_PROFILE
+  try {
+    process.env.XBK_PROFILE = '3'
+    const summary = getWxPusherProfileSummary()
+    assert.ok(Array.isArray(summary), '必须是数组')
+    for (const stat of summary) {
+      // 形状锁：七个统计字段齐全且为数字——新增/删除字段这里即红（与 printWxPusherProfileSummary 的打印字段同源）
+      for (const k of ['app', 'attempts', 'success', 'failed', 'rateLimited', 'networkError', 'apiError']) {
+        assert.ok(Object.prototype.hasOwnProperty.call(stat, k), `快照缺字段 ${k}`)
+      }
+      assert.strictEqual(typeof stat.app, 'string', 'app 应是 maskKey 后的字符串')
+      // 隔离性：改快照不得影响下一次读取（浅拷贝语义，防止调用方污染内部统计）
+      const before = JSON.stringify(summary)
+      stat.attempts = 999999
+      const again = getWxPusherProfileSummary()
+      assert.strictEqual(JSON.stringify(again), before, '修改快照不得影响内部状态（必须返回拷贝）')
+    }
+  } finally {
+    if (orig === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = orig
+  }
+})
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_sendnotify_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
