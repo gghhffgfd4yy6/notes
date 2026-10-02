@@ -6,7 +6,7 @@
 // 覆盖：maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags
 const assert = require('node:assert')
 const fs = require('node:fs')
-const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, hasWxPusherConfigured } = require('./xbk_sendNotify_slim')
+const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, hasWxPusherConfigured, getWxPusherProfileSummary, sendNotify } = require('./xbk_sendNotify_slim')
 // 判定器同源（S1/F1/P1）与截断单一实现（S6/F7）回归的对拍对象
 const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
 const { createUtils } = require('./xbk_utils')
@@ -15,7 +15,27 @@ const Utils = createUtils({ safeRe: (source, flags) => new RegExp(source, flags)
 let pass = 0
 let fail = 0
 function check (name, fn) {
-  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { fail++; console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
+  const ok = () => { pass++; console.log(`  ✅ ${name}`) }
+  const bad = (e) => { fail++; console.error(`  ❌ ${name}: ${e && e.message ? e.message : e}`); process.exitCode = 1 }
+  let r
+  try { r = fn() } catch (e) { bad(e); return }
+  // 异步感知：回调返回 promise 时，须等 settled 再计数，否则断言失败会以 unhandled rejection
+  // 逃逸出本函数的 try/catch，pass/fail 汇总失真（CodeRabbit PR #192 发现）。
+  if (r && typeof r.then === 'function') {
+    pendingAsyncChecks++
+    r.then(() => { ok(); settleAsync() }, (e) => { bad(e); settleAsync() })
+  } else {
+    ok()
+  }
+}
+// 末尾汇总须等全部异步用例 settled 再打印（同步脚本结束时 promise 可能尚未完成）
+let pendingAsyncChecks = 0
+function settleAsync () {
+  if (asyncWatchdog && pendingAsyncChecks === 1) clearTimeout(asyncWatchdog)
+  if (--pendingAsyncChecks === 0) printSuiteSummary()
+}
+function printSuiteSummary () {
+  console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_sendnotify_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
 }
 // 计时取多次最小值：屏蔽单次 GC/调度抖动，只服务于「不得退化」的量级断言（阈值极宽松）
 function bestMs (fn, runs = 3) {
@@ -1152,4 +1172,100 @@ check('PlanC mdImagesToPlain: 未闭合且无可配平括号时原样保留（p6
 // 该函数未导出，但其语义可由「sendNotify 对入参的清洗」间接锁定（见 test_sendnotify_utils.js 的通道用例）。
 // 此处不写不可达断言，登记为「需导出才可直接断言」。
 
-console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_sendnotify_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
+// --- getWxPusherProfileSummary（此前无任何测试覆盖）---
+// 语义：XBK_PROFILE!=='3' 时返回空数组；='3' 时返回内部统计 Map 的浅拷贝快照（对象隔离，不暴露内部引用）。
+// 注意：stats Map 为模块级单例，仅在 XBK_PROFILE='3' 时经 wxPusherProfileStat 填充，
+// 测试环境默认未设置该变量 → 只断言「非 profile 模式返回 []」与「开启后返回的是全新对象数组」，
+// 不依赖 Map 内历史内容（其他套件曾在子进程设置过 XBK_PROFILE 也不会影响本进程）。
+check('getWxPusherProfileSummary: XBK_PROFILE 未设置/非3 时返回空数组（profile 功能关闭）', () => {
+  const orig = process.env.XBK_PROFILE
+  try {
+    delete process.env.XBK_PROFILE
+    assert.deepStrictEqual(getWxPusherProfileSummary(), [], '未开启 profile 必须返回空数组')
+    process.env.XBK_PROFILE = '2'
+    assert.deepStrictEqual(getWxPusherProfileSummary(), [], "XBK_PROFILE='2' 不属于 summary 档（只有 '3' 汇总）")
+  } finally {
+    if (orig === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = orig
+  }
+})
+
+check('getWxPusherProfileSummary: 开启时返回快照且与内部状态对象隔离（返回 {...stat} 浅拷贝）', () => {
+  const orig = process.env.XBK_PROFILE
+  const got = require('got')
+  const { EventEmitter } = require('node:events')
+  const origGot = { post: got.post, get: got.get, stream: got.stream }
+  const cfgKeys = ['WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_pusher_channels']
+  const savedCfg = cfgKeys.map(k => [k, push_config[k]])
+  // restoreEnv：恢复 got / push_config / XBK_PROFILE。Map 本身未导出、无法直接 clear；
+  // 残留条目的 key 是原始 appToken（本用例为 'AT_test123' 占位符），且仅在 XBK_PROFILE='3'
+  // 时对任何读取者可见（getWxPusherProfileSummary/printWxPusherProfileSummary 首行即拦截），
+  // 恢复 env 后即对外不可见——无同套件污染风险，无需生产端加清理口。
+  const restoreEnv = () => {
+    Object.assign(got, origGot)
+    for (const [k, v] of savedCfg) { if (v === undefined) delete push_config[k]; else push_config[k] = v }
+    if (orig === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = orig
+  }
+  try {
+    // arrange：经生产路径（sendNotify → wxPusher 通道 → wxPusherProfileStat）填入一条真实统计，
+    // 避免「空 Map 下循环不执行、断言空洞」——Sourcery PR #192 发现的问题。
+    // got.stream 假流回 {code:1000}（成功），不触网；其余通道不配置。
+    for (const k of cfgKeys) delete push_config[k]
+    push_config.WX_pusher_appToken = 'AT_test123'
+    push_config.WX_pusher_topicIds = '5'
+    process.env.XBK_PROFILE = '3'
+    const makeMockStream = () => {
+      const s = new EventEmitter()
+      s.timings = { phases: { total: 1 } }
+      s.destroy = () => {}
+      setTimeout(() => {
+        s.emit('response', { statusCode: 200, headers: { 'content-type': 'application/json' } })
+        s.emit('data', Buffer.from('{"code":1000}'))
+        s.emit('end')
+      }, 0)
+      return s
+    }
+    const mockPost = () => Promise.resolve({ body: '{}', statusCode: 200, headers: {}, timings: { phases: {} } })
+    got.post = mockPost
+    got.get = mockPost
+    got.stream = Object.assign(makeMockStream, { get: makeMockStream, post: makeMockStream })
+    return Promise.resolve()
+      .then(() => sendNotify('快照隔离探针', '正文'))
+      .then(() => {
+        const summary = getWxPusherProfileSummary()
+        assert.strictEqual(summary.length, 1, '经生产路径应恰好记录 1 个 app 的统计')
+        const stat = summary[0]
+        // 形状锁：七个统计字段齐全——新增/删除字段这里即红（与 printWxPusherProfileSummary 的打印字段同源）
+        for (const k of ['app', 'attempts', 'success', 'failed', 'rateLimited', 'networkError', 'apiError']) {
+          assert.ok(Object.prototype.hasOwnProperty.call(stat, k), `快照缺字段 ${k}`)
+        }
+        assert.strictEqual(stat.attempts, 1, 'attempts 应为 1')
+        assert.strictEqual(stat.success, 1, 'success 路径应计 1 次成功')
+        assert.strictEqual(stat.failed, 0, '失败计数应为 0')
+        assert.strictEqual(typeof stat.app, 'string', 'app 应是 maskKey 后的字符串')
+        assert.ok(stat.app.startsWith('AT_t') && stat.app.endsWith('23'), 'app 必须经 maskKey 脱敏（不得回显完整 token）')
+        // 隔离性：改快照不得影响下一次读取（浅拷贝语义，防止调用方污染内部统计）
+        const before = JSON.stringify(getWxPusherProfileSummary())
+        stat.attempts = 999999
+        assert.strictEqual(JSON.stringify(getWxPusherProfileSummary()), before, '修改快照不得影响内部状态（必须返回拷贝）')
+      })
+      .finally(() => {
+        restoreEnv()
+      })
+  } catch (e) {
+    restoreEnv()
+    throw e
+  }
+})
+
+// 假绿防护：若有异步用例永不 settled（如 mock 流在发事件前抛错），事件循环会保持空转、node 静默
+// 挂着不退出或排空后 exit 0 且不打印汇总。看门狗必须在全部 check 注册之后再启动（否则
+// pendingAsyncChecks 还是 0，看门狗会是 null）——故放文件末尾。5s 仍有未决用例则判失败并打印汇总。
+const asyncWatchdog = pendingAsyncChecks > 0
+  ? setTimeout(() => {
+    if (pendingAsyncChecks > 0) {
+      console.error(`  ❌ ${pendingAsyncChecks} 个异步用例 5s 内未 settle（可能 mock 未发事件），判定为失败`); process.exitCode = 1
+      printSuiteSummary()
+    }
+  }, 5000)
+  : null
+if (pendingAsyncChecks === 0) printSuiteSummary()

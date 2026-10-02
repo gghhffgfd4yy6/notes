@@ -5,6 +5,7 @@
 //       isDangerousUrl/validUrl/normUrl/_decodeCssEscapes/hasValidId/anonKey/safeErrorText
 const assert = require('node:assert')
 const { createUtils } = require('./xbk_utils')
+const { trimTrailingSlashes } = require('./xbk_utils')
 
 const safeRe = (src, flags) => new RegExp(src, flags)
 const Utils = createUtils({ safeRe })
@@ -2120,6 +2121,87 @@ check('PlanR parseTime: 布尔/对象等脏输入必须安全返回 null 不抛'
   assert.strictEqual(u.parseTime(true), null, '布尔必须返回 null')
   assert.strictEqual(u.parseTime({}), null, '对象必须返回 null（不得抛）')
   assert.strictEqual(u.parseTime([]), null, '空数组必须返回 null')
+})
+
+// --- 已导出常量守护（此前无任何断言；这些常量被 daysFrom/_decodeNumeric/sanitizeSurrogates 等热路径依赖）---
+// 顶层常量经模块导出，直接 require 引入（与 createUtils 的实例方法解耦）
+const { DAY_MS, MAX_CODE_POINT, SURROGATE_LO, SURROGATE_HI } = require('./xbk_utils')
+check('常量: DAY_MS=86400000（daysFrom/注册天数计算的日界）', () => {
+  assert.strictEqual(DAY_MS, 86400000, 'DAY_MS 漂移会整体平移天数差计算')
+  assert.strictEqual(DAY_MS, 24 * 60 * 60 * 1000, '必须等于一天的毫秒数')
+})
+check('常量: MAX_CODE_POINT / SURROGATE_LO / SURROGATE_HI 与 Unicode 边界一致（_decodeNumeric 依赖）', () => {
+  assert.strictEqual(MAX_CODE_POINT, 0x10FFFF, 'Unicode 最大码点漂移会让合法实体被当原文保留')
+  assert.strictEqual(SURROGATE_LO, 0xD800, '代理区下界漂移会让代理码点被 String.fromCodePoint 非法构造')
+  assert.strictEqual(SURROGATE_HI, 0xDFFF, '代理区上界漂移同上')
+})
+check('常量与行为联动: _decodeNumeric 按 MAX_CODE_POINT/SURROGATE 区间过滤（区间守卫语义回归）', () => {
+  // 合法最大码点可解码；超界/代理区/NUL 走原文或空——锁「常量改变必须连带改变行为」而非死值
+  assert.strictEqual(Utils._decodeNumeric(0x10FFFF, 'RAW'), String.fromCodePoint(0x10FFFF), '合法最大码点必须解码')
+  assert.strictEqual(Utils._decodeNumeric(0x110000, 'RAW'), 'RAW', '超出 MAX_CODE_POINT 必须保留原文')
+  assert.strictEqual(Utils._decodeNumeric(0xD800, 'RAW'), 'RAW', '高代理码点必须保留原文（不得 fromCodePoint）')
+  assert.strictEqual(Utils._decodeNumeric(0xDFFF, 'RAW'), 'RAW', '低代理码点必须保留原文')
+  assert.strictEqual(Utils._decodeNumeric(0, 'RAW'), '', 'NUL 实体必须过滤为空串')
+  assert.strictEqual(Utils._decodeNumeric(-1, 'RAW'), 'RAW', '负数必须保留原文')
+})
+
+// --- 此前零覆盖的方法回归（safeSet/safeObjectCopy/trimTrailingSlashes/_parseDashDate/addIndex）---
+check('safeSet: 常规写入 true；frozen 对象/setter 抛错返回 false；null 与函数目标的边界', () => {
+  const o = {}
+  assert.strictEqual(Utils.safeSet(o, 'a', 1), true, '普通对象写入必须成功')
+  assert.strictEqual(o.a, 1, '写入必须生效')
+  assert.strictEqual(Utils.safeSet(Object.freeze({ x: 1 }), 'x', 2), false, '不可扩展对象 setter 抛错必须返回 false 不上抛')
+  const evil = {}
+  Object.defineProperty(evil, 'boom', { configurable: true, get () { return 0 }, set () { throw new Error('no') } })
+  assert.strictEqual(Utils.safeSet(evil, 'boom', 1), false, 'setter 抛错必须吞掉并返回 false（不破坏整批处理）')
+  assert.strictEqual(Utils.safeSet(null, 'x', 2), true, 'null 目标按契约返回 true（无操作）')
+  const fn = () => {}
+  assert.strictEqual(Utils.safeSet(fn, 'x', 2), true, '函数目标也允许挂属性')
+  assert.strictEqual(fn.x, 2, '函数目标写入必须生效')
+})
+
+check('safeObjectCopy: 浅复制并隔离异常 getter；循环引用安全；函数/脏输入边界', () => {
+  const evil = { ok: 1 }
+  Object.defineProperty(evil, 'bad', { enumerable: true, get () { throw new Error('x') } })
+  const out = Utils.safeObjectCopy(evil)
+  assert.strictEqual(out.ok, 1, '正常字段必须复制')
+  assert.strictEqual('bad' in out, false, '抛错 getter 必须被跳过（不得让脏字段破坏调用方）')
+  const cyc = { a: 1 }
+  cyc.self = cyc
+  const out2 = Utils.safeObjectCopy(cyc)
+  assert.strictEqual(out2.a, 1, '循环引用对象正常字段仍复制')
+  assert.strictEqual(out2.self, cyc, '浅复制语义：self 仍指向原对象（不深拷贝）')
+  const f = () => {}
+  f.x = 5
+  assert.strictEqual(Utils.safeObjectCopy(f).x, 5, '函数目标按 Object.keys 复制自有属性')
+  assert.deepStrictEqual(Utils.safeObjectCopy(null), {}, 'null → 空对象')
+  assert.strictEqual(Object.keys(Utils.safeObjectCopy('str')).length, 0, '字符串（非对象非函数）→ 空对象')
+})
+
+check('trimTrailingSlashes: 去尾部斜杠、空串与纯斜杠归空、中间斜杠不动', () => {
+  assert.strictEqual(trimTrailingSlashes('https://a.com/'), 'https://a.com', '单个尾斜杠必须去除')
+  assert.strictEqual(trimTrailingSlashes('https://a.com///'), 'https://a.com', '连续尾斜杠必须全部去除')
+  assert.strictEqual(trimTrailingSlashes(''), '', '空串安全')
+  assert.strictEqual(trimTrailingSlashes('///'), '', '纯斜杠归空（不残留）')
+  assert.strictEqual(trimTrailingSlashes('/x'), '/x', '非斜杠结尾原样返回（同引用语义不强制，值必须相等）')
+})
+
+check('_parseDashDate: 合法日期 UTC 解析、宿主滚动日期拒绝为 null、畸形串 undefined', () => {
+  assert.strictEqual(Utils._parseDashDate('2026-08-01'), Date.UTC(2026, 7, 1), '标准 dash 日期按 UTC 解析')
+  assert.strictEqual(Utils._parseDashDate('2026-8-1'), Date.UTC(2026, 7, 1), '单位数月日必须被 \\d{1,2} 接受（与 slash/ISO 分支同口径）')
+  assert.strictEqual(Utils._parseDashDate('2026-02-31'), null, '2026-02-31 会被宿主滚动到 3 月——回读校验必须判 null（不得静默换月）')
+  assert.strictEqual(Utils._parseDashDate('bogus'), undefined, '不匹配的串必须返回 undefined 交由下一解析分支（null 与 undefined 语义不同）')
+})
+
+check('addIndex: 空 key 忽略、同 key 累积成集合（索引化判重的底座）', () => {
+  const map = new Map()
+  Utils.addIndex(map, 'k1', 'v1')
+  Utils.addIndex(map, 'k1', 'v2')
+  Utils.addIndex(map, '', 'v0')
+  Utils.addIndex(map, null, 'v0')
+  assert.strictEqual(map.size, 1, '空/假 key 不得建立索引条目')
+  const set = map.get('k1')
+  assert.ok(set.has('v1') && set.has('v2'), '同 key 的多个值必须都进集合')
 })
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
