@@ -15,7 +15,26 @@ const Utils = createUtils({ safeRe: (source, flags) => new RegExp(source, flags)
 let pass = 0
 let fail = 0
 function check (name, fn) {
-  try { fn(); pass++; console.log(`  ✅ ${name}`) } catch (e) { fail++; console.error(`  ❌ ${name}: ${e.message}`); process.exitCode = 1 }
+  const ok = () => { pass++; console.log(`  ✅ ${name}`) }
+  const bad = (e) => { fail++; console.error(`  ❌ ${name}: ${e && e.message ? e.message : e}`); process.exitCode = 1 }
+  let r
+  try { r = fn() } catch (e) { bad(e); return }
+  // 异步感知：回调返回 promise 时，须等 settled 再计数，否则断言失败会以 unhandled rejection
+  // 逃逸出本函数的 try/catch，pass/fail 汇总失真（CodeRabbit PR #192 发现）。
+  if (r && typeof r.then === 'function') {
+    pendingAsyncChecks++
+    r.then(() => { ok(); settleAsync() }, (e) => { bad(e); settleAsync() })
+  } else {
+    ok()
+  }
+}
+// 末尾汇总须等全部异步用例 settled 再打印（同步脚本结束时 promise 可能尚未完成）
+let pendingAsyncChecks = 0
+function settleAsync () {
+  if (--pendingAsyncChecks === 0) printSuiteSummary()
+}
+function printSuiteSummary () {
+  console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_sendnotify_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
 }
 // 计时取多次最小值：屏蔽单次 GC/调度抖动，只服务于「不得退化」的量级断言（阈值极宽松）
 function bestMs (fn, runs = 3) {
@@ -1232,4 +1251,4 @@ check('getWxPusherProfileSummary: 开启时返回快照且与内部状态对象�
   }
 })
 
-console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_sendnotify_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
+if (pendingAsyncChecks === 0) printSuiteSummary()
