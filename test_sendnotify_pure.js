@@ -6,7 +6,7 @@
 // 覆盖：maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags
 const assert = require('node:assert')
 const fs = require('node:fs')
-const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, hasWxPusherConfigured, getWxPusherProfileSummary } = require('./xbk_sendNotify_slim')
+const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, hasWxPusherConfigured, getWxPusherProfileSummary, sendNotify } = require('./xbk_sendNotify_slim')
 // 判定器同源（S1/F1/P1）与截断单一实现（S6/F7）回归的对拍对象
 const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
 const { createUtils } = require('./xbk_utils')
@@ -1171,24 +1171,64 @@ check('getWxPusherProfileSummary: XBK_PROFILE 未设置/非3 时返回空数组�
 
 check('getWxPusherProfileSummary: 开启时返回快照且与内部状态对象隔离（返回 {...stat} 浅拷贝）', () => {
   const orig = process.env.XBK_PROFILE
+  const got = require('got')
+  const { EventEmitter } = require('node:events')
+  const origGot = { post: got.post, get: got.get, stream: got.stream }
+  const cfgKeys = ['WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_pusher_channels']
+  const savedCfg = cfgKeys.map(k => [k, push_config[k]])
   try {
+    // arrange：经生产路径（sendNotify → wxPusher 通道 → wxPusherProfileStat）填入一条真实统计，
+    // 避免「空 Map 下循环不执行、断言空洞」——Sourcery PR #192 发现的问题。
+    // got.stream 假流回 {code:1000}（成功），不触网；其余通道不配置。
+    for (const k of cfgKeys) delete push_config[k]
+    push_config.WX_pusher_appToken = 'AT_test123'
+    push_config.WX_pusher_topicIds = '5'
     process.env.XBK_PROFILE = '3'
-    const summary = getWxPusherProfileSummary()
-    assert.ok(Array.isArray(summary), '必须是数组')
-    for (const stat of summary) {
-      // 形状锁：七个统计字段齐全且为数字——新增/删除字段这里即红（与 printWxPusherProfileSummary 的打印字段同源）
-      for (const k of ['app', 'attempts', 'success', 'failed', 'rateLimited', 'networkError', 'apiError']) {
-        assert.ok(Object.prototype.hasOwnProperty.call(stat, k), `快照缺字段 ${k}`)
-      }
-      assert.strictEqual(typeof stat.app, 'string', 'app 应是 maskKey 后的字符串')
-      // 隔离性：改快照不得影响下一次读取（浅拷贝语义，防止调用方污染内部统计）
-      const before = JSON.stringify(summary)
-      stat.attempts = 999999
-      const again = getWxPusherProfileSummary()
-      assert.strictEqual(JSON.stringify(again), before, '修改快照不得影响内部状态（必须返回拷贝）')
+    const makeMockStream = () => {
+      const s = new EventEmitter()
+      s.timings = { phases: { total: 1 } }
+      s.destroy = () => {}
+      setTimeout(() => {
+        s.emit('response', { statusCode: 200, headers: { 'content-type': 'application/json' } })
+        s.emit('data', Buffer.from('{"code":1000}'))
+        s.emit('end')
+      }, 0)
+      return s
     }
-  } finally {
+    const mockPost = () => Promise.resolve({ body: '{}', statusCode: 200, headers: {}, timings: { phases: {} } })
+    got.post = mockPost
+    got.get = mockPost
+    got.stream = Object.assign(makeMockStream, { get: makeMockStream, post: makeMockStream })
+    return Promise.resolve()
+      .then(() => sendNotify('快照隔离探针', '正文'))
+      .then(() => {
+        const summary = getWxPusherProfileSummary()
+        assert.strictEqual(summary.length, 1, '经生产路径应恰好记录 1 个 app 的统计')
+        const stat = summary[0]
+        // 形状锁：七个统计字段齐全——新增/删除字段这里即红（与 printWxPusherProfileSummary 的打印字段同源）
+        for (const k of ['app', 'attempts', 'success', 'failed', 'rateLimited', 'networkError', 'apiError']) {
+          assert.ok(Object.prototype.hasOwnProperty.call(stat, k), `快照缺字段 ${k}`)
+        }
+        assert.strictEqual(stat.attempts, 1, 'attempts 应为 1')
+        assert.strictEqual(stat.success, 1, 'success 路径应计 1 次成功')
+        assert.strictEqual(stat.failed, 0, '失败计数应为 0')
+        assert.strictEqual(typeof stat.app, 'string', 'app 应是 maskKey 后的字符串')
+        assert.ok(stat.app.startsWith('AT_t') && stat.app.endsWith('23'), 'app 必须经 maskKey 脱敏（不得回显完整 token）')
+        // 隔离性：改快照不得影响下一次读取（浅拷贝语义，防止调用方污染内部统计）
+        const before = JSON.stringify(getWxPusherProfileSummary())
+        stat.attempts = 999999
+        assert.strictEqual(JSON.stringify(getWxPusherProfileSummary()), before, '修改快照不得影响内部状态（必须返回拷贝）')
+      })
+      .finally(() => {
+        Object.assign(got, origGot)
+        for (const [k, v] of savedCfg) { if (v === undefined) delete push_config[k]; else push_config[k] = v }
+        if (orig === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = orig
+      })
+  } catch (e) {
+    Object.assign(got, origGot)
+    for (const [k, v] of savedCfg) { if (v === undefined) delete push_config[k]; else push_config[k] = v }
     if (orig === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = orig
+    throw e
   }
 })
 
