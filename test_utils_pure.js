@@ -2179,8 +2179,8 @@ check('safeObjectCopy: 浅复制并隔离异常 getter；循环引用安全；�
 })
 
 check('trimTrailingSlashes: 去尾部斜杠、空串与纯斜杠归空、中间斜杠不动', () => {
-  assert.strictEqual(trimTrailingSlashes('http://a.com/'), 'http://a.com', '单个尾斜杠必须去除')
-  assert.strictEqual(trimTrailingSlashes('http://a.com///'), 'http://a.com', '连续尾斜杠必须全部去除')
+  assert.strictEqual(trimTrailingSlashes('https://a.com/'), 'https://a.com', '单个尾斜杠必须去除')
+  assert.strictEqual(trimTrailingSlashes('https://a.com///'), 'https://a.com', '连续尾斜杠必须全部去除')
   assert.strictEqual(trimTrailingSlashes(''), '', '空串安全')
   assert.strictEqual(trimTrailingSlashes('///'), '', '纯斜杠归空（不残留）')
   assert.strictEqual(trimTrailingSlashes('/x'), '/x', '非斜杠结尾原样返回（同引用语义不强制，值必须相等）')
