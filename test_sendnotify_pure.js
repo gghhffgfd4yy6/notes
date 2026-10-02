@@ -31,6 +31,7 @@ function check (name, fn) {
 // 末尾汇总须等全部异步用例 settled 再打印（同步脚本结束时 promise 可能尚未完成）
 let pendingAsyncChecks = 0
 function settleAsync () {
+  if (asyncWatchdog && pendingAsyncChecks === 1) clearTimeout(asyncWatchdog)
   if (--pendingAsyncChecks === 0) printSuiteSummary()
 }
 function printSuiteSummary () {
@@ -1195,6 +1196,15 @@ check('getWxPusherProfileSummary: 开启时返回快照且与内部状态对象�
   const origGot = { post: got.post, get: got.get, stream: got.stream }
   const cfgKeys = ['WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_pusher_channels']
   const savedCfg = cfgKeys.map(k => [k, push_config[k]])
+  // restoreEnv：恢复 got / push_config / XBK_PROFILE。Map 本身未导出、无法直接 clear；
+  // 残留条目的 key 是原始 appToken（本用例为 'AT_test123' 占位符），且仅在 XBK_PROFILE='3'
+  // 时对任何读取者可见（getWxPusherProfileSummary/printWxPusherProfileSummary 首行即拦截），
+  // 恢复 env 后即对外不可见——无同套件污染风险，无需生产端加清理口。
+  const restoreEnv = () => {
+    Object.assign(got, origGot)
+    for (const [k, v] of savedCfg) { if (v === undefined) delete push_config[k]; else push_config[k] = v }
+    if (orig === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = orig
+  }
   try {
     // arrange：经生产路径（sendNotify → wxPusher 通道 → wxPusherProfileStat）填入一条真实统计，
     // 避免「空 Map 下循环不执行、断言空洞」——Sourcery PR #192 发现的问题。
@@ -1239,16 +1249,23 @@ check('getWxPusherProfileSummary: 开启时返回快照且与内部状态对象�
         assert.strictEqual(JSON.stringify(getWxPusherProfileSummary()), before, '修改快照不得影响内部状态（必须返回拷贝）')
       })
       .finally(() => {
-        Object.assign(got, origGot)
-        for (const [k, v] of savedCfg) { if (v === undefined) delete push_config[k]; else push_config[k] = v }
-        if (orig === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = orig
+        restoreEnv()
       })
   } catch (e) {
-    Object.assign(got, origGot)
-    for (const [k, v] of savedCfg) { if (v === undefined) delete push_config[k]; else push_config[k] = v }
-    if (orig === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = orig
+    restoreEnv()
     throw e
   }
 })
 
+// 假绿防护：若有异步用例永不 settled（如 mock 流在发事件前抛错），事件循环会保持空转、node 静默
+// 挂着不退出或排空后 exit 0 且不打印汇总。看门狗必须在全部 check 注册之后再启动（否则
+// pendingAsyncChecks 还是 0，看门狗会是 null）——故放文件末尾。5s 仍有未决用例则判失败并打印汇总。
+const asyncWatchdog = pendingAsyncChecks > 0
+  ? setTimeout(() => {
+    if (pendingAsyncChecks > 0) {
+      console.error(`  ❌ ${pendingAsyncChecks} 个异步用例 5s 内未 settle（可能 mock 未发事件），判定为失败`); process.exitCode = 1
+      printSuiteSummary()
+    }
+  }, 5000)
+  : null
 if (pendingAsyncChecks === 0) printSuiteSummary()
