@@ -193,7 +193,14 @@ check('_normalizeReportState 逐字段走 _safeCounter 且未知键被丢弃', (
     extra: 'ignored'
   })
   assert.deepStrictEqual(got, {
-    date: '2024-01-01', runs: 5, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: Number.MAX_SAFE_INTEGER
+    date: '2024-01-01',
+    runs: 5,
+    total: 0,
+    dedup: 0,
+    filtered: 0,
+    pushed: 0,
+    failed: 0,
+    truncated: Number.MAX_SAFE_INTEGER
   })
 })
 check('_normalizeReportState date 非字符串归为空串', () => {
@@ -1051,7 +1058,14 @@ checkAsync('_sendCrossDayReport 完整路径：标题/正文逐字符精确 + �
     pending: { date: '', runs: 2, total: 12, dedup: 23, filtered: 34, pushed: 45, failed: 56, truncated: 67 }
   })
   assert.deepStrictEqual(JSON.parse(stateWrites[1][1]), {
-    date: '2024-01-02', runs: 2, total: 12, dedup: 23, filtered: 34, pushed: 45, failed: 56, truncated: 67
+    date: '2024-01-02',
+    runs: 2,
+    total: 12,
+    dedup: 23,
+    filtered: 34,
+    pushed: 45,
+    failed: 56,
+    truncated: 67
   })
   // 杀 `{...state, pending: {...pending}}` 的浅拷贝被删：原 state 的 pending 不得被累计修改
   assert.deepStrictEqual(state.pending, pending)
@@ -1080,7 +1094,14 @@ checkAsync('_sendCrossDayReport truncated=0 侧：状态与 pending 都不带「
     '运行 0 轮 | 推送 0 条 | 失败 0 条\n\n获取 0 | 去重 0 | 过滤 0\n\n今日待结转：运行 1 轮 | 推送 0 条 | 失败 0 条\n获取 0 | 去重 0 | 过滤 0'
   ]])
   assert.deepStrictEqual(JSON.parse(stateWrites[1][1]), {
-    date: '2024-03-01', runs: 1, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0
+    date: '2024-03-01',
+    runs: 1,
+    total: 0,
+    dedup: 0,
+    filtered: 0,
+    pushed: 0,
+    failed: 0,
+    truncated: 0
   })
 })
 
@@ -1094,7 +1115,14 @@ checkAsync('_sendCrossDayReport 缺 pending ⇒ 以空累计起算（state.pendi
   ]])
   assert.strictEqual(state.pending, undefined, '原 state 不得被凭空补上 pending')
   assert.deepStrictEqual(JSON.parse(stateWrites[1][1]), {
-    date: '2024-01-02', runs: 1, total: 4, dedup: 0, filtered: 0, pushed: 5, failed: 0, truncated: 0
+    date: '2024-01-02',
+    runs: 1,
+    total: 4,
+    dedup: 0,
+    filtered: 0,
+    pushed: 5,
+    failed: 0,
+    truncated: 0
   })
 })
 
@@ -1169,7 +1197,14 @@ checkAsync('_updateReport 同日 ⇒ 就地累加并持久化，日期不变（s
   await app._updateReport(SUMMARY1)
   assert.deepStrictEqual(calls.cross, [])
   assert.deepStrictEqual(calls.persist, [[REPORT_PATH, {
-    date: '2024-01-02', runs: 3, total: 11, dedup: 22, filtered: 33, pushed: 44, failed: 55, truncated: 66
+    date: '2024-01-02',
+    runs: 3,
+    total: 11,
+    dedup: 22,
+    filtered: 33,
+    pushed: 44,
+    failed: 55,
+    truncated: 66
   }]])
 })
 
@@ -1181,7 +1216,14 @@ checkAsync('_updateReport date 为空 ⇒ 补上今日再累计（!state.date �
   await app._updateReport(SUMMARY1)
   assert.deepStrictEqual(calls.cross, [])
   assert.deepStrictEqual(calls.persist, [[REPORT_PATH, {
-    date: '2024-01-02', runs: 1, total: 1, dedup: 2, filtered: 3, pushed: 4, failed: 5, truncated: 6
+    date: '2024-01-02',
+    runs: 1,
+    total: 1,
+    dedup: 2,
+    filtered: 3,
+    pushed: 4,
+    failed: 5,
+    truncated: 6
   }]])
 })
 
@@ -1208,7 +1250,14 @@ checkAsync('_updateReport 跨天但计数全 0 ⇒ 不发明报，结转后累�
   // 杀 > 0 → >= 0：全 0 会被误判「有计数」而错发空日报
   assert.deepStrictEqual(calls.cross, [])
   assert.deepStrictEqual(calls.persist, [[REPORT_PATH, {
-    date: '2024-01-02', runs: 1, total: 1, dedup: 2, filtered: 3, pushed: 4, failed: 5, truncated: 6
+    date: '2024-01-02',
+    runs: 1,
+    total: 1,
+    dedup: 2,
+    filtered: 3,
+    pushed: 4,
+    failed: 5,
+    truncated: 6
   }]])
 })
 
@@ -1253,7 +1302,14 @@ checkAsync('_updateReport 跨天结转 pending 各字段用 || 0 兜底（pendin
   await app._updateReport(SUMMARY1)
   assert.deepStrictEqual(calls.cross, [])
   assert.deepStrictEqual(calls.persist, [[REPORT_PATH, {
-    date: '2024-01-02', runs: 1, total: 1, dedup: 2, filtered: 3, pushed: 4, failed: 5, truncated: 6
+    date: '2024-01-02',
+    runs: 1,
+    total: 1,
+    dedup: 2,
+    filtered: 3,
+    pushed: 4,
+    failed: 5,
+    truncated: 6
   }]])
 })
 
@@ -1635,3 +1691,507 @@ checkAsync('_sendAlert 留痕把连续换行折叠成一个空格（+ 量词与�
   }
   process.exit(0)
 })().catch(e => { console.error(e); process.exitCode = 1 })
+
+// ===== RE2 缺失警告簇（RE2 警告标记生命周期：pending→completed/回收/7天清理）=====
+// 全部经 makeApp 注入的内存 fs 桩运行，不触碰真实缓存目录。
+// 锁契约：openSync 'wx' 独占创建；EEXIST 且陈旧且持有进程已退出才抢占。
+// 标记契约：pending+已退出进程=残留可回收；completed 永不回收；解析失败保守保留。
+
+// 内存 fs 桩：支持本簇用到的 API（existsSync/openSync/writeSync/closeSync/statSync/
+// unlinkSync/readFileSync/readdirSync/writeFileSync），按路径键存内容与 mtime。
+function makeMemFs () {
+  const files = new Map() // path -> { content, mtime, fd }
+  let nextFd = 10
+  const now = () => Date.now()
+  const fs = {
+    existsSync: (p) => files.has(String(p)),
+    openSync: (p, flags) => {
+      p = String(p)
+      if (flags === 'wx') {
+        if (files.has(p)) { const e = new Error('EEXIST'); e.code = 'EEXIST'; throw e }
+        const fd = nextFd++
+        files.set(p, { content: '', mtime: now(), fd })
+        return fd
+      }
+      if (flags === 'r' || flags === undefined) {
+        if (!files.has(p)) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e }
+        files.get(p).fd = nextFd++
+        return files.get(p).fd
+      }
+      const e = new Error('unsupported flags ' + flags); e.code = 'EINVAL'; throw e
+    },
+    writeSync: (fd, text) => {
+      for (const [, f] of files) if (f.fd === fd) { f.content += String(text); return String(text).length }
+      throw Object.assign(new Error('EBADF'), { code: 'EBADF' })
+    },
+    closeSync: (fd) => { /* fd 保留在 files 中（锁文件内容可读） */ },
+    statSync: (p) => {
+      p = String(p)
+      if (!files.has(p)) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+      return { mtimeMs: files.get(p).mtime }
+    },
+    unlinkSync: (p) => {
+      p = String(p)
+      if (!files.has(p)) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+      files.delete(p)
+    },
+    readFileSync: (p) => {
+      p = String(p)
+      if (!files.has(p)) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+      return files.get(p).content
+    },
+    readdirSync: (dir) => {
+      const names = []
+      const dirPrefix = String(dir).replace(/\/+$/, '') + '/'
+      for (const p of files.keys()) {
+        if (!p.startsWith(dirPrefix)) continue
+        const base = p.slice(dirPrefix.length)
+        if (base.includes('/')) continue
+        names.push(base)
+      }
+      return names
+    },
+    writeFileSync: (p, text) => { files.set(String(p), { content: String(text), mtime: now(), fd: nextFd++ }) },
+    renameSync: (a, b) => { if (!files.has(String(a))) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); files.set(String(b), files.get(String(a))); files.delete(String(a)) },
+    _files: files,
+    _touch: (p, mtimeMs) => { if (files.has(String(p))) files.get(String(p)).mtime = mtimeMs }
+  }
+  return fs
+}
+
+// 构造带内存 fs 的 app：MessageStore 提供 cacheDir 与 _getTombstoneProcessStart/_isTombstoneLockProcessAlive 桩
+function makeRe2App ({ fs, cacheDir = '/memcache', processStart = '123', processAlive = () => false }) {
+  return createApp({
+    Config: {},
+    Utils: { safeErrorText: (e, d) => String((e && e.message) || d) },
+    Formatter: {},
+    RuleEngine: {},
+    FilterEngine: {},
+    MessageStore: {
+      cacheDir,
+      _getTombstoneProcessStart: () => processStart,
+      _isTombstoneLockProcessAlive: () => processAlive()
+    },
+    Network: {},
+    Pusher: {},
+    fs,
+    path: require('path'),
+    crypto: require('crypto'),
+    readSafeTextResult: () => ({ status: 'missing', text: '' }),
+    writeAtomic: () => true,
+    isRegularOrMissing: () => true,
+    STATE_TEXT_MAX_BYTES: 262144,
+    DEFAULT_MAX_SIZE: 1048576,
+    RE2C: null,
+    RE2_WARN_STATE_FILE: 're2warn.state',
+    RE2_MISSING_WARNING: '[re2 缺失提醒]',
+    summarizeError: () => '',
+    PROFILE3: false,
+    PROFILE3_BOOT_MARKS: [],
+    prewarmDns: () => {},
+    prewarmTls: () => {},
+    getNotify: () => null,
+    PKG_VERSION: '0.0.0',
+    trimTrailingSlashes: (s) => s,
+    compileUserRegex: () => {}
+  })
+}
+
+const os = require('os')
+
+check('RE2 警告: RE2C 可用时只清理残留标记、不发警告', () => {
+  const mfs = makeMemFs()
+  const dir = os.tmpdir()
+  mfs.writeFileSync(dir + '/re2warn.state.2026-01-01', '{"status":"pending","pid":1}')
+  const app = makeRe2App({ fs: mfs, cacheDir: dir })
+  app.RE2C = { re: () => {} } // RE2C 可用：createApp 里是解构传入，这里直接改不行——经构造参数
+  // createApp 已把 RE2C 解构捕获，改 app.RE2C 无效 → 重建
+  const app2 = createApp({
+    Config: {},
+    Utils: { safeErrorText: (e, d) => String((e && e.message) || d) },
+    Formatter: {},
+    RuleEngine: {},
+    FilterEngine: {},
+    MessageStore: { cacheDir: dir, _getTombstoneProcessStart: () => '', _isTombstoneLockProcessAlive: () => false },
+    Network: {},
+    Pusher: {},
+    fs: mfs,
+    path: require('path'),
+    crypto: require('crypto'),
+    readSafeTextResult: () => ({ status: 'missing', text: '' }),
+    writeAtomic: () => true,
+    isRegularOrMissing: () => true,
+    STATE_TEXT_MAX_BYTES: 262144,
+    DEFAULT_MAX_SIZE: 1048576,
+    RE2C: { ok: true },
+    RE2_WARN_STATE_FILE: 're2warn.state',
+    RE2_MISSING_WARNING: '[re2 缺失提醒]',
+    summarizeError: () => '',
+    PROFILE3: false,
+    PROFILE3_BOOT_MARKS: [],
+    prewarmDns: () => {},
+    prewarmTls: () => {},
+    getNotify: () => null,
+    PKG_VERSION: '0.0.0',
+    trimTrailingSlashes: (s) => s,
+    compileUserRegex: () => {}
+  })
+  // RE2C 可用时 _warnMissingRe2 直接清理并返回——以「残留被删、无警告」为契约
+  app2._cleanupStaleRe2WarnMarkers()
+  assert.strictEqual(mfs._files.has(dir + '/re2warn.state.2026-01-01'), false, '陈旧残留必须被清理')
+})
+
+// --- RE2 警告标记生命周期用例组 ---
+// 桩约定：app._localStamp() 用真实上海日界（createApp 内部实现），标记名 YYYY-MM-DD。
+
+function makeRe2WarnApp ({ fs, cacheDir, alive = () => false, start = 'abc', sendAlert }) {
+  return createApp({
+    Config: {},
+    Utils: { safeErrorText: (e, d) => String((e && e.message) || d) },
+    Formatter: {},
+    RuleEngine: {},
+    FilterEngine: {},
+    MessageStore: { cacheDir, _getTombstoneProcessStart: () => start, _isTombstoneLockProcessAlive: () => alive() },
+    Network: {},
+    Pusher: {},
+    fs,
+    path: require('path'),
+    crypto: require('crypto'),
+    readSafeTextResult: () => ({ status: 'missing', text: '' }),
+    writeAtomic: () => true,
+    isRegularOrMissing: () => true,
+    STATE_TEXT_MAX_BYTES: 262144,
+    DEFAULT_MAX_SIZE: 1048576,
+    RE2C: null,
+    RE2_WARN_STATE_FILE: 're2warn.state',
+    RE2_MISSING_WARNING: '[re2 缺失提醒]',
+    summarizeError: () => '',
+    PROFILE3: false,
+    PROFILE3_BOOT_MARKS: [],
+    prewarmDns: () => {},
+    prewarmTls: () => {},
+    getNotify: () => null,
+    PKG_VERSION: '0.0.0',
+    trimTrailingSlashes: (s) => s,
+    compileUserRegex: () => {}
+  })
+}
+
+const dir = os.tmpdir()
+const stamp = (() => {
+  // 与生产同口径取上海日界（localStamp 未导出，直接读一个已生成标记来取，或用 Intl）
+  return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date())
+})()
+const statePath = dir + '/re2warn.state.' + stamp
+
+check('RE2 警告: 标记缺失时 _warnMissingRe2 创建 pending 标记并触发警告', async () => {
+  const mfs = makeMemFs()
+  let alerted = 0
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, sendAlert: async () => { alerted++; return true } })
+  // createApp 把 _sendAlert 也解构了吗？检查调用形态：直接调内部簇——_warnMissingRe2 未导出为可异步调用入口？
+  // 它在 createApp 对象里是 _warnMissingRe2；直接调用。
+  await app._warnMissingRe2()
+  assert.ok(mfs._files.has(statePath), '必须创建当天的标记文件')
+  const parsed = JSON.parse(mfs.readFileSync(statePath))
+  assert.strictEqual(parsed.status, 'completed', '发送成功后标记必须置 completed（防同天重复提醒）')
+  assert.strictEqual(parsed.pid, process.pid, '标记必须记录 pid')
+  assert.strictEqual(alerted, 1, '必须发送一次提醒')
+})
+
+check('RE2 警告: 当天已有 completed 标记时不重复提醒', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(statePath, JSON.stringify({ warnedAt: Date.now(), pid: process.pid, start: 'abc', status: 'completed' }))
+  let alerted = 0
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => true, sendAlert: async () => { alerted++; return true } })
+  await app._warnMissingRe2()
+  assert.strictEqual(alerted, 0, 'completed 标记必须压制提醒')
+})
+
+check('RE2 警告: 发送失败(false)时标记被删除、下次可重试', async () => {
+  const mfs = makeMemFs()
+  let calls = 0
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, sendAlert: async () => { calls++; return false } })
+  await app._warnMissingRe2()
+  assert.strictEqual(mfs._files.has(statePath), false, '发送失败必须删除 pending 标记（下次运行可重试）')
+  assert.strictEqual(calls, 1)
+})
+
+check('RE2 警告: pending 标记+持有进程已退出=残留，删除重建并警告', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(statePath, JSON.stringify({ warnedAt: Date.now(), pid: 999999, start: 'dead', status: 'pending' }))
+  let alerted = 0
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => false, sendAlert: async () => { alerted++; return true } })
+  await app._warnMissingRe2()
+  assert.strictEqual(alerted, 1, '残留 pending 必须回收并重新警告')
+  const parsed = JSON.parse(mfs.readFileSync(statePath))
+  assert.strictEqual(parsed.status, 'completed', '重发成功后新标记应为 completed')
+})
+
+check('RE2 警告: 解析失败的标记保守保留、不回收不警告', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(statePath, 'not-json{{')
+  let alerted = 0
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => false, sendAlert: async () => { alerted++; return true } })
+  await app._warnMissingRe2()
+  assert.strictEqual(alerted, 0, '损坏标记必须保守跳过（不回收不重发）')
+  assert.strictEqual(mfs._files.has(statePath), true, '损坏标记文件不得被删除')
+})
+
+check('RE2 警告: 7 天前的标记被清理，当天的保留', async () => {
+  const mfs = makeMemFs()
+  const oldStamp = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date(Date.now() - 9 * 86400000))
+  mfs.writeFileSync(dir + '/re2warn.state.' + oldStamp, '{"status":"completed"}')
+  mfs.writeFileSync(dir + '/re2warn.state.2099-01-01', '{"status":"completed"}') // 未来日期：不得删
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => true })
+  app._cleanupStaleRe2WarnMarkers()
+  assert.strictEqual(mfs._files.has(dir + '/re2warn.state.' + oldStamp), false, '9 天前的标记必须清理')
+  assert.strictEqual(mfs._files.has(dir + '/re2warn.state.2099-01-01'), true, '未来日期标记不得误删')
+})
+
+check('RE2 警告锁: 独占创建（wx），锁被占用且持锁进程存活时不抢占、超时放弃', () => {
+  const mfs = makeMemFs()
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => true })
+  mfs.writeFileSync(statePath + '.lock', '999999:xyz')
+  mfs._touch(statePath + '.lock', Date.now()) // 新鲜锁
+  const acquired = app._acquireRe2WarnLock(statePath)
+  assert.strictEqual(acquired, null, '新鲜锁+持有进程存活必须放弃（返回 null）')
+})
+
+check('RE2 警告锁: 陈旧锁+持有进程已退出时抢占成功', () => {
+  const mfs = makeMemFs()
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => false })
+  mfs.writeFileSync(statePath + '.lock', '999999:dead')
+  mfs._touch(statePath + '.lock', Date.now() - 20000) // 20s 前的陈旧锁（>10s LOCK_STALE_MS）
+  const acquired = app._acquireRe2WarnLock(statePath)
+  assert.ok(acquired, '陈旧锁+进程已退出必须抢占成功')
+  app._releaseRe2WarnLock(statePath, acquired)
+  assert.strictEqual(mfs._files.has(statePath + '.lock'), false, '释放后锁文件必须删除')
+})
+
+check('RE2 警告锁: 释放时关闭 fd 并删除锁文件；未获取时释放为 no-op', () => {
+  const mfs = makeMemFs()
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir })
+  const acquired = app._acquireRe2WarnLock(statePath)
+  assert.ok(acquired, '无锁时应获取成功')
+  app._releaseRe2WarnLock(statePath, acquired)
+  assert.strictEqual(mfs._files.has(statePath + '.lock'), false, '锁文件应删除')
+  // no-op：null 安全
+  app._releaseRe2WarnLock(statePath, null)
+})
+
+// --- 通道健康锁与恢复认领簇（FX3/APP-02：健康状态、认领租约、释放语义）---
+// 桩约定同 RE2 簇：makeMemFs + makeRe2App（RE2C=null 但不影响本簇；走 makeRe2WarnApp 同参构造）。
+// _updateChannelHealth 依赖 Config.channelHealth + Utils.num + summarizeError —— 用注入参数定制。
+
+function makeHealthApp ({ fs, cacheDir = dir, alive = () => false, start = 'abc', sendAlert, threshold = 3, intervalMs = 3600000 }) {
+  return createApp({
+    Config: { channelHealth: { consecutiveFailures: threshold, intervalMs } },
+    Utils: {
+      safeErrorText: (e, d) => String((e && e.message) || d),
+      num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d }
+    },
+    Formatter: {},
+    RuleEngine: {},
+    FilterEngine: {},
+    MessageStore: { cacheDir, _getTombstoneProcessStart: () => start, _isTombstoneLockProcessAlive: () => alive() },
+    Network: {},
+    Pusher: {},
+    fs,
+    path: require('path'),
+    crypto: require('crypto'),
+    readSafeTextResult: () => ({ status: 'missing', text: '' }),
+    writeAtomic: () => true,
+    isRegularOrMissing: () => true,
+    STATE_TEXT_MAX_BYTES: 262144,
+    DEFAULT_MAX_SIZE: 1048576,
+    RE2C: null,
+    RE2_WARN_STATE_FILE: 're2warn.state',
+    RE2_MISSING_WARNING: '[re2]',
+    summarizeError: (e) => (e && e.message) || 'err',
+    PROFILE3: false,
+    PROFILE3_BOOT_MARKS: [],
+    prewarmDns: () => {},
+    prewarmTls: () => {},
+    getNotify: () => null,
+    PKG_VERSION: '0.0.0',
+    trimTrailingSlashes: (s) => s,
+    compileUserRegex: () => {}
+  })
+}
+
+const healthPath = dir + '/channel-health.state'
+
+check('通道健康锁: 无锁时独占获取成功并写入 pid 令牌；释放删除锁文件', () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs })
+  const fd = app._tryAcquireChannelHealthLock(healthPath + '.lock')
+  assert.ok(fd >= 0, '无竞争时必须获取成功')
+  assert.ok(mfs.readFileSync(healthPath + '.lock').includes(String(process.pid)), '锁文件必须写入 pid 令牌（存活复核/PID 复用判别）')
+  app._releaseChannelHealthLock(healthPath + '.lock', fd)
+  assert.strictEqual(mfs._files.has(healthPath + '.lock'), false, '释放后锁文件必须删除')
+})
+
+check('通道健康锁: 锁被占用且持有进程存活时返回 -1（跳过本轮，不覆盖他人状态）', () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs, alive: () => true })
+  mfs.writeFileSync(healthPath + '.lock', '999999:x')
+  mfs._touch(healthPath + '.lock', Date.now()) // 新鲜
+  assert.strictEqual(app._tryAcquireChannelHealthLock(healthPath + '.lock'), -1, '新鲜锁+存活必须返回 -1')
+})
+
+check('通道健康锁: 陈旧锁+持有进程退出时抢占重获', () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs, alive: () => false })
+  mfs.writeFileSync(healthPath + '.lock', '999999:dead')
+  mfs._touch(healthPath + '.lock', Date.now() - 20000)
+  const fd = app._tryAcquireChannelHealthLock(healthPath + '.lock')
+  assert.ok(fd >= 0, '陈旧锁必须可抢占')
+  app._releaseChannelHealthLock(healthPath + '.lock', fd)
+})
+
+check('通道健康锁: 非 EEXIST 异常（如权限）直接返回 -1 不得死循环', () => {
+  const mfs = makeMemFs()
+  mfs.openSync = (p, flags) => { const e = new Error('EACCES'); e.code = 'EACCES'; throw e }
+  const app = makeHealthApp({ fs: mfs })
+  assert.strictEqual(app._tryAcquireChannelHealthLock(healthPath + '.lock'), -1, 'EACCES 必须立即放弃')
+})
+
+check('恢复认领: _newChannelRecoverClaim 两次生成不重复（含 pid 前缀）', () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs })
+  const a = app._newChannelRecoverClaim()
+  const b = app._newChannelRecoverClaim()
+  assert.notStrictEqual(a, b, '两次认领令牌不得相同')
+  assert.ok(a.startsWith(String(process.pid) + '-'), '令牌应以 pid 开头')
+})
+
+check('恢复认领: 租约内(60s)的 pending+claim 视为存活', () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs })
+  const now = Date.now()
+  assert.strictEqual(app._isChannelRecoverClaimAlive({ recoverAlertClaim: 'c1', recoverAlertClaimAt: now - 1000 }, now), true, '1s 前的认领必须在 60s 租约内')
+  assert.strictEqual(app._isChannelRecoverClaimAlive({ recoverAlertClaim: 'c1', recoverAlertClaimAt: now - 61000 }, now), false, '61s 前的认领必须已过期')
+  assert.strictEqual(app._isChannelRecoverClaimAlive(null, now), false, 'null entry 必须视为失效')
+  assert.strictEqual(app._isChannelRecoverClaimAlive({ recoverAlertClaim: '', recoverAlertClaimAt: now }, now), false, '空 claim 必须失效')
+  assert.strictEqual(app._isChannelRecoverClaimAlive({ recoverAlertClaim: 'c', recoverAlertClaimAt: 'NaN' }, now), false, '非法 claimedAt 必须失效（宁可重发不卡死）')
+})
+
+check('恢复认领释放: 令牌匹配才清 pending；不匹配不动作', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs })
+  mfs.writeFileSync(healthPath, JSON.stringify({
+    wxpusher: { consecutiveFailures: 3, lastFailureAt: 1, lastAlertAt: 2, lastRecoveredAt: 0, recoverAlertPending: true, recoverAlertClaim: 'tok-1', recoverAlertClaimAt: Date.now() }
+  }))
+  // 不匹配的 claim：不得清 pending
+  await app._releaseChannelRecoverClaim(healthPath, 'wxpusher', 'other-token')
+  let state = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(state.wxpusher.recoverAlertPending, true, 'claim 不匹配不得动作')
+  // 匹配：清 pending、保留失败计数
+  await app._releaseChannelRecoverClaim(healthPath, 'wxpusher', 'tok-1')
+  state = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(state.wxpusher.recoverAlertPending, undefined, '匹配 claim 释放后 pending 必须清除')
+  assert.strictEqual(state.wxpusher.consecutiveFailures, 3, '释放认领必须保留失败计数（下一轮仍可触发恢复）')
+})
+
+check('恢复认领清零: 通道恢复成功后计数清零、lastRecoveredAt 更新', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs })
+  const claim = 'tok-9'
+  mfs.writeFileSync(healthPath, JSON.stringify({
+    wxpusher: { consecutiveFailures: 3, lastFailureAt: 1, lastAlertAt: 2, lastRecoveredAt: 0, recoverAlertPending: true, recoverAlertClaim: claim, recoverAlertClaimAt: Date.now() }
+  }))
+  await app._clearChannelRecoverPending(healthPath, 'wxpusher', claim)
+  const state = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(state.wxpusher.consecutiveFailures, 0, '恢复确认后失败计数必须清零')
+  assert.ok(state.wxpusher.lastRecoveredAt > 0, 'lastRecoveredAt 必须更新')
+  assert.strictEqual(state.wxpusher.recoverAlertPending, undefined, 'pending 必须清除')
+})
+
+// --- _updateChannelHealth 主流程用例（失败计数 / 告警入队 / 恢复认领 / 状态损坏防御）---
+// _sendAlert 经 makeHealthApp 无注入——检查其实现依赖 getNotify/Pusher。用 sendAlert 注入参数版本。
+function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000 }) {
+  return createApp({
+    Config: { channelHealth: { consecutiveFailures: threshold, intervalMs } },
+    Utils: {
+      safeErrorText: (e, d) => String((e && e.message) || d),
+      num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d }
+    },
+    Formatter: {},
+    RuleEngine: {},
+    FilterEngine: {},
+    MessageStore: { cacheDir, _getTombstoneProcessStart: () => 's', _isTombstoneLockProcessAlive: () => alive() },
+    Network: {},
+    Pusher: {},
+    fs,
+    path: require('path'),
+    crypto: require('crypto'),
+    readSafeTextResult: () => ({ status: 'missing', text: '' }),
+    writeAtomic: () => true,
+    isRegularOrMissing: () => true,
+    STATE_TEXT_MAX_BYTES: 262144,
+    DEFAULT_MAX_SIZE: 1048576,
+    RE2C: null,
+    RE2_WARN_STATE_FILE: 're2warn.state',
+    RE2_MISSING_WARNING: '[re2]',
+    summarizeError: (e) => (e && e.message) || 'err',
+    PROFILE3: false,
+    PROFILE3_BOOT_MARKS: [],
+    prewarmDns: () => {},
+    prewarmTls: () => {},
+    getNotify: () => null,
+    PKG_VERSION: '0.0.0',
+    trimTrailingSlashes: (s) => s,
+    compileUserRegex: () => {}
+  })
+}
+
+check('健康更新: 单次失败计 1、未达阈值不入告警', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp2({ fs: mfs, threshold: 3 })
+  await app._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  const state = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(state.pushdeer.consecutiveFailures, 1, '一次失败必须计 1')
+  assert.strictEqual(state.pushdeer.lastFailureAt > 0, true, 'lastFailureAt 必须落盘')
+})
+
+check('健康更新: 连续失败达阈值入告警 + lastAlertAt 即时落盘（APP2-01 限频按尝试计时）', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp2({ fs: mfs, threshold: 2 })
+  // 预置已失败 1 次
+  mfs.writeFileSync(healthPath, JSON.stringify({ pushdeer: { consecutiveFailures: 1, lastFailureAt: 1, lastAlertAt: 0, lastRecoveredAt: 0 } }))
+  await app._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'again' }] })
+  const state = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(state.pushdeer.consecutiveFailures, 2, '计数应累到阈值 2')
+  assert.ok(state.pushdeer.lastAlertAt > 0, '达到阈值必须即时落盘 lastAlertAt（APP2-01，防告警通道挂掉时限频失效每轮重发）')
+})
+
+check('健康更新: 恢复通道清零计数并原子认领恢复告警（recoverAlertPending+claim）', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp2({ fs: mfs, threshold: 2 })
+  mfs.writeFileSync(healthPath, JSON.stringify({ pushdeer: { consecutiveFailures: 2, lastFailureAt: 1, lastAlertAt: 5, lastRecoveredAt: 0, recoverAlertPending: true } }))
+  await app._updateChannelHealth({ successfulChannels: ['pushdeer'], failures: [] })
+  const state = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(state.pushdeer.consecutiveFailures, 2, '恢复告警未确认送达前必须保留失败计数（APP2-02 不丢）')
+  assert.strictEqual(state.pushdeer.recoverAlertPending, true, '恢复告警未确认前 pending 保留')
+  assert.ok(typeof state.pushdeer.recoverAlertClaim === 'string' && state.pushdeer.recoverAlertClaim.length > 0, '入队同时必须原子认领（FX3 防重复通知竞态）')
+  assert.ok(state.pushdeer.recoverAlertClaimAt > 0, '认领时间必须落盘')
+})
+
+check('健康更新: 状态文件损坏时跳过本轮以保留原文件', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp2({ fs: mfs })
+  mfs.writeFileSync(healthPath, 'not-json{{')
+  await app._updateChannelHealth({ successfulChannels: ['x'], failures: [] })
+  assert.strictEqual(mfs.readFileSync(healthPath), 'not-json{{', '损坏状态必须原样保留（不得覆盖）')
+})
+
+check('健康更新: 锁被他人持有时跳过本轮且不动状态文件', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp2({ fs: mfs, alive: () => true })
+  mfs.writeFileSync(healthPath + '.lock', '999999:x')
+  mfs._touch(healthPath + '.lock', Date.now())
+  mfs.writeFileSync(healthPath, JSON.stringify({ pushdeer: { consecutiveFailures: 1, lastFailureAt: 1, lastAlertAt: 0, lastRecoveredAt: 0 } }))
+  const before = mfs.readFileSync(healthPath)
+  await app._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'x' }] })
+  assert.strictEqual(mfs.readFileSync(healthPath), before, '拿不到锁必须整轮跳过（不能覆盖另一轮状态）')
+})
