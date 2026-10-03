@@ -1367,7 +1367,7 @@ checkS('息知通道: 请求体形态——url 用 WX_XIZHI_KEY，json 含 title
   try {
     await sendNotify('标题甲', '内容乙')
     assert.ok(captured, '必须发出请求')
-    assert.ok(String(captured.url).includes('xizhi.fake/realpath'), `url 应取 WX_XIZHI_KEY，实际 ${captured.url}`)
+    assert.ok(String(captured.url).startsWith('https://xizhi.fake/realpath'), `url 应取 WX_XIZHI_KEY，实际 ${captured.url}`)
     assert.strictEqual(captured.opts.json.title, '标题甲', 'title 应为 text')
     assert.strictEqual(captured.opts.json.content, '内容乙', 'content 应为 desp')
   } finally { restore(); restoreGot() }
@@ -1417,12 +1417,12 @@ checkS('PushDeer: 默认 url 为 api2.pushdeer.com，DEER_URL 可覆盖', async 
     const urls1 = []
     gotModule.stream.post = grab(urls1)
     try { await sendNotify('a', 'b') } finally { gotModule.stream.post = origStreamPost; restore() }
-    assert.ok(urls1[0].includes('api2.pushdeer.com'), `默认端点应为 api2.pushdeer.com，实际 ${urls1[0]}`)
+    assert.strictEqual(new URL(urls1[0]).hostname, 'api2.pushdeer.com', `默认端点应为 api2.pushdeer.com，实际 ${urls1[0]}`)
     restore = isolateChannel({ DEER_KEY: 'PDK2', DEER_URL: 'https://deer.example/push' })
     const urls2 = []
     gotModule.stream.post = grab(urls2)
     try { await sendNotify('a', 'b') } finally { gotModule.stream.post = origStreamPost; restore() }
-    assert.ok(urls2[0].includes('deer.example'), `DEER_URL 应可覆盖，实际 ${urls2[0]}`)
+    assert.strictEqual(new URL(urls2[0]).hostname, 'deer.example', `DEER_URL 应可覆盖，实际 ${urls2[0]}`)
   } finally { restoreGot() }
 })
 
@@ -1437,7 +1437,7 @@ checkS('Telegram: data.ok===true 判成功；text 经 HTML 转义；url 含 bot 
       const res = await sendNotify('TG标题', '正文<b>&"x')
       assert.deepStrictEqual(res.successfulChannels, ['telegram'], '成功通道应为 telegram')
     } finally { gotModule.stream.post = origStreamPost }
-    assert.ok(String(captured.url).includes('/botTOK/sendMessage'), `url 应含 bot token，实际 ${captured.url}`)
+    assert.ok(/\/botTOK\/sendMessage$/.test(String(captured.url).split('?')[0]), `url 应含 bot token 路径，实际 ${captured.url}`)
     assert.strictEqual(captured.opts.json.parse_mode, 'HTML', 'parse_mode 必须是 HTML（v3.132，Markdown 对未配对 * 报错）')
     assert.strictEqual(captured.opts.json.disable_web_page_preview, true, '禁预览契约')
     assert.ok(captured.opts.json.text.includes('&lt;b&gt;'), 'HTML 敏感字符必须转义')
