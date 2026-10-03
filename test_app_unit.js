@@ -1762,52 +1762,13 @@ function makeMemFs () {
 }
 
 // 构造带内存 fs 的 app：MessageStore 提供 cacheDir 与 _getTombstoneProcessStart/_isTombstoneLockProcessAlive 桩
-function makeRe2App ({ fs, cacheDir = '/memcache', processStart = '123', processAlive = () => false }) {
-  return createApp({
-    Config: {},
-    Utils: { safeErrorText: (e, d) => String((e && e.message) || d) },
-    Formatter: {},
-    RuleEngine: {},
-    FilterEngine: {},
-    MessageStore: {
-      cacheDir,
-      _getTombstoneProcessStart: () => processStart,
-      _isTombstoneLockProcessAlive: () => processAlive()
-    },
-    Network: {},
-    Pusher: {},
-    fs,
-    path: require('path'),
-    crypto: require('crypto'),
-    readSafeTextResult: () => ({ status: 'missing', text: '' }),
-    writeAtomic: () => true,
-    isRegularOrMissing: () => true,
-    STATE_TEXT_MAX_BYTES: 262144,
-    DEFAULT_MAX_SIZE: 1048576,
-    RE2C: null,
-    RE2_WARN_STATE_FILE: 're2warn.state',
-    RE2_MISSING_WARNING: '[re2 缺失提醒]',
-    summarizeError: () => '',
-    PROFILE3: false,
-    PROFILE3_BOOT_MARKS: [],
-    prewarmDns: () => {},
-    prewarmTls: () => {},
-    getNotify: () => null,
-    PKG_VERSION: '0.0.0',
-    trimTrailingSlashes: (s) => s,
-    compileUserRegex: () => {}
-  })
-}
-
 const os = require('os')
 
-check('RE2 警告: RE2C 可用时只清理残留标记、不发警告', () => {
+checkAsync('RE2 警告: RE2C 可用时 _warnMissingRe2 早退只清理残留标记、不发警告', async () => {
   const mfs = makeMemFs()
   const dir = os.tmpdir()
   mfs.writeFileSync(dir + '/re2warn.state.2026-01-01', '{"status":"pending","pid":1}')
-  const app = makeRe2App({ fs: mfs, cacheDir: dir })
-  app.RE2C = { re: () => {} } // RE2C 可用：createApp 里是解构传入，这里直接改不行——经构造参数
-  // createApp 已把 RE2C 解构捕获，改 app.RE2C 无效 → 重建
+  let alerted = 0
   const app2 = createApp({
     Config: {},
     Utils: { safeErrorText: (e, d) => String((e && e.message) || d) },
@@ -1816,7 +1777,7 @@ check('RE2 警告: RE2C 可用时只清理残留标记、不发警告', () => {
     FilterEngine: {},
     MessageStore: { cacheDir: dir, _getTombstoneProcessStart: () => '', _isTombstoneLockProcessAlive: () => false },
     Network: {},
-    Pusher: {},
+    Pusher: { send: async () => { alerted++; return true } },
     fs: mfs,
     path: require('path'),
     crypto: require('crypto'),
@@ -1838,9 +1799,10 @@ check('RE2 警告: RE2C 可用时只清理残留标记、不发警告', () => {
     trimTrailingSlashes: (s) => s,
     compileUserRegex: () => {}
   })
-  // RE2C 可用时 _warnMissingRe2 直接清理并返回——以「残留被删、无警告」为契约
-  app2._cleanupStaleRe2WarnMarkers()
+  // RE2C 可用时 _warnMissingRe2 早退只清理不发警告——走真实入口而非直接调内部方法（CodeRabbit）
+  await app2._warnMissingRe2()
   assert.strictEqual(mfs._files.has(dir + '/re2warn.state.2026-01-01'), false, '陈旧残留必须被清理')
+  assert.strictEqual(alerted, 0, 'RE2C 可用时不得发送任何警告')
 })
 
 // --- RE2 警告标记生命周期用例组 ---

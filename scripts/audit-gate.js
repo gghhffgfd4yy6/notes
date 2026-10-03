@@ -48,13 +48,31 @@ function main () {
     const vias = Array.isArray(v.via) ? v.via : []
     const advisories = vias.filter(x => typeof x === 'object' && x.url)
     if (advisories.length === 0) {
-      // via 全是依赖传递（如 got ← cacheable-request）：溯源到根 advisory，跟随其判定
-      // 传递节点的 via 链最终指向直接 advisory；这里保守处理：看 vulnerabilities 里是否有被豁免的直接 advisory
-      const rootAllowed = entries.some(other =>
-        other !== v && (other.severity === 'high' || other.severity === 'critical') &&
-        (Array.isArray(other.via) ? other.via : []).some(x => typeof x === 'object' && x.url && ALLOWED_ADVISORIES.has(urlGhsa(x.url)))
-      )
-      if (rootAllowed) hitAllowed.push(v.name)
+      // via 全是依赖名字字符串（间接漏洞，如 got ← cacheable-request）：按 via 链逐跳溯源到根
+      // advisory（CodeRabbit Major finding：不得用「存在任意被豁免条目」的全局启发式，
+      // 否则未来新增豁免时无关的传递节点会被连带放行）。链断裂/成环/指向未豁免条目 → 一律 block。
+      const byName = new Map(entries.map(e => [e.name, e]))
+      const visited = new Set([v.name])
+      let current = v
+      let allowed = false
+      let broken = false
+      while (true) {
+        const viaNames = (Array.isArray(current.via) ? current.via : []).filter(x => typeof x === 'string')
+        if (viaNames.length === 0) { broken = true; break } // 链断：无法证明来源，保守 block
+        const nextName = viaNames[0]
+        if (visited.has(nextName)) { broken = true; break } // 环：保守 block
+        visited.add(nextName)
+        const next = byName.get(nextName)
+        if (!next) { broken = true; break } // via 指向 vulnerabilities 中不存在的条目：信息不足，保守 block
+        const nextAdvisories = (Array.isArray(next.via) ? next.via : []).filter(x => typeof x === 'object' && x.url)
+        if (nextAdvisories.length > 0) {
+          // 根 advisory 节点：仅当其全部 advisory 均在豁免清单才放行
+          allowed = nextAdvisories.every(a => ALLOWED_ADVISORIES.has(urlGhsa(a.url)))
+          break
+        }
+        current = next
+      }
+      if (!broken && allowed) hitAllowed.push(v.name)
       else hitBlocked.push(v.name)
       continue
     }
