@@ -1457,7 +1457,7 @@ checkS('Telegram: ok≠true 必须 reject（API 级失败）', async () => {
 })
 
 checkS('Telegram: TG_PROXY 配置给出一次性不生效警告（v3.76 防误配静默失效）', async () => {
-  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42', TG_PROXY_HOST: '1.2.3.4', TG_PROXY_PORT: '1080' })
+  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42', TG_PROXY_HOST: 'proxy.example', TG_PROXY_PORT: '1080' })
   const restoreGot = mockGotForChannels(() => JSON.stringify({ ok: true }))
   const origWarn = console.warn
   const warns = []

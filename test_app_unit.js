@@ -1742,7 +1742,9 @@ function makeMemFs () {
     },
     readdirSync: (dir) => {
       const names = []
-      const dirPrefix = String(dir).replace(/\/+$/, '') + '/'
+      let dp = String(dir)
+      while (dp.length > 1 && dp.endsWith('/')) dp = dp.slice(0, -1)
+      const dirPrefix = dp + '/'
       for (const p of files.keys()) {
         if (!p.startsWith(dirPrefix)) continue
         const base = p.slice(dirPrefix.length)
