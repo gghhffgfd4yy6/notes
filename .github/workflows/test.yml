@@ -213,7 +213,9 @@ jobs:
           fi
 
       - name: 安全审计（高危及以上）
-        run: npm audit --audit-level=high --omit=dev
+        run: |
+          npm audit --audit-level=high --omit=dev --json > audit-result.json || true
+          node scripts/audit-gate.js
 
   # 稳定合并门禁：汇总 quality matrix 结果。
   # 背景：quality 的 check 名带 matrix 版本后缀（quality (22.22.2) 等），若未来增删 Node 版本

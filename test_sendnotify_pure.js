@@ -28,6 +28,19 @@ function check (name, fn) {
     ok()
   }
 }
+// --- 异步用例互斥 ---
+// 异步用例共享模块级 push_config / got 单例，promise 回调默认并发（注册即跑）会串扰
+// （通道列表互染、mock 互相覆盖）。需要改全局状态的 async 用例一律经 checkS 注册：
+// 内部串行队列，前一个 settled 才跑下一个；同步用例不受影响。
+let channelQueue = Promise.resolve()
+function checkS (name, fn) {
+  check(name, () => {
+    const run = channelQueue.then(fn, fn)
+    channelQueue = run.then(() => {}, () => {})
+    return run
+  })
+}
+
 // 末尾汇总须等全部异步用例 settled 再打印（同步脚本结束时 promise 可能尚未完成）
 let pendingAsyncChecks = 0
 function settleAsync () {
@@ -1189,7 +1202,7 @@ check('getWxPusherProfileSummary: XBK_PROFILE 未设置/非3 时返回空数组�
   }
 })
 
-check('getWxPusherProfileSummary: 开启时返回快照且与内部状态对象隔离（返回 {...stat} 浅拷贝）', () => {
+checkS('getWxPusherProfileSummary: 开启时返回快照且与内部状态对象隔离（返回 {...stat} 浅拷贝）', () => {
   const orig = process.env.XBK_PROFILE
   const got = require('got')
   const { EventEmitter } = require('node:events')
@@ -1269,3 +1282,317 @@ const asyncWatchdog = pendingAsyncChecks > 0
   }, 5000)
   : null
 if (pendingAsyncChecks === 0) printSuiteSummary()
+
+// ===== v3 通道发送簇（PR #192 后续补强：息知/PushDeer/TG 通道、字节截断）=====
+// 夹具：单一通道隔离 + got.stream 假流（回包体按该通道成功判定协议定制），全程不触网。
+// 各通道成功判定（生产契约）：息知 code===200；PushDeer data.content.result.length>0；TG data.ok===true。
+// API 级失败契约（v3.160）：HTTP 200 但业务失败必须 reject（channelError 带 channel/providerCode），
+// 不得静默 resolve 把消息记成成功。
+const gotModule = require('got')
+const { EventEmitter: ChannelEE } = require('node:events')
+
+function mockGotForChannels (respond) {
+  const makeStream = (body) => {
+    const s = new ChannelEE()
+    s.timings = { phases: { total: 1 } }
+    s.destroy = () => {}
+    setTimeout(() => {
+      s.emit('response', { statusCode: 200, headers: { 'content-type': 'application/json' } })
+      s.emit('data', Buffer.from(body))
+      s.emit('end')
+    }, 0)
+    return s
+  }
+  const orig = { post: gotModule.post, get: gotModule.get, stream: gotModule.stream }
+  const fakeStream = (method) => (url, opts) => makeStream(respond(String(url), opts))
+  const fakePromise = (url, opts) => Promise.resolve({ body: respond(String(url), opts), statusCode: 200, headers: {}, timings: { phases: {} } })
+  gotModule.post = fakePromise
+  gotModule.get = fakePromise
+  gotModule.stream = Object.assign((...a) => makeStream(respond(...a)), {
+    post: fakeStream('post'),
+    get: fakeStream('get')
+  })
+  return () => { Object.assign(gotModule, orig) }
+}
+
+// 单通道隔离：清掉已知通道键，只留 want 里给的；结束后按 saved 恢复。
+const ALL_CHANNEL_KEYS = ['WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_pusher_channels',
+  'PUSH_PLUS_TOKEN', 'PUSH_KEY', 'BARK_PUSH', 'QYWX_KEY', 'WX_XIZHI_KEY', 'DEER_KEY',
+  'PUSHME_KEY', 'TG_BOT_TOKEN', 'TG_USER_ID', 'TG_API_HOST', 'HITOKOTO']
+
+function isolateChannel (want) {
+  const saved = ALL_CHANNEL_KEYS.map(k => [k, push_config[k]])
+  for (const k of ALL_CHANNEL_KEYS) delete push_config[k]
+  for (const [k, v] of Object.entries(want)) push_config[k] = v
+  return () => {
+    for (const [k, v] of saved) { if (v === undefined) delete push_config[k]; else push_config[k] = v }
+  }
+}
+
+checkS('息知通道: code===200 判成功，successfulChannels 含「息知」', async () => {
+  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/key' })
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ code: 200 }))
+  try {
+    const res = await sendNotify('息知成功探针', '正文')
+    assert.deepStrictEqual(res.successfulChannels, ['息知'], '成功通道应为息知')
+    assert.strictEqual(res.failures.length, 0, '不得有失败记录')
+  } finally { restore(); restoreGot() }
+})
+
+checkS('息知通道: HTTP 200 但 code≠200 必须 reject（API 级失败不得静默成功）', async () => {
+  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/key' })
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ code: 500, msg: '内部错误' }))
+  try {
+    let threw = null
+    try { await sendNotify('息知失败探针', '正文') } catch (e) { threw = e }
+    assert.ok(threw, 'code≠200 必须抛错（v3.160 契约）')
+    assert.ok(Array.isArray(threw.failures) && threw.failures.some(f => f.channel === '息知'), `failures 应含息知失败，实际: ${JSON.stringify(threw.failures)}`)
+  } finally { restore(); restoreGot() }
+})
+
+checkS('息知通道: HTTP 200 + JSON null 响应必须按失败处理（v3.180 判空防御）', async () => {
+  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/key' })
+  const restoreGot = mockGotForChannels(() => 'null')
+  try {
+    let threw = null
+    try { await sendNotify('息知空响应', '正文') } catch (e) { threw = e }
+    assert.ok(threw, 'data 为 null 必须拒绝（曾虚假成功）')
+  } finally { restore(); restoreGot() }
+})
+
+checkS('息知通道: 请求体形态——url 用 WX_XIZHI_KEY，json 含 title/content', async () => {
+  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/realpath' })
+  let captured = null
+  const restoreGot = mockGotForChannels((url, opts) => { captured = { url, opts }; return JSON.stringify({ code: 200 }) })
+  try {
+    await sendNotify('标题甲', '内容乙')
+    assert.ok(captured, '必须发出请求')
+    assert.ok(String(captured.url).startsWith('https://xizhi.fake/realpath'), `url 应取 WX_XIZHI_KEY，实际 ${captured.url}`)
+    assert.strictEqual(captured.opts.json.title, '标题甲', 'title 应为 text')
+    assert.strictEqual(captured.opts.json.content, '内容乙', 'content 应为 desp')
+  } finally { restore(); restoreGot() }
+})
+
+checkS('PushDeer: content.result.length>0 判成功', async () => {
+  const restore = isolateChannel({ DEER_KEY: 'PDK_fake' })
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ content: { result: [{ message: 'ok' }] } }))
+  try {
+    const res = await sendNotify('PD成功', '正文')
+    assert.deepStrictEqual(res.successfulChannels, ['pushdeer'], '成功通道应为 pushdeer')
+  } finally { restore(); restoreGot() }
+})
+
+checkS('PushDeer: result 空数组必须 reject（API 级失败）', async () => {
+  const restore = isolateChannel({ DEER_KEY: 'PDK_fake' })
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ content: { result: [] } }))
+  try {
+    let threw = null
+    try { await sendNotify('PD失败', '正文') } catch (e) { threw = e }
+    assert.ok(threw, 'result 空必须拒绝')
+  } finally { restore(); restoreGot() }
+})
+
+checkS('PushDeer: 请求体为 urlencode 表单，pushkey/text/desp 齐全且 & = # 已编码', async () => {
+  const restore = isolateChannel({ DEER_KEY: 'PDK&weird=key#x' })
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ content: { result: [1] } }))
+  try {
+    let bodyCaptured = null
+    const origStreamPost = gotModule.stream.post
+    gotModule.stream.post = (url, opts) => { bodyCaptured = { url, opts }; return origStreamPost(url, opts) }
+    try { await sendNotify('标题&特=殊#字', '正文<a>') } finally { gotModule.stream.post = origStreamPost }
+    assert.ok(bodyCaptured, '必须发出 POST')
+    const body = bodyCaptured.opts.body
+    assert.ok(body.includes(`pushkey=${encodeURIComponent('PDK&weird=key#x')}`), 'pushkey 必须 encodeURIComponent（&=# 不得裸传）')
+    assert.ok(body.includes(`text=${encodeURIComponent('标题&特=殊#字')}`), 'text 必须编码')
+    assert.ok(body.includes('type=markdown'), 'type=markdown 是既有契约')
+  } finally { restore(); restoreGot() }
+})
+
+checkS('PushDeer: 默认 url 为 api2.pushdeer.com，DEER_URL 可覆盖', async () => {
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ content: { result: [1] } }))
+  try {
+    const origStreamPost = gotModule.stream.post
+    const grab = (urls) => (url, opts) => { urls.push(String(url)); return origStreamPost(url, opts) }
+    let restore = isolateChannel({ DEER_KEY: 'PDK1' })
+    const urls1 = []
+    gotModule.stream.post = grab(urls1)
+    try { await sendNotify('a', 'b') } finally { gotModule.stream.post = origStreamPost; restore() }
+    assert.strictEqual(new URL(urls1[0]).hostname, 'api2.pushdeer.com', `默认端点应为 api2.pushdeer.com，实际 ${urls1[0]}`)
+    restore = isolateChannel({ DEER_KEY: 'PDK2', DEER_URL: 'https://deer.example/push' })
+    const urls2 = []
+    gotModule.stream.post = grab(urls2)
+    try { await sendNotify('a', 'b') } finally { gotModule.stream.post = origStreamPost; restore() }
+    assert.strictEqual(new URL(urls2[0]).hostname, 'deer.example', `DEER_URL 应可覆盖，实际 ${urls2[0]}`)
+  } finally { restoreGot() }
+})
+
+checkS('Telegram: data.ok===true 判成功；text 经 HTML 转义；url 含 bot token', async () => {
+  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ ok: true }))
+  try {
+    let captured = null
+    const origStreamPost = gotModule.stream.post
+    gotModule.stream.post = (url, opts) => { captured = { url, opts }; return origStreamPost(url, opts) }
+    try {
+      const res = await sendNotify('TG标题', '正文<b>&"x')
+      assert.deepStrictEqual(res.successfulChannels, ['telegram'], '成功通道应为 telegram')
+    } finally { gotModule.stream.post = origStreamPost }
+    assert.ok(/\/botTOK\/sendMessage$/.test(String(captured.url).split('?')[0]), `url 应含 bot token 路径，实际 ${captured.url}`)
+    assert.strictEqual(captured.opts.json.parse_mode, 'HTML', 'parse_mode 必须是 HTML（v3.132，Markdown 对未配对 * 报错）')
+    assert.strictEqual(captured.opts.json.disable_web_page_preview, true, '禁预览契约')
+    assert.ok(captured.opts.json.text.includes('&lt;b&gt;'), 'HTML 敏感字符必须转义')
+    assert.ok(captured.opts.json.text.includes('&amp;'), '& 必须转义')
+  } finally { restore(); restoreGot() }
+})
+
+checkS('Telegram: ok≠true 必须 reject（API 级失败）', async () => {
+  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ ok: false, error_code: 400, description: 'chat not found' }))
+  try {
+    let threw = null
+    try { await sendNotify('TG失败', '正文') } catch (e) { threw = e }
+    assert.ok(threw, 'ok≠true 必须拒绝')
+    assert.ok(/chat not found|Telegram/.test(threw.message), `错误信息应含 description 或通道名，实际: ${threw.message}`)
+  } finally { restore(); restoreGot() }
+})
+
+checkS('Telegram: TG_PROXY 配置给出一次性不生效警告（v3.76 防误配静默失效）', async () => {
+  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42', TG_PROXY_HOST: 'proxy.example', TG_PROXY_PORT: '1080' })
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ ok: true }))
+  const origWarn = console.warn
+  const warns = []
+  console.warn = (m) => warns.push(String(m))
+  try {
+    await sendNotify('a', 'b')
+    assert.ok(warns.some(w => w.includes('TG_PROXY') && w.includes('不生效')), `必须警告代理未接入，实际: ${JSON.stringify(warns)}`)
+  } finally { console.warn = origWarn; restore(); restoreGot() }
+})
+
+checkS('TG 超长文本: safeSlice 4000 字符截断且末尾不得是孤立高代理', async () => {
+  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ ok: true }))
+  try {
+    let captured = null
+    const origStreamPost = gotModule.stream.post
+    gotModule.stream.post = (url, opts) => { captured = opts; return origStreamPost(url, opts) }
+    const longText = '锚' + '🌟'.repeat(3000) // 3000 个 4 字节 emoji ≈ 12000 字节
+    try { await sendNotify('t', longText) } finally { gotModule.stream.post = origStreamPost }
+    const sent = captured.json.text
+    assert.ok(sent.length <= 4000, `TG 文本必须按字符受限（safeSlice 4000），实际 ${sent.length} 字符`)
+    const last = sent.charCodeAt(sent.length - 1)
+    assert.ok(!(last >= 0xD800 && last <= 0xDBFF), '末尾不得是孤立高代理（会乱码/URIError）')
+  } finally { restore(); restoreGot() }
+})
+
+checkS('sendNotify: 未配置任何通道时抛 NO_CHANNEL_CONFIG', async () => {
+  const restore = isolateChannel({})
+  try {
+    let threw = null
+    try { await sendNotify('a', 'b') } catch (e) { threw = e }
+    assert.ok(threw, '无通道必须抛错')
+    assert.strictEqual(threw.code, 'NO_CHANNEL_CONFIG', `错误码应为 NO_CHANNEL_CONFIG，实际 ${threw.code}`)
+    assert.ok(threw.message.includes('未配置任何推送通道'), '错误信息应列出全部通道名')
+  } finally { restore() }
+})
+
+checkS('sendNotify: 双通道一败一成=部分成功不抛错；双成功 failures 为空', async () => {
+  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', DEER_KEY: 'PDK' })
+  const restoreGot = mockGotForChannels((url) => {
+    if (String(url).includes('xizhi.fake')) return JSON.stringify({ code: 200 })
+    return JSON.stringify({ content: { result: [] } })
+  })
+  try {
+    let threw = null
+    let res = null
+    try { res = await sendNotify('混合', '正文') } catch (e) { threw = e }
+    assert.ok(!threw, `一成一败不得抛错（部分成功语义），实际: ${threw && threw.message}`)
+    assert.deepStrictEqual(res.successfulChannels, ['息知'], '成功通道应为息知')
+    assert.strictEqual(res.failures.length, 1, 'pushdeer 失败应计入 failures')
+    assert.strictEqual(res.failures[0].channel, 'pushdeer', '失败记录必须带 channel 标识')
+  } finally { restore(); restoreGot() }
+  const restore2 = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', DEER_KEY: 'PDK' })
+  const restoreGot2 = mockGotForChannels((url) => {
+    if (String(url).includes('xizhi.fake')) return JSON.stringify({ code: 200 })
+    return JSON.stringify({ content: { result: [1] } })
+  })
+  try {
+    const res2 = await sendNotify('双成功', '正文')
+    assert.strictEqual(res2.successfulChannels.length, 2, '两通道都应成功')
+    assert.deepStrictEqual(res2.failures, [], 'failures 应为空数组')
+  } finally { restore2(); restoreGot2() }
+})
+
+checkS('sendNotify: 全通道业务失败抛 ALL_CHANNELS_FAILED 且带 failures 数组', async () => {
+  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', DEER_KEY: 'PDK' })
+  const restoreGot = mockGotForChannels(() => JSON.stringify({ code: 1 }))
+  try {
+    let threw = null
+    try { await sendNotify('全败', '正文') } catch (e) { threw = e }
+    assert.ok(threw, '全部失败必须抛错')
+    assert.strictEqual(threw.code, 'ALL_CHANNELS_FAILED', `错误码应为 ALL_CHANNELS_FAILED，实际 ${threw.code}`)
+    assert.ok(Array.isArray(threw.failures) && threw.failures.length === 2, '必须带两个通道的失败详情')
+    assert.ok(/息知|pushdeer/.test(threw.message), `错误信息应含通道名，实际: ${threw.message}`)
+  } finally { restore(); restoreGot() }
+})
+
+// --- 一言开关与拼接簇（HITOKOTO 开关口径、3s 短超时、响应防御）---
+checkS('一言: HITOKOTO 显式 true 时请求一言并拼接 desp（含 from 缺省不输出 undefined）', async () => {
+  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: true })
+  const restoreGot = mockGotForChannels((url) => {
+    if (String(url).includes('hitokoto')) return JSON.stringify({ hitokoto: '一句', from: '出处' })
+    return JSON.stringify({ code: 200 })
+  })
+  try {
+    let hitokotoOpts = null
+    const origGet = gotModule.get
+    gotModule.get = (url, opts) => { if (String(url).includes('hitokoto')) hitokotoOpts = opts; return origGet(url, opts) }
+    try { await sendNotify('t', '正文') } finally { gotModule.get = origGet }
+    assert.ok(hitokotoOpts, 'HITOKOTO=true 必须请求一言')
+    assert.strictEqual(hitokotoOpts.timeout, 3000, '一言必须 3s 短超时（v3.151）')
+    assert.deepStrictEqual(hitokotoOpts.retry, { limit: 0 }, '必须显式关闭 got 重试（v3.273 S4）')
+  } finally { restore(); restoreGot() }
+})
+
+checkS('一言: 字符串 \'true\' 与 \'TRUE\' 也开启（兼容环境变量字符串形态）', async () => {
+  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: 'true' })
+  const restoreGot = mockGotForChannels((url) => {
+    if (String(url).includes('hitokoto')) return JSON.stringify({ hitokoto: 'x', from: '' })
+    return JSON.stringify({ code: 200 })
+  })
+  try {
+    let called = false
+    const origGet = gotModule.get
+    gotModule.get = (url, opts) => { if (String(url).includes('hitokoto')) called = true; return origGet(url, opts) }
+    try { await sendNotify('t', '正文') } finally { gotModule.get = origGet }
+    assert.strictEqual(called, true, "HITOKOTO='true' 字符串必须开启")
+  } finally { restore(); restoreGot() }
+})
+
+checkS('一言: 0 / \'false\' / undefined 均关闭（旧逻辑仅排 \'false\'，\'0\' 曾误开）', async () => {
+  for (const v of [0, 'false', '0', undefined, '']) {
+    const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: v })
+    const restoreGot = mockGotForChannels((url) => {
+      if (String(url).includes('hitokoto')) return JSON.stringify({ hitokoto: 'x', from: '' })
+      return JSON.stringify({ code: 200 })
+    })
+    try {
+      let called = false
+      const origGet = gotModule.get
+      gotModule.get = (url, opts) => { if (String(url).includes('hitokoto')) called = true; return origGet(url, opts) }
+      try { await sendNotify('t', '正文') } finally { gotModule.get = origGet }
+      assert.strictEqual(called, false, `HITOKOTO=${JSON.stringify(v)} 必须关闭`)
+    } finally { restore(); restoreGot() }
+  }
+})
+
+checkS('一言: 一言失败不阻塞推送（catch 跳过，主通道照发）', async () => {
+  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: true })
+  const restoreGot = mockGotForChannels((url) => {
+    if (String(url).includes('hitokoto')) return 'not-json{{' // 解析失败
+    return JSON.stringify({ code: 200 })
+  })
+  try {
+    const res = await sendNotify('t', '正文')
+    assert.deepStrictEqual(res.successfulChannels, ['息知'], '一言挂掉不得影响主推送')
+  } finally { restore(); restoreGot() }
+})
