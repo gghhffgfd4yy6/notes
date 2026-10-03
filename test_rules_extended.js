@@ -62,37 +62,75 @@ console.log('=== xbk_rules.js 扩展测试 ===')
 // ===== compileRules =====
 check('compileRules: 空配置返回空编译结果', () => {
   const r = engine.compileRules({})
-  assert.ok(r && typeof r === 'object', '应返回对象')
+  // 契约：空配置下字段一律未编译（null），仅保留 __compiled 旗标
+  assert.deepStrictEqual(Object.keys(r).sort(), ['__compiled', 'keyword', 'pingbitime', 'title'])
+  assert.strictEqual(r.keyword, null, '未配置的字段必须为 null（不得落成字符串语义）')
+  assert.strictEqual(r.__compiled, true, '必须打上 __compiled 旗标')
 })
 
 check('compileRules: 非字符串值跳过并告警', () => {
-  const r = engine.compileRules({ keyword: 123 })
-  assert.ok(r, '应返回结果（非字符串值被跳过）')
+  const warns = []
+  const origWarn = console.warn
+  try {
+    console.warn = (...a) => warns.push(a.join(' '))
+    const r = engine.compileRules({ keyword: 123 })
+    assert.strictEqual(r.keyword, null, '非字符串值必须置 null（不得保留为字符串语义）')
+  } finally { console.warn = origWarn }
+  assert.ok(warns.some(w => w.includes('必须为字符串')), '非字符串值应告警')
 })
 
 check('compileRules: 正常规则编译成功', () => {
   const r = engine.compileRules({ keyword: 'cat###abc' })
-  assert.ok(r, '应返回编译结果')
+  assert.strictEqual(r.keyword._type, 'multi', '分类###值 形态应编译为 multi')
+  assert.strictEqual(r.keyword.rules.length, 1, '应恰好编译出 1 条规则')
+  assert.strictEqual(r.keyword.rules[0].val.source, 'abc', '值正则应保留原文')
 })
 
 check('compileRules: 非法正则跳过', () => {
-  const r = engine.compileRules({ keyword: 'cat###[invalid' })
-  assert.ok(r, '非法正则应被跳过，不崩溃')
+  const warns = []
+  const origWarn = console.warn
+  try {
+    console.warn = (...a) => warns.push(a.join(' '))
+    const r = engine.compileRules({ keyword: 'cat###[invalid' })
+    // re2 缺失时静默置空行（不回退 V8），multi 骨架仍在但规则数为 0
+    assert.strictEqual(r.keyword._type, 'multi', '非法正则行应编译为 multi 骨架')
+    assert.strictEqual(r.keyword.rules.length, 0, '非法正则行必须被跳过（规则数 0）')
+  } finally { console.warn = origWarn }
+  assert.deepStrictEqual(warns, [], 're2 缺失时不得回退 V8，也不得告警（口径与 test_rules.js planB 一致）')
 })
 
 check('compileRules: 多行规则', () => {
   const r = engine.compileRules({ keyword: 'cat1###abc\ncat2###def' })
-  assert.ok(r, '多行规则应编译成功')
+  assert.strictEqual(r.keyword._type, 'multi', '多行应编译为 multi')
+  assert.strictEqual(r.keyword.rules.length, 2, '两行应各编译出 1 条规则')
+  assert.strictEqual(r.keyword.rules[0].val.source, 'abc', '第 1 行值应正确')
+  assert.strictEqual(r.keyword.rules[1].val.source, 'def', '第 2 行值应正确')
 })
 
 check('compileRules: 行包含多个 ### 仅前两段生效', () => {
-  const r = engine.compileRules({ keyword: 'cat###val###extra' })
-  assert.ok(r, '多个 ### 应仅前两段生效')
+  const warns = []
+  const origWarn = console.warn
+  let r
+  try {
+    console.warn = (...a) => warns.push(a.join(' '))
+    r = engine.compileRules({ keyword: 'cat###val###extra' })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(r.keyword.rules.length, 1, '仅前两段生效，应只编译出 1 条规则')
+  assert.strictEqual(r.keyword.rules[0].cat.source, 'cat', '第 1 段作为分类正则')
+  assert.strictEqual(r.keyword.rules[0].val.source, 'val', '第 2 段作为值正则（第 3 段丢弃）')
+  assert.ok(warns.some(w => w.includes('多个 ###')), '多个 ### 应告警')
 })
 
 check('compileRules: 值为空跳过（避免永真规则）', () => {
-  const r = engine.compileRules({ keyword: 'cat###' })
-  assert.ok(r, '空值应被跳过')
+  const warns = []
+  const origWarn = console.warn
+  let r
+  try {
+    console.warn = (...a) => warns.push(a.join(' '))
+    r = engine.compileRules({ keyword: 'cat###' })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(r.keyword._type, 'multi', '空值行应保留 multi 骨架')
+  assert.strictEqual(r.keyword.rules.length, 0, '空值行必须被跳过（避免永真规则，规则数 0）')
 })
 
 // ===== compileRules: pingbitime 上限 / 抛错 getter（qodo #147-3）=====
