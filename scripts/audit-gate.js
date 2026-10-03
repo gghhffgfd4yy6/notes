@@ -28,9 +28,15 @@ function main () {
     console.error('❌ audit-result.json 不是合法 JSON：', e.message)
     process.exit(1)
   }
-  const vulns = (data && data.vulnerabilities) || {}
+  // schema 漂移防护：vulnerabilities 缺失/非对象时判为基础设施异常，fail-closed（任务2 审查 finding）
+  if (!data || typeof data.vulnerabilities !== 'object' || data.vulnerabilities === null || Array.isArray(data.vulnerabilities)) {
+    console.error('❌ audit-result.json 缺少 vulnerabilities 字段（npm audit 可能异常失败/网络错误/schema 漂移），fail-closed 拒绝放行')
+    process.exit(1)
+  }
+  const vulns = data.vulnerabilities
   const entries = Object.values(vulns)
-  const high = entries.filter(v => v.severity === 'high' || v.severity === 'critical')
+  // severity 归一化：防御大小写变体被静默放行（任务2 审查 finding）
+  const high = entries.filter(v => String(v.severity || '').toLowerCase() === 'high' || String(v.severity || '').toLowerCase() === 'critical')
   if (high.length === 0) {
     console.log('✅ 安全审计通过：无高危及以上漏洞')
     return

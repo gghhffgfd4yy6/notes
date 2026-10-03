@@ -1848,19 +1848,24 @@ check('RE2 警告: RE2C 可用时只清理残留标记、不发警告', () => {
 
 function makeRe2WarnApp ({ fs, cacheDir, alive = () => false, start = 'abc', sendAlert }) {
   return createApp({
-    Config: {},
-    Utils: { safeErrorText: (e, d) => String((e && e.message) || d) },
+    Config: { alert: { enabled: true } },
+    Utils: { safeErrorText: (e, d) => String((e && e.message) || d), num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d } },
     Formatter: {},
     RuleEngine: {},
     FilterEngine: {},
     MessageStore: { cacheDir, _getTombstoneProcessStart: () => start, _isTombstoneLockProcessAlive: () => alive() },
     Network: {},
-    Pusher: {},
+    Pusher: sendAlert ? { send: async () => { const r = await sendAlert(); if (r === false) throw new Error('send failed'); return r } } : {},
     fs,
     path: require('path'),
     crypto: require('crypto'),
-    readSafeTextResult: () => ({ status: 'missing', text: '' }),
-    writeAtomic: () => true,
+    readSafeTextResult: (p, maxBytes) => {
+      if (!fs.existsSync(p)) return { status: 'missing', text: '' }
+      const text = fs.readFileSync(p)
+      if (Buffer.byteLength(text) > maxBytes) return { status: 'oversize', text: '' }
+      return { status: 'ok', text: String(text) }
+    },
+    writeAtomic: (p, text) => { fs.writeFileSync(p, text); return true },
     isRegularOrMissing: () => true,
     STATE_TEXT_MAX_BYTES: 262144,
     DEFAULT_MAX_SIZE: 1048576,
@@ -1886,7 +1891,7 @@ const stamp = (() => {
 })()
 const statePath = dir + '/re2warn.state.' + stamp
 
-check('RE2 警告: 标记缺失时 _warnMissingRe2 创建 pending 标记并触发警告', async () => {
+checkAsync('RE2 警告: 标记缺失时 _warnMissingRe2 创建 pending 标记并触发警告', async () => {
   const mfs = makeMemFs()
   let alerted = 0
   const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, sendAlert: async () => { alerted++; return true } })
@@ -1900,7 +1905,7 @@ check('RE2 警告: 标记缺失时 _warnMissingRe2 创建 pending 标记并触�
   assert.strictEqual(alerted, 1, '必须发送一次提醒')
 })
 
-check('RE2 警告: 当天已有 completed 标记时不重复提醒', async () => {
+checkAsync('RE2 警告: 当天已有 completed 标记时不重复提醒', async () => {
   const mfs = makeMemFs()
   mfs.writeFileSync(statePath, JSON.stringify({ warnedAt: Date.now(), pid: process.pid, start: 'abc', status: 'completed' }))
   let alerted = 0
@@ -1909,7 +1914,7 @@ check('RE2 警告: 当天已有 completed 标记时不重复提醒', async () =>
   assert.strictEqual(alerted, 0, 'completed 标记必须压制提醒')
 })
 
-check('RE2 警告: 发送失败(false)时标记被删除、下次可重试', async () => {
+checkAsync('RE2 警告: 发送失败(false)时标记被删除、下次可重试', async () => {
   const mfs = makeMemFs()
   let calls = 0
   const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, sendAlert: async () => { calls++; return false } })
@@ -1918,7 +1923,7 @@ check('RE2 警告: 发送失败(false)时标记被删除、下次可重试', asy
   assert.strictEqual(calls, 1)
 })
 
-check('RE2 警告: pending 标记+持有进程已退出=残留，删除重建并警告', async () => {
+checkAsync('RE2 警告: pending 标记+持有进程已退出=残留，删除重建并警告', async () => {
   const mfs = makeMemFs()
   mfs.writeFileSync(statePath, JSON.stringify({ warnedAt: Date.now(), pid: 999999, start: 'dead', status: 'pending' }))
   let alerted = 0
@@ -1929,7 +1934,7 @@ check('RE2 警告: pending 标记+持有进程已退出=残留，删除重建并
   assert.strictEqual(parsed.status, 'completed', '重发成功后新标记应为 completed')
 })
 
-check('RE2 警告: 解析失败的标记保守保留、不回收不警告', async () => {
+checkAsync('RE2 警告: 解析失败的标记保守保留、不回收不警告', async () => {
   const mfs = makeMemFs()
   mfs.writeFileSync(statePath, 'not-json{{')
   let alerted = 0
@@ -1939,7 +1944,7 @@ check('RE2 警告: 解析失败的标记保守保留、不回收不警告', asyn
   assert.strictEqual(mfs._files.has(statePath), true, '损坏标记文件不得被删除')
 })
 
-check('RE2 警告: 7 天前的标记被清理，当天的保留', async () => {
+checkAsync('RE2 警告: 7 天前的标记被清理，当天的保留', async () => {
   const mfs = makeMemFs()
   const oldStamp = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date(Date.now() - 9 * 86400000))
   mfs.writeFileSync(dir + '/re2warn.state.' + oldStamp, '{"status":"completed"}')
@@ -1987,7 +1992,7 @@ check('RE2 警告锁: 释放时关闭 fd 并删除锁文件；未获取时释放
 
 function makeHealthApp ({ fs, cacheDir = dir, alive = () => false, start = 'abc', sendAlert, threshold = 3, intervalMs = 3600000 }) {
   return createApp({
-    Config: { channelHealth: { consecutiveFailures: threshold, intervalMs } },
+    Config: { channelHealth: { enabled: true, consecutiveFailures: threshold, intervalMs } },
     Utils: {
       safeErrorText: (e, d) => String((e && e.message) || d),
       num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d }
@@ -2001,8 +2006,13 @@ function makeHealthApp ({ fs, cacheDir = dir, alive = () => false, start = 'abc'
     fs,
     path: require('path'),
     crypto: require('crypto'),
-    readSafeTextResult: () => ({ status: 'missing', text: '' }),
-    writeAtomic: () => true,
+    readSafeTextResult: (p, maxBytes) => {
+      if (!fs.existsSync(p)) return { status: 'missing', text: '' }
+      const text = fs.readFileSync(p)
+      if (Buffer.byteLength(text) > maxBytes) return { status: 'oversize', text: '' }
+      return { status: 'ok', text: String(text) }
+    },
+    writeAtomic: (p, text) => { fs.writeFileSync(p, text); return true },
     isRegularOrMissing: () => true,
     STATE_TEXT_MAX_BYTES: 262144,
     DEFAULT_MAX_SIZE: 1048576,
@@ -2078,7 +2088,7 @@ check('恢复认领: 租约内(60s)的 pending+claim 视为存活', () => {
   assert.strictEqual(app._isChannelRecoverClaimAlive({ recoverAlertClaim: 'c', recoverAlertClaimAt: 'NaN' }, now), false, '非法 claimedAt 必须失效（宁可重发不卡死）')
 })
 
-check('恢复认领释放: 令牌匹配才清 pending；不匹配不动作', async () => {
+checkAsync('恢复认领释放: 令牌匹配才清 pending；不匹配不动作', async () => {
   const mfs = makeMemFs()
   const app = makeHealthApp({ fs: mfs })
   mfs.writeFileSync(healthPath, JSON.stringify({
@@ -2088,14 +2098,15 @@ check('恢复认领释放: 令牌匹配才清 pending；不匹配不动作', asy
   await app._releaseChannelRecoverClaim(healthPath, 'wxpusher', 'other-token')
   let state = JSON.parse(mfs.readFileSync(healthPath))
   assert.strictEqual(state.wxpusher.recoverAlertPending, true, 'claim 不匹配不得动作')
-  // 匹配：清 pending、保留失败计数
+  // 匹配：释放认领（FX3 语义=删 claim、保留 pending 与失败计数，下一轮无需等租约即可重发）
   await app._releaseChannelRecoverClaim(healthPath, 'wxpusher', 'tok-1')
   state = JSON.parse(mfs.readFileSync(healthPath))
-  assert.strictEqual(state.wxpusher.recoverAlertPending, undefined, '匹配 claim 释放后 pending 必须清除')
+  assert.strictEqual(state.wxpusher.recoverAlertPending, true, '匹配 claim 释放后 pending 必须保留（下一轮重发）')
+  assert.strictEqual(state.wxpusher.recoverAlertClaim, undefined, '匹配 claim 释放后 claim 必须删除（允许重发）')
   assert.strictEqual(state.wxpusher.consecutiveFailures, 3, '释放认领必须保留失败计数（下一轮仍可触发恢复）')
 })
 
-check('恢复认领清零: 通道恢复成功后计数清零、lastRecoveredAt 更新', async () => {
+checkAsync('恢复认领清零: 通道恢复成功后计数清零、lastRecoveredAt 更新', async () => {
   const mfs = makeMemFs()
   const app = makeHealthApp({ fs: mfs })
   const claim = 'tok-9'
@@ -2111,9 +2122,9 @@ check('恢复认领清零: 通道恢复成功后计数清零、lastRecoveredAt �
 
 // --- _updateChannelHealth 主流程用例（失败计数 / 告警入队 / 恢复认领 / 状态损坏防御）---
 // _sendAlert 经 makeHealthApp 无注入——检查其实现依赖 getNotify/Pusher。用 sendAlert 注入参数版本。
-function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000 }) {
+function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000, pusher }) {
   return createApp({
-    Config: { channelHealth: { consecutiveFailures: threshold, intervalMs } },
+    Config: { channelHealth: { enabled: true, consecutiveFailures: threshold, intervalMs } },
     Utils: {
       safeErrorText: (e, d) => String((e && e.message) || d),
       num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d }
@@ -2123,12 +2134,17 @@ function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, t
     FilterEngine: {},
     MessageStore: { cacheDir, _getTombstoneProcessStart: () => 's', _isTombstoneLockProcessAlive: () => alive() },
     Network: {},
-    Pusher: {},
+    Pusher: pusher || {},
     fs,
     path: require('path'),
     crypto: require('crypto'),
-    readSafeTextResult: () => ({ status: 'missing', text: '' }),
-    writeAtomic: () => true,
+    readSafeTextResult: (p, maxBytes) => {
+      if (!fs.existsSync(p)) return { status: 'missing', text: '' }
+      const text = fs.readFileSync(p)
+      if (Buffer.byteLength(text) > maxBytes) return { status: 'oversize', text: '' }
+      return { status: 'ok', text: String(text) }
+    },
+    writeAtomic: (p, text) => { fs.writeFileSync(p, text); return true },
     isRegularOrMissing: () => true,
     STATE_TEXT_MAX_BYTES: 262144,
     DEFAULT_MAX_SIZE: 1048576,
@@ -2147,7 +2163,7 @@ function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, t
   })
 }
 
-check('健康更新: 单次失败计 1、未达阈值不入告警', async () => {
+checkAsync('健康更新: 单次失败计 1、未达阈值不入告警', async () => {
   const mfs = makeMemFs()
   const app = makeHealthApp2({ fs: mfs, threshold: 3 })
   await app._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
@@ -2156,7 +2172,7 @@ check('健康更新: 单次失败计 1、未达阈值不入告警', async () => 
   assert.strictEqual(state.pushdeer.lastFailureAt > 0, true, 'lastFailureAt 必须落盘')
 })
 
-check('健康更新: 连续失败达阈值入告警 + lastAlertAt 即时落盘（APP2-01 限频按尝试计时）', async () => {
+checkAsync('健康更新: 连续失败达阈值入告警 + lastAlertAt 即时落盘（APP2-01 限频按尝试计时）', async () => {
   const mfs = makeMemFs()
   const app = makeHealthApp2({ fs: mfs, threshold: 2 })
   // 预置已失败 1 次
@@ -2167,19 +2183,30 @@ check('健康更新: 连续失败达阈值入告警 + lastAlertAt 即时落盘�
   assert.ok(state.pushdeer.lastAlertAt > 0, '达到阈值必须即时落盘 lastAlertAt（APP2-01，防告警通道挂掉时限频失效每轮重发）')
 })
 
-check('健康更新: 恢复通道清零计数并原子认领恢复告警（recoverAlertPending+claim）', async () => {
+checkAsync('健康更新: 恢复告警送达确认后清零（APP2-02 闭环：pending/claim/计数全清）', async () => {
   const mfs = makeMemFs()
-  const app = makeHealthApp2({ fs: mfs, threshold: 2 })
+  const app = makeHealthApp2({ fs: mfs, threshold: 2, pusher: { send: async () => {} } })
   mfs.writeFileSync(healthPath, JSON.stringify({ pushdeer: { consecutiveFailures: 2, lastFailureAt: 1, lastAlertAt: 5, lastRecoveredAt: 0, recoverAlertPending: true } }))
   await app._updateChannelHealth({ successfulChannels: ['pushdeer'], failures: [] })
   const state = JSON.parse(mfs.readFileSync(healthPath))
-  assert.strictEqual(state.pushdeer.consecutiveFailures, 2, '恢复告警未确认送达前必须保留失败计数（APP2-02 不丢）')
-  assert.strictEqual(state.pushdeer.recoverAlertPending, true, '恢复告警未确认前 pending 保留')
-  assert.ok(typeof state.pushdeer.recoverAlertClaim === 'string' && state.pushdeer.recoverAlertClaim.length > 0, '入队同时必须原子认领（FX3 防重复通知竞态）')
-  assert.ok(state.pushdeer.recoverAlertClaimAt > 0, '认领时间必须落盘')
+  assert.strictEqual(state.pushdeer.consecutiveFailures, 0, '恢复确认送达后失败计数必须清零（APP2-02）')
+  assert.ok(state.pushdeer.recoverAlertPending === undefined, '确认送达后 pending 必须清除')
+  assert.ok(state.pushdeer.recoverAlertClaim === undefined, '确认送达后 claim 必须清除')
+  assert.ok(state.pushdeer.lastRecoveredAt > 0, 'lastRecoveredAt 必须更新')
 })
 
-check('健康更新: 状态文件损坏时跳过本轮以保留原文件', async () => {
+checkAsync('健康更新: 恢复告警发送失败释放认领、保留 pending 与计数（FX3 重发语义）', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp2({ fs: mfs, threshold: 2, pusher: { send: async () => { throw new Error('down') } } })
+  mfs.writeFileSync(healthPath, JSON.stringify({ pushdeer: { consecutiveFailures: 2, lastFailureAt: 1, lastAlertAt: 5, lastRecoveredAt: 0, recoverAlertPending: true } }))
+  await app._updateChannelHealth({ successfulChannels: ['pushdeer'], failures: [] })
+  const state = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(state.pushdeer.consecutiveFailures, 2, '发送失败时失败计数必须保留（APP2-02 不丢）')
+  assert.strictEqual(state.pushdeer.recoverAlertPending, true, '发送失败时 pending 必须保留（下一轮重发）')
+  assert.ok(state.pushdeer.recoverAlertClaim === undefined, '发送失败必须释放本次认领（FX3：无需等租约即可重发）')
+})
+
+checkAsync('健康更新: 状态文件损坏时跳过本轮以保留原文件', async () => {
   const mfs = makeMemFs()
   const app = makeHealthApp2({ fs: mfs })
   mfs.writeFileSync(healthPath, 'not-json{{')
@@ -2187,7 +2214,7 @@ check('健康更新: 状态文件损坏时跳过本轮以保留原文件', async
   assert.strictEqual(mfs.readFileSync(healthPath), 'not-json{{', '损坏状态必须原样保留（不得覆盖）')
 })
 
-check('健康更新: 锁被他人持有时跳过本轮且不动状态文件', async () => {
+checkAsync('健康更新: 锁被他人持有时跳过本轮且不动状态文件', async () => {
   const mfs = makeMemFs()
   const app = makeHealthApp2({ fs: mfs, alive: () => true })
   mfs.writeFileSync(healthPath + '.lock', '999999:x')
