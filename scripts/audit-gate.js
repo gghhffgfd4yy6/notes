@@ -66,8 +66,10 @@ function main () {
     }
   }
   for (const item of hitAllowed) {
-    const ghsa = /\(([^)]+)\)/.exec(item)
-    const reason = ghsa ? (ALLOWED_ADVISORIES.get(ghsa[1]) || '') : ''
+    const open = item.indexOf('(')
+    const close = item.lastIndexOf(')')
+    const ghsaId = open >= 0 && close > open ? item.slice(open + 1, close) : ''
+    const reason = ghsaId ? (ALLOWED_ADVISORIES.get(ghsaId) || '') : ''
     console.log(`::warning title=安全审计豁免显形::${item} 被显式豁免：${reason}`)
     console.log(`  ⚠️ 豁免：${item}`)
   }
