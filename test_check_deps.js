@@ -520,7 +520,10 @@ test('F6 默认 load 以项目根为基准：scripts/ 下同名坏包不得影�
 // 只有真正走完「默认 manifest → 默认 resolve/load（ROOT 基准）」的检查才会留下两条记账。
 // → 靶向移除 CLI 守卫（= 基线形态）或让清单退回硬编码，本条立刻红。
 test('F5 无参调用（默认 manifest/resolve/load）在隔离依赖树上真的完成检查且静默通过', () => {
-  const marker = path.join(os.tmpdir(), `check-deps-run-marker-${process.pid}-${Date.now()}.log`)
+  // 私有临时目录（mkdtemp）：不在共享 tmpdir 用可预测文件名建文件（CodeQL js/insecure-temporary-file，
+  // 与 test_run_mutation_cli.js 的断点文件同款处理）
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-deps-marker-'))
+  const marker = path.join(markerDir, 'run-marker.log')
   const dir = makeCheckDepsSandbox({
     manifest: { name: 'sandbox', version: '1.0.0', dependencies: { 'xbk-default-path-a': '1.0.0' }, optionalDependencies: { 'xbk-default-path-b': '1.0.0' } },
     deps: ['xbk-default-path-a', 'xbk-default-path-b'],
@@ -546,7 +549,7 @@ test('F5 无参调用（默认 manifest/resolve/load）在隔离依赖树上真�
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
-    fs.rmSync(marker, { force: true })
+    fs.rmSync(markerDir, { recursive: true, force: true })
   }
 })
 

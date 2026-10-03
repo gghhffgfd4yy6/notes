@@ -232,6 +232,20 @@ function run (ymlText) {
   assert.ok(surplus.stderr.includes('行段格式非法'), `应报「行段格式非法」，实际 stderr: ${surplus.stderr}`)
   console.log('✅ 多余冒号段 fail-loud 断言通过')
 
+  // 起止颠倒（校验 0）：「1-2000, 2001-1470」能被拼成连续且末段终点合法——旧实现（无 start>end
+  // 校验）对这类夹具只报末段/非末段的行数错甚至可能漏报，start>end 这一条必须自己点名。
+  const reversed = run(buildYml({ [TEST_FILE]: ['1-2000', '2001-1470'] }))
+  assert.strictEqual(reversed.status, 1, '起止颠倒的行段应 exit 1')
+  assert.ok(reversed.stderr.includes('起止颠倒'), `应报行段起止颠倒（stderr），实际 stderr: ${reversed.stderr}`)
+
+  // 非末段越界（校验 3 的前置兜底）：非末段终点超过实际行数必须被单独点名，而不是只被末段
+  // 那条“超过文件实际行数”模糊带过——错误应指出到底是哪一段越界。
+  const nonLastOver = run(buildYml({ [TEST_FILE]: ['1-999999', '1000000-1000000'] }))
+  assert.strictEqual(nonLastOver.status, 1, '非末段超过实际行数应 exit 1')
+  assert.ok(nonLastOver.stderr.includes('非末段'), `应报非末段越界（stderr），实际 stderr: ${nonLastOver.stderr}`)
+
+  console.log('✅ 起止颠倒 / 非末段越界 fail-loud 断言通过')
+
   // ===== require 路径的失败必须 throw（#136 review A3）：此前删掉 throw 回到「静默返回」本套件仍全绿 =====
   // 直跑路径由上面的 run() 子进程覆盖；require 路径此前无任何断言。用 -e 使 require.main 为
   // undefined（即真实的「被 require」语义），注入空矩阵 yml 后必须抛错而非静默返回。
