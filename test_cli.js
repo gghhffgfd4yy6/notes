@@ -3,26 +3,31 @@
 const assert = require('assert')
 const fs = require('fs')
 const os = require('os')
-const { execFileSync, spawnSync } = require('child_process')
+const { spawnSync } = require('child_process')
 const path = require('path')
 
 const entry = path.join(__dirname, 'qinglong', 'xbk_push.js')
 
-try {
-  execFileSync(process.execPath, [entry, '--check'], {
-    cwd: __dirname,
-    encoding: 'utf8',
-    env: { ...process.env, XBK_AUTO_INSTALL_DEPS: '' },
-    timeout: 10000,
-    stdio: ['ignore', 'pipe', 'pipe']
-  })
-  assert.fail('--check 在当前缺少 re2/通知配置环境中应返回非零')
-} catch (error) {
-  const output = `${error.stdout || ''}${error.stderr || ''}`
-  assert.match(output, /Node\.js 版本/)
-  assert.match(output, /re2 原生模块/)
-  assert.match(output, /通知通道/)
+// 旧口径断言「--check 必然失败」，只在缺 re2/通知配置的环境成立（CI 绿、配置齐全的开发机必红）。
+// 改为环境无关的契约断言：①诊断输出必须包含三类检查项；②退出码与实际失败项数一致（有 ❌ ⇒ 1，全 ✅ ⇒ 0）。
+// re2 缺失拒绝启动的路径已由 test_loop.js 的 ensureDependencies 注入用例确定性地覆盖。
+const checkRun = spawnSync(process.execPath, [entry, '--check'], {
+  cwd: __dirname,
+  encoding: 'utf8',
+  env: { ...process.env, XBK_AUTO_INSTALL_DEPS: '' },
+  timeout: 10000,
+  stdio: ['ignore', 'pipe', 'pipe']
+})
+const checkOutput = `${checkRun.stdout || ''}${checkRun.stderr || ''}`
+for (const label of ['Node.js 版本', 're2 原生模块', '通知通道']) {
+  assert.ok(checkOutput.includes(label), `--check 诊断输出应包含「${label}」检查项（实际输出：${JSON.stringify(checkOutput)}）`)
 }
+const failedItems = checkOutput.split('\n').filter(line => line.includes('❌'))
+assert.strictEqual(
+  checkRun.status,
+  failedItems.length > 0 ? 1 : 0,
+  `--check 退出码必须与诊断结论一致（${failedItems.length} 项失败），实际 status=${checkRun.status}`
+)
 
 const source = require('fs').readFileSync(entry, 'utf8')
 assert.match(source, /--dry-run/)
