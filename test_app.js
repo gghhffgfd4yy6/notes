@@ -2941,7 +2941,7 @@ console.log('========================================\n');
     }
   })
 
-  await test('通道健康: enabled=false 时关闭侧守卫早退（无状态文件、无锁、无健康告警）', async () => {
+  await test('通道健康: enabled=false 时完整 run() 链路关闭侧早退（无状态文件、无锁、无健康告警）', async () => {
     reset()
     const originalCacheDir = Config.cache.dir
     const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
@@ -2951,11 +2951,20 @@ console.log('========================================\n');
       Config.cache.dir = isolatedDir
       fs.mkdirSync(stateDir, { recursive: true })
       Config.channelHealth.enabled = false
-      await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
+      Config.channelHealth.consecutiveFailures = 1
+      Config.channelHealth.intervalMs = 3600000
+      // 走真实 run()：推送必失败 → channelFailures 非空 → 健康观测点（xbk_app.js:1637）被触发，
+      // enabled=false 时必须整段早退——不落状态、不加锁、不发健康告警（Sourcery #197：接线级验证）
+      fakeData = [makeItem({ id: 9901 })]
+      setPushUrl('t_channel_health_disabled')
+      notifyMock.sendNotify = async () => { throw new Error('channel down') }
+      const summary = await xbk.run()
+      assert(summary && summary.failed >= 1, `本轮应有失败推送，实际 ${JSON.stringify(summary)}`)
       assert(!fs.existsSync(path.join(stateDir, 'channel-health.state')), '关闭侧不得创建 channel-health 状态文件')
       assert(!fs.existsSync(path.join(stateDir, 'channel-health.state.lock')), '关闭侧不得创建健康锁文件')
       assert(!pushCalls.some(c => c.text.includes('通道异常') || c.text.includes('通道恢复')), '关闭侧不得发送健康告警')
     } finally {
+      notifyMock.sendNotify = defaultNotifySend
       Config.cache.dir = originalCacheDir
       Config.channelHealth.enabled = originalEnabled
       try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
