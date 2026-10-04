@@ -2945,6 +2945,8 @@ console.log('========================================\n');
     reset()
     const originalCacheDir = Config.cache.dir
     const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalThreshold = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const originalInterval = Config.channelHealth && Config.channelHealth.intervalMs
     const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_disabled_${Date.now()}`
     const stateDir = path.join(__dirname, isolatedDir)
     try {
@@ -2967,6 +2969,8 @@ console.log('========================================\n');
       notifyMock.sendNotify = defaultNotifySend
       Config.cache.dir = originalCacheDir
       Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalThreshold
+      Config.channelHealth.intervalMs = originalInterval
       try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
     }
   })
