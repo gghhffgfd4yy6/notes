@@ -2073,6 +2073,242 @@ check('_releaseTombstoneLock: 自己的 token 才删锁、他人 token 不删、
   assert.strictEqual(threw, false, '非 ENOENT 读盘错误也必须静默（锁清理非关键路径）')
 })
 
+// ===== G11-MS：缓存自愈/墓碑锁/路径截断的未达分支（c8 实测 L271-272/330/348/354/382/463/470/636-639/753-774/791）=====
+// 判重缓存是本仓最高风险区：这些分支的共同语义是「恢复不了就 fail-closed 保持写闸门，
+// 绝不当着未读到的存量把磁盘覆写成空缓存」。它们一旦写坏（例如隔离名生成失败时改走「直接覆写」），
+// 现有关于「成功恢复」的用例照样绿，而线上表现为整轮零推送或存量丢失。故逐条钉失败出口。
+check('MS-01 init: 目录创建失败必须抛出原始异常并打印路径；getter 二次求值也失败时用占位符诊断', () => {
+  const dir = path.join(FAKE_ROOT, 'xianbaoku_cache')
+  const outsidePath = path.resolve(FAKE_ROOT, '..', 'outside-root')
+  // ① 常规形态：getter 正常、mkdir 抛错 ⇒ 诊断带真实路径 + 原异常照常抛出
+  const fs1 = {
+    existsSync: () => false,
+    lstatSync: () => ({ isDirectory: () => true }),
+    realpathSync: (p) => p,
+    mkdirSync: () => { throw Object.assign(new Error('EACCES: cannot create cache dir'), { code: 'EACCES' }) }
+  }
+  const s1 = storeWithFs(fs1)
+  let thrown1 = null
+  const errs1 = captureConsole('error', () => { try { s1.init() } catch (e) { thrown1 = e } })
+  assert.ok(thrown1, '目录创建失败必须抛给调用方（v3.245 起不得吞错）')
+  assert.strictEqual(thrown1.message, 'EACCES: cannot create cache dir', '抛出的必须是原始异常')
+  assert.ok(errs1.some(l => l.startsWith(`缓存目录创建失败: ${dir}`)), `诊断必须带目录路径：${JSON.stringify(errs1)}`)
+  // ② catch 内二次求值 getter 也炸（校验间目录被换成指向根外的符号链接）
+  // ⇒ 诊断必须用占位符、不得崩在 getter 上，且原异常仍必须抛出（旧写法会让 getter 异常顶替原始异常）
+  let firstEval = true
+  const fs2 = {
+    existsSync: () => false,
+    lstatSync: () => ({ isDirectory: () => true }),
+    realpathSync: (p) => { if (firstEval) { firstEval = false; return p } return outsidePath },
+    mkdirSync: () => { throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }) }
+  }
+  const s2 = storeWithFs(fs2)
+  let thrown2 = null
+  const errs2 = captureConsole('error', () => { try { s2.init() } catch (e) { thrown2 = e } })
+  assert.ok(thrown2, '二次求值失败也不得吞掉原始异常')
+  assert.strictEqual(thrown2.message, 'ENOSPC: no space left on device',
+    `抛出的必须仍是 mkdir 的原始异常（不能被 getter 的「所有候选目录不可用」顶替，实际 ${thrown2.message}）`)
+  assert.ok(errs2.some(l => l.includes('<cacheDir 求值失败>')), `诊断必须用占位符而不是崩在 getter 上：${JSON.stringify(errs2)}`)
+})
+
+check('MS-02 _isResidualTombstoneLockName: 非字符串一律 false，三类可回收名字必须精确匹配', () => {
+  const s = createProbeStore()
+  assert.strictEqual(s._isResidualTombstoneLockName(undefined), false, 'undefined 必须 false')
+  assert.strictEqual(s._isResidualTombstoneLockName(123), false, '数字必须 false')
+  assert.strictEqual(s._isResidualTombstoneLockName({ endsWith: () => true }), false, '伪装对象必须 false（typeof 闸门）')
+  assert.strictEqual(s._isResidualTombstoneLockName('a.seen.lock'), true, '单文件墓碑锁')
+  assert.strictEqual(s._isResidualTombstoneLockName('.seen.cleanup.lock'), true, '目录级哨兵（精确相等，非后缀）')
+  assert.strictEqual(s._isResidualTombstoneLockName('.seen.cleanup.lock.42.1712345678901.reclaim'), true, '认领中间态')
+  assert.strictEqual(s._isResidualTombstoneLockName('.seen.cleanup.lock.x.1.reclaim'), false, 'pid 非十进制不得回收（可能是别人的活跃锁）')
+  assert.strictEqual(s._isResidualTombstoneLockName('.seen.cleanup.lock.reclaim'), false, '缺字段不得回收')
+})
+
+check('MS-03 哨兵获取：非 EEXIST 必须告警并返回 null；认领 rename 失败必须 null（不得继续清理）', () => {
+  const dir = path.join(FAKE_ROOT, 'xianbaoku_cache')
+  const guardPath = path.join(dir, '.seen.cleanup.lock')
+  // ① 非 EEXIST 的 IO 故障（旧实现静默 return null，启动清理与墓碑写入门径失效却无诊断）
+  const fsA = {
+    existsSync: () => true,
+    lstatSync: () => ({ isDirectory: () => true }),
+    realpathSync: (p) => p,
+    writeFileSync: () => { throw Object.assign(new Error('EROFS: read-only file system'), { code: 'EROFS' }) }
+  }
+  const sA = storeWithFs(fsA)
+  const warns = captureConsole('warn', () => { assert.strictEqual(sA._acquireTombstoneCleanupGuard(dir), null, '非 EEXIST 必须 null') })
+  assert.ok(warns.some(l => l.includes('墓碑清理哨兵创建失败（本次跳过清理/墓碑写入）') && l.includes(guardPath)),
+    `必须有显形诊断并带哨兵路径：${JSON.stringify(warns)}`)
+  // ② EEXIST + 持有者已退出 ⇒ 进入原子认领；此时 rename 失败必须返回 null（不得在无哨兵保护下清理）
+  const fsB = {
+    existsSync: () => true,
+    lstatSync: () => ({ isDirectory: () => true }),
+    realpathSync: (p) => p,
+    writeFileSync: () => { throw Object.assign(new Error('EEXIST'), { code: 'EEXIST' }) },
+    readFileSync: () => 'dead-token',
+    renameSync: () => { throw Object.assign(new Error('EXDEV'), { code: 'EXDEV' }) }
+  }
+  const sB = storeWithFs(fsB)
+  sB._isTombstoneLockProcessAlive = () => false // 已退出的持有者
+  assert.strictEqual(sB._acquireTombstoneCleanupGuard(dir), null, 'rename 失败必须放弃本轮（宁可不清理，不能并发清理）')
+  // ③ EEXIST + 持有者仍存活 ⇒ 直接 null，不得触碰 rename
+  let renamed = false
+  const fsC = Object.assign({}, fsB, { renameSync: () => { renamed = true } })
+  const sC = storeWithFs(fsC)
+  sC._isTombstoneLockProcessAlive = () => true
+  assert.strictEqual(sC._acquireTombstoneCleanupGuard(dir), null, '活跃哨兵必须让路')
+  assert.strictEqual(renamed, false, '持有者存活时绝不得认领（否则会把活跃哨兵搬走，双人并发清理）')
+})
+
+check('MS-04 _isTombstoneLockProcessAlive: 读锁内容失败必须保守判「存活」（保留锁，不得误删活跃锁）', () => {
+  const fsA = {
+    existsSync: () => true,
+    lstatSync: () => ({ isDirectory: () => true }),
+    realpathSync: (p) => p,
+    readFileSync: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }) }
+  }
+  const s = storeWithFs(fsA)
+  assert.strictEqual(s._isTombstoneLockProcessAlive(path.join(FAKE_ROOT, 'x.json.seen.lock')), true,
+    '读不到 token 时无法证明持有者已退出 ⇒ 必须判存活（保守保留），误删会让两个进程同时写墓碑')
+})
+
+check('MS-05 getFilePath: 超长扩展名必须放弃扩展名保留内容摘要；仅后缀不同的同长名不得落到同一路径', () => {
+  // 用真 Utils（makeBatchStore 内部是 createUtils）——anonKey 必须随**内容**变化，
+  // 长度型替身会让「单射」断言变成恒真。
+  const s = makeBatchStore({ name: 'ms05.json' }).store
+  // 扩展名本身极长 ⇒ 「-摘要+扩展名」超预算 ⇒ 走「丢扩展名保摘要」分支
+  const longExt = 'ab.' + 'x'.repeat(200) // 203 字节 > 200
+  const base1 = path.basename(s.getFilePath(longExt))
+  assert.ok(Buffer.byteLength(base1, 'utf8') <= 200, `结果必须 ≤200 字节（实际 ${Buffer.byteLength(base1, 'utf8')}）`)
+  assert.ok(!base1.includes('x'.repeat(20)), `扩展名必须被放弃（保留摘要以维持单射）：${base1}`)
+  assert.match(base1, /^ab-/, `基础名必须保留在摘要之前：${base1}`)
+  // 长度相同、内容不同的两个长名 ⇒ 必须落到不同路径（F7 回归的核心不变式）
+  const n2 = 'b'.repeat(120) + '.' + 'y'.repeat(79)
+  const n3 = 'b'.repeat(120) + '.' + 'z'.repeat(79)
+  assert.strictEqual(Buffer.byteLength(n2, 'utf8'), Buffer.byteLength(n3, 'utf8'), '两条名字必须等长，否则测不到摘要的作用')
+  const p2 = s.getFilePath(n2)
+  const p3 = s.getFilePath(n3)
+  assert.notStrictEqual(p2, p3, '仅后缀不同的长名必须落到不同路径（否则两套判重缓存互相覆盖 = 漏推/重推）')
+  assert.ok(Buffer.byteLength(path.basename(p2), 'utf8') <= 200 && Buffer.byteLength(path.basename(p3), 'utf8') <= 200,
+    '单射不得以突破长度上限为代价')
+  // 多字节（代理对）长名：截断必须落在码点边界，不得留孤立高位代理
+  const pairs = '\uD83D\uDE00'.repeat(150) // 150 个 emoji = 600 字节
+  const p4 = s.getFilePath(pairs + '.emoji')
+  const b4 = path.basename(p4)
+  assert.ok(Buffer.byteLength(b4, 'utf8') <= 200, `emoji 长名兜底后仍必须 ≤200 字节（实际 ${Buffer.byteLength(b4, 'utf8')}）`)
+  for (let i = 0; i < b4.length; i++) {
+    const c = b4.charCodeAt(i)
+    if (c >= 0xD800 && c <= 0xDBFF) {
+      const next = b4.charCodeAt(i + 1)
+      assert.ok(next >= 0xDC00 && next <= 0xDFFF, `截断点不得留下孤立高位代理（位置 ${i}）`)
+      i += 1
+    } else {
+      assert.ok(!(c >= 0xDC00 && c <= 0xDFFF), `不得以孤立低位代理开头/出现在非配对位置（位置 ${i}）`)
+    }
+  }
+})
+
+check('MS-06 _corruptBackupPath: 100 个候选全占用 ⇒ null；existsSync 抛错 ⇒ 直接用该候选（不得静默改行为）', () => {
+  const sBusy = storeWithFs({
+    existsSync: () => true, // 任何候选都已存在
+    lstatSync: () => ({ isDirectory: () => true }),
+    realpathSync: (p) => p
+  })
+  assert.strictEqual(sBusy._corruptBackupPath(path.join(FAKE_ROOT, 'xianbaoku_cache', 'a.json')), null,
+    '备份名耗尽必须返回 null（调用方据此 fail-closed，绝不复用可能被覆盖的名字）')
+  const sThrow = storeWithFs({
+    existsSync: () => { throw Object.assign(new Error('ELOOP'), { code: 'ELOOP' }) },
+    lstatSync: () => ({ isDirectory: () => true }),
+    realpathSync: (p) => p
+  })
+  const cand = sThrow._corruptBackupPath(path.join(FAKE_ROOT, 'xianbaoku_cache', 'a.json'))
+  assert.ok(typeof cand === 'string' && cand.endsWith('.bak'), `读占用状态失败时应直接给出候选而非抛穿：${cand}`)
+})
+
+check('MS-07 _tailElements: 转义引号内的 } 与引号不得参与配对；非字符串/无闭合/解析失败一律安全收手', () => {
+  const s = createProbeStore()
+  assert.deepStrictEqual(s._tailElements(''), [], '空串必须 []')
+  assert.deepStrictEqual(s._tailElements(null), [], '非字符串必须 []（不得抛 TypeError）')
+  assert.deepStrictEqual(s._tailElements('{"a": 1'), [], '无闭合花括号 ⇒ 不收（宁可不恢复）')
+  assert.deepStrictEqual(s._tailElements('{not json}'), [], '解析失败必须收手，不得产出半截元素')
+  // 字符串内含 \" 与 } —— 反向扫描若不把转义引号算作「非分隔符」，配对就会错位、丢元素
+  const escaped = '{"id":"a}\\"b"}'
+  const got = s._tailElements(escaped)
+  assert.strictEqual(got.length, 1, `含转义引号与内嵌 } 的尾部元素必须完整恢复 1 条，实际 ${got.length}`)
+  assert.strictEqual(got[0].id, 'a}"b', '恢复出的内容必须与原 JSON 一致')
+  const two = '{"id":"x"}, {"id":"y\\"}"}'
+  const got2 = s._tailElements(two)
+  assert.strictEqual(got2.length, 2, '两个尾部元素都要收（第二个含转义引号）')
+  assert.strictEqual(got2[1].id, 'y"}', '第二个元素内容不得被转义引号截断')
+})
+
+check('MS-08 _memoSet: 淘汰必须跳过数字样键取首个普通字符串键（必须用**多位数**键才测得出 P3 的 \\d 回归）', () => {
+  // 单位数键（如 '0'）测不出来：正则的 `^(?:0|[1-9]…)$` 里有字面 `0` 分支，写坏成 `\\d`
+  // （匹配字面反斜杠+d）时 '0' 仍被判为索引键，两种实现淘汰同一个键 ⇒ 断言恒绿。
+  // 只有多位数数字样键（'10'）在两种实现下分叉：正确=索引键跳过；写坏=被当普通键当成最旧淘汰。
+  const s = createProbeStore()
+  s._MEMO_MAX = 2
+  s._memoSet('10', ['index-key'])
+  s._memoSet('zz-oldest', ['normal-key'])
+  assert.strictEqual(s._memoCount, 2, '夹具必须已打满')
+  assert.deepStrictEqual(Object.keys(s._memoryCache), ['10', 'zz-oldest'],
+    '前提：Object.keys 把整数样键排在前面，所以 keys[0] 并非最旧（本用例正是钉这一点）')
+  const warns = captureConsole('warn', () => { s._memoSet('newcomer', ['x']) })
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(s._memoryCache, '10'), true,
+    '多位数数字样键必须被跳过；被淘汰它即说明索引键判定被写坏成 \\\\d')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(s._memoryCache, 'zz-oldest'), false,
+    '必须淘汰首个普通字符串键（真正的最旧键）')
+  assert.strictEqual(s._memoCount, Object.keys(s._memoryCache).length, '淘汰后计数必须与实际键数守恒')
+  assert.ok(warns.some(l => l.includes('内存缓存达到上限(2)') && l.includes('zz-oldest')),
+    `告警必须带上限与被淘汰的键名：${JSON.stringify(warns)}`)
+})
+
+check('MS-09 readMessages: tooLarge 恢复的三条失败出口都必须保持写闸门且不动原件', () => {
+  const mk = (opts) => makeBatchStore(Object.assign({ name: 'ms09.json' }, opts))
+  // ① 尾部读出来但一个完整元素都没有 ⇒ L753-755
+  const tailNoElement = mk({
+    files: { [cachePath('ms09.json')]: 'x'.repeat(100) },
+    constants: { MESSAGE_CACHE_MAX_BYTES: 20 },
+    readStatus: (p, fsMock, options) => (options && options.tail ? { status: 'ok', text: 'garbage-without-brace' } : (fsMock.files.has(p) ? { status: 'tooLarge' } : null))
+  })
+  const errs1 = captureConsole('error', () => { assert.deepStrictEqual(tailNoElement.store.readMessages(tailNoElement.filePath), []) })
+  assert.ok(errs1.some(l => l.includes('尾部无任何完整元素')), `必须点名“无完整元素”这条失败原因：${JSON.stringify(errs1)}`)
+  assert.strictEqual(tailNoElement.store._readFailed[tailNoElement.filePath], true, '恢复失败必须保持写闸门')
+  assert.strictEqual(tailNoElement.fs.files.get(tailNoElement.filePath), 'x'.repeat(100), '原件绝不得被改动或删除')
+  assert.deepStrictEqual(tailNoElement.storage.writes, [], '恢复失败时不得有任何写盘（包括重建）')
+  // ② 尾部有完整元素但裁剪阶段抛错 ⇒ L768-770
+  const trimBoom = mk({
+    files: { [cachePath('ms09.json')]: 'y'.repeat(100) },
+    constants: { MESSAGE_CACHE_MAX_BYTES: 20 },
+    readStatus: (p, fsMock, options) => (options && options.tail ? { status: 'ok', text: '[{"id":"a"},{"id":"b"}]' } : (fsMock.files.has(p) ? { status: 'tooLarge' } : null))
+  })
+  trimBoom.store._trimCacheByBytes = () => { throw new Error('trim-boom') }
+  const errs2 = captureConsole('error', () => { trimBoom.store.readMessages(trimBoom.filePath) })
+  assert.ok(errs2.some(l => l.includes('缓存尾部恢复裁剪异常')), `裁剪异常必须点名：${JSON.stringify(errs2)}`)
+  assert.strictEqual(trimBoom.store._readFailed[trimBoom.filePath], true, '裁剪异常同样保持写闸门')
+  // ③ 单条即超读端上限 ⇒ L772-774（_trimCacheByBytes 返回 null 的语义）
+  const oneTooBig = mk({
+    files: { [cachePath('ms09.json')]: 'z'.repeat(100) },
+    constants: { MESSAGE_CACHE_MAX_BYTES: 20 },
+    readStatus: (p, fsMock, options) => (options && options.tail ? { status: 'ok', text: '[{"id":"' + 'w'.repeat(64) + '"}]' } : (fsMock.files.has(p) ? { status: 'tooLarge' } : null))
+  })
+  const errs3 = captureConsole('error', () => { oneTooBig.store.readMessages(oneTooBig.filePath) })
+  assert.ok(errs3.some(l => l.includes('单条即超过读端上限')), `必须点名“单条超限”：${JSON.stringify(errs3)}`)
+  assert.strictEqual(oneTooBig.store._readFailed[oneTooBig.filePath], true, '这条也必须 fail-closed，绝不重建空缓存')
+})
+
+check('MS-10 隔离备份名不可用时绝不改名、绝不覆写：保持写闸门并点名原因', () => {
+  const h = makeBatchStore({
+    files: { [cachePath('ms10.json')]: '{ this is not valid json' },
+    name: 'ms10.json'
+  })
+  h.store._corruptBackupPath = () => null // 同毫秒备份已耗尽
+  const errs = captureConsole('error', () => { h.store.readMessages(h.filePath) })
+  assert.ok(errs.some(l => l.includes('无法生成隔离备份名') && l.includes('保持写闸门')),
+    `必须点名“备份名不可用”这条 fail-closed 出口：${JSON.stringify(errs)}`)
+  assert.strictEqual(h.store._readFailed[h.filePath], true, '写闸门必须保持（否则下一轮会拿空数组覆写存量）')
+  assert.strictEqual(h.fs.files.get(h.filePath), '{ this is not valid json', '原件必须原样保留（只隔离、绝不删除）')
+  assert.deepStrictEqual(h.storage.writes.filter(w => w.p === h.filePath), [], '不得在原路径写入任何内容')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
 // ===== 套件退场：identityStore 模块级状态清理（用例间状态猎杀 #198 后续）=====
 // seedIdentityProbe 的条目在本文件内已按同名 fp 自清理，但 mutate 类用例（F-02 组）的

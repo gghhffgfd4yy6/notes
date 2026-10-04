@@ -65,7 +65,16 @@ const SUITES = [
   // v3.276 补：xbk_app.js 此前无任何单元套件（test_app.js 是集成套件、不进变异测试集），
   // 其报告/状态簇的存活变异体无人认领。本套件在**进程内**用最小桩构造 createApp(...) 后直接
   // 调用目标方法（不走子进程 ⇒ 可被变异测试的 perTest 覆盖归因）。
-  { name: '应用状态与日报单元', file: 'test_app_unit.js', desc: 'xbk_app.js 报告/状态簇：_isValidReportDate 闰年与月界、_loadReportState 缺文件/损坏/超限降级、_normalizeReportState 形状归一与 pending 占位告警' }
+  { name: '应用状态与日报单元', file: 'test_app_unit.js', desc: 'xbk_app.js 报告/状态簇：_isValidReportDate 闰年与月界、_loadReportState 缺文件/损坏/超限降级、_normalizeReportState 形状归一与 pending 占位告警' },
+  // G11：scripts/audit-gate.js 是 fail-closed 安全门禁（v3.276 续 / PR #194 引入），此前**零测试**
+  // ——只在 test.yml:218 被 `node scripts/audit-gate.js` 调用过，仓库里没有任何断言指向它。
+  // 于是「豁免只针对 GHSA-CH52-4W7C-C8XP、其余高危一律拦」这条契约无人守护：放宽 ALLOWED_ADVISORIES、
+  // 把 every 写成 some、把「schema 漂移即拒」改成静默放行，CI 都不会红。
+  // 注册口径：不设 integration / mutationSkip ⇒ 进 run_unit_tests.js 与 TAP 变异测试集；本套件是
+  // 约 10 次 spawn 的子进程夹具套件（≈2-3s，照 test_analyze_artifacts.js 先例），增量可接受。
+  // ⚠️ 但它测的 audit-gate.js 不是 mutation 矩阵的 mutate 目标、子进程断言也拿不到 TAP perTest 归因
+  // ⇒ 这 10 条买的是「门禁不被静默改坏」的回归保护，**不是**变异分数（该口径在套件文件头同样登记）。
+  { name: '安全审计门禁', file: 'test_audit_gate.js', desc: 'scripts/audit-gate.js 子进程：夹具缺失/非法 JSON/schema 漂移四态/大小写 severity/豁免显形带理由/间接链三类断链/every 口径/GHSA 归一' }
 ]
 
 // 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与

@@ -263,5 +263,115 @@ function run (ymlText) {
     `健康仓库下 require 不应抛错（否则复用该模块的测试会被误杀），实际 stdout: ${noThrow.stdout} stderr: ${noThrow.stderr}`)
   console.log('✅ require 路径契约断言通过（失败抛错 / 健康不抛）')
 
+  // ===== G11-CMR：环境变量入口与 matrix 形状守卫（c8 实测本文件 26 条分支未达）=====
+  // 这些分支是「行段门禁自己的 fail-closed 出口」：注入方式写错、matrix 条目缺字段、段名打错、
+  // 段名重复——旧实现里任何一条被改成静默跳过，本套件的既有用例（都走「完整合法夹具 + 只改行段」）
+  // 一律照绿，而 CI 的矩阵会静默少测整个文件。故逐条断言退出码**与**具体文案。
+  {
+    const runEnv = (env) => {
+      const e = { ...process.env }
+      delete e.MUTATION_WORKFLOW_TEXT
+      delete e.MUTATION_WORKFLOW_PATH
+      for (const [k, v] of Object.entries(env)) {
+        if (v === undefined) delete e[k]
+        else e[k] = v
+      }
+      return spawnSync(process.execPath, [SCRIPT], { cwd: ROOT, encoding: 'utf8', env: e, timeout: 20000 })
+    }
+    // 取 buildYml() 的第一条 matrix 条目做形态手术（其余条目保持合法，确保失败原因唯一）
+    const ENTRY_RE = /( {10}- name: (\S+)\n {12}src: "([^"]+)"\n {12}mutate: "([^"]+)"\n)/
+    const first = buildYml().match(ENTRY_RE)
+    assert.ok(first, '夹具必须能解析出 matrix 条目形态，否则本节用例无法构造')
+    const [, entry, eName, eSrc, eMutate] = first
+    const withEntry = (replacement) => buildYml().replace(entry, replacement)
+
+    // CMR-01 显式置空 MUTATION_WORKFLOW_PATH ⇒ 必须拒绝，而不是悄悄回退读默认路径
+    {
+      const r = runEnv({ MUTATION_WORKFLOW_PATH: '' })
+      assert.strictEqual(r.status, 1, 'MUTATION_WORKFLOW_PATH 为空串必须非 0（空值不等于“未设置”）')
+      assert.ok((r.stderr + r.stdout).includes('MUTATION_WORKFLOW_PATH 不能为空'), `必须点名该环境变量用错：${r.stderr.slice(0, 160)}`)
+    }
+    // CMR-02 指向不存在的文件 ⇒ 读取失败必须响亮，不得当成“零条目”通过
+    {
+      const r = runEnv({ MUTATION_WORKFLOW_PATH: path.join(ROOT, 'no-such-workflow-' + process.pid + '.yml') })
+      assert.strictEqual(r.status, 1, '指定的工作流文件不存在必须非 0')
+      assert.ok((r.stderr + r.stdout).includes('无法读取 mutation.yml'), `必须说明读取失败：${r.stderr.slice(0, 160)}`)
+    }
+    // CMR-03 文本注入模式下必须显形“没有读真实 yml”（否则本地绿≠CI 绿，与 #156 假绿灯同类）
+    {
+      const r = run({ })
+      const injected = runEnv({ MUTATION_WORKFLOW_TEXT: buildYml() })
+      assert.strictEqual(injected.status, 0, `合法文本注入应 exit 0：${injected.stderr.slice(0, 200)}`)
+      assert.ok((injected.stderr + injected.stdout + injected.stdout).includes('MUTATION_WORKFLOW_TEXT 注入文本校验'),
+        `注入模式必须打出「未读取真实 mutation.yml」提示：stdout=${injected.stdout.slice(0, 200)}`)
+      assert.ok(typeof r.status === 'number', '默认路径（读真实 mutation.yml）也必须有确定退出码')
+    }
+    // CMR-04 matrix 零条目 ⇒ 必须非 0。
+    // ⚠️ 实测口径（不伪造命中）：`include:` 为空时先命中 L206 的「未解析到任何 mutate 行段」守卫，
+    // 因此 L221 的「未解析到任何 matrix 条目」是**被前一道守卫接管的防御性冗余分支**（c8 显示不可达）。
+    // 这里断言实际出口，并留下“两条守卫任一必须拦住”的不变式：将来若有人删掉 L206 早退，
+    // 断言仍由 fail-closed 的退出码兜住，而不会被改成“静默通过”。
+    {
+      const r = run('name: mutation\non: push\njobs:\n  mutation:\n    strategy:\n      matrix:\n        include:\n')
+      assert.strictEqual(r.status, 1, 'matrix 零条目必须非 0（不得当成“无需校验”放行）')
+      const out = r.stderr + r.stdout
+      assert.ok(out.includes('未在 mutation.yml 中解析到任何 mutate 行段') || out.includes('未在 mutation.yml 的 matrix include 中解析到任何条目'),
+        `必须由两道守卫中的任一条点名零目标：${out.slice(0, 200)}`)
+    }
+    // CMR-05 条目缺 name ⇒ 非 0（缓存 key 会退化成 stryker-undefined-*，多段互相覆盖）
+    {
+      const stripped = `          - src: "${eSrc}"\n            mutate: "${eMutate}"\n`
+      const r = run(withEntry(stripped))
+      assert.strictEqual(r.status, 1, '缺 name 的条目必须非 0（旧实现会静忽略该条，使该文件整段跳过行段校验）')
+      assert.ok((r.stderr + r.stdout).includes('matrix 条目缺 name 字段'), `必须点名缺 name：${r.stderr.slice(0, 200)}`)
+    }
+    // CMR-06 条目缺 mutate ⇒ 非 0，且诊断必须能定位到条目（缺 name 时用 (无 name) 兜底标签）
+    {
+      const r = run(withEntry(`          - name: ${eName}\n            src: "${eSrc}"\n`))
+      assert.strictEqual(r.status, 1, '缺 mutate 的条目必须非 0')
+      assert.ok((r.stderr + r.stdout).includes(eName) && (r.stderr + r.stdout).includes('mutate'),
+        `诊断必须带上条目身份与缺失字段：${r.stderr.slice(0, 220)}`)
+    }
+    // CMR-07 段名重复 ⇒ 非 0（同名的两条会共用同一个增量缓存文件，后者覆盖前者的结果）
+    {
+      const r = run(withEntry(entry + entry))
+      assert.strictEqual(r.status, 1, '重复段名必须非 0')
+      assert.ok((r.stderr + r.stdout).includes('matrix name 重复'), `必须点名重复：${r.stderr.slice(0, 200)}`)
+      assert.ok((r.stderr + r.stdout).includes(eName), `重复告警必须指名是哪个段名：${r.stderr.slice(0, 200)}`)
+    }
+    // CMR-08 段名与 mutation-report 的 EXPECTED_SEGMENTS 不一致 ⇒ 非 0（双向对账的另一侧）
+    {
+      const renamed = entry.replace(`- name: ${eName}`, '- name: zzz-not-a-real-segment')
+      const r = run(withEntry(renamed))
+      assert.strictEqual(r.status, 1, '矩阵含不认识的段名必须非 0')
+      assert.ok((r.stderr + r.stdout).includes('zzz-not-a-real-segment'), `必须点名陌生的段名：${r.stderr.slice(0, 220)}`)
+    }
+    // CMR-09 globToRegExp 字符类里连字符的两种边界（语义以实测为准，不凭猜写断言）：
+    //   · 类首/类尾的 `-` 是字面量成员（L302 的 k===0 / k===cls.length-1 分支）：`[-a]`、`[a-]`
+    //     都匹配 `-` 与 `a`；字符类只吃**一个**字符，所以 `[-a]x.js` 这类写法永远匹配不到。
+    //   · 连续 `--` 无法确定范围语义（L305）⇒ 实现把整个方括号**降级为字面文本**，而不是
+    //     “退化成含 - 的字符类”。若有人改成后者，`[a--b].js` 会开始匹配 a.js/b.js（误杀文件）。
+    {
+      const { globToRegExp } = require('./scripts/check-mutation-ranges.js')
+      const lead = globToRegExp('[-a].js')
+      const tail = globToRegExp('[a-].js')
+      assert.strictEqual(String(lead), '/^[-a]\\.js$/', '类首的 - 必须原样保留为字面量成员')
+      assert.strictEqual(String(tail), '/^[a-]\\.js$/', '类尾的 - 必须原样保留为字面量成员')
+      assert.ok(lead.test('-.js') && lead.test('a.js'), '[-a] 必须同时匹配 -.js 与 a.js')
+      assert.ok(tail.test('-.js') && tail.test('a.js'), '[a-] 必须同时匹配 -.js 与 a.js')
+      assert.ok(!lead.test('x.js') && !tail.test('x.js'), '类内未列出的字符不得被匹配')
+      assert.ok(!lead.test('-x.js'), '字符类只吃一个字符：[-a]x.js 不得被匹配（写成长名即失配）')
+
+      const deg = globToRegExp('[a--b].js')
+      assert.ok(String(deg).includes('\\['), `连续 - 时方括号必须整体降级为字面文本，实际 ${String(deg)}`)
+      assert.ok(deg.test('[a--b].js'), '降级后必须只匹配该字面文件名')
+      for (const other of ['a.js', 'b.js', '-.js', 'c.js']) {
+        assert.ok(!deg.test(other), `降级为字面后不得匹配 ${other}（若被当成字符类处理就会误杀这些文件）`)
+      }
+      assert.ok(globToRegExp('[a-c].js').test('b.js') && !globToRegExp('[a-c].js').test('d.js'),
+        '对照：合法的 a-c 范围必须仍然生效（不得把降级分支写成默认行为）')
+    }
+  }
+
   console.log('test_check_mutation_ranges OK')
 })().catch((e) => { console.error(e); process.exit(1) })

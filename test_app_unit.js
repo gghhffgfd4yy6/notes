@@ -2220,3 +2220,161 @@ checkAsync('通道健康: 状态写入失败时提前返回（不入队告警、
   await app2._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
   assert.strictEqual(sent.length, 1, 'writeOk 正常时同配置应入队告警')
 })
+
+// 本簇的状态文件路径全部取自**私有 mkdtemp 目录**，不写可预测的 /tmp 文件名
+// （Sonar「Make sure publicly writable directories are used safely here」/ CWE-377：公共可写目录里的
+// 固定名可被他人抢占/预建；本仓 6369482 已把记账文件统一改成 mkdtemp 私有目录，此处照同一口径）。
+// 注意：下面 AP-1…AP-3 用的是**注入的假 fs**，这些路径只是字符串、不落真磁盘，但命名口径仍按真实环境执行。
+const AP_ROOT = (() => {
+  const realFs = require('fs')
+  const d = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-app-unit-'))
+  try { realFs.chmodSync(d, 0o700) } catch (e) { /* 某些 FUSE 挂载不允许 chmod：目录名仍不可预测 */ } // nosemgrep（d 是 mkdtempSync 独占产物，无外部输入）
+  process.once('exit', () => { try { realFs.rmSync(d, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
+  return d
+})()
+// 唯一的动态来源是 mkdtemp 私有目录 + 本文件内硬编码的文件名常量，不接受任何外部输入
+// ⇒ Codacy 的 pathtraversal-non-literal-fs-filename 在此是结构性误报（口径同 xbk_storage.js:17 与 .codacy.yml 里 test_storage.js 的说明）
+const apPath = (name) => path.join(AP_ROOT, name) // nosemgrep
+
+// ===== G11-AP：RE2 标记原子写 / PID 复用识别 / 通道健康降级（c8 实测 xbk_app.js 分支 86.06%，
+// L341-350 与 L524-530 与 L843-845 与 L917-918 均未达）=====
+// 这四条全是「跨平台与故障降级」分支：Linux 上 rename 天然覆盖，Windows 的 EPERM 重试永不执行；
+// PID 复用、状态读取非 ok/missing、健康更新整体抛错在正常环境也走不到。它们一旦写坏（例如重试退化成
+// 直接写目标），本机全绿、生产的半写状态文件被后续判为损坏 → 当天 re2 提醒被永久压制。
+check('AP-1 _writeRe2WarnMarkerAtomic：Windows rename 失败必须先删目标再重试 rename（不得退化为直接写目标）', () => {
+  const files = new Map()
+  const seq = []
+  let renameFails = 1 // 第一次 rename 模拟 Windows「目标已存在」失败
+  const fakels = {
+    writeFileSync: (p, text, opts) => {
+      seq.push('write')
+      if (opts && opts.flag === 'wx' && files.has(p)) { const e = new Error('EEXIST'); e.code = 'EEXIST'; throw e }
+      files.set(String(p), String(text))
+    },
+    renameSync: (a, b) => {
+      seq.push('rename')
+      if (renameFails > 0) {
+        renameFails -= 1
+        const e = new Error('EPERM: operation not permitted, rename')
+        e.code = 'EPERM'
+        throw e
+      }
+      if (!files.has(String(a))) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e }
+      files.set(String(b), files.get(String(a)))
+      files.delete(String(a))
+    },
+    unlinkSync: (p) => {
+      seq.push('unlink:' + (String(p).endsWith('.tmp') ? 'tmp' : 'target'))
+      if (!files.has(String(p))) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e }
+      files.delete(String(p))
+    }
+  }
+  const a = makeApp({ fs: fakels })
+  const statePath = apPath('re2-marker.state')
+  files.set(statePath, '旧标记') // 目标已存在 ⇒ Windows 上 rename 必失败
+  assert.strictEqual(a._writeRe2WarnMarkerAtomic(statePath, '新标记'), true, '重试成功后必须返回 true')
+  assert.strictEqual(files.get(statePath), '新标记', '目标内容必须是本次写入的')
+  assert.deepStrictEqual(seq, ['write', 'rename', 'unlink:target', 'rename'],
+    `顺序必须是 tmp 独占创建 → rename 失败 → 删目标 → 重试 rename（实际 ${JSON.stringify(seq)}）`)
+  assert.ok(![...files.keys()].some(k => k.endsWith('.tmp')), '不得残留 .tmp')
+})
+
+check('AP-2 _writeRe2WarnMarkerAtomic：目标删除失败必须被吞掉后仍重试；两次 rename 都失败 ⇒ 清 tmp 返回 false 且不抛穿', () => {
+  // 分支①：unlink 抛 ENOENT（目标恰好已被别人删）⇒ 忽略后重试 rename 应成功
+  const files = new Map([[apPath('ap2.state'), '旧']])
+  let renameFails = 1
+  const fsA = {
+    writeFileSync: (p, text, opts) => {
+      if (opts && opts.flag === 'wx' && files.has(p)) { const e = new Error('EEXIST'); e.code = 'EEXIST'; throw e }
+      files.set(String(p), String(text))
+    },
+    renameSync: (a, b) => {
+      if (renameFails > 0) { renameFails -= 1; const e = new Error('EPERM'); e.code = 'EPERM'; throw e }
+      files.set(String(b), files.get(String(a)))
+      files.delete(String(a))
+    },
+    unlinkSync: () => { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e }
+  }
+  const aA = makeApp({ fs: fsA })
+  assert.strictEqual(aA._writeRe2WarnMarkerAtomic(apPath('ap2.state'), 'x'), true,
+    '目标已被他人删除时 unlink 抛 ENOENT 必须被吞掉，重试 rename 仍应成功')
+  // 分支②：两次 rename 都失败 ⇒ 外层 catch 尽力清 tmp、返回 false，且 unlink 自身抛错不得外泄
+  const unlinkTargets = []
+  let threwOutward = null
+  const fsB = {
+    writeFileSync: (p, text) => { files.set(String(p), String(text)) },
+    renameSync: () => { const e = new Error('EACCES'); e.code = 'EACCES'; throw e },
+    unlinkSync: (p) => { unlinkTargets.push(String(p)); const e = new Error('EPERM'); e.code = 'EPERM'; throw e }
+  }
+  const aB = makeApp({ fs: fsB })
+  try {
+    assert.strictEqual(aB._writeRe2WarnMarkerAtomic(apPath('ap2-fail.state'), 'x'), false, '重试仍失败必须返回 false')
+  } catch (e) { threwOutward = e }
+  assert.strictEqual(threwOutward, null,
+    `清理链上的抛错绝不能外泄（调用方在提醒主链上）：${threwOutward && threwOutward.message}`)
+  assert.strictEqual(unlinkTargets.length, 2,
+    `两次 rename 都失败时必须先试删目标、再清 .tmp（实际 ${JSON.stringify(unlinkTargets)}）`)
+  assert.ok(unlinkTargets[1].endsWith('.tmp'), `最后一次清理必须针对本次的 .tmp：${JSON.stringify(unlinkTargets)}`)
+  assert.ok(files.has(apPath('ap2-fail.state')) === false, '目标文件绝不得被直接写入（半写状态会让当天提醒被永久压制）')
+})
+
+for (const c of [
+  { start: '111', actualStart: '222', kill: 'ok', expect: true, why: '同 PID 不同启动时钟 ⇒ PID 已被复用，必须判残留' },
+  { start: '111', actualStart: '111', kill: 'ok', expect: false, why: '时钟一致 ⇒ 同一进程，绝不得回收（否则当天重复提醒）' },
+  { start: '111', actualStart: null, kill: 'ok', expect: false, why: '读不到进程启动时钟 ⇒ 证据不足，保守保留' },
+  { start: 'abc', actualStart: '222', kill: 'ok', expect: false, why: 'start 非纯数字 ⇒ 不做 incarnation 判定' },
+  { start: undefined, actualStart: '222', kill: 'ok', expect: false, why: '缺 start 字段 ⇒ 保守保留' },
+  { start: '111', actualStart: '222', kill: 'ESRCH', expect: true, why: '进程不存在 ⇒ pending 即崩溃残留' },
+  { start: '111', actualStart: '111', kill: 'EPERM', expect: false, why: 'EPERM=存在但无权限 ⇒ 仍按存活处理' }
+]) {
+  check(`AP-3 _isRe2WarnMarkerStale（start=${String(c.start)} / 实测时钟=${String(c.actualStart)} / kill=${c.kill}）：${c.why}`, () => {
+    const marker = JSON.stringify({ warnedAt: 1, status: 'pending', pid: process.pid, start: c.start })
+    const a = makeApp({
+      fs: { readFileSync: () => marker },
+      MessageStore: { _getTombstoneProcessStart: () => c.actualStart }
+    })
+    const origKill = process.kill
+    process.kill = c.kill === 'ok'
+      ? origKill
+      : () => { const e = new Error('kill'); e.code = c.kill; throw e }
+    try {
+      assert.strictEqual(a._isRe2WarnMarkerStale(apPath('ap3.state')), c.expect)
+    } finally {
+      process.kill = origKill
+    }
+  })
+}
+
+checkAsync('AP-4 通道健康：状态读取非 ok/missing（超限）⇒ 跳过本轮并留诊断，绝不当作「无历史」重置', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(healthPath, 'x'.repeat(300000)) // 超 STATE_TEXT_MAX_BYTES(262144) ⇒ oversize
+  const before = mfs.readFileSync(healthPath)
+  const sent = []
+  const a = makeHealthApp2({ fs: mfs, threshold: 1, pusher: { send: async (t) => { sent.push(t) } } })
+  const errs = []
+  const origErr = console.error
+  console.error = (...x) => errs.push(x.map(String).join(' '))
+  try {
+    await a._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  } finally {
+    console.error = origErr
+  }
+  assert.ok(errs.some(l => l.includes('通道健康状态读取失败') && l.includes('跳过本轮健康更新')),
+    `必须点名读取失败与「跳过本轮」：${JSON.stringify(errs)}`)
+  assert.ok(errs.some(l => l.includes('(oversize)')), '诊断必须带真实状态码，便于区分超限/损坏/IO')
+  assert.strictEqual(sent.length, 0, '状态读不到时不得入队告警（阈值失去依据，误报比沉默更糟）')
+  assert.strictEqual(mfs.readFileSync(healthPath), before, '读失败时绝不得覆写状态文件（否则连续失败计数被清零）')
+})
+
+checkAsync('AP-5 通道健康：更新过程整体抛错 ⇒ 补一行 WARN 留痕且仍释放锁（“仅作观测”不等于隐身）', async () => {
+  const mfs = makeMemFs()
+  const a = makeHealthApp2({ fs: mfs, threshold: 1, pusher: { send: async () => {} } })
+  const logged = []
+  a._writeRunLog = (line) => { logged.push(line); return true }
+  a._readSafeState = () => { throw new Error('state read boom') }
+  await a._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  assert.ok(logged.some(l => l.includes('WARN 通道健康更新异常')),
+    `异常必须留一行 WARN（旧实现完全静默，通道健康可能永久不更新而无人知）：${JSON.stringify(logged)}`)
+  assert.ok(logged.some(l => l.includes('state read boom')), '留痕必须带上根因文本')
+  assert.strictEqual(mfs._files.has(healthPath + '.lock'), false, '异常路径也必须释放健康更新锁（finally 语义）')
+})

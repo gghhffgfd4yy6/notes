@@ -759,5 +759,78 @@ function assertNoResidue (fx, label) {
   }
 }
 
+// 12) 安装路径（无 --verify）：.githooks 目录整体缺失 ⇒ exit 1 且给出两条可照抄的诊断
+{
+  const { dir, home } = makeCase()
+  try {
+    initRepo(dir, home)
+    // 故意不写 .githooks（与用例 5 的「目录在、文件缺」是两条不同分支）
+    const r = runPlugin(dir, home, [])
+    assert.strictEqual(r.status, 1, '钩子目录缺失时安装路径必须非 0（只写 core.hooksPath 不会让缺失的钩子生效）')
+    const err = r.stderr + r.stdout
+    assert.ok(err.includes('钩子目录不存在或不是目录'), `必须点名目录缺失：${err.slice(0, 200)}`)
+    assert.ok(err.includes('期望受版本控制的'), `必须给出期望清单指引：${err.slice(0, 200)}`)
+    const cfg = gitConfig(dir, home, 'core.hooksPath')
+    assert.notStrictEqual(cfg.status, 0, '目录缺失时不得把 core.hooksPath 写进去（写了也是静默无效配置）')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// 13) --verify：目录缺失（不是文件缺失）⇒ 非 0 且只读
+{
+  const { dir, home } = makeCase()
+  try {
+    initRepo(dir, home)
+    spawnSync(GIT, ['config', 'core.hooksPath', '.githooks'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+    const r = runVerify(dir, home)
+    assert.strictEqual(r.status, 1, '目录缺失时 --verify 必须非 0')
+    assert.ok((r.stderr + r.stdout).includes('门禁未生效：钩子目录不存在或不是目录'),
+      `--verify 的目录缺失诊断必须与安装路径同口径点名目录：${(r.stderr + r.stdout).slice(0, 200)}`)
+    assert.ok(!fs.existsSync(path.join(dir, '.githooks')), '--verify 只读：不得顺手创建缺失的钩子目录')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// 14) 安装路径：钩子存在但**无执行位** ⇒ 在尊重 chmod 的文件系统上必须真的修复成功
+//     （M3 自检教训：原先写成「成功⇒执行位齐备 / 失败⇒显式告警」的双向宽容，结果
+//     「忘了 chmod 但照旧告警」这种实现照样绿。故改为先探测本机是否 honoring chmod，
+//     honoring 就要求确定性的正结果；只在 noexec 挂载上退化为「必须显形」。）
+{
+  const probeRoot = makeCase()
+  try {
+    const probe = path.join(probeRoot.dir, 'probe-exec.sh')
+    fs.writeFileSync(probe, '#!/bin/sh\n')
+    fs.chmodSync(probe, 0o600)
+    let honoring = false
+    try { fs.chmodSync(probe, 0o700); fs.accessSync(probe, fs.constants.X_OK); honoring = true } catch (e) { honoring = false }
+    if (!honoring) {
+      console.log('  （本机不支持 chmod 执行位：本条按环境性跳过，改由用例 6/9 锁“失败必须显形”）')
+    } else {
+      const { dir, home } = makeCase()
+      try {
+        initRepo(dir, home)
+        writeHooks(dir, EXPECTED_HOOKS, 0o600)
+        for (const name of EXPECTED_HOOKS) {
+          const f = path.join(dir, '.githooks', name)
+          assert.throws(() => fs.accessSync(f, fs.constants.X_OK), `夹具前提：${name} 必须无执行位`)
+        }
+        const r = runPlugin(dir, home, [])
+        assert.strictEqual(r.status, 0, `尊重 chmod 的文件系统上，安装必须把执行位修好并 exit 0：${(r.stderr + r.stdout).slice(0, 220)}`)
+        for (const name of EXPECTED_HOOKS) {
+          assert.doesNotThrow(() => fs.accessSync(path.join(dir, '.githooks', name), fs.constants.X_OK),
+            `exit 0 却没修 ${name} 的执行位 = 门禁静默失效`)
+        }
+        assert.strictEqual(runVerify(dir, home).status, 0, '修复后 --verify 必须判定门禁已生效（两条路径结论一致）')
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  } finally {
+    fs.rmSync(probeRoot.dir, { recursive: true, force: true })
+  }
+}
+
 console.log('✅ install-hooks --verify 只读自检：未生效 fail-closed / 生效 exit 0 / 不改配置不改权限；pre-push（v3.276）列入清单且缺失/无执行位均被检出')
 console.log('✅ pre-push 门禁对象回归（PR #156）：快路径只跑一次 / 脏工作树按**被推提交内容**判定（旧实现必红）/ 非当前检出走隔离 worktree 且清理干净 / 隔离建不起来即 fail-closed 不跑工作树 / 去重+删除引用+非推送上下文 / 一次推多个非 HEAD sha 时每个隔离 worktree 都被清理（旧实现必红）/ 未跟踪文件算脏：扫描式门禁下「提交 fail、工作树的未跟踪文件补绿」仍必须真红且门禁在隔离目录里跑（旧口径假绿，G 必红）+ 有未跟踪文件改走隔离路径（旧口径只警告仍走快路径，H 必红）')

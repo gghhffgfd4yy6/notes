@@ -88,7 +88,9 @@ const explicitTestFiles = [
   'test_suite_registry.js',
   'test_tag_validator.js',
   'test_check_version.js',
-  'test_app_unit.js'
+  'test_app_unit.js',
+  // G11：与 test_suites.js 的注册顺序一致 —— 追加在末尾（本套件非 integration/mutationSkip）。
+  'test_audit_gate.js'
 ]
 
 function listDiff (expected, actual) {

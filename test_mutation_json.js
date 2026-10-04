@@ -390,4 +390,45 @@ try {
 } finally {
   fs.rmSync(tmpdir, { recursive: true, force: true })
 }
+// ===== G11-MG：mutation-guard 的形态守卫与参数解析（c8 实测本文件 15 条分支未达）=====
+// 这些是「报告坏了必须炸、参数不明必须拒」的 fail-closed 出口。既有 guard 用例只喂合法报告，
+// 结构非法的四条 throw 路径、未知/缺失 status、以及 parseArgs 的 --segment / -- / 笔误分支
+// 全部没走过：把 throw 改成「返回全 0 counts」，既有用例照绿，而 CI 守卫变成静默放行。
+{
+  const { parseArgs, countMutantsByStatus, run } = require('./scripts/mutation-guard.js')
+  const loc = { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } }
+  const okReport = { files: { 'x.js': { mutants: [{ id: '1', mutatorName: 'BlockStatement', status: 'Killed', location: loc }] } } }
+  assert.strictEqual(countMutantsByStatus(okReport).killed, 1, '对照前提：合法报告必须计到 1 个 killed')
+  const bads = [
+    ['顶层为 null', null, '报告顶层结构非法'],
+    ['顶层为数组', [], '报告顶层结构非法'],
+    ['顶层为字符串', 'x', '报告顶层结构非法'],
+    ['缺少 files 映射', { files: null }, '报告缺少 files 映射'],
+    ['files 为数组', { files: [] }, '报告缺少 files 映射'],
+    ['file 条目非法', { files: { 'x.js': null } }, '结构非法'],
+    ['mutants 非数组', { files: { 'x.js': { mutants: 'oops' } } }, 'mutants 缺失或非数组'],
+    ['status 未知', { files: { 'x.js': { mutants: [{ id: '1', status: 'Exploded', location: loc }] } } }, '未知 status'],
+    ['status 缺失', { files: { 'x.js': { mutants: [{ id: '1', location: loc }] } } }, '未知 status']
+  ]
+  for (const b of bads) {
+    assert.throws(() => countMutantsByStatus(b[1]), (e) => {
+      assert.ok(e.message.includes(b[2]), b[0] + '：诊断必须含「' + b[2] + '」，实际 ' + e.message)
+      return true
+    }, b[0] + ' 必须 throw（不得退化为全 0 计数）')
+  }
+  assert.strictEqual(parseArgs(['--segment', 'storage', 'a.json']).segment, 'storage', '--segment <值> 必须落到 segment')
+  assert.deepStrictEqual(parseArgs(['--segment', 'storage', 'a.json']).paths, ['a.json'], '位置参数必须落到 paths')
+  assert.strictEqual(parseArgs(['--segment=v3-entry', 'b.json']).segment, 'v3-entry', '--segment= 内联值必须同样生效')
+  assert.strictEqual(parseArgs(['--segment', '   ', 'c.json']).segment, null, '空白段名必须归一为 null')
+  assert.deepStrictEqual(parseArgs(['--', '-weird.json', 'd.json']).paths, ['-weird.json', 'd.json'], '-- 之后必须全部按路径处理')
+  assert.throws(() => parseArgs(['--segmnt', 'storage']), /未知参数/, '参数笔误必须 fail-closed，不得静默忽略成“无路径”空转')
+  assert.throws(() => parseArgs(['--segment']), /缺少取值/, '--segment 缺取值必须抛，不能当成未提供')
+  const outw = []
+  const errw = []
+  assert.strictEqual(run(['--segmnt', 'storage'], { stdout: { write: (s) => outw.push(String(s)) }, stderr: { write: (s) => errw.push(String(s)) }, env: {} }), 1, '参数非法时 run 必须返回 1')
+  assert.ok(errw.join('').includes('守卫参数非法'), 'stderr 必须说明根因：' + errw.join(''))
+  assert.ok(errw.join('').includes('用法：node scripts/mutation-guard.js'), '必须给出可照抄的用法行：' + errw.join(''))
+  assert.strictEqual(outw.length, 0, '参数非法时不得向 stdout 写结论（避免被当成有效判定）')
+  console.log('✅ mutation-guard 形态守卫与参数解析断言通过（9 条 throw 路径 + 7 条参数契约 + run 出口）')
+}
 console.log(`\n🎉 test_mutation_json.js 全部通过（${pass} 项）`)

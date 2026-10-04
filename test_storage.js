@@ -531,6 +531,204 @@ const {
       '默认 label「缓存初始化」与失败文案必须完整（不得置空）')
   }
 
+  // ===== G11-ST：「尽力而为」的收尾分支（c8 实测未达：L37 detail 三态 / L61-64 目录 fsync /
+  // L101-103 写失败收尾 / L142-151 残骸清理 / L196 缺 O_NOFOLLOW / L231-235 复检与外层兜底）=====
+  // 这一簇全是「不影响主语义、只影响可观测性与句柄泄漏」的路径：旧实现里它们一旦写坏
+  // （比如目录 fsync 失败被当成写入失败、或残骸清理抛错把整次写入炸成异常穿透），
+  // 主流程断言照样绿。故按「可观测副作用 + 返回值口径」逐条钉死，每条都自带补丁还原（finally），
+  // 不得把 fs.* 的改留到下一条用例（#198/#199 修的正是这类跨用例泄漏）。
+  {
+    const stWarns = []
+    const stErrs = []
+    const origWarnST = console.warn
+    const origErrST = console.error
+    console.warn = (...a) => { stWarns.push(a.map(String).join(' ')) }
+    console.error = (...a) => { stErrs.push(a.map(String).join(' ')) }
+    const restoreLogs = () => { console.warn = origWarnST; console.error = origErrST }
+
+    // ---- ST-01：isRegularOrMissing 的非 ENOENT 异常，detail 取 code → message → String(e) 三态 ----
+    // 旧实现在此只拼 e.code；无 code 的错误（自定义 Error / 抛字符串）会打印 "undefined"，
+    // 排查者拿不到任何根因。三态都必须把可用信息带出来，且一律判「不安全、拒绝」。
+    const origLstatST = fs.lstatSync
+    try {
+      fs.lstatSync = () => { const e = new Error('x'); e.code = 'EACCES'; throw e }
+      assert.strictEqual(isRegularOrMissing(make('st-detail.txt')), false, '有 code 的读异常必须拒绝')
+      assert.ok(stWarns.some(w => w.includes('读取异常(EACCES)')), `detail 必须带 code：${JSON.stringify(stWarns)}`)
+      stWarns.length = 0
+      fs.lstatSync = () => { throw new Error('no-code-here') }
+      assert.strictEqual(isRegularOrMissing(make('st-detail.txt')), false, '无 code 的读异常必须拒绝')
+      assert.ok(stWarns.some(w => w.includes('读取异常(no-code-here)')), `无 code 时必须退回 message：${JSON.stringify(stWarns)}`)
+      stWarns.length = 0
+      fs.lstatSync = () => { throw 'bare-string-throw' } // eslint-disable-line no-throw-literal
+      assert.strictEqual(isRegularOrMissing(make('st-detail.txt')), false, '抛非 Error 值同样必须拒绝（不得抛穿调用方）')
+      assert.ok(stWarns.some(w => w.includes('读取异常(bare-string-throw)')), `抛原始值时 detail 必须是 String(e)：${JSON.stringify(stWarns)}`)
+    } finally { fs.lstatSync = origLstatST; restoreLogs() }
+
+    // ---- ST-02：父目录 fsync 失败 ⇒ 本次写入仍视为成功（rename 已提交，绝不回滚成 false）----
+    // 这是 fsyncDirBestEffort 的全部意义：掉电可能丢一次目录项，但内容已在盘上；
+    // 把它升级成「写入失败」会让调用方误判并重写，反而放大风险。
+    const origFsyncST = fs.fsyncSync
+    const stWarns2 = []
+    const origWarn2 = console.warn
+    console.warn = (...a) => { stWarns2.push(a.map(String).join(' ')) }
+    let fsyncCalls = 0
+    let dirFsyncRet
+    try {
+      fs.fsyncSync = (f) => { fsyncCalls += 1; if (fsyncCalls > 1) { const e = new Error('EIO: i/o error'); e.code = 'EIO'; throw e }; return origFsyncST.call(fs, f) }
+      dirFsyncRet = writeAtomic(make('st-dir-fsync.txt'), 'committed')
+    } finally { fs.fsyncSync = origFsyncST; console.warn = origWarn2 }
+    assert.strictEqual(dirFsyncRet, true, '目录 fsync 失败不得把已 rename 的写入判成失败')
+    assert.ok(stWarns2.some(w => w.includes('目录 fsync 失败（本次写入仍视为成功')), `必须显形告警且带「仍视为成功」口径：${JSON.stringify(stWarns2)}`)
+    assert.strictEqual(fs.readFileSync(make('st-dir-fsync.txt'), 'utf8'), 'committed', '目录 fsync 失败后内容必须是本次写入的（不得半写/丢失）')
+
+    // ---- ST-03：openSync(目录) 就失败 ⇒ dfd 为 undefined ⇒ finally 绝不得 closeSync(undefined) ----
+    // closeSync(undefined) 会抛 ERR_INVALID_ARG_TYPE，把「尽力而为」的收尾变成炸穿主流程。
+    const origOpenST = fs.openSync
+    const origCloseST = fs.closeSync
+    const closedWith = []
+    const stWarns3 = []
+    const origWarn3 = console.warn
+    console.warn = (...a) => { stWarns3.push(a.map(String).join(' ')) }
+    let openFailRet
+    try {
+      fs.closeSync = (f) => { closedWith.push(f); return origCloseST.call(fs, f) }
+      fs.openSync = (p, mode, ...rest) => {
+        if (mode === 'r') { const e = new Error('EACCES: permission denied'); e.code = 'EACCES'; throw e }
+        return origOpenST.call(fs, p, mode, ...rest)
+      }
+      openFailRet = writeAtomic(make('st-dir-open.txt'), 'still-committed')
+    } finally {
+      fs.openSync = origOpenST; fs.closeSync = origCloseST; console.warn = origWarn3
+    }
+    assert.strictEqual(openFailRet, true, '打不开目录句柄同样不得判失败')
+    assert.ok(stWarns3.some(w => w.includes('目录 fsync 失败')), '必须与 fsync 失败一样显形告警')
+    assert.ok(!closedWith.includes(undefined), `dfd 未取得时不得调用 closeSync(undefined)（实际调用序列 ${JSON.stringify(closedWith)}）`)
+    assert.strictEqual(fs.readFileSync(make('st-dir-open.txt'), 'utf8'), 'still-committed', '目录句柄失败不得影响内容提交')
+
+    // ---- ST-04：writeAtomic 失败路径必须关掉已打开的 fd，且残骸 unlink 抛错只静默吞掉 ----
+    // 两个分支：① fd >= 0 时 close（漏了就是每次写失败泄一个句柄）；② 残骸清理自身抛错
+    // 不得改写成「写入成功/失败」的返回值语义，更不得抛穿。
+    const origWriteST = fs.writeFileSync
+    const origUnlinkST = fs.unlinkSync
+    const stErrs4 = []
+    const origErr4 = console.error
+    console.error = (...a) => { stErrs4.push(a.map(String).join(' ')) }
+    let fdClosed = false
+    let unlinkThrew = false
+    let writeFailRet
+    try {
+      fs.writeFileSync = (target, ...rest) => {
+        if (typeof target === 'number') {
+          origWriteST.call(fs, target, 'half-written')
+          const e = new Error('ENOSPC: no space left on device'); e.code = 'ENOSPC'; throw e
+        }
+        return origWriteST.call(fs, target, ...rest)
+      }
+      fs.closeSync = (f) => { fdClosed = true; return origCloseST.call(fs, f) }
+      fs.unlinkSync = (p) => { unlinkThrew = true; const e = new Error('EBUSY'); e.code = 'EBUSY'; throw e }
+      writeFailRet = writeAtomic(make('st-write-fail.txt'), 'nope')
+    } finally {
+      fs.writeFileSync = origWriteST; fs.unlinkSync = origUnlinkST; fs.closeSync = origCloseST; console.error = origErr4
+    }
+    assert.strictEqual(writeFailRet, false, '写失败必须返回 false')
+    assert.ok(fdClosed, '失败路径必须关闭已打开的 fd（否则每次写失败泄一个句柄）')
+    assert.ok(unlinkThrew, '本用例确实走到了「残骸清理抛错」的分支（替身生效）')
+    assert.ok(stErrs4.some(w => w.includes('写入失败') && w.includes('ENOSPC')), `失败诊断必须带根因：${JSON.stringify(stErrs4)}`)
+    assert.strictEqual(fs.existsSync(make('st-write-fail.txt')), false, '残骸清理抛错时目标路径仍不得出现（rename 未执行）')
+
+    // ---- ST-05：writeAtomicIfAbsent 的残骸清理失败 ⇒ 「半写残骸清理失败」告警 + 仍返回 false ----
+    // 独占创建的失败路径先 close 再 unlink（WIN-01 口径）；unlink 抛错时旧实现会把异常直接抛给
+    // 调用方（_ensureFileExists 因此从「降级」变成「炸穿」）。这里必须只剩两条可观测记录。
+    const origWriteST5 = fs.writeFileSync
+    const origUnlinkST5 = fs.unlinkSync
+    const origCloseST5 = fs.closeSync
+    const stWarns5 = []
+    const stErrs5 = []
+    const origWarn5 = console.warn
+    const origErr5 = console.error
+    console.warn = (...a) => { stWarns5.push(a.map(String).join(' ')) }
+    console.error = (...a) => { stErrs5.push(a.map(String).join(' ')) }
+    let absentRet
+    let threw = null
+    try {
+      fs.writeFileSync = (target, ...rest) => {
+        if (typeof target === 'number') {
+          origWriteST5.call(fs, target, 'half')
+          const e = new Error('EIO: write boom'); e.code = 'EIO'; throw e
+        }
+        return origWriteST5.call(fs, target, ...rest)
+      }
+      fs.unlinkSync = (p) => { const e = new Error('EPERM: unlink boom'); e.code = 'EPERM'; throw e }
+      fs.closeSync = () => { const e = new Error('close boom'); e.code = 'EBADF'; throw e }
+      absentRet = writeAtomicIfAbsent(make('st-absent-fail.txt'), '[]')
+    } catch (e) {
+      threw = e
+    } finally {
+      fs.writeFileSync = origWriteST5; fs.unlinkSync = origUnlinkST5; fs.closeSync = origCloseST5
+      console.warn = origWarn5; console.error = origErr5
+    }
+    assert.strictEqual(threw, null, `清理链上的抛错绝不能穿透到调用方（实际抛：${threw && threw.message}）`)
+    assert.strictEqual(absentRet, false, '写失败仍必须返回 false')
+    assert.ok(stWarns5.some(w => w.includes('半写残骸清理失败')), `残骸清理失败必须单独告警：${JSON.stringify(stWarns5)}`)
+    assert.ok(stErrs5.some(w => w.includes('写入失败') && w.includes('EIO')), `主诊断必须是原始写失败根因（不得被清理异常顶掉）：${JSON.stringify(stErrs5)}`)
+
+    // ---- ST-06：读取区间抛错 ⇒ 外层兜底 ioError 且原样带出底层错误 ----
+    // readFdRange 在 fstat 之后炸（设备错误/FUSE 抖动）时，走的是最外层 catch：
+    // 状态必须是 ioError（消费侧据此保持写闸门），不能是 missing/unsafe（那会触发隔离重建）。
+    const origReadST = fs.readSync
+    const stErrs6 = []
+    const origErr6 = console.error
+    fs.writeFileSync(make('st-read-boom.txt'), 'abcdefghij') // 必须先有文件，否则失败点落在 open 而不是 read
+    console.error = (...a) => { stErrs6.push(a.map(String).join(' ')) }
+    let readBoom
+    try {
+      fs.readSync = () => { const e = new Error('EIO: read boom'); e.code = 'EIO'; throw e }
+      readBoom = readSafeTextResult(make('st-read-boom.txt'), 1024)
+    } finally { fs.readSync = origReadST; console.error = origErr6 }
+    assert.strictEqual(readBoom.status, 'ioError', '读取区间异常必须归 ioError（不得误判 missing/unsafe）')
+    assert.strictEqual(readBoom.error.code, 'EIO', '底层错误必须原样带出，供调用方诊断')
+    assert.strictEqual(readBoom.text, null, 'ioError 不得返回半读内容')
+
+    // ---- ST-07：复检阶段的其他错误（非 ENOENT/ELOOP）⇒ ioError，不得混进 replaced ----
+    // replaced 与 ioError 在消费侧同口径（保持写闸门、不隔离），但诊断语义不同：
+    // 「权限炸了」被说成「文件被替换」会把运维引向错误的排查方向。分类必须精确。
+    const origOpenST7 = fs.openSync
+    let recheckIoError
+    fs.writeFileSync(make('st-recheck.txt'), 'plain-content-for-recheck')
+    try {
+      let opens7 = 0
+      fs.openSync = (...args) => {
+        opens7 += 1
+        if (opens7 === 2) { const e = new Error('EACCES: 复检被打断'); e.code = 'EACCES'; throw e }
+        return origOpenST7.call(fs, ...args)
+      }
+      recheckIoError = readSafeTextResult(make('st-recheck.txt'), 1024)
+    } finally { fs.openSync = origOpenST7 }
+    assert.strictEqual(recheckIoError.status, 'ioError', `复检的非瞬时错误必须归 ioError（实际 ${recheckIoError.status}）`)
+    assert.strictEqual(recheckIoError.error.code, 'EACCES', '底层错误码必须原样带出')
+
+    // ---- ST-08：复检句柄打开失败 ⇒ reFd 为 undefined ⇒ finally 不得 closeSync(undefined) ----
+    // 复检阶段的失败是「读窗口内的瞬时变化」，必须 replaced（与 ioError 同口径），
+    // 同时 finally 的 `reFd !== undefined` 守卫要真生效——否则每次复检失败泄一次异常。
+    const origOpenST8 = fs.openSync
+    const closed8 = []
+    let recheckFail
+    try {
+      let opens = 0
+      fs.closeSync = (f) => { closed8.push(f); return origCloseST.call(fs, f) }
+      fs.openSync = (...args) => {
+        opens += 1
+        if (opens === 2) { const e = new Error('ENOENT: 复检时文件已被删'); e.code = 'ENOENT'; throw e }
+        return origOpenST8.call(fs, ...args)
+      }
+      recheckFail = readSafeTextResult(make('st-recheck.txt'), 1024)
+    } finally { fs.openSync = origOpenST8; fs.closeSync = origCloseST }
+    assert.strictEqual(recheckFail.status, 'replaced', '复检 ENOENT 必须判 replaced（瞬时并发，不是 unsafe）')
+    assert.ok(!closed8.includes(undefined), `reFd 未取得时不得 closeSync(undefined)（实际 ${JSON.stringify(closed8)}）`)
+
+    restoreLogs()
+  }
+
   // 清理：临时目录递归删除即可覆盖所有测试文件
   try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) {}
 
