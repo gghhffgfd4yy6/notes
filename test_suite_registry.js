@@ -129,9 +129,9 @@ assert.deepStrictEqual(staleExemptions, [],
   const guardBlock = base.slice(base.lastIndexOf('\n', guardAt) + 1, base.lastIndexOf('module.exports'))
   const variantSrc = (push) => preGuard + push + guardBlock + tail
   const variants = [
-    { name: '条目缺 name', src: variantSrc("SUITES.push({ file: 'test_foo.js', desc: '缺 name 的条目' })\n") },
-    { name: '重复注册同一文件', src: variantSrc("SUITES.push({ name: '重复文件', file: SUITES[0].file, desc: '重复注册' })\n") },
-    { name: '重复套件名', src: variantSrc("SUITES.push({ name: SUITES[0].name, file: 'test_bar.js', desc: '重名条目' })\n") }
+    { name: '条目缺 name', expect: '缺字段', src: variantSrc("SUITES.push({ file: 'test_foo.js', desc: '缺 name 的条目' })\n") },
+    { name: '重复注册同一文件', expect: '重复注册同一文件', src: variantSrc("SUITES.push({ name: '重复文件', file: SUITES[0].file, desc: '重复注册' })\n") },
+    { name: '重复套件名', expect: '重复的套件名', src: variantSrc("SUITES.push({ name: SUITES[0].name, file: 'test_bar.js', desc: '重名条目' })\n") }
   ]
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-registry-shape-'))
   try {
@@ -140,7 +140,7 @@ assert.deepStrictEqual(staleExemptions, [],
       // 沙箱里只 require 注册表本身（其加载期校验不读磁盘清单），无需复制其它文件
       const r = spawnSync(process.execPath, ['-e', "require('" + path.join(dir, 'test_suites.js') + "')"], { encoding: 'utf8' })
       assert.notStrictEqual(r.status, 0, `${v.name}：test_suites.js 加载期校验必须失败（否则坏条目静默进入执行清单）`)
-      assert.ok(!/AssertionError|SyntaxError/.test(r.stderr) || r.stderr.includes('test_suites.js'),
+      assert.ok(r.stderr.includes(v.expect),
         `${v.name}：失败应是注册表自身的 throw 而非意外崩溃\n${r.stderr}`)
     }
     // 正向：真实注册表必须可加载且通过校验（防止上方反例把「永远失败」当成通过）
