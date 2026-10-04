@@ -43,7 +43,13 @@ function run (raw) {
   if (raw !== undefined && raw !== null) {
     fs.writeFileSync(path.join(dir, 'audit-result.json'), typeof raw === 'string' ? raw : JSON.stringify(raw)) // nosemgrep
   }
-  const r = spawnSync(process.execPath, [SCRIPT], { cwd: dir, encoding: 'utf8' })
+  // timeout 必须有：AG-08 的成环夹具在「环检测被改坏」时会让门禁自己无限循环，
+  // 没有 timeout 的 spawnSync 会永久阻塞 ⇒ 整个套件挂到 CI 作业超时（而不是明确失败）。
+  const r = spawnSync(process.execPath, [SCRIPT], { cwd: dir, encoding: 'utf8', timeout: 20000, killSignal: 'SIGKILL' })
+  if (r.error || r.status === null) {
+    throw new Error(`子进程未正常收场（error=${r.error && r.error.code} signal=${r.signal}）` +
+      '：门禁自身挂死/被强杀必须让本套件明确失败，不得静默等外层超时')
+  }
   return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || '' }
 }
 
@@ -208,6 +214,22 @@ check('AG-10 GHSA 归一：小写 id 仍命中豁免；非 GHSA 形态 URL 保�
   const weird = run({ vulnerabilities: direct('noidea', 'high', ['https://example.com/vuln/no-ghsa-id']) })
   ok1(weird, 'URL 提不出 GHSA id 时信息不足，保守 block')
   assert.match(weird.stderr, /未豁免的高危漏洞：noidea/, '提取失败必须点名，绝不静默放行')
+})
+
+check('AG-11 直接挂 advisory 的高危包：部分豁免不得放行（钉住 audit-gate.js:79 的 every）', () => {
+  // 与 AG-09 的区别：AG-09 走的是「间接链根节点」那处 every（audit-gate.js:70）；
+  // 这里的高危包 via 里**直接**带 advisory 对象，命中的是 audit-gate.js:79 的另一处 every。
+  // 两处是彼此独立的判定，只钉一处等于另一半没有守卫：把 79 行的 every 写成 some，
+  // 「同一包同时挂被豁免项与未豁免项」就会被整体放行，且未豁免项还会被打印成「⚠️ 豁免：」。
+  const mixed = { vulnerabilities: direct('evil-pkg', 'high', [EXEMPT_URL, OTHER_URL]) }
+  const r = run(mixed)
+  ok1(r, '同一包上存在任意未豁免 advisory 时必须 block（部分豁免 ≠ 全部豁免）')
+  assert.match(r.stderr, /未豁免的高危漏洞：evil-pkg/, `必须点名被拦的包：${r.stderr.trim().slice(0, 200)}`)
+  assert.doesNotMatch(r.stdout, /豁免：evil-pkg\(GHSA-ZZZZ-ZZZZ-ZZZZ\)/,
+    `未豁免的 advisory 绝不得被打印成“豁免”（some 化的典型症状）：${r.stdout.slice(0, 240)}`)
+  // 反向对照：同一包只挂被豁免那一条 ⇒ 必须放行，证明上面的红来自 every 而不是夹具写坏
+  const onlyExempt = { vulnerabilities: direct('evil-pkg', 'high', [EXEMPT_URL]) }
+  ok0(run(onlyExempt), '同一包全部 advisory 均在豁免清单时必须放行')
 })
 
 fs.rmSync(tmp, { recursive: true, force: true })

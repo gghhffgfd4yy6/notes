@@ -579,8 +579,16 @@ dns.lookup = (hostname, options, callback) => {
       const cb = typeof options === 'function' ? options : callback
       process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
     }, async () => {
-      const r = await ask('ag-legacy', { all: true })
-      assert.strictEqual(r.address, 'legacy-scalar-address', '非数组结果必须原样透传（Array.isArray 闸门之外不改形状）')
+      // all:true 与非数组结果：形状必须原样透传
+      const asAll = await ask('ag-legacy-all', { all: true })
+      assert.strictEqual(asAll.address, 'legacy-scalar-address', 'all:true 时非数组结果必须原样透传')
+      // 标量路径（调用方没要 all）同样依赖 124 行的数组闸门：把闸门改成只判 error 后，
+      // 实现会走 `address[0].address`——字符串的 [0] 是首字符、再取 .address ⇒ 地址静默变
+      // undefined。既有断言只在 all:true 下测过，等于标量侧没有守卫（外部审查 P3 复现属实）。
+      const scalar = await ask('ag-legacy-scalar', {})
+      assert.strictEqual(scalar.address, 'legacy-scalar-address',
+        `标量路径也必须原样透传非数组结果，不得退化成 undefined：实际 ${JSON.stringify(scalar.address)}`)
+      assert.strictEqual(scalar.family, 4, '标量路径的 family 也必须保留')
     })
 
     // AGENTS-26：prewarmDns 的 error 字段归类优先级 code → message → String(error)
