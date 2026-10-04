@@ -590,8 +590,15 @@ function assertNoResidue (fx, label) {
 // E) 附：refs 解析细节——同一提交去重（只校验一次）、删除引用（local sha 全 0）跳过、
 //    非推送上下文（stdin 没有 ref 流）仍可用且显式声明其证明力
 {
-  const fx = makePushFixture({ commitGate: 'pass' })
-  const fx2 = makePushFixture({ commitGate: 'pass' })
+  // 夹具注册-清理口径（用例间状态猎杀 #198 后续）：夹具在 try 之前创建，第二个夹具
+  // makePushFixture 内部 mustGit 若抛错，try/finally 尚未开始 → 第一个夹具目录永久泄漏
+  // （含假 git 仓库与钩子副本，曾注入复现 leftovers=["xbk-hooks-*"]）。
+  // 改为逐个注册：每建成一个立即进入受保护清单，finally 逆序清理已建成者。
+  const fixtures = []
+  const makeRegistered = (opts) => { const f = makePushFixture(opts); fixtures.push(f); return f }
+  process.once('exit', () => { for (const f of fixtures) { try { fs.rmSync(f.dir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } } })
+  const fx = makeRegistered({ commitGate: 'pass' })
+  const fx2 = makeRegistered({ commitGate: 'pass' })
   try {
     const head = headOf(fx)
     const r = driveHook(fx,

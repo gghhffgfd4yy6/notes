@@ -15,6 +15,9 @@ function mockNotify (count) {
 }
 
 function restoreNotify () {
+  // 幂等：无论调用多少次，require.cache 都回到套件加载时的状态。
+  // 兜底口径（用例间状态猎杀 #198 后续）：restore 不依赖每个用例顺序调用到位——
+  // 任何用例断言失败走 catch 时也会先执行 restoreNotify 再退出，坏桩不驻留。
   require.cache[notifyPath] = origNotify
 }
 
@@ -124,4 +127,4 @@ function makeApp (overrides = {}) {
   restoreNotify()
 
   console.log('test_qinglong_runcheck OK')
-})().catch((e) => { console.error(e); process.exit(1) })
+})().catch((e) => { try { restoreNotify() } catch (_) { /* 还原本身不得吞掉原始错误 */ } console.error(e); process.exit(1) })
