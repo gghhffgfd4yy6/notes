@@ -7,7 +7,9 @@
 // 运行方式：node test_suite_registry.js（exit 0 = 通过；断言抛出即非 0 退出）。
 const assert = require('node:assert')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
+const { spawnSync } = require('node:child_process')
 const { SUITES } = require('./test_suites')
 
 // 仓库根 = 本文件所在目录（__dirname）：不依赖 cwd，CI 直跑、run_unit_tests.js 子进程、
@@ -110,6 +112,43 @@ assert.deepStrictEqual(staleExemptions, [],
   assert.deepStrictEqual(reconcile(['test_x.js'], ['test_x.js'], [], () => false).ghosts, ['test_x.js'],
     'exists 桩返回 false 时该注册条目必须被判为幽灵（桩语义自检）')
   console.log('✅ 校验逻辑自测通过（漏注册 / 幽灵条目 / 白名单陈旧 三个失败方向）')
+}
+
+// ④ 注册表条目形状 / 重复注册（test_suites.js 加载期校验的回归锁定）：
+//    本套件的双向对账只比 file 集合——条目缺 name/desc、重复注册同一文件/同名套件都「看不见」，
+//    必须由 test_suites.js 的加载期 throw 兜住。用临时沙箱改写注册表副本 require，三种坏形态各自必须失败。
+{
+  const base = fs.readFileSync(path.join(__dirname, 'test_suites.js'), 'utf8')
+  const guardMarker = '// 注册表自身的加载期形状校验'
+  const guardAt = base.indexOf(guardMarker)
+  assert.ok(guardAt > 0, 'test_suites.js 应含加载期形状校验块（夹具需把坏条目插在校验之前）')
+  const tail = base.slice(base.lastIndexOf('module.exports'))
+  // 坏条目必须插在**校验块之前**（push 在校验之后 = 绕过校验，形同虚设）：
+  // preGuard（SUITES 数组为止）+ push 坏条目 + 完整校验块 + module.exports
+  const preGuard = base.slice(0, base.lastIndexOf('\n', guardAt) + 1)
+  const guardBlock = base.slice(base.lastIndexOf('\n', guardAt) + 1, base.lastIndexOf('module.exports'))
+  const variantSrc = (push) => preGuard + push + guardBlock + tail
+  const variants = [
+    { name: '条目缺 name', expect: '缺字段', src: variantSrc("SUITES.push({ file: 'test_foo.js', desc: '缺 name 的条目' })\n") },
+    { name: '重复注册同一文件', expect: '重复注册同一文件', src: variantSrc("SUITES.push({ name: '重复文件', file: SUITES[0].file, desc: '重复注册' })\n") },
+    { name: '重复套件名', expect: '重复的套件名', src: variantSrc("SUITES.push({ name: SUITES[0].name, file: 'test_bar.js', desc: '重名条目' })\n") }
+  ]
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-registry-shape-'))
+  try {
+    for (const v of variants) {
+      fs.writeFileSync(path.join(dir, 'test_suites.js'), v.src)
+      // 沙箱里只 require 注册表本身（其加载期校验不读磁盘清单），无需复制其它文件
+      const r = spawnSync(process.execPath, ['-e', "require('" + path.join(dir, 'test_suites.js') + "')"], { encoding: 'utf8' })
+      assert.notStrictEqual(r.status, 0, `${v.name}：test_suites.js 加载期校验必须失败（否则坏条目静默进入执行清单）`)
+      assert.ok(r.stderr.includes(v.expect),
+        `${v.name}：失败应是注册表自身的 throw 而非意外崩溃\n${r.stderr}`)
+    }
+    // 正向：真实注册表必须可加载且通过校验（防止上方反例把「永远失败」当成通过）
+    assert.ok(SUITES.length > 0, '真实 test_suites.js 应可加载（加载期校验通过）')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+  console.log('✅ 注册表形状门禁：缺 name / 重复文件 / 重复套件名 三种坏条目均被 test_suites.js 加载期校验拦截')
 }
 
 console.log(`✅ 根目录 ${diskTestFiles.length} 个 test_*.js 与 SUITES ${registeredFiles.length} 条注册双向一致（白名单 ${REGISTRY_EXEMPTIONS.length} 个：${REGISTRY_EXEMPTIONS.join(', ')}）`)

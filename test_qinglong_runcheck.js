@@ -113,9 +113,14 @@ function makeApp (overrides = {}) {
   restoreNotify()
 
   // ===== notify 无 configuredChannelCount 方法 → 返回 1（count=0）=====
+  // 与其他失败用例同口径：必须在 withHealthyEnv 里跑并断言「通知通道」为 ❌——否则在
+  // Node<engines 或缺 got/re2 的裸环境下 runCheck 会因环境检查先失败返回 1，
+  // 断言因错误的原因通过（假绿），区分不出「无通道」这条检查本身。
   require.cache[notifyPath] = { exports: {} }
-  const codeNoMethod = runCheck(makeApp())
-  assert.strictEqual(codeNoMethod, 1, 'notify 无 configuredChannelCount 方法应返回 1')
+  const rNoMethod = withHealthyEnv(() => captureRunCheck(makeApp()))
+  assert.strictEqual(rNoMethod.code, 1, 'notify 无 configuredChannelCount 方法应返回 1')
+  assert.ok(rNoMethod.output.includes('❌ 通知通道'), '失败项应为"通知通道"，输出应含 ❌ 通知通道')
+  assert.ok(rNoMethod.output.includes('未检测到完整通道配置'), '应显示未检测到通道配置')
   restoreNotify()
 
   console.log('test_qinglong_runcheck OK')

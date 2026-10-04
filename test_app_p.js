@@ -71,6 +71,14 @@ function runChunk (chunk, idx, quick) {
       stdio: 'inherit'
     })
     activeChildren.add(child)
+    // spawn 失败（EACCES/ENOENT 等）时 Node 只发 'error' 事件、不发 'exit'——
+    // 不 resolve 会让 Promise.all 永久挂起，调度器静默卡死。按失败片处理（进串行重跑路径）。
+    child.on('error', (err) => {
+      activeChildren.delete(child)
+      try { fs.unlinkSync(listFile) } catch (e) {}
+      console.error(`worker#${idx} 启动失败：${err && err.code ? err.code : err}`)
+      resolve(1)
+    })
     child.on('exit', (code) => {
       activeChildren.delete(child)
       try { fs.unlinkSync(listFile) } catch (e) {}

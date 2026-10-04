@@ -42,7 +42,8 @@ try {
   const degraded = readStatus('.', { now: 2000 })
   assert.strictEqual(degraded.report.status, 'invalid')
   assert.strictEqual(degraded.channels.status, 'missing')
-  assert.match(formatStatus(degraded), /不可读|缺失/)
+  assert.match(formatStatus(degraded), /日报：不可读（invalid）/, 'report 损坏必须在输出中体现为「不可读（invalid）」')
+  assert.match(formatStatus(degraded), /通道健康：缺失/, '通道文件缺失必须在输出中体现为「缺失」')
 
   // `{}`（无 date、无计数）在生产侧 _loadReportState 里是**合法**的空累计状态（_normalizeReportState
   // 归一化为 blank：date→''、计数→0），故 --status 也必须显示正常。此前这里断言 invalid，

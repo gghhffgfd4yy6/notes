@@ -628,17 +628,27 @@ check('PERF_MS 缩放 ④: 生效上界必须来自本进程 PERF_MS，断言点
 // 必须被 maskKey 遮蔽。cron 日志会重定向/分享，这条链断了就是真实密钥明文落盘。
 // 每个用例把 push_config 临时换成给定键值（只换本次关心的），跑完逐键恢复。
 // ============================================================
+// 部署侧 push_config.local.js（gitignore 真实密钥）经模块加载期 Object.assign 混进 push_config。
+// local 注入的键在测试口径下必须视为「未配置」：否则 withConfig 的保存/恢复会把真实 token 原样带回，
+// 「未配置」断言假红（本机曾 100% 红：WX_pusher_appToken/topicIds 泄入 isolateChannel/withConfig 状态）。
+let LOCAL_ONLY_KEYS = []
+try { LOCAL_ONLY_KEYS = Object.keys(require('./push_config.local.js')) } catch (e) { /* 无 local 配置文件 */ }
+// env 覆盖不经过 withConfig（见 ENV_ALIASES 用例自管），此清单只含 local 文件注入的键。
+const BASELINE_CONFIG = {}
+for (const k of Object.keys(push_config)) BASELINE_CONFIG[k] = push_config[k]
+for (const k of LOCAL_ONLY_KEYS) BASELINE_CONFIG[k] = undefined
+
 function withConfig (patch, fn) {
   const saved = {}
   for (const k of Object.keys(push_config)) saved[k] = push_config[k]
   try {
     for (const k of Object.keys(push_config)) delete push_config[k]
-    for (const [k, v] of Object.entries(saved)) push_config[k] = v
+    for (const [k, v] of Object.entries(BASELINE_CONFIG)) push_config[k] = v
     for (const [k, v] of Object.entries(patch)) push_config[k] = v
     return fn()
   } finally {
     for (const k of Object.keys(push_config)) delete push_config[k]
-    for (const [k, v] of Object.entries(saved)) push_config[k] = v
+    for (const [k, v] of Object.entries(BASELINE_CONFIG)) push_config[k] = v
   }
 }
 
@@ -877,8 +887,15 @@ check('push_config: 默认值逐键精确（空串默认不得被占位文本替
     TG_PROXY_HOST: '',
     TG_PROXY_PORT: ''
   }
-  for (const [key, value] of Object.entries(expected)) {
-    assert.strictEqual(push_config[key], value, `push_config.${key} 默认值必须为 ${JSON.stringify(value)}`)
+  // 部署侧存在 push_config.local.js（gitignore 的真实密钥文件）时，local 配置按设计在模块加载期
+  // Object.assign 覆盖默认值——此时默认值不可观测，与 test_sendnotify_utils.js:280 的跳过口径对齐
+  // （本机存在该文件时本用例曾 100% 假红：WX_pusher_topicIds 被真实主题 ID 覆盖）。
+  let hasLocalCfg = true
+  try { require.resolve('./push_config.local.js') } catch (e) { hasLocalCfg = false }
+  if (!hasLocalCfg) {
+    for (const [key, value] of Object.entries(expected)) {
+      assert.strictEqual(push_config[key], value, `push_config.${key} 默认值必须为 ${JSON.stringify(value)}`)
+    }
   }
 })
 

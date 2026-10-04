@@ -1029,7 +1029,7 @@ console.log('========================================\n');
       leakResponse = true
       let caught = null
       try { await notify.sendNotify('标题', '内容') } catch (e) { caught = e }
-      const all = captured.join('\\n')
+      const all = captured.join('\n')
       assert(caught, '业务失败应 reject')
       assert(!caught.message.includes('APP_SECRET'), `reject 错误信息不应泄露已配置 token: ${caught.message}`)
       assert(caught.message.includes('业务失败'), `reject 错误信息仍应保留诊断摘要: ${caught.message}`)
@@ -1052,7 +1052,7 @@ console.log('========================================\n');
       leakResponse = true
       let caught = null
       try { await notify.sendNotify('标题', '内容') } catch (e) { caught = e }
-      const all = captured.join('\\n')
+      const all = captured.join('\n')
       assert(caught, '嵌套配置通道失败应 reject')
       assert(!all.includes('APP_SECRET'), '嵌套 appToken 不应出现在日志')
       assert(!caught.message.includes('APP_SECRET'), '嵌套 appToken 不应出现在 reject 错误')
@@ -1087,7 +1087,7 @@ console.log('========================================\n');
         assert(caught, `${name}: 业务失败应 reject`)
         const secret = c.PUSHME_KEY ? 'PM_SECRET' : 'APP_SECRET'
         assert(!caught.message.includes(secret), `${name}: reject 错误不应泄露密钥: ${caught.message}`)
-        assert(!captured.join('\\n').includes(secret), `${name}: 日志不应泄露密钥: ${captured.join(' | ')}`)
+        assert(!captured.join('\n').includes(secret), `${name}: 日志不应泄露密钥: ${captured.join(' | ')}`)
         if (!['Bark', 'PushMe'].includes(name)) assert(caught.message.includes('业务失败'), `${name}: 应保留诊断文本: ${caught.message}`)
       }
     } finally {

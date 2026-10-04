@@ -68,4 +68,25 @@ const SUITES = [
   { name: '应用状态与日报单元', file: 'test_app_unit.js', desc: 'xbk_app.js 报告/状态簇：_isValidReportDate 闰年与月界、_loadReportState 缺文件/损坏/超限降级、_normalizeReportState 形状归一与 pending 占位告警' }
 ]
 
+// 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与
+// stryker.tap.config.js 直接 require，加载即执行。test_suite_registry.js 的「漏注册 / 幽灵条目」双向对账
+// 只比 file **集合**，看不见另外两类漏网情形——① 条目缺 name/desc（汇总行会渲染成 undefined，且
+// 不进变异 testFiles 对账的 file 维度：它按 file 推导，仍会「通过」）；② 重复注册同一文件/同名套件
+// （同一套件被跑两次、汇总/日报无法区分）。这两类必须在注册表加载处响亮失败——照抄对照
+// stryker.tap.config.js 的加载期 throw 口径（不一致即 throw，而非静默少跑/重跑）。
+{
+  const badShape = SUITES.filter(s => !s || typeof s.name !== 'string' || !s.name ||
+    typeof s.file !== 'string' || !/^test_.*\.js$/.test(s.file) || typeof s.desc !== 'string' || !s.desc)
+  if (badShape.length) {
+    throw new Error('test_suites.js 注册表条目缺字段：每条必须同时有非空 name/file/desc 且 file 形如 test_*.js；' +
+      `问题条目：${badShape.map(s => (s && s.file) || JSON.stringify(s)).join(', ')}`)
+  }
+  const files = SUITES.map(s => s.file)
+  const dupFiles = [...new Set(files.filter((f, i) => files.indexOf(f) !== i))]
+  if (dupFiles.length) throw new Error(`test_suites.js 重复注册同一文件（该套件会被执行两次）：${dupFiles.join(', ')}`)
+  const names = SUITES.map(s => s.name)
+  const dupNames = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))]
+  if (dupNames.length) throw new Error(`test_suites.js 存在重复的套件名（汇总/日报无法区分）：${dupNames.join(', ')}`)
+}
+
 module.exports = { SUITES }
