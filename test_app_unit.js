@@ -2228,11 +2228,13 @@ checkAsync('通道健康: 状态写入失败时提前返回（不入队告警、
 const AP_ROOT = (() => {
   const realFs = require('fs')
   const d = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-app-unit-'))
-  try { realFs.chmodSync(d, 0o700) } catch (e) { /* 某些 FUSE 挂载不允许 chmod：目录名仍不可预测 */ }
+  try { realFs.chmodSync(d, 0o700) } catch (e) { /* 某些 FUSE 挂载不允许 chmod：目录名仍不可预测 */ } // nosemgrep（d 是 mkdtempSync 独占产物，无外部输入）
   process.once('exit', () => { try { realFs.rmSync(d, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
   return d
 })()
-const apPath = (name) => path.join(AP_ROOT, name)
+// 唯一的动态来源是 mkdtemp 私有目录 + 本文件内硬编码的文件名常量，不接受任何外部输入
+// ⇒ Codacy 的 pathtraversal-non-literal-fs-filename 在此是结构性误报（口径同 xbk_storage.js:17 与 .codacy.yml 里 test_storage.js 的说明）
+const apPath = (name) => path.join(AP_ROOT, name) // nosemgrep
 
 // ===== G11-AP：RE2 标记原子写 / PID 复用识别 / 通道健康降级（c8 实测 xbk_app.js 分支 86.06%，
 // L341-350 与 L524-530 与 L843-845 与 L917-918 均未达）=====
