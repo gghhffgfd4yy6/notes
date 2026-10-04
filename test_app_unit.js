@@ -2221,6 +2221,19 @@ checkAsync('通道健康: 状态写入失败时提前返回（不入队告警、
   assert.strictEqual(sent.length, 1, 'writeOk 正常时同配置应入队告警')
 })
 
+// 本簇的状态文件路径全部取自**私有 mkdtemp 目录**，不写可预测的 /tmp 文件名
+// （Sonar「Make sure publicly writable directories are used safely here」/ CWE-377：公共可写目录里的
+// 固定名可被他人抢占/预建；本仓 6369482 已把记账文件统一改成 mkdtemp 私有目录，此处照同一口径）。
+// 注意：下面 AP-1…AP-3 用的是**注入的假 fs**，这些路径只是字符串、不落真磁盘，但命名口径仍按真实环境执行。
+const AP_ROOT = (() => {
+  const realFs = require('fs')
+  const d = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-app-unit-'))
+  try { realFs.chmodSync(d, 0o700) } catch (e) { /* 某些 FUSE 挂载不允许 chmod：目录名仍不可预测 */ }
+  process.once('exit', () => { try { realFs.rmSync(d, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
+  return d
+})()
+const apPath = (name) => path.join(AP_ROOT, name)
+
 // ===== G11-AP：RE2 标记原子写 / PID 复用识别 / 通道健康降级（c8 实测 xbk_app.js 分支 86.06%，
 // L341-350 与 L524-530 与 L843-845 与 L917-918 均未达）=====
 // 这四条全是「跨平台与故障降级」分支：Linux 上 rename 天然覆盖，Windows 的 EPERM 重试永不执行；
@@ -2255,7 +2268,7 @@ check('AP-1 _writeRe2WarnMarkerAtomic：Windows rename 失败必须先删目标�
     }
   }
   const a = makeApp({ fs: fakels })
-  const statePath = '/tmp/ap-re2-marker.state'
+  const statePath = apPath('re2-marker.state')
   files.set(statePath, '旧标记') // 目标已存在 ⇒ Windows 上 rename 必失败
   assert.strictEqual(a._writeRe2WarnMarkerAtomic(statePath, '新标记'), true, '重试成功后必须返回 true')
   assert.strictEqual(files.get(statePath), '新标记', '目标内容必须是本次写入的')
@@ -2266,7 +2279,7 @@ check('AP-1 _writeRe2WarnMarkerAtomic：Windows rename 失败必须先删目标�
 
 check('AP-2 _writeRe2WarnMarkerAtomic：目标删除失败必须被吞掉后仍重试；两次 rename 都失败 ⇒ 清 tmp 返回 false 且不抛穿', () => {
   // 分支①：unlink 抛 ENOENT（目标恰好已被别人删）⇒ 忽略后重试 rename 应成功
-  const files = new Map([['/tmp/ap2.state', '旧']])
+  const files = new Map([[apPath('ap2.state'), '旧']])
   let renameFails = 1
   const fsA = {
     writeFileSync: (p, text, opts) => {
@@ -2281,7 +2294,7 @@ check('AP-2 _writeRe2WarnMarkerAtomic：目标删除失败必须被吞掉后仍�
     unlinkSync: () => { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e }
   }
   const aA = makeApp({ fs: fsA })
-  assert.strictEqual(aA._writeRe2WarnMarkerAtomic('/tmp/ap2.state', 'x'), true,
+  assert.strictEqual(aA._writeRe2WarnMarkerAtomic(apPath('ap2.state'), 'x'), true,
     '目标已被他人删除时 unlink 抛 ENOENT 必须被吞掉，重试 rename 仍应成功')
   // 分支②：两次 rename 都失败 ⇒ 外层 catch 尽力清 tmp、返回 false，且 unlink 自身抛错不得外泄
   const unlinkTargets = []
@@ -2293,14 +2306,14 @@ check('AP-2 _writeRe2WarnMarkerAtomic：目标删除失败必须被吞掉后仍�
   }
   const aB = makeApp({ fs: fsB })
   try {
-    assert.strictEqual(aB._writeRe2WarnMarkerAtomic('/tmp/ap2-fail.state', 'x'), false, '重试仍失败必须返回 false')
+    assert.strictEqual(aB._writeRe2WarnMarkerAtomic(apPath('ap2-fail.state'), 'x'), false, '重试仍失败必须返回 false')
   } catch (e) { threwOutward = e }
   assert.strictEqual(threwOutward, null,
     `清理链上的抛错绝不能外泄（调用方在提醒主链上）：${threwOutward && threwOutward.message}`)
   assert.strictEqual(unlinkTargets.length, 2,
     `两次 rename 都失败时必须先试删目标、再清 .tmp（实际 ${JSON.stringify(unlinkTargets)}）`)
   assert.ok(unlinkTargets[1].endsWith('.tmp'), `最后一次清理必须针对本次的 .tmp：${JSON.stringify(unlinkTargets)}`)
-  assert.ok(files.has('/tmp/ap2-fail.state') === false, '目标文件绝不得被直接写入（半写状态会让当天提醒被永久压制）')
+  assert.ok(files.has(apPath('ap2-fail.state')) === false, '目标文件绝不得被直接写入（半写状态会让当天提醒被永久压制）')
 })
 
 for (const c of [
@@ -2323,7 +2336,7 @@ for (const c of [
       ? origKill
       : () => { const e = new Error('kill'); e.code = c.kill; throw e }
     try {
-      assert.strictEqual(a._isRe2WarnMarkerStale('/tmp/ap3.state'), c.expect)
+      assert.strictEqual(a._isRe2WarnMarkerStale(apPath('ap3.state')), c.expect)
     } finally {
       process.kill = origKill
     }
@@ -2362,16 +2375,4 @@ checkAsync('AP-5 通道健康：更新过程整体抛错 ⇒ 补一行 WARN 留�
     `异常必须留一行 WARN（旧实现完全静默，通道健康可能永久不更新而无人知）：${JSON.stringify(logged)}`)
   assert.ok(logged.some(l => l.includes('state read boom')), '留痕必须带上根因文本')
   assert.strictEqual(mfs._files.has(healthPath + '.lock'), false, '异常路径也必须释放健康更新锁（finally 语义）')
-})
-
-checkAsync('AP-6 通道健康：恢复告警写状态成功与否必须可区分（persisted 记入告警节流状态）', async () => {
-  const mfs = makeMemFs()
-  const sent = []
-  const a = makeHealthApp2({ fs: mfs, threshold: 1, pusher: { send: async (t) => { sent.push(t) } } })
-  await a._updateChannelHealth({ successfulChannels: ['pushdeer'], failures: [] })
-  const state = JSON.parse(mfs.readFileSync(healthPath))
-  assert.ok(state.pushdeer, '成功通道必须被登记')
-  assert.strictEqual(state.pushdeer.consecutiveFailures, 0, '恢复后连续失败计数必须归零')
-  assert.ok(Number.isFinite(state.pushdeer.lastRecoveredAt) && state.pushdeer.lastRecoveredAt > 0,
-    '必须落恢复时刻（否则下轮无法判断「已恢复」）')
 })

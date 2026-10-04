@@ -31,11 +31,17 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-audit-gate-'))
 process.once('exit', () => { try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
 
 // raw 为字符串时按原文写入（用于「非法 JSON」这类夹具），否则 JSON.stringify
+// 用例目录名用**自增计数**而不是 Math.random()：既避免 Sonar/Codacy 的「弱随机数用于路径」告警
+// （CWE-330：伪随机数不可用于需要唯一性/不可预测性的场合），又让同一进程内的目录名可复现。
+let caseSeq = 0
 function run (raw) {
-  const dir = path.join(tmp, `case-${Math.random().toString(36).slice(2, 10)}`)
-  fs.mkdirSync(dir, { recursive: true })
+  caseSeq += 1
+  // 夹具目录一律走 mkdtemp 私有目录（不在公共可写目录里用固定名），路径由本函数独占构造：
+  // 唯一的“动态”来源是内部计数器与 mkdtemp 随机后缀，不接受任何外部输入 ⇒ Codacy 的
+  // pathtraversal-non-literal-fs-filename 在本模块是结构性误报（同 xbk_storage.js 文件头说明）。
+  const dir = fs.mkdtempSync(path.join(tmp, `case${caseSeq}-`)) // nosemgrep
   if (raw !== undefined && raw !== null) {
-    fs.writeFileSync(path.join(dir, 'audit-result.json'), typeof raw === 'string' ? raw : JSON.stringify(raw))
+    fs.writeFileSync(path.join(dir, 'audit-result.json'), typeof raw === 'string' ? raw : JSON.stringify(raw)) // nosemgrep
   }
   const r = spawnSync(process.execPath, [SCRIPT], { cwd: dir, encoding: 'utf8' })
   return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || '' }

@@ -36,7 +36,7 @@ const REAL_DNS_LOOKUP = dns.lookup
 // options.family / options.all 返回对应结果，否则会因固定返回 4 而假绿。
 dns.lookup = (hostname, options, callback) => {
   const cb = typeof options === 'function' ? options : callback
-  process.nextTick(() => cb(null, '127.0.0.1', 4))
+  process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
 }
 
 ;(async () => {
@@ -111,7 +111,7 @@ dns.lookup = (hostname, options, callback) => {
     assert.strictEqual(timeoutLookups, 2, 'ETIMEDOUT 失效后同一主机应重新解析（旧口径此处仍为 1）')
     dns.lookup = (hostname, options, callback) => {
       const cb = typeof options === 'function' ? options : callback
-      process.nextTick(() => cb(null, '127.0.0.1', 4))
+      process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
     }
     console.log('✅ AGENTS-02：ETIMEDOUT 清理 DNS 缓存后重试窗口重新解析')
   }
@@ -136,7 +136,7 @@ dns.lookup = (hostname, options, callback) => {
     assert.strictEqual(certLookups, 1, '证书错误后缓存应仍然有效（旧口径此处为 2）')
     dns.lookup = (hostname, options, callback) => {
       const cb = typeof options === 'function' ? options : callback
-      process.nextTick(() => cb(null, '127.0.0.1', 4))
+      process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
     }
     console.log('✅ AGENTS-08：证书主机名不匹配不再清 DNS 缓存')
   }
@@ -266,7 +266,7 @@ dns.lookup = (hostname, options, callback) => {
     // 恢复文件头的确定性 mock（保持后续断言的既定语义）
     dns.lookup = (hostname, options, callback) => {
       const cb = typeof options === 'function' ? options : callback
-      process.nextTick(() => cb(null, '127.0.0.1', 4))
+      process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
     }
     console.log('✅ AGENTS-01/11：预热与真实请求同 key；选项不同（hints）不再互相复用条目')
   }
@@ -382,7 +382,7 @@ dns.lookup = (hostname, options, callback) => {
     // 恢复文件头的确定性 mock（保持后续断言的既定语义）
     dns.lookup = (hostname, options, callback) => {
       const cb = typeof options === 'function' ? options : callback
-      process.nextTick(() => cb(null, '127.0.0.1', 4))
+      process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
     }
     console.log('✅ AGENTS-11：缓存键含 family/hints/verbatim(order)——不同选项不复用不匹配地址，同选项仍共享条目')
   }
@@ -409,7 +409,7 @@ dns.lookup = (hostname, options, callback) => {
   dns.lookup = (hostname, options, callback) => {
     mrCalls += 1
     const cb = typeof options === 'function' ? options : callback
-    process.nextTick(() => cb(null, '127.0.0.1', 4))
+    process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
   }
   // 计时器必须在 race settle 后清掉：p 先 settle 时原写法仍留着定时器存活，
   // 会把进程多留 ms 毫秒（反复的变异运行逐次累积这段空等）。见 PR #173 评审。
@@ -436,7 +436,7 @@ dns.lookup = (hostname, options, callback) => {
   dns.lookup = (hostname, options, callback) => {
     mrCalls2 += 1
     const cb = typeof options === 'function' ? options : callback
-    process.nextTick(() => cb(null, '127.0.0.1', 4))
+    process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
   }
   try {
     await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-order.test', { order: 'verbatim' }, (e) => e ? reject(e) : resolve())))
@@ -516,7 +516,7 @@ dns.lookup = (hostname, options, callback) => {
     }
 
     // AGENTS-21：family / hints 非法取值 ⇒ 不建模；但**必须照常拿到解析结果**（拒绝建模 ≠ 拒绝服务）
-    for (const bad of [{ family: 5 }, { family: '4' }, { family: NaN }, { hints: '1' }, { hints: Infinity }, { hints: NaN }]) {
+    for (const bad of [{ family: 5 }, { family: '4' }, { family: Number.NaN }, { hints: '1' }, { hints: Number.POSITIVE_INFINITY }, { hints: Number.NaN }]) {
       const st = makeCounter()
       const tag = 'ag-bad-' + JSON.stringify(bad).replace(/[^\w]/g, '')
       const a = await withResolver(st.fn, () => ask(tag, bad))
@@ -577,10 +577,10 @@ dns.lookup = (hostname, options, callback) => {
     // AGENTS-25：非数组结果（旧替身/异常解析器）必须原样透传，不被“归一化”吞掉
     await withResolver((hostname, options, callback) => {
       const cb = typeof options === 'function' ? options : callback
-      process.nextTick(() => cb(null, '10.0.0.1', 4))
+      process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
     }, async () => {
       const r = await ask('ag-legacy', { all: true })
-      assert.strictEqual(r.address, '10.0.0.1', '非数组结果必须原样透传（Array.isArray 闸门之外不改形状）')
+      assert.strictEqual(r.address, 'legacy-scalar-address', '非数组结果必须原样透传（Array.isArray 闸门之外不改形状）')
     })
 
     // AGENTS-26：prewarmDns 的 error 字段归类优先级 code → message → String(error)
