@@ -107,18 +107,28 @@ function makeResidentApp (runFn) {
   assert.strictEqual(runCalls, 1, 'permanent 错误后应停止，只调用 1 次')
 
   // 3. 可重试失败后成功：第一次返回全失败 summary（retryable），第二次成功
+  // ⚠️ env 写/删必须成对且删在 finally：用例中途断言失败时若漏掉清理，同进程聚合执行
+  // （变异测试/合并 runner）时后续用例会读到残留的 XBK_RETRY_BACKOFF_CAP_MS，退避上限被污染。
+  // 快照恢复口径（Sourcery broader_impact）：若调用方在套件启动前已设该变量，finally 必须
+  // 还原其原值而非一律 delete——否则反向剥掉调用方/runner 的既有配置，同样构成泄漏。
+  const capMsWasSet = Object.prototype.hasOwnProperty.call(process.env, 'XBK_RETRY_BACKOFF_CAP_MS')
+  const capMsOriginal = process.env.XBK_RETRY_BACKOFF_CAP_MS
   process.env.XBK_RETRY_BACKOFF_CAP_MS = '10' // 极短退避，加速测试
-  runCalls = 0
-  const appRetry = makeResidentApp(async () => {
-    runCalls++
-    if (runCalls === 1) return { total: 1, pushed: 0, failed: 1 } // 全失败 → retryable
-    return { total: 1, pushed: 1, failed: 0 } // 成功
-  })
-  const ctrl3 = new AbortController()
-  setTimeout(() => ctrl3.abort(), 150)
-  await runResident(appRetry, ctrl3)
-  assert.ok(runCalls >= 2, `可重试失败后应重试，至少调用 2 次 app.run，实际 ${runCalls}`)
-  delete process.env.XBK_RETRY_BACKOFF_CAP_MS
+  try {
+    runCalls = 0
+    const appRetry = makeResidentApp(async () => {
+      runCalls++
+      if (runCalls === 1) return { total: 1, pushed: 0, failed: 1 } // 全失败 → retryable
+      return { total: 1, pushed: 1, failed: 0 } // 成功
+    })
+    const ctrl3 = new AbortController()
+    setTimeout(() => ctrl3.abort(), 150)
+    await runResident(appRetry, ctrl3)
+    assert.ok(runCalls >= 2, `可重试失败后应重试，至少调用 2 次 app.run，实际 ${runCalls}`)
+  } finally {
+    if (capMsWasSet) process.env.XBK_RETRY_BACKOFF_CAP_MS = capMsOriginal
+    else delete process.env.XBK_RETRY_BACKOFF_CAP_MS
+  }
 
   console.log('test_qinglong_resident OK')
 })().catch((e) => { console.error(e); process.exit(1) })
