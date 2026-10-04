@@ -11,6 +11,10 @@ const {
 } = require('./xbk_agents')
 
 // 确定性 DNS mock：避免测试依赖真实网络/解析器。
+// ⚠️ 全局猴补必须可逆：本 mock 覆写全局 dns.lookup（含内部用例的多次覆写），
+// 套件退出（成功/断言失败/进程退出钩子）时恢复真实解析器——否则同进程聚合执行
+// （变异测试/合并 runner）时后续套件拿到假解析器，断言被上一套件的状态污染。
+const REAL_DNS_LOOKUP = dns.lookup
 // 精简容器可能 /etc/hosts 缺 localhost 或 DNS 不可达，导致 dnsLookup 真实解析失败而误报。
 // 统一回环解析，使 dnsCache 的填充/命中/失效路径仍可验证且不触网。
 // ⚠️ 显式声明：本 mock 不模拟 family/options 语义——无条件返回 family=4，并忽略入参 options
@@ -453,4 +457,9 @@ dns.lookup = (hostname, options, callback) => {
   }
 
   console.log('test_agents OK')
-})().catch((e) => { console.error(e); process.exit(1) })
+})().catch((e) => { console.error(e); process.exitCode = 1 }).finally(() => {
+  // 全局猴补退场恢复：无论成功/失败路径（含 catch 后），dns.lookup 必须还原为真实解析器。
+  // 防御式比较：若已被中途某个 finally 恢复为真 lookup，再赋值也无害。
+  dns.lookup = REAL_DNS_LOOKUP
+})
+process.once('exit', () => { dns.lookup = REAL_DNS_LOOKUP })
