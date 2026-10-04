@@ -1948,6 +1948,26 @@ check('RE2 警告锁: 释放时关闭 fd 并删除锁文件；未获取时释放
   app._releaseRe2WarnLock(statePath, null)
 })
 
+check('RE2 警告: token 不匹配时 _completeRe2WarnMarker 不得改写他人 pending 标记', () => {
+  const mfs = makeMemFs()
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir })
+  const otherToken = JSON.stringify({ warnedAt: 123, pid: 424242, start: 'def', status: 'pending' })
+  mfs.writeFileSync(statePath, otherToken)
+  app._completeRe2WarnMarker(statePath, JSON.stringify({ warnedAt: 999, pid: process.pid, start: 'abc', status: 'pending' }))
+  assert.strictEqual(mfs.readFileSync(statePath), otherToken, 'token 不匹配必须原样保留他人标记（防误改并发进程标记）')
+  assert.strictEqual(JSON.parse(mfs.readFileSync(statePath)).status, 'pending', '他人标记 status 必须仍是 pending')
+})
+
+check('RE2 警告: token 不匹配时 _removeRe2WarnMarker 不得删除他人 pending 标记', () => {
+  const mfs = makeMemFs()
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir })
+  const otherToken = JSON.stringify({ warnedAt: 123, pid: 424242, start: 'def', status: 'pending' })
+  mfs.writeFileSync(statePath, otherToken)
+  app._removeRe2WarnMarker(statePath, JSON.stringify({ warnedAt: 999, pid: process.pid, start: 'abc', status: 'pending' }))
+  assert.strictEqual(mfs._files.has(statePath), true, 'token 不匹配必须保留他人标记文件（防误删并发进程标记）')
+  assert.strictEqual(mfs.readFileSync(statePath), otherToken, '保留的标记内容必须原样不变')
+})
+
 // --- 通道健康锁与恢复认领簇（FX3/APP-02：健康状态、认领租约、释放语义）---
 // 桩约定同 RE2 簇：makeMemFs + makeRe2App（RE2C=null 但不影响本簇；走 makeRe2WarnApp 同参构造）。
 // _updateChannelHealth 依赖 Config.channelHealth + Utils.num + summarizeError —— 用注入参数定制。
@@ -2084,7 +2104,7 @@ checkAsync('恢复认领清零: 通道恢复成功后计数清零、lastRecovere
 
 // --- _updateChannelHealth 主流程用例（失败计数 / 告警入队 / 恢复认领 / 状态损坏防御）---
 // _sendAlert 经 makeHealthApp 无注入——检查其实现依赖 getNotify/Pusher。用 sendAlert 注入参数版本。
-function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000, pusher }) {
+function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000, pusher, writeOk = true }) {
   return createApp({
     Config: { channelHealth: { enabled: true, consecutiveFailures: threshold, intervalMs } },
     Utils: {
@@ -2106,7 +2126,8 @@ function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, t
       if (Buffer.byteLength(text) > maxBytes) return { status: 'oversize', text: '' }
       return { status: 'ok', text: String(text) }
     },
-    writeAtomic: (p, text) => { fs.writeFileSync(p, text); return true },
+    // writeOk（参照 makeLogApp 的 opts.writeOk 先例）：false 模拟 writeAtomic 失败，覆盖 _writeState 短路分支
+    writeAtomic: (p, text) => { fs.writeFileSync(p, text); return writeOk },
     isRegularOrMissing: () => true,
     STATE_TEXT_MAX_BYTES: 262144,
     DEFAULT_MAX_SIZE: 1048576,
@@ -2185,4 +2206,17 @@ checkAsync('健康更新: 锁被他人持有时跳过本轮且不动状态文件
   const before = mfs.readFileSync(healthPath)
   await app._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'x' }] })
   assert.strictEqual(mfs.readFileSync(healthPath), before, '拿不到锁必须整轮跳过（不能覆盖另一轮状态）')
+})
+
+checkAsync('通道健康: 状态写入失败时提前返回（不入队告警、释放锁）', async () => {
+  const mfs = makeMemFs()
+  const sent = []
+  const app = makeHealthApp2({ fs: mfs, threshold: 1, pusher: { send: async (t) => { sent.push(t) } }, writeOk: false })
+  await app._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  assert.strictEqual(sent.length, 0, '状态写入失败必须提前返回，告警不得入队发送')
+  assert.strictEqual(mfs._files.has(healthPath + '.lock'), false, '提前返回路径必须释放锁（finally 语义）')
+  // 反向对照：writeOk 恢复 true 后同轮可正常入队（证明短路来自写入失败而非阈值/桩配置）
+  const app2 = makeHealthApp2({ fs: makeMemFs(), threshold: 1, pusher: { send: async (t) => { sent.push(t) } } })
+  await app2._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  assert.strictEqual(sent.length, 1, 'writeOk 正常时同配置应入队告警')
 })

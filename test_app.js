@@ -1244,15 +1244,18 @@ console.log('========================================\n');
     if (sendFn) {
       notifyMock.sendNotify = sendFn
     }
-    const summary = await xbk.run()
-    const cacheName = 'tpush_' + mode + (limit || 0) + '_' + (pushSeq - 1) + '.json'
-    const res = { pushed: pushCalls.length, cached: readCacheFile(cacheName).length, summary }
-    // 恢复默认
-    Config.push.mode = 'parallel'
-    Config.push.parallelLimit = 0
-    notifyMock.sendNotify = defaultNotifySend
-    require.cache[notifyPath].exports = notifyMock
-    return res
+    try {
+      const summary = await xbk.run()
+      const cacheName = 'tpush_' + mode + (limit || 0) + '_' + (pushSeq - 1) + '.json'
+      return { pushed: pushCalls.length, cached: readCacheFile(cacheName).length, summary }
+    } finally {
+      // run() 若抛错不得泄漏 mock（try/finally 恢复，与 sendNotify 同步契约用例同一纪律）
+      // 恢复默认
+      Config.push.mode = 'parallel'
+      Config.push.parallelLimit = 0
+      notifyMock.sendNotify = defaultNotifySend
+      require.cache[notifyPath].exports = notifyMock
+    }
   }
 
   await test('parallel 模式: 多条全部推送+缓存（并行模式）', async () => {
@@ -2938,6 +2941,40 @@ console.log('========================================\n');
     }
   })
 
+  await test('通道健康: enabled=false 时完整 run() 链路关闭侧早退（无状态文件、无锁、无健康告警）', async () => {
+    reset()
+    const originalCacheDir = Config.cache.dir
+    const originalEnabled = Config.channelHealth && Config.channelHealth.enabled
+    const originalThreshold = Config.channelHealth && Config.channelHealth.consecutiveFailures
+    const originalInterval = Config.channelHealth && Config.channelHealth.intervalMs
+    const isolatedDir = `${DEFAULT_CACHE_DIR}_channel_health_disabled_${Date.now()}`
+    const stateDir = path.join(__dirname, isolatedDir)
+    try {
+      Config.cache.dir = isolatedDir
+      fs.mkdirSync(stateDir, { recursive: true })
+      Config.channelHealth.enabled = false
+      Config.channelHealth.consecutiveFailures = 1
+      Config.channelHealth.intervalMs = 3600000
+      // 走真实 run()：推送必失败 → channelFailures 非空 → 健康观测点（xbk_app.js:1637）被触发，
+      // enabled=false 时必须整段早退——不落状态、不加锁、不发健康告警（Sourcery #197：接线级验证）
+      fakeData = [makeItem({ id: 9901 })]
+      setPushUrl('t_channel_health_disabled')
+      notifyMock.sendNotify = async () => { throw new Error('channel down') }
+      const summary = await xbk.run()
+      assert(summary && summary.failed >= 1, `本轮应有失败推送，实际 ${JSON.stringify(summary)}`)
+      assert(!fs.existsSync(path.join(stateDir, 'channel-health.state')), '关闭侧不得创建 channel-health 状态文件')
+      assert(!fs.existsSync(path.join(stateDir, 'channel-health.state.lock')), '关闭侧不得创建健康锁文件')
+      assert(!pushCalls.some(c => c.text.includes('通道异常') || c.text.includes('通道恢复')), '关闭侧不得发送健康告警')
+    } finally {
+      notifyMock.sendNotify = defaultNotifySend
+      Config.cache.dir = originalCacheDir
+      Config.channelHealth.enabled = originalEnabled
+      Config.channelHealth.consecutiveFailures = originalThreshold
+      Config.channelHealth.intervalMs = originalInterval
+      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('告警通道挂 → 不误报"已发送"（v3.145）', async () => {
     reset()
     setPushUrl('t59_alert_nofalse')
@@ -3906,13 +3943,17 @@ console.log('========================================\n');
     fakeData = [makeItem({ id: 1 })]
     // 同步返回 undefined 的第三方实现：Promise.race 会对 undefined 立即 resolve → 曾误判成功写缓存
     notifyMock.sendNotify = () => undefined
-    const summary = await xbk.run()
-    notifyMock.sendNotify = defaultNotifySend
-    assert(pushCalls.length === 0, `同步 sendNotify 不应产生推送记录，实际${pushCalls.length}`)
-    assert(summary?.pushed === 0 && summary?.failed === 1,
-        `应记录失败语义（不写缓存下次重试），实际 ${JSON.stringify(summary)}`)
-    const cached = readCacheFile('t_p2_sync_notify')
-    assert(cached.length === 0, '同步 sendNotify 失败不应写缓存')
+    try {
+      const summary = await xbk.run()
+      assert(pushCalls.length === 0, `同步 sendNotify 不应产生推送记录，实际${pushCalls.length}`)
+      assert(summary?.pushed === 0 && summary?.failed === 1,
+          `应记录失败语义（不写缓存下次重试），实际 ${JSON.stringify(summary)}`)
+      const cached = readCacheFile('t_p2_sync_notify')
+      assert(cached.length === 0, '同步 sendNotify 失败不应写缓存')
+    } finally {
+      // run() 若抛错不得泄漏 mock（参照本文件 runWithPushMode 先例的恢复纪律）
+      notifyMock.sendNotify = defaultNotifySend
+    }
   })
 
   await test('只看它：0/false 标题参与匹配（P2：App.run 收敛 whitelistFilter 消除漂移）', async () => {
