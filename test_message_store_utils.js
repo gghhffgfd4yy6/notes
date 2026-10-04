@@ -2240,28 +2240,25 @@ check('MS-07 _tailElements: 转义引号内的 } 与引号不得参与配对；�
   assert.strictEqual(got2[1].id, 'y"}', '第二个元素内容不得被转义引号截断')
 })
 
-check('MS-08 _memoSet: 全数字样键时退回 keys[0]；delete 抛错必须吞掉并按实际键数校准计数', () => {
+check('MS-08 _memoSet: 淘汰必须跳过数字样键取首个普通字符串键（必须用**多位数**键才测得出 P3 的 \\d 回归）', () => {
+  // 单位数键（如 '0'）测不出来：正则的 `^(?:0|[1-9]…)$` 里有字面 `0` 分支，写坏成 `\\d`
+  // （匹配字面反斜杠+d）时 '0' 仍被判为索引键，两种实现淘汰同一个键 ⇒ 断言恒绿。
+  // 只有多位数数字样键（'10'）在两种实现下分叉：正确=索引键跳过；写坏=被当普通键当成最旧淘汰。
   const s = createProbeStore()
   s._MEMO_MAX = 2
-  s._memoSet('0', [])
-  s._memoSet('1', [])
-  const warns = captureConsole('warn', () => { s._memoSet('2', []) })
-  assert.strictEqual(s._memoCount, 2, '打满后计数必须校准回上限')
-  assert.ok(!Object.prototype.hasOwnProperty.call(s._memoryCache, '0'),
-    '数字样键场景必须退回 keys[0] 淘汰（P3 修正后的 \\d 语义，写成 \\\\d 会一个都不淘汰）')
-  assert.ok(warns.some(l => l.includes('内存缓存达到上限(2)')), `必须带上限与被淘汰键：${JSON.stringify(warns)}`)
-  // 计数漂移防御：外部直接 delete 键后，写入仍必须按**实际**键数校准（否则上限判断长期偏大/偏小）
-  const s3 = createProbeStore()
-  s3._MEMO_MAX = 2
-  s3._memoSet('p1', [])
-  s3._memoSet('p2', [])
-  delete s3._memoryCache.p1
-  s3._memoSet('p3', [])
-  // 校准不变式：外部直删导致计数偏大后，下一次写入必须把 _memoCount 拉回**实际键数**
-  // （计数长期虚高会让缓存提前进入“打满淘汰”，白丢存量身份）
-  assert.strictEqual(s3._memoCount, Object.keys(s3._memoryCache).length,
-    `写入后计数必须等于实际键数（漂移未校准则计数 ${s3._memoCount} / 实际 ${Object.keys(s3._memoryCache).length}）`)
-  assert.ok(!Object.prototype.hasOwnProperty.call(s3._memoryCache, 'p1'), '被外部删除的键不得被写回复活')
+  s._memoSet('10', ['index-key'])
+  s._memoSet('zz-oldest', ['normal-key'])
+  assert.strictEqual(s._memoCount, 2, '夹具必须已打满')
+  assert.deepStrictEqual(Object.keys(s._memoryCache), ['10', 'zz-oldest'],
+    '前提：Object.keys 把整数样键排在前面，所以 keys[0] 并非最旧（本用例正是钉这一点）')
+  const warns = captureConsole('warn', () => { s._memoSet('newcomer', ['x']) })
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(s._memoryCache, '10'), true,
+    '多位数数字样键必须被跳过；被淘汰它即说明索引键判定被写坏成 \\\\d')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(s._memoryCache, 'zz-oldest'), false,
+    '必须淘汰首个普通字符串键（真正的最旧键）')
+  assert.strictEqual(s._memoCount, Object.keys(s._memoryCache).length, '淘汰后计数必须与实际键数守恒')
+  assert.ok(warns.some(l => l.includes('内存缓存达到上限(2)') && l.includes('zz-oldest')),
+    `告警必须带上限与被淘汰的键名：${JSON.stringify(warns)}`)
 })
 
 check('MS-09 readMessages: tooLarge 恢复的三条失败出口都必须保持写闸门且不动原件', () => {
