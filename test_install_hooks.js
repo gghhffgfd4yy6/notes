@@ -375,8 +375,8 @@ function mustGit (args, opts, what) {
 // gateKind='scan'：改用扫描式门禁（FIXTURE_SCAN_GATE_JS）+ 提交里只放一个含 1 次 XBK_MARKER 的
 // `xbk_alpha.js`——该提交自身必然 fail（断言要求 ≥2 次），只有「工作树里另有未跟踪的 xbk_*.js」
 // 才能把**工作树口径**补成 pass（用例 G 的靶向落差）。
-function makePushFixture ({ commitGate = 'pass', gateKind = 'flag' } = {}) {
-  const { dir, home } = makeCase()
+function makePushFixture ({ commitGate = 'pass', gateKind = 'flag' } = {}, prebuiltCase) {
+  const { dir, home } = prebuiltCase || makeCase()
   const remote = path.join(dir, 'remote.git')
   const work = path.join(dir, 'work')
   const hooks = path.join(dir, 'hooks')
@@ -590,8 +590,21 @@ function assertNoResidue (fx, label) {
 // E) 附：refs 解析细节——同一提交去重（只校验一次）、删除引用（local sha 全 0）跳过、
 //    非推送上下文（stdin 没有 ref 流）仍可用且显式声明其证明力
 {
-  const fx = makePushFixture({ commitGate: 'pass' })
-  const fx2 = makePushFixture({ commitGate: 'pass' })
+  // 夹具注册-清理口径（用例间状态猎杀 #198 后续）：夹具在 try 之前创建，第二个夹具
+  // makePushFixture 内部 mustGit 若抛错，try/finally 尚未开始 → 第一个夹具目录永久泄漏
+  // （含假 git 仓库与钩子副本，曾注入复现 leftovers=["xbk-hooks-*"]）。
+  // 改为逐个注册：每建成一个立即进入受保护清单，finally 逆序清理已建成者。
+  // Sourcery bug_risk 修正：注册动作提前到 makeCase 返回后立即执行（包装 makeCase），
+  // 覆盖「夹具目录已建、makePushFixture 中途抛错」的半成品泄漏——半成品目录同样进清单。
+  const fixtures = []
+  const makeRegistered = (opts) => {
+    const caseDir = makeCase()
+    fixtures.push(caseDir.dir)
+    return { ...caseDir, ...makePushFixture(opts, caseDir) }
+  }
+  process.once('exit', () => { for (const dir of fixtures) { try { fs.rmSync(dir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } } })
+  const fx = makeRegistered({ commitGate: 'pass' })
+  const fx2 = makeRegistered({ commitGate: 'pass' })
   try {
     const head = headOf(fx)
     const r = driveHook(fx,

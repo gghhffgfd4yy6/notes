@@ -643,6 +643,17 @@ function seedIdentityProbe (messages, name) {
   // 必须经 getFilePath 求路径：has(message, filename) 内部同样先 getFilePath(filename)，
   // 直接塞绝对路径会让两次路径不一致、内存权威数组命不中。
   const fp = identityStore.getFilePath(name)
+  // ⚠️ 状态泄漏防御（用例间状态猎杀 #198 后续）：identityStore 是模块级共享实例，
+  // _memoryCache/_verified/_memoCount 跨用例累积且 _verified 恒真永不重读磁盘——
+  // 前一用例 mutate 后的陈旧快照会被后续用例当作「已推送」判重（曾实锤复现：
+  // f02_form_2_22.json 派生名碰撞 + f02_stale.json 原地改写后 has 误真）。
+  // 同名 fp 的旧条目在重新 seed 前先清掉：陈旧快照/verified 标志/计数一起回退，
+  // 使每个 seed 用例看到的是「干净的同名缓存文件」而非前序用例的遗留态。
+  if (Object.prototype.hasOwnProperty.call(identityStore._memoryCache, fp)) {
+    delete identityStore._memoryCache[fp]
+    identityStore._memoCount -= 1
+    identityStore._verified.delete(fp)
+  }
   identityStore._memoryCache[fp] = messages
   identityStore._memoCount += 1
   identityStore._verified.add(fp) // 跳过「内存命中未验证」的真实磁盘检查
@@ -2063,3 +2074,13 @@ check('_releaseTombstoneLock: 自己的 token 才删锁、他人 token 不删、
 })
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
+// ===== 套件退场：identityStore 模块级状态清理（用例间状态猎杀 #198 后续）=====
+// seedIdentityProbe 的条目在本文件内已按同名 fp 自清理，但 mutate 类用例（F-02 组）的
+// _memoryCache/_verified/_memoCount 仍会在套件结束后残留——同进程聚合执行（变异测试/
+// 合并 runner）时污染后续套件。退场统一清空，保证套件边界零残留。
+for (const fp of Object.keys(identityStore._memoryCache)) {
+  delete identityStore._memoryCache[fp]
+  identityStore._verified.delete(fp)
+}
+identityStore._memoCount = 0
+identityStore._identityIndex = new WeakMap()

@@ -14,6 +14,10 @@ const {
 
 ;(async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-storage-'))
+  // 清理兜底（用例间状态猎杀 #198 后续）：任何断言失败走 catch → process.exit(1) 时，
+  // 末尾的 rmSync 会被跳过，私有临时目录（含 perm/、mr/ 等全部夹具）泄漏到 os.tmpdir()。
+  // exit 钩子在 process.exit 时同步执行，rmSync 幂等（与末尾显式清理重复也无害）。
+  process.once('exit', () => { try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
   const make = (rel) => path.join(tmp, rel)
 
   // ===== isRegularOrMissing =====
