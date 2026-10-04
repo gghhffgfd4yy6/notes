@@ -470,6 +470,189 @@ dns.lookup = (hostname, options, callback) => {
     assert.strictEqual(tlsAborted.count, 3, 'count 应回显请求的连接数')
   }
 
+  // ===== G11-AG：DNS 选项建模 / 缓存分流 / 取消与错误归类的未达分支（c8 实测 branch 68.03%）=====
+  // 本文件语句覆盖 97%、分支只有 68%——典型的「代码跑过、另一侧没走过」。下列逐条钉住
+  // dnsSelectionSignature / dnsResultOrder / dispatchLookupResult / prewarmDns 的**拒绝侧**与取消侧。
+  // 这些分支的语义是「宁可少一次缓存命中，也绝不把别人按别的选项筛选/排序过的地址交给这个调用方」：
+  // 一旦有人把 `return null` 改成返回某个默认签名，现有「命中缓存」的断言全部照绿，污染却静默发生。
+  // 约定：模块级 dnsCache 没有导出清空口 ⇒ 每条用**独立 hostname**；dns.lookup 替身一律装/拆成对。
+  {
+    const { dnsLookup, prewarmDns, DNS_LOOKUP_IP_VERSION } = require('./xbk_agents')
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    const ask = (hostname, options) => new Promise((resolve) => {
+      dnsLookup(hostname, options, (error, address, family) => resolve({ error, address, family }))
+    })
+    // 计数替身：模块恒以 {…opts, all:true} 调用底层，故一律回数组形状
+    const makeCounter = (answer) => {
+      const state = { calls: 0 }
+      state.fn = (hostname, options, callback) => {
+        state.calls += 1
+        const cb = typeof options === 'function' ? options : callback
+        const res = answer ? answer(hostname, state.calls) : { address: [{ address: hostname + '.fake', family: 4 }], family: 4 }
+        process.nextTick(() => cb(res.error || null, res.address, res.family))
+      }
+      return state
+    }
+    const withResolver = async (fn, body) => {
+      const prev = dns.lookup
+      dns.lookup = fn
+      try { return await body() } finally { dns.lookup = prev }
+    }
+
+    // AGENTS-20：未知选项键 ⇒ 签名 null ⇒ 既不读也不写缓存，且不得污染同主机的已建模条目
+    await withResolver(makeCounter().fn, async () => {})
+    {
+      const st = makeCounter()
+      await withResolver(st.fn, async () => {
+        await ask('ag-model-keys', { family: 4 })
+        assert.strictEqual(st.calls, 1, '首次解析必须落到解析器')
+        await ask('ag-model-keys', { family: 4 })
+        assert.strictEqual(st.calls, 1, '同选项第二次必须命中缓存（本用例的对照前提）')
+        await ask('ag-model-keys', { family: 4, service: 'https' })
+        assert.strictEqual(st.calls, 2, '带未知键必须绕过缓存（AGENTS-11：不复用别人筛过的地址）')
+        await ask('ag-model-keys', { family: 4 })
+        assert.strictEqual(st.calls, 2, '未建模调用不得写缓存、也不得让已建模条目失效')
+      })
+    }
+
+    // AGENTS-21：family / hints 非法取值 ⇒ 不建模；但**必须照常拿到解析结果**（拒绝建模 ≠ 拒绝服务）
+    for (const bad of [{ family: 5 }, { family: '4' }, { family: NaN }, { hints: '1' }, { hints: Infinity }, { hints: NaN }]) {
+      const st = makeCounter()
+      const tag = 'ag-bad-' + JSON.stringify(bad).replace(/[^\w]/g, '')
+      const a = await withResolver(st.fn, () => ask(tag, bad))
+      const b = await withResolver(st.fn, () => ask(tag, bad))
+      assert.ok(a.address && b.address, `非法选项 ${JSON.stringify(bad)} 必须仍拿到结果`)
+      assert.strictEqual(st.calls, 2, `非法选项 ${JSON.stringify(bad)} 两次调用都必须重新解析（未建模不缓存）`)
+    }
+
+    // AGENTS-22：order 合法值各自成条目；非法 order ⇒ 不建模（绝不复用别人排过序的地址）
+    {
+      const st = makeCounter()
+      await withResolver(st.fn, async () => {
+        await ask('ag-order', { order: 'ipv6first' })
+        await ask('ag-order', { order: 'ipv6first' })
+        assert.strictEqual(st.calls, 1, '同 order 第二次必须命中缓存')
+        await ask('ag-order', { order: 'verbatim' })
+        assert.strictEqual(st.calls, 2, '不同 order 必须各自一条目（缓存里存的是排过序的地址）')
+        await ask('ag-order', { order: 'ipv6first' })
+        assert.strictEqual(st.calls, 2, '回到首个 order 仍须命中它自己的条目（新条目不得覆盖旧的）')
+        await ask('ag-order', { order: 'not-an-order' })
+        assert.strictEqual(st.calls, 3, '非法 order 不得建模 ⇒ 绕过缓存')
+      })
+    }
+
+    // AGENTS-23：verbatim 必须是布尔——字符串 'yes' 不得被当成真值建模；true/false 是两个不同顺序
+    {
+      const st = makeCounter()
+      await withResolver(st.fn, async () => {
+        await ask('ag-verbatim', { verbatim: 'yes' })
+        assert.strictEqual(st.calls, 1, 'verbatim 非布尔 ⇒ 不建模（不得按“非空即真”归类）')
+        await ask('ag-verbatim', { verbatim: 'yes' })
+        assert.strictEqual(st.calls, 2, '未建模调用每次都要重新解析')
+        await ask('ag-verbatim', { verbatim: true })
+        await ask('ag-verbatim', { verbatim: false })
+        assert.strictEqual(st.calls, 4, 'verbatim:true(=verbatim) 与 false(=ipv4first) 必须是两个不同条目')
+        await ask('ag-verbatim', { verbatim: true })
+        assert.strictEqual(st.calls, 4, '同 verbatim 第二次必须命中缓存')
+      })
+    }
+
+    // AGENTS-24：all 适配的两种形状——空数组取首项必须 (undefined, 入参 family)，all:true 保持空数组
+    {
+      const empty = (hostname, options, callback) => {
+        const cb = typeof options === 'function' ? options : callback
+        process.nextTick(() => cb(null, [], 6))
+      }
+      await withResolver(empty, async () => {
+        const scalar = await ask('ag-empty-scalar', {})
+        assert.strictEqual(scalar.error, null, '空结果不是错误')
+        assert.strictEqual(scalar.address, undefined, '空数组取首项必须是 undefined（不得抛 TypeError、不得回退成空串）')
+        assert.strictEqual(scalar.family, 6, '首项不存在时必须回退解析器的 family 入参（不得吞掉族信息）')
+        const asAll = await ask('ag-empty-all', { all: true })
+        assert.ok(Array.isArray(asAll.address), 'all:true 必须保持数组形状')
+        assert.strictEqual(asAll.address.length, 0, 'all:true 不得补项/截断')
+      })
+    }
+
+    // AGENTS-25：非数组结果（旧替身/异常解析器）必须原样透传，不被“归一化”吞掉
+    await withResolver((hostname, options, callback) => {
+      const cb = typeof options === 'function' ? options : callback
+      process.nextTick(() => cb(null, '10.0.0.1', 4))
+    }, async () => {
+      const r = await ask('ag-legacy', { all: true })
+      assert.strictEqual(r.address, '10.0.0.1', '非数组结果必须原样透传（Array.isArray 闸门之外不改形状）')
+    })
+
+    // AGENTS-26：prewarmDns 的 error 字段归类优先级 code → message → String(error)
+    {
+      const cases = [
+        { err: Object.assign(new Error('msg-A'), { code: 'EAI_AGAIN' }), expected: 'EAI_AGAIN', why: '有 code 必须优先 code' },
+        { err: new Error('msg-B'), expected: 'msg-B', why: '无 code 时退回 message' },
+        { err: 'bare-string-error', expected: 'bare-string-error', why: '抛原始字符串时退回 String(error)' }
+      ]
+      for (const c of cases) {
+        const st = makeCounter(() => ({ error: c.err }))
+        const res = await withResolver(st.fn, () => prewarmDns('ag-err-' + c.expected))
+        assert.strictEqual(res.ok, false, `${c.why}：失败必须 ok:false`)
+        assert.strictEqual(res.error, c.expected, `${c.why}（实际 ${JSON.stringify(res.error)}）`)
+        assert.strictEqual(res.kind, 'dns', '预热结果必须带 kind（AGENTS-07 调用方分派依据）')
+      }
+    }
+
+    // AGENTS-27：两级 TTL——错误结果按短 TTL 缓存（1s），成功按 60s；错误不得占住长窗口
+    {
+      const st = makeCounter((host, n) => (n === 1
+        ? { error: new Error('first-fail') }
+        : { address: [{ address: host + '.fake', family: 4 }], family: 4 }))
+      await withResolver(st.fn, async () => {
+        const first = await ask('ag-ttl-host', {})
+        assert.ok(first.error, '第一次必须失败')
+        const second = await ask('ag-ttl-host', {})
+        assert.strictEqual(st.calls, 1, '错误结果仍进缓存（短 TTL 内不重复打解析器）')
+        assert.ok(second.error, '第二次应复用同一条错误')
+        await sleep(1100)
+        const third = await ask('ag-ttl-host', {})
+        assert.strictEqual(st.calls, 2, '错误条目必须按 DNS_ERROR_TTL_MS 过期（若误用成功 TTL 则这里仍是 1）')
+        assert.strictEqual(third.error, null, '过期后必须重新解析并成功')
+      })
+    }
+
+    // AGENTS-28：invalidateDns 的入参防御 + invalidateDnsForError 的两条拒绝分支
+    for (const bad of [undefined, null, 123, {}, ['a'], '']) {
+      assert.strictEqual(invalidateDns(bad), 0, `invalidateDns(${JSON.stringify(bad)}) 必须返回 0，不得抛 TypeError`)
+    }
+    assert.strictEqual(invalidateDnsForError({ code: 'ENOTFOUND' }, 'file:///no/host'), false,
+      'URL 能解析但 hostname 为空 ⇒ 不做失效（旧实现在空串上会误清同前缀条目）')
+    assert.strictEqual(invalidateDnsForError({ code: 'ENOTFOUND' }, 'not a url at all'), false,
+      'URL 构造抛错必须被 catch 成 false——本函数在 got 的错误回调里被调用，抛穿即未捕获异常')
+
+    // AGENTS-29：已 abort 的 signal ⇒ 立即取消且一次都不发起解析
+    {
+      const ctrl = new AbortController()
+      ctrl.abort()
+      const st = makeCounter()
+      const res = await withResolver(st.fn, () => prewarmDns('ag-abort-first', ctrl.signal))
+      assert.strictEqual(st.calls, 0, '已取消的预热必须零次发起解析（v3.233 不得延长进程退出）')
+      assert.strictEqual(res.ok, false, '取消结果必须 ok:false')
+      assert.strictEqual(res.error, 'aborted', '取消必须以 aborted 显形，不得静默成功')
+    }
+
+    // AGENTS-30：预热与生产请求同 key（AGENTS-01 的核心契约）
+    {
+      const st = makeCounter()
+      const prodOpts = DNS_LOOKUP_IP_VERSION
+        ? { family: DNS_LOOKUP_IP_VERSION === 'ipv4' ? 4 : 6, hints: 0 }
+        : { family: 0, hints: typeof dns.ADDRCONFIG === 'number' ? dns.ADDRCONFIG : 0 }
+      await withResolver(st.fn, async () => {
+        await prewarmDns('ag-shared-key')
+        const after = st.calls
+        assert.strictEqual(after, 1, '预热必须真的解析一次')
+        await ask('ag-shared-key', prodOpts)
+        assert.strictEqual(st.calls, 1, '生产选项必须命中预热条目；不同 key 则预热写进了一个永不被读的条目（预热完全无效）')
+      })
+    }
+  }
+
   console.log('test_agents OK')
 })().catch((e) => { console.error(e); process.exitCode = 1 }).finally(() => {
   // 全局猴补退场恢复：无论成功/失败路径（含 catch 后），dns.lookup 必须还原为真实解析器。
