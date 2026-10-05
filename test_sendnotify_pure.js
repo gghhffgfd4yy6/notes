@@ -1694,7 +1694,7 @@ function brokenBody () {
 }
 
 // 只装 promise 桩、把 got.stream 摘掉 ⇒ canStreamRequest()(:350) 为假 ⇒ 生产走 :407 的 promise 回退分支
-// （:405-421 那一支；`$.get` 的对称分支已随 v3.279 删除，故此处不再有成对的两个回退分支）。
+// （:407-423 那一支；`$.get` 的对称分支已随 v3.279 删除，故此处不再有成对的两个回退分支）。
 // restore 必须把 stream 原样放回，否则同进程后续套件全部改走 promise 路径（覆盖口径被悄悄换掉）。
 function mockTransportPromiseOnly (respond) {
   const captured = []
