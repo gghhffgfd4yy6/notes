@@ -1768,6 +1768,14 @@ for (const [label, cfg, key] of [['SN-04 Bark', { BARK_PUSH: 'dev1' }, 'bark'], 
       assert.ok(threw, `${key} 必须失败上抛（业务体不可读不得虚假成功）`)
       assert.ok(Array.isArray(threw.failures) && threw.failures.some(f => f && f.channel === key),
         `failures 必须点名 ${key}，实际: ${JSON.stringify(threw.failures)}`)
+      // 下钻逐 key 根因：catch 体被清空时 finally 只给 {ok:false}（无 error），聚合层 channel 仍在
+      // 但内层 failures 为空——只断聚合层会漏（清空 catch 体仍绿）。bark 侧另有 SNB-05，此处把
+      // pushme 侧补齐，两通道同口径。
+      const agg = threw.failures.find(f => f && f.channel === key)
+      assert.ok(agg && Array.isArray(agg.failures) && agg.failures.length === 1,
+        `${key} catch 必须留下 1 条逐 key 根因，实际 ${JSON.stringify(agg && agg.failures)}`)
+      assert.ok(agg.failures[0].channel === key && /不可读/.test(agg.failures[0].message),
+        `${key} 根因必须点名并保留原始异常文案，实际 ${JSON.stringify(agg.failures[0])}`)
       assert.ok(!threw.successfulChannels || !threw.successfulChannels.includes(key),
         `${key} 不得出现在成功通道里`)
     } finally { got1.restore(); restore() }
