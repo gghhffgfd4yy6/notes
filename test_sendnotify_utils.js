@@ -17,6 +17,50 @@ const {
 } = slim
 const cfg = slim.push_config
 
+// ===== 静默截断防线（PR #202 评审发现）=====
+// 本套件是一条 await 链：任何一次 await 不结算时，promise 永不 settle、事件循环排空，
+// node 会以**退出码 0** 结束——断言一条没跑、`test_sendnotify_utils OK` 也没打，却全绿。
+// 实测触发面：把 xbk_sendNotify_slim.js 的 `if (signal.aborted) onAbort()`（进入等待时已取消
+// 那一支）打掉，SNA-06…SNA-10 会被整段跳过而套件仍 exit 0；而 scripts/tap-shim.js 的判定正是
+// `code === 0` ⇒ 这类改坏在变异门禁里会静默存活。两道兜底：
+//   ① settleWithin：每次 await 带预算，超预算时点名是哪条用例卡住（应对「仍在转但永不结算」）；
+//   ② beforeExit 哨兵：没跑到结尾就退出 ⇒ 一律判红（应对「事件循环排空、进程自然退出」）。
+// 预算计时器必须用**加载期抓到的真 setTimeout**：SNA 簇会临时替换 global.setTimeout，
+// 若沿用被替换后的版本，>=20ms 的预算计时器会被用例自己的桩吞掉（返回永不触发的假句柄）。
+const REAL_SET_TIMEOUT = global.setTimeout
+const AWAIT_BUDGET_MS = Number(process.env.XBK_AWAIT_BUDGET_MS) || 5000
+let suiteFinished = false
+process.on('beforeExit', () => {
+  if (suiteFinished) return
+  console.error('❌ 套件未跑到结尾就退出：await 链被静默截断（后续用例没跑），按失败处理')
+  process.exitCode = 1
+})
+
+// 结算观测：在预算内 settle ⇒ {stalled:false, value|error}；超预算 ⇒ {stalled:true}。
+// 预算计时器**不 unref**：卡住的 await 若没有任何其它句柄，unref 会让进程直接排空退出、只剩
+// beforeExit 那句笼统提示；留着它才能等到预算到点、把**具体是哪条用例**报出来（诊断优先于快）。
+// 正常路径在 settle 时立刻 clearTimeout，不会把进程多吊一秒。
+function settleWithin (label, promise) {
+  return new Promise((resolve) => {
+    let settled = false
+    const budget = REAL_SET_TIMEOUT(() => {
+      if (settled) return
+      settled = true
+      resolve({ stalled: true, label })
+    }, AWAIT_BUDGET_MS)
+    Promise.resolve(promise).then(
+      (value) => { if (!settled) { settled = true; clearTimeout(budget); resolve({ stalled: false, value }) } },
+      (error) => { if (!settled) { settled = true; clearTimeout(budget); resolve({ stalled: false, error }) } }
+    )
+  })
+}
+
+// 统一的「必须结算」断言：文案里写清这条通道为什么可能卡死，免得后人只看到一句超时。
+function assertSettled (outcome, label, why) {
+  assert.ok(!outcome.stalled,
+    `${label} 在 ${AWAIT_BUDGET_MS}ms 内未结算 ⇒ await 链被静默截断。${why || ''}`)
+}
+
 ;(async () => {
   // ===== mdToPlain：Markdown → 纯文本（推送正文可读性） =====
   assert.strictEqual(mdToPlain('**粗体**'), '粗体', '粗体应剥离')
@@ -778,10 +822,19 @@ const cfg = slim.push_config
       }
     }
     const runExpectThrow = async (text, params) => {
-      let err = null
-      try { await slim.sendNotify(text, '正文', params) } catch (e) { err = e }
+      // 走 settleWithin：这类 await 的收场依赖生产里的取消分支，分支被改坏时它不是「慢」而是
+      // **永不结算** ⇒ 旧写法会让整条链停住、事件循环排空、进程以 0 退出（静默跳过后续用例）。
+      const outcome = await settleWithin(text, slim.sendNotify(text, '正文', params))
+      assertSettled(outcome, text, '取消收场只走 waitWithAbort 里「进入等待时 signal 已 aborted」那一支。')
+      const err = outcome.error
       assert.ok(err, `${text} 必须上抛`)
       return err
+    }
+    // 判「必须成功返回」的同一口径：先确保结算，再由各用例自己断言 error/value。
+    const runExpectResolve = async (text, params) => {
+      const outcome = await settleWithin(text, slim.sendNotify(text, '正文', params))
+      assertSettled(outcome, text, '本条不依赖取消支路，但仍守住「不结算就不许绿」的口径。')
+      return outcome
     }
 
     try {
@@ -843,7 +896,8 @@ const cfg = slim.push_config
       snaHandler = (url) => ({ body: url.includes('snaOk') ? { code: 200 } : { code: 500, message: 'bad' } })
       let res = null
       let threw = null
-      try { res = await slim.sendNotify('SNA-04', '正文') } catch (e) { threw = e }
+      const r04 = await runExpectResolve('SNA-04')
+      res = r04.value; threw = r04.error
       assert.ok(!threw, `一成一败必须算通道成功（v3.166），实际 ${threw && threw.message}`)
       assert.deepStrictEqual(res.successfulChannels, ['bark'], '成功通道应为 bark')
       assert.deepStrictEqual(res.failures, [], '部分成功不得记失败')
@@ -881,7 +935,11 @@ const cfg = slim.push_config
         cfg.WX_pusher_appToken = token
         cfg.WX_pusher_topicIds = 'T1'
         snaHandler = () => ({ body: { code: 1000 } })
-        for (let i = 0; i < 19; i++) await slim.sendNotify('预填-' + i, '正文')
+        for (let i = 0; i < 19; i++) {
+          const filled = await settleWithin(`预填-${i}`, slim.sendNotify('预填-' + i, '正文'))
+          assertSettled(filled, `预填-${i}（token ${token}）`, '预填走的是窗口名额分配，若窗口算术被改坏它可能永不结算。')
+          assert.ok(!filled.error, `预填-${i} 不得失败，实际 ${filled.error && filled.error.message}`)
+        }
         assert.strictEqual(snaCalls.length, 19, `窗口内 19 次必须全部发出，实际 ${snaCalls.length}`)
       }
       // 确定性等待桩：**只按「第几次看到 >=20ms 的等待」决策**，绝不依赖 setImmediate 与 0ms timer
@@ -968,7 +1026,8 @@ const cfg = slim.push_config
           snaHandler = () => ({ body: { code: 1000 } })
           const waits = hookWaits(() => { sig.fire(); return 'abort' }) // 万一没淘汰：立刻取消 ⇒ 干净判红而不是卡死
           threw = null; res = null
-          try { res = await slim.sendNotify('SNA-09c 恰好过期', '正文', { signal: sig }) } catch (e) { threw = e }
+          const r09c = await runExpectResolve('SNA-09c 恰好过期', { signal: sig })
+          res = r09c.value; threw = r09c.error
           assert.ok(!threw, `边界命中必须直接排到名额，实际 ${threw && threw.message}`)
           assert.deepStrictEqual(waits, [], '命中等号边界不得进入等待（淘汰被删就会在此变红，且不靠挂死判红）')
           assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '过期清理后第 20 次必须成功')
@@ -1007,7 +1066,8 @@ const cfg = slim.push_config
       let seen = 0
       snaHandler = () => ({ body: ++seen === 1 ? { code: '1001' } : { code: 1000 } })
       threw = null; res = null
-      try { res = await slim.sendNotify('SNA-10 字符串限频码', '正文') } catch (e) { threw = e }
+      const r10 = await runExpectResolve('SNA-10 字符串限频码')
+      res = r10.value; threw = r10.error
       assert.ok(!threw, `字符串 '1001' 也必须判限频并切备用应用，实际 ${threw && threw.message}`)
       assert.strictEqual(snaCalls.length, 2, '首个应用被判限频 ⇒ 必须换第二个')
       assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '备用应用应成功')
@@ -1022,5 +1082,6 @@ const cfg = slim.push_config
     }
   }
 
+  suiteFinished = true // 只有真的跑到结尾，beforeExit 哨兵才闭嘴（否则一律判红）
   console.log('test_sendnotify_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })
