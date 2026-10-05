@@ -1,6 +1,6 @@
 'use strict'
 
-// F5/S3 回归：推送层（xbk_sendNotify_slim 的 $.post/$.get）响应体上限。
+// F5/S3 回归：推送层（xbk_sendNotify_slim 的 $.post）响应体上限。
 // got@11 没有 maxResponseSize（实测 11.8.6）——此前 promise API 把整个响应体读进内存再 JSON.parse，
 // xbk_http 的 20MB 流式上限只覆盖 fetchJson，推送出口完全没有上限。
 // 本套件用 EventEmitter 假流验证流式限长路径（与 test_http.js 测 fetchJson 同一手法），并用回环服务器

@@ -234,14 +234,14 @@ jobs:
             src: "xbk_utils.js"
             mutate: "xbk_utils.js"
             config: "stryker.tap.config.js"
-          # sendnotify（1634 行）拆 2 段
+          # sendnotify（1612 行）拆 2 段（v3.279 删掉 $.get 死代码后重算）
           - name: sendnotify-part1
             src: "xbk_sendNotify_slim.js"
             mutate: "xbk_sendNotify_slim.js:1-750"
             config: "stryker.tap.config.js"
           - name: sendnotify-part2
             src: "xbk_sendNotify_slim.js"
-            mutate: "xbk_sendNotify_slim.js:751-1634"
+            mutate: "xbk_sendNotify_slim.js:751-1612"
             config: "stryker.tap.config.js"
           # 小文件各一任务
           - name: failure-policy

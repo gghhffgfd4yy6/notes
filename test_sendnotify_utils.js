@@ -718,5 +718,23 @@ const cfg = slim.push_config
     }
   }
 
+  // ===== 导出面守卫：slim 对外只允许这 16 个名字 =====
+  // 起因：本仓曾存在一段「谁都调不到、也没人能从外面看见」的死代码（`$` 对象上的 `$.get`，v3.279 删除）。
+  // 它能长期存活正是因为**内部对象不导出 ⇒ 没有任何测试够得着它**。这条守卫把导出面钉成显式清单：
+  // 新增/删除/改名导出都会在此点名；反过来，把 `$`、`channelError` 这类内部实现挂上导出面也需要有意识地说一句。
+  {
+    // 升序逐字清单（Object.keys().sort() 同口径）——16 个名字，多一个少一个都红
+    const expectedExports = [
+      'configuredChannelCount', 'configuredChannelNames', 'getWxPusherProfileSummary', 'hasWxPusherConfigured',
+      'looksHtml', 'maskKey', 'maskUrl', 'mdImagesToPlain', 'mdLinksToPlain', 'mdToPlain',
+      'printWxPusherProfileSummary', 'push_config', 'safeErr', 'safeSlice', 'sendNotify', 'stripAngleTags'
+    ]
+    const actual = Object.keys(slim).sort()
+    assert.deepStrictEqual(actual, expectedExports,
+      'slim 的导出面变了：多出来/少了名字会直接影响「谁能从外部测到谁」。变更需同步 CHANGELOG 与本清单')
+    assert.strictEqual('$' in slim, false, '内部请求封装对象 $ 不得导出（导出即成公共面，需按契约对待）')
+    console.log('✅ 导出面守卫：slim 对外 16 个名字逐字一致，内部对象未泄漏')
+  }
+
   console.log('test_sendnotify_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })

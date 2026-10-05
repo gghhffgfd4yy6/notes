@@ -118,3 +118,11 @@
 - CI 效率：`test_run_mutation_cli.js` 的 evaluate 场景从「2 次全量单元测试」减为「1 次全量 + 秒级 applyMutants 轻量验证」——原先场景 2 为断言「应用变异后测试仍运行」再次 copyProject + 全量跑一遍（CI ≈ 60s，纯重复），现改为直接验证变异真实写改沙箱源文件、变异体 ID 一致、变异后模块可加载；「沙箱内全量应整体通过」的核心契约由场景 1 保留。CI 上该套件 125s → ~75s。
 - 防御性：evaluate 场景的全量沙箱看门狗上限 120s → 180s（慢验证机上全量实测 115-120s 紧贴旧上限，环境波动即假红；该上限只是挂死收敛兜底，不改变断言语义）。
 - 审查收尾（PR #181 复审）：CI 并发下 `::group::`/`::endgroup::` 改为「stdout+stderr 收集完成后一次性整组输出」——组开/关不再跨套件交错（Sourcery broader_impact：并发完成顺序不定时，先完成的 `::endgroup::` 会误关后启动的组，日志归因错乱）；`path.join(__dirname, s.file)` 补 `nosemgrep` 行内抑制（Codacy Security 污点误报：`s.file` 来自静态 SUITES 注册表，非用户输入）。
+
+## v3.279
+
+- 删除死代码 `xbk_sendNotify_slim.js` 的 `$.get`（24 行）：全仓**没有任何调用点**——9 个推送通道全部只走 `$.post`，一言走 `one()` 里的 `got.get` 直连（不经 `$`），而 `$` 不在 `module.exports` 上（外部也调不到）。c8 全语料口径实测：该函数 24 条语句里 22 条从未执行、被调用 0 次，是本文件唯一真正的「零执行」代码块。
+- 同步把三处描述里过时的「`$.post`/`$.get`」改为「`$.post`」（`streamRequest` 上方注释、`test_suites.js` 套件描述、`test_sendnotify_bodylimit.js` 头注释）。`streamRequest` 的 method 白名单与 `'get'` 分支**保留**：它是通用助手，无调用方不等于该砍能力；已在注释里写明「当前唯一调用点传 `'post'`，`get` 一侧没有调用方，别当成已覆盖的路径」。
+- 变异行段同步重算：`xbk_sendNotify_slim.js` 由 1634 行缩到 1612 行（删 24 行死代码、白名单注释补 2 行说明）⇒ `sendnotify-part2` 的 `mutate` 由 `751-1634` 改为 `751-1612`（`1-750` 不变），`node scripts/check-mutation-ranges.js` 校验全覆盖与连续性。
+- 回归守卫：`test_sendnotify_utils.js` 新增「slim 导出面 16 个名字逐字一致」清单断言（多一个/少一个/改名都红），并显式断言内部请求封装对象 `$` 不在导出面上——死代码能长出来正是因为外部看不见它。
+- 行为零变化：删掉的代码从未被执行，推送请求、失败归因、脱敏、响应体上限的语义逐字不变；`README.md` / `SYSTEM_CONTRACT.md` 未提及 `$.get`，故不动。
