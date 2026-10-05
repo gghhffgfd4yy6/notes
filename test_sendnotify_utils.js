@@ -723,13 +723,18 @@ const cfg = slim.push_config
   // 它能长期存活正是因为**内部对象不导出 ⇒ 没有任何测试够得着它**。这条守卫把导出面钉成显式清单：
   // 新增/删除/改名导出都会在此点名；反过来，把 `$`、`channelError` 这类内部实现挂上导出面也需要有意识地说一句。
   {
-    // 升序逐字清单（Object.keys().sort() 同口径）——16 个名字，多一个少一个都红
+    // 16 个名字，多一个/少一个/改名都红。
+    // 排序用**显式码元序比较器**：Sonar 的 S2871 会建议 localeCompare，但那正是本仓要避免的——
+    // 比较结果随宿主 ICU/locale 变（AGENTS.md「清单排序用显式码元序比较器而非随宿主 locale 变序的
+    // localeCompare，指纹跨机器稳定」同一条理由）。显式比较器同时满足规则与确定性。
+    // 两侧都排序 ⇒ 清单本身的书写顺序不再敏感（手写升序一旦漏排就是一个假红源）。
+    const byCodeUnit = (a, b) => (a < b ? -1 : (a > b ? 1 : 0))
     const expectedExports = [
       'configuredChannelCount', 'configuredChannelNames', 'getWxPusherProfileSummary', 'hasWxPusherConfigured',
       'looksHtml', 'maskKey', 'maskUrl', 'mdImagesToPlain', 'mdLinksToPlain', 'mdToPlain',
       'printWxPusherProfileSummary', 'push_config', 'safeErr', 'safeSlice', 'sendNotify', 'stripAngleTags'
-    ]
-    const actual = Object.keys(slim).sort()
+    ].sort(byCodeUnit)
+    const actual = Object.keys(slim).sort(byCodeUnit)
     assert.deepStrictEqual(actual, expectedExports,
       'slim 的导出面变了：多出来/少了名字会直接影响「谁能从外部测到谁」。变更需同步 CHANGELOG 与本清单')
     assert.strictEqual('$' in slim, false, '内部请求封装对象 $ 不得导出（导出即成公共面，需按契约对待）')
