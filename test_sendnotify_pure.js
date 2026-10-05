@@ -6,7 +6,7 @@
 // 覆盖：maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags
 const assert = require('node:assert')
 const fs = require('node:fs')
-const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, hasWxPusherConfigured, getWxPusherProfileSummary, sendNotify } = require('./xbk_sendNotify_slim')
+const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, configuredChannelNames, hasWxPusherConfigured, getWxPusherProfileSummary, printWxPusherProfileSummary, sendNotify } = require('./xbk_sendNotify_slim')
 // 判定器同源（S1/F1/P1）与截断单一实现（S6/F7）回归的对拍对象
 const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
 const { createUtils } = require('./xbk_utils')
@@ -1612,4 +1612,489 @@ checkS('一言: 一言失败不阻塞推送（catch 跳过，主通道照发）'
     const res = await sendNotify('t', '正文')
     assert.deepStrictEqual(res.successfulChannels, ['息知'], '一言挂掉不得影响主推送')
   } finally { restore(); restoreGot() }
+})
+
+// ============================================================
+// v4 分支补强簇（g12）：通道响应判定 / 传输错误 / 结构异常 / 汇总归因
+// 依据 c8 全语料口径实测的「未达分支」清单（xbk_sendNotify_slim.js 68 条）逐条判定可达性后落地。
+// 不可达的（配置谓词与 sendNotify 的 configuredFlags 同源 ⇒「未配置就返回」的内部守卫永远走不到；
+// `$.get` 全仓无调用方）不写断言，单独在 PR 说明里交底——不为凑覆盖率伪造演员。
+//
+// 夹具扩展：可编程假收件台。三态由 respond 决定——回包体 / 传输错误 / 结构异常的 response 对象。
+// 桩必须打在 got.stream.post|get 上：本机 got.stream 存在 ⇒ canStreamRequest() 恒真 ⇒
+// `$.post` 生产真实走 streamRequest(:354)，got.post(:405) 只是无 stream 时的回退。
+// 两种桩都装：stream 走生产真实路径，promise 桩保证万一 got 形态变化用例仍能收敛而非触网。
+// ============================================================
+const EXTRA_CHANNEL_KEYS = ['QYWX_ORIGIN', 'PUSH_PLUS_USER', 'PUSHME_URL', 'TG_API_HOST', 'DEER_URL']
+
+function isolateChannel2 (want) {
+  const keys = ALL_CHANNEL_KEYS.concat(EXTRA_CHANNEL_KEYS)
+  const saved = keys.map(k => [k, push_config[k]])
+  for (const k of keys) delete push_config[k]
+  for (const [k, v] of Object.entries(want)) push_config[k] = v
+  return () => {
+    for (const [k, v] of saved) { if (v === undefined) delete push_config[k]; else push_config[k] = v }
+  }
+}
+
+function mockTransport (respond) {
+  const captured = []
+  const bodyOf = (spec) => typeof spec.body === 'string'
+    ? spec.body
+    : JSON.stringify(spec.body === undefined ? {} : spec.body)
+  const makeStream = (url, opts) => {
+    captured.push({ url: String(url), opts })
+    const spec = respond(String(url), opts) || {}
+    const s = new ChannelEE()
+    s.timings = spec.timings || { phases: { total: 1 } }
+    s.destroy = () => {}
+    setTimeout(() => {
+      if (spec.error !== undefined) { s.emit('error', spec.error); return }
+      const res = spec.response || { statusCode: 200, headers: { 'content-type': 'application/json' } }
+      s.emit('response', res)
+      s.emit('data', Buffer.from(bodyOf(spec)))
+      s.emit('end')
+    }, 0)
+    return s
+  }
+  const fakePromise = (url, opts) => {
+    captured.push({ url: String(url), opts })
+    const spec = respond(String(url), opts) || {}
+    if (spec.error !== undefined) return Promise.reject(spec.error)
+    return Promise.resolve({ body: bodyOf(spec), statusCode: 200, headers: {}, timings: { phases: {} } })
+  }
+  const orig = { post: gotModule.post, get: gotModule.get, stream: gotModule.stream }
+  gotModule.stream = Object.assign((url, opts) => makeStream(url, opts), { post: makeStream, get: makeStream })
+  gotModule.post = fakePromise
+  gotModule.get = fakePromise
+  return { capture: captured, restore: () => { Object.assign(gotModule, orig) } }
+}
+
+// 捕获 console.log/warn（生产各通道只靠日志区分「一对一/一对多」「异常」与「成功」）
+function captureLogs () {
+  const origLog = console.log
+  const origWarn = console.warn
+  const logs = []
+  const warns = []
+  console.log = (...a) => logs.push(a.map(x => String(x)).join(' '))
+  console.warn = (...a) => warns.push(a.map(x => String(x)).join(' '))
+  return { logs, warns, restore: () => { console.log = origLog; console.warn = origWarn } }
+}
+
+// 关于「response 对象本身读 statusCode 就抛」这种形态：实测会让生产的 catch 处理器自己再抛
+// （channelError 读同一个 resp），异常冒出传输回调。真实 got 的 statusCode 是普通数值，构造不出该形态
+// ⇒ 判为「实际不可达的防御性脆弱点」，不写考题（写了只考我自己造的演员），已记入 PR 交底清单。
+
+// 业务体字段读取即抛（与 test_notify.js 的 malformedResponse 同口径：脏的是【响应内容】，不是 got 的 response）。
+// 必须走 got.post 的 promise 回退路径才保得住 getter：streamRequest 走 JSON.parse(Buffer)，
+// 解析出来必然是普通对象、造不出 getter；而 $.post 的 `try { body = JSON.parse(res.body) } catch {}`
+// 在 res.body 非字符串时保留原对象（生产注释 :343-344 明确说这是给测试替身留的回退路径）。
+function brokenBody () {
+  return { get code () { throw new Error('业务码字段不可读') }, get message () { throw new Error('文案字段不可读') } }
+}
+
+// 只装 promise 桩、把 got.stream 摘掉 ⇒ canStreamRequest()(:350) 为假 ⇒ 生产走 :405/:429 回退分支。
+// restore 必须把 stream 原样放回，否则同进程后续套件全部改走 promise 路径（覆盖口径被悄悄换掉）。
+function mockTransportPromiseOnly (respond) {
+  const captured = []
+  const orig = { post: gotModule.post, get: gotModule.get, stream: gotModule.stream }
+  const fake = (url, opts) => {
+    captured.push({ url: String(url), opts })
+    const spec = respond(String(url), opts) || {}
+    if (spec.error !== undefined) return Promise.reject(spec.error)
+    return Promise.resolve({ body: spec.body, statusCode: 200, headers: {}, timings: { phases: {} } })
+  }
+  gotModule.stream = undefined
+  gotModule.post = fake
+  gotModule.get = fake
+  return { capture: captured, restore: () => { Object.assign(gotModule, orig) } }
+}
+
+// --- SN-01：Server酱 title 32 字符上限 + 末尾高代理退一位（:540）---
+// 变异对照：删掉 `if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1)` ⇒ 截断留下孤立高代理
+// ⇒ encodeURIComponent 抛 URIError ⇒ 本用例（断言通道成功）当场红。
+checkS('SN-01 Server酱: 标题>32 且第 32 位落在代理对中间时必须退位（不得留孤立高代理）', async () => {
+  const restore = isolateChannel2({ PUSH_KEY: 'SCTfakekey' })
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ errno: 0 }) }))
+  try {
+    const res = await sendNotify('a'.repeat(31) + '🌟', '正文')
+    assert.deepStrictEqual(res.successfulChannels, ['server酱'], 'Server酱 应成功送达')
+    assert.strictEqual(got1.capture.length, 1, '必须发出 1 次请求')
+    const form = new URLSearchParams(String(got1.capture[0].opts.body))
+    const sent = form.get('text') || ''
+    assert.strictEqual(sent.length, 31, `标题必须截到完整代理对之前（31 字符），实际 ${sent.length}`)
+    const last = sent.charCodeAt(sent.length - 1)
+    assert.ok(!(last >= 0xD800 && last <= 0xDBFF), '末尾不得是孤立高代理')
+  } finally { got1.restore(); restore() }
+})
+
+// --- SN-02：Server酱·Turbo 版把 errno 嵌在 data 里（:566 嵌套回退）---
+checkS('SN-02 Server酱: errno 只在 data.data 内层时也必须按成功判（Turbo 响应形状）', async () => {
+  const restore = isolateChannel2({ PUSH_KEY: 'SCTfakekey' })
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ data: { errno: 0 }, errmsg: 'ok' }) }))
+  const log1 = captureLogs()
+  try {
+    const res = await sendNotify('嵌套成功', '正文')
+    assert.deepStrictEqual(res.successfulChannels, ['server酱'], '内层 errno=0 必须判成功（不得回退外层 undefined 而 reject）')
+    assert.strictEqual(res.failures.length, 0, '不得记失败')
+  } finally { log1.restore(); got1.restore(); restore() }
+})
+
+// --- SN-03：1024=一分钟内重复内容，消息已送达 ⇒ 视为成功不 reject（:569 数字/字符串两侧 + :572 分支）---
+// 判错的后果不对称：把 1024 当失败 ⇒ 不写缓存 ⇒ 每轮重推、有效设备被反复轰炸。
+checkS('SN-03 Server酱: errno 1024（数字与字符串两种序列化）视为已送达，不得 reject', async () => {
+  for (const raw of [1024, '1024']) {
+    const restore = isolateChannel2({ PUSH_KEY: 'SCTfakekey' })
+    const got1 = mockTransport(() => ({ body: JSON.stringify({ errno: raw, errmsg: '此内容一分钟内已发送过' }) }))
+    const log1 = captureLogs()
+    try {
+      const res = await sendNotify('重复内容', '正文')
+      assert.deepStrictEqual(res.successfulChannels, ['server酱'], `errno=${JSON.stringify(raw)} 必须视为送达（不 reject）`)
+      assert.ok(log1.logs.some(l => l.includes('异常')), '仍要打出异常日志（内容重复不是成功推送新内容）')
+    } finally { log1.restore(); got1.restore(); restore() }
+  }
+})
+
+// --- SN-04 / SN-06：业务体字段读取即抛必须按通道失败（bark catch :678 / pushme catch :756）---
+// 走 promise 回退路径才保得住 getter（见上方 brokenBody 注释），顺带覆盖 :405-421 的回退分支。
+// 判错的后果是虚假成功：主流程写缓存 ⇒ 消息永久丢失（v3.180 那起 P1 的同族）。
+for (const [label, cfg, key] of [['SN-04 Bark', { BARK_PUSH: 'dev1' }, 'bark'], ['SN-06 PushMe', { PUSHME_KEY: 'pmkey1' }, 'pushme']]) {
+  checkS(`${label}: 响应业务体字段抛异常时不得被记成成功（catch 必须按通道失败）`, async () => {
+    const restore = isolateChannel2(cfg)
+    const got1 = mockTransportPromiseOnly(() => ({ body: brokenBody() }))
+    try {
+      let threw = null
+      try { await sendNotify('结构异常探针', '正文') } catch (e) { threw = e }
+      assert.ok(threw, `${key} 必须失败上抛（业务体不可读不得虚假成功）`)
+      assert.ok(Array.isArray(threw.failures) && threw.failures.some(f => f && f.channel === key),
+        `failures 必须点名 ${key}，实际: ${JSON.stringify(threw.failures)}`)
+      assert.ok(!threw.successfulChannels || !threw.successfulChannels.includes(key),
+        `${key} 不得出现在成功通道里`)
+    } finally { got1.restore(); restore() }
+  })
+}
+
+// --- SN-05：PushMe 业务码取值优先级（:748 data.code 缺省时回退 error_code / errno）---
+// 层级契约：单 key 全失败时外层是 aggregateChannelError（code=CHANNEL_PUSHME_FAILED），
+// 逐 key 的 channelError（带 providerCode）在它的 failures 里——读错层就看不到业务码。
+function unwrapChannelFailures (threw, channel) {
+  const agg = threw.failures[0]
+  assert.strictEqual(agg.channel, channel, `${channel} 聚合失败记录必须带通道名`)
+  assert.strictEqual(agg.code, `CHANNEL_${channel.toUpperCase()}_FAILED`, `${channel} 全部 key 失败必须给聚合错误码`)
+  assert.ok(Array.isArray(agg.failures) && agg.failures.length >= 1, `${channel} 聚合错误必须逐 key 留痕`)
+  return agg.failures[0]
+}
+
+checkS('SN-05 PushMe: 响应无 code 时 providerCode 取 error_code（再退 errno），不得丢业务码', async () => {
+  const restore = isolateChannel2({ PUSHME_KEY: 'pmkey1' })
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ error_code: 4001, message: 'invalid key' }) }))
+  try {
+    let threw = null
+    try { await sendNotify('业务码探针', '正文') } catch (e) { threw = e }
+    assert.ok(threw, 'PushMe 非 success 响应必须失败')
+    const inner = unwrapChannelFailures(threw, 'pushme')
+    assert.strictEqual(inner.providerCode, 4001, `providerCode 必须回退到 error_code，实际 ${JSON.stringify(inner.providerCode)}`)
+  } finally { got1.restore(); restore() }
+  const restore2 = isolateChannel2({ PUSHME_KEY: 'pmkey2' })
+  const got2 = mockTransport(() => ({ body: JSON.stringify({ errno: 5, message: 'rate' }) }))
+  try {
+    let threw = null
+    try { await sendNotify('业务码探针2', '正文') } catch (e) { threw = e }
+    const inner = unwrapChannelFailures(threw, 'pushme')
+    assert.strictEqual(inner.providerCode, 5, 'error_code 也缺时必须退到 errno')
+  } finally { got2.restore(); restore2() }
+})
+
+// --- SN-07 / SN-08：企业微信端点可覆盖 + desp 为空时正文只取标题（:782 / :789）---
+checkS('SN-07 企业微信: QYWX_ORIGIN 自定义端点必须去尾斜杠拼接（不得出现 //cgi-bin）', async () => {
+  const restore = isolateChannel2({ QYWX_KEY: 'qykey', QYWX_ORIGIN: 'https://qy.example.com///' })
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ errcode: 0, errmsg: 'ok' }) }))
+  try {
+    const res = await sendNotify('企微端点', '正文')
+    assert.deepStrictEqual(res.successfulChannels, ['企业微信'], 'errcode=0 判成功')
+    const url = got1.capture[0].url
+    assert.ok(url.startsWith('https://qy.example.com/cgi-bin/webhook/send'), `端点必须去尾斜杠，实际 ${url}`)
+    assert.ok(url.includes('key=qykey'), 'key 必须进 query')
+  } finally { got1.restore(); restore() }
+})
+
+checkS('SN-08 企业微信: desp 为空时 content 只取标题（不拼出「标题\\n\\nundefined」残尾）', async () => {
+  const restore = isolateChannel2({ QYWX_KEY: 'qykey' })
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ errcode: 0 }) }))
+  try {
+    await sendNotify('只有标题', '')
+    const content = got1.capture[0].opts.json.markdown.content
+    assert.strictEqual(content, '只有标题', `正文必须只等于标题，实际 ${JSON.stringify(content)}`)
+    assert.ok(!content.includes('\n\n'), '不得出现拼接分隔符')
+  } finally { got1.restore(); restore() }
+})
+
+// --- SN-09：WX_pusher_channels 是不可序列化形状（循环引用）⇒ 缓存键退位、解析继续（:868）---
+checkS('SN-09 WxPusher: 多应用配置循环引用不得抛穿，必须回退旧字段并显形告警', async () => {
+  const circular = { self: null }
+  circular.self = circular // 对象形状（不是数组）⇒ 既撞 :868 的不可序列化 catch，也撞「不是数组」告警
+  const restore = isolateChannel2({ WX_pusher_appToken: 'APT_fake', WX_pusher_topicIds: 'T1', WX_pusher_channels: circular })
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 1000 }) }))
+  const log1 = captureLogs()
+  try {
+    const res = await sendNotify('循环配置探针', '正文')
+    assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '必须回退 WX_pusher_appToken 完成发送，不得因配置形状崩掉')
+    assert.ok(log1.warns.some(w => w.includes('不是数组')), `必须显形「多应用配置被忽略」，实际: ${JSON.stringify(log1.warns)}`)
+  } finally { log1.restore(); got1.restore(); restore() }
+})
+
+// --- SN-10：配置值「已配置」谓词的 String() 抛错兜底（:933 / :937）---
+// 这条直接钉住注释里那起 P1：自检把脏值算成「已配置」而主流程 NO_CHANNEL_CONFIG ⇒ 全程漏推且零告警。
+// 导出的 configuredChannelCount / configuredChannelNames 与 sendNotify 共用同一对谓词 ⇒ 可直调、进程内。
+checkS('SN-10 通道自检: 配置值 String() 抛异常必须判「未配置」且不抛穿（自检与主流程同口径）', () => {
+  const throwing = { toString () { throw new Error('脏配置不可字符串化') } }
+  const restore = isolateChannel2({ QYWX_KEY: throwing, PUSHME_KEY: throwing, WX_XIZHI_KEY: 'https://xizhi.fake/k' })
+  try {
+    assert.strictEqual(configuredChannelCount(), 1, '抛错的脏值不得计入已配置通道（只剩息知）')
+    assert.deepStrictEqual(configuredChannelNames(), ['息知'], '自检清单不得包含脏值通道')
+  } finally { restore() }
+})
+
+// --- SN-22：息知 providerCode 回退 errcode（:1223）---
+checkS('SN-22 息知: 响应无 code 时 providerCode 取 errcode（业务码不得丢）', async () => {
+  const restore = isolateChannel2({ WX_XIZHI_KEY: 'https://xizhi.fake/k' })
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ errcode: 500, msg: '内部错误' }) }))
+  try {
+    let threw = null
+    try { await sendNotify('息知业务码', '正文') } catch (e) { threw = e }
+    assert.ok(threw, 'errcode≠200 必须 reject')
+    assert.strictEqual(threw.failures[0].providerCode, 500, `providerCode 必须回退 errcode，实际 ${JSON.stringify(threw.failures[0].providerCode)}`)
+  } finally { got1.restore(); restore() }
+})
+
+// --- SN-23：Telegram 正文为空时只发标题（:1319 三元另一侧）---
+checkS('SN-23 Telegram: desp 为空时 text 不含分隔符残尾', async () => {
+  const restore = isolateChannel2({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ ok: true }) }))
+  try {
+    await sendNotify('TG只有标题', '')
+    assert.strictEqual(got1.capture[0].opts.json.text, 'TG只有标题', '正文空时只发标题')
+  } finally { got1.restore(); restore() }
+})
+
+// --- SN-24：Push+「一对一/一对多」文案随 PUSH_PLUS_USER 变化（:485/:495/:500 三处日志三元）---
+checkS('SN-24 Push+: PUSH_PLUS_USER 存在时三处日志都必须是「一对多」，缺省时都是「一对一」', async () => {
+  const cases = [
+    ['成功', () => ({ body: JSON.stringify({ code: 200 }) }), /完成/],
+    ['异常', () => ({ body: JSON.stringify({ code: 500, msg: '失败' }) }), /异常/],
+    ['失败', () => ({ error: new Error('连接被拒') }), /失败/]
+  ]
+  for (const [label, spec, re] of cases) {
+    for (const who of ['一对多', '一对一']) {
+      const restore = isolateChannel2(who === '一对多'
+        ? { PUSH_PLUS_TOKEN: 'PPT_fake', PUSH_PLUS_USER: 'U1' }
+        : { PUSH_PLUS_TOKEN: 'PPT_fake' })
+      const got1 = mockTransport(spec)
+      const log1 = captureLogs()
+      try {
+        let swallowed = null
+        try { await sendNotify('文案探针', '正文') } catch (e) { swallowed = e }
+        if (swallowed) log1.logs.push('SENDTHREW:' + (swallowed.message || String(swallowed)))
+        const hit = log1.logs.filter(l => re.test(l))
+        assert.ok(hit.length > 0, `Push+ ${label}路径（who=${who}）必须打日志，实际: ${JSON.stringify(log1.logs)}`)
+        assert.ok(hit.some(l => l.includes(who)), `Push+ ${label}日志应含「${who}」，实际: ${JSON.stringify(hit)}`)
+        assert.ok(!hit.some(l => l.includes(who === '一对多' ? '一对一' : '一对多')), '不得同时出现相反文案')
+      } finally { log1.restore(); got1.restore(); restore() }
+    }
+  }
+})
+
+// ===== SN-11…SN-21：WxPusher 限频判定 / 时间窗 / profile 统计 / 通道任务异常归因 =====
+// 这一簇是「改错了会怎样」最直观的地方：限流判定反转 ⇒ 要么疯狂重试刷屏，要么一次都不重试。
+// WxPusher 多应用用唯一 appToken，profile 统计 Map 模块级不可清空 ⇒ 按 token 取自己的条目做绝对断言。
+const WX_OK = () => ({ body: JSON.stringify({ code: 1000 }) })
+
+checkS('SN-11 WxPusher: 取消（code=ABORT_ERR / name=AbortError）不得被文本规则自匹配成限频而继续换下一个应用', async () => {
+  for (const [label, mkErr, checkCancel] of [
+    ['code=ABORT_ERR', () => Object.assign(new Error('WxPusher 限频等待已取消'), { code: 'ABORT_ERR' }), (f) => assert.strictEqual(f.code, 'ABORT_ERR', '取消错误码必须原样透出')],
+    ['name=AbortError', () => Object.assign(new Error('WxPusher 限频等待已取消'), { name: 'AbortError' }), (f) => assert.ok(/已取消/.test(f.message), '取消文案必须保留（不得换成 1001 限频摘要）')]
+  ]) {
+    const restore = isolateChannel2({
+      WX_pusher_channels: [{ appToken: 'APT_SNC11A_' + label, topicIds: ['T1'] }, { appToken: 'APT_SNC11B_' + label, topicIds: ['T2'] }]
+    })
+    const got1 = mockTransport(() => ({ error: mkErr() }))
+    try {
+      let threw = null
+      try { await sendNotify('取消探针', '正文') } catch (e) { threw = e }
+      assert.ok(threw, '取消必须上抛')
+      assert.strictEqual(got1.capture.length, 1, `${label} 必须短路只发 1 次（判成限频会逐个换应用重发），实际 ${got1.capture.length} 次`)
+      assert.strictEqual(threw.code, 'ALL_CHANNELS_FAILED', '唯一通道失败要走汇总上抛')
+      checkCancel(threw.failures[0])
+    } finally { got1.restore(); restore() }
+  }
+})
+
+checkS('SN-12 WxPusher: 错误无 message 时仍须按 err 本身的文本判定 1001（换备用应用，不得一次都不重试）', async () => {
+  const restore = isolateChannel2({
+    WX_pusher_channels: [{ appToken: 'APT_SNC12A', topicIds: ['T1'] }, { appToken: 'APT_SNC12B', topicIds: ['T2'] }]
+  })
+  const rateErr = Object.assign(new Error(''), { toString: () => 'upstream 1001 速度太快' })
+  let n = 0
+  const got1 = mockTransport(() => (++n === 1 ? { error: rateErr } : WX_OK()))
+  try {
+    const res = await sendNotify('无 message 限频', '正文')
+    assert.strictEqual(n, 2, '首个应用被判限频后必须换下一个应用（判不出来就直接一次不重试）')
+    assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '第二个应用应成功')
+  } finally { got1.restore(); restore() }
+})
+
+checkS('SN-13 WxPusher: XBK_PROFILE=2 时打逐次日志但不写聚合统计（统计只在 3 档记录）', async () => {
+  // 关键：统计 Map 是模块级、跨档位持续存在 ⇒ 必须切回 3 档再读，才能证明 2 档那次运行真的没写进去。
+  // （先前我直接在 2 档读 getWxPusherProfileSummary()——它自己第一行就是同一道 !== '3' 的门，
+  //  永远返回 [] ⇒ 这条断言在「门被删掉」时照样绿 ⇒ 是废题，已按可观测方式重写。）
+  const restore = isolateChannel2({ WX_pusher_appToken: 'APT_SNC13', WX_pusher_topicIds: 'T1' })
+  const got1 = mockTransport(WX_OK)
+  const log1 = captureLogs()
+  const origProfile = process.env.XBK_PROFILE
+  process.env.XBK_PROFILE = '2'
+  try {
+    await sendNotify('profile2', '正文')
+    assert.ok(log1.logs.some(l => l.includes('[profile wxpusher]') && l.includes('outcome=success')), '2 档必须打逐次日志')
+    process.env.XBK_PROFILE = '3'
+    assert.ok(!getWxPusherProfileSummary().some(s => s.app === maskKey('APT_SNC13')), '2 档的运行不得在 3 档统计里留下条目')
+  } finally {
+    if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
+    log1.restore(); got1.restore(); restore()
+  }
+})
+
+checkS('SN-14 WxPusher: XBK_PROFILE=3 的四种 outcome 分类计数必须各归各位', async () => {
+  const restore = isolateChannel2({ WX_pusher_appToken: 'APT_SNC14', WX_pusher_topicIds: 'T1' })
+  const log1 = captureLogs()
+  const origProfile = process.env.XBK_PROFILE
+  process.env.XBK_PROFILE = '3'
+  const scripted = [WX_OK, () => ({ body: JSON.stringify({ code: 1001 }) }), () => ({ error: new Error('连接中断') }), () => ({ body: JSON.stringify({ code: 500 }) })]
+  const got1 = mockTransport(() => scripted[Math.min(got1.capture.length - 1, scripted.length - 1)]())
+  try {
+    for (let i = 0; i < scripted.length; i++) {
+      try { await sendNotify('profile3-' + i, '正文') } catch (e) { /* 失败轮次预期上抛 */ }
+    }
+    const stat = getWxPusherProfileSummary().find(s => s.app === maskKey('APT_SNC14'))
+    assert.ok(stat, '3 档必须记录该应用的统计条目')
+    assert.deepStrictEqual(
+      [stat.attempts, stat.success, stat.failed, stat.rateLimited, stat.networkError, stat.apiError],
+      [4, 1, 3, 1, 1, 1],
+      `四类 outcome 计数必须分别为 attempts=4/success=1/failed=3/rateLimited=1/networkError=1/apiError=1，实际 ${JSON.stringify(stat)}`
+    )
+  } finally {
+    if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
+    log1.restore(); got1.restore(); restore()
+  }
+})
+
+checkS('SN-15 WxPusher: 非 3 档调用 printWxPusherProfileSummary 必须一字不出（脱敏统计不得混进常规日志）', async () => {
+  const origProfile = process.env.XBK_PROFILE
+  delete process.env.XBK_PROFILE
+  const log1 = captureLogs()
+  try {
+    printWxPusherProfileSummary()
+    assert.strictEqual(log1.logs.length, 0, `未开 3 档时不得输出任何 summary 行，实际: ${JSON.stringify(log1.logs)}`)
+  } finally {
+    if (origProfile !== undefined) process.env.XBK_PROFILE = origProfile
+    log1.restore()
+  }
+})
+
+checkS('SN-16 WxPusher: 10 秒窗口过期后必须腾出名额（不得因未清理的时间戳把自己锁死）', async () => {
+  const restore = isolateChannel2({ WX_pusher_appToken: 'APT_SNC16', WX_pusher_topicIds: 'T1' })
+  const log1 = captureLogs()
+  const got1 = mockTransport(WX_OK)
+  const realNow = Date.now
+  let offset = 0
+  Date.now = () => realNow() + offset
+  try {
+    for (let i = 0; i < 19; i++) await sendNotify('填窗口-' + i, '正文')
+    assert.strictEqual(got1.capture.length, 19, '窗口内应发出 19 次')
+    offset = 15000 // 跨过 WXPUSHER_WINDOW_MS(10s)：旧时间戳必须被清理，否则本轮永远排不到名额
+    // 用有界 race：清理被删掉时这一轮不是「慢」而是永远排不到 ⇒ 让它 1.5s 就判红，而不是拖到套件看门狗。
+    const done = sendNotify('窗口过期后', '正文').then(() => 'done', (e) => 'failed: ' + (e && e.message))
+    const settled = await Promise.race([done, new Promise((resolve) => setTimeout(() => resolve('stuck'), 1500))])
+    assert.strictEqual(settled, 'done', `过期后第 20 次必须立刻排到名额，实际 ${settled}`)
+    assert.strictEqual(got1.capture.length, 20, '窗口过期清理后必须真的发出第 20 次请求')
+  } finally {
+    Date.now = realNow
+    log1.restore(); got1.restore(); restore()
+  }
+})
+
+checkS('SN-17 WxPusher: 重复应用配置在限频后必须停止空转并保留最后一次真实错误', async () => {
+  const dup = { appToken: 'APT_SNC17', topicIds: ['T1'] }
+  const restore = isolateChannel2({ WX_pusher_channels: [dup, { ...dup }] })
+  const log1 = captureLogs()
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 1001, msg: '速度太快' }) }))
+  try {
+    let threw = null
+    try { await sendNotify('重复应用限频', '正文') } catch (e) { threw = e }
+    assert.ok(threw, '全部应用都试过仍限频必须上抛')
+    assert.strictEqual(got1.capture.length, 1, '同一 appToken+topicIds 的重复项不得被当成「另一个备用应用」反复发（重复轰炸）')
+    const inner = threw.failures[0]
+    assert.strictEqual(inner.channel, 'wxpusher', '失败记录必须点名 wxpusher')
+    assert.strictEqual(String(inner.providerCode), '1001', `必须保留最后一次限频业务码，实际 ${JSON.stringify(inner.providerCode)}`)
+    assert.ok(inner.message.includes('速度太快'), `不得退化成无信息量的兜底文案，实际 ${inner.message}`)
+  } finally { log1.restore(); got1.restore(); restore() }
+})
+
+// SN-18：通道内部抛异常时的「部分成功 + 在飞清单摘除」契约。
+// 实测更正（写这条之前我以为能测 :1591 的同步抛 catch）：所有通道函数都以 `return new Promise(executor)` 开头，
+// 而 executor 里的抛错被 Promise 构造器**转成 rejection**，`task()` 根本不会同步抛出
+// ⇒ :1591 的 `try { running = task() } catch` 在当前调用图里不可达（已列入交底清单，不为它编断言）。
+// 这条改测真语义：某通道自身异常只让该通道失败，其他通道照常成功，且失败通道必须从在飞清单摘掉
+// （留着会让 Pusher 的 10s 超时归因把已结算通道也算成 PUSH_TIMEOUT）。
+checkS('SN-18 sendNotify: 通道自身抛异常只算该通道失败，不得影响其他通道，且必须从在飞清单摘掉', async () => {
+  let reads = 0
+  const restore = isolateChannel2({ PUSH_PLUS_TOKEN: 'PPT_once', WX_XIZHI_KEY: 'https://xizhi.fake/k' })
+  Object.defineProperty(push_config, 'PUSH_PLUS_TOKEN', {
+    configurable: true,
+    get () { if (reads++ > 0) throw new Error('脏配置读取失败'); return 'PPT_once' }
+  })
+  const log1 = captureLogs()
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+  const tracker = {}
+  try {
+    let threw = null
+    let res = null
+    try { res = await sendNotify('通道内部异常探针', '正文', { inFlightTracker: tracker }) } catch (e) { threw = e }
+    assert.ok(!threw, `一通道异常 + 一通道成功 = 部分成功，不得整体抛错，实际 ${threw && threw.message}`)
+    assert.deepStrictEqual(res.successfulChannels, ['息知'], '健康通道必须照常成功')
+    assert.strictEqual(res.failures[0].channel, 'pushplus', '异常通道必须记为失败并点名')
+    assert.ok(/脏配置读取失败/.test(res.failures[0].message), `失败原因必须保留根因，实际 ${res.failures[0].message}`)
+    assert.deepStrictEqual(tracker.pending, [], `已结算通道必须全部从在飞清单摘掉，实际 ${JSON.stringify(tracker.pending)}`)
+    assert.strictEqual(got1.capture.length, 1, '异常通道不得发出请求（只有息知发一次）')
+  } finally {
+    delete push_config.PUSH_PLUS_TOKEN
+    log1.restore(); got1.restore(); restore()
+  }
+})
+
+checkS('SN-20 失败归因: reason 的结构化字段读取抛异常时只保留安全消息，不得抛穿汇总', async () => {
+  const hostile = { message: '上游返回异常', code: 'ECONNRESET', get providerCode () { throw new Error('字段不可读') } }
+  const restore = isolateChannel2({ PUSH_KEY: 'SCTfakekey' })
+  const log1 = captureLogs()
+  const got1 = mockTransport(() => ({ error: hostile }))
+  try {
+    let threw = null
+    try { await sendNotify('异常字段探针', '正文') } catch (e) { threw = e }
+    assert.ok(threw, '通道失败必须上抛')
+    assert.strictEqual(threw.code, 'ALL_CHANNELS_FAILED', `必须走正常汇总而不是被字段异常炸穿，实际 code=${threw && threw.code} msg=${threw && threw.message}`)
+    assert.strictEqual(threw.failures[0].message, '上游返回异常', '失败记录必须保留安全消息')
+    assert.strictEqual(threw.failures[0].channel, 'server酱', '失败记录必须带通道名')
+  } finally { log1.restore(); got1.restore(); restore() }
+})
+
+checkS('SN-21 入口清洗: text/desp 为 undefined/null 或 String() 抛异常时都必须按空串继续，不得抛穿', async () => {
+  for (const [label, bad] of [['undefined', undefined], ['null', null], ['String() 抛', { toString () { throw new Error('不可字符串化') } }]]) {
+    const restore = isolateChannel2({ BARK_PUSH: 'dev_snc21' })
+    const log1 = captureLogs()
+    const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    try {
+      const res = await sendNotify(bad, bad)
+      assert.deepStrictEqual(res.successfulChannels, ['bark'], `${label} 必须清洗成空串后照常发送`)
+      assert.strictEqual(got1.capture[0].opts.json.title, '', `${label} 时 title 必须是空串，实际 ${JSON.stringify(got1.capture[0].opts.json.title)}`)
+    } finally { log1.restore(); got1.restore(); restore() }
+  }
 })
