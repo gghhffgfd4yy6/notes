@@ -742,7 +742,10 @@ const cfg = slim.push_config
     let snaHandler = () => ({})
     let snaCalls = []
     const snaMake = (url, opts) => {
-      const spec = snaHandler(String(url), opts) || {}
+      // 契约：snaHandler 一律返回 spec 对象（默认 `() => ({})`，各用例也返回对象字面量）。
+      // 这里原先写的是 `snaHandler(...) || {}` —— 那个 `|| {}` 是恒真的死防御，被 SonarCloud
+      // 判成可靠性 BUG（javascript:S2589，项目里唯一未解决的 bug，run 指向本行），已删除。
+      const spec = snaHandler(String(url), opts)
       snaCalls.push({ url: String(url), opts })
       const em = new SNAEE()
       em.timings = spec.timings || { phases: {} }
