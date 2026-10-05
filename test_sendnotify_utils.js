@@ -761,11 +761,11 @@ const cfg = slim.push_config
     // 记账型「假 AbortSignal」：真实 signal 只保证 aborted/addEventListener/removeEventListener 三件事，
     // 这里额外记录注册与摘除，用来观测 :1000-1007 的 cleanup 卫生（真 AbortSignal 读不到内部监听器）。
     const duckSignal = () => {
-      const rec = { added: [], onceFlags: [], removed: [], aborted: false }
+      const rec = { added: [], removed: [], aborted: false }
       return {
         rec,
         get aborted () { return rec.aborted },
-        addEventListener (name, fn, opts) { rec.added.push(name); rec.onceFlags.push(opts && opts.once === true) },
+        addEventListener (name, fn, opts) { rec.added.push([name, fn, opts]) },
         removeEventListener (name, fn) { rec.removed.push([name, fn]) },
         fire () { rec.aborted = true }
       }
@@ -877,22 +877,40 @@ const cfg = slim.push_config
         for (let i = 0; i < 19; i++) await slim.sendNotify('预填-' + i, '正文')
         assert.strictEqual(snaCalls.length, 19, `窗口内 19 次必须全部发出，实际 ${snaCalls.length}`)
       }
-      // (a) 时钟冻结 ⇒ 裸值 = 10000+10，只钉退避算术与取消语义。
-      //     ⚠️ 不宣称覆盖 :1019 的「进入等待时已 aborted」真支：生产在同一个同步段里读两次
-      //     `signal.aborted`（循环顶 :1027 与 :1018），中间没有任何 await，真实单线程运行时
-      //     不可能在这两步之间被取消 ⇒ 该支是不可达的防御代码，已登记，不靠注入合成时序去「覆盖」它。
-      {
-        const t0 = realNow()
+      // 确定性等待桩：**只按「第几次看到 >=20ms 的等待」决策**，绝不依赖 setImmediate 与 0ms timer
+      // 的相对顺序。反例（CI 实测 quality 22.22.2，run 37330406755）：先前写成「记账后放行
+      // realST(fn,0) + setImmediate 取消」，本机空闲时取消先发生 ⇒ waits 恰一个；CI 上那个 0ms
+      // timer 先跑 ⇒ 同一次等待被采集两遍（waits=[10010,10010]）⇒ 用例随机红。
+      // 现在 'abort' 分支返回**永不触发**的假句柄：生产只能靠 aborted 收场，采集次数与调度顺序无关；
+      // cleanup 里的 clearTimeout(假句柄) 在 Node 下无害。
+      const DUMMY_TIMER = { snaDummyHandle: true }
+      const hookWaits = (decide) => {
         const waits = []
-        const sig = duckSignal()
-        Date.now = () => t0
         global.setTimeout = (fn, ms, ...rest) => {
-          if (ms >= 20) { waits.push(ms); setImmediate(() => sig.fire()); return realST(fn, 0, ...rest) }
+          if (typeof ms === 'number' && ms >= 20) {
+            const verdict = decide(waits.length, ms)
+            waits.push(ms)
+            if (verdict === 'run') return realST(fn, ms, ...rest)
+            return DUMMY_TIMER
+          }
           return realST(fn, ms, ...rest)
         }
+        return waits
+      }
+      // (a) 时钟冻结 ⇒ 裸值 = 10000+10。只钉退避算术与取消语义。
+      //     ⚠️ 不宣称覆盖 :1019 的「进入等待时已 aborted」真支：生产在同一个同步段里读两次
+      //     `signal.aborted`（循环顶 :1027 与 :1018），中间没有 await ⇒ 真实运行时到不了那一支。
+      //     本条的收场确实从那一支走过，但判据只有「延迟值 + ABORT_ERR + 零请求」这三件与
+      //     取消路径无关的事实，因此不存在「靠合成时序刷覆盖」的问题。
+      {
+        const t0 = realNow()
+        const sig = duckSignal()
+        let waits
+        Date.now = () => t0
         try {
           await fillWindow('APT_sna06a')
           snaCalls = []
+          waits = hookWaits(() => { sig.fire(); return 'abort' })
           err = await runExpectThrow('SNA-06 退避中被取消', { signal: sig })
           assert.deepStrictEqual(waits, [10010], '退避延迟必须等于 nextRelease-now+10=10010（Math.max→Math.min、+10→-10 都在此变红）')
           assert.strictEqual(err.failures[0].code, 'ABORT_ERR', '取消必须按 ABORT_ERR 上抛')
@@ -901,58 +919,62 @@ const cfg = slim.push_config
         } finally { global.setTimeout = realST; Date.now = realNow }
         console.log('✅ SNA-06/07 退避算术 10010 + 取消按 ABORT_ERR 上抛且零请求')
       }
-      // (b) 派发之后才取消 ⇒ 监听器必须注册（once）且结算时摘掉同一个函数引用
+      // (b) 监听器卫生：让第一次等待**真的到期**（假时钟把延迟压到 20ms），走 timer 自然收场那条路，
+      //     才能观测 cleanup 摘监听器；第二次等待再取消收尾（不留真实 10s 定时器）。
       {
         const t0 = realNow()
-        const waits = []
         const sig = duckSignal()
-        Date.now = () => t0
-        global.setTimeout = (fn, ms, ...rest) => {
-          if (ms >= 20) { waits.push(ms); setImmediate(() => sig.fire()); return realST(fn, 0, ...rest) }
-          return realST(fn, ms, ...rest)
-        }
+        let waits
         try {
+          Date.now = () => t0
           await fillWindow('APT_sna08b')
           snaCalls = []
-          err = await runExpectThrow('SNA-08 退避后取消', { signal: sig })
-          assert.deepStrictEqual(waits, [10010], '延迟入参仍必须是 10010')
-          assert.deepStrictEqual(sig.rec.added, ['abort'], '未取消时必须注册 abort 监听器')
-          assert.deepStrictEqual(sig.rec.onceFlags, [true], '必须以 { once: true } 注册（删掉该选项在此变红）')
-          assert.strictEqual(sig.rec.removed.length, 1, '结算后必须摘掉监听器（否则长跑进程逐个退避泄漏一个闭包）')
+          // 预填**之后**才把时钟推进 9995ms：裸值 = (t0+10000) - (t0+9995) + 10 = 15 ⇒ 被夹到 20ms
+          Date.now = () => t0 + 9995
+          waits = hookWaits((n) => {
+            if (n === 0) return 'run'
+            sig.fire()
+            return 'abort'
+          })
+          err = await runExpectThrow('SNA-08 退避到点后取消', { signal: sig })
+          assert.strictEqual(waits[0], 20, `第一次等待必须被夹到 20ms 下限（裸值 15；改成 Math.min 就变 15），实际 ${waits[0]}`)
+          assert.ok(waits.length >= 2, '20ms 到期后窗口仍满 ⇒ 必须再排一次（一次都没续排说明 resolve 路径坏了）')
+          assert.strictEqual(sig.rec.added[0][0], 'abort', '未取消时必须注册 abort 监听器')
+          assert.strictEqual(sig.rec.added[0][2].once, true, '必须以 { once: true } 注册（删掉该选项在此变红）')
+          assert.ok(sig.rec.removed.length >= 1, '结算后必须摘掉监听器（否则长跑进程每轮退避泄漏一个闭包）')
           assert.strictEqual(sig.rec.removed[0][0], 'abort', '摘的必须是 abort 事件')
-          assert.strictEqual(typeof sig.rec.removed[0][1], 'function', '摘的必须是同一个函数引用')
+          assert.strictEqual(sig.rec.removed[0][1], sig.rec.added[0][1], '摘的必须是同一个函数引用（换成新建函数在此变红）')
           assert.strictEqual(err.failures[0].code, 'ABORT_ERR', '取消最终仍按 ABORT_ERR 上抛')
         } finally { global.setTimeout = realST; Date.now = realNow }
-        console.log('✅ SNA-08 abort 监听器卫生：once 注册、结算摘除、引用一致')
+        console.log('✅ SNA-08 abort 监听器卫生：once 注册、到期结算摘除、引用一致')
       }
       // (c)(d) 时间窗边界**必须成对**：恰好 10000ms ⇒ 零等待直接续发；差 1ms ⇒ 必须等待。
       //        `<=`→`<` 只有 (c) 能杀，`<=`→`>=` 只有 (d) 能杀，单独落一条都会留死角。
       {
         const t0 = realNow()
+        const sig = duckSignal()
         Date.now = () => t0
         try {
           await fillWindow('APT_sna09c')
           snaCalls = []
           Date.now = () => t0 + 10000 // 命中 `timestamps[0] <= now - WINDOW` 的等号边界
           snaHandler = () => ({ body: { code: 1000 } })
+          const waits = hookWaits(() => { sig.fire(); return 'abort' }) // 万一没淘汰：立刻取消 ⇒ 干净判红而不是卡死
           threw = null; res = null
-          try { res = await slim.sendNotify('SNA-09c 恰好过期', '正文') } catch (e) { threw = e }
+          try { res = await slim.sendNotify('SNA-09c 恰好过期', '正文', { signal: sig }) } catch (e) { threw = e }
           assert.ok(!threw, `边界命中必须直接排到名额，实际 ${threw && threw.message}`)
+          assert.deepStrictEqual(waits, [], '命中等号边界不得进入等待（淘汰被删就会在此变红，且不靠挂死判红）')
           assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '过期清理后第 20 次必须成功')
           assert.strictEqual(snaCalls.length, 1, '必须真的发出第 20 次请求')
-        } finally { Date.now = realNow }
+        } finally { global.setTimeout = realST; Date.now = realNow }
         const t1 = realNow()
         Date.now = () => t1
         try {
           await fillWindow('APT_sna09d')
           snaCalls = []
           Date.now = () => t1 + 9999 // 差 1ms 未过期 ⇒ 必须等待
-          const waits = []
           const sig = duckSignal()
-          global.setTimeout = (fn, ms, ...rest) => {
-            if (ms >= 20) { waits.push(ms); setImmediate(() => sig.fire()); return realST(fn, 0, ...rest) }
-            return realST(fn, ms, ...rest)
-          }
+          const waits = hookWaits(() => { sig.fire(); return 'abort' })
           try {
             err = await runExpectThrow('SNA-09d 差 1ms 未过期', { signal: sig })
             assert.deepStrictEqual(waits, [20], '未过期必须等待且夹到 20ms 下限（裸值 11；改成 Math.min 就变 11）')
@@ -960,7 +982,7 @@ const cfg = slim.push_config
             assert.strictEqual(err.failures[0].code, 'ABORT_ERR', '收尾用取消，不留真实 10s 定时器')
           } finally { global.setTimeout = realST }
         } finally { Date.now = realNow }
-        console.log('✅ SNA-09 时间窗边界成对：恰好过期即续发 / 差 1ms 必须等待并夹到 20')
+        console.log('✅ SNA-09 时间窗边界成对：恰好过期即零等待续发 / 差 1ms 必须等待并夹到 20')
       }
 
       // --- SNA-10：限频业务码的数字与字符串两种序列化 + 单应用限频即结束重试 ---
