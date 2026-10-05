@@ -20,7 +20,7 @@ const SUITES = [
   { name: 'Agent辅助函数', file: 'test_agents.js', desc: 'DNS 失效判定/profile 计时/请求选项/缓存清理' },
   { name: '网络重试', file: 'test_network.js', desc: 'fetchData 重试/4xx 例外/retry 非法值兜底' },
   { name: 'HTTP封装', file: 'test_http.js', desc: 'fetchJson 响应体限流/HTTP 错误/JSON 解析' },
-  { name: '推送工具函数', file: 'test_sendnotify_utils.js', desc: 'mdToPlain/脱敏/安全截断/通道统计' },
+  { name: '推送工具函数', file: 'test_sendnotify_utils.js', desc: 'mdToPlain/脱敏/安全截断/通道统计 + 失败聚合形状/channelError 状态码优先级/WxPusher 退避算术与时间窗边界/abort 监听器卫生' },
   { name: '推送层Pusher', file: 'test_pusher.js', desc: 'createPusher 超时分支+failures构造 + htmlTagNameEnd/isTagNameBoundary 纯函数边界' },
   { name: '青龙命令行', file: 'test_cli.js', desc: '--check/--dry-run/--status 参数和诊断逻辑', integration: true },
   { name: '青龙工具函数', file: 'test_qinglong_utils.js', desc: '退避/刷新计数/间隔/依赖恢复边界/缓存目录' },
