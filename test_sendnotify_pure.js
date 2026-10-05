@@ -2128,7 +2128,7 @@ checkS('SNB-02 Bark: 端点协议判定——自建 http 与大写 HTTPS 原样�
   const cases = [
     // 自建端点用主机名 + .invalid 保留域（RFC 6761：永不解析），既测「http 也原样保留」，
     // 又不写死内网 IP 字面量（Sonar 的安全那条线会点硬编码 IP）。
-    'http://bark-selfhost.invalid:8080/DevKey1234',
+    'http://bark-selfhost.invalid:8080/DevKey1234', // NOSONAR —— 本条用例测的就是「非加密 http 自建端点必须原样保留」，换成 https 等于删掉被测语义（S5332 的告警在这里是数据形态，不是缺陷）
     'HTTPS://api.day.app/DevKey1234',
     'xhttp://api.day.app/dk',
     'dev1'

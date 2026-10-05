@@ -739,14 +739,16 @@ const cfg = slim.push_config
     for (const k of Object.keys(cfg)) savedSna[k] = cfg[k]
     const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
     const origStream = { post: gotMod.stream && gotMod.stream.post, get: gotMod.stream && gotMod.stream.get }
-    let snaHandler = () => ({})
+    // 初始值与后续赋的 handler **同签名**（收 url/opts）：写成零参箭头会让 Sonar 判
+    // javascript:S930「函数声明不收参数却传了 2 个」——它抓的是这个变量的签名不一致，
+    // 与我上一轮删掉的 `|| {}` 无关（那次归因是错的，规则号我凭印象写成 S2589，也未查证）。
+    let snaHandler = (url, opts) => ({})
     let snaCalls = []
     const snaMake = (url, opts) => {
       // 契约：snaHandler 一律返回 spec 对象（body / error 两种形态）。
-      // timings 直接给固定值，**不做 `spec.timings || 默认` 的可配置开关**——本文件的用例都不读
-      // timings，那个左操作数恒假，是一道没人经过的门（SonarCloud 按 S2589 判可靠性 BUG：
-      // 先是 snaHandler(...) || {} 那处，删掉后同族的这一处又被点出来）。
-      // 将来若有用例真的要观测 timings，请连同断言一起把这条开关加回来，别留空转的配置项。
+      // timings 直接给固定值，不做 `spec.timings || 默认` 的可配置开关：本文件的用例都不读
+      // timings，那个左操作数恒假，是一道没人经过的门（删掉空转配置项即可，不必为它补断言）。
+      // 将来若有用例真的要观测 timings，请连同断言一起把这条开关加回来。
       const spec = snaHandler(String(url), opts)
       snaCalls.push({ url: String(url), opts })
       const em = new SNAEE()
