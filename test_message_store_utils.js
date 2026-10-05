@@ -381,6 +381,15 @@ function storeWithFs (fakeFs, cacheDir = 'xianbaoku_cache') {
 
 const DEFAULT_DIR = path.join(FAKE_ROOT, 'xianbaoku_cache')
 const SAFE_DIR = path.join(FAKE_ROOT, '.xbk_cache_safe')
+// 生产的第二级候选（fallback）目录名是按 XBK_PARALLEL_ID **现算**的（xbk_message_store.js:95），
+// 与 raw 同源但可能不同名；resolveCacheDirInRoot 的顺序是 raw → fallback → .xbk_cache_safe。
+// 因此「回退应急目录」这两条场景必须把**两级默认候选都置为不可用**，否则设了分片变量时生产会正确地
+// 落在分片目录，而用例按「未设变量」的语义断言 .xbk_cache_safe —— 同一份代码带/不带该变量会得出
+// 相反结论（本机实测：带变量 2 条红、不带就过）。环境变量未设时 FALLBACK_DIR === DEFAULT_DIR，
+// 多出来的那条 map 项与原有那条同键同值 ⇒ 常见路径的语义与判别力一字不变。
+const FALLBACK_DIR = path.join(FAKE_ROOT, process.env.XBK_PARALLEL_ID
+  ? `xianbaoku_cache_p${process.env.XBK_PARALLEL_ID}`
+  : 'xianbaoku_cache')
 const CACHE_FS_SCENARIOS = [
   {
     name: '默认目录是根内正常目录 → 原样使用',
@@ -393,13 +402,13 @@ const CACHE_FS_SCENARIOS = [
     expect: DEFAULT_DIR
   },
   {
-    name: '默认目录被普通文件占位 → 回退 .xbk_cache_safe（生产口径）',
-    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: 'file' },
+    name: '默认目录与分片回退名都被普通文件占位 → 回退 .xbk_cache_safe（生产口径）',
+    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: 'file', [FALLBACK_DIR]: 'file' },
     expect: SAFE_DIR
   },
   {
-    name: '默认目录是逃出根目录的符号链接 → 回退 .xbk_cache_safe（生产口径）',
-    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: { kind: 'dir', real: '/outside/xianbaoku_cache' } },
+    name: '默认目录是逃出根目录的符号链接且分片回退名也不可用 → 回退 .xbk_cache_safe（生产口径）',
+    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: { kind: 'dir', real: '/outside/xianbaoku_cache' }, [FALLBACK_DIR]: 'file' },
     expect: SAFE_DIR
   }
 ]
