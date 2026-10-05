@@ -17,6 +17,50 @@ const {
 } = slim
 const cfg = slim.push_config
 
+// ===== 静默截断防线（PR #202 评审发现）=====
+// 本套件是一条 await 链：任何一次 await 不结算时，promise 永不 settle、事件循环排空，
+// node 会以**退出码 0** 结束——断言一条没跑、`test_sendnotify_utils OK` 也没打，却全绿。
+// 实测触发面：把 xbk_sendNotify_slim.js 的 `if (signal.aborted) onAbort()`（进入等待时已取消
+// 那一支）打掉，SNA-06…SNA-10 会被整段跳过而套件仍 exit 0；而 scripts/tap-shim.js 的判定正是
+// `code === 0` ⇒ 这类改坏在变异门禁里会静默存活。两道兜底：
+//   ① settleWithin：每次 await 带预算，超预算时点名是哪条用例卡住（应对「仍在转但永不结算」）；
+//   ② beforeExit 哨兵：没跑到结尾就退出 ⇒ 一律判红（应对「事件循环排空、进程自然退出」）。
+// 预算计时器必须用**加载期抓到的真 setTimeout**：SNA 簇会临时替换 global.setTimeout，
+// 若沿用被替换后的版本，>=20ms 的预算计时器会被用例自己的桩吞掉（返回永不触发的假句柄）。
+const REAL_SET_TIMEOUT = global.setTimeout
+const AWAIT_BUDGET_MS = Number(process.env.XBK_AWAIT_BUDGET_MS) || 5000
+let suiteFinished = false
+process.on('beforeExit', () => {
+  if (suiteFinished) return
+  console.error('❌ 套件未跑到结尾就退出：await 链被静默截断（后续用例没跑），按失败处理')
+  process.exitCode = 1
+})
+
+// 结算观测：在预算内 settle ⇒ {stalled:false, value|error}；超预算 ⇒ {stalled:true}。
+// 预算计时器**不 unref**：卡住的 await 若没有任何其它句柄，unref 会让进程直接排空退出、只剩
+// beforeExit 那句笼统提示；留着它才能等到预算到点、把**具体是哪条用例**报出来（诊断优先于快）。
+// 正常路径在 settle 时立刻 clearTimeout，不会把进程多吊一秒。
+function settleWithin (label, promise) {
+  return new Promise((resolve) => {
+    let settled = false
+    const budget = REAL_SET_TIMEOUT(() => {
+      if (settled) return
+      settled = true
+      resolve({ stalled: true, label })
+    }, AWAIT_BUDGET_MS)
+    Promise.resolve(promise).then(
+      (value) => { if (!settled) { settled = true; clearTimeout(budget); resolve({ stalled: false, value }) } },
+      (error) => { if (!settled) { settled = true; clearTimeout(budget); resolve({ stalled: false, error }) } }
+    )
+  })
+}
+
+// 统一的「必须结算」断言：文案里写清这条通道为什么可能卡死，免得后人只看到一句超时。
+function assertSettled (outcome, label, why) {
+  assert.ok(!outcome.stalled,
+    `${label} 在 ${AWAIT_BUDGET_MS}ms 内未结算 ⇒ await 链被静默截断。${why || ''}`)
+}
+
 ;(async () => {
   // ===== mdToPlain：Markdown → 纯文本（推送正文可读性） =====
   assert.strictEqual(mdToPlain('**粗体**'), '粗体', '粗体应剥离')
@@ -718,5 +762,326 @@ const cfg = slim.push_config
     }
   }
 
+  // ============================================================
+  // ===== 补测 SNA 簇（g12 第二批，按本机探针口径修正过形态）=====
+  // 覆盖：失败聚合形状 / channelError 的 statusCode 来源优先级 / 一设备成功即通道成功 /
+  //       多通道失败摘要截断与逐字拼接 / WxPusher 退避算术与时间窗边界 / abort 监听器卫生 /
+  //       限频业务码的数字与字符串两种序列化。
+  //
+  // 形态纪律（探针实测，别演成生产不可能出现的形状）：
+  //   · 桩必须装在 got.stream.post|get —— 本机 got 带 stream ⇒ canStreamRequest(:350) 恒真 ⇒
+  //     `$.post` 真实走 streamRequest(:354)，**根本不碰 got.post**。只桩 got.post/get 会真触网。
+  //   · 非 2xx 在真实 got 下是 **error 事件**（err.response.statusCode），不是「response(4xx)+data」。
+  //     所以业务失败一律演成 HTTP 200 + 业务码（真实代理确实这么回），传输失败一律演成 error 事件。
+  //   · `$.logErr` 在加载期就绑定 console.log(:447)，事后桩拦不到 ⇒ 本簇只断 err.failures 形状，
+  //     不拿日志捕获当 catch 分支的判据。
+  // 计时纪律：一律「记账 setTimeout 的延迟入参」，零墙钟阈值（PERF_MS 沙箱下不会假红）。
+  {
+    const gotMod = require('got')
+    const { EventEmitter: SNAEE } = require('node:events')
+    const savedSna = {}
+    for (const k of Object.keys(cfg)) savedSna[k] = cfg[k]
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    const origStream = { post: gotMod.stream && gotMod.stream.post, get: gotMod.stream && gotMod.stream.get }
+    // 初始值与后续赋的 handler **同签名**（收 url/opts）：写成零参箭头会让 Sonar 判
+    // javascript:S930「函数声明不收参数却传了 2 个」——它抓的是这个变量的签名不一致，
+    // 与我上一轮删掉的 `|| {}` 无关（那次归因是错的，规则号我凭印象写成 S2589，也未查证）。
+    let snaHandler = (url, opts) => ({})
+    let snaCalls = []
+    const snaMake = (url, opts) => {
+      // 契约：snaHandler 一律返回 spec 对象（body / error 两种形态）。
+      // timings 直接给固定值，不做 `spec.timings || 默认` 的可配置开关：本文件的用例都不读
+      // timings，那个左操作数恒假，是一道没人经过的门（删掉空转配置项即可，不必为它补断言）。
+      // 将来若有用例真的要观测 timings，请连同断言一起把这条开关加回来。
+      const spec = snaHandler(String(url), opts)
+      snaCalls.push({ url: String(url), opts })
+      const em = new SNAEE()
+      em.timings = { phases: {} }
+      em.destroy = () => {} // 超限分支会调它；缺了会在 emit 里同步抛 TypeError 把进程干掉
+      setImmediate(() => {
+        if (spec.error !== undefined) { em.emit('error', spec.error); return }
+        em.emit('response', { statusCode: 200, headers: { 'content-type': 'application/json' }, ...spec.response })
+        const body = spec.body === undefined ? '{}' : (typeof spec.body === 'string' ? spec.body : JSON.stringify(spec.body))
+        em.emit('data', Buffer.from(body))
+        em.emit('end')
+      })
+      return em
+    }
+    gotMod.stream.post = snaMake
+    gotMod.stream.get = snaMake
+    // 记账型「假 AbortSignal」：真实 signal 只保证 aborted/addEventListener/removeEventListener 三件事，
+    // 这里额外记录注册与摘除，用来观测 :1000-1007 的 cleanup 卫生（真 AbortSignal 读不到内部监听器）。
+    const duckSignal = () => {
+      const rec = { added: [], removed: [], aborted: false }
+      return {
+        rec,
+        get aborted () { return rec.aborted },
+        addEventListener (name, fn, opts) { rec.added.push([name, fn, opts]) },
+        removeEventListener (name, fn) { rec.removed.push([name, fn]) },
+        fire () { rec.aborted = true }
+      }
+    }
+    const runExpectThrow = async (text, params) => {
+      // 走 settleWithin：这类 await 的收场依赖生产里的取消分支，分支被改坏时它不是「慢」而是
+      // **永不结算** ⇒ 旧写法会让整条链停住、事件循环排空、进程以 0 退出（静默跳过后续用例）。
+      const outcome = await settleWithin(text, slim.sendNotify(text, '正文', params))
+      assertSettled(outcome, text, '取消收场只走 waitWithAbort 里「进入等待时 signal 已 aborted」那一支。')
+      const err = outcome.error
+      assert.ok(err, `${text} 必须上抛`)
+      return err
+    }
+    // 判「必须成功返回」的同一口径：先确保结算，再由各用例自己断言 error/value。
+    const runExpectResolve = async (text, params) => {
+      const outcome = await settleWithin(text, slim.sendNotify(text, '正文', params))
+      assertSettled(outcome, text, '本条不依赖取消支路，但仍守住「不结算就不许绿」的口径。')
+      return outcome
+    }
+
+    try {
+      // --- SNA-01：Bark 全部设备失败的聚合形状（:693 → aggregateChannelError :179-183）---
+      clearCfg(); snaCalls = []
+      cfg.BARK_PUSH = 'https://api.day.app/snaDevA#https://api.day.app/snaDevB'
+      snaHandler = () => ({ body: { code: 500, message: 'device key invalid' } }) // HTTP 200 + 业务失败码（真实形态）
+      let err = await runExpectThrow('SNA-01')
+      assert.strictEqual(err.code, 'ALL_CHANNELS_FAILED', '唯一通道全设备失败必须整体上抛')
+      assert.strictEqual(err.failures.length, 1, '只有 bark 一个通道参与')
+      const agg = err.failures[0]
+      assert.strictEqual(agg.channel, 'bark', '聚合失败必须点名 bark')
+      assert.strictEqual(agg.message, 'Bark 全部设备发送失败', '聚合文案必须逐字')
+      assert.strictEqual(agg.code, 'CHANNEL_BARK_FAILED', '聚合错误码 = CHANNEL_ + 通道名大写 + _FAILED')
+      assert.strictEqual(agg.failures.length, 2, '两个设备必须各留一条失败详情（filter/map 形态改坏会少项）')
+      assert.strictEqual(agg.failures[0].statusCode, 200, '逐设备失败必须带 HTTP 状态码（来自 response 形参）')
+      assert.strictEqual(agg.failures[0].providerCode, 500, '逐设备失败必须带业务码')
+      assert.strictEqual('statusCode' in agg, false, '聚合层自己没有响应，不得凭空造 statusCode')
+      console.log('✅ SNA-01 Bark 全设备失败：CHANNEL_BARK_FAILED + 逐设备 statusCode/providerCode 留痕')
+
+      // --- SNA-02：PushMe 全 key 失败聚合（:771，part2 段独立一行）+ 纯文本响应不得造 providerCode ---
+      clearCfg(); snaCalls = []
+      cfg.PUSHME_KEY = 'snaK1#snaK2#snaK3'
+      snaHandler = () => ({ body: 'error' }) // PushMe 的成功判据是 body === 'success'
+      err = await runExpectThrow('SNA-02')
+      const pAgg = err.failures[0]
+      assert.strictEqual(pAgg.code, 'CHANNEL_PUSHME_FAILED', 'part2 段的 PushMe 聚合码必须同样由通道名大写拼成')
+      assert.strictEqual(pAgg.message, 'PushMe 全部 key 发送失败', 'PushMe 聚合文案必须逐字')
+      assert.strictEqual(pAgg.failures.length, 3, '三个 key 必须各留一条失败')
+      assert.strictEqual('providerCode' in pAgg.failures[0], false, '响应是纯文本时不得凭空造 providerCode 键')
+      console.log('✅ SNA-02 PushMe 全 key 失败：CHANNEL_PUSHME_FAILED + 三 key 留痕 + 不造空键')
+
+      // --- SNA-03：channelError 的 statusCode 来源优先级（:167-173）---
+      // 传输错误形：streamRequest 的 error 分支传 resp=null，故只能从 err.response.statusCode 取（真实 got 的形状）。
+      clearCfg(); snaCalls = []
+      cfg.BARK_PUSH = 'https://api.day.app/snaDevC'
+      const transportErr = Object.assign(new Error('connect ECONNRESET'), { code: 'ECONNRESET', response: { statusCode: 502 } })
+      snaHandler = () => ({ error: transportErr })
+      err = await runExpectThrow('SNA-03 传输错误形')
+      const inner = err.failures[0].failures[0]
+      assert.strictEqual(inner.statusCode, 502, 'resp 形参为 null 时必须退到 err.response.statusCode')
+      assert.strictEqual(inner.code, 'ECONNRESET', '传输错误码必须原样透传')
+      // 合成对照：err.statusCode 与 err.response.statusCode 同时存在时**必须取后者**。
+      // 诚实说明：真实 got 不同时给这两个字段，这一子形钉的是「取值优先级本身」，不是 got 的形态。
+      clearCfg(); snaCalls = []
+      cfg.BARK_PUSH = 'https://api.day.app/snaDevD'
+      const bothErr = Object.assign(new Error('bad gateway'), { code: 'ERR_NON_2XX_3XX_RESPONSE', statusCode: 504, response: { statusCode: 503 } })
+      snaHandler = () => ({ error: bothErr })
+      err = await runExpectThrow('SNA-03 优先级对照')
+      const inner2 = err.failures[0].failures[0]
+      assert.strictEqual(inner2.statusCode, 503, 'err.response.statusCode 必须优先于 err.statusCode（三元顺序对调在此变红）')
+      console.log('✅ SNA-03 channelError：response 形参 > err.response.statusCode > err.statusCode')
+
+      // --- SNA-04：一设备成功即通道成功（:692 results.some）——自 test_notify.js:248 移植 ---
+      // 移植理由：那条集成用例的用例体只有「await 不抛」、零断言；且 test_notify.js 标 integration:true，
+      // 被 scripts/tap-shim.js:111 排除在变异测试集外 ⇒ `some→every`、`r && r.ok→r.ok` 对变异门禁完全隐形。
+      clearCfg(); snaCalls = []
+      cfg.BARK_PUSH = 'https://api.day.app/snaOk#https://api.day.app/snaBad'
+      snaHandler = (url) => ({ body: url.includes('snaOk') ? { code: 200 } : { code: 500, message: 'bad' } })
+      let res = null
+      let threw = null
+      const r04 = await runExpectResolve('SNA-04')
+      res = r04.value; threw = r04.error
+      assert.ok(!threw, `一成一败必须算通道成功（v3.166），实际 ${threw && threw.message}`)
+      assert.deepStrictEqual(res.successfulChannels, ['bark'], '成功通道应为 bark')
+      assert.deepStrictEqual(res.failures, [], '部分成功不得记失败')
+      assert.strictEqual(snaCalls.length, 2, '两个设备各发一次，不得重试失败设备（改成失败即重试会变 3）')
+      console.log('✅ SNA-04 Bark 一成一败：通道判成功且不重试失败设备（自集成档移植进变异集）')
+
+      // --- SNA-05：多通道失败摘要的 200 字符截断与「; 」逐字拼接（:1624-1628）---
+      clearCfg(); snaCalls = []
+      cfg.WX_XIZHI_KEY = 'https://xizhi.fake/sna05'
+      cfg.DEER_KEY = 'PDK_sna05'
+      snaHandler = (url) => url.includes('xizhi')
+        ? ({ body: { code: 500, msg: 'XZFAIL' + 'q'.repeat(400) } })
+        : ({ body: { content: { result: [] } } })
+      err = await runExpectThrow('SNA-05 长摘要')
+      assert.ok(err.message.startsWith('所有推送通道失败: '), '摘要前缀必须逐字')
+      assert.strictEqual(err.message.length, '所有推送通道失败: '.length + 200, `摘要必须截到 200 字符，实际 ${err.message.length}`)
+      clearCfg(); snaCalls = []
+      cfg.WX_XIZHI_KEY = 'https://xizhi.fake/sna05b'
+      cfg.DEER_KEY = 'PDK_sna05b'
+      snaHandler = (url) => url.includes('xizhi')
+        ? ({ body: { code: 500, msg: 'A_TXT' } })
+        : ({ body: { content: { result: [] } } })
+      err = await runExpectThrow('SNA-05 短摘要')
+      assert.strictEqual(err.message, '所有推送通道失败: A_TXT; PushDeer 发送失败', '多失败必须用「; 」按通道顺序拼接')
+      assert.deepStrictEqual(err.failures.map(f => f.channel), ['息知', 'pushdeer'], 'failures 顺序必须与 channelTasks 一致')
+      console.log('✅ SNA-05 失败摘要：200 字符上限 + 「; 」逐字拼接 + 通道注册顺序')
+
+      // --- SNA-06/07/08：WxPusher 退避等待的算术、取消时机与监听器卫生（:1000-1023 / :1047）---
+      // 假时钟冻结 ⇒ 19 次成功把窗口打满；第 20 次的等待用「记账 setTimeout 延迟入参」观测，
+      // 再决定在哪个时刻取消：调度时即已取消 ⇒ 命中 :1019 真支；派发后才取消 ⇒ 观测监听器摘除。
+      const realNow = Date.now
+      const realST = global.setTimeout
+      const fillWindow = async (token) => {
+        clearCfg(); snaCalls = []
+        cfg.WX_pusher_appToken = token
+        cfg.WX_pusher_topicIds = 'T1'
+        snaHandler = () => ({ body: { code: 1000 } })
+        for (let i = 0; i < 19; i++) {
+          const filled = await settleWithin(`预填-${i}`, slim.sendNotify('预填-' + i, '正文'))
+          assertSettled(filled, `预填-${i}（token ${token}）`, '预填走的是窗口名额分配，若窗口算术被改坏它可能永不结算。')
+          assert.ok(!filled.error, `预填-${i} 不得失败，实际 ${filled.error && filled.error.message}`)
+        }
+        assert.strictEqual(snaCalls.length, 19, `窗口内 19 次必须全部发出，实际 ${snaCalls.length}`)
+      }
+      // 确定性等待桩：**只按「第几次看到 >=20ms 的等待」决策**，绝不依赖 setImmediate 与 0ms timer
+      // 的相对顺序。反例（CI 实测 quality 22.22.2，run 37330406755）：先前写成「记账后放行
+      // realST(fn,0) + setImmediate 取消」，本机空闲时取消先发生 ⇒ waits 恰一个；CI 上那个 0ms
+      // timer 先跑 ⇒ 同一次等待被采集两遍（waits=[10010,10010]）⇒ 用例随机红。
+      // 现在 'abort' 分支返回**永不触发**的假句柄：生产只能靠 aborted 收场，采集次数与调度顺序无关；
+      // cleanup 里的 clearTimeout(假句柄) 在 Node 下无害。
+      const DUMMY_TIMER = { snaDummyHandle: true }
+      const hookWaits = (decide) => {
+        const waits = []
+        global.setTimeout = (fn, ms, ...rest) => {
+          if (typeof ms === 'number' && ms >= 20) {
+            const verdict = decide(waits.length, ms)
+            waits.push(ms)
+            if (verdict === 'run') return realST(fn, ms, ...rest)
+            return DUMMY_TIMER
+          }
+          return realST(fn, ms, ...rest)
+        }
+        return waits
+      }
+      // (a) 时钟冻结 ⇒ 裸值 = 10000+10。只钉退避算术与取消语义。
+      //     ⚠️ 不宣称覆盖 :1019 的「进入等待时已 aborted」真支：生产在同一个同步段里读两次
+      //     `signal.aborted`（循环顶 :1027 与 :1018），中间没有 await ⇒ 真实运行时到不了那一支。
+      //     本条的收场确实从那一支走过，但判据只有「延迟值 + ABORT_ERR + 零请求」这三件与
+      //     取消路径无关的事实，因此不存在「靠合成时序刷覆盖」的问题。
+      {
+        const t0 = realNow()
+        const sig = duckSignal()
+        let waits
+        Date.now = () => t0
+        try {
+          await fillWindow('APT_sna06a')
+          snaCalls = []
+          waits = hookWaits(() => { sig.fire(); return 'abort' })
+          err = await runExpectThrow('SNA-06 退避中被取消', { signal: sig })
+          assert.deepStrictEqual(waits, [10010], '退避延迟必须等于 nextRelease-now+10=10010（Math.max→Math.min、+10→-10 都在此变红）')
+          assert.strictEqual(err.failures[0].code, 'ABORT_ERR', '取消必须按 ABORT_ERR 上抛')
+          assert.strictEqual(err.failures[0].message, 'WxPusher 限频等待已取消', '取消文案必须逐字')
+          assert.strictEqual(snaCalls.length, 0, '取消后一次都不发')
+        } finally { global.setTimeout = realST; Date.now = realNow }
+        console.log('✅ SNA-06/07 退避算术 10010 + 取消按 ABORT_ERR 上抛且零请求')
+      }
+      // (b) 监听器卫生：让第一次等待**真的到期**（假时钟把延迟压到 20ms），走 timer 自然收场那条路，
+      //     才能观测 cleanup 摘监听器；第二次等待再取消收尾（不留真实 10s 定时器）。
+      {
+        const t0 = realNow()
+        const sig = duckSignal()
+        let waits
+        try {
+          Date.now = () => t0
+          await fillWindow('APT_sna08b')
+          snaCalls = []
+          // 预填**之后**才把时钟推进 9995ms：裸值 = (t0+10000) - (t0+9995) + 10 = 15 ⇒ 被夹到 20ms
+          Date.now = () => t0 + 9995
+          waits = hookWaits((n) => {
+            if (n === 0) return 'run'
+            sig.fire()
+            return 'abort'
+          })
+          err = await runExpectThrow('SNA-08 退避到点后取消', { signal: sig })
+          assert.strictEqual(waits[0], 20, `第一次等待必须被夹到 20ms 下限（裸值 15；改成 Math.min 就变 15），实际 ${waits[0]}`)
+          assert.ok(waits.length >= 2, '20ms 到期后窗口仍满 ⇒ 必须再排一次（一次都没续排说明 resolve 路径坏了）')
+          assert.strictEqual(sig.rec.added[0][0], 'abort', '未取消时必须注册 abort 监听器')
+          assert.strictEqual(sig.rec.added[0][2].once, true, '必须以 { once: true } 注册（删掉该选项在此变红）')
+          assert.ok(sig.rec.removed.length >= 1, '结算后必须摘掉监听器（否则长跑进程每轮退避泄漏一个闭包）')
+          assert.strictEqual(sig.rec.removed[0][0], 'abort', '摘的必须是 abort 事件')
+          assert.strictEqual(sig.rec.removed[0][1], sig.rec.added[0][1], '摘的必须是同一个函数引用（换成新建函数在此变红）')
+          assert.strictEqual(err.failures[0].code, 'ABORT_ERR', '取消最终仍按 ABORT_ERR 上抛')
+        } finally { global.setTimeout = realST; Date.now = realNow }
+        console.log('✅ SNA-08 abort 监听器卫生：once 注册、到期结算摘除、引用一致')
+      }
+      // (c)(d) 时间窗边界**必须成对**：恰好 10000ms ⇒ 零等待直接续发；差 1ms ⇒ 必须等待。
+      //        `<=`→`<` 只有 (c) 能杀，`<=`→`>=` 只有 (d) 能杀，单独落一条都会留死角。
+      {
+        const t0 = realNow()
+        const sig = duckSignal()
+        Date.now = () => t0
+        try {
+          await fillWindow('APT_sna09c')
+          snaCalls = []
+          Date.now = () => t0 + 10000 // 命中 `timestamps[0] <= now - WINDOW` 的等号边界
+          snaHandler = () => ({ body: { code: 1000 } })
+          const waits = hookWaits(() => { sig.fire(); return 'abort' }) // 万一没淘汰：立刻取消 ⇒ 干净判红而不是卡死
+          threw = null; res = null
+          const r09c = await runExpectResolve('SNA-09c 恰好过期', { signal: sig })
+          res = r09c.value; threw = r09c.error
+          assert.ok(!threw, `边界命中必须直接排到名额，实际 ${threw && threw.message}`)
+          assert.deepStrictEqual(waits, [], '命中等号边界不得进入等待（淘汰被删就会在此变红，且不靠挂死判红）')
+          assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '过期清理后第 20 次必须成功')
+          assert.strictEqual(snaCalls.length, 1, '必须真的发出第 20 次请求')
+        } finally { global.setTimeout = realST; Date.now = realNow }
+        const t1 = realNow()
+        Date.now = () => t1
+        try {
+          await fillWindow('APT_sna09d')
+          snaCalls = []
+          Date.now = () => t1 + 9999 // 差 1ms 未过期 ⇒ 必须等待
+          const sig = duckSignal()
+          const waits = hookWaits(() => { sig.fire(); return 'abort' })
+          try {
+            err = await runExpectThrow('SNA-09d 差 1ms 未过期', { signal: sig })
+            assert.deepStrictEqual(waits, [20], '未过期必须等待且夹到 20ms 下限（裸值 11；改成 Math.min 就变 11）')
+            assert.strictEqual(snaCalls.length, 0, `未过期不得发出第 20 次（误判成已过期会在此变 1），实际 ${snaCalls.length}`)
+            assert.strictEqual(err.failures[0].code, 'ABORT_ERR', '收尾用取消，不留真实 10s 定时器')
+          } finally { global.setTimeout = realST }
+        } finally { Date.now = realNow }
+        console.log('✅ SNA-09 时间窗边界成对：恰好过期即零等待续发 / 差 1ms 必须等待并夹到 20')
+      }
+
+      // --- SNA-10：限频业务码的数字与字符串两种序列化 + 单应用限频即结束重试 ---
+      clearCfg(); snaCalls = []
+      cfg.WX_pusher_appToken = 'APT_sna10a'
+      cfg.WX_pusher_topicIds = 'T1'
+      snaHandler = () => ({ body: { code: 1001, msg: '速度太快' } })
+      err = await runExpectThrow('SNA-10 单应用限频')
+      assert.strictEqual(snaCalls.length, 1, '只有一个应用时限频必须结束重试，不得无限空转')
+      assert.strictEqual(err.failures[0].channel, 'wxpusher', '失败必须点名 wxpusher')
+      assert.strictEqual(err.failures[0].code, 1001, '业务码必须原样保留数字形态')
+      assert.strictEqual(err.failures[0].providerCode, '1001', 'providerCode 必须是字符串形态（failure_policy 按字符串判）')
+      clearCfg(); snaCalls = []
+      cfg.WX_pusher_channels = [{ appToken: 'APT_sna10b1', topicIds: ['T1'] }, { appToken: 'APT_sna10b2', topicIds: ['T2'] }]
+      let seen = 0
+      snaHandler = () => ({ body: ++seen === 1 ? { code: '1001' } : { code: 1000 } })
+      threw = null; res = null
+      const r10 = await runExpectResolve('SNA-10 字符串限频码')
+      res = r10.value; threw = r10.error
+      assert.ok(!threw, `字符串 '1001' 也必须判限频并切备用应用，实际 ${threw && threw.message}`)
+      assert.strictEqual(snaCalls.length, 2, '首个应用被判限频 ⇒ 必须换第二个')
+      assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '备用应用应成功')
+      console.log('✅ SNA-10 限频码：数字 1001 原样透传 + 字符串 1001 仍判限频切备用应用')
+    } finally {
+      if (origStream.post) gotMod.stream.post = origStream.post
+      if (origStream.get) gotMod.stream.get = origStream.get
+      clearCfg()
+      for (const k of Object.keys(savedSna)) cfg[k] = savedSna[k]
+      snaHandler = () => ({})
+      snaCalls = []
+    }
+  }
+
+  suiteFinished = true // 只有真的跑到结尾，beforeExit 哨兵才闭嘴（否则一律判红）
   console.log('test_sendnotify_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })
