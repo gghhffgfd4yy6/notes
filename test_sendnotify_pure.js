@@ -1333,9 +1333,15 @@ function mockGotForChannels (respond) {
 }
 
 // 单通道隔离：清掉已知通道键，只留 want 里给的；结束后按 saved 恢复。
+// 通道「使能键」+「端点/群组覆盖键」全集：isolateChannel 每次只留 want 里给的键，其余一律删掉。
+// 后 5 个（QYWX_ORIGIN/PUSH_PLUS_USER/PUSHME_URL/TG_API_HOST/DEER_URL）不是使能键，但会改变
+// 请求 URL 与「一对一/一对多」形态 ⇒ 不清就会让上一条用例的端点覆盖漏进下一条（v4 簇的
+// SN-07/SNB-02/SN-24 正是靠「恰好发 1 次、URL 逐字」做判据的）。删掉后各通道按 `|| 默认值` 回退，
+// 与生产默认一致，所以老用例（只设使能键）行为不变。
 const ALL_CHANNEL_KEYS = ['WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_pusher_channels',
   'PUSH_PLUS_TOKEN', 'PUSH_KEY', 'BARK_PUSH', 'QYWX_KEY', 'WX_XIZHI_KEY', 'DEER_KEY',
-  'PUSHME_KEY', 'TG_BOT_TOKEN', 'TG_USER_ID', 'TG_API_HOST', 'HITOKOTO']
+  'PUSHME_KEY', 'TG_BOT_TOKEN', 'TG_USER_ID', 'TG_API_HOST', 'HITOKOTO',
+  'QYWX_ORIGIN', 'PUSH_PLUS_USER', 'PUSHME_URL', 'DEER_URL']
 
 function isolateChannel (want) {
   const saved = ALL_CHANNEL_KEYS.map(k => [k, push_config[k]])
@@ -1620,38 +1626,32 @@ checkS('一言: 一言失败不阻塞推送（catch 跳过，主通道照发）'
 // 不可达的（配置谓词与 sendNotify 的 configuredFlags 同源 ⇒「未配置就返回」的内部守卫永远走不到；
 // `$.get` 全仓无调用方）不写断言，单独在 PR 说明里交底——不为凑覆盖率伪造演员。
 //
-// 夹具扩展：可编程假收件台。三态由 respond 决定——回包体 / 传输错误 / 结构异常的 response 对象。
+// 夹具扩展：可编程假收件台。respond 返回 spec，两态——`spec.error`＝传输错误，否则＝回包体
+// （`spec.body`，流式路径按 JSON 解析失败时保留原样字符串，所以 HTML 响应体也演得出）。
 // 桩必须打在 got.stream.post|get 上：本机 got.stream 存在 ⇒ canStreamRequest() 恒真 ⇒
 // `$.post` 生产真实走 streamRequest(:354)，got.post(:405) 只是无 stream 时的回退。
 // 两种桩都装：stream 走生产真实路径，promise 桩保证万一 got 形态变化用例仍能收敛而非触网。
 // ============================================================
-const EXTRA_CHANNEL_KEYS = ['QYWX_ORIGIN', 'PUSH_PLUS_USER', 'PUSHME_URL', 'TG_API_HOST', 'DEER_URL']
 
-function isolateChannel2 (want) {
-  const keys = ALL_CHANNEL_KEYS.concat(EXTRA_CHANNEL_KEYS)
-  const saved = keys.map(k => [k, push_config[k]])
-  for (const k of keys) delete push_config[k]
-  for (const [k, v] of Object.entries(want)) push_config[k] = v
-  return () => {
-    for (const [k, v] of saved) { if (v === undefined) delete push_config[k]; else push_config[k] = v }
-  }
-}
-
-function mockTransport (respond) {
+// ============================================================
+// 夹具契约：respond(url, opts) **一律返回 spec 对象**（{ body | error }），不做 `|| {}` 兜底——
+// 兜底是一道没人经过的门（本 PR 在 utils 侧已按同一口径删过一次），留着只会被 Sonar 再点名。
+// 也不开放 spec.timings / spec.response 开关：本簇没有任何用例传过它们，需要的计时/状态观测
+// 已在生产路径上固定注入；将来真要用例要观测它们，请连同断言一起把开关加回来。
+const mockTransport = (respond) => {
   const captured = []
   const bodyOf = (spec) => typeof spec.body === 'string'
     ? spec.body
     : JSON.stringify(spec.body === undefined ? {} : spec.body)
   const makeStream = (url, opts) => {
     captured.push({ url: String(url), opts })
-    const spec = respond(String(url), opts) || {}
+    const spec = respond(String(url), opts)
     const s = new ChannelEE()
-    s.timings = spec.timings || { phases: { total: 1 } }
+    s.timings = { phases: { total: 1 } }
     s.destroy = () => {}
     setTimeout(() => {
       if (spec.error !== undefined) { s.emit('error', spec.error); return }
-      const res = spec.response || { statusCode: 200, headers: { 'content-type': 'application/json' } }
-      s.emit('response', res)
+      s.emit('response', { statusCode: 200, headers: { 'content-type': 'application/json' } })
       s.emit('data', Buffer.from(bodyOf(spec)))
       s.emit('end')
     }, 0)
@@ -1659,7 +1659,7 @@ function mockTransport (respond) {
   }
   const fakePromise = (url, opts) => {
     captured.push({ url: String(url), opts })
-    const spec = respond(String(url), opts) || {}
+    const spec = respond(String(url), opts)
     if (spec.error !== undefined) return Promise.reject(spec.error)
     return Promise.resolve({ body: bodyOf(spec), statusCode: 200, headers: {}, timings: { phases: {} } })
   }
@@ -1700,7 +1700,7 @@ function mockTransportPromiseOnly (respond) {
   const orig = { post: gotModule.post, get: gotModule.get, stream: gotModule.stream }
   const fake = (url, opts) => {
     captured.push({ url: String(url), opts })
-    const spec = respond(String(url), opts) || {}
+    const spec = respond(String(url), opts)
     if (spec.error !== undefined) return Promise.reject(spec.error)
     return Promise.resolve({ body: spec.body, statusCode: 200, headers: {}, timings: { phases: {} } })
   }
@@ -1714,7 +1714,7 @@ function mockTransportPromiseOnly (respond) {
 // 变异对照：删掉 `if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1)` ⇒ 截断留下孤立高代理
 // ⇒ encodeURIComponent 抛 URIError ⇒ 本用例（断言通道成功）当场红。
 checkS('SN-01 Server酱: 标题>32 且第 32 位落在代理对中间时必须退位（不得留孤立高代理）', async () => {
-  const restore = isolateChannel2({ PUSH_KEY: 'SCTfakekey' })
+  const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ errno: 0 }) }))
   try {
     const res = await sendNotify('a'.repeat(31) + '🌟', '正文')
@@ -1730,7 +1730,7 @@ checkS('SN-01 Server酱: 标题>32 且第 32 位落在代理对中间时必须�
 
 // --- SN-02：Server酱·Turbo 版把 errno 嵌在 data 里（:566 嵌套回退）---
 checkS('SN-02 Server酱: errno 只在 data.data 内层时也必须按成功判（Turbo 响应形状）', async () => {
-  const restore = isolateChannel2({ PUSH_KEY: 'SCTfakekey' })
+  const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ data: { errno: 0 }, errmsg: 'ok' }) }))
   const log1 = captureLogs()
   try {
@@ -1744,7 +1744,7 @@ checkS('SN-02 Server酱: errno 只在 data.data 内层时也必须按成功判�
 // 判错的后果不对称：把 1024 当失败 ⇒ 不写缓存 ⇒ 每轮重推、有效设备被反复轰炸。
 checkS('SN-03 Server酱: errno 1024（数字与字符串两种序列化）视为已送达，不得 reject', async () => {
   for (const raw of [1024, '1024']) {
-    const restore = isolateChannel2({ PUSH_KEY: 'SCTfakekey' })
+    const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
     const got1 = mockTransport(() => ({ body: JSON.stringify({ errno: raw, errmsg: '此内容一分钟内已发送过' }) }))
     const log1 = captureLogs()
     try {
@@ -1760,7 +1760,7 @@ checkS('SN-03 Server酱: errno 1024（数字与字符串两种序列化）视为
 // 判错的后果是虚假成功：主流程写缓存 ⇒ 消息永久丢失（v3.180 那起 P1 的同族）。
 for (const [label, cfg, key] of [['SN-04 Bark', { BARK_PUSH: 'dev1' }, 'bark'], ['SN-06 PushMe', { PUSHME_KEY: 'pmkey1' }, 'pushme']]) {
   checkS(`${label}: 响应业务体字段抛异常时不得被记成成功（catch 必须按通道失败）`, async () => {
-    const restore = isolateChannel2(cfg)
+    const restore = isolateChannel(cfg)
     const got1 = mockTransportPromiseOnly(() => ({ body: brokenBody() }))
     try {
       let threw = null
@@ -1794,7 +1794,7 @@ function unwrapChannelFailures (threw, channel) {
 }
 
 checkS('SN-05 PushMe: 响应无 code 时 providerCode 取 error_code（再退 errno），不得丢业务码', async () => {
-  const restore = isolateChannel2({ PUSHME_KEY: 'pmkey1' })
+  const restore = isolateChannel({ PUSHME_KEY: 'pmkey1' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ error_code: 4001, message: 'invalid key' }) }))
   try {
     let threw = null
@@ -1803,7 +1803,7 @@ checkS('SN-05 PushMe: 响应无 code 时 providerCode 取 error_code（再退 er
     const inner = unwrapChannelFailures(threw, 'pushme')
     assert.strictEqual(inner.providerCode, 4001, `providerCode 必须回退到 error_code，实际 ${JSON.stringify(inner.providerCode)}`)
   } finally { got1.restore(); restore() }
-  const restore2 = isolateChannel2({ PUSHME_KEY: 'pmkey2' })
+  const restore2 = isolateChannel({ PUSHME_KEY: 'pmkey2' })
   const got2 = mockTransport(() => ({ body: JSON.stringify({ errno: 5, message: 'rate' }) }))
   try {
     let threw = null
@@ -1815,7 +1815,7 @@ checkS('SN-05 PushMe: 响应无 code 时 providerCode 取 error_code（再退 er
 
 // --- SN-07 / SN-08：企业微信端点可覆盖 + desp 为空时正文只取标题（:782 / :789）---
 checkS('SN-07 企业微信: QYWX_ORIGIN 自定义端点必须去尾斜杠拼接（不得出现 //cgi-bin）', async () => {
-  const restore = isolateChannel2({ QYWX_KEY: 'qykey', QYWX_ORIGIN: 'https://qy.example.com///' })
+  const restore = isolateChannel({ QYWX_KEY: 'qykey', QYWX_ORIGIN: 'https://qy.example.com///' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ errcode: 0, errmsg: 'ok' }) }))
   try {
     const res = await sendNotify('企微端点', '正文')
@@ -1827,7 +1827,7 @@ checkS('SN-07 企业微信: QYWX_ORIGIN 自定义端点必须去尾斜杠拼接�
 })
 
 checkS('SN-08 企业微信: desp 为空时 content 只取标题（不拼出「标题\\n\\nundefined」残尾）', async () => {
-  const restore = isolateChannel2({ QYWX_KEY: 'qykey' })
+  const restore = isolateChannel({ QYWX_KEY: 'qykey' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ errcode: 0 }) }))
   try {
     await sendNotify('只有标题', '')
@@ -1841,7 +1841,7 @@ checkS('SN-08 企业微信: desp 为空时 content 只取标题（不拼出「�
 checkS('SN-09 WxPusher: 多应用配置循环引用不得抛穿，必须回退旧字段并显形告警', async () => {
   const circular = { self: null }
   circular.self = circular // 对象形状（不是数组）⇒ 既撞 :868 的不可序列化 catch，也撞「不是数组」告警
-  const restore = isolateChannel2({ WX_pusher_appToken: 'APT_fake', WX_pusher_topicIds: 'T1', WX_pusher_channels: circular })
+  const restore = isolateChannel({ WX_pusher_appToken: 'APT_fake', WX_pusher_topicIds: 'T1', WX_pusher_channels: circular })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 1000 }) }))
   const log1 = captureLogs()
   try {
@@ -1856,7 +1856,7 @@ checkS('SN-09 WxPusher: 多应用配置循环引用不得抛穿，必须回退�
 // 导出的 configuredChannelCount / configuredChannelNames 与 sendNotify 共用同一对谓词 ⇒ 可直调、进程内。
 checkS('SN-10 通道自检: 配置值 String() 抛异常必须判「未配置」且不抛穿（自检与主流程同口径）', () => {
   const throwing = { toString () { throw new Error('脏配置不可字符串化') } }
-  const restore = isolateChannel2({ QYWX_KEY: throwing, PUSHME_KEY: throwing, WX_XIZHI_KEY: 'https://xizhi.fake/k' })
+  const restore = isolateChannel({ QYWX_KEY: throwing, PUSHME_KEY: throwing, WX_XIZHI_KEY: 'https://xizhi.fake/k' })
   try {
     assert.strictEqual(configuredChannelCount(), 1, '抛错的脏值不得计入已配置通道（只剩息知）')
     assert.deepStrictEqual(configuredChannelNames(), ['息知'], '自检清单不得包含脏值通道')
@@ -1865,7 +1865,7 @@ checkS('SN-10 通道自检: 配置值 String() 抛异常必须判「未配置」
 
 // --- SN-22：息知 providerCode 回退 errcode（:1223）---
 checkS('SN-22 息知: 响应无 code 时 providerCode 取 errcode（业务码不得丢）', async () => {
-  const restore = isolateChannel2({ WX_XIZHI_KEY: 'https://xizhi.fake/k' })
+  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ errcode: 500, msg: '内部错误' }) }))
   try {
     let threw = null
@@ -1877,7 +1877,7 @@ checkS('SN-22 息知: 响应无 code 时 providerCode 取 errcode（业务码不
 
 // --- SN-23：Telegram 正文为空时只发标题（:1319 三元另一侧）---
 checkS('SN-23 Telegram: desp 为空时 text 不含分隔符残尾', async () => {
-  const restore = isolateChannel2({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
+  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ ok: true }) }))
   try {
     await sendNotify('TG只有标题', '')
@@ -1894,7 +1894,7 @@ checkS('SN-24 Push+: PUSH_PLUS_USER 存在时三处日志都必须是「一对�
   ]
   for (const [label, spec, re] of cases) {
     for (const who of ['一对多', '一对一']) {
-      const restore = isolateChannel2(who === '一对多'
+      const restore = isolateChannel(who === '一对多'
         ? { PUSH_PLUS_TOKEN: 'PPT_fake', PUSH_PLUS_USER: 'U1' }
         : { PUSH_PLUS_TOKEN: 'PPT_fake' })
       const got1 = mockTransport(spec)
@@ -1902,10 +1902,12 @@ checkS('SN-24 Push+: PUSH_PLUS_USER 存在时三处日志都必须是「一对�
       try {
         let swallowed = null
         try { await sendNotify('文案探针', '正文') } catch (e) { swallowed = e }
-        if (swallowed) log1.logs.push('SENDTHREW:' + (swallowed.message || String(swallowed)))
+        // 上抛的聚合消息只作**排障线索**，不进被匹配的语料：它自带「所有推送通道失败」，
+        // 混进 logs 后 /失败/ 那条断言会被自己注入的行满足（半自证，实测削弱判红面）。
+        const threwHint = swallowed ? ` | 上抛: ${swallowed.message || String(swallowed)}` : ''
         const hit = log1.logs.filter(l => re.test(l))
-        assert.ok(hit.length > 0, `Push+ ${label}路径（who=${who}）必须打日志，实际: ${JSON.stringify(log1.logs)}`)
-        assert.ok(hit.some(l => l.includes(who)), `Push+ ${label}日志应含「${who}」，实际: ${JSON.stringify(hit)}`)
+        assert.ok(hit.length > 0, `Push+ ${label}路径（who=${who}）必须打日志，实际: ${JSON.stringify(log1.logs)}${threwHint}`)
+        assert.ok(hit.some(l => l.includes(who)), `Push+ ${label}日志应含「${who}」，实际: ${JSON.stringify(hit)}${threwHint}`)
         assert.ok(!hit.some(l => l.includes(who === '一对多' ? '一对一' : '一对多')), '不得同时出现相反文案')
       } finally { log1.restore(); got1.restore(); restore() }
     }
@@ -1922,7 +1924,7 @@ checkS('SN-11 WxPusher: 取消（code=ABORT_ERR / name=AbortError）不得被文
     ['code=ABORT_ERR', () => Object.assign(new Error('WxPusher 限频等待已取消'), { code: 'ABORT_ERR' }), (f) => assert.strictEqual(f.code, 'ABORT_ERR', '取消错误码必须原样透出')],
     ['name=AbortError', () => Object.assign(new Error('WxPusher 限频等待已取消'), { name: 'AbortError' }), (f) => assert.ok(/已取消/.test(f.message), '取消文案必须保留（不得换成 1001 限频摘要）')]
   ]) {
-    const restore = isolateChannel2({
+    const restore = isolateChannel({
       WX_pusher_channels: [{ appToken: 'APT_SNC11A_' + label, topicIds: ['T1'] }, { appToken: 'APT_SNC11B_' + label, topicIds: ['T2'] }]
     })
     const got1 = mockTransport(() => ({ error: mkErr() }))
@@ -1938,7 +1940,7 @@ checkS('SN-11 WxPusher: 取消（code=ABORT_ERR / name=AbortError）不得被文
 })
 
 checkS('SN-12 WxPusher: 错误无 message 时仍须按 err 本身的文本判定 1001（换备用应用，不得一次都不重试）', async () => {
-  const restore = isolateChannel2({
+  const restore = isolateChannel({
     WX_pusher_channels: [{ appToken: 'APT_SNC12A', topicIds: ['T1'] }, { appToken: 'APT_SNC12B', topicIds: ['T2'] }]
   })
   const rateErr = Object.assign(new Error(''), { toString: () => 'upstream 1001 速度太快' })
@@ -1955,7 +1957,7 @@ checkS('SN-13 WxPusher: XBK_PROFILE=2 时打逐次日志但不写聚合统计（
   // 关键：统计 Map 是模块级、跨档位持续存在 ⇒ 必须切回 3 档再读，才能证明 2 档那次运行真的没写进去。
   // （先前我直接在 2 档读 getWxPusherProfileSummary()——它自己第一行就是同一道 !== '3' 的门，
   //  永远返回 [] ⇒ 这条断言在「门被删掉」时照样绿 ⇒ 是废题，已按可观测方式重写。）
-  const restore = isolateChannel2({ WX_pusher_appToken: 'APT_SNC13', WX_pusher_topicIds: 'T1' })
+  const restore = isolateChannel({ WX_pusher_appToken: 'APT_SNC13', WX_pusher_topicIds: 'T1' })
   const got1 = mockTransport(WX_OK)
   const log1 = captureLogs()
   const origProfile = process.env.XBK_PROFILE
@@ -1972,7 +1974,7 @@ checkS('SN-13 WxPusher: XBK_PROFILE=2 时打逐次日志但不写聚合统计（
 })
 
 checkS('SN-14 WxPusher: XBK_PROFILE=3 的四种 outcome 分类计数必须各归各位', async () => {
-  const restore = isolateChannel2({ WX_pusher_appToken: 'APT_SNC14', WX_pusher_topicIds: 'T1' })
+  const restore = isolateChannel({ WX_pusher_appToken: 'APT_SNC14', WX_pusher_topicIds: 'T1' })
   const log1 = captureLogs()
   const origProfile = process.env.XBK_PROFILE
   process.env.XBK_PROFILE = '3'
@@ -1996,35 +1998,60 @@ checkS('SN-14 WxPusher: XBK_PROFILE=3 的四种 outcome 分类计数必须各归
 })
 
 checkS('SN-15 WxPusher: 非 3 档调用 printWxPusherProfileSummary 必须一字不出（脱敏统计不得混进常规日志）', async () => {
+  // 自播种：统计 Map 是模块级、不可清空，print 的早退条件是 `!== '3' || size === 0` 两个。
+  // 只测「非 3 档一字不出」而**不先保证 Map 非空**，判红就依赖别的用例留下的残留——
+  // 实测（本 PR 评审）：全新进程里把 `!== '3'` 那道门删掉，size===0 仍先兜住 ⇒ 本条照样绿。
+  // 所以这里先自己在 3 档跑一轮，确保「Map 非空」是本用例造成的，档位门一坏就必然显形。
   const origProfile = process.env.XBK_PROFILE
-  delete process.env.XBK_PROFILE
+  const restore = isolateChannel({ WX_pusher_appToken: 'APT_SNC15', WX_pusher_topicIds: 'T1' })
+  const got1 = mockTransport(WX_OK)
   const log1 = captureLogs()
   try {
+    process.env.XBK_PROFILE = '3'
+    await sendNotify('播种-3档', '正文')
+    const seeded = getWxPusherProfileSummary().filter(s => s.app === maskKey('APT_SNC15'))
+    assert.strictEqual(seeded.length, 1, `前置播种必须真的写进 3 档统计（否则下面的断言是空转），实际 ${JSON.stringify(seeded)}`)
+    assert.strictEqual(got1.capture.length, 1, '播种轮应发出 1 次请求')
+    // 切到非 3 档再调 print：统计已非空，此时**只可能**是档位门让它闭嘴。
+    delete process.env.XBK_PROFILE
+    log1.logs.length = 0
     printWxPusherProfileSummary()
     assert.strictEqual(log1.logs.length, 0, `未开 3 档时不得输出任何 summary 行，实际: ${JSON.stringify(log1.logs)}`)
+    // 同一非空统计在 3 档下必须打出来——反向对照，证明上一条不是「反正都不打」的废题
+    process.env.XBK_PROFILE = '3'
+    printWxPusherProfileSummary()
+    assert.ok(log1.logs.some(l => l.includes('[profile wxpusher summary]')),
+      `3 档且统计非空时必须输出，实际: ${JSON.stringify(log1.logs)}`)
   } finally {
-    if (origProfile !== undefined) process.env.XBK_PROFILE = origProfile
-    log1.restore()
+    if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
+    log1.restore(); got1.restore(); restore()
   }
 })
 
 checkS('SN-16 WxPusher: 10 秒窗口过期后必须腾出名额（不得因未清理的时间戳把自己锁死）', async () => {
-  const restore = isolateChannel2({ WX_pusher_appToken: 'APT_SNC16', WX_pusher_topicIds: 'T1' })
+  const restore = isolateChannel({ WX_pusher_appToken: 'APT_SNC16', WX_pusher_topicIds: 'T1' })
   const log1 = captureLogs()
   const got1 = mockTransport(WX_OK)
   const realNow = Date.now
   let offset = 0
   Date.now = () => realNow() + offset
+  // 取消句柄：清理支被删掉时，下面那次「第 20 次」不是慢，而是**永远排不到名额**。
+  // 有界 race 只让**断言**在 1.5s 变红，被放弃的那个 promise 仍在以 20ms 一轮的速度空转
+  // ⇒ 事件循环永不排空、进程不退出（实测：红是红了，但要挂到 run_unit_tests 的 10min 超时，
+  //   TAP 档下还会被 tap-runner 记成 RuntimeError 触发段级 fail-closed）。
+  // 所以必须自己收尾：finally 里 abort，让那个泄漏的等待在循环顶撞上 signal.aborted 立即抛掉。
+  const ac = new AbortController()
   try {
     for (let i = 0; i < 19; i++) await sendNotify('填窗口-' + i, '正文')
     assert.strictEqual(got1.capture.length, 19, '窗口内应发出 19 次')
     offset = 15000 // 跨过 WXPUSHER_WINDOW_MS(10s)：旧时间戳必须被清理，否则本轮永远排不到名额
     // 用有界 race：清理被删掉时这一轮不是「慢」而是永远排不到 ⇒ 让它 1.5s 就判红，而不是拖到套件看门狗。
-    const done = sendNotify('窗口过期后', '正文').then(() => 'done', (e) => 'failed: ' + (e && e.message))
+    const done = sendNotify('窗口过期后', '正文', { signal: ac.signal }).then(() => 'done', (e) => 'failed: ' + (e && e.message))
     const settled = await Promise.race([done, new Promise((resolve) => setTimeout(() => resolve('stuck'), 1500))])
     assert.strictEqual(settled, 'done', `过期后第 20 次必须立刻排到名额，实际 ${settled}`)
     assert.strictEqual(got1.capture.length, 20, '窗口过期清理后必须真的发出第 20 次请求')
   } finally {
+    ac.abort() // 收尾泄漏的在飞等待（判红时它已不可能自己结算）
     Date.now = realNow
     log1.restore(); got1.restore(); restore()
   }
@@ -2032,7 +2059,7 @@ checkS('SN-16 WxPusher: 10 秒窗口过期后必须腾出名额（不得因未�
 
 checkS('SN-17 WxPusher: 重复应用配置在限频后必须停止空转并保留最后一次真实错误', async () => {
   const dup = { appToken: 'APT_SNC17', topicIds: ['T1'] }
-  const restore = isolateChannel2({ WX_pusher_channels: [dup, { ...dup }] })
+  const restore = isolateChannel({ WX_pusher_channels: [dup, { ...dup }] })
   const log1 = captureLogs()
   const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 1001, msg: '速度太快' }) }))
   try {
@@ -2055,7 +2082,7 @@ checkS('SN-17 WxPusher: 重复应用配置在限频后必须停止空转并保�
 // （留着会让 Pusher 的 10s 超时归因把已结算通道也算成 PUSH_TIMEOUT）。
 checkS('SN-18 sendNotify: 通道自身抛异常只算该通道失败，不得影响其他通道，且必须从在飞清单摘掉', async () => {
   let reads = 0
-  const restore = isolateChannel2({ PUSH_PLUS_TOKEN: 'PPT_once', WX_XIZHI_KEY: 'https://xizhi.fake/k' })
+  const restore = isolateChannel({ PUSH_PLUS_TOKEN: 'PPT_once', WX_XIZHI_KEY: 'https://xizhi.fake/k' })
   Object.defineProperty(push_config, 'PUSH_PLUS_TOKEN', {
     configurable: true,
     get () { if (reads++ > 0) throw new Error('脏配置读取失败'); return 'PPT_once' }
@@ -2081,7 +2108,7 @@ checkS('SN-18 sendNotify: 通道自身抛异常只算该通道失败，不得影
 
 checkS('SN-20 失败归因: reason 的结构化字段读取抛异常时只保留安全消息，不得抛穿汇总', async () => {
   const hostile = { message: '上游返回异常', code: 'ECONNRESET', get providerCode () { throw new Error('字段不可读') } }
-  const restore = isolateChannel2({ PUSH_KEY: 'SCTfakekey' })
+  const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
   const log1 = captureLogs()
   const got1 = mockTransport(() => ({ error: hostile }))
   try {
@@ -2096,7 +2123,7 @@ checkS('SN-20 失败归因: reason 的结构化字段读取抛异常时只保留
 
 checkS('SN-21 入口清洗: text/desp 为 undefined/null 或 String() 抛异常时都必须按空串继续，不得抛穿', async () => {
   for (const [label, bad] of [['undefined', undefined], ['null', null], ['String() 抛', { toString () { throw new Error('不可字符串化') } }]]) {
-    const restore = isolateChannel2({ BARK_PUSH: 'dev_snc21' })
+    const restore = isolateChannel({ BARK_PUSH: 'dev_snc21' })
     const log1 = captureLogs()
     const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
     try {
@@ -2121,7 +2148,7 @@ checkS('SNB-01 Bark: 设备码切分——空段丢弃、每段 trim，请求条
     ['d1#  #d2', ['https://api.day.app/d1', 'https://api.day.app/d2']]
   ]
   for (const [raw, urls] of cases) {
-    const restore = isolateChannel2({ BARK_PUSH: raw })
+    const restore = isolateChannel({ BARK_PUSH: raw })
     const log1 = captureLogs()
     const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
     try {
@@ -2142,7 +2169,7 @@ checkS('SNB-02 Bark: 端点协议判定——自建 http 与大写 HTTPS 原样�
     'dev1'
   ]
   for (const raw of cases) {
-    const restore = isolateChannel2({ BARK_PUSH: raw })
+    const restore = isolateChannel({ BARK_PUSH: raw })
     const log1 = captureLogs()
     const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
     try {
@@ -2158,7 +2185,7 @@ checkS('SNB-06 Bark: 调用方 AbortSignal 必须原样交给传输层；未传�
   // 轮1：带 signal —— 必须是同一个引用（取消能否生效的唯一通路）
   const ac = new AbortController()
   {
-    const restore = isolateChannel2({ BARK_PUSH: 'dev_snb06' })
+    const restore = isolateChannel({ BARK_PUSH: 'dev_snb06' })
     const log1 = captureLogs()
     const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
     try {
@@ -2173,7 +2200,7 @@ checkS('SNB-06 Bark: 调用方 AbortSignal 必须原样交给传输层；未传�
   }
   // 轮2：脏 params（读 signal 就抛）⇒ requestExtras 的 try/catch 必须兜住，照常发送
   {
-    const restore = isolateChannel2({ BARK_PUSH: 'dev_snb06' })
+    const restore = isolateChannel({ BARK_PUSH: 'dev_snb06' })
     const log1 = captureLogs()
     const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
     try {
@@ -2184,7 +2211,7 @@ checkS('SNB-06 Bark: 调用方 AbortSignal 必须原样交给传输层；未传�
   }
   // 轮3：只传内部选项 ⇒ 传输选项里不得凭空出现 signal 键
   {
-    const restore = isolateChannel2({ BARK_PUSH: 'dev_snb06' })
+    const restore = isolateChannel({ BARK_PUSH: 'dev_snb06' })
     const log1 = captureLogs()
     const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
     try {
@@ -2195,7 +2222,7 @@ checkS('SNB-06 Bark: 调用方 AbortSignal 必须原样交给传输层；未传�
 })
 
 checkS('SNB-03 Bark: 响应不是 JSON（代理回 HTML）时按业务失败，兜底文案逐字且不得把响应体塞进 message', async () => {
-  const restore = isolateChannel2({ BARK_PUSH: 'https://api.day.app/DevKey12345' })
+  const restore = isolateChannel({ BARK_PUSH: 'https://api.day.app/DevKey12345' })
   const log1 = captureLogs()
   // 流式路径 JSON.parse 失败时保留原始字符串（:388-391 的刻意行为）⇒ data 是个 HTML 字符串
   const got1 = mockTransport(() => ({ body: '<html>Bad Gateway DevKey12345</html>' }))
@@ -2214,7 +2241,7 @@ checkS('SNB-03 Bark: 响应不是 JSON（代理回 HTML）时按业务失败，�
 })
 
 checkS('SNB-04 Bark: 传输错误（无 response）必须逐设备点名且不得重发', async () => {
-  const restore = isolateChannel2({ BARK_PUSH: 'dev_snb04' })
+  const restore = isolateChannel({ BARK_PUSH: 'dev_snb04' })
   const log1 = captureLogs()
   const got1 = mockTransport(() => ({ error: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) }))
   try {
@@ -2231,7 +2258,7 @@ checkS('SNB-04 Bark: 传输错误（无 response）必须逐设备点名且不�
 })
 
 checkS('SNB-05 Bark: catch 分支必须留下逐设备根因（比 SN-04 下钻一层）', async () => {
-  const restore = isolateChannel2({ BARK_PUSH: 'dev_snb05' })
+  const restore = isolateChannel({ BARK_PUSH: 'dev_snb05' })
   const log1 = captureLogs()
   const got1 = mockTransportPromiseOnly(() => ({ body: brokenBody() }))
   try {
@@ -2255,7 +2282,7 @@ checkS('SNB-08 Bark: 三行日志逐字 + 端点一律脱敏（query/hash 绝不
     ['传输失败', () => ({ error: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) })]
   ]
   for (const [label, spec] of scenarios) {
-    const restore = isolateChannel2({ BARK_PUSH: 'https://api.day.app/DEVI9999' })
+    const restore = isolateChannel({ BARK_PUSH: 'https://api.day.app/DEVI9999' })
     const log1 = captureLogs()
     const got1 = mockTransport(spec)
     try {
@@ -2268,7 +2295,7 @@ checkS('SNB-08 Bark: 三行日志逐字 + 端点一律脱敏（query/hash 绝不
   }
   // query/hash 形态：maskUrl 只保留协议+host+脱敏路径，query 与 hash 整段丢弃（防密钥随日志外泄）
   {
-    const restore = isolateChannel2({ BARK_PUSH: 'https://api.day.app/DevKey1234?auth=SECRETQUERY#frag' })
+    const restore = isolateChannel({ BARK_PUSH: 'https://api.day.app/DevKey1234?auth=SECRETQUERY#frag' })
     const log1 = captureLogs()
     const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 500, message: 'bad' }) }))
     try {
@@ -2281,6 +2308,51 @@ checkS('SNB-08 Bark: 三行日志逐字 + 端点一律脱敏（query/hash 绝不
   }
 })
 
+// --- SNB-09：isCode 的字符串业务码侧（slim:188）——评审实测的漏网变异体 ---
+// 原先登记「已被 SNA-10（wxpusher '1001'）杀掉」是**错的**：实测把 :188 退化成
+// `return value === expected`，pure / utils / failure_policy / pusher / bodylimit / http 六个单元档
+// 全部 exit 0（SNA-10 的字符串 '1001' 走的是 wxPusherRateLimited 自己的 `err.code === '1001'`，
+// 根本不经过 isCode）；唯一能杀它的 test_notify.js:1423 是 integration，被 tap-shim.js:111 挡在
+// 变异集外 ⇒ 该变异体在 TAP 档与 command 档都存活。这条补上真正的击杀点。
+checkS('SNB-09 Bark/企业微信: 业务码序列化成字符串时必须照样判成功（isCode 的 String 侧）', async () => {
+  const forms = [
+    ['bark', { BARK_PUSH: 'dev_snb09' }, () => ({ body: JSON.stringify({ code: '200' }) }), 'bark'],
+    ['企业微信', { QYWX_KEY: 'qykey09' }, () => ({ body: JSON.stringify({ errcode: '0', errmsg: 'ok' }) }), '企业微信']
+  ]
+  for (const [label, cfg, respond, channel] of forms) {
+    const restore = isolateChannel(cfg)
+    const log1 = captureLogs()
+    const got1 = mockTransport(respond)
+    try {
+      const res = await sendNotify('字符串业务码-' + label, '正文')
+      assert.deepStrictEqual(res.successfulChannels, [channel],
+        `${label} 的业务码是字符串时必须照样判成功（只认数字侧就会把已送达的消息当失败重推）`)
+      assert.strictEqual(res.failures.length, 0, `${label} 字符串业务码不得记失败`)
+    } finally { log1.restore(); got1.restore(); restore() }
+  }
+})
+
+// --- SN-25：企业微信 key 的参数编码（评审实测的第二处漏网）---
+// 实测把 URL 模板里的 `encodeURIComponent(String(QYWX_KEY || ''))` 换成裸拼接，全套件无人变红。
+// 判错的后果是请求面而非文案面：key 里的 `&`/`#`/`=` 会被当成 query 分隔符，
+// 轻则 webhook 截断成「发给了另一个 key」，重则用户配的脏 key 直接把 query 拼坏而无人报警。
+checkS('SN-25 企业微信: QYWX_KEY 含 query 特殊字符时必须逐字符百分号编码（不得拼出可截断的 key）', async () => {
+  const dirty = 'qy&key=x#1'
+  const restore = isolateChannel({ QYWX_KEY: dirty })
+  const log1 = captureLogs()
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ errcode: 0 }) }))
+  try {
+    const res = await sendNotify('脏 key 编码', '正文')
+    assert.deepStrictEqual(res.successfulChannels, ['企业微信'], '脏 key 不得影响发送判定')
+    const url = got1.capture[0].url
+    assert.ok(url.endsWith('key=' + encodeURIComponent(dirty)),
+      `key 必须整体百分号编码，实际 URL: ${url}`)
+    assert.ok(!url.includes('qy&key=x'), '原始 & 不得留在 query 里（会被当参数分隔符）')
+    assert.ok(!url.slice(url.indexOf('?')).includes('#'), '原始 # 不得留在 query 里（会被当 fragment 起点截断）')
+    assert.strictEqual(url.split('?').length, 2, `URL 只能有一个 query 段，实际: ${url}`)
+  } finally { log1.restore(); got1.restore(); restore() }
+})
+
 // 登记（本簇**不写**考题的等价/不可达变异体，实测所有候选都杀不掉）：
 // · :613 `if (!BARK_PUSH)` 与 :621 `deviceKeys.length === 0`（4 个变异体）——经 sendNotify 不可达：
 //   :1521 的 delimitedNonEmpty 与 :620 的 filter 是同一谓词，空列表永远走不到通道内的早退守卫。
@@ -2288,4 +2360,14 @@ checkS('SNB-08 Bark: 三行日志逐字 + 端点一律脱敏（query/hash 绝不
 //   ⇒ 等价变异体；别造「catch 自己再抛」的演员场景（实测异常会冒出传输回调、进程级崩溃）。
 // · :26 requestExtras 的 `catch (e) { return {} }`（1 个）——`{...undefined}` ≡ `{}`，无靶可杀。
 // · :181 failures.filter(Boolean) ——外层 :1624 还有一份 filter(Boolean)，双层遮蔽，公开行为不可观测。
-// · :188 isCode 的字符串业务码侧 ——已被 SNA-10（wxpusher '1001'）杀掉，重复击杀不再补。
+// · :569 Server酱 1024 的**数字侧**判定（`rawErrno === 1024`）——删掉后数字 1024 仍经兜底
+//   `rawErrno` 得到 1024 ⇒ 语义不变，是等价变异体（评审实测：删数字侧全套件绿；删字符串侧 SN-03 红，
+//   因为字符串 '1024' 过不了 `errno === 1024` 的严格比较）。字符串侧必须留，数字侧删了也不可疑。
+// · :188 isCode 的字符串业务码侧 ——**原判「已被 SNA-10 杀掉」是错的**（评审实测：退化 :188 后
+//   pure/utils/failure_policy/pusher/bodylimit/http 六个单元档全绿；SNA-10 的字符串 '1001' 走
+//   wxPusherRateLimited 自己的判据，不经 isCode；唯一击杀点在 integration 的 test_notify.js:1423，
+//   被 tap-shim.js:111 挡在变异集外）⇒ 已由 SNB-09 补成真正的单元档击杀。
+// 编号说明（避免后人以为漏抄）：SN-19 缺号——原计划考 :1591 的「通道任务同步抛」catch，实测
+// 所有通道都以 `return new Promise(executor)` 开头、executor 抛错被 Promise 构造器转成 rejection
+// ⇒ 该支不可达，考点并入 SN-18（改测异步 rejection 下的在飞清单摘除）。SNB-07 缺号——与 SNB-08
+// 同属「成功/异常/失败三条日志模板」考点，合并进 SNB-08 的三个场景，不重复列号。
