@@ -34,7 +34,7 @@ const SUITES = [
   { name: '格式化器', file: 'test_formatter.js', desc: 'xbk_formatter.js HTML→Markdown转换+模板替换+内部方法边界（提升变异分数）' },
   { name: '规则引擎扩展', file: 'test_rules_extended.js', desc: 'xbk_rules.js compileRules/matchesCompiled/checkTimeCompiled/validateConfig 边界（提升变异分数）' },
   { name: '消息存储纯函数', file: 'test_message_store_utils.js', desc: 'xbk_message_store.js getFilePath/getFileName 路径安全与URL提取边界（提升变异分数）' },
-  { name: '通知纯函数', file: 'test_sendnotify_pure.js', desc: 'xbk_sendNotify_slim.js maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags 纯函数边界（提升变异分数）' },
+  { name: '通知纯函数', file: 'test_sendnotify_pure.js', desc: 'xbk_sendNotify_slim.js 纯函数边界 + 九通道响应判定/传输错误/结构异常/限频窗口与退避/profile 归因（提升变异分数）' },
   { name: '推送响应体上限', file: 'test_sendnotify_bodylimit.js', desc: 'xbk_sendNotify_slim.js $.post 流式响应体上限（EBODYLIMIT/销毁流）+ 无 stream 替身回退 promise 路径 + 官方 got 回环端到端' },
   { name: '单元测试', file: 'test_filter.js', desc: '主代码导出函数逐函数逻辑' },
   { name: '变异报告读取', file: 'test_mutation_json.js', desc: '超大 mutation.json 剥离 statusReason 解析（v3.264）' },
