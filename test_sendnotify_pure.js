@@ -1624,12 +1624,12 @@ checkS('一言: 一言失败不阻塞推送（catch 跳过，主通道照发）'
 // v4 分支补强簇（g12）：通道响应判定 / 传输错误 / 结构异常 / 汇总归因
 // 依据 c8 全语料口径实测的「未达分支」清单（xbk_sendNotify_slim.js 68 条）逐条判定可达性后落地。
 // 不可达的（配置谓词与 sendNotify 的 configuredFlags 同源 ⇒「未配置就返回」的内部守卫永远走不到；
-// `$.get` 全仓无调用方）不写断言，单独在 PR 说明里交底——不为凑覆盖率伪造演员。
+// `$.get` 全仓无调用方 ⇒ 已随 v3.279 删除）不写断言，单独在 PR 说明里交底——不为凑覆盖率伪造演员。
 //
 // 夹具扩展：可编程假收件台。respond 返回 spec，两态——`spec.error`＝传输错误，否则＝回包体
 // （`spec.body`，流式路径按 JSON 解析失败时保留原样字符串，所以 HTML 响应体也演得出）。
 // 桩必须打在 got.stream.post|get 上：本机 got.stream 存在 ⇒ canStreamRequest() 恒真 ⇒
-// `$.post` 生产真实走 streamRequest(:354)，got.post(:405) 只是无 stream 时的回退。
+// `$.post` 生产真实走 streamRequest(:354)，got.post(:407) 只是无 stream 时的回退。
 // 两种桩都装：stream 走生产真实路径，promise 桩保证万一 got 形态变化用例仍能收敛而非触网。
 // ============================================================
 
@@ -1693,7 +1693,8 @@ function brokenBody () {
   return { get code () { throw new Error('业务码字段不可读') }, get message () { throw new Error('文案字段不可读') } }
 }
 
-// 只装 promise 桩、把 got.stream 摘掉 ⇒ canStreamRequest()(:350) 为假 ⇒ 生产走 :405/:429 回退分支。
+// 只装 promise 桩、把 got.stream 摘掉 ⇒ canStreamRequest()(:350) 为假 ⇒ 生产走 :407 的 promise 回退分支
+// （:405-421 那一支；`$.get` 的对称分支已随 v3.279 删除，故此处不再有成对的两个回退分支）。
 // restore 必须把 stream 原样放回，否则同进程后续套件全部改走 promise 路径（覆盖口径被悄悄换掉）。
 function mockTransportPromiseOnly (respond) {
   const captured = []
@@ -1710,7 +1711,7 @@ function mockTransportPromiseOnly (respond) {
   return { capture: captured, restore: () => { Object.assign(gotModule, orig) } }
 }
 
-// --- SN-01：Server酱 title 32 字符上限 + 末尾高代理退一位（:540）---
+// --- SN-01：Server酱 title 32 字符上限 + 末尾高代理退一位（:518）---
 // 变异对照：删掉 `if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1)` ⇒ 截断留下孤立高代理
 // ⇒ encodeURIComponent 抛 URIError ⇒ 本用例（断言通道成功）当场红。
 checkS('SN-01 Server酱: 标题>32 且第 32 位落在代理对中间时必须退位（不得留孤立高代理）', async () => {
@@ -1728,7 +1729,7 @@ checkS('SN-01 Server酱: 标题>32 且第 32 位落在代理对中间时必须�
   } finally { got1.restore(); restore() }
 })
 
-// --- SN-02：Server酱·Turbo 版把 errno 嵌在 data 里（:566 嵌套回退）---
+// --- SN-02：Server酱·Turbo 版把 errno 嵌在 data 里（:544 嵌套回退）---
 checkS('SN-02 Server酱: errno 只在 data.data 内层时也必须按成功判（Turbo 响应形状）', async () => {
   const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ data: { errno: 0 }, errmsg: 'ok' }) }))
@@ -1740,7 +1741,7 @@ checkS('SN-02 Server酱: errno 只在 data.data 内层时也必须按成功判�
   } finally { log1.restore(); got1.restore(); restore() }
 })
 
-// --- SN-03：1024=一分钟内重复内容，消息已送达 ⇒ 视为成功不 reject（:569 数字/字符串两侧 + :572 分支）---
+// --- SN-03：1024=一分钟内重复内容，消息已送达 ⇒ 视为成功不 reject（:547 数字/字符串两侧 + :550 分支）---
 // 判错的后果不对称：把 1024 当失败 ⇒ 不写缓存 ⇒ 每轮重推、有效设备被反复轰炸。
 checkS('SN-03 Server酱: errno 1024（数字与字符串两种序列化）视为已送达，不得 reject', async () => {
   for (const raw of [1024, '1024']) {
@@ -1755,8 +1756,8 @@ checkS('SN-03 Server酱: errno 1024（数字与字符串两种序列化）视为
   }
 })
 
-// --- SN-04 / SN-06：业务体字段读取即抛必须按通道失败（bark catch :678 / pushme catch :756）---
-// 走 promise 回退路径才保得住 getter（见上方 brokenBody 注释），顺带覆盖 :405-421 的回退分支。
+// --- SN-04 / SN-06：业务体字段读取即抛必须按通道失败（bark catch :656 / pushme catch :734）---
+// 走 promise 回退路径才保得住 getter（见上方 brokenBody 注释），顺带覆盖 :407-423 的回退分支。
 // 判错的后果是虚假成功：主流程写缓存 ⇒ 消息永久丢失（v3.180 那起 P1 的同族）。
 for (const [label, cfg, key] of [['SN-04 Bark', { BARK_PUSH: 'dev1' }, 'bark'], ['SN-06 PushMe', { PUSHME_KEY: 'pmkey1' }, 'pushme']]) {
   checkS(`${label}: 响应业务体字段抛异常时不得被记成成功（catch 必须按通道失败）`, async () => {
@@ -1782,7 +1783,7 @@ for (const [label, cfg, key] of [['SN-04 Bark', { BARK_PUSH: 'dev1' }, 'bark'], 
   })
 }
 
-// --- SN-05：PushMe 业务码取值优先级（:748 data.code 缺省时回退 error_code / errno）---
+// --- SN-05：PushMe 业务码取值优先级（:726 data.code 缺省时回退 error_code / errno）---
 // 层级契约：单 key 全失败时外层是 aggregateChannelError（code=CHANNEL_PUSHME_FAILED），
 // 逐 key 的 channelError（带 providerCode）在它的 failures 里——读错层就看不到业务码。
 function unwrapChannelFailures (threw, channel) {
@@ -1813,7 +1814,7 @@ checkS('SN-05 PushMe: 响应无 code 时 providerCode 取 error_code（再退 er
   } finally { got2.restore(); restore2() }
 })
 
-// --- SN-07 / SN-08：企业微信端点可覆盖 + desp 为空时正文只取标题（:782 / :789）---
+// --- SN-07 / SN-08：企业微信端点可覆盖 + desp 为空时正文只取标题（:760 / :767）---
 checkS('SN-07 企业微信: QYWX_ORIGIN 自定义端点必须去尾斜杠拼接（不得出现 //cgi-bin）', async () => {
   const restore = isolateChannel({ QYWX_KEY: 'qykey', QYWX_ORIGIN: 'https://qy.example.com///' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ errcode: 0, errmsg: 'ok' }) }))
@@ -1837,10 +1838,10 @@ checkS('SN-08 企业微信: desp 为空时 content 只取标题（不拼出「�
   } finally { got1.restore(); restore() }
 })
 
-// --- SN-09：WX_pusher_channels 是不可序列化形状（循环引用）⇒ 缓存键退位、解析继续（:868）---
+// --- SN-09：WX_pusher_channels 是不可序列化形状（循环引用）⇒ 缓存键退位、解析继续（:846）---
 checkS('SN-09 WxPusher: 多应用配置循环引用不得抛穿，必须回退旧字段并显形告警', async () => {
   const circular = { self: null }
-  circular.self = circular // 对象形状（不是数组）⇒ 既撞 :868 的不可序列化 catch，也撞「不是数组」告警
+  circular.self = circular // 对象形状（不是数组）⇒ 既撞 :846 的不可序列化 catch，也撞「不是数组」告警
   const restore = isolateChannel({ WX_pusher_appToken: 'APT_fake', WX_pusher_topicIds: 'T1', WX_pusher_channels: circular })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 1000 }) }))
   const log1 = captureLogs()
@@ -1851,7 +1852,7 @@ checkS('SN-09 WxPusher: 多应用配置循环引用不得抛穿，必须回退�
   } finally { log1.restore(); got1.restore(); restore() }
 })
 
-// --- SN-10：配置值「已配置」谓词的 String() 抛错兜底（:933 / :937）---
+// --- SN-10：配置值「已配置」谓词的 String() 抛错兜底（:911 / :915）---
 // 这条直接钉住注释里那起 P1：自检把脏值算成「已配置」而主流程 NO_CHANNEL_CONFIG ⇒ 全程漏推且零告警。
 // 导出的 configuredChannelCount / configuredChannelNames 与 sendNotify 共用同一对谓词 ⇒ 可直调、进程内。
 checkS('SN-10 通道自检: 配置值 String() 抛异常必须判「未配置」且不抛穿（自检与主流程同口径）', () => {
@@ -1863,7 +1864,7 @@ checkS('SN-10 通道自检: 配置值 String() 抛异常必须判「未配置」
   } finally { restore() }
 })
 
-// --- SN-22：息知 providerCode 回退 errcode（:1223）---
+// --- SN-22：息知 providerCode 回退 errcode（:1201）---
 checkS('SN-22 息知: 响应无 code 时 providerCode 取 errcode（业务码不得丢）', async () => {
   const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ errcode: 500, msg: '内部错误' }) }))
@@ -1875,7 +1876,7 @@ checkS('SN-22 息知: 响应无 code 时 providerCode 取 errcode（业务码不
   } finally { got1.restore(); restore() }
 })
 
-// --- SN-23：Telegram 正文为空时只发标题（:1319 三元另一侧）---
+// --- SN-23：Telegram 正文为空时只发标题（:1297 三元另一侧）---
 checkS('SN-23 Telegram: desp 为空时 text 不含分隔符残尾', async () => {
   const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
   const got1 = mockTransport(() => ({ body: JSON.stringify({ ok: true }) }))
@@ -1885,7 +1886,7 @@ checkS('SN-23 Telegram: desp 为空时 text 不含分隔符残尾', async () => 
   } finally { got1.restore(); restore() }
 })
 
-// --- SN-24：Push+「一对一/一对多」文案随 PUSH_PLUS_USER 变化（:485/:495/:500 三处日志三元）---
+// --- SN-24：Push+「一对一/一对多」文案随 PUSH_PLUS_USER 变化（:463/:473/:478 三处日志三元）---
 checkS('SN-24 Push+: PUSH_PLUS_USER 存在时三处日志都必须是「一对多」，缺省时都是「一对一」', async () => {
   const cases = [
     ['成功', () => ({ body: JSON.stringify({ code: 200 }) }), /完成/],
@@ -2075,9 +2076,9 @@ checkS('SN-17 WxPusher: 重复应用配置在限频后必须停止空转并保�
 })
 
 // SN-18：通道内部抛异常时的「部分成功 + 在飞清单摘除」契约。
-// 实测更正（写这条之前我以为能测 :1591 的同步抛 catch）：所有通道函数都以 `return new Promise(executor)` 开头，
+// 实测更正（写这条之前我以为能测 :1569 的同步抛 catch）：所有通道函数都以 `return new Promise(executor)` 开头，
 // 而 executor 里的抛错被 Promise 构造器**转成 rejection**，`task()` 根本不会同步抛出
-// ⇒ :1591 的 `try { running = task() } catch` 在当前调用图里不可达（已列入交底清单，不为它编断言）。
+// ⇒ :1569 的 `try { running = task() } catch` 在当前调用图里不可达（已列入交底清单，不为它编断言）。
 // 这条改测真语义：某通道自身异常只让该通道失败，其他通道照常成功，且失败通道必须从在飞清单摘掉
 // （留着会让 Pusher 的 10s 超时归因把已结算通道也算成 PUSH_TIMEOUT）。
 checkS('SN-18 sendNotify: 通道自身抛异常只算该通道失败，不得影响其他通道，且必须从在飞清单摘掉', async () => {
@@ -2135,7 +2136,7 @@ checkS('SN-21 入口清洗: text/desp 为 undefined/null 或 String() 抛异常�
 })
 
 // ===== SNB 簇（g12 第三批）：Bark 通道剩余存活变异体 =====
-// 依据：子代理用仓库自带 @stryker-mutator/instrumenter **真实枚举** barkNotify(:601-696) 的 80 个变异体
+// 依据：子代理用仓库自带 @stryker-mutator/instrumenter **真实枚举** barkNotify(:579-674) 的 80 个变异体
 // 与 requestExtras(:25-27) 的 7 个，逐个喂给已提交的四套件 ⇒ barkNotify 32 个存活、requestExtras 6 个存活。
 // 本簇吃掉其中 7 组；杀不掉的等价/不可达变异体在文件末尾的登记注释里说明，不伪造断言。
 // 另：SN-04 的判据止于聚合层（实测把 catch 体清空后，finally 的 innerResolve({ok:false}) 仍让 SN-04 绿）
@@ -2224,7 +2225,7 @@ checkS('SNB-06 Bark: 调用方 AbortSignal 必须原样交给传输层；未传�
 checkS('SNB-03 Bark: 响应不是 JSON（代理回 HTML）时按业务失败，兜底文案逐字且不得把响应体塞进 message', async () => {
   const restore = isolateChannel({ BARK_PUSH: 'https://api.day.app/DevKey12345' })
   const log1 = captureLogs()
-  // 流式路径 JSON.parse 失败时保留原始字符串（:388-391 的刻意行为）⇒ data 是个 HTML 字符串
+  // 流式路径 JSON.parse 失败时保留原始字符串（:390-393 的刻意行为）⇒ data 是个 HTML 字符串
   const got1 = mockTransport(() => ({ body: '<html>Bad Gateway DevKey12345</html>' }))
   try {
     let threw = null
@@ -2354,20 +2355,20 @@ checkS('SN-25 企业微信: QYWX_KEY 含 query 特殊字符时必须逐字符百
 })
 
 // 登记（本簇**不写**考题的等价/不可达变异体，实测所有候选都杀不掉）：
-// · :613 `if (!BARK_PUSH)` 与 :621 `deviceKeys.length === 0`（4 个变异体）——经 sendNotify 不可达：
-//   :1521 的 delimitedNonEmpty 与 :620 的 filter 是同一谓词，空列表永远走不到通道内的早退守卫。
-// · :682/:683 finally 的 innerResolve({ok:false})（3 个）——所有路径都先结算，第二次 resolve 是 no-op
+// · :591 `if (!BARK_PUSH)` 与 :599 `deviceKeys.length === 0`（4 个变异体）——经 sendNotify 不可达：
+//   :1499 的 delimitedNonEmpty 与 :598 的 filter 是同一谓词，空列表永远走不到通道内的早退守卫。
+// · :660/:661 finally 的 innerResolve({ok:false})（3 个）——所有路径都先结算，第二次 resolve 是 no-op
 //   ⇒ 等价变异体；别造「catch 自己再抛」的演员场景（实测异常会冒出传输回调、进程级崩溃）。
 // · :26 requestExtras 的 `catch (e) { return {} }`（1 个）——`{...undefined}` ≡ `{}`，无靶可杀。
-// · :181 failures.filter(Boolean) ——外层 :1624 还有一份 filter(Boolean)，双层遮蔽，公开行为不可观测。
-// · :569 Server酱 1024 的**数字侧**判定（`rawErrno === 1024`）——删掉后数字 1024 仍经兜底
+// · :181 failures.filter(Boolean) ——外层 :1602 还有一份 filter(Boolean)，双层遮蔽，公开行为不可观测。
+// · :547 Server酱 1024 的**数字侧**判定（`rawErrno === 1024`）——删掉后数字 1024 仍经兜底
 //   `rawErrno` 得到 1024 ⇒ 语义不变，是等价变异体（评审实测：删数字侧全套件绿；删字符串侧 SN-03 红，
 //   因为字符串 '1024' 过不了 `errno === 1024` 的严格比较）。字符串侧必须留，数字侧删了也不可疑。
 // · :188 isCode 的字符串业务码侧 ——**原判「已被 SNA-10 杀掉」是错的**（评审实测：退化 :188 后
 //   pure/utils/failure_policy/pusher/bodylimit/http 六个单元档全绿；SNA-10 的字符串 '1001' 走
 //   wxPusherRateLimited 自己的判据，不经 isCode；唯一击杀点在 integration 的 test_notify.js:1423，
 //   被 tap-shim.js:111 挡在变异集外）⇒ 已由 SNB-09 补成真正的单元档击杀。
-// 编号说明（避免后人以为漏抄）：SN-19 缺号——原计划考 :1591 的「通道任务同步抛」catch，实测
+// 编号说明（避免后人以为漏抄）：SN-19 缺号——原计划考 :1569 的「通道任务同步抛」catch，实测
 // 所有通道都以 `return new Promise(executor)` 开头、executor 抛错被 Promise 构造器转成 rejection
 // ⇒ 该支不可达，考点并入 SN-18（改测异步 rejection 下的在飞清单摘除）。SNB-07 缺号——与 SNB-08
 // 同属「成功/异常/失败三条日志模板」考点，合并进 SNB-08 的三个场景，不重复列号。
