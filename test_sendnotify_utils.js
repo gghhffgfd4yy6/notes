@@ -718,5 +718,280 @@ const cfg = slim.push_config
     }
   }
 
+  // ============================================================
+  // ===== 补测 SNA 簇（g12 第二批，按本机探针口径修正过形态）=====
+  // 覆盖：失败聚合形状 / channelError 的 statusCode 来源优先级 / 一设备成功即通道成功 /
+  //       多通道失败摘要截断与逐字拼接 / WxPusher 退避算术与时间窗边界 / abort 监听器卫生 /
+  //       限频业务码的数字与字符串两种序列化。
+  //
+  // 形态纪律（探针实测，别演成生产不可能出现的形状）：
+  //   · 桩必须装在 got.stream.post|get —— 本机 got 带 stream ⇒ canStreamRequest(:350) 恒真 ⇒
+  //     `$.post` 真实走 streamRequest(:354)，**根本不碰 got.post**。只桩 got.post/get 会真触网。
+  //   · 非 2xx 在真实 got 下是 **error 事件**（err.response.statusCode），不是「response(4xx)+data」。
+  //     所以业务失败一律演成 HTTP 200 + 业务码（真实代理确实这么回），传输失败一律演成 error 事件。
+  //   · `$.logErr` 在加载期就绑定 console.log(:447)，事后桩拦不到 ⇒ 本簇只断 err.failures 形状，
+  //     不拿日志捕获当 catch 分支的判据。
+  // 计时纪律：一律「记账 setTimeout 的延迟入参」，零墙钟阈值（PERF_MS 沙箱下不会假红）。
+  {
+    const gotMod = require('got')
+    const { EventEmitter: SNAEE } = require('node:events')
+    const savedSna = {}
+    for (const k of Object.keys(cfg)) savedSna[k] = cfg[k]
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    const origStream = { post: gotMod.stream && gotMod.stream.post, get: gotMod.stream && gotMod.stream.get }
+    let snaHandler = () => ({})
+    let snaCalls = []
+    const snaMake = (url, opts) => {
+      const spec = snaHandler(String(url), opts) || {}
+      snaCalls.push({ url: String(url), opts })
+      const em = new SNAEE()
+      em.timings = spec.timings || { phases: {} }
+      em.destroy = () => {} // 超限分支会调它；缺了会在 emit 里同步抛 TypeError 把进程干掉
+      setImmediate(() => {
+        if (spec.error !== undefined) { em.emit('error', spec.error); return }
+        em.emit('response', { statusCode: 200, headers: { 'content-type': 'application/json' }, ...spec.response })
+        const body = spec.body === undefined ? '{}' : (typeof spec.body === 'string' ? spec.body : JSON.stringify(spec.body))
+        em.emit('data', Buffer.from(body))
+        em.emit('end')
+      })
+      return em
+    }
+    gotMod.stream.post = snaMake
+    gotMod.stream.get = snaMake
+    // 记账型「假 AbortSignal」：真实 signal 只保证 aborted/addEventListener/removeEventListener 三件事，
+    // 这里额外记录注册与摘除，用来观测 :1000-1007 的 cleanup 卫生（真 AbortSignal 读不到内部监听器）。
+    const duckSignal = () => {
+      const rec = { added: [], onceFlags: [], removed: [], aborted: false }
+      return {
+        rec,
+        get aborted () { return rec.aborted },
+        addEventListener (name, fn, opts) { rec.added.push(name); rec.onceFlags.push(opts && opts.once === true) },
+        removeEventListener (name, fn) { rec.removed.push([name, fn]) },
+        fire () { rec.aborted = true }
+      }
+    }
+    const runExpectThrow = async (text, params) => {
+      let err = null
+      try { await slim.sendNotify(text, '正文', params) } catch (e) { err = e }
+      assert.ok(err, `${text} 必须上抛`)
+      return err
+    }
+
+    try {
+      // --- SNA-01：Bark 全部设备失败的聚合形状（:693 → aggregateChannelError :179-183）---
+      clearCfg(); snaCalls = []
+      cfg.BARK_PUSH = 'https://api.day.app/snaDevA#https://api.day.app/snaDevB'
+      snaHandler = () => ({ body: { code: 500, message: 'device key invalid' } }) // HTTP 200 + 业务失败码（真实形态）
+      let err = await runExpectThrow('SNA-01')
+      assert.strictEqual(err.code, 'ALL_CHANNELS_FAILED', '唯一通道全设备失败必须整体上抛')
+      assert.strictEqual(err.failures.length, 1, '只有 bark 一个通道参与')
+      const agg = err.failures[0]
+      assert.strictEqual(agg.channel, 'bark', '聚合失败必须点名 bark')
+      assert.strictEqual(agg.message, 'Bark 全部设备发送失败', '聚合文案必须逐字')
+      assert.strictEqual(agg.code, 'CHANNEL_BARK_FAILED', '聚合错误码 = CHANNEL_ + 通道名大写 + _FAILED')
+      assert.strictEqual(agg.failures.length, 2, '两个设备必须各留一条失败详情（filter/map 形态改坏会少项）')
+      assert.strictEqual(agg.failures[0].statusCode, 200, '逐设备失败必须带 HTTP 状态码（来自 response 形参）')
+      assert.strictEqual(agg.failures[0].providerCode, 500, '逐设备失败必须带业务码')
+      assert.strictEqual('statusCode' in agg, false, '聚合层自己没有响应，不得凭空造 statusCode')
+      console.log('✅ SNA-01 Bark 全设备失败：CHANNEL_BARK_FAILED + 逐设备 statusCode/providerCode 留痕')
+
+      // --- SNA-02：PushMe 全 key 失败聚合（:771，part2 段独立一行）+ 纯文本响应不得造 providerCode ---
+      clearCfg(); snaCalls = []
+      cfg.PUSHME_KEY = 'snaK1#snaK2#snaK3'
+      snaHandler = () => ({ body: 'error' }) // PushMe 的成功判据是 body === 'success'
+      err = await runExpectThrow('SNA-02')
+      const pAgg = err.failures[0]
+      assert.strictEqual(pAgg.code, 'CHANNEL_PUSHME_FAILED', 'part2 段的 PushMe 聚合码必须同样由通道名大写拼成')
+      assert.strictEqual(pAgg.message, 'PushMe 全部 key 发送失败', 'PushMe 聚合文案必须逐字')
+      assert.strictEqual(pAgg.failures.length, 3, '三个 key 必须各留一条失败')
+      assert.strictEqual('providerCode' in pAgg.failures[0], false, '响应是纯文本时不得凭空造 providerCode 键')
+      console.log('✅ SNA-02 PushMe 全 key 失败：CHANNEL_PUSHME_FAILED + 三 key 留痕 + 不造空键')
+
+      // --- SNA-03：channelError 的 statusCode 来源优先级（:167-173）---
+      // 传输错误形：streamRequest 的 error 分支传 resp=null，故只能从 err.response.statusCode 取（真实 got 的形状）。
+      clearCfg(); snaCalls = []
+      cfg.BARK_PUSH = 'https://api.day.app/snaDevC'
+      const transportErr = Object.assign(new Error('connect ECONNRESET'), { code: 'ECONNRESET', response: { statusCode: 502 } })
+      snaHandler = () => ({ error: transportErr })
+      err = await runExpectThrow('SNA-03 传输错误形')
+      const inner = err.failures[0].failures[0]
+      assert.strictEqual(inner.statusCode, 502, 'resp 形参为 null 时必须退到 err.response.statusCode')
+      assert.strictEqual(inner.code, 'ECONNRESET', '传输错误码必须原样透传')
+      // 合成对照：err.statusCode 与 err.response.statusCode 同时存在时**必须取后者**。
+      // 诚实说明：真实 got 不同时给这两个字段，这一子形钉的是「取值优先级本身」，不是 got 的形态。
+      clearCfg(); snaCalls = []
+      cfg.BARK_PUSH = 'https://api.day.app/snaDevD'
+      const bothErr = Object.assign(new Error('bad gateway'), { code: 'ERR_NON_2XX_3XX_RESPONSE', statusCode: 504, response: { statusCode: 503 } })
+      snaHandler = () => ({ error: bothErr })
+      err = await runExpectThrow('SNA-03 优先级对照')
+      const inner2 = err.failures[0].failures[0]
+      assert.strictEqual(inner2.statusCode, 503, 'err.response.statusCode 必须优先于 err.statusCode（三元顺序对调在此变红）')
+      console.log('✅ SNA-03 channelError：response 形参 > err.response.statusCode > err.statusCode')
+
+      // --- SNA-04：一设备成功即通道成功（:692 results.some）——自 test_notify.js:248 移植 ---
+      // 移植理由：那条集成用例的用例体只有「await 不抛」、零断言；且 test_notify.js 标 integration:true，
+      // 被 scripts/tap-shim.js:111 排除在变异测试集外 ⇒ `some→every`、`r && r.ok→r.ok` 对变异门禁完全隐形。
+      clearCfg(); snaCalls = []
+      cfg.BARK_PUSH = 'https://api.day.app/snaOk#https://api.day.app/snaBad'
+      snaHandler = (url) => ({ body: url.includes('snaOk') ? { code: 200 } : { code: 500, message: 'bad' } })
+      let res = null
+      let threw = null
+      try { res = await slim.sendNotify('SNA-04', '正文') } catch (e) { threw = e }
+      assert.ok(!threw, `一成一败必须算通道成功（v3.166），实际 ${threw && threw.message}`)
+      assert.deepStrictEqual(res.successfulChannels, ['bark'], '成功通道应为 bark')
+      assert.deepStrictEqual(res.failures, [], '部分成功不得记失败')
+      assert.strictEqual(snaCalls.length, 2, '两个设备各发一次，不得重试失败设备（改成失败即重试会变 3）')
+      console.log('✅ SNA-04 Bark 一成一败：通道判成功且不重试失败设备（自集成档移植进变异集）')
+
+      // --- SNA-05：多通道失败摘要的 200 字符截断与「; 」逐字拼接（:1624-1628）---
+      clearCfg(); snaCalls = []
+      cfg.WX_XIZHI_KEY = 'https://xizhi.fake/sna05'
+      cfg.DEER_KEY = 'PDK_sna05'
+      snaHandler = (url) => url.includes('xizhi')
+        ? ({ body: { code: 500, msg: 'XZFAIL' + 'q'.repeat(400) } })
+        : ({ body: { content: { result: [] } } })
+      err = await runExpectThrow('SNA-05 长摘要')
+      assert.ok(err.message.startsWith('所有推送通道失败: '), '摘要前缀必须逐字')
+      assert.strictEqual(err.message.length, '所有推送通道失败: '.length + 200, `摘要必须截到 200 字符，实际 ${err.message.length}`)
+      clearCfg(); snaCalls = []
+      cfg.WX_XIZHI_KEY = 'https://xizhi.fake/sna05b'
+      cfg.DEER_KEY = 'PDK_sna05b'
+      snaHandler = (url) => url.includes('xizhi')
+        ? ({ body: { code: 500, msg: 'A_TXT' } })
+        : ({ body: { content: { result: [] } } })
+      err = await runExpectThrow('SNA-05 短摘要')
+      assert.strictEqual(err.message, '所有推送通道失败: A_TXT; PushDeer 发送失败', '多失败必须用「; 」按通道顺序拼接')
+      assert.deepStrictEqual(err.failures.map(f => f.channel), ['息知', 'pushdeer'], 'failures 顺序必须与 channelTasks 一致')
+      console.log('✅ SNA-05 失败摘要：200 字符上限 + 「; 」逐字拼接 + 通道注册顺序')
+
+      // --- SNA-06/07/08：WxPusher 退避等待的算术、取消时机与监听器卫生（:1000-1023 / :1047）---
+      // 假时钟冻结 ⇒ 19 次成功把窗口打满；第 20 次的等待用「记账 setTimeout 延迟入参」观测，
+      // 再决定在哪个时刻取消：调度时即已取消 ⇒ 命中 :1019 真支；派发后才取消 ⇒ 观测监听器摘除。
+      const realNow = Date.now
+      const realST = global.setTimeout
+      const fillWindow = async (token) => {
+        clearCfg(); snaCalls = []
+        cfg.WX_pusher_appToken = token
+        cfg.WX_pusher_topicIds = 'T1'
+        snaHandler = () => ({ body: { code: 1000 } })
+        for (let i = 0; i < 19; i++) await slim.sendNotify('预填-' + i, '正文')
+        assert.strictEqual(snaCalls.length, 19, `窗口内 19 次必须全部发出，实际 ${snaCalls.length}`)
+      }
+      // (a) 时钟冻结 ⇒ 裸值 = 10000+10，只钉退避算术与取消语义。
+      //     ⚠️ 不宣称覆盖 :1019 的「进入等待时已 aborted」真支：生产在同一个同步段里读两次
+      //     `signal.aborted`（循环顶 :1027 与 :1018），中间没有任何 await，真实单线程运行时
+      //     不可能在这两步之间被取消 ⇒ 该支是不可达的防御代码，已登记，不靠注入合成时序去「覆盖」它。
+      {
+        const t0 = realNow()
+        const waits = []
+        const sig = duckSignal()
+        Date.now = () => t0
+        global.setTimeout = (fn, ms, ...rest) => {
+          if (ms >= 20) { waits.push(ms); setImmediate(() => sig.fire()); return realST(fn, 0, ...rest) }
+          return realST(fn, ms, ...rest)
+        }
+        try {
+          await fillWindow('APT_sna06a')
+          snaCalls = []
+          err = await runExpectThrow('SNA-06 退避中被取消', { signal: sig })
+          assert.deepStrictEqual(waits, [10010], '退避延迟必须等于 nextRelease-now+10=10010（Math.max→Math.min、+10→-10 都在此变红）')
+          assert.strictEqual(err.failures[0].code, 'ABORT_ERR', '取消必须按 ABORT_ERR 上抛')
+          assert.strictEqual(err.failures[0].message, 'WxPusher 限频等待已取消', '取消文案必须逐字')
+          assert.strictEqual(snaCalls.length, 0, '取消后一次都不发')
+        } finally { global.setTimeout = realST; Date.now = realNow }
+        console.log('✅ SNA-06/07 退避算术 10010 + 取消按 ABORT_ERR 上抛且零请求')
+      }
+      // (b) 派发之后才取消 ⇒ 监听器必须注册（once）且结算时摘掉同一个函数引用
+      {
+        const t0 = realNow()
+        const waits = []
+        const sig = duckSignal()
+        Date.now = () => t0
+        global.setTimeout = (fn, ms, ...rest) => {
+          if (ms >= 20) { waits.push(ms); setImmediate(() => sig.fire()); return realST(fn, 0, ...rest) }
+          return realST(fn, ms, ...rest)
+        }
+        try {
+          await fillWindow('APT_sna08b')
+          snaCalls = []
+          err = await runExpectThrow('SNA-08 退避后取消', { signal: sig })
+          assert.deepStrictEqual(waits, [10010], '延迟入参仍必须是 10010')
+          assert.deepStrictEqual(sig.rec.added, ['abort'], '未取消时必须注册 abort 监听器')
+          assert.deepStrictEqual(sig.rec.onceFlags, [true], '必须以 { once: true } 注册（删掉该选项在此变红）')
+          assert.strictEqual(sig.rec.removed.length, 1, '结算后必须摘掉监听器（否则长跑进程逐个退避泄漏一个闭包）')
+          assert.strictEqual(sig.rec.removed[0][0], 'abort', '摘的必须是 abort 事件')
+          assert.strictEqual(typeof sig.rec.removed[0][1], 'function', '摘的必须是同一个函数引用')
+          assert.strictEqual(err.failures[0].code, 'ABORT_ERR', '取消最终仍按 ABORT_ERR 上抛')
+        } finally { global.setTimeout = realST; Date.now = realNow }
+        console.log('✅ SNA-08 abort 监听器卫生：once 注册、结算摘除、引用一致')
+      }
+      // (c)(d) 时间窗边界**必须成对**：恰好 10000ms ⇒ 零等待直接续发；差 1ms ⇒ 必须等待。
+      //        `<=`→`<` 只有 (c) 能杀，`<=`→`>=` 只有 (d) 能杀，单独落一条都会留死角。
+      {
+        const t0 = realNow()
+        Date.now = () => t0
+        try {
+          await fillWindow('APT_sna09c')
+          snaCalls = []
+          Date.now = () => t0 + 10000 // 命中 `timestamps[0] <= now - WINDOW` 的等号边界
+          snaHandler = () => ({ body: { code: 1000 } })
+          threw = null; res = null
+          try { res = await slim.sendNotify('SNA-09c 恰好过期', '正文') } catch (e) { threw = e }
+          assert.ok(!threw, `边界命中必须直接排到名额，实际 ${threw && threw.message}`)
+          assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '过期清理后第 20 次必须成功')
+          assert.strictEqual(snaCalls.length, 1, '必须真的发出第 20 次请求')
+        } finally { Date.now = realNow }
+        const t1 = realNow()
+        Date.now = () => t1
+        try {
+          await fillWindow('APT_sna09d')
+          snaCalls = []
+          Date.now = () => t1 + 9999 // 差 1ms 未过期 ⇒ 必须等待
+          const waits = []
+          const sig = duckSignal()
+          global.setTimeout = (fn, ms, ...rest) => {
+            if (ms >= 20) { waits.push(ms); setImmediate(() => sig.fire()); return realST(fn, 0, ...rest) }
+            return realST(fn, ms, ...rest)
+          }
+          try {
+            err = await runExpectThrow('SNA-09d 差 1ms 未过期', { signal: sig })
+            assert.deepStrictEqual(waits, [20], '未过期必须等待且夹到 20ms 下限（裸值 11；改成 Math.min 就变 11）')
+            assert.strictEqual(snaCalls.length, 0, `未过期不得发出第 20 次（误判成已过期会在此变 1），实际 ${snaCalls.length}`)
+            assert.strictEqual(err.failures[0].code, 'ABORT_ERR', '收尾用取消，不留真实 10s 定时器')
+          } finally { global.setTimeout = realST }
+        } finally { Date.now = realNow }
+        console.log('✅ SNA-09 时间窗边界成对：恰好过期即续发 / 差 1ms 必须等待并夹到 20')
+      }
+
+      // --- SNA-10：限频业务码的数字与字符串两种序列化 + 单应用限频即结束重试 ---
+      clearCfg(); snaCalls = []
+      cfg.WX_pusher_appToken = 'APT_sna10a'
+      cfg.WX_pusher_topicIds = 'T1'
+      snaHandler = () => ({ body: { code: 1001, msg: '速度太快' } })
+      err = await runExpectThrow('SNA-10 单应用限频')
+      assert.strictEqual(snaCalls.length, 1, '只有一个应用时限频必须结束重试，不得无限空转')
+      assert.strictEqual(err.failures[0].channel, 'wxpusher', '失败必须点名 wxpusher')
+      assert.strictEqual(err.failures[0].code, 1001, '业务码必须原样保留数字形态')
+      assert.strictEqual(err.failures[0].providerCode, '1001', 'providerCode 必须是字符串形态（failure_policy 按字符串判）')
+      clearCfg(); snaCalls = []
+      cfg.WX_pusher_channels = [{ appToken: 'APT_sna10b1', topicIds: ['T1'] }, { appToken: 'APT_sna10b2', topicIds: ['T2'] }]
+      let seen = 0
+      snaHandler = () => ({ body: ++seen === 1 ? { code: '1001' } : { code: 1000 } })
+      threw = null; res = null
+      try { res = await slim.sendNotify('SNA-10 字符串限频码', '正文') } catch (e) { threw = e }
+      assert.ok(!threw, `字符串 '1001' 也必须判限频并切备用应用，实际 ${threw && threw.message}`)
+      assert.strictEqual(snaCalls.length, 2, '首个应用被判限频 ⇒ 必须换第二个')
+      assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '备用应用应成功')
+      console.log('✅ SNA-10 限频码：数字 1001 原样透传 + 字符串 1001 仍判限频切备用应用')
+    } finally {
+      if (origStream.post) gotMod.stream.post = origStream.post
+      if (origStream.get) gotMod.stream.get = origStream.get
+      clearCfg()
+      for (const k of Object.keys(savedSna)) cfg[k] = savedSna[k]
+      snaHandler = () => ({})
+      snaCalls = []
+    }
+  }
+
   console.log('test_sendnotify_utils OK')
 })().catch((e) => { console.error(e); process.exit(1) })
