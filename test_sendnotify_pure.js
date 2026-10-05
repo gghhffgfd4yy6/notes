@@ -2126,7 +2126,9 @@ checkS('SNB-01 Bark: 设备码切分——空段丢弃、每段 trim，请求条
 
 checkS('SNB-02 Bark: 端点协议判定——自建 http 与大写 HTTPS 原样保留，只有裸设备码才补 api.day.app 前缀', async () => {
   const cases = [
-    'http://192.168.1.7:8080/DevKey1234',
+    // 自建端点用主机名 + .invalid 保留域（RFC 6761：永不解析），既测「http 也原样保留」，
+    // 又不写死内网 IP 字面量（Sonar 的安全那条线会点硬编码 IP）。
+    'http://bark-selfhost.invalid:8080/DevKey1234',
     'HTTPS://api.day.app/DevKey1234',
     'xhttp://api.day.app/dk',
     'dev1'

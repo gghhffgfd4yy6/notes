@@ -742,13 +742,15 @@ const cfg = slim.push_config
     let snaHandler = () => ({})
     let snaCalls = []
     const snaMake = (url, opts) => {
-      // 契约：snaHandler 一律返回 spec 对象（默认 `() => ({})`，各用例也返回对象字面量）。
-      // 这里原先写的是 `snaHandler(...) || {}` —— 那个 `|| {}` 是恒真的死防御，被 SonarCloud
-      // 判成可靠性 BUG（javascript:S2589，项目里唯一未解决的 bug，run 指向本行），已删除。
+      // 契约：snaHandler 一律返回 spec 对象（body / error 两种形态）。
+      // timings 直接给固定值，**不做 `spec.timings || 默认` 的可配置开关**——本文件的用例都不读
+      // timings，那个左操作数恒假，是一道没人经过的门（SonarCloud 按 S2589 判可靠性 BUG：
+      // 先是 snaHandler(...) || {} 那处，删掉后同族的这一处又被点出来）。
+      // 将来若有用例真的要观测 timings，请连同断言一起把这条开关加回来，别留空转的配置项。
       const spec = snaHandler(String(url), opts)
       snaCalls.push({ url: String(url), opts })
       const em = new SNAEE()
-      em.timings = spec.timings || { phases: {} }
+      em.timings = { phases: {} }
       em.destroy = () => {} // 超限分支会调它；缺了会在 emit 里同步抛 TypeError 把进程干掉
       setImmediate(() => {
         if (spec.error !== undefined) { em.emit('error', spec.error); return }
