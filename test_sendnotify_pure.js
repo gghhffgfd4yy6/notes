@@ -2098,3 +2098,184 @@ checkS('SN-21 入口清洗: text/desp 为 undefined/null 或 String() 抛异常�
     } finally { log1.restore(); got1.restore(); restore() }
   }
 })
+
+// ===== SNB 簇（g12 第三批）：Bark 通道剩余存活变异体 =====
+// 依据：子代理用仓库自带 @stryker-mutator/instrumenter **真实枚举** barkNotify(:601-696) 的 80 个变异体
+// 与 requestExtras(:25-27) 的 7 个，逐个喂给已提交的四套件 ⇒ barkNotify 32 个存活、requestExtras 6 个存活。
+// 本簇吃掉其中 7 组；杀不掉的等价/不可达变异体在文件末尾的登记注释里说明，不伪造断言。
+// 另：SN-04 的判据止于聚合层（实测把 catch 体清空后，finally 的 innerResolve({ok:false}) 仍让 SN-04 绿）
+//     ⇒ SNB-05 把断言下钻到「逐设备根因」那一层补上这个缺口。
+
+checkS('SNB-01 Bark: 设备码切分——空段丢弃、每段 trim，请求条数与非空段条数严格一致', async () => {
+  const cases = [
+    [' d1 ## d2 ', ['https://api.day.app/d1', 'https://api.day.app/d2']],
+    ['  https://api.day.app/D3  ', ['https://api.day.app/D3']],
+    ['d1#  #d2', ['https://api.day.app/d1', 'https://api.day.app/d2']]
+  ]
+  for (const [raw, urls] of cases) {
+    const restore = isolateChannel2({ BARK_PUSH: raw })
+    const log1 = captureLogs()
+    const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    try {
+      const res = await sendNotify('切分探针', '正文')
+      assert.deepStrictEqual(got1.capture.map(c => c.url), urls, `配置 ${JSON.stringify(raw)} 的请求 URL 集合不符（filter/trim 被掏空就会多请求或带空格）`)
+      assert.deepStrictEqual(res.successfulChannels, ['bark'], `配置 ${JSON.stringify(raw)} 应判通道成功`)
+    } finally { log1.restore(); got1.restore(); restore() }
+  }
+})
+
+checkS('SNB-02 Bark: 端点协议判定——自建 http 与大写 HTTPS 原样保留，只有裸设备码才补 api.day.app 前缀', async () => {
+  const cases = [
+    'http://192.168.1.7:8080/DevKey1234',
+    'HTTPS://api.day.app/DevKey1234',
+    'xhttp://api.day.app/dk',
+    'dev1'
+  ]
+  for (const raw of cases) {
+    const restore = isolateChannel2({ BARK_PUSH: raw })
+    const log1 = captureLogs()
+    const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    try {
+      await sendNotify('协议判定探针', '正文')
+      assert.strictEqual(got1.capture.length, 1, `配置 ${raw} 必须恰好发一次`)
+      const expect = /^https?:\/\//i.test(raw) ? raw : `https://api.day.app/${raw}`
+      assert.strictEqual(got1.capture[0].url, expect, `配置 ${raw} 的端点判定错（锚点 ^ 或 s? 改动、取反都会在此变红）`)
+    } finally { log1.restore(); got1.restore(); restore() }
+  }
+})
+
+checkS('SNB-06 Bark: 调用方 AbortSignal 必须原样交给传输层；未传时不得出现该键（顺带钉 headers/timeout/内部选项不漏）', async () => {
+  // 轮1：带 signal —— 必须是同一个引用（取消能否生效的唯一通路）
+  const ac = new AbortController()
+  {
+    const restore = isolateChannel2({ BARK_PUSH: 'dev_snb06' })
+    const log1 = captureLogs()
+    const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    try {
+      await sendNotify('signal 透传', '正文', { signal: ac.signal, inFlightTracker: {} })
+      const opts = got1.capture[0].opts
+      assert.strictEqual(opts.signal, ac.signal, 'signal 必须原样（同引用）交给传输层；删掉透传这一路无人变红')
+      assert.strictEqual(opts.headers['Content-Type'], 'application/json', 'Bark 必须显式 application/json（headers 对象被清空在此变红）')
+      assert.strictEqual(opts.timeout, 15000, '超时形态契约')
+      assert.strictEqual('signal' in opts.json, false, 'signal 不得进第三方 JSON body')
+      assert.strictEqual('inFlightTracker' in opts, false, '内部选项不得漏进传输选项')
+    } finally { log1.restore(); got1.restore(); restore() }
+  }
+  // 轮2：脏 params（读 signal 就抛）⇒ requestExtras 的 try/catch 必须兜住，照常发送
+  {
+    const restore = isolateChannel2({ BARK_PUSH: 'dev_snb06' })
+    const log1 = captureLogs()
+    const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    try {
+      const res = await sendNotify('脏 params', '正文', { get signal () { throw new Error('脏 params') } })
+      assert.deepStrictEqual(res.successfulChannels, ['bark'], '脏 params 不得影响发送（try/catch 被掏空则整条通道抛穿）')
+      assert.strictEqual(got1.capture.length, 1, '仍恰好发一次')
+    } finally { log1.restore(); got1.restore(); restore() }
+  }
+  // 轮3：只传内部选项 ⇒ 传输选项里不得凭空出现 signal 键
+  {
+    const restore = isolateChannel2({ BARK_PUSH: 'dev_snb06' })
+    const log1 = captureLogs()
+    const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    try {
+      await sendNotify('无 signal', '正文', { inFlightTracker: {} })
+      assert.strictEqual('signal' in got1.capture[0].opts, false, '未传 signal 时不得注入该键（写成 {signal: undefined} 会让取消语义变成永不取消）')
+    } finally { log1.restore(); got1.restore(); restore() }
+  }
+})
+
+checkS('SNB-03 Bark: 响应不是 JSON（代理回 HTML）时按业务失败，兜底文案逐字且不得把响应体塞进 message', async () => {
+  const restore = isolateChannel2({ BARK_PUSH: 'https://api.day.app/DevKey12345' })
+  const log1 = captureLogs()
+  // 流式路径 JSON.parse 失败时保留原始字符串（:388-391 的刻意行为）⇒ data 是个 HTML 字符串
+  const got1 = mockTransport(() => ({ body: '<html>Bad Gateway DevKey12345</html>' }))
+  try {
+    let threw = null
+    try { await sendNotify('HTML 响应', '正文') } catch (e) { threw = e }
+    assert.ok(threw, 'HTTP 200 但响应不是业务成功码必须失败')
+    const inner = threw.failures[0].failures[0]
+    assert.ok(inner instanceof Error, '逐设备失败必须是 Error 实例')
+    assert.strictEqual(inner.channel, 'bark', '必须逐设备点名 bark')
+    assert.strictEqual(inner.message, 'Bark 发送失败', '无 message 字段时必须用兜底文案（把响应体当文案会在此变红）')
+    assert.strictEqual('providerCode' in inner, false, '响应体没有 code 字段时不得造 providerCode')
+    assert.strictEqual(inner.statusCode, 200, 'statusCode 取自 response 形参')
+    assert.ok(!inner.message.includes('Bad Gateway') && !inner.message.includes('DevKey12345'), '异常响应体不得进 message（可能回显密钥）')
+  } finally { log1.restore(); got1.restore(); restore() }
+})
+
+checkS('SNB-04 Bark: 传输错误（无 response）必须逐设备点名且不得重发', async () => {
+  const restore = isolateChannel2({ BARK_PUSH: 'dev_snb04' })
+  const log1 = captureLogs()
+  const got1 = mockTransport(() => ({ error: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) }))
+  try {
+    let threw = null
+    try { await sendNotify('传输失败', '正文') } catch (e) { threw = e }
+    assert.ok(threw, '传输失败必须上抛')
+    assert.strictEqual(threw.failures[0].code, 'CHANNEL_BARK_FAILED', '聚合层必须给通道码')
+    const inner = threw.failures[0].failures[0]
+    assert.strictEqual(inner.channel, 'bark', '逐设备失败必须点名 bark（通道名写错在这一层才看得见）')
+    assert.strictEqual(inner.code, 'ECONNREFUSED', '传输错误码原样透传')
+    assert.strictEqual('statusCode' in inner, false, '错误没有 response 时不得造 statusCode 键')
+    assert.strictEqual(got1.capture.length, 1, 'Bark 没有重试语义，不得重发')
+  } finally { log1.restore(); got1.restore(); restore() }
+})
+
+checkS('SNB-05 Bark: catch 分支必须留下逐设备根因（比 SN-04 下钻一层）', async () => {
+  const restore = isolateChannel2({ BARK_PUSH: 'dev_snb05' })
+  const log1 = captureLogs()
+  const got1 = mockTransportPromiseOnly(() => ({ body: brokenBody() }))
+  try {
+    let threw = null
+    try { await sendNotify('catch 根因', '正文') } catch (e) { threw = e }
+    assert.ok(threw, '业务体不可读必须失败')
+    const agg = threw.failures[0]
+    assert.strictEqual(agg.failures.length, 1, 'catch 分支必须留下 1 条逐设备根因；清空 catch 体时 finally 只给 {ok:false}（无 error）会被 filter(Boolean) 丢空，这一条就变 0')
+    assert.strictEqual(agg.failures[0].channel, 'bark', '根因必须点名 bark')
+    assert.ok(/不可读/.test(agg.failures[0].message), `根因必须保留原始异常文案，实际 ${agg.failures[0].message}`)
+    assert.strictEqual('providerCode' in agg.failures[0], false, '读不出业务码时不得造键')
+  } finally { log1.restore(); got1.restore(); restore() }
+})
+
+checkS('SNB-08 Bark: 三行日志逐字 + 端点一律脱敏（query/hash 绝不落日志）', async () => {
+  // 成功 / 业务异常 / 传输失败 三条日志模板与 maskUrl 调用点：模板串被掏空（StringLiteral→''）
+  // 或脱敏被绕过，都只在日志面上暴露——而日志正是用户排查推送失败的唯一依据。
+  const scenarios = [
+    ['成功', () => ({ body: JSON.stringify({ code: 200 }) })],
+    ['业务异常', () => ({ body: JSON.stringify({ code: 500, message: 'bad key' }) })],
+    ['传输失败', () => ({ error: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) })]
+  ]
+  for (const [label, spec] of scenarios) {
+    const restore = isolateChannel2({ BARK_PUSH: 'https://api.day.app/DEVI9999' })
+    const log1 = captureLogs()
+    const got1 = mockTransport(spec)
+    try {
+      try { await sendNotify('日志面探针', '正文') } catch (e) { /* 失败场景预期上抛 */ }
+      const hit = log1.logs.filter(l => l.includes('Bark APP 发送通知到'))
+      assert.ok(hit.length >= 1, `${label} 场景必须打「Bark APP 发送通知到 …」这条日志（模板被掏空在此暴露）`)
+      assert.ok(hit.some(l => l.includes('https://api.day.app/DEVI***99')), `${label} 场景端点必须走 maskUrl，实际: ${JSON.stringify(hit)}`)
+      assert.ok(!hit.some(l => l.includes('DEVI99')), `${label} 场景不得把完整设备码写进日志`)
+    } finally { log1.restore(); got1.restore(); restore() }
+  }
+  // query/hash 形态：maskUrl 只保留协议+host+脱敏路径，query 与 hash 整段丢弃（防密钥随日志外泄）
+  {
+    const restore = isolateChannel2({ BARK_PUSH: 'https://api.day.app/DevKey1234?auth=SECRETQUERY#frag' })
+    const log1 = captureLogs()
+    const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 500, message: 'bad' }) }))
+    try {
+      try { await sendNotify('query 脱敏', '正文') } catch (e) { /* 预期失败 */ }
+      const joined = log1.logs.join('\n')
+      assert.ok(joined.includes('https://api.day.app/DevK***34'), `路径必须脱敏为 DevK***34，实际日志: ${joined.slice(0, 200)}`)
+      assert.ok(!joined.includes('SECRETQUERY'), 'query 一律不得进日志')
+      assert.ok(!joined.includes('#frag'), 'hash 一律不得进日志')
+    } finally { log1.restore(); got1.restore(); restore() }
+  }
+})
+
+// 登记（本簇**不写**考题的等价/不可达变异体，实测所有候选都杀不掉）：
+// · :613 `if (!BARK_PUSH)` 与 :621 `deviceKeys.length === 0`（4 个变异体）——经 sendNotify 不可达：
+//   :1521 的 delimitedNonEmpty 与 :620 的 filter 是同一谓词，空列表永远走不到通道内的早退守卫。
+// · :682/:683 finally 的 innerResolve({ok:false})（3 个）——所有路径都先结算，第二次 resolve 是 no-op
+//   ⇒ 等价变异体；别造「catch 自己再抛」的演员场景（实测异常会冒出传输回调、进程级崩溃）。
+// · :26 requestExtras 的 `catch (e) { return {} }`（1 个）——`{...undefined}` ≡ `{}`，无靶可杀。
+// · :181 failures.filter(Boolean) ——外层 :1624 还有一份 filter(Boolean)，双层遮蔽，公开行为不可观测。
+// · :188 isCode 的字符串业务码侧 ——已被 SNA-10（wxpusher '1001'）杀掉，重复击杀不再补。
