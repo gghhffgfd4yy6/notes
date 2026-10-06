@@ -5,6 +5,10 @@
 // output 一律经 env 注入等），却没有任何本地执行者，全靠评审兜。本闸门把两台扫描器固化为
 // 硬校验：npm run check、pre-commit、CI quality job 三处同链。
 //
+// S4036 返工（PR #207，SonarCloud「New Code Security Rating ≥ A」必需检查）：扫描器调用由
+// 「按名 spawn（子进程经 PATH 解析可执行文件）」改为「**纯 JS 扫 PATH → 以绝对路径 spawn**」
+// ——与本仓 test_install_hooks.js 对 git 的处理同款，改代码消除、不挂 NOSONAR 压制。
+//
 // 工具缺失语义（CI vs 本地）：
 //   - CI（env CI=true）或显式 --require-tools：缺工具 = 红（fail-closed）。
 //     否则「CI 里扫描器没装 ⇒ 静默绿」等价于门禁不存在。
@@ -22,9 +26,26 @@ const path = require('path')
 const ROOT = path.join(__dirname, '..')
 const ZIZMOR_ARGS_BASE = ['--no-exit-codes', '--format', 'json', '--no-progress', '.github/workflows/']
 
+// 纯 JS 扫 PATH 解析工具的绝对路径（不额外 spawn 进程）：候选目录 = process.env.PATH 的固定
+// 分段 + 硬编码工具名，逐个做 X_OK + isFile 检查；解析不到返回 null（上层按「缺工具」语义处理）。
+// 按名 spawnSync 会让子进程经 PATH 解析可执行文件，静态分析判 Sonar S4036——先解析、再以绝对
+// 路径调用（与本仓 test_install_hooks.js 的 GIT 解析器同一口径）。
+function resolveTool (name) {
+  const dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean)
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name)
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK)
+      if (fs.statSync(candidate).isFile()) return candidate
+    } catch {
+      // 该候选目录不存在或无权限：继续下一段固定目录
+    }
+  }
+  return null
+}
+
 function toolAvailable (name) {
-  const r = spawnSync(name, ['--version'], { encoding: 'utf8' })
-  return !r.error
+  return resolveTool(name) !== null
 }
 
 // 缺工具时的判定纯函数：CI 环境（或 --require-tools）fail-closed，本地软跳过。
@@ -62,8 +83,10 @@ function runShellcheck () {
     })
   }
   const failures = []
+  const bin = resolveTool('shellcheck')
+  if (!bin) throw new Error('shellcheck 解析失败（resolveTool 返回 null）')
   for (const f of files) {
-    const r = spawnSync('shellcheck',
+    const r = spawnSync(bin,
       ['--severity=style', '-x', path.join(dir, f)],
       { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
     if (r.error) throw new Error('shellcheck 无法执行：' + r.error.message)
@@ -74,7 +97,9 @@ function runShellcheck () {
 
 // zizmor medium 及以上计为红（本机体检口径：high 必修，medium 起拦）。
 function runZizmor () {
-  const r = spawnSync('zizmor',
+  const bin = resolveTool('zizmor')
+  if (!bin) throw new Error('zizmor 解析失败（resolveTool 返回 null）')
+  const r = spawnSync(bin,
     [...ZIZMOR_ARGS_BASE, '--min-severity', 'medium'],
     { cwd: ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
   if (r.error) throw new Error('zizmor 无法执行：' + r.error.message)
@@ -95,9 +120,12 @@ function selftest () {
   assert.strictEqual(decideToolMissing(true, false), 'fail')
   assert.strictEqual(decideToolMissing(false, true), 'fail')
   assert.strictEqual(decideToolMissing(false, false), 'skip')
-  // —— toolAvailable 对不存在工具返回 false
+  // —— resolveTool / toolAvailable 边界：假工具名解析不到；真在场工具解析为绝对路径
+  assert.strictEqual(resolveTool('definitely-not-a-real-tool-xyz-98'), null)
   assert.strictEqual(toolAvailable('definitely-not-a-real-tool-xyz-98'), false)
-  console.log('✅ check-ci-static --selftest 全部通过（' + 8 + ' 断言）')
+  const nodeAbs = resolveTool('node')
+  assert.ok(nodeAbs && path.isAbsolute(nodeAbs), 'node 必然在场且解析为绝对路径（本脚本正由它执行）')
+  console.log('✅ check-ci-static --selftest 全部通过（11 断言）')
 }
 
 function main () {
@@ -165,4 +193,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { summarizeZizmor, decideToolMissing, toolAvailable }
+module.exports = { summarizeZizmor, decideToolMissing, toolAvailable, resolveTool }

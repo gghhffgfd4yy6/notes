@@ -156,10 +156,10 @@
 #
 # scripts/check-ci-static.js 是静态扫描闸门（v3.280，pre-commit/CI 用，不进入生产运行时）：
 # fs 各调用的目标只由 ROOT=__dirname 常量与硬编码目录段 '.githooks' 拼成（existsSync/readdirSync/
-# lstatSync），readdirSync 枚举结果 f 仅参与拼接「本仓库自有钩子文件」的扫描路径；spawnSync 的
-# 命令名在本文件内只以硬编码字面量出现（toolAvailable 的调用点为 'shellcheck'/'zizmor'/自检桩名，
-# 扫描调用为固定 'shellcheck' 与固定 'zizmor' 参数组），「按名调用已安装扫描器」正是该工具脚本的
-# 本职工作，无任何外部净输入参与路径或命令构造——「动态构造文件/路径信息」告警属误报
+# lstatSync），readdirSync 枚举结果 f 仅参与拼接「本仓库自有钩子文件」的扫描路径；扫描器调用为
+# 「纯 JS 扫 PATH 把硬编码工具名（'shellcheck'/'zizmor'）解析成固定目录下的可执行绝对路径，再以
+# 该绝对路径 spawn」（与本仓 test_install_hooks.js 对 git 的处理同一口径，Sonar S4036 由此消除），
+# 「按名调用已安装扫描器」正是该工具脚本的本职工作，无任何外部净输入参与路径或命令构造——「动态构造文件/路径信息」告警属误报
 # （与 scripts/install-hooks.js、run_mutation.js 等同类工具脚本同一处理）。
 #
 # test_ci_static_gates.js 是 v3.280 静态扫描闸门的接线内容断言套件：
