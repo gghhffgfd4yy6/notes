@@ -381,10 +381,25 @@ function storeWithFs (fakeFs, cacheDir = 'xianbaoku_cache') {
 
 const DEFAULT_DIR = path.join(FAKE_ROOT, 'xianbaoku_cache')
 const SAFE_DIR = path.join(FAKE_ROOT, '.xbk_cache_safe')
+// 生产的第二级候选（fallback）目录名是按 XBK_PARALLEL_ID **现算**的（xbk_message_store.js:95），
+// 与 raw 同源但可能不同名；resolveCacheDirInRoot 的顺序是 raw → fallback → .xbk_cache_safe。
+// 因此「回退应急目录」这两条场景必须把**两级默认候选都置为不可用**，否则设了分片变量时生产会正确地
+// 落在分片目录，而用例按「未设变量」的语义断言 .xbk_cache_safe —— 同一份代码带/不带该变量会得出
+// 相反结论（本机实测：带变量 2 条红、不带就过）。
+// ⚠️ 键顺序即语义：对象字面量后写覆盖先写。env 未设时 FALLBACK_DIR === DEFAULT_DIR 是**同一个键**，
+// 把 [FALLBACK_DIR] 写在 [DEFAULT_DIR] 之后，它的 'file' 会悄悄盖掉本场景真正要测的形态——
+// 评审实测踩过：那样一写，「符号链接逃根」这条在 CI 默认配置（变量未设）下不再测符号链接，
+// 把生产的 realpath 防御打掉也不会变红（原样写法：符号链接场景红=0；本写法：两种配置都红）。
+// 故 fallback 条目一律**前置**，并用下面的 defaultShape 不变式把键覆盖这件事钉死。
+const FALLBACK_DIR = path.join(FAKE_ROOT, process.env.XBK_PARALLEL_ID
+  ? `xianbaoku_cache_p${process.env.XBK_PARALLEL_ID}`
+  : 'xianbaoku_cache')
+const SYMLINK_OUTSIDE = { kind: 'dir', real: '/outside/xianbaoku_cache' }
 const CACHE_FS_SCENARIOS = [
   {
     name: '默认目录是根内正常目录 → 原样使用',
     map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: 'dir' },
+    defaultShape: 'dir',
     expect: DEFAULT_DIR
   },
   {
@@ -393,19 +408,27 @@ const CACHE_FS_SCENARIOS = [
     expect: DEFAULT_DIR
   },
   {
-    name: '默认目录被普通文件占位 → 回退 .xbk_cache_safe（生产口径）',
-    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: 'file' },
+    name: '默认目录与分片回退名都被普通文件占位 → 回退 .xbk_cache_safe（生产口径）',
+    map: { [FAKE_ROOT]: 'dir', [FALLBACK_DIR]: 'file', [DEFAULT_DIR]: 'file' },
+    defaultShape: 'file',
     expect: SAFE_DIR
   },
   {
-    name: '默认目录是逃出根目录的符号链接 → 回退 .xbk_cache_safe（生产口径）',
-    map: { [FAKE_ROOT]: 'dir', [DEFAULT_DIR]: { kind: 'dir', real: '/outside/xianbaoku_cache' } },
+    name: '默认目录是逃出根目录的符号链接且分片回退名也不可用 → 回退 .xbk_cache_safe（生产口径）',
+    map: { [FAKE_ROOT]: 'dir', [FALLBACK_DIR]: 'file', [DEFAULT_DIR]: SYMLINK_OUTSIDE },
+    defaultShape: SYMLINK_OUTSIDE,
     expect: SAFE_DIR
   }
 ]
 
 for (const scenario of CACHE_FS_SCENARIOS) {
   check(`QX-08 同源解析：${scenario.name}（--status 必须与生产 getter 一致）`, () => {
+    // 前置不变式：声明了 defaultShape 的场景，map 里 DEFAULT_DIR 这一项必须还是那个形态
+    // ——专门用来抓住上面说的键覆盖（后写把先写盖掉），否则场景名与实际布景会说谎。
+    if (scenario.defaultShape !== undefined) {
+      assert.deepStrictEqual(scenario.map[DEFAULT_DIR], scenario.defaultShape,
+        `场景布景被键覆盖：DEFAULT_DIR 应为 ${JSON.stringify(scenario.defaultShape)}，实际 ${JSON.stringify(scenario.map[DEFAULT_DIR])}（fallback 条目必须前置）`)
+    }
     const fakeFs = makeCacheFs(scenario.map)
     const prod = storeWithFs(fakeFs).cacheDir
     const status = statusCacheDir({ env: {}, fs: fakeFs, path, root: FAKE_ROOT })
