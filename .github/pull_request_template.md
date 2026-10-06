@@ -9,6 +9,7 @@
 ## 变更范围
 
 <!-- 改了哪些文件 / 模块，大致改动量 -->
+<!-- 动了哪些文档 / 为什么不需要动：README.md、SYSTEM_CONTRACT.md、CHANGELOG.md 的同步**没有门禁**（check-version.js 只校验 CHANGELOG 最新版本标题与另外三方一致，不校验内容是否描述本次改动），评审需逐条核对这一项 -->
 
 ## 类型
 
@@ -33,11 +34,13 @@
 
 ## 测试
 
-- [ ] 单元测试通过（`npm run test:unit`）
-- [ ] 集成测试通过（`npm test`，并行调度器）
-- [ ] 新增了针对本改动的测试，且已注册到 `test_suites.js`
+- [ ] `npm run check` 通过（lint → 版本四方一致 → 变异行段 → **静态扫描** → `npm test`）
+- [ ] 单元测试通过（`npm run test:unit`：34 个单元套件，v3.278 起并发池执行，默认并发 8）
+- [ ] 全量套件通过（`npm test`：48 个套件**顺序**执行；集成侧另有并行调度器 `npm run test:app`，失败片自动串行重跑）
+- [ ] 新增了针对本改动的测试，且已注册到 `test_suites.js`（需要时同步 `SKIP_SUITES` 与 `test.yml` 显式步骤）
 - [ ] 涉及性能/安全：补充了变异测试或故障注入验证
-- [ ] `npm run check` 通过（lint + 版本四方一致 + 变异行段 + 全量测试）
+- [ ] 改动 `.githooks/*` 或 `.github/workflows/*`：已跑 `npm run check:ci-static`（这两类文件默认全量被扫描，无豁免）
+- [ ] 本机跑不动的判据（`test:filter`、含子进程断言的套件）已在 **CI** 上验证——未把「本机全绿」当作契约已验证
 
 ## 安全检查
 

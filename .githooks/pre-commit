@@ -2,7 +2,7 @@
 # pre-commit 钩子：提交前自动验证（可 git commit --no-verify 跳过）
 # 四道快检：lint → 版本闸门 → 变异行段校验 → 静态扫描（便宜的在前；最贵的 test:filter 见文末说明，已迁到 pre-push）
 #
-# 变异行段闸门（node scripts/check-mutation-ranges.js，本机实测 0.47s）：AGENTS.md:27-30 把
+# 变异行段闸门（node scripts/check-mutation-ranges.js，本机实测 0.47s）：AGENTS.md「大文件与变异行段」一节把
 # 「改动带行段的文件后重拆 mutation.yml 行段并校验」列为必做，`npm run check` 也含这一步，但提交
 # 时刻真正执行的 pre-commit 此前并不跑它——只依赖钩子的人永远不过这道门；v3.270 正是文件增长后
 # 行段未同步、尾部 430 行静默漏测。成本 0.5s 换掉这一类历史事故，净收益明确（新门禁，不外放）。
