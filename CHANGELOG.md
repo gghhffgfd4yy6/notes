@@ -126,3 +126,11 @@
 - 变异行段同步重算：`xbk_sendNotify_slim.js` 由 1634 行缩到 1612 行（删 24 行死代码、白名单注释补 2 行说明）⇒ `sendnotify-part2` 的 `mutate` 由 `751-1634` 改为 `751-1612`（`1-750` 不变），`node scripts/check-mutation-ranges.js` 校验全覆盖与连续性。
 - 回归守卫：`test_sendnotify_utils.js` 新增「slim 导出面 16 个名字逐字一致」清单断言（多一个/少一个/改名都红），并显式断言内部请求封装对象 `$` 不在导出面上——死代码能长出来正是因为外部看不见它。
 - 行为零变化：删掉的代码从未被执行，推送请求、失败归因、脱敏、响应体上限的语义逐字不变；`README.md` / `SYSTEM_CONTRACT.md` 未提及 `$.get`，故不动。
+
+## v3.280
+
+- 新增静态扫描闸门 `scripts/check-ci-static.js`：`shellcheck` 扫 `.githooks/*` 全部钩子、`zizmor` 扫 `.github/workflows/`（medium 及以上计红；JSON 解析失败按「不可判定=红」fail-closed，与 `test_ci_skip_suites.js`「提取不出命令名 ⇒ 对账保持红」同口径）。同链纳入三处：`npm run check`（lint → 版本闸门 → 变异行段 → 静态扫描 → `npm test`）、pre-commit 第 4 道快检、CI quality job「版本一致性闸门」后新增步骤（zizmor 钉版 `==1.30.1`=本机基线，升级须两处同步）。动机是既有空白：原三道门禁只覆盖 JS 源码，shell 钩子与 workflow YAML 从未被扫描——「上游 step output 一律经 env 注入」这类 zizmor template-injection 约定一直靠人工与评审执行，没有本地执行者。
+- 缺工具语义：本机缺扫描器 ⇒ 显眼提示并跳过（不阻塞开发、绝不假装扫描过，CI 兜底）；CI（env `CI=true`）或 `--require-tools` ⇒ fail-closed 红，防「CI 里扫描器失踪 ⇒ 静默绿」——门禁不存在与门禁没跑，都不算通过。
+- 首次全仓扫描的两处真实发现，均已修：① `release.yml` 的 setup-node 原以注释声明「不启用缓存」的意图，zizmor 认定**省略参数 = 默认开启缓存**，报 cache-poisoning（high）——注释改为机器强制参数 `package-manager-cache: false`；② `.githooks/pre-push` 的 `remote_sha`（pre-push 协议 stdin 固定列，必须被 `read` 消费但不参与判断）被 shellcheck SC2034 误报，加行级 disable 并注明原因。此后 `shellcheck .githooks/*` 与 `zizmor --min-severity medium` 全仓均 0 发现。
+- test.yml 步骤变更对账说明（AGENTS 文档门禁条款）：新步骤命令 `npm run check:ci-static` 指向 `scripts/check-ci-static.js`，**不是** `test_*.js` 套件 ⇒ `test_suites.js` 与 `SKIP_SUITES` 无需变动（先例：`test:check-mutation-ranges` 同为非套件 npm 脚本步骤）。本机跑 `test_ci_skip_suites.js` 主流程双向对账通过；该文件更后段的子进程断言在本机的致命炸点属既有登记限制（AGENTS「本机验证盲区」），以 CI 对账为准。
+- `README.md` / `SYSTEM_CONTRACT.md` 不动：纯工程门禁增补，行为、配置、契约零变化。
