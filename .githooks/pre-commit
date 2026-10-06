@@ -40,6 +40,12 @@ run_gate () {
     echo "   ↑ 以上为「$*」的完整输出（stderr 已合并）"
     exit 1
   fi
+  # v3.280 返工（CodeRabbit #207 · Minor pre-commit:49）：成功路径里出现的 ⚠️ 行也必须透传——
+  # 「扫描器没装、本轮跳过了」不能被一行 ✅ 盖掉：无工具机器的绿 ≠ 扫描过（与「复用状态必须
+  # 可见」「不许静默当成全量重算」同一族可见性原则）。
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" | grep '⚠' || true
+  fi
   echo "✅ ${label} 通过（$((t1 - t0))s）"
 }
 

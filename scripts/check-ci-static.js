@@ -24,7 +24,10 @@ const fs = require('fs')
 const path = require('path')
 
 const ROOT = path.join(__dirname, '..')
-const ZIZMOR_ARGS_BASE = ['--no-exit-codes', '--format', 'json', '--no-progress', '.github/workflows/']
+// --strict-collection（CodeRabbit #207 · Major :27）：zizmor 默认对「无法解析的输入」只**警告并跳过**
+// ——若某 workflow 语法烂掉而被静默跳过、其余照常通过，就出现「门禁绿但扫描面缺了一块」。
+// strict 让任何收集不到的输入直接判红（本机实测：坏 yml 默认 exit=3、strict exit=1）。
+const ZIZMOR_ARGS_BASE = ['--no-exit-codes', '--strict-collection', '--format', 'json', '--no-progress', '.github/workflows/']
 
 // 纯 JS 扫 PATH 解析工具的绝对路径（不额外 spawn 进程）：候选目录 = process.env.PATH 的固定
 // 分段 + 硬编码工具名，逐个做 X_OK + isFile 检查；解析不到返回 null（上层按「缺工具」语义处理）。
@@ -95,6 +98,16 @@ function runShellcheck () {
   return { scanned: files.length, failures }
 }
 
+// zizmor 进程结局判定纯函数（CodeRabbit #207 · Major :108）：非 0 退出**不采信输出**——
+// --no-exit-codes 只抑制「有发现⇒非零」，进程错误（本机实测坏输入 exit=3、被杀 status=null）
+// 仍是非零；此时 stdout 可能为空/半截，若继续解析会把「进程没干完活」读成「0 发现」假绿。
+function decideZizmorProc (status, signal) {
+  if (status === 0 && !signal) return null
+  if (status === null) return 'zizmor 被信号终止（signal=' + signal + '），输出不采信（fail-closed）'
+  if (status === 3) return 'zizmor exit=3：收集输入遇语法/schema 错误（--strict-collection 下输入问题即红），输出不采信'
+  return 'zizmor 进程异常退出（exit=' + status + (signal ? ' / signal=' + signal : '') + '），输出不采信'
+}
+
 // zizmor medium 及以上计为红（本机体检口径：high 必修，medium 起拦）。
 function runZizmor () {
   const bin = resolveTool('zizmor')
@@ -103,6 +116,8 @@ function runZizmor () {
     [...ZIZMOR_ARGS_BASE, '--min-severity', 'medium'],
     { cwd: ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
   if (r.error) throw new Error('zizmor 无法执行：' + r.error.message)
+  const why = decideZizmorProc(r.status, r.signal)
+  if (why) return { ok: false, reason: why, findings: [] }
   const parsed = summarizeZizmor(r.stdout || '[]')
   if (!parsed.ok) return { ok: false, reason: parsed.reason, findings: [] }
   return { ok: true, findings: parsed.findings }
@@ -125,7 +140,12 @@ function selftest () {
   assert.strictEqual(toolAvailable('definitely-not-a-real-tool-xyz-98'), false)
   const nodeAbs = resolveTool('node')
   assert.ok(nodeAbs && path.isAbsolute(nodeAbs), 'node 必然在场且解析为绝对路径（本脚本正由它执行）')
-  console.log('✅ check-ci-static --selftest 全部通过（11 断言）')
+  // —— decideZizmorProc：非 0 一律「输出不采信」，0 且无信号放行
+  assert.strictEqual(decideZizmorProc(0, null), null)
+  assert.match(decideZizmorProc(3, null), /exit=3/)
+  assert.match(decideZizmorProc(1, null), /exit=1/)
+  assert.match(decideZizmorProc(null, 'SIGABRT'), /信号/)
+  console.log('✅ check-ci-static --selftest 全部通过（15 断言）')
 }
 
 function main () {
@@ -193,4 +213,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { summarizeZizmor, decideToolMissing, toolAvailable, resolveTool }
+module.exports = { summarizeZizmor, decideToolMissing, toolAvailable, resolveTool, decideZizmorProc }
