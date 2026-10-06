@@ -1,16 +1,29 @@
 #!/usr/bin/env node
 // 审计门禁：npm audit 结果审查器（fail-closed）。
-// 背景：GHSA-ch52-4w7c-c8xp（http-cache-semantics <=4.2.0，CVSS 7.5）为 got@11 的传递依赖，
-// 该 advisory 覆盖所有已发布版本（无修复版可升），got@11 已停止维护。经仓库所有者确认
-// （PR #194）对该 advisory 显式豁免：命中时以 GitHub Actions warning 注解显形，不静默。
-// 复查条件：got 官方发布含修复版的版本、或项目替换/升级 got 时，必须移除豁免并回归本门禁。
+// 背景：GHSA-ch52-4w7c-c8xp（http-cache-semantics <=4.2.0，CVSS 7.5 / CVE-2026-93748）为 got@11
+// 的传递依赖，got@11 已停止维护。经仓库所有者确认（PR #194）对该 advisory 显式豁免：
+// 命中时以 GitHub Actions warning 注解显形，不静默。
+// 现状更新（PR #203 升到 4.3.0 后实测）：受影响范围是 "<= 4.2.0"，4.3.0 落在范围外 ⇒
+//   本地 `npm audit --json` 命中数由 1 变 0、high/critical 归零，本豁免**不再被消费**（静默通过，
+//   不再是 warning 显形）。但「升上去就修好了」并不成立：GitHub 侧 first_patched_version 仍为 null，
+//   且告警正文引用的 max-stale 判定表达式在 4.2.0/4.3.0 里**一字未改**；4.3.0 真正改的是
+//   `_varyMatches`（Vary 通配与原型继承属性误匹配，上游提交 9fb520b / b5dfe0c）——即「别人的缓存
+//   条目被判成本人可用」那条通路。⇒ 准确表述是「落到受影响范围外 + 上游顺手加固了 Vary 匹配」，
+//   不是「漏洞已由官方修复版修补」。
+// 因此本豁免**保留不删**：一旦 advisory 范围回扩（或有人把依赖降回 <=4.2.0），仍需它带 warning 显形，
+//   而不是让 CI 直接变红。注意本脚本没有「未被消费的豁免」检测（AG-03/AG-04 锁定空结果必 exit 0），
+//   所以这条豁免合完后会安静地躺着——这是有意的纵深防御，不是遗漏。
+// 复查条件：① GitHub 给出 first_patched_version；② 升级/替换 got 或本仓真的启用缓存路径
+//   （cacheOptions / forceCache / CachePolicy）；③ advisory 范围被修正。三者任一成立即回来复核本段。
 // 本脚本不豁免任何其他 advisory：凡存在非豁免的高危漏洞一律 exit 1。
 'use strict'
 const fs = require('fs')
 
 // 唯一豁免条目：advisory GHSA id → 豁免理由（会打进 warning 注解，供审计追溯）
+// ⚠️ 理由里「got@11 传递依赖已停更」这个子串被 test_audit_gate.js AG-07 钉住（防静默放行），
+//    改写文案时必须保留它。
 const ALLOWED_ADVISORIES = new Map([
-  ['GHSA-CH52-4W7C-C8XP', 'http-cache-semantics<=4.2.0 全版本中招且无修复版；got@11 传递依赖已停更；项目用法为直连推送 API，cacheable-request 缓存路径不生效，实际暴露面趋近于零（PR #194 豁免）']
+  ['GHSA-CH52-4W7C-C8XP', '4.3.0 已落在受影响范围 <=4.2.0 之外（实测 npm audit 命中归零），但 GitHub 侧 first_patched_version 仍为 null、告警引用的 max-stale 表达式一字未改 ⇒ 属「范围消解 + 上游 Vary 匹配加固」而非确认修复；got@11 传递依赖已停更；项目用法为直连推送 API，cacheable-request 缓存路径不生效，实际暴露面趋近于零（PR #194 豁免，PR #203 更新理由）']
 ])
 
 function main () {
