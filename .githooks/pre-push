@@ -58,6 +58,7 @@ set -e
 ref_lines=0
 push_shas=""
 if [ ! -t 0 ]; then
+  # shellcheck disable=SC2034  # remote_sha 是 pre-push 协议的固定列（stdin 四段），必须被 read 消费但不参与判断
   while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
     if [ -z "$local_ref" ]; then
       continue

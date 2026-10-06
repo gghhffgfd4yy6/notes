@@ -126,3 +126,13 @@
 - 变异行段同步重算：`xbk_sendNotify_slim.js` 由 1634 行缩到 1612 行（删 24 行死代码、白名单注释补 2 行说明）⇒ `sendnotify-part2` 的 `mutate` 由 `751-1634` 改为 `751-1612`（`1-750` 不变），`node scripts/check-mutation-ranges.js` 校验全覆盖与连续性。
 - 回归守卫：`test_sendnotify_utils.js` 新增「slim 导出面 16 个名字逐字一致」清单断言（多一个/少一个/改名都红），并显式断言内部请求封装对象 `$` 不在导出面上——死代码能长出来正是因为外部看不见它。
 - 行为零变化：删掉的代码从未被执行，推送请求、失败归因、脱敏、响应体上限的语义逐字不变；`README.md` / `SYSTEM_CONTRACT.md` 未提及 `$.get`，故不动。
+
+## v3.280
+
+- 新增静态扫描闸门 `scripts/check-ci-static.js`：`shellcheck` 扫 `.githooks/*` 全部钩子、`zizmor` 扫 `.github/workflows/`（medium 及以上计红；JSON 解析失败按「不可判定=红」fail-closed，与 `test_ci_skip_suites.js`「提取不出命令名 ⇒ 对账保持红」同口径）。同链纳入三处：`npm run check`（lint → 版本闸门 → 变异行段 → 静态扫描 → `npm test`）、pre-commit 第 4 道快检、CI quality job「版本一致性闸门」后新增步骤（zizmor 钉版 `==1.30.1`=本机基线，升级须两处同步）。动机是既有空白：原三道门禁只覆盖 JS 源码，shell 钩子与 workflow YAML 从未被扫描——「上游 step output 一律经 env 注入」这类 zizmor template-injection 约定一直靠人工与评审执行，没有本地执行者。
+- 缺工具语义：本机缺扫描器 ⇒ 显眼提示并跳过（不阻塞开发、绝不假装扫描过，CI 兜底）；CI（env `CI=true`）或 `--require-tools` ⇒ fail-closed 红，防「CI 里扫描器失踪 ⇒ 静默绿」——门禁不存在与门禁没跑，都不算通过。
+- **返工（PR #207 · SonarCloud 必需检查）**：`check-ci-static.js` 两处 `javascript:S4036`（New Code Security Rating 被判 <A）由「按名 spawn 扫描器」改为「纯 JS 扫 PATH 解析绝对路径后 spawn」——与本仓 `test_install_hooks.js` 对 git 的处理同款，**改代码消除、不挂 NOSONAR**；`--selftest` 扩到 11 断言（新增「假工具名解析为 null」「node 解析为绝对路径」）。`.codacy.yml` 排除论证同步为真实调用形态。
+- **返工 R2（PR #207 · CodeRabbit 评审 4 条，全采纳）**：① Major：zizmor 默认对无法解析的输入**警告后跳过**，扫描面会缺块而照绿——加 `--strict-collection`（本机实测坏 yml：默认 exit=3、strict exit=1，任何收集失败即红）；② Major：`runZizmor` 原先不读进程退出码，`--no-exit-codes` 只抑制「有发现⇒非零」，进程被杀/出错时 stdout 半截会被 `'[]'` 兜底读成「0 发现」假绿——新增纯函数 `decideZizmorProc(status, signal)`：**非 0 或被信号终止一律不采信输出**；③ Minor：pre-commit `run_gate` 成功路径吞掉「⚠️ 缺工具已跳过」行，无工具机器会显示全绿——run_gate 成功后透传 `⚠` 行（「本机 ⚠️×2 + exit 0、CI ❌×2 + exit 1」两向均已实测）；④ Minor：接线断言用不锚定的 `includes('npm run check:ci-static')`，会被 test.yml **自家注释**满足——「run 行被删、注释还在」会假绿，四处全部收紧为行首锚定的命令行形态正则。`--selftest` 随之扩到 15 断言（`decideZizmorProc` 4 条边界）。
+- 首次全仓扫描的两处真实发现，均已修：① `release.yml` 的 setup-node 原以注释声明「不启用缓存」的意图，zizmor 认定**省略参数 = 默认开启缓存**，报 cache-poisoning（high）——注释改为机器强制参数 `package-manager-cache: false`；② `.githooks/pre-push` 的 `remote_sha`（pre-push 协议 stdin 固定列，必须被 `read` 消费但不参与判断）被 shellcheck SC2034 误报，加行级 disable 并注明原因。此后 `shellcheck .githooks/*` 与 `zizmor --min-severity medium` 全仓均 0 发现。
+- test.yml 步骤变更对账说明（AGENTS 文档门禁条款）：新步骤命令 `npm run check:ci-static` 指向 `scripts/check-ci-static.js`，**不是** `test_*.js` 套件 ⇒ `test_suites.js` 与 `SKIP_SUITES` 无需变动（先例：`test:check-mutation-ranges` 同为非套件 npm 脚本步骤）。本机跑 `test_ci_skip_suites.js` 主流程双向对账通过；该文件更后段的子进程断言在本机的致命炸点属既有登记限制（AGENTS「本机验证盲区」），以 CI 对账为准。
+- `README.md` / `SYSTEM_CONTRACT.md` 不动：纯工程门禁增补，行为、配置、契约零变化。

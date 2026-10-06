@@ -74,6 +74,21 @@ jobs:
       - name: 版本一致性闸门（文件头 ↔ CHANGELOG ↔ package.json）
         run: node check-version.js
 
+      # v3.280 静态扫描闸门：shellcheck(.githooks/*) + zizmor(.github/workflows/)，与
+      # npm run check / pre-commit 同一条链（npm run check:ci-static）。zizmor 钉版本=本机基线，
+      # 升级须同时改本机与此处（防口径漂移）。CI 下缺工具由脚本 fail-closed——扫描器失踪=红，
+      # 「静默绿」等价于门禁不存在。
+      - name: 静态扫描闸门（shellcheck + zizmor）
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y -qq shellcheck
+          pipx install zizmor==1.30.1
+          npm run check:ci-static
+
+      # v3.280：接线断言套件（test_suites.js 标 mutationSkip，故必须像 test:install-hooks 一样
+      # 显式列步骤——否则脱门；摘除上面步骤或 pre-commit 门链，本步骤变红）。
+      - name: 静态扫描接线断言（test_ci_static_gates.js）
+        run: npm run test:ci-static-gates
+
       - name: 单元测试（test_filter.js，含 101 章版本校验）
         run: npm run test:filter
 
