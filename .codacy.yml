@@ -153,6 +153,20 @@
 # 调用链上都不成立，属误报（规则本身只放行字符串字面量首参，而本工具的首参按设计必然是调用方给出的变量）。
 # 注：同文件 `:173` 的「RegExp 构造函数传非字面量」**不属于**本类——已改代码消除（stripAnsi 去掉
 # 正则与构造函数，见脚本内注释），不是靠这条排除压掉的；此处排除只针对上面 6 处动态路径误报。
+#
+# scripts/check-ci-static.js 是静态扫描闸门（v3.280，pre-commit/CI 用，不进入生产运行时）：
+# fs 各调用的目标只由 ROOT=__dirname 常量与硬编码目录段 '.githooks' 拼成（existsSync/readdirSync/
+# lstatSync），readdirSync 枚举结果 f 仅参与拼接「本仓库自有钩子文件」的扫描路径；spawnSync 的
+# 命令名在本文件内只以硬编码字面量出现（toolAvailable 的调用点为 'shellcheck'/'zizmor'/自检桩名，
+# 扫描调用为固定 'shellcheck' 与固定 'zizmor' 参数组），「按名调用已安装扫描器」正是该工具脚本的
+# 本职工作，无任何外部净输入参与路径或命令构造——「动态构造文件/路径信息」告警属误报
+# （与 scripts/install-hooks.js、run_mutation.js 等同类工具脚本同一处理）。
+#
+# test_ci_static_gates.js 是 v3.280 静态扫描闸门的接线内容断言套件：
+# read(p) 的 p 只在本文件内以硬编码仓库相对路径字面量调用（package.json、.githooks/pre-commit、
+# .githooks/pre-push、.github/workflows/test.yml、.github/workflows/release.yml），fs.readFileSync
+# 目标 = __dirname + 常量拼接，目录与文件名均为测试常量、无外部净输入参与路径构造——
+# 「动态构造文件/路径信息」告警属误报（与 test_qinglong_utils.js / test_mutation_ranges.js 同口径）。
 exclude_paths:
   - ".github/analyze-artifacts.js"
   - "check-version.js"
@@ -185,3 +199,5 @@ exclude_paths:
   - "test_mutation_ranges.js"
   - "test_qinglong_utils.js"
   - "test_app_p.js"
+  - "scripts/check-ci-static.js"
+  - "test_ci_static_gates.js"
