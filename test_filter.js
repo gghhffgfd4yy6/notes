@@ -8438,11 +8438,22 @@ console.log('========================================\n');
   await test('性能: saveBatch 5000 条 <500ms（v3.118 索引化，原 2475ms）', () => {
     const msgs = []
     for (let i = 0; i < 5000; i++) msgs.push({ id: i % 3000, title: 'T' + i, url: '/u/' + (i % 3000) + '.html' })
-    const t0 = Date.now()
-    saveBatch(msgs, 'test_112_perf.json')
-    const ms = Date.now() - t0
-    const perfBudget = perfLimit(500) // 默认 500ms；沙箱按 PERF_MS 缩放（见文件头 PERF_MS 注释）
-    assertEqual(ms < perfBudget, true, `5000 条 saveBatch 应 <${perfBudget}ms，实际 ${ms}ms`)
+    // 口径统一（g16）：本条此前只缩放不重试 ⇒ 与其它性能基准同样「重试一次」(benchRetry)
+    // + perfLimit(PERF_MS 缩放)。阈值本身一字未改，改的只是采样次数。
+    // 措辞核准过，别把它读大：benchRetry 的覆盖面是「85. 性能基准」那一段（该段 3 处调用全在其中，
+    // 段内没有漏网的单采样）；本条住在 112 段，是**向那个口径看齐**，不是「同一族里的例外」。
+    // ⚠️ 全文件另有 5 处仍是单采样墙钟断言，本 PR 未动，别以为它们也已统一：
+    //   「模板不用Html内容 → rawHtml 惰性生效（100k content_html <500ms）」、
+    //   「Fuzz: 大数据量性能冒烟 10000 条 listfilter」、三条 sanitizeDecodedHtml 防回溯用例
+    //   （未闭合主动标签堆叠 <2s / 长 href+多标签不回溯 / 未闭合引号不回溯）。
+    //   它们的语义是「不得越过上限」的防挂起守卫，重试一次会把最坏耗时翻倍，是否并入需单独决策。
+    // 也别把 benchRetry 读成「治好了抖动」：它只挡单次尖峰。实测 12 个 CPU 燃烧进程压 8 核时，
+    // 同段早已用上 benchRetry 的 htmlToMarkdown（2075ms）与 tuisong_replace（978ms）连同本条（5410ms）
+    // 两轮全部超限判红 ⇒ 持续超载下重试救不了，能下的结论只有「本条不再比同族更脆」。
+    // 改动前的单采样实测：581-714ms 即判红（阈值 500ms）；而真实性能回归（原实现 2475ms）两轮都拦得住。
+    benchRetry(() => {
+      saveBatch(msgs, 'test_112_perf.json')
+    }, 500, '5000 条 saveBatch')
     try { require('fs').unlinkSync(getFilePath('test_112_perf.json')) } catch (e) { /* 忽略 */ }
   })
 
