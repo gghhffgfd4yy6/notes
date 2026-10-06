@@ -762,6 +762,29 @@ function assertSettled (outcome, label, why) {
     }
   }
 
+  // ===== 导出面守卫：slim 对外只允许这 16 个名字 =====
+  // 起因：本仓曾存在一段「谁都调不到、也没人能从外面看见」的死代码（`$` 对象上的 `$.get`，v3.279 删除）。
+  // 它能长期存活正是因为**内部对象不导出 ⇒ 没有任何测试够得着它**。这条守卫把导出面钉成显式清单：
+  // 新增/删除/改名导出都会在此点名；反过来，把 `$`、`channelError` 这类内部实现挂上导出面也需要有意识地说一句。
+  {
+    // 16 个名字，多一个/少一个/改名都红。
+    // 排序用**显式码元序比较器**：Sonar 的 S2871 会建议 localeCompare，但那正是本仓要避免的——
+    // 比较结果随宿主 ICU/locale 变（AGENTS.md「清单排序用显式码元序比较器而非随宿主 locale 变序的
+    // localeCompare，指纹跨机器稳定」同一条理由）。显式比较器同时满足规则与确定性。
+    // 两侧都排序 ⇒ 清单本身的书写顺序不再敏感（手写升序一旦漏排就是一个假红源）。
+    const byCodeUnit = (a, b) => (a < b ? -1 : (a > b ? 1 : 0))
+    const expectedExports = [
+      'configuredChannelCount', 'configuredChannelNames', 'getWxPusherProfileSummary', 'hasWxPusherConfigured',
+      'looksHtml', 'maskKey', 'maskUrl', 'mdImagesToPlain', 'mdLinksToPlain', 'mdToPlain',
+      'printWxPusherProfileSummary', 'push_config', 'safeErr', 'safeSlice', 'sendNotify', 'stripAngleTags'
+    ].sort(byCodeUnit)
+    const actual = Object.keys(slim).sort(byCodeUnit)
+    assert.deepStrictEqual(actual, expectedExports,
+      'slim 的导出面变了：多出来/少了名字会直接影响「谁能从外部测到谁」。变更需同步 CHANGELOG 与本清单')
+    assert.strictEqual('$' in slim, false, '内部请求封装对象 $ 不得导出（导出即成公共面，需按契约对待）')
+    console.log('✅ 导出面守卫：slim 对外 16 个名字逐字一致，内部对象未泄漏')
+  }
+
   // ============================================================
   // ===== 补测 SNA 簇（g12 第二批，按本机探针口径修正过形态）=====
   // 覆盖：失败聚合形状 / channelError 的 statusCode 来源优先级 / 一设备成功即通道成功 /
@@ -773,7 +796,7 @@ function assertSettled (outcome, label, why) {
   //     `$.post` 真实走 streamRequest(:354)，**根本不碰 got.post**。只桩 got.post/get 会真触网。
   //   · 非 2xx 在真实 got 下是 **error 事件**（err.response.statusCode），不是「response(4xx)+data」。
   //     所以业务失败一律演成 HTTP 200 + 业务码（真实代理确实这么回），传输失败一律演成 error 事件。
-  //   · `$.logErr` 在加载期就绑定 console.log(:447)，事后桩拦不到 ⇒ 本簇只断 err.failures 形状，
+  //   · `$.logErr` 在加载期就绑定 console.log(:425)，事后桩拦不到 ⇒ 本簇只断 err.failures 形状，
   //     不拿日志捕获当 catch 分支的判据。
   // 计时纪律：一律「记账 setTimeout 的延迟入参」，零墙钟阈值（PERF_MS 沙箱下不会假红）。
   {
@@ -810,7 +833,7 @@ function assertSettled (outcome, label, why) {
     gotMod.stream.post = snaMake
     gotMod.stream.get = snaMake
     // 记账型「假 AbortSignal」：真实 signal 只保证 aborted/addEventListener/removeEventListener 三件事，
-    // 这里额外记录注册与摘除，用来观测 :1000-1007 的 cleanup 卫生（真 AbortSignal 读不到内部监听器）。
+    // 这里额外记录注册与摘除，用来观测 :978-985 的 cleanup 卫生（真 AbortSignal 读不到内部监听器）。
     const duckSignal = () => {
       const rec = { added: [], removed: [], aborted: false }
       return {
@@ -838,7 +861,7 @@ function assertSettled (outcome, label, why) {
     }
 
     try {
-      // --- SNA-01：Bark 全部设备失败的聚合形状（:693 → aggregateChannelError :179-183）---
+      // --- SNA-01：Bark 全部设备失败的聚合形状（:671 → aggregateChannelError :179-183）---
       clearCfg(); snaCalls = []
       cfg.BARK_PUSH = 'https://api.day.app/snaDevA#https://api.day.app/snaDevB'
       snaHandler = () => ({ body: { code: 500, message: 'device key invalid' } }) // HTTP 200 + 业务失败码（真实形态）
@@ -855,7 +878,7 @@ function assertSettled (outcome, label, why) {
       assert.strictEqual('statusCode' in agg, false, '聚合层自己没有响应，不得凭空造 statusCode')
       console.log('✅ SNA-01 Bark 全设备失败：CHANNEL_BARK_FAILED + 逐设备 statusCode/providerCode 留痕')
 
-      // --- SNA-02：PushMe 全 key 失败聚合（:771，part2 段独立一行）+ 纯文本响应不得造 providerCode ---
+      // --- SNA-02：PushMe 全 key 失败聚合（:749，part2 段独立一行）+ 纯文本响应不得造 providerCode ---
       clearCfg(); snaCalls = []
       cfg.PUSHME_KEY = 'snaK1#snaK2#snaK3'
       snaHandler = () => ({ body: 'error' }) // PushMe 的成功判据是 body === 'success'
@@ -888,7 +911,7 @@ function assertSettled (outcome, label, why) {
       assert.strictEqual(inner2.statusCode, 503, 'err.response.statusCode 必须优先于 err.statusCode（三元顺序对调在此变红）')
       console.log('✅ SNA-03 channelError：response 形参 > err.response.statusCode > err.statusCode')
 
-      // --- SNA-04：一设备成功即通道成功（:692 results.some）——自 test_notify.js:248 移植 ---
+      // --- SNA-04：一设备成功即通道成功（:670 results.some）——自 test_notify.js:248 移植 ---
       // 移植理由：那条集成用例的用例体只有「await 不抛」、零断言；且 test_notify.js 标 integration:true，
       // 被 scripts/tap-shim.js:111 排除在变异测试集外 ⇒ `some→every`、`r && r.ok→r.ok` 对变异门禁完全隐形。
       clearCfg(); snaCalls = []
@@ -904,7 +927,7 @@ function assertSettled (outcome, label, why) {
       assert.strictEqual(snaCalls.length, 2, '两个设备各发一次，不得重试失败设备（改成失败即重试会变 3）')
       console.log('✅ SNA-04 Bark 一成一败：通道判成功且不重试失败设备（自集成档移植进变异集）')
 
-      // --- SNA-05：多通道失败摘要的 200 字符截断与「; 」逐字拼接（:1624-1628）---
+      // --- SNA-05：多通道失败摘要的 200 字符截断与「; 」逐字拼接（:1602-1606）---
       clearCfg(); snaCalls = []
       cfg.WX_XIZHI_KEY = 'https://xizhi.fake/sna05'
       cfg.DEER_KEY = 'PDK_sna05'
@@ -925,9 +948,9 @@ function assertSettled (outcome, label, why) {
       assert.deepStrictEqual(err.failures.map(f => f.channel), ['息知', 'pushdeer'], 'failures 顺序必须与 channelTasks 一致')
       console.log('✅ SNA-05 失败摘要：200 字符上限 + 「; 」逐字拼接 + 通道注册顺序')
 
-      // --- SNA-06/07/08：WxPusher 退避等待的算术、取消时机与监听器卫生（:1000-1023 / :1047）---
+      // --- SNA-06/07/08：WxPusher 退避等待的算术、取消时机与监听器卫生（:978-1001 / :1025）---
       // 假时钟冻结 ⇒ 19 次成功把窗口打满；第 20 次的等待用「记账 setTimeout 延迟入参」观测，
-      // 再决定在哪个时刻取消：调度时即已取消 ⇒ 命中 :1019 真支；派发后才取消 ⇒ 观测监听器摘除。
+      // 再决定在哪个时刻取消：调度时即已取消 ⇒ 命中 :997 真支；派发后才取消 ⇒ 观测监听器摘除。
       const realNow = Date.now
       const realST = global.setTimeout
       const fillWindow = async (token) => {
@@ -963,8 +986,8 @@ function assertSettled (outcome, label, why) {
         return waits
       }
       // (a) 时钟冻结 ⇒ 裸值 = 10000+10。只钉退避算术与取消语义。
-      //     ⚠️ 不宣称覆盖 :1019 的「进入等待时已 aborted」真支：生产在同一个同步段里读两次
-      //     `signal.aborted`（循环顶 :1027 与 :1018），中间没有 await ⇒ 真实运行时到不了那一支。
+      //     ⚠️ 不宣称覆盖 :997 的「进入等待时已 aborted」真支：生产在同一个同步段里读两次
+      //     `signal.aborted`（循环顶 :1005 与 :997），中间没有 await ⇒ 真实运行时到不了那一支。
       //     本条的收场确实从那一支走过，但判据只有「延迟值 + ABORT_ERR + 零请求」这三件与
       //     取消路径无关的事实，因此不存在「靠合成时序刷覆盖」的问题。
       {

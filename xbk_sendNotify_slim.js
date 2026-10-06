@@ -339,7 +339,7 @@ async function one () {
 
 // 推送层响应体上限（审查 F5/S3）：got@11 没有 maxResponseSize（实测 11.8.6 无该选项），promise API 会把
 // 整个响应体读进内存并再 JSON.parse——20MB 上限此前只在 xbk_http.fetchJson 的流式路径生效，推送出口
-// （$.post/$.get）完全没有上限。这里取 xbk_http.DEFAULT_MAX_BODY 的同一口径（同为 20MB）：官方 got 走流式
+// （$.post）完全没有上限。这里取 xbk_http.DEFAULT_MAX_BODY 的同一口径（同为 20MB）：官方 got 走流式
 // 限长读取，超限报 EBODYLIMIT（与 fetchJson 同错误码）并销毁流；测试注入的 got 替身通常只提供 promise API
 // （见 test_notify.js），此时保持原 promise 路径不变（调用方行为零变更）。
 // 刻意不 require('./xbk_http') 取常量：test_app.js 会先 require 本模块、之后才替换 require.cache 里的 got
@@ -352,8 +352,10 @@ function canStreamRequest (method) {
 }
 
 function streamRequest (method, url, options, callback) {
-  // 白名单闸门（跟进 Codacy dynamic-method-invocation，PR #154）：调用点只传 'post'/'get' 两个字面量，
+  // 白名单闸门（跟进 Codacy dynamic-method-invocation，PR #154）：调用点只传字面量 method，
   // 其余一律 fail-closed，避免「用非静态数据取对象方法再调用」这种形态。
+  // 现状（v3.279 删掉 $.get 死代码之后）：本模块唯一的调用点传 'post'；'get' 一侧保留是为了这个
+  // 通用助手仍可用于 GET 场景（无人依赖不等于能力该被砍），但它**没有调用方**，别当成已覆盖的路径。
   if (method !== 'post' && method !== 'get') throw new Error('streamRequest: 不支持的 method: ' + method)
   const stream = (method === 'post' ? got.stream.post : got.stream.get)(url, options)
   const chunks = []
@@ -417,30 +419,6 @@ const $ = {
         // 且各通道失败日志已统一 safeErr 摘要（打 message 不含响应内容）
         invalidateDnsForError(err, url)
         callback(err || new Error('请求失败'), null, null, err && err.timings)
-      }
-    )
-  },
-  get: (params, callback) => {
-    const { url, ...others } = params
-    if (canStreamRequest('get')) {
-      streamRequest('get', url, others, callback)
-      return
-    }
-    got.get(url, others).then(
-      (res) => {
-        let body = res.body
-        try {
-          body = JSON.parse(body)
-        } catch (error) {
-          // 预期路径：非 JSON 响应（HTML/文本）保留原始字符串，供各通道按需解析
-        }
-        callback(null, res, body)
-      },
-      (err) => {
-        // v3.75：失败时传 Error 对象而非响应体——API 异常响应体可能回显请求参数（含密钥），
-        // 且各通道失败日志已统一 safeErr 摘要（打 message 不含响应内容）
-        invalidateDnsForError(err, url)
-        callback(err || new Error('请求失败'))
       }
     )
   },
