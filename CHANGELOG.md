@@ -249,3 +249,11 @@
   - ① 入口 guard 的**第一版**写成 `require(...).guardOrExit()` 硬依赖，最小工作树（`test_ci_skip_suites.js` 的 RT-08 夹具只复制 `run_tests.js`）当场 MODULE_NOT_FOUND ⇒ 真红。改为**只吞 `MODULE_NOT_FOUND` 的容错 require + 响亮跳过**，其它异常照抛（吞掉一切异常会让真故障伪装成「已检查且干净」）；`test_host_clean_gates.js` 把「必须吞哪一种」和「必须响亮打印」两条都锁成断言。
   - ② 新套件注册进 `test_suites.js` 后忘了同步 `stryker.tap.config.js` 的 `tap.testFiles` 显式清单，由该文件**加载期断言**直接 throw 拦下（「两档测试集将不可比」）——这条防线本来就为这类漏写而存在，这次轮到我自己踩。补同步后校验：推导 35 ↔ 显式 35 逐元素一致，套件总数 50 = 35 单元 + 10 集成 + 5 变异跳过。
 - 版本 bump 至 3.283.0（四处同步）；主文件头仍 442 行 ⇒ 变异 `1-442` 全覆盖不变。
+
+## v3.284
+
+- `.github/workflows/test.yml` 新增 **`workflow_dispatch`** 手动补跑入口（带一个可选 `note` 输入，用来留下"为什么补跑"的痕迹）。动因是 v3.283 那次排查：PR 处于 CONFLICTING 时 GitHub **不创建任何 Actions run**（连 `github-actions` 的 check-suite 都不建），而当时既没有手动触发入口、额度端点又需要 token 没有的 `user` scope，只能靠 `mergeable` 反推——补上这个入口后，"事件没派发"不再是只能干等的状态。做法对齐仓内既有先例（`analyze-artifacts.yml` 就是「无 schedule、仅自身变更 push + 手动 workflow_dispatch」）。
+- **不改任何 job 语义**，逐条核实过：`concurrency.group` 本来就是 `…-${{ github.event.pull_request.number || github.ref }}`（dispatch 走 `github.ref` 兜底）；`coverage` job 仍写着 `if: github.ref == 'refs/heads/main'`，所以在功能分支上手动跑会**如实跳过**它，而不是假装跑过；其余 `if:` 都是 outcome 形态（`steps.*.outcome` / `always()`），与事件类型无关。
+- 接线钉住：`test_ci_skip_suites.js` 顶部新增断言——`on:` 必须同时含 `pull_request` / `push` / `schedule` / `workflow_dispatch` 四种触发，且 `workflow_dispatch` 必须带 `inputs.note`。这条是必要的：删掉 `workflow_dispatch:` 一行不会让任何既有测试变红，正属于本仓反复在防的「接上了但静默失效」那族。靶向反例已实测：删掉该行 ⇒ 断言点名「test.yml 的 on: 必须保留 workflow_dispatch 触发」。
+- 文档同步：`AGENTS.md` 的「测试与文档门禁」补一条手动补跑用法与边界，`CONTRIBUTING.md` 的 CI 小节补"怎么手动补跑一次 CI"。`README.md` / `SECURITY.md` / `SYSTEM_CONTRACT.md` 不动（运行方式与安全契约都没变）。
+- 版本 bump 至 3.284.0（四处同步）；主文件头仍 442 行 ⇒ 变异 `1-442` 全覆盖不变。

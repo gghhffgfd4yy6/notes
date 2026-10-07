@@ -5,6 +5,17 @@ name: Test
 on:
   pull_request:
     branches: [main]
+  # v3.284 手动补跑入口（对齐 analyze-artifacts.yml 的既有做法）：事件偶发不派发、换 runner 镜像后
+  # 要复核、或想在新 head 上重跑必需检查时，可以从 Actions 页手动跑同一条链。
+  # 不改任何 job 语义：concurrency 组的兜底是 `github.event.pull_request.number || github.ref`
+  # （dispatch 下走 github.ref）；coverage job 仍写着 `if: github.ref == 'refs/heads/main'`，
+  # 所以在功能分支上手动跑会如实跳过它，而不是假装跑过。
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 本次手动补跑的原因（只写进 run 标题旁的备注，不参与任何判定）
+        required: false
+        default: ''
   schedule:
     - cron: "0 8 * * *"   # 每日冒烟，防环境漂移
   push:

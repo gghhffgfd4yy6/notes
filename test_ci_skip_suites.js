@@ -18,6 +18,21 @@ const { SUITES } = require('./test_suites')
 assert.ok(fs.existsSync('package.json'), '请在仓库根目录运行本套件（CI 与沙箱均由仓库根启动）')
 const testYml = fs.readFileSync('.github/workflows/test.yml', 'utf8')
 const mutationYml = fs.readFileSync('.github/workflows/mutation.yml', 'utf8')
+
+// v3.284：test.yml 的触发集必须同时含 pull_request / push / schedule / workflow_dispatch。
+// 为什么锁它：手动补跑入口是「事件没派发时唯一能自证 CI 的手段」——2026-10-06 那次被这个坑绕了半天
+// （PR 处于 CONFLICTING 时 GitHub 不创建任何 Actions run，当时既没有手动入口、也读不到额度端点，
+// 只能靠 mergeable 反推）。删掉 `workflow_dispatch:` 不会让任何既有测试变红，所以在这里钉住
+// （靶向反例：删掉那一行 ⇒ 本断言必红）。
+{
+  const onBlock = testYml.slice(testYml.indexOf('\non:\n'), testYml.indexOf('\njobs:'))
+  for (const ev of ['pull_request:', 'push:', 'schedule:', 'workflow_dispatch:']) {
+    assert.ok(onBlock.includes('\n  ' + ev),
+      'test.yml 的 on: 必须保留 ' + ev.slice(0, -1) + ' 触发（缺了就没有那条 CI 路径）')
+  }
+  assert.ok(onBlock.includes('\n    inputs:\n      note:'),
+    'workflow_dispatch 必须带 note 输入位：手动补跑要留下「为什么补跑」的痕迹')
+}
 const pkg = require('./package.json')
 
 // ── 缓存身份门禁：定义与正向调用**前移**到本文件顶部（审查 finding R3-F1 的修法）────────────

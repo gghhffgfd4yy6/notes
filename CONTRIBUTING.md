@@ -28,6 +28,12 @@
 
 npm 不会自动注册仓库钩子，克隆后**必须显式装一次**；装完跑 `npm run hooks:verify` 确认门禁真的生效（只读，未生效 exit 1 并说明是配置缺失、钩子文件缺失还是无执行位）。`hooks:install` 对「跳过/不覆盖」场景按设计仍 exit 0，不能当作「装好了」的证据。
 
+## 手动补跑一次 CI（v3.284）
+
+- Actions 页 → Test → Run workflow，可选填 `note` 说明为什么补跑。或在装好 `gh` 的机器上：`gh workflow run test.yml --ref <分支> -f note="事件没派发，手动复核必需检查"`。
+- **它不是绕过门禁的后门**：`coverage` job 仍只在 main 跑，功能分支上手动跑会如实跳过该 job。
+- CI 看起来"没跑"时按这个次序查，别急着怀疑平台：① `gh pr view --json mergeable,mergeStateStatus` —— **PR 有冲突时 GitHub 不创建任何 Actions run**（v3.283 实测：rebase 到 main 变 MERGEABLE 的瞬间三条 run 全起来）；② `gh api repos/<owner>/<repo>/actions/permissions` 与各工作流 `state`；③ 最后才是额度（额度端点需要 `user` scope，本仓 token 没有，读不到就如实说读不到）。
+
 ## 静态扫描闸门（v3.280）
 
 - `npm run check:ci-static` = `shellcheck` 扫 `.githooks/*` 全部钩子 + `zizmor` 扫 `.github/workflows/` 全部（**medium 及以上计红**；zizmor 的 JSON 解析不出来按「不可判定 = 红」fail-closed）。
