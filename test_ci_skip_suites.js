@@ -865,6 +865,11 @@ const treeDir = makeRunTestsSandbox(
       "const path = require('path')",
       "fork(path.join(__dirname, 'stub_heartbeat.js'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })",
       'setInterval(() => {}, 1000)',
+      // 有界自杀（v3.283 纵深防御）：正常路径由 run_unit_tests 的整组 SIGKILL 收口（F6）；但若有人从
+      // 外面 kill -9 掉入口进程（本机 job_kill/timeout 就是这么把桩留成孤儿的），孙进程会被 reparent
+      // 到 1 并**永久**每 50ms 写盘，实测能把 test_filter 的 300ms 墙钟基准拖到 878ms。90s 上限远大于
+      // 本用例的观察窗（入口退出后只看数秒），不会掩盖「心跳未停」的真失败。
+      'setTimeout(() => process.exit(0), 90000).unref()',
       ''
     ].join('\n'),
     'stub_heartbeat.js': [
@@ -873,6 +878,8 @@ const treeDir = makeRunTestsSandbox(
       "const out = path.join(__dirname, 'heartbeat.txt')",
       "fs.writeFileSync(out, String(process.pid) + '\\n')",
       "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+      // 同上：孙进程自己也得有上限，否则父进程被外部杀掉后它无人可杀（ppid===1 后 killTree 到不了它）
+      'setTimeout(() => process.exit(0), 90000).unref()',
       ''
     ].join('\n')
   }

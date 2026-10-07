@@ -7,6 +7,18 @@
 // 套件挂死时入口仍能收敛出结论与退出码，不会永久阻塞（RT-03）；套件派生的后代由整组杀伤一并清掉（F6）。
 // ============================================================
 const { execFileSync } = require('child_process')
+
+// v3.283 主机干净度前置检查：孤儿测试桩 / 被 reparent 到 1 的孤儿套件 / 过期 /tmp/xbk-* 沙箱会把墙钟
+// 基准拖红（实测 300ms 跑出 878ms），脏机器不启动。缺脚本时**响亮跳过**——最小工作树（如
+// test_ci_skip_suites.js 的 RT-08 夹具只复制 run_tests.js）不得因此崩；其它异常照常抛出，不吞。
+let hostClean = null
+try {
+  hostClean = require('./scripts/check-host-clean.js')
+} catch (e) {
+  if (e.code !== 'MODULE_NOT_FOUND') throw e
+  console.log('⚠️ 未找到 scripts/check-host-clean.js，跳过主机干净度前置检查（不影响本次运行）')
+}
+if (hostClean && hostClean.guardOrExit(process.env)) process.exit(1)
 const path = require('path')
 const { checkDependencies } = require('./scripts/check-deps')
 
