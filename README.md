@@ -27,7 +27,7 @@ npm start
 
 - **`pre-commit`** —— 五道快检：lint → 版本闸门 → 变异行段校验 → 静态扫描（v3.280 起第 4 道）→ 文档行长（v3.281 起第 5 道）。本机实测 lint 约 22s、其余各 <1s。
 - **`pre-push`** —— 跑 `npm run test:filter`（约 60s，推送前拦截）。校验对象是**被推提交的内容**：`local_sha == HEAD` 且整棵工作树干净（含未跟踪文件；被 ignore 的不算）时在当前工作树跑（此时两者内容一致），否则在临时 worktree 里检出那个提交再跑、跑完清理；隔离环境建不起来即 fail-closed——绝不拿当前工作树的结果冒充被推提交的验证。
-- **`commit-msg`** —— 首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头，且不超过 100 字符。
+- **`commit-msg`** —— 首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且**标题与正文之间要留一个空行**（没空行时 git 会把整段当标题，长度限制与 `git log --oneline` 都会失真）。
 
 **装完请用 `npm run hooks:verify` 自检门禁是否真的生效**（只读：生效 exit 0，未生效 exit 1 并说明是配置缺失、钩子文件缺失还是无执行位）——`hooks:install` 对「跳过/不覆盖」场景按设计仍 exit 0，不能当作「装好了」的证据。
 
@@ -250,7 +250,7 @@ node -e "require('re2'); console.log('re2 ok')"   # 原生绑定在不在？
   DSHA_DNS_MODE=native npm run check
   ```
 
-  带该开关后本机汇总**不是固定值**：同一份内容（v3.280 那版 48 个套件）实测过 **48 通过 / 0 失败**、**47 / 1**，不带该开关是 **46 / 2**；v3.281（49 个套件）三轮为 **47 / 2**、**48 / 1**、**48 / 1**。唯一的波动源是 `test_run_mutation_cli.js`，而它与注入无关——`evaluate` 场景要在沙箱里跑完整 `run_unit_tests`，180s 看门狗（`test_run_mutation_cli.js:333` 的 `evaluate([], files, 180000)`，无 env 可调）在本机贴边：单跑与链内合计 **10 次观测 = 3 绿 7 红**（红 193–205s、绿 171.1–171.3s，失败文本逐字相同「沙箱内单元测试应整体通过，实际 timeout」）⇒ 是速度抖动，不是断言失败；把文档全部回退到上一版内容再跑，红绿分布不变 ⇒ 非回归。另有一条 `test_filter.js` 在一轮链内红过（54.7s），而单跑 824/824 全通过、另一轮链内 41.0s 也绿 ⇒ **成因未归因的时序敏感**，同样按轮次记录。**报本机结果必须带轮次与耗时**，这条的最终判据在 CI（上限就是按 CI runner 速度定的）。
+  带该开关后本机汇总**不是固定值**：48 套件那版实测过 **48/0**、**47/1**，不带开关是 **46/2**；v3.281（49 套件）三轮 **47/2**、**48/1**、**48/1**。波动源一直是 `test_run_mutation_cli.js`，而它与注入无关——旧语义只有一条 180s **墙钟总长**线，在慢机器上区分不了「跑得慢但仍在推进」与「挂死」：旧语义下合计 **10 次观测 = 3 绿 7 红**（红 193–205s、绿 171.1–171.3s，失败文本逐字相同「沙箱内单元测试应整体通过，实际 timeout」），把文档全部回退到上一版内容再跑、红绿分布不变 ⇒ 非回归。**v3.282 起这条不再抖**：挂死改由静默线判定（连续 `MUTATION_IDLE_MS`＝180s 无任何输出即 SIGKILL），总上限只作兜底，改后连续两轮 **199s / 196s 绿**——这两轮在旧语义下都会红。另有一条 `test_filter.js`：5 次观测 **3 绿 2 红**（绿 41–55s、红 54.7s 与 154s），红的轮次整套明显更慢 ⇒ 指向负载下的**墙钟基准断言**（`test_filter.js:115-127` 的 PERF_MS 口径），但未逐条复现到具体断言 ⇒ 按未归因记。**报本机结果必须带轮次与耗时**，跨环境的最终判据是 CI。
 - **Android/Termux 宿主**：`process.execPath` 指向 `linker64` ⇒ 凡 `execFileSync(process.execPath, […])` 的子进程断言必炸；`re2` 缺失 ⇒ 用户过滤正则一律被跳过（代码刻意不回退 V8），`test:filter` 的 regex 断言两个方向都失真。这类机器上只有**不 spawn 子进程**的那五道闸门可当判据：
   ```bash
   npm run lint
@@ -261,7 +261,7 @@ node -e "require('re2'); console.log('re2 ok')"   # 原生绑定在不在？
   npm run check:doc-lines                     # 文档行长闸门（纯 fs 遍历，同样不依赖外部工具）
   ```
 
-无论哪种宿主，**别拿「本机跑不了」当免除验证的理由**，也别拿本机的部分红绿冒充 CI 的结论。
+无论哪种宿主，**别拿「本机跑不了」当免除验证的理由**，也别拿本机的部分红绿冒充 CI 的结论。另：别在这台机器上跑变异评估（`npm run test:mutation`）——生产每批总上限 `MUTATION_TIMEOUT` 默认 90s，而本机跑完整套单元要 170–205s，会批量超时、分数不可信；真要本地跑就把两个预算一起抬：`MUTATION_TIMEOUT=600000 MUTATION_IDLE_MS=180000 npm run test:mutation`（v3.282 起挂死由静默线判定，慢但推进的子进程不再被误杀）。
 
 静态扫描需要两个外部工具：`shellcheck`（如 `apt install shellcheck`）与 `zizmor`（如 `pipx install zizmor`；CI 钉 **1.30.1** = 本仓基线，升级须同步 workflow 与本文件口径）。本机缺工具时闸门**显眼提示并跳过**——不阻塞开发，但绝不假装扫描过；CI（env `CI=true`）或显式加 `--require-tools` 时缺工具即红。
 
