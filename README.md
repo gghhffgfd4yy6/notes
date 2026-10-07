@@ -27,7 +27,7 @@ npm start
 
 - **`pre-commit`** —— 五道快检：lint → 版本闸门 → 变异行段校验 → 静态扫描（v3.280 起第 4 道）→ 文档行长（v3.281 起第 5 道）。本机实测 lint 约 22s、其余各 <1s。
 - **`pre-push`** —— 跑 `npm run test:filter`（约 60s，推送前拦截）。校验对象是**被推提交的内容**：`local_sha == HEAD` 且整棵工作树干净（含未跟踪文件；被 ignore 的不算）时在当前工作树跑（此时两者内容一致），否则在临时 worktree 里检出那个提交再跑、跑完清理；隔离环境建不起来即 fail-closed——绝不拿当前工作树的结果冒充被推提交的验证。
-- **`commit-msg`** —— 首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且**标题与正文之间要留一个空行**（没空行时 git 会把整段当标题，长度限制与 `git log --oneline` 都会失真）。
+- **`commit-msg`** —— 首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且**标题与正文之间要留一个空行**（没空行时 git 会把整段当标题，长度限制与 `git log --oneline` 都会失真）。`#` 注释行**不算**那个空行——注释是在钩子之后才按 cleanup 规则剔除的，「第 2 行注释 + 第 3 行正文」剔完就等于标题紧贴正文。
 
 **装完请用 `npm run hooks:verify` 自检门禁是否真的生效**（只读：生效 exit 0，未生效 exit 1 并说明是配置缺失、钩子文件缺失还是无执行位）——`hooks:install` 对「跳过/不覆盖」场景按设计仍 exit 0，不能当作「装好了」的证据。
 
@@ -210,6 +210,7 @@ npm run test:mutation-ranges  # 单独校验 mutation.yml 行段覆盖
 
 - 仓库内所有被扫描的 markdown（含 `.github/` 下的 PR 模板）都**不允许出现超过 1200 字符的单行**，超了直接红——巨行的实际代价不是难看，而是评审放弃逐字核对、diff 一行改动等于整行重写。
 - 三处接线同一阈值：`npm run check`、`pre-commit` 第 5 道、CI `quality-gate` 显式步骤；接线内容由 `test_doc_line_gates.js` 锁死（含「阈值 1200 不许偷偷放宽」「`.github` 不得被跳过」）。
+- 三处 fail-closed：扫描面为 0 个 md 判红、**扫描面里某个目录读不下去当场抛错并判红**、单文件读盘失败判红——「没扫到」和「扫不到」都不等于「全绿」。最长行按迭代求，不用 `Math.max(0, ...lines)`（spread 把每个行长度当实参压栈，实测 150k 行直接 RangeError ⇒ 闸门当场崩而不是判红）。
 - 没有按文件的例外名单。**处理办法是拆行**（按语义分成子弹/表格），不是调大阈值；改完跑 `npm run check:doc-lines` 自查。
 
 变异测试档位与墙钟（CI 侧口径，逐段选 runner，见 `.github/workflows/mutation.yml` 矩阵的 `config` 字段）：

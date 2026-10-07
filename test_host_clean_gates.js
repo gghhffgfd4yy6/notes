@@ -6,7 +6,7 @@
 // 不会让任何东西变红——与 v3.280 静态闸门、v3.281 文档行长闸门同一族失效方式。
 // 本套件是普通单元套件（不标 mutationSkip）：只读仓库文件 + 调纯函数；变异沙箱的 copyProject 会整体
 // 复制 scripts/，故沙箱内也能跑；由「全量单元测试（run_unit_tests.js）」兜底步骤覆盖，SKIP_SUITES 不动。
-// 判据本身的边界用例（NUL cmdline、ppid 排除、过期阈值覆盖等）在 --selftest 的 21 条里，不在此重复。
+// 判据本身的边界用例（NUL cmdline、ppid 排除、过期阈值覆盖等）在 --selftest 的 28 条里，不在此重复。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -79,6 +79,51 @@ check('此刻判定与真实环境一致（跳过或干净，二者其一）', (
   }
   assert.deepStrictEqual(r.stubs.map((x) => x.pid), [], '本机存在孤儿测试桩：' + JSON.stringify(r.stubs))
   assert.deepStrictEqual(r.suites.map((x) => x.pid), [], '本机存在孤儿套件进程：' + JSON.stringify(r.suites))
+})
+
+check('桩的孤儿判据必须要求「父进程已没」（review #211：活动桩不得报成孤儿）', () => {
+  const nul = String.fromCharCode(0)
+  const stub = (pid, ppid, dir) => ({ pid, ppid, cmdline: 'node' + nul + dir + '/test_stub_tree.js' + nul })
+  // 另一条终端此刻正在跑 test_ci_skip_suites.js：桩的父进程（1000）与再上一级（60）都在进程表里 ⇒ 不是孤儿
+  const runner = { pid: 60, ppid: 1, cmdline: 'node' + nul + '/root/x/test_ci_skip_suites.js' + nul }
+  const concurrent = [runner, stub(1000, 60, '/tmp/xbk-run-tests-other'), stub(1001, 1000, '/tmp/xbk-run-tests-other')]
+  assert.deepStrictEqual(host.findOrphanStubs(concurrent, 500, []), [],
+    '父进程仍在进程表里的活动桩必须放行——头注第 3 条「两条终端并发互不误伤」靠的就是这个判据')
+  // 真残留：被 reparent 到 1
+  assert.deepStrictEqual(host.findOrphanStubs([stub(1001, 1, '/tmp/xbk-run-tests-dead')], 500, []).map((x) => x.pid), [1001],
+    'reparent 到 1 的桩仍必须被抓到（摘掉特征匹配会让门禁对真残留失明）')
+  // 真残留的另一种形态：ppid 指向一个已经不在进程表里的 pid
+  assert.deepStrictEqual(host.findOrphanStubs([stub(1002, 8888, '/tmp/xbk-run-tests-dead')], 500, []).map((x) => x.pid), [1002],
+    '父进程已从进程表消失的桩同样算残留')
+  // 判据不许只写在注释里：源码必须有 ppid 这一层
+  const src = read('scripts/check-host-clean.js')
+  assert.match(src, /ppid === 1 \|\| !livePids\.has\(String\(ppid\)\)/,
+    'findOrphanStubs 的父进程判据被删 = 活动桩又被当成残留拦人')
+})
+
+check('沙箱活跃时间必须含直接子项与活进程 cwd（review #211：目录自身 mtime 不是活跃度）', () => {
+  const os = require('node:os')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-gate-liveness-'))
+  try {
+    const sb = path.join(tmp, 'xbk-mutant-x')
+    fs.mkdirSync(sb)
+    fs.writeFileSync(path.join(sb, 'out.log'), 'tick\n')
+    const past = new Date(Date.now() - 61 * 60 * 1000)
+    fs.utimesSync(sb, past, past) // 只把**目录自身**退回 61 分钟前：模拟「持续写已有文件」的活动沙箱
+    assert.ok(host.activityMtimeMs(sb) > Date.now() - 30 * 60 * 1000,
+      '直接子项的 mtime 必须计入活跃时间，否则活动沙箱会被判过期并收到 rm -rf 建议')
+    assert.ok(host.isActiveSandbox(sb, [path.join(sb, 'nested')]), '活进程 cwd 在沙箱内 = 活动')
+    assert.ok(!host.isActiveSandbox(sb, [sb + 'brother']), '前缀相似但不同目录不得豁免（必须按路径分段）')
+    // 接线：listStaleSandboxDirs 必须同时用上这两个信号
+    const src = read('scripts/check-host-clean.js')
+    assert.match(src, /return findStaleSandboxes\(entries, nowMs, staleMs\)\.filter\(\(d\) => !isActiveSandbox\(d\.p, cwds\)\)/,
+      'cwd 豁免被摘掉 = 变异评估等长任务的沙箱会被误报成残留')
+    assert.match(src, /mtimeMs: activityMtimeMs\(p\)/, '活跃时间又被换回目录自身 mtime')
+    // CodeQL「useless assignment」不复发：初值形态不得回到 let mtimeMs = NaN 再无条件覆盖
+    assert.ok(!/let mtimeMs = Number\.NaN/.test(src), 'mtimeMs 的无用初值形态回潮')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 console.log('✅ test_host_clean_gates 全部通过（' + checks + ' 检查）')

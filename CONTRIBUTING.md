@@ -4,7 +4,7 @@
 
 - 从 `main` 新建 `fix/*`、`feat/*`、`docs/*`、`chore/*`、`refactor/*`、`test/*` 分支（CI/工具链改动用 `ci/*` 或 `chore/*`）；不要直接修改 `main`。
 - 一次提交只做一件事。CI 全绿后使用 Squash Merge。
-- 提交信息首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且标题与正文之间**必须留一个空行**（三条都由 `commit-msg` 钩子硬拦；漏空行会让 git 把整段当标题，首行限制随之失效）。
+- 提交信息首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且标题与正文之间**必须留一个空行**（三条都由 `commit-msg` 钩子硬拦；漏空行会让 git 把整段当标题，首行限制随之失效）。`#` 注释行**不算**那个空行：git 随后会按 cleanup 规则剔掉注释，剔完标题与正文就贴在一起了。
 
 ## 改完要跑什么
 
@@ -13,8 +13,13 @@
 - 至少必须包含 `npm test`、`npm run lint`、`node check-version.js`。
 - **本机能不能当判据，先看宿主**（探针与细节见 `README.md` 的「本机能不能当判据：先探宿主」）：
   - 真 node + `re2` 齐备的 Linux 容器：整条 `npm run check` 可本机跑完。若环境注入 `NODE_OPTIONS=--require=<dns-compat.cjs>`，`test_agents.js` 会因起动时 `dns.lookup` 被替换而假红（并连带 `test_run_mutation_cli.js`）⇒ 加 `DSHA_DNS_MODE=native`（该兼容层自带开关）或 `env -u NODE_OPTIONS` 再跑，别把环境噪声报成回归。
-  - 本机汇总**不是固定值**：48 套件那版实测过 **48/0**、**47/1**、**46/2**；49 套件三轮为 **47/2**、**48/1**、**48/1**。唯一波动源 `test_run_mutation_cli.js` 与注入无关——`evaluate` 场景的 180s 沙箱看门狗在本机贴边（合计 10 次观测 **3 绿 7 红**：红 193–205s、绿 171.1–171.3s；当日台账，别当固定值），把文档回退到上一版内容再跑，红绿分布不变 ⇒ 非回归。另 `test_filter.js` 有一轮链内红（54.7s）、单跑 824/824 绿、另一轮链内 41.0s 绿 ⇒ 成因未归因的时序敏感。报本机结果要带轮次与耗时；这条的红写成「看门狗超时」而不是「契约失败」，判据在 CI。
-  - **脏机器不启动**（v3.283）：两个测试入口先自查主机干净度（孤儿测试桩 / reparent 到 1 的孤儿套件 / >30min 过期 `<os.tmpdir()>/xbk-*` 沙箱（Linux 即 `/tmp`）），命中即 exit 1 并给出清理命令——**机器脏了 ≠ 契约失败**（v3.282 实测：孤儿能把 `test_filter.js` 的 300ms 基准拖到 878ms，清场后 276ms）。跳过条件、30 分钟阈值与入口接线由 `test_host_clean_gates.js` 锁死；独立跑用 `npm run check:host-clean`。
+  - 本机汇总**不是固定值**：48 套件那版实测过 **48/0**、**47/1**、**46/2**；49 套件三轮为 **47/2**、**48/1**、**48/1**；50 套件在干净机器上 **50/0**（550.3s）。报本机结果一律带轮次与耗时。
+  - `test_run_mutation_cli.js` 曾经的抖动**已被 v3.282 的静默线治掉**，别再照旧台账理解它：旧语义只有一条 180s **墙钟总时限**，在慢机器上区分不了「跑得慢但仍在推进」和「挂死」，于是留下过 10 次观测 **3 绿 7 红**（红 193–205s、绿 171.1–171.3s）——**这组数字是旧语义下的历史台账，不是当前判据**。现在 `runTests` 是**静默线 + 总上限双轨**：连续无任何输出满 180s（`MUTATION_IDLE_MS`，默认 `DEFAULT_IDLE_MS=180000`）才判挂死；总上限只是兜底，`test_run_mutation_cli.js` 的 `evaluate` 场景给的是 600s，生产入口 `MUTATION_TIMEOUT` 仍是 90s。改后同一套件两轮 **199s / 196s 绿**；回归在 `test_run_mutation_race.js` 场景 F/G/H。
+  - `test_filter.js` 的红**已归因**，不是未归因的时序敏感：坏轮次红在 `基准: tuisong_replace 1000次 < 300ms`（脏机实测 878ms），清场后同条 **223–276ms** 通过。所以先跑 `npm run check:host-clean`（两个测试入口启动前也会自查）再谈结果，**别顺手放宽阈值**——这条预算守的是 O(n²) 退化的历史事故。看门狗类失败会写成「timeout」而不是「契约失败」；跨环境的最终判据在 CI。
+  - **脏机器不启动**（v3.283）：两个测试入口先自查主机干净度，命中即 exit 1 并给出清理命令——**机器脏了 ≠ 契约失败**。三类残留与它们的判据：
+    - **孤儿测试桩**（`stub_heartbeat` / `test_stub_tree`）与**孤儿套件进程**：特征只说明「它是测试夹具」，不说明它是残留——两者的孤儿判据都是**父进程已没**（`ppid===1`，或 ppid 不在进程表里）。只看特征会把另一条终端正在跑的活动桩报成孤儿，让第二个运行拒绝启动。
+    - **过期 `<os.tmpdir()>/xbk-*` 沙箱**（Linux 即 `/tmp`）：活跃时间取「目录自身 + 它的**直接子项**里最新的 mtime」，因为目录自身 mtime 只在增删/改名条目时前进（本机实测：往已有文件追加一次，目录 mtime 一秒没动）；只要有任何活进程把该沙箱当 cwd（`run_mutation.js` 的 `spawn({cwd: dir})` 正是这形态）就直接豁免——判红会打印 `rm -rf`，误判活动沙箱等于劝人删掉正在跑的运行。阈值 30 分钟由 `--stale-min` 可调、由断言钉住。
+    - 跳过条件（`XBK_MUTATION_CHILD=1`）、上述判据与入口接线由 `test_host_clean_gates.js` 锁死；独立跑用 `npm run check:host-clean`。
   - Android/Termux 宿主：`execPath` 指向 `linker64` ⇒ 子进程断言必炸；缺 `re2` ⇒ `test:filter` 失真 ⇒ 只有 lint / 版本闸门 / 变异行段 / 静态扫描 / 文档行长这五道不 spawn 子进程的闸门可当判据。
   - 两条共同的红线：**不要把本机全绿当作契约已验证**（CI 才是跨环境判据），也**不要用「本机跑不了」免除本机验证**。
 

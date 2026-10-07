@@ -10,8 +10,9 @@
 // 一倍余量（现值最长 885），这点差异不影响判定。不做按文件例外名单：一旦开了名单，名单本身
 // 就是下一个「静默失效」的入口（与 v3.280「新增钩子/workflow 不得假定没被扫描」同口径）。
 //
-// fail-closed：扫描面为空（0 个 md）判红。「一个都没扫到」不等于「全绿」，与 zizmor JSON 解析
-// 不出来按不可判定=红、CI 缺扫描器=红同族。
+// fail-closed 三处：① 扫描面为空（0 个 md）判红；② 扫描面里某个目录读不下去 ⇒ 遍历当场抛错、
+// main 判红（「没扫全」不等于「全绿」，静默 omit 一个目录就是下一个静默豁免的入口）；③ 单文件读盘
+// 失败判红。与 zizmor JSON 解析不出来按不可判定=红、CI 缺扫描器=红同族。
 //
 // 用法：node scripts/check-doc-lines.js [--selftest] [--max N]
 //   --selftest：纯函数断言（扫描面收集、行长判定、空扫描面判定），不依赖任何外部工具。
@@ -36,14 +37,19 @@ function isSkippedDir (name) {
 }
 
 // 收集扫描面：返回排序后的相对路径（POSIX 分隔）。确定性排序是断言可复现的前提。
-function findMarkdownFiles (rootDir) {
+// fail-closed：非跳过目录读不下去 ⇒ **抛出**而非静默 omit——扫描面不完整时 main 必须判红，
+// 否则「少扫了一个目录」与「全绿」在输出里长得一样（与 v3.280「新增钩子/workflow 不得假定没被
+// 扫描」同口径）。opts.readdir 仅供 --selftest / 门禁注入「读不到」这一情形：以 root 跑时 chmod 000
+// 不产生 EACCES，靠真实权限造不出来，故这里留出注入口而不是假装测过了。
+function findMarkdownFiles (rootDir, opts) {
+  const readdir = (opts && opts.readdir) || ((d) => fs.readdirSync(d, { withFileTypes: true }))
   const out = []
   const walk = (dir, rel) => {
     let entries
     try {
-      entries = fs.readdirSync(dir, { withFileTypes: true })
-    } catch {
-      return // 读不到的目录不参与判定（不因权限问题把门禁变红，也不静默宣称扫过）
+      entries = readdir(dir)
+    } catch (e) {
+      throw new Error('扫描面读取失败：目录 ' + (rel || dir) + ' 读不下去（' + ((e && e.code) || (e && e.message) || 'unknown') + '）')
     }
     for (const e of entries) {
       const childRel = rel ? rel + '/' + e.name : e.name
@@ -85,7 +91,13 @@ function checkOne (rootDir, rel, max) {
     return { rel, ok: false, reason: '读取失败：' + ((e && e.code) || (e && e.message) || 'unknown'), offenders: [] }
   }
   const offenders = scanOffenders(text, max)
-  return { rel, ok: offenders.length === 0, offenders, longest: Math.max(0, ...String(text).split('\n').map((l) => l.length)) }
+  // 最长行**迭代**求，不用 Math.max(0, ...lines.map(len))：spread 把每个行长度当一个实参压栈，
+  // 本机实测 100k 行 OK、150k 行 RangeError: Maximum call stack size exceeded —— 一个长 md 会让
+  // 闸门当场崩（而不是判红），门禁的可用性不该取决于被扫文件的行数。
+  const lines = String(text).split('\n')
+  let longest = 0
+  for (const l of lines) if (l.length > longest) longest = l.length
+  return { rel, ok: offenders.length === 0, offenders, longest }
 }
 
 function selftest () {
@@ -130,6 +142,31 @@ function selftest () {
     const missing = checkOne(tmp, '没有这个文件.md', MAX_DOC_LINE)
     assert.strictEqual(missing.ok, false)
     assert.match(missing.reason, /读取失败/)
+    // —— 目录读不下去 = 扫描面不完整 = 必须抛（旧实现在此静默 omit，main 仍报「全绿」）
+    assert.throws(() => findMarkdownFiles(path.join(tmp, '没有这个目录')), /扫描面读取失败/)
+    const boom = (d) => {
+      if (d === path.join(tmp, 'docs')) {
+        const err = new Error('EACCES')
+        err.code = 'EACCES'
+        throw err
+      }
+      return fs.readdirSync(d, { withFileTypes: true })
+    }
+    // 注入口是必需的：以 root 跑时 chmod 000 不产生 EACCES，真实权限造不出这一情形
+    assert.throws(() => findMarkdownFiles(tmp, { readdir: boom }), /扫描面读取失败：目录 docs .*EACCES/)
+    // 跳过名单不受影响：被跳过的目录根本不 open，读不到也不报错
+    assert.deepStrictEqual(findMarkdownFiles(tmp, {
+      readdir: (d) => {
+        if (d === path.join(tmp, 'node_modules')) throw new Error('不该被读到')
+        return fs.readdirSync(d, { withFileTypes: true })
+      }
+    }), ['a.md', 'docs/b.md'], '跳过名单的目录不得参与遍历，也不得因注入的读取失败而报错')
+    // —— 超长文件不得靠 spread 求最长行（150k 行会让 Math.max(...args) 当场 RangeError）
+    const hugeRel = 'huge.md'
+    fs.writeFileSync(path.join(tmp, hugeRel), Array.from({ length: 200000 }, () => 'x').join('\n'))
+    const huge = checkOne(tmp, hugeRel, MAX_DOC_LINE)
+    assert.strictEqual(huge.longest, 1, '200k 行文件的最长行必须算得出来（迭代求最大，不是 spread）')
+    assert.strictEqual(huge.ok, true, '200k 行但每行 1 字符 ⇒ 绿')
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }
@@ -137,7 +174,7 @@ function selftest () {
   const real = findMarkdownFiles(path.join(__dirname, '..'))
   assert.ok(real.length >= 7, '本仓至少应有 7 个 md 在册，实得 ' + real.length)
   assert.ok(real.includes('README.md') && real.includes('AGENTS.md') && real.includes('.github/pull_request_template.md'))
-  console.log('✅ check-doc-lines --selftest 全部通过（20 断言）')
+  console.log('✅ check-doc-lines --selftest 全部通过（26 断言）')
 }
 
 function main () {
@@ -153,7 +190,14 @@ function main () {
     return 1
   }
   const root = path.join(__dirname, '..')
-  const files = findMarkdownFiles(root)
+  let files
+  try {
+    files = findMarkdownFiles(root)
+  } catch (e) {
+    console.log('❌ ' + ((e && e.message) || String(e)))
+    console.log('   「扫描面不完整」不等于「全部通过」：与「空扫描面=红」「单文件读盘失败=红」同一条 fail-closed 口径')
+    return 1
+  }
   console.log('🔍 文档行长闸门：阈值 ' + max + ' 字符/行，扫描面 ' + files.length + ' 个 markdown')
   if (decideEmptyScan(files.length) === 'fail') {
     console.log('❌ 扫描面为空（一个 markdown 都没收集到）＝不可判定＝红；绝不把「没扫到」当「全绿」')

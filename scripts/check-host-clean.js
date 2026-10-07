@@ -11,9 +11,12 @@
 // 误拦控制（三条，都是必须的）：
 //   1. `XBK_MUTATION_CHILD=1`（stryker / run_mutation 的变异评估子进程）直接跳过——沙箱里跑全量套件时，
 //      `/tmp` 下本来就有活动沙箱，按「脏」判会立刻假红。
-//   2. 沙箱只认**过期**的：mtime 距今 > STALE_MS（默认 30min）。并发在跑的活动沙箱会被持续写，不会误报。
-//   3. 孤儿进程只认**已被 reparent 到 1**（ppid===1）或命中夹具特征者：两条终端并发正常跑测试时，
-//      子套件的父进程不是 1，互不误伤；非 Linux（读不到 /proc）响亮标注「该平台不检测」，绝不静默当成「已检查干净」。
+//   2. 沙箱只认**过期**的：活跃时间距今 > STALE_MS（默认 30min）。活跃时间取「目录自身与它的直接
+//      子项里最新的 mtime」，并且只要有一个活进程的 cwd 落在该沙箱里就直接放行——目录自身的 mtime
+//      只在增删/改名条目时前进，长时间只改已有文件的沙箱会被误判成残留（review #211）。
+//   3. 孤儿进程只认**已被 reparent 到 1**（ppid===1）或父进程已从进程表里消失者：两条终端并发正常
+//      跑测试时，活动桩/子套件的父进程都还在，互不误伤；非 Linux（读不到 /proc）响亮标注「该平台不
+//      检测」，绝不静默当成「已检查干净」。
 //      返回「该平台不检测」并响亮说明，绝不静默当成「干净」。
 //
 // 用法：node scripts/check-host-clean.js [--selftest] [--stale-min N]
@@ -41,6 +44,8 @@ function shouldSkipCheck (env) {
 }
 
 // 纯函数：哪些沙箱目录算「过期残留」。entries = [{p, mtimeMs}]，由调用方负责读取。
+// ⚠️ mtimeMs 传入的必须是**活跃时间**（见 activityMtimeMs），不是目录自身的 mtime：目录 mtime 只在
+// 增删/改名条目时前进，一个只往已有文件里追加写的长任务沙箱，目录 mtime 会停在创建那一刻。
 function findStaleSandboxes (entries, nowMs, staleMs) {
   const limit = Number.isInteger(staleMs) && staleMs > 0 ? staleMs : STALE_MS
   return entries
@@ -50,12 +55,81 @@ function findStaleSandboxes (entries, nowMs, staleMs) {
     .sort((a, b) => b.ageMin - a.ageMin)
 }
 
+// 沙箱的活跃时间 = 目录自身与它**直接子项**里最新的 mtime（lstat，不跟随符号链接）。
+// 为什么不是只看目录自身：写已有文件只推进那个文件自己的 mtime，不推进父目录的（本机实测：
+// 往 heartbeat.txt 追加一次，目录 mtime 一秒没动、文件 mtime +2s）。run_mutation 的变异沙箱、
+// test_ci_skip_suites 的沙箱夹具都会在沙箱里建缓存目录再持续写，两级都看才不会把活动沙箱判成残留。
+// 残余边界（如实登记）：写入落在孙辈及更深、且中途不在子项里增删条目时，这里仍会静止——
+// 那种情形由 isActiveSandbox 的活进程 cwd 信号兜住。
+function activityMtimeMs (dirPath) {
+  let newest = Number.NaN
+  const consider = (p) => {
+    let st
+    try {
+      st = fs.lstatSync(p) // lstat 而非 stat：公共可写目录里的同名条目可以是指向别处的符号链接
+    } catch {
+      return // 读不到就不参与判定（宁可漏报也不误删）
+    }
+    if (!Number.isFinite(st.mtimeMs)) return
+    // 初值是 NaN：NaN 参与任何比较都是 false，必须先用 !isFinite 开这个头，否则 newest 永远是 NaN
+    if (!Number.isFinite(newest) || st.mtimeMs > newest) newest = st.mtimeMs
+  }
+  consider(dirPath)
+  let names
+  try {
+    names = fs.readdirSync(dirPath)
+  } catch {
+    return newest // 子项读不到：只用自身时间，不因读不到就判脏
+  }
+  for (const n of names) consider(path.join(dirPath, n))
+  return newest
+}
+
+// 活进程占用的 cwd 集合（/proc/<pid>/cwd 的符号链接目标）。读不到 /proc ⇒ null = 该平台不提供
+// 这个信号（由调用方按「不检测」处理，绝不静默放行）。
+function liveSandboxCwds (procRoot) {
+  let pids
+  try {
+    pids = fs.readdirSync(procRoot).filter((s) => /^\d+$/.test(s))
+  } catch {
+    return null
+  }
+  const cwds = []
+  for (const pid of pids) {
+    try {
+      cwds.push(fs.readlinkSync(path.join(procRoot, pid, 'cwd')))
+    } catch {
+      // 僵尸/已退出/无权限的进程：没有 cwd 就少一个保护信号，不因此判脏
+    }
+  }
+  return cwds
+}
+
+// 纯函数：沙箱是否被某个活进程当作 cwd（run_mutation.js:400 的 spawn({cwd: dir}) 正是这个形态）。
+// 前缀判定按路径分段，避免 /tmp/xbk-a 命中 /tmp/xbk-ab（那是另一个沙箱）。
+function isActiveSandbox (dirPath, cwds) {
+  if (!Array.isArray(cwds) || cwds.length === 0) return false
+  const prefix = dirPath.endsWith(path.sep) ? dirPath : dirPath + path.sep
+  return cwds.some((c) => typeof c === 'string' && (c === dirPath || c.startsWith(prefix)))
+}
+
 // 纯函数：从 /proc/<pid>/cmdline 文本里挑出孤儿桩。selfPid 与 ancestors 排除在外。
+// 孤儿判据（review #211，与 findOrphanSuites 同口径）：桩的特征只说明「它是个测试夹具」，不说明它
+// 是**残留**。父进程还活着的桩属于正在跑的某次运行（另一条终端此刻在跑 test_ci_skip_suites.js 就是
+// 这种），把它报成孤儿会让第二个运行拒绝启动——头注第 3 条「两条终端并发互不误伤」正是被这个漏掉
+// 的判据破坏的。真孤儿的症状是父进程已经没了：被 reparent 到 1，或 ppid 指向一个已消失的 pid。
+// ppid<=0（stat 读不到）不参与判定，与 readProcs 里「进程刚退出/无权限：不参与判定」同口径。
 function findOrphanStubs (procs, selfPid, ancestors) {
   const skip = new Set([String(selfPid)].concat((ancestors || []).map(String)))
+  const livePids = new Set((procs || []).filter((x) => x).map((x) => String(x.pid)))
   return (procs || [])
     .filter((x) => x && !skip.has(String(x.pid)))
     .filter((x) => STUB_MARKERS.some((m) => String(x.cmdline || '').includes(m)))
+    .filter((x) => {
+      const ppid = Number(x.ppid)
+      if (!(ppid > 0)) return false
+      return ppid === 1 || !livePids.has(String(ppid))
+    })
     .map((x) => ({ pid: Number(x.pid), cmdline: pretty(x.cmdline) }))
 }
 
@@ -133,7 +207,7 @@ function ancestorPids (procRoot, pid) {
   return chain
 }
 
-function listStaleSandboxDirs (tmpRoot, nowMs, staleMs) {
+function listStaleSandboxDirs (tmpRoot, nowMs, staleMs, cwds) {
   let names
   try {
     names = fs.readdirSync(tmpRoot)
@@ -141,19 +215,13 @@ function listStaleSandboxDirs (tmpRoot, nowMs, staleMs) {
     return [] // 读不到 /tmp：不判脏也不谎报干净，由 main 的 scanned 标志体现
   }
   const base = tmpRoot.endsWith('/') ? '' : '/'
+  // 活跃时间取「目录自身 + 直接子项」的最新 mtime（目录 mtime 不随子文件写入前进，见 activityMtimeMs）；
+  // 另外任何把该沙箱当 cwd 的活进程都直接豁免——残留判红会打印 `rm -rf`，误判活动沙箱等于劝人删掉正在跑的运行。
   const entries = names.map((n) => {
     const p = tmpRoot + base + n
-    let mtimeMs = Number.NaN
-    try {
-      // lstatSync 而非 statSync：公共可写目录里的同名条目可以是指向别处的符号链接，跟随它等于
-      // 把判定建立在别人控制的 inode 上；这里只需要「这个名字存在吗、什么时候动的」。
-      mtimeMs = fs.lstatSync(p).mtimeMs
-    } catch {
-      mtimeMs = Number.NaN
-    }
-    return { p, mtimeMs }
+    return { p, mtimeMs: activityMtimeMs(p) }
   })
-  return findStaleSandboxes(entries, nowMs, staleMs)
+  return findStaleSandboxes(entries, nowMs, staleMs).filter((d) => !isActiveSandbox(d.p, cwds))
 }
 
 // 汇总判定：{ skipped, unsupported, stubs, dirs, ok }
@@ -170,7 +238,9 @@ function inspect (opts) {
   const anc = unsupported ? [] : ancestorPids(procRoot, selfPid)
   const stubs = unsupported ? [] : findOrphanStubs(procs, selfPid, anc)
   const suites = unsupported ? [] : findOrphanSuites(procs, selfPid, anc)
-  const dirs = listStaleSandboxDirs(tmpRoot, nowMs, staleMs)
+  // 活动沙箱的豁免信号来自同一份 /proc：读不到就没有豁免（也不会误删），与 unsupported 同口径
+  const cwds = unsupported ? [] : liveSandboxCwds(procRoot)
+  const dirs = listStaleSandboxDirs(tmpRoot, nowMs, staleMs, cwds)
   return { skipped: false, unsupported, stubs, suites, dirs, ok: stubs.length === 0 && suites.length === 0 && dirs.length === 0 }
 }
 
@@ -187,18 +257,27 @@ function selftest () {
   assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'xbk-x'), mtimeMs: Number.NaN }], now, undefined), [], 'stat 拿不到时间不判脏')
   assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'xbk-y'), mtimeMs: now - 20 * 60000 }], now, 10 * 60000).length, 1,
     'staleMs 可覆盖（20min > 10min 阈值）')
-  // —— 孤儿桩识别：命中特征、排除自己与祖先
+  // —— 孤儿桩识别：命中特征 **且父进程已没** 才算孤儿；排除自己与祖先
   const procs = [
-    { pid: 100, cmdline: 'node\u0000/tmp/xbk-run-tests-q/test_stub_tree.js\u0000' },
-    { pid: 101, cmdline: 'node\u0000/tmp/xbk-run-tests-q/stub_heartbeat.js\u0000' },
-    { pid: 102, cmdline: 'node\u0000./run_unit_tests.js\u0000' },
-    { pid: 103, cmdline: '' }
+    { pid: 100, ppid: 1, cmdline: 'node\u0000/tmp/xbk-run-tests-q/test_stub_tree.js\u0000' },
+    { pid: 101, ppid: 1, cmdline: 'node\u0000/tmp/xbk-run-tests-q/stub_heartbeat.js\u0000' },
+    { pid: 102, ppid: 1, cmdline: 'node\u0000./run_unit_tests.js\u0000' },
+    { pid: 103, ppid: 1, cmdline: '' },
+    // 另一次**正在跑**的运行里的活动桩：父进程还活着（200 在进程表里）⇒ 不得报成孤儿
+    { pid: 200, ppid: 60, cmdline: 'node\u0000/root/x/test_ci_skip_suites.js\u0000' },
+    { pid: 201, ppid: 200, cmdline: 'node\u0000/tmp/xbk-run-tests-live/test_stub_tree.js\u0000' },
+    // 父进程已从进程表消失（被外部 SIGKILL、尚未 reparent 到的窗口）⇒ 同样是残留
+    { pid: 301, ppid: 999, cmdline: 'node\u0000/tmp/xbk-run-tests-dead/stub_heartbeat.js\u0000' }
   ]
   const stubs = findOrphanStubs(procs, 102, ['1', '50'])
-  assert.deepStrictEqual(stubs.map((s) => s.pid), [100, 101], '两个桩都必须被抓到，正常命令与空 cmdline 不得被抓')
+  assert.deepStrictEqual(stubs.map((s) => s.pid), [100, 101, 301],
+    'reparent 到 1 的桩与父进程已消失的桩必须被抓到；活动运行的桩（201，父进程 200 仍在表里）不得被抓')
   assert.match(stubs[0].cmdline, /test_stub_tree\.js/, 'cmdline 里的 NUL 必须换成空格，便于直接打印')
-  assert.deepStrictEqual(findOrphanStubs(procs, 100, ['100']).map((s) => s.pid), [101], '自己与祖先链上的 PID 必须排除')
+  assert.deepStrictEqual(findOrphanStubs(procs, 100, ['100']).map((s) => s.pid), [101, 301], '自己与祖先链上的 PID 必须排除')
   assert.deepStrictEqual(findOrphanStubs([], 1, []), [], '空进程表不崩')
+  // ppid<=0（/proc/<pid>/stat 读不到）不参与判定，与 readProcs 的「无权限/刚退出」口径一致
+  assert.deepStrictEqual(findOrphanStubs([{ pid: 400, ppid: -1, cmdline: 'node\u0000x/stub_heartbeat.js' }], 1, []), [],
+    'ppid 读不到时不判孤儿（宁可漏报也不误拦两条并发运行）')
   // —— 孤儿套件：只认 ppid===1 的测试进程；活动子进程与非测试进程都不误伤
   const ps = [
     { pid: 200, ppid: 1, cmdline: 'node\u0000/root/x/test_filter.js\u0000' },
@@ -231,10 +310,33 @@ function selftest () {
     const r = inspect({ env: {}, procRoot: fake, tmpRoot: fake, nowMs: now, selfPid: 1 })
     assert.ok(r.dirs.some((d) => d.p.endsWith('xbk-run-tests-old')), '过期沙箱必须出现在结果里')
     assert.strictEqual(r.ok, false, '有过期沙箱即判不干净')
+    // —— 活动沙箱不得误报①：目录自身 mtime 停在 60min 前，但里面有一个刚写过的文件
+    //    （目录 mtime 不随子文件写入前进——这是本门禁原先的误判方向）
+    const active = path.join(fake, 'xbk-mutant-active')
+    fs.mkdirSync(active)
+    fs.writeFileSync(path.join(active, 'heartbeat.log'), 'tick\n')
+    fs.utimesSync(active, past, past)
+    assert.ok(activityMtimeMs(active) > now - 30 * 60000,
+      '直接子项的 mtime 必须算进活跃时间（只看目录自身会把活动沙箱判成残留）')
+    assert.ok(!inspect({ env: {}, procRoot: fake, tmpRoot: fake, nowMs: now, selfPid: 1 }).dirs
+      .some((d) => d.p.endsWith('xbk-mutant-active')), '只写已有文件的沙箱不得被判过期')
+    // —— 活动沙箱不得误报②：某活进程把它当 cwd（run_mutation 的 spawn({cwd: dir}) 形态）
+    const held = path.join(fake, 'xbk-mutant-held')
+    fs.mkdirSync(held)
+    fs.utimesSync(held, past, past)
+    fs.mkdirSync(path.join(fake, '4242'), { recursive: true })
+    fs.symlinkSync(held, path.join(fake, '4242', 'cwd'))
+    assert.ok(isActiveSandbox(held, liveSandboxCwds(fake)), 'cwd 落在沙箱里 = 该沙箱正在被使用')
+    assert.ok(!inspect({ env: {}, procRoot: fake, tmpRoot: fake, nowMs: now, selfPid: 1 }).dirs
+      .some((d) => d.p.endsWith('xbk-mutant-held')), '被活进程占用的沙箱不得进 rm -rf 建议清单')
+    // 前缀相似不得误豁免：/tmp/xbk-a 的保护信号不能顺带放过 /tmp/xbk-ab
+    assert.strictEqual(isActiveSandbox(path.join(fake, 'xbk-mutant-held'), [path.join(fake, 'xbk-mutant-held-other')]), false,
+      'cwd 前缀判定必须按路径分段，不能靠字符串前缀放行兄弟目录')
+    assert.strictEqual(isActiveSandbox(path.join(fake, 'xbk-mutant-held'), []), false, '无 cwd 信号时不豁免')
   } finally {
     fs.rmSync(fake, { recursive: true, force: true })
   }
-  console.log('✅ check-host-clean --selftest 全部通过（21 断言）')
+  console.log('✅ check-host-clean --selftest 全部通过（28 断言）')
 }
 
 function main () {
@@ -307,4 +409,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { STALE_MS, TMP_ROOT, shouldSkipCheck, findStaleSandboxes, findOrphanStubs, findOrphanSuites, ancestorPids, inspect, guardOrExit }
+module.exports = { STALE_MS, TMP_ROOT, shouldSkipCheck, findStaleSandboxes, findOrphanStubs, findOrphanSuites, ancestorPids, activityMtimeMs, liveSandboxCwds, isActiveSandbox, inspect, guardOrExit }

@@ -102,4 +102,64 @@ check('扫描面覆盖全部 prose 文档，且此刻全绿（闸门不该因存
     '闸门本身对当前仓库为红（本套件会先于此变红，逼着当场处理而不是留给 CI）：' + red.join(' '))
 })
 
+check('扫描面读取失败 = 红（review #211：不得静默 omit 读不到的目录）', () => {
+  // ① 遍历本身把读取失败抛出来（旧实现 `catch { return }` 会让「少扫了一个目录」输出成「全绿」）
+  assert.throws(() => gate.findMarkdownFiles(path.join(__dirname, '这个目录不存在')), /扫描面读取失败/)
+  const os = require('node:os')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-docgate-'))
+  try {
+    fs.mkdirSync(path.join(tmp, 'docs'), { recursive: true })
+    fs.writeFileSync(path.join(tmp, 'docs', 'a.md'), 'ok\n')
+    const boom = (d) => {
+      if (d === path.join(tmp, 'docs')) {
+        const e = new Error('EACCES')
+        e.code = 'EACCES'
+        throw e
+      }
+      return fs.readdirSync(d, { withFileTypes: true })
+    }
+    // 注入口是必需的：本仓 CI/开发机常以 root 跑，chmod 000 不产生 EACCES，真实权限造不出该情形
+    assert.throws(() => gate.findMarkdownFiles(tmp, { readdir: boom }), /扫描面读取失败：目录 docs .*EACCES/)
+    // ② 跳过名单一字未动：被跳过的目录根本不 open，注入读取失败也不得影响扫描面
+    assert.deepStrictEqual(gate.findMarkdownFiles(tmp, {
+      readdir: (d) => {
+        if (d === path.join(tmp, 'node_modules')) throw new Error('不该被读到')
+        return fs.readdirSync(d, { withFileTypes: true })
+      }
+    }), ['docs/a.md'])
+    // ③ main 的接线：读取失败必须被接住、响亮报红并返回 1（本套件不 spawn，故按字面量锚定）
+    const src = read('scripts/check-doc-lines.js')
+    assert.ok(src.includes('files = findMarkdownFiles(root)'), 'main 里对 findMarkdownFiles 的调用形态不得漂移')
+    assert.ok(src.includes('「扫描面不完整」不等于「全部通过」'),
+      'main 缺遍历失败的 fail-closed 分支 = 读不到目录时闸门照样绿')
+    assert.ok(!/catch \{\s*\n\s*return \/\/ 读不到的目录不参与判定/.test(src),
+      '旧「静默 omit」形态回潮：读不到的目录又被当成不用判定')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+check('最长行不得用 spread 求（review #211：150k 行会让 Math.max(...args) 当场 RangeError）', () => {
+  const src = read('scripts/check-doc-lines.js')
+  // 只看可执行行：脚本里的注释本身要解释「为什么不用 spread」，按全文匹配会自己咬自己
+  const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!/Math\.max\(0,/.test(code), 'checkOne 又用回 Math.max(0, ...lines)：长文件会崩而不是判红')
+  assert.ok(lineThat(code, /^return \{ rel, ok: offenders\.length === 0, offenders, longest \}$/),
+    'checkOne 的返回形态不得漂移（longest 仍是数字、offenders 仍在）')
+  const os = require('node:os')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-docgate-max-'))
+  try {
+    // 200k 行、其中一行超限：必须算出 longest 且判定正常（spread 形态在此必抛 RangeError）
+    const lines = Array.from({ length: 200000 }, () => 'x')
+    lines[100000] = 'y'.repeat(gate.MAX_DOC_LINE + 1)
+    fs.writeFileSync(path.join(tmp, 'huge.md'), lines.join('\n'))
+    const r = gate.checkOne(tmp, 'huge.md', gate.MAX_DOC_LINE)
+    assert.strictEqual(r.longest, gate.MAX_DOC_LINE + 1, 'longest 必须是最长行的真实长度')
+    assert.deepStrictEqual(r.offenders, [{ line: 100001, len: gate.MAX_DOC_LINE + 1 }], '超限行号与长度必须给全')
+    assert.strictEqual(r.ok, false)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 console.log(`✅ test_doc_line_gates 全部通过（${checks} 检查）`)

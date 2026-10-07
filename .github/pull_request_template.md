@@ -41,7 +41,7 @@
 - [ ] 涉及性能/安全：补充了变异测试或故障注入验证
 - [ ] 改动任何 `.md`（含 `.github/` 模板）：已跑 `npm run check:doc-lines`（单行 ≤1200 字符，无例外名单，只能拆行）
 - [ ] 改动 `.githooks/*` 或 `.github/workflows/*`：已跑 `npm run check:ci-static`（这两类文件默认全量被扫描，无豁免）
-- [ ] 本机跑不动的判据（`test:filter`、含子进程断言的套件）已在 **CI** 上验证——未把「本机全绿」当作契约已验证
+- [ ] **宿主跑不动**的判据已在 **CI** 上验证——这条只对**缺 `re2` 或 `execPath` 不是真 node 的宿主**成立（Android/Termux：`test:filter` 的 regex 断言两个方向都失真、含子进程断言的套件必炸）。真 node + `re2` 齐备的 Linux 容器里 `test:filter` 本机就能跑（本地 `pre-push` 钩子跑的正是它），**不得**把它一律当 CI-only 而免除本机验证。无论哪种宿主，都不把「本机全绿」当作契约已验证（探针见 `README.md`「本机能不能当判据：先探宿主」）
 
 ## 安全检查
 

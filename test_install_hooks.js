@@ -854,6 +854,16 @@ function runCommitMsg (lines) {
   assert.strictEqual(runCommitMsg(['docs: 只有标题、没有正文']).status, 0, '仅有一行标题必须通过')
   const commentLine = runCommitMsg(['ci: 标题', '# 注释行由 git 剔除，不该被当成正文开头', ''])
   assert.strictEqual(commentLine.status, 0, '第 2 行是注释行时不得判红：' + (commentLine.stdout + commentLine.stderr).slice(0, 200))
+  // 靶向反例（review #211）：注释行**不算**分隔空行。git 的 cleanup 会把 `#` 行剔掉，剔完标题与正文
+  // 直接相邻 ⇒ 整段并成 subject，「首行 ≤100 字符」随之失效。旧钩子把 `'#'*` 与空行并列放行 = 本用例红。
+  const commentAsSep = runCommitMsg(['chore: 标题', '# 这行会被 git 剔除', '正文第一段紧跟其后'])
+  assert.strictEqual(commentAsSep.status, 1, '第 2 行是注释、第 3 行是正文时必须红（注释剔除后没有空行分隔）')
+  assert.match(commentAsSep.stdout, /空行/, '红时仍要点名「空行」')
+  assert.match(commentAsSep.stdout, /# 注释行不算空行/, '红时必须解释「为什么注释不算」，否则修复者会再加一行注释')
+  // 注释行后面真的留了空行 ⇒ 合规（不得因为「有注释」就一律红）
+  assert.strictEqual(runCommitMsg(['chore: 标题', '# 注释', '', '正文']).status, 0, '注释后有空行分隔必须通过')
+  // 空白行（只有空格/制表符）等同空行：git 的 cleanup 会剥掉行尾空白，语义上是分隔
+  assert.strictEqual(runCommitMsg(['chore: 标题', '   ', '正文']).status, 0, '只有空白的第 2 行应视为分隔')
   // 靶向反例：漏空行必须红，且要说清「缺空行」与后果（只丢一句「格式错误」等于不教人怎么改）
   const noBlank = runCommitMsg(['chore: 标题', '第二行直接就是正文（标题后漏了空行）'])
   assert.strictEqual(noBlank.status, 1, '标题与正文之间漏空行必须红（旧钩子对此完全放行 = 本用例是靶向回退）')
