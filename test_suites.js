@@ -54,6 +54,10 @@ const SUITES = [
   // 而变异沙箱（copyProject）不复制 .githooks/ ⇒ 沙箱内必 ENOENT 假红（同 test_install_hooks 的
   // 登记先例）。CI 覆盖由 test.yml 的显式步骤「静态扫描接线断言」承担。
   { name: '静态扫描接线', file: 'test_ci_static_gates.js', desc: 'check:ci-static 三处接线（check 链 / pre-commit 第4道 / test.yml 步骤）内容断言 + 首轮扫描修复不回退', mutationSkip: true },
+  // mutationSkip（v3.281）：同 test_ci_static_gates 的理由——本套件断言 `.githooks/pre-commit` 与
+  // `test.yml` 的接线内容，而变异沙箱不复制 `.githooks/` ⇒ 沙箱内必 ENOENT 假红。
+  // CI 覆盖由 test.yml 的显式步骤「文档行长接线断言」承担。
+  { name: '文档行长接线', file: 'test_doc_line_gates.js', desc: 'check:doc-lines 三处接线（check 链 / pre-commit 第5道 / test.yml 步骤）内容断言 + 阈值与空扫描面 fail-closed 口径不回退', mutationSkip: true },
   // mutationSkip（PR #156 起）：本套件的 pre-push 端到端用例要读**仓库的** `.githooks/pre-push`
   // 并真跑 npm + git worktree，而变异沙箱（run_mutation.copyProject）只复制 scripts/qinglong/.github
   // 与各 test_*.js/xbk_*.js，不复制 `.githooks/` ⇒ 在沙箱内必然 ENOENT，使「沙箱内单元测试应整体通过」

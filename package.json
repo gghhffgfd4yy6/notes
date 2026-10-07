@@ -1,6 +1,6 @@
 {
   "name": "xbk-push",
-  "version": "3.280.0",
+  "version": "3.281.0",
   "description": "线报酷推送脚本——规则过滤 + 多通道推送 + 去重缓存 + 运行日志 + 完整测试体系",
   "main": "xbk_function_v3.js",
   "scripts": {
@@ -36,11 +36,13 @@
     "test:mutation-ranges-unit": "node test_mutation_ranges.js",
     "test:install-hooks": "node test_install_hooks.js",
     "test:ci-static-gates": "node test_ci_static_gates.js",
+    "test:doc-line-gates": "node test_doc_line_gates.js",
     "test:mutation": "stryker run",
     "test:mutation-ranges": "node scripts/check-mutation-ranges.js",
     "test:coverage": "c8 --reporter=text --reporter=lcov --reporter=json-summary --exclude='test_*.js' --exclude='run_tests.js' node run_tests.js",
     "check:ci-static": "node scripts/check-ci-static.js",
-    "check": "npm run lint && node check-version.js && node scripts/check-mutation-ranges.js && npm run check:ci-static && npm test",
+    "check:doc-lines": "node scripts/check-doc-lines.js",
+    "check": "npm run lint && node check-version.js && node scripts/check-mutation-ranges.js && npm run check:ci-static && npm run check:doc-lines && npm test",
     "verify": "npm run check",
     "hooks:install": "node scripts/install-hooks.js",
     "hooks:verify": "node scripts/install-hooks.js --verify"

@@ -25,7 +25,7 @@ npm start
 
 `npm run hooks:install` 把 `core.hooksPath` 指向 `.githooks`。npm 不会自动注册仓库钩子，需在安装后显式执行一次；若你已配置过其它 `core.hooksPath`，该脚本不会覆盖。钩子文件必须可执行：noexec 挂载或无执行位的检出会以非零码拒绝安装并提示。
 
-- **`pre-commit`** —— 四道快检：lint → 版本闸门 → 变异行段校验 → 静态扫描（v3.280 起第 4 道）。本机实测 lint 约 22s、其余各 <1s。
+- **`pre-commit`** —— 五道快检：lint → 版本闸门 → 变异行段校验 → 静态扫描（v3.280 起第 4 道）→ 文档行长（v3.281 起第 5 道）。本机实测 lint 约 22s、其余各 <1s。
 - **`pre-push`** —— 跑 `npm run test:filter`（约 60s，推送前拦截）。校验对象是**被推提交的内容**：`local_sha == HEAD` 且整棵工作树干净（含未跟踪文件；被 ignore 的不算）时在当前工作树跑（此时两者内容一致），否则在临时 worktree 里检出那个提交再跑、跑完清理；隔离环境建不起来即 fail-closed——绝不拿当前工作树的结果冒充被推提交的验证。
 - **`commit-msg`** —— 首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头，且不超过 100 字符。
 
@@ -180,29 +180,37 @@ diagnostics: {
 
 ## 测试
 
-`npm test`（`run_tests.js`）顺序执行全部 **48** 个套件：
+`npm test`（`run_tests.js`）顺序执行全部 **49** 个套件：
 
-- **34** 个单元套件 + **10** 个集成套件 + **4** 个「变异沙箱跳过」套件（2 个变异行段元校验 + `test_ci_static_gates.js` + `test_install_hooks.js`）。
+- **34** 个单元套件 + **10** 个集成套件 + **5** 个「变异沙箱跳过」套件（2 个变异行段元校验 + `test_ci_static_gates.js` + `test_doc_line_gates.js` + `test_install_hooks.js`）。
 - 前置跑一遍依赖预检 `scripts/check-deps.js`：探测清单由 `package.json` 的 `dependencies`/`optionalDependencies` 派生（声明了却没装即失败，不再只认硬编码的 `got`/`re2`），区分「未安装」与「已安装但不可用」并输出根因，同时校验运行时 Node 版本是否满足 `engines.node` 与 `re2` 自身的（更严的）`engines.node`，任一不满足即退出。
 - 该脚本也可直接执行（`node scripts/check-deps.js`，按检查结果 exit 0/1）。
 - 集成套件多数已 mock，个别仍可能受运行环境/网络影响。
 
-`npm run test:unit`（`run_unit_tests.js`）只跑那 34 个单元套件（跳过集成与 4 个变异沙箱跳过套件）。自 v3.278 起它按**并发池**执行（默认并发 8，`XBK_UNIT_CONCURRENCY` 可调），每套件仍是独立子进程、逐套件判定结果与串行版一致，只是把「N 个套件串行合计」压到「最长套件」；`XBK_MUTATION_CHILD=1`（stryker 与 `run_mutation.js` 的变异评估沙箱）时强制回退串行 1，以保持变异评估的 `PERF_MS` 性能断言口径不被并发扰动。
+`npm run test:unit`（`run_unit_tests.js`）只跑那 34 个单元套件（跳过集成与 5 个变异沙箱跳过套件）。自 v3.278 起它按**并发池**执行（默认并发 8，`XBK_UNIT_CONCURRENCY` 可调），每套件仍是独立子进程、逐套件判定结果与串行版一致，只是把「N 个套件串行合计」压到「最长套件」；`XBK_MUTATION_CHILD=1`（stryker 与 `run_mutation.js` 的变异评估沙箱）时强制回退串行 1，以保持变异评估的 `PERF_MS` 性能断言口径不被并发扰动。
 
 ```bash
-npm run check                 # 总门禁：lint → 版本四方一致 → 变异行段校验 → 静态扫描 → npm test
+npm run check                 # 总门禁：lint → 版本四方一致 → 变异行段校验 → 静态扫描 → 文档行长 → npm test
 npm run verify                # `npm run check` 的别名
 npm run check:ci-static       # 只跑静态扫描（shellcheck 扫 .githooks/* + zizmor 扫 .github/workflows/）
+npm run check:doc-lines       # 只跑文档行长闸门（任何 markdown 单行 > 1200 字符即红）
 npm test
 npm run test:unit
 npm run test:filter
 npm run test:ci-static-gates  # 静态扫描「三处接线」的内容断言（摘掉任一处接线，下一次 CI 必红在这里）
+npm run test:doc-line-gates # 文档行长「三处接线」的内容断言（同上，含阈值 1200 不许偷偷放宽）
 npm run test:app              # 集成测试并行调度（默认并发 8，`CONCURRENCY` 可调，失败片自动串行重跑）
 npm run test:app:serial       # 完整串行集成测试（并行失败兜底/定位问题时用）
 npm run test:notify
 npm run test:mutation         # Stryker 变异测试（需 devDependencies，耗时长；本地走 command 档 stryker.config.js）
 npm run test:mutation-ranges  # 单独校验 mutation.yml 行段覆盖
 ```
+
+文档行长闸门（v3.281）：
+
+- 仓库内所有被扫描的 markdown（含 `.github/` 下的 PR 模板）都**不允许出现超过 1200 字符的单行**，超了直接红——巨行的实际代价不是难看，而是评审放弃逐字核对、diff 一行改动等于整行重写。
+- 三处接线同一阈值：`npm run check`、`pre-commit` 第 5 道、CI `quality-gate` 显式步骤；接线内容由 `test_doc_line_gates.js` 锁死（含「阈值 1200 不许偷偷放宽」「`.github` 不得被跳过」）。
+- 没有按文件的例外名单。**处理办法是拆行**（按语义分成子弹/表格），不是调大阈值；改完跑 `npm run check:doc-lines` 自查。
 
 变异测试档位与墙钟（CI 侧口径，逐段选 runner，见 `.github/workflows/mutation.yml` 矩阵的 `config` 字段）：
 
@@ -237,19 +245,20 @@ node -e "console.log(process.execPath)"     # 真 node？还是 linker64？
 node -e "require('re2'); console.log('re2 ok')"   # 原生绑定在不在？
 ```
 
-- **装好真 node 与 `re2` 的 Linux 容器**：整条 `npm run check`（48 个套件）可以本机跑完。若环境注入了 `NODE_OPTIONS=--require=<dns-compat.cjs>`（DNS 兼容层，起动时替换 `dns.lookup`），`test_agents.js` 的「`dns.lookup` 未被猴补」前置检查会红，并连带 `test_run_mutation_cli.js`（它的 `evaluate` 场景要在沙箱跑全量单元）——那是**环境噪声不是回归**，加 `DSHA_DNS_MODE=native`（该兼容层自带开关）或 `env -u NODE_OPTIONS` 再跑：
+- **装好真 node 与 `re2` 的 Linux 容器**：整条 `npm run check`（49 个套件）可以本机跑完。若环境注入了 `NODE_OPTIONS=--require=<dns-compat.cjs>`（DNS 兼容层，起动时替换 `dns.lookup`），`test_agents.js` 的「`dns.lookup` 未被猴补」前置检查会红，并连带 `test_run_mutation_cli.js`（它的 `evaluate` 场景要在沙箱跑全量单元）——那是**环境噪声不是回归**，加 `DSHA_DNS_MODE=native`（该兼容层自带开关）或 `env -u NODE_OPTIONS` 再跑：
   ```bash
   DSHA_DNS_MODE=native npm run check
   ```
 
-  带该开关后本机汇总**不是固定值**：同一份内容实测过 **48 通过 / 0 失败**、**47 / 1**，不带该开关是 **46 / 2**。唯一的波动源是 `test_run_mutation_cli.js`，而它与注入无关——`evaluate` 场景要在沙箱里跑完整 `run_unit_tests`，180s 看门狗（`test_run_mutation_cli.js:333` 的 `evaluate([], files, 180000)`，无 env 可调）在本机贴边：单跑与链内合计 **7 次观测 = 3 绿 4 红**（红 200–205s、绿 171.3s，失败文本逐字相同「沙箱内单元测试应整体通过，实际 timeout」）⇒ 是速度抖动，不是断言失败；把文档全部回退到上一版内容再跑，红绿分布不变 ⇒ 非回归。**报本机结果必须带轮次与耗时**，这条的最终判据在 CI（上限就是按 CI runner 速度定的）。
-- **Android/Termux 宿主**：`process.execPath` 指向 `linker64` ⇒ 凡 `execFileSync(process.execPath, […])` 的子进程断言必炸；`re2` 缺失 ⇒ 用户过滤正则一律被跳过（代码刻意不回退 V8），`test:filter` 的 regex 断言两个方向都失真。这类机器上只有**不 spawn 子进程**的那四道闸门可当判据：
+  带该开关后本机汇总**不是固定值**：同一份内容（v3.280 那版 48 个套件）实测过 **48 通过 / 0 失败**、**47 / 1**，不带该开关是 **46 / 2**；v3.281（49 个套件）三轮为 **47 / 2**、**48 / 1**、**48 / 1**。唯一的波动源是 `test_run_mutation_cli.js`，而它与注入无关——`evaluate` 场景要在沙箱里跑完整 `run_unit_tests`，180s 看门狗（`test_run_mutation_cli.js:333` 的 `evaluate([], files, 180000)`，无 env 可调）在本机贴边：单跑与链内合计 **10 次观测 = 3 绿 7 红**（红 193–205s、绿 171.1–171.3s，失败文本逐字相同「沙箱内单元测试应整体通过，实际 timeout」）⇒ 是速度抖动，不是断言失败；把文档全部回退到上一版内容再跑，红绿分布不变 ⇒ 非回归。另有一条 `test_filter.js` 在一轮链内红过（54.7s），而单跑 824/824 全通过、另一轮链内 41.0s 也绿 ⇒ **成因未归因的时序敏感**，同样按轮次记录。**报本机结果必须带轮次与耗时**，这条的最终判据在 CI（上限就是按 CI runner 速度定的）。
+- **Android/Termux 宿主**：`process.execPath` 指向 `linker64` ⇒ 凡 `execFileSync(process.execPath, […])` 的子进程断言必炸；`re2` 缺失 ⇒ 用户过滤正则一律被跳过（代码刻意不回退 V8），`test:filter` 的 regex 断言两个方向都失真。这类机器上只有**不 spawn 子进程**的那五道闸门可当判据：
   ```bash
   npm run lint
   node check-version.js                       # 版本四方一致
   node scripts/check-mutation-ranges.js       # 变异行段覆盖与连续性
   npm run check:ci-static                     # 静态扫描（缺工具时显眼跳过，见下）
   node scripts/check-ci-static.js --selftest  # 该闸门自身的 15 条纯函数断言，不需要任何外部工具
+  npm run check:doc-lines                     # 文档行长闸门（纯 fs 遍历，同样不依赖外部工具）
   ```
 
 无论哪种宿主，**别拿「本机跑不了」当免除验证的理由**，也别拿本机的部分红绿冒充 CI 的结论。

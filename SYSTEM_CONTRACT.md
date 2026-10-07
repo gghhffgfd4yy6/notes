@@ -49,7 +49,7 @@
 
 ## 修改检查
 
-- 改判重、缓存、过滤、推送、网络、配置或文件存储：补针对性测试并运行 `npm run check`（= lint → 版本闸门 → 变异行段校验 → 静态扫描 → `npm test`，v3.280 起第 4 道）。
+- 改判重、缓存、过滤、推送、网络、配置或文件存储：补针对性测试并运行 `npm run check`（= lint → 版本闸门 → 变异行段校验 → 静态扫描 → 文档行长 → `npm test`，v3.280 起第 4 道、v3.281 起第 5 道）。
 - 改 `.githooks/*` 或 `.github/workflows/*`：必跑 `npm run check:ci-static`（`shellcheck` 扫全部钩子 + `zizmor` 扫全部 workflow，medium 及以上计红；zizmor JSON 解析不出来按「不可判定=红」fail-closed）。这两类文件**默认全量被扫描、没有豁免**；三处接线（`npm run check`、pre-commit 第 4 道、CI quality job 步骤）由 `test_ci_static_gates.js` 用内容断言锁死。CI 把 zizmor 钉在 `==1.30.1`，升级须两处同步。
 - 改单元/变异测试的执行方式：`run_unit_tests.js` 自 v3.278 起以**并发池**跑单元套件（默认并发 8，`XBK_UNIT_CONCURRENCY` 可调），但 `XBK_MUTATION_CHILD=1`（stryker 与 `run_mutation.js` 的变异评估沙箱）时**必须保持串行 1**——并发会让 `test_filter.js` 的 `PERF_MS` 性能断言口径漂移，把本应 Killed 的变异体误记成 Survived/Killed（分数失真）。并发与串行的逐套件判定结果必须一致，汇总/失败归因/`GITHUB_STEP_SUMMARY` 口径不变。
 - 改 `xbk_function_v3.js` / `xbk_sendNotify_slim.js` 等带行段的文件：同步重拆 `.github/workflows/mutation.yml` 行段并跑 `node scripts/check-mutation-ranges.js`。
@@ -57,6 +57,7 @@
   - `v3-entry` / `qinglong-push` / `check-deps` 是同一条独立根因：变异目标只在**子进程**里被执行（`test_utils_pure.js:449` 的 `execFileSync(node,['-e',fallbackProbe])` 在子进程里 `require('./xbk_function_v3')` 且断言只读子进程 stdout、`test_qinglong_utils.js` spawn `qinglong/xbk_push.js --status`、`test_check_deps.js` spawn `scripts/check-deps.js`），而覆盖 hook 只预加载在被 tap-runner spawn 的测试进程里 ⇒ 父进程无覆盖 ⇒ perTest 判 NoCoverage 且**不运行任何测试**，击杀静默丢失（A5 逐变异体 replay 实测：`v3-entry` **19** 个＝15 NoCoverage + 4 Survived，`qinglong-push` **15**，`check-deps` **3**）。
   - 这 4 段 score 因此与其余 15 段**不同口径**（未覆盖计入 Survived 而非 NoCoverage），跨段比较必须排除。改 tap 配置或矩阵时同步 `test_ci_skip_suites.js` 的缓存 key 断言并跑 `node scripts/check-mutation-ranges.js`（矩阵解析器允许条目有额外字段）。
 - 增删 `test_*.js` 或改 `test.yml` 显式步骤：同步 `test_suites.js` 与 `SKIP_SUITES`（由 `test_suite_registry.js`、`test_ci_skip_suites.js` 对账）。
+- 改任何 markdown 文档（含 `.github/` 下的模板）：必过 `npm run check:doc-lines`——单行 ≤1200 字符，无按文件例外名单，超限只能按语义拆行；扫描面为空或读盘失败一律判红（「没扫到」不等于「全绿」）。它守的是**形式**（可评审性），文档**内容**是否漏写仍无门禁，靠 PR 说明与评审兜。
 - 改版本：同步主文件头**首行**、`CHANGELOG.md`（最新取版本号**最大值**，不按文件位置）、`package.json`（补丁段必须为 `.0`）、`package-lock.json` 的**两个**根版本字段（顶层 `version` 与 `packages[""].version`）——现为**四方一致**，任一缺失或形态异常即 fail-closed，不允许「字段读不到就跳过」绕过门禁（`node check-version.js` 闸门）。
 - 改行为/配置/契约：同步更新 `README.md`、本文件与 `CHANGELOG.md`（涉及贡献/安全口径时一并改 `CONTRIBUTING.md` / `SECURITY.md`），避免文档与实现漂移。**现状要说清**：文档同步**没有内容门禁**——`check-version.js` 只校验 `CHANGELOG.md` 的最新版本标题与另外三方一致，不看内容是否描述本次改动；`README.md` / 本文件的同步完全靠约定与评审。因此 PR 说明必须点明「动了哪些文档 / 为什么不需要动」，评审逐条核对。
 - 破坏性 Git 操作先备份；密钥与本地配置绝不提交。
