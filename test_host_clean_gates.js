@@ -122,6 +122,8 @@ check('沙箱活跃时间必须含直接子项与活进程 cwd（review #211：�
     assert.match(src, /return findStaleSandboxes\(entries, nowMs, staleMs\)\.filter\(\(d\) => !isActiveSandbox\(d\.p, cwds\)\)/,
       'cwd 豁免被摘掉 = 变异评估等长任务的沙箱会被误报成残留')
     assert.match(src, /mtimeMs: activityMtimeMs\(p\)/, '活跃时间又被换回目录自身 mtime')
+    assert.match(src, /const entries = names\s+\.filter\(\(n\) => n\.startsWith\(SANDBOX_NAME_PREFIX\)\)/,
+      '必须先过滤 xbk-* 候选，再读取直接子项；否则无关大目录会拖慢每次入口检查')
     // CodeQL「useless assignment」不复发：初值形态不得回到 let mtimeMs = NaN 再无条件覆盖
     assert.ok(!/let mtimeMs = Number\.NaN/.test(src), 'mtimeMs 的无用初值形态回潮')
   } finally {

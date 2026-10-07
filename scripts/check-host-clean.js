@@ -32,7 +32,8 @@ const STALE_MS = 30 * 60 * 1000
 // 前缀与 run_mutation.js / test_ci_skip_suites.js 里 mkdtempSync(path.join(os.tmpdir(), 'xbk-…'))
 // 的落点同源，两边改形态时这里跟着变即可。
 const TMP_ROOT = os.tmpdir()
-const SANDBOX_PREFIX = path.join(TMP_ROOT, 'xbk-')
+const SANDBOX_NAME_PREFIX = 'xbk-'
+const SANDBOX_PREFIX = path.join(TMP_ROOT, SANDBOX_NAME_PREFIX)
 const STUB_MARKERS = ['stub_heartbeat', 'test_stub_tree']
 // 被外部 SIGKILL 打断的运行还会留下**孤儿套件进程**本身（被 reparent 到 1）——test_filter.js 一类
 // 持续吃 CPU 并写缓存目录，同样拖红墙钟基准。本次排查就抓到过一个 job_kill 留下的 test_filter。
@@ -214,13 +215,14 @@ function listStaleSandboxDirs (tmpRoot, nowMs, staleMs, cwds) {
   } catch {
     return [] // 读不到 /tmp：不判脏也不谎报干净，由 main 的 scanned 标志体现
   }
-  const base = tmpRoot.endsWith('/') ? '' : '/'
-  // 活跃时间取「目录自身 + 直接子项」的最新 mtime（目录 mtime 不随子文件写入前进，见 activityMtimeMs）；
+  // 先按名称过滤候选，避免无关的大目录进入 activityMtimeMs；随后取目录自身与直接子项的最新 mtime。
   // 另外任何把该沙箱当 cwd 的活进程都直接豁免——残留判红会打印 `rm -rf`，误判活动沙箱等于劝人删掉正在跑的运行。
-  const entries = names.map((n) => {
-    const p = tmpRoot + base + n
-    return { p, mtimeMs: activityMtimeMs(p) }
-  })
+  const entries = names
+    .filter((n) => n.startsWith(SANDBOX_NAME_PREFIX))
+    .map((n) => {
+      const p = path.join(tmpRoot, n)
+      return { p, mtimeMs: activityMtimeMs(p) }
+    })
   return findStaleSandboxes(entries, nowMs, staleMs).filter((d) => !isActiveSandbox(d.p, cwds))
 }
 

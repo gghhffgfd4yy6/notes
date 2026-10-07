@@ -838,12 +838,17 @@ function assertNoResidue (fx, label) {
 // bash 复用上面为 pre-push 解析好的绝对路径 BASH（按名 spawn 会被静态分析判 Sonar S4036）。
 const COMMIT_MSG_HOOK = path.join(__dirname, '.githooks', 'commit-msg')
 
-function runCommitMsg (lines) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-commitmsg-'))
+function runCommitMsg (lines, cleanup) {
+  const { dir, home } = makeCase()
   try {
     const file = path.join(dir, 'MSG')
     fs.writeFileSync(file, lines.join('\n'))
-    return spawnSync(BASH, [COMMIT_MSG_HOOK, file], { encoding: 'utf8' })
+    if (cleanup) {
+      initRepo(dir, home)
+      const set = spawnSync(GIT, ['config', 'commit.cleanup', cleanup], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+      assert.strictEqual(set.status, 0, `设置 commit.cleanup=${cleanup} 失败：${set.stderr}`)
+    }
+    return spawnSync(BASH, [COMMIT_MSG_HOOK, file], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -853,13 +858,16 @@ function runCommitMsg (lines) {
   assert.strictEqual(withBody.status, 0, '标题后留空行的多段提交必须通过：' + (withBody.stdout + withBody.stderr).slice(0, 200))
   assert.strictEqual(runCommitMsg(['docs: 只有标题、没有正文']).status, 0, '仅有一行标题必须通过')
   const commentLine = runCommitMsg(['ci: 标题', '# 注释行由 git 剔除，不该被当成正文开头', ''])
-  assert.strictEqual(commentLine.status, 0, '第 2 行是注释行时不得判红：' + (commentLine.stdout + commentLine.stderr).slice(0, 200))
+  assert.strictEqual(commentLine.status, 0, 'strip cleanup 下第 2 行注释会被 Git 剔除，空行分隔应通过：' + (commentLine.stdout + commentLine.stderr).slice(0, 200))
+  const whitespaceComment = runCommitMsg(['ci: 标题', '# whitespace 会保留这行', ''], 'whitespace')
+  assert.strictEqual(whitespaceComment.status, 1, 'commit.cleanup=whitespace 保留第 2 行注释时，不得把它当空行分隔')
+  assert.match(whitespaceComment.stdout, /空行/, 'whitespace 反例被拒绝时仍要点名空行')
   // 靶向反例（review #211）：注释行**不算**分隔空行。git 的 cleanup 会把 `#` 行剔掉，剔完标题与正文
   // 直接相邻 ⇒ 整段并成 subject，「首行 ≤100 字符」随之失效。旧钩子把 `'#'*` 与空行并列放行 = 本用例红。
   const commentAsSep = runCommitMsg(['chore: 标题', '# 这行会被 git 剔除', '正文第一段紧跟其后'])
   assert.strictEqual(commentAsSep.status, 1, '第 2 行是注释、第 3 行是正文时必须红（注释剔除后没有空行分隔）')
   assert.match(commentAsSep.stdout, /空行/, '红时仍要点名「空行」')
-  assert.match(commentAsSep.stdout, /# 注释行不算空行/, '红时必须解释「为什么注释不算」，否则修复者会再加一行注释')
+  assert.match(commentAsSep.stdout, /保留 # 行的 cleanup 模式下/, '红时必须解释「为什么注释不算」，否则修复者会再加一行注释')
   // 注释行后面真的留了空行 ⇒ 合规（不得因为「有注释」就一律红）
   assert.strictEqual(runCommitMsg(['chore: 标题', '# 注释', '', '正文']).status, 0, '注释后有空行分隔必须通过')
   // 空白行（只有空格/制表符）等同空行：git 的 cleanup 会剥掉行尾空白，语义上是分隔
