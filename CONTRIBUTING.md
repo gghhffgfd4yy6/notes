@@ -14,6 +14,7 @@
 - **本机能不能当判据，先看宿主**（探针与细节见 `README.md` 的「本机能不能当判据：先探宿主」）：
   - 真 node + `re2` 齐备的 Linux 容器：整条 `npm run check` 可本机跑完。若环境注入 `NODE_OPTIONS=--require=<dns-compat.cjs>`，`test_agents.js` 会因起动时 `dns.lookup` 被替换而假红（并连带 `test_run_mutation_cli.js`）⇒ 加 `DSHA_DNS_MODE=native`（该兼容层自带开关）或 `env -u NODE_OPTIONS` 再跑，别把环境噪声报成回归。
   - 本机汇总**不是固定值**：48 套件那版实测过 **48/0**、**47/1**、**46/2**；49 套件三轮为 **47/2**、**48/1**、**48/1**。唯一波动源 `test_run_mutation_cli.js` 与注入无关——`evaluate` 场景的 180s 沙箱看门狗在本机贴边（合计 10 次观测 **3 绿 7 红**：红 193–205s、绿 171.1–171.3s；当日台账，别当固定值），把文档回退到上一版内容再跑，红绿分布不变 ⇒ 非回归。另 `test_filter.js` 有一轮链内红（54.7s）、单跑 824/824 绿、另一轮链内 41.0s 绿 ⇒ 成因未归因的时序敏感。报本机结果要带轮次与耗时；这条的红写成「看门狗超时」而不是「契约失败」，判据在 CI。
+  - **跑墙钟敏感套件前先清场**：`pgrep -fal "stub_heartbeat|test_stub_tree"` 和 `ls -d /tmp/xbk-*` 都得为空。被 `job_kill` / `timeout` 中断的运行会留下 detached 桩进程（F6 的整组杀伤只覆盖 `run_unit_tests.js` 主动超时那条路径），实测能把 `test_filter.js` 的 300ms 基准拖到 878ms —— **机器脏了 ≠ 契约失败**（清干净后同一断言 276ms、全链 49/49）。
   - Android/Termux 宿主：`execPath` 指向 `linker64` ⇒ 子进程断言必炸；缺 `re2` ⇒ `test:filter` 失真 ⇒ 只有 lint / 版本闸门 / 变异行段 / 静态扫描 / 文档行长这五道不 spawn 子进程的闸门可当判据。
   - 两条共同的红线：**不要把本机全绿当作契约已验证**（CI 才是跨环境判据），也**不要用「本机跑不了」免除本机验证**。
 
