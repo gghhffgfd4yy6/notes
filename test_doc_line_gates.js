@@ -132,7 +132,9 @@ check('扫描面读取失败 = 红（review #211：不得静默 omit 读不到�
     assert.ok(src.includes('files = findMarkdownFiles(root)'), 'main 里对 findMarkdownFiles 的调用形态不得漂移')
     assert.ok(src.includes('「扫描面不完整」不等于「全部通过」'),
       'main 缺遍历失败的 fail-closed 分支 = 读不到目录时闸门照样绿')
-    assert.ok(!/catch \{\s*\n\s*return \/\/ 读不到的目录不参与判定/.test(src),
+    const silentOmit = src.split('\n').some((line, i, lines) =>
+      line.trim() === 'catch {' && lines[i + 1] && lines[i + 1].includes('读不到的目录不参与判定'))
+    assert.ok(!silentOmit,
       '旧「静默 omit」形态回潮：读不到的目录又被当成不用判定')
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })

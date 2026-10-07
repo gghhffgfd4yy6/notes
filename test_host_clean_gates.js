@@ -9,6 +9,7 @@
 // 判据本身的边界用例（NUL cmdline、ppid 排除、过期阈值覆盖等）在 --selftest 的 28 条里，不在此重复。
 const assert = require('node:assert')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 
 const host = require('./scripts/check-host-clean.js')
@@ -84,16 +85,18 @@ check('此刻判定与真实环境一致（跳过或干净，二者其一）', (
 check('桩的孤儿判据必须要求「父进程已没」（review #211：活动桩不得报成孤儿）', () => {
   const nul = String.fromCharCode(0)
   const stub = (pid, ppid, dir) => ({ pid, ppid, cmdline: 'node' + nul + dir + '/test_stub_tree.js' + nul })
+  const testTmpRoot = os.tmpdir()
   // 另一条终端此刻正在跑 test_ci_skip_suites.js：桩的父进程（1000）与再上一级（60）都在进程表里 ⇒ 不是孤儿
-  const runner = { pid: 60, ppid: 1, cmdline: 'node' + nul + '/root/x/test_ci_skip_suites.js' + nul }
-  const concurrent = [runner, stub(1000, 60, '/tmp/xbk-run-tests-other'), stub(1001, 1000, '/tmp/xbk-run-tests-other')]
+  const runner = { pid: 60, ppid: 1, cmdline: 'node' + nul + path.join(testTmpRoot, 'runner', 'test_ci_skip_suites.js') + nul }
+  const concurrentDir = path.join(testTmpRoot, 'xbk-run-tests-other')
+  const concurrent = [runner, stub(1000, 60, concurrentDir), stub(1001, 1000, concurrentDir)]
   assert.deepStrictEqual(host.findOrphanStubs(concurrent, 500, []), [],
     '父进程仍在进程表里的活动桩必须放行——头注第 3 条「两条终端并发互不误伤」靠的就是这个判据')
   // 真残留：被 reparent 到 1
-  assert.deepStrictEqual(host.findOrphanStubs([stub(1001, 1, '/tmp/xbk-run-tests-dead')], 500, []).map((x) => x.pid), [1001],
+  assert.deepStrictEqual(host.findOrphanStubs([stub(1001, 1, path.join(testTmpRoot, 'xbk-run-tests-dead'))], 500, []).map((x) => x.pid), [1001],
     'reparent 到 1 的桩仍必须被抓到（摘掉特征匹配会让门禁对真残留失明）')
   // 真残留的另一种形态：ppid 指向一个已经不在进程表里的 pid
-  assert.deepStrictEqual(host.findOrphanStubs([stub(1002, 8888, '/tmp/xbk-run-tests-dead')], 500, []).map((x) => x.pid), [1002],
+  assert.deepStrictEqual(host.findOrphanStubs([stub(1002, 8888, path.join(testTmpRoot, 'xbk-run-tests-dead'))], 500, []).map((x) => x.pid), [1002],
     '父进程已从进程表消失的桩同样算残留')
   // 判据不许只写在注释里：源码必须有 ppid 这一层
   const src = read('scripts/check-host-clean.js')
