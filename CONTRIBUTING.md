@@ -9,19 +9,19 @@
 ## 改完要跑什么
 
 - 常规代码改动跑 `npm run check`（别名 `npm run verify`），链路为：
-  `npm run lint` → `node check-version.js` → `node scripts/check-mutation-ranges.js` → `npm run check:ci-static` → `npm test`。
+  `npm run lint` → `node check-version.js` → `node scripts/check-mutation-ranges.js` → `npm run check:ci-static` → `npm run check:doc-lines` → `npm test`。
 - 至少必须包含 `npm test`、`npm run lint`、`node check-version.js`。
 - **本机能不能当判据，先看宿主**（探针与细节见 `README.md` 的「本机能不能当判据：先探宿主」）：
   - 真 node + `re2` 齐备的 Linux 容器：整条 `npm run check` 可本机跑完。若环境注入 `NODE_OPTIONS=--require=<dns-compat.cjs>`，`test_agents.js` 会因起动时 `dns.lookup` 被替换而假红（并连带 `test_run_mutation_cli.js`）⇒ 加 `DSHA_DNS_MODE=native`（该兼容层自带开关）或 `env -u NODE_OPTIONS` 再跑，别把环境噪声报成回归。
-  - 本机汇总**不是固定值**：同一份内容实测过 **48/0**、**47/1**，不带开关 **46/2**。唯一波动源 `test_run_mutation_cli.js` 与注入无关——`evaluate` 场景的 180s 沙箱看门狗在本机贴边（合计 7 次观测 **3 绿 4 红**：红 200–205s、绿 171.3s），把文档回退到上一版内容再跑，红绿分布不变 ⇒ 非回归。报本机结果要带轮次与耗时；这条的红写成「看门狗超时」而不是「契约失败」，判据在 CI。
-  - Android/Termux 宿主：`execPath` 指向 `linker64` ⇒ 子进程断言必炸；缺 `re2` ⇒ `test:filter` 失真 ⇒ 只有 lint / 版本闸门 / 变异行段 / 静态扫描这四道不 spawn 子进程的闸门可当判据。
+  - 本机汇总**不是固定值**：48 套件那版实测过 **48/0**、**47/1**、**46/2**；49 套件三轮为 **47/2**、**48/1**、**48/1**。唯一波动源 `test_run_mutation_cli.js` 与注入无关——`evaluate` 场景的 180s 沙箱看门狗在本机贴边（合计 10 次观测 **3 绿 7 红**：红 193–205s、绿 171.1–171.3s；当日台账，别当固定值），把文档回退到上一版内容再跑，红绿分布不变 ⇒ 非回归。另 `test_filter.js` 有一轮链内红（54.7s）、单跑 824/824 绿、另一轮链内 41.0s 绿 ⇒ 成因未归因的时序敏感。报本机结果要带轮次与耗时；这条的红写成「看门狗超时」而不是「契约失败」，判据在 CI。
+  - Android/Termux 宿主：`execPath` 指向 `linker64` ⇒ 子进程断言必炸；缺 `re2` ⇒ `test:filter` 失真 ⇒ 只有 lint / 版本闸门 / 变异行段 / 静态扫描 / 文档行长这五道不 spawn 子进程的闸门可当判据。
   - 两条共同的红线：**不要把本机全绿当作契约已验证**（CI 才是跨环境判据），也**不要用「本机跑不了」免除本机验证**。
 
 ## 本地钩子
 
 `npm run hooks:install` 注册 `.githooks`：
 
-- **`pre-commit`** —— 四道快检：lint / 版本闸门 / 变异行段校验 / 静态扫描（v3.280 起第 4 道）。本机实测 lint 约 22s、其余各 <1s。
+- **`pre-commit`** —— 五道快检：lint / 版本闸门 / 变异行段校验 / 静态扫描（v3.280 起第 4 道）/ 文档行长（v3.281 起第 5 道）。本机实测 lint 约 22s、其余各 <1s。
 - **`pre-push`** —— 跑 `npm run test:filter`（约 60s，推送前拦截）。校验对象是**被推提交的内容**：工作树不干净（含未跟踪文件；被 ignore 的不算）或推的不是当前 HEAD 时，改在临时 worktree 里检出那个提交再跑；隔离环境建不起来则 fail-closed——绝不拿当前工作树的结果冒充被推提交。
 - **`commit-msg`** —— 见上节的首行格式与长度限制。
 
@@ -33,6 +33,12 @@ npm 不会自动注册仓库钩子，克隆后**必须显式装一次**；装完
 - 同一条链在 `npm run check`、pre-commit 第 4 道、CI quality job 步骤**三处**接线，接线由 `test_ci_static_gates.js` 用内容断言锁死：摘掉任一处，下一次 CI 必红在该套件。
 - **新增钩子或 workflow 文件后不得假定它没被扫描**——这两类文件从此只有更严、没有豁免。
 - zizmor 在 CI 钉 `==1.30.1`（= 本机基线），**升级须两处同步**。本机缺工具时闸门显眼提示并跳过（绝不假装扫描过）；CI（env `CI=true`）或加 `--require-tools` 时缺工具即红。
+
+## 文档行长闸门（v3.281）
+
+- `npm run check:doc-lines` 让任何被扫描的 markdown 出现 **>1200 字符**的单行即红；三处接线同一阈值（`npm run check` / pre-commit 第 5 道 / CI `quality-gate` 显式步骤），接线由 `test_doc_line_gates.js` 用内容断言锁死（含「阈值必须恰为 1200」「`.github` 不得进跳过名单」「扫描面不得漏掉任何一份 prose」）。
+- **没有例外名单**：超了就按语义拆成子弹/表格，改完跑 `npm run check:doc-lines` 自查；把阈值调大 = 闸门形同虚设，那条断言会先红。
+- 为什么值得做一道门禁：巨行的代价不是难看，而是评审放弃逐字核对 + diff 一行改动等于整行重写；AGENTS 曾长到单行 8132 字符、CHANGELOG 4788，v3.280 才重切完，没有这道闸门它就会自然长回去。
 
 ## 变异测试：分数与档位
 

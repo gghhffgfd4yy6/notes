@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.280 — 静态扫描闸门：shellcheck + zizmor 进 check/pre-commit/CI 三处门禁 *********
+//* ******* 线报酷推送脚本 v3.281 — 文档行长闸门：1200 字符/行 进 check/pre-commit/CI 三处门禁 *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

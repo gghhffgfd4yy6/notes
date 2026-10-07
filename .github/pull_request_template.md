@@ -34,11 +34,12 @@
 
 ## 测试
 
-- [ ] `npm run check` 通过（lint → 版本四方一致 → 变异行段 → **静态扫描** → `npm test`）
+- [ ] `npm run check` 通过（lint → 版本四方一致 → 变异行段 → **静态扫描** → **文档行长** → `npm test`）
 - [ ] 单元测试通过（`npm run test:unit`：34 个单元套件，v3.278 起并发池执行，默认并发 8）
-- [ ] 全量套件通过（`npm test`：48 个套件**顺序**执行；集成侧另有并行调度器 `npm run test:app`，失败片自动串行重跑）
+- [ ] 全量套件通过（`npm test`：49 个套件**顺序**执行；集成侧另有并行调度器 `npm run test:app`，失败片自动串行重跑）
 - [ ] 新增了针对本改动的测试，且已注册到 `test_suites.js`（需要时同步 `SKIP_SUITES` 与 `test.yml` 显式步骤）
 - [ ] 涉及性能/安全：补充了变异测试或故障注入验证
+- [ ] 改动任何 `.md`（含 `.github/` 模板）：已跑 `npm run check:doc-lines`（单行 ≤1200 字符，无例外名单，只能拆行）
 - [ ] 改动 `.githooks/*` 或 `.github/workflows/*`：已跑 `npm run check:ci-static`（这两类文件默认全量被扫描，无豁免）
 - [ ] 本机跑不动的判据（`test:filter`、含子进程断言的套件）已在 **CI** 上验证——未把「本机全绿」当作契约已验证
 
