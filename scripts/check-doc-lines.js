@@ -56,7 +56,9 @@ function findMarkdownFiles (rootDir) {
     }
   }
   walk(rootDir, '')
-  return out.sort()
+  // 显式比较器：默认 sort 会把元素 toString 后按 UTF-16 码元字典序排（此处正是想要的稳定顺序），
+  // 但把口径写出来才能让「为什么是这个顺序」可见（Sonar S2879）。
+  return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 }
 
 // 纯函数：给文本与上限，返回超限的行（行号 1 起）。上限判定是「>」而非「>=」——恰好等于不算红。

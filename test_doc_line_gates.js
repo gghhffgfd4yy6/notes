@@ -66,7 +66,7 @@ check('test.yml：闸门步骤与接线断言步骤都在，且走同一条 npm 
     '接线断言步骤必须真跑本套件')
   // test.yml 不跑 npm run check（只有 release.yml 跑整链）——这句是「为什么必须在此显式列步骤」的
   // 前提，前提变了就该重新评估接线位置，故锁住。
-  assert.ok(!/^\s*npm run check$/m.test(yml),
+  assert.ok(!lineThat(yml, /^npm run check$/),
     'test.yml 里出现整链 `npm run check` 说明接线位置需要重新评估（本套件的显式步骤前提变了）')
 })
 

@@ -143,13 +143,13 @@ function listStaleSandboxDirs (tmpRoot, nowMs, staleMs) {
   const base = tmpRoot.endsWith('/') ? '' : '/'
   const entries = names.map((n) => {
     const p = tmpRoot + base + n
-    let mtimeMs = NaN
+    let mtimeMs = Number.NaN
     try {
       // lstatSync 而非 statSync：公共可写目录里的同名条目可以是指向别处的符号链接，跟随它等于
       // 把判定建立在别人控制的 inode 上；这里只需要「这个名字存在吗、什么时候动的」。
       mtimeMs = fs.lstatSync(p).mtimeMs
     } catch {
-      mtimeMs = NaN
+      mtimeMs = Number.NaN
     }
     return { p, mtimeMs }
   })
@@ -184,7 +184,7 @@ function selftest () {
   assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'xbk-run-tests-a'), mtimeMs: now - 60000 }], now, undefined), [],
     '1 分钟内的活动沙箱不得误报')
   assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'zz-not-xbk'), mtimeMs: now }], now, undefined), [], '非 xbk 前缀不参与判定')
-  assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'xbk-x'), mtimeMs: NaN }], now, undefined), [], 'stat 拿不到时间不判脏')
+  assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'xbk-x'), mtimeMs: Number.NaN }], now, undefined), [], 'stat 拿不到时间不判脏')
   assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'xbk-y'), mtimeMs: now - 20 * 60000 }], now, 10 * 60000).length, 1,
     'staleMs 可覆盖（20min > 10min 阈值）')
   // —— 孤儿桩识别：命中特征、排除自己与祖先

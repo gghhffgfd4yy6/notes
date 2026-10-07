@@ -44,9 +44,9 @@ check('不回退：变异子进程必跳过；沙箱只认过期；阈值必须�
     '变异评估子进程内必须跳过——沙箱里本来就有活动 /tmp 沙箱，按「脏」判会立刻假红')
   assert.strictEqual(host.shouldSkipCheck({}), false)
   const now = 1e12
-  assert.deepStrictEqual(host.findStaleSandboxes([{ p: '/tmp/xbk-a', mtimeMs: now - 60000 }], now, undefined), [],
+  assert.deepStrictEqual(host.findStaleSandboxes([{ p: path.join(host.TMP_ROOT, 'xbk-a'), mtimeMs: now - 60000 }], now, undefined), [],
     '1 分钟内的活动沙箱不得被误报（并发跑测试时 /tmp 里本来就有）')
-  assert.strictEqual(host.findStaleSandboxes([{ p: '/tmp/xbk-a', mtimeMs: now - 31 * 60000 }], now, undefined).length, 1,
+  assert.strictEqual(host.findStaleSandboxes([{ p: path.join(host.TMP_ROOT, 'xbk-a'), mtimeMs: now - 31 * 60000 }], now, undefined).length, 1,
     '超过阈值的残留沙箱必须被点名')
   assert.strictEqual(host.STALE_MS, 30 * 60 * 1000,
     '阈值被悄悄调小 = 并发场景假红；调大 = 门禁形同虚设')
