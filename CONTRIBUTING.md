@@ -4,7 +4,7 @@
 
 - 从 `main` 新建 `fix/*`、`feat/*`、`docs/*`、`chore/*`、`refactor/*`、`test/*` 分支（CI/工具链改动用 `ci/*` 或 `chore/*`）；不要直接修改 `main`。
 - 一次提交只做一件事。CI 全绿后使用 Squash Merge。
-- 提交信息首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头，且不超过 100 字符（由 `commit-msg` 钩子硬拦）。
+- 提交信息首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且标题与正文之间**必须留一个空行**（三条都由 `commit-msg` 钩子硬拦；漏空行会让 git 把整段当标题，首行限制随之失效）。
 
 ## 改完要跑什么
 

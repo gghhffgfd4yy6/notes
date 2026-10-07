@@ -832,5 +832,42 @@ function assertNoResidue (fx, label) {
   }
 }
 
+// ── commit-msg 钩子的规范校验回归（v3.282）─────────────────────────────────────
+// 为什么测它：本仓 v3.281 那个提交的标题与正文之间漏了一个空行，git 于是把整段当作 subject，
+// 「首行 ≤100 字符」这条既有门禁当场失效（git log --oneline 会打印整段正文），而钩子一声不吭。
+// bash 复用上面为 pre-push 解析好的绝对路径 BASH（按名 spawn 会被静态分析判 Sonar S4036）。
+const COMMIT_MSG_HOOK = path.join(__dirname, '.githooks', 'commit-msg')
+
+function runCommitMsg (lines) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-commitmsg-'))
+  try {
+    const file = path.join(dir, 'MSG')
+    fs.writeFileSync(file, lines.join('\n'))
+    return spawnSync(BASH, [COMMIT_MSG_HOOK, file], { encoding: 'utf8' })
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+{
+  const withBody = runCommitMsg(['chore: 标题（合规前缀）', '', '正文第一段。'])
+  assert.strictEqual(withBody.status, 0, '标题后留空行的多段提交必须通过：' + (withBody.stdout + withBody.stderr).slice(0, 200))
+  assert.strictEqual(runCommitMsg(['docs: 只有标题、没有正文']).status, 0, '仅有一行标题必须通过')
+  const commentLine = runCommitMsg(['ci: 标题', '# 注释行由 git 剔除，不该被当成正文开头', ''])
+  assert.strictEqual(commentLine.status, 0, '第 2 行是注释行时不得判红：' + (commentLine.stdout + commentLine.stderr).slice(0, 200))
+  // 靶向反例：漏空行必须红，且要说清「缺空行」与后果（只丢一句「格式错误」等于不教人怎么改）
+  const noBlank = runCommitMsg(['chore: 标题', '第二行直接就是正文（标题后漏了空行）'])
+  assert.strictEqual(noBlank.status, 1, '标题与正文之间漏空行必须红（旧钩子对此完全放行 = 本用例是靶向回退）')
+  assert.match(noBlank.stdout, /空行/, '红时必须点名「空行」')
+  assert.match(noBlank.stdout, /git log --oneline/, '红时必须解释后果，否则修复者不知道为什么被拦')
+  // 既有两条判据不回退
+  const noPrefix = runCommitMsg(['随便写点什么', '', '正文'])
+  assert.strictEqual(noPrefix.status, 1, '缺类型前缀仍必须红')
+  assert.match(noPrefix.stdout, /类型前缀/, '缺前缀的报错文案不得漂移')
+  const tooLong = runCommitMsg(['chore: ' + 'x'.repeat(200), '', '正文'])
+  assert.strictEqual(tooLong.status, 1, '首行超长仍必须红（新加的判据不能顶掉旧的）')
+  const bothWrong = runCommitMsg(['没有前缀也没有空行', '第二行'])
+  assert.strictEqual(bothWrong.status, 1, '同时违规必须红（顺序无关）')
+}
+
 console.log('✅ install-hooks --verify 只读自检：未生效 fail-closed / 生效 exit 0 / 不改配置不改权限；pre-push（v3.276）列入清单且缺失/无执行位均被检出')
 console.log('✅ pre-push 门禁对象回归（PR #156）：快路径只跑一次 / 脏工作树按**被推提交内容**判定（旧实现必红）/ 非当前检出走隔离 worktree 且清理干净 / 隔离建不起来即 fail-closed 不跑工作树 / 去重+删除引用+非推送上下文 / 一次推多个非 HEAD sha 时每个隔离 worktree 都被清理（旧实现必红）/ 未跟踪文件算脏：扫描式门禁下「提交 fail、工作树的未跟踪文件补绿」仍必须真红且门禁在隔离目录里跑（旧口径假绿，G 必红）+ 有未跟踪文件改走隔离路径（旧口径只警告仍走快路径，H 必红）')

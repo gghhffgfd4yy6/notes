@@ -14,6 +14,10 @@ const ROOT = __dirname
 // 此前这里只列了 8 个文件（CI 矩阵有 17 个），新增 mutate 目标时本地默认跑法会静默漏掉它，形成
 // 「本地跑过 = CI 也覆盖」的错觉，且没有任何门禁对账。该一致性现由 test_mutation_ranges.js 固定
 // （双向集合相等 + 每个目标可读），改 stryker.config.js 的 mutate 时必须同步本清单。
+// 「连续静默多久算挂死」的默认线（v3.282）。必须大于最慢的**单个套件静默时长**：
+// 变异评估子进程是串行跑（XBK_MUTATION_CHILD=1），期间 test_network 一类会静默 ~45s，
+// 180s 留了 4× 余量；真挂死（死循环 / 等一个不会来的输入）本来就一直静默，照样被杀。
+const DEFAULT_IDLE_MS = 180000
 const DEFAULT_FILES = [
   'xbk_function_v3.js', 'xbk_app.js', 'xbk_filter.js', 'xbk_formatter.js',
   'xbk_message_store.js', 'xbk_network.js', 'xbk_pusher.js', 'xbk_rules.js',
@@ -386,7 +390,7 @@ function killTree (child) {
   child.kill('SIGKILL')
 }
 
-function runTests (dir, timeoutMs) {
+function runTests (dir, timeoutMs, idleMs) {
   return new Promise(resolve => {
     // 变异评估必须跑全量套件 —— 清除 SKIP_SUITES，防止 CI 显式步骤的跳过清单继承到子进程使变异分数失真。
     // PERF_MS='3000'（RT-F8）：与 stryker 路径（scripts/mutation-child.js:13 / mutation.yml step env）同口径，
@@ -407,9 +411,14 @@ function runTests (dir, timeoutMs) {
     // 与实现 if (timedOut && (code === null || code === undefined)) 不符）。
     let timedOut = false
     let falloutTimer = null
-    child.stdout.on('data', d => { output += d })
-    child.stderr.on('data', d => { output += d })
-    const timer = setTimeout(() => {
+    // idleMs（v3.282）：把「挂死」的判据从**墙钟总长**改成**连续静默**。墙钟总长这条线在慢机器上
+    // 与「跑得慢但仍在前进的子进程」不可区分——手机容器/低配 VM 实测完整套单元 170–205s，
+    // 于是 180s 的总上限会把「慢」误报成「挂死」（timeout 形态），CI 上同一套却只要 115–120s。
+    // 静默线才是挂死的真实症状：子进程持续写 stdout/stderr 就说明它在推进，不该被杀。
+    // 结算契约一字未改（D1）：两条线都只置 timedOut + killTree，最终结论仍由 close 的真实 code 决定；
+    // 总上限继续存在（生产 MUTATION_TIMEOUT=90s 不变），只是多了一条「静默够久也算挂死」。
+    const idleEff = Number.isInteger(idleMs) && idleMs > 0 ? idleMs : DEFAULT_IDLE_MS
+    const trip = () => {
       timedOut = true
       killTree(child)
       // 兜底保险：kill 后若 close 迟迟不触发（极端情况），仍要 resolve 不让 Promise 悬空——
@@ -419,18 +428,25 @@ function runTests (dir, timeoutMs) {
       falloutTimer = setTimeout(() => {
         resolve({ status: 'timeout', code: null, signal: 'SIGKILL', output, summary: extractTestSummary(output) })
       }, 2000)
-    }, timeoutMs)
+    }
+    const timer = setTimeout(trip, timeoutMs)
+    let idleTimer = setTimeout(trip, idleEff)
+    const armIdle = () => { clearTimeout(idleTimer); idleTimer = setTimeout(trip, idleEff) }
+    child.stdout.on('data', d => { output += d; armIdle() })
+    child.stderr.on('data', d => { output += d; armIdle() })
     // 子进程 spawn 失败（如 PATH 里没有 node → ENOENT）只发 'error' 且不触发 'close'：未监听会抛
     // uncaughtException 让整轮调度器崩溃，Promise 也会一直悬到 2000ms 兜底定时器（review F5）。
     // 监听后按 fail 结算，并清掉超时/兜底两个定时器（90s 超时定时器不清理会无谓拖住进程）。
     // Promise 已 resolve 后 close 即使到达也只是被忽略，不会重复结算。
     child.on('error', error => {
       clearTimeout(timer)
+      clearTimeout(idleTimer)
       if (falloutTimer) clearTimeout(falloutTimer)
       resolve({ status: 'fail', code: null, signal: null, error: error.message, output, summary: extractTestSummary(output) })
     })
     child.on('close', (code, signal) => {
       clearTimeout(timer)
+      clearTimeout(idleTimer)
       if (falloutTimer) clearTimeout(falloutTimer)
       if (timedOut && (code === null || code === undefined)) {
         // 已过超时线且 close 没给真实退出码（被信号杀死，如我们的 SIGKILL）：退出码不可知、
@@ -522,12 +538,12 @@ function numberAfter (s, idx, kwLen) {
   return start < end ? s.slice(start, end) : null
 }
 
-async function evaluate (mutants, files, timeoutMs) {
+async function evaluate (mutants, files, timeoutMs, idleMs) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mutant-'))
   try {
     copyProject(dir, files)
     const appliedIds = applyMutants(dir, mutants)
-    const result = await runTests(dir, timeoutMs)
+    const result = await runTests(dir, timeoutMs, idleMs)
     return { ...result, mutants: mutants.map(m => m.id), appliedIds }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -582,8 +598,8 @@ function positiveIntEnv (name, fallback) {
 // mutation-report.json。这是本项目最典型的假绿：工作区越坏，变异分数越漂亮。故在写断点、进入批次循环
 // 之前先跑一次未套变异的基线（与 stryker 的 initial run 同口径）；基线不通过即非零退出并打印原因，
 // 不把「沙箱本来就红」归因给变异体。返回 null 表示基线通过，否则返回失败的运行结果。
-async function ensureBaselinePass (files, timeoutMs, runEvaluation) {
-  const result = await runEvaluation([], files, timeoutMs)
+async function ensureBaselinePass (files, timeoutMs, runEvaluation, idleMs) {
+  const result = await runEvaluation([], files, timeoutMs, idleMs)
   return result && result.status === 'pass' ? null : result
 }
 
@@ -594,6 +610,9 @@ async function main (deps) {
   const batchSize = positiveIntEnv('MUTATION_BATCH', 50)
   const concurrency = positiveIntEnv('MUTATION_CONCURRENCY', Math.max(1, Math.min(os.cpus().length, 8)))
   const timeoutMs = positiveIntEnv('MUTATION_TIMEOUT', 90000)
+  // 静默线可独立调（v3.282）：总上限管「跑太久」，静默线管「不再前进」。慢机器只该抬总上限，
+  // 静默线保持在最慢单套件静默时长之上即可——把它调得比总上限还大等于退回纯墙钟语义。
+  const idleMs = positiveIntEnv('MUTATION_IDLE_MS', DEFAULT_IDLE_MS)
   const checkpointFile = process.env.MUTATION_CHECKPOINT || path.join(ROOT, 'mutation-progress.json')
   // D3：不再 existsSync 预过滤（会把缺失的 DEFAULT_FILES 静默剔除，使 copyProject 的必选校验不可达，
   // 且 collectMutants 会先抛出裸 ENOENT）。缺文件属工作区损坏，按 main() 既有风格响亮报错 + 退出码 1，
@@ -607,7 +626,7 @@ async function main (deps) {
   const files = DEFAULT_FILES
   // 基线首跑（review F1）：必须在写断点/进入批次循环之前，且失败即中止——否则沙箱整体红会被
   // 逐批误判为「变异体已检出」（假绿 100%）。
-  const baselineFailure = await ensureBaselinePass(files, timeoutMs, runEvaluation)
+  const baselineFailure = await ensureBaselinePass(files, timeoutMs, runEvaluation, idleMs)
   if (baselineFailure) {
     console.error('❌ 基线运行失败（未套用任何变异体）：沙箱整体红，变异分数不可信，已中止本轮。')
     console.error(`   状态：status=${baselineFailure.status} code=${baselineFailure.code} signal=${baselineFailure.signal}` +
@@ -662,7 +681,7 @@ async function main (deps) {
   persist()
   while (pending.length) {
     const round = pending.splice(0, concurrency)
-    const results = await mapLimit(round, concurrency, batch => runEvaluation(batch, files, timeoutMs))
+    const results = await mapLimit(round, concurrency, batch => runEvaluation(batch, files, timeoutMs, idleMs))
     for (let i = 0; i < results.length; i++) {
       const result = results[i]
       const batch = round[i]
