@@ -20,10 +20,16 @@
 'use strict'
 
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 
 const STALE_MS = 30 * 60 * 1000
-const SANDBOX_PREFIX = '/tmp/xbk-'
+// tmp 根取自 os.tmpdir()，不写死 '/tmp'：macOS/Android 上根本不是这个路径（写死会在那些宿主上
+// 永远扫不到东西 = 静默失效），而 Sonar S5995 也把公共可写目录的字面量单独列为安全问题。
+// 前缀与 run_mutation.js / test_ci_skip_suites.js 里 mkdtempSync(path.join(os.tmpdir(), 'xbk-…'))
+// 的落点同源，两边改形态时这里跟着变即可。
+const TMP_ROOT = os.tmpdir()
+const SANDBOX_PREFIX = path.join(TMP_ROOT, 'xbk-')
 const STUB_MARKERS = ['stub_heartbeat', 'test_stub_tree']
 // 被外部 SIGKILL 打断的运行还会留下**孤儿套件进程**本身（被 reparent 到 1）——test_filter.js 一类
 // 持续吃 CPU 并写缓存目录，同样拖红墙钟基准。本次排查就抓到过一个 job_kill 留下的 test_filter。
@@ -139,7 +145,9 @@ function listStaleSandboxDirs (tmpRoot, nowMs, staleMs) {
     const p = tmpRoot + base + n
     let mtimeMs = NaN
     try {
-      mtimeMs = fs.statSync(p).mtimeMs
+      // lstatSync 而非 statSync：公共可写目录里的同名条目可以是指向别处的符号链接，跟随它等于
+      // 把判定建立在别人控制的 inode 上；这里只需要「这个名字存在吗、什么时候动的」。
+      mtimeMs = fs.lstatSync(p).mtimeMs
     } catch {
       mtimeMs = NaN
     }
@@ -153,7 +161,7 @@ function inspect (opts) {
   const env = opts.env || {}
   if (shouldSkipCheck(env)) return { skipped: true, reason: 'XBK_MUTATION_CHILD=1（变异评估沙箱内）', ok: true, stubs: [], suites: [], dirs: [] }
   const procRoot = opts.procRoot || '/proc'
-  const tmpRoot = opts.tmpRoot || '/tmp'
+  const tmpRoot = opts.tmpRoot || TMP_ROOT
   const nowMs = opts.nowMs || Date.now()
   const staleMs = opts.staleMs
   const procs = readProcs(procRoot)
@@ -170,13 +178,14 @@ function selftest () {
   const assert = require('node:assert')
   const now = 1e12
   // —— 过期判定：只认 /tmp/xbk-* 且超过阈值
-  assert.deepStrictEqual(findStaleSandboxes([{ p: '/tmp/xbk-run-tests-a', mtimeMs: now - 31 * 60000 }], now, undefined),
-    [{ p: '/tmp/xbk-run-tests-a', ageMin: 31 }], '31 分钟的沙箱必须被点名（含年龄）')
-  assert.deepStrictEqual(findStaleSandboxes([{ p: '/tmp/xbk-run-tests-a', mtimeMs: now - 60000 }], now, undefined), [],
+  const staleDir = path.join(TMP_ROOT, 'xbk-run-tests-a')
+  assert.deepStrictEqual(findStaleSandboxes([{ p: staleDir, mtimeMs: now - 31 * 60000 }], now, undefined),
+    [{ p: staleDir, ageMin: 31 }], '31 分钟的沙箱必须被点名（含年龄）')
+  assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'xbk-run-tests-a'), mtimeMs: now - 60000 }], now, undefined), [],
     '1 分钟内的活动沙箱不得误报')
-  assert.deepStrictEqual(findStaleSandboxes([{ p: '/tmp/other', mtimeMs: now }], now, undefined), [], '非 xbk 前缀不参与判定')
-  assert.deepStrictEqual(findStaleSandboxes([{ p: '/tmp/xbk-x', mtimeMs: NaN }], now, undefined), [], 'stat 拿不到时间不判脏')
-  assert.deepStrictEqual(findStaleSandboxes([{ p: '/tmp/xbk-y', mtimeMs: now - 20 * 60000 }], now, 10 * 60000).length, 1,
+  assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'zz-not-xbk'), mtimeMs: now }], now, undefined), [], '非 xbk 前缀不参与判定')
+  assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'xbk-x'), mtimeMs: NaN }], now, undefined), [], 'stat 拿不到时间不判脏')
+  assert.deepStrictEqual(findStaleSandboxes([{ p: path.join(TMP_ROOT, 'xbk-y'), mtimeMs: now - 20 * 60000 }], now, 10 * 60000).length, 1,
     'staleMs 可覆盖（20min > 10min 阈值）')
   // —— 孤儿桩识别：命中特征、排除自己与祖先
   const procs = [
@@ -204,11 +213,11 @@ function selftest () {
   // —— 跳过与平台不支持
   assert.strictEqual(shouldSkipCheck({ XBK_MUTATION_CHILD: '1' }), true, '变异评估子进程必须跳过（否则沙箱内活动沙箱→假红）')
   assert.strictEqual(shouldSkipCheck({}), false)
-  const missing = inspect({ env: {}, procRoot: '/proc/definitely-not-here', tmpRoot: '/tmp/definitely-not-here', nowMs: now, selfPid: 1 })
+  const missing = inspect({ env: {}, procRoot: path.join(TMP_ROOT, 'definitely-not-here'), tmpRoot: path.join(TMP_ROOT, 'definitely-not-here'), nowMs: now, selfPid: 1 })
   assert.strictEqual(missing.unsupported, true, '读不到 /proc 必须标为「该平台不检测」，不得当成已检查')
   assert.strictEqual(missing.ok, true)
   assert.strictEqual(missing.skipped, false)
-  const skipped = inspect({ env: { XBK_MUTATION_CHILD: '1' }, procRoot: '/proc', tmpRoot: '/tmp', selfPid: 1 })
+  const skipped = inspect({ env: { XBK_MUTATION_CHILD: '1' }, procRoot: '/proc', tmpRoot: TMP_ROOT, selfPid: 1 })
   assert.strictEqual(skipped.skipped, true)
   assert.strictEqual(skipped.ok, true)
   // —— 真脏：用临时 tmp 造一个过期目录
@@ -249,7 +258,7 @@ function main () {
     console.log('⚠️ 读不到 /proc，本机不做孤儿桩检测（**不等于已检查干净**）；沙箱过期检查仍在跑')
   }
   if (r.ok && !r.unsupported) {
-    console.log('✅ 主机干净：无孤儿测试桩 / 孤儿套件进程、无过期 /tmp/xbk-* 沙箱')
+    console.log('✅ 主机干净：无孤儿测试桩 / 孤儿套件进程、无过期 ' + SANDBOX_PREFIX + '* 沙箱')
     return 0
   }
   if (!r.ok) {
@@ -298,4 +307,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { STALE_MS, shouldSkipCheck, findStaleSandboxes, findOrphanStubs, findOrphanSuites, ancestorPids, inspect, guardOrExit }
+module.exports = { STALE_MS, TMP_ROOT, shouldSkipCheck, findStaleSandboxes, findOrphanStubs, findOrphanSuites, ancestorPids, inspect, guardOrExit }

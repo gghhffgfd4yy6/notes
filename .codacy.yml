@@ -167,7 +167,22 @@
 # .githooks/pre-push、.github/workflows/test.yml、.github/workflows/release.yml），fs.readFileSync
 # 目标 = __dirname + 常量拼接，目录与文件名均为测试常量、无外部净输入参与路径构造——
 # 「动态构造文件/路径信息」告警属误报（与 test_qinglong_utils.js / test_mutation_ranges.js 同口径）。
+# scripts/check-doc-lines.js / scripts/check-host-clean.js 是文档行长与主机干净度两道闸门（本地/CI 工具，
+# 不进入生产运行时）：路径只由「仓库根常量 + fs.readdirSync 结果」或「os.tmpdir() + 条目名」拼装，
+# 前者已按 resolve 后的根前缀校验、后者只做 lstat 读取 mtime（不写、不删、不跟随符号链接），
+# 无任何外部净输入参与路径构造——「动态构造文件/路径信息」告警属误报（与 run_mutation.js /
+# check-version.js / scripts/install-hooks.js 同类工具脚本同一处理）。
+#
+# test_doc_line_gates.js / test_host_clean_gates.js 是上述两道闸门的接线断言套件：
+# ROOT = path.resolve(__dirname) 为常量，path.join(ROOT, 字面量) 读取 package.json / .githooks/* /
+# .github/workflows/*.yml 做字符串断言，另在 mkdtempSync(os.tmpdir() + 固定前缀) 下构造测试夹具，
+# 全部是测试硬编码常量、无外部净输入，静态路径注入告警属误报。
+#
 exclude_paths:
+  - "scripts/check-doc-lines.js"
+  - "scripts/check-host-clean.js"
+  - "test_doc_line_gates.js"
+  - "test_host_clean_gates.js"
   - ".github/analyze-artifacts.js"
   - "check-version.js"
   - "scripts/check-mutation-ranges.js"

@@ -17,6 +17,11 @@ const path = require('node:path')
 const gate = require('./scripts/check-doc-lines.js')
 
 const read = (p) => fs.readFileSync(path.join(__dirname, p), 'utf8')
+// 行匹配一律「拆成行 + 去缩进后精确判定」，不用 /^\s*…$/m：静态分析把「\s* + 行尾锚 + 可能很长的行」
+// 判成潜在超线性回溯（S5852），而这里的语义本来就只是「某一行的内容等于 / 以 X 起头」。
+const lineThat = (text, re) => text.split('\n').map((l) => l.trim()).find((l) => re.test(l))
+const linesThat = (text, re) => text.split('\n').map((l) => l.trim()).filter((l) => re.test(l))
+
 let checks = 0
 function check (label, fn) {
   fn()
@@ -41,9 +46,9 @@ check('package.json：check 链含文档行长闸门，且排在 npm test 之前
 check('pre-commit：第 5 道 run_gate 接线存在，道数计数与真实调用数一致', () => {
   const hook = read('.githooks/pre-commit')
   // 行首锚定命令行形态（沿用 CodeRabbit #207 的口径）：注释里提到命令不算接线。
-  assert.match(hook, /^\s*run_gate "文档行长闸门"[^\n]*npm run check:doc-lines$/m,
+  assert.ok(linesThat(hook, /^run_gate "文档行长闸门/).some((l) => l.includes('npm run check:doc-lines')),
     'pre-commit 缺文档行长 run_gate 行 = 提交时刻不再拦 prose 回长')
-  const gates = (hook.match(/^\s*run_gate "/gm) || []).length
+  const gates = linesThat(hook, /^run_gate "/).length
   const CN = ['〇', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十']
   assert.ok(hook.includes(`${gates} 道快检`) && hook.includes(`${CN[gates]}道快检`),
     `pre-commit 的道数文案必须等于真实 run_gate 调用数（应为「${gates} 道」与「${CN[gates]}道」）`)
@@ -51,13 +56,13 @@ check('pre-commit：第 5 道 run_gate 接线存在，道数计数与真实调�
 
 check('test.yml：闸门步骤与接线断言步骤都在，且走同一条 npm 链', () => {
   const yml = read('.github/workflows/test.yml')
-  assert.match(yml, /^\s*- name: 文档行长闸门（1200 字符\/行）$/m,
+  assert.ok(lineThat(yml, /^- name: 文档行长闸门（1200 字符\/行）$/),
     'test.yml 缺闸门步骤 = CI 上没人跑它（本套件将在兜底步骤里变红）')
-  assert.match(yml, /^\s*run: npm run check:doc-lines$/m,
+  assert.ok(lineThat(yml, /^run: npm run check:doc-lines$/),
     'CI 必须走与本地同一条 npm 链，禁止 CI 侧自拼命令造成口径分叉')
-  assert.match(yml, /^\s*- name: 文档行长接线断言（test_doc_line_gates\.js）$/m,
+  assert.ok(lineThat(yml, /^- name: 文档行长接线断言（test_doc_line_gates\.js）$/),
     '接线断言步骤被删 = 本套件脱门（再删闸门步骤就彻底无人看守）')
-  assert.match(yml, /^\s*run: npm run test:doc-line-gates$/m,
+  assert.ok(lineThat(yml, /^run: npm run test:doc-line-gates$/),
     '接线断言步骤必须真跑本套件')
   // test.yml 不跑 npm run check（只有 release.yml 跑整链）——这句是「为什么必须在此显式列步骤」的
   // 前提，前提变了就该重新评估接线位置，故锁住。
