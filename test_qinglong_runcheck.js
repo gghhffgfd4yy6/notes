@@ -76,13 +76,13 @@ function makeApp (overrides = {}) {
   assert.strictEqual(code0, 0, '全部检查通过应返回 0')
   restoreNotify()
 
-  // ===== QX-06 回归：Node 低于 package.json engines（>=22.22.2）→ 返回 1，且该项为 ❌ =====
+  // ===== QX-06 回归：Node 不满足 re2 engines 范围 → 返回 1，且该项为 ❌ =====
   // 旧实现只看主版本（Number(node.split('.')[0]) >= 22），22.21.0 会被放行（本用例必红）。
   mockNotify(1)
   const rNodeLow = withHealthyEnv(() => captureRunCheck(makeApp()), '22.21.0')
   assert.strictEqual(rNodeLow.code, 1, 'Node 低于 engines 下界应返回 1')
   assert.ok(rNodeLow.output.includes('❌ Node.js 版本'), '失败项应为"Node.js 版本"，输出应含 ❌ Node.js 版本')
-  assert.ok(rNodeLow.output.includes('>=22.22.2'), '失败详情应给出 engines 要求的 >=22.22.2')
+  assert.ok(rNodeLow.output.includes('不满足 re2/package.json engines 要求：^22.22.2 || ^24.15.0 || >=26.0.0'), '失败详情应给出完整的 re2 engines 要求')
   restoreNotify()
 
   // 边界对照：恰好下界 / 高于下界 → 该项通过（防"一律判红"让上面的断言失去鉴别力）
