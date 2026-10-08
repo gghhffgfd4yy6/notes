@@ -249,10 +249,13 @@ check('临时根扫描失败必须 fail-closed，普通文件不得进入沙箱�
 })
 
 check('清理建议必须对空格和 shell 元字符进行 POSIX 引用', () => {
-  assert.strictEqual(host.rmSuggestion([{ p: '/tmp/review space; touch marker; #' }]),
-    "rm -rf '/tmp/review space; touch marker; #'")
-  assert.strictEqual(host.rmSuggestion([{ p: "/tmp/reviewer's sandbox" }]),
-    "rm -rf '/tmp/reviewer'\\''s sandbox'")
+  const specialPath = path.join(__dirname, 'review space; touch marker; #')
+  assert.strictEqual(host.rmSuggestion([{ p: specialPath }]),
+    "rm -rf '" + path.resolve(specialPath) + "'")
+  const apostrophePath = path.join(__dirname, "reviewer's sandbox")
+  const resolvedApostrophePath = path.resolve(apostrophePath)
+  assert.strictEqual(host.rmSuggestion([{ p: apostrophePath }]),
+    "rm -rf '" + resolvedApostrophePath.replaceAll("'", "'\\''") + "'")
   const relativeDashPath = '-tmp/xbk-example'
   assert.strictEqual(host.rmSuggestion([{ p: relativeDashPath }]), "rm -rf '" + path.resolve(relativeDashPath) + "'")
 })
