@@ -6,7 +6,13 @@
 
 ### 1. 安装依赖
 
-需要 **Node.js 22.22.2 及以上**。
+需要以下受支持的 Node.js 版本之一：**22.22.2 及以上的 22.x、24.15.0 及以上的 24.x，或 26.x 及以上**。
+
+Node.js 23.x、25.x 和 24.0–24.14 不受 `re2` 原生模块支持。安装前可先检查：
+
+```bash
+node --version
+```
 
 ```bash
 npm ci
@@ -96,10 +102,10 @@ npm start
 
 ### 调整轮询间隔
 
-默认每 10 秒检查一次。需要调整时设置毫秒数，例如每 30 秒检查一次：
+常驻入口默认每 10 秒检查一次。需要调整时设置毫秒数，例如每 30 秒检查一次：
 
 ```bash
-XBK_INTERVAL_MS=30000 npm start
+XBK_INTERVAL_MS=30000 node qinglong/xbk_push.js
 ```
 
 ## 配置过滤规则
@@ -122,9 +128,9 @@ filter: {
 | 变量 | 作用 |
 |---|---|
 | `XBK_INTERVAL_MS` | 抓取间隔，单位为毫秒，默认 `10000` |
-| `XBK_DRY_RUN=1` | 常驻运行但不发送通知、不写入成功缓存 |
+| `XBK_DRY_RUN=1` | 仅常驻入口：不发送通知、不写入成功缓存；`npm start` 仍只运行一轮 |
 | `XBK_CACHE_DIR` | `--status` 使用的状态目录，必须是绝对路径 |
-| `XBK_AUTO_INSTALL_DEPS=1` | 青龙入口缺少依赖时尝试自动安装和构建 |
+| `XBK_AUTO_INSTALL_DEPS=1` | 青龙常驻入口缺少依赖时尝试自动安装和构建 |
 | `PUSH_PLUS_TOKEN` | PushPlus Token，可代替本地配置 |
 | `PUSH_KEY` | Server酱 Key，可代替本地配置 |
 | `BARK_PUSH` | Bark 地址，可代替本地配置 |
@@ -142,6 +148,8 @@ node qinglong/xbk_push.js --dry-run # 试运行
 npm run lint                      # 检查代码格式
 npm test                          # 运行测试
 ```
+
+青龙入口目前只支持 `--check`、`--status` 和 `--dry-run`。其他参数会被忽略并发出警告；不要把 `--help` 或拼写错误的参数当作安全检查命令。
 
 ## 常见问题
 
@@ -182,3 +190,4 @@ npm rebuild re2
 - `qinglong/xbk_push.js`：青龙入口
 - `SYSTEM_CONTRACT.md`：更完整的行为说明
 - `CHANGELOG.md`：版本记录
+- `SECURITY.md`：安全问题报告说明
