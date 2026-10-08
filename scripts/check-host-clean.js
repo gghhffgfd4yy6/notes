@@ -88,7 +88,7 @@ function activityMtimeMs (dirPath) {
 
 // 活进程占用的 cwd 集合（/proc/<pid>/cwd 的符号链接目标）。读不到 /proc ⇒ null = 该平台不提供
 // 这个信号（由调用方按「不可判定」处理，禁止继续生成沙箱删除候选）。
-function liveSandboxCwds (procRoot) {
+function liveSandboxCwds (procRoot, onReadError) {
   let pids
   try {
     pids = fs.readdirSync(procRoot).filter((s) => /^\d+$/.test(s))
@@ -97,11 +97,29 @@ function liveSandboxCwds (procRoot) {
   }
   const cwds = []
   for (const pid of pids) {
+    const procPath = path.join(procRoot, pid)
     try {
-      cwds.push(fs.readlinkSync(path.join(procRoot, pid, 'cwd')))
+      cwds.push(fs.readlinkSync(path.join(procPath, 'cwd')))
     } catch (e) {
-      // 进程在扫描时退出是正常竞态；权限等其它错误意味着保护信号不完整，必须 fail-closed。
-      if (e && (e.code === 'ENOENT' || e.code === 'ESRCH')) continue
+      const details = {
+        pid: Number(pid),
+        errorCode: e && e.code ? e.code : 'UNKNOWN',
+        procDirExists: null,
+        uid: null,
+        state: null,
+        statErrorCode: null
+      }
+      try {
+        const st = fs.statSync(procPath)
+        details.procDirExists = true
+        details.uid = st.uid
+        details.state = procStateOf(path.join(procPath, 'stat'))
+      } catch (pidError) {
+        if (pidError && (pidError.code === 'ENOENT' || pidError.code === 'ESRCH')) continue
+        details.statErrorCode = pidError && pidError.code ? pidError.code : 'UNKNOWN'
+      }
+      Object.assign(details, procStatusDetails(procPath))
+      if (typeof onReadError === 'function') onReadError(details)
       return null
     }
   }
@@ -168,6 +186,33 @@ function readProcs (procRoot) {
 }
 
 // comm 字段可能含空格与括号：切到最后一个 ')' 之后再取 ppid（第 2 个字段）
+function procStateOf (statPath) {
+  let stat
+  try {
+    stat = fs.readFileSync(statPath, 'utf8')
+  } catch {
+    return null
+  }
+  const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0]
+  return /^[A-Z]$/.test(state) ? state : null
+}
+
+function procStatusDetails (procPath) {
+  let status
+  try {
+    status = fs.readFileSync(path.join(procPath, 'status'), 'utf8')
+  } catch (e) {
+    return { statusUids: null, kthread: null, statusErrorCode: e && e.code ? e.code : 'UNKNOWN' }
+  }
+  const uidMatch = status.match(/^Uid:\s+([\d\s]+)/m)
+  const kthreadMatch = status.match(/^Kthread:\s+([01])\s*$/m)
+  return {
+    statusUids: uidMatch ? uidMatch[1].trim().split(/\s+/).map(Number) : null,
+    kthread: kthreadMatch ? kthreadMatch[1] === '1' : null,
+    statusErrorCode: null
+  }
+}
+
 function ppidOf (statPath) {
   let stat
   try {
@@ -188,7 +233,7 @@ function shellQuote (value) {
 }
 
 function rmSuggestion (dirs) {
-  return 'rm -rf ' + dirs.map((d) => shellQuote(d.p)).join(' ')
+  return 'rm -rf ' + dirs.map((d) => shellQuote(path.resolve(d.p))).join(' ')
 }
 
 // cmdline 是 NUL 分隔的 argv：测试脚本可能是相对路径、绝对路径，也可能后面带 --only 等参数，
@@ -272,21 +317,28 @@ function inspect (opts) {
   const anc = unsupported ? [] : ancestorPids(procRoot, selfPid)
   const stubs = unsupported ? [] : findOrphanStubs(procs, selfPid, anc)
   const suites = unsupported ? [] : findOrphanSuites(procs, selfPid, anc)
-  // 活动沙箱的豁免信号来自同一份 /proc：读不到 /proc 或 cwd 列表不可读时，不能安全地推荐删除任何沙箱。
-  const cwds = unsupported ? null : liveSandboxCwds(procRoot)
-  const cwdScanError = cwds === null
-  const stale = cwdScanError ? [] : listStaleSandboxDirs(tmpRoot, nowMs, staleMs, cwds)
-  const tmpScanError = stale === null
-  const dirs = cwdScanError || tmpScanError ? [] : stale
+  // 先筛出过期候选：没有候选就不会输出删除建议，无需读取所有进程 cwd。
+  const candidates = listStaleSandboxDirs(tmpRoot, nowMs, staleMs, [])
+  const tmpScanError = candidates === null
+  let cwdScanError = false
+  let cwdScanErrorDetails = null
+  const dirs = []
+  // 有候选时，cwd 是删除建议的安全豁免信号；不可判定则 fail-closed，不输出任何候选。
+  if (!tmpScanError && candidates.length > 0) {
+    const cwds = unsupported ? null : liveSandboxCwds(procRoot, (details) => { cwdScanErrorDetails = details })
+    cwdScanError = cwds === null
+    if (!cwdScanError) dirs.push(...candidates.filter((d) => !isActiveSandbox(d.p, cwds)))
+  }
   return {
     skipped: false,
     unsupported,
     cwdScanError,
+    cwdScanErrorDetails,
     tmpScanError,
     stubs,
     suites,
     dirs,
-    ok: !cwdScanError && !tmpScanError && stubs.length === 0 && suites.length === 0 && dirs.length === 0
+    ok: !unsupported && !cwdScanError && !tmpScanError && stubs.length === 0 && suites.length === 0 && dirs.length === 0
   }
 }
 
@@ -400,6 +452,16 @@ function selftest () {
   console.log('✅ check-host-clean --selftest 全部通过（34 断言）')
 }
 
+function cwdScanFailureText (details) {
+  if (!details) return ''
+  const procDir = details.procDirExists === true ? 'present' : 'unknown'
+  const uids = Array.isArray(details.statusUids) ? details.statusUids.join('/') : 'unknown'
+  const kthread = details.kthread === null ? 'unknown' : String(details.kthread)
+  const statError = details.statErrorCode || 'none'
+  const statusError = details.statusErrorCode || 'none'
+  return `（pid=${details.pid} errno=${details.errorCode} procDir=${procDir} state=${details.state || 'unknown'} uid=${details.uid ?? 'unknown'} statusUid=${uids} kthread=${kthread} statErr=${statError} statusErr=${statusError}）`
+}
+
 function main () {
   const argv = process.argv.slice(2)
   if (argv.includes('--selftest')) {
@@ -418,10 +480,10 @@ function main () {
     return 0
   }
   if (r.unsupported) {
-    console.log('⚠️ 读不到 /proc，本机不做孤儿桩检测；活动沙箱 cwd 豁免也不可判定（按 fail-closed 拒绝继续）')
+    console.log('⚠️ 读不到 /proc，本机不做孤儿桩检测；若存在过期沙箱候选，则 cwd 豁免不可判定并按 fail-closed 拒绝继续')
   }
   if (r.cwdScanError) {
-    console.log('❌ 活动沙箱 cwd 扫描失败，无法安全排除正在运行的沙箱（按 fail-closed 拒绝继续）')
+    console.log('❌ 活动沙箱 cwd 扫描失败，无法安全排除正在运行的沙箱（按 fail-closed 拒绝继续）' + cwdScanFailureText(r.cwdScanErrorDetails))
   }
   if (r.tmpScanError) {
     console.log('❌ 临时根目录扫描失败，无法判定过期沙箱（按 fail-closed 拒绝继续）')
@@ -459,9 +521,9 @@ function guardOrExit (env) {
   const r = inspect({ env: env || process.env })
   if (r.skipped) return false
   if (r.unsupported) {
-    console.log('⚠️ 主机干净度检查：读不到 /proc，孤儿桩与活动沙箱 cwd 豁免均不可判定（按 fail-closed 拒绝继续）')
+    console.log('⚠️ 主机干净度检查：读不到 /proc，无法判定孤儿桩；若有过期沙箱候选，则 cwd 豁免不可判定并按 fail-closed 拒绝继续')
   }
-  if (r.cwdScanError) console.log('   活动沙箱 cwd 扫描失败，无法安全排除正在运行的沙箱（fail-closed）')
+  if (r.cwdScanError) console.log('   活动沙箱 cwd 扫描失败，无法安全排除正在运行的沙箱（fail-closed）' + cwdScanFailureText(r.cwdScanErrorDetails))
   if (r.tmpScanError) console.log('   临时根目录扫描失败，无法判定过期沙箱（fail-closed）')
   if (r.ok) return false
   console.log('❌ 主机不干净，本次运行不启动（避免把环境残留报成契约失败）：')

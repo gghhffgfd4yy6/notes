@@ -252,7 +252,7 @@ node -e "require('re2'); console.log('re2 ok')"   # 原生绑定在不在？
   ```
 
   带该开关后本机汇总**不是固定值**：48 套件那版实测过 **48/0**、**47/1**，不带开关是 **46/2**；v3.281（49 套件）三轮 **47/2**、**48/1**、**48/1**。波动源一直是 `test_run_mutation_cli.js`，而它与注入无关——旧语义只有一条 180s **墙钟总长**线，在慢机器上区分不了「跑得慢但仍在推进」与「挂死」：旧语义下合计 **10 次观测 = 3 绿 7 红**（红 193–205s、绿 171.1–171.3s，失败文本逐字相同「沙箱内单元测试应整体通过，实际 timeout」），把文档全部回退到上一版内容再跑、红绿分布不变 ⇒ 非回归。**v3.282 起这条不再抖**：挂死改由静默线判定（连续 `MUTATION_IDLE_MS`＝180s 无任何输出即 SIGKILL），总上限只作兜底，改后连续两轮 **199s / 196s 绿**——这两轮在旧语义下都会红。另有一条 `test_filter.js` 曾在慢轮次红在 `基准: tuisong_replace 1000次 < 300ms`（实测 878ms），**根因已定位**：前序被 `job_kill` / `timeout` 中断的运行留下了 detached 心跳桩进程与 `/tmp/xbk-*` 沙箱，把墙钟基准拖红。清场后同一断言 **276ms** 通过、全链 **49/49 绿**（674.9s）。所以本机跑测试前先看这两条是否干净：`pgrep -fal "stub_heartbeat|test_stub_tree"`、`ls -d "$(node -e 'console.log(require("os").tmpdir())")/xbk-*`（Linux 上即 `/tmp/xbk-*`）。**报本机结果必须带轮次与耗时**，跨环境的最终判据是 CI。
-- **主机干净度门禁**：`npm test` / `npm run test:unit` 以及直接运行 `test_filter.js` 前会检查孤儿测试桩、父进程消失的孤儿套件和过期 `<os.tmpdir()>/xbk-*` 沙箱；临时根或活动沙箱 cwd 保护信号无法扫描时按 fail-closed 拒绝启动，不生成清理命令，普通文件/符号链接不会被列入清理命令。变异评估子进程以 `XBK_MUTATION_CHILD=1` 跳过该检查。
+- **主机干净度门禁**：`npm test` / `npm run test:unit` 以及直接运行 `test_filter.js` 前会检查孤儿测试桩、父进程消失的孤儿套件和过期 `<os.tmpdir()>/xbk-*` 沙箱；先判断是否存在过期沙箱候选，没有候选时不读取所有进程 cwd，因此无关的 `/proc` 项不会阻塞启动；有候选但活动沙箱 cwd 保护信号无法扫描时按 fail-closed 拒绝启动，不生成清理命令。发生 cwd 读取失败时仅输出 PID、errno、proc 状态和 UID 等诊断元数据，不输出 cwd 路径或命令行。普通文件/符号链接不会被列入清理命令。变异评估子进程以 `XBK_MUTATION_CHILD=1` 跳过该检查。
 
 - **Android/Termux 宿主**：`process.execPath` 指向 `linker64` ⇒ 凡 `execFileSync(process.execPath, […])` 的子进程断言必炸；`re2` 缺失 ⇒ 用户过滤正则一律被跳过（代码刻意不回退 V8），`test:filter` 的 regex 断言两个方向都失真。这类机器上只有**不 spawn 子进程**的那五道闸门可当判据：
 

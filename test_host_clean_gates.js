@@ -148,48 +148,100 @@ check('临时根扫描失败必须 fail-closed，普通文件不得进入沙箱�
     const missing = host.inspect({ env: {}, procRoot: root, tmpRoot: path.join(root, 'missing'), selfPid: 1 })
     assert.strictEqual(missing.tmpScanError, true, '临时根不可读必须显式标记扫描失败')
     assert.strictEqual(missing.ok, false, '扫描失败不得返回主机干净')
+    const emptyTmpRoot = path.join(root, 'empty-tmp')
+    fs.mkdirSync(emptyTmpRoot)
+    const emptyProcRoot = path.join(root, 'empty-proc')
+    fs.mkdirSync(emptyProcRoot)
+    const cwdNotNeeded = host.inspect({ env: {}, procRoot: emptyProcRoot, tmpRoot: emptyTmpRoot, selfPid: 1 })
+    assert.strictEqual(cwdNotNeeded.cwdScanError, false, '没有过期候选时不需要扫描 cwd 豁免')
+    assert.deepStrictEqual(cwdNotNeeded.dirs, [], '没有过期候选时不生成删除建议')
+    assert.strictEqual(cwdNotNeeded.ok, true, '没有候选且 proc 根可读时不得因未扫描 cwd 阻止测试启动')
+    const unsupportedNoCandidate = host.inspect({ env: {}, procRoot: path.join(root, 'missing-proc'), tmpRoot: emptyTmpRoot, selfPid: 1 })
+    assert.strictEqual(unsupportedNoCandidate.unsupported, true, '整个 proc 根不可读必须显式标记平台不可判定')
+    assert.strictEqual(unsupportedNoCandidate.ok, false, '整个 proc 根不可读仍必须总体 fail-closed')
+    const activeSandbox = path.join(root, 'xbk-active-unreadable-cwd')
+    fs.mkdirSync(activeSandbox)
+    const old = new Date(Date.now() - 61 * 60 * 1000)
+    fs.utimesSync(activeSandbox, old, old)
     const cwdMissing = host.inspect({ env: {}, procRoot: path.join(root, 'missing-proc'), tmpRoot: root, selfPid: 1 })
-    assert.strictEqual(cwdMissing.cwdScanError, true, 'cwd 保护信号不可读必须显式标记')
+    assert.strictEqual(cwdMissing.cwdScanError, true, '有过期候选且 cwd 保护信号不可读必须显式 fail-closed')
     assert.deepStrictEqual(cwdMissing.dirs, [], 'cwd 保护信号不可读时不得生成沙箱删除候选')
-    assert.strictEqual(cwdMissing.ok, false, 'cwd 保护信号不可读不得报告主机干净')
+    assert.strictEqual(cwdMissing.ok, false, '有过期候选且 cwd 保护信号不可读不得报告主机干净')
     const file = path.join(root, 'xbk-not-a-sandbox')
     fs.writeFileSync(file, 'ordinary file\n')
     fs.utimesSync(file, new Date(0), new Date(0))
     const inspected = host.inspect({ env: {}, procRoot: root, tmpRoot: root, nowMs: Date.now(), selfPid: 1 })
     assert.ok(!inspected.dirs.some((d) => d.p === file), '普通文件不得进入过期沙箱清单')
-    const activeSandbox = path.join(root, 'xbk-active-unreadable-cwd')
-    fs.mkdirSync(activeSandbox)
-    const old = new Date(Date.now() - 61 * 60 * 1000)
-    fs.utimesSync(activeSandbox, old, old)
     const procRoot = path.join(root, 'proc')
-    const fakeProc = path.join(procRoot, '12345')
-    fs.mkdirSync(fakeProc, { recursive: true })
-    fs.writeFileSync(path.join(fakeProc, 'cmdline'), 'node\0worker\0')
-    fs.writeFileSync(path.join(fakeProc, 'stat'), '12345 (node) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0')
-    const cwdLink = path.join(fakeProc, 'cwd')
-    fs.symlinkSync(activeSandbox, cwdLink, 'dir')
-    const originalReadlink = fs.readlinkSync
-    fs.readlinkSync = function (target, ...args) {
-      if (target === cwdLink) {
-        const error = new Error('permission denied')
-        error.code = 'EACCES'
-        throw error
+    const makeFakeProc = (pid, rootPath = procRoot) => {
+      const pidPath = path.join(rootPath, pid)
+      fs.mkdirSync(pidPath, { recursive: true })
+      fs.writeFileSync(path.join(pidPath, 'cmdline'), 'node\0worker\0')
+      fs.writeFileSync(path.join(pidPath, 'stat'), `${pid} (node) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0`)
+      const uid = typeof process.getuid === 'function' ? process.getuid() : 0
+      fs.writeFileSync(path.join(pidPath, 'status'), `Name:\tnode\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`)
+      const cwdLink = path.join(pidPath, 'cwd')
+      fs.symlinkSync(activeSandbox, cwdLink, 'dir')
+      return { pidPath, cwdLink, procRoot: rootPath }
+    }
+    const inspectWithCwdError = (proc, code, pidGone) => {
+      const originalReadlink = fs.readlinkSync
+      const originalStat = fs.statSync
+      fs.readlinkSync = function (target, ...args) {
+        if (target === proc.cwdLink) {
+          const error = new Error('cwd read failure')
+          error.code = code
+          throw error
+        }
+        return originalReadlink.call(this, target, ...args)
       }
-      return originalReadlink.call(this, target, ...args)
+      fs.statSync = function (target, ...args) {
+        if (pidGone && target === proc.pidPath) {
+          const error = new Error('process exited during cwd scan')
+          error.code = code
+          throw error
+        }
+        return originalStat.call(this, target, ...args)
+      }
+      try {
+        return host.inspect({ env: {}, procRoot: proc.procRoot, tmpRoot: root, selfPid: 1, nowMs: Date.now() })
+      } finally {
+        fs.readlinkSync = originalReadlink
+        fs.statSync = originalStat
+      }
     }
-    let unreadableCwd
-    try {
-      unreadableCwd = host.inspect({ env: {}, procRoot, tmpRoot: root, selfPid: 1, nowMs: Date.now() })
-    } finally {
-      fs.readlinkSync = originalReadlink
-    }
+    const unreadableCwd = inspectWithCwdError(makeFakeProc('12345'), 'EACCES', false)
     assert.strictEqual(unreadableCwd.cwdScanError, true, '单个进程 cwd 权限错误必须令保护信号不可判定')
+    const cwdError = unreadableCwd.cwdScanErrorDetails
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : 0
+    assert.strictEqual(cwdError.pid, 12345, 'cwd 错误诊断必须包含 PID')
+    assert.strictEqual(cwdError.errorCode, 'EACCES', 'cwd 错误诊断必须包含 errno')
+    assert.strictEqual(cwdError.procDirExists, true, 'cwd 错误诊断必须标记 PID 目录存在')
+    assert.strictEqual(cwdError.state, 'S', 'cwd 错误诊断必须包含 proc stat state')
+    assert.strictEqual(cwdError.uid, currentUid, 'cwd 错误诊断必须包含 /proc 目录 UID')
+    assert.deepStrictEqual(cwdError.statusUids, [currentUid, currentUid, currentUid, currentUid], 'cwd 错误诊断必须包含 status Uid 字段')
+    assert.strictEqual(cwdError.kthread, null, '缺失 Kthread 字段必须保持未知')
     assert.deepStrictEqual(unreadableCwd.dirs, [], 'cwd 扫描不完整时不得建议删除任何候选')
     assert.strictEqual(unreadableCwd.ok, false, 'cwd 扫描不完整不得报告主机干净')
+    const missingCwdLink = inspectWithCwdError(makeFakeProc('12346'), 'ENOENT', false)
+    assert.strictEqual(missingCwdLink.cwdScanError, true, 'PID 仍存在但 cwd 链接缺失时必须 fail-closed')
+    const missingCwdWithEsrch = inspectWithCwdError(makeFakeProc('12347'), 'ESRCH', false)
+    assert.strictEqual(missingCwdWithEsrch.cwdScanError, true, 'PID 仍存在但 readlink 返回 ESRCH 时必须 fail-closed')
+    assert.deepStrictEqual(missingCwdWithEsrch.dirs, [], 'PID 仍存在但 cwd 信号异常时不得生成删除候选')
+    assert.strictEqual(missingCwdWithEsrch.ok, false, 'PID 仍存在但 cwd 信号异常不得报告主机干净')
+    for (const [index, code] of ['ENOENT', 'ESRCH'].entries()) {
+      const raceRoot = path.join(root, 'proc-race-' + code.toLowerCase())
+      const vanishedPid = inspectWithCwdError(makeFakeProc(String(12347 + index), raceRoot), code, true)
+      assert.strictEqual(vanishedPid.cwdScanError, false, `${code} 且 PID 目录已消失应视为退出竞态`)
+      assert.ok(vanishedPid.dirs.some((d) => d.p === activeSandbox), `${code} 退出竞态后不得遗留虚假 cwd 豁免`)
+    }
     const src = read('scripts/check-host-clean.js')
-    assert.match(src, /const tmpScanError = stale === null/, '临时根扫描失败必须进入显式错误状态')
-    assert.match(src, /const cwdScanError = cwds === null/, 'cwd 保护信号不可判定必须进入显式错误状态')
-    assert.match(src, /const stale = cwdScanError \? \[\] : listStaleSandboxDirs/, 'cwd 保护信号不可判定时不得继续生成沙箱清理候选')
+    assert.match(src, /const tmpScanError = candidates === null/, '临时根扫描失败必须进入显式错误状态')
+    assert.match(src, /const candidates = listStaleSandboxDirs\(tmpRoot, nowMs, staleMs, \[\]\)/, '必须先筛出过期候选')
+    assert.match(src, /if \(!tmpScanError && candidates\.length > 0\)/, '没有删除候选时不得因 cwd 读取失败阻塞运行')
+    assert.match(src, /cwdScanError = cwds === null/, '有过期候选时 cwd 保护信号不可判定必须 fail-closed')
+    assert.match(src, /if \(!cwdScanError\) dirs\.push\(\.\.\.candidates\.filter/, 'cwd 信号不完整时不得生成沙箱清理候选')
+    assert.match(src, /cwdScanFailureText\(r\.cwdScanErrorDetails\)/, 'cwd 失败须输出有限诊断字段')
     assert.match(src, /st\.isDirectory\(\) && !st\.isSymbolicLink\(\)/, '清理候选必须限定为真实目录')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
@@ -201,6 +253,8 @@ check('清理建议必须对空格和 shell 元字符进行 POSIX 引用', () =>
     "rm -rf '/tmp/review space; touch marker; #'")
   assert.strictEqual(host.rmSuggestion([{ p: "/tmp/reviewer's sandbox" }]),
     "rm -rf '/tmp/reviewer'\\''s sandbox'")
+  const relativeDashPath = '-tmp/xbk-example'
+  assert.strictEqual(host.rmSuggestion([{ p: relativeDashPath }]), "rm -rf '" + path.resolve(relativeDashPath) + "'")
 })
 
 console.log('✅ test_host_clean_gates 全部通过（' + checks + ' 检查）')

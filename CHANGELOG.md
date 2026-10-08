@@ -257,4 +257,5 @@
 - CodeRabbit 后续评审的 3 条 actionable 逐条核实并修复：`commit-msg` 读取有效 `commit.cleanup` 模式，`whitespace` / `verbatim` / `scissors` 保留的注释行不再伪装成标题分隔空行，strip 模式按 Git 的 `core.commentChar` 清理注释，并补真实临时 Git 仓库回归；`check-host-clean.js` 先过滤 `xbk-*` 名称再读取直接子项，避免无关大目录拖慢每次测试入口；`SYSTEM_CONTRACT.md` 补齐变异静默线与提交消息 cleanup 契约。`README.md` / `AGENTS.md` / `CONTRIBUTING.md` 同步新口径，版本仍沿用 v3.283。
 - CodeRabbit 追加的第 4 条 actionable 已修复：strip 模式不再硬编码 `#`，改用 Git 原生 `stripspace` 按 `core.commentChar` 判断注释，并补 `core.commentChar=;` 的正反回归；此前 3 条 CodeRabbit 修复记录保持不变。
 - PR #211 后续对抗复核补强：host-clean 对 cwd 保护信号的权限错误 fail-closed、按真实路径比对 TMPDIR 别名，并为清理命令引用 shell 特殊字符；commit-msg 改为固定检查原始消息第二行，覆盖 `--cleanup` 命令行覆盖无法传入钩子的边界。
+- PR #211 CI 复核补强（继续沿用 v3.283，不 bump）：host-clean 先筛过期沙箱候选；无候选且 `/proc` 可读时不扫描无关进程 cwd，有候选仍要求 cwd 保护信号完整，否则 fail-closed；整个 `/proc` 不可读仍总体 fail-closed。cwd 读取失败仅输出 PID、errno、proc 状态和 UID 等有限诊断元数据，不输出 cwd 路径或命令行；回归测试用 stat mock 模拟 PID 退出，避免测试自身删除临时树。
 - 版本 bump 至 3.283.0（四处同步）；主文件头仍 442 行 ⇒ 变异 `1-442` 全覆盖不变。
