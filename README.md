@@ -27,7 +27,7 @@ npm start
 
 - **`pre-commit`** —— 五道快检：lint → 版本闸门 → 变异行段校验 → 静态扫描（v3.280 起第 4 道）→ 文档行长（v3.281 起第 5 道）。本机实测 lint 约 22s、其余各 <1s。
 - **`pre-push`** —— 跑 `npm run test:filter`（约 60s，推送前拦截）。校验对象是**被推提交的内容**：`local_sha == HEAD` 且整棵工作树干净（含未跟踪文件；被 ignore 的不算）时在当前工作树跑（此时两者内容一致），否则在临时 worktree 里检出那个提交再跑、跑完清理；隔离环境建不起来即 fail-closed——绝不拿当前工作树的结果冒充被推提交的验证。
-- **`commit-msg`** —— 首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且**标题与正文之间要留一个空行**（没空行时 git 会把整段当标题，长度限制与 `git log --oneline` 都会失真）。`#` 行不自动算空行——钩子按 Git 有效 `commit.cleanup` 判断：保留注释的 `whitespace` / `verbatim` / `scissors` 模式下，标题后的 `#` 行会被拒绝；`strip` 模式剔除注释后再检查第一个非注释行。
+- **`commit-msg`** —— 首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且**标题与正文之间要留一个空行**（没空行时 git 会把整段当标题，长度限制与 `git log --oneline` 都会失真）。`#`（或 Git 配置的 `core.commentChar`）行不自动算空行——钩子按 Git 有效 `commit.cleanup` 判断：保留注释的 `whitespace` / `verbatim` / `scissors` 模式下，标题后的注释行会被拒绝；`strip` 模式按 Git 的注释字符配置剔除注释后再检查第一个非注释行。
 
 **装完请用 `npm run hooks:verify` 自检门禁是否真的生效**（只读：生效 exit 0，未生效 exit 1 并说明是配置缺失、钩子文件缺失还是无执行位）——`hooks:install` 对「跳过/不覆盖」场景按设计仍 exit 0，不能当作「装好了」的证据。
 
@@ -252,7 +252,7 @@ node -e "require('re2'); console.log('re2 ok')"   # 原生绑定在不在？
   ```
 
   带该开关后本机汇总**不是固定值**：48 套件那版实测过 **48/0**、**47/1**，不带开关是 **46/2**；v3.281（49 套件）三轮 **47/2**、**48/1**、**48/1**。波动源一直是 `test_run_mutation_cli.js`，而它与注入无关——旧语义只有一条 180s **墙钟总长**线，在慢机器上区分不了「跑得慢但仍在推进」与「挂死」：旧语义下合计 **10 次观测 = 3 绿 7 红**（红 193–205s、绿 171.1–171.3s，失败文本逐字相同「沙箱内单元测试应整体通过，实际 timeout」），把文档全部回退到上一版内容再跑、红绿分布不变 ⇒ 非回归。**v3.282 起这条不再抖**：挂死改由静默线判定（连续 `MUTATION_IDLE_MS`＝180s 无任何输出即 SIGKILL），总上限只作兜底，改后连续两轮 **199s / 196s 绿**——这两轮在旧语义下都会红。另有一条 `test_filter.js` 曾在慢轮次红在 `基准: tuisong_replace 1000次 < 300ms`（实测 878ms），**根因已定位**：前序被 `job_kill` / `timeout` 中断的运行留下了 detached 心跳桩进程与 `/tmp/xbk-*` 沙箱，把墙钟基准拖红。清场后同一断言 **276ms** 通过、全链 **49/49 绿**（674.9s）。所以本机跑测试前先看这两条是否干净：`pgrep -fal "stub_heartbeat|test_stub_tree"`、`ls -d "$(node -e 'console.log(require("os").tmpdir())")/xbk-*`（Linux 上即 `/tmp/xbk-*`）。**报本机结果必须带轮次与耗时**，跨环境的最终判据是 CI。
-- **主机干净度门禁**：`npm test` / `npm run test:unit` 以及直接运行 `test_filter.js` 前会检查孤儿测试桩、父进程消失的孤儿套件和过期 `<os.tmpdir()>/xbk-*` 沙箱；临时根无法扫描时按 fail-closed 拒绝启动，普通文件/符号链接不会被列入清理命令。变异评估子进程以 `XBK_MUTATION_CHILD=1` 跳过该检查。
+- **主机干净度门禁**：`npm test` / `npm run test:unit` 以及直接运行 `test_filter.js` 前会检查孤儿测试桩、父进程消失的孤儿套件和过期 `<os.tmpdir()>/xbk-*` 沙箱；临时根或活动沙箱 cwd 保护信号无法扫描时按 fail-closed 拒绝启动，不生成清理命令，普通文件/符号链接不会被列入清理命令。变异评估子进程以 `XBK_MUTATION_CHILD=1` 跳过该检查。
 
 - **Android/Termux 宿主**：`process.execPath` 指向 `linker64` ⇒ 凡 `execFileSync(process.execPath, […])` 的子进程断言必炸；`re2` 缺失 ⇒ 用户过滤正则一律被跳过（代码刻意不回退 V8），`test:filter` 的 regex 断言两个方向都失真。这类机器上只有**不 spawn 子进程**的那五道闸门可当判据：
 

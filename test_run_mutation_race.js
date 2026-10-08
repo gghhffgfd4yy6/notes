@@ -166,7 +166,7 @@ function waitKillCount (expected, timeoutMs = 1500) {
       }
       // 进程级回归：Promise 已 resolve 不能证明事件循环已清空。用独立 Node 子进程复现 close 悬空，
       // idle 线故意设为 60s；修复前该子进程会被 5s watchdog 杀掉，修复后约 2s 自然退出。
-      const probeNode = process.argv0 && fs.existsSync(process.argv0) ? process.argv0 : process.execPath
+      const probeNode = process.execPath
       const probe = [
         "'use strict'",
         "const { EventEmitter } = require('node:events')",

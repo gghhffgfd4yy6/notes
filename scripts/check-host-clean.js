@@ -87,7 +87,7 @@ function activityMtimeMs (dirPath) {
 }
 
 // 活进程占用的 cwd 集合（/proc/<pid>/cwd 的符号链接目标）。读不到 /proc ⇒ null = 该平台不提供
-// 这个信号（由调用方按「不检测」处理，绝不静默放行）。
+// 这个信号（由调用方按「不可判定」处理，禁止继续生成沙箱删除候选）。
 function liveSandboxCwds (procRoot) {
   let pids
   try {
@@ -237,10 +237,10 @@ function listStaleSandboxDirs (tmpRoot, nowMs, staleMs, cwds) {
   return findStaleSandboxes(entries, nowMs, staleMs).filter((d) => !isActiveSandbox(d.p, cwds))
 }
 
-// 汇总判定：{ skipped, unsupported, tmpScanError, stubs, dirs, ok }
+// 汇总判定：{ skipped, unsupported, cwdScanError, tmpScanError, stubs, dirs, ok }
 function inspect (opts) {
   const env = opts.env || {}
-  if (shouldSkipCheck(env)) return { skipped: true, reason: 'XBK_MUTATION_CHILD=1（变异评估沙箱内）', ok: true, tmpScanError: false, stubs: [], suites: [], dirs: [] }
+  if (shouldSkipCheck(env)) return { skipped: true, reason: 'XBK_MUTATION_CHILD=1（变异评估沙箱内）', ok: true, cwdScanError: false, tmpScanError: false, stubs: [], suites: [], dirs: [] }
   const procRoot = opts.procRoot || '/proc'
   const tmpRoot = opts.tmpRoot || TMP_ROOT
   const nowMs = opts.nowMs || Date.now()
@@ -251,12 +251,22 @@ function inspect (opts) {
   const anc = unsupported ? [] : ancestorPids(procRoot, selfPid)
   const stubs = unsupported ? [] : findOrphanStubs(procs, selfPid, anc)
   const suites = unsupported ? [] : findOrphanSuites(procs, selfPid, anc)
-  // 活动沙箱的豁免信号来自同一份 /proc：读不到就没有豁免，但 tmp 扫描仍必须独立判定。
-  const cwds = unsupported ? [] : liveSandboxCwds(procRoot)
-  const stale = listStaleSandboxDirs(tmpRoot, nowMs, staleMs, cwds)
+  // 活动沙箱的豁免信号来自同一份 /proc：读不到 /proc 或 cwd 列表不可读时，不能安全地推荐删除任何沙箱。
+  const cwds = unsupported ? null : liveSandboxCwds(procRoot)
+  const cwdScanError = cwds === null
+  const stale = cwdScanError ? [] : listStaleSandboxDirs(tmpRoot, nowMs, staleMs, cwds)
   const tmpScanError = stale === null
-  const dirs = tmpScanError ? [] : stale
-  return { skipped: false, unsupported, tmpScanError, stubs, suites, dirs, ok: !tmpScanError && stubs.length === 0 && suites.length === 0 && dirs.length === 0 }
+  const dirs = cwdScanError || tmpScanError ? [] : stale
+  return {
+    skipped: false,
+    unsupported,
+    cwdScanError,
+    tmpScanError,
+    stubs,
+    suites,
+    dirs,
+    ok: !cwdScanError && !tmpScanError && stubs.length === 0 && suites.length === 0 && dirs.length === 0
+  }
 }
 
 function selftest () {
@@ -312,7 +322,9 @@ function selftest () {
   assert.strictEqual(shouldSkipCheck({}), false)
   const missing = inspect({ env: {}, procRoot: path.join(TMP_ROOT, 'definitely-not-here'), tmpRoot: path.join(TMP_ROOT, 'definitely-not-here'), nowMs: now, selfPid: 1 })
   assert.strictEqual(missing.unsupported, true, '读不到 /proc 必须标为「该平台不检测」，不得当成已检查')
-  assert.strictEqual(missing.ok, false, '读不到临时根时不得把空结果当成主机干净')
+  assert.strictEqual(missing.cwdScanError, true, '读不到 /proc 必须标记 cwd 保护信号不可判定')
+  assert.deepStrictEqual(missing.dirs, [], 'cwd 保护信号不可判定时不得生成沙箱删除候选')
+  assert.strictEqual(missing.ok, false, '读不到临时根或 cwd 保护信号时不得把空结果当成主机干净')
   assert.strictEqual(missing.skipped, false)
   const skipped = inspect({ env: { XBK_MUTATION_CHILD: '1' }, procRoot: '/proc', tmpRoot: TMP_ROOT, selfPid: 1 })
   assert.strictEqual(skipped.skipped, true)
@@ -364,7 +376,7 @@ function selftest () {
   } finally {
     fs.rmSync(fake, { recursive: true, force: true })
   }
-  console.log('✅ check-host-clean --selftest 全部通过（32 断言）')
+  console.log('✅ check-host-clean --selftest 全部通过（34 断言）')
 }
 
 function main () {
@@ -385,7 +397,10 @@ function main () {
     return 0
   }
   if (r.unsupported) {
-    console.log('⚠️ 读不到 /proc，本机不做孤儿桩检测（**不等于已检查干净**）；沙箱过期检查仍在跑')
+    console.log('⚠️ 读不到 /proc，本机不做孤儿桩检测；活动沙箱 cwd 豁免也不可判定（按 fail-closed 拒绝继续）')
+  }
+  if (r.cwdScanError) {
+    console.log('❌ 活动沙箱 cwd 扫描失败，无法安全排除正在运行的沙箱（按 fail-closed 拒绝继续）')
   }
   if (r.tmpScanError) {
     console.log('❌ 临时根目录扫描失败，无法判定过期沙箱（按 fail-closed 拒绝继续）')
@@ -423,8 +438,9 @@ function guardOrExit (env) {
   const r = inspect({ env: env || process.env })
   if (r.skipped) return false
   if (r.unsupported) {
-    console.log('⚠️ 主机干净度检查：读不到 /proc，跳过孤儿桩检测（**不等于已检查干净**）')
+    console.log('⚠️ 主机干净度检查：读不到 /proc，孤儿桩与活动沙箱 cwd 豁免均不可判定（按 fail-closed 拒绝继续）')
   }
+  if (r.cwdScanError) console.log('   活动沙箱 cwd 扫描失败，无法安全排除正在运行的沙箱（fail-closed）')
   if (r.tmpScanError) console.log('   临时根目录扫描失败，无法判定过期沙箱（fail-closed）')
   if (r.ok) return false
   console.log('❌ 主机不干净，本次运行不启动（避免把环境残留报成契约失败）：')

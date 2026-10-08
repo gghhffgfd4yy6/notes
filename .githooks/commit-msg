@@ -17,8 +17,8 @@ fi
 # 于是上面那条「首行 ≤100 字符」在落地时已经变成一整段，`git log --oneline` 也跟着吐一坨。
 # 本仓 v3.281 那个提交就是这么写的（标题被并成 5 行），钩子当时完全没拦。
 # 注释行**是否**能跳过取决于 Git 的有效 cleanup 模式（review #211）：commit.cleanup=whitespace / verbatim /
-# scissors 会保留 # 行，strip 才会剔除；未显式配置时，GIT_EDITOR=: 是 -m/-F 的 whitespace 口径，编辑器模式按 strip。
-# 这里先按 Git 的有效口径取标题后的第一行：保留 # 行的模式下它不能伪装成分隔空行，剔除 # 行的模式才跳过注释。
+# scissors 会保留注释行，strip 会按 core.commentChar 剔除；未显式配置时，GIT_EDITOR=: 是 -m/-F 的 whitespace 口径，编辑器模式按 strip。
+# 这里按 Git 的有效口径取标题后的第一条：保留注释的模式下它不能伪装成分隔空行，strip 模式才跳过当前注释字符的注释行。
 cleanup_mode=$(git config --get commit.cleanup 2>/dev/null || printf '%s' default)
 if [ "$cleanup_mode" = 'default' ]; then
   if [ "${GIT_EDITOR:-}" = ':' ]; then
@@ -32,7 +32,19 @@ case "$cleanup_mode" in
     first_after_title=$(sed -n '2p' "$msg_file")
     ;;
   *)
-    first_after_title=$(sed -n '2,$p' "$msg_file" | grep -v '^#' | sed -n '1p')
+    first_after_title=''
+    while IFS= read -r line || [ -n "$line" ]; do
+      # 保留第一条真实空白行；git stripspace 整段处理会折叠它，无法用于判断标题分隔。
+      if [ -z "$(printf '%s' "$line" | tr -d '[:space:]')" ]; then
+        first_after_title=$line
+        break
+      fi
+      # 非空行交给 Git 判断是否是当前 core.commentChar 的注释行。
+      if [ -n "$(printf '%s\n' "$line" | git stripspace --strip-comments)" ]; then
+        first_after_title=$line
+        break
+      fi
+    done < <(sed -n '2,$p' "$msg_file")
     ;;
 esac
 case "$(printf '%s' "$first_after_title" | tr -d '[:space:]')" in
@@ -40,7 +52,7 @@ case "$(printf '%s' "$first_after_title" | tr -d '[:space:]')" in
   *)
     echo "❌ 标题与正文之间必须留一个空行（标题后第一个非注释行是：${first_after_title}）"
     echo "   没有空行时 git 会把整段当标题：首行长度限制失效、git log --oneline 会打印整段正文"
-    echo "   注意：保留 # 行的 cleanup 模式下，# 行不算空行；剔除模式下才会跳过它"
+    echo "   注意：保留注释的 cleanup 模式下，注释行不算空行；strip 模式按 core.commentChar 剔除后才会跳过它"
     exit 1
     ;;
 esac

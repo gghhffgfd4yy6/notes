@@ -58,9 +58,14 @@ assert.ok(GIT, '未能在 PATH 中找到可执行的 git（本套件依赖真实
 const NODE_EXEC = process.argv0 && fs.existsSync(process.argv0) ? process.argv0 : process.execPath
 
 // 沙箱化 git 环境：HOME/XDG 指向临时目录，禁用全局与系统 gitconfig——否则开发机上的
-// core.hooksPath 会泄漏进用例，让「未配置」用例假绿/假红。
-function sandboxEnv (home) {
-  return { ...process.env, HOME: home, XDG_CONFIG_HOME: home, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }
+// core.hooksPath 会泄漏进用例，让「未配置」用例假绿/假红。Git 调用钩子时还可能继承
+// GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE；不清除它们会把临时夹具的 Git 操作导向调用方仓库。
+function sandboxEnv (home, sourceEnv = process.env) {
+  const env = { ...sourceEnv, HOME: home, XDG_CONFIG_HOME: home, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }
+  delete env.GIT_DIR
+  delete env.GIT_WORK_TREE
+  delete env.GIT_INDEX_FILE
+  return env
 }
 
 function runVerify (cwd, home) {
@@ -75,8 +80,8 @@ function gitConfig (cwd, home, key) {
   return spawnSync(GIT, ['config', '--get', key], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
-function initRepo (dir, home) {
-  const init = spawnSync(GIT, ['init', '-q'], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+function initRepo (dir, home, env = sandboxEnv(home)) {
+  const init = spawnSync(GIT, ['init', '-q'], { cwd: dir, encoding: 'utf8', env })
   assert.strictEqual(init.status, 0, `git init 失败：${init.stderr}`)
 }
 
@@ -838,17 +843,24 @@ function assertNoResidue (fx, label) {
 // bash 复用上面为 pre-push 解析好的绝对路径 BASH（按名 spawn 会被静态分析判 Sonar S4036）。
 const COMMIT_MSG_HOOK = path.join(__dirname, '.githooks', 'commit-msg')
 
-function runCommitMsg (lines, cleanup) {
+function runCommitMsg (lines, cleanup, inheritedGitEnv = {}, commentChar) {
   const { dir, home } = makeCase()
+  const env = sandboxEnv(home, { ...process.env, ...inheritedGitEnv })
   try {
     const file = path.join(dir, 'MSG')
     fs.writeFileSync(file, lines.join('\n'))
-    if (cleanup) {
-      initRepo(dir, home)
-      const set = spawnSync(GIT, ['config', 'commit.cleanup', cleanup], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
-      assert.strictEqual(set.status, 0, `设置 commit.cleanup=${cleanup} 失败：${set.stderr}`)
+    if (cleanup || commentChar) {
+      initRepo(dir, home, env)
+      if (cleanup) {
+        const set = spawnSync(GIT, ['config', 'commit.cleanup', cleanup], { cwd: dir, encoding: 'utf8', env })
+        assert.strictEqual(set.status, 0, `设置 commit.cleanup=${cleanup} 失败：${set.stderr}`)
+      }
+      if (commentChar) {
+        const set = spawnSync(GIT, ['config', 'core.commentChar', commentChar], { cwd: dir, encoding: 'utf8', env })
+        assert.strictEqual(set.status, 0, `设置 core.commentChar=${commentChar} 失败：${set.stderr}`)
+      }
     }
-    return spawnSync(BASH, [COMMIT_MSG_HOOK, file], { cwd: dir, encoding: 'utf8', env: sandboxEnv(home) })
+    return spawnSync(BASH, [COMMIT_MSG_HOOK, file], { cwd: dir, encoding: 'utf8', env })
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -862,12 +874,23 @@ function runCommitMsg (lines, cleanup) {
   const whitespaceComment = runCommitMsg(['ci: 标题', '# whitespace 会保留这行', ''], 'whitespace')
   assert.strictEqual(whitespaceComment.status, 1, 'commit.cleanup=whitespace 保留第 2 行注释时，不得把它当空行分隔')
   assert.match(whitespaceComment.stdout, /空行/, 'whitespace 反例被拒绝时仍要点名空行')
+  const inheritedGitVars = runCommitMsg(['ci: 标题', '', '正文'], 'whitespace', {
+    GIT_DIR: path.join(__dirname, 'not-a-git-dir'),
+    GIT_WORK_TREE: path.join(__dirname, 'not-a-worktree'),
+    GIT_INDEX_FILE: path.join(__dirname, 'not-an-index')
+  })
+  assert.strictEqual(inheritedGitVars.status, 0, 'cleanup-mode 夹具必须清除继承的 Git 仓库变量并使用自身 cwd')
+  const semicolonComment = runCommitMsg(['ci: 标题', '; Git 注释', '', '正文'], 'strip', {}, ';')
+  assert.strictEqual(semicolonComment.status, 0, 'strip cleanup 必须遵循 core.commentChar=; 并保留真实空行分隔')
+  const semicolonNoBlank = runCommitMsg(['ci: 标题', '; Git 注释', '正文'], 'strip', {}, ';')
+  assert.strictEqual(semicolonNoBlank.status, 1, 'core.commentChar=; 的注释后漏空行必须被拒绝')
+  assert.match(semicolonNoBlank.stdout, /空行/, '分号注释后的漏空行反例仍要点名空行')
   // 靶向反例（review #211）：注释行**不算**分隔空行。git 的 cleanup 会把 `#` 行剔掉，剔完标题与正文
   // 直接相邻 ⇒ 整段并成 subject，「首行 ≤100 字符」随之失效。旧钩子把 `'#'*` 与空行并列放行 = 本用例红。
   const commentAsSep = runCommitMsg(['chore: 标题', '# 这行会被 git 剔除', '正文第一段紧跟其后'])
   assert.strictEqual(commentAsSep.status, 1, '第 2 行是注释、第 3 行是正文时必须红（注释剔除后没有空行分隔）')
   assert.match(commentAsSep.stdout, /空行/, '红时仍要点名「空行」')
-  assert.match(commentAsSep.stdout, /保留 # 行的 cleanup 模式下/, '红时必须解释「为什么注释不算」，否则修复者会再加一行注释')
+  assert.match(commentAsSep.stdout, /保留注释的 cleanup 模式下/, '红时必须解释「为什么注释不算」，否则修复者会再加一行注释')
   // 注释行后面真的留了空行 ⇒ 合规（不得因为「有注释」就一律红）
   assert.strictEqual(runCommitMsg(['chore: 标题', '# 注释', '', '正文']).status, 0, '注释后有空行分隔必须通过')
   // 空白行（只有空格/制表符）等同空行：git 的 cleanup 会剥掉行尾空白，语义上是分隔

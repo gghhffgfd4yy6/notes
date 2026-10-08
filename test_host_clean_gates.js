@@ -6,7 +6,7 @@
 // 不会让任何东西变红——与 v3.280 静态闸门、v3.281 文档行长闸门同一族失效方式。
 // 本套件是普通单元套件（不标 mutationSkip）：只读仓库文件 + 调纯函数；变异沙箱的 copyProject 会整体
 // 复制 scripts/，故沙箱内也能跑；由「全量单元测试（run_unit_tests.js）」兜底步骤覆盖，SKIP_SUITES 不动。
-// 判据本身的边界用例（NUL cmdline、ppid 排除、过期阈值覆盖等）在 --selftest 的 32 条里，不在此重复。
+// 判据本身的边界用例（NUL cmdline、ppid 排除、过期阈值覆盖等）在 --selftest 的 34 条里，不在此重复。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -63,7 +63,7 @@ check('孤儿判据：父进程已消失的测试进程也要拦，活动子进�
     { pid: 200, ppid: 1, cmdline: 'node' + nul + '/root/x/test_filter.js' + nul },
     { pid: 201, ppid: 50, cmdline: 'node' + nul + '/root/x/test_filter.js' + nul },
     { pid: 202, ppid: 999, cmdline: 'node' + nul + 'test_filter.js' + nul },
-    { pid: 203, ppid: 999, cmdline: 'node' + nul + '/tmp/test_app.js' + nul + '--only=foo' + nul },
+    { pid: 203, ppid: 999, cmdline: 'node' + nul + path.join(__dirname, 'test_app.js') + nul + '--only=foo' + nul },
     { pid: 204, ppid: 1, cmdline: 'node' + nul + '/usr/local/bin/dsh web' + nul }
   ]
   assert.deepStrictEqual(host.findOrphanSuites(ps, 999, []).map((x) => x.pid), [200, 202, 203],
@@ -144,6 +144,10 @@ check('临时根扫描失败必须 fail-closed，普通文件不得进入沙箱�
     const missing = host.inspect({ env: {}, procRoot: root, tmpRoot: path.join(root, 'missing'), selfPid: 1 })
     assert.strictEqual(missing.tmpScanError, true, '临时根不可读必须显式标记扫描失败')
     assert.strictEqual(missing.ok, false, '扫描失败不得返回主机干净')
+    const cwdMissing = host.inspect({ env: {}, procRoot: path.join(root, 'missing-proc'), tmpRoot: root, selfPid: 1 })
+    assert.strictEqual(cwdMissing.cwdScanError, true, 'cwd 保护信号不可读必须显式标记')
+    assert.deepStrictEqual(cwdMissing.dirs, [], 'cwd 保护信号不可读时不得生成沙箱删除候选')
+    assert.strictEqual(cwdMissing.ok, false, 'cwd 保护信号不可读不得报告主机干净')
     const file = path.join(root, 'xbk-not-a-sandbox')
     fs.writeFileSync(file, 'ordinary file\n')
     fs.utimesSync(file, new Date(0), new Date(0))
@@ -151,6 +155,8 @@ check('临时根扫描失败必须 fail-closed，普通文件不得进入沙箱�
     assert.ok(!inspected.dirs.some((d) => d.p === file), '普通文件不得进入过期沙箱清单')
     const src = read('scripts/check-host-clean.js')
     assert.match(src, /const tmpScanError = stale === null/, '临时根扫描失败必须进入显式错误状态')
+    assert.match(src, /const cwdScanError = cwds === null/, 'cwd 保护信号不可判定必须进入显式错误状态')
+    assert.match(src, /const stale = cwdScanError \? \[\] : listStaleSandboxDirs/, 'cwd 保护信号不可判定时不得继续生成沙箱清理候选')
     assert.match(src, /st\.isDirectory\(\) && !st\.isSymbolicLink\(\)/, '清理候选必须限定为真实目录')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
