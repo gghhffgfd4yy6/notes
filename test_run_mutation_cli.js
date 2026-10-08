@@ -325,12 +325,14 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
   // 行为断言：验证 evaluate 真正执行了测试运行（而非因缺文件立即失败），output 含测试入口输出。
 
   // 场景 1：无变异（mutants=[]）→ evaluate 正常运行全量单元测试并返回结果
-  // ⚠️ 超时上限 180s：evaluate 内跑完整 run_unit_tests（含 test_network 的 ~45s 真实退避等待），
-  // 慢验证机（proot/手机）上全量可达 115-120s，120s 上限会因环境波动假红（新旧实现均实测撞边）；
-  // 该上限只是「沙箱挂死」的防御看门狗（真实挂死 180s 同样 SIGKILL 收敛），不改变任何断言语义。
+  // ⚠️ 预算的语义（v3.282 起）：总上限 600s 只是「跑到天荒地老」的兜底，**挂死由静默线判定**
+  // （runTests 的 idleMs，默认 180s 无任何输出即 SIGKILL）。此前这里是一条 180s 墙钟线，
+  // 而它在慢机器上与「跑得慢但仍在推进」不可区分——手机容器实测完整套单元 170–205s，
+  // 于是同一份内容会 171.3s 绿、200.4s 红（10 次观测 3 绿 7 红），CI 上却稳定 115–120s。
+  // 该预算不改变任何断言语义：真挂死仍在 ~180s 静默收敛，比旧行为只多等 0s（旧线本来就是 180s）。
   {
     const files = ['xbk_utils.js']
-    const result = await evaluate([], files, 180000)
+    const result = await evaluate([], files, 600000)
     // 行为断言 1：返回结构完整
     assert.ok(typeof result === 'object', 'evaluate 应返回对象')
     // 沙箱内整套必须真的通过：此前只断言 status ∈ {pass,fail,timeout}，copyProject 漏拷文件导致

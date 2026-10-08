@@ -89,6 +89,17 @@ jobs:
       - name: 静态扫描接线断言（test_ci_static_gates.js）
         run: npm run test:ci-static-gates
 
+      # v3.281 文档行长闸门：任何 markdown 单行 > 1200 字符即红（prose 防回长，见 scripts/check-doc-lines.js）。
+      # 必须在此显式列步骤：test.yml 不跑 `npm run check`（只有 release.yml 跑整链），所以「只接本地」
+      # 等于日常 PR 拦不住；三处接线（check 链 / pre-commit / 这里）缺一即成摆设。
+      - name: 文档行长闸门（1200 字符/行）
+        run: npm run check:doc-lines
+
+      # v3.281：接线断言套件（test_suites.js 标 mutationSkip，理由同 test_ci_static_gates：它要读
+      # .githooks/，而变异沙箱不复制该目录）。摘掉上面步骤、pre-commit 门链或 check 链任一处，本步骤变红。
+      - name: 文档行长接线断言（test_doc_line_gates.js）
+        run: npm run test:doc-line-gates
+
       - name: 单元测试（test_filter.js，含 101 章版本校验）
         run: npm run test:filter
 

@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.280 — 静态扫描闸门：shellcheck + zizmor 进 check/pre-commit/CI 三处门禁 *********
+//* ******* 线报酷推送脚本 v3.283 — 主机干净度前置检查：孤儿测试桩/孤儿套件/过期沙箱会让墙钟基准假红，入口直接拒跑 *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

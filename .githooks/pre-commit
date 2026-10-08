@@ -1,8 +1,8 @@
 #!/bin/bash
 # pre-commit 钩子：提交前自动验证（可 git commit --no-verify 跳过）
-# 四道快检：lint → 版本闸门 → 变异行段校验 → 静态扫描（便宜的在前；最贵的 test:filter 见文末说明，已迁到 pre-push）
+# 五道快检：lint → 版本闸门 → 变异行段校验 → 静态扫描 → 文档行长（便宜的在前；最贵的 test:filter 见文末说明，已迁到 pre-push）
 #
-# 变异行段闸门（node scripts/check-mutation-ranges.js，本机实测 0.47s）：AGENTS.md:27-30 把
+# 变异行段闸门（node scripts/check-mutation-ranges.js，本机实测 0.47s）：AGENTS.md「大文件与变异行段」一节把
 # 「改动带行段的文件后重拆 mutation.yml 行段并校验」列为必做，`npm run check` 也含这一步，但提交
 # 时刻真正执行的 pre-commit 此前并不跑它——只依赖钩子的人永远不过这道门；v3.270 正是文件增长后
 # 行段未同步、尾部 430 行静默漏测。成本 0.5s 换掉这一类历史事故，净收益明确（新门禁，不外放）。
@@ -13,7 +13,8 @@
 # 输出先收进变量，成功路径不刷屏（test_filter 一次打印约 460KB 的那道门禁已迁到 pre-push），
 # 失败路径 stderr 已合并、逐字可见。门禁范围与退出码语义不变（失败仍 exit 1）。
 #
-# test:filter 已于 v3.276 迁到 .githooks/pre-push，本钩子只留 3 道快检：原先四道门禁合计
+# test:filter 已于 v3.276 迁到 .githooks/pre-push，迁移当时本钩子只剩 3 道快检（v3.280 加静态扫描、
+# v3.281 加文档行长后为 5 道）：原先四道门禁合计
 # ≈82s（test:filter 单跑 59s、独占 72%），82s 的提交前阻塞是「习惯性绕过门禁」的温床。
 # 迁移**不减少覆盖**：命令、退出码语义、失败回显都不变，仍在本机执行，只是把拦截点从「提交前」
 # 移到「推送前」（代码离开本机之前）；本钩子因此稳定在 ≈23s。
@@ -53,6 +54,11 @@ run_gate "lint" "，修复后再提交（若提示某个可执行文件 not foun
 run_gate "版本闸门" "（文件头/CHANGELOG/package.json/package-lock 四方不一致），先同步再提交" node check-version.js
 run_gate "变异行段闸门" "（mutation.yml 行段未覆盖 xbk_function_v3.js / xbk_sendNotify_slim.js 实际行数），重拆行段后再提交" node scripts/check-mutation-ranges.js
 run_gate "静态扫描闸门" "（shellcheck/zizmor 有发现，修复后再提交；本机缺工具时脚本显眼提示并跳过、由 CI fail-closed 兜底）" npm run check:ci-static
+# 文档行长闸门（v3.281，node scripts/check-doc-lines.js）：prose 的自然退化方向是「往一条 bullet 里
+# 追加」——AGENTS 曾长到单行 8132 字符、CHANGELOG 4788，评审无法逐字核对、diff 一行改动=整行重写。
+# README/SYSTEM_CONTRACT 的内容同步至今无门禁（check-version.js 只管版本标题），至少把「行长」这一维
+# 固化下来：超阈值即红，且**不给例外名单**（名单本身是下一个静默失效的入口）。成本是纯 fs 遍历，亚秒级。
+run_gate "文档行长闸门" "（有 markdown 单行超过 1200 字符：按语义拆成子弹/表格再提交，不要调大阈值）" npm run check:doc-lines
 # test:filter 不在此执行：v3.276 起由 .githooks/pre-push 承担（推送前拦截，覆盖未减少）。
 # 这里**不**放「可选/默认跳过」的开关——那会把门禁变成摆设。
-echo "✅ pre-commit 全部通过（4 道快检；单元测试将在 git push 时由 pre-push 拦截）"
+echo "✅ pre-commit 全部通过（5 道快检；单元测试将在 git push 时由 pre-push 拦截）"

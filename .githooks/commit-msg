@@ -13,4 +13,19 @@ if [ "$len" -gt 100 ]; then
   echo "❌ 提交信息首行过长（${len} 字符 > 100），请精简"
   exit 1
 fi
+# 标题必须是**独立一段**（v3.282）：git 会把「标题后没空行」的多行首段整体当作 subject——
+# 于是上面那条「首行 ≤100 字符」在落地时已经变成一整段，`git log --oneline` 也跟着吐一坨。
+# 本仓 v3.281 那个提交就是这么写的（标题被并成 5 行），钩子当时完全没拦。
+# Git 的 --cleanup 命令行覆盖值不会传给 commit-msg 钩子。
+# 因此固定检查原始消息第二行，确保所有清理模式下的标题长度判据一致。
+first_after_title=$(sed -n '2p' "$msg_file")
+case "$(printf '%s' "$first_after_title" | tr -d '[:space:]')" in
+  '') ;;
+  *)
+    echo "❌ 标题与正文之间必须在原始消息第二行留一个空行（实际为：${first_after_title}）"
+    echo "   没有空行时 git 会把整段当标题：首行长度限制失效、git log --oneline 会打印整段正文"
+    echo "   注释行不算空行；cleanup 命令行覆盖不会传给钩子，因此按原始消息严格检查"
+    exit 1
+    ;;
+esac
 exit 0

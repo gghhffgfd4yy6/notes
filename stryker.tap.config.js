@@ -86,6 +86,7 @@ const explicitTestFiles = [
   'test_run_mutation_race.js',
   'test_ci_skip_suites.js',
   'test_suite_registry.js',
+  'test_host_clean_gates.js',
   'test_tag_validator.js',
   'test_check_version.js',
   'test_app_unit.js',

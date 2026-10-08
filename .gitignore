@@ -14,6 +14,9 @@ mutation-report.json
 cleanup_rootfs_junk.sh
 .tmp_parallel_*.json
 
+# 本机技能包安装脚本（用户在容器外自行下载的产物，不参与仓库构建与门禁）
+install-tech-packs.sh
+
 # AI 审查运行时产物不入库
 .ai
 

@@ -25,6 +25,18 @@ function padEndWidth (str, width) {
 // 清单与 test.yml 的显式步骤必须双向一致（漏写=重复跑，多写=漏跑）——不一致由 test_ci_skip_suites.js 拦截。
 // 变异评估场景（run_mutation.js 子进程）必须保持全量 —— run_mutation.js spawn 时会清除该变量；
 // CI 变异任务走 stryker（不经 run_mutation.js），由 mutation.yml 的 step env 设 XBK_MUTATION_CHILD=1。
+// v3.283 主机干净度前置检查：孤儿测试桩 / 被 reparent 到 1 的孤儿套件 / 过期 /tmp/xbk-* 沙箱会把墙钟
+// 基准拖红（实测 300ms 跑出 878ms），脏机器不启动。缺脚本时**响亮跳过**——最小工作树（如
+// test_ci_skip_suites.js 的 RT-08 夹具只复制 run_tests.js）不得因此崩；其它异常照常抛出，不吞。
+let hostClean = null
+try {
+  hostClean = require('./scripts/check-host-clean.js')
+} catch (e) {
+  if (e.code !== 'MODULE_NOT_FOUND') throw e
+  console.log('⚠️ 未找到 scripts/check-host-clean.js，跳过主机干净度前置检查（不影响本次运行）')
+}
+if (hostClean && hostClean.guardOrExit(process.env)) process.exit(1)
+
 const skipSuites = new Set((process.env.SKIP_SUITES || '').split(',').map(s => s.trim()).filter(Boolean))
 // 拼错的条目会「静默不生效」（等于没跳过，重复跑且无人知道），因此必须在入口处炸出来。
 const unknownSkips = [...skipSuites].filter(file => !SUITES.some(s => s.file === file))

@@ -10,11 +10,10 @@
 //      （#132 review Q4：close 发射非默认信号 'SIGTERM' 并断言返回 SIGTERM——兜底值恰是
 //      'SIGKILL'，若实现不透传而硬编码回退值，本断言即红）
 //   B2) 超时 → kill → close 悬空（异常 fd/僵尸进程）：2000ms 兜底保险定时器 resolve，signal 回退 'SIGKILL'
-// 本套件用注入法（把 child_process.spawn 替换为 fake child 工厂）在不改生产代码（run_mutation.js
-// 一行不动）的前提下覆盖四条路径；只依赖 node 内置模块，不依赖 node_modules。
+// 本套件用注入法（把 child_process.spawn 替换为 fake child 工厂）覆盖四条路径，并用独立 Node 进程验证兜底结算后没有遗留计时器；只依赖 node 内置模块，不依赖 node_modules。
 // 关键原理：run_mutation.js 顶层是 `const { spawn } = require('child_process')`（模块加载时解构），
 // 所以必须先替换 child_process.spawn，再清 require 缓存重新 require('./run_mutation') 才生效。
-// 运行方式：node test_run_mutation_race.js（exit 0 = 通过；全程约 2.2s）。
+// 运行方式：node test_run_mutation_race.js（exit 0 = 通过；普通环境约 5.5s，含 B2 约 2s 兜底与进程级探针）。
 // 变异沙箱（XBK_MUTATION_CHILD=1）下秒级跳过（#132 review Q6）；普通单元门禁完整执行。
 const assert = require('node:assert')
 const fs = require('node:fs')
@@ -165,6 +164,30 @@ function waitKillCount (expected, timeoutMs = 1500) {
       } finally {
         clearTimeout(watchdogTimer)
       }
+      // 进程级回归：Promise 已 resolve 不能证明事件循环已清空。用独立 Node 子进程复现 close 悬空，
+      // idle 线故意设为 60s；修复前该子进程会被 5s watchdog 杀掉，修复后约 2s 自然退出。
+      const probeNode = process.execPath
+      const probe = [
+        "'use strict'",
+        "const { EventEmitter } = require('node:events')",
+        "const { PassThrough } = require('node:stream')",
+        "const cp = require('node:child_process')",
+        'cp.spawn = () => {',
+        '  const c = new EventEmitter()',
+        '  c.stdout = new PassThrough()',
+        '  c.stderr = new PassThrough()',
+        '  c.kill = () => true',
+        '  return c',
+        '}',
+        "const { runTests } = require('./run_mutation')",
+        "runTests('.', 10, 60000).then(r => { if (r.status !== 'timeout') process.exitCode = 1 })"
+      ].join('\n')
+      const probeResult = childProcess.spawnSync(probeNode, ['-e', probe], {
+        cwd: __dirname, encoding: 'utf8', timeout: 5000
+      })
+      assert.strictEqual(probeResult.status, 0,
+        `B2 兜底后 Node 进程应在 5s 内退出，实际 status=${probeResult.status} signal=${probeResult.signal} error=${probeResult.error ? probeResult.error.message : ''}`)
+      console.log('✅ 场景B2进程级回归：兜底结算后无遗留 idle 定时器')
     }
 
     // ── 场景 E：spawn 失败（如 PATH 里没有 node → ENOENT）只发 'error' 且不触发 'close' ──
@@ -186,7 +209,50 @@ function waitKillCount (expected, timeoutMs = 1500) {
       console.log('✅ 场景E：子进程 error 事件按 fail 立即结算（不再 uncaughtException/悬空）')
     }
 
-    console.log('✅ 变异超时契约四路径 + spawn error 注入式回归通过')
+    // ── 场景 F（v3.282）：子进程一直静默 → 静默线判挂死，总上限远未到达 ──
+    {
+      killedSignals.length = 0
+      const t0 = Date.now()
+      const pending = runTests(dir, 60000, 120) // 总上限 60s、静默线 120ms
+      await waitKillCount(1)
+      assert.strictEqual(killedSignals[0], 'SIGKILL', '静默到线应整组 SIGKILL')
+      lastChild.emit('close', null, 'SIGKILL')
+      const result = await pending
+      const elapsed = Date.now() - t0
+      assert.strictEqual(result.status, 'timeout', '静默挂死应结算 timeout')
+      assert.ok(elapsed < 3000, '挂死应在静默线附近收敛（实测 ' + elapsed + 'ms），不该等 60s 总上限——这正是本次改动要修的语义')
+      console.log('✅ 场景F：持续静默 → 静默线判挂死（无须等总上限）')
+    }
+
+    // ── 场景 G（v3.282）：持续输出、总耗时跨过静默线 → 不被杀，按真实退出码结算 ──
+    {
+      killedSignals.length = 0
+      const pending = runTests(dir, 60000, 150)
+      const iv = setInterval(() => { if (lastChild && lastChild.stdout.writable) lastChild.stdout.write('推进一行\n') }, 40)
+      await new Promise(resolve => setTimeout(resolve, 520)) // 远超 150ms 静默线：旧语义在这里就会被杀
+      clearInterval(iv)
+      lastChild.emit('close', 0, null)
+      const result = await pending
+      assert.deepStrictEqual(killedSignals, [], '只要持续推进就不该被杀（墙钟总长的缺陷正在于区分不了「慢」与「挂死」）')
+      assert.strictEqual(result.status, 'pass', '慢但推进的子进程应按真实 code=0 判 pass')
+      assert.ok(result.output.includes('推进一行'), '输出应被完整收集')
+      console.log('✅ 场景G：持续输出跨过静默线 → 不被杀、判 pass（慢机器不再假红）')
+    }
+
+    // ── 场景 H（v3.282）：总上限仍是兜底——持续输出也要在 timeoutMs 收敛 ──
+    {
+      killedSignals.length = 0
+      const pending = runTests(dir, 150, 60000) // 总上限 150ms 先于静默线
+      const iv = setInterval(() => { if (lastChild && lastChild.stdout.writable) lastChild.stdout.write('x') }, 20)
+      await waitKillCount(1)
+      clearInterval(iv)
+      lastChild.emit('close', null, 'SIGKILL')
+      const result = await pending
+      assert.strictEqual(result.status, 'timeout', '总上限到线仍应判 timeout（静默线不是唯一防线）')
+      console.log('✅ 场景H：总上限依然兜底（持续输出也会被 timeoutMs 收敛）')
+    }
+
+    console.log('✅ 变异超时契约：四路径 + spawn error + 静默线/总上限双轨 注入式回归通过')
   } finally {
     // 还原模块状态：恢复真实 spawn，清缓存后重新 require（顶层解构重新绑定真实 spawn）
     childProcess.spawn = originalSpawn
