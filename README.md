@@ -45,7 +45,7 @@ cp push_config.local.js.example push_config.local.js
 ### 3. 运行
 
 ```bash
-npm start
+node qinglong/xbk_push.js
 ```
 
 程序会持续运行并按默认间隔抓取、过滤和推送。
@@ -91,6 +91,8 @@ node qinglong/xbk_push.js --dry-run
 ```bash
 npm start
 ```
+
+`npm start` 只执行一轮，适合手动测试；需要持续运行请使用上面的 `node qinglong/xbk_push.js`。
 
 ### 调整轮询间隔
 
