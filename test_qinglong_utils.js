@@ -222,11 +222,15 @@ const {
   // （定义处是 `runResident (app, controller)`，带空格），且不受插桩插入代码/换行差异影响。
   assert.ok(pushSource.includes('runResident(app'), '常驻路径必须仍然存在（防"删掉常驻"式假修复）')
 
-  // ===== QX-06：常驻路径的 Node 版本告警文案 =====
-  assert.strictEqual(nodeVersionWarning('22.22.2'), null, '恰为 engines 下界不应告警')
-  assert.strictEqual(nodeVersionWarning('24.18.0'), null, '高于下界不应告警')
-  assert.match(String(nodeVersionWarning('22.21.0')), /低于 package\.json engines 要求（>=22\.22\.2）/, '低于下界应给出与 engines 对齐的告警')
-  assert.match(String(nodeVersionWarning('20.11.0')), /低于 package\.json engines 要求/, '主版本低于 22 同样应告警')
+  // ===== QX-06：完整 re2 engines 范围的 Node 版本告警 =====
+  assert.strictEqual(nodeVersionWarning('22.22.2'), null, '22.x engines 下界不应告警')
+  assert.strictEqual(nodeVersionWarning('24.15.0'), null, '24.x engines 下界不应告警')
+  assert.strictEqual(nodeVersionWarning('26.0.0'), null, '26.x 及以上不应告警')
+  assert.match(String(nodeVersionWarning('23.0.0')), /不满足 re2\/package\.json engines 要求/, '23.x 不在 re2 支持范围内应告警')
+  assert.match(String(nodeVersionWarning('25.0.0')), /不满足 re2\/package\.json engines 要求/, '25.x 不在 re2 支持范围内应告警')
+  assert.match(String(nodeVersionWarning('24.14.0')), /不满足 re2\/package\.json engines 要求/, '24.0–24.14 不满足下界应告警')
+  assert.match(String(nodeVersionWarning('22.22.1')), /不满足 re2\/package\.json engines 要求/, '低于 22.x 下界应告警')
+  assert.match(String(nodeVersionWarning('20.11.0')), /不满足 re2\/package\.json engines 要求/, '主版本低于 22 应告警')
 
   // ===== QX-08：--status 的缓存目录必须与生产同源（不再硬编码 path.join(ROOT,'xianbaoku_cache')）=====
   // 反例（改动前）：生产在默认目录被普通文件占位 / realpath 逃出根目录时会回退 .xbk_cache_safe，
@@ -480,7 +484,7 @@ const deps = async (spec) => {
   assert.notStrictEqual(d.cache[2].value, 'rel/cache', '相对路径不得被当作生效目录')
   assert.strictEqual(d.cache[2].warns.length, 1, '相对路径必须恰好告警一次')
   assert.strictEqual(d.cache[2].warns[0].startsWith('⚠️ XBK_CACHE_DIR 不是绝对路径（rel/cache），已忽略并回退默认缓存目录：'), true, '相对路径告警文案必须精确并含被忽略的原始值')
-  assert.deepStrictEqual(d.version, [null, null, '⚠️ 当前 Node 22.22.1 低于 package.json engines 要求（>=22.22.2），re2 等原生依赖可能不可用', '⚠️ 当前 Node 22 低于 package.json engines 要求（>=22.22.2），re2 等原生依赖可能不可用'], 'engines 闸门按完整数值比较，缺段按 0 补齐')
+  assert.deepStrictEqual(d.version, [null, '⚠️ 当前 Node 23.0.0 不满足 re2/package.json engines 要求（^22.22.2 || ^24.15.0 || >=26.0.0），原生依赖可能不可用', '⚠️ 当前 Node 22.22.1 不满足 re2/package.json engines 要求（^22.22.2 || ^24.15.0 || >=26.0.0），原生依赖可能不可用', '⚠️ 当前 Node 22 不满足 re2/package.json engines 要求（^22.22.2 || ^24.15.0 || >=26.0.0），原生依赖可能不可用'], 'engines 闸门按完整范围比较，缺段按 0 补齐')
 
   // --- 入口参数白名单（KNOWN_ARGS）：已知参数不得告警；未知参数只告警不改变行为（QX-09）---
   const env = Object.assign({}, process.env, { XBK_CACHE_DIR: ROOT, TZ: 'UTC' })

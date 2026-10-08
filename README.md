@@ -15,14 +15,11 @@ node --version
 ```
 
 ```bash
-npm ci
+npm ci --ignore-scripts
+npm run rebuild --prefix node_modules/re2
 ```
 
-如果安装后提示 `re2` 无法加载，再执行：
-
-```bash
-npm rebuild re2
-```
+`--ignore-scripts` 用于避免安装依赖时自动执行第三方生命周期脚本；`re2` 通过显式重建完成原生模块安装。
 
 ### 2. 设置通知渠道
 
@@ -58,13 +55,23 @@ node qinglong/xbk_push.js
 
 ## 青龙使用
 
-在青龙中创建一个 Node.js 脚本任务，进入项目目录后执行：
+依赖安装和升级只在首次部署或更新版本时执行，不要放进每次定时调度的任务脚本：
 
 ```bash
-npm ci --omit=dev
-npm rebuild re2
+cd /项目目录
+npm ci --omit=dev --ignore-scripts
+npm run rebuild --prefix node_modules/re2
+node qinglong/xbk_push.js --check
+```
+
+检查通过后，在青龙中创建一个常驻任务；任务脚本只保留启动命令：
+
+```bash
+cd /项目目录
 node qinglong/xbk_push.js
 ```
+
+该入口会持续运行，青龙中只应保持一个实例，不要再用其他定时任务重复启动。通知密钥建议配置在青龙任务的环境变量中；本地运行时才使用项目根目录下的 `push_config.local.js`。各渠道的环境变量名称请参考 `push_config.local.js.example`。
 
 建议先检查环境：
 
@@ -128,9 +135,9 @@ filter: {
 | 变量 | 作用 |
 |---|---|
 | `XBK_INTERVAL_MS` | 抓取间隔，单位为毫秒，默认 `10000` |
-| `XBK_DRY_RUN=1` | 仅常驻入口：不发送通知、不写入成功缓存；`npm start` 仍只运行一轮 |
+| `XBK_DRY_RUN=1` | 对常驻和单轮入口都生效：不发送通知、不写入成功缓存；常驻入口持续运行，`npm start` 只执行一轮 |
 | `XBK_CACHE_DIR` | `--status` 使用的状态目录，必须是绝对路径 |
-| `XBK_AUTO_INSTALL_DEPS=1` | 青龙常驻入口缺少依赖时尝试自动安装和构建 |
+| `XBK_AUTO_INSTALL_DEPS=1` | 应急选项：青龙常驻入口运行时联网安装和构建缺失依赖；默认关闭，优先在部署阶段完成依赖初始化 |
 | `PUSH_PLUS_TOKEN` | PushPlus Token，可代替本地配置 |
 | `PUSH_KEY` | Server酱 Key，可代替本地配置 |
 | `BARK_PUSH` | Bark 地址，可代替本地配置 |
@@ -155,13 +162,14 @@ npm test                          # 运行测试
 
 ### 提示 `Cannot find module 're2'` 或原生模块加载失败
 
-确认 Node.js 版本满足要求，然后执行：
+确认 Node.js 版本满足要求，然后执行（不要改用会自动执行生命周期脚本的裸 `npm ci`）：
 
 ```bash
-npm rebuild re2
+npm ci --ignore-scripts
+npm run rebuild --prefix node_modules/re2
 ```
 
-如果仍然失败，检查系统是否有编译工具，或在网络正常的环境重新执行 `npm ci`。
+如果仍然失败，检查系统是否有编译工具，或在网络正常的环境重新执行上述两条命令。
 
 ### 没有收到通知
 
@@ -170,7 +178,7 @@ npm rebuild re2
 1. `push_config.local.js` 是否填写正确；
 2. 是否至少配置了一个完整的通知渠道；
 3. 运行 `node qinglong/xbk_push.js --check` 检查依赖；
-4. 查看 `xianbaoku_cache/run.log`；
+4. 以启动日志或 `--status` 输出的生效缓存目录为准，查看其中的 `run.log`（默认是 `xianbaoku_cache/run.log`；自定义 `XBK_CACHE_DIR` 或 `Config.cache.dir` 后路径会变化）；
 5. 用 `--dry-run` 确认抓取和过滤是否正常。
 
 ### 重复推送或不推送

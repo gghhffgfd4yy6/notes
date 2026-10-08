@@ -26,27 +26,36 @@ function loadApp () {
   }
 }
 
-// 与 package.json engines.node（>=22.22.2）对齐的版本下界：--check 的硬闸门按它判定（QX-06），
-// 常驻主路径只据此告警——不硬拒启动，避免把「Node 略旧但 got/re2 都可用」的既有部署直接打断。
-const MIN_NODE_VERSION = [22, 22, 2]
+// 与 re2 的 engines.node（^22.22.2 || ^24.15.0 || >=26.0.0）对齐：--check 和常驻告警
+// 必须拒绝 23.x、25.x 及 24.0–24.14，不能只检查一个最低版本。
+const SUPPORTED_NODE_RANGES = '^22.22.2 || ^24.15.0 || >=26.0.0'
+const NODE_RANGE_MINIMA = [[22, 22, 2], [24, 15, 0]]
 
-function isBelowMinNodeVersion (version = process.versions.node, min = MIN_NODE_VERSION) {
-  const parts = String(version).split('.').map(part => {
+function parseNodeVersion (version) {
+  return String(version).split('.').slice(0, 3).map(part => {
     const n = Number.parseInt(part, 10)
     return Number.isFinite(n) ? n : 0
   })
-  for (let i = 0; i < min.length; i += 1) {
-    const value = parts[i] || 0
-    if (value !== min[i]) return value < min[i]
-  }
-  return false
 }
 
-// QX-06：常驻主路径此前完全不看 Node 版本，低于 engines 的环境静默运行；这里给出与 --check
-// 同源的告警文案（返回 null 表示无需告警），由 main() 在进入常驻循环前打印。
+function compareNodeVersion (left, right) {
+  for (let i = 0; i < 3; i += 1) {
+    if (left[i] !== right[i]) return left[i] - right[i]
+  }
+  return 0
+}
+
+function isSupportedNodeVersion (version = process.versions.node) {
+  const parts = parseNodeVersion(version)
+  if (parts[0] >= 26) return true
+  return NODE_RANGE_MINIMA.some(min => parts[0] === min[0] && compareNodeVersion(parts, min) >= 0)
+}
+
+// QX-06：常驻主路径与 --check 使用同一套完整 engines 版本范围；低于或不在范围内时只告警，
+// 保持既有常驻入口不硬拒启动的行为。
 function nodeVersionWarning (version = process.versions.node) {
-  if (!isBelowMinNodeVersion(version)) return null
-  return `⚠️ 当前 Node ${version} 低于 package.json engines 要求（>=${MIN_NODE_VERSION.join('.')}），re2 等原生依赖可能不可用`
+  if (isSupportedNodeVersion(version)) return null
+  return `⚠️ 当前 Node ${version} 不满足 re2/package.json engines 要求（${SUPPORTED_NODE_RANGES}），原生依赖可能不可用`
 }
 
 function runCheck (app) {
@@ -55,12 +64,11 @@ function runCheck (app) {
     checks.push({ name, ok, detail })
     console.log(`${ok ? '✅' : '❌'} ${name}${detail ? `：${detail}` : ''}`)
   }
-  // QX-06：闸门与 package.json engines（>=22.22.2）及 CI 矩阵（22.22.2 / 24）同口径。
-  // 旧实现只看主版本（major>=22），于是 Node 22.0.0 这类低于 engines 的环境会被 --check 放行。
-  const nodeOk = !isBelowMinNodeVersion()
+  // QX-06：闸门与 re2 engines 的完整范围（^22.22.2 || ^24.15.0 || >=26.0.0）同口径。
+  const nodeOk = isSupportedNodeVersion()
   add('Node.js 版本', nodeOk, nodeOk
     ? process.version
-    : `${process.version}（低于 package.json engines 要求的 >=${MIN_NODE_VERSION.join('.')}）`)
+    : `${process.version}（不满足 re2/package.json engines 要求：${SUPPORTED_NODE_RANGES}）`)
   try {
     require('got')
     add('got 依赖', true, '可加载')
