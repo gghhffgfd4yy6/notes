@@ -37,7 +37,7 @@ const SANDBOX_PREFIX = path.join(TMP_ROOT, SANDBOX_NAME_PREFIX)
 const STUB_MARKERS = ['stub_heartbeat', 'test_stub_tree']
 // 被外部 SIGKILL 打断的运行还会留下**孤儿套件进程**本身（被 reparent 到 1）——test_filter.js 一类
 // 持续吃 CPU 并写缓存目录，同样拖红墙钟基准。本次排查就抓到过一个 job_kill 留下的 test_filter。
-const SUITE_RE = /\/(?:run_tests|run_unit_tests|test_[A-Za-z0-9_]+)\.js$/
+const SUITE_RE = /(?:^|[/\\])(?:run_tests|run_unit_tests|test_[A-Za-z0-9_]+)\.js$/
 
 // 变异评估子进程 / 显式关闭：跳过（跳过必须响亮打印，见 main）
 function shouldSkipCheck (env) {
@@ -170,20 +170,24 @@ function pretty (cmdline) {
   return String(cmdline || '').replace(/\0+/g, ' ').trim()
 }
 
-// cmdline 是 NUL 分隔的 argv：取最后一个非空段（真正被执行的脚本路径）
-function lastArg (cmdline) {
-  const parts = String(cmdline || '').split('\0').filter(Boolean)
-  return parts.length ? parts[parts.length - 1] : ''
+// cmdline 是 NUL 分隔的 argv：测试脚本可能是相对路径、绝对路径，也可能后面带 --only 等参数，
+// 因此不能只看最后一个 argv。
+function hasSuiteArg (cmdline) {
+  return String(cmdline || '').split('\0').filter(Boolean).some((arg) => SUITE_RE.test(arg))
 }
 
-// 纯函数：孤儿套件进程 = cmdline 以本仓测试入口/套件结尾，且已被 reparent（ppid===1）。
-// 「ppid===1」是关键判据：正在被 run_tests 驱动的子套件父进程不是 1，两条终端并发跑测试
-// 互不误伤；只有父进程被外部 SIGKILL 之后留下的才是这里要拦的。
+// 纯函数：孤儿套件进程 = 命中本仓测试入口/套件，且父进程已消失。selfPid 与 ancestors 排除在外。
 function findOrphanSuites (procs, selfPid, ancestors) {
   const skip = new Set([String(selfPid)].concat((ancestors || []).map(String)))
+  const livePids = new Set((procs || []).filter((x) => x).map((x) => String(x.pid)))
   return (procs || [])
-    .filter((x) => x && Number(x.ppid) === 1 && !skip.has(String(x.pid)))
-    .filter((x) => SUITE_RE.test(lastArg(x.cmdline)))
+    .filter((x) => x && !skip.has(String(x.pid)))
+    .filter((x) => hasSuiteArg(x.cmdline))
+    .filter((x) => {
+      const ppid = Number(x.ppid)
+      if (!(ppid > 0)) return false
+      return ppid === 1 || !livePids.has(String(ppid))
+    })
     .map((x) => ({ pid: Number(x.pid), cmdline: pretty(x.cmdline) }))
 }
 
@@ -213,23 +217,30 @@ function listStaleSandboxDirs (tmpRoot, nowMs, staleMs, cwds) {
   try {
     names = fs.readdirSync(tmpRoot)
   } catch {
-    return [] // 读不到 /tmp：不判脏也不谎报干净，由 main 的 scanned 标志体现
+    return null // 扫描面不可判定：调用方必须 fail-closed，不能把空结果当成干净
   }
-  // 先按名称过滤候选，避免无关的大目录进入 activityMtimeMs；随后取目录自身与直接子项的最新 mtime。
-  // 另外任何把该沙箱当 cwd 的活进程都直接豁免——残留判红会打印 `rm -rf`，误判活动沙箱等于劝人删掉正在跑的运行。
+  // 先按名称过滤候选，避免无关的大目录进入 activityMtimeMs；随后只接受真实目录，避免把普通文件或
+  // 符号链接列入后续 rm -rf 建议。任何把该沙箱当 cwd 的活进程都直接豁免——残留判红会打印清理命令，
+  // 误判活动沙箱等于劝人删掉正在跑的运行。
   const entries = names
     .filter((n) => n.startsWith(SANDBOX_NAME_PREFIX))
     .map((n) => {
       const p = path.join(tmpRoot, n)
-      return { p, mtimeMs: activityMtimeMs(p) }
+      try {
+        const st = fs.lstatSync(p)
+        return st.isDirectory() && !st.isSymbolicLink() ? { p, mtimeMs: activityMtimeMs(p) } : null
+      } catch {
+        return null
+      }
     })
+    .filter(Boolean)
   return findStaleSandboxes(entries, nowMs, staleMs).filter((d) => !isActiveSandbox(d.p, cwds))
 }
 
-// 汇总判定：{ skipped, unsupported, stubs, dirs, ok }
+// 汇总判定：{ skipped, unsupported, tmpScanError, stubs, dirs, ok }
 function inspect (opts) {
   const env = opts.env || {}
-  if (shouldSkipCheck(env)) return { skipped: true, reason: 'XBK_MUTATION_CHILD=1（变异评估沙箱内）', ok: true, stubs: [], suites: [], dirs: [] }
+  if (shouldSkipCheck(env)) return { skipped: true, reason: 'XBK_MUTATION_CHILD=1（变异评估沙箱内）', ok: true, tmpScanError: false, stubs: [], suites: [], dirs: [] }
   const procRoot = opts.procRoot || '/proc'
   const tmpRoot = opts.tmpRoot || TMP_ROOT
   const nowMs = opts.nowMs || Date.now()
@@ -240,10 +251,12 @@ function inspect (opts) {
   const anc = unsupported ? [] : ancestorPids(procRoot, selfPid)
   const stubs = unsupported ? [] : findOrphanStubs(procs, selfPid, anc)
   const suites = unsupported ? [] : findOrphanSuites(procs, selfPid, anc)
-  // 活动沙箱的豁免信号来自同一份 /proc：读不到就没有豁免（也不会误删），与 unsupported 同口径
+  // 活动沙箱的豁免信号来自同一份 /proc：读不到就没有豁免，但 tmp 扫描仍必须独立判定。
   const cwds = unsupported ? [] : liveSandboxCwds(procRoot)
-  const dirs = listStaleSandboxDirs(tmpRoot, nowMs, staleMs, cwds)
-  return { skipped: false, unsupported, stubs, suites, dirs, ok: stubs.length === 0 && suites.length === 0 && dirs.length === 0 }
+  const stale = listStaleSandboxDirs(tmpRoot, nowMs, staleMs, cwds)
+  const tmpScanError = stale === null
+  const dirs = tmpScanError ? [] : stale
+  return { skipped: false, unsupported, tmpScanError, stubs, suites, dirs, ok: !tmpScanError && stubs.length === 0 && suites.length === 0 && dirs.length === 0 }
 }
 
 function selftest () {
@@ -280,23 +293,26 @@ function selftest () {
   // ppid<=0（/proc/<pid>/stat 读不到）不参与判定，与 readProcs 的「无权限/刚退出」口径一致
   assert.deepStrictEqual(findOrphanStubs([{ pid: 400, ppid: -1, cmdline: 'node\u0000x/stub_heartbeat.js' }], 1, []), [],
     'ppid 读不到时不判孤儿（宁可漏报也不误拦两条并发运行）')
-  // —— 孤儿套件：只认 ppid===1 的测试进程；活动子进程与非测试进程都不误伤
+  // —— 孤儿套件：脚本参数可为相对/绝对路径，后面可带 --only；父进程消失也算孤儿
   const ps = [
+    { pid: 50, ppid: 1, cmdline: 'node\u0000/usr/local/bin/helper.js\u0000' },
     { pid: 200, ppid: 1, cmdline: 'node\u0000/root/x/test_filter.js\u0000' },
-    { pid: 201, ppid: 55, cmdline: 'node\u0000/root/x/test_filter.js\u0000' },
+    { pid: 201, ppid: 50, cmdline: 'node\u0000/root/x/test_filter.js\u0000' },
     { pid: 202, ppid: 1, cmdline: 'node\u0000/root/x/run_unit_tests.js\u0000' },
-    { pid: 203, ppid: 1, cmdline: 'node\u0000/usr/local/bin/dsh web\u0000' }
+    { pid: 203, ppid: 1, cmdline: 'node\u0000/usr/local/bin/dsh web\u0000' },
+    { pid: 204, ppid: 999, cmdline: 'node\u0000test_filter.js\u0000' },
+    { pid: 205, ppid: 999, cmdline: 'node\u0000/tmp/test_app.js\u0000--only=foo\u0000' }
   ]
-  assert.deepStrictEqual(findOrphanSuites(ps, 999, []).map((x) => x.pid), [200, 202],
-    '被 reparent 到 1 的测试进程算孤儿；父进程还在的（201）与非测试进程（203）都不算')
-  assert.deepStrictEqual(findOrphanSuites(ps, 200, []).map((x) => x.pid), [202], '自己的 PID 必须排除')
+  assert.deepStrictEqual(findOrphanSuites(ps, 999, []).map((x) => x.pid), [200, 202, 204, 205],
+    'reparent 到 1、父进程已消失、相对脚本路径和带参数的测试进程都必须被抓到；活动运行的 201 与非测试进程 203 不得误伤')
+  assert.deepStrictEqual(findOrphanSuites(ps, 200, []).map((x) => x.pid), [202, 204, 205], '自己的 PID 必须排除')
   assert.deepStrictEqual(findOrphanSuites([], 1, []), [])
   // —— 跳过与平台不支持
   assert.strictEqual(shouldSkipCheck({ XBK_MUTATION_CHILD: '1' }), true, '变异评估子进程必须跳过（否则沙箱内活动沙箱→假红）')
   assert.strictEqual(shouldSkipCheck({}), false)
   const missing = inspect({ env: {}, procRoot: path.join(TMP_ROOT, 'definitely-not-here'), tmpRoot: path.join(TMP_ROOT, 'definitely-not-here'), nowMs: now, selfPid: 1 })
   assert.strictEqual(missing.unsupported, true, '读不到 /proc 必须标为「该平台不检测」，不得当成已检查')
-  assert.strictEqual(missing.ok, true)
+  assert.strictEqual(missing.ok, false, '读不到临时根时不得把空结果当成主机干净')
   assert.strictEqual(missing.skipped, false)
   const skipped = inspect({ env: { XBK_MUTATION_CHILD: '1' }, procRoot: '/proc', tmpRoot: TMP_ROOT, selfPid: 1 })
   assert.strictEqual(skipped.skipped, true)
@@ -312,6 +328,16 @@ function selftest () {
     const r = inspect({ env: {}, procRoot: fake, tmpRoot: fake, nowMs: now, selfPid: 1 })
     assert.ok(r.dirs.some((d) => d.p.endsWith('xbk-run-tests-old')), '过期沙箱必须出现在结果里')
     assert.strictEqual(r.ok, false, '有过期沙箱即判不干净')
+    // 只有真实目录才是沙箱：同名前缀的普通文件不得进入 rm -rf 建议清单。
+    const staleFile = path.join(fake, 'xbk-run-tests-file')
+    fs.writeFileSync(staleFile, 'not a sandbox\n')
+    fs.utimesSync(staleFile, past, past)
+    const withFile = inspect({ env: {}, procRoot: fake, tmpRoot: fake, nowMs: now, selfPid: 1 })
+    assert.ok(!withFile.dirs.some((d) => d.p.endsWith('xbk-run-tests-file')), '普通文件不得被当成过期沙箱')
+    // 临时根扫描失败必须独立 fail-closed；这里让 procRoot 可读，避免把 /proc 不支持与 tmp 错误混在一起。
+    const tmpScanError = inspect({ env: {}, procRoot: fake, tmpRoot: path.join(fake, 'missing-tmp-root'), nowMs: now, selfPid: 1 })
+    assert.strictEqual(tmpScanError.tmpScanError, true, '临时根不可读必须留下扫描失败标记')
+    assert.strictEqual(tmpScanError.ok, false, '临时根扫描失败不得报告主机干净')
     // —— 活动沙箱不得误报①：目录自身 mtime 停在 60min 前，但里面有一个刚写过的文件
     //    （目录 mtime 不随子文件写入前进——这是本门禁原先的误判方向）
     const active = path.join(fake, 'xbk-mutant-active')
@@ -338,7 +364,7 @@ function selftest () {
   } finally {
     fs.rmSync(fake, { recursive: true, force: true })
   }
-  console.log('✅ check-host-clean --selftest 全部通过（28 断言）')
+  console.log('✅ check-host-clean --selftest 全部通过（32 断言）')
 }
 
 function main () {
@@ -361,6 +387,9 @@ function main () {
   if (r.unsupported) {
     console.log('⚠️ 读不到 /proc，本机不做孤儿桩检测（**不等于已检查干净**）；沙箱过期检查仍在跑')
   }
+  if (r.tmpScanError) {
+    console.log('❌ 临时根目录扫描失败，无法判定过期沙箱（按 fail-closed 拒绝继续）')
+  }
   if (r.ok && !r.unsupported) {
     console.log('✅ 主机干净：无孤儿测试桩 / 孤儿套件进程、无过期 ' + SANDBOX_PREFIX + '* 沙箱')
     return 0
@@ -373,7 +402,7 @@ function main () {
       console.log('    清理：kill -TERM ' + r.stubs.map((s) => s.pid).join(' ') + '  然后再 kill -KILL')
     }
     if (r.suites.length) {
-      console.log('  孤儿套件进程 ' + r.suites.length + ' 个（父进程被外部 kill 后被 reparent 到 1）：')
+      console.log('  孤儿套件进程 ' + r.suites.length + ' 个（父进程已被 reparent 到 1 或已从进程表消失）：')
       for (const x of r.suites.slice(0, 6)) console.log('    pid ' + x.pid + '  ' + x.cmdline.slice(0, 120))
       console.log('    清理：kill -TERM ' + r.suites.map((x) => x.pid).join(' ') + '  然后再 kill -KILL')
     }
@@ -396,6 +425,7 @@ function guardOrExit (env) {
   if (r.unsupported) {
     console.log('⚠️ 主机干净度检查：读不到 /proc，跳过孤儿桩检测（**不等于已检查干净**）')
   }
+  if (r.tmpScanError) console.log('   临时根目录扫描失败，无法判定过期沙箱（fail-closed）')
   if (r.ok) return false
   console.log('❌ 主机不干净，本次运行不启动（避免把环境残留报成契约失败）：')
   for (const x of r.stubs) console.log('   孤儿桩 pid ' + x.pid + '  ' + x.cmdline.slice(0, 120))

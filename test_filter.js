@@ -2,6 +2,10 @@
 /* eslint no-control-regex: off, camelcase: off */ // 脱敏正则与 tuisong_replace/zkt_gjc 等 snake_case 为设计命名
 'use strict'
 
+// 直接执行（CI/pre-push）也必须先拦截残留进程和过期沙箱；变异评估子进程由 guard 自己按环境跳过。
+const hostClean = require('./scripts/check-host-clean.js')
+if (hostClean.guardOrExit(process.env)) process.exit(1)
+
 // ============================================================
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================

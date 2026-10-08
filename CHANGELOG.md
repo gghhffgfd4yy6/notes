@@ -253,5 +253,6 @@
 - 未采纳 1 条：ast-grep 在 `scripts/check-doc-lines.js` 报的 **Zip Slip（CWE-22）**——那处是 `path.join(dir, e.name)` 遍历**本仓库自己的目录树**（`e` 来自 `readdirSync(withFileTypes)`），不解析任何归档条目、没有输出目录，前提不成立；同族的「不可读目录」判据反而按上面②收紧了。
 - 判据类改动一律配**靶向反例**（摘掉判据必红）：`test_install_hooks.js`「把注释当分隔」、`test_doc_line_gates.js`「静默 omit 回潮」/「改回 spread」、`test_host_clean_gates.js`「活动桩报成孤儿」/「活跃时间退回目录自身 mtime」。文档同步：`AGENTS.md` / `README.md` / `SYSTEM_CONTRACT.md` / `CONTRIBUTING.md` / PR 模板五处按新判据改写（这三道门禁的语义本来就写在它们里面，不改就是文档教人用旧口径）。
 
+- PR #211 后续修复（继续沿用 v3.283，不 bump 版本）：`run_mutation.js` 的超时兜底统一清理总时限、静默线和 fallout 计时器，close 悬空后 Node 进程不再拖尾；主机干净度门禁对临时根扫描失败改为 fail-closed，只把真实目录作为沙箱候选，并让孤儿套件与孤儿桩统一按父进程消失判定、扫描完整命令行参数；`check-doc-lines.js` 按 CRLF 归一化行尾；直接执行 `test_filter.js` 也接入 host guard。新增对应进程级、扫描边界和 CRLF 回归。
 - CodeRabbit 后续评审的 3 条 actionable 逐条核实并修复：`commit-msg` 读取有效 `commit.cleanup` 模式，`whitespace` / `verbatim` / `scissors` 保留的 `#` 行不再伪装成标题分隔空行，并补真实临时 Git 仓库回归；`check-host-clean.js` 先过滤 `xbk-*` 名称再读取直接子项，避免无关大目录拖慢每次测试入口；`SYSTEM_CONTRACT.md` 补齐变异静默线与提交消息 cleanup 契约。`README.md` / `AGENTS.md` / `CONTRIBUTING.md` 同步新口径，版本仍沿用 v3.283。
 - 版本 bump 至 3.283.0（四处同步）；主文件头仍 442 行 ⇒ 变异 `1-442` 全覆盖不变。

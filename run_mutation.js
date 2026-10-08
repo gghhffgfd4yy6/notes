@@ -410,7 +410,20 @@ function runTests (dir, timeoutMs, idleMs) {
     // OOM）不在其列，走 else 分支按 fail 记为 killed（#136 review：原注释漏了 timedOut 前提，
     // 与实现 if (timedOut && (code === null || code === undefined)) 不符）。
     let timedOut = false
+    let settled = false
     let falloutTimer = null
+    let timer = null
+    let idleTimer = null
+    // 所有结束路径共用一个结算出口：兜底 resolve 后也必须清理另一条计时器，且迟到的 close/error
+    // 不能再次触发 kill 或改写已经交付的结果。
+    const finish = result => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      if (idleTimer) clearTimeout(idleTimer)
+      if (falloutTimer) clearTimeout(falloutTimer)
+      resolve(result)
+    }
     // idleMs（v3.282）：把「挂死」的判据从**墙钟总长**改成**连续静默**。墙钟总长这条线在慢机器上
     // 与「跑得慢但仍在前进的子进程」不可区分——手机容器/低配 VM 实测完整套单元 170–205s，
     // 于是 180s 的总上限会把「慢」误报成「挂死」（timeout 形态），CI 上同一套却只要 115–120s。
@@ -419,46 +432,44 @@ function runTests (dir, timeoutMs, idleMs) {
     // 总上限继续存在（生产 MUTATION_TIMEOUT=90s 不变），只是多了一条「静默够久也算挂死」。
     const idleEff = Number.isInteger(idleMs) && idleMs > 0 ? idleMs : DEFAULT_IDLE_MS
     const trip = () => {
+      if (settled || falloutTimer) return
       timedOut = true
       killTree(child)
       // 兜底保险：kill 后若 close 迟迟不触发（极端情况），仍要 resolve 不让 Promise 悬空——
       // 用当前已 collect 的输出，signal 回退 'SIGKILL'（真实 close signal 已无从得知）。
-      // 正常 kill 会在毫秒级触发 close，此保险不会与 close 的 resolve 竞争（close 到达即
-      // clearTimeout(falloutTimer)，无论是否已置 timedOut，一律以 close 的真实结论为准）。
+      // 兜底结算也走 finish，确保总上限/静默线不会在结果交付后继续挂住 Node 进程。
       falloutTimer = setTimeout(() => {
-        resolve({ status: 'timeout', code: null, signal: 'SIGKILL', output, summary: extractTestSummary(output) })
+        finish({ status: 'timeout', code: null, signal: 'SIGKILL', output, summary: extractTestSummary(output) })
       }, 2000)
     }
-    const timer = setTimeout(trip, timeoutMs)
-    let idleTimer = setTimeout(trip, idleEff)
-    const armIdle = () => { clearTimeout(idleTimer); idleTimer = setTimeout(trip, idleEff) }
+    timer = setTimeout(trip, timeoutMs)
+    idleTimer = setTimeout(trip, idleEff)
+    const armIdle = () => {
+      if (settled) return
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(trip, idleEff)
+    }
     child.stdout.on('data', d => { output += d; armIdle() })
     child.stderr.on('data', d => { output += d; armIdle() })
     // 子进程 spawn 失败（如 PATH 里没有 node → ENOENT）只发 'error' 且不触发 'close'：未监听会抛
     // uncaughtException 让整轮调度器崩溃，Promise 也会一直悬到 2000ms 兜底定时器（review F5）。
-    // 监听后按 fail 结算，并清掉超时/兜底两个定时器（90s 超时定时器不清理会无谓拖住进程）。
-    // Promise 已 resolve 后 close 即使到达也只是被忽略，不会重复结算。
+    // finish 会清掉总上限、静默线和兜底三个定时器，并屏蔽迟到事件的重复结算。
     child.on('error', error => {
-      clearTimeout(timer)
-      clearTimeout(idleTimer)
-      if (falloutTimer) clearTimeout(falloutTimer)
-      resolve({ status: 'fail', code: null, signal: null, error: error.message, output, summary: extractTestSummary(output) })
+      finish({ status: 'fail', code: null, signal: null, error: error.message, output, summary: extractTestSummary(output) })
     })
     child.on('close', (code, signal) => {
-      clearTimeout(timer)
-      clearTimeout(idleTimer)
-      if (falloutTimer) clearTimeout(falloutTimer)
+      if (settled) return
       if (timedOut && (code === null || code === undefined)) {
         // 已过超时线且 close 没给真实退出码（被信号杀死，如我们的 SIGKILL）：退出码不可知、
         // 输出不完整 → 维持 timeout 形态，signal 用 close 收到的真实值（拿不到才回退 'SIGKILL'）。
-        resolve({ status: 'timeout', code: null, signal: signal || 'SIGKILL', output, summary: extractTestSummary(output) })
+        finish({ status: 'timeout', code: null, signal: signal || 'SIGKILL', output, summary: extractTestSummary(output) })
       } else {
         // 正常路径，以及「超时线已过但进程在 kill 生效前已自然退出」（close 携带真实 code）：
         // 一律按真实退出码判定 pass/fail，signal 透传（自然退出为 null）。此前该分支被并进 timeout
         // 形态，谎报 code: null + signal: 'SIGKILL'（D1）：把「刚好赶上超时窗口的正常完成」记为
         // timeout → main() 的 report.timeout 使本地运行误红，且与 scripts/mutation-report.js:103
         // 的 (killed + timeout) / total 同口径地把超时计入已检出，虚增分数、掩盖真实存活。
-        resolve({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: extractTestSummary(output) })
+        finish({ status: code === 0 ? 'pass' : 'fail', code, signal, output, summary: extractTestSummary(output) })
       }
     })
   })

@@ -6,7 +6,7 @@
 // 不会让任何东西变红——与 v3.280 静态闸门、v3.281 文档行长闸门同一族失效方式。
 // 本套件是普通单元套件（不标 mutationSkip）：只读仓库文件 + 调纯函数；变异沙箱的 copyProject 会整体
 // 复制 scripts/，故沙箱内也能跑；由「全量单元测试（run_unit_tests.js）」兜底步骤覆盖，SKIP_SUITES 不动。
-// 判据本身的边界用例（NUL cmdline、ppid 排除、过期阈值覆盖等）在 --selftest 的 28 条里，不在此重复。
+// 判据本身的边界用例（NUL cmdline、ppid 排除、过期阈值覆盖等）在 --selftest 的 32 条里，不在此重复。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -22,7 +22,7 @@ function check (label, fn) {
   console.log('✅ ' + label)
 }
 
-check('接线：npm 脚本在册 + 两个测试入口都挂了 guard', () => {
+check('接线：npm 脚本在册 + 三个测试入口都挂了 guard', () => {
   const pkg = JSON.parse(read('package.json'))
   assert.strictEqual(pkg.scripts['check:host-clean'], 'node scripts/check-host-clean.js',
     'check:host-clean 必须指向 scripts/check-host-clean.js')
@@ -38,6 +38,9 @@ check('接线：npm 脚本在册 + 两个测试入口都挂了 guard', () => {
     assert.match(src, /console\.log\('⚠️ 未找到 scripts\/check-host-clean\.js/,
       entry + ' 跳过时必须响亮打印，不得静默通过')
   }
+  const direct = read('test_filter.js')
+  assert.match(direct, /^if \(hostClean\.guardOrExit\(process\.env\)\) process\.exit\(1\)$/m,
+    '直接执行 test_filter.js（CI/pre-push）也必须先经过主机干净度检查')
 })
 
 check('不回退：变异子进程必跳过；沙箱只认过期；阈值必须是 30 分钟', () => {
@@ -53,16 +56,19 @@ check('不回退：变异子进程必跳过；沙箱只认过期；阈值必须�
     '阈值被悄悄调小 = 并发场景假红；调大 = 门禁形同虚设')
 })
 
-check('孤儿判据：只认被 reparent（ppid===1）的测试进程，活动子进程不误伤', () => {
+check('孤儿判据：父进程已消失的测试进程也要拦，活动子进程不误伤', () => {
   const nul = String.fromCharCode(0)
   const ps = [
+    { pid: 50, ppid: 1, cmdline: 'node' + nul + '/usr/local/bin/helper.js' + nul },
     { pid: 200, ppid: 1, cmdline: 'node' + nul + '/root/x/test_filter.js' + nul },
-    { pid: 201, ppid: 55, cmdline: 'node' + nul + '/root/x/test_filter.js' + nul },
-    { pid: 202, ppid: 1, cmdline: 'node' + nul + '/usr/local/bin/dsh web' + nul }
+    { pid: 201, ppid: 50, cmdline: 'node' + nul + '/root/x/test_filter.js' + nul },
+    { pid: 202, ppid: 999, cmdline: 'node' + nul + 'test_filter.js' + nul },
+    { pid: 203, ppid: 999, cmdline: 'node' + nul + '/tmp/test_app.js' + nul + '--only=foo' + nul },
+    { pid: 204, ppid: 1, cmdline: 'node' + nul + '/usr/local/bin/dsh web' + nul }
   ]
-  assert.deepStrictEqual(host.findOrphanSuites(ps, 999, []).map((x) => x.pid), [200],
-    '200 是被 reparent 的孤儿套件；201 父进程还活着（并发跑测试不误伤）；202 不是测试进程')
-  assert.deepStrictEqual(host.findOrphanSuites(ps, 200, []).map((x) => x.pid), [], '自己的 PID 必须排除')
+  assert.deepStrictEqual(host.findOrphanSuites(ps, 999, []).map((x) => x.pid), [200, 202, 203],
+    'reparent、父进程消失、相对脚本路径和尾随参数都必须被抓到；活动运行的 201 与非测试进程 204 不得误伤')
+  assert.deepStrictEqual(host.findOrphanSuites(ps, 200, []).map((x) => x.pid), [202, 203], '自己的 PID 必须排除')
 })
 
 check('v3.282 那条机制不复发：挂死夹具与心跳孙进程都带 90s 有界自杀', () => {
@@ -74,6 +80,7 @@ check('v3.282 那条机制不复发：挂死夹具与心跳孙进程都带 90s �
 check('此刻判定与真实环境一致（跳过或干净，二者其一）', () => {
   const r = host.inspect({ env: process.env })
   if (r.skipped) return
+  assert.strictEqual(r.tmpScanError, false, '真实环境临时根扫描失败必须直接暴露，而不是报告干净')
   if (r.unsupported) {
     assert.ok(Array.isArray(r.dirs), '读不到 /proc 时仍要给出沙箱判定（不得静默当已检查）')
     return
@@ -128,6 +135,25 @@ check('沙箱活跃时间必须含直接子项与活进程 cwd（review #211：�
     assert.ok(!/let mtimeMs = Number\.NaN/.test(src), 'mtimeMs 的无用初值形态回潮')
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+check('临时根扫描失败必须 fail-closed，普通文件不得进入沙箱清理清单', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-gate-scan-'))
+  try {
+    const missing = host.inspect({ env: {}, procRoot: root, tmpRoot: path.join(root, 'missing'), selfPid: 1 })
+    assert.strictEqual(missing.tmpScanError, true, '临时根不可读必须显式标记扫描失败')
+    assert.strictEqual(missing.ok, false, '扫描失败不得返回主机干净')
+    const file = path.join(root, 'xbk-not-a-sandbox')
+    fs.writeFileSync(file, 'ordinary file\n')
+    fs.utimesSync(file, new Date(0), new Date(0))
+    const inspected = host.inspect({ env: {}, procRoot: root, tmpRoot: root, nowMs: Date.now(), selfPid: 1 })
+    assert.ok(!inspected.dirs.some((d) => d.p === file), '普通文件不得进入过期沙箱清单')
+    const src = read('scripts/check-host-clean.js')
+    assert.match(src, /const tmpScanError = stale === null/, '临时根扫描失败必须进入显式错误状态')
+    assert.match(src, /st\.isDirectory\(\) && !st\.isSymbolicLink\(\)/, '清理候选必须限定为真实目录')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
   }
 })
 

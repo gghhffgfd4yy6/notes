@@ -67,9 +67,14 @@ function findMarkdownFiles (rootDir, opts) {
   return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 }
 
+// 换行符不是正文：统一剥掉 CRLF 的行尾 `\r`，保留 String.length 的 UTF-16 码元口径。
+function splitLines (text) {
+  return String(text).split('\n').map((line) => line.endsWith('\r') ? line.slice(0, -1) : line)
+}
+
 // 纯函数：给文本与上限，返回超限的行（行号 1 起）。上限判定是「>」而非「>=」——恰好等于不算红。
 function scanOffenders (text, max) {
-  const lines = String(text).split('\n')
+  const lines = splitLines(text)
   const bad = []
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].length > max) bad.push({ line: i + 1, len: lines[i].length })
@@ -94,7 +99,7 @@ function checkOne (rootDir, rel, max) {
   // 最长行**迭代**求，不用 Math.max(0, ...lines.map(len))：spread 把每个行长度当一个实参压栈，
   // 本机实测 100k 行 OK、150k 行 RangeError: Maximum call stack size exceeded —— 一个长 md 会让
   // 闸门当场崩（而不是判红），门禁的可用性不该取决于被扫文件的行数。
-  const lines = String(text).split('\n')
+  const lines = splitLines(text)
   let longest = 0
   for (const l of lines) if (l.length > longest) longest = l.length
   return { rel, ok: offenders.length === 0, offenders, longest }
@@ -105,6 +110,8 @@ function selftest () {
   // —— 行长判定的边界：恰好等于上限不红，多一个字符就红
   assert.deepStrictEqual(scanOffenders('a'.repeat(1200), 1200), [], '恰好 1200 字符不算超限')
   assert.deepStrictEqual(scanOffenders('a'.repeat(1201), 1200), [{ line: 1, len: 1201 }], '1201 字符必须红且给出行号与长度')
+  assert.deepStrictEqual(scanOffenders('a'.repeat(1200) + '\r\n', 1200), [], 'CRLF 的 CR 不属于正文，不得把恰好 1200 字符判红')
+  assert.deepStrictEqual(scanOffenders('a'.repeat(1201) + '\r\n', 1200), [{ line: 1, len: 1201 }], 'CRLF 下真正超过 1200 字符仍必须红')
   // —— 行号从 1 起、多行只报超限的那些（不误伤短行）
   assert.deepStrictEqual(scanOffenders('短行\n' + 'b'.repeat(1500) + '\n又一短行', 1200), [{ line: 2, len: 1500 }])
   // —— 空文本 / 只有换行：0 个超限，且不崩
@@ -174,7 +181,7 @@ function selftest () {
   const real = findMarkdownFiles(path.join(__dirname, '..'))
   assert.ok(real.length >= 7, '本仓至少应有 7 个 md 在册，实得 ' + real.length)
   assert.ok(real.includes('README.md') && real.includes('AGENTS.md') && real.includes('.github/pull_request_template.md'))
-  console.log('✅ check-doc-lines --selftest 全部通过（26 断言）')
+  console.log('✅ check-doc-lines --selftest 全部通过（28 断言）')
 }
 
 function main () {
