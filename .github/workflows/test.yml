@@ -46,7 +46,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        node-version: [22.22.2, 24]   # re2@1.26.1 要求 Node >=22.22.2
+        node-version: [22.22.2, 24]   # re2@1.27.0 要求 Node >=22.22.2
     steps:
       # 供应链安全：固定完整 commit SHA（可变 tag 可被上游重新指向，静默注入攻击代码）
       # 升级时由 Dependabot/手动替换为新 SHA
