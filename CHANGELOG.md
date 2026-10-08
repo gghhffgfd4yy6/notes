@@ -256,5 +256,5 @@
 - PR #211 后续修复（继续沿用 v3.283，不 bump 版本）：`run_mutation.js` 的超时兜底统一清理总时限、静默线和 fallout 计时器，close 悬空后 Node 进程不再拖尾；主机干净度门禁对临时根扫描失败改为 fail-closed，只把真实目录作为沙箱候选，并让孤儿套件与孤儿桩统一按父进程消失判定、扫描完整命令行参数；`check-doc-lines.js` 按 CRLF 归一化行尾；直接执行 `test_filter.js` 也接入 host guard。新增对应进程级、扫描边界和 CRLF 回归。
 - CodeRabbit 后续评审的 3 条 actionable 逐条核实并修复：`commit-msg` 读取有效 `commit.cleanup` 模式，`whitespace` / `verbatim` / `scissors` 保留的注释行不再伪装成标题分隔空行，strip 模式按 Git 的 `core.commentChar` 清理注释，并补真实临时 Git 仓库回归；`check-host-clean.js` 先过滤 `xbk-*` 名称再读取直接子项，避免无关大目录拖慢每次测试入口；`SYSTEM_CONTRACT.md` 补齐变异静默线与提交消息 cleanup 契约。`README.md` / `AGENTS.md` / `CONTRIBUTING.md` 同步新口径，版本仍沿用 v3.283。
 - CodeRabbit 追加的第 4 条 actionable 已修复：strip 模式不再硬编码 `#`，改用 Git 原生 `stripspace` 按 `core.commentChar` 判断注释，并补 `core.commentChar=;` 的正反回归；此前 3 条 CodeRabbit 修复记录保持不变。
-- PR #211 追踪收口（继续沿用 v3.283，不 bump）：`/proc` 或活动沙箱 cwd 保护信号不可读时 host-clean 现在 fail-closed 且不生成 `rm -rf` 候选；竞态探针固定使用 `process.execPath`，host-clean 回归不再写死 `/tmp` 测试路径；commit-msg cleanup 夹具清除继承的 `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE`，strip 模式改用 Git 原生 `stripspace` 遵循 `core.commentChar`，并补默认分号注释字符回归。
+- PR #211 后续对抗复核补强：host-clean 对 cwd 保护信号的权限错误 fail-closed、按真实路径比对 TMPDIR 别名，并为清理命令引用 shell 特殊字符；commit-msg 改为固定检查原始消息第二行，覆盖 `--cleanup` 命令行覆盖无法传入钩子的边界。
 - 版本 bump 至 3.283.0（四处同步）；主文件头仍 442 行 ⇒ 变异 `1-442` 全覆盖不变。

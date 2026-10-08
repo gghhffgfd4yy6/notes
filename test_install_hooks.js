@@ -870,7 +870,8 @@ function runCommitMsg (lines, cleanup, inheritedGitEnv = {}, commentChar) {
   assert.strictEqual(withBody.status, 0, '标题后留空行的多段提交必须通过：' + (withBody.stdout + withBody.stderr).slice(0, 200))
   assert.strictEqual(runCommitMsg(['docs: 只有标题、没有正文']).status, 0, '仅有一行标题必须通过')
   const commentLine = runCommitMsg(['ci: 标题', '# 注释行由 git 剔除，不该被当成正文开头', ''])
-  assert.strictEqual(commentLine.status, 0, 'strip cleanup 下第 2 行注释会被 Git 剔除，空行分隔应通过：' + (commentLine.stdout + commentLine.stderr).slice(0, 200))
+  assert.strictEqual(commentLine.status, 1, '注释行位于原始消息第二行时必须拒绝，即使 strip 模式会剔除')
+  assert.match(commentLine.stdout, /第二行/, '注释行反例应明确要求原文第二行为空行')
   const whitespaceComment = runCommitMsg(['ci: 标题', '# whitespace 会保留这行', ''], 'whitespace')
   assert.strictEqual(whitespaceComment.status, 1, 'commit.cleanup=whitespace 保留第 2 行注释时，不得把它当空行分隔')
   assert.match(whitespaceComment.stdout, /空行/, 'whitespace 反例被拒绝时仍要点名空行')
@@ -881,7 +882,7 @@ function runCommitMsg (lines, cleanup, inheritedGitEnv = {}, commentChar) {
   })
   assert.strictEqual(inheritedGitVars.status, 0, 'cleanup-mode 夹具必须清除继承的 Git 仓库变量并使用自身 cwd')
   const semicolonComment = runCommitMsg(['ci: 标题', '; Git 注释', '', '正文'], 'strip', {}, ';')
-  assert.strictEqual(semicolonComment.status, 0, 'strip cleanup 必须遵循 core.commentChar=; 并保留真实空行分隔')
+  assert.strictEqual(semicolonComment.status, 1, 'core.commentChar=; 的注释行也不能替代原文第二行的空行')
   const semicolonNoBlank = runCommitMsg(['ci: 标题', '; Git 注释', '正文'], 'strip', {}, ';')
   assert.strictEqual(semicolonNoBlank.status, 1, 'core.commentChar=; 的注释后漏空行必须被拒绝')
   assert.match(semicolonNoBlank.stdout, /空行/, '分号注释后的漏空行反例仍要点名空行')
@@ -890,9 +891,9 @@ function runCommitMsg (lines, cleanup, inheritedGitEnv = {}, commentChar) {
   const commentAsSep = runCommitMsg(['chore: 标题', '# 这行会被 git 剔除', '正文第一段紧跟其后'])
   assert.strictEqual(commentAsSep.status, 1, '第 2 行是注释、第 3 行是正文时必须红（注释剔除后没有空行分隔）')
   assert.match(commentAsSep.stdout, /空行/, '红时仍要点名「空行」')
-  assert.match(commentAsSep.stdout, /保留注释的 cleanup 模式下/, '红时必须解释「为什么注释不算」，否则修复者会再加一行注释')
+  assert.match(commentAsSep.stdout, /注释行不算空行/, '红时必须说明注释行不能替代标题分隔')
   // 注释行后面真的留了空行 ⇒ 合规（不得因为「有注释」就一律红）
-  assert.strictEqual(runCommitMsg(['chore: 标题', '# 注释', '', '正文']).status, 0, '注释后有空行分隔必须通过')
+  assert.strictEqual(runCommitMsg(['chore: 标题', '', '# 注释', '正文']).status, 0, '标题后直接留空行时，后续注释与正文必须通过')
   // 空白行（只有空格/制表符）等同空行：git 的 cleanup 会剥掉行尾空白，语义上是分隔
   assert.strictEqual(runCommitMsg(['chore: 标题', '   ', '正文']).status, 0, '只有空白的第 2 行应视为分隔')
   // 靶向反例：漏空行必须红，且要说清「缺空行」与后果（只丢一句「格式错误」等于不教人怎么改）
@@ -908,6 +909,36 @@ function runCommitMsg (lines, cleanup, inheritedGitEnv = {}, commentChar) {
   assert.strictEqual(tooLong.status, 1, '首行超长仍必须红（新加的判据不能顶掉旧的）')
   const bothWrong = runCommitMsg(['没有前缀也没有空行', '第二行'])
   assert.strictEqual(bothWrong.status, 1, '同时违规必须红（顺序无关）')
+  const { dir, home } = makeCase()
+  const env = sandboxEnv(home)
+  delete env.GIT_EDITOR
+  try {
+    initRepo(dir, home, env)
+    const hooks = path.join(dir, 'hooks')
+    fs.mkdirSync(hooks)
+    const hook = path.join(hooks, 'commit-msg')
+    fs.copyFileSync(COMMIT_MSG_HOOK, hook)
+    fs.chmodSync(hook, 0o700)
+    const editor = path.join(dir, 'editor.sh')
+    fs.writeFileSync(editor, "#!/bin/sh\nprintf '%s\\n' 'ci: title' '# " + 'x'.repeat(180) + "' '' 'body text' > \"$1\"\n")
+    fs.chmodSync(editor, 0o700)
+    const configure = (key, value) => {
+      const result = spawnSync(GIT, ['config', key, value], { cwd: dir, encoding: 'utf8', env })
+      assert.strictEqual(result.status, 0, `配置 ${key} 失败：${result.stderr}`)
+    }
+    configure('user.name', 'Commit Hook Regression')
+    configure('user.email', 'commit-hook@example.invalid')
+    configure('commit.cleanup', 'default')
+    configure('core.hooksPath', hooks)
+    configure('core.editor', "'" + editor.replace(/'/g, "'\\''") + "'")
+    const commit = spawnSync(GIT, ['commit', '--allow-empty', '--cleanup=whitespace'], { cwd: dir, encoding: 'utf8', env })
+    assert.strictEqual(commit.status, 1, '真实 git commit 的 --cleanup 覆盖不得绕过提交消息钩子')
+    assert.match(commit.stdout + commit.stderr, /第二行/, '真实 Git 覆盖反例须指出第二行分隔规则')
+    const log = spawnSync(GIT, ['log', '-1', '--format=%s'], { cwd: dir, encoding: 'utf8', env })
+    assert.notStrictEqual(log.status, 0, '钩子拒绝后不得创建提交')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 }
 
 console.log('✅ install-hooks --verify 只读自检：未生效 fail-closed / 生效 exit 0 / 不改配置不改权限；pre-push（v3.276）列入清单且缺失/无执行位均被检出')

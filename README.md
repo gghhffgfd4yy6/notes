@@ -27,7 +27,7 @@ npm start
 
 - **`pre-commit`** —— 五道快检：lint → 版本闸门 → 变异行段校验 → 静态扫描（v3.280 起第 4 道）→ 文档行长（v3.281 起第 5 道）。本机实测 lint 约 22s、其余各 <1s。
 - **`pre-push`** —— 跑 `npm run test:filter`（约 60s，推送前拦截）。校验对象是**被推提交的内容**：`local_sha == HEAD` 且整棵工作树干净（含未跟踪文件；被 ignore 的不算）时在当前工作树跑（此时两者内容一致），否则在临时 worktree 里检出那个提交再跑、跑完清理；隔离环境建不起来即 fail-closed——绝不拿当前工作树的结果冒充被推提交的验证。
-- **`commit-msg`** —— 首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且**标题与正文之间要留一个空行**（没空行时 git 会把整段当标题，长度限制与 `git log --oneline` 都会失真）。`#`（或 Git 配置的 `core.commentChar`）行不自动算空行——钩子按 Git 有效 `commit.cleanup` 判断：保留注释的 `whitespace` / `verbatim` / `scissors` 模式下，标题后的注释行会被拒绝；`strip` 模式按 Git 的注释字符配置剔除注释后再检查第一个非注释行。
+- **`commit-msg`** —— 首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且**标题与正文之间要留一个空行**（没空行时 git 会把整段当标题，长度限制与 `git log --oneline` 都会失真）。`#`（或 Git 配置的 `core.commentChar`）行不自动算空行——注释行不算空行；由于 `git commit --cleanup` 可在命令行覆盖且不会把有效值传给钩子，所有 cleanup 模式都要求原始消息第二行留空。
 
 **装完请用 `npm run hooks:verify` 自检门禁是否真的生效**（只读：生效 exit 0，未生效 exit 1 并说明是配置缺失、钩子文件缺失还是无执行位）——`hooks:install` 对「跳过/不覆盖」场景按设计仍 exit 0，不能当作「装好了」的证据。
 

@@ -124,6 +124,10 @@ check('沙箱活跃时间必须含直接子项与活进程 cwd（review #211：�
       '直接子项的 mtime 必须计入活跃时间，否则活动沙箱会被判过期并收到 rm -rf 建议')
     assert.ok(host.isActiveSandbox(sb, [path.join(sb, 'nested')]), '活进程 cwd 在沙箱内 = 活动')
     assert.ok(!host.isActiveSandbox(sb, [sb + 'brother']), '前缀相似但不同目录不得豁免（必须按路径分段）')
+    const aliasRoot = path.join(tmp, 'alias')
+    fs.symlinkSync(tmp, aliasRoot, 'dir')
+    assert.ok(host.isActiveSandbox(path.join(aliasRoot, path.basename(sb)), [fs.realpathSync(sb)]),
+      'TMPDIR 符号链接别名和 /proc cwd 的真实路径必须视为同一活动沙箱')
     // 接线：listStaleSandboxDirs 必须同时用上这两个信号
     const src = read('scripts/check-host-clean.js')
     assert.match(src, /return findStaleSandboxes\(entries, nowMs, staleMs\)\.filter\(\(d\) => !isActiveSandbox\(d\.p, cwds\)\)/,
@@ -153,6 +157,35 @@ check('临时根扫描失败必须 fail-closed，普通文件不得进入沙箱�
     fs.utimesSync(file, new Date(0), new Date(0))
     const inspected = host.inspect({ env: {}, procRoot: root, tmpRoot: root, nowMs: Date.now(), selfPid: 1 })
     assert.ok(!inspected.dirs.some((d) => d.p === file), '普通文件不得进入过期沙箱清单')
+    const activeSandbox = path.join(root, 'xbk-active-unreadable-cwd')
+    fs.mkdirSync(activeSandbox)
+    const old = new Date(Date.now() - 61 * 60 * 1000)
+    fs.utimesSync(activeSandbox, old, old)
+    const procRoot = path.join(root, 'proc')
+    const fakeProc = path.join(procRoot, '12345')
+    fs.mkdirSync(fakeProc, { recursive: true })
+    fs.writeFileSync(path.join(fakeProc, 'cmdline'), 'node\0worker\0')
+    fs.writeFileSync(path.join(fakeProc, 'stat'), '12345 (node) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0')
+    const cwdLink = path.join(fakeProc, 'cwd')
+    fs.symlinkSync(activeSandbox, cwdLink, 'dir')
+    const originalReadlink = fs.readlinkSync
+    fs.readlinkSync = function (target, ...args) {
+      if (target === cwdLink) {
+        const error = new Error('permission denied')
+        error.code = 'EACCES'
+        throw error
+      }
+      return originalReadlink.call(this, target, ...args)
+    }
+    let unreadableCwd
+    try {
+      unreadableCwd = host.inspect({ env: {}, procRoot, tmpRoot: root, selfPid: 1, nowMs: Date.now() })
+    } finally {
+      fs.readlinkSync = originalReadlink
+    }
+    assert.strictEqual(unreadableCwd.cwdScanError, true, '单个进程 cwd 权限错误必须令保护信号不可判定')
+    assert.deepStrictEqual(unreadableCwd.dirs, [], 'cwd 扫描不完整时不得建议删除任何候选')
+    assert.strictEqual(unreadableCwd.ok, false, 'cwd 扫描不完整不得报告主机干净')
     const src = read('scripts/check-host-clean.js')
     assert.match(src, /const tmpScanError = stale === null/, '临时根扫描失败必须进入显式错误状态')
     assert.match(src, /const cwdScanError = cwds === null/, 'cwd 保护信号不可判定必须进入显式错误状态')
@@ -161,6 +194,13 @@ check('临时根扫描失败必须 fail-closed，普通文件不得进入沙箱�
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+check('清理建议必须对空格和 shell 元字符进行 POSIX 引用', () => {
+  assert.strictEqual(host.rmSuggestion([{ p: '/tmp/review space; touch marker; #' }]),
+    "rm -rf '/tmp/review space; touch marker; #'")
+  assert.strictEqual(host.rmSuggestion([{ p: "/tmp/reviewer's sandbox" }]),
+    "rm -rf '/tmp/reviewer'\\''s sandbox'")
 })
 
 console.log('✅ test_host_clean_gates 全部通过（' + checks + ' 检查）')

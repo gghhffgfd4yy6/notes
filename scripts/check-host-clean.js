@@ -99,8 +99,10 @@ function liveSandboxCwds (procRoot) {
   for (const pid of pids) {
     try {
       cwds.push(fs.readlinkSync(path.join(procRoot, pid, 'cwd')))
-    } catch {
-      // 僵尸/已退出/无权限的进程：没有 cwd 就少一个保护信号，不因此判脏
+    } catch (e) {
+      // 进程在扫描时退出是正常竞态；权限等其它错误意味着保护信号不完整，必须 fail-closed。
+      if (e && (e.code === 'ENOENT' || e.code === 'ESRCH')) continue
+      return null
     }
   }
   return cwds
@@ -110,8 +112,19 @@ function liveSandboxCwds (procRoot) {
 // 前缀判定按路径分段，避免 /tmp/xbk-a 命中 /tmp/xbk-ab（那是另一个沙箱）。
 function isActiveSandbox (dirPath, cwds) {
   if (!Array.isArray(cwds) || cwds.length === 0) return false
-  const prefix = dirPath.endsWith(path.sep) ? dirPath : dirPath + path.sep
-  return cwds.some((c) => typeof c === 'string' && (c === dirPath || c.startsWith(prefix)))
+  let canonicalDir
+  try {
+    canonicalDir = fs.realpathSync(dirPath)
+  } catch {
+    return true // 无法规范化候选目录时，不生成可能误删的建议
+  }
+  const prefix = canonicalDir.endsWith(path.sep) ? canonicalDir : canonicalDir + path.sep
+  return cwds.some((c) => {
+    if (typeof c !== 'string') return false
+    // Linux /proc 已解析 cwd 符号链接；resolve 也使注入的相对测试路径有确定口径。
+    const activePath = path.resolve(c)
+    return activePath === canonicalDir || activePath.startsWith(prefix)
+  })
 }
 
 // 纯函数：从 /proc/<pid>/cmdline 文本里挑出孤儿桩。selfPid 与 ancestors 排除在外。
@@ -168,6 +181,14 @@ function ppidOf (statPath) {
 
 function pretty (cmdline) {
   return String(cmdline || '').replace(/\0+/g, ' ').trim()
+}
+
+function shellQuote (value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'"
+}
+
+function rmSuggestion (dirs) {
+  return 'rm -rf ' + dirs.map((d) => shellQuote(d.p)).join(' ')
 }
 
 // cmdline 是 NUL 分隔的 argv：测试脚本可能是相对路径、绝对路径，也可能后面带 --only 等参数，
@@ -424,7 +445,7 @@ function main () {
     if (r.dirs.length) {
       console.log('  过期沙箱 ' + r.dirs.length + ' 个：')
       for (const d of r.dirs.slice(0, 6)) console.log('    ' + d.p + '（' + d.ageMin + ' 分钟前）')
-      console.log('    清理：rm -rf ' + r.dirs.map((d) => d.p).join(' '))
+      console.log('    清理：' + rmSuggestion(r.dirs))
     }
     console.log('  为什么判红：v3.282 一轮 48/49 的红就是被这类残留拖出来的（详见 scripts/check-host-clean.js 头注）。')
     console.log('  在变异评估子进程里本检查自动跳过；沙箱只认过期（默认 >30min，可用 --stale-min 调）。')
@@ -449,7 +470,7 @@ function guardOrExit (env) {
   for (const d of r.dirs) console.log('   过期沙箱 ' + d.p + '（' + d.ageMin + ' 分钟前）')
   const pids = r.stubs.concat(r.suites).map((x) => x.pid)
   if (pids.length) console.log('   清理：kill -TERM ' + pids.join(' ') + ' && sleep 1 && kill -KILL ' + pids.join(' '))
-  if (r.dirs.length) console.log('   清理：rm -rf ' + r.dirs.map((d) => d.p).join(' '))
+  if (r.dirs.length) console.log('   清理：' + rmSuggestion(r.dirs))
   return true
 }
 
@@ -457,4 +478,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { STALE_MS, TMP_ROOT, shouldSkipCheck, findStaleSandboxes, findOrphanStubs, findOrphanSuites, ancestorPids, activityMtimeMs, liveSandboxCwds, isActiveSandbox, inspect, guardOrExit }
+module.exports = { STALE_MS, TMP_ROOT, shouldSkipCheck, findStaleSandboxes, findOrphanStubs, findOrphanSuites, ancestorPids, activityMtimeMs, liveSandboxCwds, isActiveSandbox, shellQuote, rmSuggestion, inspect, guardOrExit }
