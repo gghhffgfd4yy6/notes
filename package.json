@@ -76,9 +76,9 @@
     "standard": "^17.1.2"
   },
   "allowScripts": {
-    "re2@1.26.1": true
+    "re2@1.27.0": true
   },
   "optionalDependencies": {
-    "re2": "^1.26.1"
+    "re2": "^1.27.0"
   }
 }
