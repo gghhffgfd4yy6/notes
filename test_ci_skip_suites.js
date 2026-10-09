@@ -365,10 +365,28 @@ function assertNoContinueOnError (yamlText, label) {
     `${label} 禁止声明 continue-on-error 字段（包括表达式值）：${fields.join(' | ')}`)
 }
 const summaryStepName = '汇总 quality matrix 与 policy 结果'
+const summaryStepLine = '      - name: ' + summaryStepName
 const summaryStepBlock = stepBlockForName(qualityGateBlock, summaryStepName)
 assertNoContinueOnError(qualityGateBlock, 'quality-gate job')
 assertNoContinueOnError(summaryStepBlock, 'quality-gate 汇总 step')
 assertNoContinueOnError(policyBlock, 'policy job 与其门禁 steps')
+function assertNoStepIf (stepBlock, label) {
+  const fields = yamlOnly(stepBlock).filter(line => /^\s*(?:if|'if'|"if")\s*:/.test(line))
+  assert.strictEqual(fields.length, 0, `${label} 禁止声明 step-level if 条件：${fields.join(' | ')}`)
+}
+assertNoStepIf(summaryStepBlock, 'quality-gate 汇总 step')
+const pullRequestLiteral = "'pull_request'"
+const simpleIfFixture = summaryStepBlock.replace(
+  summaryStepLine, summaryStepLine + '\n        if: github.event_name != ' + pullRequestLiteral)
+assert.notStrictEqual(simpleIfFixture, summaryStepBlock, 'simple if fixture 必须命中汇总 step')
+assert.throws(() => assertNoStepIf(simpleIfFixture, 'quality-gate 汇总 step'), /step-level if/,
+  '注入 PR 条件 if 必须让 summary step 契约测试变红')
+const expressionIfValue = '$' + '{{ github.event_name != ' + pullRequestLiteral + ' }}'
+const expressionIfFixture = summaryStepBlock.replace(
+  summaryStepLine, summaryStepLine + '\n        if: ' + expressionIfValue)
+assert.notStrictEqual(expressionIfFixture, summaryStepBlock, 'expression if fixture 必须命中汇总 step')
+assert.throws(() => assertNoStepIf(expressionIfFixture, 'quality-gate 汇总 step'), /step-level if/,
+  '注入表达式 PR 条件 if 必须让 summary step 契约测试变红')
 
 const summaryContinueFixture = summaryStepBlock.replace(
   '      - name: ' + summaryStepName,
