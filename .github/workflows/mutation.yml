@@ -292,7 +292,7 @@ jobs:
         with:
           # 增量缓存 key（PR #156 的「测试指纹强制全量」改动已于 2026-09-19 回退，用户拍板）：
           #   当前形态 = **三段身份：配置 / 依赖 / 源**（档位名 `matrix.config` 在配置段内）：
-          #   key:    stryker-<段>-cfg-<matrix.config 档位>-<hashFiles(stryker.config.js, stryker.tap.config.js, scripts/tap-shim.js)>-deps-<hashFiles(package-lock.json)>-src-<hashFiles(run_mutation.js, matrix.src)>
+          #   key:    stryker-<段>-cfg-<matrix.config 档位>-<hashFiles(stryker.config.js, stryker.tap.config.js, scripts/tap-shim.js)>-deps-<hashFiles(package-lock.json)>-src-<hashFiles(matrix.src)>
           #   兜底:   stryker-<段>-cfg-<同一 matrix.config 档位>-<同一配置指纹>-deps-<同一依赖指纹>-
           # 逐字口径（独立验证实测，勿按字面复算成「不变式没成立」）：兜底前缀 == key **截掉尾部 `-src-<源指纹>`
           #   之后的前缀**（即保留 `-deps-<依赖指纹>` 的那个尾随 `-`）；`key.replace(/-src-.*$/,'')` 与兜底
@@ -315,11 +315,10 @@ jobs:
           #   `src-046488c2…`，该轮 **19/19 段 100% 复用** —— 依赖升级被静默吞掉。
           #   修法＝把 `package-lock.json` 从 src 段**移出**单列 **deps 段**，并让它**同时进兜底前缀**：依赖一变，
           #   主 key 与兜底身份一起变 ⇒ 该段必然真全量重算；源码变化仍按新兜底前缀跨 src 复用（初衷不变）。
-          # 源指纹固定用 matrix.src：mutate 里的范围字面量（如 "xbk_function_v3.js:1-442"）**不能**作
-          #   hashFiles 参数——按字面量找不到文件会返回空指纹，导致 range 段的缓存永不过期，故源指纹是
-          #   run_mutation.js + matrix.src 单列（`run_mutation.js` 是**本地**运行器——`npm run test:mutation` 走它；
-          #   CI 的 command runner 走 `scripts/mutation-child.js` → `run_unit_tests.js`，**不经它**——它留在 src 段、
-          #   只进主 key，不在兜底前缀里）。
+          # 源指纹只 hash matrix.src：mutate 里的范围字面量（如 "xbk_function_v3.js:1-442"）**不能**作
+          #   hashFiles 参数——按字面量找不到文件会返回空指纹，导致 range 段的缓存永不过期；matrix.src 是真实
+          #   文件路径，可用于普通文件与拆分行段。`run_mutation.js` 是**本地**运行器（`npm run test:mutation`）；
+          #   CI 的 command runner 走 `scripts/mutation-child.js` → `run_unit_tests.js`，**不经它**，故不应进入 CI key。
           # PR-1（CI 切 TAP 档）起 key 与兜底前缀都带**档位名 + 配置指纹**（当前形态下二者同在 cfg 段）：
           # 为什么必须这样（本 PR 评审 · qodo High + sourcery）：切档前 key 是单段 `<hashFiles(...)>`、兜底是
           #   **裸前缀** `stryker-<段>-`，而 core 的 `readIncrementalReport()` 对 inc **零校验**（源码里留着
@@ -402,7 +401,7 @@ jobs:
           # 去增量与重新标定 thresholds.break 都留到后续 PR（TAP 迁移已在本 PR 落地，break 仍 null）；
           #   在那之前，本条与分数门禁无关。
           path: reports
-          key: stryker-${{ matrix.name }}-cfg-${{ matrix.config }}-${{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-${{ hashFiles('package-lock.json') }}-src-${{ hashFiles('run_mutation.js', matrix.src) }}
+          key: stryker-${{ matrix.name }}-cfg-${{ matrix.config }}-${{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-${{ hashFiles('package-lock.json') }}-src-${{ hashFiles(matrix.src) }}
           restore-keys: |
             stryker-${{ matrix.name }}-cfg-${{ matrix.config }}-${{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-${{ hashFiles('package-lock.json') }}-
 

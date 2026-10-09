@@ -34,7 +34,7 @@ const indentOf = line => line.length - line.trimStart().length
 const yamlOnly = text => text.split('\n').filter(l => !l.trim().startsWith('#'))
 
 // (1)「恢复增量缓存」：key 与 restore-keys 必须是**回退后 + 带档位 + 带依赖**的形态——不含测试指纹段，
-//     而是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>-deps-<依赖指纹>`，源指纹只进主 key。
+//     而是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>-deps-<依赖指纹>`，matrix.src 源指纹只进主 key。
 //     抽成函数是为了让紧随其后的反例在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本：把 key
 //     改回含测试指纹的形态 ⇒ 必须立刻红。
 const assertCacheStep = (ymlText) => {
@@ -46,9 +46,9 @@ const assertCacheStep = (ymlText) => {
   const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
   assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
   // key 必须逐字等于**档位名 + 配置指纹 + 依赖指纹 + 源指纹**形态：
-  //   stryker-<段>-cfg-<matrix.config 档位>-<两份 stryker 配置 + scripts/tap-shim.js 指纹>-deps-<package-lock.json 指纹>-src-<源指纹>。
-  // 源指纹固定用 matrix.src + run_mutation.js：mutate 里的范围字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，
-  // 会得到空指纹、使 range 段缓存永不过期。
+  //   stryker-<段>-cfg-<matrix.config 档位>-<两份 stryker 配置 + scripts/tap-shim.js 指纹>-deps-<package-lock.json 指纹>-src-<hashFiles(matrix.src)>。
+  // matrix.src 是实际源文件路径；mutate 的范围字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，
+  // 会得到空指纹、使 range 段缓存永不过期。run_mutation.js 仅为本地运行器，不属于 CI 执行链。
   // 配置指纹（stryker.config.js + stryker.tap.config.js + scripts/tap-shim.js）与**档位名 `matrix.config`** 都必须同时出现在
   // key 与兜底前缀里：主 key 未命中时 core 会对恢复进来的 inc **零校验**，兜底前缀若不含配置指纹就会把
   // 另一档 runner 的旧 inc 当本轮结果复用（qodo High / sourcery 评审发现，实测 http 段 6/133 复用、
@@ -62,10 +62,10 @@ const assertCacheStep = (ymlText) => {
   // incremental-differ 只按**文件内容** diff、不认识依赖版本 ⇒ 19/19 段 100% 复用，依赖升级从未重算。
   const open = '${'
   assert.strictEqual(keyLine.trim(),
-    'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + "{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-" + open + "{ hashFiles('package-lock.json') }}-src-" + open + "{ hashFiles('run_mutation.js', matrix.src) }}",
+    'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + '{ hashFiles(\'stryker.config.js\', \'stryker.tap.config.js\', \'scripts/tap-shim.js\') }}-deps-' + open + '{ hashFiles(\'package-lock.json\') }}-src-' + open + '{ hashFiles(matrix.src) }}',
     '缓存 key 必须逐字等于 stryker-<段>-cfg-<档位 matrix.config>-<配置指纹 = 两份 stryker 配置 + scripts/tap-shim.js>' +
-    '-deps-<依赖指纹 = package-lock.json>-src-<源指纹 = run_mutation.js + matrix.src>（不含 -tests- ' +
-    '测试指纹段）：PR #156 的「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发' +
+    '-deps-<依赖指纹 = package-lock.json>-src-<源指纹 = matrix.src>（不含 -tests- 或本地 run_mutation.js 指纹）' +
+    '：PR #156 的「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发' +
     '串扰，基线全程是绿的）、跑不完（app/utils/message-store 真全量在 --concurrency 8 下仍需 ~7h/~6.5h/' +
     '~4.5h，必撞 step 330min，而失败段不保存缓存进度 ⇒ 永久红），且当前**无分数门禁** ⇒ 复用不构成门禁' +
     '风险（有意接受的取舍）。依赖指纹必须进 key：dependabot 升 fast-check 4.10.0→4.10.1 时' +
@@ -151,8 +151,8 @@ const assertCacheConfigIdentity = (ymlText) => {
     'stryker.config.js / stryker.tap.config.js / scripts/tap-shim.js）与依赖（package-lock.json）的任何变化 ' +
     '都必须同时换掉主 key 与兜底身份，即缓存身份里**除源指纹以外的全部段**都必须出现在兜底前缀里。' +
     '`run_mutation.js` 是**本地**运行器：CI 的变异任务走 stryker（`scripts/mutation-child.js` → ' +
-    '`run_unit_tests.js`），**不经 run_mutation.js**（见 run_unit_tests.js 顶部说明），故它与 matrix.src ' +
-    '同属源指纹、只进主 key 不进兜底；测试侧文件（test_suites.js / run_unit_tests.js / scripts/mutation-child.js / ' +
+    '`run_unit_tests.js`），**不经 run_mutation.js**（见 run_unit_tests.js 顶部说明），故它不进入 CI 缓存身份；' +
+    'matrix.src 是唯一源指纹、只进主 key 不进兜底；测试侧文件（test_suites.js / run_unit_tests.js / scripts/mutation-child.js / ' +
     'test_*.js）则**有意不入任何身份段**（PR #158 的取舍）⇒ 只改它们时缓存身份逐字节不变、command 档 4 段' +
     '仍会复用旧结果（当前为 `thresholds.break = null`，无分数门禁；复用状态另有日报可视化兜住）')
 }
@@ -309,6 +309,47 @@ assert.ok(explicitFiles.size > 0, '应从 test.yml 解析出显式测试步骤')
 const byName = (a, b) => a.localeCompare(b) // 显式比较函数：默认 sort 的字符串序不保证稳定可预期（Sonar S2871）
 assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explicitFiles.has(f)).sort(byName),
   'SKIP_SUITES 必须等于「显式步骤已覆盖的单元套件」：漏写会重复跑，多写会漏跑（门禁盲区）')
+
+// ── 2a. 静态/文档策略门禁只跑一次，稳定 Required Check 汇总两类结果 ──
+function jobBlock (workflowText, name) {
+  const lines = workflowText.split(/\r?\n/)
+  const jobsAt = lines.findIndex(line => line === 'jobs:')
+  assert.ok(jobsAt >= 0, 'test.yml 必须声明 jobs')
+  const start = lines.findIndex((line, i) => i > jobsAt && line === '  ' + name + ':')
+  assert.ok(start >= 0, `test.yml 必须声明 ${name} job`)
+  let end = lines.findIndex((line, i) => i > start && /^\s{2}[A-Za-z0-9_-]+:\s*$/.test(line))
+  if (end < 0) end = lines.length
+  return lines.slice(start, end).join('\n')
+}
+const qualityBlock = jobBlock(testYml, 'quality')
+const policyBlock = jobBlock(testYml, 'policy')
+const qualityGateBlock = jobBlock(testYml, 'quality-gate')
+const policyScripts = parseWorkflowSteps(policyBlock).flatMap(step => step.scripts)
+const qualityScripts = parseWorkflowSteps(qualityBlock).flatMap(step => step.scripts)
+const policyChecks = ['check:ci-static', 'test:ci-static-gates', 'check:doc-lines', 'test:doc-line-gates']
+for (const script of policyChecks) {
+  assert.strictEqual(policyScripts.filter(s => s === script).length, 1,
+    `${script} 必须且只能在非矩阵 policy job 执行一次`)
+  assert.ok(!qualityScripts.includes(script), `${script} 不得随 Node matrix 在 quality job 重复执行`)
+}
+assert.ok(!yamlOnly(policyBlock).some(line => /^[ \t]*(?:strategy|matrix):/.test(line)),
+  'policy job 不得声明 strategy/matrix，策略门禁只执行一次')
+assert.match(qualityBlock, /^\s{4}strategy:\s*$/m, 'quality 的 Node 测试矩阵必须保留')
+assert.match(qualityBlock, /^\s{6}matrix:\s*$/m, 'quality 的 matrix 配置必须保留')
+assert.ok(!/^\s{4}permissions:/m.test(qualityBlock), 'quality 测试 job 权限不得改变')
+assert.ok(testYml.includes('\npermissions:\n  contents: read\n'),
+  '工作流级 permissions 必须保持 contents: read')
+assert.match(qualityGateBlock, /^\s{4}permissions:\s+\{\}$/m, 'quality-gate 必须声明 job 级 permissions: {}')
+assert.match(qualityGateBlock, /^\s{4}needs:\s+\[quality, policy\]$/m,
+  '稳定 quality-gate 必须同时依赖 quality 与 policy')
+assert.match(qualityGateBlock, /^\s{4}if:\s+always\(\)/m, '上游失败时 quality-gate 仍须运行并产出结果')
+assert.match(qualityGateBlock, /QUALITY_RESULT: \$\{\{\s*needs\.quality\.result\s*\}\}/,
+  'quality-gate 必须读取 quality matrix 结果')
+assert.match(qualityGateBlock, /POLICY_RESULT: \$\{\{\s*needs\.policy\.result\s*\}\}/,
+  'quality-gate 必须读取 policy 结果')
+assert.ok(qualityGateBlock.includes('[ "$QUALITY_RESULT" != "success" ]') && qualityGateBlock.includes('[ "$POLICY_RESULT" != "success" ]'),
+  'quality-gate 必须分别拒绝非 success 的 quality 与 policy 结果')
+console.log('✅ policy 单次门禁与 quality-gate 双结果/最小权限契约通过')
 
 // #131 qodo #2：runLines 多行块 / EOF 补结算 / 注释剔除的回归断言。
 // 用 dummy workflow 文本驱动同一解析器 parseWorkflowSteps，验证 scripts 收集正确——不依赖真实
@@ -1127,7 +1168,7 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
     }
     // 变体 I：把 src 段塞回兜底前缀（旧形态的反向退化）⇒ 「兜底前缀不得含 -src-」必须红
     {
-      const srcSeg = '-src-${' + "{ hashFiles('run_mutation.js', matrix.src) }}-"
+      const srcSeg = '-src-${' + '{ hashFiles(matrix.src) }}-'
       const lines = mutationYml.split('\n')
       const ri = lines.findIndex(l => /^[ \t]*stryker-\$\{\{ matrix\.name \}\}-cfg-.*hashFiles\(/.test(l))
       assert.ok(ri >= 0, '变体 I 必须能在真实 mutation.yml 里定位到兜底前缀行')

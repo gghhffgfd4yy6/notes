@@ -74,32 +74,6 @@ jobs:
       - name: 版本一致性闸门（文件头 ↔ CHANGELOG ↔ package.json）
         run: node check-version.js
 
-      # v3.280 静态扫描闸门：shellcheck(.githooks/*) + zizmor(.github/workflows/)，与
-      # npm run check / pre-commit 同一条链（npm run check:ci-static）。zizmor 钉版本=本机基线，
-      # 升级须同时改本机与此处（防口径漂移）。CI 下缺工具由脚本 fail-closed——扫描器失踪=红，
-      # 「静默绿」等价于门禁不存在。
-      - name: 静态扫描闸门（shellcheck + zizmor）
-        run: |
-          command -v shellcheck >/dev/null || sudo apt-get install -y -qq shellcheck
-          pipx install zizmor==1.30.1
-          npm run check:ci-static
-
-      # v3.280：接线断言套件（test_suites.js 标 mutationSkip，故必须像 test:install-hooks 一样
-      # 显式列步骤——否则脱门；摘除上面步骤或 pre-commit 门链，本步骤变红）。
-      - name: 静态扫描接线断言（test_ci_static_gates.js）
-        run: npm run test:ci-static-gates
-
-      # v3.281 文档行长闸门：任何 markdown 单行 > 1200 字符即红（prose 防回长，见 scripts/check-doc-lines.js）。
-      # 必须在此显式列步骤：test.yml 不跑 `npm run check`（只有 release.yml 跑整链），所以「只接本地」
-      # 等于日常 PR 拦不住；三处接线（check 链 / pre-commit / 这里）缺一即成摆设。
-      - name: 文档行长闸门（1200 字符/行）
-        run: npm run check:doc-lines
-
-      # v3.281：接线断言套件（test_suites.js 标 mutationSkip，理由同 test_ci_static_gates：它要读
-      # .githooks/，而变异沙箱不复制该目录）。摘掉上面步骤、pre-commit 门链或 check 链任一处，本步骤变红。
-      - name: 文档行长接线断言（test_doc_line_gates.js）
-        run: npm run test:doc-line-gates
-
       - name: 单元测试（test_filter.js，含 101 章版本校验）
         run: npm run test:filter
 
@@ -243,27 +217,69 @@ jobs:
           npm audit --audit-level=high --omit=dev --json > audit-result.json || true
           node scripts/audit-gate.js
 
-  # 稳定合并门禁：汇总 quality matrix 结果。
+  # 非矩阵策略门禁：静态扫描/文档行长及其接线断言不依赖 Node 版本，单次执行即可。
+  # CI 缺少 shellcheck/zizmor 时 check-ci-static.js fail-closed；扫描输出不可判定也判红。
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+
+      # v3.280 静态扫描闸门：shellcheck(.githooks/*) + zizmor(.github/workflows/)，与
+      # npm run check / pre-commit 同一条链（npm run check:ci-static）。zizmor 钉版本=本机基线，
+      # 升级须同时改本机与此处（防口径漂移）。CI 下缺工具由脚本 fail-closed——扫描器失踪=红，
+      # 「静默绿」等价于门禁不存在。
+      - name: 静态扫描闸门（shellcheck + zizmor）
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y -qq shellcheck
+          pipx install zizmor==1.30.1
+          npm run check:ci-static
+
+      # v3.280：接线断言套件（test_suites.js 标 mutationSkip，故必须像 test:install-hooks 一样
+      # 显式列步骤——否则脱门；摘除上面步骤或 pre-commit 门链，本步骤变红）。
+      - name: 静态扫描接线断言（test_ci_static_gates.js）
+        run: npm run test:ci-static-gates
+
+      # v3.281 文档行长闸门：任何 markdown 单行 > 1200 字符即红（prose 防回长，见 scripts/check-doc-lines.js）。
+      # 三处接线（check 链 / pre-commit / 这里）缺一即成摆设。
+      - name: 文档行长闸门（1200 字符/行）
+        run: npm run check:doc-lines
+
+      # v3.281：接线断言套件（test_suites.js 标 mutationSkip，理由同 test_ci_static_gates：它要读
+      # .githooks/，而变异沙箱不复制该目录）。摘掉上面步骤、pre-commit 门链或 check 链任一处，本步骤变红。
+      - name: 文档行长接线断言（test_doc_line_gates.js）
+        run: npm run test:doc-line-gates
+
+  # 稳定合并门禁：汇总 quality matrix 与 policy 结果。
   # 背景：quality 的 check 名带 matrix 版本后缀（quality (22.22.2) 等），若未来增删 Node 版本
   # 或改 job 名，branch protection 绑定的 check 名会失配 → 永久阻塞合并。
   # 方案：加无后缀的汇总 job，Required Checks 只绑定 quality-gate。
   quality-gate:
     runs-on: ubuntu-latest
-    needs: quality
-    if: always()   # quality 失败也要执行，以产出正确的失败结论
-    timeout-minutes: 10   # 纯汇总步骤（needs.quality.result 判定），秒级
+    permissions: {}
+    needs: [quality, policy]
+    if: always()   # 上游失败/跳过也要执行，以产出正确的失败结论
+    timeout-minutes: 10   # 纯汇总步骤（needs.quality.result / needs.policy.result 判定），秒级
     steps:
-      - name: 汇总 quality matrix 结果
+      - name: 汇总 quality matrix 与 policy 结果
         # 经 env 注入而非内联进 run（zizmor template-injection）
         env:
-          RESULT: ${{ needs.quality.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          POLICY_RESULT: ${{ needs.policy.result }}
         run: |
-          echo "quality matrix result = ${RESULT}"
-          if [ "$RESULT" != "success" ]; then
-            echo "❌ quality matrix 存在失败，合并门禁未通过"
+          echo "quality matrix result = ${QUALITY_RESULT}"
+          echo "policy result = ${POLICY_RESULT}"
+          if [ "$QUALITY_RESULT" != "success" ] || [ "$POLICY_RESULT" != "success" ]; then
+            echo "❌ quality matrix 或 policy 存在失败，合并门禁未通过"
             exit 1
           fi
-          echo "✅ quality matrix 全部通过"
+          echo "✅ quality matrix 与 policy 均通过"
 
   # 覆盖率报告：仅在 main 分支运行（PR 不跑，节省 CI 资源）。
   # 合并到 main 后自动跑全量 c8 覆盖率，上传 artifact 供下载查看。
