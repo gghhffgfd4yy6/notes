@@ -16,10 +16,10 @@ node --version
 
 ```bash
 npm ci --ignore-scripts
-npm run rebuild --prefix node_modules/re2
+npm rebuild re2
 ```
 
-`--ignore-scripts` 用于避免安装依赖时自动执行第三方生命周期脚本；`re2` 通过显式重建完成原生模块安装。
+`--ignore-scripts` 用于避免安装依赖时自动执行第三方生命周期脚本。随后单独运行 `npm rebuild re2`，只执行 re2 官方安装脚本：优先下载并校验预编译模块，失败时回退到 node-gyp 源码构建。若预编译包不可用且系统没有 Python 与 C/C++ 工具链，源码 fallback 会失败。
 
 ### 2. 设置通知渠道
 
@@ -60,20 +60,26 @@ node qinglong/xbk_push.js
 ```bash
 cd /项目目录
 npm ci --omit=dev --ignore-scripts
-npm run rebuild --prefix node_modules/re2
+npm rebuild re2
+```
+
+执行 `--check` 前，必须先配置至少一个完整通知渠道。使用本地配置时编辑项目根目录的 `push_config.local.js`；使用青龙环境变量时，先创建一个暂不启用的青龙任务（或先不配置定时），填入渠道变量，并暂时使用以下检查命令：
+
+```bash
+cd /项目目录
 node qinglong/xbk_push.js --check
 ```
 
-检查通过后，在青龙中创建一个常驻任务；任务脚本只保留启动命令：
+手动运行该任务并确认检查通过后，把任务命令改为常驻启动，再启用任务：
 
 ```bash
 cd /项目目录
 node qinglong/xbk_push.js
 ```
 
-该入口会持续运行，青龙中只应保持一个实例，不要再用其他定时任务重复启动。通知密钥建议配置在青龙任务的环境变量中；本地运行时才使用项目根目录下的 `push_config.local.js`。各渠道的环境变量名称请参考 `push_config.local.js.example`。
+该入口会持续运行，青龙中只应保持一个实例，不要再用其他定时任务重复启动。各渠道的环境变量名称请参考 `push_config.local.js.example`。
 
-建议先检查环境：
+配置至少一个完整通知渠道后，可先运行环境检查：
 
 ```bash
 node qinglong/xbk_push.js --check
@@ -166,10 +172,10 @@ npm test                          # 运行测试
 
 ```bash
 npm ci --ignore-scripts
-npm run rebuild --prefix node_modules/re2
+npm rebuild re2
 ```
 
-如果仍然失败，检查系统是否有编译工具，或在网络正常的环境重新执行上述两条命令。
+`npm rebuild re2` 会先尝试 re2 官方校验预编译包，失败时才源码构建；若走到源码构建 fallback，系统需要 Python 与 C/C++ 工具链。网络可用只解决预编译包下载，不能替代源码构建所需工具链。
 
 ### 没有收到通知
 
@@ -178,7 +184,8 @@ npm run rebuild --prefix node_modules/re2
 1. `push_config.local.js` 是否填写正确；
 2. 是否至少配置了一个完整的通知渠道；
 3. 运行 `node qinglong/xbk_push.js --check` 检查依赖；
-4. 以启动日志或 `--status` 输出的生效缓存目录为准，查看其中的 `run.log`（默认是 `xianbaoku_cache/run.log`；自定义 `XBK_CACHE_DIR` 或 `Config.cache.dir` 后路径会变化）；
+4. 查看实际运行缓存目录中的 `run.log`：常驻/单轮运行的目录由 `Config.cache.dir` 决定，必须位于项目根内；绝对路径、`..` 或符号链接越出项目根时会回退到默认或安全目录。`XBK_CACHE_DIR` **只影响 `--status` 读取的目录**，不会改变常驻/单轮运行或 `run.log` 的写入位置。运行 `--status` 时它会打印实际读取目录；若未设置该变量且自定义了 `Config.cache.dir`，请把该根内绝对路径通过 `XBK_CACHE_DIR` 传给 `--status`；若设置了绝对 `XBK_CACHE_DIR`，以输出中的该路径为准；
+
 5. 用 `--dry-run` 确认抓取和过滤是否正常。
 
 ### 重复推送或不推送

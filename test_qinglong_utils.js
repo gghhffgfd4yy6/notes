@@ -69,7 +69,7 @@ const {
       spawnSyncFn: (cmd, args) => {
         mock.spawnCallCount += 1
         mock.spawnCalls.push({ cmd, args })
-        return args[0] === 'run' && args[1] === 'rebuild' ? rebuildResult : installResult
+        return args[0] === 'rebuild' && args[1] === 're2' ? rebuildResult : installResult
       },
       env: autoInstall ? { XBK_AUTO_INSTALL_DEPS: '1' } : {},
       lockExists
@@ -96,7 +96,7 @@ const {
   assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound(), installResult: { status: 1 } })), /npm ci 失败/, '安装退出码非 0 应抛错（有锁文件时为 npm ci）')
 
   // 5. install 成功但 re2 rebuild 失败 → throw
-  assert.throws(() => ensureDependencies(makeDepsMock({ re2Error: dlopenFailed(), rebuildResult: { status: 1 } })), /re2 原生模块构建失败/, 'rebuild 退出码非 0 应抛错')
+  assert.throws(() => ensureDependencies(makeDepsMock({ re2Error: dlopenFailed(), rebuildResult: { status: 1 } })), /re2 原生模块恢复失败/, 'rebuild 退出码非 0 应抛错')
 
   // 6. 安装+rebuild 都成功但恢复后仍不可用 → throw（got 始终不可加载模拟恢复失败）
   assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound() })), /依赖恢复后 got 仍不可用/, '恢复后仍不可用应抛错')
@@ -226,6 +226,10 @@ const {
   assert.strictEqual(nodeVersionWarning('22.22.2'), null, '22.x engines 下界不应告警')
   assert.strictEqual(nodeVersionWarning('24.15.0'), null, '24.x engines 下界不应告警')
   assert.strictEqual(nodeVersionWarning('26.0.0'), null, '26.x 及以上不应告警')
+  assert.strictEqual(nodeVersionWarning('v26.1.2+build.7'), null, '合法 build metadata 不应改变稳定版本范围判定')
+  for (const version of ['24.15.0-rc.1', '26.0.0-nightly20261008abcdef', '22.22.2-beta.1', '26.0', 'not-a-version']) {
+    assert.match(String(nodeVersionWarning(version)), /不满足 re2\/package\.json engines 要求/, `${version} 不满足稳定 Node engines 时必须告警`)
+  }
   assert.match(String(nodeVersionWarning('23.0.0')), /不满足 re2\/package\.json engines 要求/, '23.x 不在 re2 支持范围内应告警')
   assert.match(String(nodeVersionWarning('25.0.0')), /不满足 re2\/package\.json engines 要求/, '25.x 不在 re2 支持范围内应告警')
   assert.match(String(nodeVersionWarning('24.14.0')), /不满足 re2\/package\.json engines 要求/, '24.0–24.14 不满足下界应告警')
@@ -276,8 +280,7 @@ const {
   assert.ok(warns.some(w => w.includes('XBK_CACHE_DIR 不是绝对路径') && w.includes('relative/cache') && w.includes(safeCachePath)),
     `相对路径应告警并带上生效目录，实际告警：${JSON.stringify(warns)}`)
 
-  // ④ CLI 端到端：未设置 XBK_CACHE_DIR 时 --status 必须成功（不加载 got/re2）并显式暴露生效目录，
-  //    避免 Config.cache.dir 指向其它根内目录时静默读错目录（QX-08 的后半的一半）。
+  // ④ CLI 端到端：未设置覆盖时显示默认目录；设置绝对覆盖时也必须显示被读取的自定义目录。
   {
     const env = { ...process.env }
     delete env.XBK_CACHE_DIR
@@ -285,8 +288,18 @@ const {
       cwd: __dirname, encoding: 'utf8', env
     })
     assert.strictEqual(r.status, 0, `--status 应独立于 got/re2 成功退出，实际 status=${r.status} stderr=${r.stderr}`)
-    assert.match(String(r.stdout), /缓存目录：\S+（未使用 XBK_CACHE_DIR；/, `--status 应显式暴露生效缓存目录与配置口径，实际 stdout=${r.stdout}`)
+    assert.match(String(r.stdout), /缓存目录：\S+（未使用 XBK_CACHE_DIR；/, `--status 应显式暴露默认缓存目录与配置口径，实际 stdout=${r.stdout}`)
     assert.match(String(r.stdout), /xbk-push 运行状态/, '--status 仍应输出状态面板')
+  }
+  {
+    const statusDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'xbk-status-override-'))
+    try {
+      const r = spawnSync(process.execPath, [path.join(__dirname, 'qinglong', 'xbk_push.js'), '--status'], {
+        cwd: __dirname, encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: statusDir }
+      })
+      assert.strictEqual(r.status, 0, `绝对覆盖下 --status 应成功，实际 status=${r.status} stderr=${r.stderr}`)
+      assert.ok(String(r.stdout).includes(`缓存目录：${statusDir}（使用 XBK_CACHE_DIR）`), `--status 必须显示被采纳的绝对路径，实际 stdout=${r.stdout}`)
+    } finally { fs.rmSync(statusDir, { recursive: true, force: true }) }
   }
 
   console.log('test_qinglong_utils OK')
@@ -464,14 +477,15 @@ const deps = async (spec) => {
   assert.deepStrictEqual(d.deps[4].warns, [OK_MSG], '有锁文件时不得输出退化 install 告警')
   assert.deepStrictEqual(d.deps[5].warns, [OK_MSG, '未找到 package-lock.json，退化为 npm install --no-package-lock（建议按 README 用 npm ci 部署以冻结依赖版本）'], '缺锁文件必须显式告警退化')
   assert.deepStrictEqual(d.deps[5].spawns[0].args, ['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT, '--no-package-lock'], '缺锁文件时必须 install 且不得生成新锁文件')
-  assert.strictEqual(d.deps[6].spawns.length, 2, 're2 安装后仍不可加载才构建，且只构建一次')
-  assert.deepStrictEqual(d.deps[6].spawns[1].args, ['run', 'rebuild', '--prefix', path.join(NODE_MODULES, 're2')], 're2 构建必须在固定 node_modules/re2 下执行重建')
+  assert.strictEqual(d.deps[6].spawns.length, 2, '先冻结安装，再只对仍不可用的 re2 执行一次 install-script 恢复')
+  assert.strictEqual(d.deps[6].spawns[1].cmd, 'npm', 're2 恢复必须调用 npm')
+  assert.deepStrictEqual(d.deps[6].spawns[1].args, ['rebuild', 're2'], 're2 恢复必须执行官方 install 生命周期以优先获取预编译包')
   assert.strictEqual(d.deps[6].thrown && d.deps[6].thrown.message, '依赖恢复后 re2 仍不可用：dlopen failed', 're2 仍不可用必须以 re2 忠实命名')
   assert.strictEqual(d.deps[7].spawns.length, 0, '不可恢复错误不得进入恢复流程')
   assert.deepStrictEqual(d.deps[7].warns, [], '未进入恢复流程不得打印恢复告警')
   assert.strictEqual(d.deps[7].thrown && d.deps[7].thrown.code, 'EACCES', '不可恢复错误必须原样抛出（只认 MODULE_NOT_FOUND/ERR_DLOPEN_FAILED）')
   assert.strictEqual(d.deps[8].thrown && d.deps[8].thrown.message, 'EBOOM', '重建子进程自身失败必须原样抛出')
-  assert.strictEqual(d.deps[9].thrown && d.deps[9].thrown.message, 're2 原生模块构建失败，退出码 7', '重建非零退出必须带真实退出码')
+  assert.strictEqual(d.deps[9].thrown && d.deps[9].thrown.message, 're2 原生模块恢复失败，退出码 7', '重建非零退出必须带真实退出码')
   assert.strictEqual(d.deps[10].thrown && d.deps[10].thrown.message, '依赖恢复后 got 仍不可用：[object Object]', '无 message 的错误必须退化为 String(error)')
 
   // --- retryBackoffMs / statusCacheDir / nodeVersionWarning ---

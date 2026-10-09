@@ -236,6 +236,8 @@
 
 ## v3.283
 
+- PR #214 修复：re2 部署与运行期恢复统一使用 `npm rebuild re2`，优先执行官方预编译安装路径；青龙 `--check` 文档先要求配置通知渠道；`run.log` 排障说明区分 `XBK_CACHE_DIR`（仅 `--status`）与 `Config.cache.dir`；`--status` 始终打印实际读取目录；Node 版本闸门拒绝 prerelease 截断放行。
+
 - 新增**主机干净度前置检查** `scripts/check-host-clean.js`，并挂到两个测试入口（`run_tests.js`、`run_unit_tests.js`）及直接执行的 `test_filter.js`：**机器脏了就不启动**，而不是跑完给一个"看起来像契约失败"的红。检测三类残留 —— ① **孤儿桩**（命中 `stub_heartbeat` / `test_stub_tree` 特征**且父进程已没**）；② 父进程已没（`ppid===1` 或 ppid 不在进程表）的**孤儿套件进程**（cmdline 末段是 `run_tests.js` / `run_unit_tests.js` / `test_*.js`）；③ **活跃时间**（目录自身或直接子项的最新 mtime）距今 > 30 分钟、且没有任何活进程把它当 cwd 的**过期 `/tmp/xbk-*` 沙箱**。发现即红并打印可直接执行的清理命令（`kill -TERM … && kill -KILL …`、`rm -rf …`）。
 - 三条误拦控制（都不可缺）：`XBK_MUTATION_CHILD=1`（stryker / `run_mutation.js` 的变异评估子进程）**直接跳过**——沙箱里跑全量套件时 `/tmp` 本来就有活动沙箱；沙箱只认**过期**的，且**活跃时间 = 目录自身与它的直接子项里最新的 mtime**，另有活进程把它当 cwd 即豁免（评审 #211 返工：目录 mtime 只在增删/改名条目时前进，只往已有文件追加写的长任务沙箱会被误报成残留，而判红打印的 `rm -rf` 等于劝人删掉正在跑的运行）；孤儿**桩与套件同判据 = 父进程已没**（`ppid===1`，或 ppid 不在进程表里）——评审前桩只看夹具特征，另一条终端正在跑的活动桩会被报成孤儿、第二个运行直接拒绝启动，正是头注「两条终端并发互不误伤」承诺被打破的地方。读不到 `/proc` 或活动沙箱 cwd 保护信号时按 fail-closed 拒绝继续，**绝不生成沙箱删除候选**；临时根扫描失败同样 fail-closed。
 - 动因是 v3.282 收尾那次归因：`npm run check` 的 48/49 红追到 `test_filter.js` 的 `基准: tuisong_replace 1000次 < 300ms`（脏机 878ms / 清场后 276ms），残留是**被 `job_kill` / `timeout` 从外面 SIGKILL 的运行**留下的——F6 的整组杀伤只覆盖 `run_unit_tests.js` 主动超时那条路径，外部杀父进程时子/孙被 reparent 到 1 继续每 50ms 写盘。反证：4 个 40s busy-loop 的纯 CPU 负载不复现（49s / 66s 全绿）⇒ 问题不是负载而是孤儿。与其把"记得清场"写成纪律，不如让入口自己判。

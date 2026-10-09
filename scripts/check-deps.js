@@ -251,7 +251,7 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
     console.error('  npm ci --ignore-scripts')
     // 仅 re2 缺失时才提示重建原生模块；只缺 got 时该目录可能尚未创建，避免误导
     if (missing.includes(NATIVE_DEP)) {
-      console.error(`  npm run rebuild --prefix node_modules/${NATIVE_DEP}`)
+      console.error(`  npm rebuild ${NATIVE_DEP}`)
     }
   }
   if (broken.length > 0) {
@@ -261,7 +261,7 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
     // re2 的修复动作含「切换 Node 版本」（其 engines 比本仓库严，见上方版本闸门），故带上当前版本对照
     if (broken.some(b => b.name === NATIVE_DEP)) {
       console.error(`请重建原生模块或切换 Node 版本（当前 ${process.version}）：`)
-      console.error(`  npm run rebuild --prefix node_modules/${NATIVE_DEP}`)
+      console.error(`  npm rebuild ${NATIVE_DEP}`)
     }
     // 指引按实际不可用的依赖给出：非原生依赖（got）走重装，rebuild re2 对它没有意义。
     if (broken.some(b => b.name !== NATIVE_DEP)) {

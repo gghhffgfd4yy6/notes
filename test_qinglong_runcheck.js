@@ -85,6 +85,13 @@ function makeApp (overrides = {}) {
   assert.ok(rNodeLow.output.includes('不满足 re2/package.json engines 要求：^22.22.2 || ^24.15.0 || >=26.0.0'), '失败详情应给出完整的 re2 engines 要求')
   restoreNotify()
 
+  // prerelease 不能因截掉后缀而冒充稳定受支持版本。
+  mockNotify(1)
+  const rNodePrerelease = withHealthyEnv(() => captureRunCheck(makeApp()), '24.15.0-rc.1')
+  assert.strictEqual(rNodePrerelease.code, 1, '不支持的 prerelease Node 应令 --check 失败')
+  assert.ok(rNodePrerelease.output.includes('❌ Node.js 版本'), 'prerelease 应被 Node.js 版本检查标红')
+  restoreNotify()
+
   // 边界对照：恰好下界 / 高于下界 → 该项通过（防"一律判红"让上面的断言失去鉴别力）
   mockNotify(1)
   assert.strictEqual(withHealthyEnv(() => runCheck(makeApp()), '22.22.2'), 0, '恰为 engines 下界应通过')

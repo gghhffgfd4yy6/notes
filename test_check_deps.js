@@ -119,7 +119,7 @@ test('got 缺失 → 归为 missing，仅提示 npm ci，不提示 rebuild', () 
   })
   if (!out.includes('缺少依赖：got')) throw new Error(`应提示缺少 got: ${out}`)
   if (!out.includes('npm ci --ignore-scripts')) throw new Error(`应提示 npm ci: ${out}`)
-  if (out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`仅缺 got 时不应提示 rebuild: ${out}`)
+  if (out.includes('npm rebuild re2')) throw new Error(`仅缺 got 时不应提示 rebuild: ${out}`)
 })
 
 // F3 回归：got「已安装但不可用」（got 12+ 为 ESM、内部依赖缺失、包损坏等）此前被 catch 一律
@@ -145,7 +145,7 @@ test('F3 got 可解析但加载抛错 → 归为 broken，输出根因与重装�
   if (!out.includes('ERR_REQUIRE_ESM')) throw new Error(`根因 error.code 必须进入输出: ${out}`)
   if (!out.includes('require() of ES Module')) throw new Error(`根因 message 必须进入输出: ${out}`)
   if (!out.includes('npm ci --ignore-scripts')) throw new Error(`got 不可用应给重装指引: ${out}`)
-  if (out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`got 不可用不应给 re2 的 rebuild 指引: ${out}`)
+  if (out.includes('npm rebuild re2')) throw new Error(`got 不可用不应给 re2 的 rebuild 指引: ${out}`)
 })
 
 // RT-08：注册套件 test_filter.js 裸 require('fast-check')（devDependency），只探运行时清单时缺它
@@ -240,7 +240,7 @@ test('re2 完全缺失（resolve 失败）→ 归为 missing，提示 npm ci + r
   })
   if (!out.includes('缺少依赖：re2')) throw new Error(`应提示缺少 re2: ${out}`)
   if (!out.includes('npm ci --ignore-scripts')) throw new Error(`应提示 npm ci: ${out}`)
-  if (!out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`缺 re2 时应提示 rebuild: ${out}`)
+  if (!out.includes('npm rebuild re2')) throw new Error(`缺 re2 时应提示 rebuild: ${out}`)
 })
 
 test('re2 可 resolve 但 require 抛错（binding 损坏）→ 归为 broken，提示 rebuild 不提示 npm ci', () => {
@@ -259,7 +259,7 @@ test('re2 可 resolve 但 require 抛错（binding 损坏）→ 归为 broken，
     if (ok !== false) throw new Error(`期望 false，实际 ${ok}`)
   })
   if (!out.includes('依赖已安装但不可用：re2')) throw new Error(`应提示不可用: ${out}`)
-  if (!out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`应提示 rebuild: ${out}`)
+  if (!out.includes('npm rebuild re2')) throw new Error(`应提示 rebuild: ${out}`)
   if (out.includes('npm ci --ignore-scripts')) throw new Error(`binding 损坏时不应提示 npm ci: ${out}`)
 })
 
@@ -894,7 +894,7 @@ test('F1/F3 checkDependencies：resolve 失败 → missing；仅 re2 缺失才�
     '❌ 缺少依赖：got, re2',
     '请先在项目根目录执行：',
     '  npm ci --ignore-scripts',
-    '  npm run rebuild --prefix node_modules/re2'
+    '  npm rebuild re2'
   ])
   const gotOnly = captureAllOutput(() => {
     strictEqual(checkDependencies({

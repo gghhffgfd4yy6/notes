@@ -30,12 +30,13 @@ function loadApp () {
 // 必须拒绝 23.x、25.x 及 24.0–24.14，不能只检查一个最低版本。
 const SUPPORTED_NODE_RANGES = '^22.22.2 || ^24.15.0 || >=26.0.0'
 const NODE_RANGE_MINIMA = [[22, 22, 2], [24, 15, 0]]
+const STABLE_NODE_VERSION_RE = /^v?((?:0|[1-9]\d*))\.((?:0|[1-9]\d*))\.((?:0|[1-9]\d*))(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
 
 function parseNodeVersion (version) {
-  return String(version).split('.').slice(0, 3).map(part => {
-    const n = Number.parseInt(part, 10)
-    return Number.isFinite(n) ? n : 0
-  })
+  const match = STABLE_NODE_VERSION_RE.exec(String(version).trim())
+  if (!match) return null
+  const parts = match.slice(1, 4).map(Number)
+  return parts.every(Number.isSafeInteger) ? parts : null
 }
 
 function compareNodeVersion (left, right) {
@@ -47,12 +48,13 @@ function compareNodeVersion (left, right) {
 
 function isSupportedNodeVersion (version = process.versions.node) {
   const parts = parseNodeVersion(version)
+  if (!parts) return false
   if (parts[0] >= 26) return true
   return NODE_RANGE_MINIMA.some(min => parts[0] === min[0] && compareNodeVersion(parts, min) >= 0)
 }
 
 // QX-06：常驻主路径与 --check 使用同一套完整 engines 版本范围；低于或不在范围内时只告警，
-// 保持既有常驻入口不硬拒启动的行为。
+// 保持既有常驻入口不硬拒启动的行为。只接受稳定三段版本；prerelease 不能冒充受支持的稳定 Node。
 function nodeVersionWarning (version = process.versions.node) {
   if (isSupportedNodeVersion(version)) return null
   return `⚠️ 当前 Node ${version} 不满足 re2/package.json engines 要求（${SUPPORTED_NODE_RANGES}），原生依赖可能不可用`
@@ -116,7 +118,6 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
   // 固定依赖路径只作为兜底：入口不会将外部输入拼入模块或构建路径（两个模块名都是本文件字面量，
   // 且经 sanitizeModuleName 白名单复核——见该函数注释）。
   const fixedPath = (name) => path.join(ROOT, 'node_modules', sanitizeModuleName(name))
-  const re2Path = fixedPath('re2')
   // QX-01：先按 Node 常规解析（与 --check 的 require('got')、xbk_agents.js 的 require('got') 同口径），
   // 只有解析不到时才回退固定路径。旧实现只用固定路径探测，会出现「--check 通过但应用侧解析失败」
   // 或「解析本可命中却重复安装」两套口径分裂。
@@ -144,7 +145,7 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
   if (!isRecoverable(initialError)) throw initialError
   if (!shouldAutoInstallDependencies(env)) {
     const failed = initial.got ? 'got' : 're2'
-    throw new Error(`检测到 ${failed} 依赖或原生模块未完整安装；请在部署阶段依次执行：npm ci --omit=dev --ignore-scripts && npm run rebuild --prefix node_modules/re2。如确需在本次运行时安装，请显式设置 XBK_AUTO_INSTALL_DEPS=1。（本入口刻意把 re2 定为必需依赖：缺 re2 时不会带着“过滤正则被跳过”的状态进入常驻；主应用的缺 re2 降级 + 每日提醒通道不适用于本常驻入口，需要时请改用单轮入口。）`)
+    throw new Error(`检测到 ${failed} 依赖或原生模块未完整安装；请在部署阶段依次执行：npm ci --omit=dev --ignore-scripts && npm rebuild re2。如确需在本次运行时安装，请显式设置 XBK_AUTO_INSTALL_DEPS=1。（本入口刻意把 re2 定为必需依赖：缺 re2 时不会带着“过滤正则被跳过”的状态进入常驻；主应用的缺 re2 降级 + 每日提醒通道不适用于本常驻入口，需要时请改用单轮入口。）`)
   }
   console.warn('检测到 Node.js 依赖或 re2 原生模块未完整安装，已按 XBK_AUTO_INSTALL_DEPS=1 执行恢复...')
 
@@ -171,15 +172,16 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
   if (install.error) throw install.error
   if (install.status !== 0) throw new Error(`npm ${installVerb} 失败，退出码 ${install.status}`)
 
-  // 仅当安装后 re2 仍无法加载才构建：单纯 got 缺失但 re2 正常时，不要求无关的 C++ 构建环境。
+  // 仅当安装后 re2 仍无法加载才恢复：单纯 got 缺失但 re2 正常时，不要求无关的 C++ 构建环境。
   const re2AfterInstall = load('re2')
   if (re2AfterInstall) {
     if (!isRecoverable(re2AfterInstall)) throw re2AfterInstall
+    // `npm rebuild re2` 执行包的官方 install 脚本：优先取带 SHA-256 校验的预编译包，失败才源码构建。
     const rebuild = spawnSyncFn(npm, [
-      'run', 'rebuild', '--prefix', re2Path
+      'rebuild', 're2'
     ], { cwd: ROOT, stdio: 'inherit', timeout: 120000 })
     if (rebuild.error) throw rebuild.error
-    if (rebuild.status !== 0) throw new Error(`re2 原生模块构建失败，退出码 ${rebuild.status}`)
+    if (rebuild.status !== 0) throw new Error(`re2 原生模块恢复失败，退出码 ${rebuild.status}`)
   }
 
   const recovered = { got: load('got'), re2: load('re2') }
@@ -345,12 +347,13 @@ function statusCacheDir ({ env = process.env, fs: fsImpl = fs, path: pathImpl = 
 
 function runStatus () {
   const dir = statusCacheDir()
-  // QX-08：--status 刻意不加载应用配置（缺 got/re2 时仍要可用），故当 XBK_CACHE_DIR 未被采纳时
-  // 显式暴露「生效目录」与配置口径，避免 Config.cache.dir 指向其它根内目录时读错目录而不报错。
+  // QX-08：--status 刻意不加载应用配置（缺 got/re2 时仍要可用），始终显式暴露实际读取目录。
+  // 未采纳 XBK_CACHE_DIR 时额外说明：若已自定义 Config.cache.dir，需用同一绝对路径覆盖读取。
   const configured = process.env.XBK_CACHE_DIR
-  if (!(configured && path.isAbsolute(configured))) {
-    console.log(`缓存目录：${dir}（未使用 XBK_CACHE_DIR；--status 不加载应用配置，若已自定义 Config.cache.dir，请用 XBK_CACHE_DIR 指向该绝对路径）`)
-  }
+  const source = configured && path.isAbsolute(configured)
+    ? '使用 XBK_CACHE_DIR'
+    : '未使用 XBK_CACHE_DIR；--status 不加载应用配置，若已自定义 Config.cache.dir，请用 XBK_CACHE_DIR 指向该绝对路径'
+  console.log(`缓存目录：${dir}（${source}）`)
   const status = readStatus(dir)
   console.log(formatStatus(status))
   return 0
