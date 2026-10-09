@@ -36,13 +36,13 @@ npm 不会自动注册仓库钩子，克隆后**必须显式装一次**；装完
 ## 静态扫描闸门（v3.280）
 
 - `npm run check:ci-static` = `shellcheck` 扫 `.githooks/*` 全部钩子 + `zizmor` 扫 `.github/workflows/` 全部（**medium 及以上计红**；zizmor 的 JSON 解析不出来按「不可判定 = 红」fail-closed）。
-- 同一条链在 `npm run check`、pre-commit 第 4 道、CI quality job 步骤**三处**接线，接线由 `test_ci_static_gates.js` 用内容断言锁死：摘掉任一处，下一次 CI 必红在该套件。
+- 同一条链在 `npm run check`、pre-commit 第 4 道、CI policy job 步骤**三处**接线，接线由 `test_ci_static_gates.js` 用内容断言锁死：摘掉任一处，下一次 CI 必红在该套件。
 - **新增钩子或 workflow 文件后不得假定它没被扫描**——这两类文件从此只有更严、没有豁免。
 - zizmor 在 CI 钉 `==1.30.1`（= 本机基线），**升级须两处同步**。本机缺工具时闸门显眼提示并跳过（绝不假装扫描过）；CI（env `CI=true`）或加 `--require-tools` 时缺工具即红。
 
 ## 文档行长闸门（v3.281）
 
-- `npm run check:doc-lines` 让任何被扫描的 markdown 出现 **>1200 字符**的单行即红；三处接线同一阈值（`npm run check` / pre-commit 第 5 道 / CI `quality-gate` 显式步骤），接线由 `test_doc_line_gates.js` 用内容断言锁死（含「阈值必须恰为 1200」「`.github` 不得进跳过名单」「扫描面不得漏掉任何一份 prose」）。
+- `npm run check:doc-lines` 让任何被扫描的 markdown 出现 **>1200 字符**的单行即红；三处接线同一阈值（`npm run check` / pre-commit 第 5 道 / CI `policy` job 显式步骤），接线由 `test_doc_line_gates.js` 用内容断言锁死（含「阈值必须恰为 1200」「`.github` 不得进跳过名单」「扫描面不得漏掉任何一份 prose」）。
 - **没有例外名单**：超了就按语义拆成子弹/表格，改完跑 `npm run check:doc-lines` 自查；把阈值调大 = 闸门形同虚设，那条断言会先红。
 - 为什么值得做一道门禁：巨行的代价不是难看，而是评审放弃逐字核对 + diff 一行改动等于整行重写；AGENTS 曾长到单行 8132 字符、CHANGELOG 4788，v3.280 才重切完，没有这道闸门它就会自然长回去。
 

@@ -50,7 +50,7 @@
 ## 修改检查
 
 - 改判重、缓存、过滤、推送、网络、配置或文件存储：补针对性测试并运行 `npm run check`（= lint → 版本闸门 → 变异行段校验 → 静态扫描 → 文档行长 → `npm test`，v3.280 起第 4 道、v3.281 起第 5 道）。
-- 改 `.githooks/*` 或 `.github/workflows/*`：必跑 `npm run check:ci-static`（`shellcheck` 扫全部钩子 + `zizmor` 扫全部 workflow，medium 及以上计红；zizmor JSON 解析不出来按「不可判定=红」fail-closed）。这两类文件**默认全量被扫描、没有豁免**；三处接线（`npm run check`、pre-commit 第 4 道、CI quality job 步骤）由 `test_ci_static_gates.js` 用内容断言锁死。CI 把 zizmor 钉在 `==1.30.1`，升级须两处同步。
+- 改 `.githooks/*` 或 `.github/workflows/*`：必跑 `npm run check:ci-static`（`shellcheck` 扫全部钩子 + `zizmor` 扫全部 workflow，medium 及以上计红；zizmor JSON 解析不出来按「不可判定=红」fail-closed）。这两类文件**默认全量被扫描、没有豁免**；三处接线（`npm run check`、pre-commit 第 4 道、CI policy job 步骤）由 `test_ci_static_gates.js` 用内容断言锁死。CI 把 zizmor 钉在 `==1.30.1`，升级须两处同步。
 - 改单元/变异测试的执行方式：`run_unit_tests.js` 自 v3.278 起以**并发池**跑单元套件（默认并发 8，`XBK_UNIT_CONCURRENCY` 可调），但 `XBK_MUTATION_CHILD=1`（stryker 与 `run_mutation.js` 的变异评估沙箱）时**必须保持串行 1**——并发会让 `test_filter.js` 的 `PERF_MS` 性能断言口径漂移，把本应 Killed 的变异体误记成 Survived/Killed（分数失真）。并发与串行的逐套件判定结果必须一致，汇总/失败归因/`GITHUB_STEP_SUMMARY` 口径不变。
 - 变异 runner 的挂死判据是**连续静默 + 总上限**双轨：`run_mutation.js` 中 stdout 或 stderr 每收到数据都会重置 `MUTATION_IDLE_MS`（默认 180s）静默计时器；持续无输出达到该值才触发 kill，总上限 `MUTATION_TIMEOUT`（生产默认 90s）仍是硬兜底，不能因为抬高静默线而删除。两条线最终都由子进程 `close` 的真实退出结果结算，慢但持续输出的测试不得被误判为 timeout。
 - `commit-msg` 要求原始提交消息第二行是空行，注释行不能替代；Git 的 `--cleanup` 命令行覆盖值不会传给钩子，故不按配置推断清理模式。首行类型前缀和 100 字符上限仍同时生效。
