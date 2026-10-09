@@ -349,24 +349,49 @@ assert.match(qualityGateBlock, /POLICY_RESULT: \$\{\{\s*needs\.policy\.result\s*
   'quality-gate 必须读取 policy 结果')
 assert.ok(qualityGateBlock.includes('[ "$QUALITY_RESULT" != "success" ]') && qualityGateBlock.includes('[ "$POLICY_RESULT" != "success" ]'),
   'quality-gate 必须分别拒绝非 success 的 quality 与 policy 结果')
-const policyHasContinueOnError = yamlOnly(policyBlock).some(line =>
-  /^continue-on-error:\s*(?:true|'true'|"true")(?:\s+#.*)?\s*$/i.test(line.trim()))
-assert.ok(!policyHasContinueOnError, 'policy 的门禁步骤不得用 continue-on-error: true 吞掉失败')
-
-function runBlockForStep (jobText, stepName) {
+function stepBlockForName (jobText, stepName) {
   const lines = jobText.split(/\r?\n/)
   const stepAt = lines.findIndex(line => line.trim() === '- name: ' + stepName)
   assert.ok(stepAt >= 0, `job 必须包含步骤 ${stepName}`)
   const stepIndent = indentOf(lines[stepAt])
-  let runAt = -1
-  for (let i = stepAt + 1; i < lines.length; i++) {
-    if (!lines[i].trim()) continue
-    if (indentOf(lines[i]) <= stepIndent) break
-    if (lines[i].trimStart().startsWith('run:')) {
-      runAt = i
-      break
-    }
-  }
+  let end = lines.findIndex((line, i) => i > stepAt && line.trim() && indentOf(line) <= stepIndent)
+  if (end < 0) end = lines.length
+  return lines.slice(stepAt, end).join('\n')
+}
+function assertNoContinueOnError (yamlText, label) {
+  const fields = yamlOnly(yamlText).filter(line =>
+    /^\s*(?:continue-on-error|'continue-on-error'|"continue-on-error")\s*:/.test(line))
+  assert.strictEqual(fields.length, 0,
+    `${label} 禁止声明 continue-on-error 字段（包括表达式值）：${fields.join(' | ')}`)
+}
+const summaryStepName = '汇总 quality matrix 与 policy 结果'
+const summaryStepBlock = stepBlockForName(qualityGateBlock, summaryStepName)
+assertNoContinueOnError(qualityGateBlock, 'quality-gate job')
+assertNoContinueOnError(summaryStepBlock, 'quality-gate 汇总 step')
+assertNoContinueOnError(policyBlock, 'policy job 与其门禁 steps')
+
+const summaryContinueFixture = summaryStepBlock.replace(
+  '      - name: ' + summaryStepName,
+  '      - name: ' + summaryStepName + '\n        continue-on-error: true')
+assert.notStrictEqual(summaryContinueFixture, summaryStepBlock, 'step fixture 必须注入 continue-on-error: true')
+assert.throws(() => assertNoContinueOnError(summaryContinueFixture, 'quality-gate 汇总 step'), /continue-on-error/,
+  '在汇总 step 注入 continue-on-error: true 必须让契约测试变红')
+const expressionContinueValue = '$' + '{{ always() }}'
+const jobContinueFixture = qualityGateBlock.replace(
+  '  quality-gate:', '  quality-gate:\n    continue-on-error: ' + expressionContinueValue)
+assert.notStrictEqual(jobContinueFixture, qualityGateBlock, 'job fixture 必须注入表达式 continue-on-error')
+assert.throws(() => assertNoContinueOnError(jobContinueFixture, 'quality-gate job'), /continue-on-error/,
+  '在 quality-gate job 注入表达式 continue-on-error 必须让契约测试变红')
+const policyContinueFixture = policyBlock.replace(
+  '      - name: 静态扫描闸门（shellcheck + zizmor）',
+  '      - name: 静态扫描闸门（shellcheck + zizmor）\n        continue-on-error: ' + expressionContinueValue)
+assert.notStrictEqual(policyContinueFixture, policyBlock, 'policy fixture 必须注入表达式 continue-on-error')
+assert.throws(() => assertNoContinueOnError(policyContinueFixture, 'policy job'), /continue-on-error/,
+  'policy gate 注入表达式 continue-on-error 必须让契约测试变红')
+
+function runBlockForStep (jobText, stepName) {
+  const lines = stepBlockForName(jobText, stepName).split('\n')
+  const runAt = lines.findIndex((line, i) => i > 0 && line.trimStart().startsWith('run:'))
   assert.ok(runAt >= 0, `${stepName} 必须有 run 命令`)
   assert.strictEqual(lines[runAt].trim(), 'run: |', `${stepName} 必须保留可验证的多行 shell 命令`)
   const bodyIndent = indentOf(lines[runAt]) + 2
