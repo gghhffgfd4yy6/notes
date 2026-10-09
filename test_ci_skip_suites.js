@@ -435,9 +435,10 @@ const gateCases = [
   ['success', 'cancelled', 1, 'policy cancelled']
 ]
 for (const [qualityResult, policyResult, expectedExit, label] of gateCases) {
-  const result = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', gateRun], {
+  // CI uses Ubuntu; execute the system Bash directly instead of resolving it through PATH.
+  const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', gateRun], {
     encoding: 'utf8',
-    env: { PATH: '/usr/bin:/bin', QUALITY_RESULT: qualityResult, POLICY_RESULT: policyResult }
+    env: { QUALITY_RESULT: qualityResult, POLICY_RESULT: policyResult }
   })
   assert.ok(!result.error, `${label}: 无法执行 quality-gate shell 判定：${result.error && result.error.message}`)
   assert.strictEqual(result.status, expectedExit,
