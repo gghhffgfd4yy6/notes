@@ -349,7 +349,58 @@ assert.match(qualityGateBlock, /POLICY_RESULT: \$\{\{\s*needs\.policy\.result\s*
   'quality-gate 必须读取 policy 结果')
 assert.ok(qualityGateBlock.includes('[ "$QUALITY_RESULT" != "success" ]') && qualityGateBlock.includes('[ "$POLICY_RESULT" != "success" ]'),
   'quality-gate 必须分别拒绝非 success 的 quality 与 policy 结果')
-console.log('✅ policy 单次门禁与 quality-gate 双结果/最小权限契约通过')
+const policyHasContinueOnError = yamlOnly(policyBlock).some(line =>
+  /^continue-on-error:\s*(?:true|'true'|"true")(?:\s+#.*)?\s*$/i.test(line.trim()))
+assert.ok(!policyHasContinueOnError, 'policy 的门禁步骤不得用 continue-on-error: true 吞掉失败')
+
+function runBlockForStep (jobText, stepName) {
+  const lines = jobText.split(/\r?\n/)
+  const stepAt = lines.findIndex(line => line.trim() === '- name: ' + stepName)
+  assert.ok(stepAt >= 0, `job 必须包含步骤 ${stepName}`)
+  const stepIndent = indentOf(lines[stepAt])
+  let runAt = -1
+  for (let i = stepAt + 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue
+    if (indentOf(lines[i]) <= stepIndent) break
+    if (lines[i].trimStart().startsWith('run:')) {
+      runAt = i
+      break
+    }
+  }
+  assert.ok(runAt >= 0, `${stepName} 必须有 run 命令`)
+  assert.strictEqual(lines[runAt].trim(), 'run: |', `${stepName} 必须保留可验证的多行 shell 命令`)
+  const bodyIndent = indentOf(lines[runAt]) + 2
+  const body = []
+  for (let i = runAt + 1; i < lines.length; i++) {
+    if (!lines[i].trim()) {
+      body.push('')
+      continue
+    }
+    if (indentOf(lines[i]) < bodyIndent) break
+    body.push(lines[i].slice(bodyIndent))
+  }
+  return body.join('\n')
+}
+const gateRun = runBlockForStep(qualityGateBlock, '汇总 quality matrix 与 policy 结果')
+const gateCases = [
+  ['success', 'success', 0, 'all success'],
+  ['failure', 'success', 1, 'quality-only failure'],
+  ['success', 'failure', 1, 'policy-only failure'],
+  ['skipped', 'success', 1, 'quality skipped'],
+  ['cancelled', 'success', 1, 'quality cancelled'],
+  ['success', 'skipped', 1, 'policy skipped'],
+  ['success', 'cancelled', 1, 'policy cancelled']
+]
+for (const [qualityResult, policyResult, expectedExit, label] of gateCases) {
+  const result = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', gateRun], {
+    encoding: 'utf8',
+    env: { PATH: process.env.PATH, QUALITY_RESULT: qualityResult, POLICY_RESULT: policyResult }
+  })
+  assert.ok(!result.error, `${label}: 无法执行 quality-gate shell 判定：${result.error && result.error.message}`)
+  assert.strictEqual(result.status, expectedExit,
+    `${label}: quality-gate 应退出 ${expectedExit}，实际 ${result.status}；输出=${result.stdout}${result.stderr}`)
+}
+console.log('✅ policy 单次门禁、失败传播与 quality-gate 运行级结果契约通过（7 组合）')
 
 // #131 qodo #2：runLines 多行块 / EOF 补结算 / 注释剔除的回归断言。
 // 用 dummy workflow 文本驱动同一解析器 parseWorkflowSteps，验证 scripts 收集正确——不依赖真实
