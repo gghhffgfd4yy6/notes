@@ -437,7 +437,7 @@ const gateCases = [
 for (const [qualityResult, policyResult, expectedExit, label] of gateCases) {
   const result = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', gateRun], {
     encoding: 'utf8',
-    env: { PATH: process.env.PATH, QUALITY_RESULT: qualityResult, POLICY_RESULT: policyResult }
+    env: { PATH: '/usr/bin:/bin', QUALITY_RESULT: qualityResult, POLICY_RESULT: policyResult }
   })
   assert.ok(!result.error, `${label}: 无法执行 quality-gate shell 判定：${result.error && result.error.message}`)
   assert.strictEqual(result.status, expectedExit,
