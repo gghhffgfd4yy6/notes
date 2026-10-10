@@ -25,7 +25,7 @@
 | 工作流/钩子静态扫描（`zizmor` + `shellcheck`） | Test 工作流 `policy`（并由 `quality-gate` 汇总）：PR / push main / 每日冒烟 |
 | 外部静态分析（Codacy / SonarCloud） | 由 GitHub App 挂在 PR 与 main 的检查上（配置见 `.codacy.yml`、`.sonarcloud.properties`），不在本表的工作流之列 |
 
-工作流引用的第三方 action 固定到完整 commit SHA（当前 31 处 `uses:` 全部为 40 位 SHA），checkout 一律 `persist-credentials: false`，且每个工作流都声明了 job 级最小 `permissions`（未声明的 job 会退回工作流级兜底而不是仓库默认写权限），降低供应链与凭据泄露风险。
+工作流引用的第三方 action 固定到完整 commit SHA（当前 31 处 `uses:` 全部为 40 位 SHA），checkout 一律 `persist-credentials: false`，降低供应链与凭据泄露风险。权限按各工作流声明分配：workflow-level `permissions` 是未单独设置 job-level `permissions` 时的默认权限；job-level `permissions` 可为对应 job 覆盖该设置。例如，Test 工作流在 workflow 层声明 `contents: read`，`policy` job 未单独声明 `permissions`，因此继承该设置；`quality-gate` 则显式使用 `permissions: {}`，不授予 `GITHUB_TOKEN` 权限。因此，并非每个 job 都显式声明了 job-level 最小权限。
 
 ## 支持范围
 
