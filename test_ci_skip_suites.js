@@ -332,6 +332,7 @@ function jobBlock (workflowText, name) {
 const qualityBlock = jobBlock(testYml, 'quality')
 const policyBlock = jobBlock(testYml, 'policy')
 const qualityGateBlock = jobBlock(testYml, 'quality-gate')
+const coverageBlock = jobBlock(testYml, 'coverage')
 const policyChecks = ['check:ci-static', 'test:ci-static-gates', 'check:doc-lines', 'test:doc-line-gates']
 function assertPolicyStepsUnconditional (policyJobText, qualityJobText) {
   const policySteps = parseWorkflowSteps(policyJobText)
@@ -365,6 +366,43 @@ assert.match(qualityGateBlock, /POLICY_RESULT: \$\{\{\s*needs\.policy\.result\s*
   'quality-gate 必须读取 policy 结果')
 assert.ok(qualityGateBlock.includes('[ "$QUALITY_RESULT" != "success" ]') && qualityGateBlock.includes('[ "$POLICY_RESULT" != "success" ]'),
   'quality-gate 必须分别拒绝非 success 的 quality 与 policy 结果')
+function assertCoverageDependsOnQualityGate (coverageJobText) {
+  const lines = yamlOnly(coverageJobText).map(line => line.trim())
+  const needsAt = lines.findIndex(line => /^needs\s*:/.test(line))
+  assert.ok(needsAt >= 0, 'coverage job 必须声明 needs: quality-gate')
+  const needsLine = lines[needsAt].slice('needs:'.length).trim()
+  const dependencies = needsLine
+    ? needsLine.replace(/^\[|\]$/g, '').split(',').map(value => value.trim().replace(/^['"]|['"]$/g, ''))
+    : lines.slice(needsAt + 1).filter(line => /^-\s+/.test(line)).map(line => line.slice(2).trim())
+  assert.ok(dependencies.includes('quality-gate'),
+    'coverage job 的 needs 必须包含 quality-gate，避免绕过成功门禁')
+  const conditions = yamlOnly(coverageJobText).filter(line =>
+    indentOf(line) === 4 && /^(?:if|'if'|"if")\s*:/.test(line.trim()))
+  assert.strictEqual(conditions.length, 1, 'coverage job 必须恰有一个 job-level if 条件')
+  assert.ok(!/always\s*\(/i.test(conditions[0]),
+    'coverage job 的 if 禁止 always()，以保留 needs 默认成功依赖语义')
+  return conditions[0]
+}
+const coverageCondition = assertCoverageDependsOnQualityGate(coverageBlock)
+assert.match(coverageCondition, /github\.ref\s*==\s*['"]refs\/heads\/main['"]/,
+  'coverage job 应保留仅在 main 分支运行的正常条件')
+
+const coverageWithoutNeeds = coverageBlock.replace(/^ {4}needs:.*(?:\r?\n|$)/m, '')
+assert.notStrictEqual(coverageWithoutNeeds, coverageBlock, 'coverage needs 负例必须移除真实 needs 声明')
+assert.throws(() => assertCoverageDependsOnQualityGate(coverageWithoutNeeds), /needs.*quality-gate/,
+  '删除 coverage 的 needs 后必须由依赖合同判红')
+
+const coverageWithAlways = coverageBlock.replace(
+  /^ {4}if:([^\r\n]*)$/m,
+  (_, condition) => '    if: always() &&' + condition)
+assert.notStrictEqual(coverageWithAlways, coverageBlock, 'coverage always() 负例必须改写真实 job 条件')
+assert.throws(() => assertCoverageDependsOnQualityGate(coverageWithAlways), /禁止 always\(\)/,
+  'coverage job 条件加入 always() 后必须由状态依赖合同判红')
+console.log('✅ coverage job 依赖 quality-gate、拒绝 always()，且保留 main 分支条件')
+if (process.argv.includes('--coverage-gate-contract-only')) {
+  console.log('✅ --coverage-gate-contract-only：在 coverage gate 合同后早退')
+  process.exit(0)
+}
 function stepBlockForName (jobText, stepName) {
   const lines = jobText.split(/\r?\n/)
   const stepAt = lines.findIndex(line => line.trim() === '- name: ' + stepName)
