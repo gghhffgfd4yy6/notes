@@ -295,20 +295,28 @@ function parseWorkflowSteps (text) {
   return steps
 }
 
-const steps = parseWorkflowSteps(testYml)
-const explicitFiles = new Set()
-for (const step of steps) {
-  if (step.conditional) continue
-  for (const script of step.scripts) {
-    const cmd = pkg.scripts[script]
-    const file = cmd && cmd.match(/node (\S+\.js)/)
-    if (file) explicitFiles.add(path.basename(file[1]))
+function collectExplicitFiles (workflowText) {
+  const files = new Set()
+  for (const step of parseWorkflowSteps(workflowText)) {
+    if (step.conditional) continue
+    for (const script of step.scripts) {
+      const cmd = pkg.scripts[script]
+      const file = cmd && cmd.match(/node (\S+\.js)/)
+      const basename = file && path.basename(file[1])
+      if (basename && /^test_.*\.js$/.test(basename)) files.add(basename)
+    }
   }
+  return files
 }
-assert.ok(explicitFiles.size > 0, '应从 test.yml 解析出显式测试步骤')
 const byName = (a, b) => a.localeCompare(b) // 显式比较函数：默认 sort 的字符串序不保证稳定可预期（Sonar S2871）
-assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explicitFiles.has(f)).sort(byName),
-  'SKIP_SUITES 必须等于「显式步骤已覆盖的单元套件」：漏写会重复跑，多写会漏跑（门禁盲区）')
+function assertSkipSuitesMatchExplicitSteps (workflowText) {
+  const explicitFiles = collectExplicitFiles(workflowText)
+  assert.ok(explicitFiles.size > 0, '应从 test.yml 解析出显式测试步骤')
+  assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explicitFiles.has(f)).sort(byName),
+    'SKIP_SUITES 必须等于「显式步骤已覆盖的单元套件」：漏写会重复跑，多写会漏跑（门禁盲区）')
+  return explicitFiles
+}
+const explicitFiles = assertSkipSuitesMatchExplicitSteps(testYml)
 
 // ── 2a. 静态/文档策略门禁只跑一次，稳定 Required Check 汇总两类结果 ──
 function jobBlock (workflowText, name) {
@@ -382,6 +390,37 @@ function assertNoStepIf (stepBlock, label) {
   const fields = yamlOnly(stepBlock).filter(line => /^\s*(?:if|'if'|"if")\s*:/.test(line))
   assert.strictEqual(fields.length, 0, `${label} 禁止声明 step-level if 条件：${fields.join(' | ')}`)
 }
+const unitRunnerMatch = pkg.scripts['test:unit'].match(/^node (\S+\.js)$/)
+assert.ok(unitRunnerMatch, 'test:unit 必须映射到单个 JavaScript runner')
+const unitRunnerFile = path.basename(unitRunnerMatch[1])
+assert.strictEqual(unitRunnerFile, 'run_unit_tests.js', '全量单测兜底必须使用 run_unit_tests.js runner')
+assert.ok(!unitFiles.includes(unitRunnerFile) && !explicitFiles.has(unitRunnerFile),
+  'run_unit_tests.js 不是 SUITES 登记的 test_*.js 显式套件，不能由 SKIP_SUITES 对账代替兜底检查')
+function assertUnitFallbackUnconditional (qualityJobText) {
+  const fallbackSteps = parseWorkflowSteps(qualityJobText).filter(step => step.scripts.includes('test:unit'))
+  assert.strictEqual(fallbackSteps.length, 1, 'quality job 必须恰好执行一次 npm run test:unit 全量兜底')
+  assert.strictEqual(fallbackSteps[0].conditional, false,
+    'quality job 的 npm run test:unit 全量兜底 step 禁止 step-level if 条件')
+}
+assertUnitFallbackUnconditional(qualityBlock)
+const unitFallbackStepName = '全量单元测试（run_unit_tests.js）'
+const unitFallbackStepLine = '      - name: ' + unitFallbackStepName
+const unitFallbackStepBlock = stepBlockForName(qualityBlock, unitFallbackStepName)
+const unitFallbackRemovedFixture = qualityBlock.replace(unitFallbackStepBlock, '')
+assert.notStrictEqual(unitFallbackRemovedFixture, qualityBlock, '移除兜底 step fixture 必须命中目标 step')
+assert.ok(!unitFallbackRemovedFixture.includes(unitFallbackStepLine), '移除兜底 step fixture 不得残留目标步骤')
+assert.ok(!parseWorkflowSteps(unitFallbackRemovedFixture).some(step => step.scripts.includes('test:unit')),
+  '移除兜底 step fixture 不得残留 npm run test:unit 命令')
+assert.throws(() => assertUnitFallbackUnconditional(unitFallbackRemovedFixture), /恰好执行一次/,
+  '移除 test:unit 全量兜底 step 必须让数量合同失败')
+const unitFallbackIfFalseFixture = qualityBlock.replace(
+  unitFallbackStepLine, unitFallbackStepLine + '\n        if: false')
+assert.notStrictEqual(unitFallbackIfFalseFixture, qualityBlock, 'test:unit if:false fixture 必须命中兜底 step')
+const unitFallbackWorkflowFixture = testYml.replace(qualityBlock, unitFallbackIfFalseFixture)
+assert.notStrictEqual(unitFallbackWorkflowFixture, testYml, '合成 workflow 必须包含条件化兜底 step')
+assertSkipSuitesMatchExplicitSteps(unitFallbackWorkflowFixture)
+assert.throws(() => assertUnitFallbackUnconditional(unitFallbackIfFalseFixture), /step-level if/,
+  '给 test:unit 兜底 step 注入 if: false 必须让独立合同失败')
 const policyStepNames = [
   ['check:ci-static', '静态扫描闸门（shellcheck + zizmor）'],
   ['test:ci-static-gates', '静态扫描接线断言（test_ci_static_gates.js）'],
