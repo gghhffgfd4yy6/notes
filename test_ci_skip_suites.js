@@ -421,6 +421,55 @@ assert.notStrictEqual(unitFallbackWorkflowFixture, testYml, '合成 workflow 必
 assertSkipSuitesMatchExplicitSteps(unitFallbackWorkflowFixture)
 assert.throws(() => assertUnitFallbackUnconditional(unitFallbackIfFalseFixture), /step-level if/,
   '给 test:unit 兜底 step 注入 if: false 必须让独立合同失败')
+function assertQualityJobNoContinueOnError (qualityJobText) {
+  const fields = yamlOnly(qualityJobText).filter(line =>
+    indentOf(line) === 4 && /^(?:continue-on-error|'continue-on-error'|"continue-on-error")\s*:/.test(line.trim()))
+  assert.strictEqual(fields.length, 0,
+    `quality job 级禁止声明 continue-on-error：${fields.join(' | ')}`)
+}
+function assertUnitFallbackNoContinueOnError (qualityJobText) {
+  assertUnitFallbackUnconditional(qualityJobText)
+  const step = stepBlockForName(qualityJobText, unitFallbackStepName)
+  assert.ok(parseWorkflowSteps(step).some(parsed => parsed.scripts.includes('test:unit')),
+    '全量单测 step 必须实际执行 npm run test:unit')
+  assertNoContinueOnError(step, 'npm run test:unit 全量单测 step')
+}
+const integrationParallelStepName = '集成测试（并行调度）'
+function assertIntegrationParallelContinueOnErrorAllowed (qualityJobText) {
+  const step = stepBlockForName(qualityJobText, integrationParallelStepName)
+  assert.match(step, /^\s{8}id:\s*integration-parallel\s*$/m,
+    '正向控制必须仍定位到 integration-parallel step')
+  assert.match(step, /^\s{8}continue-on-error:\s*true\s*$/m,
+    'integration-parallel 的有意 continue-on-error 必须保留并允许')
+}
+
+assertQualityJobNoContinueOnError(qualityBlock)
+assertUnitFallbackNoContinueOnError(qualityBlock)
+assertIntegrationParallelContinueOnErrorAllowed(qualityBlock)
+
+const qualityJobContinueFixture = qualityBlock.replace(
+  '  quality:', '  quality:\n    continue-on-error: true')
+assert.notStrictEqual(qualityJobContinueFixture, qualityBlock,
+  'quality job fixture 必须只注入 job-level continue-on-error')
+assert.throws(() => assertQualityJobNoContinueOnError(qualityJobContinueFixture), /quality job 级.*continue-on-error/,
+  'quality job 级 continue-on-error 必须单独让 job 合同失败')
+assertUnitFallbackNoContinueOnError(qualityJobContinueFixture)
+assertIntegrationParallelContinueOnErrorAllowed(qualityJobContinueFixture)
+
+const unitFallbackContinueFixture = qualityBlock.replace(
+  unitFallbackStepLine, unitFallbackStepLine + '\n        continue-on-error: true')
+assert.notStrictEqual(unitFallbackContinueFixture, qualityBlock,
+  'test:unit fixture 必须只注入目标 step-level continue-on-error')
+assertQualityJobNoContinueOnError(unitFallbackContinueFixture)
+assert.throws(() => assertUnitFallbackNoContinueOnError(unitFallbackContinueFixture), /continue-on-error/,
+  'npm run test:unit step 级 continue-on-error 必须单独让 step 合同失败')
+assertIntegrationParallelContinueOnErrorAllowed(unitFallbackContinueFixture)
+console.log('✅ quality 全量单测的 job/step continue-on-error 分层合同与正交反例通过')
+if (process.argv.includes('--quality-coe-contract-only')) {
+  console.log('✅ --quality-coe-contract-only：在 COE 合同后早退')
+  process.exit(0)
+}
+
 const policyStepNames = [
   ['check:ci-static', '静态扫描闸门（shellcheck + zizmor）'],
   ['test:ci-static-gates', '静态扫描接线断言（test_ci_static_gates.js）'],
