@@ -324,14 +324,22 @@ function jobBlock (workflowText, name) {
 const qualityBlock = jobBlock(testYml, 'quality')
 const policyBlock = jobBlock(testYml, 'policy')
 const qualityGateBlock = jobBlock(testYml, 'quality-gate')
-const policyScripts = parseWorkflowSteps(policyBlock).flatMap(step => step.scripts)
-const qualityScripts = parseWorkflowSteps(qualityBlock).flatMap(step => step.scripts)
 const policyChecks = ['check:ci-static', 'test:ci-static-gates', 'check:doc-lines', 'test:doc-line-gates']
-for (const script of policyChecks) {
-  assert.strictEqual(policyScripts.filter(s => s === script).length, 1,
-    `${script} 必须且只能在非矩阵 policy job 执行一次`)
-  assert.ok(!qualityScripts.includes(script), `${script} 不得随 Node matrix 在 quality job 重复执行`)
+function assertPolicyStepsUnconditional (policyJobText, qualityJobText) {
+  const policySteps = parseWorkflowSteps(policyJobText)
+  const policyScripts = policySteps.flatMap(step => step.scripts)
+  const qualityScripts = parseWorkflowSteps(qualityJobText).flatMap(step => step.scripts)
+  for (const script of policyChecks) {
+    assert.strictEqual(policyScripts.filter(s => s === script).length, 1,
+      `${script} 必须且只能在非矩阵 policy job 执行一次`)
+    assert.ok(!qualityScripts.includes(script), `${script} 不得随 Node matrix 在 quality job 重复执行`)
+    const matchingSteps = policySteps.filter(step => step.scripts.includes(script))
+    assert.strictEqual(matchingSteps.length, 1, `${script} 必须由唯一 policy step 执行`)
+    assert.strictEqual(matchingSteps[0].conditional, false,
+      `${script} 对应的 policy step 禁止 step-level if 条件`)
+  }
 }
+assertPolicyStepsUnconditional(policyBlock, qualityBlock)
 assert.ok(!yamlOnly(policyBlock).some(line => /^[ \t]*(?:strategy|matrix):/.test(line)),
   'policy job 不得声明 strategy/matrix，策略门禁只执行一次')
 assert.match(qualityBlock, /^\s{4}strategy:\s*$/m, 'quality 的 Node 测试矩阵必须保留')
@@ -373,6 +381,19 @@ assertNoContinueOnError(policyBlock, 'policy job 与其门禁 steps')
 function assertNoStepIf (stepBlock, label) {
   const fields = yamlOnly(stepBlock).filter(line => /^\s*(?:if|'if'|"if")\s*:/.test(line))
   assert.strictEqual(fields.length, 0, `${label} 禁止声明 step-level if 条件：${fields.join(' | ')}`)
+}
+const policyStepNames = [
+  ['check:ci-static', '静态扫描闸门（shellcheck + zizmor）'],
+  ['test:ci-static-gates', '静态扫描接线断言（test_ci_static_gates.js）'],
+  ['check:doc-lines', '文档行长闸门（1200 字符/行）'],
+  ['test:doc-line-gates', '文档行长接线断言（test_doc_line_gates.js）']
+]
+for (const [script, stepName] of policyStepNames) {
+  const stepLine = '      - name: ' + stepName
+  const ifFalseFixture = policyBlock.replace(stepLine, stepLine + '\n        if: false')
+  assert.notStrictEqual(ifFalseFixture, policyBlock, `${script} if:false fixture 必须命中目标 step`)
+  assert.throws(() => assertPolicyStepsUnconditional(ifFalseFixture, qualityBlock), /step-level if/,
+    `${script} 对应 step 注入 if: false 必须让 policy 合同失败`)
 }
 assertNoStepIf(summaryStepBlock, 'quality-gate 汇总 step')
 const pullRequestLiteral = "'pull_request'"
