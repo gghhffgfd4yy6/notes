@@ -162,8 +162,8 @@ function validateFreshness (results, maxSkewMs = resolveMaxSkewMs(process.env.MU
 // 溯源三态（v3.276 续 · issue #167）：上面这条链路只回答了「有没有复用」，回答不了「**为什么**复用」。
 //   实测案例 run 35775812104（issue #167）：19/19 段 100% 复用，其中 fast-check 4.10.0→4.10.1 的依赖变化
 //   被**兜底缓存**吞掉、从未重算，而日报完全看不出来。两种复用的可信度不同：
-//     * `primary` —— 主 key 命中 ⇒ hashFiles 覆盖的输入（package-lock.json / run_mutation.js / matrix.src /
-//       stryker 配置与 tap-shim）真的没变，复用是「输入未变」的直接推论；
+//     * `primary` —— 主 key 命中 ⇒ 缓存身份（段名、config 档位、Stryker 配置与 tap-shim 指纹、
+//       package-lock.json 指纹及 matrix.src 的源指纹）未变，复用是「输入未变」的直接推论；
 //     * `fallback` —— 主 key 未命中、由 `restore-keys` 兜底前缀恢复了同段同档配置的旧缓存 ⇒ 输入**已经变了**
 //       （或缓存过期/被逐出），而增量差分只保证「被复用变异体所在**文件内容**未变」，不保证依赖等全局输入未变；
 //     * `none` —— 主 key 与兜底都没恢复（等价于全新运行，正常应落回全量重算）。
@@ -960,11 +960,12 @@ function _renderSegmentTable (results) {
  *   * 对照组：删掉 inc.json 后用同一 `--mutate "src.js:1-3"` 全量跑 ⇒ 报告恰好 6 个。
  * 该场景在本仓可达（两条机制叠加，**都不要求「源文件完全没变」**）：① `mutation.yml`「恢复增量缓存」
  * step 的 `key:` / `restore-keys:`（该文件是唯一权威，此处不复述）——缓存 key 是
- * `stryker-<段>-cfg-<matrix.config 档位>-<hashFiles(stryker.config.js, stryker.tap.config.js, scripts/tap-shim.js)>-deps-<hashFiles(package-lock.json)>-src-<hashFiles(run_mutation.js, matrix.src)>`
- * （**不含 mutate 范围**），而 `restore-keys` 是带**同一档位名 + 同一配置指纹 + 同一依赖指纹**的兜底前缀
- * `stryker-<段>-cfg-<同一档位>-<同一配置指纹>-deps-<同一依赖指纹>-`
- * ⇒ 主 key 未命中时（源文件变了、或 run_mutation.js / matrix.src 变了）仍会恢复**同档
- * 配置**的最近一条同前缀缓存，旧 `reports/inc-<段>.json` 照样回到工作树；
+ * `stryker-<段>-cfg-<matrix.config 档位>-<hashFiles(stryker.config.js, stryker.tap.config.js, scripts/tap-shim.js)>-deps-<hashFiles(package-lock.json)>-src-<hashFiles(matrix.src)>`
+ * （**不含 mutate 范围**；`matrix.src` 的 hash 是源文件指纹），而 `restore-keys` 是带**同一段名 + 同一档位名 +
+ * 同一配置指纹 + 同一依赖指纹**、但不含 `src` 指纹的兜底前缀：
+ * `stryker-<同一段>-cfg-<同一档位>-<同一配置指纹>-deps-<同一依赖指纹>-`
+ * ⇒ 主 key 因源文件指纹变化而未命中时，restore-prefix 不含 `src`，仍会恢复**同段同档配置**的最近一条
+ * 同前缀缓存，旧 `reports/inc-<段>.json` 照样回到工作树；
  * ② 本仓要求大文件增长时**重拆 matrix 的 mutate 行段**（AGENTS.md）⇒ 旧 inc 里落在新范围之外的变异体
  * 被 sticky 分支原样并入报告。
  *
