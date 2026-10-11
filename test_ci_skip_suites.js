@@ -34,7 +34,7 @@ const indentOf = line => line.length - line.trimStart().length
 const yamlOnly = text => text.split('\n').filter(l => !l.trim().startsWith('#'))
 
 // (1)「恢复增量缓存」：key 与 restore-keys 必须是**回退后 + 带档位 + 带依赖**的形态——不含测试指纹段，
-//     而是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>-deps-<依赖指纹>`，源指纹只进主 key。
+//     而是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>-deps-<依赖指纹>`，matrix.src 源指纹只进主 key。
 //     抽成函数是为了让紧随其后的反例在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本：把 key
 //     改回含测试指纹的形态 ⇒ 必须立刻红。
 const assertCacheStep = (ymlText) => {
@@ -46,9 +46,9 @@ const assertCacheStep = (ymlText) => {
   const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
   assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
   // key 必须逐字等于**档位名 + 配置指纹 + 依赖指纹 + 源指纹**形态：
-  //   stryker-<段>-cfg-<matrix.config 档位>-<两份 stryker 配置 + scripts/tap-shim.js 指纹>-deps-<package-lock.json 指纹>-src-<源指纹>。
-  // 源指纹固定用 matrix.src + run_mutation.js：mutate 里的范围字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，
-  // 会得到空指纹、使 range 段缓存永不过期。
+  //   stryker-<段>-cfg-<matrix.config 档位>-<两份 stryker 配置 + scripts/tap-shim.js 指纹>-deps-<package-lock.json 指纹>-src-<hashFiles(matrix.src)>。
+  // matrix.src 是实际源文件路径；mutate 的范围字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，
+  // 会得到空指纹、使 range 段缓存永不过期。run_mutation.js 仅为本地运行器，不属于 CI 执行链。
   // 配置指纹（stryker.config.js + stryker.tap.config.js + scripts/tap-shim.js）与**档位名 `matrix.config`** 都必须同时出现在
   // key 与兜底前缀里：主 key 未命中时 core 会对恢复进来的 inc **零校验**，兜底前缀若不含配置指纹就会把
   // 另一档 runner 的旧 inc 当本轮结果复用（qodo High / sourcery 评审发现，实测 http 段 6/133 复用、
@@ -62,10 +62,10 @@ const assertCacheStep = (ymlText) => {
   // incremental-differ 只按**文件内容** diff、不认识依赖版本 ⇒ 19/19 段 100% 复用，依赖升级从未重算。
   const open = '${'
   assert.strictEqual(keyLine.trim(),
-    'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + "{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-" + open + "{ hashFiles('package-lock.json') }}-src-" + open + "{ hashFiles('run_mutation.js', matrix.src) }}",
+    'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + '{ hashFiles(\'stryker.config.js\', \'stryker.tap.config.js\', \'scripts/tap-shim.js\') }}-deps-' + open + '{ hashFiles(\'package-lock.json\') }}-src-' + open + '{ hashFiles(matrix.src) }}',
     '缓存 key 必须逐字等于 stryker-<段>-cfg-<档位 matrix.config>-<配置指纹 = 两份 stryker 配置 + scripts/tap-shim.js>' +
-    '-deps-<依赖指纹 = package-lock.json>-src-<源指纹 = run_mutation.js + matrix.src>（不含 -tests- ' +
-    '测试指纹段）：PR #156 的「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发' +
+    '-deps-<依赖指纹 = package-lock.json>-src-<源指纹 = matrix.src>（不含 -tests- 或本地 run_mutation.js 指纹）' +
+    '：PR #156 的「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发' +
     '串扰，基线全程是绿的）、跑不完（app/utils/message-store 真全量在 --concurrency 8 下仍需 ~7h/~6.5h/' +
     '~4.5h，必撞 step 330min，而失败段不保存缓存进度 ⇒ 永久红），且当前**无分数门禁** ⇒ 复用不构成门禁' +
     '风险（有意接受的取舍）。依赖指纹必须进 key：dependabot 升 fast-check 4.10.0→4.10.1 时' +
@@ -151,8 +151,8 @@ const assertCacheConfigIdentity = (ymlText) => {
     'stryker.config.js / stryker.tap.config.js / scripts/tap-shim.js）与依赖（package-lock.json）的任何变化 ' +
     '都必须同时换掉主 key 与兜底身份，即缓存身份里**除源指纹以外的全部段**都必须出现在兜底前缀里。' +
     '`run_mutation.js` 是**本地**运行器：CI 的变异任务走 stryker（`scripts/mutation-child.js` → ' +
-    '`run_unit_tests.js`），**不经 run_mutation.js**（见 run_unit_tests.js 顶部说明），故它与 matrix.src ' +
-    '同属源指纹、只进主 key 不进兜底；测试侧文件（test_suites.js / run_unit_tests.js / scripts/mutation-child.js / ' +
+    '`run_unit_tests.js`），**不经 run_mutation.js**（见 run_unit_tests.js 顶部说明），故它不进入 CI 缓存身份；' +
+    'matrix.src 是唯一源指纹、只进主 key 不进兜底；测试侧文件（test_suites.js / run_unit_tests.js / scripts/mutation-child.js / ' +
     'test_*.js）则**有意不入任何身份段**（PR #158 的取舍）⇒ 只改它们时缓存身份逐字节不变、command 档 4 段' +
     '仍会复用旧结果（当前为 `thresholds.break = null`，无分数门禁；复用状态另有日报可视化兜住）')
 }
@@ -295,20 +295,303 @@ function parseWorkflowSteps (text) {
   return steps
 }
 
-const steps = parseWorkflowSteps(testYml)
-const explicitFiles = new Set()
-for (const step of steps) {
-  if (step.conditional) continue
-  for (const script of step.scripts) {
-    const cmd = pkg.scripts[script]
-    const file = cmd && cmd.match(/node (\S+\.js)/)
-    if (file) explicitFiles.add(path.basename(file[1]))
+function collectExplicitFiles (workflowText) {
+  const files = new Set()
+  for (const step of parseWorkflowSteps(workflowText)) {
+    if (step.conditional) continue
+    for (const script of step.scripts) {
+      const cmd = pkg.scripts[script]
+      const file = cmd && cmd.match(/node (\S+\.js)/)
+      const basename = file && path.basename(file[1])
+      if (basename && /^test_.*\.js$/.test(basename)) files.add(basename)
+    }
+  }
+  return files
+}
+const byName = (a, b) => a.localeCompare(b) // 显式比较函数：默认 sort 的字符串序不保证稳定可预期（Sonar S2871）
+function assertSkipSuitesMatchExplicitSteps (workflowText) {
+  const explicitFiles = collectExplicitFiles(workflowText)
+  assert.ok(explicitFiles.size > 0, '应从 test.yml 解析出显式测试步骤')
+  assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explicitFiles.has(f)).sort(byName),
+    'SKIP_SUITES 必须等于「显式步骤已覆盖的单元套件」：漏写会重复跑，多写会漏跑（门禁盲区）')
+  return explicitFiles
+}
+const explicitFiles = assertSkipSuitesMatchExplicitSteps(testYml)
+
+// ── 2a. 静态/文档策略门禁只跑一次，稳定 Required Check 汇总两类结果 ──
+function jobBlock (workflowText, name) {
+  const lines = workflowText.split(/\r?\n/)
+  const jobsAt = lines.findIndex(line => line === 'jobs:')
+  assert.ok(jobsAt >= 0, 'test.yml 必须声明 jobs')
+  const start = lines.findIndex((line, i) => i > jobsAt && line === '  ' + name + ':')
+  assert.ok(start >= 0, `test.yml 必须声明 ${name} job`)
+  let end = lines.findIndex((line, i) => i > start && /^\s{2}[A-Za-z0-9_-]+:\s*$/.test(line))
+  if (end < 0) end = lines.length
+  return lines.slice(start, end).join('\n')
+}
+const qualityBlock = jobBlock(testYml, 'quality')
+const policyBlock = jobBlock(testYml, 'policy')
+const qualityGateBlock = jobBlock(testYml, 'quality-gate')
+const coverageBlock = jobBlock(testYml, 'coverage')
+const policyChecks = ['check:ci-static', 'test:ci-static-gates', 'check:doc-lines', 'test:doc-line-gates']
+function assertPolicyStepsUnconditional (policyJobText, qualityJobText) {
+  const policySteps = parseWorkflowSteps(policyJobText)
+  const policyScripts = policySteps.flatMap(step => step.scripts)
+  const qualityScripts = parseWorkflowSteps(qualityJobText).flatMap(step => step.scripts)
+  for (const script of policyChecks) {
+    assert.strictEqual(policyScripts.filter(s => s === script).length, 1,
+      `${script} 必须且只能在非矩阵 policy job 执行一次`)
+    assert.ok(!qualityScripts.includes(script), `${script} 不得随 Node matrix 在 quality job 重复执行`)
+    const matchingSteps = policySteps.filter(step => step.scripts.includes(script))
+    assert.strictEqual(matchingSteps.length, 1, `${script} 必须由唯一 policy step 执行`)
+    assert.strictEqual(matchingSteps[0].conditional, false,
+      `${script} 对应的 policy step 禁止 step-level if 条件`)
   }
 }
-assert.ok(explicitFiles.size > 0, '应从 test.yml 解析出显式测试步骤')
-const byName = (a, b) => a.localeCompare(b) // 显式比较函数：默认 sort 的字符串序不保证稳定可预期（Sonar S2871）
-assert.deepStrictEqual(skips.slice().sort(byName), unitFiles.filter(f => explicitFiles.has(f)).sort(byName),
-  'SKIP_SUITES 必须等于「显式步骤已覆盖的单元套件」：漏写会重复跑，多写会漏跑（门禁盲区）')
+assertPolicyStepsUnconditional(policyBlock, qualityBlock)
+assert.ok(!yamlOnly(policyBlock).some(line => /^[ \t]*(?:strategy|matrix):/.test(line)),
+  'policy job 不得声明 strategy/matrix，策略门禁只执行一次')
+assert.match(qualityBlock, /^\s{4}strategy:\s*$/m, 'quality 的 Node 测试矩阵必须保留')
+assert.match(qualityBlock, /^\s{6}matrix:\s*$/m, 'quality 的 matrix 配置必须保留')
+assert.ok(!/^\s{4}permissions:/m.test(qualityBlock), 'quality 测试 job 权限不得改变')
+assert.ok(testYml.includes('\npermissions:\n  contents: read\n'),
+  '工作流级 permissions 必须保持 contents: read')
+assert.match(qualityGateBlock, /^\s{4}permissions:\s+\{\}$/m, 'quality-gate 必须声明 job 级 permissions: {}')
+assert.match(qualityGateBlock, /^\s{4}needs:\s+\[quality, policy\]$/m,
+  '稳定 quality-gate 必须同时依赖 quality 与 policy')
+assert.match(qualityGateBlock, /^\s{4}if:\s+always\(\)/m, '上游失败时 quality-gate 仍须运行并产出结果')
+assert.match(qualityGateBlock, /QUALITY_RESULT: \$\{\{\s*needs\.quality\.result\s*\}\}/,
+  'quality-gate 必须读取 quality matrix 结果')
+assert.match(qualityGateBlock, /POLICY_RESULT: \$\{\{\s*needs\.policy\.result\s*\}\}/,
+  'quality-gate 必须读取 policy 结果')
+assert.ok(qualityGateBlock.includes('[ "$QUALITY_RESULT" != "success" ]') && qualityGateBlock.includes('[ "$POLICY_RESULT" != "success" ]'),
+  'quality-gate 必须分别拒绝非 success 的 quality 与 policy 结果')
+function assertCoverageDependsOnQualityGate (coverageJobText) {
+  const lines = yamlOnly(coverageJobText).map(line => line.trim())
+  const needsAt = lines.findIndex(line => /^needs\s*:/.test(line))
+  assert.ok(needsAt >= 0, 'coverage job 必须声明 needs: quality-gate')
+  const needsLine = lines[needsAt].slice('needs:'.length).trim()
+  const dependencies = needsLine
+    ? needsLine.replace(/^\[|\]$/g, '').split(',').map(value => value.trim().replace(/^['"]|['"]$/g, ''))
+    : lines.slice(needsAt + 1).filter(line => /^-\s+/.test(line)).map(line => line.slice(2).trim())
+  assert.ok(dependencies.includes('quality-gate'),
+    'coverage job 的 needs 必须包含 quality-gate，避免绕过成功门禁')
+  const conditions = yamlOnly(coverageJobText).filter(line =>
+    indentOf(line) === 4 && /^(?:if|'if'|"if")\s*:/.test(line.trim()))
+  assert.strictEqual(conditions.length, 1, 'coverage job 必须恰有一个 job-level if 条件')
+  assert.ok(!/always\s*\(/i.test(conditions[0]),
+    'coverage job 的 if 禁止 always()，以保留 needs 默认成功依赖语义')
+  return conditions[0]
+}
+const coverageCondition = assertCoverageDependsOnQualityGate(coverageBlock)
+assert.match(coverageCondition, /github\.ref\s*==\s*['"]refs\/heads\/main['"]/,
+  'coverage job 应保留仅在 main 分支运行的正常条件')
+
+const coverageWithoutNeeds = coverageBlock.replace(/^ {4}needs:.*(?:\r?\n|$)/m, '')
+assert.notStrictEqual(coverageWithoutNeeds, coverageBlock, 'coverage needs 负例必须移除真实 needs 声明')
+assert.throws(() => assertCoverageDependsOnQualityGate(coverageWithoutNeeds), /needs.*quality-gate/,
+  '删除 coverage 的 needs 后必须由依赖合同判红')
+
+const coverageWithAlways = coverageBlock.replace(
+  /^ {4}if:([^\r\n]*)$/m,
+  (_, condition) => '    if: always() &&' + condition)
+assert.notStrictEqual(coverageWithAlways, coverageBlock, 'coverage always() 负例必须改写真实 job 条件')
+assert.throws(() => assertCoverageDependsOnQualityGate(coverageWithAlways), /禁止 always\(\)/,
+  'coverage job 条件加入 always() 后必须由状态依赖合同判红')
+console.log('✅ coverage job 依赖 quality-gate、拒绝 always()，且保留 main 分支条件')
+if (process.argv.includes('--coverage-gate-contract-only')) {
+  console.log('✅ --coverage-gate-contract-only：在 coverage gate 合同后早退')
+  process.exit(0)
+}
+function stepBlockForName (jobText, stepName) {
+  const lines = jobText.split(/\r?\n/)
+  const stepAt = lines.findIndex(line => line.trim() === '- name: ' + stepName)
+  assert.ok(stepAt >= 0, `job 必须包含步骤 ${stepName}`)
+  const stepIndent = indentOf(lines[stepAt])
+  let end = lines.findIndex((line, i) => i > stepAt && line.trim() && indentOf(line) <= stepIndent)
+  if (end < 0) end = lines.length
+  return lines.slice(stepAt, end).join('\n')
+}
+function assertNoContinueOnError (yamlText, label) {
+  const fields = yamlOnly(yamlText).filter(line =>
+    /^\s*(?:continue-on-error|'continue-on-error'|"continue-on-error")\s*:/.test(line))
+  assert.strictEqual(fields.length, 0,
+    `${label} 禁止声明 continue-on-error 字段（包括表达式值）：${fields.join(' | ')}`)
+}
+const summaryStepName = '汇总 quality matrix 与 policy 结果'
+const summaryStepLine = '      - name: ' + summaryStepName
+const summaryStepBlock = stepBlockForName(qualityGateBlock, summaryStepName)
+assertNoContinueOnError(qualityGateBlock, 'quality-gate job')
+assertNoContinueOnError(summaryStepBlock, 'quality-gate 汇总 step')
+assertNoContinueOnError(policyBlock, 'policy job 与其门禁 steps')
+function assertNoStepIf (stepBlock, label) {
+  const fields = yamlOnly(stepBlock).filter(line => /^\s*(?:if|'if'|"if")\s*:/.test(line))
+  assert.strictEqual(fields.length, 0, `${label} 禁止声明 step-level if 条件：${fields.join(' | ')}`)
+}
+const unitRunnerMatch = pkg.scripts['test:unit'].match(/^node (\S+\.js)$/)
+assert.ok(unitRunnerMatch, 'test:unit 必须映射到单个 JavaScript runner')
+const unitRunnerFile = path.basename(unitRunnerMatch[1])
+assert.strictEqual(unitRunnerFile, 'run_unit_tests.js', '全量单测兜底必须使用 run_unit_tests.js runner')
+assert.ok(!unitFiles.includes(unitRunnerFile) && !explicitFiles.has(unitRunnerFile),
+  'run_unit_tests.js 不是 SUITES 登记的 test_*.js 显式套件，不能由 SKIP_SUITES 对账代替兜底检查')
+function assertUnitFallbackUnconditional (qualityJobText) {
+  const fallbackSteps = parseWorkflowSteps(qualityJobText).filter(step => step.scripts.includes('test:unit'))
+  assert.strictEqual(fallbackSteps.length, 1, 'quality job 必须恰好执行一次 npm run test:unit 全量兜底')
+  assert.strictEqual(fallbackSteps[0].conditional, false,
+    'quality job 的 npm run test:unit 全量兜底 step 禁止 step-level if 条件')
+}
+assertUnitFallbackUnconditional(qualityBlock)
+const unitFallbackStepName = '全量单元测试（run_unit_tests.js）'
+const unitFallbackStepLine = '      - name: ' + unitFallbackStepName
+const unitFallbackStepBlock = stepBlockForName(qualityBlock, unitFallbackStepName)
+const unitFallbackRemovedFixture = qualityBlock.replace(unitFallbackStepBlock, '')
+assert.notStrictEqual(unitFallbackRemovedFixture, qualityBlock, '移除兜底 step fixture 必须命中目标 step')
+assert.ok(!unitFallbackRemovedFixture.includes(unitFallbackStepLine), '移除兜底 step fixture 不得残留目标步骤')
+assert.ok(!parseWorkflowSteps(unitFallbackRemovedFixture).some(step => step.scripts.includes('test:unit')),
+  '移除兜底 step fixture 不得残留 npm run test:unit 命令')
+assert.throws(() => assertUnitFallbackUnconditional(unitFallbackRemovedFixture), /恰好执行一次/,
+  '移除 test:unit 全量兜底 step 必须让数量合同失败')
+const unitFallbackIfFalseFixture = qualityBlock.replace(
+  unitFallbackStepLine, unitFallbackStepLine + '\n        if: false')
+assert.notStrictEqual(unitFallbackIfFalseFixture, qualityBlock, 'test:unit if:false fixture 必须命中兜底 step')
+const unitFallbackWorkflowFixture = testYml.replace(qualityBlock, unitFallbackIfFalseFixture)
+assert.notStrictEqual(unitFallbackWorkflowFixture, testYml, '合成 workflow 必须包含条件化兜底 step')
+assertSkipSuitesMatchExplicitSteps(unitFallbackWorkflowFixture)
+assert.throws(() => assertUnitFallbackUnconditional(unitFallbackIfFalseFixture), /step-level if/,
+  '给 test:unit 兜底 step 注入 if: false 必须让独立合同失败')
+function assertQualityJobNoContinueOnError (qualityJobText) {
+  const fields = yamlOnly(qualityJobText).filter(line =>
+    indentOf(line) === 4 && /^(?:continue-on-error|'continue-on-error'|"continue-on-error")\s*:/.test(line.trim()))
+  assert.strictEqual(fields.length, 0,
+    `quality job 级禁止声明 continue-on-error：${fields.join(' | ')}`)
+}
+function assertUnitFallbackNoContinueOnError (qualityJobText) {
+  assertUnitFallbackUnconditional(qualityJobText)
+  const step = stepBlockForName(qualityJobText, unitFallbackStepName)
+  assert.ok(parseWorkflowSteps(step).some(parsed => parsed.scripts.includes('test:unit')),
+    '全量单测 step 必须实际执行 npm run test:unit')
+  assertNoContinueOnError(step, 'npm run test:unit 全量单测 step')
+}
+const integrationParallelStepName = '集成测试（并行调度）'
+function assertIntegrationParallelContinueOnErrorAllowed (qualityJobText) {
+  const step = stepBlockForName(qualityJobText, integrationParallelStepName)
+  assert.match(step, /^\s{8}id:\s*integration-parallel\s*$/m,
+    '正向控制必须仍定位到 integration-parallel step')
+  assert.match(step, /^\s{8}continue-on-error:\s*true\s*$/m,
+    'integration-parallel 的有意 continue-on-error 必须保留并允许')
+}
+
+assertQualityJobNoContinueOnError(qualityBlock)
+assertUnitFallbackNoContinueOnError(qualityBlock)
+assertIntegrationParallelContinueOnErrorAllowed(qualityBlock)
+
+const qualityJobContinueFixture = qualityBlock.replace(
+  '  quality:', '  quality:\n    continue-on-error: true')
+assert.notStrictEqual(qualityJobContinueFixture, qualityBlock,
+  'quality job fixture 必须只注入 job-level continue-on-error')
+assert.throws(() => assertQualityJobNoContinueOnError(qualityJobContinueFixture), /quality job 级.*continue-on-error/,
+  'quality job 级 continue-on-error 必须单独让 job 合同失败')
+assertUnitFallbackNoContinueOnError(qualityJobContinueFixture)
+assertIntegrationParallelContinueOnErrorAllowed(qualityJobContinueFixture)
+
+const unitFallbackContinueFixture = qualityBlock.replace(
+  unitFallbackStepLine, unitFallbackStepLine + '\n        continue-on-error: true')
+assert.notStrictEqual(unitFallbackContinueFixture, qualityBlock,
+  'test:unit fixture 必须只注入目标 step-level continue-on-error')
+assertQualityJobNoContinueOnError(unitFallbackContinueFixture)
+assert.throws(() => assertUnitFallbackNoContinueOnError(unitFallbackContinueFixture), /continue-on-error/,
+  'npm run test:unit step 级 continue-on-error 必须单独让 step 合同失败')
+assertIntegrationParallelContinueOnErrorAllowed(unitFallbackContinueFixture)
+console.log('✅ quality 全量单测的 job/step continue-on-error 分层合同与正交反例通过')
+if (process.argv.includes('--quality-coe-contract-only')) {
+  console.log('✅ --quality-coe-contract-only：在 COE 合同后早退')
+  process.exit(0)
+}
+
+const policyStepNames = [
+  ['check:ci-static', '静态扫描闸门（shellcheck + zizmor）'],
+  ['test:ci-static-gates', '静态扫描接线断言（test_ci_static_gates.js）'],
+  ['check:doc-lines', '文档行长闸门（1200 字符/行）'],
+  ['test:doc-line-gates', '文档行长接线断言（test_doc_line_gates.js）']
+]
+for (const [script, stepName] of policyStepNames) {
+  const stepLine = '      - name: ' + stepName
+  const ifFalseFixture = policyBlock.replace(stepLine, stepLine + '\n        if: false')
+  assert.notStrictEqual(ifFalseFixture, policyBlock, `${script} if:false fixture 必须命中目标 step`)
+  assert.throws(() => assertPolicyStepsUnconditional(ifFalseFixture, qualityBlock), /step-level if/,
+    `${script} 对应 step 注入 if: false 必须让 policy 合同失败`)
+}
+assertNoStepIf(summaryStepBlock, 'quality-gate 汇总 step')
+const pullRequestLiteral = "'pull_request'"
+const simpleIfFixture = summaryStepBlock.replace(
+  summaryStepLine, summaryStepLine + '\n        if: github.event_name != ' + pullRequestLiteral)
+assert.notStrictEqual(simpleIfFixture, summaryStepBlock, 'simple if fixture 必须命中汇总 step')
+assert.throws(() => assertNoStepIf(simpleIfFixture, 'quality-gate 汇总 step'), /step-level if/,
+  '注入 PR 条件 if 必须让 summary step 契约测试变红')
+const expressionIfValue = '$' + '{{ github.event_name != ' + pullRequestLiteral + ' }}'
+const expressionIfFixture = summaryStepBlock.replace(
+  summaryStepLine, summaryStepLine + '\n        if: ' + expressionIfValue)
+assert.notStrictEqual(expressionIfFixture, summaryStepBlock, 'expression if fixture 必须命中汇总 step')
+assert.throws(() => assertNoStepIf(expressionIfFixture, 'quality-gate 汇总 step'), /step-level if/,
+  '注入表达式 PR 条件 if 必须让 summary step 契约测试变红')
+
+const summaryContinueFixture = summaryStepBlock.replace(
+  '      - name: ' + summaryStepName,
+  '      - name: ' + summaryStepName + '\n        continue-on-error: true')
+assert.notStrictEqual(summaryContinueFixture, summaryStepBlock, 'step fixture 必须注入 continue-on-error: true')
+assert.throws(() => assertNoContinueOnError(summaryContinueFixture, 'quality-gate 汇总 step'), /continue-on-error/,
+  '在汇总 step 注入 continue-on-error: true 必须让契约测试变红')
+const expressionContinueValue = '$' + '{{ always() }}'
+const jobContinueFixture = qualityGateBlock.replace(
+  '  quality-gate:', '  quality-gate:\n    continue-on-error: ' + expressionContinueValue)
+assert.notStrictEqual(jobContinueFixture, qualityGateBlock, 'job fixture 必须注入表达式 continue-on-error')
+assert.throws(() => assertNoContinueOnError(jobContinueFixture, 'quality-gate job'), /continue-on-error/,
+  '在 quality-gate job 注入表达式 continue-on-error 必须让契约测试变红')
+const policyContinueFixture = policyBlock.replace(
+  '      - name: 静态扫描闸门（shellcheck + zizmor）',
+  '      - name: 静态扫描闸门（shellcheck + zizmor）\n        continue-on-error: ' + expressionContinueValue)
+assert.notStrictEqual(policyContinueFixture, policyBlock, 'policy fixture 必须注入表达式 continue-on-error')
+assert.throws(() => assertNoContinueOnError(policyContinueFixture, 'policy job'), /continue-on-error/,
+  'policy gate 注入表达式 continue-on-error 必须让契约测试变红')
+
+function runBlockForStep (jobText, stepName) {
+  const lines = stepBlockForName(jobText, stepName).split('\n')
+  const runAt = lines.findIndex((line, i) => i > 0 && line.trimStart().startsWith('run:'))
+  assert.ok(runAt >= 0, `${stepName} 必须有 run 命令`)
+  assert.strictEqual(lines[runAt].trim(), 'run: |', `${stepName} 必须保留可验证的多行 shell 命令`)
+  const bodyIndent = indentOf(lines[runAt]) + 2
+  const body = []
+  for (let i = runAt + 1; i < lines.length; i++) {
+    if (!lines[i].trim()) {
+      body.push('')
+      continue
+    }
+    if (indentOf(lines[i]) < bodyIndent) break
+    body.push(lines[i].slice(bodyIndent))
+  }
+  return body.join('\n')
+}
+const gateRun = runBlockForStep(qualityGateBlock, '汇总 quality matrix 与 policy 结果')
+const gateCases = [
+  ['success', 'success', 0, 'all success'],
+  ['failure', 'success', 1, 'quality-only failure'],
+  ['success', 'failure', 1, 'policy-only failure'],
+  ['skipped', 'success', 1, 'quality skipped'],
+  ['cancelled', 'success', 1, 'quality cancelled'],
+  ['success', 'skipped', 1, 'policy skipped'],
+  ['success', 'cancelled', 1, 'policy cancelled']
+]
+for (const [qualityResult, policyResult, expectedExit, label] of gateCases) {
+  // CI uses Ubuntu; execute the system Bash directly instead of resolving it through PATH.
+  const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', gateRun], {
+    encoding: 'utf8',
+    env: { QUALITY_RESULT: qualityResult, POLICY_RESULT: policyResult }
+  })
+  assert.ok(!result.error, `${label}: 无法执行 quality-gate shell 判定：${result.error && result.error.message}`)
+  assert.strictEqual(result.status, expectedExit,
+    `${label}: quality-gate 应退出 ${expectedExit}，实际 ${result.status}；输出=${result.stdout}${result.stderr}`)
+}
+console.log('✅ policy 单次门禁、失败传播与 quality-gate 运行级结果契约通过（7 组合）')
 
 // #131 qodo #2：runLines 多行块 / EOF 补结算 / 注释剔除的回归断言。
 // 用 dummy workflow 文本驱动同一解析器 parseWorkflowSteps，验证 scripts 收集正确——不依赖真实
@@ -1127,7 +1410,7 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
     }
     // 变体 I：把 src 段塞回兜底前缀（旧形态的反向退化）⇒ 「兜底前缀不得含 -src-」必须红
     {
-      const srcSeg = '-src-${' + "{ hashFiles('run_mutation.js', matrix.src) }}-"
+      const srcSeg = '-src-${' + '{ hashFiles(matrix.src) }}-'
       const lines = mutationYml.split('\n')
       const ri = lines.findIndex(l => /^[ \t]*stryker-\$\{\{ matrix\.name \}\}-cfg-.*hashFiles\(/.test(l))
       assert.ok(ri >= 0, '变体 I 必须能在真实 mutation.yml 里定位到兜底前缀行')
