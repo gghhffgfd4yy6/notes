@@ -119,7 +119,7 @@ test('got 缺失 → 归为 missing，仅提示 npm ci，不提示 rebuild', () 
   })
   if (!out.includes('缺少依赖：got')) throw new Error(`应提示缺少 got: ${out}`)
   if (!out.includes('npm ci --ignore-scripts')) throw new Error(`应提示 npm ci: ${out}`)
-  if (out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`仅缺 got 时不应提示 rebuild: ${out}`)
+  if (out.includes('npm rebuild re2')) throw new Error(`仅缺 got 时不应提示 rebuild: ${out}`)
 })
 
 // F3 回归：got「已安装但不可用」（got 12+ 为 ESM、内部依赖缺失、包损坏等）此前被 catch 一律
@@ -145,7 +145,7 @@ test('F3 got 可解析但加载抛错 → 归为 broken，输出根因与重装�
   if (!out.includes('ERR_REQUIRE_ESM')) throw new Error(`根因 error.code 必须进入输出: ${out}`)
   if (!out.includes('require() of ES Module')) throw new Error(`根因 message 必须进入输出: ${out}`)
   if (!out.includes('npm ci --ignore-scripts')) throw new Error(`got 不可用应给重装指引: ${out}`)
-  if (out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`got 不可用不应给 re2 的 rebuild 指引: ${out}`)
+  if (out.includes('npm rebuild re2')) throw new Error(`got 不可用不应给 re2 的 rebuild 指引: ${out}`)
 })
 
 // RT-08：注册套件 test_filter.js 裸 require('fast-check')（devDependency），只探运行时清单时缺它
@@ -240,7 +240,7 @@ test('re2 完全缺失（resolve 失败）→ 归为 missing，提示 npm ci + r
   })
   if (!out.includes('缺少依赖：re2')) throw new Error(`应提示缺少 re2: ${out}`)
   if (!out.includes('npm ci --ignore-scripts')) throw new Error(`应提示 npm ci: ${out}`)
-  if (!out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`缺 re2 时应提示 rebuild: ${out}`)
+  if (!out.includes('npm rebuild re2')) throw new Error(`缺 re2 时应提示 rebuild: ${out}`)
 })
 
 test('re2 可 resolve 但 require 抛错（binding 损坏）→ 归为 broken，提示 rebuild 不提示 npm ci', () => {
@@ -259,7 +259,7 @@ test('re2 可 resolve 但 require 抛错（binding 损坏）→ 归为 broken，
     if (ok !== false) throw new Error(`期望 false，实际 ${ok}`)
   })
   if (!out.includes('依赖已安装但不可用：re2')) throw new Error(`应提示不可用: ${out}`)
-  if (!out.includes('npm run rebuild --prefix node_modules/re2')) throw new Error(`应提示 rebuild: ${out}`)
+  if (!out.includes('npm rebuild re2')) throw new Error(`应提示 rebuild: ${out}`)
   if (out.includes('npm ci --ignore-scripts')) throw new Error(`binding 损坏时不应提示 npm ci: ${out}`)
 })
 
@@ -362,8 +362,10 @@ test('F4 satisfiesNodeRange：repo engines 与 re2 更严的 engines 都按 npm 
     ['24.18.0', '^22.22.2 || ^24.15.0 || >=26.0.0', true],
     ['25.0.0', '^22.22.2 || ^24.15.0 || >=26.0.0', false],
     ['26.0.0', '^22.22.2 || ^24.15.0 || >=26.0.0', true],
-    // 带 prerelease 后缀/前导 v 的运行时版本仍可解析（只取前三段）
-    ['v24.18.0-nightly20250101', '>=22.22.2', true],
+    // 稳定版允许 v 前缀和 build metadata；prerelease 不能冒充稳定运行时
+    ['v24.18.0+build.7', '>=22.22.2', true],
+    ['24.15.0-rc.1', '>=22.22.2', null],
+    ['26.0.0-nightly20261008abcdef', '^22.22.2 || ^24.15.0 || >=26.0.0', null],
     // 复合区间、^/~ 上界、精确匹配
     ['24.18.0', '>=22.22.2 <25', true],
     ['26.0.0', '>=22.22.2 <25', false],
@@ -618,13 +620,18 @@ const A = internalsOf(__dirname)
 // ---- parseVersion / compareVersion ----
 // 杀 parseVersion 的条件表达式（true/false 两侧）、正则锚点（`^`）与三段判定；
 // 杀 compareVersion 的逐段比较与 -1/1 分支（`22.9.0` vs `22.22.2` 必须按数值，不是字典序）。
-test('F4 parseVersion：三段/两段、v 前缀与首尾空白、预发布后缀、非法写法为 null', () => {
+test('F4 parseVersion：只接受完整稳定三段版本与可选 build metadata', () => {
   deepStrictEqual(A.parseVersion('22.22.2'), [22, 22, 2])
   deepStrictEqual(A.parseVersion('v24.15.0'), [24, 15, 0])
+  deepStrictEqual(A.parseVersion('v24.15.0+build.7'), [24, 15, 0])
   deepStrictEqual(A.parseVersion('  22.9.0  '), [22, 9, 0])
-  deepStrictEqual(A.parseVersion('22.22.2-beta.1'), [22, 22, 2])
+  strictEqual(A.parseVersion('22.22.2-beta.1'), null)
   strictEqual(A.parseVersion('22.9'), null)
   strictEqual(A.parseVersion('x22.1.2'), null)
+  strictEqual(A.parseVersion('22.22.2trailing'), null)
+  strictEqual(A.parseVersion('01.2.3'), null)
+  strictEqual(A.parseVersion('22.22.2+build..7'), null)
+  strictEqual(A.parseVersion('9007199254740992.0.0'), null)
   strictEqual(A.parseVersion(''), null)
 })
 
@@ -812,7 +819,12 @@ test('F4 nodeVersionProblems：不满足时的精确 label/required、满足与�
   deepStrictEqual(I.nodeVersionProblems({}, '22.22.2'), [])
   deepStrictEqual(I.nodeVersionProblems(null, '22.22.2'), [])
   deepStrictEqual(I.nodeVersionProblems({ engines: { node: 22 } }, '30.0.0'), [])
-  deepStrictEqual(I.nodeVersionProblems({ engines: { node: '>=26.0.0' } }, 'not-a-node'), [])
+  const invalidRuntime = [{ label: '当前 Node.js 版本', required: '完整稳定的三段版本（不接受预发布版本）' }]
+  for (const version of ['24.15.0-rc.1', '26.0.0-nightly20261008abcdef', '24.15.0trailing', '9007199254740992.0.0', 'not-a-node']) {
+    deepStrictEqual(I.nodeVersionProblems({ engines: { node: '>=20.0.0' } }, version), invalidRuntime,
+      `无效或预发布的当前 Node 版本必须 fail-closed：${version}`)
+  }
+  deepStrictEqual(I.nodeVersionProblems({ engines: { node: '^24.15.0' } }, 'v24.15.0+build.7'), [])
   const out = captureAllOutput(() => {
     deepStrictEqual(I.nodeVersionProblems({ engines: { node: 'garbage' } }, '22.22.2'), [])
   })
@@ -894,7 +906,7 @@ test('F1/F3 checkDependencies：resolve 失败 → missing；仅 re2 缺失才�
     '❌ 缺少依赖：got, re2',
     '请先在项目根目录执行：',
     '  npm ci --ignore-scripts',
-    '  npm run rebuild --prefix node_modules/re2'
+    '  npm rebuild re2'
   ])
   const gotOnly = captureAllOutput(() => {
     strictEqual(checkDependencies({

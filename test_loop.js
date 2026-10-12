@@ -93,7 +93,7 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
     },
     spawnSyncFn: (cmd, args) => {
       commands.push([cmd, args])
-      if (args[0] === 'run' && args[1] === 'rebuild') re2Ready = true
+      if (args[0] === 'rebuild' && args[1] === 're2') re2Ready = true
       return { status: 0 }
     },
     env: { XBK_AUTO_INSTALL_DEPS: '1' },
@@ -101,9 +101,9 @@ const { ensureDependencies } = require('./qinglong/xbk_push')
     // 使断言不依赖跑测试时工作区是否存在锁文件（变异沙箱不复制 package-lock.json）。
     lockExists: () => true
   })
-  assert.strictEqual(commands.length, 2, '缺模块或 ABI 不匹配时，自动恢复应先安装依赖，再构建 re2 原生模块')
+  assert.strictEqual(commands.length, 2, '缺模块或 ABI 不匹配时，自动恢复应先安装依赖，再执行 re2 官方 install 生命周期')
   assert.strictEqual(commands[0][1][0], 'ci', '有 package-lock.json 时恢复必须用冻结安装 npm ci（QX-04）')
-  assert.deepStrictEqual(commands[1][1].slice(0, 3), ['run', 'rebuild', '--prefix'])
+  assert.deepStrictEqual(commands[1][1], ['rebuild', 're2'])
 
   const gotOnlyCommands = []
   let gotReady = false

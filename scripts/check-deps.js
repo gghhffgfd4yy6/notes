@@ -68,8 +68,10 @@ function dependencyFailureReason (error) {
 // 本仓库 engines.node 与 re2 的 engines.node 都是这种写法（re2 为 `^22.22.2 || ^24.15.0 || >=26.0.0`），
 // 故不引入 semver 依赖；看不懂的写法一律返回 null，由调用方降级为告警（不误红）。
 function parseVersion (value) {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(value).trim())
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null
+  const m = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(String(value).trim())
+  if (!m) return null
+  const parts = m.slice(1, 4).map(Number)
+  return parts.every(Number.isSafeInteger) ? parts : null
 }
 
 function compareVersion (a, b) {
@@ -164,8 +166,10 @@ function readNativeEngineRange () {
 
 // 收集所有不满足的 Node 版本要求（repo engines + re2 engines）
 function nodeVersionProblems (pkg, currentVersion) {
+  if (!parseVersion(currentVersion)) {
+    return [{ label: '当前 Node.js 版本', required: '完整稳定的三段版本（不接受预发布版本）' }]
+  }
   const problems = []
-  if (!parseVersion(currentVersion)) return problems
   const checks = [['package.json 的 engines.node', pkg && pkg.engines ? pkg.engines.node : null]]
   const nativeRange = readNativeEngineRange()
   if (nativeRange) checks.push([`${NATIVE_DEP} 的 engines.node`, nativeRange])
@@ -251,7 +255,7 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
     console.error('  npm ci --ignore-scripts')
     // 仅 re2 缺失时才提示重建原生模块；只缺 got 时该目录可能尚未创建，避免误导
     if (missing.includes(NATIVE_DEP)) {
-      console.error(`  npm run rebuild --prefix node_modules/${NATIVE_DEP}`)
+      console.error(`  npm rebuild ${NATIVE_DEP}`)
     }
   }
   if (broken.length > 0) {
@@ -261,7 +265,7 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
     // re2 的修复动作含「切换 Node 版本」（其 engines 比本仓库严，见上方版本闸门），故带上当前版本对照
     if (broken.some(b => b.name === NATIVE_DEP)) {
       console.error(`请重建原生模块或切换 Node 版本（当前 ${process.version}）：`)
-      console.error(`  npm run rebuild --prefix node_modules/${NATIVE_DEP}`)
+      console.error(`  npm rebuild ${NATIVE_DEP}`)
     }
     // 指引按实际不可用的依赖给出：非原生依赖（got）走重装，rebuild re2 对它没有意义。
     if (broken.some(b => b.name !== NATIVE_DEP)) {
