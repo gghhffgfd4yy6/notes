@@ -294,11 +294,15 @@ const {
   {
     const statusDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'xbk-status-override-'))
     try {
+      const report = { date: '2041-09-23', runs: 37, pushed: 41 }
+      fs.writeFileSync(path.join(statusDir, 'report.state'), JSON.stringify(report))
       const r = spawnSync(process.execPath, [path.join(__dirname, 'qinglong', 'xbk_push.js'), '--status'], {
         cwd: __dirname, encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: statusDir }
       })
       assert.strictEqual(r.status, 0, `绝对覆盖下 --status 应成功，实际 status=${r.status} stderr=${r.stderr}`)
       assert.ok(String(r.stdout).includes(`缓存目录：${statusDir}（使用 XBK_CACHE_DIR）`), `--status 必须显示被采纳的绝对路径，实际 stdout=${r.stdout}`)
+      assert.ok(String(r.stdout).includes('日报：正常 | 2041-09-23 | 37 轮 | 推送成功：41 条'),
+        `--status 必须从 XBK_CACHE_DIR 读取 report.state，而不只是打印覆盖路径，实际 stdout=${r.stdout}`)
     } finally { fs.rmSync(statusDir, { recursive: true, force: true }) }
   }
 

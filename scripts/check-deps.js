@@ -68,8 +68,10 @@ function dependencyFailureReason (error) {
 // 本仓库 engines.node 与 re2 的 engines.node 都是这种写法（re2 为 `^22.22.2 || ^24.15.0 || >=26.0.0`），
 // 故不引入 semver 依赖；看不懂的写法一律返回 null，由调用方降级为告警（不误红）。
 function parseVersion (value) {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(value).trim())
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null
+  const m = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(String(value).trim())
+  if (!m) return null
+  const parts = m.slice(1, 4).map(Number)
+  return parts.every(Number.isSafeInteger) ? parts : null
 }
 
 function compareVersion (a, b) {
@@ -164,8 +166,10 @@ function readNativeEngineRange () {
 
 // 收集所有不满足的 Node 版本要求（repo engines + re2 engines）
 function nodeVersionProblems (pkg, currentVersion) {
+  if (!parseVersion(currentVersion)) {
+    return [{ label: '当前 Node.js 版本', required: '完整稳定的三段版本（不接受预发布版本）' }]
+  }
   const problems = []
-  if (!parseVersion(currentVersion)) return problems
   const checks = [['package.json 的 engines.node', pkg && pkg.engines ? pkg.engines.node : null]]
   const nativeRange = readNativeEngineRange()
   if (nativeRange) checks.push([`${NATIVE_DEP} 的 engines.node`, nativeRange])
