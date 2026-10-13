@@ -143,6 +143,9 @@ filter: {
 | `XBK_INTERVAL_MS` | 抓取间隔，单位为毫秒，默认 `10000` |
 | `XBK_DRY_RUN=1` | 对常驻和单轮入口都生效：不发送通知、不写入成功缓存；常驻入口持续运行，`npm start` 只执行一轮 |
 | `XBK_CACHE_DIR` | `--status` 使用的状态目录，必须是绝对路径 |
+| `XBK_CONSOLE_TOKEN` | 网页控制台访问令牌（≥16 字符；未设置则控制台拒绝启动） |
+| `XBK_CONSOLE_PORT` | 网页控制台端口，默认 `7777` |
+| `XBK_CONSOLE_HOST` | 网页控制台绑定地址，默认 `127.0.0.1` |
 | `XBK_AUTO_INSTALL_DEPS=1` | 应急选项：青龙常驻入口运行时联网安装和构建缺失依赖；默认关闭，优先在部署阶段完成依赖初始化 |
 | `PUSH_PLUS_TOKEN` | PushPlus Token，可代替本地配置 |
 | `PUSH_KEY` | Server酱 Key，可代替本地配置 |
@@ -160,9 +163,24 @@ node qinglong/xbk_push.js --status # 查看状态
 node qinglong/xbk_push.js --dry-run # 试运行
 npm run lint                      # 检查代码格式
 npm test                          # 运行测试
+npm run console                   # 启动网页控制台（需先设置 XBK_CONSOLE_TOKEN）
 ```
 
 青龙入口目前只支持 `--check`、`--status` 和 `--dry-run`。其他参数会被忽略并发出警告；不要把 `--help` 或拼写错误的参数当作安全检查命令。
+
+## 网页控制台
+
+在浏览器里查看运行状态、手动触发一轮抓取（可选试运行），适合不想敲命令的场景：
+
+```bash
+XBK_CONSOLE_TOKEN=请换成至少16位的随机字符串 npm run console
+```
+
+- 默认地址 `http://127.0.0.1:7777`，请求需带请求头 `Authorization: Bearer <XBK_CONSOLE_TOKEN>`；token 未设置或短于 16 字符时服务直接拒绝启动。
+- 「试运行」抓取但不推送、不写去重记录（等价 `--dry-run`）；「正式运行一轮」会**真实推送通知**。同一时刻只允许一个触发任务，重复触发返回 409。
+- 只读部分与 `--status` 同源：日报计数、最近一轮、通道健康、过滤诊断。
+- 触发历史仅保存在控制台进程内存（最多 20 条，重启即空）；持久记录仍以缓存目录的状态文件与 `run.log` 为准。
+- 相关变量：`XBK_CONSOLE_PORT`（默认 `7777`）、`XBK_CONSOLE_HOST`（默认 `127.0.0.1`，对外暴露需显式修改并自行做好访问控制）。
 
 ## 常见问题
 
