@@ -206,7 +206,9 @@ function RunsPanel ({ runs, pollMs }) {
         if (!dead) setDetailErr(`加载失败：${e.message}`)
       }
     }
-    fetchOnce()
+    // S9383：fetchOnce 内部已 try/catch 全收（不会 reject），但仍显式 .catch 兜底，
+    // 不留 floating promise（与 console.js 里 readBody 的处理同口径）。
+    fetchOnce().catch(() => { /* 不可达：fetchOnce 不 reject */ })
     const t = setInterval(fetchOnce, pollMs)
     return () => { dead = true; clearInterval(t) }
   }, [openId, pollMs])
