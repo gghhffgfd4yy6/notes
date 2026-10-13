@@ -1,6 +1,8 @@
 node_modules
 xianbaoku_cache*
 push_config.local.js
+# 控制台 token（本机部署产物，绝不入库）
+.console.env
 .git.corrupt_backup
 .tools
 .stryker-tmp

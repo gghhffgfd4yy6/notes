@@ -271,3 +271,13 @@
 - 端点：`GET /`（看板页，15s 自动刷新）、`GET /api/status`（状态 JSON）、`POST /trigger`（触发，202/409/400）、`GET /api/runs`（触发历史）、`GET /api/runs/:id`（详情含输出）。触发历史仅进程内存（最多 20 条，重启即空），持久记录仍以缓存目录状态文件与 `run.log` 为准。
 - 测试：新套件 `test_console.js`（19 断言，注册为普通单元套件——不标 integration/mutationSkip）锁死：token 校验与 fail-closed、锁语义（损坏锁保守、陈旧接管、幂等释放）、动作解析、HTML 转义、HTTP 端到端（401/看板降级渲染/202/409/锁生命周期/404）。`console.js` 列入变异矩阵（新段 `console`，TAP 档）与 `stryker.config.js` mutate 清单，`EXPECTED_SEGMENTS`、`productionFiles` 同步 +1，矩阵 19→20 段。
 - 配置：`XBK_CONSOLE_PORT`（默认 7777）、`XBK_CONSOLE_HOST`（默认 127.0.0.1）、`XBK_CONSOLE_TOKEN`（必填，≥16 字符）；缓存目录沿用 `XBK_CACHE_DIR` 绝对路径语义（与 `--status` 同口径）。
+
+## v3.285
+
+- **控制台前端现代化**：看板从服务端拼接 HTML + meta refresh 整页刷新，改为 **SPA 壳 + 静态资产**（`scripts/console-assets/`：`app.js` / `app.css` / `htm-preact.module.js`）。深色卡片风 UI：今日日报 / 最近一轮 / 推送通道三张状态卡、徽章式状态（正常/异常/运行中）、按钮触发带 loading 与 409 文案、触发历史表格展开日志面板；5 秒自动轮询（触发后加密到 2 秒），不再整页刷新；手机窄屏自适应。
+- **零新 npm 依赖不变**：前端运行时是 preact 10.24.3 + hooks + htm 3.1.1 的 standalone 内联单文件（13 KB，无外部 import），从 npmmirror 文件直链下载后入库（`scripts/console-assets/htm-preact.module.js`），不用 CDN、离线可用、无构建步骤。`package.json` dependencies 不变（仍只有 got）。
+- **安全面收口**：页面带 CSP（`default-src 'none'; script-src 'self'; connect-src 'self'`）；token 经 `<script type="application/json" id="xbk-boot">` JSON 岛注入（文本内容转义 `&`/`<` 防 `</script>` 逃逸），前端读取后立即删除节点；静态资产仅白名单精确映射（`/assets/app.css`、`/assets/app.js`、`/assets/htm-preact.module.js`），无用户输入拼接路径（路径穿越形态 404，测试锁定）；`?token=` 鉴权语义不变（API/资产同走 authorize）。
+- **无脚本降级**：`<noscript>` 保留状态文本与动作说明（核心信息不丢）；`formatStatus` 仍是唯一状态口径。
+- 端点变化：`GET /`（SPA 壳）、`GET /assets/*`（白名单静态资产，no-cache + ETag）；`/api/status`、`POST /trigger`、`/api/runs`、`/api/runs/:id` 语义不变（前端 fetch 同源调用）。
+- 测试：`test_console.js` 19→**26 断言**：renderPage 断言改 JSON 岛/CSP/资产引用（不再 meta refresh）；新增 `/assets/*` 白名单与路径穿越 404、看板 SPA 壳端到端。
+- 版本 bump 至 3.285.0（四处同步）。

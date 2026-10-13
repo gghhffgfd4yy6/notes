@@ -248,6 +248,33 @@ function releaseLockFor (record) {
   }
 }
 
+// ── 静态资产（前端现代化 v3.285）────────────────────────────────────────────
+// 前端是零依赖 preact+htm standalone（scripts/console-assets/，无构建、无 CDN）。
+// 仅伺服白名单内的静态文件：路径映射写死，不存在用户输入拼接（无路径穿越面）。
+const ASSETS_DIR = path.join(__dirname, 'console-assets')
+const STATIC_ASSETS = Object.freeze({
+  '/assets/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
+  '/assets/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+  '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' }
+})
+
+function serveStatic (res, spec) {
+  let body
+  try {
+    body = fs.readFileSync(path.join(ASSETS_DIR, spec.file))
+  } catch (e) {
+    sendJson(res, 500, { error: '控制台前端资产缺失（仓库不完整？）' })
+    return
+  }
+  res.writeHead(200, {
+    'Content-Type': spec.type,
+    // 资产更新随部署走：浏览器缓存但每次部署后 ETag 变化即失效。
+    'Cache-Control': 'no-cache',
+    ETag: `"${crypto.createHash('sha256').update(body).digest('hex').slice(0, 16)}"`
+  })
+  res.end(body)
+}
+
 // ── HTML 看板 ──────────────────────────────────────────────────────────────
 function escapeHtml (s) {
   return String(s === undefined || s === null ? '' : s)
@@ -265,36 +292,35 @@ function formatMs (ms) {
 function renderPage (state, runsList, query) {
   const statusText = formatStatus(state)
   const statusLines = statusText.split('\n').map(escapeHtml)
-  // 浏览器流（Sourcery High）：原生表单/meta refresh 带不了请求头，token 经查询参数传递。
-  // 仅在本请求本身通过鉴权后才回显（token 已验证合法，原样传递；不新增任何存储）。
+  // 浏览器流（Sourcery High）：fetch/ESM 也带不了页内凭证之外的上下文，token 经
+  // 查询参数进入页面后由 JSON 岛交给前端 fetch。仅在本请求本身通过鉴权后才回显
+  // （token 已验证合法，原样传递；不新增任何存储）。
+  // 兼容语义：<noscript> 环境保留纯 HTML 降级（状态文本 + 提示），核心信息不丢。
   const tokenSuffix = (query instanceof URLSearchParams && query.get('token'))
     ? `?token=${encodeURIComponent(query.get('token'))}`
     : ''
-  const runRows = runsList.map((r) => {
-    const state = r.exitCode === null
-      ? (r.timedOut ? '超时终止' : '运行中')
-      : (r.exitCode === 0 ? '✅ 成功' : `❌ 退出码 ${r.exitCode}`)
-    return `<tr><td>#${r.id}</td><td>${escapeHtml(r.label)}</td><td>${escapeHtml(new Date(r.startedAt).toISOString())}</td><td>${state}</td></tr>`
-  }).join('')
-  const buttons = Object.entries(ACTIONS).map(([key, a]) =>
-    `<form method="POST" action="/trigger${escapeHtml(tokenSuffix)}" style="display:inline"><input type="hidden" name="action" value="${key}"><button type="submit">${escapeHtml(a.label)}</button></form>`).join(' ')
+  const token = (query instanceof URLSearchParams && query.get('token')) ? query.get('token') : ''
+  // JSON 岛（<script type="application/json"> 的文本内容）：只需转义 & 与 <，
+  // 防 </script> 逃逸与字符引用歧义；引号在 script 文本里无特殊含义，escapeHtml
+  // 的 &quot; 反而破坏 JSON 字面量，前端 JSON.parse 会失败。token 本身是服务端
+  // 已验证的查询参数原值，转义后写入、浏览器解析 JSON 时还原。
+  const bootJson = JSON.stringify({ token }).replace(/&/g, '&amp;').replace(/</g, '&lt;')
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
-<meta http-equiv="refresh" content="15${escapeHtml(tokenSuffix)}">
-<style>
-body{font-family:system-ui,sans-serif;margin:2rem;max-width:60rem;background:#fafafa;color:#222}
-pre{background:#fff;border:1px solid #ddd;padding:1rem;white-space:pre-wrap;word-break:break-all}
-button{padding:0.5rem 1rem;margin-right:0.5rem;cursor:pointer}
-table{border-collapse:collapse;width:100%;background:#fff}
-td,th{border:1px solid #ddd;padding:0.4rem 0.6rem;text-align:left;font-size:0.9rem}
-.warn{color:#b45309}
-</style></head><body>
-<h1>xbk-push 控制台</h1>
-<section><h2>运行状态</h2><pre>${statusLines.join('\n')}</pre></section>
-<section><h2>手动触发</h2><p>${buttons}</p>
-<p class="warn">⚠️ 「正式运行一轮」会真实推送通知；「试运行」抓取但不推送。同一时刻只能有一个触发任务。</p></section>
-<section><h2>最近触发（最多 20 条，本进程内存）</h2>
-<table><tr><th>#</th><th>动作</th><th>开始时间(UTC)</th><th>结果</th></tr>${runRows || '<tr><td colspan="4">暂无</td></tr>'}</table></section>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:">
+<link rel="stylesheet" href="/assets/app.css${escapeHtml(tokenSuffix)}">
+<link rel="modulepreload" href="/assets/htm-preact.module.js${escapeHtml(tokenSuffix)}">
+</head><body>
+<div id="app"><noscript>
+<section style="max-width:60rem;margin:2rem auto;font-family:system-ui,sans-serif">
+<h2>xbk-push 控制台（无脚本降级）</h2>
+<pre>${statusLines.join('\n')}</pre>
+<p>前端需要启用 JavaScript 才能使用触发与实时刷新。可用动作：试运行（抓取但不推送）、正式运行一轮（真实推送）、环境检查（不抓取不推送）。</p>
+</section>
+</noscript></div>
+<script type="application/json" id="xbk-boot">${bootJson}</script>
+<script type="module" src="/assets/app.js${escapeHtml(tokenSuffix)}"></script>
 </body></html>`
 }
 
@@ -377,6 +403,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(renderPage(state, runsList, url.searchParams))
+      return
+    }
+    // 静态资产：白名单映射（上面 STATIC_ASSETS），查不到即 404；先过鉴权（已在上方统一拦截）。
+    if (req.method === 'GET' && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
+      serveStatic(res, STATIC_ASSETS[url.pathname])
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/status') {

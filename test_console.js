@@ -152,17 +152,23 @@ ok('authorize: Bearer 前缀匹配 + ?token= 查询参数（浏览器路径）',
   assert.strictEqual(authorize(mkReq({ authorization: 'Bearer wrong' }), TOKEN2, new URLSearchParams(`token=${TOKEN2}`)), true)
 })
 
-ok('renderPage: token 回显进表单 action 与 meta refresh；无 token 时不回显', () => {
+ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与 CSP 引用', () => {
   const { readStatus } = require('./scripts/status')
   const TOKEN2 = 'q'.repeat(32)
   const dir = tmpDir()
   const state = readStatus(dir) // 空目录 → 全部件「缺失」，formatStatus 合法渲染
   const withToken = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`))
-  assert.ok(withToken.includes(`/trigger?token=${TOKEN2}`), '表单带 token')
-  assert.ok(withToken.includes(`content="15?token=${TOKEN2}"`), 'meta refresh 带 token')
+  // JSON 岛注入（v3.285：SPA 壳；fetch 由前端发起，不再有原生表单/meta refresh）
+  assert.ok(withToken.includes(`"token":"${TOKEN2}"`), 'JSON 岛带 token')
+  assert.ok(withToken.includes('id="xbk-boot"'), 'JSON 岛节点存在')
+  assert.ok(withToken.includes('/assets/app.js'), '引用前端 ESM')
+  assert.ok(withToken.includes('/assets/app.css'), '引用样式')
+  assert.ok(withToken.includes('Content-Security-Policy'), '带 CSP')
+  assert.ok(!withToken.includes('http-equiv="refresh"'), '不再 meta refresh 整页刷新')
   const noToken = renderPage(state, [], null)
-  assert.ok(!noToken.includes('/trigger?token='), '无 token 时不回显')
-  assert.ok(noToken.includes('缺失'), '空缓存目录渲染「缺失」分支')
+  assert.ok(noToken.includes('"token":""'), '无 token 时 JSON 岛为空串（前端触发会 401，符合 fail-closed）')
+  assert.ok(!noToken.includes(`"token":"${TOKEN2}"`), '无 token 时不回显')
+  assert.ok(noToken.includes('缺失'), '空缓存目录渲染「缺失」分支（noscript 降级）')
 })
 
 ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）', () => {
@@ -199,7 +205,7 @@ async function main () {
     assert.strictEqual(badAuth.status, 401)
     server.close()
   })
-  await aok('HTTP: 看板页含状态内容与触发按钮（缓存目录缺文件时降级展示）', async () => {
+  await aok('HTTP: 看板页为 SPA 壳（JSON 岛 + 资产引用 + noscript 降级）', async () => {
     const dir = tmpDir()
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
     const port = await listen(server)
@@ -207,13 +213,34 @@ async function main () {
     assert.strictEqual(res.status, 200)
     assert.match(res.headers['content-type'], /text\/html/)
     assert.ok(res.text.includes('xbk-push 控制台'))
-    assert.ok(res.text.includes('运行状态'))
-    assert.ok(res.text.includes('试运行'))
+    assert.ok(res.text.includes('id="app"'), 'SPA 挂载点')
+    assert.ok(res.text.includes('id="xbk-boot"'), 'JSON 岛')
+    assert.ok(res.text.includes('/assets/app.js'), '前端 ESM 引用')
+    assert.ok(res.text.includes('试运行'), 'noscript 降级文案（触发动作说明）')
     assert.ok(res.text.includes('环境检查'))
     assert.ok(res.text.includes('正式运行一轮'))
     // Sourcery #37：缺文件夹具必须断言「缺失」分支文案，不许「正常」蒙混——
     // 两种文案都接受的断言抓不住缺失降级走错分支的回归。
     assert.ok(res.text.includes('缺失'), `空缓存目录必须渲染「缺失」分支，实际片段：${res.text.slice(0, 400)}`)
+    server.close()
+  })
+  await aok('HTTP: /assets/* 白名单资产伺服；路径穿越与未知资产 404', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const css = await request(port, 'GET', '/assets/app.css', { token: TOKEN })
+    assert.strictEqual(css.status, 200)
+    assert.match(css.headers['content-type'], /text\/css/)
+    assert.ok(css.text.includes('--bg'), 'CSS 内容真实（自定义属性存在）')
+    const js = await request(port, 'GET', '/assets/app.js', { token: TOKEN })
+    assert.strictEqual(js.status, 200)
+    assert.match(js.headers['content-type'], /text\/javascript/)
+    const lib = await request(port, 'GET', '/assets/htm-preact.module.js', { token: TOKEN })
+    assert.strictEqual(lib.status, 200)
+    assert.ok(lib.text.length > 10000, '运行时文件非空壳')
+    const nope = await request(port, 'GET', '/assets/nope.js', { token: TOKEN })
+    assert.strictEqual(nope.status, 404, '白名单外 404')
+    const traversal = await request(port, 'GET', '/assets/..%2F..%2Fconsole.js', { token: TOKEN })
+    assert.strictEqual(traversal.status, 404, '路径穿越形态 404（白名单精确匹配，不解码拼接）')
     server.close()
   })
   await aok('HTTP: ?token= 查询参数放行（浏览器流：看板、API、表单触发）', async () => {
@@ -223,7 +250,7 @@ async function main () {
     // 无请求头、仅查询参数 → 200（普通浏览器打开 URL 的形态）
     const page = await request(port, 'GET', `/?token=${TOKEN}`)
     assert.strictEqual(page.status, 200, '浏览器打开带 token URL 必须放行')
-    assert.ok(page.text.includes(`/trigger?token=${TOKEN}`), '返回页里的表单/refresh 要继续携带 token')
+    assert.ok(page.text.includes(`"token":"${TOKEN}"`), '返回页 JSON 岛要继续携带 token')
     const api = await request(port, 'GET', `/api/status?token=${TOKEN}`)
     assert.strictEqual(api.status, 200, '查询参数对 JSON API 同样放行')
     const noTok = await request(port, 'GET', '/')
