@@ -194,13 +194,17 @@ td,th{border:1px solid #ddd;padding:0.4rem 0.6rem;text-align:left;font-size:0.9r
 }
 
 // ── HTTP 服务 ──────────────────────────────────────────────────────────────
-// 鉴权：Authorization: Bearer <token>（读取与触发同 token）。不设 cookie/session——
+// 鉴权：Authorization: Bearer <token>。不设 cookie/session——
 // 单用户自用工具，恒定 token 已足够；timingSafeEqual 防时序侧信道。
+// 解析不用正则（CodeQL js/polynomial-redos：`Bearer ` + 大量空白会让 `\s+(.+)$` 回溯）：
+// 手写前缀匹配 + 切片，线性且语义等价（`Bearer ` 后取剩余全部，trim 一次容忍尾随空白）。
+const BEARER_PREFIX = 'Bearer '
 function authorize (req, token) {
   const header = req.headers.authorization || ''
-  const m = /^Bearer\s+(.+)$/.exec(header)
-  if (!m) return false
-  return timingSafeEqualStr(m[1], token)
+  if (typeof header !== 'string' || !header.startsWith(BEARER_PREFIX)) return false
+  const value = header.slice(BEARER_PREFIX.length)
+  if (value.length === 0) return false
+  return timingSafeEqualStr(value.trim(), token)
 }
 
 function sendJson (res, code, obj) {

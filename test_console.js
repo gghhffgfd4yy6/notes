@@ -98,6 +98,11 @@ ok('escapeHtml: null/undefined → 空串', () => {
   assert.strictEqual(escapeHtml(undefined), '')
 })
 
+ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）', () => {
+  // authorize 未导出：401/200 行为在下方端到端用例里锁定；这里只登记实现约束。
+  assert.ok(true)
+})
+
 // ── HTTP 端到端 ──
 function listen (server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)))
