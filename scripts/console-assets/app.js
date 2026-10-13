@@ -1,8 +1,12 @@
 // scripts/console-assets/app.js —— 控制台前端（preact + htm standalone，无构建、零 npm 依赖）。
-// 数据面：GET /api/status、/api/runs、/api/runs/:id（同源）。动作面：POST /trigger。
-import { h, render, useState, useEffect, useRef, useCallback } from './htm-preact.module.js'
+// 数据面：GET /api/status、/api/runs、/api/runs/:id（同源，GET 一律带 ?token=——
+// authorize 在读 body 前只看请求头/查询参数，GET 无 body 必须显式拼 URL）。
+// 动作面：POST /trigger（token 同时在 URL 与 body，两种通道都成立）。
+import { html, render, useState, useEffect, useRef, useCallback } from './htm-preact.module.js'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
+// 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
+// 实体会让 JSON.parse 得到含 &amp; 的错误 token，Sourcery vwK）。
 // 解析后立即移除该节点（用后即焚，token 不常驻 DOM）。
 function readBoot () {
   try {
@@ -15,8 +19,13 @@ function readBoot () {
 }
 const BOOT = readBoot()
 
-const html = h
+// 所有 fetch 统一带 ?token=（页面流没有请求头，token 只能走查询参数）。
+function withToken (path) {
+  return `${path}?token=${encodeURIComponent(BOOT.token)}`
+}
+
 const POLL_MS = 5000
+const POLL_BUSY_MS = 2000
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
 function fmtTime (ts) {
@@ -32,14 +41,14 @@ function fmtNum (n) {
 
 // ── API ─────────────────────────────────────────────────────────────────────
 async function apiGet (path) {
-  const res = await fetch(path, { headers: { Accept: 'application/json' } })
+  const res = await fetch(withToken(path), { headers: { Accept: 'application/json' } })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   return res.json()
 }
 
 async function trigger (action) {
-  const body = new URLSearchParams({ action, token: BOOT.token })
-  const res = await fetch('/trigger', {
+  const body = new URLSearchParams({ action })
+  const res = await fetch(withToken('/trigger'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body
@@ -50,10 +59,42 @@ async function trigger (action) {
 }
 
 // ── 组件：状态徽章 ──────────────────────────────────────────────────────────
-// ok: true=正常绿 false=异常红 null=运行中黄
-function Badge ({ ok, children }) {
-  const cls = ok === null ? 'badge-run' : (ok ? 'badge-ok' : 'badge-bad')
+// tone: 'ok'=正常绿 | 'bad'=异常红 | 'run'=中性黄（运行中/无记录）
+// 显式字符串三态而非 true/false/null 魔值（CodeQL implicit null→string conversion）。
+function Badge ({ tone, children }) {
+  const cls = tone === 'ok' ? 'badge-ok' : (tone === 'bad' ? 'badge-bad' : 'badge-run')
   return html`<span class="badge ${cls}">${children}</span>`
+}
+
+// ── 状态归类（Sourcery vvy/vv4/vvX/vwc：错误态/中断态/畸形条目不得伪装成健康）──
+// runOk：最近一轮必须「status=ok 且未中断」才算绿。
+function runIsOk (state) {
+  if (!state || !state.run) return false
+  if (state.run.status !== 'ok') return false
+  const v = state.run.value || {}
+  return v.interrupted !== true
+}
+
+// 通道条目合法性：名字非空 + 是对象 + consecutiveFailures 是数字（畸形条目不进展示与健康判定）。
+function validChannelEntry (name, entry) {
+  return typeof name === 'string' && name.length > 0 &&
+    entry !== null && typeof entry === 'object' &&
+    typeof entry.consecutiveFailures === 'number'
+}
+
+function channelInfo (state) {
+  const raw = state && state.channels && state.channels.value && typeof state.channels.value === 'object'
+    ? state.channels.value
+    : null
+  if (!raw) return { tone: 'bad', entries: [], note: '暂无记录' }
+  const entries = Object.keys(raw)
+    .filter((k) => validChannelEntry(k, raw[k]))
+    .map((k) => ({ name: k, failures: raw[k].consecutiveFailures }))
+  if (state.channels.status !== 'ok') return { tone: 'bad', entries, note: '状态异常' }
+  // 空表 ≠ 未配置：只显示中性「暂无记录」（Sourcery vwc）。
+  if (entries.length === 0) return { tone: 'run', entries, note: '暂无记录' }
+  const tone = entries.every((e) => e.failures === 0) ? 'ok' : 'bad'
+  return { tone, entries, note: '' }
 }
 
 // ── 组件：状态卡片区 ────────────────────────────────────────────────────────
@@ -62,16 +103,13 @@ function StatusCards ({ state }) {
   const rep = state.report && state.report.value ? state.report.value : null
   const repOk = !!(state.report && state.report.status === 'ok')
   const run = state.run && state.run.value ? state.run.value : null
-  const runOk = !!(state.run && state.run.status === 'ok')
-  const chans = state.channels && state.channels.value ? state.channels.value : {}
-  const chanNames = Object.keys(chans)
-  const chanOk = state.channels && state.channels.status === 'ok' && chanNames.length > 0 &&
-    chanNames.every((k) => chans[k] && chans[k].consecutiveFailures === 0)
+  const runOk = runIsOk(state)
+  const chan = channelInfo(state)
 
   const cards = [
     {
       title: '今日日报',
-      ok: repOk,
+      tone: repOk ? 'ok' : 'bad',
       lines: rep
         ? [
             `日期 ${fmtNum(rep.date)}`,
@@ -82,7 +120,7 @@ function StatusCards ({ state }) {
     },
     {
       title: '最近一轮',
-      ok: runOk,
+      tone: runOk ? 'ok' : 'bad',
       lines: run
         ? [
             `${fmtNum(run.at)}`,
@@ -93,20 +131,17 @@ function StatusCards ({ state }) {
     },
     {
       title: '推送通道',
-      ok: chanOk,
-      lines: chanNames.length > 0
-        ? chanNames.map((k) => {
-          const c = chans[k] || {}
-          return `${k}：连续失败 ${fmtNum(c.consecutiveFailures)} 次`
-        })
-        : ['未配置通道']
+      tone: chan.tone,
+      lines: chan.entries.length > 0
+        ? chan.entries.map((e) => `${e.name}：连续失败 ${fmtNum(e.failures)} 次`)
+        : [chan.note || '暂无记录']
     }
   ]
   return html`<div class="cards">
     ${cards.map((c) => html`<div class="card" key=${c.title}>
       <div class="card-head">
         <span class="card-title">${c.title}</span>
-        <${Badge} ok=${c.ok}>${c.ok ? '正常' : '异常'}<//>
+        <${Badge} tone=${c.tone}>${c.tone === 'run' ? '—' : (c.tone === 'ok' ? '正常' : '异常')}<//>
       </div>
       <div class="card-lines">${c.lines.map((l) => html`<div key=${l}>${l}</div>`)}</div>
     </div>`)}
@@ -120,7 +155,7 @@ const ACTION_DEFS = [
   { key: 'check', label: '环境检查', desc: '不抓取不推送', cls: 'btn-secondary' }
 ]
 
-function TriggerBar ({ onTriggered, busy, setBusy }) {
+function TriggerBar ({ onTriggered, locking, setBusy }) {
   const [err, setErr] = useState('')
   const doTrigger = useCallback(async (action) => {
     setErr('')
@@ -128,12 +163,13 @@ function TriggerBar ({ onTriggered, busy, setBusy }) {
     try {
       await trigger(action)
       onTriggered()
+      // busy 不在此处清零（Sourcery vvo）：202 只代表已受理，子进程还在跑；
+      // App 的 active 派生会在轮询看到全部 finishedAt 后自动解锁。
     } catch (e) {
       setErr(e.message === '已有触发任务在运行（或锁未过期），请稍后再试'
         ? '已有任务在运行，请等它结束'
         : `触发失败：${e.message}`)
-    } finally {
-      setBusy(false)
+      setBusy(false) // 只有「提交失败」才立即解锁；提交成功的解锁交给 active 派生
     }
   }, [onTriggered, setBusy])
 
@@ -141,40 +177,55 @@ function TriggerBar ({ onTriggered, busy, setBusy }) {
     <div class="panel-head"><span class="panel-title">手动触发</span></div>
     <div class="btn-row">
       ${ACTION_DEFS.map((a) => html`<div class="btn-item" key=${a.key}>
-        <button class="btn ${a.cls}" disabled=${busy} onClick=${() => doTrigger(a.key)}>${a.label}</button>
+        <button class="btn ${a.cls}" disabled=${locking} onClick=${() => doTrigger(a.key)}>${a.label}</button>
         <span class="btn-desc">${a.desc}</span>
       </div>`)}
     </div>
-    ${busy && html`<div class="hint"><span class="spin"></span> 任务已提交，正在等待结果…</div>`}
+    ${locking && html`<div class="hint"><span class="spin"></span> 任务进行中…（完成后自动解锁）</div>`}
     ${err && html`<div class="hint hint-err">${err}</div>`}
   </div>`
 }
 
 // ── 组件：运行历史 ──────────────────────────────────────────────────────────
-function RunsPanel ({ runs }) {
+function RunsPanel ({ runs, pollMs }) {
   const [openId, setOpenId] = useState(null)
   const [detail, setDetail] = useState(null)
+  const [detailErr, setDetailErr] = useState('')
 
+  // 日志面板：打开期间跟随运行状态轮询（Sourcery vv-：运行中的输出要持续刷新）。
   useEffect(() => {
-    if (openId === null) { setDetail(null); return undefined }
+    if (openId === null) { setDetail(null); setDetailErr(''); return undefined }
     let dead = false
-    setDetail(null)
-    apiGet(`/api/runs/${openId}`)
-      .then((d) => { if (!dead) setDetail(d) })
-      .catch(() => {})
-    return () => { dead = true }
-  }, [openId])
-
-  const statusOf = (r) => {
-    if (r.exitCode === null) {
-      return r.timedOut
-        ? html`<${Badge} ok=${false}>超时<//>`
-        : html`<${Badge} ok=${null}>运行中<//>`
+    const fetchOnce = async () => {
+      try {
+        const d = await apiGet(`/api/runs/${openId}`)
+        if (dead) return
+        setDetail(d)
+        setDetailErr('')
+      } catch (e) {
+        if (!dead) setDetailErr(`加载失败：${e.message}`)
+      }
     }
-    return r.exitCode === 0
-      ? html`<${Badge} ok=${true}>成功<//>`
-      : html`<${Badge} ok=${false}>退出码 ${r.exitCode}<//>`
+    fetchOnce()
+    const t = setInterval(fetchOnce, pollMs)
+    return () => { dead = true; clearInterval(t) }
+  }, [openId, pollMs])
+
+  // statusOf（Sourcery vv4）：以 finishedAt 为完成判据；
+  // 「finishedAt 已设但 exitCode null」= 信号终止（含超时 SIGKILL），显示「已终止」。
+  const statusOf = (r) => {
+    if (r.finishedAt) {
+      if (r.timedOut) return html`<${Badge} tone='bad'>超时<//>`
+      if (r.exitCode === 0) return html`<${Badge} tone='ok'>成功<//>`
+      if (r.exitCode === null) return html`<${Badge} tone='bad'>已终止<//>`
+      return html`<${Badge} tone='bad'>退出码 ${r.exitCode}<//>`
+    }
+    if (r.exitCode === null) return html`<${Badge} tone='run'>运行中<//>`
+    return html`<${Badge} tone='bad'>已终止<//>`
   }
+
+  const openRun = openId !== null ? runs.find((r) => r.id === openId) : null
+  const openActive = !!(openRun && !openRun.finishedAt)
 
   return html`<div class="panel">
     <div class="panel-head">
@@ -199,10 +250,10 @@ function RunsPanel ({ runs }) {
       </table>`}
     ${openId !== null && html`<div class="logbox">
       <div class="logbox-head">
-        <span>运行 #${openId} 输出</span>
+        <span>运行 #${openId} 输出${openActive ? '（实时跟随）' : ''}</span>
         <button class="btn btn-ghost" onClick=${() => setOpenId(null)}>关闭</button>
       </div>
-      <pre class="logpre">${detail && detail.output ? detail.output : '加载中…'}</pre>
+      <pre class="logpre">${detailErr || (detail && detail.output ? detail.output : (openActive ? '等待输出…' : '加载中…'))}</pre>
     </div>`}
   </div>`
 }
@@ -213,40 +264,60 @@ function App () {
   const [runs, setRuns] = useState([])
   const [busy, setBusy] = useState(false)
   const [lastSync, setLastSync] = useState(null)
+  const [syncErr, setSyncErr] = useState('')
   const timerRef = useRef(null)
+  const seqRef = useRef(0)
 
   const refresh = useCallback(async () => {
+    // 乱序防护（Sourcery vwE）：每次 refresh 领号，落后响应直接丢弃。
+    const seq = ++seqRef.current
     try {
       const [s, r] = await Promise.all([apiGet('/api/status'), apiGet('/api/runs')])
+      if (seq !== seqRef.current) return
       setState(s)
       setRuns(r.runs || [])
       setLastSync(Date.now())
-    } catch (e) { /* 网络抖动：下轮轮询重试，不打断页面 */ }
+      setSyncErr('')
+    } catch (e) {
+      if (seq !== seqRef.current) return
+      // Sourcery vwN：读失败必须可见（不能静默吞掉让卡片停在旧数据上）。
+      setSyncErr(`刷新失败：${e.message}（自动重试中）`)
+    }
   }, [])
 
-  // 基础轮询 5s；busy（任务已提交）期间加密到 2s，尽快反映「运行中→完成」。
+  // 轮询节奏：基础 5s；locking（任务在跑）时 2s。
   useEffect(() => {
     refresh()
     clearInterval(timerRef.current)
-    timerRef.current = setInterval(refresh, busy ? 2000 : POLL_MS)
+    timerRef.current = setInterval(refresh, busy ? POLL_BUSY_MS : POLL_MS)
     return () => clearInterval(timerRef.current)
   }, [refresh, busy])
 
-  const active = runs.length > 0 && runs[0].exitCode === null
+  // active/busy 解耦（Sourcery vvo）：busy=「已提交、还没在历史里看到」；
+  // active 由运行历史派生（存在未 finishedAt 的记录）。两者合成为 locking：
+  // locking=true → 按钮锁定 + 2s 快轮询；全部转假 → 自动解锁回 5s。
+  const active = runs.some((r) => !r.finishedAt)
+  const locking = busy || active
+  useEffect(() => {
+    if (busy && active) setBusy(false) // 轮询已确认任务进了历史 → busy 使命完成
+  }, [busy, active])
 
   return html`<div class="wrap">
     <header class="topbar">
       <div class="brand">
         <span class="logo">⚡</span>
         <span class="name">xbk-push 控制台</span>
-        <${Badge} ok=${active ? null : true}>${active ? '任务运行中' : '空闲'}<//>
+        <${Badge} tone=${locking ? 'run' : 'ok'}>${locking ? '任务运行中' : '空闲'}<//>
       </div>
-      <div class="sync">自动刷新${lastSync ? ` · ${fmtTime(lastSync)}` : ''}</div>
+      <div class="sync">
+        自动刷新${lastSync ? ` · ${fmtTime(lastSync)}` : ''}
+        ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
+      </div>
     </header>
 
     <${StatusCards} state=${state} />
-    <${TriggerBar} onTriggered=${refresh} busy=${busy} setBusy=${setBusy} />
-    <${RunsPanel} runs=${runs} />
+    <${TriggerBar} onTriggered=${refresh} locking=${locking} setBusy=${setBusy} />
+    <${RunsPanel} runs=${runs} pollMs=${locking ? POLL_BUSY_MS : POLL_MS} />
 
     <footer class="foot">
       ⚠️ 「正式运行一轮」会真实推送通知 · 试运行只抓取不推送 · 同一时刻只能有一个触发任务

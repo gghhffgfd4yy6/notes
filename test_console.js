@@ -164,11 +164,28 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.ok(withToken.includes('/assets/app.js'), '引用前端 ESM')
   assert.ok(withToken.includes('/assets/app.css'), '引用样式')
   assert.ok(withToken.includes('Content-Security-Policy'), '带 CSP')
+  // Sourcery vww：CSP 不能只断言 meta 名——被削弱的策略（如 default-src *）也含这个字符串。
+  // 必须锁死关键指令本体。
+  assert.ok(withToken.includes("default-src 'none'"), "CSP 含 default-src 'none'")
+  assert.ok(withToken.includes("script-src 'self'"), "CSP 含 script-src 'self'")
+  assert.ok(withToken.includes("connect-src 'self'"), "CSP 含 connect-src 'self'")
   assert.ok(!withToken.includes('http-equiv="refresh"'), '不再 meta refresh 整页刷新')
   const noToken = renderPage(state, [], null)
   assert.ok(noToken.includes('"token":""'), '无 token 时 JSON 岛为空串（前端触发会 401，符合 fail-closed）')
   assert.ok(!noToken.includes(`"token":"${TOKEN2}"`), '无 token 时不回显')
   assert.ok(noToken.includes('缺失'), '空缓存目录渲染「缺失」分支（noscript 降级）')
+  // Sourcery vwK：特殊字符 token 必须以 \uXXXX JSON 转义进岛（script 文本不做实体解码，
+  // HTML 实体会让前端 parse 出错误 token）；JSON.parse 后必须还原为原值。
+  const WEIRD = 'a<b>&"\\u2028' + 'z'.repeat(20)
+  const weirdPage = renderPage(state, [], new URLSearchParams(`token=${encodeURIComponent(WEIRD)}`))
+  assert.ok(!weirdPage.includes('<b>'), '岛内不得出现裸 <script 片段')
+  const m = /<script type="application\/json" id="xbk-boot">([\s\S]*?)<\/script>/.exec(weirdPage)
+  assert.ok(m, 'JSON 岛可提取')
+  const parsed = JSON.parse(m[1].replace(/\\u003c/g, '<').replace(/\\u003e/g, '>'))
+  assert.strictEqual(parsed.token, WEIRD, '岛内 token 经 JSON 解析还原为原值')
+  // 常规 token 原样进岛（不引入任何实体）
+  const plain = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`))
+  assert.ok(plain.includes(`"token":"${TOKEN2}"`), '常规 token 原样回显')
 })
 
 ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）', () => {
@@ -224,19 +241,27 @@ async function main () {
     assert.ok(res.text.includes('缺失'), `空缓存目录必须渲染「缺失」分支，实际片段：${res.text.slice(0, 400)}`)
     server.close()
   })
-  await aok('HTTP: /assets/* 白名单资产伺服；路径穿越与未知资产 404', async () => {
+  await aok('HTTP: /assets/* 白名单资产免 token（ESM 链无法带凭证）；未知资产/穿越仍 404', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
-    const css = await request(port, 'GET', '/assets/app.css', { token: TOKEN })
-    assert.strictEqual(css.status, 200)
+    // 无 token 直取资产必须 200（Sourcery vvl/vw1：ESM 相对 import 带不了页面 ?token=，
+    // 逐请求鉴权会让 vendor 链 401；资产本身无敏感内容，鉴权面在 / 与 /api/*、/trigger）。
+    const css = await request(port, 'GET', '/assets/app.css')
+    assert.strictEqual(css.status, 200, '资产免 token')
     assert.match(css.headers['content-type'], /text\/css/)
     assert.ok(css.text.includes('--bg'), 'CSS 内容真实（自定义属性存在）')
     const js = await request(port, 'GET', '/assets/app.js', { token: TOKEN })
     assert.strictEqual(js.status, 200)
     assert.match(js.headers['content-type'], /text\/javascript/)
-    const lib = await request(port, 'GET', '/assets/htm-preact.module.js', { token: TOKEN })
+    // Sourcery vwr：不能只断言状态码+MIME——空壳 app.js 也过。锁死模块内容标志。
+    assert.ok(js.text.includes("from './htm-preact.module.js'"), 'app.js 含真实 import（非空壳）')
+    assert.ok(js.text.includes('render('), 'app.js 含 render 调用')
+    const lib = await request(port, 'GET', '/assets/htm-preact.module.js')
     assert.strictEqual(lib.status, 200)
     assert.ok(lib.text.length > 10000, '运行时文件非空壳')
+    // token 绝不进资产响应（资产免鉴权的安全边界）。
+    assert.ok(!js.text.includes(TOKEN), 'app.js 内容不含 token')
+    assert.ok(!lib.text.includes(TOKEN), 'vendor 内容不含 token')
     const nope = await request(port, 'GET', '/assets/nope.js', { token: TOKEN })
     assert.strictEqual(nope.status, 404, '白名单外 404')
     const traversal = await request(port, 'GET', '/assets/..%2F..%2Fconsole.js', { token: TOKEN })

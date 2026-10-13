@@ -300,11 +300,15 @@ function renderPage (state, runsList, query) {
     ? `?token=${encodeURIComponent(query.get('token'))}`
     : ''
   const token = (query instanceof URLSearchParams && query.get('token')) ? query.get('token') : ''
-  // JSON 岛（<script type="application/json"> 的文本内容）：只需转义 & 与 <，
-  // 防 </script> 逃逸与字符引用歧义；引号在 script 文本里无特殊含义，escapeHtml
-  // 的 &quot; 反而破坏 JSON 字面量，前端 JSON.parse 会失败。token 本身是服务端
-  // 已验证的查询参数原值，转义后写入、浏览器解析 JSON 时还原。
-  const bootJson = JSON.stringify({ token }).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  // JSON 岛（<script type="application/json"> 的文本内容）：script 文本不做 HTML 实体解码，
+  // escapeHtml 的 &quot; 会原样留在 JSON 里被前端 parse 成错误 token（Sourcery vwK）。
+  // 只需防 </script> 逃逸与注释/CDATA 攻击：把 < 和控制字符转成 \uXXXX JSON 转义
+  // （JSON.parse 会还原成原字符；/ 也转义防 </script> 序列被拼出）。
+  const bootJson = JSON.stringify({ token })
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029')
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -394,6 +398,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost')
+    // 静态资产在鉴权闸之前：白名单精确匹配（STATIC_ASSETS），内容是公开前端代码
+    // （无 token、无数据、无用户内容），且 ESM 相对 import 无法携带页面 ?token=
+    // （Sourcery vvl/vw1：逐请求鉴权会让 vendor 模块链 401、SPA 挂不上）。
+    // 鉴权面收敛在 /（页面本体）与 /api/*、/trigger（数据与动作）。
+    if (req.method === 'GET' && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
+      serveStatic(res, STATIC_ASSETS[url.pathname])
+      return
+    }
     if (!authorize(req, token, url.searchParams)) {
       sendJson(res, 401, { error: 'unauthorized' })
       return
@@ -403,11 +415,6 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(renderPage(state, runsList, url.searchParams))
-      return
-    }
-    // 静态资产：白名单映射（上面 STATIC_ASSETS），查不到即 404；先过鉴权（已在上方统一拦截）。
-    if (req.method === 'GET' && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
-      serveStatic(res, STATIC_ASSETS[url.pathname])
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/status') {
