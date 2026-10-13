@@ -87,21 +87,23 @@ ok('acquireLock: 持有期内并发获取拒绝（rename 不得静默覆盖）',
   }
   assert.strictEqual(JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')).startedAt, 1000, '锁内容不被后来者覆盖')
 })
-ok('acquireLock: 锁内容带归属 token；releaseLockFor 按 pid+token 双匹配', () => {
+ok('acquireLock: 锁内容带归属 token；releaseLockFor 按 pid+token 双匹配作废', () => {
   const dir = tmpDir()
   assert.strictEqual(acquireLock(dir, 1000, 'tok-abc'), true)
   const data = JSON.parse(fs.readFileSync(lockPath(dir), 'utf8'))
   assert.strictEqual(data.token, 'tok-abc', '锁内容必须写入归属 token')
   assert.strictEqual(data.pid, process.pid)
-  // token 不匹配（他人锁/pid 复用场景）不释放
+  // token 不匹配（他人锁/pid 复用场景）不作废
   fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: process.pid, startedAt: 1000, token: 'other' }))
   const { releaseLockFor } = require('./scripts/console')
   releaseLockFor({ _stateDir: dir, _lockToken: 'tok-abc' })
-  assert.strictEqual(fs.existsSync(lockPath(dir)), true, 'token 不匹配不得释放他人锁')
-  // 双匹配才释放
+  assert.strictEqual(JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')).token, 'other', 'token 不匹配不得作废他人锁')
+  // 双匹配 → 覆写作废（released:true），且立刻可被接管
   fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: process.pid, startedAt: 1000, token: 'tok-abc' }))
   releaseLockFor({ _stateDir: dir, _lockToken: 'tok-abc' })
-  assert.strictEqual(fs.existsSync(lockPath(dir)), false, 'pid+token 双匹配释放')
+  const after = JSON.parse(fs.readFileSync(lockPath(dir), 'utf8'))
+  assert.strictEqual(after.released, true, 'pid+token 双匹配覆写为 released')
+  assert.strictEqual(acquireLock(dir, 1001, 'tok-def'), true, 'released 锁立即可接管')
 })
 ok('releaseLock: 幂等（不存在不抛错）', () => {
   const dir = tmpDir()
@@ -267,7 +269,8 @@ async function main () {
     }
     const rec = runs.get(firstBody.id)
     assert.ok(rec && rec.finishedAt, '子进程应在 30s 内结束（--check 环境检查很快）')
-    assert.strictEqual(fs.existsSync(lockPath(dir)), false, '结束后锁必须释放')
+    const lockAfter = fs.existsSync(lockPath(dir)) ? JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')) : null
+    assert.ok(!lockAfter || lockAfter.released === true, '结束后锁必须释放（移除或作废）')
     const third = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
     assert.strictEqual(third.status, 202, '锁释放后可再次触发')
     // 清理第二个 run 的子进程（可能还在跑）

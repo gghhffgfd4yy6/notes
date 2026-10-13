@@ -89,16 +89,19 @@ function acquireLock (stateDir, now, token) {
     const raw = fs.readFileSync(p, 'utf8')
     let startedAt = 0
     let corrupted = false
+    let released = false
     try {
       const parsed = JSON.parse(raw)
       startedAt = Number(parsed.startedAt)
+      // released 锁（releaseLockFor 覆写作废）：语义等价无锁，立即接管，不判 age。
+      released = parsed.released === true
       if (!Number.isSafeInteger(startedAt) || startedAt <= 0) corrupted = true
     } catch (err) { corrupted = true }
     // 锁内容损坏/startedAt 无效（Sourcery Medium #11）：无法判定持有方死活，fail-closed
     // 视为仍被持有，由外部人工清理（README「故障排查」节说明）。不降级为按 age 接管——
     // 那会让损坏锁在超时后被自动覆盖，重新引入「无法安全分类的锁被承认」问题。
-    if (corrupted) return false
-    const stale = now - startedAt > PROC_TIMEOUT_MS
+    if (corrupted && !released) return false
+    const stale = released || now - startedAt > PROC_TIMEOUT_MS
     if (!stale) return false
     // 陈旧/损坏锁接管：哨兵独占，防并发接管双跑（Sourcery High）。
     const sentinel = p + '.takeover'
@@ -212,24 +215,33 @@ function startAction (actionKey, now, activeChildren) {
 function releaseLockFor (record) {
   // 只有仍持有锁的本次运行才释放：锁被陈旧接管后 pid 换人，此时不误删。
   // 归属判定 pid + token 双匹配（单看 pid 会被 OS pid 复用/接管换主绕过，评审 Medium）。
-  // TOCTOU 收口（评审 Medium G5K）：「读-判-删」三步之间锁可能被接管换主——unlinkSync
-  // 按路径删，可能删掉新主的锁。接管走 writeFileSync 原地覆盖（同 inode），因此把
-  // 「先读路径、再无条件删」改为「以 r+ 打开 fd → 校验 fd 内容仍是自己 → unlink」：
-  // 校验与 unlink 之间若被换主，fd 读到的是新主内容（同 inode 原地覆盖，fd 读即最新），
-  // token 不匹配即放弃；未换主则 fd 内容即自己，删除安全。锁不存在的场景照旧静默。
+  // TOCTOU 收口（评审 Medium G5K + CodeQL js/file-system-race）：「读-判-删」按路径
+  // unlink 存在 check-then-act 窗口——判定后锁可能被接管换主，unlink 会误删新主锁，
+  // 或删掉后第三进程立刻拿锁与新主重叠。改为**原地覆写作废**：归属校验通过后把同一
+  // fd 的内容覆写为 {"released":true,...}（writeFileSync 同 fd = 同 inode 原子覆盖），
+  // acquireLock 读到 released 锁立即视为可接管（与无锁等价）。全程不 unlink 路径，
+  // 无任何按路径删除动作，竞态无从谈起。锁文件残留由下次 acquireLock 的 released
+  // 短路 + 哨兵接管机制兜底，不会阻塞触发。
   const p = lockPath(record._stateDir)
   let fd = null
   try {
     fd = fs.openSync(p, 'r+')
-    const data = JSON.parse(fs.readFileSync(fd, 'utf8'))
+    const raw = fs.readFileSync(fd, 'utf8')
+    const data = JSON.parse(raw)
     if (data.pid === process.pid && data.token === record._lockToken) {
-      // 复读校验（unlink 前最后一刻）：换主是 writeFileSync 原地覆盖（同 inode），
-      // 同一 fd 重开读取读到的是路径当前内容；内容不匹配即被换主，放弃删除。
-      fd = fs.openSync(p, 'r+')
-      const again = JSON.parse(fs.readFileSync(fd, 'utf8'))
-      if (again.pid === process.pid && again.token === record._lockToken) {
-        fs.unlinkSync(p)
+      // 归属成立：原地单次 writeSync 覆写为 released 帧（同 inode，无 unlink、无
+      // truncate——中间态不可见）。released JSON 后补空格到原文件长度（JSON 尾部
+      // 空白合法），保证「读到的要么是完整旧锁、要么是完整 released 帧」，绝不出现
+      // 半旧半新或零字节窗口；若内容比原来长（不会发生，released 帧更短）就超写。
+      // 若此刻已被接管换主，校验不会通过；接管者随后覆盖则最后写者胜，语义仍正确。
+      const releasedFrame = Buffer.from(JSON.stringify({ pid: process.pid, startedAt: data.startedAt, token: record._lockToken, released: true }) + ' ', 'utf8')
+      const origLen = Buffer.byteLength(raw, 'utf8')
+      let payload = releasedFrame
+      if (releasedFrame.length < origLen) {
+        payload = Buffer.concat([releasedFrame, Buffer.alloc(origLen - releasedFrame.length, 0x20)])
       }
+      fs.writeSync(fd, payload, 0, payload.length, 0)
+      fs.fsyncSync(fd)
     }
   } catch (e) { /* 锁已不在/内容不可读：无事可做 */ } finally {
     if (fd !== null) { try { fs.closeSync(fd) } catch (e) { /* 已关 */ } }
