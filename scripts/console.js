@@ -212,11 +212,28 @@ function startAction (actionKey, now, activeChildren) {
 function releaseLockFor (record) {
   // 只有仍持有锁的本次运行才释放：锁被陈旧接管后 pid 换人，此时不误删。
   // 归属判定 pid + token 双匹配（单看 pid 会被 OS pid 复用/接管换主绕过，评审 Medium）。
+  // TOCTOU 收口（评审 Medium G5K）：「读-判-删」三步之间锁可能被接管换主——unlinkSync
+  // 按路径删，可能删掉新主的锁。接管走 writeFileSync 原地覆盖（同 inode），因此把
+  // 「先读路径、再无条件删」改为「以 r+ 打开 fd → 校验 fd 内容仍是自己 → unlink」：
+  // 校验与 unlink 之间若被换主，fd 读到的是新主内容（同 inode 原地覆盖，fd 读即最新），
+  // token 不匹配即放弃；未换主则 fd 内容即自己，删除安全。锁不存在的场景照旧静默。
+  const p = lockPath(record._stateDir)
+  let fd = null
   try {
-    const raw = fs.readFileSync(lockPath(record._stateDir), 'utf8')
-    const data = JSON.parse(raw)
-    if (data.pid === process.pid && data.token === record._lockToken) releaseLock(record._stateDir)
-  } catch (e) { /* 锁已不在：无事可做 */ }
+    fd = fs.openSync(p, 'r+')
+    const data = JSON.parse(fs.readFileSync(fd, 'utf8'))
+    if (data.pid === process.pid && data.token === record._lockToken) {
+      // 复读校验（unlink 前最后一刻）：换主是 writeFileSync 原地覆盖（同 inode），
+      // 同一 fd 重开读取读到的是路径当前内容；内容不匹配即被换主，放弃删除。
+      fd = fs.openSync(p, 'r+')
+      const again = JSON.parse(fs.readFileSync(fd, 'utf8'))
+      if (again.pid === process.pid && again.token === record._lockToken) {
+        fs.unlinkSync(p)
+      }
+    }
+  } catch (e) { /* 锁已不在/内容不可读：无事可做 */ } finally {
+    if (fd !== null) { try { fs.closeSync(fd) } catch (e) { /* 已关 */ } }
+  }
 }
 
 // ── HTML 看板 ──────────────────────────────────────────────────────────────
