@@ -428,7 +428,26 @@ function main () {
   // Sourcery Medium：与生产入口 / --status 同源解析缓存目录（含安全回退），
   // 不再手写默认值——否则 .xbk_cache_safe 生效时看板会读错目录。
   const stateDir = statusCacheDir()
-  const { server } = createConsole({ token, stateDir, port, host })
+  const { server, activeChildren } = createConsole({ token, stateDir, port, host })
+  // 优雅关闭（Sourcery #21 余量）：SIGTERM/SIGINT 默认行为不走 server.close，会留下
+  // ①还在跑的触发子进程 ②未释放的触发锁（下次触发 409 直到锁 age 超时）。这里统一收尾。
+  const shutdown = (signal) => {
+    console.log(`收到 ${signal}，关闭控制台：终止触发子进程并释放锁…`)
+    for (const child of activeChildren) {
+      try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
+    }
+    activeChildren.clear()
+    // 只释放自己写的锁（pid 匹配）；接管来的陈旧锁同样记本进程 pid，也属本进程职责。
+    try {
+      const raw = fs.readFileSync(path.join(stateDir, 'console-trigger.lock'), 'utf8')
+      if (JSON.parse(raw).pid === process.pid) fs.unlinkSync(path.join(stateDir, 'console-trigger.lock'))
+    } catch (e) { /* 锁不存在或不可读：无事可做 */ }
+    server.close(() => process.exit(0))
+    // close 回调等连接排空，给 2s 兜底强退，防止挂着的连接拖延退出。
+    setTimeout(() => process.exit(0), 2000).unref()
+  }
+  process.on('SIGTERM', () => shutdown('SIGTERM'))
+  process.on('SIGINT', () => shutdown('SIGINT'))
   server.listen(port, host, () => {
     console.log(`xbk-push 控制台已启动：http://${host}:${server.address().port}（缓存目录：${stateDir}）`)
     console.log('鉴权：请求头 Authorization: Bearer <XBK_CONSOLE_TOKEN>，或浏览器打开 http://<host>:<port>/?token=<XBK_CONSOLE_TOKEN>；token 未设置或过短则拒绝启动')
