@@ -217,7 +217,9 @@ async function main () {
   })
 }
 
-main().then(() => {
-  console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}`)
-  if (failed > 0) process.exitCode = 1
-})
+main()
+  .then(() => {
+    console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}`)
+    if (failed > 0) process.exitCode = 1
+  })
+  .catch(e => { console.error('套件执行异常:', e.message); process.exitCode = 1 })

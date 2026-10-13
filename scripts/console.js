@@ -259,22 +259,26 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (req.method === 'POST' && url.pathname === '/trigger') {
-      readBody(req).then(({ body }) => {
-        const action = parseAction(body)
-        if (!action) {
-          sendJson(res, 400, { error: '未知 action' })
-          return
-        }
-        const now = Date.now()
-        if (!acquireLock(stateDir, now)) {
-          sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
-          return
-        }
-        const record = startAction(action, now)
-        record._stateDir = stateDir
-        record._lockAt = now
-        sendJson(res, 202, { id: record.id, action, label: record.label })
-      })
+      // S9383：promise 必须显式收尾——readBody 以 resolve 收口不会 reject，但仍接 .catch
+      // 把意外异常转成 500，不留 floating promise。
+      readBody(req)
+        .then(({ body }) => {
+          const action = parseAction(body)
+          if (!action) {
+            sendJson(res, 400, { error: '未知 action' })
+            return
+          }
+          const now = Date.now()
+          if (!acquireLock(stateDir, now)) {
+            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
+            return
+          }
+          const record = startAction(action, now)
+          record._stateDir = stateDir
+          record._lockAt = now
+          sendJson(res, 202, { id: record.id, action, label: record.label })
+        })
+        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/runs') {
