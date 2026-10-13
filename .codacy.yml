@@ -198,6 +198,13 @@ exclude_paths:
   - "test_status_report.js"
   - "test_utils.js"
   - "test_mutation_report_cli.js"
+  # v3.284：console.js 的 path.join(stateDir, 'console-trigger.lock') 与 status.js 同族（工具脚本按
+  # readdirSync/配置常量拼路径是本职）；防护事实：stateDir 由启动方显式传入（默认项目根内固定目录），
+  # 锁文件名是本文件常量，读取走 readFileSync + JSON.parse，无任何外部净输入参与路径构造。
+  # test_console.js 同理（mkdtempSync(os.tmpdir()) 下的硬编码夹具路径），另含 16 位以上数字字面量
+  # 被误报「runtime value differs」（指数记法规避后仍留此登记，防后续同类）。
+  - "scripts/console.js"
+  - "test_console.js"
   - "test_run_mutation_cli.js"
   - "test_formatter.js"
   - "test_utils_pure.js"

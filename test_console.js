@@ -34,7 +34,7 @@ ok('isValidToken: 过短/非字符串/空串拒绝', () => {
   assert.strictEqual(isValidToken('a'.repeat(TOKEN_MIN_LEN - 1)), false)
   assert.strictEqual(isValidToken(''), false)
   assert.strictEqual(isValidToken(undefined), false)
-  assert.strictEqual(isValidToken(1234567890123456), false)
+  assert.strictEqual(isValidToken(1.2345678901234568e21), false)
 })
 ok('createConsole: token 缺失/过短 fail-closed 拒启', () => {
   assert.throws(() => createConsole({ token: undefined, stateDir: tmpDir() }), /XBK_CONSOLE_TOKEN/)
