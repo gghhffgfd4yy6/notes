@@ -261,3 +261,13 @@
 - PR #211 后续对抗复核补强：host-clean 对 cwd 保护信号的权限错误 fail-closed、按真实路径比对 TMPDIR 别名，并为清理命令引用 shell 特殊字符；commit-msg 改为固定检查原始消息第二行，覆盖 `--cleanup` 命令行覆盖无法传入钩子的边界。
 - PR #211 CI 复核补强（继续沿用 v3.283，不 bump）：host-clean 先筛过期沙箱候选；无候选且 `/proc` 可读时不扫描无关进程 cwd，有候选仍要求 cwd 保护信号完整，否则 fail-closed；整个 `/proc` 不可读仍总体 fail-closed。cwd 读取失败仅输出 PID、errno、proc 状态和 UID 等有限诊断元数据，不输出 cwd 路径或命令行；回归测试用 stat mock 模拟 PID 退出，避免测试自身删除临时树。
 - 版本 bump 至 3.283.0（四处同步）；主文件头仍 442 行 ⇒ 变异 `1-442` 全覆盖不变。
+
+## v3.284
+
+- 新增**网页控制台** `scripts/console.js`（`npm run console` 启动）：只读看板 + 手动触发，零新 npm 依赖（仅 node 内置 + 复用 `scripts/status.js` 的 `readStatus`/`formatStatus`，与 `--status` 同源口径）。
+- **鉴权 fail-closed**：`XBK_CONSOLE_TOKEN` 未设置或短于 16 字符即拒绝启动；所有请求（读与触发）都要求 `Authorization: Bearer <token>`，token 比对用 `crypto.timingSafeEqual`（与 `xbk_app` 的先例同源，防时序侧信道）。默认只绑 `127.0.0.1`，对外暴露需显式设置 `XBK_CONSOLE_HOST`。
+- **单飞锁**：同一时刻只允许一个触发任务。锁文件 `console-trigger.lock`（`wx` 独占创建）写 `{pid, startedAt}`；持有期内重复触发返回 409；**锁内容损坏时保守视为仍被持有**（读不到合法 `startedAt` 就无法判定死活，绝不盲目覆盖）；age 超过 `PROC_TIMEOUT_MS`（10 分钟，与子进程超时一致）按陈旧锁安全接管。
+- **三种触发动作**（全部拉起 `qinglong/xbk_push.js` 子进程跑一轮即退，绝不嵌套常驻循环）：`dry-run`（抓取不推送）、`run`（真实推送一轮）、`check`（环境检查）。子进程输出环形缓冲（512 KiB 上限）可通过 `/api/runs/:id` 查看，10 分钟超时 SIGKILL 兜底。
+- 端点：`GET /`（看板页，15s 自动刷新）、`GET /api/status`（状态 JSON）、`POST /trigger`（触发，202/409/400）、`GET /api/runs`（触发历史）、`GET /api/runs/:id`（详情含输出）。触发历史仅进程内存（最多 20 条，重启即空），持久记录仍以缓存目录状态文件与 `run.log` 为准。
+- 测试：新套件 `test_console.js`（19 断言，注册为普通单元套件——不标 integration/mutationSkip）锁死：token 校验与 fail-closed、锁语义（损坏锁保守、陈旧接管、幂等释放）、动作解析、HTML 转义、HTTP 端到端（401/看板降级渲染/202/409/锁生命周期/404）。`console.js` 列入变异矩阵（新段 `console`，TAP 档）与 `stryker.config.js` mutate 清单，`EXPECTED_SEGMENTS`、`productionFiles` 同步 +1，矩阵 19→20 段。
+- 配置：`XBK_CONSOLE_PORT`（默认 7777）、`XBK_CONSOLE_HOST`（默认 127.0.0.1）、`XBK_CONSOLE_TOKEN`（必填，≥16 字符）；缓存目录沿用 `XBK_CACHE_DIR` 绝对路径语义（与 `--status` 同口径）。

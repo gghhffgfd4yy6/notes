@@ -143,6 +143,9 @@ filter: {
 | `XBK_INTERVAL_MS` | 抓取间隔，单位为毫秒，默认 `10000` |
 | `XBK_DRY_RUN=1` | 对常驻和单轮入口都生效：不发送通知、不写入成功缓存；常驻入口持续运行，`npm start` 只执行一轮 |
 | `XBK_CACHE_DIR` | `--status` 使用的状态目录，必须是绝对路径 |
+| `XBK_CONSOLE_TOKEN` | 网页控制台访问令牌（≥16 字符；未设置则控制台拒绝启动） |
+| `XBK_CONSOLE_PORT` | 网页控制台端口，默认 `7777` |
+| `XBK_CONSOLE_HOST` | 网页控制台绑定地址，默认 `127.0.0.1` |
 | `XBK_AUTO_INSTALL_DEPS=1` | 应急选项：青龙常驻入口运行时联网安装和构建缺失依赖；默认关闭，优先在部署阶段完成依赖初始化 |
 | `PUSH_PLUS_TOKEN` | PushPlus Token，可代替本地配置 |
 | `PUSH_KEY` | Server酱 Key，可代替本地配置 |
@@ -160,9 +163,26 @@ node qinglong/xbk_push.js --status # 查看状态
 node qinglong/xbk_push.js --dry-run # 试运行
 npm run lint                      # 检查代码格式
 npm test                          # 运行测试
+npm run console                   # 启动网页控制台（需先设置 XBK_CONSOLE_TOKEN）
 ```
 
 青龙入口目前只支持 `--check`、`--status` 和 `--dry-run`。其他参数会被忽略并发出警告；不要把 `--help` 或拼写错误的参数当作安全检查命令。
+
+## 网页控制台
+
+在浏览器里查看运行状态、手动触发一轮抓取（可选试运行），适合不想敲命令的场景：
+
+```bash
+XBK_CONSOLE_TOKEN=请换成至少16位的随机字符串 npm run console
+```
+
+- 默认地址 `http://127.0.0.1:7777`。两种鉴权方式：命令行/API 用请求头 `Authorization: Bearer <XBK_CONSOLE_TOKEN>`；浏览器直接打开 `http://127.0.0.1:7777/?token=<XBK_CONSOLE_TOKEN>`（页面里的触发按钮与 15 秒自动刷新会自动带上 token）。token 未设置或短于 16 字符时服务直接拒绝启动。
+- ⚠️ `?token=` 会留在浏览器历史与访问日志里；`XBK_CONSOLE_HOST` 绑定非回环地址时 token 以明文过网（HTTP 无加密），请仅在受信内网使用，跨网访问务必前置 TLS 反代（nginx/caddy 终止 TLS 后转发本端口）。
+- 「试运行」抓取但不推送、不写去重记录（等价 `--dry-run`）；「正式运行一轮」会**真实推送通知**。同一时刻只允许一个触发任务，重复触发返回 409；锁残留（进程被 kill -9 等留下损坏锁文件）时人工删除缓存目录下的 `console-trigger.lock` 即可恢复。
+- ⚠️ 已知边界：控制台触发锁只约束「控制台触发的任务」，不感知青龙定时任务/常驻进程——定时任务正在推送时再从控制台触发一轮，可能出现重复推送。避免在定时任务运行窗口内手动触发。
+- 只读部分与 `--status` 同源：日报计数、最近一轮、通道健康、过滤诊断（缓存目录解析逻辑与 `--status` 完全一致）。
+- 触发历史仅保存在控制台进程内存（最多 20 条，重启即空）；持久记录仍以缓存目录的状态文件与 `run.log` 为准。控制台停止时会终止由它拉起的子进程。
+- 相关变量：`XBK_CONSOLE_PORT`（默认 `7777`）、`XBK_CONSOLE_HOST`（默认 `127.0.0.1`，对外暴露需显式修改并自行做好访问控制）。
 
 ## 常见问题
 

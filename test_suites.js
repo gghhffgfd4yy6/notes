@@ -83,7 +83,12 @@ const SUITES = [
   // 约 10 次 spawn 的子进程夹具套件（≈2-3s，照 test_analyze_artifacts.js 先例），增量可接受。
   // ⚠️ 但它测的 audit-gate.js 不是 mutation 矩阵的 mutate 目标、子进程断言也拿不到 TAP perTest 归因
   // ⇒ 这 10 条买的是「门禁不被静默改坏」的回归保护，**不是**变异分数（该口径在套件文件头同样登记）。
-  { name: '安全审计门禁', file: 'test_audit_gate.js', desc: 'scripts/audit-gate.js 子进程：夹具缺失/非法 JSON/schema 漂移四态/大小写 severity/豁免显形带理由/间接链三类断链/every 口径/GHSA 归一' }
+  { name: '安全审计门禁', file: 'test_audit_gate.js', desc: 'scripts/audit-gate.js 子进程：夹具缺失/非法 JSON/schema 漂移四态/大小写 severity/豁免显形带理由/间接链三类断链/every 口径/GHSA 归一' },
+  // v3.284：scripts/console.js 网页控制台。同 G11 先例——console.js 不在 mutation 矩阵
+  // （只读编排层，无核心算法；HTTP/spawn 编排对变异测试价值低），本套件买的是行为契约回归保护。
+  // 不设 integration：触发用例拉起的是 `--check`（只做环境检查、秒级、不碰网络业务），
+  // 单元入口可跑。不设 mutationSkip：套件不读 mutation.yml/.githooks，沙箱内可运行。
+  { name: '网页控制台', file: 'test_console.js', desc: 'scripts/console.js token fail-closed/单飞锁（损坏锁保守+陈旧接管）/动作解析/HTML 转义/HTTP 端到端（401/看板降级/202/409/锁生命周期/404）' }
 ]
 
 // 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与

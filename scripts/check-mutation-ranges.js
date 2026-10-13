@@ -138,7 +138,8 @@ const productionFiles = [
   ...fs.readdirSync(root).filter(file => /^xbk_.*\.js$/.test(file)),
   'qinglong/xbk_push.js',
   'scripts/check-deps.js',
-  'scripts/status.js'
+  'scripts/status.js',
+  'scripts/console.js'
 ]
 
 // 失败收敛点：直接运行（node scripts/check-mutation-ranges.js）时按 code process.exit，保证 CI /

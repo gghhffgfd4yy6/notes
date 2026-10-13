@@ -47,7 +47,11 @@ module.exports = {
     // scripts/status.js 是运行时生产模块：被 qinglong/xbk_push.js 顶层无条件 require
     // （--status 诊断与常驻入口的加载链上都会执行）。此前漏列 → 该文件零变异覆盖，且与
     // scripts/check-mutation-ranges.js 的 productionFiles 缺口同源（审查 F-01）。
-    'scripts/status.js'
+    'scripts/status.js',
+    // v3.284：scripts/console.js 网页控制台（readStatus/formatStatus 复用 + spawn 编排）。
+    // 被 require 的 scripts/status.js 在其加载链上 ⇒ 与 status.js 同理列入 mutate 目标，
+    // 避免「加载链上的生产文件零变异覆盖」（同 F-01 口径）。
+    'scripts/console.js'
   ],
   coverageAnalysis: 'off',
   // 纯 JS 项目无需类型检查注入。CI run #120 根因：ranges 行数元校验

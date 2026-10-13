@@ -46,8 +46,10 @@
     "check": "npm run lint && node check-version.js && node scripts/check-mutation-ranges.js && npm run check:ci-static && npm run check:doc-lines && npm test",
     "verify": "npm run check",
     "hooks:install": "node scripts/install-hooks.js",
-    "hooks:verify": "node scripts/install-hooks.js --verify"
+    "hooks:verify": "node scripts/install-hooks.js --verify",
+    "console": "node scripts/console.js"
   },
+  "version": "3.284.0",
   "dependencies": {
     "got": "11.8.6"
   },

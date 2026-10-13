@@ -276,6 +276,10 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
+          - name: console
+            src: "scripts/console.js"
+            mutate: "scripts/console.js"
+            config: "stryker.tap.config.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
