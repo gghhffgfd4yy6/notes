@@ -447,7 +447,7 @@ function main () {
   // 锁归属 token（评审 Medium：pid 复用会让「pid===process.pid」误认他人锁为自有；
   // takeover 换主后 unlink 竞态也可能误删新主的锁）。锁内容带 token，释放须双匹配。
   const lockToken = crypto.randomBytes(12).toString('hex')
-  const { server, activeChildren, setShuttingDown, ownerToken } = createConsole({ token, stateDir, port, host, lockToken })
+  const { server, activeChildren, setShuttingDown } = createConsole({ token, stateDir, port, host, lockToken })
   // 优雅关闭（Sourcery #21 余量）：SIGTERM/SIGINT 默认行为不走 server.close，会留下
   // ①还在跑的触发子进程 ②未释放的触发锁（下次触发 409 直到锁 age 超时）。这里统一收尾。
   const shutdown = (signal) => {
@@ -456,16 +456,34 @@ function main () {
     for (const child of activeChildren) {
       try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
     }
-    activeChildren.clear()
-    // 只释放「pid + token 双匹配」的自己的锁；他人锁/接管竞态写入的锁一律不动。
-    const p = path.join(stateDir, 'console-trigger.lock')
-    try {
-      const data = JSON.parse(fs.readFileSync(p, 'utf8'))
-      if (data.pid === process.pid && data.token === ownerToken) fs.unlinkSync(p)
-    } catch (e) { /* 锁不存在或不可读：无事可做 */ }
-    server.close(() => process.exit(0))
-    // close 回调等连接排空，给 2s 兜底强退，防止挂着的连接拖延退出。
-    setTimeout(() => process.exit(0), 2000).unref()
+    // 锁释放时机（评审 Medium G5F/G5K）：不能在 SIGKILL 后立刻 unlink（子进程还没死，
+    // 别的实例会立刻拿锁与垂死子进程重叠），也不能「读-判-删」（TOCTOU：判定后锁被
+    // 接管换主，unlink 误删新主锁）。正确序列：杀子进程 → 等每个子进程真正 close
+    // （close 回调里 releaseLockFor 已按 pid+token 双匹配释放）→ 全部收完才退出。
+    // activeChildren.clear() 不能提前——清了就收不到 close 计数。
+    const pending = [...activeChildren]
+    let exited = 0
+    const maybeFinish = () => {
+      exited++
+      if (exited >= pending.length) finishShutdown()
+    }
+    let finished = false
+    const finishShutdown = () => {
+      if (finished) return
+      finished = true
+      server.close(() => process.exit(0))
+      setTimeout(() => process.exit(0), 1000).unref()
+    }
+    if (pending.length === 0) {
+      finishShutdown()
+    } else {
+      for (const child of pending) {
+        // close 在子进程真正死后触发（SIGKILL 毫秒级）；同时兜底 3s 强制收尾，
+        // 防个别子进程 close 事件丢失导致控制台挂住不退。
+        child.once('close', maybeFinish)
+      }
+      setTimeout(finishShutdown, 3000).unref()
+    }
   }
   process.on('SIGTERM', () => shutdown('SIGTERM'))
   process.on('SIGINT', () => shutdown('SIGINT'))
