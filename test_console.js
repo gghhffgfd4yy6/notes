@@ -12,7 +12,7 @@ const http = require('node:http')
 const {
   createConsole, isValidToken, timingSafeEqualStr,
   acquireLock, releaseLock, lockPath,
-  parseAction, escapeHtml, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS
+  parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS
 } = require('./scripts/console')
 
 let passed = 0
@@ -57,15 +57,35 @@ ok('acquireLock: 空目录可获取；持有期内二次获取拒绝', () => {
 })
 ok('acquireLock: 陈旧锁（age > PROC_TIMEOUT_MS）可接管', () => {
   const dir = tmpDir()
-  fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 999999, startedAt: 0 }))
-  assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS + 1), true)
+  // startedAt 必须是合法正整数（<=0 会被判为不可信锁而 fail-closed）
+  fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 999999, startedAt: 1 }))
+  assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS + 2), true)
   const data = JSON.parse(fs.readFileSync(lockPath(dir), 'utf8'))
-  assert.strictEqual(data.startedAt, PROC_TIMEOUT_MS + 1, '接管后 startedAt 更新')
+  assert.strictEqual(data.startedAt, PROC_TIMEOUT_MS + 2, '接管后 startedAt 更新')
+  assert.strictEqual(fs.existsSync(lockPath(dir) + '.takeover'), false, '接管后哨兵清理')
 })
-ok('acquireLock: 锁内容损坏 → 保守视为被持有', () => {
+ok('acquireLock: 锁内容损坏 / startedAt 无效 → fail-closed 拒绝', () => {
   const dir = tmpDir()
+  // JSON 损坏
   fs.writeFileSync(lockPath(dir), 'not-json{{')
   assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS * 10), false)
+  // startedAt <= 0 或缺失同样不可信（Sourcery #11：Number(...)||0 曾把无效当成 epoch）
+  fs.writeFileSync(lockPath(dir), '{"pid":5,"startedAt":0}')
+  assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS * 10), false, 'startedAt=0 拒绝')
+  fs.writeFileSync(lockPath(dir), '{"pid":5}')
+  assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS * 10), false, 'startedAt 缺失拒绝')
+  fs.writeFileSync(lockPath(dir), '{"pid":5,"startedAt":-5}')
+  assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS * 10), false, 'startedAt 负数拒绝')
+})
+ok('acquireLock: 持有期内并发获取拒绝（rename 不得静默覆盖）', () => {
+  // 回归锁：writeLockAtomic 曾用 rename 覆盖路径，POSIX rename 会静默替换目标，
+  // 导致「独占创建」名存实亡——二次获取静默成功，单飞失效。
+  const dir = tmpDir()
+  assert.strictEqual(acquireLock(dir, 1000), true)
+  for (let i = 0; i < 5; i++) {
+    assert.strictEqual(acquireLock(dir, 1000 + i), false, `并发第 ${i + 1} 次必须失败`)
+  }
+  assert.strictEqual(JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')).startedAt, 1000, '锁内容不被后来者覆盖')
 })
 ok('releaseLock: 幂等（不存在不抛错）', () => {
   const dir = tmpDir()
@@ -98,8 +118,37 @@ ok('escapeHtml: null/undefined → 空串', () => {
   assert.strictEqual(escapeHtml(undefined), '')
 })
 
+ok('authorize: Bearer 前缀匹配 + ?token= 查询参数（浏览器路径）', () => {
+  const TOKEN2 = 'z'.repeat(32)
+  const mkReq = (headers) => ({ headers: headers || {} })
+  // Bearer 路径
+  assert.strictEqual(authorize(mkReq({ authorization: `Bearer ${TOKEN2}` }), TOKEN2, null), true)
+  assert.strictEqual(authorize(mkReq({ authorization: `Bearer ${TOKEN2} ` }), TOKEN2, null), true, '尾随空白容忍')
+  assert.strictEqual(authorize(mkReq({ authorization: 'Bearer wrong' }), TOKEN2, null), false)
+  assert.strictEqual(authorize(mkReq({}), TOKEN2, null), false)
+  // 查询参数路径（浏览器导航/表单/meta refresh 用）
+  assert.strictEqual(authorize(mkReq({}), TOKEN2, new URLSearchParams(`token=${TOKEN2}`)), true)
+  assert.strictEqual(authorize(mkReq({}), TOKEN2, new URLSearchParams('token=wrong')), false)
+  assert.strictEqual(authorize(mkReq({}), TOKEN2, new URLSearchParams('other=1')), false)
+  // 错误 token + 正确查询参数：查询参数可独立放行（浏览器不带请求头）
+  assert.strictEqual(authorize(mkReq({ authorization: 'Bearer wrong' }), TOKEN2, new URLSearchParams(`token=${TOKEN2}`)), true)
+})
+
+ok('renderPage: token 回显进表单 action 与 meta refresh；无 token 时不回显', () => {
+  const { readStatus } = require('./scripts/status')
+  const TOKEN2 = 'q'.repeat(32)
+  const dir = tmpDir()
+  const state = readStatus(dir) // 空目录 → 全部件「缺失」，formatStatus 合法渲染
+  const withToken = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`))
+  assert.ok(withToken.includes(`/trigger?token=${TOKEN2}`), '表单带 token')
+  assert.ok(withToken.includes(`content="15?token=${TOKEN2}"`), 'meta refresh 带 token')
+  const noToken = renderPage(state, [], null)
+  assert.ok(!noToken.includes('/trigger?token='), '无 token 时不回显')
+  assert.ok(noToken.includes('缺失'), '空缓存目录渲染「缺失」分支')
+})
+
 ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）', () => {
-  // authorize 未导出：401/200 行为在下方端到端用例里锁定；这里只登记实现约束。
+  // 端到端用例在下方；这里登记实现约束。
   assert.ok(true)
 })
 
@@ -144,8 +193,23 @@ async function main () {
     assert.ok(res.text.includes('试运行'))
     assert.ok(res.text.includes('环境检查'))
     assert.ok(res.text.includes('正式运行一轮'))
-    // 缺状态文件时 formatStatus 走「缺失」分支而非崩溃
-    assert.ok(res.text.includes('缺失') || res.text.includes('正常'))
+    // Sourcery #37：缺文件夹具必须断言「缺失」分支文案，不许「正常」蒙混——
+    // 两种文案都接受的断言抓不住缺失降级走错分支的回归。
+    assert.ok(res.text.includes('缺失'), `空缓存目录必须渲染「缺失」分支，实际片段：${res.text.slice(0, 400)}`)
+    server.close()
+  })
+  await aok('HTTP: ?token= 查询参数放行（浏览器流：看板、API、表单触发）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // 无请求头、仅查询参数 → 200（普通浏览器打开 URL 的形态）
+    const page = await request(port, 'GET', `/?token=${TOKEN}`)
+    assert.strictEqual(page.status, 200, '浏览器打开带 token URL 必须放行')
+    assert.ok(page.text.includes(`/trigger?token=${TOKEN}`), '返回页里的表单/refresh 要继续携带 token')
+    const api = await request(port, 'GET', `/api/status?token=${TOKEN}`)
+    assert.strictEqual(api.status, 200, '查询参数对 JSON API 同样放行')
+    const noTok = await request(port, 'GET', '/')
+    assert.strictEqual(noTok.status, 401)
     server.close()
   })
   await aok('HTTP: /api/status 返回 JSON（status 字段齐全）', async () => {
@@ -201,9 +265,17 @@ async function main () {
     const { id } = JSON.parse(trig.text)
     const list = JSON.parse((await request(port, 'GET', '/api/runs', { token: TOKEN })).text)
     assert.ok(Array.isArray(list.runs) && list.runs.some(r => r.id === id))
-    const detail = JSON.parse((await request(port, 'GET', `/api/runs/${id}`, { token: TOKEN })).text)
-    assert.strictEqual(detail.id, id)
-    assert.ok(typeof detail.output === 'string', '详情含 output 字段')
+    // Sourcery #39：等子进程结束再断言 output 非空——--check 必然打印环境信息，
+    // 只断言「是字符串」抓不住输出捕获链路整体失效的回归。
+    const deadline = Date.now() + 30000
+    let detail = null
+    while (Date.now() < deadline) {
+      detail = JSON.parse((await request(port, 'GET', `/api/runs/${id}`, { token: TOKEN })).text)
+      if (detail.finishedAt) break
+      await new Promise(resolve => setTimeout(resolve, 200))
+    }
+    assert.ok(detail && detail.finishedAt, '子进程应在 30s 内结束')
+    assert.ok(typeof detail.output === 'string' && detail.output.length > 0, 'output 必须捕获到子进程实际输出')
     const missing = await request(port, 'GET', '/api/runs/99999', { token: TOKEN })
     assert.strictEqual(missing.status, 404)
     server.close()
