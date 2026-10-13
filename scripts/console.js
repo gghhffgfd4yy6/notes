@@ -59,24 +59,24 @@ function isValidToken (token) {
 // ⇒ 持有方已死或卡死，安全覆盖。活跃持有期内的重复触发返回 409。
 function lockPath (stateDir) { return path.join(stateDir, 'console-trigger.lock') }
 
-function writeLockAtomic (p, now) {
-  // 独占创建 + 先写内容再占用：以 `<name>.<rand>.tmp`（wx）写完整内容后 rename 覆盖，
-  // 中断只会留下孤立 tmp（无害），不会留下「文件存在但内容残缺」的半成品锁。
-  // ⚠️ rename 在 POSIX 语义下会静默替换已存在目标，独占性只能由 open(wx) 保证：
-  // 正确顺序是先 open(p, 'wx') 抢占文件名（并发方在这里 EEXIST 失败），再把完整内容
-  // 写进同一 fd——不能走 rename 覆盖路径，否则二次获取会静默成功。
+function writeLockAtomic (p, now, token) {
+  // 独占创建 + 先写内容再占用：以 open(p,'wx') 抢占文件名（并发方在这里 EEXIST 失败），
+  // 再把完整内容写进同一 fd。⚠️ 不能走 rename 覆盖路径——POSIX rename 会静默替换已存在
+  // 目标，独占性名存实亡（回归教训见 test「并发获取拒绝」用例）。
+  // token：进程级随机归属标识，释放/判定所有权须 pid+token 双匹配（评审 Medium：
+  // 单看 pid 会被 OS 复用 pid 的后来进程误认；接管换主后也可能误删新主锁）。
   const fd = fs.openSync(p, 'wx')
   try {
-    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: now }))
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: now, token }))
     fs.fsyncSync(fd)
   } finally { fs.closeSync(fd) }
 }
 
-function acquireLock (stateDir, now) {
+function acquireLock (stateDir, now, token) {
   const p = lockPath(stateDir)
   try {
     // 第一层：直接独占创建（无锁时最常见路径）。
-    writeLockAtomic(p, now)
+    writeLockAtomic(p, now, token)
     return true
   } catch (e) {
     if (e.code !== 'EEXIST') return false
@@ -89,16 +89,19 @@ function acquireLock (stateDir, now) {
     const raw = fs.readFileSync(p, 'utf8')
     let startedAt = 0
     let corrupted = false
+    let released = false
     try {
       const parsed = JSON.parse(raw)
       startedAt = Number(parsed.startedAt)
+      // released 锁（releaseLockFor 覆写作废）：语义等价无锁，立即接管，不判 age。
+      released = parsed.released === true
       if (!Number.isSafeInteger(startedAt) || startedAt <= 0) corrupted = true
     } catch (err) { corrupted = true }
     // 锁内容损坏/startedAt 无效（Sourcery Medium #11）：无法判定持有方死活，fail-closed
     // 视为仍被持有，由外部人工清理（README「故障排查」节说明）。不降级为按 age 接管——
     // 那会让损坏锁在超时后被自动覆盖，重新引入「无法安全分类的锁被承认」问题。
-    if (corrupted) return false
-    const stale = now - startedAt > PROC_TIMEOUT_MS
+    if (corrupted && !released) return false
+    const stale = released || now - startedAt > PROC_TIMEOUT_MS
     if (!stale) return false
     // 陈旧/损坏锁接管：哨兵独占，防并发接管双跑（Sourcery High）。
     const sentinel = p + '.takeover'
@@ -121,8 +124,8 @@ function acquireLock (stateDir, now) {
     }
     if (!claimed) return false
     // takeover 路径不能再用 open(wx) 写锁（目标存在必 EEXIST）：锁内容短且由
-    // rename 静默替换语义恰好覆盖旧文件——原子替换、无半成品窗口。
-    fs.writeFileSync(p, JSON.stringify({ pid: process.pid, startedAt: now }))
+    // rename 静默替换语义恰好覆盖旧文件——原子替换、无半成品窗口。带本进程 token。
+    fs.writeFileSync(p, JSON.stringify({ pid: process.pid, startedAt: now, token }))
     try { fs.unlinkSync(sentinel) } catch (err) { /* 并发接管者会各自清自己的 */ }
     return true
   } catch (err) {
@@ -211,11 +214,38 @@ function startAction (actionKey, now, activeChildren) {
 
 function releaseLockFor (record) {
   // 只有仍持有锁的本次运行才释放：锁被陈旧接管后 pid 换人，此时不误删。
+  // 归属判定 pid + token 双匹配（单看 pid 会被 OS pid 复用/接管换主绕过，评审 Medium）。
+  // TOCTOU 收口（评审 Medium G5K + CodeQL js/file-system-race）：「读-判-删」按路径
+  // unlink 存在 check-then-act 窗口——判定后锁可能被接管换主，unlink 会误删新主锁，
+  // 或删掉后第三进程立刻拿锁与新主重叠。改为**原地覆写作废**：归属校验通过后把同一
+  // fd 的内容覆写为 {"released":true,...}（writeFileSync 同 fd = 同 inode 原子覆盖），
+  // acquireLock 读到 released 锁立即视为可接管（与无锁等价）。全程不 unlink 路径，
+  // 无任何按路径删除动作，竞态无从谈起。锁文件残留由下次 acquireLock 的 released
+  // 短路 + 哨兵接管机制兜底，不会阻塞触发。
+  const p = lockPath(record._stateDir)
+  let fd = null
   try {
-    const raw = fs.readFileSync(lockPath(record._stateDir), 'utf8')
+    fd = fs.openSync(p, 'r+')
+    const raw = fs.readFileSync(fd, 'utf8')
     const data = JSON.parse(raw)
-    if (data.pid === process.pid && data.startedAt === record._lockAt) releaseLock(record._stateDir)
-  } catch (e) { /* 锁已不在：无事可做 */ }
+    if (data.pid === process.pid && data.token === record._lockToken) {
+      // 归属成立：原地单次 writeSync 覆写为 released 帧（同 inode，无 unlink、无
+      // truncate——中间态不可见）。released JSON 后补空格到原文件长度（JSON 尾部
+      // 空白合法），保证「读到的要么是完整旧锁、要么是完整 released 帧」，绝不出现
+      // 半旧半新或零字节窗口；若内容比原来长（不会发生，released 帧更短）就超写。
+      // 若此刻已被接管换主，校验不会通过；接管者随后覆盖则最后写者胜，语义仍正确。
+      const releasedFrame = Buffer.from(JSON.stringify({ pid: process.pid, startedAt: data.startedAt, token: record._lockToken, released: true }) + ' ', 'utf8')
+      const origLen = Buffer.byteLength(raw, 'utf8')
+      let payload = releasedFrame
+      if (releasedFrame.length < origLen) {
+        payload = Buffer.concat([releasedFrame, Buffer.alloc(origLen - releasedFrame.length, 0x20)])
+      }
+      fs.writeSync(fd, payload, 0, payload.length, 0)
+      fs.fsyncSync(fd)
+    }
+  } catch (e) { /* 锁已不在/内容不可读：无事可做 */ } finally {
+    if (fd !== null) { try { fs.closeSync(fd) } catch (e) { /* 已关 */ } }
+  }
 }
 
 // ── HTML 看板 ──────────────────────────────────────────────────────────────
@@ -320,7 +350,7 @@ function parseAction (body) {
   return Object.prototype.hasOwnProperty.call(ACTIONS, v) ? v : null
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log }) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken }) {
   if (!isValidToken(token)) {
     throw new Error(`XBK_CONSOLE_TOKEN 未设置或短于 ${TOKEN_MIN_LEN} 字符，控制台拒绝启动（fail-closed）`)
   }
@@ -328,6 +358,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 活跃子进程登记（Sourcery High：控制台关闭时子进程要一并终止，否则触发任务
   // 会在控制服务消失后继续抓取/推送）。close 回调里自行从集合摘除。
   const activeChildren = new Set()
+  // 锁归属 token：调用方传入（main 生成，SIGTERM 释放时须双匹配）；未传则随机。
+  // 测试可直接传固定值断言锁内容。
+  const ownerToken = typeof lockToken === 'string' && lockToken.length > 0 ? lockToken : crypto.randomBytes(12).toString('hex')
+  // 关停闸（评审 High：SIGTERM 后 readBody 回调仍可能 acquireLock/startAction）：
+  // 置位后 /trigger 一律 503，不认动作。由 main 的 shutdown 回调置位。
+  let shuttingDown = false
+  const setShuttingDown = () => { shuttingDown = true }
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost')
@@ -347,10 +384,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (req.method === 'POST' && url.pathname === '/trigger') {
+      if (shuttingDown) {
+        sendJson(res, 503, { error: '控制台正在关闭，动作未执行' })
+        return
+      }
       // S9383：promise 必须显式收尾——readBody 以 resolve 收口不会 reject，但仍接 .catch
       // 把意外异常转成 500，不留 floating promise。
       readBody(req)
         .then(({ body, aborted, over }) => {
+          // 关停竞态兜底：readBody 期间收到 SIGTERM 时，此刻不能再 acquireLock/startAction
+          // （评审 High：关停已清完 activeChildren，新 spawn 会逃过清理并留锁）。
+          if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
           // Sourcery Medium：请求中断（error 后 resolve）时 body 可能已含 action=run，
           // 客户端却已放弃——绝不能凭残缺请求启动真实推送；超限同理拒绝。
           if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
@@ -361,13 +405,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             return
           }
           const now = Date.now()
-          if (!acquireLock(stateDir, now)) {
+          if (!acquireLock(stateDir, now, ownerToken)) {
             sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
             return
           }
           const record = startAction(action, now, activeChildren)
           record._stateDir = stateDir
           record._lockAt = now
+          record._lockToken = ownerToken
           sendJson(res, 202, { id: record.id, action, label: record.label })
         })
         .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
@@ -417,7 +462,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     return origClose(cb)
   }
   server.on('close', killAll)
-  return { server, runs, activeChildren }
+  return { server, runs, activeChildren, setShuttingDown, ownerToken }
 }
 
 // ── 启动入口 ───────────────────────────────────────────────────────────────
@@ -428,10 +473,52 @@ function main () {
   // Sourcery Medium：与生产入口 / --status 同源解析缓存目录（含安全回退），
   // 不再手写默认值——否则 .xbk_cache_safe 生效时看板会读错目录。
   const stateDir = statusCacheDir()
-  const { server } = createConsole({ token, stateDir, port, host })
+  // 锁归属 token（评审 Medium：pid 复用会让「pid===process.pid」误认他人锁为自有；
+  // takeover 换主后 unlink 竞态也可能误删新主的锁）。锁内容带 token，释放须双匹配。
+  const lockToken = crypto.randomBytes(12).toString('hex')
+  const { server, activeChildren, setShuttingDown } = createConsole({ token, stateDir, port, host, lockToken })
+  // 优雅关闭（Sourcery #21 余量）：SIGTERM/SIGINT 默认行为不走 server.close，会留下
+  // ①还在跑的触发子进程 ②未释放的触发锁（下次触发 409 直到锁 age 超时）。这里统一收尾。
+  const shutdown = (signal) => {
+    setShuttingDown() // 关停闸：/trigger 即刻 503，readBody 回调不得再 spawn（评审 High）
+    console.log(`收到 ${signal}，关闭控制台：终止触发子进程并释放锁…`)
+    for (const child of activeChildren) {
+      try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
+    }
+    // 锁释放时机（评审 Medium G5F/G5K）：不能在 SIGKILL 后立刻 unlink（子进程还没死，
+    // 别的实例会立刻拿锁与垂死子进程重叠），也不能「读-判-删」（TOCTOU：判定后锁被
+    // 接管换主，unlink 误删新主锁）。正确序列：杀子进程 → 等每个子进程真正 close
+    // （close 回调里 releaseLockFor 已按 pid+token 双匹配释放）→ 全部收完才退出。
+    // activeChildren.clear() 不能提前——清了就收不到 close 计数。
+    const pending = [...activeChildren]
+    let exited = 0
+    const maybeFinish = () => {
+      exited++
+      if (exited >= pending.length) finishShutdown()
+    }
+    let finished = false
+    const finishShutdown = () => {
+      if (finished) return
+      finished = true
+      server.close(() => process.exit(0))
+      setTimeout(() => process.exit(0), 1000).unref()
+    }
+    if (pending.length === 0) {
+      finishShutdown()
+    } else {
+      for (const child of pending) {
+        // close 在子进程真正死后触发（SIGKILL 毫秒级）；同时兜底 3s 强制收尾，
+        // 防个别子进程 close 事件丢失导致控制台挂住不退。
+        child.once('close', maybeFinish)
+      }
+      setTimeout(finishShutdown, 3000).unref()
+    }
+  }
+  process.on('SIGTERM', () => shutdown('SIGTERM'))
+  process.on('SIGINT', () => shutdown('SIGINT'))
   server.listen(port, host, () => {
     console.log(`xbk-push 控制台已启动：http://${host}:${server.address().port}（缓存目录：${stateDir}）`)
-    console.log('鉴权：请求头 Authorization: Bearer <XBK_CONSOLE_TOKEN>，或浏览器打开 http://<host>:<port>/?token=<XBK_CONSOLE_TOKEN>；token 未设置或过短则拒绝启动')
+    console.log(`鉴权：请求头 Authorization: Bearer <XBK_CONSOLE_TOKEN>，或浏览器打开 http://${host}:${server.address().port}/?token=<XBK_CONSOLE_TOKEN>；token 未设置或过短则拒绝启动`)
     if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
       // Sourcery High：非回环绑定 = token 明文过网（HTTP 无 TLS）。此处只告警不强拒——
       // 内网受信环境是 README 认可的用法，但必须让操作者知道风险与缓解手段。
@@ -449,6 +536,7 @@ module.exports = {
   timingSafeEqualStr,
   acquireLock,
   releaseLock,
+  releaseLockFor,
   lockPath,
   parseAction,
   escapeHtml,
