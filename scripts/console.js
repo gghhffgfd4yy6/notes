@@ -50,8 +50,16 @@ function timingSafeEqualStr (a, b) {
   } catch (e) { return false }
 }
 
+// token 可用性口径（Sourcery Medium G_ot）：isValidToken 此前只看长度，但 token 要同时
+// 走三条通道——Authorization 头（fetch 只接受 ByteString：非 Latin-1 直接抛错）、
+// Set-Cookie（cookie-octet 禁 `;` `,` `"` `\` 与空白）、URL 查询参数。含这些字符的
+// token 能启动服务却让浏览器端全部请求失败——校验前移到启动闸，fail-closed。
+// 允许集：可见 ASCII（0x21–0x7e）再排除 `;` `,` `"` `\`。
+const TOKEN_VISIBLE_ASCII_RE = /^[\x21-\x7e]+$/
+const TOKEN_UNSAFE_CHARS_RE = /[;,"\\]/
 function isValidToken (token) {
-  return typeof token === 'string' && token.length >= TOKEN_MIN_LEN
+  return typeof token === 'string' && token.length >= TOKEN_MIN_LEN &&
+    TOKEN_VISIBLE_ASCII_RE.test(token) && !TOKEN_UNSAFE_CHARS_RE.test(token)
 }
 
 // ── 单飞锁 ─────────────────────────────────────────────────────────────────
@@ -336,6 +344,24 @@ function renderPage (state, runsList, query) {
 // 手写前缀匹配 + 切片，线性且语义等价（`Bearer ` 后取剩余全部，trim 一次容忍尾随空白）。
 // ⚠️ ?token= 会进访问日志/浏览器历史：README 明确建议只在受信网络或 TLS 代理后使用。
 const BEARER_PREFIX = 'Bearer '
+// 会话 Cookie 名（Sourcery G_oJ：ESM import/静态资产请求无法带 Authorization 头，
+// 页面鉴权后下发 HttpOnly Cookie，浏览器同源请求自动携带）。
+const SESSION_COOKIE = 'xbk_session'
+// 从 Cookie 头取会话值：手写解析（分号分段 + 首个 = 切分），不用正则
+// （CodeQL js/polynomial-redos：cookie 值虽是自产 token，解析仍保持线性）。
+function sessionCookieValue (cookieHeader) {
+  if (typeof cookieHeader !== 'string' || cookieHeader.length === 0) return null
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=')
+    if (eq <= 0) continue
+    const name = part.slice(0, eq).trim()
+    if (name === SESSION_COOKIE) {
+      const value = part.slice(eq + 1).trim()
+      return value.length > 0 ? decodeURIComponent(value) : null
+    }
+  }
+  return null
+}
 function authorize (req, token, urlQuery) {
   const header = req.headers.authorization || ''
   if (typeof header === 'string' && header.startsWith(BEARER_PREFIX)) {
@@ -345,6 +371,9 @@ function authorize (req, token, urlQuery) {
   // 浏览器路径：?token=xxx（urlQuery 由调用方传 URLSearchParams；单独接收以便测试）
   const supplied = urlQuery instanceof URLSearchParams ? urlQuery.get('token') : null
   if (typeof supplied === 'string' && supplied.length > 0 && timingSafeEqualStr(supplied, token)) return true
+  // 会话 Cookie 路径（Sourcery G_oJ）：同源 ESM import / 静态资产请求自动携带
+  const cookie = sessionCookieValue(req.headers && req.headers.cookie)
+  if (cookie !== null && timingSafeEqualStr(cookie, token)) return true
   return false
 }
 
@@ -382,7 +411,7 @@ function parseAction (body) {
 
 function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken }) {
   if (!isValidToken(token)) {
-    throw new Error(`XBK_CONSOLE_TOKEN 未设置或短于 ${TOKEN_MIN_LEN} 字符，控制台拒绝启动（fail-closed）`)
+    throw new Error(`XBK_CONSOLE_TOKEN 未设置、短于 ${TOKEN_MIN_LEN} 字符，或含浏览器无法传输的字符（仅允许可见 ASCII，禁 ; , " \\ 与空白），控制台拒绝启动（fail-closed）`)
   }
   fs.mkdirSync(stateDir, { recursive: true })
   // 活跃子进程登记（Sourcery High：控制台关闭时子进程要一并终止，否则触发任务
@@ -395,14 +424,23 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 置位后 /trigger 一律 503，不认动作。由 main 的 shutdown 回调置位。
   let shuttingDown = false
   const setShuttingDown = () => { shuttingDown = true }
+  // 幂等重放窗（Sourcery G_nm）：同 action 在窗口内的重复 POST 不再启动新子进程。
+  // 取 12 分钟 = PROC_TIMEOUT_MS(10min) + 往返余量——覆盖「响应丢失后用户重试时
+  // 首轮已结束但窗口仍在」的场景。跨动作不拦（想跑 check 后立刻跑 run 是合法操作）。
+  const REPLAY_WINDOW_MS = PROC_TIMEOUT_MS + 2 * 60 * 1000
+  let lastAccept = null
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost')
-    // 静态资产在鉴权闸之前：白名单精确匹配（STATIC_ASSETS），内容是公开前端代码
-    // （无 token、无数据、无用户内容），且 ESM 相对 import 无法携带页面 ?token=
-    // （Sourcery vvl/vw1：逐请求鉴权会让 vendor 模块链 401、SPA 挂不上）。
-    // 鉴权面收敛在 /（页面本体）与 /api/*、/trigger（数据与动作）。
+    // 静态资产路由（Sourcery G_oJ：资产也须鉴权——此前免鉴权的理由（ESM import 无法带头）
+    // 已被 Cookie 方案解决：页面通过鉴权后下发 HttpOnly 会话 Cookie，浏览器对同源
+    // ESM import/静态请求自动带 Cookie。无凭证请求一律 401，与文档口径一致。
+    // 白名单精确匹配（STATIC_ASSETS）保留：无路径穿越面。
     if (req.method === 'GET' && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
+      if (!authorize(req, token, url.searchParams)) {
+        sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
       serveStatic(res, STATIC_ASSETS[url.pathname])
       return
     }
@@ -413,6 +451,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     if (req.method === 'GET' && url.pathname === '/') {
       const state = readStatus(stateDir)
       const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
+      // 鉴权通过后下发会话 Cookie（Sourcery G_oJ）：HttpOnly（JS 不可读，XSS 拿不走）、
+      // SameSite=Strict（跨站请求不携带）、Path=/；token 本身就是会话凭证，无需另发随机值。
+      // Max-Age 30 天：自用工具，过期后重新打开 ?token= 链接即续期。
+      res.setHeader('Set-Cookie',
+        `xbk_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`)
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(renderPage(state, runsList, url.searchParams))
       return
@@ -443,6 +486,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             return
           }
           const now = Date.now()
+          // 幂等重放窗（Sourcery G_nm：提交 202 后响应丢失 → 用户重试 → 首轮已结束释放
+          // 锁 → 重试被当作新触发再跑一轮真实推送）。解法：受理时登记
+          // lastAccept = { action, at }；同 action 在 REPLAY_WINDOW_MS 内的重复提交
+          // 返回 409 + 首轮 run id（前端把它当「已在跑」呈现，不再发起新一轮）。
+          // 窗口 > PROC_TIMEOUT_MS（子进程最长生命周期）：首轮结束后锁已释放，但重放
+          // 窗仍拦截——这正是修复点。跨动作/超窗不受影响，人工重跑语义保留。
+          const prev = lastAccept
+          if (prev && prev.action === action && now - prev.at < REPLAY_WINDOW_MS) {
+            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: prev.runId, replayBlocked: true })
+            return
+          }
           if (!acquireLock(stateDir, now, ownerToken)) {
             sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
             return
@@ -451,6 +505,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           record._stateDir = stateDir
           record._lockAt = now
           record._lockToken = ownerToken
+          lastAccept = { action, at: now, runId: record.id }
           sendJson(res, 202, { id: record.id, action, label: record.label })
         })
         .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
@@ -577,6 +632,8 @@ module.exports = {
   releaseLockFor,
   lockPath,
   parseAction,
+  sessionCookieValue,
+  SESSION_COOKIE,
   escapeHtml,
   formatMs,
   renderPage,

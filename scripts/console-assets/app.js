@@ -25,6 +25,9 @@ const POLL_BUSY_MS = 2000
 // 提交成功后按钮锁定的最长兜底时长（Sourcery vwU/vv2：轮询竞态/请求挂起时不能永久锁死；
 // 上限 = 服务端 PROC_TIMEOUT_MS(10min) + 提交往返余量，取 11 分钟）。
 const BUSY_FALLBACK_MS = 11 * 60 * 1000
+// fetch 请求期限（Sourcery G_n6）：挂起连接不得阻塞刷新链路；超时由 AbortController 取消，
+// 走正常 reject 路径（「刷新失败」可见），不会堆积请求。
+const FETCH_TIMEOUT_MS = 8000
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
 function fmtTime (ts) {
@@ -41,8 +44,16 @@ function fmtNum (n) {
 // ── API ─────────────────────────────────────────────────────────────────────
 // token 只走 Authorization: Bearer 头（URL 不带任何凭证；console.js 服务端不打访问日志，
 // 但浏览器扩展/中间代理可能记 URL——凭证不进 URL 是更安全的默认）。
+// fetch 期限（Sourcery G_n6）：8s 超时 AbortController 取消——挂起请求走 reject，
+// 刷新链路不阻塞，历史与状态在下一轮照常更新。
+function fetchWithTimeout (url, opts) {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS)
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t))
+}
+
 async function apiGet (path) {
-  const res = await fetch(path, {
+  const res = await fetchWithTimeout(path, {
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -51,7 +62,7 @@ async function apiGet (path) {
 
 async function trigger (action) {
   const body = new URLSearchParams({ action })
-  const res = await fetch('/trigger', {
+  const res = await fetchWithTimeout('/trigger', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -60,7 +71,16 @@ async function trigger (action) {
     body
   })
   const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+  if (!res.ok) {
+    // 服务端幂等重放窗（与 console.js REPLAY_WINDOW_MS 配套）：同动作重试被拦时
+    // 返回首轮 runId——提示用户「那一轮已经在跑/已完成」，前端顺手刷新历史。
+    if (data && data.replayBlocked && data.runId) {
+      const err = new Error('刚才那次触发已受理（正在运行或已完成），未重复执行')
+      err.replayRunId = data.runId
+      throw err
+    }
+    throw new Error(data.error || `HTTP ${res.status}`)
+  }
   return data
 }
 
@@ -73,6 +93,18 @@ function Badge ({ tone, children }) {
 }
 
 // ── 状态归类（Sourcery vvy/vv4/vvX/vwc/vvG：错误态/中断态/畸形条目/失败数不得伪装成健康）──
+
+// 部件三态判定（Sourcery G_od/G_oY）：readStatus 对「文件还没建」返回 truthy status
+// （'missing'）且无 value——缺失 ≠ 异常，应中性；「存在但不可读/超限/校验失败」
+// （'invalid'/'tooLarge'/...）才是异常，必须标红，不得伪装成「暂无记录」。
+// 返回：'ok'（绿）| 'bad'（红）| 'run'（中性）。
+function partTone (part, isOk) {
+  if (!part) return 'run'
+  if (part.status === 'ok') return isOk ? 'ok' : 'bad'
+  // ok 之外的显式 status：missing → 中性；invalid/tooLarge 等 → 异常
+  if (part.status === 'missing') return 'run'
+  return 'bad'
+}
 
 // runOk：最近一轮必须「status=ok 且未中断且 failed=0」才算绿（Sourcery vvG：failed>0 不得绿）。
 function runIsOk (state) {
@@ -90,25 +122,35 @@ function repIsOk (state) {
   return !(typeof v.failed === 'number' && v.failed > 0)
 }
 
-// 通道条目合法性（Sourcery vvC：必须同时有 consecutiveFailures 数字与 lastFailureAt 数字，
-// 缺任一字段视为畸形条目，不进展示与健康判定）。
+// 通道条目合法性（Sourcery vvC + G_oE：与 scripts/status.js 的 validChannelEntry 同口径——
+// 三个计数字段必须同时为非负安全整数，服务端以 lastAlertAt 为必需字段，前端镜像；
+// 缺任一字段或负数视为畸形条目，不进展示与健康判定）。
+function validCounter (v) {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
+}
 function validChannelEntry (name, entry) {
   return typeof name === 'string' && name.length > 0 &&
-    entry !== null && typeof entry === 'object' &&
-    typeof entry.consecutiveFailures === 'number' &&
-    typeof entry.lastFailureAt === 'number'
+    entry !== null && typeof entry === 'object' && !Array.isArray(entry) &&
+    validCounter(entry.consecutiveFailures) &&
+    validCounter(entry.lastFailureAt) &&
+    validCounter(entry.lastAlertAt)
 }
 
 function channelInfo (state) {
-  // 缺整个 channels 段 → 中性（Sourcery vvO：缺失数据不得标红）
-  if (!state || !state.channels || !state.channels.value || typeof state.channels.value !== 'object') {
-    return { tone: 'run', entries: [], note: '暂无记录' }
-  }
+  // Sourcery G_oY：先看部件 status 再看 value——
+  //   missing（文件还没建）→ 中性「暂无记录」；
+  //   invalid/tooLarge 等坏读 → 红「状态异常」，不得伪装成暂无记录；
+  //   ok 但 value 缺失 → 异常（服务端 ok 必带 value，缺失即契约破坏）。
+  if (!state || !state.channels) return { tone: 'run', entries: [], note: '暂无记录' }
+  if (state.channels.status === 'missing') return { tone: 'run', entries: [], note: '暂无记录' }
+  if (state.channels.status !== 'ok') return { tone: 'bad', entries: [], note: '状态异常' }
   const raw = state.channels.value
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { tone: 'bad', entries: [], note: '状态异常' }
+  }
   const entries = Object.keys(raw)
     .filter((k) => validChannelEntry(k, raw[k]))
     .map((k) => ({ name: k, failures: raw[k].consecutiveFailures }))
-  if (state.channels.status !== 'ok') return { tone: 'bad', entries, note: '状态异常' }
   // 空表 ≠ 未配置：只显示中性「暂无记录」（Sourcery vwc）。
   if (entries.length === 0) return { tone: 'run', entries, note: '暂无记录' }
   const tone = entries.every((e) => e.failures === 0) ? 'ok' : 'bad'
@@ -119,11 +161,11 @@ function channelInfo (state) {
 function StatusCards ({ state }) {
   if (!state) return null
   const rep = state.report && state.report.value ? state.report.value : null
-  const repOk = repIsOk(state)
-  const repTone = rep === null && !(state.report && state.report.status) ? 'run' : (repOk ? 'ok' : 'bad')
+  // Sourcery G_od/G_oY：三态判定走 partTone——missing=中性（文件还没建很正常），
+  // invalid/tooLarge=红（数据坏了必须看见），ok+健康=绿。
+  const repTone = partTone(state.report, repIsOk(state))
   const run = state.run && state.run.value ? state.run.value : null
-  const runOk = runIsOk(state)
-  const runTone = run === null && !(state.run && state.run.status) ? 'run' : (runOk ? 'ok' : 'bad')
+  const runTone = partTone(state.run, runIsOk(state))
   const chan = channelInfo(state)
 
   const cards = [
@@ -181,15 +223,24 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
     setErr('')
     setBusy(true)
     try {
-      await trigger(action)
-      onTriggered()
+      // 202 响应带首轮 runId——交给 App 登记为 busy 归属（G_nv 解锁判据）。
+      const data = await trigger(action)
+      onTriggered(data && typeof data.id === 'number' ? data.id : null)
       // busy 不在此处清零（Sourcery vvo）：202 只代表已受理，子进程还在跑；
-      // App 的 active 派生 + BUSY_FALLBACK 兜底负责解锁。
+      // App 的「提交轮进历史」派生 + BUSY_FALLBACK 兜底负责解锁。
     } catch (e) {
+      // 幂等重放窗命中（服务端 replayBlocked）：首轮已受理，提示后立即刷新历史
+      // 并解锁——这与「提交失败」不同，不该锁按钮。
+      if (e && e.replayRunId) {
+        setErr(`${e.message}（运行 #${e.replayRunId}）`)
+        setBusy(false)
+        onTriggered(e.replayRunId)
+        return
+      }
       setErr(e.message === '已有触发任务在运行（或锁未过期），请稍后再试'
         ? '已有任务在运行，请等它结束'
         : `触发失败：${e.message}`)
-      setBusy(false) // 只有「提交失败」才立即解锁；提交成功的解锁交给 active 派生
+      setBusy(false) // 只有「提交失败」才立即解锁；提交成功的解锁交给「进历史」派生
     }
   }, [onTriggered, setBusy])
 
@@ -214,9 +265,16 @@ function RunsPanel ({ runs, pollMs }) {
   // 乱序防护（Sourcery vwI）：detail 请求领号，落后响应丢弃。
   const detailSeqRef = useRef(0)
 
+  // 切换目标 run 时立即清旧详情（Sourcery G_oi）：否则上一个 run 的日志/错误
+  // 会挂在新 run 的标题下（请求未返回期间）。清空也重置加载态。
+  useEffect(() => {
+    setDetail(null)
+    setDetailErr('')
+  }, [openId])
+
   // 日志面板：打开期间跟随运行状态轮询（Sourcery vv-：运行中的输出要持续刷新）。
   useEffect(() => {
-    if (openId === null) { setDetail(null); setDetailErr(''); return undefined }
+    if (openId === null) return undefined
     let dead = false
     const fetchOnce = async () => {
       const seq = ++detailSeqRef.current
@@ -279,7 +337,14 @@ function RunsPanel ({ runs, pollMs }) {
         <span>运行 #${openId} 输出${openActive ? '（实时跟随）' : ''}</span>
         <button class="btn btn-ghost" onClick=${() => setOpenId(null)}>关闭</button>
       </div>
-      <pre class="logpre">${detailErr || (detail && detail.output ? detail.output : (openActive ? '等待输出…' : '加载中…'))}</pre>
+      <pre class="logpre">${
+        detailErr ||
+        (detail === null
+          ? '加载中…'
+          // Sourcery G_oq：detail 已加载但 output 为空串 = 该轮合法地没有任何输出，
+          // 必须显示「（无输出）」而不是永远「加载中…」。
+          : (typeof detail.output === 'string' && detail.output.length > 0 ? detail.output : '（无输出）'))
+      }</pre>
     </div>`}
   </div>`
 }
@@ -293,25 +358,39 @@ function App () {
   const [syncErr, setSyncErr] = useState('')
   const timerRef = useRef(null)
   const seqRef = useRef(0)
-  // busy 的兜底闹钟（Sourcery vwU/vv2：提交成功但轮询竞态/请求挂起时，
-  // 到点强制解锁，按钮永不永久失效；正常路径 active 派生会先解锁）。
-  const busySinceRef = useRef(0)
+  // 轮询互斥（Sourcery G_oY）：上一轮未完成时跳过本轮 tick，不在途中叠加新请求
+  // （fetch 有 8s 期限，跳过最多让数据晚 2-5s 更新，换来零堆积）。
+  const inFlightRef = useRef(false)
+  // busy 由哪一次提交引起（Sourcery G_nv：解锁判据是「提交的那一轮出现在历史里」，
+  // 不管它现在是否已结束——否则任务秒完成时按钮锁到 11 分钟兜底才开）。
+  const busyRunIdRef = useRef(null)
 
   // vwD：逐请求独立收口——status 失败时 runs 结果仍可用（反之亦然）；
+  // 并行发出（Sourcery G_n6）：串行 await 会让慢端点拖住另一端点的更新。
   // 乱序防护（Sourcery vwE）：每次 refresh 领号，落后响应直接丢弃（落后 ≠ 失败，
   // 落后者静默丢弃不报错——Sourcery vwB：报「刷新失败」是误导）。
   const refreshSplit = useCallback(async () => {
+    if (inFlightRef.current) return
+    inFlightRef.current = true
     const seq = ++seqRef.current
     const errs = []
-    await apiGet('/api/status')
-      .then((s) => { if (seq === seqRef.current) { setState(s); setSyncErr('') } })
-      .catch((e) => { errs.push(`状态 ${e.message}`) })
-    await apiGet('/api/runs')
-      .then((r) => { if (seq === seqRef.current) { setRuns(r.runs || []); setLastSync(Date.now()) } })
-      .catch((e) => { errs.push(`历史 ${e.message}`) })
-    if (seq !== seqRef.current) return
-    if (errs.length > 0) setSyncErr(`刷新失败：${errs.join('；')}（自动重试中）`)
-    else setSyncErr('')
+    const applyStatus = (s) => { if (seq === seqRef.current) { setState(s); setSyncErr('') } }
+    const applyRuns = (r) => { if (seq === seqRef.current) { setRuns(r.runs || []); setLastSync(Date.now()) } }
+    try {
+      const [sRes, rRes] = await Promise.allSettled([
+        apiGet('/api/status'),
+        apiGet('/api/runs')
+      ])
+      if (sRes.status === 'fulfilled') applyStatus(sRes.value)
+      else errs.push(`状态 ${sRes.reason && sRes.reason.message ? sRes.reason.message : sRes.reason}`)
+      if (rRes.status === 'fulfilled') applyRuns(rRes.value)
+      else errs.push(`历史 ${rRes.reason && rRes.reason.message ? rRes.reason.message : rRes.reason}`)
+      if (seq !== seqRef.current) return
+      if (errs.length > 0) setSyncErr(`刷新失败：${errs.join('；')}（自动重试中）`)
+      else setSyncErr('')
+    } finally {
+      inFlightRef.current = false
+    }
   }, [])
 
   // 轮询节奏（Sourcery vvJ）：任务在跑时必须用快轮询——以 locking（而非 busy）为节奏源，
@@ -329,15 +408,24 @@ function App () {
   // vwU/vv2：busy 提交成功后启动兜底闹钟；active 确认或超时即清。
   useEffect(() => {
     if (!busy) return undefined
-    busySinceRef.current = Date.now()
     const t = setTimeout(() => setBusy(false), BUSY_FALLBACK_MS)
     return () => clearTimeout(t)
   }, [busy])
 
-  // active 确认任务已进历史 → busy 使命完成（正常解锁路径）。
+  // 正常解锁路径（Sourcery G_nv）：busy 期间每次刷新比对「提交的那一轮是否已进历史」
+  // ——不管它现在运行中还是已结束，出现即解锁。秒完成的任务不再锁到兜底超时。
   useEffect(() => {
-    if (busy && active) setBusy(false)
-  }, [busy, active])
+    if (!busy || busyRunIdRef.current === null) return
+    if (runs.some((r) => r.id === busyRunIdRef.current)) {
+      busyRunIdRef.current = null
+      setBusy(false)
+    }
+  }, [busy, runs])
+
+  const handleTriggered = useCallback((runId) => {
+    if (typeof runId === 'number') busyRunIdRef.current = runId
+    refreshSplit()
+  }, [refreshSplit])
 
   return html`<div class="wrap">
     <header class="topbar">
@@ -353,7 +441,7 @@ function App () {
     </header>
 
     <${StatusCards} state=${state} />
-    <${TriggerBar} onTriggered=${refreshSplit} locking=${locking} setBusy=${setBusy} />
+    <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
     <${RunsPanel} runs=${runs} pollMs=${locking ? POLL_BUSY_MS : POLL_MS} />
 
     <footer class="foot">

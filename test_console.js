@@ -36,6 +36,26 @@ ok('isValidToken: 过短/非字符串/空串拒绝', () => {
   assert.strictEqual(isValidToken(undefined), false)
   assert.strictEqual(isValidToken(1.2345678901234568e21), false)
 })
+ok('isValidToken: 浏览器不可传输字符拒绝（Sourcery G_ot）', () => {
+  assert.strictEqual(isValidToken('a\u00e9'.repeat(16)), false, '非 Latin-1（fetch ByteString 会抛错）拒绝')
+  assert.strictEqual(isValidToken('a'.repeat(8) + ';b'.repeat(4)), false, '分号（Set-Cookie 分隔符）拒绝')
+  assert.strictEqual(isValidToken('a'.repeat(8) + ',b'.repeat(4)), false, '逗号拒绝')
+  assert.strictEqual(isValidToken('a'.repeat(8) + '"b'.repeat(4)), false, '双引号拒绝')
+  assert.strictEqual(isValidToken('a'.repeat(8) + '\\b'.repeat(4)), false, '反斜杠拒绝')
+  assert.strictEqual(isValidToken('a'.repeat(8) + ' b'.repeat(4)), false, '空白拒绝')
+  assert.strictEqual(isValidToken('-_.~' + 'a'.repeat(28)), true, '安全符号仍合法')
+})
+ok('sessionCookieValue: 解析/多段/无值/null', () => {
+  const { sessionCookieValue, SESSION_COOKIE } = require('./scripts/console')
+  assert.strictEqual(SESSION_COOKIE, 'xbk_session')
+  assert.strictEqual(sessionCookieValue('xbk_session=abc; other=1'), 'abc')
+  assert.strictEqual(sessionCookieValue('other=1; xbk_session=abc'), 'abc')
+  assert.strictEqual(sessionCookieValue('xbk_session=a%40b'), 'a@b', 'decodeURIComponent 还原')
+  assert.strictEqual(sessionCookieValue('xbk_session='), null)
+  assert.strictEqual(sessionCookieValue('other=1'), null)
+  assert.strictEqual(sessionCookieValue(''), null)
+  assert.strictEqual(sessionCookieValue(undefined), null)
+})
 ok('createConsole: token 缺失/过短 fail-closed 拒启', () => {
   assert.throws(() => createConsole({ token: undefined, stateDir: tmpDir() }), /XBK_CONSOLE_TOKEN/)
   assert.throws(() => createConsole({ token: 'short', stateDir: tmpDir() }), /XBK_CONSOLE_TOKEN/)
@@ -197,9 +217,10 @@ ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）
 function listen (server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)))
 }
-function request (port, method, urlPath, { token, body } = {}) {
+function request (port, method, urlPath, { token, body, headers } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, method, path: urlPath, headers: token ? { authorization: `Bearer ${token}` } : {} }, (res) => {
+    const base = token ? { authorization: `Bearer ${token}` } : {}
+    const req = http.request({ host: '127.0.0.1', port, method, path: urlPath, headers: { ...base, ...(headers || {}) } }, (res) => {
       let buf = ''
       res.on('data', c => { buf += c })
       res.on('end', () => resolve({ status: res.statusCode, text: buf, headers: res.headers }))
@@ -241,25 +262,32 @@ async function main () {
     assert.ok(res.text.includes('缺失'), `空缓存目录必须渲染「缺失」分支，实际片段：${res.text.slice(0, 400)}`)
     server.close()
   })
-  await aok('HTTP: /assets/* 白名单资产免 token（ESM 链无法带凭证）；未知资产/穿越仍 404', async () => {
+  await aok('HTTP: /assets/* 须鉴权（无凭证 401；token/Cookie 200）；未知资产/穿越仍 404', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
-    // 无 token 直取资产必须 200（Sourcery vvl/vw1：ESM 相对 import 带不了页面 ?token=，
-    // 逐请求鉴权会让 vendor 链 401；资产本身无敏感内容，鉴权面在 / 与 /api/*、/trigger）。
+    // Sourcery G_oJ：资产与数据同面鉴权——无凭证一律 401（与文档口径一致）；
+    // 浏览器凭 / 鉴权后下发的会话 Cookie 满足 ESM import 无法带头的限制。
     const css = await request(port, 'GET', '/assets/app.css')
-    assert.strictEqual(css.status, 200, '资产免 token')
-    assert.match(css.headers['content-type'], /text\/css/)
-    assert.ok(css.text.includes('--bg'), 'CSS 内容真实（自定义属性存在）')
+    assert.strictEqual(css.status, 401, '资产无凭证必须 401')
+    const cssTok = await request(port, 'GET', '/assets/app.css', { token: TOKEN })
+    assert.strictEqual(cssTok.status, 200, '?token= 可取资产')
+    assert.match(cssTok.headers['content-type'], /text\/css/)
+    assert.ok(cssTok.text.includes('--bg'), 'CSS 内容真实（自定义属性存在）')
+    const cssCookie = await request(port, 'GET', '/assets/app.css', { headers: { cookie: `xbk_session=${TOKEN}` } })
+    assert.strictEqual(cssCookie.status, 200, '会话 Cookie 可取资产（ESM 链路径）')
+    // 页面响应必须下发会话 Cookie（HttpOnly/SameSite=Strict）
+    const page = await request(port, 'GET', '/', { token: TOKEN })
+    assert.ok((page.headers['set-cookie'] || []).some(c => c.startsWith('xbk_session=')), '/ 鉴权后下发会话 Cookie')
     const js = await request(port, 'GET', '/assets/app.js', { token: TOKEN })
     assert.strictEqual(js.status, 200)
     assert.match(js.headers['content-type'], /text\/javascript/)
     // Sourcery vwr：不能只断言状态码+MIME——空壳 app.js 也过。锁死模块内容标志。
     assert.ok(js.text.includes("from './htm-preact.module.js'"), 'app.js 含真实 import（非空壳）')
     assert.ok(js.text.includes('render('), 'app.js 含 render 调用')
-    const lib = await request(port, 'GET', '/assets/htm-preact.module.js')
+    const lib = await request(port, 'GET', '/assets/htm-preact.module.js', { token: TOKEN })
     assert.strictEqual(lib.status, 200)
     assert.ok(lib.text.length > 10000, '运行时文件非空壳')
-    // token 绝不进资产响应（资产免鉴权的安全边界）。
+    // token 绝不进资产响应（资产不含用户数据的安全边界）。
     assert.ok(!js.text.includes(TOKEN), 'app.js 内容不含 token')
     assert.ok(!lib.text.includes(TOKEN), 'vendor 内容不含 token')
     const nope = await request(port, 'GET', '/assets/nope.js', { token: TOKEN })
@@ -323,9 +351,16 @@ async function main () {
     assert.ok(rec && rec.finishedAt, '子进程应在 30s 内结束（--check 环境检查很快）')
     const lockAfter = fs.existsSync(lockPath(dir)) ? JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')) : null
     assert.ok(!lockAfter || lockAfter.released === true, '结束后锁必须释放（移除或作废）')
-    const third = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
-    assert.strictEqual(third.status, 202, '锁释放后可再次触发')
-    // 清理第二个 run 的子进程（可能还在跑）
+    // 幂等重放窗（Sourcery G_nm）：首轮结束+锁已释放，但同 action 重试在窗口内仍须 409
+    // （防「202 响应丢失 → 重试 → 再跑一轮真实推送」），且响应带首轮 runId。
+    const replay = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+    assert.strictEqual(replay.status, 409, '重放窗内同 action 重试必须 409（首轮已结束也拦）')
+    const replayBody = JSON.parse(replay.text)
+    assert.strictEqual(replayBody.runId, firstBody.id, '409 响应指向首轮 run')
+    assert.strictEqual(replayBody.replayBlocked, true, '标记为重放拦截（非锁冲突）')
+    // 跨动作不受重放窗影响：run 在 check 的窗口期内仍可触发（合法操作）。
+    const crossAction = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
+    assert.strictEqual(crossAction.status, 202, '跨动作不受重放窗拦截')
     server.close()
   })
   await aok('HTTP: /api/runs 列表与 /api/runs/:id 详情', async () => {

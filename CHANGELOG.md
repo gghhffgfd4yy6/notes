@@ -281,3 +281,16 @@
 - 端点变化：`GET /`（SPA 壳）、`GET /assets/*`（白名单静态资产，no-cache + ETag）；`/api/status`、`POST /trigger`、`/api/runs`、`/api/runs/:id` 语义不变（前端 fetch 同源调用）。
 - 测试：`test_console.js` 19→**26 断言**：renderPage 断言改 JSON 岛/CSP/资产引用（不再 meta refresh）；新增 `/assets/*` 白名单与路径穿越 404、看板 SPA 壳端到端。
 - 版本 bump 至 3.285.0（四处同步）。
+
+## v3.286
+
+- 控制台触发幂等重放窗（Sourcery G_nm）：同动作在 12 分钟窗口（PROC_TIMEOUT_MS + 2min）内的重复 POST /trigger 返回 409 并附首轮 runId（replayBlocked 标记）——堵住「202 响应丢失 → 用户重试 → 首轮已结束释放锁 → 再跑一轮真实推送」的重复推送路径。跨动作不受拦截。
+- 静态资产纳入鉴权（Sourcery G_oJ）：/assets/* 无凭证一律 401；页面鉴权后下发会话 Cookie（xbk_session，HttpOnly + SameSite=Strict + Path=/ + Max-Age 30 天），浏览器对同源 ESM import/静态请求自动携带，解决「ESM 无法带 Authorization 头」的原免鉴权理由。authorize 新增 Cookie 通道（timingSafeEqual 同口径）。
+- token 可用性校验前移（Sourcery G_ot）：isValidToken 除 ≥16 字符外，限定可见 ASCII（0x21–0x7e）且禁 ; , " \\ 与空白——含 fetch ByteString/Set-Cookie 无法承载字符的 token 在启动闸 fail-closed，不再「能启动但浏览器全挂」。
+- 前端竞态与状态语义治理（Sourcery G_nv/G_n6/G_oY/G_oi/G_oq/G_od/G_oE/G_oR）：
+  - busy 解锁判据改为「提交的那一轮出现在历史里」（202 响应携带 runId），任务秒完成不再锁按钮到 11 分钟兜底；
+  - fetch 全部加 8s AbortController 期限；刷新两请求改 Promise.allSettled 并行 + in-flight 互斥（跳过重叠 tick，零堆积）；
+  - 日志面板切换目标 run 时立即清旧详情，不再短暂显示上一轮日志；空输出显示「（无输出）」而非永远「加载中…」；
+  - 部件三态：missing=中性、invalid/tooLarge=红、ok+健康=绿——缺数据不再标红、坏数据不再伪装「暂无记录」；
+  - validChannelEntry 与服务端 status.js 同口径（三计数字段非负安全整数，含 lastAlertAt），畸形条目不进展示与健康判定。
+- 版本 bump 至 3.286.0（四处同步）。

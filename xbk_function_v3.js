@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.285 — 网页控制台（scripts/console.js）：只读看板 + 单飞锁手动触发，token fail-closed *********
+//* ******* 线报酷推送脚本 v3.286 — 网页控制台：触发幂等重放窗 + 会话 Cookie 资产鉴权 + 前端竞态治理 *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
