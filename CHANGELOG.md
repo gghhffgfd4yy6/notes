@@ -306,5 +306,5 @@
 
 ## v3.288
 
-- Codacy Critical（前端 SSRF 启发式误报消除）：app.js 的 fetch 此前直接收调用方模板串（/api/runs/${id}），被 Codacy 数据流分析判为「用户可控 URL 进 HTTP 客户端库」。改为 API_PATHS 常量白名单查表：apiGet(name, arg) 只接受表内端点名，动态段（run id）经 encodeURIComponent 拼在固定前缀后——fetch 的 URL 数据流从查表处取值，taint 链断裂。行为不变（同源四端点）。
+- Codacy Critical（前端 SSRF 启发式误报消除）：app.js 的 fetch 此前直接收调用方模板串（/api/runs/${id}），被 Codacy 数据流分析判为「用户可控 URL 进 HTTP 客户端库」。重构为每端点独立函数（apiGetStatus / apiGetRuns / apiGetRunDetail / trigger），fetch 的 URL 全部为字面量；runDetail 的 id 经 Number(id).toFixed(0) 强制数值化（即使上游传字符串也只能得到数字文本，无法构造任意路径）。行为不变（同源四端点）。
 - 版本 bump 至 3.288.0（四处同步）。
