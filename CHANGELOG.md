@@ -351,3 +351,19 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 频道空名条目对齐后端口径：前端不再判畸形，展示用「(空名)」占位（app.js）；后端 validChannels 语义保持 SS-02 逐条容错不变。
 - 前端 11 分钟兜底清 busy 时同步清 `busyRunIdRef`，旧归属不再提前解锁新提交（app.js）。
 - 2 条 outdated 线程（旧 diff 引用）+ 2 条 vendor XSS 误报回评豁免后 resolve；未解决对话回到 0。
+
+## v3.296
+
+网页控制台安全修复批次（三轮并行代码审查后的落地，审查对象 = #221/#222/#224 三次提交）：
+
+- **畸形请求行防御**（高危）：`new URL(req.url, …)` 对畸形 request-target（如 `GET //@:99999/`）抛 TypeError，该行位于鉴权之前且无 try/catch——一条无凭证请求即可崩掉整个控制台进程（触发锁残留到陈旧接管、看板下线）。解析失败一律 400，进程存活（回归：raw socket 用例 + 存活断言）。
+- **released 帧短帧化**：原地覆写的 released 帧原含 pid/startedAt/token，恒比原锁帧长，「补空格到原长」分支是死代码，跨扇区半旧半新窗承诺未兑现。改为 `{"released":true}` 短帧（归属判定完成后 pid/token 无保留价值），补空格分支真正生效；锁接管对畸形 released 变体的 fail-closed 行为补回归。
+- **SIGTERM 优雅关闭补排空**：`server.close` 只挡新连接，补 `closeIdleConnections()`（立即）+ 500ms 后 `closeAllConnections()`（在途请求完成窗口），1s 强退兜底不变；keep-alive 连接不再被硬断（回归：子进程 SIGTERM 端到端用例——锁帧 released、子进程被杀、退出码 0）。
+- **/trigger 落盘失败释放锁**：lastAccept 持久化失败返回 500 时，已获取的触发锁无人释放（子进程未启动、close 回调无从触发），泄漏到 10 分钟陈旧接管。失败分支显式 `releaseLockFor`。
+- **子进程环境剥离 `XBK_CONSOLE_TOKEN`**：触发子进程（及其再拉起的工具、崩溃 env dump）不再携带控制台凭证。
+- **Bearer scheme 大小写不敏感**（RFC 9110）：`bearer <token>` 不再 401；仍手写前缀匹配 + 切片（无正则回溯面）。
+- **CSP 补响应头通道**：`frame-ancestors 'none'` 只能经 HTTP 响应头下发（meta http-equiv 形态被浏览器按规范忽略）。GET / 以响应头下发完整 CSP，meta 保留同串兜底（共用 `CSP_HEADER` 常量）。
+- **删除 `releaseLock`**：按路径 `unlinkSync` 删锁违反本仓 CodeQL 铁律（check-then-act），且已无生产调用方——从实现与导出面移除，释放一律走 `releaseLockFor` 原地覆写。
+- **删除死模块 `scripts/console-assets/index.js`**：注释声称「供 test_console.js 校验」，实际无任何文件 require。
+- **vendor 锚点**：app.js 头注释补 htm-preact.module.js 的来源 URL、sha256 与 CVE-2026-22028 影响区间备注；剥离 vendored 文件尾部的 sourcery-ignore 注释（豁免本就以 .sourcery.yaml ignore 承载，不再污染上游产物）。
+- **`XBK_CONSOLE_PORT=0` 语义修正**：`Number(env) || 7777` 会把合法的 `0`（随机端口）吞成 7777；改为显式判空（README 同步）。

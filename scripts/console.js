@@ -155,9 +155,9 @@ function acquireLock (stateDir, now, token) {
   }
 }
 
-function releaseLock (stateDir) {
-  try { fs.unlinkSync(lockPath(stateDir)) } catch (e) { /* 不存在即已释放 */ }
-}
+// releaseLock（按路径 unlinkSync 删锁）已删除（v3.296）：本仓 CodeQL 铁律——锁类代码
+// 禁止 unlinkSync 按路径删（check-then-act），释放一律走 releaseLockFor 的原地覆写作废。
+// 它此前已无生产调用方，继续留在导出面就是未来的回归入口。
 
 // ── 触发执行 ───────────────────────────────────────────────────────────────
 // 子进程输出进内存缓冲（环形上限 RUN_LOG_MAX_BYTES，按 UTF-8 字节计），供看板轮询；
@@ -189,9 +189,11 @@ function startAction (actionKey, now, activeChildren) {
     for (const k of oldest) runs.delete(k)
   }
   // 环境继承：剥离 XBK_DRY_RUN（Sourcery High：控制台自身带 XBK_DRY_RUN=1 时，
-  // 「正式运行」会被子进程静默降级为 dry-run，承诺的推送不会发生）。
+  // 「正式运行」会被子进程静默降级为 dry-run，承诺的推送不会发生）；剥离
+  // XBK_CONSOLE_TOKEN（子进程及其再拉起的工具、崩溃时的 env dump 都不该带控制台凭证）。
   const childEnv = { ...process.env }
   delete childEnv.XBK_DRY_RUN
+  delete childEnv.XBK_CONSOLE_TOKEN
   const child = spawn(process.execPath, [entryFile, ...action.args], {
     cwd: ROOT,
     env: childEnv,
@@ -240,7 +242,7 @@ function releaseLockFor (record) {
   // TOCTOU 收口（评审 Medium G5K + CodeQL js/file-system-race）：「读-判-删」按路径
   // unlink 存在 check-then-act 窗口——判定后锁可能被接管换主，unlink 会误删新主锁，
   // 或删掉后第三进程立刻拿锁与新主重叠。改为**原地覆写作废**：归属校验通过后把同一
-  // fd 的内容覆写为 {"released":true,...}（writeFileSync 同 fd = 同 inode 原子覆盖），
+  // fd 的内容覆写为 released 短帧 {"released":true}（writeFileSync 同 fd = 同 inode 覆写），
   // acquireLock 读到 released 锁立即视为可接管（与无锁等价）。全程不 unlink 路径，
   // 无任何按路径删除动作，竞态无从谈起。锁文件残留由下次 acquireLock 的 released
   // 短路 + 哨兵接管机制兜底，不会阻塞触发。
@@ -251,15 +253,17 @@ function releaseLockFor (record) {
     const raw = fs.readFileSync(fd, 'utf8')
     const data = JSON.parse(raw)
     if (data.pid === process.pid && data.token === record._lockToken) {
-      // 归属成立：原地单次 writeSync 覆写为 released 帧（同 inode，无 unlink、无
-      // truncate——中间态不可见）。released JSON 后补空格到原文件长度（JSON 尾部
-      // 空白合法），保证「读到的要么是完整旧锁、要么是完整 released 帧」，绝不出现
-      // 半旧半新或零字节窗口；若内容比原来长（不会发生，released 帧更短）就超写。
-      // 若此刻已被接管换主，校验不会通过；接管者随后覆盖则最后写者胜，语义仍正确。
-      const releasedFrame = Buffer.from(JSON.stringify({ pid: process.pid, startedAt: data.startedAt, token: record._lockToken, released: true }) + ' ', 'utf8')
+      // 归属成立：原地单次 writeSync 覆写为 released 短帧（同 inode，无 unlink）。
+      // released 帧必须**不大于**原帧（ASCII 锁帧下恒成立）：writeSync 定长覆写不会
+      // 追长文件，短出的字节以空格补到原长（JSON 尾部空白合法）——任意时刻读到的
+      // 要么是完整旧锁、要么是完整 released 帧，跨扇区半旧半新窗消失（v3.296 前
+      // released 帧含 pid/startedAt/token，恒比原帧长，「补空格」分支是死代码，
+      // 半旧半新承诺未兑现——三轮审查修正）。归属判定已完成，pid/startedAt/token
+      // 无保留价值，短帧正是补空格分支生效的前提。
+      const releasedFrame = Buffer.from('{"released":true}', 'utf8')
       const origLen = Buffer.byteLength(raw, 'utf8')
       let payload = releasedFrame
-      if (releasedFrame.length < origLen) {
+      if (origLen > releasedFrame.length) {
         payload = Buffer.concat([releasedFrame, Buffer.alloc(origLen - releasedFrame.length, 0x20)])
       }
       fs.writeSync(fd, payload, 0, payload.length, 0)
@@ -339,7 +343,7 @@ function renderPage (state, runsList, query, sessionToken) {
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'">
+<meta http-equiv="Content-Security-Policy" content="${CSP_HEADER}">
 <link rel="stylesheet" href="/assets/app.css">
 <link rel="modulepreload" href="/assets/htm-preact.module.js">
 </head><body>
@@ -363,6 +367,13 @@ function renderPage (state, runsList, query, sessionToken) {
 // 手写前缀匹配 + 切片，线性且语义等价（`Bearer ` 后取剩余全部，trim 一次容忍尾随空白）。
 // ⚠️ ?token= 会进访问日志/浏览器历史：README 明确建议只在受信网络或 TLS 代理后使用。
 const BEARER_PREFIX = 'Bearer '
+// RFC 9110：auth-scheme 大小写不敏感——`bearer <token>` 同样合法，客户端按规范
+// 发小写 scheme 不得被 401（v3.296 修正）。仍走手写前缀匹配 + 切片（不引入正则）。
+const BEARER_PREFIX_LOWER = 'bearer '
+// CSP 完整指令（v3.296：frame-ancestors 只能经 HTTP 响应头下发——<meta http-equiv>
+// 形态被浏览器按规范忽略，此前仅 meta 承载的 frame-ancestors 'none' 是 no-op）。
+// GET / 以响应头下发完整 CSP；HTML 内 meta 保留同串兜底（中间层剥头时仍有约束）。
+const CSP_HEADER = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
 // 会话 Cookie 名（Sourcery G_oJ：ESM import/静态资产请求无法带 Authorization 头，
 // 页面鉴权后下发 HttpOnly Cookie，浏览器同源请求自动携带）。
 const SESSION_COOKIE = 'xbk_session'
@@ -386,7 +397,7 @@ function sessionCookieValue (cookieHeader) {
 }
 function authorize (req, token, urlQuery) {
   const header = req.headers.authorization || ''
-  if (typeof header === 'string' && header.startsWith(BEARER_PREFIX)) {
+  if (typeof header === 'string' && header.slice(0, BEARER_PREFIX.length).toLowerCase() === BEARER_PREFIX_LOWER) {
     const value = header.slice(BEARER_PREFIX.length)
     if (value.length > 0 && timingSafeEqualStr(value.trim(), token)) return true
   }
@@ -495,7 +506,16 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   } catch (e) { /* 文件不存在/损坏 = 空窗口，正常 */ }
 
   const server = http.createServer((req, res) => {
-    const url = new URL(req.url, 'http://localhost')
+    // 畸形请求行防御：req.url 是原始请求行目标（客户端可发任意垃圾，如 `//@:99999/`），
+    // new URL 对非法形态抛 TypeError——此处位于鉴权之前，一条无凭证请求即可崩掉整个
+    // 控制台进程（触发锁残留到陈旧接管、看板下线）。解析失败一律 400 拒绝。
+    let url
+    try {
+      url = new URL(req.url, 'http://localhost')
+    } catch (e) {
+      sendJson(res, 400, { error: 'malformed request target' })
+      return
+    }
     // 静态资产路由（Sourcery G_oJ：资产也须鉴权——此前免鉴权的理由（ESM import 无法带头）
     // 已被 Cookie 方案解决：页面通过鉴权后下发 HttpOnly 会话 Cookie，浏览器对同源
     // ESM import/静态请求自动带 Cookie。无凭证请求一律 401，与文档口径一致。
@@ -518,6 +538,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 从根上掐断（该页所有子请求一律不带 Referer）；启动页本身在浏览器地址栏的历史
       // 记录仍含 token，这是 raw-URL 方案的已知暴露面（README 已提醒可重置）。
       res.setHeader('Referrer-Policy', 'no-referrer')
+      res.setHeader('Content-Security-Policy', CSP_HEADER)
       const state = readStatus(stateDir)
       const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
       // 鉴权通过后下发会话 Cookie（Sourcery G_oJ）：HttpOnly（JS 不可读，XSS 拿不走）、
@@ -610,6 +631,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
           } catch (e) {
             // 落盘失败 = 无持久重放记录，为满足「重试不得重复推送」必须拒绝受理（Sourcery High）。
+            // 此时锁刚拿到、子进程未启动（activeChildren 无登记，close 回调无从释放）——
+            // 必须显式释放，否则锁泄漏到 PROC_TIMEOUT_MS 陈旧接管，期间重试全部 409。
+            releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
             sendJson(res, 500, { error: '重放记录持久化失败，动作未执行（fail-closed）' })
             return
           }
@@ -703,7 +727,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
 // ── 启动入口 ───────────────────────────────────────────────────────────────
 function main () {
   const token = process.env.XBK_CONSOLE_TOKEN
-  const port = Number(process.env.XBK_CONSOLE_PORT) || 7777
+  const port = process.env.XBK_CONSOLE_PORT != null && process.env.XBK_CONSOLE_PORT !== ''
+    ? Number(process.env.XBK_CONSOLE_PORT)
+    : 7777
   const host = process.env.XBK_CONSOLE_HOST || '127.0.0.1'
   // Sourcery Medium：与生产入口 / --status 同源解析缓存目录（含安全回退），
   // 不再手写默认值——否则 .xbk_cache_safe 生效时看板会读错目录。
@@ -736,6 +762,11 @@ function main () {
       if (finished) return
       finished = true
       server.close(() => process.exit(0))
+      // close 只挡新连接，既有 keep-alive/在途连接要显式收尾：空闲连接立即排空，
+      // 在途请求给 500ms 完成窗口（本地看板端点毫秒级）后强断，1s 强退兜底——
+      // 不排空会让客户端收到 ERR_EMPTY_RESPONSE、挂起的 keep-alive 得不到关闭帧。
+      server.closeIdleConnections()
+      setTimeout(() => { server.closeAllConnections() }, 500).unref()
       setTimeout(() => process.exit(0), 1000).unref()
     }
     if (pending.length === 0) {
@@ -770,7 +801,6 @@ module.exports = {
   isValidToken,
   timingSafeEqualStr,
   acquireLock,
-  releaseLock,
   releaseLockFor,
   lockPath,
   parseAction,

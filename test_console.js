@@ -1,17 +1,19 @@
 'use strict'
 // scripts/console.js 测试：token 校验 / 锁语义 / 动作解析 / HTML 转义 / HTTP 端到端（鉴权、
-// 看板渲染、触发 202/409、JSON API）。触发用例使用注入式 fake child——不真拉起 xbk_push.js
-// （真实触发会写缓存/发通知，测试只验证服务层编排）。
+// 看板渲染、触发 202/409、JSON API、SIGTERM 优雅关闭）。触发用例真实 spawn 子进程——
+// 动作默认指向 --check（环境检查，秒级、不写缓存不发通知），不存在注入式 fake child。
 
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const http = require('node:http')
+const net = require('node:net')
+const { spawn } = require('node:child_process')
 
 const {
   createConsole, isValidToken, timingSafeEqualStr,
-  acquireLock, releaseLock, lockPath,
+  acquireLock, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS
 } = require('./scripts/console')
 
@@ -82,10 +84,11 @@ ok('timingSafeEqualStr: 等长比较/长度不等 false/异常 false', () => {
 // ── 锁语义 ──
 ok('acquireLock: 空目录可获取；持有期内二次获取拒绝', () => {
   const dir = tmpDir()
-  assert.strictEqual(acquireLock(dir, 1000), true)
-  assert.strictEqual(acquireLock(dir, 2000), false)
-  releaseLock(dir)
-  assert.strictEqual(acquireLock(dir, 3000), true, '释放后可重新获取')
+  assert.strictEqual(acquireLock(dir, 1000, 'tok-a'), true)
+  assert.strictEqual(acquireLock(dir, 2000, 'tok-b'), false, '持有期内必须拒绝')
+  // 释放走 releaseLockFor（v3.296：按路径 unlinkSync 的 releaseLock 已删）
+  releaseLockFor({ _stateDir: dir, _lockToken: 'tok-a' })
+  assert.strictEqual(acquireLock(dir, 3000, 'tok-c'), true, 'released 锁立即可接管')
 })
 ok('acquireLock: 陈旧锁（age > PROC_TIMEOUT_MS）可接管', () => {
   const dir = tmpDir()
@@ -95,6 +98,16 @@ ok('acquireLock: 陈旧锁（age > PROC_TIMEOUT_MS）可接管', () => {
   const data = JSON.parse(fs.readFileSync(lockPath(dir), 'utf8'))
   assert.strictEqual(data.startedAt, PROC_TIMEOUT_MS + 2, '接管后 startedAt 更新')
   assert.strictEqual(fs.existsSync(lockPath(dir) + '.takeover'), false, '接管后哨兵清理')
+})
+ok('acquireLock: 畸形锁帧（released 非布尔 / pid 字段超长）→ fail-closed 拒绝（回归：JSON.parse 不得抛错崩进程）', () => {
+  const dir = tmpDir()
+  // released 键为字符串：旧实现 parsed.released === true 虽判 false，但 startedAt 缺失会
+  // 走 corrupted 分支——真实回归点是 releaseLockFor 短帧化后「released+空格尾」与
+  // 「released+残留旧内容」都必须解析为合法帧，任何畸形变体不得抛出未捕获异常。
+  fs.writeFileSync(lockPath(dir), '{"released":"yes","startedAt":1}')
+  assert.strictEqual(acquireLock(dir, 1000), false, 'released 非布尔不得当作已释放')
+  fs.writeFileSync(lockPath(dir), `{"pid":"${'9'.repeat(400)}","startedAt":1,"released":true}`)
+  assert.strictEqual(acquireLock(dir, 1000), true, '超长字段的 released 帧仍可接管（解析不崩）')
 })
 ok('acquireLock: 锁内容损坏 / startedAt 无效 → fail-closed 拒绝', () => {
   const dir = tmpDir()
@@ -137,11 +150,16 @@ ok('acquireLock: 锁内容带归属 token；releaseLockFor 按 pid+token 双匹�
   assert.strictEqual(after.released, true, 'pid+token 双匹配覆写为 released')
   assert.strictEqual(acquireLock(dir, 1001, 'tok-def'), true, 'released 锁立即可接管')
 })
-ok('releaseLock: 幂等（不存在不抛错）', () => {
+ok('releaseLockFor: released 短帧不大于原帧（回归：恒比原帧长的旧帧使「补空格防半旧半新」成死代码）', () => {
   const dir = tmpDir()
-  releaseLock(dir)
-  releaseLock(dir)
-  assert.ok(true)
+  assert.strictEqual(acquireLock(dir, 1000, 'tok-abc'), true)
+  const origLen = JSON.stringify({ pid: process.pid, startedAt: 1000, token: 'tok-abc' }).length
+  const { releaseLockFor } = require('./scripts/console')
+  releaseLockFor({ _stateDir: dir, _lockToken: 'tok-abc' })
+  const body = fs.readFileSync(lockPath(dir), 'utf8')
+  assert.strictEqual(body.length, origLen, '覆写后长度必须等于原帧（补空格到原长，杜绝跨扇区半旧半新窗）')
+  assert.strictEqual(JSON.parse(body).released, true, '空格补尾后仍是合法 JSON released 帧')
+  assert.strictEqual(body.trim(), '{"released":true}', '实体内容必须是短帧（pid/token/startedAt 已无保留价值）')
 })
 
 // ── 动作解析 ──
@@ -175,6 +193,10 @@ ok('authorize: Bearer 前缀匹配 + ?token= 查询参数（浏览器路径）',
   assert.strictEqual(authorize(mkReq({ authorization: `Bearer ${TOKEN2}` }), TOKEN2, null), true)
   assert.strictEqual(authorize(mkReq({ authorization: `Bearer ${TOKEN2} ` }), TOKEN2, null), true, '尾随空白容忍')
   assert.strictEqual(authorize(mkReq({ authorization: 'Bearer wrong' }), TOKEN2, null), false)
+  // RFC 9110：auth-scheme 大小写不敏感（v3.296 修复：小写 scheme 不得 401）
+  assert.strictEqual(authorize(mkReq({ authorization: `bearer ${TOKEN2}` }), TOKEN2, null), true, 'scheme 小写同样放行')
+  assert.strictEqual(authorize(mkReq({ authorization: `BEARER ${TOKEN2}` }), TOKEN2, null), true, 'scheme 大写变体同样放行')
+  assert.strictEqual(authorize(mkReq({ authorization: `bearerx ${TOKEN2}` }), TOKEN2, null), false, '前缀必须带空格边界')
   assert.strictEqual(authorize(mkReq({}), TOKEN2, null), false)
   // 查询参数路径（浏览器导航/表单/meta refresh 用）
   assert.strictEqual(authorize(mkReq({}), TOKEN2, new URLSearchParams(`token=${TOKEN2}`)), true)
@@ -201,6 +223,7 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.ok(withToken.includes("default-src 'none'"), "CSP 含 default-src 'none'")
   assert.ok(withToken.includes("script-src 'self'"), "CSP 含 script-src 'self'")
   assert.ok(withToken.includes("connect-src 'self'"), "CSP 含 connect-src 'self'")
+  assert.ok(withToken.includes("frame-ancestors 'none'"), "CSP 含 frame-ancestors 'none'（响应头与 meta 双通道，见 HTTP 用例）")
   assert.ok(!withToken.includes('http-equiv="refresh"'), '不再 meta refresh 整页刷新')
   const noToken = renderPage(state, [], null)
   assert.ok(noToken.includes('"token":""'), '无 token 时 JSON 岛为空串（前端触发会 401，符合 fail-closed）')
@@ -240,6 +263,29 @@ function request (port, method, urlPath, { token, body, headers } = {}) {
     req.on('error', reject)
     if (body !== undefined) req.write(body)
     req.end()
+  })
+}
+// 绕过 http.request 的 URL 合法性校验，直接写原始请求行（畸形 request-target 回归用：
+// `//@:99999/` 会让裸 new URL 抛 TypeError——修复前一条无凭证请求即崩整个控制台）。
+function rawRequest (port, raw) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host: '127.0.0.1', port }, () => { sock.write(raw) })
+    let buf = ''
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      sock.destroy()
+      const m = /^HTTP\/1\.[01] (\d{3})/.exec(buf)
+      resolve({ status: m ? Number(m[1]) : 0, text: buf })
+    }
+    const to = setTimeout(finish, 5000)
+    sock.on('data', c => {
+      buf += c
+      // 收到完整响应头即收口：HTTP keep-alive 下服务端不会主动 FIN，等 'end' 会空转到超时
+      if (buf.includes('\r\n\r\n')) { clearTimeout(to); finish() }
+    })
+    sock.on('error', (e) => { clearTimeout(to); finish() })
   })
 }
 
@@ -448,6 +494,65 @@ async function main () {
     const res = await request(port, 'GET', '/nope', { token: TOKEN })
     assert.strictEqual(res.status, 404)
     server.close()
+  })
+  await aok('HTTP: 畸形 request-target → 400 且进程存活（回归：裸 new URL 曾崩整个控制台）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const bad = await rawRequest(port, 'GET //@:99999/ HTTP/1.1\r\nHost: x\r\n\r\n')
+    assert.strictEqual(bad.status, 400, '畸形请求行必须 400，不得崩进程')
+    const alive = await request(port, 'GET', '/api/status', { token: TOKEN })
+    assert.strictEqual(alive.status, 200, '同一条畸形请求处理后服务必须继续可用')
+    server.close()
+  })
+  await aok('HTTP: GET / 下发 CSP 响应头（回归：frame-ancestors 仅 meta 承载是规范 no-op）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const res = await request(port, 'GET', `/?token=${TOKEN}`)
+    assert.strictEqual(res.status, 200)
+    const csp = res.headers['content-security-policy']
+    assert.ok(csp, '必须存在 CSP 响应头')
+    assert.ok(csp.includes("frame-ancestors 'none'"), '响应头 CSP 必须含 frame-ancestors')
+    assert.ok(csp.includes("default-src 'none'"), '响应头 CSP 必须含 default-src')
+    server.close()
+  })
+  await aok('HTTP: SIGTERM 优雅关闭——锁帧 released + 子进程被杀 + 退出码 0（端到端）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-e2e-'))
+    const lockFile = path.join(dir, 'console-trigger.lock')
+    const child = spawn(process.execPath, [path.join(__dirname, 'scripts', 'console.js')], {
+      env: {
+        ...process.env,
+        XBK_CONSOLE_TOKEN: TOKEN,
+        XBK_CONSOLE_PORT: '0',
+        XBK_CACHE_DIR: dir
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    let out = ''
+    child.stdout.on('data', c => { out += c })
+    child.stderr.on('data', c => { out += c })
+    // 等就绪（监听成功日志）。
+    const readyDeadline = Date.now() + 10000
+    while (!out.includes('已启动')) {
+      if (Date.now() > readyDeadline) break
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    assert.ok(out.includes('已启动'), `子控制台未就绪：${out.slice(0, 400)}`)
+    const m = /http:\/\/127\.0\.0\.1:(\d+)/.exec(out)
+    assert.ok(m, `无法解析监听端口：${out.slice(0, 200)}`)
+    const cport = Number(m[1])
+    const trig = await request(cport, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+    assert.strictEqual(trig.status, 202, '触发必须受理')
+    assert.strictEqual(fs.existsSync(lockFile), true, '触发后锁文件必须存在')
+    await new Promise(resolve => setTimeout(resolve, 150))
+    child.kill('SIGTERM')
+    const code = await new Promise(resolve => {
+      const to = setTimeout(() => resolve('timeout'), 8000)
+      child.on('exit', (c) => { clearTimeout(to); resolve(c) })
+    })
+    assert.strictEqual(code, 0, `SIGTERM 后必须 0 退出（实际 ${code}）\n${out.slice(-400)}`)
+    const frame = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
+    assert.strictEqual(frame.released, true, '退出后锁帧必须为 released（原地产出，不靠外部清理）')
+    fs.rmSync(dir, { recursive: true, force: true })
   })
 }
 

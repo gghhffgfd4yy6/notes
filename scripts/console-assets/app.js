@@ -1,4 +1,8 @@
 // scripts/console-assets/app.js —— 控制台前端（preact + htm standalone，无构建、零 npm 依赖）。
+// vendor 锚点（v3.296 补）：./htm-preact.module.js = preact 10.24.3 + hooks + htm 3.1.1
+// standalone 内联版（npmmirror 文件直链入库，sha256 =
+// 2aeaa3232ca84a7ad7ac0bef39bad3223dbd2173bee6ce4554b77be2f7f271b3）。重取/升级必须核对该值；
+// CVE-2026-22028 影响 preact ≥10.26.5，升级越过该版本前先确认修复态。
 // 数据面：GET /api/status、/api/runs、/api/runs/:id（同源，token 走 Authorization: Bearer
 // 请求头——不复述进 URL，避免出现在任何中间层访问日志/浏览器历史，Sourcery rwH）。
 // 动作面：POST /trigger（token 同样在 Bearer 头；body 只带 action）。
