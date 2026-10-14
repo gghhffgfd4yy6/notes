@@ -49,10 +49,33 @@ function fmtNum (n) {
 // Codacy Critical（SSRF 启发式：fetch 收到「用户可控 URL」）：每个端点独立函数、
 // URL 全部为字面量——fetch 的第一个参数在数据流上只有字面量一种来源，不存在
 // 「变量 URL」路径。run id 是服务端生成的数字 id，详情端点以独立函数封装。
+// Sourcery Stalled-bodies x3：fetch() 在收到响应头时就 resolve，此前 clearTimeout 让
+// 「头到了、body 挂起」的响应绕过超时——轮询消费 res.json() 时永久等待，刷新链路卡死。
+// 修复：期限定时器不在 fetch resolve 时清掉，而是移交给 body 消费方（readBodyJson），
+// 整个「头+体」共享同一个 8s 期限；消费完成后才真正 clearTimeout。
 function fetchWithTimeout (url, opts) {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS)
-  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t))
+  const done = () => clearTimeout(t)
+  const p = fetch(url, { ...opts, signal: ctrl.signal })
+  p.then(done, () => {}) // fetch reject（网络错/中止）时也清；body 阶段的清理由 readBodyJson 负责
+  return p
+}
+
+// 与 fetchWithTimeout 配套：res.json() 的读取也受同一期限约束（由 fetch 的 AbortController
+// 触发——body 挂起到期时 abort 会 reject json() 解析）。这里再兜一层竞速，防止个别环境
+// abort 不中断进行中的 body 读取。
+async function readBodyJson (res) {
+  let timer
+  // 标准 lint（promise/param-names）要求 promise 构造第二参数名匹配 ^_?reject$。
+  const bodyTimeout = new Promise((_resolve, _reject) => {
+    timer = setTimeout(() => _reject(new Error('响应体读取超时')), FETCH_TIMEOUT_MS)
+  })
+  try {
+    return await Promise.race([res.json(), bodyTimeout])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 async function apiGetStatus () {
@@ -60,7 +83,7 @@ async function apiGetStatus () {
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json()
+  return readBodyJson(res)
 }
 
 async function apiGetRuns () {
@@ -68,7 +91,7 @@ async function apiGetRuns () {
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json()
+  return readBodyJson(res)
 }
 
 async function apiGetRunDetail (id) {
@@ -82,7 +105,7 @@ async function apiGetRunDetail (id) {
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json()
+  return readBodyJson(res)
 }
 
 async function trigger (action) {
@@ -95,7 +118,7 @@ async function trigger (action) {
     },
     body
   })
-  const data = await res.json().catch(() => ({}))
+  const data = await readBodyJson(res).catch(() => ({}))
   if (!res.ok) {
     // 服务端幂等重放窗（与 console.js REPLAY_WINDOW_MS 配套）：同动作重试被拦时
     // 返回首轮 runId——提示用户「那一轮已经在跑/已完成」，前端顺手刷新历史。
@@ -173,13 +196,50 @@ function channelInfo (state) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { tone: 'bad', entries: [], note: '状态异常' }
   }
-  const entries = Object.keys(raw)
+  const allKeys = Object.keys(raw)
+  const entries = allKeys
     .filter((k) => validChannelEntry(k, raw[k]))
     .map((k) => ({ name: k, failures: raw[k].consecutiveFailures }))
+  // Sourcery Corrupt-channels x2：合法条目全健康但存在畸形条目时，此前 filter 掉畸形后
+  // 整卡仍显示绿色「正常」——数据损坏被吞。只要 valid 条目数 < 总键数即标红，
+  // 提示「部分通道数据异常」，畸形条目名一并列出。
+  const corruptKeys = allKeys.filter((k) => !validChannelEntry(k, raw[k]))
+  if (corruptKeys.length > 0) {
+    return { tone: 'bad', entries, note: `部分通道数据异常：${corruptKeys.join('、')}` }
+  }
   // 空表 ≠ 未配置：只显示中性「暂无记录」（Sourcery vwc）。
   if (entries.length === 0) return { tone: 'run', entries, note: '暂无记录' }
   const tone = entries.every((e) => e.failures === 0) ? 'ok' : 'bad'
   return { tone, entries, note: '' }
+}
+
+// 过滤诊断卡片（Sourcery Filter-diagnostics x3）：readStatus 返回 state.diagnostics
+// （{status, value}），此前 SPA 从未渲染——无脚本降级版有此信息，JS 版反而丢失。
+// 口径与 formatStatus 一致：missing=中性暂无；invalid=红；ok 时展示最近时间与原因分布。
+function diagCard (state) {
+  if (!state || !state.diagnostics) return []
+  const d = state.diagnostics
+  if (d.status === 'missing') {
+    return [{ title: '过滤诊断', tone: 'run', lines: ['暂无记录'] }]
+  }
+  if (d.status !== 'ok') {
+    return [{ title: '过滤诊断', tone: 'bad', lines: [`状态异常（${d.status}）`] }]
+  }
+  const v = d.value || {}
+  if (!v || typeof v !== 'object') {
+    return [{ title: '过滤诊断', tone: 'bad', lines: ['状态异常'] }]
+  }
+  const reasons = v.byReason && typeof v.byReason === 'object' && !Array.isArray(v.byReason)
+    ? Object.entries(v.byReason).map(([k, n]) => `${k}=${typeof n === 'number' ? n : '?'}`).join('，')
+    : ''
+  return [{
+    title: '过滤诊断',
+    tone: 'ok',
+    lines: [
+      `最近 ${fmtNum(v.at)}`,
+      `原因分布 ${reasons || '无'}`
+    ]
+  }]
 }
 
 // ── 组件：状态卡片区 ────────────────────────────────────────────────────────
@@ -222,7 +282,8 @@ function StatusCards ({ state }) {
       lines: chan.entries.length > 0
         ? chan.entries.map((e) => `${e.name}：连续失败 ${fmtNum(e.failures)} 次`)
         : [chan.note || '暂无记录']
-    }
+    },
+    ...diagCard(state)
   ]
   return html`<div class="cards">
     ${cards.map((c) => html`<div class="card" key=${c.title}>
@@ -290,12 +351,16 @@ function RunsPanel ({ runs, pollMs }) {
   // 乱序防护（Sourcery vwI）：detail 请求领号，落后响应丢弃。
   const detailSeqRef = useRef(0)
 
-  // 切换目标 run 时立即清旧详情（Sourcery G_oi）：否则上一个 run 的日志/错误
-  // 会挂在新 run 的标题下（请求未返回期间）。清空也重置加载态。
+  // 切换目标 run 时立即清旧详情（Sourcery G_oi + Old-logs-flash）：useEffect 在渲染后
+  // 才跑，「新 openId + 旧 detail」会闪一帧。渲染期同步判定：detail.runId 与当前 openId
+  // 不符就不显示（下方 logpre 用 detailForOpen 而非裸 detail）。effect 仍负责清状态。
   useEffect(() => {
     setDetail(null)
     setDetailErr('')
   }, [openId])
+  const detailForOpen = detail !== null && typeof detail.id === 'number' && detail.id === openId
+    ? detail
+    : null
 
   // 日志面板：打开期间跟随运行状态轮询（Sourcery vv-：运行中的输出要持续刷新）。
   useEffect(() => {
@@ -364,11 +429,11 @@ function RunsPanel ({ runs, pollMs }) {
       </div>
       <pre class="logpre">${
         detailErr ||
-        (detail === null
+        (detailForOpen === null
           ? '加载中…'
           // Sourcery G_oq：detail 已加载但 output 为空串 = 该轮合法地没有任何输出，
           // 必须显示「（无输出）」而不是永远「加载中…」。
-          : (typeof detail.output === 'string' && detail.output.length > 0 ? detail.output : '（无输出）'))
+          : (typeof detailForOpen.output === 'string' && detailForOpen.output.length > 0 ? detailForOpen.output : '（无输出）'))
       }</pre>
     </div>`}
   </div>`
@@ -420,7 +485,9 @@ function App () {
 
   // 轮询节奏（Sourcery vvJ）：任务在跑时必须用快轮询——以 locking（而非 busy）为节奏源，
   // 避免「busy 在 active 确认后被清 → 退回慢轮询」的窗口。
-  const active = runs.some((r) => !r.finishedAt)
+  // Sourcery Other-instance-idle：另一实例持锁时本进程 runs 历史是空的，此前显示「空闲」
+  // 并允许触发（会被服务端 409 拒绝）。status.lock.held（共享 stateDir 的锁文件）参与判定。
+  const active = runs.some((r) => !r.finishedAt) || !!(state && state.lock && state.lock.held === true)
   const locking = busy || active
 
   useEffect(() => {

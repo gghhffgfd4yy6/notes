@@ -308,3 +308,12 @@
 
 - Codacy Critical（前端 SSRF 启发式误报消除）：app.js 的 fetch 此前直接收调用方模板串（/api/runs/${id}），被 Codacy 数据流分析判为「用户可控 URL 进 HTTP 客户端库」。重构为每端点独立函数（apiGetStatus / apiGetRuns / apiGetRunDetail / trigger），fetch 的 URL 全部为字面量；runDetail 的 id 经 Number(id).toFixed(0) 强制数值化（即使上游传字符串也只能得到数字文本，无法构造任意路径）。行为不变（同源四端点）。
 - 版本 bump 至 3.288.0（四处同步）。
+
+## v3.289
+
+Sourcery 全新评审 38 条（去重）逐条落地：
+
+- 服务端（console.js）：token 校验补尾随换行拒绝（JS 正则 $ 的边界坑）、禁 URL 特殊字符 & # +（raw ?token= 链接必须可用）、长度上限 200（浏览器 Cookie 上限防静默丢弃）；Set-Cookie Max-Age 30 天→1 天（凭证下线窗口收窄）；响应头加 Referrer-Policy: no-referrer（?token= 不进子请求 Referer）；重放窗 lastAccept 落盘 stateDir（重启后窗口仍拦截）；Cookie 会话打开页面时 boot JSON 注入已验证凭证（会话用户可直接触发）；启动闸校验资产文件存在（缺失 fail-closed 拒启，不再白屏）；/api/status 附锁状态（跨实例「空闲」误显示修复）。
+- 前端（app.js）：fetch 超时罩到 body 消费完成（此前只罩到响应头，挂起 body 卡死轮询）；切日志闪旧内容渲染期消除（detail.id 与 openId 绑定）；日志详情轮询加互斥闸（慢请求不叠加）；通道卡片畸形条目标红（不再过滤后假绿）；新增过滤诊断卡片（此前 SPA 丢失该数据）；空闲徽章参考共享锁状态。
+- 测试（test_console.js）：Cookie 属性逐项断言、token 新边界 9 例、重启后重放窗、会话 boot token。
+- 部署权衡（回评说明）：Cookie 无 Secure 属性为本服务明文 HTTP 形态的固有权衡（加 Secure 控制台不可用），上 HTTPS 后应补 Secure + __Host- 前缀。

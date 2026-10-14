@@ -44,6 +44,17 @@ ok('isValidToken: 浏览器不可传输字符拒绝（Sourcery G_ot）', () => {
   assert.strictEqual(isValidToken('a'.repeat(8) + '\\b'.repeat(4)), false, '反斜杠拒绝')
   assert.strictEqual(isValidToken('a'.repeat(8) + ' b'.repeat(4)), false, '空白拒绝')
   assert.strictEqual(isValidToken('-_.~' + 'a'.repeat(28)), true, '安全符号仍合法')
+  // Sourcery Trailing-newline：$ 会匹配尾随换行前的位置——行尾终止符必须显式拒绝
+  assert.strictEqual(isValidToken('a'.repeat(16) + '\n'), false, '尾随 LF 拒绝')
+  assert.strictEqual(isValidToken('a'.repeat(16) + '\r'), false, '尾随 CR 拒绝')
+  assert.strictEqual(isValidToken('a'.repeat(16) + '\u2028'), false, '尾随 U+2028 拒绝')
+  // Sourcery Raw-token-URLs：& # + 让 raw ?token= 链接失效，启动闸禁掉
+  assert.strictEqual(isValidToken('a'.repeat(8) + '&'.repeat(8)), false, '& 拒绝（URL 分隔符）')
+  assert.strictEqual(isValidToken('a'.repeat(8) + '#'.repeat(8)), false, '# 拒绝（锚点）')
+  assert.strictEqual(isValidToken('a'.repeat(8) + '+'.repeat(8)), false, '+ 拒绝（空格解码）')
+  // Sourcery Long-tokens：超长 token 被浏览器 Cookie 静默丢弃 → 资产全 401
+  assert.strictEqual(isValidToken('a'.repeat(201)), false, '超长（>200）拒绝')
+  assert.strictEqual(isValidToken('a'.repeat(200)), true, '恰好 200 通过')
 })
 ok('sessionCookieValue: 解析/多段/无值/null', () => {
   const { sessionCookieValue, SESSION_COOKIE } = require('./scripts/console')
@@ -277,7 +288,13 @@ async function main () {
     assert.strictEqual(cssCookie.status, 200, '会话 Cookie 可取资产（ESM 链路径）')
     // 页面响应必须下发会话 Cookie（HttpOnly/SameSite=Strict）
     const page = await request(port, 'GET', '/', { token: TOKEN })
-    assert.ok((page.headers['set-cookie'] || []).some(c => c.startsWith('xbk_session=')), '/ 鉴权后下发会话 Cookie')
+    const cookieHeader = (page.headers['set-cookie'] || []).find(c => c.startsWith('xbk_session='))
+    assert.ok(cookieHeader, '/ 鉴权后下发会话 Cookie')
+    // Sourcery Issued-session-cookie：不能只看前缀——属性逐项锁死，错值或缺属性必须红。
+    assert.ok(cookieHeader.includes('HttpOnly'), 'Cookie 含 HttpOnly')
+    assert.ok(cookieHeader.includes('SameSite=Strict'), 'Cookie 含 SameSite=Strict')
+    assert.ok(cookieHeader.includes('Path=/'), 'Cookie 含 Path=/')
+    assert.ok(cookieHeader.includes(`xbk_session=${encodeURIComponent(TOKEN)}`), 'Cookie 值=encoded token')
     // Sourcery G_4Kk：资产 URL 不再拼 tokenSuffix（Cookie 通道已覆盖，URL 零凭证重复）
     assert.ok(!page.text.includes('/assets/app.css?token='), '资产 URL 不含 ?token=')
     assert.ok(!page.text.includes('/assets/app.js?token='), '脚本 URL 不含 ?token=')
@@ -371,9 +388,22 @@ async function main () {
     // Sourcery G_4Ki：畸形 Cookie（非法 % 序列）不得炸请求处理器——按无 Cookie 处理。
     const badCookie = await request(port, 'GET', '/', { headers: { cookie: 'xbk_session=%zz' } })
     assert.strictEqual(badCookie.status, 401, '畸形 Cookie → 401（不抛 URIError）')
+    // Sourcery Session-users-cannot-trigger：Cookie 会话打开 / 且无 ?token= 时 boot JSON
+    // 必须注入服务端已验证的凭证（否则前端发空 Bearer，触发 401）。
+    const sessPage = await request(port, 'GET', '/', { headers: { cookie: `xbk_session=${TOKEN}` } })
+    assert.strictEqual(sessPage.status, 200, 'Cookie 会话可开页面')
+    assert.ok(sessPage.text.includes(`"token":"${TOKEN}"`), '会话页 boot JSON 含已验证 token')
     // Sourcery G_4Kb：POST 不接受 Cookie 凭证（写动作须显式 Bearer/?token=）。
     const csrf = await request(port, 'POST', '/trigger', { headers: { cookie: `xbk_session=${TOKEN}` }, body: 'action=check' })
     assert.strictEqual(csrf.status, 401, 'POST 仅凭 Cookie 必须 401（CSRF 面）')
+    // Sourcery Retries-duplicate：重放窗落盘——重启（新 createConsole 实例、同 stateDir）
+    // 后窗口内同 action 重试仍须 409 且指向首轮 run。
+    const { server: server2 } = createConsole({ token: TOKEN, stateDir: dir })
+    const port2 = await listen(server2)
+    const replayAfterRestart = await request(port2, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+    assert.strictEqual(replayAfterRestart.status, 409, '重启后重放窗仍拦截（lastAccept 落盘回读）')
+    assert.strictEqual(JSON.parse(replayAfterRestart.text).runId, firstBody.id, '重启后仍指向首轮 run')
+    server2.close()
     server.close()
   })
   await aok('HTTP: /api/runs 列表与 /api/runs/:id 详情', async () => {
