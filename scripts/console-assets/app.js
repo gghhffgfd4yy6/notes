@@ -325,7 +325,11 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
       if (e && e.replayRunId) {
         setErr(`${e.message}（运行 #${e.replayRunId}）`)
         setBusy(false)
-        onTriggered(e.replayRunId)
+        // Sourcery Old-run-unlocks-new-trigger：这里不能把 prevRunId 登记为 busy 归属
+        // （onTriggered 会写 busyRunIdRef）——旧轮通常已在历史里，下一次新提交 setBusy(true)
+        // 后、其 202 未返回前，「busy 且 busyRunIdRef 在历史」的解锁 effect 会立即把新提交
+        // 的 busy 清掉（按钮提前解锁）。只刷新历史，不登记归属（传 null）。
+        onTriggered(null)
         return
       }
       setErr(e.message === '已有触发任务在运行（或锁未过期），请稍后再试'
@@ -371,7 +375,13 @@ function RunsPanel ({ runs, pollMs }) {
   useEffect(() => {
     if (openId === null) return undefined
     let dead = false
+    let inflight = false
     const fetchOnce = async () => {
+      // Sourcery Overlapping-log-polls/Slow-log-requests：详情请求慢于轮询间隔时逐 tick
+      // 叠加并发请求，迟到的失败响应会把过期错误写到当前面板。与主轮询同口径：
+      // 上一轮未回跳过本轮（8s 期限保证不会永久跳过）；领号防乱序保留。
+      if (inflight) return
+      inflight = true
       const seq = ++detailSeqRef.current
       try {
         const d = await apiGetRunDetail(openId)
@@ -381,6 +391,8 @@ function RunsPanel ({ runs, pollMs }) {
       } catch (e) {
         if (dead || seq !== detailSeqRef.current) return
         setDetailErr(`加载失败：${e.message}`)
+      } finally {
+        inflight = false
       }
     }
     // S9383：fetchOnce 内部已 try/catch 全收（不会 reject），但仍显式 .catch 兜底，

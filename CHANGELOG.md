@@ -321,3 +321,8 @@ Sourcery 全新评审 38 条（去重）逐条落地：
 ## v3.290
 
 - Codacy SSRF 规则最后一形态：它只认「fetch 第一参数为字面量」——URL 对象/拼接/模板都被判变量。详情查询改为 POST /api/runs/detail（URL 字面量，run id 走请求体，Number(id).toFixed(0) 数值化）；服务端新增等价 POST 路由（鉴权同 GET，只读无副作用），GET /api/runs/:id 保留兼容。测试补 POST detail 6 断言。
+
+## v3.291
+
+- Sourcery Overlapping-log-polls / Slow-log-requests：fetchOnce 详情轮询补 inflight 互斥闸（v3.289 改动因脚本锚点失配未落盘，本次补上）——慢详情请求不再逐 tick 叠加并发。
+- Sourcery Old-run-unlocks-new-trigger：重放拦截分支不再把 prevRunId 登记为 busy 归属（onTriggered(null)）——旧轮已在历史时，新提交的 202 未返回前解锁 effect 会提前清掉 busy（按钮提前解锁竞态）。
