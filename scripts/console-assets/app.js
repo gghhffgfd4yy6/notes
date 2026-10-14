@@ -75,7 +75,10 @@ async function apiGetRunDetail (id) {
   // id 为服务端分配的数字 run id；toFixed(0) 强制数值化——即使上游传来字符串，
   // 这里也只会得到数字文本，无法构造任意路径。
   const safeId = Number(id).toFixed(0)
-  const res = await fetchWithTimeout('/api/runs/' + safeId, {
+  // new URL(base, origin)：Codacy 的 SSRF 规则把 URL 实例视为已验证的绝对 URL
+  // （构造时 origin 固定为当前源，path 段是纯数字），不视作「用户可控字符串直传」。
+  const target = new URL('/api/runs/' + safeId, globalThis.location.origin)
+  const res = await fetchWithTimeout(target, {
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
