@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.284 — 网页控制台（scripts/console.js）：只读看板 + 单飞锁手动触发，token fail-closed *********
+//* ******* 线报酷推送脚本 v3.295 — 网页控制台：前端 fetch URL 白名单化（Codacy SSRF 启发式消除） *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

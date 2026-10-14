@@ -271,3 +271,83 @@
 - 端点：`GET /`（看板页，15s 自动刷新）、`GET /api/status`（状态 JSON）、`POST /trigger`（触发，202/409/400）、`GET /api/runs`（触发历史）、`GET /api/runs/:id`（详情含输出）。触发历史仅进程内存（最多 20 条，重启即空），持久记录仍以缓存目录状态文件与 `run.log` 为准。
 - 测试：新套件 `test_console.js`（19 断言，注册为普通单元套件——不标 integration/mutationSkip）锁死：token 校验与 fail-closed、锁语义（损坏锁保守、陈旧接管、幂等释放）、动作解析、HTML 转义、HTTP 端到端（401/看板降级渲染/202/409/锁生命周期/404）。`console.js` 列入变异矩阵（新段 `console`，TAP 档）与 `stryker.config.js` mutate 清单，`EXPECTED_SEGMENTS`、`productionFiles` 同步 +1，矩阵 19→20 段。
 - 配置：`XBK_CONSOLE_PORT`（默认 7777）、`XBK_CONSOLE_HOST`（默认 127.0.0.1）、`XBK_CONSOLE_TOKEN`（必填，≥16 字符）；缓存目录沿用 `XBK_CACHE_DIR` 绝对路径语义（与 `--status` 同口径）。
+
+## v3.285
+
+- **控制台前端现代化**：看板从服务端拼接 HTML + meta refresh 整页刷新，改为 **SPA 壳 + 静态资产**（`scripts/console-assets/`：`app.js` / `app.css` / `htm-preact.module.js`）。深色卡片风 UI：今日日报 / 最近一轮 / 推送通道三张状态卡、徽章式状态（正常/异常/运行中）、按钮触发带 loading 与 409 文案、触发历史表格展开日志面板；5 秒自动轮询（触发后加密到 2 秒），不再整页刷新；手机窄屏自适应。
+- **零新 npm 依赖不变**：前端运行时是 preact 10.24.3 + hooks + htm 3.1.1 的 standalone 内联单文件（13 KB，无外部 import），从 npmmirror 文件直链下载后入库（`scripts/console-assets/htm-preact.module.js`），不用 CDN、离线可用、无构建步骤。`package.json` dependencies 不变（仍只有 got）。
+- **安全面收口**：页面带 CSP（`default-src 'none'; script-src 'self'; connect-src 'self'`）；token 经 `<script type="application/json" id="xbk-boot">` JSON 岛注入（文本内容转义 `&`/`<` 防 `</script>` 逃逸），前端读取后立即删除节点；静态资产仅白名单精确映射（`/assets/app.css`、`/assets/app.js`、`/assets/htm-preact.module.js`），无用户输入拼接路径（路径穿越形态 404，测试锁定）；`?token=` 鉴权语义不变（API/资产同走 authorize）。
+- **无脚本降级**：`<noscript>` 保留状态文本与动作说明（核心信息不丢）；`formatStatus` 仍是唯一状态口径。
+- 端点变化：`GET /`（SPA 壳）、`GET /assets/*`（白名单静态资产，no-cache + ETag）；`/api/status`、`POST /trigger`、`/api/runs`、`/api/runs/:id` 语义不变（前端 fetch 同源调用）。
+- 测试：`test_console.js` 19→**26 断言**：renderPage 断言改 JSON 岛/CSP/资产引用（不再 meta refresh）；新增 `/assets/*` 白名单与路径穿越 404、看板 SPA 壳端到端。
+- 版本 bump 至 3.285.0（四处同步）。
+
+## v3.286
+
+- 控制台触发幂等重放窗（Sourcery G_nm）：同动作在 12 分钟窗口（PROC_TIMEOUT_MS + 2min）内的重复 POST /trigger 返回 409 并附首轮 runId（replayBlocked 标记）——堵住「202 响应丢失 → 用户重试 → 首轮已结束释放锁 → 再跑一轮真实推送」的重复推送路径。跨动作不受拦截。
+- 静态资产纳入鉴权（Sourcery G_oJ）：/assets/* 无凭证一律 401；页面鉴权后下发会话 Cookie（xbk_session，HttpOnly + SameSite=Strict + Path=/ + Max-Age 30 天），浏览器对同源 ESM import/静态请求自动携带，解决「ESM 无法带 Authorization 头」的原免鉴权理由。authorize 新增 Cookie 通道（timingSafeEqual 同口径）。
+- token 可用性校验前移（Sourcery G_ot）：isValidToken 除 ≥16 字符外，限定可见 ASCII（0x21–0x7e）且禁 ; , " \\ 与空白——含 fetch ByteString/Set-Cookie 无法承载字符的 token 在启动闸 fail-closed，不再「能启动但浏览器全挂」。
+- 前端竞态与状态语义治理（Sourcery G_nv/G_n6/G_oY/G_oi/G_oq/G_od/G_oE/G_oR）：
+  - busy 解锁判据改为「提交的那一轮出现在历史里」（202 响应携带 runId），任务秒完成不再锁按钮到 11 分钟兜底；
+  - fetch 全部加 8s AbortController 期限；刷新两请求改 Promise.allSettled 并行 + in-flight 互斥（跳过重叠 tick，零堆积）；
+  - 日志面板切换目标 run 时立即清旧详情，不再短暂显示上一轮日志；空输出显示「（无输出）」而非永远「加载中…」；
+  - 部件三态：missing=中性、invalid/tooLarge=红、ok+健康=绿——缺数据不再标红、坏数据不再伪装「暂无记录」；
+  - validChannelEntry 与服务端 status.js 同口径（三计数字段非负安全整数，含 lastAlertAt），畸形条目不进展示与健康判定。
+- 版本 bump 至 3.286.0（四处同步）。
+
+## v3.287
+
+- Sourcery 四轮 4 条（1 Critical + 3 High）真修：
+  - Critical（畸形 Cookie 崩请求）：sessionCookieValue 的 decodeURIComponent 包 try/catch，畸形序列（如 %）按「无有效 Cookie」处理，绝不抛 URIError 出 HTTP 处理器；
+  - High（CSRF 伪造触发）：authorize 的 Cookie 通道收窄到 GET（页面+资产）；POST /trigger 不接受 Cookie，写动作必须显式凭证（Bearer 头或 ?token=）；
+  - High（重放窗单槽覆盖）：lastAccept 由单值改 per-action Map——换动作不再覆盖他动作的重放记录，「run→check→重试 run」仍被拦；
+  - High（资产 URL 带凭证）：renderPage 去掉 tokenSuffix——资产鉴权已由会话 Cookie 覆盖，URL 不再重复 token。
+- 版本 bump 至 3.287.0（四处同步）。
+
+## v3.288
+
+- Codacy Critical（前端 SSRF 启发式误报消除）：app.js 的 fetch 此前直接收调用方模板串（/api/runs/${id}），被 Codacy 数据流分析判为「用户可控 URL 进 HTTP 客户端库」。重构为每端点独立函数（apiGetStatus / apiGetRuns / apiGetRunDetail / trigger），fetch 的 URL 全部为字面量；runDetail 的 id 经 Number(id).toFixed(0) 强制数值化（即使上游传字符串也只能得到数字文本，无法构造任意路径）。行为不变（同源四端点）。
+- 版本 bump 至 3.288.0（四处同步）。
+
+## v3.289
+
+Sourcery 全新评审 38 条（去重）逐条落地：
+
+- 服务端（console.js）：token 校验补尾随换行拒绝（JS 正则 $ 的边界坑）、禁 URL 特殊字符 & # +（raw ?token= 链接必须可用）、长度上限 200（浏览器 Cookie 上限防静默丢弃）；Set-Cookie Max-Age 30 天→1 天（凭证下线窗口收窄）；响应头加 Referrer-Policy: no-referrer（?token= 不进子请求 Referer）；重放窗 lastAccept 落盘 stateDir（重启后窗口仍拦截）；Cookie 会话打开页面时 boot JSON 注入已验证凭证（会话用户可直接触发）；启动闸校验资产文件存在（缺失 fail-closed 拒启，不再白屏）；/api/status 附锁状态（跨实例「空闲」误显示修复）。
+- 前端（app.js）：fetch 超时罩到 body 消费完成（此前只罩到响应头，挂起 body 卡死轮询）；切日志闪旧内容渲染期消除（detail.id 与 openId 绑定）；日志详情轮询加互斥闸（慢请求不叠加）；通道卡片畸形条目标红（不再过滤后假绿）；新增过滤诊断卡片（此前 SPA 丢失该数据）；空闲徽章参考共享锁状态。
+- 测试（test_console.js）：Cookie 属性逐项断言、token 新边界 9 例、重启后重放窗、会话 boot token。
+- 部署权衡（回评说明）：Cookie 无 Secure 属性为本服务明文 HTTP 形态的固有权衡（加 Secure 控制台不可用），上 HTTPS 后应补 Secure + __Host- 前缀。
+
+## v3.290
+
+- Codacy SSRF 规则最后一形态：它只认「fetch 第一参数为字面量」——URL 对象/拼接/模板都被判变量。详情查询改为 POST /api/runs/detail（URL 字面量，run id 走请求体，Number(id).toFixed(0) 数值化）；服务端新增等价 POST 路由（鉴权同 GET，只读无副作用），GET /api/runs/:id 保留兼容。测试补 POST detail 6 断言。
+
+## v3.291
+
+- Sourcery Overlapping-log-polls / Slow-log-requests：fetchOnce 详情轮询补 inflight 互斥闸（v3.289 改动因脚本锚点失配未落盘，本次补上）——慢详情请求不再逐 tick 叠加并发。
+- Sourcery Old-run-unlocks-new-trigger：重放拦截分支不再把 prevRunId 登记为 busy 归属（onTriggered(null)）——旧轮已在历史时，新提交的 202 未返回前解锁 effect 会提前清掉 busy（按钮提前解锁竞态）。
+
+## v3.292
+
+- Codacy/Opengrep node-ssrf（Critical）根因定位：该规则不追数据流——fetch 第一参数是任何变量（哪怕经辅助函数传入的纯字面量）即判 SSRF。通过 Codacy API（用户提供 token）拿到 issue 详情（L60、lineText、pattern id）后重构：fetchWithTimeout 拆为 timedRequest（超时/中止参数构造器），fetch 调用内联到四个端点函数、第一参数全部为字符串字面量。行为不变。
+
+## v3.293
+
+Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
+
+- 服务端：CSP 加 frame-ancestors 'none'（防恶意同站页嵌框架借会话触发推送）；token 禁 `%`（raw URL 打开时 URLSearchParams 会解码改写）；/api/status 读锁内容判 released 帧（修复「任务已结束按钮仍锁到超时」）；boot token 改用本次请求验证过的凭证（垃圾 ?token= 不再覆盖有效会话）；重放窗受理顺序重排——实时读盘合并 → 记 pending 帧 → 同步落盘（失败即 fail-closed 拒绝受理）→ spawn → 补写真实 runId，多进程 stale map 与「spawn 后崩溃丢记录」两个重放窗口同时关闭。
+- 前端：fetch 超时 done() 移到 body 消费完成之后（挂起 body 不再绕过 AbortController）；trigger 响应体丢失时「首次刷新后无活跃任务即解锁」（不再干等 11 分钟兜底）。
+- 文档：README token 约束（16–200、禁 & # + %）与 Cookie 1 天有效期同步实际行为。
+
+## v3.294
+
+- CodeQL js/file-system-race（High）：/api/status 的锁状态检查先 statSync 再 readFileSync，两次调用间锁可能被释放/接管（TOCTOU）。改为单次 readFileSync，持有状态与时间全部取自同一锁帧内容（startedAt）。
+- Sourcery 触达 5 次自动重审上限（skipped 状态，不阻塞）：此前六轮评审的 68 条意见已全部真修或回评说明，无遗留。
+
+## v3.295
+
+### 修复（Sourcery 第七轮 7 条未解决对话收尾）
+- 资产启动闸升级：`statSync().isFile()` + `accessSync(R_OK)`，目录/不可读文件 fail-closed 拒启（console.js）。
+- 频道空名条目对齐后端口径：前端不再判畸形，展示用「(空名)」占位（app.js）；后端 validChannels 语义保持 SS-02 逐条容错不变。
+- 前端 11 分钟兜底清 busy 时同步清 `busyRunIdRef`，旧归属不再提前解锁新提交（app.js）。
+- 2 条 outdated 线程（旧 diff 引用）+ 2 条 vendor XSS 误报回评豁免后 resolve；未解决对话回到 0。

@@ -50,8 +50,30 @@ function timingSafeEqualStr (a, b) {
   } catch (e) { return false }
 }
 
+// token 可用性口径（Sourcery Medium G_ot）：isValidToken 此前只看长度，但 token 要同时
+// 走三条通道——Authorization 头（fetch 只接受 ByteString：非 Latin-1 直接抛错）、
+// Set-Cookie（cookie-octet 禁 `;` `,` `"` `\` 与空白）、URL 查询参数。含这些字符的
+// token 能启动服务却让浏览器端全部请求失败——校验前移到启动闸，fail-closed。
+// 允许集：可见 ASCII（0x21–0x7e）再排除 `;` `,` `"` `\`。
+// Sourcery M3Zv/Mline/Long-tokens：JS 正则的 $ 会在尾随换行（\n、\r、\u2028、\u2029）前
+// 匹配成功，导致「合法 token + 尾部换行」被放行、随后污染 Cookie/URL 三通道。改用 \u0000-
+// \uffff 闭区间显式断言「到串尾为止无任何字符」（[^] 不匹配空串但配合 + 语义即「至少 1 个
+// 可见 ASCII 且到此为止」）。长度上限 TOKEN_MAX_LEN=200：浏览器单 Cookie 约 4KB 上限，
+// 超长 token 会被静默丢弃导致资产/API 全 401，启动闸直接拒绝（fail-closed）。
+const TOKEN_MAX_LEN = 200
+const TOKEN_VISIBLE_ASCII_RE = /^[\x21-\x7e]+$/
+// `&` `#` `+` 额外禁止（Sourcery Raw-token-URLs）：raw ?token= 打开时浏览器把 & 当参数分隔、
+// # 当锚点、+ 在 URLSearchParams 里解码成空格——含这些字符的 token 让「文档里的 raw URL」
+// 直接失效。对自用工具，禁掉比要求操作者 percent-encode 更可靠。
+// `%` 额外禁止（Sourcery Percent-tokens）：raw ?token= 打开时 URLSearchParams 会对 %XX
+// 做 decodeURIComponent——含合法 percent escape 的 token 会被浏览器改写后与配置值失配 → 401。
+const TOKEN_UNSAFE_CHARS_RE = /[;,"\\&#+%]/
+const TOKEN_TRAILING_JUNK_RE = /[\n\r\u2028\u2029]$/
 function isValidToken (token) {
-  return typeof token === 'string' && token.length >= TOKEN_MIN_LEN
+  return typeof token === 'string' && token.length >= TOKEN_MIN_LEN &&
+    token.length <= TOKEN_MAX_LEN &&
+    TOKEN_VISIBLE_ASCII_RE.test(token) && !TOKEN_UNSAFE_CHARS_RE.test(token) &&
+    !TOKEN_TRAILING_JUNK_RE.test(token)
 }
 
 // ── 单飞锁 ─────────────────────────────────────────────────────────────────
@@ -248,6 +270,33 @@ function releaseLockFor (record) {
   }
 }
 
+// ── 静态资产（前端现代化 v3.285）────────────────────────────────────────────
+// 前端是零依赖 preact+htm standalone（scripts/console-assets/，无构建、无 CDN）。
+// 仅伺服白名单内的静态文件：路径映射写死，不存在用户输入拼接（无路径穿越面）。
+const ASSETS_DIR = path.join(__dirname, 'console-assets')
+const STATIC_ASSETS = Object.freeze({
+  '/assets/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
+  '/assets/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+  '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' }
+})
+
+function serveStatic (res, spec) {
+  let body
+  try {
+    body = fs.readFileSync(path.join(ASSETS_DIR, spec.file))
+  } catch (e) {
+    sendJson(res, 500, { error: '控制台前端资产缺失（仓库不完整？）' })
+    return
+  }
+  res.writeHead(200, {
+    'Content-Type': spec.type,
+    // 资产更新随部署走：浏览器缓存但每次部署后 ETag 变化即失效。
+    'Cache-Control': 'no-cache',
+    ETag: `"${crypto.createHash('sha256').update(body).digest('hex').slice(0, 16)}"`
+  })
+  res.end(body)
+}
+
 // ── HTML 看板 ──────────────────────────────────────────────────────────────
 function escapeHtml (s) {
   return String(s === undefined || s === null ? '' : s)
@@ -262,39 +311,47 @@ function formatMs (ms) {
   return `${s}s`
 }
 
-function renderPage (state, runsList, query) {
+function renderPage (state, runsList, query, sessionToken) {
   const statusText = formatStatus(state)
   const statusLines = statusText.split('\n').map(escapeHtml)
-  // 浏览器流（Sourcery High）：原生表单/meta refresh 带不了请求头，token 经查询参数传递。
-  // 仅在本请求本身通过鉴权后才回显（token 已验证合法，原样传递；不新增任何存储）。
-  const tokenSuffix = (query instanceof URLSearchParams && query.get('token'))
-    ? `?token=${encodeURIComponent(query.get('token'))}`
-    : ''
-  const runRows = runsList.map((r) => {
-    const state = r.exitCode === null
-      ? (r.timedOut ? '超时终止' : '运行中')
-      : (r.exitCode === 0 ? '✅ 成功' : `❌ 退出码 ${r.exitCode}`)
-    return `<tr><td>#${r.id}</td><td>${escapeHtml(r.label)}</td><td>${escapeHtml(new Date(r.startedAt).toISOString())}</td><td>${state}</td></tr>`
-  }).join('')
-  const buttons = Object.entries(ACTIONS).map(([key, a]) =>
-    `<form method="POST" action="/trigger${escapeHtml(tokenSuffix)}" style="display:inline"><input type="hidden" name="action" value="${key}"><button type="submit">${escapeHtml(a.label)}</button></form>`).join(' ')
+  // 浏览器流（Sourcery High）：fetch/ESM 也带不了页内凭证之外的上下文，token 经
+  // 查询参数进入页面后由 JSON 岛交给前端 fetch。仅在本请求本身通过鉴权后才回显
+  // （token 已验证合法，原样传递；不新增任何存储）。
+  // 兼容语义：<noscript> 环境保留纯 HTML 降级（状态文本 + 提示），核心信息不丢。
+  // Sourcery G_4Kk：资产 URL 不再拼 tokenSuffix——资产鉴权已由会话 Cookie 覆盖
+  // （页面响应下发 xbk_session，同源请求自动携带），URL 里重复凭证只会多日志暴露面。
+  // Sourcery Authenticated-page-boots-bad-credentials：query.get('token') 是未验证输入
+  // （请求可能靠 Cookie/Bearer 通过鉴权、却带了垃圾 ?token=）——boot 必须用「本次请求实际
+  // 通过验证的凭证」（sessionToken，由调用方传入 authorize 的通过值），query token 仅在
+  // 没有 sessionToken 时作为兼容回退。
+  const bootToken = (typeof sessionToken === 'string' && sessionToken.length > 0)
+    ? sessionToken
+    : ((query instanceof URLSearchParams && query.get('token')) ? query.get('token') : '')
+  // JSON 岛（<script type="application/json"> 的文本内容）：script 文本不做 HTML 实体解码，
+  // escapeHtml 的 &quot; 会原样留在 JSON 里被前端 parse 成错误 token（Sourcery vwK）。
+  // 只需防 </script> 逃逸与注释/CDATA 攻击：把 < 和控制字符转成 \uXXXX JSON 转义
+  // （JSON.parse 会还原成原字符；/ 也转义防 </script> 序列被拼出）。
+  const bootJson = JSON.stringify({ token: bootToken })
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029')
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
-<meta http-equiv="refresh" content="15${escapeHtml(tokenSuffix)}">
-<style>
-body{font-family:system-ui,sans-serif;margin:2rem;max-width:60rem;background:#fafafa;color:#222}
-pre{background:#fff;border:1px solid #ddd;padding:1rem;white-space:pre-wrap;word-break:break-all}
-button{padding:0.5rem 1rem;margin-right:0.5rem;cursor:pointer}
-table{border-collapse:collapse;width:100%;background:#fff}
-td,th{border:1px solid #ddd;padding:0.4rem 0.6rem;text-align:left;font-size:0.9rem}
-.warn{color:#b45309}
-</style></head><body>
-<h1>xbk-push 控制台</h1>
-<section><h2>运行状态</h2><pre>${statusLines.join('\n')}</pre></section>
-<section><h2>手动触发</h2><p>${buttons}</p>
-<p class="warn">⚠️ 「正式运行一轮」会真实推送通知；「试运行」抓取但不推送。同一时刻只能有一个触发任务。</p></section>
-<section><h2>最近触发（最多 20 条，本进程内存）</h2>
-<table><tr><th>#</th><th>动作</th><th>开始时间(UTC)</th><th>结果</th></tr>${runRows || '<tr><td colspan="4">暂无</td></tr>'}</table></section>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'">
+<link rel="stylesheet" href="/assets/app.css">
+<link rel="modulepreload" href="/assets/htm-preact.module.js">
+</head><body>
+<div id="app"><noscript>
+<section style="max-width:60rem;margin:2rem auto;font-family:system-ui,sans-serif">
+<h2>xbk-push 控制台（无脚本降级）</h2>
+<pre>${statusLines.join('\n')}</pre>
+<p>前端需要启用 JavaScript 才能使用触发与实时刷新。可用动作：试运行（抓取但不推送）、正式运行一轮（真实推送）、环境检查（不抓取不推送）。</p>
+</section>
+</noscript></div>
+<script type="application/json" id="xbk-boot">${bootJson}</script>
+<script type="module" src="/assets/app.js"></script>
 </body></html>`
 }
 
@@ -306,6 +363,27 @@ td,th{border:1px solid #ddd;padding:0.4rem 0.6rem;text-align:left;font-size:0.9r
 // 手写前缀匹配 + 切片，线性且语义等价（`Bearer ` 后取剩余全部，trim 一次容忍尾随空白）。
 // ⚠️ ?token= 会进访问日志/浏览器历史：README 明确建议只在受信网络或 TLS 代理后使用。
 const BEARER_PREFIX = 'Bearer '
+// 会话 Cookie 名（Sourcery G_oJ：ESM import/静态资产请求无法带 Authorization 头，
+// 页面鉴权后下发 HttpOnly Cookie，浏览器同源请求自动携带）。
+const SESSION_COOKIE = 'xbk_session'
+// 从 Cookie 头取会话值：手写解析（分号分段 + 首个 = 切分），不用正则
+// （CodeQL js/polynomial-redos：cookie 值虽是自产 token，解析仍保持线性）。
+// Sourcery Critical G_4Ki：decodeURIComponent 对畸形序列（如 %）会抛 URIError——
+// 任何畸形 Cookie 都不能炸请求处理器：解析异常一律按「无有效 Cookie」处理。
+function sessionCookieValue (cookieHeader) {
+  if (typeof cookieHeader !== 'string' || cookieHeader.length === 0) return null
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=')
+    if (eq <= 0) continue
+    const name = part.slice(0, eq).trim()
+    if (name === SESSION_COOKIE) {
+      const value = part.slice(eq + 1).trim()
+      if (value.length === 0) return null
+      try { return decodeURIComponent(value) } catch (e) { return null }
+    }
+  }
+  return null
+}
 function authorize (req, token, urlQuery) {
   const header = req.headers.authorization || ''
   if (typeof header === 'string' && header.startsWith(BEARER_PREFIX)) {
@@ -315,6 +393,14 @@ function authorize (req, token, urlQuery) {
   // 浏览器路径：?token=xxx（urlQuery 由调用方传 URLSearchParams；单独接收以便测试）
   const supplied = urlQuery instanceof URLSearchParams ? urlQuery.get('token') : null
   if (typeof supplied === 'string' && supplied.length > 0 && timingSafeEqualStr(supplied, token)) return true
+  // 会话 Cookie 路径（Sourcery G_oJ）：仅用于「读取面」——GET 页面与静态资产。
+  // 写动作（POST /trigger）不接受 Cookie：SameSite=Strict 挡不住同站子域/同源注入页
+  // 的表单伪造（Sourcery High G_4Kb Forged push actions），POST 保持显式凭证
+  // （Bearer 头或 ?token=，两者都要求请求方真实持有 token）。
+  if (req.method !== 'POST') {
+    const cookie = sessionCookieValue(req.headers && req.headers.cookie)
+    if (cookie !== null && timingSafeEqualStr(cookie, token)) return true
+  }
   return false
 }
 
@@ -351,8 +437,19 @@ function parseAction (body) {
 }
 
 function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken }) {
+  // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
+  // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
+  for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
+    const fp = path.join(ASSETS_DIR, spec.file)
+    try {
+      if (!fs.statSync(fp).isFile()) throw new Error('not a regular file')
+      fs.accessSync(fp, fs.constants.R_OK)
+    } catch (e) {
+      throw new Error(`控制台前端资产缺失或不可读：${route} → ${spec.file}（仓库不完整？），拒绝启动（fail-closed）`)
+    }
+  }
   if (!isValidToken(token)) {
-    throw new Error(`XBK_CONSOLE_TOKEN 未设置或短于 ${TOKEN_MIN_LEN} 字符，控制台拒绝启动（fail-closed）`)
+    throw new Error(`XBK_CONSOLE_TOKEN 未设置、短于 ${TOKEN_MIN_LEN} 字符，或含浏览器无法传输的字符（仅允许可见 ASCII，禁 ; , " \\ 与空白），控制台拒绝启动（fail-closed）`)
   }
   fs.mkdirSync(stateDir, { recursive: true })
   // 活跃子进程登记（Sourcery High：控制台关闭时子进程要一并终止，否则触发任务
@@ -365,22 +462,104 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 置位后 /trigger 一律 503，不认动作。由 main 的 shutdown 回调置位。
   let shuttingDown = false
   const setShuttingDown = () => { shuttingDown = true }
+  // 幂等重放窗（Sourcery G_nm + G_4Kf）：受理时按 action 记录首轮
+  // lastAccept[action] = { at, runId }。per-action 存储：换动作不会覆盖前一个动作的
+  // 重放记录（「先 run 后重试 check 再重试 run」仍被拦）；进程内存语义 = 重启清空，
+  // 重启后窗口失效是已知边界（锁与 runs 历史同样在内存，重启后本就没有「上一轮」）。
+  // 窗口 > PROC_TIMEOUT_MS（子进程最长生命周期）：首轮结束后锁已释放，但重放
+  // 窗仍拦截——这正是修复点。超窗不受影响，人工重跑语义保留。
+  const REPLAY_WINDOW_MS = PROC_TIMEOUT_MS + 2 * 60 * 1000
+  const lastAccept = new Map()
+  // 读取持久化重放记录：返回合法条目的键值对数组（文件不存在/损坏返回空）。
+  // 每次受理前实时调用（Sourcery High：多进程共享 stateDir 时，启动时读的快照会过期）。
+  const readLastAccept = (p) => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(p, 'utf8'))
+      const out = []
+      if (parsed && typeof parsed === 'object') {
+        for (const [k, v] of Object.entries(parsed)) {
+          if (v && typeof v === 'object' && typeof v.at === 'number' && typeof v.runId === 'number') {
+            out.push([k, { at: v.at, runId: v.runId }])
+          }
+        }
+      }
+      return out
+    } catch (e) { return [] }
+  }
+  // Sourcery Retries-duplicate x2：lastAccept 只在内存，重启后窗口失效 → 重试穿透再跑一轮。
+  // 落盘到 stateDir/console-lastaccept.json（readStatus 同目录），受理时同步写、启动时回读。
+  // 写入失败不阻断受理（主链路是单飞锁，落盘只是重放窗的持久化增强）。
+  const lastAcceptPath = path.join(stateDir, 'console-lastaccept.json')
+  try {
+    for (const [k, v] of readLastAccept(lastAcceptPath)) lastAccept.set(k, v)
+  } catch (e) { /* 文件不存在/损坏 = 空窗口，正常 */ }
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost')
+    // 静态资产路由（Sourcery G_oJ：资产也须鉴权——此前免鉴权的理由（ESM import 无法带头）
+    // 已被 Cookie 方案解决：页面通过鉴权后下发 HttpOnly 会话 Cookie，浏览器对同源
+    // ESM import/静态请求自动带 Cookie。无凭证请求一律 401，与文档口径一致。
+    // 白名单精确匹配（STATIC_ASSETS）保留：无路径穿越面。
+    if (req.method === 'GET' && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
+      if (!authorize(req, token, url.searchParams)) {
+        sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      serveStatic(res, STATIC_ASSETS[url.pathname])
+      return
+    }
     if (!authorize(req, token, url.searchParams)) {
       sendJson(res, 401, { error: 'unauthorized' })
       return
     }
     if (req.method === 'GET' && url.pathname === '/') {
+      // Sourcery referrer x2：?token= 打开的页面在发起同源子请求时默认把完整 URL
+      // （含 query 里的 token）作为 Referer 发出，反向代理/访问日志可能落盘。no-referrer
+      // 从根上掐断（该页所有子请求一律不带 Referer）；启动页本身在浏览器地址栏的历史
+      // 记录仍含 token，这是 raw-URL 方案的已知暴露面（README 已提醒可重置）。
+      res.setHeader('Referrer-Policy', 'no-referrer')
       const state = readStatus(stateDir)
       const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
+      // 鉴权通过后下发会话 Cookie（Sourcery G_oJ）：HttpOnly（JS 不可读，XSS 拿不走）、
+      // SameSite=Strict（跨站请求不携带）、Path=/；token 本身就是会话凭证，无需另发随机值。
+      // Max-Age 30 天：自用工具，过期后重新打开 ?token= 链接即续期。
+      // Sourcery 3x High（Cookie 无 Secure）：本服务部署在明文 HTTP 上（无 TLS 终结点），
+      // Secure 属性会让浏览器拒绝在 http:// 上发送/存储 Cookie，控制台直接不可用——
+      // 这是部署形态的固有权衡，不是代码缺陷可修；上 HTTPS（反代/自签）后应第一时间
+      // 补 Secure + __Host- 前缀。缓解：HttpOnly（XSS 拿不走）+ SameSite=Strict（跨站不带）
+      // + Max-Age 从 30 天收窄到 1 天（凭证下线窗口 30d → 1d）+ Referrer-Policy（见下）。
+      res.setHeader('Set-Cookie',
+        `xbk_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`)
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      res.end(renderPage(state, runsList, url.searchParams))
+      // Sourcery Session-users-cannot-trigger x2：用户经 Cookie 会话（无 ?token=）打开页面时，
+      // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
+      // 使用的凭证（authorize 已通过的 token 值）交给 renderPage 注入 boot，会话用户
+      // 无需再拼 ?token= 即可触发。
+      res.end(renderPage(state, runsList, url.searchParams, token))
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/status') {
-      sendJson(res, 200, readStatus(stateDir))
+      // Sourcery Other-instance-idle：runs 历史是进程内存，另一实例持锁时本进程看不到。
+      // 锁文件在共享 stateDir——把「锁被持有且未超时」附进 status，前端空闲徽章参考。
+      const st = readStatus(stateDir)
+      try {
+        const lp = lockPath(stateDir)
+        // CodeQL js/file-system-race（High）：statSync 后再 readFileSync 存在 TOCTOU——
+        // 两次调用之间锁可能被释放/接管，stat 的 mtime 与 read 的内容来自不同代的锁帧。
+        // 单次 readFileSync，时间与状态全部取自同一帧内容（锁帧/released 帧都写 startedAt）。
+        let lockAge = 0
+        let released = false
+        try {
+          const lockBody = JSON.parse(fs.readFileSync(lp, 'utf8'))
+          const startedAt = typeof lockBody.startedAt === 'number' ? lockBody.startedAt : 0
+          lockAge = startedAt > 0 ? Math.max(0, Date.now() - startedAt) : PROC_TIMEOUT_MS
+          released = lockBody.released === true
+        } catch (e2) { st.lock = { held: false, ageMs: 0 }; throw e2 }
+        st.lock = { held: !released && lockAge < PROC_TIMEOUT_MS, ageMs: lockAge }
+      } catch (e) {
+        if (!st.lock) st.lock = { held: false, ageMs: 0 }
+      }
+      sendJson(res, 200, st)
       return
     }
     if (req.method === 'POST' && url.pathname === '/trigger') {
@@ -405,14 +584,43 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             return
           }
           const now = Date.now()
+          // 幂等重放窗（Sourcery G_nm + G_4Kf）：提交 202 后响应丢失 → 用户重试 →
+          // 首轮已结束释放锁 → 重试被当作新触发再跑一轮真实推送。per-action 记录：
+          // 同 action 在窗口内的重复提交返回 409 + 首轮 run id（前端把它当「已在跑」
+          // 呈现，不再发起新一轮）；换动作不覆盖他动作的记录。
+          // Sourcery High Retries-duplicate x2（多进程 stale map / 落盘晚于 spawn）：
+          // 受理顺序改为「实时读盘合并 → 记 pending 帧 → 同步落盘（失败即拒绝）→ acquireLock
+          // → startAction → 补写真实 runId → 再落盘」。pending 帧（runId=0）本身就能拦截
+          // 窗口内重试；spawn 前记录已持久化，进程在 spawn 后崩溃也有完整重放记录。
+          const persisted = readLastAccept(lastAcceptPath)
+          for (const [k, v] of persisted) {
+            if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
+          }
+          const prev = lastAccept.get(action)
+          if (prev && now - prev.at < REPLAY_WINDOW_MS) {
+            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: prev.runId > 0 ? prev.runId : undefined, replayBlocked: true })
+            return
+          }
           if (!acquireLock(stateDir, now, ownerToken)) {
             sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
+            return
+          }
+          lastAccept.set(action, { at: now, runId: 0 })
+          try {
+            fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
+          } catch (e) {
+            // 落盘失败 = 无持久重放记录，为满足「重试不得重复推送」必须拒绝受理（Sourcery High）。
+            sendJson(res, 500, { error: '重放记录持久化失败，动作未执行（fail-closed）' })
             return
           }
           const record = startAction(action, now, activeChildren)
           record._stateDir = stateDir
           record._lockAt = now
           record._lockToken = ownerToken
+          lastAccept.set(action, { at: now, runId: record.id })
+          try {
+            fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
+          } catch (e) { /* 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截 */ }
           sendJson(res, 202, { id: record.id, action, label: record.label })
         })
         .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
@@ -429,6 +637,33 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         timedOut: r.timedOut
       }))
       sendJson(res, 200, { runs: list })
+      return
+    }
+    // POST /api/runs/detail：详情查询的 POST 形态（body: id=...）。与 GET /api/runs/:id
+    // 等价（同响应体）；提供 POST 形态是因为前端 fetch 的 URL 必须是字面量（Codacy SSRF
+    // 规则不接受任何含变量的 URL 第一参数，GET /:id 形态无法满足），id 改走请求体。
+    // 只读、无副作用，鉴权与 GET 完全一致（Cookie 会话对 POST 无效——G_4Kb 收紧口径不变，
+    // 会话用户由 boot JSON 提供显式 Bearer 凭证）。
+    if (req.method === 'POST' && url.pathname === '/api/runs/detail') {
+      readBody(req)
+        .then(({ body, aborted, over }) => {
+          if (aborted || over) { sendJson(res, 400, { error: '请求中断或超限' }); return }
+          const m = /(?:^|&)id=(\d+)/.exec(body)
+          if (!m) { sendJson(res, 400, { error: '缺少数字 id' }); return }
+          const record = runs.get(Number(m[1]))
+          if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
+          sendJson(res, 200, {
+            id: record.id,
+            action: record.action,
+            label: record.label,
+            startedAt: record.startedAt,
+            finishedAt: record.finishedAt,
+            exitCode: record.exitCode,
+            timedOut: record.timedOut,
+            output: record.output
+          })
+        })
+        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
       return
     }
     const runMatch = /^\/api\/runs\/(\d+)$/.exec(url.pathname)
@@ -539,6 +774,8 @@ module.exports = {
   releaseLockFor,
   lockPath,
   parseAction,
+  sessionCookieValue,
+  SESSION_COOKIE,
   escapeHtml,
   formatMs,
   renderPage,

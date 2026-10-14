@@ -1,0 +1,7 @@
+# Sourcery 云端评审配置（https://docs.sourcery.ai/Configuration/）：
+# vendor 文件不入评审面。htm-preact.module.js 是 preact+htm standalone 上游产物
+# （为免构建直接入库），其内部的 innerHTML/document.write/动态属性访问是框架
+# DOM diff 的实现细节，页面不向其传递任何用户净输入——评审与安全规则只应扫我们自己的代码。
+version: '1'
+ignore:
+  - 'scripts/console-assets/htm-preact.module.js'

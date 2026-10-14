@@ -176,9 +176,11 @@ npm run console                   # 启动网页控制台（需先设置 XBK_CON
 XBK_CONSOLE_TOKEN=请换成至少16位的随机字符串 npm run console
 ```
 
-- 默认地址 `http://127.0.0.1:7777`。两种鉴权方式：命令行/API 用请求头 `Authorization: Bearer <XBK_CONSOLE_TOKEN>`；浏览器直接打开 `http://127.0.0.1:7777/?token=<XBK_CONSOLE_TOKEN>`（页面里的触发按钮与 15 秒自动刷新会自动带上 token）。token 未设置或短于 16 字符时服务直接拒绝启动。
+- 默认地址 `http://127.0.0.1:7777`。两种鉴权方式：命令行/API 用请求头 `Authorization: Bearer <XBK_CONSOLE_TOKEN>`；浏览器直接打开 `http://127.0.0.1:7777/?token=<XBK_CONSOLE_TOKEN>`（页面内的 fetch 请求通过 Authorization: Bearer 请求头携带 token，URL 不再复述凭证；看板每 5 秒自动刷新，任务运行期间加密到 2 秒）。token 未设置或短于 16 字符时服务直接拒绝启动。
 - ⚠️ `?token=` 会留在浏览器历史与访问日志里；`XBK_CONSOLE_HOST` 绑定非回环地址时 token 以明文过网（HTTP 无加密），请仅在受信内网使用，跨网访问务必前置 TLS 反代（nginx/caddy 终止 TLS 后转发本端口）。
 - 「试运行」抓取但不推送、不写去重记录（等价 `--dry-run`）；「正式运行一轮」会**真实推送通知**。同一时刻只允许一个触发任务，重复触发返回 409；锁残留（进程被 kill -9 等留下损坏锁文件）时人工删除缓存目录下的 `console-trigger.lock` 即可恢复。
+- 触发有**幂等重放窗**：同一动作在 12 分钟窗口内的重复提交返回 409（响应带首轮 runId，`replayBlocked: true`），防止「提交成功但响应丢失 → 重试 → 再跑一轮真实推送」的重复推送；跨动作不受影响，确需重跑同一动作请等窗口过后再触发。
+- 浏览器会话：以 `?token=` 打开看板成功后服务端下发 `xbk_session` Cookie（HttpOnly、SameSite=Strict、有效期 1 天，过期后重新打开 `?token=` 链接即续期），此后同源请求（含 ESM/静态资产）自动携带，`/assets/*` 无凭证返回 401。`XBK_CONSOLE_TOKEN` 仅允许可见 ASCII 字符（长度 16–200，禁空格与 `; , " \\ & # + %`）——含这些字符时服务拒绝启动（它们会让 raw URL 打开、Cookie 传输或 URL 解码失配，浏览器端必然失败）。
 - ⚠️ 已知边界：控制台触发锁只约束「控制台触发的任务」，不感知青龙定时任务/常驻进程——定时任务正在推送时再从控制台触发一轮，可能出现重复推送。避免在定时任务运行窗口内手动触发。
 - 只读部分与 `--status` 同源：日报计数、最近一轮、通道健康、过滤诊断（缓存目录解析逻辑与 `--status` 完全一致）。
 - 触发历史仅保存在控制台进程内存（最多 20 条，重启即空）；持久记录仍以缓存目录的状态文件与 `run.log` 为准。控制台停止时会终止由它拉起的子进程。

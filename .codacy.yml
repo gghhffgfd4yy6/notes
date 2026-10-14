@@ -179,6 +179,10 @@
 # 全部是测试硬编码常量、无外部净输入，静态路径注入告警属误报。
 #
 exclude_paths:
+  # v3.285：console-assets/htm-preact.module.js 是 preact+htm standalone 上游产物
+  # （为免构建直接入库的 vendor 单文件），内部的 innerHTML/document.write/动态属性
+  # 访问是框架实现细节，非本仓代码缺陷——同 .sourcery.yaml 的 ignore 口径。
+  - "scripts/console-assets/htm-preact.module.js"
   - "scripts/check-doc-lines.js"
   - "scripts/check-host-clean.js"
   - "test_doc_line_gates.js"
