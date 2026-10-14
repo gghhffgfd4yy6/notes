@@ -542,17 +542,21 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const st = readStatus(stateDir)
       try {
         const lp = lockPath(stateDir)
-        const lockStat = fs.statSync(lp)
-        const lockAge = Date.now() - lockStat.mtimeMs
-        // Sourcery Finished-tasks-appear-running：锁文件释放后是原地覆写 released 帧（不是删除），
-        // 只看 mtime 会把「刚释放」误报为持有中 → 前端按钮一直锁到超时。必须读内容判 released。
+        // CodeQL js/file-system-race（High）：statSync 后再 readFileSync 存在 TOCTOU——
+        // 两次调用之间锁可能被释放/接管，stat 的 mtime 与 read 的内容来自不同代的锁帧。
+        // 单次 readFileSync，时间与状态全部取自同一帧内容（锁帧/released 帧都写 startedAt）。
+        let lockAge = 0
         let released = false
         try {
           const lockBody = JSON.parse(fs.readFileSync(lp, 'utf8'))
-          released = lockBody && lockBody.released === true
-        } catch (e2) { /* 解析失败按未释放处理（age 判据兜底） */ }
-        st.lock = { held: !released && lockAge < PROC_TIMEOUT_MS, ageMs: Math.max(0, Math.round(lockAge)) }
-      } catch (e) { st.lock = { held: false, ageMs: 0 } }
+          const startedAt = typeof lockBody.startedAt === 'number' ? lockBody.startedAt : 0
+          lockAge = startedAt > 0 ? Math.max(0, Date.now() - startedAt) : PROC_TIMEOUT_MS
+          released = lockBody.released === true
+        } catch (e2) { st.lock = { held: false, ageMs: 0 }; throw e2 }
+        st.lock = { held: !released && lockAge < PROC_TIMEOUT_MS, ageMs: lockAge }
+      } catch (e) {
+        if (!st.lock) st.lock = { held: false, ageMs: 0 }
+      }
       sendJson(res, 200, st)
       return
     }

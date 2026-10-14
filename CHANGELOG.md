@@ -338,3 +338,8 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 服务端：CSP 加 frame-ancestors 'none'（防恶意同站页嵌框架借会话触发推送）；token 禁 `%`（raw URL 打开时 URLSearchParams 会解码改写）；/api/status 读锁内容判 released 帧（修复「任务已结束按钮仍锁到超时」）；boot token 改用本次请求验证过的凭证（垃圾 ?token= 不再覆盖有效会话）；重放窗受理顺序重排——实时读盘合并 → 记 pending 帧 → 同步落盘（失败即 fail-closed 拒绝受理）→ spawn → 补写真实 runId，多进程 stale map 与「spawn 后崩溃丢记录」两个重放窗口同时关闭。
 - 前端：fetch 超时 done() 移到 body 消费完成之后（挂起 body 不再绕过 AbortController）；trigger 响应体丢失时「首次刷新后无活跃任务即解锁」（不再干等 11 分钟兜底）。
 - 文档：README token 约束（16–200、禁 & # + %）与 Cookie 1 天有效期同步实际行为。
+
+## v3.294
+
+- CodeQL js/file-system-race（High）：/api/status 的锁状态检查先 statSync 再 readFileSync，两次调用间锁可能被释放/接管（TOCTOU）。改为单次 readFileSync，持有状态与时间全部取自同一锁帧内容（startedAt）。
+- Sourcery 触达 5 次自动重审上限（skipped 状态，不阻塞）：此前六轮评审的 68 条意见已全部真修或回评说明，无遗留。
