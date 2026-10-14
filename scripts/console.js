@@ -65,7 +65,9 @@ const TOKEN_VISIBLE_ASCII_RE = /^[\x21-\x7e]+$/
 // `&` `#` `+` 额外禁止（Sourcery Raw-token-URLs）：raw ?token= 打开时浏览器把 & 当参数分隔、
 // # 当锚点、+ 在 URLSearchParams 里解码成空格——含这些字符的 token 让「文档里的 raw URL」
 // 直接失效。对自用工具，禁掉比要求操作者 percent-encode 更可靠。
-const TOKEN_UNSAFE_CHARS_RE = /[;,"\\&#+]/
+// `%` 额外禁止（Sourcery Percent-tokens）：raw ?token= 打开时 URLSearchParams 会对 %XX
+// 做 decodeURIComponent——含合法 percent escape 的 token 会被浏览器改写后与配置值失配 → 401。
+const TOKEN_UNSAFE_CHARS_RE = /[;,"\\&#+%]/
 const TOKEN_TRAILING_JUNK_RE = /[\n\r\u2028\u2029]$/
 function isValidToken (token) {
   return typeof token === 'string' && token.length >= TOKEN_MIN_LEN &&
@@ -318,10 +320,13 @@ function renderPage (state, runsList, query, sessionToken) {
   // 兼容语义：<noscript> 环境保留纯 HTML 降级（状态文本 + 提示），核心信息不丢。
   // Sourcery G_4Kk：资产 URL 不再拼 tokenSuffix——资产鉴权已由会话 Cookie 覆盖
   // （页面响应下发 xbk_session，同源请求自动携带），URL 里重复凭证只会多日志暴露面。
-  const token = (query instanceof URLSearchParams && query.get('token')) ? query.get('token') : ''
-  // ?token= 缺席但 Cookie 会话已通过（sessionToken 参数非空）时用它——两者都来自
-  // 服务端已验证的凭证，不含任何用户可控输入。
-  const bootToken = token || (typeof sessionToken === 'string' ? sessionToken : '')
+  // Sourcery Authenticated-page-boots-bad-credentials：query.get('token') 是未验证输入
+  // （请求可能靠 Cookie/Bearer 通过鉴权、却带了垃圾 ?token=）——boot 必须用「本次请求实际
+  // 通过验证的凭证」（sessionToken，由调用方传入 authorize 的通过值），query token 仅在
+  // 没有 sessionToken 时作为兼容回退。
+  const bootToken = (typeof sessionToken === 'string' && sessionToken.length > 0)
+    ? sessionToken
+    : ((query instanceof URLSearchParams && query.get('token')) ? query.get('token') : '')
   // JSON 岛（<script type="application/json"> 的文本内容）：script 文本不做 HTML 实体解码，
   // escapeHtml 的 &quot; 会原样留在 JSON 里被前端 parse 成错误 token（Sourcery vwK）。
   // 只需防 </script> 逃逸与注释/CDATA 攻击：把 < 和控制字符转成 \uXXXX JSON 转义
@@ -334,7 +339,7 @@ function renderPage (state, runsList, query, sessionToken) {
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'">
 <link rel="stylesheet" href="/assets/app.css">
 <link rel="modulepreload" href="/assets/htm-preact.module.js">
 </head><body>
@@ -463,19 +468,28 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 窗仍拦截——这正是修复点。超窗不受影响，人工重跑语义保留。
   const REPLAY_WINDOW_MS = PROC_TIMEOUT_MS + 2 * 60 * 1000
   const lastAccept = new Map()
+  // 读取持久化重放记录：返回合法条目的键值对数组（文件不存在/损坏返回空）。
+  // 每次受理前实时调用（Sourcery High：多进程共享 stateDir 时，启动时读的快照会过期）。
+  const readLastAccept = (p) => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(p, 'utf8'))
+      const out = []
+      if (parsed && typeof parsed === 'object') {
+        for (const [k, v] of Object.entries(parsed)) {
+          if (v && typeof v === 'object' && typeof v.at === 'number' && typeof v.runId === 'number') {
+            out.push([k, { at: v.at, runId: v.runId }])
+          }
+        }
+      }
+      return out
+    } catch (e) { return [] }
+  }
   // Sourcery Retries-duplicate x2：lastAccept 只在内存，重启后窗口失效 → 重试穿透再跑一轮。
   // 落盘到 stateDir/console-lastaccept.json（readStatus 同目录），受理时同步写、启动时回读。
   // 写入失败不阻断受理（主链路是单飞锁，落盘只是重放窗的持久化增强）。
   const lastAcceptPath = path.join(stateDir, 'console-lastaccept.json')
   try {
-    const persisted = JSON.parse(fs.readFileSync(lastAcceptPath, 'utf8'))
-    if (persisted && typeof persisted === 'object') {
-      for (const [k, v] of Object.entries(persisted)) {
-        if (v && typeof v === 'object' && typeof v.at === 'number' && typeof v.runId === 'number') {
-          lastAccept.set(k, { at: v.at, runId: v.runId })
-        }
-      }
-    }
+    for (const [k, v] of readLastAccept(lastAcceptPath)) lastAccept.set(k, v)
   } catch (e) { /* 文件不存在/损坏 = 空窗口，正常 */ }
 
   const server = http.createServer((req, res) => {
@@ -530,7 +544,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         const lp = lockPath(stateDir)
         const lockStat = fs.statSync(lp)
         const lockAge = Date.now() - lockStat.mtimeMs
-        st.lock = { held: lockAge < PROC_TIMEOUT_MS, ageMs: Math.max(0, Math.round(lockAge)) }
+        // Sourcery Finished-tasks-appear-running：锁文件释放后是原地覆写 released 帧（不是删除），
+        // 只看 mtime 会把「刚释放」误报为持有中 → 前端按钮一直锁到超时。必须读内容判 released。
+        let released = false
+        try {
+          const lockBody = JSON.parse(fs.readFileSync(lp, 'utf8'))
+          released = lockBody && lockBody.released === true
+        } catch (e2) { /* 解析失败按未释放处理（age 判据兜底） */ }
+        st.lock = { held: !released && lockAge < PROC_TIMEOUT_MS, ageMs: Math.max(0, Math.round(lockAge)) }
       } catch (e) { st.lock = { held: false, ageMs: 0 } }
       sendJson(res, 200, st)
       return
@@ -561,13 +582,29 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 首轮已结束释放锁 → 重试被当作新触发再跑一轮真实推送。per-action 记录：
           // 同 action 在窗口内的重复提交返回 409 + 首轮 run id（前端把它当「已在跑」
           // 呈现，不再发起新一轮）；换动作不覆盖他动作的记录。
+          // Sourcery High Retries-duplicate x2（多进程 stale map / 落盘晚于 spawn）：
+          // 受理顺序改为「实时读盘合并 → 记 pending 帧 → 同步落盘（失败即拒绝）→ acquireLock
+          // → startAction → 补写真实 runId → 再落盘」。pending 帧（runId=0）本身就能拦截
+          // 窗口内重试；spawn 前记录已持久化，进程在 spawn 后崩溃也有完整重放记录。
+          const persisted = readLastAccept(lastAcceptPath)
+          for (const [k, v] of persisted) {
+            if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
+          }
           const prev = lastAccept.get(action)
           if (prev && now - prev.at < REPLAY_WINDOW_MS) {
-            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: prev.runId, replayBlocked: true })
+            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: prev.runId > 0 ? prev.runId : undefined, replayBlocked: true })
             return
           }
           if (!acquireLock(stateDir, now, ownerToken)) {
             sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
+            return
+          }
+          lastAccept.set(action, { at: now, runId: 0 })
+          try {
+            fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
+          } catch (e) {
+            // 落盘失败 = 无持久重放记录，为满足「重试不得重复推送」必须拒绝受理（Sourcery High）。
+            sendJson(res, 500, { error: '重放记录持久化失败，动作未执行（fail-closed）' })
             return
           }
           const record = startAction(action, now, activeChildren)
@@ -577,7 +614,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           lastAccept.set(action, { at: now, runId: record.id })
           try {
             fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-          } catch (e) { /* 落盘失败不阻断受理：锁仍在，重放窗仅退化为进程内 */ }
+          } catch (e) { /* 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截 */ }
           sendJson(res, 202, { id: record.id, action, label: record.label })
         })
         .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))

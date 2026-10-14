@@ -52,6 +52,7 @@ ok('isValidToken: 浏览器不可传输字符拒绝（Sourcery G_ot）', () => {
   assert.strictEqual(isValidToken('a'.repeat(8) + '&'.repeat(8)), false, '& 拒绝（URL 分隔符）')
   assert.strictEqual(isValidToken('a'.repeat(8) + '#'.repeat(8)), false, '# 拒绝（锚点）')
   assert.strictEqual(isValidToken('a'.repeat(8) + '+'.repeat(8)), false, '+ 拒绝（空格解码）')
+  assert.strictEqual(isValidToken('a'.repeat(8) + '%41'.repeat(4)), false, '% 拒绝（URLSearchParams 会解码改写）')
   // Sourcery Long-tokens：超长 token 被浏览器 Cookie 静默丢弃 → 资产全 401
   assert.strictEqual(isValidToken('a'.repeat(201)), false, '超长（>200）拒绝')
   assert.strictEqual(isValidToken('a'.repeat(200)), true, '恰好 200 通过')

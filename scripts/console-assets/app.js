@@ -86,10 +86,19 @@ async function apiGetStatus () {
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   const p = fetch('/api/status', merged)
-  p.then(done, () => {})
-  const res = await p
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return readBodyJson(res)
+  p.then(() => {}, () => {}) // fetch reject（网络错）时由下方 done 兜底；正常路径在 body 消费后清
+  try {
+    const res = await p
+    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
+    try {
+      return await readBodyJson(res)
+    } finally {
+      done() // body 消费完才清期限（Sourcery Stalled-bodies-outlive：done 提前会让挂起 body 绕过 abort）
+    }
+  } catch (e) {
+    done()
+    throw e
+  }
 }
 
 async function apiGetRuns () {
@@ -97,10 +106,19 @@ async function apiGetRuns () {
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   const p = fetch('/api/runs', merged)
-  p.then(done, () => {})
-  const res = await p
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return readBodyJson(res)
+  p.then(() => {}, () => {})
+  try {
+    const res = await p
+    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
+    try {
+      return await readBodyJson(res)
+    } finally {
+      done()
+    }
+  } catch (e) {
+    done()
+    throw e
+  }
 }
 
 async function apiGetRunDetail (id) {
@@ -119,10 +137,19 @@ async function apiGetRunDetail (id) {
     body
   })
   const p = fetch('/api/runs/detail', merged)
-  p.then(done, () => {})
-  const res = await p
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return readBodyJson(res)
+  p.then(() => {}, () => {})
+  try {
+    const res = await p
+    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
+    try {
+      return await readBodyJson(res)
+    } finally {
+      done()
+    }
+  } catch (e) {
+    done()
+    throw e
+  }
 }
 
 async function trigger (action) {
@@ -136,9 +163,22 @@ async function trigger (action) {
     body
   })
   const p = fetch('/trigger', merged)
-  p.then(done, () => {})
-  const res = await p
-  const data = await readBodyJson(res).catch(() => ({}))
+  p.then(() => {}, () => {})
+  let res
+  try {
+    res = await p
+  } catch (e) {
+    done()
+    throw e
+  }
+  let data
+  try {
+    data = await readBodyJson(res)
+  } catch (e) {
+    data = {}
+  } finally {
+    done()
+  }
   if (!res.ok) {
     // 服务端幂等重放窗（与 console.js REPLAY_WINDOW_MS 配套）：同动作重试被拦时
     // 返回首轮 runId——提示用户「那一轮已经在跑/已完成」，前端顺手刷新历史。
@@ -486,6 +526,8 @@ function App () {
   // busy 由哪一次提交引起（Sourcery G_nv：解锁判据是「提交的那一轮出现在历史里」，
   // 不管它现在是否已结束——否则任务秒完成时按钮锁到 11 分钟兜底才开）。
   const busyRunIdRef = useRef(null)
+  // 首次刷新完成前不判「无活跃任务」（启动时 runs 尚空，会把丢失响应的 busy 立刻清掉）。
+  const refreshedOnceRef = useRef(false)
 
   // vwD：逐请求独立收口——status 失败时 runs 结果仍可用（反之亦然）；
   // 并行发出（Sourcery G_n6）：串行 await 会让慢端点拖住另一端点的更新。
@@ -508,6 +550,7 @@ function App () {
       if (rRes.status === 'fulfilled') applyRuns(rRes.value)
       else errs.push(`历史 ${rRes.reason && rRes.reason.message ? rRes.reason.message : rRes.reason}`)
       if (seq !== seqRef.current) return
+      refreshedOnceRef.current = true
       if (errs.length > 0) setSyncErr(`刷新失败：${errs.join('；')}（自动重试中）`)
       else setSyncErr('')
     } finally {
@@ -539,12 +582,20 @@ function App () {
   // 正常解锁路径（Sourcery G_nv）：busy 期间每次刷新比对「提交的那一轮是否已进历史」
   // ——不管它现在运行中还是已结束，出现即解锁。秒完成的任务不再锁到兜底超时。
   useEffect(() => {
-    if (!busy || busyRunIdRef.current === null) return
+    if (!busy) return
+    if (busyRunIdRef.current === null) {
+      // Sourcery Trigger-busy-after-lost-response：202 已受理但响应体丢失（无 runId 可归属）
+      // 时，等「无任何活跃任务」即解锁——2s 快轮询保证任务结束后最多 2s 恢复，不再等 11min 兜底。
+      if (refreshedOnceRef.current && !active) {
+        setBusy(false)
+      }
+      return
+    }
     if (runs.some((r) => r.id === busyRunIdRef.current)) {
       busyRunIdRef.current = null
       setBusy(false)
     }
-  }, [busy, runs])
+  }, [busy, runs, active])
 
   const handleTriggered = useCallback((runId) => {
     if (typeof runId === 'number') busyRunIdRef.current = runId

@@ -330,3 +330,11 @@ Sourcery 全新评审 38 条（去重）逐条落地：
 ## v3.292
 
 - Codacy/Opengrep node-ssrf（Critical）根因定位：该规则不追数据流——fetch 第一参数是任何变量（哪怕经辅助函数传入的纯字面量）即判 SSRF。通过 Codacy API（用户提供 token）拿到 issue 详情（L60、lineText、pattern id）后重构：fetchWithTimeout 拆为 timedRequest（超时/中止参数构造器），fetch 调用内联到四个端点函数、第一参数全部为字符串字面量。行为不变。
+
+## v3.293
+
+Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
+
+- 服务端：CSP 加 frame-ancestors 'none'（防恶意同站页嵌框架借会话触发推送）；token 禁 `%`（raw URL 打开时 URLSearchParams 会解码改写）；/api/status 读锁内容判 released 帧（修复「任务已结束按钮仍锁到超时」）；boot token 改用本次请求验证过的凭证（垃圾 ?token= 不再覆盖有效会话）；重放窗受理顺序重排——实时读盘合并 → 记 pending 帧 → 同步落盘（失败即 fail-closed 拒绝受理）→ spawn → 补写真实 runId，多进程 stale map 与「spawn 后崩溃丢记录」两个重放窗口同时关闭。
+- 前端：fetch 超时 done() 移到 body 消费完成之后（挂起 body 不再绕过 AbortController）；trigger 响应体丢失时「首次刷新后无活跃任务即解锁」（不再干等 11 分钟兜底）。
+- 文档：README token 约束（16–200、禁 & # + %）与 Cookie 1 天有效期同步实际行为。
