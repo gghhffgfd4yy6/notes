@@ -294,3 +294,12 @@
   - 部件三态：missing=中性、invalid/tooLarge=红、ok+健康=绿——缺数据不再标红、坏数据不再伪装「暂无记录」；
   - validChannelEntry 与服务端 status.js 同口径（三计数字段非负安全整数，含 lastAlertAt），畸形条目不进展示与健康判定。
 - 版本 bump 至 3.286.0（四处同步）。
+
+## v3.287
+
+- Sourcery 四轮 4 条（1 Critical + 3 High）真修：
+  - Critical（畸形 Cookie 崩请求）：sessionCookieValue 的 decodeURIComponent 包 try/catch，畸形序列（如 %）按「无有效 Cookie」处理，绝不抛 URIError 出 HTTP 处理器；
+  - High（CSRF 伪造触发）：authorize 的 Cookie 通道收窄到 GET（页面+资产）；POST /trigger 不接受 Cookie，写动作必须显式凭证（Bearer 头或 ?token=）；
+  - High（重放窗单槽覆盖）：lastAccept 由单值改 per-action Map——换动作不再覆盖他动作的重放记录，「run→check→重试 run」仍被拦；
+  - High（资产 URL 带凭证）：renderPage 去掉 tokenSuffix——资产鉴权已由会话 Cookie 覆盖，URL 不再重复 token。
+- 版本 bump 至 3.287.0（四处同步）。

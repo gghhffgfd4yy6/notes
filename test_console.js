@@ -278,6 +278,9 @@ async function main () {
     // 页面响应必须下发会话 Cookie（HttpOnly/SameSite=Strict）
     const page = await request(port, 'GET', '/', { token: TOKEN })
     assert.ok((page.headers['set-cookie'] || []).some(c => c.startsWith('xbk_session=')), '/ 鉴权后下发会话 Cookie')
+    // Sourcery G_4Kk：资产 URL 不再拼 tokenSuffix（Cookie 通道已覆盖，URL 零凭证重复）
+    assert.ok(!page.text.includes('/assets/app.css?token='), '资产 URL 不含 ?token=')
+    assert.ok(!page.text.includes('/assets/app.js?token='), '脚本 URL 不含 ?token=')
     const js = await request(port, 'GET', '/assets/app.js', { token: TOKEN })
     assert.strictEqual(js.status, 200)
     assert.match(js.headers['content-type'], /text\/javascript/)
@@ -358,9 +361,19 @@ async function main () {
     const replayBody = JSON.parse(replay.text)
     assert.strictEqual(replayBody.runId, firstBody.id, '409 响应指向首轮 run')
     assert.strictEqual(replayBody.replayBlocked, true, '标记为重放拦截（非锁冲突）')
-    // 跨动作不受重放窗影响：run 在 check 的窗口期内仍可触发（合法操作）。
+    // 跨动作首次触发放行（per-action 各自记窗，G_4Kf：换动作不覆盖他动作记录）。
     const crossAction = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
-    assert.strictEqual(crossAction.status, 202, '跨动作不受重放窗拦截')
+    assert.strictEqual(crossAction.status, 202, '跨动作首次触发不受重放窗拦截')
+    // G_4Kf：check 的重放记录不被 dry-run 覆盖——再次重试 check 仍被拦且仍指向首轮。
+    const replay2 = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+    assert.strictEqual(replay2.status, 409, '跨动作后同 action 重试仍被拦')
+    assert.strictEqual(JSON.parse(replay2.text).runId, firstBody.id, '重放记录未被换动作覆盖')
+    // Sourcery G_4Ki：畸形 Cookie（非法 % 序列）不得炸请求处理器——按无 Cookie 处理。
+    const badCookie = await request(port, 'GET', '/', { headers: { cookie: 'xbk_session=%zz' } })
+    assert.strictEqual(badCookie.status, 401, '畸形 Cookie → 401（不抛 URIError）')
+    // Sourcery G_4Kb：POST 不接受 Cookie 凭证（写动作须显式 Bearer/?token=）。
+    const csrf = await request(port, 'POST', '/trigger', { headers: { cookie: `xbk_session=${TOKEN}` }, body: 'action=check' })
+    assert.strictEqual(csrf.status, 401, 'POST 仅凭 Cookie 必须 401（CSRF 面）')
     server.close()
   })
   await aok('HTTP: /api/runs 列表与 /api/runs/:id 详情', async () => {

@@ -304,9 +304,8 @@ function renderPage (state, runsList, query) {
   // 查询参数进入页面后由 JSON 岛交给前端 fetch。仅在本请求本身通过鉴权后才回显
   // （token 已验证合法，原样传递；不新增任何存储）。
   // 兼容语义：<noscript> 环境保留纯 HTML 降级（状态文本 + 提示），核心信息不丢。
-  const tokenSuffix = (query instanceof URLSearchParams && query.get('token'))
-    ? `?token=${encodeURIComponent(query.get('token'))}`
-    : ''
+  // Sourcery G_4Kk：资产 URL 不再拼 tokenSuffix——资产鉴权已由会话 Cookie 覆盖
+  // （页面响应下发 xbk_session，同源请求自动携带），URL 里重复凭证只会多日志暴露面。
   const token = (query instanceof URLSearchParams && query.get('token')) ? query.get('token') : ''
   // JSON 岛（<script type="application/json"> 的文本内容）：script 文本不做 HTML 实体解码，
   // escapeHtml 的 &quot; 会原样留在 JSON 里被前端 parse 成错误 token（Sourcery vwK）。
@@ -321,8 +320,8 @@ function renderPage (state, runsList, query) {
 <html lang="zh-CN"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:">
-<link rel="stylesheet" href="/assets/app.css${escapeHtml(tokenSuffix)}">
-<link rel="modulepreload" href="/assets/htm-preact.module.js${escapeHtml(tokenSuffix)}">
+<link rel="stylesheet" href="/assets/app.css">
+<link rel="modulepreload" href="/assets/htm-preact.module.js">
 </head><body>
 <div id="app"><noscript>
 <section style="max-width:60rem;margin:2rem auto;font-family:system-ui,sans-serif">
@@ -332,7 +331,7 @@ function renderPage (state, runsList, query) {
 </section>
 </noscript></div>
 <script type="application/json" id="xbk-boot">${bootJson}</script>
-<script type="module" src="/assets/app.js${escapeHtml(tokenSuffix)}"></script>
+<script type="module" src="/assets/app.js"></script>
 </body></html>`
 }
 
@@ -349,6 +348,8 @@ const BEARER_PREFIX = 'Bearer '
 const SESSION_COOKIE = 'xbk_session'
 // 从 Cookie 头取会话值：手写解析（分号分段 + 首个 = 切分），不用正则
 // （CodeQL js/polynomial-redos：cookie 值虽是自产 token，解析仍保持线性）。
+// Sourcery Critical G_4Ki：decodeURIComponent 对畸形序列（如 %）会抛 URIError——
+// 任何畸形 Cookie 都不能炸请求处理器：解析异常一律按「无有效 Cookie」处理。
 function sessionCookieValue (cookieHeader) {
   if (typeof cookieHeader !== 'string' || cookieHeader.length === 0) return null
   for (const part of cookieHeader.split(';')) {
@@ -357,7 +358,8 @@ function sessionCookieValue (cookieHeader) {
     const name = part.slice(0, eq).trim()
     if (name === SESSION_COOKIE) {
       const value = part.slice(eq + 1).trim()
-      return value.length > 0 ? decodeURIComponent(value) : null
+      if (value.length === 0) return null
+      try { return decodeURIComponent(value) } catch (e) { return null }
     }
   }
   return null
@@ -371,9 +373,14 @@ function authorize (req, token, urlQuery) {
   // 浏览器路径：?token=xxx（urlQuery 由调用方传 URLSearchParams；单独接收以便测试）
   const supplied = urlQuery instanceof URLSearchParams ? urlQuery.get('token') : null
   if (typeof supplied === 'string' && supplied.length > 0 && timingSafeEqualStr(supplied, token)) return true
-  // 会话 Cookie 路径（Sourcery G_oJ）：同源 ESM import / 静态资产请求自动携带
-  const cookie = sessionCookieValue(req.headers && req.headers.cookie)
-  if (cookie !== null && timingSafeEqualStr(cookie, token)) return true
+  // 会话 Cookie 路径（Sourcery G_oJ）：仅用于「读取面」——GET 页面与静态资产。
+  // 写动作（POST /trigger）不接受 Cookie：SameSite=Strict 挡不住同站子域/同源注入页
+  // 的表单伪造（Sourcery High G_4Kb Forged push actions），POST 保持显式凭证
+  // （Bearer 头或 ?token=，两者都要求请求方真实持有 token）。
+  if (req.method !== 'POST') {
+    const cookie = sessionCookieValue(req.headers && req.headers.cookie)
+    if (cookie !== null && timingSafeEqualStr(cookie, token)) return true
+  }
   return false
 }
 
@@ -424,11 +431,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 置位后 /trigger 一律 503，不认动作。由 main 的 shutdown 回调置位。
   let shuttingDown = false
   const setShuttingDown = () => { shuttingDown = true }
-  // 幂等重放窗（Sourcery G_nm）：同 action 在窗口内的重复 POST 不再启动新子进程。
-  // 取 12 分钟 = PROC_TIMEOUT_MS(10min) + 往返余量——覆盖「响应丢失后用户重试时
-  // 首轮已结束但窗口仍在」的场景。跨动作不拦（想跑 check 后立刻跑 run 是合法操作）。
+  // 幂等重放窗（Sourcery G_nm + G_4Kf）：受理时按 action 记录首轮
+  // lastAccept[action] = { at, runId }。per-action 存储：换动作不会覆盖前一个动作的
+  // 重放记录（「先 run 后重试 check 再重试 run」仍被拦）；进程内存语义 = 重启清空，
+  // 重启后窗口失效是已知边界（锁与 runs 历史同样在内存，重启后本就没有「上一轮」）。
+  // 窗口 > PROC_TIMEOUT_MS（子进程最长生命周期）：首轮结束后锁已释放，但重放
+  // 窗仍拦截——这正是修复点。超窗不受影响，人工重跑语义保留。
   const REPLAY_WINDOW_MS = PROC_TIMEOUT_MS + 2 * 60 * 1000
-  let lastAccept = null
+  const lastAccept = new Map()
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost')
@@ -486,14 +496,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             return
           }
           const now = Date.now()
-          // 幂等重放窗（Sourcery G_nm：提交 202 后响应丢失 → 用户重试 → 首轮已结束释放
-          // 锁 → 重试被当作新触发再跑一轮真实推送）。解法：受理时登记
-          // lastAccept = { action, at }；同 action 在 REPLAY_WINDOW_MS 内的重复提交
-          // 返回 409 + 首轮 run id（前端把它当「已在跑」呈现，不再发起新一轮）。
-          // 窗口 > PROC_TIMEOUT_MS（子进程最长生命周期）：首轮结束后锁已释放，但重放
-          // 窗仍拦截——这正是修复点。跨动作/超窗不受影响，人工重跑语义保留。
-          const prev = lastAccept
-          if (prev && prev.action === action && now - prev.at < REPLAY_WINDOW_MS) {
+          // 幂等重放窗（Sourcery G_nm + G_4Kf）：提交 202 后响应丢失 → 用户重试 →
+          // 首轮已结束释放锁 → 重试被当作新触发再跑一轮真实推送。per-action 记录：
+          // 同 action 在窗口内的重复提交返回 409 + 首轮 run id（前端把它当「已在跑」
+          // 呈现，不再发起新一轮）；换动作不覆盖他动作的记录。
+          const prev = lastAccept.get(action)
+          if (prev && now - prev.at < REPLAY_WINDOW_MS) {
             sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: prev.runId, replayBlocked: true })
             return
           }
@@ -505,7 +513,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           record._stateDir = stateDir
           record._lockAt = now
           record._lockToken = ownerToken
-          lastAccept = { action, at: now, runId: record.id }
+          lastAccept.set(action, { at: now, runId: record.id })
           sendJson(res, 202, { id: record.id, action, label: record.label })
         })
         .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
