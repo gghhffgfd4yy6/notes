@@ -425,6 +425,18 @@ async function main () {
     }
     assert.ok(detail && detail.finishedAt, '子进程应在 30s 内结束')
     assert.ok(typeof detail.output === 'string' && detail.output.length > 0, 'output 必须捕获到子进程实际输出')
+    // POST /api/runs/detail（前端 fetch 字面量 URL 形态）：与 GET 等价。
+    const postDetail = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: `id=${id}` })
+    assert.strictEqual(postDetail.status, 200, 'POST detail 200')
+    const postBody = JSON.parse(postDetail.text)
+    assert.strictEqual(postBody.id, id, 'POST detail 返回同一条 run')
+    assert.ok(typeof postBody.output === 'string' && postBody.output.length > 0, 'POST detail output 非空')
+    const postMissing = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: 'id=99999' })
+    assert.strictEqual(postMissing.status, 404, 'POST detail 未命中 404')
+    const postBad = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: 'id=abc' })
+    assert.strictEqual(postBad.status, 400, 'POST detail 非数字 id 400')
+    const postNoAuth = await request(port, 'POST', '/api/runs/detail', { body: `id=${id}` })
+    assert.strictEqual(postNoAuth.status, 401, 'POST detail 无凭证 401（鉴权与 GET 一致）')
     const missing = await request(port, 'GET', '/api/runs/99999', { token: TOKEN })
     assert.strictEqual(missing.status, 404)
     server.close()

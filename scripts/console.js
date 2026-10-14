@@ -596,6 +596,33 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sendJson(res, 200, { runs: list })
       return
     }
+    // POST /api/runs/detail：详情查询的 POST 形态（body: id=...）。与 GET /api/runs/:id
+    // 等价（同响应体）；提供 POST 形态是因为前端 fetch 的 URL 必须是字面量（Codacy SSRF
+    // 规则不接受任何含变量的 URL 第一参数，GET /:id 形态无法满足），id 改走请求体。
+    // 只读、无副作用，鉴权与 GET 完全一致（Cookie 会话对 POST 无效——G_4Kb 收紧口径不变，
+    // 会话用户由 boot JSON 提供显式 Bearer 凭证）。
+    if (req.method === 'POST' && url.pathname === '/api/runs/detail') {
+      readBody(req)
+        .then(({ body, aborted, over }) => {
+          if (aborted || over) { sendJson(res, 400, { error: '请求中断或超限' }); return }
+          const m = /(?:^|&)id=(\d+)/.exec(body)
+          if (!m) { sendJson(res, 400, { error: '缺少数字 id' }); return }
+          const record = runs.get(Number(m[1]))
+          if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
+          sendJson(res, 200, {
+            id: record.id,
+            action: record.action,
+            label: record.label,
+            startedAt: record.startedAt,
+            finishedAt: record.finishedAt,
+            exitCode: record.exitCode,
+            timedOut: record.timedOut,
+            output: record.output
+          })
+        })
+        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+      return
+    }
     const runMatch = /^\/api\/runs\/(\d+)$/.exec(url.pathname)
     if (req.method === 'GET' && runMatch) {
       const record = runs.get(Number(runMatch[1]))

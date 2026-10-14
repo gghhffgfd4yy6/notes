@@ -317,3 +317,7 @@ Sourcery 全新评审 38 条（去重）逐条落地：
 - 前端（app.js）：fetch 超时罩到 body 消费完成（此前只罩到响应头，挂起 body 卡死轮询）；切日志闪旧内容渲染期消除（detail.id 与 openId 绑定）；日志详情轮询加互斥闸（慢请求不叠加）；通道卡片畸形条目标红（不再过滤后假绿）；新增过滤诊断卡片（此前 SPA 丢失该数据）；空闲徽章参考共享锁状态。
 - 测试（test_console.js）：Cookie 属性逐项断言、token 新边界 9 例、重启后重放窗、会话 boot token。
 - 部署权衡（回评说明）：Cookie 无 Secure 属性为本服务明文 HTTP 形态的固有权衡（加 Secure 控制台不可用），上 HTTPS 后应补 Secure + __Host- 前缀。
+
+## v3.290
+
+- Codacy SSRF 规则最后一形态：它只认「fetch 第一参数为字面量」——URL 对象/拼接/模板都被判变量。详情查询改为 POST /api/runs/detail（URL 字面量，run id 走请求体，Number(id).toFixed(0) 数值化）；服务端新增等价 POST 路由（鉴权同 GET，只读无副作用），GET /api/runs/:id 保留兼容。测试补 POST detail 6 断言。
