@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.287 — 网页控制台：重放窗 per-action + CSRF 收紧 + 畸形 Cookie 防崩 + 资产 URL 去凭证 *********
+//* ******* 线报酷推送脚本 v3.288 — 网页控制台：前端 fetch URL 白名单化（Codacy SSRF 启发式消除） *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

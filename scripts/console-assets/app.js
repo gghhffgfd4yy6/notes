@@ -46,14 +46,30 @@ function fmtNum (n) {
 // 但浏览器扩展/中间代理可能记 URL——凭证不进 URL 是更安全的默认）。
 // fetch 期限（Sourcery G_n6）：8s 超时 AbortController 取消——挂起请求走 reject，
 // 刷新链路不阻塞，历史与状态在下一轮照常更新。
+// Codacy Critical（SSRF 启发式：fetch 收到「用户可控 URL」）：全部请求 URL 改为
+// API_PATHS 常量白名单查表——fetch 只接受表内字面量；动态段（run id）经
+// encodeURIComponent 插值仍落在固定前缀常量上，taint 链在查表处断裂。
+// fetchWithTimeout 仅由本模块的 apiGet/trigger 调用（模块内私有），不外泄。
+const API_PATHS = Object.freeze({
+  status: '/api/status',
+  runs: '/api/runs',
+  runDetail: '/api/runs/',
+  trigger: '/trigger'
+})
+
 function fetchWithTimeout (url, opts) {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS)
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t))
 }
 
-async function apiGet (path) {
-  const res = await fetchWithTimeout(path, {
+async function apiGet (pathName, pathArg) {
+  // 白名单查表：非表内名称直接拒绝；runDetail 拼接段强制 encodeURIComponent
+  // （run id 来自服务端 JSON 的数字 id，防患于未然）。
+  const base = API_PATHS[pathName]
+  if (typeof base !== 'string') throw new Error(`未知 API 端点：${String(pathName)}`)
+  const url = pathArg === undefined ? base : base + encodeURIComponent(pathArg)
+  const res = await fetchWithTimeout(url, {
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -62,7 +78,7 @@ async function apiGet (path) {
 
 async function trigger (action) {
   const body = new URLSearchParams({ action })
-  const res = await fetchWithTimeout('/trigger', {
+  const res = await fetchWithTimeout(API_PATHS.trigger, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -279,7 +295,7 @@ function RunsPanel ({ runs, pollMs }) {
     const fetchOnce = async () => {
       const seq = ++detailSeqRef.current
       try {
-        const d = await apiGet(`/api/runs/${openId}`)
+        const d = await apiGet('runDetail', openId)
         if (dead || seq !== detailSeqRef.current) return
         setDetail(d)
         setDetailErr('')
@@ -378,8 +394,8 @@ function App () {
     const applyRuns = (r) => { if (seq === seqRef.current) { setRuns(r.runs || []); setLastSync(Date.now()) } }
     try {
       const [sRes, rRes] = await Promise.allSettled([
-        apiGet('/api/status'),
-        apiGet('/api/runs')
+        apiGet('status'),
+        apiGet('runs')
       ])
       if (sRes.status === 'fulfilled') applyStatus(sRes.value)
       else errs.push(`状态 ${sRes.reason && sRes.reason.message ? sRes.reason.message : sRes.reason}`)

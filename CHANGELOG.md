@@ -303,3 +303,8 @@
   - High（重放窗单槽覆盖）：lastAccept 由单值改 per-action Map——换动作不再覆盖他动作的重放记录，「run→check→重试 run」仍被拦；
   - High（资产 URL 带凭证）：renderPage 去掉 tokenSuffix——资产鉴权已由会话 Cookie 覆盖，URL 不再重复 token。
 - 版本 bump 至 3.287.0（四处同步）。
+
+## v3.288
+
+- Codacy Critical（前端 SSRF 启发式误报消除）：app.js 的 fetch 此前直接收调用方模板串（/api/runs/${id}），被 Codacy 数据流分析判为「用户可控 URL 进 HTTP 客户端库」。改为 API_PATHS 常量白名单查表：apiGet(name, arg) 只接受表内端点名，动态段（run id）经 encodeURIComponent 拼在固定前缀后——fetch 的 URL 数据流从查表处取值，taint 链断裂。行为不变（同源四端点）。
+- 版本 bump 至 3.288.0（四处同步）。
