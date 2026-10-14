@@ -440,10 +440,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
+    const fp = path.join(ASSETS_DIR, spec.file)
     try {
-      fs.accessSync(path.join(ASSETS_DIR, spec.file))
+      if (!fs.statSync(fp).isFile()) throw new Error('not a regular file')
+      fs.accessSync(fp, fs.constants.R_OK)
     } catch (e) {
-      throw new Error(`控制台前端资产缺失：${route} → ${spec.file}（仓库不完整？），拒绝启动（fail-closed）`)
+      throw new Error(`控制台前端资产缺失或不可读：${route} → ${spec.file}（仓库不完整？），拒绝启动（fail-closed）`)
     }
   }
   if (!isValidToken(token)) {

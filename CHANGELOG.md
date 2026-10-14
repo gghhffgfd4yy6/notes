@@ -343,3 +343,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 
 - CodeQL js/file-system-race（High）：/api/status 的锁状态检查先 statSync 再 readFileSync，两次调用间锁可能被释放/接管（TOCTOU）。改为单次 readFileSync，持有状态与时间全部取自同一锁帧内容（startedAt）。
 - Sourcery 触达 5 次自动重审上限（skipped 状态，不阻塞）：此前六轮评审的 68 条意见已全部真修或回评说明，无遗留。
+
+## v3.295
+
+### 修复（Sourcery 第七轮 7 条未解决对话收尾）
+- 资产启动闸升级：`statSync().isFile()` + `accessSync(R_OK)`，目录/不可读文件 fail-closed 拒启（console.js）。
+- 频道空名条目对齐后端口径：前端不再判畸形，展示用「(空名)」占位（app.js）；后端 validChannels 语义保持 SS-02 逐条容错不变。
+- 前端 11 分钟兜底清 busy 时同步清 `busyRunIdRef`，旧归属不再提前解锁新提交（app.js）。
+- 2 条 outdated 线程（旧 diff 引用）+ 2 条 vendor XSS 误报回评豁免后 resolve；未解决对话回到 0。

@@ -237,7 +237,9 @@ function validCounter (v) {
   return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
 }
 function validChannelEntry (name, entry) {
-  return typeof name === 'string' && name.length > 0 &&
+  // 空 key 不判畸形（与后端 status.js validChannels 同口径：后端只验 entry 结构，
+  // 不验 key 名）——否则同一份 channel-health 后端判 ok、前端标红，两处结论相反。
+  return typeof name === 'string' &&
     entry !== null && typeof entry === 'object' && !Array.isArray(entry) &&
     validCounter(entry.consecutiveFailures) &&
     validCounter(entry.lastFailureAt) &&
@@ -259,7 +261,7 @@ function channelInfo (state) {
   const allKeys = Object.keys(raw)
   const entries = allKeys
     .filter((k) => validChannelEntry(k, raw[k]))
-    .map((k) => ({ name: k, failures: raw[k].consecutiveFailures }))
+    .map((k) => ({ name: k.length > 0 ? k : '(空名)', failures: raw[k].consecutiveFailures }))
   // Sourcery Corrupt-channels x2：合法条目全健康但存在畸形条目时，此前 filter 掉畸形后
   // 整卡仍显示绿色「正常」——数据损坏被吞。只要 valid 条目数 < 总键数即标红，
   // 提示「部分通道数据异常」，畸形条目名一并列出。
@@ -573,9 +575,15 @@ function App () {
   }, [refreshSplit, locking])
 
   // vwU/vv2：busy 提交成功后启动兜底闹钟；active 确认或超时即清。
+  // Sourcery Old-run-unlocks-new-trigger：兜底清 busy 时必须同步清 busyRunIdRef——
+  // 只清 busy 留 ref，旧 runId 若随后进历史，会在「下一次提交 setBusy(true) 后、
+  // 其 202 未写 ref 前」被解锁 effect 撞上，把新提交的 busy 提前清掉。
   useEffect(() => {
     if (!busy) return undefined
-    const t = setTimeout(() => setBusy(false), BUSY_FALLBACK_MS)
+    const t = setTimeout(() => {
+      busyRunIdRef.current = null
+      setBusy(false)
+    }, BUSY_FALLBACK_MS)
     return () => clearTimeout(t)
   }, [busy])
 
