@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.291 — 网页控制台：前端 fetch URL 白名单化（Codacy SSRF 启发式消除） *********
+//* ******* 线报酷推送脚本 v3.292 — 网页控制台：前端 fetch URL 白名单化（Codacy SSRF 启发式消除） *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

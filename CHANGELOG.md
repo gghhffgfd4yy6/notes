@@ -326,3 +326,7 @@ Sourcery 全新评审 38 条（去重）逐条落地：
 
 - Sourcery Overlapping-log-polls / Slow-log-requests：fetchOnce 详情轮询补 inflight 互斥闸（v3.289 改动因脚本锚点失配未落盘，本次补上）——慢详情请求不再逐 tick 叠加并发。
 - Sourcery Old-run-unlocks-new-trigger：重放拦截分支不再把 prevRunId 登记为 busy 归属（onTriggered(null)）——旧轮已在历史时，新提交的 202 未返回前解锁 effect 会提前清掉 busy（按钮提前解锁竞态）。
+
+## v3.292
+
+- Codacy/Opengrep node-ssrf（Critical）根因定位：该规则不追数据流——fetch 第一参数是任何变量（哪怕经辅助函数传入的纯字面量）即判 SSRF。通过 Codacy API（用户提供 token）拿到 issue 详情（L60、lineText、pattern id）后重构：fetchWithTimeout 拆为 timedRequest（超时/中止参数构造器），fetch 调用内联到四个端点函数、第一参数全部为字符串字面量。行为不变。

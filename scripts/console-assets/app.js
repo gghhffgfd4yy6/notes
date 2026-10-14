@@ -53,13 +53,16 @@ function fmtNum (n) {
 // 「头到了、body 挂起」的响应绕过超时——轮询消费 res.json() 时永久等待，刷新链路卡死。
 // 修复：期限定时器不在 fetch resolve 时清掉，而是移交给 body 消费方（readBodyJson），
 // 整个「头+体」共享同一个 8s 期限；消费完成后才真正 clearTimeout。
-function fetchWithTimeout (url, opts) {
+// Codacy/Opengrep node-ssrf（Codacy Critical）：该规则将「fetch 第一参数为任何变量」
+// 判为 SSRF（不追数据流来源，即使字面量经辅助函数传入也算）。因此 fetch 调用必须
+// 内联到各端点函数、第一参数为字面量；超时/中止参数由 timedRequest() 统一构造。
+// Sourcery Stalled-bodies x3：期限定时器不在 fetch resolve 时清掉，而是移交给
+// body 消费方（readBodyJson），整个「头+体」共享同一个 8s 期限。
+function timedRequest (opts) {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS)
-  const done = () => clearTimeout(t)
-  const p = fetch(url, { ...opts, signal: ctrl.signal })
-  p.then(done, () => {}) // fetch reject（网络错/中止）时也清；body 阶段的清理由 readBodyJson 负责
-  return p
+  const merged = { ...opts, signal: ctrl.signal }
+  return { merged, done: () => clearTimeout(t) }
 }
 
 // 与 fetchWithTimeout 配套：res.json() 的读取也受同一期限约束（由 fetch 的 AbortController
@@ -79,17 +82,23 @@ async function readBodyJson (res) {
 }
 
 async function apiGetStatus () {
-  const res = await fetchWithTimeout('/api/status', {
+  const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
+  const p = fetch('/api/status', merged)
+  p.then(done, () => {})
+  const res = await p
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   return readBodyJson(res)
 }
 
 async function apiGetRuns () {
-  const res = await fetchWithTimeout('/api/runs', {
+  const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
+  const p = fetch('/api/runs', merged)
+  p.then(done, () => {})
+  const res = await p
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   return readBodyJson(res)
 }
@@ -100,7 +109,7 @@ async function apiGetRunDetail (id) {
   // GET /api/runs/:id 服务端仍保留（API 兼容），前端不再拼变量 URL——
   // Codacy SSRF 规则不接受任何含变量的 fetch 第一参数，字面量 + body 是唯一全绿形态。
   const body = new URLSearchParams({ id: Number(id).toFixed(0) })
-  const res = await fetchWithTimeout('/api/runs/detail', {
+  const { merged, done } = timedRequest({
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -109,13 +118,16 @@ async function apiGetRunDetail (id) {
     },
     body
   })
+  const p = fetch('/api/runs/detail', merged)
+  p.then(done, () => {})
+  const res = await p
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   return readBodyJson(res)
 }
 
 async function trigger (action) {
   const body = new URLSearchParams({ action })
-  const res = await fetchWithTimeout('/trigger', {
+  const { merged, done } = timedRequest({
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -123,6 +135,9 @@ async function trigger (action) {
     },
     body
   })
+  const p = fetch('/trigger', merged)
+  p.then(done, () => {})
+  const res = await p
   const data = await readBodyJson(res).catch(() => ({}))
   if (!res.ok) {
     // 服务端幂等重放窗（与 console.js REPLAY_WINDOW_MS 配套）：同动作重试被拦时
