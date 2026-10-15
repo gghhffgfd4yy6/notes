@@ -376,6 +376,14 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 搜索用 `includes` 子串匹配不用正则（用户输入进正则有 ReDoS 面，本仓正则防护红线）；查询词 240 字节封顶。
 - 测试 +4：消息三态/分页钳制/过滤/倒序、trends 按日聚合与窗口外剔除、logs 尾读、sys 无凭证 401 与无环境变量泄漏。
 
+## v3.299
+
+- **控制台「停止」按钮（运行控制批次②）**：新增 `POST /api/runs/cancel`（body `id=...`，与 `/api/runs/detail` 同形态——前端 fetch 第一参数必须是字面量 URL）——停止运行中的触发任务。安全设计：kill 只经 `record._child` **对象引用**（内核句柄绑定 spawn 时进程，免疫 pid 复用；**锁帧 pid 是控制台自身，绝不作为 kill 目标**）；信号纪律 SIGTERM → 3s 宽限 → SIGKILL 兜底（宽限定时器 unref；**不依赖 kill 返回值**——Node 不保证其反映进程状态，已死进程上再签 SIGKILL 是无害 no-op，漏签才会让卡死任务挂到 `PROC_TIMEOUT_MS`）；幂等（已完成 409 / 已取消 200 幂等返回，不发第二次信号）；**锁零操作**（不 unlink/不覆写——释放唯一入口仍是子进程 `close` → `releaseLockFor`）；不碰 `lastAccept`（取消后同动作 ≈12min 重放冷却保留，阻断「取消→误重推已送达未记录条目」）。`/api/runs`、`/api/runs/:id`、`/api/runs/detail` 附带 `cancelled` 字段（additive）。前端运行列表对未完成任务显示红色「停止」按钮，徽章「停止中」/「已停止」。
+- **已知取舍（kill 语义，README 披露）**：kill 落在推送中途时，已送达但未写缓存的条目下轮会重推（`saveBatch` 在推送完成后才执行）——与既有 `PROC_TIMEOUT_MS` 超时杀进程路径完全同构的已登记取舍。
+- **逐轮运行历史（概览页新面板）**：新增 `GET /api/run-history?limit=&before=`——**零新文件零写盘**：直接解析 run.log 摘要行（run.log 是仓内既定的持久逐轮记录，CHANGELOG v3.289 口径；「触发历史 20 条内存」之外的持久维度）。`scripts/status.js` 新增 `readRunHistory` 纯读函数（镜像 `readTrends` 纪律：`readSafeTextResult` 尾读 1MiB、行首锚定、逐行容错、上海时间戳）+ `RUN_SUMMARY_EXTRAS_RE` 捕获 `cachesaved=/noidentity=/dry-run未推送=` 可选尾组（**写入侧零改动**）。时间倒序逐轮下发 `{at,total,dedup,filtered,truncated,pushed,failed,elapsed,cachesaved,noidentity,dryRun,interrupted}`；`limit` 钳制 `[1,200]` 缺省 50、`before` 游标分页（`hasMore`）；崩溃轮（摘要行后 ERROR/运行异常，或文件尾强失败行无摘要）如实标 `interrupted`，崩溃轮占位条目计数为 null 不编数；文件超 1MiB 标 `truncated`（更早轮次已物理轮转丢失）。三态透传（missing/invalid/unsafe）。前端「逐轮运行历史」面板：进页加载 + 手动刷新 + 「加载更早轮次」游标分页，不进 5s 主轮询。
+- 测试 +7（test_console.js，60 用例）：cancel 防线（401/Cookie 401/400/404/409）、真子进程取消（202 + SIGTERM + close 释放锁 + cancelled 徽章 + 幂等）、信号纪律（fake child：SIGTERM → 重复 cancel 不发第二次信号 → 3.4s 后 SIGKILL 兜底）、run-history HTTP（鉴权/倒序/尾组捕获/limit 钳制/before 游标/非法参数回默认）、readRunHistory（missing 透传/崩溃轮占位 null 计数）；`request` 助手与 fake child 全部复用既有基建，无新套件。
+- 已知边界：run.log 超 1MiB 后更早轮次已物理轮转丢失（任何读取方案都补不回）；触发历史（/api/runs，内存 20 条）与逐轮历史（/api/run-history，run.log 持久）是两个维度，前端并列展示。
+
 ## v3.298
 
 - **控制台新增「配置」标签页（脱敏配置视图）**：新增只读端点 `GET /api/config`——运行配置（域名/推送接口/超时重试/推送模式与并发/单轮上限/缓存上限/告警与诊断开关/推送模板/过滤规则/关键词）原值下发；推送渠道只显示「已配置/未配置」布尔与渠道名（经 `xbk_sendNotify_slim` 已导出的 `configuredChannelCount`/`configuredChannelNames`/`hasWxPusherConfigured` 判定，**密钥值永不进入响应对象**，值全程不离开 sendNotify 模块作用域）。白名单**显式逐字段**构造（禁止 `Object.keys`/`JSON.stringify(Config)` 泛型拷贝——未来新增密钥字段不会自动泄漏）；响应前再过一道密钥键名形态保险丝，命中即降级为不含 runtime 的骨架（fail-closed）。环境变量只报「是否设置」布尔。前端新「配置」标签页逐项表格展示。

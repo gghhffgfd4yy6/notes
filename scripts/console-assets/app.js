@@ -145,6 +145,37 @@ async function apiGetRunDetail (id) {
   return consumeJson(p, done)
 }
 
+// 取消运行中的触发任务（v3.299 批次②）：POST 字面量 URL + id 走请求体
+// （Codacy SSRF 全绿形态，与 /api/runs/detail 同款）。202 = 已受理（异步终止中），
+// 200 = 幂等命中（已取消过），409 = 已结束无需停止。
+function apiCancelRun (id) {
+  const body = new URLSearchParams({ id: Number(id).toFixed(0) })
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+      Authorization: `Bearer ${BOOT.token}`
+    },
+    body
+  })
+  const p = fetch('/api/runs/cancel', merged)
+  return consumeJson(p, done)
+}
+
+// 逐轮运行历史（v3.299 批次②）：run.log 摘要行解析（服务端），分页游标 before=已看轮数。
+function apiGetRunHistory ({ limit, before } = {}) {
+  const params = new URLSearchParams()
+  if (Number.isSafeInteger(limit) && limit > 0) params.set('limit', String(limit))
+  if (Number.isSafeInteger(before) && before > 0) params.set('before', String(before))
+  const qs = params.toString()
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  const p = fetch(qs.length > 0 ? `/api/run-history?${qs}` : '/api/run-history', merged)
+  return consumeJson(p, done)
+}
+
 // ── v3.297 扩展 API：推送记录 / 趋势 / 日志 / 系统 ────────────────────────────
 // 与上方端点同纪律：fetch 第一参数是纯字面量（查询参数经 URLSearchParams 编码后
 // 只进模板字符串的查询段，authority 恒为字面量——SSRF 启发式全绿形态）。
@@ -470,7 +501,7 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
 }
 
 // ── 组件：运行历史 ──────────────────────────────────────────────────────────
-function RunsPanel ({ runs, pollMs }) {
+function RunsPanel ({ runs, pollMs, onRefresh }) {
   const [openId, setOpenId] = useState(null)
   const [detail, setDetail] = useState(null)
   const [detailErr, setDetailErr] = useState('')
@@ -521,8 +552,11 @@ function RunsPanel ({ runs, pollMs }) {
 
   // statusOf（Sourcery vv4）：以 finishedAt 为完成判据；
   // 「finishedAt 已设但 exitCode null」= 信号终止（含超时 SIGKILL），显示「已终止」。
+  // cancelled 徽章优先于普通结果（v3.299 批次②）：被停止的轮次无论退出码如何都标「已停止」。
   const statusOf = (r) => {
+    if (r.cancelled === true && !r.finishedAt) return html`<${Badge} tone='run'>停止中<//>`
     if (r.finishedAt) {
+      if (r.cancelled === true) return html`<${Badge} tone='bad'>已停止<//>`
       if (r.timedOut) return html`<${Badge} tone='bad'>超时<//>`
       if (r.exitCode === 0) return html`<${Badge} tone='ok'>成功<//>`
       if (r.exitCode === null) return html`<${Badge} tone='bad'>已终止<//>`
@@ -530,6 +564,15 @@ function RunsPanel ({ runs, pollMs }) {
     }
     if (r.exitCode === null) return html`<${Badge} tone='run'>运行中<//>`
     return html`<${Badge} tone='bad'>已终止<//>`
+  }
+  // 停止按钮（v3.299 批次②）：只对未完成的轮次显示；点击后置本地 pending 态并刷新，
+  // 结果徽章由下一轮轮询的 cancelled/finishedAt 驱动。
+  const [cancelPending, setCancelPending] = useState(null)
+  const doCancel = async (id) => {
+    setCancelPending(id)
+    try { await apiCancelRun(id) } catch (e) { /* 徽章由轮询纠正；失败横幅交由同步错误条 */ }
+    setCancelPending(null)
+    onRefresh()
   }
 
   const openRun = openId !== null ? runs.find((r) => r.id === openId) : null
@@ -550,9 +593,13 @@ function RunsPanel ({ runs, pollMs }) {
             <td>${r.label}</td>
             <td class="mono">${fmtTime(r.startedAt)}</td>
             <td>${statusOf(r)}</td>
-            <td><button class="btn btn-ghost" onClick=${() => setOpenId(openId === r.id ? null : r.id)}>
-              ${openId === r.id ? '收起' : '日志'}
-            </button></td>
+            <td>
+              ${!r.finishedAt && html`<button class=${'btn btn-ghost btn-danger' + (cancelPending === r.id ? ' btn-busy' : '')} disabled=${cancelPending === r.id}
+                onClick=${() => { doCancel(r.id) }} title="停止该任务（SIGTERM，3 秒后强杀；已发送但未记录的通知下轮会重推）">停止</button>`}
+              <button class="btn btn-ghost" onClick=${() => setOpenId(openId === r.id ? null : r.id)}>
+                ${openId === r.id ? '收起' : '日志'}
+              </button>
+            </td>
           </tr>`)}
         </tbody>
       </table>`}
@@ -569,6 +616,62 @@ function RunsPanel ({ runs, pollMs }) {
           // 必须显示「（无输出）」而不是永远「加载中…」。
           : (typeof detailForOpen.output === 'string' && detailForOpen.output.length > 0 ? detailForOpen.output : '（无输出）'))
       }</pre>
+    </div>`}`
+}
+
+// ── 组件：逐轮运行历史（v3.299 批次②）────────────────────────────────────────
+// run.log 摘要行解析（服务端 /api/run-history），时间倒序 + before 游标分页。
+// 进概览页拉一次 + 手动加载更多，不进 5s 主轮询（读的是磁盘日志，轮询无意义）。
+function RunHistoryPanel () {
+  const [page, setPage] = useState({ items: [], hasMore: false, truncated: false, status: null })
+  const [err, setErr] = useState('')
+  const [loading, setLoading] = useState(false)
+  const seqRef = useRef(0)
+  const load = useCallback(async (before) => {
+    const seq = ++seqRef.current
+    setLoading(true)
+    try {
+      const d = await apiGetRunHistory({ limit: 50, before })
+      if (seq !== seqRef.current) return
+      setErr('')
+      setPage((prev) => before > 0
+        ? { ...d, items: [...(prev.items || []), ...(d.items || [])] }
+        : d)
+    } catch (e) {
+      if (seq === seqRef.current) setErr(`加载失败：${e.message}`)
+    } finally {
+      if (seq === seqRef.current) setLoading(false)
+    }
+  }, [])
+  useEffect(() => { load(0).catch(() => {}) }, [load])
+  const shown = page.status === 'ok' ? page.items : []
+  return html`<div class="panel">
+    <div class="panel-head">
+      <span class="panel-title">逐轮运行历史</span>
+      <span class="panel-sub">run.log 摘要逐轮${page.truncated ? ' · 日志超 1 MiB，更早轮次已轮转' : ''}</span>
+      <span style="flex:1"></span>
+      <button class="btn btn-ghost" onClick=${() => { load(0) }} disabled=${loading}>刷新</button>
+    </div>
+    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${page.status && page.status !== 'ok' && html`<div class="empty">run.log${page.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${page.status}）`}</div>`}
+    ${shown.length > 0 && html`<table class="runs-table">
+      <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
+      <tbody>
+        ${shown.map((r, i) => html`<tr key=${`${r.at}-${i}`}>
+          <td class="mono">${r.interrupted ? `${r.at || '—'} ⚠️中断` : (r.at || '—')}</td>
+          <td>${r.total === null ? '—' : r.total}</td>
+          <td>${r.dedup === null ? '—' : r.dedup}</td>
+          <td>${r.filtered === null ? '—' : r.filtered}</td>
+          <td>${r.dryRun !== null ? `试跑 ${r.dryRun}` : r.pushed}</td>
+          <td>${r.failed > 0 ? html`<span class="sync-err">${r.failed}</span>` : r.failed}</td>
+          <td class="mono">${r.elapsed || '—'}</td>
+          <td>${r.cachesaved === 0 ? '未落盘' : ''}</td>
+        </tr>`)}
+      </tbody>
+    </table>`}
+    ${page.status === 'ok' && shown.length === 0 && html`<div class="empty">日志尾窗内没有摘要行</div>`}
+    ${page.hasMore && html`<div style="text-align:center;margin-top:8px">
+      <button class="btn btn-ghost" onClick=${() => { load(shown.length) }} disabled=${loading}>${loading ? '加载中…' : '加载更早轮次'}</button>
     </div>`}
   </div>`
 }
@@ -1036,7 +1139,8 @@ function App () {
       <${CacheHealthPanel} />
       <${StatusCards} state=${state} />
       <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
-      <${RunsPanel} runs=${runs} pollMs=${locking ? POLL_BUSY_MS : POLL_MS} />
+      <${RunHistoryPanel} />
+      <${RunsPanel} runs=${runs} pollMs=${locking ? POLL_BUSY_MS : POLL_MS} onRefresh=${refreshSplit} />
     </div>`}
     ${tab === 'messages' && html`<${MessagesPanel} />`}
     ${tab === 'logs' && html`<${LogsPanel} pollMs=${locking ? POLL_BUSY_MS : 0} />`}

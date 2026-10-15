@@ -273,6 +273,90 @@ function readTrends (dir, { now = Date.now(), days = 14 } = {}) {
   return result('ok', { days, byDay: out, truncated, today: shanghaiDayKey(now) })
 }
 
+// ── 逐轮运行历史（v3.299 批次②）：run.log 摘要行 → 时间倒序逐轮条目 ─────────────
+// 与 readTrends 同源同纪律：只读（readText = readSafeTextResult 尾读 1MiB 口径）、
+// 逐行容错、行首锚定正则（无用户输入进正则）。控制台 /api/run-history 消费。
+// 数据完整性边界（有意取舍，README 披露）：崩溃轮无摘要行只能标 interrupted；
+// 超 1MiB 后更早轮次已物理轮转丢失（truncated:true 如实标注）。
+
+// 摘要行附加尾组：cachesaved=(0|1) / noidentity=N / dry-run未推送=N（写入侧 xbk_app.js
+// 按条件输出，读取侧全部可选捕获——纯读扩展，写入侧零改动）。
+const RUN_SUMMARY_EXTRAS_RE = /(?:\scachesaved=(\d))?(?:\snoidentity=(\d+))?(?:\sdry-run未推送=(\d+))?\s*$/
+
+function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
+  const lim = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50
+  const skip = Number.isSafeInteger(before) && before > 0 ? before : 0
+  // [7] 超窗如实标注（readTrends 同款）：文件实际 >1MiB 时更早轮次已被轮转截掉。
+  let truncated = false
+  try {
+    const st = require('node:fs').statSync(path.join(dir, FILES.run))
+    if (st.isFile() && st.size > LOG_MAX_BYTES) truncated = true
+  } catch (e) { /* stat 失败按未截断处理：readText 随后会给出真实状态 */ }
+  const read = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
+  if (read.status !== 'ok') return { status: read.status, items: [], hasMore: false, truncated: false }
+  // 从尾向前扫（时间倒序天然成立）：摘要行 = 事实轮界；轮内「摘要行之后」的行按
+  // looksLikeRoundFailure 判 interrupted（与 parseLastRun 同口径：ERROR/运行异常）。
+  const lines = read.value.split('\n')
+  const items = []
+  let skipped = 0
+  for (let i = lines.length - 1; i >= 0 && items.length < lim; i--) {
+    const m = RUN_SUMMARY_LINE_RE.exec(lines[i])
+    if (!m) continue
+    if (skipped < skip) { skipped++; continue }
+    const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
+    if (!counters.every(validInt)) continue
+    const extras = RUN_SUMMARY_EXTRAS_RE.exec(lines[i])
+    // 摘要行之后的 ERROR/运行异常行属于该轮（生产写序：先摘要后异常，xbk_app.js :1498/:1526）。
+    // 崩溃轮无摘要行：文件尾存在强失败行且其后无摘要 → 追加 interrupted 占位条目。
+    const tail = lines.slice(i + 1)
+    const interrupted = tail.some(looksLikeRoundFailure)
+    if (!interrupted && tail.length > 0) {
+      // 摘要行后有非失败行（ERROR 才算失败，普通 WARN/ALERT 不算）——仍然属于该轮，
+      // 不影响 interrupted 判定，无需特殊处理；这里不 break，继续向更早扫描。
+    }
+    items.push({
+      at: m[1] ? lines[i].slice(0, 19).trim() : '',
+      total: counters[0],
+      dedup: counters[1],
+      filtered: counters[2],
+      truncated: counters[3],
+      pushed: counters[4],
+      failed: counters[5],
+      elapsed: m[8],
+      cachesaved: extras && extras[1] !== undefined ? Number(extras[1]) : null,
+      noidentity: extras && extras[2] !== undefined ? Number(extras[2]) : null,
+      dryRun: extras && extras[3] !== undefined ? Number(extras[3]) : null,
+      interrupted
+    })
+  }
+  // 崩溃轮占位：文件尾部存在强失败行、且其位置之后没有任何摘要行（items 为空或首条
+  // 摘要行在失败行之前）→ 该轮没有任何计数数据，用 null 条目如实呈现而非静默丢弃。
+  if (items.length < lim) {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (RUN_SUMMARY_LINE_RE.exec(lines[i])) break
+      if (looksLikeRoundFailure(lines[i])) {
+        items.push({ at: '', total: null, dedup: null, filtered: null, truncated: null, pushed: null, failed: null, elapsed: '', cachesaved: null, noidentity: null, dryRun: null, interrupted: true })
+        break
+      }
+    }
+  }
+  // hasMore：尾窗内还有更早摘要未下发（before 游标还有下一页）。
+  let hasMore = false
+  if (items.length > 0) {
+    for (let i = 0; i < lines.length; i++) {
+      if (RUN_SUMMARY_LINE_RE.exec(lines[i])) { hasMore = skip + items.length < countSummaryLines(lines); break }
+    }
+  }
+  return { status: 'ok', items, hasMore, truncated }
+}
+
+// 尾窗内摘要行总数（readRunHistory 的 hasMore 判定辅助；逐行 count，无正则回溯面）。
+function countSummaryLines (lines) {
+  let n = 0
+  for (const line of lines) if (RUN_SUMMARY_LINE_RE.exec(line)) n++
+  return n
+}
+
 // push.json（判重缓存主存 = 已推送消息记录）的轻量读取校验：条目必须是带 id/title 的对象。
 // 这里不做 readStatus 级别的严格 schema 校验——控制台只读展示，畸形条目跳过并计数即可
 // （与 validChannels「逐条容错」同哲学：一条坏记录不能让整份记录不可见）。
@@ -324,4 +408,4 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   return result('ok', { total: items.length, items, keys, categories, skipped })
 }
 
-module.exports = { readStatus, formatStatus, readTrends, readMessages, readMessageCount, RUN_SUMMARY_LINE_RE }
+module.exports = { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE }

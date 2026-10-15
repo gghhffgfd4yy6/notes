@@ -830,6 +830,138 @@ async function main () {
     assert.ok(events.indexOf('exit:0') > events.indexOf('kill:SIGKILL'), '退出必须发生在 kill 之后')
   })
 
+  // ── v3.299 批次②：运行控制（停止按钮 + 逐轮运行历史）────────────────────────
+  await aok('HTTP: POST /api/runs/cancel 防线（无凭证 401 / 畸形 id 400 / 不存在 404 / 已结束 409）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const noAuth = await request(port, 'POST', '/api/runs/cancel', { body: 'id=1' })
+    assert.strictEqual(noAuth.status, 401, '无凭证必须 401')
+    // POST 不收 Cookie（G_4Kb 同口径）。
+    const csrf = await request(port, 'POST', '/api/runs/cancel', { headers: { cookie: `xbk_session=${TOKEN}` }, body: 'id=1' })
+    assert.strictEqual(csrf.status, 401, '仅凭 Cookie 必须 401')
+    const bad1 = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: '' })
+    assert.strictEqual(bad1.status, 400, '缺 id 必须 400')
+    const bad2 = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=abc' })
+    assert.strictEqual(bad2.status, 400, '非数字 id 必须 400')
+    const nf = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=999' })
+    assert.strictEqual(nf.status, 404, '不存在的 run 必须 404（重启后历史丢失同文案）')
+    // 已结束的 run → 409；伪造一条已完成记录验证（不 spawn 子进程）。
+    runs.set(7, { id: 7, action: 'check', label: 'x', startedAt: Date.now(), finishedAt: Date.now(), exitCode: 0, timedOut: false, cancelled: false, output: '' })
+    const done = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=7' })
+    assert.strictEqual(done.status, 409, '已结束任务必须 409')
+    assert.strictEqual(runs.get(7).cancelled, false, '409 路径不得置 cancelled')
+    server.close()
+  })
+  await aok('HTTP: cancel 运行中任务（真子进程）→ 202 + SIGTERM + close 释放锁 + cancelled 徽章', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const trig = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+    assert.strictEqual(trig.status, 202)
+    const { id } = JSON.parse(trig.text)
+    // 立即取消：check 秒级完成，存在「先自然结束再 cancel → 409」的竞态——若撞上则
+    // 验证 409 分支后跨动作（dry-run）重触发一轮再取消（保持确定性：最终必有 202）。
+    let cancelId = id
+    let c = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: `id=${id}` })
+    if (c.status === 409) {
+      const t3 = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
+      assert.strictEqual(t3.status, 202)
+      cancelId = JSON.parse(t3.text).id
+      c = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: `id=${cancelId}` })
+    }
+    assert.strictEqual(c.status, 202, `cancel 运行中任务必须 202（实际 ${c.status}）`)
+    assert.strictEqual(JSON.parse(c.text).cancelled, true)
+    const rec = runs.get(cancelId)
+    assert.strictEqual(rec.cancelled, true, 'record.cancelled 必须置位')
+    assert.ok(rec.output.includes('收到停止请求'), '输出必须含停止提示行')
+    // 幂等：重复 cancel 同 id → 200，不发第二次信号（kill 语义由 fake-child 用例锁）。
+    const again = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: `id=${cancelId}` })
+    assert.ok(again.status === 200 || again.status === 409, `重复 cancel 幂等（实际 ${again.status}：任务可能已自然结束）`)
+    // 子进程被信号终止后 close 释放锁（SIGTERM 对无 handler 子进程近即时）。
+    const deadline = Date.now() + 30000
+    while (Date.now() < deadline && rec.finishedAt === 0) await new Promise((_resolve) => setTimeout(_resolve, 100))
+    assert.ok(rec.finishedAt > 0, '被取消任务必须走到 close（锁释放唯一入口）')
+    const lockAfter = fs.existsSync(lockPath(dir)) ? JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')) : null
+    assert.ok(!lockAfter || lockAfter.released === true, '取消后锁必须释放')
+    // runs 列表带 cancelled 字段（additive 向后兼容）。
+    const list = JSON.parse((await request(port, 'GET', '/api/runs', { token: TOKEN })).text)
+    const row = list.runs.find((r) => r.id === cancelId)
+    assert.strictEqual(row.cancelled, true, '/api/runs 必须下发 cancelled')
+    server.close()
+  })
+  await aok('cancel 信号纪律：SIGTERM → 宽限后 SIGKILL 兜底；重复 cancel 不发第二次信号', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // fake child 注入：不响应 SIGTERM（模拟装了 handler 卡住），只有 SIGKILL 能杀。
+    const events = []
+    const fakeChild = {
+      kill (sig) { events.push(sig) },
+      once (ev, fn) { this._onceClose = ev === 'close' ? fn : this._onceClose; return this },
+      stdout: { on () {} },
+      stderr: { on () {} },
+      on (ev, fn) { if (ev === 'close') this._realClose = fn; return this }
+    }
+    runs.set(9, { id: 9, action: 'check', label: 'x', startedAt: Date.now(), finishedAt: 0, exitCode: null, timedOut: false, cancelled: false, output: '', _child: fakeChild })
+    const r1 = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=9' })
+    assert.strictEqual(r1.status, 202, 'SIGTERM 已发 + 兜底已注册 → 202')
+    assert.strictEqual(events[0], 'SIGTERM', '先 SIGTERM')
+    const r2 = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=9' })
+    assert.strictEqual(r2.status, 200, '重复 cancel 幂等 200')
+    assert.strictEqual(events.length, 1, `不得发第二次信号（events=${events}）`)
+    // 宽限期（3s）后 SIGKILL 兜底——直接等 3.4s 验证兜底真实触发（缩短宽限不可注入，
+    // 常量按生产值 3000ms 走）。
+    await new Promise((resolve) => setTimeout(resolve, 3400))
+    assert.ok(events.includes('SIGKILL'), `宽限后必须 SIGKILL 兜底（events=${events}）`)
+    server.close()
+  })
+  await aok('HTTP: GET /api/run-history（逐轮解析 / limit 钳制 / before 游标 / 鉴权）', async () => {
+    const dir = tmpDir()
+    const good = '2026-10-15 11:01:40 total=20 dedup=1 filtered=2 truncated=0 pushed=17 failed=0 elapsed=10.1s cachesaved=1'
+    const dry = '2026-10-15 10:00:00 total=5 dedup=0 filtered=0 truncated=0 pushed=0 failed=0 elapsed=1.0s dry-run未推送=3'
+    const bad = '2026-10-14 22:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=0 failed=1 elapsed=9.9s'
+    fs.writeFileSync(path.join(dir, 'run.log'), [good, 'ERROR 推送全部失败', dry, '普通 WARN 行', bad].join('\n') + '\n')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const na = await request(port, 'GET', '/api/run-history')
+    assert.strictEqual(na.status, 401)
+    const r1 = JSON.parse((await request(port, 'GET', '/api/run-history', { token: TOKEN })).text)
+    assert.strictEqual(r1.status, 'ok')
+    assert.strictEqual(r1.items.length, 3)
+    assert.strictEqual(r1.items[0].at, '2026-10-14 22:00:00', '时间倒序')
+    assert.strictEqual(r1.items[2].interrupted, true, '摘要行后 ERROR 行 → interrupted')
+    assert.strictEqual(r1.items[1].dryRun, 3, 'dry-run 尾组捕获')
+    assert.strictEqual(r1.items[2].cachesaved, 1, 'cachesaved 尾组捕获')
+    const r2 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=1', { token: TOKEN })).text)
+    assert.strictEqual(r2.items.length, 1)
+    assert.strictEqual(r2.hasMore, true, '还有更早轮次')
+    const r3 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=1&before=1', { token: TOKEN })).text)
+    assert.strictEqual(r3.items[0].at, '2026-10-15 10:00:00', 'before 游标跳过最新 1 轮')
+    const r4 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=9999', { token: TOKEN })).text)
+    assert.strictEqual(r4.items.length, 3, '超限钳制到 200 但全部轮次 <200 时原样返回')
+    const r5 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=abc&before=-3', { token: TOKEN })).text)
+    assert.strictEqual(r5.items.length, 3, '非法参数回默认不报错')
+    server.close()
+  })
+  await aok('readRunHistory: missing 透传 / 崩溃轮占位（null 计数 + interrupted）', async () => {
+    const { readRunHistory } = require('./scripts/status')
+    assert.strictEqual(readRunHistory(tmpDir(), {}).status, 'missing')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=0.5s cachesaved=1\nERROR 致命崩溃：堆栈\n')
+    const r = readRunHistory(dir, { limit: 5 })
+    assert.strictEqual(r.status, 'ok')
+    assert.strictEqual(r.items.length, 2, '崩溃轮占位 + 上一轮摘要')
+    // items[0] = 最新摘要轮（其后跟着崩溃 ERROR → interrupted，写序口径）。
+    assert.strictEqual(r.items[0].at, '2026-10-15 09:00:00')
+    assert.strictEqual(r.items[0].interrupted, true)
+    // items[1] = 崩溃轮占位（文件尾 ERROR 行之后无摘要行）：null 计数如实呈现。
+    const crash = r.items[1]
+    assert.strictEqual(crash.interrupted, true)
+    assert.strictEqual(crash.total, null, '崩溃轮无计数')
+    assert.strictEqual(crash.at, '')
+  })
+
   // ── v3.298 只读扩展：配置视图 / 缓存健康 / 文件清单 / 趋势天数 ─────────────────
   await aok('只读纯函数: statSafeMeta 三态（常规文件 / 符号链接 / 缺失）', () => {
     const dir = tmpDir()

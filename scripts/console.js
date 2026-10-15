@@ -20,7 +20,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
-const { readStatus, formatStatus, readTrends, readMessages, readMessageCount } = require('./status')
+const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory } = require('./status')
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
 const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_KEYS, TOMBSTONE_MAX_BYTES } = require('../xbk_utils')
@@ -89,6 +89,13 @@ const MESSAGES_PAGE_MAX = 10000
 const MESSAGES_QUERY_MAX_BYTES = 240
 
 // ── v3.298 只读扩展常量 ─────────────────────────────────────────────────────
+// 取消宽限期：SIGTERM 后等子进程退出的时长，超时 SIGKILL 兜底（v3.299 批次②）。
+// 单轮入口子进程未装 SIGTERM handler，实际近即时退出；宽限只为兼容未来 handler。
+const CANCEL_GRACE_MS = 3000
+// 运行历史单次下发上限（v3.299 批次②）：/api/run-history 的 limit 钳制区间。
+const RUN_HISTORY_LIMIT_MAX = 200
+const RUN_HISTORY_LIMIT_DEFAULT = 50
+
 // /api/trends 的 days 白名单：URL 是未验证输入，只放行这三个值（非法/越界一律回默认 14，
 // 向后兼容）。用固定数组 includes 而非正则（用户输入不进正则是本仓红线）。
 const TREND_DAYS_ALLOWED = Object.freeze([14, 30, 60])
@@ -294,7 +301,8 @@ function startAction (actionKey, now, activeChildren) {
     finishedAt: 0,
     exitCode: null,
     timedOut: false,
-    output: ''
+    output: '',
+    cancelled: false
   }
   runs.set(id, record)
   if (runs.size > 20) {
@@ -330,6 +338,9 @@ function startAction (actionKey, now, activeChildren) {
   }
   child.stdout.on('data', append)
   child.stderr.on('data', append)
+  // 取消句柄：cancel 端点只经这个对象引用发信号（内核按 spawn 时句柄定位，天然免疫
+  // pid 复用）。绝不按锁帧 pid kill——那是控制台进程自己的 pid（v3.299 评审预审要点）。
+  record._child = child
   child.on('error', (err) => {
     // spawn 失败（ENOENT 等）：不能让 uncaught 崩掉控制台（Sourcery Medium），
     // 也不能把 run 永久留在「运行中」。close 事件在 spawn error 后仍会触发，
@@ -1104,6 +1115,19 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       })
       return
     }
+    if (req.method === 'GET' && url.pathname === '/api/run-history') {
+      // 逐轮运行历史（v3.299 批次②）：直接解析 run.log 摘要行（零新文件零写盘——
+      // run.log 是仓内既定的持久逐轮记录，CHANGELOG v3.289 口径）。limit/before 钳制：
+      // URL 是未验证输入，Number + 整数 + 区间钳制，用户输入不进正则。
+      let limit = Number(url.searchParams.get('limit'))
+      if (!Number.isSafeInteger(limit) || limit < 1) limit = RUN_HISTORY_LIMIT_DEFAULT
+      if (limit > RUN_HISTORY_LIMIT_MAX) limit = RUN_HISTORY_LIMIT_MAX
+      let before = Number(url.searchParams.get('before'))
+      if (!Number.isSafeInteger(before) || before < 0) before = 0
+      const h = readRunHistory(stateDir, { limit, before })
+      sendJson(res, 200, h)
+      return
+    }
     if (req.method === 'GET' && url.pathname === '/api/logs') {
       // 运行日志在线查看：run.log 尾部 1MiB（与 status.js LOG_READ_OPTIONS.tail 同口径）。
       const { readSafeTextResult } = require('../xbk_storage')
@@ -1254,7 +1278,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         startedAt: r.startedAt,
         finishedAt: r.finishedAt,
         exitCode: r.exitCode,
-        timedOut: r.timedOut
+        timedOut: r.timedOut,
+        cancelled: r.cancelled === true
       }))
       sendJson(res, 200, { runs: list })
       return
@@ -1280,8 +1305,61 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             finishedAt: record.finishedAt,
             exitCode: record.exitCode,
             timedOut: record.timedOut,
+            cancelled: record.cancelled === true,
             output: record.output
           })
+        })
+        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+      return
+    }
+    // POST /api/runs/cancel（v3.299 批次②）：停止运行中的触发任务。body: id=...，
+    // 与 /api/runs/detail 同形态（前端 fetch 首参必须是字面量 URL——Codacy SSRF 规则，
+    // GET /:id/cancel 形态无法满足）。
+    //
+    // 安全设计（评审预审）：
+    // - 杀进程只经 record._child 对象引用（内核句柄绑定 spawn 时进程，免疫 pid 复用）；
+    //   锁帧 pid 是控制台自身，绝不作为 kill 目标。
+    // - 信号纪律：SIGTERM → 3s 宽限（unref 定时器）→ SIGKILL 兜底，与既有超时/关停
+    //   路径同一套「杀→等 close→锁由 close 释放」机器。
+    // - 锁零操作：不 unlink（CodeQL 铁律）、不覆写、不碰 lastAccept——取消后重放窗保留，
+    //   同动作 ≈12min 冷却，阻断「取消后误重推已送达未记录条目」（半推送披露见 README）。
+    // - 幂等：已完成 409；已取消 200 返回现状（防重复按钮发第二次信号）。
+    if (req.method === 'POST' && url.pathname === '/api/runs/cancel') {
+      if (shuttingDown) {
+        sendJson(res, 503, { error: '控制台正在关闭，动作未执行' })
+        return
+      }
+      readBody(req)
+        .then(({ body, aborted, over }) => {
+          // 关停竞态兜底：readBody 期间收到 SIGTERM 时，关停序列即将 SIGKILL 全部子进程，
+          // 这里再发信号会与关停机器打架——拒绝（与 /trigger 同款双查）。
+          if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
+          if (aborted || over) { sendJson(res, 400, { error: '请求中断或超限' }); return }
+          const m = /(?:^|&)id=(\d+)/.exec(body)
+          if (!m) { sendJson(res, 400, { error: '缺少数字 id' }); return }
+          const record = runs.get(Number(m[1]))
+          if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
+          if (record.finishedAt) { sendJson(res, 409, { error: '该任务已结束，无需停止' }); return }
+          if (record.cancelled) {
+            // 幂等：已受理过的取消不再发第二次信号，直接报现状。
+            sendJson(res, 200, { id: record.id, action: record.action, cancelled: true })
+            return
+          }
+          record.cancelled = true
+          record.cancelRequestedAt = Date.now()
+          record.output += '\n[console] 收到停止请求，正在终止子进程…\n'
+          try {
+            record._child && record._child.kill('SIGTERM')
+          } catch (e) { /* 子进程句柄已失效：close 即将到来，兜底无害 */ }
+          // SIGKILL 兜底：宽限期后 close 仍未来（SIGTERM handler 卡住等）→ 强杀。
+          // 不依赖 kill 返回值（Node 不保证其反映进程状态）：已死进程上再签 SIGKILL
+          // 是无害 no-op，漏签才会让卡死任务挂到 PROC_TIMEOUT_MS。
+          const cancelChild = record._child
+          const killer = setTimeout(() => {
+            try { cancelChild.kill('SIGKILL') } catch (e) { /* 已退出 */ }
+          }, CANCEL_GRACE_MS)
+          if (typeof killer.unref === 'function') killer.unref()
+          sendJson(res, 202, { id: record.id, action: record.action, cancelled: true })
         })
         .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
       return
@@ -1298,6 +1376,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         finishedAt: record.finishedAt,
         exitCode: record.exitCode,
         timedOut: record.timedOut,
+        cancelled: record.cancelled === true,
         output: record.output
       })
       return
