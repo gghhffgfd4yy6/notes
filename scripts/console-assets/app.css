@@ -64,6 +64,10 @@ body {
 
 /* ── 按钮 ── */
 .btn-row { display: flex; gap: 18px; flex-wrap: wrap; }
+/* 停止按钮（v3.299 批次②）：危险动作红色描边 */
+.btn-danger { color: #ff9d97; border-color: rgba(255, 157, 151, 0.45); }
+.btn-danger:hover { background: rgba(255, 157, 151, 0.12); }
+.btn-busy { opacity: 0.6; cursor: wait; }
 .btn-item { display: flex; flex-direction: column; gap: 4px; }
 .btn {
   border: 1px solid var(--border);
