@@ -481,7 +481,7 @@ async function main () {
     const first = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
     assert.strictEqual(first.status, 202)
     const firstBody = JSON.parse(first.text)
-    assert.ok(firstBody.id > 0)
+    assert.ok(/^\d{13,}\.\d{1,10}$/.test(String(firstBody.id)), `run id 必须是 epoch.seq 形态（实际 ${firstBody.id}）`)
     assert.strictEqual(fs.existsSync(lockPath(dir)), true, '触发后必须有锁')
     const second = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
     assert.strictEqual(second.status, 409, '持有期内第二个触发必须 409')
@@ -557,7 +557,8 @@ async function main () {
     const postBody = JSON.parse(postDetail.text)
     assert.strictEqual(postBody.id, id, 'POST detail 返回同一条 run')
     assert.ok(typeof postBody.output === 'string' && postBody.output.length > 0, 'POST detail output 非空')
-    const postMissing = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: 'id=99999' })
+    // id 形态「epoch.seq」：不存在 id 用合法形态（重启前进程的 epoch 前缀 → 404 语义）
+    const postMissing = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: 'id=1750000000000.99999' })
     assert.strictEqual(postMissing.status, 404, 'POST detail 未命中 404')
     const postBad = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: 'id=abc' })
     assert.strictEqual(postBad.status, 400, 'POST detail 非数字 id 400')
@@ -844,13 +845,13 @@ async function main () {
     assert.strictEqual(bad1.status, 400, '缺 id 必须 400')
     const bad2 = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=abc' })
     assert.strictEqual(bad2.status, 400, '非数字 id 必须 400')
-    const nf = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=999' })
+    const nf = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1750000000000.999' })
     assert.strictEqual(nf.status, 404, '不存在的 run 必须 404（重启后历史丢失同文案）')
     // 已结束的 run → 409；伪造一条已完成记录验证（不 spawn 子进程）。
-    runs.set(7, { id: 7, action: 'check', label: 'x', startedAt: Date.now(), finishedAt: Date.now(), exitCode: 0, timedOut: false, cancelled: false, output: '' })
-    const done = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=7' })
+    runs.set('1750000000000.7', { id: '1750000000000.7', action: 'check', label: 'x', startedAt: Date.now(), finishedAt: Date.now(), exitedAt: Date.now(), exitCode: 0, timedOut: false, cancelled: false, output: '' })
+    const done = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1750000000000.7' })
     assert.strictEqual(done.status, 409, '已结束任务必须 409')
-    assert.strictEqual(runs.get(7).cancelled, false, '409 路径不得置 cancelled')
+    assert.strictEqual(runs.get('1750000000000.7').cancelled, false, '409 路径不得置 cancelled')
     server.close()
   })
   await aok('HTTP: cancel 运行中任务（真子进程）→ 202 + SIGTERM + close 释放锁 + cancelled 徽章', async () => {
@@ -903,11 +904,11 @@ async function main () {
       stderr: { on () {} },
       on (ev, fn) { if (ev === 'close') this._realClose = fn; return this }
     }
-    runs.set(9, { id: 9, action: 'check', label: 'x', startedAt: Date.now(), finishedAt: 0, exitCode: null, timedOut: false, cancelled: false, output: '', _child: fakeChild })
-    const r1 = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=9' })
+    runs.set('1750000000000.9', { id: '1750000000000.9', action: 'check', label: 'x', startedAt: Date.now(), finishedAt: 0, exitedAt: 0, exitCode: null, timedOut: false, cancelled: false, output: '', _child: fakeChild })
+    const r1 = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1750000000000.9' })
     assert.strictEqual(r1.status, 202, 'SIGTERM 已发 + 兜底已注册 → 202')
     assert.strictEqual(events[0], 'SIGTERM', '先 SIGTERM')
-    const r2 = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=9' })
+    const r2 = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1750000000000.9' })
     assert.strictEqual(r2.status, 200, '重复 cancel 幂等 200')
     assert.strictEqual(events.length, 1, `不得发第二次信号（events=${events}）`)
     // 宽限期（3s）后 SIGKILL 兜底——直接等 3.4s 验证兜底真实触发（缩短宽限不可注入，
@@ -916,35 +917,64 @@ async function main () {
     assert.ok(events.includes('SIGKILL'), `宽限后必须 SIGKILL 兜底（events=${events}）`)
     server.close()
   })
-  await aok('HTTP: GET /api/run-history（逐轮解析 / limit 钳制 / before 游标 / 鉴权）', async () => {
+  await aok('HTTP: GET /api/run-history（轮界模型 / 行号游标 / limit 钳制 / 鉴权）', async () => {
     const dir = tmpDir()
-    const good = '2026-10-15 11:01:40 total=20 dedup=1 filtered=2 truncated=0 pushed=17 failed=0 elapsed=10.1s cachesaved=1'
-    const dry = '2026-10-15 10:00:00 total=5 dedup=0 filtered=0 truncated=0 pushed=0 failed=0 elapsed=1.0s dry-run未推送=3'
-    const bad = '2026-10-14 22:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=0 failed=1 elapsed=9.9s'
-    fs.writeFileSync(path.join(dir, 'run.log'), [good, 'ERROR 推送全部失败', dry, '普通 WARN 行', bad].join('\n') + '\n')
-    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    // 轮界模型（v3.299 评审 #3/#12）：失败行在**同轮**摘要行之前紧邻出现（生产写序
+    // xbk_app.js :1684→:1688，时间戳同轮）。14:30 轮 = ERROR + 其摘要（interrupted:true）；
+    // good 15:00 与 old 13:00 正常收尾；WARN 行不是失败信号。
+    const good = '2026-10-15 15:00:00 total=20 dedup=1 filtered=2 truncated=0 pushed=17 failed=0 elapsed=10.1s cachesaved=1'
+    const midSummary = '2026-10-15 14:30:00 total=5 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=1.0s dry-run未推送=3'
+    const err = '2026-10-15 14:30:00 ERROR 推送全部失败 3 条（通道可能失效）'
+    const warn = '2026-10-15 14:00:00 WARN 通道健康更新异常: x'
+    const old_ = '2026-10-15 13:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=0 failed=1 elapsed=9.9s cachesaved=1'
+    fs.writeFileSync(path.join(dir, 'run.log'), [old_, warn, err, midSummary, good].join('\n') + '\n')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir, runHistoryDir: dir })
     const port = await listen(server)
     const na = await request(port, 'GET', '/api/run-history')
     assert.strictEqual(na.status, 401)
     const r1 = JSON.parse((await request(port, 'GET', '/api/run-history', { token: TOKEN })).text)
     assert.strictEqual(r1.status, 'ok')
     assert.strictEqual(r1.items.length, 3)
-    assert.strictEqual(r1.items[0].at, '2026-10-14 22:00:00', '时间倒序')
-    assert.strictEqual(r1.items[2].interrupted, true, '摘要行后 ERROR 行 → interrupted')
+    assert.deepStrictEqual(r1.items.map((x) => x.at), ['2026-10-15 15:00:00', '2026-10-15 14:30:00', '2026-10-15 13:00:00'], '时间倒序')
+    assert.strictEqual(r1.items[0].interrupted, false, '正常轮不受更早失败行污染（#3 修复点）')
+    assert.strictEqual(r1.items[1].interrupted, true, 'ERROR 紧邻其摘要行 → 该轮 interrupted（写序口径）')
+    assert.strictEqual(r1.items[2].interrupted, false, 'WARN 行不算失败信号')
     assert.strictEqual(r1.items[1].dryRun, 3, 'dry-run 尾组捕获')
     assert.strictEqual(r1.items[2].cachesaved, 1, 'cachesaved 尾组捕获')
+    // 行号游标（v3.299 评审 #6）：before = 上一页最旧条目 lineNo-1。
     const r2 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=1', { token: TOKEN })).text)
     assert.strictEqual(r2.items.length, 1)
     assert.strictEqual(r2.hasMore, true, '还有更早轮次')
-    const r3 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=1&before=1', { token: TOKEN })).text)
-    assert.strictEqual(r3.items[0].at, '2026-10-15 10:00:00', 'before 游标跳过最新 1 轮')
+    const r3 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=1&before=' + (r2.items[0].lineNo - 1), { token: TOKEN })).text)
+    assert.strictEqual(r3.items[0].at, '2026-10-15 14:30:00', '行号游标取更早一轮')
     const r4 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=9999', { token: TOKEN })).text)
     assert.strictEqual(r4.items.length, 3, '超限钳制到 200 但全部轮次 <200 时原样返回')
     const r5 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=abc&before=-3', { token: TOKEN })).text)
     assert.strictEqual(r5.items.length, 3, '非法参数回默认不报错')
     server.close()
   })
-  await aok('readRunHistory: missing 透传 / 崩溃轮占位（null 计数 + interrupted）', async () => {
+  await aok('HTTP: run-history limit=9999 在 220 轮 fixture 上真实钳制到 200（评审 #14）', async () => {
+    const dir = tmpDir()
+    const rows = []
+    for (let i = 0; i < 220; i++) {
+      const hh = String(Math.floor(i / 60)).padStart(2, '0')
+      const mm = String(i % 60).padStart(2, '0')
+      rows.push(`2026-10-15 ${hh}:${mm}:00 total=${i} dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1`)
+    }
+    fs.writeFileSync(path.join(dir, 'run.log'), rows.join('\n') + '\n')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir, runHistoryDir: dir })
+    const port = await listen(server)
+    const r = JSON.parse((await request(port, 'GET', '/api/run-history?limit=9999', { token: TOKEN })).text)
+    assert.strictEqual(r.items.length, 200, '220 轮 + limit=9999 必须钳制到 200')
+    const d = JSON.parse((await request(port, 'GET', '/api/run-history?limit=50', { token: TOKEN })).text)
+    assert.strictEqual(d.items.length, 50, '默认 limit=50')
+    assert.strictEqual(d.hasMore, true)
+    const r2 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=50&before=' + (d.items[49].lineNo - 1), { token: TOKEN })).text)
+    assert.strictEqual(r2.items.length, 50, '游标续页 50 条')
+    assert.ok(r2.items[0].lineNo < d.items[49].lineNo, '续页条目必须比上页最旧更早（无重复无跳过）')
+    server.close()
+  })
+  await aok('readRunHistory: missing 透传 / 崩溃轮占位最新位（#12）/ 失败行归属下一摘要轮（#3）', async () => {
     const { readRunHistory } = require('./scripts/status')
     assert.strictEqual(readRunHistory(tmpDir(), {}).status, 'missing')
     const dir = tmpDir()
@@ -952,14 +982,23 @@ async function main () {
     const r = readRunHistory(dir, { limit: 5 })
     assert.strictEqual(r.status, 'ok')
     assert.strictEqual(r.items.length, 2, '崩溃轮占位 + 上一轮摘要')
-    // items[0] = 最新摘要轮（其后跟着崩溃 ERROR → interrupted，写序口径）。
-    assert.strictEqual(r.items[0].at, '2026-10-15 09:00:00')
+    // #12：崩溃占位是**最新**条目（文件尾失败行其后无摘要），时间倒序首位。
+    assert.strictEqual(r.items[0].total, null, '崩溃占位在倒序首位')
     assert.strictEqual(r.items[0].interrupted, true)
-    // items[1] = 崩溃轮占位（文件尾 ERROR 行之后无摘要行）：null 计数如实呈现。
-    const crash = r.items[1]
-    assert.strictEqual(crash.interrupted, true)
-    assert.strictEqual(crash.total, null, '崩溃轮无计数')
-    assert.strictEqual(crash.at, '')
+    assert.strictEqual(r.items[0].at, '')
+    // items[1] = 上一轮摘要：正常收尾（失败行在它之后出现，不属于它）。
+    assert.strictEqual(r.items[1].at, '2026-10-15 09:00:00')
+    assert.strictEqual(r.items[1].interrupted, false, '#3：失败行不再污染更早的摘要轮')
+    // 失败行归属下一摘要轮：old轮 → ERROR → mid轮。
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'run.log'), [
+      '2026-10-15 08:00:00 total=9 dedup=0 filtered=0 truncated=0 pushed=9 failed=0 elapsed=1s cachesaved=1',
+      'ERROR 推送全部失败 3 条（通道可能失效）',
+      '2026-10-15 09:00:00 total=5 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=2s cachesaved=0'
+    ].join('\n') + '\n')
+    const r2 = readRunHistory(dir2, { limit: 5 })
+    assert.strictEqual(r2.items[0].interrupted, true, '失败行 → 其后摘要轮 interrupted')
+    assert.strictEqual(r2.items[1].interrupted, false, '更早摘要轮不受污染')
   })
 
   // ── v3.298 只读扩展：配置视图 / 缓存健康 / 文件清单 / 趋势天数 ─────────────────

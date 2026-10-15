@@ -128,10 +128,10 @@ function apiGetRuns () {
 
 async function apiGetRunDetail (id) {
   // 详情查询走 POST /api/runs/detail：fetch 的 URL 是纯字面量，run id 在请求体里
-  // （Number(id).toFixed(0) 强制数值化，非数字输入只会得到数字文本）。
+  // （id = 「epoch.seq」字符串原样传，服务端正则按此形态校验——v3.299 评审）。
   // GET /api/runs/:id 服务端仍保留（API 兼容），前端不再拼变量 URL——
   // Codacy SSRF 规则不接受任何含变量的 fetch 第一参数，字面量 + body 是唯一全绿形态。
-  const body = new URLSearchParams({ id: Number(id).toFixed(0) })
+  const body = new URLSearchParams({ id: String(id) })
   const { merged, done } = timedRequest({
     method: 'POST',
     headers: {
@@ -149,7 +149,8 @@ async function apiGetRunDetail (id) {
 // （Codacy SSRF 全绿形态，与 /api/runs/detail 同款）。202 = 已受理（异步终止中），
 // 200 = 幂等命中（已取消过），409 = 已结束无需停止。
 function apiCancelRun (id) {
-  const body = new URLSearchParams({ id: Number(id).toFixed(0) })
+  // id = 「epoch.seq」字符串原样传（v3.299 评审：进程 epoch 形态），不做 Number 归一。
+  const body = new URLSearchParams({ id: String(id) })
   const { merged, done } = timedRequest({
     method: 'POST',
     headers: {
@@ -568,10 +569,19 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
   // 停止按钮（v3.299 批次②）：只对未完成的轮次显示；点击后置本地 pending 态并刷新，
   // 结果徽章由下一轮轮询的 cancelled/finishedAt 驱动。
   const [cancelPending, setCancelPending] = useState(null)
+  const [cancelErr, setCancelErr] = useState('')
   const doCancel = async (id) => {
     setCancelPending(id)
-    try { await apiCancelRun(id) } catch (e) { /* 徽章由轮询纠正；失败横幅交由同步错误条 */ }
-    setCancelPending(null)
+    setCancelErr('')
+    try {
+      await apiCancelRun(id)
+    } catch (e) {
+      // v3.299 评审 #9：取消失败必须可见——成功刷新会清掉同步错误条，吞掉这里的
+      // 异常会让任务在无提示下继续跑。面板内局部横幅不依赖全局轮询状态。
+      setCancelErr(`停止请求失败：${e && e.message ? e.message : String(e)}（任务可能仍在运行，请重试）`)
+    } finally {
+      setCancelPending(null)
+    }
     onRefresh()
   }
 
@@ -583,6 +593,7 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
       <span class="panel-title">触发历史</span>
       <span class="panel-sub">最多 20 条 · 本进程内存</span>
     </div>
+    ${cancelErr && html`<div class="hint hint-err">${cancelErr}</div>`}
     ${runs.length === 0
       ? html`<div class="empty">暂无触发记录</div>`
       : html`<table class="runs-table">
@@ -634,9 +645,17 @@ function RunHistoryPanel () {
       const d = await apiGetRunHistory({ limit: 50, before })
       if (seq !== seqRef.current) return
       setErr('')
-      setPage((prev) => before > 0
-        ? { ...d, items: [...(prev.items || []), ...(d.items || [])] }
-        : d)
+      // 去重（v3.299 评审 #6）：before 是行号游标，上一页与下一页在「游标附近的行被
+      // 并发追加/截尾」的边界场景可能重叠——按 lineNo 身份去重，宁可少一条不重复。
+      setPage((prev) => {
+        if (!(before > 0)) return d
+        const seen = new Set((prev.items || []).map((x) => x.lineNo))
+        const merged = [...(prev.items || [])]
+        for (const it of d.items || []) {
+          if (!seen.has(it.lineNo)) { seen.add(it.lineNo); merged.push(it) }
+        }
+        return { ...d, items: merged }
+      })
     } catch (e) {
       if (seq === seqRef.current) setErr(`加载失败：${e.message}`)
     } finally {
@@ -648,7 +667,7 @@ function RunHistoryPanel () {
   return html`<div class="panel">
     <div class="panel-head">
       <span class="panel-title">逐轮运行历史</span>
-      <span class="panel-sub">run.log 摘要逐轮${page.truncated ? ' · 日志超 1 MiB，更早轮次已轮转' : ''}</span>
+      <span class="panel-sub">run.log 摘要逐轮${page.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : ''}</span>
       <span style="flex:1"></span>
       <button class="btn btn-ghost" onClick=${() => { load(0) }} disabled=${loading}>刷新</button>
     </div>
@@ -671,7 +690,7 @@ function RunHistoryPanel () {
     </table>`}
     ${page.status === 'ok' && shown.length === 0 && html`<div class="empty">日志尾窗内没有摘要行</div>`}
     ${page.hasMore && html`<div style="text-align:center;margin-top:8px">
-      <button class="btn btn-ghost" onClick=${() => { load(shown.length) }} disabled=${loading}>${loading ? '加载中…' : '加载更早轮次'}</button>
+      <button class="btn btn-ghost" onClick=${() => { load(shown.length > 0 ? shown[shown.length - 1].lineNo - 1 : 0) }} disabled=${loading}>${loading ? '加载中…' : '加载更早轮次'}</button>
     </div>`}
   </div>`
 }
@@ -1103,7 +1122,8 @@ function App () {
   }, [busy, runs, active])
 
   const handleTriggered = useCallback((runId) => {
-    if (typeof runId === 'number') busyRunIdRef.current = runId
+    // run id 形态「epoch.seq」字符串（v3.299 评审：进程 epoch 防重启后序列复用误命中）
+    if (typeof runId === 'string' && /^\d{13,}\.\d{1,10}$/.test(runId)) busyRunIdRef.current = runId
     refreshSplit()
   }, [refreshSplit])
 

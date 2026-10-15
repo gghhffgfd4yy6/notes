@@ -285,13 +285,17 @@ function acquireLock (stateDir, now, token) {
 // 运行中即可读（增量写 record.output）。state 存进程内 Map（重启即空——锁文件在，
 // 重启后第一次触发会因陈旧锁接管或等待，不会双跑）。
 const runs = new Map()
-let runSeq = 0
-// run ID = 单调序列，Map 重启即清空；「重启后旧 URL 命中新记录」的窗口由
-// /api/runs/:id 的 404 文案（「进程重启后历史丢失」）向用户说明，不做持久化映射。
+// run ID = 「进程 epoch.单调序列」（Sourcery #229-1：runSeq 重启归零会让重启前的旧
+// cancel/详情请求在序列复用后命中**新**任务——结构性误杀）。epoch 取控制台进程启动
+// 毫秒（同进程内恒定，跨进程几乎必异），Map 键用完整 id 字符串，旧进程的 id 重启后
+// 必然查无 → 404，不可能命中新记录。
+const runEpoch = String(Date.now())
+function makeRunId (seq) { return `${runEpoch}.${seq}` }
 
+let runSeq = 0
 function startAction (actionKey, now, activeChildren) {
   const action = ACTIONS[actionKey]
-  const id = ++runSeq
+  const id = makeRunId(++runSeq)
   const entryFile = action.entry === 'single' ? ENTRY_SINGLE : ENTRY_QINGLONG
   const record = {
     id,
@@ -299,6 +303,7 @@ function startAction (actionKey, now, activeChildren) {
     label: action.label,
     startedAt: now,
     finishedAt: 0,
+    exitedAt: 0, // exit 事件时刻（先于 close：stdout/stderr drain 中已不可取消）
     exitCode: null,
     timedOut: false,
     output: '',
@@ -306,8 +311,8 @@ function startAction (actionKey, now, activeChildren) {
   }
   runs.set(id, record)
   if (runs.size > 20) {
-    // 只保留最近 20 条：按 id 最小的清理（id 单调递增即最旧）。
-    const oldest = [...runs.keys()].sort((a, b) => a - b).slice(0, runs.size - 20)
+    // 只保留最近 20 条：按 seq 最小的清理（id=epoch.seq，同进程 epoch 恒定，seq 单调递增）。
+    const oldest = [...runs.keys()].sort((a, b) => runs.get(a).startedAt - runs.get(b).startedAt).slice(0, runs.size - 20)
     for (const k of oldest) runs.delete(k)
   }
   // 环境继承：剥离 XBK_DRY_RUN（Sourcery High：控制台自身带 XBK_DRY_RUN=1 时，
@@ -351,8 +356,15 @@ function startAction (actionKey, now, activeChildren) {
     record.timedOut = true
     try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
   }, PROC_TIMEOUT_MS)
+  child.on('exit', () => {
+    // Sourcery #229-10：exit 先于 close（输出流 drain 中）。取消判据用 exitedAt，
+    // 避免「进程已退出但 close 未到」窗口里 cancel 误杀已自然完成的任务。
+    record.exitedAt = Date.now()
+  })
   child.on('close', (code) => {
     clearTimeout(timer)
+    // Sourcery #229-0：取消宽限定时器一并清理（子进程已死，SIGKILL 兜底失去意义）。
+    if (record._cancelTimer) { clearTimeout(record._cancelTimer); record._cancelTimer = null }
     if (activeChildren) activeChildren.delete(child)
     record.exitCode = code
     record.finishedAt = Date.now()
@@ -863,7 +875,7 @@ function buildPushChannelsView () {
   return view
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json' }) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
@@ -907,9 +919,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const out = []
       if (parsed && typeof parsed === 'object') {
         for (const [k, v] of Object.entries(parsed)) {
-          if (v && typeof v === 'object' && typeof v.at === 'number' && typeof v.runId === 'number') {
-            out.push([k, { at: v.at, runId: v.runId }])
-          }
+          // runId 形态（v3.299 评审）：数字 0 = pending 帧哨兵；字符串「epoch.seq」= 已 spawn。
+          const ridOk = v && typeof v.at === 'number' &&
+            (v.runId === 0 || (typeof v.runId === 'string' && /^\d{13,}\.\d{1,10}$/.test(v.runId)))
+          if (ridOk) out.push([k, { at: v.at, runId: v.runId }])
         }
       }
       return out
@@ -1124,7 +1137,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       if (limit > RUN_HISTORY_LIMIT_MAX) limit = RUN_HISTORY_LIMIT_MAX
       let before = Number(url.searchParams.get('before'))
       if (!Number.isSafeInteger(before) || before < 0) before = 0
-      const h = readRunHistory(stateDir, { limit, before })
+      // Sourcery #229-4：run.log 的写入方是运行侧 MessageStore.cacheDir（xbk_app
+      // _writeRunLog → MessageStore.cacheDir），不是控制台 stateDir——Config.cache.dir
+      // 指向别处时两个目录分居。读取源对齐运行侧解析结果（取不到回退 stateDir），
+      // 与启动时「目录漂移」警告同一口径。
+      const historyDir = runHistoryDir || (runtimeCacheDir() || stateDir)
+      const h = readRunHistory(historyDir, { limit, before })
       sendJson(res, 200, h)
       return
     }
@@ -1235,7 +1253,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           }
           const prev = lastAccept.get(action)
           if (prev && now - prev.at < REPLAY_WINDOW_MS) {
-            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: prev.runId > 0 ? prev.runId : undefined, replayBlocked: true })
+            // runId = epoch.seq 字符串（v3.299 评审）：0 是 pending 帧哨兵（数字），
+            // 真实 runId 只在 startAction 之后落盘——用「数字 0」判 pending，其余原样下发。
+            const rid = prev.runId
+            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true })
             return
           }
           if (!acquireLock(stateDir, now, ownerToken)) {
@@ -1271,7 +1292,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/runs') {
-      const list = [...runs.values()].sort((a, b) => b.id - a.id).map((r) => ({
+      const list = [...runs.values()].sort((a, b) => b.startedAt - a.startedAt).map((r) => ({
         id: r.id,
         action: r.action,
         label: r.label,
@@ -1293,9 +1314,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       readBody(req)
         .then(({ body, aborted, over }) => {
           if (aborted || over) { sendJson(res, 400, { error: '请求中断或超限' }); return }
-          const m = /(?:^|&)id=(\d+)/.exec(body)
-          if (!m) { sendJson(res, 400, { error: '缺少数字 id' }); return }
-          const record = runs.get(Number(m[1]))
+          const m = /(?:^|&)id=(\d{13,}\.\d{1,10})$/.exec(body)
+          if (!m) { sendJson(res, 400, { error: '缺少合法 id（epoch.seq 数字形态）' }); return }
+          const record = runs.get(m[1])
           if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
           sendJson(res, 200, {
             id: record.id,
@@ -1335,38 +1356,59 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 这里再发信号会与关停机器打架——拒绝（与 /trigger 同款双查）。
           if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
           if (aborted || over) { sendJson(res, 400, { error: '请求中断或超限' }); return }
-          const m = /(?:^|&)id=(\d+)/.exec(body)
-          if (!m) { sendJson(res, 400, { error: '缺少数字 id' }); return }
-          const record = runs.get(Number(m[1]))
+          // id 形态 = 「epoch.seq」全数字段（Sourcery #229-1）：跨进程结构性失配，
+          // 旧 id 在新进程必然 404，不存在「序列复用误命中」。
+          const m = /(?:^|&)id=(\d{13,}\.\d{1,10})$/.exec(body)
+          if (!m) { sendJson(res, 400, { error: '缺少合法 id（epoch.seq 数字形态）' }); return }
+          const record = runs.get(m[1])
           if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
-          if (record.finishedAt) { sendJson(res, 409, { error: '该任务已结束，无需停止' }); return }
           if (record.cancelled) {
-            // 幂等：已受理过的取消不再发第二次信号，直接报现状。
-            sendJson(res, 200, { id: record.id, action: record.action, cancelled: true })
+            // 幂等先于 finishedAt（Sourcery #229-8）：已受理过取消的任务之后无论是否
+            // 已结束，重复 cancel 都返回 200 现状——不因时序在 200/409 间漂移。
+            sendJson(res, 200, { id: record.id, action: record.action, cancelled: true, finishedAt: record.finishedAt || null })
+            return
+          }
+          if (record.exitedAt || record.finishedAt) {
+            // exitedAt（Sourcery #229-10）：exit 事件先于 close（stdout/stderr drain 中）
+            // 的窗口里任务已不可取消——以「进程已退出」为准，而不是等 close 落 finishedAt。
+            sendJson(res, 409, { error: '该任务已结束，无需停止' })
             return
           }
           record.cancelled = true
           record.cancelRequestedAt = Date.now()
           record.output += '\n[console] 收到停止请求，正在终止子进程…\n'
+          // Sourcery #229-11：停止留痕进 run.log——被停任务不会有自然收尾的摘要行，
+          // 控制台补一行 ERROR 强失败标记（上海时区戳与写入侧 _localStamp 同形态），
+          // readRunHistory 的新轮界模型把它识别为「尾端失败行 → 崩溃轮占位」，
+          // 重启后运行历史仍能看到这轮被停过。追加失败静默（与写入侧留痕口径一致）。
+          try {
+            const stampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+            const stamp = stampFmt.format(new Date())
+            const stopDir = runtimeCacheDir() || stateDir
+            fs.appendFileSync(path.join(stopDir, 'run.log'), `${stamp} ERROR 控制台停止：任务 #${record.id}（${record.action}）于运行中被停止（SIGTERM）\n`, 'utf8')
+          } catch (e) { /* 留痕失败静默：内存 record.cancelled 已是权威 */ }
           try {
             record._child && record._child.kill('SIGTERM')
           } catch (e) { /* 子进程句柄已失效：close 即将到来，兜底无害 */ }
           // SIGKILL 兜底：宽限期后 close 仍未来（SIGTERM handler 卡住等）→ 强杀。
           // 不依赖 kill 返回值（Node 不保证其反映进程状态）：已死进程上再签 SIGKILL
           // 是无害 no-op，漏签才会让卡死任务挂到 PROC_TIMEOUT_MS。
+          // Sourcery #229-0：close 一到就 clearTimeout——子进程已死后再发的 SIGKILL
+          // 理论上不会命中复用 pid（kill 走句柄不走裸 pid，但句柄在子进程退出后发信号
+          // 本就是无意义动作），清理定时器让事件循环不留 3s 悬挂句。
           const cancelChild = record._child
-          const killer = setTimeout(() => {
+          record._cancelTimer = setTimeout(() => {
             try { cancelChild.kill('SIGKILL') } catch (e) { /* 已退出 */ }
           }, CANCEL_GRACE_MS)
-          if (typeof killer.unref === 'function') killer.unref()
+          if (typeof record._cancelTimer.unref === 'function') record._cancelTimer.unref()
           sendJson(res, 202, { id: record.id, action: record.action, cancelled: true })
         })
         .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
       return
     }
-    const runMatch = /^\/api\/runs\/(\d+)$/.exec(url.pathname)
+    const runMatch = /^\/api\/runs\/(\d{13,}\.\d{1,10})$/.exec(url.pathname)
     if (req.method === 'GET' && runMatch) {
-      const record = runs.get(Number(runMatch[1]))
+      const record = runs.get(runMatch[1])
       if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
       sendJson(res, 200, {
         id: record.id,

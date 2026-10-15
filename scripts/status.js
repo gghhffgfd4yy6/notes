@@ -303,76 +303,91 @@ function runParseExtras (line) {
 
 function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
   const lim = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50
-  const skip = Number.isSafeInteger(before) && before > 0 ? before : 0
-  // [7] 超窗如实标注（readTrends 同款）：文件实际 >1MiB 时更早轮次已被轮转截掉。
-  let truncated = false
-  try {
-    const st = require('node:fs').statSync(path.join(dir, FILES.run))
-    if (st.isFile() && st.size > LOG_MAX_BYTES) truncated = true
-  } catch (e) { /* stat 失败按未截断处理：readText 随后会给出真实状态 */ }
+  // before 游标（Sourcery #229-6 稳定分页）：语义 =「只考虑行号 ≤ before 的行」（1-based）。
+  // 行号身份对 append 天然稳定（新行只追加在文件尾部，既有行号不动），比「条数游标」抗并发
+  // 追加；调用方把上一页最旧条目的 lineNo-1 透传回来（本函数每条目下发 lineNo 行号身份）。
+  // [5] 超窗/轮转如实标注（Sourcery #229-5）：readSafeTextResult 尾读触发即 truncated
+  // （首行可能是半行）；另有写入侧历史上发生过截尾的情形——文件已 ≤1MiB，stat 大小判不出，
+  // 但窗口首行不是「时间戳锚定」形态（首行切在行中，退位算法总保完整字符、半行保不住锚），
+  // 同样判轮转。两者合并报 truncated，前端如实提示「更早轮次已丢失」。
   const read = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
   if (read.status !== 'ok') return { status: read.status, items: [], hasMore: false, truncated: false }
-  // 从尾向前扫（时间倒序天然成立）：摘要行 = 事实轮界；轮内「摘要行之后」的行按
-  // looksLikeRoundFailure 判 interrupted（与 parseLastRun 同口径：ERROR/运行异常）。
+  let truncated = read.truncated === true
   const lines = read.value.split('\n')
+  const maxLine = Number.isSafeInteger(before) && before > 0 ? before : lines.length + 1
+  const first = lines[0] || ''
+  if (!truncated && first.trim() !== '' && !RUN_SUMMARY_LINE_RE.test(first) &&
+      !/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(first)) {
+    truncated = true
+  }
+  // 从尾向前扫（时间倒序天然成立）。轮界模型（Sourcery #229-3/#229-12，按生产写序
+  // xbk_app.js :1684→:1688、:1718）：失败行（ERROR/运行异常）写在其所属摘要行**之前**
+  // （文件序，中间不会有另一条摘要——有即说明失败行属于更晚那轮），失败行归属文件序
+  // 更晚的相邻摘要轮。倒序扫描时失败行在摘要行**之后**才被遇到——遇失败行直接**回填**
+  // 已收集的最近一条摘要（items[0]）的 interrupted=true（若尚未收集任何摘要，说明失败行
+  // 之后/文件尾再无摘要 = 崩溃轮占位 crashPending）。窗口头残余无摘要可回填的失败行
+  // 静默丢弃（其摘要轮已滚出 1MiB 尾窗，归属无法重建）。
   const items = []
-  let skipped = 0
-  for (let i = lines.length - 1; i >= 0 && items.length < lim; i--) {
-    const m = RUN_SUMMARY_LINE_RE.exec(lines[i])
-    if (!m) continue
-    if (skipped < skip) { skipped++; continue }
-    const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
-    if (!counters.every(validInt)) continue
-    const extras = runParseExtras(lines[i])
-    // 摘要行之后的 ERROR/运行异常行属于该轮（生产写序：先摘要后异常，xbk_app.js :1498/:1526）。
-    // 崩溃轮无摘要行：文件尾存在强失败行且其后无摘要 → 追加 interrupted 占位条目。
-    const tail = lines.slice(i + 1)
-    const interrupted = tail.some(looksLikeRoundFailure)
-    if (!interrupted && tail.length > 0) {
-      // 摘要行后有非失败行（ERROR 才算失败，普通 WARN/ALERT 不算）——仍然属于该轮，
-      // 不影响 interrupted 判定，无需特殊处理；这里不 break，继续向更早扫描。
-    }
-    items.push({
-      at: m[1] ? lines[i].slice(0, 19).trim() : '',
-      total: counters[0],
-      dedup: counters[1],
-      filtered: counters[2],
-      truncated: counters[3],
-      pushed: counters[4],
-      failed: counters[5],
-      elapsed: m[8],
-      cachesaved: extras.cachesaved !== null ? extras.cachesaved : null,
-      noidentity: extras.noidentity !== null ? extras.noidentity : null,
-      dryRun: extras.dryRun !== null ? extras.dryRun : null,
-      interrupted
-    })
-  }
-  // 崩溃轮占位：文件尾部存在强失败行、且其位置之后没有任何摘要行（items 为空或首条
-  // 摘要行在失败行之前）→ 该轮没有任何计数数据，用 null 条目如实呈现而非静默丢弃。
-  if (items.length < lim) {
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (RUN_SUMMARY_LINE_RE.exec(lines[i])) break
-      if (looksLikeRoundFailure(lines[i])) {
-        items.push({ at: '', total: null, dedup: null, filtered: null, truncated: null, pushed: null, failed: null, elapsed: '', cachesaved: null, noidentity: null, dryRun: null, interrupted: true })
-        break
+  let crashPending = false // 尾端失败行待发占位（其后无摘要行）
+  let lastLineNo = lines.length + 1 // 本页最旧条目起始行号（初始 = 窗口外哨兵）
+  let summariesSeen = 0
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]
+    if (RUN_SUMMARY_LINE_RE.test(line)) {
+      const lineNo = i + 1 // 1-based 行号（分页游标身份）
+      if (crashPending) {
+        // 尾端失败行的占位轮行号 = 失败行行号 = lineNo+1（失败行在摘要行更早的方向不存在——
+        // 占位行号取「其后无摘要」语义下的失败行自身）。
+        const crashLineNo = lineNo + 1
+        if (crashLineNo <= maxLine && items.length < lim) {
+          items.push({ at: '', total: null, dedup: null, filtered: null, truncated: null, pushed: null, failed: null, elapsed: '', cachesaved: null, noidentity: null, dryRun: null, interrupted: true, lineNo: crashLineNo })
+          lastLineNo = crashLineNo
+        }
+        crashPending = false
       }
+      summariesSeen++
+      const m = RUN_SUMMARY_LINE_RE.exec(line)
+      const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
+      if (lineNo > maxLine || items.length >= lim || !counters.every(validInt)) continue
+      const extras = runParseExtras(line)
+      items.push({
+        at: m[1] ? line.slice(0, 19).trim() : '',
+        total: counters[0],
+        dedup: counters[1],
+        filtered: counters[2],
+        truncated: counters[3],
+        pushed: counters[4],
+        failed: counters[5],
+        elapsed: m[8],
+        cachesaved: extras.cachesaved,
+        noidentity: extras.noidentity,
+        dryRun: extras.dryRun,
+        interrupted: false, // 失败行回填在遇它时进行（文件序在摘要行之前的行后才出现）
+        lineNo
+      })
+      lastLineNo = i + 1
+      continue
+    }
+    if (looksLikeRoundFailure(line)) {
+      if (summariesSeen === 0) crashPending = true // 尾端失败行、其后无摘要轮
+      else if (items.length > 0) items[items.length - 1].interrupted = true
+      // 回填目标 = 最近 push 的摘要（items 尾部）= 倒序扫描中刚处理过的那条 = 失败行
+      // 文件序下一条摘要（相邻原则，Sourcery #229-3）。items 为空但 summariesSeen>0：
+      // 摘要行都在 maxLine 之外（翻页跳过）——失败行归属的摘要轮不在本页，无处回填，
+      // 静默丢弃（数据仍在，翻页可查）。
     }
   }
-  // hasMore：尾窗内还有更早摘要未下发（before 游标还有下一页）。
+  // 扫描到窗口头仍有待发占位（整个窗口只有失败行、零摘要）：占位轮是最早条目。
+  if (crashPending && items.length < lim && maxLine >= 1) {
+    items.push({ at: '', total: null, dedup: null, filtered: null, truncated: null, pushed: null, failed: null, elapsed: '', cachesaved: null, noidentity: null, dryRun: null, interrupted: true, lineNo: 1 })
+    lastLineNo = 1
+  }
+  // hasMore（Sourcery #229-6）：本页最旧条目行号之前还有摘要行 ⇒ 还有下一页。
   let hasMore = false
-  if (items.length > 0) {
-    for (let i = 0; i < lines.length; i++) {
-      if (RUN_SUMMARY_LINE_RE.exec(lines[i])) { hasMore = skip + items.length < countSummaryLines(lines); break }
-    }
+  for (let i = 0; i < lastLineNo - 1 && i < lines.length; i++) {
+    if (RUN_SUMMARY_LINE_RE.test(lines[i])) { hasMore = true; break }
   }
   return { status: 'ok', items, hasMore, truncated }
-}
-
-// 尾窗内摘要行总数（readRunHistory 的 hasMore 判定辅助；逐行 count，无正则回溯面）。
-function countSummaryLines (lines) {
-  let n = 0
-  for (const line of lines) if (RUN_SUMMARY_LINE_RE.exec(line)) n++
-  return n
 }
 
 // push.json（判重缓存主存 = 已推送消息记录）的轻量读取校验：条目必须是带 id/title 的对象。
