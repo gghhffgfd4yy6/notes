@@ -641,7 +641,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       if (read.status !== 'ok') {
         // missing = 缓存还没建（首轮未跑）；invalid/tooLarge = 数据坏了/过大——
         // 三态如实下发，前端按 partTone 同口径显示，不伪装成「暂无记录」。
-        sendJson(res, 200, { status: read.status, total: 0, page: 1, pageSize: 0, items: [], categories: [] })
+        // cacheDirHint：本页固定读 stateDir（与 /api/status、run.log 同源，XBK_CACHE_DIR 可改）；
+        // 运行侧 Config.cache.dir 指到别处时，推送缓存不在这里——把两边目录都告诉运维（审查 Sourcery PR#227）。
+        sendJson(res, 200, {
+          status: read.status,
+          total: 0,
+          page: 1,
+          pageSize: 0,
+          items: [],
+          categories: [],
+          cacheDirHint: stateDir
+        })
         return
       }
       const q = url.searchParams
@@ -656,8 +666,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 过滤：分类精确匹配 + 关键词子串（title / content，大小写不敏感的 ASCII 归一）。
       // 用 includes 而非正则（用户输入直接进正则有 ReDoS 面，本仓正则防护红线）。
       const cate = typeof q.get('cate') === 'string' ? q.get('cate') : ''
+      // 超长 query 按 UTF-8 字节截断（而非清空）：清空会让前端仍显示原词、结果却未过滤，
+      // 造成「搜了等于没搜」的假象（审查 Sourcery PR#227）。截断后用截断值过滤并回显 queryUsed。
+      // （中文按字符截到字节边界：从尾部丢弃不完整多字节序列。）
       let query = typeof q.get('q') === 'string' ? q.get('q').trim() : ''
-      if (Buffer.byteLength(query, 'utf8') > MESSAGES_QUERY_MAX_BYTES) query = ''
+      while (Buffer.byteLength(query, 'utf8') > MESSAGES_QUERY_MAX_BYTES) query = query.slice(0, -1)
       const needle = query.length > 0 ? query.toLowerCase() : ''
       let items = read.value.items
       if (cate.length > 0) {
@@ -672,10 +685,19 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 列表给 title/content 摘要 + 元数据；详情字段由前端展开 content 全文。
       const total = items.length
       const start = (page - 1) * size
-      const pageItems = items.slice(start, start + size).map((m) => ({
+      // rowKey：无 id 条目用数组下标合成（与 readMessages 的排序后位置一致——排序稳定，
+      // slice 后下标 = 原数组下标）。前端行键/展开用它，匿名条目不再联动。
+      const pageItems = items.slice(start, start + size).map((m, i) => ({
         id: typeof m.id === 'number' || typeof m.id === 'string' ? m.id : '',
+        // rowKey：readMessages 按「原始数组下标」合成的稳定行键（与 keys 数组对齐取）。
+        // 排序/分页不改变键；无 id 的匿名条目也不再共用 '' 导致展开联动。
+        rowKey: read.value.keys[start + i] !== undefined
+          ? read.value.keys[start + i]
+          : String(m.id !== undefined && m.id !== null ? m.id : `idx-${start + i}`),
         title: typeof m.title === 'string' ? m.title : '',
-        content: typeof m.content === 'string' ? m.content.slice(0, 500) : '',
+        // content 全文下发（前端列表自行截断显示）：列表只有 ≤100 条，截到 500 反而让
+        // 「展开正文」读不到全文（审查 Sourcery PR#227）。
+        content: typeof m.content === 'string' ? m.content : '',
         datetime: typeof m.datetime === 'string' ? m.datetime : '',
         shorttime: typeof m.shorttime === 'string' ? m.shorttime : '',
         shijianchuo: typeof m.shijianchuo === 'number' ? m.shijianchuo : null,
@@ -692,6 +714,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         pages: Math.max(1, Math.ceil(total / size)),
         grandTotal: read.value.total,
         skipped: read.value.skipped,
+        // queryUsed：超限截断后实际生效的搜索词（前端据此回显，避免「显示原词、结果未过滤」）
+        queryUsed: query,
         categories: read.value.categories,
         items: pageItems
       })
@@ -705,7 +729,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sendJson(res, 200, { status: t.status, byDay: [] })
         return
       }
-      sendJson(res, 200, { status: 'ok', days: t.value.days, byDay: t.value.byDay })
+      sendJson(res, 200, {
+        status: 'ok',
+        days: t.value.days,
+        byDay: t.value.byDay,
+        // today：Asia/Shanghai 日历日（run.log 时间戳口径），前端「今天」高亮用它；
+        // truncated：run.log 超限只统计了尾部（前端副标题如实注明）
+        today: t.value.today,
+        truncated: t.value.truncated === true
+      })
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/logs') {

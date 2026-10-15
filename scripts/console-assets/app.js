@@ -548,12 +548,16 @@ function RunsPanel ({ runs, pollMs }) {
 function usePanelLoader (apiFn) {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
+  const seqRef = useRef(0) // 竞态守卫：只应用「最新一次 load」的响应（审查 Sourcery PR#227）
   const load = useCallback(async () => {
+    const seq = ++seqRef.current
     try {
       const d = await apiFn()
+      if (seq !== seqRef.current) return // 已有更新的请求，本次响应作废
       setData(d)
       setErr('')
     } catch (e) {
+      if (seq !== seqRef.current) return
       setErr(`加载失败：${e.message}`)
     }
   }, [apiFn])
@@ -567,11 +571,12 @@ function TrendsPanel () {
   const maxPushed = Math.max(1, ...byDay.map((d) => d.pushed))
   const total14 = byDay.reduce((acc, d) => acc + d.pushed, 0)
   const fail14 = byDay.reduce((acc, d) => acc + d.failed, 0)
-  const todayKey = new Date().toISOString().slice(0, 10)
+  // today 由服务端按 Asia/Shanghai 日历日下发（run.log 时间戳口径），浏览器本地时区不再参与
+  const todayKey = trends && trends.today ? trends.today : ''
   return html`<div class="panel">
     <div class="panel-head">
       <span class="panel-title">近 14 日运行趋势</span>
-      <span class="panel-sub">run.log 摘要按日聚合</span>
+      <span class="panel-sub">run.log 摘要按日聚合${trends && trends.truncated ? '（日志超限，仅统计尾部 1 MiB）' : ''}</span>
       <span style="flex:1"></span>
       <button class="btn btn-ghost" onClick=${load}>刷新</button>
     </div>
@@ -592,13 +597,29 @@ function TrendsPanel () {
 
 // 推送记录：搜索（300ms 防抖）+ 分类筛选 + 服务端分页；点标题展开 content 全文。
 // URL 不含 content_html（服务端已裁剪）——CSP 禁外链图，贴文本才是控制台能诚实渲染的形态。
+// 原文链接：相对路径拼站内前缀，绝对 URL 原样；只放行 http/https（其他 scheme 不渲染链接）。
+// href 用函数避免 multiline-ternary（standard 规则）与 XSS scheme 注入（javascript: 等）双重问题。
+function msgHref (u) {
+  if (u.startsWith('http://') || u.startsWith('https://')) return u
+  if (u.startsWith('//')) return `https:${u}`
+  return `https://www.xianbao.fun${u.startsWith('/') ? u : '/' + u}`
+}
+
+function msgLink (m) {
+  if (!(typeof m.url === 'string' && m.url.length > 0)) return ''
+  const title = m.url.startsWith('http') ? `外部链接（来源站点）：${m.url}` : '外部链接（来源站点）'
+  return html`<a class="msg-link" href=${msgHref(m.url)}
+    target="_blank" rel="noopener noreferrer"
+    title=${title}>原文链接 ↗</a>`
+}
+
 function MessagesPanel () {
   const [page, setPage] = useState(1)
   const [size] = useState(20)
   const [cate, setCate] = useState('')
   const [input, setInput] = useState('')
   const [query, setQuery] = useState('')
-  const [expanded, setExpanded] = useState(null) // 展开的条目 id
+  const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
   // 搜索防抖：输入停 300ms 才真正改 query（重置回第 1 页）。
   useEffect(() => {
     const t = setTimeout(() => { setQuery(input.trim()); setPage(1) }, 300)
@@ -611,6 +632,14 @@ function MessagesPanel () {
   useEffect(() => { load().catch(() => {}) }, [load])
   const items = data && Array.isArray(data.items) ? data.items : []
   const categories = data && Array.isArray(data.categories) ? data.categories : []
+  // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，避免「显示原词、结果未过滤」。
+  // 只在 data 变化时对齐（standard 无 react-hooks 插件，不用行内豁免）。
+  useEffect(() => {
+    if (data && typeof data.queryUsed === 'string' && data.queryUsed !== input.trim()) {
+      setInput(data.queryUsed)
+      setQuery(data.queryUsed)
+    }
+  }, [data])
   return html`<div class="panel">
     <div class="panel-head">
       <span class="panel-title">推送记录</span>
@@ -626,23 +655,23 @@ function MessagesPanel () {
       <button class="btn btn-ghost" onClick=${load}>刷新</button>
     </div>
     ${err && html`<div class="hint hint-err">${err}</div>`}
-    ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
+    ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<div class="hint">正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）</div>` : ''}</div>`}
     ${data && data.status === 'ok' && html`<div>
       <div class="msg-count">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}</div>
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
         : html`<div class="msg-list">
-          ${items.map((m) => html`<div class="msg-item" key=${String(m.id) + m.shorttime}>
+          ${items.map((m) => html`<div class="msg-item" key=${m.rowKey}>
             <div class="msg-item-head">
-              <span class="msg-title" onClick=${() => setExpanded(expanded === m.id ? null : m.id)}>${m.title || '（无标题）'}</span>
+              <span class="msg-title" onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}>${m.title || '（无标题）'}</span>
               ${m.price !== null ? html`<span class="msg-price">¥${m.price}</span>` : ''}
             </div>
             <div class="msg-meta">
               <span class="msg-cate">${m.catename}</span>
               <span class="mono">${m.datetime} ${m.shorttime}</span>
-              ${m.url && m.url.length > 0 ? html`<a class="msg-link" href=${m.url.startsWith('http') ? m.url : `https://www.xianbao.fun${m.url}`} target="_blank" rel="noopener noreferrer">原文链接 ↗</a>` : ''}
+              ${msgLink(m)}
             </div>
-            ${expanded === m.id && html`<div class="msg-content">${m.content || '（无正文）'}</div>`}
+            ${expanded === m.rowKey && html`<div class="msg-content">${m.content || '（无正文）'}</div>`}
           </div>`)}
         </div>`}
       <div class="pager">

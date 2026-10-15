@@ -15,6 +15,14 @@ function result (status, value) {
   return { status, ...(value === undefined ? {} : { value }) }
 }
 
+// 上海日历日（YYYY-MM-DD）：run.log 的时间戳由生产侧 _localStamp 固定按 Asia/Shanghai 写，
+// 趋势窗口/输出键必须用同一日历日，否则宿主为 UTC（本机就是）时每天 00:00–08:00 的轮次
+// 会被算进前一天/后一天（审查 Sourcery PR#227）。fixed offset +8：上海无夏令时，恒定偏移安全。
+const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000
+function shanghaiDayKey (ms) {
+  return new Date(ms + SHANGHAI_OFFSET_MS).toISOString().slice(0, 10)
+}
+
 // 日志类部件（run.log / filter-diagnostics.ndjson）的读取上限与取尾部选项（审查 SS-03）。
 // 上限与写入侧 xbk_app 的截尾阈值同为 1 MiB，但写入侧在拿不到日志锁时是 fail-open（只追加、
 // 不截尾），文件可以真正超过 1 MiB；旧行为对超限文件一律返回 tooLarge，于是「最近一轮」「过滤诊断」
@@ -214,11 +222,16 @@ function validInt (v) { return Number.isSafeInteger(v) && v >= 0 }
 // 近 N 日运行趋势：摘要行按本地日期（YYYY-MM-DD）聚合。文件缺失/不可读返回 { status }，
 // 与 readStatus 部件三态（missing/ok/invalid）一致，前端沿用 partTone 归类。
 function readTrends (dir, { now = Date.now(), days = 14 } = {}) {
+  // [7] 日志超限读尾部时如实标注：readSafeTextResult 对 tail 读不报截断，这里以「文件实际大于
+  // 读取上限」判定。窗口内的更早摘要若被截掉，趋势只反映尾部日志——前端副标题会注明。
+  let truncated = false
+  try {
+    const st = require('node:fs').statSync(path.join(dir, FILES.run))
+    if (st.isFile() && st.size > LOG_MAX_BYTES) truncated = true
+  } catch (e) { /* stat 失败按未截断处理：readText 随后会给出真实状态 */ }
   const read = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
   if (read.status !== 'ok') return { status: read.status }
-  const horizon = new Date(now)
-  horizon.setDate(horizon.getDate() - (days - 1))
-  const horizonKey = horizon.toISOString().slice(0, 10)
+  const horizonKey = shanghaiDayKey(now - (days - 1) * 86400000)
   const byDay = new Map()
   const lines = read.value.split('\n')
   for (const line of lines) {
@@ -244,12 +257,10 @@ function readTrends (dir, { now = Date.now(), days = 14 } = {}) {
   // 输出按日期升序补零：没有记录的日期也给全 0 行，前端画图不用补洞。
   const out = []
   for (let i = 0; i < days; i++) {
-    const d = new Date(now)
-    d.setDate(d.getDate() - (days - 1 - i))
-    const key = d.toISOString().slice(0, 10)
+    const key = shanghaiDayKey(now - (days - 1 - i) * 86400000)
     out.push(byDay.get(key) || { date: key, rounds: 0, total: 0, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 0 })
   }
-  return result('ok', { days, byDay: out })
+  return result('ok', { days, byDay: out, truncated, today: shanghaiDayKey(now) })
 }
 
 // push.json（判重缓存主存 = 已推送消息记录）的轻量读取校验：条目必须是带 id/title 的对象。
@@ -269,15 +280,27 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024 } = {}) {
   let parsed
   try { parsed = JSON.parse(read.value) } catch (error) { return result('invalid') }
   if (!Array.isArray(parsed)) return result('invalid')
-  const items = []
+  const pairs = [] // [entry, rowKey] 绑定排序：键取「原始 parsed 下标」（push.json 只追加不重排，
+  // 追加序才是稳定身份；用排序后下标会在新条目插入时整体推移，前端展开状态随之错位）
   let skipped = 0
-  for (const entry of parsed) {
-    if (validMessageEntry(entry)) items.push(entry)
-    else skipped += 1
+  for (let i = 0; i < parsed.length; i++) {
+    const entry = parsed[i]
+    // _f 条目是「被过滤、从未推送」的记录（MessageStore 约定），不是推送历史的一部分——
+    // 控制台页面是「已推送记录」，混入会让分类计数与历史失真（审查 Sourcery PR#227）。
+    if (entry && typeof entry === 'object' && entry._f === true) continue
+    if (validMessageEntry(entry)) {
+      pairs.push([entry, (typeof entry.id === 'string' && entry.id.length > 0) || typeof entry.id === 'number'
+        ? String(entry.id)
+        : `idx-${i}`])
+    } else {
+      skipped += 1
+    }
   }
   // 时间倒序：shijianchuo（秒）优先，缺失/非法的排最后并按原顺序稳定保留。
-  const tsOf = (m) => (validInt(m.shijianchuo) ? m.shijianchuo : -1)
-  items.sort((a, b) => tsOf(b) - tsOf(a))
+  const tsOf = (pair) => (validInt(pair[0].shijianchuo) ? pair[0].shijianchuo : -1)
+  pairs.sort((a, b) => tsOf(b) - tsOf(a))
+  const items = pairs.map((p) => p[0])
+  const keys = pairs.map((p) => p[1])
   // 分类汇总（按条数倒序）：前端筛选下拉直接用。
   const cateCount = new Map()
   for (const m of items) {
@@ -285,7 +308,7 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024 } = {}) {
     cateCount.set(name, (cateCount.get(name) || 0) + 1)
   }
   const categories = [...cateCount.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }))
-  return result('ok', { total: items.length, items, categories, skipped })
+  return result('ok', { total: items.length, items, keys, categories, skipped })
 }
 
 module.exports = { readStatus, formatStatus, readTrends, readMessages, RUN_SUMMARY_LINE_RE }
