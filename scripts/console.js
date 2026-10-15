@@ -122,9 +122,10 @@ const CACHE_HEALTH_NEAR_RATIO = 0.8
 // 已有时序上更全的 run.log 留痕体系（蓝图 §3.3）。
 const ACCESS_LOG_MAX = 200
 // token 清洗正则：服务端常量、无用户输入参与构造（红线允许形态，先例 BEARER_PREFIX/
-// sessionCookieValue 的手写解析同源纪律）。([?&]) 捕获保留分隔符：
-// /?token=a → /?token=***（查询串形状不破坏）；[^&]* 线性无回溯。
-const ACCESS_TOKEN_RE = /([?&])token=[^&]*/g
+// sessionCookieValue 的手写解析同源纪律）。([?&;#]) 捕获保留分隔符：
+// /?token=a → /?token=***（查询串形状不破坏）；键名大小写不敏感（Token=/TOKEN= 同洗——
+// 「token 不进日志」不依赖键名大小写，审查 3.3-M1）；[^&;#]* 线性无回溯。
+const ACCESS_TOKEN_RE = /([?&;#])[Tt][Oo][Kk][Ee][Nn]=[^&;#]*/g
 // 详情轮询路径形态：与 /api/runs/:id 的 runMatch 同形的服务端常量正则
 // （D4 定夺的降噪对象：GET /api/runs/<epoch.seq> 2xx 不记）。
 const RUN_DETAIL_PATH_RE = /^\/api\/runs\/\d{13,}\.\d{1,10}$/
@@ -1313,6 +1314,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (format === 'json') {
             // 仅截断时下发该头；未截断不下发（缺席=完整，测试断言 undefined）。
             if (truncated) res.setHeader('X-Export-Truncated', 'true')
+            // grandTotal 此处=过滤后总数；/api/messages 同名字段=未过滤总数（read.value.total）
+            // ——同名两义，前端「共 N 条」展示只能用 /api/messages 的响应（审查 3.2-N2）。
             sendJson(res, 200, { status: 'ok', total: rows.length, grandTotal: filtered.length, truncated, items: rows })
             return
           }

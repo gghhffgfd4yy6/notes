@@ -889,7 +889,7 @@ function MessagesPanel () {
         setExportErr(`记录暂不可导出（${status}）`)
         return
       }
-      if (res.headers.get('x-export-truncated') === 'true') setExportNote('匹配结果超过 5000 条，导出已截断')
+      if (res.headers.get('x-export-truncated') === 'true') setExportNote('匹配结果超过上限，导出已截断')
       url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
@@ -1029,7 +1029,7 @@ function SysPanel () {
     ${access && access.items && access.items.length === 0 && html`<div class="empty">暂无访问记录（轮询端点与静态资产的成功请求不记入）</div>`}
     ${logTail.length > 0 && html`<details class="access-log"><summary>最近访问记录（最多 20 条，新在上）</summary>
       <table class="sys-table"><tbody>
-        ${logTail.map((it) => html`<tr key=${`${it.at}|${it.method}|${it.path}|${it.status}|${it.ms}`}><td>${it.at}</td><td>${it.method} ${it.path} → ${it.status} · ${it.ms}ms</td></tr>`)}
+        ${logTail.map((it, i) => html`<tr key=${`${i}|${it.at}|${it.method}|${it.path}|${it.status}|${it.ms}`}><td>${it.at}</td><td>${it.method} ${it.path} → ${it.status} · ${it.ms}ms</td></tr>`)}
       </tbody></table>
     </details>`}
     <div class="hint" style="margin-top:12px">数据说明：推送记录来自判重缓存 push.json（服务端已裁剪正文 HTML）；趋势解析 run.log 摘要行；日志取尾部 1 MiB。</div>

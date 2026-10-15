@@ -25,6 +25,10 @@ const {
   filterMessageItems, clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS
 } = require('./scripts/console')
+const { readMessages } = require('./scripts/status')
+// 导出端点的读取上限（console.js 内部常量，与 MESSAGES_MAX_BYTES 同值）：
+// MI2 tooLarge 用例按同一口径构造超限 fixture。
+const MESSAGES_MAX_BYTES = 32 * 1024 * 1024
 
 let passed = 0
 let failed = 0
@@ -343,6 +347,14 @@ ok('sanitizeAccessPath: token 脱敏不动点 + 解码复洗 2 轮（蓝图 §3.
   assert.ok(!sanitizeAccessPath('/x?%2574oken=z4').includes('z4'), '原文不得残留')
   // 畸形 % 序列（URIError）→ 原串（已洗）兜底，不抛
   assert.strictEqual(sanitizeAccessPath('/x?aa=%zz'), '/x?aa=%zz')
+  // 键名形态纵深（审查 3.3-M1）：大小写变体与 ;/# 分隔符形态同洗（键名在输出中统一为
+  // 小写 token=*** ——替换字面量形态，与 %74oken= 既有口径一致）；普通含 ;-# 路径不误伤
+  assert.strictEqual(sanitizeAccessPath('/x?Token=k1'), '/x?token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?TOKEN=k1'), '/x?token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?a=1;token=k1'), '/x?a=1;token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?frag#token=k1'), '/x?frag#token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?%54oken=k1'), '/x?token=***', '编码键名 %54oken= 解码为 Token= 后复洗')
+  assert.strictEqual(sanitizeAccessPath('/x?a;1&b#2'), '/x?a;1&b#2', '无 token 的 ;/# 路径原样（不误伤）')
   // null → ''；无 % 无 token 的普通路径原样
   assert.strictEqual(sanitizeAccessPath(null), '')
   assert.strictEqual(sanitizeAccessPath('/plain'), '/plain')
@@ -359,6 +371,8 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
     [['GET', '/assets/app.css', 200], false],
     [['GET', '/', 200], false],
     [['GET', '/api/access-log', 200], true],
+    [['POST', '/api/messages/export', 200], true],
+    [['POST', '/messages/export', 400], true],
     [['POST', '/trigger', 202], true]
   ]
   for (const [args, want] of cases) {
@@ -846,9 +860,14 @@ async function main () {
     assert.strictEqual(small.truncated, false)
     const smallRes = await request(port2, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
     assert.strictEqual(smallRes.headers['x-export-truncated'], undefined, '未截断时头缺席（缺席=完整）')
-    // 展示分页与导出钳制互不干扰：同 fixture GET 仍钳 100
-    const page = JSON.parse((await request(port2, 'GET', '/api/messages?size=100', { token: TOKEN })).text)
-    assert.ok(page.items.length <= 100)
+    // 展示分页与导出钳制互不干扰（审查 3.2-MI1）：对 5010 条 fixture（同一 server）断言
+    // size=100 → 恰 100 条且 total=5010——「size 超限被钳回 100」的正向锁，30 条子集断 ≤100 恒真无检出力。
+    const page = JSON.parse((await request(port, 'GET', '/api/messages?size=100', { token: TOKEN })).text)
+    assert.strictEqual(page.items.length, 100, '展示分页 size=100 → 恰 100 条（钳制仍生效）')
+    assert.strictEqual(page.total, 5010, 'total=过滤后全量（与导出 grandTotal 同 fixture 一致）')
+    // 30 条对照（未截断出口的口径不变）：size=100 无钳制效果，仍全量 30 条
+    const page2 = JSON.parse((await request(port2, 'GET', '/api/messages?size=100', { token: TOKEN })).text)
+    assert.strictEqual(page2.items.length, 30)
     s2.close()
     server.close()
   })
@@ -891,8 +910,13 @@ async function main () {
       })
       req.on('error', reject)
       req.write(parts[0])
-      req.write(parts[1])
-      req.end()
+      // 两次 write 间插 10ms（审查 3.2-MA1）：背靠背 write 会被 Node 客户端合并成单 chunk
+      // （分片不存在、新旧实现同绿=假绿）；间隔后服务端稳定收 [15,5] 两个 data 事件，
+      // 旧实现（逐 chunk toString）会产出 U+FFFD，套件对回滚真正变红。
+      // 反向验证实测：5ms 在旧 readBody 副本上仍有 ~9% 合并逃逸（单进程 53 次中 5 次旧实现照绿），
+      // 10ms 跨单进程/进程内两形态 55 次 0 逃逸；对正确实现 [15,5]/[20] 都命中 牛奶特价，
+      // 加长间隔无假红代价。用链式回调（Promise 构造回调非 async）。
+      setTimeout(() => { req.write(parts[1]); req.end() }, 10)
     })
     assert.strictEqual(body.status, 200)
     const j = JSON.parse(body.text)
@@ -937,7 +961,7 @@ async function main () {
     }
     server.close()
   })
-  await aok('T8 读取三态: missing/invalid → 200 + application/json + items 空（前端不下载判据）', async () => {
+  await aok('T8 读取三态: missing/invalid/tooLarge → 200 + application/json + items 空（前端不下载判据）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
     const missing = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
@@ -955,7 +979,25 @@ async function main () {
     assert.strictEqual(invalid.status, 200)
     assert.ok(invalid.headers['content-type'].startsWith('application/json'), 'CSV 请求的三态同样走 JSON 提示（不下载空文件）')
     assert.strictEqual(JSON.parse(invalid.text).status, 'invalid')
+    // 附件出口入日志（蓝图 §3.2 防线 5 + §3.3 测试清单末条；审查 3.2-MA2 / 3.3-M2）：
+    // 导出响应走 res.writeHead+end 附件出口（非 sendJson），finish 钩子必须同样覆盖。
+    // shouldLogAccess 白名单无此端点 → 200 也照记；path 无查询词、body 不入。
+    const exLog = JSON.parse((await request(port2, 'GET', '/api/access-log', { token: TOKEN })).text)
+    const exHit = [...exLog.items].reverse().find((it) => it.path === '/api/messages/export')
+    assert.ok(exHit, `导出响应必须入访问日志（实际 ${JSON.stringify(exLog.items.map((i) => i.path))}）`)
+    assert.strictEqual(exHit.method, 'POST')
+    assert.strictEqual(exHit.status, 200)
+    const exFlat = JSON.stringify(exLog.items)
+    assert.ok(!exFlat.includes('format=csv'), 'body/查询词不落访问日志（只记 method+path）')
     s2.close()
+    // 第三态 tooLarge（审查 3.2-MI2）：push.json > 32MiB 时 readMessages 返回 {status:'tooLarge'}，
+    // export 端点与 missing/invalid 共用同一 `read.status !== 'ok'` 分支如实下发。不必真拉起
+    // HTTP 再发 32MiB——直接单测 readMessages（同函数、同 maxBytes 口径）锁定第三态存在。
+    const dirBig = tmpDir()
+    fs.writeFileSync(path.join(dirBig, 'push.json'), Buffer.alloc(MESSAGES_MAX_BYTES + 1, 0x61))
+    const readBig = readMessages(dirBig, { maxBytes: MESSAGES_MAX_BYTES, filename: 'push.json' })
+    assert.deepStrictEqual(readBig, { status: 'tooLarge' }, '>32MiB → tooLarge（不 ok、不 invalid）')
+    fs.rmSync(dirBig, { recursive: true, force: true })
   })
   await aok('T9 body 超限 → 400（>4096 字节，与 detail 同款断言）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -1629,7 +1671,7 @@ async function main () {
     assert.ok(hit, `必须存在 path === '/api/nope?token=***' 的条目（items=${JSON.stringify(log.items.map((i) => i.path))}）`)
     assert.strictEqual(hit.status, 401)
     assert.ok(!JSON.stringify(log.items).includes(FAKE), 'token 原文在响应体零出现（深断言）')
-    assert.ok(log.unauthorizedCount >= 1, 'unauthorizedCount >= 1')
+    assert.strictEqual(log.unauthorizedCount, 1, '独立 server 全程仅此一次 401（N1 收紧）')
     server.close()
   })
   await aok('访问日志: 逃逸形态全 ***（重复参数 + %74oken 编码键名）', async () => {
@@ -1707,9 +1749,10 @@ async function main () {
     const cancel = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1750000000000.9' })
     assert.strictEqual(cancel.status, 503)
     const log = await fetchLog(port)
-    const paths = log.items.map((it) => `${it.method} ${it.path} ${it.status}`)
-    for (const quiet of ['/api/status', '/api/runs', '/ ', '/assets/app.css', '/api/runs/1750000000000.9', '/api/runs/detail']) {
-      assert.ok(!log.items.some((it) => it.path === quiet.trim().split(' ').pop() || it.path === quiet.trim()), `白名单 2xx 不得入日志：${quiet}（实际 ${paths.join(' | ')}）`)
+    const paths = log.items.map((it) => it.path)
+    // 白名单六路径逐一精确断言（N2：改为直接 path 数组，替代 trim/split 间接写法）
+    for (const quiet of ['/api/status', '/api/runs', '/', '/assets/app.css', '/api/runs/1750000000000.9', '/api/runs/detail']) {
+      assert.ok(!paths.includes(quiet), `白名单 2xx 不得入日志：${quiet}（实际 ${paths.join(' | ')}）`)
     }
     assert.ok(log.items.some((it) => it.status === 404 && it.path.includes('/api/nope-x')), '404 必须入日志')
     assert.ok(log.items.some((it) => it.status === 503 && it.path.includes('/api/runs/cancel')), '503（cancel 出口）必须入日志')
