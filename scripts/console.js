@@ -88,6 +88,16 @@ const MESSAGES_PAGE_MAX = 10000
 // 搜索词长度上限（字节）：UTF-8 下 240 字节足够容纳 80 个汉字，防止超长 query 白耗 CPU。
 const MESSAGES_QUERY_MAX_BYTES = 240
 
+// ── v3.300 批次③ 3.2 消息导出常量 ───────────────────────────────────────────
+// 单次导出行数上限：超出即截断 + 响应头 X-Export-Truncated: true 如实披露。
+const EXPORT_MAX_ROWS = 5000
+// 内容摘要截断宽度（JS 码元）：与 xbk_app.js:293 告警原因 .slice(0, 200) 同口径。
+const EXPORT_EXCERPT_MAX = 200
+// format 白名单：String 等值 includes，不进正则（用户输入不进正则红线）。
+const EXPORT_FORMATS = Object.freeze(['csv', 'json'])
+// CSV 表头（固定字面量；查询词绝不进文件名/表头）。
+const EXPORT_CSV_HEADER = Object.freeze(['id', '时间', '分类', '标题', '内容摘要'])
+
 // ── v3.298 只读扩展常量 ─────────────────────────────────────────────────────
 // 取消宽限期：SIGTERM 后等子进程退出的时长，超时 SIGKILL 兜底（v3.299 批次②）。
 // 单轮入口子进程未装 SIGTERM handler，实际近即时退出；宽限只为兼容未来 handler。
@@ -649,19 +659,90 @@ function sendJson (res, code, obj) {
 
 function readBody (req, maxBytes = 4096) {
   return new Promise((resolve) => {
+    const decoder = new StringDecoder('utf8')
     let buf = ''
     let over = false
     let aborted = false
     req.on('data', (c) => {
       if (over) { req.destroy(); return } // Sourcery Medium：超限即断流，不再吸收内存
-      buf += c.toString('utf8')
+      buf += decoder.write(c)
       if (buf.length > maxBytes) over = true
     })
-    req.on('end', () => resolve({ body: buf, over, aborted }))
+    req.on('end', () => resolve({ body: buf + decoder.end(), over, aborted }))
     // Sourcery Medium：error 时标记 aborted——残缺 body 不允许触发动作。
     req.on('error', () => { aborted = true; resolve({ body: buf, over, aborted }) })
     req.on('aborted', () => { aborted = true; resolve({ body: buf, over, aborted }) })
   })
+}
+
+// 超长 query 按 UTF-8 字节从尾截断（中文按字符截到字节边界）——/api/messages 与
+// /api/messages/export 共用同一钳制口径，防两端「截断后搜的词不一样」。
+function clampQueryBytes (query) {
+  while (Buffer.byteLength(query, 'utf8') > MESSAGES_QUERY_MAX_BYTES) query = query.slice(0, -1)
+  return query
+}
+
+// 消息过滤谓词（v3.300 3.2 从 /api/messages 抽出，两处复用——变异测试只打一处）。
+// cate 精确等值（'(未分类)' 归一，与列表端点两处口径一致）；needle 为已 trim+toLowerCase 的
+// 子串（title/content 双字段）。q/cate 全程不进正则（ReDoS 红线）：只用 includes 与 String 等值。
+function filterMessageItems (items, cate, needle) {
+  let out = items
+  if (cate.length > 0) {
+    out = out.filter((m) => (typeof m.catename === 'string' && m.catename.length > 0 ? m.catename : '(未分类)') === cate)
+  }
+  if (needle.length > 0) {
+    out = out.filter((m) =>
+      (typeof m.title === 'string' && m.title.toLowerCase().includes(needle)) ||
+      (typeof m.content === 'string' && m.content.toLowerCase().includes(needle)))
+  }
+  return out
+}
+
+// CSV 单元格转义（CWE-1236 防公式注入）。顺序定夺：①中性化（内容层）在前、②引号包裹（传输层）在后。
+// 理由：RFC 4180 的引号包裹是解析器会撤销的传输编码，电子表格求值发生在解析之后——中性化必须
+// 作用于「解析后的内容」，故先对原始值做，再包裹；若先包裹，被包裹单元格首字符恒为 "，首字符
+// 判定失真。Excel/Sheets 惯例：前置 '（text prefix）使其后内容按文本求值。
+// ① 公式中性化：跳过 spreadsheet 求值忽略的前导字符（空格/\t/\r/\n/'）找到首个有效字符，
+//    命中 = + - @ \t 即整体前置 '（前缀字符本身保留，不删数据）。
+// ② RFC 4180 引号包裹：含 " , \r \n 任一即整体用 " 包裹、内部 " 翻倍；CR/LF 留在引号内
+//    （RFC 4180 §2.6 标准转义，Excel/Sheets 正确解析；这是「CRLF 转义」的落实形态）。
+function csvCell (value) {
+  let s = value === undefined || value === null ? '' : String(value)
+  let i = 0
+  while (i < s.length && (s[i] === ' ' || s[i] === '\t' || s[i] === '\r' || s[i] === '\n' || s[i] === "'")) i++
+  if (i < s.length) {
+    const c = s[i]
+    if (c === '=' || c === '+' || c === '-' || c === '@' || c === '\t') s = "'" + s
+  }
+  if (s.includes('"') || s.includes(',') || s.includes('\r') || s.includes('\n')) {
+    return '"' + s.replace(/"/g, '""') + '"'
+  }
+  return s
+}
+
+// 导出行白名单映射（v3.300 3.2）：id/time/cate/title/excerpt 五字段，绝不透传原始条目对象
+// （readMessages 返回的 items 是未裁剪条目，url/price/cateid/content_html/判重身份一律不带走）。
+function exportRowOf (m) {
+  return {
+    // id：number|string → String；缺失回 ''（与 /api/messages 下发裁剪口径一致）
+    id: typeof m.id === 'number' || typeof m.id === 'string' ? String(m.id) : '',
+    // time：datetime + shorttime 拼接（页面展示口径）；两端 trim，双缺省得 ''
+    time: `${typeof m.datetime === 'string' ? m.datetime : ''} ${typeof m.shorttime === 'string' ? m.shorttime : ''}`.trim(),
+    // cate：'(未分类)' 归一（与列表端点一致）
+    cate: typeof m.catename === 'string' && m.catename.length > 0 ? m.catename : '(未分类)',
+    title: typeof m.title === 'string' ? m.title : '',
+    // 内容摘要：200 码元截断（xbk_app.js:293 先例口径；蓝图未要求字节级更严）
+    excerpt: typeof m.content === 'string' ? m.content.slice(0, EXPORT_EXCERPT_MAX) : ''
+  }
+}
+
+// CSV 装配：表头 + 数据行，行分隔 \r\n（RFC 4180），尾行也带 \r\n（确定性输出便于测试全串比对）。
+function buildMessagesCsv (rows) {
+  const lines = [EXPORT_CSV_HEADER.map(csvCell).join(',')]
+  for (const r of rows) {
+    lines.push([r.id, r.time, r.cate, r.title, r.excerpt].map(csvCell).join(','))
+  }
+  return lines.join('\r\n') + '\r\n'
 }
 
 function parseAction (body) {
@@ -1157,17 +1238,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 造成「搜了等于没搜」的假象（审查 Sourcery PR#227）。截断后用截断值过滤并回显 queryUsed。
       // （中文按字符截到字节边界：从尾部丢弃不完整多字节序列。）
       let query = typeof q.get('q') === 'string' ? q.get('q').trim() : ''
-      while (Buffer.byteLength(query, 'utf8') > MESSAGES_QUERY_MAX_BYTES) query = query.slice(0, -1)
+      query = clampQueryBytes(query)
       const needle = query.length > 0 ? query.toLowerCase() : ''
-      let items = read.value.items
-      if (cate.length > 0) {
-        items = items.filter((m) => (typeof m.catename === 'string' && m.catename.length > 0 ? m.catename : '(未分类)') === cate)
-      }
-      if (needle.length > 0) {
-        items = items.filter((m) =>
-          (typeof m.title === 'string' && m.title.toLowerCase().includes(needle)) ||
-          (typeof m.content === 'string' && m.content.toLowerCase().includes(needle)))
-      }
+      const items = filterMessageItems(read.value.items, cate, needle)
       // 下发字段裁剪：content_html 不出（体积大且含外链 img，CSP 下也渲染不了）；
       // 列表给 title/content 摘要 + 元数据；详情字段由前端展开 content 全文。
       const total = items.length
@@ -1208,6 +1281,52 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         categories: read.value.categories,
         items: pageItems
       })
+      return
+    }
+    // POST /api/messages/export（v3.300 批次③ 3.2）：推送记录导出下载。body:
+    // format=csv|json&cate=&q=（URLSearchParams；与 /api/runs/detail 同款 POST+body 形态
+    // ——fetch 字面量红线 + 筛选词不落访问日志 URL）。page/size 参数按蓝图签名容忍存在但
+    // 刻意不读取：导出=筛选结果全量（展示分页是另一口径，蓝图明说「不走 page-size 钳制」；
+    // 若按起点偏移切片，「截断到 5000」的 X-Export-Truncated 判据将失去唯一参照）。
+    // 无 shuttingDown 闸（定夺见规划 §2.1）：与 /api/runs/detail 同为纯读 POST，detail 无此闸。
+    if (req.method === 'POST' && url.pathname === '/api/messages/export') {
+      readBody(req)
+        .then(({ body, aborted, over }) => {
+          if (aborted || over) { sendJson(res, 400, { error: '请求中断或超限' }); return }
+          const params = new URLSearchParams(body)
+          const format = params.get('format')
+          if (!EXPORT_FORMATS.includes(format)) { sendJson(res, 400, { error: 'format 必须是 csv 或 json' }); return }
+          const cate = typeof params.get('cate') === 'string' ? params.get('cate') : ''
+          const query = clampQueryBytes(typeof params.get('q') === 'string' ? params.get('q').trim() : '')
+          const needle = query.length > 0 ? query.toLowerCase() : ''
+          const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES, filename: messagesFile })
+          if (read.status !== 'ok') {
+            // missing/invalid/tooLarge 三态如实下发（与 /api/messages 同形态同哲学）：
+            // 不伪装成空 CSV/空 JSON 让用户导出「成功却没数据」的文件；前端按 Content-Type 识别
+            // 后展示提示而非下载。
+            sendJson(res, 200, { status: read.status, total: 0, items: [], cacheDirHint: stateDir, cacheFileHint: messagesFile })
+            return
+          }
+          const filtered = filterMessageItems(read.value.items, cate, needle)
+          const truncated = filtered.length > EXPORT_MAX_ROWS
+          const rows = (truncated ? filtered.slice(0, EXPORT_MAX_ROWS) : filtered).map(exportRowOf)
+          if (format === 'json') {
+            // 仅截断时下发该头；未截断不下发（缺席=完整，测试断言 undefined）。
+            if (truncated) res.setHeader('X-Export-Truncated', 'true')
+            sendJson(res, 200, { status: 'ok', total: rows.length, grandTotal: filtered.length, truncated, items: rows })
+            return
+          }
+          const head = {
+            'Content-Type': 'text/csv; charset=utf-8',
+            // 文件名硬编码字面量：查询词可能含 token 形态字符串，绝不回显进头（蓝图防线）。
+            'Content-Disposition': 'attachment; filename="messages-export.csv"'
+          }
+          if (truncated) head['X-Export-Truncated'] = 'true'
+          // BOM EF BB BF：Excel 无 BOM 按本地代码页解析会乱码中文（蓝图硬性要求）。
+          res.writeHead(200, head)
+          res.end(Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(buildMessagesCsv(rows), 'utf8')]))
+        })
+        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/trends') {
@@ -1685,5 +1804,14 @@ module.exports = {
   // v3.300 访问日志：纯函数/常量导出（非 HTTP 单测 + 变异测试可达性）
   sanitizeAccessPath,
   shouldLogAccess,
-  ACCESS_LOG_MAX
+  ACCESS_LOG_MAX,
+  // v3.300 批次③ 3.2 消息导出：纯函数/常量导出（非 HTTP 单测 + 变异测试可达性）
+  filterMessageItems,
+  clampQueryBytes,
+  csvCell,
+  exportRowOf,
+  buildMessagesCsv,
+  EXPORT_MAX_ROWS,
+  EXPORT_EXCERPT_MAX,
+  EXPORT_FORMATS
 }

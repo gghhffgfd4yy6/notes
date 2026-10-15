@@ -21,7 +21,9 @@ const {
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
-  sanitizeAccessPath, shouldLogAccess, ACCESS_LOG_MAX
+  sanitizeAccessPath, shouldLogAccess, ACCESS_LOG_MAX,
+  filterMessageItems, clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
+  EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS
 } = require('./scripts/console')
 
 let passed = 0
@@ -365,6 +367,73 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
   assert.strictEqual(ACCESS_LOG_MAX, 200, '环形上限常量 = 200')
 })
 
+// ── v3.300 批次③ 3.2 消息导出：纯函数（同步，直接 require 新导出）──
+ok('T-P0 导出常量: 5000 行钳制 / 200 码元摘要 / format 白名单冻结', () => {
+  assert.strictEqual(EXPORT_MAX_ROWS, 5000)
+  assert.strictEqual(EXPORT_EXCERPT_MAX, 200)
+  assert.deepStrictEqual(EXPORT_FORMATS, ['csv', 'json'])
+  assert.strictEqual(Object.isFrozen(EXPORT_FORMATS), true, '白名单冻结（防运行期扩表）')
+})
+ok('T-P1 csvCell: 公式中性化 + RFC4180 包裹（先中性化后包裹）', () => {
+  // 中性化：危险首字符（跳过 spreadsheet 忽略的前导字符）前置 '
+  assert.strictEqual(csvCell('=1+1'), "'=1+1")
+  assert.strictEqual(csvCell('  =1+1'), "'  =1+1", '前导空格保留 + 前缀')
+  assert.strictEqual(csvCell('-2件起批'), "'-2件起批")
+  assert.strictEqual(csvCell('+861****8000'), "'+861****8000")
+  assert.strictEqual(csvCell('@SUM(A1:A9)'), "'@SUM(A1:A9)")
+  assert.strictEqual(csvCell(" '=1+1"), "' '=1+1", '含既有 \' 前缀（spreadsheets 忽略 \'，继续判首字符=1 → 整体加前缀，前缀字符保留）')
+  assert.strictEqual(csvCell('正常文本'), '正常文本', '安全文本原样')
+  assert.strictEqual(csvCell(''), '')
+  assert.strictEqual(csvCell(null), '')
+  assert.strictEqual(csvCell(undefined), '')
+  assert.strictEqual(csvCell('   '), '   ', '纯空白原样（无有效首字符）')
+  // 包裹：含 " , \r \n 任一即整体包裹、内部 " 翻倍
+  assert.strictEqual(csvCell('a,b'), '"a,b"')
+  assert.strictEqual(csvCell('a"b'), '"a""b"')
+  assert.strictEqual(csvCell('a\nb'), '"a\nb"', 'LF 留在引号内')
+  assert.strictEqual(csvCell('a\rb'), '"a\rb"', 'CR 留在引号内')
+  // 中性化与包裹叠加：先加 '（内容层），再因内含 " 包裹（传输层）
+  assert.strictEqual(csvCell('=1+1"x'), '"\'=1+1""x"')
+})
+ok('T-P2 filterMessageItems: cate 精确等值 + needle 双字段大小写不敏感 + 组合', () => {
+  const items = [
+    { title: '牛奶特价', content: '伊利纯牛奶', catename: '好单-日用' },
+    { title: '坐垫', content: 'Cushion 好物', catename: '好单-家用' },
+    { title: '饼干', content: '奥利奥', catename: '' },
+    { title: 'Milk Powder', content: '奶粉', catename: '好单-食品' },
+    { title: '无分类字段', content: 'x' }
+  ]
+  // cate 精确等值 + '(未分类)' 归一（空串与缺失 catename 同归一）
+  assert.deepStrictEqual(filterMessageItems(items, '好单-日用', '').map(m => m.title), ['牛奶特价'])
+  assert.deepStrictEqual(filterMessageItems(items, '(未分类)', '').map(m => m.title), ['饼干', '无分类字段'])
+  // needle 大小写不敏感、title/content 双字段（'伊利纯牛奶'.includes('milk') 为 false——
+  // toLowerCase 只做 ASCII 归一，不转译中文；命中 'milk' 的两条都靠 title 字段）
+  assert.deepStrictEqual(filterMessageItems(items, '', 'milk').map(m => m.title), ['Milk Powder'])
+  assert.deepStrictEqual(filterMessageItems(items, '', 'cushion').map(m => m.title), ['坐垫'])
+  // cate+needle 组合
+  assert.deepStrictEqual(filterMessageItems(items, '好单-食品', 'milk').map(m => m.title), ['Milk Powder'])
+  // 空 cate / 空 needle 直通
+  assert.strictEqual(filterMessageItems(items, '', '').length, 5)
+})
+ok('T-P3 exportRowOf: 五字段白名单 / 缺省回退 / 200 码元截断 / time 拼接 trim', () => {
+  const full = exportRowOf({
+    id: 7,
+    datetime: '2026-10-15',
+    shorttime: '10:00',
+    catename: '好单-日用',
+    title: '标题',
+    content: '正文',
+    price: 12.9,
+    url: '/a/7.html',
+    cateid: '3',
+    shijianchuo: 1000
+  })
+  assert.deepStrictEqual(full, { id: '7', time: '2026-10-15 10:00', cate: '好单-日用', title: '标题', excerpt: '正文' })
+  const missing = exportRowOf({ content: 'x'.repeat(250) })
+  assert.deepStrictEqual(missing, { id: '', time: '', cate: '(未分类)', title: '', excerpt: 'x'.repeat(200) }, 'id 缺失→\'\'; cate 缺失→(未分类); time 双缺省 trim→\'\'; 摘要 200 码元截断')
+  assert.strictEqual(exportRowOf({ id: 'abc' }).id, 'abc', 'string id 原样 String')
+})
+
 // ── HTTP 端到端 ──
 function listen (server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)))
@@ -691,6 +760,210 @@ async function main () {
     const invalid = JSON.parse((await request(port2, 'GET', '/api/messages', { token: TOKEN })).text)
     assert.strictEqual(invalid.status, 'invalid', '坏 JSON 必须 invalid')
     s2.close()
+  })
+  // ── v3.300 批次③ 3.2：POST /api/messages/export 端到端 ──
+  await aok('T1 导出鉴权: 无凭证/错凭证/仅 Cookie → 401（POST 不收 Cookie）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const noAuth = await request(port, 'POST', '/api/messages/export', { body: 'format=json' })
+    assert.strictEqual(noAuth.status, 401)
+    const badAuth = await request(port, 'POST', '/api/messages/export', { token: 'y'.repeat(32), body: 'format=json' })
+    assert.strictEqual(badAuth.status, 401)
+    // 仅 Cookie（POST 不走 Cookie 会话路径，authorize :637 显式排除）
+    const cookieOnly = await request(port, 'POST', '/api/messages/export', { headers: { cookie: `xbk_session=${TOKEN}` }, body: 'format=json' })
+    assert.strictEqual(cookieOnly.status, 401, 'POST 不得凭 Cookie 放行')
+    server.close()
+  })
+  await aok('T2 format 白名单: xml/缺省 → 400；GET 同路径 → 404 兜底', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const xml = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=xml' })
+    assert.strictEqual(xml.status, 400)
+    const noFmt = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'cate=' })
+    assert.strictEqual(noFmt.status, 400, '缺 format 必须 400')
+    const get = await request(port, 'GET', '/api/messages/export', { token: TOKEN })
+    assert.strictEqual(get.status, 404, '方法不匹配走 404 兜底')
+    server.close()
+  })
+  await aok('T3 CSV 转义三形态 + BOM + 响应头（全串比对，拒绝 naive split）', async () => {
+    const dir = tmpDir()
+    const msgs = [
+      { id: 1, title: '  =1+1', content: '牛奶', catename: '好单-日用', shijianchuo: 1000, datetime: '2026-10-15', shorttime: '10:00' },
+      { id: 2, title: '@SUM(A1:A9)', content: '饼干', catename: '好单-食品', shijianchuo: 2000, datetime: '2026-10-15', shorttime: '12:00' },
+      { id: 3, title: '含,引号"换行\n测试', content: '奥利奥', catename: '好单-食品', shijianchuo: 3000, datetime: '2026-10-15', shorttime: '11:00' },
+      { id: 4, title: '-2件起批', content: '正常', catename: '好单-日用', shijianchuo: 4000, datetime: '2026-10-15', shorttime: '13:00' }
+    ]
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(msgs))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const res = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=csv' })
+    assert.strictEqual(res.status, 200)
+    // 响应头（Node 出站头小写化）
+    assert.strictEqual(res.headers['content-type'], 'text/csv; charset=utf-8')
+    assert.strictEqual(res.headers['content-disposition'], 'attachment; filename="messages-export.csv"', '文件名固定字面量')
+    assert.strictEqual(res.headers['x-export-truncated'], undefined, '未截断不下发该头')
+    // BOM（request() 收 utf8 字符串，BOM 呈 U+FEFF）
+    assert.strictEqual(res.text.charCodeAt(0), 0xFEFF, 'CSV 必须以 UTF-8 BOM 开头')
+    // 全串比对（第 3 条标题含逗号/引号/换行，naive split 会碎行）：
+    // fixture 倒序 = shijianchuo 降序 → 行序 4,3,2,1
+    const expected = [
+      '\uFEFFid,时间,分类,标题,内容摘要',
+      '4,2026-10-15 13:00,好单-日用,\'-2件起批,正常',
+      '3,2026-10-15 11:00,好单-食品,"含,引号""换行\n测试",奥利奥',
+      '2,2026-10-15 12:00,好单-食品,\'@SUM(A1:A9),饼干',
+      '1,2026-10-15 10:00,好单-日用,\'  =1+1,牛奶',
+      ''
+    ].join('\r\n')
+    assert.strictEqual(res.text, expected, 'CSV 全串逐字符一致（含引号内真实 LF）')
+    server.close()
+  })
+  await aok('T4 5000 钳制 + X-Export-Truncated: 5010 条截断/30 条不出头/展示分页互不干扰', async () => {
+    const dir = tmpDir()
+    const big = []
+    for (let i = 0; i < 5010; i++) {
+      big.push({ id: i + 1, title: `条目${i + 1}`, content: '内容', catename: '好单-日用', shijianchuo: 1000000 - i, datetime: '2026-10-15', shorttime: '10:00' })
+    }
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(big))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const j = JSON.parse((await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })).text)
+    assert.strictEqual(j.status, 'ok')
+    assert.strictEqual(j.items.length, EXPORT_MAX_ROWS, '恰 5000 行（截断）')
+    assert.strictEqual(j.grandTotal, 5010)
+    assert.strictEqual(j.truncated, true)
+    const jr = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    assert.strictEqual(jr.headers['x-export-truncated'], 'true', 'JSON 分支同样下发截断头')
+    const c = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=csv' })
+    assert.strictEqual(c.headers['x-export-truncated'], 'true', 'CSV 分支同样下发截断头')
+    // 该 fixture 单元格无逗号/引号，允许 naive split：表头 + 5000 行 + 尾 \r\n = 5002 段
+    assert.strictEqual(c.text.split('\r\n').length, 5002)
+    // 对照：30 条 fixture 不出头
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'push.json'), JSON.stringify(big.slice(0, 30)))
+    const { server: s2 } = createConsole({ token: TOKEN, stateDir: dir2 })
+    const port2 = await listen(s2)
+    const small = JSON.parse((await request(port2, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })).text)
+    assert.strictEqual(small.truncated, false)
+    const smallRes = await request(port2, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    assert.strictEqual(smallRes.headers['x-export-truncated'], undefined, '未截断时头缺席（缺席=完整）')
+    // 展示分页与导出钳制互不干扰：同 fixture GET 仍钳 100
+    const page = JSON.parse((await request(port2, 'GET', '/api/messages?size=100', { token: TOKEN })).text)
+    assert.ok(page.items.length <= 100)
+    s2.close()
+    server.close()
+  })
+  await aok('T5 JSON 字段白名单: 恰五键，内部字段零携带', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([
+      { id: 9, title: '标题', content: '正文', catename: '好单-日用', shijianchuo: 500, datetime: '2026-10-15', shorttime: '10:00', price: 9.9, url: '/a/9.html', cateid: '3', content_html: '<img src=x>', _f: false }
+    ]))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const res = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    const j = JSON.parse(res.text)
+    assert.strictEqual(j.status, 'ok')
+    assert.deepStrictEqual(Object.keys(j.items[0]).sort(), ['cate', 'excerpt', 'id', 'time', 'title'], '恰五键')
+    const raw = JSON.stringify(j.items[0])
+    for (const k of ['url', 'price', 'cateid', 'content_html', 'shijianchuo', '_f', 'rowKey', 'datetime', 'shorttime']) {
+      assert.ok(!raw.includes(`"${k}"`), `不得携带内部字段 ${k}`)
+    }
+    assert.strictEqual(j.items[0].id, '9', 'id 为字符串形态')
+    server.close()
+  })
+  await aok('T6 中文 q 跨 chunk 多字节（readBody StringDecoder 回归）+ GET 对照一致', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([
+      { id: 1, title: '牛奶特价', content: '伊利', catename: '好单-日用', shijianchuo: 1000, datetime: '2026-10-15', shorttime: '10:00' },
+      { id: 2, title: '面包', content: '烘焙', catename: '好单-食品', shijianchuo: 2000, datetime: '2026-10-15', shorttime: '11:00' }
+    ]))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // 自建 http.request 两次 write：'format=json&q=' 长 14 字节，牛 = E7 89 9B，
+    // 在偏移 15（牛 的第 1 字节后）切开，其余字节走第二段——跨 chunk 多字节切分回归锁。
+    const full = Buffer.from('format=json&q=牛奶', 'utf8')
+    const parts = [full.subarray(0, 15), full.subarray(15)]
+    assert.strictEqual(Buffer.concat(parts).equals(full), true, '分片还原自检')
+    const body = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/api/messages/export', headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: `Bearer ${TOKEN}`, 'content-length': full.length } }, (res2) => {
+        let buf = ''
+        res2.on('data', c => { buf += c })
+        res2.on('end', () => resolve({ status: res2.statusCode, text: buf, headers: res2.headers }))
+      })
+      req.on('error', reject)
+      req.write(parts[0])
+      req.write(parts[1])
+      req.end()
+    })
+    assert.strictEqual(body.status, 200)
+    const j = JSON.parse(body.text)
+    assert.strictEqual(j.status, 'ok')
+    assert.strictEqual(j.total, 1)
+    assert.strictEqual(j.items[0].title, '牛奶特价')
+    // clampQueryBytes 直测：恰 240 字节的中文词不截（牛=E7 89 9B，80 字恰 240B），81 字起截尾
+    assert.strictEqual(clampQueryBytes('牛'.repeat(80)), '牛'.repeat(80))
+    assert.strictEqual(clampQueryBytes('牛'.repeat(81)), '牛'.repeat(80))
+    // GET 对照：导出与页面过滤同源（同 query，同命中）
+    const g = JSON.parse((await request(port, 'GET', `/api/messages?q=${encodeURIComponent('牛奶')}`, { token: TOKEN })).text)
+    assert.strictEqual(g.items.length, 1)
+    assert.strictEqual(String(g.items[0].id), j.items[0].id, '导出与列表过滤同源')
+    server.close()
+  })
+  await aok('T-P4 buildMessagesCsv: 表头固定字面量 + 行序 + 尾 \\r\\n（确定性输出）', () => {
+    const csv = buildMessagesCsv([
+      { id: '1', time: 't1', cate: 'c1', title: 'x', excerpt: 'e1' },
+      { id: '2', time: 't2', cate: 'c2', title: 'y,z', excerpt: 'e2' }
+    ])
+    assert.strictEqual(csv, 'id,时间,分类,标题,内容摘要\r\n1,t1,c1,x,e1\r\n2,t2,c2,"y,z",e2\r\n')
+  })
+  await aok('T7 谓词复用一致性: 导出与 GET /api/messages 同筛选 id 序列一致', async () => {
+    const dir = tmpDir()
+    const msgs = [
+      { id: 1, title: '牛奶特价', content: '伊利', catename: '好单-日用', shijianchuo: 1000, datetime: '2026-10-15', shorttime: '10:00' },
+      { id: 2, title: '坐垫', content: '好物', catename: '好单-家用', shijianchuo: 2000, datetime: '2026-10-15', shorttime: '12:00' },
+      { id: 3, title: '饼干', content: '奥利奥', catename: '好单-食品', shijianchuo: 3000, datetime: '2026-10-15', shorttime: '11:00' }
+    ]
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(msgs))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const cases = [
+      ['cate=好单-日用', 'cate=' + encodeURIComponent('好单-日用')],
+      ['q=牛奶', 'q=' + encodeURIComponent('牛奶')],
+      ['cate=好单-食品&q=饼干', 'cate=' + encodeURIComponent('好单-食品') + '&q=' + encodeURIComponent('饼干')]
+    ]
+    for (const [exportBody, getListQs] of cases) {
+      const j = JSON.parse((await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: `format=json&${exportBody}` })).text)
+      const g = JSON.parse((await request(port, 'GET', `/api/messages?${getListQs}`, { token: TOKEN })).text)
+      assert.deepStrictEqual(j.items.map(m => m.id), g.items.map(m => String(m.id)), `筛选「${exportBody}」两侧 id 序列一致`)
+    }
+    server.close()
+  })
+  await aok('T8 读取三态: missing/invalid → 200 + application/json + items 空（前端不下载判据）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const missing = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    assert.strictEqual(missing.status, 200)
+    assert.ok(missing.headers['content-type'].startsWith('application/json'), 'JSON 判据：前端不下载')
+    const mj = JSON.parse(missing.text)
+    assert.strictEqual(mj.status, 'missing')
+    assert.deepStrictEqual(mj.items, [])
+    server.close()
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'push.json'), '{broken json')
+    const { server: s2 } = createConsole({ token: TOKEN, stateDir: dir2 })
+    const port2 = await listen(s2)
+    const invalid = await request(port2, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=csv' })
+    assert.strictEqual(invalid.status, 200)
+    assert.ok(invalid.headers['content-type'].startsWith('application/json'), 'CSV 请求的三态同样走 JSON 提示（不下载空文件）')
+    assert.strictEqual(JSON.parse(invalid.text).status, 'invalid')
+    s2.close()
+  })
+  await aok('T9 body 超限 → 400（>4096 字节，与 detail 同款断言）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const big = 'q=' + 'x'.repeat(5000)
+    const r = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: big })
+    assert.strictEqual(r.status, 400)
+    server.close()
   })
   await aok('HTTP: /api/trends 按日聚合（与 parseLastRun 同一正则口径）', async () => {
     const dir = tmpDir()

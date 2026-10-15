@@ -852,6 +852,59 @@ function MessagesPanel () {
     [page, size, cate, query])
   const { data, err, load } = usePanelLoader(fetchMessages)
   useEffect(() => { load().catch(() => {}) }, [load])
+  const [exporting, setExporting] = useState('') // '' | 'csv' | 'json'：加载态防连点（两按钮共用一闸）
+  const [exportErr, setExportErr] = useState('')
+  const [exportNote, setExportNote] = useState('')
+
+  // 导出下载（v3.300 3.2）：POST /api/messages/export（字面量第一参数 + 筛选词只进 body）
+  // → response.blob() → URL.createObjectURL → 临时 <a download> 点击 → revokeObjectURL。
+  // 不拼服务端下载 URL：凭证不出现在 href（蓝图红线）。
+  const doExport = useCallback(async (format) => {
+    if (exporting !== '') return
+    setExporting(format)
+    setExportErr('')
+    setExportNote('')
+    const body = new URLSearchParams({ format })
+    if (typeof cate === 'string' && cate.length > 0) body.set('cate', cate)
+    if (typeof query === 'string' && query.length > 0) body.set('q', query)
+    // page/size 不发送：导出=筛选结果全量（服务端亦不读取）。
+    const { merged, done } = timedRequest({
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `Bearer ${BOOT.token}`
+      },
+      body
+    })
+    let url = ''
+    try {
+      const res = await fetch('/api/messages/export', merged)
+      if (!res.ok) { setExportErr(`导出失败：HTTP ${res.status}`); return }
+      const ct = String(res.headers.get('content-type') || '')
+      const blob = await res.blob()
+      if (ct.startsWith('application/json')) {
+        // 三态（missing/invalid/tooLarge）走 JSON 下发：不下载空文件，如实提示。
+        let status = 'unknown'
+        try { status = JSON.parse(await blob.text()).status || 'unknown' } catch (e) { /* 保留 unknown */ }
+        setExportErr(`记录暂不可导出（${status}）`)
+        return
+      }
+      if (res.headers.get('x-export-truncated') === 'true') setExportNote('匹配结果超过 5000 条，导出已截断')
+      url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = format === 'csv' ? 'messages-export.csv' : 'messages-export.json'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+    } catch (e) {
+      setExportErr(`导出失败：${e && e.message ? e.message : e}`)
+    } finally {
+      done() // body（blob/text）消费完才清 8s 期限（Sourcery Stalled-bodies 同口径）
+      if (url !== '') URL.revokeObjectURL(url)
+      setExporting('')
+    }
+  }, [exporting, cate, query])
   const items = data && Array.isArray(data.items) ? data.items : []
   const categories = data && Array.isArray(data.categories) ? data.categories : []
   // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，避免「显示原词、结果未过滤」。
@@ -875,8 +928,12 @@ function MessagesPanel () {
         ${categories.map((c) => html`<option key=${c.name} value=${c.name}>${c.name}（${c.count}）</option>`)}
       </select>
       <button class="btn btn-ghost" onClick=${load}>刷新</button>
+      <button class="btn btn-ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}</button>
+      <button class="btn btn-ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}</button>
     </div>
     ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${exportErr && html`<div class="hint hint-err">${exportErr}</div>`}
+    ${exportNote && html`<div class="hint">${exportNote}</div>`}
     ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<div class="hint">正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）</div>` : ''}</div>`}
     ${data && data.status === 'ok' && html`<div>
       <div class="msg-count">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}</div>
