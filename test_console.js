@@ -10,6 +10,10 @@ const path = require('node:path')
 const http = require('node:http')
 const net = require('node:net')
 const { spawn } = require('node:child_process')
+// 竞态安全读取器（生产 xbk_storage）：测试里对「刚写完/刚 rename 过的路径」的断言读取
+// 统一走它（O_NOFOLLOW + fstat 复检 + 读后复检），规避 CodeQL js/file-system-race 对
+// 「写路径 → 按路径 open」的 check-then-use 判红。
+const { readSafeTextResult } = require('./xbk_storage')
 
 const {
   createConsole, isValidToken, timingSafeEqualStr,
@@ -171,14 +175,10 @@ ok('releaseLockFor: inode 一致性闸（回归 Sourcery #225 High：陈旧持�
   fs2.utimesSync(p, 1, 1) // 把 mtime 拉旧不影响 startedAt 判定；直接改 startedAt 更直接：
   fs2.writeFileSync(p, JSON.stringify({ pid: 999999, startedAt: 1, token: 'tok-old' }))
   assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS + 5000, 'tok-new'), true, '接管方拿到锁')
-  // 断言接管结果：同 fd 读纪律（open + fstat(fd) + 同 fd 读），避免 CodeQL js/file-system-race
-  // 对「rename 写路径 → 路径读」的 check-then-use 判红。
-  const rfd1 = fs2.openSync(p, 'r')
-  try {
-    if (!fs2.fstatSync(rfd1).isFile()) throw new Error('not file')
-    const newFrameBefore = fs2.readFileSync(rfd1, 'utf8')
-    assert.strictEqual(JSON.parse(newFrameBefore).token, 'tok-new')
-  } finally { fs2.closeSync(rfd1) }
+  // 断言接管结果：readSafeTextResult（竞态安全纪律，理由见文件头注释）。
+  const safe1 = readSafeTextResult(p)
+  assert.strictEqual(safe1.status, 'ok')
+  assert.strictEqual(JSON.parse(safe1.text).token, 'tok-new')
   // 旧持有者仍握着旧 inode 的 fd？不——它每次 open 都是新 fd；竞态的本质是「旧主在
   // rename 前 open」。这里用注入模拟：手动 open 旧内容后让 rename 发生，再 releaseLockFor。
   // 简化：直接构造「fd 指向孤儿 inode」场景——把当前锁 rename 走，再在原路径放新帧。
@@ -193,13 +193,11 @@ ok('releaseLockFor: inode 一致性闸（回归 Sourcery #225 High：陈旧持�
   const { releaseLockFor } = require('./scripts/console')
   // 手动走一致性闸逻辑：直接调 releaseLockFor（它会重新 open 路径，双匹配失败返回 false）
   assert.strictEqual(releaseLockFor({ _stateDir: orphanDir, _lockToken: 'tok-victim' }), false, '锁已换主不得释放')
-  // 断言新主锁帧原样无损：按生产 readSafeText 同款纪律（open + fstat(fd) + 同 fd 读），
-  // 避免 CodeQL js/file-system-race 对「rename 写路径 → 路径读」的 check-then-use 判红。
-  const rfd2 = fs2.openSync(op, 'r')
-  try {
-    if (!fs2.fstatSync(rfd2).isFile()) throw new Error('not file')
-    assert.strictEqual(JSON.parse(fs2.readFileSync(rfd2, 'utf8')).token, 'tok-new', '新主锁帧原样无损')
-  } finally { fs2.closeSync(rfd2) }
+  // 断言新主锁帧原样无损：readSafeTextResult（O_NOFOLLOW + fstat 复检 + 读后复检），
+  // 与生产锁帧读取同一套竞态安全纪律（理由见文件头注释）。
+  const safe = readSafeTextResult(op)
+  assert.strictEqual(safe.status, 'ok', `读锁帧必须 ok（实际 ${safe.status}）`)
+  assert.strictEqual(JSON.parse(safe.text).token, 'tok-new', '新主锁帧原样无损')
   fs2.closeSync(orphanFd)
 })
 ok('releaseLockFor: 短写循环（monkeypatch writeSync 首次少写，回归 Sourcery #225 M1）', () => {
@@ -223,13 +221,12 @@ ok('releaseLockFor: 短写循环（monkeypatch writeSync 首次少写，回归 S
   } finally {
     fsmod.writeSync = realWrite
   }
-  const rfd3 = fsmod.openSync(lockPath(dir), 'r')
-  try {
-    if (!fsmod.fstatSync(rfd3).isFile()) throw new Error('not file')
-    const body = fsmod.readFileSync(rfd3, 'utf8')
-    assert.strictEqual(JSON.parse(body).released, true, '残尾补写后仍是合法 released 帧')
-    assert.strictEqual(body.trim(), '{"released":true}')
-  } finally { fsmod.closeSync(rfd3) }
+  // 断言补写结果：readSafeTextResult（竞态安全纪律，理由见文件头注释）。
+  const safeBody = readSafeTextResult(lockPath(dir))
+  assert.strictEqual(safeBody.status, 'ok')
+  const body = safeBody.text
+  assert.strictEqual(JSON.parse(body).released, true, '残尾补写后仍是合法 released 帧')
+  assert.strictEqual(body.trim(), '{"released":true}')
 })
 ok('releaseLockFor: 他人活锁返回 false；released 帧返回 true；锁不存在返回 true', () => {
   const dir = tmpDir()
