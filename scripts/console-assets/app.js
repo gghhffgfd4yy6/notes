@@ -597,18 +597,19 @@ function TrendsPanel () {
 
 // 推送记录：搜索（300ms 防抖）+ 分类筛选 + 服务端分页；点标题展开 content 全文。
 // URL 不含 content_html（服务端已裁剪）——CSP 禁外链图，贴文本才是控制台能诚实渲染的形态。
-// 原文链接：相对路径拼站内前缀，绝对 URL 原样；只放行 http/https（其他 scheme 不渲染链接）。
-// href 用函数避免 multiline-ternary（standard 规则）与 XSS scheme 注入（javascript: 等）双重问题。
-function msgHref (u) {
+// 原文链接：相对路径拼服务端下发的 baseUrl（= 生产 Config.domain，与推送侧 resolve 同口径），
+// 绝对 URL 原样；只放行 http/https（其他 scheme 不渲染链接）。
+function msgHref (u, base) {
   if (u.startsWith('http://') || u.startsWith('https://')) return u
   if (u.startsWith('//')) return `https:${u}`
-  return `https://www.xianbao.fun${u.startsWith('/') ? u : '/' + u}`
+  const b = typeof base === 'string' && base.length > 0 ? base : 'https://new.ixbk.net'
+  return `${b}${u.startsWith('/') ? u : '/' + u}`
 }
 
-function msgLink (m) {
+function msgLink (m, base) {
   if (!(typeof m.url === 'string' && m.url.length > 0)) return ''
   const title = m.url.startsWith('http') ? `外部链接（来源站点）：${m.url}` : '外部链接（来源站点）'
-  return html`<a class="msg-link" href=${msgHref(m.url)}
+  return html`<a class="msg-link" href=${msgHref(m.url, base)}
     target="_blank" rel="noopener noreferrer"
     title=${title}>原文链接 ↗</a>`
 }
@@ -669,7 +670,7 @@ function MessagesPanel () {
             <div class="msg-meta">
               <span class="msg-cate">${m.catename}</span>
               <span class="mono">${m.datetime} ${m.shorttime}</span>
-              ${msgLink(m)}
+              ${msgLink(m, data.baseUrl)}
             </div>
             ${expanded === m.rowKey && html`<div class="msg-content">${m.content || '（无正文）'}</div>`}
           </div>`)}

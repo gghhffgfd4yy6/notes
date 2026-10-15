@@ -23,6 +23,38 @@ const { StringDecoder } = require('node:string_decoder')
 const { readStatus, formatStatus, readTrends, readMessages } = require('./status')
 const { statusCacheDir } = require('../qinglong/xbk_push')
 
+// 推送缓存文件名：与生产 MessageStore.getFileName(Config.api.pushUrl) 同口径——pushUrl 末段
+// 去查询串/hash 后清洗保留字符，非 http(s) 前缀的 url 走 bad_/default 特例（这里只关心正常形态）。
+// 惰性 require 运行配置（与 qinglong/xbk_push.loadApp 同款 try/catch）：加载失败/未配置 → 'push.json'
+// （默认 domain 的 pushUrl 末段就是 push.json）。自定义 pushUrl basename 的部署不再静默读错文件
+// （Sourcery PR#227「Custom cache file is not shown」）。
+// 站内基准域名：生产侧相对 url 用 Config.domain resolve（xbk_app urlOf 同口径）。默认
+// https://new.ixbk.net（xbk_function_v3 Config 默认值）；读取失败回退默认值，前端不再硬编码错 host
+// （Sourcery PR#227「Relative links use wrong host」）。
+function sourceDomain () {
+  try {
+    const app = require('../xbk_function_v3')
+    const d = app && app.Config && app.Config.domain
+    return typeof d === 'string' && d.startsWith('http') ? d.trim().replace(/\/+$/, '') : 'https://new.ixbk.net'
+  } catch (e) {
+    return 'https://new.ixbk.net'
+  }
+}
+
+function messagesCacheName () {
+  try {
+    const app = require('../xbk_function_v3')
+    const pushUrl = app && app.Config && app.Config.api && app.Config.api.pushUrl
+    if (typeof pushUrl !== 'string' || pushUrl.length === 0) return 'push.json'
+    let name = pushUrl.split('/').pop().split(/[?#]/)[0] || 'default'
+    if (/^\.+$/.test(name)) name = 'default'
+    name = name.replace(/[\\/:*?"<>|]/g, '_')
+    return /\.json$/.test(name) ? name : `${name}.json`
+  } catch (e) {
+    return 'push.json'
+  }
+}
+
 const ROOT = path.resolve(__dirname, '..')
 const RUN_LOG_MAX_BYTES = 512 * 1024
 const PROC_TIMEOUT_MS = 10 * 60 * 1000
@@ -495,7 +527,7 @@ function parseAction (body) {
   return Object.prototype.hasOwnProperty.call(ACTIONS, v) ? v : null
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken }) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json' }) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
@@ -637,12 +669,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 全部只读（读缓存目录已有文件 + 进程自身信息），不 spawn、不写任何文件；
     // 鉴权与其余读取端点一致（Bearer / ?token= / Cookie 会话）。
     if (req.method === 'GET' && url.pathname === '/api/messages') {
-      const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES })
+      const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES, filename: messagesFile })
       if (read.status !== 'ok') {
         // missing = 缓存还没建（首轮未跑）；invalid/tooLarge = 数据坏了/过大——
         // 三态如实下发，前端按 partTone 同口径显示，不伪装成「暂无记录」。
-        // cacheDirHint：本页固定读 stateDir（与 /api/status、run.log 同源，XBK_CACHE_DIR 可改）；
-        // 运行侧 Config.cache.dir 指到别处时，推送缓存不在这里——把两边目录都告诉运维（审查 Sourcery PR#227）。
+        // cacheDirHint：本页读 stateDir + messagesCacheName()（与 /api/status、run.log 同源目录，
+        // XBK_CACHE_DIR 可改）；运行侧 Config.cache.dir / pushUrl 指到别处时缓存不在这里——
+        // 把目录与文件名口径都告诉运维（Sourcery PR#227「Custom cache records stay hidden」）。
         sendJson(res, 200, {
           status: read.status,
           total: 0,
@@ -650,7 +683,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           pageSize: 0,
           items: [],
           categories: [],
-          cacheDirHint: stateDir
+          cacheDirHint: stateDir,
+          cacheFileHint: messagesFile
         })
         return
       }
@@ -716,6 +750,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         skipped: read.value.skipped,
         // queryUsed：超限截断后实际生效的搜索词（前端据此回显，避免「显示原词、结果未过滤」）
         queryUsed: query,
+        // baseUrl：相对 url 的拼接前缀（= 生产 Config.domain，去尾斜杠），前端不再硬编码
+        baseUrl: sourceDomain(),
         categories: read.value.categories,
         items: pageItems
       })
@@ -999,7 +1035,7 @@ function main () {
   // 锁归属 token（评审 Medium：pid 复用会让「pid===process.pid」误认他人锁为自有；
   // takeover 换主后 unlink 竞态也可能误删新主的锁）。锁内容带 token，释放须双匹配。
   const lockToken = crypto.randomBytes(12).toString('hex')
-  const { server, wireGracefulShutdown } = createConsole({ token, stateDir, port, host, lockToken })
+  const { server, wireGracefulShutdown } = createConsole({ token, stateDir, port, host, lockToken, messagesFile: messagesCacheName() })
   // 优雅关闭：装配逻辑在 createConsole.wireGracefulShutdown（v3.297 抽出以便依赖注入
   // 测试，Sourcery #225 M6）。生产路径无注入 = process.exit + 全局信号监听，与抽取前等价。
   wireGracefulShutdown()

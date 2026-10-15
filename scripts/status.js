@@ -274,8 +274,11 @@ function validMessageEntry (m) {
 // 读取已推送消息列表：push.json 是 MessageStore 判重缓存（最旧在前、最新在后）。
 // 返回 { status, items(时间倒序), total, categories } —— 过滤/分页由调用方（HTTP 层）做，
 // 本函数只负责「安全读取 + 容错解析 + 排序 + 分类汇总」，保持无查询参数的纯函数可测性。
-function readMessages (dir, { maxBytes = 32 * 1024 * 1024 } = {}) {
-  const read = readText(dir, FILES.messages, maxBytes)
+function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.messages } = {}) {
+  // filename 可覆盖：运行侧缓存名由 MessageStore.getFileName(Config.api.pushUrl) 决定（pushUrl 末段
+  // 去查询串后 + .json）。控制台默认读 push.json（默认配置的产物）；自定义了 pushUrl basename 的部署
+  // 显式传 filename（console main 里从同名口径推导），不让「文件改名」静默变成「记录消失」。
+  const read = readText(dir, filename, maxBytes)
   if (read.status !== 'ok') return { status: read.status }
   let parsed
   try { parsed = JSON.parse(read.value) } catch (error) { return result('invalid') }
