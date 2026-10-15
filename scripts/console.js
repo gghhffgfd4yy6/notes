@@ -20,13 +20,69 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
-const { readStatus, formatStatus } = require('./status')
+const { readStatus, formatStatus, readTrends, readMessages } = require('./status')
 const { statusCacheDir } = require('../qinglong/xbk_push')
+
+// 推送缓存文件名：与生产 MessageStore.getFileName(Config.api.pushUrl) 同口径——pushUrl 末段
+// 去查询串/hash 后清洗保留字符，非 http(s) 前缀的 url 走 bad_/default 特例（这里只关心正常形态）。
+// 惰性 require 运行配置（与 qinglong/xbk_push.loadApp 同款 try/catch）：加载失败/未配置 → 'push.json'
+// （默认 domain 的 pushUrl 末段就是 push.json）。自定义 pushUrl basename 的部署不再静默读错文件
+// （Sourcery PR#227「Custom cache file is not shown」）。
+// 站内基准域名：生产侧相对 url 用 Config.domain resolve（xbk_app urlOf 同口径）。默认
+// https://new.ixbk.net（xbk_function_v3 Config 默认值）；读取失败回退默认值，前端不再硬编码错 host
+// （Sourcery PR#227「Relative links use wrong host」）。
+function sourceDomain () {
+  try {
+    const app = require('../xbk_function_v3')
+    const d = app && app.Config && app.Config.domain
+    return typeof d === 'string' && d.startsWith('http') ? d.trim().replace(/\/+$/, '') : 'https://new.ixbk.net'
+  } catch (e) {
+    return 'https://new.ixbk.net'
+  }
+}
+
+// 运行侧缓存目录（Config.cache.dir 经 resolveCacheDirInRoot 的结果）：能取到则用于与控制台 stateDir
+// 比对；取不到（加载失败/未配置）返回 null。仅告警用，不改变读取目录（状态文件体系仍以 stateDir 为准）。
+function runtimeCacheDir () {
+  try {
+    const app = require('../xbk_function_v3')
+    const resolved = app && app.MessageStore && app.MessageStore.cacheDir
+    return typeof resolved === 'string' && resolved.length > 0 ? resolved : null
+  } catch (e) {
+    return null
+  }
+}
+
+function messagesCacheName () {
+  try {
+    const app = require('../xbk_function_v3')
+    const pushUrl = app && app.Config && app.Config.api && app.Config.api.pushUrl
+    if (typeof pushUrl !== 'string' || pushUrl.length === 0) return 'push.json'
+    let name = pushUrl.split('/').pop().split(/[?#]/)[0] || 'default'
+    if (/^\.+$/.test(name)) name = 'default'
+    name = name.replace(/[\\/:*?"<>|]/g, '_')
+    return /\.json$/.test(name) ? name : `${name}.json`
+  } catch (e) {
+    return 'push.json'
+  }
+}
 
 const ROOT = path.resolve(__dirname, '..')
 const RUN_LOG_MAX_BYTES = 512 * 1024
 const PROC_TIMEOUT_MS = 10 * 60 * 1000
 const TOKEN_MIN_LEN = 16
+// 消息列表（GET /api/messages）读取上限：push.json 是判重缓存主存（MESSAGE_CACHE_MAX_BYTES=64MiB
+// 的生产写入上限），控制台只读展示按 32MiB 封顶——超过即 tooLarge，前端显示「记录过大不可读」，
+// 与 run.log 尾读策略不同：列表必须整读才能排序/分页，半截 JSON 假装可读更危险。
+const MESSAGES_MAX_BYTES = 32 * 1024 * 1024
+// 日志查看（GET /api/logs）取尾部：日志消费方只关心最近的记录，与 scripts/status.js 的
+// LOG_READ_OPTIONS.tail 同一口径（超限读尾 1MiB，不全拒）。
+const LOG_VIEW_MAX_BYTES = 1024 * 1024
+// 消息列表分页参数上限：单页条数 1–100，页码 1–10000（防御性钳制，URL 参数是未验证输入）。
+const MESSAGES_PAGE_SIZE_MAX = 100
+const MESSAGES_PAGE_MAX = 10000
+// 搜索词长度上限（字节）：UTF-8 下 240 字节足够容纳 80 个汉字，防止超长 query 白耗 CPU。
+const MESSAGES_QUERY_MAX_BYTES = 240
 
 // 三种触发模式 → 子进程参数。均跑一轮即退出（--dry-run 与单轮天然退出；--check 只做环境检查），
 // 绝不启动常驻循环（网页服务自己就是长驻进程，嵌套常驻只会制造孤儿）。
@@ -483,7 +539,7 @@ function parseAction (body) {
   return Object.prototype.hasOwnProperty.call(ACTIONS, v) ? v : null
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken }) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json' }) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
@@ -517,6 +573,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 窗仍拦截——这正是修复点。超窗不受影响，人工重跑语义保留。
   const REPLAY_WINDOW_MS = PROC_TIMEOUT_MS + 2 * 60 * 1000
   const lastAccept = new Map()
+  // 进程启动时刻（/api/sys 展示「已运行」用）：createConsole 被调用的瞬间。
+  const startedAtMs = Date.now()
   // 读取持久化重放记录：返回合法条目的键值对数组（文件不存在/损坏返回空）。
   // 每次受理前实时调用（Sourcery High：多进程共享 stateDir 时，启动时读的快照会过期）。
   const readLastAccept = (p) => {
@@ -617,6 +675,151 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         if (!st.lock) st.lock = { held: false, ageMs: 0 }
       }
       sendJson(res, 200, st)
+      return
+    }
+    // ── v3.297 控制台扩展：推送记录 / 趋势 / 日志 / 系统 ─────────────────────────
+    // 全部只读（读缓存目录已有文件 + 进程自身信息），不 spawn、不写任何文件；
+    // 鉴权与其余读取端点一致（Bearer / ?token= / Cookie 会话）。
+    if (req.method === 'GET' && url.pathname === '/api/messages') {
+      const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES, filename: messagesFile })
+      if (read.status !== 'ok') {
+        // missing = 缓存还没建（首轮未跑）；invalid/tooLarge = 数据坏了/过大——
+        // 三态如实下发，前端按 partTone 同口径显示，不伪装成「暂无记录」。
+        // cacheDirHint：本页读 stateDir + messagesCacheName()（与 /api/status、run.log 同源目录，
+        // XBK_CACHE_DIR 可改）；运行侧 Config.cache.dir / pushUrl 指到别处时缓存不在这里——
+        // 把目录与文件名口径都告诉运维（Sourcery PR#227「Custom cache records stay hidden」）。
+        sendJson(res, 200, {
+          status: read.status,
+          total: 0,
+          page: 1,
+          pageSize: 0,
+          items: [],
+          categories: [],
+          cacheDirHint: stateDir,
+          cacheFileHint: messagesFile
+        })
+        return
+      }
+      const q = url.searchParams
+      // 分页参数钳制（URL 是未验证输入）：非法值回退默认，不 400——自用工具宽容输入，
+      // 但永远不会越界（page*size 超大切片会复制数组，钳制后上限 100 * 10001 条仍有界）。
+      let size = Number(q.get('size'))
+      if (!Number.isSafeInteger(size) || size < 1) size = 20
+      if (size > MESSAGES_PAGE_SIZE_MAX) size = MESSAGES_PAGE_SIZE_MAX
+      let page = Number(q.get('page'))
+      if (!Number.isSafeInteger(page) || page < 1) page = 1
+      if (page > MESSAGES_PAGE_MAX) page = MESSAGES_PAGE_MAX
+      // 过滤：分类精确匹配 + 关键词子串（title / content，大小写不敏感的 ASCII 归一）。
+      // 用 includes 而非正则（用户输入直接进正则有 ReDoS 面，本仓正则防护红线）。
+      const cate = typeof q.get('cate') === 'string' ? q.get('cate') : ''
+      // 超长 query 按 UTF-8 字节截断（而非清空）：清空会让前端仍显示原词、结果却未过滤，
+      // 造成「搜了等于没搜」的假象（审查 Sourcery PR#227）。截断后用截断值过滤并回显 queryUsed。
+      // （中文按字符截到字节边界：从尾部丢弃不完整多字节序列。）
+      let query = typeof q.get('q') === 'string' ? q.get('q').trim() : ''
+      while (Buffer.byteLength(query, 'utf8') > MESSAGES_QUERY_MAX_BYTES) query = query.slice(0, -1)
+      const needle = query.length > 0 ? query.toLowerCase() : ''
+      let items = read.value.items
+      if (cate.length > 0) {
+        items = items.filter((m) => (typeof m.catename === 'string' && m.catename.length > 0 ? m.catename : '(未分类)') === cate)
+      }
+      if (needle.length > 0) {
+        items = items.filter((m) =>
+          (typeof m.title === 'string' && m.title.toLowerCase().includes(needle)) ||
+          (typeof m.content === 'string' && m.content.toLowerCase().includes(needle)))
+      }
+      // 下发字段裁剪：content_html 不出（体积大且含外链 img，CSP 下也渲染不了）；
+      // 列表给 title/content 摘要 + 元数据；详情字段由前端展开 content 全文。
+      const total = items.length
+      const start = (page - 1) * size
+      // rowKey：无 id 条目用数组下标合成（与 readMessages 的排序后位置一致——排序稳定，
+      // slice 后下标 = 原数组下标）。前端行键/展开用它，匿名条目不再联动。
+      const pageItems = items.slice(start, start + size).map((m, i) => ({
+        id: typeof m.id === 'number' || typeof m.id === 'string' ? m.id : '',
+        // rowKey：readMessages 按「原始数组下标」合成的稳定行键（与 keys 数组对齐取）。
+        // 排序/分页不改变键；无 id 的匿名条目也不再共用 '' 导致展开联动。
+        rowKey: read.value.keys[start + i] !== undefined
+          ? read.value.keys[start + i]
+          : String(m.id !== undefined && m.id !== null ? m.id : `idx-${start + i}`),
+        title: typeof m.title === 'string' ? m.title : '',
+        // content 全文下发（前端列表自行截断显示）：列表只有 ≤100 条，截到 500 反而让
+        // 「展开正文」读不到全文（审查 Sourcery PR#227）。
+        content: typeof m.content === 'string' ? m.content : '',
+        datetime: typeof m.datetime === 'string' ? m.datetime : '',
+        shorttime: typeof m.shorttime === 'string' ? m.shorttime : '',
+        shijianchuo: typeof m.shijianchuo === 'number' ? m.shijianchuo : null,
+        cateid: typeof m.cateid === 'string' || typeof m.cateid === 'number' ? String(m.cateid) : '',
+        catename: typeof m.catename === 'string' && m.catename.length > 0 ? m.catename : '(未分类)',
+        price: typeof m.price === 'number' ? m.price : null,
+        url: typeof m.url === 'string' ? m.url : ''
+      }))
+      sendJson(res, 200, {
+        status: 'ok',
+        total,
+        page,
+        pageSize: size,
+        pages: Math.max(1, Math.ceil(total / size)),
+        grandTotal: read.value.total,
+        skipped: read.value.skipped,
+        // queryUsed：超限截断后实际生效的搜索词（前端据此回显，避免「显示原词、结果未过滤」）
+        queryUsed: query,
+        // baseUrl：相对 url 的拼接前缀（= 生产 Config.domain，去尾斜杠），前端不再硬编码
+        baseUrl: sourceDomain(),
+        categories: read.value.categories,
+        items: pageItems
+      })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/trends') {
+      // 近 14 日运行趋势：run.log 摘要行按日聚合（scripts/status.js readTrends，
+      // 与 parseLastRun 同一正则口径）。missing/invalid 如实下发。
+      const t = readTrends(stateDir)
+      if (t.status !== 'ok') {
+        sendJson(res, 200, { status: t.status, byDay: [] })
+        return
+      }
+      sendJson(res, 200, {
+        status: 'ok',
+        days: t.value.days,
+        byDay: t.value.byDay,
+        // today：Asia/Shanghai 日历日（run.log 时间戳口径），前端「今天」高亮用它；
+        // truncated：run.log 超限只统计了尾部（前端副标题如实注明）
+        today: t.value.today,
+        truncated: t.value.truncated === true
+      })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/logs') {
+      // 运行日志在线查看：run.log 尾部 1MiB（与 status.js LOG_READ_OPTIONS.tail 同口径）。
+      const { readSafeTextResult } = require('../xbk_storage')
+      const safe = readSafeTextResult(path.join(stateDir, 'run.log'), LOG_VIEW_MAX_BYTES, { tail: true })
+      if (safe.status === 'missing') {
+        sendJson(res, 200, { status: 'missing', text: '' })
+        return
+      }
+      if (safe.status !== 'ok') {
+        sendJson(res, 200, { status: safe.status, text: '' })
+        return
+      }
+      sendJson(res, 200, { status: 'ok', text: safe.text })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/sys') {
+      // 系统信息：版本四方来源 package.json（与 check-version.js 的唯一真源一致）+
+      // 进程/宿主只读信息。不暴露路径之外的任何环境变量（token 等凭证绝不入响应）。
+      let version = ''
+      try { version = String(require('../package.json').version || '') } catch (e) { version = '' }
+      let rss = 0
+      try { rss = process.memoryUsage().rss } catch (e) { rss = 0 }
+      sendJson(res, 200, {
+        version,
+        node: process.version,
+        platform: `${process.platform} ${process.arch}`,
+        pid: process.pid,
+        uptimeS: Math.floor(process.uptime()),
+        rssBytes: rss,
+        cacheDir: stateDir,
+        startedAt: startedAtMs
+      })
       return
     }
     if (req.method === 'POST' && url.pathname === '/trigger') {
@@ -841,10 +1044,18 @@ function main () {
   // Sourcery Medium：与生产入口 / --status 同源解析缓存目录（含安全回退），
   // 不再手写默认值——否则 .xbk_cache_safe 生效时看板会读错目录。
   const stateDir = statusCacheDir()
+  // 显式化运行侧缓存目录漂移（Sourcery PR#227「Custom cache records stay hidden」）：
+  // 控制台状态体系（run.log / report.state / 锁）以 stateDir 为准；若运行侧 Config.cache.dir
+  // 解析到别处，推送缓存与状态文件就分居两目录——启动时高声警告，而不是让「推送记录」页静默 missing。
+  const runtimeDir = runtimeCacheDir()
+  if (runtimeDir && path.resolve(runtimeDir) !== path.resolve(stateDir)) {
+    console.error(`⚠️ 运行侧缓存目录（Config.cache.dir → ${runtimeDir}）与控制台目录（${stateDir}）不一致：` +
+      `推送记录页将读不到 push.json。请把 XBK_CACHE_DIR 设为 ${runtimeDir}，或让两处配置一致。`)
+  }
   // 锁归属 token（评审 Medium：pid 复用会让「pid===process.pid」误认他人锁为自有；
   // takeover 换主后 unlink 竞态也可能误删新主的锁）。锁内容带 token，释放须双匹配。
   const lockToken = crypto.randomBytes(12).toString('hex')
-  const { server, wireGracefulShutdown } = createConsole({ token, stateDir, port, host, lockToken })
+  const { server, wireGracefulShutdown } = createConsole({ token, stateDir, port, host, lockToken, messagesFile: messagesCacheName() })
   // 优雅关闭：装配逻辑在 createConsole.wireGracefulShutdown（v3.297 抽出以便依赖注入
   // 测试，Sourcery #225 M6）。生产路径无注入 = process.exit + 全局信号监听，与抽取前等价。
   wireGracefulShutdown()
