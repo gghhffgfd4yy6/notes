@@ -104,11 +104,23 @@ const CACHE_HEALTH_NEAR_RATIO = 0.8
 // （MessageStore._resolveMaxSize 实际执行的口径）——常量在用户自定义 maxSize 时会展示
 // 一个生产根本不执行的上限。Config 加载失败回退常量。
 function defaultHealthLimits () {
+  // entryMax 与 MessageStore._resolveMaxSize 同口径（Sourcery Medium：报出的 cap 必须等于
+  // 实际强制值）。_resolveMaxSize 用 Utils.num(Config.cache.maxSize, -1) 后
+  // Number.isInteger(v) && v > 0——Utils.num 接受数字字符串（env 覆盖 '5000' 场景），
+  // 并拒绝空串/布尔/对象；这里逐条复刻该语义（不 require Utils：createUtils 依赖注入
+  // safeRe，顶层引用会把那个耦合拖进控制台进程）。
   let entryMax = DEFAULT_MAX_SIZE
   try {
     const app = require('../xbk_function_v3')
     const ms = app && app.Config && app.Config.cache ? app.Config.cache.maxSize : null
-    if (Number.isSafeInteger(ms) && ms > 0) entryMax = ms
+    let n = null
+    if (typeof ms === 'number' || typeof ms === 'string') {
+      if (typeof ms !== 'string' || ms.trim() !== '') {
+        try { n = Number(ms) } catch (e) { n = null } // Symbol/valueOf 抛错等脏配置回退默认
+        if (typeof n === 'number' && !Number.isFinite(n)) n = null // NaN/Infinity 非法
+      }
+    }
+    if (Number.isInteger(n) && n > 0) entryMax = n
   } catch (e) { /* 加载失败回退常量 */ }
   return {
     writeMaxBytes: MESSAGE_CACHE_MAX_BYTES,
@@ -619,7 +631,9 @@ function tombstoneCounts (stateDir, messagesFile) {
   if (meta.status === 'unsafe' || meta.status === 'ioError') {
     return { status: meta.status, bytes: null, counts }
   }
-  const read = readSafeTextResult(p, TOMBSTONE_MAX_BYTES)
+  // FIFO TOCTOU（Sourcery High）：meta 闸与读之间路径可被换成 FIFO——readSafeTextResult
+  // 开 openNonBlocking，open 立即返回（普通文件不变，FIFO→unsafe），绝不阻塞等写者。
+  const read = readSafeTextResult(p, TOMBSTONE_MAX_BYTES, { openNonBlocking: true })
   if (read.status !== 'ok') return { status: read.status, bytes: null, counts }
   const bytes = Buffer.byteLength(String(read.text || ''), 'utf8')
   try {
@@ -682,8 +696,14 @@ function listStateFiles (stateDir, messagesFile) {
     if (e && e.code === 'ENOENT') return { status: 'missing', total: 0, truncated: false, files: [] }
     return { status: 'ioError', total: 0, truncated: false, files: [] }
   }
+  // 提前截断（Sourcery Medium：异常堆积目录逐条 lstat+存储+排序无界）：readdir 是单次
+  // 系统调用本身有界，O(n) 同步工作量在逐条 lstat——只对前 FILES_LIST_MAX 个条目做
+  // lstat/建对象/排序，其余仅计数。total 仍报目录真实条目数；保留哪一千个按 readdir 序，
+  // 纯展示面不承诺「保留哪个」——truncated:true 已如实标注。
+  const truncated = dirents.length > FILES_LIST_MAX
+  const keptDirents = truncated ? dirents.slice(0, FILES_LIST_MAX) : dirents
   const all = []
-  for (const d of dirents) {
+  for (const d of keptDirents) {
     if (!d.isFile()) {
       // symlink/dir/other：只报类型不给大小（不跟随、不泄露目标元数据）
       all.push({ name: d.name, kind: d.isSymbolicLink() ? 'symlink' : d.isDirectory() ? 'dir' : 'other', bytes: null, mtimeMs: null, type: 'other' })
@@ -701,12 +721,11 @@ function listStateFiles (stateDir, messagesFile) {
       all.push({ name: d.name, kind: 'file', bytes: st.size, mtimeMs: Math.round(st.mtimeMs), type: classifyStateFile(d.name, messagesFile) })
     } catch (e) { /* 竞态消失：跳过 */ }
   }
-  // 截断在排序前做：异常堆积目录（数千条目）先钳到上限再排序/保留，同步工作量有界
-  // （截断按 readdir 序，纯展示面不保证「保留哪一千个」——truncated:true 已如实标注）。
-  const truncated = all.length > FILES_LIST_MAX
-  const kept = truncated ? all.slice(0, FILES_LIST_MAX) : all
+  // （提前截断见循环前注释；此处 truncated 已在上方按 dirents.length 判定）。
+  const kept = all
   kept.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-  return { status: 'ok', total: all.length, truncated, files: kept }
+  // total = readdir 所见条目数（含未 lstat 的被截断条目与竞态消失条目）；files 才是明细。
+  return { status: 'ok', total: dirents.length, truncated, files: kept }
 }
 
 // 文件用途分类（按序精确匹配/前后缀，无正则）。遵循 F4 教训：精确形状，不用子串包含——
@@ -1433,6 +1452,7 @@ module.exports = {
   classifyStateFile,
   buildConfigView,
   configuredFlag,
+  defaultHealthLimits,
   TREND_DAYS_ALLOWED,
   TREND_DAYS_DEFAULT,
   FILES_LIST_MAX,

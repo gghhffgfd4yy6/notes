@@ -939,6 +939,46 @@ async function main () {
     assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe', 'FIFO 必须在 meta 闸被判 unsafe，绝不进入读内容路径')
     assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
   })
+  await aok('readSafeTextResult: openNonBlocking 选项（普通文件语义不变 / FIFO 立即 unsafe 不阻塞）', () => {
+    const { readSafeTextResult } = require('./xbk_storage')
+    const dir = tmpDir()
+    const fp = path.join(dir, 'plain.json')
+    fs.writeFileSync(fp, '{"ok":true}')
+    const withOpt = readSafeTextResult(fp, 1024, { openNonBlocking: true })
+    assert.strictEqual(withOpt.status, 'ok')
+    assert.strictEqual(withOpt.text, '{"ok":true}', '普通文件内容完整（O_NONBLOCK 不影响常规读取）')
+    const noOpt = readSafeTextResult(fp, 1024)
+    assert.strictEqual(noOpt.status, 'ok', '不传 options 的既有调用方语义不变')
+    // FIFO（无写者）：O_NONBLOCK open 立即 ENXIO → unsafe；若回归为裸 open 此用例挂死
+    const fifo = path.join(dir, 'pipe')
+    fs.rmSync(fifo, { force: true })
+    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifo])
+    const t0 = Date.now()
+    assert.strictEqual(readSafeTextResult(fifo, 1024, { openNonBlocking: true }).status, 'unsafe')
+    assert.ok(Date.now() - t0 < 2000, 'FIFO open 必须立即返回（O_NONBLOCK），不得阻塞等写者')
+  })
+  await aok('只读纯函数: defaultHealthLimits entryMax 与 _resolveMaxSize 同口径（数字/字符串/脏值回退）', () => {
+    const { defaultHealthLimits } = require('./scripts/console')
+    const app = require('./xbk_function_v3')
+    const saved = app.Config.cache.maxSize
+    try {
+      app.Config.cache.maxSize = 5000
+      assert.strictEqual(defaultHealthLimits().entryMax, 5000, '数字配置原样采用（MessageStore 同口径）')
+      app.Config.cache.maxSize = '5000'
+      assert.strictEqual(defaultHealthLimits().entryMax, 5000, "数字字符串 '5000' 必须被接受（env 覆盖场景，Utils.num 语义）")
+      app.Config.cache.maxSize = '  '
+      assert.strictEqual(defaultHealthLimits().entryMax, 10000, '空白字符串回退默认（Utils.num 拒空串）')
+      app.Config.cache.maxSize = 2.5
+      assert.strictEqual(defaultHealthLimits().entryMax, 10000, '小数回退默认（Number.isInteger 判否，R3-2）')
+      app.Config.cache.maxSize = 0
+      assert.strictEqual(defaultHealthLimits().entryMax, 10000, '0/负值回退默认（避免缓存被清空）')
+      app.Config.cache.maxSize = NaN
+      assert.strictEqual(defaultHealthLimits().entryMax, 10000, 'NaN 回退默认')
+    } finally {
+      app.Config.cache.maxSize = saved
+    }
+    assert.strictEqual(app.Config.cache.maxSize, saved, 'Config 必须复原（后续用例共享进程内 Config）')
+  })
   await aok('只读纯函数: cacheHealthSnapshot（边界 0.8/超限/limits 注入 + missing）', () => {
     const dir = tmpDir()
     const empty = cacheHealthSnapshot(dir, 'push.json')

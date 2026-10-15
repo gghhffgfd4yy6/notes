@@ -193,13 +193,19 @@ function readSafeTextResult (filePath, maxBytes, options = {}) {
   // 成符号链接/其他文件时，读后复检仍会将其判为 unsafe 并丢弃结果，不泄露任意文件内容。
   const limit = resolveMaxBytes(maxBytes, filePath)
   const tail = !!(options && options.tail === true)
-  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+  // openNonBlocking（可选，默认 false 不改变既有调用方）：open 加 O_NONBLOCK——普通文件
+  // 语义不变，但路径在调用方 meta 闸之后被替换成 FIFO 时，裸 O_RDONLY 会阻塞等写者挂死
+  // 同步事件循环（Sourcery High #228：tombstoneCounts 已过闸仍中招）。O_NONBLOCK 下 open
+  // FIFO 立即返回 ENXIO → 归 unsafe；随后 fstat.isFile() 同样拒绝一切非普通文件。
+  const nonBlock = !!(options && options.openNonBlocking === true)
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (nonBlock ? (fs.constants.O_NONBLOCK || 0) : 0)
   let fd
   try {
     fd = fs.openSync(filePath, flags)
   } catch (e) {
     if (e && e.code === 'ENOENT') return { status: 'missing', text: null, error: e }
     if (e && e.code === 'ELOOP') return { status: 'unsafe', text: null, error: new Error('非普通文件') }
+    if (nonBlock && e && e.code === 'ENXIO') return { status: 'unsafe', text: null, error: new Error('非普通文件（FIFO 无写者）') }
     return { status: 'ioError', text: null, error: e }
   }
   try {
