@@ -45,6 +45,11 @@ function fmtNum (n) {
   return (n === undefined || n === null) ? '—' : String(n)
 }
 
+// 字节人性化（v3.298 上提为模块级：系统信息与缓存健康面板共用）
+function fmtBytes (b) {
+  return (typeof b === 'number' && b > 0) ? `${(b / 1048576).toFixed(1)} MB` : '—'
+}
+
 // ── API ─────────────────────────────────────────────────────────────────────
 // token 只走 Authorization: Bearer 头（URL 不带任何凭证；console.js 服务端不打访问日志，
 // 但浏览器扩展/中间代理可能记 URL——凭证不进 URL 是更安全的默认）。
@@ -154,11 +159,40 @@ function apiGetMessages ({ page, size, cate, q }) {
   return consumeJson(p, done)
 }
 
-function apiGetTrends () {
+function apiGetTrends (days) {
+  const params = new URLSearchParams()
+  // days 由固定常量 TREND_DAYS 提供（14 为服务端默认，省略参数）；非法值前端先行钳制，
+  // 服务端白名单仍兜底。查询段进模板字符串、authority 恒为字面量（Codacy SSRF 全绿形态）。
+  if (days === 30 || days === 60) params.set('days', String(days))
+  const qs = params.toString()
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/trends', merged), done)
+  const p = fetch(qs.length > 0 ? `/api/trends?${qs}` : '/api/trends', merged)
+  return consumeJson(p, done)
+}
+
+// v3.298 只读扩展 API：缓存健康 / 文件清单 / 配置视图。与上方端点同纪律——
+// fetch 第一参数是纯字面量（无查询参数，字面量是唯一形态）。
+function apiGetCacheHealth () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/cache-health', merged), done)
+}
+
+function apiGetFiles () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/files', merged), done)
+}
+
+function apiGetConfig () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/config', merged), done)
 }
 
 function apiGetLogs () {
@@ -564,18 +598,26 @@ function usePanelLoader (apiFn) {
   return { data, err, load }
 }
 
+// 趋势天数选择器固定选项（与服务端白名单 TREND_DAYS_ALLOWED 对齐；14 为默认省略参数）
+const TREND_DAYS = [14, 30, 60]
+
 function TrendsPanel () {
-  const { data: trends, err, load } = usePanelLoader(apiGetTrends)
+  const [days, setDays] = useState(TREND_DAYS[0])
+  const fetchTrends = useCallback(() => apiGetTrends(days), [days])
+  const { data: trends, err, load } = usePanelLoader(fetchTrends)
   useEffect(() => { load().catch(() => {}) }, [load])
   const byDay = trends && trends.status === 'ok' ? trends.byDay : []
   const maxPushed = Math.max(1, ...byDay.map((d) => d.pushed))
-  const total14 = byDay.reduce((acc, d) => acc + d.pushed, 0)
-  const fail14 = byDay.reduce((acc, d) => acc + d.failed, 0)
+  const totalAll = byDay.reduce((acc, d) => acc + d.pushed, 0)
+  const failAll = byDay.reduce((acc, d) => acc + d.failed, 0)
   // today 由服务端按 Asia/Shanghai 日历日下发（run.log 时间戳口径），浏览器本地时区不再参与
   const todayKey = trends && trends.today ? trends.today : ''
   return html`<div class="panel">
     <div class="panel-head">
-      <span class="panel-title">近 14 日运行趋势</span>
+      <span class="panel-title">近 ${days} 日运行趋势</span>
+      <select class="msg-select" value=${days} onChange=${(e) => setDays(Number(e.target.value))} aria-label="趋势窗口天数">
+        ${TREND_DAYS.map((d) => html`<option key=${d} value=${d}>${d} 日</option>`)}
+      </select>
       <span class="panel-sub">run.log 摘要按日聚合${trends && trends.truncated ? '（日志超限，仅统计尾部 1 MiB）' : ''}</span>
       <span style="flex:1"></span>
       <button class="btn btn-ghost" onClick=${load}>刷新</button>
@@ -590,8 +632,41 @@ function TrendsPanel () {
           <span class=${'trend-day' + (d.date === todayKey ? ' today' : '')}>${d.date.slice(5)}</span>
         </div>`)}
       </div>
-      <div class="trend-meta">14 日共推送 ${total14} 条 · 失败 ${fail14} 条 · 每日轮次与抓取数悬停列查看</div>
+      <div class="trend-meta">${days} 日共推送 ${totalAll} 条 · 失败 ${failAll} 条 · 每日轮次与抓取数悬停列查看</div>
     </div>`}
+  </div>`
+}
+
+// 缓存健康（v3.298）：判重缓存字节占用对照两级上限 + 墓碑计数。纯只读快照，
+// 进概览页拉一次 + 手动刷新，不进 5s 主轮询（墓碑解析最坏 8MiB，不与状态轮询抢盘）。
+function CacheHealthPanel () {
+  const { data, err, load } = usePanelLoader(apiGetCacheHealth)
+  useEffect(() => { load().catch(() => {}) }, [load])
+  const ok = data && data.status === 'ok'
+  const ratioText = ok && data.writeRatio != null ? `${(data.writeRatio * 100).toFixed(1)}%` : '—'
+  const tomb = data && data.tombstone ? data.tombstone : null
+  return html`<div class="panel">
+    <div class="panel-head">
+      <span class="panel-title">缓存健康</span>
+      <span class="panel-sub">${data && data.file ? data.file : 'push.json'} · 判重缓存占用</span>
+      <span style="flex:1"></span>
+      <button class="btn btn-ghost" onClick=${load}>刷新</button>
+    </div>
+    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${data && !ok && html`<div class="empty">${data.status === 'missing' ? '缓存尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
+    ${ok && html`<div class="sys-grid">
+      <table class="sys-table"><tbody>
+        <tr><td>缓存大小</td><td>${fmtBytes(data.bytes)}（上限 ${fmtBytes(data.limits.writeMaxBytes)}）</td></tr>
+        <tr><td>占用比例</td><td>${ratioText}${data.nearTrim ? ' · ⚠️ 临近字节裁剪' : ''}${data.overLimit ? ' · ⛔ 已超写端上限' : ''}</td></tr>
+        <tr><td>控制台可读</td><td>${data.consoleReadable ? '是（推送记录页可浏览）' : '否——超过 32 MiB 读取封顶，推送记录页显示「过大不可读」（生产不受影响）'}</td></tr>
+      </tbody></table>
+      <table class="sys-table"><tbody>
+        <tr><td>条目上限</td><td>${data.limits.entryMax} 条（推送记录页总数见标签页）</td></tr>
+        <tr><td>墓碑状态</td><td>${tomb ? (tomb.status === 'ok' ? '正常' : tomb.status === 'missing' ? '尚未生成（首轮前正常）' : `异常（${tomb.status}）`) : '—'}${tomb && tomb.status === 'ok' ? ` · ${tomb.counts.total} 键` : ''}</td></tr>
+        <tr><td>最近写入</td><td>${data.mtimeMs ? fmtTime(data.mtimeMs) : '—'}（停滞 = 推送链路可能断了）</td></tr>
+      </tbody></table>
+    </div>`}
+    ${ok && (data.nearTrim || data.overLimit || !data.consoleReadable) && html`<div class="hint" style="margin-top:10px">占用达到写端上限 80% 时，下一轮保存会自动裁掉最旧条目并落墓碑——无需人工干预，但如果你希望保留更久，检查推送频率与 maxPerRun 配置。</div>`}
   </div>`
 }
 
@@ -719,7 +794,6 @@ function SysPanel () {
     const m = Math.floor((s % 3600) / 60)
     return d > 0 ? `${d} 天 ${h} 时 ${m} 分` : h > 0 ? `${h} 时 ${m} 分` : `${m} 分`
   }
-  const fmtBytes = (b) => (typeof b === 'number' && b > 0 ? `${(b / 1048576).toFixed(1)} MB` : '—')
   return html`<div class="panel">
     <div class="panel-head">
       <span class="panel-title">系统信息</span>
@@ -741,6 +815,81 @@ function SysPanel () {
       </tbody></table>
     </div>`}
     <div class="hint" style="margin-top:12px">数据说明：推送记录来自判重缓存 push.json（服务端已裁剪正文 HTML）；趋势解析 run.log 摘要行；日志取尾部 1 MiB。</div>
+  </div>`
+}
+
+// 状态目录文件清单（v3.298）：进系统页加载 + 手动刷新。符号链接/目录作为异常条目显性
+// 展示（bytes 为 ——— 意为「不适用」，服务端不跟随符号链接、不泄露目标元数据）。
+function FilesPanel () {
+  const { data, err, load } = usePanelLoader(apiGetFiles)
+  useEffect(() => { load().catch(() => {}) }, [load])
+  const files = data && Array.isArray(data.files) ? data.files : []
+  return html`<div class="panel">
+    <div class="panel-head">
+      <span class="panel-title">缓存目录文件</span>
+      <span class="panel-sub">${data ? `${data.total} 项${data.truncated ? '（超出展示上限，已截断）' : ''}` : ''}</span>
+      <span style="flex:1"></span>
+      <button class="btn btn-ghost" onClick=${load}>刷新</button>
+    </div>
+    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${data && data.status !== 'ok' && html`<div class="empty">${data.status === 'missing' ? '目录尚未生成' : `不可读（${data.status}）`}</div>`}
+    ${data && data.status === 'ok' && html`<table class="sys-table"><tbody>
+      ${files.map((f) => html`<tr key=${f.name}>
+        <td>${f.name}</td>
+        <td>${f.kind === 'file' ? `${fmtBytes(f.bytes)} · ${f.type}` : f.kind === 'symlink' ? '⚠️ 符号链接（异常，请排查）' : f.kind}</td>
+      </tr>`)}
+    </tbody></table>`}
+    <div class="hint" style="margin-top:10px">文件类型：cache=判重缓存 · tombstone=墓碑 · log/state=日志与状态 · lock=锁帧 · backup/temp=异常残留备份。出现 symlink/dir 即目录被异常写入，值得人工排查。</div>
+  </div>`
+}
+
+// 运行配置脱敏视图（v3.298）：推送密钥只显示「已配置/未配置」，值永不下发（服务端白名单
+// + 响应前保险丝双道防线）。进配置页加载 + 手动刷新。
+function ConfigPanel () {
+  const { data, err, load } = usePanelLoader(apiGetConfig)
+  useEffect(() => { load().catch(() => {}) }, [load])
+  const r = data && data.runtime ? data.runtime : null
+  const pc = data && data.pushChannels ? data.pushChannels : null
+  const chanNames = pc && Array.isArray(pc.perChannel) ? pc.perChannel : (pc && pc.perChannel ? Object.keys(pc.perChannel) : [])
+  const filterEntries = r && r.filter ? Object.entries(r.filter) : []
+  return html`<div class="panel">
+    <div class="panel-head">
+      <span class="panel-title">运行配置</span>
+      <span class="panel-sub">脱敏视图 · 推送密钥只显示是否已配置</span>
+      <span style="flex:1"></span>
+      <button class="btn btn-ghost" onClick=${load}>刷新</button>
+    </div>
+    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${data && !r && html`<div class="empty">运行配置不可读（模块加载失败——检查部署完整性）</div>`}
+    ${r && html`<div class="sys-grid">
+      <table class="sys-table"><tbody>
+        <tr><td>站点域名</td><td>${r.domain}</td></tr>
+        <tr><td>推送接口</td><td>${r.api.pushUrl}</td></tr>
+        <tr><td>接口超时 / 重试</td><td>${r.api.timeout}ms / ${r.api.retry} 次</td></tr>
+        <tr><td>推送模式</td><td>${r.push.mode}${r.push.mode === 'parallel' ? ` · 并发上限 ${r.push.parallelLimit}` : ''}</td></tr>
+        <tr><td>单轮上限 / 截断</td><td>${r.push.maxPerRun} 条 · 标题 ${r.push.titleMax} / 正文 ${r.push.contentMax} 字符</td></tr>
+        <tr><td>缓存上限</td><td>${r.cache.maxSize} 条 · 目录 ${r.cache.dirEffective || r.cache.dirConfigured || '—'}</td></tr>
+      </tbody></table>
+      <table class="sys-table"><tbody>
+        <tr><td>接口异常告警</td><td>${r.alert.enabled ? `开（同错误限频 ${Math.round(r.alert.intervalMs / 60000)} 分钟）` : '关'}</td></tr>
+        <tr><td>运行日报</td><td>${r.report.enabled ? '开' : '关'}</td></tr>
+        <tr><td>通道健康监测</td><td>${r.channelHealth.enabled ? `开（连续失败 ${r.channelHealth.consecutiveFailures} 次告警）` : '关'}</td></tr>
+        <tr><td>过滤诊断日志</td><td>${r.diagnostics.filterLog.enabled ? `开（每轮最多 ${r.diagnostics.filterLog.maxDetailsPerRun} 条）` : '关'}</td></tr>
+        <tr><td>磁盘余量告警</td><td>${r.storage.minFreeBytes >= 0 ? `低于 ${fmtBytes(r.storage.minFreeBytes)} 时告警` : '—'}</td></tr>
+        <tr><td>运行环境变量</td><td>${data.console && data.console.env ? ['intervalMs', 'cacheDir', 'dryRun'].filter((k) => data.console.env[k]).map((k) => `XBK_${k.toUpperCase()} 已设置`).join('，') || '无覆盖' : '—'}</td></tr>
+      </tbody></table>
+    </div>`}
+    ${r && html`<table class="sys-table" style="margin-top:12px"><tbody>
+      <tr><td>推送模板</td><td>标题：${r.template.title} · 正文：${r.template.content}</td></tr>
+      ${filterEntries.length > 0 && html`<tr><td>过滤规则</td><td>${filterEntries.map(([k, v]) => `${k}=${String(v).length > 0 ? v : '（空）'}`).join(' · ')}</td></tr>`}
+      <tr><td>关键词订阅</td><td>${r.keyword.zkt_gjc && String(r.keyword.zkt_gjc).length > 0 ? r.keyword.zkt_gjc : '（未设置）'}</td></tr>
+    </tbody></table>`}
+    ${pc && html`<table class="sys-table" style="margin-top:12px"><tbody>
+      <tr><td>推送渠道</td><td>${pc.moduleLoaded ? (pc.count > 0 ? `已配置 ${pc.count} 个：${pc.names.join('、')}` : '未配置任何渠道') : '配置模块加载失败（检查依赖）'}</td></tr>
+      <tr><td>渠道明细</td><td>${chanNames.map((k) => `${k}：${pc.perChannel[k] ? '✅ 已配置' : '未配置'}`).join(' · ')}</td></tr>
+      <tr><td>本地配置文件</td><td>${pc.localFileLoaded ? 'push_config.local.js 已加载（密钥不入库不入页面）' : '未找到（用环境变量或该文件配置推送）'}</td></tr>
+    </tbody></table>`}
+    <div class="hint" style="margin-top:12px">本页为脱敏视图：所有推送密钥（appToken / BOT token 等）的值永不出现在页面或接口响应中，只显示「已配置 / 未配置」。修改配置请编辑 push_config.local.js 或环境变量后重启。</div>
   </div>`
 }
 
@@ -847,6 +996,7 @@ function App () {
     { key: 'overview', label: '概览' },
     { key: 'messages', label: '推送记录' },
     { key: 'logs', label: '运行日志' },
+    { key: 'config', label: '配置' },
     { key: 'sys', label: '系统' }
   ]
   return html`<div class="wrap">
@@ -868,13 +1018,18 @@ function App () {
 
     ${tab === 'overview' && html`<div>
       <${TrendsPanel} />
+      <${CacheHealthPanel} />
       <${StatusCards} state=${state} />
       <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
       <${RunsPanel} runs=${runs} pollMs=${locking ? POLL_BUSY_MS : POLL_MS} />
     </div>`}
     ${tab === 'messages' && html`<${MessagesPanel} />`}
     ${tab === 'logs' && html`<${LogsPanel} pollMs=${locking ? POLL_BUSY_MS : 0} />`}
-    ${tab === 'sys' && html`<${SysPanel} />`}
+    ${tab === 'config' && html`<${ConfigPanel} />`}
+    ${tab === 'sys' && html`<div>
+      <${SysPanel} />
+      <${FilesPanel} />
+    </div>`}
 
     <footer class="foot">
       ⚠️ 「正式运行一轮」会真实推送通知 · 试运行只抓取不推送 · 同一时刻只能有一个触发任务
