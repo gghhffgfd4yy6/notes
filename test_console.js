@@ -18,7 +18,9 @@ const { readSafeTextResult } = require('./xbk_storage')
 const {
   createConsole, isValidToken, timingSafeEqualStr,
   acquireLock, releaseLockFor, lockPath,
-  parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS
+  parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
+  statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
+  buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX
 } = require('./scripts/console')
 
 let passed = 0
@@ -826,6 +828,326 @@ async function main () {
     await new Promise(resolve => setTimeout(resolve, 80))
     assert.strictEqual(exitCode, 0, `子进程 close 后必须退出 0（events=${events}）`)
     assert.ok(events.indexOf('exit:0') > events.indexOf('kill:SIGKILL'), '退出必须发生在 kill 之后')
+  })
+
+  // ── v3.298 只读扩展：配置视图 / 缓存健康 / 文件清单 / 趋势天数 ─────────────────
+  await aok('只读纯函数: statSafeMeta 三态（常规文件 / 符号链接 / 缺失）', () => {
+    const dir = tmpDir()
+    const fp = path.join(dir, 'a.json')
+    fs.writeFileSync(fp, '{"x":1}')
+    const okMeta = statSafeMeta(fp)
+    assert.strictEqual(okMeta.status, 'ok')
+    assert.strictEqual(okMeta.size, 7)
+    assert.ok(Number.isFinite(okMeta.mtimeMs), 'mtime 必须下发')
+    // 符号链接：绝不跟随（O_NOFOLLOW 口径）——链接指向哪里都判 unsafe
+    fs.symlinkSync(fp, path.join(dir, 'link.json'))
+    assert.strictEqual(statSafeMeta(path.join(dir, 'link.json')).status, 'unsafe')
+    assert.strictEqual(statSafeMeta(path.join(dir, 'link.json')).size, null, 'unsafe 不得泄露大小')
+    fs.symlinkSync('/etc', path.join(dir, 'dirlink'))
+    assert.strictEqual(statSafeMeta(path.join(dir, 'dirlink')).status, 'unsafe', '指向目录外也不跟随')
+    assert.strictEqual(statSafeMeta(path.join(dir, 'ghost.json')).status, 'missing')
+    // FIFO（非普通文件）：fstat.isFile() 为 false → unsafe；O_NONBLOCK 保证不阻塞等写者。
+    // mkfifo 需要专用系统调用（Node 22 无 mkfifoSync）——用 coreutils 绝对路径
+    // （Sonar S4036：不做可写目录 PATH 查找），普通文件先删除再建 FIFO。
+    const fifo = path.join(dir, 'pipe')
+    fs.rmSync(fifo, { force: true })
+    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifo])
+    const t0 = Date.now()
+    assert.strictEqual(statSafeMeta(path.join(dir, 'pipe')).status, 'unsafe')
+    assert.ok(Date.now() - t0 < 2000, 'FIFO 打开必须立即返回（O_NONBLOCK），不得阻塞等写者')
+  })
+  await aok('只读纯函数: classifyStateFile 分类与 F4 反例（.seen.cleanup.lock.json 是缓存不是锁）', () => {
+    assert.strictEqual(classifyStateFile('push.json', 'push.json'), 'cache')
+    assert.strictEqual(classifyStateFile('push.json.seen.json', 'push.json'), 'tombstone')
+    assert.strictEqual(classifyStateFile('console-lastaccept.json', 'push.json'), 'console')
+    assert.strictEqual(classifyStateFile('console-trigger.lock', 'push.json'), 'lock')
+    assert.strictEqual(classifyStateFile('push.json.seen.lock', 'push.json'), 'lock')
+    assert.strictEqual(classifyStateFile('push.json.seen.lock.takeover', 'push.json'), 'lock')
+    assert.strictEqual(classifyStateFile('push.json.seen.cleanup.lock.json', 'push.json'), 'cache',
+      'F4：上游 pushUrl 末段恰为 xxx.seen.cleanup.lock 时，<name>.seen.cleanup.lock.json 是合法缓存——endsWith(".lock") 不误吞它')
+    assert.strictEqual(classifyStateFile('push.json.corrupt.2026-10-15T00:00:00.000Z.bak', 'push.json'), 'backup')
+    assert.strictEqual(classifyStateFile('write.tmp', 'push.json'), 'temp')
+    assert.strictEqual(classifyStateFile('report.state', 'push.json'), 'state')
+    assert.strictEqual(classifyStateFile('re2warn.state.2026-10-15', 'push.json'), 'state')
+    assert.strictEqual(classifyStateFile('run.log', 'push.json'), 'log')
+    assert.strictEqual(classifyStateFile('filter-diagnostics.ndjson', 'push.json'), 'log')
+    assert.strictEqual(classifyStateFile('custom-push.json', 'custom-push.json'), 'cache', '自定义 pushUrl basename 同口径')
+  })
+  await aok('只读纯函数: listStateFiles（名称无路径 / symlink 显性暴露不跟随 / 截断）', () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'b.log'), 'x'.repeat(2048))
+    fs.writeFileSync(path.join(dir, 'a.json'), '[]')
+    fs.symlinkSync('/etc', path.join(dir, 'evil'))
+    const list = listStateFiles(dir, 'a.json')
+    assert.strictEqual(list.status, 'ok')
+    assert.strictEqual(list.total, 3)
+    assert.strictEqual(list.truncated, false)
+    const names = list.files.map((f) => f.name)
+    for (const n of names) {
+      assert.ok(!n.includes('/') && !n.includes('\\') && !n.includes('..'), `只下发文件名，不得含路径成分：${n}`)
+    }
+    const evil = list.files.find((f) => f.name === 'evil')
+    assert.strictEqual(evil.kind, 'symlink', '符号链接必须显性暴露')
+    assert.strictEqual(evil.bytes, null, '符号链接不得泄露目标大小')
+    assert.deepStrictEqual(list.files.map((f) => f.name), ['a.json', 'b.log', 'evil'], '按名称升序')
+    const a = list.files.find((f) => f.name === 'a.json')
+    assert.strictEqual(a.bytes, 2)
+    assert.strictEqual(a.type, 'cache')
+    // 截断：FILES_LIST_MAX 条以上 → truncated
+    const big = tmpDir()
+    for (let i = 0; i < FILES_LIST_MAX + 5; i++) fs.writeFileSync(path.join(big, `f${String(i).padStart(5, '0')}`), 'x')
+    const bigList = listStateFiles(big, 'push.json')
+    assert.strictEqual(bigList.total, FILES_LIST_MAX + 5)
+    assert.strictEqual(bigList.truncated, true)
+    assert.strictEqual(bigList.files.length, FILES_LIST_MAX)
+    // 目录不存在 → missing
+    assert.strictEqual(listStateFiles(path.join(dir, 'nope'), 'push.json').status, 'missing')
+  })
+  await aok('只读纯函数: tombstoneCounts（去重计数同 _loadTombstones / invalid 如实 / unsafe 不读）', () => {
+    const dir = tmpDir()
+    // 重复键 + 非法条目：与 MessageStore._loadTombstones 同口径——只计非空字符串、Set 去重
+    const tomb = { v: 1, id: ['a', 'b', 'a', 42, ''], urlOnly: ['c'], idWithUrl: [], anon: ['d', 'e', 'f', 'd'] }
+    fs.writeFileSync(path.join(dir, 'push.json.seen.json'), JSON.stringify(tomb))
+    const r = tombstoneCounts(dir, 'push.json')
+    assert.strictEqual(r.status, 'ok')
+    assert.strictEqual(r.counts.id, 2, '重复键与非法条目不计（同 _loadTombstones 的 Map 去重口径）')
+    assert.strictEqual(r.counts.urlOnly, 1)
+    assert.strictEqual(r.counts.anon, 3)
+    assert.strictEqual(r.counts.total, 6)
+    assert.strictEqual(r.bytes, Buffer.byteLength(JSON.stringify(tomb)), 'bytes 取自读到的内容本身（单段式，无跨代拼接）')
+    // invalid：非对象 JSON / 坏 JSON → invalid 而非崩溃
+    fs.writeFileSync(path.join(dir, 'push.json.seen.json'), 'not-json')
+    assert.strictEqual(tombstoneCounts(dir, 'push.json').status, 'invalid')
+    fs.writeFileSync(path.join(dir, 'push.json.seen.json'), '[1,2]')
+    assert.strictEqual(tombstoneCounts(dir, 'push.json').status, 'invalid')
+    fs.writeFileSync(path.join(dir, 'push.json.seen.json'), JSON.stringify({ v: 1, id: 'not-array' }))
+    const bad2 = tombstoneCounts(dir, 'push.json')
+    assert.strictEqual(bad2.status, 'ok', '非数组成员跳过不炸')
+    assert.strictEqual(bad2.counts.id, 0)
+    // missing：正常态（首轮前）
+    assert.strictEqual(tombstoneCounts(tmpDir(), 'push.json').status, 'missing')
+    // unsafe（符号链接）：过闸不读——绝不调用 readSafeTextResult（其裸 open 对 FIFO 阻塞）
+    const dir2 = tmpDir()
+    fs.symlinkSync('/etc/passwd', path.join(dir2, 'push.json.seen.json'))
+    assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe')
+    assert.strictEqual(tombstoneCounts(dir2, 'push.json').bytes, null)
+    // FIFO 也走 unsafe 闸（statSafeMeta 的 O_NONBLOCK 立即返回）——若闸失效此用例挂死
+    const fifoTomb = path.join(dir2, 'push.json.seen.json')
+    fs.rmSync(fifoTomb, { force: true })
+    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifoTomb])
+    const t0 = Date.now()
+    assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe', 'FIFO 必须在 meta 闸被判 unsafe，绝不进入读内容路径')
+    assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
+  })
+  await aok('readSafeTextResult: openNonBlocking 选项（普通文件语义不变 / FIFO 立即 unsafe 不阻塞）', () => {
+    const { readSafeTextResult } = require('./xbk_storage')
+    const dir = tmpDir()
+    const fp = path.join(dir, 'plain.json')
+    fs.writeFileSync(fp, '{"ok":true}')
+    const withOpt = readSafeTextResult(fp, 1024, { openNonBlocking: true })
+    assert.strictEqual(withOpt.status, 'ok')
+    assert.strictEqual(withOpt.text, '{"ok":true}', '普通文件内容完整（O_NONBLOCK 不影响常规读取）')
+    const noOpt = readSafeTextResult(fp, 1024)
+    assert.strictEqual(noOpt.status, 'ok', '不传 options 的既有调用方语义不变')
+    // FIFO（无写者）：O_NONBLOCK open 立即 ENXIO → unsafe；若回归为裸 open 此用例挂死
+    const fifo = path.join(dir, 'pipe')
+    fs.rmSync(fifo, { force: true })
+    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifo])
+    const t0 = Date.now()
+    assert.strictEqual(readSafeTextResult(fifo, 1024, { openNonBlocking: true }).status, 'unsafe')
+    assert.ok(Date.now() - t0 < 2000, 'FIFO open 必须立即返回（O_NONBLOCK），不得阻塞等写者')
+  })
+  await aok('只读纯函数: defaultHealthLimits entryMax 与 _resolveMaxSize 同口径（数字/字符串/脏值回退）', () => {
+    const { defaultHealthLimits } = require('./scripts/console')
+    const app = require('./xbk_function_v3')
+    const saved = app.Config.cache.maxSize
+    try {
+      app.Config.cache.maxSize = 5000
+      assert.strictEqual(defaultHealthLimits().entryMax, 5000, '数字配置原样采用（MessageStore 同口径）')
+      app.Config.cache.maxSize = '5000'
+      assert.strictEqual(defaultHealthLimits().entryMax, 5000, "数字字符串 '5000' 必须被接受（env 覆盖场景，Utils.num 语义）")
+      app.Config.cache.maxSize = '  '
+      assert.strictEqual(defaultHealthLimits().entryMax, 10000, '空白字符串回退默认（Utils.num 拒空串）')
+      app.Config.cache.maxSize = 2.5
+      assert.strictEqual(defaultHealthLimits().entryMax, 10000, '小数回退默认（Number.isInteger 判否，R3-2）')
+      app.Config.cache.maxSize = 0
+      assert.strictEqual(defaultHealthLimits().entryMax, 10000, '0/负值回退默认（避免缓存被清空）')
+      app.Config.cache.maxSize = Number.NaN
+      assert.strictEqual(defaultHealthLimits().entryMax, 10000, 'NaN 回退默认')
+    } finally {
+      app.Config.cache.maxSize = saved
+    }
+    assert.strictEqual(app.Config.cache.maxSize, saved, 'Config 必须复原（后续用例共享进程内 Config）')
+  })
+  await aok('只读纯函数: cacheHealthSnapshot（边界 0.8/超限/limits 注入 + missing）', () => {
+    const dir = tmpDir()
+    const empty = cacheHealthSnapshot(dir, 'push.json')
+    assert.strictEqual(empty.status, 'missing')
+    assert.strictEqual(empty.bytes, null)
+    assert.strictEqual(empty.nearTrim, false)
+    assert.strictEqual(empty.overLimit, false)
+    assert.strictEqual(empty.tombstone.status, 'missing')
+    // 注入小上限测边界（测试无需造 64MiB 文件）
+    const lim = { writeMaxBytes: 100, consoleReadMaxBytes: 50, entryMax: 10, tombstoneKeyMax: 5, tombstoneMaxBytes: 8 }
+    fs.writeFileSync(path.join(dir, 'push.json'), 'x'.repeat(80))
+    const near = cacheHealthSnapshot(dir, 'push.json', lim)
+    // writeRatio = 80/100，用整数比对（ Sonar S1244：浮点不用 === 严格相等）
+    assert.ok(Math.abs(near.writeRatio - 0.8) < 1e-9, '80/100 应得 0.8（容差比对）')
+    assert.strictEqual(near.nearTrim, true, '恰达 0.8 即预警（>= 判定）')
+    assert.strictEqual(near.overLimit, false)
+    assert.strictEqual(near.consoleReadable, false, '80 > 50 → 推送记录页不可读')
+    fs.writeFileSync(path.join(dir, 'push.json'), 'x'.repeat(100))
+    assert.strictEqual(cacheHealthSnapshot(dir, 'push.json', lim).nearTrim, true)
+    assert.strictEqual(cacheHealthSnapshot(dir, 'push.json', lim).overLimit, false, '恰好 100 = 上限，未超')
+    fs.writeFileSync(path.join(dir, 'push.json'), 'x'.repeat(101))
+    const over = cacheHealthSnapshot(dir, 'push.json', lim)
+    assert.strictEqual(over.overLimit, true)
+    assert.strictEqual(over.nearTrim, false, '超上限后不再报「临近」')
+    // 墓碑计数并入快照
+    fs.writeFileSync(path.join(dir, 'push.json.seen.json'), JSON.stringify({ v: 1, id: ['k1'] }))
+    const withTomb = cacheHealthSnapshot(dir, 'push.json', lim)
+    assert.strictEqual(withTomb.tombstone.status, 'ok')
+    assert.strictEqual(withTomb.tombstone.counts.total, 1)
+    assert.strictEqual(withTomb.tombstone.bytes > 0, true, '墓碑字节数取自读到的内容')
+    // HTTP 层附带 entryCount（readMessageCount 同源；tooLarge 时 null 如实下发）
+    assert.strictEqual(withTomb.entryCount, undefined, '快照纯函数不含 entryCount（HTTP 层附带）')
+  })
+  await aok('只读纯函数: buildConfigView 白名单（无密钥值 / 渠道布尔 / configuredFlag）', () => {
+    const v = buildConfigView()
+    assert.strictEqual(v.configLoaded, true, '本机部署完整，Config 应可加载')
+    assert.ok(v.runtime, 'runtime 视图存在')
+    const blob = JSON.stringify(v)
+    // 密钥值泄漏防线（fixture 值在本机 push_config.local.js 真实存在——任何值片段入响应即红）
+    assert.ok(!blob.includes('"appToken"'), 'appToken 键不得出现')
+    assert.ok(!blob.includes('PUSH_PLUS_TOKEN') && !blob.includes('TG_BOT_TOKEN'), '密钥环境变量名/键名不得出现')
+    assert.ok(typeof v.pushChannels.count === 'number')
+    assert.ok(Array.isArray(v.pushChannels.names))
+    assert.strictEqual(typeof v.pushChannels.perChannel.wxpusher, 'boolean')
+    assert.strictEqual(typeof v.pushChannels.wxpusher.configured, 'boolean')
+    assert.strictEqual(typeof v.pushChannels.localFilePresent, 'boolean')
+    // 白名单形状锁死（字段删除类变异体一次杀光）
+    assert.deepStrictEqual(Object.keys(v), ['configLoaded', 'runtime', 'pushChannels', 'console'])
+    assert.deepStrictEqual(Object.keys(v.runtime), ['domain', 'api', 'push', 'timing', 'cache', 'alert', 'report', 'channelHealth', 'diagnostics', 'storage', 'template', 'filter', 'keyword'])
+    assert.deepStrictEqual(Object.keys(v.runtime.api), ['pushUrl', 'timeout', 'retry'])
+    // filter/keyword 也是显式字段清单（不用 spread——Sourcery High：Config.filter 新增敏感
+    // 字段时 spread 会自动带进响应）
+    assert.deepStrictEqual(Object.keys(v.runtime.filter).sort((a, b) => a.localeCompare(b)), ['pingbibiaoti', 'pingbibiaotiplus', 'pingbifenlei', 'pingbilouzhu', 'pingbilouzhuplus', 'pingbineirong', 'pingbineirongplus', 'pingbitime', 'zhanxianbiaoti', 'zhanxianlouzhu', 'zhanxianneirong'])
+    assert.deepStrictEqual(Object.keys(v.runtime.keyword), ['zkt_gjc'])
+    assert.deepStrictEqual(Object.keys(v.pushChannels), ['moduleLoaded', 'count', 'names', 'perChannel', 'localFilePresent', 'wxpusher'])
+    assert.ok(!Object.prototype.hasOwnProperty.call(v.pushChannels, 'localFileLoaded'), 'localFile 已更名 localFilePresent（文件存在性上报，加载与否由 sendNotify 决定）')
+    assert.ok(!Object.prototype.hasOwnProperty.call(v.runtime, 'pushChannels'), '渠道状态只在 pushChannels 节点')
+    assert.strictEqual(v.runtime.domain, 'https://new.ixbk.net')
+    assert.strictEqual(typeof v.runtime.push.parallelLimit, 'number')
+    // configuredFlag 语义
+    assert.strictEqual(configuredFlag('x'), true)
+    assert.strictEqual(configuredFlag('  '), false)
+    assert.strictEqual(configuredFlag(''), false)
+    assert.strictEqual(configuredFlag(false), false)
+    assert.strictEqual(configuredFlag(true), true)
+    assert.strictEqual(configuredFlag(0), true, '数字 0 是「已设置」（布尔语义只对 false/null/undefined 否定）')
+    assert.strictEqual(configuredFlag(undefined), false)
+    assert.strictEqual(configuredFlag(null), false)
+  })
+  await aok('HTTP: /api/config 脱敏视图（200 + 不含 token + 无凭证 401）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const res = await request(port, 'GET', '/api/config', { token: TOKEN })
+    assert.strictEqual(res.status, 200)
+    const data = JSON.parse(res.text)
+    assert.strictEqual(data.configLoaded, true)
+    assert.ok(!res.text.includes(TOKEN), '绝不回显 XBK_CONSOLE_TOKEN')
+    assert.ok(!res.text.includes('XBK_CONSOLE'), '不暴露控制台环境变量名')
+    // 无凭证 401
+    const na = await request(port, 'GET', '/api/config')
+    assert.strictEqual(na.status, 401)
+    server.close()
+  })
+  await aok('HTTP: /api/files 清单（真实文件 / symlink 显性 / 名称无路径 / 无凭证 401）', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), 'x'.repeat(2048))
+    fs.writeFileSync(path.join(dir, 'push.json'), '[]')
+    fs.symlinkSync('/etc', path.join(dir, 'evil'))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const res = await request(port, 'GET', '/api/files', { token: TOKEN })
+    assert.strictEqual(res.status, 200)
+    const data = JSON.parse(res.text)
+    assert.strictEqual(data.status, 'ok')
+    const names = data.files.map((f) => f.name)
+    assert.ok(names.includes('run.log') && names.includes('push.json'))
+    assert.ok(names.includes('evil'), '符号链接显性暴露给运维')
+    const evil = data.files.find((f) => f.name === 'evil')
+    assert.strictEqual(evil.kind, 'symlink')
+    assert.strictEqual(evil.bytes, null)
+    for (const it of data.files) {
+      assert.ok(!it.name.includes('/') && !it.name.includes('\\') && !it.name.includes('..'), `文件名不得含路径成分：${it.name}`)
+    }
+    const na = await request(port, 'GET', '/api/files')
+    assert.strictEqual(na.status, 401)
+    server.close()
+  })
+  await aok('HTTP: /api/cache-health（ok 快照 / 字节数真实 / 无凭证 401）', async () => {
+    const dir = tmpDir()
+    const raw = JSON.stringify([{ id: 1, title: 'x', content: 'y' }])
+    fs.writeFileSync(path.join(dir, 'push.json'), raw)
+    fs.writeFileSync(path.join(dir, 'push.json.seen.json'), JSON.stringify({ v: 1, id: ['a'] }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const res = await request(port, 'GET', '/api/cache-health', { token: TOKEN })
+    assert.strictEqual(res.status, 200)
+    const data = JSON.parse(res.text)
+    assert.strictEqual(data.status, 'ok')
+    assert.strictEqual(data.bytes, Buffer.byteLength(raw))
+    assert.strictEqual(data.overLimit, false)
+    assert.strictEqual(data.consoleReadable, true)
+    assert.strictEqual(data.tombstone.status, 'ok')
+    assert.strictEqual(data.tombstone.counts.total, 1)
+    assert.ok(data.limits.writeMaxBytes > 0, '上限真源下发')
+    assert.strictEqual(data.entryCount, 1, 'HTTP 层附带条目数（readMessageCount 同源）')
+    assert.strictEqual(data.entryCountStatus, 'ok')
+    const na = await request(port, 'GET', '/api/cache-health')
+    assert.strictEqual(na.status, 401)
+    server.close()
+  })
+  await aok('HTTP: /api/trends?days 白名单（30/60 放大窗口；非法/越界钳回 14）', async () => {
+    const dir = tmpDir()
+    const now = Date.now()
+    // 与 status.js shanghaiDayKey 同口径的日历日键（Asia/Shanghai = UTC+8）
+    const dayKey = (back) => new Date(now + 8 * 3600e3 - back * 86400e3).toISOString().slice(0, 10)
+    const line = (back) => `${dayKey(back)} 10:00:00 total=10 dedup=0 filtered=0 truncated=0 pushed=5 failed=0 elapsed=1.0s cachesaved=1`
+    fs.writeFileSync(path.join(dir, 'run.log'), [line(0), line(20), line(50)].join('\n') + '\n')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const t14 = JSON.parse((await request(port, 'GET', '/api/trends', { token: TOKEN })).text)
+    assert.strictEqual(t14.byDay.length, TREND_DAYS_DEFAULT)
+    assert.ok(!t14.byDay.some((d) => d.date === dayKey(50)), '50 天前的行不进 14 日窗')
+    const t30 = JSON.parse((await request(port, 'GET', '/api/trends?days=30', { token: TOKEN })).text)
+    assert.strictEqual(t30.byDay.length, 30)
+    assert.ok(t30.byDay.some((d) => d.date === dayKey(20) && d.pushed === 5), '20 天前的行进 30 日窗')
+    const t60 = JSON.parse((await request(port, 'GET', '/api/trends?days=60', { token: TOKEN })).text)
+    assert.strictEqual(t60.byDay.length, 60)
+    assert.ok(t60.byDay.some((d) => d.date === dayKey(50) && d.pushed === 5), '50 天前的行进 60 日窗')
+    for (const bad of ['abc', '3650', '7', '-1', '1e9']) {
+      const t = JSON.parse((await request(port, 'GET', `/api/trends?days=${bad}`, { token: TOKEN })).text)
+      assert.strictEqual(t.byDay.length, TREND_DAYS_DEFAULT, `days=${bad} 必须钳回默认`)
+    }
+    server.close()
+  })
+  await aok('静态红线: app.js 所有 fetch 第一参数均为字面量或字面量起点三元', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    // Codacy SSRF 全绿形态：第一参数是 '/api/...' 字面量，或以字面量起点的三元
+    // （`qs.length > 0 ? `/api/messages?${qs}` : '/api/messages'` —— authority 恒字面量，
+    // PR#227 实测通过形态）。抓的是「第一参数为裸变量/函数调用」的形态。
+    const offenders = []
+    for (const m of src.matchAll(/fetch\(\s*([^,)]{1,60})/g)) {
+      const first = m[1].trim()
+      if (first.startsWith('\'/') || first.startsWith('`/')) continue
+      // 三元：问号任一侧含字面量起点（'/ 或 `/）即视为安全形态
+      if (first.includes('?') && (first.includes('\'/') || first.includes('`/'))) continue
+      offenders.push(first)
+    }
+    assert.deepStrictEqual(offenders, [], `fetch 第一参数必须是字面量或字面量三元：${offenders.join(' | ')}`)
   })
 }
 

@@ -1,5 +1,5 @@
 'use strict'
-// xbk-push 网页控制台（v3.284）：只读看板 + 手动触发。
+// xbk-push 网页控制台（v3.298）：只读看板 + 手动触发。
 //
 // 设计约束（与仓库契约对齐，勿破坏）：
 //   · 只依赖 node 内置模块 + scripts/status.js（零新 npm 依赖，青龙 --omit=dev 环境可用）；
@@ -20,7 +20,11 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
-const { readStatus, formatStatus, readTrends, readMessages } = require('./status')
+const { readStatus, formatStatus, readTrends, readMessages, readMessageCount } = require('./status')
+// v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
+// 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
+const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_KEYS, TOMBSTONE_MAX_BYTES } = require('../xbk_utils')
+const { readSafeTextResult } = require('../xbk_storage')
 const { statusCacheDir } = require('../qinglong/xbk_push')
 
 // 推送缓存文件名：与生产 MessageStore.getFileName(Config.api.pushUrl) 同口径——pushUrl 末段
@@ -83,6 +87,49 @@ const MESSAGES_PAGE_SIZE_MAX = 100
 const MESSAGES_PAGE_MAX = 10000
 // 搜索词长度上限（字节）：UTF-8 下 240 字节足够容纳 80 个汉字，防止超长 query 白耗 CPU。
 const MESSAGES_QUERY_MAX_BYTES = 240
+
+// ── v3.298 只读扩展常量 ─────────────────────────────────────────────────────
+// /api/trends 的 days 白名单：URL 是未验证输入，只放行这三个值（非法/越界一律回默认 14，
+// 向后兼容）。用固定数组 includes 而非正则（用户输入不进正则是本仓红线）。
+const TREND_DAYS_ALLOWED = Object.freeze([14, 30, 60])
+const TREND_DAYS_DEFAULT = 14
+// /api/files 清单条目上限：正常状态目录 ≈10 个文件；截断防异常堆积（.corrupt 残留/误写）
+// 拖垮响应。truncated:true 如实下发，不静默吞。
+const FILES_LIST_MAX = 1000
+// /api/cache-health 的「临近裁剪」判定比例：字节占用达到写入上限的 80% 即预警
+// （下轮 saveBatch 将按字节裁最旧条目并落墓碑——运维该知道缓存快满了）。
+const CACHE_HEALTH_NEAR_RATIO = 0.8
+
+// 健康检查默认上限：entryMax 不取 DEFAULT_MAX_SIZE 常量而是运行侧 Config.cache.maxSize
+// （MessageStore._resolveMaxSize 实际执行的口径）——常量在用户自定义 maxSize 时会展示
+// 一个生产根本不执行的上限。Config 加载失败回退常量。
+function defaultHealthLimits () {
+  // entryMax 与 MessageStore._resolveMaxSize 同口径（Sourcery Medium：报出的 cap 必须等于
+  // 实际强制值）。_resolveMaxSize 用 Utils.num(Config.cache.maxSize, -1) 后
+  // Number.isInteger(v) && v > 0——Utils.num 接受数字字符串（env 覆盖 '5000' 场景），
+  // 并拒绝空串/布尔/对象；这里逐条复刻该语义（不 require Utils：createUtils 依赖注入
+  // safeRe，顶层引用会把那个耦合拖进控制台进程）。
+  let entryMax = DEFAULT_MAX_SIZE
+  try {
+    const app = require('../xbk_function_v3')
+    const ms = app && app.Config && app.Config.cache ? app.Config.cache.maxSize : null
+    let n = null
+    if (typeof ms === 'number' || typeof ms === 'string') {
+      if (typeof ms !== 'string' || ms.trim() !== '') {
+        try { n = Number(ms) } catch (e) { n = null } // Symbol/valueOf 抛错等脏配置回退默认
+        if (typeof n === 'number' && !Number.isFinite(n)) n = null // NaN/Infinity 非法
+      }
+    }
+    if (Number.isInteger(n) && n > 0) entryMax = n
+  } catch (e) { /* 加载失败回退常量 */ }
+  return {
+    writeMaxBytes: MESSAGE_CACHE_MAX_BYTES,
+    consoleReadMaxBytes: MESSAGES_MAX_BYTES,
+    entryMax,
+    tombstoneKeyMax: TOMBSTONE_MAX_KEYS,
+    tombstoneMaxBytes: TOMBSTONE_MAX_BYTES
+  }
+}
 
 // 三种触发模式 → 子进程参数。均跑一轮即退出（--dry-run 与单轮天然退出；--check 只做环境检查），
 // 绝不启动常驻循环（网页服务自己就是长驻进程，嵌套常驻只会制造孤儿）。
@@ -539,6 +586,272 @@ function parseAction (body) {
   return Object.prototype.hasOwnProperty.call(ACTIONS, v) ? v : null
 }
 
+// ── v3.298 只读扩展：配置视图 / 缓存健康 / 文件清单 ──────────────────────────
+// 三者均无用户输入（无 query 参数或白名单参数），零写盘、零 spawn，纯元数据展示。
+// 暴露面论证：所有信息都在同一 token 鉴权之后；文件清单只给名字/大小/mtime（不含内容、
+// 不含路径前缀），敏感度严格低于既有 /api/logs（整份 run.log 正文）。
+
+// 元数据安全探针：逐行镜像 readSafeTextResult 的入口防御（xbk_storage.js 同一 flags 组合
+// O_RDONLY|O_NOFOLLOW）——符号链接 ELOOP 判 unsafe、非普通文件判 unsafe，绝不跟随。
+// 额外带 O_NONBLOCK：裸 O_RDONLY 打开 FIFO 会阻塞等写者（一条恶意替换的命名管道就能
+// 挂死读取端点），非阻塞下 open 立即返回、fstat.isFile() 照样把 FIFO 判 unsafe（对普通
+// 文件 O_NONBLOCK 无语义影响）。
+// 只 stat 不读内容（无读窗口 ⇒ 无 TOCTOU 承重面；观测快照允许毫秒级陈旧）。
+function statSafeMeta (p) {
+  let fd
+  try {
+    fd = fs.openSync(p, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0))
+    const st = fs.fstatSync(fd)
+    if (!st.isFile()) return { status: 'unsafe', size: null, mtimeMs: null }
+    return { status: 'ok', size: st.size, mtimeMs: Math.round(st.mtimeMs) }
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { status: 'missing', size: null, mtimeMs: null }
+    if (e && e.code === 'ELOOP') return { status: 'unsafe', size: null, mtimeMs: null }
+    return { status: 'ioError', size: null, mtimeMs: null }
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd) } catch (e) { /* 忽略 */ } }
+  }
+}
+
+// 墓碑键计数：形状 {v:1, id:[...], urlOnly:[...], idWithUrl:[...], anon:[...]}（MessageStore
+// 四类身份键）。只回计数、绝不回显键内容（键是 id/url，敏感度低于已下发的 /api/messages 全文）。
+// 与 MessageStore._loadTombstones 同口径：只计非空字符串键、按 Set 去重（原始数组长度会把
+// 重复键/非法条目一起计入，虚报活跃墓碑数）。
+// 安全序：先用 statSafeMeta（O_NONBLOCK，FIFO 立即返回）做闸——unsafe 一律不读。readSafeTextResult
+// 的裸 O_RDONLY 打开 FIFO 会阻塞等写者（同步挂死 HTTP 事件循环），绝不能对未过闸的路径调用。
+// 元数据（bytes）取自读到的内容本身（Buffer.byteLength），不做「stat 一次 + 读一次」的两段式
+// ——原子替换发生在两段之间时会把旧文件的大小配新文件的计数（跨代拼接的假快照）。
+// 残余边界（登记）：meta 过闸后、read 开打前纳米级窗口内被换成 FIFO 仍会阻塞——该原语
+// （readSafeTextResult）被全部读取端点共用，在其内部加 O_NONBLOCK 属跨切面改动（影响 F1
+// 恢复链与既有变异基线），不在本 PR 范围；观测面已被 meta 闸收窄到「替换竞态」。
+function tombstoneCounts (stateDir, messagesFile) {
+  const p = path.join(stateDir, `${messagesFile}.seen.json`)
+  const counts = { id: 0, urlOnly: 0, idWithUrl: 0, anon: 0, total: 0 }
+  const meta = statSafeMeta(p)
+  if (meta.status === 'unsafe' || meta.status === 'ioError') {
+    return { status: meta.status, bytes: null, counts }
+  }
+  // FIFO TOCTOU（Sourcery High）：meta 闸与读之间路径可被换成 FIFO——readSafeTextResult
+  // 开 openNonBlocking，open 立即返回（普通文件不变，FIFO→unsafe），绝不阻塞等写者。
+  const read = readSafeTextResult(p, TOMBSTONE_MAX_BYTES, { openNonBlocking: true })
+  if (read.status !== 'ok') return { status: read.status, bytes: null, counts }
+  const bytes = Buffer.byteLength(String(read.text || ''), 'utf8')
+  try {
+    const parsed = JSON.parse(read.text)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const k of ['id', 'urlOnly', 'idWithUrl', 'anon']) {
+        const arr = parsed[k]
+        if (Array.isArray(arr)) {
+          const uniq = new Set()
+          for (const key of arr) if (typeof key === 'string' && key !== '') uniq.add(key)
+          counts[k] = uniq.size
+          counts.total += uniq.size
+        }
+      }
+    } else {
+      return { status: 'invalid', bytes, counts }
+    }
+  } catch (e) {
+    return { status: 'invalid', bytes, counts }
+  }
+  return { status: 'ok', bytes, counts }
+}
+
+// 缓存健康快照（GET /api/cache-health）：push.json 字节占用对照两级上限（生产写端 64MiB /
+// 控制台读端 32MiB），nearTrim/overLimit/consoleReadable 三位预警 + 墓碑计数。
+// 条数不在此读（数条数要 32MiB 整读，与轮询不兼容）——前端用 /api/messages 的 grandTotal
+// 对照 limits.entryMax 自行预警。
+function cacheHealthSnapshot (stateDir, messagesFile, limits) {
+  const lim = limits || defaultHealthLimits()
+  const meta = statSafeMeta(path.join(stateDir, messagesFile))
+  const tomb = tombstoneCounts(stateDir, messagesFile)
+  const bytes = meta.status === 'ok' ? meta.size : null
+  const writeRatio = bytes !== null && lim.writeMaxBytes > 0
+    ? Math.round((bytes / lim.writeMaxBytes) * 10000) / 10000
+    : null
+  return {
+    status: meta.status,
+    file: messagesFile,
+    bytes,
+    mtimeMs: meta.status === 'ok' ? meta.mtimeMs : null,
+    limits: lim,
+    writeRatio,
+    nearTrim: writeRatio !== null && writeRatio >= CACHE_HEALTH_NEAR_RATIO && writeRatio <= 1,
+    overLimit: bytes !== null && bytes > lim.writeMaxBytes,
+    consoleReadable: bytes !== null && bytes <= lim.consoleReadMaxBytes,
+    tombstone: { status: tomb.status, bytes: tomb.bytes, counts: tomb.counts }
+  }
+}
+
+// 状态目录文件清单（GET /api/files）：readdir + lstat（Dirent 天然不跟随末级符号链接——
+// O_NOFOLLOW 的元数据等价物）。普通文件的元数据同样用 lstat（statSync 会跟随「readdir 与
+// stat 之间被替换成符号链接」的竞态，泄露目标元数据；lstat + isFile() 双重判定把该窗口
+// 收窄为「条目按 symlink 展示」）。lstat 竞态消失（ENOENT/EACCES）→ 跳过该条：best-effort
+// 快照。
+function listStateFiles (stateDir, messagesFile) {
+  let dirents
+  try {
+    dirents = fs.readdirSync(stateDir, { withFileTypes: true })
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { status: 'missing', total: 0, truncated: false, files: [] }
+    return { status: 'ioError', total: 0, truncated: false, files: [] }
+  }
+  // 提前截断（Sourcery Medium：异常堆积目录逐条 lstat+存储+排序无界）：readdir 是单次
+  // 系统调用本身有界，O(n) 同步工作量在逐条 lstat——只对前 FILES_LIST_MAX 个条目做
+  // lstat/建对象/排序，其余仅计数。total 仍报目录真实条目数；保留哪一千个按 readdir 序，
+  // 纯展示面不承诺「保留哪个」——truncated:true 已如实标注。
+  const truncated = dirents.length > FILES_LIST_MAX
+  const keptDirents = truncated ? dirents.slice(0, FILES_LIST_MAX) : dirents
+  const all = []
+  for (const d of keptDirents) {
+    if (!d.isFile()) {
+      // symlink/dir/other：只报类型不给大小（不跟随、不泄露目标元数据）
+      all.push({ name: d.name, kind: d.isSymbolicLink() ? 'symlink' : d.isDirectory() ? 'dir' : 'other', bytes: null, mtimeMs: null, type: 'other' })
+      continue
+    }
+    try {
+      // lstat 不跟随：条目在 readdir 与 lstat 之间被换成符号链接时，isFile() 为 false
+      // → 按 symlink 异常条目展示，绝不返回目标的 size/mtime。
+      const st = fs.lstatSync(path.join(stateDir, d.name), { throwIfNoEntry: false })
+      if (!st) continue
+      if (!st.isFile()) {
+        all.push({ name: d.name, kind: st.isSymbolicLink() ? 'symlink' : 'other', bytes: null, mtimeMs: null, type: 'other' })
+        continue
+      }
+      all.push({ name: d.name, kind: 'file', bytes: st.size, mtimeMs: Math.round(st.mtimeMs), type: classifyStateFile(d.name, messagesFile) })
+    } catch (e) { /* 竞态消失：跳过 */ }
+  }
+  // （提前截断见循环前注释；此处 truncated 已在上方按 dirents.length 判定）。
+  const kept = all
+  kept.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  // total = readdir 所见条目数（含未 lstat 的被截断条目与竞态消失条目）；files 才是明细。
+  return { status: 'ok', total: dirents.length, truncated, files: kept }
+}
+
+// 文件用途分类（按序精确匹配/前后缀，无正则）。遵循 F4 教训：精确形状，不用子串包含——
+// `xxx.seen.cleanup.lock.json` 是合法缓存文件，`endsWith('.lock')` 不会误吞它（含 .json 后缀）。
+function classifyStateFile (name, messagesFile) {
+  if (name === messagesFile) return 'cache'
+  if (name === `${messagesFile}.seen.json`) return 'tombstone'
+  // F4 教训：上游 pushUrl 末段恰为 `xxx.seen.cleanup.lock` 时，缓存名 = `xxx.seen.cleanup.lock.json`
+  // ——这是**合法缓存文件**，绝不能因为名字含 .lock 被归进 lock（暗示异常）。
+  if (name.endsWith('.seen.cleanup.lock.json')) return 'cache'
+  if (name === 'console-lastaccept.json') return 'console'
+  if (name === 'console-trigger.lock' || name === '.seen.cleanup.lock' ||
+    name.endsWith('.lock') || name.endsWith('.takeover') || name.endsWith('.reclaim')) return 'lock'
+  if (name.endsWith('.bak')) return 'backup'
+  if (name.endsWith('.tmp')) return 'temp'
+  if (name === 'report.state' || name === 'channel-health.state' || name === 'alert.state' ||
+    name === 'filter.hash' || name.startsWith('re2warn.state.')) return 'state'
+  if (name === 'run.log' || name === 'filter-diagnostics.ndjson') return 'log'
+  return 'other'
+}
+
+// 「已配置」布尔判定（配置视图专用）：值绝不进入响应对象，只允许布尔判定经过这里。
+// boolean 原样返回（false 就是未启用）；字符串 trim 后非空才算（空白串=未配置）；
+// 其余类型只否定 null/undefined（数字 0 视为「已设置」）。
+function configuredFlag (v) {
+  if (typeof v === 'boolean') return v
+  if (typeof v === 'string') return v.trim().length > 0
+  return v != null
+}
+
+// 运行配置脱敏视图（GET /api/config）：**显式逐字段白名单**——禁止泛型拷贝
+// （Object.keys/JSON.stringify(Config) 会让未来新增的密钥字段自动泄漏，白名单必须逐字段手写，
+// 加字段时人工过一遍敏感面）。推送密钥值永不进响应：只经 sendNotify 已导出的
+// configuredChannelCount/configuredChannelNames/hasWxPusherConfigured 做布尔/计数判定，
+// 值不落任何中间对象。两个 require 都 try/catch 懒加载：加载失败 → loaded:false，
+// 端点仍 200（与 sourceDomain 同款，缺 got 的残部署不 500）。
+function buildConfigView () {
+  let cfg = null
+  let configLoaded = false
+  try {
+    const app = require('../xbk_function_v3')
+    if (app && app.Config && typeof app.Config === 'object') { cfg = app.Config; configLoaded = true }
+  } catch (e) { /* 残部署降级 */ }
+  const pushUrl = configLoaded && cfg.api ? String(cfg.api.pushUrl) : ''
+  const dirEffective = runtimeCacheDir()
+  // 缓存目录生效值：优先运行侧解析结果，取不到回退原始配置值
+  const dirConfigured = configLoaded && cfg.cache ? String(cfg.cache.dir) : ''
+  const effDir = dirEffective || dirConfigured
+  const view = {
+    configLoaded,
+    runtime: configLoaded
+      ? {
+          domain: String(cfg.domain),
+          api: { pushUrl, timeout: cfg.api.timeout, retry: cfg.api.retry },
+          push: { mode: String(cfg.push.mode), parallelLimit: cfg.push.parallelLimit, titleMax: cfg.push.titleMax, contentMax: cfg.push.contentMax, maxPerRun: cfg.push.maxPerRun },
+          timing: { pushInterval: cfg.timing.pushInterval, finalWait: cfg.timing.finalWait },
+          cache: { maxSize: cfg.cache.maxSize, dirConfigured, dirEffective: effDir },
+          alert: { enabled: configuredFlag(cfg.alert.enabled), intervalMs: cfg.alert.intervalMs },
+          report: { enabled: configuredFlag(cfg.report.enabled) },
+          channelHealth: { enabled: configuredFlag(cfg.channelHealth.enabled), consecutiveFailures: cfg.channelHealth.consecutiveFailures, intervalMs: cfg.channelHealth.intervalMs },
+          diagnostics: { filterLog: { enabled: configuredFlag(cfg.diagnostics.filterLog.enabled), maxDetailsPerRun: cfg.diagnostics.filterLog.maxDetailsPerRun, includePassed: configuredFlag(cfg.diagnostics.filterLog.includePassed) } },
+          storage: { minFreeBytes: cfg.storage.minFreeBytes },
+          template: { title: String(cfg.template.title), content: String(cfg.template.content) },
+          // 过滤规则与关键词也是**显式字段清单**（不用 spread）——与顶层同一白名单纪律：
+          // 未来有人往 Config.filter 加敏感字段时，spread 会把它自动带进响应。
+          filter: {
+            pingbifenlei: String(cfg.filter.pingbifenlei),
+            pingbibiaoti: String(cfg.filter.pingbibiaoti),
+            zhanxianbiaoti: String(cfg.filter.zhanxianbiaoti),
+            pingbibiaotiplus: String(cfg.filter.pingbibiaotiplus),
+            pingbineirong: String(cfg.filter.pingbineirong),
+            zhanxianneirong: String(cfg.filter.zhanxianneirong),
+            pingbineirongplus: String(cfg.filter.pingbineirongplus),
+            pingbilouzhu: String(cfg.filter.pingbilouzhu),
+            zhanxianlouzhu: String(cfg.filter.zhanxianlouzhu),
+            pingbilouzhuplus: String(cfg.filter.pingbilouzhuplus),
+            pingbitime: String(cfg.filter.pingbitime)
+          },
+          keyword: { zkt_gjc: String(cfg.keyword.zkt_gjc) }
+        }
+      : null,
+    pushChannels: buildPushChannelsView(),
+    console: {
+      env: {
+        // 只报「是否设置了」，值绝不入响应（XBK_INTERVAL_MS 等非密钥，但口径从严统一）
+        intervalMs: configuredFlag(process.env.XBK_INTERVAL_MS),
+        cacheDir: configuredFlag(process.env.XBK_CACHE_DIR),
+        dryRun: configuredFlag(process.env.XBK_DRY_RUN)
+      }
+    }
+  }
+  return view
+}
+
+// 推送渠道配置状态：只经 sendNotify 已导出的布尔/计数接口（configuredChannelNames 的
+// canonical 名与 perChannel 键一一对应），密钥值全程不离开 sendNotify 模块作用域。
+function buildPushChannelsView () {
+  const view = { moduleLoaded: false, count: 0, names: [], perChannel: {}, localFilePresent: false }
+  try {
+    const notify = require('../xbk_sendNotify_slim')
+    view.moduleLoaded = true
+    const names = notify.configuredChannelNames()
+    view.count = typeof notify.configuredChannelCount() === 'number' ? notify.configuredChannelCount() : 0
+    view.names = names
+    view.perChannel = {
+      pushplus: names.includes('pushplus'),
+      serverchan: names.includes('server酱'),
+      bark: names.includes('bark'),
+      wecom: names.includes('企业微信'),
+      wxpusher: names.includes('wxpusher'),
+      xizhi: names.includes('息知'),
+      pushdeer: names.includes('pushdeer'),
+      pushme: names.includes('pushme'),
+      telegram: names.includes('telegram')
+    }
+    // wxpusher 只报「已配置」布尔（应用条数内部接口未导出，不伸手进内部结构拿值）
+    view.wxpusher = { configured: notify.hasWxPusherConfigured() === true }
+  } catch (e) { /* 模块加载失败（如缺 got）：如实 moduleLoaded:false */ }
+  // 只报「本地配置文件存在」（existsSync 语义）——sendNotify 对「文件存在但导出格式异常」
+  // 会拒绝应用并告警，控制台无法从外部区分，绝不谎报「已加载」（值本身也绝不读取）。
+  try {
+    view.localFilePresent = fs.existsSync(path.join(__dirname, '..', 'push_config.local.js'))
+  } catch (e) { /* existsSync 异常按不存在 */ }
+  return view
+}
+
 function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json' }) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
@@ -770,11 +1083,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/trends') {
-      // 近 14 日运行趋势：run.log 摘要行按日聚合（scripts/status.js readTrends，
-      // 与 parseLastRun 同一正则口径）。missing/invalid 如实下发。
-      const t = readTrends(stateDir)
+      // 近 N 日运行趋势：run.log 摘要行按日聚合（scripts/status.js readTrends，与 parseLastRun
+      // 同一正则口径）。days 走白名单（14/30/60），非法/缺省/越界一律回默认 14——向后兼容；
+      // readTrends 对 days 无内部钳制，这里的白名单是唯一防线。
+      const rawDays = Number(url.searchParams.get('days'))
+      const days = TREND_DAYS_ALLOWED.includes(rawDays) ? rawDays : TREND_DAYS_DEFAULT
+      const t = readTrends(stateDir, { days })
       if (t.status !== 'ok') {
-        sendJson(res, 200, { status: t.status, byDay: [] })
+        sendJson(res, 200, { status: t.status, byDay: [], days })
         return
       }
       sendJson(res, 200, {
@@ -801,6 +1117,43 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         return
       }
       sendJson(res, 200, { status: 'ok', text: safe.text })
+      return
+    }
+    // ── v3.298 只读扩展端点：缓存健康 / 文件清单 / 配置视图 ─────────────────────
+    // 全部无副作用（不写盘、不 spawn），鉴权与既有读取端点同一全局闸。
+    if (req.method === 'GET' && url.pathname === '/api/cache-health') {
+      const snap = cacheHealthSnapshot(stateDir, messagesFile)
+      // 条目数对照（Sourcery Medium「条目上限无预警」）：条数维度由 /api/status 同源数据
+      // 提供——这里顺带读一次（readMessages 复用同一 32MiB 封顶，tooLarge 时 count:null，
+      // 前端显示「—」不编数）。缓存健康是进页/手动刷新拉取，不在 5s 轮询里，读放大可控。
+      const cnt = readMessageCount(stateDir, { filename: messagesFile })
+      snap.entryCount = cnt.status === 'ok' ? cnt.count : null
+      snap.entryCountStatus = cnt.status
+      sendJson(res, 200, snap)
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/files') {
+      const list = listStateFiles(stateDir, messagesFile)
+      sendJson(res, 200, list)
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/config') {
+      // 脱敏在 buildConfigView 内逐字段白名单完成；这里只做最终保险丝：
+      // 万一未来白名单意外混入凭证形态字段，响应前整体拦一道（fail-closed 降级为不含
+      // runtime 的骨架）。检测纯字符串形态匹配（键名小写 includes，无正则、无用户输入）。
+      const view = buildConfigView()
+      const blob = JSON.stringify(view).toLowerCase()
+      const SECRET_MARKERS = ['appToken', 'PUSH_PLUS_TOKEN', 'PUSH_KEY', 'BARK_PUSH', 'QYWX_KEY', 'WX_XIZHI_KEY', 'DEER_KEY', 'PUSHME_KEY', 'TG_BOT_TOKEN', 'TG_USER_ID']
+      let leaked = false
+      for (const marker of SECRET_MARKERS) {
+        // 值泄漏形态 = 「"字段名":"非空值"」整段出现（perChannel 布尔不含引号值，不误伤）
+        if (blob.includes(`"${marker.toLowerCase()}":"`)) { leaked = true; break }
+      }
+      if (leaked) {
+        sendJson(res, 200, { configLoaded: false, runtime: null, pushChannels: { moduleLoaded: false, count: 0, names: [], perChannel: {}, localFileLoaded: false }, console: { env: {} }, redacted: true })
+        return
+      }
+      sendJson(res, 200, view)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/sys') {
@@ -1090,5 +1443,18 @@ module.exports = {
   ACTIONS,
   TOKEN_MIN_LEN,
   RUN_LOG_MAX_BYTES,
-  PROC_TIMEOUT_MS
+  PROC_TIMEOUT_MS,
+  // v3.298 只读扩展：纯函数/常量导出（非 HTTP 单测 + 变异测试可达性）
+  statSafeMeta,
+  tombstoneCounts,
+  cacheHealthSnapshot,
+  listStateFiles,
+  classifyStateFile,
+  buildConfigView,
+  configuredFlag,
+  defaultHealthLimits,
+  TREND_DAYS_ALLOWED,
+  TREND_DAYS_DEFAULT,
+  FILES_LIST_MAX,
+  CACHE_HEALTH_NEAR_RATIO
 }

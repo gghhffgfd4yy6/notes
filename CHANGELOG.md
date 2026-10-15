@@ -375,3 +375,13 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - `scripts/status.js` 新增 `readTrends` / `readMessages`（与 readStatus 同源同目录、同一符号链接/非常规文件防御），readStatus 返回形状不变——`--status` 与既有前端零影响。
 - 搜索用 `includes` 子串匹配不用正则（用户输入进正则有 ReDoS 面，本仓正则防护红线）；查询词 240 字节封顶。
 - 测试 +4：消息三态/分页钳制/过滤/倒序、trends 按日聚合与窗口外剔除、logs 尾读、sys 无凭证 401 与无环境变量泄漏。
+
+## v3.298
+
+- **控制台新增「配置」标签页（脱敏配置视图）**：新增只读端点 `GET /api/config`——运行配置（域名/推送接口/超时重试/推送模式与并发/单轮上限/缓存上限/告警与诊断开关/推送模板/过滤规则/关键词）原值下发；推送渠道只显示「已配置/未配置」布尔与渠道名（经 `xbk_sendNotify_slim` 已导出的 `configuredChannelCount`/`configuredChannelNames`/`hasWxPusherConfigured` 判定，**密钥值永不进入响应对象**，值全程不离开 sendNotify 模块作用域）。白名单**显式逐字段**构造（禁止 `Object.keys`/`JSON.stringify(Config)` 泛型拷贝——未来新增密钥字段不会自动泄漏）；响应前再过一道密钥键名形态保险丝，命中即降级为不含 runtime 的骨架（fail-closed）。环境变量只报「是否设置」布尔。前端新「配置」标签页逐项表格展示。
+- **缓存健康卡片（概览页）**：新增只读端点 `GET /api/cache-health`——`statSafeMeta` 以 `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` 打开 + `fstat`（镜像 `readSafeTextResult` 入口防御；**O_NONBLOCK 防一条恶意替换的 FIFO 挂死端点**，符号链接/FIFO 判 unsafe 绝不跟随），下发 push.json 字节数/mtime 对照两级上限（生产写端 64MiB、控制台读端 32MiB）与 `nearTrim`（占用 ≥80% 预警下轮自动裁剪）/`overLimit`/`consoleReadable` 三位预警；墓碑文件计数（四类身份键条数，**只回计数不回显键**，走 `readSafeTextResult` 本尊继承读后复检契约，invalid 如实下发）。条数维度由前端用 `/api/messages` 的 `grandTotal` 对照 `limits.entryMax` 自行预警（本端点不整读 32MiB）。
+- **缓存目录文件清单（系统页）**：新增只读端点 `GET /api/files`——`readdirSync(withFileTypes)` + 逐项 `lstat`（Dirent 不跟随末级符号链接，O_NOFOLLOW 的元数据等价物），下发 `{name, kind, bytes, mtimeMs, type}`（只有普通文件给大小；symlink/dir 作为异常条目显性暴露且 `bytes:null`——不泄露目标元数据）。`type` 分类按精确形状匹配（F4 教训：`xxx.seen.cleanup.lock.json` 是合法缓存不误归 lock）。`FILES_LIST_MAX=1000` 截断并 `truncated:true` 如实标注；名称只含文件名不含路径成分。
+- **趋势窗口可调**：`GET /api/trends` 支持 `days` 参数，白名单 `[14,30,60]`（`Number` + 数组 `includes`，无正则；非法/缺省/越界一律回 14 向后兼容——`readTrends` 内部无钳制，此白名单是唯一防线）。前端趋势标题旁 14/30/60 天选择器，标题与合计文案随窗口参数化。
+- 前端新增 API 函数（`apiGetCacheHealth`/`apiGetFiles`/`apiGetConfig`，fetch 第一参数均为纯字面量）与三个面板组件（缓存健康进概览页、文件清单进系统页、配置独立标签页；均进页加载 + 手动刷新，不进 5s 主轮询）；测试新增静态红线用例：app.js 所有 `fetch` 第一参数必须是 `'/api/…'` 字面量或字面量起点三元。
+- 测试 +9（test_console.js，53 用例）：statSafeMeta 三态（含 FIFO 不阻塞回归）、classifyStateFile 分类与 F4 反例、listStateFiles（symlink 显性/名称无路径/截断）、tombstoneCounts（计数/invalid）、cacheHealthSnapshot（0.8 边界/超限/limits 注入）、buildConfigView 白名单形状锁死与 configuredFlag 语义（boolean 直通修复：`false` 曾被 `!= null` 误判为 true）、三个新端点 HTTP 鉴权与脱敏断言、trends days 白名单、fetch 字面量静态闸。
+- 已知边界（有意取舍）：`/api/config` 的 `runtime` 节点为 `Config` 静态默认值（控制台进程不感知运行时覆写——本仓运行时无 `Object.assign(Config)` 写点，语义一致）；`wxpusher` 只报布尔不报应用条数（内部解析未导出，不伸手进模块内部结构）。
