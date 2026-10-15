@@ -45,9 +45,12 @@ function fmtNum (n) {
   return (n === undefined || n === null) ? '—' : String(n)
 }
 
-// 字节人性化（v3.298 上提为模块级：系统信息与缓存健康面板共用）
+// 字节人性化（v3.298 上提为模块级：系统信息与缓存健康面板共用）；0 字节是真实大小，
+// 显式显示「0 B」而不是「—」（— 意为未知/不适用，会掩盖 0 字节文件的异常）。
 function fmtBytes (b) {
-  return (typeof b === 'number' && b > 0) ? `${(b / 1048576).toFixed(1)} MB` : '—'
+  if (typeof b !== 'number' || !Number.isFinite(b) || b < 0) return '—'
+  if (b === 0) return '0 B'
+  return `${(b / 1048576).toFixed(1)} MB`
 }
 
 // ── API ─────────────────────────────────────────────────────────────────────
@@ -606,6 +609,11 @@ function TrendsPanel () {
   const fetchTrends = useCallback(() => apiGetTrends(days), [days])
   const { data: trends, err, load } = usePanelLoader(fetchTrends)
   useEffect(() => { load().catch(() => {}) }, [load])
+  // 展示口径只认「响应自带的 days」：切窗口后旧响应未替换（请求中/失败）时，
+  // 标题与合计必须跟随旧窗口的数据，不能拿着旧数据标新窗口。
+  const shownDays = trends && Number.isSafeInteger(trends.days) && TREND_DAYS.includes(trends.days)
+    ? trends.days
+    : (trends ? null : days) // 尚无任何响应时才用当前选择器值占位
   const byDay = trends && trends.status === 'ok' ? trends.byDay : []
   const maxPushed = Math.max(1, ...byDay.map((d) => d.pushed))
   const totalAll = byDay.reduce((acc, d) => acc + d.pushed, 0)
@@ -614,7 +622,7 @@ function TrendsPanel () {
   const todayKey = trends && trends.today ? trends.today : ''
   return html`<div class="panel">
     <div class="panel-head">
-      <span class="panel-title">近 ${days} 日运行趋势</span>
+      <span class="panel-title">${shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势'}</span>
       <select class="msg-select" value=${days} onChange=${(e) => setDays(Number(e.target.value))} aria-label="趋势窗口天数">
         ${TREND_DAYS.map((d) => html`<option key=${d} value=${d}>${d} 日</option>`)}
       </select>
@@ -632,19 +640,26 @@ function TrendsPanel () {
           <span class=${'trend-day' + (d.date === todayKey ? ' today' : '')}>${d.date.slice(5)}</span>
         </div>`)}
       </div>
-      <div class="trend-meta">${days} 日共推送 ${totalAll} 条 · 失败 ${failAll} 条 · 每日轮次与抓取数悬停列查看</div>
+      <div class="trend-meta">${shownDays || ''} 日共推送 ${totalAll} 条 · 失败 ${failAll} 条 · 每日轮次与抓取数悬停列查看</div>
     </div>`}
   </div>`
 }
 
 // 缓存健康（v3.298）：判重缓存字节占用对照两级上限 + 墓碑计数。纯只读快照，
 // 进概览页拉一次 + 手动刷新，不进 5s 主轮询（墓碑解析最坏 8MiB，不与状态轮询抢盘）。
+// 条数维度：服务端在响应里附带 entryCount（readMessageCount，与 /api/messages 同一
+// 32MiB 封顶与防御；tooLarge 时 null 如实显示），对照 limits.entryMax 预警。
 function CacheHealthPanel () {
   const { data, err, load } = usePanelLoader(apiGetCacheHealth)
   useEffect(() => { load().catch(() => {}) }, [load])
   const ok = data && data.status === 'ok'
   const ratioText = ok && data.writeRatio != null ? `${(data.writeRatio * 100).toFixed(1)}%` : '—'
   const tomb = data && data.tombstone ? data.tombstone : null
+  // 条数预警：服务端在 cache-health 响应里附带 entryCount（/api/status 同源的
+  // readMessageCount；tooLarge 时 null）对照写端条目上限；接近上限时下轮保存
+  // 会裁最旧条目（与字节裁剪同一出口）。
+  const entryNear = ok && typeof data.entryCount === 'number' && data.entryCount >= data.limits.entryMax * 0.8
+  const entryOver = ok && typeof data.entryCount === 'number' && data.entryCount >= data.limits.entryMax
   return html`<div class="panel">
     <div class="panel-head">
       <span class="panel-title">缓存健康</span>
@@ -658,10 +673,10 @@ function CacheHealthPanel () {
       <table class="sys-table"><tbody>
         <tr><td>缓存大小</td><td>${fmtBytes(data.bytes)}（上限 ${fmtBytes(data.limits.writeMaxBytes)}）</td></tr>
         <tr><td>占用比例</td><td>${ratioText}${data.nearTrim ? ' · ⚠️ 临近字节裁剪' : ''}${data.overLimit ? ' · ⛔ 已超写端上限' : ''}</td></tr>
-        <tr><td>控制台可读</td><td>${data.consoleReadable ? '是（推送记录页可浏览）' : '否——超过 32 MiB 读取封顶，推送记录页显示「过大不可读」（生产不受影响）'}</td></tr>
+        <tr><td>条目数</td><td>${ok && typeof data.entryCount === 'number' ? `${data.entryCount} / ${data.limits.entryMax} 条上限${entryOver ? ' · ⛔ 已达上限，旧记录将被裁剪' : entryNear ? ' · ⚠️ 临近条目上限' : ''}` : `上限 ${data.limits.entryMax} 条${ok && data.entryCountStatus === 'tooLarge' ? '（当前条数不可得：缓存超控制台读取封顶）' : '（进推送记录页获取当前条数）'}`}</td></tr>
+        <tr><td>控制台可读</td><td>${data.consoleReadable ? '是——未超 32 MiB 控制台读取封顶（超限与否以推送记录页实际显示为准，JSON 损坏时该页会显示「记录不可读」）' : '否——超过 32 MiB 读取封顶，推送记录页显示「过大不可读」（生产不受影响）'}</td></tr>
       </tbody></table>
       <table class="sys-table"><tbody>
-        <tr><td>条目上限</td><td>${data.limits.entryMax} 条（推送记录页总数见标签页）</td></tr>
         <tr><td>墓碑状态</td><td>${tomb ? (tomb.status === 'ok' ? '正常' : tomb.status === 'missing' ? '尚未生成（首轮前正常）' : `异常（${tomb.status}）`) : '—'}${tomb && tomb.status === 'ok' ? ` · ${tomb.counts.total} 键` : ''}</td></tr>
         <tr><td>最近写入</td><td>${data.mtimeMs ? fmtTime(data.mtimeMs) : '—'}（停滞 = 推送链路可能断了）</td></tr>
       </tbody></table>
@@ -876,7 +891,7 @@ function ConfigPanel () {
         <tr><td>通道健康监测</td><td>${r.channelHealth.enabled ? `开（连续失败 ${r.channelHealth.consecutiveFailures} 次告警）` : '关'}</td></tr>
         <tr><td>过滤诊断日志</td><td>${r.diagnostics.filterLog.enabled ? `开（每轮最多 ${r.diagnostics.filterLog.maxDetailsPerRun} 条）` : '关'}</td></tr>
         <tr><td>磁盘余量告警</td><td>${r.storage.minFreeBytes >= 0 ? `低于 ${fmtBytes(r.storage.minFreeBytes)} 时告警` : '—'}</td></tr>
-        <tr><td>运行环境变量</td><td>${data.console && data.console.env ? ['intervalMs', 'cacheDir', 'dryRun'].filter((k) => data.console.env[k]).map((k) => `XBK_${k.toUpperCase()} 已设置`).join('，') || '无覆盖' : '—'}</td></tr>
+        <tr><td>运行环境变量</td><td>${data.console && data.console.env ? [['intervalMs', 'XBK_INTERVAL_MS'], ['cacheDir', 'XBK_CACHE_DIR'], ['dryRun', 'XBK_DRY_RUN']].filter(([k]) => data.console.env[k]).map(([, label]) => `${label} 已设置`).join('，') || '无覆盖' : '—'}</td></tr>
       </tbody></table>
     </div>`}
     ${r && html`<table class="sys-table" style="margin-top:12px"><tbody>
@@ -887,7 +902,7 @@ function ConfigPanel () {
     ${pc && html`<table class="sys-table" style="margin-top:12px"><tbody>
       <tr><td>推送渠道</td><td>${pc.moduleLoaded ? (pc.count > 0 ? `已配置 ${pc.count} 个：${pc.names.join('、')}` : '未配置任何渠道') : '配置模块加载失败（检查依赖）'}</td></tr>
       <tr><td>渠道明细</td><td>${chanNames.map((k) => `${k}：${pc.perChannel[k] ? '✅ 已配置' : '未配置'}`).join(' · ')}</td></tr>
-      <tr><td>本地配置文件</td><td>${pc.localFileLoaded ? 'push_config.local.js 已加载（密钥不入库不入页面）' : '未找到（用环境变量或该文件配置推送）'}</td></tr>
+      <tr><td>本地配置文件</td><td>${pc.localFilePresent ? 'push_config.local.js 存在（sendNotify 启动时加载；格式异常会在运行日志告警。密钥不入库不入页面）' : '未找到（用环境变量或该文件配置推送）'}</td></tr>
     </tbody></table>`}
     <div class="hint" style="margin-top:12px">本页为脱敏视图：所有推送密钥（appToken / BOT token 等）的值永不出现在页面或接口响应中，只显示「已配置 / 未配置」。修改配置请编辑 push_config.local.js 或环境变量后重启。</div>
   </div>`

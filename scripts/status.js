@@ -178,6 +178,16 @@ function readStatus (dir, { now = Date.now() } = {}) {
   return { generatedAt: now, report, channels, run, diagnostics }
 }
 
+// 判重缓存条数（v3.298 附加部件，与 readStatus 同目录同防御）：控制台缓存健康面板的
+// 「条目数 / 上限」预警需要它，但 readStatus 形状被 --status 与既有前端锁定（不能改），
+// 故独立导出。只回计数不回显条目（调用方要详情另有 readMessages）；超限的缓存数条数
+// 要整读 32MiB——tooLarge 时如实返回 tooLarge（null），前端显示「—」而不是编个数。
+function readMessageCount (dir, { filename = FILES.messages } = {}) {
+  const read = readMessages(dir, { filename })
+  if (read.status !== 'ok') return { status: read.status, count: null }
+  return { status: 'ok', count: read.value.total }
+}
+
 function describe (part) {
   return part.status === 'missing' ? '缺失' : part.status === 'ok' ? '正常' : `不可读（${part.status}）`
 }
@@ -314,4 +324,4 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   return result('ok', { total: items.length, items, keys, categories, skipped })
 }
 
-module.exports = { readStatus, formatStatus, readTrends, readMessages, RUN_SUMMARY_LINE_RE }
+module.exports = { readStatus, formatStatus, readTrends, readMessages, readMessageCount, RUN_SUMMARY_LINE_RE }

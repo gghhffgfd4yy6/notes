@@ -846,10 +846,15 @@ async function main () {
     fs.symlinkSync('/etc', path.join(dir, 'dirlink'))
     assert.strictEqual(statSafeMeta(path.join(dir, 'dirlink')).status, 'unsafe', '指向目录外也不跟随')
     assert.strictEqual(statSafeMeta(path.join(dir, 'ghost.json')).status, 'missing')
-    // FIFO（非普通文件）：fstat.isFile() 为 false → unsafe
-    const { execFileSync } = require('node:child_process')
-    execFileSync('mkfifo', [path.join(dir, 'pipe')])
+    // FIFO（非普通文件）：fstat.isFile() 为 false → unsafe；O_NONBLOCK 保证不阻塞等写者。
+    // mkfifo 需要专用系统调用（Node 22 无 mkfifoSync）——用 coreutils 绝对路径
+    // （Sonar S4036：不做可写目录 PATH 查找），普通文件先删除再建 FIFO。
+    const fifo = path.join(dir, 'pipe')
+    fs.rmSync(fifo, { force: true })
+    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifo])
+    const t0 = Date.now()
     assert.strictEqual(statSafeMeta(path.join(dir, 'pipe')).status, 'unsafe')
+    assert.ok(Date.now() - t0 < 2000, 'FIFO 打开必须立即返回（O_NONBLOCK），不得阻塞等写者')
   })
   await aok('只读纯函数: classifyStateFile 分类与 F4 反例（.seen.cleanup.lock.json 是缓存不是锁）', () => {
     assert.strictEqual(classifyStateFile('push.json', 'push.json'), 'cache')
@@ -898,17 +903,18 @@ async function main () {
     // 目录不存在 → missing
     assert.strictEqual(listStateFiles(path.join(dir, 'nope'), 'push.json').status, 'missing')
   })
-  await aok('只读纯函数: tombstoneCounts（计数 / 键不回显 / invalid 如实）', () => {
+  await aok('只读纯函数: tombstoneCounts（去重计数同 _loadTombstones / invalid 如实 / unsafe 不读）', () => {
     const dir = tmpDir()
-    const tomb = { v: 1, id: ['a', 'b'], urlOnly: ['c'], idWithUrl: [], anon: ['d', 'e', 'f'] }
+    // 重复键 + 非法条目：与 MessageStore._loadTombstones 同口径——只计非空字符串、Set 去重
+    const tomb = { v: 1, id: ['a', 'b', 'a', 42, ''], urlOnly: ['c'], idWithUrl: [], anon: ['d', 'e', 'f', 'd'] }
     fs.writeFileSync(path.join(dir, 'push.json.seen.json'), JSON.stringify(tomb))
     const r = tombstoneCounts(dir, 'push.json')
     assert.strictEqual(r.status, 'ok')
-    assert.strictEqual(r.meta.status, 'ok')
-    assert.strictEqual(r.counts.id, 2)
+    assert.strictEqual(r.counts.id, 2, '重复键与非法条目不计（同 _loadTombstones 的 Map 去重口径）')
     assert.strictEqual(r.counts.urlOnly, 1)
     assert.strictEqual(r.counts.anon, 3)
     assert.strictEqual(r.counts.total, 6)
+    assert.strictEqual(r.bytes, Buffer.byteLength(JSON.stringify(tomb)), 'bytes 取自读到的内容本身（单段式，无跨代拼接）')
     // invalid：非对象 JSON / 坏 JSON → invalid 而非崩溃
     fs.writeFileSync(path.join(dir, 'push.json.seen.json'), 'not-json')
     assert.strictEqual(tombstoneCounts(dir, 'push.json').status, 'invalid')
@@ -920,6 +926,18 @@ async function main () {
     assert.strictEqual(bad2.counts.id, 0)
     // missing：正常态（首轮前）
     assert.strictEqual(tombstoneCounts(tmpDir(), 'push.json').status, 'missing')
+    // unsafe（符号链接）：过闸不读——绝不调用 readSafeTextResult（其裸 open 对 FIFO 阻塞）
+    const dir2 = tmpDir()
+    fs.symlinkSync('/etc/passwd', path.join(dir2, 'push.json.seen.json'))
+    assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe')
+    assert.strictEqual(tombstoneCounts(dir2, 'push.json').bytes, null)
+    // FIFO 也走 unsafe 闸（statSafeMeta 的 O_NONBLOCK 立即返回）——若闸失效此用例挂死
+    const fifoTomb = path.join(dir2, 'push.json.seen.json')
+    fs.rmSync(fifoTomb, { force: true })
+    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifoTomb])
+    const t0 = Date.now()
+    assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe', 'FIFO 必须在 meta 闸被判 unsafe，绝不进入读内容路径')
+    assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
   })
   await aok('只读纯函数: cacheHealthSnapshot（边界 0.8/超限/limits 注入 + missing）', () => {
     const dir = tmpDir()
@@ -933,7 +951,8 @@ async function main () {
     const lim = { writeMaxBytes: 100, consoleReadMaxBytes: 50, entryMax: 10, tombstoneKeyMax: 5, tombstoneMaxBytes: 8 }
     fs.writeFileSync(path.join(dir, 'push.json'), 'x'.repeat(80))
     const near = cacheHealthSnapshot(dir, 'push.json', lim)
-    assert.strictEqual(near.writeRatio, 0.8)
+    // writeRatio = 80/100，用整数比对（ Sonar S1244：浮点不用 === 严格相等）
+    assert.ok(Math.abs(near.writeRatio - 0.8) < 1e-9, '80/100 应得 0.8（容差比对）')
     assert.strictEqual(near.nearTrim, true, '恰达 0.8 即预警（>= 判定）')
     assert.strictEqual(near.overLimit, false)
     assert.strictEqual(near.consoleReadable, false, '80 > 50 → 推送记录页不可读')
@@ -949,6 +968,9 @@ async function main () {
     const withTomb = cacheHealthSnapshot(dir, 'push.json', lim)
     assert.strictEqual(withTomb.tombstone.status, 'ok')
     assert.strictEqual(withTomb.tombstone.counts.total, 1)
+    assert.strictEqual(withTomb.tombstone.bytes > 0, true, '墓碑字节数取自读到的内容')
+    // HTTP 层附带 entryCount（readMessageCount 同源；tooLarge 时 null 如实下发）
+    assert.strictEqual(withTomb.entryCount, undefined, '快照纯函数不含 entryCount（HTTP 层附带）')
   })
   await aok('只读纯函数: buildConfigView 白名单（无密钥值 / 渠道布尔 / configuredFlag）', () => {
     const v = buildConfigView()
@@ -962,11 +984,17 @@ async function main () {
     assert.ok(Array.isArray(v.pushChannels.names))
     assert.strictEqual(typeof v.pushChannels.perChannel.wxpusher, 'boolean')
     assert.strictEqual(typeof v.pushChannels.wxpusher.configured, 'boolean')
-    assert.strictEqual(typeof v.pushChannels.localFileLoaded, 'boolean')
+    assert.strictEqual(typeof v.pushChannels.localFilePresent, 'boolean')
     // 白名单形状锁死（字段删除类变异体一次杀光）
     assert.deepStrictEqual(Object.keys(v), ['configLoaded', 'runtime', 'pushChannels', 'console'])
     assert.deepStrictEqual(Object.keys(v.runtime), ['domain', 'api', 'push', 'timing', 'cache', 'alert', 'report', 'channelHealth', 'diagnostics', 'storage', 'template', 'filter', 'keyword'])
     assert.deepStrictEqual(Object.keys(v.runtime.api), ['pushUrl', 'timeout', 'retry'])
+    // filter/keyword 也是显式字段清单（不用 spread——Sourcery High：Config.filter 新增敏感
+    // 字段时 spread 会自动带进响应）
+    assert.deepStrictEqual(Object.keys(v.runtime.filter).sort(), ['pingbibiaoti', 'pingbibiaotiplus', 'pingbifenlei', 'pingbilouzhu', 'pingbilouzhuplus', 'pingbineirong', 'pingbineirongplus', 'pingbitime', 'zhanxianbiaoti', 'zhanxianlouzhu', 'zhanxianneirong'])
+    assert.deepStrictEqual(Object.keys(v.runtime.keyword), ['zkt_gjc'])
+    assert.deepStrictEqual(Object.keys(v.pushChannels), ['moduleLoaded', 'count', 'names', 'perChannel', 'localFilePresent', 'wxpusher'])
+    assert.ok(!Object.prototype.hasOwnProperty.call(v.pushChannels, 'localFileLoaded'), 'localFile 已更名 localFilePresent（文件存在性上报，加载与否由 sendNotify 决定）')
     assert.ok(!Object.prototype.hasOwnProperty.call(v.runtime, 'pushChannels'), '渠道状态只在 pushChannels 节点')
     assert.strictEqual(v.runtime.domain, 'https://new.ixbk.net')
     assert.strictEqual(typeof v.runtime.push.parallelLimit, 'number')
@@ -1036,6 +1064,8 @@ async function main () {
     assert.strictEqual(data.tombstone.status, 'ok')
     assert.strictEqual(data.tombstone.counts.total, 1)
     assert.ok(data.limits.writeMaxBytes > 0, '上限真源下发')
+    assert.strictEqual(data.entryCount, 1, 'HTTP 层附带条目数（readMessageCount 同源）')
+    assert.strictEqual(data.entryCountStatus, 'ok')
     const na = await request(port, 'GET', '/api/cache-health')
     assert.strictEqual(na.status, 401)
     server.close()
