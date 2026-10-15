@@ -972,7 +972,7 @@ async function main () {
       assert.strictEqual(defaultHealthLimits().entryMax, 10000, '小数回退默认（Number.isInteger 判否，R3-2）')
       app.Config.cache.maxSize = 0
       assert.strictEqual(defaultHealthLimits().entryMax, 10000, '0/负值回退默认（避免缓存被清空）')
-      app.Config.cache.maxSize = NaN
+      app.Config.cache.maxSize = Number.NaN
       assert.strictEqual(defaultHealthLimits().entryMax, 10000, 'NaN 回退默认')
     } finally {
       app.Config.cache.maxSize = saved
@@ -1031,7 +1031,7 @@ async function main () {
     assert.deepStrictEqual(Object.keys(v.runtime.api), ['pushUrl', 'timeout', 'retry'])
     // filter/keyword 也是显式字段清单（不用 spread——Sourcery High：Config.filter 新增敏感
     // 字段时 spread 会自动带进响应）
-    assert.deepStrictEqual(Object.keys(v.runtime.filter).sort(), ['pingbibiaoti', 'pingbibiaotiplus', 'pingbifenlei', 'pingbilouzhu', 'pingbilouzhuplus', 'pingbineirong', 'pingbineirongplus', 'pingbitime', 'zhanxianbiaoti', 'zhanxianlouzhu', 'zhanxianneirong'])
+    assert.deepStrictEqual(Object.keys(v.runtime.filter).sort((a, b) => a.localeCompare(b)), ['pingbibiaoti', 'pingbibiaotiplus', 'pingbifenlei', 'pingbilouzhu', 'pingbilouzhuplus', 'pingbineirong', 'pingbineirongplus', 'pingbitime', 'zhanxianbiaoti', 'zhanxianlouzhu', 'zhanxianneirong'])
     assert.deepStrictEqual(Object.keys(v.runtime.keyword), ['zkt_gjc'])
     assert.deepStrictEqual(Object.keys(v.pushChannels), ['moduleLoaded', 'count', 'names', 'perChannel', 'localFilePresent', 'wxpusher'])
     assert.ok(!Object.prototype.hasOwnProperty.call(v.pushChannels, 'localFileLoaded'), 'localFile 已更名 localFilePresent（文件存在性上报，加载与否由 sendNotify 决定）')
