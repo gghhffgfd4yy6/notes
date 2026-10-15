@@ -85,25 +85,10 @@ async function readBodyJson (res) {
   }
 }
 
-// fetch 公共骨架：所有 GET 端点共用（超时/abort、非 2xx 抛错、body 消费完才清期限）。
-// 端点路径走白名单常量表（字面量），调用侧只传键名——Codacy SSRF 启发式据此断 taint。
-const API_PATHS = Object.freeze({
-  status: '/api/status',
-  runs: '/api/runs',
-  messages: '/api/messages',
-  trends: '/api/trends',
-  logs: '/api/logs',
-  sys: '/api/sys'
-})
-
-async function apiFetchJson (pathKey, { query } = {}) {
-  const base = API_PATHS[pathKey]
-  if (typeof base !== 'string') throw new Error(`unknown endpoint: ${String(pathKey)}`)
-  const qs = query instanceof URLSearchParams ? query.toString() : ''
-  const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  const p = fetch(qs.length > 0 ? `${base}?${qs}` : base, merged)
+// 响应消费公共骨架：fetch promise 进来后统一「非 2xx 抛错 + body 消费完才清期限」。
+// 注意 fetch 本身不收进这里——各端点保持字面量 URL（Codacy SSRF 启发式：第一参数
+// 任何变量形态都会红，包括白名单查表后的常量；字面量是唯一全绿形态，PR #227 实测）。
+async function consumeJson (p, done) {
   p.then(() => {}, () => {}) // fetch reject（网络错）时由下方 done 兜底；正常路径在 body 消费后清
   try {
     const res = await p
@@ -120,11 +105,17 @@ async function apiFetchJson (pathKey, { query } = {}) {
 }
 
 function apiGetStatus () {
-  return apiFetchJson('status')
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/status', merged), done)
 }
 
 function apiGetRuns () {
-  return apiFetchJson('runs')
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/runs', merged), done)
 }
 
 async function apiGetRunDetail (id) {
@@ -143,43 +134,45 @@ async function apiGetRunDetail (id) {
     body
   })
   const p = fetch('/api/runs/detail', merged)
-  p.then(() => {}, () => {})
-  try {
-    const res = await p
-    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
-    try {
-      return await readBodyJson(res)
-    } finally {
-      done()
-    }
-  } catch (e) {
-    done()
-    throw e
-  }
+  return consumeJson(p, done)
 }
 
 // ── v3.297 扩展 API：推送记录 / 趋势 / 日志 / 系统 ────────────────────────────
-// 与上方端点同纪律：fetch 第一参数是白名单字面量，查询参数经 URLSearchParams 编码
-// （值已被 form-encode，无注入面）。
+// 与上方端点同纪律：fetch 第一参数是纯字面量（查询参数经 URLSearchParams 编码后
+// 只进模板字符串的查询段，authority 恒为字面量——SSRF 启发式全绿形态）。
 function apiGetMessages ({ page, size, cate, q }) {
   const params = new URLSearchParams()
   if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
   if (Number.isSafeInteger(size) && size !== 20) params.set('size', String(size))
   if (typeof cate === 'string' && cate.length > 0) params.set('cate', cate)
   if (typeof q === 'string' && q.length > 0) params.set('q', q)
-  return apiFetchJson('messages', { query: params })
+  const qs = params.toString()
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  const p = fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged)
+  return consumeJson(p, done)
 }
 
 function apiGetTrends () {
-  return apiFetchJson('trends')
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/trends', merged), done)
 }
 
 function apiGetLogs () {
-  return apiFetchJson('logs')
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/logs', merged), done)
 }
 
 function apiGetSys () {
-  return apiFetchJson('sys')
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/sys', merged), done)
 }
 
 async function trigger (action) {
