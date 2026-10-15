@@ -829,6 +829,11 @@ async function main () {
       ''
     ].join('\r\n')
     assert.strictEqual(res.text, expected, 'CSV 全串逐字符一致（含引号内真实 LF）')
+    // 附件出口（writeHead+end）入日志（蓝图 §3.2 防线 5 + §3.3 测试清单末条；审查 3.2-MA2 / 3.3-M2）：
+    // 真附件 200 导出走 res.writeHead+end 附件出口（非 sendJson），finish 钩子必须同样覆盖。
+    const attachLog = JSON.parse((await request(port, 'GET', '/api/access-log', { token: TOKEN })).text)
+    const attachHit = [...attachLog.items].reverse().find((it) => it.path === '/api/messages/export')
+    assert.ok(attachHit && attachHit.method === 'POST' && attachHit.status === 200, 'CSV 附件出口（writeHead+end，非 sendJson）必须入访问日志')
     server.close()
   })
   await aok('T4 5000 钳制 + X-Export-Truncated: 5010 条截断/30 条不出头/展示分页互不干扰', async () => {
@@ -979,8 +984,9 @@ async function main () {
     assert.strictEqual(invalid.status, 200)
     assert.ok(invalid.headers['content-type'].startsWith('application/json'), 'CSV 请求的三态同样走 JSON 提示（不下载空文件）')
     assert.strictEqual(JSON.parse(invalid.text).status, 'invalid')
-    // 附件出口入日志（蓝图 §3.2 防线 5 + §3.3 测试清单末条；审查 3.2-MA2 / 3.3-M2）：
-    // 导出响应走 res.writeHead+end 附件出口（非 sendJson），finish 钩子必须同样覆盖。
+    // 三态（invalid）出口入日志（蓝图 §3.2 防线 5 + §3.3 测试清单末条；审查 3.2-MA2 / 3.3-M2）：
+    // 本断言锁定的是 invalid 三态的 sendJson(res,200,{status:'invalid'}) 出口；
+    // 真附件 200 的 writeHead+end 附件出口由 T3 锁定（其 finish 钩子覆盖）。
     // shouldLogAccess 白名单无此端点 → 200 也照记；path 无查询词、body 不入。
     const exLog = JSON.parse((await request(port2, 'GET', '/api/access-log', { token: TOKEN })).text)
     const exHit = [...exLog.items].reverse().find((it) => it.path === '/api/messages/export')
