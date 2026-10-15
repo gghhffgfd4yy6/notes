@@ -244,6 +244,15 @@ function apiGetSys () {
   return consumeJson(fetch('/api/sys', merged), done)
 }
 
+// 访问日志（v3.300 §3.3）：系统页可查的内存环形访问日志。与上方端点同纪律——
+// fetch 第一参数纯字面量（Codacy SSRF 全绿形态，静态红线测试自动覆盖）。
+function apiGetAccessLog () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/access-log', merged), done)
+}
+
 async function trigger (action) {
   const body = new URLSearchParams({ action })
   const { merged, done } = timedRequest({
@@ -922,8 +931,13 @@ function LogsPanel ({ pollMs }) {
 
 // 系统信息：版本 / 运行环境 / 进程 / 缓存目录。全部只读，无操作按钮。
 function SysPanel () {
+  // 访问日志（v3.300 §3.3）：第二个 loader 并列拉取；「刷新」按钮同日 load 两个。
+  // 近窗未授权尝试数 = 服务端独立 401 计数（进程启动以来、不随环形窗截断）。
   const { data: sys, err, load } = usePanelLoader(apiGetSys)
+  const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog)
   useEffect(() => { load().catch(() => {}) }, [load])
+  useEffect(() => { loadAccess().catch(() => {}) }, [loadAccess])
+  const refreshAll = () => { load(); loadAccess() }
   const fmtUptime = (s) => {
     if (!(typeof s === 'number' && s >= 0)) return '—'
     const d = Math.floor(s / 86400)
@@ -931,11 +945,13 @@ function SysPanel () {
     const m = Math.floor((s % 3600) / 60)
     return d > 0 ? `${d} 天 ${h} 时 ${m} 分` : h > 0 ? `${h} 时 ${m} 分` : `${m} 分`
   }
+  const logItems = access && Array.isArray(access.items) ? access.items : []
+  const logTail = logItems.slice(-20).reverse()
   return html`<div class="panel">
     <div class="panel-head">
       <span class="panel-title">系统信息</span>
       <span style="flex:1"></span>
-      <button class="btn btn-ghost" onClick=${load}>刷新</button>
+      <button class="btn btn-ghost" onClick=${refreshAll}>刷新</button>
     </div>
     ${err && html`<div class="hint hint-err">${err}</div>`}
     ${sys && html`<div class="sys-grid">
@@ -951,6 +967,14 @@ function SysPanel () {
         <tr><td>缓存目录</td><td>${sys.cacheDir}</td></tr>
       </tbody></table>
     </div>`}
+    <div class="hint" style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。</div>
+    ${accessErr && html`<div class="hint hint-err">访问日志加载失败：${accessErr.message || accessErr}</div>`}
+    ${access && access.items && access.items.length === 0 && html`<div class="empty">暂无访问记录（轮询端点与静态资产的成功请求不记入）</div>`}
+    ${logTail.length > 0 && html`<details class="access-log"><summary>最近访问记录（最多 20 条，新在上）</summary>
+      <table class="sys-table"><tbody>
+        ${logTail.map((it) => html`<tr key=${`${it.at}|${it.method}|${it.path}|${it.status}|${it.ms}`}><td>${it.at}</td><td>${it.method} ${it.path} → ${it.status} · ${it.ms}ms</td></tr>`)}
+      </tbody></table>
+    </details>`}
     <div class="hint" style="margin-top:12px">数据说明：推送记录来自判重缓存 push.json（服务端已裁剪正文 HTML）；趋势解析 run.log 摘要行；日志取尾部 1 MiB。</div>
   </div>`
 }

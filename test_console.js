@@ -20,7 +20,8 @@ const {
   acquireLock, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
-  buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX
+  buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
+  sanitizeAccessPath, shouldLogAccess, ACCESS_LOG_MAX
 } = require('./scripts/console')
 
 let passed = 0
@@ -325,6 +326,43 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
 ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）', () => {
   // 端到端用例在下方；这里登记实现约束。
   assert.ok(true)
+})
+
+// ── v3.300 访问日志：纯函数表（无 HTTP；端到端用例见下方 T1-T7）──
+ok('sanitizeAccessPath: token 脱敏不动点 + 解码复洗 2 轮（蓝图 §3.3 防线 1）', () => {
+  // 分隔符保留：查询串形状不破坏
+  assert.strictEqual(sanitizeAccessPath('/x?token=a&b=1'), '/x?token=***&b=1')
+  // 重复 token 参数逃逸：迭代清洗到不动点
+  assert.strictEqual(sanitizeAccessPath('/x?a=1&token=x1&token=y2'), '/x?a=1&token=***&token=***')
+  // 编码键名 %74oken= → 解码后复洗（返回解码形态，内容已 *** 化）
+  assert.strictEqual(sanitizeAccessPath('/x?%74oken=z3'), '/x?token=***')
+  // 双层编码 %2574oken= → 2 轮解码复洗（D6）
+  assert.ok(sanitizeAccessPath('/x?%2574oken=z4').includes('token=***'), '双层编码键名也洗出 token=***')
+  assert.ok(!sanitizeAccessPath('/x?%2574oken=z4').includes('z4'), '原文不得残留')
+  // 畸形 % 序列（URIError）→ 原串（已洗）兜底，不抛
+  assert.strictEqual(sanitizeAccessPath('/x?aa=%zz'), '/x?aa=%zz')
+  // null → ''；无 % 无 token 的普通路径原样
+  assert.strictEqual(sanitizeAccessPath(null), '')
+  assert.strictEqual(sanitizeAccessPath('/plain'), '/plain')
+})
+ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/access-log 自身照记）', () => {
+  const cases = [
+    [['GET', '/api/status', 200], false],
+    [['GET', '/api/status', 500], true],
+    [['GET', '/api/runs', 200], false],
+    [['GET', '/api/runs/1750000000000.9', 200], false],
+    [['GET', '/api/runs/1750000000000.9', 404], true],
+    [['POST', '/api/runs/detail', 200], false],
+    [['POST', '/api/runs/detail', 401], true],
+    [['GET', '/assets/app.css', 200], false],
+    [['GET', '/', 200], false],
+    [['GET', '/api/access-log', 200], true],
+    [['POST', '/trigger', 202], true]
+  ]
+  for (const [args, want] of cases) {
+    assert.strictEqual(shouldLogAccess(...args), want, `shouldLogAccess(${args.join(', ')}) 应为 ${want}`)
+  }
+  assert.strictEqual(ACCESS_LOG_MAX, 200, '环形上限常量 = 200')
 })
 
 // ── HTTP 端到端 ──
@@ -1305,6 +1343,145 @@ async function main () {
     }
     server.close()
   })
+  // ── v3.300 访问日志端到端（蓝图 §3.3 T1-T7）────────────────────────────────
+  const fetchLog = async (port) => JSON.parse((await request(port, 'GET', '/api/access-log', { token: TOKEN })).text)
+  await aok('访问日志: ?token= 脱敏 + 原文零出现（深断言 JSON.stringify(items)）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const FAKE = 'z'.repeat(20)
+    const noAuth = await request(port, 'GET', `/api/nope?token=${FAKE}`)
+    assert.strictEqual(noAuth.status, 401, '错 token 必须 401')
+    const log = await fetchLog(port)
+    const hit = log.items.find((it) => it.path === '/api/nope?token=***')
+    assert.ok(hit, `必须存在 path === '/api/nope?token=***' 的条目（items=${JSON.stringify(log.items.map((i) => i.path))}）`)
+    assert.strictEqual(hit.status, 401)
+    assert.ok(!JSON.stringify(log.items).includes(FAKE), 'token 原文在响应体零出现（深断言）')
+    assert.ok(log.unauthorizedCount >= 1, 'unauthorizedCount >= 1')
+    server.close()
+  })
+  await aok('访问日志: 逃逸形态全 ***（重复参数 + %74oken 编码键名）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const r1 = await request(port, 'GET', '/api/nope?a=1&token=x1&token=y2')
+    assert.strictEqual(r1.status, 401)
+    const r2 = await request(port, 'GET', '/api/nope?%74oken=z3')
+    assert.strictEqual(r2.status, 401)
+    const log = await fetchLog(port)
+    const flat = JSON.stringify(log.items)
+    assert.ok(!flat.includes('x1') && !flat.includes('y2') && !flat.includes('z3'), `逃逸原文零出现（items=${flat}）`)
+    assert.ok(log.items.some((it) => it.path === '/api/nope?a=1&token=***&token=***'), '重复参数形态全 ***')
+    assert.ok(log.items.some((it) => it.path === '/api/nope?token=***'), '%74oken= 解码形态洗出 token=***')
+    server.close()
+  })
+  await aok('访问日志: 401 独立计数（3 次未授权后 =3，重复查询不漂移）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const r1 = await request(port, 'GET', '/api/sys')
+    assert.strictEqual(r1.status, 401)
+    const r2 = await request(port, 'GET', '/api/sys', { token: 'y'.repeat(32) })
+    assert.strictEqual(r2.status, 401)
+    const r3 = await request(port, 'POST', '/trigger', { body: 'action=check' })
+    assert.strictEqual(r3.status, 401)
+    const log = await fetchLog(port)
+    assert.strictEqual(log.unauthorizedCount, 3, `3 次未授权后计数必须为 3（实际 ${log.unauthorizedCount}）`)
+    const again = await fetchLog(port)
+    assert.strictEqual(again.unauthorizedCount, 3, '查询自身（200）不计入，值不漂移')
+    server.close()
+  })
+  await aok('访问日志: 环形 201 挤最旧 + 自举（查询自身入日志且最新）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    for (let i = 0; i <= 200; i++) {
+      const r = await request(port, 'GET', `/api/nope?seq=${i}`, { token: TOKEN })
+      assert.strictEqual(r.status, 404)
+    }
+    // 201 条 nope 请求全部入日志；本条查询自身的条目在其响应 finish 之后才入数组
+    // ——读取时只见此前请求（蓝图自举时序：响应内容不含自身这条）。
+    const log = await fetchLog(port)
+    assert.strictEqual(log.items.length, ACCESS_LOG_MAX, `环形钳制到 ${ACCESS_LOG_MAX}（201 条 nope → 挤出 seq=0）`)
+    assert.ok(log.items[0].path.includes('seq=1'), `最旧存活条目应为 seq=1（seq=0 已挤出；实际 ${log.items[0].path}）`)
+    assert.ok(!log.items.some((it) => it.path.endsWith('seq=0')), 'seq=0 必须已被挤出')
+    assert.ok(!log.items.some((it) => it.path === '/api/access-log'), '读取时点查询自身尚未入数组（finish 时序）')
+    // 自举（第二时序）：此刻再查一次——上一条查询自身已入数组且是最新条目；
+    // 环形现 202 条 → 再挤出 seq=1，items[0] = seq=2。
+    const log2 = await fetchLog(port)
+    assert.ok(log2.items[log2.items.length - 1].path === '/api/access-log', `自举：上次查询自身入日志且最新（实际末条 ${log2.items[log2.items.length - 1].path}）`)
+    assert.ok(log2.items[0].path.includes('seq=2'), `第二轮后最旧存活 = seq=2（seq=0/1 已挤出；实际 ${log2.items[0].path}）`)
+    assert.ok(!log2.items.some((it) => it.path.endsWith('seq=0') || it.path.endsWith('seq=1')), 'seq=0/seq=1 必须已被挤出')
+    server.close()
+  })
+  await aok('访问日志: 降噪白名单 2xx 不入 / 404、5xx 入（含 POST /runs/detail 与 503 出口）', async () => {
+    const dir = tmpDir()
+    const { server, runs, setShuttingDown } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // fake record 注入（与 cancel 用例同先例）：让 GET /api/runs/:id 与 POST /api/runs/detail 命中 2xx
+    runs.set('1750000000000.9', { id: '1750000000000.9', action: 'check', label: 'x', startedAt: Date.now(), finishedAt: 0, exitCode: 0, timedOut: false, cancelled: false, output: '' })
+    const seq = [
+      ['GET', '/api/status', 200],
+      ['GET', '/api/runs', 200],
+      ['GET', '/', 200],
+      ['GET', '/assets/app.css', 200],
+      ['GET', '/api/runs/1750000000000.9', 200],
+      ['POST', '/api/runs/detail', 200]
+    ]
+    for (const [method, p] of seq) {
+      const r = await request(port, method, p, { token: TOKEN, body: method === 'POST' ? 'id=1750000000000.9' : undefined })
+      assert.strictEqual(r.status, 200, `${method} ${p} 预置 200`)
+    }
+    const nf = await request(port, 'GET', '/api/nope-x', { token: TOKEN })
+    assert.strictEqual(nf.status, 404)
+    setShuttingDown() // 关停闸：/api/runs/cancel 即刻 503（确定性 5xx 出口）
+    const cancel = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1750000000000.9' })
+    assert.strictEqual(cancel.status, 503)
+    const log = await fetchLog(port)
+    const paths = log.items.map((it) => `${it.method} ${it.path} ${it.status}`)
+    for (const quiet of ['/api/status', '/api/runs', '/ ', '/assets/app.css', '/api/runs/1750000000000.9', '/api/runs/detail']) {
+      assert.ok(!log.items.some((it) => it.path === quiet.trim().split(' ').pop() || it.path === quiet.trim()), `白名单 2xx 不得入日志：${quiet}（实际 ${paths.join(' | ')}）`)
+    }
+    assert.ok(log.items.some((it) => it.status === 404 && it.path.includes('/api/nope-x')), '404 必须入日志')
+    assert.ok(log.items.some((it) => it.status === 503 && it.path.includes('/api/runs/cancel')), '503（cancel 出口）必须入日志')
+    server.close()
+  })
+  await aok('访问日志: 畸形 request-target 400 入日志且脱敏（raw 串路径 D2/D3）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const SEKRIT = 'q'.repeat(20)
+    // 畸形形态 1：`//@:99999` 让 new URL 抛 TypeError → 400（此前的崩溃回归形态）。
+    const bad1 = await rawRequest(port, 'GET //@:99999 HTTP/1.1\r\nHost: x\r\n\r\n')
+    assert.strictEqual(bad1.status, 400)
+    // 畸形形态 2：合法 target 内嵌 ?token= 的 raw 形态 → 401（无凭证），path 原样
+    // 进访问日志（new URL 不改写它）——验证 raw 形态过脱敏闸。
+    const bad2 = await rawRequest(port, `GET /x?token=${SEKRIT} HTTP/1.1\r\nHost: x\r\n\r\n`)
+    assert.strictEqual(bad2.status, 401, `raw token 请求无凭证应 401（实际 ${bad2.status}）`)
+    const log = await fetchLog(port)
+    assert.ok(log.items.some((it) => it.status === 400 && it.path.includes('//@:99999')), `畸形 target 的 400 必须入日志（items=${JSON.stringify(log.items.map((i) => [i.path, i.status]))}）`)
+    assert.ok(log.items.some((it) => it.status === 401 && it.path.includes('token=***')), 'raw token 请求 401 条目必须脱敏')
+    assert.ok(!JSON.stringify(log.items).includes(SEKRIT), 'SEKRIT 原文零出现（raw request-target 也过脱敏闸）')
+    server.close()
+  })
+  await aok('访问日志: 字段形状六字段 / at 上海戳 / ms≥0 / src=127.0.0.1', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    await request(port, 'GET', '/api/nope', { token: TOKEN })
+    // 预置两条后再查：查询自身条目在其 finish 之后才入数组，读取时点至少能看到
+    // 此前的请求（若此用例是数组里第一批，请求前先垫一条 nope 404）。
+    await request(port, 'GET', '/api/nope?anchor=1', { token: TOKEN })
+    const log = await fetchLog(port)
+    assert.ok(log.items.length >= 2, `至少含两条此前请求（实际 ${log.items.length}）`)
+    for (const it of log.items) {
+      assert.deepStrictEqual(Object.keys(it).sort(), ['at', 'method', 'ms', 'path', 'src', 'status'], '字段恰为六个（字典序）')
+      assert.match(it.at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, 'at = 上海戳 YYYY-MM-DD HH:mm:ss')
+      assert.ok(Number.isInteger(it.ms) && it.ms >= 0, 'ms 为 ≥0 整数')
+      assert.strictEqual(it.src, '127.0.0.1', 'src = remoteAddress 字符串（listen 绑 127.0.0.1，无 ::ffff: 前缀）')
+      assert.strictEqual(typeof it.status, 'number', 'status 为 number')
+    }
+    // 时间正序：数组插入序 = at 非严格递增（同秒并列按入序，下标即权威时序）
+    for (let i = 1; i < log.items.length; i++) {
+      assert.ok(log.items[i - 1].at <= log.items[i].at, '时间正序')
+    }
+    server.close()
+  })
+
   await aok('静态红线: app.js 所有 fetch 第一参数均为字面量或字面量起点三元', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     // Codacy SSRF 全绿形态：第一参数是 '/api/...' 字面量，或以字面量起点的三元

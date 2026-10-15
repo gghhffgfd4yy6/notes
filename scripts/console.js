@@ -107,6 +107,18 @@ const FILES_LIST_MAX = 1000
 // （下轮 saveBatch 将按字节裁最旧条目并落墓碑——运维该知道缓存快满了）。
 const CACHE_HEALTH_NEAR_RATIO = 0.8
 
+// ── v3.300 访问日志常量 ─────────────────────────────────────────────────────
+// 纯内存环形上限：重启即空、不写盘（README 披露）——避免日志自身成为磁盘面，
+// 已有时序上更全的 run.log 留痕体系（蓝图 §3.3）。
+const ACCESS_LOG_MAX = 200
+// token 清洗正则：服务端常量、无用户输入参与构造（红线允许形态，先例 BEARER_PREFIX/
+// sessionCookieValue 的手写解析同源纪律）。([?&]) 捕获保留分隔符：
+// /?token=a → /?token=***（查询串形状不破坏）；[^&]* 线性无回溯。
+const ACCESS_TOKEN_RE = /([?&])token=[^&]*/g
+// 详情轮询路径形态：与 /api/runs/:id 的 runMatch 同形的服务端常量正则
+// （D4 定夺的降噪对象：GET /api/runs/<epoch.seq> 2xx 不记）。
+const RUN_DETAIL_PATH_RE = /^\/api\/runs\/\d{13,}\.\d{1,10}$/
+
 // 健康检查默认上限：entryMax 不取 DEFAULT_MAX_SIZE 常量而是运行侧 Config.cache.maxSize
 // （MessageStore._resolveMaxSize 实际执行的口径）——常量在用户自定义 maxSize 时会展示
 // 一个生产根本不执行的上限。Config 加载失败回退常量。
@@ -475,6 +487,58 @@ function formatMs (ms) {
   if (ms < 1000) return `${ms}ms`
   const s = Math.round(ms / 100) / 10
   return `${s}s`
+}
+
+// ── 访问日志（v3.300）──────────────────────────────────────────────────────
+let accessStampFmt = null
+function accessStamp () {
+  // 惰性单例 + 兜底（D7）：sv-SE + Asia/Shanghai 与 run.log 留痕戳同参同输出；
+  // 顶层惰性而非 require 期构造——防 ICU 异常炸 import。at 是展示字段
+  // （数组下标即权威时序），格式 YYYY-MM-DD HH:mm:ss。
+  if (!accessStampFmt) {
+    try {
+      accessStampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+    } catch (e) { return new Date().toISOString() }
+  }
+  try { return accessStampFmt.format(new Date()) } catch (e) { return new Date().toISOString() }
+}
+
+function washTokens (s) {
+  // 迭代到不动点：堵重复 token 参数逃逸（?a=1&token=x&token=y 这类拼接形态）。
+  // g 标志单轮即全量替换，但迭代写法对任意拼接形态都收口到不动点，成本恒为零或一轮。
+  let prev = null
+  while (prev !== s) { prev = s; s = s.replace(ACCESS_TOKEN_RE, '$1token=***') }
+  return s
+}
+
+function sanitizeAccessPath (raw) {
+  // 脱敏硬闸（蓝图防线 1）：先原串洗，再「解码→复洗」至多 2 轮（D6，堵 %74oken= /
+  // %2574oken= 编码键名）。解码失败（畸形 % 序列抛 URIError）用当前已洗串——
+  // 先例口径：sessionCookieValue 对畸形 Cookie 按「无有效值」处理，绝不炸主链路。
+  // 注意：解码后若洗出了 token，返回的是解码形态路径（内容已 *** 化，泄露面为零）。
+  let s = washTokens(String(raw == null ? '' : raw))
+  for (let round = 0; round < 2; round++) {
+    let d
+    try { d = decodeURIComponent(s) } catch (e) { return s }
+    if (d === s) return s
+    s = washTokens(d)
+  }
+  return s
+}
+
+function shouldLogAccess (method, pathname, statusCode) {
+  // 降噪白名单（蓝图「记什么」）：仅 2xx 且命中白名单才免记；非 2xx（含 401/404/5xx）全记。
+  // 白名单 = GET / 页面、GET /api/status、GET /api/runs 列表、GET /api/runs/:id 详情、
+  // POST /api/runs/detail（D4：前端实际形态，响应体与 GET /:id 等价）、静态三资产。
+  // /api/access-log 自身 200 不在名单 → 入日志（自举，蓝图防线 3）。
+  if (!(statusCode >= 200 && statusCode <= 299)) return true
+  const m = method === 'GET'
+  const p = String(pathname || '')
+  if (m && (p === '/' || p === '/api/status' || p === '/api/runs' ||
+    Object.prototype.hasOwnProperty.call(STATIC_ASSETS, p))) return false
+  if (m && RUN_DETAIL_PATH_RE.test(p)) return false // D4：GET 详情轮询
+  if (method === 'POST' && p === '/api/runs/detail') return false // D4：POST 详情轮询（前端实际形态）
+  return true
 }
 
 function renderPage (state, runsList, query, sessionToken) {
@@ -928,6 +992,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return out
     } catch (e) { return [] }
   }
+  // ── v3.300 访问日志（内存环形，蓝图 §3.3）：闭包态，access-log 端点与 finish 钩子共用。
+  const accessLog = []
+  let unauthorizedCount = 0
   // Sourcery Retries-duplicate x2：lastAccept 只在内存，重启后窗口失效 → 重试穿透再跑一轮。
   // 落盘到 stateDir/console-lastaccept.json（readStatus 同目录），受理时同步写、启动时回读。
   // 写入失败不阻断受理（主链路是单飞锁，落盘只是重放窗的持久化增强）。
@@ -937,6 +1004,34 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   } catch (e) { /* 文件不存在/损坏 = 空窗口，正常 */ }
 
   const server = http.createServer((req, res) => {
+    // ── v3.300 访问日志装配：单点 res.on('finish')，覆盖 sendJson/静态/页面全部响应出口
+    // （全文件原本无任何 res.on 监听）。挂回调第一行 ⇒ 畸形 request-target 的 400
+    // （下方 sendJson(…,400) 也在覆盖内；malformed 是最值得记录的可疑流量，D3 定夺）。
+    // 闭包引用下方 let url：finish 异步触发时回调体已同步执行完，TDZ 已解除。
+    // - ms = finish 时刻 − 回调入口时刻；SSE（3.1 落地后）为整段连接时长，如实记录零特判（D5）。
+    // - finish vs close：客户端中途断连、响应未 end 的请求无 finish → 不入日志
+    //  （记录口径 =「完成的响应」，蓝图 R3 接受）。
+    // - 脱敏在入数组之前（蓝图防线 1）：数组本身干净，非展示时过滤。
+    // - src 只存字符串，不存 socket 引用（蓝图防线 4）；每个 res 一个监听器、res 随请求 GC。
+    const reqStart = Date.now()
+    const reqSrc = String((req.socket && req.socket.remoteAddress) || '')
+    res.on('finish', () => {
+      try {
+        const status = res.statusCode
+        if (status === 401) unauthorizedCount++ // 环形外的独立计数器（蓝图：401 全记且单独计数）
+        if (url ? shouldLogAccess(req.method, url.pathname, status) : true) {
+          accessLog.push({
+            at: accessStamp(),
+            method: String(req.method || ''),
+            path: sanitizeAccessPath(String(req.url || '')),
+            status,
+            ms: Date.now() - reqStart,
+            src: reqSrc
+          })
+          if (accessLog.length > ACCESS_LOG_MAX) accessLog.shift() // 丢最旧（D1）
+        }
+      } catch (e) { /* 装配失败静默：观测面绝不反噬主链路（finish 监听器抛错会炸进程） */ }
+    })
     // 畸形请求行防御：req.url 是原始请求行目标（客户端可发任意垃圾，如 `//@:99999/`），
     // new URL 对非法形态抛 TypeError——此处位于鉴权之前，一条无凭证请求即可崩掉整个
     // 控制台进程（触发锁残留到陈旧接管、看板下线）。解析失败一律 400 拒绝。
@@ -1012,6 +1107,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         if (!st.lock) st.lock = { held: false, ageMs: 0 }
       }
       sendJson(res, 200, st)
+      return
+    }
+    // GET /api/access-log（v3.300 §3.3）：系统页可查的内存环形访问日志。
+    // 鉴权与其余读取端点一致（上方 authorize 闸已过）。时间正序 = 数组插入序
+    // （push 尾=最新）；slice() 浅拷贝防外部持有内部引用改写（条目对象 push 后
+    // 只读不变，浅拷贝足够——蓝图防线 3「数组本身必须干净」）。unauthorizedCount
+    // 是进程启动以来全部 401 的独立计数（可大于环形窗内条数，不环形截断）。
+    if (req.method === 'GET' && url.pathname === '/api/access-log') {
+      sendJson(res, 200, { items: accessLog.slice(), unauthorizedCount })
       return
     }
     // ── v3.297 控制台扩展：推送记录 / 趋势 / 日志 / 系统 ─────────────────────────
@@ -1577,5 +1681,9 @@ module.exports = {
   TREND_DAYS_ALLOWED,
   TREND_DAYS_DEFAULT,
   FILES_LIST_MAX,
-  CACHE_HEALTH_NEAR_RATIO
+  CACHE_HEALTH_NEAR_RATIO,
+  // v3.300 访问日志：纯函数/常量导出（非 HTTP 单测 + 变异测试可达性）
+  sanitizeAccessPath,
+  shouldLogAccess,
+  ACCESS_LOG_MAX
 }
