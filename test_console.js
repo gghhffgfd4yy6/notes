@@ -161,6 +161,70 @@ ok('releaseLockFor: released 短帧不大于原帧（回归：恒比原帧长的
   assert.strictEqual(JSON.parse(body).released, true, '空格补尾后仍是合法 JSON released 帧')
   assert.strictEqual(body.trim(), '{"released":true}', '实体内容必须是短帧（pid/token/startedAt 已无保留价值）')
 })
+ok('releaseLockFor: inode 一致性闸（回归 Sourcery #225 High：陈旧持有者不得覆写接管方的新锁帧）', () => {
+  const dir = tmpDir()
+  assert.strictEqual(acquireLock(dir, 1000, 'tok-old'), true)
+  // 模拟接管：走 acquireLock 自己的陈旧接管路径（startedAt 远超 PROC_TIMEOUT_MS），
+  // 该路径现已用 tmp+rename 原子换代——旧持有者 fd 里的 inode 变成孤儿。
+  const fs2 = require('node:fs')
+  const p = lockPath(dir)
+  fs2.utimesSync(p, 1, 1) // 把 mtime 拉旧不影响 startedAt 判定；直接改 startedAt 更直接：
+  fs2.writeFileSync(p, JSON.stringify({ pid: 999999, startedAt: 1, token: 'tok-old' }))
+  assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS + 5000, 'tok-new'), true, '接管方拿到锁')
+  const newFrameBefore = fs2.readFileSync(p, 'utf8')
+  assert.strictEqual(JSON.parse(newFrameBefore).token, 'tok-new')
+  // 旧持有者仍握着旧 inode 的 fd？不——它每次 open 都是新 fd；竞态的本质是「旧主在
+  // rename 前 open」。这里用注入模拟：手动 open 旧内容后让 rename 发生，再 releaseLockFor。
+  // 简化：直接构造「fd 指向孤儿 inode」场景——把当前锁 rename 走，再在原路径放新帧。
+  const orphanDir = tmpDir()
+  assert.strictEqual(acquireLock(orphanDir, 1000, 'tok-victim'), true)
+  const op = lockPath(orphanDir)
+  const orphanFd = fs2.openSync(op, 'r+') // 旧主此刻的 fd
+  // 接管者 rename 换代
+  fs2.writeFileSync(`${op}.t`, JSON.stringify({ pid: 424242, startedAt: 2000, token: 'tok-new' }))
+  fs2.renameSync(`${op}.t`, op)
+  // 旧主释放：fd 指向孤儿 inode，路径上已是新主帧——不得覆盖新主
+  const { releaseLockFor } = require('./scripts/console')
+  // 手动走一致性闸逻辑：直接调 releaseLockFor（它会重新 open 路径，双匹配失败返回 false）
+  assert.strictEqual(releaseLockFor({ _stateDir: orphanDir, _lockToken: 'tok-victim' }), false, '锁已换主不得释放')
+  assert.strictEqual(JSON.parse(fs2.readFileSync(op, 'utf8')).token, 'tok-new', '新主锁帧原样无损')
+  fs2.closeSync(orphanFd)
+})
+ok('releaseLockFor: 短写循环（monkeypatch writeSync 首次少写，回归 Sourcery #225 M1）', () => {
+  const dir = tmpDir()
+  const fsmod = require('node:fs')
+  assert.strictEqual(acquireLock(dir, 1000, 'tok-sw'), true)
+  const realWrite = fsmod.writeSync
+  let calls = 0
+  fsmod.writeSync = function (fd, buf, off, len, pos) {
+    if (Buffer.isBuffer(buf) && buf.slice(0, 17).toString('utf8') === '{"released":true}') {
+      calls++
+      if (calls === 1) return realWrite(fd, buf, off, len - 6, pos) // 模拟少写 6 字节
+    }
+    return realWrite(fd, buf, off, len, pos)
+  }
+  try {
+    const { releaseLockFor } = require('./scripts/console')
+    const res = releaseLockFor({ _stateDir: dir, _lockToken: 'tok-sw' })
+    assert.strictEqual(res, true, '短写循环补齐后必须成功')
+    assert.ok(calls >= 2, `必须发生多次 writeSync（实际 ${calls} 次）`)
+  } finally {
+    fsmod.writeSync = realWrite
+  }
+  const body = fsmod.readFileSync(lockPath(dir), 'utf8')
+  assert.strictEqual(JSON.parse(body).released, true, '残尾补写后仍是合法 released 帧')
+  assert.strictEqual(body.trim(), '{"released":true}')
+})
+ok('releaseLockFor: 他人活锁返回 false；released 帧返回 true；锁不存在返回 true', () => {
+  const dir = tmpDir()
+  const { releaseLockFor } = require('./scripts/console')
+  fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 999, startedAt: 1000, token: 'other' }))
+  assert.strictEqual(releaseLockFor({ _stateDir: dir, _lockToken: 'mine' }), false, '他人活锁如实报 false')
+  fs.writeFileSync(lockPath(dir), '{"released":true}')
+  assert.strictEqual(releaseLockFor({ _stateDir: dir, _lockToken: 'mine' }), true, '已 released 报 true')
+  fs.unlinkSync(lockPath(dir))
+  assert.strictEqual(releaseLockFor({ _stateDir: dir, _lockToken: 'mine' }), true, '锁不存在报 true')
+})
 
 // ── 动作解析 ──
 ok('parseAction: urlencoded 三种合法动作 + 非法动作 null', () => {
@@ -544,15 +608,50 @@ async function main () {
     assert.strictEqual(trig.status, 202, '触发必须受理')
     assert.strictEqual(fs.existsSync(lockFile), true, '触发后锁文件必须存在')
     await new Promise(resolve => setTimeout(resolve, 150))
+    // Sourcery #225 M6：SIGTERM 前无法直接观测孙进程（--check 在控制台进程内 spawn），
+    // 用退出延迟区分「杀掉子进程走 close 收尾」（毫秒级）与「子进程没死、3s 看门狗
+    // 强退」（≥3s）——若关停逻辑不再杀子进程，此断言必红。
+    const killAt = Date.now()
     child.kill('SIGTERM')
     const code = await new Promise(resolve => {
       const to = setTimeout(() => resolve('timeout'), 8000)
       child.on('exit', (c) => { clearTimeout(to); resolve(c) })
     })
+    const shutdownMs = Date.now() - killAt
+    assert.ok(shutdownMs < 2800, `关停耗时 ${shutdownMs}ms ≥ 2800ms：疑似走了 3s 看门狗（子进程未被杀）\n${out.slice(-400)}`)
     assert.strictEqual(code, 0, `SIGTERM 后必须 0 退出（实际 ${code}）\n${out.slice(-400)}`)
     const frame = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
     assert.strictEqual(frame.released, true, '退出后锁帧必须为 released（原地产出，不靠外部清理）')
     fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await aok('HTTP: /trigger 落盘失败 → 500 且可立即重试（回归 Sourcery #225 M2：pending 条目必须回滚）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // 让 lastAcceptPath 写入必然失败：同名目录挡路（EISDIR）。
+    fs.mkdirSync(path.join(dir, 'console-lastaccept.json'))
+    const bad = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+    assert.strictEqual(bad.status, 500, '持久化失败必须 500')
+    assert.ok(bad.text.includes('fail-closed'))
+    // 释放锁：上一轮已显式 releaseLockFor（否则这里 409）
+    fs.rmdirSync(path.join(dir, 'console-lastaccept.json'))
+    const retry = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+    assert.strictEqual(retry.status, 202, '失败动作在窗口内必须可立即重试（pending 条目已回滚），不得 409')
+    server.close()
+  })
+  await aok('main: XBK_CONSOLE_PORT 非法值拒绝启动（回归 Sourcery #225 M5：NaN 不得回退 7777）', async () => {
+    const c = spawn(process.execPath, [path.join(__dirname, 'scripts', 'console.js')], {
+      env: { ...process.env, XBK_CONSOLE_TOKEN: TOKEN, XBK_CONSOLE_PORT: 'abc' },
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    let errOut = ''
+    c.stderr.on('data', d => { errOut += d })
+    const code = await new Promise(resolve => {
+      const to = setTimeout(() => resolve('timeout'), 5000)
+      c.on('exit', (v) => { clearTimeout(to); resolve(v) })
+    })
+    assert.strictEqual(code, 1, `非法端口必须 exit 1（实际 ${code}）`)
+    assert.ok(errOut.includes('非法'), `stderr 必须说明端口非法：${errOut.slice(0, 200)}`)
   })
 }
 

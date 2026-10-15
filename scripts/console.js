@@ -145,9 +145,20 @@ function acquireLock (stateDir, now, token) {
       }
     }
     if (!claimed) return false
-    // takeover 路径不能再用 open(wx) 写锁（目标存在必 EEXIST）：锁内容短且由
-    // rename 静默替换语义恰好覆盖旧文件——原子替换、无半成品窗口。带本进程 token。
-    fs.writeFileSync(p, JSON.stringify({ pid: process.pid, startedAt: now, token }))
+    // takeover 路径不能再用 open(wx) 写锁（目标存在必 EEXIST）：走「临时文件 + rename
+    // 原子换代」。rename 原子替换且**换 inode**——仍握着旧 inode fd 的旧持有者，其
+    // releaseLockFor 的原地覆写只会落进孤儿 inode，绝不可能盖掉新持有者的锁帧
+    // （Sourcery #225 High：直写同 inode 时「旧主已 read、takeover 已覆写、旧主再 write」
+    // 的窗口会让 released 帧覆盖新主锁帧，第三进程可再接管造成动作重叠）。带本进程 token。
+    const tmp = `${p}.${process.pid}.${now}.tmp`
+    try {
+      fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, startedAt: now, token }))
+      fs.renameSync(tmp, p)
+    } catch (err) {
+      try { fs.unlinkSync(tmp) } catch (e2) { /* tmp 未建成 */ }
+      try { fs.unlinkSync(sentinel) } catch (e2) { /* 并发接管者会各自清自己的 */ }
+      return false
+    }
     try { fs.unlinkSync(sentinel) } catch (err) { /* 并发接管者会各自清自己的 */ }
     return true
   } catch (err) {
@@ -231,7 +242,11 @@ function startAction (actionKey, now, activeChildren) {
     if (activeChildren) activeChildren.delete(child)
     record.exitCode = code
     record.finishedAt = Date.now()
-    releaseLockFor(record)
+    // Sourcery #225 M4：释放失败（磁盘/权限异常持续、或锁已换主）必须响亮上报，
+    // 不许静默当作已释放——锁残留时后续触发 409 属预期，运维按 README「故障排查」处理。
+    if (!releaseLockFor(record)) {
+      console.error(`⚠️ 任务 #${record.id} 的触发锁释放失败（文件系统异常或锁已换主）：锁将保留到陈旧接管（约 10 分钟），期间触发 409 属预期；持续出现请按 README「故障排查」处理。`)
+    }
   })
   return record
 }
@@ -239,20 +254,30 @@ function startAction (actionKey, now, activeChildren) {
 function releaseLockFor (record) {
   // 只有仍持有锁的本次运行才释放：锁被陈旧接管后 pid 换人，此时不误删。
   // 归属判定 pid + token 双匹配（单看 pid 会被 OS pid 复用/接管换主绕过，评审 Medium）。
-  // TOCTOU 收口（评审 Medium G5K + CodeQL js/file-system-race）：「读-判-删」按路径
-  // unlink 存在 check-then-act 窗口——判定后锁可能被接管换主，unlink 会误删新主锁，
-  // 或删掉后第三进程立刻拿锁与新主重叠。改为**原地覆写作废**：归属校验通过后把同一
-  // fd 的内容覆写为 released 短帧 {"released":true}（writeFileSync 同 fd = 同 inode 覆写），
-  // acquireLock 读到 released 锁立即视为可接管（与无锁等价）。全程不 unlink 路径，
-  // 无任何按路径删除动作，竞态无从谈起。锁文件残留由下次 acquireLock 的 released
-  // 短路 + 哨兵接管机制兜底，不会阻塞触发。
+  // 竞态收口（Sourcery #225 High）：takeover 已走 tmp+rename 原子换代，这里再加一道
+  // **inode 一致性闸**（fstat(fd) vs stat(path)）——不一致即锁已被接管换名，直接放弃
+  // 覆写；旧 fd 的任何写入都只落在孤儿 inode 上，碰不到新持有者的锁帧。
+  // TOCTOU 收口（评审 Medium G5K + CodeQL js/file-system-race）：全程不 unlink 锁路径，
+  // 释放动作本身保持原地覆写（rename 释放是无条件替换，反而会重新打开覆写新主的窗口）。
+  // 返回值（Sourcery #225 M3）：true = 锁已释放（released 帧已写 / 已是 released / 不存在）；
+  // false = 锁仍处于持有态（写失败 / 已归他人且未释放）——调用方必须对 false 响亮处理，
+  // 不许静默当作已释放。
   const p = lockPath(record._stateDir)
   let fd = null
   try {
     fd = fs.openSync(p, 'r+')
+  } catch (e) {
+    return true // 锁已不在：无事可释放
+  }
+  try {
     const raw = fs.readFileSync(fd, 'utf8')
     const data = JSON.parse(raw)
     if (data.pid === process.pid && data.token === record._lockToken) {
+      // inode 一致性闸：两代不一致 = 已被 tmp+rename 接管换名，本 fd 只指向孤儿
+      // inode——不覆写，锁归接管方负责（返回 false 如实上报）。
+      let pathIno = 0
+      try { pathIno = fs.statSync(p).ino } catch (e) { return true /* 锁路径已消失 */ }
+      if (fs.fstatSync(fd).ino !== pathIno) return false
       // 归属成立：原地单次 writeSync 覆写为 released 短帧（同 inode，无 unlink）。
       // released 帧必须**不大于**原帧（ASCII 锁帧下恒成立）：writeSync 定长覆写不会
       // 追长文件，短出的字节以空格补到原长（JSON 尾部空白合法）——任意时刻读到的
@@ -266,10 +291,21 @@ function releaseLockFor (record) {
       if (origLen > releasedFrame.length) {
         payload = Buffer.concat([releasedFrame, Buffer.alloc(origLen - releasedFrame.length, 0x20)])
       }
-      fs.writeSync(fd, payload, 0, payload.length, 0)
+      // 短写收口（Sourcery #225 M1）：writeSync 可能少写（信号中断/磁盘紧张），残尾
+      // 旧字节会让 JSON.parse 失败 → fail-closed 10 分钟。按返回字节数循环补写到位。
+      let off = 0
+      while (off < payload.length) {
+        off += fs.writeSync(fd, payload, off, payload.length - off, off)
+      }
       fs.fsyncSync(fd)
+      return true
     }
-  } catch (e) { /* 锁已不在/内容不可读：无事可做 */ } finally {
+    // 不是我们的锁：已是 released 帧视为已释放；仍是活的他人锁则如实返回 false
+    // （由持有方负责释放，我们不碰）。
+    return data.released === true
+  } catch (e) {
+    return false
+  } finally {
     if (fd !== null) { try { fs.closeSync(fd) } catch (e) { /* 已关 */ } }
   }
 }
@@ -632,8 +668,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           } catch (e) {
             // 落盘失败 = 无持久重放记录，为满足「重试不得重复推送」必须拒绝受理（Sourcery High）。
             // 此时锁刚拿到、子进程未启动（activeChildren 无登记，close 回调无从释放）——
-            // 必须显式释放，否则锁泄漏到 PROC_TIMEOUT_MS 陈旧接管，期间重试全部 409。
-            releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
+            // 必须显式释放（Sourcery #225 M3/M4：releaseLockFor 返回 false = 文件系统
+            // 同样写不进锁 → 响亮告警给运维排查线索；恢复 pending 前值，失败动作可在
+            // 窗口内重试，不再被 409 拦到窗口过期）。
+            const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
+            if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：磁盘/权限异常仍未恢复，锁将保留到陈旧接管（约 10 分钟）。后续触发 409 属预期。`)
+            lastAccept.delete(action)
             sendJson(res, 500, { error: '重放记录持久化失败，动作未执行（fail-closed）' })
             return
           }
@@ -727,9 +767,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
 // ── 启动入口 ───────────────────────────────────────────────────────────────
 function main () {
   const token = process.env.XBK_CONSOLE_TOKEN
-  const port = process.env.XBK_CONSOLE_PORT != null && process.env.XBK_CONSOLE_PORT !== ''
-    ? Number(process.env.XBK_CONSOLE_PORT)
-    : 7777
+  // Sourcery #225 M5：XBK_CONSOLE_PORT 非空但非法（非数字/超范围）时 Number() 得 NaN，
+  // 旧 || 7777 会把合法的 0（随机端口）一起吞掉；先区分「未设置」与「设了但坏」——
+  // 坏值 fail-closed 拒启并说明，不静默回退默认端口（用户以为改了端口实际没有）。
+  const rawPort = process.env.XBK_CONSOLE_PORT
+  let port = 7777
+  if (rawPort != null && rawPort !== '') {
+    port = Number(rawPort)
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      console.error(`❌ XBK_CONSOLE_PORT 非法：「${rawPort}」不是 0–65535 的整数端口，控制台拒绝启动（fail-closed）`)
+      process.exit(1)
+    }
+  }
   const host = process.env.XBK_CONSOLE_HOST || '127.0.0.1'
   // Sourcery Medium：与生产入口 / --status 同源解析缓存目录（含安全回退），
   // 不再手写默认值——否则 .xbk_cache_safe 生效时看板会读错目录。

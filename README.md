@@ -144,7 +144,7 @@ filter: {
 | `XBK_DRY_RUN=1` | 对常驻和单轮入口都生效：不发送通知、不写入成功缓存；常驻入口持续运行，`npm start` 只执行一轮 |
 | `XBK_CACHE_DIR` | `--status` 使用的状态目录，必须是绝对路径 |
 | `XBK_CONSOLE_TOKEN` | 网页控制台访问令牌（≥16 字符；未设置则控制台拒绝启动） |
-| `XBK_CONSOLE_PORT` | 网页控制台端口，默认 `7777`（设 `0` 则绑定随机可用端口） |
+| `XBK_CONSOLE_PORT` | 网页控制台端口，默认 `7777`（设 `0` 则绑定随机可用端口；非 0–65535 整数拒绝启动） |
 | `XBK_CONSOLE_HOST` | 网页控制台绑定地址，默认 `127.0.0.1` |
 | `XBK_AUTO_INSTALL_DEPS=1` | 应急选项：青龙常驻入口运行时联网安装和构建缺失依赖；默认关闭，优先在部署阶段完成依赖初始化 |
 | `PUSH_PLUS_TOKEN` | PushPlus Token，可代替本地配置 |

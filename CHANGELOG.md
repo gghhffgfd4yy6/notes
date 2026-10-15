@@ -366,4 +366,5 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **删除 `releaseLock`**：按路径 `unlinkSync` 删锁违反本仓 CodeQL 铁律（check-then-act），且已无生产调用方——从实现与导出面移除，释放一律走 `releaseLockFor` 原地覆写。
 - **删除死模块 `scripts/console-assets/index.js`**：注释声称「供 test_console.js 校验」，实际无任何文件 require。
 - **vendor 锚点**：app.js 头注释补 htm-preact.module.js 的来源 URL、sha256 与 CVE-2026-22028 影响区间备注；剥离 vendored 文件尾部的 sourcery-ignore 注释（豁免本就以 .sourcery.yaml ignore 承载，不再污染上游产物）。
-- **`XBK_CONSOLE_PORT=0` 语义修正**：`Number(env) || 7777` 会把合法的 `0`（随机端口）吞成 7777；改为显式判空（README 同步）。
+- **`XBK_CONSOLE_PORT=0` 语义修正**：`Number(env) || 7777` 会把合法的 `0`（随机端口）吞成 7777；改为显式判空，非 0–65535 整数 fail-closed 拒启（Sourcery #225 M5：NaN 静默回退默认端口同样有害）。
+- **Sourcery #225 评审 6 条收尾**：①（High）陈旧持有者可在「read 旧锁 → 接管者覆写 → write 旧 fd」窗口把 released 帧盖到接管方新锁帧上——接管路径改「tmp + rename 原子换代」（换 inode，旧 fd 落在孤儿 inode 上）+ releaseLockFor 增 inode 一致性闸（fstat(fd) vs stat(path) 不一致即放弃覆写）；②writeSync 短写会留半 JSON 残帧（fail-closed 10 分钟）——按返回字节数循环补写到位；③落盘失败路径残留 pending 重放条目使失败动作被 409 拦到窗口过期——错误分支回滚 `lastAccept` 条目，失败动作窗口内可立即重试；④releaseLockFor 吞错误静默「当作已释放」——返回布尔（true=已释放/false=仍持有），两处调用方对 false 响亮 console.error；⑤非法端口拒绝启动（上一条的延伸，NaN/越界不再回退 7777）；⑥SIGTERM 端到端测试补「关停耗时 <2.8s」断言（区分真杀子进程与 3s 看门狗强退）。回归 +6（inode 闸/短写循环/返回值三态/落盘失败可重试/非法端口/关停延迟）。
