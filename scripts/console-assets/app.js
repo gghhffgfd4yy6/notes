@@ -85,11 +85,25 @@ async function readBodyJson (res) {
   }
 }
 
-async function apiGetStatus () {
+// fetch 公共骨架：所有 GET 端点共用（超时/abort、非 2xx 抛错、body 消费完才清期限）。
+// 端点路径走白名单常量表（字面量），调用侧只传键名——Codacy SSRF 启发式据此断 taint。
+const API_PATHS = Object.freeze({
+  status: '/api/status',
+  runs: '/api/runs',
+  messages: '/api/messages',
+  trends: '/api/trends',
+  logs: '/api/logs',
+  sys: '/api/sys'
+})
+
+async function apiFetchJson (pathKey, { query } = {}) {
+  const base = API_PATHS[pathKey]
+  if (typeof base !== 'string') throw new Error(`unknown endpoint: ${String(pathKey)}`)
+  const qs = query instanceof URLSearchParams ? query.toString() : ''
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  const p = fetch('/api/status', merged)
+  const p = fetch(qs.length > 0 ? `${base}?${qs}` : base, merged)
   p.then(() => {}, () => {}) // fetch reject（网络错）时由下方 done 兜底；正常路径在 body 消费后清
   try {
     const res = await p
@@ -105,24 +119,12 @@ async function apiGetStatus () {
   }
 }
 
-async function apiGetRuns () {
-  const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  const p = fetch('/api/runs', merged)
-  p.then(() => {}, () => {})
-  try {
-    const res = await p
-    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
-    try {
-      return await readBodyJson(res)
-    } finally {
-      done()
-    }
-  } catch (e) {
-    done()
-    throw e
-  }
+function apiGetStatus () {
+  return apiFetchJson('status')
+}
+
+function apiGetRuns () {
+  return apiFetchJson('runs')
 }
 
 async function apiGetRunDetail (id) {
@@ -157,92 +159,27 @@ async function apiGetRunDetail (id) {
 }
 
 // ── v3.297 扩展 API：推送记录 / 趋势 / 日志 / 系统 ────────────────────────────
-// 与上方端点同纪律：fetch 第一参数必须是字面量（Codacy SSRF 启发式不接受变量 URL），
-// 查询参数全部经 URLSearchParams 编码后拼进字面量模板（值已被 form-encode，无注入面）。
-async function apiGetMessages ({ page, size, cate, q }) {
+// 与上方端点同纪律：fetch 第一参数是白名单字面量，查询参数经 URLSearchParams 编码
+// （值已被 form-encode，无注入面）。
+function apiGetMessages ({ page, size, cate, q }) {
   const params = new URLSearchParams()
   if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
   if (Number.isSafeInteger(size) && size !== 20) params.set('size', String(size))
   if (typeof cate === 'string' && cate.length > 0) params.set('cate', cate)
   if (typeof q === 'string' && q.length > 0) params.set('q', q)
-  const qs = params.toString()
-  const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  const p = fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged)
-  p.then(() => {}, () => {})
-  try {
-    const res = await p
-    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
-    try {
-      return await readBodyJson(res)
-    } finally {
-      done()
-    }
-  } catch (e) {
-    done()
-    throw e
-  }
+  return apiFetchJson('messages', { query: params })
 }
 
-async function apiGetTrends () {
-  const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  const p = fetch('/api/trends', merged)
-  p.then(() => {}, () => {})
-  try {
-    const res = await p
-    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
-    try {
-      return await readBodyJson(res)
-    } finally {
-      done()
-    }
-  } catch (e) {
-    done()
-    throw e
-  }
+function apiGetTrends () {
+  return apiFetchJson('trends')
 }
 
-async function apiGetLogs () {
-  const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  const p = fetch('/api/logs', merged)
-  p.then(() => {}, () => {})
-  try {
-    const res = await p
-    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
-    try {
-      return await readBodyJson(res)
-    } finally {
-      done()
-    }
-  } catch (e) {
-    done()
-    throw e
-  }
+function apiGetLogs () {
+  return apiFetchJson('logs')
 }
 
-async function apiGetSys () {
-  const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  const p = fetch('/api/sys', merged)
-  p.then(() => {}, () => {})
-  try {
-    const res = await p
-    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
-    try {
-      return await readBodyJson(res)
-    } finally {
-      done()
-    }
-  } catch (e) {
-    done()
-    throw e
-  }
+function apiGetSys () {
+  return apiFetchJson('sys')
 }
 
 async function trigger (action) {
@@ -613,18 +550,25 @@ function RunsPanel ({ runs, pollMs }) {
 
 // 近 14 日趋势（纯 CSS 条形图，零依赖）：一格=一天，高度按当日推送条数归一。
 // failed>0 的日子用红色渐变提示；0 推送的日子画灰色基线（看得见「没有数据」≠ 没画）。
-function TrendsPanel () {
-  const [trends, setTrends] = useState(null)
+// 面板加载器公共骨架：data/err 状态 + load()（成功清错、失败写横幅）。
+// apiFn 由调用方用 useCallback/useMemo 固定引用，避免 effect 风暴。
+function usePanelLoader (apiFn) {
+  const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const load = useCallback(async () => {
     try {
-      const t = await apiGetTrends()
-      setTrends(t)
+      const d = await apiFn()
+      setData(d)
       setErr('')
     } catch (e) {
       setErr(`加载失败：${e.message}`)
     }
-  }, [])
+  }, [apiFn])
+  return { data, err, load }
+}
+
+function TrendsPanel () {
+  const { data: trends, err, load } = usePanelLoader(apiGetTrends)
   useEffect(() => { load().catch(() => {}) }, [load])
   const byDay = trends && trends.status === 'ok' ? trends.byDay : []
   const maxPushed = Math.max(1, ...byDay.map((d) => d.pushed))
@@ -661,23 +605,16 @@ function MessagesPanel () {
   const [cate, setCate] = useState('')
   const [input, setInput] = useState('')
   const [query, setQuery] = useState('')
-  const [data, setData] = useState(null)
-  const [err, setErr] = useState('')
   const [expanded, setExpanded] = useState(null) // 展开的条目 id
   // 搜索防抖：输入停 300ms 才真正改 query（重置回第 1 页）。
   useEffect(() => {
     const t = setTimeout(() => { setQuery(input.trim()); setPage(1) }, 300)
     return () => clearTimeout(t)
   }, [input])
-  const load = useCallback(async () => {
-    try {
-      const d = await apiGetMessages({ page, size, cate, q: query })
-      setData(d)
-      setErr('')
-    } catch (e) {
-      setErr(`加载失败：${e.message}`)
-    }
-  }, [page, size, cate, query])
+  const fetchMessages = useCallback(
+    () => apiGetMessages({ page, size, cate, q: query }),
+    [page, size, cate, query])
+  const { data, err, load } = usePanelLoader(fetchMessages)
   useEffect(() => { load().catch(() => {}) }, [load])
   const items = data && Array.isArray(data.items) ? data.items : []
   const categories = data && Array.isArray(data.categories) ? data.categories : []
@@ -728,17 +665,7 @@ function MessagesPanel () {
 
 // 运行日志：run.log 尾部（服务端 1MiB 上限），进页拉一次 + 手动刷新；有任务在跑时跟随轮询。
 function LogsPanel ({ pollMs }) {
-  const [data, setData] = useState(null)
-  const [err, setErr] = useState('')
-  const load = useCallback(async () => {
-    try {
-      const d = await apiGetLogs()
-      setData(d)
-      setErr('')
-    } catch (e) {
-      setErr(`加载失败：${e.message}`)
-    }
-  }, [])
+  const { data, err, load } = usePanelLoader(apiGetLogs)
   useEffect(() => {
     load().catch(() => {})
     if (!pollMs) return undefined
@@ -760,17 +687,7 @@ function LogsPanel ({ pollMs }) {
 
 // 系统信息：版本 / 运行环境 / 进程 / 缓存目录。全部只读，无操作按钮。
 function SysPanel () {
-  const [sys, setSys] = useState(null)
-  const [err, setErr] = useState('')
-  const load = useCallback(async () => {
-    try {
-      const d = await apiGetSys()
-      setSys(d)
-      setErr('')
-    } catch (e) {
-      setErr(`加载失败：${e.message}`)
-    }
-  }, [])
+  const { data: sys, err, load } = usePanelLoader(apiGetSys)
   useEffect(() => { load().catch(() => {}) }, [load])
   const fmtUptime = (s) => {
     if (!(typeof s === 'number' && s >= 0)) return '—'
