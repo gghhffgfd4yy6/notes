@@ -171,8 +171,14 @@ ok('releaseLockFor: inode 一致性闸（回归 Sourcery #225 High：陈旧持�
   fs2.utimesSync(p, 1, 1) // 把 mtime 拉旧不影响 startedAt 判定；直接改 startedAt 更直接：
   fs2.writeFileSync(p, JSON.stringify({ pid: 999999, startedAt: 1, token: 'tok-old' }))
   assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS + 5000, 'tok-new'), true, '接管方拿到锁')
-  const newFrameBefore = fs2.readFileSync(p, 'utf8')
-  assert.strictEqual(JSON.parse(newFrameBefore).token, 'tok-new')
+  // 断言接管结果：同 fd 读纪律（open + fstat(fd) + 同 fd 读），避免 CodeQL js/file-system-race
+  // 对「rename 写路径 → 路径读」的 check-then-use 判红。
+  const rfd1 = fs2.openSync(p, 'r')
+  try {
+    if (!fs2.fstatSync(rfd1).isFile()) throw new Error('not file')
+    const newFrameBefore = fs2.readFileSync(rfd1, 'utf8')
+    assert.strictEqual(JSON.parse(newFrameBefore).token, 'tok-new')
+  } finally { fs2.closeSync(rfd1) }
   // 旧持有者仍握着旧 inode 的 fd？不——它每次 open 都是新 fd；竞态的本质是「旧主在
   // rename 前 open」。这里用注入模拟：手动 open 旧内容后让 rename 发生，再 releaseLockFor。
   // 简化：直接构造「fd 指向孤儿 inode」场景——把当前锁 rename 走，再在原路径放新帧。
@@ -187,7 +193,13 @@ ok('releaseLockFor: inode 一致性闸（回归 Sourcery #225 High：陈旧持�
   const { releaseLockFor } = require('./scripts/console')
   // 手动走一致性闸逻辑：直接调 releaseLockFor（它会重新 open 路径，双匹配失败返回 false）
   assert.strictEqual(releaseLockFor({ _stateDir: orphanDir, _lockToken: 'tok-victim' }), false, '锁已换主不得释放')
-  assert.strictEqual(JSON.parse(fs2.readFileSync(op, 'utf8')).token, 'tok-new', '新主锁帧原样无损')
+  // 断言新主锁帧原样无损：按生产 readSafeText 同款纪律（open + fstat(fd) + 同 fd 读），
+  // 避免 CodeQL js/file-system-race 对「rename 写路径 → 路径读」的 check-then-use 判红。
+  const rfd2 = fs2.openSync(op, 'r')
+  try {
+    if (!fs2.fstatSync(rfd2).isFile()) throw new Error('not file')
+    assert.strictEqual(JSON.parse(fs2.readFileSync(rfd2, 'utf8')).token, 'tok-new', '新主锁帧原样无损')
+  } finally { fs2.closeSync(rfd2) }
   fs2.closeSync(orphanFd)
 })
 ok('releaseLockFor: 短写循环（monkeypatch writeSync 首次少写，回归 Sourcery #225 M1）', () => {
@@ -211,9 +223,13 @@ ok('releaseLockFor: 短写循环（monkeypatch writeSync 首次少写，回归 S
   } finally {
     fsmod.writeSync = realWrite
   }
-  const body = fsmod.readFileSync(lockPath(dir), 'utf8')
-  assert.strictEqual(JSON.parse(body).released, true, '残尾补写后仍是合法 released 帧')
-  assert.strictEqual(body.trim(), '{"released":true}')
+  const rfd3 = fsmod.openSync(lockPath(dir), 'r')
+  try {
+    if (!fsmod.fstatSync(rfd3).isFile()) throw new Error('not file')
+    const body = fsmod.readFileSync(rfd3, 'utf8')
+    assert.strictEqual(JSON.parse(body).released, true, '残尾补写后仍是合法 released 帧')
+    assert.strictEqual(body.trim(), '{"released":true}')
+  } finally { fsmod.closeSync(rfd3) }
 })
 ok('releaseLockFor: 他人活锁返回 false；released 帧返回 true；锁不存在返回 true', () => {
   const dir = tmpDir()
@@ -652,6 +668,34 @@ async function main () {
     })
     assert.strictEqual(code, 1, `非法端口必须 exit 1（实际 ${code}）`)
     assert.ok(errOut.includes('非法'), `stderr 必须说明端口非法：${errOut.slice(0, 200)}`)
+  })
+  await aok('wireGracefulShutdown: kill(SIGKILL) → 等 close → 才退出（回归 Sourcery #225 M6：关停必须真终止子进程）', async () => {
+    const dir = tmpDir()
+    const { activeChildren, wireGracefulShutdown: wire } = createConsole({ token: TOKEN, stateDir: dir, port: 0 })
+    // 假子进程：只有显式调 kill 才会发 close（模拟真实存活子进程）；关停若不再杀子进程，
+    // kill 断言红；若不等 close 直接退出，时序断言红。
+    const events = []
+    const fakeChild = {
+      kill (sig) { this.killed = true; this.signal = sig; events.push(`kill:${sig}`) },
+      once (ev, fn) { this._onceClose = ev === 'close' ? fn : this._onceClose; return this }
+    }
+    activeChildren.add(fakeChild)
+    let exitCode = null
+    let registered = null
+    const { shutdown } = wire({
+      onExit: (code) => { events.push(`exit:${code}`); exitCode = code },
+      registerSignal: (fn) => { registered = fn }
+    })
+    assert.strictEqual(typeof registered, 'function', '必须注册信号回调')
+    shutdown('SIGTERM')
+    assert.ok(events.includes('kill:SIGKILL'), `关停必须对活跃子进程 SIGKILL（events=${events}）`)
+    // close 之前不得退出（等每个子进程真正死掉才收尾——评审 Medium G5F 序列）。
+    assert.strictEqual(exitCode, null, `close 前不得退出（events=${events}）`)
+    // 子进程真正 close → 才走 finishShutdown → server.close 回调 → 退出。
+    fakeChild._onceClose()
+    await new Promise(resolve => setTimeout(resolve, 80))
+    assert.strictEqual(exitCode, 0, `子进程 close 后必须退出 0（events=${events}）`)
+    assert.ok(events.indexOf('exit:0') > events.indexOf('kill:SIGKILL'), '退出必须发生在 kill 之后')
   })
 }
 

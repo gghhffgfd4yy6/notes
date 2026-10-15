@@ -761,7 +761,65 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     return origClose(cb)
   }
   server.on('close', killAll)
-  return { server, runs, activeChildren, setShuttingDown, ownerToken }
+  // ── 优雅关闭装配（v3.297 自 main 抽出，Sourcery #225 M6：原实现不可测——测试无法
+  // 确认「关停真的 SIGKILL 了子进程、并等 close 后才退出」）。依赖注入 onExit/registerSignal：
+  // 测试传假子进程 + 假 exit 即可确定性断言序列；生产 main 无参调用即等价旧行为。
+  const wireGracefulShutdown = ({ onExit, registerSignal } = {}) => {
+    let exitDone = false
+    const doExit = (code) => {
+      if (exitDone) return
+      exitDone = true
+      if (onExit) onExit(code)
+      else process.exit(code)
+    }
+    const shutdown = (signal) => {
+      setShuttingDown() // 关停闸：/trigger 即刻 503，readBody 回调不得再 spawn（评审 High）
+      console.log(`收到 ${signal}，关闭控制台：终止触发子进程并释放锁…`)
+      for (const child of activeChildren) {
+        try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
+      }
+      // 锁释放时机（评审 Medium G5F/G5K）：不能在 SIGKILL 后立刻 unlink（子进程还没死，
+      // 别的实例会立刻拿锁与垂死子进程重叠），也不能「读-判-删」（TOCTOU：判定后锁被
+      // 接管换主，unlink 误删新主锁）。正确序列：杀子进程 → 等每个子进程真正 close
+      // （close 回调里 releaseLockFor 已按 pid+token 双匹配释放）→ 全部收完才退出。
+      // activeChildren.clear() 不能提前——清了就收不到 close 计数。
+      const pending = [...activeChildren]
+      let exited = 0
+      const maybeFinish = () => {
+        exited++
+        if (exited >= pending.length) finishShutdown()
+      }
+      let finished = false
+      const finishShutdown = () => {
+        if (finished) return
+        finished = true
+        server.close(() => doExit(0))
+        // close 只挡新连接，既有 keep-alive/在途连接要显式收尾：空闲连接立即排空，
+        // 在途请求给 500ms 完成窗口（本地看板端点毫秒级）后强断，1s 强退兜底——
+        // 不排空会让客户端收到 ERR_EMPTY_RESPONSE、挂起的 keep-alive 得不到关闭帧。
+        server.closeIdleConnections()
+        setTimeout(() => { server.closeAllConnections() }, 500).unref()
+        setTimeout(() => doExit(0), 1000).unref()
+      }
+      if (pending.length === 0) {
+        finishShutdown()
+      } else {
+        for (const child of pending) {
+          // close 在子进程真正死后触发（SIGKILL 毫秒级）；同时兜底 3s 强制收尾，
+          // 防个别子进程 close 事件丢失导致控制台挂住不退。
+          child.once('close', maybeFinish)
+        }
+        setTimeout(finishShutdown, 3000).unref()
+      }
+    }
+    if (registerSignal) registerSignal(shutdown)
+    else {
+      process.on('SIGTERM', () => shutdown('SIGTERM'))
+      process.on('SIGINT', () => shutdown('SIGINT'))
+    }
+    return { shutdown }
+  }
+  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown }
 }
 
 // ── 启动入口 ───────────────────────────────────────────────────────────────
@@ -786,51 +844,10 @@ function main () {
   // 锁归属 token（评审 Medium：pid 复用会让「pid===process.pid」误认他人锁为自有；
   // takeover 换主后 unlink 竞态也可能误删新主的锁）。锁内容带 token，释放须双匹配。
   const lockToken = crypto.randomBytes(12).toString('hex')
-  const { server, activeChildren, setShuttingDown } = createConsole({ token, stateDir, port, host, lockToken })
-  // 优雅关闭（Sourcery #21 余量）：SIGTERM/SIGINT 默认行为不走 server.close，会留下
-  // ①还在跑的触发子进程 ②未释放的触发锁（下次触发 409 直到锁 age 超时）。这里统一收尾。
-  const shutdown = (signal) => {
-    setShuttingDown() // 关停闸：/trigger 即刻 503，readBody 回调不得再 spawn（评审 High）
-    console.log(`收到 ${signal}，关闭控制台：终止触发子进程并释放锁…`)
-    for (const child of activeChildren) {
-      try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
-    }
-    // 锁释放时机（评审 Medium G5F/G5K）：不能在 SIGKILL 后立刻 unlink（子进程还没死，
-    // 别的实例会立刻拿锁与垂死子进程重叠），也不能「读-判-删」（TOCTOU：判定后锁被
-    // 接管换主，unlink 误删新主锁）。正确序列：杀子进程 → 等每个子进程真正 close
-    // （close 回调里 releaseLockFor 已按 pid+token 双匹配释放）→ 全部收完才退出。
-    // activeChildren.clear() 不能提前——清了就收不到 close 计数。
-    const pending = [...activeChildren]
-    let exited = 0
-    const maybeFinish = () => {
-      exited++
-      if (exited >= pending.length) finishShutdown()
-    }
-    let finished = false
-    const finishShutdown = () => {
-      if (finished) return
-      finished = true
-      server.close(() => process.exit(0))
-      // close 只挡新连接，既有 keep-alive/在途连接要显式收尾：空闲连接立即排空，
-      // 在途请求给 500ms 完成窗口（本地看板端点毫秒级）后强断，1s 强退兜底——
-      // 不排空会让客户端收到 ERR_EMPTY_RESPONSE、挂起的 keep-alive 得不到关闭帧。
-      server.closeIdleConnections()
-      setTimeout(() => { server.closeAllConnections() }, 500).unref()
-      setTimeout(() => process.exit(0), 1000).unref()
-    }
-    if (pending.length === 0) {
-      finishShutdown()
-    } else {
-      for (const child of pending) {
-        // close 在子进程真正死后触发（SIGKILL 毫秒级）；同时兜底 3s 强制收尾，
-        // 防个别子进程 close 事件丢失导致控制台挂住不退。
-        child.once('close', maybeFinish)
-      }
-      setTimeout(finishShutdown, 3000).unref()
-    }
-  }
-  process.on('SIGTERM', () => shutdown('SIGTERM'))
-  process.on('SIGINT', () => shutdown('SIGINT'))
+  const { server, wireGracefulShutdown } = createConsole({ token, stateDir, port, host, lockToken })
+  // 优雅关闭：装配逻辑在 createConsole.wireGracefulShutdown（v3.297 抽出以便依赖注入
+  // 测试，Sourcery #225 M6）。生产路径无注入 = process.exit + 全局信号监听，与抽取前等价。
+  wireGracefulShutdown()
   server.listen(port, host, () => {
     console.log(`xbk-push 控制台已启动：http://${host}:${server.address().port}（缓存目录：${stateDir}）`)
     console.log(`鉴权：请求头 Authorization: Bearer <XBK_CONSOLE_TOKEN>，或浏览器打开 http://${host}:${server.address().port}/?token=<XBK_CONSOLE_TOKEN>；token 未设置或过短则拒绝启动`)
