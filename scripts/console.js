@@ -20,13 +20,25 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
-const { readStatus, formatStatus } = require('./status')
+const { readStatus, formatStatus, readTrends, readMessages } = require('./status')
 const { statusCacheDir } = require('../qinglong/xbk_push')
 
 const ROOT = path.resolve(__dirname, '..')
 const RUN_LOG_MAX_BYTES = 512 * 1024
 const PROC_TIMEOUT_MS = 10 * 60 * 1000
 const TOKEN_MIN_LEN = 16
+// 消息列表（GET /api/messages）读取上限：push.json 是判重缓存主存（MESSAGE_CACHE_MAX_BYTES=64MiB
+// 的生产写入上限），控制台只读展示按 32MiB 封顶——超过即 tooLarge，前端显示「记录过大不可读」，
+// 与 run.log 尾读策略不同：列表必须整读才能排序/分页，半截 JSON 假装可读更危险。
+const MESSAGES_MAX_BYTES = 32 * 1024 * 1024
+// 日志查看（GET /api/logs）取尾部：日志消费方只关心最近的记录，与 scripts/status.js 的
+// LOG_READ_OPTIONS.tail 同一口径（超限读尾 1MiB，不全拒）。
+const LOG_VIEW_MAX_BYTES = 1024 * 1024
+// 消息列表分页参数上限：单页条数 1–100，页码 1–10000（防御性钳制，URL 参数是未验证输入）。
+const MESSAGES_PAGE_SIZE_MAX = 100
+const MESSAGES_PAGE_MAX = 10000
+// 搜索词长度上限（字节）：UTF-8 下 240 字节足够容纳 80 个汉字，防止超长 query 白耗 CPU。
+const MESSAGES_QUERY_MAX_BYTES = 240
 
 // 三种触发模式 → 子进程参数。均跑一轮即退出（--dry-run 与单轮天然退出；--check 只做环境检查），
 // 绝不启动常驻循环（网页服务自己就是长驻进程，嵌套常驻只会制造孤儿）。
@@ -517,6 +529,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 窗仍拦截——这正是修复点。超窗不受影响，人工重跑语义保留。
   const REPLAY_WINDOW_MS = PROC_TIMEOUT_MS + 2 * 60 * 1000
   const lastAccept = new Map()
+  // 进程启动时刻（/api/sys 展示「已运行」用）：createConsole 被调用的瞬间。
+  const startedAtMs = Date.now()
   // 读取持久化重放记录：返回合法条目的键值对数组（文件不存在/损坏返回空）。
   // 每次受理前实时调用（Sourcery High：多进程共享 stateDir 时，启动时读的快照会过期）。
   const readLastAccept = (p) => {
@@ -617,6 +631,115 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         if (!st.lock) st.lock = { held: false, ageMs: 0 }
       }
       sendJson(res, 200, st)
+      return
+    }
+    // ── v3.297 控制台扩展：推送记录 / 趋势 / 日志 / 系统 ─────────────────────────
+    // 全部只读（读缓存目录已有文件 + 进程自身信息），不 spawn、不写任何文件；
+    // 鉴权与其余读取端点一致（Bearer / ?token= / Cookie 会话）。
+    if (req.method === 'GET' && url.pathname === '/api/messages') {
+      const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES })
+      if (read.status !== 'ok') {
+        // missing = 缓存还没建（首轮未跑）；invalid/tooLarge = 数据坏了/过大——
+        // 三态如实下发，前端按 partTone 同口径显示，不伪装成「暂无记录」。
+        sendJson(res, 200, { status: read.status, total: 0, page: 1, pageSize: 0, items: [], categories: [] })
+        return
+      }
+      const q = url.searchParams
+      // 分页参数钳制（URL 是未验证输入）：非法值回退默认，不 400——自用工具宽容输入，
+      // 但永远不会越界（page*size 超大切片会复制数组，钳制后上限 100 * 10001 条仍有界）。
+      let size = Number(q.get('size'))
+      if (!Number.isSafeInteger(size) || size < 1) size = 20
+      if (size > MESSAGES_PAGE_SIZE_MAX) size = MESSAGES_PAGE_SIZE_MAX
+      let page = Number(q.get('page'))
+      if (!Number.isSafeInteger(page) || page < 1) page = 1
+      if (page > MESSAGES_PAGE_MAX) page = MESSAGES_PAGE_MAX
+      // 过滤：分类精确匹配 + 关键词子串（title / content，大小写不敏感的 ASCII 归一）。
+      // 用 includes 而非正则（用户输入直接进正则有 ReDoS 面，本仓正则防护红线）。
+      const cate = typeof q.get('cate') === 'string' ? q.get('cate') : ''
+      let query = typeof q.get('q') === 'string' ? q.get('q').trim() : ''
+      if (Buffer.byteLength(query, 'utf8') > MESSAGES_QUERY_MAX_BYTES) query = ''
+      const needle = query.length > 0 ? query.toLowerCase() : ''
+      let items = read.value.items
+      if (cate.length > 0) {
+        items = items.filter((m) => (typeof m.catename === 'string' && m.catename.length > 0 ? m.catename : '(未分类)') === cate)
+      }
+      if (needle.length > 0) {
+        items = items.filter((m) =>
+          (typeof m.title === 'string' && m.title.toLowerCase().includes(needle)) ||
+          (typeof m.content === 'string' && m.content.toLowerCase().includes(needle)))
+      }
+      // 下发字段裁剪：content_html 不出（体积大且含外链 img，CSP 下也渲染不了）；
+      // 列表给 title/content 摘要 + 元数据；详情字段由前端展开 content 全文。
+      const total = items.length
+      const start = (page - 1) * size
+      const pageItems = items.slice(start, start + size).map((m) => ({
+        id: typeof m.id === 'number' || typeof m.id === 'string' ? m.id : '',
+        title: typeof m.title === 'string' ? m.title : '',
+        content: typeof m.content === 'string' ? m.content.slice(0, 500) : '',
+        datetime: typeof m.datetime === 'string' ? m.datetime : '',
+        shorttime: typeof m.shorttime === 'string' ? m.shorttime : '',
+        shijianchuo: typeof m.shijianchuo === 'number' ? m.shijianchuo : null,
+        cateid: typeof m.cateid === 'string' || typeof m.cateid === 'number' ? String(m.cateid) : '',
+        catename: typeof m.catename === 'string' && m.catename.length > 0 ? m.catename : '(未分类)',
+        price: typeof m.price === 'number' ? m.price : null,
+        url: typeof m.url === 'string' ? m.url : ''
+      }))
+      sendJson(res, 200, {
+        status: 'ok',
+        total,
+        page,
+        pageSize: size,
+        pages: Math.max(1, Math.ceil(total / size)),
+        grandTotal: read.value.total,
+        skipped: read.value.skipped,
+        categories: read.value.categories,
+        items: pageItems
+      })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/trends') {
+      // 近 14 日运行趋势：run.log 摘要行按日聚合（scripts/status.js readTrends，
+      // 与 parseLastRun 同一正则口径）。missing/invalid 如实下发。
+      const t = readTrends(stateDir)
+      if (t.status !== 'ok') {
+        sendJson(res, 200, { status: t.status, byDay: [] })
+        return
+      }
+      sendJson(res, 200, { status: 'ok', days: t.value.days, byDay: t.value.byDay })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/logs') {
+      // 运行日志在线查看：run.log 尾部 1MiB（与 status.js LOG_READ_OPTIONS.tail 同口径）。
+      const { readSafeTextResult } = require('../xbk_storage')
+      const safe = readSafeTextResult(path.join(stateDir, 'run.log'), LOG_VIEW_MAX_BYTES, { tail: true })
+      if (safe.status === 'missing') {
+        sendJson(res, 200, { status: 'missing', text: '' })
+        return
+      }
+      if (safe.status !== 'ok') {
+        sendJson(res, 200, { status: safe.status, text: '' })
+        return
+      }
+      sendJson(res, 200, { status: 'ok', text: safe.text })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/sys') {
+      // 系统信息：版本四方来源 package.json（与 check-version.js 的唯一真源一致）+
+      // 进程/宿主只读信息。不暴露路径之外的任何环境变量（token 等凭证绝不入响应）。
+      let version = ''
+      try { version = String(require('../package.json').version || '') } catch (e) { version = '' }
+      let rss = 0
+      try { rss = process.memoryUsage().rss } catch (e) { rss = 0 }
+      sendJson(res, 200, {
+        version,
+        node: process.version,
+        platform: `${process.platform} ${process.arch}`,
+        pid: process.pid,
+        uptimeS: Math.floor(process.uptime()),
+        rssBytes: rss,
+        cacheDir: stateDir,
+        startedAt: startedAtMs
+      })
       return
     }
     if (req.method === 'POST' && url.pathname === '/trigger') {

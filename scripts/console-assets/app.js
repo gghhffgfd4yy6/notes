@@ -156,6 +156,95 @@ async function apiGetRunDetail (id) {
   }
 }
 
+// ── v3.297 扩展 API：推送记录 / 趋势 / 日志 / 系统 ────────────────────────────
+// 与上方端点同纪律：fetch 第一参数必须是字面量（Codacy SSRF 启发式不接受变量 URL），
+// 查询参数全部经 URLSearchParams 编码后拼进字面量模板（值已被 form-encode，无注入面）。
+async function apiGetMessages ({ page, size, cate, q }) {
+  const params = new URLSearchParams()
+  if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
+  if (Number.isSafeInteger(size) && size !== 20) params.set('size', String(size))
+  if (typeof cate === 'string' && cate.length > 0) params.set('cate', cate)
+  if (typeof q === 'string' && q.length > 0) params.set('q', q)
+  const qs = params.toString()
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  const p = fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged)
+  p.then(() => {}, () => {})
+  try {
+    const res = await p
+    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
+    try {
+      return await readBodyJson(res)
+    } finally {
+      done()
+    }
+  } catch (e) {
+    done()
+    throw e
+  }
+}
+
+async function apiGetTrends () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  const p = fetch('/api/trends', merged)
+  p.then(() => {}, () => {})
+  try {
+    const res = await p
+    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
+    try {
+      return await readBodyJson(res)
+    } finally {
+      done()
+    }
+  } catch (e) {
+    done()
+    throw e
+  }
+}
+
+async function apiGetLogs () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  const p = fetch('/api/logs', merged)
+  p.then(() => {}, () => {})
+  try {
+    const res = await p
+    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
+    try {
+      return await readBodyJson(res)
+    } finally {
+      done()
+    }
+  } catch (e) {
+    done()
+    throw e
+  }
+}
+
+async function apiGetSys () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  const p = fetch('/api/sys', merged)
+  p.then(() => {}, () => {})
+  try {
+    const res = await p
+    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
+    try {
+      return await readBodyJson(res)
+    } finally {
+      done()
+    }
+  } catch (e) {
+    done()
+    throw e
+  }
+}
+
 async function trigger (action) {
   const body = new URLSearchParams({ action })
   const { merged, done } = timedRequest({
@@ -518,6 +607,203 @@ function RunsPanel ({ runs, pollMs }) {
 }
 
 // ── 组件：整体 ──────────────────────────────────────────────────────────────
+// v3.297 标签页：概览（原看板+触发+历史）/ 推送记录 / 运行日志 / 系统。
+// 轮询只挂在概览（状态+历史要跟任务跑）；其余标签页进页时拉取 + 手动刷新，
+// 不自动轮询——消息/日志读的是磁盘文件，5s 轮询只会白耗磁盘与带宽。
+
+// 近 14 日趋势（纯 CSS 条形图，零依赖）：一格=一天，高度按当日推送条数归一。
+// failed>0 的日子用红色渐变提示；0 推送的日子画灰色基线（看得见「没有数据」≠ 没画）。
+function TrendsPanel () {
+  const [trends, setTrends] = useState(null)
+  const [err, setErr] = useState('')
+  const load = useCallback(async () => {
+    try {
+      const t = await apiGetTrends()
+      setTrends(t)
+      setErr('')
+    } catch (e) {
+      setErr(`加载失败：${e.message}`)
+    }
+  }, [])
+  useEffect(() => { load().catch(() => {}) }, [load])
+  const byDay = trends && trends.status === 'ok' ? trends.byDay : []
+  const maxPushed = Math.max(1, ...byDay.map((d) => d.pushed))
+  const total14 = byDay.reduce((acc, d) => acc + d.pushed, 0)
+  const fail14 = byDay.reduce((acc, d) => acc + d.failed, 0)
+  const todayKey = new Date().toISOString().slice(0, 10)
+  return html`<div class="panel">
+    <div class="panel-head">
+      <span class="panel-title">近 14 日运行趋势</span>
+      <span class="panel-sub">run.log 摘要按日聚合</span>
+      <span style="flex:1"></span>
+      <button class="btn btn-ghost" onClick=${load}>刷新</button>
+    </div>
+    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${trends && trends.status !== 'ok' && html`<div class="empty">日志${trends.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${trends.status}）`}</div>`}
+    ${trends && trends.status === 'ok' && html`<div>
+      <div class="trend">
+        ${byDay.map((d) => html`<div class="trend-col" key=${d.date} title=${`${d.date}：轮次 ${d.rounds} · 抓取 ${d.total} · 推送 ${d.pushed} · 失败 ${d.failed}`}>
+          <span class="trend-n">${d.pushed > 0 ? d.pushed : ''}</span>
+          <div class=${'trend-bar' + (d.pushed === 0 ? ' zero' : '') + (d.failed > 0 ? ' fail' : '')} style=${`height:${Math.max(3, Math.round(d.pushed / maxPushed * 88))}px`}></div>
+          <span class=${'trend-day' + (d.date === todayKey ? ' today' : '')}>${d.date.slice(5)}</span>
+        </div>`)}
+      </div>
+      <div class="trend-meta">14 日共推送 ${total14} 条 · 失败 ${fail14} 条 · 每日轮次与抓取数悬停列查看</div>
+    </div>`}
+  </div>`
+}
+
+// 推送记录：搜索（300ms 防抖）+ 分类筛选 + 服务端分页；点标题展开 content 全文。
+// URL 不含 content_html（服务端已裁剪）——CSP 禁外链图，贴文本才是控制台能诚实渲染的形态。
+function MessagesPanel () {
+  const [page, setPage] = useState(1)
+  const [size] = useState(20)
+  const [cate, setCate] = useState('')
+  const [input, setInput] = useState('')
+  const [query, setQuery] = useState('')
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState('')
+  const [expanded, setExpanded] = useState(null) // 展开的条目 id
+  // 搜索防抖：输入停 300ms 才真正改 query（重置回第 1 页）。
+  useEffect(() => {
+    const t = setTimeout(() => { setQuery(input.trim()); setPage(1) }, 300)
+    return () => clearTimeout(t)
+  }, [input])
+  const load = useCallback(async () => {
+    try {
+      const d = await apiGetMessages({ page, size, cate, q: query })
+      setData(d)
+      setErr('')
+    } catch (e) {
+      setErr(`加载失败：${e.message}`)
+    }
+  }, [page, size, cate, query])
+  useEffect(() => { load().catch(() => {}) }, [load])
+  const items = data && Array.isArray(data.items) ? data.items : []
+  const categories = data && Array.isArray(data.categories) ? data.categories : []
+  return html`<div class="panel">
+    <div class="panel-head">
+      <span class="panel-title">推送记录</span>
+      <span class="panel-sub">判重缓存 push.json（已抓取并推送的消息）</span>
+    </div>
+    <div class="msg-toolbar">
+      <input class="msg-search" type="search" placeholder="搜索标题 / 内容…" value=${input}
+        onInput=${(e) => setInput(e.target.value)} />
+      <select class="msg-select" value=${cate} onChange=${(e) => { setCate(e.target.value); setPage(1) }}>
+        <option value="">全部分类</option>
+        ${categories.map((c) => html`<option key=${c.name} value=${c.name}>${c.name}（${c.count}）</option>`)}
+      </select>
+      <button class="btn btn-ghost" onClick=${load}>刷新</button>
+    </div>
+    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
+    ${data && data.status === 'ok' && html`<div>
+      <div class="msg-count">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}</div>
+      ${items.length === 0
+        ? html`<div class="empty">没有匹配的记录</div>`
+        : html`<div class="msg-list">
+          ${items.map((m) => html`<div class="msg-item" key=${String(m.id) + m.shorttime}>
+            <div class="msg-item-head">
+              <span class="msg-title" onClick=${() => setExpanded(expanded === m.id ? null : m.id)}>${m.title || '（无标题）'}</span>
+              ${m.price !== null ? html`<span class="msg-price">¥${m.price}</span>` : ''}
+            </div>
+            <div class="msg-meta">
+              <span class="msg-cate">${m.catename}</span>
+              <span class="mono">${m.datetime} ${m.shorttime}</span>
+              ${m.url && m.url.length > 0 ? html`<a class="msg-link" href=${m.url.startsWith('http') ? m.url : `https://www.xianbao.fun${m.url}`} target="_blank" rel="noopener noreferrer">原文链接 ↗</a>` : ''}
+            </div>
+            ${expanded === m.id && html`<div class="msg-content">${m.content || '（无正文）'}</div>`}
+          </div>`)}
+        </div>`}
+      <div class="pager">
+        <button class="btn btn-secondary" disabled=${page <= 1} onClick=${() => setPage(1)}>« 首页</button>
+        <button class="btn btn-secondary" disabled=${page <= 1} onClick=${() => setPage(page - 1)}>上一页</button>
+        <span class="pager-info">第 ${data.page} / ${data.pages} 页</span>
+        <button class="btn btn-secondary" disabled=${page >= data.pages} onClick=${() => setPage(page + 1)}>下一页</button>
+        <button class="btn btn-secondary" disabled=${page >= data.pages} onClick=${() => setPage(data.pages)}>末页 »</button>
+      </div>
+    </div>`}
+  </div>`
+}
+
+// 运行日志：run.log 尾部（服务端 1MiB 上限），进页拉一次 + 手动刷新；有任务在跑时跟随轮询。
+function LogsPanel ({ pollMs }) {
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState('')
+  const load = useCallback(async () => {
+    try {
+      const d = await apiGetLogs()
+      setData(d)
+      setErr('')
+    } catch (e) {
+      setErr(`加载失败：${e.message}`)
+    }
+  }, [])
+  useEffect(() => {
+    load().catch(() => {})
+    if (!pollMs) return undefined
+    const t = setInterval(() => { load().catch(() => {}) }, pollMs)
+    return () => clearInterval(t)
+  }, [load, pollMs])
+  return html`<div class="panel">
+    <div class="panel-head">
+      <span class="panel-title">运行日志</span>
+      <span class="panel-sub">run.log 尾部 1 MiB${pollMs ? ' · 任务运行中，实时跟随' : ''}</span>
+      <span style="flex:1"></span>
+      <button class="btn btn-ghost" onClick=${load}>刷新</button>
+    </div>
+    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${data && data.status !== 'ok' && html`<div class="empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
+    ${data && data.status === 'ok' && html`<pre class="logpre">${data.text.length > 0 ? data.text : '（空）'}</pre>`}
+  </div>`
+}
+
+// 系统信息：版本 / 运行环境 / 进程 / 缓存目录。全部只读，无操作按钮。
+function SysPanel () {
+  const [sys, setSys] = useState(null)
+  const [err, setErr] = useState('')
+  const load = useCallback(async () => {
+    try {
+      const d = await apiGetSys()
+      setSys(d)
+      setErr('')
+    } catch (e) {
+      setErr(`加载失败：${e.message}`)
+    }
+  }, [])
+  useEffect(() => { load().catch(() => {}) }, [load])
+  const fmtUptime = (s) => {
+    if (!(typeof s === 'number' && s >= 0)) return '—'
+    const d = Math.floor(s / 86400)
+    const h = Math.floor((s % 86400) / 3600)
+    const m = Math.floor((s % 3600) / 60)
+    return d > 0 ? `${d} 天 ${h} 时 ${m} 分` : h > 0 ? `${h} 时 ${m} 分` : `${m} 分`
+  }
+  const fmtBytes = (b) => (typeof b === 'number' && b > 0 ? `${(b / 1048576).toFixed(1)} MB` : '—')
+  return html`<div class="panel">
+    <div class="panel-head">
+      <span class="panel-title">系统信息</span>
+      <span style="flex:1"></span>
+      <button class="btn btn-ghost" onClick=${load}>刷新</button>
+    </div>
+    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${sys && html`<div class="sys-grid">
+      <table class="sys-table"><tbody>
+        <tr><td>脚本版本</td><td>v${sys.version || '?'}</td></tr>
+        <tr><td>Node.js</td><td>${sys.node}</td></tr>
+        <tr><td>平台</td><td>${sys.platform}</td></tr>
+      </tbody></table>
+      <table class="sys-table"><tbody>
+        <tr><td>控制台已运行</td><td>${fmtUptime(sys.uptimeS)}</td></tr>
+        <tr><td>内存占用</td><td>${fmtBytes(sys.rssBytes)}</td></tr>
+        <tr><td>进程 PID</td><td>${sys.pid}</td></tr>
+        <tr><td>缓存目录</td><td>${sys.cacheDir}</td></tr>
+      </tbody></table>
+    </div>`}
+    <div class="hint" style="margin-top:12px">数据说明：推送记录来自判重缓存 push.json（服务端已裁剪正文 HTML）；趋势解析 run.log 摘要行；日志取尾部 1 MiB。</div>
+  </div>`
+}
+
 function App () {
   const [state, setState] = useState(null)
   const [runs, setRuns] = useState([])
@@ -614,6 +900,15 @@ function App () {
     refreshSplit()
   }, [refreshSplit])
 
+  // v3.297 标签页状态：概览 / 推送记录 / 日志 / 系统。切到非概览页时主轮询继续跑
+  // （后台保持状态新鲜，切回来即时可用），但该页的重内容组件只在挂载时拉取。
+  const [tab, setTab] = useState('overview')
+  const TABS = [
+    { key: 'overview', label: '概览' },
+    { key: 'messages', label: '推送记录' },
+    { key: 'logs', label: '运行日志' },
+    { key: 'sys', label: '系统' }
+  ]
   return html`<div class="wrap">
     <header class="topbar">
       <div class="brand">
@@ -627,9 +922,19 @@ function App () {
       </div>
     </header>
 
-    <${StatusCards} state=${state} />
-    <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
-    <${RunsPanel} runs=${runs} pollMs=${locking ? POLL_BUSY_MS : POLL_MS} />
+    <nav class="tabs">
+      ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')} onClick=${() => setTab(t.key)}>${t.label}</button>`)}
+    </nav>
+
+    ${tab === 'overview' && html`<div>
+      <${TrendsPanel} />
+      <${StatusCards} state=${state} />
+      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
+      <${RunsPanel} runs=${runs} pollMs=${locking ? POLL_BUSY_MS : POLL_MS} />
+    </div>`}
+    ${tab === 'messages' && html`<${MessagesPanel} />`}
+    ${tab === 'logs' && html`<${LogsPanel} pollMs=${locking ? POLL_BUSY_MS : 0} />`}
+    ${tab === 'sys' && html`<${SysPanel} />`}
 
     <footer class="foot">
       ⚠️ 「正式运行一轮」会真实推送通知 · 试运行只抓取不推送 · 同一时刻只能有一个触发任务

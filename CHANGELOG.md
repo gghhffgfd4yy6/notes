@@ -368,3 +368,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **vendor 锚点**：app.js 头注释补 htm-preact.module.js 的来源 URL、sha256 与 CVE-2026-22028 影响区间备注；剥离 vendored 文件尾部的 sourcery-ignore 注释（豁免本就以 .sourcery.yaml ignore 承载，不再污染上游产物）。
 - **`XBK_CONSOLE_PORT=0` 语义修正**：`Number(env) || 7777` 会把合法的 `0`（随机端口）吞成 7777；改为显式判空，非 0–65535 整数 fail-closed 拒启（Sourcery #225 M5：NaN 静默回退默认端口同样有害）。
 - **Sourcery #225 评审 6 条收尾**：①（High）陈旧持有者可在「read 旧锁 → 接管者覆写 → write 旧 fd」窗口把 released 帧盖到接管方新锁帧上——接管路径改「tmp + rename 原子换代」（换 inode，旧 fd 落在孤儿 inode 上）+ releaseLockFor 增 inode 一致性闸（fstat(fd) vs stat(path) 不一致即放弃覆写）；②writeSync 短写会留半 JSON 残帧（fail-closed 10 分钟）——按返回字节数循环补写到位；③落盘失败路径残留 pending 重放条目使失败动作被 409 拦到窗口过期——错误分支回滚 `lastAccept` 条目，失败动作窗口内可立即重试；④releaseLockFor 吞错误静默「当作已释放」——返回布尔（true=已释放/false=仍持有），两处调用方对 false 响亮 console.error；⑤非法端口拒绝启动（NaN/越界不再回退 7777，fail-closed exit 1）；⑥优雅关闭装配自 main 抽出为 `createConsole.wireGracefulShutdown`（onExit/registerSignal 依赖注入），假子进程测试可确定性断言「SIGKILL → 等每个子进程 close → 才退出」序列（生产路径无注入，行为与抽取前等价）。测试文件新增的锁帧断言统一走「open + fstat(fd) + 同 fd 读」纪律（与生产 readSafeText 同口径），规避 CodeQL js/file-system-race 对「写路径 → 路径读」的 check-then-use 告警。回归 +7（inode 闸/短写循环/返回值三态/落盘失败可重试/非法端口/关停序列/关停端到端延迟）。
+## v3.297
+
+- **控制台新增四个标签页**（概览 / 推送记录 / 运行日志 / 系统）：①「推送记录」浏览判重缓存 push.json（已推送消息）：关键词搜索（title/content 子串，300ms 防抖）+ 分类筛选（按条数排序下拉）+ 服务端分页（size 1–100 / page 1–10000 钳制，越界回空页不崩），点标题展开正文（content 纯文本，content_html 不下发）；②「近 14 日运行趋势」：run.log 摘要行按日聚合（与 parseLastRun 同一正则口径），纯 CSS 条形图，失败数>0 的日期红色提示；③「运行日志」在线查看 run.log 尾部 1 MiB（任务运行中自动跟随轮询）；④「系统信息」：版本（package.json 单一真源）/ Node / 平台 / 进程内存 / 运行时长 / 缓存目录。
+- 新增只读端点（鉴权与既有读取面一致，Bearer/?token=/Cookie 会话；无凭证一律 401）：`GET /api/messages`（读取走 `readSafeTextResult` 32MiB 封顶，missing/invalid/tooLarge 三态如实下发不伪装空列表；条目逐条容错，畸形条目 skipped 计数）、`GET /api/trends`、`GET /api/logs`（尾读 1MiB）、`GET /api/sys`（不暴露环境变量/token）。全部只读，不 spawn、不写任何文件。
+- `scripts/status.js` 新增 `readTrends` / `readMessages`（与 readStatus 同源同目录、同一符号链接/非常规文件防御），readStatus 返回形状不变——`--status` 与既有前端零影响。
+- 搜索用 `includes` 子串匹配不用正则（用户输入进正则有 ReDoS 面，本仓正则防护红线）；查询词 240 字节封顶。
+- 测试 +4：消息三态/分页钳制/过滤/倒序、trends 按日聚合与窗口外剔除、logs 尾读、sys 无凭证 401 与无环境变量泄漏。

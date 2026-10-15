@@ -572,6 +572,112 @@ async function main () {
     assert.strictEqual(res.status, 404)
     server.close()
   })
+  // ── v3.297 扩展端点：/api/messages、/api/trends、/api/logs、/api/sys ──
+  await aok('HTTP: /api/messages 三态 + 分页钳制 + 过滤（回归：URL 未验证输入不得越界）', async () => {
+    const dir = tmpDir()
+    // 造一份 push.json：3 条合法 + 1 条畸形（skipped 计数）+ 乱序时间戳验证倒序。
+    const msgs = [
+      { id: 1, title: '牛奶特价', content: '伊利纯牛奶', catename: '好单-日用', shijianchuo: 1000, datetime: '2026-10-15', shorttime: '10:00', price: 12.9, url: '/a/1.html' },
+      { id: 2, title: '护腰坐垫', content: '光星', catename: '好单-家用', shijianchuo: 3000, datetime: '2026-10-15', shorttime: '12:00', price: 21.9, url: '/a/2.html' },
+      { id: 3, title: '饼干', content: '奥利奥', catename: '好单-食品', shijianchuo: 2000, datetime: '2026-10-15', shorttime: '11:00', price: 5, url: '/a/3.html' },
+      { notValid: true }
+    ]
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(msgs))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // 缺省：倒序（最新在前）+ 畸形条目计数
+    const all = JSON.parse((await request(port, 'GET', '/api/messages', { token: TOKEN })).text)
+    assert.strictEqual(all.status, 'ok')
+    assert.strictEqual(all.grandTotal, 3)
+    assert.strictEqual(all.skipped, 1)
+    assert.deepStrictEqual(all.items.map(m => m.id), [2, 3, 1], '必须按时间倒序')
+    assert.strictEqual(all.items[0].content_html, undefined, 'content_html 不得下发')
+    // 搜索（大小写不敏感子串）
+    const q = JSON.parse((await request(port, 'GET', `/api/messages?q=${encodeURIComponent('牛奶')}`, { token: TOKEN })).text)
+    assert.strictEqual(q.total, 1)
+    assert.strictEqual(q.items[0].id, 1)
+    // 分类精确匹配
+    const c = JSON.parse((await request(port, 'GET', `/api/messages?cate=${encodeURIComponent('好单-家用')}`, { token: TOKEN })).text)
+    assert.strictEqual(c.total, 1)
+    assert.strictEqual(c.items[0].id, 2)
+    // 分页：size 钳到 1，page 2 为空
+    const p1 = JSON.parse((await request(port, 'GET', '/api/messages?size=1&page=1', { token: TOKEN })).text)
+    assert.strictEqual(p1.items.length, 1)
+    assert.strictEqual(p1.pages, 3)
+    const p3 = JSON.parse((await request(port, 'GET', '/api/messages?size=1&page=3', { token: TOKEN })).text)
+    assert.strictEqual(p3.items.length, 1)
+    // 越界参数钳制：size=abc → 默认 20；page=999999 → 钳到空页不崩
+    const pBig = JSON.parse((await request(port, 'GET', '/api/messages?page=99999&size=abc', { token: TOKEN })).text)
+    assert.deepStrictEqual(pBig.items, [], '越界页必须空（不得崩、不得回绕）')
+    // 无凭证 401
+    const noAuth = await request(port, 'GET', '/api/messages')
+    assert.strictEqual(noAuth.status, 401)
+    server.close()
+  })
+  await aok('HTTP: /api/messages missing/invalid 三态如实下发', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const missing = JSON.parse((await request(port, 'GET', '/api/messages', { token: TOKEN })).text)
+    assert.strictEqual(missing.status, 'missing', '空缓存目录必须 missing（不伪装成空列表 ok）')
+    assert.strictEqual(missing.items.length, 0)
+    server.close()
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'push.json'), '{broken json')
+    const { server: s2 } = createConsole({ token: TOKEN, stateDir: dir2 })
+    const port2 = await listen(s2)
+    const invalid = JSON.parse((await request(port2, 'GET', '/api/messages', { token: TOKEN })).text)
+    assert.strictEqual(invalid.status, 'invalid', '坏 JSON 必须 invalid')
+    s2.close()
+  })
+  await aok('HTTP: /api/trends 按日聚合（与 parseLastRun 同一正则口径）', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-14 18:02:34 total=20 dedup=5 filtered=1 truncated=0 pushed=18 failed=2 elapsed=10.1s cachesaved=1',
+      '2026-10-14 19:00:00 total=10 dedup=0 filtered=0 truncated=0 pushed=10 failed=0 elapsed=1.0s cachesaved=1',
+      '2026-10-15 11:01:40 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s cachesaved=1',
+      '2026-10-01 08:00:00 total=99 dedup=0 filtered=0 truncated=0 pushed=99 failed=0 elapsed=1.0s cachesaved=1',
+      'ERROR something broke'
+    ].join('\n') + '\n')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const t = JSON.parse((await request(port, 'GET', '/api/trends', { token: TOKEN })).text)
+    assert.strictEqual(t.status, 'ok')
+    assert.strictEqual(t.byDay.length, 14)
+    const d14 = t.byDay.find(d => d.date === '2026-10-14')
+    assert.ok(d14, '14 窗口含 10-14')
+    assert.strictEqual(d14.rounds, 2)
+    assert.strictEqual(d14.pushed, 28)
+    assert.strictEqual(d14.failed, 2)
+    const d15 = t.byDay.find(d => d.date === '2026-10-15')
+    assert.strictEqual(d15.pushed, 20)
+    // 窗口外的 10-01 不进任何桶（14 天窗口）
+    assert.ok(!t.byDay.some(d => d.date === '2026-10-01'))
+    server.close()
+  })
+  await aok('HTTP: /api/logs 尾读 + missing；/api/sys 版本与缓存目录、无环境变量泄漏', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), ['x'.repeat(50), '2026-10-15 12:16:21 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s cachesaved=1'].join('\n') + '\n')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const l = JSON.parse((await request(port, 'GET', '/api/logs', { token: TOKEN })).text)
+    assert.strictEqual(l.status, 'ok')
+    assert.ok(l.text.includes('total=20'), '日志正文可见')
+    const empty = JSON.parse((await request(port, 'GET', '/api/logs', { token: TOKEN })).text)
+    assert.strictEqual(empty.status, 'ok')
+    const s = JSON.parse((await request(port, 'GET', '/api/sys', { token: TOKEN })).text)
+    assert.ok(/^\d+\.\d+\.\d+/.test(s.version), `版本号必须是 semver 形态（实际 ${s.version}）`)
+    assert.strictEqual(s.cacheDir, dir)
+    assert.ok(typeof s.uptimeS === 'number' && s.uptimeS >= 0)
+    assert.ok(s.rssBytes > 0)
+    assert.ok(!JSON.stringify(s).includes(TOKEN), '/api/sys 绝不含 token')
+    assert.ok(!JSON.stringify(s).includes('XBK_CONSOLE_TOKEN'), '/api/sys 不暴露环境变量名')
+    // 无凭证 401（新端点与旧端点同一鉴权口径）
+    for (const p of ['/api/trends', '/api/logs', '/api/sys']) {
+      const na = await request(port, 'GET', p)
+      assert.strictEqual(na.status, 401, `${p} 无凭证必须 401`)
+    }
+    server.close()
+  })
   await aok('HTTP: 畸形 request-target → 400 且进程存活（回归：裸 new URL 曾崩整个控制台）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
