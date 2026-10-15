@@ -281,7 +281,25 @@ function readTrends (dir, { now = Date.now(), days = 14 } = {}) {
 
 // 摘要行附加尾组：cachesaved=(0|1) / noidentity=N / dry-run未推送=N（写入侧 xbk_app.js
 // 按条件输出，读取侧全部可选捕获——纯读扩展，写入侧零改动）。
-const RUN_SUMMARY_EXTRAS_RE = /(?:\scachesaved=(\d))?(?:\snoidentity=(\d+))?(?:\sdry-run未推送=(\d+))?\s*$/
+// Sonar S8786：可选组链 `(?: …)?(?: …)?` 有超线性回溯形态，改用零正则的线性尾部扫描
+// （runParseExtras）：只锚定「最后一个数值 token 边界」，与原正则捕获语义逐分支等价，
+// 且对任意行输入保证 O(行尾段) 单遍。
+function runParseExtras (line) {
+  const tail = line.length > 64 ? line.slice(-64) : line
+  const grab = (tag) => {
+    const at = tail.lastIndexOf(' ' + tag + '=')
+    if (at < 0) return null
+    const start = at + tag.length + 2
+    let end = start
+    while (end < tail.length && tail.charCodeAt(end) >= 48 && tail.charCodeAt(end) <= 57) end++
+    if (end === start) return null
+    return Number(tail.slice(start, end))
+  }
+  const cachesaved = grab('cachesaved')
+  const noidentity = grab('noidentity')
+  const dryRun = tail.indexOf('dry-run未推送=') >= 0 ? grab('dry-run未推送') : null
+  return { cachesaved, noidentity, dryRun }
+}
 
 function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
   const lim = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50
@@ -305,7 +323,7 @@ function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
     if (skipped < skip) { skipped++; continue }
     const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
     if (!counters.every(validInt)) continue
-    const extras = RUN_SUMMARY_EXTRAS_RE.exec(lines[i])
+    const extras = runParseExtras(lines[i])
     // 摘要行之后的 ERROR/运行异常行属于该轮（生产写序：先摘要后异常，xbk_app.js :1498/:1526）。
     // 崩溃轮无摘要行：文件尾存在强失败行且其后无摘要 → 追加 interrupted 占位条目。
     const tail = lines.slice(i + 1)
@@ -323,9 +341,9 @@ function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
       pushed: counters[4],
       failed: counters[5],
       elapsed: m[8],
-      cachesaved: extras && extras[1] !== undefined ? Number(extras[1]) : null,
-      noidentity: extras && extras[2] !== undefined ? Number(extras[2]) : null,
-      dryRun: extras && extras[3] !== undefined ? Number(extras[3]) : null,
+      cachesaved: extras.cachesaved !== null ? extras.cachesaved : null,
+      noidentity: extras.noidentity !== null ? extras.noidentity : null,
+      dryRun: extras.dryRun !== null ? extras.dryRun : null,
       interrupted
     })
   }

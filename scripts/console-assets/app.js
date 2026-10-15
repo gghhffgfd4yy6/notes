@@ -595,7 +595,7 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
             <td>${statusOf(r)}</td>
             <td>
               ${!r.finishedAt && html`<button class=${'btn btn-ghost btn-danger' + (cancelPending === r.id ? ' btn-busy' : '')} disabled=${cancelPending === r.id}
-                onClick=${() => { doCancel(r.id) }} title="停止该任务（SIGTERM，3 秒后强杀；已发送但未记录的通知下轮会重推）">停止</button>`}
+                onClick=${() => { doCancel(r.id).catch(() => {}) }} title="停止该任务（SIGTERM，3 秒后强杀；已发送但未记录的通知下轮会重推）">停止</button>`}
               <button class="btn btn-ghost" onClick=${() => setOpenId(openId === r.id ? null : r.id)}>
                 ${openId === r.id ? '收起' : '日志'}
               </button>
