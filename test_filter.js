@@ -6305,7 +6305,8 @@ console.log('========================================\n');
     const mod = require('./xbk_function_v3.js')
     const tf = require('fs').readFileSync(path.join(__dirname, 'test_filter.js'), 'utf8')
     const ta = require('fs').readFileSync(path.join(__dirname, '/test_app.js'), 'utf8')
-    const all = tf + ta
+    const tn = require('fs').readFileSync(path.join(__dirname, 'test_notify_selfcheck.js'), 'utf8')
+    const all = tf + ta + tn
     const unused = []
     for (const k of Object.keys(mod)) {
       if (k === 'Config' || k === 'Pusher') continue

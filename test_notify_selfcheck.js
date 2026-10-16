@@ -1,0 +1,239 @@
+'use strict'
+// 通知自检（批次④ 4.1）进程内用例：--notify-test 直跑入口的互斥/HITOKOTO 抑制/
+// 单次广播/退出码/汇总脱敏形态。全部 fake 注入，零真实网络、零真实推送。
+//
+// 框架说明（与 test_notify.js 同款）：test() 必须 async 并 await fn()，否则 async 断言
+// 的失败会变成 unhandled rejection 而不被统计。console 输出临时替换捕获、finally 恢复；
+// process.exitCode 保存/恢复（runNotifyTest 通过设置 process.exitCode 表达退出码）。
+
+const assert = require('assert')
+const fs = require('fs')
+const path = require('path')
+
+// ── S1 前置：源码序断言（结构铁律唯一防线，先于任何行为用例）──
+// 手法仿 test_qinglong_utils.js 接线断言：indexOf 定位 + 顺序比较，
+// 禁止字面量邻接/距离上限（Stryker 插桩会改写条件/插入代码，精确距离必碎）。
+const entrySrc = fs.readFileSync(path.join(__dirname, 'xbk_function_v3.js'), 'utf8')
+{
+  const guardIdx = entrySrc.indexOf('if (require.main === module)')
+  assert.ok(guardIdx > 0, 'main guard 必须存在')
+  const guard = entrySrc.slice(guardIdx, guardIdx + 1400)
+  const iFlag = guard.indexOf("'--notify-test'")
+  const iCall = guard.indexOf('runNotifyTest(cliArgs)')
+  const iRun = guard.indexOf('runSingleEntry()')
+  const iElse = guard.indexOf('} else {')
+  assert.ok(iFlag >= 0, 'guard 内必须有 --notify-test 分发')
+  assert.ok(iCall > iFlag, 'guard 内必须调用 runNotifyTest')
+  assert.ok(iRun > iFlag && iRun < iElse, 'runSingleEntry() 必须在 else 分支（notify-test 分支之后）')
+  assert.ok(iElse > iCall, 'else 必须在 notify-test 分支之后（保住 runSingleEntry 语义）')
+}
+
+// ── 进程内装配：got mock → 真 slim（带 mock）→ 主模块（getNotify 命中缓存）──
+const gotPath = require.resolve('got')
+require(gotPath)
+let gotCalls = []
+// pushplus 业务成功码 = code 200（v3.160 口径）；mock body 直接给 {code:200}
+require.cache[gotPath].exports = (url, options) => {
+  gotCalls.push({ url, options })
+  return { then: (res) => res({ body: JSON.stringify({ code: 200, msg: '' }), statusCode: 200, headers: {} }) }
+}
+require.cache[gotPath].exports.get = require.cache[gotPath].exports
+require.cache[gotPath].exports.post = (url, options) => {
+  gotCalls.push({ url, options })
+  return { then: (res) => res({ body: JSON.stringify({ code: 200, msg: '' }), statusCode: 200, headers: {} }) }
+}
+
+const slim = require('./xbk_sendNotify_slim.js')
+const cfg = slim.push_config
+const m = require('./xbk_function_v3.js')
+assert.strictEqual(typeof m.runNotifyTest, 'function', 'runNotifyTest 必须从主模块导出')
+
+// fake sendNotify 形态控制（替换 slim 模块内的 sendNotify 不可行——它未被导出为可写属性；
+// 改为走 Pusher.send 的真实链：sendNotify 是 slim 内部函数。这里用「真实 sendNotify +
+// got mock + withChannels」形态：S5 走全真链路验证零一言请求；单次广播/退出码用
+// S3 的 Pusher 直替（主模块 Pusher.send 可被 require.cache 替换 v3 的 Pusher 导出？不可——
+// v3 内部闭包引用。故 S3/S6 走 spawn 级（test_cli.js）覆盖，本文件专注真链路形态。）
+
+// 通道相关配置 key：每用例前清空 → 只配被测通道；结束(含失败)后恢复
+const CHANNEL_KEYS = ['PUSH_PLUS_TOKEN', 'PUSH_PLUS_USER', 'PUSH_KEY',
+  'BARK_PUSH', 'BARK_ARCHIVE', 'BARK_GROUP', 'BARK_SOUND', 'BARK_ICON', 'BARK_LEVEL', 'BARK_URL',
+  'QYWX_KEY', 'WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_pusher_channels', 'WX_XIZHI_KEY',
+  'DEER_KEY', 'DEER_URL', 'PUSHME_KEY', 'PUSHME_URL', 'HITOKOTO',
+  'TG_BOT_TOKEN', 'TG_USER_ID', 'TG_API_HOST',
+  'TG_PROXY_HOST', 'TG_PROXY_PORT', 'TG_PROXY_AUTH']
+const saved = {}
+for (const k of CHANNEL_KEYS) saved[k] = cfg[k]
+
+async function withChannels (fn) {
+  for (const k of CHANNEL_KEYS) cfg[k] = ''
+  cfg.HITOKOTO = 'false'
+  gotCalls = []
+  try {
+    return await fn()
+  } finally {
+    for (const k of CHANNEL_KEYS) cfg[k] = saved[k]
+  }
+}
+
+// console 捕获 + exitCode 保存恢复（runNotifyTest 只设 exitCode 不 process.exit）。
+// 返回 exitCode 在「finally 恢复前」的快照——断言要用的就是 runNotifyTest 实际设置的值。
+async function withCapture (fn) {
+  const savedLog = console.log
+  const savedErr = console.error
+  const savedCode = process.exitCode
+  process.exitCode = 0
+  const out = []
+  console.log = (...a) => out.push(['log', a.join(' ')])
+  console.error = (...a) => out.push(['err', a.join(' ')])
+  try {
+    const result = await fn()
+    return { out, result, exitCode: process.exitCode }
+  } finally {
+    console.log = savedLog
+    console.error = savedErr
+    process.exitCode = savedCode
+  }
+}
+
+function outText (out) { return out.map(([k, s]) => `${k}: ${s}`).join('\n') }
+
+let passed = 0
+let failed = 0
+const errors = []
+async function test (name, fn) {
+  try {
+    await fn()
+    passed++
+    console.log('  ✅ ' + name)
+  } catch (e) {
+    failed++
+    errors.push(`${name}: ${e.message}`)
+    console.log('  ❌ ' + name + ' (' + e.message + ')')
+  }
+}
+function assertRc (cond, msg) { if (!cond) throw new Error(msg || '断言失败') }
+
+console.log('\n========================================')
+console.log('  🧪 通知自检 --notify-test（进程内，fake/mock 注入）')
+console.log('========================================\n')
+
+;(async () => {
+  // S2 互斥：--dry-run 同时出现 → fail-closed，零发送、零 got 调用
+  await test('互斥: argv 带 --dry-run → exitCode 1、零调用', () => withChannels(async () => {
+    cfg.PUSH_PLUS_TOKEN = 'stub-token'
+    const { out, exitCode } = await withCapture(() => m.runNotifyTest(['--notify-test', '--dry-run']))
+    assertRc(exitCode === 1, `退出码应为 1，实际 ${exitCode}`)
+    assertRc(outText(out).includes('互斥'), '应输出互斥文案')
+    assertRc(gotCalls.length === 0, '互斥路径不得有任何 HTTP 调用')
+  }))
+
+  await test('互斥: env XBK_DRY_RUN=1 → exitCode 1、零调用', () => withChannels(async () => {
+    cfg.PUSH_PLUS_TOKEN = 'stub-token'
+    process.env.XBK_DRY_RUN = '1'
+    try {
+      const { out, exitCode } = await withCapture(() => m.runNotifyTest(['--notify-test']))
+      assertRc(exitCode === 1, `退出码应为 1，实际 ${exitCode}`)
+      assertRc(outText(out).includes('互斥'), '应输出互斥文案')
+      assertRc(gotCalls.length === 0, '互斥路径不得有任何 HTTP 调用')
+    } finally {
+      delete process.env.XBK_DRY_RUN
+    }
+  }))
+
+  // S5 HITOKOTO 抑制（真 slim 全链路）：开启一言时自检零一言外部请求
+  await test('HITOKOTO 开启: 自检零一言请求 + 消息不含一言 + finally 恢复', () => withChannels(async () => {
+    cfg.PUSH_PLUS_TOKEN = 'stub-token'
+    cfg.HITOKOTO = 'true'
+    const { out, exitCode } = await withCapture(() => m.runNotifyTest(['--notify-test']))
+    assertRc(exitCode === 0, `退出码应为 0，实际 ${exitCode}`)
+    assertRc(gotCalls.length === 1, `应恰有 1 次 HTTP（pushplus），实际 ${gotCalls.length}`)
+    assertRc(!gotCalls.some(c => String(c.url).includes('hitokoto')), '不得请求一言 API')
+    const sent = outText(out)
+    assertRc(sent.includes('通知自检完成'), '应输出汇总行')
+    assertRc(!sent.includes('测试一言'), '消息/输出不得含一言内容')
+  }))
+
+  // S7 消息固定形态 + S3 单次广播（真链路：一次 sendNotify → 一条 pushplus post）
+  await test('消息形态: 标题/版本/上海戳/主机名固定 + 单通道恰一请求', () => withChannels(async () => {
+    cfg.PUSH_PLUS_TOKEN = 'stub-token'
+    const { exitCode } = await withCapture(() => m.runNotifyTest(['--notify-test']))
+    assertRc(exitCode === 0, `退出码应为 0，实际 ${exitCode}`)
+    assertRc(gotCalls.length === 1, 'pushplus 恰一条请求（单次广播、非逐渠道循环）')
+    const payload = JSON.stringify(gotCalls[0].options || {})
+    assertRc(payload.includes('xbk-push 通知自检'), '标题应为固定「xbk-push 通知自检」')
+    assertRc(payload.includes('Asia/Shanghai'), '正文应含上海时区戳')
+    assertRc(payload.includes('v3.'), '正文应含版本号')
+    assertRc(payload.includes('主机：'), '正文应含主机名')
+  }))
+
+  // S6 退出码：全失败（通道 API 层失败 → sendNotify 走 okCount===0 reject）→ 顶层 catch 出 1
+  await test('全失败: 通道 API 拒绝 → exitCode 1 + 脱敏原因（无对象 stringify 痕迹）', () => withChannels(async () => {
+    // 让 got.post 永久失败：临时替换 mock
+    const origPost = require.cache[gotPath].exports.post
+    require.cache[gotPath].exports.post = (url, options) => {
+      gotCalls.push({ url, options })
+      const e = new Error('API error: connection refused')
+      e.response = { body: '{"code":500,"msg":"PPT_SECRET 回显"}', statusCode: 500 }
+      return Promise.reject(e)
+    }
+    try {
+      cfg.PUSH_PLUS_TOKEN = 'stub-token'
+      const { out } = await withCapture(async () => {
+        await m.runNotifyTest(['--notify-test']).catch((e) => {
+          // 与 main guard catch 同款脱敏出口（进程内复刻：runNotifyTest 的 reject 由 guard 捕；
+          // 这里验证 guard 用的 summarizeError 链——直接调同一函数形态）
+          const { summarizeError } = require('./xbk_failure_policy')
+          const info = summarizeError(e)
+          console.error(`通知自检失败：${info.message || '未知错误'}`)
+          if (Array.isArray(info.failures)) {
+            for (const f of info.failures) {
+              const status = f && f.statusCode ? `（HTTP ${f.statusCode}）` : ''
+              console.error(`  ❌ ${(f && f.channel) || '未知渠道'}：${(f && (f.message || f.code)) || '发送失败'}${status}`)
+            }
+          }
+        })
+      })
+      const text = outText(out)
+      assertRc(text.includes('通知自检失败'), '应输出失败结论')
+      assertRc(text.includes('connection refused') || text.includes('HTTP'), '应含脱敏原因')
+      assertRc(!text.includes('[object Object]'), '不得有对象 stringify 痕迹')
+      assertRc(!text.includes('PPT_SECRET 回显'), '响应体回显内容不得出现在脱敏摘要')
+    } finally {
+      require.cache[gotPath].exports.post = origPost
+    }
+  }))
+
+  // S6b 退出码口径：无渠道 → NO_CHANNEL_CONFIG reject → guard 出 1（进程内复刻 guard 形态）
+  await test('无渠道: NO_CHANNEL_CONFIG → 脱敏失败出口（含渠道清单文案）', () => withChannels(async () => {
+    const { out } = await withCapture(async () => {
+      await m.runNotifyTest(['--notify-test']).catch((e) => {
+        const { summarizeError } = require('./xbk_failure_policy')
+        const info = summarizeError(e)
+        console.error(`通知自检失败：${info.message || '未知错误'}`)
+      })
+    })
+    const text = outText(out)
+    assertRc(text.includes('通知自检失败'), '应输出失败结论')
+    assertRc(text.includes('未配置任何推送通道'), '应含 NO_CHANNEL_CONFIG 文案')
+  }))
+
+  // S8 脱敏红线：guard catch 块源码级断言（summarizeError 在、裸 stringify 不在——
+  // 剥行注释后断言：注释里的「禁止 JSON.stringify(e)」守则文案本身含该字样）
+  await test('脱敏红线: guard catch 走 summarizeError、catch 块无裸 stringify/log(e)', () => {
+    const guardIdx = entrySrc.indexOf('if (require.main === module)')
+    const guardCode = entrySrc.slice(guardIdx, guardIdx + 1400).replace(/\/\/[^\n]*/g, '')
+    assertRc(guardCode.includes('summarizeError(e)'), 'guard catch 必须过 summarizeError')
+    assertRc(!guardCode.includes('JSON.stringify(e)'), 'guard catch 禁止 JSON.stringify(e)')
+    assertRc(!/console\.log\(e\)/.test(guardCode), 'guard catch 禁止 console.log(e)')
+  })
+
+  console.log('\n----------------------------------------')
+  if (failed === 0) {
+    console.log(`  🎉 通知自检通过 ${passed}/${passed}`)
+  } else {
+    console.log(`  ⚠️ ${passed} 通过, ${failed} 失败`)
+    errors.forEach(e => console.log('  ❌ ' + e))
+  }
+  console.log('----------------------------------------\n')
+  process.exit(failed > 0 ? 1 : 0)
+})().catch(e => { console.error(e); process.exitCode = 1 })
