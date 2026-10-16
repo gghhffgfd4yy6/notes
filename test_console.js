@@ -777,10 +777,13 @@ async function main () {
     assert.ok(ACTIONS['notify-test'].label.includes('通知自检'), 'label 含「通知自检」')
     assert.strictEqual(ENTRY_SINGLE, path.join(__dirname, 'xbk_function_v3.js'), 'ENTRY_SINGLE 导出且指向 v3 主文件')
     assert.strictEqual(REPLAY_WINDOW_NOTIFY_TEST_MS, 60000, 'notify-test 独立重放窗 60s')
-    // 源码序：entry 映射在 ACTIONS 定义之后（spawn 不跑错脚本）
+    // 源码序：entry 映射在 ACTIONS 定义之后（spawn 不跑错脚本）。
+    // 插桩安全（Stryker 沙箱实测教训，同 test_notify_selfcheck S1）：锚点用插桩存活形态——
+    //   'const ACTIONS = ' 赋值头部存活（'Object.freeze({' 会被包裹改写）；
+    //   'const entryFile = ' 唯一（entry 映射赋值行头部存活，三元本体被包裹）。
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
-    const iActions = src.indexOf('const ACTIONS = Object.freeze({')
-    const iMap = src.indexOf("action.entry === 'single' ? ENTRY_SINGLE : ENTRY_QINGLONG")
+    const iActions = src.indexOf('const ACTIONS = ')
+    const iMap = src.indexOf('const entryFile = ')
     assert.ok(iActions >= 0 && iMap > iActions, 'entry 映射必须在 ACTIONS 之后')
     // parseAction 白名单顺带放行（D6）：urlencoded form 携带 action=notify-test 合法
     assert.strictEqual(parseAction('action=notify-test'), 'notify-test')
