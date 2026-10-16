@@ -200,7 +200,7 @@ jobs:
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
-            mutate: "xbk_function_v3.js:1-442"
+            mutate: "xbk_function_v3.js:1-511"
             config: "stryker.config.js"
           - name: app
             src: "xbk_app.js"

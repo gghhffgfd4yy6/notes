@@ -293,6 +293,41 @@ async function trigger (action) {
   return data
 }
 
+// 通知自检走独立端点（无 body）：与 trigger() 同款 timedRequest/replayBlocked 处理形态，
+// fetch 第一参数为纯字面量（§0 红线，查询参数-free）。
+async function triggerNotifyTest () {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: { Authorization: `Bearer ${BOOT.token}` }
+  })
+  const p = fetch('/api/notify-test', merged)
+  p.then(() => {}, () => {})
+  let res
+  try {
+    res = await p
+  } catch (e) {
+    done()
+    throw e
+  }
+  let data
+  try {
+    data = await readBodyJson(res)
+  } catch (e) {
+    data = {}
+  } finally {
+    done()
+  }
+  if (!res.ok) {
+    if (data && data.replayBlocked && data.runId) {
+      const err = new Error('刚才那次通知自检已受理（正在运行或已完成），60 秒内无需重复')
+      err.replayRunId = data.runId
+      throw err
+    }
+    throw new Error((data && data.error) || `通知自检失败（HTTP ${res.status}）`)
+  }
+  return data
+}
+
 // ── 组件：状态徽章 ──────────────────────────────────────────────────────────
 // tone: 'ok'=正常绿 | 'bad'=异常红 | 'run'=中性黄（运行中/无记录）
 // 显式字符串三态而非 true/false/null 魔值（CodeQL implicit null→string conversion）。
@@ -463,7 +498,8 @@ function StatusCards ({ state }) {
 const ACTION_DEFS = [
   { key: 'dry-run', label: '试运行', desc: '抓取但不推送', cls: 'btn-secondary' },
   { key: 'run', label: '正式运行一轮', desc: '抓取并真实推送', cls: 'btn-primary' },
-  { key: 'check', label: '环境检查', desc: '不抓取不推送', cls: 'btn-secondary' }
+  { key: 'check', label: '环境检查', desc: '不抓取不推送', cls: 'btn-secondary' },
+  { key: 'notify-test', label: '通知自检', desc: '向全部渠道发一条测试消息（真实推送）', cls: 'btn-secondary' }
 ]
 
 function TriggerBar ({ onTriggered, locking, setBusy }) {
@@ -473,7 +509,8 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
     setBusy(true)
     try {
       // 202 响应带首轮 runId——交给 App 登记为 busy 归属（G_nv 解锁判据）。
-      const data = await trigger(action)
+      // 通知自检走独立端点（fetch 字面量 /api/notify-test，无 body）。
+      const data = action === 'notify-test' ? await triggerNotifyTest() : await trigger(action)
       onTriggered(data && typeof data.id === 'number' ? data.id : null)
       // busy 不在此处清零（Sourcery vvo）：202 只代表已受理，子进程还在跑；
       // App 的「提交轮进历史」派生 + BUSY_FALLBACK 兜底负责解锁。

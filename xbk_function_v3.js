@@ -8,6 +8,7 @@
 'use strict'
 
 const crypto = require('node:crypto') // SonarCloud S7772：优先 node: 前缀内置模块
+const os = require('node:os') // 内置模块零副作用，不影响「加载链零写盘」（批次④ 4.1：通知自检消息带主机名）
 
 // ============================================================
 // ⏱️ 启动性能诊断（仅 XBK_PROFILE=3 收集，不改变默认行为）
@@ -369,11 +370,78 @@ async function runSingleEntry (app = App) {
   return summary
 }
 
-if (require.main === module) {
-  runSingleEntry().catch(e => {
-    console.error('程序运行失败:', Utils.safeErrorText(e, Utils.safeText(e, '未知错误')))
+// ── 通知自检（批次④ 4.1）：纯推送面动作，绝不触发抓取/写缓存/写 run.log ──
+// 只允许出现在直跑入口 main guard 的早退分支；落入 runSingleEntry 会真跑一轮。
+// args 参数化（默认 process.argv.slice(2)）供进程内测试注入，避免改全局 argv。
+async function runNotifyTest (args = process.argv.slice(2)) {
+  // 防线7 互斥（fail-closed）：自检是真实发送，拒绝在 dry-run 语义下执行。
+  // argv 与 env 双查：qinglong 入口以 XBK_DRY_RUN=1 表达 dry-run，一并拒绝防语义混淆。
+  if (args.includes('--dry-run') || (typeof process.env.XBK_DRY_RUN === 'string' && process.env.XBK_DRY_RUN !== '')) {
+    console.error('❌ --notify-test 与 --dry-run 互斥：通知自检是真实发送动作，拒绝执行（fail-closed）')
     process.exitCode = 1
-  })
+    return
+  }
+  const notify = await getNotify() // 缺 got 时以 promise reject 冒泡 → 顶层 catch（脱敏后提示部署命令）
+  // 固定测试消息：标题 + 版本 + 上海戳（与 xbk_app._localStamp 同款 sv-SE/Asia/Shanghai 口径，
+  // console.js cancel 留痕同形态）+ 主机名——用户可核对到达时间与来源机器。
+  const stampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+  const title = 'xbk-push 通知自检'
+  const desp = `版本 v${PKG_VERSION}\n时间：${stampFmt.format(new Date())}（Asia/Shanghai）\n主机：${os.hostname()}\n\n收到本条即代表推送链路各渠道畅通（--notify-test 自检消息，内容固定，不含线报数据）。`
+  // 防线4 HITOKOTO 抑制：开关只读模块级 push_config.HITOKOTO（slim 开启条件 true/'true'），
+  // 临时置禁 + finally 恢复；自检消息必须内容固定且零额外外部请求。push_config 是 slim 导出的同一活对象。
+  const savedHitokoto = notify.push_config.HITOKOTO
+  notify.push_config.HITOKOTO = 'false'
+  let result
+  try {
+    // 防线3 单次广播：sendNotify 一次调用 allSettled 并发全渠道，每渠道恰一份。
+    // 逐渠道循环 Pusher.send 会让每渠道收 N 份——绝不可循环。
+    result = await Pusher.send(title, desp)
+  } finally {
+    notify.push_config.HITOKOTO = savedHitokoto
+  }
+  // 结果汇总（防线5）：successfulChannels/failures 直接送渠道粒度（sendNotify 返回形态），
+  // failures[].message 已是 slim safeErr 脱敏产物；禁止 console.log(e)/JSON.stringify(e)。
+  const okChannels = Array.isArray(result && result.successfulChannels) ? result.successfulChannels : []
+  const failures = Array.isArray(result && result.failures) ? result.failures : []
+  console.log(`通知自检完成：成功 ${okChannels.length} 个渠道，失败 ${failures.length} 个渠道`)
+  for (const ch of okChannels) console.log(`  ✅ ${ch}`)
+  for (const f of failures) {
+    const status = f && f.statusCode ? `（HTTP ${f.statusCode}）` : ''
+    console.log(`  ❌ ${(f && f.channel) || '未知渠道'}：${(f && (f.message || f.code)) || '发送失败'}${status}`)
+  }
+  // 退出码口径 D3：≥1 渠道成功 → 0；否则 1（全失败路径走不到这里——sendNotify 抛
+  // ALL_CHANNELS_FAILED/NO_CHANNEL_CONFIG → 顶层 catch；此处兜底空数组形态）。
+  process.exitCode = okChannels.length > 0 ? 0 : 1
+}
+
+if (require.main === module) {
+  const cliArgs = process.argv.slice(2)
+  if (cliArgs.includes('--notify-test')) {
+    // 批次④ 4.1：通知自检早退分支——必须在 runSingleEntry() 之前分发，
+    // 否则掉进完整抓取/推送/缓存流程（自检变成真跑一轮）。
+    runNotifyTest(cliArgs).catch(e => {
+      // 统一脱敏出口：summarizeError 承诺不抛且 message 已 redact + 截断；
+      // 绝不 console.log(e)/JSON.stringify(e)（error.options/response 可能带 URL query 凭证）。
+      const { summarizeError } = require('./xbk_failure_policy')
+      const info = summarizeError(e)
+      console.error(`通知自检失败：${info.message || '未知错误'}`)
+      if (Array.isArray(info.failures)) {
+        for (const f of info.failures) {
+          const status = f && f.statusCode ? `（HTTP ${f.statusCode}）` : ''
+          console.error(`  ❌ ${(f && f.channel) || '未知渠道'}：${(f && (f.message || f.code)) || '发送失败'}${status}`)
+        }
+      }
+      if (info.name === 'MODULE_NOT_FOUND' || /Cannot find module/.test(info.message || '')) {
+        console.error('依赖缺失：请先执行 npm ci --omit=dev --ignore-scripts')
+      }
+      process.exitCode = 1
+    })
+  } else {
+    runSingleEntry().catch(e => {
+      console.error('程序运行失败:', Utils.safeErrorText(e, Utils.safeText(e, '未知错误')))
+      process.exitCode = 1
+    })
+  }
 }
 
 // ============================================================
@@ -395,6 +463,7 @@ if (typeof module !== 'undefined' && module.exports) {
     // 主流程（集成测试用）
     run: App.run.bind(App),
     runSingleEntry,
+    runNotifyTest,
     // 推送层（测试/扩展用）
     Pusher,
     // 补充导出（供更全面的测试）
