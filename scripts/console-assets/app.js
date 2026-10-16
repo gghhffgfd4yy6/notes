@@ -517,6 +517,10 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
   const [detailErr, setDetailErr] = useState('')
   // 乱序防护（Sourcery vwI）：detail 请求领号，落后响应丢弃。
   const detailSeqRef = useRef(0)
+  // onRefresh 经 ref 解引用（v3.300 3.1 §2 D7）：若直接进 effect deps，其身份不稳定
+  // 会导致 SSE 每渲染重连（快照重建流）。
+  const onRefreshRef = useRef(onRefresh)
+  onRefreshRef.current = onRefresh
 
   // 切换目标 run 时立即清旧详情（Sourcery G_oi + Old-logs-flash）：useEffect 在渲染后
   // 才跑，「新 openId + 旧 detail」会闪一帧。渲染期同步判定：detail.runId 与当前 openId
@@ -525,15 +529,27 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
     setDetail(null)
     setDetailErr('')
   }, [openId])
-  const detailForOpen = detail !== null && typeof detail.id === 'number' && detail.id === openId
+  // openRun/openActive 先声明后使用（v3.300 3.1 §1.9b）：详情跟随 effect 依赖 openActive，
+  // 须在 effect 之前声明（渲染逻辑零变化）。
+  const openRun = openId !== null ? runs.find((r) => r.id === openId) : null
+  const openActive = !!(openRun && !openRun.finishedAt)
+  // typeof 判据必须是 'string'（v3.300 3.1 §1.9a 回归修复）：v3.299 起 run id 改为
+  // 「epoch.seq」字符串下发（服务端 makeRunId 模板串），number 判据恒 false ⇒
+  // detailForOpen 恒 null ⇒ 日志框永远「加载中…」。
+  const detailForOpen = detail !== null && typeof detail.id === 'string' && detail.id === openId
     ? detail
     : null
 
-  // 日志面板：打开期间跟随运行状态轮询（Sourcery vv-：运行中的输出要持续刷新）。
+  // 详情跟随（v3.300 3.1）：运行中走 SSE 实时流（原生 EventSource，零依赖）；
+  // 非运行中 / 快照已完结 / 流错误回退原轮询。两通道在 effect 内二选一：SSE 模式不建
+  // interval，轮询模式不建 EventSource——切态必经 cleanup（dead + es.close()），无叠加。
+  // SSE 不经过 inFlightRef/timedRequest（那是 5s 主轮询的互斥面），互不抢占（蓝图红线 6）。
   useEffect(() => {
     if (openId === null) return undefined
     let dead = false
+    let es = null
     let inflight = false
+    let pollTimer = null
     const fetchOnce = async () => {
       // Sourcery Overlapping-log-polls/Slow-log-requests：详情请求慢于轮询间隔时逐 tick
       // 叠加并发请求，迟到的失败响应会把过期错误写到当前面板。与主轮询同口径：
@@ -553,12 +569,67 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
         inflight = false
       }
     }
-    // S9383：fetchOnce 内部已 try/catch 全收（不会 reject），但仍显式 .catch 兜底，
-    // 不留 floating promise（与 console.js 里 readBody 的处理同口径）。
-    fetchOnce().catch(() => { /* 不可达：fetchOnce 不 reject */ })
-    const t = setInterval(fetchOnce, pollMs)
-    return () => { dead = true; clearInterval(t) }
-  }, [openId, pollMs])
+    const startPolling = () => {
+      if (pollTimer !== null || dead) return
+      // S9383：fetchOnce 内部已 try/catch 全收（不会 reject），但仍显式 .catch 兜底，
+      // 不留 floating promise（与 console.js 里 readBody 的处理同口径）。
+      fetchOnce().catch(() => { /* fetchOnce 不 reject，S9383 口径 */ })
+      pollTimer = setInterval(() => { fetchOnce().catch(() => {}) }, pollMs)
+    }
+    if (!openActive) {
+      startPolling()
+      return () => { dead = true; if (pollTimer !== null) clearInterval(pollTimer) }
+    }
+    // ── SSE 模式：先取轮询快照，以快照 outputTotalLength 为初始游标建流（顺序不可倒置，
+    // 快照先落 detail 再开流，快照后新增量由首个 tick 补发——不重不漏，见 §2 D5）。
+    const seq = ++detailSeqRef.current
+    apiGetRunDetail(openId).then((d) => {
+      if (dead || seq !== detailSeqRef.current) return
+      setDetail(d)
+      setDetailErr('')
+      if (d.finishedAt) return // 快照时已完结：不开流，runs 刷新翻转 openActive 后进轮询
+      const start = typeof d.outputTotalLength === 'number' ? d.outputTotalLength : (d.output || '').length
+      const params = new URLSearchParams({ id: String(openId), since: String(start) })
+      // EventSource 第一参数照 fetch 字面量纪律：`/api/...` 模板字面量（同源相对路径，
+      // authority 恒同源），变量只进查询段（§2 D1）。不带 token：会话 Cookie 自动携带
+      // （页面加载即下发，authorize GET 收 Cookie）；token 进 URL 会落浏览器历史/访问日志。
+      es = new window.EventSource(`/api/runs/stream?${params.toString()}`)
+      es.onmessage = (ev) => {
+        // 未命名 data 帧 = 增量文本（JSON 字符串）。函数式更新 + 身份护栏，防旧面板串写。
+        try {
+          const chunk = JSON.parse(ev.data)
+          if (typeof chunk === 'string' && chunk.length > 0) {
+            setDetail((prev) => (prev !== null && prev.id === openId ? { ...prev, output: (prev.output || '') + chunk } : prev))
+          }
+        } catch (e) { /* 坏帧忽略：最终快照/重拉自愈 */ }
+      }
+      // named event 不进 onmessage（蓝图红线）：显式注册 reset / done。
+      es.addEventListener('reset', (ev) => {
+        try {
+          const payload = JSON.parse(ev.data)
+          if (payload && typeof payload.full === 'string') {
+            setDetail((prev) => (prev !== null && prev.id === openId ? { ...prev, output: payload.full } : prev))
+          }
+        } catch (e) { /* 同上 */ }
+      })
+      es.addEventListener('done', () => {
+        if (es !== null) { es.close(); es = null } // 防原生自动重连在流关闭后无限重试（蓝图口径）
+        fetchOnce().catch(() => {}) // 最终快照补 finishedAt/exitCode
+        onRefreshRef.current() // 立即刷新 runs 列表徽章（ref 解引用，防 effect 重连，§2 D7）
+      })
+      es.onerror = () => {
+        // 显式 close 后整段重拉一次后退回轮询；不带过期游标复连（蓝图重连语义）。
+        if (es !== null) { es.close(); es = null }
+        fetchOnce().catch(() => {})
+        startPolling()
+      }
+    }).catch(() => { if (!dead) startPolling() }) // 快照失败 → 回退轮询（既有能力兜底）
+    return () => {
+      dead = true
+      if (es !== null) es.close()
+      if (pollTimer !== null) clearInterval(pollTimer)
+    }
+  }, [openId, openActive, pollMs])
 
   // statusOf（Sourcery vv4）：以 finishedAt 为完成判据；
   // 「finishedAt 已设但 exitCode null」= 信号终止（含超时 SIGKILL），显示「已终止」。
@@ -593,9 +664,6 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
     }
     onRefresh()
   }
-
-  const openRun = openId !== null ? runs.find((r) => r.id === openId) : null
-  const openActive = !!(openRun && !openRun.finishedAt)
 
   return html`<div class="panel">
     <div class="panel-head">

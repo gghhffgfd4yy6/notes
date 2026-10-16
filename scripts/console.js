@@ -106,6 +106,20 @@ const CANCEL_GRACE_MS = 3000
 const RUN_HISTORY_LIMIT_MAX = 200
 const RUN_HISTORY_LIMIT_DEFAULT = 50
 
+// ── v3.300 批次③ 3.1 SSE 常量 ───────────────────────────────────────────────
+// run id 白名单（服务端常量正则，允许——与 detail/cancel body 解析、runMatch、lastAccept
+// 落盘校验的同形内联正则同族；「用户输入不进正则」红线指的是用户输入参与构造/拼接的
+// 正则，这里是服务端固定形态闸）。
+const RUN_ID_RE = /^\d{13,}\.\d{1,10}$/
+// 每连接增量 tick：轮查 runs.get(id) 存在性 / 增量 / 完结（500ms，实时感与 CPU 成本平衡）。
+const SSE_TICK_MS = 500
+// 心跳注释帧间隔：防代理/防火墙 idle 断连（蓝图口径 15s）。
+const SSE_HEARTBEAT_MS = 15000
+// 单连接「应用层待发积压」上限（UTF-8 字节）：超出直接断开该连接（慢客户端不拖垮内存）。
+const SSE_MAX_PENDING = 1024 * 1024
+// 每进程并发 SSE 连接上限：第 9 个 503（防 token 泄露后被刷连接拖垮控制台）。
+const SSE_MAX_CONNECTIONS = 8
+
 // /api/trends 的 days 白名单：URL 是未验证输入，只放行这三个值（非法/越界一律回默认 14，
 // 向后兼容）。用固定数组 includes 而非正则（用户输入不进正则是本仓红线）。
 const TREND_DAYS_ALLOWED = Object.freeze([14, 30, 60])
@@ -330,6 +344,7 @@ function startAction (actionKey, now, activeChildren) {
     exitCode: null,
     timedOut: false,
     output: '',
+    outputTotalLength: 0,
     cancelled: false
   }
   runs.set(id, record)
@@ -353,7 +368,8 @@ function startAction (actionKey, now, activeChildren) {
   const decoder = new StringDecoder('utf8')
   const append = (chunk) => {
     // StringDecoder 处理跨 chunk 的多字节 UTF-8（Sourcery Medium：逐 chunk toString 产生替换符）。
-    let buf = record.output + decoder.write(chunk)
+    const produced = decoder.write(chunk) // 本 chunk 解码产物（现有 UTF-16 头部丢码元语义保留不动）
+    let buf = record.output + produced
     // 上限按 UTF-8 字节计（Buffer.byteLength），超限从字节边界近似回退丢头部。
     if (Buffer.byteLength(buf, 'utf8') > RUN_LOG_MAX_BYTES) {
       let drop = Buffer.byteLength(buf, 'utf8') - RUN_LOG_MAX_BYTES
@@ -363,6 +379,9 @@ function startAction (actionKey, now, activeChildren) {
       }
     }
     record.output = buf
+    // 单调总偏移计数器（v3.300 3.1）：统计「生产总量」而非现存长度——环形淘汰（上方头部
+    // 丢码元）只减 output.length 不减计数器，SSE 的 reset 判据 cursor < total − 缓冲长依赖它。
+    record.outputTotalLength += produced.length
   }
   child.stdout.on('data', append)
   child.stderr.on('data', append)
@@ -373,7 +392,10 @@ function startAction (actionKey, now, activeChildren) {
     // spawn 失败（ENOENT 等）：不能让 uncaught 崩掉控制台（Sourcery Medium），
     // 也不能把 run 永久留在「运行中」。close 事件在 spawn error 后仍会触发，
     // 这里只登记原因，收尾交给 close。
-    record.output += `\n[console] 子进程启动失败：${err && err.message ? err.message : String(err)}\n`
+    // 绕过 append 直改 output：计数器必须同步加（漏加会让 reset 判据失真，§1.3 理由）。
+    const note = `\n[console] 子进程启动失败：${err && err.message ? err.message : String(err)}\n`
+    record.output += note
+    record.outputTotalLength += note.length
   })
   const timer = setTimeout(() => {
     record.timedOut = true
@@ -540,12 +562,14 @@ function sanitizeAccessPath (raw) {
 function shouldLogAccess (method, pathname, statusCode) {
   // 降噪白名单（蓝图「记什么」）：仅 2xx 且命中白名单才免记；非 2xx（含 401/404/5xx）全记。
   // 白名单 = GET / 页面、GET /api/status、GET /api/runs 列表、GET /api/runs/:id 详情、
-  // POST /api/runs/detail（D4：前端实际形态，响应体与 GET /:id 等价）、静态三资产。
+  // POST /api/runs/detail（D4：前端实际形态，响应体与 GET /:id 等价）、静态三资产、
+  // GET /api/runs/stream（v3.300 3.1：SSE 连接分钟级，finish 时 ms=整段连接时长，
+  // 照记会污染「慢请求」读数；非 2xx 照记）。
   // /api/access-log 自身 200 不在名单 → 入日志（自举，蓝图防线 3）。
   if (!(statusCode >= 200 && statusCode <= 299)) return true
   const m = method === 'GET'
   const p = String(pathname || '')
-  if (m && (p === '/' || p === '/api/status' || p === '/api/runs' ||
+  if (m && (p === '/' || p === '/api/status' || p === '/api/runs' || p === '/api/runs/stream' ||
     Object.prototype.hasOwnProperty.call(STATIC_ASSETS, p))) return false
   if (m && RUN_DETAIL_PATH_RE.test(p)) return false // D4：GET 详情轮询
   if (method === 'POST' && p === '/api/runs/detail') return false // D4：POST 详情轮询（前端实际形态）
@@ -656,6 +680,25 @@ function sendJson (res, code, obj) {
   const body = JSON.stringify(obj)
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
   res.end(body)
+}
+
+// SSE 增量规划（纯函数，模块级——非 HTTP 单测 + 变异可达，照导出先例）。
+// cursor = 已发游标，**绝对偏移**，单位 = JS 字符串偏移（UTF-16 code units）——量取、切片、
+// 下发三处同单位（蓝图红线：不用「字节」描述，杜绝多字节文本偏移错位）。
+// output = 环形缓冲现存串；outputTotalLength = 生产总量单调计数器（只增）；
+// lost = outputTotalLength − output.length = 已被环形淘汰的头部码元数。
+// 分支：cursor < lost ⇒ 游标落后淘汰点（数据已不完整）→ reset + 整段重发；
+//       lost ≤ cursor < total ⇒ 正常增量 output.slice(cursor − lost)；
+//       cursor ≥ total ⇒ 无新数据（含 cursor > total 的超前/伪造游标，静默对齐为等新数据）。
+// 多字节正确性论证：cursor 恒落在「某次 append 边界」= StringDecoder.write() 整段解码边界，
+// 4 字节 UTF-8（代理对）整对解码追加、不会被 cursor 切半；环形淘汰的头部丢码元（append 的
+// buf.slice(1)）可把代理对劈成孤立代理——只影响 reset 分支的整段 text，JSON.stringify
+// （ES2019 well-formed，Node 22）会把孤立代理转义为 \uD8XX，JSON.parse 原样还原，传输无损。
+function ssePlanChunk (cursor, output, outputTotalLength) {
+  const lost = outputTotalLength - output.length
+  if (cursor < lost) return { reset: true, text: output, cursor: outputTotalLength }
+  if (cursor < outputTotalLength) return { reset: false, text: output.slice(cursor - lost), cursor: outputTotalLength }
+  return null
 }
 
 function readBody (req, maxBytes = 4096) {
@@ -1021,7 +1064,7 @@ function buildPushChannelsView () {
   return view
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir } = {}) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
@@ -1084,6 +1127,95 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   try {
     for (const [k, v] of readLastAccept(lastAcceptPath)) lastAccept.set(k, v)
   } catch (e) { /* 文件不存在/损坏 = 空窗口，正常 */ }
+
+  // ── SSE 连接管理（v3.300 3.1）────────────────────────────────────────────
+  // 按实例隔离（createConsole 闭包内，非模块级）：测试会创建多个 console 实例，
+  // 模块级 Set 会跨实例泄漏连接数（第 9 个 503 误伤）；runs/startAction 模块级是既有
+  // 形态，不据此扩散。Set 不进 module.exports，经 createConsole 返回值暴露给测试。
+  const sseConnections = new Set()
+  // 每连接「应用层待发积压」上限：createConsole 可注入 sseMaxPending（测试注小值用），
+  // 未注入/非法值回退默认。命名用 ssePendingLimit 避免与解构参数同名（同名 const 会
+  // SyntaxError: Identifier has already been declared）。
+  const ssePendingLimit = typeof sseMaxPending === 'number' && sseMaxPending > 0 ? sseMaxPending : SSE_MAX_PENDING
+
+  // 幂等清理：clearInterval + 摘除登记 + res.end()。res 'close'/'error'/积压超限/关停
+  // 广播/完结收尾全走这里（蓝图防线 5：close 必清理，防 Set 泄漏）。
+  // abort=true（积压超限）：end 后再 destroy socket——慢客户端硬断（蓝图「直接断开」），
+  // 客户端 onerror → 整段重拉自愈；正常路径（done/对端关闭）只 end，FIN 干净收尾。
+  const sseTeardown = (conn, abort = false) => {
+    if (conn.closed) return
+    conn.closed = true
+    clearInterval(conn.timer)
+    sseConnections.delete(conn)
+    try { conn.res.end() } catch (e) { /* 已断开 */ }
+    if (abort) { try { conn.res.socket && conn.res.socket.destroy() } catch (e) { /* 已断开 */ } }
+  }
+
+  // 帧写出唯一出口（背压闸）。Node 语义：res.write() 无论返回值都会把帧入队，
+  // 返回 false 只表示「内部缓冲超高水位」——所以只在**已暂停**时入应用层待发队列，
+  // 绝不把同一帧既 write 又记 pending（会重复）。
+  const sseWriteFrame = (conn, frame) => {
+    if (conn.closed) return
+    if (conn.paused) {
+      conn.pending += frame
+      conn.pendingBytes += Buffer.byteLength(frame, 'utf8')
+      if (conn.pendingBytes > ssePendingLimit) sseTeardown(conn, true) // 慢客户端硬断
+      return
+    }
+    let ok = false
+    try { ok = conn.res.write(frame) } catch (e) { sseTeardown(conn); return }
+    if (!ok) conn.paused = true // 帧已入 Node 缓冲，仅暂停后续推送，等 drain
+  }
+
+  // drain 回调：待发串一次性交给 Node（无论返回值都已入队），按返回值决定是否保持暂停。
+  const sseFlushPending = (conn) => {
+    if (conn.closed || conn.pending.length === 0) return
+    let ok = false
+    try { ok = conn.res.write(conn.pending) } catch (e) { sseTeardown(conn); return }
+    conn.pending = ''
+    conn.pendingBytes = 0
+    conn.paused = !ok
+    if (ok) conn.lastPingAt = Date.now()
+  }
+
+  // 连接 tick（单一 500ms 定时器，unref；同时承担 15s 心跳——蓝图「心跳定时器 unref +
+  // close 时 clearInterval」由本定时器与 sseTeardown 落实）。写循环复查 runs.get(id)
+  // 感知淘汰与完结（蓝图口径：非事件驱动，对注入式测试友好——见 §2 D3）。
+  // ⚠️ 背压期间的 tick 仍运行，但只把新帧写入 conn.pending（sseWriteFrame 暂停分支），
+  // 不直接 write——积压超限断开的判据（SSE_MAX_PENDING）由此才能真实触发（蓝图口径
+  // 「记待发，超限断开」：待发必须持续累积，而不是暂停期整帧丢弃）。
+  const sseTick = (conn) => {
+    if (conn.closed) return
+    const record = runs.get(conn.id)
+    if (!record) {
+      // 20 条上限淘汰（startAction）或进程内丢失 → done + 关流。
+      // 背压中未发的待发帧随连接丢弃：客户端 EventSource onerror → 整段重拉自愈（§2 D3）。
+      sseWriteFrame(conn, 'event: done\ndata: {}\n\n')
+      sseTeardown(conn)
+      return
+    }
+    const plan = ssePlanChunk(conn.cursor, record.output, record.outputTotalLength)
+    if (plan) {
+      // 帧格式：data 单行（JSON.stringify 转义换行/引号，多字节经转义无损传输）；
+      // named event reset/done 前端必须 addEventListener（onmessage 不收 named——蓝图红线）。
+      const frame = plan.reset
+        ? `event: reset\ndata: ${JSON.stringify({ full: plan.text })}\n\n`
+        : `data: ${JSON.stringify(plan.text)}\n\n`
+      sseWriteFrame(conn, frame)
+      conn.cursor = plan.cursor
+    } else if (record.finishedAt && !conn.paused) {
+      // 完结且增量发完 → done + res.end()（蓝图 done 条件②；①淘汰在上分支）。
+      // !conn.paused 守卫（蕴含 pending 空）：背压未恢复前不发 done——否则帧入 pending
+      // 后被 teardown 丢弃，客户端收 RST 而非 done。暂停中则下轮 tick（drain 后）再发。
+      sseWriteFrame(conn, 'event: done\ndata: {}\n\n')
+      sseTeardown(conn)
+      return
+    }
+    if (Date.now() - conn.lastPingAt >= SSE_HEARTBEAT_MS) {
+      sseWriteFrame(conn, ': ping\n\n')
+      conn.lastPingAt = Date.now()
+    }
+  }
 
   const server = http.createServer((req, res) => {
     // ── v3.300 访问日志装配：单点 res.on('finish')，覆盖 sendJson/静态/页面全部响应出口
@@ -1531,6 +1663,57 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sendJson(res, 200, { runs: list })
       return
     }
+    // GET /api/runs/stream（v3.300 批次③ 3.1）：运行中任务输出的 SSE 实时流。
+    // ?id=<epoch.seq>&since=<offset>。鉴权零代码（继承上方全局闸）：原生 EventSource
+    // 不能带自定义头 → Bearer 不可用；GET 收会话 Cookie（authorize 内 GET 分支），前端走
+    // Cookie；API/测试可用 ?token=（浏览器流同款）。端点与前端统一 id= 键名（蓝图口径）。
+    if (req.method === 'GET' && url.pathname === '/api/runs/stream') {
+      // 关停闸：与 /trigger/cancel 同哲学——关停窗口不新开长连接（setShuttingDown 已置位，
+      // 活跃连接由 shutdown 序列广播 done，见 wireGracefulShutdown）。
+      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭' }); return }
+      const id = url.searchParams.get('id')
+      if (typeof id !== 'string' || id.length === 0) { sendJson(res, 400, { error: '缺少 id（epoch.seq 数字形态）' }); return }
+      if (!RUN_ID_RE.test(id)) { sendJson(res, 400, { error: 'id 必须是 epoch.seq 数字形态' }); return }
+      const record = runs.get(id)
+      if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
+      // 连接数闸：第 9 个 503（蓝图防线 3；Set 登记 + close 必清理在上方连接管理块）。
+      if (sseConnections.size >= SSE_MAX_CONNECTIONS) { sendJson(res, 503, { error: 'SSE 连接数已达上限' }); return }
+      // since 钳制（蓝图红线：Number + 整数 + 非负）：非法一律钳 0 → 客户端收整段，自愈。
+      // 缺省 = 从当前快照尾部开始（绝对偏移 = outputTotalLength，增量只发新数据）。
+      let cursor
+      if (url.searchParams.has('since')) {
+        const n = Number(url.searchParams.get('since'))
+        cursor = Number.isSafeInteger(n) && n >= 0 ? n : 0
+      } else {
+        cursor = record.outputTotalLength
+      }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no', // 禁 nginx 类反向代理缓冲（蓝图口径）
+        Connection: 'keep-alive'
+      })
+      res.flushHeaders()
+      const conn = {
+        id,
+        res,
+        cursor, // 绝对偏移（UTF-16 code units），与 ssePlanChunk 同单位
+        pending: '', // 背压期间的应用层待发帧串（有序）
+        pendingBytes: 0, // 待发积压（UTF-8 字节），超 ssePendingLimit 硬断
+        paused: false,
+        closed: false,
+        lastPingAt: Date.now(),
+        timer: null
+      }
+      sseConnections.add(conn)
+      conn.timer = setInterval(() => sseTick(conn), SSE_TICK_MS)
+      if (typeof conn.timer.unref === 'function') conn.timer.unref() // 蓝图防线 5
+      res.on('drain', () => { conn.paused = false; sseFlushPending(conn) })
+      res.on('close', () => sseTeardown(conn))
+      res.on('error', () => sseTeardown(conn))
+      sseTick(conn) // 建连即补发一次：since=0 / 落后游标 → 本 tick 出增量或 reset
+      return
+    }
     // POST /api/runs/detail：详情查询的 POST 形态（body: id=...）。与 GET /api/runs/:id
     // 等价（同响应体）；提供 POST 形态是因为前端 fetch 的 URL 必须是字面量（Codacy SSRF
     // 规则不接受任何含变量的 URL 第一参数，GET /:id 形态无法满足），id 改走请求体。
@@ -1553,7 +1736,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             exitCode: record.exitCode,
             timedOut: record.timedOut,
             cancelled: record.cancelled === true,
-            output: record.output
+            output: record.output,
+            // 绝对偏移游标数据源（v3.300 3.1）：环形淘汰后 output.length ≠ 绝对偏移，
+            // 前端初始游标必须用 outputTotalLength（§2 D5）。两详情响应体保持等价。
+            outputTotalLength: record.outputTotalLength
           })
         })
         .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
@@ -1602,7 +1788,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           }
           record.cancelled = true
           record.cancelRequestedAt = Date.now()
-          record.output += '\n[console] 收到停止请求，正在终止子进程…\n'
+          // 绕过 append 直改 output：计数器必须同步加（§1.3 理由同上）。
+          const note = '\n[console] 收到停止请求，正在终止子进程…\n'
+          record.output += note
+          record.outputTotalLength += note.length
           // Sourcery #229-11：停止留痕进 run.log——被停任务不会有自然收尾的摘要行，
           // 控制台补一行 ERROR 强失败标记（上海时区戳与写入侧 _localStamp 同形态），
           // readRunHistory 的新轮界模型把它识别为「尾端失败行 → 崩溃轮占位」，
@@ -1645,7 +1834,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         exitCode: record.exitCode,
         timedOut: record.timedOut,
         cancelled: record.cancelled === true,
-        output: record.output
+        output: record.output,
+        outputTotalLength: record.outputTotalLength // 与 POST detail 等价（v3.300 3.1）
       })
       return
     }
@@ -1677,6 +1867,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     const shutdown = (signal) => {
       setShuttingDown() // 关停闸：/trigger 即刻 503，readBody 回调不得再 spawn（评审 High）
+      // SSE 关停广播（v3.300 3.1）：置位即给所有活跃连接发 done 并 end。
+      // ⚠️ 正确性要求而非体验优化（§A5）：不主动 end 的话 SSE 属「在途连接」，
+      // closeIdleConnections() 不动它，500ms 的 closeAllConnections() 会硬断——
+      // 客户端收到 RST 而非 done 帧；且 server.close() 回调会一直等 SSE 结束，
+      // 悬挂到 1s 强退兜底。done 帧经 sseWriteFrame（背压安全）+ sseTeardown（幂等 end）。
+      for (const conn of sseConnections) {
+        sseWriteFrame(conn, 'event: done\ndata: {}\n\n')
+        sseTeardown(conn)
+      }
       console.log(`收到 ${signal}，关闭控制台：终止触发子进程并释放锁…`)
       for (const child of activeChildren) {
         try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
@@ -1722,7 +1921,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     return { shutdown }
   }
-  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown }
+  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections }
 }
 
 // ── 启动入口 ───────────────────────────────────────────────────────────────
@@ -1816,5 +2015,12 @@ module.exports = {
   buildMessagesCsv,
   EXPORT_MAX_ROWS,
   EXPORT_EXCERPT_MAX,
-  EXPORT_FORMATS
+  EXPORT_FORMATS,
+  // v3.300 批次③ 3.1 SSE：纯函数/常量导出（非 HTTP 单测 + 变异测试可达性）
+  RUN_ID_RE,
+  ssePlanChunk,
+  SSE_TICK_MS,
+  SSE_HEARTBEAT_MS,
+  SSE_MAX_PENDING,
+  SSE_MAX_CONNECTIONS
 }

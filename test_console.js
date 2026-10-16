@@ -23,7 +23,8 @@ const {
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
   sanitizeAccessPath, shouldLogAccess, ACCESS_LOG_MAX,
   filterMessageItems, clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
-  EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS
+  EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
+  RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS
 } = require('./scripts/console')
 const { readMessages } = require('./scripts/status')
 // 导出端点的读取上限（console.js 内部常量，与 MESSAGES_MAX_BYTES 同值）：
@@ -381,6 +382,56 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
   assert.strictEqual(ACCESS_LOG_MAX, 200, '环形上限常量 = 200')
 })
 
+// ── v3.300 批次③ 3.1 SSE：纯函数（同步，直接 require 新导出）──
+ok('T-P1 ssePlanChunk 全分支（增量/reset/边界/无新数据/超前游标/孤立代理/连续不重不漏）', () => {
+  // 正常增量：多字节逐码元（中文=1 码元、🐮=2 码元）
+  const inc = ssePlanChunk(2, 'AB中文🐮', 6)
+  assert.deepStrictEqual(inc, { reset: false, text: '中文🐮', cursor: 6 })
+  assert.strictEqual(inc.text.length, 4)
+  // reset：游标落后淘汰点（lost=7）
+  assert.deepStrictEqual(ssePlanChunk(3, 'CDE', 10), { reset: true, text: 'CDE', cursor: 10 })
+  // 边界 cursor === lost：数据恰从游标起，不误发 reset
+  const edge = ssePlanChunk(7, 'CDE', 10)
+  assert.strictEqual(edge.reset, false)
+  assert.strictEqual(edge.text, 'CDE')
+  assert.strictEqual(edge.cursor, 10)
+  // 无新数据 / 超前游标 → null
+  assert.strictEqual(ssePlanChunk(10, 'CDE', 10), null)
+  assert.strictEqual(ssePlanChunk(12, 'CDE', 10), null)
+  // 孤立代理（环形淘汰劈对模拟）：reset 分支 text 原样含孤立低代理 + well-formed JSON 往返无损
+  const lone = ssePlanChunk(0, '\uDF6B牛', 4)
+  assert.strictEqual(lone.reset, true)
+  assert.strictEqual(lone.text, '\uDF6B牛')
+  assert.strictEqual(JSON.parse(JSON.stringify({ full: '\uDF6B' })).full, '\uDF6B', 'well-formed JSON.stringify/parse 往返无损')
+  // 连续增量不重不漏：模拟 5 段追加、游标推进
+  let output = ''
+  let total = 0
+  let cursor = 0
+  let received = ''
+  for (const piece of ['你好', '世界', '🐮栖', 'line\n', 'end']) {
+    output += piece
+    total += piece.length
+    const plan = ssePlanChunk(cursor, output, total)
+    if (plan) {
+      assert.strictEqual(plan.reset, false)
+      received += plan.text
+      cursor = plan.cursor
+    }
+  }
+  assert.strictEqual(received, '你好世界🐮栖line\nend', '连续增量拼接 === 全串')
+})
+ok('T-P2 SSE 常量与 RUN_ID_RE 形态', () => {
+  assert.strictEqual(SSE_MAX_CONNECTIONS, 8)
+  assert.strictEqual(SSE_MAX_PENDING, 1048576)
+  assert.strictEqual(SSE_TICK_MS, 500)
+  assert.strictEqual(SSE_HEARTBEAT_MS, 15000)
+  assert.strictEqual(RUN_ID_RE.test('1750000000000.1'), true)
+  assert.strictEqual(RUN_ID_RE.test('abc'), false)
+  assert.strictEqual(RUN_ID_RE.test('1750.1'), false)
+  assert.strictEqual(RUN_ID_RE.test('1750000000000..'), false)
+  assert.strictEqual(RUN_ID_RE.test('1750000000000.12345678901'), false)
+})
+
 // ── v3.300 批次③ 3.2 消息导出：纯函数（同步，直接 require 新导出）──
 ok('T-P0 导出常量: 5000 行钳制 / 200 码元摘要 / format 白名单冻结', () => {
   assert.strictEqual(EXPORT_MAX_ROWS, 5000)
@@ -488,6 +539,70 @@ function rawRequest (port, raw) {
     sock.on('error', (e) => { clearTimeout(to); finish() })
   })
 }
+
+// ── SSE 增量收集 helper（v3.300 3.1）──
+// request() 等 'end' 不适用于长连接（有心跳永不 end）。打开流 → 按 '\n\n' 分帧 →
+// event/data 解析（未命名帧 event='message'；':' 注释帧跳过）→ waitFor(谓词, 超时)
+// 轮询已收事件（25ms 步进，不用 sleep 猜时序）→ pause()/resume() 模拟慢客户端
+// （T10 背压）→ close() 主动断。
+function sseCollect (port, urlPath, { headers } = {}) {
+  const events = []
+  let raw = ''
+  let ended = false
+  let resRef = null
+  const req = http.request({ host: '127.0.0.1', port, path: urlPath, headers: headers || {} }, (res) => {
+    resRef = res
+    res.setEncoding('utf8')
+    res.on('data', (c) => {
+      raw += c
+      let idx
+      while ((idx = raw.indexOf('\n\n')) >= 0) {
+        const frame = raw.slice(0, idx)
+        raw = raw.slice(idx + 2)
+        if (frame.startsWith(':')) continue // 心跳注释帧
+        let event = 'message'
+        const datas = []
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim()
+          else if (line.startsWith('data:')) datas.push(line.slice(5).trim())
+        }
+        events.push({ event, data: datas.join('\n') })
+      }
+    })
+    res.on('end', () => { ended = true })
+  })
+  req.on('error', () => { ended = true })
+  req.end()
+  const waitFor = async (pred, ms = 5000) => {
+    const to = Date.now() + ms
+    while (Date.now() < to) {
+      if (events.some(pred)) return true
+      await new Promise((_resolve) => setTimeout(_resolve, 25))
+    }
+    return events.some(pred)
+  }
+  const close = () => {
+    try { if (resRef) resRef.destroy() } catch (e) { /* 已断 */ }
+    try { req.destroy() } catch (e) { /* 已断 */ }
+  }
+  // 慢客户端模拟：暂停 socket 读（服务端 write 返回 false → 背压）与恢复（drain）。
+  const pause = () => { try { if (resRef) resRef.socket.pause() } catch (e) { /* 已断 */ } }
+  const resume = () => { try { if (resRef) resRef.socket.resume() } catch (e) { /* 已断 */ } }
+  // 等响应头到达（resRef 就绪）——T10 要在服务端任何 body 帧写出前暂停 socket。
+  const ready = async (ms = 5000) => {
+    const to = Date.now() + ms
+    while (Date.now() < to) {
+      if (resRef !== null) return true
+      await new Promise((_resolve) => setTimeout(_resolve, 10))
+    }
+    return resRef !== null
+  }
+  return { events, waitFor, close, pause, resume, ready, isEnded: () => ended }
+}
+// 注入式 fake record（cancel 用例同先例）+ 与生产 append 同语义的测试追加器
+// （output 与 outputTotalLength 必须同步——镜像生产约束）。
+const makeStreamRecord = (id) => ({ id, action: 'check', label: 'x', startedAt: Date.now(), finishedAt: 0, exitedAt: 0, exitCode: null, timedOut: false, cancelled: false, output: '', outputTotalLength: 0 })
+const streamAppend = (record, text) => { record.output += text; record.outputTotalLength += text.length }
 
 const TOKEN = 'x'.repeat(32)
 
@@ -1276,6 +1391,341 @@ async function main () {
     assert.ok(events.includes('SIGKILL'), `宽限后必须 SIGKILL 兜底（events=${events}）`)
     server.close()
   })
+  // ── v3.300 批次③ 3.1 SSE 端到端 ──
+  await aok('SSE T1 鉴权与方法：无/错凭证 401；仅 Cookie 放行（GET 收 Cookie）；POST → 404 兜底', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const seed = makeStreamRecord('1750000000000.9')
+    streamAppend(seed, 'seed')
+    runs.set('1750000000000.9', seed)
+    const noAuth = await request(port, 'GET', '/api/runs/stream?id=1750000000000.9')
+    assert.strictEqual(noAuth.status, 401, '无凭证必须 401（不升级连接）')
+    const badAuth = await request(port, 'GET', '/api/runs/stream?id=1750000000000.9&token=' + 'y'.repeat(32))
+    assert.strictEqual(badAuth.status, 401, '错凭证必须 401')
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=0', { headers: { cookie: `xbk_session=${TOKEN}` } })
+    assert.strictEqual(await sse.waitFor(() => sse.events.length > 0), true, '仅 Cookie 必须放行（GET 收 Cookie）')
+    sse.close()
+    const post = await request(port, 'POST', '/api/runs/stream', { token: TOKEN })
+    assert.strictEqual(post.status, 404, 'POST 不匹配 → 落 404 兜底')
+    server.close()
+  })
+  await aok('SSE T2 参数闸：缺 id/坏形态 400、不存在 404、since 非法值 200 且按 0 钳制', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    runs.set('1750000000000.9', makeStreamRecord('1750000000000.9'))
+    const bad1 = await request(port, 'GET', '/api/runs/stream', { token: TOKEN })
+    assert.strictEqual(bad1.status, 400, '缺 id 必须 400')
+    for (const bad of ['abc', '1750.1', '1750000000000..', '1750000000000.-1', '1750000000000.12345678901']) {
+      const r = await request(port, 'GET', `/api/runs/stream?id=${encodeURIComponent(bad)}`, { token: TOKEN })
+      assert.strictEqual(r.status, 400, `坏形态 id「${bad}」必须 400`)
+    }
+    const nf = await request(port, 'GET', '/api/runs/stream?id=1750000000000.999', { token: TOKEN })
+    assert.strictEqual(nf.status, 404, '合法形态不存在 → 404')
+    const seeded = makeStreamRecord('1750000000000.9')
+    streamAppend(seeded, 'hello')
+    runs.set('1750000000000.9', seeded)
+    for (const badSince of ['abc', '-5', '1.5', '1e999']) {
+      const sse = sseCollect(port, `/api/runs/stream?id=1750000000000.9&since=${badSince}`, { headers: { authorization: `Bearer ${TOKEN}` } })
+      assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, `since=${badSince} 钳 0 → 收整段`)
+      const frames = sse.events.filter((e) => e.event === 'message')
+      assert.strictEqual(JSON.parse(frames[0].data), 'hello', `since=${badSince} 首帧=整段（按 0 钳制）`)
+      sse.close()
+    }
+    server.close()
+  })
+  await aok('SSE T3 响应头：event-stream / x-accel-buffering: no / cache-control: no-cache', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    runs.set('1750000000000.9', makeStreamRecord('1750000000000.9'))
+    const head = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, path: '/api/runs/stream?id=1750000000000.9', headers: { authorization: `Bearer ${TOKEN}` } }, (res) => {
+        res.once('data', () => {}) // 触发头到达即可
+        resolve(res)
+      })
+      req.on('error', reject)
+      req.end()
+    })
+    assert.ok(head.headers['content-type'].startsWith('text/event-stream'), 'content-type 前缀 event-stream')
+    assert.strictEqual(head.headers['x-accel-buffering'], 'no')
+    assert.strictEqual(head.headers['cache-control'], 'no-cache')
+    head.destroy()
+    server.close()
+  })
+  await aok('SSE T4 增量推送与游标：since=0 全串 → 追加收增量 → 拼接不重不漏 → close 后 Set 归零', async () => {
+    const dir = tmpDir()
+    const { server, runs, sseConnections } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, '第一段输出\n第二行')
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=0', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, '首帧到达')
+    const f1 = sse.events.find((e) => e.event === 'message')
+    assert.strictEqual(JSON.parse(f1.data), '第一段输出\n第二行', '首帧=快照全串')
+    streamAppend(rec, '第一段增量')
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message' && JSON.parse(e.data) === '第一段增量'), true, '增量帧到达')
+    streamAppend(rec, '第二段增量\n中文🐮多字节')
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message' && e.data.includes('🐮')), true, '多字节增量到达')
+    const all = sse.events.filter((e) => e.event === 'message').map((e) => JSON.parse(e.data)).join('')
+    assert.strictEqual(all, '第一段输出\n第二行第一段增量第二段增量\n中文🐮多字节', '所有 message 帧拼接 === 期望全串（不重不漏）')
+    sse.close()
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && sseConnections.size > 0) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sseConnections.size, 0, 'close 后服务端连接必须清理归零')
+    server.close()
+  })
+  await aok('SSE T5 多字节 since 切片：since=3 → 恰一帧「文🐮」（逐码元，不重不漏）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, 'AB中文🐮') // len 6：A B 中 文 🐮🐮
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=3', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true)
+    const frames = sse.events.filter((e) => e.event === 'message')
+    assert.strictEqual(frames.length, 1, '恰一帧')
+    assert.strictEqual(JSON.parse(frames[0].data), '文🐮')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE T6 环形淘汰：游标落后 lost → reset 帧整段重发；对照游标 ≥ lost → 普通增量', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    rec.output = 'y'.repeat(1000)
+    rec.outputTotalLength = 1100 // 模拟已淘汰 100 码元
+    runs.set('1750000000000.9', rec)
+    const sseA = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=50', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sseA.waitFor((e) => e.event === 'reset'), true, 'since=50 < lost=100 → reset')
+    const rf = sseA.events.find((e) => e.event === 'reset')
+    assert.strictEqual(JSON.parse(rf.data).full, rec.output, 'reset 整段=现存缓冲')
+    sseA.close()
+    const sseB = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=150', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sseB.waitFor((e) => e.event === 'message'), true, 'since=150 ≥ lost → 普通增量')
+    assert.strictEqual(sseB.events.some((e) => e.event === 'reset'), false, '不得误发 reset')
+    assert.strictEqual(JSON.parse(sseB.events.find((e) => e.event === 'message').data), 'y'.repeat(950), '增量恰为 slice(150−100)=950 码元')
+    sseB.close()
+    server.close()
+  })
+  await aok('SSE T7 完结 done + 关流：finishedAt 已设且游标对齐 → done 帧 + res.end', async () => {
+    const dir = tmpDir()
+    const { server, runs, sseConnections } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, '最终输出')
+    rec.finishedAt = Date.now()
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9', { headers: { authorization: `Bearer ${TOKEN}` } }) // 无 since → cursor=total
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'done'), true, '收到 done 帧')
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && !sse.isEnded()) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sse.isEnded(), true, '服务端 res.end 后客户端收到 end')
+    const deadline2 = Date.now() + 3000
+    while (Date.now() < deadline2 && sseConnections.size > 0) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sseConnections.size, 0, '关流后连接不在 Set')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE T8 淘汰 done：runs.delete 后写循环复查感知 → done + end（20 条淘汰路径零 diff 验证）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, '在跑')
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=0', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, '首帧到达')
+    runs.delete('1750000000000.9')
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'done'), true, '淘汰 → done')
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && !sse.isEnded()) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sse.isEnded(), true, 'done 后关流')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE T9 连接上限：第 9 条 503；关 1 条可再开；全关 Set 归零', async () => {
+    const dir = tmpDir()
+    const { server, runs, sseConnections } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const seeded = makeStreamRecord('1750000000000.9')
+    streamAppend(seeded, 'seed')
+    runs.set('1750000000000.9', seeded)
+    const conns = []
+    for (let i = 0; i < SSE_MAX_CONNECTIONS; i++) {
+      const sse = sseCollect(port, `/api/runs/stream?id=1750000000000.9&since=0&seq=${i}`, { headers: { authorization: `Bearer ${TOKEN}` } })
+      assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, `第 ${i + 1} 条建连收首帧`)
+      conns.push(sse)
+    }
+    const ninth = await request(port, 'GET', '/api/runs/stream?id=1750000000000.9', { token: TOKEN })
+    assert.strictEqual(ninth.status, 503, '第 9 条必须 503')
+    conns[0].close()
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && sseConnections.size >= SSE_MAX_CONNECTIONS) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    // 重开探测不能用 request()（它会等响应体 end——SSE 有心跳永不 end）：只读响应头。
+    const reopen = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, path: '/api/runs/stream?id=1750000000000.9&probe=reopen', headers: { authorization: `Bearer ${TOKEN}` } }, (res) => {
+        res.once('data', () => {})
+        resolve(res)
+      })
+      req.on('error', reject)
+      req.end()
+    })
+    assert.strictEqual(reopen.statusCode, 200, '关 1 条后可再开')
+    assert.ok(String(reopen.headers['content-type']).startsWith('text/event-stream'))
+    reopen.destroy()
+    for (const sse of conns) sse.close()
+    server.close()
+  })
+  await aok('SSE T10 慢客户端积压硬断：暂停读 + 大快照 + 定隔追加 → 待发超限硬断（无 done 帧）', async () => {
+    const dir = tmpDir()
+    const { server, runs, sseConnections } = createConsole({ token: TOKEN, stateDir: dir, sseMaxPending: 1024 })
+    const port = await listen(server)
+    // 种子输出 600KiB：建连首个 tick 整帧 write（600KiB > 回环内核发送缓冲）。
+    const rec = makeStreamRecord('1750000000000.9')
+    rec.output = 'y'.repeat(614400)
+    rec.outputTotalLength = 614400
+    runs.set('1750000000000.9', rec)
+    // raw socket 客户端：请求行发出后**立即** pause 读，且**不挂 data 监听**——挂了
+    // 'data' 流动模式会先吃掉首块、pause 失去对 libuv 读的门闩作用（探针实测 paused
+    // 恒 false）；无监听时 socket 永不流入，pause 是确定性闸。
+    // 硬断判据（plan §4 T10 口径「无 done 帧」）：
+    // 1. 服务端侧：待发积压 > sseMaxPending(1024) → sseTeardown(conn,true) → Set 摘除。
+    //    客户端 paused 期间 RST/FIN 不可见（内核缓冲吞掉终结事件，探针 t10wr 实测
+    //    服务端 res.close 已触发而 paused 客户端无任何事件）——故只以服务端 Set 归零
+    //    为「已断」判据，随后恢复读让排队字节与终结流入。
+    // 2. 客户端侧：恢复读后 socket 必终结（destroy → 排队字节流尽后 close）；收到的
+    //    原始字节含数据帧但**不含 event: done**（超限 teardown 不发 done；淘汰/完结
+    //    路径才发——区分硬断与正常收尾）。ECONNRESET 'error' 不可用作判据：本服务端
+    //    destroy 前已 res.end() 且缓冲已入内核（探针 destroyorder 实测 end-then-destroy
+    //    → 客户端只 'close' 无 'error'），错误码断言在本机形态物理不可达。
+    // ⚠️ 追加节奏必须用 setInterval（await-sleep 异步链在回环自调优下会让首帧恰好被
+    // 吸收、paused 恒 false——plan §4 T10 预警的环境敏感形态）；追加总量 24×256KiB ≈
+    // 6MiB 必须压过内核缓冲 autotune 硬顶（套件内实测 ~2.9MB 处 write 才返 false）。
+    let ended = false
+    let raw = ''
+    let appendTimer = null
+    let torn = false
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.write(`GET /api/runs/stream?id=1750000000000.9&since=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${TOKEN}\r\n\r\n`)
+      sock.pause()
+      // 连接登记后再开始追加：untilTornDown「先等出现、再等消失」不能与追加赛跑。
+      const waitConn = setInterval(() => {
+        if (sseConnections.size > 0) {
+          clearInterval(waitConn)
+          let i = 0
+          appendTimer = setInterval(() => {
+            i++
+            streamAppend(rec, 'z'.repeat(262144))
+            if (i >= 24 || torn) clearInterval(appendTimer)
+          }, 50)
+        }
+      }, 5)
+    })
+    sock.on('error', () => { ended = true })
+    sock.on('close', () => { ended = true })
+    const untilTornDown = async (ms) => {
+      const t0 = Date.now()
+      while (Date.now() - t0 < ms && sseConnections.size === 0) await new Promise((_resolve) => setTimeout(_resolve, 10))
+      if (sseConnections.size === 0) return false // 连接从未建立（异常形态，直接判负）
+      const to = Date.now() + ms
+      while (Date.now() < to) {
+        if (sseConnections.size === 0) return true
+        await new Promise((_resolve) => setTimeout(_resolve, 25))
+      }
+      return sseConnections.size === 0
+    }
+    torn = await untilTornDown(20000)
+    if (appendTimer) clearInterval(appendTimer)
+    assert.strictEqual(torn, true, '超限硬断 → 服务端连接已 teardown 摘除')
+    sock.on('data', (c) => { raw += c })
+    sock.resume()
+    // pause-before-flow 的 readableFlowing=false 陷阱：resume 一次不必然启动流动，
+    // 周期性踢一脚直到终结（探针 t10kick/t10good 实证 3/3 稳定）。
+    const kick = setInterval(() => { if (!sock.destroyed) sock.resume() }, 20)
+    const untilEnded = async (ms) => {
+      const to = Date.now() + ms
+      while (Date.now() < to) {
+        if (ended) return true
+        await new Promise((_resolve) => setTimeout(_resolve, 25))
+      }
+      return ended
+    }
+    assert.strictEqual(await untilEnded(10000), true, '恢复读后客户端收到连接终结（排队字节流尽 → close）')
+    clearInterval(kick)
+    assert.strictEqual(sseConnections.size, 0, '硬断后服务端连接保持摘除')
+    assert.strictEqual(raw.includes('event: done'), false, '超限硬断不发 done 帧（区别于淘汰/完结收尾路径）')
+    assert.ok(raw.length > 0, '硬断前已排队的数据帧照常流入客户端')
+    server.close()
+  })
+  await aok('SSE T11 shuttingDown 广播：置位 → 活跃连接收 done + end；新连接 503', async () => {
+    const dir = tmpDir()
+    const { server, runs, activeChildren, wireGracefulShutdown: wire } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const seeded = makeStreamRecord('1750000000000.9')
+    streamAppend(seeded, 'seed')
+    runs.set('1750000000000.9', seeded)
+    // 假活跃子进程（cancel 用例同款 fake 形态）：无 activeChildren 时关停序列会立即
+    // finishShutdown → server.close()，「新连接 → 503」探测会 ECONNREFUSED；有 pending
+    // 子进程时收尾被推迟到 close/3s 看门狗，窗口内 server 仍在监听、关停闸可测。
+    const fakeChild = {
+      kill () {},
+      once () { return this },
+      stdout: { on () {} },
+      stderr: { on () {} },
+      on () { return this }
+    }
+    activeChildren.add(fakeChild)
+    let registered = null
+    // onExit 必须注入 no-op：doExit 默认 process.exit(0)——1s 强退兜底会把整个测试套件
+    // 静默带走（EXIT=0、摘要行缺失）。与 SIGTERM e2e 用例注入 onExit 同理。
+    wire({ onExit: () => {}, registerSignal: (fn) => { registered = fn } })
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=0', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, '建连收首帧')
+    registered('SIGTERM')
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'done'), true, '关停广播 done')
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && !sse.isEnded()) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sse.isEnded(), true, '广播后 end')
+    const again = await request(port, 'GET', '/api/runs/stream?id=1750000000000.9', { token: TOKEN })
+    assert.strictEqual(again.status, 503, '关停窗口新连接 503')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE T12 outputTotalLength 端到端：真子进程 check 轮详情输出数值计数器且常态等于 output.length', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    let trig = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+    if (trig.status === 409) {
+      // 竞态兜底（cancel 用例同款）：check 窗口内撞上重放窗 → 跨动作重触发
+      const t3 = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
+      assert.strictEqual(t3.status, 202, '跨动作触发必须 202')
+      trig = t3
+    } else {
+      assert.strictEqual(trig.status, 202)
+    }
+    const { id } = JSON.parse(trig.text)
+    const deadline = Date.now() + 30000
+    let detail = null
+    while (Date.now() < deadline) {
+      const r = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: `id=${id}` })
+      detail = JSON.parse(r.text)
+      if (detail.finishedAt) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    assert.ok(detail && detail.finishedAt, '子进程应在 30s 内结束')
+    assert.strictEqual(typeof detail.outputTotalLength, 'number', '详情必须下发 outputTotalLength 数值')
+    assert.ok(detail.outputTotalLength >= detail.output.length, '计数器 ≥ 现存长度（无淘汰常态应相等）')
+    assert.strictEqual(detail.outputTotalLength, detail.output.length, 'check 输出 < 512KiB 无淘汰 → 恒等')
+    const get = JSON.parse((await request(port, 'GET', `/api/runs/${id}`, { token: TOKEN })).text)
+    assert.strictEqual(get.outputTotalLength, detail.outputTotalLength, 'GET 详情响应体等价')
+    server.close()
+  })
   await aok('HTTP: GET /api/run-history（轮界模型 / 行号游标 / limit 钳制 / 鉴权）', async () => {
     const dir = tmpDir()
     // 轮界模型（v3.299 评审 #3/#12）：失败行在**同轮**摘要行之前紧邻出现（生产写序
@@ -1804,20 +2254,25 @@ async function main () {
     server.close()
   })
 
-  await aok('静态红线: app.js 所有 fetch 第一参数均为字面量或字面量起点三元', () => {
+  await aok('静态红线: app.js 所有 fetch/EventSource 第一参数均为字面量或字面量起点三元', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     // Codacy SSRF 全绿形态：第一参数是 '/api/...' 字面量，或以字面量起点的三元
     // （`qs.length > 0 ? `/api/messages?${qs}` : '/api/messages'` —— authority 恒字面量，
     // PR#227 实测通过形态）。抓的是「第一参数为裸变量/函数调用」的形态。
+    // v3.300 扩扫 new EventSource( ——原生 EventSource 第一参数同为 URL，同受「变量 URL」
+    // 注入/SSF 风险，字面量纪律零成本统一（EventSource 无法自定义头，风险面只增不减）。
     const offenders = []
-    for (const m of src.matchAll(/fetch\(\s*([^,)]{1,60})/g)) {
+    // app.js 经 standard no-undef 改写为 window.EventSource（原生全局引用）——正则需
+    // 同时覆盖两种拼写，否则扩扫形同虚设（T13 开发期自检实证：new window.EventSource(
+    // 不被 /new EventSource\(/ 命中）。
+    for (const m of src.matchAll(/(?:fetch|new (?:window\.)?EventSource)\(\s*([^,)]{1,60})/g)) {
       const first = m[1].trim()
       if (first.startsWith('\'/') || first.startsWith('`/')) continue
       // 三元：问号任一侧含字面量起点（'/ 或 `/）即视为安全形态
       if (first.includes('?') && (first.includes('\'/') || first.includes('`/'))) continue
       offenders.push(first)
     }
-    assert.deepStrictEqual(offenders, [], `fetch 第一参数必须是字面量或字面量三元：${offenders.join(' | ')}`)
+    assert.deepStrictEqual(offenders, [], `fetch/EventSource 第一参数必须是字面量或字面量三元：${offenders.join(' | ')}`)
   })
 }
 
