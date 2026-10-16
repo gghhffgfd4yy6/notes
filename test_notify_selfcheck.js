@@ -35,12 +35,12 @@ let gotCalls = []
 // pushplus 业务成功码 = code 200（v3.160 口径）；mock body 直接给 {code:200}
 require.cache[gotPath].exports = (url, options) => {
   gotCalls.push({ url, options })
-  return { then: (res) => res({ body: JSON.stringify({ code: 200, msg: '' }), statusCode: 200, headers: {} }) }
+  return Promise.resolve({ body: JSON.stringify({ code: 200, msg: '' }), statusCode: 200, headers: {} })
 }
 require.cache[gotPath].exports.get = require.cache[gotPath].exports
 require.cache[gotPath].exports.post = (url, options) => {
   gotCalls.push({ url, options })
-  return { then: (res) => res({ body: JSON.stringify({ code: 200, msg: '' }), statusCode: 200, headers: {} }) }
+  return Promise.resolve({ body: JSON.stringify({ code: 200, msg: '' }), statusCode: 200, headers: {} })
 }
 
 const slim = require('./xbk_sendNotify_slim.js')
