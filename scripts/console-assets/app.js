@@ -253,17 +253,12 @@ function apiGetAccessLog () {
   return consumeJson(fetch('/api/access-log', merged), done)
 }
 
-async function trigger (action) {
-  const body = new URLSearchParams({ action })
-  const { merged, done } = timedRequest({
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Authorization: `Bearer ${BOOT.token}`
-    },
-    body
-  })
-  const p = fetch('/trigger', merged)
+// 触发类请求公共体（SonarCloud new_duplicated_lines_density：trigger 与 triggerNotifyTest
+// 两段同构模板抽公共，消除新增代码重复率超标）。fetch 字面量由调用侧闭包注入——
+// 第一参数仍是纯字面量（§0 静态红线形态保持），公共体只管 timedRequest/重放拦截语义。
+async function triggerVia (timedOpts, doFetch, dupMsg, failMsgOf) {
+  const { merged, done } = timedRequest(timedOpts)
+  const p = doFetch(merged)
   p.then(() => {}, () => {})
   let res
   try {
@@ -284,48 +279,44 @@ async function trigger (action) {
     // 服务端幂等重放窗（与 console.js REPLAY_WINDOW_MS 配套）：同动作重试被拦时
     // 返回首轮 runId——提示用户「那一轮已经在跑/已完成」，前端顺手刷新历史。
     if (data && data.replayBlocked && data.runId) {
-      const err = new Error('刚才那次触发已受理（正在运行或已完成），未重复执行')
+      const err = new Error(dupMsg)
       err.replayRunId = data.runId
       throw err
     }
-    throw new Error(data.error || `HTTP ${res.status}`)
+    throw new Error(failMsgOf(data, res.status))
   }
   return data
 }
 
-// 通知自检走独立端点（无 body）：与 trigger() 同款 timedRequest/replayBlocked 处理形态，
+async function trigger (action) {
+  const body = new URLSearchParams({ action })
+  return triggerVia(
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `*** ${BOOT.token}`
+      },
+      body
+    },
+    (merged) => fetch('/trigger', merged),
+    '刚才那次触发已受理（正在运行或已完成），未重复执行',
+    (data, status) => (data && data.error) || `HTTP ${status}`
+  )
+}
+
+// 通知自检走独立端点（无 body）：与 trigger() 共用 triggerVia 模板，
 // fetch 第一参数为纯字面量（§0 红线，查询参数-free）。
 async function triggerNotifyTest () {
-  const { merged, done } = timedRequest({
-    method: 'POST',
-    headers: { Authorization: `Bearer ${BOOT.token}` }
-  })
-  const p = fetch('/api/notify-test', merged)
-  p.then(() => {}, () => {})
-  let res
-  try {
-    res = await p
-  } catch (e) {
-    done()
-    throw e
-  }
-  let data
-  try {
-    data = await readBodyJson(res)
-  } catch (e) {
-    data = {}
-  } finally {
-    done()
-  }
-  if (!res.ok) {
-    if (data && data.replayBlocked && data.runId) {
-      const err = new Error('刚才那次通知自检已受理（正在运行或已完成），60 秒内无需重复')
-      err.replayRunId = data.runId
-      throw err
-    }
-    throw new Error((data && data.error) || `通知自检失败（HTTP ${res.status}）`)
-  }
-  return data
+  return triggerVia(
+    {
+      method: 'POST',
+      headers: { Authorization: `*** ${BOOT.token}` }
+    },
+    (merged) => fetch('/api/notify-test', merged),
+    '刚才那次通知自检已受理（正在运行或已完成），60 秒内无需重复',
+    (data, status) => (data && data.error) || `通知自检失败（HTTP ${status}）`
+  )
 }
 
 // ── 组件：状态徽章 ──────────────────────────────────────────────────────────
