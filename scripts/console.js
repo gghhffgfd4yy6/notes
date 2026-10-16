@@ -544,15 +544,36 @@ function washTokens (s) {
   return s
 }
 
+// 尽力解码（评审 231-555）：decodeURIComponent 全串版对任何畸形 % 序列整体抛错，
+// 导致「编码 token 键 + 无关畸形转义」同串时 token 洗不掉。逐段解码：可解的 %xx
+// 解开，非法序列原样保留——不抛错、不丢段。
+function bestEffortDecode (s) {
+  let out = ''
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (c !== '%') { out += c; continue }
+    const hex = s.slice(i + 1, i + 3)
+    if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+      out += String.fromCharCode(parseInt(hex, 16))
+      i += 2
+    } else {
+      out += c
+    }
+  }
+  return out
+}
+
 function sanitizeAccessPath (raw) {
-  // 脱敏硬闸（蓝图防线 1）：先原串洗，再「解码→复洗」至多 2 轮（D6，堵 %74oken= /
-  // %2574oken= 编码键名）。解码失败（畸形 % 序列抛 URIError）用当前已洗串——
+  // 脱敏硬闸（蓝图防线 1）：先原串洗，再「解码→复洗」至不动点（D6，堵 %74oken= /
+  // %2574oken= 及更深编码键名；上限 16 轮防病态深嵌套，URL 编码超过 16 层无实际形态）。
+  // 解码失败（畸形 % 序列抛 URIError）不再提前 return（评审 231-555：那会放过同串的
+  // 编码 token 键）——改用逐段尽力解码后继续洗；全失败也保有已洗串。
   // 先例口径：sessionCookieValue 对畸形 Cookie 按「无有效值」处理，绝不炸主链路。
   // 注意：解码后若洗出了 token，返回的是解码形态路径（内容已 *** 化，泄露面为零）。
   let s = washTokens(String(raw == null ? '' : raw))
-  for (let round = 0; round < 2; round++) {
+  for (let round = 0; round < 16; round++) {
     let d
-    try { d = decodeURIComponent(s) } catch (e) { return s }
+    try { d = decodeURIComponent(s) } catch (e) { d = bestEffortDecode(s) }
     if (d === s) return s
     s = washTokens(d)
   }
@@ -764,6 +785,16 @@ function csvCell (value) {
   return s
 }
 
+// 截断到 max 码元且不在代理对中间落刀（评审 231-M6）：slice 后若末码元是孤立高代理
+// （D800-DBFF 且后无低代理），回退一码元。纯函数。
+function excerptTruncated (text, max) {
+  if (text.length <= max) return text
+  let cut = text.slice(0, max)
+  const last = cut.charCodeAt(cut.length - 1)
+  if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1)
+  return cut
+}
+
 // 导出行白名单映射（v3.300 3.2）：id/time/cate/title/excerpt 五字段，绝不透传原始条目对象
 // （readMessages 返回的 items 是未裁剪条目，url/price/cateid/content_html/判重身份一律不带走）。
 function exportRowOf (m) {
@@ -775,8 +806,11 @@ function exportRowOf (m) {
     // cate：'(未分类)' 归一（与列表端点一致）
     cate: typeof m.catename === 'string' && m.catename.length > 0 ? m.catename : '(未分类)',
     title: typeof m.title === 'string' ? m.title : '',
-    // 内容摘要：200 码元截断（xbk_app.js:293 先例口径；蓝图未要求字节级更严）
-    excerpt: typeof m.content === 'string' ? m.content.slice(0, EXPORT_EXCERPT_MAX) : ''
+    // 内容摘要：200 码元截断（xbk_app.js:293 先例口径；蓝图未要求字节级更严）。
+    // 截断点落在代理对中间（末码元是孤立高代理）时回退一码元——劈开的 emoji 经
+    // JSON.stringify 转义为孤立代理（ES2019 well-formed），CSV UTF-8 编码则变 U+FFFD，
+    // 消费方拿到的是半个字符（评审 231-M6）。
+    excerpt: typeof m.content === 'string' ? excerptTruncated(m.content, EXPORT_EXCERPT_MAX) : ''
   }
 }
 
@@ -1140,13 +1174,20 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
 
   // 幂等清理：clearInterval + 摘除登记 + res.end()。res 'close'/'error'/积压超限/关停
   // 广播/完结收尾全走这里（蓝图防线 5：close 必清理，防 Set 泄漏）。
-  // abort=true（积压超限）：end 后再 destroy socket——慢客户端硬断（蓝图「直接断开」），
-  // 客户端 onerror → 整段重拉自愈；正常路径（done/对端关闭）只 end，FIN 干净收尾。
+  // 正常路径（done/对端关闭/关停广播）end 前先 flush pending——done 帧可能刚被
+  // sseWriteFrame 排进队列（背压分支），不 flush 客户端就收不到终结事件（评审 231-M2）；
+  // abort=true（积压超限）不 flush：待发积压本就超限，flush 只会继续喂慢客户端，
+  // 直接 end + destroy——慢客户端硬断（蓝图「直接断开」），onerror → 整段重拉自愈。
   const sseTeardown = (conn, abort = false) => {
     if (conn.closed) return
     conn.closed = true
     clearInterval(conn.timer)
     sseConnections.delete(conn)
+    if (!abort && conn.pending.length > 0) {
+      try { conn.res.write(conn.pending) } catch (e) { /* 已断开，end 兜底 */ }
+      conn.pending = ''
+      conn.pendingBytes = 0
+    }
     try { conn.res.end() } catch (e) { /* 已断开 */ }
     if (abort) { try { conn.res.socket && conn.res.socket.destroy() } catch (e) { /* 已断开 */ } }
   }
@@ -1446,9 +1487,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (format === 'json') {
             // 仅截断时下发该头；未截断不下发（缺席=完整，测试断言 undefined）。
             if (truncated) res.setHeader('X-Export-Truncated', 'true')
-            // grandTotal 此处=过滤后总数；/api/messages 同名字段=未过滤总数（read.value.total）
-            // ——同名两义，前端「共 N 条」展示只能用 /api/messages 的响应（审查 3.2-N2）。
-            sendJson(res, 200, { status: 'ok', total: rows.length, grandTotal: filtered.length, truncated, items: rows })
+            // 成功导出=直接数组（文档口径「JSON 形态直出数组」，评审 231-M1）：消费方
+            // JSON.parse 即得行数组，无需剥 items。截断信息走 X-Export-Truncated 头，
+            // 不进响应体（形态纯度优先；三态响应才是 {status,...} 对象，前端按
+            // Array.isArray 区分成功/三态——评审 231-H1）。
+            const body = JSON.stringify(rows)
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="messages-export.json"' })
+            res.end(body)
             return
           }
           const head = {
@@ -1679,11 +1724,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 连接数闸：第 9 个 503（蓝图防线 3；Set 登记 + close 必清理在上方连接管理块）。
       if (sseConnections.size >= SSE_MAX_CONNECTIONS) { sendJson(res, 503, { error: 'SSE 连接数已达上限' }); return }
       // since 钳制（蓝图红线：Number + 整数 + 非负）：非法一律钳 0 → 客户端收整段，自愈。
+      // 越界（> outputTotalLength）钳到当前尾部（评审 231-M3）：保留超前游标会让
+      // ssePlanChunk 恒 null，后续真实输出被吞到游标追上为止——客户端错过内容。
       // 缺省 = 从当前快照尾部开始（绝对偏移 = outputTotalLength，增量只发新数据）。
       let cursor
       if (url.searchParams.has('since')) {
         const n = Number(url.searchParams.get('since'))
-        cursor = Number.isSafeInteger(n) && n >= 0 ? n : 0
+        cursor = Number.isSafeInteger(n) && n >= 0 ? Math.min(n, record.outputTotalLength) : 0
       } else {
         cursor = record.outputTotalLength
       }

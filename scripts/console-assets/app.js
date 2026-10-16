@@ -583,6 +583,10 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
     // ── SSE 模式：先取轮询快照，以快照 outputTotalLength 为初始游标建流（顺序不可倒置，
     // 快照先落 detail 再开流，快照后新增量由首个 tick 补发——不重不漏，见 §2 D5）。
     const seq = ++detailSeqRef.current
+    // 流代次号（评审 231-M4）：本 effect 运行 = 新一代。旧流的排队回调（同一 run 关了
+    // 又开的场景：prev.id===openId 仍命中）必须凭代次失效——seq 是闭包值，回调比对
+    // detailSeqRef.current 即可判「自己是否仍是当前代」。
+    const mySeq = seq
     apiGetRunDetail(openId).then((d) => {
       if (dead || seq !== detailSeqRef.current) return
       setDetail(d)
@@ -595,11 +599,13 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
       // （页面加载即下发，authorize GET 收 Cookie）；token 进 URL 会落浏览器历史/访问日志。
       es = new window.EventSource(`/api/runs/stream?${params.toString()}`)
       es.onmessage = (ev) => {
-        // 未命名 data 帧 = 增量文本（JSON 字符串）。函数式更新 + 身份护栏，防旧面板串写。
+        // 未命名 data 帧 = 增量文本（JSON 字符串）。函数式更新 + 身份护栏（prev.id 匹配
+        // + 代次守卫：陈旧流回调在「同 run 关闭重开」场景 prev.id 仍命中，必须再验
+        // mySeq===detailSeqRef.current，评审 231-M4）。
         try {
           const chunk = JSON.parse(ev.data)
           if (typeof chunk === 'string' && chunk.length > 0) {
-            setDetail((prev) => (prev !== null && prev.id === openId ? { ...prev, output: (prev.output || '') + chunk } : prev))
+            setDetail((prev) => (prev !== null && prev.id === openId && mySeq === detailSeqRef.current ? { ...prev, output: (prev.output || '') + chunk } : prev))
           }
         } catch (e) { /* 坏帧忽略：最终快照/重拉自愈 */ }
       }
@@ -608,7 +614,7 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
         try {
           const payload = JSON.parse(ev.data)
           if (payload && typeof payload.full === 'string') {
-            setDetail((prev) => (prev !== null && prev.id === openId ? { ...prev, output: payload.full } : prev))
+            setDetail((prev) => (prev !== null && prev.id === openId && mySeq === detailSeqRef.current ? { ...prev, output: payload.full } : prev))
           }
         } catch (e) { /* 同上 */ }
       })
@@ -951,14 +957,22 @@ function MessagesPanel () {
       const ct = String(res.headers.get('content-type') || '')
       const blob = await res.blob()
       if (ct.startsWith('application/json')) {
-        // 三态（missing/invalid/tooLarge）走 JSON 下发：不下载空文件，如实提示。
-        let status = 'unknown'
-        try { status = JSON.parse(await blob.text()).status || 'unknown' } catch (e) { /* 保留 unknown */ }
-        setExportErr(`记录暂不可导出（${status}）`)
-        return
+        // application/json 两种含义（评审 231-H1）：三态（missing/invalid/tooLarge）=
+        // {status,...} 对象 → 不下载、如实提示；成功导出 = 行数组 → 照常下载。
+        // 按 Array.isArray 区分（成功形态 231-M1 已改为直接数组）。
+        let parsed = null
+        try { parsed = JSON.parse(await blob.text()) } catch (e) { parsed = null }
+        if (!Array.isArray(parsed)) {
+          const status = parsed && typeof parsed.status === 'string' ? parsed.status : 'unknown'
+          setExportErr(`记录暂不可导出（${status}）`)
+          return
+        }
+        if (res.headers.get('x-export-truncated') === 'true') setExportNote('匹配结果超过上限，导出已截断')
+        url = URL.createObjectURL(new Blob([JSON.stringify(parsed)], { type: 'application/json' }))
+      } else {
+        if (res.headers.get('x-export-truncated') === 'true') setExportNote('匹配结果超过上限，导出已截断')
+        url = URL.createObjectURL(blob)
       }
-      if (res.headers.get('x-export-truncated') === 'true') setExportNote('匹配结果超过上限，导出已截断')
-      url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
       a.download = format === 'csv' ? 'messages-export.csv' : 'messages-export.json'
@@ -969,7 +983,10 @@ function MessagesPanel () {
       setExportErr(`导出失败：${e && e.message ? e.message : e}`)
     } finally {
       done() // body（blob/text）消费完才清 8s 期限（Sourcery Stalled-bodies 同口径）
-      if (url !== '') URL.revokeObjectURL(url)
+      // revoke 延迟到 click 之后一拍（评审 231-M5）：浏览器解析下载是异步的，同步
+      // revoke 会让 deferred download 拿不到 blob。1 分钟后回收（URL 规范建议的
+      // 「延迟 revoke」口径，内存占用一次性、不累积）。
+      if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, 60000)
       setExporting('')
     }
   }, [exporting, cate, query])
