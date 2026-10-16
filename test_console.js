@@ -20,8 +20,16 @@ const {
   acquireLock, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
-  buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX
+  buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
+  sanitizeAccessPath, shouldLogAccess, ACCESS_LOG_MAX,
+  filterMessageItems, clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
+  EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
+  RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS
 } = require('./scripts/console')
+const { readMessages } = require('./scripts/status')
+// 导出端点的读取上限（console.js 内部常量，与 MESSAGES_MAX_BYTES 同值）：
+// MI2 tooLarge 用例按同一口径构造超限 fixture。
+const MESSAGES_MAX_BYTES = 32 * 1024 * 1024
 
 let passed = 0
 let failed = 0
@@ -327,6 +335,170 @@ ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）
   assert.ok(true)
 })
 
+// ── v3.300 访问日志：纯函数表（无 HTTP；端到端用例见下方 T1-T7）──
+ok('sanitizeAccessPath: token 脱敏不动点 + 解码复洗 2 轮（蓝图 §3.3 防线 1）', () => {
+  // 分隔符保留：查询串形状不破坏
+  assert.strictEqual(sanitizeAccessPath('/x?token=a&b=1'), '/x?token=***&b=1')
+  // 重复 token 参数逃逸：迭代清洗到不动点
+  assert.strictEqual(sanitizeAccessPath('/x?a=1&token=x1&token=y2'), '/x?a=1&token=***&token=***')
+  // 编码键名 %74oken= → 解码后复洗（返回解码形态，内容已 *** 化）
+  assert.strictEqual(sanitizeAccessPath('/x?%74oken=z3'), '/x?token=***')
+  // 双层编码 %2574oken= → 2 轮解码复洗（D6）
+  assert.ok(sanitizeAccessPath('/x?%2574oken=z4').includes('token=***'), '双层编码键名也洗出 token=***')
+  assert.ok(!sanitizeAccessPath('/x?%2574oken=z4').includes('z4'), '原文不得残留')
+  // 畸形 % 序列（URIError）→ 原串（已洗）兜底，不抛
+  assert.strictEqual(sanitizeAccessPath('/x?aa=%zz'), '/x?aa=%zz')
+  // 键名形态纵深（审查 3.3-M1）：大小写变体与 ;/# 分隔符形态同洗（键名在输出中统一为
+  // 小写 token=*** ——替换字面量形态，与 %74oken= 既有口径一致）；普通含 ;-# 路径不误伤
+  assert.strictEqual(sanitizeAccessPath('/x?Token=k1'), '/x?token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?TOKEN=k1'), '/x?token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?a=1;token=k1'), '/x?a=1;token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?frag#token=k1'), '/x?frag#token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?%54oken=k1'), '/x?token=***', '编码键名 %54oken= 解码为 Token= 后复洗')
+  assert.strictEqual(sanitizeAccessPath('/x?a;1&b#2'), '/x?a;1&b#2', '无 token 的 ;/# 路径原样（不误伤）')
+  // null → ''；无 % 无 token 的普通路径原样
+  assert.strictEqual(sanitizeAccessPath(null), '')
+  assert.strictEqual(sanitizeAccessPath('/plain'), '/plain')
+})
+ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/access-log 自身照记）', () => {
+  const cases = [
+    [['GET', '/api/status', 200], false],
+    [['GET', '/api/status', 500], true],
+    [['GET', '/api/runs', 200], false],
+    [['GET', '/api/runs/1750000000000.9', 200], false],
+    [['GET', '/api/runs/1750000000000.9', 404], true],
+    [['POST', '/api/runs/detail', 200], false],
+    [['POST', '/api/runs/detail', 401], true],
+    [['GET', '/assets/app.css', 200], false],
+    [['GET', '/', 200], false],
+    [['GET', '/api/access-log', 200], true],
+    [['POST', '/api/messages/export', 200], true],
+    [['POST', '/messages/export', 400], true],
+    [['POST', '/trigger', 202], true]
+  ]
+  for (const [args, want] of cases) {
+    assert.strictEqual(shouldLogAccess(...args), want, `shouldLogAccess(${args.join(', ')}) 应为 ${want}`)
+  }
+  assert.strictEqual(ACCESS_LOG_MAX, 200, '环形上限常量 = 200')
+})
+
+// ── v3.300 批次③ 3.1 SSE：纯函数（同步，直接 require 新导出）──
+ok('T-P1 ssePlanChunk 全分支（增量/reset/边界/无新数据/超前游标/孤立代理/连续不重不漏）', () => {
+  // 正常增量：多字节逐码元（中文=1 码元、🐮=2 码元）
+  const inc = ssePlanChunk(2, 'AB中文🐮', 6)
+  assert.deepStrictEqual(inc, { reset: false, text: '中文🐮', cursor: 6 })
+  assert.strictEqual(inc.text.length, 4)
+  // reset：游标落后淘汰点（lost=7）
+  assert.deepStrictEqual(ssePlanChunk(3, 'CDE', 10), { reset: true, text: 'CDE', cursor: 10 })
+  // 边界 cursor === lost：数据恰从游标起，不误发 reset
+  const edge = ssePlanChunk(7, 'CDE', 10)
+  assert.strictEqual(edge.reset, false)
+  assert.strictEqual(edge.text, 'CDE')
+  assert.strictEqual(edge.cursor, 10)
+  // 无新数据 / 超前游标 → null
+  assert.strictEqual(ssePlanChunk(10, 'CDE', 10), null)
+  assert.strictEqual(ssePlanChunk(12, 'CDE', 10), null)
+  // 孤立代理（环形淘汰劈对模拟）：reset 分支 text 原样含孤立低代理 + well-formed JSON 往返无损
+  const lone = ssePlanChunk(0, '\uDF6B牛', 4)
+  assert.strictEqual(lone.reset, true)
+  assert.strictEqual(lone.text, '\uDF6B牛')
+  assert.strictEqual(JSON.parse(JSON.stringify({ full: '\uDF6B' })).full, '\uDF6B', 'well-formed JSON.stringify/parse 往返无损')
+  // 连续增量不重不漏：模拟 5 段追加、游标推进
+  let output = ''
+  let total = 0
+  let cursor = 0
+  let received = ''
+  for (const piece of ['你好', '世界', '🐮栖', 'line\n', 'end']) {
+    output += piece
+    total += piece.length
+    const plan = ssePlanChunk(cursor, output, total)
+    if (plan) {
+      assert.strictEqual(plan.reset, false)
+      received += plan.text
+      cursor = plan.cursor
+    }
+  }
+  assert.strictEqual(received, '你好世界🐮栖line\nend', '连续增量拼接 === 全串')
+})
+ok('T-P2 SSE 常量与 RUN_ID_RE 形态', () => {
+  assert.strictEqual(SSE_MAX_CONNECTIONS, 8)
+  assert.strictEqual(SSE_MAX_PENDING, 1048576)
+  assert.strictEqual(SSE_TICK_MS, 500)
+  assert.strictEqual(SSE_HEARTBEAT_MS, 15000)
+  assert.strictEqual(RUN_ID_RE.test('1750000000000.1'), true)
+  assert.strictEqual(RUN_ID_RE.test('abc'), false)
+  assert.strictEqual(RUN_ID_RE.test('1750.1'), false)
+  assert.strictEqual(RUN_ID_RE.test('1750000000000..'), false)
+  assert.strictEqual(RUN_ID_RE.test('1750000000000.12345678901'), false)
+})
+
+// ── v3.300 批次③ 3.2 消息导出：纯函数（同步，直接 require 新导出）──
+ok('T-P0 导出常量: 5000 行钳制 / 200 码元摘要 / format 白名单冻结', () => {
+  assert.strictEqual(EXPORT_MAX_ROWS, 5000)
+  assert.strictEqual(EXPORT_EXCERPT_MAX, 200)
+  assert.deepStrictEqual(EXPORT_FORMATS, ['csv', 'json'])
+  assert.strictEqual(Object.isFrozen(EXPORT_FORMATS), true, '白名单冻结（防运行期扩表）')
+})
+ok('T-P1 csvCell: 公式中性化 + RFC4180 包裹（先中性化后包裹）', () => {
+  // 中性化：危险首字符（跳过 spreadsheet 忽略的前导字符）前置 '
+  assert.strictEqual(csvCell('=1+1'), "'=1+1")
+  assert.strictEqual(csvCell('  =1+1'), "'  =1+1", '前导空格保留 + 前缀')
+  assert.strictEqual(csvCell('-2件起批'), "'-2件起批")
+  assert.strictEqual(csvCell('+861****8000'), "'+861****8000")
+  assert.strictEqual(csvCell('@SUM(A1:A9)'), "'@SUM(A1:A9)")
+  assert.strictEqual(csvCell(" '=1+1"), "' '=1+1", '含既有 \' 前缀（spreadsheets 忽略 \'，继续判首字符=1 → 整体加前缀，前缀字符保留）')
+  assert.strictEqual(csvCell('正常文本'), '正常文本', '安全文本原样')
+  assert.strictEqual(csvCell(''), '')
+  assert.strictEqual(csvCell(null), '')
+  assert.strictEqual(csvCell(undefined), '')
+  assert.strictEqual(csvCell('   '), '   ', '纯空白原样（无有效首字符）')
+  // 包裹：含 " , \r \n 任一即整体包裹、内部 " 翻倍
+  assert.strictEqual(csvCell('a,b'), '"a,b"')
+  assert.strictEqual(csvCell('a"b'), '"a""b"')
+  assert.strictEqual(csvCell('a\nb'), '"a\nb"', 'LF 留在引号内')
+  assert.strictEqual(csvCell('a\rb'), '"a\rb"', 'CR 留在引号内')
+  // 中性化与包裹叠加：先加 '（内容层），再因内含 " 包裹（传输层）
+  assert.strictEqual(csvCell('=1+1"x'), '"\'=1+1""x"')
+})
+ok('T-P2 filterMessageItems: cate 精确等值 + needle 双字段大小写不敏感 + 组合', () => {
+  const items = [
+    { title: '牛奶特价', content: '伊利纯牛奶', catename: '好单-日用' },
+    { title: '坐垫', content: 'Cushion 好物', catename: '好单-家用' },
+    { title: '饼干', content: '奥利奥', catename: '' },
+    { title: 'Milk Powder', content: '奶粉', catename: '好单-食品' },
+    { title: '无分类字段', content: 'x' }
+  ]
+  // cate 精确等值 + '(未分类)' 归一（空串与缺失 catename 同归一）
+  assert.deepStrictEqual(filterMessageItems(items, '好单-日用', '').map(m => m.title), ['牛奶特价'])
+  assert.deepStrictEqual(filterMessageItems(items, '(未分类)', '').map(m => m.title), ['饼干', '无分类字段'])
+  // needle 大小写不敏感、title/content 双字段（'伊利纯牛奶'.includes('milk') 为 false——
+  // toLowerCase 只做 ASCII 归一，不转译中文；命中 'milk' 的两条都靠 title 字段）
+  assert.deepStrictEqual(filterMessageItems(items, '', 'milk').map(m => m.title), ['Milk Powder'])
+  assert.deepStrictEqual(filterMessageItems(items, '', 'cushion').map(m => m.title), ['坐垫'])
+  // cate+needle 组合
+  assert.deepStrictEqual(filterMessageItems(items, '好单-食品', 'milk').map(m => m.title), ['Milk Powder'])
+  // 空 cate / 空 needle 直通
+  assert.strictEqual(filterMessageItems(items, '', '').length, 5)
+})
+ok('T-P3 exportRowOf: 五字段白名单 / 缺省回退 / 200 码元截断 / time 拼接 trim', () => {
+  const full = exportRowOf({
+    id: 7,
+    datetime: '2026-10-15',
+    shorttime: '10:00',
+    catename: '好单-日用',
+    title: '标题',
+    content: '正文',
+    price: 12.9,
+    url: '/a/7.html',
+    cateid: '3',
+    shijianchuo: 1000
+  })
+  assert.deepStrictEqual(full, { id: '7', time: '2026-10-15 10:00', cate: '好单-日用', title: '标题', excerpt: '正文' })
+  const missing = exportRowOf({ content: 'x'.repeat(250) })
+  assert.deepStrictEqual(missing, { id: '', time: '', cate: '(未分类)', title: '', excerpt: 'x'.repeat(200) }, 'id 缺失→\'\'; cate 缺失→(未分类); time 双缺省 trim→\'\'; 摘要 200 码元截断')
+  assert.strictEqual(exportRowOf({ id: 'abc' }).id, 'abc', 'string id 原样 String')
+})
+
 // ── HTTP 端到端 ──
 function listen (server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)))
@@ -367,6 +539,71 @@ function rawRequest (port, raw) {
     sock.on('error', (e) => { clearTimeout(to); finish() })
   })
 }
+
+// ── SSE 增量收集 helper（v3.300 3.1）──
+// request() 等 'end' 不适用于长连接（有心跳永不 end）。打开流 → 按 '\n\n' 分帧 →
+// event/data 解析（未命名帧 event='message'；':' 注释帧跳过）→ waitFor(谓词, 超时)
+// 轮询已收事件（25ms 步进，不用 sleep 猜时序）→ pause()/resume() 模拟慢客户端
+// （T10 背压）→ close() 主动断。
+function sseCollect (port, urlPath, { headers } = {}) {
+  const events = []
+  let raw = ''
+  let ended = false
+  let resRef = null
+  const req = http.request({ host: '127.0.0.1', port, path: urlPath, headers: headers || {} }, (res) => {
+    resRef = res
+    res.setEncoding('utf8')
+    res.on('data', (c) => {
+      raw += c
+      let idx
+      while ((idx = raw.indexOf('\n\n')) >= 0) {
+        const frame = raw.slice(0, idx)
+        raw = raw.slice(idx + 2)
+        if (frame.startsWith(':')) continue // 心跳注释帧
+        let event = 'message'
+        const datas = []
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim()
+          else if (line.startsWith('data:')) datas.push(line.slice(5).trim())
+        }
+        events.push({ event, data: datas.join('\n') })
+      }
+    })
+    res.on('end', () => { ended = true })
+  })
+  req.on('error', () => { ended = true })
+  req.end()
+  const waitFor = async (pred, ms = 5000) => {
+    const to = Date.now() + ms
+    // S7727：pred 直传 some 会把「index/array」作第 2/3 参泄漏给谓词——包一层单参箭头。
+    while (Date.now() < to) {
+      if (events.some((e) => pred(e))) return true
+      await new Promise((_resolve) => setTimeout(_resolve, 25))
+    }
+    return events.some((e) => pred(e))
+  }
+  const close = () => {
+    try { if (resRef) resRef.destroy() } catch (e) { /* 已断 */ }
+    try { req.destroy() } catch (e) { /* 已断 */ }
+  }
+  // 慢客户端模拟：暂停 socket 读（服务端 write 返回 false → 背压）与恢复（drain）。
+  const pause = () => { try { if (resRef) resRef.socket.pause() } catch (e) { /* 已断 */ } }
+  const resume = () => { try { if (resRef) resRef.socket.resume() } catch (e) { /* 已断 */ } }
+  // 等响应头到达（resRef 就绪）——T10 要在服务端任何 body 帧写出前暂停 socket。
+  const ready = async (ms = 5000) => {
+    const to = Date.now() + ms
+    while (Date.now() < to) {
+      if (resRef !== null) return true
+      await new Promise((_resolve) => setTimeout(_resolve, 10))
+    }
+    return resRef !== null
+  }
+  return { events, waitFor, close, pause, resume, ready, isEnded: () => ended }
+}
+// 注入式 fake record（cancel 用例同先例）+ 与生产 append 同语义的测试追加器
+// （output 与 outputTotalLength 必须同步——镜像生产约束）。
+const makeStreamRecord = (id) => ({ id, action: 'check', label: 'x', startedAt: Date.now(), finishedAt: 0, exitedAt: 0, exitCode: null, timedOut: false, cancelled: false, output: '', outputTotalLength: 0 })
+const streamAppend = (record, text) => { record.output += text; record.outputTotalLength += text.length }
 
 const TOKEN = 'x'.repeat(32)
 
@@ -654,6 +891,254 @@ async function main () {
     assert.strictEqual(invalid.status, 'invalid', '坏 JSON 必须 invalid')
     s2.close()
   })
+  // ── v3.300 批次③ 3.2：POST /api/messages/export 端到端 ──
+  await aok('T1 导出鉴权: 无凭证/错凭证/仅 Cookie → 401（POST 不收 Cookie）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const noAuth = await request(port, 'POST', '/api/messages/export', { body: 'format=json' })
+    assert.strictEqual(noAuth.status, 401)
+    const badAuth = await request(port, 'POST', '/api/messages/export', { token: 'y'.repeat(32), body: 'format=json' })
+    assert.strictEqual(badAuth.status, 401)
+    // 仅 Cookie（POST 不走 Cookie 会话路径，authorize :637 显式排除）
+    const cookieOnly = await request(port, 'POST', '/api/messages/export', { headers: { cookie: `xbk_session=${TOKEN}` }, body: 'format=json' })
+    assert.strictEqual(cookieOnly.status, 401, 'POST 不得凭 Cookie 放行')
+    server.close()
+  })
+  await aok('T2 format 白名单: xml/缺省 → 400；GET 同路径 → 404 兜底', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const xml = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=xml' })
+    assert.strictEqual(xml.status, 400)
+    const noFmt = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'cate=' })
+    assert.strictEqual(noFmt.status, 400, '缺 format 必须 400')
+    const get = await request(port, 'GET', '/api/messages/export', { token: TOKEN })
+    assert.strictEqual(get.status, 404, '方法不匹配走 404 兜底')
+    server.close()
+  })
+  await aok('T3 CSV 转义三形态 + BOM + 响应头（全串比对，拒绝 naive split）', async () => {
+    const dir = tmpDir()
+    const msgs = [
+      { id: 1, title: '  =1+1', content: '牛奶', catename: '好单-日用', shijianchuo: 1000, datetime: '2026-10-15', shorttime: '10:00' },
+      { id: 2, title: '@SUM(A1:A9)', content: '饼干', catename: '好单-食品', shijianchuo: 2000, datetime: '2026-10-15', shorttime: '12:00' },
+      { id: 3, title: '含,引号"换行\n测试', content: '奥利奥', catename: '好单-食品', shijianchuo: 3000, datetime: '2026-10-15', shorttime: '11:00' },
+      { id: 4, title: '-2件起批', content: '正常', catename: '好单-日用', shijianchuo: 4000, datetime: '2026-10-15', shorttime: '13:00' }
+    ]
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(msgs))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const res = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=csv' })
+    assert.strictEqual(res.status, 200)
+    // 响应头（Node 出站头小写化）
+    assert.strictEqual(res.headers['content-type'], 'text/csv; charset=utf-8')
+    assert.strictEqual(res.headers['content-disposition'], 'attachment; filename="messages-export.csv"', '文件名固定字面量')
+    assert.strictEqual(res.headers['x-export-truncated'], undefined, '未截断不下发该头')
+    // BOM（request() 收 utf8 字符串，BOM 呈 U+FEFF）
+    assert.strictEqual(res.text.charCodeAt(0), 0xFEFF, 'CSV 必须以 UTF-8 BOM 开头')
+    // 全串比对（第 3 条标题含逗号/引号/换行，naive split 会碎行）：
+    // fixture 倒序 = shijianchuo 降序 → 行序 4,3,2,1
+    const expected = [
+      '\uFEFFid,时间,分类,标题,内容摘要',
+      '4,2026-10-15 13:00,好单-日用,\'-2件起批,正常',
+      '3,2026-10-15 11:00,好单-食品,"含,引号""换行\n测试",奥利奥',
+      '2,2026-10-15 12:00,好单-食品,\'@SUM(A1:A9),饼干',
+      '1,2026-10-15 10:00,好单-日用,\'  =1+1,牛奶',
+      ''
+    ].join('\r\n')
+    assert.strictEqual(res.text, expected, 'CSV 全串逐字符一致（含引号内真实 LF）')
+    // 附件出口（writeHead+end）入日志（蓝图 §3.2 防线 5 + §3.3 测试清单末条；审查 3.2-MA2 / 3.3-M2）：
+    // 真附件 200 导出走 res.writeHead+end 附件出口（非 sendJson），finish 钩子必须同样覆盖。
+    const attachLog = JSON.parse((await request(port, 'GET', '/api/access-log', { token: TOKEN })).text)
+    const attachHit = [...attachLog.items].reverse().find((it) => it.path === '/api/messages/export')
+    assert.ok(attachHit && attachHit.method === 'POST' && attachHit.status === 200, 'CSV 附件出口（writeHead+end，非 sendJson）必须入访问日志')
+    server.close()
+  })
+  await aok('T4 5000 钳制 + X-Export-Truncated: 5010 条截断/30 条不出头/展示分页互不干扰', async () => {
+    const dir = tmpDir()
+    const big = []
+    for (let i = 0; i < 5010; i++) {
+      big.push({ id: i + 1, title: `条目${i + 1}`, content: '内容', catename: '好单-日用', shijianchuo: 1000000 - i, datetime: '2026-10-15', shorttime: '10:00' })
+    }
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(big))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const j = JSON.parse((await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })).text)
+    // 成功导出 = 直接数组（评审 231-M1）；截断信息走 X-Export-Truncated 头（不进体）。
+    assert.ok(Array.isArray(j), '成功 JSON 导出必须是直接数组')
+    assert.strictEqual(j.length, EXPORT_MAX_ROWS, '恰 5000 行（截断）')
+    assert.strictEqual(typeof j[0].title, 'string', '元素=行对象')
+    const jr = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    assert.strictEqual(jr.headers['x-export-truncated'], 'true', 'JSON 分支同样下发截断头')
+    const c = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=csv' })
+    assert.strictEqual(c.headers['x-export-truncated'], 'true', 'CSV 分支同样下发截断头')
+    // 该 fixture 单元格无逗号/引号，允许 naive split：表头 + 5000 行 + 尾 \r\n = 5002 段
+    assert.strictEqual(c.text.split('\r\n').length, 5002)
+    // 对照：30 条 fixture 不出头
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'push.json'), JSON.stringify(big.slice(0, 30)))
+    const { server: s2 } = createConsole({ token: TOKEN, stateDir: dir2 })
+    const port2 = await listen(s2)
+    const small = JSON.parse((await request(port2, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })).text)
+    assert.ok(Array.isArray(small) && small.length === 30, '30 条子集=30 行数组（评审 231-M1 形态）')
+    const smallRes = await request(port2, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    assert.strictEqual(smallRes.headers['x-export-truncated'], undefined, '未截断时头缺席（缺席=完整）')
+    // 展示分页与导出钳制互不干扰（审查 3.2-MI1）：对 5010 条 fixture（同一 server）断言
+    // size=100 → 恰 100 条且 total=5010——「size 超限被钳回 100」的正向锁，30 条子集断 ≤100 恒真无检出力。
+    const page = JSON.parse((await request(port, 'GET', '/api/messages?size=100', { token: TOKEN })).text)
+    assert.strictEqual(page.items.length, 100, '展示分页 size=100 → 恰 100 条（钳制仍生效）')
+    assert.strictEqual(page.total, 5010, 'total=过滤后全量（与导出 grandTotal 同 fixture 一致）')
+    // 30 条对照（未截断出口的口径不变）：size=100 无钳制效果，仍全量 30 条
+    const page2 = JSON.parse((await request(port2, 'GET', '/api/messages?size=100', { token: TOKEN })).text)
+    assert.strictEqual(page2.items.length, 30)
+    s2.close()
+    server.close()
+  })
+  await aok('T5 JSON 字段白名单: 恰五键，内部字段零携带', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([
+      { id: 9, title: '标题', content: '正文', catename: '好单-日用', shijianchuo: 500, datetime: '2026-10-15', shorttime: '10:00', price: 9.9, url: '/a/9.html', cateid: '3', content_html: '<img src=x>', _f: false }
+    ]))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const res = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    const j = JSON.parse(res.text)
+    assert.ok(Array.isArray(j), '成功 JSON 导出=直接数组（评审 231-M1）')
+    assert.deepStrictEqual(Object.keys(j[0]).sort((a, b) => a.localeCompare(b)), ['cate', 'excerpt', 'id', 'time', 'title'], '恰五键')
+    const raw = JSON.stringify(j[0])
+    for (const k of ['url', 'price', 'cateid', 'content_html', 'shijianchuo', '_f', 'rowKey', 'datetime', 'shorttime']) {
+      assert.ok(!raw.includes(`"${k}"`), `不得携带内部字段 ${k}`)
+    }
+    assert.strictEqual(j[0].id, '9', 'id 为字符串形态')
+    server.close()
+  })
+  await aok('T6 中文 q 跨 chunk 多字节（readBody StringDecoder 回归）+ GET 对照一致', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([
+      { id: 1, title: '牛奶特价', content: '伊利', catename: '好单-日用', shijianchuo: 1000, datetime: '2026-10-15', shorttime: '10:00' },
+      { id: 2, title: '面包', content: '烘焙', catename: '好单-食品', shijianchuo: 2000, datetime: '2026-10-15', shorttime: '11:00' }
+    ]))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // 自建 http.request 两次 write：'format=json&q=' 长 14 字节，牛 = E7 89 9B，
+    // 在偏移 15（牛 的第 1 字节后）切开，其余字节走第二段——跨 chunk 多字节切分回归锁。
+    const full = Buffer.from('format=json&q=牛奶', 'utf8')
+    const parts = [full.subarray(0, 15), full.subarray(15)]
+    assert.strictEqual(Buffer.concat(parts).equals(full), true, '分片还原自检')
+    const body = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/api/messages/export', headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: `Bearer ${TOKEN}`, 'content-length': full.length } }, (res2) => {
+        let buf = ''
+        res2.on('data', c => { buf += c })
+        res2.on('end', () => resolve({ status: res2.statusCode, text: buf, headers: res2.headers }))
+      })
+      req.on('error', reject)
+      req.write(parts[0])
+      // 两次 write 间插 10ms（审查 3.2-MA1）：背靠背 write 会被 Node 客户端合并成单 chunk
+      // （分片不存在、新旧实现同绿=假绿）；间隔后服务端稳定收 [15,5] 两个 data 事件，
+      // 旧实现（逐 chunk toString）会产出 U+FFFD，套件对回滚真正变红。
+      // 反向验证实测：5ms 在旧 readBody 副本上仍有 ~9% 合并逃逸（单进程 53 次中 5 次旧实现照绿），
+      // 10ms 跨单进程/进程内两形态 55 次 0 逃逸；对正确实现 [15,5]/[20] 都命中 牛奶特价，
+      // 加长间隔无假红代价。用链式回调（Promise 构造回调非 async）。
+      setTimeout(() => { req.write(parts[1]); req.end() }, 10)
+    })
+    assert.strictEqual(body.status, 200)
+    const j = JSON.parse(body.text)
+    assert.ok(Array.isArray(j), '成功 JSON 导出=直接数组')
+    assert.strictEqual(j.length, 1)
+    assert.strictEqual(j[0].title, '牛奶特价')
+    // clampQueryBytes 直测：恰 240 字节的中文词不截（牛=E7 89 9B，80 字恰 240B），81 字起截尾
+    assert.strictEqual(clampQueryBytes('牛'.repeat(80)), '牛'.repeat(80))
+    assert.strictEqual(clampQueryBytes('牛'.repeat(81)), '牛'.repeat(80))
+    // GET 对照：导出与页面过滤同源（同 query，同命中）
+    const g = JSON.parse((await request(port, 'GET', `/api/messages?q=${encodeURIComponent('牛奶')}`, { token: TOKEN })).text)
+    assert.strictEqual(g.items.length, 1)
+    assert.strictEqual(String(g.items[0].id), j[0].id, '导出与列表过滤同源')
+    server.close()
+  })
+  await aok('T-P4 buildMessagesCsv: 表头固定字面量 + 行序 + 尾 \\r\\n（确定性输出）', () => {
+    const csv = buildMessagesCsv([
+      { id: '1', time: 't1', cate: 'c1', title: 'x', excerpt: 'e1' },
+      { id: '2', time: 't2', cate: 'c2', title: 'y,z', excerpt: 'e2' }
+    ])
+    assert.strictEqual(csv, 'id,时间,分类,标题,内容摘要\r\n1,t1,c1,x,e1\r\n2,t2,c2,"y,z",e2\r\n')
+  })
+  await aok('T7 谓词复用一致性: 导出与 GET /api/messages 同筛选 id 序列一致', async () => {
+    const dir = tmpDir()
+    const msgs = [
+      { id: 1, title: '牛奶特价', content: '伊利', catename: '好单-日用', shijianchuo: 1000, datetime: '2026-10-15', shorttime: '10:00' },
+      { id: 2, title: '坐垫', content: '好物', catename: '好单-家用', shijianchuo: 2000, datetime: '2026-10-15', shorttime: '12:00' },
+      { id: 3, title: '饼干', content: '奥利奥', catename: '好单-食品', shijianchuo: 3000, datetime: '2026-10-15', shorttime: '11:00' }
+    ]
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(msgs))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const cases = [
+      ['cate=好单-日用', 'cate=' + encodeURIComponent('好单-日用')],
+      ['q=牛奶', 'q=' + encodeURIComponent('牛奶')],
+      ['cate=好单-食品&q=饼干', 'cate=' + encodeURIComponent('好单-食品') + '&q=' + encodeURIComponent('饼干')]
+    ]
+    for (const [exportBody, getListQs] of cases) {
+      const j = JSON.parse((await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: `format=json&${exportBody}` })).text)
+      const g = JSON.parse((await request(port, 'GET', `/api/messages?${getListQs}`, { token: TOKEN })).text)
+      assert.deepStrictEqual(j.map(m => m.id), g.items.map(m => String(m.id)), `筛选「${exportBody}」两侧 id 序列一致`)
+    }
+    server.close()
+  })
+  await aok('T8 读取三态: missing/invalid/tooLarge → 200 + application/json + items 空（前端不下载判据）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const missing = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    assert.strictEqual(missing.status, 200)
+    assert.ok(missing.headers['content-type'].startsWith('application/json'), 'JSON 判据：前端不下载')
+    const mj = JSON.parse(missing.text)
+    assert.strictEqual(mj.status, 'missing')
+    assert.deepStrictEqual(mj.items, [])
+    server.close()
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'push.json'), '{broken json')
+    const { server: s2 } = createConsole({ token: TOKEN, stateDir: dir2 })
+    const port2 = await listen(s2)
+    const invalid = await request(port2, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=csv' })
+    assert.strictEqual(invalid.status, 200)
+    assert.ok(invalid.headers['content-type'].startsWith('application/json'), 'CSV 请求的三态同样走 JSON 提示（不下载空文件）')
+    assert.strictEqual(JSON.parse(invalid.text).status, 'invalid')
+    // 三态（invalid）出口入日志（蓝图 §3.2 防线 5 + §3.3 测试清单末条；审查 3.2-MA2 / 3.3-M2）：
+    // 本断言锁定的是 invalid 三态的 sendJson(res,200,{status:'invalid'}) 出口；
+    // 真附件 200 的 writeHead+end 附件出口由 T3 锁定（其 finish 钩子覆盖）。
+    // shouldLogAccess 白名单无此端点 → 200 也照记；path 无查询词、body 不入。
+    const exLog = JSON.parse((await request(port2, 'GET', '/api/access-log', { token: TOKEN })).text)
+    const exHit = [...exLog.items].reverse().find((it) => it.path === '/api/messages/export')
+    assert.ok(exHit, `导出响应必须入访问日志（实际 ${JSON.stringify(exLog.items.map((i) => i.path))}）`)
+    assert.strictEqual(exHit.method, 'POST')
+    assert.strictEqual(exHit.status, 200)
+    const exFlat = JSON.stringify(exLog.items)
+    assert.ok(!exFlat.includes('format=csv'), 'body/查询词不落访问日志（只记 method+path）')
+    s2.close()
+    // 第三态 tooLarge（审查 3.2-MI2；评审 231-T8 改真端点）：push.json > 32MiB 时
+    // export 端点与 missing/invalid 共用同一 `read.status !== 'ok'` 分支如实下发。
+    // 直调 readMessages 只能锁「函数行为」，锁不住路由（route 回退成功文件的回归
+    // 依然全绿）——必须真发 POST /api/messages/export 断言 JSON 三态响应。
+    const dirBig = tmpDir()
+    fs.writeFileSync(path.join(dirBig, 'push.json'), Buffer.alloc(MESSAGES_MAX_BYTES + 1, 0x61))
+    const readBig = readMessages(dirBig, { maxBytes: MESSAGES_MAX_BYTES, filename: 'push.json' })
+    assert.deepStrictEqual(readBig, { status: 'tooLarge' }, '>32MiB → tooLarge（不 ok、不 invalid）')
+    const { server: s3 } = createConsole({ token: TOKEN, stateDir: dirBig })
+    const port3 = await listen(s3)
+    const tooBig = await request(port3, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    assert.strictEqual(tooBig.status, 200)
+    assert.ok(tooBig.headers['content-type'].startsWith('application/json'), 'tooLarge 仍走 JSON 三态（不落成功附件）')
+    const tj = JSON.parse(tooBig.text)
+    assert.strictEqual(tj.status, 'tooLarge')
+    assert.deepStrictEqual(tj.items, [])
+    s3.close()
+    fs.rmSync(dirBig, { recursive: true, force: true })
+  })
+  await aok('T9 body 超限 → 400（>4096 字节，与 detail 同款断言）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const big = 'q=' + 'x'.repeat(5000)
+    const r = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: big })
+    assert.strictEqual(r.status, 400)
+    server.close()
+  })
   await aok('HTTP: /api/trends 按日聚合（与 parseLastRun 同一正则口径）', async () => {
     const dir = tmpDir()
     fs.writeFileSync(path.join(dir, 'run.log'), [
@@ -915,6 +1400,419 @@ async function main () {
     // 常量按生产值 3000ms 走）。
     await new Promise((resolve) => setTimeout(resolve, 3400))
     assert.ok(events.includes('SIGKILL'), `宽限后必须 SIGKILL 兜底（events=${events}）`)
+    server.close()
+  })
+  // ── v3.300 批次③ 3.1 SSE 端到端 ──
+  await aok('SSE T1 鉴权与方法：无/错凭证 401；仅 Cookie 放行（GET 收 Cookie）；POST → 404 兜底', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const seed = makeStreamRecord('1750000000000.9')
+    streamAppend(seed, 'seed')
+    runs.set('1750000000000.9', seed)
+    const noAuth = await request(port, 'GET', '/api/runs/stream?id=1750000000000.9')
+    assert.strictEqual(noAuth.status, 401, '无凭证必须 401（不升级连接）')
+    const badAuth = await request(port, 'GET', '/api/runs/stream?id=1750000000000.9&token=' + 'y'.repeat(32))
+    assert.strictEqual(badAuth.status, 401, '错凭证必须 401')
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=0', { headers: { cookie: `xbk_session=${TOKEN}` } })
+    assert.strictEqual(await sse.waitFor(() => sse.events.length > 0), true, '仅 Cookie 必须放行（GET 收 Cookie）')
+    sse.close()
+    const post = await request(port, 'POST', '/api/runs/stream', { token: TOKEN })
+    assert.strictEqual(post.status, 404, 'POST 不匹配 → 落 404 兜底')
+    server.close()
+  })
+  await aok('SSE T2 参数闸：缺 id/坏形态 400、不存在 404、since 非法值 200 且按 0 钳制', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    runs.set('1750000000000.9', makeStreamRecord('1750000000000.9'))
+    const bad1 = await request(port, 'GET', '/api/runs/stream', { token: TOKEN })
+    assert.strictEqual(bad1.status, 400, '缺 id 必须 400')
+    for (const bad of ['abc', '1750.1', '1750000000000..', '1750000000000.-1', '1750000000000.12345678901']) {
+      const r = await request(port, 'GET', `/api/runs/stream?id=${encodeURIComponent(bad)}`, { token: TOKEN })
+      assert.strictEqual(r.status, 400, `坏形态 id「${bad}」必须 400`)
+    }
+    const nf = await request(port, 'GET', '/api/runs/stream?id=1750000000000.999', { token: TOKEN })
+    assert.strictEqual(nf.status, 404, '合法形态不存在 → 404')
+    const seeded = makeStreamRecord('1750000000000.9')
+    streamAppend(seeded, 'hello')
+    runs.set('1750000000000.9', seeded)
+    for (const badSince of ['abc', '-5', '1.5', '1e999']) {
+      const sse = sseCollect(port, `/api/runs/stream?id=1750000000000.9&since=${badSince}`, { headers: { authorization: `Bearer ${TOKEN}` } })
+      assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, `since=${badSince} 钳 0 → 收整段`)
+      const frames = sse.events.filter((e) => e.event === 'message')
+      assert.strictEqual(JSON.parse(frames[0].data), 'hello', `since=${badSince} 首帧=整段（按 0 钳制）`)
+      sse.close()
+    }
+    server.close()
+  })
+  await aok('SSE T3 响应头：event-stream / x-accel-buffering: no / cache-control: no-cache', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    runs.set('1750000000000.9', makeStreamRecord('1750000000000.9'))
+    const head = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, path: '/api/runs/stream?id=1750000000000.9', headers: { authorization: `Bearer ${TOKEN}` } }, (res) => {
+        res.once('data', () => {}) // 触发头到达即可
+        resolve(res)
+      })
+      req.on('error', reject)
+      req.end()
+    })
+    assert.ok(head.headers['content-type'].startsWith('text/event-stream'), 'content-type 前缀 event-stream')
+    assert.strictEqual(head.headers['x-accel-buffering'], 'no')
+    assert.strictEqual(head.headers['cache-control'], 'no-cache')
+    head.destroy()
+    server.close()
+  })
+  await aok('SSE T4 增量推送与游标：since=0 全串 → 追加收增量 → 拼接不重不漏 → close 后 Set 归零', async () => {
+    const dir = tmpDir()
+    const { server, runs, sseConnections } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, '第一段输出\n第二行')
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=0', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, '首帧到达')
+    const f1 = sse.events.find((e) => e.event === 'message')
+    assert.strictEqual(JSON.parse(f1.data), '第一段输出\n第二行', '首帧=快照全串')
+    streamAppend(rec, '第一段增量')
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message' && JSON.parse(e.data) === '第一段增量'), true, '增量帧到达')
+    streamAppend(rec, '第二段增量\n中文🐮多字节')
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message' && e.data.includes('🐮')), true, '多字节增量到达')
+    const all = sse.events.filter((e) => e.event === 'message').map((e) => JSON.parse(e.data)).join('')
+    assert.strictEqual(all, '第一段输出\n第二行第一段增量第二段增量\n中文🐮多字节', '所有 message 帧拼接 === 期望全串（不重不漏）')
+    sse.close()
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && sseConnections.size > 0) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sseConnections.size, 0, 'close 后服务端连接必须清理归零')
+    server.close()
+  })
+  await aok('SSE T5 多字节 since 切片：since=3 → 恰一帧「文🐮」（逐码元，不重不漏）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, 'AB中文🐮') // len 6：A B 中 文 🐮🐮
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=3', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true)
+    const frames = sse.events.filter((e) => e.event === 'message')
+    assert.strictEqual(frames.length, 1, '恰一帧')
+    assert.strictEqual(JSON.parse(frames[0].data), '文🐮')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE M3 超前 since 钳制：since=99999 → 钳到尾部，追加照常收增量（不吞输出）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, 'seed')
+    runs.set('1750000000000.9', rec)
+    // since=99999 > outputTotalLength=4：旧实现保留超前游标 → ssePlanChunk 恒 null，
+    // 追加 '增量' 后（total=7 < 99999）永远无帧；修复后钳到 4，追加即推。
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=99999', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sse.ready(), true, '响应头到达（连接已建立、游标已定）')
+    streamAppend(rec, '增量') // 建流后追加：修复前（保留超前游标）永远无帧
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message' && JSON.parse(e.data) === '增量'), true, '追加后增量帧必须到达（超前游标已钳尾部）')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE M2 背压下 done 不丢：暂停客户端 → 关停广播排队 done → teardown flush（非 abort 路径）', async () => {
+    const dir = tmpDir()
+    const { server, runs, sseConnections } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    rec.output = 'y'.repeat(614400)
+    rec.outputTotalLength = 614400
+    runs.set('1750000000000.9', rec)
+    let raw = ''
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.write(`GET /api/runs/stream?id=1750000000000.9&since=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${TOKEN}\r\n\r\n`)
+      sock.pause() // 无 data 监听：内核收下首帧后服务端 write 返 false → paused
+      const waitConn = setInterval(() => {
+        if (sseConnections.size > 0) {
+          clearInterval(waitConn)
+          runs.delete('1750000000000.9') // 淘汰路径：下个 tick sseWriteFrame(done) 入 pending（paused）→ teardown flush
+        }
+      }, 5)
+    })
+    const to = Date.now() + 15000
+    while (Date.now() < to && sseConnections.size > 0) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sseConnections.size, 0, '关停广播 → 连接摘除')
+    // 判据=读到 done 帧（非 abort 路径 res.end 的 FIN 对暂停客户端不可靠——T10 同教训，
+    // ended 在探针 t10k 实测 5s 不浮出；帧在字节流里即证据）。
+    sock.on('data', (c) => { raw += c })
+    sock.resume()
+    const kick = setInterval(() => { if (!sock.destroyed) sock.resume() }, 20)
+    const to2 = Date.now() + 10000
+    while (Date.now() < to2 && !raw.includes('event: done')) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    clearInterval(kick)
+    assert.strictEqual(raw.includes('event: done'), true, '背压排队的 done 帧经 teardown flush 照常送达')
+    sock.destroy()
+    server.close()
+  })
+  await aok('脱敏 D1 深层编码：三层 %2574oken 与 畸形转义+编码键 同串 → 全 ***（不动点 + 尽力解码）', () => {
+    // 三层编码（%2574oken= → %74oken= → token=）：旧 2 轮上限漏洗
+    // washTokens 语义=键保留、值 ***：三层解码后 token=***（返回解码形态，泄露面为零）
+    assert.strictEqual(sanitizeAccessPath('/api/x?%2574oken=SECRET'), '/api/x?token=***')
+    // 编码 token 键 + 无关畸形转义同串：旧实现 decodeURIComponent 整体抛错提前 return，
+    // 键名保持 %74 形态洗不到；现在尽力解码继续洗（可解段解开——%E0%80 解成裸码点
+    // `à\x80`，SECRET 已洗净即达标；畸形段不解码不丢段）
+    const mixed = sanitizeAccessPath('/api/x?%74oken=SECRET&z=%E0%80')
+    assert.strictEqual(mixed.startsWith('/api/x?token=***&z='), true, 'token 键洗净、可解段已解')
+    assert.ok(!mixed.includes('SECRET'))
+    assert.ok(!mixed.includes('%74oken'), '编码键名不残留')
+  })
+  await aok('代理对 M6/M7：excerpt 截断与 query 钳制均不劈 emoji', () => {
+    // M6：excerpt 边界劈代理对 → 回退一码元（无孤立高代理）
+    const emoji = '🐮'
+    const pad = 'x'.repeat(EXPORT_EXCERPT_MAX - 1)
+    const row = exportRowOf({ content: pad + emoji + 'tail', title: 't' })
+    assert.strictEqual(row.excerpt.length, EXPORT_EXCERPT_MAX - 1, '边界代理对回退一码元')
+    assert.strictEqual(/[\uD800-\uDBFF]$/.test(row.excerpt), false, '末码元不得是孤立高代理')
+    assert.ok(!row.excerpt.includes('tail'), '仍是截断串')
+    // 恰好整对落在界内：不回退
+    const row2 = exportRowOf({ content: 'x'.repeat(EXPORT_EXCERPT_MAX - 2) + emoji, title: 't' })
+    assert.strictEqual(row2.excerpt.endsWith(emoji), true, '完整代理对保留')
+    // M7：query 钳制不残留孤立代理
+    const q = clampQueryBytes('a'.repeat(238) + emoji) // 238+4=242B > 240B → 去到 ≤240
+    assert.strictEqual(/[\uD800-\uDBFF]$/.test(q), false, '钳制结果不得以孤立高代理结尾')
+    assert.ok(Buffer.byteLength(q, 'utf8') <= 240, '仍在字节上限内')
+  })
+  await aok('SSE T6 环形淘汰：游标落后 lost → reset 帧整段重发；对照游标 ≥ lost → 普通增量', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    rec.output = 'y'.repeat(1000)
+    rec.outputTotalLength = 1100 // 模拟已淘汰 100 码元
+    runs.set('1750000000000.9', rec)
+    const sseA = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=50', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sseA.waitFor((e) => e.event === 'reset'), true, 'since=50 < lost=100 → reset')
+    const rf = sseA.events.find((e) => e.event === 'reset')
+    assert.strictEqual(JSON.parse(rf.data).full, rec.output, 'reset 整段=现存缓冲')
+    sseA.close()
+    const sseB = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=150', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sseB.waitFor((e) => e.event === 'message'), true, 'since=150 ≥ lost → 普通增量')
+    assert.strictEqual(sseB.events.some((e) => e.event === 'reset'), false, '不得误发 reset')
+    assert.strictEqual(JSON.parse(sseB.events.find((e) => e.event === 'message').data), 'y'.repeat(950), '增量恰为 slice(150−100)=950 码元')
+    sseB.close()
+    server.close()
+  })
+  await aok('SSE T7 完结 done + 关流：finishedAt 已设且游标对齐 → done 帧 + res.end', async () => {
+    const dir = tmpDir()
+    const { server, runs, sseConnections } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, '最终输出')
+    rec.finishedAt = Date.now()
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9', { headers: { authorization: `Bearer ${TOKEN}` } }) // 无 since → cursor=total
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'done'), true, '收到 done 帧')
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && !sse.isEnded()) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sse.isEnded(), true, '服务端 res.end 后客户端收到 end')
+    const deadline2 = Date.now() + 3000
+    while (Date.now() < deadline2 && sseConnections.size > 0) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sseConnections.size, 0, '关流后连接不在 Set')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE T8 淘汰 done：runs.delete 后写循环复查感知 → done + end（20 条淘汰路径零 diff 验证）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, '在跑')
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=0', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, '首帧到达')
+    runs.delete('1750000000000.9')
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'done'), true, '淘汰 → done')
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && !sse.isEnded()) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sse.isEnded(), true, 'done 后关流')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE T9 连接上限：第 9 条 503；关 1 条可再开；全关 Set 归零', async () => {
+    const dir = tmpDir()
+    const { server, runs, sseConnections } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const seeded = makeStreamRecord('1750000000000.9')
+    streamAppend(seeded, 'seed')
+    runs.set('1750000000000.9', seeded)
+    const conns = []
+    for (let i = 0; i < SSE_MAX_CONNECTIONS; i++) {
+      const sse = sseCollect(port, `/api/runs/stream?id=1750000000000.9&since=0&seq=${i}`, { headers: { authorization: `Bearer ${TOKEN}` } })
+      assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, `第 ${i + 1} 条建连收首帧`)
+      conns.push(sse)
+    }
+    const ninth = await request(port, 'GET', '/api/runs/stream?id=1750000000000.9', { token: TOKEN })
+    assert.strictEqual(ninth.status, 503, '第 9 条必须 503')
+    conns[0].close()
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && sseConnections.size >= SSE_MAX_CONNECTIONS) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    // 重开探测不能用 request()（它会等响应体 end——SSE 有心跳永不 end）：只读响应头。
+    const reopen = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, path: '/api/runs/stream?id=1750000000000.9&probe=reopen', headers: { authorization: `Bearer ${TOKEN}` } }, (res) => {
+        res.once('data', () => {})
+        resolve(res)
+      })
+      req.on('error', reject)
+      req.end()
+    })
+    assert.strictEqual(reopen.statusCode, 200, '关 1 条后可再开')
+    assert.ok(String(reopen.headers['content-type']).startsWith('text/event-stream'))
+    reopen.destroy()
+    for (const sse of conns) sse.close()
+    server.close()
+  })
+  await aok('SSE T10 慢客户端积压硬断：暂停读 + 大快照 + 定隔追加 → 待发超限硬断（无 done 帧）', async () => {
+    const dir = tmpDir()
+    const { server, runs, sseConnections } = createConsole({ token: TOKEN, stateDir: dir, sseMaxPending: 1024 })
+    const port = await listen(server)
+    // 种子输出 600KiB：建连首个 tick 整帧 write（600KiB > 回环内核发送缓冲）。
+    const rec = makeStreamRecord('1750000000000.9')
+    rec.output = 'y'.repeat(614400)
+    rec.outputTotalLength = 614400
+    runs.set('1750000000000.9', rec)
+    // raw socket 客户端：请求行发出后**立即** pause 读，且**不挂 data 监听**——挂了
+    // 'data' 流动模式会先吃掉首块、pause 失去对 libuv 读的门闩作用（探针实测 paused
+    // 恒 false）；无监听时 socket 永不流入，pause 是确定性闸。
+    // 硬断判据（plan §4 T10 口径「无 done 帧」）：
+    // 1. 服务端侧：待发积压 > sseMaxPending(1024) → sseTeardown(conn,true) → Set 摘除。
+    //    客户端 paused 期间 RST/FIN 不可见（内核缓冲吞掉终结事件，探针 t10wr 实测
+    //    服务端 res.close 已触发而 paused 客户端无任何事件）——故只以服务端 Set 归零
+    //    为「已断」判据，随后恢复读让排队字节与终结流入。
+    // 2. 客户端侧：恢复读后 socket 必终结（destroy → 排队字节流尽后 close）；收到的
+    //    原始字节含数据帧但**不含 event: done**（超限 teardown 不发 done；淘汰/完结
+    //    路径才发——区分硬断与正常收尾）。ECONNRESET 'error' 不可用作判据：本服务端
+    //    destroy 前已 res.end() 且缓冲已入内核（探针 destroyorder 实测 end-then-destroy
+    //    → 客户端只 'close' 无 'error'），错误码断言在本机形态物理不可达。
+    // ⚠️ 追加节奏必须用 setInterval（await-sleep 异步链在回环自调优下会让首帧恰好被
+    // 吸收、paused 恒 false——plan §4 T10 预警的环境敏感形态）；追加总量 24×256KiB ≈
+    // 6MiB 必须压过内核缓冲 autotune 硬顶（套件内实测 ~2.9MB 处 write 才返 false）。
+    let ended = false
+    let raw = ''
+    let appendTimer = null
+    let torn = false
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.write(`GET /api/runs/stream?id=1750000000000.9&since=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${TOKEN}\r\n\r\n`)
+      sock.pause()
+      // 连接登记后再开始追加：untilTornDown「先等出现、再等消失」不能与追加赛跑。
+      const waitConn = setInterval(() => {
+        if (sseConnections.size > 0) {
+          clearInterval(waitConn)
+          let i = 0
+          appendTimer = setInterval(() => {
+            i++
+            streamAppend(rec, 'z'.repeat(262144))
+            if (i >= 24 || torn) clearInterval(appendTimer)
+          }, 50)
+        }
+      }, 5)
+    })
+    sock.on('error', () => { ended = true })
+    sock.on('close', () => { ended = true })
+    const untilTornDown = async (ms) => {
+      const t0 = Date.now()
+      while (Date.now() - t0 < ms && sseConnections.size === 0) await new Promise((_resolve) => setTimeout(_resolve, 10))
+      if (sseConnections.size === 0) return false // 连接从未建立（异常形态，直接判负）
+      const to = Date.now() + ms
+      while (Date.now() < to) {
+        if (sseConnections.size === 0) return true
+        await new Promise((_resolve) => setTimeout(_resolve, 25))
+      }
+      return sseConnections.size === 0
+    }
+    torn = await untilTornDown(20000)
+    if (appendTimer) clearInterval(appendTimer)
+    assert.strictEqual(torn, true, '超限硬断 → 服务端连接已 teardown 摘除')
+    sock.on('data', (c) => { raw += c })
+    sock.resume()
+    // pause-before-flow 的 readableFlowing=false 陷阱：resume 一次不必然启动流动，
+    // 周期性踢一脚直到终结（探针 t10kick/t10good 实证 3/3 稳定）。
+    const kick = setInterval(() => { if (!sock.destroyed) sock.resume() }, 20)
+    const untilEnded = async (ms) => {
+      const to = Date.now() + ms
+      while (Date.now() < to) {
+        if (ended) return true
+        await new Promise((_resolve) => setTimeout(_resolve, 25))
+      }
+      return ended
+    }
+    assert.strictEqual(await untilEnded(10000), true, '恢复读后客户端收到连接终结（排队字节流尽 → close）')
+    clearInterval(kick)
+    assert.strictEqual(sseConnections.size, 0, '硬断后服务端连接保持摘除')
+    assert.strictEqual(raw.includes('event: done'), false, '超限硬断不发 done 帧（区别于淘汰/完结收尾路径）')
+    assert.ok(raw.length > 0, '硬断前已排队的数据帧照常流入客户端')
+    server.close()
+  })
+  await aok('SSE T11 shuttingDown 广播：置位 → 活跃连接收 done + end；新连接 503', async () => {
+    const dir = tmpDir()
+    const { server, runs, activeChildren, wireGracefulShutdown: wire } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const seeded = makeStreamRecord('1750000000000.9')
+    streamAppend(seeded, 'seed')
+    runs.set('1750000000000.9', seeded)
+    // 假活跃子进程（cancel 用例同款 fake 形态）：无 activeChildren 时关停序列会立即
+    // finishShutdown → server.close()，「新连接 → 503」探测会 ECONNREFUSED；有 pending
+    // 子进程时收尾被推迟到 close/3s 看门狗，窗口内 server 仍在监听、关停闸可测。
+    const fakeChild = {
+      kill () {},
+      once () { return this },
+      stdout: { on () {} },
+      stderr: { on () {} },
+      on () { return this }
+    }
+    activeChildren.add(fakeChild)
+    let registered = null
+    // onExit 必须注入 no-op：doExit 默认 process.exit(0)——1s 强退兜底会把整个测试套件
+    // 静默带走（EXIT=0、摘要行缺失）。与 SIGTERM e2e 用例注入 onExit 同理。
+    wire({ onExit: () => {}, registerSignal: (fn) => { registered = fn } })
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=0', { headers: { authorization: `Bearer ${TOKEN}` } })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, '建连收首帧')
+    registered('SIGTERM')
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'done'), true, '关停广播 done')
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && !sse.isEnded()) await new Promise((_resolve) => setTimeout(_resolve, 25))
+    assert.strictEqual(sse.isEnded(), true, '广播后 end')
+    const again = await request(port, 'GET', '/api/runs/stream?id=1750000000000.9', { token: TOKEN })
+    assert.strictEqual(again.status, 503, '关停窗口新连接 503')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE T12 outputTotalLength 端到端：真子进程 check 轮详情输出数值计数器且常态等于 output.length', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    let trig = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+    if (trig.status === 409) {
+      // 竞态兜底（cancel 用例同款）：check 窗口内撞上重放窗 → 跨动作重触发
+      const t3 = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
+      assert.strictEqual(t3.status, 202, '跨动作触发必须 202')
+      trig = t3
+    } else {
+      assert.strictEqual(trig.status, 202)
+    }
+    const { id } = JSON.parse(trig.text)
+    const deadline = Date.now() + 30000
+    let detail = null
+    while (Date.now() < deadline) {
+      const r = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: `id=${id}` })
+      detail = JSON.parse(r.text)
+      if (detail.finishedAt) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    assert.ok(detail && detail.finishedAt, '子进程应在 30s 内结束')
+    assert.strictEqual(typeof detail.outputTotalLength, 'number', '详情必须下发 outputTotalLength 数值')
+    assert.ok(detail.outputTotalLength >= detail.output.length, '计数器 ≥ 现存长度（无淘汰常态应相等）')
+    assert.strictEqual(detail.outputTotalLength, detail.output.length, 'check 输出 < 512KiB 无淘汰 → 恒等')
+    const get = JSON.parse((await request(port, 'GET', `/api/runs/${id}`, { token: TOKEN })).text)
+    assert.strictEqual(get.outputTotalLength, detail.outputTotalLength, 'GET 详情响应体等价')
     server.close()
   })
   await aok('HTTP: GET /api/run-history（轮界模型 / 行号游标 / limit 钳制 / 鉴权）', async () => {
@@ -1305,20 +2203,165 @@ async function main () {
     }
     server.close()
   })
-  await aok('静态红线: app.js 所有 fetch 第一参数均为字面量或字面量起点三元', () => {
+  // ── v3.300 访问日志端到端（蓝图 §3.3 T1-T7）────────────────────────────────
+  const fetchLog = async (port) => JSON.parse((await request(port, 'GET', '/api/access-log', { token: TOKEN })).text)
+  await aok('访问日志: ?token= 脱敏 + 原文零出现（深断言 JSON.stringify(items)）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const FAKE = 'z'.repeat(20)
+    const noAuth = await request(port, 'GET', `/api/nope?token=${FAKE}`)
+    assert.strictEqual(noAuth.status, 401, '错 token 必须 401')
+    const log = await fetchLog(port)
+    const hit = log.items.find((it) => it.path === '/api/nope?token=***')
+    assert.ok(hit, `必须存在 path === '/api/nope?token=***' 的条目（items=${JSON.stringify(log.items.map((i) => i.path))}）`)
+    assert.strictEqual(hit.status, 401)
+    assert.ok(!JSON.stringify(log.items).includes(FAKE), 'token 原文在响应体零出现（深断言）')
+    assert.strictEqual(log.unauthorizedCount, 1, '独立 server 全程仅此一次 401（N1 收紧）')
+    server.close()
+  })
+  await aok('访问日志: 逃逸形态全 ***（重复参数 + %74oken 编码键名）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const r1 = await request(port, 'GET', '/api/nope?a=1&token=x1&token=y2')
+    assert.strictEqual(r1.status, 401)
+    const r2 = await request(port, 'GET', '/api/nope?%74oken=z3')
+    assert.strictEqual(r2.status, 401)
+    const log = await fetchLog(port)
+    const flat = JSON.stringify(log.items)
+    assert.ok(!flat.includes('x1') && !flat.includes('y2') && !flat.includes('z3'), `逃逸原文零出现（items=${flat}）`)
+    assert.ok(log.items.some((it) => it.path === '/api/nope?a=1&token=***&token=***'), '重复参数形态全 ***')
+    assert.ok(log.items.some((it) => it.path === '/api/nope?token=***'), '%74oken= 解码形态洗出 token=***')
+    server.close()
+  })
+  await aok('访问日志: 401 独立计数（3 次未授权后 =3，重复查询不漂移）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const r1 = await request(port, 'GET', '/api/sys')
+    assert.strictEqual(r1.status, 401)
+    const r2 = await request(port, 'GET', '/api/sys', { token: 'y'.repeat(32) })
+    assert.strictEqual(r2.status, 401)
+    const r3 = await request(port, 'POST', '/trigger', { body: 'action=check' })
+    assert.strictEqual(r3.status, 401)
+    const log = await fetchLog(port)
+    assert.strictEqual(log.unauthorizedCount, 3, `3 次未授权后计数必须为 3（实际 ${log.unauthorizedCount}）`)
+    const again = await fetchLog(port)
+    assert.strictEqual(again.unauthorizedCount, 3, '查询自身（200）不计入，值不漂移')
+    server.close()
+  })
+  await aok('访问日志: 环形 201 挤最旧 + 自举（查询自身入日志且最新）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    for (let i = 0; i <= 200; i++) {
+      const r = await request(port, 'GET', `/api/nope?seq=${i}`, { token: TOKEN })
+      assert.strictEqual(r.status, 404)
+    }
+    // 201 条 nope 请求全部入日志；本条查询自身的条目在其响应 finish 之后才入数组
+    // ——读取时只见此前请求（蓝图自举时序：响应内容不含自身这条）。
+    const log = await fetchLog(port)
+    assert.strictEqual(log.items.length, ACCESS_LOG_MAX, `环形钳制到 ${ACCESS_LOG_MAX}（201 条 nope → 挤出 seq=0）`)
+    assert.ok(log.items[0].path.includes('seq=1'), `最旧存活条目应为 seq=1（seq=0 已挤出；实际 ${log.items[0].path}）`)
+    assert.ok(!log.items.some((it) => it.path.endsWith('seq=0')), 'seq=0 必须已被挤出')
+    assert.ok(!log.items.some((it) => it.path === '/api/access-log'), '读取时点查询自身尚未入数组（finish 时序）')
+    // 自举（第二时序）：此刻再查一次——上一条查询自身已入数组且是最新条目；
+    // 环形现 202 条 → 再挤出 seq=1，items[0] = seq=2。
+    const log2 = await fetchLog(port)
+    assert.ok(log2.items[log2.items.length - 1].path === '/api/access-log', `自举：上次查询自身入日志且最新（实际末条 ${log2.items[log2.items.length - 1].path}）`)
+    assert.ok(log2.items[0].path.includes('seq=2'), `第二轮后最旧存活 = seq=2（seq=0/1 已挤出；实际 ${log2.items[0].path}）`)
+    assert.ok(!log2.items.some((it) => it.path.endsWith('seq=0') || it.path.endsWith('seq=1')), 'seq=0/seq=1 必须已被挤出')
+    server.close()
+  })
+  await aok('访问日志: 降噪白名单 2xx 不入 / 404、5xx 入（含 POST /runs/detail 与 503 出口）', async () => {
+    const dir = tmpDir()
+    const { server, runs, setShuttingDown } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // fake record 注入（与 cancel 用例同先例）：让 GET /api/runs/:id 与 POST /api/runs/detail 命中 2xx
+    runs.set('1750000000000.9', { id: '1750000000000.9', action: 'check', label: 'x', startedAt: Date.now(), finishedAt: 0, exitCode: 0, timedOut: false, cancelled: false, output: '' })
+    const seq = [
+      ['GET', '/api/status', 200],
+      ['GET', '/api/runs', 200],
+      ['GET', '/', 200],
+      ['GET', '/assets/app.css', 200],
+      ['GET', '/api/runs/1750000000000.9', 200],
+      ['POST', '/api/runs/detail', 200]
+    ]
+    for (const [method, p] of seq) {
+      const r = await request(port, method, p, { token: TOKEN, body: method === 'POST' ? 'id=1750000000000.9' : undefined })
+      assert.strictEqual(r.status, 200, `${method} ${p} 预置 200`)
+    }
+    const nf = await request(port, 'GET', '/api/nope-x', { token: TOKEN })
+    assert.strictEqual(nf.status, 404)
+    setShuttingDown() // 关停闸：/api/runs/cancel 即刻 503（确定性 5xx 出口）
+    const cancel = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1750000000000.9' })
+    assert.strictEqual(cancel.status, 503)
+    const log = await fetchLog(port)
+    const paths = log.items.map((it) => it.path)
+    // 白名单六路径逐一精确断言（N2：改为直接 path 数组，替代 trim/split 间接写法）
+    for (const quiet of ['/api/status', '/api/runs', '/', '/assets/app.css', '/api/runs/1750000000000.9', '/api/runs/detail']) {
+      assert.ok(!paths.includes(quiet), `白名单 2xx 不得入日志：${quiet}（实际 ${paths.join(' | ')}）`)
+    }
+    assert.ok(log.items.some((it) => it.status === 404 && it.path.includes('/api/nope-x')), '404 必须入日志')
+    assert.ok(log.items.some((it) => it.status === 503 && it.path.includes('/api/runs/cancel')), '503（cancel 出口）必须入日志')
+    server.close()
+  })
+  await aok('访问日志: 畸形 request-target 400 入日志且脱敏（raw 串路径 D2/D3）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const SEKRIT = 'q'.repeat(20)
+    // 畸形形态 1：`//@:99999` 让 new URL 抛 TypeError → 400（此前的崩溃回归形态）。
+    const bad1 = await rawRequest(port, 'GET //@:99999 HTTP/1.1\r\nHost: x\r\n\r\n')
+    assert.strictEqual(bad1.status, 400)
+    // 畸形形态 2：合法 target 内嵌 ?token= 的 raw 形态 → 401（无凭证），path 原样
+    // 进访问日志（new URL 不改写它）——验证 raw 形态过脱敏闸。
+    const bad2 = await rawRequest(port, `GET /x?token=${SEKRIT} HTTP/1.1\r\nHost: x\r\n\r\n`)
+    assert.strictEqual(bad2.status, 401, `raw token 请求无凭证应 401（实际 ${bad2.status}）`)
+    const log = await fetchLog(port)
+    assert.ok(log.items.some((it) => it.status === 400 && it.path.includes('//@:99999')), `畸形 target 的 400 必须入日志（items=${JSON.stringify(log.items.map((i) => [i.path, i.status]))}）`)
+    assert.ok(log.items.some((it) => it.status === 401 && it.path.includes('token=***')), 'raw token 请求 401 条目必须脱敏')
+    assert.ok(!JSON.stringify(log.items).includes(SEKRIT), 'SEKRIT 原文零出现（raw request-target 也过脱敏闸）')
+    server.close()
+  })
+  await aok('访问日志: 字段形状六字段 / at 上海戳 / ms≥0 / src=127.0.0.1', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    await request(port, 'GET', '/api/nope', { token: TOKEN })
+    // 预置两条后再查：查询自身条目在其 finish 之后才入数组，读取时点至少能看到
+    // 此前的请求（若此用例是数组里第一批，请求前先垫一条 nope 404）。
+    await request(port, 'GET', '/api/nope?anchor=1', { token: TOKEN })
+    const log = await fetchLog(port)
+    assert.ok(log.items.length >= 2, `至少含两条此前请求（实际 ${log.items.length}）`)
+    for (const it of log.items) {
+      assert.deepStrictEqual(Object.keys(it).sort((a, b) => a.localeCompare(b)), ['at', 'method', 'ms', 'path', 'src', 'status'], '字段恰为六个（字典序）')
+      assert.match(it.at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, 'at = 上海戳 YYYY-MM-DD HH:mm:ss')
+      assert.ok(Number.isInteger(it.ms) && it.ms >= 0, 'ms 为 ≥0 整数')
+      assert.strictEqual(it.src, '127.0.0.1', 'src = remoteAddress 字符串（listen 绑 127.0.0.1，无 ::ffff: 前缀）')
+      assert.strictEqual(typeof it.status, 'number', 'status 为 number')
+    }
+    // 时间正序：数组插入序 = at 非严格递增（同秒并列按入序，下标即权威时序）
+    for (let i = 1; i < log.items.length; i++) {
+      assert.ok(log.items[i - 1].at <= log.items[i].at, '时间正序')
+    }
+    server.close()
+  })
+
+  await aok('静态红线: app.js 所有 fetch/EventSource 第一参数均为字面量或字面量起点三元', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     // Codacy SSRF 全绿形态：第一参数是 '/api/...' 字面量，或以字面量起点的三元
     // （`qs.length > 0 ? `/api/messages?${qs}` : '/api/messages'` —— authority 恒字面量，
     // PR#227 实测通过形态）。抓的是「第一参数为裸变量/函数调用」的形态。
+    // v3.300 扩扫 new EventSource( ——原生 EventSource 第一参数同为 URL，同受「变量 URL」
+    // 注入/SSF 风险，字面量纪律零成本统一（EventSource 无法自定义头，风险面只增不减）。
     const offenders = []
-    for (const m of src.matchAll(/fetch\(\s*([^,)]{1,60})/g)) {
+    // app.js 经 standard no-undef 改写为 window.EventSource（原生全局引用）——正则需
+    // 同时覆盖两种拼写，否则扩扫形同虚设（T13 开发期自检实证：new window.EventSource(
+    // 不被 /new EventSource\(/ 命中）。
+    for (const m of src.matchAll(/(?:fetch|new (?:window\.)?EventSource)\(\s*([^,)]{1,60})/g)) {
       const first = m[1].trim()
       if (first.startsWith('\'/') || first.startsWith('`/')) continue
       // 三元：问号任一侧含字面量起点（'/ 或 `/）即视为安全形态
       if (first.includes('?') && (first.includes('\'/') || first.includes('`/'))) continue
       offenders.push(first)
     }
-    assert.deepStrictEqual(offenders, [], `fetch 第一参数必须是字面量或字面量三元：${offenders.join(' | ')}`)
+    assert.deepStrictEqual(offenders, [], `fetch/EventSource 第一参数必须是字面量或字面量三元：${offenders.join(' | ')}`)
   })
 }
 

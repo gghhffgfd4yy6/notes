@@ -244,6 +244,15 @@ function apiGetSys () {
   return consumeJson(fetch('/api/sys', merged), done)
 }
 
+// 访问日志（v3.300 §3.3）：系统页可查的内存环形访问日志。与上方端点同纪律——
+// fetch 第一参数纯字面量（Codacy SSRF 全绿形态，静态红线测试自动覆盖）。
+function apiGetAccessLog () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/access-log', merged), done)
+}
+
 async function trigger (action) {
   const body = new URLSearchParams({ action })
   const { merged, done } = timedRequest({
@@ -508,6 +517,10 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
   const [detailErr, setDetailErr] = useState('')
   // 乱序防护（Sourcery vwI）：detail 请求领号，落后响应丢弃。
   const detailSeqRef = useRef(0)
+  // onRefresh 经 ref 解引用（v3.300 3.1 §2 D7）：若直接进 effect deps，其身份不稳定
+  // 会导致 SSE 每渲染重连（快照重建流）。
+  const onRefreshRef = useRef(onRefresh)
+  onRefreshRef.current = onRefresh
 
   // 切换目标 run 时立即清旧详情（Sourcery G_oi + Old-logs-flash）：useEffect 在渲染后
   // 才跑，「新 openId + 旧 detail」会闪一帧。渲染期同步判定：detail.runId 与当前 openId
@@ -516,15 +529,27 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
     setDetail(null)
     setDetailErr('')
   }, [openId])
-  const detailForOpen = detail !== null && typeof detail.id === 'number' && detail.id === openId
+  // openRun/openActive 先声明后使用（v3.300 3.1 §1.9b）：详情跟随 effect 依赖 openActive，
+  // 须在 effect 之前声明（渲染逻辑零变化）。
+  const openRun = openId !== null ? runs.find((r) => r.id === openId) : null
+  const openActive = !!(openRun && !openRun.finishedAt)
+  // typeof 判据必须是 'string'（v3.300 3.1 §1.9a 回归修复）：v3.299 起 run id 改为
+  // 「epoch.seq」字符串下发（服务端 makeRunId 模板串），number 判据恒 false ⇒
+  // detailForOpen 恒 null ⇒ 日志框永远「加载中…」。
+  const detailForOpen = detail !== null && typeof detail.id === 'string' && detail.id === openId
     ? detail
     : null
 
-  // 日志面板：打开期间跟随运行状态轮询（Sourcery vv-：运行中的输出要持续刷新）。
+  // 详情跟随（v3.300 3.1）：运行中走 SSE 实时流（原生 EventSource，零依赖）；
+  // 非运行中 / 快照已完结 / 流错误回退原轮询。两通道在 effect 内二选一：SSE 模式不建
+  // interval，轮询模式不建 EventSource——切态必经 cleanup（dead + es.close()），无叠加。
+  // SSE 不经过 inFlightRef/timedRequest（那是 5s 主轮询的互斥面），互不抢占（蓝图红线 6）。
   useEffect(() => {
     if (openId === null) return undefined
     let dead = false
+    let es = null
     let inflight = false
+    let pollTimer = null
     const fetchOnce = async () => {
       // Sourcery Overlapping-log-polls/Slow-log-requests：详情请求慢于轮询间隔时逐 tick
       // 叠加并发请求，迟到的失败响应会把过期错误写到当前面板。与主轮询同口径：
@@ -544,12 +569,73 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
         inflight = false
       }
     }
-    // S9383：fetchOnce 内部已 try/catch 全收（不会 reject），但仍显式 .catch 兜底，
-    // 不留 floating promise（与 console.js 里 readBody 的处理同口径）。
-    fetchOnce().catch(() => { /* 不可达：fetchOnce 不 reject */ })
-    const t = setInterval(fetchOnce, pollMs)
-    return () => { dead = true; clearInterval(t) }
-  }, [openId, pollMs])
+    const startPolling = () => {
+      if (pollTimer !== null || dead) return
+      // S9383：fetchOnce 内部已 try/catch 全收（不会 reject），但仍显式 .catch 兜底，
+      // 不留 floating promise（与 console.js 里 readBody 的处理同口径）。
+      fetchOnce().catch(() => { /* fetchOnce 不 reject，S9383 口径 */ })
+      pollTimer = setInterval(() => { fetchOnce().catch(() => {}) }, pollMs)
+    }
+    if (!openActive) {
+      startPolling()
+      return () => { dead = true; if (pollTimer !== null) clearInterval(pollTimer) }
+    }
+    // ── SSE 模式：先取轮询快照，以快照 outputTotalLength 为初始游标建流（顺序不可倒置，
+    // 快照先落 detail 再开流，快照后新增量由首个 tick 补发——不重不漏，见 §2 D5）。
+    const seq = ++detailSeqRef.current
+    // 流代次号（评审 231-M4）：本 effect 运行 = 新一代。旧流的排队回调（同一 run 关了
+    // 又开的场景：prev.id===openId 仍命中）必须凭代次失效——seq 是闭包值，回调比对
+    // detailSeqRef.current 即可判「自己是否仍是当前代」。
+    const mySeq = seq
+    apiGetRunDetail(openId).then((d) => {
+      if (dead || seq !== detailSeqRef.current) return
+      setDetail(d)
+      setDetailErr('')
+      if (d.finishedAt) return // 快照时已完结：不开流，runs 刷新翻转 openActive 后进轮询
+      const start = typeof d.outputTotalLength === 'number' ? d.outputTotalLength : (d.output || '').length
+      const params = new URLSearchParams({ id: String(openId), since: String(start) })
+      // EventSource 第一参数照 fetch 字面量纪律：`/api/...` 模板字面量（同源相对路径，
+      // authority 恒同源），变量只进查询段（§2 D1）。不带 token：会话 Cookie 自动携带
+      // （页面加载即下发，authorize GET 收 Cookie）；token 进 URL 会落浏览器历史/访问日志。
+      es = new window.EventSource(`/api/runs/stream?${params.toString()}`)
+      es.onmessage = (ev) => {
+        // 未命名 data 帧 = 增量文本（JSON 字符串）。函数式更新 + 身份护栏（prev.id 匹配
+        // + 代次守卫：陈旧流回调在「同 run 关闭重开」场景 prev.id 仍命中，必须再验
+        // mySeq===detailSeqRef.current，评审 231-M4）。
+        try {
+          const chunk = JSON.parse(ev.data)
+          if (typeof chunk === 'string' && chunk.length > 0) {
+            setDetail((prev) => (prev !== null && prev.id === openId && mySeq === detailSeqRef.current ? { ...prev, output: (prev.output || '') + chunk } : prev))
+          }
+        } catch (e) { /* 坏帧忽略：最终快照/重拉自愈 */ }
+      }
+      // named event 不进 onmessage（蓝图红线）：显式注册 reset / done。
+      es.addEventListener('reset', (ev) => {
+        try {
+          const payload = JSON.parse(ev.data)
+          if (payload && typeof payload.full === 'string') {
+            setDetail((prev) => (prev !== null && prev.id === openId && mySeq === detailSeqRef.current ? { ...prev, output: payload.full } : prev))
+          }
+        } catch (e) { /* 同上 */ }
+      })
+      es.addEventListener('done', () => {
+        if (es !== null) { es.close(); es = null } // 防原生自动重连在流关闭后无限重试（蓝图口径）
+        fetchOnce().catch(() => {}) // 最终快照补 finishedAt/exitCode
+        onRefreshRef.current() // 立即刷新 runs 列表徽章（ref 解引用，防 effect 重连，§2 D7）
+      })
+      es.onerror = () => {
+        // 显式 close 后整段重拉一次后退回轮询；不带过期游标复连（蓝图重连语义）。
+        if (es !== null) { es.close(); es = null }
+        fetchOnce().catch(() => {})
+        startPolling()
+      }
+    }).catch(() => { if (!dead) startPolling() }) // 快照失败 → 回退轮询（既有能力兜底）
+    return () => {
+      dead = true
+      if (es !== null) es.close()
+      if (pollTimer !== null) clearInterval(pollTimer)
+    }
+  }, [openId, openActive, pollMs])
 
   // statusOf（Sourcery vv4）：以 finishedAt 为完成判据；
   // 「finishedAt 已设但 exitCode null」= 信号终止（含超时 SIGKILL），显示「已终止」。
@@ -584,9 +670,6 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
     }
     onRefresh()
   }
-
-  const openRun = openId !== null ? runs.find((r) => r.id === openId) : null
-  const openActive = !!(openRun && !openRun.finishedAt)
 
   return html`<div class="panel">
     <div class="panel-head">
@@ -843,6 +926,70 @@ function MessagesPanel () {
     [page, size, cate, query])
   const { data, err, load } = usePanelLoader(fetchMessages)
   useEffect(() => { load().catch(() => {}) }, [load])
+  const [exporting, setExporting] = useState('') // '' | 'csv' | 'json'：加载态防连点（两按钮共用一闸）
+  const [exportErr, setExportErr] = useState('')
+  const [exportNote, setExportNote] = useState('')
+
+  // 导出下载（v3.300 3.2）：POST /api/messages/export（字面量第一参数 + 筛选词只进 body）
+  // → response.blob() → URL.createObjectURL → 临时 <a download> 点击 → revokeObjectURL。
+  // 不拼服务端下载 URL：凭证不出现在 href（蓝图红线）。
+  const doExport = useCallback(async (format) => {
+    if (exporting !== '') return
+    setExporting(format)
+    setExportErr('')
+    setExportNote('')
+    const body = new URLSearchParams({ format })
+    if (typeof cate === 'string' && cate.length > 0) body.set('cate', cate)
+    if (typeof query === 'string' && query.length > 0) body.set('q', query)
+    // page/size 不发送：导出=筛选结果全量（服务端亦不读取）。
+    const { merged, done } = timedRequest({
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `Bearer ${BOOT.token}`
+      },
+      body
+    })
+    let url = ''
+    try {
+      const res = await fetch('/api/messages/export', merged)
+      if (!res.ok) { setExportErr(`导出失败：HTTP ${res.status}`); return }
+      const ct = String(res.headers.get('content-type') || '')
+      const blob = await res.blob()
+      if (ct.startsWith('application/json')) {
+        // application/json 两种含义（评审 231-H1）：三态（missing/invalid/tooLarge）=
+        // {status,...} 对象 → 不下载、如实提示；成功导出 = 行数组 → 照常下载。
+        // 按 Array.isArray 区分（成功形态 231-M1 已改为直接数组）。
+        let parsed = null
+        try { parsed = JSON.parse(await blob.text()) } catch (e) { parsed = null }
+        if (!Array.isArray(parsed)) {
+          const status = parsed && typeof parsed.status === 'string' ? parsed.status : 'unknown'
+          setExportErr(`记录暂不可导出（${status}）`)
+          return
+        }
+        if (res.headers.get('x-export-truncated') === 'true') setExportNote('匹配结果超过上限，导出已截断')
+        url = URL.createObjectURL(new Blob([JSON.stringify(parsed)], { type: 'application/json' }))
+      } else {
+        if (res.headers.get('x-export-truncated') === 'true') setExportNote('匹配结果超过上限，导出已截断')
+        url = URL.createObjectURL(blob)
+      }
+      const a = document.createElement('a')
+      a.href = url
+      a.download = format === 'csv' ? 'messages-export.csv' : 'messages-export.json'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+    } catch (e) {
+      setExportErr(`导出失败：${e && e.message ? e.message : e}`)
+    } finally {
+      done() // body（blob/text）消费完才清 8s 期限（Sourcery Stalled-bodies 同口径）
+      // revoke 延迟到 click 之后一拍（评审 231-M5）：浏览器解析下载是异步的，同步
+      // revoke 会让 deferred download 拿不到 blob。1 分钟后回收（URL 规范建议的
+      // 「延迟 revoke」口径，内存占用一次性、不累积）。
+      if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, 60000)
+      setExporting('')
+    }
+  }, [exporting, cate, query])
   const items = data && Array.isArray(data.items) ? data.items : []
   const categories = data && Array.isArray(data.categories) ? data.categories : []
   // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，避免「显示原词、结果未过滤」。
@@ -866,8 +1013,12 @@ function MessagesPanel () {
         ${categories.map((c) => html`<option key=${c.name} value=${c.name}>${c.name}（${c.count}）</option>`)}
       </select>
       <button class="btn btn-ghost" onClick=${load}>刷新</button>
+      <button class="btn btn-ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}</button>
+      <button class="btn btn-ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}</button>
     </div>
     ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${exportErr && html`<div class="hint hint-err">${exportErr}</div>`}
+    ${exportNote && html`<div class="hint">${exportNote}</div>`}
     ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<div class="hint">正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）</div>` : ''}</div>`}
     ${data && data.status === 'ok' && html`<div>
       <div class="msg-count">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}</div>
@@ -922,8 +1073,13 @@ function LogsPanel ({ pollMs }) {
 
 // 系统信息：版本 / 运行环境 / 进程 / 缓存目录。全部只读，无操作按钮。
 function SysPanel () {
+  // 访问日志（v3.300 §3.3）：第二个 loader 并列拉取；「刷新」按钮同日 load 两个。
+  // 近窗未授权尝试数 = 服务端独立 401 计数（进程启动以来、不随环形窗截断）。
   const { data: sys, err, load } = usePanelLoader(apiGetSys)
+  const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog)
   useEffect(() => { load().catch(() => {}) }, [load])
+  useEffect(() => { loadAccess().catch(() => {}) }, [loadAccess])
+  const refreshAll = () => { load(); loadAccess() }
   const fmtUptime = (s) => {
     if (!(typeof s === 'number' && s >= 0)) return '—'
     const d = Math.floor(s / 86400)
@@ -931,11 +1087,13 @@ function SysPanel () {
     const m = Math.floor((s % 3600) / 60)
     return d > 0 ? `${d} 天 ${h} 时 ${m} 分` : h > 0 ? `${h} 时 ${m} 分` : `${m} 分`
   }
+  const logItems = access && Array.isArray(access.items) ? access.items : []
+  const logTail = logItems.slice(-20).reverse()
   return html`<div class="panel">
     <div class="panel-head">
       <span class="panel-title">系统信息</span>
       <span style="flex:1"></span>
-      <button class="btn btn-ghost" onClick=${load}>刷新</button>
+      <button class="btn btn-ghost" onClick=${refreshAll}>刷新</button>
     </div>
     ${err && html`<div class="hint hint-err">${err}</div>`}
     ${sys && html`<div class="sys-grid">
@@ -951,6 +1109,14 @@ function SysPanel () {
         <tr><td>缓存目录</td><td>${sys.cacheDir}</td></tr>
       </tbody></table>
     </div>`}
+    <div class="hint" style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。</div>
+    ${accessErr && html`<div class="hint hint-err">访问日志加载失败：${accessErr.message || accessErr}</div>`}
+    ${access && access.items && access.items.length === 0 && html`<div class="empty">暂无访问记录（轮询端点与静态资产的成功请求不记入）</div>`}
+    ${logTail.length > 0 && html`<details class="access-log"><summary>最近访问记录（最多 20 条，新在上）</summary>
+      <table class="sys-table"><tbody>
+        ${logTail.map((it, i) => html`<tr key=${`${i}|${it.at}|${it.method}|${it.path}|${it.status}|${it.ms}`}><td>${it.at}</td><td>${it.method} ${it.path} → ${it.status} · ${it.ms}ms</td></tr>`)}
+      </tbody></table>
+    </details>`}
     <div class="hint" style="margin-top:12px">数据说明：推送记录来自判重缓存 push.json（服务端已裁剪正文 HTML）；趋势解析 run.log 摘要行；日志取尾部 1 MiB。</div>
   </div>`
 }
