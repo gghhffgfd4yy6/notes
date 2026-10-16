@@ -11,21 +11,24 @@ const fs = require('fs')
 const path = require('path')
 
 // ── S1 前置：源码序断言（结构铁律唯一防线，先于任何行为用例）──
-// 手法仿 test_qinglong_utils.js 接线断言：indexOf 定位 + 顺序比较，
-// 禁止字面量邻接/距离上限（Stryker 插桩会改写条件/插入代码，精确距离必碎）。
+// 手法仿 test_qinglong_utils.js 接线断言：indexOf 定位 + 顺序比较。
+// 插桩安全注意（Stryker 沙箱实测教训）：
+//   ① if (require.main === module) 的 if( 前缀会被改写成 stryMutAct 三元（字面串消失），
+//      但 require.main === module 表达式文本始终保留 ⇒ 定位用表达式本身；
+//   ② 插桩使代码膨胀 ~2x 且产生大量 '} else {' ⇒ 禁用窗口切片和花括号锚点；
+//   ③ 锚点必须全文唯一：'--notify-test' 旗标（1 处）、runNotifyTest(cliArgs)（1 处）、
+//      runSingleEntry().catch（完整入口唯一调用，1 处）。
+// 铁律语义 = runNotifyTest 分发在 runSingleEntry 完整入口之前（早退分支不被吞掉）。
 const entrySrc = fs.readFileSync(path.join(__dirname, 'xbk_function_v3.js'), 'utf8')
 {
-  const guardIdx = entrySrc.indexOf('if (require.main === module)')
+  const guardIdx = entrySrc.indexOf('require.main === module')
   assert.ok(guardIdx > 0, 'main guard 必须存在')
-  const guard = entrySrc.slice(guardIdx, guardIdx + 1400)
-  const iFlag = guard.indexOf("'--notify-test'")
-  const iCall = guard.indexOf('runNotifyTest(cliArgs)')
-  const iRun = guard.indexOf('runSingleEntry()')
-  const iElse = guard.indexOf('} else {')
-  assert.ok(iFlag >= 0, 'guard 内必须有 --notify-test 分发')
+  const iFlag = entrySrc.indexOf("'--notify-test'", guardIdx)
+  const iCall = entrySrc.indexOf('runNotifyTest(cliArgs)', guardIdx)
+  const iRun = entrySrc.indexOf('runSingleEntry().catch', guardIdx)
+  assert.ok(iFlag > guardIdx, 'guard 内必须有 --notify-test 分发')
   assert.ok(iCall > iFlag, 'guard 内必须调用 runNotifyTest')
-  assert.ok(iRun > iFlag && iRun < iElse, 'runSingleEntry() 必须在 else 分支（notify-test 分支之后）')
-  assert.ok(iElse > iCall, 'else 必须在 notify-test 分支之后（保住 runSingleEntry 语义）')
+  assert.ok(iRun > iCall, 'runSingleEntry 完整入口必须在 notify-test 分支之后（早退语义）')
 }
 
 // ── 进程内装配：got mock → 真 slim（带 mock）→ 主模块（getNotify 命中缓存）──
@@ -218,10 +221,12 @@ console.log('========================================\n')
   }))
 
   // S8 脱敏红线：guard catch 块源码级断言（summarizeError 在、裸 stringify 不在——
-  // 剥行注释后断言：注释里的「禁止 JSON.stringify(e)」守则文案本身含该字样）
+  // 剥行注释后断言：注释里的「禁止 JSON.stringify(e)」守则文案本身含该字样）。
+  // 插桩安全：同 S1——定位用 'require.main === module' 表达式；插桩膨胀 ~2x ⇒ 窗口 4000
+  // （沙箱实测 1400 会漏掉 summarizeError(e) 调用点）。
   await test('脱敏红线: guard catch 走 summarizeError、catch 块无裸 stringify/log(e)', () => {
-    const guardIdx = entrySrc.indexOf('if (require.main === module)')
-    const guardCode = entrySrc.slice(guardIdx, guardIdx + 1400).replace(/\/\/[^\n]*/g, '')
+    const guardIdx = entrySrc.indexOf('require.main === module')
+    const guardCode = entrySrc.slice(guardIdx, guardIdx + 4000).replace(/\/\/[^\n]*/g, '')
     assertRc(guardCode.includes('summarizeError(e)'), 'guard catch 必须过 summarizeError')
     assertRc(!guardCode.includes('JSON.stringify(e)'), 'guard catch 禁止 JSON.stringify(e)')
     assertRc(!/console\.log\(e\)/.test(guardCode), 'guard catch 禁止 console.log(e)')
