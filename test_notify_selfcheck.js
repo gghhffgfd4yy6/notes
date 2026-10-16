@@ -170,41 +170,49 @@ console.log('========================================\n')
   }))
 
   // S6 退出码：全失败（通道 API 层失败 → sendNotify 走 okCount===0 reject）→ 顶层 catch 出 1
-  await test('全失败: 通道 API 拒绝 → exitCode 1 + 脱敏原因（无对象 stringify 痕迹）', () => withChannels(async () => {
-    // 让 got.post 永久失败：临时替换 mock
-    const origPost = require.cache[gotPath].exports.post
-    require.cache[gotPath].exports.post = (url, options) => {
-      gotCalls.push({ url, options })
-      const e = new Error('API error: connection refused')
-      e.response = { body: '{"code":500,"msg":"PPT_SECRET 回显"}', statusCode: 500 }
-      return Promise.reject(e)
-    }
+  // Sourcery Medium（Credential leaks bypass guard test）：S6 旧形态在进程内 catch 后自行
+  // 复刻 guard 的 summarizeError 处理，从不执行真实 main-guard catch——若真 guard 里加了
+  // 裸 console.error(e)，本测试依然绿而凭证照样泄漏。改为 spawn 型：真子进程真 guard，
+  // fake 渠道 API 回显含假凭证的响应体，断言合并输出中凭证零出现。
+  await test('全失败: 真 main-guard spawn → exitCode 1 + 凭证零泄漏 + 脱敏原因', () => {
+    const os = require('os')
+    const { spawnSync } = require('child_process')
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-selfcheck-stub-'))
+    const stubPath = path.join(stubDir, 'stub.js')
+    // 桩：require.cache 替身替换 slim；sendNotify 抛 ALL_CHANNELS_FAILED，错误对象与
+    // response.body 均埋假凭证哨兵。真 slim 永不加载 → 零真实网络/推送（D10）。
+    // 哨兵用 redact 可识别的 KV 形态（token=…）——redact 契约是模式脱敏（KV/Bearer），
+    // 非配置值字典；provider 回显凭证的真实形态就是响应体/消息里的 KV。
+    const SECRET = 'LEAK-CANARY-pK3dQ9'
+    fs.writeFileSync(stubPath, `'use strict'
+const slimPath = require('path').join(process.cwd(), 'xbk_sendNotify_slim.js')
+const err = new Error('所有推送通道失败: HTTP 502 回显 token=${SECRET}')
+err.code = 'ALL_CHANNELS_FAILED'
+err.statusCode = 502
+err.response = { body: '{"token":"${SECRET}"}', statusCode: 502 }
+err.failures = [{ channel: '桩渠道A', message: 'pushplus 响应: token=${SECRET}', statusCode: 502 }]
+err.successfulChannels = []
+require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, exports: { push_config: { HITOKOTO: 'false' }, configuredChannelNames: () => ['桩渠道A'], configuredChannelCount: () => 1, sendNotify: async () => { throw err } } }
+// 注意：桩内绝不 require 入口文件——--require 阶段 require 它会让 Node 22 把入口标记为
+// 已加载，真 main 不再执行（require.main !== module）→ guard 不触发、进程零输出退出 0。
+`)
     try {
-      cfg.PUSH_PLUS_TOKEN = 'stub-token'
-      const { out } = await withCapture(async () => {
-        await m.runNotifyTest(['--notify-test']).catch((e) => {
-          // 与 main guard catch 同款脱敏出口（进程内复刻：runNotifyTest 的 reject 由 guard 捕；
-          // 这里验证 guard 用的 summarizeError 链——直接调同一函数形态）
-          const { summarizeError } = require('./xbk_failure_policy')
-          const info = summarizeError(e)
-          console.error(`通知自检失败：${info.message || '未知错误'}`)
-          if (Array.isArray(info.failures)) {
-            for (const f of info.failures) {
-              const status = f && f.statusCode ? `（HTTP ${f.statusCode}）` : ''
-              console.error(`  ❌ ${(f && f.channel) || '未知渠道'}：${(f && (f.message || f.code)) || '发送失败'}${status}`)
-            }
-          }
-        })
+      const nodeOptions = [process.env.NODE_OPTIONS, `--require=${stubPath}`].filter(Boolean).join(' ')
+      const run = spawnSync(process.execPath, [path.join(__dirname, 'xbk_function_v3.js'), '--notify-test'], {
+        cwd: __dirname,
+        encoding: 'utf8',
+        timeout: 30000,
+        env: { ...process.env, NODE_OPTIONS: nodeOptions }
       })
-      const text = outText(out)
-      assertRc(text.includes('通知自检失败'), '应输出失败结论')
-      assertRc(text.includes('connection refused') || text.includes('HTTP'), '应含脱敏原因')
+      const text = `${run.stdout || ''}${run.stderr || ''}`
+      assertRc(run.status === 1, `退出码应为 1，实际 ${run.status}`)
+      assertRc(text.includes('通知自检失败'), '真 guard 应输出失败结论')
+      assertRc(!text.includes(SECRET), '凭证哨兵不得出现在真 guard 输出（脱敏红线）')
       assertRc(!text.includes('[object Object]'), '不得有对象 stringify 痕迹')
-      assertRc(!text.includes('PPT_SECRET 回显'), '响应体回显内容不得出现在脱敏摘要')
     } finally {
-      require.cache[gotPath].exports.post = origPost
+      fs.rmSync(stubDir, { recursive: true, force: true })
     }
-  }))
+  })
 
   // S6b 退出码口径：无渠道 → NO_CHANNEL_CONFIG reject → guard 出 1（进程内复刻 guard 形态）
   await test('无渠道: NO_CHANNEL_CONFIG → 脱敏失败出口（含渠道清单文案）', () => withChannels(async () => {

@@ -508,10 +508,11 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
     setErr('')
     setBusy(true)
     try {
-      // 202 响应带首轮 runId——交给 App 登记为 busy 归属（G_nv 解锁判据）。
-      // 通知自检走独立端点（fetch 字面量 /api/notify-test，无 body）。
+      // 202 响应带首轮 runId（epoch.seq 字符串，v3.299）——交给 App 登记为 busy 归属
+      // （G_nv 解锁判据）。Sourcery Medium：makeRunId 返回字符串，这里不能按数字过滤，
+      // 否则 busy 状态丢 run 关联（自检 202 的 string id 被误判为 null）。
       const data = action === 'notify-test' ? await triggerNotifyTest() : await trigger(action)
-      onTriggered(data && typeof data.id === 'number' ? data.id : null)
+      onTriggered(data && typeof data.id === 'string' ? data.id : null)
       // busy 不在此处清零（Sourcery vvo）：202 只代表已受理，子进程还在跑；
       // App 的「提交轮进历史」派生 + BUSY_FALLBACK 兜底负责解锁。
     } catch (e) {

@@ -386,7 +386,7 @@ async function runNotifyTest (args = process.argv.slice(2)) {
   // console.js cancel 留痕同形态）+ 主机名——用户可核对到达时间与来源机器。
   const stampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
   const title = 'xbk-push 通知自检'
-  const desp = `版本 v${PKG_VERSION}\n时间：${stampFmt.format(new Date())}（Asia/Shanghai）\n主机：${os.hostname()}\n\n收到本条即代表推送链路各渠道畅通（--notify-test 自检消息，内容固定，不含线报数据）。`
+  const desp = `版本 v${PKG_VERSION}\n时间：${stampFmt.format(new Date())}（Asia/Shanghai）\n主机：${os.hostname()}\n\n收到本条仅代表该渠道送达（--notify-test 会对每个渠道各发一条；其他渠道是否成功以命令行汇总为准）。内容固定，不含线报数据。`
   // 防线4 HITOKOTO 抑制：开关只读模块级 push_config.HITOKOTO（slim 开启条件 true/'true'），
   // 临时置禁 + finally 恢复；自检消息必须内容固定且零额外外部请求。push_config 是 slim 导出的同一活对象。
   const savedHitokoto = notify.push_config.HITOKOTO
@@ -401,13 +401,22 @@ async function runNotifyTest (args = process.argv.slice(2)) {
   }
   // 结果汇总（防线5）：successfulChannels/failures 直接送渠道粒度（sendNotify 返回形态），
   // failures[].message 已是 slim safeErr 脱敏产物；禁止 console.log(e)/JSON.stringify(e)。
+  // Sourcery Medium（Provider responses control terminal）：provider 返回的错误文本即使
+  // 经过 safeErr 脱敏仍可能含 ANSI/OSC 终端控制序列——自检在终端跑，必须剥掉再打印。
+  const stripTerminalCtrl = (s) => String(s)
+    // OSC 序列：ESC ] … 直到 BEL 或 ST（ESC \）
+    .replace(/\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)/g, '')
+    // CSI 序列：ESC [ 参数字节…终止字节
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+    // 残余 C0/C1 控制字符（TAB/换行除外）
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '')
   const okChannels = Array.isArray(result && result.successfulChannels) ? result.successfulChannels : []
   const failures = Array.isArray(result && result.failures) ? result.failures : []
   console.log(`通知自检完成：成功 ${okChannels.length} 个渠道，失败 ${failures.length} 个渠道`)
-  for (const ch of okChannels) console.log(`  ✅ ${ch}`)
+  for (const ch of okChannels) console.log(`  ✅ ${stripTerminalCtrl(ch)}`)
   for (const f of failures) {
     const status = f && f.statusCode ? `（HTTP ${f.statusCode}）` : ''
-    console.log(`  ❌ ${(f && f.channel) || '未知渠道'}：${(f && (f.message || f.code)) || '发送失败'}${status}`)
+    console.log(`  ❌ ${stripTerminalCtrl((f && f.channel) || '未知渠道')}：${stripTerminalCtrl((f && (f.message || f.code)) || '发送失败')}${status}`)
   }
   // 退出码口径 D3：≥1 渠道成功 → 0；否则 1（全失败路径走不到这里——sendNotify 抛
   // ALL_CHANNELS_FAILED/NO_CHANNEL_CONFIG → 顶层 catch；此处兜底空数组形态）。

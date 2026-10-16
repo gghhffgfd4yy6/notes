@@ -105,7 +105,8 @@ process.on('exit', () => {
   process.stderr.write('__NOTIFY_PROBE__' + JSON.stringify({ writes, sendCalls: sendCalls.length, sendArgs }) + '\\n')
 })
 `
-  const p = path.join(os.tmpdir(), `xbk-notify-stub-${process.pid}.js`)
+  const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-notify-stub-'))
+  const p = path.join(stubDir, 'stub.js')
   fs.writeFileSync(p, stub)
   return p
 })()
@@ -173,6 +174,6 @@ function probeOf (run) {
   assert.ok(!merged.includes('dry-run 单轮'), '不得出现 dry-run 单轮摘要')
   assert.ok(!/共 \d+ 条/.test(merged), '不得出现抓取统计（runSingleEntry 痕迹）')
 }
-fs.rmSync(notifyStubPath, { force: true })
+fs.rmSync(path.dirname(notifyStubPath), { recursive: true, force: true })
 
 console.log('✅ 青龙命令行：--check 诊断与 --dry-run 参数已接入')

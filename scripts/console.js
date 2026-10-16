@@ -368,11 +368,20 @@ function startAction (actionKey, now, activeChildren) {
   const childEnv = { ...process.env }
   delete childEnv.XBK_DRY_RUN
   delete childEnv.XBK_CONSOLE_TOKEN
-  const child = spawn(process.execPath, [entryFile, ...action.args], {
-    cwd: ROOT,
-    env: childEnv,
-    stdio: ['ignore', 'pipe', 'pipe']
-  })
+  const child = (() => {
+    try {
+      return spawn(process.execPath, [entryFile, ...action.args], {
+        cwd: ROOT,
+        env: childEnv,
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+    } catch (e) {
+      // spawn 同步抛（EMFILE 等资源极端）：runs 里已登记死记录，必须摘除后再抛，
+      // 让调用侧 acceptAction 回滚重放帧与锁（Sourcery Medium：Failed spawn leaves trigger locked）。
+      runs.delete(id)
+      throw e
+    }
+  })()
   if (activeChildren) activeChildren.add(child)
   const decoder = new StringDecoder('utf8')
   const append = (chunk) => {
@@ -1300,9 +1309,28 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 同 action 在窗口内的重复提交返回 409 + 首轮 run id（前端把它当「已在跑」
         // 呈现，不再发起新一轮）；换动作不覆盖他动作的记录。
         // Sourcery High Retries-duplicate x2（多进程 stale map / 落盘晚于 spawn）：
-        // 受理顺序改为「实时读盘合并 → 记 pending 帧 → 同步落盘（失败即拒绝）→ acquireLock
-        // → startAction → 补写真实 runId → 再落盘」。pending 帧（runId=0）本身就能拦截
-        // 窗口内重试；spawn 前记录已持久化，进程在 spawn 后崩溃也有完整重放记录。
+        // 受理顺序为「acquireLock → 持锁后实时读盘合并 → 判窗 → 记 pending 帧 → 同步落盘
+        // （失败即拒绝）→ startAction → 补写真实 runId → 再落盘」。读盘-判窗-落盘全程
+        // 持锁（Sourcery Medium：先读后锁存在 stale map 窗口——另一进程在此间落盘的话
+        // 本进程会用陈旧记录放行重复动作），pending 帧（runId=0）本身就能拦截窗口内重试；
+        // spawn 前记录已持久化，进程在 spawn 后崩溃也有完整重放记录。
+        // 例外：锁被其他动作占着时（acquireLock 失败）先做一次锁外只读判窗——窗口内重试
+        // 即使撞上他动作运行中也按「重放拦截」回（带首轮 runId），不降级成裸锁冲突
+        // （G_4Kf 用例语义；竞态由锁内二次判窗兜底，锁外这层只是报错形态优化）。
+        const winMsPre = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : REPLAY_WINDOW_MS
+        if (!acquireLock(stateDir, now, ownerToken)) {
+          // readLastAccept 返回 [key, value] 数组（非 Map），用 find 取当前动作记录。
+          const persistedPre = readLastAccept(lastAcceptPath)
+          const prevPrePair = persistedPre.find(([k]) => k === action)
+          const prevPre = prevPrePair ? prevPrePair[1] : lastAccept.get(action)
+          if (prevPre && now - prevPre.at < winMsPre) {
+            const rid = prevPre.runId
+            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true })
+            return
+          }
+          sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
+          return
+        }
         const persisted = readLastAccept(lastAcceptPath)
         for (const [k, v] of persisted) {
           if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
@@ -1315,11 +1343,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // runId = epoch.seq 字符串（v3.299 评审）：0 是 pending 帧哨兵（数字），
           // 真实 runId 只在 startAction 之后落盘——用「数字 0」判 pending，其余原样下发。
           const rid = prev.runId
+          releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
           sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true })
-          return
-        }
-        if (!acquireLock(stateDir, now, ownerToken)) {
-          sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
           return
         }
         lastAccept.set(action, { at: now, runId: 0 })
@@ -1337,7 +1362,19 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           sendJson(res, 500, { error: '重放记录持久化失败，动作未执行（fail-closed）' })
           return
         }
-        const record = startAction(action, now, activeChildren)
+        let record
+        try {
+          record = startAction(action, now, activeChildren)
+        } catch (e) {
+          // startAction 同步抛（spawn 资源极端，Sourcery Medium）：回滚重放帧与锁，
+          // 让用户可重试，而不是被卡到陈旧接管。恢复 pending 前值语义同落盘失败分支。
+          lastAccept.delete(action)
+          const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
+          if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：锁将保留到陈旧接管（约 10 分钟）。`)
+          console.error(`⚠️ ${action} 启动失败（spawn）：${e && e.message ? e.message : e}`)
+          sendJson(res, 500, { error: '动作启动失败，已回滚，可稍后重试' })
+          return
+        }
         record._stateDir = stateDir
         record._lockAt = now
         record._lockToken = ownerToken
