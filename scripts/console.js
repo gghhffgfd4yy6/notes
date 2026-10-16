@@ -554,7 +554,7 @@ function bestEffortDecode (s) {
     if (c !== '%') { out += c; continue }
     const hex = s.slice(i + 1, i + 3)
     if (/^[0-9a-fA-F]{2}$/.test(hex)) {
-      out += String.fromCharCode(parseInt(hex, 16))
+      out += String.fromCharCode(Number.parseInt(hex, 16))
       i += 2
     } else {
       out += c

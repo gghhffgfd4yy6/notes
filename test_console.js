@@ -575,11 +575,12 @@ function sseCollect (port, urlPath, { headers } = {}) {
   req.end()
   const waitFor = async (pred, ms = 5000) => {
     const to = Date.now() + ms
+    // S7727：pred 直传 some 会把「index/array」作第 2/3 参泄漏给谓词——包一层单参箭头。
     while (Date.now() < to) {
-      if (events.some(pred)) return true
+      if (events.some((e) => pred(e))) return true
       await new Promise((_resolve) => setTimeout(_resolve, 25))
     }
-    return events.some(pred)
+    return events.some((e) => pred(e))
   }
   const close = () => {
     try { if (resRef) resRef.destroy() } catch (e) { /* 已断 */ }
@@ -1001,7 +1002,7 @@ async function main () {
     const res = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
     const j = JSON.parse(res.text)
     assert.ok(Array.isArray(j), '成功 JSON 导出=直接数组（评审 231-M1）')
-    assert.deepStrictEqual(Object.keys(j[0]).sort(), ['cate', 'excerpt', 'id', 'time', 'title'], '恰五键')
+    assert.deepStrictEqual(Object.keys(j[0]).sort((a, b) => a.localeCompare(b)), ['cate', 'excerpt', 'id', 'time', 'title'], '恰五键')
     const raw = JSON.stringify(j[0])
     for (const k of ['url', 'price', 'cateid', 'content_html', 'shijianchuo', '_f', 'rowKey', 'datetime', 'shorttime']) {
       assert.ok(!raw.includes(`"${k}"`), `不得携带内部字段 ${k}`)
@@ -2329,7 +2330,7 @@ async function main () {
     const log = await fetchLog(port)
     assert.ok(log.items.length >= 2, `至少含两条此前请求（实际 ${log.items.length}）`)
     for (const it of log.items) {
-      assert.deepStrictEqual(Object.keys(it).sort(), ['at', 'method', 'ms', 'path', 'src', 'status'], '字段恰为六个（字典序）')
+      assert.deepStrictEqual(Object.keys(it).sort((a, b) => a.localeCompare(b)), ['at', 'method', 'ms', 'path', 'src', 'status'], '字段恰为六个（字典序）')
       assert.match(it.at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, 'at = 上海戳 YYYY-MM-DD HH:mm:ss')
       assert.ok(Number.isInteger(it.ms) && it.ms >= 0, 'ms 为 ≥0 整数')
       assert.strictEqual(it.src, '127.0.0.1', 'src = remoteAddress 字符串（listen 绑 127.0.0.1，无 ::ffff: 前缀）')
