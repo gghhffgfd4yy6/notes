@@ -276,16 +276,30 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 2142 行（2678+ 变异体）整段跑曾连续两轮在 CI 变异评估阶段 5.5h 零输出
-          # 被 step 330min 杀死（dry-run 均过）——拆两行段并行，评估窗口减半，排除 perTest 归因雪崩面。
+          # console.js 2142 行（实测 2678 变异体）：变异评估成本 ≈ 变异体数 × 13.3s（C=8，历史
+          # 成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）⇒ 整段 ≈ 594min、
+          # 两片各 ≈ 297min 都逼近/超过 step 330min 上限（前两轮整段各 330min 被杀即此因，不是挂死）。
+          # 按上限倒推取 5 片（各 ~536 体 ≈ 120-180min，含新测试更慢的余量）。
           # 行段连续不重叠全覆盖（check-mutation-ranges 校验）；段名与 mutation-report EXPECTED_SEGMENTS 双向对账。
           - name: console-part1
             src: "scripts/console.js"
-            mutate: "scripts/console.js:1-1100"
+            mutate: "scripts/console.js:1-428"
             config: "stryker.tap.config.js"
           - name: console-part2
             src: "scripts/console.js"
-            mutate: "scripts/console.js:1101-2142"
+            mutate: "scripts/console.js:429-856"
+            config: "stryker.tap.config.js"
+          - name: console-part3
+            src: "scripts/console.js"
+            mutate: "scripts/console.js:857-1284"
+            config: "stryker.tap.config.js"
+          - name: console-part4
+            src: "scripts/console.js"
+            mutate: "scripts/console.js:1285-1712"
+            config: "stryker.tap.config.js"
+          - name: console-part5
+            src: "scripts/console.js"
+            mutate: "scripts/console.js:1713-2142"
             config: "stryker.tap.config.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

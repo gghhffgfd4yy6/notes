@@ -13,7 +13,7 @@ const EXPECTED_SEGMENTS = Object.freeze([
   'v3-entry', 'app', 'filter', 'formatter', 'message-store', 'network', 'pusher', 'rules', 'utils',
   'sendnotify-part1', 'sendnotify-part2',
   'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push', 'check-deps', 'status',
-  'console-part1', 'console-part2'
+  'console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5'
 ])
 
 // stryker 报告的合法变异状态——权威来源是本仓已安装的 mutation-testing-report-schema 里

@@ -25,10 +25,11 @@ const SPECIAL_SEGMENTS = {
   'qinglong/xbk_push.js': ['qinglong-push'],
   'scripts/check-deps.js': ['check-deps'],
   'scripts/status.js': ['status'],
-  'scripts/console.js': ['console-part1', 'console-part2']
+  'scripts/console.js': ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5']
 }
-// 拆段边界固定（与 mutation.yml 真实矩阵一致），终点随文件增长自动跟随
-const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': 750, 'scripts/console.js': 1100 }
+// 拆段边界固定（与 mutation.yml 真实矩阵一致），终点随文件增长自动跟随。
+// 值为边界数组：N 个边界 ⇒ N+1 段（单边界即两段拆法）。
+const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': [750], 'scripts/console.js': [428, 856, 1284, 1712] }
 
 // 构造包含所有生产文件的 yml，行段可按文件覆盖
 function buildYml (overrides = {}) {
@@ -44,8 +45,10 @@ function buildYml (overrides = {}) {
     const raw = fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : 'x\n'
     const lines = raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
     const names = SPECIAL_SEGMENTS[f] || [f.replace(/^xbk_/, '').replace(/\.js$/, '').replace(/_/g, '-')]
-    const fallback = SPLIT_BOUNDARY_RANGES[f]
-      ? [`1-${SPLIT_BOUNDARY_RANGES[f]}`, `${SPLIT_BOUNDARY_RANGES[f] + 1}-${lines}`]
+    const bounds = SPLIT_BOUNDARY_RANGES[f]
+    const edges = bounds ? [0, ...bounds, lines] : null
+    const fallback = edges
+      ? edges.slice(0, -1).map((start, i) => `${start + 1}-${edges[i + 1]}`)
       : [`1-${lines}`]
     const ranges = Array.isArray(overrides[f]) ? overrides[f] : (overrides[f] ? [overrides[f]] : fallback.map(() => null))
     return ranges.map((range, i) => {
