@@ -65,7 +65,7 @@ function fmtBytes (b) {
 // 刷新链路不阻塞，历史与状态在下一轮照常更新。
 // Codacy Critical（SSRF 启发式：fetch 收到「用户可控 URL」）：每个端点独立函数、
 // URL 全部为字面量——fetch 的第一个参数在数据流上只有字面量一种来源，不存在
-// 「变量 URL」路径。run id 是服务端生成的数字 id，详情端点以独立函数封装。
+// 「变量 URL」路径。run id 是服务端生成的 `epoch.seq` 字符串（不是数字），详情端点以独立函数封装。
 // Sourcery Stalled-bodies x3：fetch() 在收到响应头时就 resolve，此前 clearTimeout 让
 // 「头到了、body 挂起」的响应绕过超时——轮询消费 res.json() 时永久等待，刷新链路卡死。
 // 修复：期限定时器不在 fetch resolve 时清掉，而是移交给 body 消费方（readBodyJson），
@@ -332,6 +332,22 @@ function Badge ({ tone, children }) {
   return html`<span class="badge ${cls}">${children}</span>`
 }
 
+// 提示行：tone='error' 时红色。页面不再拼 'hint hint-err' 字符串。
+function Hint ({ tone, style, children }) {
+  return html`<div class=${tone === 'error' ? 'hint hint-err' : 'hint'} style=${style}>${children}</div>`
+}
+
+// 指标卡：标题 + 右上角徽章 + 若干行文本。换卡片实现（或组件库）只改这里。
+function Card ({ title, badge, children }) {
+  return html`<div class="card">
+    <div class="card-head">
+      <span class="card-title">${title}</span>
+      ${badge}
+    </div>
+    <div class="card-lines">${children}</div>
+  </div>`
+}
+
 // ── 状态归类（Sourcery vvy/vv4/vvX/vwc/vvG：错误态/中断态/畸形条目/失败数不得伪装成健康）──
 
 // 部件三态判定（Sourcery G_od/G_oY）：readStatus 对「文件还没建」返回 truthy status
@@ -480,13 +496,10 @@ function StatusCards ({ state }) {
     ...diagCard(state)
   ]
   return html`<div class="cards">
-    ${cards.map((c) => html`<div class="card" key=${c.title}>
-      <div class="card-head">
-        <span class="card-title">${c.title}</span>
-        <${Badge} tone=${c.tone}>${c.tone === 'run' ? '—' : (c.tone === 'ok' ? '正常' : '异常')}<//>
-      </div>
-      <div class="card-lines">${c.lines.map((l) => html`<div key=${l}>${l}</div>`)}</div>
-    </div>`)}
+    ${cards.map((c) => html`<${Card} key=${c.title} title=${c.title}
+      badge=${html`<${Badge} tone=${c.tone}>${c.tone === 'run' ? '—' : (c.tone === 'ok' ? '正常' : '异常')}<//>`}>
+      ${c.lines.map((l) => html`<div key=${l}>${l}</div>`)}
+    <//>`)}
   </div>`
 }
 
@@ -539,8 +552,8 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
         <span class="btn-desc">${a.desc}</span>
       </div>`)}
     </div>
-    ${locking && html`<div class="hint"><span class="spin"></span> 任务进行中…（完成后自动解锁）</div>`}
-    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${locking && html`<${Hint}><span class="spin"></span> 任务进行中…（完成后自动解锁）<//>`}
+    ${err && html`<${Hint} tone="error">${err}<//>`}
   </div>`
 }
 
@@ -710,7 +723,7 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
       <span class="panel-title">触发历史</span>
       <span class="panel-sub">最多 20 条 · 本进程内存</span>
     </div>
-    ${cancelErr && html`<div class="hint hint-err">${cancelErr}</div>`}
+    ${cancelErr && html`<${Hint} tone="error">${cancelErr}<//>`}
     ${runs.length === 0
       ? html`<div class="empty">暂无触发记录</div>`
       : html`<table class="runs-table">
@@ -788,7 +801,7 @@ function RunHistoryPanel () {
       <span style="flex:1"></span>
       <button class="btn btn-ghost" onClick=${() => { load(0) }} disabled=${loading}>刷新</button>
     </div>
-    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${err && html`<${Hint} tone="error">${err}<//>`}
     ${page.status && page.status !== 'ok' && html`<div class="empty">run.log${page.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${page.status}）`}</div>`}
     ${shown.length > 0 && html`<table class="runs-table">
       <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
@@ -869,7 +882,7 @@ function TrendsPanel () {
       <span style="flex:1"></span>
       <button class="btn btn-ghost" onClick=${load}>刷新</button>
     </div>
-    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${err && html`<${Hint} tone="error">${err}<//>`}
     ${trends && trends.status !== 'ok' && html`<div class="empty">日志${trends.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${trends.status}）`}</div>`}
     ${trends && trends.status === 'ok' && html`<div>
       <div class="trend">
@@ -906,7 +919,7 @@ function CacheHealthPanel () {
       <span style="flex:1"></span>
       <button class="btn btn-ghost" onClick=${load}>刷新</button>
     </div>
-    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && !ok && html`<div class="empty">${data.status === 'missing' ? '缓存尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
     ${ok && html`<div class="sys-grid">
       <table class="sys-table"><tbody>
@@ -920,7 +933,7 @@ function CacheHealthPanel () {
         <tr><td>最近写入</td><td>${data.mtimeMs ? fmtTime(data.mtimeMs) : '—'}（停滞 = 推送链路可能断了）</td></tr>
       </tbody></table>
     </div>`}
-    ${ok && (data.nearTrim || data.overLimit || !data.consoleReadable) && html`<div class="hint" style="margin-top:10px">占用达到写端上限 80% 时，下一轮保存会自动裁掉最旧条目并落墓碑——无需人工干预，但如果你希望保留更久，检查推送频率与 maxPerRun 配置。</div>`}
+    ${ok && (data.nearTrim || data.overLimit || !data.consoleReadable) && html`<${Hint} style="margin-top:10px">占用达到写端上限 80% 时，下一轮保存会自动裁掉最旧条目并落墓碑——无需人工干预，但如果你希望保留更久，检查推送频率与 maxPerRun 配置。<//>`}
   </div>`
 }
 
@@ -1050,10 +1063,10 @@ function MessagesPanel () {
       <button class="btn btn-ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}</button>
       <button class="btn btn-ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}</button>
     </div>
-    ${err && html`<div class="hint hint-err">${err}</div>`}
-    ${exportErr && html`<div class="hint hint-err">${exportErr}</div>`}
-    ${exportNote && html`<div class="hint">${exportNote}</div>`}
-    ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<div class="hint">正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）</div>` : ''}</div>`}
+    ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${exportErr && html`<${Hint} tone="error">${exportErr}<//>`}
+    ${exportNote && html`<${Hint}>${exportNote}<//>`}
+    ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<${Hint}>正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）<//>` : ''}</div>`}
     ${data && data.status === 'ok' && html`<div>
       <div class="msg-count">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}</div>
       ${items.length === 0
@@ -1099,7 +1112,7 @@ function LogsPanel ({ pollMs }) {
       <span style="flex:1"></span>
       <button class="btn btn-ghost" onClick=${load}>刷新</button>
     </div>
-    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && data.status !== 'ok' && html`<div class="empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
     ${data && data.status === 'ok' && html`<pre class="logpre">${data.text.length > 0 ? data.text : '（空）'}</pre>`}
   </div>`
@@ -1129,7 +1142,7 @@ function SysPanel () {
       <span style="flex:1"></span>
       <button class="btn btn-ghost" onClick=${refreshAll}>刷新</button>
     </div>
-    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${err && html`<${Hint} tone="error">${err}<//>`}
     ${sys && html`<div class="sys-grid">
       <table class="sys-table"><tbody>
         <tr><td>脚本版本</td><td>v${sys.version || '?'}</td></tr>
@@ -1143,15 +1156,15 @@ function SysPanel () {
         <tr><td>缓存目录</td><td>${sys.cacheDir}</td></tr>
       </tbody></table>
     </div>`}
-    <div class="hint" style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。</div>
-    ${accessErr && html`<div class="hint hint-err">访问日志加载失败：${accessErr.message || accessErr}</div>`}
+    <${Hint} style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。<//>
+    ${accessErr && html`<${Hint} tone="error">访问日志加载失败：${accessErr.message || accessErr}<//>`}
     ${access && access.items && access.items.length === 0 && html`<div class="empty">暂无访问记录（轮询端点与静态资产的成功请求不记入）</div>`}
     ${logTail.length > 0 && html`<details class="access-log"><summary>最近访问记录（最多 20 条，新在上）</summary>
       <table class="sys-table"><tbody>
         ${logTail.map((it, i) => html`<tr key=${`${i}|${it.at}|${it.method}|${it.path}|${it.status}|${it.ms}`}><td>${it.at}</td><td>${it.method} ${it.path} → ${it.status} · ${it.ms}ms</td></tr>`)}
       </tbody></table>
     </details>`}
-    <div class="hint" style="margin-top:12px">数据说明：推送记录来自判重缓存 push.json（服务端已裁剪正文 HTML）；趋势解析 run.log 摘要行；日志取尾部 1 MiB。</div>
+    <${Hint} style="margin-top:12px">数据说明：推送记录来自判重缓存 push.json（服务端已裁剪正文 HTML）；趋势解析 run.log 摘要行；日志取尾部 1 MiB。<//>
   </div>`
 }
 
@@ -1168,7 +1181,7 @@ function FilesPanel () {
       <span style="flex:1"></span>
       <button class="btn btn-ghost" onClick=${load}>刷新</button>
     </div>
-    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && data.status !== 'ok' && html`<div class="empty">${data.status === 'missing' ? '目录尚未生成' : `不可读（${data.status}）`}</div>`}
     ${data && data.status === 'ok' && html`<table class="sys-table"><tbody>
       ${files.map((f) => html`<tr key=${f.name}>
@@ -1176,7 +1189,7 @@ function FilesPanel () {
         <td>${f.kind === 'file' ? `${fmtBytes(f.bytes)} · ${f.type}` : f.kind === 'symlink' ? '⚠️ 符号链接（异常，请排查）' : f.kind}</td>
       </tr>`)}
     </tbody></table>`}
-    <div class="hint" style="margin-top:10px">文件类型：cache=判重缓存 · tombstone=墓碑 · log/state=日志与状态 · lock=锁帧 · backup/temp=异常残留备份。出现 symlink/dir 即目录被异常写入，值得人工排查。</div>
+    <${Hint} style="margin-top:10px">文件类型：cache=判重缓存 · tombstone=墓碑 · log/state=日志与状态 · lock=锁帧 · backup/temp=异常残留备份。出现 symlink/dir 即目录被异常写入，值得人工排查。<//>
   </div>`
 }
 
@@ -1196,7 +1209,7 @@ function ConfigPanel () {
       <span style="flex:1"></span>
       <button class="btn btn-ghost" onClick=${load}>刷新</button>
     </div>
-    ${err && html`<div class="hint hint-err">${err}</div>`}
+    ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && !r && html`<div class="empty">运行配置不可读（模块加载失败——检查部署完整性）</div>`}
     ${r && html`<div class="sys-grid">
       <table class="sys-table"><tbody>
@@ -1226,7 +1239,7 @@ function ConfigPanel () {
       <tr><td>渠道明细</td><td>${chanNames.map((k) => `${k}：${pc.perChannel[k] ? '✅ 已配置' : '未配置'}`).join(' · ')}</td></tr>
       <tr><td>本地配置文件</td><td>${pc.localFilePresent ? 'push_config.local.js 存在（sendNotify 启动时加载；格式异常会在运行日志告警。密钥不入库不入页面）' : '未找到（用环境变量或该文件配置推送）'}</td></tr>
     </tbody></table>`}
-    <div class="hint" style="margin-top:12px">本页为脱敏视图：所有推送密钥（appToken / BOT token 等）的值永不出现在页面或接口响应中，只显示「已配置 / 未配置」。修改配置请编辑 push_config.local.js 或环境变量后重启。</div>
+    <${Hint} style="margin-top:12px">本页为脱敏视图：所有推送密钥（appToken / BOT token 等）的值永不出现在页面或接口响应中，只显示「已配置 / 未配置」。修改配置请编辑 push_config.local.js 或环境变量后重启。<//>
   </div>`
 }
 
