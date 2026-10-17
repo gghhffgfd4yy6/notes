@@ -32,6 +32,8 @@
     --accent-line: rgba(79, 140, 255, .3);
     --accent-hover: rgba(79, 140, 255, .05);
     --accent-sel: rgba(79, 140, 255, .08);
+    --accent-fade: rgba(79, 140, 255, .45);
+    --accent-fade: color-mix(in srgb, var(--accent) 45%, transparent);
     --info-fg: #9db9ff;
 
     /* 状态三件套（背景/描边/前景） */
@@ -43,6 +45,8 @@
     --bad-soft: rgba(229, 83, 75, .14);
     --bad-line: rgba(229, 83, 75, .35);
     --bad-fg: #ff9d97;
+    --bad-fade: rgba(229, 83, 75, .45);
+    --bad-fade: color-mix(in srgb, var(--bad) 45%, transparent);
     --warn: #c9a227;
     --warn-soft: rgba(201, 162, 39, .14);
     --warn-line: rgba(201, 162, 39, .4);
@@ -169,7 +173,7 @@
   .btn:disabled { opacity: .45; cursor: not-allowed; }
   .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 500; }
   .btn-secondary { background: var(--panel-2); }
-  .btn-ghost { background: transparent; border-color: transparent; color: var(--accent); padding: var(--sp-1) var(--sp-2); font-size: var(--fs-sm); min-height: 32px; }
+  .btn-ghost { background: transparent; border-color: transparent; color: var(--accent); padding: var(--sp-1) var(--sp-2); font-size: var(--fs-sm); min-height: 40px; }
   .btn-desc { color: var(--text-dim); font-size: var(--fs-xs); }
 
   /* ── 提示行 ── */
@@ -217,9 +221,9 @@
   /* ── 趋势条形图（纯 CSS）── */
   .trend { display: flex; align-items: flex-end; gap: 6px; height: 120px; padding: var(--sp-2) 2px 0; }
   .trend-col { flex: 1 1 0; display: flex; flex-direction: column; align-items: center; gap: var(--sp-1); min-width: 0; }
-  .trend-bar { width: 100%; max-width: 34px; border-radius: var(--sp-1) var(--sp-1) 0 0; background: linear-gradient(180deg, var(--accent) 0%, rgba(79, 140, 255, .45) 100%); min-height: 2px; position: relative; }
+  .trend-bar { width: 100%; max-width: 34px; border-radius: var(--sp-1) var(--sp-1) 0 0; background: linear-gradient(180deg, var(--accent) 0%, var(--accent-fade) 100%); min-height: 2px; position: relative; }
   .trend-bar.zero { background: var(--border); min-height: 2px; }
-  .trend-bar.fail { background: linear-gradient(180deg, var(--bad) 0%, rgba(229, 83, 75, .45) 100%); }
+  .trend-bar.fail { background: linear-gradient(180deg, var(--bad) 0%, var(--bad-fade) 100%); }
   .trend-n { font-size: var(--fs-2xs); color: var(--text); font-family: var(--mono); }
   .trend-day { font-size: 10.5px; color: var(--text-dim); white-space: nowrap; }
   .trend-day.today { color: var(--accent); }
@@ -231,7 +235,6 @@
     flex: 1 1 200px; min-width: 160px; background: var(--panel-2); color: var(--text);
     border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); font-size: var(--fs-md);
   }
-  .msg-search:focus { outline: 1px solid var(--accent); }
   .msg-select {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
     border-radius: var(--r-sm); padding: var(--sp-2) 10px; font-size: var(--fs-sm); max-width: 260px;
@@ -266,6 +269,7 @@
     .btn-item { flex: 1 1 100%; }
     .btn { width: 100%; min-height: 44px; }
     .tab-btn { min-height: 44px; }
+    .btn-ghost { min-height: 44px; }
     .runs-table th:nth-child(3), .runs-table td:nth-child(3) { display: none; }
   }
 }
