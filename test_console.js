@@ -684,7 +684,7 @@ async function main () {
     assert.ok(verMatch, 'HTML 资产引用必须带内容版本号 ?v=<sha16>')
     // 版本号必须由内容派生（sha256(各文件哈希拼接) 前 16 位），常量/陈旧版本过不了这条
     const crypto = require('node:crypto')
-    const hashes = ['app.css', 'app.js', 'htm-preact.module.js'].map((f) => {
+    const hashes = ['app.css', 'app.js', 'pure.mjs', 'htm-preact.module.js'].map((f) => {
       const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', f))
       return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
     })
@@ -722,7 +722,12 @@ async function main () {
     assert.match(js.headers['content-type'], /text\/javascript/)
     // Sourcery vwr：不能只断言状态码+MIME——空壳 app.js 也过。锁死模块内容标志。
     assert.ok(js.text.includes("from './htm-preact.module.js'"), 'app.js 含真实 import（非空壳）')
+    assert.ok(js.text.includes("from './pure.mjs'"), 'app.js 必须引用纯函数模块')
     assert.ok(js.text.includes('render('), 'app.js 含 render 调用')
+    const pure = await request(port, 'GET', '/assets/pure.mjs', { token: TOKEN })
+    assert.strictEqual(pure.status, 200, '纯函数模块必须可加载（白名单）')
+    assert.match(pure.headers['content-type'], /text\/javascript/)
+    assert.ok(pure.text.includes('export function filterLogLines'), 'pure.mjs 非空壳')
     const lib = await request(port, 'GET', '/assets/htm-preact.module.js', { token: TOKEN })
     assert.strictEqual(lib.status, 200)
     assert.ok(lib.text.length > 10000, '运行时文件非空壳')
@@ -2681,6 +2686,80 @@ async function main () {
     assert.ok(!/rule-val' \+ \(isEmpty\(v\) \? ' empty'/.test(seg), '空值类名不得复用 .empty（全局空态有 14px padding）')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/\.rule-row\s*\{/.test(css) && /\.chan-chip\s*\{/.test(css), '过滤规则/渠道样式必须存在')
+  })
+
+  await aok('行为: relDay / fmtAge / cacheWriteInfo（注入固定时钟）', async () => {
+    const { relDay, fmtAge, cacheWriteInfo } = await import('./scripts/console-assets/pure.mjs')
+    // 2026-10-18 00:00 Asia/Shanghai = 2026-10-17T16:00Z
+    const now = Date.UTC(2026, 9, 17, 16, 0, 0)
+    assert.strictEqual(relDay('2026-10-18', now), '今天')
+    assert.strictEqual(relDay('2026-10-17', now), '昨天')
+    assert.strictEqual(relDay('2026-10-15', now), '3 天前')
+    assert.strictEqual(relDay('2026-10-19', now), '', '未来日期不标注')
+    assert.strictEqual(relDay('not-a-date', now), '', '坏日期不标注')
+    assert.strictEqual(fmtAge(-5000), '刚刚', '负年龄（时钟漂移）按 0 处理')
+    assert.strictEqual(fmtAge(2 * 3600 * 1000), '2 小时前')
+    const DAY = 24 * 3600 * 1000
+    const fresh = cacheWriteInfo(now - 2 * 3600 * 1000, now)
+    assert.strictEqual(fresh.ageText, '2 小时前', '正常年龄必须有相对文案')
+    assert.strictEqual(fresh.stale, false)
+    assert.strictEqual(cacheWriteInfo(now - (DAY - 60000), now).stale, false, '23h59m 不得告警')
+    assert.strictEqual(cacheWriteInfo(now - (DAY + 60000), now).stale, true, '24h01m 必须告警')
+    assert.strictEqual(cacheWriteInfo(now + 5000, now).ageText, '刚刚', '未来 mtime 仍显示相对时间')
+    assert.strictEqual(cacheWriteInfo(null, now).ageText, '', '缺 mtime 不显示年龄')
+  })
+
+  await aok('行为: 日志异常口径与筛选（issue × 关键字交集）', async () => {
+    const { isIssueLogLine, filterLogLines } = await import('./scripts/console-assets/pure.mjs')
+    const okLine = '2026-10-17 23:06:42 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s cachesaved=1'
+    const errLine = '2026-10-17 23:00:00 ERROR 推送全部失败 3 条（通道可能失效）'
+    const alertLine = '2026-10-17 23:00:00 ALERT [v3.0] 运行异常'
+    const failLine = '2026-10-17 23:00:00 total=20 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=1s'
+    const txt = [okLine, errLine, alertLine, failLine].join('\n') + '\n'
+    assert.strictEqual(isIssueLogLine(okLine), false, '正常摘要行不算异常')
+    assert.deepStrictEqual([errLine, alertLine, failLine].map((l) => isIssueLogLine(l)), [true, true, true], 'ERROR/ALERT/failed>0 都算异常')
+    assert.strictEqual(filterLogLines(txt, 'all', '').length, 4, '全部模式保留所有行（含末尾空行剔除）')
+    assert.deepStrictEqual(filterLogLines(txt, 'issue', ''), [errLine, alertLine, failLine])
+    assert.deepStrictEqual(filterLogLines(txt, 'all', 'WXPUSHER'), [], '关键字大小写不敏感，未命中为空')
+    assert.deepStrictEqual(filterLogLines(txt, 'issue', 'alert'), [alertLine], 'issue 与关键字取交集')
+    assert.deepStrictEqual(filterLogLines(txt, 'issue', 'pushed=20'), [], '正常摘要行不混进异常结果')
+  })
+
+  await aok('结构红线: 概览先状态与操作，空触发历史不占位（运行中仍显示）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const start = src.indexOf("${tab === 'overview' && html`<div>")
+    const end = src.indexOf("${tab === 'messages'", start)
+    assert.ok(start > -1 && end > start, '应能定位概览区块')
+    const seg = src.slice(start, end)
+    const order = ['StatusCards', 'TriggerBar', 'TrendsPanel', 'RunHistoryPanel', 'CacheHealthPanel'].map((n) => seg.indexOf(n))
+    assert.ok(order.every((i) => i > -1), '概览必须包含状态卡/触发/趋势/逐轮历史/缓存健康')
+    assert.deepStrictEqual([...order].sort((a, b) => a - b), order, '首屏必须先状态与操作，缓存健康垫底')
+    assert.ok(/\(runs\.length > 0 \|\| locking\) && html`<\$\{RunsPanel\}/.test(seg),
+      '触发历史有记录或任务运行中才渲染（另一实例持锁时不能消失）')
+  })
+
+  await aok('结构红线: 后台标签页不轮询（概览/日志/触发详情三处）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
+    assert.ok(logs.includes('if (pollMs) {'), '轮询间隔必须由 pollMs 控制')
+    assert.ok(logs.includes("const onVis = () => { if (document.visibilityState === 'visible') load()"),
+      '即使 pollMs=0 也要挂 visibilitychange 补拉')
+    const runs = src.slice(src.indexOf('function RunsPanel'), src.indexOf('// ── 组件：逐轮运行历史'))
+    assert.ok(runs.includes("if (document.visibilityState === 'hidden') return"), '触发详情在后台必须跳过请求')
+    assert.ok(runs.includes("document.addEventListener('visibilitychange', onVisibility)"), '切回前台必须补一拍')
+    const app = src.slice(src.indexOf('const active = runs.some'), src.indexOf('// vwU/vv2'))
+    assert.ok(app.includes("document.visibilityState !== 'hidden'"), '概览主轮询在后台必须跳过')
+  })
+
+  await aok('结构红线: 标签页吸顶、切页回顶、缓存每分钟刷新', () => {
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.tabs\s*\{[^}]*position:\s*sticky/.test(css), '标签页必须吸顶')
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes('window.scrollTo(0, 0)'), '切页必须回到顶部')
+    assert.ok(/onClick=\$\{\(\) => switchTab\(t\.key\)\}/.test(src), '标签点击必须走 switchTab，不得绕过')
+    const cache = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('// 推送记录：'))
+    assert.ok(cache.includes('60000'), '缓存健康必须每分钟刷新')
+    assert.ok(cache.includes("document.addEventListener('visibilitychange', onVis)"), '切回前台要补拉缓存快照')
   })
 
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
