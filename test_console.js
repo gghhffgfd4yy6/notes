@@ -2055,11 +2055,15 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
     // 现场证据：生产 run.log 里出现只存在于测试 fixture 的 id 1750000000000.9，且每轮都被标
     // 「中断」——测试实例的取消/停止留痕写进了仓库缓存，子进程也继承了缺省缓存目录。
-    assert.ok(src.includes('childEnv.XBK_CACHE_DIR = stateDir'), '子进程必须钉 XBK_CACHE_DIR 到本实例 stateDir')
-    assert.ok(src.includes('startAction(action, now, activeChildren, runHistoryDir || stateDir)'),
-      'spawn 必须把 runHistoryDir || stateDir 传给子进程（否则 run.log 写不到历史读取目录）')
-    assert.ok(src.includes('const stopDir = runHistoryDir || stateDir'), '停止留痕必须写历史读取目录')
-    assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得回落到运行侧全局缓存目录')
+    // 变异沙箱里 console.js 是插桩后的机器生成代码（语句被 stryMutAct_* 条件包裹），
+    // 源码串断言只对原始源文件有意义；这些红线由 Test workflow 的 npm test 兜底。
+    if (process.env.XBK_MUTATION_CHILD !== '1') {
+      assert.ok(src.includes('childEnv.XBK_CACHE_DIR = stateDir'), '子进程必须钉 XBK_CACHE_DIR 到本实例 stateDir')
+      assert.ok(src.includes('startAction(action, now, activeChildren, runHistoryDir || stateDir)'),
+        'spawn 必须把 runHistoryDir || stateDir 传给子进程（否则 run.log 写不到历史读取目录）')
+      assert.ok(src.includes('const stopDir = runHistoryDir || stateDir'), '停止留痕必须写历史读取目录')
+      assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得回落到运行侧全局缓存目录')
+    }
     // 行为验证：子进程（独立 node）只在真读 XBK_CACHE_DIR 时才可能写到实例目录。
     const dir = fs.mkdtempSync(path.join(__dirname, '.tmp-cache-'))
     try {
