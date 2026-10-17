@@ -920,9 +920,11 @@ function RunHistoryPanel () {
 function usePanelLoader (apiFn) {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
+  const [loading, setLoading] = useState(false)
   const seqRef = useRef(0) // 竞态守卫：只应用「最新一次 load」的响应（审查 Sourcery PR#227）
   const load = useCallback(async () => {
     const seq = ++seqRef.current
+    setLoading(true)
     try {
       const d = await apiFn()
       if (seq !== seqRef.current) return // 已有更新的请求，本次响应作废
@@ -931,9 +933,11 @@ function usePanelLoader (apiFn) {
     } catch (e) {
       if (seq !== seqRef.current) return
       setErr(`加载失败：${e.message}`)
+    } finally {
+      if (seq === seqRef.current) setLoading(false)
     }
   }, [apiFn])
-  return { data, err, load }
+  return { data, err, load, loading }
 }
 
 // 趋势天数选择器固定选项（与服务端白名单 TREND_DAYS_ALLOWED 对齐；14 为默认省略参数）
@@ -1051,12 +1055,48 @@ function msgLink (m, base) {
     title=${title}>原文链接 ↗</a>`
 }
 
+// 分类名是「来源-品类-平台」的三段式（如 好单线报-日用-京东）；按 '-' 建树，
+// 弹层里逐级下钻，而不是把 83 个全名平铺给用户。
+function buildCateTree (categories) {
+  const root = { name: '', path: [], children: new Map(), count: 0, total: 0, full: '' }
+  for (const c of categories) {
+    if (!c || typeof c.name !== 'string' || c.name.length === 0 || c.name.length > 300) continue
+    // 按原始 '-' 段建树（不 trim/去空，避免 A-B 与 A- B 被合并）；最多 6 级，
+    // 防上游塞超深分类名把渲染递归打爆。full 仍保留原始全名，筛选口径不变。
+    const parts = c.name.split('-').slice(0, 6)
+    if (parts.length === 0) continue
+    let node = root
+    for (const p of parts) {
+      if (!node.children.has(p)) node.children.set(p, { name: p, path: [...node.path, p], children: new Map(), count: 0, total: 0, full: '' })
+      node = node.children.get(p)
+    }
+    node.count += Number(c.count) || 0
+    node.full = c.name
+  }
+  const sum = (n) => {
+    let t = n.count
+    for (const ch of n.children.values()) t += sum(ch)
+    n.total = t
+    return t
+  }
+  sum(root)
+  return root
+}
+function flatCateLeaves (node, out = []) {
+  for (const ch of node.children.values()) {
+    if (ch.full) out.push({ name: ch.full, label: ch.path.map((s) => s.trim() || '（空）').join(' › '), count: ch.count })
+    if (ch.children.size > 0) flatCateLeaves(ch, out)
+  }
+  return out
+}
+
 // 分类筛选：自定义弹层而不是原生 <select>。
 // Android 上原生 select 会弹出全屏白底系统列表（80+ 分类、无搜索、与暗色控制台割裂），
 // 这里改为暗色下拉 + 搜索，手机端贴底弹出，选中项打勾。
 function CategoryPicker ({ value, categories, total, onChange }) {
   const [open, setOpen] = useState(false)
   const [q, setQ] = useState('')
+  const [path, setPath] = useState([])
   const [active, setActive] = useState(0)
   const [narrow, setNarrow] = useState(() => window.matchMedia('(max-width: 640px)').matches)
   const [place, setPlace] = useState({ up: false, max: 380 })
@@ -1071,6 +1111,10 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     mq.addEventListener('change', on)
     return () => mq.removeEventListener('change', on)
   }, [])
+  // 每次打开都从一级分类开始；搜索词与高亮项一并清空。
+  useEffect(() => {
+    if (open) { setPath([]); setQ(''); setActive(0) }
+  }, [open])
   // 打开时：桌面把焦点放进搜索框；手机聚焦当前选项（不弹软键盘）。
   useEffect(() => {
     if (!open) return
@@ -1081,8 +1125,8 @@ function CategoryPicker ({ value, categories, total, onChange }) {
       searchRef.current.focus()
     }
   }, [open, narrow])
-  // 搜索词变化后回到第一项，避免 active 指向已被过滤掉的项。
-  useEffect(() => { setActive(0) }, [q])
+  // 搜索词/层级变化后回到第一项，避免 active 指向已被过滤掉的项。
+  useEffect(() => { setActive(0) }, [q, path])
   // 桌面端空间不足时向上翻，并按可用高度限制弹层，避免被视口底边裁掉。
   useEffect(() => {
     if (!open || narrow) return
@@ -1131,13 +1175,41 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   }, [open, narrow])
   const current = categories.find((c) => c.name === value)
   const label = value === '' ? '全部分类' : `${value}${current ? `（${current.count}）` : ''}`
+  const tree = buildCateTree(categories)
+  let node = tree
+  for (const p of path) node = node.children.get(p) || node
   const kw = q.trim().toLowerCase()
-  const shown = kw === '' ? categories : categories.filter((c) => c.name.toLowerCase().includes(kw))
+  const leaves = kw === '' ? [] : flatCateLeaves(tree)
+  const results = kw === '' ? [] : leaves.filter((l) => l.label.toLowerCase().includes(kw) || l.name.toLowerCase().includes(kw))
+  const level = [...node.children.values()].sort((a, b) => b.total - a.total)
+  const options = kw === ''
+    ? [...(path.length === 0 ? [{ key: '__all', label: '全部分类', count: typeof total === 'number' ? total : tree.total, leaf: true, name: '' }] : []),
+        ...level.map((n) => ({ key: n.path.join('-'), label: n.name, count: n.total, leaf: n.children.size === 0, name: n.full, node: n }))]
+    : results.map((l) => ({ key: l.name, label: l.label, count: l.count, leaf: true, name: l.name }))
   const choose = (name) => {
     onChange(name)
     setOpen(false)
     setQ('')
     if (btnRef.current) btnRef.current.focus()
+  }
+  const pick = (o) => {
+    if (!o.leaf) {
+      setPath(o.node.path)
+      setQ('')
+      setActive(0)
+      // 下钻后把焦点放到新一级第一项：键盘 Enter 不会掉到 body 上。
+      setTimeout(() => {
+        const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
+        if (el) el.focus()
+      }, 0)
+      return
+    }
+    choose(o.name)
+  }
+  const go = (nextPath) => {
+    setPath(nextPath)
+    setQ('')
+    setActive(0)
   }
   const dismiss = () => {
     setOpen(false)
@@ -1159,7 +1231,6 @@ function CategoryPicker ({ value, categories, total, onChange }) {
       opts[next].focus()
     }
   }
-  const options = [{ name: '', label: '全部分类', count: typeof total === 'number' ? total : '' }, ...shown.map((c) => ({ name: c.name, label: c.name, count: c.count }))]
   return html`<div class="cate-picker" ref=${rootRef}>
     <button type="button" class="cate-btn" ref=${btnRef} aria-haspopup="dialog"
       aria-expanded=${open ? 'true' : 'false'} onClick=${() => setOpen(!open)}>
@@ -1168,21 +1239,34 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     ${open && html`<div class="cate-backdrop" aria-hidden="true" onClick=${dismiss}></div>
       <div class="cate-pop" ref=${popRef} role="dialog" aria-modal=${narrow ? 'true' : 'false'} aria-label="分类筛选"
         style=${narrow ? '' : `max-height:${Math.max(180, place.max)}px;${place.up ? 'top:auto;bottom:calc(100% + 6px);' : ''}`}>
-        <input class="cate-search" ref=${searchRef} type="search" placeholder="搜索分类…"
+        <input class="cate-search" ref=${searchRef} type="search" placeholder="搜索全部分类…"
           value=${q} onInput=${(e) => setQ(e.target.value)} onKeyDown=${onListKey} />
+        ${kw === ''
+          ? html`<div class="cate-crumb">
+            ${path.length > 0 && html`<button type="button" class="cate-back" aria-label="上一级"
+              onClick=${() => go(path.slice(0, -1))}>‹</button>`}
+            <button type="button" class="cate-crumb-link" onClick=${() => go([])}>全部分类</button>
+            ${path.map((p, i) => html`<span class="cate-crumb-sep">›</span>
+              <button type="button" class="cate-crumb-link" onClick=${() => go(path.slice(0, i + 1))}>${p}</button>`)}
+          </div>`
+          : html`<div class="cate-crumb"><span class="cate-crumb-cur">搜索“${q.trim()}”</span></div>`}
         <div class="cate-list" ref=${listRef} role="listbox" aria-label="分类" onKeyDown=${onListKey}>
-          ${options.map((o, i) => html`<button type="button" key=${o.name || '__all'}
-            class=${'cate-opt' + (value === o.name ? ' active' : '')}
-            role="option" aria-selected=${value === o.name ? 'true' : 'false'}
+          ${options.map((o, i) => html`<button type="button" key=${o.key}
+            class=${'cate-opt' + (o.leaf ? '' : ' group') + (o.leaf && value === o.name ? ' active' : '')}
+            role="option" aria-selected=${o.leaf && value === o.name ? 'true' : 'false'}
             tabIndex=${i === active ? 0 : -1} onFocus=${() => setActive(i)}
-            title=${o.label} onClick=${() => choose(o.name)}>
+            title=${o.label} onClick=${() => pick(o)}>
             <span class="cate-opt-name">${o.label}</span>
             <span class="cate-count">${o.count}</span>
-            <span class="cate-check">${value === o.name ? '✓' : ''}</span>
+            <span class="cate-check">${o.leaf ? (value === o.name ? '✓' : '') : '›'}</span>
           </button>`)}
         </div>
-        ${shown.length === 0 && html`<div class="cate-empty">没有匹配的分类</div>`}
-        <div class="cate-foot">${categories.length + 1} 个分类${typeof total === 'number' ? ` · ${total} 条` : ''} · 滚动查看</div>
+        ${options.length === 0 && html`<div class="cate-empty">没有匹配的分类</div>`}
+        <div class="cate-foot">${kw === ''
+          ? (path.length === 0
+              ? `${level.length + 1} 个一级分类${typeof total === 'number' ? ` · ${total} 条` : ''} · 逐级选择`
+              : `${path[path.length - 1]}：${level.length} 项 · ${node.total} 条 · ${level.some((n) => n.children.size === 0) ? '点选筛选' : '逐级选择'}`)
+          : `${results.length} 个匹配分类 · 点选即筛选`}</div>
       </div>`}
   </div>`
 }
@@ -1194,16 +1278,26 @@ function MessagesPanel () {
   const [input, setInput] = useState('')
   const [query, setQuery] = useState('')
   const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
+  const sentQueryRef = useRef('') // 当前请求实际发出的 query（含防抖未落地的新输入）
   // 搜索防抖：输入停 300ms 才真正改 query（重置回第 1 页）。
   useEffect(() => {
     const t = setTimeout(() => { setQuery(input.trim()); setPage(1) }, 300)
     return () => clearTimeout(t)
   }, [input])
   const fetchMessages = useCallback(
-    () => apiGetMessages({ page, size, cate, q: query }),
+    () => {
+      sentQueryRef.current = query
+      return apiGetMessages({ page, size, cate, q: query })
+    },
     [page, size, cate, query])
-  const { data, err, load } = usePanelLoader(fetchMessages)
+  const { data, err, load, loading } = usePanelLoader(fetchMessages)
   useEffect(() => { load().catch(() => {}) }, [load])
+  // 搜索框回车 / 刷新前先把未落地的输入立刻生效，避免「刚打完字点刷新，还是旧结果」。
+  const refreshNow = () => {
+    const q = input.trim()
+    if (q !== query || page !== 1) { setQuery(q); setPage(1); return }
+    load().catch(() => {})
+  }
   const [exporting, setExporting] = useState('') // '' | 'csv' | 'json'：加载态防连点（两按钮共用一闸）
   const [exportErr, setExportErr] = useState('')
   const [exportNote, setExportNote] = useState('')
@@ -1270,35 +1364,40 @@ function MessagesPanel () {
   }, [exporting, cate, query])
   const items = data && Array.isArray(data.items) ? data.items : []
   const categories = data && Array.isArray(data.categories) ? data.categories : []
-  // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，避免「显示原词、结果未过滤」。
-  // 只在 data 变化时对齐（standard 无 react-hooks 插件，不用行内豁免）。
+  // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，
+  // 但只在「响应确实属于当前查询、且用户没有继续输入」时回写；
+  // 否则旧响应会把刚打的新词覆盖回旧值（搜索像没生效）。
   useEffect(() => {
-    if (data && typeof data.queryUsed === 'string' && data.queryUsed !== input.trim()) {
+    if (!data || typeof data.queryUsed !== 'string') return
+    if (sentQueryRef.current !== query) return
+    if (data.queryUsed !== sentQueryRef.current && input.trim() === sentQueryRef.current) {
       setInput(data.queryUsed)
       setQuery(data.queryUsed)
     }
-  }, [data])
+  }, [data, input, query])
   return html`<div class="panel">
     <${PanelHead} title="推送记录" sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
       <input class="msg-search" type="search" placeholder="搜索标题 / 内容…" value=${input}
-        onInput=${(e) => setInput(e.target.value)} />
+        onInput=${(e) => setInput(e.target.value)}
+        onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); refreshNow() } }} />
       <${CategoryPicker} value=${cate} categories=${categories}
         total=${data && typeof data.grandTotal === 'number' ? data.grandTotal : null}
         onChange=${(v) => { setCate(v); setPage(1) }} />
       <select class="msg-select" value=${size} onChange=${(e) => { setSize(Number(e.target.value)); setPage(1) }} aria-label="每页显示条数">
         ${[10, 20, 50, 100].map((n) => html`<option key=${n} value=${n}>每页 ${n} 条</option>`)}
       </select>
-      <${Button} variant="ghost" onClick=${load}>刷新<//>
+      <${Button} variant="ghost" disabled=${loading} onClick=${refreshNow}>${loading ? '刷新中…' : '刷新'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
     </div>
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${exportErr && html`<${Hint} tone="error">${exportErr}<//>`}
     ${exportNote && html`<${Hint}>${exportNote}<//>`}
+    ${loading && !data && html`<div class="empty">加载中…</div>`}
     ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<${Hint}>正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）<//>` : ''}</div>`}
     ${data && data.status === 'ok' && html`<div>
-      <div class="msg-count">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}</div>
+      <div class="msg-count" aria-live="polite">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}${loading ? html`<span class="msg-loading"> · 更新中…</span>` : ''}</div>
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
         : html`<div class="msg-list">
@@ -1485,11 +1584,13 @@ function App () {
   const [busy, setBusy] = useState(false)
   const [lastSync, setLastSync] = useState(null)
   const [syncErr, setSyncErr] = useState('')
+  const [tab, setTab] = useState('overview')
   const timerRef = useRef(null)
   const seqRef = useRef(0)
   // 轮询互斥（Sourcery G_oY）：上一轮未完成时跳过本轮 tick，不在途中叠加新请求
   // （fetch 有 8s 期限，跳过最多让数据晚 2-5s 更新，换来零堆积）。
   const inFlightRef = useRef(false)
+  const pendingRefreshRef = useRef(false)
   // busy 由哪一次提交引起（Sourcery G_nv：解锁判据是「提交的那一轮出现在历史里」，
   // 不管它现在是否已结束——否则任务秒完成时按钮锁到 11 分钟兜底才开）。
   const busyRunIdRef = useRef(null)
@@ -1501,7 +1602,11 @@ function App () {
   // 乱序防护（Sourcery vwE）：每次 refresh 领号，落后响应直接丢弃（落后 ≠ 失败，
   // 落后者静默丢弃不报错——Sourcery vwB：报「刷新失败」是误导）。
   const refreshSplit = useCallback(async () => {
-    if (inFlightRef.current) return
+    if (inFlightRef.current) {
+      // 切回概览时若上一轮还在路上，标记一次补刷，等 finally 再跑。
+      pendingRefreshRef.current = true
+      return
+    }
     inFlightRef.current = true
     const seq = ++seqRef.current
     const errs = []
@@ -1522,6 +1627,10 @@ function App () {
       else setSyncErr('')
     } finally {
       inFlightRef.current = false
+      if (pendingRefreshRef.current) {
+        pendingRefreshRef.current = false
+        refreshSplit()
+      }
     }
   }, [])
 
@@ -1535,9 +1644,13 @@ function App () {
   useEffect(() => {
     refreshSplit()
     clearInterval(timerRef.current)
+    // 概览与运行日志需要状态新鲜（日志的 pollMs 取决于 task 是否在跑）；
+    // 推送记录/配置/系统不轮询，避免每 5s 的 App 重渲染让页面闪一下。
+    // 切回需要的页时会立即补一次 refreshSplit。
+    if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)
     timerRef.current = setInterval(refreshSplit, locking ? POLL_BUSY_MS : POLL_MS)
     return () => clearInterval(timerRef.current)
-  }, [refreshSplit, locking])
+  }, [refreshSplit, locking, tab])
 
   // vwU/vv2：busy 提交成功后启动兜底闹钟；active 确认或超时即清。
   // Sourcery Old-run-unlocks-new-trigger：兜底清 busy 时必须同步清 busyRunIdRef——
@@ -1576,9 +1689,8 @@ function App () {
     refreshSplit()
   }, [refreshSplit])
 
-  // v3.297 标签页状态：概览 / 推送记录 / 日志 / 系统。切到非概览页时主轮询继续跑
-  // （后台保持状态新鲜，切回来即时可用），但该页的重内容组件只在挂载时拉取。
-  const [tab, setTab] = useState('overview')
+  // v3.297 标签页状态：概览 / 推送记录 / 日志 / 系统。非概览页不跑主轮询，
+  // 避免每 5s 的 App 重渲染让推送记录/配置页「闪一下」（刷新记录页有自己的加载）。
   const TABS = [
     { key: 'overview', label: '概览' },
     { key: 'messages', label: '推送记录' },
@@ -1594,7 +1706,7 @@ function App () {
         <${Badge} tone=${locking ? 'run' : 'ok'}>${locking ? '任务运行中' : '空闲'}<//>
       </div>
       <div class="sync">
-        自动刷新${lastSync ? ` · ${fmtTime(lastSync)}` : ''}
+        ${tab === 'overview' || tab === 'logs' ? '自动刷新' : '数据截至'}${lastSync ? ` · ${fmtTime(lastSync)}` : ''}
         ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
       </div>
     </header>
