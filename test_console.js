@@ -2440,6 +2440,19 @@ async function main () {
     }
     assert.deepStrictEqual(offenders, [], `fetch/EventSource 第一参数必须是字面量或字面量三元：${offenders.join(' | ')}`)
   })
+
+  // 静态红线：Authorization 头必须是 `Bearer ${BOOT.token}` 形态。
+  // 背景（2026-10-17 真实故障）：POST /trigger 与 /api/notify-test 的头一度被写成
+  // `Authorization: `*** ${BOOT.token}`` —— GET 走 Cookie 照常工作、页面全绿，只有写动作
+  // 恒 401「触发失败：unauthorized」。运行期无浏览器测试可抓，只能靠源码形态断言。
+  await aok('静态红线: app.js 的 Authorization 头一律 Bearer 形态（防 *** 占位符回潮）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const authLines = src.split('\n').filter(l => l.includes('Authorization:') && !l.trim().startsWith('//'))
+    assert.ok(authLines.length > 0, '应存在 Authorization 头')
+    const bad = authLines.filter(l => !/Authorization:\s*`Bearer \$\{BOOT\.token\}`/.test(l))
+    assert.deepStrictEqual(bad.map(s => s.trim()), [], 'Authorization 头必须使用 Bearer 前缀加 boot token')
+    assert.ok(!src.includes('***'), 'app.js 不得残留 *** 占位符')
+  })
 }
 
 main()

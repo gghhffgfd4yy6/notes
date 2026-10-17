@@ -295,7 +295,7 @@ async function trigger (action) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: `*** ${BOOT.token}`
+        Authorization: `Bearer ${BOOT.token}`
       },
       body
     },
@@ -311,7 +311,7 @@ async function triggerNotifyTest () {
   return triggerVia(
     {
       method: 'POST',
-      headers: { Authorization: `*** ${BOOT.token}` }
+      headers: { Authorization: `Bearer ${BOOT.token}` }
     },
     (merged) => fetch('/api/notify-test', merged),
     '刚才那次通知自检已受理（正在运行或已完成），60 秒内无需重复',
