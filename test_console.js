@@ -2536,7 +2536,13 @@ async function main () {
     // 面板头/按钮同理：类名契约只在原语里出现一次
     assert.strictEqual(attrs.filter(c => /(^|\s)panel-head(\s|$)/.test(c)).length, 1, 'panel-head 只允许出现在 PanelHead 原语里')
     assert.strictEqual(attrs.filter(c => /(^|\s)panel-title(\s|$)/.test(c)).length, 1, 'panel-title 只允许出现在 PanelHead 原语里')
-    assert.deepStrictEqual(attrs.filter(c => /^btn btn-/.test(c)), [], '按钮必须走 Button 原语，不得手写 btn btn-*')
+    assert.deepStrictEqual(attrs.filter(c => /(^|\s)btn btn-/.test(c)), [], '按钮必须走 Button 原语，不得手写 btn btn-*（含前缀类名）')
+    // 插值 class=${...} 同样要查：原语自身允许各 1 处，别处不得再写
+    const interp = [...src.matchAll(/class=\$\{([^}]*)\}/g)].map(m => m[1])
+    assert.strictEqual(interp.filter(x => /(^|['"\s])hint(['"\s]|$)/.test(x)).length, 1, 'hint 类名只允许出现在 Hint 原语里')
+    assert.strictEqual(interp.filter(x => /btn btn-/.test(x)).length, 1, 'btn btn-* 只允许出现在 Button 原语里')
+    assert.deepStrictEqual(interp.filter(x => /(^|['"\s])panel-head(['"\s]|$)/.test(x)), [], 'panel-head 只允许出现在 PanelHead 原语里')
+    assert.deepStrictEqual(interp.filter(x => /(^|['"\s])card(['"\s]|$)/.test(x)), [], 'card 只允许出现在 Card 原语里')
   })
 }
 
