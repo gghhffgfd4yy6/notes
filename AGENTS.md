@@ -18,8 +18,7 @@ npm test
 npm run test:filter
 npm run test:app
 npm run test:notify
-npm run test:mutation
-npm run test:mutation-ranges  # 校验矩阵行段覆盖（改带行段的文件后必跑）
+npm run test:mutation-ranges  # 只校验行段，不跑变异；变异评估禁止在本机跑（见下）  # 校验矩阵行段覆盖（改带行段的文件后必跑）
 npm run check:ci-static       # 静态扫描：shellcheck 扫 .githooks/* + zizmor 扫 .github/workflows/
 npm run check:doc-lines       # 文档行长闸门（v3.281）：任何 markdown 单行 > 1200 字符即红
 npm run check:host-clean        # 主机干净度（v3.283）：孤儿测试桩/孤儿套件/过期 tmp 沙箱；两个测试入口与直接 test_filter.js 启动前也会自查
@@ -96,6 +95,6 @@ npm run check:host-clean        # 主机干净度（v3.283）：孤儿测试桩/
   - **非回归已用基线证伪（两处各自做）**：`test_agents.js` 在未含本轮文档改动的 detached worktree（HEAD `167625f`）里单跑同样红 ⇒ 红来自环境注入；`test_run_mutation_cli.js` 把八个文档回退到 HEAD~1 内容后在主树单跑，报出**完全相同**的失败文本「沙箱内单元测试应整体通过，实际 timeout」⇒ 与本轮改动无关。
   - 因此本环境跑 `npm run check` 的正确方式是**带 `DSHA_DNS_MODE=native`**（去掉注入噪声）。历史汇总：48 套件那版出现过 **48/0**、**47/1**、**46/2**；v3.281（49 套件）三轮 **47/2**、**48/1**、**48/1**——其中 `test_run_mutation_cli.js` 的抖动已由 v3.282 的静默线治掉。那条 `test_filter.js` 的红**已归因**：坏轮次红在 `基准: tuisong_replace 1000次 < 300ms`（实测 878ms），清场后同一断言 **276ms** 通过、全链 **49 通过 / 0 失败**（674.9s）；v3.283（50 套件）在干净机器上再跑一轮为 **50 通过 / 0 失败**（550.3s），同条基准 **223ms**——「脏 → 878ms 红 / 干净 → 223–276ms 绿」这条对照就是该归因的证据，也说明新加的主机干净度门禁拦的是真问题。凶手是**被外部 kill / timeout 掉的运行留下的 detached 孤儿桩**——`test_ci_skip_suites.js` 的「挂死套件（带孙进程）」用例每 20ms 写一次盘，而 F6 的整组杀伤只在 `run_unit_tests.js` 主动超时那条路径生效，**从外面 SIGKILL 父进程时孙进程照旧存活**。⇒ 报本机结果仍须带轮次与耗时，跨环境最终判据是 CI。**同理别把「CI 没跑」读成平台故障**：PR 处于 CONFLICTING/DIRTY 时 GitHub 不创建任何 Actions run（连 `github-actions` 的 check-suite 都不建，而外部分析服务照常有套件），v3.283 实测 rebase 到 main 变 MERGEABLE 的瞬间三条 run 全起来 ⇒ 查 CI 状态先看 `gh pr view --json mergeable,mergeStateStatus`；squash 合并过的分支要继续推，就先 `git rebase --onto origin/main <已合并提交>`。
   - **脏机器不启动**（v3.282 登记 → v3.283 落成门禁）：`run_tests.js` / `run_unit_tests.js` / 直接 `test_filter.js` 入口先跑 `scripts/check-host-clean.js`——发现**孤儿测试桩**（`stub_heartbeat` / `test_stub_tree`）、**父进程消失的孤儿套件进程**、或 **>30min 的过期 `<os.tmpdir()>/xbk-*` 沙箱**（Linux 上就是 `/tmp`；写死 `/tmp` 会让 mac/Android 宿主永远扫不到＝静默失效，v3.283 返工已改为 `os.tmpdir()` 派生），直接 exit 1 并打印清理命令，不给一个"环境残留冒充契约失败"的结果。三条误拦控制：变异评估子进程（`XBK_MUTATION_CHILD=1`）**自动跳过**；沙箱先筛出过期候选，没有候选时不扫描所有进程 cwd；有候选时只认过期的，**活跃时间 = 目录自身与直接子项里最新 mtime，且有任何活进程把它当 cwd 即豁免**（评审 #211：目录 mtime 只在增删条目时前进，只写已有文件的长任务沙箱会被误报，而判红打印的 `rm -rf` 等于劝人删掉正在跑的运行）；整个 `/proc` 不可读时仍按总体 fail-closed 拒绝启动；有候选但 cwd 保护信号无法扫描时 fail-closed，不生成清理建议，错误输出仅含 PID、errno、proc 状态和 UID 等诊断元数据，不含 cwd 路径或命令行；临时根无法扫描时同样 fail-closed，普通文件/符号链接不进入清理建议，绝不静默当已检查。接线与阈值由 `test_host_clean_gates.js` 锁死（`STALE_MS` 必须恰为 30 分钟；活动桩不得报孤儿、沙箱活跃时间必须含直接子项 mtime 与 cwd 豁免，两条都同时锚定源码形态）。漏洞本体同时补了纵深防御：挂死夹具与其心跳孙进程都带 90s 有界自杀。
-  - **本机不要跑变异评估**（v3.282 登记）：生产 `run_mutation.js` 每批的总上限是 `MUTATION_TIMEOUT`（默认 90s），而这台机器跑完整套单元要 170–205s ⇒ 本地 `npm run test:mutation` 会**批量超时**、分数不可信。真要本地跑就把两个预算一起抬：`MUTATION_TIMEOUT=600000 MUTATION_IDLE_MS=180000`（静默线保持不动即可，它才是挂死判据）；变异分数与存活清单的判据仍在 CI。
+  - **本机禁止跑变异评估**（v3.282 登记，2026-10-16 用户明确指示，2026-10-17 重申）：判据**只在 CI**（`mutation.yml` 矩阵）。本地入口已 **fail-closed**：`npm run test:mutation`（`scripts/local-mutation-guard.js`）与 `node run_mutation.js` 默认直接 exit 1 并打印说明，只有显式 `XBK_ALLOW_LOCAL_MUTATION=1` 才放行——仅供单段/沙箱级调试，分数与存活清单**不得当判据**。历史后果：本机跑全量大段会留 `.stryker-tmp`/`/tmp/xbk-*` 沙箱残留，触发 `check-host-clean` 闸 fail-closed，测试假红、任务被拖数小时。`MUTATION_TIMEOUT`/`MUTATION_IDLE_MS` 是 `run_mutation.js` 的挂死判据参数，调它们不改变「本机不跑」的结论。
 
 高风险区域：判重/缓存、推送结果、配置兼容、网络请求、正则防护、文件存储与符号链接防御。改动须补回归测试。完整行为约束见 [SYSTEM_CONTRACT.md](SYSTEM_CONTRACT.md)；运行方式见 [README.md](README.md)。

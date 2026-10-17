@@ -78,6 +78,7 @@ const explicitTestFiles = [
   'test_filter.js',
   'test_mutation_json.js',
   'test_mutation_report.js',
+  'test_local_mutation_guard.js',
   'test_mutation_report_cli.js',
   'test_analyze_artifacts.js',
   'test_run_mutation.js',
