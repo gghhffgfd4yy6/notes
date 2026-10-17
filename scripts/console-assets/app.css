@@ -232,11 +232,14 @@
   .trend-day { font-size: 10.5px; color: var(--text-dim); white-space: nowrap; }
   .trend-day.today { color: var(--accent); }
   .trend-meta { color: var(--text-dim); font-size: var(--fs-xs); margin-top: var(--sp-2); }
+  .trend-col { cursor: pointer; border-radius: var(--sp-1); }
+  .trend-col:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .trend-detail { color: var(--text); font-size: var(--fs-xs); margin-top: var(--sp-2); padding: var(--sp-1) var(--sp-2); border: 1px solid var(--border); border-radius: var(--sp-1); }
   /* 运行历史表：8 列在手机上必然挤压——给最小宽度并允许横向滑动，
      时间/「试跑 20」一律不换行（日期被折成两行会被误读）。 */
   .runs-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  .runs-table { min-width: 560px; }
-  .runs-table th, .runs-table td { white-space: nowrap; }
+  .runs-scroll .runs-table { min-width: 560px; }
+  .runs-scroll .runs-table th, .runs-scroll .runs-table td { white-space: nowrap; }
 
   /* ── 推送记录 ── */
   .msg-toolbar { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-3); }
@@ -279,6 +282,5 @@
     .btn { width: 100%; min-height: 44px; }
     .tab-btn { min-height: 44px; }
     .btn-ghost { min-height: 44px; }
-    .runs-table th:nth-child(3), .runs-table td:nth-child(3) { display: none; }
   }
 }

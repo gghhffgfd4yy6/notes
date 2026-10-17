@@ -305,7 +305,20 @@ function runParseExtras (line) {
   return { cachesaved, noidentity, dryRun }
 }
 
-function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
+// 尾窗身份（评审 #243-1）：before 行号相对「当前 1MiB 尾窗」编号，文件超窗后新写入会让
+// 整个窗口平移，旧游标会指到别的轮次。用窗口首行算 8 位哈希作为窗口指纹，客户端翻页时
+// 带回；指纹不符 → stale，前端回第 1 页（宁可重看，不跳/不重复）。
+function windowKeyOf (firstLine) {
+  let h = 0x811c9dc5
+  const t = String(firstLine || '').slice(0, 200)
+  for (let i = 0; i < t.length; i++) {
+    h ^= t.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
+
+function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
   const lim = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50
   // before 游标（Sourcery #229-6 稳定分页）：语义 =「只考虑行号 ≤ before 的行」（1-based）。
   // 行号身份对 append 天然稳定（新行只追加在文件尾部，既有行号不动），比「条数游标」抗并发
@@ -331,6 +344,10 @@ function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
   // 已收集的最近一条摘要（items[0]）的 interrupted=true（若尚未收集任何摘要，说明失败行
   // 之后/文件尾再无摘要 = 崩溃轮占位 crashPending）。窗口头残余无摘要可回填的失败行
   // 静默丢弃（其摘要轮已滚出 1MiB 尾窗，归属无法重建）。
+  const key = windowKeyOf(first)
+  if (typeof windowKey === 'string' && windowKey !== '' && windowKey !== key) {
+    return { status: 'stale', items: [], hasMore: false, truncated, windowKey: key }
+  }
   const items = []
   // 同轮归属（评审：手机端整页「中断」）：生产写序是「摘要行 → 同秒 ERROR」（崩溃轮），
   // 与旧假设「失败行在摘要行之前」相反；倒序扫描时失败行先遇到，会误标**上一条更晚**的
@@ -446,7 +463,7 @@ function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
   for (let i = 0; i < lastLineNo - 1 && i < lines.length; i++) {
     if (RUN_SUMMARY_LINE_RE.test(lines[i])) { hasMore = true; break }
   }
-  return { status: 'ok', items, hasMore, truncated }
+  return { status: 'ok', items, hasMore, truncated, windowKey: key }
 }
 
 // push.json（判重缓存主存 = 已推送消息记录）的轻量读取校验：条目必须是带 id/title 的对象。

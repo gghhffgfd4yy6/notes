@@ -1776,12 +1776,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       if (limit > RUN_HISTORY_LIMIT_MAX) limit = RUN_HISTORY_LIMIT_MAX
       let before = Number(url.searchParams.get('before'))
       if (!Number.isSafeInteger(before) || before < 0) before = 0
+      // 尾窗指纹（评审 #243-1）：8 位十六进制；其它形态一律当「没带」，不做截断猜测
+      const rawWin = String(url.searchParams.get('win') || '')
+      const windowKey = /^[0-9a-f]{8}$/.test(rawWin) ? rawWin : ''
       // Sourcery #229-4：run.log 的写入方是运行侧 MessageStore.cacheDir（xbk_app
       // _writeRunLog → MessageStore.cacheDir），不是控制台 stateDir——Config.cache.dir
       // 指向别处时两个目录分居。读取源对齐运行侧解析结果（取不到回退 stateDir），
       // 与启动时「目录漂移」警告同一口径。
       const historyDir = runHistoryDir || stateDir
-      const h = readRunHistory(historyDir, { limit, before })
+      const h = readRunHistory(historyDir, { limit, before, windowKey })
       sendJson(res, 200, h)
       return
     }

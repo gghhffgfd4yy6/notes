@@ -1983,12 +1983,33 @@ async function main () {
     assert.strictEqual(r5.items.length, 3, '非法参数回默认不报错')
     server.close()
   })
+  await aok('readRunHistory: 尾窗指纹不匹配返回 stale（超窗翻页不跳轮）', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 10:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=1s cachesaved=1'
+    ].join('\n') + '\n')
+    const a = readRunHistory(dir, { limit: 2 })
+    assert.ok(/^[0-9a-f]{8}$/.test(a.windowKey), '响应须带 8 位尾窗指纹')
+    const b = readRunHistory(dir, { limit: 1, windowKey: a.windowKey })
+    assert.strictEqual(b.status, 'ok', '同窗口翻页正常')
+    const c = readRunHistory(dir, { limit: 1, windowKey: 'deadbeef' })
+    assert.strictEqual(c.status, 'stale', '窗口平移须返回 stale')
+    assert.strictEqual(c.items.length, 0, 'stale 不得下发可能错位的行')
+  })
+
   await aok('分页/横滑控件: 运行历史与推送记录都有每页条数，趋势与历史表可横向滑动', () => {
     const js = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
     assert.ok(/const RUN_PAGE_SIZES = \[2, 3, 5, 10\]/.test(js), '运行历史每页条数须为 2/3/5/10')
     const sizeSelects = js.match(/aria-label="每页显示条数"/g) || []
     assert.ok(sizeSelects.length >= 2, '运行历史与推送记录各要有一个每页条数选择')
+    // 选择器必须是「活的」：选项由常量渲染 + 改变时真的改条数（评审 #243-7）
+    assert.ok(/RUN_PAGE_SIZES\.map\(\(n\) => html`<option key=\$\{n\} value=\$\{n\}>每页 \$\{n\} 条<\/option>`\)/.test(js), '运行历史选项须由 RUN_PAGE_SIZES 渲染')
+    assert.ok(/\[10, 20, 50, 100\]\.map\(\(n\) => html`<option key=\$\{n\} value=\$\{n\}>每页 \$\{n\} 条<\/option>`\)/.test(js), '推送记录选项须由 10/20/50/100 渲染')
+    assert.ok(/onChange=\$\{\(e\) => changeSize\(Number\(e\.target\.value\)\)\}/.test(js), '运行历史下拉须接 changeSize')
+    assert.ok(/onChange=\$\{\(e\) => \{ setSize\(Number\(e\.target\.value\)\); setPage\(1\) \}\}/.test(js), '推送记录下拉须同时改 size 并回第 1 页')
     assert.ok(/\.trend-scroll\s*\{[^}]*overflow-x:\s*auto/.test(css), '趋势图须横向滚动容器')
     assert.ok(/\.trend-col\s*\{[^}]*flex:\s*0 0 34px/.test(css), '趋势列须固定宽度（否则日期挤在一起）')
     assert.ok(/\.runs-scroll\s*\{[^}]*overflow-x:\s*auto/.test(css), '运行历史表须横向滚动容器')

@@ -170,10 +170,12 @@ function apiCancelRun (id) {
 }
 
 // 逐轮运行历史（v3.299 批次②）：run.log 摘要行解析（服务端），分页游标 before=已看轮数。
-function apiGetRunHistory ({ limit, before } = {}) {
+function apiGetRunHistory ({ limit, before, windowKey } = {}) {
   const params = new URLSearchParams()
   if (Number.isSafeInteger(limit) && limit > 0) params.set('limit', String(limit))
   if (Number.isSafeInteger(before) && before > 0) params.set('before', String(before))
+  // 尾窗指纹：只在服务端下发过时回传（8 位十六进制），翻页跨窗口时服务端会判 stale
+  if (typeof windowKey === 'string' && /^[0-9a-f]{8}$/.test(windowKey)) params.set('win', windowKey)
   const qs = params.toString()
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
@@ -774,8 +776,11 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
 
 // ── 组件：逐轮运行历史（v3.299 批次②）────────────────────────────────────────
 // run.log 摘要行解析（服务端 /api/run-history），时间倒序 + before 游标分页。
-// 分页口径：每页 N 条（2/3/5/10），上一页/下一页按游标栈回放——不累积 DOM，也不
-// 把「加载更多」伪装成分页。进概览页拉一次 + 手动刷新，不进 5s 主轮询。
+// 分页口径：每页 N 条（2/3/5/10），上一页/下一页按游标栈回放，不累积 DOM。
+// 两个稳定性约定（评审 #243）：
+//   ① 游标只在「请求成功」后提交——加载失败时页面与游标保持原样，不会让旧行冒充新页；
+//   ② 回第 1 页/刷新会丢弃后续页游标——追加新轮次后旧游标可能跳过被挤出页的行；
+//      服务端另用尾窗指纹（win）兜底：窗口平移时返回 stale，前端自动回第 1 页。
 const RUN_PAGE_SIZES = [2, 3, 5, 10]
 
 function RunHistoryPanel () {
@@ -784,40 +789,84 @@ function RunHistoryPanel () {
   const [pos, setPos] = useState(0)
   const [page, setPage] = useState({ items: [], hasMore: false, truncated: false, status: null })
   const [err, setErr] = useState('')
+  const [note, setNote] = useState('')
   const [loading, setLoading] = useState(false)
   const seqRef = useRef(0)
-  const load = useCallback(async (before, lim) => {
+  const winRef = useRef('')
+  const skipEffectRef = useRef(false)
+
+  const fetchPage = useCallback(async (before, lim) => {
     const seq = ++seqRef.current
     setLoading(true)
     try {
-      const d = await apiGetRunHistory({ limit: lim, before })
-      if (seq !== seqRef.current) return
+      const d = await apiGetRunHistory({ limit: lim, before, windowKey: winRef.current })
+      if (seq !== seqRef.current) return null
       setErr('')
-      setPage(d)
+      winRef.current = typeof d.windowKey === 'string' ? d.windowKey : ''
+      if (d.status === 'stale') {
+        setNote('期间有新轮次写入（日志尾窗平移），已回到第 1 页')
+        return { stale: true }
+      }
+      setNote('')
+      return d
     } catch (e) {
       if (seq === seqRef.current) setErr(`加载失败：${e.message}`)
+      return null
     } finally {
       if (seq === seqRef.current) setLoading(false)
     }
   }, [])
-  useEffect(() => { load(stack[pos], size).catch(() => {}) }, [stack, pos, size, load])
+
+  const loadFirst = useCallback(async (lim) => {
+    let d = await fetchPage(0, lim)
+    if (!d) return
+    if (d.stale) d = await fetchPage(0, lim) // 指纹已更新，重拉第 1 页
+    if (!d || d.stale || !d.items) return
+    setStack([0])
+    setPos(0)
+    setPage(d)
+  }, [fetchPage])
+
+  useEffect(() => {
+    if (skipEffectRef.current) { skipEffectRef.current = false; return }
+    loadFirst(size).catch(() => {})
+  }, [loadFirst, size])
+
   const shown = page.status === 'ok' ? page.items : []
-  const goNext = () => {
+  const goNext = async () => {
     if (!page.hasMore || shown.length === 0 || loading) return
     const cursor = shown[shown.length - 1].lineNo - 1
+    const d = await fetchPage(cursor, size)
+    if (!d) return
+    if (d.stale) { await loadFirst(size); return }
+    setPage(d)
     setStack((prev) => [...prev.slice(0, pos + 1), cursor])
     setPos(pos + 1)
   }
-  const changeSize = (n) => {
-    if (n === size) return
-    setStack([0])
-    setPos(0)
-    setSize(n)
+  const goPrev = async () => {
+    if (pos <= 0 || loading) return
+    const d = await fetchPage(stack[pos - 1], size)
+    if (!d) return
+    if (d.stale) { await loadFirst(size); return }
+    setPage(d)
+    setStack(stack.slice(0, pos)) // 后续页游标作废：重新进入时按新边界重算
+    setPos(pos - 1)
   }
-  const refresh = () => {
+  const changeSize = async (n) => {
+    if (n === size || loading) return
+    const d = await fetchPage(0, n)
+    if (!d) return // 失败：保持原页与原条数（不拿旧行冒充新页）
+    if (d.stale) {
+      skipEffectRef.current = true
+      setSize(n); setStack([0]); setPos(0)
+      await loadFirst(n)
+      return
+    }
+    skipEffectRef.current = true
+    setSize(n)
     setStack([0])
     setPos(0)
-    load(0, size).catch(() => {})
+    setPage(d)
   }
   return html`<div class="panel">
     <${PanelHead} title="逐轮运行历史"
@@ -826,9 +875,10 @@ function RunHistoryPanel () {
         <select class="msg-select" value=${size} onChange=${(e) => changeSize(Number(e.target.value))} aria-label="每页显示条数">
           ${RUN_PAGE_SIZES.map((n) => html`<option key=${n} value=${n}>每页 ${n} 条</option>`)}
         </select>
-        <${Button} variant="ghost" onClick=${refresh} disabled=${loading}>刷新<//>
+        <${Button} variant="ghost" onClick=${() => loadFirst(size)} disabled=${loading}>刷新<//>
       </div>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${note && html`<${Hint}>${note}<//>`}
     ${page.status && page.status !== 'ok' && html`<div class="empty">run.log${page.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${page.status}）`}</div>`}
     ${shown.length > 0 && html`<div class="runs-scroll"><table class="runs-table">
       <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
@@ -847,7 +897,7 @@ function RunHistoryPanel () {
     </table></div>`}
     ${page.status === 'ok' && shown.length === 0 && html`<div class="empty">日志尾窗内没有摘要行</div>`}
     ${page.status === 'ok' && (shown.length > 0 || pos > 0) && html`<div class="pager">
-      <${Button} disabled=${pos <= 0 || loading} onClick=${() => setPos(pos - 1)}>上一页<//>
+      <${Button} disabled=${pos <= 0 || loading} onClick=${goPrev}>上一页<//>
       <span class="pager-info">第 ${pos + 1} 页${page.hasMore ? '' : '（最后一页）'}</span>
       <${Button} disabled=${!page.hasMore || loading} onClick=${goNext}>${loading ? '加载中…' : '下一页'}<//>
     </div>`}
@@ -901,6 +951,9 @@ function TrendsPanel () {
   const failAll = byDay.reduce((acc, d) => acc + d.failed, 0)
   // today 由服务端按 Asia/Shanghai 日历日下发（run.log 时间戳口径），浏览器本地时区不再参与
   const todayKey = trends && trends.today ? trends.today : ''
+  // 点/键盘选中某天：手机没有 hover，title 提示不可达，点按展开当天明细（评审 #243-4）
+  const [selDay, setSelDay] = useState(null)
+  const toggleDay = (date) => setSelDay((cur) => (cur === date ? null : date))
   // 横向滚动：默认停在最右侧（最近一天），用户可直接左滑看更早日期
   const scrollRef = useRef(null)
   useEffect(() => {
@@ -919,14 +972,22 @@ function TrendsPanel () {
     ${trends && trends.status === 'ok' && html`<div>
       <div class="trend-scroll" ref=${scrollRef}>
         <div class="trend">
-          ${byDay.map((d) => html`<div class="trend-col" key=${d.date} title=${`${d.date}：轮次 ${d.rounds} · 抓取 ${d.total} · 推送 ${d.pushed} · 失败 ${d.failed}`}>
+          ${byDay.map((d) => html`<div class="trend-col" key=${d.date} role="button" tabindex="0"
+            aria-label=${`${d.date}：轮次 ${d.rounds} · 抓取 ${d.total} · 推送 ${d.pushed} · 失败 ${d.failed}`}
+            title=${`${d.date}：轮次 ${d.rounds} · 抓取 ${d.total} · 推送 ${d.pushed} · 失败 ${d.failed}`}
+            onClick=${() => toggleDay(d.date)}
+            onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleDay(d.date) } }}>
             <span class="trend-n">${d.pushed > 0 ? d.pushed : ''}</span>
             <div class=${'trend-bar' + (d.pushed === 0 ? ' zero' : '') + (d.failed > 0 ? ' fail' : '')} style=${`height:${Math.max(3, Math.round(d.pushed / maxPushed * 88))}px`}></div>
             <span class=${'trend-day' + (d.date === todayKey ? ' today' : '')}>${d.date.slice(5)}</span>
           </div>`)}
         </div>
       </div>
-      <div class="trend-meta">${shownDays || ''} 日共推送 ${totalAll} 条 · 失败 ${failAll} 条 · 左右滑动查看更早日期，点/悬停柱子看每日明细</div>
+      ${selDay && (() => {
+        const d = byDay.find((x) => x.date === selDay)
+        return d ? html`<div class="trend-detail">${d.date}：轮次 ${d.rounds} · 抓取 ${d.total} · 推送 ${d.pushed} · 失败 ${d.failed}</div>` : ''
+      })()}
+      <div class="trend-meta">${shownDays || ''} 日共推送 ${totalAll} 条 · 失败 ${failAll} 条 · 左右滑动查看更早日期，点柱子看每日明细</div>
     </div>`}
   </div>`
 }
