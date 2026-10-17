@@ -2452,6 +2452,10 @@ async function main () {
     const bad = authLines.filter(l => !/Authorization:\s*`Bearer \$\{BOOT\.token\}`/.test(l))
     assert.deepStrictEqual(bad.map(s => s.trim()), [], 'Authorization 头必须使用 Bearer 前缀加 boot token')
     assert.ok(!src.includes('***'), 'app.js 不得残留 *** 占位符')
+    // 评审 #233 · Sourcery Medium：BFCache 恢复时可能跳过 `/` 请求，BOOT.token 过期仍发旧
+    // Bearer → 写动作 401。必须有 persisted=true 的重载分支。
+    assert.ok(/addEventListener\(['"]pageshow['"]/.test(src), 'app.js 须监听 pageshow')
+    assert.ok(/ev\.persisted|e\.persisted/.test(src), 'pageshow 分支须判 persisted 后重载')
   })
 }
 
