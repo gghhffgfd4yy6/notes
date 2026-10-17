@@ -1532,6 +1532,61 @@ function FilesPanel () {
   </div>`
 }
 
+// 过滤规则：按「一行一条」渲染，空规则默认折叠。
+// 旧版把 11 条键值对拼成一行（k=v · k=v…），手机端只能从单词中间硬断，挤成一团；
+// 规则再多页面会成一条无限长的“毛线”。这里每条独立成行，空值默认隐藏。
+function FilterRules ({ entries }) {
+  const [showEmpty, setShowEmpty] = useState(false)
+  const isEmpty = (v) => v === undefined || v === null || String(v).length === 0
+  const emptyCount = entries.filter(([, v]) => isEmpty(v)).length
+  const shown = showEmpty ? entries : entries.filter(([, v]) => !isEmpty(v))
+  return html`<div class="cfg-block">
+    <div class="cfg-block-head">
+      <span class="cfg-block-title">过滤规则</span>
+      <span class="cfg-block-sub">${entries.length} 项${emptyCount > 0 ? ` · ${emptyCount} 项为空` : ''}</span>
+    </div>
+    ${shown.length === 0
+      ? html`<div class="empty">暂无已设置的过滤规则${emptyCount > 0 ? `（${emptyCount} 项为空）` : ''}</div>`
+      : html`<div class="rule-list">
+        ${shown.map(([k, v]) => html`<div class="rule-row" key=${k}>
+          <code class="rule-key">${k}</code>
+          <span class=${'rule-val' + (isEmpty(v) ? ' rule-empty' : '')}>${isEmpty(v) ? '（空）' : String(v)}</span>
+        </div>`)}
+      </div>`}
+    ${emptyCount > 0 && html`<button type="button" class="cfg-toggle" aria-expanded=${showEmpty} onClick=${() => setShowEmpty(!showEmpty)}>
+      ${showEmpty ? '▾ 收起空规则' : `▸ 显示 ${emptyCount} 个空规则`}
+    </button>`}
+  </div>`
+}
+
+function ChannelList ({ pc }) {
+  const raw = pc && pc.perChannel
+  const map = raw && !Array.isArray(raw) ? raw : {}
+  const legacy = Array.isArray(raw) ? raw.filter((x) => typeof x === 'string') : []
+  const names = Object.keys(map).length > 0 ? Object.keys(map) : (Array.isArray(pc.names) ? pc.names : legacy)
+  const isOn = (k) => Object.prototype.hasOwnProperty.call(map, k)
+    ? !!map[k]
+    : (Array.isArray(pc.names) && pc.names.includes(k)) || legacy.includes(k)
+  const on = names.filter(isOn)
+  return html`<div class="cfg-block">
+    <div class="cfg-block-head">
+      <span class="cfg-block-title">推送渠道</span>
+      <span class="cfg-block-sub">已配置 ${on.length} / ${names.length} · 绿色为已配置</span>
+    </div>
+    ${!pc.moduleLoaded
+      ? html`<div class="empty">配置模块加载失败（检查依赖）</div>`
+      : names.length === 0
+        ? html`<div class="empty">未配置任何渠道</div>`
+        : html`<div class="chan-grid">
+          ${names.map((k) => html`<span key=${k} class=${'chan-chip' + (isOn(k) ? ' on' : '')}
+            role="img" aria-label=${`${k}：${isOn(k) ? '已配置' : '未配置'}`}>
+            <span class="chan-dot" aria-hidden="true"></span>${k}
+          </span>`)}
+        </div>`}
+    ${Array.isArray(pc.names) && pc.names.length > 0 && html`<div class="cfg-note">已启用：${pc.names.join('、')}</div>`}
+  </div>`
+}
+
 // 运行配置脱敏视图（v3.298）：推送密钥只显示「已配置/未配置」，值永不下发（服务端白名单
 // + 响应前保险丝双道防线）。进配置页加载 + 手动刷新。
 function ConfigPanel () {
@@ -1539,7 +1594,6 @@ function ConfigPanel () {
   useEffect(() => { load().catch(() => {}) }, [load])
   const r = data && data.runtime ? data.runtime : null
   const pc = data && data.pushChannels ? data.pushChannels : null
-  const chanNames = pc && Array.isArray(pc.perChannel) ? pc.perChannel : (pc && pc.perChannel ? Object.keys(pc.perChannel) : [])
   const filterEntries = r && r.filter ? Object.entries(r.filter) : []
   return html`<div class="panel">
     <${PanelHead} title="运行配置" sub="脱敏视图 · 推送密钥只显示是否已配置"
@@ -1564,16 +1618,21 @@ function ConfigPanel () {
         <tr><td>运行环境变量</td><td>${data.console && data.console.env ? [['intervalMs', 'XBK_INTERVAL_MS'], ['cacheDir', 'XBK_CACHE_DIR'], ['dryRun', 'XBK_DRY_RUN']].filter(([k]) => data.console.env[k]).map(([, label]) => `${label} 已设置`).join('，') || '无覆盖' : '—'}</td></tr>
       </tbody></table>
     </div>`}
-    ${r && html`<table class="sys-table" style="margin-top:12px"><tbody>
-      <tr><td>推送模板</td><td>标题：${r.template.title} · 正文：${r.template.content}</td></tr>
-      ${filterEntries.length > 0 && html`<tr><td>过滤规则</td><td>${filterEntries.map(([k, v]) => `${k}=${String(v).length > 0 ? v : '（空）'}`).join(' · ')}</td></tr>`}
-      <tr><td>关键词订阅</td><td>${r.keyword.zkt_gjc && String(r.keyword.zkt_gjc).length > 0 ? r.keyword.zkt_gjc : '（未设置）'}</td></tr>
-    </tbody></table>`}
-    ${pc && html`<table class="sys-table" style="margin-top:12px"><tbody>
-      <tr><td>推送渠道</td><td>${pc.moduleLoaded ? (pc.count > 0 ? `已配置 ${pc.count} 个：${pc.names.join('、')}` : '未配置任何渠道') : '配置模块加载失败（检查依赖）'}</td></tr>
-      <tr><td>渠道明细</td><td>${chanNames.map((k) => `${k}：${pc.perChannel[k] ? '✅ 已配置' : '未配置'}`).join(' · ')}</td></tr>
-      <tr><td>本地配置文件</td><td>${pc.localFilePresent ? 'push_config.local.js 存在（sendNotify 启动时加载；格式异常会在运行日志告警。密钥不入库不入页面）' : '未找到（用环境变量或该文件配置推送）'}</td></tr>
-    </tbody></table>`}
+    ${r && html`<div class="cfg-block">
+      <div class="cfg-block-head"><span class="cfg-block-title">推送模板</span></div>
+      <div class="tpl-row"><span>标题</span><code>${r.template.title}</code></div>
+      <div class="tpl-row"><span>正文</span><code>${r.template.content}</code></div>
+    </div>`}
+    ${r && filterEntries.length > 0 && html`<${FilterRules} entries=${filterEntries} />`}
+    ${r && html`<div class="cfg-block">
+      <div class="cfg-block-head"><span class="cfg-block-title">关键词订阅</span></div>
+      <div class="cfg-text">${r.keyword.zkt_gjc && String(r.keyword.zkt_gjc).length > 0 ? r.keyword.zkt_gjc : '（未设置）'}</div>
+    </div>`}
+    ${pc && html`<${ChannelList} pc=${pc} />`}
+    ${pc && html`<div class="cfg-block">
+      <div class="cfg-block-head"><span class="cfg-block-title">本地配置文件</span></div>
+      <div class="cfg-text">${pc.localFilePresent ? 'push_config.local.js 存在（sendNotify 启动时加载；格式异常会在运行日志告警。密钥不入库不入页面）' : '未找到（用环境变量或该文件配置推送）'}</div>
+    </div>`}
     <${Hint} style="margin-top:12px">本页为脱敏视图：所有推送密钥（appToken / BOT token 等）的值永不出现在页面或接口响应中，只显示「已配置 / 未配置」。修改配置请编辑 push_config.local.js 或环境变量后重启。<//>
   </div>`
 }
