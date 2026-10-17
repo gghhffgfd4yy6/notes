@@ -2612,6 +2612,36 @@ async function main () {
     assert.deepStrictEqual(offenders, [], '不得用 typeof <id 表达式> === "number" 判定运行 id（id 恒为 string）')
   })
 
+  await aok('结构红线: RunsPanel 模板的 <div> 必须成对闭合（漏根 </div> 回归）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    // 事故形态：RunsPanel 根 `<div class="panel">` 漏了 `</div>`，htm 把根标签解析成
+    // 文本节点 "div" → 页面出现裸字 "div"、面板丢边框，运行期零报错。
+    const start = src.indexOf('function RunsPanel')
+    const end = src.indexOf('// ── 组件：逐轮运行历史', start)
+    assert.ok(start > -1 && end > start, '应能定位 RunsPanel 源码段')
+    const seg = src.slice(start, end)
+    const opens = (seg.match(/<div\b/g) || []).length
+    const closes = (seg.match(/<\/div>/g) || []).length
+    assert.strictEqual(opens, closes, `div 开闭必须相等（open=${opens}, close=${closes}）`)
+    // 只数个数抓不到「根闭合被挪到条件日志框之前」：要求最后一个 </div> 在 logbox 之后，
+    // 且模板以根 </div> 收尾（否则日志框会被甩到面板外）。
+    const logbox = seg.indexOf('openId !== null && html`<div class="logbox">')
+    assert.ok(logbox > -1, '应能定位条件日志框')
+    assert.ok(seg.lastIndexOf('</div>') > logbox, '根 </div> 必须在条件日志框之后')
+    assert.ok(/<\/div>`\s*\}\s*$/.test(seg), 'RunsPanel 模板必须以根 </div> 收尾')
+  })
+
+  await aok('静态红线: fmtTime 固定按 Asia/Shanghai（UTC+8）渲染', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    // 服务器时区为 UTC：用本地 getHours() 会让「自动刷新 14:xx」与 run.log 的 22:xx 混显。
+    const start = src.indexOf('function fmtTime')
+    const end = src.indexOf('function fmtNum', start)
+    assert.ok(start > -1 && end > start, '应能定位 fmtTime')
+    const seg = src.slice(start, end)
+    assert.ok(/Number\(ts\) \+ 8 \* 3600 \* 1000/.test(seg), 'fmtTime 必须固定 +8 小时')
+    assert.ok(/getUTC/.test(seg) && !/getHours\(\)/.test(seg), 'fmtTime 必须用 getUTC*，不得用浏览器本地 getHours')
+  })
+
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function Hint ('), '必须有 Hint 原语')

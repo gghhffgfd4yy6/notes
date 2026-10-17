@@ -147,9 +147,10 @@
     padding: var(--sp-4);
     margin-bottom: var(--sp-4);
   }
-  .panel-head { display: flex; align-items: baseline; gap: var(--sp-3); margin-bottom: var(--sp-3); }
-  .panel-title { font-weight: 600; font-size: var(--fs-lg); }
-  .panel-sub { color: var(--text-dim); font-size: var(--fs-xs); }
+  .panel-head { display: flex; align-items: baseline; gap: var(--sp-3); margin-bottom: var(--sp-3); flex-wrap: wrap; }
+  .panel-title { font-weight: 600; font-size: var(--fs-lg); flex: 0 0 auto; white-space: nowrap; }
+  .panel-sub { color: var(--text-dim); font-size: var(--fs-xs); min-width: 0; }
+  .panel-right { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); }
 
   /* ── 按钮 ── */
   .btn-row { display: flex; gap: var(--sp-4); flex-wrap: wrap; }
@@ -255,7 +256,7 @@
   .msg-list { display: flex; flex-direction: column; gap: var(--sp-2); }
   .msg-item { border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px var(--sp-3); background: var(--panel-2); }
   .msg-item-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-2); }
-  .msg-title { font-weight: 500; font-size: var(--fs-md); cursor: pointer; word-break: break-all; }
+  .msg-title { font-weight: 500; font-size: var(--fs-md); cursor: pointer; overflow-wrap: anywhere; word-break: normal; }
   .msg-title:hover { color: var(--accent); }
   .msg-price { color: var(--ok-fg); font-weight: 600; font-family: var(--mono); font-size: var(--fs-sm); white-space: nowrap; }
   .msg-meta { display: flex; gap: 10px; flex-wrap: wrap; color: var(--text-dim); font-size: var(--fs-xs); margin-top: var(--sp-1); }
@@ -267,7 +268,7 @@
   .pager-info { color: var(--text-dim); font-size: 12.5px; }
 
   /* ── 系统信息 ── */
-  .sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--sp-3); }
+  .sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: var(--sp-3); }
   .sys-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
   .sys-table td { padding: 7px var(--sp-2); border-bottom: 1px solid var(--border-soft); }
   .sys-table td:first-child { color: var(--text-dim); width: 38%; }
@@ -279,8 +280,11 @@
     .cards { grid-template-columns: 1fr; }
     .btn-row { gap: 10px; }
     .btn-item { flex: 1 1 100%; }
-    .btn { width: 100%; min-height: 44px; }
-    .tab-btn { min-height: 44px; }
+    .tabs { gap: 4px; }
+    /* 触控尺寸只抬高度；整行宽度只给手动触发的竖排按钮，别把表头/分页里的按钮也拉满 */
+    .btn { min-height: 44px; }
+    .btn-item .btn { width: 100%; }
+    .tab-btn { min-height: 44px; padding: 7px 10px; }
     .btn-ghost { min-height: 44px; }
   }
 }
