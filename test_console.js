@@ -2055,7 +2055,9 @@ async function main () {
       const out = require('node:child_process').execFileSync(process.execPath, ['-e',
         "const x=require('./xbk_function_v3');process.stdout.write(x.MessageStore.cacheDir)"],
       { cwd: __dirname, encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: dir } })
-      assert.strictEqual(out.trim(), dir, 'MessageStore.cacheDir 必须服从 XBK_CACHE_DIR（否则子进程 run.log 仍写生产）')
+      // 沙箱（stryker/CI）里 __dirname 可能是软链路径，子进程返回的是 realpath —— 两端都归一后再比
+      assert.strictEqual(fs.realpathSync(out.trim()), fs.realpathSync(dir),
+        'MessageStore.cacheDir 必须服从 XBK_CACHE_DIR（否则子进程 run.log 仍写生产）')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
