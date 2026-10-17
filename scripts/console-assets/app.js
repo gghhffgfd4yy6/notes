@@ -774,48 +774,66 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
 
 // ── 组件：逐轮运行历史（v3.299 批次②）────────────────────────────────────────
 // run.log 摘要行解析（服务端 /api/run-history），时间倒序 + before 游标分页。
-// 进概览页拉一次 + 手动加载更多，不进 5s 主轮询（读的是磁盘日志，轮询无意义）。
+// 分页口径：每页 N 条（2/3/5/10），上一页/下一页按游标栈回放——不累积 DOM，也不
+// 把「加载更多」伪装成分页。进概览页拉一次 + 手动刷新，不进 5s 主轮询。
+const RUN_PAGE_SIZES = [2, 3, 5, 10]
+
 function RunHistoryPanel () {
+  const [size, setSize] = useState(5)
+  const [stack, setStack] = useState([0]) // 每页起点游标（stack[pos] 为当前页 before）
+  const [pos, setPos] = useState(0)
   const [page, setPage] = useState({ items: [], hasMore: false, truncated: false, status: null })
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   const seqRef = useRef(0)
-  const load = useCallback(async (before) => {
+  const load = useCallback(async (before, lim) => {
     const seq = ++seqRef.current
     setLoading(true)
     try {
-      const d = await apiGetRunHistory({ limit: 50, before })
+      const d = await apiGetRunHistory({ limit: lim, before })
       if (seq !== seqRef.current) return
       setErr('')
-      // 去重（v3.299 评审 #6）：before 是行号游标，上一页与下一页在「游标附近的行被
-      // 并发追加/截尾」的边界场景可能重叠——按 lineNo 身份去重，宁可少一条不重复。
-      setPage((prev) => {
-        if (!(before > 0)) return d
-        const seen = new Set((prev.items || []).map((x) => x.lineNo))
-        const merged = [...(prev.items || [])]
-        for (const it of d.items || []) {
-          if (!seen.has(it.lineNo)) { seen.add(it.lineNo); merged.push(it) }
-        }
-        return { ...d, items: merged }
-      })
+      setPage(d)
     } catch (e) {
       if (seq === seqRef.current) setErr(`加载失败：${e.message}`)
     } finally {
       if (seq === seqRef.current) setLoading(false)
     }
   }, [])
-  useEffect(() => { load(0).catch(() => {}) }, [load])
+  useEffect(() => { load(stack[pos], size).catch(() => {}) }, [stack, pos, size, load])
   const shown = page.status === 'ok' ? page.items : []
+  const goNext = () => {
+    if (!page.hasMore || shown.length === 0 || loading) return
+    const cursor = shown[shown.length - 1].lineNo - 1
+    setStack((prev) => [...prev.slice(0, pos + 1), cursor])
+    setPos(pos + 1)
+  }
+  const changeSize = (n) => {
+    if (n === size) return
+    setStack([0])
+    setPos(0)
+    setSize(n)
+  }
+  const refresh = () => {
+    setStack([0])
+    setPos(0)
+    load(0, size).catch(() => {})
+  }
   return html`<div class="panel">
     <${PanelHead} title="逐轮运行历史"
       sub=${'run.log 摘要逐轮' + (page.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : '')}
-      right=${html`<${Button} variant="ghost" onClick=${() => { load(0) }} disabled=${loading}>刷新<//>`} />
+      right=${html`<div class="toolbar">
+        <select class="msg-select" value=${size} onChange=${(e) => changeSize(Number(e.target.value))} aria-label="每页显示条数">
+          ${RUN_PAGE_SIZES.map((n) => html`<option key=${n} value=${n}>每页 ${n} 条</option>`)}
+        </select>
+        <${Button} variant="ghost" onClick=${refresh} disabled=${loading}>刷新<//>
+      </div>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${page.status && page.status !== 'ok' && html`<div class="empty">run.log${page.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${page.status}）`}</div>`}
-    ${shown.length > 0 && html`<table class="runs-table">
+    ${shown.length > 0 && html`<div class="runs-scroll"><table class="runs-table">
       <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
       <tbody>
-        ${shown.map((r, i) => html`<tr key=${`${r.at}-${i}`}>
+        ${shown.map((r, i) => html`<tr key=${`${r.at}-${r.lineNo}-${i}`}>
           <td class="mono">${r.interrupted ? `${r.at || '—'} ⚠️中断` : (r.at || '—')}</td>
           <td>${r.total === null ? '—' : r.total}</td>
           <td>${r.dedup === null ? '—' : r.dedup}</td>
@@ -826,10 +844,12 @@ function RunHistoryPanel () {
           <td>${r.cachesaved === 0 ? '未落盘' : ''}</td>
         </tr>`)}
       </tbody>
-    </table>`}
+    </table></div>`}
     ${page.status === 'ok' && shown.length === 0 && html`<div class="empty">日志尾窗内没有摘要行</div>`}
-    ${page.hasMore && html`<div style="text-align:center;margin-top:8px">
-      <${Button} variant="ghost" onClick=${() => { load(shown.length > 0 ? shown[shown.length - 1].lineNo - 1 : 0) }} disabled=${loading}>${loading ? '加载中…' : '加载更早轮次'}<//>
+    ${page.status === 'ok' && (shown.length > 0 || pos > 0) && html`<div class="pager">
+      <${Button} disabled=${pos <= 0 || loading} onClick=${() => setPos(pos - 1)}>上一页<//>
+      <span class="pager-info">第 ${pos + 1} 页${page.hasMore ? '' : '（最后一页）'}</span>
+      <${Button} disabled=${!page.hasMore || loading} onClick=${goNext}>${loading ? '加载中…' : '下一页'}<//>
     </div>`}
   </div>`
 }
@@ -881,6 +901,12 @@ function TrendsPanel () {
   const failAll = byDay.reduce((acc, d) => acc + d.failed, 0)
   // today 由服务端按 Asia/Shanghai 日历日下发（run.log 时间戳口径），浏览器本地时区不再参与
   const todayKey = trends && trends.today ? trends.today : ''
+  // 横向滚动：默认停在最右侧（最近一天），用户可直接左滑看更早日期
+  const scrollRef = useRef(null)
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el) el.scrollLeft = el.scrollWidth
+  }, [byDay.length])
   return html`<div class="panel">
     <${PanelHead} title=${shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势'}
       afterTitle=${html`<select class="msg-select" value=${days} onChange=${(e) => setDays(Number(e.target.value))} aria-label="趋势窗口天数">
@@ -891,14 +917,16 @@ function TrendsPanel () {
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${trends && trends.status !== 'ok' && html`<div class="empty">日志${trends.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${trends.status}）`}</div>`}
     ${trends && trends.status === 'ok' && html`<div>
-      <div class="trend">
-        ${byDay.map((d) => html`<div class="trend-col" key=${d.date} title=${`${d.date}：轮次 ${d.rounds} · 抓取 ${d.total} · 推送 ${d.pushed} · 失败 ${d.failed}`}>
-          <span class="trend-n">${d.pushed > 0 ? d.pushed : ''}</span>
-          <div class=${'trend-bar' + (d.pushed === 0 ? ' zero' : '') + (d.failed > 0 ? ' fail' : '')} style=${`height:${Math.max(3, Math.round(d.pushed / maxPushed * 88))}px`}></div>
-          <span class=${'trend-day' + (d.date === todayKey ? ' today' : '')}>${d.date.slice(5)}</span>
-        </div>`)}
+      <div class="trend-scroll" ref=${scrollRef}>
+        <div class="trend">
+          ${byDay.map((d) => html`<div class="trend-col" key=${d.date} title=${`${d.date}：轮次 ${d.rounds} · 抓取 ${d.total} · 推送 ${d.pushed} · 失败 ${d.failed}`}>
+            <span class="trend-n">${d.pushed > 0 ? d.pushed : ''}</span>
+            <div class=${'trend-bar' + (d.pushed === 0 ? ' zero' : '') + (d.failed > 0 ? ' fail' : '')} style=${`height:${Math.max(3, Math.round(d.pushed / maxPushed * 88))}px`}></div>
+            <span class=${'trend-day' + (d.date === todayKey ? ' today' : '')}>${d.date.slice(5)}</span>
+          </div>`)}
+        </div>
       </div>
-      <div class="trend-meta">${shownDays || ''} 日共推送 ${totalAll} 条 · 失败 ${failAll} 条 · 每日轮次与抓取数悬停列查看</div>
+      <div class="trend-meta">${shownDays || ''} 日共推送 ${totalAll} 条 · 失败 ${failAll} 条 · 左右滑动查看更早日期，点/悬停柱子看每日明细</div>
     </div>`}
   </div>`
 }
@@ -960,7 +988,7 @@ function msgLink (m, base) {
 
 function MessagesPanel () {
   const [page, setPage] = useState(1)
-  const [size] = useState(20)
+  const [size, setSize] = useState(20)
   const [cate, setCate] = useState('')
   const [input, setInput] = useState('')
   const [query, setQuery] = useState('')
@@ -1057,6 +1085,9 @@ function MessagesPanel () {
       <select class="msg-select" value=${cate} onChange=${(e) => { setCate(e.target.value); setPage(1) }}>
         <option value="">全部分类</option>
         ${categories.map((c) => html`<option key=${c.name} value=${c.name}>${c.name}（${c.count}）</option>`)}
+      </select>
+      <select class="msg-select" value=${size} onChange=${(e) => { setSize(Number(e.target.value)); setPage(1) }} aria-label="每页显示条数">
+        ${[10, 20, 50, 100].map((n) => html`<option key=${n} value=${n}>每页 ${n} 条</option>`)}
       </select>
       <${Button} variant="ghost" onClick=${load}>刷新<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>

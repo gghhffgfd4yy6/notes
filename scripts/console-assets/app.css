@@ -219,8 +219,12 @@
   .tab-btn.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 500; }
 
   /* ── 趋势条形图（纯 CSS）── */
-  .trend { display: flex; align-items: flex-end; gap: 6px; height: 120px; padding: var(--sp-2) 2px 0; }
-  .trend-col { flex: 1 1 0; display: flex; flex-direction: column; align-items: center; gap: var(--sp-1); min-width: 0; }
+  /* 趋势图：一天一列固定宽度，总宽超出时横向滚动（14/30/60 日都不再挤成一团）。
+     列宽 34px + gap 6px，日期标签 "MM-DD" 完整可读；滚动区独立于页面横向溢出。 */
+  .trend-scroll { overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
+  /* 高度要容得下「数值 + 柱 + 日期」三层，120px 会把最高柱的数值裁掉（评审截图 175 被切）。 */
+  .trend { display: flex; align-items: flex-end; justify-content: space-between; gap: 6px; height: 140px; padding: var(--sp-2) 2px 0; min-width: max-content; }
+  .trend-col { flex: 0 0 34px; width: 34px; display: flex; flex-direction: column; align-items: center; gap: var(--sp-1); }
   .trend-bar { width: 100%; max-width: 34px; border-radius: var(--sp-1) var(--sp-1) 0 0; background: linear-gradient(180deg, var(--accent) 0%, var(--accent-fade) 100%); min-height: 2px; position: relative; }
   .trend-bar.zero { background: var(--border); min-height: 2px; }
   .trend-bar.fail { background: linear-gradient(180deg, var(--bad) 0%, var(--bad-fade) 100%); }
@@ -228,6 +232,11 @@
   .trend-day { font-size: 10.5px; color: var(--text-dim); white-space: nowrap; }
   .trend-day.today { color: var(--accent); }
   .trend-meta { color: var(--text-dim); font-size: var(--fs-xs); margin-top: var(--sp-2); }
+  /* 运行历史表：8 列在手机上必然挤压——给最小宽度并允许横向滑动，
+     时间/「试跑 20」一律不换行（日期被折成两行会被误读）。 */
+  .runs-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .runs-table { min-width: 560px; }
+  .runs-table th, .runs-table td { white-space: nowrap; }
 
   /* ── 推送记录 ── */
   .msg-toolbar { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-3); }

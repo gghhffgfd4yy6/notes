@@ -1983,6 +1983,17 @@ async function main () {
     assert.strictEqual(r5.items.length, 3, '非法参数回默认不报错')
     server.close()
   })
+  await aok('分页/横滑控件: 运行历史与推送记录都有每页条数，趋势与历史表可横向滑动', () => {
+    const js = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
+    assert.ok(/const RUN_PAGE_SIZES = \[2, 3, 5, 10\]/.test(js), '运行历史每页条数须为 2/3/5/10')
+    const sizeSelects = js.match(/aria-label="每页显示条数"/g) || []
+    assert.ok(sizeSelects.length >= 2, '运行历史与推送记录各要有一个每页条数选择')
+    assert.ok(/\.trend-scroll\s*\{[^}]*overflow-x:\s*auto/.test(css), '趋势图须横向滚动容器')
+    assert.ok(/\.trend-col\s*\{[^}]*flex:\s*0 0 34px/.test(css), '趋势列须固定宽度（否则日期挤在一起）')
+    assert.ok(/\.runs-scroll\s*\{[^}]*overflow-x:\s*auto/.test(css), '运行历史表须横向滚动容器')
+  })
+
   await aok('readRunHistory: 分页截断时旧失败行不得误标本页最旧一条', () => {
     const { readRunHistory } = require('./scripts/status')
     const dir = tmpDir()
