@@ -2508,6 +2508,22 @@ async function main () {
     assert.ok(/addEventListener\(['"]pageshow['"]/.test(src), 'app.js 须监听 pageshow')
     assert.ok(/ev\.persisted|e\.persisted/.test(src), 'pageshow 分支须判 persisted 后重载')
   })
+
+  await aok('静态红线: 运行 id 是 string，禁 typeof … === number 判定（v3.299 回归）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    // v3.299 事故形态：服务端把 run id 从 number 改成 'epoch.seq' 字符串后，前端仍有
+    // `typeof id === 'number'` 守卫 → 按钮永久禁用、请求永不发出，且页面无任何报错。
+    const bad = /typeof\s+(?:[A-Za-z_$][\w$]*\.)?id\s*===\s*['"]number['"]/.test(src)
+    assert.strictEqual(bad, false, '不得用 typeof <expr>.id === "number" 判定运行 id（id 恒为 string）')
+  })
+
+  await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes('function Hint ('), '必须有 Hint 原语')
+    assert.ok(src.includes('function Card ('), '必须有 Card 原语')
+    assert.ok(!src.includes('class="hint'), '提示行不得再手写 class="hint"')
+    assert.strictEqual(src.split('class="card"').length - 1, 1, 'class="card" 只允许出现在 Card 原语定义里')
+  })
 }
 
 main()
