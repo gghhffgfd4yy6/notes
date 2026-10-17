@@ -2642,6 +2642,16 @@ async function main () {
     assert.ok(/getUTC/.test(seg) && !/getHours\(\)/.test(seg), 'fmtTime 必须用 getUTC*，不得用浏览器本地 getHours')
   })
 
+  await aok('结构红线: 分类筛选走自定义 CategoryPicker（手机端不弹原生 select）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes('function CategoryPicker ('), '必须有 CategoryPicker 组件')
+    const start = src.indexOf('function MessagesPanel')
+    const end = src.indexOf('function LogsPanel', start)
+    const seg = src.slice(start, end)
+    assert.ok(/<\$\{CategoryPicker\}/.test(seg), '推送记录必须使用 CategoryPicker')
+    assert.ok(!/<select[^>]*value=\$\{cate\}/.test(seg), '分类筛选不得回退原生 select')
+  })
+
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function Hint ('), '必须有 Hint 原语')

@@ -252,6 +252,41 @@
     background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
     border-radius: var(--r-sm); padding: var(--sp-2) 10px; font-size: var(--fs-sm); max-width: 260px;
   }
+  /* 分类筛选：自定义下拉（替代 Android 原生全屏白底 select） */
+  .cate-picker { position: relative; flex: 0 1 240px; min-width: 0; }
+  .cate-btn {
+    width: 100%; display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2);
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: var(--r-sm); padding: var(--sp-2) 10px; font-size: var(--fs-sm); cursor: pointer;
+  }
+  .cate-btn:hover { border-color: var(--accent-line); }
+  .cate-btn-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cate-caret { color: var(--text-dim); flex: 0 0 auto; }
+  .cate-backdrop { display: none; }
+  .cate-pop {
+    position: absolute; z-index: 40; top: calc(100% + 6px); left: 0;
+    width: min(360px, calc(100vw - 48px)); padding: var(--sp-2);
+    padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom));
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, .45); display: flex; flex-direction: column;
+  }
+  .cate-search {
+    width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: var(--r-sm); padding: 8px 10px; font-size: var(--fs-sm);
+  }
+  .cate-list { flex: 1 1 auto; min-height: 0; max-height: 300px; overflow-y: auto; margin-top: var(--sp-2); padding-bottom: 10px; }
+  .cate-opt {
+    width: 100%; display: flex; align-items: center; gap: 8px; text-align: left;
+    background: none; border: 0; color: var(--text); border-radius: var(--r-sm);
+    padding: 8px 10px; font-size: var(--fs-sm); cursor: pointer;
+  }
+  .cate-opt:hover { background: var(--panel-2); }
+  .cate-opt.active { background: var(--accent-soft); color: var(--info-fg); }
+  .cate-opt-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .cate-count { color: var(--text-dim); font-family: var(--mono); font-size: var(--fs-xs); flex: 0 0 auto; }
+  .cate-check { color: var(--accent); width: 14px; flex: 0 0 14px; text-align: center; }
+  .cate-empty { color: var(--text-dim); font-size: var(--fs-xs); padding: var(--sp-2) 10px; }
+  .cate-foot { color: var(--text-dim); font-size: var(--fs-2xs); text-align: center; padding-top: var(--sp-2); margin-top: var(--sp-2); border-top: 1px solid var(--border-soft); }
   .msg-count { color: var(--text-dim); font-size: var(--fs-xs); margin-bottom: var(--sp-2); }
   .msg-list { display: flex; flex-direction: column; gap: var(--sp-2); }
   .msg-item { border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px var(--sp-3); background: var(--panel-2); }
@@ -286,5 +321,14 @@
     .btn-item .btn { width: 100%; }
     .tab-btn { min-height: 44px; padding: 7px 10px; }
     .btn-ghost { min-height: 44px; }
+    /* 分类筛选：手机端贴底弹层 + 遮罩，避免原生 select 的全屏白底列表 */
+    .cate-picker { flex: 1 1 100%; }
+    .cate-btn { min-height: 44px; }
+    .cate-backdrop { display: block; position: fixed; inset: 0; z-index: 55; background: rgba(0, 0, 0, .55); }
+    .cate-pop {
+      position: fixed; top: auto; left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); width: auto;
+      max-height: 70vh; max-height: 70dvh; z-index: 56; display: flex; flex-direction: column;
+    }
+    .cate-list { max-height: calc(70vh - 140px); max-height: calc(70dvh - 140px); flex: 1 1 auto; }
   }
 }

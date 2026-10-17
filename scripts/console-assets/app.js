@@ -1051,6 +1051,142 @@ function msgLink (m, base) {
     title=${title}>原文链接 ↗</a>`
 }
 
+// 分类筛选：自定义弹层而不是原生 <select>。
+// Android 上原生 select 会弹出全屏白底系统列表（80+ 分类、无搜索、与暗色控制台割裂），
+// 这里改为暗色下拉 + 搜索，手机端贴底弹出，选中项打勾。
+function CategoryPicker ({ value, categories, total, onChange }) {
+  const [open, setOpen] = useState(false)
+  const [q, setQ] = useState('')
+  const [active, setActive] = useState(0)
+  const [narrow, setNarrow] = useState(() => window.matchMedia('(max-width: 640px)').matches)
+  const [place, setPlace] = useState({ up: false, max: 380 })
+  const rootRef = useRef(null)
+  const btnRef = useRef(null)
+  const popRef = useRef(null)
+  const searchRef = useRef(null)
+  const listRef = useRef(null)
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 640px)')
+    const on = () => setNarrow(mq.matches)
+    mq.addEventListener('change', on)
+    return () => mq.removeEventListener('change', on)
+  }, [])
+  // 打开时：桌面把焦点放进搜索框；手机聚焦当前选项（不弹软键盘）。
+  useEffect(() => {
+    if (!open) return
+    if (narrow) {
+      const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
+      if (el) el.focus()
+    } else if (searchRef.current) {
+      searchRef.current.focus()
+    }
+  }, [open, narrow])
+  // 搜索词变化后回到第一项，避免 active 指向已被过滤掉的项。
+  useEffect(() => { setActive(0) }, [q])
+  // 桌面端空间不足时向上翻，并按可用高度限制弹层，避免被视口底边裁掉。
+  useEffect(() => {
+    if (!open || narrow) return
+    const calc = () => {
+      const r = btnRef.current.getBoundingClientRect()
+      const below = window.innerHeight - r.bottom - 12
+      const above = r.top - 12
+      const want = 380
+      if (below < Math.min(300, want) && above > below) setPlace({ up: true, max: Math.min(want, above) })
+      else setPlace({ up: false, max: Math.min(want, below) })
+    }
+    calc()
+    window.addEventListener('resize', calc)
+    window.addEventListener('scroll', calc, true)
+    return () => {
+      window.removeEventListener('resize', calc)
+      window.removeEventListener('scroll', calc, true)
+    }
+  }, [open, narrow])
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e) => {
+      if (!rootRef.current || !rootRef.current.contains(e.target)) setOpen(false)
+    }
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        setOpen(false)
+        if (btnRef.current) btnRef.current.focus()
+        return
+      }
+      // 手机端是带遮罩的模态弹层：Tab 在弹层内循环，不跑到背后的工具栏。
+      if (e.key === 'Tab' && narrow && popRef.current) {
+        const f = [...popRef.current.querySelectorAll('button, input')].filter((el) => !el.disabled && el.tabIndex !== -1)
+        if (f.length === 0) return
+        const first = f[0]
+        const last = f[f.length - 1]
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+      }
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open, narrow])
+  const current = categories.find((c) => c.name === value)
+  const label = value === '' ? '全部分类' : `${value}${current ? `（${current.count}）` : ''}`
+  const kw = q.trim().toLowerCase()
+  const shown = kw === '' ? categories : categories.filter((c) => c.name.toLowerCase().includes(kw))
+  const choose = (name) => {
+    onChange(name)
+    setOpen(false)
+    setQ('')
+    if (btnRef.current) btnRef.current.focus()
+  }
+  const dismiss = () => {
+    setOpen(false)
+    setQ('')
+    if (btnRef.current) btnRef.current.focus()
+  }
+  const onListKey = (e) => {
+    const opts = listRef.current ? [...listRef.current.querySelectorAll('.cate-opt')] : []
+    if (opts.length === 0) return
+    const i = opts.indexOf(document.activeElement)
+    let next = -1
+    if (e.key === 'ArrowDown') next = i < 0 ? 0 : Math.min(opts.length - 1, i + 1)
+    else if (e.key === 'ArrowUp') next = i < 0 ? 0 : Math.max(0, i - 1)
+    else if (e.key === 'Home') next = 0
+    else if (e.key === 'End') next = opts.length - 1
+    if (next >= 0) {
+      e.preventDefault()
+      setActive(next)
+      opts[next].focus()
+    }
+  }
+  const options = [{ name: '', label: '全部分类', count: typeof total === 'number' ? total : '' }, ...shown.map((c) => ({ name: c.name, label: c.name, count: c.count }))]
+  return html`<div class="cate-picker" ref=${rootRef}>
+    <button type="button" class="cate-btn" ref=${btnRef} aria-haspopup="dialog"
+      aria-expanded=${open ? 'true' : 'false'} onClick=${() => setOpen(!open)}>
+      <span class="cate-btn-label">${label}</span><span class="cate-caret" aria-hidden="true">▾</span>
+    </button>
+    ${open && html`<div class="cate-backdrop" aria-hidden="true" onClick=${dismiss}></div>
+      <div class="cate-pop" ref=${popRef} role="dialog" aria-modal=${narrow ? 'true' : 'false'} aria-label="分类筛选"
+        style=${narrow ? '' : `max-height:${Math.max(180, place.max)}px;${place.up ? 'top:auto;bottom:calc(100% + 6px);' : ''}`}>
+        <input class="cate-search" ref=${searchRef} type="search" placeholder="搜索分类…"
+          value=${q} onInput=${(e) => setQ(e.target.value)} onKeyDown=${onListKey} />
+        <div class="cate-list" ref=${listRef} role="listbox" aria-label="分类" onKeyDown=${onListKey}>
+          ${options.map((o, i) => html`<button type="button" key=${o.name || '__all'}
+            class=${'cate-opt' + (value === o.name ? ' active' : '')}
+            role="option" aria-selected=${value === o.name ? 'true' : 'false'}
+            tabIndex=${i === active ? 0 : -1} onFocus=${() => setActive(i)}
+            title=${o.label} onClick=${() => choose(o.name)}>
+            <span class="cate-opt-name">${o.label}</span>
+            <span class="cate-count">${o.count}</span>
+            <span class="cate-check">${value === o.name ? '✓' : ''}</span>
+          </button>`)}
+        </div>
+        ${shown.length === 0 && html`<div class="cate-empty">没有匹配的分类</div>`}
+        <div class="cate-foot">${categories.length + 1} 个分类${typeof total === 'number' ? ` · ${total} 条` : ''} · 滚动查看</div>
+      </div>`}
+  </div>`
+}
+
 function MessagesPanel () {
   const [page, setPage] = useState(1)
   const [size, setSize] = useState(20)
@@ -1147,10 +1283,9 @@ function MessagesPanel () {
     <div class="msg-toolbar">
       <input class="msg-search" type="search" placeholder="搜索标题 / 内容…" value=${input}
         onInput=${(e) => setInput(e.target.value)} />
-      <select class="msg-select" value=${cate} onChange=${(e) => { setCate(e.target.value); setPage(1) }}>
-        <option value="">全部分类</option>
-        ${categories.map((c) => html`<option key=${c.name} value=${c.name}>${c.name}（${c.count}）</option>`)}
-      </select>
+      <${CategoryPicker} value=${cate} categories=${categories}
+        total=${data && typeof data.grandTotal === 'number' ? data.grandTotal : null}
+        onChange=${(v) => { setCate(v); setPage(1) }} />
       <select class="msg-select" value=${size} onChange=${(e) => { setSize(Number(e.target.value)); setPage(1) }} aria-label="每页显示条数">
         ${[10, 20, 50, 100].map((n) => html`<option key=${n} value=${n}>每页 ${n} 条</option>`)}
       </select>
