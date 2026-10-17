@@ -214,6 +214,8 @@ exclude_paths:
   # 锁文件名是本文件常量，读取走 readFileSync + JSON.parse，无任何外部净输入参与路径构造。
   # test_console.js 同理（mkdtempSync(os.tmpdir()) 下的硬编码夹具路径），另含 16 位以上数字字面量
   # 被误报「runtime value differs」（指数记法规避后仍留此登记，防后续同类）。
+  # test_local_mutation_guard.js 用 path.join(__dirname, 硬编码文件名) 定位守卫脚本与 AGENTS.md，
+  # 路径全为测试硬编码常量、无用户输入，静态路径注入告警属误报。
   - "scripts/console.js"
   - "test_console.js"
   - "test_run_mutation_cli.js"
@@ -236,3 +238,4 @@ exclude_paths:
   - "test_ci_static_gates.js"
   - "test_cli.js"
   - "test_notify_selfcheck.js"
+  - "test_local_mutation_guard.js"

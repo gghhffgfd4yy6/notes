@@ -24,12 +24,22 @@ if (process.env.XBK_ALLOW_LOCAL_MUTATION !== '1') {
   process.exit(1)
 }
 
+const fs = require('fs')
+const path = require('path')
 const { spawnSync } = require('child_process')
-const result = spawnSync('npx', ['stryker', 'run'], {
-  stdio: 'inherit',
-  cwd: __dirname.replace(/[\\/]scripts$/, ''),
-  shell: process.platform === 'win32'
-})
+
+const ROOT = path.resolve(__dirname, '..')
+// 直接执行仓库内 node_modules 的 stryker 入口，不依赖 PATH（Sonar S4036）。
+const binLink = path.join(ROOT, 'node_modules', '.bin', 'stryker')
+let binPath
+try {
+  binPath = fs.realpathSync(binLink)
+} catch (e) {
+  console.error('未找到本地 stryker（node_modules/.bin/stryker）：先 npm install，再重试。')
+  process.exit(1)
+}
+
+const result = spawnSync(process.execPath, [binPath, 'run'], { stdio: 'inherit', cwd: ROOT })
 if (result.error) {
   console.error(`stryker 启动失败：${result.error.message}`)
   process.exit(1)
