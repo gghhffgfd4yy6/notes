@@ -337,6 +337,21 @@ function Hint ({ tone, style, children }) {
   return html`<div class=${tone === 'error' ? 'hint hint-err' : 'hint'} style=${style}>${children}</div>`
 }
 
+// 面板头：标题 + 说明 + 右侧操作（右侧自动左推）。含 select 等复杂头部仍可手写。
+function PanelHead ({ title, sub, right, afterTitle }) {
+  return html`<div class="panel-head">
+    <span class="panel-title">${title}</span>
+    ${afterTitle}
+    ${sub && html`<span class="panel-sub">${sub}</span>`}
+    ${right && html`<span style="flex:1"></span>${right}`}
+  </div>`
+}
+
+// 按钮：variant 生成 `btn btn-<variant>`；修饰词（btn-danger/btn-busy）可拼进 variant。
+function Button ({ variant = 'secondary', disabled, onClick, title, children }) {
+  return html`<button class=${'btn btn-' + variant} disabled=${disabled} onClick=${onClick} title=${title}>${children}</button>`
+}
+
 // 指标卡：标题 + 右上角徽章 + 若干行文本。换卡片实现（或组件库）只改这里。
 function Card ({ title, badge, children }) {
   return html`<div class="card">
@@ -545,7 +560,7 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
   }, [onTriggered, setBusy])
 
   return html`<div class="panel">
-    <div class="panel-head"><span class="panel-title">手动触发</span></div>
+    <${PanelHead} title="手动触发" />
     <div class="btn-row">
       ${ACTION_DEFS.map((a) => html`<div class="btn-item" key=${a.key}>
         <button class="btn ${a.cls}" disabled=${locking} onClick=${() => doTrigger(a.key)}>${a.label}</button>
@@ -719,10 +734,7 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
   }
 
   return html`<div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">触发历史</span>
-      <span class="panel-sub">最多 20 条 · 本进程内存</span>
-    </div>
+    <${PanelHead} title="触发历史" sub="最多 20 条 · 本进程内存" />
     ${cancelErr && html`<${Hint} tone="error">${cancelErr}<//>`}
     ${runs.length === 0
       ? html`<div class="empty">暂无触发记录</div>`
@@ -735,11 +747,11 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
             <td class="mono">${fmtTime(r.startedAt)}</td>
             <td>${statusOf(r)}</td>
             <td>
-              ${!r.finishedAt && html`<button class=${'btn btn-ghost btn-danger' + (cancelPending === r.id ? ' btn-busy' : '')} disabled=${cancelPending === r.id}
-                onClick=${() => { doCancel(r.id).catch(() => {}) }} title="停止该任务（SIGTERM，3 秒后强杀；已发送但未记录的通知下轮会重推）">停止</button>`}
-              <button class="btn btn-ghost" onClick=${() => setOpenId(openId === r.id ? null : r.id)}>
+              ${!r.finishedAt && html`<${Button} variant=${'ghost btn-danger' + (cancelPending === r.id ? ' btn-busy' : '')} disabled=${cancelPending === r.id}
+                onClick=${() => { doCancel(r.id).catch(() => {}) }} title="停止该任务（SIGTERM，3 秒后强杀；已发送但未记录的通知下轮会重推）">停止<//>`}
+              <${Button} variant="ghost" onClick=${() => setOpenId(openId === r.id ? null : r.id)}>
                 ${openId === r.id ? '收起' : '日志'}
-              </button>
+              <//>
             </td>
           </tr>`)}
         </tbody>
@@ -747,7 +759,7 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
     ${openId !== null && html`<div class="logbox">
       <div class="logbox-head">
         <span>运行 #${openId} 输出${openActive ? '（实时跟随）' : ''}</span>
-        <button class="btn btn-ghost" onClick=${() => setOpenId(null)}>关闭</button>
+        <${Button} variant="ghost" onClick=${() => setOpenId(null)}>关闭<//>
       </div>
       <pre class="logpre">${
         detailErr ||
@@ -795,12 +807,9 @@ function RunHistoryPanel () {
   useEffect(() => { load(0).catch(() => {}) }, [load])
   const shown = page.status === 'ok' ? page.items : []
   return html`<div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">逐轮运行历史</span>
-      <span class="panel-sub">run.log 摘要逐轮${page.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : ''}</span>
-      <span style="flex:1"></span>
-      <button class="btn btn-ghost" onClick=${() => { load(0) }} disabled=${loading}>刷新</button>
-    </div>
+    <${PanelHead} title="逐轮运行历史"
+      sub=${'run.log 摘要逐轮' + (page.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : '')}
+      right=${html`<${Button} variant="ghost" onClick=${() => { load(0) }} disabled=${loading}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${page.status && page.status !== 'ok' && html`<div class="empty">run.log${page.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${page.status}）`}</div>`}
     ${shown.length > 0 && html`<table class="runs-table">
@@ -820,7 +829,7 @@ function RunHistoryPanel () {
     </table>`}
     ${page.status === 'ok' && shown.length === 0 && html`<div class="empty">日志尾窗内没有摘要行</div>`}
     ${page.hasMore && html`<div style="text-align:center;margin-top:8px">
-      <button class="btn btn-ghost" onClick=${() => { load(shown.length > 0 ? shown[shown.length - 1].lineNo - 1 : 0) }} disabled=${loading}>${loading ? '加载中…' : '加载更早轮次'}</button>
+      <${Button} variant="ghost" onClick=${() => { load(shown.length > 0 ? shown[shown.length - 1].lineNo - 1 : 0) }} disabled=${loading}>${loading ? '加载中…' : '加载更早轮次'}<//>
     </div>`}
   </div>`
 }
@@ -873,15 +882,12 @@ function TrendsPanel () {
   // today 由服务端按 Asia/Shanghai 日历日下发（run.log 时间戳口径），浏览器本地时区不再参与
   const todayKey = trends && trends.today ? trends.today : ''
   return html`<div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">${shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势'}</span>
-      <select class="msg-select" value=${days} onChange=${(e) => setDays(Number(e.target.value))} aria-label="趋势窗口天数">
+    <${PanelHead} title=${shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势'}
+      afterTitle=${html`<select class="msg-select" value=${days} onChange=${(e) => setDays(Number(e.target.value))} aria-label="趋势窗口天数">
         ${TREND_DAYS.map((d) => html`<option key=${d} value=${d}>${d} 日</option>`)}
-      </select>
-      <span class="panel-sub">run.log 摘要按日聚合${trends && trends.truncated ? '（日志超限，仅统计尾部 1 MiB）' : ''}</span>
-      <span style="flex:1"></span>
-      <button class="btn btn-ghost" onClick=${load}>刷新</button>
-    </div>
+      </select>`}
+      sub=${'run.log 摘要按日聚合' + (trends && trends.truncated ? '（日志超限，仅统计尾部 1 MiB）' : '')}
+      right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${trends && trends.status !== 'ok' && html`<div class="empty">日志${trends.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${trends.status}）`}</div>`}
     ${trends && trends.status === 'ok' && html`<div>
@@ -913,12 +919,8 @@ function CacheHealthPanel () {
   const entryNear = ok && typeof data.entryCount === 'number' && data.entryCount >= data.limits.entryMax * 0.8
   const entryOver = ok && typeof data.entryCount === 'number' && data.entryCount >= data.limits.entryMax
   return html`<div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">缓存健康</span>
-      <span class="panel-sub">${data && data.file ? data.file : 'push.json'} · 判重缓存占用</span>
-      <span style="flex:1"></span>
-      <button class="btn btn-ghost" onClick=${load}>刷新</button>
-    </div>
+    <${PanelHead} title="缓存健康" sub=${(data && data.file ? data.file : 'push.json') + ' · 判重缓存占用'}
+      right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && !ok && html`<div class="empty">${data.status === 'missing' ? '缓存尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
     ${ok && html`<div class="sys-grid">
@@ -1048,10 +1050,7 @@ function MessagesPanel () {
     }
   }, [data])
   return html`<div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">推送记录</span>
-      <span class="panel-sub">判重缓存 push.json（已抓取并推送的消息）</span>
-    </div>
+    <${PanelHead} title="推送记录" sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
       <input class="msg-search" type="search" placeholder="搜索标题 / 内容…" value=${input}
         onInput=${(e) => setInput(e.target.value)} />
@@ -1059,9 +1058,9 @@ function MessagesPanel () {
         <option value="">全部分类</option>
         ${categories.map((c) => html`<option key=${c.name} value=${c.name}>${c.name}（${c.count}）</option>`)}
       </select>
-      <button class="btn btn-ghost" onClick=${load}>刷新</button>
-      <button class="btn btn-ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}</button>
-      <button class="btn btn-ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}</button>
+      <${Button} variant="ghost" onClick=${load}>刷新<//>
+      <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
+      <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
     </div>
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${exportErr && html`<${Hint} tone="error">${exportErr}<//>`}
@@ -1086,11 +1085,11 @@ function MessagesPanel () {
           </div>`)}
         </div>`}
       <div class="pager">
-        <button class="btn btn-secondary" disabled=${page <= 1} onClick=${() => setPage(1)}>« 首页</button>
-        <button class="btn btn-secondary" disabled=${page <= 1} onClick=${() => setPage(page - 1)}>上一页</button>
+        <${Button} disabled=${page <= 1} onClick=${() => setPage(1)}>« 首页<//>
+        <${Button} disabled=${page <= 1} onClick=${() => setPage(page - 1)}>上一页<//>
         <span class="pager-info">第 ${data.page} / ${data.pages} 页</span>
-        <button class="btn btn-secondary" disabled=${page >= data.pages} onClick=${() => setPage(page + 1)}>下一页</button>
-        <button class="btn btn-secondary" disabled=${page >= data.pages} onClick=${() => setPage(data.pages)}>末页 »</button>
+        <${Button} disabled=${page >= data.pages} onClick=${() => setPage(page + 1)}>下一页<//>
+        <${Button} disabled=${page >= data.pages} onClick=${() => setPage(data.pages)}>末页 »<//>
       </div>
     </div>`}
   </div>`
@@ -1106,12 +1105,8 @@ function LogsPanel ({ pollMs }) {
     return () => clearInterval(t)
   }, [load, pollMs])
   return html`<div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">运行日志</span>
-      <span class="panel-sub">run.log 尾部 1 MiB${pollMs ? ' · 任务运行中，实时跟随' : ''}</span>
-      <span style="flex:1"></span>
-      <button class="btn btn-ghost" onClick=${load}>刷新</button>
-    </div>
+    <${PanelHead} title="运行日志" sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
+      right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && data.status !== 'ok' && html`<div class="empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
     ${data && data.status === 'ok' && html`<pre class="logpre">${data.text.length > 0 ? data.text : '（空）'}</pre>`}
@@ -1137,11 +1132,7 @@ function SysPanel () {
   const logItems = access && Array.isArray(access.items) ? access.items : []
   const logTail = logItems.slice(-20).reverse()
   return html`<div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">系统信息</span>
-      <span style="flex:1"></span>
-      <button class="btn btn-ghost" onClick=${refreshAll}>刷新</button>
-    </div>
+    <${PanelHead} title="系统信息" right=${html`<${Button} variant="ghost" onClick=${refreshAll}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${sys && html`<div class="sys-grid">
       <table class="sys-table"><tbody>
@@ -1175,12 +1166,9 @@ function FilesPanel () {
   useEffect(() => { load().catch(() => {}) }, [load])
   const files = data && Array.isArray(data.files) ? data.files : []
   return html`<div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">缓存目录文件</span>
-      <span class="panel-sub">${data ? `${data.total} 项${data.truncated ? '（超出展示上限，已截断）' : ''}` : ''}</span>
-      <span style="flex:1"></span>
-      <button class="btn btn-ghost" onClick=${load}>刷新</button>
-    </div>
+    <${PanelHead} title="缓存目录文件"
+      sub=${data ? `${data.total} 项${data.truncated ? '（超出展示上限，已截断）' : ''}` : ''}
+      right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && data.status !== 'ok' && html`<div class="empty">${data.status === 'missing' ? '目录尚未生成' : `不可读（${data.status}）`}</div>`}
     ${data && data.status === 'ok' && html`<table class="sys-table"><tbody>
@@ -1203,12 +1191,8 @@ function ConfigPanel () {
   const chanNames = pc && Array.isArray(pc.perChannel) ? pc.perChannel : (pc && pc.perChannel ? Object.keys(pc.perChannel) : [])
   const filterEntries = r && r.filter ? Object.entries(r.filter) : []
   return html`<div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">运行配置</span>
-      <span class="panel-sub">脱敏视图 · 推送密钥只显示是否已配置</span>
-      <span style="flex:1"></span>
-      <button class="btn btn-ghost" onClick=${load}>刷新</button>
-    </div>
+    <${PanelHead} title="运行配置" sub="脱敏视图 · 推送密钥只显示是否已配置"
+      right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && !r && html`<div class="empty">运行配置不可读（模块加载失败——检查部署完整性）</div>`}
     ${r && html`<div class="sys-grid">
