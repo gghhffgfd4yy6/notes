@@ -510,12 +510,15 @@ const ASSETS_DIR = path.join(__dirname, 'console-assets')
 const STATIC_ASSETS = Object.freeze({
   '/assets/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
   '/assets/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+  '/assets/pure.mjs': { file: 'pure.mjs', type: 'text/javascript; charset=utf-8' },
   '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' }
 })
 
-// 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，三文件 < 100KB）。
-// 版本号 = 三文件内容哈希的 sha16，renderPage 以 ?v=<sha16> 引用；带当前版本的 URL 可长缓存
+// 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，各文件 < 100KB）。
+// 版本号 = 各文件内容哈希拼接后的 sha16，renderPage 以 ?v=<sha16> 引用；带当前版本的 URL 可长缓存
 // （private + immutable），裸 URL 仍 no-cache（测试与旧页面兼容）。部署 = systemd restart。
+// 注：app.js 内部 `import './pure.mjs'` 不带版本号，走裸 URL 的 no-cache + ETag 协商（内容哈希仍参与
+// 全站版本号，因此任一资产变更都会让页面引用的 app.js?v= 一起失效）。
 //
 // 一致性（评审 #236 · Sourcery Medium）：读盘前后各取一次 (mtime,size) 快照，不一致说明
 // 部署正在替换资产 ⇒ 重试一次，仍不一致则 fail-closed，绝不把两个版本的资产拼在同一快照里。

@@ -8,6 +8,8 @@
 // 动作面：POST /trigger（token 同样在 Bearer 头；body 只带 action）。
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useRef, useCallback } from './htm-preact.module.js'
+// 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
+import { relDay, cacheWriteInfo, isIssueLogLine, filterLogLines } from './pure.mjs'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -52,6 +54,8 @@ function fmtTime (ts) {
 function fmtNum (n) {
   return (n === undefined || n === null) ? '—' : String(n)
 }
+
+// 「多久以前」（缓存写入停滞判断）与日报相对日期见 pure.mjs——纯函数便于行为测试。
 
 // 字节人性化（v3.298 上提为模块级：系统信息与缓存健康面板共用）；0 字节是真实大小，
 // 显式显示「0 B」而不是「—」（— 意为未知/不适用，会掩盖 0 字节文件的异常）。
@@ -482,14 +486,17 @@ function StatusCards ({ state }) {
   const run = state.run && state.run.value ? state.run.value : null
   const runTone = partTone(state.run, runIsOk(state))
   const chan = channelInfo(state)
+  // 日报只有跑过一轮才更新——标题写「最近日报」，日期附「今天/昨天」，避免凌晨看到
+  // 「今日日报 10-17」而今天已是 10-18 的错位（实测 2026-10-18 01:12）。
+  const repRel = rep ? relDay(rep.date) : ''
 
   const cards = [
     {
-      title: '今日日报',
+      title: '最近日报',
       tone: repTone,
       lines: rep
         ? [
-            `日期 ${fmtNum(rep.date)}`,
+            `日期 ${fmtNum(rep.date)}${repRel ? `（${repRel}）` : ''}`,
             `轮数 ${fmtNum(rep.runs)} · 抓取 ${fmtNum(rep.total)}`,
             `推送成功 ${fmtNum(rep.pushed)} · 失败 ${fmtNum(rep.failed)}`
           ]
@@ -621,6 +628,7 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
       // Sourcery Overlapping-log-polls/Slow-log-requests：详情请求慢于轮询间隔时逐 tick
       // 叠加并发请求，迟到的失败响应会把过期错误写到当前面板。与主轮询同口径：
       // 上一轮未回跳过本轮（8s 期限保证不会永久跳过）；领号防乱序保留。
+      if (document.visibilityState === 'hidden') return // 后台标签页不轮询详情（切回时补一次）
       if (inflight) return
       inflight = true
       const seq = ++detailSeqRef.current
@@ -636,6 +644,11 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
         inflight = false
       }
     }
+    // 切回前台立即补一拍（不依赖 interval 的下一 tick；隐藏期间已跳过所有详情请求）。
+    const onVisibility = () => {
+      if (!dead && document.visibilityState === 'visible') fetchOnce().catch(() => {})
+    }
+    document.addEventListener('visibilitychange', onVisibility)
     const startPolling = () => {
       if (pollTimer !== null || dead) return
       // S9383：fetchOnce 内部已 try/catch 全收（不会 reject），但仍显式 .catch 兜底，
@@ -645,7 +658,11 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
     }
     if (!openActive) {
       startPolling()
-      return () => { dead = true; if (pollTimer !== null) clearInterval(pollTimer) }
+      return () => {
+        dead = true
+        document.removeEventListener('visibilitychange', onVisibility)
+        if (pollTimer !== null) clearInterval(pollTimer)
+      }
     }
     // ── SSE 模式：先取轮询快照，以快照 outputTotalLength 为初始游标建流（顺序不可倒置，
     // 快照先落 detail 再开流，快照后新增量由首个 tick 补发——不重不漏，见 §2 D5）。
@@ -699,6 +716,7 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
     }).catch(() => { if (!dead) startPolling() }) // 快照失败 → 回退轮询（既有能力兜底）
     return () => {
       dead = true
+      document.removeEventListener('visibilitychange', onVisibility)
       if (es !== null) es.close()
       if (pollTimer !== null) clearInterval(pollTimer)
     }
@@ -995,7 +1013,7 @@ function TrendsPanel () {
         const d = byDay.find((x) => x.date === selDay)
         return d ? html`<div class="trend-detail">${d.date}：轮次 ${d.rounds} · 抓取 ${d.total} · 推送 ${d.pushed} · 失败 ${d.failed}</div>` : ''
       })()}
-      <div class="trend-meta">${shownDays || ''} 日共推送 ${totalAll} 条 · 失败 ${failAll} 条 · 左右滑动查看更早日期，点柱子看每日明细</div>
+      <div class="trend-meta">${shownDays || ''} 日共推送 ${totalAll} 条 · 失败 ${failAll} 条${failAll > 0 ? ' · 红柱=当日有失败' : ''} · 左右滑动查看更早日期，点柱子看每日明细</div>
     </div>`}
   </div>`
 }
@@ -1007,9 +1025,24 @@ function TrendsPanel () {
 function CacheHealthPanel () {
   const { data, err, load } = usePanelLoader(apiGetCacheHealth)
   useEffect(() => { load().catch(() => {}) }, [load])
+  // 缓存健康随概览常开：每分钟（且切回前台时）重拉一次，避免「页面开着过夜、mtime 早已更新
+  // 但面板还拿着旧快照」；1 分钟一次只读小 JSON，不与 5s 主轮询抢盘。
+  useEffect(() => {
+    const t = setInterval(() => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }, 60000)
+    const onVis = () => { if (document.visibilityState === 'visible') load().catch(() => {}) }
+    document.addEventListener('visibilitychange', onVis)
+    return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVis) }
+  }, [load])
   const ok = data && data.status === 'ok'
   const ratioText = ok && data.writeRatio != null ? `${(data.writeRatio * 100).toFixed(1)}%` : '—'
   const tomb = data && data.tombstone ? data.tombstone : null
+  // 最近写入：显示相对时间；超过 24 小时只陈述事实（不推断链路断没断——调度暂停同样会这样）。
+  const write = ok ? cacheWriteInfo(data.mtimeMs) : { ageText: '', stale: false }
+  // 控制台可读：长解释收进 title，首屏只留结论（32 MiB 封顶是控制台读取限制，不影响推送）。
+  const readableText = data && data.consoleReadable
+    ? '是（未超 32 MiB 读取封顶）'
+    : '否——超过 32 MiB 读取封顶，推送记录页显示「过大不可读」（生产不受影响）'
+  const readableTitle = '超限与否以推送记录页实际显示为准；JSON 损坏时该页会显示「记录不可读」'
   // 条数预警：服务端在 cache-health 响应里附带 entryCount（/api/status 同源的
   // readMessageCount；tooLarge 时 null）对照写端条目上限；接近上限时下轮保存
   // 会裁最旧条目（与字节裁剪同一出口）。
@@ -1025,11 +1058,11 @@ function CacheHealthPanel () {
         <tr><td>缓存大小</td><td>${fmtBytes(data.bytes)}（上限 ${fmtBytes(data.limits.writeMaxBytes)}）</td></tr>
         <tr><td>占用比例</td><td>${ratioText}${data.nearTrim ? ' · ⚠️ 临近字节裁剪' : ''}${data.overLimit ? ' · ⛔ 已超写端上限' : ''}</td></tr>
         <tr><td>条目数</td><td>${ok && typeof data.entryCount === 'number' ? `${data.entryCount} / ${data.limits.entryMax} 条上限${entryOver ? ' · ⛔ 已达上限，旧记录将被裁剪' : entryNear ? ' · ⚠️ 临近条目上限' : ''}` : `上限 ${data.limits.entryMax} 条${ok && data.entryCountStatus === 'tooLarge' ? '（当前条数不可得：缓存超控制台读取封顶）' : '（进推送记录页获取当前条数）'}`}</td></tr>
-        <tr><td>控制台可读</td><td>${data.consoleReadable ? '是——未超 32 MiB 控制台读取封顶（超限与否以推送记录页实际显示为准，JSON 损坏时该页会显示「记录不可读」）' : '否——超过 32 MiB 读取封顶，推送记录页显示「过大不可读」（生产不受影响）'}</td></tr>
+        <tr><td>控制台可读</td><td title=${readableTitle}>${readableText}</td></tr>
       </tbody></table>
       <table class="sys-table"><tbody>
         <tr><td>墓碑状态</td><td>${tomb ? (tomb.status === 'ok' ? '正常' : tomb.status === 'missing' ? '尚未生成（首轮前正常）' : `异常（${tomb.status}）`) : '—'}${tomb && tomb.status === 'ok' ? ` · ${tomb.counts.total} 键` : ''}</td></tr>
-        <tr><td>最近写入</td><td>${data.mtimeMs ? fmtTime(data.mtimeMs) : '—'}（停滞 = 推送链路可能断了）</td></tr>
+        <tr><td>最近写入</td><td>${data.mtimeMs ? `${fmtTime(data.mtimeMs)}${write.ageText ? ` · ${write.ageText}` : ''}` : '—'}${write.stale ? ' · 超过 24 小时未写入缓存' : ''}</td></tr>
       </tbody></table>
     </div>`}
     ${ok && (data.nearTrim || data.overLimit || !data.consoleReadable) && html`<${Hint} style="margin-top:10px">占用达到写端上限 80% 时，下一轮保存会自动裁掉最旧条目并落墓碑——无需人工干预，但如果你希望保留更久，检查推送频率与 maxPerRun 配置。<//>`}
@@ -1426,26 +1459,48 @@ function MessagesPanel () {
 }
 
 // 运行日志：run.log 尾部（服务端 1MiB 上限），进页拉一次 + 手动刷新；有任务在跑时跟随轮询。
+// 异常口径与筛选在 pure.mjs（isIssueLogLine / filterLogLines），组件与测试共用。
 function LogsPanel ({ pollMs }) {
   const { data, err, load } = usePanelLoader(apiGetLogs)
   const preRef = useRef(null)
   const stickRef = useRef(true)
   const prevTextRef = useRef('')
+  // 日志筛选（v3.306）：run.log 尾部最多 1 MiB，排障时先按「异常」收窄；纯客户端过滤，
+  // 不发新请求。异常口径含 ERROR/ALERT/WARN、中文「失败」与 failed>0 的摘要行。
+  const [mode, setMode] = useState('all')
+  const [q, setQ] = useState('')
   useEffect(() => {
     load().catch(() => {})
-    if (!pollMs) return undefined
-    const t = setInterval(() => { load().catch(() => {}) }, pollMs)
-    return () => clearInterval(t)
+    // 页面在后台时不轮询（切回前台立即补一次）：控制台常驻标签页也不该整夜每 5s 读盘。
+    // 即使 pollMs=0（空闲时不自动轮询），也要挂 visibilitychange——后台期间跑完的任务
+    // 会在切回时补一次，不会停留在旧快照。
+    let t = null
+    if (pollMs) {
+      const tick = () => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }
+      t = setInterval(tick, pollMs)
+    }
+    const onVis = () => { if (document.visibilityState === 'visible') load().catch(() => {}) }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      if (t !== null) clearInterval(t)
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [load, pollMs])
+  const rawText = data && data.status === 'ok' && typeof data.text === 'string' ? data.text : ''
+  const lines = filterLogLines(rawText, 'all', '')
+  const issueCount = lines.filter((l) => isIssueLogLine(l)).length
+  const kw = q.trim().toLowerCase()
+  const filtered = filterLogLines(rawText, mode, q)
+  const shownText = filtered.join('\n')
   // 首屏与「原本就在底部」时跟随最新日志；用户上翻查看历史时不抢滚动位置。
-  // 手动「刷新」与日志从不可读恢复时强制回到底部，避免 Sourcery 指出的「刷新后仍停在旧位置」。
+  // 手动「刷新」与日志从不可读恢复时强制回到底部，避免「刷新后仍停在旧位置」。
   useEffect(() => {
     const el = preRef.current
     if (!el || !data) return
     if (data.status !== 'ok') { stickRef.current = true; prevTextRef.current = ''; return }
     if (stickRef.current || prevTextRef.current === '') el.scrollTop = el.scrollHeight
-    prevTextRef.current = typeof data.text === 'string' ? data.text : ''
-  }, [data])
+    prevTextRef.current = shownText
+  }, [data, mode, q, shownText])
   const onLogScroll = () => {
     const el = preRef.current
     if (!el) return
@@ -1455,12 +1510,29 @@ function LogsPanel ({ pollMs }) {
     stickRef.current = true
     load().catch(() => {})
   }
+  const pickMode = (next) => {
+    stickRef.current = true
+    setMode(next)
+  }
   return html`<div class="panel">
     <${PanelHead} title="运行日志" sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
       right=${html`<${Button} variant="ghost" onClick=${refreshNow}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && data.status !== 'ok' && html`<div class="empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
-    ${data && data.status === 'ok' && html`<pre class="logpre" ref=${preRef} onScroll=${onLogScroll}>${data.text.length > 0 ? data.text : '（空）'}</pre>`}
+    ${data && data.status === 'ok' && html`<div>
+      <div class="log-tools">
+        <div class="log-chips" role="group" aria-label="日志筛选">
+          <button type="button" class=${'log-chip' + (mode === 'all' ? ' on' : '')}
+            aria-pressed=${mode === 'all' ? 'true' : 'false'} onClick=${() => pickMode('all')}>全部 ${lines.length}</button>
+          <button type="button" class=${'log-chip' + (mode === 'issue' ? ' on' : '')}
+            aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => pickMode('issue')}>异常 ${issueCount}</button>
+        </div>
+        <input class="msg-search log-search" type="search" placeholder="搜索日志…" aria-label="搜索日志"
+          value=${q} onInput=${(e) => { stickRef.current = true; setQ(e.target.value) }} />
+      </div>
+      <div class="log-count">${mode === 'issue' || kw !== '' ? `显示 ${filtered.length} / ${lines.length} 行` : `共 ${lines.length} 行`}</div>
+      <pre class="logpre" ref=${preRef} onScroll=${onLogScroll}>${filtered.length > 0 ? shownText : (lines.length === 0 ? '（空）' : '（没有匹配的日志行）')}</pre>
+    </div>`}
   </div>`
 }
 
@@ -1707,8 +1779,15 @@ function App () {
     // 推送记录/配置/系统不轮询，避免每 5s 的 App 重渲染让页面闪一下。
     // 切回需要的页时会立即补一次 refreshSplit。
     if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)
-    timerRef.current = setInterval(refreshSplit, locking ? POLL_BUSY_MS : POLL_MS)
-    return () => clearInterval(timerRef.current)
+    // 页面在后台时不轮询（切回前台立即补一次）：控制台标签页常驻也不该整夜打接口。
+    const tick = () => { if (document.visibilityState !== 'hidden') refreshSplit() }
+    timerRef.current = setInterval(tick, locking ? POLL_BUSY_MS : POLL_MS)
+    const onVis = () => { if (document.visibilityState === 'visible') refreshSplit() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      clearInterval(timerRef.current)
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [refreshSplit, locking, tab])
 
   // vwU/vv2：busy 提交成功后启动兜底闹钟；active 确认或超时即清。
@@ -1757,6 +1836,13 @@ function App () {
     { key: 'config', label: '配置' },
     { key: 'sys', label: '系统' }
   ]
+  // 切页回到顶部（v3.306）：手机从概览滚到底部再点「推送记录」，此前会停在
+  // 新页面的中段/底部（window.scrollY 被保留），看起来像页面缺了开头。
+  const switchTab = (next) => {
+    if (next === tab) return
+    setTab(next)
+    window.scrollTo(0, 0)
+  }
   return html`<div class="wrap">
     <header class="topbar">
       <div class="brand">
@@ -1771,16 +1857,16 @@ function App () {
     </header>
 
     <nav class="tabs">
-      ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')} onClick=${() => setTab(t.key)}>${t.label}</button>`)}
+      ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')} onClick=${() => switchTab(t.key)}>${t.label}</button>`)}
     </nav>
 
     ${tab === 'overview' && html`<div>
-      <${TrendsPanel} />
-      <${CacheHealthPanel} />
       <${StatusCards} state=${state} />
       <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
+      ${(runs.length > 0 || locking) && html`<${RunsPanel} runs=${runs} pollMs=${locking ? POLL_BUSY_MS : POLL_MS} onRefresh=${refreshSplit} />`}
+      <${TrendsPanel} />
       <${RunHistoryPanel} />
-      <${RunsPanel} runs=${runs} pollMs=${locking ? POLL_BUSY_MS : POLL_MS} onRefresh=${refreshSplit} />
+      <${CacheHealthPanel} />
     </div>`}
     ${tab === 'messages' && html`<${MessagesPanel} />`}
     ${tab === 'logs' && html`<${LogsPanel} pollMs=${locking ? POLL_BUSY_MS : 0} />`}
