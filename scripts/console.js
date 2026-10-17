@@ -18,6 +18,7 @@ const http = require('node:http')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
+const zlib = require('node:zlib')
 const { spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
 const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory } = require('./status')
@@ -509,21 +510,73 @@ const STATIC_ASSETS = Object.freeze({
   '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' }
 })
 
-function serveStatic (res, spec) {
-  let body
+// 资产存储（v3.302）：启动后首次使用时读盘一次，raw/gzip/ETag 常驻内存（三文件 < 100KB）。
+// 版本号 = 三文件内容哈希的 sha8，renderPage 以 ?v=<sha8> 引用；带当前版本的 URL 可长缓存
+// （immutable），裸 URL 仍 no-cache（测试与旧页面兼容）。部署 = systemd restart，版本随之更新。
+let assetStore = null
+function loadAssets () {
+  if (assetStore) return assetStore
+  const table = new Map()
+  const hashes = []
+  for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
+    const raw = fs.readFileSync(path.join(ASSETS_DIR, spec.file))
+    const hash = crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
+    table.set(route, {
+      spec,
+      raw,
+      gzip: zlib.gzipSync(raw, { level: 9 }),
+      etag: `"${hash}"`,
+      gzipEtag: `"${hash}-gz"`
+    })
+    hashes.push(hash)
+  }
+  assetStore = {
+    table,
+    version: crypto.createHash('sha256').update(hashes.join('|')).digest('hex').slice(0, 8)
+  }
+  return assetStore
+}
+
+function assetQuery () {
   try {
-    body = fs.readFileSync(path.join(ASSETS_DIR, spec.file))
+    return `?v=${loadAssets().version}`
+  } catch (e) {
+    // createConsole 的启动闸已保证资产可读；这里兜底成裸 URL，页面仍可用（只是没有长缓存）。
+    return ''
+  }
+}
+
+function serveStatic (req, res, route, spec) {
+  let store
+  try {
+    store = loadAssets()
   } catch (e) {
     sendJson(res, 500, { error: '控制台前端资产缺失（仓库不完整？）' })
     return
   }
-  res.writeHead(200, {
+  const entry = store.table.get(route)
+  // Accept-Encoding 协商：只认显式 gzip（不处理 q=0 的极端写法，浏览器不会这样发）。
+  const accept = String(req.headers['accept-encoding'] || '')
+  const useGzip = /(?:^|,)\s*gzip\s*(?:;|,|$)/i.test(accept)
+  const etag = useGzip ? entry.gzipEtag : entry.etag
+  let versioned = false
+  try {
+    versioned = new URL(req.url, 'http://localhost').searchParams.get('v') === store.version
+  } catch (e) { /* 畸形 URL 交给上层校验；这里按裸 URL 处理 */ }
+  const headers = {
     'Content-Type': spec.type,
-    // 资产更新随部署走：浏览器缓存但每次部署后 ETag 变化即失效。
-    'Cache-Control': 'no-cache',
-    ETag: `"${crypto.createHash('sha256').update(body).digest('hex').slice(0, 16)}"`
-  })
-  res.end(body)
+    'Cache-Control': versioned ? 'public, max-age=31536000, immutable' : 'no-cache',
+    ETag: etag,
+    Vary: 'Accept-Encoding'
+  }
+  if (req.headers['if-none-match'] === etag) {
+    res.writeHead(304, headers)
+    res.end()
+    return
+  }
+  if (useGzip) headers['Content-Encoding'] = 'gzip'
+  res.writeHead(200, headers)
+  res.end(useGzip ? entry.gzip : entry.raw)
 }
 
 // ── HTML 看板 ──────────────────────────────────────────────────────────────
@@ -644,8 +697,8 @@ function renderPage (state, runsList, query, sessionToken) {
 <html lang="zh-CN"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="${CSP_HEADER}">
-<link rel="stylesheet" href="/assets/app.css">
-<link rel="modulepreload" href="/assets/htm-preact.module.js">
+<link rel="stylesheet" href="/assets/app.css${assetQuery()}">
+<link rel="modulepreload" href="/assets/htm-preact.module.js${assetQuery()}">
 </head><body>
 <div id="app"><noscript>
 <section style="max-width:60rem;margin:2rem auto;font-family:system-ui,sans-serif">
@@ -655,7 +708,7 @@ function renderPage (state, runsList, query, sessionToken) {
 </section>
 </noscript></div>
 <script type="application/json" id="xbk-boot">${bootJson}</script>
-<script type="module" src="/assets/app.js"></script>
+<script type="module" src="/assets/app.js${assetQuery()}"></script>
 </body></html>`
 }
 
@@ -1435,7 +1488,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sendJson(res, 401, { error: 'unauthorized' })
         return
       }
-      serveStatic(res, STATIC_ASSETS[url.pathname])
+      serveStatic(req, res, url.pathname, STATIC_ASSETS[url.pathname])
       return
     }
     if (!authorize(req, token, url.searchParams)) {

@@ -190,6 +190,7 @@ XBK_CONSOLE_TOKEN=请换成至少16位的随机字符串 npm run console
 ```
 
 - 默认地址 `http://127.0.0.1:7777`。两种鉴权方式：命令行/API 用请求头 `Authorization: Bearer <XBK_CONSOLE_TOKEN>`；浏览器直接打开 `http://127.0.0.1:7777/?token=<XBK_CONSOLE_TOKEN>`（页面内的 fetch 请求通过 Authorization: Bearer 请求头携带 token，URL 不再复述凭证；看板每 5 秒自动刷新，任务运行期间加密到 2 秒）。token 未设置或短于 16 字符时服务直接拒绝启动。
+- 前端资产按内容哈希做版本号（`?v=<sha8>`）：带版本的 URL 走 `immutable` 长缓存，裸 URL 仍 `no-cache` + ETag（命中 `If-None-Match` 返回 304）；并按 `Accept-Encoding` 提供 gzip（首屏 JS 77KB → 约 26KB）。页面 HTML 始终 `no-store`（含会话凭证）。
 - ⚠️ `?token=` 会留在浏览器历史与访问日志里；`XBK_CONSOLE_HOST` 绑定非回环地址时 token 以明文过网（HTTP 无加密），请仅在受信内网使用，跨网访问务必前置 TLS 反代（nginx/caddy 终止 TLS 后转发本端口）。
 - 「试运行」抓取但不推送、不写去重记录（等价 `--dry-run`）；「正式运行一轮」会**真实推送通知**；「通知自检」向全部已配置渠道各发一条固定测试消息（真实推送，`POST /api/notify-test`，无 body）。同一时刻只允许一个触发任务，重复触发返回 409；锁残留（进程被 kill -9 等留下损坏锁文件）时人工删除缓存目录下的 `console-trigger.lock` 即可恢复。
 - 触发有**幂等重放窗**：同一动作在窗口内的重复提交返回 409（响应带首轮 runId，`replayBlocked: true`），防止「提交成功但响应丢失 → 重试 → 再跑一轮真实推送」的重复推送；跨动作不受影响，确需重跑同一动作请等窗口过后再触发。通知自检的重放窗为 60 秒（高频调试动作防连点），其余动作为 12 分钟。
