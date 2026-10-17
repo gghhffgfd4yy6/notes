@@ -1996,6 +1996,17 @@ async function main () {
     const r = readRunHistory(dir, { limit: 2 })
     assert.deepStrictEqual(r.items.map(x => x.at), ['2026-10-15 11:00:00', '2026-10-15 10:00:00'])
     assert.deepStrictEqual(r.items.map(x => x.interrupted), [false, false], '页面满时的旧失败行不得污染本页条目')
+    // 反向：紧贴本页最旧摘要之前 1 行的失败行仍须回填（旧写序 ERROR → 摘要）
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'run.log'), [
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 10:00:00 ERROR 推送全部失败 3 条（通道可能失效）',
+      '2026-10-15 10:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=1s cachesaved=1',
+      '2026-10-15 11:00:00 total=3 dedup=0 filtered=0 truncated=0 pushed=3 failed=0 elapsed=1s cachesaved=1'
+    ].join('\n') + '\n')
+    const r2 = readRunHistory(dir2, { limit: 2 })
+    assert.strictEqual(r2.items[1].at, '2026-10-15 10:00:00')
+    assert.strictEqual(r2.items[1].interrupted, true, '紧邻本页最旧摘要的失败行必须回填')
   })
   await aok('测试隔离: 子进程缓存目录与停止留痕都钉到本实例 stateDir', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
