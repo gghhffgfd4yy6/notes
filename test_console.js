@@ -1,4 +1,15 @@
 'use strict'
+
+// 诊断（仅变异沙箱）：tap 档 dry run 只把失败折叠成「exit code 1」，看不到是哪条断言。
+// 在 XBK_MUTATION_CHILD=1 时把本进程输出同时写进 /tmp/xbk-test-console.log，CI 失败步骤 cat 它。
+if (process.env.XBK_MUTATION_CHILD === '1') {
+  const lines = []
+  const origLog = console.log
+  console.log = (...args) => { lines.push(args.map(String).join(' ')); origLog(...args) }
+  process.on('exit', (code) => {
+    try { require('node:fs').writeFileSync('/tmp/xbk-test-console.log', 'exit=' + code + '\n' + lines.join('\n')) } catch (e) { /* 诊断失败不影响结果 */ }
+  })
+}
 // scripts/console.js 测试：token 校验 / 锁语义 / 动作解析 / HTML 转义 / HTTP 端到端（鉴权、
 // 看板渲染、触发 202/409、JSON API、SIGTERM 优雅关闭）。触发用例真实 spawn 子进程——
 // 动作默认指向 --check（环境检查，秒级、不写缓存不发通知），不存在注入式 fake child。
