@@ -90,9 +90,13 @@ check('AGENTS.md 记录本地禁令，且常用命令不再列 test:mutation', (
   if (!fs.existsSync(docPath)) return
   const doc = fs.readFileSync(docPath, 'utf8')
   assert.match(doc, /本机禁止跑变异评估/, 'AGENTS.md 必须写明禁令')
+  // Sonar S8786：不要用 (^|\n)\s* 这类含歧义量词的正则（回溯超线性）；按行做字符串判断。
   const block = (doc.split('## 常用命令')[1] || '').split('```')[1] || ''
-  assert.ok(!/(^|\n)\s*npm run test:mutation(?!-)/.test(block),
-    '常用命令代码块不得列 npm run test:mutation（含带注释写法）')
+  const listed = block.split('\n').some(line => {
+    const t = line.trimStart()
+    return t.startsWith('npm run test:mutation') && !t.startsWith('npm run test:mutation-')
+  })
+  assert.ok(!listed, '常用命令代码块不得列 npm run test:mutation（含带注释写法）')
 })
 
 console.log(`\n本地变异禁令套件：通过 ${passed} / 失败 ${failed}`)
