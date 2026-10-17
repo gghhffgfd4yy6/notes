@@ -39,6 +39,7 @@ const SUITES = [
   { name: '单元测试', file: 'test_filter.js', desc: '主代码导出函数逐函数逻辑' },
   { name: '变异报告读取', file: 'test_mutation_json.js', desc: '超大 mutation.json 剥离 statusReason 解析（v3.264）' },
   { name: '变异报告渲染', file: 'test_mutation_report.js', desc: 'render 函数 markdown 输出快照（v3.266 重构验证）' },
+  { name: '本地变异禁令', file: 'test_local_mutation_guard.js', desc: 'npm/直跑入口 fail-closed、放行开关与文档禁令（用户指示本机不跑变异）' },
   { name: '变异报告CLI', file: 'test_mutation_report_cli.js', desc: 'scripts/mutation-report.js main() 入口：无参数/不存在目录/有效目录 3种子进程场景' },
   // 审查 F6：.github/analyze-artifacts.js 此前无任何测试/CI 覆盖，失效常量（硬编码行数阈值）无人守护
   { name: '变异产物分析', file: 'test_analyze_artifacts.js', desc: '.github/analyze-artifacts.js 子进程：目录缺失/空目录/坏报告/合法报告 + V3 存活统计与实际行数' },

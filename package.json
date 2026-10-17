@@ -37,7 +37,7 @@
     "test:install-hooks": "node test_install_hooks.js",
     "test:ci-static-gates": "node test_ci_static_gates.js",
     "test:doc-line-gates": "node test_doc_line_gates.js",
-    "test:mutation": "stryker run",
+    "test:mutation": "node scripts/local-mutation-guard.js",
     "test:mutation-ranges": "node scripts/check-mutation-ranges.js",
     "test:coverage": "c8 --reporter=text --reporter=lcov --reporter=json-summary --exclude='test_*.js' --exclude='run_tests.js' node run_tests.js",
     "check:ci-static": "node scripts/check-ci-static.js",

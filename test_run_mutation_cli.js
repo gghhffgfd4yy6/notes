@@ -27,6 +27,7 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
     try {
       process.env.MUTATION_CHECKPOINT = ckpt
       await main({
+        allowLocal: true,
         evaluate: async (mutants) => {
           calls.push(mutants.length)
           return { status: 'fail', code: 1, signal: null, output: '沙箱本来就有红套件', summary: ['0', '1', '1'] }
@@ -72,6 +73,7 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
         pending: []
       }))
       await main({
+        allowLocal: true,
         evaluate: async (mutants) => {
           calls.push(mutants.length)
           return { status: 'pass', code: 0, signal: null, output: 'ok' }
@@ -117,6 +119,7 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
         pending: []
       }))
       await main({
+        allowLocal: true,
         evaluate: async (mutants) => {
           calls.push(mutants.length)
           return { status: 'pass', code: 0, signal: null, output: 'ok' }
