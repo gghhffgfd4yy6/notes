@@ -340,7 +340,7 @@ const runEpoch = String(Date.now())
 function makeRunId (seq) { return `${runEpoch}.${seq}` }
 
 let runSeq = 0
-function startAction (actionKey, now, activeChildren) {
+function startAction (actionKey, now, activeChildren, stateDir) {
   const action = ACTIONS[actionKey]
   const id = makeRunId(++runSeq)
   const entryFile = action.entry === 'single' ? ENTRY_SINGLE : ENTRY_QINGLONG
@@ -369,6 +369,9 @@ function startAction (actionKey, now, activeChildren) {
   const childEnv = { ...process.env }
   delete childEnv.XBK_DRY_RUN
   delete childEnv.XBK_CONSOLE_TOKEN
+  // 子进程缓存/日志目录钉死到本控制台实例的 stateDir（Sourcery：测试实例的临时 stateDir
+  // 若不下传，子进程会回落到仓库生产缓存 → 测试触发的轮次/停止留痕混进生产 run.log）。
+  if (stateDir) childEnv.XBK_CACHE_DIR = stateDir
   const child = (() => {
     try {
       return spawn(process.execPath, [entryFile, ...action.args], {
@@ -1463,7 +1466,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         let record
         try {
-          record = startAction(action, now, activeChildren)
+          record = startAction(action, now, activeChildren, stateDir)
         } catch (e) {
           // startAction 同步抛（spawn 资源极端，Sourcery Medium）：回滚重放帧与锁，
           // 让用户可重试，而不是被卡到陈旧接管。恢复 pending 前值语义同落盘失败分支。
@@ -2016,7 +2019,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           try {
             const stampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
             const stamp = stampFmt.format(new Date())
-            const stopDir = runtimeCacheDir() || stateDir
+            const stopDir = stateDir
             fs.appendFileSync(path.join(stopDir, 'run.log'), `${stamp} ERROR 控制台停止：任务 #${record.id}（${record.action}）于运行中被停止（SIGTERM）\n`, 'utf8')
           } catch (e) { /* 留痕失败静默：内存 record.cancelled 已是权威 */ }
           try {
