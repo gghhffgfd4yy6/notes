@@ -413,3 +413,12 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **登记面**：test_suites.js + stryker.tap.config.js explicitTestFiles 同步（加载期对账防线）；mutation.yml v3-entry 行段 1-442 → 1-511（新增 runNotifyTest/guard 行段纳入变异）；SYSTEM_CONTRACT 增补 notify-test 入口契约与控制台端点边界；README 常用命令/常用操作/网页控制台三处同步。
 - **控制台静态层**（v3.302）：资产按内容哈希 `?v=<sha8>` 引用（带版本长缓存 immutable，裸 URL 仍 no-cache + ETag），支持 `If-None-Match` → 304 与 gzip（首屏 JS 77KB → 约 26KB，CSS 9.4KB → 2.8KB）；HTML 仍 `no-store`。
 - **本机变异禁令护栏**：`npm run test:mutation` 改走 `scripts/local-mutation-guard.js`（默认 exit 1 并打印禁令），`run_mutation.js` 直跑同样拒绝；仅 `XBK_ALLOW_LOCAL_MUTATION=1` 显式放行（单段/沙箱调试，分数不得当判据）。新增 `test_local_mutation_guard.js` 套件锁死脚本指向、两个入口的拒绝行为与 AGENTS.md 文档禁令；AGENTS/SYSTEM_CONTRACT 同步改为「判据只在 CI」。
+
+## v3.302 — 控制台显示修复（触发历史面板闭合 + 移动端头部/日志跟随）
+
+- **触发历史面板闭合**：`RunsPanel` 根 `<div class="panel">` 漏了 `</div>`——htm 把根标签解析成文本节点，页面出现裸字 `div`、面板丢边框与内边距（运行期零报错，只有肉眼可见）。补齐闭合并新增 `test_console.js` 结构红线（RunsPanel 源码段 `<div>` 与 `</div>` 必须相等）。
+- **移动端面板头**：`.panel-head` 允许换行、标题 `flex:0 0 auto` 不参与压缩（此前 390px 下「近 14 日运行趋势」被挤成四行竖排）；右侧操作统一包进 `.panel-right`（`margin-left:auto`），换行后仍靠右。
+- **移动端按钮宽度**：`@media(max-width:640px)` 的 `.btn{width:100%}` 收窄为 `.btn-item .btn`——此前表头「刷新」、分页按钮也被拉满整行；标签页按钮缩小横向内边距，五个标签在 390px 下保持一行。
+- **运行日志默认跟随最新**：日志面板进页/刷新后滚到底部；用户上翻查看历史时不被后续轮询抢走滚动位置（此前停在 4 天前第一行，形似日志未更新）。
+- **时间显示统一上海时区**：`fmtTime` 改为固定 UTC+8（不再用浏览器本地 `getHours()`）——服务器时区为 UTC 时，「自动刷新 14:xx」与 run.log 的「22:xx」不再混显、相差 8 小时。
+- **其它移动端排版**：`.msg-title` 由 `word-break:break-all` 改为 `overflow-wrap:anywhere`，标题内价格不再从数字中间断行；`.sys-grid` 的 `minmax(280px,1fr)` 改为 `minmax(min(280px,100%),1fr)`，320px 下不再横向溢出。

@@ -39,11 +39,14 @@ const BUSY_FALLBACK_MS = 11 * 60 * 1000
 const FETCH_TIMEOUT_MS = 8000
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
+// 服务端时间戳统一按 Asia/Shanghai（UTC+8）渲染，不跟浏览器时区走。
+// 服务器时区是 UTC，若用本地 getHours()，「自动刷新 14:xx」会和 run.log 的 22:xx 混显，
+// 看起来像日志停在 8 小时前（实测）。上海无夏令时，固定 +8 即可。
 function fmtTime (ts) {
   if (!ts) return '—'
-  const d = new Date(ts)
+  const d = new Date(Number(ts) + 8 * 3600 * 1000)
   const p = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`
 }
 
 function fmtNum (n) {
@@ -345,7 +348,7 @@ function PanelHead ({ title, sub, right, afterTitle }) {
     <span class="panel-title">${title}</span>
     ${afterTitle}
     ${sub && html`<span class="panel-sub">${sub}</span>`}
-    ${right && html`<span style="flex:1"></span>${right}`}
+    ${right && html`<span class="panel-right">${right}</span>`}
   </div>`
 }
 
@@ -771,7 +774,8 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
           // 必须显示「（无输出）」而不是永远「加载中…」。
           : (typeof detailForOpen.output === 'string' && detailForOpen.output.length > 0 ? detailForOpen.output : '（无输出）'))
       }</pre>
-    </div>`}`
+    </div>`}
+  </div>`
 }
 
 // ── 组件：逐轮运行历史（v3.299 批次②）────────────────────────────────────────
@@ -1190,18 +1194,39 @@ function MessagesPanel () {
 // 运行日志：run.log 尾部（服务端 1MiB 上限），进页拉一次 + 手动刷新；有任务在跑时跟随轮询。
 function LogsPanel ({ pollMs }) {
   const { data, err, load } = usePanelLoader(apiGetLogs)
+  const preRef = useRef(null)
+  const stickRef = useRef(true)
+  const prevTextRef = useRef('')
   useEffect(() => {
     load().catch(() => {})
     if (!pollMs) return undefined
     const t = setInterval(() => { load().catch(() => {}) }, pollMs)
     return () => clearInterval(t)
   }, [load, pollMs])
+  // 首屏与「原本就在底部」时跟随最新日志；用户上翻查看历史时不抢滚动位置。
+  // 手动「刷新」与日志从不可读恢复时强制回到底部，避免 Sourcery 指出的「刷新后仍停在旧位置」。
+  useEffect(() => {
+    const el = preRef.current
+    if (!el || !data) return
+    if (data.status !== 'ok') { stickRef.current = true; prevTextRef.current = ''; return }
+    if (stickRef.current || prevTextRef.current === '') el.scrollTop = el.scrollHeight
+    prevTextRef.current = typeof data.text === 'string' ? data.text : ''
+  }, [data])
+  const onLogScroll = () => {
+    const el = preRef.current
+    if (!el) return
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+  }
+  const refreshNow = () => {
+    stickRef.current = true
+    load().catch(() => {})
+  }
   return html`<div class="panel">
     <${PanelHead} title="运行日志" sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
-      right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
+      right=${html`<${Button} variant="ghost" onClick=${refreshNow}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && data.status !== 'ok' && html`<div class="empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
-    ${data && data.status === 'ok' && html`<pre class="logpre">${data.text.length > 0 ? data.text : '（空）'}</pre>`}
+    ${data && data.status === 'ok' && html`<pre class="logpre" ref=${preRef} onScroll=${onLogScroll}>${data.text.length > 0 ? data.text : '（空）'}</pre>`}
   </div>`
 }
 
