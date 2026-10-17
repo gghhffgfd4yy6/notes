@@ -510,12 +510,24 @@ const STATIC_ASSETS = Object.freeze({
   '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' }
 })
 
-// 资产存储（v3.302）：启动后首次使用时读盘一次，raw/gzip/ETag 常驻内存（三文件 < 100KB）。
-// 版本号 = 三文件内容哈希的 sha8，renderPage 以 ?v=<sha8> 引用；带当前版本的 URL 可长缓存
-// （immutable），裸 URL 仍 no-cache（测试与旧页面兼容）。部署 = systemd restart，版本随之更新。
+// 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，三文件 < 100KB）。
+// 版本号 = 三文件内容哈希的 sha16，renderPage 以 ?v=<sha16> 引用；带当前版本的 URL 可长缓存
+// （private + immutable），裸 URL 仍 no-cache（测试与旧页面兼容）。部署 = systemd restart。
+//
+// 一致性（评审 #236 · Sourcery Medium）：读盘前后各取一次 (mtime,size) 快照，不一致说明
+// 部署正在替换资产 ⇒ 重试一次，仍不一致则 fail-closed，绝不把两个版本的资产拼在同一快照里。
 let assetStore = null
-function loadAssets () {
-  if (assetStore) return assetStore
+
+function assetStatSignature () {
+  return Object.entries(STATIC_ASSETS)
+    .map(([, spec]) => {
+      const st = fs.statSync(path.join(ASSETS_DIR, spec.file))
+      return `${spec.file}:${st.size}:${st.mtimeMs}`
+    })
+    .join('|')
+}
+
+function buildAssetStore () {
   const table = new Map()
   const hashes = []
   for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
@@ -530,11 +542,23 @@ function loadAssets () {
     })
     hashes.push(hash)
   }
-  assetStore = {
+  return {
     table,
-    version: crypto.createHash('sha256').update(hashes.join('|')).digest('hex').slice(0, 8)
+    version: crypto.createHash('sha256').update(hashes.join('|')).digest('hex').slice(0, 16)
   }
-  return assetStore
+}
+
+function loadAssets () {
+  if (assetStore) return assetStore
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const before = assetStatSignature()
+    const built = buildAssetStore()
+    if (before === assetStatSignature()) {
+      assetStore = built
+      return assetStore
+    }
+  }
+  throw new Error('控制台前端资产在读取期间被替换（部署进行中？），拒绝以混合版本继续')
 }
 
 function assetQuery () {
@@ -546,6 +570,31 @@ function assetQuery () {
   }
 }
 
+// Accept-Encoding：按 RFC 9110 只认「显式接受且 q>0」的 gzip（含 * 通配）。
+function acceptsGzip (header) {
+  const parts = String(header || '').split(',')
+  for (const part of parts) {
+    const segs = part.trim().toLowerCase().split(';')
+    const token = segs[0].trim()
+    if (token !== 'gzip' && token !== '*') continue
+    const q = segs.slice(1).map(x => x.trim()).find(x => x.startsWith('q='))
+    if (!q) return true
+    const val = Number(q.slice(2))
+    if (Number.isFinite(val) && val > 0) return true
+  }
+  return false
+}
+
+// If-None-Match：支持 *、逗号列表与弱比较（GET 语义）。
+function etagMatches (header, etag) {
+  const raw = String(header || '').trim()
+  if (!raw) return false
+  if (raw === '*') return true
+  const strip = (v) => v.trim().replace(/^W\//, '')
+  const mine = strip(etag)
+  return raw.split(',').some(candidate => strip(candidate) === mine)
+}
+
 function serveStatic (req, res, route, spec) {
   let store
   try {
@@ -555,9 +604,7 @@ function serveStatic (req, res, route, spec) {
     return
   }
   const entry = store.table.get(route)
-  // Accept-Encoding 协商：只认显式 gzip（不处理 q=0 的极端写法，浏览器不会这样发）。
-  const accept = String(req.headers['accept-encoding'] || '')
-  const useGzip = /(?:^|,)\s*gzip\s*(?:;|,|$)/i.test(accept)
+  const useGzip = acceptsGzip(req.headers['accept-encoding'])
   const etag = useGzip ? entry.gzipEtag : entry.etag
   let versioned = false
   try {
@@ -565,11 +612,13 @@ function serveStatic (req, res, route, spec) {
   } catch (e) { /* 畸形 URL 交给上层校验；这里按裸 URL 处理 */ }
   const headers = {
     'Content-Type': spec.type,
-    'Cache-Control': versioned ? 'public, max-age=31536000, immutable' : 'no-cache',
+    // 资产与数据同面鉴权（无凭证 401）：只能进浏览器私有缓存，绝不能让共享缓存
+    // 把一次带凭证的响应复用给未鉴权调用方（评审 #236 · Sourcery Medium）。
+    'Cache-Control': versioned ? 'private, max-age=31536000, immutable' : 'no-cache',
     ETag: etag,
     Vary: 'Accept-Encoding'
   }
-  if (req.headers['if-none-match'] === etag) {
+  if (etagMatches(req.headers['if-none-match'], etag)) {
     res.writeHead(304, headers)
     res.end()
     return
@@ -698,7 +747,6 @@ function renderPage (state, runsList, query, sessionToken) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="${CSP_HEADER}">
 <link rel="stylesheet" href="/assets/app.css${assetQuery()}">
-<link rel="modulepreload" href="/assets/htm-preact.module.js${assetQuery()}">
 </head><body>
 <div id="app"><noscript>
 <section style="max-width:60rem;margin:2rem auto;font-family:system-ui,sans-serif">
@@ -1172,14 +1220,12 @@ function buildPushChannelsView () {
 function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
-  for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
-    const fp = path.join(ASSETS_DIR, spec.file)
-    try {
-      if (!fs.statSync(fp).isFile()) throw new Error('not a regular file')
-      fs.accessSync(fp, fs.constants.R_OK)
-    } catch (e) {
-      throw new Error(`控制台前端资产缺失或不可读：${route} → ${spec.file}（仓库不完整？），拒绝启动（fail-closed）`)
-    }
+  // 启动即做一次一致快照：既校验资产可读（缺失即拒启），也把版本号钉死在进程生命周期内
+  // ——避免「首个请求时才读盘、恰好撞上部署替换」的混合版本窗口。
+  try {
+    loadAssets()
+  } catch (e) {
+    throw new Error(`控制台前端资产缺失或不可读（仓库不完整？）：${e.message}，拒绝启动（fail-closed）`)
   }
   if (!isValidToken(token)) {
     throw new Error(`XBK_CONSOLE_TOKEN 未设置、短于 ${TOKEN_MIN_LEN} 字符，或含浏览器无法传输的字符（仅允许可见 ASCII，禁 ; , " \\ 与空白），控制台拒绝启动（fail-closed）`)
