@@ -1,4 +1,5 @@
 'use strict'
+
 // scripts/console.js 测试：token 校验 / 锁语义 / 动作解析 / HTML 转义 / HTTP 端到端（鉴权、
 // 看板渲染、触发 202/409、JSON API、SIGTERM 优雅关闭）。触发用例真实 spawn 子进程——
 // 动作默认指向 --check（环境检查，秒级、不写缓存不发通知），不存在注入式 fake child。
@@ -1983,6 +1984,38 @@ async function main () {
     assert.strictEqual(r5.items.length, 3, '非法参数回默认不报错')
     server.close()
   })
+  await aok('readRunHistory: 尾窗指纹不匹配返回 stale（超窗翻页不跳轮）', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 10:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=1s cachesaved=1'
+    ].join('\n') + '\n')
+    const a = readRunHistory(dir, { limit: 2 })
+    assert.ok(/^[0-9a-f]{8}$/.test(a.windowKey), '响应须带 8 位尾窗指纹')
+    const b = readRunHistory(dir, { limit: 1, windowKey: a.windowKey })
+    assert.strictEqual(b.status, 'ok', '同窗口翻页正常')
+    const c = readRunHistory(dir, { limit: 1, windowKey: 'deadbeef' })
+    assert.strictEqual(c.status, 'stale', '窗口平移须返回 stale')
+    assert.strictEqual(c.items.length, 0, 'stale 不得下发可能错位的行')
+  })
+
+  await aok('分页/横滑控件: 运行历史与推送记录都有每页条数，趋势与历史表可横向滑动', () => {
+    const js = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
+    assert.ok(/const RUN_PAGE_SIZES = \[2, 3, 5, 10\]/.test(js), '运行历史每页条数须为 2/3/5/10')
+    const sizeSelects = js.match(/aria-label="每页显示条数"/g) || []
+    assert.ok(sizeSelects.length >= 2, '运行历史与推送记录各要有一个每页条数选择')
+    // 选择器必须是「活的」：选项由常量渲染 + 改变时真的改条数（评审 #243-7）
+    assert.ok(/RUN_PAGE_SIZES\.map\(\(n\) => html`<option key=\$\{n\} value=\$\{n\}>每页 \$\{n\} 条<\/option>`\)/.test(js), '运行历史选项须由 RUN_PAGE_SIZES 渲染')
+    assert.ok(/\[10, 20, 50, 100\]\.map\(\(n\) => html`<option key=\$\{n\} value=\$\{n\}>每页 \$\{n\} 条<\/option>`\)/.test(js), '推送记录选项须由 10/20/50/100 渲染')
+    assert.ok(/onChange=\$\{\(e\) => changeSize\(Number\(e\.target\.value\)\)\}/.test(js), '运行历史下拉须接 changeSize')
+    assert.ok(/onChange=\$\{\(e\) => \{ setSize\(Number\(e\.target\.value\)\); setPage\(1\) \}\}/.test(js), '推送记录下拉须同时改 size 并回第 1 页')
+    assert.ok(/\.trend-scroll\s*\{[^}]*overflow-x:\s*auto/.test(css), '趋势图须横向滚动容器')
+    assert.ok(/\.trend-col\s*\{[^}]*flex:\s*0 0 34px/.test(css), '趋势列须固定宽度（否则日期挤在一起）')
+    assert.ok(/\.runs-scroll\s*\{[^}]*overflow-x:\s*auto/.test(css), '运行历史表须横向滚动容器')
+  })
+
   await aok('readRunHistory: 分页截断时旧失败行不得误标本页最旧一条', () => {
     const { readRunHistory } = require('./scripts/status')
     const dir = tmpDir()
@@ -2012,18 +2045,24 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
     // 现场证据：生产 run.log 里出现只存在于测试 fixture 的 id 1750000000000.9，且每轮都被标
     // 「中断」——测试实例的取消/停止留痕写进了仓库缓存，子进程也继承了缺省缓存目录。
-    assert.ok(src.includes('childEnv.XBK_CACHE_DIR = stateDir'), '子进程必须钉 XBK_CACHE_DIR 到本实例 stateDir')
-    assert.ok(src.includes('startAction(action, now, activeChildren, runHistoryDir || stateDir)'),
-      'spawn 必须把 runHistoryDir || stateDir 传给子进程（否则 run.log 写不到历史读取目录）')
-    assert.ok(src.includes('const stopDir = runHistoryDir || stateDir'), '停止留痕必须写历史读取目录')
-    assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得回落到运行侧全局缓存目录')
+    // 变异沙箱里 console.js 是插桩后的机器生成代码（语句被 stryMutAct_* 条件包裹），
+    // 源码串断言只对原始源文件有意义；这些红线由 Test workflow 的 npm test 兜底。
+    if (process.env.XBK_MUTATION_CHILD !== '1') {
+      assert.ok(src.includes('childEnv.XBK_CACHE_DIR = stateDir'), '子进程必须钉 XBK_CACHE_DIR 到本实例 stateDir')
+      assert.ok(src.includes('startAction(action, now, activeChildren, runHistoryDir || stateDir)'),
+        'spawn 必须把 runHistoryDir || stateDir 传给子进程（否则 run.log 写不到历史读取目录）')
+      assert.ok(src.includes('const stopDir = runHistoryDir || stateDir'), '停止留痕必须写历史读取目录')
+      assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得回落到运行侧全局缓存目录')
+    }
     // 行为验证：子进程（独立 node）只在真读 XBK_CACHE_DIR 时才可能写到实例目录。
     const dir = fs.mkdtempSync(path.join(__dirname, '.tmp-cache-'))
     try {
       const out = require('node:child_process').execFileSync(process.execPath, ['-e',
         "const x=require('./xbk_function_v3');process.stdout.write(x.MessageStore.cacheDir)"],
       { cwd: __dirname, encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: dir } })
-      assert.strictEqual(out.trim(), dir, 'MessageStore.cacheDir 必须服从 XBK_CACHE_DIR（否则子进程 run.log 仍写生产）')
+      // 沙箱（stryker/CI）里 __dirname 可能是软链路径，子进程返回的是 realpath —— 两端都归一后再比
+      assert.strictEqual(fs.realpathSync(out.trim()), fs.realpathSync(dir),
+        'MessageStore.cacheDir 必须服从 XBK_CACHE_DIR（否则子进程 run.log 仍写生产）')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

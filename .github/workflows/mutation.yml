@@ -299,7 +299,7 @@ jobs:
             config: "stryker.tap.config.js"
           - name: console-part5
             src: "scripts/console.js"
-            mutate: "scripts/console.js:1713-2249"
+            mutate: "scripts/console.js:1713-2252"
             config: "stryker.tap.config.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -510,6 +510,15 @@ jobs:
           # 约 656 次即被截断）。该变量的语义即「已在变异运行内」，同时被 run_mutation.js 与
           # test_run_mutation_cli.js 复用。
           XBK_MUTATION_CHILD: '1'
+
+      # 诊断（仅失败时）：tap 档 dry run 的测试输出只写进 stryker.log，job 日志里只有
+      # 「test_console.js # exit code 1」——没有这段就无法定位是哪条断言红了（2026-10-17 实测）。
+      - name: 失败时打印 stryker.log 尾部
+        if: failure()
+        run: |
+          tail -n 120 stryker.log || true
+          echo '--- test_console.js 诊断日志 ---'
+          tail -n 80 /tmp/xbk-test-console.log || true
 
       # fail-closed 守卫（本轮新增）：分数门禁已撤回（break = null），但「报告本身不可信」必须仍然响亮失败。
       # 它兜住 stryker 不会置退出码的假绿通道（NaN 通道的源码依据见 stryker.config.js 的 thresholds 注释）：
