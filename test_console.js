@@ -2668,6 +2668,21 @@ async function main () {
     assert.ok(/\[refreshSplit, locking, tab\]/.test(src), '轮询 effect 必须随 tab 变化重跑')
   })
 
+  await aok('结构红线: 配置页过滤规则/渠道不拼成一条长串', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes('function FilterRules ('), '必须有 FilterRules 组件（一条规则一行）')
+    assert.ok(src.includes('function ChannelList ('), '必须有 ChannelList 组件（渠道 chip）')
+    const start = src.indexOf('function ConfigPanel ')
+    const end = src.indexOf('function SystemPanel', start)
+    const seg = src.slice(start, end)
+    assert.ok(/<\$\{FilterRules\}/.test(seg), '配置页必须使用 FilterRules')
+    assert.ok(/<\$\{ChannelList\}/.test(seg), '配置页必须使用 ChannelList')
+    assert.ok(!/filterEntries\.map\([\s\S]*?\)\.join\(' · '\)/.test(seg), '过滤规则不得再 join 成一条 · 长串')
+    assert.ok(!/rule-val' \+ \(isEmpty\(v\) \? ' empty'/.test(seg), '空值类名不得复用 .empty（全局空态有 14px padding）')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.rule-row\s*\{/.test(css) && /\.chan-chip\s*\{/.test(css), '过滤规则/渠道样式必须存在')
+  })
+
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function Hint ('), '必须有 Hint 原语')

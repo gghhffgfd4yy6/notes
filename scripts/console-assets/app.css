@@ -178,7 +178,7 @@
   .btn-desc { color: var(--text-dim); font-size: var(--fs-xs); }
 
   /* ── 提示行 ── */
-  .hint { margin-top: var(--sp-2); color: var(--text-dim); font-size: var(--fs-sm); display: flex; align-items: center; gap: var(--sp-2); }
+  .hint { margin-top: var(--sp-2); color: var(--text-dim); font-size: var(--fs-sm); display: flex; align-items: flex-start; gap: var(--sp-2); line-height: 1.55; flex-wrap: wrap; }
   .hint-err { color: var(--bad-fg); }
   .spin {
     width: 12px; height: 12px; border-radius: 50%;
@@ -314,17 +314,53 @@
   .pager { display: flex; align-items: center; gap: 10px; justify-content: center; margin-top: 14px; flex-wrap: wrap; }
   .pager-info { color: var(--text-dim); font-size: 12.5px; }
 
+  /* ── 配置页 ── */
+  .cfg-block { background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-3); margin-top: 12px; }
+  .cfg-block-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .cfg-block-title { font-weight: 600; font-size: var(--fs-md); }
+  .cfg-block-sub { color: var(--text-dim); font-size: var(--fs-xs); }
+  .tpl-row { display: flex; gap: 10px; align-items: flex-start; padding: 6px 0; border-bottom: 1px dashed var(--border-soft); }
+  .tpl-row:last-child { border-bottom: 0; padding-bottom: 0; }
+  .tpl-row > span { color: var(--text-dim); font-size: var(--fs-xs); flex: 0 0 32px; line-height: 1.7; }
+  .tpl-row code { font-family: var(--mono); font-size: var(--fs-xs); line-height: 1.6; overflow-wrap: anywhere; word-break: normal; min-width: 0; }
+  .cfg-text { color: var(--text); font-size: var(--fs-sm); line-height: 1.6; overflow-wrap: anywhere; word-break: normal; }
+  .rule-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0 14px; max-height: 420px; overflow-y: auto; }
+  .rule-row { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; padding: 7px 2px; border-bottom: 1px solid var(--border-soft); min-width: 0; }
+  .rule-key { color: var(--text-dim); font-family: var(--mono); font-size: var(--fs-xs); flex: 0 1 auto; overflow-wrap: anywhere; word-break: normal; }
+  .rule-val { color: var(--text); font-family: var(--mono); font-size: var(--fs-xs); flex: 1 1 120px; min-width: 0; overflow-wrap: anywhere; word-break: normal; }
+  .rule-val.rule-empty { color: var(--text-dim); }
+  .cfg-toggle { align-self: flex-start; margin-top: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text-dim); font-size: var(--fs-xs); padding: 5px 10px; cursor: pointer; }
+  .cfg-toggle:hover { color: var(--text); border-color: var(--accent-line); }
+  .chan-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chan-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: var(--r-pill); padding: 4px 10px; font-size: var(--fs-xs); color: var(--text-dim); white-space: nowrap; }
+  .chan-chip.on { color: var(--ok-fg); background: var(--ok-soft); border-color: var(--ok-line); }
+  .chan-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); }
+  .chan-chip.on .chan-dot { background: var(--ok-fg); }
+  .cfg-note { margin-top: 9px; color: var(--text-dim); font-size: var(--fs-xs); line-height: 1.5; overflow-wrap: anywhere; }
+
   /* ── 系统信息 ── */
   .sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: var(--sp-3); }
   .sys-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
   .sys-table td { padding: 7px var(--sp-2); border-bottom: 1px solid var(--border-soft); }
   .sys-table td:first-child { color: var(--text-dim); width: 38%; }
-  .sys-table td:last-child { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+  .sys-table td:last-child { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; word-break: normal; }
 
   /* ── 手机 ── */
   @media (max-width: 640px) {
-    .wrap { padding: var(--sp-3) 10px 30px; }
+    .wrap { padding: var(--sp-3) 10px calc(30px + env(safe-area-inset-bottom)); }
     .cards { grid-template-columns: 1fr; }
+    /* 配置页：键值一行一条，空规则默认折叠；长值只按需断行，不再逐字硬断 */
+    .cfg-block { padding: 12px; }
+    .rule-list { grid-template-columns: 1fr; max-height: 50vh; }
+    .rule-key { font-size: var(--fs-2xs); }
+    .tpl-row { flex-direction: column; gap: 2px; }
+    .tpl-row > span { flex: none; }
+    .chan-chip { padding: 5px 10px; }
+    /* 系统/配置的键值表：手机端改为上下两行，值拿满整行，长 URL/路径不再被挤成半行 */
+    .sys-table tr { display: block; padding: 7px 2px; border-bottom: 1px solid var(--border-soft); }
+    .sys-table td { display: block; border-bottom: 0; padding: 0 2px; }
+    .sys-table td:first-child { width: auto; font-size: var(--fs-xs); }
+    .sys-table td:last-child { padding-top: 2px; }
     .btn-row { gap: 10px; }
     .btn-item { flex: 1 1 100%; }
     .tabs { gap: 4px; }
