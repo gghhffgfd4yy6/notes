@@ -915,6 +915,7 @@ async function main () {
       await new Promise(resolve => setTimeout(resolve, 200))
     }
     assert.ok(detail && detail.finishedAt, '子进程应在 30s 内结束')
+
     assert.ok(typeof detail.output === 'string' && detail.output.length > 0, 'output 必须捕获到子进程实际输出')
     // POST /api/runs/detail（前端 fetch 字面量 URL 形态）：与 GET 等价。
     const postDetail = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: `id=${id}` })
@@ -1953,7 +1954,8 @@ async function main () {
     const err = '2026-10-15 14:30:00 ERROR 推送全部失败 3 条（通道可能失效）'
     const warn = '2026-10-15 14:00:00 WARN 通道健康更新异常: x'
     const old_ = '2026-10-15 13:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=0 failed=1 elapsed=9.9s cachesaved=1'
-    fs.writeFileSync(path.join(dir, 'run.log'), [old_, warn, err, midSummary, good].join('\n') + '\n')
+    const stop = '2026-10-15 15:05:00 ERROR 控制台停止：任务 #1792236290484.5（check）于运行中被停止（SIGTERM）'
+    fs.writeFileSync(path.join(dir, 'run.log'), [old_, warn, err, midSummary, good, stop].join('\n') + '\n')
     const { server } = createConsole({ token: TOKEN, stateDir: dir, runHistoryDir: dir })
     const port = await listen(server)
     const na = await request(port, 'GET', '/api/run-history')
@@ -1962,7 +1964,9 @@ async function main () {
     assert.strictEqual(r1.status, 'ok')
     assert.strictEqual(r1.items.length, 3)
     assert.deepStrictEqual(r1.items.map((x) => x.at), ['2026-10-15 15:00:00', '2026-10-15 14:30:00', '2026-10-15 13:00:00'], '时间倒序')
+    assert.strictEqual(r1.items.length, 3, '控制台停止行不产生占位轮（它是取消留痕，不是失败轮）')
     assert.strictEqual(r1.items[0].interrupted, false, '正常轮不受更早失败行污染（#3 修复点）')
+    assert.strictEqual(r1.items[0].at, '2026-10-15 15:00:00', '尾部停止行不得把最新摘要挤成占位行')
     assert.strictEqual(r1.items[1].interrupted, true, 'ERROR 紧邻其摘要行 → 该轮 interrupted（写序口径）')
     assert.strictEqual(r1.items[2].interrupted, false, 'WARN 行不算失败信号')
     assert.strictEqual(r1.items[1].dryRun, 3, 'dry-run 尾组捕获')
@@ -1978,6 +1982,26 @@ async function main () {
     const r5 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=abc&before=-3', { token: TOKEN })).text)
     assert.strictEqual(r5.items.length, 3, '非法参数回默认不报错')
     server.close()
+  })
+  await aok('测试隔离: 子进程缓存目录与停止留痕都钉到本实例 stateDir', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    // 现场证据：生产 run.log 里出现只存在于测试 fixture 的 id 1750000000000.9，且每轮都被标
+    // 「中断」——测试实例的取消/停止留痕写进了仓库缓存，子进程也继承了缺省缓存目录。
+    assert.ok(src.includes('childEnv.XBK_CACHE_DIR = stateDir'), '子进程必须钉 XBK_CACHE_DIR 到本实例 stateDir')
+    assert.ok(src.includes('startAction(action, now, activeChildren, runHistoryDir || stateDir)'),
+      'spawn 必须把 runHistoryDir || stateDir 传给子进程（否则 run.log 写不到历史读取目录）')
+    assert.ok(src.includes('const stopDir = runHistoryDir || stateDir'), '停止留痕必须写历史读取目录')
+    assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得回落到运行侧全局缓存目录')
+    // 行为验证：子进程（独立 node）只在真读 XBK_CACHE_DIR 时才可能写到实例目录。
+    const dir = fs.mkdtempSync(path.join(__dirname, '.tmp-cache-'))
+    try {
+      const out = require('node:child_process').execFileSync(process.execPath, ['-e',
+        "const x=require('./xbk_function_v3');process.stdout.write(x.MessageStore.cacheDir)"],
+      { cwd: __dirname, encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: dir } })
+      assert.strictEqual(out.trim(), dir, 'MessageStore.cacheDir 必须服从 XBK_CACHE_DIR（否则子进程 run.log 仍写生产）')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
   await aok('HTTP: run-history limit=9999 在 220 轮 fixture 上真实钳制到 200（评审 #14）', async () => {
     const dir = tmpDir()

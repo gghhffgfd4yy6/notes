@@ -242,3 +242,7 @@ exclude_paths:
   - "test_notify_selfcheck.js"
   - "test_local_mutation_guard.js"
   - "scripts/local-mutation-guard.js"
+  # test_lazy_notify.js 的探针缓存目录 = path.join(__dirname, `.tmp-lazy-notify-${process.pid}`)，
+  # 只用于把测试轮次隔离到仓库内临时目录（跑完即删），不含任何外部输入；
+  # Semgrep 的非字面量 fs 路径告警在此属误报。
+  - "test_lazy_notify.js"

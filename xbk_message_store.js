@@ -93,7 +93,12 @@ function createMessageStore ({
   // 回退硬编码 'xianbaoku_cache' 会让 t51 等非法配置测试撞共享目录竞态）
     get cacheDir () {
       const fallback = process.env.XBK_PARALLEL_ID ? `xianbaoku_cache_p${process.env.XBK_PARALLEL_ID}` : 'xianbaoku_cache'
-      const raw = typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : fallback
+      // XBK_CACHE_DIR 优先（与 --status / 控制台 stateDir 同源）：控制台 spawn 的子进程
+      // 靠它把 run.log 写回本实例缓存目录；未设置时保持 Config.cache.dir（生产行为不变）。
+      // 仍走 resolveCacheDirInRoot 的根内校验，越界/符号链接逃逸照旧回退。
+      const fromEnv = typeof process.env.XBK_CACHE_DIR === 'string' ? process.env.XBK_CACHE_DIR.trim() : ''
+      const configured = typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : fallback
+      const raw = fromEnv || configured
       // P2/P3/C022 的根内校验与多级兜底统一实现于模块顶部的 resolveCacheDirInRoot；
       // 青龙 `--status` 复用同一函数（QX-08），两侧口径不再各写一份。
       return resolveCacheDirInRoot({ fs, path, root: path.resolve(__dirname), raw, fallback })

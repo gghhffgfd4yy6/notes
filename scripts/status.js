@@ -120,6 +120,10 @@ function parseJson (read, validate) {
 // 所以摘要行之后出现 ERROR 或「运行异常」即代表该轮在其后中断。只认这两种强信号，
 // 普通 ALERT（低磁盘/日报更新失败等）不参与判定，避免把成功的轮次误报成异常。
 function looksLikeRoundFailure (line) {
+  // 「控制台停止：任务 #… 于运行中被停止（SIGTERM）」是控制台侧的取消留痕，不是某一轮的
+  // 运行失败：它没有自己的摘要行，把最近的摘要回填成 interrupted 会让每次重启/取消都把
+  // 上一轮标成「中断」（评审：手机端整页黄色警告）。取消轮次照旧无处归属 ⇒ 忽略。
+  if (line.includes('控制台停止：任务 #')) return false
   return /(?:^|\s)ERROR(?:\s|$)|运行异常/.test(line)
 }
 
@@ -328,6 +332,45 @@ function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
   // 之后/文件尾再无摘要 = 崩溃轮占位 crashPending）。窗口头残余无摘要可回填的失败行
   // 静默丢弃（其摘要轮已滚出 1MiB 尾窗，归属无法重建）。
   const items = []
+  // 同轮归属（评审：手机端整页「中断」）：生产写序是「摘要行 → 同秒 ERROR」（崩溃轮），
+  // 与旧假设「失败行在摘要行之前」相反；倒序扫描时失败行先遇到，会误标**上一条更晚**的
+  // 摘要。这里先按时间戳建立失败行 → 摘要行归属（同秒即同轮），扫描时直接查表。
+  const tsOf = (line) => (line.match(/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/) || [''])[0]
+  const tsMs = (line) => {
+    const ts = tsOf(line)
+    const v = ts ? Date.parse(ts.replace(' ', 'T') + 'Z') : NaN
+    return Number.isFinite(v) ? v : null
+  }
+  // 同轮归属（评审：手机端整页「中断」）：生产写序是「摘要 → 同秒/下一秒 ERROR」（崩溃轮），
+  // 与旧假设「失败行在摘要行之前」相反；倒序扫描时失败行先遇到，会误标**上一条更晚**的
+  // 摘要。这里按行距就近归属（≤2 行，时间差 ≤2s），只认通过计数器校验的摘要行。
+  const summaryByLine = new Map()
+  for (let i = 0; i < lines.length; i++) {
+    if (!RUN_SUMMARY_LINE_RE.test(lines[i])) continue
+    const m = RUN_SUMMARY_LINE_RE.exec(lines[i])
+    // 与建 items 同一套校验：计数器非法/缺失的摘要行不参与归属（否则失败轮会凭空消失）
+    if (![m[2], m[3], m[4], m[5], m[6], m[7]].map(Number).every(validInt)) continue
+    summaryByLine.set(i, tsMs(lines[i]))
+  }
+  const interruptedIdx = new Set()
+  const attributedFailures = new Set()
+  for (let i = 0; i < lines.length; i++) {
+    if (!looksLikeRoundFailure(lines[i])) continue
+    const t = tsMs(lines[i])
+    if (t === null) continue
+    let best = null
+    for (let d = 1; d <= 2 && !best; d++) {
+      for (const j of [i - d, i + d]) {
+        if (!summaryByLine.has(j) || interruptedIdx.has(j)) continue
+        const st = summaryByLine.get(j)
+        if (st === null) continue
+        const gap = Math.abs(st - t)
+        if (gap > 2000) continue
+        if (!best || gap < best.gap) best = { j, gap } // 同距离取时间差更小者
+      }
+    }
+    if (best) { interruptedIdx.add(best.j); attributedFailures.add(i) }
+  }
   let crashPending = false // 尾端失败行待发占位（其后无摘要行）
   let lastLineNo = lines.length + 1 // 本页最旧条目起始行号（初始 = 窗口外哨兵）
   let summariesSeen = 0
@@ -362,13 +405,15 @@ function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
         cachesaved: extras.cachesaved,
         noidentity: extras.noidentity,
         dryRun: extras.dryRun,
-        interrupted: false, // 失败行回填在遇它时进行（文件序在摘要行之前的行后才出现）
+        interrupted: interruptedIdx.has(i), // 同秒失败行已在预扫描归属到本轮
         lineNo
       })
       lastLineNo = i + 1
       continue
     }
     if (looksLikeRoundFailure(line)) {
+      // 带时间戳且能对上某轮摘要 ⇒ 已在预扫描归属，不再按文件序回填（否则会标错轮）。
+      if (attributedFailures.has(i)) continue
       if (summariesSeen === 0) crashPending = true // 尾端失败行、其后无摘要轮
       else if (items.length > 0) items[items.length - 1].interrupted = true
       // 回填目标 = 最近 push 的摘要（items 尾部）= 倒序扫描中刚处理过的那条 = 失败行
