@@ -18,6 +18,7 @@ const http = require('node:http')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
+const zlib = require('node:zlib')
 const { spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
 const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory } = require('./status')
@@ -509,21 +510,122 @@ const STATIC_ASSETS = Object.freeze({
   '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' }
 })
 
-function serveStatic (res, spec) {
-  let body
+// 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，三文件 < 100KB）。
+// 版本号 = 三文件内容哈希的 sha16，renderPage 以 ?v=<sha16> 引用；带当前版本的 URL 可长缓存
+// （private + immutable），裸 URL 仍 no-cache（测试与旧页面兼容）。部署 = systemd restart。
+//
+// 一致性（评审 #236 · Sourcery Medium）：读盘前后各取一次 (mtime,size) 快照，不一致说明
+// 部署正在替换资产 ⇒ 重试一次，仍不一致则 fail-closed，绝不把两个版本的资产拼在同一快照里。
+let assetStore = null
+
+function assetStatSignature () {
+  return Object.entries(STATIC_ASSETS)
+    .map(([, spec]) => {
+      const st = fs.statSync(path.join(ASSETS_DIR, spec.file))
+      return `${spec.file}:${st.size}:${st.mtimeMs}`
+    })
+    .join('|')
+}
+
+function buildAssetStore () {
+  const table = new Map()
+  const hashes = []
+  for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
+    const raw = fs.readFileSync(path.join(ASSETS_DIR, spec.file))
+    const hash = crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
+    table.set(route, {
+      spec,
+      raw,
+      gzip: zlib.gzipSync(raw, { level: 9 }),
+      etag: `"${hash}"`,
+      gzipEtag: `"${hash}-gz"`
+    })
+    hashes.push(hash)
+  }
+  return {
+    table,
+    version: crypto.createHash('sha256').update(hashes.join('|')).digest('hex').slice(0, 16)
+  }
+}
+
+function loadAssets () {
+  if (assetStore) return assetStore
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const before = assetStatSignature()
+    const built = buildAssetStore()
+    if (before === assetStatSignature()) {
+      assetStore = built
+      return assetStore
+    }
+  }
+  throw new Error('控制台前端资产在读取期间被替换（部署进行中？），拒绝以混合版本继续')
+}
+
+function assetQuery () {
   try {
-    body = fs.readFileSync(path.join(ASSETS_DIR, spec.file))
+    return `?v=${loadAssets().version}`
+  } catch (e) {
+    // createConsole 的启动闸已保证资产可读；这里兜底成裸 URL，页面仍可用（只是没有长缓存）。
+    return ''
+  }
+}
+
+// Accept-Encoding：按 RFC 9110 只认「显式接受且 q>0」的 gzip（含 * 通配）。
+function acceptsGzip (header) {
+  const parts = String(header || '').split(',')
+  for (const part of parts) {
+    const segs = part.trim().toLowerCase().split(';')
+    const token = segs[0].trim()
+    if (token !== 'gzip' && token !== '*') continue
+    const q = segs.slice(1).map(x => x.trim()).find(x => x.startsWith('q='))
+    if (!q) return true
+    const val = Number(q.slice(2))
+    if (Number.isFinite(val) && val > 0) return true
+  }
+  return false
+}
+
+// If-None-Match：支持 *、逗号列表与弱比较（GET 语义）。
+function etagMatches (header, etag) {
+  const raw = String(header || '').trim()
+  if (!raw) return false
+  if (raw === '*') return true
+  const strip = (v) => v.trim().replace(/^W\//, '')
+  const mine = strip(etag)
+  return raw.split(',').some(candidate => strip(candidate) === mine)
+}
+
+function serveStatic (req, res, route, spec) {
+  let store
+  try {
+    store = loadAssets()
   } catch (e) {
     sendJson(res, 500, { error: '控制台前端资产缺失（仓库不完整？）' })
     return
   }
-  res.writeHead(200, {
+  const entry = store.table.get(route)
+  const useGzip = acceptsGzip(req.headers['accept-encoding'])
+  const etag = useGzip ? entry.gzipEtag : entry.etag
+  let versioned = false
+  try {
+    versioned = new URL(req.url, 'http://localhost').searchParams.get('v') === store.version
+  } catch (e) { /* 畸形 URL 交给上层校验；这里按裸 URL 处理 */ }
+  const headers = {
     'Content-Type': spec.type,
-    // 资产更新随部署走：浏览器缓存但每次部署后 ETag 变化即失效。
-    'Cache-Control': 'no-cache',
-    ETag: `"${crypto.createHash('sha256').update(body).digest('hex').slice(0, 16)}"`
-  })
-  res.end(body)
+    // 资产与数据同面鉴权（无凭证 401）：只能进浏览器私有缓存，绝不能让共享缓存
+    // 把一次带凭证的响应复用给未鉴权调用方（评审 #236 · Sourcery Medium）。
+    'Cache-Control': versioned ? 'private, max-age=31536000, immutable' : 'no-cache',
+    ETag: etag,
+    Vary: 'Accept-Encoding'
+  }
+  if (etagMatches(req.headers['if-none-match'], etag)) {
+    res.writeHead(304, headers)
+    res.end()
+    return
+  }
+  if (useGzip) headers['Content-Encoding'] = 'gzip'
+  res.writeHead(200, headers)
+  res.end(useGzip ? entry.gzip : entry.raw)
 }
 
 // ── HTML 看板 ──────────────────────────────────────────────────────────────
@@ -644,8 +746,7 @@ function renderPage (state, runsList, query, sessionToken) {
 <html lang="zh-CN"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="${CSP_HEADER}">
-<link rel="stylesheet" href="/assets/app.css">
-<link rel="modulepreload" href="/assets/htm-preact.module.js">
+<link rel="stylesheet" href="/assets/app.css${assetQuery()}">
 </head><body>
 <div id="app"><noscript>
 <section style="max-width:60rem;margin:2rem auto;font-family:system-ui,sans-serif">
@@ -655,7 +756,7 @@ function renderPage (state, runsList, query, sessionToken) {
 </section>
 </noscript></div>
 <script type="application/json" id="xbk-boot">${bootJson}</script>
-<script type="module" src="/assets/app.js"></script>
+<script type="module" src="/assets/app.js${assetQuery()}"></script>
 </body></html>`
 }
 
@@ -1119,14 +1220,12 @@ function buildPushChannelsView () {
 function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
-  for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
-    const fp = path.join(ASSETS_DIR, spec.file)
-    try {
-      if (!fs.statSync(fp).isFile()) throw new Error('not a regular file')
-      fs.accessSync(fp, fs.constants.R_OK)
-    } catch (e) {
-      throw new Error(`控制台前端资产缺失或不可读：${route} → ${spec.file}（仓库不完整？），拒绝启动（fail-closed）`)
-    }
+  // 启动即做一次一致快照：既校验资产可读（缺失即拒启），也把版本号钉死在进程生命周期内
+  // ——避免「首个请求时才读盘、恰好撞上部署替换」的混合版本窗口。
+  try {
+    loadAssets()
+  } catch (e) {
+    throw new Error(`控制台前端资产缺失或不可读（仓库不完整？）：${e.message}，拒绝启动（fail-closed）`)
   }
   if (!isValidToken(token)) {
     throw new Error(`XBK_CONSOLE_TOKEN 未设置、短于 ${TOKEN_MIN_LEN} 字符，或含浏览器无法传输的字符（仅允许可见 ASCII，禁 ; , " \\ 与空白），控制台拒绝启动（fail-closed）`)
@@ -1435,7 +1534,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sendJson(res, 401, { error: 'unauthorized' })
         return
       }
-      serveStatic(res, STATIC_ASSETS[url.pathname])
+      serveStatic(req, res, url.pathname, STATIC_ASSETS[url.pathname])
       return
     }
     if (!authorize(req, token, url.searchParams)) {

@@ -8,6 +8,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const http = require('node:http')
+const zlib = require('node:zlib')
 const net = require('node:net')
 const { spawn } = require('node:child_process')
 // 竞态安全读取器（生产 xbk_storage）：测试里对「刚写完/刚 rename 过的路径」的断言读取
@@ -517,6 +518,20 @@ function request (port, method, urlPath, { token, body, headers } = {}) {
     req.end()
   })
 }
+// 二进制安全请求（gzip/304 用例需要 Buffer，不能用字符串拼接的 request）。
+function requestBuffer (port, method, urlPath, { token, body, headers } = {}) {
+  return new Promise((resolve, reject) => {
+    const base = token ? { authorization: `Bearer ${token}` } : {}
+    const req = http.request({ host: '127.0.0.1', port, method, path: urlPath, headers: { ...base, ...(headers || {}) } }, (res) => {
+      const chunks = []
+      res.on('data', c => chunks.push(c))
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks), headers: res.headers }))
+    })
+    req.on('error', reject)
+    if (body !== undefined) req.write(body)
+    req.end()
+  })
+}
 // 绕过 http.request 的 URL 合法性校验，直接写原始请求行（畸形 request-target 回归用：
 // `//@:99999/` 会让裸 new URL 抛 TypeError——修复前一条无凭证请求即崩整个控制台）。
 function rawRequest (port, raw) {
@@ -653,6 +668,42 @@ async function main () {
     assert.ok(cssTok.text.includes('--bg'), 'CSS 内容真实（自定义属性存在）')
     const cssCookie = await request(port, 'GET', '/assets/app.css', { headers: { cookie: `xbk_session=${TOKEN}` } })
     assert.strictEqual(cssCookie.status, 200, '会话 Cookie 可取资产（ESM 链路径）')
+    // v3.302 静态层：gzip 协商 / 304 条件请求 / 版本化长缓存
+    const cssGz = await requestBuffer(port, 'GET', '/assets/app.css', { token: TOKEN, headers: { 'accept-encoding': 'gzip' } })
+    assert.strictEqual(cssGz.status, 200)
+    assert.strictEqual(cssGz.headers['content-encoding'], 'gzip', '声明 gzip 时必须压缩')
+    assert.match(String(cssGz.headers.vary || ''), /Accept-Encoding/, '必须 Vary: Accept-Encoding')
+    const cssPlain = await requestBuffer(port, 'GET', '/assets/app.css', { token: TOKEN, headers: { 'accept-encoding': 'identity' } })
+    assert.ok(cssGz.body.length < cssPlain.body.length, 'gzip 体积必须小于原件')
+    assert.strictEqual(zlib.gunzipSync(cssGz.body).toString('utf8'), cssPlain.body.toString('utf8'), 'gzip 解压后与原件逐字一致')
+    const cond = await requestBuffer(port, 'GET', '/assets/app.css', { token: TOKEN, headers: { 'if-none-match': cssPlain.headers.etag } })
+    assert.strictEqual(cond.status, 304, 'If-None-Match 命中必须 304（不再重传正文）')
+    assert.strictEqual(cond.body.length, 0, '304 不得带正文')
+    const verMatch = (await request(port, 'GET', '/', { token: TOKEN })).text.match(/\/assets\/app\.js\?v=([0-9a-f]{16})/)
+    assert.ok(verMatch, 'HTML 资产引用必须带内容版本号 ?v=<sha16>')
+    // 版本号必须由内容派生（sha256(各文件哈希拼接) 前 16 位），常量/陈旧版本过不了这条
+    const crypto = require('node:crypto')
+    const hashes = ['app.css', 'app.js', 'htm-preact.module.js'].map((f) => {
+      const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', f))
+      return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
+    })
+    const expectVer = crypto.createHash('sha256').update(hashes.join('|')).digest('hex').slice(0, 16)
+    assert.strictEqual(verMatch[1], expectVer, '版本号必须等于资产内容的哈希（不能是常量/陈旧值）')
+    const immutable = await requestBuffer(port, 'GET', `/assets/app.css?v=${verMatch[1]}`, { token: TOKEN })
+    const cc = String(immutable.headers['cache-control'] || '')
+    assert.match(cc, /immutable/, '版本化资产必须 immutable 长缓存')
+    assert.match(cc, /private/, '资产与数据同面鉴权：只能进浏览器私有缓存（shared cache 会把带凭证响应复用给未鉴权方）')
+    const staleVer = await requestBuffer(port, 'GET', '/assets/app.css?v=deadbeefdeadbeef', { token: TOKEN })
+    assert.strictEqual(String(staleVer.headers['cache-control'] || ''), 'no-cache', '不匹配的版本号必须回退 no-cache')
+    // gzip;q=0 表示明确拒绝：不得发压缩体
+    const refused = await requestBuffer(port, 'GET', '/assets/app.css', { token: TOKEN, headers: { 'accept-encoding': 'gzip;q=0' } })
+    assert.strictEqual(refused.headers['content-encoding'], undefined, 'gzip;q=0 时不得压缩')
+    assert.strictEqual(refused.body.toString('utf8'), cssPlain.body.toString('utf8'), 'q=0 时返回原件')
+    // If-None-Match：弱比较 + 逗号列表 + 通配
+    for (const h of [`W/${cssPlain.headers.etag}`, `"other", ${cssPlain.headers.etag}`, '*']) {
+      const r304 = await requestBuffer(port, 'GET', '/assets/app.css', { token: TOKEN, headers: { 'if-none-match': h } })
+      assert.strictEqual(r304.status, 304, `If-None-Match: ${h} 必须命中 304`)
+    }
     // 页面响应必须下发会话 Cookie（HttpOnly/SameSite=Strict）
     const page = await request(port, 'GET', '/', { token: TOKEN })
     const cookieHeader = (page.headers['set-cookie'] || []).find(c => c.startsWith('xbk_session='))
