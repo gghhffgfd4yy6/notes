@@ -1,4 +1,5 @@
 'use strict'
+require('./scripts/mutation-run-guard.js').assertLocalMutationAllowed()
 // ============================================================
 // TAP 档 Stryker 配置（**CI 生产档**）
 //

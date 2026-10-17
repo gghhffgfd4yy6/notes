@@ -615,6 +615,15 @@ async function ensureBaselinePass (files, timeoutMs, runEvaluation, idleMs) {
 }
 
 async function main (deps) {
+  // 本机禁令同样作用于「import 后直接调用 main()」的路径（防止绕过 CLI 闸）；
+  // 测试用 deps.allowLocal 显式豁免，不依赖环境变量。
+  if (!(deps && deps.allowLocal) && process.env.XBK_ALLOW_LOCAL_MUTATION !== '1') {
+    console.error('❌ 本机禁止跑变异评估（用户明确指示；判据只在 CI）。\n' +
+      '   变异矩阵见 .github/workflows/mutation.yml；本机跑会留沙箱残留并触发 host-clean 闸。\n' +
+      '   仅调试时显式放开：XBK_ALLOW_LOCAL_MUTATION=1 node run_mutation.js')
+    process.exitCode = 1
+    return
+  }
   // 依赖注入点（默认生产实现 evaluate）：测试可用 fake evaluate 覆盖基线与批次行为，
   // 无需真实沙箱与 node_modules（与 linkNodeModules/copyProject 的注入口径一致）。
   const runEvaluation = (deps && deps.evaluate) || evaluate

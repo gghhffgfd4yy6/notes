@@ -1,4 +1,5 @@
 'use strict'
+require('./scripts/mutation-run-guard.js').assertLocalMutationAllowed()
 
 const os = require('os')
 
