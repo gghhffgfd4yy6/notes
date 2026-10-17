@@ -131,6 +131,11 @@ const FILES_LIST_MAX = 1000
 // （下轮 saveBatch 将按字节裁最旧条目并落墓碑——运维该知道缓存快满了）。
 const CACHE_HEALTH_NEAR_RATIO = 0.8
 
+// ── 批次④ 4.1：通知自检的独立重放窗 ─────────────────────────────────────────
+// 自检是高频调试动作，12min 太长；但也不能连点刷通知 → 60s。
+// lastAccept 本就按 action 键控（per-action Map + 持久化 JSON 的 key），无需改持久化结构。
+const REPLAY_WINDOW_NOTIFY_TEST_MS = 60 * 1000
+
 // ── v3.300 访问日志常量 ─────────────────────────────────────────────────────
 // 纯内存环形上限：重启即空、不写盘（README 披露）——避免日志自身成为磁盘面，
 // 已有时序上更全的 run.log 留痕体系（蓝图 §3.3）。
@@ -182,7 +187,11 @@ function defaultHealthLimits () {
 const ACTIONS = Object.freeze({
   'dry-run': { entry: 'qinglong', args: ['--dry-run'], label: '试运行（抓取但不推送）' },
   run: { entry: 'single', args: [], label: '正式运行一轮（真实推送）' },
-  check: { entry: 'qinglong', args: ['--check'], label: '环境检查（不抓取不推送）' }
+  check: { entry: 'qinglong', args: ['--check'], label: '环境检查（不抓取不推送）' },
+  // 批次④ 4.1：通知自检——真实推送一条固定测试消息。entry 必须是 'single'：startAction
+  // 的映射是 `action.entry === 'single' ? ENTRY_SINGLE : ENTRY_QINGLONG`，任何其他值
+  // 都落到 qinglong 入口（该入口不识别 --notify-test，会告警后落进常驻真实抓取）。
+  'notify-test': { entry: 'single', args: ['--notify-test'], label: '通知自检（真实推送一条测试消息）' }
 })
 const ENTRY_QINGLONG = path.join(ROOT, 'qinglong', 'xbk_push.js')
 const ENTRY_SINGLE = path.join(ROOT, 'xbk_function_v3.js')
@@ -359,11 +368,20 @@ function startAction (actionKey, now, activeChildren) {
   const childEnv = { ...process.env }
   delete childEnv.XBK_DRY_RUN
   delete childEnv.XBK_CONSOLE_TOKEN
-  const child = spawn(process.execPath, [entryFile, ...action.args], {
-    cwd: ROOT,
-    env: childEnv,
-    stdio: ['ignore', 'pipe', 'pipe']
-  })
+  const child = (() => {
+    try {
+      return spawn(process.execPath, [entryFile, ...action.args], {
+        cwd: ROOT,
+        env: childEnv,
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+    } catch (e) {
+      // spawn 同步抛（EMFILE 等资源极端）：runs 里已登记死记录，必须摘除后再抛，
+      // 让调用侧 acceptAction 回滚重放帧与锁（Sourcery Medium：Failed spawn leaves trigger locked）。
+      runs.delete(id)
+      throw e
+    }
+  })()
   if (activeChildren) activeChildren.add(child)
   const decoder = new StringDecoder('utf8')
   const append = (chunk) => {
@@ -633,7 +651,7 @@ function renderPage (state, runsList, query, sessionToken) {
 <section style="max-width:60rem;margin:2rem auto;font-family:system-ui,sans-serif">
 <h2>xbk-push 控制台（无脚本降级）</h2>
 <pre>${statusLines.join('\n')}</pre>
-<p>前端需要启用 JavaScript 才能使用触发与实时刷新。可用动作：试运行（抓取但不推送）、正式运行一轮（真实推送）、环境检查（不抓取不推送）。</p>
+<p>前端需要启用 JavaScript 才能使用触发与实时刷新。可用动作：试运行（抓取但不推送）、正式运行一轮（真实推送）、环境检查（不抓取不推送）、通知自检（真实推送一条测试消息）。</p>
 </section>
 </noscript></div>
 <script type="application/json" id="xbk-boot">${bootJson}</script>
@@ -1258,6 +1276,117 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
   }
 
+  // ── 批次④ 4.1：触发受理序列共享（/trigger 与 POST /api/notify-test）─────────
+  // 序列：shuttingDown 入口查 → readBody（统一 aborted 400 / over 413 / 关停竞态兜底）
+  //   → 实时读盘合并 lastAccept → 重放窗（notify-test 独立 60s，其余 12min）→ 单飞锁
+  //   → pending 帧 → 同步落盘（失败 fail-closed 500 + 释放锁 + 回滚）→ startAction
+  //   → 补写真实 runId → 再落盘 → 202。
+  // fixedAction 传值时跳过 body 解析（动作已在端点定死，body 仅排水丢弃）；否则 parseAction。
+  function acceptAction (req, res, { fixedAction = null } = {}) {
+    if (shuttingDown) {
+      sendJson(res, 503, { error: '控制台正在关闭，动作未执行' })
+      return
+    }
+    // S9383：promise 必须显式收尾——readBody 以 resolve 收口不会 reject，但仍接 .catch
+    // 把意外异常转成 500，不留 floating promise。
+    readBody(req)
+      .then(({ body, aborted, over }) => {
+        // 关停竞态兜底：readBody 期间收到 SIGTERM 时，此刻不能再 acquireLock/startAction
+        // （评审 High：关停已清完 activeChildren，新 spawn 会逃过清理并留锁）。
+        if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
+        // Sourcery Medium：请求中断（error 后 resolve）时 body 可能已含 action=run，
+        // 客户端却已放弃——绝不能凭残缺请求启动真实推送；超限同理拒绝。
+        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
+        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
+        const action = fixedAction || parseAction(body)
+        if (!action) {
+          sendJson(res, 400, { error: '未知 action' })
+          return
+        }
+        const now = Date.now()
+        // 幂等重放窗（Sourcery G_nm + G_4Kf）：提交 202 后响应丢失 → 用户重试 →
+        // 首轮已结束释放锁 → 重试被当作新触发再跑一轮真实推送。per-action 记录：
+        // 同 action 在窗口内的重复提交返回 409 + 首轮 run id（前端把它当「已在跑」
+        // 呈现，不再发起新一轮）；换动作不覆盖他动作的记录。
+        // Sourcery High Retries-duplicate x2（多进程 stale map / 落盘晚于 spawn）：
+        // 受理顺序为「acquireLock → 持锁后实时读盘合并 → 判窗 → 记 pending 帧 → 同步落盘
+        // （失败即拒绝）→ startAction → 补写真实 runId → 再落盘」。读盘-判窗-落盘全程
+        // 持锁（Sourcery Medium：先读后锁存在 stale map 窗口——另一进程在此间落盘的话
+        // 本进程会用陈旧记录放行重复动作），pending 帧（runId=0）本身就能拦截窗口内重试；
+        // spawn 前记录已持久化，进程在 spawn 后崩溃也有完整重放记录。
+        // 例外：锁被其他动作占着时（acquireLock 失败）先做一次锁外只读判窗——窗口内重试
+        // 即使撞上他动作运行中也按「重放拦截」回（带首轮 runId），不降级成裸锁冲突
+        // （G_4Kf 用例语义；竞态由锁内二次判窗兜底，锁外这层只是报错形态优化）。
+        const winMsPre = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : REPLAY_WINDOW_MS
+        if (!acquireLock(stateDir, now, ownerToken)) {
+          // readLastAccept 返回 [key, value] 数组（非 Map），用 find 取当前动作记录。
+          const persistedPre = readLastAccept(lastAcceptPath)
+          const prevPrePair = persistedPre.find(([k]) => k === action)
+          const prevPre = prevPrePair ? prevPrePair[1] : lastAccept.get(action)
+          if (prevPre && now - prevPre.at < winMsPre) {
+            const rid = prevPre.runId
+            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true })
+            return
+          }
+          sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
+          return
+        }
+        const persisted = readLastAccept(lastAcceptPath)
+        for (const [k, v] of persisted) {
+          if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
+        }
+        const prev = lastAccept.get(action)
+        // 60s 独立窗：notify-test 用短窗（高频调试动作防连点刷通知），其余动作维持 12min。
+        // /trigger 的 action=notify-test 与独立端点共享同一 lastAccept 键与窗长（有意行为）。
+        const winMs = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : REPLAY_WINDOW_MS
+        if (prev && now - prev.at < winMs) {
+          // runId = epoch.seq 字符串（v3.299 评审）：0 是 pending 帧哨兵（数字），
+          // 真实 runId 只在 startAction 之后落盘——用「数字 0」判 pending，其余原样下发。
+          const rid = prev.runId
+          releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
+          sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true })
+          return
+        }
+        lastAccept.set(action, { at: now, runId: 0 })
+        try {
+          fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
+        } catch (e) {
+          // 落盘失败 = 无持久重放记录，为满足「重试不得重复推送」必须拒绝受理（Sourcery High）。
+          // 此时锁刚拿到、子进程未启动（activeChildren 无登记，close 回调无从释放）——
+          // 必须显式释放（Sourcery #225 M3/M4：releaseLockFor 返回 false = 文件系统
+          // 同样写不进锁 → 响亮告警给运维排查线索；恢复 pending 前值，失败动作可在
+          // 窗口内重试，不再被 409 拦到窗口过期）。
+          const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
+          if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：磁盘/权限异常仍未恢复，锁将保留到陈旧接管（约 10 分钟）。后续触发 409 属预期。`)
+          lastAccept.delete(action)
+          sendJson(res, 500, { error: '重放记录持久化失败，动作未执行（fail-closed）' })
+          return
+        }
+        let record
+        try {
+          record = startAction(action, now, activeChildren)
+        } catch (e) {
+          // startAction 同步抛（spawn 资源极端，Sourcery Medium）：回滚重放帧与锁，
+          // 让用户可重试，而不是被卡到陈旧接管。恢复 pending 前值语义同落盘失败分支。
+          lastAccept.delete(action)
+          const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
+          if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：锁将保留到陈旧接管（约 10 分钟）。`)
+          console.error(`⚠️ ${action} 启动失败（spawn）：${e && e.message ? e.message : e}`)
+          sendJson(res, 500, { error: '动作启动失败，已回滚，可稍后重试' })
+          return
+        }
+        record._stateDir = stateDir
+        record._lockAt = now
+        record._lockToken = ownerToken
+        lastAccept.set(action, { at: now, runId: record.id })
+        try {
+          fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
+        } catch (e) { /* 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截 */ }
+        sendJson(res, 202, { id: record.id, action, label: record.label })
+      })
+      .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+  }
+
   const server = http.createServer((req, res) => {
     // ── v3.300 访问日志装配：单点 res.on('finish')，覆盖 sendJson/静态/页面全部响应出口
     // （全文件原本无任何 res.on 监听）。挂回调第一行 ⇒ 畸形 request-target 的 400
@@ -1621,77 +1750,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (req.method === 'POST' && url.pathname === '/trigger') {
-      if (shuttingDown) {
-        sendJson(res, 503, { error: '控制台正在关闭，动作未执行' })
-        return
-      }
-      // S9383：promise 必须显式收尾——readBody 以 resolve 收口不会 reject，但仍接 .catch
-      // 把意外异常转成 500，不留 floating promise。
-      readBody(req)
-        .then(({ body, aborted, over }) => {
-          // 关停竞态兜底：readBody 期间收到 SIGTERM 时，此刻不能再 acquireLock/startAction
-          // （评审 High：关停已清完 activeChildren，新 spawn 会逃过清理并留锁）。
-          if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-          // Sourcery Medium：请求中断（error 后 resolve）时 body 可能已含 action=run，
-          // 客户端却已放弃——绝不能凭残缺请求启动真实推送；超限同理拒绝。
-          if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-          if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-          const action = parseAction(body)
-          if (!action) {
-            sendJson(res, 400, { error: '未知 action' })
-            return
-          }
-          const now = Date.now()
-          // 幂等重放窗（Sourcery G_nm + G_4Kf）：提交 202 后响应丢失 → 用户重试 →
-          // 首轮已结束释放锁 → 重试被当作新触发再跑一轮真实推送。per-action 记录：
-          // 同 action 在窗口内的重复提交返回 409 + 首轮 run id（前端把它当「已在跑」
-          // 呈现，不再发起新一轮）；换动作不覆盖他动作的记录。
-          // Sourcery High Retries-duplicate x2（多进程 stale map / 落盘晚于 spawn）：
-          // 受理顺序改为「实时读盘合并 → 记 pending 帧 → 同步落盘（失败即拒绝）→ acquireLock
-          // → startAction → 补写真实 runId → 再落盘」。pending 帧（runId=0）本身就能拦截
-          // 窗口内重试；spawn 前记录已持久化，进程在 spawn 后崩溃也有完整重放记录。
-          const persisted = readLastAccept(lastAcceptPath)
-          for (const [k, v] of persisted) {
-            if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
-          }
-          const prev = lastAccept.get(action)
-          if (prev && now - prev.at < REPLAY_WINDOW_MS) {
-            // runId = epoch.seq 字符串（v3.299 评审）：0 是 pending 帧哨兵（数字），
-            // 真实 runId 只在 startAction 之后落盘——用「数字 0」判 pending，其余原样下发。
-            const rid = prev.runId
-            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true })
-            return
-          }
-          if (!acquireLock(stateDir, now, ownerToken)) {
-            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
-            return
-          }
-          lastAccept.set(action, { at: now, runId: 0 })
-          try {
-            fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-          } catch (e) {
-            // 落盘失败 = 无持久重放记录，为满足「重试不得重复推送」必须拒绝受理（Sourcery High）。
-            // 此时锁刚拿到、子进程未启动（activeChildren 无登记，close 回调无从释放）——
-            // 必须显式释放（Sourcery #225 M3/M4：releaseLockFor 返回 false = 文件系统
-            // 同样写不进锁 → 响亮告警给运维排查线索；恢复 pending 前值，失败动作可在
-            // 窗口内重试，不再被 409 拦到窗口过期）。
-            const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
-            if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：磁盘/权限异常仍未恢复，锁将保留到陈旧接管（约 10 分钟）。后续触发 409 属预期。`)
-            lastAccept.delete(action)
-            sendJson(res, 500, { error: '重放记录持久化失败，动作未执行（fail-closed）' })
-            return
-          }
-          const record = startAction(action, now, activeChildren)
-          record._stateDir = stateDir
-          record._lockAt = now
-          record._lockToken = ownerToken
-          lastAccept.set(action, { at: now, runId: record.id })
-          try {
-            fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-          } catch (e) { /* 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截 */ }
-          sendJson(res, 202, { id: record.id, action, label: record.label })
-        })
-        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+      acceptAction(req, res, {})
+      return
+    }
+    // 批次④ 4.1：通知自检——一次真实推送动作，语义上是「另一种动作」，复用触发全套防线
+    // （鉴权 401 / shuttingDown 503 / 重放窗 60s / 单飞锁），零 body。子进程 =
+    // spawn(node, [ENTRY_SINGLE, '--notify-test'])（entry:'single' 映射，见 ACTIONS 行）。
+    if (req.method === 'POST' && url.pathname === '/api/notify-test') {
+      acceptAction(req, res, { fixedAction: 'notify-test' })
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/runs') {
@@ -2069,5 +2135,8 @@ module.exports = {
   SSE_TICK_MS,
   SSE_HEARTBEAT_MS,
   SSE_MAX_PENDING,
-  SSE_MAX_CONNECTIONS
+  SSE_MAX_CONNECTIONS,
+  // v3.301 批次④ 4.1 通知自检：常量/入口导出（spawn entry 映射断言 + 重放窗断言）
+  REPLAY_WINDOW_NOTIFY_TEST_MS,
+  ENTRY_SINGLE
 }

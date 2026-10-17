@@ -253,17 +253,12 @@ function apiGetAccessLog () {
   return consumeJson(fetch('/api/access-log', merged), done)
 }
 
-async function trigger (action) {
-  const body = new URLSearchParams({ action })
-  const { merged, done } = timedRequest({
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Authorization: `Bearer ${BOOT.token}`
-    },
-    body
-  })
-  const p = fetch('/trigger', merged)
+// 触发类请求公共体（SonarCloud new_duplicated_lines_density：trigger 与 triggerNotifyTest
+// 两段同构模板抽公共，消除新增代码重复率超标）。fetch 字面量由调用侧闭包注入——
+// 第一参数仍是纯字面量（§0 静态红线形态保持），公共体只管 timedRequest/重放拦截语义。
+async function triggerVia (timedOpts, doFetch, dupMsg, failMsgOf) {
+  const { merged, done } = timedRequest(timedOpts)
+  const p = doFetch(merged)
   p.then(() => {}, () => {})
   let res
   try {
@@ -284,13 +279,44 @@ async function trigger (action) {
     // 服务端幂等重放窗（与 console.js REPLAY_WINDOW_MS 配套）：同动作重试被拦时
     // 返回首轮 runId——提示用户「那一轮已经在跑/已完成」，前端顺手刷新历史。
     if (data && data.replayBlocked && data.runId) {
-      const err = new Error('刚才那次触发已受理（正在运行或已完成），未重复执行')
+      const err = new Error(dupMsg)
       err.replayRunId = data.runId
       throw err
     }
-    throw new Error(data.error || `HTTP ${res.status}`)
+    throw new Error(failMsgOf(data, res.status))
   }
   return data
+}
+
+async function trigger (action) {
+  const body = new URLSearchParams({ action })
+  return triggerVia(
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `*** ${BOOT.token}`
+      },
+      body
+    },
+    (merged) => fetch('/trigger', merged),
+    '刚才那次触发已受理（正在运行或已完成），未重复执行',
+    (data, status) => (data && data.error) || `HTTP ${status}`
+  )
+}
+
+// 通知自检走独立端点（无 body）：与 trigger() 共用 triggerVia 模板，
+// fetch 第一参数为纯字面量（§0 红线，查询参数-free）。
+async function triggerNotifyTest () {
+  return triggerVia(
+    {
+      method: 'POST',
+      headers: { Authorization: `*** ${BOOT.token}` }
+    },
+    (merged) => fetch('/api/notify-test', merged),
+    '刚才那次通知自检已受理（正在运行或已完成），60 秒内无需重复',
+    (data, status) => (data && data.error) || `通知自检失败（HTTP ${status}）`
+  )
 }
 
 // ── 组件：状态徽章 ──────────────────────────────────────────────────────────
@@ -463,7 +489,8 @@ function StatusCards ({ state }) {
 const ACTION_DEFS = [
   { key: 'dry-run', label: '试运行', desc: '抓取但不推送', cls: 'btn-secondary' },
   { key: 'run', label: '正式运行一轮', desc: '抓取并真实推送', cls: 'btn-primary' },
-  { key: 'check', label: '环境检查', desc: '不抓取不推送', cls: 'btn-secondary' }
+  { key: 'check', label: '环境检查', desc: '不抓取不推送', cls: 'btn-secondary' },
+  { key: 'notify-test', label: '通知自检', desc: '向全部渠道发一条测试消息（真实推送）', cls: 'btn-secondary' }
 ]
 
 function TriggerBar ({ onTriggered, locking, setBusy }) {
@@ -472,9 +499,11 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
     setErr('')
     setBusy(true)
     try {
-      // 202 响应带首轮 runId——交给 App 登记为 busy 归属（G_nv 解锁判据）。
-      const data = await trigger(action)
-      onTriggered(data && typeof data.id === 'number' ? data.id : null)
+      // 202 响应带首轮 runId（epoch.seq 字符串，v3.299）——交给 App 登记为 busy 归属
+      // （G_nv 解锁判据）。Sourcery Medium：makeRunId 返回字符串，这里不能按数字过滤，
+      // 否则 busy 状态丢 run 关联（自检 202 的 string id 被误判为 null）。
+      const data = action === 'notify-test' ? await triggerNotifyTest() : await trigger(action)
+      onTriggered(data && typeof data.id === 'string' ? data.id : null)
       // busy 不在此处清零（Sourcery vvo）：202 只代表已受理，子进程还在跑；
       // App 的「提交轮进历史」派生 + BUSY_FALLBACK 兜底负责解锁。
     } catch (e) {

@@ -113,7 +113,12 @@ function liveSandboxCwds (procRoot, onReadError) {
         const st = fs.statSync(procPath)
         details.procDirExists = true
         details.uid = st.uid
-        details.state = procStateOf(path.join(procPath, 'stat'))
+        const state = procStateOf(path.join(procPath, 'stat'))
+        details.state = state
+        // 僵尸进程（Z）已终止、由父进程收尸，不占有 cwd（readlinkSync 必 ENOENT）——
+        // 它不可能把任何目录当工作目录，跳过而不是 fail-closed（本机实测：常驻
+        // dashboard 的子 node 僵尸会永久堵死主机闸，ENOENT 与进程消失同等语义）。
+        if (state === 'Z') continue
       } catch (pidError) {
         if (pidError && (pidError.code === 'ENOENT' || pidError.code === 'ESRCH')) continue
         details.statErrorCode = pidError && pidError.code ? pidError.code : 'UNKNOWN'

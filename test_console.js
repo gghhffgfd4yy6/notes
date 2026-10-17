@@ -24,7 +24,8 @@ const {
   sanitizeAccessPath, shouldLogAccess, ACCESS_LOG_MAX,
   filterMessageItems, clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
-  RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS
+  RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS,
+  REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE
 } = require('./scripts/console')
 const { readMessages } = require('./scripts/status')
 // 导出端点的读取上限（console.js 内部常量，与 MESSAGES_MAX_BYTES 同值）：
@@ -767,6 +768,79 @@ async function main () {
     assert.strictEqual(replayAfterRestart.status, 409, '重启后重放窗仍拦截（lastAccept 落盘回读）')
     assert.strictEqual(JSON.parse(replayAfterRestart.text).runId, firstBody.id, '重启后仍指向首轮 run')
     server2.close()
+    server.close()
+  })
+  // ── 批次④ 4.1：通知自检端点 ──────────────────────────────────────────────
+  await aok('HTTP: notify-test 动作映射与导出面（K1）', async () => {
+    assert.strictEqual(ACTIONS['notify-test'].entry, 'single', 'entry 必须是 single（spawn ENTRY_SINGLE）')
+    assert.deepStrictEqual(ACTIONS['notify-test'].args, ['--notify-test'], 'args 必须 --notify-test')
+    assert.ok(ACTIONS['notify-test'].label.includes('通知自检'), 'label 含「通知自检」')
+    assert.strictEqual(ENTRY_SINGLE, path.join(__dirname, 'xbk_function_v3.js'), 'ENTRY_SINGLE 导出且指向 v3 主文件')
+    assert.strictEqual(REPLAY_WINDOW_NOTIFY_TEST_MS, 60000, 'notify-test 独立重放窗 60s')
+    // 源码序：entry 映射在 ACTIONS 定义之后（spawn 不跑错脚本）。
+    // 插桩安全（Stryker 沙箱实测教训，同 test_notify_selfcheck S1）：锚点用插桩存活形态——
+    //   'const ACTIONS = ' 赋值头部存活（'Object.freeze({' 会被包裹改写）；
+    //   'const entryFile = ' 唯一（entry 映射赋值行头部存活，三元本体被包裹）。
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    const iActions = src.indexOf('const ACTIONS = ')
+    const iMap = src.indexOf('const entryFile = ')
+    assert.ok(iActions >= 0 && iMap > iActions, 'entry 映射必须在 ACTIONS 之后')
+    // parseAction 白名单顺带放行（D6）：urlencoded form 携带 action=notify-test 合法
+    assert.strictEqual(parseAction('action=notify-test'), 'notify-test')
+  })
+  await aok('HTTP: POST /api/notify-test 鉴权面（K2）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const noAuth = await request(port, 'POST', '/api/notify-test', { body: '' })
+    assert.strictEqual(noAuth.status, 401, '无凭证 401')
+    const badAuth = await request(port, 'POST', '/api/notify-test', { token: 'y'.repeat(32), body: '' })
+    assert.strictEqual(badAuth.status, 401, '错 token 401')
+    const csrf = await request(port, 'POST', '/api/notify-test', { headers: { cookie: `xbk_session=${TOKEN}` }, body: '' })
+    assert.strictEqual(csrf.status, 401, 'POST 仅凭 Cookie 401（CSRF 面）')
+    server.close()
+  })
+  await aok('HTTP: notify-test 60s 独立重放窗行为区分（K3）', async () => {
+    // 两个独立实例（独立 stateDir）：lastAccept 是「内存 Map + 实时读盘合并（at 更大者胜）」，
+    // 同一实例内先写 30s 帧再改盘为 61s 帧不会生效（内存 30s 帧更权威）。
+    // 场景①：30s 前（60s 窗内）→ 409 + replayBlocked + runId 回带
+    {
+      const dir = tmpDir()
+      const { server } = createConsole({ token: TOKEN, stateDir: dir })
+      const port = await listen(server)
+      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1750000000000.7' } }))
+      const blocked = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
+      assert.strictEqual(blocked.status, 409, '60s 窗内重放必须 409')
+      const blockedBody = JSON.parse(blocked.text)
+      assert.strictEqual(blockedBody.replayBlocked, true, '标记重放拦截')
+      assert.strictEqual(blockedBody.runId, '1750000000000.7', '409 回带首轮 runId')
+      server.close()
+    }
+    // 场景②：61s 前（超 60s 窗；若误用 12min 全局窗此请求会被重放窗拦——60s 窗的区分性断言）
+    // → 应越过重放窗、撞上既有锁（手工预占锁）→ 409 无 replayBlocked。
+    // 不走 202+spawn：node xbk_function_v3.js --notify-test 直跑会真实推送（本机有真实凭证）。
+    {
+      const dir = tmpDir()
+      const { server } = createConsole({ token: TOKEN, stateDir: dir })
+      const port = await listen(server)
+      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - 61000, runId: '1750000000000.7' } }))
+      assert.strictEqual(acquireLock(dir, Date.now(), 'other-token'), true, '预占锁成功')
+      const lockConflict = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
+      assert.strictEqual(lockConflict.status, 409, '越窗后撞锁仍 409')
+      const lockBody = JSON.parse(lockConflict.text)
+      assert.strictEqual(lockBody.replayBlocked, undefined, '锁冲突不带 replayBlocked（区别于重放窗 409）')
+      server.close()
+    }
+  })
+  await aok('HTTP: /trigger 的 action=notify-test 与独立端点共享受理序列（K7 侧通道一致）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const laPath = path.join(dir, 'console-lastaccept.json')
+    // 独立端点 60s 窗内 → /trigger 侧同键同窗同样拦截（共享 lastAccept 键）
+    fs.writeFileSync(laPath, JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1750000000000.8' } }))
+    const viaTrigger = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=notify-test' })
+    assert.strictEqual(viaTrigger.status, 409, '/trigger 侧通道同键同窗拦截（D6 有意行为）')
+    assert.strictEqual(JSON.parse(viaTrigger.text).runId, '1750000000000.8', '回带同一首轮 runId')
     server.close()
   })
   await aok('HTTP: /api/runs 列表与 /api/runs/:id 详情', async () => {
