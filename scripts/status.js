@@ -341,13 +341,16 @@ function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
     const v = ts ? Date.parse(ts.replace(' ', 'T') + 'Z') : NaN
     return Number.isFinite(v) ? v : null
   }
-  // 摘要行清单（行号 + 毫秒）：崩溃轮的写序是「摘要 → 同秒/下一秒 ERROR」，也可能
-  // 「ERROR → 摘要」；按「行距 ≤3 且时间差 ≤5s」取最近的一轮归属，避免误标更晚的摘要。
-  const summaries = []
+  // 同轮归属（评审：手机端整页「中断」）：生产写序是「摘要 → 同秒/下一秒 ERROR」（崩溃轮），
+  // 与旧假设「失败行在摘要行之前」相反；倒序扫描时失败行先遇到，会误标**上一条更晚**的
+  // 摘要。这里按行距就近归属（≤2 行，时间差 ≤2s），只认通过计数器校验的摘要行。
+  const summaryByLine = new Map()
   for (let i = 0; i < lines.length; i++) {
     if (!RUN_SUMMARY_LINE_RE.test(lines[i])) continue
-    const t = tsMs(lines[i])
-    if (t !== null) summaries.push({ i, t })
+    const m = RUN_SUMMARY_LINE_RE.exec(lines[i])
+    // 与建 items 同一套校验：计数器非法/缺失的摘要行不参与归属（否则失败轮会凭空消失）
+    if (![m[2], m[3], m[4], m[5], m[6], m[7]].map(Number).every(validInt)) continue
+    summaryByLine.set(i, tsMs(lines[i]))
   }
   const interruptedIdx = new Set()
   const attributedFailures = new Set()
@@ -356,13 +359,17 @@ function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
     const t = tsMs(lines[i])
     if (t === null) continue
     let best = null
-    for (const s of summaries) {
-      if (Math.abs(s.i - i) > 3) continue
-      const gap = Math.abs(s.t - t)
-      if (gap > 5000) continue
-      if (!best || gap < Math.abs(best.t - t)) best = s
+    for (let d = 1; d <= 2 && !best; d++) {
+      for (const j of [i - d, i + d]) {
+        if (!summaryByLine.has(j) || interruptedIdx.has(j)) continue
+        const st = summaryByLine.get(j)
+        if (st === null) continue
+        const gap = Math.abs(st - t)
+        if (gap > 2000) continue
+        if (!best || gap < best.gap) best = { j, gap } // 同距离取时间差更小者
+      }
     }
-    if (best) { interruptedIdx.add(best.i); attributedFailures.add(i) }
+    if (best) { interruptedIdx.add(best.j); attributedFailures.add(i) }
   }
   let crashPending = false // 尾端失败行待发占位（其后无摘要行）
   let lastLineNo = lines.length + 1 // 本页最旧条目起始行号（初始 = 窗口外哨兵）

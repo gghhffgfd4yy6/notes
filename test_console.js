@@ -1988,8 +1988,20 @@ async function main () {
     // 现场证据：生产 run.log 里出现只存在于测试 fixture 的 id 1750000000000.9，且每轮都被标
     // 「中断」——测试实例的取消/停止留痕写进了仓库缓存，子进程也继承了缺省缓存目录。
     assert.ok(src.includes('childEnv.XBK_CACHE_DIR = stateDir'), '子进程必须钉 XBK_CACHE_DIR 到本实例 stateDir')
-    assert.ok(src.includes('const stopDir = stateDir'), '停止留痕必须写本实例 stateDir')
+    assert.ok(src.includes('startAction(action, now, activeChildren, runHistoryDir || stateDir)'),
+      'spawn 必须把 runHistoryDir || stateDir 传给子进程（否则 run.log 写不到历史读取目录）')
+    assert.ok(src.includes('const stopDir = runHistoryDir || stateDir'), '停止留痕必须写历史读取目录')
     assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得回落到运行侧全局缓存目录')
+    // 行为验证：子进程（独立 node）只在真读 XBK_CACHE_DIR 时才可能写到实例目录。
+    const dir = fs.mkdtempSync(path.join(__dirname, '.tmp-cache-'))
+    try {
+      const out = require('node:child_process').execFileSync(process.execPath, ['-e',
+        "const x=require('./xbk_function_v3');process.stdout.write(x.MessageStore.cacheDir)"],
+      { cwd: __dirname, encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: dir } })
+      assert.strictEqual(out.trim(), dir, 'MessageStore.cacheDir 必须服从 XBK_CACHE_DIR（否则子进程 run.log 仍写生产）')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
   await aok('HTTP: run-history limit=9999 在 220 轮 fixture 上真实钳制到 200（评审 #14）', async () => {
     const dir = tmpDir()

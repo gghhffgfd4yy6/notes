@@ -1466,7 +1466,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         let record
         try {
-          record = startAction(action, now, activeChildren, stateDir)
+          record = startAction(action, now, activeChildren, runHistoryDir || stateDir)
         } catch (e) {
           // startAction 同步抛（spawn 资源极端，Sourcery Medium）：回滚重放帧与锁，
           // 让用户可重试，而不是被卡到陈旧接管。恢复 pending 前值语义同落盘失败分支。
@@ -1780,7 +1780,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // _writeRunLog → MessageStore.cacheDir），不是控制台 stateDir——Config.cache.dir
       // 指向别处时两个目录分居。读取源对齐运行侧解析结果（取不到回退 stateDir），
       // 与启动时「目录漂移」警告同一口径。
-      const historyDir = runHistoryDir || (runtimeCacheDir() || stateDir)
+      const historyDir = runHistoryDir || stateDir
       const h = readRunHistory(historyDir, { limit, before })
       sendJson(res, 200, h)
       return
@@ -2019,7 +2019,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           try {
             const stampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
             const stamp = stampFmt.format(new Date())
-            const stopDir = stateDir
+            const stopDir = runHistoryDir || stateDir
             fs.appendFileSync(path.join(stopDir, 'run.log'), `${stamp} ERROR 控制台停止：任务 #${record.id}（${record.action}）于运行中被停止（SIGTERM）\n`, 'utf8')
           } catch (e) { /* 留痕失败静默：内存 record.cancelled 已是权威 */ }
           try {
