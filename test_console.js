@@ -2652,6 +2652,22 @@ async function main () {
     assert.ok(!/<select[^>]*value=\$\{cate\}/.test(seg), '分类筛选不得回退原生 select')
   })
 
+  await aok('结构红线: 分类筛选按「来源-品类-平台」逐级下钻', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const start = src.indexOf('function buildCateTree')
+    const end = src.indexOf('function flatCateLeaves', start)
+    assert.ok(start > -1 && end > start, '必须有 buildCateTree')
+    assert.ok(src.slice(start, end).includes("c.name.split('-')"), '必须按 - 拆分三级分类')
+    assert.ok(src.includes('setPath(o.node.path)'), '点分组必须下钻而不是直接筛选')
+    assert.ok(src.includes('path.length === 0 ? [{ key'), '「全部分类」只应出现在一级')
+  })
+
+  await aok('结构红线: 非概览/日志页停止主轮询（防 5s 闪屏）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes("if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)"), '推送记录/配置/系统必须停止主轮询')
+    assert.ok(/\[refreshSplit, locking, tab\]/.test(src), '轮询 effect 必须随 tab 变化重跑')
+  })
+
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function Hint ('), '必须有 Hint 原语')
