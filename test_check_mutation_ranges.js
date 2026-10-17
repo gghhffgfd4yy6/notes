@@ -25,9 +25,10 @@ const SPECIAL_SEGMENTS = {
   'qinglong/xbk_push.js': ['qinglong-push'],
   'scripts/check-deps.js': ['check-deps'],
   'scripts/status.js': ['status'],
-  'scripts/console.js': ['console']
+  'scripts/console.js': ['console-part1', 'console-part2']
 }
-const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': 750 } // 拆段边界固定，终点随文件增长自动跟随
+// 拆段边界固定（与 mutation.yml 真实矩阵一致），终点随文件增长自动跟随
+const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': 750, 'scripts/console.js': 1100 }
 
 // 构造包含所有生产文件的 yml，行段可按文件覆盖
 function buildYml (overrides = {}) {

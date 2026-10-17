@@ -276,9 +276,16 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          - name: console
+          # console.js 2142 行（2678+ 变异体）整段跑曾连续两轮在 CI 变异评估阶段 5.5h 零输出
+          # 被 step 330min 杀死（dry-run 均过）——拆两行段并行，评估窗口减半，排除 perTest 归因雪崩面。
+          # 行段连续不重叠全覆盖（check-mutation-ranges 校验）；段名与 mutation-report EXPECTED_SEGMENTS 双向对账。
+          - name: console-part1
             src: "scripts/console.js"
-            mutate: "scripts/console.js"
+            mutate: "scripts/console.js:1-1100"
+            config: "stryker.tap.config.js"
+          - name: console-part2
+            src: "scripts/console.js"
+            mutate: "scripts/console.js:1101-2142"
             config: "stryker.tap.config.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
