@@ -632,6 +632,9 @@ async function main () {
     assert.ok(res.text.includes('试运行'), 'noscript 降级文案（触发动作说明）')
     assert.ok(res.text.includes('环境检查'))
     assert.ok(res.text.includes('正式运行一轮'))
+    // 页面含会话凭证（boot JSON token）⇒ 不得被缓存：缺 Cache-Control 时浏览器启发式缓存
+    // 会留下旧页面的空/过期 boot token，表现为「页面正常、点按钮 POST 400/401 unauthorized」。
+    assert.strictEqual(res.headers['cache-control'], 'no-store', 'HTML 必须 no-store（凭证不落缓存）')
     // Sourcery #37：缺文件夹具必须断言「缺失」分支文案，不许「正常」蒙混——
     // 两种文案都接受的断言抓不住缺失降级走错分支的回归。
     assert.ok(res.text.includes('缺失'), `空缓存目录必须渲染「缺失」分支，实际片段：${res.text.slice(0, 400)}`)
@@ -2436,6 +2439,23 @@ async function main () {
       offenders.push(first)
     }
     assert.deepStrictEqual(offenders, [], `fetch/EventSource 第一参数必须是字面量或字面量三元：${offenders.join(' | ')}`)
+  })
+
+  // 静态红线：Authorization 头必须是 `Bearer ${BOOT.token}` 形态。
+  // 背景（2026-10-17 真实故障）：POST /trigger 与 /api/notify-test 的头一度被写成
+  // `Authorization: `*** ${BOOT.token}`` —— GET 走 Cookie 照常工作、页面全绿，只有写动作
+  // 恒 401「触发失败：unauthorized」。运行期无浏览器测试可抓，只能靠源码形态断言。
+  await aok('静态红线: app.js 的 Authorization 头一律 Bearer 形态（防 *** 占位符回潮）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const authLines = src.split('\n').filter(l => l.includes('Authorization:') && !l.trim().startsWith('//'))
+    assert.ok(authLines.length > 0, '应存在 Authorization 头')
+    const bad = authLines.filter(l => !/Authorization:\s*`Bearer \$\{BOOT\.token\}`/.test(l))
+    assert.deepStrictEqual(bad.map(s => s.trim()), [], 'Authorization 头必须使用 Bearer 前缀加 boot token')
+    assert.ok(!src.includes('***'), 'app.js 不得残留 *** 占位符')
+    // 评审 #233 · Sourcery Medium：BFCache 恢复时可能跳过 `/` 请求，BOOT.token 过期仍发旧
+    // Bearer → 写动作 401。必须有 persisted=true 的重载分支。
+    assert.ok(/addEventListener\(['"]pageshow['"]/.test(src), 'app.js 须监听 pageshow')
+    assert.ok(/ev\.persisted|e\.persisted/.test(src), 'pageshow 分支须判 persisted 后重载')
   })
 }
 

@@ -24,6 +24,11 @@ function readBoot () {
 }
 const BOOT = readBoot()
 
+// BFCache 恢复（评审 #233 · Sourcery Medium）：浏览器从往返缓存恢复页面时会跳过 `/` 请求，
+// BOOT.token 可能已随服务重启/轮换而过期——GET 靠 Cookie 仍正常，但写动作会 401。
+// persisted=true 即非首次加载，强制重载拿当前凭证（no-store 不保证 BFCache 驱逐）。
+window.addEventListener('pageshow', (ev) => { if (ev.persisted) window.location.reload() })
+
 const POLL_MS = 5000
 const POLL_BUSY_MS = 2000
 // 提交成功后按钮锁定的最长兜底时长（Sourcery vwU/vv2：轮询竞态/请求挂起时不能永久锁死；
@@ -295,7 +300,7 @@ async function trigger (action) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: `*** ${BOOT.token}`
+        Authorization: `Bearer ${BOOT.token}`
       },
       body
     },
@@ -311,7 +316,7 @@ async function triggerNotifyTest () {
   return triggerVia(
     {
       method: 'POST',
-      headers: { Authorization: `*** ${BOOT.token}` }
+      headers: { Authorization: `Bearer ${BOOT.token}` }
     },
     (merged) => fetch('/api/notify-test', merged),
     '刚才那次通知自检已受理（正在运行或已完成），60 秒内无需重复',
