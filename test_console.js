@@ -1983,6 +1983,20 @@ async function main () {
     assert.strictEqual(r5.items.length, 3, '非法参数回默认不报错')
     server.close()
   })
+  await aok('readRunHistory: 分页截断时旧失败行不得误标本页最旧一条', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 08:00:00 ERROR 推送全部失败 3 条（通道可能失效）',
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 10:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 11:00:00 total=3 dedup=0 filtered=0 truncated=0 pushed=3 failed=0 elapsed=1s cachesaved=1'
+    ].join('\n') + '\n')
+    // limit=2 时 09:00 轮不在本页；08:00 的失败行无处归属，不得回填到 10:00。
+    const r = readRunHistory(dir, { limit: 2 })
+    assert.deepStrictEqual(r.items.map(x => x.at), ['2026-10-15 11:00:00', '2026-10-15 10:00:00'])
+    assert.deepStrictEqual(r.items.map(x => x.interrupted), [false, false], '页面满时的旧失败行不得污染本页条目')
+  })
   await aok('测试隔离: 子进程缓存目录与停止留痕都钉到本实例 stateDir', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
     // 现场证据：生产 run.log 里出现只存在于测试 fixture 的 id 1750000000000.9，且每轮都被标

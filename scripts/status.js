@@ -414,6 +414,9 @@ function readRunHistory (dir, { limit = 50, before = 0 } = {}) {
     if (looksLikeRoundFailure(line)) {
       // 带时间戳且能对上某轮摘要 ⇒ 已在预扫描归属，不再按文件序回填（否则会标错轮）。
       if (attributedFailures.has(i)) continue
+      // 页面已满：更早的失败行属于不在本页的轮次，回填只会把「本页最旧那条」误标中断
+      // （评审：limit=8 与 limit=9 对同一行给出不同结论）。
+      if (items.length >= lim) continue
       if (summariesSeen === 0) crashPending = true // 尾端失败行、其后无摘要轮
       else if (items.length > 0) items[items.length - 1].interrupted = true
       // 回填目标 = 最近 push 的摘要（items 尾部）= 倒序扫描中刚处理过的那条 = 失败行
