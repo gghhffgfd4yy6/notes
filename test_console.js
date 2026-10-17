@@ -2513,8 +2513,15 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     // v3.299 事故形态：服务端把 run id 从 number 改成 'epoch.seq' 字符串后，前端仍有
     // `typeof id === 'number'` 守卫 → 按钮永久禁用、请求永不发出，且页面无任何报错。
-    const bad = /typeof\s+(?:[A-Za-z_$][\w$]*\.)?id\s*===\s*['"]number['"]/.test(src)
-    assert.strictEqual(bad, false, '不得用 typeof <expr>.id === "number" 判定运行 id（id 恒为 string）')
+    // 不用单条正则：别名（runId）、括号（(id)）、下标（rows[i].id）、!== 都要覆盖。
+    const offenders = []
+    for (const seg of src.split('typeof').slice(1)) {
+      const head = seg.slice(0, 80)
+      if (!/[!=]==\s*['"]number['"]/.test(head)) continue
+      const operand = head.split(/[!=]==/)[0].replace(/[\s()]/g, '')
+      if (/id$/i.test(operand)) offenders.push(operand)
+    }
+    assert.deepStrictEqual(offenders, [], '不得用 typeof <id 表达式> === "number" 判定运行 id（id 恒为 string）')
   })
 
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
@@ -2522,7 +2529,10 @@ async function main () {
     assert.ok(src.includes('function Hint ('), '必须有 Hint 原语')
     assert.ok(src.includes('function Card ('), '必须有 Card 原语')
     assert.ok(!src.includes('class="hint'), '提示行不得再手写 class="hint"')
-    assert.strictEqual(src.split('class="card"').length - 1, 1, 'class="card" 只允许出现在 Card 原语定义里')
+    // 双引号、单引号都要查（class='hint' 曾能逃过字面量检查）
+    const attrs = [...src.matchAll(/class=(["'])([^"']*)\1/g)].map(m => m[2])
+    assert.deepStrictEqual(attrs.filter(c => /(^|\s)hint(\s|$)/.test(c)), [], '提示行只能走 Hint 原语')
+    assert.strictEqual(attrs.filter(c => /(^|\s)card(\s|$)/.test(c)).length, 1, 'class="card" 只允许出现在 Card 原语定义里')
   })
 }
 

@@ -65,7 +65,7 @@ function fmtBytes (b) {
 // 刷新链路不阻塞，历史与状态在下一轮照常更新。
 // Codacy Critical（SSRF 启发式：fetch 收到「用户可控 URL」）：每个端点独立函数、
 // URL 全部为字面量——fetch 的第一个参数在数据流上只有字面量一种来源，不存在
-// 「变量 URL」路径。run id 是服务端生成的数字 id，详情端点以独立函数封装。
+// 「变量 URL」路径。run id 是服务端生成的 `epoch.seq` 字符串（不是数字），详情端点以独立函数封装。
 // Sourcery Stalled-bodies x3：fetch() 在收到响应头时就 resolve，此前 clearTimeout 让
 // 「头到了、body 挂起」的响应绕过超时——轮询消费 res.json() 时永久等待，刷新链路卡死。
 // 修复：期限定时器不在 fetch resolve 时清掉，而是移交给 body 消费方（readBodyJson），
