@@ -1449,6 +1449,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 记录仍含 token，这是 raw-URL 方案的已知暴露面（README 已提醒可重置）。
       res.setHeader('Referrer-Policy', 'no-referrer')
       res.setHeader('Content-Security-Policy', CSP_HEADER)
+      // HTML 里含本次会话凭证（boot JSON 的 token），绝不能被浏览器缓存：无 Cache-Control
+      // 时浏览器启发式缓存会留下旧页面（旧 boot token 为空/过期）——页面照常渲染、GET 靠
+      // Cookie 正常，但点按钮 POST 报 unauthorized（真实故障：2026-10-17 通知自检 401）。
+      // no-store 同时禁掉 bfcache 与磁盘缓存，保证每次打开都拿到当前凭证。
+      res.setHeader('Cache-Control', 'no-store')
       const state = readStatus(stateDir)
       const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
       // 鉴权通过后下发会话 Cookie（Sourcery G_oJ）：HttpOnly（JS 不可读，XSS 拿不走）、

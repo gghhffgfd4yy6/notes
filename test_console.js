@@ -632,6 +632,9 @@ async function main () {
     assert.ok(res.text.includes('试运行'), 'noscript 降级文案（触发动作说明）')
     assert.ok(res.text.includes('环境检查'))
     assert.ok(res.text.includes('正式运行一轮'))
+    // 页面含会话凭证（boot JSON token）⇒ 不得被缓存：缺 Cache-Control 时浏览器启发式缓存
+    // 会留下旧页面的空/过期 boot token，表现为「页面正常、点按钮 POST 400/401 unauthorized」。
+    assert.strictEqual(res.headers['cache-control'], 'no-store', 'HTML 必须 no-store（凭证不落缓存）')
     // Sourcery #37：缺文件夹具必须断言「缺失」分支文案，不许「正常」蒙混——
     // 两种文案都接受的断言抓不住缺失降级走错分支的回归。
     assert.ok(res.text.includes('缺失'), `空缓存目录必须渲染「缺失」分支，实际片段：${res.text.slice(0, 400)}`)
