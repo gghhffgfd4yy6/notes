@@ -2533,6 +2533,10 @@ async function main () {
     const attrs = [...src.matchAll(/class=(["'])([^"']*)\1/g)].map(m => m[2])
     assert.deepStrictEqual(attrs.filter(c => /(^|\s)hint(\s|$)/.test(c)), [], '提示行只能走 Hint 原语')
     assert.strictEqual(attrs.filter(c => /(^|\s)card(\s|$)/.test(c)).length, 1, 'class="card" 只允许出现在 Card 原语定义里')
+    // 面板头/按钮同理：类名契约只在原语里出现一次
+    assert.strictEqual(attrs.filter(c => /(^|\s)panel-head(\s|$)/.test(c)).length, 1, 'panel-head 只允许出现在 PanelHead 原语里')
+    assert.strictEqual(attrs.filter(c => /(^|\s)panel-title(\s|$)/.test(c)).length, 1, 'panel-title 只允许出现在 PanelHead 原语里')
+    assert.deepStrictEqual(attrs.filter(c => /^btn btn-/.test(c)), [], '按钮必须走 Button 原语，不得手写 btn btn-*')
   })
 }
 
