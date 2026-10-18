@@ -686,11 +686,11 @@ function messagesFileName (filename) {
 }
 
 function messagesSignature (dir, filename, maxBytes) {
+  // 只给默认 push.json 做 (ino,size,mtime) 签名缓存：自定义缓存名的部署走无缓存路径，
+  // 这样 fs.statSync 的路径是**字面量常量**，不给静态分析留下动态路径面（Codacy 误报）。
+  if (messagesFileName(filename) !== FILES.messages) return null
   try {
-    // filename 已由 messagesFileName() 归一为 basename（无目录成分/无 ..）；Semgrep 的
-    // taint 规则不跟自定义 sanitizer，这里显式豁免（Codacy 误报）。
-    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal
-    const st = fs.statSync(path.join(dir, messagesFileName(filename)))
+    const st = fs.statSync(path.join(dir, FILES.messages))
     if (!st.isFile() || st.size > maxBytes) return null
     if (Date.now() - st.mtimeMs < MESSAGES_CACHE_MIN_AGE_MS) return null
     return `${st.ino}:${st.size}:${Math.round(st.mtimeMs)}`
