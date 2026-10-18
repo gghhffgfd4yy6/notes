@@ -2194,6 +2194,21 @@ async function main () {
     assert.strictEqual(r2.items[1].interrupted, true, '同秒失败行必须归属其摘要轮')
     assert.strictEqual(r2.items[0].interrupted, false)
   })
+  await aok('readStatus/readRunHistory: ALERT「运行异常」不把成功轮标中断（审查 D2-M3）', () => {
+    const { readStatus, readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 09:00:00 total=120 dedup=0 filtered=0 truncated=0 pushed=100 failed=0 elapsed=8s cachesaved=1',
+      '2026-10-15 09:00:01 ALERT [v3.307] ⚠️ xbk-push 运行异常 原因：线报酷数据截断',
+      '2026-10-15 09:00:02 ALERT [v3.307] ⚠️ xbk-push 运行异常 原因：缺少可选依赖 re2'
+    ].join('\n') + '\n')
+    assert.strictEqual(readStatus(dir).run.value.interrupted, false,
+      '线报酷截断/缺 re2 的 ALERT 正文含「运行异常」，但该轮是成功轮')
+    const r = readRunHistory(dir, { limit: 5 })
+    assert.strictEqual(r.items.length, 1, 'ALERT 不是失败行，不得生成崩溃占位轮')
+    assert.strictEqual(r.items[0].interrupted, false)
+    assert.strictEqual(r.items[0].pushed, 100)
+  })
   // ── v3.298 只读扩展：配置视图 / 缓存健康 / 文件清单 / 趋势天数 ─────────────────
   await aok('只读纯函数: statSafeMeta 三态（常规文件 / 符号链接 / 缺失）', () => {
     const dir = tmpDir()

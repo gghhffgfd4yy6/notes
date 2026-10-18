@@ -125,7 +125,11 @@ function looksLikeRoundFailure (line) {
   // 上一轮标成「中断」（评审：手机端整页黄色警告）。取消轮次由 readRunHistory 按 CANCEL
   // 前缀单独成条（cancelled=true），这里一律不算失败。
   if (line.includes('控制台停止：任务 #')) return false
-  return /(?:^|\s)ERROR(?:\s|$)|运行异常/.test(line)
+  // 审查 D2-M3：ALERT 的正文固定含「运行异常」（xbk_app.js:324 的告警模板），但线报酷截断、
+  // 缺 re2 等**非失败**告警都用同一句正文 ⇒ 不能按正文命中，否则成功轮被标「中断」。
+  // ALERT 行里可能内嵌带 ERROR 字样的原因串，先整行排除，只认真正的 ERROR 行。
+  if (/(?:^|\s)ALERT(?:\s|$)/.test(line)) return false
+  return /(?:^|\s)ERROR(?:\s|$)/.test(line)
 }
 
 // run.log 摘要行正则（parseLastRun 只看最后一条；readTrends / readRunHistory / parseRunStats
