@@ -1871,7 +1871,6 @@ function ChannelList ({ pc }) {
             <span class="chan-dot" aria-hidden="true"></span>${k}
           </span>`)}
         </div>`}
-    ${Array.isArray(pc.names) && pc.names.length > 0 && html`<div class="cfg-note">已启用：${pc.names.join('、')}</div>`}
   </div>`
 }
 
