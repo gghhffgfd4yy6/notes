@@ -3434,6 +3434,9 @@ async function main () {
     assert.ok(!msgSeg.includes('sentQueryRef'), '旧的 sentQueryRef 归属判断必须移除')
     const cateSeg = src.slice(src.indexOf('function CategoryPicker'), src.indexOf('function MessagesPanel', src.indexOf('function CategoryPicker')))
     assert.ok(!/\.focus\(\)/.test(cateSeg), '分类弹层聚焦必须 preventScroll，禁止把页面滚回顶部')
+    // 触发历史表在 320 宽会撑出面板：必须和逐轮历史一样放进横向滚动容器。
+    const runsSeg = src.slice(src.indexOf('function RunsPanel'), src.indexOf('function RunHistoryPanel', src.indexOf('function RunsPanel')))
+    assert.ok(runsSeg.includes('<div class="runs-scroll"><table class="runs-table">'), '触发历史表必须包 .runs-scroll，窄屏不得撑破面板')
     // preventScroll 不能把键盘焦点留在 .cate-list 的可视区外：必须显式滚列表。
     assert.ok(cateSeg.includes('focusInList') && cateSeg.includes('list.scrollTop'), '分类列表键盘焦点必须滚进可视区')
     // 趋势图自动停靠最右时，最左列可能只露半截日期：须把下一个完整列对齐到容器左缘。
@@ -3452,6 +3455,10 @@ async function main () {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const cateCss = (css.match(/\.msg-cate\s*\{[^}]*\}/) || [''])[0]
     assert.ok(/max-width:\s*100%/.test(cateCss) && /overflow-wrap:\s*anywhere/.test(cateCss), '长分类 pill 必须能折行，不得撑破卡片')
+    const accessCss = (css.match(/\.access-log summary\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/min-height:\s*44px/.test(accessCss) && /display:\s*list-item/.test(accessCss), '最近访问记录 summary 必须 44px 且保留原生展开标记')
+    const narrow = (css.match(/@media \(max-width: 360px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
+    assert.ok(/\.tabs\s*\{[^}]*gap:/.test(narrow) && /\.tab-btn\s*\{[^}]*padding:/.test(narrow), '320 窄屏媒体查询必须真的作用于标签栏')
     assert.ok(/\.msg-meta\s*\{[^}]*min-width:\s*0/.test(css), 'msg-meta 须 min-width:0（flex 子项才可收缩）')
   })
 

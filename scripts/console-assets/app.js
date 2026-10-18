@@ -962,7 +962,7 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh }) {
         ? html`<div class="empty">触发历史暂不可用，请稍后刷新</div>`
         : runs.length === 0
           ? html`<div class="empty">暂无触发记录</div>`
-          : html`<table class="runs-table">
+          : html`<div class="runs-scroll"><table class="runs-table">
         <thead><tr><th>#</th><th>动作</th><th>开始时间</th><th>结果</th><th></th></tr></thead>
         <tbody>
           ${runs.map((r) => html`<tr key=${r.id} class=${openId === r.id ? 'row-open' : ''}>
@@ -979,7 +979,7 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh }) {
             </td>
           </tr>`)}
         </tbody>
-      </table>`}
+      </table></div>`}
     ${openId !== null && html`<div class="logbox">
       <div class="logbox-head">
         <span>运行 #${openId} 输出${openActive ? '（实时跟随）' : ''}</span>
