@@ -76,6 +76,24 @@ try {
     assert.strictEqual(status.run.value.elapsed, '3.4s', 'elapsed 应原样保留（含尾部 s）')
   })
 
+  // ===== 最近一条是 CANCEL：不能回退显示上一条正常摘要（Sourcery PR#252） =====
+  test('S5b run.log 末尾取消留痕 → cancelled 最新轮；取消后再有摘要则摘要优先', () => {
+    fs.writeFileSync(path.join(tmp, 'run.log'), [
+      '2026-09-08 10:00:00 total=42 dedup=5 filtered=7 truncated=2 pushed=28 failed=2 elapsed=3.4s',
+      '2026-09-08 10:05:00 CANCEL 控制台停止：任务 #1792236290484.7（run）于运行中被停止（SIGTERM）'
+    ].join('\n') + '\n')
+    let status = readStatus(tmp)
+    assert.strictEqual(status.run.status, 'ok')
+    assert.strictEqual(status.run.value.cancelled, true, '最近一轮是取消，不能显示成上一轮正常')
+    assert.strictEqual(status.run.value.total, null, '取消轮没有计数')
+    assert.strictEqual(status.run.value.at, '2026-09-08 10:05:00')
+
+    fs.appendFileSync(path.join(tmp, 'run.log'), '2026-09-08 10:06:00 total=7 dedup=0 filtered=1 truncated=0 pushed=6 failed=0 elapsed=1.0s\n')
+    status = readStatus(tmp)
+    assert.notStrictEqual(status.run.value.cancelled, true, '取消后已完成的新一轮摘要优先')
+    assert.strictEqual(status.run.value.total, 7)
+  })
+
   // ===== parseLastRun 行首锚定：行中间内嵌的 total=… 不再被误命中 =====
   test('S6 run.log 仅 ERROR 行内嵌 total=… 子串（行首为其它文字）→ invalid', () => {
     fs.writeFileSync(path.join(tmp, 'run.log'), [

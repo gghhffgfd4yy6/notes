@@ -913,7 +913,7 @@ function renderUnauthorizedPage () {
     <input id="token" name="token" type="password" autocomplete="current-password" minlength="16" required autofocus>
     <button type="submit">打开控制台</button>
   </form>
-  <p class="hint">令牌只用于本次登录；登录后的地址栏会带 <code>?token=</code>，请勿把该链接转发给他人。</p>
+  <p class="hint">令牌只用于本次登录；成功后写入 HttpOnly 会话 Cookie，地址栏不会保留令牌。请勿把登录链接或令牌转发给他人。</p>
 </main></body></html>`
 }
 // 会话 Cookie 名（Sourcery G_oJ：ESM import/静态资产请求无法带 Authorization 头，
@@ -2123,10 +2123,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 尾窗指纹（评审 #243-1）：8 位十六进制；其它形态一律当「没带」，不做截断猜测
       const rawWin = String(url.searchParams.get('win') || '')
       const windowKey = /^[0-9a-f]{8}$/.test(rawWin) ? rawWin : ''
+      // 「仅运行」：服务端先剔除 CANCEL 留痕再套 limit，避免取消记录挤掉真实轮次。
+      const excludeCancelled = url.searchParams.get('excludeCancelled') === '1'
       // Sourcery #229-4 / 审查 #241 S1：run.log 的写入方是运行侧 MessageStore.cacheDir
       // （xbk_app _writeRunLog → MessageStore.cacheDir），不是控制台 stateDir——Config.cache.dir
       // 指向别处时两个目录分居。读取源与 spawn/停止留痕同走 historyDir()（运行侧真实目录优先）。
-      const h = readRunHistory(historyDir(), { limit, before, windowKey })
+      const h = readRunHistory(historyDir(), { limit, before, windowKey, excludeCancelled })
       sendJson(res, 200, h)
       return
     }

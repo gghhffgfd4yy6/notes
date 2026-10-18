@@ -71,15 +71,16 @@ export function logLineKind (line) {
 }
 
 // 各筛选模式的计数（v3.307）：前端 chips 显示数字，纯函数避免每次渲染把 6 个模式各扫一遍。
-// issue = isIssueLogLine（不含控制台生命周期）；error/alert 按原始级别统计（error 含生命周期，
-// 因为「错误」就是按级别看）；summary = 运行摘要行；console = 控制台生命周期。
+// issue = isIssueLogLine；error 只看真正的业务 ERROR，控制台生命周期单独归 console——
+// 否则每次启停的「ERROR 控制台停止」会把错误数抬到上百，排障时反而找不到真错误。
+// summary = 运行摘要行；console = 控制台生命周期。
 export function logLineCounts (text) {
   const lines = typeof text === 'string' && text.length > 0 ? text.replace(/\n$/, '').split('\n') : []
   const out = { all: lines.length, issue: 0, error: 0, alert: 0, warn: 0, summary: 0, console: 0 }
   for (const l of lines) {
     if (isIssueLogLine(l)) out.issue += 1
     if (isConsoleLifecycleLine(l)) out.console += 1
-    if (/(^|\s)ERROR\b/.test(l)) out.error += 1
+    if (!isConsoleLifecycleLine(l) && /(^|\s)ERROR\b/.test(l)) out.error += 1
     if (/(^|\s)ALERT\b/.test(l)) out.alert += 1
     if (/(^|\s)WARN\b/.test(l)) out.warn += 1
     if (/total=\d+ dedup=\d+/.test(l)) out.summary += 1
@@ -87,16 +88,18 @@ export function logLineCounts (text) {
   return out
 }
 
-// 日志筛选：mode='issue' 只看异常（不含控制台生命周期）；其余级别模式按行首级别匹配；
-// query 大小写不敏感地做子串匹配。未知 mode 按 all 处理（宽松，不静默吞行）。
+// 日志筛选：mode='issue' 只看异常（不含控制台生命周期）；error 同样排除生命周期——
+// 「错误」是业务错误，不是每次启停的停止记录；query 大小写不敏感地做子串匹配。
+// 未知 mode 按 all 处理（宽松，不静默吞行）。
 // 返回切好的行数组，组件与测试共用同一套「尾部文本 → 行」口径（去末尾空行）。
 export function filterLogLines (text, mode, query) {
   const lines = typeof text === 'string' && text.length > 0 ? text.replace(/\n$/, '').split('\n') : []
   const kw = typeof query === 'string' ? query.trim().toLowerCase() : ''
+  const isError = (l) => !isConsoleLifecycleLine(l) && /(^|\s)ERROR\b/.test(l)
   const pick = mode === 'issue'
     ? isIssueLogLine
     : mode === 'error'
-      ? (l) => /(^|\s)ERROR\b/.test(l)
+      ? isError
       : mode === 'alert'
         ? (l) => /(^|\s)ALERT\b/.test(l)
         : mode === 'summary'
@@ -123,11 +126,13 @@ export function tabFromHash (hash) {
   return m && TAB_KEYS.includes(m[1]) ? m[1] : 'overview'
 }
 
-// 逐轮历史筛选（v3.307）：mode='issue' 只看失败/中断；day='YYYY-MM-DD' 只看当天。
+// 逐轮历史筛选（v3.307）：mode='runs' 只看真实轮次（排除取消留痕）；
+// mode='issue' 只看失败/中断/取消；day='YYYY-MM-DD' 只看当天。
 // 两个条件是交集；空值不过滤。at 为 '' 的崩溃占位在按天筛选时不展示（无法证明日期）。
 export function filterRunItems (items, { mode = 'all', day = '' } = {}) {
   const list = Array.isArray(items) ? items : []
   return list.filter((r) => {
+    if (mode === 'runs' && r.cancelled === true) return false
     if (mode === 'issue' && !(r.interrupted === true || r.cancelled === true || (typeof r.failed === 'number' && r.failed > 0))) return false
     if (typeof day === 'string' && day.length === 10) {
       if (typeof r.at !== 'string' || r.at.slice(0, 10) !== day) return false
