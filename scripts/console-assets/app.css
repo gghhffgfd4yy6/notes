@@ -452,11 +452,12 @@
     .tpl-row { flex-direction: column; gap: 2px; }
     .tpl-row > span { flex: none; }
     .chan-chip { padding: 5px 10px; }
-    /* 系统/配置的键值表：手机端改为上下两行，值拿满整行，长 URL/路径不再被挤成半行 */
-    .sys-table tr { display: block; padding: 7px 2px; border-bottom: 1px solid var(--border-soft); }
-    .sys-table td { display: block; border-bottom: 0; padding: 0 2px; }
-    .sys-table td:first-child { width: auto; font-size: var(--fs-xs); }
-    .sys-table td:last-child { padding-top: 2px; }
+    /* 空规则折叠按钮是唯一能展开被隐藏规则的入口，手机端触控高度补到 44px（审查 #247） */
+    .cfg-toggle { min-height: 44px; }
+    /* 系统/配置的键值表：保留 table/row/cell 语义（审查 #247：display:block 会把 AX 树的
+       table/row/cell 全部抹掉）。手机端只缩小标签列字号并顶部对齐，长值在单元格内换行。 */
+    .sys-table td { vertical-align: top; }
+    .sys-table td:first-child { font-size: var(--fs-xs); }
     .btn-row { gap: 10px; }
     .btn-item { flex: 1 1 calc(50% - 5px); min-width: 0; }
     .tabs { gap: 4px; }
