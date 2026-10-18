@@ -1883,7 +1883,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 「陈旧可抢」，acquireLock 却对新鲜损坏帧 fail-closed，两处结论相反）。
         if (lockBody && lockBody.released !== true && !(Number.isSafeInteger(lockBody.startedAt) && lockBody.startedAt > 0)) corrupted = true
         if (corrupted) {
-          let mtimeAge = PROC_TIMEOUT_MS
+          let mtimeAge
           try { mtimeAge = Math.max(0, Date.now() - fs.statSync(lp).mtimeMs) } catch (e2) { mtimeAge = PROC_TIMEOUT_MS }
           const held = mtimeAge <= PROC_TIMEOUT_MS
           st.lock = {

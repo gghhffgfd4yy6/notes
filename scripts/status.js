@@ -229,8 +229,6 @@ function classifyRoundFailures (lines, summaryAt) {
 function parseLastRun (read) {
   if (read.status !== 'ok') return { status: read.status }
   const lines = read.value.trim().split('\n').filter(Boolean)
-  let summaryAt = null
-  let classified = null
   for (let i = lines.length - 1; i >= 0; i--) {
     // 行首锚定：摘要行只可能是「时间戳（本地 YYYY-MM-DD HH:MM:SS 或历史 ISO）+ total=」或裸 total=，
     // 避免 ERROR/ALERT 行文本里恰好含 total=… 子串时被误取。
@@ -241,10 +239,10 @@ function parseLastRun (read) {
     // 与 parseDiagnostics 同口径：六项计数必须是非负安全整数（超长数字经 Number 得 Infinity/超界，直接跳过该行）
     const counters = match.slice(2, 8).map(Number)
     if (!counters.every(validCounter)) continue
-    if (!summaryAt) {
-      summaryAt = summaryIndexOf(lines)
-      classified = classifyRoundFailures(lines, summaryAt)
-    }
+    // 找到最近一条完整摘要就返回，循环不会进入第二次——归属表可以在这里一次性构建
+    // （CodeQL: 旧写法的 !summaryAt 条件恒真，属死分支）。
+    const summaryAt = summaryIndexOf(lines)
+    const classified = classifyRoundFailures(lines, summaryAt)
     // 与 readRunHistory 同一归属口径：只标「本条摘要自己的轮」是否中断；其后的无主失败行
     // 单独计数上报（旧实现把尾部任意 ERROR 回填给本条摘要 ⇒ 与运行历史结论相反）。
     let orphanFailures = 0
@@ -689,6 +687,9 @@ function messagesFileName (filename) {
 
 function messagesSignature (dir, filename, maxBytes) {
   try {
+    // filename 已由 messagesFileName() 归一为 basename（无目录成分/无 ..）；Semgrep 的
+    // taint 规则不跟自定义 sanitizer，这里显式豁免（Codacy 误报）。
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal
     const st = fs.statSync(path.join(dir, messagesFileName(filename)))
     if (!st.isFile() || st.size > maxBytes) return null
     if (Date.now() - st.mtimeMs < MESSAGES_CACHE_MIN_AGE_MS) return null
