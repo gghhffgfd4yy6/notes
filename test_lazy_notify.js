@@ -13,6 +13,9 @@ const { execFileSync } = require('child_process')
 // 所以用仓库内临时目录，跑完即删。
 const probeCacheDir = path.join(__dirname, `.tmp-lazy-notify-${process.pid}`)
 fs.mkdirSync(probeCacheDir, { recursive: true })
+// 断言失败会直接抛到顶层退出；最终一行 rmSync 只在全绿时执行。挂 exit 钩子保证
+// 失败/中断路径也清理仓库内临时目录，不留 .tmp-lazy-notify-<pid>。
+process.on('exit', () => fs.rmSync(probeCacheDir, { recursive: true, force: true }))
 
 const probe = String.raw`
 'use strict';
