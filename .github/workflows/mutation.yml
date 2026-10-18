@@ -276,7 +276,7 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 2298 行（历史实测 2678 变异体）：变异评估成本 ≈ 变异体数 × 13.3s（C=8，历史
+          # console.js 2302 行（历史实测 2678 变异体）：变异评估成本 ≈ 变异体数 × 13.3s（C=8，历史
           # 成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）⇒ 整段 ≈ 594min、
           # 两片各 ≈ 297min 都逼近/超过 step 330min 上限（前两轮整段各 330min 被杀即此因，不是挂死）。
           # 按上限倒推取 5 片（各 ~536 体 ≈ 120-180min，含新测试更慢的余量）。
@@ -299,7 +299,7 @@ jobs:
             config: "stryker.tap.config.js"
           - name: console-part5
             src: "scripts/console.js"
-            mutate: "scripts/console.js:1713-2298"
+            mutate: "scripts/console.js:1713-2302"
             config: "stryker.tap.config.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

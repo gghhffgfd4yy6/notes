@@ -2194,6 +2194,64 @@ async function main () {
     assert.strictEqual(r2.items[1].interrupted, true, '同秒失败行必须归属其摘要轮')
     assert.strictEqual(r2.items[0].interrupted, false)
   })
+  await aok('readRunHistory: 尾窗追加后 key 游标仍可翻页（>1MiB 不再永久 stale，审查 D1-S3）', async () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    const filler = '2026-10-15 00:00:00 DEBUG 填充行 ' + 'x'.repeat(120)
+    const lines = []
+    while (Buffer.byteLength(lines.join('\n'), 'utf8') < 1024 * 1024 + 2048) lines.push(filler)
+    for (let i = 0; i < 6; i++) {
+      lines.push(`2026-10-15 1${i}:00:00 total=${i} dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1`)
+    }
+    fs.writeFileSync(path.join(dir, 'run.log'), lines.join('\n') + '\n')
+    const p1 = readRunHistory(dir, { limit: 2 })
+    assert.strictEqual(p1.truncated, true, '1MiB 尾读必须标注 truncated')
+    assert.deepStrictEqual(p1.items.map((x) => x.at), ['2026-10-15 15:00:00', '2026-10-15 14:00:00'])
+    assert.ok(/^[0-9a-f]{8}$/.test(p1.items[1].key), '每条目必须下发 8 位稳定 key')
+    // 追加一行 ⇒ 尾窗整体前移：旧的行号游标 + 旧窗口指纹必须判 stale（数据已错位）
+    fs.appendFileSync(path.join(dir, 'run.log'), '2026-10-15 17:00:00 total=9 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1\n')
+    const stale = readRunHistory(dir, { limit: 2, before: p1.items[1].lineNo - 1, windowKey: p1.windowKey })
+    assert.strictEqual(stale.status, 'stale', '行号游标在尾窗平移后必须 stale')
+    // key 游标按内容定位，追加不改变既有行 → 继续翻页
+    const p2 = readRunHistory(dir, { limit: 2, before: p1.items[1].key })
+    assert.strictEqual(p2.status, 'ok', 'key 游标不得因追加而失效')
+    assert.deepStrictEqual(p2.items.map((x) => x.at), ['2026-10-15 13:00:00', '2026-10-15 12:00:00'])
+    // HTTP 层同样接受 key 游标（前端只改传参，不改端点）
+    const { server } = createConsole({ token: TOKEN, stateDir: dir, runHistoryDir: dir })
+    const port = await listen(server)
+    const http = JSON.parse((await request(port, 'GET', `/api/run-history?limit=2&before=${p1.items[1].key}`, { token: TOKEN })).text)
+    assert.strictEqual(http.status, 'ok')
+    assert.deepStrictEqual(http.items.map((x) => x.at), ['2026-10-15 13:00:00', '2026-10-15 12:00:00'])
+    // 不存在的 key（锚点轮已滚出尾窗）→ stale，前端回第 1 页
+    const gone = readRunHistory(dir, { limit: 2, before: 'deadbeef' })
+    assert.strictEqual(gone.status, 'stale')
+    server.close()
+  })
+  await aok('readRunHistory: 尾窗指纹不因首行为空/超长而退化（审查 D1-N6）', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const summary = '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1'
+    const write = (head) => {
+      const d = tmpDir()
+      fs.writeFileSync(path.join(d, 'run.log'), [head, summary].join('\n') + '\n')
+      return d
+    }
+    const blankA = write('')
+    const blankB = write('\n')
+    const blankC = write('\n\n2026-10-15 10:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=1s cachesaved=1\n')
+    const ka = readRunHistory(blankA, { limit: 1 }).windowKey
+    assert.notStrictEqual(ka, '811c9dc5', '空首行不得退化成常量指纹 811c9dc5')
+    assert.notStrictEqual(readRunHistory(blankB, { limit: 1 }).windowKey, ka,
+      '首个非空行的行序不同（0 vs 1）必须给出不同指纹')
+    assert.notStrictEqual(readRunHistory(blankC, { limit: 1 }).windowKey, ka,
+      '首个非空行内容不同（09:00 vs 10:00）必须给出不同指纹')
+    // 首行 200 字符之后不同：旧实现只哈希前 200 字符，会误判成同一窗口
+    const prefix = 'x'.repeat(240)
+    assert.notStrictEqual(readRunHistory(write(prefix + 'A'), { limit: 1 }).windowKey,
+      readRunHistory(write(prefix + 'B'), { limit: 1 }).windowKey,
+      '首行第 200 字符之后不同也必须区分')
+    assert.ok(/^[0-9a-f]{8}$/.test(ka))
+    assert.strictEqual(readRunHistory(blankC, { limit: 1 }).status, 'ok')
+  })
   await aok('readStatus/readRunHistory: ALERT「运行异常」不把成功轮标中断（审查 D2-M3）', () => {
     const { readStatus, readRunHistory } = require('./scripts/status')
     const dir = tmpDir()
