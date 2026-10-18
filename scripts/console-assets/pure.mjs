@@ -128,7 +128,7 @@ export function tabFromHash (hash) {
 export function filterRunItems (items, { mode = 'all', day = '' } = {}) {
   const list = Array.isArray(items) ? items : []
   return list.filter((r) => {
-    if (mode === 'issue' && !(r.interrupted === true || (typeof r.failed === 'number' && r.failed > 0))) return false
+    if (mode === 'issue' && !(r.interrupted === true || r.cancelled === true || (typeof r.failed === 'number' && r.failed > 0))) return false
     if (typeof day === 'string' && day.length === 10) {
       if (typeof r.at !== 'string' || r.at.slice(0, 10) !== day) return false
     }

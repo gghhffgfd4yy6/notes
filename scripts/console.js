@@ -413,6 +413,7 @@ function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockD
     startedAt: now,
     finishedAt: 0,
     exitedAt: 0, // exit 事件时刻（先于 close：stdout/stderr drain 中已不可取消）
+    closedAt: 0, // close 事件时刻（stdio 全部 drain 完；SSE 只在此后发 done）
     exitCode: null,
     timedOut: false,
     output: '',
@@ -501,6 +502,9 @@ function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockD
   })
   child.on('close', (code) => {
     // 剩余清理：exit 未触发的极端路径（spawn error 后仅 close）在这里补收尾；幂等。
+    // closedAt 必须先于 finishRun：SSE 的 done 以「stdio 已 drain」为准，exit 时提前
+    // 发 done 会丢掉 exit 后、close 前到达的尾段输出（Sourcery SSE 丢最后一段日志）。
+    record.closedAt = Date.now()
     finishRun(record, code)
     if (record.exitCode === null && Number.isInteger(code)) record.exitCode = code
     if (activeChildren) activeChildren.delete(child)
@@ -904,7 +908,7 @@ function renderUnauthorizedPage () {
 <body><main>
   <h1>需要访问令牌</h1>
   <p>会话未携带有效凭证（链接可能来自聊天/书签，或 Cookie 已过期）。输入部署时设置的 <code>XBK_CONSOLE_TOKEN</code> 继续。</p>
-  <form method="get" action="/">
+  <form method="post" action="/login">
     <label for="token">访问令牌（至少 16 字符）</label>
     <input id="token" name="token" type="password" autocomplete="current-password" minlength="16" required autofocus>
     <button type="submit">打开控制台</button>
@@ -1446,13 +1450,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 运行历史目录（审查 #241 S1）：run.log 的写入方是运行侧 MessageStore.cacheDir，而控制台
   // stateDir 可能因配置/注入与之不同。读取历史、spawn 子进程（决定它把 run.log 写哪）、
   // 停止留痕三处必须同源，否则 Config.cache.dir 漂移时 cron 轮次从历史里消失（无提示）。
-  // 优先级：显式注入 runHistoryDir（测试/嵌入）→ 运行侧真实解析 → stateDir。
-  // 解析结果按进程缓存：Config 在进程启动时定型，没必要每个请求 require 一次。
-  let cachedRuntimeDir
+  // 运行产物目录：显式 runHistoryDir（测试/嵌入）> 调用方注入的 stateDir。
+  // 生产 main 传入的 stateDir 就是 consoleStateDir()（与运行侧 MessageStore.cacheDir 同源），
+  // 因此这里不能再优先全局 runtimeCacheDir——嵌入式实例传了隔离 stateDir 时会被绕过，
+  // 读状态用 A、跑子进程写 B（Sourcery 注入目录被忽略）。
   const historyDir = () => {
-    if (runHistoryDir) return runHistoryDir
-    if (cachedRuntimeDir === undefined) cachedRuntimeDir = runtimeCacheDir()
-    return cachedRuntimeDir || stateDir
+    return runHistoryDir || stateDir
   }
   // 锁归属 token：调用方传入（main 生成，SIGTERM 释放时须双匹配）；未传则随机。
   // 测试可直接传固定值断言锁内容。
@@ -1582,8 +1585,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         : `data: ${JSON.stringify(plan.text)}\n\n`
       sseWriteFrame(conn, frame)
       conn.cursor = plan.cursor
-    } else if (record.finishedAt && !conn.paused) {
+    } else if (record.closedAt && !conn.paused) {
       // 完结且增量发完 → done + res.end()（蓝图 done 条件②；①淘汰在上分支）。
+      // 用 closedAt 而不是 finishedAt：exit 先到、stdio 还在 drain 时不能发 done，
+      // 否则 close 前最后一段输出无处可去（Sourcery SSE 尾段丢失）。
       // !conn.paused 守卫（蕴含 pending 空）：背压未恢复前不发 done——否则帧入 pending
       // 后被 teardown 丢弃，客户端收 RST 而非 done。暂停中则下轮 tick（drain 后）再发。
       sseWriteFrame(conn, 'event: done\ndata: {}\n\n')
@@ -1699,6 +1704,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // startAction 同步抛（spawn 资源极端，Sourcery Medium）：回滚重放帧与锁，
           // 让用户可重试，而不是被卡到陈旧接管。恢复 pending 前值语义同落盘失败分支。
           lastAccept.delete(action)
+          // 关键：pending 帧已落盘（runId=0），只删内存会让下一次请求重读旧帧 → 整个
+          // 重放窗都 409「重复提交」，但实际没有子进程跑过。这里把删除后的 Map 重新落盘；
+          // 落盘失败只能告警（内存已回滚，本进程内可重试，重启后可能重现 409）。
+          try {
+            fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
+          } catch (persistErr) {
+            console.error(`⚠️ ${action} 启动失败后清理重放帧失败：${persistErr && persistErr.message ? persistErr.message : persistErr}`)
+          }
           const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
           if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：锁将保留到陈旧接管（约 10 分钟）。`)
           console.error(`⚠️ ${action} 启动失败（spawn）：${e && e.message ? e.message : e}`)
@@ -1764,6 +1777,32 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         return
       }
       serveStatic(req, res, url.pathname, STATIC_ASSETS[url.pathname])
+      return
+    }
+    // 登录表单只收 POST body（审查 #224 / Sourcery High）：GET 表单会把 token 带进
+    // 地址栏与浏览器历史、Referer 与中间代理日志；POST 校验成功后 303 到干净 `/`，
+    // 只下发 HttpOnly Cookie。直接打开 `?token=` 的分享链接仍兼容（见下方 authorize）。
+    if (req.method === 'POST' && url.pathname === '/login') {
+      readBody(req, 2048).then(({ body, aborted, over }) => {
+        if (aborted || over) {
+          sendJson(res, over ? 413 : 400, { error: over ? '登录请求过大' : '登录请求不完整' })
+          return
+        }
+        const submitted = new URLSearchParams(body).get('token') || ''
+        if (!timingSafeEqualStr(submitted, token)) {
+          res.setHeader('Content-Security-Policy', CSP_HEADER)
+          res.setHeader('Cache-Control', 'no-store')
+          res.setHeader('X-Content-Type-Options', 'nosniff')
+          res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end(renderUnauthorizedPage())
+          return
+        }
+        res.setHeader('Set-Cookie',
+          `xbk_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400`)
+        res.setHeader('Cache-Control', 'no-store')
+        res.writeHead(303, { Location: '/' })
+        res.end()
+      }).catch(() => sendJson(res, 400, { error: '登录请求读取失败' }))
       return
     }
     if (!authorize(req, token, url.searchParams)) {
@@ -1975,9 +2014,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         queryUsed: query,
         // baseUrl：相对 url 的拼接前缀（= 生产 Config.domain，去尾斜杠），前端不再硬编码
         baseUrl: sourceDomain(),
-        // 时间窗：0=全部；>0 时 categories 也只统计窗口内条目（筛选器计数要跟手）
+        // 时间窗：0=全部；>0 时 categories 也只统计窗口内条目（筛选器计数要跟手）。
+        // 搜索词同样要参与分类计数：否则「搜某某」后仍显示全量分类条数，点进去是空的
+        // （Sourcery 分类计数忽略搜索）。
         days,
-        categories: days > 0 ? messageCategoriesOf(windowed) : read.value.categories,
+        categories: needle.length > 0
+          ? messageCategoriesOf(filterMessageItems(days > 0 ? windowed : read.value.items, '', needle))
+          : (days > 0 ? messageCategoriesOf(windowed) : read.value.categories),
         items: pageItems
       })
       return

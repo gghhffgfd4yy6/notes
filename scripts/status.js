@@ -33,7 +33,12 @@ const LOG_READ_OPTIONS = { tail: true }
 
 function readText (dir, name, maxBytes = LOG_MAX_BYTES, options) {
   const safe = readSafeTextResult(path.join(dir, name), maxBytes, options)
-  return safe.status === 'ok' ? result('ok', safe.text) : result(safe.status)
+  if (safe.status !== 'ok') return result(safe.status)
+  const out = result('ok', safe.text)
+  // 尾部窗口读取（run.log 超过 1 MiB）会切掉更早行：调用方要能区分「没有旧轮」与
+  // 「旧轮被窗口截掉」，统计/运行历史据此标注不完整（Sourcery 统计少算旧摘要）。
+  if (safe.truncated === true) out.truncated = true
+  return out
 }
 
 function validCounter (value) {
@@ -192,14 +197,17 @@ function classifyRoundFailures (lines, summaryAt) {
         if (summaryAt.has(i + d)) best = { j: i + d, gap: 0 }
       }
     } else {
-      for (let d = 1; d <= ROUND_FAILURE_NEAR_LINES && !best; d++) {
-        for (const j of [i - d, i + d]) {
+      // 同距时优先「其后的摘要」：生产写序是失败行 → 本轮摘要，前一条摘要属于上一轮。
+      // 必须把所有 ≤2 行的候选都算完再取最小 Δt，不能找到第一个就停——两轮交错写日志时，
+      // 1 行外的上一条摘要可能比 2 行外的本轮摘要更远（Sourcery 失败归属错轮）。
+      for (let d = 1; d <= ROUND_FAILURE_NEAR_LINES; d++) {
+        for (const j of [i + d, i - d]) {
           if (!summaryAt.has(j)) continue
           const st = summaryAt.get(j)
           if (st === null) continue
           const gap = Math.abs(st - t)
           if (gap > ROUND_FAILURE_NEAR_MS) continue
-          if (!best || gap < best.gap) best = { j, gap } // 同距离取时间差更小者
+          if (!best || gap < best.gap) best = { j, gap }
         }
       }
       if (!best) {
@@ -283,7 +291,9 @@ function parseRunStats (read, now = Date.now()) {
     const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
     if (!counters.every(validCounter)) continue
     const day = m[1]
-    if (!day || day < weekStartKey) continue
+    // 只统计 [本周起点, 今天]：未来日期（时钟回拨/手写 fixture/坏摘要）会把周汇总和
+    // lastFailure 一起推高（Sourcery 未来摘要污染周统计）。
+    if (!day || day < weekStartKey || day > todayKey) continue
     week.rounds += 1
     week.total += counters[0]
     week.pushed += counters[4]
@@ -302,7 +312,10 @@ function parseRunStats (read, now = Date.now()) {
   return result('ok', {
     today: { ...today, successRate: rate(today.pushed, today.failed) },
     week: { ...week, successRate: rate(week.pushed, week.failed) },
-    lastFailure
+    lastFailure,
+    // 尾部 1 MiB 窗口外可能还有本日/本周摘要：true 时前端必须标注「仅统计日志尾部」，
+    // 不得把少算的总数当完整数据展示。
+    truncated: read.truncated === true
   })
 }
 

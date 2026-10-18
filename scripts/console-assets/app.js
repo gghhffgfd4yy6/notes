@@ -494,14 +494,17 @@ function AlertBanner ({ state, onOpenLog }) {
   const run = state.run && state.run.value ? state.run.value : null
   const stats = state.stats && state.stats.status === 'ok' ? state.stats.value : null
   const lastFail = stats ? stats.lastFailure : null
-  const runBad = !!(run && (run.interrupted === true || (typeof run.failed === 'number' && run.failed > 0)))
+  const orphan = run && typeof run.orphanFailures === 'number' ? run.orphanFailures : 0
+  const runBad = !!(run && (run.interrupted === true || (typeof run.failed === 'number' && run.failed > 0) || orphan > 0))
   if (!runBad && !lastFail) return null
-  const at = runBad && run.at ? run.at : (lastFail ? lastFail.at : '')
-  const text = runBad
-    ? (run.failed > 0
-        ? `最近一轮推送失败 ${run.failed} 条（${run.at || '时间未知'}）`
-        : `最近一轮异常中断（${run.at || '时间未知'}）`)
-    : `近 7 天有失败：${lastFail.date} 推送失败 ${lastFail.failed} 条`
+  const at = orphan > 0 && run.orphanFailureAt ? run.orphanFailureAt : (runBad && run.at ? run.at : (lastFail ? lastFail.at : ''))
+  const text = orphan > 0 && !(run && (run.interrupted === true || run.failed > 0))
+    ? `运行日志有 ${orphan} 条失败行未归属任何轮次（独立崩溃，最近 ${run.orphanFailureAt || '时间未知'}）`
+    : (runBad
+        ? (run.failed > 0
+            ? `最近一轮推送失败 ${run.failed} 条（${run.at || '时间未知'}）`
+            : `最近一轮异常中断（${run.at || '时间未知'}）`)
+        : `近 7 天有失败：${lastFail.date} 推送失败 ${lastFail.failed} 条`)
   return html`<div class="alert-banner" role="alert">
     <span class="alert-dot" aria-hidden="true"></span>
     <span class="alert-text">${text}</span>
@@ -523,7 +526,7 @@ function StatusCards ({ state }) {
   const stats = state.stats && state.stats.status === 'ok' ? state.stats.value : null
   const today = stats ? stats.today : null
   const week = stats ? stats.week : null
-  const diag = (diagCard(state) || [])[0] || null
+  const diag = diagCard(state)[0] || null
   const diagTone = diag ? diag.tone : 'run'
   const diagLines = diag ? diag.lines : ['暂无记录']
   const repRel = rep ? relDay(rep.date) : ''
@@ -551,7 +554,8 @@ function StatusCards ({ state }) {
         ? [
             `轮次 ${week.rounds} · 推送 ${week.pushed}`,
             `失败 ${week.failed} · 成功率 ${rateText(week)}`,
-            `日均 ${(week.rounds / 7).toFixed(1)} 轮`
+            `日均 ${(week.rounds / 7).toFixed(1)} 轮`,
+            ...(stats && stats.truncated ? ['⚠️ run.log 超窗，统计仅覆盖尾部'] : [])
           ]
         : ['暂无数据']
     },
@@ -618,12 +622,16 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, 
   </div>`
 }
 
-function TriggerBar ({ onTriggered, locking, setBusy, state }) {
+function TriggerBar ({ onTriggered, locking, setBusy }) {
   const [err, setErr] = useState('')
   // 待确认的真实推送动作（null = 无弹窗）；dry-run/check 不弹窗，直接执行。
   const [pending, setPending] = useState(null)
-  const chan = channelInfo(state)
-  const channelText = chan.entries.length > 0 ? chan.entries.map((e) => e.name).join('、') : '未配置任何渠道'
+  // 确认框里的渠道名必须来自「当前配置」，不能拿 channel-health 历史凑数——配置改过之后
+  // 历史里可能是已删除的渠道（Sourcery 确认框列错渠道）。null = 还没拉到，用模糊文案。
+  const [configuredNames, setConfiguredNames] = useState(null)
+  const channelText = Array.isArray(configuredNames)
+    ? (configuredNames.length > 0 ? configuredNames.join('、') : '未配置任何渠道')
+    : '所有已配置渠道（以「配置」页为准）'
   const doTrigger = useCallback(async (action) => {
     setErr('')
     setBusy(true)
@@ -658,8 +666,15 @@ function TriggerBar ({ onTriggered, locking, setBusy, state }) {
   const ask = (action) => {
     setErr('')
     // 只有真实推送需要确认；试运行与环境检查立即执行
-    if (action === 'run' || action === 'notify-test') setPending(action)
-    else doTrigger(action)
+    if (action === 'run' || action === 'notify-test') {
+      setPending(action)
+      setConfiguredNames(null)
+      // 配置页同源接口（脱敏）：只取渠道名，取不到就退回模糊文案，绝不猜。
+      apiGetConfig().then((v) => {
+        const names = v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : []
+        setConfiguredNames(names)
+      }).catch(() => setConfiguredNames(null))
+    } else doTrigger(action)
   }
   const confirmPending = () => {
     const action = pending
@@ -986,7 +1001,7 @@ function RunHistoryPanel ({ onOpenLog }) {
       <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
       <tbody>
         ${shown.map((r, i) => html`<tr key=${`${r.at}-${r.lineNo}-${i}`}>
-          <td class="mono">${r.interrupted ? `${r.at || '—'} ⚠️中断` : (r.at || '—')}</td>
+          <td class="mono">${r.cancelled === true ? `${r.at || '—'} ⏹已取消` : r.interrupted ? `${r.at || '—'} ⚠️中断` : (r.at || '—')}</td>
           <td>${r.total === null ? '—' : r.total}</td>
           <td>${r.dedup === null ? '—' : r.dedup}</td>
           <td>${r.filtered === null ? '—' : r.filtered}</td>
@@ -1105,7 +1120,7 @@ function TrendsPanel () {
 // 进概览页拉一次 + 手动刷新，不进 5s 主轮询（墓碑解析最坏 8MiB，不与状态轮询抢盘）。
 // 条数维度：服务端在响应里附带 entryCount（readMessageCount，与 /api/messages 同一
 // 32MiB 封顶与防御；tooLarge 时 null 如实显示），对照 limits.entryMax 预警。
-function CacheHealthPanel () {
+function CacheHealthPanel ({ paused = false }) {
   const { data, err, load } = usePanelLoader(apiGetCacheHealth)
   // 右列状态文件（v3.307）：缓存健康面板原来只占左半 451px，右边 460px 空白；
   // 系统页的「缓存目录文件」在这里给一份紧凑版（前 8 项），整页仍保留全量清单。
@@ -1114,11 +1129,12 @@ function CacheHealthPanel () {
   // 缓存健康随概览常开：每分钟（且切回前台时）重拉一次，避免「页面开着过夜、mtime 早已更新
   // 但面板还拿着旧快照」；1 分钟一次只读小 JSON，不与 5s 主轮询抢盘。
   useEffect(() => {
+    if (paused) return undefined
     const t = setInterval(() => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }, 60000)
     const onVis = () => { if (document.visibilityState === 'visible') load().catch(() => {}) }
     document.addEventListener('visibilitychange', onVis)
     return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVis) }
-  }, [load])
+  }, [load, paused])
   const ok = data && data.status === 'ok'
   const ratioText = ok && data.writeRatio != null ? `${(data.writeRatio * 100).toFixed(1)}%` : '—'
   const tomb = data && data.tombstone ? data.tombstone : null
@@ -2065,23 +2081,23 @@ function App () {
         onClick=${() => { if (t.key === 'logs') setLogJump(null); switchTab(t.key) }}>${t.label}</button>`)}
     </nav>
 
-    ${tab === 'overview' && html`<div>
+    ${!authExpired && tab === 'overview' && html`<div>
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} />
-      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} state=${state} />
-      ${locking && html`<${RunsPanel} runs=${runs} pollMs=${pollMs} onRefresh=${refreshSplit} />`}
+      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
+      ${locking && html`<${RunsPanel} runs=${runs} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />`}
       <${TrendsPanel} />
       <${RunHistoryPanel} onOpenLog=${openLog} />
-      <${CacheHealthPanel} />
+      <${CacheHealthPanel} paused=${!autoRefresh} />
     </div>`}
-    ${tab === 'messages' && html`<${MessagesPanel} />`}
-    ${tab === 'logs' && html`<div>
-      ${runs.length > 0 && html`<${RunsPanel} runs=${runs} pollMs=${pollMs} onRefresh=${refreshSplit} />`}
-      <${LogsPanel} key=${logJump ? logJump.n : 'base'} pollMs=${locking ? POLL_BUSY_MS : 0}
+    ${!authExpired && tab === 'messages' && html`<${MessagesPanel} />`}
+    ${!authExpired && tab === 'logs' && html`<div>
+      ${runs.length > 0 && html`<${RunsPanel} runs=${runs} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />`}
+      <${LogsPanel} key=${logJump ? logJump.n : 'base'} pollMs=${autoRefresh && locking ? POLL_BUSY_MS : 0}
         initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} />
     </div>`}
-    ${tab === 'config' && html`<${ConfigPanel} />`}
-    ${tab === 'sys' && html`<div>
+    ${!authExpired && tab === 'config' && html`<${ConfigPanel} />`}
+    ${!authExpired && tab === 'sys' && html`<div>
       <${SysPanel} />
       <${FilesPanel} />
     </div>`}

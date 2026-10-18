@@ -838,7 +838,21 @@ async function main () {
     assert.strictEqual(unauth.status, 401, '未授权 GET / 回 401')
     assert.match(unauth.headers['content-type'], /text\/html/, '未授权首屏必须是 HTML')
     assert.ok(unauth.text.includes('需要访问令牌'), '登录页含标题')
-    assert.ok(unauth.text.includes('<form method="get" action="/">'), '登录页含 token 表单')
+    assert.ok(unauth.text.includes('<form method="post" action="/login">'), '登录页必须用 POST 表单（token 不进地址栏）')
+    // POST /login：正确 token → 303 到干净 `/` + Cookie；错误 token → 401 仍是登录页。
+    const loginOk = await request(port, 'POST', '/login', {
+      body: `token=${encodeURIComponent(TOKEN)}`,
+      headers: { 'content-type': 'application/x-www-form-urlencoded' }
+    })
+    assert.strictEqual(loginOk.status, 303)
+    assert.strictEqual(loginOk.headers.location, '/')
+    assert.ok(String(loginOk.headers['set-cookie']).includes('HttpOnly'), 'POST 登录必须下发 HttpOnly Cookie')
+    const loginBad = await request(port, 'POST', '/login', {
+      body: 'token=wrong-token-000000',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' }
+    })
+    assert.strictEqual(loginBad.status, 401)
+    assert.match(loginBad.headers['content-type'], /text\/html/, '错误凭证仍回登录页')
     assert.ok(!unauth.text.includes('{"error":"unauthorized"}'), '不得回裸 JSON')
     // Sourcery G_4Kk：资产 URL 不再拼 tokenSuffix（Cookie 通道已覆盖，URL 零凭证重复）
     assert.ok(!page.text.includes('/assets/app.css?token='), '资产 URL 不含 ?token=')
@@ -1133,6 +1147,8 @@ async function main () {
     const q = JSON.parse((await request(port, 'GET', `/api/messages?q=${encodeURIComponent('牛奶')}`, { token: TOKEN })).text)
     assert.strictEqual(q.total, 1)
     assert.strictEqual(q.items[0].id, 1)
+    assert.deepStrictEqual(q.categories, [{ name: '好单-日用', count: 1 }],
+      '分类计数必须跟随搜索词，不能继续显示全量分类')
     // 分类精确匹配
     const c = JSON.parse((await request(port, 'GET', `/api/messages?cate=${encodeURIComponent('好单-家用')}`, { token: TOKEN })).text)
     assert.strictEqual(c.total, 1)
@@ -1992,6 +2008,7 @@ async function main () {
     const rec = makeStreamRecord('1750000000000.9')
     streamAppend(rec, '最终输出')
     rec.finishedAt = Date.now()
+    rec.closedAt = Date.now()
     runs.set('1750000000000.9', rec)
     const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9', { headers: { authorization: `Bearer ${TOKEN}` } }) // 无 since → cursor=total
     assert.strictEqual(await sse.waitFor((e) => e.event === 'done'), true, '收到 done 帧')
@@ -2306,7 +2323,7 @@ async function main () {
       assert.ok(/startAction\(action, now, activeChildren, historyDir\(\), runToken, stateDir\)/.test(src),
         'spawn 必须把 historyDir() 传给子进程（否则 run.log 写不到历史读取目录）')
       assert.ok(src.includes('const stopDir = historyDir()'), '停止留痕必须写历史读取目录')
-      assert.ok(/const historyDir = \(\) => \{/.test(src), '读取/写入/停止留痕三处必须同源 historyDir()')
+      assert.ok(src.includes('const historyDir = () => {'), '读取/写入/停止留痕三处必须同源 historyDir()')
       assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得各自手写运行侧目录解析')
       assert.ok(src.includes('CANCEL 控制台停止：任务 #'), '取消留痕必须用独立 CANCEL 前缀')
       assert.ok(!src.includes('ERROR 控制台停止：任务 #'), '不得再写 ERROR（会被当成轮失败）')
@@ -2413,22 +2430,31 @@ async function main () {
     assert.strictEqual(r.items[0].interrupted, false, '取消留痕不得把下一轮标成中断')
     assert.strictEqual(r.items[2].interrupted, false, '也不得把上一轮标成中断')
   })
-  await aok('createConsole: run-history 读取回退到运行侧缓存目录（Config.cache.dir 漂移，审查 #241 S1）', async () => {
+  await aok('createConsole: 注入 stateDir 优先于全局缓存；显式 runHistoryDir 可覆盖（Sourcery 注入目录被绕过）', async () => {
     const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtime-dir-'))
     const state = tmpDir()
     fs.writeFileSync(path.join(runtime, 'run.log'),
       '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1\n')
+    fs.writeFileSync(path.join(state, 'run.log'),
+      '2026-10-15 09:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=1s cachesaved=1\n')
     const prev = process.env.XBK_CACHE_DIR
     process.env.XBK_CACHE_DIR = runtime
     try {
-      // 不传 runHistoryDir：stateDir 里没有 run.log，历史必须回退到运行侧真实目录
-      const { server } = createConsole({ token: TOKEN, stateDir: state })
-      const port = await listen(server)
-      const r = JSON.parse((await request(port, 'GET', '/api/run-history', { token: TOKEN })).text)
-      assert.strictEqual(r.status, 'ok')
-      assert.strictEqual(r.items.length, 1, '必须从运行侧缓存目录读到 cron 轮次（旧实现读 stateDir ⇒ 空）')
-      assert.strictEqual(r.items[0].pushed, 1)
-      server.close()
+      // 注入 stateDir 的嵌入式实例：即使 XBK_CACHE_DIR 指向别处，也必须读自己的 stateDir。
+      const a = createConsole({ token: TOKEN, stateDir: state })
+      const portA = await listen(a.server)
+      const ra = JSON.parse((await request(portA, 'GET', '/api/run-history', { token: TOKEN })).text)
+      assert.strictEqual(ra.status, 'ok')
+      assert.strictEqual(ra.items.length, 1)
+      assert.strictEqual(ra.items[0].pushed, 2, '注入 stateDir 必须优先，不能被全局运行目录覆盖')
+      a.server.close()
+      // 显式 runHistoryDir 仍是最高优先级（生产/测试需要「状态与运行产物分居」时用）。
+      const b = createConsole({ token: TOKEN, stateDir: state, runHistoryDir: runtime })
+      const portB = await listen(b.server)
+      const rb = JSON.parse((await request(portB, 'GET', '/api/run-history', { token: TOKEN })).text)
+      assert.strictEqual(rb.items.length, 1)
+      assert.strictEqual(rb.items[0].pushed, 1, 'runHistoryDir 必须覆盖 stateDir')
+      b.server.close()
     } finally {
       if (prev === undefined) delete process.env.XBK_CACHE_DIR
       else process.env.XBK_CACHE_DIR = prev
@@ -3275,10 +3301,11 @@ async function main () {
     const runs = [
       { at: '2026-10-14 10:00:00', failed: 3, interrupted: false },
       { at: '2026-10-15 10:00:00', failed: 0, interrupted: true },
+      { at: '2026-10-15 11:00:00', failed: 0, interrupted: false, cancelled: true },
       { at: '', failed: 0, interrupted: false }
     ]
-    assert.strictEqual(filterRunItems(runs, { mode: 'issue' }).length, 2, '失败/中断都算 issue')
-    assert.deepStrictEqual(filterRunItems(runs, { day: '2026-10-15' }).map((r) => r.at), ['2026-10-15 10:00:00'])
+    assert.strictEqual(filterRunItems(runs, { mode: 'issue' }).length, 3, '失败/中断/取消都算 issue')
+    assert.deepStrictEqual(filterRunItems(runs, { day: '2026-10-15' }).map((r) => r.at), ['2026-10-15 10:00:00', '2026-10-15 11:00:00'])
     assert.strictEqual(filterRunItems(runs, { mode: 'issue', day: '2026-10-14' }).length, 1, '筛选取交集')
     assert.strictEqual(filterRunItems(null, { mode: 'issue' }).length, 0)
   })
@@ -3286,7 +3313,7 @@ async function main () {
   await aok('结构红线: v3.307 确认弹窗 / 今日统计 / 时间窗 / 日志级别 / hash 路由', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function ConfirmDialog'), '危险动作必须有确认弹窗')
-    assert.ok(src.includes("if (action === 'run' || action === 'notify-test') setPending(action)"),
+    assert.ok(src.includes("if (action === 'run' || action === 'notify-test') {"),
       '正式运行与通知自检必须走确认；试运行/环境检查直接执行')
     assert.ok(src.includes("cls: 'btn-danger-solid'"), '正式运行必须是红色危险按钮')
     assert.ok(src.includes('role="dialog"') && src.includes('aria-modal="true"'), '弹窗必须有无障碍语义')
@@ -3312,8 +3339,8 @@ async function main () {
 
   await aok('结构红线: 概览先状态与操作，空触发历史不占位（运行中仍显示）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
-    const start = src.indexOf("${tab === 'overview' && html`<div>")
-    const end = src.indexOf("${tab === 'messages'", start)
+    const start = src.indexOf("${!authExpired && tab === 'overview' && html`<div>")
+    const end = src.indexOf("${!authExpired && tab === 'messages'", start)
     assert.ok(start > -1 && end > start, '应能定位概览区块')
     const seg = src.slice(start, end)
     const order = ['AlertBanner', 'StatusCards', 'TriggerBar', 'TrendsPanel', 'RunHistoryPanel', 'CacheHealthPanel'].map((n) => seg.indexOf(n))

@@ -512,6 +512,21 @@ try {
     assert.strictEqual(h.items[0].isPlaceholder, false)
   })
 
+  test('S28 失败行落在前后摘要等距窗口时归后一条（生产写序：失败 → 本轮摘要）', () => {
+    const dir = scratch('s28')
+    put(dir, 'run.log', [
+      '2026-09-08 09:59:59 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s',
+      '2026-09-08 10:00:00 ERROR 推送全部失败 3 条（通道可能失效）',
+      '2026-09-08 10:00:01 total=3 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=1s'
+    ].join('\n') + '\n')
+    const h = readRunHistory(dir, { limit: 10 })
+    assert.strictEqual(h.items.length, 2)
+    assert.strictEqual(h.items[0].at, '2026-09-08 10:00:01')
+    assert.strictEqual(h.items[0].interrupted, true, '等距时必须归后一条摘要')
+    assert.strictEqual(h.items[1].at, '2026-09-08 09:59:59')
+    assert.strictEqual(h.items[1].interrupted, false, '前一条不得被误标')
+  })
+
   test('S26 同内容摘要行的游标 key 唯一：翻页不再返回同一页（B0-4 死循环回归）', () => {
     const dir = scratch('s26')
     const line = '2026-09-08 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s'
@@ -527,6 +542,28 @@ try {
     // 首次出现仍保留裸 8 位 key（旧游标兼容）
     const first = readRunHistory(dir, { limit: 1, before: p1.items[1].key })
     assert.strictEqual(first.status, 'ok')
+  })
+
+  test('S27 未来日期摘要不进入周统计 / 尾部超窗时 stats.truncated 如实上报', () => {
+    const dir = scratch('s27')
+    put(dir, 'run.log', [
+      '2026-09-08 10:00:00 total=10 dedup=0 filtered=0 truncated=0 pushed=10 failed=0 elapsed=1s',
+      '2099-01-01 10:00:00 total=999 dedup=0 filtered=0 truncated=0 pushed=999 failed=9 elapsed=1s'
+    ].join('\n') + '\n')
+    const st = readStatus(dir, { now: NOW }).stats
+    assert.strictEqual(st.status, 'ok')
+    assert.strictEqual(st.value.today.rounds, 1)
+    assert.strictEqual(st.value.today.pushed, 10, '未来摘要不得灌入今日/本周')
+    assert.strictEqual(st.value.week.rounds, 1)
+    assert.strictEqual(st.value.lastFailure, null, '未来失败不得成为 lastFailure')
+
+    // 1 MiB 尾部窗口只保留最后一段：stats 必须标注 truncated，而不是假装总数完整。
+    const big = scratch('s27-big')
+    put(big, 'run.log', 'x'.repeat(1100 * 1024) + '\n' +
+      '2026-09-08 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s\n')
+    const tail = readStatus(big, { now: NOW }).stats
+    assert.strictEqual(tail.status, 'ok')
+    assert.strictEqual(tail.value.truncated, true, '尾部截断必须显式上报')
   })
 
   console.log(`test_status_report OK (${failed === 0 ? '全部通过' : failed + ' 项失败'})`)
