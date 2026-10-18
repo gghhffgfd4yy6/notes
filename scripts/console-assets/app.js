@@ -563,7 +563,7 @@ function StatusCards ({ state }) {
       tone: chanTone,
       lines: [
         ...(chan.entries.length > 0
-          ? chan.entries.map((e) => `${e.name}：连续失败 ${fmtNum(e.failures)} 次`)
+          ? [...chan.entries.map((e) => `${e.name}：连续失败 ${fmtNum(e.failures)} 次`), ...(chan.note ? [chan.note] : [])]
           : [chan.note || '暂无记录']),
         ...diagLines.map((l) => `过滤：${l}`)
       ]
@@ -900,7 +900,7 @@ const RUN_PAGE_SIZES = [2, 3, 5, 10]
 const RUN_FETCH_LIMIT = 200
 
 function RunHistoryPanel ({ onOpenLog }) {
-  const [size, setSize] = useState(5)
+  const [size, setSize] = useState(10)
   const [mode, setMode] = useState('all')
   const [day, setDay] = useState('')
   const [pageNo, setPageNo] = useState(1)
@@ -1487,6 +1487,11 @@ function MessagesPanel () {
   }, [exporting, cate, query, days])
   const items = data && Array.isArray(data.items) ? data.items : []
   const categories = data && Array.isArray(data.categories) ? data.categories : []
+  // 分类弹层的「全部分类」计数必须跟时间窗走（服务端 days>0 时 categories 已按窗口重算）；
+  // 直接用 grandTotal 会在「今天」里显示全量 374，看起来像筛选没生效。
+  const cateTotal = data && Array.isArray(data.categories)
+    ? data.categories.reduce((sum, c) => sum + (typeof c.count === 'number' ? c.count : 0), 0)
+    : null
   // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，
   // 但只在「响应确实属于当前查询、且用户没有继续输入」时回写；
   // 否则旧响应会把刚打的新词覆盖回旧值（搜索像没生效）。
@@ -1505,7 +1510,7 @@ function MessagesPanel () {
         onInput=${(e) => setInput(e.target.value)}
         onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); refreshNow() } }} />
       <${CategoryPicker} value=${cate} categories=${categories}
-        total=${data && typeof data.grandTotal === 'number' ? data.grandTotal : null}
+        total=${cateTotal}
         onChange=${(v) => { setCate(v); setPage(1) }} />
       <select class="msg-select" value=${days} onChange=${(e) => { setDays(Number(e.target.value)); setPage(1) }} aria-label="时间范围">
         <option value="0">全部时间</option>
