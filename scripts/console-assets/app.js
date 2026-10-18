@@ -7,7 +7,7 @@
 // 请求头——不复述进 URL，避免出现在任何中间层访问日志/浏览器历史，Sourcery rwH）。
 // 动作面：POST /trigger（token 同样在 Bearer 头；body 只带 action）。
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
-import { html, render, useState, useEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
+import { html, render, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
 import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, filterRunItems, tabFromHash } from './pure.mjs'
 
@@ -363,6 +363,18 @@ function Badge ({ tone, children }) {
     ? 'badge-ok'
     : (tone === 'bad' ? 'badge-bad' : (tone === 'warn' ? 'badge-warn' : 'badge-run'))
   return html`<span class="badge ${cls}">${children}</span>`
+}
+
+// 顶栏倒计时独立持有 1s 时钟：避免 App 每秒重渲染整页（安卓原生 select 会闪）。
+function AutoRefreshText ({ nextAt, pollMs, lastSync }) {
+  const [nowMs, setNowMs] = useState(Date.now())
+  useEffect(() => {
+    // 每秒只重渲染这个文本节点；App 不再持有该时钟。
+    const t = setInterval(() => setNowMs(() => Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [])
+  const remain = Math.max(0, Math.min(Math.ceil(pollMs / 1000), Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000)))
+  return html`${`自动刷新 · ${remain}s`}${lastSync ? ` · ${fmtLocalTime(lastSync)}` : ''}`
 }
 
 // 提示行：tone='error' 时红色。页面不再拼 'hint hint-err' 字符串。
@@ -1039,8 +1051,8 @@ function RunHistoryPanel ({ onOpenLog }) {
             ? `run.log 摘要逐轮 · 最近 ${all.length} 轮` + (data.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : '')
             : 'run.log 摘要逐轮 · 加载中…')}
       right=${html`<div class="toolbar">
-        <select class="msg-select" value=${size} onChange=${(e) => changeSize(Number(e.target.value))} aria-label="每页显示条数">
-          ${RUN_PAGE_SIZES.map((n) => html`<option key=${n} value=${n}>每页 ${n} 条</option>`)}
+        <select class="msg-select" value=${String(size)} onChange=${(e) => changeSize(Number(e.target.value))} aria-label="每页显示条数">
+          ${RUN_PAGE_SIZES.map((n) => html`<option key=${n} value=${String(n)}>每页 ${n} 条</option>`)}
         </select>
         <${Button} variant="ghost" onClick=${refresh} disabled=${loading}>刷新<//>
       </div>`} />
@@ -1151,12 +1163,36 @@ function TrendsPanel () {
   const scrollRef = useRef(null)
   useEffect(() => {
     const el = scrollRef.current
-    if (el) el.scrollLeft = el.scrollWidth
+    if (!el) return
+    const trend = el.firstElementChild
+    if (!trend) return
+    // 每轮先清掉上一轮补的右 padding：14→30→60 来回切时它会累加成大块空白。
+    trend.style.paddingRight = ''
+    el.scrollLeft = el.scrollWidth
+    // 最右停靠时最左列可能只露半截：把下一个完整列的左缘对齐到容器左缘，
+    // 不够的滚动量用右 padding 补出来（只在自动停靠时做，用户手动滑动不干预）。
+    const cols = [...trend.children]
+    const partial = cols.find((c) => {
+      const r = c.getBoundingClientRect()
+      return r.left < 0 && r.right > 0
+    })
+    if (!partial) return
+    const next = cols[cols.indexOf(partial) + 1]
+    if (!next) return
+    const shift = next.getBoundingClientRect().left
+    if (shift <= 0) return
+    const max = el.scrollWidth - el.clientWidth
+    const need = el.scrollLeft + shift - max
+    if (need > 0) {
+      const pad = parseFloat(window.getComputedStyle(trend).paddingRight) || 0
+      trend.style.paddingRight = `${Math.ceil(pad + need)}px`
+    }
+    el.scrollLeft += shift
   }, [byDay.length])
   return html`<div class="panel">
     <${PanelHead} title=${shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势'}
-      afterTitle=${html`<select class="msg-select" value=${days} onChange=${(e) => setDays(Number(e.target.value))} aria-label="趋势窗口天数">
-        ${TREND_DAYS.map((d) => html`<option key=${d} value=${d}>${d} 日</option>`)}
+      afterTitle=${html`<select class="msg-select" value=${String(days)} onChange=${(e) => setDays(Number(e.target.value))} aria-label="趋势窗口天数">
+        ${TREND_DAYS.map((d) => html`<option key=${d} value=${String(d)}>${d} 日</option>`)}
       </select>`}
       sub=${'run.log 摘要按日聚合' + (trends && trends.truncated ? '（日志超限，仅统计尾部 1 MiB）' : '')}
       right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
@@ -1357,11 +1393,11 @@ function CategoryPicker ({ value, categories, total, onChange }) {
       // 重置渲染后焦点就丢了。延后一拍，等新一级列表渲染完再聚焦（与 focusFirst 同口径）。
       const t = setTimeout(() => {
         const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
-        if (el) el.focus()
+        if (el) el.focus({ preventScroll: true })
       }, 0)
       return () => clearTimeout(t)
     }
-    if (searchRef.current) searchRef.current.focus()
+    if (searchRef.current) searchRef.current.focus({ preventScroll: true })
     return undefined
   }, [open, narrow])
   // 搜索词/层级变化后回到第一项，避免 active 指向已被过滤掉的项。
@@ -1393,7 +1429,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     const onKey = (e) => {
       if (e.key === 'Escape') {
         setOpen(false)
-        if (btnRef.current) btnRef.current.focus()
+        if (btnRef.current) btnRef.current.focus({ preventScroll: true })
         return
       }
       // 手机端是带遮罩的模态弹层：Tab 在弹层内循环，不跑到背后的工具栏。
@@ -1402,7 +1438,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
         if (f.length === 0) return
         const first = f[0]
         const last = f[f.length - 1]
-        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus({ preventScroll: true }) } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus({ preventScroll: true }) }
       }
     }
     document.addEventListener('mousedown', onDown)
@@ -1434,14 +1470,14 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   const focusFirst = () => {
     setTimeout(() => {
       const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
-      if (el) el.focus()
+      if (el) el.focus({ preventScroll: true })
     }, 0)
   }
   const choose = (name) => {
     onChange(name)
     setOpen(false)
     setQ('')
-    if (btnRef.current) btnRef.current.focus()
+    if (btnRef.current) btnRef.current.focus({ preventScroll: true })
   }
   const pick = (o) => {
     if (!o.leaf) {
@@ -1465,7 +1501,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   const dismiss = () => {
     setOpen(false)
     setQ('')
-    if (btnRef.current) btnRef.current.focus()
+    if (btnRef.current) btnRef.current.focus({ preventScroll: true })
   }
   const onListKey = (e) => {
     const opts = listRef.current ? [...listRef.current.querySelectorAll('.cate-opt')] : []
@@ -1489,7 +1525,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     if (next >= 0) {
       e.preventDefault()
       setActive(next)
-      opts[next].focus()
+      opts[next].focus({ preventScroll: true })
     }
   }
   return html`<div class="cate-picker" ref=${rootRef}>
@@ -1540,7 +1576,11 @@ function MessagesPanel ({ onSync }) {
   const [input, setInput] = useState('')
   const [query, setQuery] = useState('')
   const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
-  const sentQueryRef = useRef('') // 当前请求实际发出的 query（含防抖未落地的新输入）
+  // 响应归属（问题5）：请求发出时记下的 query 会在 in-flight 期间过期——旧响应的
+  // queryUsed 会把刚打的新词清空（搜索吞字）。改为：loadSeqRef 给每次请求领号，
+  // loadedQueryRef 只在「最新一次请求」回包时记录它对应的 query。
+  const loadedQueryRef = useRef('')
+  const loadSeqRef = useRef(0)
   // 搜索防抖：输入停 300ms 才真正改 query；页码重置跟随 query 的真实变化。
   useEffect(() => {
     const t = setTimeout(() => { setQuery(input.trim()) }, 300)
@@ -1550,8 +1590,12 @@ function MessagesPanel ({ onSync }) {
   useEffect(() => { setPage(1) }, [query])
   const fetchMessages = useCallback(
     () => {
-      sentQueryRef.current = query
-      return apiGetMessages({ page, size, cate, q: query, days })
+      const requested = query
+      const seq = ++loadSeqRef.current
+      return apiGetMessages({ page, size, cate, q: requested, days }).then((d) => {
+        if (seq === loadSeqRef.current) loadedQueryRef.current = requested
+        return d
+      })
     },
     [page, size, cate, query, days])
   const { data, err, load, loading } = usePanelLoader(fetchMessages, onSync)
@@ -1647,8 +1691,9 @@ function MessagesPanel ({ onSync }) {
   // 否则旧响应会把刚打的新词覆盖回旧值（搜索像没生效）。
   useEffect(() => {
     if (!data || typeof data.queryUsed !== 'string') return
-    if (sentQueryRef.current !== query) return
-    if (data.queryUsed !== sentQueryRef.current && input.trim() === sentQueryRef.current) {
+    // 只接受「本次响应确实对应当前 query」的回写：旧 data 的 queryUsed 不能把刚输入的新词清空。
+    if (loadedQueryRef.current !== query) return
+    if (data.queryUsed !== query && input.trim() === query) {
       setInput(data.queryUsed)
       setQuery(data.queryUsed)
     }
@@ -1662,15 +1707,15 @@ function MessagesPanel ({ onSync }) {
       <${CategoryPicker} value=${cate} categories=${categories}
         total=${cateTotal}
         onChange=${(v) => { setCate(v); setPage(1) }} />
-      <select class="msg-select" value=${days} onChange=${(e) => { setDays(Number(e.target.value)); setPage(1) }} aria-label="时间范围">
+      <select class="msg-select" value=${String(days)} onChange=${(e) => { setDays(Number(e.target.value)); setPage(1) }} aria-label="时间范围">
         <option value="0">全部时间</option>
         <option value="1">今天</option>
         <option value="3">近 3 天</option>
         <option value="7">近 7 天</option>
         <option value="30">近 30 天</option>
       </select>
-      <select class="msg-select" value=${size} onChange=${(e) => { setSize(Number(e.target.value)); setPage(1) }} aria-label="每页显示条数">
-        ${[10, 20, 50, 100].map((n) => html`<option key=${n} value=${n}>每页 ${n} 条</option>`)}
+      <select class="msg-select" value=${String(size)} onChange=${(e) => { setSize(Number(e.target.value)); setPage(1) }} aria-label="每页显示条数">
+        ${[10, 20, 50, 100].map((n) => html`<option key=${n} value=${String(n)}>每页 ${n} 条</option>`)}
       </select>
       <${Button} variant="ghost" disabled=${loading} onClick=${refreshNow}>${loading ? '刷新中…' : '刷新'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
@@ -2017,7 +2062,6 @@ function App () {
   // 凭证失效（审查 #224）：任一 API 401 ⇒ 停轮询并显示自助恢复提示，不再每 5s 空打。
   const [authExpired, setAuthExpired] = useState(false)
   const [nextAt, setNextAt] = useState(0)
-  const [nowMs, setNowMs] = useState(Date.now())
   const timerRef = useRef(null)
   const seqRef = useRef(0)
   // 轮询互斥（Sourcery G_oY）：上一轮未完成时跳过本轮 tick，不在途中叠加新请求
@@ -2032,6 +2076,9 @@ function App () {
 
   // 换页先清掉上一页的「数据截至」；当前页自己的 loader 成功后再写入。
   useEffect(() => { setPanelSync(null) }, [tab])
+
+  // 切页在 DOM 提交后、绘制前回顶：先 setTab 再立即 scrollTo 会让旧长页面先闪一下。
+  useLayoutEffect(() => { window.scrollTo(0, 0) }, [tab, logJump])
 
   // vwD：逐请求独立收口——status 失败时 runs 结果仍可用（反之亦然）；
   // 并行发出（Sourcery G_n6）：串行 await 会让慢端点拖住另一端点的更新。
@@ -2098,6 +2145,10 @@ function App () {
     const mark = () => setNextAt(Date.now() + interval)
     const tick = () => {
       if (document.visibilityState !== 'hidden') {
+        // 用户正在操作表单（下拉/输入框）时不整页重渲染：安卓原生 select 会被
+        // 重建导致展开的选项闪退。跳过本拍，下一次 tick 恢复。
+        const ae = document.activeElement
+        if (ae && (ae.tagName === 'SELECT' || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) { mark(); return }
         refreshSplit()
         mark()
       }
@@ -2111,13 +2162,6 @@ function App () {
       document.removeEventListener('visibilitychange', onVis)
     }
   }, [refreshSplit, locking, tab, autoRefresh, authExpired])
-
-  // 倒计时秒数：每秒重渲染一次顶栏；只在概览/日志且自动刷新开启时跑。
-  useEffect(() => {
-    if (!autoRefresh || (tab !== 'overview' && tab !== 'logs')) return undefined
-    const t = setInterval(() => setNowMs(Date.now()), 1000)
-    return () => clearInterval(t)
-  }, [autoRefresh, tab])
 
   // hash 路由（v3.307）：首次进入补 #/overview；前进/后退跟着切页。
   useEffect(() => {
@@ -2189,14 +2233,12 @@ function App () {
   const switchTab = (next) => {
     if (next === tab) return
     setTab(next)
-    window.scrollTo(0, 0)
     if (window.location.hash !== `#/${next}`) window.location.hash = `#/${next}`
   }
   // 「查看日志」跳转：横幅/逐轮历史点进来时带筛选条件与日期，重挂载 LogsPanel。
   const openLog = useCallback((jump) => {
     setLogJump({ q: jump && jump.q ? jump.q : '', mode: jump && jump.mode ? jump.mode : 'all', n: Date.now() })
     setTab('logs')
-    window.scrollTo(0, 0)
     if (window.location.hash !== '#/logs') window.location.hash = '#/logs'
   }, [])
   const pollMs = locking ? POLL_BUSY_MS : POLL_MS
@@ -2206,9 +2248,6 @@ function App () {
   const badgeText = authExpired
     ? '凭证失效'
     : `${locking ? '任务运行中' : '空闲'}${livePolling ? '' : '（快照）'}`
-  const remain = autoRefresh
-    ? Math.max(0, Math.min(Math.ceil(pollMs / 1000), Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000)))
-    : 0
   return html`<div class="wrap">
     <header class="topbar">
       <div class="brand">
@@ -2218,9 +2257,9 @@ function App () {
       </div>
       <div class="sync">
         ${tab === 'overview'
-          ? html`${autoRefresh ? `自动刷新 · ${remain}s` : '自动刷新已暂停'}${lastSync ? ` · ${fmtLocalTime(lastSync)}` : ''}
+          ? html`${autoRefresh ? html`<${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${lastSync} />` : '自动刷新已暂停'}
             <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
-              onClick=${() => { setNowMs(Date.now()); setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`
+              onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`
           : panelSync ? `数据截至 · ${fmtLocalTime(panelSync)}` : '手动刷新'}
         ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
       </div>
@@ -2243,7 +2282,7 @@ function App () {
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} />
       <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
-      ${locking && html`<${RunsPanel} runs=${runs} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />`}
+      <${RunsPanel} runs=${runs} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />
       <${TrendsPanel} />
       <${RunHistoryPanel} onOpenLog=${openLog} />
       <${CacheHealthPanel} paused=${!autoRefresh} />

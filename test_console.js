@@ -2278,13 +2278,17 @@ async function main () {
     const sizeSelects = js.match(/aria-label="每页显示条数"/g) || []
     assert.ok(sizeSelects.length >= 2, '运行历史与推送记录各要有一个每页条数选择')
     // 选择器必须是「活的」：选项由常量渲染 + 改变时真的改条数（评审 #243-7）
-    assert.ok(/RUN_PAGE_SIZES\.map\(\(n\) => html`<option key=\$\{n\} value=\$\{n\}>每页 \$\{n\} 条<\/option>`\)/.test(js), '运行历史选项须由 RUN_PAGE_SIZES 渲染')
-    assert.ok(/\[10, 20, 50, 100\]\.map\(\(n\) => html`<option key=\$\{n\} value=\$\{n\}>每页 \$\{n\} 条<\/option>`\)/.test(js), '推送记录选项须由 10/20/50/100 渲染')
+    assert.ok(/RUN_PAGE_SIZES\.map\(\(n\) => html`<option key=\$\{n\} value=\$\{String\(n\)\}>每页 \$\{n\} 条<\/option>`\)/.test(js), '运行历史选项须由 RUN_PAGE_SIZES 渲染')
+    assert.ok(/\[10, 20, 50, 100\]\.map\(\(n\) => html`<option key=\$\{n\} value=\$\{String\(n\)\}>每页 \$\{n\} 条<\/option>`\)/.test(js), '推送记录选项须由 10/20/50/100 渲染')
     assert.ok(/onChange=\$\{\(e\) => changeSize\(Number\(e\.target\.value\)\)\}/.test(js), '运行历史下拉须接 changeSize')
     assert.ok(/onChange=\$\{\(e\) => \{ setSize\(Number\(e\.target\.value\)\); setPage\(1\) \}\}/.test(js), '推送记录下拉须同时改 size 并回第 1 页')
     assert.ok(/\.trend-scroll\s*\{[^}]*overflow-x:\s*auto/.test(css), '趋势图须横向滚动容器')
     assert.ok(/\.trend-col\s*\{[^}]*flex:\s*0 0 34px/.test(css), '趋势列须固定宽度（否则日期挤在一起）')
     assert.ok(/\.runs-scroll\s*\{[^}]*overflow-x:\s*auto/.test(css), '运行历史表须横向滚动容器')
+    // 数字 value 会让 Preact 每帧重写 attribute，安卓原生下拉在展开瞬间被重建（闪烁）。
+    assert.ok(!/<select[^>]*value=\$\{(?:days|size)\}/.test(js), 'select value 必须是字符串（数字会触发 Preact 每帧重写，安卓下拉闪烁）')
+    assert.ok(js.includes('function AutoRefreshText ('), '倒计时必须独立组件，App 不得每秒重渲染')
+    assert.ok(!js.includes('setNowMs(Date.now())'), 'App 不得保留每秒 nowMs 状态')
   })
 
   await aok('readRunHistory: 分页截断时旧失败行不得误标本页最旧一条', () => {
@@ -3376,7 +3380,7 @@ async function main () {
       '手机端动作按钮必须 2×2')
   })
 
-  await aok('结构红线: 概览先状态与操作，空触发历史不占位（运行中仍显示）', () => {
+  await aok('结构红线: 概览先状态与操作，触发历史常驻（空态显示暂无记录）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     const start = src.indexOf("${!authExpired && tab === 'overview' && html`<div>")
     const end = src.indexOf("${!authExpired && tab === 'messages'", start)
@@ -3385,8 +3389,8 @@ async function main () {
     const order = ['AlertBanner', 'StatusCards', 'TriggerBar', 'TrendsPanel', 'RunHistoryPanel', 'CacheHealthPanel'].map((n) => seg.indexOf(n))
     assert.ok(order.every((i) => i > -1), '概览必须包含异常横幅/状态卡/触发/趋势/逐轮历史/缓存健康')
     assert.deepStrictEqual([...order].sort((a, b) => a - b), order, '首屏先异常与状态、再操作，缓存健康垫底')
-    assert.ok(/locking && html`<\$\{RunsPanel\}/.test(seg),
-      '触发历史只在任务运行中占位（空闲时让位给趋势/逐轮历史；另一实例持锁时 locking=true）')
+    assert.ok(/<\$\{RunsPanel\} runs=\$\{runs\}/.test(seg), '触发历史须常驻概览（空态显示暂无记录），不得随任务结束消失')
+    assert.ok(!/locking && html`<\$\{RunsPanel\}/.test(seg), '触发历史不得回退为仅运行中渲染')
   })
 
   await aok('结构红线: 后台标签页不轮询（概览/日志/触发详情三处）', () => {
@@ -3407,10 +3411,27 @@ async function main () {
     assert.ok(/\.tabs\s*\{[^}]*position:\s*sticky/.test(css), '标签页必须吸顶')
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('window.scrollTo(0, 0)'), '切页必须回到顶部')
+    assert.ok(/useLayoutEffect\(\(\) => \{ window\.scrollTo\(0, 0\) \}, \[tab, logJump\]\)/.test(src), '切页回顶必须在 layout effect 中执行')
     assert.ok(/onClick=\$\{\(\) => \{[^\n]*switchTab\(t\.key\)/.test(src), '标签点击必须走 switchTab，不得绕过（可先清日志跳转）')
     const cache = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('// 推送记录：'))
     assert.ok(cache.includes('60000'), '缓存健康必须每分钟刷新')
     assert.ok(cache.includes("document.addEventListener('visibilitychange', onVis)"), '切回前台要补拉缓存快照')
+  })
+
+  await aok('结构红线: 控制台 UX 稳定性（搜索归属 / 弹层聚焦 / 趋势对齐）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const msgSeg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel', src.indexOf('function MessagesPanel')))
+    // 旧响应（in-flight 期间用户又改了词）不得把新词回写成旧 queryUsed。
+    assert.ok(msgSeg.includes('loadedQueryRef.current !== query'), 'queryUsed 回写必须有响应归属守卫')
+    assert.ok(!msgSeg.includes('sentQueryRef'), '旧的 sentQueryRef 归属判断必须移除')
+    const cateSeg = src.slice(src.indexOf('function CategoryPicker'), src.indexOf('function MessagesPanel', src.indexOf('function CategoryPicker')))
+    assert.ok(!/\.focus\(\)/.test(cateSeg), '分类弹层聚焦必须 preventScroll，禁止把页面滚回顶部')
+    // 趋势图自动停靠最右时，最左列可能只露半截日期：须把下一个完整列对齐到容器左缘。
+    assert.ok(src.includes('const partial'), '趋势图须对最左半截列做对齐')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const cateCss = (css.match(/\.msg-cate\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/max-width:\s*100%/.test(cateCss) && /overflow-wrap:\s*anywhere/.test(cateCss), '长分类 pill 必须能折行，不得撑破卡片')
+    assert.ok(/\.msg-meta\s*\{[^}]*min-width:\s*0/.test(css), 'msg-meta 须 min-width:0（flex 子项才可收缩）')
   })
 
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
