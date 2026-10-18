@@ -2139,7 +2139,61 @@ async function main () {
     assert.strictEqual(r2.items[0].interrupted, true, '失败行 → 其后摘要轮 interrupted')
     assert.strictEqual(r2.items[1].interrupted, false, '更早摘要轮不受污染')
   })
-
+  await aok('readRunHistory: 崩溃轮独立占位（不回填下一轮）且带 isPlaceholder（审查 D1-M2/D1-N5）', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 10:00:00 ERROR fetch failed ETIMEDOUT',
+      '2026-10-15 11:00:00 total=5 dedup=0 filtered=0 truncated=0 pushed=5 failed=0 elapsed=2s cachesaved=1'
+    ].join('\n') + '\n')
+    const r = readRunHistory(dir, { limit: 5 })
+    assert.deepStrictEqual(r.items.map((x) => x.at),
+      ['2026-10-15 11:00:00', '2026-10-15 10:00:00', '2026-10-15 09:00:00'])
+    assert.strictEqual(r.items[0].interrupted, false, '崩溃轮的 ERROR 不得把下一轮标成中断')
+    assert.strictEqual(r.items[0].pushed, 5)
+    assert.strictEqual(r.items[1].isPlaceholder, true, '无摘要可归属的失败行必须生成独立占位条目')
+    assert.strictEqual(r.items[1].interrupted, true)
+    assert.strictEqual(r.items[1].total, null)
+    assert.strictEqual(r.items[1].lineNo, 2, '占位行号 = 失败行自身行号（不是摘要行号+1）')
+    // limit=1：占位轮不被摘要挤掉，翻页时也按自身行号定位（不与摘要行比较）
+    const one = readRunHistory(dir, { limit: 1 })
+    assert.deepStrictEqual(one.items.map((x) => x.at), ['2026-10-15 11:00:00'])
+    const next = readRunHistory(dir, { limit: 1, before: one.items[0].lineNo - 1 })
+    assert.strictEqual(next.items[0].isPlaceholder, true, '下一页能取到崩溃占位轮')
+    assert.strictEqual(next.items[0].at, '2026-10-15 10:00:00')
+  })
+  await aok('readRunHistory: 失败行归属与每页条数无关（±2 行且 ≤2s，审查 D1-M3/D1-S2）', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 07:00:00 ERROR 上一轮残留失败',
+      '2026-10-15 08:00:00 WARN 通道健康更新异常: x',
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 11:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1'
+    ].join('\n') + '\n')
+    const two = readRunHistory(dir, { limit: 2 })
+    const five = readRunHistory(dir, { limit: 5 })
+    assert.deepStrictEqual(two.items.map((x) => x.interrupted), [false, false],
+      'limit=2：本页摘要都不得被 07:00 的失败行标中断')
+    assert.deepStrictEqual(five.items.map((x) => x.interrupted), [false, false, false, true],
+      'limit=5：同一文件结论必须一致（09:00 不再因「页满闸门失效」被标中断）')
+    assert.strictEqual(five.items[3].at, '2026-10-15 07:00:00')
+    assert.strictEqual(five.items[3].isPlaceholder, true, '相隔 1 小时的失败行是独立崩溃轮')
+    // 反向：同秒相邻（ERROR → 摘要）仍归属本轮，不受 limit 影响
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'run.log'), [
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 10:00:00 ERROR 推送全部失败 3 条（通道可能失效）',
+      '2026-10-15 10:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=1s cachesaved=1',
+      '2026-10-15 11:00:00 total=3 dedup=0 filtered=0 truncated=0 pushed=3 failed=0 elapsed=1s cachesaved=1'
+    ].join('\n') + '\n')
+    const r2 = readRunHistory(dir2, { limit: 2 })
+    assert.strictEqual(r2.items[1].at, '2026-10-15 10:00:00')
+    assert.strictEqual(r2.items[1].interrupted, true, '同秒失败行必须归属其摘要轮')
+    assert.strictEqual(r2.items[0].interrupted, false)
+  })
   // ── v3.298 只读扩展：配置视图 / 缓存健康 / 文件清单 / 趋势天数 ─────────────────
   await aok('只读纯函数: statSafeMeta 三态（常规文件 / 符号链接 / 缺失）', () => {
     const dir = tmpDir()
