@@ -1,8 +1,8 @@
 'use strict'
 
-const fs = require('node:fs')
 const path = require('node:path')
 const { readSafeTextResult } = require('../xbk_storage')
+const { defaultMessageSignature } = require('./message-signature')
 
 const FILES = {
   run: 'run.log',
@@ -685,21 +685,6 @@ function messagesFileName (filename) {
   return base.length > 0 && base !== '.' && base !== '..' ? base : FILES.messages
 }
 
-function messagesSignature (dir, filename, maxBytes) {
-  // 只给默认 push.json 做 (ino,size,mtime) 签名缓存：自定义缓存名的部署走无缓存路径，
-  // 这样 fs.statSync 的路径是**字面量常量**，不给静态分析留下动态路径面（Codacy 误报）。
-  if (messagesFileName(filename) !== FILES.messages) return null
-  try {
-    // Codacy 的 ESLint security 插件把「dir 变量 + 字面量文件名」也当成动态路径；
-    // dir 由调用方显式传入（控制台 stateDir / --status 解析结果），文件名是常量。
-    // eslint-disable-next-line
-    const st = fs.statSync(path.join(dir, FILES.messages))
-    if (!st.isFile() || st.size > maxBytes) return null
-    if (Date.now() - st.mtimeMs < MESSAGES_CACHE_MIN_AGE_MS) return null
-    return `${st.ino}:${st.size}:${Math.round(st.mtimeMs)}`
-  } catch (e) { return null }
-}
-
 function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.messages, cache = true } = {}) {
   // filename 可覆盖：运行侧缓存名由 MessageStore.getFileName(Config.api.pushUrl) 决定（pushUrl 末段
   // 去查询串后 + .json）。控制台默认读 push.json（默认配置的产物）；自定义了 pushUrl basename 的部署
@@ -707,7 +692,9 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   // cache=false：需要「此刻磁盘内容」的调用方（测试/诊断）显式绕过缓存。
   const name = messagesFileName(filename)
   const cacheKey = `${dir}\u0000${name}\u0000${maxBytes}`
-  const sig = cache ? messagesSignature(dir, name, maxBytes) : null
+  const sig = cache && name === FILES.messages
+    ? defaultMessageSignature(dir, maxBytes, MESSAGES_CACHE_MIN_AGE_MS)
+    : null
   if (sig) {
     const hit = messagesCache.get(cacheKey)
     if (hit && hit.sig === sig && Date.now() - hit.at < MESSAGES_CACHE_TTL_MS) return hit.value
