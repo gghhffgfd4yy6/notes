@@ -168,7 +168,7 @@ test('schema 错误被拒绝（数字/字符串都严格比对）', () => {
 })
 
 test('空/非法 revision 被拒绝（null/空串/负数/小数/数字字符串）', () => {
-  for (const bad of [null, '', -1, 1.5, '3', NaN]) {
+  for (const bad of [null, '', -1, 1.5, '3', Number.NaN]) {
     expectError(validateFilterRules({ revision: bad, filter: {} }, deps), 'revision', 'invalid_revision', `revision=${String(bad)}`)
   }
 })

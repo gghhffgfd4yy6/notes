@@ -23,8 +23,9 @@
 //   合并语义依赖「字段是否存在」（hasOwnProperty），故校验结果保留「只含已提交字段」的形状。
 // ============================================================
 
-const path = require('path')
 const { readSafeTextResult, writeAtomic } = require('./xbk_storage')
+// 路径构造单独成模块（纯 path.join + 本文件常量名），见该文件顶部说明。
+const { filterRulesPaths } = require('./scripts/filter-rules-paths')
 
 // 字段顺序沿用 xbk_utils.FILTER_FIELDS 的历史顺序（末尾追加 pingbitime），
 // 必须与 Config.filter 的键集合完全一致（测试逐元素断言）。
@@ -95,31 +96,6 @@ function normalizeKeyword (keyword, { forSnapshot = false } = {}) {
   // 若在此 String 化，对象会变成 '[object Object]' 正则（字符类），静默把全部条目滤掉（R11-1 回归）。
   // 正常配置（字符串）逐字符不变，故这是纯扩大信息量的透传，不改变合法输入的语义。
   return { zkt_gjc: raw }
-}
-
-function resolveCacheDir (cacheDir) {
-  // 路径 helper 是纯函数、不得抛错：非法 cacheDir 退化为进程 CWD（调用方本应传绝对路径）。
-  return typeof cacheDir === 'string' && cacheDir !== '' ? cacheDir : '.'
-}
-
-/**
- * 覆盖文件族路径。console 阶段的锁/审计/备份流程复用同一套命名，
- * 本阶段只提供 helper（不实现写流程、不创建文件）。
- * backupFor(rev)：`.bak.<rev>.json` 保留最近 3 代（清理策略在 console 阶段实现）；
- * rev 只接受非负安全整数，其余一律归 0——防止请求里的 revision 变成路径穿越片段。
- */
-function filterRulesPaths (cacheDir) {
-  const dir = resolveCacheDir(cacheDir)
-  return {
-    file: path.join(dir, 'filter-rules.json'),
-    applied: path.join(dir, 'filter-rules.applied.json'),
-    audit: path.join(dir, 'filter-rules.audit.ndjson'),
-    lock: path.join(dir, 'filter-rules.lock'),
-    backupFor (rev) {
-      const safeRev = Number.isSafeInteger(rev) && rev >= 0 ? rev : 0
-      return path.join(dir, `filter-rules.bak.${safeRev}.json`)
-    }
-  }
 }
 
 /**

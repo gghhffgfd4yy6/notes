@@ -1289,10 +1289,10 @@ function acquireFilterLock (cacheDir) {
       fs.writeSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now(), token }))
       fs.fchmodSync(fd, 0o600)
       fs.closeSync(fd)
-      fd = -1
     } catch (e) {
-      // 写入/授权失败：自己刚创建的锁文件必须清掉，否则后续 10s 内全是假 write_busy。
-      if (fd >= 0) { try { fs.closeSync(fd) } catch (e2) { /* 已关闭 */ } }
+      // 写入/授权/关闭失败：自己刚创建的锁文件必须清掉，否则后续 10s 内全是假 write_busy。
+      // closeSync 之后抛错时 fd 可能已关闭——重复 close 的 EBADF 直接吞掉，不影响清理。
+      try { fs.closeSync(fd) } catch (e2) { /* 已关闭 */ }
       try { fs.unlinkSync(lockPath) } catch (e3) { /* 已被清理 */ }
       return null
     }

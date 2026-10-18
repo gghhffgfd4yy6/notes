@@ -17,6 +17,21 @@ const { spawn, spawnSync } = require('node:child_process')
 // 「写路径 → 按路径 open」的 check-then-use 判红。
 const { readSafeTextResult } = require('./xbk_storage')
 
+// 变异 dry-run 取证（仅变异子进程生效）：tap 档失败时只回传 `test_console.js # exit code 1`，
+// stryker.log 不含测试 stdout；把 stdout/stderr 与未捕获异常落盘，mutation.yml 的
+// `if: failure()` 步骤再 tail 出来。正常 npm test 下完全无副作用。
+if (process.env.XBK_MUTATION_CHILD === '1') {
+  const chunks = []
+  const outWrite = process.stdout.write.bind(process.stdout)
+  const errWrite = process.stderr.write.bind(process.stderr)
+  process.stdout.write = (c, ...rest) => { try { chunks.push(String(c)) } catch (e) {} return outWrite(c, ...rest) }
+  process.stderr.write = (c, ...rest) => { try { chunks.push(String(c)) } catch (e) {} return errWrite(c, ...rest) }
+  process.on('uncaughtException', (e) => { try { chunks.push('UNCAUGHT ' + ((e && e.stack) || e) + '\n') } catch (e2) {} })
+  process.on('exit', (code) => {
+    try { fs.writeFileSync('/tmp/xbk-test-console.log', 'exit=' + code + '\n' + chunks.join('').slice(-200000)) } catch (e) {}
+  })
+}
+
 const {
   createConsole, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
   acquireLock, releaseLockFor, lockPath,
@@ -1013,14 +1028,20 @@ async function filterRuleApiTests () {
     try {
       assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '审计敏感词' } })).status, 200)
       assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: '第二版' } })).status, 200)
-      assert.strictEqual(fs.statSync(paths.audit).mode & 0o777, 0o600)
-      const raw = readSafeTextResult(paths.audit, 1024 * 1024).text
+      // 0600 与正文用同一个 fd 取（fstat 后立即读），避免「按路径 stat → 按路径读写」的
+      // TOCTOU 形态（CodeQL js/file-system-race 会把它判成 high）。
+      const auditFd = fs.openSync(paths.audit, 'r')
+      let raw
+      try {
+        assert.strictEqual(fs.fstatSync(auditFd).mode & 0o777, 0o600)
+        raw = fs.readFileSync(auditFd, 'utf8')
+      } finally { fs.closeSync(auditFd) }
       assert.ok(!raw.includes('审计敏感词'), '审计不得写规则正文')
       assert.ok(!raw.includes(dir), '审计不得写绝对路径')
       const lines = raw.trim().split('\n')
       assert.strictEqual(lines.length, 2)
       const first = JSON.parse(lines[0])
-      assert.deepStrictEqual(Object.keys(first).sort(), ['action', 'actor', 'changedFields', 'entryHash', 'prevHash', 'revision', 'ts'])
+      assert.deepStrictEqual(Object.keys(first).sort((a, b) => a.localeCompare(b)), ['action', 'actor', 'changedFields', 'entryHash', 'prevHash', 'revision', 'ts'])
       assert.strictEqual(first.action, 'save')
       assert.strictEqual(first.revision, 1)
       assert.deepStrictEqual(first.changedFields, ['pingbibiaoti'])
@@ -1038,7 +1059,8 @@ async function filterRuleApiTests () {
       const edited = JSON.parse(tampered[0])
       edited.revision = 99
       tampered[0] = JSON.stringify(edited)
-      fs.writeFileSync(paths.audit, tampered.join('\n') + '\n')
+      const tamperFd = fs.openSync(paths.audit, 'w')
+      try { fs.writeSync(tamperFd, tampered.join('\n') + '\n') } finally { fs.closeSync(tamperFd) }
       const after = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
       assert.strictEqual(after.auditChain.ok, false, '篡改必须可检测')
       assert.strictEqual(after.auditChain.brokenAt, 1, '断链行号从 1 开始')
@@ -1065,7 +1087,7 @@ async function filterRuleApiTests () {
       assert.strictEqual(body.capped, false)
       assert.strictEqual(body.samples.length, 1)
       assert.strictEqual(body.samples[0].id, '3')
-      assert.deepStrictEqual(Object.keys(body.samples[0]).sort(), ['id', 'reason', 'title'], '样例只含 id/title/reason')
+      assert.deepStrictEqual(Object.keys(body.samples[0]).sort((a, b) => a.localeCompare(b)), ['id', 'reason', 'title'], '样例只含 id/title/reason')
 
       const wide = await postFilterJson(port, '/api/config/filter/preview', { filter: { pingbibiaoti: '.*' } })
       assert.strictEqual(wide.status, 400)
