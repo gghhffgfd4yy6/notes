@@ -2289,6 +2289,10 @@ async function main () {
     assert.ok(!/<select[^>]*value=\$\{(?:days|size)\}/.test(js), 'select value 必须是字符串（数字会触发 Preact 每帧重写，安卓下拉闪烁）')
     assert.ok(js.includes('function AutoRefreshText ('), '倒计时必须独立组件，App 不得每秒重渲染')
     assert.ok(!js.includes('setNowMs(Date.now())'), 'App 不得保留每秒 nowMs 状态')
+    // 只查精确字符串会被 setNowMs(() => Date.now()) 绕过：把 AutoRefreshText 整段摘掉后，
+    // 任何剩余的 setNowMs 都说明 App/其他组件又拿到了秒级时钟（Sourcery #254）。
+    const withoutAuto = js.replace(/function AutoRefreshText[\s\S]*?\n}\n/, '\n')
+    assert.ok(!withoutAuto.includes('setNowMs'), '秒级时钟只能存在于 AutoRefreshText 内')
   })
 
   await aok('readRunHistory: 分页截断时旧失败行不得误标本页最旧一条', () => {
@@ -3423,17 +3427,28 @@ async function main () {
     const msgSeg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel', src.indexOf('function MessagesPanel')))
     // 旧响应（in-flight 期间用户又改了词）不得把新词回写成旧 queryUsed。
     assert.ok(msgSeg.includes('loadedQueryRef.current !== query'), 'queryUsed 回写必须有响应归属守卫')
+    // 守卫必须真的包住回写：把守卫留在注释里、回写移到守卫外，旧响应仍会吞掉新输入。
+    const guardAt = msgSeg.indexOf('if (loadedQueryRef.current !== query) return')
+    const writeAt = msgSeg.indexOf('setInput(data.queryUsed)')
+    assert.ok(guardAt >= 0 && writeAt > guardAt && writeAt - guardAt < 500, 'queryUsed 回写必须位于响应归属守卫内')
     assert.ok(!msgSeg.includes('sentQueryRef'), '旧的 sentQueryRef 归属判断必须移除')
     const cateSeg = src.slice(src.indexOf('function CategoryPicker'), src.indexOf('function MessagesPanel', src.indexOf('function CategoryPicker')))
     assert.ok(!/\.focus\(\)/.test(cateSeg), '分类弹层聚焦必须 preventScroll，禁止把页面滚回顶部')
+    // preventScroll 不能把键盘焦点留在 .cate-list 的可视区外：必须显式滚列表。
+    assert.ok(cateSeg.includes('focusInList') && cateSeg.includes('list.scrollTop'), '分类列表键盘焦点必须滚进可视区')
     // 趋势图自动停靠最右时，最左列可能只露半截日期：须把下一个完整列对齐到容器左缘。
     assert.ok(src.includes('const partial'), '趋势图须对最左半截列做对齐')
     assert.ok(src.includes('r.left < base && r.right > base'), '趋势对齐基准必须是滚动容器左缘，不是视口 x=0')
+    // 容器宽度变化而天数不变时也要重算，不能只在 byDay.length 变化时跑。
+    assert.ok(src.includes('new window.ResizeObserver'), '趋势对齐必须监听容器尺寸变化')
     // 表单交互暂停轮询必须有截止时间；只看 activeElement 会在选完后永久停轮。
     assert.ok(src.includes('formPauseUntilRef.current'), '表单交互暂停轮询必须有截止时间')
     assert.ok(!src.includes('const ae = document.activeElement'), '不得用 activeElement 永久暂停轮询')
     // 暂停自动刷新时 pollMs=0，详情轮询必须只取一次快照，不能 setInterval(fn, 0)。
     assert.ok(src.includes('if (!(pollMs > 0)) return'), 'pollMs=0 时必须跳过 setInterval，避免热循环')
+    assert.ok(src.includes('if (!openActive) return'), '已结束轮次不得继续轮询详情')
+    // 首次历史未回/失败时不得谎报「暂无触发记录」。
+    assert.ok(src.includes('runsState') && src.includes('触发历史加载中'), '触发历史必须区分加载中/失败/空')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const cateCss = (css.match(/\.msg-cate\s*\{[^}]*\}/) || [''])[0]
     assert.ok(/max-width:\s*100%/.test(cateCss) && /overflow-wrap:\s*anywhere/.test(cateCss), '长分类 pill 必须能折行，不得撑破卡片')

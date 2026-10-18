@@ -754,7 +754,7 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
 }
 
 // ── 组件：运行历史 ──────────────────────────────────────────────────────────
-function RunsPanel ({ runs, pollMs, onRefresh }) {
+function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh }) {
   const [openId, setOpenId] = useState(null)
   const [detail, setDetail] = useState(null)
   const [detailErr, setDetailErr] = useState('')
@@ -845,6 +845,9 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
       // S9383：fetchOnce 内部已 try/catch 全收（不会 reject），但仍显式 .catch 兜底，
       // 不留 floating promise（与 console.js 里 readBody 的处理同口径）。
       fetchOnce().catch(() => { /* fetchOnce 不 reject，S9383 口径 */ })
+      // 已结束的轮次只需要一次快照，永不建 interval（Sourcery #254：否则打开已完成的
+      // 日志会按 pollMs 无限轮询详情）。运行中 SSE 回退才需要继续轮询。
+      if (!openActive) return
       // pollMs=0 表示自动刷新已暂停：只取一次快照，绝不能 setInterval(fn, 0)
       // （暂停后打开已结束轮次的日志会变成热循环，持续打 /api/runs/detail）。
       if (!(pollMs > 0)) return
@@ -953,9 +956,13 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
   return html`<div class="panel">
     <${PanelHead} title="触发历史" sub="最多 20 条 · 本进程内存" />
     ${cancelErr && html`<${Hint} tone="error">${cancelErr}<//>`}
-    ${runs.length === 0
-      ? html`<div class="empty">暂无触发记录</div>`
-      : html`<table class="runs-table">
+    ${status === 'loading'
+      ? html`<div class="empty">触发历史加载中…</div>`
+      : status === 'error' && runs.length === 0
+        ? html`<div class="empty">触发历史暂不可用，请稍后刷新</div>`
+        : runs.length === 0
+          ? html`<div class="empty">暂无触发记录</div>`
+          : html`<table class="runs-table">
         <thead><tr><th>#</th><th>动作</th><th>开始时间</th><th>结果</th><th></th></tr></thead>
         <tbody>
           ${runs.map((r) => html`<tr key=${r.id} class=${openId === r.id ? 'row-open' : ''}>
@@ -1166,33 +1173,53 @@ function TrendsPanel () {
   const scrollRef = useRef(null)
   useEffect(() => {
     const el = scrollRef.current
-    if (!el) return
+    if (!el) return undefined
     const trend = el.firstElementChild
-    if (!trend) return
-    // 每轮先清掉上一轮补的右 padding：14→30→60 来回切时它会累加成大块空白。
-    trend.style.paddingRight = ''
-    el.scrollLeft = el.scrollWidth
-    // 最右停靠时最左列可能只露半截：把下一个完整列的左缘对齐到容器左缘，
-    // 不够的滚动量用右 padding 补出来（只在自动停靠时做，用户手动滑动不干预）。
-    // 注意基准是滚动容器的左缘（面板有内边距，视口 x=0 不是容器左缘）。
-    const base = el.getBoundingClientRect().left
-    const cols = [...trend.children]
-    const partial = cols.find((c) => {
-      const r = c.getBoundingClientRect()
-      return r.left < base && r.right > base
-    })
-    if (!partial) return
-    const next = cols[cols.indexOf(partial) + 1]
-    if (!next) return
-    const shift = next.getBoundingClientRect().left - base
-    if (shift <= 0) return
-    const max = el.scrollWidth - el.clientWidth
-    const need = el.scrollLeft + shift - max
-    if (need > 0) {
-      const pad = parseFloat(window.getComputedStyle(trend).paddingRight) || 0
-      trend.style.paddingRight = `${Math.ceil(pad + need)}px`
+    if (!trend) return undefined
+    let raf = 0
+    const align = () => {
+      raf = 0
+      // 每轮先清掉上一轮补的右 padding：14→30→60 来回切时它会累加成大块空白。
+      trend.style.paddingRight = ''
+      el.scrollLeft = el.scrollWidth
+      // 最右停靠时最左列可能只露半截：把下一个完整列的左缘对齐到容器左缘，
+      // 不够的滚动量用右 padding 补出来（只在自动停靠时做，用户手动滑动不干预）。
+      // 注意基准是滚动容器的左缘（面板有内边距，视口 x=0 不是容器左缘）。
+      const base = el.getBoundingClientRect().left
+      const cols = [...trend.children]
+      const partial = cols.find((c) => {
+        const r = c.getBoundingClientRect()
+        return r.left < base && r.right > base
+      })
+      if (!partial) return
+      const next = cols[cols.indexOf(partial) + 1]
+      if (!next) return
+      const shift = next.getBoundingClientRect().left - base
+      if (shift <= 0) return
+      const max = el.scrollWidth - el.clientWidth
+      const need = el.scrollLeft + shift - max
+      if (need > 0) {
+        const pad = parseFloat(window.getComputedStyle(trend).paddingRight) || 0
+        trend.style.paddingRight = `${Math.ceil(pad + need)}px`
+      }
+      el.scrollLeft += shift
     }
-    el.scrollLeft += shift
+    const schedule = () => { if (raf === 0) raf = window.requestAnimationFrame(align) }
+    align()
+    // 容器宽度变化（横竖屏、窗口缩放）时 byDay.length 不变，也必须重新对齐；
+    // 否则会保留旧 padding/滚动位置，最右几列又跑出容器（Sourcery #254）。
+    let ro = null
+    if (typeof window.ResizeObserver === 'function') {
+      ro = new window.ResizeObserver(schedule)
+      ro.observe(el)
+    } else {
+      window.addEventListener('resize', schedule)
+    }
+    return () => {
+      if (raf !== 0) window.cancelAnimationFrame(raf)
+      if (ro !== null) ro.disconnect()
+      else window.removeEventListener('resize', schedule)
+    }
   }, [byDay.length])
   return html`<div class="panel">
     <${PanelHead} title=${shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势'}
@@ -1368,6 +1395,19 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   const popRef = useRef(null)
   const searchRef = useRef(null)
   const listRef = useRef(null)
+  // 键盘导航时焦点既要避免带动整页滚动，又必须把选项滚进 .cate-list 的可视区。
+  // 只调 focus({preventScroll:true}) 会让长列表里获得焦点的项停在视口外（Sourcery #254）。
+  const focusInList = (el) => {
+    if (!el) return
+    el.focus({ preventScroll: true })
+    const list = listRef.current
+    if (!list) return
+    if (!list.contains(el)) return
+    const r = el.getBoundingClientRect()
+    const lr = list.getBoundingClientRect()
+    if (r.top < lr.top) list.scrollTop -= (lr.top - r.top)
+    else if (r.bottom > lr.bottom) list.scrollTop += (r.bottom - lr.bottom)
+  }
   useEffect(() => {
     const mq = window.matchMedia('(max-width: 640px)')
     const on = () => setNarrow(mq.matches)
@@ -1398,7 +1438,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
       // 重置渲染后焦点就丢了。延后一拍，等新一级列表渲染完再聚焦（与 focusFirst 同口径）。
       const t = setTimeout(() => {
         const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
-        if (el) el.focus({ preventScroll: true })
+        if (el) focusInList(el)
       }, 0)
       return () => clearTimeout(t)
     }
@@ -1443,7 +1483,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
         if (f.length === 0) return
         const first = f[0]
         const last = f[f.length - 1]
-        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus({ preventScroll: true }) } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus({ preventScroll: true }) }
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); focusInList(last) } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); focusInList(first) }
       }
     }
     document.addEventListener('mousedown', onDown)
@@ -1475,7 +1515,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   const focusFirst = () => {
     setTimeout(() => {
       const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
-      if (el) el.focus({ preventScroll: true })
+      if (el) focusInList(el)
     }, 0)
   }
   const choose = (name) => {
@@ -1530,7 +1570,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     if (next >= 0) {
       e.preventDefault()
       setActive(next)
-      opts[next].focus({ preventScroll: true })
+      focusInList(opts[next])
     }
   }
   return html`<div class="cate-picker" ref=${rootRef}>
@@ -2052,6 +2092,9 @@ function ConfigPanel ({ onSync }) {
 function App () {
   const [state, setState] = useState(null)
   const [runs, setRuns] = useState([])
+  // 触发历史是否已经成功加载过：首次请求未回/失败时不能显示「暂无触发记录」，
+  // 否则会把「还不知道」谎报成「确实没有」（Sourcery #254）。
+  const [runsState, setRunsState] = useState('loading') // loading | ok | error
   const [busy, setBusy] = useState(false)
   const [lastSync, setLastSync] = useState(null)
   // 非概览页的「数据截至」必须来自当前页自己的成功加载：共用一个 lastSync 会把
@@ -2093,6 +2136,8 @@ function App () {
   // 乱序防护（Sourcery vwE）：每次 refresh 领号，落后响应直接丢弃（落后 ≠ 失败，
   // 落后者静默丢弃不报错——Sourcery vwB：报「刷新失败」是误导）。
   const refreshSplit = useCallback(async () => {
+    // 表单交互暂停期间不发起刷新；已在途的响应也会在下方 apply 前被丢弃。
+    if (Date.now() < formPauseUntilRef.current) return
     if (inFlightRef.current) {
       // 切回概览时若上一轮还在路上，标记一次补刷，等 finally 再跑。
       pendingRefreshRef.current = true
@@ -2101,8 +2146,15 @@ function App () {
     inFlightRef.current = true
     const seq = ++seqRef.current
     const errs = []
-    const applyStatus = (s) => { if (seq === seqRef.current) { setState(s); setSyncErr('') } }
-    const applyRuns = (r) => { if (seq === seqRef.current) { setRuns(r.runs || []); setLastSync(Date.now()) } }
+    const paused = () => Date.now() < formPauseUntilRef.current
+    const applyStatus = (s) => { if (seq === seqRef.current && !paused()) { setState(s); setSyncErr('') } }
+    const applyRuns = (r) => {
+      if (seq === seqRef.current && !paused()) {
+        setRuns(r.runs || [])
+        setLastSync(Date.now())
+        setRunsState('ok')
+      }
+    }
     try {
       const [sRes, rRes] = await Promise.allSettled([
         apiGetStatus(),
@@ -2111,8 +2163,11 @@ function App () {
       if (sRes.status === 'fulfilled') applyStatus(sRes.value)
       else errs.push(`状态 ${sRes.reason && sRes.reason.message ? sRes.reason.message : sRes.reason}`)
       if (rRes.status === 'fulfilled') applyRuns(rRes.value)
-      else errs.push(`历史 ${rRes.reason && rRes.reason.message ? rRes.reason.message : rRes.reason}`)
-      if (seq !== seqRef.current) return
+      else {
+        errs.push(`历史 ${rRes.reason && rRes.reason.message ? rRes.reason.message : rRes.reason}`)
+        if (seq === seqRef.current) setRunsState((s) => (s === 'ok' ? 'ok' : 'error'))
+      }
+      if (seq !== seqRef.current || paused()) return
       refreshedOnceRef.current = true
       if (errs.length > 0) setSyncErr(`刷新失败：${errs.join('；')}（自动重试中）`)
       else setSyncErr('')
@@ -2188,7 +2243,12 @@ function App () {
     }
     timerRef.current = setInterval(tick, interval)
     mark()
-    const onVis = () => { if (document.visibilityState === 'visible') { refreshSplit(); mark() } }
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return
+      if (Date.now() < formPauseUntilRef.current) return
+      refreshSplit()
+      mark()
+    }
     document.addEventListener('visibilitychange', onVis)
     return () => {
       clearInterval(timerRef.current)
@@ -2198,7 +2258,7 @@ function App () {
 
   // hash 路由（v3.307）：首次进入补 #/overview；前进/后退跟着切页。
   useEffect(() => {
-    const onHash = () => { setTab(tabFromHash(window.location.hash)); window.scrollTo(0, 0) }
+    const onHash = () => { setTab(tabFromHash(window.location.hash)) }
     if (!window.location.hash) window.history.replaceState(null, '', '#/overview')
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
@@ -2315,14 +2375,14 @@ function App () {
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} />
       <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
-      <${RunsPanel} runs=${runs} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />
+      <${RunsPanel} runs=${runs} status=${runsState} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />
       <${TrendsPanel} />
       <${RunHistoryPanel} onOpenLog=${openLog} />
       <${CacheHealthPanel} paused=${!autoRefresh} />
     </div>`}
     ${!authExpired && tab === 'messages' && html`<${MessagesPanel} onSync=${setPanelSync} />`}
     ${!authExpired && tab === 'logs' && html`<div>
-      ${runs.length > 0 && html`<${RunsPanel} runs=${runs} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />`}
+      ${runs.length > 0 && html`<${RunsPanel} runs=${runs} status=${runsState} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />`}
       <${LogsPanel} key=${logJump ? logJump.n : 'base'} pollMs=${autoRefresh && locking ? POLL_BUSY_MS : 0}
         initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} onSync=${setPanelSync} />
     </div>`}
