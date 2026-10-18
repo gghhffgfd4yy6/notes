@@ -9,7 +9,7 @@
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
-import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, filterRunItems, tabFromHash, effectiveFilterRows } from './pure.mjs'
+import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote } from './pure.mjs'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -2138,18 +2138,8 @@ function ChannelList ({ pc }) {
 // 运行配置脱敏视图（v3.298）：推送密钥只显示「已配置/未配置」，值永不下发（服务端白名单
 // + 响应前保险丝双道防线）。进配置页加载 + 手动刷新。
 // v3.312：过滤规则块改为「实际生效值」——另拉 GET /api/config/filter（覆盖文件结果），
-// 与代码默认逐字段比对并给被覆盖字段打「覆盖」徽章。此前只读 Config.filter，保存覆盖文件后
-// 两页对不上（用户看到「已保存」但配置页仍然全空）。
-function filterSourceNote (effData, rows, overrideCount) {
-  if (!effData) return ''
-  if (effData.source === 'corrupt') return `${rows.length} 项 · 覆盖文件损坏，显示降级值`
-  if (effData.source === 'override') {
-    const rev = Number.isSafeInteger(effData.revision) ? effData.revision : 0
-    return `${rows.length} 项 · 生效 rev ${rev}（覆盖文件）${overrideCount > 0 ? ` · ${overrideCount} 项已覆盖` : ''}`
-  }
-  return `${rows.length} 项 · 来自代码默认（未建覆盖文件）`
-}
-
+// 与代码默认按字段合并并给覆盖文件提供的字段打「覆盖」徽章。此前只读 Config.filter，保存
+// 覆盖文件后两页对不上（用户看到「已保存」但配置页仍然全空）。
 function ConfigPanel ({ onSync }) {
   const { data, err, load } = usePanelLoader(apiGetConfig, onSync)
   const { data: eff, err: effErr, load: loadEff } = usePanelLoader(apiGetFilter, onSync)
@@ -2160,11 +2150,14 @@ function ConfigPanel ({ onSync }) {
   useEffect(() => { refresh() }, [refresh])
   const r = data && data.runtime ? data.runtime : null
   const pc = data && data.pushChannels ? data.pushChannels : null
+  // 读面失败时 usePanelLoader 仍保留上一次的 data（不清空），这里必须显式丢弃，
+  // 否则页面会一边报「读取失败、显示代码默认值」一边渲染旧的覆盖值（Sourcery #257）。
+  const effLive = effErr ? null : eff
   // 生效值口径与 FilterStore.mergeActiveFilter 一致：覆盖文件优先、缺字段回代码默认。
-  const effFilter = eff && eff.filter && typeof eff.filter === 'object' ? eff.filter : null
+  const effFilter = effLive && effLive.filter && typeof effLive.filter === 'object' ? effLive.filter : null
   const filterRows = r ? effectiveFilterRows(r.filter, effFilter) : []
   const overrideCount = filterRows.filter((row) => row.overridden).length
-  const filterSub = filterSourceNote(eff, filterRows, overrideCount)
+  const filterSub = filterSourceNote(effLive, filterRows.length, overrideCount)
   return html`<div class="panel">
     <${PanelHead} title="运行配置" sub="脱敏视图 · 推送密钥只显示是否已配置"
       right=${html`<${Button} variant="ghost" onClick=${refresh}>刷新<//>`} />
@@ -2195,7 +2188,7 @@ function ConfigPanel ({ onSync }) {
     </div>`}
     ${r && filterRows.length > 0 && html`<${FilterRules} rows=${filterRows} sub=${filterSub} />`}
     ${r && effErr && html`<${Hint} tone="error">过滤规则覆盖层读取失败：${effErr}（本块显示代码默认值）<//>`}
-    ${r && eff && eff.source === 'corrupt' && html`<${Hint} tone="error">覆盖文件损坏，当前按降级值运行${eff.error && eff.error.message ? `：${eff.error.message}` : ''}。请到「过滤规则」标签回滚或重新保存。<//>`}
+    ${r && effLive && effLive.source === 'corrupt' && html`<${Hint} tone="error">覆盖文件损坏，当前按降级值运行${effLive.error && effLive.error.message ? `：${effLive.error.message}` : ''}。请到「过滤规则」标签回滚或重新保存。<//>`}
     ${r && html`<${Hint}>本块显示实际生效值：覆盖文件优先于代码默认，带「覆盖」标记的字段由覆盖文件提供。修改请到「过滤规则」标签。<//>`}
     ${r && html`<div class="cfg-block">
       <div class="cfg-block-head"><span class="cfg-block-title">关键词订阅</span></div>

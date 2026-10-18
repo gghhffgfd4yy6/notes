@@ -520,6 +520,6 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 ## v3.312 — 配置页过滤规则显示覆盖文件生效值
 
 - **问题**：在「过滤规则」标签保存后，配置页的「过滤规则」块仍然全空（只把 `pingbitime=5` 显示出来）。原因是配置页读 `GET /api/config` 的 `runtime.filter`（代码默认层），而保存写的是覆盖文件 `filter-rules.json`，两层没有在页面上合并——用户看到的是「保存成功但配置没变」。
-- **修复**：配置页另拉 `GET /api/config/filter`，用 `effectiveFilterRows()` 把覆盖文件与代码默认按字段合并（与 `FilterStore.mergeActiveFilter` 同口径：覆盖优先、缺字段回代码默认、显式 `""` 才是清空），被覆盖字段旁标注「覆盖」徽章；块标题显示来源与版本（`生效 rev N（覆盖文件）`），覆盖文件损坏时显示降级红条，读取失败时回退代码默认并提示。
+- **修复**：配置页另拉 `GET /api/config/filter`，用 `effectiveFilterRows()` 把覆盖文件与代码默认按字段合并（与 `FilterStore.mergeActiveFilter` 同口径：覆盖优先、缺字段回代码默认、显式 `""` 才是清空），覆盖文件显式提供的字段旁标注「覆盖」徽章（值与默认相同也算——表示该字段被钉住）；块标题用 `filterSourceNote()` 区分「生效 rev N」与「已保存 rev N（下一轮生效）」，覆盖文件损坏时显示降级红条，读面失败时丢弃 `usePanelLoader` 保留的陈旧数据并回退代码默认。
 - **范围**：纯前端（`scripts/console-assets/app.js` / `pure.mjs` / `app.css`），服务端接口与运行侧行为未变；「过滤规则」标签仍是唯一写入面。
 - **门禁**：`test_console.js` 新增 `effectiveFilterRows` 单测（覆盖优先/缺字段回落/显式清空/多余字段/非对象输入）与配置页源码契约断言（必须接 `rows` 生效值、必须有「覆盖」徽章与 revision 来源）。

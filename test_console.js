@@ -1441,9 +1441,13 @@ async function filterRuleApiTests () {
     // 保存成功后配置页仍全空，用户以为没保存）。
     assert.ok(js.includes('effectiveFilterRows'), '配置页过滤规则块必须合并覆盖文件生效值')
     const tpl = (name) => '$' + '{' + name + '}' // 拼接出模板占位符，避免 no-template-curly-in-string
+    assert.ok(js.includes('const filterRows = r ? effectiveFilterRows(r.filter, effFilter) : []'), '生效值必须真的赋给 filterRows（只留 import 与属性名不算）')
+    assert.ok(js.includes('const effLive = effErr ? null : eff'), '读面失败必须丢弃 usePanelLoader 保留的陈旧 data')
     assert.ok(js.includes('rows=' + tpl('filterRows')), 'FilterRules 必须接生效值 rows，而不是代码默认 entries')
     assert.ok(js.includes('class="rule-src"'), '被覆盖字段必须带「覆盖」徽章')
-    assert.ok(js.includes('生效 rev ' + tpl('rev') + '（覆盖文件）'), '配置页必须标明生效 revision 来自覆盖文件')
+    const pureSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pure.mjs'), 'utf8')
+    assert.ok(pureSrc.includes('生效 rev ' + tpl('rev') + '（覆盖文件）'), '副标题必须标明生效 revision 来自覆盖文件')
+    assert.ok(pureSrc.includes('下一轮生效'), '保存后未跑过一轮时必须说「下一轮生效」')
   })
 }
 
@@ -4069,23 +4073,30 @@ async function main () {
   })
 
   await aok('行为: v3.312 配置页过滤规则显示生效值（覆盖文件优先）', async () => {
-    const { effectiveFilterRows } = await import('./scripts/console-assets/pure.mjs')
+    const { effectiveFilterRows, filterSourceNote } = await import('./scripts/console-assets/pure.mjs')
     const base = { pingbitime: '5', pingbibiaoti: '', pingbineirong: '' }
-    const rows = effectiveFilterRows(base, { ...base, pingbibiaoti: '身体乳' })
+    const rows = effectiveFilterRows(base, { pingbibiaoti: '身体乳' })
     assert.strictEqual(rows.length, 3)
     const body = rows.find((r) => r.key === 'pingbibiaoti')
     assert.strictEqual(body.value, '身体乳', '覆盖文件的值必须显示在配置页')
-    assert.strictEqual(body.overridden, true)
-    assert.strictEqual(rows.find((r) => r.key === 'pingbitime').overridden, false, '与代码默认相同不挂徽章')
+    assert.strictEqual(body.overridden, true, '覆盖文件提供的字段必须挂徽章')
+    assert.strictEqual(rows.find((r) => r.key === 'pingbitime').overridden, false, '文件里没有的字段回代码默认且不挂徽章')
+    assert.strictEqual(rows.find((r) => r.key === 'pingbitime').value, '5', '缺字段回代码默认')
+    assert.strictEqual(effectiveFilterRows({ pingbitime: '5' }, { pingbitime: '5' })[0].overridden, true, '文件显式写同值也算覆盖文件提供（钉住默认值）')
     assert.deepStrictEqual(effectiveFilterRows(base, null).map((r) => r.overridden), [false, false, false], '没有覆盖文件时不标覆盖')
-    const partial = effectiveFilterRows(base, { pingbibiaoti: '身体乳' })
-    assert.strictEqual(partial.find((r) => r.key === 'pingbitime').value, '5', '缺字段回代码默认')
-    assert.strictEqual(partial.find((r) => r.key === 'pingbitime').overridden, false, '缺字段不算覆盖')
     const cleared = effectiveFilterRows({ pingbibiaoti: '旧词' }, { pingbibiaoti: '' })
     assert.strictEqual(cleared[0].value, '')
     assert.strictEqual(cleared[0].overridden, true, '显式清空也是一次覆盖')
     assert.deepStrictEqual(effectiveFilterRows({ pingbitime: '5' }, { pingbibiaoti: 'A' }).map((r) => r.key), ['pingbitime', 'pingbibiaoti'], '覆盖文件多出的字段也要显示')
     assert.deepStrictEqual(effectiveFilterRows(null, undefined), [], '非对象输入不抛错')
+    // 副标题：已保存 ≠ 已生效（保存发生在上一轮之后时，本轮仍在用旧规则）
+    assert.ok(filterSourceNote({ source: 'override', revision: 2, applied: { revision: 2 } }, 11, 1).includes('生效 rev 2（覆盖文件）'))
+    const pending = filterSourceNote({ source: 'override', revision: 3, applied: { revision: 2 } }, 11, 1)
+    assert.ok(pending.includes('已保存 rev 3') && pending.includes('下一轮生效') && pending.includes('本轮仍用 rev 2'), '保存后未跑时必须明说下一轮生效')
+    assert.ok(filterSourceNote({ source: 'override', revision: 3, applied: null }, 11, 0).includes('尚未跑过'))
+    assert.ok(filterSourceNote({ source: 'corrupt', revision: 0 }, 11, 0).includes('损坏'))
+    assert.ok(filterSourceNote({ source: 'default', revision: 0 }, 11, 0).includes('代码默认'))
+    assert.strictEqual(filterSourceNote(null, 11, 0), '')
   })
 
   await aok('结构红线: v3.307 确认弹窗 / 今日统计 / 时间窗 / 日志级别 / hash 路由', () => {
