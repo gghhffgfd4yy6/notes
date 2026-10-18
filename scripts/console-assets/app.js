@@ -1104,20 +1104,22 @@ function usePanelLoader (apiFn, onLoaded) {
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   const seqRef = useRef(0) // 竞态守卫：只应用「最新一次 load」的响应（审查 Sourcery PR#227）
+  const mountedRef = useRef(true) // 卸载后旧请求仍可能回包：不得再写父页时间戳（PR#253）
+  useEffect(() => () => { mountedRef.current = false }, [])
   const load = useCallback(async () => {
     const seq = ++seqRef.current
     setLoading(true)
     try {
       const d = await apiFn()
-      if (seq !== seqRef.current) return // 已有更新的请求，本次响应作废
+      if (seq !== seqRef.current || !mountedRef.current) return // 已有更新的请求或面板已卸载，本次响应作废
       setData(d)
       setErr('')
       if (typeof onLoaded === 'function') onLoaded(Date.now())
     } catch (e) {
-      if (seq !== seqRef.current) return
+      if (seq !== seqRef.current || !mountedRef.current) return
       setErr(`加载失败：${e.message}`)
     } finally {
-      if (seq === seqRef.current) setLoading(false)
+      if (seq === seqRef.current && mountedRef.current) setLoading(false)
     }
   }, [apiFn, onLoaded])
   return { data, err, load, loading }
@@ -1825,11 +1827,12 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync }) 
 }
 
 // 系统信息：版本 / 运行环境 / 进程 / 缓存目录。全部只读，无操作按钮。
-function SysPanel ({ onSync }) {
+function SysPanel () {
   // 访问日志（v3.300 §3.3）：第二个 loader 并列拉取；「刷新」按钮同日 load 两个。
   // 近窗未授权尝试数 = 服务端独立 401 计数（进程启动以来、不随环形窗截断）。
-  const { data: sys, err, load } = usePanelLoader(apiGetSys, onSync)
-  const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog, onSync)
+  // 两个请求可能一成一败：本页不认「数据截至」，避免半套数据被标成完整刷新（Sourcery PR#253）。
+  const { data: sys, err, load } = usePanelLoader(apiGetSys)
+  const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog)
   useEffect(() => { load().catch(() => {}) }, [load])
   useEffect(() => { loadAccess().catch(() => {}) }, [loadAccess])
   const refreshAll = () => { load(); loadAccess() }
@@ -2001,6 +2004,9 @@ function App () {
   const [runs, setRuns] = useState([])
   const [busy, setBusy] = useState(false)
   const [lastSync, setLastSync] = useState(null)
+  // 非概览页的「数据截至」必须来自当前页自己的成功加载：共用一个 lastSync 会把
+  // 概览/runs 的时间挂到日志页上（Sourcery PR#252）；换页时清空，加载失败就显示手动刷新。
+  const [panelSync, setPanelSync] = useState(null)
   const [syncErr, setSyncErr] = useState('')
   // 标签页写 hash（v3.307）：刷新/后退不丢当前页；初始值从 hash 读，非法值回概览。
   const [tab, setTab] = useState(() => tabFromHash(window.location.hash))
@@ -2023,6 +2029,9 @@ function App () {
   const busyRunIdRef = useRef(null)
   // 首次刷新完成前不判「无活跃任务」（启动时 runs 尚空，会把丢失响应的 busy 立刻清掉）。
   const refreshedOnceRef = useRef(false)
+
+  // 换页先清掉上一页的「数据截至」；当前页自己的 loader 成功后再写入。
+  useEffect(() => { setPanelSync(null) }, [tab])
 
   // vwD：逐请求独立收口——status 失败时 runs 结果仍可用（反之亦然）；
   // 并行发出（Sourcery G_n6）：串行 await 会让慢端点拖住另一端点的更新。
@@ -2212,7 +2221,7 @@ function App () {
           ? html`${autoRefresh ? `自动刷新 · ${remain}s` : '自动刷新已暂停'}${lastSync ? ` · ${fmtLocalTime(lastSync)}` : ''}
             <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
               onClick=${() => { setNowMs(Date.now()); setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`
-          : `数据截至${lastSync ? ` · ${fmtLocalTime(lastSync)}` : ''}`}
+          : panelSync ? `数据截至 · ${fmtLocalTime(panelSync)}` : '手动刷新'}
         ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
       </div>
     </header>
@@ -2239,15 +2248,15 @@ function App () {
       <${RunHistoryPanel} onOpenLog=${openLog} />
       <${CacheHealthPanel} paused=${!autoRefresh} />
     </div>`}
-    ${!authExpired && tab === 'messages' && html`<${MessagesPanel} onSync=${setLastSync} />`}
+    ${!authExpired && tab === 'messages' && html`<${MessagesPanel} onSync=${setPanelSync} />`}
     ${!authExpired && tab === 'logs' && html`<div>
       ${runs.length > 0 && html`<${RunsPanel} runs=${runs} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />`}
       <${LogsPanel} key=${logJump ? logJump.n : 'base'} pollMs=${autoRefresh && locking ? POLL_BUSY_MS : 0}
-        initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} onSync=${setLastSync} />
+        initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} onSync=${setPanelSync} />
     </div>`}
-    ${!authExpired && tab === 'config' && html`<${ConfigPanel} onSync=${setLastSync} />`}
+    ${!authExpired && tab === 'config' && html`<${ConfigPanel} onSync=${setPanelSync} />`}
     ${!authExpired && tab === 'sys' && html`<div>
-      <${SysPanel} onSync=${setLastSync} />
+      <${SysPanel} />
       <${FilesPanel} />
     </div>`}
 
