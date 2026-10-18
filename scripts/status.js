@@ -127,9 +127,10 @@ function looksLikeRoundFailure (line) {
   if (line.includes('控制台停止：任务 #')) return false
   // 审查 D2-M3：ALERT 的正文固定含「运行异常」（xbk_app.js:324 的告警模板），但线报酷截断、
   // 缺 re2 等**非失败**告警都用同一句正文 ⇒ 不能按正文命中，否则成功轮被标「中断」。
-  // ALERT 行里可能内嵌带 ERROR 字样的原因串，先整行排除，只认真正的 ERROR 行。
+  // ALERT 行里可能内嵌带 ERROR 字样的原因串，先整行排除；独立的中文「运行异常」（无 ALERT
+  // 前缀）仍按失败处理，保留状态报告既有口径。
   if (/(?:^|\s)ALERT(?:\s|$)/.test(line)) return false
-  return /(?:^|\s)ERROR(?:\s|$)/.test(line)
+  return /(?:^|\s)ERROR(?:\s|$)|运行异常/.test(line)
 }
 
 // run.log 摘要行正则（parseLastRun 只看最后一条；readTrends / readRunHistory / parseRunStats
