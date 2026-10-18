@@ -679,9 +679,17 @@ const MESSAGES_CACHE_MIN_AGE_MS = 100
 const MESSAGES_CACHE_MAX = 4
 const messagesCache = new Map()
 
+// 缓存文件名来自 Config.api.pushUrl 的末段（运行时派生）。落盘前只允许纯文件名：
+// 去掉任何目录成分，既防 ../ 穿越，也让 Codacy 的 dynamic path 规则看到显式 basename。
+function messagesFileName (filename) {
+  if (typeof filename !== 'string' || filename.length === 0) return FILES.messages
+  const base = path.basename(filename)
+  return base.length > 0 && base !== '.' && base !== '..' ? base : FILES.messages
+}
+
 function messagesSignature (dir, filename, maxBytes) {
   try {
-    const st = fs.statSync(path.join(dir, filename))
+    const st = fs.statSync(path.join(dir, messagesFileName(filename)))
     if (!st.isFile() || st.size > maxBytes) return null
     if (Date.now() - st.mtimeMs < MESSAGES_CACHE_MIN_AGE_MS) return null
     return `${st.ino}:${st.size}:${Math.round(st.mtimeMs)}`
@@ -693,13 +701,14 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   // 去查询串后 + .json）。控制台默认读 push.json（默认配置的产物）；自定义了 pushUrl basename 的部署
   // 显式传 filename（console main 里从同名口径推导），不让「文件改名」静默变成「记录消失」。
   // cache=false：需要「此刻磁盘内容」的调用方（测试/诊断）显式绕过缓存。
-  const cacheKey = `${dir}\u0000${filename}\u0000${maxBytes}`
-  const sig = cache ? messagesSignature(dir, filename, maxBytes) : null
+  const name = messagesFileName(filename)
+  const cacheKey = `${dir}\u0000${name}\u0000${maxBytes}`
+  const sig = cache ? messagesSignature(dir, name, maxBytes) : null
   if (sig) {
     const hit = messagesCache.get(cacheKey)
     if (hit && hit.sig === sig && Date.now() - hit.at < MESSAGES_CACHE_TTL_MS) return hit.value
   }
-  const read = readText(dir, filename, maxBytes)
+  const read = readText(dir, name, maxBytes)
   if (read.status !== 'ok') return { status: read.status }
   let parsed
   try { parsed = JSON.parse(read.value) } catch (error) { return result('invalid') }
