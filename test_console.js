@@ -253,6 +253,67 @@ ok('releaseLockFor: 他人活锁返回 false；released 帧返回 true；锁不�
   fs.unlinkSync(lockPath(dir))
   assert.strictEqual(releaseLockFor({ _stateDir: dir, _lockToken: 'mine' }), true, '锁不存在报 true')
 })
+ok('acquireLock: 陈旧损坏锁 / 0 字节锁可接管；新鲜损坏锁仍 fail-closed（D2-S1 回归）', () => {
+  const dir = tmpDir()
+  const p = lockPath(dir)
+  const old = new Date(Date.now() - PROC_TIMEOUT_MS - 60000)
+  // 0 字节锁（旧写入路径 open(wx) 后崩溃的产物）：修前永久 fail-closed，只能人工删文件
+  fs.writeFileSync(p, '')
+  fs.utimesSync(p, old, old)
+  assert.strictEqual(acquireLock(dir, Date.now(), 'tok-fix'), true, 'mtime 陈旧的 0 字节锁必须可接管')
+  assert.strictEqual(JSON.parse(fs.readFileSync(p, 'utf8')).token, 'tok-fix')
+  // 半截 JSON 同理
+  fs.writeFileSync(p, '{"pid":1,"starte')
+  fs.utimesSync(p, old, old)
+  assert.strictEqual(acquireLock(dir, Date.now(), 'tok-fix2'), true, 'mtime 陈旧的半截 JSON 锁可接管')
+  // 新鲜的损坏锁仍 fail-closed（可能正被写入）
+  fs.writeFileSync(p, 'half-json{{')
+  assert.strictEqual(acquireLock(dir, Date.now(), 'tok-x'), false, '新鲜损坏锁不得接管')
+  // 写入路径本身不再产生 0 字节锁：link 落地时内容已完整
+  const dir2 = tmpDir()
+  assert.strictEqual(acquireLock(dir2, 1000, 'tok-link'), true)
+  const raw = fs.readFileSync(lockPath(dir2), 'utf8')
+  assert.ok(raw.length > 0 && JSON.parse(raw).token === 'tok-link', '锁帧必须一次成型')
+  const leftovers = fs.readdirSync(dir2).filter((n) => n.endsWith('.tmp'))
+  assert.deepStrictEqual(leftovers, [], '临时文件必须清理干净')
+})
+ok('acquireLock: 陈旧 .takeover 哨兵 unlink 后重抢；新鲜哨兵仍拒绝（D2-S5 回归）', () => {
+  const dir = tmpDir()
+  const p = lockPath(dir)
+  const sentinel = p + '.takeover'
+  const old = new Date(Date.now() - PROC_TIMEOUT_MS - 60000)
+  // 残留哨兵（上次接管者崩溃）+ 陈旧锁：修前用 stat→writeFileSync「刷新」哨兵（非原子），
+  // 且哨兵残留会让后续触发连续 10 分钟 409。现在必须 unlink 后重新 open(wx) 抢占。
+  fs.writeFileSync(p, JSON.stringify({ pid: 999999, startedAt: 1, token: 'old' }))
+  fs.writeFileSync(sentinel, 'stale')
+  fs.utimesSync(sentinel, old, old)
+  assert.strictEqual(acquireLock(dir, Date.now(), 'tok-reclaim'), true, '陈旧哨兵必须被回收')
+  assert.strictEqual(fs.existsSync(sentinel), false, '接管完成后哨兵必须清理')
+  assert.strictEqual(JSON.parse(fs.readFileSync(p, 'utf8')).token, 'tok-reclaim')
+  // 新鲜哨兵 = 另一个实例正在接管：让给对方（拒绝）
+  fs.writeFileSync(p, JSON.stringify({ pid: 999999, startedAt: 1, token: 'old' }))
+  fs.writeFileSync(sentinel, 'live')
+  assert.strictEqual(acquireLock(dir, Date.now(), 'tok-x'), false, '新鲜哨兵必须尊重并发接管')
+})
+ok('releaseLockFor: open 失败只有 ENOENT 才算已释放（EACCES/EMFILE → false，D2-S3）', () => {
+  const dir = tmpDir()
+  const p = lockPath(dir)
+  assert.strictEqual(acquireLock(dir, 1000, 'tok-perm'), true)
+  const fsmod = require('node:fs')
+  const realOpen = fsmod.openSync
+  for (const code of ['EACCES', 'EMFILE', 'EIO']) {
+    fsmod.openSync = function (target, flags, ...rest) {
+      if (target === p) { const e = new Error(`${code}: simulated`); e.code = code; throw e }
+      return realOpen.call(this, target, flags, ...rest)
+    }
+    try {
+      assert.strictEqual(releaseLockFor({ _stateDir: dir, _lockToken: 'tok-perm' }), false, `${code} 必须如实报 false`)
+    } finally { fsmod.openSync = realOpen }
+  }
+  // 锁帧未被写成 released（调用方会据此响亮告警，而不是当成功）
+  assert.strictEqual(JSON.parse(fs.readFileSync(p, 'utf8')).released, undefined)
+  assert.strictEqual(releaseLockFor({ _stateDir: dir, _lockToken: 'tok-perm' }), true, '正常路径仍可释放')
+})
 
 // ── 动作解析 ──
 ok('parseAction: urlencoded 三种合法动作 + 非法动作 null', () => {

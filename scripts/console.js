@@ -250,16 +250,32 @@ function isValidToken (token) {
 function lockPath (stateDir) { return path.join(stateDir, 'console-trigger.lock') }
 
 function writeLockAtomic (p, now, token) {
-  // 独占创建 + 先写内容再占用：以 open(p,'wx') 抢占文件名（并发方在这里 EEXIST 失败），
-  // 再把完整内容写进同一 fd。⚠️ 不能走 rename 覆盖路径——POSIX rename 会静默替换已存在
-  // 目标，独占性名存实亡（回归教训见 test「并发获取拒绝」用例）。
+  // 独占创建 = 「临时文件写全 + link 占名」：内容先完整落盘，再用 linkSync 原子占名
+  // （link 目标已存在即 EEXIST，不会覆盖——独占语义与 open(p,'wx') 等价，但不会暴露
+  // 「文件名已占、内容还没写」的窗口）。旧实现 open(p,'wx') 后写内容：进程在这两步之间
+  // 崩溃就留下 0 字节锁，读取侧无法解析 ⇒ fail-closed 永久拒绝触发（D2-S1）。
+  // ⚠️ 不能走 rename 覆盖路径——POSIX rename 会静默替换已存在目标，独占性名存实亡
+  // （回归教训见 test「并发获取拒绝」用例）。
   // token：进程级随机归属标识，释放/判定所有权须 pid+token 双匹配（评审 Medium：
   // 单看 pid 会被 OS 复用 pid 的后来进程误认；接管换主后也可能误删新主锁）。
-  const fd = fs.openSync(p, 'wx')
+  const frame = JSON.stringify({ pid: process.pid, startedAt: now, token })
+  const tmp = `${p}.${process.pid}.${now}.${crypto.randomBytes(4).toString('hex')}.tmp`
+  fs.writeFileSync(tmp, frame, { flag: 'wx' })
   try {
-    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: now, token }))
-    fs.fsyncSync(fd)
-  } finally { fs.closeSync(fd) }
+    fs.linkSync(tmp, p)
+  } catch (e) {
+    // 不支持硬链接的文件系统（少数网络卷/容器层）回退到旧的独占创建 + 写内容；
+    // EEXIST 原样上抛给 acquireLock 的「锁已存在」分支。
+    if (!e || e.code === 'EEXIST') throw e
+    if (['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'EXDEV', 'ENOSYS', 'EACCES'].includes(e.code)) {
+      const fd = fs.openSync(p, 'wx')
+      try { fs.writeFileSync(fd, frame); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+      return
+    }
+    throw e
+  } finally {
+    try { fs.unlinkSync(tmp) } catch (e) { /* 已被 link 消费或并发清理 */ }
+  }
 }
 
 function acquireLock (stateDir, now, token) {
@@ -287,29 +303,39 @@ function acquireLock (stateDir, now, token) {
       released = parsed.released === true
       if (!Number.isSafeInteger(startedAt) || startedAt <= 0) corrupted = true
     } catch (err) { corrupted = true }
-    // 锁内容损坏/startedAt 无效（Sourcery Medium #11）：无法判定持有方死活，fail-closed
-    // 视为仍被持有，由外部人工清理（README「故障排查」节说明）。不降级为按 age 接管——
-    // 那会让损坏锁在超时后被自动覆盖，重新引入「无法安全分类的锁被承认」问题。
-    if (corrupted && !released) return false
-    const stale = released || now - startedAt > PROC_TIMEOUT_MS
+    // 锁内容损坏/startedAt 无效（Sourcery Medium #11）：无法判定持有方死活。旧实现一律
+    // fail-closed ⇒ 0 字节锁（旧写入路径在 open 与 write 之间崩溃的产物）让触发永久 409，
+    // 只能人工删文件（D2-S1）。现在给一条自救路径：锁文件 mtime 已陈旧（超过单轮超时，
+    // 说明没有任何进程在维护它）时允许接管；新鲜损坏锁仍 fail-closed（可能正被写入）。
+    let corruptedStale = false
+    if (corrupted && !released) {
+      let mtimeAge = null
+      try { mtimeAge = now - fs.statSync(p).mtimeMs } catch (e) { mtimeAge = null }
+      if (!(typeof mtimeAge === 'number' && mtimeAge > PROC_TIMEOUT_MS)) return false
+      corruptedStale = true
+    }
+    const stale = released || (corrupted ? corruptedStale : (now - startedAt > PROC_TIMEOUT_MS))
     if (!stale) return false
     // 陈旧/损坏锁接管：哨兵独占，防并发接管双跑（Sourcery High）。
     const sentinel = p + '.takeover'
     let claimed = false
-    try {
-      const fd = fs.openSync(sentinel, 'wx')
-      fs.closeSync(fd)
-      claimed = true
-    } catch (err) {
-      if (err.code === 'EEXIST') {
-        // 哨兵已存在：看它是否也陈旧（上次接管者死了留下的）。
+    for (let attempt = 0; attempt < 2 && !claimed; attempt++) {
+      try {
+        const fd = fs.openSync(sentinel, 'wx')
+        fs.closeSync(fd)
+        claimed = true
+      } catch (err) {
+        if (!err || err.code !== 'EEXIST') break
+        // 哨兵已存在：可能是上一次接管者崩溃后留下的残留（它会让后续触发连续 10 分钟 409，
+        // D2-S5）。陈旧 ⇒ 先 unlink 再重抢；重抢必须走 open(wx) —— 旧实现的
+        // stat→writeFileSync 是 check-then-write，两个实例可同时 claimed。
+        let sentinelStale = false
         try {
-          const sAge = now - (fs.statSync(sentinel).mtimeMs || 0)
-          if (sAge > PROC_TIMEOUT_MS) {
-            fs.writeFileSync(sentinel, String(now))
-            claimed = true
-          }
-        } catch (err2) { claimed = false }
+          const st = fs.statSync(sentinel)
+          sentinelStale = now - st.mtimeMs > PROC_TIMEOUT_MS
+        } catch (e2) { sentinelStale = true /* 哨兵刚消失：重抢 */ }
+        if (!sentinelStale) break
+        try { fs.unlinkSync(sentinel) } catch (e2) { /* 已被并发接管者清掉 */ }
       }
     }
     if (!claimed) return false
@@ -490,7 +516,10 @@ function releaseLockFor (record) {
   try {
     fd = fs.openSync(p, 'r+')
   } catch (e) {
-    return true // 锁已不在：无事可释放
+    // 只有 ENOENT 才是「锁已不在，无事可释放」；EACCES/EMFILE/EIO 等是「读不到/打不开」——
+    // 旧实现一律 return true 会让调用方以为锁已释放，实际锁仍挂在盘上（D2-S3）。
+    // 返回 false 让调用方响亮告警（finishRun / 受理失败分支都已有告警文案）。
+    return !!e && e.code === 'ENOENT'
   }
   try {
     const raw = fs.readFileSync(fd, 'utf8')
@@ -499,7 +528,7 @@ function releaseLockFor (record) {
       // inode 一致性闸：两代不一致 = 已被 tmp+rename 接管换名，本 fd 只指向孤儿
       // inode——不覆写，锁归接管方负责（返回 false 如实上报）。
       let pathIno = 0
-      try { pathIno = fs.statSync(p).ino } catch (e) { return true /* 锁路径已消失 */ }
+      try { pathIno = fs.statSync(p).ino } catch (e) { return !!e && e.code === 'ENOENT' /* 锁路径已消失 */ }
       if (fs.fstatSync(fd).ino !== pathIno) return false
       // 归属成立：原地单次 writeSync 覆写为 released 短帧（同 inode，无 unlink）。
       // released 帧必须**不大于**原帧（ASCII 锁帧下恒成立）：writeSync 定长覆写不会
@@ -1707,17 +1736,60 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // CodeQL js/file-system-race（High）：statSync 后再 readFileSync 存在 TOCTOU——
         // 两次调用之间锁可能被释放/接管，stat 的 mtime 与 read 的内容来自不同代的锁帧。
         // 单次 readFileSync，时间与状态全部取自同一帧内容（锁帧/released 帧都写 startedAt）。
+        // 损坏/0 字节锁（D2-S1）不能报成「空闲」：看板显示空闲而按钮一直 409 正是这条
+        // finding。按 mtime 判陈旧：陈旧的损坏锁本次触发会被接管（held:false 且
+        // state:'corrupted-stale'），新鲜的损坏锁仍在阻止触发（held:true）。
         let lockAge = 0
-        let released = false
+        let lockBody = null
+        let corrupted = false
         try {
-          const lockBody = JSON.parse(fs.readFileSync(lp, 'utf8'))
+          lockBody = JSON.parse(fs.readFileSync(lp, 'utf8'))
+          // "null"/标量帧（被外部写坏）同样按损坏处理：下面 lockBody.startedAt 会抛，
+          // 不能让它冒到外层 catch 把 st.lock 留成 undefined。
+          if (!lockBody || typeof lockBody !== 'object') throw new TypeError('lock frame is not an object')
+        } catch (e2) {
+          if (e2 && e2.code === 'ENOENT') {
+            st.lock = { held: false, ageMs: 0, state: 'absent', corrupted: false, takeoverInMs: 0 }
+          } else {
+            corrupted = true
+          }
+        }
+        // 与 acquireLock 同一分类：缺 startedAt / 非正整数的帧也算损坏（否则看板说
+        // 「陈旧可抢」，acquireLock 却对新鲜损坏帧 fail-closed，两处结论相反）。
+        if (lockBody && lockBody.released !== true && !(Number.isSafeInteger(lockBody.startedAt) && lockBody.startedAt > 0)) corrupted = true
+        if (corrupted) {
+          let mtimeAge = PROC_TIMEOUT_MS
+          try { mtimeAge = Math.max(0, Date.now() - fs.statSync(lp).mtimeMs) } catch (e2) { mtimeAge = PROC_TIMEOUT_MS }
+          const held = mtimeAge <= PROC_TIMEOUT_MS
+          st.lock = {
+            held,
+            ageMs: mtimeAge,
+            state: held ? 'corrupted' : 'corrupted-stale',
+            corrupted: true,
+            takeoverInMs: held ? Math.max(0, PROC_TIMEOUT_MS - mtimeAge) : 0
+          }
+        } else if (lockBody) {
           const startedAt = typeof lockBody.startedAt === 'number' ? lockBody.startedAt : 0
+          const released = lockBody.released === true
           lockAge = startedAt > 0 ? Math.max(0, Date.now() - startedAt) : PROC_TIMEOUT_MS
-          released = lockBody.released === true
-        } catch (e2) { st.lock = { held: false, ageMs: 0 }; throw e2 }
-        st.lock = { held: !released && lockAge < PROC_TIMEOUT_MS, ageMs: lockAge }
+          const held = !released && lockAge < PROC_TIMEOUT_MS
+          st.lock = {
+            held,
+            ageMs: lockAge,
+            state: released ? 'released' : (held ? 'running' : 'stale'),
+            corrupted: false,
+            takeoverInMs: held ? Math.max(0, PROC_TIMEOUT_MS - lockAge) : 0
+          }
+        }
+        // 残留 .takeover 哨兵（上一次接管者崩溃的产物）：陈旧哨兵会阻塞接管，必须让运维
+        // 一眼看到它是「残留」而不是「正在接管」（D2-S5）。
+        try {
+          const sst = fs.statSync(lp + '.takeover')
+          const sAge = Math.max(0, Date.now() - sst.mtimeMs)
+          st.lock.sentinel = { present: true, ageMs: sAge, stale: sAge > PROC_TIMEOUT_MS }
+        } catch (e2) { /* 无哨兵 */ }
       } catch (e) {
-        if (!st.lock) st.lock = { held: false, ageMs: 0 }
+        if (!st.lock) st.lock = { held: false, ageMs: 0, state: 'unknown', corrupted: false, takeoverInMs: 0 }
       }
       sendJson(res, 200, st)
       return
