@@ -530,7 +530,11 @@ jobs:
         run: |
           tail -n 120 stryker.log || true
           echo '--- test_console.js 诊断日志 ---'
-          tail -n 80 /tmp/xbk-test-console.log || true
+          for f in "${TMPDIR:-/tmp}"/xbk-test-console-*/log; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            tail -n 120 "$f" || true
+          done
 
       # fail-closed 守卫（本轮新增）：分数门禁已撤回（break = null），但「报告本身不可信」必须仍然响亮失败。
       # 它兜住 stryker 不会置退出码的假绿通道（NaN 通道的源码依据见 stryker.config.js 的 thresholds 注释）：

@@ -28,7 +28,12 @@ if (process.env.XBK_MUTATION_CHILD === '1') {
   process.stderr.write = (c, ...rest) => { try { chunks.push(String(c)) } catch (e) {} return errWrite(c, ...rest) }
   process.on('uncaughtException', (e) => { try { chunks.push('UNCAUGHT ' + ((e && e.stack) || e) + '\n') } catch (e2) {} })
   process.on('exit', (code) => {
-    try { fs.writeFileSync('/tmp/xbk-test-console.log', 'exit=' + code + '\n' + chunks.join('').slice(-200000)) } catch (e) {}
+    // mkdtempSync 随机子目录（不直写 /tmp 固定名，Sonar S5443）；mutation.yml 的
+    // failure 步骤按 xbk-test-console-*/log 通配 tail。
+    try {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-test-console-'))
+      fs.writeFileSync(path.join(dir, 'log'), 'exit=' + code + '\n' + chunks.join('').slice(-200000), { mode: 0o600 })
+    } catch (e) {}
   })
 }
 
@@ -1028,42 +1033,42 @@ async function filterRuleApiTests () {
     try {
       assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '审计敏感词' } })).status, 200)
       assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: '第二版' } })).status, 200)
-      // 0600 与正文用同一个 fd 取（fstat 后立即读），避免「按路径 stat → 按路径读写」的
-      // TOCTOU 形态（CodeQL js/file-system-race 会把它判成 high）。
-      const auditFd = fs.openSync(paths.audit, 'r')
-      let raw
+      // 0600、正文读取与随后的篡改改写全走同一个 fd：fstat 后立即读，ftruncate + write
+      // 原地改写。全程不按路径二次打开（消除 CodeQL js/file-system-race 的
+      // 「按路径检查 → 按路径写」形态；文件被并发替换也影响不到这个 fd）。
+      const auditFd = fs.openSync(paths.audit, 'r+')
       try {
         assert.strictEqual(fs.fstatSync(auditFd).mode & 0o777, 0o600)
-        raw = fs.readFileSync(auditFd, 'utf8')
+        const raw = fs.readFileSync(auditFd, 'utf8')
+        assert.ok(!raw.includes('审计敏感词'), '审计不得写规则正文')
+        assert.ok(!raw.includes(dir), '审计不得写绝对路径')
+        const lines = raw.trim().split('\n')
+        assert.strictEqual(lines.length, 2)
+        const first = JSON.parse(lines[0])
+        assert.deepStrictEqual(Object.keys(first).sort((a, b) => a.localeCompare(b)), ['action', 'actor', 'changedFields', 'entryHash', 'prevHash', 'revision', 'ts'])
+        assert.strictEqual(first.action, 'save')
+        assert.strictEqual(first.revision, 1)
+        assert.deepStrictEqual(first.changedFields, ['pingbibiaoti'])
+        assert.strictEqual(first.actor.length, 8, 'actor = sha256(token) 前 8 位')
+        assert.strictEqual(first.prevHash, '0'.repeat(64))
+        assert.strictEqual(first.entryHash.length, 64)
+        const second = JSON.parse(lines[1])
+        assert.strictEqual(second.prevHash, first.entryHash, 'prevHash 必须接上一行 entryHash')
+
+        const before = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+        assert.strictEqual(before.auditChain.ok, true)
+        assert.strictEqual(before.auditChain.entries, 2)
+
+        const tampered = lines.slice()
+        const edited = JSON.parse(tampered[0])
+        edited.revision = 99
+        tampered[0] = JSON.stringify(edited)
+        fs.ftruncateSync(auditFd, 0)
+        fs.writeSync(auditFd, tampered.join('\n') + '\n')
+        const after = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+        assert.strictEqual(after.auditChain.ok, false, '篡改必须可检测')
+        assert.strictEqual(after.auditChain.brokenAt, 1, '断链行号从 1 开始')
       } finally { fs.closeSync(auditFd) }
-      assert.ok(!raw.includes('审计敏感词'), '审计不得写规则正文')
-      assert.ok(!raw.includes(dir), '审计不得写绝对路径')
-      const lines = raw.trim().split('\n')
-      assert.strictEqual(lines.length, 2)
-      const first = JSON.parse(lines[0])
-      assert.deepStrictEqual(Object.keys(first).sort((a, b) => a.localeCompare(b)), ['action', 'actor', 'changedFields', 'entryHash', 'prevHash', 'revision', 'ts'])
-      assert.strictEqual(first.action, 'save')
-      assert.strictEqual(first.revision, 1)
-      assert.deepStrictEqual(first.changedFields, ['pingbibiaoti'])
-      assert.strictEqual(first.actor.length, 8, 'actor = sha256(token) 前 8 位')
-      assert.strictEqual(first.prevHash, '0'.repeat(64))
-      assert.strictEqual(first.entryHash.length, 64)
-      const second = JSON.parse(lines[1])
-      assert.strictEqual(second.prevHash, first.entryHash, 'prevHash 必须接上一行 entryHash')
-
-      const before = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
-      assert.strictEqual(before.auditChain.ok, true)
-      assert.strictEqual(before.auditChain.entries, 2)
-
-      const tampered = lines.slice()
-      const edited = JSON.parse(tampered[0])
-      edited.revision = 99
-      tampered[0] = JSON.stringify(edited)
-      const tamperFd = fs.openSync(paths.audit, 'w')
-      try { fs.writeSync(tamperFd, tampered.join('\n') + '\n') } finally { fs.closeSync(tamperFd) }
-      const after = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
-      assert.strictEqual(after.auditChain.ok, false, '篡改必须可检测')
-      assert.strictEqual(after.auditChain.brokenAt, 1, '断链行号从 1 开始')
     } finally { server.close() }
   })
 

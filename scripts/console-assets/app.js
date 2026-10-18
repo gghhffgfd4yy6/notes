@@ -2541,7 +2541,7 @@ function FilterRulesPanel ({ onSync }) {
       if (res.ok) {
         const payload = res.data && typeof res.data === 'object' ? res.data : {}
         applySaved(base, payload.revision, true)
-        refreshBackups(Number.isSafeInteger(payload.revision) ? payload.revision : (data ? data.revision : 0))
+        refreshBackups(Number.isSafeInteger(payload.revision) ? payload.revision : data.revision)
         return
       }
       const code = showFailure(res, '复制默认规则失败')
