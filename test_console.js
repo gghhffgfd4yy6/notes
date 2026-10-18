@@ -2274,7 +2274,7 @@ async function main () {
   await aok('分页/横滑控件: 运行历史与推送记录都有每页条数，趋势与历史表可横向滑动', () => {
     const js = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
-    assert.ok(/const RUN_PAGE_SIZES = \[2, 3, 5, 10\]/.test(js), '运行历史每页条数须为 2/3/5/10')
+    assert.ok(/const RUN_PAGE_SIZES = \[10, 20, 50, 100\]/.test(js), '运行历史每页条数须为 10/20/50/100')
     const sizeSelects = js.match(/aria-label="每页显示条数"/g) || []
     assert.ok(sizeSelects.length >= 2, '运行历史与推送记录各要有一个每页条数选择')
     // 选择器必须是「活的」：选项由常量渲染 + 改变时真的改条数（评审 #243-7）
@@ -2419,16 +2419,21 @@ async function main () {
     fs.writeFileSync(path.join(dir, 'run.log'), [
       '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
       '2026-10-15 09:05:00 CANCEL 控制台停止：任务 #1792236290484.7（run）于运行中被停止（SIGTERM）',
+      '2026-10-15 09:05:00 CANCEL 控制台停止：任务 #1792236290484.8（check）于运行中被停止（SIGTERM）',
       '2026-10-15 11:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=1s cachesaved=1'
     ].join('\n') + '\n')
     const r = readRunHistory(dir, { limit: 5 })
     assert.deepStrictEqual(r.items.map((x) => x.at),
-      ['2026-10-15 11:00:00', '2026-10-15 09:05:00', '2026-10-15 09:00:00'])
+      ['2026-10-15 11:00:00', '2026-10-15 09:05:00', '2026-10-15 09:05:00', '2026-10-15 09:00:00'])
     assert.strictEqual(r.items[1].cancelled, true, '取消留痕必须生成 cancelled 条目（这轮不能消失）')
+    assert.strictEqual(r.items[2].cancelled, true, '同秒两条停止留痕必须是两条独立记录')
     assert.strictEqual(r.items[1].isPlaceholder, true)
     assert.strictEqual(r.items[1].interrupted, false, '取消不是运行失败')
     assert.strictEqual(r.items[0].interrupted, false, '取消留痕不得把下一轮标成中断')
-    assert.strictEqual(r.items[2].interrupted, false, '也不得把上一轮标成中断')
+    assert.strictEqual(r.items[3].interrupted, false, '也不得把上一轮标成中断')
+    const only = readRunHistory(dir, { limit: 5, excludeCancelled: true })
+    assert.deepStrictEqual(only.items.map((x) => x.at),
+      ['2026-10-15 11:00:00', '2026-10-15 09:00:00'], '「仅运行」在服务端排除取消留痕')
   })
   await aok('createConsole: 注入 stateDir 优先于全局缓存；显式 runHistoryDir 可覆盖（Sourcery 注入目录被绕过）', async () => {
     const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtime-dir-'))
@@ -3321,9 +3326,9 @@ async function main () {
     assert.strictEqual(logLineKind(alertLine), 'alert')
     assert.strictEqual(logLineKind(okLine), 'summary')
     const counts = logLineCounts(txt)
-    assert.deepStrictEqual(counts, { all: 5, issue: 3, error: 2, alert: 1, warn: 0, summary: 2, console: 1 })
+    assert.deepStrictEqual(counts, { all: 5, issue: 3, error: 1, alert: 1, warn: 0, summary: 2, console: 1 })
     assert.deepStrictEqual(filterLogLines(txt, 'console', ''), [life], '控制台筛选只留生命周期')
-    assert.deepStrictEqual(filterLogLines(txt, 'error', ''), [life, errLine], '错误=按原始级别（含生命周期）')
+    assert.deepStrictEqual(filterLogLines(txt, 'error', ''), [errLine], '错误只算业务 ERROR，不含控制台停止')
     assert.deepStrictEqual(filterLogLines(txt, 'issue', ''), [errLine, alertLine, failLine], '异常已排除生命周期')
     assert.strictEqual(ageFromStamp('2026-10-18 00:00:00', Date.UTC(2026, 9, 17, 16, 0, 0)), '刚刚')
     assert.strictEqual(ageFromStamp('bad', 0), '')
@@ -3338,6 +3343,7 @@ async function main () {
       { at: '', failed: 0, interrupted: false }
     ]
     assert.strictEqual(filterRunItems(runs, { mode: 'issue' }).length, 3, '失败/中断/取消都算 issue')
+    assert.strictEqual(filterRunItems(runs, { mode: 'runs' }).length, 3, '仅运行排除取消留痕')
     assert.deepStrictEqual(filterRunItems(runs, { day: '2026-10-15' }).map((r) => r.at), ['2026-10-15 10:00:00', '2026-10-15 11:00:00'])
     assert.strictEqual(filterRunItems(runs, { mode: 'issue', day: '2026-10-14' }).length, 1, '筛选取交集')
     assert.strictEqual(filterRunItems(null, { mode: 'issue' }).length, 0)

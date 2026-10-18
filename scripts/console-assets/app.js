@@ -71,6 +71,8 @@ function fmtLocalTime (ts) {
 function fmtBytes (b) {
   if (typeof b !== 'number' || !Number.isFinite(b) || b < 0) return '—'
   if (b === 0) return '0 B'
+  if (b < 1024) return `${b} B`
+  if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`
   return `${(b / 1048576).toFixed(1)} MB`
 }
 
@@ -194,12 +196,13 @@ function apiCancelRun (id) {
 }
 
 // 逐轮运行历史（v3.299 批次②）：run.log 摘要行解析（服务端），分页游标 before=已看轮数。
-function apiGetRunHistory ({ limit, before, windowKey } = {}) {
+function apiGetRunHistory ({ limit, before, windowKey, excludeCancelled = false } = {}) {
   const params = new URLSearchParams()
   if (Number.isSafeInteger(limit) && limit > 0) params.set('limit', String(limit))
   if (Number.isSafeInteger(before) && before > 0) params.set('before', String(before))
   // 尾窗指纹：只在服务端下发过时回传（8 位十六进制），翻页跨窗口时服务端会判 stale
   if (typeof windowKey === 'string' && /^[0-9a-f]{8}$/.test(windowKey)) params.set('win', windowKey)
+  if (excludeCancelled === true) params.set('excludeCancelled', '1')
   const qs = params.toString()
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
@@ -353,10 +356,12 @@ async function triggerNotifyTest () {
 }
 
 // ── 组件：状态徽章 ──────────────────────────────────────────────────────────
-// tone: 'ok'=正常绿 | 'bad'=异常红 | 'run'=中性黄（运行中/无记录）
-// 显式字符串三态而非 true/false/null 魔值（CodeQL implicit null→string conversion）。
+// tone: 'ok'=正常绿 | 'bad'=异常红 | 'warn'=有历史失败琥珀 | 'run'=中性黄（运行中/无记录）
+// 显式字符串四态而非 true/false/null 魔值（CodeQL implicit null→string conversion）。
 function Badge ({ tone, children }) {
-  const cls = tone === 'ok' ? 'badge-ok' : (tone === 'bad' ? 'badge-bad' : 'badge-run')
+  const cls = tone === 'ok'
+    ? 'badge-ok'
+    : (tone === 'bad' ? 'badge-bad' : (tone === 'warn' ? 'badge-warn' : 'badge-run'))
   return html`<span class="badge ${cls}">${children}</span>`
 }
 
@@ -437,6 +442,22 @@ function validChannelEntry (name, entry) {
     validCounter(entry.lastAlertAt)
 }
 
+// 渠道 id → 展示名：配置页/状态卡不再把 `serverchan` 这种内部键直接端给用户。
+const CHANNEL_LABELS = {
+  pushplus: 'PushPlus',
+  serverchan: 'Server酱',
+  bark: 'Bark',
+  wecom: '企业微信',
+  wxpusher: 'WxPusher',
+  xizhi: '息知',
+  pushdeer: 'PushDeer',
+  pushme: 'PushMe',
+  telegram: 'Telegram'
+}
+function channelLabel (k) {
+  return CHANNEL_LABELS[k] || k
+}
+
 function channelInfo (state) {
   // Sourcery G_oY：先看部件 status 再看 value——
   //   missing（文件还没建）→ 中性「暂无记录」；
@@ -452,7 +473,7 @@ function channelInfo (state) {
   const allKeys = Object.keys(raw)
   const entries = allKeys
     .filter((k) => validChannelEntry(k, raw[k]))
-    .map((k) => ({ name: k.length > 0 ? k : '(空名)', failures: raw[k].consecutiveFailures }))
+    .map((k) => ({ name: k.length > 0 ? channelLabel(k) : '(空名)', failures: raw[k].consecutiveFailures }))
   // Sourcery Corrupt-channels x2：合法条目全健康但存在畸形条目时，此前 filter 掉畸形后
   // 整卡仍显示绿色「正常」——数据损坏被吞。只要 valid 条目数 < 总键数即标红，
   // 提示「部分通道数据异常」，畸形条目名一并列出。
@@ -505,7 +526,11 @@ function AlertBanner ({ state, onOpenLog }) {
   const lastFail = stats ? stats.lastFailure : null
   const orphan = run && typeof run.orphanFailures === 'number' ? run.orphanFailures : 0
   const runBad = !!(run && (run.interrupted === true || (typeof run.failed === 'number' && run.failed > 0) || orphan > 0))
-  if (!runBad && !lastFail) return null
+  // 周失败只在「今天/昨天」置顶：三天前的失败仍留在「近 7 天」卡里，但不再每天红着脸占首屏。
+  // 运行级异常（最近一轮失败/中断/孤儿失败）始终置顶，不受日期限制。
+  const failRel = lastFail ? relDay(lastFail.date) : ''
+  const recentFail = !!(lastFail && (failRel === '今天' || failRel === '昨天'))
+  if (!runBad && !recentFail) return null
   const at = orphan > 0 && run.orphanFailureAt ? run.orphanFailureAt : (runBad && run.at ? run.at : (lastFail ? lastFail.at : ''))
   const text = orphan > 0 && !(run && (run.interrupted === true || run.failed > 0))
     ? `运行日志有 ${orphan} 条失败行未归属任何轮次（独立崩溃，最近 ${run.orphanFailureAt || '时间未知'}）`
@@ -541,13 +566,15 @@ function StatusCards ({ state }) {
   const repRel = rep ? relDay(rep.date) : ''
   const rateText = (r) => (r && typeof r.successRate === 'number' ? `${(r.successRate * 100).toFixed(1)}%` : '—')
   const todayTone = !today ? 'run' : (today.failed > 0 ? 'bad' : (today.rounds > 0 ? 'ok' : 'run'))
-  const weekTone = !week ? 'run' : (week.rounds > 0 && week.failed === 0 ? 'ok' : 'run')
+  // 周失败用琥珀色而非红色：它仍是「过去 7 天」的事实，但不应让三天前的故障长期染红首屏。
+  const weekTone = !week ? 'run' : (week.failed > 0 ? 'warn' : (week.rounds > 0 ? 'ok' : 'run'))
   const chanTone = (chan.tone === 'bad' || diagTone === 'bad') ? 'bad' : (chan.tone === 'ok' ? 'ok' : 'run')
   const runAge = run ? ageFromStamp(run.at) : ''
   const cards = [
     {
       title: '今日',
       tone: todayTone,
+      badge: !today ? '—' : (today.failed > 0 ? '异常' : (today.rounds > 0 ? '正常' : '—')),
       lines: today
         ? [
             `轮次 ${today.rounds} · 推送 ${today.pushed}`,
@@ -559,6 +586,7 @@ function StatusCards ({ state }) {
     {
       title: '近 7 天',
       tone: weekTone,
+      badge: !week ? '—' : (week.failed > 0 ? '有失败' : (week.rounds > 0 ? '正常' : '—')),
       lines: week
         ? [
             `轮次 ${week.rounds} · 推送 ${week.pushed}`,
@@ -571,28 +599,30 @@ function StatusCards ({ state }) {
     {
       title: '最近一轮',
       tone: runTone,
+      badge: !run ? '—' : (run.cancelled === true ? '已取消' : (run.interrupted || run.failed > 0 ? '异常' : '正常')),
       lines: run
         ? [
             `${runAge || '时间未知'}${run.at ? ` · ${run.at.slice(5, 16)}` : ''}`,
             `获取 ${fmtNum(run.total)} · 推送 ${fmtNum(run.pushed)} · 失败 ${fmtNum(run.failed)}`,
-            `耗时 ${fmtNum(run.elapsed)}${run.interrupted ? ' · ⚠️ 中断' : ''}`
+            `耗时 ${fmtNum(run.elapsed)}${run.cancelled === true ? ' · ⏹ 已取消' : run.interrupted ? ' · ⚠️ 中断' : ''}`
           ]
         : ['暂无数据']
     },
     {
       title: '通道与过滤',
       tone: chanTone,
+      badge: chanTone === 'bad' ? '异常' : (chanTone === 'ok' ? '正常' : '—'),
       lines: [
         ...(chan.entries.length > 0
           ? [...chan.entries.map((e) => `${e.name}：连续失败 ${fmtNum(e.failures)} 次`), ...(chan.note ? [chan.note] : [])]
           : [chan.note || '暂无记录']),
-        ...diagLines.map((l) => `过滤：${l}`)
+        ...(diagLines.length > 0 ? [`过滤 ${diagLines.join(' · ')}`] : [])
       ]
     }
   ]
   return html`<div class="cards">
     ${cards.map((c) => html`<${Card} key=${c.title} title=${c.title}
-      badge=${html`<${Badge} tone=${c.tone}>${c.tone === 'run' ? '—' : (c.tone === 'ok' ? '正常' : '异常')}<//>`}>
+      badge=${html`<${Badge} tone=${c.tone}>${c.badge}<//>`}>
       ${c.lines.map((l) => html`<div key=${l}>${l}</div>`)}
     <//>`)}
   </div>`
@@ -950,12 +980,13 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
 // 现在一次取尾窗最近 200 轮（服务端上限），在前端做「只看失败/中断」「按日期」筛选与页码分页；
 // 数据量小（≤200 条），换来的是「跳日期、看失败、点日志」三件事都能直接做。
 // 尾窗指纹/stale 语义仍由服务端保留（本组件只发一次 limit=200，不翻游标）。
-const RUN_PAGE_SIZES = [2, 3, 5, 10]
+const RUN_PAGE_SIZES = [10, 20, 50, 100]
 const RUN_FETCH_LIMIT = 200
 
 function RunHistoryPanel ({ onOpenLog }) {
   const [size, setSize] = useState(10)
-  const [mode, setMode] = useState('all')
+  // 默认只看真实轮次：取消留痕是操作审计，不该在每次打开历史时占据一半行。
+  const [mode, setMode] = useState('runs')
   const [day, setDay] = useState('')
   const [pageNo, setPageNo] = useState(1)
   const [data, setData] = useState(null)
@@ -967,7 +998,7 @@ function RunHistoryPanel ({ onOpenLog }) {
     const seq = ++seqRef.current
     setLoading(true)
     try {
-      const d = await apiGetRunHistory({ limit: RUN_FETCH_LIMIT })
+      const d = await apiGetRunHistory({ limit: RUN_FETCH_LIMIT, excludeCancelled: mode === 'runs' })
       if (seq !== seqRef.current) return
       setData(d)
       setErr('')
@@ -976,11 +1007,12 @@ function RunHistoryPanel ({ onOpenLog }) {
     } finally {
       if (seq === seqRef.current) setLoading(false)
     }
-  }, [])
+  }, [mode])
   useEffect(() => { load().catch(() => {}) }, [load])
 
   const all = data && data.status === 'ok' && Array.isArray(data.items) ? data.items : []
   const issueCount = filterRunItems(all, { mode: 'issue' }).length
+  const runsCount = filterRunItems(all, { mode: 'runs' }).length
   const filtered = filterRunItems(all, { mode, day })
   const pages = Math.max(1, Math.ceil(filtered.length / size))
   const current = Math.min(pageNo, pages)
@@ -1001,7 +1033,11 @@ function RunHistoryPanel ({ onOpenLog }) {
   }
   return html`<div class="panel">
     <${PanelHead} title="逐轮运行历史"
-      sub=${`run.log 摘要逐轮 · 最近 ${all.length} 轮` + (data && data.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : '')}
+      sub=${err
+        ? 'run.log 读取失败'
+        : (data
+            ? `run.log 摘要逐轮 · 最近 ${all.length} 轮` + (data.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : '')
+            : 'run.log 摘要逐轮 · 加载中…')}
       right=${html`<div class="toolbar">
         <select class="msg-select" value=${size} onChange=${(e) => changeSize(Number(e.target.value))} aria-label="每页显示条数">
           ${RUN_PAGE_SIZES.map((n) => html`<option key=${n} value=${n}>每页 ${n} 条</option>`)}
@@ -1012,28 +1048,31 @@ function RunHistoryPanel ({ onOpenLog }) {
     ${data && data.status === 'ok' && html`<div class="run-tools">
       <div class="log-chips" role="group" aria-label="逐轮筛选">
         <button type="button" class=${'log-chip' + (mode === 'all' ? ' on' : '')}
-          aria-pressed=${mode === 'all' ? 'true' : 'false'} onClick=${() => { setMode('all'); setPageNo(1) }}>全部 ${all.length}</button>
+          aria-pressed=${mode === 'all' ? 'true' : 'false'} onClick=${() => { setMode('all'); setPageNo(1) }}>${mode === 'all' ? `全部 ${all.length}` : '全部'}</button>
+        <button type="button" class=${'log-chip' + (mode === 'runs' ? ' on' : '')}
+          aria-pressed=${mode === 'runs' ? 'true' : 'false'} onClick=${() => { setMode('runs'); setPageNo(1) }}>仅运行 ${runsCount}</button>
         <button type="button" class=${'log-chip' + (mode === 'issue' ? ' on' : '')}
-          aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => { setMode('issue'); setPageNo(1) }}>只看失败/中断 ${issueCount}</button>
+          aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => { setMode('issue'); setPageNo(1) }}>${mode === 'runs' ? '只看异常' : `只看异常 ${issueCount}`}</button>
       </div>
       <label class="run-day">
         <span>日期</span>
         <input type="date" value=${day} onInput=${(e) => changeDay(e.target.value)} onChange=${(e) => changeDay(e.target.value)} aria-label="按日期筛选轮次" />
       </label>
       ${day !== '' && html`<button type="button" class="log-chip on" onClick=${() => changeDay('')}>清除日期</button>`}
-      <span class="run-tools-note">${mode === 'issue' ? '只显示失败或中断的轮次' : '点行尾「日志」跳到该日日志'}</span>
+      <span class="run-tools-note">${mode === 'issue' ? '只显示失败、中断或取消的轮次' : (mode === 'runs' ? '不显示取消留痕；切「全部」可查' : '点行尾「日志」跳到该日日志')}</span>
     </div>`}
     ${data && data.status && data.status !== 'ok' && html`<div class="empty">run.log${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
+    ${!data && !err && html`<div class="empty">加载中…</div>`}
     ${shown.length > 0 && html`<div class="runs-scroll"><table class="runs-table">
       <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
       <tbody>
         ${shown.map((r, i) => html`<tr key=${`${r.at}-${r.lineNo}-${i}`}>
           <td class="mono">${r.cancelled === true ? `${r.at || '—'} ⏹已取消` : r.interrupted ? `${r.at || '—'} ⚠️中断` : (r.at || '—')}</td>
-          <td>${r.total === null ? '—' : r.total}</td>
-          <td>${r.dedup === null ? '—' : r.dedup}</td>
-          <td>${r.filtered === null ? '—' : r.filtered}</td>
-          <td>${r.dryRun !== null ? `试跑 ${r.dryRun}` : r.pushed}</td>
-          <td>${r.failed > 0 ? html`<span class="sync-err">${r.failed}</span>` : r.failed}</td>
+          <td>${r.total == null ? '—' : r.total}</td>
+          <td>${r.dedup == null ? '—' : r.dedup}</td>
+          <td>${r.filtered == null ? '—' : r.filtered}</td>
+          <td>${r.dryRun != null ? `试跑 ${r.dryRun}` : (r.pushed == null ? '—' : r.pushed)}</td>
+          <td>${r.failed == null ? '—' : (r.failed > 0 ? html`<span class="sync-err">${r.failed}</span>` : r.failed)}</td>
           <td class="mono">${r.elapsed || '—'}</td>
           <td class="run-actions">${r.cachesaved === 0 ? html`<span class="run-note">未落盘</span>` : ''}
             <button type="button" class="row-link" disabled=${!r.at} onClick=${() => jumpLog(r)}>日志</button></td>
@@ -1060,7 +1099,7 @@ function RunHistoryPanel ({ onOpenLog }) {
 // failed>0 的日子用红色渐变提示；0 推送的日子画灰色基线（看得见「没有数据」≠ 没画）。
 // 面板加载器公共骨架：data/err 状态 + load()（成功清错、失败写横幅）。
 // apiFn 由调用方用 useCallback/useMemo 固定引用，避免 effect 风暴。
-function usePanelLoader (apiFn) {
+function usePanelLoader (apiFn, onLoaded) {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
@@ -1073,13 +1112,14 @@ function usePanelLoader (apiFn) {
       if (seq !== seqRef.current) return // 已有更新的请求，本次响应作废
       setData(d)
       setErr('')
+      if (typeof onLoaded === 'function') onLoaded(Date.now())
     } catch (e) {
       if (seq !== seqRef.current) return
       setErr(`加载失败：${e.message}`)
     } finally {
       if (seq === seqRef.current) setLoading(false)
     }
-  }, [apiFn])
+  }, [apiFn, onLoaded])
   return { data, err, load, loading }
 }
 
@@ -1490,7 +1530,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   </div>`
 }
 
-function MessagesPanel () {
+function MessagesPanel ({ onSync }) {
   const [page, setPage] = useState(1)
   const [size, setSize] = useState(20)
   const [cate, setCate] = useState('')
@@ -1512,7 +1552,7 @@ function MessagesPanel () {
       return apiGetMessages({ page, size, cate, q: query, days })
     },
     [page, size, cate, query, days])
-  const { data, err, load, loading } = usePanelLoader(fetchMessages)
+  const { data, err, load, loading } = usePanelLoader(fetchMessages, onSync)
   useEffect(() => { load().catch(() => {}) }, [load])
   // 结果集缩小后旧页码可能超过新页数（服务端按请求页切片，回空 items）。收到响应后把
   // 页码钳到最后一页并重拉，避免「在后面的页点刷新，整页空白」。
@@ -1676,8 +1716,8 @@ function MessagesPanel () {
 
 // 运行日志：run.log 尾部（服务端 1MiB 上限），进页拉一次 + 手动刷新；有任务在跑时跟随轮询。
 // 异常口径与筛选在 pure.mjs（isIssueLogLine / filterLogLines），组件与测试共用。
-function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all' }) {
-  const { data, err, load: loadRaw } = usePanelLoader(apiGetLogs)
+function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync }) {
+  const { data, err, load: loadRaw } = usePanelLoader(apiGetLogs, onSync)
   const preRef = useRef(null)
   const stickRef = useRef(true)
   const prevTextRef = useRef('')
@@ -1778,18 +1818,18 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all' }) {
         <input class="msg-search log-search" type="search" placeholder="搜索日志…" aria-label="搜索日志"
           value=${q} onInput=${(e) => { stickRef.current = true; setQ(e.target.value) }} />
       </div>
-      <div class="log-count">${mode !== 'all' || kw !== '' ? `显示 ${filtered.length} / ${lines.length} 行` : `共 ${lines.length} 行`}${mode === 'issue' ? ' · 已排除控制台停止记录' : ''}</div>
+      <div class="log-count">${mode !== 'all' || kw !== '' ? `显示 ${filtered.length} / ${lines.length} 行` : `共 ${lines.length} 行`}${mode === 'issue' || mode === 'error' ? ' · 已排除控制台停止记录' : ''}</div>
       <pre class="logpre" ref=${preRef} onScroll=${onLogScroll}>${filtered.length > 0 ? shownText : (lines.length === 0 ? '（空）' : '（没有匹配的日志行）')}</pre>
     </div>`}
   </div>`
 }
 
 // 系统信息：版本 / 运行环境 / 进程 / 缓存目录。全部只读，无操作按钮。
-function SysPanel () {
+function SysPanel ({ onSync }) {
   // 访问日志（v3.300 §3.3）：第二个 loader 并列拉取；「刷新」按钮同日 load 两个。
   // 近窗未授权尝试数 = 服务端独立 401 计数（进程启动以来、不随环形窗截断）。
-  const { data: sys, err, load } = usePanelLoader(apiGetSys)
-  const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog)
+  const { data: sys, err, load } = usePanelLoader(apiGetSys, onSync)
+  const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog, onSync)
   useEffect(() => { load().catch(() => {}) }, [load])
   useEffect(() => { loadAccess().catch(() => {}) }, [loadAccess])
   const refreshAll = () => { load(); loadAccess() }
@@ -1899,8 +1939,8 @@ function ChannelList ({ pc }) {
         ? html`<div class="empty">未配置任何渠道</div>`
         : html`<div class="chan-grid">
           ${names.map((k) => html`<span key=${k} class=${'chan-chip' + (isOn(k) ? ' on' : '')}
-            role="img" aria-label=${`${k}：${isOn(k) ? '已配置' : '未配置'}`}>
-            <span class="chan-dot" aria-hidden="true"></span>${k}
+            role="img" aria-label=${`${channelLabel(k)}：${isOn(k) ? '已配置' : '未配置'}`}>
+            <span class="chan-dot" aria-hidden="true"></span>${channelLabel(k)}
           </span>`)}
         </div>`}
   </div>`
@@ -1908,8 +1948,8 @@ function ChannelList ({ pc }) {
 
 // 运行配置脱敏视图（v3.298）：推送密钥只显示「已配置/未配置」，值永不下发（服务端白名单
 // + 响应前保险丝双道防线）。进配置页加载 + 手动刷新。
-function ConfigPanel () {
-  const { data, err, load } = usePanelLoader(apiGetConfig)
+function ConfigPanel ({ onSync }) {
+  const { data, err, load } = usePanelLoader(apiGetConfig, onSync)
   useEffect(() => { load().catch(() => {}) }, [load])
   const r = data && data.runtime ? data.runtime : null
   const pc = data && data.pushChannels ? data.pushChannels : null
@@ -2168,7 +2208,7 @@ function App () {
         <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
       </div>
       <div class="sync">
-        ${tab === 'overview' || tab === 'logs'
+        ${tab === 'overview'
           ? html`${autoRefresh ? `自动刷新 · ${remain}s` : '自动刷新已暂停'}${lastSync ? ` · ${fmtLocalTime(lastSync)}` : ''}
             <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
               onClick=${() => { setNowMs(Date.now()); setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`
@@ -2199,15 +2239,15 @@ function App () {
       <${RunHistoryPanel} onOpenLog=${openLog} />
       <${CacheHealthPanel} paused=${!autoRefresh} />
     </div>`}
-    ${!authExpired && tab === 'messages' && html`<${MessagesPanel} />`}
+    ${!authExpired && tab === 'messages' && html`<${MessagesPanel} onSync=${setLastSync} />`}
     ${!authExpired && tab === 'logs' && html`<div>
       ${runs.length > 0 && html`<${RunsPanel} runs=${runs} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />`}
       <${LogsPanel} key=${logJump ? logJump.n : 'base'} pollMs=${autoRefresh && locking ? POLL_BUSY_MS : 0}
-        initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} />
+        initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} onSync=${setLastSync} />
     </div>`}
-    ${!authExpired && tab === 'config' && html`<${ConfigPanel} />`}
+    ${!authExpired && tab === 'config' && html`<${ConfigPanel} onSync=${setLastSync} />`}
     ${!authExpired && tab === 'sys' && html`<div>
-      <${SysPanel} />
+      <${SysPanel} onSync=${setLastSync} />
       <${FilesPanel} />
     </div>`}
 

@@ -229,6 +229,33 @@ function classifyRoundFailures (lines, summaryAt) {
 function parseLastRun (read) {
   if (read.status !== 'ok') return { status: read.status }
   const lines = read.value.trim().split('\n').filter(Boolean)
+  // 取消留痕也可能就是「最近一轮」：它没有 counters，旧实现跳过它继续找上一条摘要，
+  // 于是刚被停止的任务在状态卡里显示成上一轮「正常」。只取比最后一条摘要更晚的 CANCEL；
+  // 取消后若已有新摘要，仍以新摘要为准。
+  const summaryAt = summaryIndexOf(lines)
+  let lastSummary = -1
+  for (const idx of summaryAt.keys()) lastSummary = Math.max(lastSummary, idx)
+  let lastCancel = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (isCancelTrace(lines[i])) lastCancel = i
+  }
+  if (lastCancel > lastSummary) {
+    return result('ok', {
+      at: tsOf(lines[lastCancel]),
+      total: null,
+      dedup: null,
+      filtered: null,
+      truncated: null,
+      pushed: null,
+      failed: null,
+      elapsed: '',
+      interrupted: false,
+      cancelled: true,
+      isPlaceholder: true,
+      orphanFailures: 0,
+      orphanFailureAt: ''
+    })
+  }
   for (let i = lines.length - 1; i >= 0; i--) {
     // 行首锚定：摘要行只可能是「时间戳（本地 YYYY-MM-DD HH:MM:SS 或历史 ISO）+ total=」或裸 total=，
     // 避免 ERROR/ALERT 行文本里恰好含 total=… 子串时被误取。
@@ -512,7 +539,7 @@ function isCancelTrace (line) {
   return /(?:^|\s)CANCEL(?:\s|$)/.test(line) && line.includes('控制台停止：任务 #')
 }
 
-function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
+function readRunHistory (dir, { limit = 50, before = 0, windowKey = '', excludeCancelled = false } = {}) {
   const lim = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50
   // before 两种形态（审查 D1-S3）：数字 = 行号游标（兼容旧前端；尾窗平移后需窗口指纹校验），
   // 8 位十六进制 = 条目 key 游标（追加安全，新前端使用）。
@@ -593,6 +620,7 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
   }
   // 文件序倒置即时间倒序（摘要行在其失败行之后写出；占位行号取失败行自身）。
   // 取消留痕单独成条（cancelled=true），既不标相邻轮中断、也不让这轮消失。
+  // 同秒多条停止留痕保持独立：每条的 task/action 都可能是不同请求，不能按时间合并。
   for (let i = 0; i < lines.length; i++) {
     if (summaryAt.has(i) || crashIdx.has(i) || !isCancelTrace(lines[i])) continue
     rounds.push({
@@ -625,14 +653,17 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
     roundKey.set(r.i, n === 1 ? h : `${h}-${n}`)
   }
   rounds.sort((a, b) => b.i - a.i)
-  let pool = rounds
+  // 「仅运行」在服务端先排除取消留痕再套 200 条上限：否则一次批量停止的 CANCEL 会把
+  // 较早的真实轮次挤出尾窗，前端再筛也找不回来（Sourcery PR#252）。
+  const visibleRounds = excludeCancelled ? rounds.filter((r) => r.cancelled !== true) : rounds
+  let pool = visibleRounds
   if (beforeKey !== '') {
-    const anchor = rounds.findIndex((r) => roundKey.get(r.i) === beforeKey)
+    const anchor = visibleRounds.findIndex((r) => roundKey.get(r.i) === beforeKey)
     // 锚点轮已滚出尾窗（或 key 从未存在）：游标无法定位，宁可重看第 1 页
     if (anchor < 0) return { status: 'stale', items: [], hasMore: false, truncated, windowKey: key }
-    pool = rounds.slice(anchor + 1)
+    pool = visibleRounds.slice(anchor + 1)
   } else if (beforeLine > 0) {
-    pool = rounds.filter((r) => r.i + 1 <= beforeLine)
+    pool = visibleRounds.filter((r) => r.i + 1 <= beforeLine)
   }
   const items = pool.slice(0, lim).map((r) => ({
     at: r.at,
