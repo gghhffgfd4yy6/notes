@@ -3150,19 +3150,39 @@ async function main () {
     assert.ok(/ev\.persisted|e\.persisted/.test(src), 'pageshow 分支须判 persisted 后重载')
   })
 
-  await aok('静态红线: 运行 id 是 string，禁 typeof … === number 判定（v3.299 回归）', () => {
+  await aok('静态红线: 运行 id 是 string，禁 typeof / Number.is* 的 number 判定（v3.299 回归）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     // v3.299 事故形态：服务端把 run id 从 number 改成 'epoch.seq' 字符串后，前端仍有
     // `typeof id === 'number'` 守卫 → 按钮永久禁用、请求永不发出，且页面无任何报错。
     // 不用单条正则：别名（runId）、括号（(id)）、下标（rows[i].id）、!== 都要覆盖。
+    // 旧实现的两个洞：/id$/i 把 `valid` 误报成 id；只看 typeof，Number.isInteger(detail.id)
+    // 这类等价写法静默通过。
+    const isIdOperand = (raw) => {
+      // 归一化：detail['id'] → detail.id；空白去掉。保留 ?. 与 || 等复合形态，
+      // 用「id 记号」判定而不是整串后缀——detail?.id、id || 0 都要命中，
+      // 同时不能把 valid / rowId 误判成运行 id。
+      const t = String(raw)
+        .replace(/\[['"](id|runId|openId|detailId)['"]\]/g, '.$1')
+        .replace(/\s+/g, '')
+      return /(?:^|[.?])(?:id|runId|openId|detailId)(?![A-Za-z0-9_$])/.test(t)
+    }
+    assert.strictEqual(isIdOperand('detail.id'), true, 'detail.id 必须识别为运行 id')
+    assert.strictEqual(isIdOperand('runId'), true, 'runId 必须识别')
+    assert.strictEqual(isIdOperand('detail?.id'), true, '可选链 detail?.id 必须识别')
+    assert.strictEqual(isIdOperand('id || 0'), true, '复合操作数 id || 0 必须识别')
+    assert.strictEqual(isIdOperand("detail['id']"), true, '下标写法 detail["id"] 必须识别')
+    assert.strictEqual(isIdOperand('valid'), false, 'valid 以 id 结尾但不是 id 表达式（旧 /id$/ 会误报）')
+    assert.strictEqual(isIdOperand('rowId'), false, 'rowId 是行 key，不是运行 id')
+
     const offenders = []
     for (const seg of src.split('typeof').slice(1)) {
-      const head = seg.slice(0, 80)
-      if (!/[!=]==\s*['"]number['"]/.test(head)) continue
-      const operand = head.split(/[!=]==/)[0].replace(/[\s()]/g, '')
-      if (/id$/i.test(operand)) offenders.push(operand)
+      const m = seg.slice(0, 120).match(/^\s*\(*([^=!]+?)\)*\s*[!=]==\s*['"]number['"]/)
+      if (m && isIdOperand(m[1])) offenders.push(m[1].trim())
     }
-    assert.deepStrictEqual(offenders, [], '不得用 typeof <id 表达式> === "number" 判定运行 id（id 恒为 string）')
+    for (const m of src.matchAll(/Number\.(?:isInteger|isSafeInteger|isFinite)\s*\(\s*([^)]+)\)/g)) {
+      if (isIdOperand(m[1])) offenders.push(`Number.is*(${m[1].trim()})`)
+    }
+    assert.deepStrictEqual(offenders, [], '不得用 typeof / Number.is* 对运行 id 做 number 判定（id 恒为 string）')
   })
 
   await aok('结构红线: RunsPanel 模板的 <div> 必须成对闭合（漏根 </div> 回归）', () => {
@@ -3225,13 +3245,26 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function FilterRules ('), '必须有 FilterRules 组件（一条规则一行）')
     assert.ok(src.includes('function ChannelList ('), '必须有 ChannelList 组件（渠道 chip）')
+    // 切片边界必须是 ConfigPanel 之后真实存在的下一个顶层组件：SysPanel 定义在
+    // ConfigPanel 之前，用作 end 会得到 -1（slice(start, -1) 一路切到文件末尾，断言永真）。
     const start = src.indexOf('function ConfigPanel ')
-    const end = src.indexOf('function SysPanel', start)
+    const end = src.indexOf('function App ', start)
+    assert.ok(start > -1 && end > start, 'ConfigPanel 与 App 的切片边界必须可定位')
     const seg = src.slice(start, end)
     assert.ok(/<\$\{FilterRules\}/.test(seg), '配置页必须使用 FilterRules')
     assert.ok(/<\$\{ChannelList\}/.test(seg), '配置页必须使用 ChannelList')
     assert.ok(!/filterEntries\.map\([\s\S]*?\)\.join\(' · '\)/.test(seg), '过滤规则不得再 join 成一条 · 长串')
-    assert.ok(!/rule-val' \+ \(isEmpty\(v\) \? ' empty'/.test(seg), '空值类名不得复用 .empty（全局空态有 14px padding）')
+    // FilterRules 位于 ConfigPanel 之前，必须单独切片才能锁住「空值不复用 .empty」。
+    const filterStart = src.indexOf('function FilterRules ')
+    const filterEnd = src.indexOf('function ChannelList ', filterStart)
+    assert.ok(filterStart > -1 && filterEnd > filterStart, 'FilterRules 与 ChannelList 的切片边界必须可定位')
+    const filterSeg = src.slice(filterStart, filterEnd)
+    assert.ok(!/rule-val' \+ \(isEmpty\(v\) \? ' empty'/.test(filterSeg), '空值类名不得复用 .empty（全局空态有 14px padding）')
+    // C 批已把渠道注记收成一套名称；红线锁住「同一张卡两个名字」不回潮。
+    const chanEnd = src.indexOf('function ConfigPanel ', filterEnd)
+    assert.ok(chanEnd > filterEnd, 'ChannelList 的切片边界必须可定位')
+    const chanSeg = src.slice(filterEnd, chanEnd)
+    assert.ok(!/已启用：/.test(chanSeg), '渠道卡不得再用中文名注记重复一遍渠道名')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/\.rule-row\s*\{/.test(css) && /\.chan-chip\s*\{/.test(css), '过滤规则/渠道样式必须存在')
   })
@@ -3393,6 +3426,14 @@ async function main () {
     assert.strictEqual(interp.filter(x => /btn btn-/.test(x)).length, 1, 'btn btn-* 只允许出现在 Button 原语里')
     assert.deepStrictEqual(interp.filter(x => /(^|['"\s])panel-head(['"\s]|$)/.test(x)), [], 'panel-head 只允许出现在 PanelHead 原语里')
     assert.deepStrictEqual(interp.filter(x => /(^|['"\s])card(['"\s]|$)/.test(x)), [], 'card 只允许出现在 Card 原语里')
+    // 双引号/单引号属性里嵌插值（class="btn ${...}"、class="foo btn ${...}"）不落入上面的
+    // class=${...} 扫描；旧红线因此放过了首屏 4 个主按钮（审查 #240），直到 C 批改走 Button 原语。
+    // 按「btn 是独立类名」判定，前置类名/顺序不同也要命中。
+    const inlineBtn = attrs.filter((c) => /(^|\s)btn(\s|$)/.test(c) && /\$\{/.test(c))
+    assert.deepStrictEqual(inlineBtn, [], '按钮基础类不得手写在带插值的 class 属性里（含前置类名）')
+    // 表达式值 class=${'btn ' + a.cls}：Button 原语自身允许 1 处，别处再写就是绕过原语。
+    const interpBtn = interp.filter((x) => /(^|['"\s])btn(['"\s]|$)/.test(x))
+    assert.strictEqual(interpBtn.length, 1, 'btn 基础类只允许出现在 Button 原语表达式里')
   })
 }
 

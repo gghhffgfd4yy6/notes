@@ -28,6 +28,9 @@
 
     /* 强调 */
     --accent: #4f8cff;
+    /* 实心按钮底色：白字压 #4f8cff 只有 3.22:1（AA 不成立），改用更深的同色相
+       #356fd6（对白字 4.78:1）。--accent 仍用于深底上的文字/描边，不被拉暗。 */
+    --accent-solid: #356fd6;
     --accent-soft: rgba(79, 140, 255, .12);
     --accent-line: rgba(79, 140, 255, .3);
     --accent-hover: rgba(79, 140, 255, .05);
@@ -45,6 +48,8 @@
     --bad-soft: rgba(229, 83, 75, .14);
     --bad-line: rgba(229, 83, 75, .35);
     --bad-fg: #ff9d97;
+    /* 危险实心按钮底色：白字压 --bad-fg（#ff9d97）只有约 1.8:1；改用深红 #b3261e（约 6.5:1）。 */
+    --bad-solid: #b3261e;
     --bad-fade: rgba(229, 83, 75, .45);
     --bad-fade: color-mix(in srgb, var(--bad) 45%, transparent);
     --warn: #c9a227;
@@ -197,11 +202,19 @@
   .btn:hover:not(:disabled) { filter: brightness(1.2); }
   .btn:active:not(:disabled) { transform: translateY(1px); }
   .btn:disabled { opacity: .45; cursor: not-allowed; }
-  .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 500; }
-  .btn-danger-solid { background: var(--bad-fg); border-color: var(--bad-fg); color: #fff; font-weight: 600; }
-  .btn-danger-solid:hover:not(:disabled) { filter: brightness(1.1); }
+  .btn-primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); font-weight: 500; }
+  .btn-danger-solid { background: var(--bad-solid); border-color: var(--bad-solid); color: #fff; font-weight: 600; }
+  /* 实心按钮的 hover 不能再 brightness(1.2)：底色被提亮后白字对比度掉到 4.5:1 以下。
+     改为轻微压暗，既保留 hover 反馈，又把对比度往上抬。 */
+  .btn-primary:hover:not(:disabled),
+  .btn-danger-solid:hover:not(:disabled) { filter: brightness(.92); }
   .btn-secondary { background: var(--panel-2); }
   .btn-ghost { background: transparent; border-color: transparent; color: var(--accent); padding: var(--sp-1) var(--sp-2); font-size: var(--fs-sm); min-height: 40px; }
+  /* 表格行/日志框头里的 ghost 按钮不参与 40px 触控高度：否则行高 45→57、框头 44→56
+     （审查 #237）。独立作用域，工具栏与手机端主按钮的触控尺寸不变。 */
+  .runs-table .btn-ghost,
+  .logbox-head .btn-ghost { min-height: 28px; }
+
   .btn-desc { color: var(--text-dim); font-size: var(--fs-xs); }
 
   /* ── 确认弹窗（v3.307）── */
@@ -276,7 +289,8 @@
     min-height: 36px;
   }
   .tab-btn:hover { filter: brightness(1.2); }
-  .tab-btn.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 500; }
+  .tab-btn.active { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); font-weight: 500; }
+  .tab-btn.active:hover { filter: brightness(.92); }
 
   /* ── 趋势条形图（纯 CSS）── */
   /* 趋势图：一天一列固定宽度，总宽超出时横向滚动（14/30/60 日都不再挤成一团）。
@@ -328,6 +342,7 @@
     padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom));
     background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md);
     box-shadow: 0 12px 32px rgba(0, 0, 0, .45); display: flex; flex-direction: column;
+    overscroll-behavior: contain;
   }
   .cate-search {
     width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
@@ -344,7 +359,7 @@
   .cate-crumb-cur { color: var(--text); }
   .cate-opt.group .cate-opt-name { font-weight: 600; }
   .cate-opt.group .cate-check { color: var(--accent); font-size: var(--fs-md); }
-  .cate-list { flex: 1 1 auto; min-height: 0; max-height: 300px; overflow-y: auto; margin-top: var(--sp-2); padding-bottom: 10px; }
+  .cate-list { flex: 1 1 auto; min-height: 0; max-height: 300px; overflow-y: auto; margin-top: var(--sp-2); padding-bottom: 10px; overscroll-behavior: contain; }
   .cate-opt {
     width: 100%; display: flex; align-items: center; gap: 8px; text-align: left;
     background: none; border: 0; color: var(--text); border-radius: var(--r-sm);
@@ -443,11 +458,12 @@
     .tpl-row { flex-direction: column; gap: 2px; }
     .tpl-row > span { flex: none; }
     .chan-chip { padding: 5px 10px; }
-    /* 系统/配置的键值表：手机端改为上下两行，值拿满整行，长 URL/路径不再被挤成半行 */
-    .sys-table tr { display: block; padding: 7px 2px; border-bottom: 1px solid var(--border-soft); }
-    .sys-table td { display: block; border-bottom: 0; padding: 0 2px; }
-    .sys-table td:first-child { width: auto; font-size: var(--fs-xs); }
-    .sys-table td:last-child { padding-top: 2px; }
+    /* 空规则折叠按钮是唯一能展开被隐藏规则的入口，手机端触控高度补到 44px（审查 #247） */
+    .cfg-toggle { min-height: 44px; }
+    /* 系统/配置的键值表：保留 table/row/cell 语义（审查 #247：display:block 会把 AX 树的
+       table/row/cell 全部抹掉）。手机端只缩小标签列字号并顶部对齐，长值在单元格内换行。 */
+    .sys-table td { vertical-align: top; }
+    .sys-table td:first-child { font-size: var(--fs-xs); }
     .btn-row { gap: 10px; }
     .btn-item { flex: 1 1 calc(50% - 5px); min-width: 0; }
     .tabs { gap: 4px; }

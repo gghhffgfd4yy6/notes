@@ -902,7 +902,7 @@ function renderUnauthorizedPage () {
   p { color: #9aa8c0; margin: 0 0 16px; }
   label { display: block; font-size: 13px; color: #9aa8c0; margin-bottom: 6px; }
   input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #33405f; background: #0f1420; color: #e6edf7; font: inherit; }
-  button { margin-top: 12px; width: 100%; padding: 10px 12px; border: 0; border-radius: 8px; background: #4f8cff; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button { margin-top: 12px; width: 100%; padding: 10px 12px; border: 0; border-radius: 8px; background: #356fd6; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
   .hint { font-size: 12px; margin: 14px 0 0; }
 </style></head>
 <body><main>

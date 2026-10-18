@@ -7,7 +7,7 @@
 // 请求头——不复述进 URL，避免出现在任何中间层访问日志/浏览器历史，Sourcery rwH）。
 // 动作面：POST /trigger（token 同样在 Bearer 头；body 只带 action）。
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
-import { html, render, useState, useEffect, useRef, useCallback } from './htm-preact.module.js'
+import { html, render, useState, useEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
 import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, filterRunItems, tabFromHash } from './pure.mjs'
 
@@ -53,6 +53,15 @@ function fmtTime (ts) {
 
 function fmtNum (n) {
   return (n === undefined || n === null) ? '—' : String(n)
+}
+
+// 本机时钟（lastSync = 浏览器 Date.now()）用本地时间渲染：套 fmtTime 的 +8 会让
+// 非 UTC+8 用户看到「未来时间」（审查 #244 可选）。服务器时间戳仍走 fmtTime。
+function fmtLocalTime (ts) {
+  if (!ts) return '—'
+  const d = new Date(Number(ts))
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
 // 「多久以前」（缓存写入停滞判断）与日报相对日期见 pure.mjs——纯函数便于行为测试。
@@ -685,7 +694,7 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
     <${PanelHead} title="手动触发" />
     <div class="btn-row">
       ${ACTION_DEFS.map((a) => html`<div class="btn-item" key=${a.key}>
-        <button class="btn ${a.cls}" disabled=${locking} onClick=${() => ask(a.key)}>${a.label}</button>
+        <${Button} variant=${a.cls.replace(/^btn-/, '')} disabled=${locking} onClick=${() => ask(a.key)}>${a.label}<//>
         <span class="btn-desc">${a.desc}</span>
       </div>`)}
     </div>
@@ -707,6 +716,11 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
   const [openId, setOpenId] = useState(null)
   const [detail, setDetail] = useState(null)
   const [detailErr, setDetailErr] = useState('')
+  // 详情日志跟随（审查 #244）：运行中标题写「实时跟随」，但输出框此前从不滚动——
+  // 新行只追加在底部，用户看到的是开头几行。与运行日志页同口径：默认贴底，
+  // 用户上翻后不抢位置，滚回底部自动恢复跟随。
+  const logRef = useRef(null)
+  const followRef = useRef(true)
   // 乱序防护（Sourcery vwI）：detail 请求领号，落后响应丢弃。
   const detailSeqRef = useRef(0)
   // onRefresh 经 ref 解引用（v3.300 3.1 §2 D7）：若直接进 effect deps，其身份不稳定
@@ -731,6 +745,19 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
   const detailForOpen = detail !== null && typeof detail.id === 'string' && detail.id === openId
     ? detail
     : null
+
+  // 切换目标时恢复跟随；输出变化时若仍在底部就贴底（含 SSE 增量与轮询快照）。
+  useEffect(() => { followRef.current = true }, [openId])
+  useEffect(() => {
+    const el = logRef.current
+    if (!el || detailForOpen === null) return
+    if (followRef.current) el.scrollTop = el.scrollHeight
+  }, [detailForOpen])
+  const onLogScroll = () => {
+    const el = logRef.current
+    if (!el) return
+    followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+  }
 
   // 详情跟随（v3.300 3.1）：运行中走 SSE 实时流（原生 EventSource，零依赖）；
   // 非运行中 / 快照已完结 / 流错误回退原轮询。两通道在 effect 内二选一：SSE 模式不建
@@ -906,7 +933,7 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
         <span>运行 #${openId} 输出${openActive ? '（实时跟随）' : ''}</span>
         <${Button} variant="ghost" onClick=${() => setOpenId(null)}>关闭<//>
       </div>
-      <pre class="logpre">${
+      <pre class="logpre" ref=${logRef} onScroll=${onLogScroll}>${
         detailErr ||
         (detailForOpen === null
           ? '加载中…'
@@ -1119,7 +1146,7 @@ function TrendsPanel () {
 // 缓存健康（v3.298）：判重缓存字节占用对照两级上限 + 墓碑计数。纯只读快照，
 // 进概览页拉一次 + 手动刷新，不进 5s 主轮询（墓碑解析最坏 8MiB，不与状态轮询抢盘）。
 // 条数维度：服务端在响应里附带 entryCount（readMessageCount，与 /api/messages 同一
-// 32MiB 封顶与防御；tooLarge 时 null 如实显示），对照 limits.entryMax 预警。
+// 读取封顶与防御；tooLarge 时 null 如实显示），对照 limits.entryMax 预警。
 function CacheHealthPanel ({ paused = false }) {
   const { data, err, load } = usePanelLoader(apiGetCacheHealth)
   // 右列状态文件（v3.307）：缓存健康面板原来只占左半 451px，右边 460px 空白；
@@ -1140,10 +1167,14 @@ function CacheHealthPanel ({ paused = false }) {
   const tomb = data && data.tombstone ? data.tombstone : null
   // 最近写入：显示相对时间；超过 24 小时只陈述事实（不推断链路断没断——调度暂停同样会这样）。
   const write = ok ? cacheWriteInfo(data.mtimeMs) : { ageText: '', stale: false }
-  // 控制台可读：长解释收进 title，首屏只留结论（32 MiB 封顶是控制台读取限制，不影响推送）。
+  // 控制台可读：长解释收进 title，首屏只留结论。上限取服务端下发的
+  // limits.consoleReadMaxBytes（此前写死 32 MiB，服务端调到 64 MiB 后文案说谎）。
+  const readCap = ok && data.limits && typeof data.limits.consoleReadMaxBytes === 'number'
+    ? fmtBytes(data.limits.consoleReadMaxBytes)
+    : '控制台读取上限'
   const readableText = data && data.consoleReadable
-    ? '是（未超 32 MiB 读取封顶）'
-    : '否——超过 32 MiB 读取封顶，推送记录页显示「过大不可读」（生产不受影响）'
+    ? `是（未超 ${readCap} 读取封顶）`
+    : `否——超过 ${readCap} 读取封顶，推送记录页显示「过大不可读」（生产不受影响）`
   const readableTitle = '超限与否以推送记录页实际显示为准；JSON 损坏时该页会显示「记录不可读」'
   // 条数预警：服务端在 cache-health 响应里附带 entryCount（/api/status 同源的
   // readMessageCount；tooLarge 时 null）对照写端条目上限；接近上限时下轮保存
@@ -1260,19 +1291,36 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     mq.addEventListener('change', on)
     return () => mq.removeEventListener('change', on)
   }, [])
-  // 每次打开都从一级分类开始；搜索词与高亮项一并清空。
+  // 每次打开都从一级分类开始；搜索词、高亮项与列表滚动一并清空（审查 #246 可选：
+  // 手机端重开弹层时不能停在上次的 active 下标/滚动位置，否则容易误下钻）。
   useEffect(() => {
-    if (open) { setPath([]); setQ(''); setActive(0) }
+    if (open) {
+      setPath([]); setQ(''); setActive(0)
+      if (listRef.current) listRef.current.scrollTop = 0
+    }
   }, [open])
+  // 手机端是贴底模态弹层：锁住背景页滚动（审查 #245），否则手指滑弹层会把背后的
+  // 推送记录/页面一起带动。只在本组件打开且窄屏时接管，关闭时还原原值。
+  useEffect(() => {
+    if (!open || !narrow) return undefined
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => { document.body.style.overflow = prev }
+  }, [open, narrow])
   // 打开时：桌面把焦点放进搜索框；手机聚焦当前选项（不弹软键盘）。
   useEffect(() => {
-    if (!open) return
+    if (!open) return undefined
     if (narrow) {
-      const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
-      if (el) el.focus()
-    } else if (searchRef.current) {
-      searchRef.current.focus()
+      // 打开时 path 会在同一提交里重置为空；立刻 query 会聚焦到上一级即将被移除的节点，
+      // 重置渲染后焦点就丢了。延后一拍，等新一级列表渲染完再聚焦（与 focusFirst 同口径）。
+      const t = setTimeout(() => {
+        const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
+        if (el) el.focus()
+      }, 0)
+      return () => clearTimeout(t)
     }
+    if (searchRef.current) searchRef.current.focus()
+    return undefined
   }, [open, narrow])
   // 搜索词/层级变化后回到第一项，避免 active 指向已被过滤掉的项。
   useEffect(() => { setActive(0) }, [q, path])
@@ -1331,10 +1379,22 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   const leaves = kw === '' ? [] : flatCateLeaves(tree)
   const results = kw === '' ? [] : leaves.filter((l) => l.label.toLowerCase().includes(kw) || l.name.toLowerCase().includes(kw))
   const level = [...node.children.values()].sort((a, b) => b.total - a.total)
+  // 分类名同时是叶子与父节点时（如 A-B 与 A-B-C 并存），父级此前只能下钻、永远选不到
+  // A-B 本身（审查 #246 可选）。下钻后补一条「本级」选项，既能选自己也能继续下钻。
+  const selfOption = path.length > 0 && node.full
+    ? [{ key: '__self', label: `${node.name}（本级）`, count: node.count, leaf: true, name: node.full }]
+    : []
   const options = kw === ''
     ? [...(path.length === 0 ? [{ key: '__all', label: '全部分类', count: typeof total === 'number' ? total : tree.total, leaf: true, name: '' }] : []),
+        ...selfOption,
         ...level.map((n) => ({ key: n.path.join('-'), label: n.name, count: n.total, leaf: n.children.size === 0, name: n.full, node: n }))]
     : results.map((l) => ({ key: l.name, label: l.label, count: l.count, leaf: true, name: l.name }))
+  const focusFirst = () => {
+    setTimeout(() => {
+      const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
+      if (el) el.focus()
+    }, 0)
+  }
   const choose = (name) => {
     onChange(name)
     setOpen(false)
@@ -1347,10 +1407,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
       setQ('')
       setActive(0)
       // 下钻后把焦点放到新一级第一项：键盘 Enter 不会掉到 body 上。
-      setTimeout(() => {
-        const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
-        if (el) el.focus()
-      }, 0)
+      focusFirst()
       return
     }
     choose(o.name)
@@ -1359,6 +1416,9 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     setPath(nextPath)
     setQ('')
     setActive(0)
+    // 面包屑/「‹ 上一级」会重渲染掉当前按钮，焦点必须搬回列表（审查 #246：
+    // 否则返回上层后焦点掉到 body，键盘下钻中断）。
+    focusFirst()
   }
   const dismiss = () => {
     setOpen(false)
@@ -1368,6 +1428,16 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   const onListKey = (e) => {
     const opts = listRef.current ? [...listRef.current.querySelectorAll('.cate-opt')] : []
     if (opts.length === 0) return
+    const inSearch = e.target === searchRef.current
+    // 搜索框里的 Home/End 是文本光标操作，不能被列表导航劫持（审查 #245：
+    // 此前光标无法到词首/词尾）。上下键仍可从搜索框进入列表。
+    if (inSearch && (e.key === 'Home' || e.key === 'End')) return
+    // 搜索框按 Enter 直接选中当前高亮项（审查 #245 可选：此前必须先 ↓ 再 Enter）。
+    if (inSearch && e.key === 'Enter') {
+      const target = opts[Math.min(active, opts.length - 1)]
+      if (target) { e.preventDefault(); target.click() }
+      return
+    }
     const i = opts.indexOf(document.activeElement)
     let next = -1
     if (e.key === 'ArrowDown') next = i < 0 ? 0 : Math.min(opts.length - 1, i + 1)
@@ -1429,11 +1499,13 @@ function MessagesPanel () {
   const [query, setQuery] = useState('')
   const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
   const sentQueryRef = useRef('') // 当前请求实际发出的 query（含防抖未落地的新输入）
-  // 搜索防抖：输入停 300ms 才真正改 query（重置回第 1 页）。
+  // 搜索防抖：输入停 300ms 才真正改 query；页码重置跟随 query 的真实变化。
   useEffect(() => {
-    const t = setTimeout(() => { setQuery(input.trim()); setPage(1) }, 300)
+    const t = setTimeout(() => { setQuery(input.trim()) }, 300)
     return () => clearTimeout(t)
   }, [input])
+  // 只有 query 真的变了才回第 1 页；只加/减空白时 query 不变，刷新不应把用户踢回首页。
+  useEffect(() => { setPage(1) }, [query])
   const fetchMessages = useCallback(
     () => {
       sentQueryRef.current = query
@@ -1442,10 +1514,18 @@ function MessagesPanel () {
     [page, size, cate, query, days])
   const { data, err, load, loading } = usePanelLoader(fetchMessages)
   useEffect(() => { load().catch(() => {}) }, [load])
+  // 结果集缩小后旧页码可能超过新页数（服务端按请求页切片，回空 items）。收到响应后把
+  // 页码钳到最后一页并重拉，避免「在后面的页点刷新，整页空白」。
+  useEffect(() => {
+    if (data && data.status === 'ok' && Number.isSafeInteger(data.pages) && data.pages >= 1 && page > data.pages) {
+      setPage(data.pages)
+    }
+  }, [data, page])
   // 搜索框回车 / 刷新前先把未落地的输入立刻生效，避免「刚打完字点刷新，还是旧结果」。
+  // 只有搜索词变了才回第 1 页；没改词时刷新当前页，不应把用户踢回首页（审查 #246 可选）。
   const refreshNow = () => {
     const q = input.trim()
-    if (q !== query || page !== 1) { setQuery(q); setPage(1); return }
+    if (q !== query) { setQuery(q); setPage(1); return }
     load().catch(() => {})
   }
   const [exporting, setExporting] = useState('') // '' | 'csv' | 'json'：加载态防连点（两按钮共用一闸）
@@ -1597,10 +1677,32 @@ function MessagesPanel () {
 // 运行日志：run.log 尾部（服务端 1MiB 上限），进页拉一次 + 手动刷新；有任务在跑时跟随轮询。
 // 异常口径与筛选在 pure.mjs（isIssueLogLine / filterLogLines），组件与测试共用。
 function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all' }) {
-  const { data, err, load } = usePanelLoader(apiGetLogs)
+  const { data, err, load: loadRaw } = usePanelLoader(apiGetLogs)
   const preRef = useRef(null)
   const stickRef = useRef(true)
   const prevTextRef = useRef('')
+  // 轮询互斥（审查 #231 前端项）：任务运行时每 2s 拉 1 MiB，上一请求未回时再叠一发
+  // 只会让服务端并发读盘、后到的响应还可能盖掉新结果。手动刷新同样走这把闸。
+  const busyRef = useRef(false)
+  const pendingRef = useRef(false)
+  const load = useCallback(async (queue = false) => {
+    // 手动刷新撞上在飞请求时不丢这次意图：记 pending，当前请求结束后再补一轮。
+    // 轮询/可见性补拉不排队（queue=false），避免慢请求把轮询变成背靠背重试。
+    if (busyRef.current) {
+      if (queue) pendingRef.current = true
+      return
+    }
+    busyRef.current = true
+    try {
+      do {
+        pendingRef.current = false
+        await loadRaw()
+      } while (pendingRef.current)
+    } finally {
+      busyRef.current = false
+      pendingRef.current = false
+    }
+  }, [loadRaw])
   // 日志筛选（v3.307）：run.log 尾部最多 1 MiB，排障时先按级别收窄；纯客户端过滤，
   // 不发新请求。默认「异常」已排除控制台生命周期行（旧口径 123 条异常里 119 条是它）。
   const [mode, setMode] = useState(initialMode)
@@ -1624,11 +1726,13 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all' }) {
     }
   }, [load, pollMs])
   const rawText = data && data.status === 'ok' && typeof data.text === 'string' ? data.text : ''
-  const lines = filterLogLines(rawText, 'all', '')
-  const counts = logLineCounts(rawText)
+  // 1 MiB 文本的 split/lowercase 只在输入变化时做一次（审查 #248 可选：此前每次渲染
+  // 3 次全量 split + 2 次 lowercase，手机输入关键字会掉帧）。
+  const lines = useMemo(() => filterLogLines(rawText, 'all', ''), [rawText])
+  const counts = useMemo(() => logLineCounts(rawText), [rawText])
   const kw = q.trim().toLowerCase()
-  const filtered = filterLogLines(rawText, mode, q)
-  const shownText = filtered.join('\n')
+  const filtered = useMemo(() => filterLogLines(rawText, mode, q), [rawText, mode, q])
+  const shownText = useMemo(() => filtered.join('\n'), [filtered])
   const LOG_MODES = [
     ['all', '全部', counts.all],
     ['issue', '异常', counts.issue],
@@ -1653,7 +1757,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all' }) {
   }
   const refreshNow = () => {
     stickRef.current = true
-    load().catch(() => {})
+    load(true).catch(() => {})
   }
   const pickMode = (next) => {
     stickRef.current = true
@@ -1799,7 +1903,6 @@ function ChannelList ({ pc }) {
             <span class="chan-dot" aria-hidden="true"></span>${k}
           </span>`)}
         </div>`}
-    ${Array.isArray(pc.names) && pc.names.length > 0 && html`<div class="cfg-note">已启用：${pc.names.join('、')}</div>`}
   </div>`
 }
 
@@ -2048,6 +2151,12 @@ function App () {
     if (window.location.hash !== '#/logs') window.location.hash = '#/logs'
   }, [])
   const pollMs = locking ? POLL_BUSY_MS : POLL_MS
+  // 顶栏徽章只在「概览/日志 + 自动刷新开」时是活状态；其它情况（暂停、推送记录/配置/系统）
+  // 主轮询已停，徽章显示的是离开时的快照——必须注明，不能永久挂着「任务运行中」（审查 #246）。
+  const livePolling = !authExpired && autoRefresh && (tab === 'overview' || tab === 'logs')
+  const badgeText = authExpired
+    ? '凭证失效'
+    : `${locking ? '任务运行中' : '空闲'}${livePolling ? '' : '（快照）'}`
   const remain = autoRefresh
     ? Math.max(0, Math.min(Math.ceil(pollMs / 1000), Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000)))
     : 0
@@ -2056,14 +2165,14 @@ function App () {
       <div class="brand">
         <span class="logo">⚡</span>
         <span class="name">xbk-push 控制台</span>
-        <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${authExpired ? '凭证失效' : locking ? '任务运行中' : '空闲'}<//>
+        <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
       </div>
       <div class="sync">
         ${tab === 'overview' || tab === 'logs'
-          ? html`${autoRefresh ? `自动刷新 · ${remain}s` : '自动刷新已暂停'}${lastSync ? ` · ${fmtTime(lastSync)}` : ''}
+          ? html`${autoRefresh ? `自动刷新 · ${remain}s` : '自动刷新已暂停'}${lastSync ? ` · ${fmtLocalTime(lastSync)}` : ''}
             <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
               onClick=${() => { setNowMs(Date.now()); setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`
-          : `数据截至${lastSync ? ` · ${fmtTime(lastSync)}` : ''}`}
+          : `数据截至${lastSync ? ` · ${fmtLocalTime(lastSync)}` : ''}`}
         ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
       </div>
     </header>

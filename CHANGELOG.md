@@ -477,5 +477,6 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **触发锁按运行隔离（审查 #225）**：锁 token 改为每次受理独立生成，前驱运行迟到的 close 不会把后继活锁误写为 released；子进程 `exit` 即收尾并释放锁，不再等孙进程关闭 stdio 导致的数秒「停止中」。
 - **凭证失效自助恢复（审查 #224）**：任一 API 返回 401 时页面停止轮询并显示「凭证已失效」横幅与「重新登录」入口，不再每 5s 空打 401；未授权 `GET /` 返回无脚本登录页（token 表单），不再是裸 JSON。会话 Cookie 改 `SameSite=Lax`（写动作 POST 本就不收 Cookie），从聊天点链接不再必然 401。
 - **SSE 日志冻结修复（审查 #248）**：切回前台时运行中详情不再 `fetchOnce` 领号，避免已建 SSE 流的回调因代次不符全部丢弃；SSE 模式只刷新 runs 徽章。
-- **门禁收紧（审查 #234/#247）**：`GITHUB_ACTIONS` 只认字符串 `'true'`（`0`/`false` 不再放行本机变异）；配置页结构红线切片终点改为真实的 `SysPanel`，不再因 `-1` 把整文件当片段导致断言永真。
+- **门禁收紧（审查 #234/#247）**：`GITHUB_ACTIONS` 只认字符串 `'true'`（`0`/`false` 不再放行本机变异）；配置页结构红线切片终点改为 `function App `（此前写成 `SysPanel`，而 `SysPanel` 定义在 `ConfigPanel` 之前 ⇒ `indexOf` 仍返回 -1，断言继续永真），`FilterRules`/`ChannelList` 各自单独切片。
 - **测试**：新增/更新 `test_console.js`（ALERT 不误伤、崩溃轮独立占位、每页条数无关、key 游标、401 登录页/Cookie、结构红线切片）、`test_qinglong_utils.js`（未知参数 fail-closed）、`test_notify_selfcheck.js`（前缀分发静态红线）与 `test_local_mutation_guard.js`（GITHUB_ACTIONS 严格 true）。
+- **批次 D 门禁补强（审查 #234/#239/#240/#241）**：变异配置期闸门不再用「入口路径含 stryker」判定——`node -e` / 自命名 wrapper 改按 `require.cache` 是否已加载 `@stryker-mutator/core` 拦截，检出目录名含 stryker 不再误伤；放行示例带 `--mutate` 段选择。运行 id 红线补 `Number.isInteger/isSafeInteger/isFinite(<id>)` 并修掉 `/id$/` 把 `valid` 误报的洞；按钮红线补 `class="btn ${...}"`；`test_lazy_notify` 临时目录挂 `exit` 钩子，失败路径也清理。
