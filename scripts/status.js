@@ -115,10 +115,10 @@ function parseJson (read, validate) {
   } catch (error) { return result('invalid') }
 }
 
-// 摘要行之后的日志行是否说明「这一轮没正常走完」（审查 SS-01）。生产侧写日志的顺序是
-// 「先写 total=… 摘要、再在异常分支写 ERROR / ALERT 运行异常」（xbk_app.js:1498 → :1526/:314），
-// 所以摘要行之后出现 ERROR 或「运行异常」即代表该轮在其后中断。只认这两种强信号，
-// 普通 ALERT（低磁盘/日报更新失败等）不参与判定，避免把成功的轮次误报成异常。
+// 失败行的强信号判定（审查 SS-01 / D2-M3）：只认独立 ERROR 或「运行异常」，普通 ALERT
+// （低磁盘/线报酷截断/缺 re2/日报更新失败）不参与——它们的正文同样含「⚠️ xbk-push 运行异常」，
+// 按正文命中会把成功轮误报成中断。轮起止归属见下方 classifyRoundFailures（与 readRunHistory
+// 共用同一口径，避免「同一面板两处结论相反」）。
 function looksLikeRoundFailure (line) {
   // 「控制台停止：任务 #… 于运行中被停止（SIGTERM）」是控制台侧的取消留痕，不是某一轮的
   // 运行失败：它没有自己的摘要行，把最近的摘要回填成 interrupted 会让每次重启/取消都把
@@ -138,9 +138,90 @@ function looksLikeRoundFailure (line) {
 // 与真实口径一致；noidentity/cachesaved 等附加字段不参与聚合。
 const RUN_SUMMARY_LINE_RE = /^(?:(\d{4}-\d{2}-\d{2})[T ]\d{2}:\d{2}:\d{2}\S* )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=(\S+)/
 
+// ── 轮界归属（parseLastRun / readRunHistory 共用）────────────────────────────
+// 生产写序（xbk_app.js）：失败行写在所属轮的摘要行**之前**——「推送全部失败」ERROR 后紧跟
+// 同秒摘要（:1684 → :1688），「缓存读取失败」ERROR 后本轮仍走完收尾写摘要（:1191）；进程在
+// 写摘要前退出则只剩失败行（崩溃轮）。归属判据：
+//   ① 近距：与摘要相距 ≤2 行且 |Δt| ≤2s（同一秒写出，防跨轮误挂）；
+//   ② 轮内远距：其后第一条摘要在 10 分钟内、且两行之间没有别的摘要（同轮先记错误再写摘要，
+//      中间隔着若干行普通日志——旧实现只在 2 行内找，于是同一物理轮多出一条幽灵崩溃行）；
+//   ③ 其余 = 无摘要可归属的独立崩溃轮（占位条目），绝不回填「最近一条摘要」（那会把上一轮
+//      误标 interrupted，而崩溃轮自己从历史里消失）。
+// 10 分钟与 console.js 的单轮超时（PROC_TIMEOUT_MS）同量级：一轮不可能更久；崩溃后下一次
+// 调度通常远超此窗，因此不会把上一轮的崩溃行挂到下一轮。
+const ROUND_FAILURE_NEAR_LINES = 2
+const ROUND_FAILURE_NEAR_MS = 2000
+const ROUND_FAILURE_INROUND_MS = 10 * 60 * 1000
+
+function tsOf (line) {
+  const m = /^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/.exec(line)
+  return m ? m[1] : ''
+}
+function tsMs (line) {
+  const ts = tsOf(line)
+  const v = ts ? Date.parse(ts.replace(' ', 'T') + 'Z') : NaN
+  return Number.isFinite(v) ? v : null
+}
+
+// 摘要行索引表：0-based 行号 → 摘要时间戳(ms) / null（无时间戳）。
+// 计数器非法/缺失的摘要行不参与归属（否则失败轮会凭空消失）。
+function summaryIndexOf (lines) {
+  const summaryAt = new Map()
+  for (let i = 0; i < lines.length; i++) {
+    if (!RUN_SUMMARY_LINE_RE.test(lines[i])) continue
+    const m = RUN_SUMMARY_LINE_RE.exec(lines[i])
+    if (![m[2], m[3], m[4], m[5], m[6], m[7]].map(Number).every(validCounter)) continue
+    summaryAt.set(i, tsMs(lines[i]))
+  }
+  return summaryAt
+}
+
+// 失败行 → 所属摘要行（interruptedIdx）或无主崩溃行（crashIdx）。
+function classifyRoundFailures (lines, summaryAt) {
+  const summaryIdx = [...summaryAt.keys()].sort((a, b) => a - b)
+  const interruptedIdx = new Set()
+  const crashIdx = new Set()
+  for (let i = 0; i < lines.length; i++) {
+    if (summaryAt.has(i) || !looksLikeRoundFailure(lines[i])) continue
+    const t = tsMs(lines[i])
+    let best = null
+    if (t === null) {
+      // 无时间戳：只认文件序其后的摘要（1–2 行内），不把更早一轮的堆栈行回填给它
+      for (let d = 1; d <= ROUND_FAILURE_NEAR_LINES && !best; d++) {
+        if (summaryAt.has(i + d)) best = { j: i + d, gap: 0 }
+      }
+    } else {
+      for (let d = 1; d <= ROUND_FAILURE_NEAR_LINES && !best; d++) {
+        for (const j of [i - d, i + d]) {
+          if (!summaryAt.has(j)) continue
+          const st = summaryAt.get(j)
+          if (st === null) continue
+          const gap = Math.abs(st - t)
+          if (gap > ROUND_FAILURE_NEAR_MS) continue
+          if (!best || gap < best.gap) best = { j, gap } // 同距离取时间差更小者
+        }
+      }
+      if (!best) {
+        // 轮内远距：其后第一条摘要（之间无其他摘要）且时间差在单轮上限内
+        const next = summaryIdx.find((j) => j > i)
+        if (next !== undefined) {
+          const st = summaryAt.get(next)
+          const gap = st === null ? null : st - t
+          if (gap !== null && gap >= 0 && gap <= ROUND_FAILURE_INROUND_MS) best = { j: next, gap }
+        }
+      }
+    }
+    if (best) interruptedIdx.add(best.j)
+    else crashIdx.add(i) // 无摘要可归属 ⇒ 独立崩溃轮占位
+  }
+  return { interruptedIdx, crashIdx }
+}
+
 function parseLastRun (read) {
   if (read.status !== 'ok') return { status: read.status }
   const lines = read.value.trim().split('\n').filter(Boolean)
+  let summaryAt = null
+  let classified = null
   for (let i = lines.length - 1; i >= 0; i--) {
     // 行首锚定：摘要行只可能是「时间戳（本地 YYYY-MM-DD HH:MM:SS 或历史 ISO）+ total=」或裸 total=，
     // 避免 ERROR/ALERT 行文本里恰好含 total=… 子串时被误取。
@@ -151,7 +232,20 @@ function parseLastRun (read) {
     // 与 parseDiagnostics 同口径：六项计数必须是非负安全整数（超长数字经 Number 得 Infinity/超界，直接跳过该行）
     const counters = match.slice(2, 8).map(Number)
     if (!counters.every(validCounter)) continue
-    const interrupted = lines.slice(i + 1).some(looksLikeRoundFailure)
+    if (!summaryAt) {
+      summaryAt = summaryIndexOf(lines)
+      classified = classifyRoundFailures(lines, summaryAt)
+    }
+    // 与 readRunHistory 同一归属口径：只标「本条摘要自己的轮」是否中断；其后的无主失败行
+    // 单独计数上报（旧实现把尾部任意 ERROR 回填给本条摘要 ⇒ 与运行历史结论相反）。
+    let orphanFailures = 0
+    let orphanFailureAt = ''
+    for (const j of classified.crashIdx) {
+      if (j <= i) continue
+      orphanFailures += 1
+      const at = tsOf(lines[j])
+      if (at) orphanFailureAt = at
+    }
     return result('ok', {
       at: match[1] ? match[1].trim() : '',
       total: counters[0],
@@ -161,7 +255,9 @@ function parseLastRun (read) {
       pushed: counters[4],
       failed: counters[5],
       elapsed: match[8],
-      interrupted
+      interrupted: classified.interruptedIdx.has(i),
+      orphanFailures,
+      orphanFailureAt
     })
   }
   return result('invalid')
@@ -260,6 +356,11 @@ function formatStatus (status) {
   //    不再一律渲染成「正常」（崩溃轮此前与正常轮显示完全一致）。
   const runState = run && run.interrupted ? '⚠️ 上一轮未正常结束' : describe(status.run)
   lines.push(`最近一轮：${runState}${run ? ` | 时间 ${run.at || '无时间戳'} | 获取 ${run.total} | 去重 ${run.dedup} | 过滤 ${run.filtered} | 推送 ${run.pushed} | 失败 ${run.failed} | 截断 ${run.truncated}${run.truncated > 0 ? ' ⚠️' : ''} | 耗时 ${run.elapsed}` : ''}`)
+  // 摘要之后的无主失败行（崩溃轮）：不把这轮标成中断（它确实正常写完了摘要），但也不能让
+  // 崩溃信号在首屏消失——单独一行如实上报，指向运行历史里的占位条目。
+  if (run && run.orphanFailures > 0) {
+    lines.push(`⚠️ 其后另有 ${run.orphanFailures} 条失败行未归属任何摘要（独立崩溃轮${run.orphanFailureAt ? `，最近 ${run.orphanFailureAt}` : ''}；见运行历史）`)
+  }
   const channels = status.channels.value
   if (channels) {
     // 与 validChannels 同口径逐条过滤（审查 SS-02）：损坏条目单独计数并明示，健康通道照常展示。
