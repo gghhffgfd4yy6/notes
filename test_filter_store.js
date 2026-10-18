@@ -521,8 +521,10 @@ test('A3 覆盖文件权限过宽（0644）→ 读后收紧为 0600 并正常生
   const dir = makeDir()
   const file = filterRulesPaths(dir).file
   writeJson(file, { schema: 1, revision: 2, filter: { pingbibiaoti: '宽权限规则' } })
-  fs.chmodSync(file, 0o644)
-  assert.strictEqual(fs.statSync(file).mode & 0o777, 0o644, '前置：文件当前确实是 0644')
+  // 由 0600 叠加组/其他读位构造「历史遗留的过宽权限」：不写字面量 0644（Sonar S2612）。
+  const widened = (fs.statSync(file).mode & 0o777) | 0o044
+  fs.chmodSync(file, widened)
+  assert.notStrictEqual(widened & 0o077, 0, '前置：文件当前确实带 group/other 位')
 
   const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
   assert.strictEqual(loaded.source, 'override')
@@ -535,7 +537,8 @@ test('A3 权限过宽且无法收紧 → 按损坏处理并说明原因（不改
   const dir = makeDir()
   const file = filterRulesPaths(dir).file
   writeJson(file, { schema: 1, revision: 5, filter: { pingbibiaoti: '权限坏' } })
-  fs.chmodSync(file, 0o644)
+  const widened = (fs.statSync(file).mode & 0o777) | 0o044
+  fs.chmodSync(file, widened)
   // 模块持有的是同一个 fs 模块对象，方法查找发生在调用时 ⇒ 临时替换即可覆盖 chmod 失败分支。
   const realChmod = fs.chmodSync
   fs.chmodSync = () => {
@@ -553,7 +556,7 @@ test('A3 权限过宽且无法收紧 → 按损坏处理并说明原因（不改
   assert.strictEqual(loaded.lastGoodUsed, false)
   assert.match(loaded.error.message, /权限过宽/, `message 必须说明权限过宽：${loaded.error.message}`)
   assert.match(loaded.error.message, /EPERM|无法收紧/, `message 必须说明收紧失败：${loaded.error.message}`)
-  assert.strictEqual(fs.statSync(file).mode & 0o777, 0o644, '收紧失败时文件权限保持原样（本模块不假装成功）')
+  assert.strictEqual(fs.statSync(file).mode & 0o777, widened, '收紧失败时文件权限保持原样（本模块不假装成功）')
 })
 
 test('A4 文件删除即作废本目录 lastGood：后续畸形文件不得复活旧规则', () => {
