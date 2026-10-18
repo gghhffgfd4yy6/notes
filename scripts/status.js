@@ -127,6 +127,11 @@ function looksLikeRoundFailure (line) {
   return /(?:^|\s)ERROR(?:\s|$)|运行异常/.test(line)
 }
 
+// run.log 摘要行正则（parseLastRun 只看最后一条；readTrends / readRunHistory / parseRunStats
+// 都按同一逐行形态解析）。dry-run 行（含 dry-run未推送=）计入轮次与获取数，但 pushed 恒为 0，
+// 与真实口径一致；noidentity/cachesaved 等附加字段不参与聚合。
+const RUN_SUMMARY_LINE_RE = /^(?:(\d{4}-\d{2}-\d{2})[T ]\d{2}:\d{2}:\d{2}\S* )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=(\S+)/
+
 function parseLastRun (read) {
   if (read.status !== 'ok') return { status: read.status }
   const lines = read.value.trim().split('\n').filter(Boolean)
@@ -156,6 +161,48 @@ function parseLastRun (read) {
   return result('invalid')
 }
 
+// 首屏「今日 / 近 7 天」聚合（v3.307）：与趋势同源同口径（run.log 摘要行 + Asia/Shanghai
+// 日历日），但只下发计数，不在前端重算。today/week 的 successRate = pushed/(pushed+failed)，
+// 无尝试时 null（前端显示「—」而不是编一个 100%）。
+// lastFailure 是近 7 天窗口内最近一条 failed>0 的摘要（用于首屏异常横幅的「看日志」跳转）；
+// 窗口外失败不进入 stats，避免首屏长期挂红。
+function parseRunStats (read, now = Date.now()) {
+  if (read.status !== 'ok') return { status: read.status }
+  const todayKey = shanghaiDayKey(now)
+  const weekStartKey = shanghaiDayKey(now - 6 * 86400000)
+  const blank = (date) => ({ date, rounds: 0, total: 0, pushed: 0, failed: 0 })
+  const today = blank(todayKey)
+  const week = { from: weekStartKey, to: todayKey, rounds: 0, total: 0, pushed: 0, failed: 0 }
+  let lastFailure = null
+  for (const line of read.value.split('\n')) {
+    const m = RUN_SUMMARY_LINE_RE.exec(line)
+    if (!m) continue
+    const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
+    if (!counters.every(validCounter)) continue
+    const day = m[1]
+    if (!day || day < weekStartKey) continue
+    week.rounds += 1
+    week.total += counters[0]
+    week.pushed += counters[4]
+    week.failed += counters[5]
+    if (day === todayKey) {
+      today.rounds += 1
+      today.total += counters[0]
+      today.pushed += counters[4]
+      today.failed += counters[5]
+    }
+    if (counters[5] > 0) {
+      lastFailure = { at: line.slice(0, 19).trim(), date: day, failed: counters[5] }
+    }
+  }
+  const rate = (pushed, failed) => (pushed + failed > 0 ? pushed / (pushed + failed) : null)
+  return result('ok', {
+    today: { ...today, successRate: rate(today.pushed, today.failed) },
+    week: { ...week, successRate: rate(week.pushed, week.failed) },
+    lastFailure
+  })
+}
+
 function parseDiagnostics (read) {
   if (read.status !== 'ok') return { status: read.status }
   const lines = read.value.trim().split('\n').filter(Boolean)
@@ -177,9 +224,10 @@ function readStatus (dir, { now = Date.now() } = {}) {
   // report.state / channel-health 是「整份 JSON」，必须整读：超限仍判 tooLarge（读尾部只会得到
   // 半个 JSON，假装可读更危险）。run.log / filter-diagnostics 是追加式日志，取尾部 1 MiB
   // （审查 SS-03）：超限时旧行为让这两个部件整体不可见，而解析本来就是「从最后一行往前找」。
-  const run = parseLastRun(readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS))
+  const runRead = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
+  const run = parseLastRun(runRead)
   const diagnostics = parseDiagnostics(readText(dir, FILES.diagnostics, LOG_MAX_BYTES, LOG_READ_OPTIONS))
-  return { generatedAt: now, report, channels, run, diagnostics }
+  return { generatedAt: now, report, channels, run, diagnostics, stats: parseRunStats(runRead, now) }
 }
 
 // 判重缓存条数（v3.298 附加部件，与 readStatus 同目录同防御）：控制台缓存健康面板的
@@ -225,11 +273,6 @@ function formatStatus (status) {
 // ── 控制台扩展数据（v3.297）：趋势 / 推送记录 ────────────────────────────────
 // 与 readStatus 同源同目录、同样只读（readSafeTextResult，符号链接/非常规文件防御继承），
 // 不改变 readStatus 返回形状——现有 --status / formatStatus / 前端看板零影响。
-
-// run.log 摘要行正则（与 parseLastRun 同一口径的**逐行**形态）：trends 把全部摘要行按日聚合，
-// 而不是只取最近一轮。dry-run 行（含 dry-run未推送=）计入轮次与获取数，但 pushed 恒为 0，
-// 与真实口径一致；noidentity/cachesaved 等附加字段不参与聚合。
-const RUN_SUMMARY_LINE_RE = /^(?:(\d{4}-\d{2}-\d{2})[T ]\d{2}:\d{2}:\d{2}\S* )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=(\S+)/
 
 function validInt (v) { return Number.isSafeInteger(v) && v >= 0 }
 

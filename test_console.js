@@ -24,7 +24,8 @@ const {
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
   sanitizeAccessPath, shouldLogAccess, ACCESS_LOG_MAX,
-  filterMessageItems, clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
+  filterMessageItems, filterMessagesByDays, messageCategoriesOf, MESSAGE_DAYS_ALLOWED,
+  clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
   RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS,
   REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE
@@ -482,6 +483,25 @@ ok('T-P2 filterMessageItems: cate 精确等值 + needle 双字段大小写不敏
   assert.deepStrictEqual(filterMessageItems(items, '好单-食品', 'milk').map(m => m.title), ['Milk Powder'])
   // 空 cate / 空 needle 直通
   assert.strictEqual(filterMessageItems(items, '', '').length, 5)
+})
+ok('T-P2b 时间窗: 上海日历日边界 / 分类计数跟随窗口 / 非法天数回全部', () => {
+  // 2026-10-18 00:00 Asia/Shanghai = 2026-10-17T16:00Z
+  const now = Date.UTC(2026, 9, 17, 16, 0, 0)
+  const items = [
+    { title: '今天', catename: 'A', datetime: '2026-10-18 09:00:00' },
+    { title: '昨天', catename: 'B', datetime: '2026-10-17 23:00:00' },
+    { title: '前天', catename: 'A', datetime: '2026-10-16 12:00:00' },
+    { title: '三天前', catename: 'C', datetime: '2026-10-15 12:00:00' },
+    { title: '缺日期', catename: 'A' },
+    { title: '坏日期', catename: 'B', datetime: 'not-a-date' }
+  ]
+  assert.deepStrictEqual(MESSAGE_DAYS_ALLOWED, [0, 1, 3, 7, 30])
+  assert.deepStrictEqual(filterMessagesByDays(items, 1, now).map(m => m.title), ['今天'], '今天=上海 00:00 起')
+  assert.deepStrictEqual(filterMessagesByDays(items, 3, now).map(m => m.title), ['今天', '昨天', '前天'], '近 3 天含今天')
+  assert.deepStrictEqual(filterMessagesByDays(items, 7, now).map(m => m.title), ['今天', '昨天', '前天', '三天前'])
+  assert.strictEqual(filterMessagesByDays(items, 0, now).length, 6, '0=全部，不因缺日期丢条目')
+  assert.strictEqual(filterMessagesByDays(items, 99, now).length, 4, '正数窗宽按窗口过滤（白名单在端点）')
+  assert.deepStrictEqual(messageCategoriesOf(filterMessagesByDays(items, 1, now)), [{ name: 'A', count: 1 }], '分类计数跟随时间窗')
 })
 ok('T-P3 exportRowOf: 五字段白名单 / 缺省回退 / 200 码元截断 / time 拼接 trim', () => {
   const full = exportRowOf({
@@ -2670,7 +2690,7 @@ async function main () {
   await aok('结构红线: 非概览/日志页停止主轮询（防 5s 闪屏）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes("if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)"), '推送记录/配置/系统必须停止主轮询')
-    assert.ok(/\[refreshSplit, locking, tab\]/.test(src), '轮询 effect 必须随 tab 变化重跑')
+    assert.ok(/\[refreshSplit, locking, tab, autoRefresh\]/.test(src), '轮询 effect 必须随 tab / 暂停开关变化重跑')
   })
 
   await aok('结构红线: 配置页过滤规则/渠道不拼成一条长串', () => {
@@ -2725,17 +2745,80 @@ async function main () {
     assert.deepStrictEqual(filterLogLines(txt, 'issue', 'pushed=20'), [], '正常摘要行不混进异常结果')
   })
 
+  await aok('行为: v3.307 日志级别 / 时间戳 / 哈希 / 逐轮筛选纯函数', async () => {
+    const { isConsoleLifecycleLine, logLineKind, logLineCounts, filterLogLines, ageFromStamp, tabFromHash, filterRunItems } =
+      await import('./scripts/console-assets/pure.mjs')
+    const okLine = '2026-10-17 23:06:42 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s'
+    const life = '2026-10-16 10:00:00 ERROR 控制台停止：任务 #12 于运行中被停止（SIGTERM）'
+    const errLine = '2026-10-17 23:00:00 ERROR 推送全部失败 3 条（通道可能失效）'
+    const alertLine = '2026-10-17 23:00:00 ALERT [v3.0] 运行异常'
+    const failLine = '2026-10-17 23:00:00 total=20 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=1s'
+    const txt = [okLine, life, errLine, alertLine, failLine].join('\n') + '\n'
+    assert.strictEqual(isConsoleLifecycleLine(life), true)
+    assert.strictEqual(isConsoleLifecycleLine(errLine), false, '普通 ERROR 不是控制台生命周期')
+    assert.strictEqual(logLineKind(life), 'console', '生命周期优先于 ERROR 级别')
+    assert.strictEqual(logLineKind(alertLine), 'alert')
+    assert.strictEqual(logLineKind(okLine), 'summary')
+    const counts = logLineCounts(txt)
+    assert.deepStrictEqual(counts, { all: 5, issue: 3, error: 2, alert: 1, warn: 0, summary: 2, console: 1 })
+    assert.deepStrictEqual(filterLogLines(txt, 'console', ''), [life], '控制台筛选只留生命周期')
+    assert.deepStrictEqual(filterLogLines(txt, 'error', ''), [life, errLine], '错误=按原始级别（含生命周期）')
+    assert.deepStrictEqual(filterLogLines(txt, 'issue', ''), [errLine, alertLine, failLine], '异常已排除生命周期')
+    assert.strictEqual(ageFromStamp('2026-10-18 00:00:00', Date.UTC(2026, 9, 17, 16, 0, 0)), '刚刚')
+    assert.strictEqual(ageFromStamp('bad', 0), '')
+    assert.strictEqual(tabFromHash('#/logs'), 'logs')
+    assert.strictEqual(tabFromHash('#/sys'), 'sys')
+    assert.strictEqual(tabFromHash('#/nope'), 'overview')
+    assert.strictEqual(tabFromHash(''), 'overview')
+    const runs = [
+      { at: '2026-10-14 10:00:00', failed: 3, interrupted: false },
+      { at: '2026-10-15 10:00:00', failed: 0, interrupted: true },
+      { at: '', failed: 0, interrupted: false }
+    ]
+    assert.strictEqual(filterRunItems(runs, { mode: 'issue' }).length, 2, '失败/中断都算 issue')
+    assert.deepStrictEqual(filterRunItems(runs, { day: '2026-10-15' }).map((r) => r.at), ['2026-10-15 10:00:00'])
+    assert.strictEqual(filterRunItems(runs, { mode: 'issue', day: '2026-10-14' }).length, 1, '筛选取交集')
+    assert.strictEqual(filterRunItems(null, { mode: 'issue' }).length, 0)
+  })
+
+  await aok('结构红线: v3.307 确认弹窗 / 今日统计 / 时间窗 / 日志级别 / hash 路由', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes('function ConfirmDialog'), '危险动作必须有确认弹窗')
+    assert.ok(src.includes("if (action === 'run' || action === 'notify-test') setPending(action)"),
+      '正式运行与通知自检必须走确认；试运行/环境检查直接执行')
+    assert.ok(src.includes("cls: 'btn-danger-solid'"), '正式运行必须是红色危险按钮')
+    assert.ok(src.includes('role="dialog"') && src.includes('aria-modal="true"'), '弹窗必须有无障碍语义')
+    assert.ok(src.includes('defaultFocus') === false && src.includes('cancelRef.current.focus()'),
+      '默认焦点必须落在取消，不能落在确认')
+    assert.ok(src.includes('function AlertBanner'), '首屏必须有失败横幅')
+    assert.ok(src.includes("state.stats.status === 'ok'"), '状态卡必须消费 stats')
+    assert.ok(src.includes('成功率'), '状态卡必须显示成功率')
+    assert.ok(src.includes('>今天</option>') && src.includes('>近 7 天</option>'), '推送记录必须有时间窗')
+    assert.ok(src.includes('initialMode') && src.includes('initialQuery'), '日志面板必须支持带条件跳转')
+    assert.ok(src.includes("window.addEventListener('hashchange'"), '页签必须跟随 hash')
+    assert.ok(src.includes('document.title ='), '标题必须带状态点')
+    assert.ok(src.includes('autoRefresh') && src.includes('自动刷新 · '), '自动刷新必须有暂停与倒计时')
+    assert.ok(src.includes('filterRunItems'), '逐轮历史必须支持失败/日期筛选')
+    assert.ok(!src.includes('首轮前正常'), '墓碑文案不得再写「首轮前正常」')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.alert-banner\s*\{/.test(css) && /\.modal-backdrop\s*\{/.test(css), '横幅/弹窗样式必须存在')
+    assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.cards\s*\{\s*grid-template-columns:\s*1fr 1fr/.test(css),
+      '手机端状态卡必须 2×2，不能四张单列')
+    assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.btn-item\s*\{\s*flex:\s*1 1 calc\(50% - 5px\)/.test(css),
+      '手机端动作按钮必须 2×2')
+  })
+
   await aok('结构红线: 概览先状态与操作，空触发历史不占位（运行中仍显示）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     const start = src.indexOf("${tab === 'overview' && html`<div>")
     const end = src.indexOf("${tab === 'messages'", start)
     assert.ok(start > -1 && end > start, '应能定位概览区块')
     const seg = src.slice(start, end)
-    const order = ['StatusCards', 'TriggerBar', 'TrendsPanel', 'RunHistoryPanel', 'CacheHealthPanel'].map((n) => seg.indexOf(n))
-    assert.ok(order.every((i) => i > -1), '概览必须包含状态卡/触发/趋势/逐轮历史/缓存健康')
-    assert.deepStrictEqual([...order].sort((a, b) => a - b), order, '首屏必须先状态与操作，缓存健康垫底')
-    assert.ok(/\(runs\.length > 0 \|\| locking\) && html`<\$\{RunsPanel\}/.test(seg),
-      '触发历史有记录或任务运行中才渲染（另一实例持锁时不能消失）')
+    const order = ['AlertBanner', 'StatusCards', 'TriggerBar', 'TrendsPanel', 'RunHistoryPanel', 'CacheHealthPanel'].map((n) => seg.indexOf(n))
+    assert.ok(order.every((i) => i > -1), '概览必须包含异常横幅/状态卡/触发/趋势/逐轮历史/缓存健康')
+    assert.deepStrictEqual([...order].sort((a, b) => a - b), order, '首屏先异常与状态、再操作，缓存健康垫底')
+    assert.ok(/locking && html`<\$\{RunsPanel\}/.test(seg),
+      '触发历史只在任务运行中占位（空闲时让位给趋势/逐轮历史；另一实例持锁时 locking=true）')
   })
 
   await aok('结构红线: 后台标签页不轮询（概览/日志/触发详情三处）', () => {
@@ -2756,7 +2839,7 @@ async function main () {
     assert.ok(/\.tabs\s*\{[^}]*position:\s*sticky/.test(css), '标签页必须吸顶')
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('window.scrollTo(0, 0)'), '切页必须回到顶部')
-    assert.ok(/onClick=\$\{\(\) => switchTab\(t\.key\)\}/.test(src), '标签点击必须走 switchTab，不得绕过')
+    assert.ok(/onClick=\$\{\(\) => \{[^\n]*switchTab\(t\.key\)/.test(src), '标签点击必须走 switchTab，不得绕过（可先清日志跳转）')
     const cache = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('// 推送记录：'))
     assert.ok(cache.includes('60000'), '缓存健康必须每分钟刷新')
     assert.ok(cache.includes("document.addEventListener('visibilitychange', onVis)"), '切回前台要补拉缓存快照')

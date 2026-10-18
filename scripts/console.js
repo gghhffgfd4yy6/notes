@@ -88,6 +88,9 @@ const MESSAGES_PAGE_SIZE_MAX = 100
 const MESSAGES_PAGE_MAX = 10000
 // 搜索词长度上限（字节）：UTF-8 下 240 字节足够容纳 80 个汉字，防止超长 query 白耗 CPU。
 const MESSAGES_QUERY_MAX_BYTES = 240
+// 推送记录时间窗（v3.307）：0=全部；1=今天；3/7/30=近 N 个上海日历日（含今天）。
+// 与 run.log 同口径用 Asia/Shanghai 日历日，避免宿主 UTC 时 00:00–08:00 归错天。
+const MESSAGE_DAYS_ALLOWED = Object.freeze([0, 1, 3, 7, 30])
 
 // ── v3.300 批次③ 3.2 消息导出常量 ───────────────────────────────────────────
 // 单次导出行数上限：超出即截断 + 响应头 X-Export-Truncated: true 如实披露。
@@ -888,6 +891,32 @@ function filterMessageItems (items, cate, needle) {
   return out
 }
 
+// 推送记录时间窗过滤（v3.307）：按条目的 datetime（生产写入的上海本地时间）前缀比较，
+// 不解析时分秒——页面只提供「今天/近 N 天」粗粒度，日期边界由字符串前缀天然满足。
+// datetime 缺失/非法的条目在时间窗模式下不展示（无法证明它属于窗口，不猜）。
+function filterMessagesByDays (items, days, now = Date.now()) {
+  if (!(Number.isSafeInteger(days) && days > 0)) return items
+  const offsetMs = 8 * 3600 * 1000
+  const todayKey = new Date(now + offsetMs).toISOString().slice(0, 10)
+  const startKey = new Date(now - (days - 1) * 86400000 + offsetMs).toISOString().slice(0, 10)
+  return items.filter((m) => {
+    if (typeof m.datetime !== 'string' || m.datetime.length < 10) return false
+    const day = m.datetime.slice(0, 10)
+    return day >= startKey && day <= todayKey
+  })
+}
+
+// 分类计数（v3.307）：时间窗筛选后分类下拉的计数必须跟随窗口，否则「今天」里会显示
+// 全量 83 个分类的条数，看起来像筛选没生效。无窗口时仍用 readMessages 的预聚合结果。
+function messageCategoriesOf (items) {
+  const counts = new Map()
+  for (const m of items) {
+    const name = typeof m.catename === 'string' && m.catename.length > 0 ? m.catename : '(未分类)'
+    counts.set(name, (counts.get(name) || 0) + 1)
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }))
+}
+
 // CSV 单元格转义（CWE-1236 防公式注入）。顺序定夺：①中性化（内容层）在前、②引号包裹（传输层）在后。
 // 理由：RFC 4180 的引号包裹是解析器会撤销的传输编码，电子表格求值发生在解析之后——中性化必须
 // 作用于「解析后的内容」，故先对原始值做，再包裹；若先包裹，被包裹单元格首字符恒为 "，首字符
@@ -1653,7 +1682,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       let query = typeof q.get('q') === 'string' ? q.get('q').trim() : ''
       query = clampQueryBytes(query)
       const needle = query.length > 0 ? query.toLowerCase() : ''
-      const items = filterMessageItems(read.value.items, cate, needle)
+      // 时间窗（v3.307）：白名单外的值一律回「全部」（宽松输入，不 400）。
+      const daysRaw = Number(q.get('days'))
+      const days = MESSAGE_DAYS_ALLOWED.includes(daysRaw) ? daysRaw : 0
+      const windowed = days > 0 ? filterMessagesByDays(read.value.items, days) : read.value.items
+      const items = filterMessageItems(windowed, cate, needle)
+      // 行键必须按「条目对象」取原始 keys：过滤/时间窗会改变下标，继续用 start+i 会把
+      // 旧行的 rowKey 贴到新行上（展开状态/React key 联动错位）。
+      const keyByItem = new Map(read.value.items.map((m, i) => [m, read.value.keys[i]]))
       // 下发字段裁剪：content_html 不出（体积大且含外链 img，CSP 下也渲染不了）；
       // 列表给 title/content 摘要 + 元数据；详情字段由前端展开 content 全文。
       const total = items.length
@@ -1664,8 +1700,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         id: typeof m.id === 'number' || typeof m.id === 'string' ? m.id : '',
         // rowKey：readMessages 按「原始数组下标」合成的稳定行键（与 keys 数组对齐取）。
         // 排序/分页不改变键；无 id 的匿名条目也不再共用 '' 导致展开联动。
-        rowKey: read.value.keys[start + i] !== undefined
-          ? read.value.keys[start + i]
+        rowKey: keyByItem.get(m) !== undefined
+          ? keyByItem.get(m)
           : String(m.id !== undefined && m.id !== null ? m.id : `idx-${start + i}`),
         title: typeof m.title === 'string' ? m.title : '',
         // content 全文下发（前端列表自行截断显示）：列表只有 ≤100 条，截到 500 反而让
@@ -1691,7 +1727,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         queryUsed: query,
         // baseUrl：相对 url 的拼接前缀（= 生产 Config.domain，去尾斜杠），前端不再硬编码
         baseUrl: sourceDomain(),
-        categories: read.value.categories,
+        // 时间窗：0=全部；>0 时 categories 也只统计窗口内条目（筛选器计数要跟手）
+        days,
+        categories: days > 0 ? messageCategoriesOf(windowed) : read.value.categories,
         items: pageItems
       })
       return
@@ -1712,6 +1750,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           const cate = typeof params.get('cate') === 'string' ? params.get('cate') : ''
           const query = clampQueryBytes(typeof params.get('q') === 'string' ? params.get('q').trim() : '')
           const needle = query.length > 0 ? query.toLowerCase() : ''
+          const daysRaw = Number(params.get('days'))
+          const days = MESSAGE_DAYS_ALLOWED.includes(daysRaw) ? daysRaw : 0
           const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES, filename: messagesFile })
           if (read.status !== 'ok') {
             // missing/invalid/tooLarge 三态如实下发（与 /api/messages 同形态同哲学）：
@@ -1720,7 +1760,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             sendJson(res, 200, { status: read.status, total: 0, items: [], cacheDirHint: stateDir, cacheFileHint: messagesFile })
             return
           }
-          const filtered = filterMessageItems(read.value.items, cate, needle)
+          const filtered = filterMessageItems(days > 0 ? filterMessagesByDays(read.value.items, days) : read.value.items, cate, needle)
           const truncated = filtered.length > EXPORT_MAX_ROWS
           const rows = (truncated ? filtered.slice(0, EXPORT_MAX_ROWS) : filtered).map(exportRowOf)
           if (format === 'json') {
@@ -2235,6 +2275,9 @@ module.exports = {
   ACCESS_LOG_MAX,
   // v3.300 批次③ 3.2 消息导出：纯函数/常量导出（非 HTTP 单测 + 变异测试可达性）
   filterMessageItems,
+  filterMessagesByDays,
+  messageCategoriesOf,
+  MESSAGE_DAYS_ALLOWED,
   clampQueryBytes,
   csvCell,
   exportRowOf,
