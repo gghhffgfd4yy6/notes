@@ -84,10 +84,16 @@ const ROOT = path.resolve(__dirname, '..')
 const RUN_LOG_MAX_BYTES = 512 * 1024
 const PROC_TIMEOUT_MS = 10 * 60 * 1000
 const TOKEN_MIN_LEN = 16
-// 消息列表（GET /api/messages）读取上限：push.json 是判重缓存主存（MESSAGE_CACHE_MAX_BYTES=64MiB
-// 的生产写入上限），控制台只读展示按 32MiB 封顶——超过即 tooLarge，前端显示「记录过大不可读」，
-// 与 run.log 尾读策略不同：列表必须整读才能排序/分页，半截 JSON 假装可读更危险。
-const MESSAGES_MAX_BYTES = 32 * 1024 * 1024
+// 消息列表（GET /api/messages）读取上限：push.json 是判重缓存主存（生产写入上限
+// MESSAGE_CACHE_MAX_BYTES = 64MiB）。旧口径按 32MiB 封顶（D2-N11）：介于两者之间的**合法**
+// 缓存会被永久判 tooLarge——缓存健康页报「不可读」，但生产侧一切正常。现与写端对齐到 64MiB；
+// 单次解析成本由 status.readMessages 的 (ino,size,mtime) 缓存摊薄（D2-S18），不再每请求整读。
+const MESSAGES_MAX_BYTES = 64 * 1024 * 1024
+// cache-health 的条数统计阈值（D2-S12）：这个端点在 HTTP 事件循环上同步整读 + parse，
+// 20MB/29704 条实测 232ms 阻塞。超过阈值就不整读——条数如实报 null + tooLarge（前端显示
+// 「当前条数不可得」），需要精确条数时去推送记录页看 grandTotal。阈值内的文件走
+// readMessages 的 (ino,size,mtime) 缓存，重复请求不再 parse。
+const CACHE_HEALTH_COUNT_MAX_BYTES = 8 * 1024 * 1024
 // 日志查看（GET /api/logs）取尾部：日志消费方只关心最近的记录，与 scripts/status.js 的
 // LOG_READ_OPTIONS.tail 同一口径（超限读尾 1MiB，不全拒）。
 const LOG_VIEW_MAX_BYTES = 1024 * 1024
@@ -144,7 +150,8 @@ const FILES_LIST_MAX = 1000
 const CACHE_HEALTH_NEAR_RATIO = 0.8
 
 // ── 批次④ 4.1：通知自检的独立重放窗 ─────────────────────────────────────────
-// 自检是高频调试动作，12min 太长；但也不能连点刷通知 → 60s。
+// 自检是高频调试动作，不能连点刷通知 → 60s。通用动作窗 D2-S16 后同为 60s，但常量保持
+// 独立：语义不同（自检每次都真实推送），将来若要再区分，不必重拆通用窗。
 // lastAccept 本就按 action 键控（per-action Map + 持久化 JSON 的 key），无需改持久化结构。
 const REPLAY_WINDOW_NOTIFY_TEST_MS = 60 * 1000
 
@@ -152,11 +159,12 @@ const REPLAY_WINDOW_NOTIFY_TEST_MS = 60 * 1000
 // 纯内存环形上限：重启即空、不写盘（README 披露）——避免日志自身成为磁盘面，
 // 已有时序上更全的 run.log 留痕体系（蓝图 §3.3）。
 const ACCESS_LOG_MAX = 200
-// token 清洗正则：服务端常量、无用户输入参与构造（红线允许形态，先例 BEARER_PREFIX/
-// sessionCookieValue 的手写解析同源纪律）。([?&;#]) 捕获保留分隔符：
-// /?token=a → /?token=***（查询串形状不破坏）；键名大小写不敏感（Token=/TOKEN= 同洗——
-// 「token 不进日志」不依赖键名大小写，审查 3.3-M1）；[^&;#]* 线性无回溯。
-const ACCESS_TOKEN_RE = /([?&;#])[Tt][Oo][Kk][Ee][Nn]=[^&;#]*/g
+// 访问日志的敏感参数键（D2-N1）：旧实现只认 `token=`，`access_token=`/`key=`/`secret=`
+// 原样入日志并展示。这里用「键名包含」判定（键名先解码到不动点再小写），覆盖
+// access_token / refresh_token / appkey / api_key / secret / password 等派生形态；
+// 判定对象是键名而不是整条 URL——值里恰好出现 "token" 字样不得导致整段删除（D2-N2）。
+// 键名列表是服务端常量，用户输入只作为 String 被 includes，不进正则构造。
+const SECRET_PARAM_HINTS = Object.freeze(['token', 'secret', 'password', 'passwd', 'key', 'credential'])
 // 详情轮询路径形态：与 /api/runs/:id 的 runMatch 同形的服务端常量正则
 // （D4 定夺的降噪对象：GET /api/runs/<epoch.seq> 2xx 不记）。
 const RUN_DETAIL_PATH_RE = /^\/api\/runs\/\d{13,}\.\d{1,10}$/
@@ -636,17 +644,27 @@ function assetQuery () {
 }
 
 // Accept-Encoding：按 RFC 9110 只认「显式接受且 q>0」的 gzip（含 * 通配）。
+// 优先级（D1-N2）：显式 gzip 的 q 永远压过 * —— `gzip;q=0, *` 是「明确拒绝 gzip，其余随你」，
+// 旧实现按出现顺序先命中 `*`（无 q ⇒ 视为接受）就返回 true，仍回压缩体。
+// 无显式 gzip 时才落 *；两者都没有 = 不接受 gzip。非法 q 值按 0（不接受）处理。
 function acceptsGzip (header) {
-  const parts = String(header || '').split(',')
-  for (const part of parts) {
+  let explicit = null
+  let wildcard = null
+  for (const part of String(header || '').split(',')) {
     const segs = part.trim().toLowerCase().split(';')
     const token = segs[0].trim()
     if (token !== 'gzip' && token !== '*') continue
-    const q = segs.slice(1).map(x => x.trim()).find(x => x.startsWith('q='))
-    if (!q) return true
-    const val = Number(q.slice(2))
-    if (Number.isFinite(val) && val > 0) return true
+    const qseg = segs.slice(1).map((x) => x.trim()).find((x) => x.startsWith('q='))
+    let q = 1
+    if (qseg) {
+      const val = Number(qseg.slice(2))
+      q = Number.isFinite(val) ? val : 0
+    }
+    if (token === 'gzip') explicit = q
+    else wildcard = q
   }
+  if (explicit !== null) return explicit > 0
+  if (wildcard !== null) return wildcard > 0
   return false
 }
 
@@ -721,12 +739,29 @@ function accessStamp () {
   try { return accessStampFmt.format(new Date()) } catch (e) { return new Date().toISOString() }
 }
 
-function washTokens (s) {
-  // 迭代到不动点：堵重复 token 参数逃逸（?a=1&token=x&token=y 这类拼接形态）。
-  // g 标志单轮即全量替换，但迭代写法对任意拼接形态都收口到不动点，成本恒为零或一轮。
-  let prev = null
-  while (prev !== s) { prev = s; s = s.replace(ACCESS_TOKEN_RE, '$1token=***') }
-  return s
+// 敏感键名判定：把键名里的 %XX 逐层解到不动点再小写（堵 %74oken= / %2574oken= 等
+// 编码键名；16 轮上限防病态深嵌套）。
+function isSecretParamKey (key) {
+  let s = String(key == null ? '' : key)
+  for (let round = 0; round < 16; round++) {
+    let d
+    try { d = decodeURIComponent(s) } catch (e) { d = bestEffortDecode(s) }
+    if (d === s) break
+    s = d
+  }
+  const lower = s.toLowerCase()
+  return SECRET_PARAM_HINTS.some((hint) => lower.includes(hint))
+}
+
+// 原串里的裸控制字符转成 %XX：请求行本不该含它们，但 sanitize 的输出会进 JSON/页面，
+// 不能把 C0/C1 原样留在日志里（D2-N2）。
+function escapeControlChars (s) {
+  let out = ''
+  for (let i = 0; i < s.length; i++) {
+    const cp = s.charCodeAt(i)
+    out += (cp < 0x20 || cp === 0x7f) ? `%${cp.toString(16).toUpperCase().padStart(2, '0')}` : s[i]
+  }
+  return out
 }
 
 // 尽力解码（评审 231-555）：decodeURIComponent 全串版对任何畸形 % 序列整体抛错，
@@ -749,30 +784,37 @@ function bestEffortDecode (s) {
 }
 
 function sanitizeAccessPath (raw) {
-  // 脱敏硬闸（蓝图防线 1）：先原串洗，再「解码→复洗」至不动点（D6，堵 %74oken= /
-  // %2574oken= 及更深编码键名；上限 16 轮防病态深嵌套，URL 编码超过 16 层无实际形态）。
-  // 解码失败（畸形 % 序列抛 URIError）不再提前 return（评审 231-555：那会放过同串的
-  // 编码 token 键）——改用逐段尽力解码后继续洗；全失败也保有已洗串。
-  // 先例口径：sessionCookieValue 对畸形 Cookie 按「无有效值」处理，绝不炸主链路。
-  // 注意：解码后若洗出了 token，返回的是解码形态路径（内容已 *** 化，泄露面为零）。
-  let s = washTokens(String(raw == null ? '' : raw))
-  for (let round = 0; round < 16; round++) {
-    let d
-    try { d = decodeURIComponent(s) } catch (e) { d = bestEffortDecode(s) }
-    if (d === s) return s
-    s = washTokens(d)
+  // 脱敏硬闸（蓝图防线 1 / D2-N1 / D2-N2）：
+  // ① 判定用「解码到不动点」的键名（堵 %74oken= / %2574oken= 与 access_token= 等派生键）；
+  // ② 落盘用**原串**逐段改写——旧实现返回解码后的整条 URL，既可能含 %0A 解出的控制字符，
+  //    也与真实请求行不再一一对应（排障时按日志无法定位请求）；
+  // ③ 只替换命中键的**值**：非敏感参数的值原样保留（值里出现 "token" 字样不等于它就是
+  //    凭证，不得整段删除）；
+  // ④ 畸形 % 序列不抛错（bestEffortDecode 逐段解），先例口径同 sessionCookieValue。
+  const src = typeof raw === 'string' ? raw : String(raw == null ? '' : raw)
+  const parts = src.split(/([?&;#])/)
+  let out = ''
+  for (const part of parts) {
+    if (part === '?' || part === '&' || part === ';' || part === '#') { out += part; continue }
+    const eq = part.indexOf('=')
+    if (eq < 0) { out += part; continue }
+    const key = part.slice(0, eq)
+    out += isSecretParamKey(key) ? `${key}=***` : part
   }
-  return s
+  return escapeControlChars(out)
 }
 
 function shouldLogAccess (method, pathname, statusCode) {
-  // 降噪白名单（蓝图「记什么」）：仅 2xx 且命中白名单才免记；非 2xx（含 401/404/5xx）全记。
+  // 降噪白名单（蓝图「记什么」）：2xx/304 且命中白名单才免记；其余（含 401/404/5xx）全记。
+  // 304（D2-S10）是浏览器缓存的正常命中——静态资产每次协商都 304，旧实现把它们全塞进
+  // 200 条环形，把真正的可疑请求挤掉。304 只对白名单路径免记（非白名单 304 仍记）。
   // 白名单 = GET / 页面、GET /api/status、GET /api/runs 列表、GET /api/runs/:id 详情、
   // POST /api/runs/detail（D4：前端实际形态，响应体与 GET /:id 等价）、静态三资产、
   // GET /api/runs/stream（v3.300 3.1：SSE 连接分钟级，finish 时 ms=整段连接时长，
   // 照记会污染「慢请求」读数；非 2xx 照记）。
   // /api/access-log 自身 200 不在名单 → 入日志（自举，蓝图防线 3）。
-  if (!(statusCode >= 200 && statusCode <= 299)) return true
+  const okStatus = (statusCode >= 200 && statusCode <= 299) || statusCode === 304
+  if (!okStatus) return true
   const m = method === 'GET'
   const p = String(pathname || '')
   if (m && (p === '/' || p === '/api/status' || p === '/api/runs' || p === '/api/runs/stream' ||
@@ -936,21 +978,42 @@ function ssePlanChunk (cursor, output, outputTotalLength) {
   return null
 }
 
+// 超限后的排空上限（D2-S2）：客户端若只发一半就挂住，不能让连接无限期占着事件循环。
+const BODY_DRAIN_TIMEOUT_MS = 10 * 1000
 function readBody (req, maxBytes = 4096) {
   return new Promise((resolve) => {
     const decoder = new StringDecoder('utf8')
     let buf = ''
     let over = false
     let aborted = false
+    let settled = false
+    let drainTimer = null
+    const finish = () => {
+      if (settled) return
+      settled = true
+      if (drainTimer) { clearTimeout(drainTimer); drainTimer = null }
+      resolve({ body: over ? '' : buf, over, aborted })
+    }
     req.on('data', (c) => {
-      if (over) { req.destroy(); return } // Sourcery Medium：超限即断流，不再吸收内存
+      if (over) return // 已超限：只排空，不再累积
       buf += decoder.write(c)
-      if (buf.length > maxBytes) over = true
+      if (buf.length > maxBytes) {
+        // 超限后**不能**先 destroy：多 chunk 客户端只会看到 ECONNRESET，413 分支永远
+        // 到不了（D2-S2）。改为停止累积 + resume() 排空剩余字节，等 'end' 再回 413。
+        over = true
+        buf = ''
+        req.resume()
+        drainTimer = setTimeout(() => {
+          try { req.destroy() } catch (e) { /* 已断开 */ }
+          finish()
+        }, BODY_DRAIN_TIMEOUT_MS)
+        if (drainTimer.unref) drainTimer.unref()
+      }
     })
-    req.on('end', () => resolve({ body: buf + decoder.end(), over, aborted }))
+    req.on('end', () => { if (!over) buf += decoder.end(); finish() })
     // Sourcery Medium：error 时标记 aborted——残缺 body 不允许触发动作。
-    req.on('error', () => { aborted = true; resolve({ body: buf, over, aborted }) })
-    req.on('aborted', () => { aborted = true; resolve({ body: buf, over, aborted }) })
+    req.on('error', () => { aborted = true; finish() })
+    req.on('aborted', () => { aborted = true; finish() })
   })
 }
 
@@ -1315,6 +1378,22 @@ function buildConfigView () {
   return view
 }
 
+// 最终保险丝（D2-S13）：递归扫描响应里的键名，任一键名含 token/key/secret/password 且值
+// 是非空字符串即视为泄漏形态（白名单结构最深 4 层，深度上限 6 足够且防环）。返回命中的键名，
+// 空串表示干净。纯函数（导出给单测：这段防线必须可被执行到，而不是不可达的死代码）。
+const SECRET_KEY_RE = /token|key|secret|password|passwd/i
+function findSecretLikeField (value, depth = 0) {
+  if (depth > 6 || value === null || typeof value !== 'object') return ''
+  for (const [k, v] of Object.entries(value)) {
+    if (SECRET_KEY_RE.test(k) && typeof v === 'string' && v.length > 0) return k
+    if (v && typeof v === 'object') {
+      const hit = findSecretLikeField(v, depth + 1)
+      if (hit) return hit
+    }
+  }
+  return ''
+}
+
 // 推送渠道配置状态：只经 sendNotify 已导出的布尔/计数接口（configuredChannelNames 的
 // canonical 名与 perChannel 键一一对应），密钥值全程不离开 sendNotify 模块作用域。
 function buildPushChannelsView () {
@@ -1386,9 +1465,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // lastAccept[action] = { at, runId }。per-action 存储：换动作不会覆盖前一个动作的
   // 重放记录（「先 run 后重试 check 再重试 run」仍被拦）；进程内存语义 = 重启清空，
   // 重启后窗口失效是已知边界（锁与 runs 历史同样在内存，重启后本就没有「上一轮」）。
-  // 窗口 > PROC_TIMEOUT_MS（子进程最长生命周期）：首轮结束后锁已释放，但重放
-  // 窗仍拦截——这正是修复点。超窗不受影响，人工重跑语义保留。
-  const REPLAY_WINDOW_MS = PROC_TIMEOUT_MS + 2 * 60 * 1000
+  // 窗口长度（D2-S16）：旧口径 PROC_TIMEOUT_MS + 2min ≈ 12min —— 首轮早已结束、锁也
+  // 释放了，人工重跑仍被当成「重复提交」拦 12 分钟，文案还说「已有任务在运行」（假话）。
+  // 防的是「202 响应丢失后的自动重试」，60s 足够覆盖；超窗即视为新的手动触发。
+  const REPLAY_WINDOW_MS = 60 * 1000
   const lastAccept = new Map()
   // 进程启动时刻（/api/sys 展示「已运行」用）：createConsole 被调用的瞬间。
   const startedAtMs = Date.now()
@@ -1569,7 +1649,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           const prevPre = prevPrePair ? prevPrePair[1] : lastAccept.get(action)
           if (prevPre && now - prevPre.at < winMsPre) {
             const rid = prevPre.runId
-            sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true })
+            const remainS = Math.max(1, Math.ceil((winMsPre - (now - prevPre.at)) / 1000))
+            sendJson(res, 409, { error: `重复提交已拦截（该动作刚受理过，${remainS} 秒后可重试）`, runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true, retryAfterS: remainS })
             return
           }
           sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
@@ -1580,15 +1661,20 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
         }
         const prev = lastAccept.get(action)
-        // 60s 独立窗：notify-test 用短窗（高频调试动作防连点刷通知），其余动作维持 12min。
-        // /trigger 的 action=notify-test 与独立端点共享同一 lastAccept 键与窗长（有意行为）。
+        // 两种动作同为 60s 窗（D2-S16：普通动作不再用 12min——那只拦得到人工重跑，拦不到
+        // 真正的重复提交；运行中互斥由单飞锁负责）。/trigger 的 action=notify-test 与独立
+        // 端点共享同一 lastAccept 键与窗长（有意行为）。
         const winMs = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : REPLAY_WINDOW_MS
         if (prev && now - prev.at < winMs) {
           // runId = epoch.seq 字符串（v3.299 评审）：0 是 pending 帧哨兵（数字），
           // 真实 runId 只在 startAction 之后落盘——用「数字 0」判 pending，其余原样下发。
           const rid = prev.runId
-          releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
-          sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true })
+          // D2-N3：这一处此前丢弃 releaseLockFor 的返回值，锁释放失败无人知晓（另两处
+          // 同款分支都有响亮告警）。统一成同款文案。
+          const replayReleasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
+          if (!replayReleasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}，重放拦截分支）：锁将保留到陈旧接管（约 10 分钟），期间触发 409 属预期。`)
+          const remainS = Math.max(1, Math.ceil((winMs - (now - prev.at)) / 1000))
+          sendJson(res, 409, { error: `重复提交已拦截（该动作刚受理过，${remainS} 秒后可重试）`, runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true, retryAfterS: remainS })
           return
         }
         lastAccept.set(action, { at: now, runId: 0 })
@@ -1925,6 +2011,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           const filtered = filterMessageItems(days > 0 ? filterMessagesByDays(read.value.items, days) : read.value.items, cate, needle)
           const truncated = filtered.length > EXPORT_MAX_ROWS
           const rows = (truncated ? filtered.slice(0, EXPORT_MAX_ROWS) : filtered).map(exportRowOf)
+          // 截断回显（D2-S9）：列表端点有 queryUsed，导出此前没有——搜索词超过 240 字节被
+          // 静默截断时，用户会以为「导出的是我搜的那个词的结果」。JSON 保持裸数组契约
+          // （不改成 {items,...} 对象），CSV 也不插注释行，统一走响应头：percent-encoded
+          // UTF-8，非 ASCII 安全；未截断也下发，消费方可据此判断词是否被接受。
+          const exportMeta = { 'X-Export-Query-Used': encodeURIComponent(query) }
           if (format === 'json') {
             // 仅截断时下发该头；未截断不下发（缺席=完整，测试断言 undefined）。
             if (truncated) res.setHeader('X-Export-Truncated', 'true')
@@ -1933,15 +2024,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             // 不进响应体（形态纯度优先；三态响应才是 {status,...} 对象，前端按
             // Array.isArray 区分成功/三态——评审 231-H1）。
             const body = JSON.stringify(rows)
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="messages-export.json"' })
+            res.writeHead(200, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="messages-export.json"' }, exportMeta))
             res.end(body)
             return
           }
-          const head = {
+          const head = Object.assign({
             'Content-Type': 'text/csv; charset=utf-8',
             // 文件名硬编码字面量：查询词可能含 token 形态字符串，绝不回显进头（蓝图防线）。
             'Content-Disposition': 'attachment; filename="messages-export.csv"'
-          }
+          }, exportMeta)
           if (truncated) head['X-Export-Truncated'] = 'true'
           // BOM EF BB BF：Excel 无 BOM 按本地代码页解析会乱码中文（蓝图硬性要求）。
           res.writeHead(200, head)
@@ -2036,19 +2127,22 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/config') {
-      // 脱敏在 buildConfigView 内逐字段白名单完成；这里只做最终保险丝：
-      // 万一未来白名单意外混入凭证形态字段，响应前整体拦一道（fail-closed 降级为不含
-      // runtime 的骨架）。检测纯字符串形态匹配（键名小写 includes，无正则、无用户输入）。
+      // 脱敏在 buildConfigView 内逐字段白名单完成；这里只做最终保险丝：万一未来白名单
+      // 意外混入凭证形态字段，响应前整体拦一道（fail-closed 降级为不含 runtime 的骨架）。
+      // D2-S13：旧实现拿「大写环境变量名」去匹配小写化后的 JSON，两个形态永不相交，这段
+      // 防线不可达；且降级响应的键名写成 localFileLoaded（前端读 localFilePresent），
+      // 前端把「保险丝触发」误显示成「模块缺失」。现在按键名语义递归扫描 + 统一键名。
       const view = buildConfigView()
-      const blob = JSON.stringify(view).toLowerCase()
-      const SECRET_MARKERS = ['appToken', 'PUSH_PLUS_TOKEN', 'PUSH_KEY', 'BARK_PUSH', 'QYWX_KEY', 'WX_XIZHI_KEY', 'DEER_KEY', 'PUSHME_KEY', 'TG_BOT_TOKEN', 'TG_USER_ID']
-      let leaked = false
-      for (const marker of SECRET_MARKERS) {
-        // 值泄漏形态 = 「"字段名":"非空值"」整段出现（perChannel 布尔不含引号值，不误伤）
-        if (blob.includes(`"${marker.toLowerCase()}":"`)) { leaked = true; break }
-      }
+      const leaked = findSecretLikeField(view)
       if (leaked) {
-        sendJson(res, 200, { configLoaded: false, runtime: null, pushChannels: { moduleLoaded: false, count: 0, names: [], perChannel: {}, localFileLoaded: false }, console: { env: {} }, redacted: true })
+        sendJson(res, 200, {
+          configLoaded: false,
+          runtime: null,
+          pushChannels: { moduleLoaded: false, count: 0, names: [], perChannel: {}, localFilePresent: buildPushChannelsView().localFilePresent },
+          console: { env: {} },
+          redacted: true,
+          redactedField: leaked
+        })
         return
       }
       sendJson(res, 200, view)
@@ -2349,7 +2443,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 防个别子进程 close 事件丢失导致控制台挂住不退。
           child.once('close', maybeFinish)
         }
-        setTimeout(finishShutdown, 3000).unref()
+        // 看门狗（D1-N1）：3s 内没等到 close ≠ 锁已释放——finishRun 只在 exit/close 里跑。
+        // 孙进程持有 stdio 时 close 可能迟到数秒，而看门狗会先退出进程，锁就留到 10 分钟
+        // 陈旧接管（重启后第一次触发 409）。这里对仍未收尾的记录补一次 finishRun：
+        // 锁按 pid+token 双匹配作废，释放失败会走 finishRun 内的响亮告警。
+        setTimeout(() => {
+          for (const child of pending) {
+            for (const record of runs.values()) {
+              if (record._child === child && !record.finishedAt) finishRun(record, null)
+            }
+          }
+          finishShutdown()
+        }, 3000).unref()
       }
     }
     if (registerSignal) registerSignal(shutdown)
@@ -2431,6 +2536,7 @@ module.exports = {
   RUN_LOG_MAX_BYTES,
   PROC_TIMEOUT_MS,
   // v3.298 只读扩展：纯函数/常量导出（非 HTTP 单测 + 变异测试可达性）
+  MESSAGES_MAX_BYTES,
   statSafeMeta,
   tombstoneCounts,
   cacheHealthSnapshot,
@@ -2446,7 +2552,10 @@ module.exports = {
   // v3.300 访问日志：纯函数/常量导出（非 HTTP 单测 + 变异测试可达性）
   sanitizeAccessPath,
   shouldLogAccess,
+  acceptsGzip,
   ACCESS_LOG_MAX,
+  // D2-S13：最终保险丝（必须可被单测执行，否则又是一段不可达的死代码）
+  findSecretLikeField,
   // D2-S12：cache-health 条数阈值（用例按同一常量构造夹具）
   CACHE_HEALTH_COUNT_MAX_BYTES,
   cacheHealthEntryCount,

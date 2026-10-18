@@ -180,40 +180,40 @@ ok('releaseLockFor: released 短帧不大于原帧（回归：恒比原帧长的
   assert.strictEqual(JSON.parse(body).released, true, '空格补尾后仍是合法 JSON released 帧')
   assert.strictEqual(body.trim(), '{"released":true}', '实体内容必须是短帧（pid/token/startedAt 已无保留价值）')
 })
-ok('releaseLockFor: inode 一致性闸（回归 Sourcery #225 High：陈旧持有者不得覆写接管方的新锁帧）', () => {
+ok('releaseLockFor: inode 一致性闸（回归 Sourcery #225 High / D2-S4：闸必须真的被执行）', () => {
   const dir = tmpDir()
-  assert.strictEqual(acquireLock(dir, 1000, 'tok-old'), true)
-  // 模拟接管：走 acquireLock 自己的陈旧接管路径（startedAt 远超 PROC_TIMEOUT_MS），
-  // 该路径现已用 tmp+rename 原子换代——旧持有者 fd 里的 inode 变成孤儿。
-  const fs2 = require('node:fs')
   const p = lockPath(dir)
-  fs2.utimesSync(p, 1, 1) // 把 mtime 拉旧不影响 startedAt 判定；直接改 startedAt 更直接：
-  fs2.writeFileSync(p, JSON.stringify({ pid: 999999, startedAt: 1, token: 'tok-old' }))
-  assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS + 5000, 'tok-new'), true, '接管方拿到锁')
-  // 断言接管结果：readSafeTextResult（竞态安全纪律，理由见文件头注释）。
-  const safe1 = readSafeTextResult(p)
-  assert.strictEqual(safe1.status, 'ok')
-  assert.strictEqual(JSON.parse(safe1.text).token, 'tok-new')
-  // 旧持有者仍握着旧 inode 的 fd？不——它每次 open 都是新 fd；竞态的本质是「旧主在
-  // rename 前 open」。这里用注入模拟：手动 open 旧内容后让 rename 发生，再 releaseLockFor。
-  // 简化：直接构造「fd 指向孤儿 inode」场景——把当前锁 rename 走，再在原路径放新帧。
-  const orphanDir = tmpDir()
-  assert.strictEqual(acquireLock(orphanDir, 1000, 'tok-victim'), true)
-  const op = lockPath(orphanDir)
-  const orphanFd = fs2.openSync(op, 'r+') // 旧主此刻的 fd
-  // 接管者 rename 换代
-  fs2.writeFileSync(`${op}.t`, JSON.stringify({ pid: 424242, startedAt: 2000, token: 'tok-new' }))
-  fs2.renameSync(`${op}.t`, op)
-  // 旧主释放：fd 指向孤儿 inode，路径上已是新主帧——不得覆盖新主
-  const { releaseLockFor } = require('./scripts/console')
-  // 手动走一致性闸逻辑：直接调 releaseLockFor（它会重新 open 路径，双匹配失败返回 false）
-  assert.strictEqual(releaseLockFor({ _stateDir: orphanDir, _lockToken: 'tok-victim' }), false, '锁已换主不得释放')
-  // 断言新主锁帧原样无损：readSafeTextResult（O_NOFOLLOW + fstat 复检 + 读后复检），
-  // 与生产锁帧读取同一套竞态安全纪律（理由见文件头注释）。
-  const safe = readSafeTextResult(op)
+  assert.strictEqual(acquireLock(dir, 1000, 'tok-old'), true)
+  const fsmod = require('node:fs')
+  // 旧持有者在 rename 之前 open 到的 fd（与本用例的 victimFd 指向同一 inode）。
+  const victimFd = fsmod.openSync(p, 'r+')
+  // 关键：在 releaseLockFor 的「open 读完内容 → statSync 取路径 inode」之间注入换代。
+  // 旧用例把新帧 pid 写成 424242，releaseLockFor 先命中 pid 分支返回 false，闸那行从未
+  // 执行——删掉闸仍然 PASS（假绿）。这里用 statSync 钩子在正确的时序点 rename，才真正
+  // 覆盖 fstat(fd).ino !== stat(path).ino 这一行。
+  const realStat = fsmod.statSync
+  let injected = false
+  fsmod.statSync = function (target, ...rest) {
+    if (!injected && target === p) {
+      injected = true
+      fsmod.writeFileSync(`${p}.t`, JSON.stringify({ pid: process.pid, startedAt: 2000, token: 'tok-new' }))
+      fsmod.renameSync(`${p}.t`, p)
+    }
+    return realStat.call(this, target, ...rest)
+  }
+  let released
+  try { released = releaseLockFor({ _stateDir: dir, _lockToken: 'tok-old' }) } finally { fsmod.statSync = realStat }
+  assert.strictEqual(injected, true, '用例必须真的在 open 与 stat 之间注入换代（否则闸未被执行）')
+  assert.strictEqual(released, false, 'fd 指向孤儿 inode 时必须放弃覆写并如实报 false')
+  // 新主锁帧原样无损（竞态安全读取）。
+  const safe = readSafeTextResult(p)
   assert.strictEqual(safe.status, 'ok', `读锁帧必须 ok（实际 ${safe.status}）`)
   assert.strictEqual(JSON.parse(safe.text).token, 'tok-new', '新主锁帧原样无损')
-  fs2.closeSync(orphanFd)
+  // 孤儿 inode 也不得被写成 released（删掉闸时这里会读到 {"released":true}）。
+  const buf = Buffer.alloc(4096)
+  const n = fsmod.readSync(victimFd, buf, 0, 4096, 0)
+  assert.ok(buf.slice(0, n).toString('utf8').includes('tok-old'), '孤儿 inode 不得被覆写')
+  fsmod.closeSync(victimFd)
 })
 ok('releaseLockFor: 短写循环（monkeypatch writeSync 首次少写，回归 Sourcery #225 M1）', () => {
   const dir = tmpDir()
@@ -402,26 +402,37 @@ ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）
 })
 
 // ── v3.300 访问日志：纯函数表（无 HTTP；端到端用例见下方 T1-T7）──
-ok('sanitizeAccessPath: token 脱敏不动点 + 解码复洗 2 轮（蓝图 §3.3 防线 1）', () => {
+ok('sanitizeAccessPath: 敏感键值 *** + 原串形态保留（D2-N1/N2）', () => {
   // 分隔符保留：查询串形状不破坏
   assert.strictEqual(sanitizeAccessPath('/x?token=a&b=1'), '/x?token=***&b=1')
-  // 重复 token 参数逃逸：迭代清洗到不动点
+  // 重复 token 参数：逐个命中，不靠正则回溯
   assert.strictEqual(sanitizeAccessPath('/x?a=1&token=x1&token=y2'), '/x?a=1&token=***&token=***')
-  // 编码键名 %74oken= → 解码后复洗（返回解码形态，内容已 *** 化）
-  assert.strictEqual(sanitizeAccessPath('/x?%74oken=z3'), '/x?token=***')
-  // 双层编码 %2574oken= → 2 轮解码复洗（D6）
-  assert.ok(sanitizeAccessPath('/x?%2574oken=z4').includes('token=***'), '双层编码键名也洗出 token=***')
-  assert.ok(!sanitizeAccessPath('/x?%2574oken=z4').includes('z4'), '原文不得残留')
-  // 畸形 % 序列（URIError）→ 原串（已洗）兜底，不抛
+  // 编码键名：判定用解码副本，落盘保留原串（与真实请求行一一对应）
+  assert.strictEqual(sanitizeAccessPath('/x?%74oken=z3'), '/x?%74oken=***')
+  // 双层编码 %2574oken=
+  const dbl = sanitizeAccessPath('/x?%2574oken=z4')
+  assert.strictEqual(dbl, '/x?%2574oken=***', '双层编码键名同样命中')
+  assert.ok(!dbl.includes('z4'), '原文不得残留')
+  // 畸形 % 序列（URIError）→ 原串兜底，不抛
   assert.strictEqual(sanitizeAccessPath('/x?aa=%zz'), '/x?aa=%zz')
-  // 键名形态纵深（审查 3.3-M1）：大小写变体与 ;/# 分隔符形态同洗（键名在输出中统一为
-  // 小写 token=*** ——替换字面量形态，与 %74oken= 既有口径一致）；普通含 ;-# 路径不误伤
-  assert.strictEqual(sanitizeAccessPath('/x?Token=k1'), '/x?token=***')
-  assert.strictEqual(sanitizeAccessPath('/x?TOKEN=k1'), '/x?token=***')
+  // 大小写变体与 ;/# 分隔符形态同洗（键名原样保留，只盖值）
+  assert.strictEqual(sanitizeAccessPath('/x?Token=k1'), '/x?Token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?TOKEN=k1'), '/x?TOKEN=***')
   assert.strictEqual(sanitizeAccessPath('/x?a=1;token=k1'), '/x?a=1;token=***')
   assert.strictEqual(sanitizeAccessPath('/x?frag#token=k1'), '/x?frag#token=***')
-  assert.strictEqual(sanitizeAccessPath('/x?%54oken=k1'), '/x?token=***', '编码键名 %54oken= 解码为 Token= 后复洗')
-  assert.strictEqual(sanitizeAccessPath('/x?a;1&b#2'), '/x?a;1&b#2', '无 token 的 ;/# 路径原样（不误伤）')
+  assert.strictEqual(sanitizeAccessPath('/x?%54oken=k1'), '/x?%54oken=***')
+  assert.strictEqual(sanitizeAccessPath('/x?a;1&b#2'), '/x?a;1&b#2', '无敏感键的 ;/# 路径原样（不误伤）')
+  // D2-N1：只认 token= 的时代结束——派生键名同样脱敏
+  assert.strictEqual(sanitizeAccessPath('/x?access_token=abc'), '/x?access_token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?refresh_token=abc&q=1'), '/x?refresh_token=***&q=1')
+  assert.strictEqual(sanitizeAccessPath('/x?apikey=abc'), '/x?apikey=***')
+  assert.strictEqual(sanitizeAccessPath('/x?client_secret=abc'), '/x?client_secret=***')
+  assert.strictEqual(sanitizeAccessPath('/x?password=abc'), '/x?password=***')
+  // D2-N2：非敏感参数的值里出现 token 字样不得整段删除
+  assert.strictEqual(sanitizeAccessPath('/x?q=token%3Dabc'), '/x?q=token%3Dabc')
+  // D2-N2：裸控制字符转义（落盘串不能带 C0）
+  assert.strictEqual(sanitizeAccessPath('/x?a=\u0001b'), '/x?a=%01b')
+  assert.strictEqual(sanitizeAccessPath('/x?token=a\u0007b'), '/x?token=***', '敏感值整体盖掉，控制字符不再需要转义')
   // null → ''；无 % 无 token 的普通路径原样
   assert.strictEqual(sanitizeAccessPath(null), '')
   assert.strictEqual(sanitizeAccessPath('/plain'), '/plain')
@@ -436,6 +447,9 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
     [['POST', '/api/runs/detail', 200], false],
     [['POST', '/api/runs/detail', 401], true],
     [['GET', '/assets/app.css', 200], false],
+    [['GET', '/assets/app.css', 304], false],
+    [['GET', '/api/status', 304], false],
+    [['GET', '/api/access-log', 304], true],
     [['GET', '/', 200], false],
     [['GET', '/api/access-log', 200], true],
     [['POST', '/api/messages/export', 200], true],
@@ -446,6 +460,28 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
     assert.strictEqual(shouldLogAccess(...args), want, `shouldLogAccess(${args.join(', ')}) 应为 ${want}`)
   }
   assert.strictEqual(ACCESS_LOG_MAX, 200, '环形上限常量 = 200')
+})
+ok('acceptsGzip: 显式 gzip 的 q 压过 *（D1-N2：gzip;q=0, * 不得回压缩体）', () => {
+  assert.strictEqual(acceptsGzip('gzip;q=0, *'), false, '显式拒绝 gzip 时 * 不得翻盘')
+  assert.strictEqual(acceptsGzip('gzip;q=0, *;q=1'), false)
+  assert.strictEqual(acceptsGzip('*;q=0, gzip'), true, '显式接受压过 *;q=0')
+  assert.strictEqual(acceptsGzip('*'), true)
+  assert.strictEqual(acceptsGzip('br, *;q=0.5'), true)
+  assert.strictEqual(acceptsGzip('*;q=0'), false)
+  assert.strictEqual(acceptsGzip('deflate'), false)
+  assert.strictEqual(acceptsGzip('gzip;q=0.5'), true)
+  assert.strictEqual(acceptsGzip('gzip;q=abc'), false, '非法 q 值按拒绝')
+  assert.strictEqual(acceptsGzip(''), false)
+  assert.strictEqual(acceptsGzip(undefined), false)
+})
+ok('findSecretLikeField: 大小写无关键名 + 非空字符串值（D2-S13 最终保险丝可达）', () => {
+  assert.strictEqual(findSecretLikeField({ pushUrl: 'https://x', template: { title: 't' } }), '', '正常白名单视图零误报')
+  assert.strictEqual(findSecretLikeField({ runtime: { api: { appToken: 'abc' } } }), 'appToken', 'camelCase 键名必须命中')
+  assert.strictEqual(findSecretLikeField({ a: { b: { c: { PUSH_KEY: 'k' } } } }), 'PUSH_KEY')
+  assert.strictEqual(findSecretLikeField({ access_token: 't' }), 'access_token')
+  assert.strictEqual(findSecretLikeField({ secret: '' }), '', '空值=未配置，不算泄漏')
+  assert.strictEqual(findSecretLikeField({ key: false }), '', '布尔值不算泄漏')
+  assert.strictEqual(findSecretLikeField(null), '')
 })
 
 // ── v3.300 批次③ 3.1 SSE：纯函数（同步，直接 require 新导出）──
@@ -963,6 +999,9 @@ async function main () {
       const blockedBody = JSON.parse(blocked.text)
       assert.strictEqual(blockedBody.replayBlocked, true, '标记重放拦截')
       assert.strictEqual(blockedBody.runId, '1750000000000.7', '409 回带首轮 runId')
+      // D2-S16：文案必须说「N 秒后可重试」且带 retryAfterS——旧文案谎称「已有任务在运行」
+      assert.match(String(blockedBody.error || ''), /\d+ 秒后可重试/, '409 必须给出可重试倒计时')
+      assert.ok(Number.isInteger(blockedBody.retryAfterS) && blockedBody.retryAfterS > 0 && blockedBody.retryAfterS <= 60, 'retryAfterS 在窗内')
       server.close()
     }
     // 场景②：61s 前（超 60s 窗；若误用 12min 全局窗此请求会被重放窗拦——60s 窗的区分性断言）
@@ -980,6 +1019,37 @@ async function main () {
       assert.strictEqual(lockBody.replayBlocked, undefined, '锁冲突不带 replayBlocked（区别于重放窗 409）')
       server.close()
     }
+  })
+  await aok('HTTP: 全局重放窗 60s（D2-S16：窗内 409 带剩余秒数，文案不谎称有任务在运行）', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 30000, runId: '1750000000000.3' } }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const blocked = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
+    assert.strictEqual(blocked.status, 409)
+    const b = JSON.parse(blocked.text)
+    assert.strictEqual(b.replayBlocked, true)
+    assert.ok(b.retryAfterS >= 1 && b.retryAfterS <= 30, `retryAfterS 应为剩余秒数（实际 ${b.retryAfterS}）`)
+    assert.ok(!/已有触发任务在运行/.test(b.error), '文案不得谎称「已有任务在运行」（锁早就释放了）')
+    assert.match(b.error, /重复提交/)
+    server.close()
+  })
+  await aok('HTTP: 全局重放窗越窗放行（61s 前受理 → 202；旧 12min 窗会拦）', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 61000, runId: '1750000000000.3' } }))
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const okRes = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
+    assert.strictEqual(okRes.status, 202, '越过 60s 窗必须放行（旧 12min 窗下这里会 409，人工重跑要等 12 分钟）')
+    // 收尾：等子进程结束释放锁，避免影响后续用例
+    const id = JSON.parse(okRes.text).id
+    const deadline = Date.now() + 30000
+    while (Date.now() < deadline) {
+      const rec = runs.get(id)
+      if (rec && rec.finishedAt) break
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    server.close()
   })
   await aok('HTTP: /trigger 的 action=notify-test 与独立端点共享受理序列（K7 侧通道一致）', async () => {
     const dir = tmpDir()
@@ -1193,6 +1263,10 @@ async function main () {
     assert.strictEqual(typeof j[0].title, 'string', '元素=行对象')
     const jr = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
     assert.strictEqual(jr.headers['x-export-truncated'], 'true', 'JSON 分支同样下发截断头')
+    // D2-S9：导出口径必须回显「实际生效的搜索词」（列表端点早有 queryUsed）
+    assert.strictEqual(jr.headers['x-export-query-used'], '', '无搜索词时头为空串而非缺席')
+    const longQ = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: `format=json&q=${'a'.repeat(300)}` })
+    assert.strictEqual(longQ.headers['x-export-query-used'], encodeURIComponent('a'.repeat(240)), '240 字节截断后的词必须如实回显（修前完全不回显）')
     const c = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=csv' })
     assert.strictEqual(c.headers['x-export-truncated'], 'true', 'CSV 分支同样下发截断头')
     // 该 fixture 单元格无逗号/引号，允许 naive split：表头 + 5000 行 + 尾 \r\n = 5002 段
@@ -1337,14 +1411,14 @@ async function main () {
     const exFlat = JSON.stringify(exLog.items)
     assert.ok(!exFlat.includes('format=csv'), 'body/查询词不落访问日志（只记 method+path）')
     s2.close()
-    // 第三态 tooLarge（审查 3.2-MI2；评审 231-T8 改真端点）：push.json > 32MiB 时
+    // 第三态 tooLarge（审查 3.2-MI2；评审 231-T8 改真端点）：push.json 超过控制台读取上限时
     // export 端点与 missing/invalid 共用同一 `read.status !== 'ok'` 分支如实下发。
     // 直调 readMessages 只能锁「函数行为」，锁不住路由（route 回退成功文件的回归
     // 依然全绿）——必须真发 POST /api/messages/export 断言 JSON 三态响应。
     const dirBig = tmpDir()
     fs.writeFileSync(path.join(dirBig, 'push.json'), Buffer.alloc(MESSAGES_MAX_BYTES + 1, 0x61))
     const readBig = readMessages(dirBig, { maxBytes: MESSAGES_MAX_BYTES, filename: 'push.json' })
-    assert.deepStrictEqual(readBig, { status: 'tooLarge' }, '>32MiB → tooLarge（不 ok、不 invalid）')
+    assert.deepStrictEqual(readBig, { status: 'tooLarge' }, '超上限 → tooLarge（不 ok、不 invalid）')
     const { server: s3 } = createConsole({ token: TOKEN, stateDir: dirBig })
     const port3 = await listen(s3)
     const tooBig = await request(port3, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
@@ -1363,6 +1437,56 @@ async function main () {
     const r = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: big })
     assert.strictEqual(r.status, 400)
     server.close()
+  })
+  await aok('HTTP: /trigger 超限 body 分 3 chunk 发送仍收到 413（D2-S2：修前只见 ECONNRESET）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const res = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1',
+        port,
+        method: 'POST',
+        path: '/trigger',
+        headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/x-www-form-urlencoded' }
+      }, (r) => {
+        let body = ''
+        r.on('data', (c) => { body += c })
+        r.on('end', () => resolve({ status: r.statusCode, text: body }))
+      })
+      req.on('error', reject)
+      const chunk = 'x'.repeat(3000)
+      req.write('action=run&pad=')
+      setTimeout(() => req.write(chunk), 20)
+      setTimeout(() => { req.write(chunk); req.end() }, 40)
+    })
+    assert.strictEqual(res.status, 413, '多 chunk 超限必须能读到 413（修前 req.destroy() 先断流）')
+    assert.match(res.text, /请求体超限/)
+    server.close()
+  })
+  await aok('readMessages: (ino,size,mtime) 缓存命中 + 文件变化自动失效 + rawTotal 含 _f（D2-S18/D2-S11）', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'a' }, { id: 2, title: 'b' }]))
+    // mtime 太新（<100ms）刻意不进缓存：写后立刻读必须看到新内容
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const a = readMessages(dir)
+    const b = readMessages(dir)
+    assert.strictEqual(a.value === b.value, true, '同一份文件必须命中解析缓存（修前每请求整读+parse+排序）')
+    assert.strictEqual(a.value.rawTotal, 2)
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'a' }, { id: 2, title: 'b' }, { id: 3, title: 'c' }]))
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const c = readMessages(dir)
+    assert.strictEqual(c.value.rawTotal, 3, '文件变化（size/ino/mtime）后必须重读')
+    // _f 条目：rawTotal 计入、total 不计入、filteredCount 单列
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'push.json'), JSON.stringify([
+      { id: 1, title: 'a' }, { id: 2, title: 'b' },
+      { _f: true, title: 'f1' }, { _f: true, title: 'f2' }, { _f: true, title: 'f3' }
+    ]))
+    const r = readMessages(dir2)
+    assert.strictEqual(r.value.rawTotal, 5)
+    assert.strictEqual(r.value.total, 2)
+    assert.strictEqual(r.value.filteredCount, 3)
   })
   await aok('HTTP: /api/trends 按日聚合（与 parseLastRun 同一正则口径）', async () => {
     const dir = tmpDir()
@@ -1544,6 +1668,39 @@ async function main () {
     await new Promise(resolve => setTimeout(resolve, 80))
     assert.strictEqual(exitCode, 0, `子进程 close 后必须退出 0（events=${events}）`)
     assert.ok(events.indexOf('exit:0') > events.indexOf('kill:SIGKILL'), '退出必须发生在 kill 之后')
+  })
+
+  await aok('wireGracefulShutdown: 3s 看门狗对未 close 的子进程补释放锁（D1-N1 回归）', async () => {
+    const dir = tmpDir()
+    const p = lockPath(dir)
+    const { activeChildren, runs, wireGracefulShutdown: wire } = createConsole({ token: TOKEN, stateDir: dir })
+    assert.strictEqual(acquireLock(dir, Date.now(), 'tok-wd'), true)
+    const fakeChild = { kill () {}, once () { return this } }
+    const record = {
+      id: 'wd.1',
+      action: 'check',
+      label: 'x',
+      startedAt: Date.now(),
+      finishedAt: 0,
+      exitedAt: 0,
+      exitCode: null,
+      output: '',
+      cancelled: false,
+      _child: fakeChild,
+      _stateDir: dir,
+      _lockToken: 'tok-wd'
+    }
+    runs.set(record.id, record)
+    activeChildren.add(fakeChild)
+    const { shutdown } = wire({ onExit: () => {}, registerSignal: () => {} })
+    shutdown('SIGTERM')
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.strictEqual(JSON.parse(fs.readFileSync(p, 'utf8')).released, undefined, 'close 前不得假定已释放')
+    // 看门狗 3s：子进程始终不发 close，退出前必须补 finishRun（否则锁留到 10 分钟陈旧接管）
+    await new Promise((resolve) => setTimeout(resolve, 3200))
+    const frame = JSON.parse(fs.readFileSync(p, 'utf8'))
+    assert.strictEqual(frame.released, true, '看门狗路径必须释放锁')
+    assert.strictEqual(record.finishedAt > 0, true, '记录必须收尾，不能长期停在「停止中」')
   })
 
   // ── v3.299 批次②：运行控制（停止按钮 + 逐轮运行历史）────────────────────────
@@ -1784,16 +1941,13 @@ async function main () {
     server.close()
   })
   await aok('脱敏 D1 深层编码：三层 %2574oken 与 畸形转义+编码键 同串 → 全 ***（不动点 + 尽力解码）', () => {
-    // 三层编码（%2574oken= → %74oken= → token=）：旧 2 轮上限漏洗
-    // washTokens 语义=键保留、值 ***：三层解码后 token=***（返回解码形态，泄露面为零）
-    assert.strictEqual(sanitizeAccessPath('/api/x?%2574oken=SECRET'), '/api/x?token=***')
-    // 编码 token 键 + 无关畸形转义同串：旧实现 decodeURIComponent 整体抛错提前 return，
-    // 键名保持 %74 形态洗不到；现在尽力解码继续洗（可解段解开——%E0%80 解成裸码点
-    // `à\x80`，SECRET 已洗净即达标；畸形段不解码不丢段）
+    // 三层编码（%2574oken= → %74oken= → token=）：判定用解码副本，落盘保留原串
+    assert.strictEqual(sanitizeAccessPath('/api/x?%2574oken=SECRET'), '/api/x?%2574oken=***')
+    // 编码敏感键 + 无关畸形转义同串：旧实现 decodeURIComponent 整体抛错提前 return，
+    // 键名保持 %74 形态洗不到；现在逐段尽力解码判定（畸形段不解码、不丢段）
     const mixed = sanitizeAccessPath('/api/x?%74oken=SECRET&z=%E0%80')
-    assert.strictEqual(mixed.startsWith('/api/x?token=***&z='), true, 'token 键洗净、可解段已解')
+    assert.strictEqual(mixed, '/api/x?%74oken=***&z=%E0%80', '敏感键值盖掉，其余原样保留')
     assert.ok(!mixed.includes('SECRET'))
-    assert.ok(!mixed.includes('%74oken'), '编码键名不残留')
   })
   await aok('代理对 M6/M7：excerpt 截断与 query 钳制均不劈 emoji', () => {
     // M6：excerpt 边界劈代理对 → 回退一码元（无孤立高代理）
@@ -2819,7 +2973,7 @@ async function main () {
     const flat = JSON.stringify(log.items)
     assert.ok(!flat.includes('x1') && !flat.includes('y2') && !flat.includes('z3'), `逃逸原文零出现（items=${flat}）`)
     assert.ok(log.items.some((it) => it.path === '/api/nope?a=1&token=***&token=***'), '重复参数形态全 ***')
-    assert.ok(log.items.some((it) => it.path === '/api/nope?token=***'), '%74oken= 解码形态洗出 token=***')
+    assert.ok(log.items.some((it) => it.path === '/api/nope?%74oken=***'), '编码键名命中，落盘保留原串形态（D2-N2）')
     server.close()
   })
   await aok('访问日志: 401 独立计数（3 次未授权后 =3，重复查询不漂移）', async () => {
