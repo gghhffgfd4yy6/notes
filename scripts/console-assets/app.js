@@ -55,6 +55,15 @@ function fmtNum (n) {
   return (n === undefined || n === null) ? '—' : String(n)
 }
 
+// 本机时钟（lastSync = 浏览器 Date.now()）用本地时间渲染：套 fmtTime 的 +8 会让
+// 非 UTC+8 用户看到「未来时间」（审查 #244 可选）。服务器时间戳仍走 fmtTime。
+function fmtLocalTime (ts) {
+  if (!ts) return '—'
+  const d = new Date(Number(ts))
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
 // 「多久以前」（缓存写入停滞判断）与日报相对日期见 pure.mjs——纯函数便于行为测试。
 
 // 字节人性化（v3.298 上提为模块级：系统信息与缓存健康面板共用）；0 字节是真实大小，
@@ -2100,6 +2109,12 @@ function App () {
     if (window.location.hash !== '#/logs') window.location.hash = '#/logs'
   }, [])
   const pollMs = locking ? POLL_BUSY_MS : POLL_MS
+  // 顶栏徽章只在「概览/日志 + 自动刷新开」时是活状态；其它情况（暂停、推送记录/配置/系统）
+  // 主轮询已停，徽章显示的是离开时的快照——必须注明，不能永久挂着「任务运行中」（审查 #246）。
+  const livePolling = !authExpired && autoRefresh && (tab === 'overview' || tab === 'logs')
+  const badgeText = authExpired
+    ? '凭证失效'
+    : `${locking ? '任务运行中' : '空闲'}${livePolling ? '' : '（快照）'}`
   const remain = autoRefresh
     ? Math.max(0, Math.min(Math.ceil(pollMs / 1000), Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000)))
     : 0
@@ -2108,14 +2123,14 @@ function App () {
       <div class="brand">
         <span class="logo">⚡</span>
         <span class="name">xbk-push 控制台</span>
-        <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${authExpired ? '凭证失效' : locking ? '任务运行中' : '空闲'}<//>
+        <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
       </div>
       <div class="sync">
         ${tab === 'overview' || tab === 'logs'
-          ? html`${autoRefresh ? `自动刷新 · ${remain}s` : '自动刷新已暂停'}${lastSync ? ` · ${fmtTime(lastSync)}` : ''}
+          ? html`${autoRefresh ? `自动刷新 · ${remain}s` : '自动刷新已暂停'}${lastSync ? ` · ${fmtLocalTime(lastSync)}` : ''}
             <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
               onClick=${() => { setNowMs(Date.now()); setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`
-          : `数据截至${lastSync ? ` · ${fmtTime(lastSync)}` : ''}`}
+          : `数据截至${lastSync ? ` · ${fmtLocalTime(lastSync)}` : ''}`}
         ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
       </div>
     </header>
