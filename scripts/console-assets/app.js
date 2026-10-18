@@ -707,6 +707,11 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
   const [openId, setOpenId] = useState(null)
   const [detail, setDetail] = useState(null)
   const [detailErr, setDetailErr] = useState('')
+  // 详情日志跟随（审查 #244）：运行中标题写「实时跟随」，但输出框此前从不滚动——
+  // 新行只追加在底部，用户看到的是开头几行。与运行日志页同口径：默认贴底，
+  // 用户上翻后不抢位置，滚回底部自动恢复跟随。
+  const logRef = useRef(null)
+  const followRef = useRef(true)
   // 乱序防护（Sourcery vwI）：detail 请求领号，落后响应丢弃。
   const detailSeqRef = useRef(0)
   // onRefresh 经 ref 解引用（v3.300 3.1 §2 D7）：若直接进 effect deps，其身份不稳定
@@ -731,6 +736,19 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
   const detailForOpen = detail !== null && typeof detail.id === 'string' && detail.id === openId
     ? detail
     : null
+
+  // 切换目标时恢复跟随；输出变化时若仍在底部就贴底（含 SSE 增量与轮询快照）。
+  useEffect(() => { followRef.current = true }, [openId])
+  useEffect(() => {
+    const el = logRef.current
+    if (!el || detailForOpen === null) return
+    if (followRef.current) el.scrollTop = el.scrollHeight
+  }, [detailForOpen])
+  const onLogScroll = () => {
+    const el = logRef.current
+    if (!el) return
+    followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+  }
 
   // 详情跟随（v3.300 3.1）：运行中走 SSE 实时流（原生 EventSource，零依赖）；
   // 非运行中 / 快照已完结 / 流错误回退原轮询。两通道在 effect 内二选一：SSE 模式不建
@@ -906,7 +924,7 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
         <span>运行 #${openId} 输出${openActive ? '（实时跟随）' : ''}</span>
         <${Button} variant="ghost" onClick=${() => setOpenId(null)}>关闭<//>
       </div>
-      <pre class="logpre">${
+      <pre class="logpre" ref=${logRef} onScroll=${onLogScroll}>${
         detailErr ||
         (detailForOpen === null
           ? '加载中…'
