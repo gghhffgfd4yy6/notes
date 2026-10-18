@@ -388,6 +388,13 @@ function entryKeyOf (line) {
   return h.toString(16).padStart(8, '0')
 }
 
+// 取消留痕（审查 #229 S7 / D1-N3）：控制台停止任务时写 `CANCEL 控制台停止：任务 #…`。
+// 它不是运行失败（不参与 interrupted），但也不能让这轮从历史里消失——readRunHistory 给它
+// 生成 cancelled 占位条目；相邻轮次不受影响。
+function isCancelTrace (line) {
+  return /(?:^|\s)CANCEL(?:\s|$)/.test(line) && line.includes('控制台停止：任务 #')
+}
+
 function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
   const lim = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50
   // before 两种形态（审查 D1-S3）：数字 = 行号游标（兼容旧前端；尾窗平移后需窗口指纹校验），
@@ -515,6 +522,28 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
     roundKey.set(i, entryKeyOf(lines[i]))
   }
   // 文件序倒置即时间倒序（摘要行在其失败行之后写出；占位行号取失败行自身）。
+  // 取消留痕单独成条（cancelled=true），既不标相邻轮中断、也不让这轮消失。
+  for (let i = 0; i < lines.length; i++) {
+    if (summaryAt.has(i) || crashIdx.has(i) || !isCancelTrace(lines[i])) continue
+    rounds.push({
+      i,
+      at: tsOf(lines[i]),
+      total: null,
+      dedup: null,
+      filtered: null,
+      truncated: null,
+      pushed: null,
+      failed: null,
+      elapsed: '',
+      cachesaved: null,
+      noidentity: null,
+      dryRun: null,
+      interrupted: false,
+      cancelled: true,
+      isPlaceholder: true
+    })
+    roundKey.set(i, entryKeyOf(lines[i]))
+  }
   rounds.sort((a, b) => b.i - a.i)
   let pool = rounds
   if (beforeKey !== '') {

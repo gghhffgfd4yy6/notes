@@ -18,7 +18,7 @@ const { spawn, spawnSync } = require('node:child_process')
 const { readSafeTextResult } = require('./xbk_storage')
 
 const {
-  createConsole, consoleStateDir, isValidToken, timingSafeEqualStr,
+  createConsole, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
   acquireLock, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
@@ -2073,11 +2073,14 @@ async function main () {
     // 变异沙箱里 console.js 是插桩后的机器生成代码（语句被 stryMutAct_* 条件包裹），
     // 源码串断言只对原始源文件有意义；这些红线由 Test workflow 的 npm test 兜底。
     if (process.env.XBK_MUTATION_CHILD !== '1') {
-      assert.ok(src.includes('childEnv.XBK_CACHE_DIR = stateDir'), '子进程必须钉 XBK_CACHE_DIR 到本实例 stateDir')
-      assert.ok(src.includes('startAction(action, now, activeChildren, runHistoryDir || stateDir)'),
-        'spawn 必须把 runHistoryDir || stateDir 传给子进程（否则 run.log 写不到历史读取目录）')
-      assert.ok(src.includes('const stopDir = runHistoryDir || stateDir'), '停止留痕必须写历史读取目录')
-      assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得回落到运行侧全局缓存目录')
+      assert.ok(src.includes('childEnv.XBK_CACHE_DIR = cacheDir'), '子进程必须钉 XBK_CACHE_DIR 到历史目录')
+      assert.ok(/startAction\(action, now, activeChildren, historyDir\(\), runToken, stateDir\)/.test(src),
+        'spawn 必须把 historyDir() 传给子进程（否则 run.log 写不到历史读取目录）')
+      assert.ok(src.includes('const stopDir = historyDir()'), '停止留痕必须写历史读取目录')
+      assert.ok(/const historyDir = \(\) => \{/.test(src), '读取/写入/停止留痕三处必须同源 historyDir()')
+      assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得各自手写运行侧目录解析')
+      assert.ok(src.includes('CANCEL 控制台停止：任务 #'), '取消留痕必须用独立 CANCEL 前缀')
+      assert.ok(!src.includes('ERROR 控制台停止：任务 #'), '不得再写 ERROR（会被当成轮失败）')
     }
     // 行为验证：子进程（独立 node）只在真读 XBK_CACHE_DIR 时才可能写到实例目录。
     const dir = fs.mkdtempSync(path.join(__dirname, '.tmp-cache-'))
@@ -2127,6 +2130,80 @@ async function main () {
       if (prev === undefined) delete process.env.XBK_CACHE_DIR
       else process.env.XBK_CACHE_DIR = prev
       fs.rmSync(outside, { recursive: true, force: true })
+    }
+  })
+  await aok('finishRun: exit 即收尾且幂等（finishedAt 只落一次、锁只释放一次，审查 #229 S6）', () => {
+    const dir1 = tmpDir()
+    const token1 = 'tok1'
+    assert.strictEqual(acquireLock(dir1, Date.now(), token1), true)
+    const rec = {
+      id: 'x.1',
+      finishedAt: 0,
+      exitCode: null,
+      _stateDir: dir1,
+      _lockToken: token1,
+      _timer: setTimeout(() => {}, 60000),
+      _cancelTimer: setTimeout(() => {}, 60000)
+    }
+    let released = 0
+    const release = () => { released += 1; return true }
+    assert.strictEqual(finishRun(rec, 0, { release, now: () => 111 }), true)
+    assert.strictEqual(rec.finishedAt, 111, 'exit 到达即落 finishedAt（不等 close）')
+    assert.strictEqual(rec.exitCode, 0)
+    assert.strictEqual(released, 1)
+    // close 迟到再调一次：幂等，不得覆盖 exit 的事实、不得二次释放
+    assert.strictEqual(finishRun(rec, 1, { release, now: () => 999 }), false)
+    assert.strictEqual(rec.finishedAt, 111, 'finishAt 不得被迟到事件改写')
+    assert.strictEqual(rec.exitCode, 0, 'exitCode 不得被迟到事件改写')
+    assert.strictEqual(released, 1, '锁只释放一次')
+    // 真实锁：收尾必须写成 released 帧（旧实现只在 close 里做，孙进程持 stdio 时锁滞留）
+    const dir2 = tmpDir()
+    assert.strictEqual(acquireLock(dir2, Date.now(), 'tok2'), true)
+    assert.strictEqual(finishRun({ id: 'x.2', finishedAt: 0, exitCode: null, _stateDir: dir2, _lockToken: 'tok2' }, 0), true)
+    assert.strictEqual(JSON.parse(fs.readFileSync(lockPath(dir2), 'utf8')).released, true,
+      'finishRun 必须释放触发锁')
+    // 接线：exit 与 close 都调用 finishRun（close 只做剩余清理）
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    assert.ok(/child\.on\('exit'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'exit 必须收尾')
+    assert.ok(/child\.on\('close'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'close 必须幂等补收尾')
+  })
+  await aok('readRunHistory: CANCEL 取消留痕成独立条目且不污染相邻轮（审查 #229 S7/D1-N3）', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 09:05:00 CANCEL 控制台停止：任务 #1792236290484.7（run）于运行中被停止（SIGTERM）',
+      '2026-10-15 11:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=1s cachesaved=1'
+    ].join('\n') + '\n')
+    const r = readRunHistory(dir, { limit: 5 })
+    assert.deepStrictEqual(r.items.map((x) => x.at),
+      ['2026-10-15 11:00:00', '2026-10-15 09:05:00', '2026-10-15 09:00:00'])
+    assert.strictEqual(r.items[1].cancelled, true, '取消留痕必须生成 cancelled 条目（这轮不能消失）')
+    assert.strictEqual(r.items[1].isPlaceholder, true)
+    assert.strictEqual(r.items[1].interrupted, false, '取消不是运行失败')
+    assert.strictEqual(r.items[0].interrupted, false, '取消留痕不得把下一轮标成中断')
+    assert.strictEqual(r.items[2].interrupted, false, '也不得把上一轮标成中断')
+  })
+  await aok('createConsole: run-history 读取回退到运行侧缓存目录（Config.cache.dir 漂移，审查 #241 S1）', async () => {
+    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtime-dir-'))
+    const state = tmpDir()
+    fs.writeFileSync(path.join(runtime, 'run.log'),
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1\n')
+    const prev = process.env.XBK_CACHE_DIR
+    process.env.XBK_CACHE_DIR = runtime
+    try {
+      // 不传 runHistoryDir：stateDir 里没有 run.log，历史必须回退到运行侧真实目录
+      const { server } = createConsole({ token: TOKEN, stateDir: state })
+      const port = await listen(server)
+      const r = JSON.parse((await request(port, 'GET', '/api/run-history', { token: TOKEN })).text)
+      assert.strictEqual(r.status, 'ok')
+      assert.strictEqual(r.items.length, 1, '必须从运行侧缓存目录读到 cron 轮次（旧实现读 stateDir ⇒ 空）')
+      assert.strictEqual(r.items[0].pushed, 1)
+      server.close()
+    } finally {
+      if (prev === undefined) delete process.env.XBK_CACHE_DIR
+      else process.env.XBK_CACHE_DIR = prev
+      fs.rmSync(runtime, { recursive: true, force: true })
     }
   })
   await aok('HTTP: run-history limit=9999 在 220 轮 fixture 上真实钳制到 200（评审 #14）', async () => {

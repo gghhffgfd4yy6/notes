@@ -351,7 +351,24 @@ const runEpoch = String(Date.now())
 function makeRunId (seq) { return `${runEpoch}.${seq}` }
 
 let runSeq = 0
-function startAction (actionKey, now, activeChildren, stateDir) {
+// 子进程收尾（审查 #229 S6）：exit 与 close 都调用，幂等。旧实现只挂 close——孙进程继承
+// stdout/stderr 时 close 要等所有持有者关闭管道（实测父进程 211ms 退出、close 4032ms 才到），
+// 期间看板长时间显示「停止中」，触发锁也不释放。exit 一到就落 finishedAt + 释放锁；
+// close 只做剩余清理（exitCode 兜底、activeChildren 摘除、取消定时器）。
+function finishRun (record, code, { release = releaseLockFor, now = Date.now } = {}) {
+  if (!record || record.finishedAt) return false
+  if (Number.isInteger(code)) record.exitCode = code
+  record.finishedAt = now()
+  if (record._cancelTimer) { clearTimeout(record._cancelTimer); record._cancelTimer = null }
+  if (record._timer) { clearTimeout(record._timer); record._timer = null }
+  // 只有真正持有过锁的运行才释放（spawn 前就失败的记录没有 _stateDir/_lockToken）
+  if (record._stateDir && record._lockToken && !release(record)) {
+    console.error(`⚠️ 任务 #${record.id} 的触发锁释放失败（文件系统异常或锁已换主）：锁将保留到陈旧接管（约 10 分钟），期间触发 409 属预期；持续出现请按 README「故障排查」处理。`)
+  }
+  return true
+}
+
+function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockDir) {
   const action = ACTIONS[actionKey]
   const id = makeRunId(++runSeq)
   const entryFile = action.entry === 'single' ? ENTRY_SINGLE : ENTRY_QINGLONG
@@ -366,7 +383,11 @@ function startAction (actionKey, now, activeChildren, stateDir) {
     timedOut: false,
     output: '',
     outputTotalLength: 0,
-    cancelled: false
+    cancelled: false,
+    // 锁归属（startAction 内登记，exit 可能早于调用方后续赋值：收尾必须能直接释放锁）。
+    // lockDir = 锁文件所在目录（控制台 stateDir）；cacheDir = 子进程 run.log 写入目录。
+    _stateDir: lockDir || cacheDir,
+    _lockToken: lockToken
   }
   runs.set(id, record)
   if (runs.size > 20) {
@@ -380,9 +401,10 @@ function startAction (actionKey, now, activeChildren, stateDir) {
   const childEnv = { ...process.env }
   delete childEnv.XBK_DRY_RUN
   delete childEnv.XBK_CONSOLE_TOKEN
-  // 子进程缓存/日志目录钉死到本控制台实例的 stateDir（Sourcery：测试实例的临时 stateDir
-  // 若不下传，子进程会回落到仓库生产缓存 → 测试触发的轮次/停止留痕混进生产 run.log）。
-  if (stateDir) childEnv.XBK_CACHE_DIR = stateDir
+  // 子进程缓存/日志目录钉死到 historyDir()（Sourcery：测试实例的临时目录若不下传，子进程
+  // 会回落到仓库生产缓存 → 测试触发的轮次/停止留痕混进生产 run.log；生产侧它与运行侧
+  // MessageStore.cacheDir 同源，读写一致）。
+  if (cacheDir) childEnv.XBK_CACHE_DIR = cacheDir
   const child = (() => {
     try {
       return spawn(process.execPath, [entryFile, ...action.args], {
@@ -434,23 +456,20 @@ function startAction (actionKey, now, activeChildren, stateDir) {
     record.timedOut = true
     try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
   }, PROC_TIMEOUT_MS)
-  child.on('exit', () => {
+  record._timer = timer
+  child.on('exit', (code) => {
     // Sourcery #229-10：exit 先于 close（输出流 drain 中）。取消判据用 exitedAt，
     // 避免「进程已退出但 close 未到」窗口里 cancel 误杀已自然完成的任务。
     record.exitedAt = Date.now()
+    // 审查 #229 S6：exit 即收尾（finishedAt + 释放锁）。close 可能因孙进程持有 stdio
+    // 迟到数秒，不能把「任务已结束」和「锁已释放」押在 close 上。
+    finishRun(record, code)
   })
   child.on('close', (code) => {
-    clearTimeout(timer)
-    // Sourcery #229-0：取消宽限定时器一并清理（子进程已死，SIGKILL 兜底失去意义）。
-    if (record._cancelTimer) { clearTimeout(record._cancelTimer); record._cancelTimer = null }
+    // 剩余清理：exit 未触发的极端路径（spawn error 后仅 close）在这里补收尾；幂等。
+    finishRun(record, code)
+    if (record.exitCode === null && Number.isInteger(code)) record.exitCode = code
     if (activeChildren) activeChildren.delete(child)
-    record.exitCode = code
-    record.finishedAt = Date.now()
-    // Sourcery #225 M4：释放失败（磁盘/权限异常持续、或锁已换主）必须响亮上报，
-    // 不许静默当作已释放——锁残留时后续触发 409 属预期，运维按 README「故障排查」处理。
-    if (!releaseLockFor(record)) {
-      console.error(`⚠️ 任务 #${record.id} 的触发锁释放失败（文件系统异常或锁已换主）：锁将保留到陈旧接管（约 10 分钟），期间触发 409 属预期；持续出现请按 README「故障排查」处理。`)
-    }
   })
   return record
 }
@@ -1277,6 +1296,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 活跃子进程登记（Sourcery High：控制台关闭时子进程要一并终止，否则触发任务
   // 会在控制服务消失后继续抓取/推送）。close 回调里自行从集合摘除。
   const activeChildren = new Set()
+  // 运行历史目录（审查 #241 S1）：run.log 的写入方是运行侧 MessageStore.cacheDir，而控制台
+  // stateDir 可能因配置/注入与之不同。读取历史、spawn 子进程（决定它把 run.log 写哪）、
+  // 停止留痕三处必须同源，否则 Config.cache.dir 漂移时 cron 轮次从历史里消失（无提示）。
+  // 优先级：显式注入 runHistoryDir（测试/嵌入）→ 运行侧真实解析 → stateDir。
+  // 解析结果按进程缓存：Config 在进程启动时定型，没必要每个请求 require 一次。
+  let cachedRuntimeDir
+  const historyDir = () => {
+    if (runHistoryDir) return runHistoryDir
+    if (cachedRuntimeDir === undefined) cachedRuntimeDir = runtimeCacheDir()
+    return cachedRuntimeDir || stateDir
+  }
   // 锁归属 token：调用方传入（main 生成，SIGTERM 释放时须双匹配）；未传则随机。
   // 测试可直接传固定值断言锁内容。
   const ownerToken = typeof lockToken === 'string' && lockToken.length > 0 ? lockToken : crypto.randomBytes(12).toString('hex')
@@ -1446,6 +1476,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         const now = Date.now()
+        // 审查 D2-M1（#225）：ownerToken 不能整个进程复用——前驱运行的 close 迟到时，
+        // 会把后继运行的活锁误认成「自己的」并覆写成 released，第三个触发随即接管，
+        // 造成两个真实推送并发。每次受理生成独立锁 token；归属判定 pid+token 双匹配。
+        const runToken = crypto.randomBytes(12).toString('hex')
         // 幂等重放窗（Sourcery G_nm + G_4Kf）：提交 202 后响应丢失 → 用户重试 →
         // 首轮已结束释放锁 → 重试被当作新触发再跑一轮真实推送。per-action 记录：
         // 同 action 在窗口内的重复提交返回 409 + 首轮 run id（前端把它当「已在跑」
@@ -1460,7 +1494,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 即使撞上他动作运行中也按「重放拦截」回（带首轮 runId），不降级成裸锁冲突
         // （G_4Kf 用例语义；竞态由锁内二次判窗兜底，锁外这层只是报错形态优化）。
         const winMsPre = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : REPLAY_WINDOW_MS
-        if (!acquireLock(stateDir, now, ownerToken)) {
+        if (!acquireLock(stateDir, now, runToken)) {
           // readLastAccept 返回 [key, value] 数组（非 Map），用 find 取当前动作记录。
           const persistedPre = readLastAccept(lastAcceptPath)
           const prevPrePair = persistedPre.find(([k]) => k === action)
@@ -1485,7 +1519,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // runId = epoch.seq 字符串（v3.299 评审）：0 是 pending 帧哨兵（数字），
           // 真实 runId 只在 startAction 之后落盘——用「数字 0」判 pending，其余原样下发。
           const rid = prev.runId
-          releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
+          releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
           sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试', runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true })
           return
         }
@@ -1498,7 +1532,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 必须显式释放（Sourcery #225 M3/M4：releaseLockFor 返回 false = 文件系统
           // 同样写不进锁 → 响亮告警给运维排查线索；恢复 pending 前值，失败动作可在
           // 窗口内重试，不再被 409 拦到窗口过期）。
-          const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
+          const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
           if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：磁盘/权限异常仍未恢复，锁将保留到陈旧接管（约 10 分钟）。后续触发 409 属预期。`)
           lastAccept.delete(action)
           sendJson(res, 500, { error: '重放记录持久化失败，动作未执行（fail-closed）' })
@@ -1506,20 +1540,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         let record
         try {
-          record = startAction(action, now, activeChildren, runHistoryDir || stateDir)
+          record = startAction(action, now, activeChildren, historyDir(), runToken, stateDir)
         } catch (e) {
           // startAction 同步抛（spawn 资源极端，Sourcery Medium）：回滚重放帧与锁，
           // 让用户可重试，而不是被卡到陈旧接管。恢复 pending 前值语义同落盘失败分支。
           lastAccept.delete(action)
-          const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: ownerToken })
+          const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
           if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：锁将保留到陈旧接管（约 10 分钟）。`)
           console.error(`⚠️ ${action} 启动失败（spawn）：${e && e.message ? e.message : e}`)
           sendJson(res, 500, { error: '动作启动失败，已回滚，可稍后重试' })
           return
         }
-        record._stateDir = stateDir
         record._lockAt = now
-        record._lockToken = ownerToken
         lastAccept.set(action, { at: now, runId: record.id })
         try {
           fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
@@ -1834,12 +1866,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 尾窗指纹（评审 #243-1）：8 位十六进制；其它形态一律当「没带」，不做截断猜测
       const rawWin = String(url.searchParams.get('win') || '')
       const windowKey = /^[0-9a-f]{8}$/.test(rawWin) ? rawWin : ''
-      // Sourcery #229-4：run.log 的写入方是运行侧 MessageStore.cacheDir（xbk_app
-      // _writeRunLog → MessageStore.cacheDir），不是控制台 stateDir——Config.cache.dir
-      // 指向别处时两个目录分居。读取源对齐运行侧解析结果（取不到回退 stateDir），
-      // 与启动时「目录漂移」警告同一口径。
-      const historyDir = runHistoryDir || stateDir
-      const h = readRunHistory(historyDir, { limit, before, windowKey })
+      // Sourcery #229-4 / 审查 #241 S1：run.log 的写入方是运行侧 MessageStore.cacheDir
+      // （xbk_app _writeRunLog → MessageStore.cacheDir），不是控制台 stateDir——Config.cache.dir
+      // 指向别处时两个目录分居。读取源与 spawn/停止留痕同走 historyDir()（运行侧真实目录优先）。
+      const h = readRunHistory(historyDir(), { limit, before, windowKey })
       sendJson(res, 200, h)
       return
     }
@@ -2070,15 +2100,16 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           const note = '\n[console] 收到停止请求，正在终止子进程…\n'
           record.output += note
           record.outputTotalLength += note.length
-          // Sourcery #229-11：停止留痕进 run.log——被停任务不会有自然收尾的摘要行，
-          // 控制台补一行 ERROR 强失败标记（上海时区戳与写入侧 _localStamp 同形态），
-          // readRunHistory 的新轮界模型把它识别为「尾端失败行 → 崩溃轮占位」，
-          // 重启后运行历史仍能看到这轮被停过。追加失败静默（与写入侧留痕口径一致）。
+          // 审查 #229 S7 / D1-N3：停止留痕进 run.log——被停任务不会有自然收尾的摘要行，
+          // 控制台补一行 **CANCEL** 前缀的取消留痕（上海时区戳与写入侧 _localStamp 同形态）。
+          // readRunHistory 把 CANCEL 行识别成「cancelled 占位条目」，既让这轮在历史里可见，
+          // 又不参与 interrupted 判定（旧实现写 ERROR → 被回填成「下一轮中断」；#241 去掉
+          // 回填后该轮又彻底消失，两种都错）。
           try {
             const stampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
             const stamp = stampFmt.format(new Date())
-            const stopDir = runHistoryDir || stateDir
-            fs.appendFileSync(path.join(stopDir, 'run.log'), `${stamp} ERROR 控制台停止：任务 #${record.id}（${record.action}）于运行中被停止（SIGTERM）\n`, 'utf8')
+            const stopDir = historyDir()
+            fs.appendFileSync(path.join(stopDir, 'run.log'), `${stamp} CANCEL 控制台停止：任务 #${record.id}（${record.action}）于运行中被停止（SIGTERM）\n`, 'utf8')
           } catch (e) { /* 留痕失败静默：内存 record.cancelled 已是权威 */ }
           try {
             record._child && record._child.kill('SIGTERM')
@@ -2252,6 +2283,7 @@ if (require.main === module) main()
 module.exports = {
   createConsole,
   consoleStateDir,
+  finishRun,
   isValidToken,
   timingSafeEqualStr,
   acquireLock,
