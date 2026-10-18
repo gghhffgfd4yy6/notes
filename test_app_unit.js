@@ -41,6 +41,13 @@ function makeApp (over = {}) {
     RuleEngine: {},
     FilterEngine: {},
     MessageStore: Object.assign({}, over.MessageStore),
+    // 过滤规则存储层：默认桩只覆盖 run() 用到的两个入口，避免既有单测因缺依赖而抛错。
+    // 真正的「两轮生效 / 损坏降级」回归用例用专用 harness 注入真实 FilterStore（见文件末尾）。
+    FilterStore: over.FilterStore || {
+      loadFilterRules: () => ({ filter: {}, keyword: { zkt_gjc: '' }, source: 'default', revision: 0, degraded: false, lastGoodUsed: false }),
+      writeAppliedSnapshot: () => true,
+      readAppliedSnapshot: () => ({ status: 'missing' })
+    },
     Network: {},
     Pusher: {},
     fs: Object.assign({ existsSync: () => stub.exists }, over.fs),
@@ -2377,4 +2384,311 @@ checkAsync('AP-5 通道健康：更新过程整体抛错 ⇒ 补一行 WARN 留�
     `异常必须留一行 WARN（旧实现完全静默，通道健康可能永久不更新而无人知）：${JSON.stringify(logged)}`)
   assert.ok(logged.some(l => l.includes('state read boom')), '留痕必须带上根因文本')
   assert.strictEqual(mfs._files.has(healthPath + '.lock'), false, '异常路径也必须释放健康更新锁（finally 语义）')
+})
+
+// ============================================================
+// 过滤规则覆盖文件（xbk_filter_store）→ App.run 生效 / 损坏降级回归
+//
+// 与上方纯方法用例不同，这一段**真调 App.run**（同一进程连续多轮）：
+//   · 依赖装配走与生产同一批工厂（createUtils/Formatter/RuleEngine/FilterEngine/MessageStore），
+//     只有 Network.fetchData 与 Pusher.send 是桩——不触网、不推送；
+//   · cacheDir 是 os.tmpdir() 下的临时目录（Config 副本与 XBK_CACHE_DIR 同指向：MessageStore
+//     的 getter 只接受根内 cache.dir，临时目录必须走部署开关才真正生效），断言后递归删除；
+//   · 覆盖文件按轮改写，证明「保存后下一轮生效」，且代码默认层 Config.filter 全程不被污染。
+// ============================================================
+function buildFilterRunHarness (cacheDir) {
+  const realFs = require('fs')
+  const nodeCrypto = require('crypto')
+  const {
+    createUtils, FILTER_FIELDS, DEFAULT_MAX_SIZE, STATE_TEXT_MAX_BYTES, MESSAGE_CACHE_MAX_BYTES,
+    TOMBSTONE_MAX_KEYS, TOMBSTONE_MAX_BYTES, TOMBSTONE_LOCK_STALE_MS, normalize, trimTrailingSlashes
+  } = require('./xbk_utils')
+  const { createFormatter } = require('./xbk_formatter')
+  const { createRuleEngine } = require('./xbk_rules')
+  const { createFilterEngine } = require('./xbk_filter')
+  const { createMessageStore } = require('./xbk_message_store')
+  const { readSafeTextResult, writeAtomic, writeAtomicIfAbsent, isRegularOrMissing } = require('./xbk_storage')
+  const { summarizeError } = require('./xbk_failure_policy')
+  const FilterStore = require('./xbk_filter_store')
+  const baseConfig = require('./xbk_function_v3').Config
+  // 代码默认层只读：这里深拷贝一份给被测 App，生产 Config 全程不被修改（下方有深比较断言）。
+  const Config = JSON.parse(JSON.stringify(baseConfig))
+  Config.cache.dir = cacheDir
+  Config.domain = 'https://example.invalid'
+  Config.api.pushUrl = 'https://example.invalid/plus/json/push.json'
+  Config.api.retry = 0
+  Config.alert = { enabled: false, intervalMs: 0 }
+  Config.report = { enabled: false }
+  Config.channelHealth = { enabled: false }
+  Config.diagnostics = { filterLog: { enabled: false, maxDetailsPerRun: 100, includePassed: false } }
+  Config.push.mode = 'sequential'
+  Config.timing.pushInterval = 0
+  Config.timing.finalWait = 0
+
+  // 与生产同口径：RE2 优先（用户正则缺 RE2 时一律跳过，测试不应掩盖这一点）
+  let RE2C = null
+  try { RE2C = require('re2') } catch (e) { RE2C = null }
+  const reCache = new Map()
+  const safeRe = (src, flags) => {
+    const key = src + '\u0000' + flags
+    const cached = reCache.get(key)
+    if (cached) return cached
+    const re = RE2C ? new RE2C(src, flags) : new RegExp(src, flags)
+    reCache.set(key, re)
+    return re
+  }
+  const compileUserRegex = (source, flags = 'i') => {
+    if (typeof source !== 'string' || !RE2C) return null
+    try { return new RE2C(source, flags) } catch (e) { return null }
+  }
+
+  const Utils = createUtils({ fs: realFs, safeRe })
+  const Formatter = createFormatter({ Utils, safeRe })
+  const RuleEngine = createRuleEngine({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Available: () => Boolean(RE2C) })
+  const FilterEngine = createFilterEngine({ Utils, RuleEngine, FILTER_FIELDS, compileUserRegex })
+  const MessageStore = createMessageStore({
+    Config,
+    Utils,
+    fs: realFs,
+    path,
+    crypto: nodeCrypto,
+    normalize,
+    storage: { readSafeTextResult, writeAtomic, writeAtomicIfAbsent, isRegularOrMissing },
+    constants: {
+      DEFAULT_MAX_SIZE,
+      MESSAGE_CACHE_MAX_BYTES,
+      TOMBSTONE_MAX_KEYS,
+      TOMBSTONE_MAX_BYTES,
+      TOMBSTONE_LOCK_STALE_MS
+    }
+  })
+  let items = []
+  const sends = []
+  const Network = { fetchData: async () => items }
+  const Pusher = {
+    send: async (text, desp) => {
+      sends.push({ text, desp })
+      return { successfulChannels: ['stub'], failures: [] }
+    }
+  }
+  const App = createApp({
+    Config,
+    Utils,
+    Formatter,
+    RuleEngine,
+    FilterEngine,
+    MessageStore,
+    FilterStore,
+    Network,
+    Pusher,
+    fs: realFs,
+    path,
+    crypto: nodeCrypto,
+    readSafeTextResult,
+    writeAtomic,
+    isRegularOrMissing,
+    STATE_TEXT_MAX_BYTES,
+    DEFAULT_MAX_SIZE,
+    RE2C,
+    RE2_WARN_STATE_FILE: 're2warn.state',
+    RE2_MISSING_WARNING: 'missing re2',
+    summarizeError,
+    PROFILE3: false,
+    PROFILE3_BOOT_MARKS: [],
+    prewarmDns: () => ({ ok: true, skipped: true }),
+    prewarmTls: () => ({ ok: true, skipped: true, okCount: 0, count: 0 }),
+    getNotify: () => Promise.resolve(null),
+    PKG_VERSION: '0.0.0-test',
+    trimTrailingSlashes,
+    compileUserRegex
+  })
+  return {
+    App,
+    Config,
+    MessageStore,
+    FilterStore,
+    sends,
+    baseConfig,
+    setItems (next) { items = next },
+    cacheName () { return MessageStore.getFileName(Config.api.pushUrl) },
+    cacheMessages () { return MessageStore.readMessages(MessageStore.getFilePath(MessageStore.getFileName(Config.api.pushUrl))) }
+  }
+}
+
+function makeRunItem (id, title) {
+  return { id, title, catename: '测试分类', content: '', shijianchuo: 1760000000 }
+}
+
+async function runWithWarnings (app) {
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => { warns.push(args.map(String).join(' ')) }
+  try {
+    const summary = await app.run()
+    return { summary, warns }
+  } finally {
+    console.warn = origWarn
+  }
+}
+
+checkAsync('FR-1 覆盖文件按轮生效：同一进程两次 App.run 读到不同规则，applied 快照与第二轮一致，Config.filter 不被污染', async () => {
+  const os = require('os')
+  const realFs = require('fs')
+  const FilterStore = require('./xbk_filter_store')
+  FilterStore.resetStoreStateForTests()
+  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  const rulesFile = FilterStore.filterRulesPaths(cacheDir).file
+  const defaultsBefore = JSON.parse(JSON.stringify(h.baseConfig.filter))
+  const keywordBefore = JSON.parse(JSON.stringify(h.baseConfig.keyword))
+  const writeRules = (revision, filter) => realFs.writeFileSync(rulesFile, JSON.stringify({ schema: 1, revision, filter }), { mode: 0o600 })
+  try {
+    // 第一轮：屏蔽标题含「屏蔽词」的 1 条
+    writeRules(1, { pingbibiaoti: '屏蔽词', pingbitime: '' })
+    h.setItems([makeRunItem('fr1-a', '屏蔽词甲'), makeRunItem('fr1-b', '正常乙')])
+    const round1 = await runWithWarnings(h.App)
+    assert.deepStrictEqual(
+      { total: round1.summary.total, dedup: round1.summary.dedup, filtered: round1.summary.filtered, pushed: round1.summary.pushed },
+      { total: 2, dedup: 0, filtered: 1, pushed: 1 },
+      `第一轮应只屏蔽 1 条并推送 1 条：${JSON.stringify(round1.summary)}`)
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(h.Config.filter)), defaultsBefore,
+      'App.run 不得原地修改注入的 Config.filter（覆盖文件只影响局部 active）')
+
+    // 第二轮：换成另一条规则（revision 2），验证「下一轮生效」，而不是本轮热替换
+    writeRules(2, { pingbibiaoti: '另一屏蔽', pingbitime: '' })
+    h.setItems([makeRunItem('fr2-a', '另一屏蔽丙'), makeRunItem('fr2-b', '正常丁')])
+    const round2 = await runWithWarnings(h.App)
+    assert.deepStrictEqual(
+      { total: round2.summary.total, dedup: round2.summary.dedup, filtered: round2.summary.filtered, pushed: round2.summary.pushed },
+      { total: 2, dedup: 0, filtered: 1, pushed: 1 },
+      `第二轮必须用 revision 2 的新规则（旧规则会 0 屏蔽、默认规则也会 0 屏蔽）：${JSON.stringify(round2.summary)}`)
+
+    // 生效快照：revision=2、filter 与第二轮实际生效规则逐字段一致
+    const applied = FilterStore.readAppliedSnapshot(cacheDir)
+    assert.strictEqual(applied.status, 'ok', `applied 快照应可读：${JSON.stringify(applied)}`)
+    const expectedFilter = Object.assign({}, defaultsBefore, { pingbibiaoti: '另一屏蔽', pingbitime: '' })
+    assert.strictEqual(applied.snapshot.revision, 2, 'applied 快照必须记录第二轮 revision')
+    assert.strictEqual(applied.snapshot.source, 'override', 'applied 快照 source 应为 override')
+    assert.deepStrictEqual(applied.snapshot.filter, expectedFilter, 'applied 快照 filter 必须等于第二轮生效规则')
+    assert.deepStrictEqual(applied.snapshot.keyword, { zkt_gjc: '' }, 'applied 快照必须带只读 keyword')
+    assert.ok(typeof applied.snapshot.hash === 'string' && applied.snapshot.hash.length > 0, 'applied 快照必须记录生效哈希')
+
+    // 代码默认层（生产 Config）与注入副本都必须保持原值
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(h.baseConfig.filter)), defaultsBefore,
+      '两轮之后代码默认层 Config.filter 必须逐字段不变（测试/运行都不得把它当持久化）')
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(h.baseConfig.keyword)), keywordBefore,
+      '两轮之后代码默认层 Config.keyword 必须不变')
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
+
+checkAsync('FR-2 覆盖文件损坏：沿用进程内 last-known-good，保留 _f 与 filter.hash，告警含 source/lastGoodUsed', async () => {
+  const os = require('os')
+  const realFs = require('fs')
+  const FilterStore = require('./xbk_filter_store')
+  FilterStore.resetStoreStateForTests()
+  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  const rulesFile = FilterStore.filterRulesPaths(cacheDir).file
+  const hashPath = path.join(cacheDir, 'filter.hash')
+  const cacheFIds = () => h.cacheMessages().filter(m => m && m._f === true).map(m => m.id).sort()
+  try {
+    // 先合法加载一次，建立 last-known-good，并让缓存里出现 _f 记录
+    realFs.writeFileSync(rulesFile, JSON.stringify({ schema: 1, revision: 2, filter: { pingbibiaoti: '另一屏蔽', pingbitime: '' } }), { mode: 0o600 })
+    h.setItems([makeRunItem('fr2-a', '另一屏蔽丙'), makeRunItem('fr2-b', '正常丁')])
+    const warm = await runWithWarnings(h.App)
+    assert.strictEqual(warm.summary.filtered, 1, '预热轮必须先写出 1 条 _f 记录')
+    const hashBefore = realFs.readFileSync(hashPath, 'utf8')
+    assert.deepStrictEqual(cacheFIds(), ['fr2-a'], `预热轮后缓存应含 _f 记录：${JSON.stringify(cacheFIds())}`)
+
+    // 损坏覆盖文件：JSON 都解析不了
+    realFs.writeFileSync(rulesFile, '{ 这不是 JSON', { mode: 0o600 })
+    h.setItems([makeRunItem('fr3-a', '另一屏蔽戊'), makeRunItem('fr3-b', '正常己')])
+    const round3 = await runWithWarnings(h.App)
+    assert.deepStrictEqual(
+      { filtered: round3.summary.filtered, pushed: round3.summary.pushed },
+      { filtered: 1, pushed: 1 },
+      `损坏时必须继续用 last-known-good 过滤（不得置空/跳过过滤）：${JSON.stringify(round3.summary)}`)
+    assert.ok(round3.warns.some(l => l.includes('过滤规则覆盖文件损坏') && l.includes('source=corrupt') && l.includes('lastGoodUsed=true')),
+      `console.warn 必须含 source=corrupt 与 lastGoodUsed=true：${JSON.stringify(round3.warns)}`)
+    assert.strictEqual(realFs.readFileSync(hashPath, 'utf8'), hashBefore,
+      '损坏降级不得推进 filter.hash（否则下一轮规则变更检测被跳过，_f 永久失效）')
+    assert.ok(cacheFIds().includes('fr2-a'),
+      `损坏降级不得清 _f：上一轮被过滤的 fr2-a 必须仍在缓存中（实际 ${JSON.stringify(cacheFIds())}）`)
+    const runLog = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    assert.ok(/WARN 过滤规则覆盖文件损坏/.test(runLog) && /lastGoodUsed=true/.test(runLog),
+      `run.log 必须留 WARN 行并带 lastGoodUsed：${runLog.slice(-400)}`)
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
+
+checkAsync('FR-3 首次加载即损坏（无 last-known-good）：回代码默认、告警 lastGoodUsed=false，仍不清 _f/不推进 hash', async () => {
+  const os = require('os')
+  const realFs = require('fs')
+  const FilterStore = require('./xbk_filter_store')
+  FilterStore.resetStoreStateForTests() // 关键：清掉进程内 last-known-good，模拟「本进程从未读到合法文件」
+  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  const rulesFile = FilterStore.filterRulesPaths(cacheDir).file
+  const hashPath = path.join(cacheDir, 'filter.hash')
+  const cacheFIds = () => h.cacheMessages().filter(m => m && m._f === true).map(m => m.id).sort()
+  const defaultsFilter = JSON.parse(JSON.stringify(h.baseConfig.filter))
+  try {
+    // 先合法跑一轮：留下 _f 记录与 filter.hash，作为「损坏后不得清理」的基线
+    realFs.writeFileSync(rulesFile, JSON.stringify({ schema: 1, revision: 2, filter: { pingbibiaoti: '另一屏蔽', pingbitime: '' } }), { mode: 0o600 })
+    h.setItems([makeRunItem('fr2-a', '另一屏蔽丙'), makeRunItem('fr2-b', '正常丁')])
+    await runWithWarnings(h.App)
+    const hashBefore = realFs.readFileSync(hashPath, 'utf8')
+    const fBefore = cacheFIds()
+    assert.deepStrictEqual(fBefore, ['fr2-a'], `基线应含 1 条 _f 记录：${JSON.stringify(fBefore)}`)
+
+    // 清 last-known-good 后再损坏：只能回代码默认（pingbitime='5' 因接口无注册时间字段而跳过 → 0 屏蔽）
+    FilterStore.resetStoreStateForTests()
+    realFs.writeFileSync(rulesFile, '{ 仍然不是 JSON', { mode: 0o600 })
+    h.setItems([makeRunItem('fr4-a', '另一屏蔽庚'), makeRunItem('fr4-b', '正常辛')])
+    const round4 = await runWithWarnings(h.App)
+    assert.deepStrictEqual(
+      { filtered: round4.summary.filtered, pushed: round4.summary.pushed },
+      { filtered: 0, pushed: 2 },
+      `首次损坏应回代码默认（默认 pingbibiaoti 为空 ⇒ 不过滤）：${JSON.stringify(round4.summary)}`)
+    assert.ok(round4.warns.some(l => l.includes('过滤规则覆盖文件损坏') && l.includes('source=corrupt') && l.includes('lastGoodUsed=false')),
+      `首次损坏必须告警 lastGoodUsed=false：${JSON.stringify(round4.warns)}`)
+    assert.strictEqual(realFs.readFileSync(hashPath, 'utf8'), hashBefore,
+      '首次损坏同样不得推进 filter.hash')
+    assert.deepStrictEqual(cacheFIds(), fBefore,
+      `首次损坏同样不得清 _f（实际 ${JSON.stringify(cacheFIds())} vs 基线 ${JSON.stringify(fBefore)}）`)
+    const applied = FilterStore.readAppliedSnapshot(cacheDir)
+    assert.strictEqual(applied.status, 'ok', `applied 快照应可读：${JSON.stringify(applied)}`)
+    assert.strictEqual(applied.snapshot.revision, 0, '首次损坏的 applied 快照 revision 应为 0')
+    assert.strictEqual(applied.snapshot.source, 'corrupt', '首次损坏的 applied 快照 source 应为 corrupt')
+    assert.deepStrictEqual(applied.snapshot.filter, defaultsFilter, '首次损坏的 applied 快照应记录代码默认规则')
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
 })

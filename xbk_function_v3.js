@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.309 — 控制台观感收敛（陈旧告警 / 取消留痕 / 日志口径） *********
+//* ******* 线报酷推送脚本 v3.310 — 过滤规则覆盖文件（控制台编辑 / 下一轮生效 / 降级与回滚） *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -314,6 +314,12 @@ const Network = createNetwork({
 const { createPusher, looksLikeHtmlLinear } = profile3Require('xbk_pusher', () => require('./xbk_pusher'))
 const Pusher = createPusher({ Utils, getNotify, looksLikeHtmlLinear })
 // ============================================================
+// 🗂️ FilterStore — 过滤规则覆盖文件存储层
+// ============================================================
+// 只读存储层（不反向 require 本文件，避免循环依赖）；App.run 每轮调用一次 loadFilterRules。
+const FilterStore = profile3Require('xbk_filter_store', () => require('./xbk_filter_store'))
+
+// ============================================================
 // 🚀 App — 主流程层
 // ============================================================
 const { createApp } = profile3Require('xbk_app', () => require('./xbk_app'))
@@ -324,6 +330,7 @@ const App = createApp({
   RuleEngine,
   FilterEngine,
   MessageStore,
+  FilterStore,
   Network,
   Pusher,
   fs,

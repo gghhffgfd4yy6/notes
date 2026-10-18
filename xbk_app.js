@@ -1,5 +1,5 @@
 function createApp ({
-  Config, Utils, Formatter, RuleEngine, FilterEngine, MessageStore, Network, Pusher,
+  Config, Utils, Formatter, RuleEngine, FilterEngine, MessageStore, FilterStore, Network, Pusher,
   fs, path, crypto, readSafeTextResult, writeAtomic, isRegularOrMissing,
   STATE_TEXT_MAX_BYTES, DEFAULT_MAX_SIZE, RE2C, RE2_WARN_STATE_FILE, RE2_MISSING_WARNING,
   summarizeError, PROFILE3, PROFILE3_BOOT_MARKS, prewarmDns, prewarmTls,
@@ -1048,10 +1048,29 @@ function createApp ({
         this._warnLowDisk()
         checkpoint('disk-check')
 
+        // ①′ 每轮读取过滤规则覆盖文件（<cacheDir>/filter-rules.json）——「保存后下一轮生效」的唯一入口。
+        // 必须放在本轮开头且只读一次：正在跑的一轮始终使用同一个局部 active，不在中途换规则；
+        // active 每轮新建，禁止提升到模块级（否则常驻进程会跨轮陈旧，控制台的修改永不生效）。
+        // FilterStore.loadFilterRules 契约不抛错：覆盖文件损坏时返回 source:'corrupt' + degraded:true，
+        // 优先沿用进程内 last-known-good，本进程从未读到合法文件才回代码默认。
+        const active = FilterStore.loadFilterRules({
+          cacheDir: MessageStore.cacheDir,
+          defaults: Config.filter,
+          keyword: Config.keyword
+        })
+        if (active.degraded) {
+          // 三处告警之一（console.warn / run.log WARN / 控制台红条由 console 侧读 GET source 呈现）。
+          // 降级不放宽规则、不把规则置空，也不进入下方的 filter.hash 比对/_f 清理（见 ③b 的 !active.degraded 闸）。
+          const corruptReason = (active.error && active.error.message) || '未知原因'
+          const corruptCode = (active.error && active.error.code) || 'store_corrupt'
+          console.warn(`⚠️ 过滤规则覆盖文件损坏（source=corrupt, code=${corruptCode}, lastGoodUsed=${active.lastGoodUsed}）：${corruptReason}——本轮沿用${active.lastGoodUsed ? '上一次合法规则' : '代码默认规则'}，不清 _f、不推进 filter.hash`)
+          this._writeRunLog(`${this._localStamp()} WARN 过滤规则覆盖文件损坏：${String(corruptReason).replace(/[\r\n]+/g, ' ')}（source=corrupt, lastGoodUsed=${active.lastGoodUsed}，本轮不清 _f、不推进 filter.hash）\n`)
+        }
+
         // ① 校验配置
-        const warnings = RuleEngine.validateConfig({ ...Config.filter, zkt_gjc: Config.keyword.zkt_gjc })
-        // CodeRabbit：zkt_gjc 在 Config.keyword 下（validateConfig 只收 filter 配置时该字段恒为 undefined，
-        // 首尾空白/非法正则告警在正常执行时永不触发）——显式传入 active 配置使告警生效
+        const warnings = RuleEngine.validateConfig({ ...active.filter, zkt_gjc: active.keyword.zkt_gjc })
+        // CodeRabbit：zkt_gjc 在 keyword 下（validateConfig 只收 filter 配置时该字段恒为 undefined，
+        // 首尾空白/非法正则告警在正常执行时永不触发）——显式传入本轮生效的 keyword 使告警生效
         for (const w of warnings) console.warn(w)
 
         // 配置告警显示统一安全字符串化：脏值（Symbol / 异常 valueOf）不能让告警路径再次崩溃。
@@ -1096,8 +1115,23 @@ function createApp ({
         checkpoint('config-validated')
 
         // ② 预编译规则（只执行一次）
-        const compiledRules = RuleEngine.compileRules(Config.filter)
+        const compiledRules = RuleEngine.compileRules(active.filter)
         checkpoint('rules-compiled')
+
+        // 生效哈希只算一次：既用于写 applied 快照，也用于 ③b 的 filter.hash 比对（原 1125 处复用本值）。
+        const filterHash = Utils.filterHash(active.filter, active.keyword.zkt_gjc, RuleEngine.compileStateOf(compiledRules))
+        // 生效快照：证明「本轮实际用的是哪一版规则」，供控制台显示「已生效 rN」。写失败只告警，绝不抛穿本轮推送。
+        if (!FilterStore.writeAppliedSnapshot({
+          cacheDir: MessageStore.cacheDir,
+          filter: active.filter,
+          keyword: active.keyword,
+          revision: active.revision,
+          source: active.source,
+          hash: filterHash
+        })) {
+          console.warn('⚠️ 过滤规则生效快照写入失败（不影响本轮过滤/推送，下一轮会重试）')
+          this._writeRunLog(`${this._localStamp()} WARN 过滤规则生效快照写入失败（不影响本轮过滤/推送）\n`)
+        }
 
         const fetchStart = Date.now()
         const xbkdata = await Network.fetchData()
@@ -1121,8 +1155,9 @@ function createApp ({
         // （RuleEngine.compileStateOf(compiledRules)：re2 可用性 + 各字段是否真的编译出规则）。
         // 否则同一份配置下 re2 缺失/规则被 ReDoS 守卫丢弃时哈希不变，已打 _f 的条目永不重评、
         // 改宽后静默漏推。该维度随环境稳定，不会每轮清 _f。
-        {
-          const filterHash = Utils.filterHash(Config.filter, Config.keyword.zkt_gjc, RuleEngine.compileStateOf(compiledRules))
+        // 覆盖文件损坏（active.degraded）时**整段跳过**：不清 _f、不推进 filter.hash——
+        // 降级不能放宽规则，也就不能触发「之前被过滤的条目重新评估」，否则一次文件损坏就会补推一堆历史条目。
+        if (!active.degraded) {
           const hashPath = path.join(MessageStore.cacheDir, 'filter.hash')
           let lastFile = ''
           let lastHash = ''
@@ -1282,7 +1317,7 @@ function createApp ({
             if (identity.kind === 'url') batchNoIdUrls.add(identity.url)
           }
           if (identity.kind === 'anon') batchAnonKeys.add(identity.key)
-          const explanation = FilterEngine.explainFilter(item, compiledRules, Config.filter)
+          const explanation = FilterEngine.explainFilter(item, compiledRules, active.filter)
           filterExplanations.set(item, explanation)
           if (explanation.passed) {
             items.push(item)
@@ -1300,7 +1335,7 @@ function createApp ({
         }
 
         // v3.159：接口未提供注册时间字段时 pingbitime 过滤不生效——运行期警告（配置无效不感知）
-        const pbCfg = Config.filter && Config.filter.pingbitime
+        const pbCfg = active.filter && active.filter.pingbitime
         const pbText = Utils.safeText(pbCfg, '')
         if (pbCfg !== undefined && pbCfg !== null && pbText.trim() !== '' && xbkdata.length > 0) {
           const missing = xbkdata.length - regTimePresent
@@ -1311,7 +1346,7 @@ function createApp ({
 
         // ⑤ 只看它过滤（独立白名单函数，keyword 正则预编译一次）
         const beforeKwd = items.length
-        const kw = Config.keyword.zkt_gjc
+        const kw = active.keyword.zkt_gjc
         // R11-1：非字符串 zkt_gjc（对象/数字脏配置）→ 警告并跳过过滤（String 化会把 '[object Object]' 当正则，静默怪行为）
         if (kw !== undefined && kw !== null && typeof kw !== 'string') {
           console.warn(`⚠️ 配置「zkt_gjc」应为字符串，当前为 ${typeof kw}，已忽略只看它过滤`)

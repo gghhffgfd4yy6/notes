@@ -490,3 +490,14 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **卡片与文案**：近 7 天失败用琥珀徽章；通道名显示 PushPlus/Server酱/WxPusher 等展示名；过滤诊断不再重复「过滤：过滤：」；字节小于 1 MB 显示 KB；登录页提示改为「成功后写入 HttpOnly Cookie，地址栏不保留令牌」。
 - **布局**：桌面内容宽度 980 → 1200px，1440 宽屏不再两侧空出近 500px；手机 2×2 与 320 宽无横向溢出保持不变。
 - **测试**：`test_console.js` 更新日志错误口径、仅运行服务端筛选、同秒 CANCEL 独立成条、每页条数断言；`test_status_report.js` 新增「末尾 CANCEL 优先于上一条摘要」用例。
+
+## v3.310 — 过滤规则覆盖文件（控制台编辑 / 下一轮生效 / 降级与回滚）
+
+- **规则不再只写在代码里**：`Config.filter` 仍是代码默认层，新增覆盖文件 `<缓存目录>/filter-rules.json`（0600，`schema:1` + `revision` + 11 个过滤字段）。文件不存在时按代码默认运行，控制台如实显示「代码默认」，不会替你自动生成第一版。
+- **合并语义**：覆盖文件逐字段覆盖代码默认，**缺字段回代码默认（不是置空）**；显式 `""` 才表示「明确清空该规则」，旧文件缺字段不会因此放宽。`zkt_gjc` 在 v1 只读展示，不开放写入。
+- **控制台「过滤规则」页**：按判定顺序分组（时间 → 分类 → 楼主 → 标题 → 内容），`zhanxian*` 标注「保护（命中即保留）」，`pingbitime` 标注「屏蔽注册不足 N 天」；支持校验并保存、回放最近 N 条、回滚到备份或恢复代码默认。保存前给补推提示：「将重评 N 条历史被过滤记录（超过 5000 条显示 ≥5000），后续每轮最多补推 `Config.push.maxPerRun`（默认 100）条」。
+- **下一轮生效**：`App.run` 每轮开头读一次覆盖文件、构造本轮局部的 `activeFilter`；正在跑的一轮不换规则，控制台触发的新进程或常驻进程的下一轮才生效。每轮写 `filter-rules.applied.json` 快照（revision/source/hash/appliedAt），页面据此显示「已生效：rN @ 时间」与「有未保存修改」。
+- **损坏降级**：覆盖文件解析失败/不可读/超限时优先沿用进程内 last-known-good，仅首次加载即损坏才回退代码默认；降级轮**不清 `_f`、不推进 `filter.hash`**，所以既不重评补推历史条目、也不放宽规则。三处告警同时给出：`console.warn`、`run.log` WARN 行、控制台红条。
+- **写端点仅 Bearer**：只认 `Authorization: Bearer <token>`，固定路径、0600、`O_EXCL` 并发锁（10s 陈旧接管）、`baseRevision` CAS；读-校验-写-审计在锁内同步完成、中间不 `await`。状态码：400 校验失败（含 `.*` 全命中未确认）、413 体积超限、415 非 JSON/压缩体、401 缺 Bearer 或仅 Cookie（`cookie_not_allowed`）、400 URL 带 token（`query_token_not_allowed`）、409 revision 冲突/写锁（`write_busy`）/覆盖文件损坏未确认（`store_corrupt`）、503 re2 不可用、500 写盘失败。
+- **审计与回滚**：`filter-rules.audit.ndjson` append-only（0600），每条含 `ts/actor/action/revision/changedFields/prevHash/entryHash`，可检测断链与静默删除；只记字段名与 hash，不记规则正文、token 或绝对路径（不声称防 root 篡改）。保存前备份 `filter-rules.bak.<rev>.json` 保留 3 代；回滚与恢复默认都以 `revision+1` 写入（线性历史，不倒退版本号），删除覆盖文件即恢复代码默认。
+- **门禁**：新增 `xbk_filter_store.js` 与 `test_filter_store.js` 纳入变异矩阵（`filter-store` 全文件段）；`scripts/console.js` 3380 行按变异体预算重拆 6 段（`console-part1..6`，边界 563/1126/1689/2252/2815），`xbk_function_v3.js` 行段改为 1-541；矩阵现为 26 段（22 TAP + 4 command）。

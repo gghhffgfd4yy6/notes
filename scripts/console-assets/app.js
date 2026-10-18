@@ -76,6 +76,15 @@ function fmtBytes (b) {
   return `${(b / 1048576).toFixed(1)} MB`
 }
 
+// 生效快照的 appliedAt 是服务端 ISO 串（writeAppliedSnapshot 写 toISOString），
+// 与 run.log 时间戳同口径按 Asia/Shanghai 展示；解析失败原样显示，不吞成「—」。
+function fmtIsoStamp (iso) {
+  if (!iso) return '—'
+  if (typeof iso === 'number') return fmtTime(iso)
+  const t = Date.parse(String(iso))
+  return Number.isFinite(t) ? fmtTime(t) : String(iso)
+}
+
 // ── API ─────────────────────────────────────────────────────────────────────
 // token 只走 Authorization: Bearer 头（URL 不带任何凭证；console.js 服务端不打访问日志，
 // 但浏览器扩展/中间代理可能记 URL——凭证不进 URL 是更安全的默认）。
@@ -287,6 +296,89 @@ function apiGetAccessLog () {
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   return consumeJson(fetch('/api/access-log', merged), done)
+}
+
+// ── v3.310 过滤规则控制面：读面 GET + 四个写面 POST ─────────────────────────
+// 读面沿用现有 api helper（Cookie / Bearer / ?token= 均可）。写面只带
+// `Authorization: Bearer <boot token>`，不带 ?token=（服务端写端点只认 Bearer 头，
+// URL 里带 token 会直接 400 query_token_not_allowed）。
+// 写请求的错误体必须读出来：409 要区分 revision_mismatch / write_busy / store_corrupt，
+// 400 要逐字段 errors。consumeJson 把非 2xx 收敛成「HTTP 4xx」会丢掉 code，所以这里用
+// consumeJsonResult 保留状态码与响应体；超时/中止仍由同一个 timedRequest + readBodyJson 期限覆盖。
+async function consumeJsonResult (p, done) {
+  p.then(() => {}, () => {}) // fetch reject 由 await 抛出；这里只防提前未处理拒绝
+  try {
+    const res = await p
+    let data = null
+    try {
+      data = await readBodyJson(res)
+    } catch (e) {
+      data = null
+    }
+    // 与 consumeJson 同口径：401 让 App 停轮询并显示「重新打开带 token 链接」。
+    if (res.status === 401 && typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(new Event('xbk-auth-expired'))
+    }
+    return {
+      status: res.status,
+      ok: res.ok,
+      data,
+      retryAfter: res.headers && typeof res.headers.get === 'function' ? res.headers.get('Retry-After') : null
+    }
+  } finally {
+    done()
+  }
+}
+
+function filterWriteHeaders () {
+  return {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${BOOT.token}`
+  }
+}
+
+function apiGetFilter () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/config/filter', merged), done)
+}
+
+function apiPostFilterSave (body) {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify(body)
+  })
+  return consumeJsonResult(fetch('/api/config/filter', merged), done)
+}
+
+function apiPostFilterValidate (body) {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify(body)
+  })
+  return consumeJsonResult(fetch('/api/config/filter/validate', merged), done)
+}
+
+function apiPostFilterPreview (body) {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify(body)
+  })
+  return consumeJsonResult(fetch('/api/config/filter/preview', merged), done)
+}
+
+function apiPostFilterRestore (body) {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify(body)
+  })
+  return consumeJsonResult(fetch('/api/config/filter/restore', merged), done)
 }
 
 // 触发类请求公共体（SonarCloud new_duplicated_lines_density：trigger 与 triggerNotifyTest
@@ -2089,6 +2181,591 @@ function ConfigPanel ({ onSync }) {
   </div>`
 }
 
+// ── 过滤规则（v3.310）：覆盖文件编辑面 ─────────────────────────────────────
+// 语义红线（规格 §2.8/§3）：zhanxian* 是「保护」——命中即保留、优先于屏蔽，绝不写成
+// 「展示 / 只看」；pingbitime 是「屏蔽注册不足 N 天的楼主」，不是「只看最近 N 天」。
+// 分组顺序 = 运行侧判定顺序：时间 → 分类 → 楼主 → 标题 → 内容。
+const FILTER_GROUPS = [
+  {
+    key: 'time',
+    title: '时间',
+    note: '第 1 步 · 先按楼主注册天数判定',
+    fields: [
+      {
+        name: 'pingbitime',
+        label: '屏蔽注册不足 N 天的楼主',
+        kind: 'days',
+        hint: '填天数（整数）。留空 = 不启用；支持「分类###天数」多行写法。'
+      }
+    ]
+  },
+  {
+    key: 'category',
+    title: '分类',
+    note: '第 2 步 · 分类名命中即屏蔽',
+    fields: [
+      { name: 'pingbifenlei', label: '屏蔽分类', hint: '分类名正则（如 美妆|数码），不支持 ### 多行语法。' }
+    ]
+  },
+  {
+    key: 'author',
+    title: '楼主',
+    note: '第 3 步 · 保护优先于屏蔽，强化屏蔽可抵消同字段保护',
+    fields: [
+      { name: 'pingbilouzhu', label: '屏蔽楼主', hint: '一行一条；支持「分类###关键词」。命中即过滤。' },
+      { name: 'zhanxianlouzhu', label: '保护楼主', protect: true, hint: '保护（命中即保留，优先于屏蔽）。' },
+      { name: 'pingbilouzhuplus', label: '强化屏蔽楼主', hint: '强化屏蔽：命中即过滤，并可抵消同字段的保护。' }
+    ]
+  },
+  {
+    key: 'title',
+    title: '标题',
+    note: '第 4 步 · 楼主已屏蔽时不再看标题',
+    fields: [
+      { name: 'pingbibiaoti', label: '屏蔽标题', hint: '一行一条；支持「分类###关键词」。命中即过滤。' },
+      { name: 'zhanxianbiaoti', label: '保护标题', protect: true, hint: '保护（命中即保留，优先于屏蔽）。' },
+      { name: 'pingbibiaotiplus', label: '强化屏蔽标题', hint: '强化屏蔽：命中即过滤，并可抵消同字段的保护。' }
+    ]
+  },
+  {
+    key: 'content',
+    title: '内容',
+    note: '第 5 步 · 楼主/标题已屏蔽时不再看内容',
+    fields: [
+      { name: 'pingbineirong', label: '屏蔽内容', hint: '一行一条；支持「分类###关键词」。命中即过滤。' },
+      { name: 'zhanxianneirong', label: '保护内容', protect: true, hint: '保护（命中即保留，优先于屏蔽）。' },
+      { name: 'pingbineirongplus', label: '强化屏蔽内容', hint: '强化屏蔽：命中即过滤，并可抵消同字段的保护。' }
+    ]
+  }
+]
+
+const FILTER_FIELD_NAMES = FILTER_GROUPS.reduce((acc, g) => acc.concat(g.fields.map((f) => f.name)), [])
+
+// 全命中判定与服务端 wideMatchFields 同口径：trim 后等于 .* 或 ^.*$。
+const FILTER_WIDE_PATTERNS = ['.*', '^.*$']
+
+function isWideMatchValue (v) {
+  const s = v === undefined || v === null ? '' : String(v).trim()
+  return FILTER_WIDE_PATTERNS.includes(s)
+}
+
+function wideFieldsOf (filter) {
+  const src = filter && typeof filter === 'object' ? filter : {}
+  return FILTER_FIELD_NAMES.filter((name) => isWideMatchValue(src[name]))
+}
+
+// GET 返回的 filter 只含 11 个服务端字段；缺字段按空串（不把 undefined 塞进 textarea）。
+function filterDraftFrom (data) {
+  const src = data && data.filter && typeof data.filter === 'object' ? data.filter : {}
+  const out = {}
+  for (const name of FILTER_FIELD_NAMES) {
+    out[name] = src[name] === undefined || src[name] === null ? '' : String(src[name])
+  }
+  return out
+}
+
+// 服务端 errors 是 [{field, code, message}]；body/baseRevision 这类非字段错误汇总在顶部 Hint。
+function fieldErrorMap (errors) {
+  const map = {}
+  if (!Array.isArray(errors)) return map
+  for (const item of errors) {
+    if (item && typeof item.field === 'string' && FILTER_FIELD_NAMES.includes(item.field)) {
+      map[item.field] = item.message || item.code || '校验失败'
+    }
+  }
+  return map
+}
+
+// 补推口径（规格 §4.4）：最多扫 5000 条，超过显示「≥5000」。
+function reEvalText (preview) {
+  const n = preview && preview.capped === true ? '≥5000' : fmtNum(preview ? preview.reEvalCount : null)
+  return `将重评 ${n} 条历史被过滤记录，后续每轮最多补推 Config.push.maxPerRun（默认 100）条。`
+}
+
+// 备份下拉：/api/files 的清单里筛 filter-rules.bak.<rev>.json（最多 3 代）。
+// 清单不可读时退化为「最近 3 代候选」——缺失的 revision 由服务端 404 backup_not_found 如实提示。
+function backupRevisionsOf (files, revision) {
+  const list = files && Array.isArray(files.files) ? files.files : null
+  if (!list) {
+    const out = []
+    for (let r = revision - 1; r >= 1 && out.length < 3; r--) out.push(r)
+    return out
+  }
+  return list
+    .map((f) => /^filter-rules\.bak\.(\d+)\.json$/.exec(f && typeof f.name === 'string' ? f.name : ''))
+    .filter(Boolean)
+    .map((m) => Number(m[1]))
+    .filter((r) => Number.isSafeInteger(r) && r >= 0 && r < revision)
+    .sort((a, b) => b - a)
+    .slice(0, 3)
+}
+
+// 单个规则字段：label/for 绑定、当前值、脏标记、逐字段错误。
+function FilterField ({ def, value, saved, error, onChange }) {
+  const id = `filter-rule-${def.name}`
+  const hintId = `${id}-hint`
+  const errId = `${id}-err`
+  const shown = value === undefined || value === null ? '' : String(value)
+  const prev = saved === undefined || saved === null ? '' : String(saved)
+  const dirty = shown !== prev
+  const describedBy = error ? `${hintId} ${errId}` : hintId
+  return html`<div class=${'fr-field' + (def.protect ? ' fr-field-protect' : '')}>
+    <div class="fr-field-head">
+      <label class="fr-label" for=${id}>${def.label}</label>
+      ${def.protect && html`<span class="fr-protect">保护（命中即保留，优先于屏蔽）</span>`}
+      ${dirty && html`<span class="fr-dirty">未保存</span>`}
+      <code class="fr-key">${def.name}</code>
+    </div>
+    ${def.kind === 'days'
+      ? html`<input id=${id} class="fr-input fr-input-days" type="text" inputmode="numeric" autocomplete="off"
+          value=${shown} aria-describedby=${describedBy} aria-invalid=${error ? 'true' : 'false'}
+          onInput=${(e) => onChange(def.name, e.target.value)} />`
+      : html`<textarea id=${id} class="fr-input fr-textarea" rows="2" spellcheck="false"
+          value=${shown} aria-describedby=${describedBy} aria-invalid=${error ? 'true' : 'false'}
+          onInput=${(e) => onChange(def.name, e.target.value)}></textarea>`}
+    <div class="fr-field-hint" id=${hintId}>${def.hint}</div>
+    ${error && html`<div class="fr-field-err" id=${errId} role="alert">${error}</div>`}
+  </div>`
+}
+
+function FilterRulesPanel ({ onSync }) {
+  const [data, setData] = useState(null)
+  const [draft, setDraft] = useState(null)
+  const [base, setBase] = useState(null)
+  const [backups, setBackups] = useState([])
+  const [backupListKnown, setBackupListKnown] = useState(false)
+  const [restoreTo, setRestoreTo] = useState('default')
+  const [loading, setLoading] = useState(false)
+  const [busy, setBusy] = useState('') // '' | validate | preview | save | copy | restore
+  const [err, setErr] = useState('')
+  const [fieldErrors, setFieldErrors] = useState({})
+  const [notice, setNotice] = useState(null)
+  const [preview, setPreview] = useState(null)
+  const [dialog, setDialog] = useState(null)
+
+  const applyLoaded = useCallback((d, files) => {
+    const revision = d && Number.isSafeInteger(d.revision) ? d.revision : 0
+    const next = filterDraftFrom(d)
+    const list = backupRevisionsOf(files, revision)
+    setData(d)
+    setDraft(next)
+    setBase(next)
+    setPreview(null)
+    setFieldErrors({})
+    setBackups(list)
+    setBackupListKnown(!!(files && Array.isArray(files.files)))
+    setRestoreTo(list.length > 0 ? String(list[0]) : 'default')
+  }, [])
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setErr('')
+    try {
+      // 备份清单与规则读取并行：/api/files 只是下拉数据，读不到不阻断规则编辑。
+      const [d, files] = await Promise.all([apiGetFilter(), apiGetFiles().catch(() => null)])
+      applyLoaded(d, files)
+      if (typeof onSync === 'function') onSync(Date.now())
+    } catch (e) {
+      setErr(`加载失败：${e.message}`)
+    } finally {
+      setLoading(false)
+    }
+  }, [applyLoaded, onSync])
+
+  useEffect(() => { load().catch(() => {}) }, [load])
+
+  const dirtyFields = useMemo(() => {
+    if (!draft || !base) return []
+    return FILTER_FIELD_NAMES.filter((n) => String(draft[n]) !== String(base[n]))
+  }, [draft, base])
+  const draftWide = useMemo(() => wideFieldsOf(draft), [draft])
+
+  const setFieldValue = useCallback((name, value) => {
+    setDraft((cur) => (cur ? { ...cur, [name]: value } : cur))
+    setFieldErrors((cur) => {
+      if (!cur[name]) return cur
+      const next = { ...cur }
+      delete next[name]
+      return next
+    })
+  }, [])
+
+  const applySaved = useCallback((filter, revision, copy) => {
+    const rev = Number.isSafeInteger(revision) ? revision : null
+    const next = filterDraftFrom({ filter })
+    setData((cur) => (cur
+      ? { ...cur, revision: rev === null ? cur.revision : rev, source: 'override', filter: { ...filter }, wideMatch: wideFieldsOf(filter) }
+      : cur))
+    setDraft(next)
+    setBase(next)
+    setFieldErrors({})
+    setPreview(null)
+    setDialog(null)
+    setNotice({ tone: 'ok', text: `${copy ? '已把当前规则复制到覆盖文件' : '已保存'}${rev === null ? '' : ` r${rev}`}，下一轮生效（当前轮不换规则）。` })
+  }, [])
+
+  // 备份清单单独刷新：保存会新增一代备份，下拉必须跟着更新（不重读规则，避免覆盖草稿）。
+  const refreshBackups = useCallback(async (revision) => {
+    try {
+      const files = await apiGetFiles()
+      const list = backupRevisionsOf(files, revision)
+      setBackups(list)
+      setBackupListKnown(!!(files && Array.isArray(files.files)))
+      setRestoreTo((cur) => (cur !== 'default' && list.includes(Number(cur))
+        ? cur
+        : (list.length > 0 ? String(list[0]) : 'default')))
+    } catch (e) { /* 清单读取失败：保留旧下拉，不阻断保存结果 */ }
+  }, [])
+
+  // 错误体 → 统一文案 + 逐字段错误。返回值供调用方决定是否开二次确认弹窗。
+  const showFailure = useCallback((res, fallback) => {
+    const payload = res.data && typeof res.data === 'object' && !Array.isArray(res.data) ? res.data : {}
+    const code = typeof payload.code === 'string' ? payload.code : ''
+    const errors = Array.isArray(payload.errors) ? payload.errors : []
+    const fail = (text) => {
+      setNotice(null) // 失败时清掉上一条成功提示，避免「已保存」与错误同屏
+      setFieldErrors(fieldErrorMap(errors))
+      setErr(text)
+    }
+    if (res.status === 401) { fail('凭证已失效（401），写操作被拒绝；请用带 token 的完整链接重新打开控制台。'); return 'unauthorized' }
+    if (code === 'engine_unavailable' || res.status === 503) { fail('安全正则引擎（re2）暂不可用，本次不落盘；请检查部署后重试。'); return 'engine_unavailable' }
+    if (code === 'body_too_large' || res.status === 413) { fail('规则内容超过 64 KiB 上限，请精简后再保存。'); return 'body_too_large' }
+    if (code === 'unsupported_media_type' || res.status === 415) { fail('请求格式不被接受（写端点要求 application/json）。'); return 'unsupported_media_type' }
+    if (code === 'write_busy') { fail(`另一个写入正在进行，请 1 秒后重试（Retry-After: ${res.retryAfter || '1'}）。`); return 'write_busy' }
+    if (code === 'store_corrupt') { fail('覆盖文件已损坏：保存需要确认覆盖（确认后损坏内容不可回滚）。'); return 'store_corrupt' }
+    if (code === 'revision_mismatch') {
+      const cur = Number.isSafeInteger(payload.revision) ? payload.revision : null
+      setFieldErrors({})
+      setErr(`保存冲突：${cur === null ? '服务端 revision 已变化' : `服务端当前为 r${cur}`}，你基于 r${data ? data.revision : '?'}。请先「重新加载」合并后再保存。`)
+      return 'revision_mismatch'
+    }
+    if (code === 'backup_not_found' || res.status === 404) { fail('备份不存在（backup_not_found），可能已被清理；请重新加载备份列表。'); return 'backup_not_found' }
+    if (code === 'validation_failed' || res.status === 400) {
+      const lines = errors.map((x) => `${x && x.field ? x.field : ''}${x && x.message ? `：${x.message}` : ''}`).filter(Boolean)
+      fail(lines.length > 0 ? `${fallback}：${lines.join('；')}` : `${fallback}：规则未通过校验`)
+      return 'validation_failed'
+    }
+    fail(`${fallback}：${payload.error || payload.code || `HTTP ${res.status}`}`)
+    return code || `http_${res.status}`
+  }, [data])
+
+  // 保存前两次预检：/validate（逐字段语法）→ /preview（补推条数），再开二次确认弹窗。
+  const beginSave = async () => {
+    if (!data || !draft || busy) return
+    setErr('')
+    setFieldErrors({})
+    setNotice(null)
+    const candidate = { ...draft }
+    setBusy('validate')
+    try {
+      // confirmWideMatch:true 只关掉服务端的「宽匹配需确认」闸；真正的二次确认由本页弹窗
+      // 负责（用户必须在弹窗里看到 .* 字段与补推条数后才会发出保存）。
+      const checked = await apiPostFilterValidate({ schema: 1, filter: candidate, confirmWideMatch: true })
+      if (!checked.ok) { showFailure(checked, '校验未通过'); return }
+      setBusy('preview')
+      const pv = await apiPostFilterPreview({ schema: 1, filter: candidate, confirmWideMatch: true })
+      if (!pv.ok) { showFailure(pv, '补推预览失败'); return }
+      setPreview(pv.data)
+      setDialog({ kind: 'save', filter: candidate, baseRevision: data.revision, preview: pv.data, wide: wideFieldsOf(candidate) })
+    } catch (e) {
+      setErr(`保存前检查失败：${e.message}`)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const runPreview = async () => {
+    if (!draft || busy) return
+    setErr('')
+    setFieldErrors({})
+    setNotice(null)
+    setBusy('preview')
+    try {
+      const res = await apiPostFilterPreview({ schema: 1, filter: { ...draft }, confirmWideMatch: true })
+      if (!res.ok) { showFailure(res, '预览失败'); return }
+      setPreview(res.data)
+    } catch (e) {
+      setErr(`预览失败：${e.message}`)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const submitSave = async ({ filter, baseRevision, confirmWideMatch, confirmReplaceCorrupt, copy }) => {
+    setBusy('save')
+    setErr('')
+    try {
+      const res = await apiPostFilterSave({
+        schema: 1,
+        baseRevision,
+        filter,
+        confirmWideMatch: confirmWideMatch === true,
+        confirmReplaceCorrupt: confirmReplaceCorrupt === true
+      })
+      if (res.ok) {
+        const payload = res.data && typeof res.data === 'object' ? res.data : {}
+        applySaved(filter, payload.revision, copy === true)
+        refreshBackups(Number.isSafeInteger(payload.revision) ? payload.revision : (data ? data.revision : 0))
+        return
+      }
+      const code = showFailure(res, copy ? '复制默认规则失败' : '保存失败')
+      const errors = res.data && Array.isArray(res.data.errors) ? res.data.errors : []
+      if (code === 'store_corrupt') {
+        setDialog({ kind: 'corrupt', filter, baseRevision, confirmWideMatch })
+        return
+      }
+      if (code === 'validation_failed' && errors.some((x) => x && x.code === 'wide_match_confirm_required')) {
+        setDialog({ kind: 'copyWide', filter })
+        return
+      }
+      // 其余失败（revision_mismatch / write_busy / validation_failed / 503…）关掉确认弹窗，
+      // 让顶部错误文案可见；草稿与 baseRevision 保留，用户可重新加载后再存。
+      setDialog(null)
+    } catch (e) {
+      setErr(`保存请求失败：${e.message}`)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // 首启：把 GET 到的代码默认整份写进覆盖文件（baseRevision:0）。不自动写，必须点按钮。
+  const copyDefaults = async () => {
+    if (!data || !base || busy) return
+    setDialog(null)
+    setBusy('copy')
+    setErr('')
+    setFieldErrors({})
+    setNotice(null)
+    try {
+      const res = await apiPostFilterSave({ schema: 1, baseRevision: 0, filter: { ...base } })
+      if (res.ok) {
+        const payload = res.data && typeof res.data === 'object' ? res.data : {}
+        applySaved(base, payload.revision, true)
+        refreshBackups(Number.isSafeInteger(payload.revision) ? payload.revision : (data ? data.revision : 0))
+        return
+      }
+      const code = showFailure(res, '复制默认规则失败')
+      const errors = res.data && Array.isArray(res.data.errors) ? res.data.errors : []
+      if (code === 'validation_failed' && errors.some((x) => x && x.code === 'wide_match_confirm_required')) {
+        setDialog({ kind: 'copyWide', filter: { ...base } })
+        setNotice({ tone: 'warn', text: '代码默认里含 .* 全命中字段，复制前需要二次确认。' })
+      }
+    } catch (e) {
+      setErr(`复制失败：${e.message}`)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const doRestore = async (to) => {
+    setBusy('restore')
+    setErr('')
+    try {
+      const res = await apiPostFilterRestore({ to: to === 'default' ? 'default' : Number(to), confirm: true })
+      if (!res.ok) {
+        showFailure(res, '回滚失败')
+        setDialog(null)
+        return
+      }
+      const payload = res.data && typeof res.data === 'object' ? res.data : {}
+      const revText = Number.isSafeInteger(payload.revision) ? ` r${payload.revision}` : ''
+      setDialog(null)
+      setFieldErrors({})
+      setNotice({
+        tone: 'ok',
+        text: to === 'default'
+          ? `已恢复代码默认（审计 revision${revText || ' 已递增'}），下一轮生效。`
+          : `已回滚到备份 r${to}，写入新 revision${revText}，下一轮生效。`
+      })
+      // 回滚/恢复默认成功后重新 GET：来源/生效状态/备份列表都以服务端为准。
+      await load()
+    } catch (e) {
+      setDialog(null)
+      setErr(`回滚请求失败：${e.message}`)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const askReload = () => {
+    if (busy) return
+    if (dirtyFields.length > 0) {
+      setDialog({ kind: 'reload' })
+      return
+    }
+    load().catch(() => {})
+  }
+
+  const closeDialog = () => {
+    if (busy) return
+    setDialog(null)
+  }
+
+  const dialogNode = () => {
+    if (!dialog) return null
+    if (dialog.kind === 'save') {
+      return html`<${ConfirmDialog} open=${true} title="确认保存过滤规则"
+        confirmLabel=${busy === 'save' ? '保存中…' : '确认保存'} busy=${busy === 'save'}
+        onCancel=${closeDialog}
+        onConfirm=${() => submitSave({ filter: dialog.filter, baseRevision: dialog.baseRevision, confirmWideMatch: dialog.wide.length > 0 })}>
+        <div class="fr-dialog-line">${reEvalText(dialog.preview)}</div>
+        ${dialog.wide.length > 0 && html`<div class="fr-wide-warn" role="alert">
+          含 .* 全命中规则：${dialog.wide.join('、')}。保存后几乎所有记录都会被命中，因此需要二次确认（confirmWideMatch:true）。
+        </div>`}
+        <div class="modal-note">保存后写入覆盖文件，<strong>下一轮生效</strong>；当前正在跑的一轮不换规则。</div>
+      <//>`
+    }
+    if (dialog.kind === 'corrupt') {
+      return html`<${ConfirmDialog} open=${true} title="覆盖已损坏的规则文件？"
+        confirmLabel=${busy === 'save' ? '覆盖中…' : '确认覆盖'} busy=${busy === 'save'}
+        onCancel=${closeDialog}
+        onConfirm=${() => submitSave({ filter: dialog.filter, baseRevision: dialog.baseRevision, confirmWideMatch: dialog.confirmWideMatch, confirmReplaceCorrupt: true })}>
+        <div class="fr-dialog-line">覆盖文件已损坏，不能作为可回滚版本。确认后用当前编辑内容重建覆盖文件（confirmReplaceCorrupt:true）。</div>
+        <div class="modal-note">重建后同样下一轮生效；损坏内容不会被保留。</div>
+      <//>`
+    }
+    if (dialog.kind === 'copyWide') {
+      return html`<${ConfirmDialog} open=${true} title="默认规则含 .* 全命中字段"
+        confirmLabel=${busy === 'save' ? '复制中…' : '确认复制'} busy=${busy === 'save'}
+        onCancel=${closeDialog}
+        onConfirm=${() => submitSave({ filter: dialog.filter, baseRevision: 0, confirmWideMatch: true, copy: true })}>
+        <div class="fr-dialog-line">以下字段 trim 后是 .* / ^.*$：${wideFieldsOf(dialog.filter).join('、') || '（未知）'}。复制后几乎所有记录都会被命中。</div>
+        <div class="modal-note">确认后以 confirmWideMatch:true 写入覆盖文件；同样下一轮生效。</div>
+      <//>`
+    }
+    if (dialog.kind === 'restore') {
+      return html`<${ConfirmDialog} open=${true} title="确认回滚过滤规则"
+        confirmLabel=${busy === 'restore' ? '回滚中…' : '确认回滚'} busy=${busy === 'restore'}
+        onCancel=${closeDialog}
+        onConfirm=${() => doRestore(dialog.to)}>
+        <div class="fr-dialog-line">${dialog.to === 'default'
+          ? '删除覆盖文件，恢复代码默认。'
+          : `用备份 r${dialog.to} 的内容写入新 revision（revision 只增不减，线性历史）。`}</div>
+        <div class="modal-note">回滚同样下一轮生效；当前正在跑的一轮不换规则。</div>
+      <//>`
+    }
+    if (dialog.kind === 'reload') {
+      return html`<${ConfirmDialog} open=${true} title="放弃未保存的修改？"
+        confirmLabel="放弃并重新加载" busy=${false}
+        onCancel=${closeDialog}
+        onConfirm=${() => { setDialog(null); load().catch(() => {}) }}>
+        <div class="fr-dialog-line">当前有 ${dirtyFields.length} 个字段尚未保存，重新加载会丢弃这些修改。</div>
+      <//>`
+    }
+    return null
+  }
+
+  const revision = data && Number.isSafeInteger(data.revision) ? data.revision : 0
+  const applied = data && data.applied && typeof data.applied === 'object' ? data.applied : null
+  const appliedRev = applied && Number.isSafeInteger(applied.revision) ? applied.revision : null
+  const appliedAt = applied && applied.appliedAt ? fmtIsoStamp(applied.appliedAt) : ''
+  const pendingNext = appliedRev !== null && revision > appliedRev
+  const corrupt = !!(data && data.source === 'corrupt')
+  const auditBroken = !!(data && data.auditChain && data.auditChain.ok === false)
+  const sourceBadge = !data
+    ? null
+    : data.source === 'corrupt'
+      ? html`<${Badge} tone="bad">覆盖文件损坏（降级）<//>`
+      : data.source === 'override'
+        ? html`<${Badge} tone="ok">覆盖文件 r${revision}<//>`
+        : html`<${Badge} tone="warn">代码默认<//>`
+
+  return html`<div class="panel">
+    <${PanelHead} title="过滤规则" sub="覆盖文件编辑 · 保存后在下一轮生效，当前轮不换规则" />
+    ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${notice && html`<${Hint}>${notice.text}<//>`}
+    ${loading && !data && html`<div class="empty">加载中…</div>`}
+    ${!loading && !data && html`<div class="empty">暂无可显示的规则（上方为错误详情）</div>`}
+    ${data && html`<div>
+      <div class="fr-status">
+        <span class="fr-status-item"><span class="fr-status-k">来源</span>${sourceBadge}</span>
+        <span class="fr-status-item"><span class="fr-status-k">已生效</span>${appliedRev === null
+          ? html`<span class="fr-status-muted">尚未生效</span>`
+          : html`<span class="fr-status-v">r${appliedRev}${appliedAt ? ` · ${appliedAt}` : ''}</span>`}</span>
+        ${pendingNext && html`<span class="fr-status-item"><${Badge} tone="warn">r${revision} 待下一轮<//></span>`}
+        ${dirtyFields.length > 0 && html`<span class="fr-status-item"><${Badge} tone="warn">有未保存修改<//></span>`}
+        ${loading && html`<span class="fr-status-muted">刷新中…</span>`}
+      </div>
+
+      ${(corrupt || auditBroken) && html`<div class="alert-banner" role="alert">
+        <span class="alert-dot" aria-hidden="true"></span>
+        <div class="alert-main">
+          <strong>${corrupt ? '过滤规则覆盖文件损坏，运行侧已降级' : '过滤规则审计链断链'}</strong>
+          <span class="alert-sub">${corrupt
+            ? `运行侧优先使用进程内 last-known-good，首次加载即损坏才回退代码默认（不清 _f、不推进过滤 hash）。${data.error && data.error.message ? `原因：${data.error.message}` : ''}`
+            : `审计链在${data.auditChain.brokenAt === null || data.auditChain.brokenAt === undefined ? '未知位置' : `第 ${data.auditChain.brokenAt} 条`}断开，可能存在静默删除/篡改（只保证可检测，不声称防 root）。`}
+            <br />本轮不换规则、下一轮生效：这里保存的修改从下一轮开始生效，正在跑的一轮继续用已生效规则。</span>
+        </div>
+      </div>`}
+
+      ${data.source === 'default' && html`<div class="fr-firstrun">
+        <div class="fr-firstrun-title">当前使用代码默认</div>
+        <div class="fr-firstrun-text">还没有覆盖文件。保存任意修改会自动创建；也可以先把当前代码默认整份复制成第一版，之后的修改都写覆盖文件（不自动写，避免不知情地产生第一版）。</div>
+        <${Button} variant="primary" disabled=${!!busy || loading} onClick=${copyDefaults}>把当前规则复制到覆盖文件<//>
+      </div>`}
+
+      <div class="fr-form" role="group" aria-label="过滤规则表单">
+        ${FILTER_GROUPS.map((g) => html`<fieldset class="fr-group" key=${g.key}>
+          <legend class="fr-group-title">${g.title}</legend>
+          <div class="fr-group-note">${g.note}</div>
+          ${g.fields.map((f) => html`<${FilterField} key=${f.name} def=${f}
+            value=${draft ? draft[f.name] : ''} saved=${base ? base[f.name] : ''}
+            error=${fieldErrors[f.name] || ''} onChange=${setFieldValue} />`)}
+        </fieldset>`)}
+      </div>
+
+      <div class="fr-readonly">
+        <div class="fr-field-head">
+          <span class="fr-label">只看它关键词（v1 不开放写入）</span>
+          <code class="fr-key">zkt_gjc</code>
+        </div>
+        <div class="fr-readonly-val">${data.keyword && data.keyword.zkt_gjc ? String(data.keyword.zkt_gjc) : '（未设置）'}</div>
+        <div class="fr-field-hint">值来自代码配置 Config.keyword.zkt_gjc；v1 只读，不接受写入。修改需改代码并重启。</div>
+      </div>
+
+      ${preview && html`<div class="fr-preview" aria-live="polite">
+        <div class="fr-preview-head">补推影响预览</div>
+        <div class="fr-preview-main">${reEvalText(preview)}</div>
+        <div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（达 5000 上限，实际可能更多）' : ''} · 缓存读取 ${preview.cacheStatus || '—'}</div>
+        ${Array.isArray(preview.samples) && preview.samples.length > 0 && html`<ul class="fr-samples">
+          ${preview.samples.map((s, i) => html`<li key=${s && s.id !== null && s.id !== undefined ? String(s.id) : `sample-${i}`}>
+            <span class="fr-sample-title">${s && s.title ? s.title : '（无标题）'}</span>
+            ${s && s.id !== null && s.id !== undefined && html`<span class="fr-sample-id">${String(s.id)}</span>`}
+          </li>`)}
+        </ul>`}
+        <div class="fr-field-hint">预览只在内存试算，不落盘、不推进过滤 hash、不触发推送。</div>
+      </div>`}
+
+      <div class="fr-actions">
+        <${Button} variant="primary" disabled=${dirtyFields.length === 0 || !!busy || loading} onClick=${beginSave}>
+          ${busy === 'validate' ? '校验中…' : busy === 'preview' ? '预览补推中…' : '校验并保存'}<//>
+        <${Button} disabled=${!!busy || loading} onClick=${runPreview}>预览最近记录<//>
+        <${Button} disabled=${!!busy || loading} onClick=${askReload}>重新加载<//>
+        <span class="fr-actions-note">${dirtyFields.length > 0
+          ? `${dirtyFields.length} 个字段有未保存修改${draftWide.length > 0 ? `（含 ${draftWide.length} 个 .* 全命中）` : ''}`
+          : '没有未保存修改'}</span>
+      </div>
+
+      <div class="fr-restore">
+        <div class="fr-restore-head">回滚 / 恢复默认</div>
+        <div class="fr-restore-row">
+          <label class="fr-label" for="filter-restore-to">回滚目标</label>
+          <select id="filter-restore-to" class="fr-select" value=${restoreTo} disabled=${!!busy || loading}
+            onChange=${(e) => setRestoreTo(e.target.value)}>
+            <option value="default">恢复代码默认（删除覆盖文件）</option>
+            ${backups.map((r) => html`<option key=${r} value=${String(r)}>备份 r${r}</option>`)}
+          </select>
+          <${Button} variant="danger" disabled=${!!busy || loading} onClick=${() => setDialog({ kind: 'restore', to: restoreTo })}>回滚<//>
+        </div>
+        <div class="fr-field-hint">${backups.length > 0
+          ? `可用备份：${backups.map((r) => `r${r}`).join('、')}（保存前备份上一版，最多保留 3 代）`
+          : (backupListKnown ? '没有可用备份（每次保存前会备份上一版，最多保留 3 代）' : '文件清单不可读，按最近 3 代候选列出；缺失的备份会在回滚时提示 404')}。回滚写入新 revision（历史不回退），同样下一轮生效。</div>
+      </div>
+    </div>`}
+    ${dialogNode()}
+  </div>`
+}
+
 function App () {
   const [state, setState] = useState(null)
   const [runs, setRuns] = useState([])
@@ -2102,7 +2779,11 @@ function App () {
   const [panelSync, setPanelSync] = useState(null)
   const [syncErr, setSyncErr] = useState('')
   // 标签页写 hash（v3.307）：刷新/后退不丢当前页；初始值从 hash 读，非法值回概览。
-  const [tab, setTab] = useState(() => tabFromHash(window.location.hash))
+  // v3.310「过滤规则」新增为第六个页签。pure.mjs 的 tabFromHash 只认 v3.307 的五个键
+  // （该模块本批不改），这里补一层本文件内的白名单，保持 hash 路由对新页签同样生效
+  // （刷新/后退不丢当前页；非法值仍回概览）。
+  const resolveTab = (hash) => (/^#\/filter$/.test(typeof hash === 'string' ? hash : '') ? 'filter' : tabFromHash(hash))
+  const [tab, setTab] = useState(() => resolveTab(window.location.hash))
   // 跳日志请求：{q, mode, n}。n 只用来做 key，重复点同一行也能强制重挂载。
   const [logJump, setLogJump] = useState(null)
   // 自动刷新开关（v3.307）：默认开；暂停后顶部倒计时停住，手动「继续」恢复。
@@ -2258,7 +2939,7 @@ function App () {
 
   // hash 路由（v3.307）：首次进入补 #/overview；前进/后退跟着切页。
   useEffect(() => {
-    const onHash = () => { setTab(tabFromHash(window.location.hash)) }
+    const onHash = () => { setTab(resolveTab(window.location.hash)) }
     if (!window.location.hash) window.history.replaceState(null, '', '#/overview')
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
@@ -2318,6 +2999,7 @@ function App () {
     { key: 'messages', label: '推送记录' },
     { key: 'logs', label: '运行日志' },
     { key: 'config', label: '配置' },
+    { key: 'filter', label: '过滤规则' },
     { key: 'sys', label: '系统' }
   ]
   // 切页回到顶部（v3.306）：手机从概览滚到底部再点「推送记录」，此前会停在
@@ -2387,6 +3069,7 @@ function App () {
         initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} onSync=${setPanelSync} />
     </div>`}
     ${!authExpired && tab === 'config' && html`<${ConfigPanel} onSync=${setPanelSync} />`}
+    ${!authExpired && tab === 'filter' && html`<${FilterRulesPanel} onSync=${setPanelSync} />`}
     ${!authExpired && tab === 'sys' && html`<div>
       <${SysPanel} />
       <${FilesPanel} />

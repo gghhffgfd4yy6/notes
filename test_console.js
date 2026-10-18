@@ -742,7 +742,395 @@ const streamAppend = (record, text) => { record.output += text; record.outputTot
 
 const TOKEN = 'x'.repeat(32)
 
+// ── 过滤规则控制面（scripts/console.js 的 5 个端点）────────────────────────
+// 全部用 mkdtemp 隔离缓存目录；写端点只认 Authorization 头，读面沿用全局鉴权。
+function filterPaths (dir) { return require('./xbk_filter_store').filterRulesPaths(dir) }
+function postFilterJson (port, urlPath, obj, { token = TOKEN, headers = {}, raw } = {}) {
+  return request(port, 'POST', urlPath, {
+    token,
+    body: raw === undefined ? JSON.stringify(obj) : raw,
+    headers: { 'content-type': 'application/json', ...headers }
+  })
+}
+async function filterServer (dir) {
+  const { server } = createConsole({ token: TOKEN, stateDir: dir })
+  const port = await listen(server)
+  return { server, port }
+}
+
+async function filterRuleApiTests () {
+  await aok('过滤规则 GET: 代码默认/覆盖/损坏三态 + Cookie 读面与 applied/auditChain', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    try {
+      const defRes = await request(port, 'GET', '/api/config/filter', { headers: { cookie: `xbk_session=${TOKEN}` } })
+      assert.strictEqual(defRes.status, 200, 'GET 读面允许会话 Cookie')
+      const def = JSON.parse(defRes.text)
+      assert.strictEqual(def.schema, 1)
+      assert.strictEqual(def.source, 'default')
+      assert.strictEqual(def.revision, 0)
+      assert.strictEqual(def.filter.pingbitime, '5', 'default 时 filter 必须是 Config.filter 代码默认值')
+      assert.deepStrictEqual(def.keyword, { zkt_gjc: '', writable: false })
+      assert.strictEqual(def.applied, null)
+      assert.deepStrictEqual(def.auditChain, { ok: true, entries: 0, brokenAt: null })
+
+      const paths = filterPaths(dir)
+      fs.writeFileSync(paths.file, JSON.stringify({ schema: 1, revision: 4, filter: { pingbibiaoti: '覆盖词' } }))
+      fs.writeFileSync(paths.applied, JSON.stringify({ schema: 1, revision: 3, source: 'override', hash: 'h', appliedAt: '2026-10-18T00:00:00.000Z', filter: {}, keyword: {} }))
+      const over = JSON.parse((await request(port, 'GET', '/api/config/filter?token=' + TOKEN)).text)
+      assert.strictEqual(over.source, 'override')
+      assert.strictEqual(over.revision, 4)
+      assert.strictEqual(over.filter.pingbibiaoti, '覆盖词')
+      assert.strictEqual(over.applied.revision, 3, 'applied 快照读回')
+      assert.strictEqual(over.applied.hash, 'h')
+      assert.strictEqual(over.applied.source, 'override')
+
+      fs.writeFileSync(paths.file, '{broken-json')
+      const corrupt = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.strictEqual(corrupt.source, 'corrupt')
+      assert.strictEqual(corrupt.revision, 0, '损坏时 revision 强制 0')
+      assert.strictEqual(corrupt.error.code, 'store_corrupt')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则写鉴权: 无 Bearer 401 / 仅 Cookie 401 cookie_not_allowed / ?token= 400（即使带 Bearer）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const payload = { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '鉴权词' } }
+    try {
+      const anon = await postFilterJson(port, '/api/config/filter', payload, { token: null })
+      assert.strictEqual(anon.status, 401)
+      assert.strictEqual(JSON.parse(anon.text).code, 'unauthorized')
+
+      const cookieOnly = await request(port, 'POST', '/api/config/filter', {
+        body: JSON.stringify(payload),
+        headers: { 'content-type': 'application/json', cookie: `xbk_session=${TOKEN}` }
+      })
+      assert.strictEqual(cookieOnly.status, 401)
+      assert.strictEqual(JSON.parse(cookieOnly.text).code, 'cookie_not_allowed', '写端点只认 Bearer')
+
+      const viaQuery = await request(port, 'POST', '/api/config/filter?token=' + encodeURIComponent(TOKEN), {
+        body: JSON.stringify(payload),
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` }
+      })
+      assert.strictEqual(viaQuery.status, 400)
+      assert.strictEqual(JSON.parse(viaQuery.text).code, 'query_token_not_allowed', 'URL token 一律拒绝，即便同时带合法 Bearer')
+
+      assert.strictEqual(fs.existsSync(filterPaths(dir).file), false, '鉴权失败不得落盘')
+
+      const okRes = await postFilterJson(port, '/api/config/filter', payload)
+      assert.strictEqual(okRes.status, 200, '合法 Bearer 可写')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则写端点: 415（text/plain、Content-Encoding:gzip）与 413（>64KiB）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    try {
+      const plain = await request(port, 'POST', '/api/config/filter', {
+        token: TOKEN,
+        body: JSON.stringify({ filter: {} }),
+        headers: { 'content-type': 'text/plain' }
+      })
+      assert.strictEqual(plain.status, 415)
+      assert.strictEqual(JSON.parse(plain.text).code, 'unsupported_media_type')
+
+      const gz = await request(port, 'POST', '/api/config/filter', {
+        token: TOKEN,
+        body: '{}',
+        headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' }
+      })
+      assert.strictEqual(gz.status, 415, '压缩体不解析')
+
+      const big = JSON.stringify({ schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'a'.repeat(70 * 1024) } })
+      const tooBig = await postFilterJson(port, '/api/config/filter', null, { raw: big })
+      assert.strictEqual(tooBig.status, 413)
+      assert.strictEqual(JSON.parse(tooBig.text).code, 'body_too_large')
+      assert.strictEqual(fs.existsSync(filterPaths(dir).file), false)
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则 POST: 非法规则 400 且不落盘；合法保存 0600 + revision+1 + changedFields', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      const bad = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '(' } })
+      assert.strictEqual(bad.status, 400)
+      const badBody = JSON.parse(bad.text)
+      assert.strictEqual(badBody.code, 'validation_failed')
+      assert.ok(Array.isArray(badBody.errors) && badBody.errors.length > 0, '必须带 errors 数组')
+      assert.strictEqual(fs.existsSync(paths.file), false, '非法规则绝不落盘')
+
+      const unknown = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { nope: 'x' } })
+      assert.strictEqual(unknown.status, 400, '未知字段拒绝')
+      assert.strictEqual(JSON.parse(unknown.text).errors[0].code, 'unknown_field')
+
+      const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '屏蔽词' } })
+      assert.strictEqual(saved.status, 200)
+      const body = JSON.parse(saved.text)
+      assert.strictEqual(body.ok, true)
+      assert.strictEqual(body.revision, 1)
+      assert.deepStrictEqual(body.changedFields, ['pingbibiaoti'])
+      assert.ok(typeof body.hash === 'string' && body.hash.length > 0, '必须返回规则摘要 hash')
+      assert.strictEqual(body.appliedHint, '下一轮生效')
+      assert.strictEqual(fs.statSync(paths.file).mode & 0o777, 0o600, '覆盖文件必须 0600')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '保存后锁必须释放')
+      const read = readSafeTextResult(paths.file, 64 * 1024)
+      assert.strictEqual(read.status, 'ok')
+      const disk = JSON.parse(read.text)
+      assert.strictEqual(disk.schema, 1)
+      assert.strictEqual(disk.revision, 1)
+      assert.deepStrictEqual(disk.filter, { pingbibiaoti: '屏蔽词' })
+
+      // 预检端点（不取锁、不落盘）
+      const validated = await postFilterJson(port, '/api/config/filter/validate', { filter: { pingbibiaoti: 'ok' } })
+      assert.strictEqual(validated.status, 200)
+      assert.deepStrictEqual(JSON.parse(validated.text), { ok: true, warnings: [], wideMatch: [] })
+
+      // `.*` 全命中需二次确认
+      const wide = await postFilterJson(port, '/api/config/filter/validate', { filter: { pingbibiaoti: '.*' } })
+      assert.strictEqual(wide.status, 400)
+      assert.strictEqual(JSON.parse(wide.text).errors[0].code, 'wide_match_confirm_required')
+      const wideOk = await postFilterJson(port, '/api/config/filter/validate', { filter: { pingbibiaoti: '.*' }, confirmWideMatch: true })
+      assert.strictEqual(wideOk.status, 200)
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则 POST: 409 revision_mismatch 带当前 revision；409 锁占用带 Retry-After 且不覆盖文件', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      const stale = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 99, filter: { pingbibiaoti: 'v2' } })
+      assert.strictEqual(stale.status, 409)
+      const staleBody = JSON.parse(stale.text)
+      assert.strictEqual(staleBody.code, 'revision_mismatch')
+      assert.strictEqual(staleBody.revision, 1, '必须回当前 revision')
+
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      fs.writeFileSync(paths.lock, JSON.stringify({ pid: process.pid, startedAt: Date.now() }), { mode: 0o600 })
+      const busy = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })
+      assert.strictEqual(busy.status, 409)
+      assert.strictEqual(JSON.parse(busy.text).code, 'write_busy')
+      assert.strictEqual(busy.headers['retry-after'], '1')
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '锁占用时不得写文件')
+      assert.strictEqual(fs.existsSync(paths.lock), true, '失败路径不得删别人的锁')
+    } finally {
+      try { fs.unlinkSync(paths.lock) } catch (e) { /* 已清理 */ }
+      server.close()
+    }
+  })
+
+  await aok('过滤规则 POST: 损坏文件 409 store_corrupt；confirmReplaceCorrupt 后可按 revision 0 覆盖', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      fs.writeFileSync(paths.file, 'not-json{{')
+      const refused = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } })
+      assert.strictEqual(refused.status, 409)
+      assert.strictEqual(JSON.parse(refused.text).code, 'store_corrupt')
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, 'not-json{{', '未确认时不得覆盖')
+
+      const replaced = await postFilterJson(port, '/api/config/filter', {
+        schema: 1,
+        baseRevision: 0,
+        confirmReplaceCorrupt: true,
+        filter: { pingbibiaoti: 'x' }
+      })
+      assert.strictEqual(replaced.status, 200)
+      assert.strictEqual(JSON.parse(replaced.text).revision, 1)
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.file, 64 * 1024).text).filter.pingbibiaoti, 'x')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则 restore: 备份（保留 3 代 0600）+ 回滚 revision+1 + 恢复默认删文件 + confirm/404', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'A' } })).status, 200)
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'B' } })).status, 200)
+      assert.strictEqual(fs.existsSync(paths.backupFor(1)), true, '保存前必须备份上一版')
+      assert.strictEqual(fs.statSync(paths.backupFor(1)).mode & 0o777, 0o600)
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.backupFor(1), 64 * 1024).text).filter.pingbibiaoti, 'A')
+
+      const noConfirm = await postFilterJson(port, '/api/config/filter/restore', { to: 1 })
+      assert.strictEqual(noConfirm.status, 400)
+      assert.strictEqual(JSON.parse(noConfirm.text).errors[0].code, 'confirm_required')
+
+      const missing = await postFilterJson(port, '/api/config/filter/restore', { to: 999, confirm: true })
+      assert.strictEqual(missing.status, 404)
+      assert.strictEqual(JSON.parse(missing.text).code, 'backup_not_found')
+
+      const restored = await postFilterJson(port, '/api/config/filter/restore', { to: 1, confirm: true })
+      assert.strictEqual(restored.status, 200)
+      const restoredBody = JSON.parse(restored.text)
+      assert.strictEqual(restoredBody.restoredFrom, 1)
+      assert.strictEqual(restoredBody.revision, 3, '回滚必须 revision+1（线性历史）')
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.file, 64 * 1024).text).filter.pingbibiaoti, 'A')
+
+      const reset = await postFilterJson(port, '/api/config/filter/restore', { to: 'default', confirm: true })
+      assert.strictEqual(reset.status, 200)
+      assert.strictEqual(JSON.parse(reset.text).restoredFrom, 'default')
+      assert.strictEqual(JSON.parse(reset.text).revision, 4)
+      assert.strictEqual(fs.existsSync(paths.file), false, '恢复默认 = 删除覆盖文件')
+
+      const back = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.strictEqual(back.source, 'default')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 备份只留最近 3 代；>10s 陈旧锁可接管', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      for (let rev = 1; rev <= 4; rev++) {
+        const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: rev - 1, filter: { pingbibiaoti: `v${rev}` } })
+        assert.strictEqual(saved.status, 200, `第 ${rev} 次保存应成功`)
+      }
+      const baks = fs.readdirSync(dir).filter((n) => n.startsWith('filter-rules.bak.') && n.endsWith('.json')).sort()
+      assert.deepStrictEqual(baks, ['filter-rules.bak.1.json', 'filter-rules.bak.2.json', 'filter-rules.bak.3.json'], '只保留最近 3 代')
+
+      // 陈旧锁（mtime 11s 前）：保存应接管并成功（不是 409）。
+      fs.writeFileSync(paths.lock, '{}')
+      const old = new Date(Date.now() - 11000)
+      fs.utimesSync(paths.lock, old, old)
+      const takeover = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 4, filter: { pingbibiaoti: 'v5' } })
+      assert.strictEqual(takeover.status, 200, '陈旧锁应被接管')
+      assert.strictEqual(JSON.parse(takeover.text).revision, 5)
+      assert.strictEqual(fs.existsSync(paths.lock), false, '接管后保存结束必须释放自己的锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则审计: 0600 / 不含规则正文与路径 / prevHash 链可复算 / 手改一行后 GET 报断链', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '审计敏感词' } })).status, 200)
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: '第二版' } })).status, 200)
+      assert.strictEqual(fs.statSync(paths.audit).mode & 0o777, 0o600)
+      const raw = readSafeTextResult(paths.audit, 1024 * 1024).text
+      assert.ok(!raw.includes('审计敏感词'), '审计不得写规则正文')
+      assert.ok(!raw.includes(dir), '审计不得写绝对路径')
+      const lines = raw.trim().split('\n')
+      assert.strictEqual(lines.length, 2)
+      const first = JSON.parse(lines[0])
+      assert.deepStrictEqual(Object.keys(first).sort(), ['action', 'actor', 'changedFields', 'entryHash', 'prevHash', 'revision', 'ts'])
+      assert.strictEqual(first.action, 'save')
+      assert.strictEqual(first.revision, 1)
+      assert.deepStrictEqual(first.changedFields, ['pingbibiaoti'])
+      assert.strictEqual(first.actor.length, 8, 'actor = sha256(token) 前 8 位')
+      assert.strictEqual(first.prevHash, '0'.repeat(64))
+      assert.strictEqual(first.entryHash.length, 64)
+      const second = JSON.parse(lines[1])
+      assert.strictEqual(second.prevHash, first.entryHash, 'prevHash 必须接上一行 entryHash')
+
+      const before = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.strictEqual(before.auditChain.ok, true)
+      assert.strictEqual(before.auditChain.entries, 2)
+
+      const tampered = lines.slice()
+      const edited = JSON.parse(tampered[0])
+      edited.revision = 99
+      tampered[0] = JSON.stringify(edited)
+      fs.writeFileSync(paths.audit, tampered.join('\n') + '\n')
+      const after = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.strictEqual(after.auditChain.ok, false, '篡改必须可检测')
+      assert.strictEqual(after.auditChain.brokenAt, 1, '断链行号从 1 开始')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则 preview: _f 补推统计（不用 readMessages）+ limit 钳制 + capped(>5000)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const pushPath = path.join(dir, 'push.json')
+    const nowS = Math.floor(Date.now() / 1000)
+    try {
+      fs.writeFileSync(pushPath, JSON.stringify([
+        { id: '1', title: 'blocked one', content: '', catename: '', shijianchuo: nowS, _f: true },
+        { id: '2', title: 'blocked two', content: '', catename: '', shijianchuo: nowS, _f: true },
+        { id: '3', title: 'free', content: '', catename: '', shijianchuo: nowS, _f: true },
+        { id: '4', title: 'already pushed', content: '', catename: '', shijianchuo: nowS }
+      ]))
+      const res = await postFilterJson(port, '/api/config/filter/preview', { filter: { pingbibiaoti: 'blocked' }, limit: 10 })
+      assert.strictEqual(res.status, 200)
+      const body = JSON.parse(res.text)
+      assert.strictEqual(body.scanned, 3, '只扫 _f===true 记录')
+      assert.strictEqual(body.reEvalCount, 1, 'blocked 的仍被挡，free 会补推')
+      assert.strictEqual(body.capped, false)
+      assert.strictEqual(body.samples.length, 1)
+      assert.strictEqual(body.samples[0].id, '3')
+      assert.deepStrictEqual(Object.keys(body.samples[0]).sort(), ['id', 'reason', 'title'], '样例只含 id/title/reason')
+
+      const wide = await postFilterJson(port, '/api/config/filter/preview', { filter: { pingbibiaoti: '.*' } })
+      assert.strictEqual(wide.status, 400)
+      assert.strictEqual(JSON.parse(wide.text).errors[0].code, 'wide_match_confirm_required')
+      const wideOk = await postFilterJson(port, '/api/config/filter/preview', { filter: {}, confirmWideMatch: true, limit: 100 })
+      assert.strictEqual(wideOk.status, 200)
+      assert.strictEqual(JSON.parse(wideOk.text).limit, 20, 'limit 钳到 [1,20]')
+      assert.strictEqual(JSON.parse(wideOk.text).reEvalCount, 3)
+
+      const many = []
+      for (let i = 0; i < 5001; i++) many.push({ id: String(i), title: 't', content: '', catename: '', shijianchuo: nowS, _f: true })
+      fs.writeFileSync(pushPath, JSON.stringify(many))
+      const capped = await postFilterJson(port, '/api/config/filter/preview', { filter: {} })
+      assert.strictEqual(capped.status, 200)
+      const cappedBody = JSON.parse(capped.text)
+      assert.strictEqual(cappedBody.capped, true, '总条数 >5000 必须 capped')
+      assert.strictEqual(cappedBody.scanned, 5000, '最多扫 5000 条 _f')
+      assert.strictEqual(cappedBody.reEvalCount, 5000)
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则 POST: re2 不可用 → 503 engine_unavailable 且不落盘', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const { setFilterDepsForTests } = require('./scripts/console')
+    try {
+      setFilterDepsForTests({
+        RuleEngine: { hasNestedQuantifier: () => false, compileRules: () => null },
+        compileUserRegex: () => null,
+        re2Available: false,
+        isRe2Available: () => false
+      })
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } })
+      assert.strictEqual(res.status, 503)
+      assert.strictEqual(JSON.parse(res.text).code, 'engine_unavailable')
+      assert.strictEqual(fs.existsSync(filterPaths(dir).file), false, 're2 不可用不得落盘')
+    } finally {
+      setFilterDepsForTests(null)
+      server.close()
+    }
+  })
+  await aok('过滤规则 POST: 写盘失败（目标是目录）→ 500 write_failed 且锁释放', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      fs.mkdirSync(paths.file) // 覆盖"文件"是目录：writeAtomic 拒绝写入
+      const res = await postFilterJson(port, '/api/config/filter', {
+        schema: 1,
+        baseRevision: 0,
+        confirmReplaceCorrupt: true,
+        filter: { pingbibiaoti: 'x' }
+      })
+      assert.strictEqual(res.status, 500)
+      assert.strictEqual(JSON.parse(res.text).code, 'write_failed')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径同样必须释放锁')
+    } finally {
+      try { fs.rmdirSync(paths.file) } catch (e) { /* 已清理 */ }
+      server.close()
+    }
+  })
+}
+
 async function main () {
+  await filterRuleApiTests()
   await aok('HTTP: 无 token / 错 token → 401', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
