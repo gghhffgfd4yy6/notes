@@ -9,7 +9,7 @@
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
-import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, filterRunItems, tabFromHash } from './pure.mjs'
+import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, filterRunItems, tabFromHash, effectiveFilterRows } from './pure.mjs'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -2080,22 +2080,26 @@ function FilesPanel () {
 // 过滤规则：按「一行一条」渲染，空规则默认折叠。
 // 旧版把 11 条键值对拼成一行（k=v · k=v…），手机端只能从单词中间硬断，挤成一团；
 // 规则再多页面会成一条无限长的“毛线”。这里每条独立成行，空值默认隐藏。
-function FilterRules ({ entries }) {
+// v3.312：rows 来自 effectiveFilterRows（覆盖文件 > 代码配置），被覆盖字段带「覆盖」徽章——
+// 配置页原先只读 Config.filter，保存覆盖文件后两页对不上（「已保存」但配置页全空）。
+function FilterRules ({ rows, sub }) {
   const [showEmpty, setShowEmpty] = useState(false)
+  const list = Array.isArray(rows) ? rows : []
   const isEmpty = (v) => v === undefined || v === null || String(v).length === 0
-  const emptyCount = entries.filter(([, v]) => isEmpty(v)).length
-  const shown = showEmpty ? entries : entries.filter(([, v]) => !isEmpty(v))
+  const emptyCount = list.filter((row) => isEmpty(row.value)).length
+  const shown = showEmpty ? list : list.filter((row) => !isEmpty(row.value))
   return html`<div class="cfg-block">
     <div class="cfg-block-head">
       <span class="cfg-block-title">过滤规则</span>
-      <span class="cfg-block-sub">${entries.length} 项${emptyCount > 0 ? ` · ${emptyCount} 项为空` : ''}</span>
+      <span class="cfg-block-sub">${sub || `${list.length} 项${emptyCount > 0 ? ` · ${emptyCount} 项为空` : ''}`}</span>
     </div>
     ${shown.length === 0
       ? html`<div class="empty">暂无已设置的过滤规则${emptyCount > 0 ? `（${emptyCount} 项为空）` : ''}</div>`
       : html`<div class="rule-list">
-        ${shown.map(([k, v]) => html`<div class="rule-row" key=${k}>
-          <code class="rule-key">${k}</code>
-          <span class=${'rule-val' + (isEmpty(v) ? ' rule-empty' : '')}>${isEmpty(v) ? '（空）' : String(v)}</span>
+        ${shown.map((row) => html`<div class="rule-row" key=${row.key}>
+          <code class="rule-key">${row.key}</code>
+          <span class=${'rule-val' + (isEmpty(row.value) ? ' rule-empty' : '')}>${isEmpty(row.value) ? '（空）' : String(row.value)}</span>
+          ${row.overridden && html`<span class="rule-src" title="该字段由覆盖文件提供">覆盖</span>`}
         </div>`)}
       </div>`}
     ${emptyCount > 0 && html`<button type="button" class="cfg-toggle" aria-expanded=${showEmpty} onClick=${() => setShowEmpty(!showEmpty)}>
@@ -2133,15 +2137,37 @@ function ChannelList ({ pc }) {
 
 // 运行配置脱敏视图（v3.298）：推送密钥只显示「已配置/未配置」，值永不下发（服务端白名单
 // + 响应前保险丝双道防线）。进配置页加载 + 手动刷新。
+// v3.312：过滤规则块改为「实际生效值」——另拉 GET /api/config/filter（覆盖文件结果），
+// 与代码默认逐字段比对并给被覆盖字段打「覆盖」徽章。此前只读 Config.filter，保存覆盖文件后
+// 两页对不上（用户看到「已保存」但配置页仍然全空）。
+function filterSourceNote (effData, rows, overrideCount) {
+  if (!effData) return ''
+  if (effData.source === 'corrupt') return `${rows.length} 项 · 覆盖文件损坏，显示降级值`
+  if (effData.source === 'override') {
+    const rev = Number.isSafeInteger(effData.revision) ? effData.revision : 0
+    return `${rows.length} 项 · 生效 rev ${rev}（覆盖文件）${overrideCount > 0 ? ` · ${overrideCount} 项已覆盖` : ''}`
+  }
+  return `${rows.length} 项 · 来自代码默认（未建覆盖文件）`
+}
+
 function ConfigPanel ({ onSync }) {
   const { data, err, load } = usePanelLoader(apiGetConfig, onSync)
-  useEffect(() => { load().catch(() => {}) }, [load])
+  const { data: eff, err: effErr, load: loadEff } = usePanelLoader(apiGetFilter, onSync)
+  const refresh = useCallback(() => {
+    load().catch(() => {})
+    loadEff().catch(() => {})
+  }, [load, loadEff])
+  useEffect(() => { refresh() }, [refresh])
   const r = data && data.runtime ? data.runtime : null
   const pc = data && data.pushChannels ? data.pushChannels : null
-  const filterEntries = r && r.filter ? Object.entries(r.filter) : []
+  // 生效值口径与 FilterStore.mergeActiveFilter 一致：覆盖文件优先、缺字段回代码默认。
+  const effFilter = eff && eff.filter && typeof eff.filter === 'object' ? eff.filter : null
+  const filterRows = r ? effectiveFilterRows(r.filter, effFilter) : []
+  const overrideCount = filterRows.filter((row) => row.overridden).length
+  const filterSub = filterSourceNote(eff, filterRows, overrideCount)
   return html`<div class="panel">
     <${PanelHead} title="运行配置" sub="脱敏视图 · 推送密钥只显示是否已配置"
-      right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
+      right=${html`<${Button} variant="ghost" onClick=${refresh}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && !r && html`<div class="empty">运行配置不可读（模块加载失败——检查部署完整性）</div>`}
     ${r && html`<div class="sys-grid">
@@ -2167,7 +2193,10 @@ function ConfigPanel ({ onSync }) {
       <div class="tpl-row"><span>标题</span><code>${r.template.title}</code></div>
       <div class="tpl-row"><span>正文</span><code>${r.template.content}</code></div>
     </div>`}
-    ${r && filterEntries.length > 0 && html`<${FilterRules} entries=${filterEntries} />`}
+    ${r && filterRows.length > 0 && html`<${FilterRules} rows=${filterRows} sub=${filterSub} />`}
+    ${r && effErr && html`<${Hint} tone="error">过滤规则覆盖层读取失败：${effErr}（本块显示代码默认值）<//>`}
+    ${r && eff && eff.source === 'corrupt' && html`<${Hint} tone="error">覆盖文件损坏，当前按降级值运行${eff.error && eff.error.message ? `：${eff.error.message}` : ''}。请到「过滤规则」标签回滚或重新保存。<//>`}
+    ${r && html`<${Hint}>本块显示实际生效值：覆盖文件优先于代码默认，带「覆盖」标记的字段由覆盖文件提供。修改请到「过滤规则」标签。<//>`}
     ${r && html`<div class="cfg-block">
       <div class="cfg-block-head"><span class="cfg-block-title">关键词订阅</span></div>
       <div class="cfg-text">${r.keyword.zkt_gjc && String(r.keyword.zkt_gjc).length > 0 ? r.keyword.zkt_gjc : '（未设置）'}</div>

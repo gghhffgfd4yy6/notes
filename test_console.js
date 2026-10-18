@@ -1437,6 +1437,13 @@ async function filterRuleApiTests () {
     assert.ok(js.includes("kind: 'restore', to: restoreTo, baseRevision: revision"), '回滚弹窗必须带页面加载时的 revision')
     assert.ok(!js.includes('恢复代码默认（删除覆盖文件）'), '恢复默认不再删文件，选项文案必须同步')
     assert.ok(js.includes('写入空覆盖文件'), '回滚弹窗/选项必须说明恢复默认写空覆盖文件')
+    // v3.312：配置页的过滤规则块必须显示覆盖文件生效值（此前只读 Config.filter，
+    // 保存成功后配置页仍全空，用户以为没保存）。
+    assert.ok(js.includes('effectiveFilterRows'), '配置页过滤规则块必须合并覆盖文件生效值')
+    const tpl = (name) => '$' + '{' + name + '}' // 拼接出模板占位符，避免 no-template-curly-in-string
+    assert.ok(js.includes('rows=' + tpl('filterRows')), 'FilterRules 必须接生效值 rows，而不是代码默认 entries')
+    assert.ok(js.includes('class="rule-src"'), '被覆盖字段必须带「覆盖」徽章')
+    assert.ok(js.includes('生效 rev ' + tpl('rev') + '（覆盖文件）'), '配置页必须标明生效 revision 来自覆盖文件')
   })
 }
 
@@ -4059,6 +4066,26 @@ async function main () {
     assert.deepStrictEqual(filterRunItems(runs, { day: '2026-10-15' }).map((r) => r.at), ['2026-10-15 10:00:00', '2026-10-15 11:00:00'])
     assert.strictEqual(filterRunItems(runs, { mode: 'issue', day: '2026-10-14' }).length, 1, '筛选取交集')
     assert.strictEqual(filterRunItems(null, { mode: 'issue' }).length, 0)
+  })
+
+  await aok('行为: v3.312 配置页过滤规则显示生效值（覆盖文件优先）', async () => {
+    const { effectiveFilterRows } = await import('./scripts/console-assets/pure.mjs')
+    const base = { pingbitime: '5', pingbibiaoti: '', pingbineirong: '' }
+    const rows = effectiveFilterRows(base, { ...base, pingbibiaoti: '身体乳' })
+    assert.strictEqual(rows.length, 3)
+    const body = rows.find((r) => r.key === 'pingbibiaoti')
+    assert.strictEqual(body.value, '身体乳', '覆盖文件的值必须显示在配置页')
+    assert.strictEqual(body.overridden, true)
+    assert.strictEqual(rows.find((r) => r.key === 'pingbitime').overridden, false, '与代码默认相同不挂徽章')
+    assert.deepStrictEqual(effectiveFilterRows(base, null).map((r) => r.overridden), [false, false, false], '没有覆盖文件时不标覆盖')
+    const partial = effectiveFilterRows(base, { pingbibiaoti: '身体乳' })
+    assert.strictEqual(partial.find((r) => r.key === 'pingbitime').value, '5', '缺字段回代码默认')
+    assert.strictEqual(partial.find((r) => r.key === 'pingbitime').overridden, false, '缺字段不算覆盖')
+    const cleared = effectiveFilterRows({ pingbibiaoti: '旧词' }, { pingbibiaoti: '' })
+    assert.strictEqual(cleared[0].value, '')
+    assert.strictEqual(cleared[0].overridden, true, '显式清空也是一次覆盖')
+    assert.deepStrictEqual(effectiveFilterRows({ pingbitime: '5' }, { pingbibiaoti: 'A' }).map((r) => r.key), ['pingbitime', 'pingbibiaoti'], '覆盖文件多出的字段也要显示')
+    assert.deepStrictEqual(effectiveFilterRows(null, undefined), [], '非对象输入不抛错')
   })
 
   await aok('结构红线: v3.307 确认弹窗 / 今日统计 / 时间窗 / 日志级别 / hash 路由', () => {

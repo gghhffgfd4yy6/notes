@@ -6,6 +6,26 @@
 
 export const DAY_MS = 1000 * 60 * 60 * 24
 
+// 配置页「过滤规则」块的数据口径（v3.312）：显示**实际生效值**，而不是只读代码默认。
+// 背景：过滤规则页写的是覆盖文件 filter-rules.json，配置页原先只读 Config.filter ⇒
+// 保存成功后两页对不上（用户看到「已保存」，配置页仍全空）。
+// 口径与 FilterStore.mergeActiveFilter 一致：覆盖文件优先、缺字段回代码默认（不是置空）；
+// 只有「值真的不同」的字段才标 overridden，避免 11 个字段全挂徽章。
+export function effectiveFilterRows (configFilter, activeFilter) {
+  const isPlain = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v)
+  const base = isPlain(configFilter) ? configFilter : {}
+  const active = isPlain(activeFilter) ? activeFilter : null
+  const norm = (v) => (v === undefined || v === null ? '' : String(v))
+  const has = (k) => Boolean(active) && Object.prototype.hasOwnProperty.call(active, k)
+  const keys = Object.keys(base)
+  if (active) for (const k of Object.keys(active)) if (!keys.includes(k)) keys.push(k)
+  return keys.map((key) => ({
+    key,
+    value: norm(has(key) ? active[key] : base[key]),
+    overridden: has(key) && norm(active[key]) !== norm(base[key])
+  }))
+}
+
 // 「多久以前」：负数（时钟漂移/文件时间在未来）按 0 处理，显示「刚刚」。
 export function fmtAge (ms) {
   if (typeof ms !== 'number' || !Number.isFinite(ms)) return ''

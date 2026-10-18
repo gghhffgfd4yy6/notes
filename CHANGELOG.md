@@ -516,3 +516,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **审计边界与失败可见**：审计 4 MiB 上限按「当前大小 + 一行预留（1 KiB）」判定，避免最后一次 append 恰好越界后读取判假断链；审计路径为 symlink 时统一走 500 `audit_failed`（不因目标大小改报 507）；审计/回滚失败响应带 `rolledBack`/`rollbackMode`，有原文时不再用「删除」兜底（删除会把保存前规则变成代码默认）。
 - **FIFO 不再挂死**：审计链读取加 `openNonBlocking`、追加加 `O_NONBLOCK`，预置 FIFO 时立即失败而不是阻塞事件循环。
 - **门禁**：`test_console.js` 新增靶向用例（锁接管竞态、恢复默认 revision 连续、审计失败回滚 / symlink 拒绝 / 4 MiB 拒绝、备份失败、剪枝时机、坏缓存、`_f` capped、回滚 baseRevision）；`scripts/console.js` 增至 3625 行，变异矩阵末段同步为 `console-part6: 2816-3625`、`v3-entry` 到 1-544（边界 563/1126/1689/2252/2815 不变）。
+
+## v3.312 — 配置页过滤规则显示覆盖文件生效值
+
+- **问题**：在「过滤规则」标签保存后，配置页的「过滤规则」块仍然全空（只把 `pingbitime=5` 显示出来）。原因是配置页读 `GET /api/config` 的 `runtime.filter`（代码默认层），而保存写的是覆盖文件 `filter-rules.json`，两层没有在页面上合并——用户看到的是「保存成功但配置没变」。
+- **修复**：配置页另拉 `GET /api/config/filter`，用 `effectiveFilterRows()` 把覆盖文件与代码默认按字段合并（与 `FilterStore.mergeActiveFilter` 同口径：覆盖优先、缺字段回代码默认、显式 `""` 才是清空），被覆盖字段旁标注「覆盖」徽章；块标题显示来源与版本（`生效 rev N（覆盖文件）`），覆盖文件损坏时显示降级红条，读取失败时回退代码默认并提示。
+- **范围**：纯前端（`scripts/console-assets/app.js` / `pure.mjs` / `app.css`），服务端接口与运行侧行为未变；「过滤规则」标签仍是唯一写入面。
+- **门禁**：`test_console.js` 新增 `effectiveFilterRows` 单测（覆盖优先/缺字段回落/显式清空/多余字段/非对象输入）与配置页源码契约断言（必须接 `rows` 生效值、必须有「覆盖」徽章与 revision 来源）。
