@@ -845,6 +845,9 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
       // S9383：fetchOnce 内部已 try/catch 全收（不会 reject），但仍显式 .catch 兜底，
       // 不留 floating promise（与 console.js 里 readBody 的处理同口径）。
       fetchOnce().catch(() => { /* fetchOnce 不 reject，S9383 口径 */ })
+      // pollMs=0 表示自动刷新已暂停：只取一次快照，绝不能 setInterval(fn, 0)
+      // （暂停后打开已结束轮次的日志会变成热循环，持续打 /api/runs/detail）。
+      if (!(pollMs > 0)) return
       pollTimer = setInterval(() => { fetchOnce().catch(() => {}) }, pollMs)
     }
     if (!openActive) {
@@ -1171,15 +1174,17 @@ function TrendsPanel () {
     el.scrollLeft = el.scrollWidth
     // 最右停靠时最左列可能只露半截：把下一个完整列的左缘对齐到容器左缘，
     // 不够的滚动量用右 padding 补出来（只在自动停靠时做，用户手动滑动不干预）。
+    // 注意基准是滚动容器的左缘（面板有内边距，视口 x=0 不是容器左缘）。
+    const base = el.getBoundingClientRect().left
     const cols = [...trend.children]
     const partial = cols.find((c) => {
       const r = c.getBoundingClientRect()
-      return r.left < 0 && r.right > 0
+      return r.left < base && r.right > base
     })
     if (!partial) return
     const next = cols[cols.indexOf(partial) + 1]
     if (!next) return
-    const shift = next.getBoundingClientRect().left
+    const shift = next.getBoundingClientRect().left - base
     if (shift <= 0) return
     const max = el.scrollWidth - el.clientWidth
     const need = el.scrollLeft + shift - max
@@ -2062,6 +2067,9 @@ function App () {
   // 凭证失效（审查 #224）：任一 API 401 ⇒ 停轮询并显示自助恢复提示，不再每 5s 空打。
   const [authExpired, setAuthExpired] = useState(false)
   const [nextAt, setNextAt] = useState(0)
+  // 表单交互暂停轮询的截止时间（见下方 focusin/change/input 监听）。不能只看
+  // activeElement：用户选完下拉后焦点仍停在 select 上，会永久冻住自动刷新。
+  const formPauseUntilRef = useRef(0)
   const timerRef = useRef(null)
   const seqRef = useRef(0)
   // 轮询互斥（Sourcery G_oY）：上一轮未完成时跳过本轮 tick，不在途中叠加新请求
@@ -2130,6 +2138,31 @@ function App () {
     return () => window.removeEventListener('xbk-auth-expired', onAuth)
   }, [])
 
+  // 表单交互期间短暂暂停整页轮询：用户的焦点会一直停在下拉/输入框上，
+  // 只按 activeElement 判断会永久停轮；这里用截止时间兜底，最长 10s 后恢复。
+  // 选择器展开到选择完成通常 <10s；change/input 后 1.5s 再恢复，避免选完立刻重绘。
+  useEffect(() => {
+    const isForm = (el) => el && (el.tagName === 'SELECT' || el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')
+    const bump = (ms) => { formPauseUntilRef.current = Date.now() + ms }
+    const onFocus = (e) => { if (isForm(e.target)) bump(10000) }
+    // 部分安卓 WebView 的原生下拉在 focus 之前就展开；pointerdown 先兜一层。
+    const onPointerDown = (e) => { if (isForm(e.target)) bump(10000) }
+    const onDone = (e) => {
+      const tag = e.target && e.target.tagName
+      if (tag === 'SELECT') { if (e.type === 'change') bump(1500) } else if (tag === 'INPUT' || tag === 'TEXTAREA') bump(1500)
+    }
+    document.addEventListener('pointerdown', onPointerDown, true)
+    document.addEventListener('focusin', onFocus)
+    document.addEventListener('change', onDone)
+    document.addEventListener('input', onDone)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true)
+      document.removeEventListener('focusin', onFocus)
+      document.removeEventListener('change', onDone)
+      document.removeEventListener('input', onDone)
+    }
+  }, [])
+
   useEffect(() => {
     if (authExpired) return undefined
     refreshSplit()
@@ -2145,10 +2178,10 @@ function App () {
     const mark = () => setNextAt(Date.now() + interval)
     const tick = () => {
       if (document.visibilityState !== 'hidden') {
-        // 用户正在操作表单（下拉/输入框）时不整页重渲染：安卓原生 select 会被
-        // 重建导致展开的选项闪退。跳过本拍，下一次 tick 恢复。
-        const ae = document.activeElement
-        if (ae && (ae.tagName === 'SELECT' || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) { mark(); return }
+        // 用户正在操作表单（下拉/输入框）时跳过整拍：不 refresh、也不 mark
+        // （mark 会 setNextAt 触发 App 重渲染，安卓原生 select 仍可能被重建）。
+        // 截止时间到后自动恢复，不会因为焦点一直停在 select 上而永久停轮。
+        if (Date.now() < formPauseUntilRef.current) return
         refreshSplit()
         mark()
       }

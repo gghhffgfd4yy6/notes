@@ -3428,6 +3428,12 @@ async function main () {
     assert.ok(!/\.focus\(\)/.test(cateSeg), '分类弹层聚焦必须 preventScroll，禁止把页面滚回顶部')
     // 趋势图自动停靠最右时，最左列可能只露半截日期：须把下一个完整列对齐到容器左缘。
     assert.ok(src.includes('const partial'), '趋势图须对最左半截列做对齐')
+    assert.ok(src.includes('r.left < base && r.right > base'), '趋势对齐基准必须是滚动容器左缘，不是视口 x=0')
+    // 表单交互暂停轮询必须有截止时间；只看 activeElement 会在选完后永久停轮。
+    assert.ok(src.includes('formPauseUntilRef.current'), '表单交互暂停轮询必须有截止时间')
+    assert.ok(!src.includes('const ae = document.activeElement'), '不得用 activeElement 永久暂停轮询')
+    // 暂停自动刷新时 pollMs=0，详情轮询必须只取一次快照，不能 setInterval(fn, 0)。
+    assert.ok(src.includes('if (!(pollMs > 0)) return'), 'pollMs=0 时必须跳过 setInterval，避免热循环')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const cateCss = (css.match(/\.msg-cate\s*\{[^}]*\}/) || [''])[0]
     assert.ok(/max-width:\s*100%/.test(cateCss) && /overflow-wrap:\s*anywhere/.test(cateCss), '长分类 pill 必须能折行，不得撑破卡片')
