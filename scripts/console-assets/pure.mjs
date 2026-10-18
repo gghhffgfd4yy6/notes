@@ -23,14 +23,17 @@ export function effectiveFilterRows (configFilter, activeFilter) {
   return keys.map((key) => ({
     key,
     value: norm(has(key) ? active[key] : base[key]),
-    overridden: has(key)
+    overridden: has(key),
+    differs: has(key) && norm(active[key]) !== norm(base[key])
   }))
 }
 
 // 配置页过滤规则块的副标题（v3.312）。把「已保存」与「已生效」分开：
 // 覆盖文件可能在上一轮跑完之后才保存 ⇒ 页面显示保存的规则（下一轮生效），但不得
 // 把文件 revision 说成「已生效」——那会让用户以为本轮已经换规则。
-export function filterSourceNote (effData, rowCount, overrideCount) {
+// changedCount 只数「与代码默认不同」的字段（覆盖文件常把未改字段也一并钉住，
+// 把「文件里有这个键」当成「改过」会让 11 项全算覆盖，反而看不出真正改了什么）。
+export function filterSourceNote (effData, rowCount, changedCount) {
   if (!effData || !Number.isSafeInteger(rowCount)) return ''
   if (effData.source === 'corrupt') return `${rowCount} 项 · 覆盖文件损坏，显示降级值`
   if (effData.source !== 'override') return `${rowCount} 项 · 来自代码默认（未建覆盖文件）`
@@ -40,7 +43,7 @@ export function filterSourceNote (effData, rowCount, overrideCount) {
     const tail = appliedRev === null ? '尚未跑过' : `本轮仍用 rev ${appliedRev}`
     return `${rowCount} 项 · 已保存 rev ${rev}（下一轮生效，${tail}）`
   }
-  return `${rowCount} 项 · 生效 rev ${rev}（覆盖文件）${overrideCount > 0 ? ` · ${overrideCount} 项已覆盖` : ''}`
+  return `${rowCount} 项 · 生效 rev ${rev}（覆盖文件）${changedCount > 0 ? ` · ${changedCount} 项与默认不同` : ''}`
 }
 
 // 「多久以前」：负数（时钟漂移/文件时间在未来）按 0 处理，显示「刚刚」。

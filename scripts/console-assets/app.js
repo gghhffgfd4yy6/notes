@@ -2156,8 +2156,8 @@ function ConfigPanel ({ onSync }) {
   // 生效值口径与 FilterStore.mergeActiveFilter 一致：覆盖文件优先、缺字段回代码默认。
   const effFilter = effLive && effLive.filter && typeof effLive.filter === 'object' ? effLive.filter : null
   const filterRows = r ? effectiveFilterRows(r.filter, effFilter) : []
-  const overrideCount = filterRows.filter((row) => row.overridden).length
-  const filterSub = filterSourceNote(effLive, filterRows.length, overrideCount)
+  const changedCount = filterRows.filter((row) => row.differs).length
+  const filterSub = filterSourceNote(effLive, filterRows.length, changedCount)
   return html`<div class="panel">
     <${PanelHead} title="运行配置" sub="脱敏视图 · 推送密钥只显示是否已配置"
       right=${html`<${Button} variant="ghost" onClick=${refresh}>刷新<//>`} />

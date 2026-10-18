@@ -4083,6 +4083,8 @@ async function main () {
     assert.strictEqual(rows.find((r) => r.key === 'pingbitime').overridden, false, '文件里没有的字段回代码默认且不挂徽章')
     assert.strictEqual(rows.find((r) => r.key === 'pingbitime').value, '5', '缺字段回代码默认')
     assert.strictEqual(effectiveFilterRows({ pingbitime: '5' }, { pingbitime: '5' })[0].overridden, true, '文件显式写同值也算覆盖文件提供（钉住默认值）')
+    assert.strictEqual(effectiveFilterRows({ pingbitime: '5' }, { pingbitime: '5' })[0].differs, false, '同值不计入「与默认不同」')
+    assert.strictEqual(effectiveFilterRows({ pingbitime: '5' }, { pingbitime: '6' })[0].differs, true)
     assert.deepStrictEqual(effectiveFilterRows(base, null).map((r) => r.overridden), [false, false, false], '没有覆盖文件时不标覆盖')
     const cleared = effectiveFilterRows({ pingbibiaoti: '旧词' }, { pingbibiaoti: '' })
     assert.strictEqual(cleared[0].value, '')
@@ -4090,7 +4092,7 @@ async function main () {
     assert.deepStrictEqual(effectiveFilterRows({ pingbitime: '5' }, { pingbibiaoti: 'A' }).map((r) => r.key), ['pingbitime', 'pingbibiaoti'], '覆盖文件多出的字段也要显示')
     assert.deepStrictEqual(effectiveFilterRows(null, undefined), [], '非对象输入不抛错')
     // 副标题：已保存 ≠ 已生效（保存发生在上一轮之后时，本轮仍在用旧规则）
-    assert.ok(filterSourceNote({ source: 'override', revision: 2, applied: { revision: 2 } }, 11, 1).includes('生效 rev 2（覆盖文件）'))
+    assert.ok(filterSourceNote({ source: 'override', revision: 2, applied: { revision: 2 } }, 11, 1).includes('1 项与默认不同'), '数量只数真正不同的字段，不把「文件里有键」当改过')
     const pending = filterSourceNote({ source: 'override', revision: 3, applied: { revision: 2 } }, 11, 1)
     assert.ok(pending.includes('已保存 rev 3') && pending.includes('下一轮生效') && pending.includes('本轮仍用 rev 2'), '保存后未跑时必须明说下一轮生效')
     assert.ok(filterSourceNote({ source: 'override', revision: 3, applied: null }, 11, 0).includes('尚未跑过'))
