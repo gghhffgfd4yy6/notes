@@ -7,7 +7,7 @@
 // 请求头——不复述进 URL，避免出现在任何中间层访问日志/浏览器历史，Sourcery rwH）。
 // 动作面：POST /trigger（token 同样在 Bearer 头；body 只带 action）。
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
-import { html, render, useState, useEffect, useRef, useCallback } from './htm-preact.module.js'
+import { html, render, useState, useEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
 import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, filterRunItems, tabFromHash } from './pure.mjs'
 
@@ -1659,10 +1659,18 @@ function MessagesPanel () {
 // 运行日志：run.log 尾部（服务端 1MiB 上限），进页拉一次 + 手动刷新；有任务在跑时跟随轮询。
 // 异常口径与筛选在 pure.mjs（isIssueLogLine / filterLogLines），组件与测试共用。
 function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all' }) {
-  const { data, err, load } = usePanelLoader(apiGetLogs)
+  const { data, err, load: loadRaw } = usePanelLoader(apiGetLogs)
   const preRef = useRef(null)
   const stickRef = useRef(true)
   const prevTextRef = useRef('')
+  // 轮询互斥（审查 #231 前端项）：任务运行时每 2s 拉 1 MiB，上一请求未回时再叠一发
+  // 只会让服务端并发读盘、后到的响应还可能盖掉新结果。手动刷新同样走这把闸。
+  const busyRef = useRef(false)
+  const load = useCallback(async () => {
+    if (busyRef.current) return
+    busyRef.current = true
+    try { await loadRaw() } finally { busyRef.current = false }
+  }, [loadRaw])
   // 日志筛选（v3.307）：run.log 尾部最多 1 MiB，排障时先按级别收窄；纯客户端过滤，
   // 不发新请求。默认「异常」已排除控制台生命周期行（旧口径 123 条异常里 119 条是它）。
   const [mode, setMode] = useState(initialMode)
@@ -1686,11 +1694,13 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all' }) {
     }
   }, [load, pollMs])
   const rawText = data && data.status === 'ok' && typeof data.text === 'string' ? data.text : ''
-  const lines = filterLogLines(rawText, 'all', '')
-  const counts = logLineCounts(rawText)
+  // 1 MiB 文本的 split/lowercase 只在输入变化时做一次（审查 #248 可选：此前每次渲染
+  // 3 次全量 split + 2 次 lowercase，手机输入关键字会掉帧）。
+  const lines = useMemo(() => filterLogLines(rawText, 'all', ''), [rawText])
+  const counts = useMemo(() => logLineCounts(rawText), [rawText])
   const kw = q.trim().toLowerCase()
-  const filtered = filterLogLines(rawText, mode, q)
-  const shownText = filtered.join('\n')
+  const filtered = useMemo(() => filterLogLines(rawText, mode, q), [rawText, mode, q])
+  const shownText = useMemo(() => filtered.join('\n'), [filtered])
   const LOG_MODES = [
     ['all', '全部', counts.all],
     ['issue', '异常', counts.issue],
