@@ -146,6 +146,21 @@ console.log('========================================\n')
     }
   }))
 
+  // D2-S15：环境变量判据与真实运行同口径（xbk_app.js 只在 === '1' 时进 dry-run）。
+  // XBK_DRY_RUN=0/false 是「显式关闭」，自检不得被误拒——旧实现任何非空串都当 dry-run。
+  await test('互斥: env XBK_DRY_RUN=0（显式关闭）→ 不拦、正常自检', () => withChannels(async () => {
+    cfg.PUSH_PLUS_TOKEN = 'stub-token'
+    process.env.XBK_DRY_RUN = '0'
+    try {
+      const { out, exitCode } = await withCapture(() => m.runNotifyTest(['--notify-test']))
+      assertRc(exitCode === 0, `退出码应为 0（=0 不是 dry-run），实际 ${exitCode}`)
+      assertRc(!outText(out).includes('互斥'), '=0 不得触发 dry-run 互斥')
+      assertRc(gotCalls.length === 1, `应正常发送 1 次，实际 ${gotCalls.length}`)
+    } finally {
+      delete process.env.XBK_DRY_RUN
+    }
+  }))
+
   // S5 HITOKOTO 抑制（真 slim 全链路）：开启一言时自检零一言外部请求
   await test('HITOKOTO 开启: 自检零一言请求 + 消息不含一言 + finally 恢复', () => withChannels(async () => {
     cfg.PUSH_PLUS_TOKEN = 'stub-token'
@@ -189,11 +204,13 @@ console.log('========================================\n')
     const SECRET = 'LEAK-CANARY-pK3dQ9'
     fs.writeFileSync(stubPath, `'use strict'
 const slimPath = require('path').join(process.cwd(), 'xbk_sendNotify_slim.js')
-const err = new Error('所有推送通道失败: HTTP 502 回显 token=${SECRET}')
+// D2-S14：错误文本里混入 ANSI/OSC（provider 可回显）——真 guard 的失败路径必须剥掉，
+// 否则自检在终端运行时 provider 能清屏/改标题。\u001B 在输出中零出现即为达标。
+const err = new Error('所有推送通道失败: HTTP 502 回显 token=${SECRET} \u001B]0;pwned\u0007')
 err.code = 'ALL_CHANNELS_FAILED'
 err.statusCode = 502
 err.response = { body: '{"token":"${SECRET}"}', statusCode: 502 }
-err.failures = [{ channel: '桩渠道A', message: 'pushplus 响应: token=${SECRET}', statusCode: 502 }]
+err.failures = [{ channel: '桩渠道A', message: 'pushplus 响应: token=${SECRET} \u001B[31mRED\u001B[0m', statusCode: 502 }]
 err.successfulChannels = []
 require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, exports: { push_config: { HITOKOTO: 'false' }, configuredChannelNames: () => ['桩渠道A'], configuredChannelCount: () => 1, sendNotify: async () => { throw err } } }
 // 注意：桩内绝不 require 入口文件——--require 阶段 require 它会让 Node 22 把入口标记为
@@ -212,6 +229,8 @@ require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, expo
       assertRc(text.includes('通知自检失败'), '真 guard 应输出失败结论')
       assertRc(!text.includes(SECRET), '凭证哨兵不得出现在真 guard 输出（脱敏红线）')
       assertRc(!text.includes('[object Object]'), '不得有对象 stringify 痕迹')
+      assertRc(!text.includes('\u001B'), 'D2-S14：失败路径不得把 ANSI/OSC 控制序列打到终端')
+      assertRc(!text.includes('pwned'), 'OSC 整段剥除（含正文）')
     } finally {
       fs.rmSync(stubDir, { recursive: true, force: true })
     }
