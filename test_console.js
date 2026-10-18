@@ -1330,17 +1330,22 @@ async function main () {
   })
   await aok('HTTP: /api/logs 尾读（>1MiB 截断保留尾部）+ missing；/api/sys 版本与缓存目录、无环境变量泄漏', async () => {
     const dir = tmpDir()
+    const hist = tmpDir()
     // >1MiB 前缀 + 摘要行在尾部：若端点放弃尾读限制（整个文件下发）或丢了尾读（tooLarge），这条都红
     const bigPrefix = 'HEAD-MARKER-' + 'x'.repeat(1024 * 1024)
-    fs.writeFileSync(path.join(dir, 'run.log'), [bigPrefix, '2026-10-15 12:16:21 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s cachesaved=1'].join('\n') + '\n')
-    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    fs.writeFileSync(path.join(hist, 'run.log'), [bigPrefix, '2026-10-15 12:16:21 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s cachesaved=1'].join('\n') + '\n')
+    // D2-S5：/api/logs 必须与 /api/run-history 同读 historyDir()（运行侧真实目录），
+    // 而不是 stateDir。stateDir 放一份干扰日志证明读取源唯一。
+    fs.writeFileSync(path.join(dir, 'run.log'), 'STATE-DIR-ONLY-MARKER\n')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir, runHistoryDir: hist })
     const port = await listen(server)
     const l = JSON.parse((await request(port, 'GET', '/api/logs', { token: TOKEN })).text)
     assert.strictEqual(l.status, 'ok')
     assert.ok(l.text.includes('total=20'), '日志正文可见')
     assert.ok(!l.text.includes('HEAD-MARKER'), '超限日志必须只下发尾部 1 MiB（前缀不得出现）')
+    assert.ok(!l.text.includes('STATE-DIR-ONLY-MARKER'), 'stateDir/run.log 不得被读取（与运行历史同源）')
     // missing 分支：文件不在必须 missing（不得把别的状态伪装成 ok）
-    fs.unlinkSync(path.join(dir, 'run.log'))
+    fs.unlinkSync(path.join(hist, 'run.log'))
     const empty = JSON.parse((await request(port, 'GET', '/api/logs', { token: TOKEN })).text)
     assert.strictEqual(empty.status, 'missing', 'run.log 已删除必须 missing')
     const s = JSON.parse((await request(port, 'GET', '/api/sys', { token: TOKEN })).text)

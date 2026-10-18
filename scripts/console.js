@@ -1926,8 +1926,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     if (req.method === 'GET' && url.pathname === '/api/logs') {
       // 运行日志在线查看：run.log 尾部 1MiB（与 status.js LOG_READ_OPTIONS.tail 同口径）。
+      // 读取源与 /api/run-history、/api/status 同走 historyDir()（D2-S5 复核）：run.log 由
+      // 运行侧 MessageStore.cacheDir 写入，Config.cache.dir/XBK_CACHE_DIR 漂移或嵌入式注入
+      // 时与 stateDir 分居——旧实现读 stateDir/run.log，日志页在那种部署里恒为空。
       const { readSafeTextResult } = require('../xbk_storage')
-      const safe = readSafeTextResult(path.join(stateDir, 'run.log'), LOG_VIEW_MAX_BYTES, { tail: true })
+      const safe = readSafeTextResult(path.join(historyDir(), 'run.log'), LOG_VIEW_MAX_BYTES, { tail: true })
       if (safe.status === 'missing') {
         sendJson(res, 200, { status: 'missing', text: '' })
         return
