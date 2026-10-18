@@ -250,3 +250,25 @@ exclude_paths:
   # 只用于把测试轮次隔离到仓库内临时目录（跑完即删），不含任何外部输入；
   # Semgrep 的非字面量 fs 路径告警在此属误报。
   - "test_lazy_notify.js"
+  # ---- v3.310 过滤规则覆盖文件：静态路径构造的误报登记 ----
+  # scripts/filter-rules-paths.js 只做 path.join(运行期目录, 本文件常量名)：
+  # 目录来自调用方（控制台 stateDir / XBK_CACHE_DIR 解析结果 / 测试临时目录），
+  # 不来自请求体或 URL；4 个文件名是字面量常量，备份名里的 rev 先经
+  # Number.isSafeInteger + >=0 归一（非法一律归 0），无路径穿越片段。
+  # 把纯路径构造单独成模块正是不想整文件排除 xbk_filter_store.js——校验、
+  # 合并、降级、审计等真实逻辑的告警必须继续生效。
+  - "scripts/filter-rules-paths.js"
+  # test_filter_store.js 是上者与 FilterStore 的单元测试：mkdtempSync 临时目录 +
+  # 硬编码夹具文件名，另有以测试常量构造的 new RegExp(src, flags) mock；
+  # 目录/文件名/正则源全为测试字面量，无外部输入，静态路径与 ReDoS 告警属误报。
+  - "test_filter_store.js"
+  # ---- v3.311 覆盖文件权限收紧助手（同 filter-rules-paths 的误报口径）----
+  # scripts/owner-only-mode.js 只对 FilterStore 传入的固定文件做 stat + chmod
+  # (0600)，入参来自运行期状态目录 + 本仓字面量文件名，不接受请求体/URL 拼路径；
+  # Semgrep 的非字面量 fs 路径告警在此属误报。
+  - "scripts/owner-only-mode.js"
+  # test_app_unit.js 的 v3.310 覆盖文件夹具同样在 mkdtempSync 目录下写
+  # filter-rules.json（realFs.writeFileSync(rulesFile, …)），并 mock 了
+  # new RegExp(src, flags) 与 RE2 路径；src/flags/路径均为测试常量，
+  # 无外部输入。真实断言仍由 npm test / CI quality-gate 全量执行。
+  - "test_app_unit.js"

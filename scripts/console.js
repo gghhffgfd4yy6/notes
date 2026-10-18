@@ -25,7 +25,10 @@ const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, re
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
 const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_KEYS, TOMBSTONE_MAX_BYTES } = require('../xbk_utils')
-const { readSafeTextResult } = require('../xbk_storage')
+const { readSafeTextResult, writeAtomic } = require('../xbk_storage')
+// 过滤规则覆盖文件存储层（纯同步、零新依赖、不 require xbk_function_v3）：
+// 路径/合并/校验/生效快照复用 store 的单一实现，控制台只做 HTTP 装配与写流程。
+const FilterStore = require('../xbk_filter_store')
 const { statusCacheDir } = require('../qinglong/xbk_push')
 
 // 推送缓存文件名：与生产 MessageStore.getFileName(Config.api.pushUrl) 同口径——pushUrl 末段
@@ -1021,6 +1024,482 @@ function readBody (req, maxBytes = 4096) {
   })
 }
 
+// ── 过滤规则覆盖文件控制面（规格 §3/§4；计划 §3.3）─────────────────────────
+// 5 个固定路径端点：GET 读取 / POST 保存 / POST 预检 / POST 预览 / POST 回滚。
+// 写端点在全局 authorize 之前分流，且**只认 Authorization 头**：
+//   · 全局闸接受 ?token=，POST 又不收 Cookie——直接复用会让「URL 带 token」与
+//     「仅 Cookie」都落到同一条 401，无法给出规格要求的专属 code。
+// 规则正文绝不进访问日志/审计：审计只记 action/revision/changedFields 与 prevHash 链。
+const FILTER_BODY_MAX_BYTES = 64 * 1024
+const FILTER_AUDIT_MAX_BYTES = 4 * 1024 * 1024
+const FILTER_LOCK_STALE_MS = 10 * 1000
+const FILTER_BACKUP_KEEP = 3
+const FILTER_PREVIEW_SCAN_MAX = 5000
+const FILTER_PREVIEW_SAMPLE_DEFAULT = 5
+const FILTER_PREVIEW_SAMPLE_MAX = 20
+const FILTER_PREVIEW_MAX_BYTES = 64 * 1024 * 1024
+const FILTER_AUDIT_GENESIS = '0'.repeat(64)
+// 全命中字面量（trim 后等值）：与 xbk_filter_store 的 WIDE_MATCH_VALUES 同口径。
+const FILTER_WIDE_MATCH = new Set(['.*', '^.*$'])
+// 写端点固定路径白名单（无动态后缀；非白名单路径继续走全局 404/鉴权）。
+const FILTER_WRITE_PATHS = new Set([
+  '/api/config/filter',
+  '/api/config/filter/validate',
+  '/api/config/filter/preview',
+  '/api/config/filter/restore'
+])
+
+function sha256Hex (text) {
+  return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex')
+}
+
+// 惰性依赖：xbk_function_v3 顶层会 require got/re2，不能在 console 顶层加载。
+// 首次过滤 API 调用时才取 RuleEngine（v3 导出的已绑定 compileRules/hasNestedQuantifier）、
+// explainFilter/filterHash 与 Config；re2 可用性按「能否 require('re2')」判定，
+// compileUserRegex 与 v3 内部同实现（new RE2 + 'i'，失败返回 null）。
+let filterDepsOverride = null
+let filterDepsCache = null
+function runtimeFilterDeps () {
+  if (filterDepsOverride) return filterDepsOverride
+  if (filterDepsCache) return filterDepsCache
+  let v3 = null
+  try { v3 = require('../xbk_function_v3') } catch (e) { v3 = null }
+  let RE2 = null
+  try { RE2 = require('re2') } catch (e) { RE2 = null }
+  const compileUserRegex = (source, flags = 'i') => {
+    if (typeof source !== 'string' || !RE2) return null
+    try { return new RE2(source, flags) } catch (e) { return null }
+  }
+  const ruleEngine = v3 && typeof v3.compileRules === 'function' && typeof v3.hasNestedQuantifier === 'function'
+    ? {
+        hasNestedQuantifier: v3.hasNestedQuantifier,
+        compileRules: v3.compileRules,
+        // 预览白名单与运行期同口径：先剥零宽字符再 test（缺导出时退化为原串）。
+        _normalizeReInput: typeof v3._normalizeReInput === 'function' ? v3._normalizeReInput : undefined
+      }
+    : null
+  filterDepsCache = {
+    v3,
+    config: v3 && v3.Config ? v3.Config : null,
+    RuleEngine: ruleEngine,
+    compileUserRegex,
+    re2Available: Boolean(RE2),
+    isRe2Available: () => Boolean(RE2),
+    explainFilter: v3 && typeof v3.explainFilter === 'function' ? v3.explainFilter : null,
+    filterHash: v3 && typeof v3.filterHash === 'function' ? v3.filterHash : null
+  }
+  return filterDepsCache
+}
+
+// 仅测试：注入确定性 deps（如 re2Available:false 验 503）；传 null 恢复真实惰性依赖。
+function setFilterDepsForTests (deps) {
+  filterDepsOverride = deps && typeof deps === 'object' ? deps : null
+}
+
+function filterValidationDeps (deps) {
+  return {
+    RuleEngine: deps && deps.RuleEngine,
+    compileUserRegex: deps && deps.compileUserRegex,
+    re2Available: deps && deps.re2Available === true,
+    isRe2Available: deps && typeof deps.isRe2Available === 'function' ? deps.isRe2Available : undefined
+  }
+}
+
+function filterEngineUnavailable (errors) {
+  return Array.isArray(errors) && errors.some((e) => e && (e.code === 'engine_unavailable' || e.code === 'deps_invalid'))
+}
+
+// 写端点鉴权顺序（规格 §4.2）：
+// ① URL 带 token → 400（即使同时带合法 Bearer 也拒绝，避免凭证进日志/历史）；
+// ② Authorization: <scheme> <token> 合法 → 放行；
+// ③ 仅会话 Cookie → 401 cookie_not_allowed（Cookie 不能用于写，CSRF 面）；
+// ④ 其余 → 401 unauthorized。
+function writeAuthVerdict (req, urlQuery, token) {
+  if (urlQuery instanceof URLSearchParams && urlQuery.has('token')) {
+    return { ok: false, status: 400, body: { error: 'query_token_not_allowed', code: 'query_token_not_allowed' } }
+  }
+  const header = req.headers && req.headers.authorization
+  if (typeof header === 'string' && header.slice(0, BEARER_PREFIX.length).toLowerCase() === BEARER_PREFIX_LOWER) {
+    const value = header.slice(BEARER_PREFIX.length)
+    if (value.length > 0 && timingSafeEqualStr(value.trim(), token)) return { ok: true, actorToken: token }
+  }
+  const cookie = sessionCookieValue(req.headers && req.headers.cookie)
+  if (cookie !== null && timingSafeEqualStr(cookie, token)) {
+    return { ok: false, status: 401, body: { error: 'cookie_not_allowed', code: 'cookie_not_allowed' } }
+  }
+  return { ok: false, status: 401, body: { error: 'unauthorized', code: 'unauthorized' } }
+}
+
+// 媒体类型闸：只收 application/json（允许 ;charset=...），Content-Encoding 只允许 identity/缺省。
+// 字符串前缀判定（用户输入不进正则）。
+function filterMediaAllowed (req) {
+  const rawType = req.headers && req.headers['content-type']
+  const type = typeof rawType === 'string' ? rawType.trim().toLowerCase() : ''
+  const jsonType = type === 'application/json' || type.startsWith('application/json;')
+  if (!jsonType) return false
+  const rawEncoding = req.headers && req.headers['content-encoding']
+  const encoding = typeof rawEncoding === 'string' ? rawEncoding.trim().toLowerCase() : ''
+  return encoding === '' || encoding === 'identity'
+}
+
+function filterAuditCanonical (entry) {
+  // 固定键序 + 只含白名单字段：审计行可复算、且不可能夹带规则正文/路径/token。
+  return JSON.stringify({
+    ts: entry.ts,
+    actor: entry.actor,
+    action: entry.action,
+    revision: entry.revision,
+    changedFields: entry.changedFields
+  })
+}
+
+function filterAuditEntryHash (prevHash, entry) {
+  return sha256Hex(`${prevHash}\n${filterAuditCanonical(entry)}`)
+}
+
+// 逐行重算审计链。brokenAt 为 1 基行号；坏 JSON / prevHash 断裂 / entryHash 不匹配
+// 都算断链（可检测静默删除与篡改，但不声称能防 root）。
+function readFilterAuditChain (auditPath) {
+  // openNonBlocking：审计路径被替换成 FIFO 时立即判 unsafe，不阻塞 GET/save。
+  const read = readSafeTextResult(auditPath, FILTER_AUDIT_MAX_BYTES, { openNonBlocking: true })
+  if (read.status === 'missing') return { ok: true, entries: 0, brokenAt: null, lastHash: FILTER_AUDIT_GENESIS }
+  if (read.status !== 'ok') return { ok: false, entries: 0, brokenAt: 0, lastHash: FILTER_AUDIT_GENESIS }
+  const lines = read.text.split('\n')
+  let lastHash = FILTER_AUDIT_GENESIS
+  let entries = 0
+  let brokenAt = null
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trim() === '') continue
+    entries++
+    let entry
+    try { entry = JSON.parse(line) } catch (e) { brokenAt = i + 1; break }
+    const shapeOk = entry && typeof entry === 'object' && !Array.isArray(entry) &&
+      typeof entry.ts === 'string' && typeof entry.actor === 'string' &&
+      typeof entry.action === 'string' && Number.isSafeInteger(entry.revision) &&
+      Array.isArray(entry.changedFields)
+    if (!shapeOk || entry.prevHash !== lastHash || entry.entryHash !== filterAuditEntryHash(lastHash, entry)) {
+      brokenAt = i + 1
+      break
+    }
+    lastHash = entry.entryHash
+  }
+  return { ok: brokenAt === null, entries, brokenAt, lastHash }
+}
+
+// 审计文件达到上限（>4 MiB）后无法再安全续写：readFilterAuditChain 会把超限文件读成「不可读 ⇒
+// genesis」，在其后按 genesis 续写会让整条链被判成断链。写入方必须先 stat 大小，超限即拒绝保存（507），
+// 规则文件一个字节都不动，等人工归档后再继续。
+function filterAuditAtLimit (auditPath) {
+  try {
+    const st = fs.lstatSync(auditPath)
+    // symlink 不在这里判 507：统一交给 append 的 O_NOFOLLOW 失败路径（500 audit_failed），
+    // 避免同一个链接因目标大小不同而报 507/500 两种结果。
+    if (st.isSymbolicLink()) return false
+    // 预留一行审计的宽度（entryHash 64 hex + 时间戳 + 字段名，实测 < 512B）：
+    // 只判 size > MAX 会让「最后一次 append 恰好越界」，随后读取按 tooLarge 判假断链。
+    return st.size + 1024 > FILTER_AUDIT_MAX_BYTES
+  } catch (e) {
+    return false // 不存在/不可 stat：交给 append 的真实失败路径（保存侧按审计失败回滚）
+  }
+}
+
+// append-only + 0600：每次从头复算链尾（文件上限 4MiB，控制台写频率极低）。
+// 打开时带 O_NOFOLLOW 且 fstat 必须是普通文件：预置的 symlink/FIFO/目录一律拒绝，否则
+// 「fchmod + append」会顺着链接改写别的可写文件。失败返回 false，由调用方回滚规则文件并报
+// 500 audit_failed——审计不落地就不能让调用方看到成功。
+function appendFilterAudit ({ auditPath, actor, action, revision, changedFields }) {
+  try {
+    if (filterAuditAtLimit(auditPath)) {
+      console.error('⚠️ 过滤规则审计已到 4 MiB 上限，拒绝续写（需人工归档后重试）')
+      return false
+    }
+    const chain = readFilterAuditChain(auditPath)
+    const prevHash = chain.lastHash || FILTER_AUDIT_GENESIS
+    const entry = {
+      ts: new Date().toISOString(),
+      actor,
+      action,
+      revision,
+      changedFields: Array.isArray(changedFields) ? changedFields.slice() : []
+    }
+    entry.prevHash = prevHash
+    entry.entryHash = filterAuditEntryHash(prevHash, entry)
+    const line = `${JSON.stringify(entry)}\n`
+    // O_NOFOLLOW 在非 POSIX 平台可能缺省（undefined），按位或会把它当 0 从而丢掉整组 flag。
+    // O_NONBLOCK：审计路径被预置成 FIFO 时 open 立即返回（ENXIO），而不是阻塞整个事件循环。
+    const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
+      (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0)
+    const fd = fs.openSync(auditPath, flags, 0o600)
+    try {
+      if (!fs.fstatSync(fd).isFile()) throw new Error('审计路径不是普通文件')
+      fs.fchmodSync(fd, 0o600)
+      fs.writeSync(fd, line)
+    } finally {
+      fs.closeSync(fd)
+    }
+    return true
+  } catch (e) {
+    console.error(`⚠️ 过滤规则审计写入失败：${e && e.message ? e.message : e}`)
+    return false
+  }
+}
+
+// 审计失败时把覆盖文件回滚为保存前内容：原本有文件（含损坏文件）就原子写回原文，
+// 原本没有就删掉本次新建的文件——绝不留下「规则已生效但审计缺失」的状态。
+function rollbackFilterOverride (paths, previousText) {
+  // 有保存前原文：只尝试写回，失败就如实报 rolledBack:false，绝不删文件（删除会把
+  // 「保存前规则」变成「代码默认」，是比留下旧规则更大的语义跳变）。
+  if (typeof previousText === 'string') {
+    try {
+      if (writeAtomic(paths.file, previousText, '过滤规则覆盖文件（审计失败回滚）')) return { ok: true, mode: 'restored' }
+    } catch (e) { /* 落到下面如实上报 */ }
+    return { ok: false, mode: 'restore_failed' }
+  }
+  // 原本没有覆盖文件（本次新建）：删掉才回到保存前状态。
+  try {
+    fs.unlinkSync(paths.file)
+    return { ok: true, mode: 'removed' }
+  } catch (e) {
+    return { ok: false, mode: 'remove_failed' }
+  }
+}
+
+// 字段级 diff：只报字段名（顺序与 FILTER_RULE_FIELDS 一致），值绝不入响应/日志。
+function diffFilterFields (before, after) {
+  const out = []
+  const prev = before && typeof before === 'object' ? before : {}
+  const next = after && typeof after === 'object' ? after : {}
+  for (const field of FilterStore.FILTER_RULE_FIELDS) {
+    const a = typeof prev[field] === 'string' ? prev[field] : ''
+    const b = typeof next[field] === 'string' ? next[field] : ''
+    if (a !== b) out.push(field)
+  }
+  return out
+}
+
+// GET 的 wideMatch 提示：与 store 的确认口径一致（单行 = 整值 trim；多行 = 任一行 trim）。
+function wideMatchFields (filter) {
+  const out = []
+  const src = filter && typeof filter === 'object' ? filter : {}
+  for (const field of FilterStore.FILTER_RULE_FIELDS) {
+    if (field === 'pingbitime') continue
+    const value = src[field]
+    if (typeof value !== 'string' || value === '') continue
+    if (!value.includes('###')) {
+      if (FILTER_WIDE_MATCH.has(value.trim())) out.push(field)
+      continue
+    }
+    const lines = value.split(/<br\s*\/?>|\r\n|\r|\n/)
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      // 多行规则的判定值在 ### 之后（与 RuleEngine._parseLine 的 val 同口径）。
+      const val = trimmed.includes('###') ? trimmed.split('###')[1].trim() : trimmed
+      if (FILTER_WIDE_MATCH.has(val)) { out.push(field); break }
+    }
+  }
+  return out
+}
+
+function filterHashOf (deps, filter, keyword) {
+  const zkt = keyword && typeof keyword.zkt_gjc === 'string' ? keyword.zkt_gjc : ''
+  try {
+    if (deps && typeof deps.filterHash === 'function') {
+      const hash = deps.filterHash(filter, zkt)
+      if (typeof hash === 'string' && hash.length > 0) return hash
+    }
+  } catch (e) { /* 回退 sha256（deps 注入/Config 异常时仍给出稳定摘要） */ }
+  return sha256Hex(JSON.stringify(filter))
+}
+
+function actorOf (token) {
+  return sha256Hex(typeof token === 'string' ? token : '').slice(0, 8)
+}
+
+// 预览用的 zkt_gjc 白名单编译：与运行期 App.run 同口径——非字符串/空串/纯空白/嵌套量词/非法
+// 正则一律「不启用白名单」（宁可多算补推，也不虚报少推）。返回 null 表示本次未应用（zktApplied:false）。
+function previewWhitelistRegex (deps, keyword) {
+  const kw = keyword && typeof keyword.zkt_gjc === 'string' ? keyword.zkt_gjc : null
+  if (kw === null || kw === '' || kw.trim() === '') return null
+  if (!deps || typeof deps.compileUserRegex !== 'function') return null
+  if (deps.RuleEngine && typeof deps.RuleEngine.hasNestedQuantifier === 'function' && deps.RuleEngine.hasNestedQuantifier(kw)) return null
+  try {
+    return deps.compileUserRegex(kw, 'i')
+  } catch (e) {
+    return null
+  }
+}
+
+// 白名单放行判定（对齐 FilterEngine.whitelistFilter 的 title 口径）：标题 undefined/null/空串
+// 视为放行（运行期同款「字段缺失不拦截」），其余按正则匹配；任何异常按放行处理（宁可多算）。
+function previewWhitelistKeeps (entry, regex, normalize) {
+  if (!regex) return true
+  const raw = entry && entry.title !== undefined ? entry.title : undefined
+  if (raw === undefined || raw === null || raw === '') return true
+  let subject = typeof raw === 'string' ? raw : String(raw)
+  // 与运行期 FilterEngine.whitelistFilter 同口径：test 前先剥零宽字符（\u200B-\u200D\uFEFF）。
+  if (typeof normalize === 'function') {
+    try { subject = normalize(subject) } catch (e) { /* 归一失败按原串（宁可多算补推） */ }
+  }
+  try {
+    return regex.test(subject)
+  } catch (e) {
+    return true
+  }
+}
+
+// 锁文件身份快照：陈旧判定用 mtimeMs，接管后的归属核验用 dev+ino（bigint，避免大 inode 丢精度）。
+// lstat 不跟随链接：锁文件本身必须是它自己，不是指向别处的链接。
+function filterLockIdentity (lockPath) {
+  const st = fs.lstatSync(lockPath, { bigint: true })
+  return { dev: st.dev, ino: st.ino, mtimeMs: Number(st.mtimeMs) }
+}
+
+// 读锁文件里的持有者 pid（写失败/不可解析 ⇒ null，按孤儿锁处理）。
+function filterLockHolderPid (lockPath) {
+  try {
+    const raw = fs.readFileSync(lockPath, 'utf8')
+    const data = JSON.parse(raw)
+    return Number.isSafeInteger(data && data.pid) && data.pid > 0 ? data.pid : null
+  } catch (e) {
+    return null
+  }
+}
+
+// pid 是否活着：EPERM 说明进程存在但无权限探测 ⇒ 视为活。
+function isProcessAlive (pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return Boolean(e && e.code === 'EPERM')
+  }
+}
+
+// 接管一把「已判定过期」的锁。互斥不靠 rename（把活锁搬走会让原持有者失去互斥），
+// 而是用一个 O_EXCL 的 takeover 标记把接管串行化：只有建标记成功的人能进临界区，
+// 进区后重新 stat 锁文件，dev/ino/mtime 与判定时一致才 unlink（期间被别人释放/重建就放弃）。
+// 标记本身带 mtime 兜底：持有标记的进程崩溃后，STALE 之后可被下一个接管者清掉。
+function claimStaleFilterLock (lockPath, judged) {
+  const marker = `${lockPath}.takeover`
+  let fd
+  try {
+    fd = fs.openSync(marker, 'wx', 0o600)
+  } catch (e) {
+    // 标记被占：可能是并发接管（放弃本轮，回 409）或上次崩溃的残留（过期即清）。
+    try {
+      if (Date.now() - fs.lstatSync(marker).mtimeMs > FILTER_LOCK_STALE_MS) fs.unlinkSync(marker)
+    } catch (e2) { /* 已消失/无法判定：保持 fail-closed */ }
+    return false
+  }
+  try {
+    let now
+    try { now = filterLockIdentity(lockPath) } catch (e) { return false } // 已被释放
+    if (now.dev !== judged.dev || now.ino !== judged.ino || now.mtimeMs !== judged.mtimeMs) return false
+    try { fs.unlinkSync(lockPath) } catch (e) { return false }
+    return true
+  } finally {
+    try { fs.closeSync(fd) } catch (e) { /* 已关闭 */ }
+    try { fs.unlinkSync(marker) } catch (e) { /* 已被清理 */ }
+  }
+}
+
+// 锁：O_EXCL + 0600；EEXIST 时按 mtime 判陈旧（>10s 才尝试接管），否则让调用方回 409。
+// 锁内容带随机 token，释放时校验，避免陈旧接管后误删别人的锁。
+function acquireFilterLock (cacheDir) {
+  const lockPath = FilterStore.filterRulesPaths(cacheDir).lock
+  const token = crypto.randomBytes(12).toString('hex')
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let fd
+    try {
+      fd = fs.openSync(lockPath, 'wx', 0o600)
+    } catch (e) {
+      if (!e || e.code !== 'EEXIST') return null
+      let judged
+      try {
+        judged = filterLockIdentity(lockPath)
+      } catch (e2) {
+        if (e2 && e2.code === 'ENOENT') continue // 刚被释放：重试一次
+        return null
+      }
+      if (!(Date.now() - judged.mtimeMs > FILTER_LOCK_STALE_MS)) return null
+      // 持有者还活着就绝不接管（mtime 过期只说明写得久，不代表进程死了）：
+      // 搬走活锁会让原持有者失去互斥，两人同时进写段。孤儿锁（pid 不可解析/进程已死）才允许接管。
+      const holderPid = filterLockHolderPid(lockPath)
+      if (holderPid !== null && isProcessAlive(holderPid)) return null
+      // 无论接管成败都进入下一轮重判：成功 ⇒ open 自己的锁；失败（别人先抢到/锁已释放）⇒
+      // 看到别人的新锁后放弃、或直接 open 成功。
+      claimStaleFilterLock(lockPath, judged)
+      continue
+    }
+    try {
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now(), token }))
+      fs.fchmodSync(fd, 0o600)
+      fs.closeSync(fd)
+    } catch (e) {
+      // 写入/授权/关闭失败：自己刚创建的锁文件必须清掉，否则后续 10s 内全是假 write_busy。
+      // closeSync 之后抛错时 fd 可能已关闭——重复 close 的 EBADF 直接吞掉，不影响清理。
+      try { fs.closeSync(fd) } catch (e2) { /* 已关闭 */ }
+      try { fs.unlinkSync(lockPath) } catch (e3) { /* 已被清理 */ }
+      return null
+    }
+    return { path: lockPath, token }
+  }
+  return null
+}
+
+function releaseFilterLock (lock) {
+  if (!lock || typeof lock.path !== 'string') return
+  try {
+    const text = fs.readFileSync(lock.path, 'utf8')
+    if (!text.includes(lock.token)) return // 已被陈旧接管：绝不删别人的锁
+    fs.unlinkSync(lock.path)
+  } catch (e) { /* 锁已释放/被接管：幂等 */ }
+}
+
+// 备份只保留最近 FILTER_BACKUP_KEEP 代（按 revision 数值降序）。
+// 注意调用时机：必须在新的覆盖文件提交成功**之后**才剪枝——失败的保存不该剪掉最老备份。
+function pruneFilterBackups (paths) {
+  let names
+  try { names = fs.readdirSync(path.dirname(paths.file)) } catch (e) { return }
+  const revisions = []
+  for (const name of names) {
+    const prefix = 'filter-rules.bak.'
+    if (!name.startsWith(prefix) || !name.endsWith('.json')) continue
+    const raw = name.slice(prefix.length, -'.json'.length)
+    if (!/^\d+$/.test(raw)) continue
+    const rev = Number(raw)
+    if (Number.isSafeInteger(rev) && rev >= 0) revisions.push(rev)
+  }
+  revisions.sort((a, b) => b - a)
+  for (const rev of revisions.slice(FILTER_BACKUP_KEEP)) {
+    try { fs.unlinkSync(paths.backupFor(rev)) } catch (e) { /* 已被清理 */ }
+  }
+}
+
+// 只写备份、返回是否成功（不剪枝：剪枝由调用方在提交后执行）。
+// 返回 false 时调用方必须放弃本次保存——备份是回滚的唯一来源，不能「备份失败也照写」。
+function backupFilterFile (paths, revision, text) {
+  if (typeof text !== 'string' || text === '') return false
+  try {
+    return writeAtomic(paths.backupFor(revision), text, '过滤规则备份') === true
+  } catch (e) {
+    return false
+  }
+}
+
+// 备份文件的结构读取（字段白名单/正则合法性仍交给 validateFilterRules）。
+function parseFilterFile (text) {
+  let data
+  try { data = JSON.parse(text) } catch (e) { return { ok: false, message: '不是合法 JSON' } }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return { ok: false, message: '根节点必须是对象' }
+  if (data.schema !== FilterStore.FILTER_RULES_SCHEMA) return { ok: false, message: 'schema 不匹配' }
+  if (!Number.isSafeInteger(data.revision) || data.revision < 0) return { ok: false, message: 'revision 必须是非负整数' }
+  if (!data.filter || typeof data.filter !== 'object' || Array.isArray(data.filter)) return { ok: false, message: 'filter 必须是对象' }
+  return { ok: true, revision: data.revision, filter: data.filter }
+}
+
 // 超长 query 按 UTF-8 字节从尾截断（中文按字符截到字节边界）——/api/messages 与
 // /api/messages/export 共用同一钳制口径，防两端「截断后搜的词不一样」。
 function clampQueryBytes (query) {
@@ -1728,6 +2207,497 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
   }
 
+  // ── 过滤规则控制面（规格 §3/§4；计划 §3.3）──────────────────────────────
+  // 代码默认层（Config.filter / Config.keyword）只读：惰性 require，取不到时退化为空对象。
+  const filterDefaults = () => {
+    const deps = runtimeFilterDeps()
+    const cfg = deps.config && typeof deps.config === 'object' ? deps.config : {}
+    return {
+      filter: cfg.filter && typeof cfg.filter === 'object' ? cfg.filter : {},
+      keyword: cfg.keyword && typeof cfg.keyword === 'object' ? cfg.keyword : {}
+    }
+  }
+
+  const loadCurrentFilter = () => {
+    const defaults = filterDefaults()
+    // 与 App.run 同口径传 deps：手工编辑的覆盖文件若含编译不了的规则，GET 必须报 corrupt
+    // （否则页面全绿、运行侧却在降级，A1 承诺的红条永远不出现）。
+    return FilterStore.loadFilterRules({
+      cacheDir: stateDir,
+      defaults: defaults.filter,
+      keyword: defaults.keyword,
+      deps: filterValidationDeps(runtimeFilterDeps())
+    })
+  }
+
+  const sendFilterValidation = (res, errors, code = 'validation_failed') => {
+    sendJson(res, 400, {
+      ok: false,
+      error: 'validation_failed',
+      code,
+      errors: Array.isArray(errors) ? errors : []
+    })
+  }
+
+  // 请求体：415/413 在鉴权之后、解析之前；aborted 与解析失败都收敛成 400 validation_failed。
+  const readFilterJson = (req) => {
+    return readBody(req, FILTER_BODY_MAX_BYTES).then(({ body, over, aborted }) => {
+      if (over) return { error: { status: 413, body: { error: 'body_too_large', code: 'body_too_large' } } }
+      if (aborted) {
+        return { error: { status: 400, body: { error: 'validation_failed', code: 'validation_failed', errors: [{ field: 'body', code: 'aborted', message: '请求体不完整' }] } } }
+      }
+      if (Buffer.byteLength(body, 'utf8') > FILTER_BODY_MAX_BYTES) {
+        return { error: { status: 413, body: { error: 'body_too_large', code: 'body_too_large' } } }
+      }
+      let value
+      try {
+        value = JSON.parse(body)
+      } catch (e) {
+        return { error: { status: 400, body: { error: 'validation_failed', code: 'validation_failed', errors: [{ field: 'body', code: 'invalid_json', message: '请求体不是合法 JSON' }] } } }
+      }
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return { error: { status: 400, body: { error: 'validation_failed', code: 'validation_failed', errors: [{ field: 'body', code: 'invalid_body', message: '请求体必须是对象' }] } } }
+      }
+      return { value }
+    })
+  }
+
+  const validateCandidate = (deps, candidate) => {
+    return FilterStore.validateFilterRules(
+      { schema: candidate && candidate.schema, filter: candidate && candidate.filter },
+      filterValidationDeps(deps)
+    )
+  }
+
+  const wideConfirmErrors = (wideMatch) => {
+    return wideMatch.map((field) => ({
+      field,
+      code: 'wide_match_confirm_required',
+      message: `字段「${field}」是 .* 全命中规则，需 confirmWideMatch:true 二次确认`
+    }))
+  }
+
+  const respondValidationFailure = (res, result) => {
+    if (filterEngineUnavailable(result.errors)) {
+      sendJson(res, 503, { error: 'engine_unavailable', code: 'engine_unavailable' })
+      return
+    }
+    sendFilterValidation(res, result.errors)
+  }
+
+  // GET /api/config/filter：读面，沿用全局鉴权（Cookie / Bearer / ?token= 均可）。
+  // 损坏时 revision 强制 0（即便进程内有 last-known-good，那是运行侧降级，不是覆盖文件版本）。
+  const handleFilterGet = (req, res) => {
+    const loaded = loadCurrentFilter()
+    const corrupt = loaded.source === 'corrupt'
+    const appliedRead = FilterStore.readAppliedSnapshot(stateDir)
+    // 原样返回生效快照（readAppliedSnapshot 的 snapshot），UI 读 revision/appliedAt/hash；
+    // 不在这里二次裁剪，避免与运行侧写入形状漂移。
+    const applied = appliedRead.status === 'ok' ? appliedRead.snapshot : null
+    const chain = readFilterAuditChain(FilterStore.filterRulesPaths(stateDir).audit)
+    const payload = {
+      schema: FilterStore.FILTER_RULES_SCHEMA,
+      revision: corrupt ? 0 : loaded.revision,
+      source: loaded.source,
+      filter: loaded.filter,
+      keyword: {
+        zkt_gjc: loaded.keyword && loaded.keyword.zkt_gjc !== undefined ? loaded.keyword.zkt_gjc : '',
+        writable: false
+      },
+      wideMatch: wideMatchFields(loaded.filter),
+      applied,
+      auditChain: { ok: chain.ok, entries: chain.entries, brokenAt: chain.brokenAt }
+    }
+    if (corrupt) {
+      payload.error = {
+        code: 'store_corrupt',
+        message: loaded.error && loaded.error.message ? loaded.error.message : '覆盖文件损坏'
+      }
+    }
+    sendJson(res, 200, payload)
+  }
+
+  // POST /api/config/filter：保存。鉴权/媒体类型已由调用方处理。
+  // 锁内顺序：读当前 → CAS → 损坏确认 → 备份 → 原子写 → 审计 → 释放（全程同步）。
+  const handleFilterSave = (req, res, actorToken) => {
+    readFilterJson(req).then((parsed) => {
+      if (parsed.error) { sendJson(res, parsed.error.status, parsed.error.body); return }
+      const body = parsed.value
+      const deps = runtimeFilterDeps()
+      const defaults = filterDefaults()
+      const baseRevision = body.baseRevision === undefined ? 0 : body.baseRevision
+      const result = validateCandidate(deps, body)
+      if (result.ok && result.wideMatch.length > 0 && body.confirmWideMatch !== true) {
+        sendFilterValidation(res, wideConfirmErrors(result.wideMatch))
+        return
+      }
+      if (!result.ok) { respondValidationFailure(res, result); return }
+      if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+        sendFilterValidation(res, [{ field: 'baseRevision', code: 'invalid_revision', message: 'baseRevision 必须是非负整数' }])
+        return
+      }
+      const lock = acquireFilterLock(stateDir)
+      if (!lock) {
+        // 锁被占：显式 Retry-After（sendJson 只写 Content-Type，先用 setHeader 合并）。
+        res.setHeader('Retry-After', '1')
+        sendJson(res, 409, { error: 'write_busy', code: 'write_busy' })
+        return
+      }
+      try {
+        const paths = FilterStore.filterRulesPaths(stateDir)
+        const loaded = loadCurrentFilter()
+        const corrupt = loaded.source === 'corrupt'
+        const curRevision = corrupt ? 0 : loaded.revision
+        if (baseRevision !== curRevision) {
+          sendJson(res, 409, {
+            error: 'revision_mismatch',
+            code: 'revision_mismatch',
+            revision: curRevision,
+            errors: [{ field: 'baseRevision', code: 'revision_mismatch', message: `当前 revision 为 ${curRevision}，请重新加载后再保存` }]
+          })
+          return
+        }
+        if (corrupt && body.confirmReplaceCorrupt !== true) {
+          sendJson(res, 409, {
+            error: 'store_corrupt',
+            code: 'store_corrupt',
+            errors: [{ field: 'confirmReplaceCorrupt', code: 'store_corrupt', message: '覆盖文件已损坏，需 confirmReplaceCorrupt:true 才能覆盖' }]
+          })
+          return
+        }
+        // 审计已满（>4 MiB）时链无法安全续写：先拒绝保存，规则文件一个字节都不动。
+        if (filterAuditAtLimit(paths.audit)) {
+          sendJson(res, 507, {
+            error: 'audit_full',
+            code: 'audit_full',
+            errors: [{ field: 'audit', code: 'audit_full', message: '审计文件已达 4 MiB 上限，需人工归档 filter-rules.audit.ndjson 后才能继续保存' }]
+          })
+          return
+        }
+        // 保存前快照：合法覆盖文件既写备份（回滚用），也留原文给审计失败回滚；
+        // 损坏文件不备份（不是可回滚的代），但仍留原文，审计失败时原样写回。
+        let previousText = null
+        if (loaded.source === 'override' || corrupt) {
+          const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
+          if (raw.status === 'ok') previousText = raw.text
+          // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
+          if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
+            sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
+            return
+          }
+        }
+        const nextRevision = curRevision + 1
+        const nextFile = {
+          schema: FilterStore.FILTER_RULES_SCHEMA,
+          revision: nextRevision,
+          filter: result.value
+        }
+        if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则覆盖文件')) {
+          sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
+          return
+        }
+        const nextActive = FilterStore.mergeActiveFilter({
+          defaults: defaults.filter,
+          keyword: defaults.keyword,
+          override: result.value
+        })
+        const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
+        const hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
+        if (!appendFilterAudit({
+          auditPath: paths.audit,
+          actor: actorOf(actorToken),
+          action: 'save',
+          revision: nextRevision,
+          changedFields
+        })) {
+          // 审计不落地 ⇒ 本次保存整体作废（回滚覆盖文件），绝不报成功。
+          const rolled = rollbackFilterOverride(paths, previousText)
+          sendJson(res, 500, {
+            error: 'audit_failed',
+            code: 'audit_failed',
+            rolledBack: rolled.ok,
+            rollbackMode: rolled.mode
+          })
+          return
+        }
+        // 剪枝只在整个保存（含审计）成功后才执行：任何失败路径都不得剪掉最老备份。
+        pruneFilterBackups(paths)
+        sendJson(res, 200, {
+          ok: true,
+          revision: nextRevision,
+          changedFields,
+          hash,
+          appliedHint: '下一轮生效'
+        })
+      } finally {
+        releaseFilterLock(lock)
+      }
+    }).catch(() => sendJson(res, 500, { error: 'write_failed', code: 'write_failed' }))
+  }
+
+  // POST /api/config/filter/validate：只预检，不取锁、不落盘。
+  const handleFilterValidate = (req, res) => {
+    readFilterJson(req).then((parsed) => {
+      if (parsed.error) { sendJson(res, parsed.error.status, parsed.error.body); return }
+      const body = parsed.value
+      const deps = runtimeFilterDeps()
+      const result = validateCandidate(deps, body)
+      if (result.ok && result.wideMatch.length > 0 && body.confirmWideMatch !== true) {
+        sendFilterValidation(res, wideConfirmErrors(result.wideMatch))
+        return
+      }
+      if (!result.ok) { respondValidationFailure(res, result); return }
+      sendJson(res, 200, { ok: true, warnings: [], wideMatch: result.wideMatch })
+    }).catch(() => sendJson(res, 500, { error: 'write_failed', code: 'write_failed' }))
+  }
+
+  // POST /api/config/filter/preview：候选规则对 push.json 中 _f===true 记录试算补推数。
+  // 直接 readSafeTextResult + JSON.parse（**不能**用 status.readMessages：它会丢弃 _f）。
+  const handleFilterPreview = (req, res) => {
+    readFilterJson(req).then((parsed) => {
+      if (parsed.error) { sendJson(res, parsed.error.status, parsed.error.body); return }
+      const body = parsed.value
+      const deps = runtimeFilterDeps()
+      const defaults = filterDefaults()
+      const result = validateCandidate(deps, body)
+      if (result.ok && result.wideMatch.length > 0 && body.confirmWideMatch !== true) {
+        sendFilterValidation(res, wideConfirmErrors(result.wideMatch))
+        return
+      }
+      if (!result.ok) { respondValidationFailure(res, result); return }
+      if (!deps.RuleEngine || typeof deps.explainFilter !== 'function') {
+        sendJson(res, 503, { error: 'engine_unavailable', code: 'engine_unavailable' })
+        return
+      }
+      const candidate = FilterStore.mergeActiveFilter({
+        defaults: defaults.filter,
+        keyword: defaults.keyword,
+        override: result.value
+      }).filter
+      let compiled
+      try {
+        compiled = deps.RuleEngine.compileRules(candidate)
+      } catch (e) {
+        sendJson(res, 503, { error: 'engine_unavailable', code: 'engine_unavailable' })
+        return
+      }
+      const limitRaw = Number(body.limit)
+      const limit = Number.isFinite(limitRaw)
+        ? Math.min(FILTER_PREVIEW_SAMPLE_MAX, Math.max(1, Math.floor(limitRaw)))
+        : FILTER_PREVIEW_SAMPLE_DEFAULT
+      const read = readSafeTextResult(path.join(stateDir, messagesFile), FILTER_PREVIEW_MAX_BYTES)
+      let records = null
+      if (read.status === 'ok') {
+        try {
+          const data = JSON.parse(read.text)
+          if (Array.isArray(data)) records = data
+        } catch (e) { records = null }
+      }
+      // 读不到缓存（缺失/超限/坏 JSON/非数组）不能显示成「0 条影响」——那是把未知说成确定。
+      // 200 + available:false，计数一律 null，前端显示「无法读取推送历史，本次不显示补推估算」。
+      if (records === null) {
+        sendJson(res, 200, {
+          ok: true,
+          available: false,
+          code: 'cache_unavailable',
+          scanned: null,
+          capped: false,
+          reEvalCount: null,
+          atLeast: false,
+          limit,
+          samples: [],
+          cacheStatus: read.status,
+          zktApplied: false
+        })
+        return
+      }
+      // 扫描上限只作用于 _f 记录：capped 必须按 _f 条数判定（缓存总条数与补推估算无关）。
+      const fRecords = records.filter((entry) => entry && typeof entry === 'object' && entry._f === true)
+      const capped = fRecords.length > FILTER_PREVIEW_SCAN_MAX
+      // zkt_gjc 白名单与运行期同源（Config.keyword.zkt_gjc）：标题不匹配白名单的记录即使过了
+      // 候选规则也不会补推，必须从估算里排除；拿不到编译能力时按「未应用」如实标注。
+      const zktRegex = previewWhitelistRegex(deps, defaults.keyword)
+      const zktApplied = zktRegex !== null
+      let scanned = 0
+      let reEvalCount = 0
+      const samples = []
+      for (const entry of fRecords) {
+        if (scanned >= FILTER_PREVIEW_SCAN_MAX) break
+        scanned++
+        let verdict = null
+        try { verdict = deps.explainFilter(entry, compiled, candidate) } catch (e) { verdict = null }
+        if (!verdict || verdict.passed !== true) continue
+        if (!previewWhitelistKeeps(entry, zktRegex, deps.RuleEngine && deps.RuleEngine._normalizeReInput)) continue
+        reEvalCount++
+        if (samples.length < limit) {
+          samples.push({
+            id: entry.id === undefined ? null : entry.id,
+            title: typeof entry.title === 'string' ? entry.title : '',
+            reason: verdict.reason === undefined ? null : verdict.reason
+          })
+        }
+      }
+      sendJson(res, 200, {
+        ok: true,
+        available: true,
+        scanned,
+        capped,
+        reEvalCount,
+        atLeast: capped,
+        limit,
+        samples,
+        cacheStatus: read.status,
+        zktApplied
+      })
+    }).catch(() => sendJson(res, 500, { error: 'write_failed', code: 'write_failed' }))
+  }
+
+  // POST /api/config/filter/restore：备份回滚或恢复代码默认——两者都写 revision+1 的覆盖文件。
+  // 恢复默认写 `{filter:{}}`（等价于代码默认）而**不再删除文件**：删文件会让 revision 归零、
+  // 备份列表消失、陈旧客户端还能拿旧 baseRevision 过 CAS。
+  const handleFilterRestore = (req, res, actorToken) => {
+    readFilterJson(req).then((parsed) => {
+      if (parsed.error) { sendJson(res, parsed.error.status, parsed.error.body); return }
+      const body = parsed.value
+      if (body.confirm !== true) {
+        sendFilterValidation(res, [{ field: 'confirm', code: 'confirm_required', message: '回滚/恢复默认需 confirm:true' }], 'confirm_required')
+        return
+      }
+      const to = body.to
+      const toDefault = to === 'default'
+      if (!toDefault && (!Number.isSafeInteger(to) || to < 0)) {
+        sendFilterValidation(res, [{ field: 'to', code: 'invalid_target', message: "to 必须是非负整数 revision 或 'default'" }])
+        return
+      }
+      // 契约变更：回滚必须带页面加载时的 revision，否则陈旧回滚页会覆盖新版本。
+      const baseRevision = body.baseRevision
+      if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+        sendFilterValidation(res, [{ field: 'baseRevision', code: 'invalid_revision', message: 'baseRevision 必须是非负整数（取页面加载时的 revision）' }], 'invalid_revision')
+        return
+      }
+      const deps = runtimeFilterDeps()
+      const defaults = filterDefaults()
+      const paths = FilterStore.filterRulesPaths(stateDir)
+      let restoredFilter = null
+      if (!toDefault) {
+        const read = readSafeTextResult(paths.backupFor(to), FILTER_BODY_MAX_BYTES)
+        if (read.status === 'missing') {
+          sendJson(res, 404, { error: 'backup_not_found', code: 'backup_not_found' })
+          return
+        }
+        if (read.status !== 'ok') {
+          sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
+          return
+        }
+        const backup = parseFilterFile(read.text)
+        if (!backup.ok) {
+          sendFilterValidation(res, [{ field: 'to', code: 'invalid_backup', message: `备份文件不可用：${backup.message}` }])
+          return
+        }
+        const result = validateCandidate(deps, backup)
+        if (!result.ok) { respondValidationFailure(res, result); return }
+        restoredFilter = result.value
+      }
+      const lock = acquireFilterLock(stateDir)
+      if (!lock) {
+        res.setHeader('Retry-After', '1')
+        sendJson(res, 409, { error: 'write_busy', code: 'write_busy' })
+        return
+      }
+      try {
+        const loaded = loadCurrentFilter()
+        const curRevision = loaded.source === 'corrupt' ? 0 : loaded.revision
+        if (baseRevision !== curRevision) {
+          sendJson(res, 409, {
+            error: 'revision_mismatch',
+            code: 'revision_mismatch',
+            revision: curRevision,
+            errors: [{ field: 'baseRevision', code: 'revision_mismatch', message: `当前 revision 为 ${curRevision}，请重新加载后再回滚` }]
+          })
+          return
+        }
+        if (filterAuditAtLimit(paths.audit)) {
+          sendJson(res, 507, {
+            error: 'audit_full',
+            code: 'audit_full',
+            errors: [{ field: 'audit', code: 'audit_full', message: '审计文件已达 4 MiB 上限，需人工归档 filter-rules.audit.ndjson 后才能继续回滚' }]
+          })
+          return
+        }
+        // 改文件前先备份当前配置：被替换的这一代必须仍能从备份列表回滚回来。
+        let previousText = null
+        if (loaded.source === 'override' || loaded.source === 'corrupt') {
+          const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
+          if (raw.status === 'ok') previousText = raw.text
+          if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
+            sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
+            return
+          }
+        }
+        const nextRevision = curRevision + 1
+        const nextFile = {
+          schema: FilterStore.FILTER_RULES_SCHEMA,
+          revision: nextRevision,
+          filter: toDefault ? {} : restoredFilter
+        }
+        if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则覆盖文件')) {
+          sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
+          return
+        }
+        const nextActive = toDefault
+          ? FilterStore.mergeActiveFilter({ defaults: defaults.filter, keyword: defaults.keyword })
+          : FilterStore.mergeActiveFilter({
+            defaults: defaults.filter,
+            keyword: defaults.keyword,
+            override: restoredFilter
+          })
+        const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
+        if (!appendFilterAudit({
+          auditPath: paths.audit,
+          actor: actorOf(actorToken),
+          action: toDefault ? 'reset_default' : 'restore',
+          revision: nextRevision,
+          changedFields
+        })) {
+          const rolled = rollbackFilterOverride(paths, previousText)
+          sendJson(res, 500, {
+            error: 'audit_failed',
+            code: 'audit_failed',
+            rolledBack: rolled.ok,
+            rollbackMode: rolled.mode
+          })
+          return
+        }
+        // 剪枝只在整个回滚（含审计）成功后才执行。
+        pruneFilterBackups(paths)
+        const payload = {
+          ok: true,
+          revision: nextRevision,
+          restoredFrom: toDefault ? 'default' : to,
+          changedFields
+        }
+        if (!toDefault) payload.hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
+        sendJson(res, 200, payload)
+      } finally {
+        releaseFilterLock(lock)
+      }
+    }).catch(() => sendJson(res, 500, { error: 'write_failed', code: 'write_failed' }))
+  }
+
+  // 写端点入口：Bearer-only 闸 → 媒体类型 → 按固定路径分派。
+  const handleFilterWrite = (req, res, url) => {
+    const verdict = writeAuthVerdict(req, url.searchParams, token)
+    if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
+    if (!filterMediaAllowed(req)) {
+      sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' })
+      return
+    }
+    if (url.pathname === '/api/config/filter/validate') { handleFilterValidate(req, res); return }
+    if (url.pathname === '/api/config/filter/preview') { handleFilterPreview(req, res); return }
+    if (url.pathname === '/api/config/filter/restore') { handleFilterRestore(req, res, verdict.actorToken); return }
+    handleFilterSave(req, res, verdict.actorToken)
+  }
+
   const server = http.createServer((req, res) => {
     // ── v3.300 访问日志装配：单点 res.on('finish')，覆盖 sendJson/静态/页面全部响应出口
     // （全文件原本无任何 res.on 监听）。挂回调第一行 ⇒ 畸形 request-target 的 400
@@ -1803,6 +2773,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         res.writeHead(303, { Location: '/' })
         res.end()
       }).catch(() => sendJson(res, 400, { error: '登录请求读取失败' }))
+      return
+    }
+    // 过滤规则写端点：必须在全局 authorize 之前分流。全局闸对 POST 接受 ?token= 且
+    // 对 Cookie 统一回 unauthorized——只有专属入口才能给出 query_token_not_allowed /
+    // cookie_not_allowed 两个规格要求的 code（写面仅 Bearer）。
+    if (req.method === 'POST' && FILTER_WRITE_PATHS.has(url.pathname)) {
+      handleFilterWrite(req, res, url)
       return
     }
     if (!authorize(req, token, url.searchParams)) {
@@ -2191,6 +3168,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         return
       }
       sendJson(res, 200, view)
+      return
+    }
+    // GET /api/config/filter：过滤规则读面（全局鉴权已通过，Cookie/Bearer/?token= 均可）。
+    if (req.method === 'GET' && url.pathname === '/api/config/filter') {
+      handleFilterGet(req, res)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/sys') {
@@ -2625,5 +3607,19 @@ module.exports = {
   SSE_MAX_CONNECTIONS,
   // v3.301 批次④ 4.1 通知自检：常量/入口导出（spawn entry 映射断言 + 重放窗断言）
   REPLAY_WINDOW_NOTIFY_TEST_MS,
-  ENTRY_SINGLE
+  ENTRY_SINGLE,
+  // 过滤规则控制面：常量/写鉴权/测试注入口（HTTP 用例 + 非 HTTP 断言）
+  FILTER_BODY_MAX_BYTES,
+  FILTER_PREVIEW_SCAN_MAX,
+  FILTER_AUDIT_MAX_BYTES,
+  FILTER_BACKUP_KEEP,
+  writeAuthVerdict,
+  setFilterDepsForTests,
+  // 惰性依赖取用器（测试注入 zkt_gjc 等 Config 覆盖时以真实 deps 为基底）
+  runtimeFilterDeps,
+  // 陈旧锁接管的原子性单测入口（rename + inode 归属核验，见 claimStaleFilterLock 注释）
+  filterLockIdentity,
+  claimStaleFilterLock,
+  previewWhitelistRegex,
+  previewWhitelistKeeps
 }

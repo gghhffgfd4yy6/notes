@@ -10,7 +10,7 @@ if (hostClean.guardOrExit(process.env)) process.exit(1)
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================
 
-const { listfilter, explainFilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, truncateUtf16, filterHash, MessageStore, getMessageIdentity, num } = require('./xbk_function_v3.js')
+const { listfilter, explainFilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, compileUserRegex, _normalizeReInput, truncateUtf16, filterHash, MessageStore, getMessageIdentity, num } = require('./xbk_function_v3.js')
 const { createUtils } = require('./xbk_utils.js')
 const assert = require('assert')
 const slim = require('./xbk_sendNotify_slim.js')
@@ -6296,6 +6296,15 @@ console.log('========================================\n');
     const g = { catename: '', louzhu: null, title: '', content: undefined }
     assertEqual(typeof listfilter(g, c), 'boolean')
     assertEqual(Array.isArray(validateConfig(all)), true)
+  })
+
+  // v3.311：覆盖文件读面（console GET / qinglong --check）与 App.run 共用同一套正则引擎，
+  // 这两个导出是该口径的实现，必须在生产模块里真实可用（可达性用例也会引用）。
+  await test('覆盖文件读面: compileUserRegex / _normalizeReInput 与运行期同口径', () => {
+    assertEqual(typeof compileUserRegex, 'function')
+    const re = compileUserRegex('^a', 'i')
+    assertEqual(Boolean(re && re.test('Ab')), true)
+    assertEqual(_normalizeReInput('a\u200Bb\uFEFFc'), 'abc')
   })
 
   // ==================== 90. 死代码检测(可达性) ====================

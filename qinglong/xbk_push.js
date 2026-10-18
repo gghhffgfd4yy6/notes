@@ -80,7 +80,46 @@ function runCheck (app) {
     const probe = new RE2('^ok$')
     add('re2 原生模块', probe.test('ok'), '可加载且匹配正常')
   } catch (e) { add('re2 原生模块', false, `不可加载，过滤正则不会安全执行：${e && e.message ? e.message : String(e)}`) }
-  const warnings = app.validateConfig({ ...app.Config.filter, zkt_gjc: app.Config.keyword.zkt_gjc })
+  // 过滤规则：与 App.run 同源读覆盖文件（<cacheDir>/filter-rules.json），而不是只看代码默认——
+  // 否则控制台改过的规则会让 --check 报「合法」/「非法」与真实运行不一致。
+  // loadFilterRules 契约不抛错：损坏时降级（last-known-good 或代码默认）并给一条警告，检查继续。
+  let activeFilter = app.Config.filter
+  let activeKeyword = app.Config.keyword
+  // MessageStore 缺失只可能出现在测试桩里（生产组合根必然注入）；此时按代码默认校验即可，
+  // 不必把「桩不完整」当成规则文件损坏来告警。
+  if (app.MessageStore) {
+    try {
+      const cacheDir = app.MessageStore.cacheDir
+      if (typeof cacheDir === 'string') {
+        const FilterStore = require('../xbk_filter_store')
+        // 与 App.run 同口径传 deps：--check 也要能发现「规则编译不了」的覆盖文件，
+        // 否则控制台红条/启动校验都报合法、真正跑起来却降级。
+        const ruleEngine = typeof app.compileRules === 'function' && typeof app.hasNestedQuantifier === 'function'
+          ? { hasNestedQuantifier: app.hasNestedQuantifier, compileRules: app.compileRules }
+          : null
+        let re2Ready = false
+        try { re2Ready = Boolean(require('re2')) } catch (e) { re2Ready = false }
+        const filterDeps = ruleEngine && typeof app.compileUserRegex === 'function'
+          ? { RuleEngine: ruleEngine, compileUserRegex: app.compileUserRegex, re2Available: re2Ready, isRe2Available: () => re2Ready }
+          : undefined
+        const active = FilterStore.loadFilterRules({
+          cacheDir,
+          defaults: app.Config.filter,
+          keyword: app.Config.keyword,
+          deps: filterDeps
+        })
+        activeFilter = active.filter
+        activeKeyword = active.keyword
+        if (active.degraded) {
+          const reason = (active.error && active.error.message) || '未知原因'
+          console.warn(`⚠️ 过滤规则覆盖文件损坏（source=corrupt），启动校验改用${active.lastGoodUsed ? '上次合法规则' : '代码默认规则'}；运行时本轮不清 _f、不推进 filter.hash：${reason}`)
+        }
+      }
+    } catch (e) {
+      console.warn(`⚠️ 过滤规则覆盖文件读取异常，启动校验改用代码默认规则：${e && e.message ? e.message : String(e)}`)
+    }
+  }
+  const warnings = app.validateConfig({ ...activeFilter, zkt_gjc: activeKeyword.zkt_gjc })
   add('过滤配置', warnings.length === 0, warnings.length ? `${warnings.length} 条警告：${warnings.join('；')}` : '合法')
   try {
     app.init()

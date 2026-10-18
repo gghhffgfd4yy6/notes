@@ -90,7 +90,10 @@ const SUITES = [
   // 不设 integration：触发用例拉起的是 `--check`（只做环境检查、秒级、不碰网络业务），
   // 单元入口可跑。不设 mutationSkip：套件不读 mutation.yml/.githooks，沙箱内可运行。
   { name: '网页控制台', file: 'test_console.js', desc: 'scripts/console.js token fail-closed/单飞锁（损坏锁保守+陈旧接管）/动作解析/HTML 转义/HTTP 端到端（401/看板降级/202/409/锁生命周期/404）' },
-  { name: '通知自检', file: 'test_notify_selfcheck.js', desc: '--notify-test 直跑自检：argv/env 互斥/HITOKOTO 抑制与恢复/单次广播/消息固定形态/退出码 0 与 1/脱敏出口形态（进程内 mock 注入，零真实网络）' }
+  { name: '通知自检', file: 'test_notify_selfcheck.js', desc: '--notify-test 直跑自检：argv/env 互斥/HITOKOTO 抑制与恢复/单次广播/消息固定形态/退出码 0 与 1/脱敏出口形态（进程内 mock 注入，零真实网络）' },
+  // S1-store：过滤规则覆盖文件存储层（xbk_filter_store.js）。纯同步、临时 cacheDir 驱动，
+  // 不 require xbk_function_v3、不触碰 Config.filter ⇒ 进单元入口与 TAP 变异测试集。
+  { name: '过滤规则存储', file: 'test_filter_store.js', desc: '覆盖文件校验四道闸（白名单/schema/revision/长度/控制字符、### 行语法、嵌套量词与 RE2、编译对账）+ 默认合并/last-known-good 降级/生效快照往返/路径 helper' }
 ]
 
 // 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与

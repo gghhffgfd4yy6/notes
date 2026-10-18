@@ -41,6 +41,8 @@ module.exports = {
     'xbk_http.js',
     'xbk_sendNotify_slim.js',
     'xbk_storage.js',
+    // S1-store：过滤规则覆盖文件存储层（读盘合并 + 严格校验 + 生效快照）。
+    'xbk_filter_store.js',
     'xbk_loop.js',
     'xbk_failure_policy.js',
     'qinglong/xbk_push.js',
