@@ -1504,9 +1504,10 @@ function MessagesPanel () {
   const { data, err, load, loading } = usePanelLoader(fetchMessages)
   useEffect(() => { load().catch(() => {}) }, [load])
   // 搜索框回车 / 刷新前先把未落地的输入立刻生效，避免「刚打完字点刷新，还是旧结果」。
+  // 只有搜索词变了才回第 1 页；没改词时刷新当前页，不应把用户踢回首页（审查 #246 可选）。
   const refreshNow = () => {
     const q = input.trim()
-    if (q !== query || page !== 1) { setQuery(q); setPage(1); return }
+    if (q !== query) { setQuery(q); setPage(1); return }
     load().catch(() => {})
   }
   const [exporting, setExporting] = useState('') // '' | 'csv' | 'json'：加载态防连点（两按钮共用一闸）
