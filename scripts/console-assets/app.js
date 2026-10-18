@@ -1278,10 +1278,22 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     mq.addEventListener('change', on)
     return () => mq.removeEventListener('change', on)
   }, [])
-  // 每次打开都从一级分类开始；搜索词与高亮项一并清空。
+  // 每次打开都从一级分类开始；搜索词、高亮项与列表滚动一并清空（审查 #246 可选：
+  // 手机端重开弹层时不能停在上次的 active 下标/滚动位置，否则容易误下钻）。
   useEffect(() => {
-    if (open) { setPath([]); setQ(''); setActive(0) }
+    if (open) {
+      setPath([]); setQ(''); setActive(0)
+      if (listRef.current) listRef.current.scrollTop = 0
+    }
   }, [open])
+  // 手机端是贴底模态弹层：锁住背景页滚动（审查 #245），否则手指滑弹层会把背后的
+  // 推送记录/页面一起带动。只在本组件打开且窄屏时接管，关闭时还原原值。
+  useEffect(() => {
+    if (!open || !narrow) return undefined
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => { document.body.style.overflow = prev }
+  }, [open, narrow])
   // 打开时：桌面把焦点放进搜索框；手机聚焦当前选项（不弹软键盘）。
   useEffect(() => {
     if (!open) return
@@ -1349,10 +1361,22 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   const leaves = kw === '' ? [] : flatCateLeaves(tree)
   const results = kw === '' ? [] : leaves.filter((l) => l.label.toLowerCase().includes(kw) || l.name.toLowerCase().includes(kw))
   const level = [...node.children.values()].sort((a, b) => b.total - a.total)
+  // 分类名同时是叶子与父节点时（如 A-B 与 A-B-C 并存），父级此前只能下钻、永远选不到
+  // A-B 本身（审查 #246 可选）。下钻后补一条「本级」选项，既能选自己也能继续下钻。
+  const selfOption = path.length > 0 && node.full
+    ? [{ key: '__self', label: `${node.name}（本级）`, count: node.count, leaf: true, name: node.full }]
+    : []
   const options = kw === ''
     ? [...(path.length === 0 ? [{ key: '__all', label: '全部分类', count: typeof total === 'number' ? total : tree.total, leaf: true, name: '' }] : []),
+        ...selfOption,
         ...level.map((n) => ({ key: n.path.join('-'), label: n.name, count: n.total, leaf: n.children.size === 0, name: n.full, node: n }))]
     : results.map((l) => ({ key: l.name, label: l.label, count: l.count, leaf: true, name: l.name }))
+  const focusFirst = () => {
+    setTimeout(() => {
+      const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
+      if (el) el.focus()
+    }, 0)
+  }
   const choose = (name) => {
     onChange(name)
     setOpen(false)
@@ -1365,10 +1389,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
       setQ('')
       setActive(0)
       // 下钻后把焦点放到新一级第一项：键盘 Enter 不会掉到 body 上。
-      setTimeout(() => {
-        const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
-        if (el) el.focus()
-      }, 0)
+      focusFirst()
       return
     }
     choose(o.name)
@@ -1377,6 +1398,9 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     setPath(nextPath)
     setQ('')
     setActive(0)
+    // 面包屑/「‹ 上一级」会重渲染掉当前按钮，焦点必须搬回列表（审查 #246：
+    // 否则返回上层后焦点掉到 body，键盘下钻中断）。
+    focusFirst()
   }
   const dismiss = () => {
     setOpen(false)
@@ -1386,6 +1410,16 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   const onListKey = (e) => {
     const opts = listRef.current ? [...listRef.current.querySelectorAll('.cate-opt')] : []
     if (opts.length === 0) return
+    const inSearch = e.target === searchRef.current
+    // 搜索框里的 Home/End 是文本光标操作，不能被列表导航劫持（审查 #245：
+    // 此前光标无法到词首/词尾）。上下键仍可从搜索框进入列表。
+    if (inSearch && (e.key === 'Home' || e.key === 'End')) return
+    // 搜索框按 Enter 直接选中当前高亮项（审查 #245 可选：此前必须先 ↓ 再 Enter）。
+    if (inSearch && e.key === 'Enter') {
+      const target = opts[Math.min(active, opts.length - 1)]
+      if (target) { e.preventDefault(); target.click() }
+      return
+    }
     const i = opts.indexOf(document.activeElement)
     let next = -1
     if (e.key === 'ArrowDown') next = i < 0 ? 0 : Math.min(opts.length - 1, i + 1)
