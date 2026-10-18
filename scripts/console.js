@@ -1898,11 +1898,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       let limit = Number(url.searchParams.get('limit'))
       if (!Number.isSafeInteger(limit) || limit < 1) limit = RUN_HISTORY_LIMIT_DEFAULT
       if (limit > RUN_HISTORY_LIMIT_MAX) limit = RUN_HISTORY_LIMIT_MAX
-      // before 游标（审查 D1-S3）：数字 = 旧的行号游标；8 位十六进制 = 条目 key 游标
-      // （追加安全，前端翻页传上一页最旧条目的 key）。其它形态一律当未传。
+      // before 游标（审查 D1-S3）：数字 = 旧的行号游标；条目 key 游标 = 8 位十六进制，
+      // 同内容重复行的第 2..n 条带 `-<序号>` 后缀（D2-S4 复核：两条相同摘要行用同一个
+      // key 会让 `before` 命中较新一条 → 翻页反复返回同一页）。其它形态一律当未传。
       const rawBefore = String(url.searchParams.get('before') || '')
       let before = 0
-      if (/^[0-9a-f]{8}$/.test(rawBefore)) before = rawBefore
+      if (/^[0-9a-f]{8}(?:-\d{1,4})?$/.test(rawBefore)) before = rawBefore
       else if (/^\d{1,9}$/.test(rawBefore) && Number(rawBefore) > 0) before = Number(rawBefore)
       // 尾窗指纹（评审 #243-1）：8 位十六进制；其它形态一律当「没带」，不做截断猜测
       const rawWin = String(url.searchParams.get('win') || '')

@@ -400,7 +400,8 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
   const lim = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50
   // before 两种形态（审查 D1-S3）：数字 = 行号游标（兼容旧前端；尾窗平移后需窗口指纹校验），
   // 8 位十六进制 = 条目 key 游标（追加安全，新前端使用）。
-  const beforeKey = typeof before === 'string' && /^[0-9a-f]{8}$/.test(before) ? before : ''
+  // key 游标：裸 8 位（首次出现）或 `<8位>-<序号>`（同内容重复行，见下方 occurrence 去重）
+  const beforeKey = typeof before === 'string' && /^[0-9a-f]{8}(?:-\d{1,4})?$/.test(before) ? before : ''
   const beforeLine = Number.isSafeInteger(before) && before > 0
     ? before
     : (typeof before === 'string' && /^\d{1,9}$/.test(before) ? Number(before) : 0)
@@ -424,59 +425,13 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
   }
 
   // 轮界模型（审查 #241 M2 / #242 M3+S2 / #243 / D2-N5，按生产写序 xbk_app.js :1684→:1688）：
-  // 一轮的摘要行在**轮末**写出，失败行（ERROR）写在其所属摘要行**之前**（文件序相邻、
-  // 通常同一秒）。因此失败行 → 摘要行的归属只按「±2 行且 |Δt| ≤ 2s」判定，与「本页是否
-  // 已满」无关——旧实现把判据挂在 items.length >= lim 上，同一文件按每页条数给出相反结论
-  // （limit=2 正常、limit=5 标中断）。没有摘要可归属的失败行 = 崩溃轮（进程在写摘要前
-  // 退出）：单独生成占位条目（lineNo = 该失败行行号，isPlaceholder=true），绝不再把「最近
-  // 一条摘要」回填成 interrupted——旧兜底会把下一轮标成中断、崩溃轮自己从历史里消失。
-  // 无时间戳的失败行（极旧日志/堆栈续行）无法做同秒判定：按文件序只回填其后的摘要
-  // （生产写序 ERROR → 摘要），其后没有摘要则同样成崩溃轮。
-  const tsOf = (line) => {
-    const m = /^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/.exec(line)
-    return m ? m[1] : ''
-  }
-  const tsMs = (line) => {
-    const ts = tsOf(line)
-    const v = ts ? Date.parse(ts.replace(' ', 'T') + 'Z') : NaN
-    return Number.isFinite(v) ? v : null
-  }
-  const summaryAt = new Map() // 0-based 行号 → 摘要时间戳(ms) / null（无时间戳）
-  for (let i = 0; i < lines.length; i++) {
-    if (!RUN_SUMMARY_LINE_RE.test(lines[i])) continue
-    const m = RUN_SUMMARY_LINE_RE.exec(lines[i])
-    // 与建条目同一套校验：计数器非法/缺失的摘要行不参与归属（否则失败轮会凭空消失）
-    if (![m[2], m[3], m[4], m[5], m[6], m[7]].map(Number).every(validInt)) continue
-    summaryAt.set(i, tsMs(lines[i]))
-  }
-  const interruptedIdx = new Set()
-  const crashIdx = new Set()
-  for (let i = 0; i < lines.length; i++) {
-    if (summaryAt.has(i) || !looksLikeRoundFailure(lines[i])) continue
-    const t = tsMs(lines[i])
-    let best = null
-    if (t === null) {
-      // 无时间戳：只认文件序其后的摘要（1–2 行内），不把更早一轮的堆栈行回填给它
-      for (let d = 1; d <= 2 && !best; d++) {
-        if (summaryAt.has(i + d)) best = { j: i + d, gap: 0 }
-      }
-    } else {
-      for (let d = 1; d <= 2 && !best; d++) {
-        for (const j of [i - d, i + d]) {
-          if (!summaryAt.has(j)) continue
-          const st = summaryAt.get(j)
-          if (st === null) continue
-          const gap = Math.abs(st - t)
-          if (gap > 2000) continue
-          if (!best || gap < best.gap) best = { j, gap } // 同距离取时间差更小者
-        }
-      }
-    }
-    if (best) interruptedIdx.add(best.j)
-    else crashIdx.add(i) // 无摘要可归属 ⇒ 独立崩溃轮占位（旧实现回填最近摘要）
-  }
+  // 一轮的摘要行在**轮末**写出，失败行写在其所属摘要行**之前**。归属判据与 parseLastRun
+  // 共用 classifyRoundFailures（近距 ≤2 行且 ≤2s / 轮内远距 ≤10min / 其余为崩溃占位），
+  // 同一文件在「上一轮 / 运行历史」两处必须给出同一结论。
+  const summaryAt = summaryIndexOf(lines)
+  const { interruptedIdx, crashIdx } = classifyRoundFailures(lines, summaryAt)
 
-  const roundKey = new Map() // 0-based 行号 → 条目稳定 key
+  const roundKey = new Map() // 0-based 行号 → 条目稳定 key（重复内容追加 -N 序号）
   const rounds = []
   for (const i of summaryAt.keys()) {
     const line = lines[i]
@@ -500,7 +455,6 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
       cancelled: false,
       isPlaceholder: false
     })
-    roundKey.set(i, entryKeyOf(line))
   }
   for (const i of crashIdx) {
     rounds.push({
@@ -520,7 +474,6 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
       cancelled: false,
       isPlaceholder: true
     })
-    roundKey.set(i, entryKeyOf(lines[i]))
   }
   // 文件序倒置即时间倒序（摘要行在其失败行之后写出；占位行号取失败行自身）。
   // 取消留痕单独成条（cancelled=true），既不标相邻轮中断、也不让这轮消失。
@@ -543,7 +496,17 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
       cancelled: true,
       isPlaceholder: true
     })
-    roundKey.set(i, entryKeyOf(lines[i]))
+  }
+  // 游标身份去重（D2-S4 复核）：两条内容完全相同的摘要行 entryKeyOf 相同，`before=<key>`
+  // 用 findIndex 只会命中最新的那条 ⇒ 翻页反复返回同一页（[5,4] → [3,2] → [3,2] …）。
+  // 同一 key 的第 2..n 次出现追加 `-<序号>`（序号按窗口内文件序，追加新行不改变既有序号）；
+  // 首次出现保留裸 8 位 key，旧游标/旧书签仍可定位到第一条。
+  const occurrence = new Map()
+  for (const r of [...rounds].sort((a, b) => a.i - b.i)) {
+    const h = entryKeyOf(lines[r.i])
+    const n = (occurrence.get(h) || 0) + 1
+    occurrence.set(h, n)
+    roundKey.set(r.i, n === 1 ? h : `${h}-${n}`)
   }
   rounds.sort((a, b) => b.i - a.i)
   let pool = rounds
