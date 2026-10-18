@@ -3150,19 +3150,31 @@ async function main () {
     assert.ok(/ev\.persisted|e\.persisted/.test(src), 'pageshow 分支须判 persisted 后重载')
   })
 
-  await aok('静态红线: 运行 id 是 string，禁 typeof … === number 判定（v3.299 回归）', () => {
+  await aok('静态红线: 运行 id 是 string，禁 typeof / Number.is* 的 number 判定（v3.299 回归）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     // v3.299 事故形态：服务端把 run id 从 number 改成 'epoch.seq' 字符串后，前端仍有
     // `typeof id === 'number'` 守卫 → 按钮永久禁用、请求永不发出，且页面无任何报错。
     // 不用单条正则：别名（runId）、括号（(id)）、下标（rows[i].id）、!== 都要覆盖。
+    // 旧实现的两个洞：/id$/i 把 `valid` 误报成 id；只看 typeof，Number.isInteger(detail.id)
+    // 这类等价写法静默通过。
+    const isIdOperand = (raw) => {
+      const t = String(raw).replace(/[\s()]/g, '')
+      return /(?:^|\.)(?:id|runId|openId|detailId)$/.test(t)
+    }
+    assert.strictEqual(isIdOperand('detail.id'), true, 'detail.id 必须识别为运行 id')
+    assert.strictEqual(isIdOperand('runId'), true, 'runId 必须识别')
+    assert.strictEqual(isIdOperand('valid'), false, 'valid 以 id 结尾但不是 id 表达式（旧 /id$/ 会误报）')
+    assert.strictEqual(isIdOperand('rowId'), false, 'rowId 是行 key，不是运行 id')
+
     const offenders = []
     for (const seg of src.split('typeof').slice(1)) {
-      const head = seg.slice(0, 80)
-      if (!/[!=]==\s*['"]number['"]/.test(head)) continue
-      const operand = head.split(/[!=]==/)[0].replace(/[\s()]/g, '')
-      if (/id$/i.test(operand)) offenders.push(operand)
+      const m = seg.slice(0, 120).match(/^\s*\(*([^=!]+?)\)*\s*[!=]==\s*['"]number['"]/)
+      if (m && isIdOperand(m[1])) offenders.push(m[1].trim())
     }
-    assert.deepStrictEqual(offenders, [], '不得用 typeof <id 表达式> === "number" 判定运行 id（id 恒为 string）')
+    for (const m of src.matchAll(/Number\.(?:isInteger|isSafeInteger|isFinite)\s*\(\s*([^)]+)\)/g)) {
+      if (isIdOperand(m[1])) offenders.push(`Number.is*(${m[1].trim()})`)
+    }
+    assert.deepStrictEqual(offenders, [], '不得用 typeof / Number.is* 对运行 id 做 number 判定（id 恒为 string）')
   })
 
   await aok('结构红线: RunsPanel 模板的 <div> 必须成对闭合（漏根 </div> 回归）', () => {
@@ -3406,6 +3418,10 @@ async function main () {
     assert.strictEqual(interp.filter(x => /btn btn-/.test(x)).length, 1, 'btn btn-* 只允许出现在 Button 原语里')
     assert.deepStrictEqual(interp.filter(x => /(^|['"\s])panel-head(['"\s]|$)/.test(x)), [], 'panel-head 只允许出现在 PanelHead 原语里')
     assert.deepStrictEqual(interp.filter(x => /(^|['"\s])card(['"\s]|$)/.test(x)), [], 'card 只允许出现在 Card 原语里')
+    // 双引号属性里嵌插值（class="btn ${...}"）不落入上面的 class=${...} 扫描；旧红线因此
+    // 放过了首屏 4 个主按钮（审查 #240），直到 C 批改走 Button 原语。
+    const inlineBtn = [...src.matchAll(/class=(["'])btn\s+\$\{/g)]
+    assert.deepStrictEqual(inlineBtn.map(m => m[0]), [], '按钮基础类不得手写在双引号 class 属性里（btn + 插值）')
   })
 }
 
