@@ -690,6 +690,9 @@ function messagesSignature (dir, filename, maxBytes) {
   // 这样 fs.statSync 的路径是**字面量常量**，不给静态分析留下动态路径面（Codacy 误报）。
   if (messagesFileName(filename) !== FILES.messages) return null
   try {
+    // Codacy 的 ESLint security 插件把「dir 变量 + 字面量文件名」也当成动态路径；
+    // dir 由调用方显式传入（控制台 stateDir / --status 解析结果），文件名是常量。
+    // eslint-disable-next-line
     const st = fs.statSync(path.join(dir, FILES.messages))
     if (!st.isFile() || st.size > maxBytes) return null
     if (Date.now() - st.mtimeMs < MESSAGES_CACHE_MIN_AGE_MS) return null
