@@ -1146,7 +1146,7 @@ function TrendsPanel () {
 // 缓存健康（v3.298）：判重缓存字节占用对照两级上限 + 墓碑计数。纯只读快照，
 // 进概览页拉一次 + 手动刷新，不进 5s 主轮询（墓碑解析最坏 8MiB，不与状态轮询抢盘）。
 // 条数维度：服务端在响应里附带 entryCount（readMessageCount，与 /api/messages 同一
-// 32MiB 封顶与防御；tooLarge 时 null 如实显示），对照 limits.entryMax 预警。
+// 读取封顶与防御；tooLarge 时 null 如实显示），对照 limits.entryMax 预警。
 function CacheHealthPanel ({ paused = false }) {
   const { data, err, load } = usePanelLoader(apiGetCacheHealth)
   // 右列状态文件（v3.307）：缓存健康面板原来只占左半 451px，右边 460px 空白；
@@ -1167,10 +1167,14 @@ function CacheHealthPanel ({ paused = false }) {
   const tomb = data && data.tombstone ? data.tombstone : null
   // 最近写入：显示相对时间；超过 24 小时只陈述事实（不推断链路断没断——调度暂停同样会这样）。
   const write = ok ? cacheWriteInfo(data.mtimeMs) : { ageText: '', stale: false }
-  // 控制台可读：长解释收进 title，首屏只留结论（32 MiB 封顶是控制台读取限制，不影响推送）。
+  // 控制台可读：长解释收进 title，首屏只留结论。上限取服务端下发的
+  // limits.consoleReadMaxBytes（此前写死 32 MiB，服务端调到 64 MiB 后文案说谎）。
+  const readCap = ok && data.limits && typeof data.limits.consoleReadMaxBytes === 'number'
+    ? fmtBytes(data.limits.consoleReadMaxBytes)
+    : '控制台读取上限'
   const readableText = data && data.consoleReadable
-    ? '是（未超 32 MiB 读取封顶）'
-    : '否——超过 32 MiB 读取封顶，推送记录页显示「过大不可读」（生产不受影响）'
+    ? `是（未超 ${readCap} 读取封顶）`
+    : `否——超过 ${readCap} 读取封顶，推送记录页显示「过大不可读」（生产不受影响）`
   const readableTitle = '超限与否以推送记录页实际显示为准；JSON 损坏时该页会显示「记录不可读」'
   // 条数预警：服务端在 cache-health 响应里附带 entryCount（/api/status 同源的
   // readMessageCount；tooLarge 时 null）对照写端条目上限；接近上限时下轮保存
