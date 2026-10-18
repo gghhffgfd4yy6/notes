@@ -7,7 +7,7 @@
 
 function shouldBlock (mainFile, env) {
   const loadedByStryker = /stryker/i.test(mainFile || '')
-  return loadedByStryker && !env.GITHUB_ACTIONS && env.XBK_ALLOW_LOCAL_MUTATION !== '1'
+  return loadedByStryker && env.GITHUB_ACTIONS !== 'true' && env.XBK_ALLOW_LOCAL_MUTATION !== '1'
 }
 
 function assertLocalMutationAllowed () {

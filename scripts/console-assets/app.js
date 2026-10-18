@@ -112,6 +112,14 @@ async function consumeJson (p, done) {
   p.then(() => {}, () => {}) // fetch reject（网络错）时由下方 done 兜底；正常路径在 body 消费后清
   try {
     const res = await p
+    if (res.status === 401) {
+      // 审查 #224：凭证失效必须让页面进入明确的「重新打开带 token 链接」状态，
+      // 否则轮询每 5s 继续打 401，页面只剩空壳。事件由 App 监听并停轮询。
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        window.dispatchEvent(new Event('xbk-auth-expired'))
+      }
+      throw new Error('凭证已失效（401）')
+    }
     if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
     try {
       return await readBodyJson(res)
@@ -740,8 +748,12 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
       }
     }
     // 切回前台立即补一拍（不依赖 interval 的下一 tick；隐藏期间已跳过所有详情请求）。
+    // SSE 模式不能 fetchOnce：它会领号 ++detailSeqRef，令已建流的所有回调因代次不符被丢弃，
+    // 运行中日志就此冻结（审查 #248）。SSE 模式下只需刷新 runs 徽章，详情交给流继续推。
     const onVisibility = () => {
-      if (!dead && document.visibilityState === 'visible') fetchOnce().catch(() => {})
+      if (dead || document.visibilityState !== 'visible') return
+      if (openActive) { onRefreshRef.current(); return }
+      fetchOnce().catch(() => {})
     }
     document.addEventListener('visibilitychange', onVisibility)
     const startPolling = () => {
@@ -1837,6 +1849,8 @@ function App () {
   const [logJump, setLogJump] = useState(null)
   // 自动刷新开关（v3.307）：默认开；暂停后顶部倒计时停住，手动「继续」恢复。
   const [autoRefresh, setAutoRefresh] = useState(true)
+  // 凭证失效（审查 #224）：任一 API 401 ⇒ 停轮询并显示自助恢复提示，不再每 5s 空打。
+  const [authExpired, setAuthExpired] = useState(false)
   const [nextAt, setNextAt] = useState(0)
   const [nowMs, setNowMs] = useState(Date.now())
   const timerRef = useRef(null)
@@ -1896,6 +1910,13 @@ function App () {
   const locking = busy || active
 
   useEffect(() => {
+    const onAuth = () => setAuthExpired(true)
+    window.addEventListener('xbk-auth-expired', onAuth)
+    return () => window.removeEventListener('xbk-auth-expired', onAuth)
+  }, [])
+
+  useEffect(() => {
+    if (authExpired) return undefined
     refreshSplit()
     clearInterval(timerRef.current)
     // 概览与运行日志需要状态新鲜（日志的 pollMs 取决于 task 是否在跑）；
@@ -1921,7 +1942,7 @@ function App () {
       clearInterval(timerRef.current)
       document.removeEventListener('visibilitychange', onVis)
     }
-  }, [refreshSplit, locking, tab, autoRefresh])
+  }, [refreshSplit, locking, tab, autoRefresh, authExpired])
 
   // 倒计时秒数：每秒重渲染一次顶栏；只在概览/日志且自动刷新开启时跑。
   useEffect(() => {
@@ -1944,9 +1965,9 @@ function App () {
     const run = state && state.run && state.run.status === 'ok' ? state.run.value : null
     const stats = state && state.stats && state.stats.status === 'ok' ? state.stats.value : null
     const bad = !!(stats && stats.today && stats.today.failed > 0) || !!(run && (run.failed > 0 || run.interrupted))
-    const dot = !state ? '⚪' : locking ? '🟡' : bad ? '🔴' : '🟢'
+    const dot = authExpired ? '🔴' : !state ? '⚪' : locking ? '🟡' : bad ? '🔴' : '🟢'
     document.title = `${dot} xbk-push 控制台`
-  }, [state, locking])
+  }, [state, locking, authExpired])
 
   // vwU/vv2：busy 提交成功后启动兜底闹钟；active 确认或超时即清。
   // Sourcery Old-run-unlocks-new-trigger：兜底清 busy 时必须同步清 busyRunIdRef——
@@ -2019,7 +2040,7 @@ function App () {
       <div class="brand">
         <span class="logo">⚡</span>
         <span class="name">xbk-push 控制台</span>
-        <${Badge} tone=${locking ? 'run' : 'ok'}>${locking ? '任务运行中' : '空闲'}<//>
+        <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${authExpired ? '凭证失效' : locking ? '任务运行中' : '空闲'}<//>
       </div>
       <div class="sync">
         ${tab === 'overview' || tab === 'logs'
@@ -2030,6 +2051,14 @@ function App () {
         ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
       </div>
     </header>
+
+    ${authExpired && html`<div class="alert-banner bad" role="alert">
+      <div class="alert-main">
+        <strong>凭证已失效，控制台已停止自动刷新</strong>
+        <span class="alert-sub">请用带 <code>?token=</code> 的完整链接重新打开；若链接已过期，从部署环境重新获取 XBK_CONSOLE_TOKEN。</span>
+      </div>
+      <a class="alert-action" href="/">重新登录</a>
+    </div>`}
 
     <nav class="tabs">
       ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')}

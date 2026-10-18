@@ -811,6 +811,36 @@ const BEARER_PREFIX_LOWER = 'bearer '
 // 形态被浏览器按规范忽略，此前仅 meta 承载的 frame-ancestors 'none' 是 no-op）。
 // GET / 以响应头下发完整 CSP；HTML 内 meta 保留同串兜底（中间层剥头时仍有约束）。
 const CSP_HEADER = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
+
+// 未授权首屏（审查 #224）：从聊天点开链接时 SameSite=Strict 的 Cookie 不会随跨站
+// 导航发出，旧实现只回裸 JSON {"error":"unauthorized"}，用户看不出该怎么恢复。
+// 这里给一个无脚本的最小登录页；token 只经 GET 表单回填，不写日志、不预填。
+function renderUnauthorizedPage () {
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>需要访问令牌 · xbk-push 控制台</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0f1420; color: #e6edf7; font: 15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { width: min(420px, calc(100vw - 32px)); background: #171e2e; border: 1px solid #2a3550; border-radius: 12px; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  p { color: #9aa8c0; margin: 0 0 16px; }
+  label { display: block; font-size: 13px; color: #9aa8c0; margin-bottom: 6px; }
+  input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #33405f; background: #0f1420; color: #e6edf7; font: inherit; }
+  button { margin-top: 12px; width: 100%; padding: 10px 12px; border: 0; border-radius: 8px; background: #4f8cff; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  .hint { font-size: 12px; margin: 14px 0 0; }
+</style></head>
+<body><main>
+  <h1>需要访问令牌</h1>
+  <p>会话未携带有效凭证（链接可能来自聊天/书签，或 Cookie 已过期）。输入部署时设置的 <code>XBK_CONSOLE_TOKEN</code> 继续。</p>
+  <form method="get" action="/">
+    <label for="token">访问令牌（至少 16 字符）</label>
+    <input id="token" name="token" type="password" autocomplete="current-password" minlength="16" required autofocus>
+    <button type="submit">打开控制台</button>
+  </form>
+  <p class="hint">令牌只用于本次登录；登录后的地址栏会带 <code>?token=</code>，请勿把该链接转发给他人。</p>
+</main></body></html>`
+}
 // 会话 Cookie 名（Sourcery G_oJ：ESM import/静态资产请求无法带 Authorization 头，
 // 页面鉴权后下发 HttpOnly Cookie，浏览器同源请求自动携带）。
 const SESSION_COOKIE = 'xbk_session'
@@ -1613,6 +1643,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (!authorize(req, token, url.searchParams)) {
+      // 审查 #224：GET / 未授权时给可自助恢复的登录页，而不是裸 JSON；API/静态资源仍回 JSON。
+      if (req.method === 'GET' && url.pathname === '/') {
+        res.setHeader('Content-Security-Policy', CSP_HEADER)
+        res.setHeader('Cache-Control', 'no-store')
+        res.setHeader('X-Content-Type-Options', 'nosniff')
+        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(renderUnauthorizedPage())
+        return
+      }
       sendJson(res, 401, { error: 'unauthorized' })
       return
     }
@@ -1631,15 +1670,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const state = readStatus(stateDir)
       const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
       // 鉴权通过后下发会话 Cookie（Sourcery G_oJ）：HttpOnly（JS 不可读，XSS 拿不走）、
-      // SameSite=Strict（跨站请求不携带）、Path=/；token 本身就是会话凭证，无需另发随机值。
+      // SameSite=Lax（审查 #224：Strict 会让「从聊天点链接」的跨站顶层导航不带 Cookie，
+      // 首屏必 401；Lax 对同源子请求照常携带，而写动作 POST /trigger 本就不收 Cookie，
+      // 因此不扩大 CSRF 面）、Path=/；token 本身就是会话凭证，无需另发随机值。
       // Max-Age 30 天：自用工具，过期后重新打开 ?token= 链接即续期。
       // Sourcery 3x High（Cookie 无 Secure）：本服务部署在明文 HTTP 上（无 TLS 终结点），
       // Secure 属性会让浏览器拒绝在 http:// 上发送/存储 Cookie，控制台直接不可用——
       // 这是部署形态的固有权衡，不是代码缺陷可修；上 HTTPS（反代/自签）后应第一时间
-      // 补 Secure + __Host- 前缀。缓解：HttpOnly（XSS 拿不走）+ SameSite=Strict（跨站不带）
-      // + Max-Age 从 30 天收窄到 1 天（凭证下线窗口 30d → 1d）+ Referrer-Policy（见下）。
+      // 补 Secure + __Host- 前缀。缓解：HttpOnly（XSS 拿不走）+ SameSite=Lax（跨站顶层
+      // 导航可带，但 POST 不收 Cookie）+ Max-Age 从 30 天收窄到 1 天 + Referrer-Policy（见下）。
       res.setHeader('Set-Cookie',
-        `xbk_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`)
+        `xbk_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400`)
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       // Sourcery Session-users-cannot-trigger x2：用户经 Cookie 会话（无 ?token=）打开页面时，
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
@@ -2284,6 +2325,7 @@ module.exports = {
   createConsole,
   consoleStateDir,
   finishRun,
+  renderUnauthorizedPage,
   isValidToken,
   timingSafeEqualStr,
   acquireLock,

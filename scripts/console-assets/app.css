@@ -139,6 +139,15 @@
     color: var(--bad-fg); font-size: var(--fs-sm);
   }
   .alert-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad-fg); flex: 0 0 8px; }
+  .alert-main { flex: 1 1 220px; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .alert-sub { font-weight: 400; opacity: .9; overflow-wrap: anywhere; }
+  .alert-banner .btn { flex: 0 0 auto; }
+  .alert-action {
+    flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+    min-height: 36px; padding: 0 14px; border-radius: var(--r-md);
+    border: 1px solid var(--bad-line); color: var(--bad-fg); text-decoration: none;
+    font-size: var(--fs-sm); font-weight: 600; background: transparent;
+  }
   .alert-text { flex: 1 1 220px; min-width: 0; }
   .alert-link { background: none; border: 0; color: var(--bad-fg); font-size: var(--fs-sm); text-decoration: underline; cursor: pointer; min-height: 32px; padding: 0 2px; }
 

@@ -67,6 +67,9 @@ check('stryker 直跑被配置期闸门拦截（含 CI/放行豁免）', () => {
   const strykerBin = '/repo/node_modules/@stryker-mutator/core/bin/stryker.js'
   assert.strictEqual(shouldBlock(strykerBin, {}), true, '本机 stryker 直跑必须拦')
   assert.strictEqual(shouldBlock(strykerBin, { GITHUB_ACTIONS: 'true' }), false, 'CI 必须放行')
+  // 审查 #234：旧实现用真值判断，GITHUB_ACTIONS=0/false 也会放行本机变异。
+  assert.strictEqual(shouldBlock(strykerBin, { GITHUB_ACTIONS: '0' }), true, 'GITHUB_ACTIONS=0 不得放行')
+  assert.strictEqual(shouldBlock(strykerBin, { GITHUB_ACTIONS: 'false' }), true, 'GITHUB_ACTIONS=false 不得放行')
   assert.strictEqual(shouldBlock(strykerBin, { XBK_ALLOW_LOCAL_MUTATION: '1' }), false, '显式放行必须可用')
   assert.strictEqual(shouldBlock('/repo/scripts/check-mutation-ranges.js', {}), false,
     '自家脚本 require 配置不得误伤')

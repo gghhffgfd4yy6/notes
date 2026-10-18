@@ -725,15 +725,23 @@ async function main () {
       const r304 = await requestBuffer(port, 'GET', '/assets/app.css', { token: TOKEN, headers: { 'if-none-match': h } })
       assert.strictEqual(r304.status, 304, `If-None-Match: ${h} 必须命中 304`)
     }
-    // 页面响应必须下发会话 Cookie（HttpOnly/SameSite=Strict）
+    // 页面响应必须下发会话 Cookie（HttpOnly/SameSite=Lax）— 审查 #224：Strict 会让聊天
+    // 链接的跨站顶层导航不带 Cookie，首屏必 401；写动作 POST 本就不收 Cookie。
     const page = await request(port, 'GET', '/', { token: TOKEN })
     const cookieHeader = (page.headers['set-cookie'] || []).find(c => c.startsWith('xbk_session='))
     assert.ok(cookieHeader, '/ 鉴权后下发会话 Cookie')
     // Sourcery Issued-session-cookie：不能只看前缀——属性逐项锁死，错值或缺属性必须红。
     assert.ok(cookieHeader.includes('HttpOnly'), 'Cookie 含 HttpOnly')
-    assert.ok(cookieHeader.includes('SameSite=Strict'), 'Cookie 含 SameSite=Strict')
+    assert.ok(cookieHeader.includes('SameSite=Lax'), 'Cookie 含 SameSite=Lax')
     assert.ok(cookieHeader.includes('Path=/'), 'Cookie 含 Path=/')
     assert.ok(cookieHeader.includes(`xbk_session=${encodeURIComponent(TOKEN)}`), 'Cookie 值=encoded token')
+    // 审查 #224：未授权首屏必须是可自助恢复的登录页，不是裸 JSON。
+    const unauth = await request(port, 'GET', '/')
+    assert.strictEqual(unauth.status, 401, '未授权 GET / 回 401')
+    assert.match(unauth.headers['content-type'], /text\/html/, '未授权首屏必须是 HTML')
+    assert.ok(unauth.text.includes('需要访问令牌'), '登录页含标题')
+    assert.ok(unauth.text.includes('<form method="get" action="/">'), '登录页含 token 表单')
+    assert.ok(!unauth.text.includes('{"error":"unauthorized"}'), '不得回裸 JSON')
     // Sourcery G_4Kk：资产 URL 不再拼 tokenSuffix（Cookie 通道已覆盖，URL 零凭证重复）
     assert.ok(!page.text.includes('/assets/app.css?token='), '资产 URL 不含 ?token=')
     assert.ok(!page.text.includes('/assets/app.js?token='), '脚本 URL 不含 ?token=')
@@ -2931,7 +2939,7 @@ async function main () {
   await aok('结构红线: 非概览/日志页停止主轮询（防 5s 闪屏）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes("if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)"), '推送记录/配置/系统必须停止主轮询')
-    assert.ok(/\[refreshSplit, locking, tab, autoRefresh\]/.test(src), '轮询 effect 必须随 tab / 暂停开关变化重跑')
+    assert.ok(/\[refreshSplit, locking, tab, autoRefresh, authExpired\]/.test(src), '轮询 effect 必须随 tab / 暂停开关 / 凭证失效状态变化重跑')
   })
 
   await aok('结构红线: 配置页过滤规则/渠道不拼成一条长串', () => {
@@ -2939,7 +2947,7 @@ async function main () {
     assert.ok(src.includes('function FilterRules ('), '必须有 FilterRules 组件（一条规则一行）')
     assert.ok(src.includes('function ChannelList ('), '必须有 ChannelList 组件（渠道 chip）')
     const start = src.indexOf('function ConfigPanel ')
-    const end = src.indexOf('function SystemPanel', start)
+    const end = src.indexOf('function SysPanel', start)
     const seg = src.slice(start, end)
     assert.ok(/<\$\{FilterRules\}/.test(seg), '配置页必须使用 FilterRules')
     assert.ok(/<\$\{ChannelList\}/.test(seg), '配置页必须使用 ChannelList')
