@@ -694,7 +694,7 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
     <${PanelHead} title="手动触发" />
     <div class="btn-row">
       ${ACTION_DEFS.map((a) => html`<div class="btn-item" key=${a.key}>
-        <button class="btn ${a.cls}" disabled=${locking} onClick=${() => ask(a.key)}>${a.label}</button>
+        <${Button} variant=${a.cls.replace(/^btn-/, '')} disabled=${locking} onClick=${() => ask(a.key)}>${a.label}<//>
         <span class="btn-desc">${a.desc}</span>
       </div>`)}
     </div>
