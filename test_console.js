@@ -2831,10 +2831,15 @@ async function main () {
     assert.strictEqual(finishRun({ id: 'x.2', finishedAt: 0, exitCode: null, _stateDir: dir2, _lockToken: 'tok2' }, 0), true)
     assert.strictEqual(JSON.parse(fs.readFileSync(lockPath(dir2), 'utf8')).released, true,
       'finishRun 必须释放触发锁')
-    // 接线：exit 与 close 都调用 finishRun（close 只做剩余清理）
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
-    assert.ok(/child\.on\('exit'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'exit 必须收尾')
-    assert.ok(/child\.on\('close'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'close 必须幂等补收尾')
+    // 接线：exit 与 close 都调用 finishRun（close 只做剩余清理）。
+    // 变异沙箱里 console.js:498（child.on('exit')）落在 part1（1-563）变异范围内，
+    // 插桩插入的 stryMutAct_* 会撑爆 400 字符窗口——源码窗口断言只对原始源文件有意义；
+    // 该接线的行为语义由上面的 finishRun 单元断言（exit 即落 / close 幂等）兜底。
+    if (process.env.XBK_MUTATION_CHILD !== '1') {
+      const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+      assert.ok(/child\.on\('exit'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'exit 必须收尾')
+      assert.ok(/child\.on\('close'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'close 必须幂等补收尾')
+    }
   })
   await aok('readRunHistory: CANCEL 取消留痕成独立条目且不污染相邻轮（审查 #229 S7/D1-N3）', () => {
     const { readRunHistory } = require('./scripts/status')
