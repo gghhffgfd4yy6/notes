@@ -500,4 +500,19 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **损坏降级**：覆盖文件解析失败/不可读/超限时优先沿用进程内 last-known-good，仅首次加载即损坏才回退代码默认；降级轮**不清 `_f`、不推进 `filter.hash`**，所以既不重评补推历史条目、也不放宽规则。三处告警同时给出：`console.warn`、`run.log` WARN 行、控制台红条。
 - **写端点仅 Bearer**：只认 `Authorization: Bearer <token>`，固定路径、0600、`O_EXCL` 并发锁（10s 陈旧接管）、`baseRevision` CAS；读-校验-写-审计在锁内同步完成、中间不 `await`。状态码：400 校验失败（含 `.*` 全命中未确认）、413 体积超限、415 非 JSON/压缩体、401 缺 Bearer 或仅 Cookie（`cookie_not_allowed`）、400 URL 带 token（`query_token_not_allowed`）、409 revision 冲突/写锁（`write_busy`）/覆盖文件损坏未确认（`store_corrupt`）、503 re2 不可用、500 写盘失败。
 - **审计与回滚**：`filter-rules.audit.ndjson` append-only（0600），每条含 `ts/actor/action/revision/changedFields/prevHash/entryHash`，可检测断链与静默删除；只记字段名与 hash，不记规则正文、token 或绝对路径（不声称防 root 篡改）。保存前备份 `filter-rules.bak.<rev>.json` 保留 3 代；回滚与恢复默认都以 `revision+1` 写入（线性历史，不倒退版本号），删除覆盖文件即恢复代码默认。
-- **门禁**：新增 `xbk_filter_store.js` 与 `test_filter_store.js` 纳入变异矩阵（`filter-store` 全文件段）；`scripts/console.js` 3380 行按变异体预算重拆 6 段（`console-part1..6`，边界 563/1126/1689/2252/2815），`xbk_function_v3.js` 行段改为 1-541；矩阵现为 26 段（22 TAP + 4 command）。
+- **门禁**：新增 `xbk_filter_store.js` 与 `test_filter_store.js` 纳入变异矩阵（`filter-store` 全文件段）；`scripts/console.js` 按变异体预算重拆 6 段（`console-part1..6`，边界 563/1126/1689/2252/2815），`xbk_function_v3.js` 行段覆盖到文件尾；矩阵现为 26 段（22 TAP + 4 command）。
+
+## v3.311 — 过滤规则控制面评审修复（Sourcery 12 项）
+
+- **陈旧锁接管（High）**：陈旧接管改为「原子 rename 到唯一 stale 名 + inode/mtime 归属核验」再重试 `open wx`；两个写者同时判同一把旧锁过期时，后到者搬走的是先到者**刚建的新锁**（inode 不符）⇒ 用 `link` 原样放回并放弃本轮。绝不再按路径 `unlink` 判定过期的锁，两人不可能同时进写段。
+- **恢复默认不再清零历史（High）**：`/restore` 的 `to:'default'` 改为写 `{schema:1, revision:cur+1, filter:{}}` 覆盖文件（不再删文件），回滚备份同样写 `revision+1`；GET 的 revision/备份列表保持连续，陈旧客户端无法再用旧 `baseRevision` 过 CAS。README / SYSTEM_CONTRACT 的「恢复默认=删除文件」措辞同步修正。
+- **审计与备份失败不再假成功**：审计写失败（含 `O_NOFOLLOW` 拒绝 symlink、非普通文件）⇒ 覆盖文件回滚为保存前内容并返回 500 `audit_failed`；保存前备份失败返回 500 `backup_failed` 且不替换；备份剪枝移到整个保存（含审计）成功之后，任何失败路径都不剪掉最老备份。
+- **审计文件超 4 MiB**：写规则前先 `stat` 审计大小，超限返回 507 `audit_full`（不再按 genesis 续写把链弄断），响应 `errors` 说明需人工归档 `filter-rules.audit.ndjson`。
+- **回滚契约变更**：`POST /api/config/filter/restore` 新增必填 `baseRevision`（页面加载时的 revision）：缺失/非法 → 400 `invalid_revision`；与当前不一致 → 409 `revision_mismatch`（带当前 revision）。**旧客户端不带该字段会被拒绝**。回滚前先备份当前合法覆盖，被替换的那一代仍可回滚。
+- **补推预览**：缓存读不到（缺失/超限/坏 JSON/非数组）返回 `available:false` + `code:'cache_unavailable'`，`scanned`/`reEvalCount` 为 null、`samples:[]`（HTTP 仍 200），页面显示「无法读取推送历史，本次不显示补推估算」而不是 0；`capped` 改按 `_f` 记录条数判定（只扫 `_f`，不再被缓存总条数虚高）；新增 `zktApplied` 并按 `Config.keyword.zkt_gjc` 白名单排除标题不匹配的记录（与运行期同源，拿不到引擎时不排除并标 `zktApplied:false`）。
+- **锁接管再收紧（复核 P1）**：只在「锁内 pid 不可解析或进程已死」时才接管；持有者活着时即使 mtime >10s 也直接 409。接管用 `O_EXCL` 的 `.takeover` 标记串行化，进临界区后按 dev/ino/mtime 复核同一 inode 才 unlink——不再 rename 活锁（那会让原持有者失去互斥），也不在 `link` 失败时删别人的锁。
+- **读面与运行侧同口径（复核 P1）**：控制台 `GET /api/config/filter` 与 `qinglong --check` 也传 `deps` 做深度校验；手工写入编译不了的规则时，页面显示损坏红条、`--check` 报损坏，而不是「页面全绿、运行侧降级」。为此 `xbk_function_v3` 导出 `compileUserRegex` 与 `_normalizeReInput`。
+- **保存只写改过的字段**：控制台保存提交 `dirtyFields` 子集，未改动的代码默认不再被钉进覆盖文件（否则后续版本改默认，该实例收不到）。
+- **审计边界与失败可见**：审计 4 MiB 上限按「当前大小 + 一行预留（1 KiB）」判定，避免最后一次 append 恰好越界后读取判假断链；审计路径为 symlink 时统一走 500 `audit_failed`（不因目标大小改报 507）；审计/回滚失败响应带 `rolledBack`/`rollbackMode`，有原文时不再用「删除」兜底（删除会把保存前规则变成代码默认）。
+- **FIFO 不再挂死**：审计链读取加 `openNonBlocking`、追加加 `O_NONBLOCK`，预置 FIFO 时立即失败而不是阻塞事件循环。
+- **门禁**：`test_console.js` 新增靶向用例（锁接管竞态、恢复默认 revision 连续、审计失败回滚 / symlink 拒绝 / 4 MiB 拒绝、备份失败、剪枝时机、坏缓存、`_f` capped、回滚 baseRevision）；`scripts/console.js` 增至 3625 行，变异矩阵末段同步为 `console-part6: 2816-3625`、`v3-entry` 到 1-544（边界 563/1126/1689/2252/2815 不变）。

@@ -2276,8 +2276,11 @@ function fieldErrorMap (errors) {
   return map
 }
 
-// 补推口径（规格 §4.4）：最多扫 5000 条，超过显示「≥5000」。
+// 补推口径（规格 §4.4）：最多扫 5000 条 _f 记录，超过显示「≥5000」。
+// 缓存读不到时服务端回 available:false（scanned/reEvalCount 为 null）——此时显示「未知」，
+// 不能把 null 格式化成 0 条（那等于把「读不到」说成「没有影响」）。
 function reEvalText (preview) {
+  if (preview && preview.available === false) return '无法读取推送历史，本次不显示补推估算'
   const n = preview && preview.capped === true ? '≥5000' : fmtNum(preview ? preview.reEvalCount : null)
   return `将重评 ${n} 条历史被过滤记录，后续每轮最多补推 Config.push.maxPerRun（默认 100）条。`
 }
@@ -2455,7 +2458,11 @@ function FilterRulesPanel ({ onSync }) {
     setErr('')
     setFieldErrors({})
     setNotice(null)
-    const candidate = { ...draft }
+    // 只提交用户真正改过的字段：把没动过的「当前生效值」也整份写进覆盖文件，等于把
+    // 代码默认永久钉死——后续版本改默认时这台实例收不到（评审 Medium）。
+    // 缺字段的语义本来就是「回代码默认」，所以省略未改字段不改变本次保存的结果。
+    const candidate = {}
+    for (const name of dirtyFields) candidate[name] = draft[name]
     setBusy('validate')
     try {
       // confirmWideMatch:true 只关掉服务端的「宽匹配需确认」闸；真正的二次确认由本页弹窗
@@ -2557,14 +2564,20 @@ function FilterRulesPanel ({ onSync }) {
     }
   }
 
-  const doRestore = async (to) => {
+  const doRestore = async (to, baseRevision) => {
     setBusy('restore')
     setErr('')
     try {
-      const res = await apiPostFilterRestore({ to: to === 'default' ? 'default' : Number(to), confirm: true })
+      const res = await apiPostFilterRestore({
+        to: to === 'default' ? 'default' : Number(to),
+        confirm: true,
+        baseRevision
+      })
       if (!res.ok) {
-        showFailure(res, '回滚失败')
+        const code = showFailure(res, '回滚失败')
         setDialog(null)
+        // 陈旧页面（baseRevision 与服务端不一致）：自动重新加载，让用户在新版本上重试。
+        if (code === 'revision_mismatch') { try { await load() } catch (e) { /* 顶部错误已提示 */ } }
         return
       }
       const payload = res.data && typeof res.data === 'object' ? res.data : {}
@@ -2574,7 +2587,7 @@ function FilterRulesPanel ({ onSync }) {
       setNotice({
         tone: 'ok',
         text: to === 'default'
-          ? `已恢复代码默认（审计 revision${revText || ' 已递增'}），下一轮生效。`
+          ? `已恢复代码默认（写入空覆盖文件 filter:{}，revision${revText || ' 已递增'}），下一轮生效。`
           : `已回滚到备份 r${to}，写入新 revision${revText}，下一轮生效。`
       })
       // 回滚/恢复默认成功后重新 GET：来源/生效状态/备份列表都以服务端为准。
@@ -2637,11 +2650,11 @@ function FilterRulesPanel ({ onSync }) {
       return html`<${ConfirmDialog} open=${true} title="确认回滚过滤规则"
         confirmLabel=${busy === 'restore' ? '回滚中…' : '确认回滚'} busy=${busy === 'restore'}
         onCancel=${closeDialog}
-        onConfirm=${() => doRestore(dialog.to)}>
+        onConfirm=${() => doRestore(dialog.to, dialog.baseRevision)}>
         <div class="fr-dialog-line">${dialog.to === 'default'
-          ? '删除覆盖文件，恢复代码默认。'
+          ? '写入空覆盖文件（filter:{}、revision+1）恢复代码默认，不删除文件——revision 与备份列表保持连续。'
           : `用备份 r${dialog.to} 的内容写入新 revision（revision 只增不减，线性历史）。`}</div>
-        <div class="modal-note">回滚同样下一轮生效；当前正在跑的一轮不换规则。</div>
+        <div class="modal-note">回滚前会先备份当前配置（r${dialog.baseRevision}）；同样下一轮生效，当前正在跑的一轮不换规则。</div>
       <//>`
     }
     if (dialog.kind === 'reload') {
@@ -2726,7 +2739,9 @@ function FilterRulesPanel ({ onSync }) {
       ${preview && html`<div class="fr-preview" aria-live="polite">
         <div class="fr-preview-head">补推影响预览</div>
         <div class="fr-preview-main">${reEvalText(preview)}</div>
-        <div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（达 5000 上限，实际可能更多）' : ''} · 缓存读取 ${preview.cacheStatus || '—'}</div>
+        ${preview.available === false
+          ? html`<div class="fr-preview-meta">缓存读取 ${preview.cacheStatus || '—'}（${preview.code || 'cache_unavailable'}）</div>`
+          : html`<div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（被过滤记录超过 5000 条，实际可能更多）' : ''}${preview.zktApplied === true ? ' · 已按 zkt_gjc 白名单排除不匹配标题' : ''} · 缓存读取 ${preview.cacheStatus || '—'}</div>`}
         ${Array.isArray(preview.samples) && preview.samples.length > 0 && html`<ul class="fr-samples">
           ${preview.samples.map((s, i) => html`<li key=${s && s.id !== null && s.id !== undefined ? String(s.id) : `sample-${i}`}>
             <span class="fr-sample-title">${s && s.title ? s.title : '（无标题）'}</span>
@@ -2752,10 +2767,10 @@ function FilterRulesPanel ({ onSync }) {
           <label class="fr-label" for="filter-restore-to">回滚目标</label>
           <select id="filter-restore-to" class="fr-select" value=${restoreTo} disabled=${!!busy || loading}
             onChange=${(e) => setRestoreTo(e.target.value)}>
-            <option value="default">恢复代码默认（删除覆盖文件）</option>
+            <option value="default">恢复代码默认（写入空覆盖文件）</option>
             ${backups.map((r) => html`<option key=${r} value=${String(r)}>备份 r${r}</option>`)}
           </select>
-          <${Button} variant="danger" disabled=${!!busy || loading} onClick=${() => setDialog({ kind: 'restore', to: restoreTo })}>回滚<//>
+          <${Button} variant="danger" disabled=${!!busy || loading} onClick=${() => setDialog({ kind: 'restore', to: restoreTo, baseRevision: revision })}>回滚<//>
         </div>
         <div class="fr-field-hint">${backups.length > 0
           ? `可用备份：${backups.map((r) => `r${r}`).join('、')}（保存前备份上一版，最多保留 3 代）`

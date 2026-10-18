@@ -156,7 +156,7 @@ filter: {
 - **每轮读一次**：`App.run` 在每轮开头读取并构造本轮局部的生效规则；正在跑的一轮不换规则，控制台触发的新进程或常驻的下一轮才生效。每轮写 `filter-rules.applied.json` 快照（revision/source/hash/appliedAt）供控制台显示「已生效」。
 - **推荐走控制台「过滤规则」页**：保存时做四道校验（字段白名单/长度 → 行语法 → RE2 与嵌套量词 → 编译对账），非法规则直接 400 拒绝、不落盘；手改文件没有这层保护，写坏后按下面的降级处理。
 - **损坏降级**：文件解析失败/不可读/超限时优先沿用进程内上一次合法规则，仅首次加载即坏才回退代码默认；降级轮**不清 `_f`、不推进 `filter.hash`**，所以不会把历史被过滤条目重评补推，也不会放宽规则，并在 `console.warn`、`run.log` WARN 与控制台红条三处告警。
-- **回滚/恢复默认**：控制台保存前自动备份 `filter-rules.bak.<revision>.json`（保留最近 3 代），可回滚到任一备份，或删除覆盖文件恢复代码默认；回滚同样以 `revision+1` 写入，审计链保持线性。审计在 `filter-rules.audit.ndjson`（append-only，只记动作/字段名/revision 与 hash，不记规则正文），并发写用 `filter-rules.lock` 串行化。
+- **回滚/恢复默认**：控制台保存前自动备份 `filter-rules.bak.<revision>.json`（保留最近 3 代），可回滚到任一备份，或恢复代码默认（写空覆盖文件 `filter:{}`，`revision+1`，**不删文件**——删文件会让 revision 归零、备份列表消失）。两者都以 `revision+1` 写入，审计链保持线性；回滚请求必须带页面加载时的 `baseRevision`（不一致返回 409 `revision_mismatch`，防止陈旧页面覆盖新版本）。审计在 `filter-rules.audit.ndjson`（append-only，只记动作/字段名/revision 与 hash，不记规则正文），并发写用 `filter-rules.lock` 串行化。
 
 ## 常用环境变量
 

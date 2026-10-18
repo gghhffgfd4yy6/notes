@@ -52,7 +52,12 @@ const {
   REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE,
   // 导出端点的读取上限直接取实现常量（D2-N11：修前测试自己写死 32MiB，实现改 64MiB 后
   // 用例仍在 32MiB 造夹具 → 以为测了 tooLarge，实际测的是 invalid）
-  MESSAGES_MAX_BYTES
+  MESSAGES_MAX_BYTES,
+  // 过滤规则评审修复靶向用例：审计上限 / 锁接管原子性 / 真实 deps（注入 zkt_gjc 用）
+  FILTER_AUDIT_MAX_BYTES,
+  filterLockIdentity,
+  claimStaleFilterLock,
+  runtimeFilterDeps
 } = require('./scripts/console')
 const { readMessages } = require('./scripts/status')
 
@@ -966,7 +971,7 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
-  await aok('过滤规则 restore: 备份（保留 3 代 0600）+ 回滚 revision+1 + 恢复默认删文件 + confirm/404', async () => {
+  await aok('过滤规则 restore: 备份（保留 3 代 0600）+ 回滚 revision+1 + baseRevision 闸 + 恢复默认写空覆盖（不删文件）', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
@@ -981,25 +986,51 @@ async function filterRuleApiTests () {
       assert.strictEqual(noConfirm.status, 400)
       assert.strictEqual(JSON.parse(noConfirm.text).errors[0].code, 'confirm_required')
 
-      const missing = await postFilterJson(port, '/api/config/filter/restore', { to: 999, confirm: true })
+      // B9：旧客户端不带 baseRevision → 400 invalid_revision，且不落盘
+      const noBase = await postFilterJson(port, '/api/config/filter/restore', { to: 1, confirm: true })
+      assert.strictEqual(noBase.status, 400)
+      assert.strictEqual(JSON.parse(noBase.text).code, 'invalid_revision')
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.file, 64 * 1024).text).revision, 2, '缺 baseRevision 不得改文件')
+
+      const missing = await postFilterJson(port, '/api/config/filter/restore', { to: 999, confirm: true, baseRevision: 2 })
       assert.strictEqual(missing.status, 404)
       assert.strictEqual(JSON.parse(missing.text).code, 'backup_not_found')
 
-      const restored = await postFilterJson(port, '/api/config/filter/restore', { to: 1, confirm: true })
+      // B9：陈旧回滚页（baseRevision 落后）→ 409，带当前 revision，文件不动
+      const stale = await postFilterJson(port, '/api/config/filter/restore', { to: 1, confirm: true, baseRevision: 1 })
+      assert.strictEqual(stale.status, 409)
+      const staleBody = JSON.parse(stale.text)
+      assert.strictEqual(staleBody.code, 'revision_mismatch')
+      assert.strictEqual(staleBody.revision, 2, '必须回当前 revision')
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.file, 64 * 1024).text).revision, 2, '409 不得改文件')
+
+      const restored = await postFilterJson(port, '/api/config/filter/restore', { to: 1, confirm: true, baseRevision: 2 })
       assert.strictEqual(restored.status, 200)
       const restoredBody = JSON.parse(restored.text)
       assert.strictEqual(restoredBody.restoredFrom, 1)
       assert.strictEqual(restoredBody.revision, 3, '回滚必须 revision+1（线性历史）')
       assert.strictEqual(JSON.parse(readSafeTextResult(paths.file, 64 * 1024).text).filter.pingbibiaoti, 'A')
+      // B8：被替换的当前版本（r2=B）必须先备份，之后还能回滚回来
+      assert.strictEqual(fs.existsSync(paths.backupFor(2)), true, '回滚前必须备份被替换的当前版本')
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.backupFor(2), 64 * 1024).text).filter.pingbibiaoti, 'B')
 
-      const reset = await postFilterJson(port, '/api/config/filter/restore', { to: 'default', confirm: true })
+      // B2：恢复默认 = 写空覆盖（revision+1），不删文件、revision 不归零、备份列表仍在
+      const reset = await postFilterJson(port, '/api/config/filter/restore', { to: 'default', confirm: true, baseRevision: 3 })
       assert.strictEqual(reset.status, 200)
       assert.strictEqual(JSON.parse(reset.text).restoredFrom, 'default')
       assert.strictEqual(JSON.parse(reset.text).revision, 4)
-      assert.strictEqual(fs.existsSync(paths.file), false, '恢复默认 = 删除覆盖文件')
+      assert.strictEqual(fs.existsSync(paths.file), true, '恢复默认不得删除覆盖文件')
+      const diskAfterReset = JSON.parse(readSafeTextResult(paths.file, 64 * 1024).text)
+      assert.strictEqual(diskAfterReset.revision, 4)
+      assert.deepStrictEqual(diskAfterReset.filter, {}, '恢复默认 = 空覆盖（逐字段回代码默认）')
+      assert.strictEqual(fs.existsSync(paths.backupFor(3)), true, '恢复默认前必须备份当前 r3')
 
       const back = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
-      assert.strictEqual(back.source, 'default')
+      assert.strictEqual(back.source, 'override', '恢复默认后覆盖文件仍是合法 override')
+      assert.strictEqual(back.revision, 4, 'GET revision 必须延续（不归零）')
+      assert.strictEqual(back.filter.pingbitime, '5', '空覆盖 ⇒ 逐字段回代码默认')
+      const bakNames = fs.readdirSync(dir).filter((n) => /^filter-rules\.bak\.\d+\.json$/.test(n))
+      assert.ok(bakNames.length >= 2, `恢复默认后备份列表不得消失（实际 ${bakNames.join(',')}）`)
     } finally { server.close() }
   })
 
@@ -1024,6 +1055,61 @@ async function filterRuleApiTests () {
       assert.strictEqual(JSON.parse(takeover.text).revision, 5)
       assert.strictEqual(fs.existsSync(paths.lock), false, '接管后保存结束必须释放自己的锁')
     } finally { server.close() }
+  })
+
+  await aok('过滤锁: 持有者进程还活着 → 绝不接管（即使 mtime 已过期）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      // 活锁：pid 是当前测试进程（活），mtime 已过期——旧实现会按 mtime 抢走，导致原持有者失去互斥。
+      fs.writeFileSync(paths.lock, JSON.stringify({ pid: process.pid, startedAt: Date.now() - 60000, token: 'live-holder' }), { mode: 0o600 })
+      const old = new Date(Date.now() - 11000)
+      fs.utimesSync(paths.lock, old, old)
+      const blocked = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } })
+      assert.strictEqual(blocked.status, 409, '活锁必须 409 write_busy')
+      assert.strictEqual(JSON.parse(blocked.text).code, 'write_busy')
+      assert.strictEqual(JSON.parse(fs.readFileSync(paths.lock, 'utf8')).token, 'live-holder', '活锁不得被搬走/覆盖')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则 GET: 手工编辑出编译不了的规则 → source=corrupt（与 App.run 同口径）', async () => {
+    let re2Ok = false
+    try { require('re2'); re2Ok = true } catch (e) { re2Ok = false }
+    if (!re2Ok) { console.log('  ⏭ 跳过：本机无 re2（深度校验按设计跳过）'); return }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      // 结构合法但正则编译不了的覆盖文件：GET 若只做结构校验会显示 override（页面全绿），
+      // 而 App.run 会降级。这里锁死「读面必须同口径报 corrupt」。
+      fs.writeFileSync(paths.file, JSON.stringify({ schema: 1, revision: 2, filter: { pingbibiaoti: '(' } }), { mode: 0o600 })
+      const res = await request(port, 'GET', '/api/config/filter', { token: TOKEN })
+      assert.strictEqual(res.status, 200)
+      const body = JSON.parse(res.text)
+      assert.strictEqual(body.source, 'corrupt', '编译不了的规则必须显示为损坏')
+      assert.strictEqual(body.error && body.error.code, 'store_corrupt')
+      assert.strictEqual(body.revision, 0, '损坏时 revision 强制 0')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 审计文件接近 4 MiB（差 512B）→ 507 audit_full（预留行宽）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      fs.writeFileSync(paths.audit, Buffer.alloc(FILTER_AUDIT_MAX_BYTES - 512, 0x0a), { mode: 0o600 })
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } })
+      assert.strictEqual(res.status, 507, '剩余空间不够一行审计时必须提前拒绝')
+      assert.strictEqual(JSON.parse(res.text).code, 'audit_full')
+      assert.strictEqual(fs.existsSync(paths.file), false, '拒绝时不得写规则文件')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则页: 只提交用户改过的字段（未改的代码默认不得钉死）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    assert.ok(src.includes('for (const name of dirtyFields) candidate[name] = draft[name]'),
+      '保存候选必须只含 dirtyFields（整份 draft 会把代码默认钉死）')
   })
 
   await aok('过滤规则审计: 0600 / 不含规则正文与路径 / prevHash 链可复算 / 手改一行后 GET 报断链', async () => {
@@ -1087,6 +1173,8 @@ async function filterRuleApiTests () {
       const res = await postFilterJson(port, '/api/config/filter/preview', { filter: { pingbibiaoti: 'blocked' }, limit: 10 })
       assert.strictEqual(res.status, 200)
       const body = JSON.parse(res.text)
+      assert.strictEqual(body.available, true, '缓存可读时 available:true')
+      assert.strictEqual(body.zktApplied, false, '默认 zkt_gjc 为空 ⇒ 未应用白名单')
       assert.strictEqual(body.scanned, 3, '只扫 _f===true 记录')
       assert.strictEqual(body.reEvalCount, 1, 'blocked 的仍被挡，free 会补推')
       assert.strictEqual(body.capped, false)
@@ -1153,6 +1241,202 @@ async function filterRuleApiTests () {
       try { fs.rmdirSync(paths.file) } catch (e) { /* 已清理 */ }
       server.close()
     }
+  })
+
+  // ── 评审修复靶向用例（Sourcery 12 项）────────────────────────────────────
+  await aok('过滤锁: 两个写者同判同一把旧锁过期 → 只有先到者完成接管（rename + inode 核验）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-lock-'))
+    const paths = filterPaths(dir)
+    try {
+      fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, startedAt: 1 }), { mode: 0o600 })
+      const old = new Date(Date.now() - 11000)
+      fs.utimesSync(paths.lock, old, old)
+      // 竞态起点：两个写者在「判过期」这一刻拿到同一份快照。
+      const judgedA = filterLockIdentity(paths.lock)
+      const judgedB = filterLockIdentity(paths.lock)
+      assert.strictEqual(claimStaleFilterLock(paths.lock, judgedA, 'token-a'), true, '先到者应完成接管')
+      // 先到者接管后立刻建新锁并进入写段（内容带自己的 token）。
+      fs.writeFileSync(paths.lock, JSON.stringify({ pid: 222, token: 'token-a' }), { mode: 0o600 })
+      // 后到者仍按旧快照接管：rename 成功但搬走的是先到者的新锁 ⇒ 必须放弃并原样放回。
+      assert.strictEqual(claimStaleFilterLock(paths.lock, judgedB, 'token-b'), false, '后到者不得完成接管')
+      assert.strictEqual(fs.existsSync(paths.lock), true, '先到者的新锁必须还在原路径')
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.lock, 4096).text).token, 'token-a', '新锁内容不得被替换')
+      assert.strictEqual(fs.existsSync(`${paths.lock}.stale.token-b`), false, '后到者的 stale 临时名必须清理')
+      // 后到者随后的 open wx（acquireFilterLock 的第一步）必须失败：同一时刻只能有一个写者进写段。
+      assert.throws(() => fs.openSync(paths.lock, 'wx', 0o600), /EEXIST/, '锁仍被占用：第二个写者进不了写段')
+    } finally {
+      try { fs.unlinkSync(paths.lock) } catch (e) { /* 已清理 */ }
+    }
+  })
+
+  await aok('过滤规则保存: 审计写失败 → 500 audit_failed 且回滚覆盖文件；失败保存不剪最老备份', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      for (let rev = 1; rev <= 4; rev++) {
+        assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: rev - 1, filter: { pingbibiaoti: `v${rev}` } })).status, 200)
+      }
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      assert.strictEqual(fs.existsSync(paths.backupFor(1)), true, '前置：4 次保存后应有 bak.1')
+      // 审计路径换成目录：open(O_WRONLY|O_APPEND|O_NOFOLLOW) 必失败（EISDIR），stat.size 却远小于上限。
+      fs.unlinkSync(paths.audit)
+      fs.mkdirSync(paths.audit)
+      const failed = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 4, filter: { pingbibiaoti: 'v5' } })
+      assert.strictEqual(failed.status, 500)
+      assert.strictEqual(JSON.parse(failed.text).code, 'audit_failed')
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '审计失败必须回滚为保存前内容')
+      assert.strictEqual(fs.existsSync(paths.backupFor(4)), true, '第 5 次保存前仍应写备份 r4')
+      assert.strictEqual(fs.existsSync(paths.backupFor(1)), true, '失败的保存不得剪掉最老备份（剪枝只在提交成功后）')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 预置 symlink 的审计文件 → 500 audit_failed 且不写目标文件', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    const target = path.join(dir, 'audit-target.txt')
+    try {
+      fs.writeFileSync(target, 'untouched', { mode: 0o600 })
+      fs.symlinkSync(target, paths.audit)
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } })
+      assert.strictEqual(res.status, 500)
+      assert.strictEqual(JSON.parse(res.text).code, 'audit_failed')
+      assert.strictEqual(fs.readFileSync(target, 'utf8'), 'untouched', '绝不能顺着 symlink 写入目标')
+      assert.strictEqual(fs.existsSync(paths.file), false, '原本没有覆盖文件 ⇒ 回滚为不存在（不留下未审计规则）')
+      assert.strictEqual(fs.lstatSync(paths.audit).isSymbolicLink(), true, '预置链接本身不得被替换')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 审计超 4 MiB → 507 audit_full 且不写规则文件', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      fs.writeFileSync(paths.audit, 'x'.repeat(FILTER_AUDIT_MAX_BYTES + 1), { mode: 0o600 })
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } })
+      assert.strictEqual(res.status, 507)
+      const body = JSON.parse(res.text)
+      assert.strictEqual(body.code, 'audit_full')
+      assert.ok(Array.isArray(body.errors) && body.errors.length > 0, '必须说明需人工归档审计')
+      assert.strictEqual(fs.existsSync(paths.file), false, '审计满时不得写规则文件（更不能按 genesis 续链）')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '拒绝路径必须释放锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 备份失败 → 500 backup_failed 且不替换当前覆盖文件', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      fs.mkdirSync(paths.backupFor(1)) // 备份目标变成目录 → writeAtomic 拒绝
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })
+      assert.strictEqual(res.status, 500)
+      assert.strictEqual(JSON.parse(res.text).code, 'backup_failed')
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '备份失败不得替换覆盖文件')
+      assert.strictEqual(JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text).revision, 1)
+    } finally {
+      try { fs.rmdirSync(paths.backupFor(1)) } catch (e) { /* 已清理 */ }
+      server.close()
+    }
+  })
+
+  await aok('过滤规则 preview: 推送历史不可读 → available:false / 计数为 null（不显示 0 影响）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const pushPath = path.join(dir, 'push.json')
+    try {
+      // ① 缓存缺失
+      const missing = await postFilterJson(port, '/api/config/filter/preview', { filter: {} })
+      assert.strictEqual(missing.status, 200, '读不到缓存仍 200（这是可预期的降级，不是请求错误）')
+      const missingBody = JSON.parse(missing.text)
+      assert.strictEqual(missingBody.available, false)
+      assert.strictEqual(missingBody.code, 'cache_unavailable')
+      assert.strictEqual(missingBody.scanned, null)
+      assert.strictEqual(missingBody.reEvalCount, null)
+      assert.deepStrictEqual(missingBody.samples, [])
+      assert.strictEqual(missingBody.cacheStatus, 'missing')
+
+      // ② JSON 损坏
+      fs.writeFileSync(pushPath, '{not-json')
+      const broken = await postFilterJson(port, '/api/config/filter/preview', { filter: {} })
+      assert.strictEqual(broken.status, 200)
+      const brokenBody = JSON.parse(broken.text)
+      assert.strictEqual(brokenBody.available, false)
+      assert.strictEqual(brokenBody.reEvalCount, null)
+      assert.deepStrictEqual(brokenBody.samples, [])
+
+      // ③ 合法 JSON 但不是数组
+      fs.writeFileSync(pushPath, JSON.stringify({ items: [] }))
+      const notArray = await postFilterJson(port, '/api/config/filter/preview', { filter: {} })
+      assert.strictEqual(JSON.parse(notArray.text).available, false)
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则 preview: zkt_gjc 白名单排除标题不匹配的记录（与运行期同源）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const pushPath = path.join(dir, 'push.json')
+    const nowS = Math.floor(Date.now() / 1000)
+    const { setFilterDepsForTests } = require('./scripts/console')
+    const base = runtimeFilterDeps()
+    const originalConfig = base.config
+    try {
+      fs.writeFileSync(pushPath, JSON.stringify([
+        { id: '1', title: '白名单 命中', content: '', catename: '', shijianchuo: nowS, _f: true },
+        { id: '2', title: '其他标题', content: '', catename: '', shijianchuo: nowS, _f: true },
+        { id: '3', title: '', content: '', catename: '', shijianchuo: nowS, _f: true }
+      ]))
+      // 注入真实 deps 的副本，只把 Config.keyword.zkt_gjc 换成白名单词（模拟线上只看它配置）。
+      setFilterDepsForTests({
+        ...base,
+        config: { filter: originalConfig.filter, keyword: { ...originalConfig.keyword, zkt_gjc: '白名单' } }
+      })
+      const res = await postFilterJson(port, '/api/config/filter/preview', { filter: {}, limit: 10 })
+      assert.strictEqual(res.status, 200)
+      const body = JSON.parse(res.text)
+      assert.strictEqual(body.zktApplied, true, '白名单已编译 ⇒ zktApplied:true')
+      assert.strictEqual(body.scanned, 3)
+      assert.strictEqual(body.reEvalCount, 2, '标题不匹配白名单的不计入补推；空标题按放行')
+      assert.deepStrictEqual(body.samples.map((s) => s.id), ['1', '3'])
+    } finally {
+      setFilterDepsForTests(null)
+      server.close()
+    }
+  })
+
+  await aok('过滤规则 preview: capped 按 _f 条数判定（6000 条普通 + 3 条 _f → capped:false）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const pushPath = path.join(dir, 'push.json')
+    const nowS = Math.floor(Date.now() / 1000)
+    try {
+      const many = []
+      for (let i = 0; i < 6000; i++) many.push({ id: `n${i}`, title: 't', content: '', catename: '', shijianchuo: nowS })
+      for (let i = 0; i < 3; i++) many.push({ id: `f${i}`, title: 't', content: '', catename: '', shijianchuo: nowS, _f: true })
+      fs.writeFileSync(pushPath, JSON.stringify(many))
+      const res = await postFilterJson(port, '/api/config/filter/preview', { filter: {}, limit: 10 })
+      assert.strictEqual(res.status, 200)
+      const body = JSON.parse(res.text)
+      assert.strictEqual(body.available, true)
+      assert.strictEqual(body.capped, false, '扫描上限只作用于 _f：缓存总条数再多也不虚高 capped')
+      assert.strictEqual(body.scanned, 3)
+      assert.strictEqual(body.reEvalCount, 3)
+    } finally { server.close() }
+  })
+
+  // 前端对接的结构红线（HTTP 用例测不到 app.js 的渲染分支，只能断言源码契约）。
+  await aok('过滤规则页对接: 预览不可读文案 + 回滚带 baseRevision（结构红线）', () => {
+    const js = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    assert.ok(js.includes('无法读取推送历史，本次不显示补推估算'), 'available===false 时必须显示「无法读取推送历史」而不是 0 条')
+    assert.ok(js.includes('preview.available === false'), 'reEvalText / 预览面板必须先判 available===false')
+    assert.ok(js.includes('confirm: true,\n        baseRevision'), 'doRestore 必须把 baseRevision 与 confirm 一起提交')
+    assert.ok(js.includes("kind: 'restore', to: restoreTo, baseRevision: revision"), '回滚弹窗必须带页面加载时的 revision')
+    assert.ok(!js.includes('恢复代码默认（删除覆盖文件）'), '恢复默认不再删文件，选项文案必须同步')
+    assert.ok(js.includes('写入空覆盖文件'), '回滚弹窗/选项必须说明恢复默认写空覆盖文件')
   })
 }
 

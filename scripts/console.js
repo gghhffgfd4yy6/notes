@@ -1071,7 +1071,12 @@ function runtimeFilterDeps () {
     try { return new RE2(source, flags) } catch (e) { return null }
   }
   const ruleEngine = v3 && typeof v3.compileRules === 'function' && typeof v3.hasNestedQuantifier === 'function'
-    ? { hasNestedQuantifier: v3.hasNestedQuantifier, compileRules: v3.compileRules }
+    ? {
+        hasNestedQuantifier: v3.hasNestedQuantifier,
+        compileRules: v3.compileRules,
+        // 预览白名单与运行期同口径：先剥零宽字符再 test（缺导出时退化为原串）。
+        _normalizeReInput: typeof v3._normalizeReInput === 'function' ? v3._normalizeReInput : undefined
+      }
     : null
   filterDepsCache = {
     v3,
@@ -1155,7 +1160,8 @@ function filterAuditEntryHash (prevHash, entry) {
 // 逐行重算审计链。brokenAt 为 1 基行号；坏 JSON / prevHash 断裂 / entryHash 不匹配
 // 都算断链（可检测静默删除与篡改，但不声称能防 root）。
 function readFilterAuditChain (auditPath) {
-  const read = readSafeTextResult(auditPath, FILTER_AUDIT_MAX_BYTES)
+  // openNonBlocking：审计路径被替换成 FIFO 时立即判 unsafe，不阻塞 GET/save。
+  const read = readSafeTextResult(auditPath, FILTER_AUDIT_MAX_BYTES, { openNonBlocking: true })
   if (read.status === 'missing') return { ok: true, entries: 0, brokenAt: null, lastHash: FILTER_AUDIT_GENESIS }
   if (read.status !== 'ok') return { ok: false, entries: 0, brokenAt: 0, lastHash: FILTER_AUDIT_GENESIS }
   const lines = read.text.split('\n')
@@ -1181,10 +1187,33 @@ function readFilterAuditChain (auditPath) {
   return { ok: brokenAt === null, entries, brokenAt, lastHash }
 }
 
+// 审计文件达到上限（>4 MiB）后无法再安全续写：readFilterAuditChain 会把超限文件读成「不可读 ⇒
+// genesis」，在其后按 genesis 续写会让整条链被判成断链。写入方必须先 stat 大小，超限即拒绝保存（507），
+// 规则文件一个字节都不动，等人工归档后再继续。
+function filterAuditAtLimit (auditPath) {
+  try {
+    const st = fs.lstatSync(auditPath)
+    // symlink 不在这里判 507：统一交给 append 的 O_NOFOLLOW 失败路径（500 audit_failed），
+    // 避免同一个链接因目标大小不同而报 507/500 两种结果。
+    if (st.isSymbolicLink()) return false
+    // 预留一行审计的宽度（entryHash 64 hex + 时间戳 + 字段名，实测 < 512B）：
+    // 只判 size > MAX 会让「最后一次 append 恰好越界」，随后读取按 tooLarge 判假断链。
+    return st.size + 1024 > FILTER_AUDIT_MAX_BYTES
+  } catch (e) {
+    return false // 不存在/不可 stat：交给 append 的真实失败路径（保存侧按审计失败回滚）
+  }
+}
+
 // append-only + 0600：每次从头复算链尾（文件上限 4MiB，控制台写频率极低）。
-// 审计失败只告警不反噬保存结果（规则已落盘，回滚比丢一行审计代价更大）。
+// 打开时带 O_NOFOLLOW 且 fstat 必须是普通文件：预置的 symlink/FIFO/目录一律拒绝，否则
+// 「fchmod + append」会顺着链接改写别的可写文件。失败返回 false，由调用方回滚规则文件并报
+// 500 audit_failed——审计不落地就不能让调用方看到成功。
 function appendFilterAudit ({ auditPath, actor, action, revision, changedFields }) {
   try {
+    if (filterAuditAtLimit(auditPath)) {
+      console.error('⚠️ 过滤规则审计已到 4 MiB 上限，拒绝续写（需人工归档后重试）')
+      return false
+    }
     const chain = readFilterAuditChain(auditPath)
     const prevHash = chain.lastHash || FILTER_AUDIT_GENESIS
     const entry = {
@@ -1197,8 +1226,13 @@ function appendFilterAudit ({ auditPath, actor, action, revision, changedFields 
     entry.prevHash = prevHash
     entry.entryHash = filterAuditEntryHash(prevHash, entry)
     const line = `${JSON.stringify(entry)}\n`
-    const fd = fs.openSync(auditPath, 'a', 0o600)
+    // O_NOFOLLOW 在非 POSIX 平台可能缺省（undefined），按位或会把它当 0 从而丢掉整组 flag。
+    // O_NONBLOCK：审计路径被预置成 FIFO 时 open 立即返回（ENXIO），而不是阻塞整个事件循环。
+    const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
+      (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0)
+    const fd = fs.openSync(auditPath, flags, 0o600)
     try {
+      if (!fs.fstatSync(fd).isFile()) throw new Error('审计路径不是普通文件')
       fs.fchmodSync(fd, 0o600)
       fs.writeSync(fd, line)
     } finally {
@@ -1208,6 +1242,26 @@ function appendFilterAudit ({ auditPath, actor, action, revision, changedFields 
   } catch (e) {
     console.error(`⚠️ 过滤规则审计写入失败：${e && e.message ? e.message : e}`)
     return false
+  }
+}
+
+// 审计失败时把覆盖文件回滚为保存前内容：原本有文件（含损坏文件）就原子写回原文，
+// 原本没有就删掉本次新建的文件——绝不留下「规则已生效但审计缺失」的状态。
+function rollbackFilterOverride (paths, previousText) {
+  // 有保存前原文：只尝试写回，失败就如实报 rolledBack:false，绝不删文件（删除会把
+  // 「保存前规则」变成「代码默认」，是比留下旧规则更大的语义跳变）。
+  if (typeof previousText === 'string') {
+    try {
+      if (writeAtomic(paths.file, previousText, '过滤规则覆盖文件（审计失败回滚）')) return { ok: true, mode: 'restored' }
+    } catch (e) { /* 落到下面如实上报 */ }
+    return { ok: false, mode: 'restore_failed' }
+  }
+  // 原本没有覆盖文件（本次新建）：删掉才回到保存前状态。
+  try {
+    fs.unlinkSync(paths.file)
+    return { ok: true, mode: 'removed' }
+  } catch (e) {
+    return { ok: false, mode: 'remove_failed' }
   }
 }
 
@@ -1263,7 +1317,95 @@ function actorOf (token) {
   return sha256Hex(typeof token === 'string' ? token : '').slice(0, 8)
 }
 
-// 锁：O_EXCL + 0600；EEXIST 时按 mtime 判陈旧（>10s 才 unlink 重试一次），否则让调用方回 409。
+// 预览用的 zkt_gjc 白名单编译：与运行期 App.run 同口径——非字符串/空串/纯空白/嵌套量词/非法
+// 正则一律「不启用白名单」（宁可多算补推，也不虚报少推）。返回 null 表示本次未应用（zktApplied:false）。
+function previewWhitelistRegex (deps, keyword) {
+  const kw = keyword && typeof keyword.zkt_gjc === 'string' ? keyword.zkt_gjc : null
+  if (kw === null || kw === '' || kw.trim() === '') return null
+  if (!deps || typeof deps.compileUserRegex !== 'function') return null
+  if (deps.RuleEngine && typeof deps.RuleEngine.hasNestedQuantifier === 'function' && deps.RuleEngine.hasNestedQuantifier(kw)) return null
+  try {
+    return deps.compileUserRegex(kw, 'i')
+  } catch (e) {
+    return null
+  }
+}
+
+// 白名单放行判定（对齐 FilterEngine.whitelistFilter 的 title 口径）：标题 undefined/null/空串
+// 视为放行（运行期同款「字段缺失不拦截」），其余按正则匹配；任何异常按放行处理（宁可多算）。
+function previewWhitelistKeeps (entry, regex, normalize) {
+  if (!regex) return true
+  const raw = entry && entry.title !== undefined ? entry.title : undefined
+  if (raw === undefined || raw === null || raw === '') return true
+  let subject = typeof raw === 'string' ? raw : String(raw)
+  // 与运行期 FilterEngine.whitelistFilter 同口径：test 前先剥零宽字符（\u200B-\u200D\uFEFF）。
+  if (typeof normalize === 'function') {
+    try { subject = normalize(subject) } catch (e) { /* 归一失败按原串（宁可多算补推） */ }
+  }
+  try {
+    return regex.test(subject)
+  } catch (e) {
+    return true
+  }
+}
+
+// 锁文件身份快照：陈旧判定用 mtimeMs，接管后的归属核验用 dev+ino（bigint，避免大 inode 丢精度）。
+// lstat 不跟随链接：锁文件本身必须是它自己，不是指向别处的链接。
+function filterLockIdentity (lockPath) {
+  const st = fs.lstatSync(lockPath, { bigint: true })
+  return { dev: st.dev, ino: st.ino, mtimeMs: Number(st.mtimeMs) }
+}
+
+// 读锁文件里的持有者 pid（写失败/不可解析 ⇒ null，按孤儿锁处理）。
+function filterLockHolderPid (lockPath) {
+  try {
+    const raw = fs.readFileSync(lockPath, 'utf8')
+    const data = JSON.parse(raw)
+    return Number.isSafeInteger(data && data.pid) && data.pid > 0 ? data.pid : null
+  } catch (e) {
+    return null
+  }
+}
+
+// pid 是否活着：EPERM 说明进程存在但无权限探测 ⇒ 视为活。
+function isProcessAlive (pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return Boolean(e && e.code === 'EPERM')
+  }
+}
+
+// 接管一把「已判定过期」的锁。互斥不靠 rename（把活锁搬走会让原持有者失去互斥），
+// 而是用一个 O_EXCL 的 takeover 标记把接管串行化：只有建标记成功的人能进临界区，
+// 进区后重新 stat 锁文件，dev/ino/mtime 与判定时一致才 unlink（期间被别人释放/重建就放弃）。
+// 标记本身带 mtime 兜底：持有标记的进程崩溃后，STALE 之后可被下一个接管者清掉。
+function claimStaleFilterLock (lockPath, judged) {
+  const marker = `${lockPath}.takeover`
+  let fd
+  try {
+    fd = fs.openSync(marker, 'wx', 0o600)
+  } catch (e) {
+    // 标记被占：可能是并发接管（放弃本轮，回 409）或上次崩溃的残留（过期即清）。
+    try {
+      if (Date.now() - fs.lstatSync(marker).mtimeMs > FILTER_LOCK_STALE_MS) fs.unlinkSync(marker)
+    } catch (e2) { /* 已消失/无法判定：保持 fail-closed */ }
+    return false
+  }
+  try {
+    let now
+    try { now = filterLockIdentity(lockPath) } catch (e) { return false } // 已被释放
+    if (now.dev !== judged.dev || now.ino !== judged.ino || now.mtimeMs !== judged.mtimeMs) return false
+    try { fs.unlinkSync(lockPath) } catch (e) { return false }
+    return true
+  } finally {
+    try { fs.closeSync(fd) } catch (e) { /* 已关闭 */ }
+    try { fs.unlinkSync(marker) } catch (e) { /* 已被清理 */ }
+  }
+}
+
+// 锁：O_EXCL + 0600；EEXIST 时按 mtime 判陈旧（>10s 才尝试接管），否则让调用方回 409。
 // 锁内容带随机 token，释放时校验，避免陈旧接管后误删别人的锁。
 function acquireFilterLock (cacheDir) {
   const lockPath = FilterStore.filterRulesPaths(cacheDir).lock
@@ -1274,15 +1416,21 @@ function acquireFilterLock (cacheDir) {
       fd = fs.openSync(lockPath, 'wx', 0o600)
     } catch (e) {
       if (!e || e.code !== 'EEXIST') return null
-      let age
+      let judged
       try {
-        age = Date.now() - fs.lstatSync(lockPath).mtimeMs
+        judged = filterLockIdentity(lockPath)
       } catch (e2) {
         if (e2 && e2.code === 'ENOENT') continue // 刚被释放：重试一次
         return null
       }
-      if (!(age > FILTER_LOCK_STALE_MS)) return null
-      try { fs.unlinkSync(lockPath) } catch (e3) { return null }
+      if (!(Date.now() - judged.mtimeMs > FILTER_LOCK_STALE_MS)) return null
+      // 持有者还活着就绝不接管（mtime 过期只说明写得久，不代表进程死了）：
+      // 搬走活锁会让原持有者失去互斥，两人同时进写段。孤儿锁（pid 不可解析/进程已死）才允许接管。
+      const holderPid = filterLockHolderPid(lockPath)
+      if (holderPid !== null && isProcessAlive(holderPid)) return null
+      // 无论接管成败都进入下一轮重判：成功 ⇒ open 自己的锁；失败（别人先抢到/锁已释放）⇒
+      // 看到别人的新锁后放弃、或直接 open 成功。
+      claimStaleFilterLock(lockPath, judged)
       continue
     }
     try {
@@ -1311,6 +1459,7 @@ function releaseFilterLock (lock) {
 }
 
 // 备份只保留最近 FILTER_BACKUP_KEEP 代（按 revision 数值降序）。
+// 注意调用时机：必须在新的覆盖文件提交成功**之后**才剪枝——失败的保存不该剪掉最老备份。
 function pruneFilterBackups (paths) {
   let names
   try { names = fs.readdirSync(path.dirname(paths.file)) } catch (e) { return }
@@ -1329,12 +1478,15 @@ function pruneFilterBackups (paths) {
   }
 }
 
+// 只写备份、返回是否成功（不剪枝：剪枝由调用方在提交后执行）。
+// 返回 false 时调用方必须放弃本次保存——备份是回滚的唯一来源，不能「备份失败也照写」。
 function backupFilterFile (paths, revision, text) {
-  if (typeof text !== 'string' || text === '') return
+  if (typeof text !== 'string' || text === '') return false
   try {
-    if (!writeAtomic(paths.backupFor(revision), text, '过滤规则备份')) return
-    pruneFilterBackups(paths)
-  } catch (e) { /* 备份失败不阻断保存：覆盖文件本身是权威，备份是回滚便利 */ }
+    return writeAtomic(paths.backupFor(revision), text, '过滤规则备份') === true
+  } catch (e) {
+    return false
+  }
 }
 
 // 备份文件的结构读取（字段白名单/正则合法性仍交给 validateFilterRules）。
@@ -2068,10 +2220,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
 
   const loadCurrentFilter = () => {
     const defaults = filterDefaults()
+    // 与 App.run 同口径传 deps：手工编辑的覆盖文件若含编译不了的规则，GET 必须报 corrupt
+    // （否则页面全绿、运行侧却在降级，A1 承诺的红条永远不出现）。
     return FilterStore.loadFilterRules({
       cacheDir: stateDir,
       defaults: defaults.filter,
-      keyword: defaults.keyword
+      keyword: defaults.keyword,
+      deps: filterValidationDeps(runtimeFilterDeps())
     })
   }
 
@@ -2210,10 +2365,26 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           })
           return
         }
-        // 备份当前**合法**文件（损坏文件不备份：它不是可回滚的代）。
-        if (loaded.source === 'override') {
+        // 审计已满（>4 MiB）时链无法安全续写：先拒绝保存，规则文件一个字节都不动。
+        if (filterAuditAtLimit(paths.audit)) {
+          sendJson(res, 507, {
+            error: 'audit_full',
+            code: 'audit_full',
+            errors: [{ field: 'audit', code: 'audit_full', message: '审计文件已达 4 MiB 上限，需人工归档 filter-rules.audit.ndjson 后才能继续保存' }]
+          })
+          return
+        }
+        // 保存前快照：合法覆盖文件既写备份（回滚用），也留原文给审计失败回滚；
+        // 损坏文件不备份（不是可回滚的代），但仍留原文，审计失败时原样写回。
+        let previousText = null
+        if (loaded.source === 'override' || corrupt) {
           const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
-          if (raw.status === 'ok') backupFilterFile(paths, curRevision, raw.text)
+          if (raw.status === 'ok') previousText = raw.text
+          // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
+          if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
+            sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
+            return
+          }
         }
         const nextRevision = curRevision + 1
         const nextFile = {
@@ -2232,13 +2403,25 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         })
         const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
         const hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
-        appendFilterAudit({
+        if (!appendFilterAudit({
           auditPath: paths.audit,
           actor: actorOf(actorToken),
           action: 'save',
           revision: nextRevision,
           changedFields
-        })
+        })) {
+          // 审计不落地 ⇒ 本次保存整体作废（回滚覆盖文件），绝不报成功。
+          const rolled = rollbackFilterOverride(paths, previousText)
+          sendJson(res, 500, {
+            error: 'audit_failed',
+            code: 'audit_failed',
+            rolledBack: rolled.ok,
+            rollbackMode: rolled.mode
+          })
+          return
+        }
+        // 剪枝只在整个保存（含审计）成功后才执行：任何失败路径都不得剪掉最老备份。
+        pruneFilterBackups(paths)
         sendJson(res, 200, {
           ok: true,
           revision: nextRevision,
@@ -2303,48 +2486,75 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         ? Math.min(FILTER_PREVIEW_SAMPLE_MAX, Math.max(1, Math.floor(limitRaw)))
         : FILTER_PREVIEW_SAMPLE_DEFAULT
       const read = readSafeTextResult(path.join(stateDir, messagesFile), FILTER_PREVIEW_MAX_BYTES)
-      let records = []
+      let records = null
       if (read.status === 'ok') {
         try {
           const data = JSON.parse(read.text)
           if (Array.isArray(data)) records = data
-        } catch (e) { records = [] }
+        } catch (e) { records = null }
       }
+      // 读不到缓存（缺失/超限/坏 JSON/非数组）不能显示成「0 条影响」——那是把未知说成确定。
+      // 200 + available:false，计数一律 null，前端显示「无法读取推送历史，本次不显示补推估算」。
+      if (records === null) {
+        sendJson(res, 200, {
+          ok: true,
+          available: false,
+          code: 'cache_unavailable',
+          scanned: null,
+          capped: false,
+          reEvalCount: null,
+          atLeast: false,
+          limit,
+          samples: [],
+          cacheStatus: read.status,
+          zktApplied: false
+        })
+        return
+      }
+      // 扫描上限只作用于 _f 记录：capped 必须按 _f 条数判定（缓存总条数与补推估算无关）。
+      const fRecords = records.filter((entry) => entry && typeof entry === 'object' && entry._f === true)
+      const capped = fRecords.length > FILTER_PREVIEW_SCAN_MAX
+      // zkt_gjc 白名单与运行期同源（Config.keyword.zkt_gjc）：标题不匹配白名单的记录即使过了
+      // 候选规则也不会补推，必须从估算里排除；拿不到编译能力时按「未应用」如实标注。
+      const zktRegex = previewWhitelistRegex(deps, defaults.keyword)
+      const zktApplied = zktRegex !== null
       let scanned = 0
       let reEvalCount = 0
-      let capped = records.length > FILTER_PREVIEW_SCAN_MAX
       const samples = []
-      for (const entry of records) {
-        if (!entry || typeof entry !== 'object' || entry._f !== true) continue
-        if (scanned >= FILTER_PREVIEW_SCAN_MAX) { capped = true; break }
+      for (const entry of fRecords) {
+        if (scanned >= FILTER_PREVIEW_SCAN_MAX) break
         scanned++
         let verdict = null
         try { verdict = deps.explainFilter(entry, compiled, candidate) } catch (e) { verdict = null }
-        if (verdict && verdict.passed === true) {
-          reEvalCount++
-          if (samples.length < limit) {
-            samples.push({
-              id: entry.id === undefined ? null : entry.id,
-              title: typeof entry.title === 'string' ? entry.title : '',
-              reason: verdict.reason === undefined ? null : verdict.reason
-            })
-          }
+        if (!verdict || verdict.passed !== true) continue
+        if (!previewWhitelistKeeps(entry, zktRegex, deps.RuleEngine && deps.RuleEngine._normalizeReInput)) continue
+        reEvalCount++
+        if (samples.length < limit) {
+          samples.push({
+            id: entry.id === undefined ? null : entry.id,
+            title: typeof entry.title === 'string' ? entry.title : '',
+            reason: verdict.reason === undefined ? null : verdict.reason
+          })
         }
       }
       sendJson(res, 200, {
         ok: true,
+        available: true,
         scanned,
         capped,
         reEvalCount,
         atLeast: capped,
         limit,
         samples,
-        cacheStatus: read.status
+        cacheStatus: read.status,
+        zktApplied
       })
     }).catch(() => sendJson(res, 500, { error: 'write_failed', code: 'write_failed' }))
   }
 
-  // POST /api/config/filter/restore：备份回滚（revision+1，线性历史）或恢复代码默认（删文件）。
+  // POST /api/config/filter/restore：备份回滚或恢复代码默认——两者都写 revision+1 的覆盖文件。
+  // 恢复默认写 `{filter:{}}`（等价于代码默认）而**不再删除文件**：删文件会让 revision 归零、
+  // 备份列表消失、陈旧客户端还能拿旧 baseRevision 过 CAS。
   const handleFilterRestore = (req, res, actorToken) => {
     readFilterJson(req).then((parsed) => {
       if (parsed.error) { sendJson(res, parsed.error.status, parsed.error.body); return }
@@ -2357,6 +2567,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const toDefault = to === 'default'
       if (!toDefault && (!Number.isSafeInteger(to) || to < 0)) {
         sendFilterValidation(res, [{ field: 'to', code: 'invalid_target', message: "to 必须是非负整数 revision 或 'default'" }])
+        return
+      }
+      // 契约变更：回滚必须带页面加载时的 revision，否则陈旧回滚页会覆盖新版本。
+      const baseRevision = body.baseRevision
+      if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+        sendFilterValidation(res, [{ field: 'baseRevision', code: 'invalid_revision', message: 'baseRevision 必须是非负整数（取页面加载时的 revision）' }], 'invalid_revision')
         return
       }
       const deps = runtimeFilterDeps()
@@ -2391,57 +2607,77 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       try {
         const loaded = loadCurrentFilter()
         const curRevision = loaded.source === 'corrupt' ? 0 : loaded.revision
-        const nextRevision = curRevision + 1
-        if (toDefault) {
-          try {
-            fs.unlinkSync(paths.file)
-          } catch (e) {
-            if (!e || e.code !== 'ENOENT') {
-              sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
-              return
-            }
-          }
-          const nextActive = FilterStore.mergeActiveFilter({ defaults: defaults.filter, keyword: defaults.keyword })
-          const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-          appendFilterAudit({
-            auditPath: paths.audit,
-            actor: actorOf(actorToken),
-            action: 'reset_default',
-            revision: nextRevision,
-            changedFields
+        if (baseRevision !== curRevision) {
+          sendJson(res, 409, {
+            error: 'revision_mismatch',
+            code: 'revision_mismatch',
+            revision: curRevision,
+            errors: [{ field: 'baseRevision', code: 'revision_mismatch', message: `当前 revision 为 ${curRevision}，请重新加载后再回滚` }]
           })
-          sendJson(res, 200, { ok: true, revision: nextRevision, restoredFrom: 'default', changedFields })
           return
         }
+        if (filterAuditAtLimit(paths.audit)) {
+          sendJson(res, 507, {
+            error: 'audit_full',
+            code: 'audit_full',
+            errors: [{ field: 'audit', code: 'audit_full', message: '审计文件已达 4 MiB 上限，需人工归档 filter-rules.audit.ndjson 后才能继续回滚' }]
+          })
+          return
+        }
+        // 改文件前先备份当前配置：被替换的这一代必须仍能从备份列表回滚回来。
+        let previousText = null
+        if (loaded.source === 'override' || loaded.source === 'corrupt') {
+          const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
+          if (raw.status === 'ok') previousText = raw.text
+          if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
+            sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
+            return
+          }
+        }
+        const nextRevision = curRevision + 1
         const nextFile = {
           schema: FilterStore.FILTER_RULES_SCHEMA,
           revision: nextRevision,
-          filter: restoredFilter
+          filter: toDefault ? {} : restoredFilter
         }
         if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则覆盖文件')) {
           sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
           return
         }
-        const nextActive = FilterStore.mergeActiveFilter({
-          defaults: defaults.filter,
-          keyword: defaults.keyword,
-          override: restoredFilter
-        })
+        const nextActive = toDefault
+          ? FilterStore.mergeActiveFilter({ defaults: defaults.filter, keyword: defaults.keyword })
+          : FilterStore.mergeActiveFilter({
+            defaults: defaults.filter,
+            keyword: defaults.keyword,
+            override: restoredFilter
+          })
         const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-        appendFilterAudit({
+        if (!appendFilterAudit({
           auditPath: paths.audit,
           actor: actorOf(actorToken),
-          action: 'restore',
+          action: toDefault ? 'reset_default' : 'restore',
           revision: nextRevision,
           changedFields
-        })
-        sendJson(res, 200, {
+        })) {
+          const rolled = rollbackFilterOverride(paths, previousText)
+          sendJson(res, 500, {
+            error: 'audit_failed',
+            code: 'audit_failed',
+            rolledBack: rolled.ok,
+            rollbackMode: rolled.mode
+          })
+          return
+        }
+        // 剪枝只在整个回滚（含审计）成功后才执行。
+        pruneFilterBackups(paths)
+        const payload = {
           ok: true,
           revision: nextRevision,
-          restoredFrom: to,
-          changedFields,
-          hash: filterHashOf(deps, nextActive.filter, nextActive.keyword)
-        })
+          restoredFrom: toDefault ? 'default' : to,
+          changedFields
+        }
+        if (!toDefault) payload.hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
+        sendJson(res, 200, payload)
       } finally {
         releaseFilterLock(lock)
       }
@@ -3375,6 +3611,15 @@ module.exports = {
   // 过滤规则控制面：常量/写鉴权/测试注入口（HTTP 用例 + 非 HTTP 断言）
   FILTER_BODY_MAX_BYTES,
   FILTER_PREVIEW_SCAN_MAX,
+  FILTER_AUDIT_MAX_BYTES,
+  FILTER_BACKUP_KEEP,
   writeAuthVerdict,
-  setFilterDepsForTests
+  setFilterDepsForTests,
+  // 惰性依赖取用器（测试注入 zkt_gjc 等 Config 覆盖时以真实 deps 为基底）
+  runtimeFilterDeps,
+  // 陈旧锁接管的原子性单测入口（rename + inode 归属核验，见 claimStaleFilterLock 注释）
+  filterLockIdentity,
+  claimStaleFilterLock,
+  previewWhitelistRegex,
+  previewWhitelistKeeps
 }

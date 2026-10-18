@@ -1056,7 +1056,12 @@ function createApp ({
         const active = FilterStore.loadFilterRules({
           cacheDir: MessageStore.cacheDir,
           defaults: Config.filter,
-          keyword: Config.keyword
+          keyword: Config.keyword,
+          // Sourcery #256 A1：读路径也做深度校验（非法正则/嵌套量词）。只过结构校验的手工编辑文件
+          // 会被当成 last-known-good，而运行期 compileRules 跳过坏规则后本方法仍推进 filter.hash
+          // 并清 _f ⇒ 被过滤记录补推且无损坏告警。缺 RE2 时 FilterStore 自行跳过深度校验
+          // （读路径仍能读合法文件），故这里传 re2Available 而不是让存储层猜。
+          deps: { RuleEngine, compileUserRegex, re2Available: Boolean(RE2C) }
         })
         if (active.degraded) {
           // 三处告警之一（console.warn / run.log WARN / 控制台红条由 console 侧读 GET source 呈现）。

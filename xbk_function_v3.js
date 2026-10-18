@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.310 — 过滤规则覆盖文件（控制台编辑 / 下一轮生效 / 降级与回滚） *********
+//* ******* 线报酷推送脚本 v3.311 — 过滤规则控制面评审修复（锁接管 / 恢复 revision / 审计与预览契约） *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -527,6 +527,9 @@ if (typeof module !== 'undefined' && module.exports) {
     sanitizeDecodedHtml: Utils.sanitizeDecodedHtml.bind(Utils),
     // ReDoS 防护检测（嵌套量词）
     hasNestedQuantifier: RuleEngine.hasNestedQuantifier.bind(RuleEngine),
+    // 过滤规则覆盖文件的读路径深度校验（console GET / qinglong --check 与 App.run 同口径）
+    compileUserRegex,
+    _normalizeReInput: RuleEngine._normalizeReInput.bind(RuleEngine),
     // 缓存内部方法
     getFilePath: MessageStore.getFilePath.bind(MessageStore),
     _ensureFileExists: MessageStore._ensureFileExists.bind(MessageStore),

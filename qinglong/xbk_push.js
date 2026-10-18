@@ -92,10 +92,21 @@ function runCheck (app) {
       const cacheDir = app.MessageStore.cacheDir
       if (typeof cacheDir === 'string') {
         const FilterStore = require('../xbk_filter_store')
+        // 与 App.run 同口径传 deps：--check 也要能发现「规则编译不了」的覆盖文件，
+        // 否则控制台红条/启动校验都报合法、真正跑起来却降级。
+        const ruleEngine = typeof app.compileRules === 'function' && typeof app.hasNestedQuantifier === 'function'
+          ? { hasNestedQuantifier: app.hasNestedQuantifier, compileRules: app.compileRules }
+          : null
+        let re2Ready = false
+        try { re2Ready = Boolean(require('re2')) } catch (e) { re2Ready = false }
+        const filterDeps = ruleEngine && typeof app.compileUserRegex === 'function'
+          ? { RuleEngine: ruleEngine, compileUserRegex: app.compileUserRegex, re2Available: re2Ready, isRe2Available: () => re2Ready }
+          : undefined
         const active = FilterStore.loadFilterRules({
           cacheDir,
           defaults: app.Config.filter,
-          keyword: app.Config.keyword
+          keyword: app.Config.keyword,
+          deps: filterDeps
         })
         activeFilter = active.filter
         activeKeyword = active.keyword

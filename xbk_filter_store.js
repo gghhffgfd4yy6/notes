@@ -8,7 +8,7 @@
 //   · 只做「读覆盖文件 → 合并代码默认 → 生效规则」与「校验待保存规则」；
 //   · 只做「写/读生效快照」与「审计/锁/备份路径」helper；
 //   · **不**读规则于模块加载期（每轮由 App.run 调用 loadFilterRules 一次）；
-//   · **不**缓存 activeFilter——模块级状态只有 last-known-good（损坏降级用）；
+//   · **不**缓存 activeFilter——模块级状态只有 last-known-good（损坏降级用，按 cacheDir 分槽）；
 //   · **不** require xbk_function_v3（会与 xbk_app → FilterStore 形成循环依赖）；
 //     RuleEngine / compileUserRegex / RE2 可用性一律由调用方经 deps 注入；
 //   · 全程同步、零新依赖；读走 xbk_storage.readSafeTextResult，写走 writeAtomic（原子 + 0600）。
@@ -23,6 +23,8 @@
 //   合并语义依赖「字段是否存在」（hasOwnProperty），故校验结果保留「只含已提交字段」的形状。
 // ============================================================
 
+const fs = require('fs')
+const path = require('path')
 const { readSafeTextResult, writeAtomic } = require('./xbk_storage')
 // 路径构造单独成模块（纯 path.join + 本文件常量名），见该文件顶部说明。
 const { filterRulesPaths } = require('./scripts/filter-rules-paths')
@@ -61,9 +63,18 @@ const LINE_SPLIT_RE = /<br\s*\/?>|\r\n|\r|\n/
 const WIDE_MATCH_VALUES = new Set(['.*', '^.*$'])
 const FIELD_SET = new Set(FILTER_RULE_FIELDS)
 
-// 进程内 last-known-good：**只**保存最近一次合法覆盖文件的 {filter, revision}。
+// 进程内 last-known-good：**只**保存最近一次合法覆盖文件的 {filter, revision}，
+// 且按 cacheDir 分槽（键 = 覆盖文件所在目录）。一个进程可能读多个缓存目录（测试/控制台/多实例），
+// 用单个槽位会让「A 目录的合法规则」在「B 目录损坏」时代入，把 B 的过滤面悄悄改成 A 的（A2）。
+// 键取 path.dirname(filterRulesPaths(cacheDir).file)，而不是给 filterRulesPaths 增加 dir 字段——
+// 后者被 console/qinglong 共用，为一行取值扩大公共契约不划算。
 // 不是 activeFilter 缓存——每轮 loadFilterRules 仍重新读盘、重新合并、返回新对象。
-let lastGood = null
+const lastGoodByDir = new Map()
+
+function cacheDirKey (cacheDir) {
+  // filterRulesPaths 对非法 cacheDir 已退化为 '.'（不抛错），dirname 恒为字符串。
+  return path.dirname(filterRulesPaths(cacheDir).file)
+}
 
 function safeGet (obj, key) {
   // 脏对象/Proxy 的抛错 getter 不得抛穿（与 xbk_rules.readField 同口径）。
@@ -123,7 +134,9 @@ function addError (errors, field, code, message) {
 
 function isValidDays (value) {
   const days = Number(value)
-  return Number.isFinite(days) && days >= 0 && days <= PINGBITIME_MAX_DAYS
+  // 必须是整数：运行期 compileRules 对天数做 Math.floor，保存 1.9 实际按 1 天跑，
+  // 「保存值」与「生效值」不一致且无任何告警（A5）。上下限口径不变。
+  return Number.isFinite(days) && Number.isInteger(days) && days >= 0 && days <= PINGBITIME_MAX_DAYS
 }
 
 function engineAvailable (deps) {
@@ -246,7 +259,7 @@ function validateFilterRules (input, deps) {
           continue
         }
         if (field === 'pingbitime' && !isValidDays(val)) {
-          addError(errors, field, 'invalid_number', `行「${trimmed}」的天数必须是 0..${PINGBITIME_MAX_DAYS} 的有限数`)
+          addError(errors, field, 'invalid_number', `行「${trimmed}」的天数必须是 0..${PINGBITIME_MAX_DAYS} 的整数`)
           continue
         }
         ruleLines.push({ field, cat, val })
@@ -260,7 +273,7 @@ function validateFilterRules (input, deps) {
         continue
       }
       if (field === 'pingbitime' && !isValidDays(val)) {
-        addError(errors, field, 'invalid_number', `pingbitime 的天数必须是 0..${PINGBITIME_MAX_DAYS} 的有限数`)
+        addError(errors, field, 'invalid_number', `pingbitime 的天数必须是 0..${PINGBITIME_MAX_DAYS} 的整数`)
         continue
       }
       simpleRules.push({ field, val })
@@ -392,9 +405,68 @@ function parseStoredRules (text) {
   return { ok: true, filter, revision: data.revision }
 }
 
-function corruptResult (defaults, keyword, message) {
-  // 损坏降级：优先进程内 last-known-good；只有「本进程从未成功读过合法文件」才回代码默认。
+/**
+ * 覆盖文件权限收紧：覆盖文件由外部工具/手工创建时可能带 group/other 位，
+ * 读取时装作遵守 0600 会让「同机其他用户可写你的过滤规则」变成无声事实（A3）。
+ * 有宽位就先收紧到 0600；收紧失败按损坏处理（不改用一份权限不可控的规则）。
+ * @returns {{ok:true, tightened:boolean}|{ok:false, message:string}}
+ */
+function enforceOwnerOnlyMode (file) {
+  let stat
+  try {
+    stat = fs.statSync(file)
+  } catch (e) {
+    // 读成功后 stat 仍失败（并发删除/替换）：无法确认权限 ⇒ 按损坏降级。
+    return { ok: false, message: `覆盖文件无法确认权限（${safeErrorMessage(e)}）` }
+  }
+  const mode = stat.mode & 0o777
+  if ((mode & 0o077) === 0) return { ok: true, tightened: false }
+  try {
+    fs.chmodSync(file, 0o600)
+  } catch (e) {
+    return { ok: false, message: `覆盖文件权限过宽（0${mode.toString(8)}）且无法收紧到 0600：${safeErrorMessage(e)}` }
+  }
+  return { ok: true, tightened: true }
+}
+
+/**
+ * 读路径是否具备「深度校验」条件：需要注入完整 deps 且引擎可用。
+ * 缺 RE2 时 compileUserRegex 恒返回 null，深校验会把**合法**文件全部判损坏；
+ * 读路径的既有契约是「缺依赖也能读合法文件」，故引擎不可用直接跳过（A1）。
+ */
+function canDeepValidate (deps) {
+  if (!deps || typeof deps !== 'object') return false
+  const engine = deps.RuleEngine
+  if (!engine || typeof engine.hasNestedQuantifier !== 'function' || typeof engine.compileRules !== 'function') return false
+  if (typeof deps.compileUserRegex !== 'function') return false
+  return engineAvailable(deps) === true
+}
+
+/**
+ * 对「结构已合法」的覆盖文件再做一次四道闸校验（A1）。
+ * 结构校验只证明形状合法：手工编辑写入的非法正则/嵌套量词会被运行期 compileRules 静默跳过，
+ * 而 App.run 仍推进 filter.hash 并清 _f ⇒ 被过滤记录被补推且无任何损坏告警。
+ * @returns {string|null} 失败描述（首条错误的 field+message），通过返回 null
+ */
+function deepValidationError (parsed, deps) {
+  if (!canDeepValidate(deps)) return null
+  const result = validateFilterRules({
+    schema: FILTER_RULES_SCHEMA,
+    revision: parsed.revision,
+    filter: parsed.filter
+  }, deps)
+  if (result && result.ok === true) return null
+  const first = result && Array.isArray(result.errors) ? result.errors[0] : null
+  const field = first ? safeString(safeGet(first, 'field')) : ''
+  const detail = first ? safeString(safeGet(first, 'message')) : ''
+  if (!field && !detail) return '覆盖文件规则深度校验失败'
+  return `覆盖文件规则深度校验失败（${field || 'filter'}：${detail || '未知原因'}）`
+}
+
+function corruptResult (defaults, keyword, message, key) {
+  // 损坏降级：优先本目录的 last-known-good；只有「本进程从未在该目录成功读过合法文件」才回代码默认。
   // 两种情形都标记 degraded:true + source:'corrupt'，由运行侧做三处告警并跳过 _f 清理/hash 推进。
+  const lastGood = key === undefined ? null : lastGoodByDir.get(key)
   if (lastGood) {
     const merged = mergeActiveFilter({ defaults, keyword, override: lastGood.filter })
     return {
@@ -417,23 +489,31 @@ function corruptResult (defaults, keyword, message) {
   }
 }
 
-function loadFilterRulesImpl ({ cacheDir, defaults, keyword }) {
+function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
   const paths = filterRulesPaths(cacheDir)
+  const key = path.dirname(paths.file)
   // 明确上限：覆盖文件是外部可编辑的输入，禁止无界整读（64 KiB 与 console body 上限同源）。
   const read = readSafeTextResult(paths.file, FILTER_RULES_MAX_BYTES)
   if (read.status === 'missing') {
+    // 文件被删除 = 用户恢复代码默认：本目录的 last-known-good 随之作废。
+    // 否则「删文件 → 之后又出现畸形文件」会把早已废弃的旧规则复活成生效规则（A4）。
+    lastGoodByDir.delete(key)
     const merged = mergeActiveFilter({ defaults, keyword })
     return { ...merged, source: 'default', revision: 0, degraded: false, lastGoodUsed: false }
   }
   if (read.status !== 'ok') {
     // unsafe / replaced / tooLarge / ioError：全部按损坏处理（安全读已保证不泄露非普通文件内容）。
-    return corruptResult(defaults, keyword, `覆盖文件不可读（${read.status}）`)
+    return corruptResult(defaults, keyword, `覆盖文件不可读（${read.status}）`, key)
   }
+  const modeCheck = enforceOwnerOnlyMode(paths.file)
+  if (!modeCheck.ok) return corruptResult(defaults, keyword, modeCheck.message, key)
   const parsed = parseStoredRules(read.text)
-  if (!parsed.ok) return corruptResult(defaults, keyword, parsed.message)
+  if (!parsed.ok) return corruptResult(defaults, keyword, parsed.message, key)
+  const deepError = deepValidationError(parsed, deps)
+  if (deepError) return corruptResult(defaults, keyword, deepError, key)
 
-  // 只有合法文件才更新 last-known-good；损坏读绝不覆盖它。
-  lastGood = { filter: { ...parsed.filter }, revision: parsed.revision }
+  // 只有通过（结构 + 可选深度）校验的文件才更新本目录的 last-known-good；损坏读绝不覆盖它。
+  lastGoodByDir.set(key, { filter: { ...parsed.filter }, revision: parsed.revision })
   const merged = mergeActiveFilter({ defaults, keyword, override: parsed.filter })
   return {
     ...merged,
@@ -447,20 +527,26 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword }) {
 /**
  * 读取覆盖文件并返回本轮的生效规则（每轮 App.run 开头调用一次）。
  * 任何异常都不得抛穿；文件不存在 → source:'default'、revision:0、filter 为代码默认深拷贝。
+ * @param {{cacheDir:string, defaults:Object, keyword:Object,
+ *   deps?:{RuleEngine:Object, compileUserRegex:Function, re2Available?:boolean, isRe2Available?:Function}}} options
+ *   deps 可选：提供且引擎可用时，读路径在结构校验之后再跑 validateFilterRules 的四道闸（A1）；
+ *   不提供时保持「只做结构校验」的既有契约（console/qinglong 等调用方无需改造）。
  * @returns {{filter:Object, keyword:{zkt_gjc:string}, source:'override'|'default'|'corrupt',
  *   revision:number, degraded:boolean, lastGoodUsed:boolean, error?:{code:string,message:string}}}
  */
 function loadFilterRules (options) {
   const opts = options && typeof options === 'object' ? options : {}
+  const key = cacheDirKey(opts.cacheDir)
   try {
     return loadFilterRulesImpl({
       cacheDir: opts.cacheDir,
       defaults: opts.defaults,
-      keyword: opts.keyword
+      keyword: opts.keyword,
+      deps: opts.deps
     })
   } catch (e) {
     // 兜底：读盘/解析/合并的任何未预期异常都收敛成降级结果（绝不杀整轮 run）。
-    return corruptResult(opts.defaults, opts.keyword, `覆盖文件读取异常：${safeErrorMessage(e)}`)
+    return corruptResult(opts.defaults, opts.keyword, `覆盖文件读取异常：${safeErrorMessage(e)}`, key)
   }
 }
 
@@ -525,9 +611,9 @@ function readAppliedSnapshot (cacheDir) {
   return { status: 'ok', snapshot }
 }
 
-// 仅测试：清进程内 last-known-good。生产代码不得调用（每轮 run 由真实读盘决定）。
+// 仅测试：清空进程内 last-known-good（全部 cacheDir 槽位）。生产代码不得调用（每轮 run 由真实读盘决定）。
 function resetStoreStateForTests () {
-  lastGood = null
+  lastGoodByDir.clear()
 }
 
 module.exports = {

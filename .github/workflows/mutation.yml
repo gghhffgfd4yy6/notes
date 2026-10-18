@@ -202,7 +202,7 @@ jobs:
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
-            mutate: "xbk_function_v3.js:1-541"
+            mutate: "xbk_function_v3.js:1-544"
             config: "stryker.config.js"
           - name: app
             src: "xbk_app.js"
@@ -284,7 +284,7 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 3380 行（历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 3800 体，变异评估
+          # console.js 3625 行（历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 4100 体，变异评估
           # 成本 ≈ 变异体数 × 13.3s（C=8，历史成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）
           # ⇒ 整段 ≈ 840min、远超 step 330min 上限。按上限倒推取 6 片（各 ≈560 行、~630 体
           # ≈ 140min，含新测试更慢的余量）。
@@ -311,7 +311,7 @@ jobs:
             config: "stryker.tap.config.js"
           - name: console-part6
             src: "scripts/console.js"
-            mutate: "scripts/console.js:2816-3380"
+            mutate: "scripts/console.js:2816-3625"
             config: "stryker.tap.config.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

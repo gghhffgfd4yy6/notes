@@ -207,6 +207,16 @@ test('pingbitime 天数必须是合法有限数', () => {
   expectError(validateFilterRules({ revision: 0, filter: { pingbitime: '3650001' } }, deps), 'pingbitime', 'invalid_number', '超上限')
 })
 
+test('pingbitime 天数必须是整数（A5：小数会被运行期 floor，不得静默接受）', () => {
+  for (const bad of ['1.9', '0.5', '1e-1', '分类A###1.9']) {
+    expectError(validateFilterRules({ revision: 0, filter: { pingbitime: bad } }, deps), 'pingbitime', 'invalid_number', `小数 ${bad}`)
+  }
+  for (const okValue of ['5', '0', '3650000', '分类A###5']) {
+    const result = validateFilterRules({ revision: 0, filter: { pingbitime: okValue } }, deps)
+    assert.strictEqual(result.ok, true, `整数 ${okValue} 应通过：${JSON.stringify(result.errors)}`)
+  }
+})
+
 // ===== 闸门 3：嵌套量词 / RE2 不可用 / 正则语法 =====
 test('嵌套量词被拒绝（值与分类两条路径）', () => {
   expectError(validateFilterRules({ revision: 0, filter: { pingbibiaoti: '(a+)+' } }, deps), 'pingbibiaoti', 'nested_quantifier', '值嵌套量词')
@@ -410,6 +420,161 @@ test('非普通文件（目录）不抛穿，按损坏降级', () => {
   const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
   assert.strictEqual(loaded.source, 'corrupt')
   assert.strictEqual(loaded.degraded, true)
+})
+
+// ===== Sourcery #256 评审修复：A1 读路径深度校验 / A2 lastGood 分目录 / A3 权限收紧 / A4 删除即作废 =====
+test('A1 手工编辑的非法正则 → 深度校验判损坏，且不污染 last-known-good', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const file = filterRulesPaths(dir).file
+  writeJson(file, { schema: 1, revision: 11, filter: { pingbibiaoti: '好规则' } })
+  const good = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, deps })
+  assert.strictEqual(good.source, 'override')
+  assert.strictEqual(good.revision, 11)
+
+  // 结构完全合法、正则非法——手工编辑覆盖文件最容易产生的形态
+  writeJson(file, { schema: 1, revision: 12, filter: { pingbibiaoti: '(' } })
+  const bad = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, deps })
+  assert.strictEqual(bad.source, 'corrupt', '非法正则必须判损坏，不能当 override 生效')
+  assert.strictEqual(bad.degraded, true)
+  assert.strictEqual(bad.lastGoodUsed, true)
+  assert.strictEqual(bad.revision, 11, '损坏轮沿用上一次合法 revision')
+  assert.strictEqual(bad.filter.pingbibiaoti, '好规则', '损坏轮必须沿用上一次合法规则')
+  assert.match(bad.error.message, /pingbibiaoti/, `message 必须带首条错误的 field：${bad.error.message}`)
+  assert.match(bad.error.message, /正则无法编译|深度校验/)
+
+  // 嵌套量词同样拦下，且证明 lastGood 仍是 revision 11（坏文件没有覆盖它）
+  writeJson(file, { schema: 1, revision: 13, filter: { pingbibiaoti: '(a+)+' } })
+  const bad2 = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, deps })
+  assert.strictEqual(bad2.source, 'corrupt')
+  assert.strictEqual(bad2.revision, 11, '坏文件不得成为新的 last-known-good')
+  assert.strictEqual(bad2.filter.pingbibiaoti, '好规则')
+
+  // 修好文件后恢复正常（lastGood 不被污染，也不会卡在降级态）
+  writeJson(file, { schema: 1, revision: 14, filter: { pingbibiaoti: '修好了' } })
+  const fixed = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, deps })
+  assert.strictEqual(fixed.source, 'override')
+  assert.strictEqual(fixed.revision, 14)
+})
+
+test('A1 深度校验只在 deps 完整且引擎可用时执行（缺依赖仍能读合法文件）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const file = filterRulesPaths(dir).file
+  writeJson(file, { schema: 1, revision: 1, filter: { pingbibiaoti: '(' } })
+
+  // 不传 deps（console/qinglong 现状）：保持只做结构校验的既有契约
+  assert.strictEqual(
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }).source,
+    'override',
+    '未注入 deps 时不得新增深度校验（否则老调用方全量降级）'
+  )
+  // 传了 deps 但 RE2 不可用：compileUserRegex 恒 null，深校验会把合法文件全判坏 ⇒ 必须跳过
+  assert.strictEqual(
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, deps: noRe2Deps }).source,
+    'override',
+    '无 RE2 时必须跳过深度校验'
+  )
+  assert.strictEqual(
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, deps: { ...deps, re2Available: undefined, isRe2Available: () => false } }).source,
+    'override',
+    'isRe2Available()=false 时同样跳过'
+  )
+
+  // 首次加载即含非法正则（无 lastGood）→ 回代码默认，不得把坏规则当唯一规则
+  resetStoreStateForTests()
+  const fresh = makeDir()
+  writeJson(filterRulesPaths(fresh).file, { schema: 1, revision: 2, filter: { pingbibiaoti: '(' } })
+  const loaded = loadFilterRules({ cacheDir: fresh, defaults: DEFAULTS, keyword: {}, deps })
+  assert.strictEqual(loaded.source, 'corrupt')
+  assert.strictEqual(loaded.lastGoodUsed, false)
+  assert.strictEqual(loaded.revision, 0)
+  assert.strictEqual(loaded.filter.pingbibiaoti, '默认标题')
+})
+
+test('A2 last-known-good 按 cacheDir 分槽：dirB 损坏不得套用 dirA 的规则', () => {
+  resetStoreStateForTests()
+  const dirA = makeDir()
+  const dirB = makeDir()
+  writeJson(filterRulesPaths(dirA).file, { schema: 1, revision: 4, filter: { pingbibiaoti: 'A目录规则' } })
+  const loadedA = loadFilterRules({ cacheDir: dirA, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(loadedA.source, 'override')
+  assert.strictEqual(loadedA.filter.pingbibiaoti, 'A目录规则')
+
+  writeRaw(filterRulesPaths(dirB).file, '{ 坏 JSON')
+  const loadedB = loadFilterRules({ cacheDir: dirB, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(loadedB.source, 'corrupt')
+  assert.strictEqual(loadedB.lastGoodUsed, false, 'dirB 从未读过合法文件，不得借用 dirA 的 lastGood')
+  assert.strictEqual(loadedB.revision, 0, 'revision 也不得借用 dirA 的 4')
+  assert.strictEqual(loadedB.filter.pingbibiaoti, '默认标题', 'dirB 必须回代码默认，不能出现 dirA 的过滤面')
+
+  // 分槽不等于取消 lastGood：dirA 自己的降级仍然生效
+  writeRaw(filterRulesPaths(dirA).file, 'broken')
+  const degradedA = loadFilterRules({ cacheDir: dirA, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(degradedA.source, 'corrupt')
+  assert.strictEqual(degradedA.lastGoodUsed, true)
+  assert.strictEqual(degradedA.filter.pingbibiaoti, 'A目录规则')
+})
+
+test('A3 覆盖文件权限过宽（0644）→ 读后收紧为 0600 并正常生效', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const file = filterRulesPaths(dir).file
+  writeJson(file, { schema: 1, revision: 2, filter: { pingbibiaoti: '宽权限规则' } })
+  fs.chmodSync(file, 0o644)
+  assert.strictEqual(fs.statSync(file).mode & 0o777, 0o644, '前置：文件当前确实是 0644')
+
+  const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(loaded.source, 'override')
+  assert.strictEqual(loaded.filter.pingbibiaoti, '宽权限规则')
+  assert.strictEqual(fs.statSync(file).mode & 0o777, 0o600, 'group/other 位必须在读取后收紧掉')
+})
+
+test('A3 权限过宽且无法收紧 → 按损坏处理并说明原因（不改用权限不可控的规则）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const file = filterRulesPaths(dir).file
+  writeJson(file, { schema: 1, revision: 5, filter: { pingbibiaoti: '权限坏' } })
+  fs.chmodSync(file, 0o644)
+  // 模块持有的是同一个 fs 模块对象，方法查找发生在调用时 ⇒ 临时替换即可覆盖 chmod 失败分支。
+  const realChmod = fs.chmodSync
+  fs.chmodSync = () => {
+    const err = new Error('EPERM: operation not permitted')
+    err.code = 'EPERM'
+    throw err
+  }
+  let loaded
+  try {
+    loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  } finally {
+    fs.chmodSync = realChmod
+  }
+  assert.strictEqual(loaded.source, 'corrupt')
+  assert.strictEqual(loaded.lastGoodUsed, false)
+  assert.match(loaded.error.message, /权限过宽/, `message 必须说明权限过宽：${loaded.error.message}`)
+  assert.match(loaded.error.message, /EPERM|无法收紧/, `message 必须说明收紧失败：${loaded.error.message}`)
+  assert.strictEqual(fs.statSync(file).mode & 0o777, 0o644, '收紧失败时文件权限保持原样（本模块不假装成功）')
+})
+
+test('A4 文件删除即作废本目录 lastGood：后续畸形文件不得复活旧规则', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const file = filterRulesPaths(dir).file
+  writeJson(file, { schema: 1, revision: 9, filter: { pingbibiaoti: '旧规则' } })
+  assert.strictEqual(loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }).source, 'override')
+
+  fs.rmSync(file)
+  const defaulted = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(defaulted.source, 'default', '删文件 = 用户恢复代码默认')
+  assert.strictEqual(defaulted.filter.pingbibiaoti, '默认标题')
+
+  // 之后又出现畸形文件：必须回代码默认，不得把删除前那份规则复活
+  writeRaw(file, '不是 JSON')
+  const bad = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(bad.source, 'corrupt')
+  assert.strictEqual(bad.lastGoodUsed, false, '删除已作废 lastGood，畸形文件不得把它复活')
+  assert.strictEqual(bad.revision, 0)
+  assert.strictEqual(bad.filter.pingbibiaoti, '默认标题')
 })
 
 // ===== 生效快照写读往返 =====
