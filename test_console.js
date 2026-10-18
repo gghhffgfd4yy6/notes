@@ -3225,13 +3225,26 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function FilterRules ('), '必须有 FilterRules 组件（一条规则一行）')
     assert.ok(src.includes('function ChannelList ('), '必须有 ChannelList 组件（渠道 chip）')
+    // 切片边界必须是 ConfigPanel 之后真实存在的下一个顶层组件：SysPanel 定义在
+    // ConfigPanel 之前，用作 end 会得到 -1（slice(start, -1) 一路切到文件末尾，断言永真）。
     const start = src.indexOf('function ConfigPanel ')
-    const end = src.indexOf('function SysPanel', start)
+    const end = src.indexOf('function App ', start)
+    assert.ok(start > -1 && end > start, 'ConfigPanel 与 App 的切片边界必须可定位')
     const seg = src.slice(start, end)
     assert.ok(/<\$\{FilterRules\}/.test(seg), '配置页必须使用 FilterRules')
     assert.ok(/<\$\{ChannelList\}/.test(seg), '配置页必须使用 ChannelList')
     assert.ok(!/filterEntries\.map\([\s\S]*?\)\.join\(' · '\)/.test(seg), '过滤规则不得再 join 成一条 · 长串')
-    assert.ok(!/rule-val' \+ \(isEmpty\(v\) \? ' empty'/.test(seg), '空值类名不得复用 .empty（全局空态有 14px padding）')
+    // FilterRules 位于 ConfigPanel 之前，必须单独切片才能锁住「空值不复用 .empty」。
+    const filterStart = src.indexOf('function FilterRules ')
+    const filterEnd = src.indexOf('function ChannelList ', filterStart)
+    assert.ok(filterStart > -1 && filterEnd > filterStart, 'FilterRules 与 ChannelList 的切片边界必须可定位')
+    const filterSeg = src.slice(filterStart, filterEnd)
+    assert.ok(!/rule-val' \+ \(isEmpty\(v\) \? ' empty'/.test(filterSeg), '空值类名不得复用 .empty（全局空态有 14px padding）')
+    // C 批已把渠道注记收成一套名称；红线锁住「同一张卡两个名字」不回潮。
+    const chanEnd = src.indexOf('function ConfigPanel ', filterEnd)
+    assert.ok(chanEnd > filterEnd, 'ChannelList 的切片边界必须可定位')
+    const chanSeg = src.slice(filterEnd, chanEnd)
+    assert.ok(!/已启用：/.test(chanSeg), '渠道卡不得再用中文名注记重复一遍渠道名')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/\.rule-row\s*\{/.test(css) && /\.chan-chip\s*\{/.test(css), '过滤规则/渠道样式必须存在')
   })
