@@ -380,8 +380,11 @@ async function runDryRunOnce (app) {
 async function main () {
   const unknownArgs = [...ARGS].filter(arg => !KNOWN_ARGS.has(arg))
   if (unknownArgs.length > 0) {
-    // 只告警不改行为：拒绝未知参数会改变既有命令行契约，需产品决策（QX-09 的 defer 部分）。
-    console.warn(`⚠️ 未识别参数已忽略：${unknownArgs.join(' ')}（可用参数：--status / --check / --dry-run）`)
+    // 审查 D2-M2（#232）：未知参数不再「只告警」——`--notify-test` 拼错成别的写法时，
+    // 旧行为会一路落进常驻循环（生产上等于静默开始真实运行）。入口参数必须 fail-closed。
+    console.error(`❌ 未识别参数：${unknownArgs.join(' ')}（可用参数：--status / --check / --dry-run），拒绝执行（fail-closed）`)
+    process.exitCode = 1
+    return
   }
   if (hasArg('--status')) {
     try { process.exitCode = runStatus() } catch (error) {

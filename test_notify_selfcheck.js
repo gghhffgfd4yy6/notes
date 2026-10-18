@@ -29,6 +29,9 @@ const entrySrc = fs.readFileSync(path.join(__dirname, 'xbk_function_v3.js'), 'ut
   assert.ok(iFlag > guardIdx, 'guard 内必须有 --notify-test 分发')
   assert.ok(iCall > iFlag, 'guard 内必须调用 runNotifyTest')
   assert.ok(iRun > iCall, 'runSingleEntry 完整入口必须在 notify-test 分支之后（早退语义）')
+  // 审查 D2-M2（#232）：近似写法必须走自检，未知 -- 参数必须 fail-closed（不得静默跑一轮）。
+  assert.ok(entrySrc.includes("a.startsWith('--notify-test=')"), '--notify-test=1 必须前缀分发到自检')
+  assert.ok(entrySrc.includes('未识别参数'), '未知 -- 参数必须显式报错而不是进入 runSingleEntry')
 }
 
 // ── 进程内装配：got mock → 真 slim（带 mock）→ 主模块（getNotify 命中缓存）──

@@ -425,7 +425,11 @@ async function runNotifyTest (args = process.argv.slice(2)) {
 
 if (require.main === module) {
   const cliArgs = process.argv.slice(2)
-  if (cliArgs.includes('--notify-test')) {
+  // 审查 D2-M2（#232）：旧实现只认精确的 `--notify-test`，`--notify-test=1` 这类近似写法
+  // 会静默落进 runSingleEntry() —— 生产上就是真抓取 + 真推送 + 写缓存。改为前缀分发；
+  // 其余未识别的 `--` 参数一律 fail-closed，绝不让拼写错误变成一次真实运行。
+  const notifyArg = cliArgs.find((a) => a === '--notify-test' || a.startsWith('--notify-test='))
+  if (notifyArg) {
     // 批次④ 4.1：通知自检早退分支——必须在 runSingleEntry() 之前分发，
     // 否则掉进完整抓取/推送/缓存流程（自检变成真跑一轮）。
     runNotifyTest(cliArgs).catch(e => {
@@ -445,6 +449,10 @@ if (require.main === module) {
       }
       process.exitCode = 1
     })
+  } else if (cliArgs.some((a) => a.startsWith('--'))) {
+    const unknown = cliArgs.filter((a) => a.startsWith('--'))
+    console.error(`❌ 未识别参数：${unknown.join(' ')}；直跑入口仅支持 --notify-test（试运行请用 XBK_DRY_RUN=1 环境变量），拒绝执行（fail-closed）`)
+    process.exitCode = 1
   } else {
     runSingleEntry().catch(e => {
       console.error('程序运行失败:', Utils.safeErrorText(e, Utils.safeText(e, '未知错误')))
