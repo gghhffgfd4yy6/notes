@@ -1309,13 +1309,18 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   }, [open, narrow])
   // 打开时：桌面把焦点放进搜索框；手机聚焦当前选项（不弹软键盘）。
   useEffect(() => {
-    if (!open) return
+    if (!open) return undefined
     if (narrow) {
-      const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
-      if (el) el.focus()
-    } else if (searchRef.current) {
-      searchRef.current.focus()
+      // 打开时 path 会在同一提交里重置为空；立刻 query 会聚焦到上一级即将被移除的节点，
+      // 重置渲染后焦点就丢了。延后一拍，等新一级列表渲染完再聚焦（与 focusFirst 同口径）。
+      const t = setTimeout(() => {
+        const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
+        if (el) el.focus()
+      }, 0)
+      return () => clearTimeout(t)
     }
+    if (searchRef.current) searchRef.current.focus()
+    return undefined
   }, [open, narrow])
   // 搜索词/层级变化后回到第一项，避免 active 指向已被过滤掉的项。
   useEffect(() => { setActive(0) }, [q, path])
@@ -1494,11 +1499,13 @@ function MessagesPanel () {
   const [query, setQuery] = useState('')
   const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
   const sentQueryRef = useRef('') // 当前请求实际发出的 query（含防抖未落地的新输入）
-  // 搜索防抖：输入停 300ms 才真正改 query（重置回第 1 页）。
+  // 搜索防抖：输入停 300ms 才真正改 query；页码重置跟随 query 的真实变化。
   useEffect(() => {
-    const t = setTimeout(() => { setQuery(input.trim()); setPage(1) }, 300)
+    const t = setTimeout(() => { setQuery(input.trim()) }, 300)
     return () => clearTimeout(t)
   }, [input])
+  // 只有 query 真的变了才回第 1 页；只加/减空白时 query 不变，刷新不应把用户踢回首页。
+  useEffect(() => { setPage(1) }, [query])
   const fetchMessages = useCallback(
     () => {
       sentQueryRef.current = query
@@ -1507,6 +1514,13 @@ function MessagesPanel () {
     [page, size, cate, query, days])
   const { data, err, load, loading } = usePanelLoader(fetchMessages)
   useEffect(() => { load().catch(() => {}) }, [load])
+  // 结果集缩小后旧页码可能超过新页数（服务端按请求页切片，回空 items）。收到响应后把
+  // 页码钳到最后一页并重拉，避免「在后面的页点刷新，整页空白」。
+  useEffect(() => {
+    if (data && data.status === 'ok' && Number.isSafeInteger(data.pages) && data.pages >= 1 && page > data.pages) {
+      setPage(data.pages)
+    }
+  }, [data, page])
   // 搜索框回车 / 刷新前先把未落地的输入立刻生效，避免「刚打完字点刷新，还是旧结果」。
   // 只有搜索词变了才回第 1 页；没改词时刷新当前页，不应把用户踢回首页（审查 #246 可选）。
   const refreshNow = () => {
@@ -1670,10 +1684,24 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all' }) {
   // 轮询互斥（审查 #231 前端项）：任务运行时每 2s 拉 1 MiB，上一请求未回时再叠一发
   // 只会让服务端并发读盘、后到的响应还可能盖掉新结果。手动刷新同样走这把闸。
   const busyRef = useRef(false)
-  const load = useCallback(async () => {
-    if (busyRef.current) return
+  const pendingRef = useRef(false)
+  const load = useCallback(async (queue = false) => {
+    // 手动刷新撞上在飞请求时不丢这次意图：记 pending，当前请求结束后再补一轮。
+    // 轮询/可见性补拉不排队（queue=false），避免慢请求把轮询变成背靠背重试。
+    if (busyRef.current) {
+      if (queue) pendingRef.current = true
+      return
+    }
     busyRef.current = true
-    try { await loadRaw() } finally { busyRef.current = false }
+    try {
+      do {
+        pendingRef.current = false
+        await loadRaw()
+      } while (pendingRef.current)
+    } finally {
+      busyRef.current = false
+      pendingRef.current = false
+    }
   }, [loadRaw])
   // 日志筛选（v3.307）：run.log 尾部最多 1 MiB，排障时先按级别收窄；纯客户端过滤，
   // 不发新请求。默认「异常」已排除控制台生命周期行（旧口径 123 条异常里 119 条是它）。
@@ -1729,7 +1757,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all' }) {
   }
   const refreshNow = () => {
     stickRef.current = true
-    load().catch(() => {})
+    load(true).catch(() => {})
   }
   const pickMode = (next) => {
     stickRef.current = true

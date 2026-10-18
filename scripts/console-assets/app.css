@@ -48,6 +48,8 @@
     --bad-soft: rgba(229, 83, 75, .14);
     --bad-line: rgba(229, 83, 75, .35);
     --bad-fg: #ff9d97;
+    /* 危险实心按钮底色：白字压 --bad-fg（#ff9d97）只有约 1.8:1；改用深红 #b3261e（约 6.5:1）。 */
+    --bad-solid: #b3261e;
     --bad-fade: rgba(229, 83, 75, .45);
     --bad-fade: color-mix(in srgb, var(--bad) 45%, transparent);
     --warn: #c9a227;
@@ -201,8 +203,11 @@
   .btn:active:not(:disabled) { transform: translateY(1px); }
   .btn:disabled { opacity: .45; cursor: not-allowed; }
   .btn-primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); font-weight: 500; }
-  .btn-danger-solid { background: var(--bad-fg); border-color: var(--bad-fg); color: #fff; font-weight: 600; }
-  .btn-danger-solid:hover:not(:disabled) { filter: brightness(1.1); }
+  .btn-danger-solid { background: var(--bad-solid); border-color: var(--bad-solid); color: #fff; font-weight: 600; }
+  /* 实心按钮的 hover 不能再 brightness(1.2)：底色被提亮后白字对比度掉到 4.5:1 以下。
+     改为轻微压暗，既保留 hover 反馈，又把对比度往上抬。 */
+  .btn-primary:hover:not(:disabled),
+  .btn-danger-solid:hover:not(:disabled) { filter: brightness(.92); }
   .btn-secondary { background: var(--panel-2); }
   .btn-ghost { background: transparent; border-color: transparent; color: var(--accent); padding: var(--sp-1) var(--sp-2); font-size: var(--fs-sm); min-height: 40px; }
   /* 表格行/日志框头里的 ghost 按钮不参与 40px 触控高度：否则行高 45→57、框头 44→56
@@ -285,6 +290,7 @@
   }
   .tab-btn:hover { filter: brightness(1.2); }
   .tab-btn.active { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); font-weight: 500; }
+  .tab-btn.active:hover { filter: brightness(.92); }
 
   /* ── 趋势条形图（纯 CSS）── */
   /* 趋势图：一天一列固定宽度，总宽超出时横向滚动（14/30/60 日都不再挤成一团）。
