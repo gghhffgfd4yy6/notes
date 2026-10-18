@@ -1,5 +1,6 @@
 'use strict'
 
+const fs = require('node:fs')
 const path = require('node:path')
 const { readSafeTextResult } = require('../xbk_storage')
 
@@ -336,10 +337,13 @@ function readStatus (dir, { now = Date.now() } = {}) {
 // 「条目数 / 上限」预警需要它，但 readStatus 形状被 --status 与既有前端锁定（不能改），
 // 故独立导出。只回计数不回显条目（调用方要详情另有 readMessages）；超限的缓存数条数
 // 要整读 32MiB——tooLarge 时如实返回 tooLarge（null），前端显示「—」而不是编个数。
-function readMessageCount (dir, { filename = FILES.messages } = {}) {
-  const read = readMessages(dir, { filename })
-  if (read.status !== 'ok') return { status: read.status, count: null }
-  return { status: 'ok', count: read.value.total }
+function readMessageCount (dir, { filename = FILES.messages, maxBytes = 32 * 1024 * 1024 } = {}) {
+  const read = readMessages(dir, { filename, maxBytes })
+  if (read.status !== 'ok') return { status: read.status, count: null, filteredCount: null }
+  // count 用 rawTotal（含 _f 条目）：条数上限约束的是缓存条目总数，而 _f（被过滤、从未推送）
+  // 一样占额度。旧实现报 items.length（排除 _f），9000 条 _f + 1500 条正常时报 1500/10000，
+  // 实际 10500 已超上限却预警不响（D2-S11）。filteredCount 单列，页面仍可显示「已推送」条数。
+  return { status: 'ok', count: read.value.rawTotal, filteredCount: read.value.filteredCount }
 }
 
 function describe (part) {
@@ -651,10 +655,37 @@ function validMessageEntry (m) {
 // 读取已推送消息列表：push.json 是 MessageStore 判重缓存（最旧在前、最新在后）。
 // 返回 { status, items(时间倒序), total, categories } —— 过滤/分页由调用方（HTTP 层）做，
 // 本函数只负责「安全读取 + 容错解析 + 排序 + 分类汇总」，保持无查询参数的纯函数可测性。
-function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.messages } = {}) {
+// ── push.json 解析缓存（D2-S18）─────────────────────────────────────────────
+// 25.6MB/6 万条实测：每次请求整读 + parse + 全量排序 250–325ms，全压在 HTTP 事件循环上。
+// push.json 只在单轮结束时整份原子替换（MessageStore saveBatch → tmp + rename），
+// (ino, size, mtimeMs) 三元组足以识别「同一份文件」（inode 变化能抓到同毫秒同大小的换文件）。
+// 叠 60s TTL 兜底；mtime 太新（<100ms）的文件不进缓存——写后立刻读必须看到新内容。
+// 缓存的是只读结果对象：调用方全部用 filter/map 派生新数组，不做原地改写。
+const MESSAGES_CACHE_TTL_MS = 60 * 1000
+const MESSAGES_CACHE_MIN_AGE_MS = 100
+const MESSAGES_CACHE_MAX = 4
+const messagesCache = new Map()
+
+function messagesSignature (dir, filename, maxBytes) {
+  try {
+    const st = fs.statSync(path.join(dir, filename))
+    if (!st.isFile() || st.size > maxBytes) return null
+    if (Date.now() - st.mtimeMs < MESSAGES_CACHE_MIN_AGE_MS) return null
+    return `${st.ino}:${st.size}:${Math.round(st.mtimeMs)}`
+  } catch (e) { return null }
+}
+
+function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.messages, cache = true } = {}) {
   // filename 可覆盖：运行侧缓存名由 MessageStore.getFileName(Config.api.pushUrl) 决定（pushUrl 末段
   // 去查询串后 + .json）。控制台默认读 push.json（默认配置的产物）；自定义了 pushUrl basename 的部署
   // 显式传 filename（console main 里从同名口径推导），不让「文件改名」静默变成「记录消失」。
+  // cache=false：需要「此刻磁盘内容」的调用方（测试/诊断）显式绕过缓存。
+  const cacheKey = `${dir}\u0000${filename}\u0000${maxBytes}`
+  const sig = cache ? messagesSignature(dir, filename, maxBytes) : null
+  if (sig) {
+    const hit = messagesCache.get(cacheKey)
+    if (hit && hit.sig === sig && Date.now() - hit.at < MESSAGES_CACHE_TTL_MS) return hit.value
+  }
   const read = readText(dir, filename, maxBytes)
   if (read.status !== 'ok') return { status: read.status }
   let parsed
@@ -663,11 +694,12 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   const pairs = [] // [entry, rowKey] 绑定排序：键取「原始 parsed 下标」（push.json 只追加不重排，
   // 追加序才是稳定身份；用排序后下标会在新条目插入时整体推移，前端展开状态随之错位）
   let skipped = 0
+  let filteredCount = 0
   for (let i = 0; i < parsed.length; i++) {
     const entry = parsed[i]
     // _f 条目是「被过滤、从未推送」的记录（MessageStore 约定），不是推送历史的一部分——
     // 控制台页面是「已推送记录」，混入会让分类计数与历史失真（审查 Sourcery PR#227）。
-    if (entry && typeof entry === 'object' && entry._f === true) continue
+    if (entry && typeof entry === 'object' && entry._f === true) { filteredCount += 1; continue }
     if (validMessageEntry(entry)) {
       pairs.push([entry, (typeof entry.id === 'string' && entry.id.length > 0) || typeof entry.id === 'number'
         ? String(entry.id)
@@ -688,7 +720,15 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
     cateCount.set(name, (cateCount.get(name) || 0) + 1)
   }
   const categories = [...cateCount.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }))
-  return result('ok', { total: items.length, items, keys, categories, skipped })
+  // rawTotal = 文件里的条目总数（含 _f）：缓存健康页的「条目数 / 上限」必须按它算，
+  // 否则 _f 条目把缓存撑到超限也报不出来（D2-S11）。total 仍是「已推送记录」条数。
+  const value = result('ok', { total: items.length, rawTotal: parsed.length, filteredCount, items, keys, categories, skipped })
+  if (sig) {
+    messagesCache.delete(cacheKey)
+    messagesCache.set(cacheKey, { sig, at: Date.now(), value })
+    while (messagesCache.size > MESSAGES_CACHE_MAX) messagesCache.delete(messagesCache.keys().next().value)
+  }
+  return value
 }
 
 module.exports = { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE }

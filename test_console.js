@@ -23,17 +23,18 @@ const {
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
-  sanitizeAccessPath, shouldLogAccess, ACCESS_LOG_MAX,
+  sanitizeAccessPath, shouldLogAccess, acceptsGzip, ACCESS_LOG_MAX,
+  findSecretLikeField, CACHE_HEALTH_COUNT_MAX_BYTES, cacheHealthEntryCount,
   filterMessageItems, filterMessagesByDays, messageCategoriesOf, MESSAGE_DAYS_ALLOWED,
   clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
   RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS,
-  REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE
+  REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE,
+  // 导出端点的读取上限直接取实现常量（D2-N11：修前测试自己写死 32MiB，实现改 64MiB 后
+  // 用例仍在 32MiB 造夹具 → 以为测了 tooLarge，实际测的是 invalid）
+  MESSAGES_MAX_BYTES
 } = require('./scripts/console')
 const { readMessages } = require('./scripts/status')
-// 导出端点的读取上限（console.js 内部常量，与 MESSAGES_MAX_BYTES 同值）：
-// MI2 tooLarge 用例按同一口径构造超限 fixture。
-const MESSAGES_MAX_BYTES = 32 * 1024 * 1024
 
 let passed = 0
 let failed = 0
@@ -2665,8 +2666,40 @@ async function main () {
     assert.ok(data.limits.writeMaxBytes > 0, '上限真源下发')
     assert.strictEqual(data.entryCount, 1, 'HTTP 层附带条目数（readMessageCount 同源）')
     assert.strictEqual(data.entryCountStatus, 'ok')
+    assert.strictEqual(data.entryCountFiltered, 0, '无 _f 条目时 filteredCount=0')
     const na = await request(port, 'GET', '/api/cache-health')
     assert.strictEqual(na.status, 401)
+    server.close()
+  })
+  await aok('cache-health: entryCount 必须计入 _f（D2-S11：9000 _f + 1500 正常 → 10500 已超限）', async () => {
+    const dir = tmpDir()
+    const msgs = []
+    for (let i = 0; i < 40; i++) msgs.push({ id: i + 1, title: `t${i}`, content: 'c' })
+    for (let i = 0; i < 60; i++) msgs.push({ _f: true, title: `f${i}`, content: 'c' })
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(msgs))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const data = JSON.parse((await request(port, 'GET', '/api/cache-health', { token: TOKEN })).text)
+    assert.strictEqual(data.entryCount, 100, '条目数 = 文件条目总数（含 _f）——旧口径报 40/10000')
+    assert.strictEqual(data.entryCountFiltered, 60, '_f 条数单独可见')
+    const page = JSON.parse((await request(port, 'GET', '/api/messages', { token: TOKEN })).text)
+    assert.strictEqual(page.grandTotal, 40, '推送记录页仍只算已推送条目')
+    server.close()
+  })
+  await aok('cache-health: 超过条数统计阈值 → 不整读，如实 tooLarge（D2-S12）', async () => {
+    const dir = tmpDir()
+    // 稀疏文件：8MiB+1，内容不是合法 JSON——若端点仍整读会走 invalid；必须报 tooLarge 且不 parse
+    const p = path.join(dir, 'push.json')
+    fs.writeFileSync(p, '')
+    fs.truncateSync(p, CACHE_HEALTH_COUNT_MAX_BYTES + 1)
+    const direct = cacheHealthEntryCount(dir, 'push.json')
+    assert.deepStrictEqual(direct, { status: 'tooLarge', count: null, filteredCount: null }, '超阈值不整读')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const data = JSON.parse((await request(port, 'GET', '/api/cache-health', { token: TOKEN })).text)
+    assert.strictEqual(data.entryCount, null, '条数不可得时不得编数')
+    assert.strictEqual(data.entryCountStatus, 'tooLarge')
+    assert.match(String(data.entryCountHint || ''), /MiB/, '必须说明为何不可得')
     server.close()
   })
   await aok('HTTP: /api/trends?days 白名单（30/60 放大窗口；非法/越界钳回 14）', async () => {

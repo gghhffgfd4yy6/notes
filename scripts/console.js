@@ -1115,9 +1115,10 @@ function tombstoneCounts (stateDir, messagesFile) {
 }
 
 // 缓存健康快照（GET /api/cache-health）：push.json 字节占用对照两级上限（生产写端 64MiB /
-// 控制台读端 32MiB），nearTrim/overLimit/consoleReadable 三位预警 + 墓碑计数。
-// 条数不在此读（数条数要 32MiB 整读，与轮询不兼容）——前端用 /api/messages 的 grandTotal
-// 对照 limits.entryMax 自行预警。
+// 控制台读端 64MiB，D2-N11：两者同值，介于 32–64MiB 的合法缓存不再被误报「过大不可读」），
+// nearTrim/overLimit/consoleReadable 三位预警 + 墓碑计数。
+// 条数在 cacheHealthEntryCount 里读，但先过 CACHE_HEALTH_COUNT_MAX_BYTES 闸（超闸报
+// tooLarge，不整读）——整读大文件会与轮询抢盘。
 function cacheHealthSnapshot (stateDir, messagesFile, limits) {
   const lim = limits || defaultHealthLimits()
   const meta = statSafeMeta(path.join(stateDir, messagesFile))
@@ -1138,6 +1139,14 @@ function cacheHealthSnapshot (stateDir, messagesFile, limits) {
     consoleReadable: bytes !== null && bytes <= lim.consoleReadMaxBytes,
     tombstone: { status: tomb.status, bytes: tomb.bytes, counts: tomb.counts }
   }
+}
+
+// 缓存健康页的条目数（D2-S11/D2-S12）：先 stat，超阈值不整读；否则复用 readMessages 缓存。
+function cacheHealthEntryCount (stateDir, messagesFile) {
+  const meta = statSafeMeta(path.join(stateDir, messagesFile))
+  if (meta.status !== 'ok') return { status: meta.status, count: null, filteredCount: null }
+  if (meta.size > CACHE_HEALTH_COUNT_MAX_BYTES) return { status: 'tooLarge', count: null, filteredCount: null }
+  return readMessageCount(stateDir, { filename: messagesFile, maxBytes: MESSAGES_MAX_BYTES })
 }
 
 // 状态目录文件清单（GET /api/files）：readdir + lstat（Dirent 天然不跟随末级符号链接——
@@ -1934,12 +1943,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 全部无副作用（不写盘、不 spawn），鉴权与既有读取端点同一全局闸。
     if (req.method === 'GET' && url.pathname === '/api/cache-health') {
       const snap = cacheHealthSnapshot(stateDir, messagesFile)
-      // 条目数对照（Sourcery Medium「条目上限无预警」）：条数维度由 /api/status 同源数据
-      // 提供——这里顺带读一次（readMessages 复用同一 32MiB 封顶，tooLarge 时 count:null，
-      // 前端显示「—」不编数）。缓存健康是进页/手动刷新拉取，不在 5s 轮询里，读放大可控。
-      const cnt = readMessageCount(stateDir, { filename: messagesFile })
+      // 条目数对照（Sourcery Medium「条目上限无预警」/ D2-S11 / D2-S12）：
+      // ① count 用 rawTotal（含 _f 条目）——_f 一样占缓存额度，旧口径漏计会让超限预警不响；
+      // ② 超过 CACHE_HEALTH_COUNT_MAX_BYTES 不整读（同步 parse 20MB 实测阻塞 232ms），
+      //    如实报 null + tooLarge，不编数；阈值内走 readMessages 的解析缓存。
+      const cnt = cacheHealthEntryCount(stateDir, messagesFile)
       snap.entryCount = cnt.status === 'ok' ? cnt.count : null
       snap.entryCountStatus = cnt.status
+      snap.entryCountFiltered = cnt.status === 'ok' ? cnt.filteredCount : null
+      if (cnt.status === 'tooLarge') snap.entryCountHint = `缓存超过 ${Math.round(CACHE_HEALTH_COUNT_MAX_BYTES / (1024 * 1024))}MiB，不在请求路径上整读计数（推送记录页的 grandTotal 仍可查）`
       sendJson(res, 200, snap)
       return
     }
@@ -2360,6 +2372,9 @@ module.exports = {
   sanitizeAccessPath,
   shouldLogAccess,
   ACCESS_LOG_MAX,
+  // D2-S12：cache-health 条数阈值（用例按同一常量构造夹具）
+  CACHE_HEALTH_COUNT_MAX_BYTES,
+  cacheHealthEntryCount,
   // v3.300 批次③ 3.2 消息导出：纯函数/常量导出（非 HTTP 单测 + 变异测试可达性）
   filterMessageItems,
   filterMessagesByDays,
