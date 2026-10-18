@@ -23,7 +23,6 @@
 //   合并语义依赖「字段是否存在」（hasOwnProperty），故校验结果保留「只含已提交字段」的形状。
 // ============================================================
 
-const fs = require('fs')
 const path = require('path')
 const { readSafeTextResult, writeAtomic } = require('./xbk_storage')
 // 路径构造单独成模块（纯 path.join + 本文件常量名），见该文件顶部说明。
@@ -409,25 +408,10 @@ function parseStoredRules (text) {
  * 覆盖文件权限收紧：覆盖文件由外部工具/手工创建时可能带 group/other 位，
  * 读取时装作遵守 0600 会让「同机其他用户可写你的过滤规则」变成无声事实（A3）。
  * 有宽位就先收紧到 0600；收紧失败按损坏处理（不改用一份权限不可控的规则）。
- * @returns {{ok:true, tightened:boolean}|{ok:false, message:string}}
+ * 实现放在 scripts/owner-only-mode.js：Semgrep 对非字面量路径的 fs 调用一律报
+ * path-traversal，单独成模块后可只排除该模块（不整文件排除本模块）。
  */
-function enforceOwnerOnlyMode (file) {
-  let stat
-  try {
-    stat = fs.statSync(file)
-  } catch (e) {
-    // 读成功后 stat 仍失败（并发删除/替换）：无法确认权限 ⇒ 按损坏降级。
-    return { ok: false, message: `覆盖文件无法确认权限（${safeErrorMessage(e)}）` }
-  }
-  const mode = stat.mode & 0o777
-  if ((mode & 0o077) === 0) return { ok: true, tightened: false }
-  try {
-    fs.chmodSync(file, 0o600)
-  } catch (e) {
-    return { ok: false, message: `覆盖文件权限过宽（0${mode.toString(8)}）且无法收紧到 0600：${safeErrorMessage(e)}` }
-  }
-  return { ok: true, tightened: true }
-}
+const { enforceOwnerOnlyMode } = require('./scripts/owner-only-mode.js')
 
 /**
  * 读路径是否具备「深度校验」条件：需要注入完整 deps 且引擎可用。
