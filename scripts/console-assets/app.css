@@ -28,6 +28,9 @@
 
     /* 强调 */
     --accent: #4f8cff;
+    /* 实心按钮底色：白字压 #4f8cff 只有 3.22:1（AA 不成立），改用更深的同色相
+       #356fd6（对白字 4.78:1）。--accent 仍用于深底上的文字/描边，不被拉暗。 */
+    --accent-solid: #356fd6;
     --accent-soft: rgba(79, 140, 255, .12);
     --accent-line: rgba(79, 140, 255, .3);
     --accent-hover: rgba(79, 140, 255, .05);
@@ -197,11 +200,16 @@
   .btn:hover:not(:disabled) { filter: brightness(1.2); }
   .btn:active:not(:disabled) { transform: translateY(1px); }
   .btn:disabled { opacity: .45; cursor: not-allowed; }
-  .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 500; }
+  .btn-primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); font-weight: 500; }
   .btn-danger-solid { background: var(--bad-fg); border-color: var(--bad-fg); color: #fff; font-weight: 600; }
   .btn-danger-solid:hover:not(:disabled) { filter: brightness(1.1); }
   .btn-secondary { background: var(--panel-2); }
   .btn-ghost { background: transparent; border-color: transparent; color: var(--accent); padding: var(--sp-1) var(--sp-2); font-size: var(--fs-sm); min-height: 40px; }
+  /* 表格行/日志框头里的 ghost 按钮不参与 40px 触控高度：否则行高 45→57、框头 44→56
+     （审查 #237）。独立作用域，工具栏与手机端主按钮的触控尺寸不变。 */
+  .runs-table .btn-ghost,
+  .logbox-head .btn-ghost { min-height: 28px; }
+
   .btn-desc { color: var(--text-dim); font-size: var(--fs-xs); }
 
   /* ── 确认弹窗（v3.307）── */
@@ -276,7 +284,7 @@
     min-height: 36px;
   }
   .tab-btn:hover { filter: brightness(1.2); }
-  .tab-btn.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 500; }
+  .tab-btn.active { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); font-weight: 500; }
 
   /* ── 趋势条形图（纯 CSS）── */
   /* 趋势图：一天一列固定宽度，总宽超出时横向滚动（14/30/60 日都不再挤成一团）。
