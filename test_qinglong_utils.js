@@ -267,6 +267,12 @@ const {
   assert.strictEqual(statusCacheDir({ env: { XBK_CACHE_DIR: outside }, fs: normalFs, path, root: CACHE_ROOT }), outside,
     '绝对路径覆盖必须原样采纳（不被根内校验改写）')
 
+  // ②b 尾随空格（D2-S7）：MessageStore 对 XBK_CACHE_DIR 做 trim 后才判绝对路径，
+  // --status 不 trim 会让读写两侧解析成不同目录（运行写 A、状态读 B）。
+  const padded = `  ${outside}  `
+  assert.strictEqual(statusCacheDir({ env: { XBK_CACHE_DIR: padded }, fs: normalFs, path, root: CACHE_ROOT }), outside,
+    '尾随/前导空格必须 trim 后与运行侧同源（修前会把带空格的串当另一个目录）')
+
   // ③ XBK_CACHE_DIR 为相对路径：告警 + 按同源规则解析默认目录（告警文案仍带生效目录）
   const relativeFs = makeStatusFs({ [CACHE_ROOT]: 'dir', [defaultCachePath]: 'file' })
   const warns = []

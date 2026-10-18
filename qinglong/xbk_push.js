@@ -328,7 +328,10 @@ const { readStatus, formatStatus } = require('../scripts/status')
 const DEFAULT_CACHE_DIR = 'xianbaoku_cache'
 
 function statusCacheDir ({ env = process.env, fs: fsImpl = fs, path: pathImpl = path, root = ROOT } = {}) {
-  const configured = env.XBK_CACHE_DIR
+  // 与 MessageStore 同源（D2-S7 复核）：xbk_message_store 对 XBK_CACHE_DIR 做 trim 后才判
+  // 绝对路径，这里不 trim 会让「尾随空格」的配置在读写两侧解析成不同目录（--status 读 A、
+  // 运行写 B，一边空一边有）。非字符串（undefined 等）按未设置处理。
+  const configured = typeof env.XBK_CACHE_DIR === 'string' ? env.XBK_CACHE_DIR.trim() : ''
   // 文档契约（README「若状态文件写在别处」）：XBK_CACHE_DIR 允许是项目目录之外的任意绝对路径。
   if (configured && pathImpl.isAbsolute(configured)) return configured
   const resolved = resolveCacheDirInRoot({
@@ -349,7 +352,9 @@ function runStatus () {
   const dir = statusCacheDir()
   // QX-08：--status 刻意不加载应用配置（缺 got/re2 时仍要可用），始终显式暴露实际读取目录。
   // 未采纳 XBK_CACHE_DIR 时额外说明：若已自定义 Config.cache.dir，需用同一绝对路径覆盖读取。
-  const configured = process.env.XBK_CACHE_DIR
+  // 展示口径必须与 statusCacheDir 同源（同一 trim）：否则「带尾随空格」的配置会打印
+  // 「未使用 XBK_CACHE_DIR」而实际已采用，排障时自相矛盾（D2-S7 复核）。
+  const configured = typeof process.env.XBK_CACHE_DIR === 'string' ? process.env.XBK_CACHE_DIR.trim() : ''
   const source = configured && path.isAbsolute(configured)
     ? '使用 XBK_CACHE_DIR'
     : '未使用 XBK_CACHE_DIR；--status 不加载应用配置，若已自定义 Config.cache.dir，请用 XBK_CACHE_DIR 指向该绝对路径'
