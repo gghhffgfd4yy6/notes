@@ -58,6 +58,14 @@ function runtimeCacheDir () {
   }
 }
 
+// 控制台 stateDir（审查 #241 M1）：以运行侧 MessageStore.cacheDir（runtimeCacheDir）为
+// 唯一来源——面板读的目录必须就是运行侧真实写入的目录（run.log / report.state / push.json）。
+// 否则设根外绝对 XBK_CACHE_DIR 时控制台读 A、运行写 B，运行历史与推送记录永远读空。
+// 取不到运行侧解析结果（应用配置加载失败）才退回 XBK_CACHE_DIR / 默认目录。
+function consoleStateDir () {
+  return runtimeCacheDir() || statusCacheDir()
+}
+
 function messagesCacheName () {
   try {
     const app = require('../xbk_function_v3')
@@ -2212,14 +2220,13 @@ function main () {
   const host = process.env.XBK_CONSOLE_HOST || '127.0.0.1'
   // Sourcery Medium：与生产入口 / --status 同源解析缓存目录（含安全回退），
   // 不再手写默认值——否则 .xbk_cache_safe 生效时看板会读错目录。
-  const stateDir = statusCacheDir()
-  // 显式化运行侧缓存目录漂移（Sourcery PR#227「Custom cache records stay hidden」）：
-  // 控制台状态体系（run.log / report.state / 锁）以 stateDir 为准；若运行侧 Config.cache.dir
-  // 解析到别处，推送缓存与状态文件就分居两目录——启动时高声警告，而不是让「推送记录」页静默 missing。
-  const runtimeDir = runtimeCacheDir()
-  if (runtimeDir && path.resolve(runtimeDir) !== path.resolve(stateDir)) {
-    console.error(`⚠️ 运行侧缓存目录（Config.cache.dir → ${runtimeDir}）与控制台目录（${stateDir}）不一致：` +
-      `推送记录页将读不到 push.json。请把 XBK_CACHE_DIR 设为 ${runtimeDir}，或让两处配置一致。`)
+  // v3.308（审查 #241 M1）：以运行侧 MessageStore.cacheDir 为唯一来源——控制台状态体系
+  // （run.log / report.state / push.json / 锁）读的目录必须与运行侧真实写入目录一致；
+  // 仅当应用配置加载失败、无法解析运行侧目录时退回 statusCacheDir()。
+  const stateDir = consoleStateDir()
+  if (!runtimeCacheDir()) {
+    console.warn(`⚠️ 无法解析运行侧缓存目录（应用配置加载失败），控制台按 ${stateDir} 读取；` +
+      '推送记录与运行历史可能不在该目录。')
   }
   // 锁归属 token（评审 Medium：pid 复用会让「pid===process.pid」误认他人锁为自有；
   // takeover 换主后 unlink 竞态也可能误删新主的锁）。锁内容带 token，释放须双匹配。
@@ -2244,6 +2251,7 @@ if (require.main === module) main()
 
 module.exports = {
   createConsole,
+  consoleStateDir,
   isValidToken,
   timingSafeEqualStr,
   acquireLock,

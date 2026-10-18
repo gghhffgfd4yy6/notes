@@ -11,14 +11,14 @@ const path = require('node:path')
 const http = require('node:http')
 const zlib = require('node:zlib')
 const net = require('node:net')
-const { spawn } = require('node:child_process')
+const { spawn, spawnSync } = require('node:child_process')
 // 竞态安全读取器（生产 xbk_storage）：测试里对「刚写完/刚 rename 过的路径」的断言读取
 // 统一走它（O_NOFOLLOW + fstat 复检 + 读后复检），规避 CodeQL js/file-system-race 对
 // 「写路径 → 按路径 open」的 check-then-use 判红。
 const { readSafeTextResult } = require('./xbk_storage')
 
 const {
-  createConsole, isValidToken, timingSafeEqualStr,
+  createConsole, consoleStateDir, isValidToken, timingSafeEqualStr,
   acquireLock, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
@@ -2090,6 +2090,43 @@ async function main () {
         'MessageStore.cacheDir 必须服从 XBK_CACHE_DIR（否则子进程 run.log 仍写生产）')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+  await aok('缓存目录: XBK_CACHE_DIR 两侧同一规则 + 控制台目录跟随运行侧（审查 D1-M1）', () => {
+    const probe = "const x=require('./xbk_function_v3');process.stdout.write(x.MessageStore.cacheDir)"
+    const run = (value) => spawnSync(process.execPath, ['-e', probe], {
+      cwd: __dirname, encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: value }
+    })
+    const norm = (p) => { try { return fs.realpathSync(p) } catch (e) { return path.resolve(p) } }
+    const base = run('')
+    assert.strictEqual(base.status, 0, String(base.stderr))
+    const defaultDir = norm(base.stdout.trim())
+    // 相对路径：与 --status 同一套规则（告警 + 忽略）。旧实现运行侧真的写进 <root>/rel/cache，
+    // 控制台却打印「已忽略并回退默认目录」——同一变量两套解析。
+    const rel = run('rel/cache')
+    assert.strictEqual(norm(rel.stdout.trim()), defaultDir, '相对路径 XBK_CACHE_DIR 必须被运行侧忽略')
+    assert.match(String(rel.stderr), /XBK_CACHE_DIR 不是绝对路径（rel\/cache）/, '忽略相对路径必须告警')
+    // 绝对路径（含项目根外）：两侧都原样采纳，控制台读的就是运行侧写的
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-abs-'))
+    const prev = process.env.XBK_CACHE_DIR
+    try {
+      const abs = run(outside)
+      assert.strictEqual(norm(abs.stdout.trim()), norm(outside), '绝对路径必须被运行侧采纳（含根外）')
+      const quiet = (fn) => { const w = console.warn; console.warn = () => {}; try { return fn() } finally { console.warn = w } }
+      process.env.XBK_CACHE_DIR = outside
+      assert.strictEqual(norm(quiet(consoleStateDir)), norm(outside),
+        '控制台 stateDir 必须取运行侧 MessageStore.cacheDir（否则运行历史/推送记录读空）')
+      process.env.XBK_CACHE_DIR = 'rel/cache'
+      assert.strictEqual(norm(quiet(consoleStateDir)), defaultDir,
+        '相对路径下控制台也回退默认目录（与运行侧口径一致）')
+      // --status 侧同一规则（statusCacheDir）：绝对路径原样采纳，相对路径回默认目录
+      const { statusCacheDir } = require('./qinglong/xbk_push')
+      assert.strictEqual(norm(quiet(() => statusCacheDir({ env: { XBK_CACHE_DIR: outside }, fs, path }))), norm(outside))
+      assert.strictEqual(norm(quiet(() => statusCacheDir({ env: { XBK_CACHE_DIR: 'rel/cache' }, fs, path }))), defaultDir)
+    } finally {
+      if (prev === undefined) delete process.env.XBK_CACHE_DIR
+      else process.env.XBK_CACHE_DIR = prev
+      fs.rmSync(outside, { recursive: true, force: true })
     }
   })
   await aok('HTTP: run-history limit=9999 在 220 轮 fixture 上真实钳制到 200（评审 #14）', async () => {

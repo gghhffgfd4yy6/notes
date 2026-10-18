@@ -154,7 +154,7 @@ filter: {
 |---|---|
 | `XBK_INTERVAL_MS` | 抓取间隔，单位为毫秒，默认 `10000` |
 | `XBK_DRY_RUN=1` | 对常驻和单轮入口都生效：不发送通知、不写入成功缓存；常驻入口持续运行，`npm start` 只执行一轮 |
-| `XBK_CACHE_DIR` | `--status` 使用的状态目录，必须是绝对路径 |
+| `XBK_CACHE_DIR` | 缓存目录覆盖（`--status`、控制台与常驻/单轮运行共用），必须是绝对路径，相对路径告警后忽略。已部署实例不要修改：`push.json` 判重主存随目录迁移、旧记录不自动搬家，会导致重复推送 |
 | `XBK_CONSOLE_TOKEN` | 网页控制台访问令牌（≥16 字符；未设置则控制台拒绝启动） |
 | `XBK_CONSOLE_PORT` | 网页控制台端口，默认 `7777`（设 `0` 则绑定随机可用端口；非 0–65535 整数拒绝启动） |
 | `XBK_CONSOLE_HOST` | 网页控制台绑定地址，默认 `127.0.0.1` |
@@ -224,7 +224,7 @@ npm rebuild re2
 1. `push_config.local.js` 是否填写正确；
 2. 是否至少配置了一个完整的通知渠道；
 3. 运行 `node qinglong/xbk_push.js --check` 检查依赖；
-4. 查看实际运行缓存目录中的 `run.log`：常驻/单轮运行的目录由 `Config.cache.dir` 决定，必须位于项目根内；绝对路径、`..` 或符号链接越出项目根时会回退到默认或安全目录。`XBK_CACHE_DIR` **只影响 `--status` 读取的目录**，不会改变常驻/单轮运行或 `run.log` 的写入位置。运行 `--status` 时它会打印实际读取目录；若未设置该变量且自定义了 `Config.cache.dir`，请把该根内绝对路径通过 `XBK_CACHE_DIR` 传给 `--status`；若设置了绝对 `XBK_CACHE_DIR`，以输出中的该路径为准；
+4. 查看实际运行缓存目录中的 `run.log`：缓存目录由 `Config.cache.dir` 决定（默认 `<项目根>/xianbaoku_cache`，必须位于项目根内；绝对路径、`..` 或符号链接越出项目根时会回退到默认或安全目录）。`XBK_CACHE_DIR`（必须是绝对路径，相对路径告警后忽略）会覆盖 `Config.cache.dir`，并同时决定 `--status`、控制台与常驻/单轮运行（含 `run.log`、`report.state`、`push.json`）使用的目录——读取位置与写入位置因此永远一致。**已部署实例不要修改它**：`push.json` 是判重主存，改目录不会迁移旧记录，下一轮会把已推送条目当新条目重推；确需迁移时请连同目录内文件一起搬。运行 `--status` 时它会打印实际读取目录；若未设置该变量且自定义了 `Config.cache.dir`，请把该根内绝对路径通过 `XBK_CACHE_DIR` 传给 `--status` 与控制台；若设置了绝对 `XBK_CACHE_DIR`，以输出中的该路径为准；
 
 5. 用 `--dry-run` 确认抓取和过滤是否正常。
 
