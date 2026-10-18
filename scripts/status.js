@@ -2,6 +2,7 @@
 
 const path = require('node:path')
 const { readSafeTextResult } = require('../xbk_storage')
+const { defaultMessageSignature } = require('./message-signature')
 
 const FILES = {
   run: 'run.log',
@@ -32,7 +33,12 @@ const LOG_READ_OPTIONS = { tail: true }
 
 function readText (dir, name, maxBytes = LOG_MAX_BYTES, options) {
   const safe = readSafeTextResult(path.join(dir, name), maxBytes, options)
-  return safe.status === 'ok' ? result('ok', safe.text) : result(safe.status)
+  if (safe.status !== 'ok') return result(safe.status)
+  const out = result('ok', safe.text)
+  // 尾部窗口读取（run.log 超过 1 MiB）会切掉更早行：调用方要能区分「没有旧轮」与
+  // 「旧轮被窗口截掉」，统计/运行历史据此标注不完整（Sourcery 统计少算旧摘要）。
+  if (safe.truncated === true) out.truncated = true
+  return out
 }
 
 function validCounter (value) {
@@ -115,16 +121,109 @@ function parseJson (read, validate) {
   } catch (error) { return result('invalid') }
 }
 
-// 摘要行之后的日志行是否说明「这一轮没正常走完」（审查 SS-01）。生产侧写日志的顺序是
-// 「先写 total=… 摘要、再在异常分支写 ERROR / ALERT 运行异常」（xbk_app.js:1498 → :1526/:314），
-// 所以摘要行之后出现 ERROR 或「运行异常」即代表该轮在其后中断。只认这两种强信号，
-// 普通 ALERT（低磁盘/日报更新失败等）不参与判定，避免把成功的轮次误报成异常。
+// 失败行的强信号判定（审查 SS-01 / D2-M3）：只认独立 ERROR 或「运行异常」，普通 ALERT
+// （低磁盘/线报酷截断/缺 re2/日报更新失败）不参与——它们的正文同样含「⚠️ xbk-push 运行异常」，
+// 按正文命中会把成功轮误报成中断。轮起止归属见下方 classifyRoundFailures（与 readRunHistory
+// 共用同一口径，避免「同一面板两处结论相反」）。
 function looksLikeRoundFailure (line) {
   // 「控制台停止：任务 #… 于运行中被停止（SIGTERM）」是控制台侧的取消留痕，不是某一轮的
   // 运行失败：它没有自己的摘要行，把最近的摘要回填成 interrupted 会让每次重启/取消都把
-  // 上一轮标成「中断」（评审：手机端整页黄色警告）。取消轮次照旧无处归属 ⇒ 忽略。
+  // 上一轮标成「中断」（评审：手机端整页黄色警告）。取消轮次由 readRunHistory 按 CANCEL
+  // 前缀单独成条（cancelled=true），这里一律不算失败。
   if (line.includes('控制台停止：任务 #')) return false
+  // 审查 D2-M3：ALERT 的正文固定含「运行异常」（xbk_app.js:324 的告警模板），但线报酷截断、
+  // 缺 re2 等**非失败**告警都用同一句正文 ⇒ 不能按正文命中，否则成功轮被标「中断」。
+  // ALERT 行里可能内嵌带 ERROR 字样的原因串，先整行排除；独立的中文「运行异常」（无 ALERT
+  // 前缀）仍按失败处理，保留状态报告既有口径。
+  if (/(?:^|\s)ALERT(?:\s|$)/.test(line)) return false
   return /(?:^|\s)ERROR(?:\s|$)|运行异常/.test(line)
+}
+
+// run.log 摘要行正则（parseLastRun 只看最后一条；readTrends / readRunHistory / parseRunStats
+// 都按同一逐行形态解析）。dry-run 行（含 dry-run未推送=）计入轮次与获取数，但 pushed 恒为 0，
+// 与真实口径一致；noidentity/cachesaved 等附加字段不参与聚合。
+const RUN_SUMMARY_LINE_RE = /^(?:(\d{4}-\d{2}-\d{2})[T ]\d{2}:\d{2}:\d{2}\S* )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=(\S+)/
+
+// ── 轮界归属（parseLastRun / readRunHistory 共用）────────────────────────────
+// 生产写序（xbk_app.js）：失败行写在所属轮的摘要行**之前**——「推送全部失败」ERROR 后紧跟
+// 同秒摘要（:1684 → :1688），「缓存读取失败」ERROR 后本轮仍走完收尾写摘要（:1191）；进程在
+// 写摘要前退出则只剩失败行（崩溃轮）。归属判据：
+//   ① 近距：与摘要相距 ≤2 行且 |Δt| ≤2s（同一秒写出，防跨轮误挂）；
+//   ② 轮内远距：其后第一条摘要在 10 分钟内、且两行之间没有别的摘要（同轮先记错误再写摘要，
+//      中间隔着若干行普通日志——旧实现只在 2 行内找，于是同一物理轮多出一条幽灵崩溃行）；
+//   ③ 其余 = 无摘要可归属的独立崩溃轮（占位条目），绝不回填「最近一条摘要」（那会把上一轮
+//      误标 interrupted，而崩溃轮自己从历史里消失）。
+// 10 分钟与 console.js 的单轮超时（PROC_TIMEOUT_MS）同量级：一轮不可能更久；崩溃后下一次
+// 调度通常远超此窗，因此不会把上一轮的崩溃行挂到下一轮。
+const ROUND_FAILURE_NEAR_LINES = 2
+const ROUND_FAILURE_NEAR_MS = 2000
+const ROUND_FAILURE_INROUND_MS = 10 * 60 * 1000
+
+function tsOf (line) {
+  const m = /^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/.exec(line)
+  return m ? m[1] : ''
+}
+function tsMs (line) {
+  const ts = tsOf(line)
+  const v = ts ? Date.parse(ts.replace(' ', 'T') + 'Z') : NaN
+  return Number.isFinite(v) ? v : null
+}
+
+// 摘要行索引表：0-based 行号 → 摘要时间戳(ms) / null（无时间戳）。
+// 计数器非法/缺失的摘要行不参与归属（否则失败轮会凭空消失）。
+function summaryIndexOf (lines) {
+  const summaryAt = new Map()
+  for (let i = 0; i < lines.length; i++) {
+    if (!RUN_SUMMARY_LINE_RE.test(lines[i])) continue
+    const m = RUN_SUMMARY_LINE_RE.exec(lines[i])
+    if (![m[2], m[3], m[4], m[5], m[6], m[7]].map(Number).every(validCounter)) continue
+    summaryAt.set(i, tsMs(lines[i]))
+  }
+  return summaryAt
+}
+
+// 失败行 → 所属摘要行（interruptedIdx）或无主崩溃行（crashIdx）。
+function classifyRoundFailures (lines, summaryAt) {
+  const summaryIdx = [...summaryAt.keys()].sort((a, b) => a - b)
+  const interruptedIdx = new Set()
+  const crashIdx = new Set()
+  for (let i = 0; i < lines.length; i++) {
+    if (summaryAt.has(i) || !looksLikeRoundFailure(lines[i])) continue
+    const t = tsMs(lines[i])
+    let best = null
+    if (t === null) {
+      // 无时间戳：只认文件序其后的摘要（1–2 行内），不把更早一轮的堆栈行回填给它
+      for (let d = 1; d <= ROUND_FAILURE_NEAR_LINES && !best; d++) {
+        if (summaryAt.has(i + d)) best = { j: i + d, gap: 0 }
+      }
+    } else {
+      // 同距时优先「其后的摘要」：生产写序是失败行 → 本轮摘要，前一条摘要属于上一轮。
+      // 必须把所有 ≤2 行的候选都算完再取最小 Δt，不能找到第一个就停——两轮交错写日志时，
+      // 1 行外的上一条摘要可能比 2 行外的本轮摘要更远（Sourcery 失败归属错轮）。
+      for (let d = 1; d <= ROUND_FAILURE_NEAR_LINES; d++) {
+        for (const j of [i + d, i - d]) {
+          if (!summaryAt.has(j)) continue
+          const st = summaryAt.get(j)
+          if (st === null) continue
+          const gap = Math.abs(st - t)
+          if (gap > ROUND_FAILURE_NEAR_MS) continue
+          if (!best || gap < best.gap) best = { j, gap }
+        }
+      }
+      if (!best) {
+        // 轮内远距：其后第一条摘要（之间无其他摘要）且时间差在单轮上限内
+        const next = summaryIdx.find((j) => j > i)
+        if (next !== undefined) {
+          const st = summaryAt.get(next)
+          const gap = st === null ? null : st - t
+          if (gap !== null && gap >= 0 && gap <= ROUND_FAILURE_INROUND_MS) best = { j: next, gap }
+        }
+      }
+    }
+    if (best) interruptedIdx.add(best.j)
+    else crashIdx.add(i) // 无摘要可归属 ⇒ 独立崩溃轮占位
+  }
+  return { interruptedIdx, crashIdx }
 }
 
 function parseLastRun (read) {
@@ -140,7 +239,20 @@ function parseLastRun (read) {
     // 与 parseDiagnostics 同口径：六项计数必须是非负安全整数（超长数字经 Number 得 Infinity/超界，直接跳过该行）
     const counters = match.slice(2, 8).map(Number)
     if (!counters.every(validCounter)) continue
-    const interrupted = lines.slice(i + 1).some(looksLikeRoundFailure)
+    // 找到最近一条完整摘要就返回，循环不会进入第二次——归属表可以在这里一次性构建
+    // （CodeQL: 旧写法的 !summaryAt 条件恒真，属死分支）。
+    const summaryAt = summaryIndexOf(lines)
+    const classified = classifyRoundFailures(lines, summaryAt)
+    // 与 readRunHistory 同一归属口径：只标「本条摘要自己的轮」是否中断；其后的无主失败行
+    // 单独计数上报（旧实现把尾部任意 ERROR 回填给本条摘要 ⇒ 与运行历史结论相反）。
+    let orphanFailures = 0
+    let orphanFailureAt = ''
+    for (const j of classified.crashIdx) {
+      if (j <= i) continue
+      orphanFailures += 1
+      const at = tsOf(lines[j])
+      if (at) orphanFailureAt = at
+    }
     return result('ok', {
       at: match[1] ? match[1].trim() : '',
       total: counters[0],
@@ -150,10 +262,59 @@ function parseLastRun (read) {
       pushed: counters[4],
       failed: counters[5],
       elapsed: match[8],
-      interrupted
+      interrupted: classified.interruptedIdx.has(i),
+      orphanFailures,
+      orphanFailureAt
     })
   }
   return result('invalid')
+}
+
+// 首屏「今日 / 近 7 天」聚合（v3.307）：与趋势同源同口径（run.log 摘要行 + Asia/Shanghai
+// 日历日），但只下发计数，不在前端重算。today/week 的 successRate = pushed/(pushed+failed)，
+// 无尝试时 null（前端显示「—」而不是编一个 100%）。
+// lastFailure 是近 7 天窗口内最近一条 failed>0 的摘要（用于首屏异常横幅的「看日志」跳转）；
+// 窗口外失败不进入 stats，避免首屏长期挂红。
+function parseRunStats (read, now = Date.now()) {
+  if (read.status !== 'ok') return { status: read.status }
+  const todayKey = shanghaiDayKey(now)
+  const weekStartKey = shanghaiDayKey(now - 6 * 86400000)
+  const blank = (date) => ({ date, rounds: 0, total: 0, pushed: 0, failed: 0 })
+  const today = blank(todayKey)
+  const week = { from: weekStartKey, to: todayKey, rounds: 0, total: 0, pushed: 0, failed: 0 }
+  let lastFailure = null
+  for (const line of read.value.split('\n')) {
+    const m = RUN_SUMMARY_LINE_RE.exec(line)
+    if (!m) continue
+    const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
+    if (!counters.every(validCounter)) continue
+    const day = m[1]
+    // 只统计 [本周起点, 今天]：未来日期（时钟回拨/手写 fixture/坏摘要）会把周汇总和
+    // lastFailure 一起推高（Sourcery 未来摘要污染周统计）。
+    if (!day || day < weekStartKey || day > todayKey) continue
+    week.rounds += 1
+    week.total += counters[0]
+    week.pushed += counters[4]
+    week.failed += counters[5]
+    if (day === todayKey) {
+      today.rounds += 1
+      today.total += counters[0]
+      today.pushed += counters[4]
+      today.failed += counters[5]
+    }
+    if (counters[5] > 0) {
+      lastFailure = { at: line.slice(0, 19).trim(), date: day, failed: counters[5] }
+    }
+  }
+  const rate = (pushed, failed) => (pushed + failed > 0 ? pushed / (pushed + failed) : null)
+  return result('ok', {
+    today: { ...today, successRate: rate(today.pushed, today.failed) },
+    week: { ...week, successRate: rate(week.pushed, week.failed) },
+    lastFailure,
+    // 尾部 1 MiB 窗口外可能还有本日/本周摘要：true 时前端必须标注「仅统计日志尾部」，
+    // 不得把少算的总数当完整数据展示。
+    truncated: read.truncated === true
+  })
 }
 
 function parseDiagnostics (read) {
@@ -177,19 +338,23 @@ function readStatus (dir, { now = Date.now() } = {}) {
   // report.state / channel-health 是「整份 JSON」，必须整读：超限仍判 tooLarge（读尾部只会得到
   // 半个 JSON，假装可读更危险）。run.log / filter-diagnostics 是追加式日志，取尾部 1 MiB
   // （审查 SS-03）：超限时旧行为让这两个部件整体不可见，而解析本来就是「从最后一行往前找」。
-  const run = parseLastRun(readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS))
+  const runRead = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
+  const run = parseLastRun(runRead)
   const diagnostics = parseDiagnostics(readText(dir, FILES.diagnostics, LOG_MAX_BYTES, LOG_READ_OPTIONS))
-  return { generatedAt: now, report, channels, run, diagnostics }
+  return { generatedAt: now, report, channels, run, diagnostics, stats: parseRunStats(runRead, now) }
 }
 
 // 判重缓存条数（v3.298 附加部件，与 readStatus 同目录同防御）：控制台缓存健康面板的
 // 「条目数 / 上限」预警需要它，但 readStatus 形状被 --status 与既有前端锁定（不能改），
 // 故独立导出。只回计数不回显条目（调用方要详情另有 readMessages）；超限的缓存数条数
 // 要整读 32MiB——tooLarge 时如实返回 tooLarge（null），前端显示「—」而不是编个数。
-function readMessageCount (dir, { filename = FILES.messages } = {}) {
-  const read = readMessages(dir, { filename })
-  if (read.status !== 'ok') return { status: read.status, count: null }
-  return { status: 'ok', count: read.value.total }
+function readMessageCount (dir, { filename = FILES.messages, maxBytes = 32 * 1024 * 1024 } = {}) {
+  const read = readMessages(dir, { filename, maxBytes })
+  if (read.status !== 'ok') return { status: read.status, count: null, filteredCount: null }
+  // count 用 rawTotal（含 _f 条目）：条数上限约束的是缓存条目总数，而 _f（被过滤、从未推送）
+  // 一样占额度。旧实现报 items.length（排除 _f），9000 条 _f + 1500 条正常时报 1500/10000，
+  // 实际 10500 已超上限却预警不响（D2-S11）。filteredCount 单列，页面仍可显示「已推送」条数。
+  return { status: 'ok', count: read.value.rawTotal, filteredCount: read.value.filteredCount }
 }
 
 function describe (part) {
@@ -206,6 +371,11 @@ function formatStatus (status) {
   //    不再一律渲染成「正常」（崩溃轮此前与正常轮显示完全一致）。
   const runState = run && run.interrupted ? '⚠️ 上一轮未正常结束' : describe(status.run)
   lines.push(`最近一轮：${runState}${run ? ` | 时间 ${run.at || '无时间戳'} | 获取 ${run.total} | 去重 ${run.dedup} | 过滤 ${run.filtered} | 推送 ${run.pushed} | 失败 ${run.failed} | 截断 ${run.truncated}${run.truncated > 0 ? ' ⚠️' : ''} | 耗时 ${run.elapsed}` : ''}`)
+  // 摘要之后的无主失败行（崩溃轮）：不把这轮标成中断（它确实正常写完了摘要），但也不能让
+  // 崩溃信号在首屏消失——单独一行如实上报，指向运行历史里的占位条目。
+  if (run && run.orphanFailures > 0) {
+    lines.push(`⚠️ 其后另有 ${run.orphanFailures} 条失败行未归属任何摘要（独立崩溃轮${run.orphanFailureAt ? `，最近 ${run.orphanFailureAt}` : ''}；见运行历史）`)
+  }
   const channels = status.channels.value
   if (channels) {
     // 与 validChannels 同口径逐条过滤（审查 SS-02）：损坏条目单独计数并明示，健康通道照常展示。
@@ -225,11 +395,6 @@ function formatStatus (status) {
 // ── 控制台扩展数据（v3.297）：趋势 / 推送记录 ────────────────────────────────
 // 与 readStatus 同源同目录、同样只读（readSafeTextResult，符号链接/非常规文件防御继承），
 // 不改变 readStatus 返回形状——现有 --status / formatStatus / 前端看板零影响。
-
-// run.log 摘要行正则（与 parseLastRun 同一口径的**逐行**形态）：trends 把全部摘要行按日聚合，
-// 而不是只取最近一轮。dry-run 行（含 dry-run未推送=）计入轮次与获取数，但 pushed 恒为 0，
-// 与真实口径一致；noidentity/cachesaved 等附加字段不参与聚合。
-const RUN_SUMMARY_LINE_RE = /^(?:(\d{4}-\d{2}-\d{2})[T ]\d{2}:\d{2}:\d{2}\S* )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=(\S+)/
 
 function validInt (v) { return Number.isSafeInteger(v) && v >= 0 }
 
@@ -305,24 +470,57 @@ function runParseExtras (line) {
   return { cachesaved, noidentity, dryRun }
 }
 
-// 尾窗身份（评审 #243-1）：before 行号相对「当前 1MiB 尾窗」编号，文件超窗后新写入会让
-// 整个窗口平移，旧游标会指到别的轮次。用窗口首行算 8 位哈希作为窗口指纹，客户端翻页时
-// 带回；指纹不符 → stale，前端回第 1 页（宁可重看，不跳/不重复）。
-function windowKeyOf (firstLine) {
+// 尾窗指纹（评审 #243-1 / 审查 D1-N6）：before 行号相对「当前 1MiB 尾窗」编号，文件超窗后
+// 新写入会让整个窗口平移，旧游标会指到别的轮次。窗口指纹随响应下发，客户端翻页时带回；
+// 指纹不符 → stale，前端回第 1 页（宁可重看，不跳/不重复）。
+// 旧实现直接哈希首行前 200 字符：空行/空串恒得 811c9dc5（不同的空窗口无法区分），首行第
+// 200 字符之后不同也判不出来。现口径：跳过空行取首个非空行，把「行序 + 长度 + 完整内容」
+// 并入哈希。行数与总长度刻意不入哈希——append-only 日志每追加一行都会变，那会让翻页永远
+// stale（追加安全的游标见 entryKeyOf）。
+function windowKeyOf (windowLines) {
+  const lines = Array.isArray(windowLines) ? windowLines : [windowLines]
+  let n = 0
+  while (n < lines.length && String(lines[n] === undefined || lines[n] === null ? '' : lines[n]).trim() === '') n++
+  const anchor = n < lines.length ? String(lines[n] === undefined || lines[n] === null ? '' : lines[n]) : ''
+  const seed = `${n}:${anchor.length}:${anchor}`
   let h = 0x811c9dc5
-  const t = String(firstLine || '').slice(0, 200)
-  for (let i = 0; i < t.length; i++) {
-    h ^= t.charCodeAt(i)
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i)
     h = Math.imul(h, 0x01000193) >>> 0
   }
   return h.toString(16).padStart(8, '0')
 }
 
+// 条目稳定身份（审查 D1-S3）：尾窗按字节平移，行号（窗口相对）在追加时必变，只有行内容
+// 不变。key = 行内容 8 位哈希；客户端翻页回传上一页最旧条目的 key，服务端按 key 定位锚点、
+// 取文件序更早的条目——追加新行不再让游标失效；仅当锚点轮已滚出 1MiB 尾窗（物理丢失）
+// 时才返回 stale。
+function entryKeyOf (line) {
+  const text = String(line === undefined || line === null ? '' : line)
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
+
+// 取消留痕（审查 #229 S7 / D1-N3）：控制台停止任务时写 `CANCEL 控制台停止：任务 #…`。
+// 它不是运行失败（不参与 interrupted），但也不能让这轮从历史里消失——readRunHistory 给它
+// 生成 cancelled 占位条目；相邻轮次不受影响。
+function isCancelTrace (line) {
+  return /(?:^|\s)CANCEL(?:\s|$)/.test(line) && line.includes('控制台停止：任务 #')
+}
+
 function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
   const lim = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50
-  // before 游标（Sourcery #229-6 稳定分页）：语义 =「只考虑行号 ≤ before 的行」（1-based）。
-  // 行号身份对 append 天然稳定（新行只追加在文件尾部，既有行号不动），比「条数游标」抗并发
-  // 追加；调用方把上一页最旧条目的 lineNo-1 透传回来（本函数每条目下发 lineNo 行号身份）。
+  // before 两种形态（审查 D1-S3）：数字 = 行号游标（兼容旧前端；尾窗平移后需窗口指纹校验），
+  // 8 位十六进制 = 条目 key 游标（追加安全，新前端使用）。
+  // key 游标：裸 8 位（首次出现）或 `<8位>-<序号>`（同内容重复行，见下方 occurrence 去重）
+  const beforeKey = typeof before === 'string' && /^[0-9a-f]{8}(?:-\d{1,4})?$/.test(before) ? before : ''
+  const beforeLine = Number.isSafeInteger(before) && before > 0
+    ? before
+    : (typeof before === 'string' && /^\d{1,9}$/.test(before) ? Number(before) : 0)
   // [5] 超窗/轮转如实标注（Sourcery #229-5）：readSafeTextResult 尾读触发即 truncated
   // （首行可能是半行）；另有写入侧历史上发生过截尾的情形——文件已 ≤1MiB，stat 大小判不出，
   // 但窗口首行不是「时间戳锚定」形态（首行切在行中，退位算法总保完整字符、半行保不住锚），
@@ -331,139 +529,130 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '' } = {}) {
   if (read.status !== 'ok') return { status: read.status, items: [], hasMore: false, truncated: false }
   let truncated = read.truncated === true
   const lines = read.value.split('\n')
-  const maxLine = Number.isSafeInteger(before) && before > 0 ? before : lines.length + 1
   const first = lines[0] || ''
   if (!truncated && first.trim() !== '' && !RUN_SUMMARY_LINE_RE.test(first) &&
       !/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(first)) {
     truncated = true
   }
-  // 从尾向前扫（时间倒序天然成立）。轮界模型（Sourcery #229-3/#229-12，按生产写序
-  // xbk_app.js :1684→:1688、:1718）：失败行（ERROR/运行异常）写在其所属摘要行**之前**
-  // （文件序，中间不会有另一条摘要——有即说明失败行属于更晚那轮），失败行归属文件序
-  // 更晚的相邻摘要轮。倒序扫描时失败行在摘要行**之后**才被遇到——遇失败行直接**回填**
-  // 已收集的最近一条摘要（items[0]）的 interrupted=true（若尚未收集任何摘要，说明失败行
-  // 之后/文件尾再无摘要 = 崩溃轮占位 crashPending）。窗口头残余无摘要可回填的失败行
-  // 静默丢弃（其摘要轮已滚出 1MiB 尾窗，归属无法重建）。
-  const key = windowKeyOf(first)
-  if (typeof windowKey === 'string' && windowKey !== '' && windowKey !== key) {
+  const key = windowKeyOf(lines)
+  // 行号游标必须配窗口指纹（窗口平移后同一行号指向别的轮次）；key 游标自带身份，不需要。
+  if (beforeKey === '' && typeof windowKey === 'string' && windowKey !== '' && windowKey !== key) {
     return { status: 'stale', items: [], hasMore: false, truncated, windowKey: key }
   }
-  const items = []
-  // 同轮归属（评审：手机端整页「中断」）：生产写序是「摘要行 → 同秒 ERROR」（崩溃轮），
-  // 与旧假设「失败行在摘要行之前」相反；倒序扫描时失败行先遇到，会误标**上一条更晚**的
-  // 摘要。这里先按时间戳建立失败行 → 摘要行归属（同秒即同轮），扫描时直接查表。
-  const tsOf = (line) => (line.match(/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/) || [''])[0]
-  const tsMs = (line) => {
-    const ts = tsOf(line)
-    const v = ts ? Date.parse(ts.replace(' ', 'T') + 'Z') : NaN
-    return Number.isFinite(v) ? v : null
-  }
-  // 同轮归属（评审：手机端整页「中断」）：生产写序是「摘要 → 同秒/下一秒 ERROR」（崩溃轮），
-  // 与旧假设「失败行在摘要行之前」相反；倒序扫描时失败行先遇到，会误标**上一条更晚**的
-  // 摘要。这里按行距就近归属（≤2 行，时间差 ≤2s），只认通过计数器校验的摘要行。
-  const summaryByLine = new Map()
-  for (let i = 0; i < lines.length; i++) {
-    if (!RUN_SUMMARY_LINE_RE.test(lines[i])) continue
-    const m = RUN_SUMMARY_LINE_RE.exec(lines[i])
-    // 与建 items 同一套校验：计数器非法/缺失的摘要行不参与归属（否则失败轮会凭空消失）
-    if (![m[2], m[3], m[4], m[5], m[6], m[7]].map(Number).every(validInt)) continue
-    summaryByLine.set(i, tsMs(lines[i]))
-  }
-  const interruptedIdx = new Set()
-  const attributedFailures = new Set()
-  for (let i = 0; i < lines.length; i++) {
-    if (!looksLikeRoundFailure(lines[i])) continue
-    const t = tsMs(lines[i])
-    if (t === null) continue
-    let best = null
-    for (let d = 1; d <= 2 && !best; d++) {
-      for (const j of [i - d, i + d]) {
-        if (!summaryByLine.has(j) || interruptedIdx.has(j)) continue
-        const st = summaryByLine.get(j)
-        if (st === null) continue
-        const gap = Math.abs(st - t)
-        if (gap > 2000) continue
-        if (!best || gap < best.gap) best = { j, gap } // 同距离取时间差更小者
-      }
-    }
-    if (best) { interruptedIdx.add(best.j); attributedFailures.add(i) }
-  }
-  let crashPending = false // 尾端失败行待发占位（其后无摘要行）
-  let lastLineNo = lines.length + 1 // 本页最旧条目起始行号（初始 = 窗口外哨兵）
-  let summariesSeen = 0
-  for (let i = lines.length - 1; i >= 0; i--) {
+
+  // 轮界模型（审查 #241 M2 / #242 M3+S2 / #243 / D2-N5，按生产写序 xbk_app.js :1684→:1688）：
+  // 一轮的摘要行在**轮末**写出，失败行写在其所属摘要行**之前**。归属判据与 parseLastRun
+  // 共用 classifyRoundFailures（近距 ≤2 行且 ≤2s / 轮内远距 ≤10min / 其余为崩溃占位），
+  // 同一文件在「上一轮 / 运行历史」两处必须给出同一结论。
+  const summaryAt = summaryIndexOf(lines)
+  const { interruptedIdx, crashIdx } = classifyRoundFailures(lines, summaryAt)
+
+  const roundKey = new Map() // 0-based 行号 → 条目稳定 key（重复内容追加 -N 序号）
+  const rounds = []
+  for (const i of summaryAt.keys()) {
     const line = lines[i]
-    if (RUN_SUMMARY_LINE_RE.test(line)) {
-      const lineNo = i + 1 // 1-based 行号（分页游标身份）
-      if (crashPending) {
-        // 尾端失败行的占位轮行号 = 失败行行号 = lineNo+1（失败行在摘要行更早的方向不存在——
-        // 占位行号取「其后无摘要」语义下的失败行自身）。
-        const crashLineNo = lineNo + 1
-        if (crashLineNo <= maxLine && items.length < lim) {
-          items.push({ at: '', total: null, dedup: null, filtered: null, truncated: null, pushed: null, failed: null, elapsed: '', cachesaved: null, noidentity: null, dryRun: null, interrupted: true, lineNo: crashLineNo })
-          lastLineNo = crashLineNo
-        }
-        crashPending = false
-      }
-      summariesSeen++
-      const m = RUN_SUMMARY_LINE_RE.exec(line)
-      const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
-      if (lineNo > maxLine || items.length >= lim || !counters.every(validInt)) continue
-      const extras = runParseExtras(line)
-      items.push({
-        at: m[1] ? line.slice(0, 19).trim() : '',
-        total: counters[0],
-        dedup: counters[1],
-        filtered: counters[2],
-        truncated: counters[3],
-        pushed: counters[4],
-        failed: counters[5],
-        elapsed: m[8],
-        cachesaved: extras.cachesaved,
-        noidentity: extras.noidentity,
-        dryRun: extras.dryRun,
-        interrupted: interruptedIdx.has(i), // 同秒失败行已在预扫描归属到本轮
-        lineNo
-      })
-      lastLineNo = i + 1
-      continue
-    }
-    if (looksLikeRoundFailure(line)) {
-      // 带时间戳且能对上某轮摘要 ⇒ 已在预扫描归属，不再按文件序回填（否则会标错轮）。
-      if (attributedFailures.has(i)) continue
-      // 页面已满：只有「紧贴本页最旧摘要之前 1–2 行」的失败行仍允许回填（旧写序
-      // ERROR → 摘要），更早的失败行属于不在本页的轮次，回填只会误标本页最旧那条
-      // （评审：limit=8 与 limit=9 对同一行给出不同结论）。
-      if (items.length >= lim) {
-        const oldestLn = items.length > 0 ? items[items.length - 1].lineNo : 0
-        const sameRound = (a, b) => {
-          const ta = tsMs(a); const tb = tsMs(b)
-          return ta !== null && tb !== null && Math.abs(ta - tb) <= 2000
-        }
-        // 紧邻（上一行）或隔一行且同轮（时间差 ≤2s）才允许回填
-        const adjacent = oldestLn > 0 && (i === oldestLn - 2 ||
-          (i === oldestLn - 3 && sameRound(lines[i], lines[oldestLn - 1])))
-        if (!adjacent) continue
-      }
-      if (summariesSeen === 0) crashPending = true // 尾端失败行、其后无摘要轮
-      else if (items.length > 0) items[items.length - 1].interrupted = true
-      // 回填目标 = 最近 push 的摘要（items 尾部）= 倒序扫描中刚处理过的那条 = 失败行
-      // 文件序下一条摘要（相邻原则，Sourcery #229-3）。items 为空但 summariesSeen>0：
-      // 摘要行都在 maxLine 之外（翻页跳过）——失败行归属的摘要轮不在本页，无处回填，
-      // 静默丢弃（数据仍在，翻页可查）。
-    }
+    const m = RUN_SUMMARY_LINE_RE.exec(line)
+    const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
+    const extras = runParseExtras(line)
+    rounds.push({
+      i,
+      at: m[1] ? line.slice(0, 19).trim() : '',
+      total: counters[0],
+      dedup: counters[1],
+      filtered: counters[2],
+      truncated: counters[3],
+      pushed: counters[4],
+      failed: counters[5],
+      elapsed: m[8],
+      cachesaved: extras.cachesaved,
+      noidentity: extras.noidentity,
+      dryRun: extras.dryRun,
+      interrupted: interruptedIdx.has(i), // 同秒/相邻失败行已在预扫描归属到本轮
+      cancelled: false,
+      isPlaceholder: false
+    })
   }
-  // 扫描到窗口头仍有待发占位（整个窗口只有失败行、零摘要）：占位轮是最早条目。
-  if (crashPending && items.length < lim && maxLine >= 1) {
-    items.push({ at: '', total: null, dedup: null, filtered: null, truncated: null, pushed: null, failed: null, elapsed: '', cachesaved: null, noidentity: null, dryRun: null, interrupted: true, lineNo: 1 })
-    lastLineNo = 1
+  for (const i of crashIdx) {
+    rounds.push({
+      i,
+      at: tsOf(lines[i]),
+      total: null,
+      dedup: null,
+      filtered: null,
+      truncated: null,
+      pushed: null,
+      failed: null,
+      elapsed: '',
+      cachesaved: null,
+      noidentity: null,
+      dryRun: null,
+      interrupted: true,
+      cancelled: false,
+      isPlaceholder: true
+    })
   }
-  // hasMore（Sourcery #229-6）：本页最旧条目行号之前还有摘要行 ⇒ 还有下一页。
-  let hasMore = false
-  for (let i = 0; i < lastLineNo - 1 && i < lines.length; i++) {
-    if (RUN_SUMMARY_LINE_RE.test(lines[i])) { hasMore = true; break }
+  // 文件序倒置即时间倒序（摘要行在其失败行之后写出；占位行号取失败行自身）。
+  // 取消留痕单独成条（cancelled=true），既不标相邻轮中断、也不让这轮消失。
+  for (let i = 0; i < lines.length; i++) {
+    if (summaryAt.has(i) || crashIdx.has(i) || !isCancelTrace(lines[i])) continue
+    rounds.push({
+      i,
+      at: tsOf(lines[i]),
+      total: null,
+      dedup: null,
+      filtered: null,
+      truncated: null,
+      pushed: null,
+      failed: null,
+      elapsed: '',
+      cachesaved: null,
+      noidentity: null,
+      dryRun: null,
+      interrupted: false,
+      cancelled: true,
+      isPlaceholder: true
+    })
   }
-  return { status: 'ok', items, hasMore, truncated, windowKey: key }
+  // 游标身份去重（D2-S4 复核）：两条内容完全相同的摘要行 entryKeyOf 相同，`before=<key>`
+  // 用 findIndex 只会命中最新的那条 ⇒ 翻页反复返回同一页（[5,4] → [3,2] → [3,2] …）。
+  // 同一 key 的第 2..n 次出现追加 `-<序号>`（序号按窗口内文件序，追加新行不改变既有序号）；
+  // 首次出现保留裸 8 位 key，旧游标/旧书签仍可定位到第一条。
+  const occurrence = new Map()
+  for (const r of [...rounds].sort((a, b) => a.i - b.i)) {
+    const h = entryKeyOf(lines[r.i])
+    const n = (occurrence.get(h) || 0) + 1
+    occurrence.set(h, n)
+    roundKey.set(r.i, n === 1 ? h : `${h}-${n}`)
+  }
+  rounds.sort((a, b) => b.i - a.i)
+  let pool = rounds
+  if (beforeKey !== '') {
+    const anchor = rounds.findIndex((r) => roundKey.get(r.i) === beforeKey)
+    // 锚点轮已滚出尾窗（或 key 从未存在）：游标无法定位，宁可重看第 1 页
+    if (anchor < 0) return { status: 'stale', items: [], hasMore: false, truncated, windowKey: key }
+    pool = rounds.slice(anchor + 1)
+  } else if (beforeLine > 0) {
+    pool = rounds.filter((r) => r.i + 1 <= beforeLine)
+  }
+  const items = pool.slice(0, lim).map((r) => ({
+    at: r.at,
+    total: r.total,
+    dedup: r.dedup,
+    filtered: r.filtered,
+    truncated: r.truncated,
+    pushed: r.pushed,
+    failed: r.failed,
+    elapsed: r.elapsed,
+    cachesaved: r.cachesaved,
+    noidentity: r.noidentity,
+    dryRun: r.dryRun,
+    interrupted: r.interrupted,
+    cancelled: r.cancelled,
+    isPlaceholder: r.isPlaceholder,
+    lineNo: r.i + 1,
+    key: roundKey.get(r.i)
+  }))
+  return { status: 'ok', items, hasMore: pool.length > items.length, truncated, windowKey: key }
 }
 
 // push.json（判重缓存主存 = 已推送消息记录）的轻量读取校验：条目必须是带 id/title 的对象。
@@ -477,11 +666,40 @@ function validMessageEntry (m) {
 // 读取已推送消息列表：push.json 是 MessageStore 判重缓存（最旧在前、最新在后）。
 // 返回 { status, items(时间倒序), total, categories } —— 过滤/分页由调用方（HTTP 层）做，
 // 本函数只负责「安全读取 + 容错解析 + 排序 + 分类汇总」，保持无查询参数的纯函数可测性。
-function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.messages } = {}) {
+// ── push.json 解析缓存（D2-S18）─────────────────────────────────────────────
+// 25.6MB/6 万条实测：每次请求整读 + parse + 全量排序 250–325ms，全压在 HTTP 事件循环上。
+// push.json 只在单轮结束时整份原子替换（MessageStore saveBatch → tmp + rename），
+// (ino, size, mtimeMs) 三元组足以识别「同一份文件」（inode 变化能抓到同毫秒同大小的换文件）。
+// 叠 60s TTL 兜底；mtime 太新（<100ms）的文件不进缓存——写后立刻读必须看到新内容。
+// 缓存的是只读结果对象：调用方全部用 filter/map 派生新数组，不做原地改写。
+const MESSAGES_CACHE_TTL_MS = 60 * 1000
+const MESSAGES_CACHE_MIN_AGE_MS = 100
+const MESSAGES_CACHE_MAX = 4
+const messagesCache = new Map()
+
+// 缓存文件名来自 Config.api.pushUrl 的末段（运行时派生）。落盘前只允许纯文件名：
+// 去掉任何目录成分，既防 ../ 穿越，也让 Codacy 的 dynamic path 规则看到显式 basename。
+function messagesFileName (filename) {
+  if (typeof filename !== 'string' || filename.length === 0) return FILES.messages
+  const base = path.basename(filename)
+  return base.length > 0 && base !== '.' && base !== '..' ? base : FILES.messages
+}
+
+function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.messages, cache = true } = {}) {
   // filename 可覆盖：运行侧缓存名由 MessageStore.getFileName(Config.api.pushUrl) 决定（pushUrl 末段
   // 去查询串后 + .json）。控制台默认读 push.json（默认配置的产物）；自定义了 pushUrl basename 的部署
   // 显式传 filename（console main 里从同名口径推导），不让「文件改名」静默变成「记录消失」。
-  const read = readText(dir, filename, maxBytes)
+  // cache=false：需要「此刻磁盘内容」的调用方（测试/诊断）显式绕过缓存。
+  const name = messagesFileName(filename)
+  const cacheKey = `${dir}\u0000${name}\u0000${maxBytes}`
+  const sig = cache && name === FILES.messages
+    ? defaultMessageSignature(dir, maxBytes, MESSAGES_CACHE_MIN_AGE_MS)
+    : null
+  if (sig) {
+    const hit = messagesCache.get(cacheKey)
+    if (hit && hit.sig === sig && Date.now() - hit.at < MESSAGES_CACHE_TTL_MS) return hit.value
+  }
+  const read = readText(dir, name, maxBytes)
   if (read.status !== 'ok') return { status: read.status }
   let parsed
   try { parsed = JSON.parse(read.value) } catch (error) { return result('invalid') }
@@ -489,11 +707,12 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   const pairs = [] // [entry, rowKey] 绑定排序：键取「原始 parsed 下标」（push.json 只追加不重排，
   // 追加序才是稳定身份；用排序后下标会在新条目插入时整体推移，前端展开状态随之错位）
   let skipped = 0
+  let filteredCount = 0
   for (let i = 0; i < parsed.length; i++) {
     const entry = parsed[i]
     // _f 条目是「被过滤、从未推送」的记录（MessageStore 约定），不是推送历史的一部分——
     // 控制台页面是「已推送记录」，混入会让分类计数与历史失真（审查 Sourcery PR#227）。
-    if (entry && typeof entry === 'object' && entry._f === true) continue
+    if (entry && typeof entry === 'object' && entry._f === true) { filteredCount += 1; continue }
     if (validMessageEntry(entry)) {
       pairs.push([entry, (typeof entry.id === 'string' && entry.id.length > 0) || typeof entry.id === 'number'
         ? String(entry.id)
@@ -514,7 +733,15 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
     cateCount.set(name, (cateCount.get(name) || 0) + 1)
   }
   const categories = [...cateCount.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }))
-  return result('ok', { total: items.length, items, keys, categories, skipped })
+  // rawTotal = 文件里的条目总数（含 _f）：缓存健康页的「条目数 / 上限」必须按它算，
+  // 否则 _f 条目把缓存撑到超限也报不出来（D2-S11）。total 仍是「已推送记录」条数。
+  const value = result('ok', { total: items.length, rawTotal: parsed.length, filteredCount, items, keys, categories, skipped })
+  if (sig) {
+    messagesCache.delete(cacheKey)
+    messagesCache.set(cacheKey, { sig, at: Date.now(), value })
+    while (messagesCache.size > MESSAGES_CACHE_MAX) messagesCache.delete(messagesCache.keys().next().value)
+  }
+  return value
 }
 
 module.exports = { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE }

@@ -11,28 +11,30 @@ const path = require('node:path')
 const http = require('node:http')
 const zlib = require('node:zlib')
 const net = require('node:net')
-const { spawn } = require('node:child_process')
+const { spawn, spawnSync } = require('node:child_process')
 // 竞态安全读取器（生产 xbk_storage）：测试里对「刚写完/刚 rename 过的路径」的断言读取
 // 统一走它（O_NOFOLLOW + fstat 复检 + 读后复检），规避 CodeQL js/file-system-race 对
 // 「写路径 → 按路径 open」的 check-then-use 判红。
 const { readSafeTextResult } = require('./xbk_storage')
 
 const {
-  createConsole, isValidToken, timingSafeEqualStr,
+  createConsole, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
   acquireLock, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
-  sanitizeAccessPath, shouldLogAccess, ACCESS_LOG_MAX,
-  filterMessageItems, clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
+  sanitizeAccessPath, shouldLogAccess, acceptsGzip, ACCESS_LOG_MAX,
+  findSecretLikeField, CACHE_HEALTH_COUNT_MAX_BYTES, cacheHealthEntryCount,
+  filterMessageItems, filterMessagesByDays, messageCategoriesOf, MESSAGE_DAYS_ALLOWED,
+  clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
   RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS,
-  REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE
+  REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE,
+  // 导出端点的读取上限直接取实现常量（D2-N11：修前测试自己写死 32MiB，实现改 64MiB 后
+  // 用例仍在 32MiB 造夹具 → 以为测了 tooLarge，实际测的是 invalid）
+  MESSAGES_MAX_BYTES
 } = require('./scripts/console')
 const { readMessages } = require('./scripts/status')
-// 导出端点的读取上限（console.js 内部常量，与 MESSAGES_MAX_BYTES 同值）：
-// MI2 tooLarge 用例按同一口径构造超限 fixture。
-const MESSAGES_MAX_BYTES = 32 * 1024 * 1024
 
 let passed = 0
 let failed = 0
@@ -178,40 +180,40 @@ ok('releaseLockFor: released 短帧不大于原帧（回归：恒比原帧长的
   assert.strictEqual(JSON.parse(body).released, true, '空格补尾后仍是合法 JSON released 帧')
   assert.strictEqual(body.trim(), '{"released":true}', '实体内容必须是短帧（pid/token/startedAt 已无保留价值）')
 })
-ok('releaseLockFor: inode 一致性闸（回归 Sourcery #225 High：陈旧持有者不得覆写接管方的新锁帧）', () => {
+ok('releaseLockFor: inode 一致性闸（回归 Sourcery #225 High / D2-S4：闸必须真的被执行）', () => {
   const dir = tmpDir()
-  assert.strictEqual(acquireLock(dir, 1000, 'tok-old'), true)
-  // 模拟接管：走 acquireLock 自己的陈旧接管路径（startedAt 远超 PROC_TIMEOUT_MS），
-  // 该路径现已用 tmp+rename 原子换代——旧持有者 fd 里的 inode 变成孤儿。
-  const fs2 = require('node:fs')
   const p = lockPath(dir)
-  fs2.utimesSync(p, 1, 1) // 把 mtime 拉旧不影响 startedAt 判定；直接改 startedAt 更直接：
-  fs2.writeFileSync(p, JSON.stringify({ pid: 999999, startedAt: 1, token: 'tok-old' }))
-  assert.strictEqual(acquireLock(dir, PROC_TIMEOUT_MS + 5000, 'tok-new'), true, '接管方拿到锁')
-  // 断言接管结果：readSafeTextResult（竞态安全纪律，理由见文件头注释）。
-  const safe1 = readSafeTextResult(p)
-  assert.strictEqual(safe1.status, 'ok')
-  assert.strictEqual(JSON.parse(safe1.text).token, 'tok-new')
-  // 旧持有者仍握着旧 inode 的 fd？不——它每次 open 都是新 fd；竞态的本质是「旧主在
-  // rename 前 open」。这里用注入模拟：手动 open 旧内容后让 rename 发生，再 releaseLockFor。
-  // 简化：直接构造「fd 指向孤儿 inode」场景——把当前锁 rename 走，再在原路径放新帧。
-  const orphanDir = tmpDir()
-  assert.strictEqual(acquireLock(orphanDir, 1000, 'tok-victim'), true)
-  const op = lockPath(orphanDir)
-  const orphanFd = fs2.openSync(op, 'r+') // 旧主此刻的 fd
-  // 接管者 rename 换代
-  fs2.writeFileSync(`${op}.t`, JSON.stringify({ pid: 424242, startedAt: 2000, token: 'tok-new' }))
-  fs2.renameSync(`${op}.t`, op)
-  // 旧主释放：fd 指向孤儿 inode，路径上已是新主帧——不得覆盖新主
-  const { releaseLockFor } = require('./scripts/console')
-  // 手动走一致性闸逻辑：直接调 releaseLockFor（它会重新 open 路径，双匹配失败返回 false）
-  assert.strictEqual(releaseLockFor({ _stateDir: orphanDir, _lockToken: 'tok-victim' }), false, '锁已换主不得释放')
-  // 断言新主锁帧原样无损：readSafeTextResult（O_NOFOLLOW + fstat 复检 + 读后复检），
-  // 与生产锁帧读取同一套竞态安全纪律（理由见文件头注释）。
-  const safe = readSafeTextResult(op)
+  assert.strictEqual(acquireLock(dir, 1000, 'tok-old'), true)
+  const fsmod = require('node:fs')
+  // 旧持有者在 rename 之前 open 到的 fd（与本用例的 victimFd 指向同一 inode）。
+  const victimFd = fsmod.openSync(p, 'r+')
+  // 关键：在 releaseLockFor 的「open 读完内容 → statSync 取路径 inode」之间注入换代。
+  // 旧用例把新帧 pid 写成 424242，releaseLockFor 先命中 pid 分支返回 false，闸那行从未
+  // 执行——删掉闸仍然 PASS（假绿）。这里用 statSync 钩子在正确的时序点 rename，才真正
+  // 覆盖 fstat(fd).ino !== stat(path).ino 这一行。
+  const realStat = fsmod.statSync
+  let injected = false
+  fsmod.statSync = function (target, ...rest) {
+    if (!injected && target === p) {
+      injected = true
+      fsmod.writeFileSync(`${p}.t`, JSON.stringify({ pid: process.pid, startedAt: 2000, token: 'tok-new' }))
+      fsmod.renameSync(`${p}.t`, p)
+    }
+    return realStat.call(this, target, ...rest)
+  }
+  let released
+  try { released = releaseLockFor({ _stateDir: dir, _lockToken: 'tok-old' }) } finally { fsmod.statSync = realStat }
+  assert.strictEqual(injected, true, '用例必须真的在 open 与 stat 之间注入换代（否则闸未被执行）')
+  assert.strictEqual(released, false, 'fd 指向孤儿 inode 时必须放弃覆写并如实报 false')
+  // 新主锁帧原样无损（竞态安全读取）。
+  const safe = readSafeTextResult(p)
   assert.strictEqual(safe.status, 'ok', `读锁帧必须 ok（实际 ${safe.status}）`)
   assert.strictEqual(JSON.parse(safe.text).token, 'tok-new', '新主锁帧原样无损')
-  fs2.closeSync(orphanFd)
+  // 孤儿 inode 也不得被写成 released（删掉闸时这里会读到 {"released":true}）。
+  const buf = Buffer.alloc(4096)
+  const n = fsmod.readSync(victimFd, buf, 0, 4096, 0)
+  assert.ok(buf.slice(0, n).toString('utf8').includes('tok-old'), '孤儿 inode 不得被覆写')
+  fsmod.closeSync(victimFd)
 })
 ok('releaseLockFor: 短写循环（monkeypatch writeSync 首次少写，回归 Sourcery #225 M1）', () => {
   const dir = tmpDir()
@@ -250,6 +252,67 @@ ok('releaseLockFor: 他人活锁返回 false；released 帧返回 true；锁不�
   assert.strictEqual(releaseLockFor({ _stateDir: dir, _lockToken: 'mine' }), true, '已 released 报 true')
   fs.unlinkSync(lockPath(dir))
   assert.strictEqual(releaseLockFor({ _stateDir: dir, _lockToken: 'mine' }), true, '锁不存在报 true')
+})
+ok('acquireLock: 陈旧损坏锁 / 0 字节锁可接管；新鲜损坏锁仍 fail-closed（D2-S1 回归）', () => {
+  const dir = tmpDir()
+  const p = lockPath(dir)
+  const old = new Date(Date.now() - PROC_TIMEOUT_MS - 60000)
+  // 0 字节锁（旧写入路径 open(wx) 后崩溃的产物）：修前永久 fail-closed，只能人工删文件
+  fs.writeFileSync(p, '')
+  fs.utimesSync(p, old, old)
+  assert.strictEqual(acquireLock(dir, Date.now(), 'tok-fix'), true, 'mtime 陈旧的 0 字节锁必须可接管')
+  assert.strictEqual(JSON.parse(fs.readFileSync(p, 'utf8')).token, 'tok-fix')
+  // 半截 JSON 同理
+  fs.writeFileSync(p, '{"pid":1,"starte')
+  fs.utimesSync(p, old, old)
+  assert.strictEqual(acquireLock(dir, Date.now(), 'tok-fix2'), true, 'mtime 陈旧的半截 JSON 锁可接管')
+  // 新鲜的损坏锁仍 fail-closed（可能正被写入）
+  fs.writeFileSync(p, 'half-json{{')
+  assert.strictEqual(acquireLock(dir, Date.now(), 'tok-x'), false, '新鲜损坏锁不得接管')
+  // 写入路径本身不再产生 0 字节锁：link 落地时内容已完整
+  const dir2 = tmpDir()
+  assert.strictEqual(acquireLock(dir2, 1000, 'tok-link'), true)
+  const raw = fs.readFileSync(lockPath(dir2), 'utf8')
+  assert.ok(raw.length > 0 && JSON.parse(raw).token === 'tok-link', '锁帧必须一次成型')
+  const leftovers = fs.readdirSync(dir2).filter((n) => n.endsWith('.tmp'))
+  assert.deepStrictEqual(leftovers, [], '临时文件必须清理干净')
+})
+ok('acquireLock: 陈旧 .takeover 哨兵 unlink 后重抢；新鲜哨兵仍拒绝（D2-S5 回归）', () => {
+  const dir = tmpDir()
+  const p = lockPath(dir)
+  const sentinel = p + '.takeover'
+  const old = new Date(Date.now() - PROC_TIMEOUT_MS - 60000)
+  // 残留哨兵（上次接管者崩溃）+ 陈旧锁：修前用 stat→writeFileSync「刷新」哨兵（非原子），
+  // 且哨兵残留会让后续触发连续 10 分钟 409。现在必须 unlink 后重新 open(wx) 抢占。
+  fs.writeFileSync(p, JSON.stringify({ pid: 999999, startedAt: 1, token: 'old' }))
+  fs.writeFileSync(sentinel, 'stale')
+  fs.utimesSync(sentinel, old, old)
+  assert.strictEqual(acquireLock(dir, Date.now(), 'tok-reclaim'), true, '陈旧哨兵必须被回收')
+  assert.strictEqual(fs.existsSync(sentinel), false, '接管完成后哨兵必须清理')
+  assert.strictEqual(JSON.parse(fs.readFileSync(p, 'utf8')).token, 'tok-reclaim')
+  // 新鲜哨兵 = 另一个实例正在接管：让给对方（拒绝）
+  fs.writeFileSync(p, JSON.stringify({ pid: 999999, startedAt: 1, token: 'old' }))
+  fs.writeFileSync(sentinel, 'live')
+  assert.strictEqual(acquireLock(dir, Date.now(), 'tok-x'), false, '新鲜哨兵必须尊重并发接管')
+})
+ok('releaseLockFor: open 失败只有 ENOENT 才算已释放（EACCES/EMFILE → false，D2-S3）', () => {
+  const dir = tmpDir()
+  const p = lockPath(dir)
+  assert.strictEqual(acquireLock(dir, 1000, 'tok-perm'), true)
+  const fsmod = require('node:fs')
+  const realOpen = fsmod.openSync
+  for (const code of ['EACCES', 'EMFILE', 'EIO']) {
+    fsmod.openSync = function (target, flags, ...rest) {
+      if (target === p) { const e = new Error(`${code}: simulated`); e.code = code; throw e }
+      return realOpen.call(this, target, flags, ...rest)
+    }
+    try {
+      assert.strictEqual(releaseLockFor({ _stateDir: dir, _lockToken: 'tok-perm' }), false, `${code} 必须如实报 false`)
+    } finally { fsmod.openSync = realOpen }
+  }
+  // 锁帧未被写成 released（调用方会据此响亮告警，而不是当成功）
+  assert.strictEqual(JSON.parse(fs.readFileSync(p, 'utf8')).released, undefined)
+  assert.strictEqual(releaseLockFor({ _stateDir: dir, _lockToken: 'tok-perm' }), true, '正常路径仍可释放')
 })
 
 // ── 动作解析 ──
@@ -339,26 +402,37 @@ ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）
 })
 
 // ── v3.300 访问日志：纯函数表（无 HTTP；端到端用例见下方 T1-T7）──
-ok('sanitizeAccessPath: token 脱敏不动点 + 解码复洗 2 轮（蓝图 §3.3 防线 1）', () => {
+ok('sanitizeAccessPath: 敏感键值 *** + 原串形态保留（D2-N1/N2）', () => {
   // 分隔符保留：查询串形状不破坏
   assert.strictEqual(sanitizeAccessPath('/x?token=a&b=1'), '/x?token=***&b=1')
-  // 重复 token 参数逃逸：迭代清洗到不动点
+  // 重复 token 参数：逐个命中，不靠正则回溯
   assert.strictEqual(sanitizeAccessPath('/x?a=1&token=x1&token=y2'), '/x?a=1&token=***&token=***')
-  // 编码键名 %74oken= → 解码后复洗（返回解码形态，内容已 *** 化）
-  assert.strictEqual(sanitizeAccessPath('/x?%74oken=z3'), '/x?token=***')
-  // 双层编码 %2574oken= → 2 轮解码复洗（D6）
-  assert.ok(sanitizeAccessPath('/x?%2574oken=z4').includes('token=***'), '双层编码键名也洗出 token=***')
-  assert.ok(!sanitizeAccessPath('/x?%2574oken=z4').includes('z4'), '原文不得残留')
-  // 畸形 % 序列（URIError）→ 原串（已洗）兜底，不抛
+  // 编码键名：判定用解码副本，落盘保留原串（与真实请求行一一对应）
+  assert.strictEqual(sanitizeAccessPath('/x?%74oken=z3'), '/x?%74oken=***')
+  // 双层编码 %2574oken=
+  const dbl = sanitizeAccessPath('/x?%2574oken=z4')
+  assert.strictEqual(dbl, '/x?%2574oken=***', '双层编码键名同样命中')
+  assert.ok(!dbl.includes('z4'), '原文不得残留')
+  // 畸形 % 序列（URIError）→ 原串兜底，不抛
   assert.strictEqual(sanitizeAccessPath('/x?aa=%zz'), '/x?aa=%zz')
-  // 键名形态纵深（审查 3.3-M1）：大小写变体与 ;/# 分隔符形态同洗（键名在输出中统一为
-  // 小写 token=*** ——替换字面量形态，与 %74oken= 既有口径一致）；普通含 ;-# 路径不误伤
-  assert.strictEqual(sanitizeAccessPath('/x?Token=k1'), '/x?token=***')
-  assert.strictEqual(sanitizeAccessPath('/x?TOKEN=k1'), '/x?token=***')
+  // 大小写变体与 ;/# 分隔符形态同洗（键名原样保留，只盖值）
+  assert.strictEqual(sanitizeAccessPath('/x?Token=k1'), '/x?Token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?TOKEN=k1'), '/x?TOKEN=***')
   assert.strictEqual(sanitizeAccessPath('/x?a=1;token=k1'), '/x?a=1;token=***')
   assert.strictEqual(sanitizeAccessPath('/x?frag#token=k1'), '/x?frag#token=***')
-  assert.strictEqual(sanitizeAccessPath('/x?%54oken=k1'), '/x?token=***', '编码键名 %54oken= 解码为 Token= 后复洗')
-  assert.strictEqual(sanitizeAccessPath('/x?a;1&b#2'), '/x?a;1&b#2', '无 token 的 ;/# 路径原样（不误伤）')
+  assert.strictEqual(sanitizeAccessPath('/x?%54oken=k1'), '/x?%54oken=***')
+  assert.strictEqual(sanitizeAccessPath('/x?a;1&b#2'), '/x?a;1&b#2', '无敏感键的 ;/# 路径原样（不误伤）')
+  // D2-N1：只认 token= 的时代结束——派生键名同样脱敏
+  assert.strictEqual(sanitizeAccessPath('/x?access_token=abc'), '/x?access_token=***')
+  assert.strictEqual(sanitizeAccessPath('/x?refresh_token=abc&q=1'), '/x?refresh_token=***&q=1')
+  assert.strictEqual(sanitizeAccessPath('/x?apikey=abc'), '/x?apikey=***')
+  assert.strictEqual(sanitizeAccessPath('/x?client_secret=abc'), '/x?client_secret=***')
+  assert.strictEqual(sanitizeAccessPath('/x?password=abc'), '/x?password=***')
+  // D2-N2：非敏感参数的值里出现 token 字样不得整段删除
+  assert.strictEqual(sanitizeAccessPath('/x?q=token%3Dabc'), '/x?q=token%3Dabc')
+  // D2-N2：裸控制字符转义（落盘串不能带 C0）
+  assert.strictEqual(sanitizeAccessPath('/x?a=\u0001b'), '/x?a=%01b')
+  assert.strictEqual(sanitizeAccessPath('/x?token=a\u0007b'), '/x?token=***', '敏感值整体盖掉，控制字符不再需要转义')
   // null → ''；无 % 无 token 的普通路径原样
   assert.strictEqual(sanitizeAccessPath(null), '')
   assert.strictEqual(sanitizeAccessPath('/plain'), '/plain')
@@ -373,6 +447,9 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
     [['POST', '/api/runs/detail', 200], false],
     [['POST', '/api/runs/detail', 401], true],
     [['GET', '/assets/app.css', 200], false],
+    [['GET', '/assets/app.css', 304], false],
+    [['GET', '/api/status', 304], false],
+    [['GET', '/api/access-log', 304], true],
     [['GET', '/', 200], false],
     [['GET', '/api/access-log', 200], true],
     [['POST', '/api/messages/export', 200], true],
@@ -383,6 +460,28 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
     assert.strictEqual(shouldLogAccess(...args), want, `shouldLogAccess(${args.join(', ')}) 应为 ${want}`)
   }
   assert.strictEqual(ACCESS_LOG_MAX, 200, '环形上限常量 = 200')
+})
+ok('acceptsGzip: 显式 gzip 的 q 压过 *（D1-N2：gzip;q=0, * 不得回压缩体）', () => {
+  assert.strictEqual(acceptsGzip('gzip;q=0, *'), false, '显式拒绝 gzip 时 * 不得翻盘')
+  assert.strictEqual(acceptsGzip('gzip;q=0, *;q=1'), false)
+  assert.strictEqual(acceptsGzip('*;q=0, gzip'), true, '显式接受压过 *;q=0')
+  assert.strictEqual(acceptsGzip('*'), true)
+  assert.strictEqual(acceptsGzip('br, *;q=0.5'), true)
+  assert.strictEqual(acceptsGzip('*;q=0'), false)
+  assert.strictEqual(acceptsGzip('deflate'), false)
+  assert.strictEqual(acceptsGzip('gzip;q=0.5'), true)
+  assert.strictEqual(acceptsGzip('gzip;q=abc'), false, '非法 q 值按拒绝')
+  assert.strictEqual(acceptsGzip(''), false)
+  assert.strictEqual(acceptsGzip(undefined), false)
+})
+ok('findSecretLikeField: 大小写无关键名 + 非空字符串值（D2-S13 最终保险丝可达）', () => {
+  assert.strictEqual(findSecretLikeField({ pushUrl: 'https://x', template: { title: 't' } }), '', '正常白名单视图零误报')
+  assert.strictEqual(findSecretLikeField({ runtime: { api: { appToken: 'abc' } } }), 'appToken', 'camelCase 键名必须命中')
+  assert.strictEqual(findSecretLikeField({ a: { b: { c: { PUSH_KEY: 'k' } } } }), 'PUSH_KEY')
+  assert.strictEqual(findSecretLikeField({ access_token: 't' }), 'access_token')
+  assert.strictEqual(findSecretLikeField({ secret: '' }), '', '空值=未配置，不算泄漏')
+  assert.strictEqual(findSecretLikeField({ key: false }), '', '布尔值不算泄漏')
+  assert.strictEqual(findSecretLikeField(null), '')
 })
 
 // ── v3.300 批次③ 3.1 SSE：纯函数（同步，直接 require 新导出）──
@@ -482,6 +581,25 @@ ok('T-P2 filterMessageItems: cate 精确等值 + needle 双字段大小写不敏
   assert.deepStrictEqual(filterMessageItems(items, '好单-食品', 'milk').map(m => m.title), ['Milk Powder'])
   // 空 cate / 空 needle 直通
   assert.strictEqual(filterMessageItems(items, '', '').length, 5)
+})
+ok('T-P2b 时间窗: 上海日历日边界 / 分类计数跟随窗口 / 非法天数回全部', () => {
+  // 2026-10-18 00:00 Asia/Shanghai = 2026-10-17T16:00Z
+  const now = Date.UTC(2026, 9, 17, 16, 0, 0)
+  const items = [
+    { title: '今天', catename: 'A', datetime: '2026-10-18 09:00:00' },
+    { title: '昨天', catename: 'B', datetime: '2026-10-17 23:00:00' },
+    { title: '前天', catename: 'A', datetime: '2026-10-16 12:00:00' },
+    { title: '三天前', catename: 'C', datetime: '2026-10-15 12:00:00' },
+    { title: '缺日期', catename: 'A' },
+    { title: '坏日期', catename: 'B', datetime: 'not-a-date' }
+  ]
+  assert.deepStrictEqual(MESSAGE_DAYS_ALLOWED, [0, 1, 3, 7, 30])
+  assert.deepStrictEqual(filterMessagesByDays(items, 1, now).map(m => m.title), ['今天'], '今天=上海 00:00 起')
+  assert.deepStrictEqual(filterMessagesByDays(items, 3, now).map(m => m.title), ['今天', '昨天', '前天'], '近 3 天含今天')
+  assert.deepStrictEqual(filterMessagesByDays(items, 7, now).map(m => m.title), ['今天', '昨天', '前天', '三天前'])
+  assert.strictEqual(filterMessagesByDays(items, 0, now).length, 6, '0=全部，不因缺日期丢条目')
+  assert.strictEqual(filterMessagesByDays(items, 99, now).length, 4, '正数窗宽按窗口过滤（白名单在端点）')
+  assert.deepStrictEqual(messageCategoriesOf(filterMessagesByDays(items, 1, now)), [{ name: 'A', count: 1 }], '分类计数跟随时间窗')
 })
 ok('T-P3 exportRowOf: 五字段白名单 / 缺省回退 / 200 码元截断 / time 拼接 trim', () => {
   const full = exportRowOf({
@@ -705,15 +823,37 @@ async function main () {
       const r304 = await requestBuffer(port, 'GET', '/assets/app.css', { token: TOKEN, headers: { 'if-none-match': h } })
       assert.strictEqual(r304.status, 304, `If-None-Match: ${h} 必须命中 304`)
     }
-    // 页面响应必须下发会话 Cookie（HttpOnly/SameSite=Strict）
+    // 页面响应必须下发会话 Cookie（HttpOnly/SameSite=Lax）— 审查 #224：Strict 会让聊天
+    // 链接的跨站顶层导航不带 Cookie，首屏必 401；写动作 POST 本就不收 Cookie。
     const page = await request(port, 'GET', '/', { token: TOKEN })
     const cookieHeader = (page.headers['set-cookie'] || []).find(c => c.startsWith('xbk_session='))
     assert.ok(cookieHeader, '/ 鉴权后下发会话 Cookie')
     // Sourcery Issued-session-cookie：不能只看前缀——属性逐项锁死，错值或缺属性必须红。
     assert.ok(cookieHeader.includes('HttpOnly'), 'Cookie 含 HttpOnly')
-    assert.ok(cookieHeader.includes('SameSite=Strict'), 'Cookie 含 SameSite=Strict')
+    assert.ok(cookieHeader.includes('SameSite=Lax'), 'Cookie 含 SameSite=Lax')
     assert.ok(cookieHeader.includes('Path=/'), 'Cookie 含 Path=/')
     assert.ok(cookieHeader.includes(`xbk_session=${encodeURIComponent(TOKEN)}`), 'Cookie 值=encoded token')
+    // 审查 #224：未授权首屏必须是可自助恢复的登录页，不是裸 JSON。
+    const unauth = await request(port, 'GET', '/')
+    assert.strictEqual(unauth.status, 401, '未授权 GET / 回 401')
+    assert.match(unauth.headers['content-type'], /text\/html/, '未授权首屏必须是 HTML')
+    assert.ok(unauth.text.includes('需要访问令牌'), '登录页含标题')
+    assert.ok(unauth.text.includes('<form method="post" action="/login">'), '登录页必须用 POST 表单（token 不进地址栏）')
+    // POST /login：正确 token → 303 到干净 `/` + Cookie；错误 token → 401 仍是登录页。
+    const loginOk = await request(port, 'POST', '/login', {
+      body: `token=${encodeURIComponent(TOKEN)}`,
+      headers: { 'content-type': 'application/x-www-form-urlencoded' }
+    })
+    assert.strictEqual(loginOk.status, 303)
+    assert.strictEqual(loginOk.headers.location, '/')
+    assert.ok(String(loginOk.headers['set-cookie']).includes('HttpOnly'), 'POST 登录必须下发 HttpOnly Cookie')
+    const loginBad = await request(port, 'POST', '/login', {
+      body: 'token=wrong-token-000000',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' }
+    })
+    assert.strictEqual(loginBad.status, 401)
+    assert.match(loginBad.headers['content-type'], /text\/html/, '错误凭证仍回登录页')
+    assert.ok(!unauth.text.includes('{"error":"unauthorized"}'), '不得回裸 JSON')
     // Sourcery G_4Kk：资产 URL 不再拼 tokenSuffix（Cookie 通道已覆盖，URL 零凭证重复）
     assert.ok(!page.text.includes('/assets/app.css?token='), '资产 URL 不含 ?token=')
     assert.ok(!page.text.includes('/assets/app.js?token='), '脚本 URL 不含 ?token=')
@@ -873,6 +1013,9 @@ async function main () {
       const blockedBody = JSON.parse(blocked.text)
       assert.strictEqual(blockedBody.replayBlocked, true, '标记重放拦截')
       assert.strictEqual(blockedBody.runId, '1750000000000.7', '409 回带首轮 runId')
+      // D2-S16：文案必须说「N 秒后可重试」且带 retryAfterS——旧文案谎称「已有任务在运行」
+      assert.match(String(blockedBody.error || ''), /\d+ 秒后可重试/, '409 必须给出可重试倒计时')
+      assert.ok(Number.isInteger(blockedBody.retryAfterS) && blockedBody.retryAfterS > 0 && blockedBody.retryAfterS <= 60, 'retryAfterS 在窗内')
       server.close()
     }
     // 场景②：61s 前（超 60s 窗；若误用 12min 全局窗此请求会被重放窗拦——60s 窗的区分性断言）
@@ -890,6 +1033,37 @@ async function main () {
       assert.strictEqual(lockBody.replayBlocked, undefined, '锁冲突不带 replayBlocked（区别于重放窗 409）')
       server.close()
     }
+  })
+  await aok('HTTP: 全局重放窗 60s（D2-S16：窗内 409 带剩余秒数，文案不谎称有任务在运行）', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 30000, runId: '1750000000000.3' } }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const blocked = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
+    assert.strictEqual(blocked.status, 409)
+    const b = JSON.parse(blocked.text)
+    assert.strictEqual(b.replayBlocked, true)
+    assert.ok(b.retryAfterS >= 1 && b.retryAfterS <= 30, `retryAfterS 应为剩余秒数（实际 ${b.retryAfterS}）`)
+    assert.ok(!/已有触发任务在运行/.test(b.error), '文案不得谎称「已有任务在运行」（锁早就释放了）')
+    assert.match(b.error, /重复提交/)
+    server.close()
+  })
+  await aok('HTTP: 全局重放窗越窗放行（61s 前受理 → 202；旧 12min 窗会拦）', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 61000, runId: '1750000000000.3' } }))
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const okRes = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
+    assert.strictEqual(okRes.status, 202, '越过 60s 窗必须放行（旧 12min 窗下这里会 409，人工重跑要等 12 分钟）')
+    // 收尾：等子进程结束释放锁，避免影响后续用例
+    const id = JSON.parse(okRes.text).id
+    const deadline = Date.now() + 30000
+    while (Date.now() < deadline) {
+      const rec = runs.get(id)
+      if (rec && rec.finishedAt) break
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    server.close()
   })
   await aok('HTTP: /trigger 的 action=notify-test 与独立端点共享受理序列（K7 侧通道一致）', async () => {
     const dir = tmpDir()
@@ -973,6 +1147,8 @@ async function main () {
     const q = JSON.parse((await request(port, 'GET', `/api/messages?q=${encodeURIComponent('牛奶')}`, { token: TOKEN })).text)
     assert.strictEqual(q.total, 1)
     assert.strictEqual(q.items[0].id, 1)
+    assert.deepStrictEqual(q.categories, [{ name: '好单-日用', count: 1 }],
+      '分类计数必须跟随搜索词，不能继续显示全量分类')
     // 分类精确匹配
     const c = JSON.parse((await request(port, 'GET', `/api/messages?cate=${encodeURIComponent('好单-家用')}`, { token: TOKEN })).text)
     assert.strictEqual(c.total, 1)
@@ -1103,6 +1279,10 @@ async function main () {
     assert.strictEqual(typeof j[0].title, 'string', '元素=行对象')
     const jr = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
     assert.strictEqual(jr.headers['x-export-truncated'], 'true', 'JSON 分支同样下发截断头')
+    // D2-S9：导出口径必须回显「实际生效的搜索词」（列表端点早有 queryUsed）
+    assert.strictEqual(jr.headers['x-export-query-used'], '', '无搜索词时头为空串而非缺席')
+    const longQ = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: `format=json&q=${'a'.repeat(300)}` })
+    assert.strictEqual(longQ.headers['x-export-query-used'], encodeURIComponent('a'.repeat(240)), '240 字节截断后的词必须如实回显（修前完全不回显）')
     const c = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=csv' })
     assert.strictEqual(c.headers['x-export-truncated'], 'true', 'CSV 分支同样下发截断头')
     // 该 fixture 单元格无逗号/引号，允许 naive split：表头 + 5000 行 + 尾 \r\n = 5002 段
@@ -1247,14 +1427,14 @@ async function main () {
     const exFlat = JSON.stringify(exLog.items)
     assert.ok(!exFlat.includes('format=csv'), 'body/查询词不落访问日志（只记 method+path）')
     s2.close()
-    // 第三态 tooLarge（审查 3.2-MI2；评审 231-T8 改真端点）：push.json > 32MiB 时
+    // 第三态 tooLarge（审查 3.2-MI2；评审 231-T8 改真端点）：push.json 超过控制台读取上限时
     // export 端点与 missing/invalid 共用同一 `read.status !== 'ok'` 分支如实下发。
     // 直调 readMessages 只能锁「函数行为」，锁不住路由（route 回退成功文件的回归
     // 依然全绿）——必须真发 POST /api/messages/export 断言 JSON 三态响应。
     const dirBig = tmpDir()
     fs.writeFileSync(path.join(dirBig, 'push.json'), Buffer.alloc(MESSAGES_MAX_BYTES + 1, 0x61))
     const readBig = readMessages(dirBig, { maxBytes: MESSAGES_MAX_BYTES, filename: 'push.json' })
-    assert.deepStrictEqual(readBig, { status: 'tooLarge' }, '>32MiB → tooLarge（不 ok、不 invalid）')
+    assert.deepStrictEqual(readBig, { status: 'tooLarge' }, '超上限 → tooLarge（不 ok、不 invalid）')
     const { server: s3 } = createConsole({ token: TOKEN, stateDir: dirBig })
     const port3 = await listen(s3)
     const tooBig = await request(port3, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
@@ -1273,6 +1453,56 @@ async function main () {
     const r = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: big })
     assert.strictEqual(r.status, 400)
     server.close()
+  })
+  await aok('HTTP: /trigger 超限 body 分 3 chunk 发送仍收到 413（D2-S2：修前只见 ECONNRESET）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const res = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1',
+        port,
+        method: 'POST',
+        path: '/trigger',
+        headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/x-www-form-urlencoded' }
+      }, (r) => {
+        let body = ''
+        r.on('data', (c) => { body += c })
+        r.on('end', () => resolve({ status: r.statusCode, text: body }))
+      })
+      req.on('error', reject)
+      const chunk = 'x'.repeat(3000)
+      req.write('action=run&pad=')
+      setTimeout(() => req.write(chunk), 20)
+      setTimeout(() => { req.write(chunk); req.end() }, 40)
+    })
+    assert.strictEqual(res.status, 413, '多 chunk 超限必须能读到 413（修前 req.destroy() 先断流）')
+    assert.match(res.text, /请求体超限/)
+    server.close()
+  })
+  await aok('readMessages: (ino,size,mtime) 缓存命中 + 文件变化自动失效 + rawTotal 含 _f（D2-S18/D2-S11）', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'a' }, { id: 2, title: 'b' }]))
+    // mtime 太新（<100ms）刻意不进缓存：写后立刻读必须看到新内容
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const a = readMessages(dir)
+    const b = readMessages(dir)
+    assert.strictEqual(a.value === b.value, true, '同一份文件必须命中解析缓存（修前每请求整读+parse+排序）')
+    assert.strictEqual(a.value.rawTotal, 2)
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'a' }, { id: 2, title: 'b' }, { id: 3, title: 'c' }]))
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const c = readMessages(dir)
+    assert.strictEqual(c.value.rawTotal, 3, '文件变化（size/ino/mtime）后必须重读')
+    // _f 条目：rawTotal 计入、total 不计入、filteredCount 单列
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'push.json'), JSON.stringify([
+      { id: 1, title: 'a' }, { id: 2, title: 'b' },
+      { _f: true, title: 'f1' }, { _f: true, title: 'f2' }, { _f: true, title: 'f3' }
+    ]))
+    const r = readMessages(dir2)
+    assert.strictEqual(r.value.rawTotal, 5)
+    assert.strictEqual(r.value.total, 2)
+    assert.strictEqual(r.value.filteredCount, 3)
   })
   await aok('HTTP: /api/trends 按日聚合（与 parseLastRun 同一正则口径）', async () => {
     const dir = tmpDir()
@@ -1301,17 +1531,22 @@ async function main () {
   })
   await aok('HTTP: /api/logs 尾读（>1MiB 截断保留尾部）+ missing；/api/sys 版本与缓存目录、无环境变量泄漏', async () => {
     const dir = tmpDir()
+    const hist = tmpDir()
     // >1MiB 前缀 + 摘要行在尾部：若端点放弃尾读限制（整个文件下发）或丢了尾读（tooLarge），这条都红
     const bigPrefix = 'HEAD-MARKER-' + 'x'.repeat(1024 * 1024)
-    fs.writeFileSync(path.join(dir, 'run.log'), [bigPrefix, '2026-10-15 12:16:21 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s cachesaved=1'].join('\n') + '\n')
-    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    fs.writeFileSync(path.join(hist, 'run.log'), [bigPrefix, '2026-10-15 12:16:21 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s cachesaved=1'].join('\n') + '\n')
+    // D2-S5：/api/logs 必须与 /api/run-history 同读 historyDir()（运行侧真实目录），
+    // 而不是 stateDir。stateDir 放一份干扰日志证明读取源唯一。
+    fs.writeFileSync(path.join(dir, 'run.log'), 'STATE-DIR-ONLY-MARKER\n')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir, runHistoryDir: hist })
     const port = await listen(server)
     const l = JSON.parse((await request(port, 'GET', '/api/logs', { token: TOKEN })).text)
     assert.strictEqual(l.status, 'ok')
     assert.ok(l.text.includes('total=20'), '日志正文可见')
     assert.ok(!l.text.includes('HEAD-MARKER'), '超限日志必须只下发尾部 1 MiB（前缀不得出现）')
+    assert.ok(!l.text.includes('STATE-DIR-ONLY-MARKER'), 'stateDir/run.log 不得被读取（与运行历史同源）')
     // missing 分支：文件不在必须 missing（不得把别的状态伪装成 ok）
-    fs.unlinkSync(path.join(dir, 'run.log'))
+    fs.unlinkSync(path.join(hist, 'run.log'))
     const empty = JSON.parse((await request(port, 'GET', '/api/logs', { token: TOKEN })).text)
     assert.strictEqual(empty.status, 'missing', 'run.log 已删除必须 missing')
     const s = JSON.parse((await request(port, 'GET', '/api/sys', { token: TOKEN })).text)
@@ -1449,6 +1684,39 @@ async function main () {
     await new Promise(resolve => setTimeout(resolve, 80))
     assert.strictEqual(exitCode, 0, `子进程 close 后必须退出 0（events=${events}）`)
     assert.ok(events.indexOf('exit:0') > events.indexOf('kill:SIGKILL'), '退出必须发生在 kill 之后')
+  })
+
+  await aok('wireGracefulShutdown: 3s 看门狗对未 close 的子进程补释放锁（D1-N1 回归）', async () => {
+    const dir = tmpDir()
+    const p = lockPath(dir)
+    const { activeChildren, runs, wireGracefulShutdown: wire } = createConsole({ token: TOKEN, stateDir: dir })
+    assert.strictEqual(acquireLock(dir, Date.now(), 'tok-wd'), true)
+    const fakeChild = { kill () {}, once () { return this } }
+    const record = {
+      id: 'wd.1',
+      action: 'check',
+      label: 'x',
+      startedAt: Date.now(),
+      finishedAt: 0,
+      exitedAt: 0,
+      exitCode: null,
+      output: '',
+      cancelled: false,
+      _child: fakeChild,
+      _stateDir: dir,
+      _lockToken: 'tok-wd'
+    }
+    runs.set(record.id, record)
+    activeChildren.add(fakeChild)
+    const { shutdown } = wire({ onExit: () => {}, registerSignal: () => {} })
+    shutdown('SIGTERM')
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.strictEqual(JSON.parse(fs.readFileSync(p, 'utf8')).released, undefined, 'close 前不得假定已释放')
+    // 看门狗 3s：子进程始终不发 close，退出前必须补 finishRun（否则锁留到 10 分钟陈旧接管）
+    await new Promise((resolve) => setTimeout(resolve, 3200))
+    const frame = JSON.parse(fs.readFileSync(p, 'utf8'))
+    assert.strictEqual(frame.released, true, '看门狗路径必须释放锁')
+    assert.strictEqual(record.finishedAt > 0, true, '记录必须收尾，不能长期停在「停止中」')
   })
 
   // ── v3.299 批次②：运行控制（停止按钮 + 逐轮运行历史）────────────────────────
@@ -1689,16 +1957,13 @@ async function main () {
     server.close()
   })
   await aok('脱敏 D1 深层编码：三层 %2574oken 与 畸形转义+编码键 同串 → 全 ***（不动点 + 尽力解码）', () => {
-    // 三层编码（%2574oken= → %74oken= → token=）：旧 2 轮上限漏洗
-    // washTokens 语义=键保留、值 ***：三层解码后 token=***（返回解码形态，泄露面为零）
-    assert.strictEqual(sanitizeAccessPath('/api/x?%2574oken=SECRET'), '/api/x?token=***')
-    // 编码 token 键 + 无关畸形转义同串：旧实现 decodeURIComponent 整体抛错提前 return，
-    // 键名保持 %74 形态洗不到；现在尽力解码继续洗（可解段解开——%E0%80 解成裸码点
-    // `à\x80`，SECRET 已洗净即达标；畸形段不解码不丢段）
+    // 三层编码（%2574oken= → %74oken= → token=）：判定用解码副本，落盘保留原串
+    assert.strictEqual(sanitizeAccessPath('/api/x?%2574oken=SECRET'), '/api/x?%2574oken=***')
+    // 编码敏感键 + 无关畸形转义同串：旧实现 decodeURIComponent 整体抛错提前 return，
+    // 键名保持 %74 形态洗不到；现在逐段尽力解码判定（畸形段不解码、不丢段）
     const mixed = sanitizeAccessPath('/api/x?%74oken=SECRET&z=%E0%80')
-    assert.strictEqual(mixed.startsWith('/api/x?token=***&z='), true, 'token 键洗净、可解段已解')
+    assert.strictEqual(mixed, '/api/x?%74oken=***&z=%E0%80', '敏感键值盖掉，其余原样保留')
     assert.ok(!mixed.includes('SECRET'))
-    assert.ok(!mixed.includes('%74oken'), '编码键名不残留')
   })
   await aok('代理对 M6/M7：excerpt 截断与 query 钳制均不劈 emoji', () => {
     // M6：excerpt 边界劈代理对 → 回退一码元（无孤立高代理）
@@ -1743,6 +2008,7 @@ async function main () {
     const rec = makeStreamRecord('1750000000000.9')
     streamAppend(rec, '最终输出')
     rec.finishedAt = Date.now()
+    rec.closedAt = Date.now()
     runs.set('1750000000000.9', rec)
     const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9', { headers: { authorization: `Bearer ${TOKEN}` } }) // 无 since → cursor=total
     assert.strictEqual(await sse.waitFor((e) => e.event === 'done'), true, '收到 done 帧')
@@ -2053,11 +2319,14 @@ async function main () {
     // 变异沙箱里 console.js 是插桩后的机器生成代码（语句被 stryMutAct_* 条件包裹），
     // 源码串断言只对原始源文件有意义；这些红线由 Test workflow 的 npm test 兜底。
     if (process.env.XBK_MUTATION_CHILD !== '1') {
-      assert.ok(src.includes('childEnv.XBK_CACHE_DIR = stateDir'), '子进程必须钉 XBK_CACHE_DIR 到本实例 stateDir')
-      assert.ok(src.includes('startAction(action, now, activeChildren, runHistoryDir || stateDir)'),
-        'spawn 必须把 runHistoryDir || stateDir 传给子进程（否则 run.log 写不到历史读取目录）')
-      assert.ok(src.includes('const stopDir = runHistoryDir || stateDir'), '停止留痕必须写历史读取目录')
-      assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得回落到运行侧全局缓存目录')
+      assert.ok(src.includes('childEnv.XBK_CACHE_DIR = cacheDir'), '子进程必须钉 XBK_CACHE_DIR 到历史目录')
+      assert.ok(/startAction\(action, now, activeChildren, historyDir\(\), runToken, stateDir\)/.test(src),
+        'spawn 必须把 historyDir() 传给子进程（否则 run.log 写不到历史读取目录）')
+      assert.ok(src.includes('const stopDir = historyDir()'), '停止留痕必须写历史读取目录')
+      assert.ok(src.includes('const historyDir = () => {'), '读取/写入/停止留痕三处必须同源 historyDir()')
+      assert.ok(!src.includes('const stopDir = runtimeCacheDir() || stateDir'), '不得各自手写运行侧目录解析')
+      assert.ok(src.includes('CANCEL 控制台停止：任务 #'), '取消留痕必须用独立 CANCEL 前缀')
+      assert.ok(!src.includes('ERROR 控制台停止：任务 #'), '不得再写 ERROR（会被当成轮失败）')
     }
     // 行为验证：子进程（独立 node）只在真读 XBK_CACHE_DIR 时才可能写到实例目录。
     const dir = fs.mkdtempSync(path.join(__dirname, '.tmp-cache-'))
@@ -2070,6 +2339,126 @@ async function main () {
         'MessageStore.cacheDir 必须服从 XBK_CACHE_DIR（否则子进程 run.log 仍写生产）')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+  await aok('缓存目录: XBK_CACHE_DIR 两侧同一规则 + 控制台目录跟随运行侧（审查 D1-M1）', () => {
+    const probe = "const x=require('./xbk_function_v3');process.stdout.write(x.MessageStore.cacheDir)"
+    const run = (value) => spawnSync(process.execPath, ['-e', probe], {
+      cwd: __dirname, encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: value }
+    })
+    const norm = (p) => { try { return fs.realpathSync(p) } catch (e) { return path.resolve(p) } }
+    const base = run('')
+    assert.strictEqual(base.status, 0, String(base.stderr))
+    const defaultDir = norm(base.stdout.trim())
+    // 相对路径：与 --status 同一套规则（告警 + 忽略）。旧实现运行侧真的写进 <root>/rel/cache，
+    // 控制台却打印「已忽略并回退默认目录」——同一变量两套解析。
+    const rel = run('rel/cache')
+    assert.strictEqual(norm(rel.stdout.trim()), defaultDir, '相对路径 XBK_CACHE_DIR 必须被运行侧忽略')
+    assert.match(String(rel.stderr), /XBK_CACHE_DIR 不是绝对路径（rel\/cache）/, '忽略相对路径必须告警')
+    // 绝对路径（含项目根外）：两侧都原样采纳，控制台读的就是运行侧写的
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-abs-'))
+    const prev = process.env.XBK_CACHE_DIR
+    try {
+      const abs = run(outside)
+      assert.strictEqual(norm(abs.stdout.trim()), norm(outside), '绝对路径必须被运行侧采纳（含根外）')
+      const quiet = (fn) => { const w = console.warn; console.warn = () => {}; try { return fn() } finally { console.warn = w } }
+      process.env.XBK_CACHE_DIR = outside
+      assert.strictEqual(norm(quiet(consoleStateDir)), norm(outside),
+        '控制台 stateDir 必须取运行侧 MessageStore.cacheDir（否则运行历史/推送记录读空）')
+      process.env.XBK_CACHE_DIR = 'rel/cache'
+      assert.strictEqual(norm(quiet(consoleStateDir)), defaultDir,
+        '相对路径下控制台也回退默认目录（与运行侧口径一致）')
+      // --status 侧同一规则（statusCacheDir）：绝对路径原样采纳，相对路径回默认目录
+      const { statusCacheDir } = require('./qinglong/xbk_push')
+      assert.strictEqual(norm(quiet(() => statusCacheDir({ env: { XBK_CACHE_DIR: outside }, fs, path }))), norm(outside))
+      assert.strictEqual(norm(quiet(() => statusCacheDir({ env: { XBK_CACHE_DIR: 'rel/cache' }, fs, path }))), defaultDir)
+    } finally {
+      if (prev === undefined) delete process.env.XBK_CACHE_DIR
+      else process.env.XBK_CACHE_DIR = prev
+      fs.rmSync(outside, { recursive: true, force: true })
+    }
+  })
+  await aok('finishRun: exit 即收尾且幂等（finishedAt 只落一次、锁只释放一次，审查 #229 S6）', () => {
+    const dir1 = tmpDir()
+    const token1 = 'tok1'
+    assert.strictEqual(acquireLock(dir1, Date.now(), token1), true)
+    const rec = {
+      id: 'x.1',
+      finishedAt: 0,
+      exitCode: null,
+      _stateDir: dir1,
+      _lockToken: token1,
+      _timer: setTimeout(() => {}, 60000),
+      _cancelTimer: setTimeout(() => {}, 60000)
+    }
+    let released = 0
+    const release = () => { released += 1; return true }
+    assert.strictEqual(finishRun(rec, 0, { release, now: () => 111 }), true)
+    assert.strictEqual(rec.finishedAt, 111, 'exit 到达即落 finishedAt（不等 close）')
+    assert.strictEqual(rec.exitCode, 0)
+    assert.strictEqual(released, 1)
+    // close 迟到再调一次：幂等，不得覆盖 exit 的事实、不得二次释放
+    assert.strictEqual(finishRun(rec, 1, { release, now: () => 999 }), false)
+    assert.strictEqual(rec.finishedAt, 111, 'finishAt 不得被迟到事件改写')
+    assert.strictEqual(rec.exitCode, 0, 'exitCode 不得被迟到事件改写')
+    assert.strictEqual(released, 1, '锁只释放一次')
+    // 真实锁：收尾必须写成 released 帧（旧实现只在 close 里做，孙进程持 stdio 时锁滞留）
+    const dir2 = tmpDir()
+    assert.strictEqual(acquireLock(dir2, Date.now(), 'tok2'), true)
+    assert.strictEqual(finishRun({ id: 'x.2', finishedAt: 0, exitCode: null, _stateDir: dir2, _lockToken: 'tok2' }, 0), true)
+    assert.strictEqual(JSON.parse(fs.readFileSync(lockPath(dir2), 'utf8')).released, true,
+      'finishRun 必须释放触发锁')
+    // 接线：exit 与 close 都调用 finishRun（close 只做剩余清理）
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    assert.ok(/child\.on\('exit'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'exit 必须收尾')
+    assert.ok(/child\.on\('close'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'close 必须幂等补收尾')
+  })
+  await aok('readRunHistory: CANCEL 取消留痕成独立条目且不污染相邻轮（审查 #229 S7/D1-N3）', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 09:05:00 CANCEL 控制台停止：任务 #1792236290484.7（run）于运行中被停止（SIGTERM）',
+      '2026-10-15 11:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=1s cachesaved=1'
+    ].join('\n') + '\n')
+    const r = readRunHistory(dir, { limit: 5 })
+    assert.deepStrictEqual(r.items.map((x) => x.at),
+      ['2026-10-15 11:00:00', '2026-10-15 09:05:00', '2026-10-15 09:00:00'])
+    assert.strictEqual(r.items[1].cancelled, true, '取消留痕必须生成 cancelled 条目（这轮不能消失）')
+    assert.strictEqual(r.items[1].isPlaceholder, true)
+    assert.strictEqual(r.items[1].interrupted, false, '取消不是运行失败')
+    assert.strictEqual(r.items[0].interrupted, false, '取消留痕不得把下一轮标成中断')
+    assert.strictEqual(r.items[2].interrupted, false, '也不得把上一轮标成中断')
+  })
+  await aok('createConsole: 注入 stateDir 优先于全局缓存；显式 runHistoryDir 可覆盖（Sourcery 注入目录被绕过）', async () => {
+    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtime-dir-'))
+    const state = tmpDir()
+    fs.writeFileSync(path.join(runtime, 'run.log'),
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1\n')
+    fs.writeFileSync(path.join(state, 'run.log'),
+      '2026-10-15 09:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=1s cachesaved=1\n')
+    const prev = process.env.XBK_CACHE_DIR
+    process.env.XBK_CACHE_DIR = runtime
+    try {
+      // 注入 stateDir 的嵌入式实例：即使 XBK_CACHE_DIR 指向别处，也必须读自己的 stateDir。
+      const a = createConsole({ token: TOKEN, stateDir: state })
+      const portA = await listen(a.server)
+      const ra = JSON.parse((await request(portA, 'GET', '/api/run-history', { token: TOKEN })).text)
+      assert.strictEqual(ra.status, 'ok')
+      assert.strictEqual(ra.items.length, 1)
+      assert.strictEqual(ra.items[0].pushed, 2, '注入 stateDir 必须优先，不能被全局运行目录覆盖')
+      a.server.close()
+      // 显式 runHistoryDir 仍是最高优先级（生产/测试需要「状态与运行产物分居」时用）。
+      const b = createConsole({ token: TOKEN, stateDir: state, runHistoryDir: runtime })
+      const portB = await listen(b.server)
+      const rb = JSON.parse((await request(portB, 'GET', '/api/run-history', { token: TOKEN })).text)
+      assert.strictEqual(rb.items.length, 1)
+      assert.strictEqual(rb.items[0].pushed, 1, 'runHistoryDir 必须覆盖 stateDir')
+      b.server.close()
+    } finally {
+      if (prev === undefined) delete process.env.XBK_CACHE_DIR
+      else process.env.XBK_CACHE_DIR = prev
+      fs.rmSync(runtime, { recursive: true, force: true })
     }
   })
   await aok('HTTP: run-history limit=9999 在 220 轮 fixture 上真实钳制到 200（评审 #14）', async () => {
@@ -2119,7 +2508,134 @@ async function main () {
     assert.strictEqual(r2.items[0].interrupted, true, '失败行 → 其后摘要轮 interrupted')
     assert.strictEqual(r2.items[1].interrupted, false, '更早摘要轮不受污染')
   })
-
+  await aok('readRunHistory: 崩溃轮独立占位（不回填下一轮）且带 isPlaceholder（审查 D1-M2/D1-N5）', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 10:00:00 ERROR fetch failed ETIMEDOUT',
+      '2026-10-15 11:00:00 total=5 dedup=0 filtered=0 truncated=0 pushed=5 failed=0 elapsed=2s cachesaved=1'
+    ].join('\n') + '\n')
+    const r = readRunHistory(dir, { limit: 5 })
+    assert.deepStrictEqual(r.items.map((x) => x.at),
+      ['2026-10-15 11:00:00', '2026-10-15 10:00:00', '2026-10-15 09:00:00'])
+    assert.strictEqual(r.items[0].interrupted, false, '崩溃轮的 ERROR 不得把下一轮标成中断')
+    assert.strictEqual(r.items[0].pushed, 5)
+    assert.strictEqual(r.items[1].isPlaceholder, true, '无摘要可归属的失败行必须生成独立占位条目')
+    assert.strictEqual(r.items[1].interrupted, true)
+    assert.strictEqual(r.items[1].total, null)
+    assert.strictEqual(r.items[1].lineNo, 2, '占位行号 = 失败行自身行号（不是摘要行号+1）')
+    // limit=1：占位轮不被摘要挤掉，翻页时也按自身行号定位（不与摘要行比较）
+    const one = readRunHistory(dir, { limit: 1 })
+    assert.deepStrictEqual(one.items.map((x) => x.at), ['2026-10-15 11:00:00'])
+    const next = readRunHistory(dir, { limit: 1, before: one.items[0].lineNo - 1 })
+    assert.strictEqual(next.items[0].isPlaceholder, true, '下一页能取到崩溃占位轮')
+    assert.strictEqual(next.items[0].at, '2026-10-15 10:00:00')
+  })
+  await aok('readRunHistory: 失败行归属与每页条数无关（±2 行且 ≤2s，审查 D1-M3/D1-S2）', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 07:00:00 ERROR 上一轮残留失败',
+      '2026-10-15 08:00:00 WARN 通道健康更新异常: x',
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 11:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1'
+    ].join('\n') + '\n')
+    const two = readRunHistory(dir, { limit: 2 })
+    const five = readRunHistory(dir, { limit: 5 })
+    assert.deepStrictEqual(two.items.map((x) => x.interrupted), [false, false],
+      'limit=2：本页摘要都不得被 07:00 的失败行标中断')
+    assert.deepStrictEqual(five.items.map((x) => x.interrupted), [false, false, false, true],
+      'limit=5：同一文件结论必须一致（09:00 不再因「页满闸门失效」被标中断）')
+    assert.strictEqual(five.items[3].at, '2026-10-15 07:00:00')
+    assert.strictEqual(five.items[3].isPlaceholder, true, '相隔 1 小时的失败行是独立崩溃轮')
+    // 反向：同秒相邻（ERROR → 摘要）仍归属本轮，不受 limit 影响
+    const dir2 = tmpDir()
+    fs.writeFileSync(path.join(dir2, 'run.log'), [
+      '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1',
+      '2026-10-15 10:00:00 ERROR 推送全部失败 3 条（通道可能失效）',
+      '2026-10-15 10:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=1s cachesaved=1',
+      '2026-10-15 11:00:00 total=3 dedup=0 filtered=0 truncated=0 pushed=3 failed=0 elapsed=1s cachesaved=1'
+    ].join('\n') + '\n')
+    const r2 = readRunHistory(dir2, { limit: 2 })
+    assert.strictEqual(r2.items[1].at, '2026-10-15 10:00:00')
+    assert.strictEqual(r2.items[1].interrupted, true, '同秒失败行必须归属其摘要轮')
+    assert.strictEqual(r2.items[0].interrupted, false)
+  })
+  await aok('readRunHistory: 尾窗追加后 key 游标仍可翻页（>1MiB 不再永久 stale，审查 D1-S3）', async () => {
+    const { readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    const filler = '2026-10-15 00:00:00 DEBUG 填充行 ' + 'x'.repeat(120)
+    const lines = []
+    while (Buffer.byteLength(lines.join('\n'), 'utf8') < 1024 * 1024 + 2048) lines.push(filler)
+    for (let i = 0; i < 6; i++) {
+      lines.push(`2026-10-15 1${i}:00:00 total=${i} dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1`)
+    }
+    fs.writeFileSync(path.join(dir, 'run.log'), lines.join('\n') + '\n')
+    const p1 = readRunHistory(dir, { limit: 2 })
+    assert.strictEqual(p1.truncated, true, '1MiB 尾读必须标注 truncated')
+    assert.deepStrictEqual(p1.items.map((x) => x.at), ['2026-10-15 15:00:00', '2026-10-15 14:00:00'])
+    assert.ok(/^[0-9a-f]{8}$/.test(p1.items[1].key), '每条目必须下发 8 位稳定 key')
+    // 追加一行 ⇒ 尾窗整体前移：旧的行号游标 + 旧窗口指纹必须判 stale（数据已错位）
+    fs.appendFileSync(path.join(dir, 'run.log'), '2026-10-15 17:00:00 total=9 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1\n')
+    const stale = readRunHistory(dir, { limit: 2, before: p1.items[1].lineNo - 1, windowKey: p1.windowKey })
+    assert.strictEqual(stale.status, 'stale', '行号游标在尾窗平移后必须 stale')
+    // key 游标按内容定位，追加不改变既有行 → 继续翻页
+    const p2 = readRunHistory(dir, { limit: 2, before: p1.items[1].key })
+    assert.strictEqual(p2.status, 'ok', 'key 游标不得因追加而失效')
+    assert.deepStrictEqual(p2.items.map((x) => x.at), ['2026-10-15 13:00:00', '2026-10-15 12:00:00'])
+    // HTTP 层同样接受 key 游标（前端只改传参，不改端点）
+    const { server } = createConsole({ token: TOKEN, stateDir: dir, runHistoryDir: dir })
+    const port = await listen(server)
+    const http = JSON.parse((await request(port, 'GET', `/api/run-history?limit=2&before=${p1.items[1].key}`, { token: TOKEN })).text)
+    assert.strictEqual(http.status, 'ok')
+    assert.deepStrictEqual(http.items.map((x) => x.at), ['2026-10-15 13:00:00', '2026-10-15 12:00:00'])
+    // 不存在的 key（锚点轮已滚出尾窗）→ stale，前端回第 1 页
+    const gone = readRunHistory(dir, { limit: 2, before: 'deadbeef' })
+    assert.strictEqual(gone.status, 'stale')
+    server.close()
+  })
+  await aok('readRunHistory: 尾窗指纹不因首行为空/超长而退化（审查 D1-N6）', () => {
+    const { readRunHistory } = require('./scripts/status')
+    const summary = '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1'
+    const write = (head) => {
+      const d = tmpDir()
+      fs.writeFileSync(path.join(d, 'run.log'), [head, summary].join('\n') + '\n')
+      return d
+    }
+    const blankA = write('')
+    const blankB = write('\n')
+    const blankC = write('\n\n2026-10-15 10:00:00 total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=1s cachesaved=1\n')
+    const ka = readRunHistory(blankA, { limit: 1 }).windowKey
+    assert.notStrictEqual(ka, '811c9dc5', '空首行不得退化成常量指纹 811c9dc5')
+    assert.notStrictEqual(readRunHistory(blankB, { limit: 1 }).windowKey, ka,
+      '首个非空行的行序不同（0 vs 1）必须给出不同指纹')
+    assert.notStrictEqual(readRunHistory(blankC, { limit: 1 }).windowKey, ka,
+      '首个非空行内容不同（09:00 vs 10:00）必须给出不同指纹')
+    // 首行 200 字符之后不同：旧实现只哈希前 200 字符，会误判成同一窗口
+    const prefix = 'x'.repeat(240)
+    assert.notStrictEqual(readRunHistory(write(prefix + 'A'), { limit: 1 }).windowKey,
+      readRunHistory(write(prefix + 'B'), { limit: 1 }).windowKey,
+      '首行第 200 字符之后不同也必须区分')
+    assert.ok(/^[0-9a-f]{8}$/.test(ka))
+    assert.strictEqual(readRunHistory(blankC, { limit: 1 }).status, 'ok')
+  })
+  await aok('readStatus/readRunHistory: ALERT「运行异常」不把成功轮标中断（审查 D2-M3）', () => {
+    const { readStatus, readRunHistory } = require('./scripts/status')
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), [
+      '2026-10-15 09:00:00 total=120 dedup=0 filtered=0 truncated=0 pushed=100 failed=0 elapsed=8s cachesaved=1',
+      '2026-10-15 09:00:01 ALERT [v3.307] ⚠️ xbk-push 运行异常 原因：线报酷数据截断',
+      '2026-10-15 09:00:02 ALERT [v3.307] ⚠️ xbk-push 运行异常 原因：缺少可选依赖 re2'
+    ].join('\n') + '\n')
+    assert.strictEqual(readStatus(dir).run.value.interrupted, false,
+      '线报酷截断/缺 re2 的 ALERT 正文含「运行异常」，但该轮是成功轮')
+    const r = readRunHistory(dir, { limit: 5 })
+    assert.strictEqual(r.items.length, 1, 'ALERT 不是失败行，不得生成崩溃占位轮')
+    assert.strictEqual(r.items[0].interrupted, false)
+    assert.strictEqual(r.items[0].pushed, 100)
+  })
   // ── v3.298 只读扩展：配置视图 / 缓存健康 / 文件清单 / 趋势天数 ─────────────────
   await aok('只读纯函数: statSafeMeta 三态（常规文件 / 符号链接 / 缺失）', () => {
     const dir = tmpDir()
@@ -2396,8 +2912,40 @@ async function main () {
     assert.ok(data.limits.writeMaxBytes > 0, '上限真源下发')
     assert.strictEqual(data.entryCount, 1, 'HTTP 层附带条目数（readMessageCount 同源）')
     assert.strictEqual(data.entryCountStatus, 'ok')
+    assert.strictEqual(data.entryCountFiltered, 0, '无 _f 条目时 filteredCount=0')
     const na = await request(port, 'GET', '/api/cache-health')
     assert.strictEqual(na.status, 401)
+    server.close()
+  })
+  await aok('cache-health: entryCount 必须计入 _f（D2-S11：9000 _f + 1500 正常 → 10500 已超限）', async () => {
+    const dir = tmpDir()
+    const msgs = []
+    for (let i = 0; i < 40; i++) msgs.push({ id: i + 1, title: `t${i}`, content: 'c' })
+    for (let i = 0; i < 60; i++) msgs.push({ _f: true, title: `f${i}`, content: 'c' })
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(msgs))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const data = JSON.parse((await request(port, 'GET', '/api/cache-health', { token: TOKEN })).text)
+    assert.strictEqual(data.entryCount, 100, '条目数 = 文件条目总数（含 _f）——旧口径报 40/10000')
+    assert.strictEqual(data.entryCountFiltered, 60, '_f 条数单独可见')
+    const page = JSON.parse((await request(port, 'GET', '/api/messages', { token: TOKEN })).text)
+    assert.strictEqual(page.grandTotal, 40, '推送记录页仍只算已推送条目')
+    server.close()
+  })
+  await aok('cache-health: 超过条数统计阈值 → 不整读，如实 tooLarge（D2-S12）', async () => {
+    const dir = tmpDir()
+    // 稀疏文件：8MiB+1，内容不是合法 JSON——若端点仍整读会走 invalid；必须报 tooLarge 且不 parse
+    const p = path.join(dir, 'push.json')
+    fs.writeFileSync(p, '')
+    fs.truncateSync(p, CACHE_HEALTH_COUNT_MAX_BYTES + 1)
+    const direct = cacheHealthEntryCount(dir, 'push.json')
+    assert.deepStrictEqual(direct, { status: 'tooLarge', count: null, filteredCount: null }, '超阈值不整读')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const data = JSON.parse((await request(port, 'GET', '/api/cache-health', { token: TOKEN })).text)
+    assert.strictEqual(data.entryCount, null, '条数不可得时不得编数')
+    assert.strictEqual(data.entryCountStatus, 'tooLarge')
+    assert.match(String(data.entryCountHint || ''), /MiB/, '必须说明为何不可得')
     server.close()
   })
   await aok('HTTP: /api/trends?days 白名单（30/60 放大窗口；非法/越界钳回 14）', async () => {
@@ -2451,7 +2999,7 @@ async function main () {
     const flat = JSON.stringify(log.items)
     assert.ok(!flat.includes('x1') && !flat.includes('y2') && !flat.includes('z3'), `逃逸原文零出现（items=${flat}）`)
     assert.ok(log.items.some((it) => it.path === '/api/nope?a=1&token=***&token=***'), '重复参数形态全 ***')
-    assert.ok(log.items.some((it) => it.path === '/api/nope?token=***'), '%74oken= 解码形态洗出 token=***')
+    assert.ok(log.items.some((it) => it.path === '/api/nope?%74oken=***'), '编码键名命中，落盘保留原串形态（D2-N2）')
     server.close()
   })
   await aok('访问日志: 401 独立计数（3 次未授权后 =3，重复查询不漂移）', async () => {
@@ -2670,7 +3218,7 @@ async function main () {
   await aok('结构红线: 非概览/日志页停止主轮询（防 5s 闪屏）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes("if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)"), '推送记录/配置/系统必须停止主轮询')
-    assert.ok(/\[refreshSplit, locking, tab\]/.test(src), '轮询 effect 必须随 tab 变化重跑')
+    assert.ok(/\[refreshSplit, locking, tab, autoRefresh, authExpired\]/.test(src), '轮询 effect 必须随 tab / 暂停开关 / 凭证失效状态变化重跑')
   })
 
   await aok('结构红线: 配置页过滤规则/渠道不拼成一条长串', () => {
@@ -2678,7 +3226,7 @@ async function main () {
     assert.ok(src.includes('function FilterRules ('), '必须有 FilterRules 组件（一条规则一行）')
     assert.ok(src.includes('function ChannelList ('), '必须有 ChannelList 组件（渠道 chip）')
     const start = src.indexOf('function ConfigPanel ')
-    const end = src.indexOf('function SystemPanel', start)
+    const end = src.indexOf('function SysPanel', start)
     const seg = src.slice(start, end)
     assert.ok(/<\$\{FilterRules\}/.test(seg), '配置页必须使用 FilterRules')
     assert.ok(/<\$\{ChannelList\}/.test(seg), '配置页必须使用 ChannelList')
@@ -2725,17 +3273,81 @@ async function main () {
     assert.deepStrictEqual(filterLogLines(txt, 'issue', 'pushed=20'), [], '正常摘要行不混进异常结果')
   })
 
+  await aok('行为: v3.307 日志级别 / 时间戳 / 哈希 / 逐轮筛选纯函数', async () => {
+    const { isConsoleLifecycleLine, logLineKind, logLineCounts, filterLogLines, ageFromStamp, tabFromHash, filterRunItems } =
+      await import('./scripts/console-assets/pure.mjs')
+    const okLine = '2026-10-17 23:06:42 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s'
+    const life = '2026-10-16 10:00:00 ERROR 控制台停止：任务 #12 于运行中被停止（SIGTERM）'
+    const errLine = '2026-10-17 23:00:00 ERROR 推送全部失败 3 条（通道可能失效）'
+    const alertLine = '2026-10-17 23:00:00 ALERT [v3.0] 运行异常'
+    const failLine = '2026-10-17 23:00:00 total=20 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=1s'
+    const txt = [okLine, life, errLine, alertLine, failLine].join('\n') + '\n'
+    assert.strictEqual(isConsoleLifecycleLine(life), true)
+    assert.strictEqual(isConsoleLifecycleLine(errLine), false, '普通 ERROR 不是控制台生命周期')
+    assert.strictEqual(logLineKind(life), 'console', '生命周期优先于 ERROR 级别')
+    assert.strictEqual(logLineKind(alertLine), 'alert')
+    assert.strictEqual(logLineKind(okLine), 'summary')
+    const counts = logLineCounts(txt)
+    assert.deepStrictEqual(counts, { all: 5, issue: 3, error: 2, alert: 1, warn: 0, summary: 2, console: 1 })
+    assert.deepStrictEqual(filterLogLines(txt, 'console', ''), [life], '控制台筛选只留生命周期')
+    assert.deepStrictEqual(filterLogLines(txt, 'error', ''), [life, errLine], '错误=按原始级别（含生命周期）')
+    assert.deepStrictEqual(filterLogLines(txt, 'issue', ''), [errLine, alertLine, failLine], '异常已排除生命周期')
+    assert.strictEqual(ageFromStamp('2026-10-18 00:00:00', Date.UTC(2026, 9, 17, 16, 0, 0)), '刚刚')
+    assert.strictEqual(ageFromStamp('bad', 0), '')
+    assert.strictEqual(tabFromHash('#/logs'), 'logs')
+    assert.strictEqual(tabFromHash('#/sys'), 'sys')
+    assert.strictEqual(tabFromHash('#/nope'), 'overview')
+    assert.strictEqual(tabFromHash(''), 'overview')
+    const runs = [
+      { at: '2026-10-14 10:00:00', failed: 3, interrupted: false },
+      { at: '2026-10-15 10:00:00', failed: 0, interrupted: true },
+      { at: '2026-10-15 11:00:00', failed: 0, interrupted: false, cancelled: true },
+      { at: '', failed: 0, interrupted: false }
+    ]
+    assert.strictEqual(filterRunItems(runs, { mode: 'issue' }).length, 3, '失败/中断/取消都算 issue')
+    assert.deepStrictEqual(filterRunItems(runs, { day: '2026-10-15' }).map((r) => r.at), ['2026-10-15 10:00:00', '2026-10-15 11:00:00'])
+    assert.strictEqual(filterRunItems(runs, { mode: 'issue', day: '2026-10-14' }).length, 1, '筛选取交集')
+    assert.strictEqual(filterRunItems(null, { mode: 'issue' }).length, 0)
+  })
+
+  await aok('结构红线: v3.307 确认弹窗 / 今日统计 / 时间窗 / 日志级别 / hash 路由', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes('function ConfirmDialog'), '危险动作必须有确认弹窗')
+    assert.ok(src.includes("if (action === 'run' || action === 'notify-test') {"),
+      '正式运行与通知自检必须走确认；试运行/环境检查直接执行')
+    assert.ok(src.includes("cls: 'btn-danger-solid'"), '正式运行必须是红色危险按钮')
+    assert.ok(src.includes('role="dialog"') && src.includes('aria-modal="true"'), '弹窗必须有无障碍语义')
+    assert.ok(src.includes('defaultFocus') === false && src.includes('cancelRef.current.focus()'),
+      '默认焦点必须落在取消，不能落在确认')
+    assert.ok(src.includes('function AlertBanner'), '首屏必须有失败横幅')
+    assert.ok(src.includes("state.stats.status === 'ok'"), '状态卡必须消费 stats')
+    assert.ok(src.includes('成功率'), '状态卡必须显示成功率')
+    assert.ok(src.includes('>今天</option>') && src.includes('>近 7 天</option>'), '推送记录必须有时间窗')
+    assert.ok(src.includes('initialMode') && src.includes('initialQuery'), '日志面板必须支持带条件跳转')
+    assert.ok(src.includes("window.addEventListener('hashchange'"), '页签必须跟随 hash')
+    assert.ok(src.includes('document.title ='), '标题必须带状态点')
+    assert.ok(src.includes('autoRefresh') && src.includes('自动刷新 · '), '自动刷新必须有暂停与倒计时')
+    assert.ok(src.includes('filterRunItems'), '逐轮历史必须支持失败/日期筛选')
+    assert.ok(!src.includes('首轮前正常'), '墓碑文案不得再写「首轮前正常」')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.alert-banner\s*\{/.test(css) && /\.modal-backdrop\s*\{/.test(css), '横幅/弹窗样式必须存在')
+    assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.cards\s*\{\s*grid-template-columns:\s*1fr 1fr/.test(css),
+      '手机端状态卡必须 2×2，不能四张单列')
+    assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.btn-item\s*\{\s*flex:\s*1 1 calc\(50% - 5px\)/.test(css),
+      '手机端动作按钮必须 2×2')
+  })
+
   await aok('结构红线: 概览先状态与操作，空触发历史不占位（运行中仍显示）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
-    const start = src.indexOf("${tab === 'overview' && html`<div>")
-    const end = src.indexOf("${tab === 'messages'", start)
+    const start = src.indexOf("${!authExpired && tab === 'overview' && html`<div>")
+    const end = src.indexOf("${!authExpired && tab === 'messages'", start)
     assert.ok(start > -1 && end > start, '应能定位概览区块')
     const seg = src.slice(start, end)
-    const order = ['StatusCards', 'TriggerBar', 'TrendsPanel', 'RunHistoryPanel', 'CacheHealthPanel'].map((n) => seg.indexOf(n))
-    assert.ok(order.every((i) => i > -1), '概览必须包含状态卡/触发/趋势/逐轮历史/缓存健康')
-    assert.deepStrictEqual([...order].sort((a, b) => a - b), order, '首屏必须先状态与操作，缓存健康垫底')
-    assert.ok(/\(runs\.length > 0 \|\| locking\) && html`<\$\{RunsPanel\}/.test(seg),
-      '触发历史有记录或任务运行中才渲染（另一实例持锁时不能消失）')
+    const order = ['AlertBanner', 'StatusCards', 'TriggerBar', 'TrendsPanel', 'RunHistoryPanel', 'CacheHealthPanel'].map((n) => seg.indexOf(n))
+    assert.ok(order.every((i) => i > -1), '概览必须包含异常横幅/状态卡/触发/趋势/逐轮历史/缓存健康')
+    assert.deepStrictEqual([...order].sort((a, b) => a - b), order, '首屏先异常与状态、再操作，缓存健康垫底')
+    assert.ok(/locking && html`<\$\{RunsPanel\}/.test(seg),
+      '触发历史只在任务运行中占位（空闲时让位给趋势/逐轮历史；另一实例持锁时 locking=true）')
   })
 
   await aok('结构红线: 后台标签页不轮询（概览/日志/触发详情三处）', () => {
@@ -2756,7 +3368,7 @@ async function main () {
     assert.ok(/\.tabs\s*\{[^}]*position:\s*sticky/.test(css), '标签页必须吸顶')
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('window.scrollTo(0, 0)'), '切页必须回到顶部')
-    assert.ok(/onClick=\$\{\(\) => switchTab\(t\.key\)\}/.test(src), '标签点击必须走 switchTab，不得绕过')
+    assert.ok(/onClick=\$\{\(\) => \{[^\n]*switchTab\(t\.key\)/.test(src), '标签点击必须走 switchTab，不得绕过（可先清日志跳转）')
     const cache = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('// 推送记录：'))
     assert.ok(cache.includes('60000'), '缓存健康必须每分钟刷新')
     assert.ok(cache.includes("document.addEventListener('visibilitychange', onVis)"), '切回前台要补拉缓存快照')

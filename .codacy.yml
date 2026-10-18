@@ -218,6 +218,10 @@ exclude_paths:
   # 路径全为测试硬编码常量、无用户输入，静态路径注入告警属误报。
   # scripts/local-mutation-guard.js 只用 path.resolve(__dirname, "..") + 固定三段常量定位仓库内
   # node_modules/.bin/stryker（再 realpathSync），不接受任何外部输入，告警属误报。
+  # scripts/message-signature.js 只做 push.json 的 (ino,size,mtime) 只读 stat 签名：
+  # dir 由调用方显式传入（控制台 stateDir/--status 解析结果）、文件名是本文件常量，
+  # 无外部净输入；「动态构造文件/路径信息」属静态分析误报，按工具文件口径排除。
+  - "scripts/message-signature.js"
   - "scripts/console.js"
   - "test_console.js"
   - "test_run_mutation_cli.js"

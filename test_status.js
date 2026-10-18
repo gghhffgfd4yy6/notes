@@ -31,6 +31,30 @@ try {
   assert.deepStrictEqual(status.diagnostics.value.byReason, { title: 2, category: 1 })
   assert.strictEqual(status.run.value.total, 8)
   assert.strictEqual(status.run.value.failed, 1)
+  // v3.307 首屏统计：与 run.log 同源，今天=2026-09-05（上海），成功率=pushed/(pushed+failed)
+  const stats = readStatus('.', { now: Date.UTC(2026, 8, 5, 2, 0, 0) }).stats
+  assert.strictEqual(stats.status, 'ok')
+  assert.deepStrictEqual(stats.value.today, {
+    date: '2026-09-05', rounds: 1, total: 8, pushed: 2, failed: 1, successRate: 2 / 3
+  })
+  assert.strictEqual(stats.value.week.rounds, 1)
+  assert.strictEqual(stats.value.lastFailure.date, '2026-09-05')
+  assert.strictEqual(stats.value.lastFailure.failed, 1)
+
+  // 7 天窗口：09-05 当天 + 09-04 计入，08-29（第 8 天）不计入；dry-run 轮次计入轮次但不计推送。
+  writeRunLog([
+    '2026-09-05 10:00:00 total=8 dedup=2 filtered=3 truncated=1 pushed=2 failed=1 elapsed=1.2s',
+    '2026-09-04 23:00:00 total=10 dedup=0 filtered=0 truncated=0 pushed=10 failed=0 elapsed=2.0s',
+    '2026-09-04 12:00:00 total=5 dedup=0 filtered=0 truncated=0 pushed=0 failed=0 elapsed=1.0s dry-run未推送=3',
+    '2026-08-29 10:00:00 total=5 dedup=0 filtered=0 truncated=0 pushed=5 failed=0 elapsed=1.0s'
+  ].join('\n') + '\n')
+  const weekStats = readStatus('.', { now: Date.UTC(2026, 8, 5, 2, 0, 0) }).stats.value
+  assert.strictEqual(weekStats.week.from, '2026-08-30', '窗口起点=今天-6 天')
+  assert.strictEqual(weekStats.week.rounds, 3, '窗口外 08-29 不计入')
+  assert.strictEqual(weekStats.week.pushed, 12)
+  assert.strictEqual(weekStats.week.failed, 1)
+  assert.strictEqual(weekStats.today.rounds, 1, '今天只算 09-05 一轮')
+  writeRunLog('2026-09-05 10:00:00 total=8 dedup=2 filtered=3 truncated=1 pushed=2 failed=1 elapsed=1.2s\n')
   const output = formatStatus(status)
   assert.match(output, /运行状态/)
   assert.match(output, /推送成功：6 条/)

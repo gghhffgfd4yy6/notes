@@ -88,20 +88,52 @@ function createMessageStore ({
     TOMBSTONE_LOCK_STALE_MS
   } = constants
 
+  // XBK_CACHE_DIR 取值规则（审查 #241 M1）：与青龙 `--status`（statusCacheDir）同一套——
+  // 只采纳绝对路径；相对路径告警一次并忽略。绝对路径原样采纳（含项目根外路径），因为
+  // 它就是「控制台 / --status / 运行侧」唯一的共用目录开关，任何一侧私自回退都会造成
+  // 读 A 写 B（面板与运行历史永远读空）。
+  // 覆盖了 Config.cache.dir 时额外告警一次：push.json 是判重主存，目录一换旧记录不会
+  // 自动迁移，已部署实例直接改这个变量会把已推送条目当新条目重推。
+  let warnedEnvDir = ''
+  let warnedEnvOverride = ''
+  const cacheDirFromEnv = (configured) => {
+    const raw = typeof process.env.XBK_CACHE_DIR === 'string' ? process.env.XBK_CACHE_DIR.trim() : ''
+    if (!raw) return ''
+    if (!path.isAbsolute(raw)) {
+      if (warnedEnvDir !== raw) {
+        warnedEnvDir = raw
+        console.warn(`⚠️ XBK_CACHE_DIR 不是绝对路径（${raw}），已忽略；缓存目录仍按 Config.cache.dir 解析`)
+      }
+      return ''
+    }
+    const resolved = path.resolve(raw)
+    const configuredPath = path.resolve(__dirname, configured)
+    if (resolved !== configuredPath && warnedEnvOverride !== resolved) {
+      warnedEnvOverride = resolved
+      console.warn(`⚠️ XBK_CACHE_DIR（${resolved}）覆盖了 Config.cache.dir（${configuredPath}）：push.json 判重主存随目录迁移，旧目录的已推送记录不会自动搬家；已部署实例修改前请先迁移缓存文件，否则会重复推送。`)
+    }
+    return raw
+  }
+
   const MessageStore = {
   // v3.172：cache.dir 非法回退时支持并行 worker 隔离（test_app_parallel 用 XBK_PARALLEL_ID 分片，
   // 回退硬编码 'xianbaoku_cache' 会让 t51 等非法配置测试撞共享目录竞态）
     get cacheDir () {
       const fallback = process.env.XBK_PARALLEL_ID ? `xianbaoku_cache_p${process.env.XBK_PARALLEL_ID}` : 'xianbaoku_cache'
-      // XBK_CACHE_DIR 优先（与 --status / 控制台 stateDir 同源）：控制台 spawn 的子进程
-      // 靠它把 run.log 写回本实例缓存目录；未设置时保持 Config.cache.dir（生产行为不变）。
-      // 仍走 resolveCacheDirInRoot 的根内校验，越界/符号链接逃逸照旧回退。
-      const fromEnv = typeof process.env.XBK_CACHE_DIR === 'string' ? process.env.XBK_CACHE_DIR.trim() : ''
       const configured = typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : fallback
-      const raw = fromEnv || configured
+      // XBK_CACHE_DIR（审查 #241 M1）：与青龙 `--status` / 控制台**同一套取值规则**——只采纳
+      // 绝对路径，相对路径告警一次并忽略（旧实现 `fromEnv || configured` 直接采纳，控制台按
+      // 「相对路径已忽略」回退默认目录，运行侧却真的写进 <root>/rel/cache：面板空 + 日志说反话）。
+      const fromEnv = cacheDirFromEnv(configured)
+      if (fromEnv) {
+        // 显式环境变量覆盖原样采纳（--status 侧同样原样采纳绝对路径，含项目根外路径）：
+        // 两侧解析必须一致，否则「控制台读 A、运行写 B」，运行历史/推送记录永远读空。
+        // 根内校验只约束 Config.cache.dir（配置文件），不约束这个显式部署开关。
+        return path.resolve(fromEnv)
+      }
       // P2/P3/C022 的根内校验与多级兜底统一实现于模块顶部的 resolveCacheDirInRoot；
       // 青龙 `--status` 复用同一函数（QX-08），两侧口径不再各写一份。
-      return resolveCacheDirInRoot({ fs, path, root: path.resolve(__dirname), raw, fallback })
+      return resolveCacheDirInRoot({ fs, path, root: path.resolve(__dirname), raw: configured, fallback })
     },
     _memoryCache: {},
     // 内存缓存实际键数（与 _memoryCache 同步维护，替代热路径上每次新键写都 Object.keys O(n)）

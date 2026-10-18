@@ -9,7 +9,7 @@
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useRef, useCallback } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
-import { relDay, cacheWriteInfo, isIssueLogLine, filterLogLines } from './pure.mjs'
+import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, filterRunItems, tabFromHash } from './pure.mjs'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -112,6 +112,14 @@ async function consumeJson (p, done) {
   p.then(() => {}, () => {}) // fetch reject（网络错）时由下方 done 兜底；正常路径在 body 消费后清
   try {
     const res = await p
+    if (res.status === 401) {
+      // 审查 #224：凭证失效必须让页面进入明确的「重新打开带 token 链接」状态，
+      // 否则轮询每 5s 继续打 401，页面只剩空壳。事件由 App 监听并停轮询。
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        window.dispatchEvent(new Event('xbk-auth-expired'))
+      }
+      throw new Error('凭证已失效（401）')
+    }
     if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
     try {
       return await readBodyJson(res)
@@ -194,12 +202,14 @@ function apiGetRunHistory ({ limit, before, windowKey } = {}) {
 // ── v3.297 扩展 API：推送记录 / 趋势 / 日志 / 系统 ────────────────────────────
 // 与上方端点同纪律：fetch 第一参数是纯字面量（查询参数经 URLSearchParams 编码后
 // 只进模板字符串的查询段，authority 恒为字面量——SSRF 启发式全绿形态）。
-function apiGetMessages ({ page, size, cate, q }) {
+function apiGetMessages ({ page, size, cate, q, days }) {
   const params = new URLSearchParams()
   if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
   if (Number.isSafeInteger(size) && size !== 20) params.set('size', String(size))
   if (typeof cate === 'string' && cate.length > 0) params.set('cate', cate)
   if (typeof q === 'string' && q.length > 0) params.set('q', q)
+  // 时间窗（v3.307）：0/未传=全部；1/3/7/30=近 N 个上海日历日（服务端白名单兜底）
+  if (Number.isSafeInteger(days) && days > 0) params.set('days', String(days))
   const qs = params.toString()
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
@@ -357,8 +367,8 @@ function PanelHead ({ title, sub, right, afterTitle }) {
 }
 
 // 按钮：variant 生成 `btn btn-<variant>`；修饰词（btn-danger/btn-busy）可拼进 variant。
-function Button ({ variant = 'secondary', disabled, onClick, title, children }) {
-  return html`<button class=${'btn btn-' + variant} disabled=${disabled} onClick=${onClick} title=${title}>${children}</button>`
+function Button ({ variant = 'secondary', disabled, onClick, title, buttonRef, children }) {
+  return html`<button ref=${buttonRef} class=${'btn btn-' + variant} disabled=${disabled} onClick=${onClick} title=${title}>${children}</button>`
 }
 
 // 指标卡：标题 + 右上角徽章 + 若干行文本。换卡片实现（或组件库）只改这里。
@@ -476,29 +486,76 @@ function diagCard (state) {
   }]
 }
 
+// ── 组件：首屏异常横幅（v3.307）────────────────────────────────────────────
+// 只在「最近一轮失败/中断」或「近 7 天有失败」时出现：用户打开控制台第一眼就知道
+// 有没有需要处理的事，并可直接跳到带筛选的日志（不再靠逐页翻逐轮历史）。
+function AlertBanner ({ state, onOpenLog }) {
+  if (!state) return null
+  const run = state.run && state.run.value ? state.run.value : null
+  const stats = state.stats && state.stats.status === 'ok' ? state.stats.value : null
+  const lastFail = stats ? stats.lastFailure : null
+  const orphan = run && typeof run.orphanFailures === 'number' ? run.orphanFailures : 0
+  const runBad = !!(run && (run.interrupted === true || (typeof run.failed === 'number' && run.failed > 0) || orphan > 0))
+  if (!runBad && !lastFail) return null
+  const at = orphan > 0 && run.orphanFailureAt ? run.orphanFailureAt : (runBad && run.at ? run.at : (lastFail ? lastFail.at : ''))
+  const text = orphan > 0 && !(run && (run.interrupted === true || run.failed > 0))
+    ? `运行日志有 ${orphan} 条失败行未归属任何轮次（独立崩溃，最近 ${run.orphanFailureAt || '时间未知'}）`
+    : (runBad
+        ? (run.failed > 0
+            ? `最近一轮推送失败 ${run.failed} 条（${run.at || '时间未知'}）`
+            : `最近一轮异常中断（${run.at || '时间未知'}）`)
+        : `近 7 天有失败：${lastFail.date} 推送失败 ${lastFail.failed} 条`)
+  return html`<div class="alert-banner" role="alert">
+    <span class="alert-dot" aria-hidden="true"></span>
+    <span class="alert-text">${text}</span>
+    <button type="button" class="alert-link" onClick=${() => onOpenLog && onOpenLog({ q: at.slice(0, 10), mode: 'issue' })}>查看日志 →</button>
+  </div>`
+}
+
 // ── 组件：状态卡片区 ────────────────────────────────────────────────────────
+// v3.307 信息层级：今日 / 近 7 天 / 最近一轮 / 通道与过滤。旧版「最近日报」与「最近一轮」
+// 两张卡都在讲最近一次，缺「今天怎么样、成功率多少」；现在日报压成今日卡的一行，
+// 过滤诊断并入通道卡，四张卡各答一个问题。
 function StatusCards ({ state }) {
   if (!state) return null
   const rep = state.report && state.report.value ? state.report.value : null
-  // Sourcery G_od/G_oY：三态判定走 partTone——missing=中性（文件还没建很正常），
-  // invalid/tooLarge=红（数据坏了必须看见），ok+健康=绿。
   const repTone = partTone(state.report, repIsOk(state))
   const run = state.run && state.run.value ? state.run.value : null
   const runTone = partTone(state.run, runIsOk(state))
   const chan = channelInfo(state)
-  // 日报只有跑过一轮才更新——标题写「最近日报」，日期附「今天/昨天」，避免凌晨看到
-  // 「今日日报 10-17」而今天已是 10-18 的错位（实测 2026-10-18 01:12）。
+  const stats = state.stats && state.stats.status === 'ok' ? state.stats.value : null
+  const today = stats ? stats.today : null
+  const week = stats ? stats.week : null
+  const diag = diagCard(state)[0] || null
+  const diagTone = diag ? diag.tone : 'run'
+  const diagLines = diag ? diag.lines : ['暂无记录']
   const repRel = rep ? relDay(rep.date) : ''
-
+  const rateText = (r) => (r && typeof r.successRate === 'number' ? `${(r.successRate * 100).toFixed(1)}%` : '—')
+  const todayTone = !today ? 'run' : (today.failed > 0 ? 'bad' : (today.rounds > 0 ? 'ok' : 'run'))
+  const weekTone = !week ? 'run' : (week.rounds > 0 && week.failed === 0 ? 'ok' : 'run')
+  const chanTone = (chan.tone === 'bad' || diagTone === 'bad') ? 'bad' : (chan.tone === 'ok' ? 'ok' : 'run')
+  const runAge = run ? ageFromStamp(run.at) : ''
   const cards = [
     {
-      title: '最近日报',
-      tone: repTone,
-      lines: rep
+      title: '今日',
+      tone: todayTone,
+      lines: today
         ? [
-            `日期 ${fmtNum(rep.date)}${repRel ? `（${repRel}）` : ''}`,
-            `轮数 ${fmtNum(rep.runs)} · 抓取 ${fmtNum(rep.total)}`,
-            `推送成功 ${fmtNum(rep.pushed)} · 失败 ${fmtNum(rep.failed)}`
+            `轮次 ${today.rounds} · 推送 ${today.pushed}`,
+            `失败 ${today.failed}${today.failed > 0 ? ' ⚠️' : ''} · 成功率 ${rateText(today)}`,
+            `日报 ${rep ? `${rep.date || '—'}${repRel ? `（${repRel}）` : ''} · ${repTone === 'ok' ? '正常' : repTone === 'bad' ? '异常' : '暂无'}` : '暂无'}`
+          ]
+        : ['暂无 run.log 数据']
+    },
+    {
+      title: '近 7 天',
+      tone: weekTone,
+      lines: week
+        ? [
+            `轮次 ${week.rounds} · 推送 ${week.pushed}`,
+            `失败 ${week.failed} · 成功率 ${rateText(week)}`,
+            `日均 ${(week.rounds / 7).toFixed(1)} 轮`,
+            ...(stats && stats.truncated ? ['⚠️ run.log 超窗，统计仅覆盖尾部'] : [])
           ]
         : ['暂无数据']
     },
@@ -507,20 +564,22 @@ function StatusCards ({ state }) {
       tone: runTone,
       lines: run
         ? [
-            `${fmtNum(run.at)}`,
-            `获取 ${fmtNum(run.total)} · 去重 ${fmtNum(run.dedup)} · 过滤 ${fmtNum(run.filtered)}`,
-            `推送 ${fmtNum(run.pushed)} · 失败 ${fmtNum(run.failed)} · 耗时 ${fmtNum(run.elapsed)}`
+            `${runAge || '时间未知'}${run.at ? ` · ${run.at.slice(5, 16)}` : ''}`,
+            `获取 ${fmtNum(run.total)} · 推送 ${fmtNum(run.pushed)} · 失败 ${fmtNum(run.failed)}`,
+            `耗时 ${fmtNum(run.elapsed)}${run.interrupted ? ' · ⚠️ 中断' : ''}`
           ]
         : ['暂无数据']
     },
     {
-      title: '推送通道',
-      tone: chan.tone,
-      lines: chan.entries.length > 0
-        ? chan.entries.map((e) => `${e.name}：连续失败 ${fmtNum(e.failures)} 次`)
-        : [chan.note || '暂无记录']
-    },
-    ...diagCard(state)
+      title: '通道与过滤',
+      tone: chanTone,
+      lines: [
+        ...(chan.entries.length > 0
+          ? [...chan.entries.map((e) => `${e.name}：连续失败 ${fmtNum(e.failures)} 次`), ...(chan.note ? [chan.note] : [])]
+          : [chan.note || '暂无记录']),
+        ...diagLines.map((l) => `过滤：${l}`)
+      ]
+    }
   ]
   return html`<div class="cards">
     ${cards.map((c) => html`<${Card} key=${c.title} title=${c.title}
@@ -533,13 +592,46 @@ function StatusCards ({ state }) {
 // ── 组件：触发按钮 ──────────────────────────────────────────────────────────
 const ACTION_DEFS = [
   { key: 'dry-run', label: '试运行', desc: '抓取但不推送', cls: 'btn-secondary' },
-  { key: 'run', label: '正式运行一轮', desc: '抓取并真实推送', cls: 'btn-primary' },
+  { key: 'run', label: '正式运行一轮', desc: '抓取并真实推送', cls: 'btn-danger-solid' },
   { key: 'check', label: '环境检查', desc: '不抓取不推送', cls: 'btn-secondary' },
   { key: 'notify-test', label: '通知自检', desc: '向全部渠道发一条测试消息（真实推送）', cls: 'btn-secondary' }
 ]
 
+// ── 组件：危险动作二次确认（v3.307）────────────────────────────────────────
+// 「正式运行一轮」「通知自检」会真实推送，之前是蓝色主按钮一键触发、警示文案在页脚
+// （桌面隔 1100px、手机更远）。现在弹窗列出真实目的地，默认焦点在「取消」。
+function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, children }) {
+  const cancelRef = useRef(null)
+  useEffect(() => {
+    if (!open) return undefined
+    const onKey = (e) => { if (e.key === 'Escape') onCancel() }
+    document.addEventListener('keydown', onKey)
+    const t = setTimeout(() => { if (cancelRef.current) cancelRef.current.focus() }, 0)
+    return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
+  }, [open, onCancel])
+  if (!open) return null
+  return html`<div class="modal-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCancel() }}>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+      <div class="modal-title" id="confirm-title">${title}</div>
+      <div class="modal-body">${children}</div>
+      <div class="modal-actions">
+        <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${onCancel}>取消<//>
+        <${Button} variant="danger-solid" disabled=${busy} onClick=${onConfirm}>${confirmLabel}<//>
+      </div>
+    </div>
+  </div>`
+}
+
 function TriggerBar ({ onTriggered, locking, setBusy }) {
   const [err, setErr] = useState('')
+  // 待确认的真实推送动作（null = 无弹窗）；dry-run/check 不弹窗，直接执行。
+  const [pending, setPending] = useState(null)
+  // 确认框里的渠道名必须来自「当前配置」，不能拿 channel-health 历史凑数——配置改过之后
+  // 历史里可能是已删除的渠道（Sourcery 确认框列错渠道）。null = 还没拉到，用模糊文案。
+  const [configuredNames, setConfiguredNames] = useState(null)
+  const channelText = Array.isArray(configuredNames)
+    ? (configuredNames.length > 0 ? configuredNames.join('、') : '未配置任何渠道')
+    : '所有已配置渠道（以「配置」页为准）'
   const doTrigger = useCallback(async (action) => {
     setErr('')
     setBusy(true)
@@ -549,8 +641,8 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
       // 否则 busy 状态丢 run 关联（自检 202 的 string id 被误判为 null）。
       const data = action === 'notify-test' ? await triggerNotifyTest() : await trigger(action)
       onTriggered(data && typeof data.id === 'string' ? data.id : null)
-      // busy 不在此处清零（Sourcery vvo）：202 只代表已受理，子进程还在跑；
-      // App 的「提交轮进历史」派生 + BUSY_FALLBACK 兜底负责解锁。
+      // busy 不在此处清零（Sourcery vvo）：202 只代表已受理，子进程还在跑；App 的
+      // 「提交轮进历史」派生 + BUSY_FALLBACK 兜底负责解锁。
     } catch (e) {
       // 幂等重放窗命中（服务端 replayBlocked）：首轮已受理，提示后立即刷新历史
       // 并解锁——这与「提交失败」不同，不该锁按钮。
@@ -571,16 +663,42 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
     }
   }, [onTriggered, setBusy])
 
+  const ask = (action) => {
+    setErr('')
+    // 只有真实推送需要确认；试运行与环境检查立即执行
+    if (action === 'run' || action === 'notify-test') {
+      setPending(action)
+      setConfiguredNames(null)
+      // 配置页同源接口（脱敏）：只取渠道名，取不到就退回模糊文案，绝不猜。
+      apiGetConfig().then((v) => {
+        const names = v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : []
+        setConfiguredNames(names)
+      }).catch(() => setConfiguredNames(null))
+    } else doTrigger(action)
+  }
+  const confirmPending = () => {
+    const action = pending
+    setPending(null)
+    if (action) doTrigger(action)
+  }
   return html`<div class="panel">
     <${PanelHead} title="手动触发" />
     <div class="btn-row">
       ${ACTION_DEFS.map((a) => html`<div class="btn-item" key=${a.key}>
-        <button class="btn ${a.cls}" disabled=${locking} onClick=${() => doTrigger(a.key)}>${a.label}</button>
+        <button class="btn ${a.cls}" disabled=${locking} onClick=${() => ask(a.key)}>${a.label}</button>
         <span class="btn-desc">${a.desc}</span>
       </div>`)}
     </div>
     ${locking && html`<${Hint}><span class="spin"></span> 任务进行中…（完成后自动解锁）<//>`}
     ${err && html`<${Hint} tone="error">${err}<//>`}
+    <${ConfirmDialog} open=${pending !== null}
+      title=${pending === 'run' ? '确认正式运行一轮？' : '确认发送通知自检？'}
+      confirmLabel=${pending === 'run' ? '确认真实推送' : '确认发送'}
+      busy=${locking} onConfirm=${confirmPending} onCancel=${() => setPending(null)}>
+      ${pending === 'run'
+        ? html`<div>将抓取线报并<b>真实推送</b>到：${channelText}。</div><div class="modal-note">推送发出后无法撤回；只想验证抓取流程请用「试运行」（不推送）。</div>`
+        : html`<div>将向全部渠道发送一条<b>真实测试消息</b>：${channelText}。</div><div class="modal-note">这条消息会出现在你的微信/推送客户端里。</div>`}
+    <//>
   </div>`
 }
 
@@ -645,8 +763,12 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
       }
     }
     // 切回前台立即补一拍（不依赖 interval 的下一 tick；隐藏期间已跳过所有详情请求）。
+    // SSE 模式不能 fetchOnce：它会领号 ++detailSeqRef，令已建流的所有回调因代次不符被丢弃，
+    // 运行中日志就此冻结（审查 #248）。SSE 模式下只需刷新 runs 徽章，详情交给流继续推。
     const onVisibility = () => {
-      if (!dead && document.visibilityState === 'visible') fetchOnce().catch(() => {})
+      if (dead || document.visibilityState !== 'visible') return
+      if (openActive) { onRefreshRef.current(); return }
+      fetchOnce().catch(() => {})
     }
     document.addEventListener('visibilitychange', onVisibility)
     const startPolling = () => {
@@ -796,132 +918,108 @@ function RunsPanel ({ runs, pollMs, onRefresh }) {
   </div>`
 }
 
-// ── 组件：逐轮运行历史（v3.299 批次②）────────────────────────────────────────
-// run.log 摘要行解析（服务端 /api/run-history），时间倒序 + before 游标分页。
-// 分页口径：每页 N 条（2/3/5/10），上一页/下一页按游标栈回放，不累积 DOM。
-// 两个稳定性约定（评审 #243）：
-//   ① 游标只在「请求成功」后提交——加载失败时页面与游标保持原样，不会让旧行冒充新页；
-//   ② 回第 1 页/刷新会丢弃后续页游标——追加新轮次后旧游标可能跳过被挤出页的行；
-//      服务端另用尾窗指纹（win）兜底：窗口平移时返回 stale，前端自动回第 1 页。
+// ── 组件：逐轮运行历史（v3.307 改版）────────────────────────────────────────
+// 旧版用 before 游标 + 每页 2/3/5/10 条：180 行日志要翻 30+ 页，找某天的失败轮只能一页页点。
+// 现在一次取尾窗最近 200 轮（服务端上限），在前端做「只看失败/中断」「按日期」筛选与页码分页；
+// 数据量小（≤200 条），换来的是「跳日期、看失败、点日志」三件事都能直接做。
+// 尾窗指纹/stale 语义仍由服务端保留（本组件只发一次 limit=200，不翻游标）。
 const RUN_PAGE_SIZES = [2, 3, 5, 10]
+const RUN_FETCH_LIMIT = 200
 
-function RunHistoryPanel () {
-  const [size, setSize] = useState(5)
-  const [stack, setStack] = useState([0]) // 每页起点游标（stack[pos] 为当前页 before）
-  const [pos, setPos] = useState(0)
-  const [page, setPage] = useState({ items: [], hasMore: false, truncated: false, status: null })
+function RunHistoryPanel ({ onOpenLog }) {
+  const [size, setSize] = useState(10)
+  const [mode, setMode] = useState('all')
+  const [day, setDay] = useState('')
+  const [pageNo, setPageNo] = useState(1)
+  const [data, setData] = useState(null)
   const [err, setErr] = useState('')
-  const [note, setNote] = useState('')
   const [loading, setLoading] = useState(false)
   const seqRef = useRef(0)
-  const winRef = useRef('')
-  const skipEffectRef = useRef(false)
 
-  const fetchPage = useCallback(async (before, lim) => {
+  const load = useCallback(async () => {
     const seq = ++seqRef.current
     setLoading(true)
     try {
-      const d = await apiGetRunHistory({ limit: lim, before, windowKey: winRef.current })
-      if (seq !== seqRef.current) return null
+      const d = await apiGetRunHistory({ limit: RUN_FETCH_LIMIT })
+      if (seq !== seqRef.current) return
+      setData(d)
       setErr('')
-      winRef.current = typeof d.windowKey === 'string' ? d.windowKey : ''
-      if (d.status === 'stale') {
-        setNote('期间有新轮次写入（日志尾窗平移），已回到第 1 页')
-        return { stale: true }
-      }
-      setNote('')
-      return d
     } catch (e) {
       if (seq === seqRef.current) setErr(`加载失败：${e.message}`)
-      return null
     } finally {
       if (seq === seqRef.current) setLoading(false)
     }
   }, [])
+  useEffect(() => { load().catch(() => {}) }, [load])
 
-  const loadFirst = useCallback(async (lim) => {
-    let d = await fetchPage(0, lim)
-    if (!d) return
-    if (d.stale) d = await fetchPage(0, lim) // 指纹已更新，重拉第 1 页
-    if (!d || d.stale || !d.items) return
-    setStack([0])
-    setPos(0)
-    setPage(d)
-  }, [fetchPage])
-
-  useEffect(() => {
-    if (skipEffectRef.current) { skipEffectRef.current = false; return }
-    loadFirst(size).catch(() => {})
-  }, [loadFirst, size])
-
-  const shown = page.status === 'ok' ? page.items : []
-  const goNext = async () => {
-    if (!page.hasMore || shown.length === 0 || loading) return
-    const cursor = shown[shown.length - 1].lineNo - 1
-    const d = await fetchPage(cursor, size)
-    if (!d) return
-    if (d.stale) { await loadFirst(size); return }
-    setPage(d)
-    setStack((prev) => [...prev.slice(0, pos + 1), cursor])
-    setPos(pos + 1)
-  }
-  const goPrev = async () => {
-    if (pos <= 0 || loading) return
-    const d = await fetchPage(stack[pos - 1], size)
-    if (!d) return
-    if (d.stale) { await loadFirst(size); return }
-    setPage(d)
-    setStack(stack.slice(0, pos)) // 后续页游标作废：重新进入时按新边界重算
-    setPos(pos - 1)
-  }
-  const changeSize = async (n) => {
-    if (n === size || loading) return
-    const d = await fetchPage(0, n)
-    if (!d) return // 失败：保持原页与原条数（不拿旧行冒充新页）
-    if (d.stale) {
-      skipEffectRef.current = true
-      setSize(n); setStack([0]); setPos(0)
-      await loadFirst(n)
-      return
-    }
-    skipEffectRef.current = true
+  const all = data && data.status === 'ok' && Array.isArray(data.items) ? data.items : []
+  const issueCount = filterRunItems(all, { mode: 'issue' }).length
+  const filtered = filterRunItems(all, { mode, day })
+  const pages = Math.max(1, Math.ceil(filtered.length / size))
+  const current = Math.min(pageNo, pages)
+  // 数据变少（筛选/刷新）时把页码收回有效区间；不在渲染期 setState。
+  useEffect(() => { if (pageNo > pages) setPageNo(pages) }, [pageNo, pages])
+  const shown = filtered.slice((current - 1) * size, current * size)
+  const changeSize = (n) => {
+    if (n === size) return
     setSize(n)
-    setStack([0])
-    setPos(0)
-    setPage(d)
+    setPageNo(1)
+  }
+  const refresh = () => { setPageNo(1); load().catch(() => {}) }
+  const changeDay = (v) => { setDay(v); setPageNo(1) }
+  const jumpLog = (r) => {
+    if (!onOpenLog || typeof r.at !== 'string' || r.at.length < 10) return
+    // 单轮「日志」= 看这一天的完整日志（含摘要/告警/错误）；要只看异常，进日志页点「异常」。
+    onOpenLog({ q: r.at.slice(0, 10), mode: 'all' })
   }
   return html`<div class="panel">
     <${PanelHead} title="逐轮运行历史"
-      sub=${'run.log 摘要逐轮' + (page.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : '')}
+      sub=${`run.log 摘要逐轮 · 最近 ${all.length} 轮` + (data && data.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : '')}
       right=${html`<div class="toolbar">
         <select class="msg-select" value=${size} onChange=${(e) => changeSize(Number(e.target.value))} aria-label="每页显示条数">
           ${RUN_PAGE_SIZES.map((n) => html`<option key=${n} value=${n}>每页 ${n} 条</option>`)}
         </select>
-        <${Button} variant="ghost" onClick=${() => loadFirst(size)} disabled=${loading}>刷新<//>
+        <${Button} variant="ghost" onClick=${refresh} disabled=${loading}>刷新<//>
       </div>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
-    ${note && html`<${Hint}>${note}<//>`}
-    ${page.status && page.status !== 'ok' && html`<div class="empty">run.log${page.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${page.status}）`}</div>`}
+    ${data && data.status === 'ok' && html`<div class="run-tools">
+      <div class="log-chips" role="group" aria-label="逐轮筛选">
+        <button type="button" class=${'log-chip' + (mode === 'all' ? ' on' : '')}
+          aria-pressed=${mode === 'all' ? 'true' : 'false'} onClick=${() => { setMode('all'); setPageNo(1) }}>全部 ${all.length}</button>
+        <button type="button" class=${'log-chip' + (mode === 'issue' ? ' on' : '')}
+          aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => { setMode('issue'); setPageNo(1) }}>只看失败/中断 ${issueCount}</button>
+      </div>
+      <label class="run-day">
+        <span>日期</span>
+        <input type="date" value=${day} onInput=${(e) => changeDay(e.target.value)} onChange=${(e) => changeDay(e.target.value)} aria-label="按日期筛选轮次" />
+      </label>
+      ${day !== '' && html`<button type="button" class="log-chip on" onClick=${() => changeDay('')}>清除日期</button>`}
+      <span class="run-tools-note">${mode === 'issue' ? '只显示失败或中断的轮次' : '点行尾「日志」跳到该日日志'}</span>
+    </div>`}
+    ${data && data.status && data.status !== 'ok' && html`<div class="empty">run.log${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
     ${shown.length > 0 && html`<div class="runs-scroll"><table class="runs-table">
       <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
       <tbody>
         ${shown.map((r, i) => html`<tr key=${`${r.at}-${r.lineNo}-${i}`}>
-          <td class="mono">${r.interrupted ? `${r.at || '—'} ⚠️中断` : (r.at || '—')}</td>
+          <td class="mono">${r.cancelled === true ? `${r.at || '—'} ⏹已取消` : r.interrupted ? `${r.at || '—'} ⚠️中断` : (r.at || '—')}</td>
           <td>${r.total === null ? '—' : r.total}</td>
           <td>${r.dedup === null ? '—' : r.dedup}</td>
           <td>${r.filtered === null ? '—' : r.filtered}</td>
           <td>${r.dryRun !== null ? `试跑 ${r.dryRun}` : r.pushed}</td>
           <td>${r.failed > 0 ? html`<span class="sync-err">${r.failed}</span>` : r.failed}</td>
           <td class="mono">${r.elapsed || '—'}</td>
-          <td>${r.cachesaved === 0 ? '未落盘' : ''}</td>
+          <td class="run-actions">${r.cachesaved === 0 ? html`<span class="run-note">未落盘</span>` : ''}
+            <button type="button" class="row-link" disabled=${!r.at} onClick=${() => jumpLog(r)}>日志</button></td>
         </tr>`)}
       </tbody>
     </table></div>`}
-    ${page.status === 'ok' && shown.length === 0 && html`<div class="empty">日志尾窗内没有摘要行</div>`}
-    ${page.status === 'ok' && (shown.length > 0 || pos > 0) && html`<div class="pager">
-      <${Button} disabled=${pos <= 0 || loading} onClick=${goPrev}>上一页<//>
-      <span class="pager-info">第 ${pos + 1} 页${page.hasMore ? '' : '（最后一页）'}</span>
-      <${Button} disabled=${!page.hasMore || loading} onClick=${goNext}>${loading ? '加载中…' : '下一页'}<//>
+    ${data && data.status === 'ok' && filtered.length === 0 && html`<div class="empty">${all.length === 0 ? '日志尾窗内没有摘要行' : '没有匹配的轮次'}</div>`}
+    ${filtered.length > 0 && html`<div class="pager">
+      <${Button} disabled=${current <= 1 || loading} onClick=${() => setPageNo(1)}>« 首页<//>
+      <${Button} disabled=${current <= 1 || loading} onClick=${() => setPageNo(current - 1)}>上一页<//>
+      <span class="pager-info">第 ${current} / ${pages} 页 · 共 ${filtered.length} 条</span>
+      <${Button} disabled=${current >= pages || loading} onClick=${() => setPageNo(current + 1)}>下一页<//>
+      <${Button} disabled=${current >= pages || loading} onClick=${() => setPageNo(pages)}>末页 »<//>
     </div>`}
   </div>`
 }
@@ -1022,17 +1120,21 @@ function TrendsPanel () {
 // 进概览页拉一次 + 手动刷新，不进 5s 主轮询（墓碑解析最坏 8MiB，不与状态轮询抢盘）。
 // 条数维度：服务端在响应里附带 entryCount（readMessageCount，与 /api/messages 同一
 // 32MiB 封顶与防御；tooLarge 时 null 如实显示），对照 limits.entryMax 预警。
-function CacheHealthPanel () {
+function CacheHealthPanel ({ paused = false }) {
   const { data, err, load } = usePanelLoader(apiGetCacheHealth)
-  useEffect(() => { load().catch(() => {}) }, [load])
+  // 右列状态文件（v3.307）：缓存健康面板原来只占左半 451px，右边 460px 空白；
+  // 系统页的「缓存目录文件」在这里给一份紧凑版（前 8 项），整页仍保留全量清单。
+  const filesLoader = usePanelLoader(apiGetFiles)
+  useEffect(() => { load().catch(() => {}); filesLoader.load().catch(() => {}) }, [load, filesLoader.load])
   // 缓存健康随概览常开：每分钟（且切回前台时）重拉一次，避免「页面开着过夜、mtime 早已更新
   // 但面板还拿着旧快照」；1 分钟一次只读小 JSON，不与 5s 主轮询抢盘。
   useEffect(() => {
+    if (paused) return undefined
     const t = setInterval(() => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }, 60000)
     const onVis = () => { if (document.visibilityState === 'visible') load().catch(() => {}) }
     document.addEventListener('visibilitychange', onVis)
     return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVis) }
-  }, [load])
+  }, [load, paused])
   const ok = data && data.status === 'ok'
   const ratioText = ok && data.writeRatio != null ? `${(data.writeRatio * 100).toFixed(1)}%` : '—'
   const tomb = data && data.tombstone ? data.tombstone : null
@@ -1048,6 +1150,7 @@ function CacheHealthPanel () {
   // 会裁最旧条目（与字节裁剪同一出口）。
   const entryNear = ok && typeof data.entryCount === 'number' && data.entryCount >= data.limits.entryMax * 0.8
   const entryOver = ok && typeof data.entryCount === 'number' && data.entryCount >= data.limits.entryMax
+  const files = filesLoader.data && Array.isArray(filesLoader.data.files) ? filesLoader.data.files : []
   return html`<div class="panel">
     <${PanelHead} title="缓存健康" sub=${(data && data.file ? data.file : 'push.json') + ' · 判重缓存占用'}
       right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
@@ -1060,10 +1163,23 @@ function CacheHealthPanel () {
         <tr><td>条目数</td><td>${ok && typeof data.entryCount === 'number' ? `${data.entryCount} / ${data.limits.entryMax} 条上限${entryOver ? ' · ⛔ 已达上限，旧记录将被裁剪' : entryNear ? ' · ⚠️ 临近条目上限' : ''}` : `上限 ${data.limits.entryMax} 条${ok && data.entryCountStatus === 'tooLarge' ? '（当前条数不可得：缓存超控制台读取封顶）' : '（进推送记录页获取当前条数）'}`}</td></tr>
         <tr><td>控制台可读</td><td title=${readableTitle}>${readableText}</td></tr>
       </tbody></table>
+      <div class="cache-side">
       <table class="sys-table"><tbody>
-        <tr><td>墓碑状态</td><td>${tomb ? (tomb.status === 'ok' ? '正常' : tomb.status === 'missing' ? '尚未生成（首轮前正常）' : `异常（${tomb.status}）`) : '—'}${tomb && tomb.status === 'ok' ? ` · ${tomb.counts.total} 键` : ''}</td></tr>
+        <tr><td>墓碑状态</td><td>${tomb ? (tomb.status === 'ok' ? '正常' : tomb.status === 'missing' ? '尚未生成（未发生过裁剪时正常）' : `异常（${tomb.status}）`) : '—'}${tomb && tomb.status === 'ok' ? ` · ${tomb.counts.total} 键` : ''}</td></tr>
         <tr><td>最近写入</td><td>${data.mtimeMs ? `${fmtTime(data.mtimeMs)}${write.ageText ? ` · ${write.ageText}` : ''}` : '—'}${write.stale ? ' · 超过 24 小时未写入缓存' : ''}</td></tr>
       </tbody></table>
+      <div class="cache-files">
+        <div class="cache-files-head"><span>状态目录文件</span><button type="button" class="row-link" onClick=${filesLoader.load}>刷新</button></div>
+        ${files.length === 0
+          ? html`<div class="cache-files-empty">${filesLoader.err ? '文件清单加载失败' : '暂无文件'}</div>`
+          : html`<table class="sys-table compact"><tbody>
+            ${files.slice(0, 8).map((f) => html`<tr key=${f.name}>
+              <td class="mono">${f.name}</td>
+              <td>${f.kind === 'file' ? fmtBytes(f.bytes) : f.kind === 'symlink' ? '⚠️ 符号链接' : f.kind}</td>
+            </tr>`)}
+          </tbody></table>`}
+      </div>
+      </div>
     </div>`}
     ${ok && (data.nearTrim || data.overLimit || !data.consoleReadable) && html`<${Hint} style="margin-top:10px">占用达到写端上限 80% 时，下一轮保存会自动裁掉最旧条目并落墓碑——无需人工干预，但如果你希望保留更久，检查推送频率与 maxPerRun 配置。<//>`}
   </div>`
@@ -1308,6 +1424,7 @@ function MessagesPanel () {
   const [page, setPage] = useState(1)
   const [size, setSize] = useState(20)
   const [cate, setCate] = useState('')
+  const [days, setDays] = useState(0)
   const [input, setInput] = useState('')
   const [query, setQuery] = useState('')
   const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
@@ -1320,9 +1437,9 @@ function MessagesPanel () {
   const fetchMessages = useCallback(
     () => {
       sentQueryRef.current = query
-      return apiGetMessages({ page, size, cate, q: query })
+      return apiGetMessages({ page, size, cate, q: query, days })
     },
-    [page, size, cate, query])
+    [page, size, cate, query, days])
   const { data, err, load, loading } = usePanelLoader(fetchMessages)
   useEffect(() => { load().catch(() => {}) }, [load])
   // 搜索框回车 / 刷新前先把未落地的输入立刻生效，避免「刚打完字点刷新，还是旧结果」。
@@ -1346,6 +1463,7 @@ function MessagesPanel () {
     const body = new URLSearchParams({ format })
     if (typeof cate === 'string' && cate.length > 0) body.set('cate', cate)
     if (typeof query === 'string' && query.length > 0) body.set('q', query)
+    if (Number.isSafeInteger(days) && days > 0) body.set('days', String(days))
     // page/size 不发送：导出=筛选结果全量（服务端亦不读取）。
     const { merged, done } = timedRequest({
       method: 'POST',
@@ -1394,9 +1512,14 @@ function MessagesPanel () {
       if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, 60000)
       setExporting('')
     }
-  }, [exporting, cate, query])
+  }, [exporting, cate, query, days])
   const items = data && Array.isArray(data.items) ? data.items : []
   const categories = data && Array.isArray(data.categories) ? data.categories : []
+  // 分类弹层的「全部分类」计数必须跟时间窗走（服务端 days>0 时 categories 已按窗口重算）；
+  // 直接用 grandTotal 会在「今天」里显示全量 374，看起来像筛选没生效。
+  const cateTotal = data && Array.isArray(data.categories)
+    ? data.categories.reduce((sum, c) => sum + (typeof c.count === 'number' ? c.count : 0), 0)
+    : null
   // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，
   // 但只在「响应确实属于当前查询、且用户没有继续输入」时回写；
   // 否则旧响应会把刚打的新词覆盖回旧值（搜索像没生效）。
@@ -1415,8 +1538,15 @@ function MessagesPanel () {
         onInput=${(e) => setInput(e.target.value)}
         onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); refreshNow() } }} />
       <${CategoryPicker} value=${cate} categories=${categories}
-        total=${data && typeof data.grandTotal === 'number' ? data.grandTotal : null}
+        total=${cateTotal}
         onChange=${(v) => { setCate(v); setPage(1) }} />
+      <select class="msg-select" value=${days} onChange=${(e) => { setDays(Number(e.target.value)); setPage(1) }} aria-label="时间范围">
+        <option value="0">全部时间</option>
+        <option value="1">今天</option>
+        <option value="3">近 3 天</option>
+        <option value="7">近 7 天</option>
+        <option value="30">近 30 天</option>
+      </select>
       <select class="msg-select" value=${size} onChange=${(e) => { setSize(Number(e.target.value)); setPage(1) }} aria-label="每页显示条数">
         ${[10, 20, 50, 100].map((n) => html`<option key=${n} value=${n}>每页 ${n} 条</option>`)}
       </select>
@@ -1436,7 +1566,13 @@ function MessagesPanel () {
         : html`<div class="msg-list">
           ${items.map((m) => html`<div class="msg-item" key=${m.rowKey}>
             <div class="msg-item-head">
-              <span class="msg-title" onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}>${m.title || '（无标题）'}</span>
+              <span class="msg-title" role="button" tabindex="0"
+                aria-expanded=${expanded === m.rowKey ? 'true' : 'false'}
+                title=${expanded === m.rowKey ? '收起正文' : '点击展开正文'}
+                onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}
+                onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(expanded === m.rowKey ? null : m.rowKey) } }}>
+                <span class="msg-caret" aria-hidden="true">${expanded === m.rowKey ? '▾' : '▸'}</span>${m.title || '（无标题）'}
+              </span>
               ${m.price !== null ? html`<span class="msg-price">¥${m.price}</span>` : ''}
             </div>
             <div class="msg-meta">
@@ -1460,15 +1596,16 @@ function MessagesPanel () {
 
 // 运行日志：run.log 尾部（服务端 1MiB 上限），进页拉一次 + 手动刷新；有任务在跑时跟随轮询。
 // 异常口径与筛选在 pure.mjs（isIssueLogLine / filterLogLines），组件与测试共用。
-function LogsPanel ({ pollMs }) {
+function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all' }) {
   const { data, err, load } = usePanelLoader(apiGetLogs)
   const preRef = useRef(null)
   const stickRef = useRef(true)
   const prevTextRef = useRef('')
-  // 日志筛选（v3.306）：run.log 尾部最多 1 MiB，排障时先按「异常」收窄；纯客户端过滤，
-  // 不发新请求。异常口径含 ERROR/ALERT/WARN、中文「失败」与 failed>0 的摘要行。
-  const [mode, setMode] = useState('all')
-  const [q, setQ] = useState('')
+  // 日志筛选（v3.307）：run.log 尾部最多 1 MiB，排障时先按级别收窄；纯客户端过滤，
+  // 不发新请求。默认「异常」已排除控制台生命周期行（旧口径 123 条异常里 119 条是它）。
+  const [mode, setMode] = useState(initialMode)
+  const [q, setQ] = useState(initialQuery)
+  useEffect(() => { setMode(initialMode); setQ(initialQuery) }, [initialMode, initialQuery])
   useEffect(() => {
     load().catch(() => {})
     // 页面在后台时不轮询（切回前台立即补一次）：控制台常驻标签页也不该整夜每 5s 读盘。
@@ -1488,10 +1625,18 @@ function LogsPanel ({ pollMs }) {
   }, [load, pollMs])
   const rawText = data && data.status === 'ok' && typeof data.text === 'string' ? data.text : ''
   const lines = filterLogLines(rawText, 'all', '')
-  const issueCount = lines.filter((l) => isIssueLogLine(l)).length
+  const counts = logLineCounts(rawText)
   const kw = q.trim().toLowerCase()
   const filtered = filterLogLines(rawText, mode, q)
   const shownText = filtered.join('\n')
+  const LOG_MODES = [
+    ['all', '全部', counts.all],
+    ['issue', '异常', counts.issue],
+    ['error', '错误', counts.error],
+    ['alert', '告警', counts.alert],
+    ['summary', '摘要', counts.summary],
+    ['console', '控制台', counts.console]
+  ]
   // 首屏与「原本就在底部」时跟随最新日志；用户上翻查看历史时不抢滚动位置。
   // 手动「刷新」与日志从不可读恢复时强制回到底部，避免「刷新后仍停在旧位置」。
   useEffect(() => {
@@ -1522,15 +1667,14 @@ function LogsPanel ({ pollMs }) {
     ${data && data.status === 'ok' && html`<div>
       <div class="log-tools">
         <div class="log-chips" role="group" aria-label="日志筛选">
-          <button type="button" class=${'log-chip' + (mode === 'all' ? ' on' : '')}
-            aria-pressed=${mode === 'all' ? 'true' : 'false'} onClick=${() => pickMode('all')}>全部 ${lines.length}</button>
-          <button type="button" class=${'log-chip' + (mode === 'issue' ? ' on' : '')}
-            aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => pickMode('issue')}>异常 ${issueCount}</button>
+          ${LOG_MODES.map(([key, label, n]) => html`
+            <button type="button" key=${key} class=${'log-chip' + (mode === key ? ' on' : '')}
+              aria-pressed=${mode === key ? 'true' : 'false'} onClick=${() => pickMode(key)}>${label} ${n}</button>`)}
         </div>
         <input class="msg-search log-search" type="search" placeholder="搜索日志…" aria-label="搜索日志"
           value=${q} onInput=${(e) => { stickRef.current = true; setQ(e.target.value) }} />
       </div>
-      <div class="log-count">${mode === 'issue' || kw !== '' ? `显示 ${filtered.length} / ${lines.length} 行` : `共 ${lines.length} 行`}</div>
+      <div class="log-count">${mode !== 'all' || kw !== '' ? `显示 ${filtered.length} / ${lines.length} 行` : `共 ${lines.length} 行`}${mode === 'issue' ? ' · 已排除控制台停止记录' : ''}</div>
       <pre class="logpre" ref=${preRef} onScroll=${onLogScroll}>${filtered.length > 0 ? shownText : (lines.length === 0 ? '（空）' : '（没有匹配的日志行）')}</pre>
     </div>`}
   </div>`
@@ -1715,7 +1859,16 @@ function App () {
   const [busy, setBusy] = useState(false)
   const [lastSync, setLastSync] = useState(null)
   const [syncErr, setSyncErr] = useState('')
-  const [tab, setTab] = useState('overview')
+  // 标签页写 hash（v3.307）：刷新/后退不丢当前页；初始值从 hash 读，非法值回概览。
+  const [tab, setTab] = useState(() => tabFromHash(window.location.hash))
+  // 跳日志请求：{q, mode, n}。n 只用来做 key，重复点同一行也能强制重挂载。
+  const [logJump, setLogJump] = useState(null)
+  // 自动刷新开关（v3.307）：默认开；暂停后顶部倒计时停住，手动「继续」恢复。
+  const [autoRefresh, setAutoRefresh] = useState(true)
+  // 凭证失效（审查 #224）：任一 API 401 ⇒ 停轮询并显示自助恢复提示，不再每 5s 空打。
+  const [authExpired, setAuthExpired] = useState(false)
+  const [nextAt, setNextAt] = useState(0)
+  const [nowMs, setNowMs] = useState(Date.now())
   const timerRef = useRef(null)
   const seqRef = useRef(0)
   // 轮询互斥（Sourcery G_oY）：上一轮未完成时跳过本轮 tick，不在途中叠加新请求
@@ -1773,6 +1926,13 @@ function App () {
   const locking = busy || active
 
   useEffect(() => {
+    const onAuth = () => setAuthExpired(true)
+    window.addEventListener('xbk-auth-expired', onAuth)
+    return () => window.removeEventListener('xbk-auth-expired', onAuth)
+  }, [])
+
+  useEffect(() => {
+    if (authExpired) return undefined
     refreshSplit()
     clearInterval(timerRef.current)
     // 概览与运行日志需要状态新鲜（日志的 pollMs 取决于 task 是否在跑）；
@@ -1780,15 +1940,50 @@ function App () {
     // 切回需要的页时会立即补一次 refreshSplit。
     if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)
     // 页面在后台时不轮询（切回前台立即补一次）：控制台标签页常驻也不该整夜打接口。
-    const tick = () => { if (document.visibilityState !== 'hidden') refreshSplit() }
-    timerRef.current = setInterval(tick, locking ? POLL_BUSY_MS : POLL_MS)
-    const onVis = () => { if (document.visibilityState === 'visible') refreshSplit() }
+    // 暂停（autoRefresh=false）同样不建定时器；恢复时本 effect 重跑并立即补一次。
+    if (!autoRefresh) return () => clearInterval(timerRef.current)
+    const interval = locking ? POLL_BUSY_MS : POLL_MS
+    const mark = () => setNextAt(Date.now() + interval)
+    const tick = () => {
+      if (document.visibilityState !== 'hidden') {
+        refreshSplit()
+        mark()
+      }
+    }
+    timerRef.current = setInterval(tick, interval)
+    mark()
+    const onVis = () => { if (document.visibilityState === 'visible') { refreshSplit(); mark() } }
     document.addEventListener('visibilitychange', onVis)
     return () => {
       clearInterval(timerRef.current)
       document.removeEventListener('visibilitychange', onVis)
     }
-  }, [refreshSplit, locking, tab])
+  }, [refreshSplit, locking, tab, autoRefresh, authExpired])
+
+  // 倒计时秒数：每秒重渲染一次顶栏；只在概览/日志且自动刷新开启时跑。
+  useEffect(() => {
+    if (!autoRefresh || (tab !== 'overview' && tab !== 'logs')) return undefined
+    const t = setInterval(() => setNowMs(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [autoRefresh, tab])
+
+  // hash 路由（v3.307）：首次进入补 #/overview；前进/后退跟着切页。
+  useEffect(() => {
+    const onHash = () => { setTab(tabFromHash(window.location.hash)); window.scrollTo(0, 0) }
+    if (!window.location.hash) window.history.replaceState(null, '', '#/overview')
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  // 标题状态点（v3.307）：标签页在后台时也能一眼看出「有失败/在跑」。
+  // 只在拿到状态后着色；未加载用灰点，不谎报「正常」。
+  useEffect(() => {
+    const run = state && state.run && state.run.status === 'ok' ? state.run.value : null
+    const stats = state && state.stats && state.stats.status === 'ok' ? state.stats.value : null
+    const bad = !!(stats && stats.today && stats.today.failed > 0) || !!(run && (run.failed > 0 || run.interrupted))
+    const dot = authExpired ? '🔴' : !state ? '⚪' : locking ? '🟡' : bad ? '🔴' : '🟢'
+    document.title = `${dot} xbk-push 控制台`
+  }, [state, locking, authExpired])
 
   // vwU/vv2：busy 提交成功后启动兜底闹钟；active 确认或超时即清。
   // Sourcery Old-run-unlocks-new-trigger：兜底清 busy 时必须同步清 busyRunIdRef——
@@ -1838,46 +2033,77 @@ function App () {
   ]
   // 切页回到顶部（v3.306）：手机从概览滚到底部再点「推送记录」，此前会停在
   // 新页面的中段/底部（window.scrollY 被保留），看起来像页面缺了开头。
+  // v3.307 同步写 hash：刷新/后退能回到同一页。
   const switchTab = (next) => {
     if (next === tab) return
     setTab(next)
     window.scrollTo(0, 0)
+    if (window.location.hash !== `#/${next}`) window.location.hash = `#/${next}`
   }
+  // 「查看日志」跳转：横幅/逐轮历史点进来时带筛选条件与日期，重挂载 LogsPanel。
+  const openLog = useCallback((jump) => {
+    setLogJump({ q: jump && jump.q ? jump.q : '', mode: jump && jump.mode ? jump.mode : 'all', n: Date.now() })
+    setTab('logs')
+    window.scrollTo(0, 0)
+    if (window.location.hash !== '#/logs') window.location.hash = '#/logs'
+  }, [])
+  const pollMs = locking ? POLL_BUSY_MS : POLL_MS
+  const remain = autoRefresh
+    ? Math.max(0, Math.min(Math.ceil(pollMs / 1000), Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000)))
+    : 0
   return html`<div class="wrap">
     <header class="topbar">
       <div class="brand">
         <span class="logo">⚡</span>
         <span class="name">xbk-push 控制台</span>
-        <${Badge} tone=${locking ? 'run' : 'ok'}>${locking ? '任务运行中' : '空闲'}<//>
+        <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${authExpired ? '凭证失效' : locking ? '任务运行中' : '空闲'}<//>
       </div>
       <div class="sync">
-        ${tab === 'overview' || tab === 'logs' ? '自动刷新' : '数据截至'}${lastSync ? ` · ${fmtTime(lastSync)}` : ''}
+        ${tab === 'overview' || tab === 'logs'
+          ? html`${autoRefresh ? `自动刷新 · ${remain}s` : '自动刷新已暂停'}${lastSync ? ` · ${fmtTime(lastSync)}` : ''}
+            <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
+              onClick=${() => { setNowMs(Date.now()); setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`
+          : `数据截至${lastSync ? ` · ${fmtTime(lastSync)}` : ''}`}
         ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
       </div>
     </header>
 
+    ${authExpired && html`<div class="alert-banner bad" role="alert">
+      <div class="alert-main">
+        <strong>凭证已失效，控制台已停止自动刷新</strong>
+        <span class="alert-sub">请用带 <code>?token=</code> 的完整链接重新打开；若链接已过期，从部署环境重新获取 XBK_CONSOLE_TOKEN。</span>
+      </div>
+      <a class="alert-action" href="/">重新登录</a>
+    </div>`}
+
     <nav class="tabs">
-      ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')} onClick=${() => switchTab(t.key)}>${t.label}</button>`)}
+      ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')}
+        onClick=${() => { if (t.key === 'logs') setLogJump(null); switchTab(t.key) }}>${t.label}</button>`)}
     </nav>
 
-    ${tab === 'overview' && html`<div>
+    ${!authExpired && tab === 'overview' && html`<div>
+      <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} />
       <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
-      ${(runs.length > 0 || locking) && html`<${RunsPanel} runs=${runs} pollMs=${locking ? POLL_BUSY_MS : POLL_MS} onRefresh=${refreshSplit} />`}
+      ${locking && html`<${RunsPanel} runs=${runs} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />`}
       <${TrendsPanel} />
-      <${RunHistoryPanel} />
-      <${CacheHealthPanel} />
+      <${RunHistoryPanel} onOpenLog=${openLog} />
+      <${CacheHealthPanel} paused=${!autoRefresh} />
     </div>`}
-    ${tab === 'messages' && html`<${MessagesPanel} />`}
-    ${tab === 'logs' && html`<${LogsPanel} pollMs=${locking ? POLL_BUSY_MS : 0} />`}
-    ${tab === 'config' && html`<${ConfigPanel} />`}
-    ${tab === 'sys' && html`<div>
+    ${!authExpired && tab === 'messages' && html`<${MessagesPanel} />`}
+    ${!authExpired && tab === 'logs' && html`<div>
+      ${runs.length > 0 && html`<${RunsPanel} runs=${runs} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />`}
+      <${LogsPanel} key=${logJump ? logJump.n : 'base'} pollMs=${autoRefresh && locking ? POLL_BUSY_MS : 0}
+        initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} />
+    </div>`}
+    ${!authExpired && tab === 'config' && html`<${ConfigPanel} />`}
+    ${!authExpired && tab === 'sys' && html`<div>
       <${SysPanel} />
       <${FilesPanel} />
     </div>`}
 
     <footer class="foot">
-      ⚠️ 「正式运行一轮」会真实推送通知 · 试运行只抓取不推送 · 同一时刻只能有一个触发任务
+      ⚠️ 「正式运行一轮」会真实推送，触发前二次确认 · 试运行只抓取不推送 · 同一时刻只能有一个触发任务
     </footer>
   </div>`
 }

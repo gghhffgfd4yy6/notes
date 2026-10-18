@@ -13,7 +13,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { readStatus, formatStatus } = require('./scripts/status')
+const { readStatus, formatStatus, readRunHistory } = require('./scripts/status')
 
 let failed = 0
 function test (name, fn) {
@@ -179,18 +179,23 @@ try {
     assert.match(formatStatus(status), /最近一轮：正常 \| 时间 2026-09-08 10:00:00/, '输出必须展示这一轮的摘要时间戳')
   })
 
-  test('S13 摘要行之后出现 ERROR → 不再渲染「正常」，标记上一轮未正常结束', () => {
+  test('S13 摘要行之后才出现的 ERROR → 不回填给上一轮，单独上报为崩溃留痕', () => {
+    // 生产写序是「失败行 → 摘要行」；摘要 5 分钟后才出现的 ERROR 不属于这一轮（readRunHistory
+    // 早已按独立崩溃轮处理）。旧实现用 slice(i+1).some(...) 把它回填给上一轮，导致同一面板
+    // /api/status 说「中断」、/api/run-history 说「正常 + 崩溃占位」两处结论相反。
     fs.writeFileSync(path.join(tmp, 'run.log'), [
       '2026-09-08 10:00:00 total=42 dedup=5 filtered=7 truncated=0 pushed=28 failed=2 elapsed=3.4s',
       '2026-09-08 10:05:00 ERROR [v3.275.0] 运行异常 原因：HTTP 500'
     ].join('\n') + '\n')
     const status = readStatus(tmp)
     assert.strictEqual(status.run.status, 'ok', '自摘要行向前最近的一条完整摘要仍应解析成功')
-    assert.strictEqual(status.run.value.interrupted, true, '摘要行之后有 ERROR 行必须标记该轮中断（修前无此字段）')
+    assert.strictEqual(status.run.value.interrupted, false, '摘要写完之后才出现的失败行不得回填给本轮')
+    assert.strictEqual(status.run.value.orphanFailures, 1, '无主失败行必须如实计数')
+    assert.strictEqual(status.run.value.orphanFailureAt, '2026-09-08 10:05:00')
     const output = formatStatus(status)
-    assert.match(output, /最近一轮：⚠️ 上一轮未正常结束/, '崩溃轮必须与正常轮显示不同')
-    assert.doesNotMatch(output, /最近一轮：正常/, '中断轮不得渲染成「正常」')
-    assert.match(output, /时间 2026-09-08 10:00:00/, '中断轮仍要展示最近一条摘要的时间（陈旧程度可见）')
+    assert.match(output, /最近一轮：正常/, '该轮确实正常写完了摘要')
+    assert.match(output, /其后另有 1 条失败行未归属任何摘要/, '崩溃信号不得在首屏消失')
+    assert.match(output, /时间 2026-09-08 10:00:00/, '仍要展示最近一条摘要的时间（陈旧程度可见）')
   })
 
   test('S14 普通 ALERT 行不参与中断判定；无时间戳的裸摘要行仍可解析', () => {
@@ -378,7 +383,10 @@ try {
 
   // S18 looksLikeRoundFailure：行首/行尾/独立 ERROR 与「运行异常」为真，词内 ERROR 与普通 ALERT 为假
   // （杀 ^|\s、\s|$ 两处字符类放宽与锚点收紧）
-  test('S18 只认行首·独立·行尾 ERROR 与「运行异常」', () => {
+  test('S18 只认行首·独立·行尾 ERROR 与「运行异常」（按生产写序：失败行在摘要之前）', () => {
+    // 生产写序是「失败行 → 摘要行」（xbk_app.js:1684 → :1688），因此归属用例必须把失败行
+    // 放在摘要前面；放在摘要之后的无时间戳行属于下一轮的崩溃占位（见 S23）。
+    const summary = '2026-09-08 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s\n'
     const cases = [
       ['ERROR 启动失败', true],
       ['2026-09-08 10:00:00 运行异常 退出', true],
@@ -388,9 +396,9 @@ try {
       ['2026-09-08 10:00:00 ALERT 磁盘不足', false]
     ]
     for (let i = 0; i < cases.length; i++) {
-      const tail = cases[i][0]
-      const status = mk('s18-' + i, { 'run.log': 'total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s\n' + tail + '\n' })
-      assert.strictEqual(status.run.value.interrupted, cases[i][1], '尾部行：' + tail)
+      const line = cases[i][0]
+      const status = mk('s18-' + i, { 'run.log': line + '\n' + summary })
+      assert.strictEqual(status.run.value.interrupted, cases[i][1], '摘要前的失败行：' + line)
     }
   })
 
@@ -450,6 +458,112 @@ try {
       put(dir, 'filter-diagnostics.ndjson', JSON.stringify(near[i]) + '\n')
       assert.strictEqual(readStatus(dir, { now: NOW }).diagnostics.status, 'invalid', '近失配记录：' + JSON.stringify(near[i]))
     }
+  })
+
+  // ===== 批次 B0：轮界归属统一（/api/status 与 /api/run-history 同一口径）=====
+  test('S23 摘要之后的无摘要 ERROR = 独立崩溃轮，不回填上一轮（B0-1 回归）', () => {
+    const dir = scratch('s23')
+    put(dir, 'run.log', [
+      '2026-09-08 09:00:00 total=10 dedup=1 filtered=2 truncated=0 pushed=5 failed=0 elapsed=1s',
+      '2026-09-08 10:00:00 ERROR 运行异常 进程在写摘要前退出'
+    ].join('\n') + '\n')
+    const run = readStatus(dir, { now: NOW }).run
+    assert.strictEqual(run.value.at, '2026-09-08 09:00:00')
+    assert.strictEqual(run.value.interrupted, false, '10:00 的 ERROR 不属于 09:00 这一轮')
+    assert.strictEqual(run.value.orphanFailures, 1, '无主失败行必须单独计数')
+    const h = readRunHistory(dir, { limit: 10 })
+    assert.strictEqual(h.status, 'ok')
+    assert.strictEqual(h.items.length, 2, '09:00 摘要 + 10:00 崩溃占位')
+    assert.strictEqual(h.items[0].isPlaceholder, true, '10:00 崩溃轮必须独立成条')
+    assert.strictEqual(h.items[0].at, '2026-09-08 10:00:00')
+    assert.strictEqual(h.items[1].at, '2026-09-08 09:00:00')
+    assert.strictEqual(h.items[1].interrupted, false, '两处口径必须一致：09:00 正常结束')
+  })
+
+  test('S24 「推送全部失败」写序（ERROR → 同秒摘要）两处都判 interrupted（B0-2）', () => {
+    const dir = scratch('s24')
+    put(dir, 'run.log', [
+      '2026-09-08 10:00:00 ERROR 推送全部失败 3 条（通道可能失效）',
+      '2026-09-08 10:00:00 total=3 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=2s'
+    ].join('\n') + '\n')
+    const run = readStatus(dir, { now: NOW }).run
+    assert.strictEqual(run.value.interrupted, true, 'parseLastRun 必须与生产写序一致')
+    assert.strictEqual(run.value.orphanFailures, 0, '已归属的失败行不得再计成崩溃')
+    const h = readRunHistory(dir, { limit: 10 })
+    assert.strictEqual(h.items.length, 1, '不得多出幽灵崩溃行')
+    assert.strictEqual(h.items[0].interrupted, true)
+  })
+
+  test('S25 轮内远距 ERROR（其后 10 分钟内无其他摘要）归属本摘要，不生成幽灵崩溃行（B0-3）', () => {
+    const dir = scratch('s25')
+    put(dir, 'run.log', [
+      '2026-09-08 10:00:00 ERROR 缓存读取失败，跳过本轮推送（防重复轰炸）/x/push.json',
+      '2026-09-08 10:00:01 普通日志 A',
+      '2026-09-08 10:00:02 普通日志 B',
+      '2026-09-08 10:00:03 普通日志 C',
+      '2026-09-08 10:01:00 total=9 dedup=1 filtered=1 truncated=0 pushed=0 failed=9 elapsed=60s'
+    ].join('\n') + '\n')
+    const run = readStatus(dir, { now: NOW }).run
+    assert.strictEqual(run.value.interrupted, true, '同一物理轮的错误必须归属它自己的摘要')
+    assert.strictEqual(run.value.orphanFailures, 0, '远距离轮内错误不得变成幽灵崩溃轮')
+    const h = readRunHistory(dir, { limit: 10 })
+    assert.strictEqual(h.items.length, 1, '同一物理轮只应有一条')
+    assert.strictEqual(h.items[0].interrupted, true)
+    assert.strictEqual(h.items[0].isPlaceholder, false)
+  })
+
+  test('S28 失败行落在前后摘要等距窗口时归后一条（生产写序：失败 → 本轮摘要）', () => {
+    const dir = scratch('s28')
+    put(dir, 'run.log', [
+      '2026-09-08 09:59:59 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s',
+      '2026-09-08 10:00:00 ERROR 推送全部失败 3 条（通道可能失效）',
+      '2026-09-08 10:00:01 total=3 dedup=0 filtered=0 truncated=0 pushed=0 failed=3 elapsed=1s'
+    ].join('\n') + '\n')
+    const h = readRunHistory(dir, { limit: 10 })
+    assert.strictEqual(h.items.length, 2)
+    assert.strictEqual(h.items[0].at, '2026-09-08 10:00:01')
+    assert.strictEqual(h.items[0].interrupted, true, '等距时必须归后一条摘要')
+    assert.strictEqual(h.items[1].at, '2026-09-08 09:59:59')
+    assert.strictEqual(h.items[1].interrupted, false, '前一条不得被误标')
+  })
+
+  test('S26 同内容摘要行的游标 key 唯一：翻页不再返回同一页（B0-4 死循环回归）', () => {
+    const dir = scratch('s26')
+    const line = '2026-09-08 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s'
+    put(dir, 'run.log', Array.from({ length: 5 }, () => line).join('\n') + '\n')
+    const p1 = readRunHistory(dir, { limit: 2 })
+    assert.strictEqual(p1.items.length, 2)
+    assert.strictEqual(new Set(p1.items.map((x) => x.key)).size, 2, '同页两条的 key 必须不同')
+    const p2 = readRunHistory(dir, { limit: 2, before: p1.items[1].key })
+    assert.deepStrictEqual(p2.items.map((x) => x.lineNo), [3, 2], '第二页必须是更早的两条（修前会重复 [3,2]）')
+    const p3 = readRunHistory(dir, { limit: 2, before: p2.items[1].key })
+    assert.deepStrictEqual(p3.items.map((x) => x.lineNo), [1])
+    assert.strictEqual(p3.hasMore, false)
+    // 首次出现仍保留裸 8 位 key（旧游标兼容）
+    const first = readRunHistory(dir, { limit: 1, before: p1.items[1].key })
+    assert.strictEqual(first.status, 'ok')
+  })
+
+  test('S27 未来日期摘要不进入周统计 / 尾部超窗时 stats.truncated 如实上报', () => {
+    const dir = scratch('s27')
+    put(dir, 'run.log', [
+      '2026-09-08 10:00:00 total=10 dedup=0 filtered=0 truncated=0 pushed=10 failed=0 elapsed=1s',
+      '2099-01-01 10:00:00 total=999 dedup=0 filtered=0 truncated=0 pushed=999 failed=9 elapsed=1s'
+    ].join('\n') + '\n')
+    const st = readStatus(dir, { now: NOW }).stats
+    assert.strictEqual(st.status, 'ok')
+    assert.strictEqual(st.value.today.rounds, 1)
+    assert.strictEqual(st.value.today.pushed, 10, '未来摘要不得灌入今日/本周')
+    assert.strictEqual(st.value.week.rounds, 1)
+    assert.strictEqual(st.value.lastFailure, null, '未来失败不得成为 lastFailure')
+
+    // 1 MiB 尾部窗口只保留最后一段：stats 必须标注 truncated，而不是假装总数完整。
+    const big = scratch('s27-big')
+    put(big, 'run.log', 'x'.repeat(1100 * 1024) + '\n' +
+      '2026-09-08 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s\n')
+    const tail = readStatus(big, { now: NOW }).stats
+    assert.strictEqual(tail.status, 'ok')
+    assert.strictEqual(tail.value.truncated, true, '尾部截断必须显式上报')
   })
 
   console.log(`test_status_report OK (${failed === 0 ? '全部通过' : failed + ' 项失败'})`)

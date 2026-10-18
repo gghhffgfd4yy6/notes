@@ -267,6 +267,12 @@ const {
   assert.strictEqual(statusCacheDir({ env: { XBK_CACHE_DIR: outside }, fs: normalFs, path, root: CACHE_ROOT }), outside,
     '绝对路径覆盖必须原样采纳（不被根内校验改写）')
 
+  // ②b 尾随空格（D2-S7）：MessageStore 对 XBK_CACHE_DIR 做 trim 后才判绝对路径，
+  // --status 不 trim 会让读写两侧解析成不同目录（运行写 A、状态读 B）。
+  const padded = `  ${outside}  `
+  assert.strictEqual(statusCacheDir({ env: { XBK_CACHE_DIR: padded }, fs: normalFs, path, root: CACHE_ROOT }), outside,
+    '尾随/前导空格必须 trim 后与运行侧同源（修前会把带空格的串当另一个目录）')
+
   // ③ XBK_CACHE_DIR 为相对路径：告警 + 按同源规则解析默认目录（告警文案仍带生效目录）
   const relativeFs = makeStatusFs({ [CACHE_ROOT]: 'dir', [defaultCachePath]: 'file' })
   const warns = []
@@ -504,15 +510,16 @@ const deps = async (spec) => {
   assert.strictEqual(d.cache[2].warns[0].startsWith('⚠️ XBK_CACHE_DIR 不是绝对路径（rel/cache），已忽略并回退默认缓存目录：'), true, '相对路径告警文案必须精确并含被忽略的原始值')
   assert.deepStrictEqual(d.version, [null, '⚠️ 当前 Node 23.0.0 不满足 re2/package.json engines 要求（^22.22.2 || ^24.15.0 || >=26.0.0），原生依赖可能不可用', '⚠️ 当前 Node 22.22.1 不满足 re2/package.json engines 要求（^22.22.2 || ^24.15.0 || >=26.0.0），原生依赖可能不可用', '⚠️ 当前 Node 22 不满足 re2/package.json engines 要求（^22.22.2 || ^24.15.0 || >=26.0.0），原生依赖可能不可用'], 'engines 闸门按完整范围比较，缺段按 0 补齐')
 
-  // --- 入口参数白名单（KNOWN_ARGS）：已知参数不得告警；未知参数只告警不改变行为（QX-09）---
+  // --- 入口参数白名单（KNOWN_ARGS）：已知参数不得告警；未知参数 fail-closed（审查 D2-M2）---
   const env = Object.assign({}, process.env, { XBK_CACHE_DIR: ROOT, TZ: 'UTC' })
   const known = spawnSync(process.execPath, [ENTRY, '--status'], { encoding: 'utf8', env, timeout: 120000 })
   assert.strictEqual(known.status, 0, `--status 必须成功退出：${known.stderr}`)
   assert.strictEqual(known.stderr, '', '--status 是已知参数，不得输出任何 stderr（含未识别参数告警）')
   assert.strictEqual(known.stdout.length > 0, true, '--status 必须输出状态报告')
   const unknown = spawnSync(process.execPath, [ENTRY, '--status', '--dryrun'], { encoding: 'utf8', env, timeout: 120000 })
-  assert.strictEqual(unknown.status, 0, '未知参数只告警不改变行为，--status 仍应成功退出')
-  assert.strictEqual(unknown.stderr, '⚠️ 未识别参数已忽略：--dryrun（可用参数：--status / --check / --dry-run）\n', '未知参数必须按精确文案告警')
+  assert.strictEqual(unknown.status, 1, '未知参数必须 fail-closed，不得继续执行 --status')
+  assert.strictEqual(unknown.stderr, '❌ 未识别参数：--dryrun（可用参数：--status / --check / --dry-run），拒绝执行（fail-closed）\n', '未知参数必须按精确文案报错')
+  assert.strictEqual(unknown.stdout, '', '未知参数不得输出状态报告')
 
   console.log('test_qinglong_utils OK (entry contract)')
 })().catch((e) => { fs.writeSync(2, 'entry-contract FAIL: ' + (e && e.stack ? e.stack : String(e)) + '\n'); process.exit(1) })

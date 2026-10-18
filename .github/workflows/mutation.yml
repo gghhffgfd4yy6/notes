@@ -4,7 +4,9 @@ name: Mutation
 # runner（PR-1 起）：CI 走 **TAP 档** stryker.tap.config.js（15 段；v3-entry / storage / qinglong-push / check-deps 四段走 command 档）（testRunner: tap + coverageAnalysis: perTest，
 #   报告仍落 stryker 默认路径 reports/mutation/）；本地 `npm run test:mutation` 仍走 command 档
 #   stryker.config.js——两档测试集由 tap 配置的加载期断言强制对齐（不一致即配置加载失败）。
-# 长文件按官方行范围语法（file:start-end）拆分防超时：V3 目前 1 段全覆盖（1-442），sendnotify 拆 2 段。
+# 长文件按官方行范围语法（file:start-end）拆分防超时：V3 目前 1 段全覆盖（行段以 matrix 的
+# mutate 值为准，本注释不再复制具体数字——D2-N4：三处硬编码数字曾各写 1-442/1-511/1-520，全都与
+# 实际行数不一致），sendnotify 拆 2 段。改文件后同步重拆并跑 check-mutation-ranges。
 # ⚠️ v3.270 教训：行段硬编码曾静默漏测尾部新增代码（4495-4924 未变异）。
 # 修改大文件后必须同步重拆行段；AGENTS.md「大文件与变异行段」一节有具体步骤，改动前跑
 #   node scripts/check-mutation-ranges.js
@@ -200,7 +202,7 @@ jobs:
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
-            mutate: "xbk_function_v3.js:1-520"
+            mutate: "xbk_function_v3.js:1-534"
             config: "stryker.config.js"
           - name: app
             src: "xbk_app.js"
@@ -276,7 +278,7 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 2255 行（历史实测 2678 变异体）：变异评估成本 ≈ 变异体数 × 13.3s（C=8，历史
+          # console.js 2384 行（历史实测 2678 变异体）：变异评估成本 ≈ 变异体数 × 13.3s（C=8，历史
           # 成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）⇒ 整段 ≈ 594min、
           # 两片各 ≈ 297min 都逼近/超过 step 330min 上限（前两轮整段各 330min 被杀即此因，不是挂死）。
           # 按上限倒推取 5 片（各 ~536 体 ≈ 120-180min，含新测试更慢的余量）。
@@ -299,7 +301,7 @@ jobs:
             config: "stryker.tap.config.js"
           - name: console-part5
             src: "scripts/console.js"
-            mutate: "scripts/console.js:1713-2255"
+            mutate: "scripts/console.js:1713-2627"
             config: "stryker.tap.config.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

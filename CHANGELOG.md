@@ -236,7 +236,7 @@
 
 ## v3.283
 
-- PR #214 修复：re2 部署与运行期恢复统一使用 `npm rebuild re2`，优先执行官方预编译安装路径；青龙 `--check` 文档先要求配置通知渠道；`run.log` 排障说明区分 `XBK_CACHE_DIR`（仅 `--status`）与 `Config.cache.dir`；`--status` 始终打印实际读取目录；Node 版本闸门拒绝 prerelease 截断放行。
+- PR #214 修复：re2 部署与运行期恢复统一使用 `npm rebuild re2`，优先执行官方预编译安装路径；青龙 `--check` 文档先要求配置通知渠道；`run.log` 排障说明区分 `XBK_CACHE_DIR`（当时仅 `--status`；v3.308 起改为读、写、控制台共用，见 README「常用环境变量」）与 `Config.cache.dir`；`--status` 始终打印实际读取目录；Node 版本闸门拒绝 prerelease 截断放行。
 
 - 新增**主机干净度前置检查** `scripts/check-host-clean.js`，并挂到两个测试入口（`run_tests.js`、`run_unit_tests.js`）及直接执行的 `test_filter.js`：**机器脏了就不启动**，而不是跑完给一个"看起来像契约失败"的红。检测三类残留 —— ① **孤儿桩**（命中 `stub_heartbeat` / `test_stub_tree` 特征**且父进程已没**）；② 父进程已没（`ppid===1` 或 ppid 不在进程表）的**孤儿套件进程**（cmdline 末段是 `run_tests.js` / `run_unit_tests.js` / `test_*.js`）；③ **活跃时间**（目录自身或直接子项的最新 mtime）距今 > 30 分钟、且没有任何活进程把它当 cwd 的**过期 `/tmp/xbk-*` 沙箱**。发现即红并打印可直接执行的清理命令（`kill -TERM … && kill -KILL …`、`rm -rf …`）。
 - 三条误拦控制（都不可缺）：`XBK_MUTATION_CHILD=1`（stryker / `run_mutation.js` 的变异评估子进程）**直接跳过**——沙箱里跑全量套件时 `/tmp` 本来就有活动沙箱；沙箱只认**过期**的，且**活跃时间 = 目录自身与它的直接子项里最新的 mtime**，另有活进程把它当 cwd 即豁免（评审 #211 返工：目录 mtime 只在增删/改名条目时前进，只往已有文件追加写的长任务沙箱会被误报成残留，而判红打印的 `rm -rf` 等于劝人删掉正在跑的运行）；孤儿**桩与套件同判据 = 父进程已没**（`ppid===1`，或 ppid 不在进程表里）——评审前桩只看夹具特征，另一条终端正在跑的活动桩会被报成孤儿、第二个运行直接拒绝启动，正是头注「两条终端并发互不误伤」承诺被打破的地方。读不到 `/proc` 或活动沙箱 cwd 保护信号时按 fail-closed 拒绝继续，**绝不生成沙箱删除候选**；临时根扫描失败同样 fail-closed。
@@ -400,7 +400,7 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **SSE 实时输出流（§3.1）**：新增 `GET /api/runs/stream?id=<epoch.seq>&since=<offset>`——运行中任务的输出经 Server-Sent Events 推送（增量文本帧 data / 整段重发帧 event: reset / 收尾帧 event: done）。游标为**绝对偏移**（UTF-16 code units，三处同单位：量取/切片/下发），配套 `record.outputTotalLength` 单调计数器（环形淘汰只缩 output 不减计数器；详情 GET/POST 响应体附带该字段，前端以它为初始 since）。安全面：鉴权继承全局闸（GET 收会话 Cookie——原生 EventSource 不能带自定义头；API/测试走 `?token=`；前端不带 token 走 Cookie）；`id` 白名单 `RUN_ID_RE`（epoch.seq 数字形态）；每进程连接上限 **8**（第 9 个 503）；单连接待发积压上限 **1MiB**（慢客户端硬断：res.end + socket.destroy，不发 done——客户端 onerror 整段重拉自愈）；`since` 非法一律钳 0 自愈。背压语义（Node write 恒入队）：只在 `write()` 返回 false 时进入应用层 pending 队列（绝不双写），drain 一次性 flush；tick/心跳合一 500ms unref 定时器（写循环复查 runs 感知 20 条淘汰/完结 → done + end；15s `: ping` 心跳防代理 idle 断连）；关停广播：置位即对活跃连接发 done + end（SSE 属在途连接，不主动 end 会被 closeAllConnections 硬断成 RST）。响应头 `X-Accel-Buffering: no`（禁反代缓冲）。`/api/runs/stream` 2xx 入访问日志降噪白名单（连接分钟级，ms 读数会污染慢请求统计；非 2xx 照记）。
   - 前端：运行中详情走原生 EventSource（先取快照、以 outputTotalLength 为初始游标建流；reset/done 显式 addEventListener——named event 不进 onmessage；done 后 es.close() 防原生自动重连；onerror 回退轮询自愈；SSE 不经 inFlightRef/timedRequest，与 5s 主轮询互不抢占）。
   - 回归修复：`app.js:519` `typeof detail.id === 'number'` 判据自 v3.299 起（id 改字符串）恒 false ⇒ 详情日志框永远「加载中…」——改 `'string'`。
-- **消息导出 CSV/JSON（§3.2）**：新增 `POST /api/messages/export`（body `format=csv|json&cate=...`）——按分类导出推送记录。CSV 公式注入防御（`=`/`+`/`-`/`@`/制表符/回车开头的单元格前缀中性化 `'`，RFC4180 包裹）+ 截断披露（EXPORT_MAX_ROWS 上限时响应体带 truncated 标记）；JSON 形态直出数组。响应经 writeHead + end 走访问日志 finish 钩子（附件出口留痕）。
+- **消息导出 CSV/JSON（§3.2）**：新增 `POST /api/messages/export`（body `format=csv|json&cate=...`）——按分类导出推送记录。CSV 公式注入防御（`=`/`+`/`-`/`@`/制表符/回车开头的单元格前缀中性化 `'`，RFC4180 包裹）+ 截断披露（EXPORT_MAX_ROWS 上限时**响应头** `X-Export-Truncated: true`，响应体保持纯 CSV/纯数组——落盘文件本身没有标记，消费方须读响应头）；JSON 形态直出数组；两种格式都带 `X-Export-Query-Used`（percent-encoded）回显截断后实际生效的搜索词。响应经 writeHead + end 走访问日志 finish 钩子（附件出口留痕）。
 - **访问日志（§3.3）**：内存环形 200 条（重启即空、零写盘）+ `GET /api/access-log`（`{items, unauthorizedCount}` 时间正序）。token 脱敏硬闸：迭代不动点 + 解码复洗 2 轮，堵 `?token=` / 重复参数 / `%74oken=` / `%2574oken=` 逃逸；`res.on('finish')` 单点装配（畸形 request-target 400 也入日志）；降噪白名单（页面/状态/列表/详情/静态资产/SSE 的 2xx 不记，401 全记 + unauthorizedCount 独立计数）。
 - 测试 +38（test_console.js，98 用例）：ssePlanChunk 全分支纯测试（增量/reset/边界/超前游标/孤立代理/连续不重不漏）、SSE 常量与 RUN_ID_RE 形态、鉴权/参数钳制/reset 多字节游标/双 done 路径（淘汰+完结）/连接上限 503/慢客户端积压硬断（服务端侧判据 + 非 FIN 逻辑证明；回环 tcp_wmem autotune 实测调参总量 6MiB）/关停广播 503/访问日志脱敏联动/outputTotalLength 端到端、CSV 公式注入真回归（分片写入场景）/出口断言、token 键名纵深、静态红线扩扫 `new (window.)EventSource`（自检实证：standard 要求的 `window.` 拼写不被 `/new EventSource\(/` 命中，正则已放宽）。
 - 已知边界：SSE 连接进程内存活（重启后历史 404，客户端自愈重拉）；积压硬断在暂停客户端上 RST 不保证浮出（Linux 回环实测），判据以服务端侧 teardown 为准；/api/config runtime 节点为静态默认值（v3.298 口径延续）。
@@ -408,9 +408,9 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 ## v3.301 — 通知自检（--notify-test 直跑入口 + 控制台按钮）
 
 - **CLI `--notify-test`**（直跑入口 `node xbk_function_v3.js --notify-test`）：向全部已配置渠道各发一条固定测试消息（标题「xbk-push 通知自检」+ 版本号/上海戳/主机名），改完 push_config 无需等真实线报即可验证渠道。main guard 内、`runSingleEntry` 之前互斥早退分支（掉进调度即真跑一轮——结构性防线 + 源码序测试）；与 `--dry-run`（argv 或 env `XBK_DRY_RUN`）同时出现拒绝执行（fail-closed）；单次广播（绝不逐渠道循环）；HITOKOTO 临时置禁 finally 恢复（消息固定、零额外外部请求）；退出码 ≥1 渠道成功=0 / 全失败·无渠道·超时=1，失败渠道逐行列出（脱敏原因 + HTTP 状态码）；错误出口统一 `summarizeError`（凭证零泄漏）；自检路径零写盘（不写缓存/墓碑/run.log）。
-- **控制台「通知自检」按钮**：`POST /api/notify-test`（无 body）复用触发类端点全套防线（鉴权 401/shuttingDown 503/单飞锁/lastAccept 持久化），重放窗独立 60s（其余动作 12min，高频调试动作防连点）；受理序列抽共享 `acceptAction` helper（/trigger 与新端点共用，/trigger 行为不变）；ACTIONS 新行 `entry: 'single'` spawn `[ENTRY_SINGLE, '--notify-test']`；`/trigger` 的 `action=notify-test` 共享同一受理序列与重放键（有意行为）；前端 `triggerNotifyTest()`（fetch 字面量）+ ACTION_DEFS 新行。
+- **控制台「通知自检」按钮**：`POST /api/notify-test`（无 body）复用触发类端点全套防线（鉴权 401/shuttingDown 503/单飞锁/lastAccept 持久化），重放窗独立 60s（其余动作同为 60s——D2-S16 后 12min 窗只拦得到人工重跑）；受理序列抽共享 `acceptAction` helper（/trigger 与新端点共用，/trigger 行为不变）；ACTIONS 新行 `entry: 'single'` spawn `[ENTRY_SINGLE, '--notify-test']`；`/trigger` 的 `action=notify-test` 共享同一受理序列与重放键（有意行为）；前端 `triggerNotifyTest()`（fetch 字面量）+ ACTION_DEFS 新行。
 - **测试**：新增 `test_notify_selfcheck.js` 套件（进程内：互斥 argv/env、HITOKOTO 抑制与恢复、单次广播、消息固定形态、全失败/无渠道退出码、guard 脱敏红线——mock got 零真实网络）；test_cli.js 追加 spawn 用例（NODE_OPTIONS --require 桩替换 slim + fs 写钩子探针：零写/单次广播/互斥零发送/失败也零写/无抓取痕迹）；test_console.js 追加 K1–K3/K7（动作映射与 ENTRY_SINGLE 导出、401 面、60s 独立重放窗行为区分、/trigger 侧通道同键同窗）。
-- **登记面**：test_suites.js + stryker.tap.config.js explicitTestFiles 同步（加载期对账防线）；mutation.yml v3-entry 行段 1-442 → 1-511（新增 runNotifyTest/guard 行段纳入变异）；SYSTEM_CONTRACT 增补 notify-test 入口契约与控制台端点边界；README 常用命令/常用操作/网页控制台三处同步。
+- **登记面**：test_suites.js + stryker.tap.config.js explicitTestFiles 同步（加载期对账防线）；mutation.yml v3-entry 行段 1-442 → 1-534（新增 runNotifyTest/guard 行段纳入变异；D2-N4 复核：旧文案写 1-511，与当时的实际行数不符——落笔前按 `wc -l` 校准）；SYSTEM_CONTRACT 增补 notify-test 入口契约与控制台端点边界；README 常用命令/常用操作/网页控制台三处同步。
 - **控制台静态层**（v3.302）：资产按内容哈希 `?v=<sha8>` 引用（带版本长缓存 immutable，裸 URL 仍 no-cache + ETag），支持 `If-None-Match` → 304 与 gzip（首屏 JS 77KB → 约 26KB，CSS 9.4KB → 2.8KB）；HTML 仍 `no-store`。
 - **本机变异禁令护栏**：`npm run test:mutation` 改走 `scripts/local-mutation-guard.js`（默认 exit 1 并打印禁令），`run_mutation.js` 直跑同样拒绝；仅 `XBK_ALLOW_LOCAL_MUTATION=1` 显式放行（单段/沙箱调试，分数不得当判据）。新增 `test_local_mutation_guard.js` 套件锁死脚本指向、两个入口的拒绝行为与 AGENTS.md 文档禁令；AGENTS/SYSTEM_CONTRACT 同步改为「判据只在 CI」。
 
@@ -454,3 +454,28 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **导航**：标签栏吸顶（手机滚到缓存 / 日志区仍能切页），切页自动回到顶部；趋势图失败日增加「红柱=当日有失败」图例。
 - **可测性**：日报相对日期、缓存年龄与日志筛选抽到 `scripts/console-assets/pure.mjs`（前端 `import`，Node 测试直接 `import` 做行为断言），静态资产白名单与内容版本号同步纳入该文件。
 - **测试**：`test_console.js` 新增日期/缓存年龄与日志筛选的行为断言（固定时钟、issue × 关键字交集），以及概览顺序、后台不轮询、吸顶 / 切页回顶、缓存自动刷新四条结构红线。
+
+## v3.307 — 控制台运维工作台（今日统计 / 危险动作确认 / 排障直达）
+
+- **首屏「今天怎么样」**：状态卡改四张——今日（轮次/推送/失败/成功率 + 日报相对日期）、近 7 天（轮次/推送/失败/成功率/日均）、最近一轮（相对时间/计数/耗时/中断）、通道与过滤；数据由 `/api/status` 新增的 `stats` 字段下发（与 run.log/趋势同源，Asia/Shanghai 日历日）。不再出现「四张卡都在讲最近一次、10-14 的 20 条失败首屏看不见」。
+- **待处理横幅**：最近一轮失败/中断或近 7 天有失败时，概览顶部出现红色横幅，点「查看日志」直接跳到带日期与异常筛选的运行日志。
+- **危险动作二次确认**：「正式运行一轮」改成红色危险按钮，点击后弹窗写明「将真实推送到 xxx 渠道」；「通知自检」同样确认。默认焦点在「取消」，支持 Esc/点遮罩关闭；试运行与环境检查仍一键执行。
+- **日志降噪与分级**：日志页新增 全部/异常/错误/告警/摘要/控制台 六个筛选 chip（纯客户端）。「异常」默认排除「控制台停止：任务 #…」生命周期行——实测 178 行日志里 123 条异常有 119 条是它，真异常只剩 4 条。
+- **逐轮历史可排障**：一次取尾窗最近 200 轮，前端提供「只看失败/中断」「按日期」筛选、首页/上一页/下一页/末页页码与每行「日志」直达；不再每页 5 条、180 行翻 30+ 页。
+- **推送记录时间窗**：新增 全部/今天/近 3 天/近 7 天/近 30 天 筛选（服务端按上海日历日过滤，分类计数跟随窗口；导出同步带上 days）。
+- **手机首屏压缩**：状态卡改 2×2、动作按钮改 2×2，正式运行按钮从 y≈794 提到首屏内；概览「触发历史（本进程内存）」只在任务运行时占位，空闲时让位给趋势与逐轮历史，运行日志页仍保留完整触发输出/停止按钮。
+- **布局补空**：缓存健康右列补「状态目录文件」紧凑清单（前 8 项），不再留 460px 空白；墓碑文案由「尚未生成（首轮前正常）」改为「尚未生成（未发生过裁剪时正常）」。
+- **导航与标题**：页签写 `#/overview` 等 hash（刷新/后退不丢），标题前加状态点（🟢 正常 / 🔴 有失败 / 🟡 运行中 / ⚪ 未加载）；顶栏自动刷新显示倒计时并可暂停/继续。
+- **测试**：`test_status.js` 覆盖今日/近 7 天/窗口边界/成功率；`test_console.js` 覆盖时间窗边界、分类计数、日志级别计数、hash/逐轮筛选纯函数，以及确认弹窗、今日统计、时间窗、日志级别、hash 路由与手机 2×2 布局的结构红线。
+
+## v3.308 — 控制台可靠性与并发修复（审查 P0/P1/P2）
+
+- **缓存目录同源（审查 #241）**：`XBK_CACHE_DIR` 只采纳绝对路径（相对路径告警后忽略），并同时决定 `--status`、控制台与常驻/单轮运行的读写目录（含项目根外路径）；控制台 stateDir 改以运行侧 `MessageStore.cacheDir` 为唯一来源，不再出现「面板读 A、运行写 B」。文档同步说明 `push.json` 判重主存不会自动迁移，已部署实例改目录会重复推送。
+- **运行历史归属修正（审查 #229/#241/#242）**：失败行只按「±2 行且 ≤2s」归属摘要轮；未被归属的失败行独立成崩溃轮占位，不再把下一轮标成中断；页满闸门删除，同一 run.log 不再因每页 2/5/10 条给出相反结论；普通 ALERT（线报酷截断、缺 re2）不再被当成轮失败。
+- **尾窗翻页稳定（审查 #243）**：逐轮历史新增行内容 `key` 游标（兼容旧行号游标），1 MiB 尾窗追加后继续翻页不再永久 `stale`。
+- **入口参数 fail-closed（审查 #232）**：直跑入口 `--notify-test=1` 等前缀写法一律按通知自检处理（不再静默落进完整抓取/推送）；直跑与青龙入口的未知 `--` 参数改为报错退出 1，不再「告警后继续跑」。
+- **触发锁按运行隔离（审查 #225）**：锁 token 改为每次受理独立生成，前驱运行迟到的 close 不会把后继活锁误写为 released；子进程 `exit` 即收尾并释放锁，不再等孙进程关闭 stdio 导致的数秒「停止中」。
+- **凭证失效自助恢复（审查 #224）**：任一 API 返回 401 时页面停止轮询并显示「凭证已失效」横幅与「重新登录」入口，不再每 5s 空打 401；未授权 `GET /` 返回无脚本登录页（token 表单），不再是裸 JSON。会话 Cookie 改 `SameSite=Lax`（写动作 POST 本就不收 Cookie），从聊天点链接不再必然 401。
+- **SSE 日志冻结修复（审查 #248）**：切回前台时运行中详情不再 `fetchOnce` 领号，避免已建 SSE 流的回调因代次不符全部丢弃；SSE 模式只刷新 runs 徽章。
+- **门禁收紧（审查 #234/#247）**：`GITHUB_ACTIONS` 只认字符串 `'true'`（`0`/`false` 不再放行本机变异）；配置页结构红线切片终点改为真实的 `SysPanel`，不再因 `-1` 把整文件当片段导致断言永真。
+- **测试**：新增/更新 `test_console.js`（ALERT 不误伤、崩溃轮独立占位、每页条数无关、key 游标、401 登录页/Cookie、结构红线切片）、`test_qinglong_utils.js`（未知参数 fail-closed）、`test_notify_selfcheck.js`（前缀分发静态红线）与 `test_local_mutation_guard.js`（GITHUB_ACTIONS 严格 true）。

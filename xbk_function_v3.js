@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.306 — 控制台概览信息层级与日志筛选（状态卡置顶 / 日报相对日期 / 日志异常筛选） *********
+//* ******* 线报酷推送脚本 v3.308 — 控制台运维工作台与可靠性修复（审查 P0/P1/P2） *********
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -370,13 +370,28 @@ async function runSingleEntry (app = App) {
   return summary
 }
 
+// provider 返回的错误文本即使经过 safeErr 脱敏仍可能含 ANSI/OSC 终端控制序列（可清屏、
+// 改标题）——自检在终端跑，所有打印前必须剥掉。D2-S14：旧实现只剥了成功路径的
+// `✅/❌` 行，main guard 的 catch（失败汇总）原样打印，provider 仍能控制终端。
+// 模块级而非 runNotifyTest 内局部：失败路径也要用同一实现。
+const stripTerminalCtrl = (s) => String(s)
+  // OSC 序列：ESC ] … 直到 BEL 或 ST（ESC \）
+  .replace(/\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)/g, '')
+  // CSI 序列：ESC [ 参数字节…终止字节
+  .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+  // 残余 C0/C1 控制字符（TAB/换行除外）
+  .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '')
+
 // ── 通知自检（批次④ 4.1）：纯推送面动作，绝不触发抓取/写缓存/写 run.log ──
 // 只允许出现在直跑入口 main guard 的早退分支；落入 runSingleEntry 会真跑一轮。
 // args 参数化（默认 process.argv.slice(2)）供进程内测试注入，避免改全局 argv。
 async function runNotifyTest (args = process.argv.slice(2)) {
   // 防线7 互斥（fail-closed）：自检是真实发送，拒绝在 dry-run 语义下执行。
   // argv 与 env 双查：qinglong 入口以 XBK_DRY_RUN=1 表达 dry-run，一并拒绝防语义混淆。
-  if (args.includes('--dry-run') || (typeof process.env.XBK_DRY_RUN === 'string' && process.env.XBK_DRY_RUN !== '')) {
+  // D2-S15：环境变量判据必须与真实运行同一口径（xbk_app.js 只在 === '1' 时进 dry-run）。
+  // 旧实现把任何非空串（XBK_DRY_RUN=0/false/no）都当 dry-run，于是「显式关闭 dry-run」
+  // 的部署反而自检被拒、普通运行却真跑——同一变量两种语义。
+  if (args.includes('--dry-run') || process.env.XBK_DRY_RUN === '1') {
     console.error('❌ --notify-test 与 --dry-run 互斥：通知自检是真实发送动作，拒绝执行（fail-closed）')
     process.exitCode = 1
     return
@@ -401,15 +416,6 @@ async function runNotifyTest (args = process.argv.slice(2)) {
   }
   // 结果汇总（防线5）：successfulChannels/failures 直接送渠道粒度（sendNotify 返回形态），
   // failures[].message 已是 slim safeErr 脱敏产物；禁止 console.log(e)/JSON.stringify(e)。
-  // Sourcery Medium（Provider responses control terminal）：provider 返回的错误文本即使
-  // 经过 safeErr 脱敏仍可能含 ANSI/OSC 终端控制序列——自检在终端跑，必须剥掉再打印。
-  const stripTerminalCtrl = (s) => String(s)
-    // OSC 序列：ESC ] … 直到 BEL 或 ST（ESC \）
-    .replace(/\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)/g, '')
-    // CSI 序列：ESC [ 参数字节…终止字节
-    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
-    // 残余 C0/C1 控制字符（TAB/换行除外）
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '')
   const okChannels = Array.isArray(result && result.successfulChannels) ? result.successfulChannels : []
   const failures = Array.isArray(result && result.failures) ? result.failures : []
   console.log(`通知自检完成：成功 ${okChannels.length} 个渠道，失败 ${failures.length} 个渠道`)
@@ -425,7 +431,11 @@ async function runNotifyTest (args = process.argv.slice(2)) {
 
 if (require.main === module) {
   const cliArgs = process.argv.slice(2)
-  if (cliArgs.includes('--notify-test')) {
+  // 审查 D2-M2（#232）：旧实现只认精确的 `--notify-test`，`--notify-test=1` 这类近似写法
+  // 会静默落进 runSingleEntry() —— 生产上就是真抓取 + 真推送 + 写缓存。改为前缀分发；
+  // 其余未识别的 `--` 参数一律 fail-closed，绝不让拼写错误变成一次真实运行。
+  const notifyArg = cliArgs.find((a) => a === '--notify-test' || a.startsWith('--notify-test='))
+  if (notifyArg) {
     // 批次④ 4.1：通知自检早退分支——必须在 runSingleEntry() 之前分发，
     // 否则掉进完整抓取/推送/缓存流程（自检变成真跑一轮）。
     runNotifyTest(cliArgs).catch(e => {
@@ -433,11 +443,11 @@ if (require.main === module) {
       // 绝不 console.log(e)/JSON.stringify(e)（error.options/response 可能带 URL query 凭证）。
       const { summarizeError } = require('./xbk_failure_policy')
       const info = summarizeError(e)
-      console.error(`通知自检失败：${info.message || '未知错误'}`)
+      console.error(`通知自检失败：${stripTerminalCtrl(info.message || '未知错误')}`)
       if (Array.isArray(info.failures)) {
         for (const f of info.failures) {
           const status = f && f.statusCode ? `（HTTP ${f.statusCode}）` : ''
-          console.error(`  ❌ ${(f && f.channel) || '未知渠道'}：${(f && (f.message || f.code)) || '发送失败'}${status}`)
+          console.error(`  ❌ ${stripTerminalCtrl((f && f.channel) || '未知渠道')}：${stripTerminalCtrl((f && (f.message || f.code)) || '发送失败')}${status}`)
         }
       }
       if (info.name === 'MODULE_NOT_FOUND' || /Cannot find module/.test(info.message || '')) {
@@ -445,6 +455,10 @@ if (require.main === module) {
       }
       process.exitCode = 1
     })
+  } else if (cliArgs.some((a) => a.startsWith('--'))) {
+    const unknown = cliArgs.filter((a) => a.startsWith('--'))
+    console.error(`❌ 未识别参数：${unknown.join(' ')}；直跑入口仅支持 --notify-test（试运行请用 XBK_DRY_RUN=1 环境变量），拒绝执行（fail-closed）`)
+    process.exitCode = 1
   } else {
     runSingleEntry().catch(e => {
       console.error('程序运行失败:', Utils.safeErrorText(e, Utils.safeText(e, '未知错误')))
