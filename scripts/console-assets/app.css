@@ -424,6 +424,8 @@
   .rule-key { color: var(--text-dim); font-family: var(--mono); font-size: var(--fs-xs); flex: 0 1 auto; overflow-wrap: anywhere; word-break: normal; }
   .rule-val { color: var(--text); font-family: var(--mono); font-size: var(--fs-xs); flex: 1 1 120px; min-width: 0; overflow-wrap: anywhere; word-break: normal; }
   .rule-val.rule-empty { color: var(--text-dim); }
+  /* 配置页「覆盖」徽章（v3.312）：标记该字段实际值来自覆盖文件而非代码默认。 */
+  .rule-src { flex: 0 0 auto; color: var(--info-fg); background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: var(--r-pill); padding: 0 6px; font-size: var(--fs-2xs); line-height: 1.6; }
   .cfg-toggle { align-self: flex-start; margin-top: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text-dim); font-size: var(--fs-xs); padding: 5px 10px; cursor: pointer; }
   .cfg-toggle:hover { color: var(--text); border-color: var(--accent-line); }
   .chan-grid { display: flex; flex-wrap: wrap; gap: 8px; }

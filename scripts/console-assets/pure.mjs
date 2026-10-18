@@ -6,6 +6,46 @@
 
 export const DAY_MS = 1000 * 60 * 60 * 24
 
+// 配置页「过滤规则」块的数据口径（v3.312）：显示**实际生效值**，而不是只读代码默认。
+// 背景：过滤规则页写的是覆盖文件 filter-rules.json，配置页原先只读 Config.filter ⇒
+// 保存成功后两页对不上（用户看到「已保存」，配置页仍全空）。
+// 口径与 FilterStore.mergeActiveFilter 一致：覆盖文件优先、缺字段回代码默认（不是置空）。
+// overridden 的语义是「该字段由覆盖文件显式提供」——即便值与代码默认相同也算（覆盖文件把它
+// 钉住了，后续版本改默认时该实例不会跟随）；只有「文件里没这个键」才回落到默认且不挂徽章。
+export function effectiveFilterRows (configFilter, activeFilter) {
+  const isPlain = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v)
+  const base = isPlain(configFilter) ? configFilter : {}
+  const active = isPlain(activeFilter) ? activeFilter : null
+  const norm = (v) => (v === undefined || v === null ? '' : String(v))
+  const has = (k) => Boolean(active) && Object.prototype.hasOwnProperty.call(active, k)
+  const keys = Object.keys(base)
+  if (active) for (const k of Object.keys(active)) if (!keys.includes(k)) keys.push(k)
+  return keys.map((key) => ({
+    key,
+    value: norm(has(key) ? active[key] : base[key]),
+    overridden: has(key),
+    differs: has(key) && norm(active[key]) !== norm(base[key])
+  }))
+}
+
+// 配置页过滤规则块的副标题（v3.312）。把「已保存」与「已生效」分开：
+// 覆盖文件可能在上一轮跑完之后才保存 ⇒ 页面显示保存的规则（下一轮生效），但不得
+// 把文件 revision 说成「已生效」——那会让用户以为本轮已经换规则。
+// changedCount 只数「与代码默认不同」的字段（覆盖文件常把未改字段也一并钉住，
+// 把「文件里有这个键」当成「改过」会让 11 项全算覆盖，反而看不出真正改了什么）。
+export function filterSourceNote (effData, rowCount, changedCount) {
+  if (!effData || !Number.isSafeInteger(rowCount)) return ''
+  if (effData.source === 'corrupt') return `${rowCount} 项 · 覆盖文件损坏，显示降级值`
+  if (effData.source !== 'override') return `${rowCount} 项 · 来自代码默认（未建覆盖文件）`
+  const rev = Number.isSafeInteger(effData.revision) ? effData.revision : 0
+  const appliedRev = effData.applied && Number.isSafeInteger(effData.applied.revision) ? effData.applied.revision : null
+  if (appliedRev !== rev) {
+    const tail = appliedRev === null ? '尚未跑过' : `本轮仍用 rev ${appliedRev}`
+    return `${rowCount} 项 · 已保存 rev ${rev}（下一轮生效，${tail}）`
+  }
+  return `${rowCount} 项 · 生效 rev ${rev}（覆盖文件）${changedCount > 0 ? ` · ${changedCount} 项与默认不同` : ''}`
+}
+
 // 「多久以前」：负数（时钟漂移/文件时间在未来）按 0 处理，显示「刚刚」。
 export function fmtAge (ms) {
   if (typeof ms !== 'number' || !Number.isFinite(ms)) return ''
