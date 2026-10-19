@@ -693,9 +693,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15   # 实测 0.5-0.9min（下载全部 artifact + 汇总发日报）
     # 发日报 Issue 需要 issues: write（Actions 默认 GITHUB_TOKEN 可能 read-only → 403 失败）
+    # actions: read 供「解析本轮运行起点」步骤读本次 run（GET /repos/…/actions/runs/<id>）；
+    # 显式 permissions 块里未列出的权限一律为 none，缺它该步会 403 → fail-closed 红。
     permissions:
       issues: write
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -712,11 +715,29 @@ jobs:
           pattern: mutation-report-*
           merge-multiple: false
 
+      # 本轮运行起点：github 上下文没有 run_started_at（只有 run_id/run_number/run_attempt），
+      # 不存在的属性求值为空串 ⇒ 直接注入会让 validateFreshness 的第③层（同日跨轮回填）静默跳过。
+      # 故先用 REST API 取真值、经 $GITHUB_ENV 交给下一步；取不到/不可解析就 fail-closed 拒绝发布。
+      - name: 解析本轮运行起点
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ts=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .run_started_at) || {
+            echo "取不到 run_started_at（gh api 失败），拒绝发布" >&2
+            exit 1
+          }
+          if [ -z "$ts" ] || ! date -u -d "$ts" +%s >/dev/null 2>&1; then
+            echo "run_started_at 缺失或不可解析（值：${ts:-<空>}），拒绝发布" >&2
+            exit 1
+          fi
+          echo "MUTATION_RUN_STARTED_AT=$ts" >> "$GITHUB_ENV"
+
       - name: 汇总并发日报
         run: node scripts/mutation-report.js mutation-reports --issue
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          # F1（返工）：本轮运行起点——validateFreshness 的第三层据此拦截「同日跨轮回填」（全体段
-          # mtime 互差≈0 且都在 12h 阈值内时，只比较本批最新报告看不见）。matrix job 必然晚于该时刻。
-          MUTATION_RUN_STARTED_AT: ${{ github.run_started_at }}
+          # F1（返工）：本轮运行起点由上一「解析本轮运行起点」步骤经 $GITHUB_ENV 写入——validateFreshness
+          # 的第③层据此拦截「同日跨轮回填」（全体段 mtime 互差≈0 且都在 12h 阈值内时，只比较本批最新
+          # 报告看不见）。matrix job 必然晚于该时刻。此处**不得**再写 MUTATION_RUN_STARTED_AT：
+          # 步骤级 env 优先级高于 GITHUB_ENV，空值会把刚取到的真值覆盖掉。

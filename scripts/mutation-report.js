@@ -35,7 +35,8 @@ const LIST_QUERY_TIMEOUT_MS = 15000
 // （单位毫秒；`off` 或 ≤0 关闭该闸门；无法解析的值回落到默认值，不静默关闭闸门）。
 // 返工（V4 打回）：只用「本批最新者」当基准会漏掉两种**回填同族**——全体回填（所有段 mtime 都很旧、
 // 互差≈0）与跨轮同日回填（<12h、互差≈0）。故该阈值同时用作「相对现在的年龄上限」，并另加一层
-// 以本轮 workflow 运行起点（MUTATION_RUN_STARTED_AT = github.run_started_at）为下界的判定。
+// 以本轮 workflow 运行起点（MUTATION_RUN_STARTED_AT；CI 由 mutation.yml 的「解析本轮运行起点」步骤
+// 经 REST API 取 run_started_at 后写 $GITHUB_ENV 注入）为下界的判定。
 const DEFAULT_MAX_SKEW_MS = 12 * 60 * 60 * 1000
 
 // F1（返工）：本轮运行起点下界的容差——工件落盘/时钟分辨率的余量（CI 内各 job 同钟，无需大余量）。
@@ -50,9 +51,12 @@ function resolveMaxSkewMs (raw) {
   return n > 0 ? n : 0
 }
 
-// F1（返工）：解析本轮 workflow 的 run_started_at（mutation.yml 的 report 步骤注入
-// MUTATION_RUN_STARTED_AT: ${{ github.run_started_at }}）。无法解析/未提供 → undefined（跳过该层，
-// 不误红也不假绿；本地手工跑日报时该层自然不生效）。
+// F1（返工）：解析本轮 workflow 的 run_started_at。CI 的注入链：mutation.yml 的「解析本轮运行起点」
+// 步骤 `gh api repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID --jq .run_started_at` → 写
+// $GITHUB_ENV 的 MUTATION_RUN_STARTED_AT → 汇总步骤继承。**不能**直接写 `MUTATION_RUN_STARTED_AT:
+// ${{ github.run_started_at }}`：github 上下文没有 run_started_at 属性（只有 run_id / run_number /
+// run_attempt），不存在的属性求值为空串 ⇒ 本函数返回 undefined、第③层静默跳过（这正是修前的 bug）。
+// 无法解析/未提供 → undefined（跳过该层，不误红也不假绿；本地手工跑日报时该层自然不生效）。
 function resolveRunStartedAtMs (raw) {
   if (raw === undefined || raw === null || String(raw).trim() === '') return undefined
   const ms = Date.parse(String(raw).trim())
