@@ -1705,6 +1705,37 @@ async function main () {
     assert.strictEqual(REPLAY_WINDOW_RUN_AUTO_MS, 3000, '自动运行独立重放窗 3s（前端间隔下限）')
     assert.strictEqual(parseAction('action=run-auto'), 'run-auto')
   })
+  await aok('HTTP: run-auto 3s 独立重放窗行为（K1c）', async () => {
+    // 2s 前受理：3s 窗内 → 409 + replayBlocked + runId 回带
+    {
+      const dir = tmpDir()
+      const { server } = createConsole({ token: TOKEN, stateDir: dir })
+      const port = await listen(server)
+      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'run-auto': { at: Date.now() - 2000, runId: '1750000000000.9' } }))
+      const blocked = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=run-auto' })
+      assert.strictEqual(blocked.status, 409, '3s 窗内 run-auto 重放必须 409')
+      const b = JSON.parse(blocked.text)
+      assert.strictEqual(b.replayBlocked, true, '标记为重放拦截')
+      assert.strictEqual(b.runId, '1750000000000.9', '409 回带首轮 runId')
+      assert.ok(Number.isInteger(b.retryAfterS) && b.retryAfterS > 0 && b.retryAfterS <= 3,
+        `retryAfterS 应在 3s 窗内（实际 ${b.retryAfterS}）`)
+      server.close()
+    }
+    // 4s 前受理：已越 3s 窗。预占锁后应报「锁冲突」而不是 replayBlocked；
+    // 若误用全局 60s 窗，这里会带 replayBlocked，用例即红。
+    {
+      const dir = tmpDir()
+      const { server } = createConsole({ token: TOKEN, stateDir: dir })
+      const port = await listen(server)
+      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'run-auto': { at: Date.now() - 4000, runId: '1750000000000.9' } }))
+      assert.strictEqual(acquireLock(dir, Date.now(), 'other-token'), true, '预占锁成功')
+      const lockConflict = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=run-auto' })
+      assert.strictEqual(lockConflict.status, 409, '越窗后撞锁仍 409')
+      assert.strictEqual(JSON.parse(lockConflict.text).replayBlocked, undefined,
+        '4s 前已越 3s 窗，应是锁冲突而不是重放拦截')
+      server.close()
+    }
+  })
   await aok('HTTP: POST /api/notify-test 鉴权面（K2）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
