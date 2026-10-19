@@ -261,11 +261,18 @@ function apiGetCacheHealth () {
   return consumeJson(fetch('/api/cache-health', merged), done)
 }
 
+let filesInFlight = null
 function apiGetFiles () {
+  // 启动预加载会同时命中缓存健康右列、系统页文件清单、过滤规则备份下拉；
+  // 共享同一个在飞 Promise，避免对大目录做三次同步扫描（Sourcery #272）。
+  if (filesInFlight) return filesInFlight
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/files', merged), done)
+  filesInFlight = consumeJson(fetch('/api/files', merged), done)
+  const clear = () => { filesInFlight = null }
+  filesInFlight.then(clear, clear)
+  return filesInFlight
 }
 
 function apiGetConfig () {
@@ -359,11 +366,17 @@ function filterWriteHeaders () {
   }
 }
 
+let filterInFlight = null
 function apiGetFilter () {
+  // 配置页和过滤规则页启动预加载时都会要同一份过滤规则快照，共享在飞 Promise。
+  if (filterInFlight) return filterInFlight
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/config/filter', merged), done)
+  filterInFlight = consumeJson(fetch('/api/config/filter', merged), done)
+  const clear = () => { filterInFlight = null }
+  filterInFlight.then(clear, clear)
+  return filterInFlight
 }
 
 function apiPostFilterSave (body) {
@@ -1419,7 +1432,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     }
   }, [mode])
   // 保活后概览切回来时补拉一次；离开概览不拉。data 保留，不出现加载占位。
-  useEffect(() => { if (active) load().catch(() => {}) }, [load, active])
+  usePanelAutoLoad(active, load)
 
   const all = data && data.status === 'ok' && Array.isArray(data.items) ? data.items : []
   const issueCount = filterRunItems(all, { mode: 'issue' }).length
@@ -1536,6 +1549,33 @@ function usePanelLoader (apiFn, onLoaded) {
   return { data, err, load, loading }
 }
 
+// 页签保活 + 首屏预加载：面板即使还没被点开（active=false）也先拉一次，
+// 刷新网页后第一次点页签时数据已经在手里，不会闪「加载中…」；之后离开不拉，
+// 再切回才补一次（active 由 false 变 true）。
+// queue=true 用于日志这种自带互斥的 loader（在飞时排队，而不是丢掉这次刷新）。
+function usePanelAutoLoad (active, load, { queue = false } = {}) {
+  const seenRef = useRef(null)
+  const loadRef = useRef(load)
+  const pendingRef = useRef(false)
+  const loadedAtRef = useRef(0)
+  useEffect(() => {
+    const first = seenRef.current === null
+    const becameActive = active && seenRef.current === false
+    const loadChanged = loadRef.current !== load
+    seenRef.current = active
+    loadRef.current = load
+    if (!active && !first) return
+    if (!first && !becameActive && !loadChanged) return
+    // 首次点开时若预加载还在飞、或刚回来不到 3s，直接用手里的/路上的数据，
+    // 不再发第二发把预加载响应顶掉（Sourcery #272）。更久才点开则补一次新鲜的。
+    if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))) return
+    if (pendingRef.current && !loadChanged) return
+    pendingRef.current = true
+    const p = queue ? load(true) : load()
+    Promise.resolve(p).then(() => { loadedAtRef.current = Date.now() }).catch(() => {}).finally(() => { pendingRef.current = false })
+  }, [active, load, queue])
+}
+
 // 趋势天数选择器固定选项（与服务端白名单 TREND_DAYS_ALLOWED 对齐；14 为默认省略参数）
 const TREND_DAYS = [14, 30, 60]
 
@@ -1544,7 +1584,7 @@ function TrendsPanel ({ active = true }) {
   const fetchTrends = useCallback(() => apiGetTrends(days), [days])
   const { data: trends, err, load } = usePanelLoader(fetchTrends)
   // 保活后概览切回来时补拉一次；离开概览不拉。
-  useEffect(() => { if (active) load().catch(() => {}) }, [load, active])
+  usePanelAutoLoad(active, load)
   // 展示口径只认「响应自带的 days」：切窗口后旧响应未替换（请求中/失败）时，
   // 标题与合计必须跟随旧窗口的数据，不能拿着旧数据标新窗口。
   const shownDays = trends && Number.isSafeInteger(trends.days) && TREND_DAYS.includes(trends.days)
@@ -1655,17 +1695,22 @@ function CacheHealthPanel ({ paused = false }) {
   useEffect(() => { load().catch(() => {}); filesLoader.load().catch(() => {}) }, [load, filesLoader.load])
   // 缓存健康随概览常开：每分钟（且切回前台时）重拉一次，避免「页面开着过夜、mtime 早已更新
   // 但面板还拿着旧快照」；1 分钟一次只读小 JSON，不与 5s 主轮询抢盘。
-  const timerStartedRef = useRef(false)
+  const wasPausedRef = useRef(paused)
   useEffect(() => {
+    const wasPaused = wasPausedRef.current
+    wasPausedRef.current = paused
     if (paused) return undefined
-    // 页签保活：从别的页签切回概览时先补一拍（首帧由上面的 mount effect 拉，不重复）。
-    if (timerStartedRef.current) load().catch(() => {})
-    timerStartedRef.current = true
+    // 从暂停/隐藏状态回到概览时先补一拍（首帧由上面的 mount effect 拉，不重复）。
+    // 右列文件清单也要一起补，否则左列新鲜、右列还是几小时前的快照。
+    if (wasPaused) {
+      load().catch(() => {})
+      filesLoader.load().catch(() => {})
+    }
     const t = setInterval(() => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }, 60000)
     const onVis = () => { if (document.visibilityState === 'visible') load().catch(() => {}) }
     document.addEventListener('visibilitychange', onVis)
     return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVis) }
-  }, [load, paused])
+  }, [load, paused, filesLoader.load])
   const ok = data && data.status === 'ok'
   const ratioText = ok && data.writeRatio != null ? `${(data.writeRatio * 100).toFixed(1)}%` : '—'
   const tomb = data && data.tombstone ? data.tombstone : null
@@ -2090,7 +2135,7 @@ function MessagesPanel ({ onSync, active = true }) {
   const { data, err, load, loading } = usePanelLoader(fetchMessages, onSync)
   // 保活后每次切回本页都静默拉一次新数据：旧列表留在原地（loading 不会清 data），
   // 只更新内容，不出现「加载中…」占位。离开本页时不拉。
-  useEffect(() => { if (active) load().catch(() => {}) }, [load, active])
+  usePanelAutoLoad(active, load)
   // 结果集缩小后旧页码可能超过新页数（服务端按请求页切片，回空 items）。收到响应后把
   // 页码钳到最后一页并重拉，避免「在后面的页点刷新，整页空白」。
   useEffect(() => {
@@ -2254,10 +2299,10 @@ function MessagesPanel ({ onSync, active = true }) {
   </div>`
 }
 
-// 运行日志：run.log 尾部（服务端 1MiB 上限），进页拉一次 + 手动刷新；有任务在跑时跟随轮询。
+// 运行日志：run.log 尾部（服务端 1MiB 上限），启动预加载 + 手动/切回刷新；有任务在跑时跟随轮询。
 // 异常口径与筛选在 pure.mjs（isIssueLogLine / filterLogLines），组件与测试共用。
 function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync, active = true }) {
-  const { data, err, load: loadRaw } = usePanelLoader(apiGetLogs, onSync)
+  const { data, err, load: loadRaw, loading } = usePanelLoader(apiGetLogs, onSync)
   const preRef = useRef(null)
   const stickRef = useRef(true)
   const prevTextRef = useRef('')
@@ -2288,11 +2333,27 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync, ac
   const [mode, setMode] = useState(initialMode)
   const [q, setQ] = useState(initialQuery)
   useEffect(() => { setMode(initialMode); setQ(initialQuery) }, [initialMode, initialQuery])
+  const preloadedRef = useRef(false)
+  const revealedRef = useRef(active)
+  const dataAtRef = useRef(0)
+  useEffect(() => { if (data) dataAtRef.current = Date.now() }, [data])
   useEffect(() => {
+    // 首访预加载：页签还没点开也先把日志拉下来；之后离开不拉，切回再补。
+    if (!active && preloadedRef.current) return undefined
+    const firstReveal = preloadedRef.current && active && !revealedRef.current
+    preloadedRef.current = true
+    revealedRef.current = active
+    // 第一次点开时直接用预加载结果；只有预加载失败（没 data 也没在飞）或数据已超过
+    // 5s 才补一发，避免点击瞬间再发请求把预加载响应顶掉（Sourcery #272）。
+    if (firstReveal) {
+      const stale = !loading && (!data || Date.now() - dataAtRef.current > 5000)
+      if (stale) load(true).catch(() => {})
+    } else {
+      // 切回本页时若上一发还在飞，load(true) 会排队补拉；load() 会直接丢弃这次刷新，
+      // 保活后就会出现「回来了但日志是离开那刻的旧快照」（Sourcery #271）。
+      load(true).catch(() => {})
+    }
     if (!active) return undefined
-    // 切回本页时若上一发还在飞，load(true) 会排队补拉；load() 会直接丢弃这次刷新，
-    // 保活后就会出现「回来了但日志是离开那刻的旧快照」（Sourcery #271）。
-    load(true).catch(() => {})
     // 页面在后台时不轮询（切回前台立即补一次）：控制台常驻标签页也不该整夜每 5s 读盘。
     // 即使 pollMs=0（空闲时不自动轮询），也要挂 visibilitychange——后台期间跑完的任务
     // 会在切回时补一次，不会停留在旧快照。
@@ -2373,21 +2434,41 @@ function SysPanel ({ onReady, active = true }) {
   // 访问日志（v3.300 §3.3）：第二个 loader 并列拉取；「刷新」按钮同日 load 两个。
   // 近窗未授权尝试数 = 服务端独立 401 计数（进程启动以来、不随环形窗截断）。
   // 两个请求可能一成一败：本页不认「数据截至」，避免半套数据被标成完整刷新（Sourcery PR#253）。
-  // 保活后 data 不会清空，ready 也一直为真：用 loadTick 让「切回→重新拉完」也报一次完成，
-  // 页头时间才不会停在首访那一刻（Sourcery #271）。
-  const [loadTick, setLoadTick] = useState(0)
-  const bumpTick = useCallback(() => setLoadTick((v) => v + 1), [])
-  const { data: sys, err, load } = usePanelLoader(apiGetSys, bumpTick)
-  const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog, bumpTick)
+  // 保活后 data 不会清空，ready 也一直为真：必须等同一次刷新里的两个请求都结算，
+  // 才能报「数据截至」；只跟其中一个会在访问日志还是旧快照时提前更新时间（Sourcery #272）。
+  const { data: sys, err, load } = usePanelLoader(apiGetSys)
+  const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog)
+  const [readyTick, setReadyTick] = useState(0)
+  const seenRef = useRef(null)
+  const pendingRef = useRef(false)
+  const loadedAtRef = useRef(0)
+  useEffect(() => {
+    const first = seenRef.current === null
+    const becameActive = active && seenRef.current === false
+    seenRef.current = active
+    if (!active && !first) return
+    // 首次点开时预加载还在飞/刚回来不到 3s，直接用预加载结果；更久才点开则补一次。
+    if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))) return
+    if (pendingRef.current) return
+    pendingRef.current = true
+    Promise.allSettled([load(), loadAccess()]).then(() => {
+      pendingRef.current = false
+      loadedAtRef.current = Date.now()
+      setReadyTick((v) => v + 1)
+    }).catch(() => {})
+  }, [active, load, loadAccess])
   // 两个 loader 都落定才通知滚动层收口；只报第一个会在下半页还空着时提前释放垫高。
   const sysReady = !!(sys || err)
   const accessReady = !!(access || accessErr)
   useEffect(() => {
     if (sysReady && accessReady && typeof onReady === 'function') onReady()
-  }, [sysReady, accessReady, loadTick, onReady])
-  useEffect(() => { if (active) load().catch(() => {}) }, [load, active])
-  useEffect(() => { if (active) loadAccess().catch(() => {}) }, [loadAccess, active])
-  const refreshAll = () => { load(); loadAccess() }
+  }, [sysReady, accessReady, readyTick, onReady])
+  const refreshAll = () => {
+    Promise.allSettled([load(), loadAccess()]).then(() => {
+      loadedAtRef.current = Date.now()
+      setReadyTick((v) => v + 1)
+    }).catch(() => {})
+  }
   const fmtUptime = (s) => {
     if (!(typeof s === 'number' && s >= 0)) return '—'
     const d = Math.floor(s / 86400)
@@ -2425,15 +2506,18 @@ function SysPanel ({ onReady, active = true }) {
   </div>`
 }
 
-// 状态目录文件清单（v3.298）：进系统页加载 + 手动刷新。符号链接/目录作为异常条目显性
+// 状态目录文件清单（v3.298）：启动预加载 + 切回系统页刷新 + 手动刷新。符号链接/目录作为异常条目显性
 // 展示（bytes 为 ——— 意为「不适用」，服务端不跟随符号链接、不泄露目标元数据）。
 function FilesPanel ({ onReady, active = true }) {
-  const { data, err, load } = usePanelLoader(apiGetFiles)
+  const [loadTick, setLoadTick] = useState(0)
+  const bumpTick = useCallback(() => setLoadTick((v) => v + 1), [])
+  const { data, err, load } = usePanelLoader(apiGetFiles, bumpTick)
   // 保活后系统页切回来时补拉一次；离开不拉。data 保留，不出现加载占位。
-  useEffect(() => { if (active) load().catch(() => {}) }, [load, active])
-  // 文件清单是系统页的下半截；它落定前不能释放切页垫高。
+  usePanelAutoLoad(active, load)
+  // 文件清单是系统页的下半截；它落定前不能释放切页垫高。loadTick 让切回重拉完成
+  // 后也再报一次，否则 ready 首访后就一直为 true，头部「数据截至」不会更新。
   const ready = !!(data || err)
-  useEffect(() => { if (ready && typeof onReady === 'function') onReady() }, [ready, onReady])
+  useEffect(() => { if (ready && typeof onReady === 'function') onReady() }, [ready, loadTick, onReady])
   const files = data && Array.isArray(data.files) ? data.files : []
   return html`<div class="panel">
     <${PanelHead} title="缓存目录文件"
@@ -2528,8 +2612,8 @@ function ConfigPanel ({ onSync, active = true }) {
     load().catch(() => {})
     loadEff().catch(() => {})
   }, [load, loadEff])
-  // 保活后每次切回本页静默重拉（旧值留在原地）；离开本页不拉。
-  useEffect(() => { if (active) refresh() }, [refresh, active])
+  // 启动预加载；保活后每次切回本页静默重拉（旧值留在原地），离开本页不拉。
+  usePanelAutoLoad(active, refresh)
   const r = data && data.runtime ? data.runtime : null
   const pc = data && data.pushChannels ? data.pushChannels : null
   // 读面失败时 usePanelLoader 仍保留上一次的 data（不清空），这里必须显式丢弃，
@@ -2735,7 +2819,7 @@ function FilterField ({ def, value, saved, error, onChange }) {
   </div>`
 }
 
-function FilterRulesPanel ({ onSync }) {
+function FilterRulesPanel ({ onSync, active = true }) {
   const [data, setData] = useState(null)
   const [draft, setDraft] = useState(null)
   const [base, setBase] = useState(null)
@@ -2787,6 +2871,14 @@ function FilterRulesPanel ({ onSync }) {
   }, [applyLoaded, onSync])
 
   useEffect(() => { load().catch(() => {}) }, [load])
+  // 首访预加载后规则文件可能已经变了：第一次真正点开本页时静默补一次（旧数据留在
+  // 原地，不闪加载）。只在第一次打开时补；之后再切回不重拉，避免覆盖未保存草稿。
+  const openedRef = useRef(active)
+  useEffect(() => {
+    if (!active || openedRef.current) return
+    openedRef.current = true
+    load().catch(() => {})
+  }, [active, load])
 
   const dirtyFields = useMemo(() => {
     if (!draft || !base) return []
@@ -3221,15 +3313,19 @@ function App () {
   // 这是网关（WorkBuddy）切换丝滑的原因：它也是所有 page 常驻、只 toggle 可见性。
   const [visited, setVisited] = useState(() => new Set([resolveTab(window.location.hash)]))
   const visitedRef = useRef(visited)
+  // 「真正点开过」的页签（用于滚动锚定）。预加载会把六个页签都挂上，但没点开过的页
+  // 仍要按首访处理：先垫高，等内容/预加载落定再落位，避免点击瞬间文档变矮被夹到顶部
+  // （Sourcery #272）。
+  const enteredRef = useRef(new Set([resolveTab(window.location.hash)]))
   const markVisited = useCallback((key) => {
     if (visitedRef.current.has(key)) return
-    visitedRef.current.add(key)
-    setVisited((prev) => {
-      if (prev.has(key)) return prev
-      const next = new Set(prev)
-      next.add(key)
-      return next
-    })
+    // 不能先改 visitedRef.current 再交给 setVisited：那样 ref 与 state 是同一个 Set，
+    // 更新器里 prev.has(key) 恒为真，会返回旧集合，state 实际上没换新（只靠 setTab
+    // 顺带重渲染才碰巧能看见）。这里先复制，再同时替换 ref 与 state。
+    const next = new Set(visitedRef.current)
+    next.add(key)
+    visitedRef.current = next
+    setVisited(next)
   }, [])
   // 跳日志请求：{q, mode, n}。n 只用来做 key，重复点同一行也能强制重挂载。
   const [logJump, setLogJump] = useState(null)
@@ -3238,6 +3334,13 @@ function App () {
   // 凭证失效（审查 #224）：任一 API 401 ⇒ 停轮询并显示自助恢复提示，不再每 5s 空打。
   const [authExpired, setAuthExpired] = useState(false)
   const [nextAt, setNextAt] = useState(0)
+  // 首屏渲染完就把六个页签全部挂上（隐藏），让它们的数据先加载。这样刷新网页后
+  // 第一次点某个页签也只是切 hidden，而不是「现挂载 + 现请求」闪一下加载占位。
+  // 各面板的 active 门控保证隐藏期间不轮询；这里只承担一次首载。
+  useEffect(() => {
+    if (authExpired) return
+    for (const t of TABS) markVisited(t.key)
+  }, [authExpired, markVisited])
   // 表单交互暂停轮询的截止时间（见下方 focusin/change/input 监听）。不能只看
   // activeElement：用户选完下拉后焦点仍停在 select 上，会永久冻住自动刷新。
   const formPauseUntilRef = useRef(0)
@@ -3352,7 +3455,8 @@ function App () {
     const from = tabRef.current
     const y = window.scrollY
     if (from && from !== next) scrollMemRef.current[from] = y
-    const firstVisit = !visitedRef.current.has(next)
+    const firstVisit = !enteredRef.current.has(next)
+    enteredRef.current.add(next)
     const mem = scrollMemRef.current[next]
     // 第一次进入沿用当前视口；只有 forceTop（查看日志）才回 0。
     const target = forceTop ? 0 : (typeof mem === 'number' ? mem : y)
@@ -3369,6 +3473,11 @@ function App () {
   useLayoutEffect(() => {
     if (logJumpPendingRef.current) {
       logJumpPendingRef.current = false
+      // openLog 已经把 pendingScrollRef 置 0、pendingFirstVisitRef 置 true；这里直接
+      // 回顶后必须一并清掉，否则之后清 logJump 让 effect 重跑时会消费这个 stale 0，
+      // 把已在日志页滚动的用户再拽回顶部（审查 must-fix #3）。
+      pendingScrollRef.current = null
+      pendingFirstVisitRef.current = false
       scrollMemRef.current[tab] = 0
       holdAnchor()
       releaseScrollHold()
@@ -3830,7 +3939,7 @@ function App () {
       <${ConfigPanel} active=${tab === 'config'} onSync=${syncFor.config} />
     </section>`}
     ${!authExpired && visited.has('filter') && html`<section class="page" hidden=${tab !== 'filter'}>
-      <${FilterRulesPanel} onSync=${syncFor.filter} />
+      <${FilterRulesPanel} onSync=${syncFor.filter} active=${tab === 'filter'} />
     </section>`}
     ${!authExpired && visited.has('sys') && html`<section class="page" hidden=${tab !== 'sys'}>
       <div>

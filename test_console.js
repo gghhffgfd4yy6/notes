@@ -4275,8 +4275,8 @@ async function main () {
       '切页必须把目标位置交给 pendingScrollRef')
     assert.ok(prepBlock.includes('if (firstVisit && target > 0) holdScroll(target)'),
       '切页前必须先垫高文档，避免首访卸载/挂载之间塌陷')
-    assert.ok(prepBlock.includes('const firstVisit = !visitedRef.current.has(next)'),
-      '必须先判断目标页是否首访，再决定是否垫高')
+    assert.ok(prepBlock.includes('const firstVisit = !enteredRef.current.has(next)'),
+      '必须先判断目标页是否真正点开过（预挂载不算），再决定是否垫高')
     const prepPos = switchBlock.indexOf('prepareScroll(next)')
     const tabPos = switchBlock.indexOf('setTab(next)')
     assert.ok(prepPos > -1 && prepPos < tabPos, '必须先 prepareScroll 再 setTab')
@@ -4374,8 +4374,13 @@ async function main () {
     }
     assert.ok(src.includes('const [visited, setVisited] = useState(() => new Set(['),
       '必须记录已挂载的页签集合')
-    assert.ok(src.includes('visitedRef.current.add(key)') && src.includes('const next = new Set(prev)') &&
-      src.includes('return next'), 'markVisited 必须真的把新页签写进 state（返回 next，不能返回 prev）')
+    assert.ok(src.includes('const next = new Set(visitedRef.current)') &&
+      src.includes('visitedRef.current = next') && src.includes('setVisited(next)'),
+    'markVisited 必须先复制 Set，再同时替换 ref 与 state（不能原地改 state 持有的 Set）')
+    assert.ok(!src.includes('visitedRef.current.add(key)'), '不得原地修改 state 持有的 Set')
+    assert.ok(src.includes('next.add(key)'), 'markVisited 必须把传入的 key 加进副本（不能写死别的页签）')
+    assert.ok(src.includes('for (const t of TABS) markVisited(t.key)'),
+      '首屏后必须预挂载全部页签，刷新后第一次点击不闪加载占位')
     assert.ok(src.includes('markVisited(next)') && src.includes("markVisited('logs')"),
       '点击页签 / 查看日志 / hash 前进后退都必须登记保活')
     // 已保活页直接落位；首访才垫高。
@@ -4383,6 +4388,8 @@ async function main () {
       '已保活页必须在 layout effect 里直接调用 scrollTo 落到记忆位置')
     assert.ok(src.includes('if (firstVisit && target > 0) holdScroll(target)'),
       '只有首访才垫高文档')
+    assert.ok(/if \(logJumpPendingRef\.current\) \{[\s\S]{0,400}?pendingScrollRef\.current = null[\s\S]{0,200}?window\.scrollTo\(0, 0\)/.test(src),
+      'logJump 强制回顶后必须清掉 pending 引用，避免下次 effect 误消费 stale 0')
     // 隐藏页不轮询、不跟着倒计时重渲染、不保持 SSE。
     assert.ok(src.includes("autoRefresh && tab === 'overview' ? pollMs : 0"), '概览隐藏后触发历史必须停轮询')
     assert.ok(src.includes("autoRefresh && tab === 'logs' ? pollMs : 0"), '日志页隐藏后触发历史必须停轮询')
@@ -4398,19 +4405,31 @@ async function main () {
     assert.ok(src.includes('active=$' + "{tab === 'overview'} />"), '逐轮历史切回必须刷新')
     assert.ok(src.includes('<$' + '{SysPanel} onReady=$' + '{onSysReady} active=$' + "{tab === 'sys'}"), '系统页切回必须刷新')
     assert.ok(src.includes('<$' + '{FilesPanel} onReady=$' + '{onFilesReady} active=$' + "{tab === 'sys'}"), '文件清单切回必须刷新')
-    assert.ok(src.includes('<$' + '{FilterRulesPanel} onSync=$' + '{syncFor.filter} />'), '过滤规则页有草稿，切回不得重拉覆盖')
+    assert.ok(src.includes('<$' + '{FilterRulesPanel} onSync=$' + '{syncFor.filter} active=$' + "{tab === 'filter'}"), '过滤规则页必须拿到 active，首次打开补拉、之后切回不重拉')
     const filterSeg = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('function App ()'))
     assert.ok(!filterSeg.includes('if (active) load()'), '过滤规则页不得在切回时重拉')
     // 各面板自己必须真的消费 active（父组件传了 prop 但子组件不 reload 也算失败）。
     const seg = (name, next) => src.slice(src.indexOf('function ' + name), src.indexOf(next))
-    assert.ok(seg('MessagesPanel', 'function LogsPanel').includes('if (active) load()'), '推送记录必须 active-gated reload')
+    assert.ok(seg('MessagesPanel', 'function LogsPanel').includes('usePanelAutoLoad(active, load)'), '推送记录必须首访预加载 + 切回刷新')
     assert.ok(seg('LogsPanel', 'function SysPanel').includes('load(true).catch'), '日志切回必须排队补拉（busy 时不能丢）')
-    assert.ok(seg('ConfigPanel', 'function FilterRulesPanel').includes('if (active) refresh()'), '配置必须 active-gated reload')
-    assert.ok(seg('TrendsPanel', 'function CacheHealthPanel').includes('if (active) load()'), '趋势必须 active-gated reload')
-    assert.ok(seg('RunHistoryPanel', 'function usePanelLoader').includes('if (active) load()'), '逐轮历史必须 active-gated reload')
-    assert.ok(seg('SysPanel', 'function FilesPanel').includes('if (active) load()'), '系统必须 active-gated reload')
-    assert.ok(seg('FilesPanel', 'function FilterRules').includes('if (active) load()'), '文件清单必须 active-gated reload')
-    assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('if (timerStartedRef.current) load()'), '缓存健康切回必须立即补拉一次')
+    assert.ok(seg('ConfigPanel', 'function FilterRulesPanel').includes('usePanelAutoLoad(active, refresh)'), '配置必须首访预加载 + 切回刷新')
+    assert.ok(seg('TrendsPanel', 'function CacheHealthPanel').includes('usePanelAutoLoad(active, load)'), '趋势必须首访预加载 + 切回刷新')
+    assert.ok(seg('RunHistoryPanel', 'function usePanelLoader').includes('usePanelAutoLoad(active, load)'), '逐轮历史必须首访预加载 + 切回刷新')
+    assert.ok(seg('SysPanel', 'function FilesPanel').includes('Promise.allSettled([load(), loadAccess()])'),
+      '系统页必须等同一次刷新的两个请求都结算后才报完成')
+    assert.ok(seg('FilesPanel', 'function FilterRules').includes('usePanelAutoLoad(active, load)'), '文件清单必须首访预加载 + 切回刷新')
+    assert.ok(src.includes('function usePanelAutoLoad') && src.includes('if (!active && !first) return') &&
+      src.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
+    '必须有首访预加载 hook：未点开的页签也先拉一次，离开后不拉')
+    assert.ok(seg('LogsPanel', 'function SysPanel').includes('const firstReveal = preloadedRef.current && active && !revealedRef.current'),
+      '日志首访也要预加载，离开后不拉')
+    assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('filesLoader.load().catch'),
+      '缓存健康切回必须连右列文件清单一起补拉')
+    assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('if (wasPaused) {'), '缓存健康从暂停/隐藏恢复时必须立即补拉一次')
+    assert.ok(src.includes('let filesInFlight = null') && src.includes('if (filesInFlight) return filesInFlight'),
+      '三个面板同时要 /api/files 时必须共享同一个在飞请求')
+    assert.ok(seg('FilesPanel', 'function FilterRules').includes('loadTick'),
+      '文件清单重拉完成也必须重报 ready，头部时间才会更新')
     // 保活带来的两个交互坑：分类弹层要主动关（否则 body overflow:hidden 卡住新页面）；
     // 多个保留页面的确认弹窗不能共用固定 id。
     assert.ok(seg('CategoryPicker', 'function MessagesPanel').includes('if (!pageActive && open) setOpen(false)'),
@@ -4419,7 +4438,10 @@ async function main () {
       src.includes('aria-labelledby=$' + '{titleId}') && src.includes('id=$' + '{titleId}'),
     '确认弹窗标题 id 必须逐实例唯一')
     assert.ok(/\.page\[hidden\]\s*\{\s*display:\s*none/.test(css), '隐藏页面必须真正 display:none，不能占布局')
-    assert.ok(/\.page\s*\{[^}]*min-height:/.test(css), '页面必须有最小高度，首访加载时页脚不能跳到首屏中间')
+    assert.ok(/\.wrap\s*\{[^}]*display:\s*flex[^}]*min-height:\s*100dvh/.test(css),
+      '页脚贴底必须用列布局，不能靠写死的 100vh 减常量')
+    assert.ok(/\.page\s*\{\s*flex:\s*1 0 auto/.test(css), '当前页必须吃掉剩余高度')
+    assert.ok(!/\.page\s*\{[^}]*min-height:/.test(css), '不得再用固定减值的 min-height（短页会多出滚动）')
   })
 
   await aok('结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）', () => {
