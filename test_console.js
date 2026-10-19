@@ -4196,11 +4196,28 @@ async function main () {
       '目标页更矮时只在用户未接管时落到最大位置')
     assert.ok(scrollBlock.includes('window.scrollTo(0, Math.max(0, document.documentElement.scrollHeight - window.innerHeight))'),
       '落位必须用页面最大滚动位置，不能回 0')
-    assert.ok(scrollBlock.includes('hold.check(true)') && scrollBlock.includes('panelSync >= hold.startedAt'),
-      '目标面板加载完成后必须让垫高就地收口')
+    assert.ok(scrollBlock.includes('hold.check(true)') && scrollBlock.includes('panelReadyAt >= hold.startedAtMono'),
+      '目标面板加载完成后必须让垫高就地收口（单调时钟，不受系统时钟回拨影响）')
     assert.ok(scrollBlock.includes('setTimeout(check, 9000)'), '加载失败必须有 9s 兜底释放，不能永久垫高')
-    assert.ok(src.includes('const make = (key) => (ts) => { if (tabRef.current === key) setPanelSync(ts) }'),
-      '完成回调必须绑定页签，旧页在途响应不得释放新页垫高')
+    const syncBlock = src.slice(src.indexOf('const syncFor = useMemo'), src.indexOf('// 系统页由两个面板组成'))
+    assert.ok(syncBlock.includes('syncMemRef.current[key] = ts') && syncBlock.includes('setPanelSync(ts)') &&
+      syncBlock.includes('setPanelReadyAt(performance.now())') && syncBlock.includes('if (tabRef.current === key)'),
+    '成功回调必须同时缓存本页时间、更新当前页显示、写单调 ready 标记')
+    const sysBlock = src.slice(src.indexOf('const markSysReady'), src.indexOf('const onSysReady'))
+    assert.ok(sysBlock.includes('syncMemRef.current.sys = ts') && sysBlock.includes('setPanelReadyAt(performance.now())'),
+      '系统页两个面板都完成时必须缓存 sys 时间并写 ready 标记')
+    const switchSyncBlock = src.slice(src.indexOf('const switchTab ='), src.indexOf('// 「查看日志」跳转'))
+    assert.ok(switchSyncBlock.includes('showSyncFor(next)'), '页签点击必须同步切到目标页缓存时间')
+    const hashSyncBlock = src.slice(src.indexOf('const onHash ='), src.indexOf("window.addEventListener('hashchange'"))
+    assert.ok(hashSyncBlock.includes('showSyncFor(next)'), '后退/前进必须同步切到目标页缓存时间')
+    const openLogSyncBlock = src.slice(src.indexOf('const openLog ='), src.indexOf('const pollMs ='))
+    assert.ok(openLogSyncBlock.includes("showSyncFor('logs')"), '查看日志必须切到 logs 的缓存时间')
+    assert.ok(src.includes('const loadSeqRef = useRef(0)') &&
+      src.includes('if (seq !== loadSeqRef.current || !mountedRef.current) return'),
+    '过滤规则页必须做竞态/卸载守卫，旧响应不能刷新时间戳')
+    assert.ok(!src.includes('useEffect(() => { setPanelSync(null) }, [tab])'),
+      '换页不得清空时间，否则每次切页都会闪一下手动刷新')
+    assert.ok(src.includes("'数据截至 · —'"), '第一次进入未加载时必须用占位符，不能整行换成手动刷新')
     assert.ok(src.includes('if (configAt && filterAt && typeof onSync'), '配置页两个 loader 都落定才算完成')
     assert.ok(src.includes('if (sysReady && accessReady && typeof onReady'), '系统页两个 loader 都落定才算完成')
     assert.ok(src.includes('onReady=$' + '{onSysReady}') && src.includes('onReady=$' + '{onFilesReady}'),
