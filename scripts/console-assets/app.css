@@ -114,9 +114,12 @@
 }
 
 @layer components {
-  .wrap { max-width: 1200px; margin: 0 auto; padding: var(--sp-5) var(--sp-4) var(--sp-10); }
-  /* 页签保活：只有当前页参与布局，其余页留在 DOM 里但不可见。 */
-  .page { min-height: calc(100vh - 132px); min-height: calc(100dvh - 132px); }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: var(--sp-5) var(--sp-4) var(--sp-10);
+    display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; }
+  /* 页签保活：只有当前页参与布局，其余页留在 DOM 里但不可见。
+     用列布局把剩余高度给当前页，页脚自然贴底；不再写死「100vh - 132px」这种
+     只减顶部、不减页脚和 padding 的固定常量（短页会多出一段无意义滚动）。 */
+  .page { flex: 1 0 auto; }
   .page[hidden] { display: none; }
 
   /* ── 顶栏 ── */
