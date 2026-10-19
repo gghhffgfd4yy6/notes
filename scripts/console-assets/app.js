@@ -2428,6 +2428,10 @@ function FilterRulesPanel ({ onSync }) {
   const [notice, setNotice] = useState(null)
   const [preview, setPreview] = useState(null)
   const [dialog, setDialog] = useState(null)
+  // 竞态/卸载守卫：只应用最新一次 load 的响应；旧响应不能刷新时间戳或覆盖草稿。
+  const loadSeqRef = useRef(0)
+  const mountedRef = useRef(true)
+  useEffect(() => () => { mountedRef.current = false }, [])
 
   const applyLoaded = useCallback((d, files) => {
     const revision = d && Number.isSafeInteger(d.revision) ? d.revision : 0
@@ -2444,17 +2448,20 @@ function FilterRulesPanel ({ onSync }) {
   }, [])
 
   const load = useCallback(async () => {
+    const seq = ++loadSeqRef.current
     setLoading(true)
     setErr('')
     try {
       // 备份清单与规则读取并行：/api/files 只是下拉数据，读不到不阻断规则编辑。
       const [d, files] = await Promise.all([apiGetFilter(), apiGetFiles().catch(() => null)])
+      if (seq !== loadSeqRef.current || !mountedRef.current) return
       applyLoaded(d, files)
       if (typeof onSync === 'function') onSync(Date.now())
     } catch (e) {
+      if (seq !== loadSeqRef.current || !mountedRef.current) return
       setErr(`加载失败：${e.message}`)
     } finally {
-      setLoading(false)
+      if (seq === loadSeqRef.current && mountedRef.current) setLoading(false)
     }
   }, [applyLoaded, onSync])
 
@@ -2872,9 +2879,11 @@ function App () {
   const [runsState, setRunsState] = useState('loading') // loading | ok | error
   const [busy, setBusy] = useState(false)
   const [lastSync, setLastSync] = useState(null)
-  // 非概览页的「数据截至」必须来自当前页自己的成功加载：共用一个 lastSync 会把
-  // 概览/runs 的时间挂到日志页上（Sourcery PR#252）；换页时清空，加载失败就显示手动刷新。
+  // 非概览页的「数据截至」按页签缓存：每个页签只认自己的成功加载时间，
+  // 切回已来过的页签先显示上次时间，首次进入/加载失败显示「数据截至 · —」。
   const [panelSync, setPanelSync] = useState(null)
+  // 单调时钟：本次成功加载的时刻，只用于释放滚动垫高；不受系统时钟回拨影响。
+  const [panelReadyAt, setPanelReadyAt] = useState(0)
   const [syncErr, setSyncErr] = useState('')
   // 标签页写 hash（v3.307）：刷新/后退不丢当前页；初始值从 hash 读，非法值回概览。
   // v3.310「过滤规则」新增为第六个页签。pure.mjs 的 tabFromHash 只认 v3.307 的五个键
@@ -2905,8 +2914,9 @@ function App () {
   // 首次刷新完成前不判「无活跃任务」（启动时 runs 尚空，会把丢失响应的 busy 立刻清掉）。
   const refreshedOnceRef = useRef(false)
 
-  // 换页先清掉上一页的「数据截至」；当前页自己的 loader 成功后再写入。
-  useEffect(() => { setPanelSync(null) }, [tab])
+  // 每个页签记住自己的「数据截至」：切回已来过的页签时先显示上次时间，
+  // 不再先闪一下「手动刷新」再跳成时间。第一次进入才显示占位符。
+  const syncMemRef = useRef({})
 
   // 切页的滚动策略（修 #260 的二次跳动）：
   // 1) 每个页签记住自己的 scrollY；第一次进入的页签沿用当前视口位置（#260 的初衷：
@@ -2926,8 +2936,19 @@ function App () {
   tabRef.current = tab
   // 每个面板只接受「自己这一页」的完成回调：切走后旧请求再回包，不碰新页的垫高。
   const syncFor = useMemo(() => {
-    const make = (key) => (ts) => { if (tabRef.current === key) setPanelSync(ts) }
+    const make = (key) => (ts) => {
+      if (typeof ts === 'number') syncMemRef.current[key] = ts
+      if (tabRef.current === key) {
+        setPanelSync(ts)
+        setPanelReadyAt(performance.now())
+      }
+    }
     return { messages: make('messages'), logs: make('logs'), config: make('config'), filter: make('filter') }
+  }, [])
+  // 切页时同步换成目标页签自己的时间（没有就占位），同一帧内完成，不闪上一页/手动刷新。
+  const showSyncFor = useCallback((next) => {
+    const ts = syncMemRef.current[next]
+    setPanelSync(typeof ts === 'number' ? ts : null)
   }, [])
   // 系统页由两个面板组成（SysPanel + FilesPanel）；两边都落定才允许释放垫高。
   const sysReadyRef = useRef(null)
@@ -2935,8 +2956,11 @@ function App () {
     if (tabRef.current !== 'sys') return
     if (!sysReadyRef.current) sysReadyRef.current = new Set()
     sysReadyRef.current.add(key)
-    const hold = scrollHoldRef.current
-    if (sysReadyRef.current.size >= 2 && hold) hold.check(true)
+    if (sysReadyRef.current.size < 2) return
+    const ts = Date.now()
+    syncMemRef.current.sys = ts
+    setPanelSync(ts)
+    setPanelReadyAt(performance.now())
   }, [])
   const onSysReady = useCallback(() => markSysReady('sys'), [markSysReady])
   const onFilesReady = useCallback(() => markSysReady('files'), [markSysReady])
@@ -3018,7 +3042,7 @@ function App () {
     holdAnchor()
     window.scrollTo(0, y)
     const t0 = performance.now()
-    const hold = { y, user: false, raf: 0, timer: 0, ro: null, onUser: null, check: null, startedAt: Date.now() }
+    const hold = { y, user: false, raf: 0, timer: 0, ro: null, onUser: null, check: null, startedAtMono: performance.now() }
     hold.onUser = () => { hold.user = true; if (hold.check) hold.check() }
     window.addEventListener('wheel', hold.onUser, { capture: true, passive: true })
     window.addEventListener('touchstart', hold.onUser, { capture: true, passive: true })
@@ -3069,11 +3093,12 @@ function App () {
   }, [])
 
   // 目标面板报「加载完成」后，如果它的内容撑不到记忆位置，就地落到最大滚动位置；
-  // 只认切页后新面板写入的 sync，避免上一页在途响应把垫高提前撤掉。
+  // 只认切页后新面板写入的 panelReadyAt（单调时钟）：缓存时间/上一页在途响应
+  // 都不会把垫高提前撤掉，系统时钟回拨也不影响。
   useEffect(() => {
     const hold = scrollHoldRef.current
-    if (hold && panelSync && panelSync >= hold.startedAt) hold.check(true)
-  }, [panelSync])
+    if (hold && panelReadyAt >= hold.startedAtMono) hold.check(true)
+  }, [panelReadyAt])
 
   // 标签栏是单行横滚：切页、旋转屏幕或改窗口宽度后都要把当前页签滚进可视区，
   // 否则活动页签会停在滚动容器的裁剪边之外（Sourcery #260）。只改 .tabs 的
@@ -3235,8 +3260,11 @@ function App () {
     const onHash = () => {
       const next = resolveTab(window.location.hash)
       if (next === tabRef.current) return
+      // 系统页每次进入都重新等两个面板，不能拿上一次的 ready 集合提前收口。
+      if (next === 'sys') sysReadyRef.current = null
       // 后退/前进也走同一套记忆与垫高，不再绕过 switchTab 丢失还原。
       prepareScrollRef.current(next)
+      showSyncFor(next)
       setTab(next)
       tabRef.current = next
     }
@@ -3310,9 +3338,11 @@ function App () {
   // v3.307 同步写 hash：刷新/后退能回到同一页。
   const switchTab = (next) => {
     if (next === tab) return
+    if (next === 'sys') sysReadyRef.current = null
     // 统一走 prepareScroll：保存出发页位置、决定目标页位置、需要时先垫高。
     // 第一次进入沿用当前视口，不把整页拽回顶部；只有「查看日志」走 forceTop。
     prepareScroll(next)
+    showSyncFor(next)
     setTab(next)
     tabRef.current = next
     if (window.location.hash !== `#/${next}`) window.location.hash = `#/${next}`
@@ -3324,6 +3354,7 @@ function App () {
     prepareScrollRef.current('logs', { forceTop: true })
     logJumpPendingRef.current = true
     setLogJump({ q: jump && jump.q ? jump.q : '', mode: jump && jump.mode ? jump.mode : 'all', n: Date.now() })
+    showSyncFor('logs')
     setTab('logs')
     tabRef.current = 'logs'
     if (window.location.hash !== '#/logs') window.location.hash = '#/logs'
@@ -3347,7 +3378,7 @@ function App () {
           ? html`${autoRefresh ? html`<${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${lastSync} />` : '自动刷新已暂停'}
             <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
               onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`
-          : panelSync ? `数据截至 · ${fmtLocalTime(panelSync)}` : '手动刷新'}
+          : panelSync ? `数据截至 · ${fmtLocalTime(panelSync)}` : '数据截至 · —'}
         ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
       </div>
     </header>
