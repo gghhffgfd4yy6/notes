@@ -529,23 +529,23 @@ function schemaReport (seg, mutants) {
   assert.ok(script.includes('gh api'), `run 段必须实际调用 gh api，实际：${script}`)
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-resolver-'))
   try {
-    const bin = path.join(tmp, 'bin')
-    fs.mkdirSync(bin)
-    fs.writeFileSync(path.join(bin, 'gh'), [
-      '#!/usr/bin/env bash',
-      'case "$GH_STUB_MODE" in',
-      '  ok) echo "2026-10-19T02:03:37Z" ;;',
-      '  empty) printf "" ;;',
-      '  bad) echo "not-a-date" ;;',
-      '  fail) echo "HTTP 403" >&2; exit 1 ;;',
-      'esac'
-    ].join('\n'), { mode: 0o755 })
+    // 用同 shell 的函数桩代替 PATH 前置：不引入任何可写目录（S4036 无从触发），函数也必然优先于外部 gh。
+    const stub = [
+      'gh () {',
+      '  case "$GH_STUB_MODE" in',
+      '    ok) echo "2026-10-19T02:03:37Z" ;;',
+      '    empty) printf "" ;;',
+      '    bad) echo "not-a-date" ;;',
+      '    fail) echo "HTTP 403" >&2; return 1 ;;',
+      '  esac',
+      '}'
+    ].join('\n')
     const runCase = (mode) => {
       const envFile = path.join(tmp, 'env-' + mode)
       fs.writeFileSync(envFile, '')
-      const r = spawnSync('bash', ['-c', script], { // NOSONAR:S4036 测试桩必须让临时 bin（mkdtemp 0700、仅本用例写入）优先于系统 gh；S4036 的「不可写目录」前提在桩场景不成立
+      const r = spawnSync('bash', ['-c', stub + '\n' + script], {
         env: {
-          PATH: bin + ':/usr/bin:/bin',
+          PATH: '/usr/bin:/bin',
           GITHUB_ENV: envFile,
           GITHUB_REPOSITORY: 'o/r',
           GITHUB_RUN_ID: '1',
