@@ -1097,12 +1097,28 @@ function wxPusherBusinessError (data) {
 // 超过 WxPusher 的 1000 字符上限就整体放弃——被截断的链接必然打不开。
 const WXPUSHER_URL_MAX = 1000
 const WXPUSHER_CLICK_MODES = ['deal', 'detail', 'off']
+const WXPUSHER_DETAIL_MARKER = '原文链接'
+const URL_ENTITY_MAP = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' }
 let wxPusherClickModeWarned = false
 
-// 内容源的链接常被多层转义（&amp;amp;）——逐层解到稳定，最多 3 层防病态输入
+// 内容源的链接常被多层转义（&amp;amp; / &#38;）——逐层解到稳定，最多 3 层防病态输入。
+// 只解 URL 里有意义的实体；解出的控制字符会被 normalizeClickUrl 拒绝。
 function decodeUrlEntities (value) {
   let out = value
-  for (let i = 0; i < 3 && out.includes('&amp;'); i++) out = out.split('&amp;').join('&')
+  for (let i = 0; i < 3 && out.indexOf('&') >= 0; i++) {
+    const next = out.replace(/&(#[xX][0-9a-fA-F]{1,6}|#[0-9]{1,7}|[a-zA-Z]{2,8});/g, (m, body) => {
+      if (body[0] === '#') {
+        const hex = body[1] === 'x' || body[1] === 'X'
+        const code = parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10)
+        if (!Number.isFinite(code) || code < 32 || code > 0x10FFFF) return m
+        try { return String.fromCodePoint(code) } catch (e) { return m }
+      }
+      const named = URL_ENTITY_MAP[body.toLowerCase()]
+      return named === undefined ? m : named
+    })
+    if (next === out) break
+    out = next
+  }
   return out
 }
 
@@ -1114,76 +1130,141 @@ function normalizeClickUrl (value) {
   return raw.length <= WXPUSHER_URL_MAX ? raw : ''
 }
 
-// 线性扫描（不用回溯正则）：返回 from 之后第一个 HTML href 链接
-function nextHrefLink (text, from) {
-  let at = from
-  while (at < text.length) {
-    at = text.indexOf('href', at)
-    if (at < 0) return null
-    const start = at
-    at += 4
-    // 属性名精确匹配：排除 data-href= / xhref=
-    if (start > 0 && /[-\w]/.test(text[start - 1])) continue
-    let i = start + 4
-    while (i < text.length && (text[i] === ' ' || text[i] === '\t')) i++
-    if (text[i] !== '=') continue
-    i++
-    while (i < text.length && (text[i] === ' ' || text[i] === '\t')) i++
-    const quote = text[i]
-    if (quote !== '"' && quote !== "'") continue
-    const end = text.indexOf(quote, i + 1)
-    if (end < 0) return null
-    return { index: start, url: text.slice(i + 1, end) }
-  }
-  return null
-}
-
-// 线性扫描 Markdown 链接 [text](url) / [text](<url>)；图片 ![alt](src) 不算
-// 回看 '[' 的窗口设上限：畸形输入里大量 '](' 无配对 '[' 时，无界回看会退化成 O(n²)
-const MD_LINK_TEXT_MAX = 4000
-
-function lastOpenBracket (text, close) {
-  const start = Math.max(0, close - MD_LINK_TEXT_MAX)
-  for (let i = close - 1; i >= start; i--) if (text[i] === '[') return i
-  return -1
-}
-
-function nextMarkdownLink (text, from) {
-  let at = from
-  while (at < text.length) {
-    const close = text.indexOf('](', at)
-    if (close < 0) return null
-    at = close + 2
-    const open = lastOpenBracket(text, close)
-    if (open < 0) continue
-    if (open > 0 && text[open - 1] === '!') continue
-    let i = close + 2
-    while (i < text.length && /\s/.test(text[i])) i++
-    if (text[i] === '<') {
-      const end = text.indexOf('>', i + 1)
-      if (end < 0) continue
-      return { index: open, url: text.slice(i + 1, end), end: close + 2 }
+// Markdown 代码段/围栏里的「链接」只是示例文本，不能当点击目标（也不该让上游用示例
+// 抢走通知的跳转地址）。用等长掩码把代码内容换成空格：下标与原串一致，URL 切片不受影响。
+function maskCode (text) {
+  if (text.indexOf('`') < 0) return text
+  const out = text.split('')
+  let i = 0
+  while (i < text.length) {
+    if (text[i] !== '`') { i++; continue }
+    let size = 0
+    while (text[i + size] === '`') size++
+    let j = i + size
+    let close = -1
+    while (j < text.length) {
+      if (text[j] !== '`') { j++; continue }
+      let run = 0
+      while (text[j + run] === '`') run++
+      if (run >= size) { close = j + run; break }
+      j += run
     }
-    const end = text.indexOf(')', i)
-    if (end < 0) return null
-    return { index: open, url: text.slice(i, end), end: close + 2 }
+    if (close < 0) break // 未闭合的代码段在 CommonMark 里不是代码，保留原样
+    for (let k = i; k < close; k++) out[k] = ' '
+    i = close
   }
-  return null
+  return out.join('')
+}
+
+// 解析一个标签内的属性（大小写不敏感、支持引号/无引号值、'=' 两侧任意空白），返回 href 与标签结束位
+function parseTagAttributes (text, from) {
+  let i = from
+  let href = ''
+  while (i < text.length && text[i] !== '>') {
+    while (i < text.length && /\s/.test(text[i])) i++
+    if (i >= text.length || text[i] === '>') break
+    if (text[i] === '/') { i++; continue }
+    const nameStart = i
+    while (i < text.length && !/[\s=>/]/.test(text[i])) i++
+    const name = text.slice(nameStart, i).toLowerCase()
+    while (i < text.length && /\s/.test(text[i])) i++
+    let value = ''
+    if (text[i] === '=') {
+      i++
+      while (i < text.length && /\s/.test(text[i])) i++
+      const quote = text[i]
+      if (quote === '"' || quote === "'") {
+        const end = text.indexOf(quote, i + 1)
+        if (end < 0) { i = text.length; break }
+        value = text.slice(i + 1, end)
+        i = end + 1
+      } else {
+        const start = i
+        while (i < text.length && !/[\s>]/.test(text[i])) i++
+        value = text.slice(start, i)
+      }
+    }
+    if (name === 'href' && !href) href = value
+  }
+  return { href, end: i + 1 }
+}
+
+// 只把真正的 <a href> 当链接：正文里裸写的 href="..." 是文本，不是跳转目标
+function listHrefLinks (text) {
+  const links = []
+  let i = 0
+  while (i < text.length) {
+    const lt = text.indexOf('<', i)
+    if (lt < 0) break
+    i = lt + 1
+    if (text[i] === '/') i++
+    while (i < text.length && /\s/.test(text[i])) i++
+    const nameStart = i
+    while (i < text.length && /[a-zA-Z0-9-]/.test(text[i])) i++
+    const name = text.slice(nameStart, i).toLowerCase()
+    if (name !== 'a') continue
+    const parsed = parseTagAttributes(text, i)
+    i = parsed.end
+    if (parsed.href) links.push({ index: lt, url: parsed.href })
+  }
+  return links
+}
+
+// 解析 Markdown 目标：<...> 形式原样取；裸目标按括号配平扫描，遇到空白即止（后面是 title）。
+// 返回 dest.end 为 URL 结束位（用于找闭合的 ')'）。
+function readMarkdownDestination (text, from) {
+  let i = from
+  while (i < text.length && /\s/.test(text[i])) i++
+  if (text[i] === '<') {
+    const end = text.indexOf('>', i + 1)
+    if (end < 0) return null
+    return { url: text.slice(i + 1, end), end: end + 1 }
+  }
+  const start = i
+  let depth = 0
+  for (; i < text.length; i++) {
+    const c = text[i]
+    if (c === '\\') { i++; continue }
+    if (c === '(') { depth++; continue }
+    if (c === ')') { if (depth === 0) break; depth--; continue }
+    if (/\s/.test(c)) break
+  }
+  return { url: text.slice(start, i), end: i }
+}
+
+// 单次前向扫描 + 括号栈：链接文本里的嵌套方括号、图片 ![alt](src) 都能正确归类；
+// 总工作量 O(n)，不存在「每个 '](' 回看 4000 字符」的放大路径。
+function listMarkdownLinks (text) {
+  const links = []
+  const stack = []
+  let i = 0
+  while (i < text.length) {
+    const c = text[i]
+    if (c === '[') { stack.push(i); i++; continue }
+    if (c !== ']') { i++; continue }
+    const open = stack.pop()
+    if (open === undefined) { i++; continue }
+    if (text[i + 1] !== '(') { i++; continue }
+    const dest = readMarkdownDestination(text, i + 2)
+    if (!dest) { i++; continue }
+    const closeParen = text.indexOf(')', dest.end)
+    if (closeParen < 0) { i++; continue }
+    if (!(open > 0 && text[open - 1] === '!')) links.push({ index: open, url: dest.url })
+    i = closeParen + 1
+  }
+  return links
 }
 
 // 按文档顺序取第一条「可用」链接：形态合法但超长/非 http(s) 的候选跳过，
 // 继续看后面的（典型：微博线报的二维码长链 >1000 字符，应落到末尾原文链接）。
-// 两个扫描器各自持有游标、只前进不回头（每次 O(n) 只算一次，避免反复从头扫）。
 function firstClickUrl (text) {
-  let html = nextHrefLink(text, 0)
-  let md = nextMarkdownLink(text, 0)
-  while (html || md) {
-    const useHtml = Boolean(html) && (!md || html.index <= md.index)
-    const candidate = useHtml ? html : md
-    const url = normalizeClickUrl(candidate.url)
+  // 掩码后的串与原串等长：代码段里的示例链接被抹成空格，其余位置（含所有候选 URL）原样保留
+  const masked = maskCode(text)
+  const links = listHrefLinks(masked).concat(listMarkdownLinks(masked))
+  links.sort((a, b) => a.index - b.index)
+  for (const link of links) {
+    const url = normalizeClickUrl(link.url)
     if (url) return url
-    if (useHtml) html = nextHrefLink(text, html.index + 4)
-    else md = nextMarkdownLink(text, md.end)
   }
   return ''
 }
@@ -1211,8 +1292,10 @@ function pickWxPusherClickUrl (desp, mode) {
   const wanted = normalizeClickMode(mode)
   if (wanted === 'off') return ''
   if (wanted === 'detail') {
-    const at = text.lastIndexOf('原文链接')
-    return at < 0 ? firstClickUrl(text) : firstClickUrl(text.slice(at))
+    // detail 只认「原文链接」段：没有该段就返回空，不能悄悄退回正文外链——
+    // 用户选了 detail 却在点通知时打开商品页，比不跳转更糟。
+    const at = text.lastIndexOf(WXPUSHER_DETAIL_MARKER)
+    return at < 0 ? '' : firstClickUrl(text.slice(at))
   }
   return firstClickUrl(text)
 }

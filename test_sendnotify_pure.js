@@ -1314,9 +1314,53 @@ check('WxPusher clickUrl: detail 模式取末尾「原文链接」，不是正�
   assert.strictEqual(pickWxPusherClickUrl(desp, 'detail'), 'https://new.xianbao.fun/haodan/1.html')
 })
 
-check('WxPusher clickUrl: detail 模式没有「原文链接」段时回退第一条可用链接', () => {
+check('WxPusher clickUrl: detail 模式没有「原文链接」段时返回空（不得偷偷退回正文外链）', () => {
   const desp = '[下单](https://m.tb.cn/h.abc)'
-  assert.strictEqual(pickWxPusherClickUrl(desp, 'detail'), 'https://m.tb.cn/h.abc')
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'detail'), '')
+})
+
+check('WxPusher clickUrl: detail 模式只看「原文链接」段，正文外链在前也不受影响', () => {
+  const desp = '[下单](https://m.tb.cn/h.abc)\n\n[别的](https://u.jd.com/xyz)\n\n原文链接：[线报](https://new.xianbao.fun/haodan/1.html)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'detail'), 'https://new.xianbao.fun/haodan/1.html')
+})
+
+check('WxPusher clickUrl: Markdown 行内代码/围栏里的链接是示例文本，不当跳转目标', () => {
+  assert.strictEqual(pickWxPusherClickUrl('示例 `[点我](https://evil.example/inline)` 结束\n\n[真](https://m.tb.cn/h.ok)', 'deal'),
+    'https://m.tb.cn/h.ok')
+  assert.strictEqual(pickWxPusherClickUrl('```\n[x](https://evil.example/fence)\n```\n\n[真](https://m.tb.cn/h.ok)', 'deal'),
+    'https://m.tb.cn/h.ok')
+  // 只有代码里的链接 → 没有可用跳转目标
+  assert.strictEqual(pickWxPusherClickUrl('`[x](https://evil.example/only)`', 'deal'), '')
+})
+
+check('WxPusher clickUrl: HTML 属性大小写不敏感、支持无引号值与 = 两侧空白', () => {
+  assert.strictEqual(pickWxPusherClickUrl('<A HREF="https://m.tb.cn/h.up">x</A>', 'deal'), 'https://m.tb.cn/h.up')
+  assert.strictEqual(pickWxPusherClickUrl('<a href=https://u.jd.com/nq>x</a>', 'deal'), 'https://u.jd.com/nq')
+  assert.strictEqual(pickWxPusherClickUrl('<a href\n =\n "https://m.tb.cn/h.nl">x</a>', 'deal'), 'https://m.tb.cn/h.nl')
+})
+
+check('WxPusher clickUrl: 正文里裸写的 href="..." 不是 <a> 标签，不算链接', () => {
+  const desp = '参数写法：href="https://evil.example/inert"\n\n[真](https://m.tb.cn/h.ok)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'deal'), 'https://m.tb.cn/h.ok')
+})
+
+check('WxPusher clickUrl: Markdown 裸目标支持括号配平与 title', () => {
+  assert.strictEqual(pickWxPusherClickUrl('[商品](https://x.example/a(b)c)', 'deal'), 'https://x.example/a(b)c')
+  assert.strictEqual(pickWxPusherClickUrl('[商品](https://x.example/a "标题")', 'deal'), 'https://x.example/a')
+})
+
+check('WxPusher clickUrl: 图片 alt 含嵌套方括号时仍判为图片（不抢跳转目标）', () => {
+  const desp = '![图 [局部]](https://img.example/a.jpg)\n\n[真](https://m.tb.cn/h.ok)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'deal'), 'https://m.tb.cn/h.ok')
+})
+
+check('WxPusher clickUrl: 数字实体 &#38; 与命名实体都能解码', () => {
+  assert.strictEqual(pickWxPusherClickUrl('<a href="https://x.example/a?b=1&#38;c=2">x</a>', 'deal'),
+    'https://x.example/a?b=1&c=2')
+})
+
+check('WxPusher clickUrl: 出厂默认是 deal（改默认值必须显式改这条断言）', () => {
+  assert.strictEqual(push_config.WX_pusher_clickUrl, 'deal', '默认模式变了就等于默认行为变了，不能被空值回退掩盖')
 })
 
 check('WxPusher clickUrl: off 模式不产生链接（保持旧行为），大小写不敏感', () => {

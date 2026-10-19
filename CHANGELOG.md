@@ -534,7 +534,7 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 
 - **用法**：WxPusher 通知现在带 `url`（原文链接）字段。App 端在「我的 → 通用 → 通知点击设置」选「原文链接」后，点通知即可直接打开对应页面，省去「打开 App → 找消息 → 点链接」。
 - **`WX_pusher_clickUrl` 三种模式**：`deal`（默认）取正文第一条 http(s) 外链（线报的商品/活动链接），`detail` 只取末尾「原文链接」（线报详情页），`off` 不带链接、保持旧行为。环境变量同名，可用 `WX_PUSHER_CLICK_URL`。
-- **取链规则**：Markdown `[text](url)` 与 HTML `<a href>` 都能解析；图片 `![]()`、`data-href`、相对路径、非 http(s) 协议一律跳过；超过 WxPusher 1000 字符上限的链接（典型是微博线报的二维码长链）跳过并继续找下一条，最终回退到原文链接。
-- **为什么不直接用自定义 Scheme**：实测 434 条缓存线报里 84% 的外链是 `m.tb.cn` / `u.jd.com` 这类短链，没有商品 ID 可拼 Scheme，离线拼不出来；先跳 https 落地页（淘宝/京东 H5 自己会拉起 App），需要直达 App 的用户可在后续版本按域名加映射表。
+- **取链规则**：只认真正的链接结构——HTML 必须落在 `<a href>` 标签内（`data-href`、正文里裸写的 `href="..."` 不算），支持大小写属性名、无引号值与 `=` 两侧空白；Markdown 支持 `[text](url)`、`<url>` 目标、括号配平与 title，图片 `![]()`（含 alt 内嵌方括号）与代码段/围栏里的示例链接一律跳过。相对路径与非 http(s) 协议丢弃；超过 WxPusher 1000 字符上限的候选继续看下一条（典型是微博线报的二维码长链），最终回退到原文链接。解析为单次前向扫描，长消息不会退化成 O(n²)。
+- **为什么不直接用自定义 Scheme**：实测 460 余条缓存线报里 84% 的外链是 `m.tb.cn` / `u.jd.com` 这类短链，没有商品 ID 可拼 Scheme，离线拼不出来；先跳 https 落地页（淘宝/京东 H5 自己会拉起 App），需要直达 App 的用户可在后续版本按域名加映射表。
 - **范围**：仅 WxPusher 通道的请求体多一个 `url`；其它通道、消息正文、去重与缓存行为不变。取不到链接时整字段省略，请求体与旧版逐字一致。
-- **门禁**：`pickWxPusherClickUrl` 纯函数单测 11 条（`test_sendnotify_pure.js`）+ 4 条通道端到端（`test_notify.js`）；`xbk_sendNotify_slim.js` 增至 1735 行，变异矩阵 `sendnotify-part2` 尾段同步为 `751-1735`。
+- **门禁**：`pickWxPusherClickUrl` 纯函数单测 20 条（`test_sendnotify_pure.js`）+ 4 条通道端到端（`test_notify.js`）；`xbk_sendNotify_slim.js` 增至 1828 行，变异矩阵 `sendnotify-part2` 尾段同步为 `751-1828`。
