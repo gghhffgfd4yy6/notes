@@ -510,6 +510,187 @@ function Button ({ variant = 'secondary', disabled, onClick, title, buttonRef, c
   return html`<button ref=${buttonRef} class=${'btn btn-' + variant} disabled=${disabled} onClick=${onClick} title=${title}>${children}</button>`
 }
 
+// 深色小下拉：趋势窗口/每页条数/时间范围共用。
+// 不用原生 <select>：Android Chrome 会弹全屏白底系统列表，和暗色控制台完全割裂
+// （分类筛选已因此改 CategoryPicker）。这里保留锚定弹层：选项少时不铺满屏幕，
+// 空间不足向上翻，键盘/触屏同一套交互。
+function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) {
+  const list = Array.isArray(options) ? options : []
+  const [open, setOpen] = useState(false)
+  const [active, setActive] = useState(0)
+  const [place, setPlace] = useState({ up: false, max: 240, dx: 0, ready: false })
+  const rootRef = useRef(null)
+  const btnRef = useRef(null)
+  const popRef = useRef(null)
+  const focusedRef = useRef(false)
+
+  const selIdx = Math.max(0, list.findIndex((o) => o.value === value))
+  const current = list[selIdx]
+
+  const focusOpt = (i) => {
+    const pop = popRef.current
+    if (!pop) return
+    const el = pop.querySelector(`[data-idx="${i}"]`)
+    if (!el) return
+    // preventScroll：弹层在页面下部时，浏览器默认 focus 会把整页猛地滚下去。
+    el.focus({ preventScroll: true })
+    const r = el.getBoundingClientRect()
+    const pr = pop.getBoundingClientRect()
+    if (r.top < pr.top) pop.scrollTop -= (pr.top - r.top)
+    else if (r.bottom > pr.bottom) pop.scrollTop += (r.bottom - pr.bottom)
+  }
+
+  // 先量再显示：首帧用 visibility:hidden，避免先按「向下」铺一帧再跳到上方。
+  // 打开期间滚动/缩放也要重量：否则页面滚走后方向与高度还是旧值，选项会被裁掉。
+  useLayoutEffect(() => {
+    if (!open) return undefined
+    let raf = 0
+    const measure = () => {
+      const btn = btnRef.current
+      const pop = popRef.current
+      if (!btn || !pop) return
+      const b = btn.getBoundingClientRect()
+      const vw = window.innerWidth
+      const vh = window.innerHeight
+      const below = vh - b.bottom - 10
+      const above = b.top - 10
+      const natural = Math.min(pop.scrollHeight + 2, 320)
+      const up = below < Math.min(natural, 200) && above > below
+      const max = Math.max(48, Math.min(natural, up ? above : below))
+      // 水平也做视口夹取：默认右对齐，靠左的按钮 + 更长选项时不能越出左边界。
+      const w = pop.getBoundingClientRect().width
+      const pad = 8
+      const left = Math.min(Math.max(pad, b.right - w), Math.max(pad, vw - w - pad))
+      const dx = Math.round(left - b.left)
+      setPlace((prev) => (prev.ready && prev.up === up && prev.max === max && prev.dx === dx
+        ? prev
+        : { up, max, dx, ready: true }))
+    }
+    const schedule = () => {
+      if (raf) return
+      raf = window.requestAnimationFrame(() => { raf = 0; measure() })
+    }
+    measure()
+    window.addEventListener('resize', schedule)
+    window.addEventListener('scroll', schedule, { passive: true })
+    return () => {
+      if (raf) window.cancelAnimationFrame(raf)
+      window.removeEventListener('resize', schedule)
+      window.removeEventListener('scroll', schedule)
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!open) { focusedRef.current = false; return undefined }
+    if (!place.ready || focusedRef.current) return undefined
+    focusedRef.current = true
+    setActive(selIdx)
+    focusOpt(selIdx)
+    return undefined
+  }, [open, place.ready, selIdx])
+
+  useEffect(() => {
+    if (!open) return undefined
+    const onDown = (e) => {
+      if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false)
+    }
+    document.addEventListener('pointerdown', onDown, true)
+    return () => document.removeEventListener('pointerdown', onDown, true)
+  }, [open])
+
+  // busy/loading 时按钮 disabled；必须允许按钮本身失焦，不能再接键盘动作。
+  useEffect(() => { if (disabled && open) setOpen(false) }, [disabled, open])
+
+  const openMenu = () => {
+    if (disabled) return
+    setPlace({ up: false, max: 240, dx: 0, ready: false })
+    setActive(Math.max(0, list.findIndex((o) => o.value === value)))
+    setOpen(true)
+  }
+  const close = (refocus) => {
+    setOpen(false)
+    if (refocus && btnRef.current) btnRef.current.focus({ preventScroll: true })
+  }
+  const choose = (i) => {
+    const o = list[i]
+    close(true)
+    if (o && o.value !== value) onChange(o.value)
+  }
+  const move = (i) => {
+    if (list.length === 0) return
+    const next = Math.max(0, Math.min(list.length - 1, i))
+    setActive(next)
+    focusOpt(next)
+  }
+  // Tab 必须显式把焦点送到组件外的下一个/上一个可聚焦控件：只 close 再放行默认行为，
+  // 浏览器可能落在即将卸载的选项上，焦点会掉到 body。
+  const focusOutside = (dir) => {
+    const root = rootRef.current
+    const btn = btnRef.current
+    if (!root || !btn) return null
+    const sel = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
+    const els = [...document.querySelectorAll(sel)].filter((el) => !root.contains(el) && el.getClientRects().length > 0)
+    if (dir < 0) {
+      for (let i = els.length - 1; i >= 0; i--) {
+        if (btn.compareDocumentPosition(els[i]) & window.Node.DOCUMENT_POSITION_PRECEDING) return els[i]
+      }
+    } else {
+      for (const el of els) {
+        if (btn.compareDocumentPosition(el) & window.Node.DOCUMENT_POSITION_FOLLOWING) return el
+      }
+    }
+    return null
+  }
+  const onKeyDown = (e) => {
+    if (e.key === 'Escape' && open) { e.preventDefault(); close(true); return }
+    if (!open) {
+      if (!disabled && (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter' || e.key === ' ')) {
+        e.preventDefault()
+        openMenu()
+      }
+      return
+    }
+    switch (e.key) {
+      case 'ArrowDown': e.preventDefault(); move(active + 1); break
+      case 'ArrowUp': e.preventDefault(); move(active - 1); break
+      case 'Home': e.preventDefault(); move(0); break
+      case 'End': e.preventDefault(); move(list.length - 1); break
+      case 'Enter':
+      case ' ': e.preventDefault(); choose(active); break
+      case 'Tab': {
+        e.preventDefault()
+        const target = focusOutside(e.shiftKey ? -1 : 1)
+        close(false)
+        if (target) target.focus({ preventScroll: true })
+        else if (btnRef.current) btnRef.current.focus({ preventScroll: true })
+        break
+      }
+    }
+  }
+
+  const buttonLabel = current ? current.label : ''
+  const buttonAria = current ? `${ariaLabel}，当前 ${buttonLabel}` : ariaLabel
+  return html`<span class="mini-select" ref=${rootRef} onKeyDown=${onKeyDown}>
+    <button type="button" class="mini-btn" ref=${btnRef} disabled=${disabled}
+      aria-haspopup="listbox" aria-expanded=${open ? 'true' : 'false'} aria-label=${buttonAria}
+      onClick=${() => { if (open) close(true); else openMenu() }}>
+      <span class="mini-label">${buttonLabel}</span>
+      <span class="mini-caret" aria-hidden="true">▾</span>
+    </button>
+    ${open && html`<div class="mini-pop" ref=${popRef} role="listbox" aria-label=${ariaLabel}
+      style=${`left:${place.dx}px;right:auto;max-height:${place.max}px;visibility:${place.ready ? 'visible' : 'hidden'};${place.up ? 'top:auto;bottom:calc(100% + 6px);' : ''}`}>
+      ${list.map((o, i) => html`<button type="button" key=${o.value} data-idx=${i}
+        class=${'mini-opt' + (o.value === value ? ' on' : '')}
+        role="option" aria-selected=${o.value === value ? 'true' : 'false'}
+        tabIndex=${i === active ? 0 : -1}
+        onFocus=${() => setActive(i)}
+        onClick=${() => choose(i)}>
+        <span>${o.label}</span>${o.value === value ? html`<span class="mini-check" aria-hidden="true">✓</span>` : ''}
+      </button>`)}
+    </div>`}
+  </span>`
+}
+
 // 指标卡：标题 + 右上角徽章 + 若干行文本。换卡片实现（或组件库）只改这里。
 function Card ({ title, badge, children }) {
   return html`<div class="card">
@@ -1261,9 +1442,9 @@ function RunHistoryPanel ({ onOpenLog }) {
             ? `run.log 摘要逐轮 · 最近 ${all.length} 轮` + (data.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : '')
             : 'run.log 摘要逐轮 · 加载中…')}
       right=${html`<div class="toolbar">
-        <select class="msg-select" value=${String(size)} onChange=${(e) => changeSize(Number(e.target.value))} aria-label="每页显示条数">
-          ${RUN_PAGE_SIZES.map((n) => html`<option key=${n} value=${String(n)}>每页 ${n} 条</option>`)}
-        </select>
+        <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
+          options=${RUN_PAGE_SIZES.map((n) => ({ value: String(n), label: `每页 ${n} 条` }))}
+          onChange=${(v) => changeSize(Number(v))} />
         <${Button} variant="ghost" onClick=${refresh} disabled=${loading}>刷新<//>
       </div>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
@@ -1423,9 +1604,9 @@ function TrendsPanel () {
   }, [byDay.length])
   return html`<div class="panel">
     <${PanelHead} title=${shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势'}
-      afterTitle=${html`<select class="msg-select" value=${String(days)} onChange=${(e) => setDays(Number(e.target.value))} aria-label="趋势窗口天数">
-        ${TREND_DAYS.map((d) => html`<option key=${d} value=${String(d)}>${d} 日</option>`)}
-      </select>`}
+      afterTitle=${html`<${MiniSelect} value=${String(days)} ariaLabel="趋势窗口天数"
+        options=${TREND_DAYS.map((d) => ({ value: String(d), label: `${d} 日` }))}
+        onChange=${(v) => setDays(Number(v))} />`}
       sub=${'run.log 摘要按日聚合' + (trends && trends.truncated ? '（日志超限，仅统计尾部 1 MiB）' : '')}
       right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
@@ -1997,16 +2178,18 @@ function MessagesPanel ({ onSync }) {
       <${CategoryPicker} value=${cate} categories=${categories}
         total=${cateTotal}
         onChange=${(v) => { setCate(v); setPage(1) }} />
-      <select class="msg-select" value=${String(days)} onChange=${(e) => { setDays(Number(e.target.value)); setPage(1) }} aria-label="时间范围">
-        <option value="0">全部时间</option>
-        <option value="1">今天</option>
-        <option value="3">近 3 天</option>
-        <option value="7">近 7 天</option>
-        <option value="30">近 30 天</option>
-      </select>
-      <select class="msg-select" value=${String(size)} onChange=${(e) => { setSize(Number(e.target.value)); setPage(1) }} aria-label="每页显示条数">
-        ${[10, 20, 50, 100].map((n) => html`<option key=${n} value=${String(n)}>每页 ${n} 条</option>`)}
-      </select>
+      <${MiniSelect} value=${String(days)} ariaLabel="时间范围"
+        options=${[
+          { value: '0', label: '全部时间' },
+          { value: '1', label: '今天' },
+          { value: '3', label: '近 3 天' },
+          { value: '7', label: '近 7 天' },
+          { value: '30', label: '近 30 天' }
+        ]}
+        onChange=${(v) => { setDays(Number(v)); setPage(1) }} />
+      <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
+        options=${[10, 20, 50, 100].map((n) => ({ value: String(n), label: `每页 ${n} 条` }))}
+        onChange=${(v) => { setSize(Number(v)); setPage(1) }} />
       <${Button} variant="ghost" disabled=${loading} onClick=${refreshNow}>${loading ? '刷新中…' : '刷新'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
@@ -2962,12 +3145,13 @@ function FilterRulesPanel ({ onSync }) {
       <div class="fr-restore">
         <div class="fr-restore-head">回滚 / 恢复默认</div>
         <div class="fr-restore-row">
-          <label class="fr-label" for="filter-restore-to">回滚目标</label>
-          <select id="filter-restore-to" class="fr-select" value=${restoreTo} disabled=${!!busy || loading}
-            onChange=${(e) => setRestoreTo(e.target.value)}>
-            <option value="default">恢复代码默认（写入空覆盖文件）</option>
-            ${backups.map((r) => html`<option key=${r} value=${String(r)}>备份 r${r}</option>`)}
-          </select>
+          <span class="fr-label">回滚目标</span>
+          <${MiniSelect} value=${restoreTo} ariaLabel="回滚目标" disabled=${!!busy || loading}
+            options=${[
+              { value: 'default', label: '恢复代码默认（写入空覆盖文件）' },
+              ...backups.map((r) => ({ value: String(r), label: `备份 r${r}` }))
+            ]}
+            onChange=${setRestoreTo} />
           <${Button} variant="danger" disabled=${!!busy || loading} onClick=${() => setDialog({ kind: 'restore', to: restoreTo, baseRevision: revision })}>回滚<//>
         </div>
         <div class="fr-field-hint">${backups.length > 0

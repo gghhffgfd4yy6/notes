@@ -352,10 +352,36 @@
     flex: 1 1 200px; min-width: 160px; background: var(--panel-2); color: var(--text);
     border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); font-size: var(--fs-md);
   }
-  .msg-select {
+  /* 深色小下拉（趋势窗口/每页条数/时间范围）：替代原生 select 的白底系统列表 */
+  .mini-select { position: relative; display: inline-block; flex: 0 0 auto; }
+  .mini-btn {
+    display: inline-flex; align-items: center; gap: 6px; min-height: 36px;
     background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
-    border-radius: var(--r-sm); padding: var(--sp-2) 10px; font-size: var(--fs-sm); max-width: 260px;
+    border-radius: var(--r-sm); padding: var(--sp-1) 10px; font-size: var(--fs-sm);
+    cursor: pointer; white-space: nowrap;
   }
+  .mini-btn:hover { border-color: var(--accent-line); }
+  .mini-btn:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+  .mini-btn:disabled { opacity: .45; cursor: not-allowed; }
+  .mini-label { overflow: hidden; text-overflow: ellipsis; }
+  .mini-caret { color: var(--text-dim); font-size: 10px; line-height: 1; }
+  .mini-pop {
+    position: absolute; z-index: 45; top: calc(100% + 6px); right: 0;
+    min-width: 100%; width: max-content; max-width: min(260px, calc(100vw - 24px));
+    padding: 4px; display: flex; flex-direction: column; gap: 1px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, .45); overflow-y: auto; overscroll-behavior: contain;
+  }
+  .mini-opt {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    width: 100%; min-height: 38px; padding: 6px 10px; text-align: left; white-space: nowrap;
+    background: transparent; color: var(--text); border: 1px solid transparent;
+    border-radius: var(--r-sm); font-size: var(--fs-sm); cursor: pointer;
+  }
+  .mini-opt:hover { background: var(--accent-hover); }
+  .mini-opt:focus-visible { background: var(--accent-hover); outline: 1px solid var(--accent-line); outline-offset: -1px; }
+  .mini-opt.on { color: var(--info-fg); background: var(--accent-soft); }
+  .mini-check { color: var(--accent); font-size: 12px; }
   /* 分类筛选：自定义下拉（替代 Android 原生全屏白底 select） */
   .cate-picker { position: relative; flex: 0 1 240px; min-width: 0; }
   .cate-btn {
@@ -565,11 +591,8 @@
   .fr-restore { margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--border); }
   .fr-restore-head { margin-bottom: var(--sp-2); font-weight: 600; font-size: var(--fs-sm); }
   .fr-restore-row { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
-  .fr-select {
-    max-width: 100%; min-height: 40px; padding: var(--sp-2) 10px;
-    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
-    border-radius: var(--r-sm); font-size: var(--fs-sm);
-  }
+  .fr-restore-row .mini-select { flex: 1 1 260px; min-width: 0; }
+  .fr-restore-row .mini-btn { width: 100%; min-height: 40px; }
   .fr-dialog-line { font-size: var(--fs-sm); line-height: 1.6; overflow-wrap: anywhere; }
   .fr-wide-warn {
     margin-top: var(--sp-2); padding: var(--sp-2) var(--sp-3);
@@ -634,6 +657,7 @@
     .tab-btn { min-height: 44px; padding: 7px 10px; flex: 0 0 auto; white-space: nowrap; }
     .btn-ghost { min-height: 44px; }
     .log-chip { min-height: 40px; }
+    .mini-btn, .mini-opt { min-height: 44px; }
     /* 分类筛选：手机端贴底弹层 + 遮罩，避免原生 select 的全屏白底列表 */
     .cate-picker { flex: 1 1 100%; }
     .cate-btn { min-height: 44px; }
@@ -649,7 +673,7 @@
     .fr-input-days { max-width: 100%; }
     .fr-actions .btn { flex: 1 1 calc(50% - 5px); }
     .fr-actions-note { flex: 1 1 100%; }
-    .fr-restore-row .fr-select { flex: 1 1 100%; }
+    .fr-restore-row .mini-select { flex: 1 1 100%; }
   }
 
   /* 360px 窄屏：标签栏已是单行横滚，这里再收一档间距/内边距，让前四个常用页签
