@@ -4215,6 +4215,21 @@ async function main () {
     assert.ok(/\.tabs\s*\{[^}]*flex-wrap:\s*nowrap/.test(phone) && /\.tabs\s*\{[^}]*overflow-x:\s*auto/.test(phone),
       '手机断点标签栏必须单行横滚（nowrap + overflow-x）')
     assert.ok(/\.tab-btn\s*\{[^}]*flex:\s*0 0 auto/.test(phone), '手机断点标签按钮不得被压缩换行')
+    const lastPhoneRule = (re) => {
+      const all = [...phone.matchAll(re)]
+      return all.length ? all[all.length - 1][1] : ''
+    }
+    const topbarPhone = lastPhoneRule(/\.topbar\s*\{([^}]*)\}/g)
+    const brandPhone = lastPhoneRule(/\.brand\s*\{([^}]*)\}/g)
+    const syncPhone = lastPhoneRule(/\.sync\s*\{([^}]*)\}/g)
+    assert.ok(/flex-direction:\s*column/.test(topbarPhone),
+      '最后一条手机 .topbar 规则必须是 column，后置规则不能把它改回 row')
+    assert.ok(/flex-wrap:\s*nowrap/.test(brandPhone) && /white-space:\s*nowrap/.test(brandPhone),
+      '手机端 brand 必须单行，徽章变长不能换行顶动页签')
+    assert.ok(/white-space:\s*nowrap/.test(syncPhone) && /min-height:\s*24px/.test(syncPhone),
+      '手机端 sync 必须单行 + 固定行高，文字长短不能改高度')
+    assert.ok(src.includes('class="sync" tabindex="0"'),
+      '手机端 sync 必须可聚焦，长错误才能用键盘横向滚动查看')
     assert.ok(src.includes('tabsRef') && src.includes("querySelector('.tab-btn.active')"),
       '切页后必须把当前页签滚进可视区（横滚后靠右页签不能停在视野外）')
     assert.ok(src.includes("window.addEventListener('resize', adjust)") && src.includes('new window.ResizeObserver(adjust)'),
