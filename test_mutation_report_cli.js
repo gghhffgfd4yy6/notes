@@ -514,11 +514,19 @@ function schemaReport (seg, mutants) {
 
   // ① 执行级验证：桩 gh 实跑 run 段，覆盖成功 / 空值 / 不可解析 / API 失败四条分支。
   //    纯文本断言会被「删掉空值守卫但留下 API 失败文案」骗过（Sourcery 指出），必须看真实退出码与落盘值。
-  const runMatch = resolve.text.match(/^(\s*)run: \|\n([\s\S]*)$/m)
-  assert.ok(runMatch, `解析步骤必须有 run: | 块，实际：${resolve.text}`)
-  const scriptIndent = runMatch[1].length + 2
-  const script = runMatch[2].split('\n')
-    .map(l => l.trim() === '' ? '' : l.slice(scriptIndent)).join('\n')
+  //    逐行解析 run: | 块（不用 /^(\s*)run: \|/ + [\s\S]*$/ 这类嵌套量词，Sonar S8786 会判超线性回溯）。
+  const resolveLines2 = resolve.text.split('\n')
+  const runLineIdx = resolveLines2.findIndex(l => l.trim() === 'run: |')
+  assert.ok(runLineIdx >= 0, `解析步骤必须有 run: | 块，实际：${resolve.text}`)
+  const runIndent = resolveLines2[runLineIdx].search(/\S/)
+  const body = []
+  for (let i = runLineIdx + 1; i < resolveLines2.length; i++) {
+    if (resolveLines2[i].trim() === '') { body.push(''); continue }
+    if (resolveLines2[i].search(/\S/) <= runIndent) break
+    body.push(resolveLines2[i].slice(runIndent + 2))
+  }
+  const script = body.join('\n').trimEnd()
+  assert.ok(script.includes('gh api'), `run 段必须实际调用 gh api，实际：${script}`)
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-resolver-'))
   try {
     const bin = path.join(tmp, 'bin')
@@ -537,7 +545,7 @@ function schemaReport (seg, mutants) {
       fs.writeFileSync(envFile, '')
       const r = spawnSync('bash', ['-c', script], {
         env: {
-          PATH: bin + ':' + process.env.PATH,
+          PATH: bin + ':/usr/bin:/bin',
           GITHUB_ENV: envFile,
           GITHUB_REPOSITORY: 'o/r',
           GITHUB_RUN_ID: '1',
