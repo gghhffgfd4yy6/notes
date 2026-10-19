@@ -157,6 +157,9 @@ const CACHE_HEALTH_NEAR_RATIO = 0.8
 // 独立：语义不同（自检每次都真实推送），将来若要再区分，不必重拆通用窗。
 // lastAccept 本就按 action 键控（per-action Map + 持久化 JSON 的 key），无需改持久化结构。
 const REPLAY_WINDOW_NOTIFY_TEST_MS = 60 * 1000
+// 自动正式运行：前端保证「上一轮结束后再等 3–20s」，这里留 3s 只看重复提交；
+// 运行中互斥仍由单飞锁负责，不会与手动 run 并发。
+const REPLAY_WINDOW_RUN_AUTO_MS = 3 * 1000
 
 // ── v3.300 访问日志常量 ─────────────────────────────────────────────────────
 // 纯内存环形上限：重启即空、不写盘（README 披露）——避免日志自身成为磁盘面，
@@ -210,6 +213,9 @@ function defaultHealthLimits () {
 const ACTIONS = Object.freeze({
   'dry-run': { entry: 'qinglong', args: ['--dry-run'], label: '试运行（抓取但不推送）' },
   run: { entry: 'single', args: [], label: '正式运行一轮（真实推送）' },
+  // 自动模式与手动 run 跑同一个入口/参数，只是独立的幂等重放键（3s 窗），
+  // 否则 60s 窗会把自动循环挡掉；运行中仍由同一把单飞锁互斥。
+  'run-auto': { entry: 'single', args: [], label: '自动正式运行（真实推送）' },
   check: { entry: 'qinglong', args: ['--check'], label: '环境检查（不抓取不推送）' },
   // 批次④ 4.1：通知自检——真实推送一条固定测试消息。entry 必须是 'single'：startAction
   // 的映射是 `action.entry === 'single' ? ENTRY_SINGLE : ENTRY_QINGLONG`，任何其他值
@@ -2125,7 +2131,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 例外：锁被其他动作占着时（acquireLock 失败）先做一次锁外只读判窗——窗口内重试
         // 即使撞上他动作运行中也按「重放拦截」回（带首轮 runId），不降级成裸锁冲突
         // （G_4Kf 用例语义；竞态由锁内二次判窗兜底，锁外这层只是报错形态优化）。
-        const winMsPre = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : REPLAY_WINDOW_MS
+        const winMsPre = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : action === 'run-auto' ? REPLAY_WINDOW_RUN_AUTO_MS : REPLAY_WINDOW_MS
         if (!acquireLock(stateDir, now, runToken)) {
           // readLastAccept 返回 [key, value] 数组（非 Map），用 find 取当前动作记录。
           const persistedPre = readLastAccept(lastAcceptPath)
@@ -2145,10 +2151,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
         }
         const prev = lastAccept.get(action)
-        // 两种动作同为 60s 窗（D2-S16：普通动作不再用 12min——那只拦得到人工重跑，拦不到
+        // notify-test 60s、run-auto 3s、其余动作 60s（D2-S16：普通动作不再用 12min——那只拦得到人工重跑，拦不到
         // 真正的重复提交；运行中互斥由单飞锁负责）。/trigger 的 action=notify-test 与独立
         // 端点共享同一 lastAccept 键与窗长（有意行为）。
-        const winMs = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : REPLAY_WINDOW_MS
+        const winMs = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : action === 'run-auto' ? REPLAY_WINDOW_RUN_AUTO_MS : REPLAY_WINDOW_MS
         if (prev && now - prev.at < winMs) {
           // runId = epoch.seq 字符串（v3.299 评审）：0 是 pending 帧哨兵（数字），
           // 真实 runId 只在 startAction 之后落盘——用「数字 0」判 pending，其余原样下发。
@@ -3607,6 +3613,7 @@ module.exports = {
   SSE_MAX_CONNECTIONS,
   // v3.301 批次④ 4.1 通知自检：常量/入口导出（spawn entry 映射断言 + 重放窗断言）
   REPLAY_WINDOW_NOTIFY_TEST_MS,
+  REPLAY_WINDOW_RUN_AUTO_MS,
   ENTRY_SINGLE,
   // 过滤规则控制面：常量/写鉴权/测试注入口（HTTP 用例 + 非 HTTP 断言）
   FILTER_BODY_MAX_BYTES,

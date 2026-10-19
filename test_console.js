@@ -49,7 +49,7 @@ const {
   clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
   RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS,
-  REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE,
+  REPLAY_WINDOW_NOTIFY_TEST_MS, REPLAY_WINDOW_RUN_AUTO_MS, ENTRY_SINGLE,
   // 导出端点的读取上限直接取实现常量（D2-N11：修前测试自己写死 32MiB，实现改 64MiB 后
   // 用例仍在 32MiB 造夹具 → 以为测了 tooLarge，实际测的是 invalid）
   MESSAGES_MAX_BYTES,
@@ -1697,6 +1697,13 @@ async function main () {
     assert.ok(iActions >= 0 && iMap > iActions, 'entry 映射必须在 ACTIONS 之后')
     // parseAction 白名单顺带放行（D6）：urlencoded form 携带 action=notify-test 合法
     assert.strictEqual(parseAction('action=notify-test'), 'notify-test')
+  })
+  await aok('HTTP: run-auto 动作映射与重放窗（K1b）', async () => {
+    assert.strictEqual(ACTIONS['run-auto'].entry, 'single', 'entry 必须是 single（与手动 run 同入口）')
+    assert.deepStrictEqual(ACTIONS['run-auto'].args, [], 'run-auto 参数与手动 run 一致')
+    assert.ok(ACTIONS['run-auto'].label.includes('自动正式运行'), 'label 含「自动正式运行」')
+    assert.strictEqual(REPLAY_WINDOW_RUN_AUTO_MS, 3000, '自动运行独立重放窗 3s（前端间隔下限）')
+    assert.strictEqual(parseAction('action=run-auto'), 'run-auto')
   })
   await aok('HTTP: POST /api/notify-test 鉴权面（K2）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -4254,6 +4261,40 @@ async function main () {
     const cache = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('// 推送记录：'))
     assert.ok(cache.includes('60000'), '缓存健康必须每分钟刷新')
     assert.ok(cache.includes("document.addEventListener('visibilitychange', onVis)"), '切回前台要补拉缓存快照')
+  })
+
+  await aok('结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(src.includes('const AUTO_MIN_S = 3') && src.includes('const AUTO_MAX_S = 20'),
+      '自动间隔必须夹在 3–20 秒')
+    assert.ok(src.includes('Math.min(AUTO_MAX_S') && src.includes('Math.max(AUTO_MIN_S'),
+      '保存/启动前必须统一 clamp 到 3–20')
+    assert.ok(src.includes("trigger('run-auto')"), '自动循环必须走独立 run-auto 动作（3s 重放窗）')
+    assert.ok(src.includes('window.localStorage.setItem(AUTO_KEY'), '间隔保存必须持久化到 localStorage')
+    const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
+    assert.ok(trigger.includes('class="auto-input"') && trigger.includes('type="number"') &&
+      trigger.includes('min=$' + '{AUTO_MIN_S}') && trigger.includes('max=$' + '{AUTO_MAX_S}'),
+    '自动间隔必须是带 3–20 边界的数字框')
+    assert.ok(trigger.includes('aria-label="减少间隔"') && trigger.includes('aria-label="增加间隔"'),
+      '数字框必须有减/加按钮')
+    assert.ok(trigger.includes('onClick=$' + '{saveAuto}') && trigger.includes('保存'), '必须有保存键')
+    assert.ok(trigger.includes('auto.start') && trigger.includes('auto.stop') && trigger.includes('停止'),
+      '必须能开始/停止自动运行')
+    assert.ok(trigger.includes("setPending('auto')") && trigger.includes('确认开启自动正式运行'),
+      '自动运行是持续真实推送，必须先确认')
+    const autoApp = src.slice(src.indexOf('const startAuto ='), src.indexOf('// v3.297 标签页状态'))
+    assert.ok(autoApp.includes('if (locking)'), '上一轮未结束不得叠跑')
+    assert.ok(autoApp.includes('autoInterval * 1000') && autoApp.includes('setTimeout('),
+      '必须按保存的间隔在轮间调度')
+    assert.ok(autoApp.includes('autoFailsRef.current >= AUTO_MAX_FAILS') && autoApp.includes('stopAuto('),
+      '连续失败必须自动停止')
+    assert.ok(autoApp.includes("r.action === 'run-auto'") && autoApp.includes('latest.exitCode !== 0'),
+      '必须按真实 run 结果统计失败，不能只看提交是否 202')
+    assert.ok(autoApp.includes('autoRunWatchRef.current = latest.id'), '同一轮失败不得重复计数')
+    assert.ok(autoApp.includes('AUTO_MAX_MS'), '必须有最长运行时长上限')
+    assert.ok(css.includes('.auto-run') && css.includes('.auto-input') && css.includes('.auto-step'),
+      '自动运行控件必须有独立样式（数字框/加减/状态）')
   })
 
   await aok('结构红线: 控制台 UX 稳定性（搜索归属 / 弹层聚焦 / 趋势对齐）', () => {

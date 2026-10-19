@@ -218,6 +218,36 @@
 
   .btn-desc { color: var(--text-dim); font-size: var(--fs-xs); }
 
+  /* ── 自动正式运行（3–20s 可调）── */
+  .auto-run { margin-top: var(--sp-4); padding-top: var(--sp-3); border-top: 1px dashed var(--border); }
+  .auto-run-head { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-2); }
+  .auto-run-title { font-size: var(--fs-sm); font-weight: 600; }
+  .auto-run-tag { font-size: var(--fs-2xs); color: var(--warn-fg); background: var(--warn-soft); border: 1px solid var(--warn-line); border-radius: var(--r-pill); padding: 1px 7px; }
+  .auto-run-live { font-size: var(--fs-2xs); color: var(--ok-fg); background: var(--ok-soft); border: 1px solid var(--ok-line); border-radius: var(--r-pill); padding: 1px 7px; }
+  .auto-run-row { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+  .auto-step {
+    width: 40px; height: 40px; padding: 0; flex: 0 0 auto;
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    background: var(--panel-2); color: var(--text); font-size: var(--fs-lg);
+    display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+    transition: filter var(--dur-fast), transform .05s;
+  }
+  .auto-step:hover { filter: brightness(1.2); }
+  .auto-step:active { transform: translateY(1px); }
+  .auto-input {
+    width: 64px; height: 40px; padding: 0 var(--sp-2); flex: 0 0 auto;
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    background: var(--panel-2); color: var(--text); font-size: var(--fs-md);
+    text-align: center; font-variant-numeric: tabular-nums;
+  }
+  .auto-input:focus { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+  .auto-input::-webkit-outer-spin-button,
+  .auto-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  .auto-input { -moz-appearance: textfield; appearance: textfield; }
+  .auto-unit { color: var(--text-dim); font-size: var(--fs-sm); }
+  .auto-run-note { margin-top: var(--sp-2); color: var(--text-dim); font-size: var(--fs-2xs); line-height: 1.55; }
+  .auto-run-status { min-height: 17px; margin-top: var(--sp-1); color: var(--accent); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+
   /* ── 确认弹窗（v3.307）── */
   .modal-backdrop {
     position: fixed; inset: 0; z-index: 80; background: rgba(0, 0, 0, .62);
@@ -598,6 +628,9 @@
     /* 触控尺寸只抬高度；整行宽度只给手动触发的竖排按钮，别把表头/分页里的按钮也拉满 */
     .btn { min-height: 44px; }
     .btn-item .btn { width: 100%; }
+    .auto-run-row { gap: 8px; }
+    .auto-step { width: 44px; height: 44px; }
+    .auto-input { width: 68px; height: 44px; }
     .tab-btn { min-height: 44px; padding: 7px 10px; flex: 0 0 auto; white-space: nowrap; }
     .btn-ghost { min-height: 44px; }
     .log-chip { min-height: 40px; }

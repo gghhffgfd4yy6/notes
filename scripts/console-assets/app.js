@@ -733,6 +733,24 @@ function StatusCards ({ state }) {
 }
 
 // ── 组件：触发按钮 ──────────────────────────────────────────────────────────
+// 自动正式运行的间隔（秒）：前端限制 3–20s；运行状态不持久化，刷新/关页即停。
+const AUTO_MIN_S = 3
+const AUTO_MAX_S = 20
+const AUTO_DEFAULT_S = 10
+const AUTO_MAX_MS = 10 * 60 * 1000
+const AUTO_MAX_FAILS = 3
+const AUTO_KEY = 'xbk.autoInterval'
+function clampAutoSeconds (v) {
+  const n = Math.round(Number(v))
+  if (!Number.isFinite(n)) return AUTO_DEFAULT_S
+  return Math.min(AUTO_MAX_S, Math.max(AUTO_MIN_S, n))
+}
+function readAutoSeconds () {
+  try {
+    const raw = window.localStorage.getItem(AUTO_KEY)
+    return raw === null ? AUTO_DEFAULT_S : clampAutoSeconds(raw)
+  } catch (e) { return AUTO_DEFAULT_S }
+}
 const ACTION_DEFS = [
   { key: 'dry-run', label: '试运行', desc: '抓取但不推送', cls: 'btn-secondary' },
   { key: 'run', label: '正式运行一轮', desc: '抓取并真实推送', cls: 'btn-danger-solid' },
@@ -765,7 +783,7 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, 
   </div>`
 }
 
-function TriggerBar ({ onTriggered, locking, setBusy }) {
+function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
   const [err, setErr] = useState('')
   // 待确认的真实推送动作（null = 无弹窗）；dry-run/check 不弹窗，直接执行。
   const [pending, setPending] = useState(null)
@@ -775,6 +793,27 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
   const channelText = Array.isArray(configuredNames)
     ? (configuredNames.length > 0 ? configuredNames.join('、') : '未配置任何渠道')
     : '所有已配置渠道（以「配置」页为准）'
+  // 自动间隔草稿：输入框可自由键入，保存/开始时统一夹到 3–20；运行状态由 App 持有。
+  const [autoDraft, setAutoDraft] = useState(String(auto.interval))
+  const [autoSaved, setAutoSaved] = useState(false)
+  const autoSavedTimerRef = useRef(0)
+  useEffect(() => { setAutoDraft(String(auto.interval)) }, [auto.interval])
+  useEffect(() => () => clearTimeout(autoSavedTimerRef.current), [])
+  const adjustAuto = (delta) => {
+    const next = clampAutoSeconds(Number(autoDraft) + delta)
+    setAutoDraft(String(next))
+    setAutoSaved(false)
+  }
+  const flashAutoSaved = () => {
+    setAutoSaved(true)
+    clearTimeout(autoSavedTimerRef.current)
+    autoSavedTimerRef.current = setTimeout(() => setAutoSaved(false), 1500)
+  }
+  const saveAuto = () => {
+    const v = auto.save(autoDraft)
+    setAutoDraft(String(v))
+    flashAutoSaved()
+  }
   const doTrigger = useCallback(async (action) => {
     setErr('')
     setBusy(true)
@@ -819,9 +858,25 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
       }).catch(() => setConfiguredNames(null))
     } else doTrigger(action)
   }
+  // 自动运行是持续真实推送，必须先确认；确认后用当前草稿值启动。
+  const askAuto = () => {
+    setErr('')
+    setAutoDraft(String(clampAutoSeconds(autoDraft)))
+    setPending('auto')
+    setConfiguredNames(null)
+    apiGetConfig().then((v) => {
+      const names = v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : []
+      setConfiguredNames(names)
+    }).catch(() => setConfiguredNames(null))
+  }
   const confirmPending = () => {
     const action = pending
     setPending(null)
+    if (action === 'auto') {
+      const v = auto.start(autoDraft)
+      setAutoDraft(String(v))
+      return
+    }
     if (action) doTrigger(action)
   }
   return html`<div class="panel">
@@ -834,13 +889,39 @@ function TriggerBar ({ onTriggered, locking, setBusy }) {
     </div>
     ${locking && html`<${Hint}><span class="spin"></span> 任务进行中…（完成后自动解锁）<//>`}
     ${err && html`<${Hint} tone="error">${err}<//>`}
+    <div class="auto-run">
+      <div class="auto-run-head">
+        <span class="auto-run-title">自动正式运行</span>
+        <span class="auto-run-tag">真实推送</span>
+        ${auto.on && html`<span class="auto-run-live">运行中</span>`}
+      </div>
+      <div class="auto-run-row">
+        <button type="button" class="auto-step" aria-label="减少间隔" onClick=${() => adjustAuto(-1)}>−</button>
+        <input class="auto-input" type="number" inputmode="numeric" min=${AUTO_MIN_S} max=${AUTO_MAX_S} step="1"
+          aria-label="自动运行间隔（秒）" value=${autoDraft}
+          onInput=${(e) => { setAutoDraft(e.target.value); setAutoSaved(false) }}
+          onBlur=${() => setAutoDraft(String(clampAutoSeconds(autoDraft)))} />
+        <span class="auto-unit">秒</span>
+        <button type="button" class="auto-step" aria-label="增加间隔" onClick=${() => adjustAuto(1)}>+</button>
+        <${Button} variant="secondary" onClick=${saveAuto}>保存<//>
+        ${auto.on
+          ? html`<${Button} variant="danger" onClick=${() => auto.stop()}>停止<//>`
+          : html`<${Button} variant="danger-solid" disabled=${locking} onClick=${askAuto}>开始<//>`}
+      </div>
+      <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒；运行 10 分钟或连续失败 ${AUTO_MAX_FAILS} 次自动停止，刷新/关页即停，切到后台会暂停。</div>
+      ${auto.on && html`<div class="auto-run-status">${auto.nextAt > 0 ? `下一轮 ${Math.max(0, Math.ceil((auto.nextAt - auto.now) / 1000))} 秒` : '本轮进行中'} · 已自动运行 ${auto.runs} 轮</div>`}
+      ${!auto.on && html`<div class="auto-run-status">${autoSaved ? '间隔已保存' : ''}</div>`}
+      ${auto.err && html`<${Hint} tone="error">${auto.err}<//>`}
+    </div>
     <${ConfirmDialog} open=${pending !== null}
-      title=${pending === 'run' ? '确认正式运行一轮？' : '确认发送通知自检？'}
-      confirmLabel=${pending === 'run' ? '确认真实推送' : '确认发送'}
+      title=${pending === 'run' ? '确认正式运行一轮？' : pending === 'auto' ? '确认开启自动正式运行？' : '确认发送通知自检？'}
+      confirmLabel=${pending === 'run' ? '确认真实推送' : pending === 'auto' ? '开始自动运行' : '确认发送'}
       busy=${locking} onConfirm=${confirmPending} onCancel=${() => setPending(null)}>
       ${pending === 'run'
         ? html`<div>将抓取线报并<b>真实推送</b>到：${channelText}。</div><div class="modal-note">推送发出后无法撤回；只想验证抓取流程请用「试运行」（不推送）。</div>`
-        : html`<div>将向全部渠道发送一条<b>真实测试消息</b>：${channelText}。</div><div class="modal-note">这条消息会出现在你的微信/推送客户端里。</div>`}
+        : pending === 'auto'
+          ? html`<div>将每轮结束后等待 <b>${clampAutoSeconds(autoDraft)} 秒</b>，自动再次<b>正式运行</b>（真实推送）到：${channelText}。</div><div class="modal-note">最低 3 秒、最高 20 秒；连续运行 10 分钟或连续失败 3 次自动停止；刷新/关闭页面即停，切到后台会暂停。</div>`
+          : html`<div>将向全部渠道发送一条<b>真实测试消息</b>：${channelText}。</div><div class="modal-note">这条消息会出现在你的微信/推送客户端里。</div>`}
     <//>
   </div>`
 }
@@ -2878,6 +2959,17 @@ function App () {
   // 否则会把「还不知道」谎报成「确实没有」（Sourcery #254）。
   const [runsState, setRunsState] = useState('loading') // loading | ok | error
   const [busy, setBusy] = useState(false)
+  // 自动正式运行：间隔持久化，运行状态不持久化（刷新/关页即停，避免无人值守真实推送）。
+  const [autoInterval, setAutoInterval] = useState(readAutoSeconds)
+  const [autoOn, setAutoOn] = useState(false)
+  const [autoRuns, setAutoRuns] = useState(0)
+  const [autoErr, setAutoErr] = useState('')
+  const [autoNextAt, setAutoNextAt] = useState(0)
+  const [autoNow, setAutoNow] = useState(Date.now())
+  const autoTimerRef = useRef(0)
+  const autoFailsRef = useRef(0)
+  const autoStartedAtRef = useRef(0)
+  const autoRunWatchRef = useRef(null)
   const [lastSync, setLastSync] = useState(null)
   // 非概览页的「数据截至」按页签缓存：每个页签只认自己的成功加载时间，
   // 切回已来过的页签先显示上次时间，首次进入/加载失败显示「数据截至 · —」。
@@ -3323,6 +3415,107 @@ function App () {
     refreshSplit()
   }, [refreshSplit])
 
+  const saveAutoInterval = useCallback((value) => {
+    const v = clampAutoSeconds(value)
+    setAutoInterval(v)
+    try { window.localStorage.setItem(AUTO_KEY, String(v)) } catch (e) { /* 隐私模式忽略 */ }
+    return v
+  }, [])
+  const stopAuto = useCallback((reason = '') => {
+    if (autoTimerRef.current) { clearTimeout(autoTimerRef.current); autoTimerRef.current = 0 }
+    autoRunWatchRef.current = null
+    setAutoOn(false)
+    setAutoNextAt(0)
+    setAutoErr(reason || '')
+  }, [])
+  const startAuto = useCallback((value) => {
+    const v = saveAutoInterval(value)
+    autoFailsRef.current = 0
+    autoRunWatchRef.current = null
+    autoStartedAtRef.current = Date.now()
+    setAutoRuns(0)
+    setAutoErr('')
+    setAutoNextAt(0)
+    setAutoOn(true)
+    return v
+  }, [saveAutoInterval])
+
+  // 自动循环：等上一轮真正结束（locking=false）再等 interval 秒，不叠跑。
+  // 3–20s 只控制「轮间等待」，一轮本身耗时（含推送限频）另算。
+  useEffect(() => {
+    if (!autoOn) return undefined
+    if (locking) {
+      if (autoTimerRef.current) { clearTimeout(autoTimerRef.current); autoTimerRef.current = 0 }
+      setAutoNextAt(0)
+      return undefined
+    }
+    if (Date.now() - autoStartedAtRef.current >= AUTO_MAX_MS) {
+      stopAuto('已连续自动运行 10 分钟，已停止。')
+      return undefined
+    }
+    const delay = autoInterval * 1000
+    const at = Date.now()
+    setAutoNow(at)
+    setAutoNextAt(at + delay)
+    const t = setTimeout(async () => {
+      autoTimerRef.current = 0
+      setAutoNextAt(0)
+      setBusy(true)
+      try {
+        const data = await trigger('run-auto')
+        handleTriggered(data && typeof data.id === 'string' ? data.id : null)
+        setAutoRuns((n) => n + 1)
+        setAutoErr('')
+      } catch (e) {
+        if (e && e.replayRunId) {
+          handleTriggered(null)
+          setAutoErr(`${e.message}（运行 #${e.replayRunId}）`)
+        } else {
+          autoFailsRef.current += 1
+          setBusy(false)
+          const msg = e && e.message ? e.message : String(e)
+          if (autoFailsRef.current >= AUTO_MAX_FAILS) {
+            stopAuto(`连续 ${AUTO_MAX_FAILS} 轮失败，已自动停止：${msg}`)
+          } else {
+            setAutoErr(msg)
+          }
+        }
+      }
+    }, delay)
+    autoTimerRef.current = t
+    return () => { if (autoTimerRef.current === t) { clearTimeout(t); autoTimerRef.current = 0 } }
+  }, [autoOn, autoInterval, locking, handleTriggered, stopAuto])
+
+  // 倒计时 tick：只在自动模式且有下一轮时刷新显示。
+  useEffect(() => {
+    if (!autoOn || !autoNextAt) return undefined
+    const t = setInterval(() => setAutoNow(Date.now()), 250)
+    return () => clearInterval(t)
+  }, [autoOn, autoNextAt])
+
+  // 自动模式看真实结果：连续 3 轮 exitCode!=0 / 超时 / 取消才停；成功归零。
+  // 只统计本次自动会话启动后的 run-auto，避免把历史失败算进来。
+  useEffect(() => {
+    if (!autoOn) return
+    const latest = runs
+      .filter((r) => r.action === 'run-auto' && r.finishedAt && r.startedAt >= autoStartedAtRef.current)
+      .sort((a, b) => b.startedAt - a.startedAt)[0]
+    if (!latest || latest.id === autoRunWatchRef.current) return
+    autoRunWatchRef.current = latest.id
+    const failed = latest.exitCode !== 0 || latest.timedOut || latest.cancelled
+    if (!failed) {
+      autoFailsRef.current = 0
+      setAutoErr('')
+      return
+    }
+    autoFailsRef.current += 1
+    if (autoFailsRef.current >= AUTO_MAX_FAILS) {
+      stopAuto(`连续 ${AUTO_MAX_FAILS} 轮失败，已自动停止。`)
+    } else {
+      setAutoErr(`最近一轮失败（exit ${latest.exitCode}），连续 ${autoFailsRef.current} 次`)
+    }
+  }, [autoOn, runs, stopAuto])
+
   // v3.297 标签页状态：概览 / 推送记录 / 日志 / 系统。非概览页不跑主轮询，
   // 避免每 5s 的 App 重渲染让推送记录/配置页「闪一下」（刷新记录页有自己的加载）。
   const TABS = [
@@ -3399,7 +3592,8 @@ function App () {
     ${!authExpired && tab === 'overview' && html`<div>
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} />
-      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} />
+      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy}
+        auto=${{ on: autoOn, interval: autoInterval, runs: autoRuns, err: autoErr, nextAt: autoNextAt, now: autoNow, start: startAuto, stop: stopAuto, save: saveAutoInterval }} />
       <${RunsPanel} runs=${runs} status=${runsState} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />
       <${TrendsPanel} />
       <${RunHistoryPanel} onOpenLog=${openLog} />
