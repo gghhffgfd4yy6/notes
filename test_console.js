@@ -4362,19 +4362,19 @@ async function main () {
     assert.ok(src.includes('Math.min(AUTO_MAX_S') && src.includes('Math.max(AUTO_MIN_S'),
       '保存/启动前必须统一 clamp 到 3–20')
     const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
-    assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
-      '服务器端也必须夹在 3–20 秒')
-    assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && consoleSrc.includes('function tickAuto') &&
-      consoleSrc.includes("startAction('run-auto'") && consoleSrc.includes('acquireLock(stateDir'),
-    '自动调度必须在服务器进程内跑 run-auto，并经过单飞锁')
-    assert.ok(consoleSrc.includes('activeChildren.size > 0') && consoleSrc.includes('autoInFlightId'),
-      '上一轮未结束不得叠跑')
-    assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
-      '自动开关/间隔必须由服务器持久化，重启可恢复')
-    assert.ok(consoleSrc.includes('AUTO_MAX_MS') === false, '不得再有 10 分钟总时长上限')
     // 变异沙箱里 console.js 是机器生成代码（语句被 stryMutAct_* 条件包裹 + 覆盖率计数），
-    // 源码串断言只对原始源文件有意义——与上面「测试隔离」红线同一口径，交 Test workflow 兜底。
+    // 所有源码串断言只对原始源文件有意义——与「测试隔离」红线同一口径，交 Test workflow 兜底。
     if (process.env.XBK_MUTATION_CHILD !== '1') {
+      assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
+        '服务器端也必须夹在 3–20 秒')
+      assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && consoleSrc.includes('function tickAuto') &&
+        consoleSrc.includes("startAction('run-auto'") && consoleSrc.includes('acquireLock(stateDir'),
+      '自动调度必须在服务器进程内跑 run-auto，并经过单飞锁')
+      assert.ok(consoleSrc.includes('activeChildren.size > 0') && consoleSrc.includes('autoInFlightId'),
+        '上一轮未结束不得叠跑')
+      assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
+        '自动开关/间隔必须由服务器持久化，重启可恢复')
+      assert.ok(consoleSrc.includes('AUTO_MAX_MS') === false, '不得再有 10 分钟总时长上限')
       const closeAt = consoleSrc.indexOf("server.on('close'")
       const disposeAt = consoleSrc.indexOf('disposeAuto()', closeAt)
       const killAt = consoleSrc.indexOf('killAll()', closeAt)
