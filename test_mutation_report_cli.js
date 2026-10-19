@@ -543,7 +543,7 @@ function schemaReport (seg, mutants) {
     const runCase = (mode) => {
       const envFile = path.join(tmp, 'env-' + mode)
       fs.writeFileSync(envFile, '')
-      const r = spawnSync('bash', ['-c', stub + '\n' + script], {
+      const r = spawnSync('/bin/bash', ['-c', stub + '\n' + script], {
         env: {
           GITHUB_ENV: envFile,
           GITHUB_REPOSITORY: 'o/r',
