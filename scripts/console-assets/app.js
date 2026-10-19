@@ -1559,12 +1559,22 @@ function CategoryPicker ({ value, categories, total, onChange }) {
       const below = window.innerHeight - r.bottom - 12
       const above = r.top - 12
       const want = 380
-      const up = below < Math.min(300, want) && above > below
-      // 下限只保 1px：写死 180px 这类下限，在可用空间不足时会把弹层撑出视口。
-      const max = Math.max(1, Math.min(want, up ? above : below))
-      setPlace((prev) => (prev.ready && prev.up === up && Math.abs(prev.max - max) < 8
-        ? prev // 8px 迟滞：阈值附近来回抖时返回同一对象，preact 的 useState 会直接跳过重渲染
-        : { up, max, ready: true }))
+      const cutoff = Math.min(300, want)
+      const H = 8
+      // 首次量测按硬阈值定方向；之后方向也走 8px 迟滞：页面在临界线附近小幅滚动时保持
+      // 当前朝向。否则 up 一翻转，下面的 prev.up === up 就必然不成立，弹层会跟着上下跳。
+      const baseUp = below < cutoff && above > below
+      setPlace((prev) => {
+        const up = !prev.ready
+          ? baseUp
+          : (prev.up
+              ? !(below > cutoff + H && below > above + H) // 已在上方：明显更该在下方才翻
+              : (below < cutoff - H && above > below + H)) // 已在下方：明显更该在上方才翻
+        // 下限只保 1px：写死 180px 这类下限，在可用空间不足时会把弹层撑出视口。
+        const max = Math.max(1, Math.min(want, up ? above : below))
+        // 方向与高度都没跨过阈值时返回同一对象，preact 的 useState 会直接跳过重渲染。
+        return prev.ready && prev.up === up && Math.abs(prev.max - max) < H ? prev : { up, max, ready: true }
+      })
     }
     // open/断点变化：先回到未就绪，再同步量测，避免沿用上一轮的 up/max。
     setPlace({ up: false, max: 380, ready: false })
