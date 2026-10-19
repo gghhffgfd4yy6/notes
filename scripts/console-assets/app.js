@@ -3342,7 +3342,7 @@ function App () {
         <span class="name">xbk-push 控制台</span>
         <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
       </div>
-      <div class="sync">
+      <div class="sync" tabindex="0" aria-label="刷新状态">
         ${tab === 'overview'
           ? html`${autoRefresh ? html`<${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${lastSync} />` : '自动刷新已暂停'}
             <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}

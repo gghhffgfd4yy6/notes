@@ -549,6 +549,24 @@
 
   /* ── 手机 ── */
   @media (max-width: 640px) {
+    /* 顶栏固定两行：brand 一行、sync 一行。否则「手动刷新」→「数据截至 · …」
+       会让 sync 从 1 行变 2 行，页签栏和正文整体被顶下 ~27px——切页时看到的
+       “跳”就是这个，不是滚动位置。两行后高度恒定，内容再晚到也不挪页签。 */
+    .topbar { flex-direction: column; align-items: stretch; flex-wrap: nowrap; gap: 4px; }
+    .brand {
+      align-self: flex-start; flex-wrap: nowrap; white-space: nowrap;
+      min-height: 24px; max-width: 100%; overflow: hidden;
+    }
+    .brand .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .brand .badge { flex: 0 0 auto; white-space: nowrap; }
+    .sync {
+      flex: 0 0 auto; flex-wrap: nowrap; justify-content: flex-start; min-height: 24px;
+      white-space: nowrap; overflow-x: auto; overflow-y: hidden;
+      -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    }
+    .sync::-webkit-scrollbar { display: none; }
+    .sync:focus-visible { outline: var(--ring); outline-offset: 2px; border-radius: 4px; }
+    .sync .sync-toggle:focus-visible { outline-offset: -2px; }
     .wrap { padding: var(--sp-3) 10px calc(30px + env(safe-area-inset-bottom)); }
     .cards { grid-template-columns: 1fr 1fr; gap: 10px; }
     .card { padding: 10px 12px; }
