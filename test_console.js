@@ -49,7 +49,7 @@ const {
   clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
   RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS,
-  REPLAY_WINDOW_NOTIFY_TEST_MS, REPLAY_WINDOW_RUN_AUTO_MS, ENTRY_SINGLE,
+  REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE,
   // 导出端点的读取上限直接取实现常量（D2-N11：修前测试自己写死 32MiB，实现改 64MiB 后
   // 用例仍在 32MiB 造夹具 → 以为测了 tooLarge，实际测的是 invalid）
   MESSAGES_MAX_BYTES,
@@ -341,10 +341,11 @@ ok('releaseLockFor: open 失败只有 ENOENT 才算已释放（EACCES/EMFILE →
 })
 
 // ── 动作解析 ──
-ok('parseAction: urlencoded 三种合法动作 + 非法动作 null', () => {
+ok('parseAction: urlencoded 合法动作（run-auto 仅内部）+ 非法动作 null', () => {
   for (const key of Object.keys(ACTIONS)) {
-    assert.strictEqual(parseAction(`action=${key}`), key)
-    assert.strictEqual(parseAction(`other=1&action=${key}&x=2`), key)
+    const expected = key === 'run-auto' ? null : key
+    assert.strictEqual(parseAction(`action=${key}`), expected)
+    assert.strictEqual(parseAction(`other=1&action=${key}&x=2`), expected)
   }
   assert.strictEqual(parseAction('action=nope'), null)
   assert.strictEqual(parseAction(''), null)
@@ -1698,43 +1699,19 @@ async function main () {
     // parseAction 白名单顺带放行（D6）：urlencoded form 携带 action=notify-test 合法
     assert.strictEqual(parseAction('action=notify-test'), 'notify-test')
   })
-  await aok('HTTP: run-auto 动作映射与重放窗（K1b）', async () => {
+  await aok('HTTP: run-auto 只允许服务器内部调度（K1b）', async () => {
     assert.strictEqual(ACTIONS['run-auto'].entry, 'single', 'entry 必须是 single（与手动 run 同入口）')
     assert.deepStrictEqual(ACTIONS['run-auto'].args, [], 'run-auto 参数与手动 run 一致')
     assert.ok(ACTIONS['run-auto'].label.includes('自动正式运行'), 'label 含「自动正式运行」')
-    assert.strictEqual(REPLAY_WINDOW_RUN_AUTO_MS, 3000, '自动运行独立重放窗 3s（前端间隔下限）')
-    assert.strictEqual(parseAction('action=run-auto'), 'run-auto')
+    assert.strictEqual(parseAction('action=run-auto'), null, 'HTTP 层必须拒绝 run-auto（无稳定幂等键）')
   })
-  await aok('HTTP: run-auto 3s 独立重放窗行为（K1c）', async () => {
-    // 2s 前受理：3s 窗内 → 409 + replayBlocked + runId 回带
-    {
-      const dir = tmpDir()
-      const { server } = createConsole({ token: TOKEN, stateDir: dir })
-      const port = await listen(server)
-      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'run-auto': { at: Date.now() - 2000, runId: '1750000000000.9' } }))
-      const blocked = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=run-auto' })
-      assert.strictEqual(blocked.status, 409, '3s 窗内 run-auto 重放必须 409')
-      const b = JSON.parse(blocked.text)
-      assert.strictEqual(b.replayBlocked, true, '标记为重放拦截')
-      assert.strictEqual(b.runId, '1750000000000.9', '409 回带首轮 runId')
-      assert.ok(Number.isInteger(b.retryAfterS) && b.retryAfterS > 0 && b.retryAfterS <= 3,
-        `retryAfterS 应在 3s 窗内（实际 ${b.retryAfterS}）`)
-      server.close()
-    }
-    // 4s 前受理：已越 3s 窗。预占锁后应报「锁冲突」而不是 replayBlocked；
-    // 若误用全局 60s 窗，这里会带 replayBlocked，用例即红。
-    {
-      const dir = tmpDir()
-      const { server } = createConsole({ token: TOKEN, stateDir: dir })
-      const port = await listen(server)
-      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'run-auto': { at: Date.now() - 4000, runId: '1750000000000.9' } }))
-      assert.strictEqual(acquireLock(dir, Date.now(), 'other-token'), true, '预占锁成功')
-      const lockConflict = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=run-auto' })
-      assert.strictEqual(lockConflict.status, 409, '越窗后撞锁仍 409')
-      assert.strictEqual(JSON.parse(lockConflict.text).replayBlocked, undefined,
-        '4s 前已越 3s 窗，应是锁冲突而不是重放拦截')
-      server.close()
-    }
+  await aok('HTTP: /trigger 拒绝 run-auto（K1c）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const rejected = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=run-auto' })
+    assert.strictEqual(rejected.status, 400, 'HTTP 直接触发 run-auto 必须 400')
+    assert.strictEqual(JSON.parse(rejected.text).error, '未知 action', '按未知动作拒绝，不能落进真实推送')
+    server.close()
   })
   await aok('HTTP: /api/auto 服务器端自动运行开关与持久化（K1d）', async () => {
     const dir = tmpDir()
