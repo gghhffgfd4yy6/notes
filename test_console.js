@@ -4173,6 +4173,8 @@ async function main () {
     assert.ok(/\.tab-btn\s*\{[^}]*flex:\s*0 0 auto/.test(phone), '手机断点标签按钮不得被压缩换行')
     assert.ok(src.includes('tabsRef') && src.includes("querySelector('.tab-btn.active')"),
       '切页后必须把当前页签滚进可视区（横滚后靠右页签不能停在视野外）')
+    assert.ok(src.includes("window.addEventListener('resize', adjust)") && src.includes('new window.ResizeObserver(adjust)'),
+      '窗口/标签栏尺寸变化后必须重新把当前页签滚进可视区（旋转屏不能停在裁剪边外）')
     const cache = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('// 推送记录：'))
     assert.ok(cache.includes('60000'), '缓存健康必须每分钟刷新')
     assert.ok(cache.includes("document.addEventListener('visibilitychange', onVis)"), '切回前台要补拉缓存快照')

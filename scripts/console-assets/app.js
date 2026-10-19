@@ -2921,18 +2921,29 @@ function App () {
     if (typeof y === 'number') restoreScroll(y)
   }, [tab, logJump])
 
-  // 标签栏是单行横滚：切到靠右的页签（或直接用 #/system 打开）时把当前页签滚进可视区。
-  // 只改 .tabs 的 scrollLeft，不碰页面滚动；sticky 栏本身始终在视口里。
+  // 标签栏是单行横滚：切页、旋转屏幕或改窗口宽度后都要把当前页签滚进可视区，
+  // 否则活动页签会停在滚动容器的裁剪边之外（Sourcery #260）。只改 .tabs 的
+  // scrollLeft，不碰页面滚动；sticky 栏本身始终在视口里。
   useLayoutEffect(() => {
     const bar = tabsRef.current
-    if (!bar) return
-    const el = bar.querySelector('.tab-btn.active')
-    if (!el) return
-    const br = bar.getBoundingClientRect()
-    const er = el.getBoundingClientRect()
-    const pad = 4
-    if (er.left < br.left + pad) bar.scrollLeft -= (br.left + pad) - er.left
-    else if (er.right > br.right - pad) bar.scrollLeft += er.right - (br.right - pad)
+    if (!bar) return undefined
+    const adjust = () => {
+      const el = bar.querySelector('.tab-btn.active')
+      if (!el) return
+      const br = bar.getBoundingClientRect()
+      const er = el.getBoundingClientRect()
+      const pad = 4
+      if (er.left < br.left + pad) bar.scrollLeft -= (br.left + pad) - er.left
+      else if (er.right > br.right - pad) bar.scrollLeft += er.right - (br.right - pad)
+    }
+    adjust()
+    window.addEventListener('resize', adjust)
+    const ro = window.ResizeObserver ? new window.ResizeObserver(adjust) : null
+    if (ro) ro.observe(bar)
+    return () => {
+      window.removeEventListener('resize', adjust)
+      if (ro) ro.disconnect()
+    }
   }, [tab])
 
   // vwD：逐请求独立收口——status 失败时 runs 结果仍可用（反之亦然）；
