@@ -2877,6 +2877,7 @@ function App () {
   // activeElement：用户选完下拉后焦点仍停在 select 上，会永久冻住自动刷新。
   const formPauseUntilRef = useRef(0)
   const timerRef = useRef(null)
+  const tabsRef = useRef(null)
   const seqRef = useRef(0)
   // 轮询互斥（Sourcery G_oY）：上一轮未完成时跳过本轮 tick，不在途中叠加新请求
   // （fetch 有 8s 期限，跳过最多让数据晚 2-5s 更新，换来零堆积）。
@@ -2893,6 +2894,20 @@ function App () {
 
   // 切页在 DOM 提交后、绘制前回顶：先 setTab 再立即 scrollTo 会让旧长页面先闪一下。
   useLayoutEffect(() => { window.scrollTo(0, 0) }, [tab, logJump])
+
+  // 标签栏是单行横滚：切到靠右的页签（或直接用 #/system 打开）时把当前页签滚进可视区。
+  // 只改 .tabs 的 scrollLeft，不碰页面滚动；sticky 栏本身始终在视口里。
+  useLayoutEffect(() => {
+    const bar = tabsRef.current
+    if (!bar) return
+    const el = bar.querySelector('.tab-btn.active')
+    if (!el) return
+    const br = bar.getBoundingClientRect()
+    const er = el.getBoundingClientRect()
+    const pad = 4
+    if (er.left < br.left + pad) bar.scrollLeft -= (br.left + pad) - er.left
+    else if (er.right > br.right - pad) bar.scrollLeft += er.right - (br.right - pad)
+  }, [tab])
 
   // vwD：逐请求独立收口——status 失败时 runs 结果仍可用（反之亦然）；
   // 并行发出（Sourcery G_n6）：串行 await 会让慢端点拖住另一端点的更新。
@@ -3130,7 +3145,7 @@ function App () {
       <a class="alert-action" href="/">重新登录</a>
     </div>`}
 
-    <nav class="tabs">
+    <nav class="tabs" ref=${tabsRef}>
       ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')}
         onClick=${() => { if (t.key === 'logs') setLogJump(null); switchTab(t.key) }}>${t.label}</button>`)}
     </nav>
