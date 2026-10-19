@@ -1481,7 +1481,8 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   const [path, setPath] = useState([])
   const [active, setActive] = useState(0)
   const [narrow, setNarrow] = useState(() => window.matchMedia('(max-width: 640px)').matches)
-  const [place, setPlace] = useState({ up: false, max: 380 })
+  // ready=false 时弹层先 visibility:hidden：桌面首帧的 up/max 还没量过，不能拿默认值上屏。
+  const [place, setPlace] = useState({ up: false, max: 380, ready: false })
   const rootRef = useRef(null)
   const btnRef = useRef(null)
   const popRef = useRef(null)
@@ -1523,6 +1524,8 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     return () => { document.body.style.overflow = prev }
   }, [open, narrow])
   // 打开时：桌面把焦点放进搜索框；手机聚焦当前选项（不弹软键盘）。
+  // 依赖 place.ready：桌面首帧弹层是 visibility:hidden（等量测），此时 focus 会被忽略；
+  // ready 翻真、弹层可见后再跑一次，否则首次打开焦点进不了搜索框。
   useEffect(() => {
     if (!open) return undefined
     if (narrow) {
@@ -1536,26 +1539,58 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     }
     if (searchRef.current) searchRef.current.focus({ preventScroll: true })
     return undefined
-  }, [open, narrow])
+  }, [open, narrow, place.ready])
   // 搜索词/层级变化后回到第一项，避免 active 指向已被过滤掉的项。
   useEffect(() => { setActive(0) }, [q, path])
   // 桌面端空间不足时向上翻，并按可用高度限制弹层，避免被视口底边裁掉。
-  useEffect(() => {
-    if (!open || narrow) return
-    const calc = () => {
-      const r = btnRef.current.getBoundingClientRect()
+  // 必须 useLayoutEffect：量测要赶在首帧绘制前完成。用 useEffect 时弹层会先按默认的
+  // 「向下」铺一帧，量到下方不够再跳到上方，肉眼就是先下坠再弹起。ready 未就绪时隐身兜底。
+  useLayoutEffect(() => {
+    if (!open || narrow) return undefined
+    let raf = 0
+    const measure = () => {
+      const btn = btnRef.current
+      if (!btn) {
+        // 量不到按钮就退回默认值，绝不能让弹层一直停在 visibility:hidden。
+        setPlace((prev) => (prev.ready ? prev : { up: false, max: 380, ready: true }))
+        return
+      }
+      const r = btn.getBoundingClientRect()
       const below = window.innerHeight - r.bottom - 12
       const above = r.top - 12
       const want = 380
-      if (below < Math.min(300, want) && above > below) setPlace({ up: true, max: Math.min(want, above) })
-      else setPlace({ up: false, max: Math.min(want, below) })
+      const cutoff = Math.min(300, want)
+      const H = 8
+      // 首次量测按硬阈值定方向；之后方向也走 8px 迟滞：页面在临界线附近小幅滚动时保持
+      // 当前朝向。否则 up 一翻转，下面的 prev.up === up 就必然不成立，弹层会跟着上下跳。
+      const baseUp = below < cutoff && above > below
+      setPlace((prev) => {
+        const up = !prev.ready
+          ? baseUp
+          : (prev.up
+              ? !(below > cutoff + H && below > above + H) // 已在上方：明显更该在下方才翻
+              : (below < cutoff - H && above > below + H)) // 已在下方：明显更该在上方才翻
+        // 下限只保 1px：写死 180px 这类下限，在可用空间不足时会把弹层撑出视口。
+        const max = Math.max(1, Math.min(want, up ? above : below))
+        // 方向与高度都没跨过阈值时返回同一对象，preact 的 useState 会直接跳过重渲染。
+        return prev.ready && prev.up === up && Math.abs(prev.max - max) < H ? prev : { up, max, ready: true }
+      })
     }
-    calc()
-    window.addEventListener('resize', calc)
-    window.addEventListener('scroll', calc, true)
+    // open/断点变化：先回到未就绪，再同步量测，避免沿用上一轮的 up/max。
+    setPlace({ up: false, max: 380, ready: false })
+    measure()
+    // 只监听 window 的 scroll（不 capture）：capture 会把 .cate-list 内部滚动也收进来，
+    // 列表每滚一下都重算定位，阈值附近就上下反复。rAF 合并同帧的多次 scroll/resize。
+    const schedule = () => {
+      if (raf) return
+      raf = window.requestAnimationFrame(() => { raf = 0; measure() })
+    }
+    window.addEventListener('resize', schedule)
+    window.addEventListener('scroll', schedule, { passive: true })
     return () => {
-      window.removeEventListener('resize', calc)
-      window.removeEventListener('scroll', calc, true)
+      if (raf) window.cancelAnimationFrame(raf)
+      window.removeEventListener('resize', schedule)
+      window.removeEventListener('scroll', schedule, { passive: true })
     }
   }, [open, narrow])
   useEffect(() => {
@@ -1587,23 +1622,33 @@ function CategoryPicker ({ value, categories, total, onChange }) {
   }, [open, narrow])
   const current = categories.find((c) => c.name === value)
   const label = value === '' ? '全部分类' : `${value}${current ? `（${current.count}）` : ''}`
-  const tree = buildCateTree(categories)
-  let node = tree
-  for (const p of path) node = node.children.get(p) || node
-  const kw = q.trim().toLowerCase()
-  const leaves = kw === '' ? [] : flatCateLeaves(tree)
-  const results = kw === '' ? [] : leaves.filter((l) => l.label.toLowerCase().includes(kw) || l.name.toLowerCase().includes(kw))
-  const level = [...node.children.values()].sort((a, b) => b.total - a.total)
-  // 分类名同时是叶子与父节点时（如 A-B 与 A-B-C 并存），父级此前只能下钻、永远选不到
-  // A-B 本身（审查 #246 可选）。下钻后补一条「本级」选项，既能选自己也能继续下钻。
-  const selfOption = path.length > 0 && node.full
-    ? [{ key: '__self', label: `${node.name}（本级）`, count: node.count, leaf: true, name: node.full }]
-    : []
-  const options = kw === ''
-    ? [...(path.length === 0 ? [{ key: '__all', label: '全部分类', count: typeof total === 'number' ? total : tree.total, leaf: true, name: '' }] : []),
-        ...selfOption,
-        ...level.map((n) => ({ key: n.path.join('-'), label: n.name, count: n.total, leaf: n.children.size === 0, name: n.full, node: n }))]
-    : results.map((l) => ({ key: l.name, label: l.label, count: l.count, leaf: true, name: l.name }))
+  // 80+ 分类建树有成本，输入/滚动重渲染时不该重做：tree 只随 categories 变。
+  const tree = useMemo(() => buildCateTree(categories), [categories])
+  // 当前层节点、搜索词、命中项、层级与最终选项都由 tree/path/q/total/value 派生，
+  // 一次 useMemo 收口：搜索时的整树摊平与 80+ 选项对象只在输入/下钻/选中变化时重建，
+  // 滚动定位这类无关重渲染直接复用同一份数组。
+  const view = useMemo(() => {
+    let node = tree
+    for (const p of path) node = node.children.get(p) || node
+    const kw = q.trim().toLowerCase()
+    const leaves = kw === '' ? [] : flatCateLeaves(tree)
+    const results = kw === '' ? [] : leaves.filter((l) => l.label.toLowerCase().includes(kw) || l.name.toLowerCase().includes(kw))
+    const level = [...node.children.values()].sort((a, b) => b.total - a.total)
+    // 分类名同时是叶子与父节点时（如 A-B 与 A-B-C 并存），父级此前只能下钻、永远选不到
+    // A-B 本身（审查 #246 可选）。下钻后补一条「本级」选项，既能选自己也能继续下钻。
+    const selfOption = path.length > 0 && node.full
+      ? [{ key: '__self', label: `${node.name}（本级）`, count: node.count, leaf: true, name: node.full }]
+      : []
+    const options = kw === ''
+      ? [...(path.length === 0 ? [{ key: '__all', label: '全部分类', count: typeof total === 'number' ? total : tree.total, leaf: true, name: '' }] : []),
+          ...selfOption,
+          ...level.map((n) => ({ key: n.path.join('-'), label: n.name, count: n.total, leaf: n.children.size === 0, name: n.full, node: n }))]
+      : results.map((l) => ({ key: l.name, label: l.label, count: l.count, leaf: true, name: l.name }))
+    // 选中态与 options 同源：行上的 active 类、aria-selected、✓ 都读 sel，不再各算一遍。
+    for (const o of options) o.sel = o.leaf && value === o.name
+    return { node, kw, results, level, options }
+  }, [tree, path, q, total, value])
+  const { node, kw, results, level, options } = view
   const focusFirst = () => {
     setTimeout(() => {
       const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
@@ -1672,7 +1717,7 @@ function CategoryPicker ({ value, categories, total, onChange }) {
     </button>
     ${open && html`<div class="cate-backdrop" aria-hidden="true" onClick=${dismiss}></div>
       <div class="cate-pop" ref=${popRef} role="dialog" aria-modal=${narrow ? 'true' : 'false'} aria-label="分类筛选"
-        style=${narrow ? '' : `max-height:${Math.max(180, place.max)}px;${place.up ? 'top:auto;bottom:calc(100% + 6px);' : ''}`}>
+        style=${narrow ? '' : `max-height:${place.max}px;visibility:${place.ready ? 'visible' : 'hidden'};${place.up ? 'top:auto;bottom:calc(100% + 6px);' : ''}`}>
         <input class="cate-search" ref=${searchRef} type="search" placeholder="搜索全部分类…"
           value=${q} onInput=${(e) => setQ(e.target.value)} onKeyDown=${onListKey} />
         ${kw === ''
@@ -1686,13 +1731,13 @@ function CategoryPicker ({ value, categories, total, onChange }) {
           : html`<div class="cate-crumb"><span class="cate-crumb-cur">搜索“${q.trim()}”</span></div>`}
         <div class="cate-list" ref=${listRef} role="listbox" aria-label="分类" onKeyDown=${onListKey}>
           ${options.map((o, i) => html`<button type="button" key=${o.key}
-            class=${'cate-opt' + (o.leaf ? '' : ' group') + (o.leaf && value === o.name ? ' active' : '')}
-            role="option" aria-selected=${o.leaf && value === o.name ? 'true' : 'false'}
+            class=${'cate-opt' + (o.leaf ? '' : ' group') + (o.sel ? ' active' : '')}
+            role="option" aria-selected=${o.sel ? 'true' : 'false'}
             tabIndex=${i === active ? 0 : -1} onFocus=${() => setActive(i)}
             title=${o.label} onClick=${() => pick(o)}>
             <span class="cate-opt-name">${o.label}</span>
             <span class="cate-count">${o.count}</span>
-            <span class="cate-check">${o.leaf ? (value === o.name ? '✓' : '') : '›'}</span>
+            <span class="cate-check">${o.leaf ? (o.sel ? '✓' : '') : '›'}</span>
           </button>`)}
         </div>
         ${options.length === 0 && html`<div class="cate-empty">没有匹配的分类</div>`}
