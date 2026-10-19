@@ -157,6 +157,18 @@ const CACHE_HEALTH_NEAR_RATIO = 0.8
 // 独立：语义不同（自检每次都真实推送），将来若要再区分，不必重拆通用窗。
 // lastAccept 本就按 action 键控（per-action Map + 持久化 JSON 的 key），无需改持久化结构。
 const REPLAY_WINDOW_NOTIFY_TEST_MS = 60 * 1000
+// 自动正式运行：HTTP 不接受该动作，只由服务器调度器内部触发。
+// 服务器端自动正式运行：调度在控制台进程内，不依赖浏览器页面。
+const AUTO_MIN_S = 3
+const AUTO_MAX_S = 20
+const AUTO_DEFAULT_S = 10
+const AUTO_MAX_FAILS = 3
+const AUTO_STATE_FILE = 'console-auto.json'
+function clampAutoSeconds (v) {
+  const n = Math.round(Number(v))
+  if (!Number.isFinite(n)) return AUTO_DEFAULT_S
+  return Math.min(AUTO_MAX_S, Math.max(AUTO_MIN_S, n))
+}
 
 // ── v3.300 访问日志常量 ─────────────────────────────────────────────────────
 // 纯内存环形上限：重启即空、不写盘（README 披露）——避免日志自身成为磁盘面，
@@ -210,6 +222,9 @@ function defaultHealthLimits () {
 const ACTIONS = Object.freeze({
   'dry-run': { entry: 'qinglong', args: ['--dry-run'], label: '试运行（抓取但不推送）' },
   run: { entry: 'single', args: [], label: '正式运行一轮（真实推送）' },
+  // 自动模式与手动 run 跑同一个入口/参数，只是独立的幂等重放键（3s 窗），
+  // 否则 60s 窗会把自动循环挡掉；运行中仍由同一把单飞锁互斥。
+  'run-auto': { entry: 'single', args: [], label: '自动正式运行（真实推送）' },
   check: { entry: 'qinglong', args: ['--check'], label: '环境检查（不抓取不推送）' },
   // 批次④ 4.1：通知自检——真实推送一条固定测试消息。entry 必须是 'single'：startAction
   // 的映射是 `action.entry === 'single' ? ENTRY_SINGLE : ENTRY_QINGLONG`，任何其他值
@@ -1615,6 +1630,8 @@ function parseAction (body) {
   if (!m) return null
   let v = m[1]
   try { v = decodeURIComponent(v.replace(/\+/g, ' ')) } catch (e) { return null }
+  // run-auto 只给服务器调度器内部用：HTTP 侧没有稳定幂等键，窗外的重试会重复真实推送。
+  if (v === 'run-auto') return null
   return Object.prototype.hasOwnProperty.call(ACTIONS, v) ? v : null
 }
 
@@ -1954,6 +1971,134 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const lastAccept = new Map()
   // 进程启动时刻（/api/sys 展示「已运行」用）：createConsole 被调用的瞬间。
   const startedAtMs = Date.now()
+
+  // ── 服务器端自动正式运行 ──────────────────────────────────────────────────
+  // 调度器常驻控制台进程：不依赖浏览器页面，关页/切后台/锁屏都不影响。
+  // 持久化只存 {on, interval}：进程重启后若 on=true 会继续；点「停止」才落盘关闭。
+  const autoPath = path.join(stateDir, AUTO_STATE_FILE)
+  const auto = {
+    on: false,
+    interval: AUTO_DEFAULT_S,
+    startedAt: 0,
+    nextAt: 0,
+    runs: 0,
+    fails: 0,
+    lastError: '',
+    lastRunId: null
+  }
+  try {
+    const raw = JSON.parse(fs.readFileSync(autoPath, 'utf8'))
+    if (raw && typeof raw === 'object') {
+      if (raw.on === true) auto.on = true
+      if (raw.interval !== undefined) auto.interval = clampAutoSeconds(raw.interval)
+    }
+  } catch (e) {
+    if (!e || e.code !== 'ENOENT') {
+      console.error(`⚠️ 自动运行状态读取失败，按停止处理：${e && e.message ? e.message : e}`)
+    }
+  }
+  let autoTimer = null
+  let autoWaitTimer = null
+  let autoInFlightId = null
+
+  const autoSnapshot = () => ({
+    on: auto.on,
+    interval: auto.interval,
+    startedAt: auto.startedAt,
+    nextAt: auto.nextAt,
+    runs: auto.runs,
+    fails: auto.fails,
+    lastError: auto.lastError,
+    lastRunId: auto.lastRunId
+  })
+  const persistAuto = () => {
+    try {
+      fs.writeFileSync(autoPath, JSON.stringify({ on: auto.on, interval: auto.interval, updatedAt: Date.now() }))
+    } catch (e) {
+      console.error(`⚠️ 自动运行状态落盘失败（进程内仍生效）：${e && e.message ? e.message : e}`)
+    }
+  }
+  const clearAutoTimer = () => {
+    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null }
+  }
+  const disposeAuto = () => {
+    clearAutoTimer()
+    if (autoWaitTimer) { clearInterval(autoWaitTimer); autoWaitTimer = null }
+  }
+  function stopAuto (reason = '') {
+    clearAutoTimer()
+    auto.on = false
+    auto.nextAt = 0
+    auto.lastError = reason
+    persistAuto()
+  }
+  function scheduleAuto (delayMs) {
+    clearAutoTimer()
+    if (!auto.on || shuttingDown) return
+    auto.nextAt = Date.now() + delayMs
+    autoTimer = setTimeout(() => {
+      autoTimer = null
+      auto.nextAt = 0
+      tickAuto()
+    }, delayMs)
+    if (typeof autoTimer.unref === 'function') autoTimer.unref()
+  }
+  function tickAuto () {
+    if (!auto.on || shuttingDown) return
+    // 手动/上一次自动运行还没结束：不叠跑，按间隔再试。
+    if (autoInFlightId || activeChildren.size > 0) {
+      scheduleAuto(auto.interval * 1000)
+      return
+    }
+    const now = Date.now()
+    const runToken = crypto.randomBytes(12).toString('hex')
+    if (!acquireLock(stateDir, now, runToken)) {
+      // 青龙/另一控制台实例持锁：不抢跑，也不计失败。
+      scheduleAuto(auto.interval * 1000)
+      return
+    }
+    let record
+    try {
+      record = startAction('run-auto', now, activeChildren, historyDir(), runToken, stateDir)
+    } catch (e) {
+      releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
+      auto.fails += 1
+      auto.lastError = `启动失败：${e && e.message ? e.message : e}`
+      if (auto.fails >= AUTO_MAX_FAILS) stopAuto(`连续 ${AUTO_MAX_FAILS} 次启动失败，已停止`)
+      else scheduleAuto(auto.interval * 1000)
+      return
+    }
+    record._lockAt = now
+    autoInFlightId = record.id
+    auto.runs += 1
+    auto.lastRunId = record.id
+    auto.nextAt = 0
+    autoWaitTimer = setInterval(() => {
+      if (!record.finishedAt) return
+      clearInterval(autoWaitTimer)
+      autoWaitTimer = null
+      if (autoInFlightId !== record.id) return
+      autoInFlightId = null
+      const failed = record.exitCode !== 0 || record.timedOut || record.cancelled
+      if (failed) {
+        auto.fails += 1
+        auto.lastError = `最近一轮失败（exit ${record.exitCode}）`
+        if (auto.fails >= AUTO_MAX_FAILS) {
+          stopAuto(`连续 ${AUTO_MAX_FAILS} 轮失败，已停止`)
+          return
+        }
+      } else {
+        auto.fails = 0
+        auto.lastError = ''
+      }
+      if (auto.on) scheduleAuto(auto.interval * 1000)
+    }, 250)
+    if (typeof autoWaitTimer.unref === 'function') autoWaitTimer.unref()
+  }
+  if (auto.on) {
+    auto.startedAt = Date.now()
+    scheduleAuto(auto.interval * 1000)
+  }
   // 读取持久化重放记录：返回合法条目的键值对数组（文件不存在/损坏返回空）。
   // 每次受理前实时调用（Sourcery High：多进程共享 stateDir 时，启动时读的快照会过期）。
   const readLastAccept = (p) => {
@@ -2145,9 +2290,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
         }
         const prev = lastAccept.get(action)
-        // 两种动作同为 60s 窗（D2-S16：普通动作不再用 12min——那只拦得到人工重跑，拦不到
+        // notify-test 60s、其余动作 60s（D2-S16：普通动作不再用 12min——那只拦得到人工重跑，拦不到
         // 真正的重复提交；运行中互斥由单飞锁负责）。/trigger 的 action=notify-test 与独立
-        // 端点共享同一 lastAccept 键与窗长（有意行为）。
+        // 端点共享同一 lastAccept 键与窗长（有意行为）。run-auto 不接受 HTTP 触发。
         const winMs = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : REPLAY_WINDOW_MS
         if (prev && now - prev.at < winMs) {
           // runId = epoch.seq 字符串（v3.299 评审）：0 是 pending 帧哨兵（数字），
@@ -3194,6 +3339,61 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       })
       return
     }
+    // 服务器端自动正式运行：状态/开关/间隔。GET 走全局鉴权；POST 只认 Bearer（写面防 CSRF）。
+    if (req.method === 'GET' && url.pathname === '/api/auto') {
+      sendJson(res, 200, { auto: autoSnapshot(), min: AUTO_MIN_S, max: AUTO_MAX_S, maxFails: AUTO_MAX_FAILS })
+      return
+    }
+    if (req.method === 'POST' && url.pathname === '/api/auto') {
+      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
+      const verdict = writeAuthVerdict(req, url.searchParams, token)
+      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
+      readBody(req)
+        .then(({ body, aborted, over }) => {
+          if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
+          if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
+          if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
+          let payload
+          try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
+          if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            sendJson(res, 400, { error: 'body 必须是对象' })
+            return
+          }
+          let on = auto.on
+          if (Object.prototype.hasOwnProperty.call(payload, 'on')) {
+            if (typeof payload.on !== 'boolean') { sendJson(res, 400, { error: 'on 必须是布尔值' }); return }
+            on = payload.on
+          }
+          let interval = auto.interval
+          if (Object.prototype.hasOwnProperty.call(payload, 'interval')) {
+            if (typeof payload.interval !== 'number' || !Number.isInteger(payload.interval) ||
+              payload.interval < AUTO_MIN_S || payload.interval > AUTO_MAX_S) {
+              sendJson(res, 400, { error: `interval 必须是 ${AUTO_MIN_S}–${AUTO_MAX_S} 的整数` })
+              return
+            }
+            interval = payload.interval
+          }
+          if (on) {
+            auto.interval = interval
+            if (!auto.on) {
+              auto.on = true
+              auto.startedAt = Date.now()
+              auto.runs = 0
+              auto.fails = 0
+              auto.lastError = ''
+            }
+            persistAuto()
+            // 有在途轮次时不重排；它结束后按新间隔排下一轮。
+            if (!autoInFlightId) scheduleAuto(auto.interval * 1000)
+          } else {
+            auto.interval = interval
+            stopAuto('')
+          }
+          sendJson(res, 200, { auto: autoSnapshot(), min: AUTO_MIN_S, max: AUTO_MAX_S, maxFails: AUTO_MAX_FAILS })
+        })
+        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+      return
+    }
     if (req.method === 'POST' && url.pathname === '/trigger') {
       acceptAction(req, res, {})
       return
@@ -3412,7 +3612,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     killAll()
     return origClose(cb)
   }
-  server.on('close', killAll)
+  server.on('close', () => { disposeAuto(); killAll() })
   // ── 优雅关闭装配（v3.297 自 main 抽出，Sourcery #225 M6：原实现不可测——测试无法
   // 确认「关停真的 SIGKILL 了子进程、并等 close 后才退出」）。依赖注入 onExit/registerSignal：
   // 测试传假子进程 + 假 exit 即可确定性断言序列；生产 main 无参调用即等价旧行为。
