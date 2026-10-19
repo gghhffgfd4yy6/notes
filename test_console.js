@@ -4180,6 +4180,16 @@ async function main () {
     assert.ok(scrollBlock.includes('logJumpPendingRef.current = false'), '日志跳转必须一次性消费')
     assert.ok(scrollBlock.includes('scrollMemRef.current[tab] = 0'), '日志跳转必须清掉日志页记忆并回顶')
     assert.ok(scrollBlock.includes('new window.ResizeObserver(() => check())'), '内容增长必须用 ResizeObserver 等到撑起来')
+    assert.ok(scrollBlock.includes('releaseAnchorSoon()') && scrollBlock.includes("overflowAnchor = 'none'"),
+      '切页后必须暂时关掉 scroll anchoring，防止每次切换 +26px 漂移')
+    const anchorHelper = scrollBlock.slice(scrollBlock.indexOf('const releaseAnchorSoon'), scrollBlock.indexOf('const releaseScrollHold'))
+    assert.ok(anchorHelper.includes('}, 1000)'), '锚定恢复窗口必须是 1s，不能立刻恢复')
+    const restoreBlock = scrollBlock.slice(scrollBlock.indexOf('// 垫高已生效'), scrollBlock.indexOf('const t0 = performance.now()'))
+    assert.ok(restoreBlock.includes('holdAnchor()') && restoreBlock.indexOf('holdAnchor()') < restoreBlock.indexOf('window.scrollTo(0, y)'),
+      '切页还原必须先关锚定再 scrollTo')
+    const zeroBlock = scrollBlock.slice(scrollBlock.indexOf('if (y <= 0)'), scrollBlock.indexOf('// 垫高已生效'))
+    assert.ok(zeroBlock.includes('holdAnchor()') && zeroBlock.indexOf('holdAnchor()') < zeroBlock.indexOf('window.scrollTo(0, 0)'),
+      '回顶分支也必须先关锚定')
     assert.ok(scrollBlock.includes('if (ready || settled || performance.now() - t0 > 9000)'),
       '只有内容已撑起、面板落定或 9s 超时才允许收口')
     assert.ok(scrollBlock.includes('if (settled && !hold.user && !ready && bottom > 0)'),

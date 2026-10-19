@@ -2945,6 +2945,22 @@ function App () {
     if (!el) return
     el.style.minHeight = y > 0 ? `${y + window.innerHeight}px` : ''
   }
+  // 切页后的 1s 内关掉 scroll anchoring：新面板常分几批长高，锚定会把
+  // scrollY 每次往上补一截（实测日志↔配置每来回一次 +26px，越切越往下漂）。
+  // 只关这一小段，页面稳定后恢复，避免横幅/告警插入时正文跟着上下滑。
+  const anchorTimerRef = useRef(0)
+  const holdAnchor = () => {
+    if (anchorTimerRef.current) window.clearTimeout(anchorTimerRef.current)
+    anchorTimerRef.current = 0
+    document.documentElement.style.overflowAnchor = 'none'
+  }
+  const releaseAnchorSoon = () => {
+    if (anchorTimerRef.current) window.clearTimeout(anchorTimerRef.current)
+    anchorTimerRef.current = window.setTimeout(() => {
+      anchorTimerRef.current = 0
+      document.documentElement.style.overflowAnchor = ''
+    }, 1000)
+  }
   const releaseScrollHold = () => {
     const hold = scrollHoldRef.current
     if (hold) {
@@ -2958,8 +2974,8 @@ function App () {
       window.removeEventListener('keydown', hold.onUser, true)
     }
     // 过渡期临时关掉滚动锚定：旧面板卸载时它在背后微调 scrollY，
-    // 会把「用户自己滚走了」的判据误触发。
-    document.documentElement.style.overflowAnchor = ''
+    // 会把「用户自己滚走了」的判据误触发。切页后 1s 再恢复。
+    releaseAnchorSoon()
     const el = document.getElementById('app')
     if (el) el.style.minHeight = ''
   }
@@ -2983,6 +2999,7 @@ function App () {
     if (logJumpPendingRef.current) {
       logJumpPendingRef.current = false
       scrollMemRef.current[tab] = 0
+      holdAnchor()
       releaseScrollHold()
       window.scrollTo(0, 0)
       return
@@ -2991,12 +3008,14 @@ function App () {
     pendingScrollRef.current = null
     if (typeof y !== 'number') return
     if (y <= 0) {
+      // 回顶也要挡住锚定：新面板内容若在顶部上方插入，浏览器会把你从 0 挪走。
+      holdAnchor()
       releaseScrollHold()
       window.scrollTo(0, 0)
       return
     }
     // 垫高已生效：这里同步还原，绘制前就到位，不会先出现塌陷后的 0。
-    document.documentElement.style.overflowAnchor = 'none'
+    holdAnchor()
     window.scrollTo(0, y)
     const t0 = performance.now()
     const hold = { y, user: false, raf: 0, timer: 0, ro: null, onUser: null, check: null, startedAt: Date.now() }
@@ -3043,6 +3062,11 @@ function App () {
       hold.raf = window.requestAnimationFrame(loop)
     }
   }, [tab, logJump])
+
+  useEffect(() => () => {
+    if (anchorTimerRef.current) window.clearTimeout(anchorTimerRef.current)
+    document.documentElement.style.overflowAnchor = ''
+  }, [])
 
   // 目标面板报「加载完成」后，如果它的内容撑不到记忆位置，就地落到最大滚动位置；
   // 只认切页后新面板写入的 sync，避免上一页在途响应把垫高提前撤掉。
