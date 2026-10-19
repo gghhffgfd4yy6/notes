@@ -4158,12 +4158,32 @@ async function main () {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/\.tabs\s*\{[^}]*position:\s*sticky/.test(css), '标签页必须吸顶')
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
-    assert.ok(!/window\.scrollTo\(0, 0\) \}, \[tab/.test(src), '切页不得强制回顶（长页深处会被整页拽回顶部）')
-    assert.ok(src.includes('const scrollMemRef = useRef({})') && src.includes('scrollMemRef.current[tab] = window.scrollY'),
-      '切页前必须记住当前页的滚动位置')
-    assert.ok(src.includes('pendingScrollRef') && src.includes('const restoreScroll = (y)'),
-      '切页后必须在新面板撑起高度时还原位置（文档塌陷会把 scrollY 夹到 0）')
-    assert.ok(src.includes('scrollMemRef.current[tab] = 0'), '日志跳转必须清掉日志页记忆并回顶')
+    assert.ok(!/window\.scrollTo\(0, 0\) \}, \[tab/.test(src), '切页不得无条件强制回顶（长页深处会被整页拽回顶部）')
+    const scrollBlock = src.slice(src.indexOf('const scrollMemRef = useRef({})'), src.indexOf('// 标签栏是单行横滚'))
+    const switchBlock = src.slice(src.indexOf('const switchTab = '), src.indexOf('// 「查看日志」跳转'))
+    assert.ok(scrollBlock.includes('scrollMemRef.current[from] = y'),
+      '切页前必须记住出发页的滚动位置')
+    assert.ok(scrollBlock.includes("const target = forceTop ? 0 : (typeof mem === 'number' ? mem : 0)"),
+      '第一次进入的页签必须从顶部开始，不得继承上一页的 scrollY')
+    const prepBlock = scrollBlock.slice(scrollBlock.indexOf('const prepareScroll = '), scrollBlock.indexOf('const prepareScrollRef'))
+    assert.ok(prepBlock.includes('pendingScrollRef.current = target'),
+      '切页必须把目标位置交给 pendingScrollRef')
+    assert.ok(prepBlock.includes('if (target > 0) holdScroll(target)'),
+      '切页前必须先垫高文档，避免卸载/挂载之间塌陷')
+    const prepPos = switchBlock.indexOf('prepareScroll(next)')
+    const tabPos = switchBlock.indexOf('setTab(next)')
+    assert.ok(prepPos > -1 && prepPos < tabPos, '必须先 prepareScroll 再 setTab')
+    const syncPos = scrollBlock.indexOf('window.scrollTo(0, y)')
+    const rafPos = scrollBlock.indexOf('requestAnimationFrame')
+    assert.ok(syncPos > -1 && (rafPos === -1 || syncPos < rafPos),
+      '同步还原必须在 layout effect 内、且早于任何 rAF')
+    assert.ok(scrollBlock.includes('logJumpPendingRef.current = false'), '日志跳转必须一次性消费')
+    assert.ok(scrollBlock.includes('scrollMemRef.current[tab] = 0'), '日志跳转必须清掉日志页记忆并回顶')
+    assert.ok(scrollBlock.includes('ResizeObserver(check)'), '内容增长必须用 ResizeObserver 等到撑起来')
+    assert.ok(scrollBlock.includes('setTimeout(check, 4000)'), '加载失败必须有兜底释放，不能永久垫高')
+    assert.ok(src.includes('prepareScrollRef.current(next)'), 'hash 后退/前进必须走同一套滚动还原')
+    assert.ok(src.includes("window.history.scrollRestoration = 'manual'"), '后退/前进必须关掉浏览器默认的滚动恢复')
+    assert.ok(src.includes("prepareScrollRef.current('logs', { forceTop: true })"), '查看日志必须强制回顶')
     assert.ok(/onClick=\$\{\(\) => \{[^\n]*switchTab\(t\.key\)/.test(src), '标签点击必须走 switchTab，不得绕过（可先清日志跳转）')
     // 手机端 6 个页签在 640 断点下会折成两行（吸顶 108px）；必须改成单行横滚，
     // 否则吸顶区翻倍、正文被挤掉。桌面保持 wrap，不引入滚动容器吞滚轮。

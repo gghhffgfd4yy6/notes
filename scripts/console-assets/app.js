@@ -2892,33 +2892,114 @@ function App () {
   // 换页先清掉上一页的「数据截至」；当前页自己的 loader 成功后再写入。
   useEffect(() => { setPanelSync(null) }, [tab])
 
-  // 切页不强制回顶：旧面板卸载、新面板挂载之间文档高度会短暂塌陷，浏览器把
-  // scrollY 夹到 0，新面板再挂载也回不来（用户反馈「切一个跳一下」）。记下切页前
-  // 的位置，等新面板撑起高度（数据走缓存通常 1-2 帧）再还原；每个页签另有位置记忆。
-  // 只有日志跳转（openLog）仍强制回顶，保证看到日志面板开头。
+  // 切页的滚动策略（修 #260 的二次跳动）：
+  // 1) 每个页签记住自己的 scrollY；第一次进入的页签从顶部开始，绝不继承上一页的
+  //    位置——配置页比日志页矮，继承过来的 y 根本撑不到，浏览器只能夹到 0，
+  //    看起来就是「往上一跳」。
+  // 2) 返回已来过的页签时，切页前先给 #app 垫一个 min-height = y + innerHeight。
+  //    旧面板卸载、新面板还在 loading 的那一帧文档不会塌陷，scrollY 也就不会被
+  //    浏览器夹到 0；随后在 useLayoutEffect（绘制前）同步 scrollTo(y)。垫高一直
+  //    留到新面板真正撑到目标高度（ResizeObserver 盯着内容增长，慢加载也不提前撤），
+  //    这样全程没有「先回顶、再弹回去」的两段跳。
+  // 3) 「查看日志」（logJump）是一次性的强制回顶；消费掉之后，后续切页仍按记忆还原。
   const scrollMemRef = useRef({})
   const pendingScrollRef = useRef(null)
-  const restoreScroll = (y) => {
-    if (!(y > 0)) return
-    const t0 = performance.now()
-    const tick = () => {
-      if (window.scrollY === y) return
-      // 用户已经自己滚动了（不是塌陷后的 0），不要再把他拽回去
-      if (window.scrollY !== 0 && Math.abs(window.scrollY - y) > 2) return
-      if (document.documentElement.scrollHeight - window.innerHeight >= y) window.scrollTo(0, y)
-      else if (performance.now() - t0 < 600) setTimeout(tick, 16)
-    }
-    setTimeout(tick, 16)
+  const scrollHoldRef = useRef(null)
+  const logJumpPendingRef = useRef(false)
+  const tabRef = useRef(tab)
+  tabRef.current = tab
+  const holdScroll = (y) => {
+    const el = document.getElementById('app')
+    if (!el) return
+    el.style.minHeight = y > 0 ? `${y + window.innerHeight}px` : ''
   }
+  const releaseScrollHold = () => {
+    const hold = scrollHoldRef.current
+    if (hold) {
+      scrollHoldRef.current = null
+      if (hold.raf) window.cancelAnimationFrame(hold.raf)
+      if (hold.timer) window.clearTimeout(hold.timer)
+      if (hold.ro) hold.ro.disconnect()
+      window.removeEventListener('wheel', hold.onUser, true)
+      window.removeEventListener('touchstart', hold.onUser, true)
+      window.removeEventListener('pointerdown', hold.onUser, true)
+      window.removeEventListener('keydown', hold.onUser, true)
+    }
+    // 过渡期临时关掉滚动锚定：旧面板卸载时它在背后微调 scrollY，
+    // 会把「用户自己滚走了」的判据误触发。
+    document.documentElement.style.overflowAnchor = ''
+    const el = document.getElementById('app')
+    if (el) el.style.minHeight = ''
+  }
+  // 切页前统一登记：保存出发页位置、决定目标页位置、需要时先垫高。
+  // 只改 ref 与 #app 的临时样式，不触发 React 渲染；调用方随后 setTab。
+  const prepareScroll = (next, { forceTop = false } = {}) => {
+    const from = tabRef.current
+    const y = window.scrollY
+    if (from && from !== next) scrollMemRef.current[from] = y
+    const mem = scrollMemRef.current[next]
+    const target = forceTop ? 0 : (typeof mem === 'number' ? mem : 0)
+    pendingScrollRef.current = target
+    releaseScrollHold()
+    if (target > 0) holdScroll(target)
+  }
+  const prepareScrollRef = useRef(prepareScroll)
+  prepareScrollRef.current = prepareScroll
   useLayoutEffect(() => {
-    if (logJump) {
+    if (logJumpPendingRef.current) {
+      logJumpPendingRef.current = false
       scrollMemRef.current[tab] = 0
+      releaseScrollHold()
       window.scrollTo(0, 0)
       return
     }
     const y = pendingScrollRef.current
     pendingScrollRef.current = null
-    if (typeof y === 'number') restoreScroll(y)
+    if (typeof y !== 'number') return
+    if (y <= 0) {
+      releaseScrollHold()
+      window.scrollTo(0, 0)
+      return
+    }
+    // 垫高已生效：这里同步还原，绘制前就到位，不会先出现塌陷后的 0。
+    document.documentElement.style.overflowAnchor = 'none'
+    window.scrollTo(0, y)
+    const t0 = performance.now()
+    const hold = { y, user: false, raf: 0, timer: 0, ro: null, onUser: null, check: null }
+    hold.onUser = () => { hold.user = true; if (hold.check) hold.check() }
+    window.addEventListener('wheel', hold.onUser, { capture: true, passive: true })
+    window.addEventListener('touchstart', hold.onUser, { capture: true, passive: true })
+    window.addEventListener('pointerdown', hold.onUser, { capture: true, passive: true })
+    window.addEventListener('keydown', hold.onUser, true)
+    const check = () => {
+      if (scrollHoldRef.current !== hold) return
+      // 用户接管后不再钉住位置；但垫高先留着，等内容长到能接住当前视口再撤，
+      // 否则撤早了浏览器会把 scrollY 夹回 0，用户的滚动直接丢。
+      if (!hold.user && Math.abs(window.scrollY - y) > 2) window.scrollTo(0, y)
+      const foot = document.querySelector('.foot')
+      const bottom = foot ? foot.getBoundingClientRect().bottom + window.scrollY : 0
+      const need = (hold.user ? window.scrollY : y) + window.innerHeight
+      // 内容慢时用 ResizeObserver 等到真正撑起来；4s 只是失败兜底，不提前撤。
+      if (bottom >= need || performance.now() - t0 > 4000) releaseScrollHold()
+    }
+    hold.check = check
+    hold.ro = window.ResizeObserver ? new window.ResizeObserver(check) : null
+    const wrap = document.querySelector('.wrap')
+    if (hold.ro && wrap) hold.ro.observe(wrap)
+    scrollHoldRef.current = hold
+    check()
+    // 加载失败/永远撑不起来时，到点释放，避免一直留着一块空白。
+    if (scrollHoldRef.current === hold) hold.timer = window.setTimeout(check, 4000)
+    // 没有 ResizeObserver 的老环境：用 rAF 轮询兜底（4s 到点后 check 会自停）。
+    if (!hold.ro) {
+      const loop = () => {
+        hold.raf = 0
+        if (scrollHoldRef.current !== hold) return
+        check()
+        if (scrollHoldRef.current === hold) hold.raf = window.requestAnimationFrame(loop)
+      }
+      hold.raf = window.requestAnimationFrame(loop)
+    }
   }, [tab, logJump])
 
   // 标签栏是单行横滚：切页、旋转屏幕或改窗口宽度后都要把当前页签滚进可视区，
@@ -3073,10 +3154,25 @@ function App () {
 
   // hash 路由（v3.307）：首次进入补 #/overview；前进/后退跟着切页。
   useEffect(() => {
-    const onHash = () => { setTab(resolveTab(window.location.hash)) }
+    // 后退/前进的滚动位置由本页的 per-tab 记忆负责；浏览器默认的
+    // scrollRestoration='auto' 会在 layout effect 之后再按历史条目恢复一次，
+    // 把刚还原好的位置覆盖掉（实测 forward 回到长页被压回旧位置）。
+    const prevRestoration = window.history.scrollRestoration
+    if ('scrollRestoration' in window.history) window.history.scrollRestoration = 'manual'
+    const onHash = () => {
+      const next = resolveTab(window.location.hash)
+      if (next === tabRef.current) return
+      // 后退/前进也走同一套记忆与垫高，不再绕过 switchTab 丢失还原。
+      prepareScrollRef.current(next)
+      setTab(next)
+      tabRef.current = next
+    }
     if (!window.location.hash) window.history.replaceState(null, '', '#/overview')
     window.addEventListener('hashchange', onHash)
-    return () => window.removeEventListener('hashchange', onHash)
+    return () => {
+      window.removeEventListener('hashchange', onHash)
+      if ('scrollRestoration' in window.history) window.history.scrollRestoration = prevRestoration
+    }
   }, [])
 
   // 标题状态点（v3.307）：标签页在后台时也能一眼看出「有失败/在跑」。
@@ -3141,17 +3237,22 @@ function App () {
   // v3.307 同步写 hash：刷新/后退能回到同一页。
   const switchTab = (next) => {
     if (next === tab) return
-    // 记住当前页的位置；目标页没来过就沿用当前视口（切页不该把整页拽回顶部）。
-    scrollMemRef.current[tab] = window.scrollY
-    const mem = scrollMemRef.current[next]
-    pendingScrollRef.current = typeof mem === 'number' ? mem : window.scrollY
+    // 统一走 prepareScroll：保存出发页位置、决定目标页位置、需要时先垫高。
+    // 第一次进入的页签从顶部开始，不继承上一页的位置（短页撑不到那个高度）。
+    prepareScroll(next)
     setTab(next)
+    tabRef.current = next
     if (window.location.hash !== `#/${next}`) window.location.hash = `#/${next}`
   }
   // 「查看日志」跳转：横幅/逐轮历史点进来时带筛选条件与日期，重挂载 LogsPanel。
+  // 这是一次性的强制回顶；logJumpPendingRef 被 layout effect 消费后即失效，
+  // logJump 本身继续留给 LogsPanel 当重挂载 key。
   const openLog = useCallback((jump) => {
+    prepareScrollRef.current('logs', { forceTop: true })
+    logJumpPendingRef.current = true
     setLogJump({ q: jump && jump.q ? jump.q : '', mode: jump && jump.mode ? jump.mode : 'all', n: Date.now() })
     setTab('logs')
+    tabRef.current = 'logs'
     if (window.location.hash !== '#/logs') window.location.hash = '#/logs'
   }, [])
   const pollMs = locking ? POLL_BUSY_MS : POLL_MS
@@ -3188,7 +3289,7 @@ function App () {
 
     <nav class="tabs" ref=${tabsRef}>
       ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')}
-        onClick=${() => { if (t.key === 'logs') setLogJump(null); switchTab(t.key) }}>${t.label}</button>`)}
+        onClick=${() => { if (t.key === 'logs') { logJumpPendingRef.current = false; setLogJump(null) } switchTab(t.key) }}>${t.label}</button>`)}
     </nav>
 
     ${!authExpired && tab === 'overview' && html`<div>
