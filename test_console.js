@@ -4163,8 +4163,8 @@ async function main () {
     const switchBlock = src.slice(src.indexOf('const switchTab = '), src.indexOf('// 「查看日志」跳转'))
     assert.ok(scrollBlock.includes('scrollMemRef.current[from] = y'),
       '切页前必须记住出发页的滚动位置')
-    assert.ok(scrollBlock.includes("const target = forceTop ? 0 : (typeof mem === 'number' ? mem : 0)"),
-      '第一次进入的页签必须从顶部开始，不得继承上一页的 scrollY')
+    assert.ok(scrollBlock.includes("const target = forceTop ? 0 : (typeof mem === 'number' ? mem : y)"),
+      '第一次进入的页签必须沿用当前视口位置，不得被拽回顶部')
     const prepBlock = scrollBlock.slice(scrollBlock.indexOf('const prepareScroll = '), scrollBlock.indexOf('const prepareScrollRef'))
     assert.ok(prepBlock.includes('pendingScrollRef.current = target'),
       '切页必须把目标位置交给 pendingScrollRef')
@@ -4179,8 +4179,22 @@ async function main () {
       '同步还原必须在 layout effect 内、且早于任何 rAF')
     assert.ok(scrollBlock.includes('logJumpPendingRef.current = false'), '日志跳转必须一次性消费')
     assert.ok(scrollBlock.includes('scrollMemRef.current[tab] = 0'), '日志跳转必须清掉日志页记忆并回顶')
-    assert.ok(scrollBlock.includes('ResizeObserver(check)'), '内容增长必须用 ResizeObserver 等到撑起来')
-    assert.ok(scrollBlock.includes('setTimeout(check, 4000)'), '加载失败必须有兜底释放，不能永久垫高')
+    assert.ok(scrollBlock.includes('new window.ResizeObserver(() => check())'), '内容增长必须用 ResizeObserver 等到撑起来')
+    assert.ok(scrollBlock.includes('if (ready || settled || performance.now() - t0 > 9000)'),
+      '只有内容已撑起、面板落定或 9s 超时才允许收口')
+    assert.ok(scrollBlock.includes('if (settled && !hold.user && !ready && bottom > 0)'),
+      '目标页更矮时只在用户未接管时落到最大位置')
+    assert.ok(scrollBlock.includes('window.scrollTo(0, Math.max(0, document.documentElement.scrollHeight - window.innerHeight))'),
+      '落位必须用页面最大滚动位置，不能回 0')
+    assert.ok(scrollBlock.includes('hold.check(true)') && scrollBlock.includes('panelSync >= hold.startedAt'),
+      '目标面板加载完成后必须让垫高就地收口')
+    assert.ok(scrollBlock.includes('setTimeout(check, 9000)'), '加载失败必须有 9s 兜底释放，不能永久垫高')
+    assert.ok(src.includes('const make = (key) => (ts) => { if (tabRef.current === key) setPanelSync(ts) }'),
+      '完成回调必须绑定页签，旧页在途响应不得释放新页垫高')
+    assert.ok(src.includes('if (configAt && filterAt && typeof onSync'), '配置页两个 loader 都落定才算完成')
+    assert.ok(src.includes('if (sysReady && accessReady && typeof onReady'), '系统页两个 loader 都落定才算完成')
+    assert.ok(src.includes('onReady=$' + '{onSysReady}') && src.includes('onReady=$' + '{onFilesReady}'),
+      '系统页与文件清单都要向滚动层报完成')
     assert.ok(src.includes('prepareScrollRef.current(next)'), 'hash 后退/前进必须走同一套滚动还原')
     assert.ok(src.includes("window.history.scrollRestoration = 'manual'"), '后退/前进必须关掉浏览器默认的滚动恢复')
     assert.ok(src.includes("prepareScrollRef.current('logs', { forceTop: true })"), '查看日志必须强制回顶')
