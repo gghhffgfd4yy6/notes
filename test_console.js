@@ -4158,8 +4158,12 @@ async function main () {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/\.tabs\s*\{[^}]*position:\s*sticky/.test(css), '标签页必须吸顶')
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
-    assert.ok(src.includes('window.scrollTo(0, 0)'), '切页必须回到顶部')
-    assert.ok(/useLayoutEffect\(\(\) => \{ window\.scrollTo\(0, 0\) \}, \[tab, logJump\]\)/.test(src), '切页回顶必须在 layout effect 中执行')
+    assert.ok(!/window\.scrollTo\(0, 0\) \}, \[tab/.test(src), '切页不得强制回顶（长页深处会被整页拽回顶部）')
+    assert.ok(src.includes('const scrollMemRef = useRef({})') && src.includes('scrollMemRef.current[tab] = window.scrollY'),
+      '切页前必须记住当前页的滚动位置')
+    assert.ok(src.includes('pendingScrollRef') && src.includes('const restoreScroll = (y)'),
+      '切页后必须在新面板撑起高度时还原位置（文档塌陷会把 scrollY 夹到 0）')
+    assert.ok(src.includes('scrollMemRef.current[tab] = 0'), '日志跳转必须清掉日志页记忆并回顶')
     assert.ok(/onClick=\$\{\(\) => \{[^\n]*switchTab\(t\.key\)/.test(src), '标签点击必须走 switchTab，不得绕过（可先清日志跳转）')
     // 手机端 6 个页签在 640 断点下会折成两行（吸顶 108px）；必须改成单行横滚，
     // 否则吸顶区翻倍、正文被挤掉。桌面保持 wrap，不引入滚动容器吞滚轮。

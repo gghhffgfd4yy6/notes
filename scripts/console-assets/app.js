@@ -2892,8 +2892,34 @@ function App () {
   // 换页先清掉上一页的「数据截至」；当前页自己的 loader 成功后再写入。
   useEffect(() => { setPanelSync(null) }, [tab])
 
-  // 切页在 DOM 提交后、绘制前回顶：先 setTab 再立即 scrollTo 会让旧长页面先闪一下。
-  useLayoutEffect(() => { window.scrollTo(0, 0) }, [tab, logJump])
+  // 切页不强制回顶：旧面板卸载、新面板挂载之间文档高度会短暂塌陷，浏览器把
+  // scrollY 夹到 0，新面板再挂载也回不来（用户反馈「切一个跳一下」）。记下切页前
+  // 的位置，等新面板撑起高度（数据走缓存通常 1-2 帧）再还原；每个页签另有位置记忆。
+  // 只有日志跳转（openLog）仍强制回顶，保证看到日志面板开头。
+  const scrollMemRef = useRef({})
+  const pendingScrollRef = useRef(null)
+  const restoreScroll = (y) => {
+    if (!(y > 0)) return
+    const t0 = performance.now()
+    const tick = () => {
+      if (window.scrollY === y) return
+      // 用户已经自己滚动了（不是塌陷后的 0），不要再把他拽回去
+      if (window.scrollY !== 0 && Math.abs(window.scrollY - y) > 2) return
+      if (document.documentElement.scrollHeight - window.innerHeight >= y) window.scrollTo(0, y)
+      else if (performance.now() - t0 < 600) setTimeout(tick, 16)
+    }
+    setTimeout(tick, 16)
+  }
+  useLayoutEffect(() => {
+    if (logJump) {
+      scrollMemRef.current[tab] = 0
+      window.scrollTo(0, 0)
+      return
+    }
+    const y = pendingScrollRef.current
+    pendingScrollRef.current = null
+    if (typeof y === 'number') restoreScroll(y)
+  }, [tab, logJump])
 
   // 标签栏是单行横滚：切到靠右的页签（或直接用 #/system 打开）时把当前页签滚进可视区。
   // 只改 .tabs 的 scrollLeft，不碰页面滚动；sticky 栏本身始终在视口里。
@@ -3104,6 +3130,10 @@ function App () {
   // v3.307 同步写 hash：刷新/后退能回到同一页。
   const switchTab = (next) => {
     if (next === tab) return
+    // 记住当前页的位置；目标页没来过就沿用当前视口（切页不该把整页拽回顶部）。
+    scrollMemRef.current[tab] = window.scrollY
+    const mem = scrollMemRef.current[next]
+    pendingScrollRef.current = typeof mem === 'number' ? mem : window.scrollY
     setTab(next)
     if (window.location.hash !== `#/${next}`) window.location.hash = `#/${next}`
   }
