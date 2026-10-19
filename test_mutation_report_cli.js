@@ -5,7 +5,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { execFileSync } = require('node:child_process')
+const { execFileSync, spawnSync } = require('node:child_process')
 
 const SCRIPT = path.join(__dirname, 'scripts', 'mutation-report.js')
 
@@ -405,7 +405,8 @@ function schemaReport (seg, mutants) {
 
 // 场景 10（F1 返工 · 同族反例②）：**跨轮 <12h 的同日回填**——全部段都来自同一天的上一次运行
 // （互差≈0、11h 前）。年龄层看不见（11h < 12h 阈值），只有「本轮运行起点」层能拦下：CI 由
-// mutation.yml 注入 MUTATION_RUN_STARTED_AT=github.run_started_at。不注入时必须放行（本地手工运行
+// mutation.yml 的「解析本轮运行起点」步骤经 REST API 取本次 run 的 run_started_at，再经
+// $GITHUB_ENV 注入 MUTATION_RUN_STARTED_AT（见场景 11 的接线断言）。不注入时必须放行（本地手工运行
 // 日报不得误红）——两条一起构成「该层真的在起作用」的证据。
 {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-sameday-'))
@@ -432,12 +433,152 @@ function schemaReport (seg, mutants) {
   }
 }
 
-// 场景 11（F1 返工 · 接线）：report job 必须把本轮运行起点喂给闸门——否则第三层在 CI 里永不生效
-// （本机无法执行 Actions，只能对 workflow 文本做结构断言）。
+// 场景 11（F1 返工 · 接线）：report job 必须把本轮运行起点喂给闸门——否则第③层在 CI 里永不生效。
+// 原接线 `MUTATION_RUN_STARTED_AT: ${{ github.run_started_at }}` 是**恒空值**：github 上下文没有
+// run_started_at 属性（只有 run_id / run_number / run_attempt），不存在的属性求值为空串 ⇒
+// resolveRunStartedAtMs('') 返回 undefined、第③层被静默跳过；而旧断言只检查「YAML 字面里有这个
+// 表达式」，正好把这条死接线锁成绿（change-detector，场景 10 又只是手工注入环境变量测闸门逻辑）。
+// 现接线＝独立步骤经 REST API 取真值 → $GITHUB_ENV → 汇总步骤继承；取不到/不可解析即 exit 1。
+// 本场景锁三件事：① 新接线的结构与位置；② 汇总步骤不得再自带该变量（步骤级 env 优先级高于
+// GITHUB_ENV，空值会覆盖真值）；③ 反例——全文不得再出现无效表达式。
 {
   const yml = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'mutation.yml'), 'utf8')
-  assert.ok(/MUTATION_RUN_STARTED_AT:\s*\$\{\{\s*github\.run_started_at\s*\}\}/.test(yml),
-    'mutation.yml 的汇总步骤必须注入 MUTATION_RUN_STARTED_AT: ' + '${' + '{ github.run_started_at }}')
+  // ③ 反例：无效表达式必须彻底消失（残留任一处都会把空值重新注入、或误导后来者照抄）
+  assert.ok(!yml.includes('github.run_started_at'),
+    'mutation.yml 不得再出现 github.run_started_at：github 上下文没有该属性，求值为空串 ⇒ 第③层静默失效')
+
+  // 只定位 report job（`  report:` … 下一个顶层 job 或文件末）：mutation job 里也有同名/近似步骤名
+  const all = yml.split('\n')
+  const jobStart = all.findIndex(l => /^ {2}report:\s*$/.test(l))
+  assert.ok(jobStart >= 0, 'mutation.yml 必须能定位 report job（  report: …）')
+  let jobEnd = all.length
+  for (let i = jobStart + 1; i < all.length; i++) {
+    if (/^ {2}\S/.test(all[i])) { jobEnd = i; break }
+  }
+  const jobLines = all.slice(jobStart, jobEnd)
+  const stepStart = (name) => jobLines.findIndex(l => l.trim() === `- name: ${name}`)
+  const stepBlock = (name) => {
+    const start = stepStart(name)
+    assert.ok(start >= 0, `report job 必须存在步骤「${name}」`)
+    let end = jobLines.length
+    for (let i = start + 1; i < jobLines.length; i++) {
+      const t = jobLines[i].trim()
+      if (t.startsWith('- uses:') || t.startsWith('- name:') || t.startsWith('- id:')) { end = i; break }
+    }
+    return { text: jobLines.slice(start, end).join('\n'), start }
+  }
+
+  const download = stepBlock('下载各段变异报告')
+  const resolve = stepBlock('解析本轮运行起点')
+  const summary = stepBlock('汇总并发日报')
+  // workflow 里的模板表达式字面量要靠拼接构造：standard 的 no-template-curly-in-string 会把普通
+  // 字符串里的 `${…}` / `${{ … }}` 判成「写错模板」（本仓既有断言同样是拆开拼，见上方旧写法）。
+  const D = '$' + '{' // ${
+  const DD = '$' + '{{' // ${{
+  // ① 位置：必须在下载之后（步骤顺序即 env 生效范围）且在汇总之前——$GITHUB_ENV 只对后续步骤生效
+  assert.ok(resolve.start > download.start,
+    '「解析本轮运行起点」必须在「下载各段变异报告」之后')
+  assert.ok(resolve.start < summary.start,
+    '「解析本轮运行起点」必须在「汇总并发日报」之前（$GITHUB_ENV 只对后续步骤生效）')
+
+  // ① 取真值：REST API 读本次 run 的 run_started_at；run 段不内联任何上游表达式（zizmor template-injection 约定）
+  assert.ok(resolve.text.includes('gh api "repos/' + D + 'GITHUB_REPOSITORY}/actions/runs/' + D + 'GITHUB_RUN_ID}"'),
+    `必须用 REST API 读本次 run（gh api …/actions/runs/${'$'}{GITHUB_RUN_ID}），实际：${resolve.text}`)
+  assert.ok(resolve.text.includes('--jq .run_started_at'),
+    `必须取 .run_started_at 字段，实际：${resolve.text}`)
+  // ① token 必须是步骤级 env 的真实映射（不是注释/echo 里的字面量）：解析 env 块，拒绝「挪进注释也算过」
+  const resolveLines = resolve.text.split('\n')
+  const envIdx = resolveLines.findIndex(l => l.trim() === 'env:')
+  assert.ok(envIdx >= 0, `解析步骤必须有 env: 块，实际：${resolve.text}`)
+  const envIndent = resolveLines[envIdx].search(/\S/)
+  const tokenLine = resolveLines.slice(envIdx + 1).find(l => {
+    const indent = l.search(/\S/)
+    return l.trim() !== '' && indent > envIndent && l.trim().startsWith('GITHUB_TOKEN:')
+  })
+  assert.strictEqual(tokenLine && tokenLine.trim(), 'GITHUB_TOKEN: ' + DD + ' secrets.GITHUB_TOKEN }}',
+    `解析步骤的 env.GITHUB_TOKEN 必须精确等于 \${{ secrets.GITHUB_TOKEN }}，实际：${tokenLine}`)
+
+  // ① report job 的显式 permissions 必须含 actions: read：
+  //    显式块里未列出的权限为 none，缺它 gh api 读本次 run 会 403。
+  const permIdx = jobLines.findIndex(l => l === '    permissions:')
+  assert.ok(permIdx >= 0, 'report job 必须有 4 空格缩进的 permissions: 块')
+  const perms = []
+  for (let i = permIdx + 1; i < jobLines.length; i++) {
+    const l = jobLines[i]
+    if (l.trim() === '') continue
+    if (l.search(/\S/) <= 4) break
+    perms.push(l.trim())
+  }
+  assert.ok(perms.includes('actions: read'),
+    `report job 的 permissions 必须含 actions: read（否则读 run 403），实际：${perms.join(', ')}`)
+
+  // ① 执行级验证：桩 gh 实跑 run 段，覆盖成功 / 空值 / 不可解析 / API 失败四条分支。
+  //    纯文本断言会被「删掉空值守卫但留下 API 失败文案」骗过（Sourcery 指出），必须看真实退出码与落盘值。
+  //    逐行解析 run: | 块（不用 /^(\s*)run: \|/ + [\s\S]*$/ 这类嵌套量词，Sonar S8786 会判超线性回溯）。
+  const resolveLines2 = resolve.text.split('\n')
+  const runLineIdx = resolveLines2.findIndex(l => l.trim() === 'run: |')
+  assert.ok(runLineIdx >= 0, `解析步骤必须有 run: | 块，实际：${resolve.text}`)
+  const runIndent = resolveLines2[runLineIdx].search(/\S/)
+  const body = []
+  for (let i = runLineIdx + 1; i < resolveLines2.length; i++) {
+    if (resolveLines2[i].trim() === '') { body.push(''); continue }
+    if (resolveLines2[i].search(/\S/) <= runIndent) break
+    body.push(resolveLines2[i].slice(runIndent + 2))
+  }
+  const script = body.join('\n').trimEnd()
+  assert.ok(script.includes('gh api'), `run 段必须实际调用 gh api，实际：${script}`)
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-resolver-'))
+  try {
+    // 用同 shell 的函数桩代替 PATH 前置：不引入任何可写目录（S4036 无从触发），函数也必然优先于外部 gh。
+    const stub = [
+      'gh () {',
+      '  case "$GH_STUB_MODE" in',
+      '    ok) echo "2026-10-19T02:03:37Z" ;;',
+      '    empty) printf "" ;;',
+      '    bad) echo "not-a-date" ;;',
+      '    fail) echo "HTTP 403" >&2; return 1 ;;',
+      '  esac',
+      '}'
+    ].join('\n')
+    const runCase = (mode) => {
+      const envFile = path.join(tmp, 'env-' + mode)
+      fs.writeFileSync(envFile, '')
+      const r = spawnSync('/bin/bash', ['-c', stub + '\n' + script], {
+        env: {
+          GITHUB_ENV: envFile,
+          GITHUB_REPOSITORY: 'o/r',
+          GITHUB_RUN_ID: '1',
+          GITHUB_TOKEN: 'stub',
+          GH_STUB_MODE: mode
+        },
+        encoding: 'utf8'
+      })
+      return { status: r.status, stderr: r.stderr, env: fs.readFileSync(envFile, 'utf8') }
+    }
+    const okCase = runCase('ok')
+    assert.strictEqual(okCase.status, 0, `成功分支必须 exit 0，stderr=${okCase.stderr}`)
+    assert.strictEqual(okCase.env.trim(), 'MUTATION_RUN_STARTED_AT=2026-10-19T02:03:37Z',
+      `成功分支必须把 ts 原样写入 $GITHUB_ENV，实际=${JSON.stringify(okCase.env)}`)
+    for (const mode of ['empty', 'bad', 'fail']) {
+      const c = runCase(mode)
+      assert.notStrictEqual(c.status, 0, `${mode} 分支必须非零退出（fail-closed），实际 exit=${c.status}`)
+      assert.ok(c.stderr.includes('拒绝发布'), `${mode} 分支必须点名拒绝发布，stderr=${c.stderr}`)
+      assert.ok(!c.env.includes('MUTATION_RUN_STARTED_AT='),
+        `${mode} 分支不得写入环境文件，实际=${JSON.stringify(c.env)}`)
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+
+  // ② 汇总步骤不得再声明该变量：步骤级 env 覆盖 $GITHUB_ENV，空值会把真值顶掉
+  const declaresRunStart = summary.text.split('\n')
+    .some(l => l.trim().startsWith('MUTATION_RUN_STARTED_AT:'))
+  assert.ok(!declaresRunStart,
+    '汇总步骤不得再声明 MUTATION_RUN_STARTED_AT（步骤级 env 优先于 $GITHUB_ENV，空值会覆盖刚取到的真值）')
+  // 既有 env 保留：发 Issue 与去重查询都靠这两个
+  assert.ok(summary.text.includes('GITHUB_TOKEN: ' + DD + ' secrets.GITHUB_TOKEN }}') &&
+    summary.text.includes('GITHUB_REPOSITORY: ' + DD + ' github.repository }}'),
+    `汇总步骤必须保留 GITHUB_TOKEN / GITHUB_REPOSITORY，实际：${summary.text}`)
 }
 
 // 场景 12（F1 返工 · workflow 兜底层）：清理缓存回填的旧报告是 mtime 不可靠时**唯一不依赖文件时间**
