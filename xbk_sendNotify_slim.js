@@ -223,6 +223,9 @@ const push_config = {
   WX_pusher_topicIds: '', // wxpusher 主题ID(真实ID已移除)
   // 多应用分流：[{ appToken: '...', topicIds: '主题ID' }]；为空时兼容上面单应用配置
   WX_pusher_channels: [],
+  // v3.314：通知点击直达——deal=正文第一条商品/活动外链（默认），detail=末尾「原文链接」，
+  // off=不带链接。需要在 WxPusher App「我的 → 通用 → 通知点击设置」选「原文链接」才会生效。
+  WX_pusher_clickUrl: 'deal',
 
   // 息知文档：https://xz.qqoq.net/
   // 推送地址示例：https://xizhi.qqoq.net/xxxxxxxxxxxxx.send
@@ -300,6 +303,7 @@ const ENV_ALIASES = {
   WX_pusher_appToken: ['WX_pusher_appToken', 'WX_PUSHER_APP_TOKEN'],
   WX_pusher_topicIds: ['WX_pusher_topicIds', 'WX_PUSHER_TOPIC_IDS'],
   WX_pusher_channels: ['WX_pusher_channels', 'WX_PUSHER_CHANNELS'],
+  WX_pusher_clickUrl: ['WX_pusher_clickUrl', 'WX_PUSHER_CLICK_URL'],
   WX_XIZHI_KEY: ['WX_XIZHI_KEY'],
   DEER_KEY: ['DEER_KEY'],
   DEER_URL: ['DEER_URL'],
@@ -1088,8 +1092,135 @@ function wxPusherBusinessError (data) {
   return channelError(sourceErr, 'wxpusher', null, sourceErr.code ? String(sourceErr.code) : '')
 }
 
+// v3.314：WxPusher「点击通知打开原文链接」。desp 是模板渲染后的串（Markdown 或 HTML），
+// 两种形态都要能取出链接；只认 http(s)（不要自定义 Scheme / javascript: 进 url 字段），
+// 超过 WxPusher 的 1000 字符上限就整体放弃——被截断的链接必然打不开。
+const WXPUSHER_URL_MAX = 1000
+const WXPUSHER_CLICK_MODES = ['deal', 'detail', 'off']
+let wxPusherClickModeWarned = false
+
+// 内容源的链接常被多层转义（&amp;amp;）——逐层解到稳定，最多 3 层防病态输入
+function decodeUrlEntities (value) {
+  let out = value
+  for (let i = 0; i < 3 && out.includes('&amp;'); i++) out = out.split('&amp;').join('&')
+  return out
+}
+
+function normalizeClickUrl (value) {
+  const raw = decodeUrlEntities(safeString(value)).trim()
+  if (!/^https?:\/\//i.test(raw)) return ''
+  // eslint-disable-next-line no-control-regex -- 控制字符是显式拒绝项（与 Utils.safeUrl 同口径）
+  if (/[\u0000-\u001F\u007F]/.test(raw)) return ''
+  return raw.length <= WXPUSHER_URL_MAX ? raw : ''
+}
+
+// 线性扫描（不用回溯正则）：返回 from 之后第一个 HTML href 链接
+function nextHrefLink (text, from) {
+  let at = from
+  while (at < text.length) {
+    at = text.indexOf('href', at)
+    if (at < 0) return null
+    const start = at
+    at += 4
+    // 属性名精确匹配：排除 data-href= / xhref=
+    if (start > 0 && /[-\w]/.test(text[start - 1])) continue
+    let i = start + 4
+    while (i < text.length && (text[i] === ' ' || text[i] === '\t')) i++
+    if (text[i] !== '=') continue
+    i++
+    while (i < text.length && (text[i] === ' ' || text[i] === '\t')) i++
+    const quote = text[i]
+    if (quote !== '"' && quote !== "'") continue
+    const end = text.indexOf(quote, i + 1)
+    if (end < 0) return null
+    return { index: start, url: text.slice(i + 1, end) }
+  }
+  return null
+}
+
+// 线性扫描 Markdown 链接 [text](url) / [text](<url>)；图片 ![alt](src) 不算
+// 回看 '[' 的窗口设上限：畸形输入里大量 '](' 无配对 '[' 时，无界回看会退化成 O(n²)
+const MD_LINK_TEXT_MAX = 4000
+
+function lastOpenBracket (text, close) {
+  const start = Math.max(0, close - MD_LINK_TEXT_MAX)
+  for (let i = close - 1; i >= start; i--) if (text[i] === '[') return i
+  return -1
+}
+
+function nextMarkdownLink (text, from) {
+  let at = from
+  while (at < text.length) {
+    const close = text.indexOf('](', at)
+    if (close < 0) return null
+    at = close + 2
+    const open = lastOpenBracket(text, close)
+    if (open < 0) continue
+    if (open > 0 && text[open - 1] === '!') continue
+    let i = close + 2
+    while (i < text.length && /\s/.test(text[i])) i++
+    if (text[i] === '<') {
+      const end = text.indexOf('>', i + 1)
+      if (end < 0) continue
+      return { index: open, url: text.slice(i + 1, end), end: close + 2 }
+    }
+    const end = text.indexOf(')', i)
+    if (end < 0) return null
+    return { index: open, url: text.slice(i, end), end: close + 2 }
+  }
+  return null
+}
+
+// 按文档顺序取第一条「可用」链接：形态合法但超长/非 http(s) 的候选跳过，
+// 继续看后面的（典型：微博线报的二维码长链 >1000 字符，应落到末尾原文链接）。
+// 两个扫描器各自持有游标、只前进不回头（每次 O(n) 只算一次，避免反复从头扫）。
+function firstClickUrl (text) {
+  let html = nextHrefLink(text, 0)
+  let md = nextMarkdownLink(text, 0)
+  while (html || md) {
+    const useHtml = Boolean(html) && (!md || html.index <= md.index)
+    const candidate = useHtml ? html : md
+    const url = normalizeClickUrl(candidate.url)
+    if (url) return url
+    if (useHtml) html = nextHrefLink(text, html.index + 4)
+    else md = nextMarkdownLink(text, md.end)
+  }
+  return ''
+}
+
+function normalizeClickMode (value) {
+  const raw = safeString(value).trim().toLowerCase()
+  if (raw === '') return 'deal'
+  if (WXPUSHER_CLICK_MODES.includes(raw)) return raw
+  if (!wxPusherClickModeWarned) {
+    wxPusherClickModeWarned = true
+    console.warn(`⚠️ WX_pusher_clickUrl 值无效：「${raw}」（应为 deal/detail/off），已按 deal 执行`)
+  }
+  return 'deal'
+}
+
+/**
+ * 选取 WxPusher 通知点击要打开的链接。
+ * deal：正文里第一条 http(s) 链接（线报的商品/活动外链；正文没有外链时自然落到末尾的原文链接）
+ * detail：末尾「原文链接」段里的链接（模板没写该段时回退第一条）
+ * off：不带动跳链接（保持旧行为）
+ */
+function pickWxPusherClickUrl (desp, mode) {
+  const text = safeString(desp)
+  if (!text) return ''
+  const wanted = normalizeClickMode(mode)
+  if (wanted === 'off') return ''
+  if (wanted === 'detail') {
+    const at = text.lastIndexOf('原文链接')
+    return at < 0 ? firstClickUrl(text) : firstClickUrl(text.slice(at))
+  }
+  return firstClickUrl(text)
+}
+
 function wxPusherPost (channel, text, desp, params = {}) {
   const started = Date.now()
+  // v3.314：点击通知打开链接（App 端需选「通知点击设置 → 原文链接」）；取不到就整字段省略
+  const clickUrl = pickWxPusherClickUrl(desp, push_config.WX_pusher_clickUrl)
   if (process.env.XBK_PROFILE === '2' || process.env.XBK_PROFILE === '3') console.log(`[profile wxpusher] app=${maskKey(channel.appToken)} outcome=start`)
   return new Promise((resolve, reject) => {
     const options = {
@@ -1102,7 +1233,9 @@ function wxPusherPost (channel, text, desp, params = {}) {
         summary: safeSlice(text, 90),
         // v3.159：内容含 HTML 标签时用 contentType=2（HTML 渲染）——Markdown(3) 会把 <br>/<a> 当纯文本裸露
         contentType: looksHtml(desp) ? 2 : 3, // 1文字 2HTML 3Markdown
-        topicIds: channel.topicIds
+        topicIds: channel.topicIds,
+        // v3.314：点击通知打开链接；取不到就整字段省略
+        ...(clickUrl ? { url: clickUrl } : {})
       },
       headers: { 'Content-Type': 'application/json' },
       timeout
@@ -1609,4 +1742,4 @@ async function sendNotify (text, desp, params = {}) {
   return { successfulChannels, failures: failedChannels }
 }
 
-module.exports = { sendNotify, push_config, hasWxPusherConfigured, configuredChannelCount, configuredChannelNames, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags }
+module.exports = { sendNotify, push_config, hasWxPusherConfigured, configuredChannelCount, configuredChannelNames, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, pickWxPusherClickUrl }

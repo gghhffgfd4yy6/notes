@@ -762,12 +762,12 @@ function assertSettled (outcome, label, why) {
     }
   }
 
-  // ===== 导出面守卫：slim 对外只允许这 16 个名字 =====
+  // ===== 导出面守卫：slim 对外只允许这 17 个名字 =====
   // 起因：本仓曾存在一段「谁都调不到、也没人能从外面看见」的死代码（`$` 对象上的 `$.get`，v3.279 删除）。
   // 它能长期存活正是因为**内部对象不导出 ⇒ 没有任何测试够得着它**。这条守卫把导出面钉成显式清单：
   // 新增/删除/改名导出都会在此点名；反过来，把 `$`、`channelError` 这类内部实现挂上导出面也需要有意识地说一句。
   {
-    // 16 个名字，多一个/少一个/改名都红。
+    // 17 个名字，多一个/少一个/改名都红。
     // 排序用**显式码元序比较器**：Sonar 的 S2871 会建议 localeCompare，但那正是本仓要避免的——
     // 比较结果随宿主 ICU/locale 变（AGENTS.md「清单排序用显式码元序比较器而非随宿主 locale 变序的
     // localeCompare，指纹跨机器稳定」同一条理由）。显式比较器同时满足规则与确定性。
@@ -776,13 +776,13 @@ function assertSettled (outcome, label, why) {
     const expectedExports = [
       'configuredChannelCount', 'configuredChannelNames', 'getWxPusherProfileSummary', 'hasWxPusherConfigured',
       'looksHtml', 'maskKey', 'maskUrl', 'mdImagesToPlain', 'mdLinksToPlain', 'mdToPlain',
-      'printWxPusherProfileSummary', 'push_config', 'safeErr', 'safeSlice', 'sendNotify', 'stripAngleTags'
+      'pickWxPusherClickUrl', 'printWxPusherProfileSummary', 'push_config', 'safeErr', 'safeSlice', 'sendNotify', 'stripAngleTags'
     ].sort(byCodeUnit)
     const actual = Object.keys(slim).sort(byCodeUnit)
     assert.deepStrictEqual(actual, expectedExports,
       'slim 的导出面变了：多出来/少了名字会直接影响「谁能从外部测到谁」。变更需同步 CHANGELOG 与本清单')
     assert.strictEqual('$' in slim, false, '内部请求封装对象 $ 不得导出（导出即成公共面，需按契约对待）')
-    console.log('✅ 导出面守卫：slim 对外 16 个名字逐字一致，内部对象未泄漏')
+    console.log('✅ 导出面守卫：slim 对外 17 个名字逐字一致，内部对象未泄漏')
   }
 
   // ============================================================

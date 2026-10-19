@@ -6,7 +6,7 @@
 // 覆盖：maskKey/maskUrl/safeSlice/safeErr/mdLinksToPlain/mdImagesToPlain/mdToPlain/looksHtml/stripAngleTags
 const assert = require('node:assert')
 const fs = require('node:fs')
-const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, configuredChannelNames, hasWxPusherConfigured, getWxPusherProfileSummary, printWxPusherProfileSummary, sendNotify } = require('./xbk_sendNotify_slim')
+const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, configuredChannelNames, hasWxPusherConfigured, getWxPusherProfileSummary, printWxPusherProfileSummary, sendNotify, pickWxPusherClickUrl } = require('./xbk_sendNotify_slim')
 // 判定器同源（S1/F1/P1）与截断单一实现（S6/F7）回归的对拍对象
 const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
 const { createUtils } = require('./xbk_utils')
@@ -1285,6 +1285,72 @@ checkS('getWxPusherProfileSummary: 开启时返回快照且与内部状态对象
     restoreEnv()
     throw e
   }
+})
+
+// ===== WxPusher 通知点击直达（v3.314）：pickWxPusherClickUrl =====
+// 该串直接进 WxPusher 的 url 字段：解析错了轻则点开无关页面，重则把危险协议交给客户端。
+check('WxPusher clickUrl: Markdown 取正文第一条外链（不是末尾原文链接）', () => {
+  const desp = '好价\n\n[https://m.tb.cn/h.abc](https://m.tb.cn/h.abc)\n\n原文链接：[https://new.xianbao.fun/haodan/1.html](https://new.xianbao.fun/haodan/1.html)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'deal'), 'https://m.tb.cn/h.abc')
+})
+
+check('WxPusher clickUrl: Markdown 图片不算链接（![](img) 在前仍取后面的商品链接）', () => {
+  const desp = '![图](https://img.example/a.jpg)\n\n[下单](https://u.jd.com/abc)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'deal'), 'https://u.jd.com/abc')
+})
+
+check('WxPusher clickUrl: HTML href 取值并解码 &amp; 实体（含二次转义）', () => {
+  const desp = '<br>领券:<a href="https://x.example/a?b=1&amp;amp;c=2" target="_blank">点我</a>'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'deal'), 'https://x.example/a?b=1&c=2')
+})
+
+check('WxPusher clickUrl: data-href 不是链接属性（不能被当成跳转目标）', () => {
+  const desp = '<span data-href="https://evil.example/x">假</span><a href="https://ok.example/y">真</a>'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'deal'), 'https://ok.example/y')
+})
+
+check('WxPusher clickUrl: detail 模式取末尾「原文链接」，不是正文外链', () => {
+  const desp = '[下单](https://m.tb.cn/h.abc)\n\n原文链接：[线报](https://new.xianbao.fun/haodan/1.html)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'detail'), 'https://new.xianbao.fun/haodan/1.html')
+})
+
+check('WxPusher clickUrl: detail 模式没有「原文链接」段时回退第一条可用链接', () => {
+  const desp = '[下单](https://m.tb.cn/h.abc)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'detail'), 'https://m.tb.cn/h.abc')
+})
+
+check('WxPusher clickUrl: off 模式不产生链接（保持旧行为），大小写不敏感', () => {
+  const desp = '[下单](https://m.tb.cn/h.abc)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'off'), '')
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'OFF'), '')
+})
+
+check('WxPusher clickUrl: 非 http(s) 协议一律跳过（javascript:/相对路径不进 url 字段）', () => {
+  const desp = '[a](/haodan/1.html) [b](javascript:alert(1)) [c](https://m.tb.cn/h.ok)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'deal'), 'https://m.tb.cn/h.ok')
+})
+
+check('WxPusher clickUrl: 超过 1000 字符的链接跳过，落到后面可用的原文链接（微博二维码长链回归）', () => {
+  const long = 'https://pages-fast.m.taobao.com/wow/?q=' + 'x'.repeat(1200)
+  const desp = `[二维码](${long})\n\n原文链接：[原文](https://new.xianbao.fun/weibo/1.html)`
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'deal'), 'https://new.xianbao.fun/weibo/1.html')
+})
+
+check('WxPusher clickUrl: Markdown 角括号目标（URL 含括号）可解析', () => {
+  const desp = '[商品](<https://x.example/a(b)c>)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'deal'), 'https://x.example/a(b)c')
+})
+
+check('WxPusher clickUrl: 畸形 "]( " 密集输入仍能取到后续有效链接（扫描不卡死）', () => {
+  const bad = ']('.repeat(3000) + '[x](https://m.tb.cn/h.ok)'
+  assert.strictEqual(pickWxPusherClickUrl(bad, 'deal'), 'https://m.tb.cn/h.ok')
+})
+
+check('WxPusher clickUrl: 空串/非字符串不抛错且返回空', () => {
+  assert.strictEqual(pickWxPusherClickUrl('', 'deal'), '')
+  assert.strictEqual(pickWxPusherClickUrl(undefined, 'deal'), '')
+  assert.strictEqual(pickWxPusherClickUrl(null, 'deal'), '')
+  assert.strictEqual(pickWxPusherClickUrl({ a: 1 }, 'deal'), '')
 })
 
 // 假绿防护：若有异步用例永不 settled（如 mock 流在发事件前抛错），事件循环会保持空转、node 静默
