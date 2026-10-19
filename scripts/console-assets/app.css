@@ -569,11 +569,18 @@
     .sys-table td:first-child { font-size: var(--fs-xs); }
     .btn-row { gap: 10px; }
     .btn-item { flex: 1 1 calc(50% - 5px); min-width: 0; }
-    .tabs { gap: 4px; }
+    /* 单行横向滚动：6 个标签在 390/360/320 下折成两行会把吸顶区从 52px 撑到 108px，
+       挤掉正文；nowrap + 横滚后高度恒定，滚动条隐藏（触控/滚轮仍可用）。
+       只作用于手机断点，桌面（≥641px）保持原来的 wrap + 无滚动容器，不吞滚轮。 */
+    .tabs {
+      gap: 4px; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden;
+      -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    }
+    .tabs::-webkit-scrollbar { display: none; }
     /* 触控尺寸只抬高度；整行宽度只给手动触发的竖排按钮，别把表头/分页里的按钮也拉满 */
     .btn { min-height: 44px; }
     .btn-item .btn { width: 100%; }
-    .tab-btn { min-height: 44px; padding: 7px 10px; }
+    .tab-btn { min-height: 44px; padding: 7px 10px; flex: 0 0 auto; white-space: nowrap; }
     .btn-ghost { min-height: 44px; }
     .log-chip { min-height: 40px; }
     /* 分类筛选：手机端贴底弹层 + 遮罩，避免原生 select 的全屏白底列表 */
@@ -594,7 +601,8 @@
     .fr-restore-row .fr-select { flex: 1 1 100%; }
   }
 
-  /* 320px 窄屏：五个标签在 640 断点下会折成两行（吸顶占 108px），压缩内边距保单行。 */
+  /* 360px 窄屏：标签栏已是单行横滚，这里再收一档间距/内边距，让前四个常用页签
+     不滑动就能看到（6 个全放下仍需横向滑动，最小 320px 也放不下）。 */
   @media (max-width: 360px) {
     .tabs { gap: 2px; }
     .tab-btn { padding: 7px 8px; font-size: var(--fs-sm); }
