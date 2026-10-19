@@ -5,7 +5,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { execFileSync } = require('node:child_process')
+const { execFileSync, spawnSync } = require('node:child_process')
 
 const SCRIPT = path.join(__dirname, 'scripts', 'mutation-report.js')
 
@@ -486,18 +486,82 @@ function schemaReport (seg, mutants) {
     `必须用 REST API 读本次 run（gh api …/actions/runs/${'$'}{GITHUB_RUN_ID}），实际：${resolve.text}`)
   assert.ok(resolve.text.includes('--jq .run_started_at'),
     `必须取 .run_started_at 字段，实际：${resolve.text}`)
-  assert.ok(resolve.text.includes('GITHUB_TOKEN: ' + DD + ' secrets.GITHUB_TOKEN }}'),
-    `gh api 必须拿到 token（env 注入，不内联进 run），实际：${resolve.text}`)
-  // ① 交给汇总步骤：写 $GITHUB_ENV 且变量名正确
-  assert.ok(resolve.text.includes('>> "$GITHUB_ENV"'),
-    `解析结果必须写入 $GITHUB_ENV（否则汇总步骤拿不到），实际：${resolve.text}`)
-  assert.ok(resolve.text.includes('MUTATION_RUN_STARTED_AT='),
-    `写入的变量名必须是 MUTATION_RUN_STARTED_AT（scripts/mutation-report.js 读该名），实际：${resolve.text}`)
-  // ① fail-closed：取不到必须非零退出——静默跳过第③层正是本 bug 的成因，不能换成「空值照跑」
-  assert.ok(resolve.text.includes('exit 1'),
-    `取不到 run_started_at 必须 exit 1（fail-closed），实际：${resolve.text}`)
-  assert.ok(resolve.text.includes('拒绝发布'),
-    `失败必须点名拒绝发布，实际：${resolve.text}`)
+  // ① token 必须是步骤级 env 的真实映射（不是注释/echo 里的字面量）：解析 env 块，拒绝「挪进注释也算过」
+  const resolveLines = resolve.text.split('\n')
+  const envIdx = resolveLines.findIndex(l => l.trim() === 'env:')
+  assert.ok(envIdx >= 0, `解析步骤必须有 env: 块，实际：${resolve.text}`)
+  const envIndent = resolveLines[envIdx].search(/\S/)
+  const tokenLine = resolveLines.slice(envIdx + 1).find(l => {
+    const indent = l.search(/\S/)
+    return l.trim() !== '' && indent > envIndent && l.trim().startsWith('GITHUB_TOKEN:')
+  })
+  assert.strictEqual(tokenLine && tokenLine.trim(), 'GITHUB_TOKEN: ' + DD + ' secrets.GITHUB_TOKEN }}',
+    `解析步骤的 env.GITHUB_TOKEN 必须精确等于 \${{ secrets.GITHUB_TOKEN }}，实际：${tokenLine}`)
+
+  // ① report job 的显式 permissions 必须含 actions: read：
+  //    显式块里未列出的权限为 none，缺它 gh api 读本次 run 会 403。
+  const permIdx = jobLines.findIndex(l => l === '    permissions:')
+  assert.ok(permIdx >= 0, 'report job 必须有 4 空格缩进的 permissions: 块')
+  const perms = []
+  for (let i = permIdx + 1; i < jobLines.length; i++) {
+    const l = jobLines[i]
+    if (l.trim() === '') continue
+    if (l.search(/\S/) <= 4) break
+    perms.push(l.trim())
+  }
+  assert.ok(perms.includes('actions: read'),
+    `report job 的 permissions 必须含 actions: read（否则读 run 403），实际：${perms.join(', ')}`)
+
+  // ① 执行级验证：桩 gh 实跑 run 段，覆盖成功 / 空值 / 不可解析 / API 失败四条分支。
+  //    纯文本断言会被「删掉空值守卫但留下 API 失败文案」骗过（Sourcery 指出），必须看真实退出码与落盘值。
+  const runMatch = resolve.text.match(/^(\s*)run: \|\n([\s\S]*)$/m)
+  assert.ok(runMatch, `解析步骤必须有 run: | 块，实际：${resolve.text}`)
+  const scriptIndent = runMatch[1].length + 2
+  const script = runMatch[2].split('\n')
+    .map(l => l.trim() === '' ? '' : l.slice(scriptIndent)).join('\n')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-resolver-'))
+  try {
+    const bin = path.join(tmp, 'bin')
+    fs.mkdirSync(bin)
+    fs.writeFileSync(path.join(bin, 'gh'), [
+      '#!/usr/bin/env bash',
+      'case "$GH_STUB_MODE" in',
+      '  ok) echo "2026-10-19T02:03:37Z" ;;',
+      '  empty) printf "" ;;',
+      '  bad) echo "not-a-date" ;;',
+      '  fail) echo "HTTP 403" >&2; exit 1 ;;',
+      'esac'
+    ].join('\n'), { mode: 0o755 })
+    const runCase = (mode) => {
+      const envFile = path.join(tmp, 'env-' + mode)
+      fs.writeFileSync(envFile, '')
+      const r = spawnSync('bash', ['-c', script], {
+        env: {
+          PATH: bin + ':' + process.env.PATH,
+          GITHUB_ENV: envFile,
+          GITHUB_REPOSITORY: 'o/r',
+          GITHUB_RUN_ID: '1',
+          GITHUB_TOKEN: 'stub',
+          GH_STUB_MODE: mode
+        },
+        encoding: 'utf8'
+      })
+      return { status: r.status, stderr: r.stderr, env: fs.readFileSync(envFile, 'utf8') }
+    }
+    const okCase = runCase('ok')
+    assert.strictEqual(okCase.status, 0, `成功分支必须 exit 0，stderr=${okCase.stderr}`)
+    assert.strictEqual(okCase.env.trim(), 'MUTATION_RUN_STARTED_AT=2026-10-19T02:03:37Z',
+      `成功分支必须把 ts 原样写入 $GITHUB_ENV，实际=${JSON.stringify(okCase.env)}`)
+    for (const mode of ['empty', 'bad', 'fail']) {
+      const c = runCase(mode)
+      assert.notStrictEqual(c.status, 0, `${mode} 分支必须非零退出（fail-closed），实际 exit=${c.status}`)
+      assert.ok(c.stderr.includes('拒绝发布'), `${mode} 分支必须点名拒绝发布，stderr=${c.stderr}`)
+      assert.ok(!c.env.includes('MUTATION_RUN_STARTED_AT='),
+        `${mode} 分支不得写入环境文件，实际=${JSON.stringify(c.env)}`)
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
 
   // ② 汇总步骤不得再声明该变量：步骤级 env 覆盖 $GITHUB_ENV，空值会把真值顶掉
   const declaresRunStart = summary.text.split('\n')
