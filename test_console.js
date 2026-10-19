@@ -1736,6 +1736,89 @@ async function main () {
       server.close()
     }
   })
+  await aok('HTTP: /api/auto 服务器端自动运行开关与持久化（K1d）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const init = await request(port, 'GET', '/api/auto', { token: TOKEN })
+    assert.strictEqual(init.status, 200)
+    const initBody = JSON.parse(init.text)
+    assert.strictEqual(initBody.auto.on, false, '默认关闭')
+    assert.strictEqual(initBody.auto.interval, 10, '默认 10 秒')
+    assert.strictEqual(initBody.min, 3)
+    assert.strictEqual(initBody.max, 20)
+
+    const noAuth = await request(port, 'POST', '/api/auto', {
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ on: true })
+    })
+    assert.strictEqual(noAuth.status, 401, '写面无凭证 401')
+    const csrf = await request(port, 'POST', '/api/auto', {
+      headers: { cookie: `xbk_session=${TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ on: true })
+    })
+    assert.strictEqual(csrf.status, 401, '写面仅凭 Cookie 401（CSRF 面）')
+
+    const badLo = await request(port, 'POST', '/api/auto', {
+      token: TOKEN,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ on: true, interval: 2 })
+    })
+    assert.strictEqual(badLo.status, 400, 'interval < 3 拒绝')
+    const badHi = await request(port, 'POST', '/api/auto', {
+      token: TOKEN,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ on: true, interval: 21 })
+    })
+    assert.strictEqual(badHi.status, 400, 'interval > 20 拒绝')
+    const badType = await request(port, 'POST', '/api/auto', {
+      token: TOKEN,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ on: true, interval: '5' })
+    })
+    assert.strictEqual(badType.status, 400, 'interval 必须是整数，不接受字符串')
+
+    const save = await request(port, 'POST', '/api/auto', {
+      token: TOKEN,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ interval: 5 })
+    })
+    assert.strictEqual(save.status, 200)
+    assert.strictEqual(JSON.parse(save.text).auto.on, false, '只保存间隔不启动')
+    assert.strictEqual(JSON.parse(save.text).auto.interval, 5)
+    assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8')).on, false)
+
+    const start = await request(port, 'POST', '/api/auto', {
+      token: TOKEN,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ on: true, interval: 5 })
+    })
+    assert.strictEqual(start.status, 200)
+    const started = JSON.parse(start.text).auto
+    assert.strictEqual(started.on, true)
+    assert.strictEqual(started.interval, 5)
+    assert.ok(started.nextAt > Date.now(), '启动后应排下一轮')
+    assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8')).on, true)
+
+    // 进程重启：同一 stateDir 重新 createConsole，应恢复 on=true/interval=5。
+    await new Promise(resolve => server.close(resolve))
+    const second = createConsole({ token: TOKEN, stateDir: dir })
+    const port2 = await listen(second.server)
+    const resumed = await request(port2, 'GET', '/api/auto', { token: TOKEN })
+    assert.strictEqual(resumed.status, 200)
+    assert.strictEqual(JSON.parse(resumed.text).auto.on, true, '服务器重启后应恢复自动运行')
+    assert.strictEqual(JSON.parse(resumed.text).auto.interval, 5, '间隔也应恢复')
+
+    const stop = await request(port2, 'POST', '/api/auto', {
+      token: TOKEN,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ on: false })
+    })
+    assert.strictEqual(stop.status, 200)
+    assert.strictEqual(JSON.parse(stop.text).auto.on, false, '停止后关闭')
+    assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8')).on, false)
+    await new Promise(resolve => second.server.close(resolve))
+  })
   await aok('HTTP: POST /api/notify-test 鉴权面（K2）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
@@ -4301,8 +4384,20 @@ async function main () {
       '自动间隔必须夹在 3–20 秒')
     assert.ok(src.includes('Math.min(AUTO_MAX_S') && src.includes('Math.max(AUTO_MIN_S'),
       '保存/启动前必须统一 clamp 到 3–20')
-    assert.ok(src.includes("trigger('run-auto')"), '自动循环必须走独立 run-auto 动作（3s 重放窗）')
-    assert.ok(src.includes('window.localStorage.setItem(AUTO_KEY'), '间隔保存必须持久化到 localStorage')
+    const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
+      '服务器端也必须夹在 3–20 秒')
+    assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && consoleSrc.includes('function tickAuto') &&
+      consoleSrc.includes("startAction('run-auto'") && consoleSrc.includes('acquireLock(stateDir'),
+    '自动调度必须在服务器进程内跑 run-auto，并经过单飞锁')
+    assert.ok(consoleSrc.includes('activeChildren.size > 0') && consoleSrc.includes('autoInFlightId'),
+      '上一轮未结束不得叠跑')
+    assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
+      '自动开关/间隔必须由服务器持久化，重启可恢复')
+    assert.ok(consoleSrc.includes('AUTO_MAX_MS') === false, '不得再有 10 分钟总时长上限')
+    assert.ok(consoleSrc.includes('server.on(\'close\', () => { disposeAuto(); killAll() })'),
+      '控制台关闭时必须清理自动定时器')
+
     const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
     assert.ok(trigger.includes('class="auto-input"') && trigger.includes('type="number"') &&
       trigger.includes('min=$' + '{AUTO_MIN_S}') && trigger.includes('max=$' + '{AUTO_MAX_S}'),
@@ -4314,16 +4409,15 @@ async function main () {
       '必须能开始/停止自动运行')
     assert.ok(trigger.includes("setPending('auto')") && trigger.includes('确认开启自动正式运行'),
       '自动运行是持续真实推送，必须先确认')
+    assert.ok(trigger.includes('服务器调度') && trigger.includes('关闭页面'),
+      '界面必须说明调度在服务器，关页不影响')
     const autoApp = src.slice(src.indexOf('const startAuto ='), src.indexOf('// v3.297 标签页状态'))
-    assert.ok(autoApp.includes('if (locking)'), '上一轮未结束不得叠跑')
-    assert.ok(autoApp.includes('autoInterval * 1000') && autoApp.includes('setTimeout('),
-      '必须按保存的间隔在轮间调度')
-    assert.ok(autoApp.includes('autoFailsRef.current >= AUTO_MAX_FAILS') && autoApp.includes('stopAuto('),
-      '连续失败必须自动停止')
-    assert.ok(autoApp.includes("r.action === 'run-auto'") && autoApp.includes('latest.exitCode !== 0'),
-      '必须按真实 run 结果统计失败，不能只看提交是否 202')
-    assert.ok(autoApp.includes('autoRunWatchRef.current = latest.id'), '同一轮失败不得重复计数')
-    assert.ok(autoApp.includes('AUTO_MAX_MS'), '必须有最长运行时长上限')
+    assert.ok(autoApp.includes('apiSetAuto({ on: true, interval: v })') && autoApp.includes('apiSetAuto({ on: false })'),
+      '前端只能通过 /api/auto 开关，不得自己 setTimeout 调度')
+    assert.ok(!autoApp.includes('setTimeout(') && !autoApp.includes('window.localStorage'),
+      '前端不得再把自动循环放在浏览器里')
+    assert.ok(src.includes('function apiGetAuto') && src.includes("fetch('/api/auto'"),
+      '前端必须读取服务器自动运行状态')
     assert.ok(css.includes('.auto-run') && css.includes('.auto-input') && css.includes('.auto-step'),
       '自动运行控件必须有独立样式（数字框/加减/状态）')
   })
