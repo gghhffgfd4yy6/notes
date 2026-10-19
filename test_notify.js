@@ -142,7 +142,7 @@ function reset () { gotCalls = [] }
 // 所有通道相关配置 key：每个测试前清空 → 只配被测通道（防本地密钥/跨测试污染）
 const CHANNEL_KEYS = ['PUSH_PLUS_TOKEN', 'PUSH_PLUS_USER', 'PUSH_KEY',
   'BARK_PUSH', 'BARK_ARCHIVE', 'BARK_GROUP', 'BARK_SOUND', 'BARK_ICON', 'BARK_LEVEL', 'BARK_URL',
-  'QYWX_KEY', 'WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_pusher_channels', 'WX_XIZHI_KEY',
+  'QYWX_KEY', 'WX_pusher_appToken', 'WX_pusher_topicIds', 'WX_pusher_channels', 'WX_pusher_clickUrl', 'WX_XIZHI_KEY',
   'DEER_KEY', 'DEER_URL', 'PUSHME_KEY', 'PUSHME_URL', 'HITOKOTO',
   'TG_BOT_TOKEN', 'TG_USER_ID', 'TG_API_HOST',
   'TG_PROXY_HOST', 'TG_PROXY_PORT', 'TG_PROXY_AUTH']
@@ -422,6 +422,47 @@ console.log('========================================\n');
     await notify.sendNotify('标题', '原文链接：<https://x.com/a> **粗体**')
     assert(gotCalls[0].options.json.contentType === 3,
         `无HTML标签应保持Markdown(contentType=3): ${gotCalls[0].options.json.contentType}`)
+  }))
+
+  // 6c-2. WxPusher 点击直达（v3.314）：url 字段决定点通知后打开什么
+  await test('wxpusher: 出厂默认 clickUrl=deal（显式断言，避免空值回退掩盖默认值回归）', () => {
+    assert(notify.push_config.WX_pusher_clickUrl === 'deal',
+      `出厂默认应为 deal，实际 ${notify.push_config.WX_pusher_clickUrl}`)
+  })
+
+  await test('wxpusher: 默认取正文第一条外链进 url 字段', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '456'
+    await notify.sendNotify('标题', '[下单](https://m.tb.cn/h.abc)\n\n原文链接：[线报](https://new.xianbao.fun/haodan/1.html)')
+    assert(gotCalls.length === 1, '仅 wxpusher 一次请求')
+    assert(gotCalls[0].options.json.url === 'https://m.tb.cn/h.abc',
+      `默认应取正文外链，实际 ${gotCalls[0].options.json.url}`)
+  }))
+
+  await test('wxpusher: clickUrl=detail 时 url 指向原文链接', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '456'
+    cfg.WX_pusher_clickUrl = 'detail'
+    await notify.sendNotify('标题', '[下单](https://m.tb.cn/h.abc)\n\n原文链接：[线报](https://new.xianbao.fun/haodan/1.html)')
+    assert(gotCalls[0].options.json.url === 'https://new.xianbao.fun/haodan/1.html',
+      `detail 应取原文链接，实际 ${gotCalls[0].options.json.url}`)
+  }))
+
+  await test('wxpusher: clickUrl=off 时请求体不带 url 字段（旧行为）', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '456'
+    cfg.WX_pusher_clickUrl = 'off'
+    await notify.sendNotify('标题', '[下单](https://m.tb.cn/h.abc)')
+    assert(!Object.prototype.hasOwnProperty.call(gotCalls[0].options.json, 'url'),
+      'off 模式不得带 url 字段')
+  }))
+
+  await test('wxpusher: 正文没有链接时不带 url 字段', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '456'
+    await notify.sendNotify('标题', '纯文本内容')
+    assert(!Object.prototype.hasOwnProperty.call(gotCalls[0].options.json, 'url'),
+      '取不到链接时不得凭空给 url 字段')
   }))
 
   // 6d. F4（V4 打回）：混合数组的部分丢弃必须留痕——被丢弃项先前完全静默。
