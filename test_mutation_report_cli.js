@@ -543,9 +543,10 @@ function schemaReport (seg, mutants) {
     const runCase = (mode) => {
       const envFile = path.join(tmp, 'env-' + mode)
       fs.writeFileSync(envFile, '')
-      const r = spawnSync('bash', ['-c', script], { // NOSONAR:S4036 测试桩必须让临时 bin 优先于系统 gh（mkdtemp 0700、仅本用例写入），S4036 的「不可写目录」前提在桩场景不成立
+      const r = spawnSync('bash', ['-c', script], {
         env: {
-          PATH: bin + ':/usr/bin:/bin',
+          // 测试桩必须让临时 bin 优先于系统 gh（mkdtemp 0700、仅本用例写入），桩场景不满足 S4036 的「不可写目录」前提
+          PATH: bin + ':/usr/bin:/bin', // NOSONAR:S4036
           GITHUB_ENV: envFile,
           GITHUB_REPOSITORY: 'o/r',
           GITHUB_RUN_ID: '1',
