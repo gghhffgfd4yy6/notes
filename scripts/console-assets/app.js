@@ -2054,12 +2054,18 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync }) 
 }
 
 // 系统信息：版本 / 运行环境 / 进程 / 缓存目录。全部只读，无操作按钮。
-function SysPanel () {
+function SysPanel ({ onReady }) {
   // 访问日志（v3.300 §3.3）：第二个 loader 并列拉取；「刷新」按钮同日 load 两个。
   // 近窗未授权尝试数 = 服务端独立 401 计数（进程启动以来、不随环形窗截断）。
   // 两个请求可能一成一败：本页不认「数据截至」，避免半套数据被标成完整刷新（Sourcery PR#253）。
   const { data: sys, err, load } = usePanelLoader(apiGetSys)
   const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog)
+  // 两个 loader 都落定才通知滚动层收口；只报第一个会在下半页还空着时提前释放垫高。
+  const sysReady = !!(sys || err)
+  const accessReady = !!(access || accessErr)
+  useEffect(() => {
+    if (sysReady && accessReady && typeof onReady === 'function') onReady()
+  }, [sysReady, accessReady, onReady])
   useEffect(() => { load().catch(() => {}) }, [load])
   useEffect(() => { loadAccess().catch(() => {}) }, [loadAccess])
   const refreshAll = () => { load(); loadAccess() }
@@ -2102,9 +2108,12 @@ function SysPanel () {
 
 // 状态目录文件清单（v3.298）：进系统页加载 + 手动刷新。符号链接/目录作为异常条目显性
 // 展示（bytes 为 ——— 意为「不适用」，服务端不跟随符号链接、不泄露目标元数据）。
-function FilesPanel () {
+function FilesPanel ({ onReady }) {
   const { data, err, load } = usePanelLoader(apiGetFiles)
   useEffect(() => { load().catch(() => {}) }, [load])
+  // 文件清单是系统页的下半截；它落定前不能释放切页垫高。
+  const ready = !!(data || err)
+  useEffect(() => { if (ready && typeof onReady === 'function') onReady() }, [ready, onReady])
   const files = data && Array.isArray(data.files) ? data.files : []
   return html`<div class="panel">
     <${PanelHead} title="缓存目录文件"
@@ -2186,8 +2195,15 @@ function ChannelList ({ pc }) {
 // 与代码默认按字段合并并给覆盖文件提供的字段打「覆盖」徽章。此前只读 Config.filter，保存
 // 覆盖文件后两页对不上（用户看到「已保存」但配置页仍然全空）。
 function ConfigPanel ({ onSync }) {
-  const { data, err, load } = usePanelLoader(apiGetConfig, onSync)
-  const { data: eff, err: effErr, load: loadEff } = usePanelLoader(apiGetFilter, onSync)
+  const [configAt, setConfigAt] = useState(0)
+  const [filterAt, setFilterAt] = useState(0)
+  const { data, err, load } = usePanelLoader(apiGetConfig, setConfigAt)
+  const { data: eff, err: effErr, load: loadEff } = usePanelLoader(apiGetFilter, setFilterAt)
+  // 两个 loader 都回过一次才算「配置页加载完成」；只报第一个会让滚动垫高
+  // 在第二块还没渲染时就收口（Sourcery #263）。
+  useEffect(() => {
+    if (configAt && filterAt && typeof onSync === 'function') onSync(Math.max(configAt, filterAt))
+  }, [configAt, filterAt, onSync])
   const refresh = useCallback(() => {
     load().catch(() => {})
     loadEff().catch(() => {})
@@ -2893,14 +2909,14 @@ function App () {
   useEffect(() => { setPanelSync(null) }, [tab])
 
   // 切页的滚动策略（修 #260 的二次跳动）：
-  // 1) 每个页签记住自己的 scrollY；第一次进入的页签从顶部开始，绝不继承上一页的
-  //    位置——配置页比日志页矮，继承过来的 y 根本撑不到，浏览器只能夹到 0，
-  //    看起来就是「往上一跳」。
+  // 1) 每个页签记住自己的 scrollY；第一次进入的页签沿用当前视口位置（#260 的初衷：
+  //    切页不把整页拽回顶部），只有「查看日志」才强制回顶。
   // 2) 返回已来过的页签时，切页前先给 #app 垫一个 min-height = y + innerHeight。
   //    旧面板卸载、新面板还在 loading 的那一帧文档不会塌陷，scrollY 也就不会被
   //    浏览器夹到 0；随后在 useLayoutEffect（绘制前）同步 scrollTo(y)。垫高一直
   //    留到新面板真正撑到目标高度（ResizeObserver 盯着内容增长，慢加载也不提前撤），
-  //    这样全程没有「先回顶、再弹回去」的两段跳。
+  //    这样全程没有「先回顶、再弹回去」的两段跳。目标页比记忆位置矮时，等它报加载
+  //    完成再落到它自己的最大滚动位置，不空等 4s。
   // 3) 「查看日志」（logJump）是一次性的强制回顶；消费掉之后，后续切页仍按记忆还原。
   const scrollMemRef = useRef({})
   const pendingScrollRef = useRef(null)
@@ -2908,6 +2924,22 @@ function App () {
   const logJumpPendingRef = useRef(false)
   const tabRef = useRef(tab)
   tabRef.current = tab
+  // 每个面板只接受「自己这一页」的完成回调：切走后旧请求再回包，不碰新页的垫高。
+  const syncFor = useMemo(() => {
+    const make = (key) => (ts) => { if (tabRef.current === key) setPanelSync(ts) }
+    return { messages: make('messages'), logs: make('logs'), config: make('config'), filter: make('filter') }
+  }, [])
+  // 系统页由两个面板组成（SysPanel + FilesPanel）；两边都落定才允许释放垫高。
+  const sysReadyRef = useRef(null)
+  const markSysReady = useCallback((key) => {
+    if (tabRef.current !== 'sys') return
+    if (!sysReadyRef.current) sysReadyRef.current = new Set()
+    sysReadyRef.current.add(key)
+    const hold = scrollHoldRef.current
+    if (sysReadyRef.current.size >= 2 && hold) hold.check(true)
+  }, [])
+  const onSysReady = useCallback(() => markSysReady('sys'), [markSysReady])
+  const onFilesReady = useCallback(() => markSysReady('files'), [markSysReady])
   const holdScroll = (y) => {
     const el = document.getElementById('app')
     if (!el) return
@@ -2938,8 +2970,10 @@ function App () {
     const y = window.scrollY
     if (from && from !== next) scrollMemRef.current[from] = y
     const mem = scrollMemRef.current[next]
-    const target = forceTop ? 0 : (typeof mem === 'number' ? mem : 0)
+    // 第一次进入沿用当前视口；只有 forceTop（查看日志）才回 0。
+    const target = forceTop ? 0 : (typeof mem === 'number' ? mem : y)
     pendingScrollRef.current = target
+    sysReadyRef.current = null
     releaseScrollHold()
     if (target > 0) holdScroll(target)
   }
@@ -2965,13 +2999,13 @@ function App () {
     document.documentElement.style.overflowAnchor = 'none'
     window.scrollTo(0, y)
     const t0 = performance.now()
-    const hold = { y, user: false, raf: 0, timer: 0, ro: null, onUser: null, check: null }
+    const hold = { y, user: false, raf: 0, timer: 0, ro: null, onUser: null, check: null, startedAt: Date.now() }
     hold.onUser = () => { hold.user = true; if (hold.check) hold.check() }
     window.addEventListener('wheel', hold.onUser, { capture: true, passive: true })
     window.addEventListener('touchstart', hold.onUser, { capture: true, passive: true })
     window.addEventListener('pointerdown', hold.onUser, { capture: true, passive: true })
     window.addEventListener('keydown', hold.onUser, true)
-    const check = () => {
+    const check = (settled = false) => {
       if (scrollHoldRef.current !== hold) return
       // 用户接管后不再钉住位置；但垫高先留着，等内容长到能接住当前视口再撤，
       // 否则撤早了浏览器会把 scrollY 夹回 0，用户的滚动直接丢。
@@ -2979,18 +3013,26 @@ function App () {
       const foot = document.querySelector('.foot')
       const bottom = foot ? foot.getBoundingClientRect().bottom + window.scrollY : 0
       const need = (hold.user ? window.scrollY : y) + window.innerHeight
-      // 内容慢时用 ResizeObserver 等到真正撑起来；4s 只是失败兜底，不提前撤。
-      if (bottom >= need || performance.now() - t0 > 4000) releaseScrollHold()
+      const ready = bottom >= need
+      // settled：目标面板已确认所有首批请求都结束。内容仍撑不到记忆位置时收口；
+      // 用户自己已经滚过就不替他改位置，只撤垫高（浏览器会按内容高度自然夹取）。
+      if (ready || settled || performance.now() - t0 > 9000) {
+        if (settled && !hold.user && !ready && bottom > 0) {
+          window.scrollTo(0, Math.max(0, document.documentElement.scrollHeight - window.innerHeight))
+        }
+        releaseScrollHold()
+      }
     }
     hold.check = check
-    hold.ro = window.ResizeObserver ? new window.ResizeObserver(check) : null
+    hold.ro = window.ResizeObserver ? new window.ResizeObserver(() => check()) : null
     const wrap = document.querySelector('.wrap')
     if (hold.ro && wrap) hold.ro.observe(wrap)
     scrollHoldRef.current = hold
     check()
     // 加载失败/永远撑不起来时，到点释放，避免一直留着一块空白。
-    if (scrollHoldRef.current === hold) hold.timer = window.setTimeout(check, 4000)
-    // 没有 ResizeObserver 的老环境：用 rAF 轮询兜底（4s 到点后 check 会自停）。
+    // 9s 比 fetch 的 8s 超时略长：正常响应（哪怕很慢）一定先报 settled。
+    if (scrollHoldRef.current === hold) hold.timer = window.setTimeout(check, 9000)
+    // 没有 ResizeObserver 的老环境：用 rAF 轮询兜底（9s 到点后 check 会自停）。
     if (!hold.ro) {
       const loop = () => {
         hold.raf = 0
@@ -3001,6 +3043,13 @@ function App () {
       hold.raf = window.requestAnimationFrame(loop)
     }
   }, [tab, logJump])
+
+  // 目标面板报「加载完成」后，如果它的内容撑不到记忆位置，就地落到最大滚动位置；
+  // 只认切页后新面板写入的 sync，避免上一页在途响应把垫高提前撤掉。
+  useEffect(() => {
+    const hold = scrollHoldRef.current
+    if (hold && panelSync && panelSync >= hold.startedAt) hold.check(true)
+  }, [panelSync])
 
   // 标签栏是单行横滚：切页、旋转屏幕或改窗口宽度后都要把当前页签滚进可视区，
   // 否则活动页签会停在滚动容器的裁剪边之外（Sourcery #260）。只改 .tabs 的
@@ -3238,7 +3287,7 @@ function App () {
   const switchTab = (next) => {
     if (next === tab) return
     // 统一走 prepareScroll：保存出发页位置、决定目标页位置、需要时先垫高。
-    // 第一次进入的页签从顶部开始，不继承上一页的位置（短页撑不到那个高度）。
+    // 第一次进入沿用当前视口，不把整页拽回顶部；只有「查看日志」走 forceTop。
     prepareScroll(next)
     setTab(next)
     tabRef.current = next
@@ -3301,17 +3350,17 @@ function App () {
       <${RunHistoryPanel} onOpenLog=${openLog} />
       <${CacheHealthPanel} paused=${!autoRefresh} />
     </div>`}
-    ${!authExpired && tab === 'messages' && html`<${MessagesPanel} onSync=${setPanelSync} />`}
+    ${!authExpired && tab === 'messages' && html`<${MessagesPanel} onSync=${syncFor.messages} />`}
     ${!authExpired && tab === 'logs' && html`<div>
       ${runs.length > 0 && html`<${RunsPanel} runs=${runs} status=${runsState} pollMs=${autoRefresh ? pollMs : 0} onRefresh=${refreshSplit} />`}
       <${LogsPanel} key=${logJump ? logJump.n : 'base'} pollMs=${autoRefresh && locking ? POLL_BUSY_MS : 0}
-        initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} onSync=${setPanelSync} />
+        initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} onSync=${syncFor.logs} />
     </div>`}
-    ${!authExpired && tab === 'config' && html`<${ConfigPanel} onSync=${setPanelSync} />`}
-    ${!authExpired && tab === 'filter' && html`<${FilterRulesPanel} onSync=${setPanelSync} />`}
+    ${!authExpired && tab === 'config' && html`<${ConfigPanel} onSync=${syncFor.config} />`}
+    ${!authExpired && tab === 'filter' && html`<${FilterRulesPanel} onSync=${syncFor.filter} />`}
     ${!authExpired && tab === 'sys' && html`<div>
-      <${SysPanel} />
-      <${FilesPanel} />
+      <${SysPanel} onReady=${onSysReady} />
+      <${FilesPanel} onReady=${onFilesReady} />
     </div>`}
 
     <footer class="foot">
