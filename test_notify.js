@@ -425,6 +425,11 @@ console.log('========================================\n');
   }))
 
   // 6c-2. WxPusher 点击直达（v3.314）：url 字段决定点通知后打开什么
+  await test('wxpusher: 出厂默认 clickUrl=deal（显式断言，避免空值回退掩盖默认值回归）', () => {
+    assert(notify.push_config.WX_pusher_clickUrl === 'deal',
+      `出厂默认应为 deal，实际 ${notify.push_config.WX_pusher_clickUrl}`)
+  })
+
   await test('wxpusher: 默认取正文第一条外链进 url 字段', () => withChannels(async () => {
     cfg.WX_pusher_appToken = 'AT123'
     cfg.WX_pusher_topicIds = '456'
