@@ -3080,21 +3080,28 @@ async function main () {
   })
 
   await aok('分页/横滑控件: 运行历史与推送记录都有每页条数，趋势与历史表可横向滑动', () => {
-    const js = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
-    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
+    const js = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/const RUN_PAGE_SIZES = \[10, 20, 50, 100\]/.test(js), '运行历史每页条数须为 10/20/50/100')
-    const sizeSelects = js.match(/aria-label="每页显示条数"/g) || []
+    assert.ok(js.includes('function MiniSelect ('), '必须有 MiniSelect 深色下拉组件')
+    const sizeSelects = js.match(/ariaLabel="每页显示条数"/g) || []
     assert.ok(sizeSelects.length >= 2, '运行历史与推送记录各要有一个每页条数选择')
     // 选择器必须是「活的」：选项由常量渲染 + 改变时真的改条数（评审 #243-7）
-    assert.ok(/RUN_PAGE_SIZES\.map\(\(n\) => html`<option key=\$\{n\} value=\$\{String\(n\)\}>每页 \$\{n\} 条<\/option>`\)/.test(js), '运行历史选项须由 RUN_PAGE_SIZES 渲染')
-    assert.ok(/\[10, 20, 50, 100\]\.map\(\(n\) => html`<option key=\$\{n\} value=\$\{String\(n\)\}>每页 \$\{n\} 条<\/option>`\)/.test(js), '推送记录选项须由 10/20/50/100 渲染')
-    assert.ok(/onChange=\$\{\(e\) => changeSize\(Number\(e\.target\.value\)\)\}/.test(js), '运行历史下拉须接 changeSize')
-    assert.ok(/onChange=\$\{\(e\) => \{ setSize\(Number\(e\.target\.value\)\); setPage\(1\) \}\}/.test(js), '推送记录下拉须同时改 size 并回第 1 页')
+    assert.ok(/RUN_PAGE_SIZES\.map\(\(n\) => \(\{ value: String\(n\), label: `每页 \$\{n\} 条` \}\)\)/.test(js), '运行历史选项须由 RUN_PAGE_SIZES 渲染')
+    assert.ok(/\[10, 20, 50, 100\]\.map\(\(n\) => \(\{ value: String\(n\), label: `每页 \$\{n\} 条` \}\)\)/.test(js), '推送记录选项须由 10/20/50/100 渲染')
+    assert.ok(/onChange=\$\{\(v\) => changeSize\(Number\(v\)\)\}/.test(js), '运行历史下拉须接 changeSize')
+    assert.ok(/onChange=\$\{\(v\) => \{ setSize\(Number\(v\)\); setPage\(1\) \}\}/.test(js), '推送记录下拉须同时改 size 并回第 1 页')
+    assert.ok(/\{ value: '0', label: '全部时间' \}/.test(js), '时间范围选项须走 MiniSelect 数据')
+    assert.ok(/\{ value: '30', label: '近 30 天' \}/.test(js), '时间范围须保留近 30 天')
+    // 原生 select 在 Android 会弹全屏白底系统列表，控制台内不得回退。
+    assert.ok(!/class="msg-select"/.test(js), '控制台不得再用原生 select（安卓白底全屏列表）')
+    assert.ok(!/<select\s+(?:id|class)=/.test(js), '控制台不得再用原生 select（含过滤规则回滚目标）')
+    assert.ok(/\.mini-pop\s*\{[^}]*background:\s*var\(--panel\)/.test(css), 'MiniSelect 弹层必须是深色面板')
+    assert.ok(/\.mini-opt\.on\s*\{[^}]*var\(--accent-soft\)/.test(css), 'MiniSelect 选中项须有暗色高亮')
+    assert.ok(/\{ value: String\(n\), label: `每页 \$\{n\} 条` \}/.test(js), 'MiniSelect 的 value 必须传字符串')
     assert.ok(/\.trend-scroll\s*\{[^}]*overflow-x:\s*auto/.test(css), '趋势图须横向滚动容器')
     assert.ok(/\.trend-col\s*\{[^}]*flex:\s*0 0 34px/.test(css), '趋势列须固定宽度（否则日期挤在一起）')
     assert.ok(/\.runs-scroll\s*\{[^}]*overflow-x:\s*auto/.test(css), '运行历史表须横向滚动容器')
-    // 数字 value 会让 Preact 每帧重写 attribute，安卓原生下拉在展开瞬间被重建（闪烁）。
-    assert.ok(!/<select[^>]*value=\$\{(?:days|size)\}/.test(js), 'select value 必须是字符串（数字会触发 Preact 每帧重写，安卓下拉闪烁）')
     assert.ok(js.includes('function AutoRefreshText ('), '倒计时必须独立组件，App 不得每秒重渲染')
     assert.ok(!js.includes('setNowMs(Date.now())'), 'App 不得保留每秒 nowMs 状态')
     // 只查精确字符串会被 setNowMs(() => Date.now()) 绕过：把 AutoRefreshText 整段摘掉后，
@@ -4211,7 +4218,7 @@ async function main () {
     assert.ok(src.includes('function AlertBanner'), '首屏必须有失败横幅')
     assert.ok(src.includes("state.stats.status === 'ok'"), '状态卡必须消费 stats')
     assert.ok(src.includes('成功率'), '状态卡必须显示成功率')
-    assert.ok(src.includes('>今天</option>') && src.includes('>近 7 天</option>'), '推送记录必须有时间窗')
+    assert.ok(src.includes("label: '今天'") && src.includes("label: '近 7 天'"), '推送记录必须有时间窗')
     assert.ok(src.includes('initialMode') && src.includes('initialQuery'), '日志面板必须支持带条件跳转')
     assert.ok(src.includes("window.addEventListener('hashchange'"), '页签必须跟随 hash')
     assert.ok(src.includes('document.title ='), '标题必须带状态点')
@@ -4468,6 +4475,31 @@ async function main () {
     const narrow = (css.match(/@media \(max-width: 360px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
     assert.ok(/\.tabs\s*\{[^}]*gap:/.test(narrow) && /\.tab-btn\s*\{[^}]*padding:/.test(narrow), '320 窄屏媒体查询必须真的作用于标签栏')
     assert.ok(/\.msg-meta\s*\{[^}]*min-width:\s*0/.test(css), 'msg-meta 须 min-width:0（flex 子项才可收缩）')
+  })
+
+  await aok('结构红线: MiniSelect（滚动重量 / 视口夹取 / Tab 焦点 / 可访问名 / 回滚目标）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const start = src.indexOf('function MiniSelect (')
+    const end = src.indexOf('// 指标卡', start)
+    assert.ok(start > -1 && end > start, '必须能定位 MiniSelect')
+    const seg = src.slice(start, end)
+    // Sourcery #270：打开期间滚动/缩放不重量，弹层会按旧方向/高度被裁掉。
+    assert.ok(seg.includes("window.addEventListener('scroll', schedule"), '打开期间页面滚动须重新量测')
+    assert.ok(seg.includes("window.addEventListener('resize', schedule"), '打开期间视口缩放须重新量测')
+    // 靠左的按钮 + 更宽选项：right:0 会把弹层推出左边界。
+    assert.ok(seg.includes('const left = Math.min(Math.max(pad, b.right - w)'), '弹层须做水平视口夹取')
+    assert.ok(/left:\$\{place\.dx\}px;right:auto/.test(seg), '弹层水平位置须由量测结果决定')
+    // Tab 不能落回即将卸载的选项，否则焦点掉 body。
+    assert.ok(seg.includes('focusOutside') && seg.includes('DOCUMENT_POSITION_FOLLOWING'), 'Tab 须显式把焦点送出组件')
+    // aria-label 覆盖可见文字时必须带回当前值。
+    assert.ok(/aria-label=\$\{buttonAria\}/.test(seg) && /，当前 \$\{buttonLabel\}/.test(seg), '可访问名须包含当前选项')
+    assert.ok(seg.includes('disabled = false') && /disabled=\$\{disabled\}/.test(seg), 'MiniSelect 须支持 disabled')
+    // 过滤规则页的回滚目标也不能漏（Sourcery #270）。
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(src.includes('ariaLabel="回滚目标"'), '回滚目标必须改用 MiniSelect')
+    assert.ok(!src.includes('fr-select'), '原生 fr-select 样式与用法必须移除')
+    assert.ok(!/<select\s+(?:id|class)=/.test(src), '控制台不得再有原生 select')
+    assert.ok(/\.fr-restore-row \.mini-select\s*\{[^}]*min-width:\s*0/.test(css), '回滚目标在窄屏必须可收缩')
   })
 
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
