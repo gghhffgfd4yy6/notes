@@ -4235,8 +4235,8 @@ async function main () {
 
   await aok('结构红线: 概览先状态与操作，触发历史常驻（空态显示暂无记录）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
-    const start = src.indexOf("${!authExpired && tab === 'overview' && html`<div>")
-    const end = src.indexOf("${!authExpired && tab === 'messages'", start)
+    const start = src.indexOf("${!authExpired && visited.has('overview') && html`<section class=\"page\"")
+    const end = src.indexOf("${!authExpired && visited.has('messages')", start)
     assert.ok(start > -1 && end > start, '应能定位概览区块')
     const seg = src.slice(start, end)
     const order = ['AlertBanner', 'StatusCards', 'TriggerBar', 'TrendsPanel', 'RunHistoryPanel', 'CacheHealthPanel'].map((n) => seg.indexOf(n))
@@ -4273,8 +4273,10 @@ async function main () {
     const prepBlock = scrollBlock.slice(scrollBlock.indexOf('const prepareScroll = '), scrollBlock.indexOf('const prepareScrollRef'))
     assert.ok(prepBlock.includes('pendingScrollRef.current = target'),
       '切页必须把目标位置交给 pendingScrollRef')
-    assert.ok(prepBlock.includes('if (target > 0) holdScroll(target)'),
-      '切页前必须先垫高文档，避免卸载/挂载之间塌陷')
+    assert.ok(prepBlock.includes('if (firstVisit && target > 0) holdScroll(target)'),
+      '切页前必须先垫高文档，避免首访卸载/挂载之间塌陷')
+    assert.ok(prepBlock.includes('const firstVisit = !visitedRef.current.has(next)'),
+      '必须先判断目标页是否首访，再决定是否垫高')
     const prepPos = switchBlock.indexOf('prepareScroll(next)')
     const tabPos = switchBlock.indexOf('setTab(next)')
     assert.ok(prepPos > -1 && prepPos < tabPos, '必须先 prepareScroll 再 setTab')
@@ -4359,6 +4361,65 @@ async function main () {
     const cache = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('// 推送记录：'))
     assert.ok(cache.includes('60000'), '缓存健康必须每分钟刷新')
     assert.ok(cache.includes("document.addEventListener('visibilitychange', onVis)"), '切回前台要补拉缓存快照')
+  })
+
+  await aok('结构红线: 页签保活（切回已访问页签不重挂载、不塌陷、不重新占位）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    // 六个页签都按 visited 保活：第一次进入才挂载，之后只切 hidden。
+    for (const key of ['overview', 'messages', 'logs', 'config', 'filter', 'sys']) {
+      assert.ok(src.includes(`visited.has('${key}')`), `${key} 页必须按 visited 保活渲染`)
+      const open = "visited.has('" + key + "') && html`<section class=\"page\" hidden=$" + "{tab !== '" + key + "'}>"
+      assert.ok(src.includes(open), `${key} 页的 hidden 必须比较自己的 tab，不能拿别的页签顶替`)
+    }
+    assert.ok(src.includes('const [visited, setVisited] = useState(() => new Set(['),
+      '必须记录已挂载的页签集合')
+    assert.ok(src.includes('visitedRef.current.add(key)') && src.includes('const next = new Set(prev)') &&
+      src.includes('return next'), 'markVisited 必须真的把新页签写进 state（返回 next，不能返回 prev）')
+    assert.ok(src.includes('markVisited(next)') && src.includes("markVisited('logs')"),
+      '点击页签 / 查看日志 / hash 前进后退都必须登记保活')
+    // 已保活页直接落位；首访才垫高。
+    assert.ok(src.includes('if (!firstVisit)') && src.includes('window.scrollTo(0, Math.min(y, maxScroll))'),
+      '已保活页必须在 layout effect 里直接调用 scrollTo 落到记忆位置')
+    assert.ok(src.includes('if (firstVisit && target > 0) holdScroll(target)'),
+      '只有首访才垫高文档')
+    // 隐藏页不轮询、不跟着倒计时重渲染、不保持 SSE。
+    assert.ok(src.includes("autoRefresh && tab === 'overview' ? pollMs : 0"), '概览隐藏后触发历史必须停轮询')
+    assert.ok(src.includes("autoRefresh && tab === 'logs' ? pollMs : 0"), '日志页隐藏后触发历史必须停轮询')
+    assert.ok(src.includes("autoRefresh && tab === 'logs' && locking ? POLL_BUSY_MS : 0"), '日志页隐藏后日志轮询必须停')
+    assert.ok(src.includes("if (!autoOn || tab !== 'overview') return undefined"), '概览隐藏后倒计时时钟必须停')
+    assert.ok(src.includes('paused=$' + "{!autoRefresh || tab !== 'overview'}"), '概览隐藏后缓存健康分钟轮询必须停')
+    assert.ok(src.includes('if (openId === null || !active) return undefined'), '隐藏页的运行详情必须断开 SSE/轮询')
+    // 只读页切回静默刷新；带草稿的过滤规则页不得重拉覆盖。
+    assert.ok(src.includes('<$' + '{MessagesPanel} active=$' + "{tab === 'messages'}"), '推送记录页切回时必须静默刷新')
+    assert.ok(src.includes('active=$' + "{tab === 'logs'}"), '日志页切回时必须静默刷新')
+    assert.ok(src.includes('<$' + '{ConfigPanel} active=$' + "{tab === 'config'}"), '配置页切回时必须静默刷新')
+    assert.ok(src.includes('<$' + '{TrendsPanel} active=$' + "{tab === 'overview'}"), '趋势切回必须刷新')
+    assert.ok(src.includes('active=$' + "{tab === 'overview'} />"), '逐轮历史切回必须刷新')
+    assert.ok(src.includes('<$' + '{SysPanel} onReady=$' + '{onSysReady} active=$' + "{tab === 'sys'}"), '系统页切回必须刷新')
+    assert.ok(src.includes('<$' + '{FilesPanel} onReady=$' + '{onFilesReady} active=$' + "{tab === 'sys'}"), '文件清单切回必须刷新')
+    assert.ok(src.includes('<$' + '{FilterRulesPanel} onSync=$' + '{syncFor.filter} />'), '过滤规则页有草稿，切回不得重拉覆盖')
+    const filterSeg = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('function App ()'))
+    assert.ok(!filterSeg.includes('if (active) load()'), '过滤规则页不得在切回时重拉')
+    // 各面板自己必须真的消费 active（父组件传了 prop 但子组件不 reload 也算失败）。
+    const seg = (name, next) => src.slice(src.indexOf('function ' + name), src.indexOf(next))
+    assert.ok(seg('MessagesPanel', 'function LogsPanel').includes('if (active) load()'), '推送记录必须 active-gated reload')
+    assert.ok(seg('LogsPanel', 'function SysPanel').includes('load(true).catch'), '日志切回必须排队补拉（busy 时不能丢）')
+    assert.ok(seg('ConfigPanel', 'function FilterRulesPanel').includes('if (active) refresh()'), '配置必须 active-gated reload')
+    assert.ok(seg('TrendsPanel', 'function CacheHealthPanel').includes('if (active) load()'), '趋势必须 active-gated reload')
+    assert.ok(seg('RunHistoryPanel', 'function usePanelLoader').includes('if (active) load()'), '逐轮历史必须 active-gated reload')
+    assert.ok(seg('SysPanel', 'function FilesPanel').includes('if (active) load()'), '系统必须 active-gated reload')
+    assert.ok(seg('FilesPanel', 'function FilterRules').includes('if (active) load()'), '文件清单必须 active-gated reload')
+    assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('if (timerStartedRef.current) load()'), '缓存健康切回必须立即补拉一次')
+    // 保活带来的两个交互坑：分类弹层要主动关（否则 body overflow:hidden 卡住新页面）；
+    // 多个保留页面的确认弹窗不能共用固定 id。
+    assert.ok(seg('CategoryPicker', 'function MessagesPanel').includes('if (!pageActive && open) setOpen(false)'),
+      '分类弹层必须在切走时主动关闭，释放 body 滚动锁')
+    assert.ok(src.includes('const [titleId] = useState(() => `confirm-title-$' + '{++dialogSeq}`') &&
+      src.includes('aria-labelledby=$' + '{titleId}') && src.includes('id=$' + '{titleId}'),
+    '确认弹窗标题 id 必须逐实例唯一')
+    assert.ok(/\.page\[hidden\]\s*\{\s*display:\s*none/.test(css), '隐藏页面必须真正 display:none，不能占布局')
+    assert.ok(/\.page\s*\{[^}]*min-height:/.test(css), '页面必须有最小高度，首访加载时页脚不能跳到首屏中间')
   })
 
   await aok('结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）', () => {

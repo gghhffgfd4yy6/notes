@@ -115,6 +115,9 @@
 
 @layer components {
   .wrap { max-width: 1200px; margin: 0 auto; padding: var(--sp-5) var(--sp-4) var(--sp-10); }
+  /* 页签保活：只有当前页参与布局，其余页留在 DOM 里但不可见。 */
+  .page { min-height: calc(100vh - 132px); min-height: calc(100dvh - 132px); }
+  .page[hidden] { display: none; }
 
   /* ── 顶栏 ── */
   .topbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-4); }
