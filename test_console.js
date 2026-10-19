@@ -4372,8 +4372,19 @@ async function main () {
     assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
       '自动开关/间隔必须由服务器持久化，重启可恢复')
     assert.ok(consoleSrc.includes('AUTO_MAX_MS') === false, '不得再有 10 分钟总时长上限')
-    assert.ok(consoleSrc.includes('server.on(\'close\', () => { disposeAuto(); killAll() })'),
-      '控制台关闭时必须清理自动定时器')
+    // 变异沙箱里 console.js 会被插桩（语句之间插入覆盖率计数），整行逐字匹配必然失效；
+    // 改为「on('close' 之后 disposeAuto() 与 killAll() 都在且相邻」的结构断言，与插桩无关。
+    const closeCleanupWired = (srcText) => {
+      const at = srcText.indexOf("server.on('close'")
+      if (at < 0) return false
+      const disposeAt = srcText.indexOf('disposeAuto()', at)
+      const killAt = srcText.indexOf('killAll()', at)
+      return disposeAt > at && killAt > at && killAt - at < 400
+    }
+    assert.ok(closeCleanupWired(consoleSrc), '控制台关闭时必须清理自动定时器')
+    // 回归钉子：模拟插桩后（statement 之间插 cov 计数）仍必须命中，防止改回逐字匹配
+    const instrumented = consoleSrc.replace("server.on('close', () => {", "server.on('close', () => {cov_1abc().s[7]++;")
+    assert.ok(closeCleanupWired(instrumented), '插桩后仍须识别关闭清理（变异沙箱真实形态）')
 
     const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
     assert.ok(trigger.includes('class="auto-input"') && trigger.includes('type="number"') &&
