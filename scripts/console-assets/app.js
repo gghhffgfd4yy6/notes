@@ -1208,32 +1208,40 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
   // 打开日志框：先取详情、再与 openId 同一批 set，让首帧就是最终日志（v3.313）。
   // 旧实现先 setOpenId、由 effect 再拉详情：框首帧只有「加载中…」（实测高 89px），
   // 详情回来撑成整段（366px、页高 +277px）——手机上就是先闪一下再跳一截。
-  // 与确认弹窗同口径：最多等 RUN_LOG_WAIT_MS；拿不到才用占位符开框，且一旦开框
-  // 不再改写文案。seq 防「先点 A 再点 B」时迟到的 A 详情盖住 B；openingRef 防连点同一行
-  // 反复起请求（每次重起都会把 600ms 的上限重新计时，等于越点越慢）。
+  // 与确认弹窗同口径：最多等 RUN_LOG_WAIT_MS；拿不到才用占位符开框，开框后原请求
+  // 到达只回填正文（不再重开）。seq 作废「先点 A 再点 B」时迟到的 A；openingRef 防连点
+  // 同一行反复起请求（每次重起都会把 600ms 的上限重新计时，等于越点越慢）。
   const openSeqRef = useRef(0)
   const openingRef = useRef(null)
+  // 预取成功的详情只给「打开它的那次 effect」用一次：之后 openActive 翻转等重跑
+  // 必须重新取快照，否则拿旧 outputTotalLength 当游标会把已有增量再推一遍。
+  const seedRef = useRef(null)
+  // 关闭必须同时作废在飞的预取：否则「点 B → 关闭」后 B 的详情回来还会把框打开。
+  const closeLog = () => {
+    openSeqRef.current++
+    openingRef.current = null
+    setOpenId(null)
+  }
   const openLog = (id) => {
     if (openId === id) {
-      openSeqRef.current++
-      openingRef.current = null
-      setOpenId(null)
+      closeLog()
       return
     }
     if (openingRef.current === id) return
     const seq = ++openSeqRef.current
     openingRef.current = id
     let timer = 0
-    let settled = false
+    let opened = false
     const openWith = (d) => {
-      if (settled || seq !== openSeqRef.current) return
-      settled = true
+      // 代次守卫必须是第一句：过期响应不得在任何 set 之前漏过去。
+      if (seq !== openSeqRef.current) return
       clearTimeout(timer)
       openingRef.current = null
-      if (d) {
-        setDetail(d)
-        setDetailErr('')
-      }
+      if (d) setDetail(d)
+      setDetailErr('')
+      if (opened) return // 超时已开框：晚到的详情只回填正文，不再 setOpenId
+      opened = true
+      if (d) seedRef.current = { id, detail: d }
       setOpenId(id)
     }
     // 正常一发几十毫秒；超时也不能把点击卡住——照旧用「加载中…」开框。
@@ -1268,6 +1276,11 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
     // pollMs=0 只关掉 interval；页签保活后隐藏的概览/日志仍会打开 SSE 或拉快照。
     // active=false 直接不建流：切走即断开，切回 effect 重跑会重新取快照/重连。
     if (openId === null || !active) return undefined
+    // 预取成功时本轮已有完整快照：不再重复请求（慢网下第二次失败会把有效日志盖成
+    // 「加载失败」）。seed 只吃一次——之后 effect 因 openActive 翻转等重跑时必须
+    // 重新取快照，不能拿旧 outputTotalLength 当游标（会把已追加的增量再推一遍）。
+    const seed = seedRef.current !== null && seedRef.current.id === openId ? seedRef.current.detail : null
+    seedRef.current = null
     let dead = false
     let es = null
     let inflight = false
@@ -1315,7 +1328,8 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
       pollTimer = setInterval(() => { fetchOnce().catch(() => {}) }, pollMs)
     }
     if (!openActive) {
-      startPolling()
+      // 预取已拿到快照：不再发第二个详情请求（失败会覆盖有效日志）。
+      if (seed === null) startPolling()
       return () => {
         dead = true
         document.removeEventListener('visibilitychange', onVisibility)
@@ -1329,7 +1343,7 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
     // 又开的场景：prev.id===openId 仍命中）必须凭代次失效——seq 是闭包值，回调比对
     // detailSeqRef.current 即可判「自己是否仍是当前代」。
     const mySeq = seq
-    apiGetRunDetail(openId).then((d) => {
+    const startStream = (d) => {
       if (dead || seq !== detailSeqRef.current) return
       setDetail(d)
       setDetailErr('')
@@ -1371,7 +1385,10 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
         fetchOnce().catch(() => {})
         startPolling()
       }
-    }).catch(() => { if (!dead) startPolling() }) // 快照失败 → 回退轮询（既有能力兜底）
+    }
+    // 预取快照直接建流（省一次请求，也避免慢网下第二次失败覆盖有效日志）。
+    if (seed !== null) startStream(seed)
+    else apiGetRunDetail(openId).then(startStream).catch(() => { if (!dead) startPolling() }) // 快照失败 → 回退轮询（既有能力兜底）
     return () => {
       dead = true
       document.removeEventListener('visibilitychange', onVisibility)
@@ -1444,7 +1461,7 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
     ${openId !== null && html`<div class="logbox">
       <div class="logbox-head">
         <span>运行 #${openId} 输出${openActive ? '（实时跟随）' : ''}</span>
-        <${Button} variant="ghost" onClick=${() => setOpenId(null)}>关闭<//>
+        <${Button} variant="ghost" onClick=${closeLog}>关闭<//>
       </div>
       <pre class="logpre" ref=${logRef} onScroll=${onLogScroll}>${
         detailErr ||

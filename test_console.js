@@ -4051,16 +4051,29 @@ async function main () {
     assert.ok(from > 0, '必须有 openLog 预取入口')
     const fn = seg.slice(from, seg.indexOf('// typeof 判据', from))
     assert.ok(fn.includes('apiGetRunDetail(id)'), 'openLog 必须先取详情（不能只留条件不调用）')
-    assert.ok(fn.indexOf('setDetail(d)') > -1 && fn.indexOf('setDetail(d)') < fn.indexOf('setOpenId(id)'),
-      '预取的 detail 必须与 openId 一起 set（同一批渲染，首帧即最终）')
+    // 守卫必须是 openWith 的第一句：放在 set 之后时，过期响应仍会先写 state 再被忽略。
+    assert.ok(/const openWith = \(d\) => \{\s*(?:\/\/[^\n]*\n\s*)*if \(seq !== openSeqRef\.current\) return/.test(fn),
+      '代次守卫必须是 openWith 的第一句')
+    // 开框的 setOpenId 不得被 if (d) 包住：超时兜底（d=null）也必须开框。
+    assert.ok(/if \(d\) setDetail\(d\)\s*\n\s*setDetailErr\(''\)\s*\n\s*if \(opened\) return[\s\S]{0,400}setOpenId\(id\)/.test(fn),
+      'setOpenId 必须在 if (d) 之外（超时/失败也要开框），且晚到详情只回填不重开')
     assert.ok(fn.includes('setTimeout(() => openWith(null), RUN_LOG_WAIT_MS)'),
       '详情超时也必须开框（占位兜底），不能把点击卡死')
-    assert.ok(fn.includes('seq !== openSeqRef.current') && fn.includes('settled'),
-      '过期响应/已开过的请求必须丢弃，开框后不得再改文案')
+    assert.ok(fn.includes('seedRef.current = { id, detail: d }'), '预取结果必须交给 effect 当首帧快照')
     const wait = src.match(/const RUN_LOG_WAIT_MS = (\d+)/)
     assert.ok(wait && Number(wait[1]) > 0 && Number(wait[1]) <= 1000, '等待详情必须有 ≤1s 的上限')
+    // 关闭必须作废在飞的预取，否则「点 B → 关闭」后 B 的详情回来仍会开框。
+    const close = seg.slice(seg.indexOf('const closeLog = () =>'), seg.indexOf('const openLog = (id) =>'))
+    assert.ok(close.includes('openSeqRef.current++') && close.includes('openingRef.current = null'),
+      'closeLog 必须作废在飞预取（seq++ 且清 openingRef）')
+    assert.ok(/onClick=\$\{closeLog\}/.test(seg), '关闭按钮必须走 closeLog（不得直接 setOpenId(null)）')
     assert.ok(seg.includes('setDetail((prev) => (prev !== null && prev.id === openId ? prev : null))'),
       '清详情 effect 必须保留同一 openId 的预取详情（否则预取被当场抹掉）')
+    // effect 拿到 seed 后不得再发第二个详情请求（慢网下第二次失败会盖掉有效日志）。
+    assert.ok(seg.includes('const seed = seedRef.current !== null && seedRef.current.id === openId'),
+      'effect 必须消费且只消费一次 seed')
+    assert.ok(seg.includes('if (seed === null) startPolling()'), '已有 seed 时不得重复拉详情')
+    assert.ok(seg.includes('if (seed !== null) startStream(seed)'), '运行中必须用 seed 当 SSE 初始快照')
     assert.ok(/onClick=\$\{\(\) => openLog\(r\.id\)\}/.test(seg), '行内按钮必须走 openLog')
   })
 
