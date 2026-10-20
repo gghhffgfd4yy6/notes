@@ -104,6 +104,12 @@
   }
   /* 键盘可达性：鼠标点击不显示焦点环，键盘导航必须可见 */
   :focus-visible { outline: var(--ring); outline-offset: 2px; }
+  /* 触屏点按高亮：安卓 Chrome / 各家 WebView 会自己在被点的元素上画一块蓝色方块
+     （不跟随圆角、盖满整个盒子，手机上每次点击都闪一下）。这层由内核绘制，CSS 背景改不掉，
+     只能用 -webkit-tap-highlight-color 关掉；按压反馈仍由 .btn:active 的 1px 下沉提供。
+     html 上是可继承的兜底，交互元素再显式写一遍，覆盖不继承该属性的内核。 */
+  html { -webkit-tap-highlight-color: transparent; }
+  a, button, input, select, textarea, label, summary, [role="button"] { -webkit-tap-highlight-color: transparent; }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
       animation-duration: .01ms !important;
@@ -604,6 +610,29 @@
     margin-top: var(--sp-2); padding: var(--sp-2) var(--sp-3);
     color: var(--bad-fg); background: var(--bad-soft); border: 1px solid var(--bad-line);
     border-radius: var(--r-sm); font-size: var(--fs-xs); line-height: 1.6; overflow-wrap: anywhere;
+  }
+
+  /* ── 触屏按压反馈 ──
+     内核点按高亮已在 base 层关掉（那层是蓝色直角方块，跟着圆角都跑偏）。
+     这些控件原本只靠内核高亮表示「按下了」，关掉后必须补一瞬反馈，否则点了像没反应。
+     .btn / .auto-step 自带 :active 位移，不在此列；只在触屏（hover: none）生效，桌面仍走 :hover。 */
+  @media (hover: none) {
+    .tab-btn:active,
+    .sync-toggle:active,
+    .log-chip:active,
+    .mini-btn:active,
+    .mini-opt:active,
+    .cate-btn:active,
+    .cate-back:active,
+    .cate-opt:active,
+    .cate-crumb-link:active,
+    .cfg-toggle:active,
+    .alert-link:active,
+    .alert-action:active,
+    .row-link:active,
+    .msg-title:active,
+    .trend-col:active,
+    .access-log summary:active { filter: brightness(.85); }
   }
 
   /* ── 手机 ── */

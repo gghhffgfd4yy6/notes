@@ -4233,6 +4233,33 @@ async function main () {
       '手机端动作按钮必须 2×2')
   })
 
+  await aok('触屏反馈: 内核点按高亮必须关掉，按压反馈由 :active 承担', () => {
+    const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    // 注释掉的规则不算数：断言必须只看真实声明，否则把 html 那条注释掉也能「通过」（Sourcery #274）。
+    const css = raw.replace(/\/\*[\s\S]*?\*\//g, '')
+    const base = css.slice(css.indexOf('@layer base'), css.indexOf('@layer components'))
+    assert.ok(base.length > 0, '应能定位基础层')
+    // 安卓 Chrome / WebView 默认在被点元素上画一块不跟随圆角的蓝色方块（每次点击闪一下），
+    // 这层由内核绘制，只有 -webkit-tap-highlight-color 能关；写进组件层会因优先级被内核覆盖。
+    assert.ok(/html\s*\{[^}]*-webkit-tap-highlight-color:\s*transparent/.test(base),
+      '基础层必须在 html 上关闭点按高亮（可继承兜底）')
+    const controls = base.match(/^.*-webkit-tap-highlight-color:\s*transparent.*$/gm) || []
+    assert.ok(controls.some((l) => /\bbutton\b/.test(l) && /\ba\b/.test(l) && /\[role="button"\]/.test(l)),
+      '交互元素须显式关闭点按高亮（覆盖不继承该属性的内核）')
+    // 关掉高亮后不能连按压反馈一起丢掉：.btn:active 的位移必须还在。
+    assert.ok(/\.btn:active:not\(:disabled\)\s*\{\s*transform:\s*translateY\(1px\)/.test(css),
+      '关闭点按高亮后 .btn:active 的下沉反馈必须保留')
+    // 原本只靠内核高亮的控件（页签/日志筛选/小按钮）没有 :active 位移，必须补一瞬压暗，
+    // 否则手机上点下去像没反应——这是「关高亮」最容易带出来的回归（Sourcery #274）。
+    const touchStart = css.indexOf('@media (hover: none)')
+    assert.ok(touchStart > -1, '触屏需有专门的按压反馈区块（@media (hover: none)）')
+    const touch = css.slice(touchStart, css.indexOf('\n  }', touchStart))
+    for (const sel of ['.tab-btn:active', '.log-chip:active', '.mini-btn:active', '.mini-opt:active']) {
+      assert.ok(touch.includes(sel), `触屏按压反馈须覆盖 ${sel}`)
+    }
+    assert.ok(/filter:\s*brightness\(\.85\)/.test(touch), '触屏按压反馈须有可见的压暗')
+  })
+
   await aok('结构红线: 概览先状态与操作，触发历史常驻（空态显示暂无记录）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     const start = src.indexOf("${!authExpired && visited.has('overview') && html`<section class=\"page\"")
