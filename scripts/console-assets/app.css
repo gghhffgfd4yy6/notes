@@ -239,6 +239,16 @@
   .trigger-busy { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--text-dim); font-size: var(--fs-xs); }
   .trigger-busy .spin { flex: 0 0 auto; }
   .trigger-busy-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* v3.317 触发结果行：常驻占位（min-height）⇒ 文字出现/消失都不改面板高度，
+     下方「自动正式运行」和页脚一动不动；两行文案会换行，故按行高预留而不是定死一行。 */
+  .trigger-result {
+    min-height: 18px; margin-top: var(--sp-2); color: var(--text-dim);
+    font-size: var(--fs-xs); line-height: 1.55; font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+  }
+  .trigger-result.ok { color: var(--ok-fg); }
+  .trigger-result.bad { color: var(--bad-fg); }
+  .trigger-result.warn { color: var(--warn-fg); }
   /* 触发失败/重放提示：固定 toast，不参与文档流（插行同样会顶动下方内容）。 */
   .trigger-toast {
     position: fixed; left: var(--sp-3); right: var(--sp-3);
@@ -322,6 +332,24 @@
     font-family: var(--mono); font-size: var(--fs-xs); line-height: var(--lh-code);
     white-space: pre-wrap; word-break: break-all;
   }
+  /* v3.317 日志页专用高度：旧版固定 320px，362×795 下首屏只能看到 6 行、日志框还从
+     y=826 开始（视口 795）。手机按视口高度的 62%（上限 520px），桌面固定 520px；
+     触发历史里的 .logbox 仍沿用上面的 320px，不受影响。 */
+  .logpre-main { max-height: 520px; }
+  /* 行级着色（v3.317）：ERROR 红、ALERT/WARN 琥珀，其余继承默认前景色。
+     一行一个行内 <span>、换行仍是真实 "\n" ⇒ pre-wrap 与复制出来的换行都不变。 */
+  .logline-bad { color: var(--bad-fg); }
+  .logline-warn { color: var(--warn-fg); }
+  /* 搜索命中：<mark> 默认黄底黑字会把 ERROR 行的红字盖成黑色，这里只加底色、
+     文字色继承所在行（深浅主题都成立）。 */
+  .logpre mark { background: var(--warn-soft); color: inherit; border-radius: 2px; box-shadow: inset 0 0 0 1px var(--warn-line); }
+  /* 日志空态：与日志框同底色，避免面板里出现一段透明空洞；「在全部日志中搜索」
+     按钮就在这一层里（0 命中且筛选非 all 时才出现）。 */
+  .log-empty {
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--sp-2);
+    min-height: 120px; padding: var(--sp-3); text-align: center;
+    background: var(--log-bg); color: var(--text-dim); border-radius: var(--r-sm); font-size: var(--fs-sm);
+  }
   /* 日志筛选（v3.306）：全部/异常 + 关键字；异常收窄后仍是同一份尾部文本，不发请求。 */
   .log-tools { display: flex; gap: var(--sp-2); flex-wrap: wrap; align-items: center; margin-bottom: var(--sp-2); }
   .log-chips { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -353,6 +381,22 @@
   .tab-btn:hover { filter: brightness(1.2); }
   .tab-btn.active { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); font-weight: 500; }
   .tab-btn.active:hover { filter: brightness(.92); }
+  /* v3.317 横滚提示：320 宽放不下 6 个页签，旧版把滚动条藏了又不给任何线索（「系统」
+     看起来像不存在）。渐隐用 mask-image 做——不新增覆盖层，绝不吃点击；只在真的溢出时
+     挂上（data-edge 由 syncTabEdge 维护，362 宽全部放得下 ⇒ 零遮罩，最后一格不会被
+     误读成「被裁掉」）。这里的 #000 是遮罩的 alpha，不是可见色值，换主题不必改。 */
+  .tabs[data-edge="right"] {
+    mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+  }
+  .tabs[data-edge="left"] {
+    mask-image: linear-gradient(to left, #000 calc(100% - 22px), transparent);
+    -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 22px), transparent);
+  }
+  .tabs[data-edge="both"] {
+    mask-image: linear-gradient(to right, transparent, #000 22px, #000 calc(100% - 22px), transparent);
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 22px, #000 calc(100% - 22px), transparent);
+  }
 
   /* ── 趋势条形图（纯 CSS）── */
   /* 趋势图：一天一列固定宽度，总宽超出时横向滚动（14/30/60 日都不再挤成一团）。
@@ -376,6 +420,17 @@
   .runs-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   .runs-scroll .runs-table { min-width: 560px; }
   .runs-scroll .runs-table th, .runs-scroll .runs-table td { white-space: nowrap; }
+  /* v3.317 动作列贴右：表 597 / 可视 308 时，旧版「日志」按钮右边缘在 616——屏外 254px，
+     手机上要横滑才够得着。末列固定到右缘 + 不透明行底色 + 左侧 1px 分隔线，不横滑也完整可点。
+     横滑时它盖住的是「结果」列右侧的空白，不压「成功/失败」徽标。 */
+  .runs-scroll .runs-table th:last-child,
+  .runs-scroll .runs-table td:last-child {
+    position: sticky; right: 0; background: var(--panel); box-shadow: -1px 0 0 var(--border);
+  }
+  /* hover / 展开行的底色是半透明 token，粘边格必须换成同色相的不透明混色，
+     否则横向滑过的内容会从它下面透出来。 */
+  .runs-scroll .runs-table tr:hover td:last-child { background: color-mix(in srgb, var(--accent) 5%, var(--panel)); }
+  .runs-scroll .runs-table tr.row-open td:last-child { background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
 
   /* ── 推送记录 ── */
   .msg-toolbar { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-3); }
@@ -472,7 +527,12 @@
   .msg-meta { display: flex; gap: 10px; flex-wrap: wrap; color: var(--text-dim); font-size: var(--fs-xs); margin-top: var(--sp-1); min-width: 0; }
   .msg-cate { background: var(--accent-soft); border: 1px solid var(--accent-line); color: var(--info-fg); border-radius: var(--r-pill); padding: 0 var(--sp-2); font-size: var(--fs-2xs); max-width: 100%; overflow-wrap: anywhere; }
   .msg-content { margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px dashed var(--border); color: var(--text); font-size: var(--fs-sm); white-space: pre-wrap; word-break: break-all; }
-  .msg-link { color: var(--accent); font-size: var(--fs-xs); text-decoration: none; }
+  /* v3.317：原文链接是卡片里唯一的跳转入口，旧版点击区只有字高 ≈15px。视觉字号不变，
+     只把行盒抬到 44px（inline-flex 居中），命中区不再考验拇指。 */
+  .msg-link {
+    color: var(--accent); font-size: var(--fs-xs); text-decoration: none;
+    display: inline-flex; align-items: center; min-height: 44px; padding: 0 2px;
+  }
   .msg-link:hover { text-decoration: underline; }
   .pager { display: flex; align-items: center; gap: 10px; justify-content: center; margin-top: 14px; flex-wrap: wrap; }
   .pager-info { color: var(--text-dim); font-size: 12.5px; }
@@ -711,6 +771,11 @@
     .tab-btn { min-height: 44px; padding: 7px 10px; flex: 0 0 auto; white-space: nowrap; }
     .btn-ghost { min-height: 44px; }
     .log-chip { min-height: 40px; }
+    /* v3.317：输入框字号 <16px 时 iOS 聚焦会整页放大（Android 也会缩放），手机端统一
+       16px 且高度 ≥40px；桌面维持原字阶，不放大页面观感。 */
+    .msg-search, .log-search { font-size: 16px; min-height: 40px; }
+    /* 日志页日志框：手机按视口高度的 62%（上限 520px），362×795 下首屏可见 20+ 行。 */
+    .logpre-main { max-height: 62vh; max-height: min(62dvh, 520px); }
     .mini-btn, .mini-opt { min-height: 44px; }
     /* 分类筛选：手机端贴底弹层 + 遮罩，避免原生 select 的全屏白底列表 */
     .cate-picker { flex: 1 1 100%; }
@@ -730,10 +795,12 @@
     .fr-restore-row .mini-select { flex: 1 1 100%; }
   }
 
-  /* 360px 窄屏：标签栏已是单行横滚，这里再收一档间距/内边距，让前四个常用页签
-     不滑动就能看到（6 个全放下仍需横向滑动，最小 320px 也放不下）。 */
-  @media (max-width: 360px) {
+  /* ≤420px 窄屏（v3.317 由 360 上移）：6 个页签在 362 宽只能占 342（.wrap 左右各 10px），
+     旧断点 360 差 1px 没命中 ⇒ 实测内容 404 宽，「过滤规则」被切 8px、「系统」整格在屏外。
+     这里收到 padding 7px 5px + fs-sm（内容 ≈316），362 下 6 个全部完整可见、不横滑；
+     320 仍是横滚，但已挂 data-edge 渐隐 + scrollIntoView 把当前页签带进视野。 */
+  @media (max-width: 420px) {
     .tabs { gap: 2px; }
-    .tab-btn { padding: 7px 8px; font-size: var(--fs-sm); }
+    .tab-btn { padding: 7px 5px; font-size: var(--fs-sm); }
   }
 }

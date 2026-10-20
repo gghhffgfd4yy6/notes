@@ -4679,8 +4679,8 @@ async function main () {
     assert.ok(/max-width:\s*100%/.test(cateCss) && /overflow-wrap:\s*anywhere/.test(cateCss), '长分类 pill 必须能折行，不得撑破卡片')
     const accessCss = (css.match(/\.access-log summary\s*\{[^}]*\}/) || [''])[0]
     assert.ok(/min-height:\s*44px/.test(accessCss) && /display:\s*list-item/.test(accessCss), '最近访问记录 summary 必须 44px 且保留原生展开标记')
-    const narrow = (css.match(/@media \(max-width: 360px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
-    assert.ok(/\.tabs\s*\{[^}]*gap:/.test(narrow) && /\.tab-btn\s*\{[^}]*padding:/.test(narrow), '320 窄屏媒体查询必须真的作用于标签栏')
+    const narrow = (css.match(/@media \(max-width: 420px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
+    assert.ok(/\.tabs\s*\{[^}]*gap:/.test(narrow) && /\.tab-btn\s*\{[^}]*padding:/.test(narrow), '≤420 窄屏媒体查询必须真的作用于标签栏（v3.317 由 360 上移：362 宽要命中）')
     assert.ok(/\.msg-meta\s*\{[^}]*min-width:\s*0/.test(css), 'msg-meta 须 min-width:0（flex 子项才可收缩）')
   })
 
@@ -4736,6 +4736,136 @@ async function main () {
     // 表达式值 class=${'btn ' + a.cls}：Button 原语自身允许 1 处，别处再写就是绕过原语。
     const interpBtn = interp.filter((x) => /(^|['"\s])btn(['"\s]|$)/.test(x))
     assert.strictEqual(interpBtn.length, 1, 'btn 基础类只允许出现在 Button 原语表达式里')
+  })
+
+  // ── v3.317 手机端可用性（日志顺序/行级渲染/页签/表格动作列/触发结果）──────────
+  await aok('行为: v3.317 日志行着色与命中切分（纯函数）', async () => {
+    const { logLineTone, splitLogHits } = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(logLineTone('2026-10-20 16:00:00 ERROR 推送全部失败 3 条'), 'bad', 'ERROR 行必须标红')
+    assert.strictEqual(logLineTone('2026-10-20 16:00:00 ALERT [v3.0] 运行异常'), 'warn', 'ALERT 行必须标琥珀')
+    assert.strictEqual(logLineTone('2026-10-20 16:00:00 WARN 通道慢'), 'warn')
+    assert.strictEqual(logLineTone('2026-10-20 16:00:00 total=20 dedup=0 pushed=20'), '', '普通摘要行不着色')
+    assert.strictEqual(logLineTone('2026-10-20 16:00:00 ERROR 控制台停止：任务 #12 于运行中被停止'), '',
+      '控制台生命周期行不着色（否则每次重启满屏红，白做 v3.307 降噪）')
+    assert.deepStrictEqual(splitLogHits('推送 2 条，推送成功', '推送'),
+      [['推送', true], [' 2 条，', false], ['推送', true], ['成功', false]], '同一行多处命中都要切出来')
+    assert.deepStrictEqual(splitLogHits('PUSH ok', 'push'), [['PUSH', true], [' ok', false]],
+      '大小写不敏感，但片段必须是原文（不能输出小写副本）')
+    assert.deepStrictEqual(splitLogHits('abc', ''), [['abc', false]], '空关键词不切')
+    assert.deepStrictEqual(splitLogHits('', 'x'), [['', false]], '空行原样返回（行不能被吞掉）')
+    assert.deepStrictEqual(splitLogHits('İstanbul', 'i'), [['İstanbul', false]],
+      '小写后长度会变的字符不切（索引与原文对不上就不猜，宁可不高亮）')
+  })
+
+  await aok('结构红线: v3.317 日志页（顺序 / 行级渲染 / <mark> / 护栏 / 空态出口 / 高度）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
+    // 模板占位符拼出来再比对（直接写 ${...} 会触发 no-template-curly-in-string）
+    const ph = (name) => '$' + '{' + name + '}'
+    // A. 日志提到首屏：362×795 下旧顺序让日志框从 y=826 开始（视口 795）。
+    const logsPage = src.slice(src.indexOf("visited.has('logs')"), src.indexOf("visited.has('config')"))
+    const logsAt = logsPage.indexOf('<' + ph('LogsPanel'))
+    const runsAt = logsPage.indexOf('<' + ph('RunsPanel'))
+    assert.ok(logsAt > -1 && runsAt > -1 && logsAt < runsAt, '日志页必须把运行日志排在触发历史之前')
+    assert.ok(/\.logpre-main\s*\{[^}]*max-height:\s*520px/.test(css), '桌面日志框 520px')
+    const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
+    assert.ok(/\.logpre-main\s*\{[^}]*min\(62dvh, 520px\)/.test(phone), '手机日志框必须 min(62dvh, 520px)')
+    // B. 行级渲染 + 高亮：一行一个节点、换行仍是真实 "\n"（复制/空行都不变）。
+    assert.ok(src.includes('class=' + ph("'logline' + (tone ? ' logline-' + tone : '')")), '日志必须逐行渲染并按级别着色')
+    assert.ok(src.includes('}' + ph("i === last ? '' : '\\n'") + '</span>'), '行间必须仍是真实换行（只加 display:block 会丢换行）')
+    assert.ok(src.includes('splitLogHits(line, kwNow)') &&
+      src.includes('html`<mark key=' + ph('j') + '>' + ph('text') + '</mark>`'), '命中片段必须用 <mark> 包起来')
+    assert.ok(!/innerHTML\s*=/.test(src), '高亮不得拼 innerHTML（用户输入只能是文本节点）')
+    assert.ok(/\.logline-bad\s*\{[^}]*var\(--bad-fg\)/.test(css) && /\.logline-warn\s*\{[^}]*var\(--warn-fg\)/.test(css),
+      '行级色必须走 CSS 变量（不写死 hex）')
+    assert.ok(/\.logpre mark\s*\{[^}]*color:\s*inherit/.test(css), '<mark> 不得把 ERROR 行的红字盖成默认黑字')
+    // 性能护栏：>3000 行退回纯文本，且计数行明说。
+    assert.ok(src.includes('const LOG_HIGHLIGHT_MAX = 3000'), '高亮护栏阈值必须是 3000 行')
+    assert.ok(src.includes('const heavy = filtered.length > LOG_HIGHLIGHT_MAX'), '超过阈值必须走纯文本分支')
+    assert.ok(src.includes('已关闭高亮'), '关掉高亮必须在计数行写明（不能让人以为搜不到）')
+    assert.ok(/heavy \? shownText : lineNodes/.test(src), '超阈值必须退回纯文本渲染')
+    // 计数行点名筛选 + 空态出口（0 命中先点名筛选，再给「在全部日志中搜索」）。
+    assert.ok(src.includes('筛选下 · 显示 ' + ph('filtered.length') + ' / ' + ph('lines.length') + ' 行'),
+      '筛选非 all 时计数行必须点名筛选')
+    assert.ok(src.includes('在全部日志中搜索') && src.includes('onClick=' + ph('searchAllLogs')),
+      '空态必须给「在全部日志中搜索」按钮')
+    assert.ok(src.includes('在「' + ph('modeLabel') + '」筛选下没有匹配的日志行'), '空态文案必须点名当前筛选')
+    const searchAll = src.slice(src.indexOf('const searchAllLogs = () => {'), src.indexOf('}, [filtered, q])'))
+    assert.ok(searchAll.includes("setMode('all')") && !searchAll.includes('setQ('), '出口只放开筛选、必须保留关键词')
+    assert.ok(src.includes('分类可重叠'), '计数行必须注明分类可重叠（269 ≠ 100+165 的自洽提示）')
+  })
+
+  await aok('结构红线: v3.317 页签（420 断点 / 边缘渐隐 / 当前页签滚入视野）', () => {
+    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
+    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const ph = (name) => '$' + '{' + name + '}'
+    // C. 362 宽必须命中紧凑规则（旧断点 360 差 1px，实测内容 404 宽、末两格被切/出屏）。
+    assert.ok(!/@media \(max-width: 360px\)/.test(css), '旧的 360 断点必须移除，否则 362 仍差 1px 不命中')
+    const compact = (css.match(/@media \(max-width: 420px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
+    assert.ok(/\.tabs\s*\{[^}]*gap:\s*2px/.test(compact), '≤420 必须收紧 gap 且真的落到 .tabs')
+    assert.ok(/\.tab-btn\s*\{[^}]*padding:\s*7px 5px/.test(compact) && /font-size:\s*var\(--fs-sm\)/.test(compact),
+      '≤420 必须再收一档 padding + 字阶（实测 362 下内容 ≈316 ≤ 可视 342）')
+    // 320 横滚时的可见提示：mask-image 渐变（不吃点击），且只在溢出时挂。
+    const maskRule = (edge) => (css.match(new RegExp('\\.tabs\\[data-edge="' + edge + '"\\]\\s*\\{[\\s\\S]*?\\}')) || [''])[0]
+    assert.ok(/mask-image:\s*linear-gradient\(to right,\s*#000/.test(maskRule('right')), '右缘必须有渐隐提示（320 下有更多页签在右侧）')
+    assert.ok(/mask-image:\s*linear-gradient\(to left,/.test(maskRule('left')), '左缘必须有渐隐提示（滑到右端后能看出左边还有）')
+    assert.ok(/linear-gradient\(to right,\s*transparent/.test(maskRule('both')), '两端都能滑时两侧同时渐隐')
+    assert.ok(maskRule('right').includes('-webkit-mask-image'), '需要 -webkit- 前缀（旧版 Chrome/Android WebView）')
+    assert.ok(src.includes('data-edge=' + ph('tabEdge || undefined')), '渐隐只能由溢出状态驱动（362 下不得有遮罩）')
+    assert.ok(src.includes('bar.scrollWidth - bar.clientWidth'), '溢出判定必须按滚动容器实测宽度')
+    assert.ok(src.includes("left && right ? 'both' : left ? 'left' : right ? 'right' : ''"), '三态（左/右/两端）必须都算')
+    assert.ok(src.includes("el.scrollIntoView({ inline: 'nearest', block: 'nearest', preventScroll: true })"),
+      '当前页签必须自动滚入视野且不带动整页滚动')
+  })
+
+  await aok('结构红线: v3.317 表格动作列贴右（两个表 / 不透明底色 / 分隔线）', () => {
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.css'), 'utf8')
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.js'), 'utf8')
+    // D. 362 下「日志」按钮右边缘旧版在 616（屏外 254px）：末列贴右。
+    const stickyRule = /\.runs-scroll \.runs-table th:last-child,\s*\.runs-scroll \.runs-table td:last-child\s*\{[^}]*position:\s*sticky;\s*right:\s*0/
+    assert.ok(stickyRule.test(css), '两个表的末列都必须 position:sticky; right:0（含 th）')
+    assert.ok(/\.runs-scroll \.runs-table th:last-child,[\s\S]{0,200}?background:\s*var\(--panel\)/.test(css),
+      '粘边格必须有不透明底色（否则横滑内容会从下面透出来）')
+    assert.ok(/box-shadow:\s*-1px 0 0 var\(--border\)/.test(css), '粘边格左侧必须有 1px 分隔线')
+    assert.ok(/td:last-child\s*\{\s*background:\s*color-mix\(in srgb,\s*var\(--accent\) 5%,\s*var\(--panel\)\)/.test(css),
+      'hover 底色必须换成不透明混色（--accent-hover 是半透明 token）')
+    assert.ok(/\.row-open td:last-child\s*\{\s*background:\s*color-mix\(in srgb,\s*var\(--accent\) 8%,\s*var\(--panel\)\)/.test(css),
+      '展开行同理')
+    // 两个表都得落在 .runs-scroll 里才有粘边效果。
+    const runsPanel = src.slice(src.indexOf('function RunsPanel'), src.indexOf('function RunHistoryPanel'))
+    const histPanel = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
+    assert.ok(runsPanel.includes('<div class="runs-scroll"><table class="runs-table">'), '触发历史表必须在 .runs-scroll 内')
+    assert.ok(histPanel.includes('<div class="runs-scroll"><table class="runs-table">'), '逐轮历史表必须在 .runs-scroll 内')
+    assert.ok(histPanel.includes('<td class="run-actions">'), '逐轮历史的末列必须是动作列（其 sticky 才有意义）')
+  })
+
+  await aok('结构红线: v3.317 触发结果行（aria-live / 用 runs 结算 / 不位移 / 失败给原因）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.css'), 'utf8')
+    // runOutcome / triggerResultLine 是模块级纯函数（定义在 TriggerBar 之前），
+    // 所以从「触发结果行」注释起切，别只切组件体。
+    const bar = src.slice(src.indexOf('// ── 触发结果行'), src.indexOf('// ── 组件：运行历史'))
+    const ph = (name) => '$' + '{' + name + '}'
+    // E. 点「环境检查」后必须有一行结果，而不是只把徽标从「任务运行中」改回「空闲」。
+    assert.ok(bar.includes('role="status" aria-live="polite" aria-atomic="true"'), '结果行必须是 polite live region')
+    assert.ok(bar.includes('triggerResultLine(lastTrigger, lastRun)'), '结果必须由被触发那条 run 结算')
+    assert.ok(bar.includes('runs.find((r) => r.id === lastTrigger.id)'), '结算必须按 202 返回的 run id 匹配')
+    assert.ok(src.includes('setLastTrigger({ id: runId'), '202 到达时必须记下 run id（否则永远结不出结果）')
+    assert.ok(src.includes('runs=' + ph('runs')), 'App 必须把 runs 传给 TriggerBar（不新增轮询）')
+    assert.ok(!bar.includes('setInterval'), '结果行不得新增轮询')
+    assert.ok(bar.includes('上一轮：') && bar.includes('· 用时 '), '结果行必须带「上一轮 / 用时」')
+    assert.ok(bar.includes('失败（退出码 '), '失败必须说明原因（不只换颜色）')
+    assert.ok(/\.trigger-result\s*\{[^}]*min-height:\s*18px/.test(css), '结果行必须预留行高（出现时按钮不位移）')
+  })
+
+  await aok('结构红线: v3.317 小项（msg-link 44px / 手机输入 16px）', () => {
+    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
+    const linkCss = (css.match(/\.msg-link\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/min-height:\s*44px/.test(linkCss), '原文链接点击区 ≥44px')
+    assert.ok(/font-size:\s*var\(--fs-xs\)/.test(linkCss), '视觉字号不变（只抬行盒）')
+    const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
+    assert.ok(/\.msg-search, \.log-search\s*\{[^}]*font-size:\s*16px/.test(phone), '手机输入框必须 16px（防 iOS 聚焦缩放）')
+    assert.ok(/\.msg-search, \.log-search\s*\{[^}]*min-height:\s*40px/.test(phone), '手机输入框高度 ≥40px')
   })
 }
 

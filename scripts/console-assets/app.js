@@ -9,7 +9,7 @@
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
-import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote } from './pure.mjs'
+import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitLogHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote } from './pure.mjs'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -62,6 +62,21 @@ function fmtLocalTime (ts) {
   const d = new Date(Number(ts))
   const p = (n) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+// 只取时分秒（Asia/Shanghai）：触发结果行要与 run.log 的时间对照，口径必须与 fmtTime 一致。
+function fmtClock (ts) {
+  const s = fmtTime(ts)
+  return s === '—' ? '—' : s.slice(11)
+}
+
+// 轮次用时：<1s 用 ms（避免「0.0s」），其余一位小数秒。未知返回 '—'（不编 0）。
+function fmtDuration (startedAt, finishedAt) {
+  const a = Number(startedAt)
+  const b = Number(finishedAt)
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return '—'
+  const ms = b - a
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
 }
 
 // 「多久以前」（缓存写入停滞判断）与日报相对日期见 pure.mjs——纯函数便于行为测试。
@@ -998,8 +1013,37 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, 
   </div>`
 }
 
-function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
+// ── 触发结果行（v3.317）─────────────────────────────────────────────────────
+// 触发返回 202 后旧界面只把面板头徽标从「任务运行中」改回「空闲」：手机上看不出
+// 「刚才那次到底成没成」。这里用 App 已有的 runs（被触发那条 run 的结算）拼一行结果，
+// 不新增轮询、不引入新接口。文案：上一轮：环境检查 · 成功 · 16:13:11 · 用时 1.2s
+// 这一行在面板里**常驻**（空态也占着 min-height），出现时只换文字，按钮位置不动。
+function runOutcome (run) {
+  if (run.cancelled === true) return { text: '已停止', tone: 'warn' }
+  if (run.timedOut) return { text: '超时', tone: 'bad' }
+  if (run.exitCode === null) return { text: '已终止', tone: 'bad' }
+  if (run.exitCode === 0) return { text: '成功', tone: 'ok' }
+  return { text: `失败（退出码 ${run.exitCode}）`, tone: 'bad' }
+}
+
+function triggerResultLine (trig, run) {
+  if (!trig) return { text: '', tone: '' }
+  const label = trig.label || '任务'
+  if (!run) return { text: `上一轮：${label} · 已提交 · ${fmtClock(trig.at)}`, tone: '' }
+  if (!run.finishedAt) return { text: `上一轮：${label} · 运行中 · ${fmtClock(run.startedAt)}`, tone: '' }
+  const o = runOutcome(run)
+  return {
+    text: `上一轮：${label} · ${o.text} · ${fmtClock(run.finishedAt)} · 用时 ${fmtDuration(run.startedAt, run.finishedAt)}`,
+    tone: o.tone
+  }
+}
+
+function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
   const [err, setErr] = useState('')
+  // 最近一次「提交成功」的触发（202 那一刻记下 id/label/at）；结果由 runs 结算。
+  const [lastTrigger, setLastTrigger] = useState(null)
+  const lastRun = lastTrigger && lastTrigger.id ? runs.find((r) => r.id === lastTrigger.id) : null
+  const result = triggerResultLine(lastTrigger, lastRun)
   // 错误走固定的 toast（不占布局）：出现/消失都不许把页面顶动，10s 后自动收起，点按也能关。
   useEffect(() => {
     if (!err) return
@@ -1073,7 +1117,12 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
       // （G_nv 解锁判据）。Sourcery Medium：makeRunId 返回字符串，这里不能按数字过滤，
       // 否则 busy 状态丢 run 关联（自检 202 的 string id 被误判为 null）。
       const data = action === 'notify-test' ? await triggerNotifyTest() : await trigger(action)
-      onTriggered(data && typeof data.id === 'string' ? data.id : null)
+      const runId = data && typeof data.id === 'string' ? data.id : null
+      // 结果行与 busy 归属用同一份数据：202 的 id 还没进 runs 时显示「已提交」，
+      // 主轮询把它带进 runs 后自动改成「成功/失败 · 用时」。
+      const def = ACTION_DEFS.find((a) => a.key === action)
+      setLastTrigger({ id: runId, label: def ? def.label : ((data && data.label) || '任务'), at: Date.now() })
+      onTriggered(runId)
       // busy 不在此处清零（Sourcery vvo）：202 只代表已受理，子进程还在跑；App 的
       // 「提交轮进历史」派生 + BUSY_FALLBACK 兜底负责解锁。
     } catch (e) {
@@ -1132,6 +1181,8 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
         <span class="btn-desc">${a.desc}</span>
       </div>`)}
     </div>
+    <div class=${'trigger-result' + (result.tone ? ' ' + result.tone : '')}
+      role="status" aria-live="polite" aria-atomic="true">${result.text}</div>
     ${err && html`<div class="trigger-toast" role="alert" title="点按关闭"
       onClick=${() => setErr('')}>${err}</div>`}
     <div class="auto-run">
@@ -2381,6 +2432,14 @@ function MessagesPanel ({ onSync, active = true }) {
 
 // 运行日志：run.log 尾部（服务端 1MiB 上限），启动预加载 + 手动/切回刷新；有任务在跑时跟随轮询。
 // 异常口径与筛选在 pure.mjs（isIssueLogLine / filterLogLines），组件与测试共用。
+// ── 日志行渲染（v3.317）────────────────────────────────────────────────────
+// 旧版把整段尾部文本塞进一个 <pre>：ERROR/ALERT 与普通行同色；搜「推送」命中 53 行
+// 却 0 处高亮。现在一行一个 <span>（仍是 <pre> 内的行内节点 ⇒ pre-wrap/等宽/复制
+// 换行都不变），按级别着色，命中片段用 <mark> 包起来。
+// 高亮上限：超过 3000 行退回纯文本（每行一个节点 + mark 在手机上明显掉帧），
+// 计数行必须明说「已关闭高亮」，不能让用户以为搜不到。
+const LOG_HIGHLIGHT_MAX = 3000
+
 function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync, active = true }) {
   const { data, err, load: loadRaw, loading } = usePanelLoader(apiGetLogs, onSync)
   const preRef = useRef(null)
@@ -2488,6 +2547,40 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync, ac
     stickRef.current = true
     setMode(next)
   }
+  // v3.317：计数行/空态都必须点名筛选——只说「没有匹配的日志行」时，用户会以为
+  // 关键词搜不到，其实是上一个 chip 还开着（实测：先点「控制台」再搜「推送」= 0 行）。
+  const modeLabel = (LOG_MODES.find((m) => m[0] === mode) || ['', '全部'])[1]
+  const heavy = filtered.length > LOG_HIGHLIGHT_MAX
+  const countLine = [
+    mode !== 'all'
+      ? `在「${modeLabel}」筛选下 · 显示 ${filtered.length} / ${lines.length} 行`
+      : (kw !== '' ? `显示 ${filtered.length} / ${lines.length} 行` : `共 ${lines.length} 行`),
+    (mode === 'issue' || mode === 'error') ? '已排除控制台停止记录' : '',
+    heavy ? `行数过多（>${LOG_HIGHLIGHT_MAX}），已关闭高亮` : '',
+    mode === 'all' ? '分类可重叠' : ''
+  ].filter(Boolean).join(' · ')
+  const emptyText = lines.length === 0
+    ? '（空）'
+    : mode !== 'all'
+      ? `在「${modeLabel}」筛选下没有匹配的日志行${kw !== '' ? `（关键词「${q.trim()}」）` : ''}`
+      : '（没有匹配的日志行）'
+  // 空态里的出口：把筛选交回「全部」，关键词保留（用户本来要搜的就是这个词）。
+  const searchAllLogs = () => {
+    stickRef.current = true
+    setMode('all')
+  }
+  // 一行一个 <span>，换行仍用真实 "\n"（行内节点 + pre-wrap）：复制日志保留原换行、
+  // 空行不会塌成 0 高；命中片段只作为 <mark> 的文本子节点，不拼 innerHTML。
+  const lineNodes = useMemo(() => {
+    const kwNow = q.trim().toLowerCase()
+    const last = filtered.length - 1
+    return filtered.map((line, i) => {
+      const tone = logLineTone(line)
+      return html`<span class=${'logline' + (tone ? ' logline-' + tone : '')} key=${i}>${
+        splitLogHits(line, kwNow).map(([text, hit], j) => hit ? html`<mark key=${j}>${text}</mark>` : text)
+      }${i === last ? '' : '\n'}</span>`
+    })
+  }, [filtered, q])
   return html`<div class="panel">
     <${PanelHead} title="运行日志" sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
       right=${html`<${Button} variant="ghost" onClick=${refreshNow}>刷新<//>`} />
@@ -2503,8 +2596,13 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync, ac
         <input class="msg-search log-search" type="search" placeholder="搜索日志…" aria-label="搜索日志"
           value=${q} onInput=${(e) => { stickRef.current = true; setQ(e.target.value) }} />
       </div>
-      <div class="log-count">${mode !== 'all' || kw !== '' ? `显示 ${filtered.length} / ${lines.length} 行` : `共 ${lines.length} 行`}${mode === 'issue' || mode === 'error' ? ' · 已排除控制台停止记录' : ''}</div>
-      <pre class="logpre" ref=${preRef} onScroll=${onLogScroll}>${filtered.length > 0 ? shownText : (lines.length === 0 ? '（空）' : '（没有匹配的日志行）')}</pre>
+      <div class="log-count">${countLine}</div>
+      ${filtered.length === 0
+        ? html`<div class="log-empty" role="status">
+          <div class="log-empty-text">${emptyText}</div>
+          ${mode !== 'all' && html`<button type="button" class="log-chip" onClick=${searchAllLogs}>在全部日志中搜索</button>`}
+        </div>`
+        : html`<pre class="logpre logpre-main" ref=${preRef} onScroll=${onLogScroll}>${heavy ? shownText : lineNodes}</pre>`}
     </div>`}
   </div>`
 }
@@ -3426,6 +3524,9 @@ function App () {
   const formPauseUntilRef = useRef(0)
   const timerRef = useRef(null)
   const tabsRef = useRef(null)
+  // 标签栏边缘渐隐状态（v3.317）：'' | 'left' | 'right' | 'both'。只在真的溢出时挂
+  // data-edge，362 宽（6 个页签全部放得下）保持零遮罩——否则最后一格会被误读成被裁掉。
+  const [tabEdge, setTabEdge] = useState('')
   const seqRef = useRef(0)
   // 轮询互斥（Sourcery G_oY）：上一轮未完成时跳过本轮 tick，不在途中叠加新请求
   // （fetch 有 8s 期限，跳过最多让数据晚 2-5s 更新，换来零堆积）。
@@ -3652,27 +3753,38 @@ function App () {
   // 标签栏是单行横滚：切页、旋转屏幕或改窗口宽度后都要把当前页签滚进可视区，
   // 否则活动页签会停在滚动容器的裁剪边之外（Sourcery #260）。只改 .tabs 的
   // scrollLeft，不碰页面滚动；sticky 栏本身始终在视口里。
+  // v3.317：改由 scrollIntoView({inline:'nearest', preventScroll:true}) 做同一件事
+  // （浏览器只在需要时挪最近的滚动容器），并顺带刷新左右渐隐状态。
+  const syncTabEdge = useCallback(() => {
+    const bar = tabsRef.current
+    if (!bar) return
+    const max = bar.scrollWidth - bar.clientWidth
+    if (max <= 1) { setTabEdge(''); return }
+    const left = bar.scrollLeft > 1
+    const right = bar.scrollLeft < max - 1
+    setTabEdge(left && right ? 'both' : left ? 'left' : right ? 'right' : '')
+  }, [])
   useLayoutEffect(() => {
     const bar = tabsRef.current
     if (!bar) return undefined
     const adjust = () => {
       const el = bar.querySelector('.tab-btn.active')
-      if (!el) return
-      const br = bar.getBoundingClientRect()
-      const er = el.getBoundingClientRect()
-      const pad = 4
-      if (er.left < br.left + pad) bar.scrollLeft -= (br.left + pad) - er.left
-      else if (er.right > br.right - pad) bar.scrollLeft += er.right - (br.right - pad)
+      if (el && typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ inline: 'nearest', block: 'nearest', preventScroll: true })
+      }
+      syncTabEdge()
     }
     adjust()
     window.addEventListener('resize', adjust)
+    bar.addEventListener('scroll', syncTabEdge, { passive: true })
     const ro = window.ResizeObserver ? new window.ResizeObserver(adjust) : null
     if (ro) ro.observe(bar)
     return () => {
       window.removeEventListener('resize', adjust)
+      bar.removeEventListener('scroll', syncTabEdge)
       if (ro) ro.disconnect()
     }
-  }, [tab])
+  }, [tab, syncTabEdge])
 
   // vwD：逐请求独立收口——status 失败时 runs 结果仍可用（反之亦然）；
   // 并行发出（Sourcery G_n6）：串行 await 会让慢端点拖住另一端点的更新。
@@ -3987,7 +4099,7 @@ function App () {
       <a class="alert-action" href="/">重新登录</a>
     </div>`}
 
-    <nav class="tabs" ref=${tabsRef}>
+    <nav class="tabs" ref=${tabsRef} data-edge=${tabEdge || undefined} onScroll=${syncTabEdge}>
       ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')}
         onClick=${() => { if (t.key === 'logs') { logJumpPendingRef.current = false; setLogJump(null) } switchTab(t.key) }}>${t.label}</button>`)}
     </nav>
@@ -3996,7 +4108,7 @@ function App () {
       <div>
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} />
-      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy}
+      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} runs=${runs}
         auto=${{ on: autoOn, interval: autoState && Number.isInteger(autoState.interval) ? autoState.interval : AUTO_DEFAULT_S, runs: autoState && autoState.runs ? autoState.runs : 0, err: autoState && autoState.lastError ? autoState.lastError : '', nextAt: autoState && autoState.nextAt ? autoState.nextAt : 0, now: autoNow, start: startAuto, stop: stopAuto, save: saveAutoInterval }} />
       <${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'overview'} pollMs=${autoRefresh && tab === 'overview' ? pollMs : 0} onRefresh=${refreshSplit} />
       <${TrendsPanel} active=${tab === 'overview'} />
@@ -4009,10 +4121,12 @@ function App () {
     </section>`}
     ${!authExpired && visited.has('logs') && html`<section class="page" hidden=${tab !== 'logs'}>
       <div>
-      ${runs.length > 0 && html`<${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'logs'} pollMs=${autoRefresh && tab === 'logs' ? pollMs : 0} onRefresh=${refreshSplit} />`}
+      ${/* 日志在前、触发历史在后（v3.317）：362×795 下旧顺序让日志框从 y=826 开始，
+           首屏一行日志都看不到；排障时日志才是主内容，触发历史滚下去看。 */ ''}
       <${LogsPanel} key=${logJump ? logJump.n : 'base'} active=${tab === 'logs'}
         pollMs=${autoRefresh && tab === 'logs' && locking ? POLL_BUSY_MS : 0}
         initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} onSync=${syncFor.logs} />
+      ${runs.length > 0 && html`<${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'logs'} pollMs=${autoRefresh && tab === 'logs' ? pollMs : 0} onRefresh=${refreshSplit} />`}
       </div>
     </section>`}
     ${!authExpired && visited.has('config') && html`<section class="page" hidden=${tab !== 'config'}>
