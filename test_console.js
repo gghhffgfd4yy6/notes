@@ -4782,6 +4782,9 @@ async function main () {
     // 性能护栏：>3000 行退回纯文本，且计数行明说。
     assert.ok(src.includes('const LOG_HIGHLIGHT_MAX = 3000'), '高亮护栏阈值必须是 3000 行')
     assert.ok(src.includes('const heavy = filtered.length > LOG_HIGHLIGHT_MAX'), '超过阈值必须走纯文本分支')
+    const guardAt = src.indexOf('if (filtered.length > LOG_HIGHLIGHT_MAX) return null')
+    assert.ok(guardAt > 0, '超阈值必须在 useMemo 里短路（不能先 map 一遍再二选一）')
+    assert.ok(src.indexOf('return filtered.map((line, i) =>', guardAt - 200) > guardAt, '护栏必须早于 map（顺序反了等于没省）')
     assert.ok(src.includes('已关闭高亮'), '关掉高亮必须在计数行写明（不能让人以为搜不到）')
     assert.ok(/heavy \? shownText : lineNodes/.test(src), '超阈值必须退回纯文本渲染')
     // 计数行点名筛选 + 空态出口（0 命中先点名筛选，再给「在全部日志中搜索」）。
@@ -4855,6 +4858,12 @@ async function main () {
     assert.ok(!bar.includes('setInterval'), '结果行不得新增轮询')
     assert.ok(bar.includes('上一轮：') && bar.includes('· 用时 '), '结果行必须带「上一轮 / 用时」')
     assert.ok(bar.includes('失败（退出码 '), '失败必须说明原因（不只换颜色）')
+    // 评审修复（Sourcery PR#279）：①run 滑出 20 轮窗口后不能从「成功」退回「已提交」；
+    // ②重放命中要把已受理的 run 登记进结果行；③超过护栏先在 useMemo 里短路，别白 map 一遍。
+    assert.ok(bar.includes('final: true') && bar.includes('final: false'), 'triggerResultLine 必须标记是否已结算')
+    assert.ok(bar.includes('setLastTrigger({ ...lastTrigger, settled:'), '结算后必须把文案快照进 lastTrigger')
+    assert.ok(bar.includes('lastTrigger.settled') && bar.includes('live.final ||'), 'run 消失时必须回落到快照而不是「已提交」')
+    assert.ok(src.includes('setLastTrigger({ id: String(e.replayRunId)'), '重放命中必须登记 run id（否则结果行停在旧文案）')
     assert.ok(/\.trigger-result\s*\{[^}]*min-height:\s*18px/.test(css), '结果行必须预留行高（出现时按钮不位移）')
   })
 

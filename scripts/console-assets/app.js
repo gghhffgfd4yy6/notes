@@ -1027,14 +1027,15 @@ function runOutcome (run) {
 }
 
 function triggerResultLine (trig, run) {
-  if (!trig) return { text: '', tone: '' }
+  if (!trig) return { text: '', tone: '', final: false }
   const label = trig.label || '任务'
-  if (!run) return { text: `上一轮：${label} · 已提交 · ${fmtClock(trig.at)}`, tone: '' }
-  if (!run.finishedAt) return { text: `上一轮：${label} · 运行中 · ${fmtClock(run.startedAt)}`, tone: '' }
+  if (!run) return { text: `上一轮：${label} · 已提交 · ${fmtClock(trig.at)}`, tone: '', final: false }
+  if (!run.finishedAt) return { text: `上一轮：${label} · 运行中 · ${fmtClock(run.startedAt)}`, tone: '', final: false }
   const o = runOutcome(run)
   return {
     text: `上一轮：${label} · ${o.text} · ${fmtClock(run.finishedAt)} · 用时 ${fmtDuration(run.startedAt, run.finishedAt)}`,
-    tone: o.tone
+    tone: o.tone,
+    final: true
   }
 }
 
@@ -1043,7 +1044,16 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
   // 最近一次「提交成功」的触发（202 那一刻记下 id/label/at）；结果由 runs 结算。
   const [lastTrigger, setLastTrigger] = useState(null)
   const lastRun = lastTrigger && lastTrigger.id ? runs.find((r) => r.id === lastTrigger.id) : null
-  const result = triggerResultLine(lastTrigger, lastRun)
+  const live = triggerResultLine(lastTrigger, lastRun)
+  // 结算过的结果必须留住（Sourcery：Settled outcomes regress）。服务端只保留最近 20 轮，
+  // 被触发那条 run 滑出窗口后 lastRun 变 null、live 退回「已提交」——用户会看到一条已经
+  // 跑完（成功 · 用时 1.2s）的记录倒退成「已提交」。所以第一次拿到 final 结果时把文案快照
+  // 进 lastTrigger（同一个触发的快照不再覆盖），run 消失后继续用快照渲染。
+  useEffect(() => {
+    if (!live.final || !lastTrigger || lastTrigger.settled) return
+    setLastTrigger({ ...lastTrigger, settled: { text: live.text, tone: live.tone } })
+  }, [live.final, live.text, live.tone, lastTrigger])
+  const result = live.final || !(lastTrigger && lastTrigger.settled) ? live : lastTrigger.settled
   // 错误走固定的 toast（不占布局）：出现/消失都不许把页面顶动，10s 后自动收起，点按也能关。
   useEffect(() => {
     if (!err) return
@@ -1131,6 +1141,10 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
       if (e && e.replayRunId) {
         setErr(`${e.message}（运行 #${e.replayRunId}）`)
         setBusy(false)
+        // 重放命中 = 首轮已受理：把那条 run 登记为结果行来源，否则结果行停在空白/上一次的
+        // 旧文案（Sourcery：Replay leaves result line stale）。run.id 是字符串，这里统一转。
+        const replayDef = ACTION_DEFS.find((a) => a.key === action)
+        setLastTrigger({ id: String(e.replayRunId), label: replayDef ? replayDef.label : '任务', at: Date.now() })
         // Sourcery Old-run-unlocks-new-trigger：这里不能把 prevRunId 登记为 busy 归属
         // （onTriggered 会写 busyRunIdRef）——旧轮通常已在历史里，下一次新提交 setBusy(true)
         // 后、其 202 未返回前，「busy 且 busyRunIdRef 在历史」的解锁 effect 会立即把新提交
@@ -2571,7 +2585,10 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync, ac
   }
   // 一行一个 <span>，换行仍用真实 "\n"（行内节点 + pre-wrap）：复制日志保留原换行、
   // 空行不会塌成 0 高；命中片段只作为 <mark> 的文本子节点，不拼 innerHTML。
+  // 超阈值先在 useMemo 里返回 null：旧实现「先 map 出一整页 span、再在渲染时二选一」，
+  // 护栏只省了挂载没省构造，3000+ 行搜索在手机上照样卡（Sourcery：Large log searches still lag）。
   const lineNodes = useMemo(() => {
+    if (filtered.length > LOG_HIGHLIGHT_MAX) return null
     const kwNow = q.trim().toLowerCase()
     const last = filtered.length - 1
     return filtered.map((line, i) => {
