@@ -4380,7 +4380,7 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(!/window\.scrollTo\(0, 0\) \}, \[tab/.test(src), '切页不得无条件强制回顶（长页深处会被整页拽回顶部）')
     const scrollBlock = src.slice(src.indexOf('const scrollMemRef = useRef({})'), src.indexOf('// 标签栏是单行横滚'))
-    const switchBlock = src.slice(src.indexOf('const switchTab = '), src.indexOf('// 「查看日志」跳转'))
+    const switchBlock = src.slice(src.indexOf('const switchTab = '), src.indexOf('const openLog = useCallback'))
     assert.ok(scrollBlock.includes('scrollMemRef.current[from] = y'),
       '切页前必须记住出发页的滚动位置')
     assert.ok(scrollBlock.includes("const target = forceTop ? 0 : (typeof mem === 'number' ? mem : y)"),
@@ -4428,7 +4428,7 @@ async function main () {
     const sysBlock = src.slice(src.indexOf('const markSysReady'), src.indexOf('const onSysReady'))
     assert.ok(sysBlock.includes('syncMemRef.current.sys = ts') && sysBlock.includes('setPanelReadyAt(performance.now())'),
       '系统页两个面板都完成时必须缓存 sys 时间并写 ready 标记')
-    const switchSyncBlock = src.slice(src.indexOf('const switchTab ='), src.indexOf('// 「查看日志」跳转'))
+    const switchSyncBlock = src.slice(src.indexOf('const switchTab ='), src.indexOf('const openLog = useCallback'))
     assert.ok(switchSyncBlock.includes('showSyncFor(next)'), '页签点击必须同步切到目标页缓存时间')
     const hashSyncBlock = src.slice(src.indexOf('const onHash ='), src.indexOf("window.addEventListener('hashchange'"))
     assert.ok(hashSyncBlock.includes('showSyncFor(next)'), '后退/前进必须同步切到目标页缓存时间')
@@ -4447,7 +4447,10 @@ async function main () {
     assert.ok(src.includes('prepareScrollRef.current(next)'), 'hash 后退/前进必须走同一套滚动还原')
     assert.ok(src.includes("window.history.scrollRestoration = 'manual'"), '后退/前进必须关掉浏览器默认的滚动恢复')
     assert.ok(src.includes("prepareScrollRef.current('logs', { forceTop: true })"), '查看日志必须强制回顶')
-    assert.ok(/onClick=\$\{\(\) => \{[^\n]*switchTab\(t\.key\)/.test(src), '标签点击必须走 switchTab，不得绕过（可先清日志跳转）')
+    assert.ok(src.includes('onClick=$' + '{() => switchTab(t.key)}'), '标签点击必须直接走 switchTab')
+    // v3.318：点「运行日志」页签不能清 logJump 触发重挂载——重挂载会先画 90px 空壳，
+    // 把下面的「触发历史」顶进视口闪一下。数据与筛选由保活面板自己保留。
+    assert.ok(!src.includes('setLogJump(null)'), '点「运行日志」页签不得清 logJump 重挂载（会闪空壳）')
     // 手机端 6 个页签在 640 断点下会折成两行（吸顶 108px）；必须改成单行横滚，
     // 否则吸顶区翻倍、正文被挤掉。桌面保持 wrap，不引入滚动容器吞滚轮。
     const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
@@ -4796,6 +4799,48 @@ async function main () {
     const searchAll = src.slice(src.indexOf('const searchAllLogs = () => {'), src.indexOf('}, [filtered, q])'))
     assert.ok(searchAll.includes("setMode('all')") && !searchAll.includes('setQ('), '出口只放开筛选、必须保留关键词')
     assert.ok(src.includes('分类可重叠'), '计数行必须注明分类可重叠（269 ≠ 100+165 的自洽提示）')
+  })
+
+  await aok('结构红线: v3.318 日志跳转先取后切（首帧定稿 / 转圈反馈 / 可取消）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const openAt = src.indexOf('const openLog = useCallback((jump) => {')
+    const open = src.slice(openAt, src.indexOf('}, [markVisited])', openAt))
+    assert.ok(openAt > 0 && open.includes('apiGetLogs()'), '跳转必须先取日志快照')
+    // 只比较 indexOf 会被「发起请求后立刻 setTab」骗过：setTab 必须在 then 的成功回调里。
+    assert.ok(open.includes('return apiGetLogs().then('), '必须把预取 Promise 返回并等它落定')
+    const thenAt = open.indexOf('(d) => {')
+    assert.ok(thenAt > 0 && open.indexOf("setTab('logs')") > thenAt, 'setTab 必须在预取成功的回调里')
+    assert.ok(open.indexOf("setTab('logs')") > open.indexOf('seq !== logJumpSeqRef.current'), '切页前必须先过代次守卫')
+    const rejAt = open.indexOf('(e) => {', thenAt)
+    assert.ok(rejAt > thenAt && open.slice(rejAt).includes('tabRef.current !== from'),
+      '迟到的失败也必须按切页作废（不能在新页面弹旧错误）')
+    assert.ok(src.includes('logJumpSeqRef.current++'), '主动切页/后退必须作废在飞的日志跳转')
+    assert.ok(open.includes('setLogJump({ q, mode, n: seq, data: d })'), '快照必须随 logJump 交给日志面板')
+    const loader = src.slice(src.indexOf('function usePanelLoader'), src.indexOf('function usePanelAutoLoad'))
+    assert.ok(loader.includes('const [data, setData] = useState(initialData)'), 'usePanelLoader 必须真的把快照作为初始 data')
+    const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
+    assert.ok(logs.includes('initialData = null') && logs.includes('usePanelLoader(apiGetLogs, onSync, initialData)'),
+      '日志面板必须用预取快照当首帧')
+    const seededAt = logs.indexOf('if (seeded) {')
+    const seededEnd = logs.indexOf('} else if (firstReveal)', seededAt)
+    assert.ok(seededAt > 0 && seededEnd > seededAt, '带快照分支必须存在')
+    assert.ok(!logs.slice(seededAt, seededEnd).includes('load('), '带快照分支不得再发请求（重复拉会盖内容）')
+    assert.ok(logs.includes('useLayoutEffect(() => {') && logs.includes('el.scrollTop = el.scrollHeight'),
+      '日志贴底必须在 paint 前完成（否则首帧先看到顶部）')
+    const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
+    const jumpAt = hist.indexOf('const jumpLog = (r) => {')
+    const jump = hist.slice(jumpAt, hist.indexOf('return html`<div class="panel">', jumpAt))
+    assert.ok(jump.includes('setJumpBusy((prev)'), '点击另一行时必须先撤掉上一行的转圈')
+    const busyAt = jump.indexOf('setJumpBusy(key)')
+    const timerAt = jump.indexOf('window.setTimeout(() => {')
+    const delayAt = jump.indexOf('}, 150)')
+    assert.ok(timerAt > 0 && busyAt > timerAt && busyAt < delayAt, '转圈只能由 150ms 定时器挂上（不能点了就转）')
+    assert.ok(hist.includes('class="row-spin"') && hist.includes('aria-busy='), '慢请求必须在行内按钮转圈并报 aria-busy')
+    const banner = src.slice(src.indexOf('function AlertBanner'), src.indexOf('// ── 组件：状态卡片区'))
+    assert.ok(banner.includes("failed ? '重试 →'"), '横幅跳转失败必须给可见反馈')
+    assert.ok(/\.row-spin\s*\{[^}]*animation:\s*row-spin/.test(css), '转圈动画必须存在')
+    assert.ok(/\.run-actions \.row-link\s*\{[^}]*min-width/.test(css), '转圈时按钮宽度不得变化')
   })
 
   await aok('结构红线: v3.317 页签（420 断点 / 边缘渐隐 / 当前页签滚入视野）', () => {

@@ -854,6 +854,12 @@ function diagCard (state) {
 // 只在「最近一轮失败/中断」或「近 7 天有失败」时出现：用户打开控制台第一眼就知道
 // 有没有需要处理的事，并可直接跳到带筛选的日志（不再靠逐页翻逐轮历史）。
 function AlertBanner ({ state, onOpenLog }) {
+  // v3.318：横幅的「查看日志」也走先取后切；150ms 后才显示「加载中…」，失败变「重试 →」。
+  const [busy, setBusy] = useState(false)
+  const [failed, setFailed] = useState(false)
+  const jumpSeqRef = useRef(0)
+  const jumpTimerRef = useRef(0)
+  useEffect(() => () => clearTimeout(jumpTimerRef.current), [])
   if (!state) return null
   const run = state.run && state.run.value ? state.run.value : null
   const stats = state.stats && state.stats.status === 'ok' ? state.stats.value : null
@@ -873,10 +879,35 @@ function AlertBanner ({ state, onOpenLog }) {
             ? `最近一轮推送失败 ${run.failed} 条（${run.at || '时间未知'}）`
             : `最近一轮异常中断（${run.at || '时间未知'}）`)
         : `近 7 天有失败：${lastFail.date} 推送失败 ${lastFail.failed} 条`)
+  const openJump = () => {
+    if (!onOpenLog) return
+    const seq = ++jumpSeqRef.current
+    setFailed(false)
+    clearTimeout(jumpTimerRef.current)
+    jumpTimerRef.current = window.setTimeout(() => {
+      if (seq === jumpSeqRef.current) setBusy(true)
+    }, 150)
+    Promise.resolve(onOpenLog({ q: at.slice(0, 10), mode: 'issue' }))
+      .then((res) => {
+        if (seq !== jumpSeqRef.current) return
+        if (res && res.ok === false && !res.canceled) setFailed(true)
+      })
+      .catch(() => {
+        if (seq === jumpSeqRef.current) setFailed(true)
+      })
+      .finally(() => {
+        if (seq !== jumpSeqRef.current) return
+        clearTimeout(jumpTimerRef.current)
+        jumpTimerRef.current = 0
+        setBusy(false)
+      })
+  }
   return html`<div class="alert-banner" role="alert">
     <span class="alert-dot" aria-hidden="true"></span>
     <span class="alert-text">${text}</span>
-    <button type="button" class="alert-link" onClick=${() => onOpenLog && onOpenLog({ q: at.slice(0, 10), mode: 'issue' })}>查看日志 →</button>
+    <button type="button" class="alert-link" aria-busy=${busy ? 'true' : 'false'}
+      title=${failed ? '日志加载失败，点此重试' : '查看该日日志'}
+      onClick=${openJump}>${busy ? '加载中…' : (failed ? '重试 →' : '查看日志 →')}</button>
   </div>`
 }
 
@@ -1557,6 +1588,13 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
+  // v3.318：点「日志」先在原页取快照，150ms 内没回来才在按钮上转圈——快请求不闪转圈；
+  // 慢请求（日志到 1 MiB 时）也不会看起来「没点上」。失败就地报错，不切页。
+  const [jumpBusy, setJumpBusy] = useState('')
+  const [jumpErr, setJumpErr] = useState('')
+  const jumpSeqRef = useRef(0)
+  const jumpTimerRef = useRef(0)
+  useEffect(() => () => clearTimeout(jumpTimerRef.current), [])
   const seqRef = useRef(0)
 
   const load = useCallback(async () => {
@@ -1594,8 +1632,33 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   const changeDay = (v) => { setDay(v); setPageNo(1) }
   const jumpLog = (r) => {
     if (!onOpenLog || typeof r.at !== 'string' || r.at.length < 10) return
+    const key = `${r.at}-${r.lineNo}`
+    const seq = ++jumpSeqRef.current
+    setJumpErr('')
+    // 连点另一行时先撤掉上一行的转圈；点同一行则保持，避免转圈闪一下。
+    setJumpBusy((prev) => (prev === '' || prev === key ? prev : ''))
+    // 150ms 内回来的请求不显示忙碌（否则一闪而过的转圈比不转还烦）。
+    clearTimeout(jumpTimerRef.current)
+    jumpTimerRef.current = window.setTimeout(() => {
+      if (seq === jumpSeqRef.current) setJumpBusy(key)
+    }, 150)
     // 单轮「日志」= 看这一天的完整日志（含摘要/告警/错误）；要只看异常，进日志页点「异常」。
-    onOpenLog({ q: r.at.slice(0, 10), mode: 'all' })
+    Promise.resolve(onOpenLog({ q: r.at.slice(0, 10), mode: 'all' }))
+      .then((res) => {
+        if (seq !== jumpSeqRef.current) return
+        if (res && res.ok === false && !res.canceled) {
+          setJumpErr(`日志加载失败：${res.error || '请重试'}`)
+        }
+      })
+      .catch((e) => {
+        if (seq === jumpSeqRef.current) setJumpErr(`日志加载失败：${e && e.message ? e.message : e}`)
+      })
+      .finally(() => {
+        if (seq !== jumpSeqRef.current) return
+        clearTimeout(jumpTimerRef.current)
+        jumpTimerRef.current = 0
+        setJumpBusy('')
+      })
   }
   return html`<div class="panel">
     <${PanelHead} title="逐轮运行历史"
@@ -1611,6 +1674,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
         <${Button} variant="ghost" onClick=${refresh} disabled=${loading}>刷新<//>
       </div>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${jumpErr && html`<${Hint} tone="error">${jumpErr}<//>`}
     ${data && data.status === 'ok' && html`<div class="run-tools">
       <div class="log-chips" role="group" aria-label="逐轮筛选">
         <button type="button" class=${'log-chip' + (mode === 'all' ? ' on' : '')}
@@ -1641,7 +1705,12 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
           <td>${r.failed == null ? '—' : (r.failed > 0 ? html`<span class="sync-err">${r.failed}</span>` : r.failed)}</td>
           <td class="mono">${r.elapsed || '—'}</td>
           <td class="run-actions">${r.cachesaved === 0 ? html`<span class="run-note">未落盘</span>` : ''}
-            <button type="button" class="row-link" disabled=${!r.at} onClick=${() => jumpLog(r)}>日志</button></td>
+            <button type="button" class="row-link" disabled=${!r.at}
+              aria-busy=${jumpBusy === `${r.at}-${r.lineNo}` ? 'true' : 'false'}
+              aria-label=${jumpBusy === `${r.at}-${r.lineNo}` ? '日志加载中' : '查看该日日志'}
+              onClick=${() => jumpLog(r)}>${jumpBusy === `${r.at}-${r.lineNo}`
+                ? html`<span class="row-spin" aria-hidden="true"></span>`
+                : '日志'}</button></td>
         </tr>`)}
       </tbody>
     </table></div>`}
@@ -1665,8 +1734,9 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
 // failed>0 的日子用红色渐变提示；0 推送的日子画灰色基线（看得见「没有数据」≠ 没画）。
 // 面板加载器公共骨架：data/err 状态 + load()（成功清错、失败写横幅）。
 // apiFn 由调用方用 useCallback/useMemo 固定引用，避免 effect 风暴。
-function usePanelLoader (apiFn, onLoaded) {
-  const [data, setData] = useState(null)
+function usePanelLoader (apiFn, onLoaded, initialData = null) {
+  // initialData：跳转前已取到的快照（v3.318）。给它就把首帧定稿，挂载后不再立刻重拉。
+  const [data, setData] = useState(initialData)
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   const seqRef = useRef(0) // 竞态守卫：只应用「最新一次 load」的响应（审查 Sourcery PR#227）
@@ -2454,8 +2524,10 @@ function MessagesPanel ({ onSync, active = true }) {
 // 计数行必须明说「已关闭高亮」，不能让用户以为搜不到。
 const LOG_HIGHLIGHT_MAX = 3000
 
-function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync, active = true }) {
-  const { data, err, load: loadRaw, loading } = usePanelLoader(apiGetLogs, onSync)
+function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialData = null, onSync, active = true }) {
+  const { data, err, load: loadRaw, loading } = usePanelLoader(apiGetLogs, onSync, initialData)
+  // v3.318：跳转前预取的快照只用于本次挂载——首帧即最终日志，且不再立刻重拉一次。
+  const seededRef = useRef(initialData !== null)
   const preRef = useRef(null)
   const stickRef = useRef(true)
   const prevTextRef = useRef('')
@@ -2494,11 +2566,17 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync, ac
     // 首访预加载：页签还没点开也先把日志拉下来；之后离开不拉，切回再补。
     if (!active && preloadedRef.current) return undefined
     const firstReveal = preloadedRef.current && active && !revealedRef.current
+    const seeded = seededRef.current
+    seededRef.current = false
     preloadedRef.current = true
     revealedRef.current = active
-    // 第一次点开时直接用预加载结果；只有预加载失败（没 data 也没在飞）或数据已超过
-    // 5s 才补一发，避免点击瞬间再发请求把预加载响应顶掉（Sourcery #272）。
-    if (firstReveal) {
+    // v3.318：跳转前 openLog 已取到快照，首帧就用它定稿，不再立刻重拉——慢网下
+    // 第二次请求失败还会把有效日志盖成错误。之后切走再回来仍走下面的补拉。
+    if (seeded) {
+      // 快照已就位，本次挂载不发请求。
+    } else if (firstReveal) {
+      // 第一次点开时直接用预加载结果；只有预加载失败（没 data 也没在飞）或数据已超过
+      // 5s 才补一发，避免点击瞬间再发请求把预加载响应顶掉（Sourcery #272）。
       const stale = !loading && (!data || Date.now() - dataAtRef.current > 5000)
       if (stale) load(true).catch(() => {})
     } else {
@@ -2541,7 +2619,9 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', onSync, ac
   ]
   // 首屏与「原本就在底部」时跟随最新日志；用户上翻查看历史时不抢滚动位置。
   // 手动「刷新」与日志从不可读恢复时强制回到底部，避免「刷新后仍停在旧位置」。
-  useEffect(() => {
+  // v3.318：改用 layout effect——跳转时快照已在首帧，若等 paint 后再贴底，
+  // 会先看到日志顶部再被拽到底部（一帧闪动）。
+  useLayoutEffect(() => {
     const el = preRef.current
     if (!el || !data) return
     if (data.status !== 'ok') { stickRef.current = true; prevTextRef.current = ''; return }
@@ -3576,6 +3656,8 @@ function App () {
   const pendingFirstVisitRef = useRef(false)
   const scrollHoldRef = useRef(null)
   const logJumpPendingRef = useRef(false)
+  // 日志跳转代次：主动切页/后退/新的跳转都会 ++，迟到的 /api/logs 响应据此作废。
+  const logJumpSeqRef = useRef(0)
   const tabRef = useRef(tab)
   tabRef.current = tab
   // 每个面板只接受「自己这一页」的完成回调：切走后旧请求再回包，不碰新页的垫高。
@@ -3938,6 +4020,8 @@ function App () {
     const onHash = () => {
       const next = resolveTab(window.location.hash)
       if (next === tabRef.current) return
+      // 后退/前进也算主动切页：作废在飞的日志跳转，迟到的响应不得再改页。
+      logJumpSeqRef.current++
       // 系统页每次进入都重新等两个面板，不能拿上一次的 ready 集合提前收口。
       if (next === 'sys') sysReadyRef.current = null
       // 后退/前进也走同一套记忆与垫高，不再绕过 switchTab 丢失还原。
@@ -4061,6 +4145,9 @@ function App () {
   // v3.307 同步写 hash：刷新/后退能回到同一页。
   const switchTab = (next) => {
     if (next === tab) return
+    // 任何主动切页都作废在飞的日志跳转：即使只切走再切回概览（tabRef 仍是 from），
+    // 迟到的响应也不得把用户再拽去日志页。
+    logJumpSeqRef.current++
     if (next === 'sys') sysReadyRef.current = null
     // 统一走 prepareScroll：保存出发页位置、决定目标页位置、首访时先垫高。
     // 第一次进入沿用当前视口，不把整页拽回顶部；只有「查看日志」走 forceTop。
@@ -4071,18 +4158,38 @@ function App () {
     tabRef.current = next
     if (window.location.hash !== `#/${next}`) window.location.hash = `#/${next}`
   }
-  // 「查看日志」跳转：横幅/逐轮历史点进来时带筛选条件与日期，重挂载 LogsPanel。
-  // 这是一次性的强制回顶；logJumpPendingRef 被 layout effect 消费后即失效，
-  // logJump 本身继续留给 LogsPanel 当重挂载 key。
+  // 「查看日志」跳转（v3.318）：先在原页取日志快照，取到再切页。重挂载的 LogsPanel
+  // 直接拿这份快照当首帧，不再先 paint 一个 90px 空壳（否则下面的「触发历史」会
+  // 顶进视口闪一下）。seq 守卫保证晚到的响应不会把已切走的用户拽回日志页。
   const openLog = useCallback((jump) => {
-    prepareScrollRef.current('logs', { forceTop: true })
-    markVisited('logs')
-    logJumpPendingRef.current = true
-    setLogJump({ q: jump && jump.q ? jump.q : '', mode: jump && jump.mode ? jump.mode : 'all', n: Date.now() })
-    showSyncFor('logs')
-    setTab('logs')
-    tabRef.current = 'logs'
-    if (window.location.hash !== '#/logs') window.location.hash = '#/logs'
+    const q = jump && jump.q ? jump.q : ''
+    const mode = jump && jump.mode ? jump.mode : 'all'
+    const seq = ++logJumpSeqRef.current
+    const from = tabRef.current
+    return apiGetLogs().then(
+      (d) => {
+        if (seq !== logJumpSeqRef.current) return { ok: false, canceled: true }
+        // 等待期间用户已切到别的页签：这次跳转作废，不能过一会儿再把人拽回来。
+        if (tabRef.current !== from) return { ok: false, canceled: true }
+        const at = Date.now()
+        // 数据截至直接记这次预取的落盘时间，切页后首帧就显示正确时间。
+        syncMemRef.current.logs = at
+        prepareScrollRef.current('logs', { forceTop: true })
+        markVisited('logs')
+        logJumpPendingRef.current = true
+        setLogJump({ q, mode, n: seq, data: d })
+        showSyncFor('logs')
+        setTab('logs')
+        tabRef.current = 'logs'
+        if (window.location.hash !== '#/logs') window.location.hash = '#/logs'
+        return { ok: true }
+      },
+      (e) => {
+        // 迟到的失败同样要作废：用户已经切走时不能在他的新页面上弹旧错误。
+        if (seq !== logJumpSeqRef.current || tabRef.current !== from) return { ok: false, canceled: true }
+        return { ok: false, error: e && e.message ? e.message : String(e) }
+      }
+    )
   }, [markVisited])
   const pollMs = locking ? POLL_BUSY_MS : POLL_MS
   // 顶栏徽章只在「概览/日志 + 自动刷新开」时是活状态；其它情况（暂停、推送记录/配置/系统）
@@ -4118,7 +4225,7 @@ function App () {
 
     <nav class="tabs" ref=${tabsRef} data-edge=${tabEdge || undefined} onScroll=${syncTabEdge}>
       ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')}
-        onClick=${() => { if (t.key === 'logs') { logJumpPendingRef.current = false; setLogJump(null) } switchTab(t.key) }}>${t.label}</button>`)}
+        onClick=${() => switchTab(t.key)}>${t.label}</button>`)}
     </nav>
 
     ${!authExpired && visited.has('overview') && html`<section class="page" hidden=${tab !== 'overview'}>
@@ -4142,7 +4249,8 @@ function App () {
            首屏一行日志都看不到；排障时日志才是主内容，触发历史滚下去看。 */ ''}
       <${LogsPanel} key=${logJump ? logJump.n : 'base'} active=${tab === 'logs'}
         pollMs=${autoRefresh && tab === 'logs' && locking ? POLL_BUSY_MS : 0}
-        initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'} onSync=${syncFor.logs} />
+        initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'}
+        initialData=${logJump ? logJump.data : null} onSync=${syncFor.logs} />
       ${runs.length > 0 && html`<${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'logs'} pollMs=${autoRefresh && tab === 'logs' ? pollMs : 0} onRefresh=${refreshSplit} />`}
       </div>
     </section>`}

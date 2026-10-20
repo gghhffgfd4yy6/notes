@@ -552,9 +552,18 @@
   .row-link {
     background: none; border: 0; color: var(--accent); font-size: var(--fs-xs);
     cursor: pointer; padding: 2px 4px; min-height: 30px;
+    display: inline-flex; align-items: center; justify-content: center;
   }
   .row-link:hover { text-decoration: underline; }
   .row-link:disabled { color: var(--text-dim); cursor: not-allowed; }
+  /* v3.318：跳转预取超过 150ms 才转圈（快请求不闪转圈）；固定宽度避免按钮宽度变化。 */
+  .run-actions .row-link { min-width: 34px; }
+  .row-spin {
+    width: 13px; height: 13px; border: 2px solid currentColor; border-right-color: transparent;
+    border-radius: 50%; animation: row-spin .7s linear infinite;
+  }
+  @keyframes row-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .row-spin { animation-duration: 1.6s; } }
 
   /* ── 配置页 ── */
   .cfg-block { background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-3); margin-top: 12px; }
