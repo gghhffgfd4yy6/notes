@@ -1173,6 +1173,9 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
 }
 
 // ── 组件：运行历史 ──────────────────────────────────────────────────────────
+// 点「日志」时等详情接口的上限（同确认弹窗的 CONFIRM_NAMES_WAIT_MS 口径）：
+// 正常一发几十毫秒；超时就先用「加载中…」开框，绝不把点击卡住。
+const RUN_LOG_WAIT_MS = 600
 function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
   const [openId, setOpenId] = useState(null)
   const [detail, setDetail] = useState(null)
@@ -1189,17 +1192,54 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
   const onRefreshRef = useRef(onRefresh)
   onRefreshRef.current = onRefresh
 
-  // 切换目标 run 时立即清旧详情（Sourcery G_oi + Old-logs-flash）：useEffect 在渲染后
+  // 切换目标 run 时清旧详情（Sourcery G_oi + Old-logs-flash）：useEffect 在渲染后
   // 才跑，「新 openId + 旧 detail」会闪一帧。渲染期同步判定：detail.runId 与当前 openId
   // 不符就不显示（下方 logpre 用 detailForOpen 而非裸 detail）。effect 仍负责清状态。
+  // v3.313：点「日志」改为先取详情再开框（见 openLog），预取的 detail 已属于新 openId，
+  // 这里必须原样保留——无条件 setDetail(null) 会把预取结果当场抹掉，框又退回「加载中…」。
   useEffect(() => {
-    setDetail(null)
+    setDetail((prev) => (prev !== null && prev.id === openId ? prev : null))
     setDetailErr('')
   }, [openId])
   // openRun/openActive 先声明后使用（v3.300 3.1 §1.9b）：详情跟随 effect 依赖 openActive，
   // 须在 effect 之前声明（渲染逻辑零变化）。
   const openRun = openId !== null ? runs.find((r) => r.id === openId) : null
   const openActive = !!(openRun && !openRun.finishedAt)
+  // 打开日志框：先取详情、再与 openId 同一批 set，让首帧就是最终日志（v3.313）。
+  // 旧实现先 setOpenId、由 effect 再拉详情：框首帧只有「加载中…」（实测高 89px），
+  // 详情回来撑成整段（366px、页高 +277px）——手机上就是先闪一下再跳一截。
+  // 与确认弹窗同口径：最多等 RUN_LOG_WAIT_MS；拿不到才用占位符开框，且一旦开框
+  // 不再改写文案。seq 防「先点 A 再点 B」时迟到的 A 详情盖住 B；openingRef 防连点同一行
+  // 反复起请求（每次重起都会把 600ms 的上限重新计时，等于越点越慢）。
+  const openSeqRef = useRef(0)
+  const openingRef = useRef(null)
+  const openLog = (id) => {
+    if (openId === id) {
+      openSeqRef.current++
+      openingRef.current = null
+      setOpenId(null)
+      return
+    }
+    if (openingRef.current === id) return
+    const seq = ++openSeqRef.current
+    openingRef.current = id
+    let timer = 0
+    let settled = false
+    const openWith = (d) => {
+      if (settled || seq !== openSeqRef.current) return
+      settled = true
+      clearTimeout(timer)
+      openingRef.current = null
+      if (d) {
+        setDetail(d)
+        setDetailErr('')
+      }
+      setOpenId(id)
+    }
+    // 正常一发几十毫秒；超时也不能把点击卡住——照旧用「加载中…」开框。
+    timer = setTimeout(() => openWith(null), RUN_LOG_WAIT_MS)
+    apiGetRunDetail(id).then((d) => openWith(d)).catch(() => openWith(null))
+  }
   // typeof 判据必须是 'string'（v3.300 3.1 §1.9a 回归修复）：v3.299 起 run id 改为
   // 「epoch.seq」字符串下发（服务端 makeRunId 模板串），number 判据恒 false ⇒
   // detailForOpen 恒 null ⇒ 日志框永远「加载中…」。
@@ -1394,7 +1434,7 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
             <td>
               ${!r.finishedAt && html`<${Button} variant=${'ghost btn-danger' + (cancelPending === r.id ? ' btn-busy' : '')} disabled=${cancelPending === r.id}
                 onClick=${() => { doCancel(r.id).catch(() => {}) }} title="停止该任务（SIGTERM，3 秒后强杀；已发送但未记录的通知下轮会重推）">停止<//>`}
-              <${Button} variant="ghost" onClick=${() => setOpenId(openId === r.id ? null : r.id)}>
+              <${Button} variant="ghost" onClick=${() => openLog(r.id)}>
                 ${openId === r.id ? '收起' : '日志'}
               <//>
             </td>

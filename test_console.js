@@ -4037,6 +4037,33 @@ async function main () {
     assert.ok(/<\/div>`\s*\}\s*$/.test(seg), 'RunsPanel 模板必须以根 </div> 收尾')
   })
 
+  await aok('结构红线: 日志框首帧即最终日志（点「日志」不得先画「加载中…」再撑开）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const start = src.indexOf('function RunsPanel')
+    const end = src.indexOf('// ── 组件：逐轮运行历史', start)
+    assert.ok(start > -1 && end > start, '应能定位 RunsPanel 源码段')
+    const seg = src.slice(start, end)
+    // 手机录屏实测：点「日志」后框先以「加载中…」占 89px 出现，详情回来再撑到 366px，
+    // 页高 +277px ⇒ 「闪一下再跳一截」。修法是先取详情、再与 openId 同一批 set。
+    assert.ok(!seg.includes('setOpenId(openId === r.id ? null : r.id)'),
+      '点「日志」不得直接 setOpenId（会先渲染加载占位）')
+    const from = seg.indexOf('const openLog = (id) =>')
+    assert.ok(from > 0, '必须有 openLog 预取入口')
+    const fn = seg.slice(from, seg.indexOf('// typeof 判据', from))
+    assert.ok(fn.includes('apiGetRunDetail(id)'), 'openLog 必须先取详情（不能只留条件不调用）')
+    assert.ok(fn.indexOf('setDetail(d)') > -1 && fn.indexOf('setDetail(d)') < fn.indexOf('setOpenId(id)'),
+      '预取的 detail 必须与 openId 一起 set（同一批渲染，首帧即最终）')
+    assert.ok(fn.includes('setTimeout(() => openWith(null), RUN_LOG_WAIT_MS)'),
+      '详情超时也必须开框（占位兜底），不能把点击卡死')
+    assert.ok(fn.includes('seq !== openSeqRef.current') && fn.includes('settled'),
+      '过期响应/已开过的请求必须丢弃，开框后不得再改文案')
+    const wait = src.match(/const RUN_LOG_WAIT_MS = (\d+)/)
+    assert.ok(wait && Number(wait[1]) > 0 && Number(wait[1]) <= 1000, '等待详情必须有 ≤1s 的上限')
+    assert.ok(seg.includes('setDetail((prev) => (prev !== null && prev.id === openId ? prev : null))'),
+      '清详情 effect 必须保留同一 openId 的预取详情（否则预取被当场抹掉）')
+    assert.ok(/onClick=\$\{\(\) => openLog\(r\.id\)\}/.test(seg), '行内按钮必须走 openLog')
+  })
+
   await aok('静态红线: fmtTime 固定按 Asia/Shanghai（UTC+8）渲染', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     // 服务器时区为 UTC：用本地 getHours() 会让「自动刷新 14:xx」与 run.log 的 22:xx 混显。
