@@ -4857,6 +4857,8 @@ async function main () {
     assert.ok(open.includes("typeof jump.focus === 'string'") && open.includes('setLogJump({ q, mode, focus, n: seq, data: d })'),
       'focus 必须随 logJump 状态交给日志页')
     const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
+    assert.ok(open.includes("const focus = jump && typeof jump.focus === 'string' ? jump.focus : ''"),
+      'focus 必须真的取 jump.focus（不能恒为空）')
     assert.ok(logs.includes("focusAt = ''") && logs.includes("focusDate = ''"),
       '日志页必须接收定位时间戳与日期')
     assert.ok(src.includes('focusAt=$' + "{logJump && logJump.focus ? logJump.focus : ''}") &&
@@ -4864,12 +4866,19 @@ async function main () {
     assert.ok(logs.includes("q === focusAt ? 'only' : (q === focusDate ? 'day' : '')"),
       '定位条必须区分「当天列表」与「只看这一轮」')
     assert.ok(logs.includes('只看这一轮') && logs.includes('看当天全部'), '两个出口必须都在')
-    assert.ok(logs.includes('line.startsWith(focusAt)') && logs.includes("' logline-focus'"),
-      '点中的那一行必须按时间戳匹配并加高亮类')
-    assert.ok(logs.includes('focusDoneRef.current === focusAt') && logs.includes('pre.scrollTop = Math.max(0'),
-      '定位滚动必须只做一次，并落在日志框内')
-    assert.ok(src.includes("document.querySelector('.logline-focus')") && src.includes('window.scrollTo(0, y)'),
-      '定位后页面必须滚到定位条下方，保证高亮行在首屏可见')
+    assert.ok(logs.includes("const isFocus = focusAt !== '' && line.startsWith(focusAt)") &&
+      logs.includes("(isFocus ? ' logline-focus' : '')"), '高亮类必须由 isFocus 条件真实驱动')
+    assert.ok(logs.includes('focusDoneRef.current = focusAt'), '滚动完成后必须记下 focusAt（否则轮询会反复拽回）')
+    assert.ok(logs.includes('pre.scrollTop = Math.max(0'), '定位滚动必须落在日志框内')
+    assert.ok(src.includes('const bottomAfter = line.getBoundingClientRect().bottom - (y - startY)') &&
+      src.includes('y += bottomAfter - (vh - 12)'), '小屏必须把页面多滚一点，保证高亮行完整可见')
+    assert.ok(logs.includes('focusOnly ? base.filter((l) => l.startsWith(focusAt)) : base'),
+      '「只看这一轮」必须按行首过滤（不能把正文提到时间戳的行也带进来）')
+    assert.ok(logs.includes('setFocusDismissed(true)') && logs.includes('focusDismissed ||'),
+      '切分类/手改搜索词后定位条必须保持收起')
+    assert.ok(logs.includes('focusHeavy') && logs.includes('整行高亮已关闭'), '>3000 行必须明说高亮关闭')
+    assert.ok(logs.includes("focusDoneRef.current = ''; setQ(focusAt)") &&
+      logs.includes("focusDoneRef.current = ''; setQ(focusDate)"), '两个按钮必须真的切换查询（不能是空 handler）')
     assert.ok(css.includes('.logline-focus') && /border-left:\s*3px solid var\(--accent\)/.test(css),
       '整行高亮必须有左侧竖条')
     assert.ok(css.includes('.log-focus') && css.includes('.log-focus-time'), '顶部定位条必须有样式')
