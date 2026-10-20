@@ -1024,7 +1024,7 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, active = true }) {
       namesInFlightRef.current = null
       // 弹窗开着时绝不换文案：换文案 = 换行数 = 弹窗自己变高变矮。
       if (names && pendingRef.current === null) setConfiguredNames(names)
-    })
+    }, () => { namesInFlightRef.current = null })
     return p
   }, [])
   useEffect(() => { if (active && pending === null) loadConfiguredNames() }, [active, pending, loadConfiguredNames])
