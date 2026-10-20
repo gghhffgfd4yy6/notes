@@ -951,6 +951,9 @@ function StatusCards ({ state }) {
 // 自动正式运行由服务器调度；前端只负责输入/保存/开关与展示状态。
 const AUTO_MIN_S = 3
 const AUTO_MAX_S = 20
+// 打开确认弹窗前等配置接口的上限：正常一发几十毫秒；超时就先用兜底文案开，
+// 绝不为了等渠道名把按钮卡住，也绝不在弹窗显示后再换文案（会缩一行）。
+const CONFIRM_NAMES_WAIT_MS = 600
 const AUTO_DEFAULT_S = 10
 const AUTO_MAX_FAILS = 3
 function clampAutoSeconds (v) {
@@ -1006,10 +1009,31 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
   // 待确认的真实推送动作（null = 无弹窗）；dry-run/check 不弹窗，直接执行。
   const [pending, setPending] = useState(null)
   // 确认框里的渠道名必须来自「当前配置」，不能拿 channel-health 历史凑数——配置改过之后
-  // 历史里可能是已删除的渠道（Sourcery 确认框列错渠道）。null = 还没拉到，用模糊文案。
-  const [configuredNames, setConfiguredNames] = useState(null)
-  const channelText = Array.isArray(configuredNames)
-    ? (configuredNames.length > 0 ? configuredNames.join('、') : '未配置任何渠道')
+  // 历史里可能是已删除的渠道（Sourcery 确认框列错渠道）。
+  // 文案还必须在弹窗「画出来之前」定稿：先画模糊文案、配置回来再换成真实渠道名，会让
+  // 正文少一行 ⇒ 居中的弹窗在打开后缩一截、上下各跳半行（手机上就是「弹一下」）。
+  // 所以每次打开都先取一次配置（最多等 CONFIRM_NAMES_WAIT_MS），把渠道名和 pending
+  // 一起 set：首帧就是最终文案；拿不到（失败/超时）才用兜底文案，绝不在显示后改。
+  const [pendingNames, setPendingNames] = useState(null)
+  const confirmSeqRef = useRef(0)
+  const askConfirm = useCallback((action) => {
+    const seq = ++confirmSeqRef.current
+    let timer = 0
+    let settled = false
+    const open = (names) => {
+      if (settled || seq !== confirmSeqRef.current) return
+      settled = true
+      clearTimeout(timer)
+      setPendingNames(names)
+      setPending(action)
+    }
+    timer = setTimeout(() => open(null), CONFIRM_NAMES_WAIT_MS)
+    apiGetConfig().then((v) => {
+      open(v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : [])
+    }).catch(() => open(null))
+  }, [])
+  const channelText = Array.isArray(pendingNames)
+    ? (pendingNames.length > 0 ? pendingNames.join('、') : '未配置任何渠道')
     : '所有已配置渠道（以「配置」页为准）'
   // 自动间隔草稿：输入框可自由键入，保存/开始时统一夹到 3–20；运行状态由 App 持有。
   const [autoDraft, setAutoDraft] = useState(String(auto.interval))
@@ -1075,26 +1099,14 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
   const ask = (action) => {
     setErr('')
     // 只有真实推送需要确认；试运行与环境检查立即执行
-    if (action === 'run' || action === 'notify-test') {
-      setPending(action)
-      setConfiguredNames(null)
-      // 配置页同源接口（脱敏）：只取渠道名，取不到就退回模糊文案，绝不猜。
-      apiGetConfig().then((v) => {
-        const names = v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : []
-        setConfiguredNames(names)
-      }).catch(() => setConfiguredNames(null))
-    } else doTrigger(action)
+    if (action === 'run' || action === 'notify-test') askConfirm(action)
+    else doTrigger(action)
   }
   // 自动运行是持续真实推送，必须先确认；确认后用当前草稿值启动。
   const askAuto = () => {
     setErr('')
     setAutoDraft(String(clampAutoSeconds(autoDraft)))
-    setPending('auto')
-    setConfiguredNames(null)
-    apiGetConfig().then((v) => {
-      const names = v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : []
-      setConfiguredNames(names)
-    }).catch(() => setConfiguredNames(null))
+    askConfirm('auto')
   }
   const confirmPending = async () => {
     const action = pending

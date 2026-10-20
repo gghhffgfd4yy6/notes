@@ -4209,7 +4209,7 @@ async function main () {
   await aok('结构红线: v3.307 确认弹窗 / 今日统计 / 时间窗 / 日志级别 / hash 路由', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function ConfirmDialog'), '危险动作必须有确认弹窗')
-    assert.ok(src.includes("if (action === 'run' || action === 'notify-test') {"),
+    assert.ok(src.includes("if (action === 'run' || action === 'notify-test') askConfirm(action)"),
       '正式运行与通知自检必须走确认；试运行/环境检查直接执行')
     assert.ok(src.includes("cls: 'btn-danger-solid'"), '正式运行必须是红色危险按钮')
     assert.ok(src.includes('role="dialog"') && src.includes('aria-modal="true"'), '弹窗必须有无障碍语义')
@@ -4231,6 +4231,28 @@ async function main () {
       '手机端状态卡必须 2×2，不能四张单列')
     assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.btn-item\s*\{\s*flex:\s*1 1 calc\(50% - 5px\)/.test(css),
       '手机端动作按钮必须 2×2')
+  })
+
+  await aok('弹窗文案: 渠道名必须在弹窗画出来前定稿（打开后不得再改行数）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const from = src.indexOf('const askConfirm = useCallback')
+    const openPath = src.slice(from, src.indexOf('const channelText', from))
+    // 手机录屏实测：打开确认弹窗时先画「所有已配置渠道（以「配置」页为准）」占 3 行，
+    // 配置接口回来换成真实渠道名只剩 2 行 ⇒ 居中弹窗在 0.1s 内缩掉一行（34 物理 px），
+    // 上下各跳 17px。弹窗一旦显示，文案与行数就必须是最终态。
+    assert.ok(from > 0, '必须有统一的「先取配置再开弹窗」入口')
+    assert.ok(openPath.includes('apiGetConfig()'), '打开确认框必须真的取当前配置（不能只留条件不调用）')
+    assert.ok(openPath.includes('setPendingNames(names)') && openPath.includes('setPending(action)'),
+      '渠道名必须与 pending 一起 set，弹窗首帧即最终文案')
+    assert.ok(openPath.includes('setTimeout(() => open(null), CONFIRM_NAMES_WAIT_MS)'),
+      '配置超时也必须开弹窗（用兜底文案），不能把按钮卡死')
+    assert.ok(openPath.includes('seq !== confirmSeqRef.current') && openPath.includes('settled'),
+      '过期响应/已开过的请求必须丢弃，不得二次改文案')
+    const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
+    assert.ok(!trigger.includes('setConfiguredNames'), '不得再保留「打开后异步换渠道名」的旧状态')
+    assert.ok(trigger.includes('askConfirm(action)') && trigger.includes("askConfirm('auto')"),
+      '真实推送与自动运行都必须走统一入口')
+    assert.ok(trigger.includes('所有已配置渠道（以「配置」页为准）'), '拿不到配置时仍要有兜底文案')
   })
 
   await aok('触屏反馈: 内核点按高亮必须关掉，按压反馈由 :active 承担', () => {
@@ -4558,7 +4580,7 @@ async function main () {
     assert.ok(trigger.includes('onClick=$' + '{saveAuto}') && trigger.includes('保存'), '必须有保存键')
     assert.ok(trigger.includes('auto.start') && trigger.includes('auto.stop') && trigger.includes('停止'),
       '必须能开始/停止自动运行')
-    assert.ok(trigger.includes("setPending('auto')") && trigger.includes('确认开启自动正式运行'),
+    assert.ok(trigger.includes("askConfirm('auto')") && trigger.includes('确认开启自动正式运行'),
       '自动运行是持续真实推送，必须先确认')
     assert.ok(trigger.includes('服务器调度') && trigger.includes('关闭页面'),
       '界面必须说明调度在服务器，关页不影响')
