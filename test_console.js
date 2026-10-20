@@ -4233,6 +4233,24 @@ async function main () {
       '手机端动作按钮必须 2×2')
   })
 
+  await aok('弹窗文案: 渠道名必须在弹窗画出来前定稿（打开后不得再改行数）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
+    // 手机录屏实测：打开确认弹窗时先画「所有已配置渠道（以「配置」页为准）」占 3 行，
+    // 配置接口回来换成真实渠道名只剩 2 行 ⇒ 居中弹窗在 0.1s 内缩掉一行（34 物理 px），
+    // 上下各跳 17px。弹窗一旦显示，文案与行数就必须是最终态。
+    assert.ok(!trigger.includes('setConfiguredNames(null)'),
+      '打开弹窗时不得把渠道名清空重拉（会先按模糊文案排版、再缩一行）')
+    assert.ok(trigger.includes('namesInFlightRef') && trigger.includes('loadConfiguredNames'),
+      '渠道名必须预取并复用同一发在飞请求')
+    assert.ok(trigger.includes('pendingRef.current === null'),
+      '弹窗在屏上时不得替换渠道名（换文案就会换行数）')
+    assert.ok(trigger.includes('active && pending === null'),
+      '切回概览/关闭弹窗后才刷新渠道名')
+    assert.ok(trigger.includes('所有已配置渠道（以「配置」页为准）'),
+      '拿不到配置时仍要有兜底文案')
+  })
+
   await aok('触屏反馈: 内核点按高亮必须关掉，按压反馈由 :active 承担', () => {
     const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     // 注释掉的规则不算数：断言必须只看真实声明，否则把 html 那条注释掉也能「通过」（Sourcery #274）。

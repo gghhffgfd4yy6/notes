@@ -995,7 +995,7 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, 
   </div>`
 }
 
-function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
+function TriggerBar ({ onTriggered, locking, setBusy, auto, active = true }) {
   const [err, setErr] = useState('')
   // 错误走固定的 toast（不占布局）：出现/消失都不许把页面顶动，10s 后自动收起，点按也能关。
   useEffect(() => {
@@ -1007,7 +1007,27 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
   const [pending, setPending] = useState(null)
   // 确认框里的渠道名必须来自「当前配置」，不能拿 channel-health 历史凑数——配置改过之后
   // 历史里可能是已删除的渠道（Sourcery 确认框列错渠道）。null = 还没拉到，用模糊文案。
+  // 但文案必须在弹窗「画出来之前」定稿：先画模糊文案、配置回来再换成真实渠道名，会让
+  // 正文少一行 ⇒ 居中的弹窗在打开后缩一截、上下各跳半行（手机上就是「弹一下」）。
+  // 所以挂载时预取，弹窗在屏上时不换文案；关闭后再补一发保持新鲜。
   const [configuredNames, setConfiguredNames] = useState(null)
+  const pendingRef = useRef(null)
+  const namesInFlightRef = useRef(null)
+  useEffect(() => { pendingRef.current = pending }, [pending])
+  const loadConfiguredNames = useCallback(() => {
+    if (namesInFlightRef.current) return namesInFlightRef.current
+    const p = apiGetConfig()
+      .then((v) => (v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : []))
+      .catch(() => null)
+    namesInFlightRef.current = p
+    p.then((names) => {
+      namesInFlightRef.current = null
+      // 弹窗开着时绝不换文案：换文案 = 换行数 = 弹窗自己变高变矮。
+      if (names && pendingRef.current === null) setConfiguredNames(names)
+    })
+    return p
+  }, [])
+  useEffect(() => { if (active && pending === null) loadConfiguredNames() }, [active, pending, loadConfiguredNames])
   const channelText = Array.isArray(configuredNames)
     ? (configuredNames.length > 0 ? configuredNames.join('、') : '未配置任何渠道')
     : '所有已配置渠道（以「配置」页为准）'
@@ -1076,13 +1096,9 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
     setErr('')
     // 只有真实推送需要确认；试运行与环境检查立即执行
     if (action === 'run' || action === 'notify-test') {
+      // 不再在打开弹窗时把渠道名清空重拉：那会让弹窗先按模糊文案排版、100ms 后再缩一行。
+      // 名字由挂载/切回概览时预取（见 loadConfiguredNames），打开时直接是最终文案。
       setPending(action)
-      setConfiguredNames(null)
-      // 配置页同源接口（脱敏）：只取渠道名，取不到就退回模糊文案，绝不猜。
-      apiGetConfig().then((v) => {
-        const names = v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : []
-        setConfiguredNames(names)
-      }).catch(() => setConfiguredNames(null))
     } else doTrigger(action)
   }
   // 自动运行是持续真实推送，必须先确认；确认后用当前草稿值启动。
@@ -1090,11 +1106,6 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
     setErr('')
     setAutoDraft(String(clampAutoSeconds(autoDraft)))
     setPending('auto')
-    setConfiguredNames(null)
-    apiGetConfig().then((v) => {
-      const names = v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : []
-      setConfiguredNames(names)
-    }).catch(() => setConfiguredNames(null))
   }
   const confirmPending = async () => {
     const action = pending
@@ -3927,7 +3938,7 @@ function App () {
       <div>
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} />
-      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy}
+      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} active=${tab === 'overview'}
         auto=${{ on: autoOn, interval: autoState && Number.isInteger(autoState.interval) ? autoState.interval : AUTO_DEFAULT_S, runs: autoState && autoState.runs ? autoState.runs : 0, err: autoState && autoState.lastError ? autoState.lastError : '', nextAt: autoState && autoState.nextAt ? autoState.nextAt : 0, now: autoNow, start: startAuto, stop: stopAuto, save: saveAutoInterval }} />
       <${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'overview'} pollMs=${autoRefresh && tab === 'overview' ? pollMs : 0} onRefresh=${refreshSplit} />
       <${TrendsPanel} active=${tab === 'overview'} />
