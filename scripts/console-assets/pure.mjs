@@ -110,6 +110,36 @@ export function logLineKind (line) {
   return 'info'
 }
 
+// 行级着色（v3.317）：ERROR 红、ALERT/WARN 琥珀，其余不着色（'bad' | 'warn' | ''）。
+// 控制台生命周期行虽是 ERROR 前缀，但语义是「任务被停掉」，与「异常」口径一致不着色
+// （否则每次重启满屏红，正是 v3.307 降噪要去掉的那类噪声）。
+export function logLineTone (line) {
+  const kind = logLineKind(line)
+  if (kind === 'error') return 'bad'
+  if (kind === 'alert' || kind === 'warn') return 'warn'
+  return ''
+}
+
+// 把一行按关键字切成 [文本, 是否命中] 片段，交给 <mark> 渲染（v3.317）。
+// 大小写不敏感，但绝不拼 innerHTML——用户输入只作为文本节点插入（XSS 面为零）。
+// 少数 Unicode（如 'İ'）小写后长度会变、索引与原文对不上，此时整行不切（不猜位置）。
+export function splitLogHits (line, kw) {
+  if (typeof line !== 'string' || line.length === 0 || kw === '') return [[line, false]]
+  const lower = line.toLowerCase()
+  if (lower.length !== line.length) return [[line, false]]
+  const out = []
+  let from = 0
+  let at = lower.indexOf(kw, from)
+  while (at !== -1) {
+    if (at > from) out.push([line.slice(from, at), false])
+    out.push([line.slice(at, at + kw.length), true])
+    from = at + kw.length
+    at = lower.indexOf(kw, from)
+  }
+  if (from < line.length) out.push([line.slice(from), false])
+  return out
+}
+
 // 各筛选模式的计数（v3.307）：前端 chips 显示数字，纯函数避免每次渲染把 6 个模式各扫一遍。
 // issue = isIssueLogLine；error 只看真正的业务 ERROR，控制台生命周期单独归 console——
 // 否则每次启停的「ERROR 控制台停止」会把错误数抬到上百，排障时反而找不到真错误。
