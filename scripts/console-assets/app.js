@@ -951,6 +951,9 @@ function StatusCards ({ state }) {
 // 自动正式运行由服务器调度；前端只负责输入/保存/开关与展示状态。
 const AUTO_MIN_S = 3
 const AUTO_MAX_S = 20
+// 打开确认弹窗前等配置接口的上限：正常一发几十毫秒；超时就先用兜底文案开，
+// 绝不为了等渠道名把按钮卡住，也绝不在弹窗显示后再换文案（会缩一行）。
+const CONFIRM_NAMES_WAIT_MS = 600
 const AUTO_DEFAULT_S = 10
 const AUTO_MAX_FAILS = 3
 function clampAutoSeconds (v) {
@@ -995,7 +998,7 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, 
   </div>`
 }
 
-function TriggerBar ({ onTriggered, locking, setBusy, auto, active = true }) {
+function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
   const [err, setErr] = useState('')
   // 错误走固定的 toast（不占布局）：出现/消失都不许把页面顶动，10s 后自动收起，点按也能关。
   useEffect(() => {
@@ -1006,30 +1009,31 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, active = true }) {
   // 待确认的真实推送动作（null = 无弹窗）；dry-run/check 不弹窗，直接执行。
   const [pending, setPending] = useState(null)
   // 确认框里的渠道名必须来自「当前配置」，不能拿 channel-health 历史凑数——配置改过之后
-  // 历史里可能是已删除的渠道（Sourcery 确认框列错渠道）。null = 还没拉到，用模糊文案。
-  // 但文案必须在弹窗「画出来之前」定稿：先画模糊文案、配置回来再换成真实渠道名，会让
+  // 历史里可能是已删除的渠道（Sourcery 确认框列错渠道）。
+  // 文案还必须在弹窗「画出来之前」定稿：先画模糊文案、配置回来再换成真实渠道名，会让
   // 正文少一行 ⇒ 居中的弹窗在打开后缩一截、上下各跳半行（手机上就是「弹一下」）。
-  // 所以挂载时预取，弹窗在屏上时不换文案；关闭后再补一发保持新鲜。
-  const [configuredNames, setConfiguredNames] = useState(null)
-  const pendingRef = useRef(null)
-  const namesInFlightRef = useRef(null)
-  useEffect(() => { pendingRef.current = pending }, [pending])
-  const loadConfiguredNames = useCallback(() => {
-    if (namesInFlightRef.current) return namesInFlightRef.current
-    const p = apiGetConfig()
-      .then((v) => (v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : []))
-      .catch(() => null)
-    namesInFlightRef.current = p
-    p.then((names) => {
-      namesInFlightRef.current = null
-      // 弹窗开着时绝不换文案：换文案 = 换行数 = 弹窗自己变高变矮。
-      if (names && pendingRef.current === null) setConfiguredNames(names)
-    }, () => { namesInFlightRef.current = null })
-    return p
+  // 所以每次打开都先取一次配置（最多等 CONFIRM_NAMES_WAIT_MS），把渠道名和 pending
+  // 一起 set：首帧就是最终文案；拿不到（失败/超时）才用兜底文案，绝不在显示后改。
+  const [pendingNames, setPendingNames] = useState(null)
+  const confirmSeqRef = useRef(0)
+  const askConfirm = useCallback((action) => {
+    const seq = ++confirmSeqRef.current
+    let timer = 0
+    let settled = false
+    const open = (names) => {
+      if (settled || seq !== confirmSeqRef.current) return
+      settled = true
+      clearTimeout(timer)
+      setPendingNames(names)
+      setPending(action)
+    }
+    timer = setTimeout(() => open(null), CONFIRM_NAMES_WAIT_MS)
+    apiGetConfig().then((v) => {
+      open(v && v.pushChannels && Array.isArray(v.pushChannels.names) ? v.pushChannels.names : [])
+    }).catch(() => open(null))
   }, [])
-  useEffect(() => { if (active && pending === null) loadConfiguredNames() }, [active, pending, loadConfiguredNames])
-  const channelText = Array.isArray(configuredNames)
-    ? (configuredNames.length > 0 ? configuredNames.join('、') : '未配置任何渠道')
+  const channelText = Array.isArray(pendingNames)
+    ? (pendingNames.length > 0 ? pendingNames.join('、') : '未配置任何渠道')
     : '所有已配置渠道（以「配置」页为准）'
   // 自动间隔草稿：输入框可自由键入，保存/开始时统一夹到 3–20；运行状态由 App 持有。
   const [autoDraft, setAutoDraft] = useState(String(auto.interval))
@@ -1095,17 +1099,14 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, active = true }) {
   const ask = (action) => {
     setErr('')
     // 只有真实推送需要确认；试运行与环境检查立即执行
-    if (action === 'run' || action === 'notify-test') {
-      // 不再在打开弹窗时把渠道名清空重拉：那会让弹窗先按模糊文案排版、100ms 后再缩一行。
-      // 名字由挂载/切回概览时预取（见 loadConfiguredNames），打开时直接是最终文案。
-      setPending(action)
-    } else doTrigger(action)
+    if (action === 'run' || action === 'notify-test') askConfirm(action)
+    else doTrigger(action)
   }
   // 自动运行是持续真实推送，必须先确认；确认后用当前草稿值启动。
   const askAuto = () => {
     setErr('')
     setAutoDraft(String(clampAutoSeconds(autoDraft)))
-    setPending('auto')
+    askConfirm('auto')
   }
   const confirmPending = async () => {
     const action = pending
@@ -3938,7 +3939,7 @@ function App () {
       <div>
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} />
-      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} active=${tab === 'overview'}
+      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy}
         auto=${{ on: autoOn, interval: autoState && Number.isInteger(autoState.interval) ? autoState.interval : AUTO_DEFAULT_S, runs: autoState && autoState.runs ? autoState.runs : 0, err: autoState && autoState.lastError ? autoState.lastError : '', nextAt: autoState && autoState.nextAt ? autoState.nextAt : 0, now: autoNow, start: startAuto, stop: stopAuto, save: saveAutoInterval }} />
       <${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'overview'} pollMs=${autoRefresh && tab === 'overview' ? pollMs : 0} onRefresh=${refreshSplit} />
       <${TrendsPanel} active=${tab === 'overview'} />
