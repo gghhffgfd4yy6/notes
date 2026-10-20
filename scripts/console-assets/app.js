@@ -997,6 +997,12 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, 
 
 function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
   const [err, setErr] = useState('')
+  // 错误走固定的 toast（不占布局）：出现/消失都不许把页面顶动，10s 后自动收起，点按也能关。
+  useEffect(() => {
+    if (!err) return
+    const t = setTimeout(() => setErr(''), 10000)
+    return () => clearTimeout(t)
+  }, [err])
   // 待确认的真实推送动作（null = 无弹窗）；dry-run/check 不弹窗，直接执行。
   const [pending, setPending] = useState(null)
   // 确认框里的渠道名必须来自「当前配置」，不能拿 channel-health 历史凑数——配置改过之后
@@ -1104,16 +1110,18 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto }) {
     }
     if (action) doTrigger(action)
   }
-  return html`<div class="panel">
-    <${PanelHead} title="手动触发" />
+  return html`<div class="panel trigger-panel">
+    <${PanelHead} title="手动触发"
+      right=${locking && html`<span class="trigger-busy" role="status" aria-live="polite"
+        aria-label="任务进行中，完成后自动解锁" title="任务进行中，完成后自动解锁"><span class="spin"></span><span class="trigger-busy-text">任务进行中…</span></span>`} />
     <div class="btn-row">
       ${ACTION_DEFS.map((a) => html`<div class="btn-item" key=${a.key}>
         <${Button} variant=${a.cls.replace(/^btn-/, '')} disabled=${locking} onClick=${() => ask(a.key)}>${a.label}<//>
         <span class="btn-desc">${a.desc}</span>
       </div>`)}
     </div>
-    ${locking && html`<${Hint}><span class="spin"></span> 任务进行中…（完成后自动解锁）<//>`}
-    ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${err && html`<div class="trigger-toast" role="alert" title="点按关闭"
+      onClick=${() => setErr('')}>${err}</div>`}
     <div class="auto-run">
       <div class="auto-run-head">
         <span class="auto-run-title">自动正式运行</span>

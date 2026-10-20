@@ -4260,6 +4260,32 @@ async function main () {
     assert.ok(/filter:\s*brightness\(\.85\)/.test(touch), '触屏按压反馈须有可见的压暗')
   })
 
+  await aok('手动触发: 忙碌/错误提示都不许插行顶动布局', () => {
+    const js = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const start = js.indexOf('function TriggerBar')
+    const end = js.indexOf('// ── 组件：运行历史', start)
+    assert.ok(start > -1 && end > start, '应能定位 TriggerBar 组件')
+    const block = js.slice(start, end)
+    // 手动触发状态区（面板头 + 按钮行 + 提示）里不许出现行内 Hint。
+    const triggerArea = block.slice(0, block.indexOf('<div class="auto-run">'))
+    // 忙碌提示原先插在按钮行与自动运行之间，出现/消失会把下方内容整体顶下 ~28px，
+    // 手机上点一下就像「弹一下」；它必须由 locking 直接条件渲染成面板头徽标（不占额外高度）。
+    assert.ok(/locking && html`<span class="trigger-busy"/.test(triggerArea),
+      '忙碌徽标必须由 locking 直接条件渲染（只留类名字符串不算）')
+    // 行内 Hint 无论装忙碌还是错误都会插行：面板头与按钮行之间一个都不许留。
+    assert.ok(!/<\$\{Hint\}/.test(triggerArea), '手动触发状态区不得再渲染行内 Hint（出现/消失会顶动布局）')
+    assert.ok(/err && html`<div class="trigger-toast" role="alert"/.test(triggerArea),
+      '触发错误必须走不占布局的 toast')
+    const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const css = raw.replace(/\/\*[\s\S]*?\*\//g, '')
+    const head = css.match(/\.trigger-panel \.panel-head \{[^}]*\}/)
+    assert.ok(head && /flex-wrap:\s*nowrap/.test(head[0]), '面板头必须单行：徽标换行会把标题行撑高')
+    assert.ok(/\.trigger-busy-text\s*\{[^}]*text-overflow:\s*ellipsis/.test(css),
+      '窄屏/放大字号下徽标文字必须可省略，避免压住标题')
+    const toast = css.match(/\.trigger-toast\s*\{[^}]*\}/)
+    assert.ok(toast && /position:\s*fixed/.test(toast[0]), '错误 toast 必须 fixed，不参与布局')
+  })
+
   await aok('结构红线: 概览先状态与操作，触发历史常驻（空态显示暂无记录）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     const start = src.indexOf("${!authExpired && visited.has('overview') && html`<section class=\"page\"")

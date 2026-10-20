@@ -230,6 +230,25 @@
 
   .btn-desc { color: var(--text-dim); font-size: var(--fs-xs); }
 
+  /* 手动触发的忙碌提示：放在面板头右侧、与标题同一行。
+     它原先插在按钮行与自动运行之间，出现/消失会把下方内容整体顶下 ~28px，
+     手机点按看起来就是「弹一下」。面板头单行不换行、徽标可收缩省略，
+     任何宽度或放大字号下都不会换行撑高，也不会压到标题。 */
+  .trigger-panel .panel-head { align-items: center; flex-wrap: nowrap; }
+  .trigger-panel .panel-head .panel-right { min-width: 0; }
+  .trigger-busy { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--text-dim); font-size: var(--fs-xs); }
+  .trigger-busy .spin { flex: 0 0 auto; }
+  .trigger-busy-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 触发失败/重放提示：固定 toast，不参与文档流（插行同样会顶动下方内容）。 */
+  .trigger-toast {
+    position: fixed; left: var(--sp-3); right: var(--sp-3);
+    bottom: calc(var(--sp-3) + env(safe-area-inset-bottom));
+    z-index: 70; padding: 10px 12px; max-height: 40vh; overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--bad-line); border-radius: var(--r-md);
+    color: var(--bad-fg); font-size: var(--fs-sm); line-height: 1.55;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, .45); cursor: pointer;
+  }
+
   /* ── 自动正式运行（3–20s 可调）── */
   .auto-run { margin-top: var(--sp-4); padding-top: var(--sp-3); border-top: 1px dashed var(--border); }
   .auto-run-head { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-2); }
