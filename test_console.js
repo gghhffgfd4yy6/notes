@@ -4575,7 +4575,7 @@ async function main () {
     // 只断言 hook 名字不够：把 align() 塞进 rAF（schedule）照样通过，仍会闪一帧。
     // 布局效应里必须同步调用一次 align()，ResizeObserver 只负责后续尺寸变化。
     const syncAlign = src.slice(src.indexOf('const schedule = () => { if (raf === 0)'), src.indexOf('const schedule = () => { if (raf === 0)') + 160)
-    assert.ok(/\n\s*align\(\)/.test(syncAlign), '布局效应必须同步调用 align()，不得只 schedule 到 rAF')
+    assert.ok(syncAlign.includes('\n    align()\n'), '布局效应必须同步调用 align()，不得只 schedule 到 rAF')
     // 容器宽度变化而天数不变时也要重算，不能只在 byDay.length 变化时跑。
     assert.ok(src.includes('new window.ResizeObserver'), '趋势对齐必须监听容器尺寸变化')
     // 表单交互暂停轮询必须有截止时间；只看 activeElement 会在选完后永久停轮。
