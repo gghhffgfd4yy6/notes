@@ -1601,7 +1601,10 @@ function TrendsPanel ({ active = true }) {
   const toggleDay = (date) => setSelDay((cur) => (cur === date ? null : date))
   // 横向滚动：默认停在最右侧（最近一天），用户可直接左滑看更早日期
   const scrollRef = useRef(null)
-  useEffect(() => {
+  // 对齐必须在绘制前完成：切窗口时一组新列在同一个 commit 里换进来，
+  // 若放到 useEffect（绘制后）再对齐，会先画出一帧「沿用旧 scrollLeft、指向窗口最早几天」的
+  // 空图表，下一帧才跳回最右——手机上看就是趋势模块「闪一下」（v3.315）。
+  useLayoutEffect(() => {
     const el = scrollRef.current
     if (!el) return undefined
     const trend = el.firstElementChild

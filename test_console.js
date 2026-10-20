@@ -4567,6 +4567,15 @@ async function main () {
     // 趋势图自动停靠最右时，最左列可能只露半截日期：须把下一个完整列对齐到容器左缘。
     assert.ok(src.includes('const partial'), '趋势图须对最左半截列做对齐')
     assert.ok(src.includes('r.left < base && r.right > base'), '趋势对齐基准必须是滚动容器左缘，不是视口 x=0')
+    // 切窗口时新的一组列与旧 scrollLeft 在同一个 commit 里换进来：对齐必须在绘制前完成，
+    // 放到 useEffect（绘制后）会先画出一帧指向窗口最早几天的空图表——手机上看就是「闪一下」。
+    const scrollAt = src.indexOf('const scrollRef = useRef(null)')
+    const alignEffect = src.slice(scrollAt, scrollAt + 600)
+    assert.ok(alignEffect.includes('useLayoutEffect(() => {'), '趋势切窗口对齐必须在绘制前（useLayoutEffect）')
+    // 只断言 hook 名字不够：把 align() 塞进 rAF（schedule）照样通过，仍会闪一帧。
+    // 布局效应里必须同步调用一次 align()，ResizeObserver 只负责后续尺寸变化。
+    const syncAlign = src.slice(src.indexOf('const schedule = () => { if (raf === 0)'), src.indexOf('const schedule = () => { if (raf === 0)') + 160)
+    assert.ok(syncAlign.includes('\n    align()\n'), '布局效应必须同步调用 align()，不得只 schedule 到 rAF')
     // 容器宽度变化而天数不变时也要重算，不能只在 byDay.length 变化时跑。
     assert.ok(src.includes('new window.ResizeObserver'), '趋势对齐必须监听容器尺寸变化')
     // 表单交互暂停轮询必须有截止时间；只看 activeElement 会在选完后永久停轮。
