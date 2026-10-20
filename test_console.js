@@ -4400,7 +4400,7 @@ async function main () {
     assert.ok(syncPos > -1 && (rafPos === -1 || syncPos < rafPos),
       '同步还原必须在 layout effect 内、且早于任何 rAF')
     assert.ok(scrollBlock.includes('logJumpPendingRef.current = false'), '日志跳转必须一次性消费')
-    assert.ok(scrollBlock.includes('scrollMemRef.current[tab] = 0'), '日志跳转必须清掉日志页记忆并回顶')
+    assert.ok(scrollBlock.includes('scrollMemRef.current[tab] = y'), '日志跳转必须重写日志页记忆（有 focus 落到定位条，无 focus 回顶）')
     assert.ok(scrollBlock.includes('new window.ResizeObserver(() => check())'), '内容增长必须用 ResizeObserver 等到撑起来')
     assert.ok(scrollBlock.includes('releaseAnchorSoon()') && scrollBlock.includes("overflowAnchor = 'none'"),
       '切页后必须暂时关掉 scroll anchoring，防止每次切换 +26px 漂移')
@@ -4506,8 +4506,11 @@ async function main () {
       '已保活页必须在 layout effect 里直接调用 scrollTo 落到记忆位置')
     assert.ok(src.includes('if (firstVisit && target > 0) holdScroll(target)'),
       '只有首访才垫高文档')
-    assert.ok(/if \(logJumpPendingRef\.current\) \{[\s\S]{0,400}?pendingScrollRef\.current = null[\s\S]{0,200}?window\.scrollTo\(0, 0\)/.test(src),
-      'logJump 强制回顶后必须清掉 pending 引用，避免下次 effect 误消费 stale 0')
+    const jumpBranch = src.slice(src.indexOf('if (logJumpPendingRef.current) {'), src.indexOf('const y = pendingScrollRef.current'))
+    assert.ok(jumpBranch.includes('pendingScrollRef.current = null') &&
+      jumpBranch.includes('pendingFirstVisitRef.current = false') &&
+      jumpBranch.includes('window.scrollTo(0, y)'),
+    'logJump 分支必须清掉 pending 引用，再落到定位条/顶部')
     // 隐藏页不轮询、不跟着倒计时重渲染、不保持 SSE。
     assert.ok(src.includes("autoRefresh && tab === 'overview' ? pollMs : 0"), '概览隐藏后触发历史必须停轮询')
     assert.ok(src.includes("autoRefresh && tab === 'logs' ? pollMs : 0"), '日志页隐藏后触发历史必须停轮询')
@@ -4774,7 +4777,7 @@ async function main () {
     const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
     assert.ok(/\.logpre-main\s*\{[^}]*min\(62dvh, 520px\)/.test(phone), '手机日志框必须 min(62dvh, 520px)')
     // B. 行级渲染 + 高亮：一行一个节点、换行仍是真实 "\n"（复制/空行都不变）。
-    assert.ok(src.includes('class=' + ph("'logline' + (tone ? ' logline-' + tone : '')")), '日志必须逐行渲染并按级别着色')
+    assert.ok(src.includes('class=' + ph("'logline' + (tone ? ' logline-' + tone : '') + (isFocus ? ' logline-focus' : '')")), '日志必须逐行渲染并按级别着色')
     assert.ok(src.includes('}' + ph("i === last ? '' : '\\n'") + '</span>'), '行间必须仍是真实换行（只加 display:block 会丢换行）')
     assert.ok(src.includes('splitLogHits(line, kwNow)') &&
       src.includes('html`<mark key=' + ph('j') + '>' + ph('text') + '</mark>`'), '命中片段必须用 <mark> 包起来')
@@ -4796,7 +4799,7 @@ async function main () {
     assert.ok(src.includes('在全部日志中搜索') && src.includes('onClick=' + ph('searchAllLogs')),
       '空态必须给「在全部日志中搜索」按钮')
     assert.ok(src.includes('在「' + ph('modeLabel') + '」筛选下没有匹配的日志行'), '空态文案必须点名当前筛选')
-    const searchAll = src.slice(src.indexOf('const searchAllLogs = () => {'), src.indexOf('}, [filtered, q])'))
+    const searchAll = src.slice(src.indexOf('const searchAllLogs = () => {'), src.indexOf('// 一行一个 <span>'))
     assert.ok(searchAll.includes("setMode('all')") && !searchAll.includes('setQ('), '出口只放开筛选、必须保留关键词')
     assert.ok(src.includes('分类可重叠'), '计数行必须注明分类可重叠（269 ≠ 100+165 的自洽提示）')
   })
@@ -4816,7 +4819,7 @@ async function main () {
     assert.ok(rejAt > thenAt && open.slice(rejAt).includes('tabRef.current !== from'),
       '迟到的失败也必须按切页作废（不能在新页面弹旧错误）')
     assert.ok(src.includes('logJumpSeqRef.current++'), '主动切页/后退必须作废在飞的日志跳转')
-    assert.ok(open.includes('setLogJump({ q, mode, n: seq, data: d })'), '快照必须随 logJump 交给日志面板')
+    assert.ok(open.includes('setLogJump({ q, mode, focus, n: seq, data: d })'), '快照必须随 logJump 交给日志面板')
     const loader = src.slice(src.indexOf('function usePanelLoader'), src.indexOf('function usePanelAutoLoad'))
     assert.ok(loader.includes('const [data, setData] = useState(initialData)'), 'usePanelLoader 必须真的把快照作为初始 data')
     const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
@@ -4841,6 +4844,35 @@ async function main () {
     assert.ok(banner.includes("failed ? '重试 →'"), '横幅跳转失败必须给可见反馈')
     assert.ok(/\.row-spin\s*\{[^}]*animation:\s*row-spin/.test(css), '转圈动画必须存在')
     assert.ok(/\.run-actions \.row-link\s*\{[^}]*min-width/.test(css), '转圈时按钮宽度不得变化')
+  })
+
+  await aok('结构红线: v3.319 日志跳转定位到具体轮次（横幅 / 整行高亮 / 只看这一轮）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
+    assert.ok(hist.includes("onOpenLog({ q: r.at.slice(0, 10), mode: 'all', focus: r.at })"),
+      '行级跳转必须把完整时间戳交给日志页')
+    const openAt = src.indexOf('const openLog = useCallback')
+    const open = src.slice(openAt, src.indexOf('}, [markVisited])', openAt))
+    assert.ok(open.includes("typeof jump.focus === 'string'") && open.includes('setLogJump({ q, mode, focus, n: seq, data: d })'),
+      'focus 必须随 logJump 状态交给日志页')
+    const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
+    assert.ok(logs.includes("focusAt = ''") && logs.includes("focusDate = ''"),
+      '日志页必须接收定位时间戳与日期')
+    assert.ok(src.includes('focusAt=$' + "{logJump && logJump.focus ? logJump.focus : ''}") &&
+      src.includes('focusDate=$' + "{logJump ? logJump.q : ''}"), 'App 必须把 focusAt/focusDate 传进日志页')
+    assert.ok(logs.includes("q === focusAt ? 'only' : (q === focusDate ? 'day' : '')"),
+      '定位条必须区分「当天列表」与「只看这一轮」')
+    assert.ok(logs.includes('只看这一轮') && logs.includes('看当天全部'), '两个出口必须都在')
+    assert.ok(logs.includes('line.startsWith(focusAt)') && logs.includes("' logline-focus'"),
+      '点中的那一行必须按时间戳匹配并加高亮类')
+    assert.ok(logs.includes('focusDoneRef.current === focusAt') && logs.includes('pre.scrollTop = Math.max(0'),
+      '定位滚动必须只做一次，并落在日志框内')
+    assert.ok(src.includes("document.querySelector('.logline-focus')") && src.includes('window.scrollTo(0, y)'),
+      '定位后页面必须滚到定位条下方，保证高亮行在首屏可见')
+    assert.ok(css.includes('.logline-focus') && /border-left:\s*3px solid var\(--accent\)/.test(css),
+      '整行高亮必须有左侧竖条')
+    assert.ok(css.includes('.log-focus') && css.includes('.log-focus-time'), '顶部定位条必须有样式')
   })
 
   await aok('结构红线: v3.317 页签（420 断点 / 边缘渐隐 / 当前页签滚入视野）', () => {

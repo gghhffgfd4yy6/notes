@@ -1642,8 +1642,9 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     jumpTimerRef.current = window.setTimeout(() => {
       if (seq === jumpSeqRef.current) setJumpBusy(key)
     }, 150)
-    // 单轮「日志」= 看这一天的完整日志（含摘要/告警/错误）；要只看异常，进日志页点「异常」。
-    Promise.resolve(onOpenLog({ q: r.at.slice(0, 10), mode: 'all' }))
+    // 单轮「日志」= 看这一天的完整日志（含摘要/告警/错误）；带 focus 让日志页把
+    // 点中的那一轮居中高亮，而不是丢进当天 14 条一模一样的时间戳里。
+    Promise.resolve(onOpenLog({ q: r.at.slice(0, 10), mode: 'all', focus: r.at }))
       .then((res) => {
         if (seq !== jumpSeqRef.current) return
         if (res && res.ok === false && !res.canceled) {
@@ -2524,11 +2525,14 @@ function MessagesPanel ({ onSync, active = true }) {
 // 计数行必须明说「已关闭高亮」，不能让用户以为搜不到。
 const LOG_HIGHLIGHT_MAX = 3000
 
-function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialData = null, onSync, active = true }) {
+function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialData = null, focusAt = '', focusDate = '', onSync, active = true }) {
   const { data, err, load: loadRaw, loading } = usePanelLoader(apiGetLogs, onSync, initialData)
   // v3.318：跳转前预取的快照只用于本次挂载——首帧即最终日志，且不再立刻重拉一次。
   const seededRef = useRef(initialData !== null)
   const preRef = useRef(null)
+  // v3.319：行级跳转把「点中的那一轮」滚到框中部、加底色；只做一次，之后轮询不抢滚动。
+  const focusRef = useRef(null)
+  const focusDoneRef = useRef('')
   const stickRef = useRef(true)
   const prevTextRef = useRef('')
   // 轮询互斥（审查 #231 前端项）：任务运行时每 2s 拉 1 MiB，上一请求未回时再叠一发
@@ -2609,6 +2613,13 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const kw = q.trim().toLowerCase()
   const filtered = useMemo(() => filterLogLines(rawText, mode, q), [rawText, mode, q])
   const shownText = useMemo(() => filtered.join('\n'), [filtered])
+  // v3.319：行级跳转的定位状态。day = 当天列表 + 高亮该轮；only = 只看该轮。
+  // 用户切了分类或自己改了搜索词就收起定位条，避免和当前筛选打架。
+  const focusHits = useMemo(() => (focusAt ? lines.filter((l) => l.startsWith(focusAt)).length : 0), [lines, focusAt])
+  const focusMode = mode !== 'all' || focusAt === '' || focusHits === 0
+    ? ''
+    : (q === focusAt ? 'only' : (q === focusDate ? 'day' : ''))
+  const focusMiss = mode === 'all' && focusAt !== '' && focusHits === 0 && q === focusDate
   const LOG_MODES = [
     ['all', '全部', counts.all],
     ['issue', '异常', counts.issue],
@@ -2628,6 +2639,20 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     if (stickRef.current || prevTextRef.current === '') el.scrollTop = el.scrollHeight
     prevTextRef.current = shownText
   }, [data, mode, q, shownText])
+  // v3.319：行级跳转把点中的那一轮滚到日志框中部；只做一次，轮询不抢用户滚动。
+  // 用 useLayoutEffect：与贴底同一帧完成，首帧就是定位后的位置，不会先闪顶部/底部。
+  useLayoutEffect(() => {
+    if (!focusAt || focusDoneRef.current === focusAt) return
+    const pre = preRef.current
+    const el = focusRef.current
+    if (!pre || !el) return
+    const box = pre.getBoundingClientRect()
+    const row = el.getBoundingClientRect()
+    const top = row.top - box.top + pre.scrollTop
+    pre.scrollTop = Math.max(0, top - (pre.clientHeight - row.height) / 2)
+    stickRef.current = false
+    focusDoneRef.current = focusAt
+  }, [data, focusAt, q])
   const onLogScroll = () => {
     const el = preRef.current
     if (!el) return
@@ -2673,17 +2698,31 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     const last = filtered.length - 1
     return filtered.map((line, i) => {
       const tone = logLineTone(line)
-      return html`<span class=${'logline' + (tone ? ' logline-' + tone : '')} key=${i}>${
+      // v3.319：点中的那一轮加底色并把 ref 交给居中 effect（只会在行首时间戳匹配）。
+      const isFocus = focusAt !== '' && line.startsWith(focusAt)
+      return html`<span class=${'logline' + (tone ? ' logline-' + tone : '') + (isFocus ? ' logline-focus' : '')}
+        key=${i} ref=${isFocus ? focusRef : null}>${
         splitLogHits(line, kwNow).map(([text, hit], j) => hit ? html`<mark key=${j}>${text}</mark>` : text)
       }${i === last ? '' : '\n'}</span>`
     })
-  }, [filtered, q])
+  }, [filtered, q, focusAt])
   return html`<div class="panel">
     <${PanelHead} title="运行日志" sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
       right=${html`<${Button} variant="ghost" onClick=${refreshNow}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && data.status !== 'ok' && html`<div class="empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
     ${data && data.status === 'ok' && html`<div>
+      ${focusMode === 'day' && html`<div class="log-focus" role="status">
+        <span class="log-focus-text">已定位：<span class="log-focus-time">${focusAt}</span> 这一轮${focusHits > 1 ? `（同秒 ${focusHits} 行）` : ''}</span>
+        <button type="button" class="log-chip" onClick=${() => { focusDoneRef.current = ''; setQ(focusAt) }}>只看这一轮</button>
+      </div>`}
+      ${focusMode === 'only' && html`<div class="log-focus" role="status">
+        <span class="log-focus-text">只看：<span class="log-focus-time">${focusAt}</span> 这一轮</span>
+        <button type="button" class="log-chip" onClick=${() => { focusDoneRef.current = ''; setQ(focusDate) }}>看当天全部</button>
+      </div>`}
+      ${focusMiss && html`<div class="log-focus log-focus-miss" role="status">
+        <span class="log-focus-text">这一轮不在当前日志尾部（可能已轮转），下面只显示当天其他轮次</span>
+      </div>`}
       <div class="log-tools">
         <div class="log-chips" role="group" aria-label="日志筛选">
           ${LOG_MODES.map(([key, label, n]) => html`
@@ -3758,10 +3797,29 @@ function App () {
       // 把已在日志页滚动的用户再拽回顶部（审查 must-fix #3）。
       pendingScrollRef.current = null
       pendingFirstVisitRef.current = false
-      scrollMemRef.current[tab] = 0
+      // v3.319：行级跳转不再死回顶部——滚到定位条下方，保证被高亮的那一轮在首屏可见。
+      // 日志框最高 520px，手机上框底会伸到视口外；只把框内滚到中间，行仍可能在屏幕外。
+      let y = 0
+      if (logJump && logJump.focus) {
+        const banner = document.querySelector('.log-focus')
+        if (banner) {
+          const tabs = document.querySelector('.tabs')
+          const pad = (tabs ? tabs.getBoundingClientRect().height : 0) + 8
+          const startY = window.scrollY
+          y = Math.max(0, banner.getBoundingClientRect().top + startY - pad)
+          // 末尾几轮贴在日志框底部：只把定位条顶到 tabs 下，高亮行仍可能露在屏幕外。
+          const line = document.querySelector('.logline-focus')
+          if (line) {
+            const bottomAfter = line.getBoundingClientRect().bottom - (y - startY)
+            const vh = window.innerHeight || document.documentElement.clientHeight
+            if (bottomAfter > vh - 12) y += bottomAfter - (vh - 12)
+          }
+        }
+      }
+      scrollMemRef.current[tab] = y
       holdAnchor()
       releaseScrollHold()
-      window.scrollTo(0, 0)
+      window.scrollTo(0, y)
       return
     }
     const y = pendingScrollRef.current
@@ -4164,6 +4222,8 @@ function App () {
   const openLog = useCallback((jump) => {
     const q = jump && jump.q ? jump.q : ''
     const mode = jump && jump.mode ? jump.mode : 'all'
+    // 行级跳转带完整时间戳（YYYY-MM-DD HH:MM:SS）；页签/横幅跳转没有，日志页显示整天。
+    const focus = jump && typeof jump.focus === 'string' ? jump.focus : ''
     const seq = ++logJumpSeqRef.current
     const from = tabRef.current
     return apiGetLogs().then(
@@ -4177,7 +4237,7 @@ function App () {
         prepareScrollRef.current('logs', { forceTop: true })
         markVisited('logs')
         logJumpPendingRef.current = true
-        setLogJump({ q, mode, n: seq, data: d })
+        setLogJump({ q, mode, focus, n: seq, data: d })
         showSyncFor('logs')
         setTab('logs')
         tabRef.current = 'logs'
@@ -4250,6 +4310,8 @@ function App () {
       <${LogsPanel} key=${logJump ? logJump.n : 'base'} active=${tab === 'logs'}
         pollMs=${autoRefresh && tab === 'logs' && locking ? POLL_BUSY_MS : 0}
         initialQuery=${logJump ? logJump.q : ''} initialMode=${logJump ? logJump.mode : 'all'}
+        focusAt=${logJump && logJump.focus ? logJump.focus : ''}
+        focusDate=${logJump ? logJump.q : ''}
         initialData=${logJump ? logJump.data : null} onSync=${syncFor.logs} />
       ${runs.length > 0 && html`<${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'logs'} pollMs=${autoRefresh && tab === 'logs' ? pollMs : 0} onRefresh=${refreshSplit} />`}
       </div>
