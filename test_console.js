@@ -3090,7 +3090,7 @@ async function main () {
     assert.ok(/RUN_PAGE_SIZES\.map\(\(n\) => \(\{ value: String\(n\), label: `每页 \$\{n\} 条` \}\)\)/.test(js), '运行历史选项须由 RUN_PAGE_SIZES 渲染')
     assert.ok(/\[10, 20, 50, 100\]\.map\(\(n\) => \(\{ value: String\(n\), label: `每页 \$\{n\} 条` \}\)\)/.test(js), '推送记录选项须由 10/20/50/100 渲染')
     assert.ok(/onChange=\$\{\(v\) => changeSize\(Number\(v\)\)\}/.test(js), '运行历史下拉须接 changeSize')
-    assert.ok(/onChange=\$\{\(v\) => \{ setSize\(Number\(v\)\); setPage\(1\) \}\}/.test(js), '推送记录下拉须同时改 size 并回第 1 页')
+    assert.ok(/onChange=\$\{\(v\) => \{ (?:armLand\(\); |landRef\.current = true; )?setSize\(Number\(v\)\); setPage\(1\) \}\}/.test(js), '推送记录下拉须同时改 size 并回第 1 页')
     assert.ok(/\{ value: '0', label: '全部时间' \}/.test(js), '时间范围选项须走 MiniSelect 数据')
     assert.ok(/\{ value: '30', label: '近 30 天' \}/.test(js), '时间范围须保留近 30 天')
     // 原生 select 在 Android 会弹全屏白底系统列表，控制台内不得回退。
@@ -4924,7 +4924,7 @@ async function main () {
     const runsPanel = src.slice(src.indexOf('function RunsPanel'), src.indexOf('function RunHistoryPanel'))
     const histPanel = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
     assert.ok(runsPanel.includes('<div class="runs-scroll"><table class="runs-table">'), '触发历史表必须在 .runs-scroll 内')
-    assert.ok(histPanel.includes('<div class="runs-scroll"><table class="runs-table">'), '逐轮历史表必须在 .runs-scroll 内')
+    assert.ok(histPanel.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && histPanel.includes('$' + '{shown.length > 0') && histPanel.includes('? html`<table class="runs-table">'), '逐轮历史表必须在 .runs-scroll 内（空态也保留容器）')
     assert.ok(histPanel.includes('<td class="run-actions">'), '逐轮历史的末列必须是动作列（其 sticky 才有意义）')
   })
 
@@ -4961,6 +4961,291 @@ async function main () {
     const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
     assert.ok(/\.msg-search, \.log-search\s*\{[^}]*font-size:\s*16px/.test(phone), '手机输入框必须 16px（防 iOS 聚焦缩放）')
     assert.ok(/\.msg-search, \.log-search\s*\{[^}]*min-height:\s*40px/.test(phone), '手机输入框高度 ≥40px')
+  })
+
+  // ── v3.320 首帧形状与落点（sys 同形占位 / 日志定高 / 校验失败定位 / 分页落点）──────
+  await aok('结构红线: v3.320 系统信息首帧同形占位（7 行无条件渲染）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const sys = src.slice(src.indexOf('function SysPanel'), src.indexOf('function FilesPanel'))
+    const ref = (name) => '$' + '{' + name // 只取到 `${` 前缀（补上 } 就匹配不到源码里的换行/后续表达式）
+    // 旧版整块挂在 `${sys && …}` 后面：冷启动首帧只有面板头 + 提示（223px），数据到达后
+    // 两张表一次性填满（551px），下半页整体被推走。容器不得再拍 min-height 冒充占位。
+    assert.ok(!sys.includes(ref('sys && html`<div class="sys-grid">')), 'sys-grid 不得再挂在 sys && 条件后面')
+    assert.ok(sys.includes('const info = sys || {}'), '首帧必须用 sys || {} 取值（无数据也渲染）')
+    assert.ok(!sys.includes(ref('sys.version')) && !sys.includes(ref('sys.node')) && !sys.includes(ref('sys.pid')),
+      '字段必须一律走 info（sys 为 null 时取 sys.node 会直接抛）')
+    assert.ok(sys.includes("info.node || '—'") && sys.includes("info.platform || '—'") && sys.includes("info.cacheDir || '—'"),
+      '缺值必须显式落到 —（不能渲染 undefined）')
+    assert.ok(sys.includes("info.pid == null ? '—' : info.pid"), 'pid 必须按 == null 判（0 也算有效值）')
+    assert.strictEqual((sys.match(/<tr>/g) || []).length, 7, '首帧必须固定 7 行（3+4），行数就是占位高度')
+    assert.ok(!/\.sys-grid\s*\{[^}]*min-height/.test(fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')),
+      '不许给 .sys-grid 拍 min-height（行高本身就是占位）')
+    // 错误 Hint 仍在表上方：数据失败时先看到原因，再看到空表。
+    const errAt = sys.indexOf('tone="error"')
+    const gridAt = sys.indexOf('class="sys-grid"')
+    assert.ok(errAt >= 0 && gridAt >= 0 && errAt < gridAt, '错误 Hint 必须存在且仍在表上方')
+  })
+
+  await aok('结构红线: v3.320 日志框定高（读取中/空态与日志框同高）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const px = (s, prop) => { const m = new RegExp(prop + ':\\s*(\\d+)px').exec(s); return m ? m[1] : '' }
+    // 既有契约（v3.317）照旧逐字成立：max-height 字面量不得改。
+    const desk = (css.match(/\.logpre-main\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/max-height:\s*520px/.test(desk), '桌面日志框 max-height 必须仍是 520px')
+    assert.ok(/min-height:\s*520px/.test(desk), '桌面日志框必须有同值 min-height（首帧/空态同形）')
+    const empty = (css.match(/\.log-empty\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(empty.length > 0, '.log-empty 必须存在')
+    assert.strictEqual(px(empty, 'min-height'), px(desk, 'max-height'), '.log-empty 的 min-height 必须与日志框同值')
+    // 手机断点：vh 兜底 + dvh 两档，两条都要有（旧版只有 max-height）。
+    const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
+    assert.ok(/\.logpre-main\s*\{[^}]*min-height:\s*62vh; min-height:\s*min\(62dvh, 520px\)/.test(phone),
+      '手机日志框必须补 min-height: 62vh 再 min(62dvh, 520px)')
+    assert.ok(/\.log-empty\s*\{[^}]*min-height:\s*min\(62dvh, 520px\)/.test(phone), '手机空态与日志框同值')
+    const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
+    assert.ok(logs.includes('!data && !err && html`<div class="log-empty"'), '首帧必须渲染读取中占位')
+    assert.ok(logs.includes('读取中'), '占位文案必须说明在读（不能空白）')
+    assert.ok(!logs.includes('html`<div class="empty">日志'), '日志未生成/不可读不得用 .empty（高度会反向塌）')
+    assert.ok(/filtered\.length === 0\s*\?\s*html`<div class="log-empty"/.test(logs), '0 命中必须也用 .log-empty')
+  })
+
+  // ── v3.321 首屏剩余 pop：系统页 access-log 的 44px、日志页工具条的 153px ──────────
+  await aok('结构红线: v3.321 系统页 access-log 无条件占位（+44px 不再由加载引入）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const sys = src.slice(src.indexOf('function SysPanel'), src.indexOf('function FilesPanel'))
+    assert.ok(sys.length > 0, '必须能定位 SysPanel')
+    // 旧版：${logTail.length > 0 && html`<details class="access-log">…} 与 ${access && …暂无访问记录…}
+    // 两条条件 ⇒ 数据未到首帧没有 summary 那 44px，加载后才长出来（panel 487→551）。
+    assert.ok(/^[ \t]*<details class="access-log">$/m.test(sys),
+      'access-log 必须无条件渲染：源码里要有一行裸的 <details class="access-log">')
+    assert.ok(!sys.includes('logTail.length > 0 &&'), 'access-log 不得再被 logTail.length > 0 && 包住')
+    assert.ok(!sys.includes('access && access.items &&'), 'access-log 不得再被 access && 包住')
+    // 空态与表格都移进 details：默认折叠不占高度，展开才长。
+    const inner = sys.slice(sys.indexOf('<details class="access-log">'))
+    const close = inner.indexOf('</details>')
+    assert.ok(close > 0, 'details 必须闭合')
+    const body = inner.slice(0, close)
+    assert.ok(body.includes('暂无访问记录'), '空态必须在 details 内部（留在折叠线以上会重新引入高度）')
+    assert.ok(body.includes('<table class="sys-table">'), '访问表格必须在 details 内部')
+    assert.ok(body.includes('读取中…'), 'access 未回来时 details 内要说明在读（不能空着）')
+    assert.ok(!/<details class="access-log" open/.test(sys), '不得默认展开（展开重新引入首屏高度）')
+  })
+
+  await aok('结构红线: v3.321 日志页工具条/计数行在加载态就渲染（+153px 不再由加载引入）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
+    assert.ok(logs.length > 0, '必须能定位 LogsPanel')
+    // 旧版整块（定位条 + chips + 计数 + 日志框）都在 ok 分支的 <div> 里 ⇒ 数据到达才出现。
+    assert.ok(!logs.includes("data && data.status === 'ok' && html`<div>"), 'ok 分支的包装 div 必须拆掉')
+    assert.ok(/^[ \t]*<div class="log-tools">$/m.test(logs), '.log-tools 必须无条件渲染（不能挂在条件 && 后面）')
+    assert.ok(/^[ \t]*<div class="log-count">\$\{countText\}<\/div>$/m.test(logs), '.log-count 必须无条件渲染')
+    // 顺序：工具条 + 计数在占位日志框之前，首帧就占住 134+19。
+    assert.ok(logs.indexOf('<div class="log-tools">') < logs.indexOf('!data && !err && html`<div class="log-empty"'),
+      '工具条必须排在加载占位之前（否则首帧仍只有占位框）')
+    // 加载态文案：计数行「读取中…」，chips 计数 —（同一组标签，宽度由 CSS 钉住）。
+    assert.ok(logs.includes("'读取中…'"), '加载态计数行必须说明在读')
+    assert.ok(logs.includes("logReady ? n : '—'"), 'chips 计数在数据未到时必须用 —（同一组标签）')
+    assert.ok(logs.includes("const logReady = !!(data && data.status === 'ok')"), '必须显式判定数据是否 ok')
+    // — → 269 的宽度差在 362px 下会把 chip 行挤重排，工具条高度就跟着跳。
+    const nCss = (css.match(/\.log-chip-n\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/display:\s*inline-block/.test(nCss) && /min-width:\s*[\d.]+em/.test(nCss) && /text-align:\s*right/.test(nCss),
+      '.log-chip-n 必须 inline-block + em 定宽 + 右对齐（否则计数从 — 变 269 会重排）')
+  })
+
+  await aok('结构红线: v3.320 过滤规则校验失败定位（只失败且有字段错误时滚到首个错误行）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const fr = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('function App ()'))
+    const effects = [...fr.matchAll(/useLayoutEffect\(\(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\)/g)].map((m) => m[0])
+    const reveal = effects.find((e) => e.includes('[aria-invalid="true"]'))
+    assert.ok(reveal, '失败路径必须有 [aria-invalid="true"] 定位')
+    assert.ok(reveal.includes('focus({ preventScroll: true })'),
+      '必须先聚焦且 preventScroll（否则浏览器自己先滚一次，位置和手工算的打架）')
+    assert.ok(reveal.includes("document.querySelector('.tabs')") && reveal.includes('getBoundingClientRect().height'),
+      '落点必须按 .tabs 实测高度算（吸顶页签会盖住错误行）')
+    assert.ok(reveal.includes('+ 8'), '页签下沿要留 8px')
+    assert.ok(/window\.scrollTo\(0, Math\.max\(0, Math\.min\(top, max\)\)\)/.test(reveal), '落点必须夹进可滚动范围')
+    assert.ok(fr.includes('revealFieldRef.current = errors.length > 0'), '只有确有字段错误的失败才置旗')
+    // 成功路径：res.ok 分支里既不得置旗，也不得出现 aria-invalid 定位。
+    const okAt = fr.indexOf('if (res.ok) {')
+    const okPath = fr.slice(okAt, fr.indexOf('const code = showFailure(res', okAt))
+    assert.ok(okAt > 0 && okPath.length > 0 && !okPath.includes('revealFieldRef') && !okPath.includes('[aria-invalid'),
+      '成功路径不得触发定位/滚动')
+    // 加载失败路径（load 的 catch）同样不得置旗。
+    const loadAt = fr.indexOf('const load = useCallback')
+    const loadPath = fr.slice(loadAt, fr.indexOf('useEffect(() => { load().catch', loadAt))
+    assert.ok(loadAt > 0 && loadPath.length > 0 && !loadPath.includes('revealFieldRef'), '加载失败路径不得触发定位/滚动')
+    assert.ok(!/transition:|animation:/.test(reveal), '定位不得加动画（错位时动画等于二次跳动）')
+  })
+
+  await aok('结构红线: v3.320 分页/搜索落点（共用助手 / 只主动路径 / 分页统一 goPage）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    // 助手：读 .tabs 下沿 + 8，目标夹进 document.scrollHeight - innerHeight，面板隐藏时不滚。
+    const helperAt = src.indexOf('function listLandTarget')
+    assert.ok(helperAt > 0, '必须有一个共用的落点助手（两个面板同一口径）')
+    const helper = src.slice(helperAt, src.indexOf('function RunHistoryPanel', helperAt))
+    assert.ok(helper.includes("document.querySelector('.tabs')"), '落点必须读吸顶页签')
+    assert.ok(helper.includes('getBoundingClientRect().height') && helper.includes('+ 8'), '落点 = .tabs 高度 + 8')
+    assert.ok(!helper.includes('getBoundingClientRect().bottom'), 'pad 不得再用 .tabs 的 bottom（未吸顶时会多算一截偏移）')
+    assert.ok(helper.includes('Math.min(top, max)'), '助手内必须有 Math.min 收口（不能算出文档外的目标）')
+    assert.ok(helper.includes('document.documentElement.scrollHeight - window.innerHeight'), '上限必须按可滚动高度算')
+    assert.ok(helper.includes('if (!(rect.height > 0)) return null'), '面板 hidden/rect 为 0 时不得执行')
+    const pagerOf = (seg) => { const s = seg.slice(seg.indexOf('<div class="pager">')); return s.slice(0, s.indexOf('</div>')) }
+    const msg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel'))
+    const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
+    // 取一个具名函数体（到 2 空格缩进的闭合花括号）：断言只看该函数内部，不被邻居带过。
+    const fnOf = (seg, name) => {
+      const at = seg.indexOf('const ' + name + ' = ')
+      assert.ok(at > 0, '缺少 ' + name)
+      return seg.slice(at, seg.indexOf('\n  }', at) + 4)
+    }
+    for (const [name, seg] of [['推送记录', msg], ['逐轮历史', hist]]) {
+      const goPageFn = fnOf(seg, 'goPage')
+      assert.ok(/if \(n === (?:page|current)\) return/.test(goPageFn), name + '目标页 = 当前页时不得置旗（旗子会悬挂）')
+      assert.ok(goPageFn.includes('armLand()') && /setPage(?:No)?\(n\)/.test(goPageFn), name + '分页必须经 armLand 落点并真的换页')
+      const pager = pagerOf(seg)
+      assert.ok(pager.length > 0, name + '必须有分页器')
+      assert.ok(!pager.includes('setPage('), name + '分页按钮不得再直接 setPage（会绕过落点）')
+      assert.strictEqual((pager.match(/goPage\(/g) || []).length, 4, name + '四个分页按钮都要走 goPage')
+      assert.ok(/useLayoutEffect\(\(\) => \{\s*if \(!landRef\.current\) return[\s\S]*?listLandTarget\(listRef\.current\)/.test(seg),
+        name + '落点必须在 useLayoutEffect（paint 前）执行')
+      assert.ok(seg.includes('listRef') && seg.includes('landRef'), name + '必须有列表 ref 与落点旗')
+      // 裸置旗只允许出现在 armLand 内：分页/筛选/搜索共用同一道「已滚进列表」门。
+      assert.strictEqual((seg.match(/landRef\.current = true/g) || []).length, 1,
+        name + '置旗必须只在 armLand 内（其余路径一律调用 armLand）')
+      const arm = fnOf(seg, 'armLand')
+      assert.ok(/window\.scrollY > listTop/.test(arm), name + '必须有「已滚进列表」门（停在顶部改筛选不得拽列表）')
+      assert.ok(arm.includes("document.querySelector('.tabs')") && arm.includes('getBoundingClientRect().height'),
+        name + '门必须按 .tabs 实测高度算（与 listLandTarget 同口径）')
+      assert.ok(arm.includes('if (!(rect.height > 0)) return'), name + '面板隐藏/rect 为 0 时不得置旗')
+    }
+    // ① 依赖必须同时含 days 与 loading：漏 days ⇒ 第 1 页改时间范围不落（page 不变、effect 不跑）；
+    //    漏 loading ⇒ 响应未回就消费旗子（新页更短时被浏览器二次夹取）。
+    const msgEffectAt = msg.indexOf('useLayoutEffect(() => {')
+    const msgDepsAt = msg.indexOf('}, [', msgEffectAt)
+    const msgEffect = msg.slice(msgEffectAt, msgDepsAt)
+    const msgDeps = msg.slice(msgDepsAt, msg.indexOf('\n', msgDepsAt))
+    for (const dep of ['data', 'loading', 'page', 'size', 'cate', 'days', 'query']) {
+      assert.ok(new RegExp('(\\[|, )' + dep + '(, |\\])').test(msgDeps), '推送记录落点依赖必须包含 ' + dep)
+    }
+    assert.ok(msgEffect.includes('if (loading) return'), '响应未回时必须保留旗子（跨过 loading）')
+    assert.ok(msgEffect.includes('data === armedDataRef.current'), '必须等这次响应落地（data 换过）再落点')
+    assert.ok(msgEffect.indexOf('landRef.current = false') < msgEffect.indexOf('if (y === null) return'),
+      '消费即清旗：listLandTarget 返回 null 时不得重试')
+    const histEffectAt = hist.indexOf('useLayoutEffect(() => {')
+    const histEffect = hist.slice(histEffectAt, hist.indexOf('}, [pageNo', histEffectAt))
+    assert.ok(histEffect.indexOf('landRef.current = false') < histEffect.indexOf('if (y === null) return'),
+      '逐轮历史消费即清旗：返回 null 不重试')
+    // 旗只由主动路径置：纯 load()/自动刷新不搬滚动位置。
+    const msgRefresh = msg.slice(msg.indexOf('const refreshNow = () => {'), msg.indexOf('const [exporting'))
+    assert.ok(msgRefresh.includes('load().catch') && !msgRefresh.includes('landRef'), '推送记录纯刷新不得搬滚动位置')
+    const histRefresh = hist.slice(hist.indexOf('const refresh = () =>'), hist.indexOf('const changeDay'))
+    assert.ok(histRefresh.includes('load().catch') && !histRefresh.includes('landRef'), '逐轮历史刷新不得搬滚动位置')
+    // 主动路径逐个点名：改每页 / 改分类 / 改时间都走同一个带门的 armLand。
+    for (const frag of ['armLand(); setSize(Number(v)); setPage(1)', 'armLand(); setCate(v); setPage(1)', 'armLand(); setDays(Number(v)); setPage(1)']) {
+      assert.ok(msg.includes(frag), '推送记录主动筛选必须置落点旗：' + frag)
+    }
+    // ④ 逐轮历史只在值真变化时置旗：已选中的 chip / 同一天 / 同一页都不得留旗。
+    assert.ok(/const changeMode = \(m\) => \{\s*if \(m === mode\) return/.test(hist), '已选中的 chip 不得再置旗')
+    assert.strictEqual((hist.match(/changeMode\('/g) || []).length, 3, '三个 chip 都必须走 changeMode')
+    assert.ok(!/onClick=\$\{\(\) => \{ landRef\.current = true/.test(hist), 'chip 不得裸置旗')
+    assert.ok(/const changeDay = \(v\) => \{\s*if \(v === day\) return/.test(hist), '日期没变不得置旗')
+    assert.ok(/const changeSize = \(n\) => \{\s*if \(n === size\) return/.test(hist), '每页条数没变不得置旗')
+    // ③ 搜索落点：不得再看 activeElement（防抖触发时焦点必然还在输入框 ⇒ 主路径永不落点），
+    //    只在词真的变了时置旗；「已滚进列表」门保留在 armLand 里。
+    assert.ok(!msg.includes('document.activeElement'), '搜索落点不得再看 activeElement（那道门让主路径不可达）')
+    const debounceAt = msg.indexOf('const t = setTimeout')
+    const debounce = msg.slice(debounceAt, msg.indexOf('}, 300)', debounceAt))
+    assert.ok(debounce.includes('next !== queryRef.current') && debounce.includes('armLand()'),
+      '搜索落点必须在防抖里按「词真的变了」置旗')
+  })
+
+  // ── v3.320 终评 must-fix：失败路径的落点旗清不掉（settle 代数）+ 5 个便宜修复 ──────
+  await aok('结构红线: v3.320 落点失败清旗（结算代数 / 失败不滚）与分页/占位细节', () => {
+    const read = (f) => fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', f), 'utf8')
+    const src = read('app.js')
+    const css = read('app.css')
+    const loader = src.slice(src.indexOf('function usePanelLoader'), src.indexOf('function usePanelAutoLoad'))
+    // 失败时 hook 只写 err、不动 data：只比 data 引用会永远等不到「这次响应落地」，
+    // 所以必须有一个成功/失败都会推进的结算代数。
+    assert.ok(/const \[settleTick, setSettleTick\] = useState\(0\)/.test(loader), 'usePanelLoader 必须有结算代数 state')
+    const catchBlock = loader.slice(loader.indexOf('} catch (e) {'), loader.indexOf('} finally {'))
+    assert.ok(catchBlock.length > 0 && !catchBlock.includes('setData('), '失败分支不得改 data（故 data 引用不能当落地信号）')
+    assert.ok(/setSettleTick\(\(t\) => t \+ 1\)[ \t]*\n[ \t]*setLoading\(false\)/.test(loader),
+      '成功与失败都要推进结算代数，且与 setLoading(false) 同批（不多一次渲染）')
+    assert.ok(/return \{ data, err, load, loading, settleTick \}/.test(loader), '结算代数必须暴露给调用方')
+
+    const msg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel'))
+    const effectAt = msg.indexOf('useLayoutEffect(() => {')
+    const depsAt = msg.indexOf('}, [', effectAt)
+    const effect = msg.slice(effectAt, depsAt)
+    const deps = msg.slice(depsAt, msg.indexOf('\n', depsAt))
+    // ① 只改 err 不换 data 时也算一次「结算」：依赖漏 settleTick ⇒ 失败后 effect 不跑、旗子留着。
+    assert.ok(/(\[|, )settleTick(, |\])/.test(deps), '落点 effect 依赖必须包含 settleTick')
+    // ② 置旗时记代数；消费要求代数前进（未结算 ⇒ 保留旗子）。
+    const armAt = msg.indexOf('const armLand = ')
+    const arm = msg.slice(armAt, msg.indexOf('\n  }', armAt) + 4)
+    assert.ok(arm.includes('armedSettleRef.current = settleTick'), '置旗时必须记下当时的结算代数')
+    assert.ok(effect.includes('settleTick > armedSettleRef.current'), '消费必须以结算代数前进为条件')
+    assert.ok(effect.indexOf('settleTick > armedSettleRef.current') < effect.indexOf('landRef.current = false'),
+      '代数未前进时必须先 return（保留旗子），不得提前清旗')
+    assert.ok(arm.includes('armedSeqRef.current = loadSeqRef.current') && effect.includes('loadSeqRef.current > armedSeqRef.current'),
+      '置旗前就在飞的旧请求先回包不得抢消费（按请求号再挡一道）')
+    // ③ 失败：清旗要在消费块里（err 判断之前），且 err 判断必须在 scrollTo 之前 ⇒ 只清旗不滚。
+    assert.ok(effect.indexOf('landRef.current = false') < effect.indexOf('if (err) return'),
+      '失败分支也必须清旗（否则跨过失败留到下一次成功，把用户拽到列表顶）')
+    assert.ok(effect.indexOf('if (err) return') < effect.indexOf('window.scrollTo'),
+      '失败分支不得滚动：err 判断必须在 scrollTo 之前')
+    assert.ok(!/if \(data === armedDataRef\.current\) return/.test(effect),
+      '不得再单靠 data 引用判断落地（失败时 data 不变 ⇒ 清旗不可达）')
+
+    // ④ 两处分页四个按钮都要 || loading：连点第二个请求会顶掉第一个的响应。
+    const pagerOf = (seg) => { const s = seg.slice(seg.indexOf('<div class="pager">')); return s.slice(0, s.indexOf('</div>')) }
+    const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
+    for (const [name, seg] of [['推送记录', msg], ['逐轮历史', hist]]) {
+      const pager = pagerOf(seg)
+      assert.ok(pager.length > 0, name + '必须有分页器')
+      assert.strictEqual((pager.match(/\|\| loading/g) || []).length, 4, name + '四个分页按钮都必须 || loading（防连点）')
+    }
+
+    // ⑤ 分类弹层选中当前值不回调（同 MiniSelect 的值守卫）。
+    const cateSeg = src.slice(src.indexOf('function CategoryPicker'), src.indexOf('function MessagesPanel'))
+    const chooseFn = cateSeg.slice(cateSeg.indexOf('const choose = (name) => {'), cateSeg.indexOf('const pick = (o) =>'))
+    assert.ok(chooseFn.includes('if (name !== value) onChange(name)'), 'CategoryPicker 必须有值守卫（同值不 onChange）')
+
+    // ⑥ 日志首次加载失败也要同高占位：错误路径不得让 520px 日志框整体消失。
+    const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
+    assert.ok(/err && !data && html`<div class="log-empty" role="status">日志读取失败/.test(logs),
+      'err && !data 时必须渲染「日志读取失败」占位（.log-empty 同高）')
+
+    // ⑦ chip 计数 6 位不重排（1MiB 全是换行也有 7 位，5em 留余量）。
+    const nCss = (css.match(/\.log-chip-n\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/min-width:\s*5em/.test(nCss), '.log-chip-n min-width 必须 5em（6 位计数不重排）')
+    assert.ok(!/min-width:\s*(2\.4|3\.2)em/.test(nCss), '旧的 2.4em / 3.2em 必须改掉')
+
+    // ⑧ 回车/刷新直接生效搜索词时也要置旗（否则防抖随后看到词已生效，主路径漏落点）。
+    assert.ok(msg.includes('if (q !== query) { armLand(); setQuery(q); setPage(1); return }'),
+      'refreshNow 在词变化时必须 armLand（回车/刷新也要落点）')
+
+    // ⑨ 请求飞行期间用户自己滚动时撤销落点（浏览器夹取/锚定不算）。
+    assert.ok(arm.includes('userMovedRef.current = false'), '置旗时必须复位用户滚动标记')
+    assert.ok(effect.includes('if (userMovedRef.current) return'), '消费前必须检测用户是否自己滚走')
+    assert.ok(msg.includes('useLandScrollCancel(landRef, userMovedRef)'), '必须接入用户滚动取消 hook')
+    assert.ok(src.includes("window.addEventListener('touchmove', mark"), 'hook 里必须有 touchmove/wheel 监听')
+
+    // ⑩ 逐轮历史切模式要等重拉结算；空结果也要保留 listRef（否则无法落点）。
+    const hEffectAt = hist.indexOf('useLayoutEffect(() => {')
+    const hEffect = hist.slice(hEffectAt, hist.indexOf('}, [', hEffectAt))
+    assert.ok(hist.includes('asyncLandRef.current = true'), '切模式必须标记为异步落点')
+    assert.ok(hEffect.includes('if (loading) { sawLoadingRef.current = true; return }'), '异步落点必须等 loading 开始')
+    assert.ok(hEffect.includes('if (!sawLoadingRef.current) return'), '重拉未开始的那一帧不得落点')
+    assert.ok(hEffect.includes('if (userMovedRef.current) return'), '逐轮历史也要防用户自己滚走')
+    assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
+    assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
+
+    // 版本没 bump：注释里的版本号只能是 v3.320。
+    assert.ok(!/v3\.321/.test(src), 'app.js 注释不得写 v3.321（版本未 bump）')
+    assert.ok(!/v3\.321/.test(css), 'app.css 注释不得写 v3.321（版本未 bump）')
   })
 }
 

@@ -1579,6 +1579,43 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
 const RUN_PAGE_SIZES = [10, 20, 50, 100]
 const RUN_FETCH_LIMIT = 200
 
+// ── 列表落点（v3.320）──────────────────────────────────────────────────────
+// 推送记录 / 逐轮历史的列表都比一屏长，分页器在列表底部：用户翻页时人已经在底部，
+// 新一页更短时浏览器会把 scrollY 夹进新的可滚动范围（document.scrollHeight 变小），
+// 于是停在短页的中间甚至末行，看不到第一行。搜索落地同理（结果集变小）。
+// 统一落点 = 列表容器顶部 − 吸顶页签高度 + 8，再夹进
+// document.scrollHeight − innerHeight；返回 null 表示别滚（未挂载 / 面板隐藏时
+// rect 全为 0 / 列表不在屏幕上），调用方据此跳过。
+// pad 用 .tabs 的 height 而不是 bottom：页签还没吸顶时 bottom 会多算它自己的页面
+// 偏移，落点比过滤定位/搜索门的「列表顶」偏低一个页签的距离。
+function listLandTarget (el) {
+  if (!el) return null
+  const rect = el.getBoundingClientRect()
+  if (!(rect.height > 0)) return null
+  const tabs = document.querySelector('.tabs')
+  const pad = (tabs ? tabs.getBoundingClientRect().height : 0) + 8
+  const top = rect.top + window.scrollY - pad
+  const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+  return Math.max(0, Math.min(top, max))
+}
+
+// 落点请求在飞时，只有用户自己滚动才撤销；浏览器夹取/滚动锚定不会触发这些事件。
+function useLandScrollCancel (landRef, movedRef) {
+  useEffect(() => {
+    const mark = () => { if (landRef.current) movedRef.current = true }
+    const keys = ['PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown', ' ']
+    const onKey = (e) => { if (keys.includes(e.key)) mark() }
+    window.addEventListener('wheel', mark, { passive: true })
+    window.addEventListener('touchmove', mark, { passive: true })
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('wheel', mark)
+      window.removeEventListener('touchmove', mark)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [landRef, movedRef])
+}
+
 function RunHistoryPanel ({ onOpenLog, active = true }) {
   const [size, setSize] = useState(10)
   // 默认只看真实轮次：取消留痕是操作审计，不该在每次打开历史时占据一半行。
@@ -1596,6 +1633,37 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   const jumpTimerRef = useRef(0)
   useEffect(() => () => clearTimeout(jumpTimerRef.current), [])
   const seqRef = useRef(0)
+  // v3.320：分页/筛选后把列表顶部拉回页签下沿的落点旗（见 listLandTarget）。
+  // 只有用户主动改页/改每页/改分类/改时间时置位；纯 load() 与自动刷新不置。
+  const listRef = useRef(null)
+  const landRef = useRef(false)
+  // 置旗那一刻的位置与数据：模式切换要等自动加载的响应落地才落点；
+  // 请求飞行期间用户自己滚走（非浏览器夹取）则撤销这次落点。
+  const armedDataRef = useRef(undefined)
+  const armedErrRef = useRef('')
+  const asyncLandRef = useRef(false)
+  const sawLoadingRef = useRef(false)
+  const userMovedRef = useRef(false)
+  // 「已滚进列表」门：列表顶还在页签下沿之下（用户停在顶部改筛选）时不置旗——
+  // 否则会把列表顶拽到页签下沿，工具条被顶出视口。口径与 listLandTarget 一致
+  // （.tabs 实测高度 + 8）。
+  const armLand = () => {
+    const el = listRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (!(rect.height > 0)) return
+    const tabs = document.querySelector('.tabs')
+    const tabsH = tabs ? tabs.getBoundingClientRect().height : 0
+    const listTop = rect.top + window.scrollY - tabsH - 8
+    if (!(window.scrollY > listTop)) return
+    landRef.current = true
+    armedDataRef.current = data
+    armedErrRef.current = err
+    asyncLandRef.current = false
+    sawLoadingRef.current = false
+    userMovedRef.current = false
+  }
+  useLandScrollCancel(landRef, userMovedRef)
 
   const load = useCallback(async () => {
     const seq = ++seqRef.current
@@ -1624,12 +1692,50 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   useEffect(() => { if (pageNo > pages) setPageNo(pages) }, [pageNo, pages])
   const shown = filtered.slice((current - 1) * size, current * size)
   const changeSize = (n) => {
-    if (n === size) return
+    if (n === size) return // 值没变不置旗：旗子悬着会在下一次响应落地时替旧操作搬位置
+    armLand()
     setSize(n)
     setPageNo(1)
   }
+  // refresh() 是「重新加载当前页」，不搬滚动位置；只有用户主动改页/改每页/改分类/
+  // 改日期才置落点旗。
   const refresh = () => { setPageNo(1); load().catch(() => {}) }
-  const changeDay = (v) => { setDay(v); setPageNo(1) }
+  const changeDay = (v) => {
+    if (v === day) return
+    armLand()
+    setDay(v)
+    setPageNo(1)
+  }
+  const changeMode = (m) => {
+    if (m === mode) return // 已选中的 chip 再点一次不搬位置
+    armLand()
+    asyncLandRef.current = true // 切模式会重拉 run.log，必须等响应落地再落点
+    setMode(m)
+    setPageNo(1)
+  }
+  const goPage = (n) => {
+    if (n === current) return // 目标页 = 当前页：不置旗（否则残留的旗会替下一次操作落点）
+    armLand()
+    setPageNo(n)
+  }
+  // v3.320：在 paint 前落点（旧版换页后页高变化，浏览器把 scrollY 夹到新的上限，
+  // 停在短页中间）。listLandTarget 在面板隐藏/列表不在时返回 null ⇒ 不滚。
+  // 消费即清旗：返回 null 也不再重试（否则旗子会挂到下一次操作上）。
+  useLayoutEffect(() => {
+    if (!landRef.current) return
+    if (asyncLandRef.current) {
+      if (loading) { sawLoadingRef.current = true; return } // 重拉已开始，等结算
+      if (!sawLoadingRef.current) return // 重拉还没开始：这一帧是旧数据，不能落点
+    }
+    landRef.current = false
+    asyncLandRef.current = false
+    sawLoadingRef.current = false
+    // 请求飞行期间用户自己滚动时撤销落点，别把人拽回列表顶（夹取/锚定不算）。
+    if (userMovedRef.current) return
+    const y = listLandTarget(listRef.current)
+    if (y === null) return
+    window.scrollTo(0, y)
+  }, [data, loading, err, pageNo, size, mode, day])
   const jumpLog = (r) => {
     if (!onOpenLog || typeof r.at !== 'string' || r.at.length < 10) return
     const key = `${r.at}-${r.lineNo}`
@@ -1679,11 +1785,11 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     ${data && data.status === 'ok' && html`<div class="run-tools">
       <div class="log-chips" role="group" aria-label="逐轮筛选">
         <button type="button" class=${'log-chip' + (mode === 'all' ? ' on' : '')}
-          aria-pressed=${mode === 'all' ? 'true' : 'false'} onClick=${() => { setMode('all'); setPageNo(1) }}>${mode === 'all' ? `全部 ${all.length}` : '全部'}</button>
+          aria-pressed=${mode === 'all' ? 'true' : 'false'} onClick=${() => changeMode('all')}>${mode === 'all' ? `全部 ${all.length}` : '全部'}</button>
         <button type="button" class=${'log-chip' + (mode === 'runs' ? ' on' : '')}
-          aria-pressed=${mode === 'runs' ? 'true' : 'false'} onClick=${() => { setMode('runs'); setPageNo(1) }}>仅运行 ${runsCount}</button>
+          aria-pressed=${mode === 'runs' ? 'true' : 'false'} onClick=${() => changeMode('runs')}>仅运行 ${runsCount}</button>
         <button type="button" class=${'log-chip' + (mode === 'issue' ? ' on' : '')}
-          aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => { setMode('issue'); setPageNo(1) }}>${mode === 'runs' ? '只看异常' : `只看异常 ${issueCount}`}</button>
+          aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => changeMode('issue')}>${mode === 'runs' ? '只看异常' : `只看异常 ${issueCount}`}</button>
       </div>
       <label class="run-day">
         <span>日期</span>
@@ -1694,7 +1800,9 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     </div>`}
     ${data && data.status && data.status !== 'ok' && html`<div class="empty">run.log${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
     ${!data && !err && html`<div class="empty">加载中…</div>`}
-    ${shown.length > 0 && html`<div class="runs-scroll"><table class="runs-table">
+    ${data && data.status === 'ok' && html`<div class="runs-scroll" ref=${listRef}>
+      ${shown.length > 0
+        ? html`<table class="runs-table">
       <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
       <tbody>
         ${shown.map((r, i) => html`<tr key=${`${r.at}-${r.lineNo}-${i}`}>
@@ -1714,14 +1822,15 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
                 : '日志'}</button></td>
         </tr>`)}
       </tbody>
-    </table></div>`}
-    ${data && data.status === 'ok' && filtered.length === 0 && html`<div class="empty">${all.length === 0 ? '日志尾窗内没有摘要行' : '没有匹配的轮次'}</div>`}
+    </table>`
+        : html`<div class="empty">${all.length === 0 ? '日志尾窗内没有摘要行' : '没有匹配的轮次'}</div>`}
+    </div>`}
     ${filtered.length > 0 && html`<div class="pager">
-      <${Button} disabled=${current <= 1 || loading} onClick=${() => setPageNo(1)}>« 首页<//>
-      <${Button} disabled=${current <= 1 || loading} onClick=${() => setPageNo(current - 1)}>上一页<//>
+      <${Button} disabled=${current <= 1 || loading} onClick=${() => goPage(1)}>« 首页<//>
+      <${Button} disabled=${current <= 1 || loading} onClick=${() => goPage(current - 1)}>上一页<//>
       <span class="pager-info">第 ${current} / ${pages} 页 · 共 ${filtered.length} 条</span>
-      <${Button} disabled=${current >= pages || loading} onClick=${() => setPageNo(current + 1)}>下一页<//>
-      <${Button} disabled=${current >= pages || loading} onClick=${() => setPageNo(pages)}>末页 »<//>
+      <${Button} disabled=${current >= pages || loading} onClick=${() => goPage(current + 1)}>下一页<//>
+      <${Button} disabled=${current >= pages || loading} onClick=${() => goPage(pages)}>末页 »<//>
     </div>`}
   </div>`
 }
@@ -1740,6 +1849,10 @@ function usePanelLoader (apiFn, onLoaded, initialData = null) {
   const [data, setData] = useState(initialData)
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
+  // v3.320：结算代数——每次最新一次 load 收尾（成功或失败）都 +1，与 setLoading(false) 同批。
+  // 失败时只写 err、data 保持旧值，调用方只比 data 引用会永远等不到「这次响应落地」；
+  // 有了代数就能区分「还没结算」与「结算完但数据没变」，错误路径的旗子才清得掉。
+  const [settleTick, setSettleTick] = useState(0)
   const seqRef = useRef(0) // 竞态守卫：只应用「最新一次 load」的响应（审查 Sourcery PR#227）
   const mountedRef = useRef(true) // 卸载后旧请求仍可能回包：不得再写父页时间戳（PR#253）
   useEffect(() => () => { mountedRef.current = false }, [])
@@ -1756,10 +1869,13 @@ function usePanelLoader (apiFn, onLoaded, initialData = null) {
       if (seq !== seqRef.current || !mountedRef.current) return
       setErr(`加载失败：${e.message}`)
     } finally {
-      if (seq === seqRef.current && mountedRef.current) setLoading(false)
+      if (seq === seqRef.current && mountedRef.current) {
+        setSettleTick((t) => t + 1)
+        setLoading(false)
+      }
     }
   }, [apiFn, onLoaded])
-  return { data, err, load, loading }
+  return { data, err, load, loading, settleTick }
 }
 
 // 页签保活 + 首屏预加载：面板即使还没被点开（active=false）也先拉一次，
@@ -2224,7 +2340,8 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
     }, 0)
   }
   const choose = (name) => {
-    onChange(name)
+    // 值守卫（同 MiniSelect）：点中的就是当前分类时不回调，避免一次无意义的筛选重拉。
+    if (name !== value) onChange(name)
     setOpen(false)
     setQ('')
     if (btnRef.current) btnRef.current.focus({ preventScroll: true })
@@ -2331,9 +2448,53 @@ function MessagesPanel ({ onSync, active = true }) {
   // loadedQueryRef 只在「最新一次请求」回包时记录它对应的 query。
   const loadedQueryRef = useRef('')
   const loadSeqRef = useRef(0)
+  // v3.320：列表落点（见 listLandTarget）。listRef 指列表外层容器，landRef 只由用户
+  // 主动改页/改每页/改分类/改时间/搜索词落地时置位；queryRef 供防抖里判断词真变了。
+  const listRef = useRef(null)
+  const landRef = useRef(false)
+  // 置旗那一刻的 data：服务端分页要等「这次请求的响应」落地才落点，不能拿旧页的
+  // 高度先滚一次（新页更短时浏览器还会二次夹取）。data 引用变了才算落地。
+  // 失败时 data 引用不变，故同时记「结算代数」：load 收尾（成功或失败）才 +1，
+  // 代数没前进就是响应还没来——旗子必须留着，不能拿旧数据先滚一次。
+  const armedDataRef = useRef(undefined)
+  const armedSettleRef = useRef(0)
+  const userMovedRef = useRef(false)
+  // 置旗那一刻已发出的请求号（fetchMessages 里自增）：只有当「置旗后才发出的请求」结算时
+  // 才允许消费——否则置旗前就在飞的旧请求先回包，会拿旧筛选的结果抢着落点。
+  const armedSeqRef = useRef(0)
+  const queryRef = useRef(query)
+  queryRef.current = query
+  const dataRef = useRef(null)
+  // 落点门（v3.320）：只有用户已经滚进列表（列表顶已在页签下沿之上）才置旗——
+  // 停在顶部改筛选/搜索时把列表顶拽到页签下沿，工具条会被顶出视口。
+  // 面板隐藏/列表不在（rect 为 0）⇒ 不置旗。口径与 listLandTarget 一致。
+  const armLand = () => {
+    const el = listRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (!(rect.height > 0)) return
+    const tabs = document.querySelector('.tabs')
+    const tabsH = tabs ? tabs.getBoundingClientRect().height : 0
+    const listTop = rect.top + window.scrollY - tabsH - 8
+    if (!(window.scrollY > listTop)) return
+    landRef.current = true
+    armedDataRef.current = dataRef.current
+    armedSettleRef.current = settleTick
+    armedSeqRef.current = loadSeqRef.current
+    userMovedRef.current = false
+  }
+  useLandScrollCancel(landRef, userMovedRef)
   // 搜索防抖：输入停 300ms 才真正改 query；页码重置跟随 query 的真实变化。
+  // 落点旗只能在这里置：防抖触发时焦点必然还在输入框（原先看 activeElement 会让
+  // 主路径永不落点），所以只按「已滚进列表」判断，滚动等这次响应落地后再做。
   useEffect(() => {
-    const t = setTimeout(() => { setQuery(input.trim()) }, 300)
+    const t = setTimeout(() => {
+      const next = input.trim()
+      if (next !== queryRef.current) {
+        armLand()
+        setQuery(next)
+      }
+    }, 300)
     return () => clearTimeout(t)
   }, [input])
   // 只有 query 真的变了才回第 1 页；只加/减空白时 query 不变，刷新不应把用户踢回首页。
@@ -2348,7 +2509,9 @@ function MessagesPanel ({ onSync, active = true }) {
       })
     },
     [page, size, cate, query, days])
-  const { data, err, load, loading } = usePanelLoader(fetchMessages, onSync)
+  const { data, err, load, loading, settleTick } = usePanelLoader(fetchMessages, onSync)
+  // armLand 需要「点击那一刻的 data」做前后对比；渲染期同步，避免闭包拿到旧值。
+  dataRef.current = data
   // 保活后每次切回本页都静默拉一次新数据：旧列表留在原地（loading 不会清 data），
   // 只更新内容，不出现「加载中…」占位。离开本页时不拉。
   usePanelAutoLoad(active, load)
@@ -2359,11 +2522,37 @@ function MessagesPanel ({ onSync, active = true }) {
       setPage(data.pages)
     }
   }, [data, page])
+  // v3.320：主动操作后（paint 前）把列表顶部落到吸顶页签下沿——旧版换页时页高变化，
+  // 浏览器把 scrollY 夹到新的上限，用户停在短页中间/底部。纯 load()、自动刷新、不置旗 ⇒ 不搬用户的位置。
+  // 服务端分页：置旗那一帧 data 还是旧页，先落点会在新页更短时被浏览器二次夹取；
+  // 旗子跨过 loading 保留，等这次响应结算（settleTick 前进 + loading=false）再消费一次。
+  // 失败时 data 引用不变，只比 data 会永远等下去（旗子跨过失败留到下一次成功 = 把用户拽到列表顶）。
+  useLayoutEffect(() => {
+    if (!landRef.current) return
+    if (loading) return // 响应未回：保留旗子
+    if (!(settleTick > armedSettleRef.current)) return // 这次响应还没结算：继续等（含失败前）
+    if (!(loadSeqRef.current > armedSeqRef.current)) return // 结算的是置旗前的旧请求：不能拿它落点
+    if (data === armedDataRef.current && !err) return // 仍是置旗前那份数据：继续等
+    landRef.current = false
+    armedDataRef.current = undefined
+    if (err) return // 请求失败：新数据不会来了，清旗不重试，更不滚动
+    // 请求飞行期间用户自己滚动时撤销落点（夹取/锚定不算）。
+    if (userMovedRef.current) return
+    const y = listLandTarget(listRef.current)
+    if (y === null) return
+    window.scrollTo(0, y)
+  }, [data, loading, err, settleTick, page, size, cate, days, query])
+  // 分页统一入口：只有用户点分页才置落点旗；目标页 = 当前页不置（否则旗子悬挂）。
+  const goPage = (n) => {
+    if (n === page) return
+    armLand()
+    setPage(n)
+  }
   // 搜索框回车 / 刷新前先把未落地的输入立刻生效，避免「刚打完字点刷新，还是旧结果」。
   // 只有搜索词变了才回第 1 页；没改词时刷新当前页，不应把用户踢回首页（审查 #246 可选）。
   const refreshNow = () => {
     const q = input.trim()
-    if (q !== query) { setQuery(q); setPage(1); return }
+    if (q !== query) { armLand(); setQuery(q); setPage(1); return }
     load().catch(() => {})
   }
   const [exporting, setExporting] = useState('') // '' | 'csv' | 'json'：加载态防连点（两按钮共用一闸）
@@ -2458,7 +2647,7 @@ function MessagesPanel ({ onSync, active = true }) {
         onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); refreshNow() } }} />
       <${CategoryPicker} value=${cate} categories=${categories}
         total=${cateTotal} pageActive=${active}
-        onChange=${(v) => { setCate(v); setPage(1) }} />
+        onChange=${(v) => { armLand(); setCate(v); setPage(1) }} />
       <${MiniSelect} value=${String(days)} ariaLabel="时间范围"
         options=${[
           { value: '0', label: '全部时间' },
@@ -2467,10 +2656,10 @@ function MessagesPanel ({ onSync, active = true }) {
           { value: '7', label: '近 7 天' },
           { value: '30', label: '近 30 天' }
         ]}
-        onChange=${(v) => { setDays(Number(v)); setPage(1) }} />
+        onChange=${(v) => { armLand(); setDays(Number(v)); setPage(1) }} />
       <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
         options=${[10, 20, 50, 100].map((n) => ({ value: String(n), label: `每页 ${n} 条` }))}
-        onChange=${(v) => { setSize(Number(v)); setPage(1) }} />
+        onChange=${(v) => { armLand(); setSize(Number(v)); setPage(1) }} />
       <${Button} variant="ghost" disabled=${loading} onClick=${refreshNow}>${loading ? '刷新中…' : '刷新'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
@@ -2480,7 +2669,7 @@ function MessagesPanel ({ onSync, active = true }) {
     ${exportNote && html`<${Hint}>${exportNote}<//>`}
     ${loading && !data && html`<div class="empty">加载中…</div>`}
     ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<${Hint}>正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）<//>` : ''}</div>`}
-    ${data && data.status === 'ok' && html`<div>
+    ${data && data.status === 'ok' && html`<div ref=${listRef}>
       <div class="msg-count" aria-live="polite">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}${loading ? html`<span class="msg-loading"> · 更新中…</span>` : ''}</div>
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
@@ -2505,11 +2694,11 @@ function MessagesPanel ({ onSync, active = true }) {
           </div>`)}
         </div>`}
       <div class="pager">
-        <${Button} disabled=${page <= 1} onClick=${() => setPage(1)}>« 首页<//>
-        <${Button} disabled=${page <= 1} onClick=${() => setPage(page - 1)}>上一页<//>
+        <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(1)}>« 首页<//>
+        <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(page - 1)}>上一页<//>
         <span class="pager-info">第 ${data.page} / ${data.pages} 页</span>
-        <${Button} disabled=${page >= data.pages} onClick=${() => setPage(page + 1)}>下一页<//>
-        <${Button} disabled=${page >= data.pages} onClick=${() => setPage(data.pages)}>末页 »<//>
+        <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(page + 1)}>下一页<//>
+        <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(data.pages)}>末页 »<//>
       </div>
     </div>`}
   </div>`
@@ -2717,44 +2906,53 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
       }${i === last ? '' : '\n'}</span>`
     })
   }, [filtered, q, focusAt])
+  // v3.320：工具条与计数行不再等数据。旧版整块挂在 ok 分支里：首帧只有「读取中」占位
+  // （panel 583），数据到达后筛选栏凭空插进来（+134）再加计数行（+19），日志框连下半页
+  // 一起被推走 153px。现在 chips 用同一组标签、计数先显示 —，计数行显示「读取中…」。
+  const logReady = !!(data && data.status === 'ok')
+  const countText = logReady ? countLine : ((data || err) ? '—' : '读取中…')
   return html`<div class="panel">
     <${PanelHead} title="运行日志" sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
       right=${html`<${Button} variant="ghost" onClick=${refreshNow}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
-    ${data && data.status !== 'ok' && html`<div class="empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
-    ${data && data.status === 'ok' && html`<div>
-      ${focusMode === 'day' && html`<div class="log-focus" role="status">
-        <span class="log-focus-text">已定位：<span class="log-focus-time">${focusAt}</span> 这一轮${focusHits > 1 ? `（同秒 ${focusHits} 行，均已高亮）` : ''}</span>
-        <button type="button" class="log-chip" onClick=${() => { focusDoneRef.current = ''; setQ(focusAt) }}>只看这一轮</button>
-      </div>`}
-      ${focusMode === 'only' && html`<div class="log-focus" role="status">
-        <span class="log-focus-text">只看：<span class="log-focus-time">${focusAt}</span> 这一轮</span>
-        <button type="button" class="log-chip" onClick=${() => { focusDoneRef.current = ''; setQ(focusDate) }}>看当天全部</button>
-      </div>`}
-      ${focusMiss && html`<div class="log-focus log-focus-miss" role="status">
-        <span class="log-focus-text">这一轮不在当前日志尾部（可能已轮转），下面只显示当天其他轮次</span>
-      </div>`}
-      ${focusHeavy && html`<div class="log-focus log-focus-miss" role="status">
-        <span class="log-focus-text">当天日志超过 ${LOG_HIGHLIGHT_MAX} 行，整行高亮已关闭</span>
-        <button type="button" class="log-chip" onClick=${() => { stickRef.current = true; setQ(focusAt) }}>只看这一轮</button>
-      </div>`}
-      <div class="log-tools">
-        <div class="log-chips" role="group" aria-label="日志筛选">
-          ${LOG_MODES.map(([key, label, n]) => html`
-            <button type="button" key=${key} class=${'log-chip' + (mode === key ? ' on' : '')}
-              aria-pressed=${mode === key ? 'true' : 'false'} onClick=${() => pickMode(key)}>${label} ${n}</button>`)}
-        </div>
-        <input class="msg-search log-search" type="search" placeholder="搜索日志…" aria-label="搜索日志"
-          value=${q} onInput=${(e) => { stickRef.current = true; setFocusDismissed(true); setQ(e.target.value) }} />
-      </div>
-      <div class="log-count">${countLine}</div>
-      ${filtered.length === 0
-        ? html`<div class="log-empty" role="status">
-          <div class="log-empty-text">${emptyText}</div>
-          ${mode !== 'all' && html`<button type="button" class="log-chip" onClick=${searchAllLogs}>在全部日志中搜索</button>`}
-        </div>`
-        : html`<pre class="logpre logpre-main" ref=${preRef} onScroll=${onLogScroll}>${heavy ? shownText : lineNodes}</pre>`}
+    ${/* v3.320：首帧就按最终高度占位（.log-empty 与 .logpre-main 同高）。旧版首帧只有
+         90px，数据到达后 .logpre 一次性出现（776px），文档高度突跳一次。 */ ''}
+    ${logReady && focusMode === 'day' && html`<div class="log-focus" role="status">
+      <span class="log-focus-text">已定位：<span class="log-focus-time">${focusAt}</span> 这一轮${focusHits > 1 ? `（同秒 ${focusHits} 行，均已高亮）` : ''}</span>
+      <button type="button" class="log-chip" onClick=${() => { focusDoneRef.current = ''; setQ(focusAt) }}>只看这一轮</button>
     </div>`}
+    ${logReady && focusMode === 'only' && html`<div class="log-focus" role="status">
+      <span class="log-focus-text">只看：<span class="log-focus-time">${focusAt}</span> 这一轮</span>
+      <button type="button" class="log-chip" onClick=${() => { focusDoneRef.current = ''; setQ(focusDate) }}>看当天全部</button>
+    </div>`}
+    ${logReady && focusMiss && html`<div class="log-focus log-focus-miss" role="status">
+      <span class="log-focus-text">这一轮不在当前日志尾部（可能已轮转），下面只显示当天其他轮次</span>
+    </div>`}
+    ${logReady && focusHeavy && html`<div class="log-focus log-focus-miss" role="status">
+      <span class="log-focus-text">当天日志超过 ${LOG_HIGHLIGHT_MAX} 行，整行高亮已关闭</span>
+      <button type="button" class="log-chip" onClick=${() => { stickRef.current = true; setQ(focusAt) }}>只看这一轮</button>
+    </div>`}
+    <div class="log-tools">
+      <div class="log-chips" role="group" aria-label="日志筛选">
+        ${LOG_MODES.map(([key, label, n]) => html`
+          <button type="button" key=${key} class=${'log-chip' + (mode === key ? ' on' : '')}
+            aria-pressed=${mode === key ? 'true' : 'false'} onClick=${() => pickMode(key)}>${label} <span class="log-chip-n">${logReady ? n : '—'}</span></button>`)}
+      </div>
+      <input class="msg-search log-search" type="search" placeholder="搜索日志…" aria-label="搜索日志"
+        value=${q} onInput=${(e) => { stickRef.current = true; setFocusDismissed(true); setQ(e.target.value) }} />
+    </div>
+    <div class="log-count">${countText}</div>
+    ${!data && !err && html`<div class="log-empty" role="status">日志读取中…</div>`}
+    ${/* v3.320：首次加载就失败时也给同高占位。旧版错误路径只有顶部 Hint，520px 日志框
+         整个消失，跳转/切页后页面高度反向塌一次。 */ ''}
+    ${err && !data && html`<div class="log-empty" role="status">日志读取失败</div>`}
+    ${data && data.status !== 'ok' && html`<div class="log-empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
+    ${logReady && (filtered.length === 0
+      ? html`<div class="log-empty" role="status">
+        <div class="log-empty-text">${emptyText}</div>
+        ${mode !== 'all' && html`<button type="button" class="log-chip" onClick=${searchAllLogs}>在全部日志中搜索</button>`}
+      </div>`
+      : html`<pre class="logpre logpre-main" ref=${preRef} onScroll=${onLogScroll}>${heavy ? shownText : lineNodes}</pre>`)}
   </div>`
 }
 
@@ -2807,30 +3005,43 @@ function SysPanel ({ onReady, active = true }) {
   }
   const logItems = access && Array.isArray(access.items) ? access.items : []
   const logTail = logItems.slice(-20).reverse()
+  // v3.320：首帧同形占位——数据到达前也按最终行数（3+4）把两张表画出来，值用 —。
+  // 旧版整块 sys-grid 挂在 `${sys && …}` 后面：冷启动首帧只有面板头 + 提示（223px），
+  // 75–137ms 后两张表一次性填满（551px），文档 795→1644，下半页整体被推走。
+  // 不给容器拍 min-height（行高本身就是占位）。
+  // v3.320：access-log 的 details 也无条件渲染——summary 的 44px 就是占位。旧版整块挂在
+  // 「有访问记录」条件后面（空态另挂一条 condition），数据到达前首帧没有这一行，加载后凭空
+  // 多出 44px（panel 487→551，留在 ≤25px 的残差里）。空态与表格一起移进 details：默认折叠
+  // 不占高度，展开才长，首帧与加载后同形。
+  const info = sys || {}
   return html`<div class="panel">
     <${PanelHead} title="系统信息" right=${html`<${Button} variant="ghost" onClick=${refreshAll}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
-    ${sys && html`<div class="sys-grid">
+    <div class="sys-grid">
       <table class="sys-table"><tbody>
-        <tr><td>脚本版本</td><td>v${sys.version || '?'}</td></tr>
-        <tr><td>Node.js</td><td>${sys.node}</td></tr>
-        <tr><td>平台</td><td>${sys.platform}</td></tr>
+        <tr><td>脚本版本</td><td>${info.version ? `v${info.version}` : '—'}</td></tr>
+        <tr><td>Node.js</td><td>${info.node || '—'}</td></tr>
+        <tr><td>平台</td><td>${info.platform || '—'}</td></tr>
       </tbody></table>
       <table class="sys-table"><tbody>
-        <tr><td>控制台已运行</td><td>${fmtUptime(sys.uptimeS)}</td></tr>
-        <tr><td>内存占用</td><td>${fmtBytes(sys.rssBytes)}</td></tr>
-        <tr><td>进程 PID</td><td>${sys.pid}</td></tr>
-        <tr><td>缓存目录</td><td>${sys.cacheDir}</td></tr>
+        <tr><td>控制台已运行</td><td>${fmtUptime(info.uptimeS)}</td></tr>
+        <tr><td>内存占用</td><td>${fmtBytes(info.rssBytes)}</td></tr>
+        <tr><td>进程 PID</td><td>${info.pid == null ? '—' : info.pid}</td></tr>
+        <tr><td>缓存目录</td><td>${info.cacheDir || '—'}</td></tr>
       </tbody></table>
-    </div>`}
+    </div>
     <${Hint} style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。<//>
     ${accessErr && html`<${Hint} tone="error">访问日志加载失败：${accessErr.message || accessErr}<//>`}
-    ${access && access.items && access.items.length === 0 && html`<div class="empty">暂无访问记录（轮询端点与静态资产的成功请求不记入）</div>`}
-    ${logTail.length > 0 && html`<details class="access-log"><summary>最近访问记录（最多 20 条，新在上）</summary>
-      <table class="sys-table"><tbody>
-        ${logTail.map((it, i) => html`<tr key=${`${i}|${it.at}|${it.method}|${it.path}|${it.status}|${it.ms}`}><td>${it.at}</td><td>${it.method} ${it.path} → ${it.status} · ${it.ms}ms</td></tr>`)}
-      </tbody></table>
-    </details>`}
+    <details class="access-log">
+      <summary>最近访问记录（最多 20 条，新在上）</summary>
+      ${!accessReady
+        ? html`<div class="empty" role="status">读取中…</div>`
+        : logTail.length === 0
+          ? html`<div class="empty">${accessErr ? '访问日志读取失败' : '暂无访问记录（轮询端点与静态资产的成功请求不记入）'}</div>`
+          : html`<table class="sys-table"><tbody>
+          ${logTail.map((it, i) => html`<tr key=${`${i}|${it.at}|${it.method}|${it.path}|${it.status}|${it.ms}`}><td>${it.at}</td><td>${it.method} ${it.path} → ${it.status} · ${it.ms}ms</td></tr>`)}
+        </tbody></table>`}
+    </details>
     <${Hint} style="margin-top:12px">数据说明：推送记录来自判重缓存 push.json（服务端已裁剪正文 HTML）；趋势解析 run.log 摘要行；日志取尾部 1 MiB。<//>
   </div>`
 }
@@ -3165,6 +3376,9 @@ function FilterRulesPanel ({ onSync, active = true }) {
   // 竞态/卸载守卫：只应用最新一次 load 的响应；旧响应不能刷新时间戳或覆盖草稿。
   const loadSeqRef = useRef(0)
   const mountedRef = useRef(true)
+  // v3.320：校验失败的定位旗（见下方 useLayoutEffect）。只有「确有字段错误」的失败
+  // 提交会置它，成功路径与加载失败路径不碰。
+  const revealFieldRef = useRef(false)
   useEffect(() => () => { mountedRef.current = false }, [])
 
   const applyLoaded = useCallback((d, files) => {
@@ -3259,6 +3473,9 @@ function FilterRulesPanel ({ onSync, active = true }) {
     const errors = Array.isArray(payload.errors) ? payload.errors : []
     const fail = (text) => {
       setNotice(null) // 失败时清掉上一条成功提示，避免「已保存」与错误同屏
+      // v3.320：确有逐字段错误时才置定位旗——没有字段错误的失败（401/503/写入忙…）
+      // 顶部 Hint 就在原地，不该拽页面。旗子由下面的 useLayoutEffect 消费。
+      revealFieldRef.current = errors.length > 0
       setFieldErrors(fieldErrorMap(errors))
       setErr(text)
     }
@@ -3283,6 +3500,26 @@ function FilterRulesPanel ({ onSync, active = true }) {
     fail(`${fallback}：${payload.error || payload.code || `HTTP ${res.status}`}`)
     return code || `http_${res.status}`
   }, [data])
+
+  // v3.320：校验失败时反馈在视口外——顶部汇总 Hint 与每字段错误行都插在动作区上方，
+  // 屏幕内只看到按钮被推下 74px。这里在状态提交后（paint 前）把第一个 aria-invalid
+  // 字段滚到吸顶页签下沿并聚焦：先 focus({ preventScroll: true }) 拿焦点，再按
+  // .tabs 高度 + 8 手工算 scrollTo（不居中，避免把错误行顶出屏幕上沿）。
+  // 只由上面的 fail() 置旗 ⇒ 成功路径、加载失败路径都不会触发。
+  useLayoutEffect(() => {
+    if (!revealFieldRef.current) return
+    revealFieldRef.current = false
+    const el = document.querySelector('[aria-invalid="true"]')
+    if (!el) return
+    // 面板被 section[hidden] 隐藏时 rect 全为 0：不在这里拽页面。
+    if (!el.getBoundingClientRect().height) return
+    el.focus({ preventScroll: true })
+    const tabs = document.querySelector('.tabs')
+    const pad = (tabs ? tabs.getBoundingClientRect().height : 0) + 8
+    const top = el.getBoundingClientRect().top + window.scrollY - pad
+    const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+    window.scrollTo(0, Math.max(0, Math.min(top, max)))
+  }, [fieldErrors])
 
   // 保存前两次预检：/validate（逐字段语法）→ /preview（补推条数），再开二次确认弹窗。
   const beginSave = async () => {
