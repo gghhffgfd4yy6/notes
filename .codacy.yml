@@ -190,6 +190,9 @@ exclude_paths:
   # （为免构建直接入库的 vendor 单文件），内部的 innerHTML/document.write/动态属性
   # 访问是框架实现细节，非本仓代码缺陷——同 .sourcery.yaml 的 ignore 口径。
   - "scripts/console-assets/htm-preact.module.js"
+  # v3.326：flatpickr 4.6.13 的上游 ESM 单文件（vendored，不引 CDN）。内部
+  # new RegExp / innerHTML / 动态属性访问都是库实现，页面不向它传用户数据。
+  - "scripts/console-assets/flatpickr.module.js"
   - "scripts/check-doc-lines.js"
   - "scripts/check-host-clean.js"
   - "test_doc_line_gates.js"

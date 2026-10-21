@@ -4842,7 +4842,9 @@ async function main () {
     }
     assert.ok(/:root \{[^}]*--shadow-card/.test(css), '默认（深夜）也要有 --shadow-card')
     assert.ok(!/localStorage\.(get|set)Item/.test(js), '不得用 localStorage 记主题（CSP 禁内联脚本，首帧会闪）')
-    assert.ok(srv.includes("const THEMES = ['deep', 'material', 'nord', 'light']"), '服务端必须有主题白名单')
+    // 变异沙箱里 console.js 会被插桩成 stryMutAct_… ? … : ['deep', …]，文本断言必假红；
+    // 改断言运行时导出值，比文本更硬（键名/顺序/数量全覆盖）。
+    assert.deepStrictEqual([...require('./scripts/console.js').THEMES], ['deep', 'material', 'nord', 'light'], '服务端必须有主题白名单')
     assert.ok(/data-theme="\$\{THEMES\.includes\(theme\) \? theme : THEMES\[0\]\}"/.test(srv), '服务端必须把主题写进首帧 <html>')
   })
 
@@ -5094,9 +5096,21 @@ async function main () {
     assert.ok(!src.includes('type="date"'), '不得残留原生 date 输入（统一走 DateRange）')
     assert.ok(!src.includes('flatpickr(') || (src.match(/flatpickr\(/g) || []).length === 1, 'flatpickr 只允许在 DateRange 里初始化一次')
     // 趋势服务端：区间优先于 days（与推送记录同口径）
-    const st = fs.readFileSync(path.join(__dirname, 'scripts/status.js'), 'utf8')
-    assert.ok(st.includes('from = \'\', to = \'\'') && st.includes('rangeMode'), 'readTrends 必须支持 from/to')
-    assert.ok(/spanDays = Math\.min\(92/.test(st), '趋势区间跨度必须有上限（防一次画几百列）')
+    // 同样不能读源码文本（status.js 也在变异矩阵里）：直接调 readTrends 验行为。
+    const tmpDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'xbk-trends-'))
+    try {
+      fs.writeFileSync(path.join(tmpDir, 'run.log'), '')
+      const { readTrends } = require('./scripts/status.js')
+      const fixedNow = Date.parse('2026-01-10T00:00:00Z')
+      const r3 = readTrends(tmpDir, { from: '2026-01-01', to: '2026-01-03', now: fixedNow })
+      assert.strictEqual(r3.status, 'ok', '空 run.log 也应可读')
+      assert.strictEqual(r3.value.days, 3, 'readTrends 必须按 from/to 算窗口（闭区间 3 天）')
+      assert.strictEqual(r3.value.from, '2026-01-01', 'readTrends 必须回显区间起点')
+      const rCap = readTrends(tmpDir, { from: '2020-01-01', to: '2026-01-10', now: fixedNow })
+      assert.strictEqual(rCap.value.days, 92, '趋势区间跨度必须有上限（92 天，防一次画几百列）')
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
   })
 
   await aok('结构红线: v3.317 表格动作列贴右（两个表 / 不透明底色 / 分隔线）', () => {
