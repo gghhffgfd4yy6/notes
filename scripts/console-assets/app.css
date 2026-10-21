@@ -374,8 +374,9 @@
   .log-chip.on { color: var(--info-fg); background: var(--accent-soft); border-color: var(--accent-line); }
   /* v3.320：chip 计数固定宽度。加载态显示 —、到数据后变 269，宽度差在 362px 下会把 chip
      行挤重排（多/少一行），工具条高度就跟着跳——首帧占位白算。钉住 min-width + 右对齐，
-     两种状态同宽；tabular-nums 让数字本身等宽。3.2em 容得下 5 位数（旧 2.4em 只够 3 位）。 */
-  .log-chip-n { display: inline-block; min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }
+     两种状态同宽；tabular-nums 让数字本身等宽。5em 容得下 6 位（1MiB 全是换行也有 7 位，
+     再留一点余量；旧 3.2em 只够 5 位）。 */
+  .log-chip-n { display: inline-block; min-width: 5em; text-align: right; font-variant-numeric: tabular-nums; }
   /* v3.319 行级定位条：写清「这是哪一轮」，并提供「只看这一轮 / 看当天全部」开关。 */
   .log-focus {
     display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;

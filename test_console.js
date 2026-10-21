@@ -4924,8 +4924,7 @@ async function main () {
     const runsPanel = src.slice(src.indexOf('function RunsPanel'), src.indexOf('function RunHistoryPanel'))
     const histPanel = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
     assert.ok(runsPanel.includes('<div class="runs-scroll"><table class="runs-table">'), '触发历史表必须在 .runs-scroll 内')
-    assert.ok(/<div class="runs-scroll"[^>]*><table class="runs-table">/.test(histPanel),
-      '逐轮历史表必须在 .runs-scroll 内（ref 等属性不影响）')
+    assert.ok(histPanel.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && histPanel.includes('$' + '{shown.length > 0') && histPanel.includes('? html`<table class="runs-table">'), '逐轮历史表必须在 .runs-scroll 内（空态也保留容器）')
     assert.ok(histPanel.includes('<td class="run-actions">'), '逐轮历史的末列必须是动作列（其 sticky 才有意义）')
   })
 
@@ -4982,7 +4981,9 @@ async function main () {
     assert.ok(!/\.sys-grid\s*\{[^}]*min-height/.test(fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')),
       '不许给 .sys-grid 拍 min-height（行高本身就是占位）')
     // 错误 Hint 仍在表上方：数据失败时先看到原因，再看到空表。
-    assert.ok(sys.indexOf('tone="error"') < sys.indexOf('class="sys-grid"'), '错误 Hint 必须仍在表上方')
+    const errAt = sys.indexOf('tone="error"')
+    const gridAt = sys.indexOf('class="sys-grid"')
+    assert.ok(errAt >= 0 && gridAt >= 0 && errAt < gridAt, '错误 Hint 必须存在且仍在表上方')
   })
 
   await aok('结构红线: v3.320 日志框定高（读取中/空态与日志框同高）', () => {
@@ -5015,7 +5016,7 @@ async function main () {
     assert.ok(sys.length > 0, '必须能定位 SysPanel')
     // 旧版：${logTail.length > 0 && html`<details class="access-log">…} 与 ${access && …暂无访问记录…}
     // 两条条件 ⇒ 数据未到首帧没有 summary 那 44px，加载后才长出来（panel 487→551）。
-    assert.ok(/^\s*<details class="access-log">$/m.test(sys),
+    assert.ok(/^[ \t]*<details class="access-log">$/m.test(sys),
       'access-log 必须无条件渲染：源码里要有一行裸的 <details class="access-log">')
     assert.ok(!sys.includes('logTail.length > 0 &&'), 'access-log 不得再被 logTail.length > 0 && 包住')
     assert.ok(!sys.includes('access && access.items &&'), 'access-log 不得再被 access && 包住')
@@ -5037,8 +5038,8 @@ async function main () {
     assert.ok(logs.length > 0, '必须能定位 LogsPanel')
     // 旧版整块（定位条 + chips + 计数 + 日志框）都在 ok 分支的 <div> 里 ⇒ 数据到达才出现。
     assert.ok(!logs.includes("data && data.status === 'ok' && html`<div>"), 'ok 分支的包装 div 必须拆掉')
-    assert.ok(/^\s*<div class="log-tools">$/m.test(logs), '.log-tools 必须无条件渲染（不能挂在条件 && 后面）')
-    assert.ok(/^\s*<div class="log-count">\$\{countText\}<\/div>$/m.test(logs), '.log-count 必须无条件渲染')
+    assert.ok(/^[ \t]*<div class="log-tools">$/m.test(logs), '.log-tools 必须无条件渲染（不能挂在条件 && 后面）')
+    assert.ok(/^[ \t]*<div class="log-count">\$\{countText\}<\/div>$/m.test(logs), '.log-count 必须无条件渲染')
     // 顺序：工具条 + 计数在占位日志框之前，首帧就占住 134+19。
     assert.ok(logs.indexOf('<div class="log-tools">') < logs.indexOf('!data && !err && html`<div class="log-empty"'),
       '工具条必须排在加载占位之前（否则首帧仍只有占位框）')
@@ -5170,7 +5171,7 @@ async function main () {
     assert.ok(/const \[settleTick, setSettleTick\] = useState\(0\)/.test(loader), 'usePanelLoader 必须有结算代数 state')
     const catchBlock = loader.slice(loader.indexOf('} catch (e) {'), loader.indexOf('} finally {'))
     assert.ok(catchBlock.length > 0 && !catchBlock.includes('setData('), '失败分支不得改 data（故 data 引用不能当落地信号）')
-    assert.ok(/setSettleTick\(\(t\) => t \+ 1\)\s*\n\s*setLoading\(false\)/.test(loader),
+    assert.ok(/setSettleTick\(\(t\) => t \+ 1\)[ \t]*\n[ \t]*setLoading\(false\)/.test(loader),
       '成功与失败都要推进结算代数，且与 setLoading(false) 同批（不多一次渲染）')
     assert.ok(/return \{ data, err, load, loading, settleTick \}/.test(loader), '结算代数必须暴露给调用方')
 
@@ -5217,10 +5218,30 @@ async function main () {
     assert.ok(/err && !data && html`<div class="log-empty" role="status">日志读取失败/.test(logs),
       'err && !data 时必须渲染「日志读取失败」占位（.log-empty 同高）')
 
-    // ⑦ chip 计数 5 位不重排。
+    // ⑦ chip 计数 6 位不重排（1MiB 全是换行也有 7 位，5em 留余量）。
     const nCss = (css.match(/\.log-chip-n\s*\{[^}]*\}/) || [''])[0]
-    assert.ok(/min-width:\s*3\.2em/.test(nCss), '.log-chip-n min-width 必须 3.2em（5 位计数不重排）')
-    assert.ok(!/min-width:\s*2\.4em/.test(nCss), '旧的 2.4em 必须改掉')
+    assert.ok(/min-width:\s*5em/.test(nCss), '.log-chip-n min-width 必须 5em（6 位计数不重排）')
+    assert.ok(!/min-width:\s*(2\.4|3\.2)em/.test(nCss), '旧的 2.4em / 3.2em 必须改掉')
+
+    // ⑧ 回车/刷新直接生效搜索词时也要置旗（否则防抖随后看到词已生效，主路径漏落点）。
+    assert.ok(msg.includes('if (q !== query) { armLand(); setQuery(q); setPage(1); return }'),
+      'refreshNow 在词变化时必须 armLand（回车/刷新也要落点）')
+
+    // ⑨ 请求飞行期间用户自己滚动时撤销落点（浏览器夹取/锚定不算）。
+    assert.ok(arm.includes('userMovedRef.current = false'), '置旗时必须复位用户滚动标记')
+    assert.ok(effect.includes('if (userMovedRef.current) return'), '消费前必须检测用户是否自己滚走')
+    assert.ok(msg.includes('useLandScrollCancel(landRef, userMovedRef)'), '必须接入用户滚动取消 hook')
+    assert.ok(src.includes("window.addEventListener('touchmove', mark"), 'hook 里必须有 touchmove/wheel 监听')
+
+    // ⑩ 逐轮历史切模式要等重拉结算；空结果也要保留 listRef（否则无法落点）。
+    const hEffectAt = hist.indexOf('useLayoutEffect(() => {')
+    const hEffect = hist.slice(hEffectAt, hist.indexOf('}, [', hEffectAt))
+    assert.ok(hist.includes('asyncLandRef.current = true'), '切模式必须标记为异步落点')
+    assert.ok(hEffect.includes('if (loading) { sawLoadingRef.current = true; return }'), '异步落点必须等 loading 开始')
+    assert.ok(hEffect.includes('if (!sawLoadingRef.current) return'), '重拉未开始的那一帧不得落点')
+    assert.ok(hEffect.includes('if (userMovedRef.current) return'), '逐轮历史也要防用户自己滚走')
+    assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
+    assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
     // 版本没 bump：注释里的版本号只能是 v3.320。
     assert.ok(!/v3\.321/.test(src), 'app.js 注释不得写 v3.321（版本未 bump）')

@@ -1599,6 +1599,23 @@ function listLandTarget (el) {
   return Math.max(0, Math.min(top, max))
 }
 
+// 落点请求在飞时，只有用户自己滚动才撤销；浏览器夹取/滚动锚定不会触发这些事件。
+function useLandScrollCancel (landRef, movedRef) {
+  useEffect(() => {
+    const mark = () => { if (landRef.current) movedRef.current = true }
+    const keys = ['PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown', ' ']
+    const onKey = (e) => { if (keys.includes(e.key)) mark() }
+    window.addEventListener('wheel', mark, { passive: true })
+    window.addEventListener('touchmove', mark, { passive: true })
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('wheel', mark)
+      window.removeEventListener('touchmove', mark)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [landRef, movedRef])
+}
+
 function RunHistoryPanel ({ onOpenLog, active = true }) {
   const [size, setSize] = useState(10)
   // 默认只看真实轮次：取消留痕是操作审计，不该在每次打开历史时占据一半行。
@@ -1620,6 +1637,13 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   // 只有用户主动改页/改每页/改分类/改时间时置位；纯 load() 与自动刷新不置。
   const listRef = useRef(null)
   const landRef = useRef(false)
+  // 置旗那一刻的位置与数据：模式切换要等自动加载的响应落地才落点；
+  // 请求飞行期间用户自己滚走（非浏览器夹取）则撤销这次落点。
+  const armedDataRef = useRef(undefined)
+  const armedErrRef = useRef('')
+  const asyncLandRef = useRef(false)
+  const sawLoadingRef = useRef(false)
+  const userMovedRef = useRef(false)
   // 「已滚进列表」门：列表顶还在页签下沿之下（用户停在顶部改筛选）时不置旗——
   // 否则会把列表顶拽到页签下沿，工具条被顶出视口。口径与 listLandTarget 一致
   // （.tabs 实测高度 + 8）。
@@ -1633,7 +1657,13 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     const listTop = rect.top + window.scrollY - tabsH - 8
     if (!(window.scrollY > listTop)) return
     landRef.current = true
+    armedDataRef.current = data
+    armedErrRef.current = err
+    asyncLandRef.current = false
+    sawLoadingRef.current = false
+    userMovedRef.current = false
   }
+  useLandScrollCancel(landRef, userMovedRef)
 
   const load = useCallback(async () => {
     const seq = ++seqRef.current
@@ -1679,6 +1709,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   const changeMode = (m) => {
     if (m === mode) return // 已选中的 chip 再点一次不搬位置
     armLand()
+    asyncLandRef.current = true // 切模式会重拉 run.log，必须等响应落地再落点
     setMode(m)
     setPageNo(1)
   }
@@ -1692,11 +1723,19 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   // 消费即清旗：返回 null 也不再重试（否则旗子会挂到下一次操作上）。
   useLayoutEffect(() => {
     if (!landRef.current) return
+    if (asyncLandRef.current) {
+      if (loading) { sawLoadingRef.current = true; return } // 重拉已开始，等结算
+      if (!sawLoadingRef.current) return // 重拉还没开始：这一帧是旧数据，不能落点
+    }
     landRef.current = false
+    asyncLandRef.current = false
+    sawLoadingRef.current = false
+    // 请求飞行期间用户自己滚动时撤销落点，别把人拽回列表顶（夹取/锚定不算）。
+    if (userMovedRef.current) return
     const y = listLandTarget(listRef.current)
     if (y === null) return
     window.scrollTo(0, y)
-  }, [pageNo, size, mode, day])
+  }, [data, loading, err, pageNo, size, mode, day])
   const jumpLog = (r) => {
     if (!onOpenLog || typeof r.at !== 'string' || r.at.length < 10) return
     const key = `${r.at}-${r.lineNo}`
@@ -1761,7 +1800,9 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     </div>`}
     ${data && data.status && data.status !== 'ok' && html`<div class="empty">run.log${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
     ${!data && !err && html`<div class="empty">加载中…</div>`}
-    ${shown.length > 0 && html`<div class="runs-scroll" ref=${listRef}><table class="runs-table">
+    ${data && data.status === 'ok' && html`<div class="runs-scroll" ref=${listRef}>
+      ${shown.length > 0
+        ? html`<table class="runs-table">
       <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
       <tbody>
         ${shown.map((r, i) => html`<tr key=${`${r.at}-${r.lineNo}-${i}`}>
@@ -1781,8 +1822,9 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
                 : '日志'}</button></td>
         </tr>`)}
       </tbody>
-    </table></div>`}
-    ${data && data.status === 'ok' && filtered.length === 0 && html`<div class="empty">${all.length === 0 ? '日志尾窗内没有摘要行' : '没有匹配的轮次'}</div>`}
+    </table>`
+        : html`<div class="empty">${all.length === 0 ? '日志尾窗内没有摘要行' : '没有匹配的轮次'}</div>`}
+    </div>`}
     ${filtered.length > 0 && html`<div class="pager">
       <${Button} disabled=${current <= 1 || loading} onClick=${() => goPage(1)}>« 首页<//>
       <${Button} disabled=${current <= 1 || loading} onClick=${() => goPage(current - 1)}>上一页<//>
@@ -2416,6 +2458,7 @@ function MessagesPanel ({ onSync, active = true }) {
   // 代数没前进就是响应还没来——旗子必须留着，不能拿旧数据先滚一次。
   const armedDataRef = useRef(undefined)
   const armedSettleRef = useRef(0)
+  const userMovedRef = useRef(false)
   // 置旗那一刻已发出的请求号（fetchMessages 里自增）：只有当「置旗后才发出的请求」结算时
   // 才允许消费——否则置旗前就在飞的旧请求先回包，会拿旧筛选的结果抢着落点。
   const armedSeqRef = useRef(0)
@@ -2438,7 +2481,9 @@ function MessagesPanel ({ onSync, active = true }) {
     armedDataRef.current = dataRef.current
     armedSettleRef.current = settleTick
     armedSeqRef.current = loadSeqRef.current
+    userMovedRef.current = false
   }
+  useLandScrollCancel(landRef, userMovedRef)
   // 搜索防抖：输入停 300ms 才真正改 query；页码重置跟随 query 的真实变化。
   // 落点旗只能在这里置：防抖触发时焦点必然还在输入框（原先看 activeElement 会让
   // 主路径永不落点），所以只按「已滚进列表」判断，滚动等这次响应落地后再做。
@@ -2491,6 +2536,8 @@ function MessagesPanel ({ onSync, active = true }) {
     landRef.current = false
     armedDataRef.current = undefined
     if (err) return // 请求失败：新数据不会来了，清旗不重试，更不滚动
+    // 请求飞行期间用户自己滚动时撤销落点（夹取/锚定不算）。
+    if (userMovedRef.current) return
     const y = listLandTarget(listRef.current)
     if (y === null) return
     window.scrollTo(0, y)
@@ -2505,7 +2552,7 @@ function MessagesPanel ({ onSync, active = true }) {
   // 只有搜索词变了才回第 1 页；没改词时刷新当前页，不应把用户踢回首页（审查 #246 可选）。
   const refreshNow = () => {
     const q = input.trim()
-    if (q !== query) { setQuery(q); setPage(1); return }
+    if (q !== query) { armLand(); setQuery(q); setPage(1); return }
     load().catch(() => {})
   }
   const [exporting, setExporting] = useState('') // '' | 'csv' | 'json'：加载态防连点（两按钮共用一闸）
