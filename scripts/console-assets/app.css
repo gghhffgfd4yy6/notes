@@ -91,6 +91,119 @@
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     --sans: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
   }
+
+  /* ── 主题（v3.323）────────────────────────────────────────────────────
+     只覆盖颜色 token（外加 color-scheme），间距/字阶/圆角/动效一律不动 ⇒ 切换主题
+     不会改变布局，也不会让页签、表格、日志框跳动。默认 :root = 深夜；data-theme 由
+     服务端首帧写进 <html>（cookie 记忆），切主题时前端只改这一个属性。 */
+
+  /* 材质：Material 3 的紫调中性色（surface 带紫灰、primary 用浅紫描边 + 深紫实心），
+     elevation 靠更亮的 panel 层表达，不用阴影堆。 */
+  :root[data-theme="material"] {
+    color-scheme: dark;
+    --bg: #141218;
+    --panel: #1d1b20;
+    --panel-2: #211f26;
+    --log-bg: #100e14;
+    --log-fg: #e6e0e9;
+    --border: #38343f;
+    --border-soft: rgba(230, 224, 233, .14);
+    --text: #e6e0e9;
+    --text-dim: #a8a2b4;
+    --on-accent: #fff;
+    --accent: #cfbcff;
+    --accent-solid: #6750a4;
+    --accent-soft: rgba(207, 188, 255, .12);
+    --accent-line: rgba(207, 188, 255, .32);
+    --accent-hover: rgba(207, 188, 255, .06);
+    --accent-sel: rgba(207, 188, 255, .10);
+    --info-fg: #d0bcff;
+    --ok: #4caf82;
+    --ok-soft: rgba(76, 175, 130, .16);
+    --ok-line: rgba(76, 175, 130, .38);
+    --ok-fg: #8fe0b8;
+    --bad: #e57373;
+    --bad-soft: rgba(229, 115, 115, .16);
+    --bad-line: rgba(229, 115, 115, .38);
+    --bad-fg: #ffb4ab;
+    --bad-solid: #b3261e;
+    --warn: #d0b45a;
+    --warn-soft: rgba(208, 180, 90, .16);
+    --warn-line: rgba(208, 180, 90, .38);
+    --warn-fg: #f2df9b;
+  }
+
+  /* 北境：Nord 的冷灰蓝（极夜蓝底 + 冰川蓝强调），对比度比默认低一档，夜读不刺眼。 */
+  :root[data-theme="nord"] {
+    color-scheme: dark;
+    --bg: #2e3440;
+    --panel: #3b4252;
+    --panel-2: #343b49;
+    --log-bg: #272c36;
+    --log-fg: #d8dee9;
+    --border: #4c566a;
+    --border-soft: rgba(216, 222, 233, .16);
+    --text: #eceff4;
+    --text-dim: #aeb8c9;
+    --on-accent: #fff;
+    --accent: #88c0d0;
+    /* 白字压 #5e81ac 只有 4.03:1（AA 不成立）；同色相压深到 #4c6a92 = 5.55:1。 */
+    --accent-solid: #4c6a92;
+    --accent-soft: rgba(136, 192, 208, .14);
+    --accent-line: rgba(136, 192, 208, .34);
+    --accent-hover: rgba(136, 192, 208, .07);
+    --accent-sel: rgba(136, 192, 208, .11);
+    --info-fg: #8fbcbb;
+    --ok: #a3be8c;
+    --ok-soft: rgba(163, 190, 140, .16);
+    --ok-line: rgba(163, 190, 140, .38);
+    --ok-fg: #b8d3a3;
+    --bad: #bf616a;
+    --bad-soft: rgba(191, 97, 106, .18);
+    --bad-line: rgba(191, 97, 106, .4);
+    --bad-fg: #d99aa0;
+    --bad-solid: #a54e57;
+    --warn: #ebcb8b;
+    --warn-soft: rgba(235, 203, 139, .14);
+    --warn-line: rgba(235, 203, 139, .36);
+    --warn-fg: #ebcb8b;
+  }
+
+  /* 明亮：白天/投屏用。所有前景色改为深色系（--ok-fg/--bad-fg/--warn-fg 是文字色，
+     不能沿用深色主题的浅色值，否则白底上读不出来）。 */
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f3f5f9;
+    --panel: #ffffff;
+    --panel-2: #eef1f6;
+    --log-bg: #f8fafc;
+    --log-fg: #1f2a37;
+    --border: #d5dbe5;
+    --border-soft: rgba(15, 23, 42, .10);
+    --text: #1b2330;
+    --text-dim: #5a6678;
+    --on-accent: #fff;
+    --accent: #1c64d9;
+    --accent-solid: #1a5fd0;
+    --accent-soft: rgba(28, 100, 217, .10);
+    --accent-line: rgba(28, 100, 217, .28);
+    --accent-hover: rgba(28, 100, 217, .06);
+    --accent-sel: rgba(28, 100, 217, .08);
+    --info-fg: #2b5fb3;
+    --ok: #12805a;
+    --ok-soft: rgba(18, 128, 90, .12);
+    --ok-line: rgba(18, 128, 90, .30);
+    --ok-fg: #0b6b4b;
+    --bad: #c0392b;
+    --bad-soft: rgba(192, 57, 43, .10);
+    --bad-line: rgba(192, 57, 43, .28);
+    --bad-fg: #a32b20;
+    --bad-solid: #b3261e;
+    --warn: #8a6100;
+    --warn-soft: rgba(180, 130, 10, .12);
+    --warn-line: rgba(180, 130, 10, .30);
+    --warn-fg: #7a5600;
+  }
 }
 
 @layer base {
@@ -139,6 +252,9 @@
     border-radius: var(--r-pill); padding: 1px 8px; font-size: var(--fs-2xs); cursor: pointer; min-height: 24px;
   }
   .sync-toggle:hover { color: var(--text); border-color: var(--accent-line); }
+  /* 主题键（v3.323）：跟「数据截至」同一行，窄屏不换行、不把行撑高（与「暂停」同尺寸）。 */
+  .theme-btn { flex: 0 0 auto; white-space: nowrap; }
+  .theme-btn:active { transform: translateY(1px); }
 
   /* ── 徽章 ── */
   .badge { display: inline-block; padding: 2px 10px; border-radius: var(--r-pill); font-size: var(--fs-xs); font-weight: 500; border: 1px solid transparent; }
@@ -598,7 +714,7 @@
   .run-day input {
     background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--r-sm);
     color: var(--text); font-family: var(--mono); font-size: var(--fs-xs); padding: 4px 8px; min-height: 32px;
-    color-scheme: dark;
+    color-scheme: inherit;
   }
   .run-day input:hover { border-color: var(--accent-line); }
   .run-tools-note { color: var(--text-dim); font-size: var(--fs-xs); }

@@ -3903,9 +3903,41 @@ function BackToTop () {
     aria-hidden=${show ? 'false' : 'true'} onClick=${toTop}>↑</button>`
 }
 
+// ── 主题（v3.323）──────────────────────────────────────────────────────────
+// 4 套配色只换 token（见 app.css 的 data-theme 块），不动布局。首帧由服务端把
+// cookie 里的选择写进 <html data-theme>——CSP 是 script-src 'self'，不能在 head
+// 里内联读 localStorage，否则浅色主题每次加载都会先闪一帧深色。
+const THEMES = [
+  { key: 'deep', label: '深夜' },
+  { key: 'material', label: '材质' },
+  { key: 'nord', label: '北境' },
+  { key: 'light', label: '明亮' }
+]
+const THEME_COOKIE = 'xbk_theme'
+function currentThemeKey () {
+  const t = document.documentElement.getAttribute('data-theme')
+  return THEMES.some((x) => x.key === t) ? t : 'deep'
+}
+function readThemeCookie () {
+  const hit = document.cookie.split('; ').find((c) => c.startsWith(THEME_COOKIE + '='))
+  const value = hit ? hit.slice(THEME_COOKIE.length + 1) : ''
+  return THEMES.some((x) => x.key === value) ? value : ''
+}
+function applyThemeKey (key) {
+  document.documentElement.setAttribute('data-theme', key)
+  try {
+    document.cookie = THEME_COOKIE + '=' + key + '; Path=/; Max-Age=31536000; SameSite=Lax'
+  } catch (e) {
+    // 沙箱/禁用 Cookie 的上下文（opaque origin）会在这里抛：本页照样能切，
+    // 只是刷新后回到服务端默认。绝不能让它挡住下面的 setTheme。
+  }
+}
+
 function App () {
   const [state, setState] = useState(null)
   const [runs, setRuns] = useState([])
+  // 主题：初值取服务端写进 <html data-theme> 的键（非法值回落 deep）。
+  const [theme, setTheme] = useState(currentThemeKey)
   // 触发历史是否已经成功加载过：首次请求未回/失败时不能显示「暂无触发记录」，
   // 否则会把「还不知道」谎报成「确实没有」（Sourcery #254）。
   const [runsState, setRunsState] = useState('loading') // loading | ok | error
@@ -4555,6 +4587,19 @@ function App () {
       }
     )
   }, [markVisited])
+  // 循环切主题：一次点击换下一套，按钮上直接显示当前主题名（不弹菜单，手机少一次点按）。
+  const cycleTheme = () => {
+    // 多标签页：cookie 才是共享偏好——先读它再算下一位，别拿本标签页的旧 state
+    // 把另一个标签页刚改的主题覆盖回去（Sourcery #286）。
+    const shared = readThemeCookie() || currentThemeKey()
+    const at = THEMES.findIndex((t) => t.key === shared)
+    const next = THEMES[(at + 1) % THEMES.length]
+    // 先落 React 状态再写 cookie：写 cookie 抛异常时不会出现「CSS 变了、按钮还是旧名」。
+    setTheme(next.key)
+    applyThemeKey(next.key)
+  }
+  const themeLabel = (THEMES.find((t) => t.key === theme) || THEMES[0]).label
+  const nextThemeLabel = (THEMES[(THEMES.findIndex((t) => t.key === theme) + 1) % THEMES.length] || THEMES[0]).label
   const pollMs = locking ? POLL_BUSY_MS : POLL_MS
   // 顶栏徽章只在「概览/日志 + 自动刷新开」时是活状态；其它情况（暂停、推送记录/配置/系统）
   // 主轮询已停，徽章显示的是离开时的快照——必须注明，不能永久挂着「任务运行中」（审查 #246）。
@@ -4576,6 +4621,9 @@ function App () {
               onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`
           : panelSync ? `数据截至 · ${fmtLocalTime(panelSync)}` : '数据截至 · —'}
         ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
+        <button type="button" class="sync-toggle theme-btn" onClick=${cycleTheme}
+          aria-label=${'切换主题（当前 ' + themeLabel + '，下一套 ' + nextThemeLabel + '）'}
+          title=${'主题：' + themeLabel + ' → ' + nextThemeLabel}>◐ ${themeLabel}</button>
       </div>
     </header>
 
