@@ -846,7 +846,7 @@ function shouldLogAccess (method, pathname, statusCode) {
   return true
 }
 
-function renderPage (state, runsList, query, sessionToken) {
+function renderPage (state, runsList, query, sessionToken, theme) {
   const statusText = formatStatus(state)
   const statusLines = statusText.split('\n').map(escapeHtml)
   // 浏览器流（Sourcery High）：fetch/ESM 也带不了页内凭证之外的上下文，token 经
@@ -872,7 +872,7 @@ function renderPage (state, runsList, query, sessionToken) {
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029')
   return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
+<html lang="zh-CN" data-theme="${THEMES.includes(theme) ? theme : THEMES[0]}"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="${CSP_HEADER}">
 <link rel="stylesheet" href="/assets/app.css${assetQuery()}">
@@ -954,6 +954,22 @@ function sessionCookieValue (cookieHeader) {
     }
   }
   return null
+}
+// 主题记忆（v3.323）：只影响配色。CSP 是 script-src 'self'（禁内联脚本），前端无法在
+// 首帧前读 localStorage，所以选择放 Cookie，由服务端写进 <html data-theme>；前端切换时
+// 只改属性 + 写 cookie，下次打开首帧就是对的（浅色不会先闪一帧深色）。
+const THEME_COOKIE = 'xbk_theme'
+const THEMES = ['deep', 'material', 'nord', 'light']
+function themeCookieValue (cookieHeader) {
+  if (typeof cookieHeader !== 'string' || cookieHeader.length === 0) return THEMES[0]
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=')
+    if (eq <= 0) continue
+    if (part.slice(0, eq).trim() !== THEME_COOKIE) continue
+    const value = part.slice(eq + 1).trim()
+    return THEMES.includes(value) ? value : THEMES[0]
+  }
+  return THEMES[0]
 }
 function authorize (req, token, urlQuery) {
   const header = req.headers.authorization || ''
@@ -2971,7 +2987,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
       // 使用的凭证（authorize 已通过的 token 值）交给 renderPage 注入 boot，会话用户
       // 无需再拼 ?token= 即可触发。
-      res.end(renderPage(state, runsList, url.searchParams, token))
+      res.end(renderPage(state, runsList, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie)))
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/status') {
@@ -3753,7 +3769,9 @@ module.exports = {
   lockPath,
   parseAction,
   sessionCookieValue,
+  themeCookieValue,
   SESSION_COOKIE,
+  THEMES,
   escapeHtml,
   formatMs,
   renderPage,

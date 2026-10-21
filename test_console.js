@@ -404,6 +404,13 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.ok(withToken.includes("connect-src 'self'"), "CSP 含 connect-src 'self'")
   assert.ok(withToken.includes("frame-ancestors 'none'"), "CSP 含 frame-ancestors 'none'（响应头与 meta 双通道，见 HTTP 用例）")
   assert.ok(!withToken.includes('http-equiv="refresh"'), '不再 meta refresh 整页刷新')
+  // v3.323 主题：首帧必须由服务端把 <html data-theme> 渲染出来（放 body 或只在 JS 里设都不算）。
+  assert.ok(/<html lang="zh-CN" data-theme="deep">/.test(withToken), '默认首帧 data-theme 必须是 deep')
+  const nordPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), '', 'nord')
+  assert.ok(/<html lang="zh-CN" data-theme="nord">/.test(nordPage), '首帧必须跟随传入的主题')
+  const badPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), '', 'evil')
+  assert.ok(/<html lang="zh-CN" data-theme="deep">/.test(badPage), '白名单外主题必须回落 deep')
+  assert.ok(!/<body[^>]*data-theme/.test(nordPage), 'data-theme 必须在 <html> 上（放到 body 不生效）')
   const noToken = renderPage(state, [], null)
   assert.ok(noToken.includes('"token":""'), '无 token 时 JSON 岛为空串（前端触发会 401，符合 fail-closed）')
   assert.ok(!noToken.includes(`"token":"${TOKEN2}"`), '无 token 时不回显')
@@ -4754,6 +4761,42 @@ async function main () {
     assert.strictEqual(backToTopBehavior(false, false), null, '宿主不支持 scrollBehavior 时必须瞬时回顶（传 options 会被老 Safari 当成 x,y）')
   })
 
+  await aok('结构红线: 主题切换（4 套 token / 首帧服务端渲染 / cookie 记忆）', () => {
+    const cssRaw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    // 先把 /* */ 注释剥掉：注释里写一个示例块 / 把真块整段注释掉，都不能骗过门禁（Sourcery #286）。
+    const css = cssRaw.replace(/\/\*[\s\S]*?\*\//g, '')
+    assert.ok(css.length < cssRaw.length, 'CSS 注释剥离必须真的生效（否则本断言恒真）')
+    const js = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const srv = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    for (const key of ['material', 'nord', 'light']) {
+      const block = (css.match(new RegExp(':root\\[data-theme="' + key + '"\\]\\s*\\{[^}]*\\}')) || [''])[0]
+      assert.ok(block.length > 0, '必须有 ' + key + ' 主题 token 块')
+      assert.ok(/--bg:/.test(block) && /--text:/.test(block) && /--accent-solid:/.test(block), key + ' 必须覆盖面层/文字/强调三类 token')
+      // 主题块只许改颜色：夹带 --sp/--fs/--r 会让切换主题时布局跳动（与「只换配色」的承诺相悖）。
+      assert.ok(!/--(sp|fs|r|lh|dur)-/.test(block), key + ' 主题块不得改间距/字阶/圆角/动效')
+    }
+    assert.ok(/:root\[data-theme="light"\]\s*\{[^}]*color-scheme:\s*light/.test(css), '明亮主题必须声明 color-scheme: light（原生控件跟随）')
+    assert.ok(js.includes("setAttribute('data-theme', key)"), '切换必须只改 data-theme 属性')
+    assert.ok(js.includes("document.cookie = THEME_COOKIE + '=' + key"), '切主题必须写 cookie（首帧靠它）')
+    assert.ok(js.includes('切换主题（当前 ') && js.includes('title='), '主题键必须有可访问名与悬停提示')
+    assert.ok(js.includes('const shared = readThemeCookie() || currentThemeKey()'), '多标签页必须以共享 cookie 为准算下一套（不得用本标签页旧 state）')
+    assert.ok(/try \{\s*document\.cookie/.test(js), '写 cookie 必须 try/catch：沙箱里抛异常不能挡住状态更新')
+    assert.ok(!/localStorage\.(get|set)Item/.test(js), '不得用 localStorage 记主题（CSP 禁内联脚本，首帧会闪）')
+    assert.ok(srv.includes("const THEMES = ['deep', 'material', 'nord', 'light']"), '服务端必须有主题白名单')
+    assert.ok(/data-theme="\$\{THEMES\.includes\(theme\) \? theme : THEMES\[0\]\}"/.test(srv), '服务端必须把主题写进首帧 <html>')
+  })
+
+  await aok('行为: themeCookieValue（白名单 / 畸形 / 缺省）', () => {
+    const { themeCookieValue } = require('./scripts/console.js')
+    assert.strictEqual(themeCookieValue('xbk_session=x; xbk_theme=nord'), 'nord', '必须能从前面的 cookie 里取到主题')
+    assert.strictEqual(themeCookieValue('xbk_theme=light'), 'light')
+    assert.strictEqual(themeCookieValue('xbk_theme=evil'), 'deep', '白名单外的值必须回落深色（不得写进 <html>）')
+    assert.strictEqual(themeCookieValue('xbk_theme='), 'deep')
+    assert.strictEqual(themeCookieValue(''), 'deep')
+    assert.strictEqual(themeCookieValue(undefined), 'deep')
+    assert.strictEqual(themeCookieValue('xbk_theme=%E0%A4%A'), 'deep', '畸形百分号不得抛异常')
+  })
+
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function Hint ('), '必须有 Hint 原语')
@@ -5283,8 +5326,8 @@ async function main () {
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
     // 版本已 bump 到 3.322：注释里的版本号不得写下一版 v3.323。
-    assert.ok(!/v3\.323/.test(src), 'app.js 注释不得写 v3.323（版本未 bump）')
-    assert.ok(!/v3\.323/.test(css), 'app.css 注释不得写 v3.323（版本未 bump）')
+    assert.ok(!/v3\.324/.test(src), 'app.js 注释不得写 v3.324（版本未 bump）')
+    assert.ok(!/v3\.324/.test(css), 'app.css 注释不得写 v3.324（版本未 bump）')
   })
 }
 

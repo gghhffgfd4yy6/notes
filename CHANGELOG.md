@@ -610,3 +610,12 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **修复**：`.msg-meta` 显式 `align-items: center`；pill 与时间保持自身 19px 高度、在 44px 行内垂直居中，原文链接的 44px 命中区不变。
 - **范围**：纯前端（`scripts/console-assets/app.css`）；服务端接口与数据未变。
 - **门禁**：`test_console.js` 结构红线补一条——`.msg-meta` 必须 `align-items:center`，否则 44px 链接会把来源 pill 拉成圆球。
+
+## v3.323 — 控制台四套主题（切换键 / 首帧不闪）
+
+- **新增**：顶部「◐ 主题」键，点一次换下一套：深夜（默认）/ 材质 / 北境 / 明亮；按钮上直接显示当前主题名，不弹菜单。
+- **实现**：只换 CSS token（`app.css` 的 `:root[data-theme=…]` 块，仅颜色 + `color-scheme`），间距/字阶/圆角/动效一律不动 ⇒ 切换不改变布局、不顶动列表与页签。
+- **首帧**：CSP 是 `script-src 'self'`（禁内联脚本），不能在 `<head>` 里读 localStorage；改为前端把选择写进 `xbk_theme` cookie，服务端渲染时写进 `<html data-theme>`，浅色主题不会先闪一帧深色。非法/缺失 cookie 回落 `deep`。
+- **风格**：材质 = Material 3 紫调中性色（浅紫描边 + `#6750a4` 实心）；北境 = Nord 冷灰蓝（`#2e3440` / `#88c0d0`）；明亮 = 白天/投屏，前景色全套改深色系。
+- **范围**：`app.js` / `app.css` / `console.js`（首帧属性与 cookie 解析）；接口与数据不变。
+- **门禁**：`test_console.js` 新增两条契约（4 套 token 块且不夹带布局 token、`color-scheme: light`、服务端白名单与首帧属性、禁 localStorage）与 `themeCookieValue` 行为断言（正常/白名单外/空/畸形百分号）。
