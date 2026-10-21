@@ -602,3 +602,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **细节**：滚动监听 `passive` 且用 rAF 合帧（惯性滚动一帧多个 scroll 事件只 setState 一次）；隐藏态 `visibility: hidden` + `pointer-events: none`，不吞列表末尾的点击；尊重 `prefers-reduced-motion`，老 Safari 没有 `scrollBehavior` 时退回瞬时滚动；键盘/读屏触发后把焦点交给当前页签，不掉到 body。
 - **范围**：纯前端（`scripts/console-assets/app.js`、`app.css`）；服务端接口未变。
 - **门禁**：`test_console.js` 新增一条 v3.321 契约（固定层 / 44px / 隐藏态不可点 / 安全区 / 可访问名 / 隐藏时不进 Tab 序列 / reduced-motion 分支）。
+
+## v3.322 — 控制台推送记录来源 pill 不再被 44px 原文链接拉成圆球
+
+- **现象**：手机端推送记录里，来源标签变成 44px 高的圆球/胖胶囊——「新赚吧」实测 51×44，文字贴在顶部、下方一大片空白；同一条记录里的时间与「原文链接」看着正常。
+- **根因**：v3.317 把 `.msg-link` 的点击区抬到 44px（`min-height`）；`.msg-meta` 是 flex 行且没设 `align-items`，默认 `stretch` 会把同一行的 `.msg-cate` 一起拉到 44px。pill 的 `border-radius:999px` 下，短分类 51×44 就是近圆形。分类名较长时链接被挤到下一行，pill 才保持 19px——所以只有部分记录异常，越短的来源越像圆球。
+- **修复**：`.msg-meta` 显式 `align-items: center`；pill 与时间保持自身 19px 高度、在 44px 行内垂直居中，原文链接的 44px 命中区不变。
+- **范围**：纯前端（`scripts/console-assets/app.css`）；服务端接口与数据未变。
+- **门禁**：`test_console.js` 结构红线补一条——`.msg-meta` 必须 `align-items:center`，否则 44px 链接会把来源 pill 拉成圆球。

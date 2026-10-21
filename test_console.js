@@ -4688,6 +4688,12 @@ async function main () {
     const narrow = (css.match(/@media \(max-width: 420px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
     assert.ok(/\.tabs\s*\{[^}]*gap:/.test(narrow) && /\.tab-btn\s*\{[^}]*padding:/.test(narrow), '≤420 窄屏媒体查询必须真的作用于标签栏（v3.317 由 360 上移：362 宽要命中）')
     assert.ok(/\.msg-meta\s*\{[^}]*min-width:\s*0/.test(css), 'msg-meta 须 min-width:0（flex 子项才可收缩）')
+    // v3.322：44px 的 .msg-link 会把同一 flex 行的 .msg-cate 拉到 44px（默认 stretch），
+    // 999px 圆角下短分类变成圆球、文字贴顶。meta 行必须显式居中。
+    const metaRules = css.match(/\.msg-meta\s*\{[^}]*\}/g) || []
+    const metaAligns = metaRules.map(r => (r.match(/align-items:\s*([^;]+)/) || [])[1]).filter(Boolean).map(v => v.trim())
+    assert.ok(metaAligns.length > 0 && metaAligns.every(v => v === 'center'),
+      '每条 .msg-meta 的 align-items 都必须是 center（后置 stretch 会重新把来源 pill 拉成圆球）')
   })
 
   await aok('结构红线: MiniSelect（滚动重量 / 视口夹取 / Tab 焦点 / 可访问名 / 回滚目标）', () => {
@@ -5276,9 +5282,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本没 bump：注释里的版本号只能是 v3.321。
-    assert.ok(!/v3\.322/.test(src), 'app.js 注释不得写 v3.322（版本未 bump）')
-    assert.ok(!/v3\.322/.test(css), 'app.css 注释不得写 v3.322（版本未 bump）')
+    // 版本已 bump 到 3.322：注释里的版本号不得写下一版 v3.323。
+    assert.ok(!/v3\.323/.test(src), 'app.js 注释不得写 v3.323（版本未 bump）')
+    assert.ok(!/v3\.323/.test(css), 'app.css 注释不得写 v3.323（版本未 bump）')
   })
 }
 
