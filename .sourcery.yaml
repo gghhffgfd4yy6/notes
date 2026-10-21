@@ -5,3 +5,5 @@
 version: '1'
 ignore:
   - 'scripts/console-assets/htm-preact.module.js'
+  # flatpickr 4.6.13 上游产物，同上：只评审我们自己的代码。
+  - 'scripts/console-assets/flatpickr.module.js'

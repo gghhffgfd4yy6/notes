@@ -216,3 +216,18 @@ export function filterRunItems (items, { mode = 'all', day = '' } = {}) {
     return true
   })
 }
+
+// 日期区间按钮文案（v3.326）：跨年必须写全两端年份，否则 "12-28 ~ 01-03" 会被读成
+// 同一年（甚至同一天）——用户实测在日志页把 2025-10-01 ~ 2026-10-01 看成了一天。
+// 同一年且就是今年才省略年份（"10-19 ~ 10-20"），非今年保留起点年份。
+export function dateRangeLabel (from, to, todayKey = '') {
+  const dayRe = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
+  if (typeof from !== 'string' || typeof to !== 'string') return ''
+  if (!dayRe.test(from) || !dayRe.test(to) || from > to) return ''
+  const fy = from.slice(0, 4)
+  const ty = to.slice(0, 4)
+  if (fy !== ty) return `${from} ~ ${to}`
+  const thisYear = typeof todayKey === 'string' && todayKey.length >= 4 ? todayKey.slice(0, 4) : ''
+  if (thisYear !== '' && fy !== thisYear) return `${from} ~ ${to.slice(5)}`
+  return `${from.slice(5)} ~ ${to.slice(5)}`
+}

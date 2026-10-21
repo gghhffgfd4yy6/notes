@@ -46,6 +46,7 @@ const {
   sanitizeAccessPath, shouldLogAccess, acceptsGzip, ACCESS_LOG_MAX,
   findSecretLikeField, CACHE_HEALTH_COUNT_MAX_BYTES, cacheHealthEntryCount,
   filterMessageItems, filterMessagesByDays, messageCategoriesOf, MESSAGE_DAYS_ALLOWED,
+  parseDayKey, filterMessagesByRange, windowMessages,
   clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
   RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS,
@@ -634,6 +635,37 @@ ok('T-P2b 时间窗: 上海日历日边界 / 分类计数跟随窗口 / 非法�
   assert.strictEqual(filterMessagesByDays(items, 99, now).length, 4, '正数窗宽按窗口过滤（白名单在端点）')
   assert.deepStrictEqual(messageCategoriesOf(filterMessagesByDays(items, 1, now)), [{ name: 'A', count: 1 }], '分类计数跟随时间窗')
 })
+ok('T-P2c 日期区间: parseDayKey 回环校验 / 闭区间过滤 / 区间优先于 days', () => {
+  // 格式与真实性：闰日合法、2 月 30 归一化必须被拒（Date 会把 02-30 挪到 03-02）
+  assert.strictEqual(parseDayKey('2026-10-05'), '2026-10-05')
+  assert.strictEqual(parseDayKey('2024-02-29'), '2024-02-29', '闰日合法')
+  assert.strictEqual(parseDayKey('2026-02-30'), '', '不存在的日期必须拒（防 Date 归一化）')
+  assert.strictEqual(parseDayKey('2026-13-01'), '', '月份越界拒')
+  assert.strictEqual(parseDayKey('2026-1-5'), '', '必须两位月日')
+  assert.strictEqual(parseDayKey('2026-10-05x'), '', '多余字符拒')
+  assert.strictEqual(parseDayKey(undefined), '', '非字符串拒')
+  const items = [
+    { title: '区间外前', datetime: '2026-10-04 23:00:00' },
+    { title: '起点', datetime: '2026-10-05 00:00:00' },
+    { title: '中间', datetime: '2026-10-08 12:00:00' },
+    { title: '终点', datetime: '2026-10-12 23:59:59' },
+    { title: '区间外后', datetime: '2026-10-13 00:00:00' },
+    { title: '缺日期' },
+    { title: '坏日期', datetime: 'oops' }
+  ]
+  assert.deepStrictEqual(filterMessagesByRange(items, '2026-10-05', '2026-10-12').map(m => m.title),
+    ['起点', '中间', '终点'], '闭区间（端点都含），缺/坏日期不猜')
+  assert.strictEqual(filterMessagesByRange(items, '2026-10-12', '2026-10-05').length, 7, '颠倒区间直通（服务端另有回落）')
+  assert.strictEqual(filterMessagesByRange(items, '', '2026-10-12').length, 7, '缺起点直通')
+  // windowMessages：区间优先于 days，回显三元组
+  const w = windowMessages(items, { days: 1, fromKey: '2026-10-05', toKey: '2026-10-12' })
+  assert.deepStrictEqual(w.items.map(m => m.title), ['起点', '中间', '终点'])
+  assert.deepStrictEqual([w.days, w.from, w.to], [0, '2026-10-05', '2026-10-12'], '区间生效时 days 归零，避免两套窗口同时回显')
+  const w2 = windowMessages(items, { days: 0, fromKey: '', toKey: '' })
+  assert.strictEqual(w2.items.length, 7)
+  assert.deepStrictEqual([w2.days, w2.from, w2.to], [0, '', ''], '无区间无 days = 全部')
+})
+
 ok('T-P3 exportRowOf: 五字段白名单 / 缺省回退 / 200 码元截断 / time 拼接 trim', () => {
   const full = exportRowOf({
     id: 7,
@@ -1520,7 +1552,7 @@ async function main () {
     assert.ok(verMatch, 'HTML 资产引用必须带内容版本号 ?v=<sha16>')
     // 版本号必须由内容派生（sha256(各文件哈希拼接) 前 16 位），常量/陈旧版本过不了这条
     const crypto = require('node:crypto')
-    const hashes = ['app.css', 'app.js', 'pure.mjs', 'htm-preact.module.js'].map((f) => {
+    const hashes = ['app.css', 'app.js', 'pure.mjs', 'htm-preact.module.js', 'flatpickr.module.js', 'flatpickr.css'].map((f) => {
       const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', f))
       return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
     })
@@ -3800,6 +3832,17 @@ async function main () {
     const t14 = JSON.parse((await request(port, 'GET', '/api/trends', { token: TOKEN })).text)
     assert.strictEqual(t14.byDay.length, TREND_DAYS_DEFAULT)
     assert.ok(!t14.byDay.some((d) => d.date === dayKey(50)), '50 天前的行不进 14 日窗')
+    // 区间用「相对今天」的日期，让 fixture 的当天行落在区间里：只验日期回显/补零
+    // 不验聚合的话，端点全返 0 也能过（Sourcery #288 M8）。
+    const trFrom = dayKey(2)
+    const trTo = dayKey(0)
+    const tr = JSON.parse((await request(port, 'GET', `/api/trends?from=${trFrom}&to=${trTo}`, { token: TOKEN })).text)
+    assert.deepStrictEqual([tr.from, tr.to, tr.byDay.length], [trFrom, trTo, 3], '趋势区间：回显 from/to 且按天补零')
+    const trToday = tr.byDay.find((d) => d.date === trTo)
+    assert.ok(trToday && trToday.rounds === 1 && trToday.total === 10 && trToday.pushed === 5,
+      '区间聚合必须把当天摘要行算进去（不能只回三行 0）')
+    const trBad = JSON.parse((await request(port, 'GET', '/api/trends?from=2026-02-30&to=2026-10-03', { token: TOKEN })).text)
+    assert.strictEqual(trBad.from, '', '非法日期必须静默回落到 days 模式')
     const t30 = JSON.parse((await request(port, 'GET', '/api/trends?days=30', { token: TOKEN })).text)
     assert.strictEqual(t30.byDay.length, 30)
     assert.ok(t30.byDay.some((d) => d.date === dayKey(20) && d.pushed === 5), '20 天前的行进 30 日窗')
@@ -4150,6 +4193,14 @@ async function main () {
   })
 
   await aok('行为: relDay / fmtAge / cacheWriteInfo（注入固定时钟）', async () => {
+    const { dateRangeLabel } = await import('./scripts/console-assets/pure.mjs')
+    // 跨年文案（用户实测 bug）：2025-10-01 ~ 2026-10-01 曾显示成 "10-01 ~ 10-01"，像一天。
+    assert.strictEqual(dateRangeLabel('2025-10-01', '2026-10-01', '2026-10-21'), '2025-10-01 ~ 2026-10-01', '跨年必须写全两端年份')
+    assert.strictEqual(dateRangeLabel('2025-10-01', '2025-10-05', '2026-10-21'), '2025-10-01 ~ 10-05', '非今年保留起点年份')
+    assert.strictEqual(dateRangeLabel('2026-10-19', '2026-10-20', '2026-10-21'), '10-19 ~ 10-20', '今年同一年可省年份')
+    assert.strictEqual(dateRangeLabel('2026-10-21', '2026-10-21', '2026-10-21'), '10-21 ~ 10-21', '同一天也写两端（不省略成一天）')
+    assert.strictEqual(dateRangeLabel('2026-10-21', '2026-10-20', '2026-10-21'), '', '颠倒区间返回空（调用方回退占位）')
+    assert.strictEqual(dateRangeLabel('x', '2026-10-20'), '', '非法输入返回空')
     const { relDay, fmtAge, cacheWriteInfo } = await import('./scripts/console-assets/pure.mjs')
     // 2026-10-18 00:00 Asia/Shanghai = 2026-10-17T16:00Z
     const now = Date.UTC(2026, 9, 17, 16, 0, 0)
@@ -4798,7 +4849,9 @@ async function main () {
     }
     assert.ok(/:root \{[^}]*--shadow-card/.test(css), '默认（深夜）也要有 --shadow-card')
     assert.ok(!/localStorage\.(get|set)Item/.test(js), '不得用 localStorage 记主题（CSP 禁内联脚本，首帧会闪）')
-    assert.ok(srv.includes("const THEMES = ['deep', 'material', 'nord', 'light']"), '服务端必须有主题白名单')
+    // 变异沙箱里 console.js 会被插桩成 stryMutAct_… ? … : ['deep', …]，文本断言必假红；
+    // 改断言运行时导出值，比文本更硬（键名/顺序/数量全覆盖）。
+    assert.deepStrictEqual([...require('./scripts/console.js').THEMES], ['deep', 'material', 'nord', 'light'], '服务端必须有主题白名单')
     assert.ok(/data-theme="\$\{THEMES\.includes\(theme\) \? theme : THEMES\[0\]\}"/.test(srv), '服务端必须把主题写进首帧 <html>')
   })
 
@@ -4885,15 +4938,15 @@ async function main () {
     assert.ok(/\.logpre mark\s*\{[^}]*color:\s*inherit/.test(css), '<mark> 不得把 ERROR 行的红字盖成默认黑字')
     // 性能护栏：>3000 行退回纯文本，且计数行明说。
     assert.ok(src.includes('const LOG_HIGHLIGHT_MAX = 3000'), '高亮护栏阈值必须是 3000 行')
-    assert.ok(src.includes('const heavy = filtered.length > LOG_HIGHLIGHT_MAX'), '超过阈值必须走纯文本分支')
-    const guardAt = src.indexOf('if (filtered.length > LOG_HIGHLIGHT_MAX) return null')
+    assert.ok(src.includes('const heavy = ranged.length > LOG_HIGHLIGHT_MAX'), '超过阈值必须走纯文本分支（v3.326 起按区间过滤后的行数算）')
+    const guardAt = src.indexOf('if (ranged.length > LOG_HIGHLIGHT_MAX) return null')
     assert.ok(guardAt > 0, '超阈值必须在 useMemo 里短路（不能先 map 一遍再二选一）')
-    assert.ok(src.indexOf('return filtered.map((line, i) =>', guardAt - 200) > guardAt, '护栏必须早于 map（顺序反了等于没省）')
+    assert.ok(src.indexOf('return ranged.map((line, i) =>', guardAt - 200) > guardAt, '护栏必须早于 map（顺序反了等于没省）')
     assert.ok(src.includes('已关闭高亮'), '关掉高亮必须在计数行写明（不能让人以为搜不到）')
     assert.ok(/heavy \? shownText : lineNodes/.test(src), '超阈值必须退回纯文本渲染')
     // 计数行点名筛选 + 空态出口（0 命中先点名筛选，再给「在全部日志中搜索」）。
-    assert.ok(src.includes('筛选下 · 显示 ' + ph('filtered.length') + ' / ' + ph('lines.length') + ' 行'),
-      '筛选非 all 时计数行必须点名筛选')
+    assert.ok(src.includes('筛选下 · 显示 ' + ph('ranged.length') + ' / ' + ph('lines.length') + ' 行'),
+      '筛选非 all 时计数行必须点名筛选（v3.326 起按含日期区间的 ranged 计数）')
     assert.ok(src.includes('在全部日志中搜索') && src.includes('onClick=' + ph('searchAllLogs')),
       '空态必须给「在全部日志中搜索」按钮')
     assert.ok(src.includes('在「' + ph('modeLabel') + '」筛选下没有匹配的日志行'), '空态文案必须点名当前筛选')
@@ -5005,6 +5058,68 @@ async function main () {
       '当前页签必须自动滚入视野且不带动整页滚动')
   })
 
+  await aok('结构红线: v3.326 日期区间（资产白名单 / 中文分隔符 / 双月只在桌面 / 44px）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
+    const srv = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
+    // 资产：新增两个文件必须进白名单（CSP script-src 'self' 下没有 CDN 兜底，漏一条就整页白屏）
+    assert.ok(srv.includes("'/assets/flatpickr.js'") && srv.includes("'/assets/flatpickr.css'"), 'flatpickr 的 JS/CSS 都必须在 STATIC_ASSETS 白名单里')
+    const ph = (name) => '$' + '{' + name + '}'
+    assert.ok(srv.includes('<link rel="stylesheet" href="/assets/flatpickr.css' + ph('assetQuery()') + '">'), 'CSS 必须在页面 head 引入且带内容版本号')
+    assert.ok(src.includes("import flatpickr from './flatpickr.js'"), '前端按白名单路由名导入（写成 flatpickr.module.js 会 404 整页白屏）')
+    // 交互：range 模式 + 统一日历；中文语言包的区间分隔符是「 至 」——按 " to " 切会永远匹配不上
+    assert.ok(src.includes("mode: 'range'") && src.includes('disableMobile: true'), '区间模式且禁用原生手机弹层（原生 date 不支持区间）')
+    assert.ok(src.includes('dates.length !== 2'), '端点只认 Date 对象数组（不解析本地化字符串）')
+    assert.ok(!src.includes("str.split(' to ')"), "zh 语言包用「 至 」，不得按 ' to ' 切")
+    assert.ok(src.includes('maxDate: todayKeyShanghai()'), '不允许选未来：上限必须按上海日历日（浏览器本地 today 会错位）')
+    assert.ok(src.includes('showMonths: 1'), '单月：390 下双月 613px 必然横溢出，maxDate 后第二月只剩禁用格')
+    assert.ok(src.includes("monthSelectorType: 'static'"), '月份必须是静态文字：原生 <select> 在手机上弹白底系统列表，深色面板里必破一致性')
+    // 年份：原生 number 输入框在月份旁边，手机上下滑动极易误触弹键盘 ⇒ 禁指针 + 自有 « » 步进。
+    assert.ok(/\.flatpickr-current-month \.numInputWrapper \{ pointer-events: none/.test(css), '年份原生输入框必须禁用指针')
+    assert.ok(!src.includes('fp-year-step'), '头部只保留 ‹ › 两个箭头：再塞年份步进会变成四个箭头挤一起')
+    // 区间高亮：flatpickr 用 box-shadow 把首尾连成"蓝条"，只选两天就是一根横杠（用户实拍）。
+    assert.ok(/\.flatpickr-day\.selected\.startRange \+ \.endRange:not\(:nth-child\(7n\+1\)\)/.test(css), '必须显式覆盖相邻首尾的连接阴影')
+    assert.ok(/\.flatpickr-day\.selected::before[\s\S]{0,200}border-radius: 50%/.test(css), '区间高亮改成独立圆点（::before）')
+    // 选中态底色必须用带 .flatpickr-calendar 前缀的规则压干净，否则露出 52x44 蓝色方块（用户实拍）。
+    assert.ok(/\.flatpickr-calendar \.flatpickr-day\.selected, \.flatpickr-calendar \.flatpickr-day\.startRange,[\s\S]{0,700}background: transparent; border-color: transparent; color: var\(--on-accent\)/.test(css), '选中态不能留方形底色')
+    assert.ok(/\.flatpickr-day\.today:not\(\.selected\)::after/.test(css), '「今天」用小圆点，不用方形描边')
+    // 月份箭头长按连翻：跨年要按十几下（用户要求"按越久翻越快"）。
+    assert.ok(src.includes('function attachMonthHoldRepeat') && src.includes('onReady (_sel, _str, inst) { attachMonthHoldRepeat(inst) }'), '月份箭头必须挂长按连翻')
+    assert.ok(/held < 1200 \? 800 : held < 2400 \? 400 : held < 4000 \? 200 : 100/.test(src), '连翻要递进加速（800→400→200→100ms）')
+    assert.ok(src.includes('flatpickr-disabled') && /classList\.contains\('flatpickr-disabled'\)/.test(src), '连翻到边界必须自己停（下一月按钮已被隐藏）')
+    assert.ok(/touch-action: none; -webkit-user-select: none/.test(css), '长按不能弹选字/系统菜单')
+    // 系统在长按 ~500ms 会弹选字/预览（手机上"叮"一声）：touchstart 必须拦掉，点击也只认自己的 pointerup。
+    assert.ok(/addEventListener\('touchstart', \(e\) => e\.preventDefault\(\), \{ passive: false \}\)/.test(src), '长按要拦 touchstart，否则系统菜单+提示音')
+    assert.ok(/addEventListener\('click', \(e\) => \{ e\.preventDefault\(\); e\.stopPropagation\(\) \}, true\)/.test(src), '原生 click 必须吞掉，避免和自管手势重复翻月')
+    assert.ok(/\.flatpickr-current-month input\.cur-year \{ cursor: default/.test(css), '年份不可编辑（静态展示）')
+    // 主题与触控：日历必须吃 token（四套主题自动跟随），手机日格 44px
+    assert.ok(/\.flatpickr-calendar \{[^}]*background: var\(--panel\)/.test(css), '日历底色必须走 --panel')
+    assert.ok(/\.flatpickr-day\.selected[^{]*\{[^}]*background: var\(--accent-solid\)/.test(css), '区间端点必须实心强调色（不靠描边）')
+    assert.ok(/@media \(max-width: 640px\) \{[\s\S]*?\.flatpickr-calendar \.flatpickr-day \{ height: 44px/.test(css), '手机日格高度必须 44px（触控红线）')
+    // 复用面：四处时间筛选（趋势 / 逐轮历史 / 推送记录 / 运行日志）都必须用同一个组件，
+    // 不允许再出现第二套原生 date 输入或手写日历。
+    const uses = (src.match(/<\$\{DateRange\}/g) || []).length
+    assert.ok(uses >= 4, `四处时间筛选都要复用 DateRange（实际 ${uses} 处）`)
+    assert.ok(!src.includes('type="date"'), '不得残留原生 date 输入（统一走 DateRange）')
+    assert.strictEqual((src.match(/flatpickr\(/g) || []).length, 1, 'flatpickr 只允许在 DateRange 里初始化一次（必须真的调了一次）')
+    // 趋势服务端：区间优先于 days（与推送记录同口径）
+    // 同样不能读源码文本（status.js 也在变异矩阵里）：直接调 readTrends 验行为。
+    const tmpDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'xbk-trends-'))
+    try {
+      fs.writeFileSync(path.join(tmpDir, 'run.log'), '')
+      const { readTrends } = require('./scripts/status.js')
+      const fixedNow = Date.parse('2026-01-10T00:00:00Z')
+      const r3 = readTrends(tmpDir, { from: '2026-01-01', to: '2026-01-03', now: fixedNow })
+      assert.strictEqual(r3.status, 'ok', '空 run.log 也应可读')
+      assert.strictEqual(r3.value.days, 3, 'readTrends 必须按 from/to 算窗口（闭区间 3 天）')
+      assert.strictEqual(r3.value.from, '2026-01-01', 'readTrends 必须回显区间起点')
+      const rCap = readTrends(tmpDir, { from: '2020-01-01', to: '2026-01-10', now: fixedNow })
+      assert.strictEqual(rCap.value.days, 92, '趋势区间跨度必须有上限（92 天，防一次画几百列）')
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
   await aok('结构红线: v3.317 表格动作列贴右（两个表 / 不透明底色 / 分隔线）', () => {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.css'), 'utf8')
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.js'), 'utf8')
@@ -5104,7 +5219,7 @@ async function main () {
     assert.ok(logs.includes('!data && !err && html`<div class="log-empty"'), '首帧必须渲染读取中占位')
     assert.ok(logs.includes('读取中'), '占位文案必须说明在读（不能空白）')
     assert.ok(!logs.includes('html`<div class="empty">日志'), '日志未生成/不可读不得用 .empty（高度会反向塌）')
-    assert.ok(/filtered\.length === 0\s*\?\s*html`<div class="log-empty"/.test(logs), '0 命中必须也用 .log-empty')
+    assert.ok(/ranged\.length === 0\s*\?\s*html`<div class="log-empty"/.test(logs), '0 命中必须也用 .log-empty（按区间筛完的 ranged 判定，不是 filtered）')
   })
 
   // ── v3.321 首屏剩余 pop：系统页 access-log 的 44px、日志页工具条的 153px ──────────
@@ -5240,7 +5355,10 @@ async function main () {
     const histRefresh = hist.slice(hist.indexOf('const refresh = () =>'), hist.indexOf('const changeDay'))
     assert.ok(histRefresh.includes('load().catch') && !histRefresh.includes('landRef'), '逐轮历史刷新不得搬滚动位置')
     // 主动路径逐个点名：改每页 / 改分类 / 改时间都走同一个带门的 armLand。
-    for (const frag of ['armLand(); setSize(Number(v)); setPage(1)', 'armLand(); setCate(v); setPage(1)', 'armLand(); setDays(Number(v)); setPage(1)']) {
+    // v3.326：时间窗处理器多了「先清区间」一步（自定义区间与 preset 互斥），
+    // 红线只要求「主动筛选必须先置落点旗」，不再锁死单行拼接形态。
+    for (const frag of ['armLand(); setSize(Number(v)); setPage(1)', 'armLand(); setCate(v); setPage(1)',
+      'armLand()\n          setRange({ from: \'\', to: \'\' })\n          setDays(Number(v))\n          setPage(1)']) {
       assert.ok(msg.includes(frag), '推送记录主动筛选必须置落点旗：' + frag)
     }
     // ④ 逐轮历史只在值真变化时置旗：已选中的 chip / 同一天 / 同一页都不得留旗。
@@ -5249,7 +5367,7 @@ async function main () {
     assert.ok(cmHead.includes('if (m === mode) {') && cmHead.includes('return'), '已选中的 chip 不得再置旗')
     assert.strictEqual((hist.match(/changeMode\('/g) || []).length, 3, '三个 chip 都必须走 changeMode')
     assert.ok(!/onClick=\$\{\(\) => \{ landRef\.current = true/.test(hist), 'chip 不得裸置旗')
-    assert.ok(/const changeDay = \(v\) => \{\s*if \(v === day\) return/.test(hist), '日期没变不得置旗')
+    assert.ok(/const changeDay = \(v\) => \{[\s\S]{0,160}?if \(v\.from === runRange\.from && v\.to === runRange\.to\) return/.test(hist), '区间没变不得置旗')
     assert.ok(/const changeSize = \(n\) => \{\s*if \(n === size\) return/.test(hist), '每页条数没变不得置旗')
     // ③ 搜索落点：不得再看 activeElement（防抖触发时焦点必然还在输入框 ⇒ 主路径永不落点），
     //    只在词真的变了时置旗；「已滚进列表」门保留在 armLand 里。
@@ -5342,9 +5460,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.326：注释里的版本号不得写下一版 v3.327。
-    assert.ok(!/v3\.327/.test(src), 'app.js 注释不得写 v3.327（版本未 bump）')
-    assert.ok(!/v3\.327/.test(css), 'app.css 注释不得写 v3.327（版本未 bump）')
+    // 版本已 bump 到 3.327：注释里的版本号不得写下一版 v3.328。
+    assert.ok(!/v3\.328/.test(src), 'app.js 注释不得写 v3.328（版本未 bump）')
+    assert.ok(!/v3\.328/.test(css), 'app.css 注释不得写 v3.328（版本未 bump）')
   })
 
   await aok('结构红线: v3.326 逐轮历史切档不闪（两档快照预取 / 无快照等数据回来再换）', () => {
@@ -5376,8 +5494,8 @@ async function main () {
       '无快照时必须等请求回来再一起换数据与选中态')
     assert.ok(pendingTail.includes('window.setTimeout(') && pendingTail.includes('}, 150)'), '忙碌提示必须延迟 150ms（快请求不闪）')
     assert.ok(pendingTail.includes('landRef.current = false'), '请求失败必须撤销落点')
-    assert.ok(hist.includes('const filtered = filterRunItems(all, { mode, day })'),
-      '切档原子化后可以直接按 mode 过滤（数据始终属于当前档）')
+    assert.ok(hist.includes('const filtered = filterRunItems(all, { mode })') && hist.includes('inDayRange('),
+      '切档原子化后可以直接按 mode 过滤，本分支再叠日期区间（数据始终属于当前档）')
     assert.ok(hist.includes("const issueCount = fullSnap ? filterRunItems(all, { mode: 'issue' }).length : null"),
       '异常计数只能来自全量快照（仅运行档算出来是假的 2）')
     assert.ok(hist.includes("mode === 'runs' || issueCount === null ? '只看异常'"), '没有全量快照 / 仅运行档下不得显示异常数字')
