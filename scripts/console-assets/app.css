@@ -334,8 +334,10 @@
   }
   /* v3.317 日志页专用高度：旧版固定 320px，362×795 下首屏只能看到 6 行、日志框还从
      y=826 开始（视口 795）。手机按视口高度的 62%（上限 520px），桌面固定 520px；
-     触发历史里的 .logbox 仍沿用上面的 320px，不受影响。 */
-  .logpre-main { max-height: 520px; }
+     触发历史里的 .logbox 仍沿用上面的 320px，不受影响。
+     v3.320：max-height 之外再给同值的 min-height——首帧「读取中」占位、0 命中空态
+     与有日志时的框同高，数据到达/筛选切换不再让文档高度突跳（旧版 90→776px）。 */
+  .logpre-main { max-height: 520px; min-height: 520px; }
   /* 行级着色（v3.317）：ERROR 红、ALERT/WARN 琥珀，其余继承默认前景色。
      一行一个行内 <span>、换行仍是真实 "\n" ⇒ pre-wrap 与复制出来的换行都不变。 */
   .logline-bad { color: var(--bad-fg); }
@@ -353,10 +355,11 @@
      文字色继承所在行（深浅主题都成立）。 */
   .logpre mark { background: var(--warn-soft); color: inherit; border-radius: 2px; box-shadow: inset 0 0 0 1px var(--warn-line); }
   /* 日志空态：与日志框同底色，避免面板里出现一段透明空洞；「在全部日志中搜索」
-     按钮就在这一层里（0 命中且筛选非 all 时才出现）。 */
+     按钮就在这一层里（0 命中且筛选非 all 时才出现）。
+     v3.320：高度与 .logpre-main 对齐（旧版 120px），0 命中时日志框不再反向塌掉。 */
   .log-empty {
     display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--sp-2);
-    min-height: 120px; padding: var(--sp-3); text-align: center;
+    min-height: 520px; padding: var(--sp-3); text-align: center;
     background: var(--log-bg); color: var(--text-dim); border-radius: var(--r-sm); font-size: var(--fs-sm);
   }
   /* 日志筛选（v3.306）：全部/异常 + 关键字；异常收窄后仍是同一份尾部文本，不发请求。 */
@@ -369,6 +372,10 @@
   }
   .log-chip:hover { color: var(--text); border-color: var(--accent-line); }
   .log-chip.on { color: var(--info-fg); background: var(--accent-soft); border-color: var(--accent-line); }
+  /* v3.320：chip 计数固定宽度。加载态显示 —、到数据后变 269，宽度差在 362px 下会把 chip
+     行挤重排（多/少一行），工具条高度就跟着跳——首帧占位白算。钉住 min-width + 右对齐，
+     两种状态同宽；tabular-nums 让数字本身等宽。3.2em 容得下 5 位数（旧 2.4em 只够 3 位）。 */
+  .log-chip-n { display: inline-block; min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }
   /* v3.319 行级定位条：写清「这是哪一轮」，并提供「只看这一轮 / 看当天全部」开关。 */
   .log-focus {
     display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
@@ -803,8 +810,10 @@
     /* v3.317：输入框字号 <16px 时 iOS 聚焦会整页放大（Android 也会缩放），手机端统一
        16px 且高度 ≥40px；桌面维持原字阶，不放大页面观感。 */
     .msg-search, .log-search { font-size: 16px; min-height: 40px; }
-    /* 日志页日志框：手机按视口高度的 62%（上限 520px），362×795 下首屏可见 20+ 行。 */
-    .logpre-main { max-height: 62vh; max-height: min(62dvh, 520px); }
+    /* 日志页日志框：手机按视口高度的 62%（上限 520px），362×795 下首屏可见 20+ 行。
+       v3.320：min-height 与 max-height 同值（先 vh 兜底、再 dvh），空态/读取中同高。 */
+    .logpre-main { max-height: 62vh; max-height: min(62dvh, 520px); min-height: 62vh; min-height: min(62dvh, 520px); }
+    .log-empty { min-height: 62vh; min-height: min(62dvh, 520px); }
     .mini-btn, .mini-opt { min-height: 44px; }
     /* 分类筛选：手机端贴底弹层 + 遮罩，避免原生 select 的全屏白底列表 */
     .cate-picker { flex: 1 1 100%; }
