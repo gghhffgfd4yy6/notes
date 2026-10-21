@@ -5460,9 +5460,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.326：注释里的版本号不得写下一版 v3.327。
-    assert.ok(!/v3\.327/.test(src), 'app.js 注释不得写 v3.327（版本未 bump）')
-    assert.ok(!/v3\.327/.test(css), 'app.css 注释不得写 v3.327（版本未 bump）')
+    // 版本已 bump 到 3.327：注释里的版本号不得写下一版 v3.328。
+    assert.ok(!/v3\.328/.test(src), 'app.js 注释不得写 v3.328（版本未 bump）')
+    assert.ok(!/v3\.328/.test(css), 'app.css 注释不得写 v3.328（版本未 bump）')
   })
 
   await aok('结构红线: v3.326 逐轮历史切档不闪（两档快照预取 / 无快照等数据回来再换）', () => {
@@ -5494,8 +5494,8 @@ async function main () {
       '无快照时必须等请求回来再一起换数据与选中态')
     assert.ok(pendingTail.includes('window.setTimeout(') && pendingTail.includes('}, 150)'), '忙碌提示必须延迟 150ms（快请求不闪）')
     assert.ok(pendingTail.includes('landRef.current = false'), '请求失败必须撤销落点')
-    assert.ok(hist.includes('const filtered = filterRunItems(all, { mode, day })'),
-      '切档原子化后可以直接按 mode 过滤（数据始终属于当前档）')
+    assert.ok(hist.includes('const filtered = filterRunItems(all, { mode })') && hist.includes('inDayRange('),
+      '切档原子化后可以直接按 mode 过滤，本分支再叠日期区间（数据始终属于当前档）')
     assert.ok(hist.includes("const issueCount = fullSnap ? filterRunItems(all, { mode: 'issue' }).length : null"),
       '异常计数只能来自全量快照（仅运行档算出来是假的 2）')
     assert.ok(hist.includes("mode === 'runs' || issueCount === null ? '只看异常'"), '没有全量快照 / 仅运行档下不得显示异常数字')
