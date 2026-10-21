@@ -533,6 +533,11 @@
   }
   .log-chip:hover { color: var(--text); border-color: var(--accent-line); }
   .log-chip.on { color: var(--info-fg); background: var(--accent-soft); border-color: var(--accent-line); }
+  /* v3.326：切到没有快照的档位时，数据回来前选中态/列表都不动；超过 150ms 才让点中的
+     chip 呼吸提示（不插转圈节点：chip 宽度一变整行会重排，工具条高度跟着跳）。 */
+  .log-chip[aria-busy="true"] { color: var(--text); border-color: var(--accent-line); animation: chip-wait 1.1s ease-in-out infinite; }
+  @keyframes chip-wait { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+  @media (prefers-reduced-motion: reduce) { .log-chip[aria-busy="true"] { animation: none; border-style: dashed; } }
   /* v3.320：chip 计数固定宽度。加载态显示 —、到数据后变 269，宽度差在 362px 下会把 chip
      行挤重排（多/少一行），工具条高度就跟着跳——首帧占位白算。钉住 min-width + 右对齐，
      两种状态同宽；tabular-nums 让数字本身等宽。5em 容得下 6 位（1MiB 全是换行也有 7 位，

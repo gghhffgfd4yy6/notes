@@ -5244,7 +5244,9 @@ async function main () {
       assert.ok(msg.includes(frag), '推送记录主动筛选必须置落点旗：' + frag)
     }
     // ④ 逐轮历史只在值真变化时置旗：已选中的 chip / 同一天 / 同一页都不得留旗。
-    assert.ok(/const changeMode = \(m\) => \{\s*if \(m === mode\) return/.test(hist), '已选中的 chip 不得再置旗')
+    const cmStart = hist.indexOf('const changeMode = (m) => {')
+    const cmHead = hist.slice(cmStart, hist.indexOf('armLand()', cmStart))
+    assert.ok(cmHead.includes('if (m === mode) {') && cmHead.includes('return'), '已选中的 chip 不得再置旗')
     assert.strictEqual((hist.match(/changeMode\('/g) || []).length, 3, '三个 chip 都必须走 changeMode')
     assert.ok(!/onClick=\$\{\(\) => \{ landRef\.current = true/.test(hist), 'chip 不得裸置旗')
     assert.ok(/const changeDay = \(v\) => \{\s*if \(v === day\) return/.test(hist), '日期没变不得置旗')
@@ -5331,19 +5333,60 @@ async function main () {
     assert.ok(msg.includes('useLandScrollCancel(landRef, userMovedRef)'), '必须接入用户滚动取消 hook')
     assert.ok(src.includes("window.addEventListener('touchmove', mark"), 'hook 里必须有 touchmove/wheel 监听')
 
-    // ⑩ 逐轮历史切模式要等重拉结算；空结果也要保留 listRef（否则无法落点）。
+    // ⑩ 逐轮历史切模式是原子的：有快照同批换；没快照不得先换选中态/列表。
+    // 空结果也要保留 listRef（否则无法落点）。
     const hEffectAt = hist.indexOf('useLayoutEffect(() => {')
     const hEffect = hist.slice(hEffectAt, hist.indexOf('}, [', hEffectAt))
-    assert.ok(hist.includes('asyncLandRef.current = true'), '切模式必须标记为异步落点')
-    assert.ok(hEffect.includes('if (loading) { sawLoadingRef.current = true; return }'), '异步落点必须等 loading 开始')
-    assert.ok(hEffect.includes('if (!sawLoadingRef.current) return'), '重拉未开始的那一帧不得落点')
+    assert.ok(!hEffect.includes('asyncLandRef') && !hEffect.includes('sawLoadingRef'), '落点不得再等「重拉结算」：切档已原子化')
     assert.ok(hEffect.includes('if (userMovedRef.current) return'), '逐轮历史也要防用户自己滚走')
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.322：注释里的版本号不得写下一版 v3.323。
-    assert.ok(!/v3\.324/.test(src), 'app.js 注释不得写 v3.324（版本未 bump）')
-    assert.ok(!/v3\.324/.test(css), 'app.css 注释不得写 v3.324（版本未 bump）')
+    // 版本已 bump 到 3.326：注释里的版本号不得写下一版 v3.327。
+    assert.ok(!/v3\.327/.test(src), 'app.js 注释不得写 v3.327（版本未 bump）')
+    assert.ok(!/v3\.327/.test(css), 'app.css 注释不得写 v3.327（版本未 bump）')
+  })
+
+  await aok('结构红线: v3.326 逐轮历史切档不闪（两档快照预取 / 无快照等数据回来再换）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
+    assert.ok(hist.includes('snapsRef = useRef({ runs: null, all: null })'), '必须留 runs/all 两份服务端快照')
+    assert.ok(hist.includes("fetchSnap(k === 'runs' ? 'all' : 'runs')"), '当前档加载时必须预取另一档（切过去才不用等）')
+    const change = hist.slice(hist.indexOf('const changeMode = (m) => {'), hist.indexOf('const goPage = (n) => {'))
+    // 有快照：数据先于选中态落地（同一批渲染），首帧就是目标档。
+    const cachedAt = change.indexOf('if (cached !== null) {')
+    const cachedBlock = change.slice(cachedAt, change.indexOf('return', cachedAt))
+    assert.ok(cachedBlock.includes('setData(cached)') && cachedBlock.indexOf('setData(cached)') < cachedBlock.indexOf('setMode(m)'),
+      '有快照时数据必须先于选中态落地')
+    assert.ok(cachedBlock.includes('setDataMode(key)'), '有快照时 dataMode 必须同步换档（否则筛选会按旧档渲染）')
+    // load 必须真的消费 quietNextRef：静默刷新不置 loading（否则切档时分页按钮闪禁用态）。
+    const loadAt = hist.indexOf('const load = useCallback(async () => {')
+    const loadSrc = hist.slice(loadAt, hist.indexOf('}, [mode, fetchSnap])', loadAt))
+    assert.ok(loadSrc.includes('const quiet = quietNextRef.current') && loadSrc.includes('quietNextRef.current = false'),
+      'load 必须读取并清掉 quietNextRef')
+    assert.ok(loadSrc.includes('setLoading(!quiet)'), '静默刷新不得置 loading')
+    assert.ok(hist.includes("const fullSnap = dataMode === 'all'"), 'fullSnap 必须由 dataMode 推导，不得写死')
+    // 没快照：选中态与列表都不先动，请求回来再一次性 setData + setMode。
+    const pendingAt = change.indexOf('setPendingMode(m)')
+    const pendingTail = change.slice(pendingAt)
+    assert.ok(pendingAt > 0, '必须有无快照的等待分支')
+    assert.ok(pendingTail.indexOf('setMode(m)') > pendingTail.indexOf('fetchSnap(key).then'), '无快照时不得先换选中态（等请求回来再换）')
+    assert.ok(pendingTail.includes('fetchSnap(key).then((d) => {') && pendingTail.includes('setData(d)') && pendingTail.includes('setMode(m)'),
+      '无快照时必须等请求回来再一起换数据与选中态')
+    assert.ok(pendingTail.includes('window.setTimeout(') && pendingTail.includes('}, 150)'), '忙碌提示必须延迟 150ms（快请求不闪）')
+    assert.ok(pendingTail.includes('landRef.current = false'), '请求失败必须撤销落点')
+    assert.ok(hist.includes('const filtered = filterRunItems(all, { mode, day })'),
+      '切档原子化后可以直接按 mode 过滤（数据始终属于当前档）')
+    assert.ok(hist.includes("const issueCount = fullSnap ? filterRunItems(all, { mode: 'issue' }).length : null"),
+      '异常计数只能来自全量快照（仅运行档算出来是假的 2）')
+    assert.ok(hist.includes("mode === 'runs' || issueCount === null ? '只看异常'"), '没有全量快照 / 仅运行档下不得显示异常数字')
+    assert.ok(hist.includes('aria-busy=$' + "{pendingMode === 'issue' && pendingBusy ? 'true' : 'false'}"),
+      '忙碌态必须延迟到 pendingBusy 才对外声明（否则快请求也闪一下）')
+    const chipCss = css.slice(css.indexOf('.log-chip[aria-busy="true"]'), css.indexOf('.log-chip-n'))
+    assert.ok(/animation:\s*chip-wait/.test(chipCss), '忙碌 chip 必须有提示动画')
+    assert.ok(/prefers-reduced-motion/.test(chipCss), '减少动效时必须退回静态提示')
+    assert.ok(!/chip-spin/.test(src), '忙碌提示不得插节点改 chip 宽度（会挤重排工具条）')
   })
 }
 

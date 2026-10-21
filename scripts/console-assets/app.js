@@ -1609,6 +1609,8 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
 // 尾窗指纹/stale 语义仍由服务端保留（本组件只发一次 limit=200，不翻游标）。
 const RUN_PAGE_SIZES = [10, 20, 50, 100]
 const RUN_FETCH_LIMIT = 200
+// 逐轮历史的两份服务端快照：仅运行（excludeCancelled）与全量（全部/只看异常共用）。
+const RUN_SNAP_KEY = (m) => (m === 'runs' ? 'runs' : 'all')
 
 // ── 列表落点（v3.320）──────────────────────────────────────────────────────
 // 推送记录 / 逐轮历史的列表都比一屏长，分页器在列表底部：用户翻页时人已经在底部，
@@ -1654,8 +1656,19 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   const [day, setDay] = useState('')
   const [pageNo, setPageNo] = useState(1)
   const [data, setData] = useState(null)
+  // data 属于哪一档（runs = 仅运行，all = 全量，供 全部/只看异常 共用）。切模式时
+  // data 可能与 mode 不同步：只用来渲染手里真正有的那一档，绝不把另一档的数据硬套
+  // 新筛选（v3.326）。
+  const [dataMode, setDataMode] = useState('runs')
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
+  // 没有目标快照时的等待态（v3.326 评审）：选中态与列表都先不动，数据回来一次性换。
+  // 快速回来（<150ms）完全不闪；更慢才在点中的胶囊上转圈。
+  const [pendingMode, setPendingMode] = useState(null)
+  const [pendingBusy, setPendingBusy] = useState(false)
+  const pendingSeqRef = useRef(0)
+  const pendingTimerRef = useRef(0)
+  useEffect(() => () => clearTimeout(pendingTimerRef.current), [])
   // v3.318：点「日志」先在原页取快照，150ms 内没回来才在按钮上转圈——快请求不闪转圈；
   // 慢请求（日志到 1 MiB 时）也不会看起来「没点上」。失败就地报错，不切页。
   const [jumpBusy, setJumpBusy] = useState('')
@@ -1672,8 +1685,6 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   // 请求飞行期间用户自己滚走（非浏览器夹取）则撤销这次落点。
   const armedDataRef = useRef(undefined)
   const armedErrRef = useRef('')
-  const asyncLandRef = useRef(false)
-  const sawLoadingRef = useRef(false)
   const userMovedRef = useRef(false)
   // 「已滚进列表」门：列表顶还在页签下沿之下（用户停在顶部改筛选）时不置旗——
   // 否则会把列表顶拽到页签下沿，工具条被顶出视口。口径与 listLandTarget 一致
@@ -1690,32 +1701,60 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     landRef.current = true
     armedDataRef.current = data
     armedErrRef.current = err
-    asyncLandRef.current = false
-    sawLoadingRef.current = false
     userMovedRef.current = false
   }
   useLandScrollCancel(landRef, userMovedRef)
 
+  // 两种筛选各留一份快照：服务端口径不同（仅运行 = excludeCancelled，最近 200 个真轮次）。
+  // 切「只看异常」若拿「仅运行」的快照按异常过滤，会先算成「只看异常 2 / 共 2 条」，
+  // 等请求回来再跳成 48 条——手机上就是约 130ms 的闪跳（v3.326 录屏实测 4 帧）。
+  // 所以另一档在后台预取，切过去首帧直接用目标快照；目标快照还没到就保持旧列表，
+  // 绝不用另一档的数据重算。「全部」与「只看异常」共用同一份全量快照。
+  const snapsRef = useRef({ runs: null, all: null })
+  const preSeqRef = useRef({ runs: 0, all: 0 })
+  const quietNextRef = useRef(false)
+  const fetchSnap = useCallback((k) => {
+    const seq = ++preSeqRef.current[k]
+    return apiGetRunHistory({ limit: RUN_FETCH_LIMIT, excludeCancelled: k === 'runs' })
+      .then((d) => {
+        if (seq === preSeqRef.current[k]) snapsRef.current[k] = d
+        return d
+      })
+  }, [])
   const load = useCallback(async () => {
     const seq = ++seqRef.current
-    setLoading(true)
+    const m = mode
+    const k = RUN_SNAP_KEY(m)
+    // 切到已有快照的档位时静默刷新：不置 loading（分页按钮不闪禁用态），
+    // 首帧已由 changeMode 用快照画好。
+    const quiet = quietNextRef.current
+    quietNextRef.current = false
+    // 另一档同时预取：每次刷新都补一次，切过去看到的是新快照而不是陈的。
+    fetchSnap(k === 'runs' ? 'all' : 'runs').catch(() => {})
+    // 静默刷新要顺手清掉可能还挂着的 loading（切档会顶掉上一发非静默请求，
+    // 那发的 finally 因请求号过期不会再来清，否则分页按钮会一直禁用）。
+    setLoading(!quiet)
     try {
-      const d = await apiGetRunHistory({ limit: RUN_FETCH_LIMIT, excludeCancelled: mode === 'runs' })
+      const d = await fetchSnap(k)
       if (seq !== seqRef.current) return
       setData(d)
+      setDataMode(k)
       setErr('')
     } catch (e) {
       if (seq === seqRef.current) setErr(`加载失败：${e.message}`)
     } finally {
       if (seq === seqRef.current) setLoading(false)
     }
-  }, [mode])
+  }, [mode, fetchSnap])
   // 保活后概览切回来时补拉一次；离开概览不拉。data 保留，不出现加载占位。
   usePanelAutoLoad(active, load)
 
   const all = data && data.status === 'ok' && Array.isArray(data.items) ? data.items : []
-  const issueCount = filterRunItems(all, { mode: 'issue' }).length
+  // 全量快照才含取消留痕：仅运行档算出来是假的 2（本档不显示数字，仍保险）。
+  const fullSnap = dataMode === 'all'
+  const issueCount = fullSnap ? filterRunItems(all, { mode: 'issue' }).length : null
   const runsCount = filterRunItems(all, { mode: 'runs' }).length
+  // 切档是原子的（mode 变化时 data 已换成同一档），直接按 mode 过滤即可。
   const filtered = filterRunItems(all, { mode, day })
   const pages = Math.max(1, Math.ceil(filtered.length / size))
   const current = Math.min(pageNo, pages)
@@ -1738,11 +1777,57 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     setPageNo(1)
   }
   const changeMode = (m) => {
-    if (m === mode) return // 已选中的 chip 再点一次不搬位置
-    armLand()
-    asyncLandRef.current = true // 切模式会重拉 run.log，必须等响应落地再落点
-    setMode(m)
-    setPageNo(1)
+    if (m === pendingMode) return // 已在等这个档位，别重复发请求
+    if (m === mode) {
+      if (pendingMode === null) return // 已选中的 chip 再点一次不搬位置
+      // 点回当前档 = 取消还在路上的等待，留在原视图。
+      clearTimeout(pendingTimerRef.current)
+      pendingSeqRef.current++
+      setPendingMode(null)
+      setPendingBusy(false)
+      return
+    }
+    const key = RUN_SNAP_KEY(m)
+    const cached = snapsRef.current[key]
+    clearTimeout(pendingTimerRef.current)
+    const seq = ++pendingSeqRef.current // 取消上一次还没落地的等待
+    seqRef.current++ // 作废还在飞的旧档刷新（晚到的响应会把新档数据盖掉）
+    armLand() // 等待期间用户自己滚动会撤销落点
+    if (cached !== null) {
+      // 目标快照已在：同一批换列表与选中态，首帧就是目标数据。
+      setPendingMode(null)
+      setPendingBusy(false)
+      setData(cached)
+      setDataMode(key)
+      setMode(m)
+      setPageNo(1)
+      quietNextRef.current = true
+      return
+    }
+    // 没有目标快照：选中态与列表都先不动，等数据回来一次性换——绝不把旧档数据
+    // 挂到新筛选下。150ms 内回来完全不闪，更慢才在点中的胶囊上转圈。
+    setPendingMode(m)
+    pendingTimerRef.current = window.setTimeout(() => {
+      if (seq === pendingSeqRef.current) setPendingBusy(true)
+    }, 150)
+    fetchSnap(key).then((d) => {
+      if (seq !== pendingSeqRef.current) return
+      clearTimeout(pendingTimerRef.current)
+      setPendingBusy(false)
+      setPendingMode(null)
+      setData(d)
+      setDataMode(key)
+      setMode(m)
+      setPageNo(1)
+      quietNextRef.current = true
+    }).catch((e) => {
+      if (seq !== pendingSeqRef.current) return
+      clearTimeout(pendingTimerRef.current)
+      setPendingBusy(false)
+      setPendingMode(null)
+      landRef.current = false // 失败不落点
+      setErr(`加载失败：${e.message}`)
+    })
   }
   const goPage = (n) => {
     if (n === current) return // 目标页 = 当前页：不置旗（否则残留的旗会替下一次操作落点）
@@ -1754,13 +1839,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   // 消费即清旗：返回 null 也不再重试（否则旗子会挂到下一次操作上）。
   useLayoutEffect(() => {
     if (!landRef.current) return
-    if (asyncLandRef.current) {
-      if (loading) { sawLoadingRef.current = true; return } // 重拉已开始，等结算
-      if (!sawLoadingRef.current) return // 重拉还没开始：这一帧是旧数据，不能落点
-    }
     landRef.current = false
-    asyncLandRef.current = false
-    sawLoadingRef.current = false
     // 请求飞行期间用户自己滚动时撤销落点，别把人拽回列表顶（夹取/锚定不算）。
     if (userMovedRef.current) return
     const y = listLandTarget(listRef.current)
@@ -1816,11 +1895,14 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     ${data && data.status === 'ok' && html`<div class="run-tools">
       <div class="log-chips" role="group" aria-label="逐轮筛选">
         <button type="button" class=${'log-chip' + (mode === 'all' ? ' on' : '')}
-          aria-pressed=${mode === 'all' ? 'true' : 'false'} onClick=${() => changeMode('all')}>${mode === 'all' ? `全部 ${all.length}` : '全部'}</button>
+          aria-busy=${pendingMode === 'all' && pendingBusy ? 'true' : 'false'}
+          aria-pressed=${mode === 'all' ? 'true' : 'false'} onClick=${() => changeMode('all')}>${mode === 'all' && fullSnap ? `全部 ${all.length}` : '全部'}</button>
         <button type="button" class=${'log-chip' + (mode === 'runs' ? ' on' : '')}
+          aria-busy=${pendingMode === 'runs' && pendingBusy ? 'true' : 'false'}
           aria-pressed=${mode === 'runs' ? 'true' : 'false'} onClick=${() => changeMode('runs')}>仅运行 ${runsCount}</button>
         <button type="button" class=${'log-chip' + (mode === 'issue' ? ' on' : '')}
-          aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => changeMode('issue')}>${mode === 'runs' ? '只看异常' : `只看异常 ${issueCount}`}</button>
+          aria-busy=${pendingMode === 'issue' && pendingBusy ? 'true' : 'false'}
+          aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => changeMode('issue')}>${mode === 'runs' || issueCount === null ? '只看异常' : `只看异常 ${issueCount}`}</button>
       </div>
       <label class="run-day">
         <span>日期</span>
