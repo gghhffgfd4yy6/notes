@@ -5359,6 +5359,14 @@ async function main () {
     const cachedBlock = change.slice(cachedAt, change.indexOf('return', cachedAt))
     assert.ok(cachedBlock.includes('setData(cached)') && cachedBlock.indexOf('setData(cached)') < cachedBlock.indexOf('setMode(m)'),
       '有快照时数据必须先于选中态落地')
+    assert.ok(cachedBlock.includes('setDataMode(key)'), '有快照时 dataMode 必须同步换档（否则筛选会按旧档渲染）')
+    // load 必须真的消费 quietNextRef：静默刷新不置 loading（否则切档时分页按钮闪禁用态）。
+    const loadAt = hist.indexOf('const load = useCallback(async () => {')
+    const loadSrc = hist.slice(loadAt, hist.indexOf('}, [mode, fetchSnap])', loadAt))
+    assert.ok(loadSrc.includes('const quiet = quietNextRef.current') && loadSrc.includes('quietNextRef.current = false'),
+      'load 必须读取并清掉 quietNextRef')
+    assert.ok(loadSrc.includes('setLoading(!quiet)'), '静默刷新不得置 loading')
+    assert.ok(hist.includes("const fullSnap = dataMode === 'all'"), 'fullSnap 必须由 dataMode 推导，不得写死')
     // 没快照：选中态与列表都不先动，请求回来再一次性 setData + setMode。
     const pendingAt = change.indexOf('setPendingMode(m)')
     const pendingTail = change.slice(pendingAt)
