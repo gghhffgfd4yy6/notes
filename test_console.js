@@ -3832,8 +3832,15 @@ async function main () {
     const t14 = JSON.parse((await request(port, 'GET', '/api/trends', { token: TOKEN })).text)
     assert.strictEqual(t14.byDay.length, TREND_DAYS_DEFAULT)
     assert.ok(!t14.byDay.some((d) => d.date === dayKey(50)), '50 天前的行不进 14 日窗')
-    const tr = JSON.parse((await request(port, 'GET', '/api/trends?from=2026-10-01&to=2026-10-03', { token: TOKEN })).text)
-    assert.deepStrictEqual([tr.from, tr.to, tr.byDay.length], ['2026-10-01', '2026-10-03', 3], '趋势区间：回显 from/to 且按天补零')
+    // 区间用「相对今天」的日期，让 fixture 的当天行落在区间里：只验日期回显/补零
+    // 不验聚合的话，端点全返 0 也能过（Sourcery #288 M8）。
+    const trFrom = dayKey(2)
+    const trTo = dayKey(0)
+    const tr = JSON.parse((await request(port, 'GET', `/api/trends?from=${trFrom}&to=${trTo}`, { token: TOKEN })).text)
+    assert.deepStrictEqual([tr.from, tr.to, tr.byDay.length], [trFrom, trTo, 3], '趋势区间：回显 from/to 且按天补零')
+    const trToday = tr.byDay.find((d) => d.date === trTo)
+    assert.ok(trToday && trToday.rounds === 1 && trToday.total === 10 && trToday.pushed === 5,
+      '区间聚合必须把当天摘要行算进去（不能只回三行 0）')
     const trBad = JSON.parse((await request(port, 'GET', '/api/trends?from=2026-02-30&to=2026-10-03', { token: TOKEN })).text)
     assert.strictEqual(trBad.from, '', '非法日期必须静默回落到 days 模式')
     const t30 = JSON.parse((await request(port, 'GET', '/api/trends?days=30', { token: TOKEN })).text)
@@ -5064,7 +5071,7 @@ async function main () {
     assert.ok(src.includes("mode: 'range'") && src.includes('disableMobile: true'), '区间模式且禁用原生手机弹层（原生 date 不支持区间）')
     assert.ok(src.includes('dates.length !== 2'), '端点只认 Date 对象数组（不解析本地化字符串）')
     assert.ok(!src.includes("str.split(' to ')"), "zh 语言包用「 至 」，不得按 ' to ' 切")
-    assert.ok(src.includes("maxDate: 'today'"), '不允许选未来：缓存里没有未来数据，选了只会是空结果')
+    assert.ok(src.includes('maxDate: todayKeyShanghai()'), '不允许选未来：上限必须按上海日历日（浏览器本地 today 会错位）')
     assert.ok(src.includes('showMonths: 1'), '单月：390 下双月 613px 必然横溢出，maxDate 后第二月只剩禁用格')
     assert.ok(src.includes("monthSelectorType: 'static'"), '月份必须是静态文字：原生 <select> 在手机上弹白底系统列表，深色面板里必破一致性')
     // 年份：原生 number 输入框在月份旁边，手机上下滑动极易误触弹键盘 ⇒ 禁指针 + 自有 « » 步进。
@@ -5094,7 +5101,7 @@ async function main () {
     const uses = (src.match(/<\$\{DateRange\}/g) || []).length
     assert.ok(uses >= 4, `四处时间筛选都要复用 DateRange（实际 ${uses} 处）`)
     assert.ok(!src.includes('type="date"'), '不得残留原生 date 输入（统一走 DateRange）')
-    assert.ok(!src.includes('flatpickr(') || (src.match(/flatpickr\(/g) || []).length === 1, 'flatpickr 只允许在 DateRange 里初始化一次')
+    assert.strictEqual((src.match(/flatpickr\(/g) || []).length, 1, 'flatpickr 只允许在 DateRange 里初始化一次（必须真的调了一次）')
     // 趋势服务端：区间优先于 days（与推送记录同口径）
     // 同样不能读源码文本（status.js 也在变异矩阵里）：直接调 readTrends 验行为。
     const tmpDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'xbk-trends-'))
@@ -5212,7 +5219,7 @@ async function main () {
     assert.ok(logs.includes('!data && !err && html`<div class="log-empty"'), '首帧必须渲染读取中占位')
     assert.ok(logs.includes('读取中'), '占位文案必须说明在读（不能空白）')
     assert.ok(!logs.includes('html`<div class="empty">日志'), '日志未生成/不可读不得用 .empty（高度会反向塌）')
-    assert.ok(/filtered\.length === 0\s*\?\s*html`<div class="log-empty"/.test(logs), '0 命中必须也用 .log-empty')
+    assert.ok(/ranged\.length === 0\s*\?\s*html`<div class="log-empty"/.test(logs), '0 命中必须也用 .log-empty（按区间筛完的 ranged 判定，不是 filtered）')
   })
 
   // ── v3.321 首屏剩余 pop：系统页 access-log 的 44px、日志页工具条的 153px ──────────

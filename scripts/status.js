@@ -441,10 +441,26 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
   if (read.status !== 'ok') return { status: read.status }
   const todayKey = shanghaiDayKey(now)
   const dayRe = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
-  const rangeMode = typeof from === 'string' && typeof to === 'string' && dayRe.test(from) && dayRe.test(to) && from <= to
+  // 回环校验：2026-02-30 这类「日期形状但不存在」的键，Date 会归一化成 03-02，
+  // 只测正则会让它进区间模式（Sourcery #288）。
+  const realDay = (v) => {
+    if (typeof v !== 'string' || !dayRe.test(v)) return false
+    const t = Date.parse(v + 'T00:00:00Z')
+    return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === v
+  }
+  const rangeMode = realDay(from) && realDay(to) && from <= to
   // 区间模式：to 超过今天按今天截；跨度上限 92 天（超出时保留靠近 to 的一端）。
   const endKey = rangeMode ? (to > todayKey ? todayKey : to) : todayKey
-  const rawStart = rangeMode ? from : shanghaiDayKey(now - (days - 1) * 86400000)
+  // 显式区间但起点已晚于截断后的终点（未来区间）：区间内没有任何上海日 → 空结果，
+  // 不能因为 spanDays 至少 1 就把「今天」当成区间内容返回（Sourcery #288）。
+  if (rangeMode && from > endKey) {
+    return result('ok', { days: 0, from, to: endKey, byDay: [], truncated, today: todayKey })
+  }
+  // 显式给了 from/to 但格式非法/颠倒：按「没有窗口」处理（取日志里能覆盖的最大跨度），
+  // 不回落到 days——否则调用方以为看的是区间、实际拿到「最近 N 天」子集（Sourcery #288 M2）。
+  const wantRange = (typeof from === 'string' && from !== '') || (typeof to === 'string' && to !== '')
+  const effDays = rangeMode ? days : (wantRange ? 92 : days)
+  const rawStart = rangeMode ? from : shanghaiDayKey(now - (effDays - 1) * 86400000)
   const endMs = Date.parse(endKey + 'T00:00:00Z')
   const startMs = Date.parse(rawStart + 'T00:00:00Z')
   const spanDays = Math.min(92, Math.max(1, Math.round((endMs - startMs) / 86400000) + 1))
@@ -473,8 +489,11 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
   }
   // 输出按日期升序补零：没有记录的日期也给全 0 行，前端画图不用补洞。
   const out = []
+  // 补零必须从「截断后的起点」startKey 起算：超过 92 天时 startMs 仍指向原始起点，
+  // 照它补零会让 byDay 的日期落在窗口外、聚合值为 0（Sourcery #288 H1）。
+  const startKeyMs = Date.parse(startKey + 'T00:00:00Z')
   for (let i = 0; i < spanDays; i++) {
-    const key = new Date(startMs + i * 86400000).toISOString().slice(0, 10)
+    const key = new Date(startKeyMs + i * 86400000).toISOString().slice(0, 10)
     out.push(byDay.get(key) || { date: key, rounds: 0, total: 0, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 0 })
   }
   return result('ok', { days: spanDays, from: rangeMode ? startKey : '', to: rangeMode ? endKey : '', byDay: out, truncated, today: todayKey })

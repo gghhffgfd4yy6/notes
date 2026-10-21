@@ -1590,15 +1590,23 @@ function filterMessagesByRange (items, from, to) {
   return items.filter((m) => {
     if (typeof m.datetime !== 'string' || m.datetime.length < 10) return false
     const day = m.datetime.slice(0, 10)
-    return day >= from && day <= to
+    // 存储里的畸形前缀（如 2026-02-30）在字典序上会落进区间，必须先回环校验是真日期
+    // 再比较（与 parseDayKey 同口径，Sourcery #288 M4）。
+    if (day < from || day > to) return false
+    return parseDayKey(day) === day
   })
 }
 
 // 时间窗统一入口：区间优先于「近 N 天」（两者同时出现时以区间为准，days 视作 0）。
 // 返回 { items, days, from, to } —— days/from/to 三个回显字段由调用方原样下发。
 function windowMessages (items, { days, fromKey, toKey }) {
-  if (fromKey !== '' && toKey !== '' && fromKey <= toKey) {
-    return { items: filterMessagesByRange(items, fromKey, toKey), days: 0, from: fromKey, to: toKey }
+  // 显式区间：合法就按闭区间；非法/颠倒一律按「无窗口」返回全量，不回落到 days——
+  // 否则调用方以为在看区间，实际拿到的是「最近 N 天」子集（Sourcery #288 M3）。
+  if (fromKey !== '' || toKey !== '') {
+    if (fromKey !== '' && toKey !== '' && fromKey <= toKey) {
+      return { items: filterMessagesByRange(items, fromKey, toKey), days: 0, from: fromKey, to: toKey }
+    }
+    return { items, days: 0, from: '', to: '' }
   }
   return { items: days > 0 ? filterMessagesByDays(items, days) : items, days, from: '', to: '' }
 }

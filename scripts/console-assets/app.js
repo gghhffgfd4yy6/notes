@@ -813,8 +813,9 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
     const inst = flatpickr(el, {
       mode: 'range',
       dateFormat: 'Y-m-d',
-      // 只到今天：控制台里的数据都是已发生的，未来日期选了只会是空结果。
-      maxDate: 'today',
+      // 只到今天（上海日历日）：数据都按上海日聚合，用浏览器本地 'today' 会在
+      // 时差区和上海跨零点后错位（选不到今天 / 选到未来得到空结果，Sourcery #288 M6）。
+      maxDate: todayKeyShanghai(),
       disableMobile: true,
       // 单月：双月在 390 宽必然溢出；maxDate 之后第二个月也只剩禁用格。
       showMonths: 1,
@@ -823,6 +824,8 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
       monthSelectorType: 'static',
       positionElement: btnRef.current || el,
       onReady (_sel, _str, inst) { attachMonthHoldRepeat(inst) },
+      // 面板可能开着跨过上海零点：每次打开按当下上海日重设上限。
+      onOpen (_d, _s, inst) { inst.set('maxDate', todayKeyShanghai()) },
 
       onChange (dates) {
         if (!Array.isArray(dates) || dates.length !== 2) return
@@ -836,6 +839,17 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
     instRef.current = inst
     return () => { inst.destroy(); instRef.current = null }
   }, [])
+  // 受控值外部变化（清除 ×、切预设、跳转重置）时同步 flatpickr 的选中态：
+  // 实例只在挂载时建一次，不同步的话日历仍高亮上一个区间（Sourcery #288 M7）。
+  useEffect(() => {
+    const inst = instRef.current
+    if (!inst) return
+    const want = active ? [from, to] : []
+    const cur = (inst.selectedDates || []).map(fmtDayKey)
+    if (cur.join('|') === want.join('|')) return
+    if (want.length === 2) inst.setDate(want, false, 'Y-m-d')
+    else inst.clear()
+  }, [from, to, active])
   const clear = () => { if (cbRef.current) cbRef.current({ ...EMPTY_RANGE }) }
   return html`<span class="date-range">
     <button type="button" ref=${btnRef} class=${active ? 'date-btn on' : 'date-btn'} disabled=${disabled}
@@ -3077,7 +3091,9 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const kw = q.trim().toLowerCase()
   // v3.319：「只看这一轮」必须按行首时间戳收窄——普通关键字搜索会把正文里
   // 提到同一时间戳的其他行也带进来，看起来像「这一轮」有多行。
-  const focusOnly = focusAt !== '' && focusDate !== '' && q === focusAt && mode === 'all'
+  // 用户已用「清除定位 / 选区间 / 改搜索」把定位条收起了，就不能再按 focusAt 收窄——
+  // 否则选了区间也只剩那一轮的行（Sourcery #288 M5）。
+  const focusOnly = focusAt !== '' && focusDate !== '' && q === focusAt && mode === 'all' && !focusDismissed
   // v3.326：按日期区间筛日志（客户端侧，行首时间戳前缀；不重拉 /api/logs）。
   const [logRange, setLogRange] = useState(EMPTY_RANGE)
   const logRangeActive = DAY_KEY_RE.test(logRange.from) && DAY_KEY_RE.test(logRange.to)
@@ -3228,7 +3244,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
          整个消失，跳转/切页后页面高度反向塌一次。 */ ''}
     ${err && !data && html`<div class="log-empty" role="status">日志读取失败</div>`}
     ${data && data.status !== 'ok' && html`<div class="log-empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
-    ${logReady && (filtered.length === 0
+    ${logReady && (ranged.length === 0
       ? html`<div class="log-empty" role="status">
         <div class="log-empty-text">${emptyText}</div>
         ${mode !== 'all' && html`<button type="button" class="log-chip" onClick=${searchAllLogs}>在全部日志中搜索</button>`}
