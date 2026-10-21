@@ -619,3 +619,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **风格**：材质 = Material 3 紫调中性色（浅紫描边 + `#6750a4` 实心）；北境 = Nord 冷灰蓝（`#2e3440` / `#88c0d0`）；明亮 = 白天/投屏，前景色全套改深色系。
 - **范围**：`app.js` / `app.css` / `console.js`（首帧属性与 cookie 解析）；接口与数据不变。
 - **门禁**：`test_console.js` 新增两条契约（4 套 token 块且不夹带布局 token、`color-scheme: light`、服务端白名单与首帧属性、禁 localStorage）与 `themeCookieValue` 行为断言（正常/白名单外/空/畸形百分号）。
+
+## v3.324 — 材质 / 北境两套主题重做
+
+- **材质**：改用 Material 3 深色基线。面层按 surface → container → high 三级提亮（`#100e14` / `#1d1b20` / `#26232b`），边/面对比 2.06:1；主色改成 M3 的 filled 语义（浅紫 `#d0bcff` + 深紫字 `#381e72`，7.71:1），选中页签单独走 secondaryContainer `#4a4458` / `#e8def8`，不再整块铺 primary。
+- **北境**：底色压到 `#1a1f27`、边提到 `#566176`（2.0:1），正文 `#eceff4` / 次级 `#cdd5e2`；强调色换 Nord 最亮的冰川蓝 nord8 `#88c0d0` + 深色字（6.24:1），选中态不再发灰。
+- **通用**：`--fs-2xs` 11px → 12px（按钮说明、运行规则等小字抬一档）。
+- **范围**：仅 `scripts/console-assets/app.css`；四套主题文档高度仍为 2207px，390 宽无横向滚动。
