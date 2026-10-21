@@ -8,6 +8,7 @@
 
 @layer tokens {
   :root {
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, .45);
     color-scheme: dark;
 
     /* 面层 */
@@ -97,9 +98,10 @@
      不会改变布局，也不会让页签、表格、日志框跳动。默认 :root = 深夜；data-theme 由
      服务端首帧写进 <html>（cookie 记忆），切主题时前端只改这一个属性。 */
 
-  /* 材质：Material 3 的紫调中性色（surface 带紫灰、primary 用浅紫描边 + 深紫实心），
-     elevation 靠更亮的 panel 层表达，不用阴影堆。 */
+  /* 材质：Material 3 深色基线。primary 是「浅紫实心 + 深紫字」（primary / on-primary），
+     选中页签走 secondaryContainer；面层靠 surface 三级 + 一层卡片投影表达 elevation。 */
   :root[data-theme="material"] {
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, .5), 0 8px 24px rgba(0, 0, 0, .32);
     color-scheme: dark;
 
     /* Material 3 深色基线（surface / surface-container / outline / primary）。
@@ -151,6 +153,7 @@
      加上 #4c566a 的边和 #aeb8c9 的小字 ⇒ 整页像蒙雾。这版把底色压深、字和边提亮，
      强调色用 Nord 最亮的冰川蓝 nord8（#88c0d0）+ 深色字，焦点才立得住。 */
   :root[data-theme="nord"] {
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, .4), 0 6px 18px rgba(0, 0, 0, .25);
     color-scheme: dark;
 
     --bg: #1a1f27;
@@ -192,6 +195,7 @@
   /* 明亮：白天/投屏用。所有前景色改为深色系（--ok-fg/--bad-fg/--warn-fg 是文字色，
      不能沿用深色主题的浅色值，否则白底上读不出来）。 */
   :root[data-theme="light"] {
+    --shadow-card: 0 1px 2px rgba(15, 23, 42, .06), 0 10px 24px rgba(15, 23, 42, .08);
     color-scheme: light;
     --bg: #f3f5f9;
     --panel: #ffffff;
@@ -278,7 +282,15 @@
 
   /* ── 徽章 ── */
   .badge { display: inline-block; padding: 2px 10px; border-radius: var(--r-pill); font-size: var(--fs-xs); font-weight: 500; border: 1px solid transparent; }
-  .badge-ok  { color: var(--ok-fg); background: var(--ok-soft); border-color: var(--ok-line); }
+  /* v3.325：四张卡各挂一个绿色「正常」胶囊＝纯噪声。健康态收成「小圆点 + 小字」，
+     异常/有失败才保留彩色胶囊。 */
+  .badge-ok {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 0; border-color: transparent; background: transparent; color: var(--ok-fg);
+  }
+  .badge-ok::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  /* 健康态已在上面收成「圆点 + 小字」，这里只留颜色，不再画胶囊底。 */
+  .badge-ok  { color: var(--ok-fg); }
   .badge-bad { color: var(--bad-fg); background: var(--bad-soft); border-color: var(--bad-line); }
   .badge-warn { color: var(--warn-fg); background: var(--warn-soft); border-color: var(--warn-line); }
   .badge-run { color: var(--warn-fg); background: var(--warn-soft); border-color: var(--warn-line); }
@@ -312,11 +324,24 @@
     border: 1px solid var(--border);
     border-radius: var(--r-lg);
     padding: var(--sp-3) var(--sp-4);
+    box-shadow: var(--shadow-card, none);
   }
   .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--sp-2); }
   .card-title { font-weight: 600; font-size: var(--fs-sm); color: var(--text-dim); letter-spacing: .5px; }
   .card-lines { color: var(--text); font-size: var(--fs-sm); }
   .card-lines > div { padding: 2px 0; }
+  /* v3.325：主数字。四张卡之前全是同一档小字，扫读没有主次；现在一卡一个主指标，
+     数字放大 + 等宽，单位和说明压回小字。 */
+  .card-main { display: flex; align-items: baseline; gap: 5px; margin: 2px 0 1px; }
+  .card-num {
+    font-size: 26px; line-height: 1.15; font-weight: 650; letter-spacing: -.6px;
+    color: var(--text); font-variant-numeric: tabular-nums;
+  }
+  .card-unit { font-size: var(--fs-xs); color: var(--text-dim); }
+  .card-hint {
+    font-size: var(--fs-xs); color: var(--text-dim); margin-bottom: 6px;
+    font-variant-numeric: tabular-nums;
+  }
 
   /* ── 面板 ── */
   .panel {
@@ -941,6 +966,7 @@
     .card { padding: 10px 12px; }
     .card-title { font-size: var(--fs-2xs); }
     .card-lines { font-size: var(--fs-xs); }
+    .card-num { font-size: 22px; }
     /* 配置页：键值一行一条，空规则默认折叠；长值只按需断行，不再逐字硬断 */
     .cfg-block { padding: 12px; }
     .rule-list { grid-template-columns: 1fr; max-height: 50vh; }
