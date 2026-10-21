@@ -4781,6 +4781,22 @@ async function main () {
     assert.ok(js.includes('切换主题（当前 ') && js.includes('title='), '主题键必须有可访问名与悬停提示')
     assert.ok(js.includes('const shared = readThemeCookie() || currentThemeKey()'), '多标签页必须以共享 cookie 为准算下一套（不得用本标签页旧 state）')
     assert.ok(/try \{\s*document\.cookie/.test(js), '写 cookie 必须 try/catch：沙箱里抛异常不能挡住状态更新')
+
+    // v3.325：四张指标卡必须有「主数字」层级（一卡一个主指标），否则又退回「四段小字」。
+    assert.ok(js.includes('function Card ({ title, badge, main, children })'), '卡片组件要接 main（主数字）')
+    assert.ok(js.includes('class="card-num"') && js.includes('class="card-unit"'), '主数字/单位要独立节点')
+    assert.ok(/\.card-num \{[^}]*tabular-nums/.test(css), '主数字必须等宽（tabular-nums），否则跨卡数字不齐')
+    assert.ok(/\.card-num \{[^}]*font-size: 26px/.test(css), '主数字字号要明显大于正文（26px）')
+    // 「正常」徽章不许再画成彩色胶囊：健康态只留小圆点 + 同色小字，异常才用胶囊。
+    const okBadge = (css.match(/\.badge-ok\s*\{[^}]*\}/g) || []).join('')
+    assert.ok(okBadge.includes('background: transparent'), '健康徽章必须去掉实心底（四张卡重复彩色胶囊＝噪声）')
+    assert.ok(css.includes('.badge-ok::before'), '健康徽章要保留小圆点')
+    // 每套主题都要有卡片投影 token，否则材质/北境的卡片仍是「贴在底上的平面」。
+    for (const key of ['material', 'nord', 'light']) {
+      const block = (css.match(new RegExp(':root\\[data-theme="' + key + '"\\]\\s*\\{[^}]*\\}')) || [''])[0]
+      assert.ok(block.includes('--shadow-card'), `主题 ${key} 必须定义 --shadow-card`)
+    }
+    assert.ok(/:root \{[^}]*--shadow-card/.test(css), '默认（深夜）也要有 --shadow-card')
     assert.ok(!/localStorage\.(get|set)Item/.test(js), '不得用 localStorage 记主题（CSP 禁内联脚本，首帧会闪）')
     assert.ok(srv.includes("const THEMES = ['deep', 'material', 'nord', 'light']"), '服务端必须有主题白名单')
     assert.ok(/data-theme="\$\{THEMES\.includes\(theme\) \? theme : THEMES\[0\]\}"/.test(srv), '服务端必须把主题写进首帧 <html>')

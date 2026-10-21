@@ -8,6 +8,7 @@
 
 @layer tokens {
   :root {
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, .45);
     color-scheme: dark;
 
     /* 面层 */
@@ -68,7 +69,7 @@
     --sp-10: 40px;
 
     /* 字阶 */
-    --fs-2xs: 11px;
+    --fs-2xs: 12px;
     --fs-xs: 12px;
     --fs-sm: 13px;
     --fs-md: 14px;
@@ -97,81 +98,104 @@
      不会改变布局，也不会让页签、表格、日志框跳动。默认 :root = 深夜；data-theme 由
      服务端首帧写进 <html>（cookie 记忆），切主题时前端只改这一个属性。 */
 
-  /* 材质：Material 3 的紫调中性色（surface 带紫灰、primary 用浅紫描边 + 深紫实心），
-     elevation 靠更亮的 panel 层表达，不用阴影堆。 */
+  /* 材质：Material 3 深色基线。primary 是「浅紫实心 + 深紫字」（primary / on-primary），
+     选中页签走 secondaryContainer；面层靠 surface 三级 + 一层卡片投影表达 elevation。 */
   :root[data-theme="material"] {
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, .5), 0 8px 24px rgba(0, 0, 0, .32);
     color-scheme: dark;
-    --bg: #141218;
+
+    /* Material 3 深色基线（surface / surface-container / outline / primary）。
+       面层按 0 → 1 → 2 逐级提亮，别再用同一块炭灰——上一版就是灰面太接近才发脏。 */
+    --bg: #100e14;
     --panel: #1d1b20;
-    --panel-2: #211f26;
-    --log-bg: #100e14;
+    --panel-2: #26232b;
+    --log-bg: #0b090f;
     --log-fg: #e6e0e9;
-    --border: #38343f;
-    --border-soft: rgba(230, 224, 233, .14);
+
+    --border: #514c5c;
+    --border-soft: rgba(230, 224, 233, .18);
+
     --text: #e6e0e9;
-    --text-dim: #a8a2b4;
-    --on-accent: #fff;
-    --accent: #cfbcff;
-    --accent-solid: #6750a4;
-    --accent-soft: rgba(207, 188, 255, .12);
-    --accent-line: rgba(207, 188, 255, .32);
-    --accent-hover: rgba(207, 188, 255, .06);
-    --accent-sel: rgba(207, 188, 255, .10);
+    /* M3 的 on-surface-variant，比上一版的 #a8a2b4 亮一档：灰底上的小字不再糊成一片。 */
+    --text-dim: #cac4d0;
+    /* M3 的 filled button 是「浅色底 + 深色字」（primary / on-primary），
+       不是 #6750a4 压白字——那样只有 6:1 却发闷，且和灰底糊在一起。 */
+    --on-accent: #381e72;
+    --accent: #d0bcff;
+    --accent-solid: #d0bcff;
+    --accent-soft: rgba(208, 188, 255, .14);
+    --accent-line: rgba(208, 188, 255, .38);
+    --accent-hover: rgba(208, 188, 255, .07);
+    --accent-sel: rgba(208, 188, 255, .12);
     --info-fg: #d0bcff;
-    --ok: #4caf82;
-    --ok-soft: rgba(76, 175, 130, .16);
-    --ok-line: rgba(76, 175, 130, .38);
-    --ok-fg: #8fe0b8;
-    --bad: #e57373;
-    --bad-soft: rgba(229, 115, 115, .16);
-    --bad-line: rgba(229, 115, 115, .38);
-    --bad-fg: #ffb4ab;
+    /* 选中页签 = secondaryContainer / onSecondaryContainer（M3 导航语义），
+       浅紫 primary 只留给真正的主按钮，不再整块铺在导航上。 */
+    --tab-active-bg: #4a4458;
+    --tab-active-fg: #e8def8;
+
+    /* M3 的 success/danger 不在基线里，按 tonal 规则自己配：soft 压得更沉，fg 提亮。 */
+    --ok: #6dd58c;
+    --ok-soft: rgba(109, 213, 140, .14);
+    --ok-line: rgba(109, 213, 140, .36);
+    --ok-fg: #a6f0bb;
+    --bad: #f2b8b5;
+    --bad-soft: rgba(242, 184, 181, .14);
+    --bad-line: rgba(242, 184, 181, .36);
+    --bad-fg: #ffd6d3;
     --bad-solid: #b3261e;
-    --warn: #d0b45a;
-    --warn-soft: rgba(208, 180, 90, .16);
-    --warn-line: rgba(208, 180, 90, .38);
-    --warn-fg: #f2df9b;
+    --warn: #e8c56a;
+    --warn-soft: rgba(232, 197, 106, .14);
+    --warn-line: rgba(232, 197, 106, .36);
+    --warn-fg: #f5e2a8;
   }
 
-  /* 北境：Nord 的冷灰蓝（极夜蓝底 + 冰川蓝强调），对比度比默认低一档，夜读不刺眼。 */
+  /* 北境：Nord 的冷灰蓝。上一版的问题不是色相，是明度全挤在 #2e3440~#3b4252 一条带里，
+     加上 #4c566a 的边和 #aeb8c9 的小字 ⇒ 整页像蒙雾。这版把底色压深、字和边提亮，
+     强调色用 Nord 最亮的冰川蓝 nord8（#88c0d0）+ 深色字，焦点才立得住。 */
   :root[data-theme="nord"] {
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, .4), 0 6px 18px rgba(0, 0, 0, .25);
     color-scheme: dark;
-    --bg: #2e3440;
-    --panel: #3b4252;
-    --panel-2: #343b49;
-    --log-bg: #272c36;
-    --log-fg: #d8dee9;
-    --border: #4c566a;
-    --border-soft: rgba(216, 222, 233, .16);
+
+    --bg: #1a1f27;
+    --panel: #2e3440;
+    --panel-2: #3b4252;
+    --log-bg: #161a21;
+    --log-fg: #e5e9f0;
+
+    --border: #566176;
+    --border-soft: rgba(216, 222, 233, .24);
+
     --text: #eceff4;
-    --text-dim: #aeb8c9;
-    --on-accent: #fff;
+    --text-dim: #cdd5e2;
+
+    --on-accent: #2e3440;
     --accent: #88c0d0;
-    /* 白字压 #5e81ac 只有 4.03:1（AA 不成立）；同色相压深到 #4c6a92 = 5.55:1。 */
-    --accent-solid: #4c6a92;
-    --accent-soft: rgba(136, 192, 208, .14);
-    --accent-line: rgba(136, 192, 208, .34);
-    --accent-hover: rgba(136, 192, 208, .07);
-    --accent-sel: rgba(136, 192, 208, .11);
+    --accent-solid: #88c0d0;
+    --accent-soft: rgba(136, 192, 208, .16);
+    --accent-line: rgba(136, 192, 208, .40);
+    --accent-hover: rgba(136, 192, 208, .08);
+    --accent-sel: rgba(136, 192, 208, .13);
     --info-fg: #8fbcbb;
+
     --ok: #a3be8c;
     --ok-soft: rgba(163, 190, 140, .16);
-    --ok-line: rgba(163, 190, 140, .38);
-    --ok-fg: #b8d3a3;
+    --ok-line: rgba(163, 190, 140, .40);
+    --ok-fg: #c3e0a8;
     --bad: #bf616a;
     --bad-soft: rgba(191, 97, 106, .18);
-    --bad-line: rgba(191, 97, 106, .4);
-    --bad-fg: #d99aa0;
+    --bad-line: rgba(191, 97, 106, .42);
+    --bad-fg: #e5a3a9;
     --bad-solid: #a54e57;
     --warn: #ebcb8b;
     --warn-soft: rgba(235, 203, 139, .14);
-    --warn-line: rgba(235, 203, 139, .36);
+    --warn-line: rgba(235, 203, 139, .38);
     --warn-fg: #ebcb8b;
   }
 
   /* 明亮：白天/投屏用。所有前景色改为深色系（--ok-fg/--bad-fg/--warn-fg 是文字色，
      不能沿用深色主题的浅色值，否则白底上读不出来）。 */
   :root[data-theme="light"] {
+    --shadow-card: 0 1px 2px rgba(15, 23, 42, .06), 0 10px 24px rgba(15, 23, 42, .08);
     color-scheme: light;
     --bg: #f3f5f9;
     --panel: #ffffff;
@@ -258,7 +282,15 @@
 
   /* ── 徽章 ── */
   .badge { display: inline-block; padding: 2px 10px; border-radius: var(--r-pill); font-size: var(--fs-xs); font-weight: 500; border: 1px solid transparent; }
-  .badge-ok  { color: var(--ok-fg); background: var(--ok-soft); border-color: var(--ok-line); }
+  /* v3.325：四张卡各挂一个绿色「正常」胶囊＝纯噪声。健康态收成「小圆点 + 小字」，
+     异常/有失败才保留彩色胶囊。 */
+  .badge-ok {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 0; border-color: transparent; background: transparent; color: var(--ok-fg);
+  }
+  .badge-ok::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  /* 健康态已在上面收成「圆点 + 小字」，这里只留颜色，不再画胶囊底。 */
+  .badge-ok  { color: var(--ok-fg); }
   .badge-bad { color: var(--bad-fg); background: var(--bad-soft); border-color: var(--bad-line); }
   .badge-warn { color: var(--warn-fg); background: var(--warn-soft); border-color: var(--warn-line); }
   .badge-run { color: var(--warn-fg); background: var(--warn-soft); border-color: var(--warn-line); }
@@ -292,11 +324,24 @@
     border: 1px solid var(--border);
     border-radius: var(--r-lg);
     padding: var(--sp-3) var(--sp-4);
+    box-shadow: var(--shadow-card, none);
   }
   .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--sp-2); }
   .card-title { font-weight: 600; font-size: var(--fs-sm); color: var(--text-dim); letter-spacing: .5px; }
   .card-lines { color: var(--text); font-size: var(--fs-sm); }
   .card-lines > div { padding: 2px 0; }
+  /* v3.325：主数字。四张卡之前全是同一档小字，扫读没有主次；现在一卡一个主指标，
+     数字放大 + 等宽，单位和说明压回小字。 */
+  .card-main { display: flex; align-items: baseline; gap: 5px; margin: 2px 0 1px; }
+  .card-num {
+    font-size: 26px; line-height: 1.15; font-weight: 650; letter-spacing: -.6px;
+    color: var(--text); font-variant-numeric: tabular-nums;
+  }
+  .card-unit { font-size: var(--fs-xs); color: var(--text-dim); }
+  .card-hint {
+    font-size: var(--fs-xs); color: var(--text-dim); margin-bottom: 6px;
+    font-variant-numeric: tabular-nums;
+  }
 
   /* ── 面板 ── */
   .panel {
@@ -545,7 +590,9 @@
     min-height: 36px;
   }
   .tab-btn:hover { filter: brightness(1.2); }
-  .tab-btn.active { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); font-weight: 500; }
+  /* 选中页签单独给一层 token：Material 3 的选中导航不是 primary 大色块，
+     而是 secondary container；其他三套沿用 accent-solid 不动。 */
+  .tab-btn.active { background: var(--tab-active-bg, var(--accent-solid)); border-color: var(--tab-active-bg, var(--accent-solid)); color: var(--tab-active-fg, var(--on-accent)); font-weight: 500; }
   .tab-btn.active:hover { filter: brightness(.92); }
   /* v3.317 横滚提示：320 宽放不下 6 个页签，旧版把滚动条藏了又不给任何线索（「系统」
      看起来像不存在）。渐隐用 mask-image 做——不新增覆盖层，绝不吃点击；只在真的溢出时
@@ -919,6 +966,7 @@
     .card { padding: 10px 12px; }
     .card-title { font-size: var(--fs-2xs); }
     .card-lines { font-size: var(--fs-xs); }
+    .card-num { font-size: 22px; }
     /* 配置页：键值一行一条，空规则默认折叠；长值只按需断行，不再逐字硬断 */
     .cfg-block { padding: 12px; }
     .rule-list { grid-template-columns: 1fr; max-height: 50vh; }

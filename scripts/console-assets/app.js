@@ -720,12 +720,20 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
 }
 
 // 指标卡：标题 + 右上角徽章 + 若干行文本。换卡片实现（或组件库）只改这里。
-function Card ({ title, badge, children }) {
+// v3.325：卡片加「主数字」——之前四张卡都是同一档小字，扫读时分不出主次。
+// main = { num, unit, hint }：数字单独放大 + 等宽数字（tabular-nums），标签压回小字。
+function Card ({ title, badge, main, children }) {
   return html`<div class="card">
     <div class="card-head">
       <span class="card-title">${title}</span>
       ${badge}
     </div>
+    ${main
+      ? html`<div class="card-main">
+          <span class="card-num">${main.num}</span><span class="card-unit">${main.unit}</span>
+        </div>
+        ${main.hint ? html`<div class="card-hint">${main.hint}</div>` : null}`
+      : null}
     <div class="card-lines">${children}</div>
   </div>`
 }
@@ -928,6 +936,16 @@ function StatusCards ({ state }) {
   const diag = diagCard(state)[0] || null
   const diagTone = diag ? diag.tone : 'run'
   const diagLines = diag ? diag.lines : ['暂无记录']
+  // v3.325：通道卡的「主数字」用被过滤条数（有信息量），连续失败放 hint。
+  const diagRaw = state.diagnostics && state.diagnostics.status === 'ok' ? state.diagnostics.value : null
+  const diagReasons = diagRaw && diagRaw.byReason && typeof diagRaw.byReason === 'object'
+    ? Object.entries(diagRaw.byReason).map(([k, n]) => `${k} ${typeof n === 'number' ? n : '?'}`).join('，')
+    : ''
+  const filteredCount = diagRaw && diagRaw.byReason && typeof diagRaw.byReason === 'object'
+    ? Object.values(diagRaw.byReason).reduce((a, n) => a + (typeof n === 'number' ? n : 0), 0)
+    : null
+  const diagAt = diagRaw ? diagRaw.at : null
+  const chanMax = chan.entries.length > 0 ? Math.max(...chan.entries.map((e) => e.failures)) : 0
   const repRel = rep ? relDay(rep.date) : ''
   const rateText = (r) => (r && typeof r.successRate === 'number' ? `${(r.successRate * 100).toFixed(1)}%` : '—')
   const todayTone = !today ? 'run' : (today.failed > 0 ? 'bad' : (today.rounds > 0 ? 'ok' : 'run'))
@@ -940,53 +958,66 @@ function StatusCards ({ state }) {
       title: '今日',
       tone: todayTone,
       badge: !today ? '—' : (today.failed > 0 ? '异常' : (today.rounds > 0 ? '正常' : '—')),
+      main: today
+        ? { num: fmtNum(today.pushed), unit: '条推送', hint: `轮次 ${today.rounds} · 成功率 ${rateText(today)}` }
+        : { num: '—', unit: '', hint: '暂无 run.log 数据' },
       lines: today
         ? [
-            `轮次 ${today.rounds} · 推送 ${today.pushed}`,
-            `失败 ${today.failed}${today.failed > 0 ? ' ⚠️' : ''} · 成功率 ${rateText(today)}`,
-            `日报 ${rep ? `${rep.date || '—'}${repRel ? `（${repRel}）` : ''} · ${repTone === 'ok' ? '正常' : repTone === 'bad' ? '异常' : '暂无'}` : '暂无'}`
+            `失败 ${fmtNum(today.failed)}${today.failed > 0 ? ' ⚠️' : ''}`,
+            // 「正常」不再重复写在日报行：右上角状态点已经表达，重复反而每次都要读两遍。
+            `日报 ${rep ? `${rep.date || '—'}${repRel ? `（${repRel}）` : ''}${repTone === 'ok' ? '' : repTone === 'bad' ? ' · 异常' : ' · 暂无'}` : '暂无'}`
           ]
-        : ['暂无 run.log 数据']
+        : []
     },
     {
       title: '近 7 天',
       tone: weekTone,
       badge: !week ? '—' : (week.failed > 0 ? '有失败' : (week.rounds > 0 ? '正常' : '—')),
+      main: week
+        ? { num: fmtNum(week.pushed), unit: '条推送', hint: `轮次 ${week.rounds}` }
+        : { num: '—', unit: '', hint: '暂无数据' },
       lines: week
         ? [
-            `轮次 ${week.rounds} · 推送 ${week.pushed}`,
-            `失败 ${week.failed} · 成功率 ${rateText(week)}`,
+            `失败 ${fmtNum(week.failed)} · 成功率 ${rateText(week)}`,
             `日均 ${(week.rounds / 7).toFixed(1)} 轮`,
             ...(stats && stats.truncated ? ['⚠️ run.log 超窗，统计仅覆盖尾部'] : [])
           ]
-        : ['暂无数据']
+        : []
     },
     {
       title: '最近一轮',
       tone: runTone,
       badge: !run ? '—' : (run.cancelled === true ? '已取消' : (run.interrupted || run.failed > 0 ? '异常' : '正常')),
+      main: run
+        ? {
+            num: fmtNum(run.pushed),
+            unit: '条推送',
+            hint: `${runAge || '时间未知'}${run.at ? ` · ${run.at.slice(5, 16)}` : ''}`
+          }
+        : { num: '—', unit: '', hint: '暂无数据' },
       lines: run
         ? [
-            `${runAge || '时间未知'}${run.at ? ` · ${run.at.slice(5, 16)}` : ''}`,
-            `获取 ${fmtNum(run.total)} · 推送 ${fmtNum(run.pushed)} · 失败 ${fmtNum(run.failed)}`,
-            `耗时 ${fmtNum(run.elapsed)}${run.cancelled === true ? ' · ⏹ 已取消' : run.interrupted ? ' · ⚠️ 中断' : ''}`
+            `获取 ${fmtNum(run.total)} · 失败 ${fmtNum(run.failed)} · 耗时 ${fmtNum(run.elapsed)}${run.cancelled === true ? ' · ⏹ 已取消' : run.interrupted ? ' · ⚠️ 中断' : ''}`
           ]
-        : ['暂无数据']
+        : []
     },
     {
       title: '通道与过滤',
       tone: chanTone,
       badge: chanTone === 'bad' ? '异常' : (chanTone === 'ok' ? '正常' : '—'),
-      lines: [
-        ...(chan.entries.length > 0
-          ? [...chan.entries.map((e) => `${e.name}：连续失败 ${fmtNum(e.failures)} 次`), ...(chan.note ? [chan.note] : [])]
-          : [chan.note || '暂无记录']),
-        ...(diagLines.length > 0 ? [`过滤 ${diagLines.join(' · ')}`] : [])
-      ]
+      // 主数字换成「被过滤条数」：连续失败 0 当大字没意义（0 太抢且不是成绩）。
+      main: {
+        num: filteredCount === null ? '—' : fmtNum(filteredCount),
+        unit: '条被过滤',
+        hint: `${chan.entries.length > 0 ? chan.entries.map((e) => e.name).join('、') : (chan.note || '暂无记录')}${chanMax > 0 ? ` · 连续失败 ${chanMax}` : ' · 连续失败 0'}`
+      },
+      lines: diagLines.length > 0
+        ? [`最近过滤 ${fmtNum(diagAt)}`, `原因 ${diagReasons || '无'}`]
+        : []
     }
   ]
   return html`<div class="cards">
-    ${cards.map((c) => html`<${Card} key=${c.title} title=${c.title}
+    ${cards.map((c) => html`<${Card} key=${c.title} title=${c.title} main=${c.main}
       badge=${html`<${Badge} tone=${c.tone}>${c.badge}<//>`}>
       ${c.lines.map((l) => html`<div key=${l}>${l}</div>`)}
     <//>`)}
