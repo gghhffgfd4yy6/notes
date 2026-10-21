@@ -4715,6 +4715,39 @@ async function main () {
     assert.ok(/\.fr-restore-row \.mini-select\s*\{[^}]*min-width:\s*0/.test(css), '回滚目标在窄屏必须可收缩')
   })
 
+  await aok('结构红线: 回到顶部（固定层 / 触控尺寸 / 可访问名 / 平滑滚动）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const start = src.indexOf('function BackToTop ()')
+    const end = src.indexOf('function App () {', start)
+    assert.ok(start > -1 && end > start, '必须有 BackToTop 组件（长列表滚到深处没有回顶入口）')
+    const seg = src.slice(start, end)
+    // 固定层不参与文档流：换成行内按钮会把列表与分页整体顶动一截。
+    assert.ok(src.indexOf('html`<' + '$' + '{BackToTop} />') > -1, 'App 必须挂载回到顶部按钮')
+    assert.ok(seg.includes("document.addEventListener('scroll', onScroll, { capture: true, passive: true })"), '滚动监听必须 passive，且用捕获阶段收内层日志框的滚动（scroll 不冒泡）')
+    assert.ok(seg.includes("document.removeEventListener('scroll', onScroll, { capture: true })"), '卸载时必须摘掉捕获监听')
+    assert.ok(seg.includes('window.requestAnimationFrame(read)') && seg.includes('window.cancelAnimationFrame'), '滚动回调须合帧且卸载时取消')
+    assert.ok(seg.includes('window.scrollTo({ top: 0, behavior'), '点击必须回到文档顶部')
+    assert.ok(seg.includes('LOG_SCROLLER') && seg.includes('box.scrollTop = 0'), '日志框是内层滚动容器：点击必须把它也回到第一行')
+    assert.ok(seg.includes('backToTopBehavior(reduce'), '滚动方式必须走纯函数判定（reduced-motion / 老 Safari）')
+    assert.ok(/aria-label="回到顶部"/.test(seg), '按钮必须有可访问名')
+    assert.ok(/tabindex=\$\{show \? '0' : '-1'\}/.test(seg), '隐藏态不得留在 Tab 序列里')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const topCss = (css.match(/\.to-top\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/position:\s*fixed/.test(topCss), '.to-top 必须是固定层（出现/消失不改页高）')
+    assert.ok(/width:\s*44px/.test(topCss) && /height:\s*44px/.test(topCss), '.to-top 触控区必须 44px')
+    assert.ok(/pointer-events:\s*none/.test(topCss), '隐藏态不得吃掉列表末尾的点击')
+    assert.ok(/env\(safe-area-inset-bottom\)/.test(topCss), '.to-top 必须避开 iOS 底部安全区')
+    const showCss = (css.match(/\.to-top\.show\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/visibility:\s*visible/.test(showCss) && /pointer-events:\s*auto/.test(showCss), '显示态必须真的可见可点')
+  })
+
+  await aok('行为: backToTopBehavior（减少动效 / 老 Safari 退回瞬时回顶）', async () => {
+    const { backToTopBehavior } = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(backToTopBehavior(false, true), 'smooth', '默认必须平滑滚动')
+    assert.strictEqual(backToTopBehavior(true, true), null, 'prefers-reduced-motion 时不得动画，必须瞬时回顶')
+    assert.strictEqual(backToTopBehavior(false, false), null, '宿主不支持 scrollBehavior 时必须瞬时回顶（传 options 会被老 Safari 当成 x,y）')
+  })
+
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function Hint ('), '必须有 Hint 原语')
@@ -5243,9 +5276,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本没 bump：注释里的版本号只能是 v3.320。
-    assert.ok(!/v3\.321/.test(src), 'app.js 注释不得写 v3.321（版本未 bump）')
-    assert.ok(!/v3\.321/.test(css), 'app.css 注释不得写 v3.321（版本未 bump）')
+    // 版本没 bump：注释里的版本号只能是 v3.321。
+    assert.ok(!/v3\.322/.test(src), 'app.js 注释不得写 v3.322（版本未 bump）')
+    assert.ok(!/v3\.322/.test(css), 'app.css 注释不得写 v3.322（版本未 bump）')
   })
 }
 

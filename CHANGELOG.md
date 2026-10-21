@@ -594,3 +594,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **细节**：两处分页按钮在请求在飞时禁用（`|| loading`，与逐轮历史对齐，防连点双请求）；分类弹层选中当前值不再回调（同 `MiniSelect` 的值守卫）；日志首次加载失败也渲染 `.log-empty`「日志读取失败」（错误路径不再让 520px 日志框整体塌掉）；`.log-chip-n` 定宽 `2.4em` → `5em`（6 位计数不再挤动 chip 行；1MiB 全是换行也有 7 位，5em 留余量）。
 - **范围**：纯前端（`scripts/console-assets/app.js`、`app.css`）；服务端接口未变。
 - **门禁**：`test_console.js` 新增四条 v3.320 契约（sys-grid 不得再挂条件 + 7 行 + `info` 取值；`.logpre-main` min/max 同值 + `.log-empty` 同值 + 读取中占位 + 0 命中走 `.log-empty`；失败路径 aria-invalid 定位/聚焦/夹取且成功与加载失败路径不置旗；共用落点助手含 `Math.min` 收口 + 分页全走 `goPage` + 纯刷新不置旗），并改掉两处会被新属性骗过的旧断言（`runs-scroll` 精确串、推送记录每页条数的 onChange 精确串）。落点契约再补五条可证伪断言：依赖含 `days`/`loading`、两面板都有「已滚进列表」门且裸置旗仅 1 处、搜索路径不含 `activeElement`、chip/日期/页码只在值变化时置旗、`listLandTarget` 用 tabs 高度。终评门禁再补一条：`usePanelLoader` 暴露结算代数（失败分支不动 `data`、代数与 `setLoading(false)` 同批）、落点 effect 依赖含 `settleTick`、置旗记代数且消费要求代数前进 + 请求号前进、失败路径先清旗再判 `err`（不滚动）、两处分页四个 `|| loading`、分类值守卫、`err && !data` 的「日志读取失败」占位、`.log-chip-n` 3.2em、注释里不得出现 v3.321。
+
+## v3.321 — 长列表「回到顶部」按钮
+
+- **现象**：推送记录/逐轮历史/运行日志都远超一屏，手机上滚到深处后没有任何回顶入口（iOS 可点状态栏回顶，Android 没有），只能一路往回拖。
+- **修复**：新增固定层 `.to-top` 按钮（`BackToTop` 组件），滚动超过 320px 才出现、回顶后自动隐藏；`position: fixed` 不参与文档流 ⇒ 出现/消失都不改页高，不顶动列表与分页；44px 触控区并避开 `env(safe-area-inset-bottom)`。
+- **细节**：滚动监听 `passive` 且用 rAF 合帧（惯性滚动一帧多个 scroll 事件只 setState 一次）；隐藏态 `visibility: hidden` + `pointer-events: none`，不吞列表末尾的点击；尊重 `prefers-reduced-motion`，老 Safari 没有 `scrollBehavior` 时退回瞬时滚动；键盘/读屏触发后把焦点交给当前页签，不掉到 body。
+- **范围**：纯前端（`scripts/console-assets/app.js`、`app.css`）；服务端接口未变。
+- **门禁**：`test_console.js` 新增一条 v3.321 契约（固定层 / 44px / 隐藏态不可点 / 安全区 / 可访问名 / 隐藏时不进 Tab 序列 / reduced-motion 分支）。

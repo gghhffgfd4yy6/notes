@@ -6,6 +6,12 @@
 
 export const DAY_MS = 1000 * 60 * 60 * 24
 
+// 回到顶部的滚动方式（v3.321）：开了「减少动效」或宿主没有 scrollBehavior（老 Safari）时
+// 返回 null，调用方走 window.scrollTo(0, 0) 瞬时回顶；否则返回 'smooth'。
+export function backToTopBehavior (reduceMotion, supportsSmooth) {
+  return reduceMotion || !supportsSmooth ? null : 'smooth'
+}
+
 // 配置页「过滤规则」块的数据口径（v3.312）：显示**实际生效值**，而不是只读代码默认。
 // 背景：过滤规则页写的是覆盖文件 filter-rules.json，配置页原先只读 Config.filter ⇒
 // 保存成功后两页对不上（用户看到「已保存」，配置页仍全空）。

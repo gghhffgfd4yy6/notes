@@ -9,7 +9,7 @@
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
-import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitLogHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote } from './pure.mjs'
+import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitLogHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior } from './pure.mjs'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -3851,6 +3851,58 @@ function FilterRulesPanel ({ onSync, active = true }) {
   </div>`
 }
 
+// ── 回到顶部（v3.321）──────────────────────────────────────────────────────
+// 推送记录/逐轮历史/日志都远超一屏，手机滚到深处后没有回顶入口（iOS 可点状态栏，
+// Android 只能一路往回拖）。固定按钮：不参与文档流 ⇒ 出现/消失都不改页高；超过
+// TOP_SHOW_Y 才出现，回到顶部后自己消失。z-index 35 在吸顶页签(30)之上、浮层(45)/
+// 确认弹窗遮罩(80)之下，展开选择器或弹窗时不会盖住它们；隐藏态连 pointer-events 一并
+// 关掉，免得一个看不见的按钮吃掉列表末尾的点击。
+const TOP_SHOW_Y = 320
+// 日志页的日志框是内层滚动容器：页面停在顶部时只在框里滚，window.scrollY 一直是 0，
+// 只看整页滚动就不出按钮（Sourcery #284）。内层滚过一屏的 1/8 也算「滚深了」。
+const TOP_SHOW_INNER = 80
+const LOG_SCROLLER = '.logpre-main'
+function BackToTop () {
+  const [show, setShow] = useState(false)
+  const rafRef = useRef(0)
+  useEffect(() => {
+    const read = () => {
+      rafRef.current = 0
+      const box = document.querySelector(LOG_SCROLLER)
+      const next = (window.scrollY || 0) > TOP_SHOW_Y || Boolean(box && box.scrollTop > TOP_SHOW_INNER)
+      setShow((prev) => (prev === next ? prev : next))
+    }
+    const onScroll = () => {
+      // rAF 合并：手机惯性滚动一帧能来好几个 scroll 事件，别每个都 setState。
+      if (rafRef.current) return
+      rafRef.current = window.requestAnimationFrame(read)
+    }
+    read()
+    // scroll 不冒泡：捕获阶段才收得到 .logpre-main 的滚动，否则日志框滚到底也不出按钮。
+    document.addEventListener('scroll', onScroll, { capture: true, passive: true })
+    return () => {
+      document.removeEventListener('scroll', onScroll, { capture: true })
+      if (rafRef.current) window.cancelAnimationFrame(rafRef.current)
+    }
+  }, [])
+  const toTop = () => {
+    // 回顶后按钮自己隐藏：先把焦点交给当前页签，否则键盘/读屏用户的焦点会掉到 body。
+    const activeTab = document.querySelector('.tab-btn.active')
+    if (activeTab && typeof activeTab.focus === 'function') activeTab.focus({ preventScroll: true })
+    // 日志页：内层日志框一起回到第一行，只滚整页的话用户仍停在日志末尾。
+    const box = document.querySelector(LOG_SCROLLER)
+    if (box) box.scrollTop = 0
+    const reduce = Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)
+    // 老 Safari 没有 scrollBehavior，传 options 会被当成 (x, y) 静默失败。
+    const behavior = backToTopBehavior(reduce, 'scrollBehavior' in document.documentElement.style)
+    if (behavior) window.scrollTo({ top: 0, behavior })
+    else window.scrollTo(0, 0)
+  }
+  return html`<button type="button" class=${'to-top' + (show ? ' show' : '')}
+    aria-label="回到顶部" title="回到顶部" tabindex=${show ? '0' : '-1'}
+    aria-hidden=${show ? 'false' : 'true'} onClick=${toTop}>↑</button>`
+}
+
 function App () {
   const [state, setState] = useState(null)
   const [runs, setRuns] = useState([])
@@ -4584,6 +4636,7 @@ function App () {
     <footer class="foot">
       ⚠️ 「正式运行一轮」会真实推送，触发前二次确认 · 试运行只抓取不推送 · 同一时刻只能有一个触发任务
     </footer>
+    ${!authExpired && html`<${BackToTop} />`}
   </div>`
 }
 

@@ -394,6 +394,28 @@
   /* ── 页脚 ── */
   .foot { color: var(--text-dim); font-size: var(--fs-xs); text-align: center; padding-top: var(--sp-2); }
 
+  /* ── 回到顶部（v3.321）── */
+  /* 固定层不参与文档流 ⇒ 出现/消失都不改页高（不顶动列表、不改分页位置）。
+     visibility 用 0s 延迟切换，隐藏动画能播完再消失；pointer-events 隐藏态关掉，
+     否则透明的按钮会吃掉右下角列表的点击。44px 触控尺寸，避开 iOS 底部安全区。 */
+  .to-top {
+    position: fixed; right: var(--sp-3); bottom: calc(var(--sp-3) + env(safe-area-inset-bottom));
+    z-index: 35; width: 44px; height: 44px; padding: 0; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    font-size: 19px; line-height: 1; box-shadow: 0 6px 18px rgba(0, 0, 0, .35); cursor: pointer;
+    opacity: 0; visibility: hidden; transform: translateY(6px); pointer-events: none;
+    transition: opacity var(--dur-fast), transform var(--dur-fast), visibility 0s linear var(--dur-fast);
+  }
+  .to-top.show {
+    opacity: 1; visibility: visible; transform: none; pointer-events: auto;
+    transition: opacity var(--dur-fast), transform var(--dur-fast), visibility 0s linear 0s;
+  }
+  .to-top:hover { filter: brightness(1.15); }
+  .to-top:active { transform: translateY(1px); }
+  .to-top:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { .to-top { transition: none; } }
+
   /* ── 标签页（v3.297：概览/推送记录/运行日志/系统）── */
   /* 吸顶（v3.306）：手机滚动看缓存/日志时仍能切页；背景用页面底色遮住穿过的内容。 */
   .tabs {
