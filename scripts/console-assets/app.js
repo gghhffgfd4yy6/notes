@@ -9,7 +9,11 @@
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
-import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitLogHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior } from './pure.mjs'
+import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitLogHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior, dateRangeLabel } from './pure.mjs'
+// 日期区间（v3.326）：flatpickr 4.6.13 的 ESM 单文件 bundle（含 zh 语言包，vendored 入库，
+// 与 htm-preact 同口径——不引 CDN，CSP script-src 'self' 覆盖）。样式在 flatpickr.css，
+// 主题化覆盖写在 app.css 的 .flatpickr-calendar 段（跟四套 token 走）。
+import flatpickr from './flatpickr.js'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -238,7 +242,7 @@ function apiGetRunHistory ({ limit, before, windowKey, excludeCancelled = false 
 // ── v3.297 扩展 API：推送记录 / 趋势 / 日志 / 系统 ────────────────────────────
 // 与上方端点同纪律：fetch 第一参数是纯字面量（查询参数经 URLSearchParams 编码后
 // 只进模板字符串的查询段，authority 恒为字面量——SSRF 启发式全绿形态）。
-function apiGetMessages ({ page, size, cate, q, days }) {
+function apiGetMessages ({ page, size, cate, q, days, from, to }) {
   const params = new URLSearchParams()
   if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
   if (Number.isSafeInteger(size) && size !== 20) params.set('size', String(size))
@@ -246,6 +250,9 @@ function apiGetMessages ({ page, size, cate, q, days }) {
   if (typeof q === 'string' && q.length > 0) params.set('q', q)
   // 时间窗（v3.307）：0/未传=全部；1/3/7/30=近 N 个上海日历日（服务端白名单兜底）
   if (Number.isSafeInteger(days) && days > 0) params.set('days', String(days))
+  // 自定义区间（v3.326）：YYYY-MM-DD 闭区间，服务端优先于 days（非法/颠倒时静默回落）
+  if (typeof from === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(from)) params.set('from', from)
+  if (typeof to === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(to)) params.set('to', to)
   const qs = params.toString()
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
@@ -254,11 +261,14 @@ function apiGetMessages ({ page, size, cate, q, days }) {
   return consumeJson(p, done)
 }
 
-function apiGetTrends (days) {
+function apiGetTrends ({ days, from, to } = {}) {
   const params = new URLSearchParams()
   // days 由固定常量 TREND_DAYS 提供（14 为服务端默认，省略参数）；非法值前端先行钳制，
   // 服务端白名单仍兜底。查询段进模板字符串、authority 恒为字面量（Codacy SSRF 全绿形态）。
   if (days === 30 || days === 60) params.set('days', String(days))
+  // v3.326：自定义区间优先于 days（服务端同口径：非法/颠倒回落 days）。
+  if (typeof from === 'string' && DAY_KEY_RE.test(from)) params.set('from', from)
+  if (typeof to === 'string' && DAY_KEY_RE.test(to)) params.set('to', to)
   const qs = params.toString()
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
@@ -722,6 +732,128 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
 // 指标卡：标题 + 右上角徽章 + 若干行文本。换卡片实现（或组件库）只改这里。
 // v3.325：卡片加「主数字」——之前四张卡都是同一档小字，扫读时分不出主次。
 // main = { num, unit, hint }：数字单独放大 + 等宽数字（tabular-nums），标签压回小字。
+// ── 组件：日期区间（v3.326）──────────────────────────────────────────────────
+// 所有「按时间筛」的地方共用这一个：推送记录（服务端区间）、运行日志（按行首日期）、
+// 逐轮历史（按轮次日期）、趋势（服务端区间）。flatpickr 挂在 1px 隐形 input 上，
+// 弹层对齐按钮（positionElement）；只认 Date 数组不解析本地化字符串——zh 语言包的
+// 区间分隔符是「 至 」，按 " to " 切永远匹配不上（实测踩过）。
+const DAY_KEY_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
+const EMPTY_RANGE = { from: '', to: '' }
+
+// 上海日历日（与 run.log / 服务端同口径）：按钮文案按它判断「是不是今年」。
+function todayKeyShanghai () {
+  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10)
+}
+
+function fmtDayKey (d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// 月份箭头长按连翻（v3.326）：跨年要按十几下，用户要求按住就能一直翻、按越久翻越快。
+// 单击仍旧只翻一个月（原生 click 负责），长按 420ms 后由这里接管自动重复。
+function attachMonthHoldRepeat (inst) {
+  const pick = (delta) => inst.calendarContainer.querySelector(delta < 0 ? '.flatpickr-prev-month' : '.flatpickr-next-month')
+  const bind = (delta) => {
+    const el = pick(delta)
+    if (!el || el.dataset.holdBound === '1') return
+    el.dataset.holdBound = '1'
+    let timer = null
+    let startTs = 0
+    const stop = () => {
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+    }
+    const step = () => {
+      const arrow = pick(delta)
+      if (!arrow || arrow.classList.contains('flatpickr-disabled')) return stop()
+      inst.changeMonth(delta, true)
+      // 越按越快（用户口径：起手约一秒一格，按住越久越快）：
+      // 1.2s 内 800ms/格 ≈ 1 格/秒；2.4s 内 400ms；4s 内 200ms；之后 100ms ≈ 10 格/秒。
+      const held = Date.now() - startTs
+      timer = setTimeout(step, held < 1200 ? 800 : held < 2400 ? 400 : held < 4000 ? 200 : 100)
+    }
+    // 手势全部自己接管：系统在长按 ~500ms 时会弹选字/预览菜单（手机会"叮"一声），
+    // 所以 touchstart / pointerdown 都 preventDefault，点击也只认我们自己的 pointerup。
+    el.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation() }, true)
+    el.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false })
+    el.addEventListener('pointerdown', (e) => {
+      if (typeof e.button === 'number' && e.button > 0) return
+      e.preventDefault()
+      stop()
+      startTs = Date.now()
+      timer = setTimeout(step, 420)
+    })
+    el.addEventListener('pointerup', () => {
+      const held = Date.now() - startTs
+      stop()
+      // 没到连翻阈值就是单击：自己翻一格（原生 click 已被吞掉）。
+      if (held < 420 && !pick(delta).classList.contains('flatpickr-disabled')) inst.changeMonth(delta, true)
+    })
+    for (const ev of ['pointerleave', 'pointercancel', 'blur']) el.addEventListener(ev, stop)
+    el.addEventListener('contextmenu', (e) => e.preventDefault())
+  }
+  bind(-1)
+  bind(1)
+}
+
+function DateRange ({ value, onChange, label = '日期区间', disabled = false }) {
+  const from = value && typeof value.from === 'string' ? value.from : ''
+  const to = value && typeof value.to === 'string' ? value.to : ''
+  const active = DAY_KEY_RE.test(from) && DAY_KEY_RE.test(to)
+  const anchorRef = useRef(null)
+  const instRef = useRef(null)
+  const btnRef = useRef(null)
+  const cbRef = useRef(onChange)
+  cbRef.current = onChange
+  useEffect(() => {
+    const el = anchorRef.current
+    if (!el) return undefined
+    const inst = flatpickr(el, {
+      mode: 'range',
+      dateFormat: 'Y-m-d',
+      // 只到今天：控制台里的数据都是已发生的，未来日期选了只会是空结果。
+      maxDate: 'today',
+      disableMobile: true,
+      // 单月：双月在 390 宽必然溢出；maxDate 之后第二个月也只剩禁用格。
+      showMonths: 1,
+      // 月份不用原生 <select>：它弹出的是系统选择器（手机上是白底系统弹层，CSS 改不了），
+      // 在深色面板里必然破一致性。改成静态文字 + 左右箭头翻月，年份仍可直接改。
+      monthSelectorType: 'static',
+      positionElement: btnRef.current || el,
+      onReady (_sel, _str, inst) { attachMonthHoldRepeat(inst) },
+
+      onChange (dates) {
+        if (!Array.isArray(dates) || dates.length !== 2) return
+        const f = fmtDayKey(dates[0])
+        const t = fmtDayKey(dates[1])
+        if (!DAY_KEY_RE.test(f) || !DAY_KEY_RE.test(t) || f > t) return
+        if (cbRef.current) cbRef.current({ from: f, to: t })
+        inst.close()
+      }
+    })
+    instRef.current = inst
+    return () => { inst.destroy(); instRef.current = null }
+  }, [])
+  const clear = () => { if (cbRef.current) cbRef.current({ ...EMPTY_RANGE }) }
+  return html`<span class="date-range">
+    <button type="button" ref=${btnRef} class=${active ? 'date-btn on' : 'date-btn'} disabled=${disabled}
+      aria-label=${active ? `${label} ${from} 至 ${to}` : label}
+      onClick=${() => { const inst = instRef.current; if (inst) inst.open() }}>
+      ${active ? dateRangeLabel(from, to, todayKeyShanghai()) : label}
+    </button>
+    ${active && html`<button type="button" class="date-clear" aria-label=${`清除${label}`} onClick=${clear}>×</button>`}
+    <input ref=${anchorRef} class="fp-anchor" type="text" tabIndex=${-1} aria-hidden="true" readOnly />
+  </span>`
+}
+
+// 按区间过滤「带 datetime/at 前缀」的条目（客户端侧复用：日志行、逐轮历史）。
+function inDayRange (day, range) {
+  if (!range || !DAY_KEY_RE.test(range.from) || !DAY_KEY_RE.test(range.to)) return true
+  return typeof day === 'string' && day >= range.from && day <= range.to
+}
+
 function Card ({ title, badge, main, children }) {
   return html`<div class="card">
     <div class="card-head">
@@ -1653,7 +1785,9 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   const [size, setSize] = useState(10)
   // 默认只看真实轮次：取消留痕是操作审计，不该在每次打开历史时占据一半行。
   const [mode, setMode] = useState('runs')
-  const [day, setDay] = useState('')
+  // v3.326：单日筛选升级为日期区间（同一个 DateRange 组件，复用组件而不是再造一个原生 date）。
+  const [runRange, setRunRange] = useState(EMPTY_RANGE)
+  const runRangeActive = DAY_KEY_RE.test(runRange.from) && DAY_KEY_RE.test(runRange.to)
   const [pageNo, setPageNo] = useState(1)
   const [data, setData] = useState(null)
   // data 属于哪一档（runs = 仅运行，all = 全量，供 全部/只看异常 共用）。切模式时
@@ -1755,7 +1889,8 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   const issueCount = fullSnap ? filterRunItems(all, { mode: 'issue' }).length : null
   const runsCount = filterRunItems(all, { mode: 'runs' }).length
   // 切档是原子的（mode 变化时 data 已换成同一档），直接按 mode 过滤即可。
-  const filtered = filterRunItems(all, { mode, day })
+  const filtered = filterRunItems(all, { mode })
+    .filter((r) => inDayRange(typeof r.at === 'string' ? r.at.slice(0, 10) : '', runRange))
   const pages = Math.max(1, Math.ceil(filtered.length / size))
   const current = Math.min(pageNo, pages)
   // 数据变少（筛选/刷新）时把页码收回有效区间；不在渲染期 setState。
@@ -1771,9 +1906,10 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   // 改日期才置落点旗。
   const refresh = () => { setPageNo(1); load().catch(() => {}) }
   const changeDay = (v) => {
-    if (v === day) return
+    // 值守卫（同 MiniSelect）：区间没变就不回调，避免一次无意义的筛选重拉。
+    if (v.from === runRange.from && v.to === runRange.to) return
     armLand()
-    setDay(v)
+    setRunRange(v)
     setPageNo(1)
   }
   const changeMode = (m) => {
@@ -1845,7 +1981,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     const y = listLandTarget(listRef.current)
     if (y === null) return
     window.scrollTo(0, y)
-  }, [data, loading, err, pageNo, size, mode, day])
+  }, [data, loading, err, pageNo, size, mode, runRange.from, runRange.to])
   const jumpLog = (r) => {
     if (!onOpenLog || typeof r.at !== 'string' || r.at.length < 10) return
     const key = `${r.at}-${r.lineNo}`
@@ -1882,7 +2018,8 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
       sub=${err
         ? 'run.log 读取失败'
         : (data
-            ? `run.log 摘要逐轮 · 最近 ${all.length} 轮` + (data.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : '')
+            ? `run.log 摘要逐轮 · 最近 ${all.length} 轮` + (data.truncated ? ' · 日志已轮转/超窗，更早轮次已丢失' : '') +
+              (runRangeActive ? ` · 日期 ${runRange.from} ~ ${runRange.to}（${filtered.length} 轮）` : '')
             : 'run.log 摘要逐轮 · 加载中…')}
       right=${html`<div class="toolbar">
         <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
@@ -1904,11 +2041,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
           aria-busy=${pendingMode === 'issue' && pendingBusy ? 'true' : 'false'}
           aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => changeMode('issue')}>${mode === 'runs' || issueCount === null ? '只看异常' : `只看异常 ${issueCount}`}</button>
       </div>
-      <label class="run-day">
-        <span>日期</span>
-        <input type="date" value=${day} onInput=${(e) => changeDay(e.target.value)} onChange=${(e) => changeDay(e.target.value)} aria-label="按日期筛选轮次" />
-      </label>
-      ${day !== '' && html`<button type="button" class="log-chip on" onClick=${() => changeDay('')}>清除日期</button>`}
+      <${DateRange} value=${runRange} onChange=${changeDay} label="按日期筛选轮次" />
       <span class="run-tools-note">${mode === 'issue' ? '只显示失败、中断或取消的轮次' : (mode === 'runs' ? '不显示取消留痕；切「全部」可查' : '点行尾「日志」跳到该日日志')}</span>
     </div>`}
     ${data && data.status && data.status !== 'ok' && html`<div class="empty">run.log${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
@@ -2023,15 +2156,23 @@ const TREND_DAYS = [14, 30, 60]
 
 function TrendsPanel ({ active = true }) {
   const [days, setDays] = useState(TREND_DAYS[0])
-  const fetchTrends = useCallback(() => apiGetTrends(days), [days])
+  const [range, setRange] = useState(EMPTY_RANGE)
+  const rangeActive = DAY_KEY_RE.test(range.from) && DAY_KEY_RE.test(range.to)
+  const fetchTrends = useCallback(
+    () => apiGetTrends(rangeActive ? { from: range.from, to: range.to } : { days }),
+    [days, rangeActive, range.from, range.to])
   const { data: trends, err, load } = usePanelLoader(fetchTrends)
   // 保活后概览切回来时补拉一次；离开概览不拉。
   usePanelAutoLoad(active, load)
   // 展示口径只认「响应自带的 days」：切窗口后旧响应未替换（请求中/失败）时，
   // 标题与合计必须跟随旧窗口的数据，不能拿着旧数据标新窗口。
-  const shownDays = trends && Number.isSafeInteger(trends.days) && TREND_DAYS.includes(trends.days)
-    ? trends.days
-    : (trends ? null : days) // 尚无任何响应时才用当前选择器值占位
+  // 区间模式下标题显示实际区间（服务端回显，含被 92 天上限截断后的真实起点）。
+  const shownRange = trends && typeof trends.from === 'string' && trends.from !== '' ? `${trends.from} ~ ${trends.to}` : ''
+  const shownDays = shownRange !== ''
+    ? null
+    : (trends && Number.isSafeInteger(trends.days) && TREND_DAYS.includes(trends.days)
+        ? trends.days
+        : (trends ? null : days)) // 尚无任何响应时才用当前选择器值占位
   const byDay = trends && trends.status === 'ok' ? trends.byDay : []
   const maxPushed = Math.max(1, ...byDay.map((d) => d.pushed))
   const totalAll = byDay.reduce((acc, d) => acc + d.pushed, 0)
@@ -2097,10 +2238,17 @@ function TrendsPanel ({ active = true }) {
     }
   }, [byDay.length])
   return html`<div class="panel">
-    <${PanelHead} title=${shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势'}
-      afterTitle=${html`<${MiniSelect} value=${String(days)} ariaLabel="趋势窗口天数"
-        options=${TREND_DAYS.map((d) => ({ value: String(d), label: `${d} 日` }))}
-        onChange=${(v) => setDays(Number(v))} />`}
+    <${PanelHead} title=${shownRange ? `运行趋势（${shownRange}）` : (shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势')}
+      afterTitle=${html`<div class="toolbar">
+        <${MiniSelect} value=${rangeActive ? '__range' : String(days)} ariaLabel="趋势窗口天数"
+          options=${[
+            ...(rangeActive ? [{ value: '__range', label: '自定义区间' }] : []),
+            ...TREND_DAYS.map((d) => ({ value: String(d), label: `${d} 日` }))
+          ]}
+          onChange=${(v) => { if (v === '__range') return; setRange(EMPTY_RANGE); setDays(Number(v)) }} />
+        <${DateRange} value=${range} label="趋势日期区间"
+          onChange=${(r) => setRange(r)} />
+      </div>`}
       sub=${'run.log 摘要按日聚合' + (trends && trends.truncated ? '（日志超限，仅统计尾部 1 MiB）' : '')}
       right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
@@ -2553,6 +2701,9 @@ function MessagesPanel ({ onSync, active = true }) {
   const [size, setSize] = useState(20)
   const [cate, setCate] = useState('')
   const [days, setDays] = useState(0)
+  // 自定义日期区间（v3.326）：两项都非空才生效，否则退回「近 N 天」。
+  const [range, setRange] = useState({ from: '', to: '' })
+  const rangeActive = range.from !== '' && range.to !== ''
   const [input, setInput] = useState('')
   const [query, setQuery] = useState('')
   const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
@@ -2616,12 +2767,12 @@ function MessagesPanel ({ onSync, active = true }) {
     () => {
       const requested = query
       const seq = ++loadSeqRef.current
-      return apiGetMessages({ page, size, cate, q: requested, days }).then((d) => {
+      return apiGetMessages({ page, size, cate, q: requested, days: rangeActive ? 0 : days, from: range.from, to: range.to }).then((d) => {
         if (seq === loadSeqRef.current) loadedQueryRef.current = requested
         return d
       })
     },
-    [page, size, cate, query, days])
+    [page, size, cate, query, days, rangeActive, range.from, range.to])
   const { data, err, load, loading, settleTick } = usePanelLoader(fetchMessages, onSync)
   // armLand 需要「点击那一刻的 data」做前后对比；渲染期同步，避免闭包拿到旧值。
   dataRef.current = data
@@ -2684,6 +2835,7 @@ function MessagesPanel ({ onSync, active = true }) {
     if (typeof cate === 'string' && cate.length > 0) body.set('cate', cate)
     if (typeof query === 'string' && query.length > 0) body.set('q', query)
     if (Number.isSafeInteger(days) && days > 0) body.set('days', String(days))
+    if (rangeActive) { body.set('from', range.from); body.set('to', range.to) }
     // page/size 不发送：导出=筛选结果全量（服务端亦不读取）。
     const { merged, done } = timedRequest({
       method: 'POST',
@@ -2732,7 +2884,7 @@ function MessagesPanel ({ onSync, active = true }) {
       if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, 60000)
       setExporting('')
     }
-  }, [exporting, cate, query, days])
+  }, [exporting, cate, query, days, rangeActive, range.from, range.to])
   const items = data && Array.isArray(data.items) ? data.items : []
   const categories = data && Array.isArray(data.categories) ? data.categories : []
   // 分类弹层的「全部分类」计数必须跟时间窗走（服务端 days>0 时 categories 已按窗口重算）；
@@ -2761,15 +2913,23 @@ function MessagesPanel ({ onSync, active = true }) {
       <${CategoryPicker} value=${cate} categories=${categories}
         total=${cateTotal} pageActive=${active}
         onChange=${(v) => { armLand(); setCate(v); setPage(1) }} />
-      <${MiniSelect} value=${String(days)} ariaLabel="时间范围"
+      <${MiniSelect} value=${rangeActive ? '__range' : String(days)} ariaLabel="时间范围"
         options=${[
+          ...(rangeActive ? [{ value: '__range', label: '自定义区间' }] : []),
           { value: '0', label: '全部时间' },
           { value: '1', label: '今天' },
           { value: '3', label: '近 3 天' },
           { value: '7', label: '近 7 天' },
           { value: '30', label: '近 30 天' }
         ]}
-        onChange=${(v) => { armLand(); setDays(Number(v)); setPage(1) }} />
+        onChange=${(v) => {
+          if (v === '__range') return
+          armLand()
+          setRange({ from: '', to: '' })
+          setDays(Number(v))
+          setPage(1)
+        }} />
+      <${DateRange} value=${range} onChange=${(r) => { armLand(); setRange(r); setDays(0); setPage(1) }} />
       <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
         options=${[10, 20, 50, 100].map((n) => ({ value: String(n), label: `每页 ${n} 条` }))}
         onChange=${(v) => { armLand(); setSize(Number(v)); setPage(1) }} />
@@ -2918,13 +3078,19 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   // v3.319：「只看这一轮」必须按行首时间戳收窄——普通关键字搜索会把正文里
   // 提到同一时间戳的其他行也带进来，看起来像「这一轮」有多行。
   const focusOnly = focusAt !== '' && focusDate !== '' && q === focusAt && mode === 'all'
+  // v3.326：按日期区间筛日志（客户端侧，行首时间戳前缀；不重拉 /api/logs）。
+  const [logRange, setLogRange] = useState(EMPTY_RANGE)
+  const logRangeActive = DAY_KEY_RE.test(logRange.from) && DAY_KEY_RE.test(logRange.to)
   const filtered = useMemo(() => {
     const base = filterLogLines(rawText, mode, q)
     return focusOnly ? base.filter((l) => l.startsWith(focusAt)) : base
   }, [rawText, mode, q, focusOnly, focusAt])
-  const shownText = useMemo(() => filtered.join('\n'), [filtered])
+  const ranged = useMemo(
+    () => (logRangeActive ? filtered.filter((l) => inDayRange(l.slice(0, 10), logRange)) : filtered),
+    [filtered, logRangeActive, logRange.from, logRange.to])
+  const shownText = useMemo(() => ranged.join('\n'), [ranged])
   // 高亮节点上限（v3.319）：超过 3000 行退回纯文本，定位也不再假装有高亮。
-  const heavy = filtered.length > LOG_HIGHLIGHT_MAX
+  const heavy = ranged.length > LOG_HIGHLIGHT_MAX
   // v3.319：行级跳转的定位状态。day = 当天列表 + 高亮该轮；only = 只看该轮。
   // 用户切了分类/自己改了搜索词就收起定位条，避免和当前筛选打架。
   const focusHits = useMemo(() => (focusAt ? lines.filter((l) => l.startsWith(focusAt)).length : 0), [lines, focusAt])
@@ -2985,10 +3151,11 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const modeLabel = (LOG_MODES.find((m) => m[0] === mode) || ['', '全部'])[1]
   const countLine = [
     mode !== 'all'
-      ? `在「${modeLabel}」筛选下 · 显示 ${filtered.length} / ${lines.length} 行`
-      : (kw !== '' ? `显示 ${filtered.length} / ${lines.length} 行` : `共 ${lines.length} 行`),
+      ? `在「${modeLabel}」筛选下 · 显示 ${ranged.length} / ${lines.length} 行`
+      : ((kw !== '' || logRangeActive) ? `显示 ${ranged.length} / ${lines.length} 行` : `共 ${lines.length} 行`),
     (mode === 'issue' || mode === 'error') ? '已排除控制台停止记录' : '',
     heavy ? `行数过多（>${LOG_HIGHLIGHT_MAX}），已关闭高亮` : '',
+    logRangeActive ? `日期 ${logRange.from} ~ ${logRange.to}` : '',
     mode === 'all' ? '分类可重叠' : ''
   ].filter(Boolean).join(' · ')
   const emptyText = lines.length === 0
@@ -3006,10 +3173,10 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   // 超阈值先在 useMemo 里返回 null：旧实现「先 map 出一整页 span、再在渲染时二选一」，
   // 护栏只省了挂载没省构造，3000+ 行搜索在手机上照样卡（Sourcery：Large log searches still lag）。
   const lineNodes = useMemo(() => {
-    if (filtered.length > LOG_HIGHLIGHT_MAX) return null
+    if (ranged.length > LOG_HIGHLIGHT_MAX) return null
     const kwNow = q.trim().toLowerCase()
-    const last = filtered.length - 1
-    return filtered.map((line, i) => {
+    const last = ranged.length - 1
+    return ranged.map((line, i) => {
       const tone = logLineTone(line)
       // v3.319：点中的那一轮加底色并把 ref 交给居中 effect（只会在行首时间戳匹配）。
       const isFocus = focusAt !== '' && line.startsWith(focusAt)
@@ -3018,7 +3185,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
         splitLogHits(line, kwNow).map(([text, hit], j) => hit ? html`<mark key=${j}>${text}</mark>` : text)
       }${i === last ? '' : '\n'}</span>`
     })
-  }, [filtered, q, focusAt])
+  }, [ranged, q, focusAt])
   // v3.320：工具条与计数行不再等数据。旧版整块挂在 ok 分支里：首帧只有「读取中」占位
   // （panel 583），数据到达后筛选栏凭空插进来（+134）再加计数行（+19），日志框连下半页
   // 一起被推走 153px。现在 chips 用同一组标签、计数先显示 —，计数行显示「读取中…」。
@@ -3051,6 +3218,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
           <button type="button" key=${key} class=${'log-chip' + (mode === key ? ' on' : '')}
             aria-pressed=${mode === key ? 'true' : 'false'} onClick=${() => pickMode(key)}>${label} <span class="log-chip-n">${logReady ? n : '—'}</span></button>`)}
       </div>
+      <${DateRange} value=${logRange} onChange=${(r) => { stickRef.current = true; setFocusDismissed(true); setLogRange(r) }} />
       <input class="msg-search log-search" type="search" placeholder="搜索日志…" aria-label="搜索日志"
         value=${q} onInput=${(e) => { stickRef.current = true; setFocusDismissed(true); setQ(e.target.value) }} />
     </div>

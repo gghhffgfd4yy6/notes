@@ -600,7 +600,11 @@ const STATIC_ASSETS = Object.freeze({
   '/assets/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
   '/assets/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
   '/assets/pure.mjs': { file: 'pure.mjs', type: 'text/javascript; charset=utf-8' },
-  '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' }
+  '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' },
+  // v3.326 日期区间：flatpickr 4.6.13 的 ESM 单文件 bundle（esbuild 打包，含 zh 语言包）
+  // 与官方 CSS。两者都随白名单伺服，CSP script-src 'self' 覆盖，无 CDN。
+  '/assets/flatpickr.js': { file: 'flatpickr.module.js', type: 'text/javascript; charset=utf-8' },
+  '/assets/flatpickr.css': { file: 'flatpickr.css', type: 'text/css; charset=utf-8' }
 })
 
 // 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，各文件 < 100KB）。
@@ -875,6 +879,7 @@ function renderPage (state, runsList, query, sessionToken, theme) {
 <html lang="zh-CN" data-theme="${THEMES.includes(theme) ? theme : THEMES[0]}"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="${CSP_HEADER}">
+<link rel="stylesheet" href="/assets/flatpickr.css${assetQuery()}">
 <link rel="stylesheet" href="/assets/app.css${assetQuery()}">
 </head><body>
 <div id="app"><noscript>
@@ -1567,6 +1572,35 @@ function filterMessagesByDays (items, days, now = Date.now()) {
     const day = m.datetime.slice(0, 10)
     return day >= startKey && day <= todayKey
   })
+}
+
+// 自定义日期区间（v3.326）：from/to 为上海日历日 YYYY-MM-DD，闭区间，前缀比较与 days 同口径。
+// 非法格式/不存在的日期/颠倒区间一律忽略（宽松输入，与 days 越界回「全部」同一哲学，不 400）。
+// 正则无嵌套量词、定长锚定，无 ReDoS 面（本仓正则红线）。
+function parseDayKey (v) {
+  if (typeof v !== 'string' || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(v)) return ''
+  const t = new Date(v + 'T00:00:00Z')
+  // 回环校验：2026-02-30 会被 Date 归一化成 03-02，必须与输入不等即拒。
+  if (Number.isNaN(t.getTime()) || t.toISOString().slice(0, 10) !== v) return ''
+  return v
+}
+
+function filterMessagesByRange (items, from, to) {
+  if (from === '' || to === '' || from > to) return items
+  return items.filter((m) => {
+    if (typeof m.datetime !== 'string' || m.datetime.length < 10) return false
+    const day = m.datetime.slice(0, 10)
+    return day >= from && day <= to
+  })
+}
+
+// 时间窗统一入口：区间优先于「近 N 天」（两者同时出现时以区间为准，days 视作 0）。
+// 返回 { items, days, from, to } —— days/from/to 三个回显字段由调用方原样下发。
+function windowMessages (items, { days, fromKey, toKey }) {
+  if (fromKey !== '' && toKey !== '' && fromKey <= toKey) {
+    return { items: filterMessagesByRange(items, fromKey, toKey), days: 0, from: fromKey, to: toKey }
+  }
+  return { items: days > 0 ? filterMessagesByDays(items, days) : items, days, from: '', to: '' }
 }
 
 // 分类计数（v3.307）：时间窗筛选后分类下拉的计数必须跟随窗口，否则「今天」里会显示
@@ -3110,7 +3144,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 时间窗（v3.307）：白名单外的值一律回「全部」（宽松输入，不 400）。
       const daysRaw = Number(q.get('days'))
       const days = MESSAGE_DAYS_ALLOWED.includes(daysRaw) ? daysRaw : 0
-      const windowed = days > 0 ? filterMessagesByDays(read.value.items, days) : read.value.items
+      // v3.326：自定义日期区间优先于「近 N 天」；非法区间静默回落到 days/全部。
+      const win = windowMessages(read.value.items, {
+        days, fromKey: parseDayKey(q.get('from')), toKey: parseDayKey(q.get('to'))
+      })
+      const windowed = win.items
       const items = filterMessageItems(windowed, cate, needle)
       // 行键必须按「条目对象」取原始 keys：过滤/时间窗会改变下标，继续用 start+i 会把
       // 旧行的 rowKey 贴到新行上（展开状态/React key 联动错位）。
@@ -3155,10 +3193,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 时间窗：0=全部；>0 时 categories 也只统计窗口内条目（筛选器计数要跟手）。
         // 搜索词同样要参与分类计数：否则「搜某某」后仍显示全量分类条数，点进去是空的
         // （Sourcery 分类计数忽略搜索）。
-        days,
+        days: win.days,
+        from: win.from,
+        to: win.to,
         categories: needle.length > 0
-          ? messageCategoriesOf(filterMessageItems(days > 0 ? windowed : read.value.items, '', needle))
-          : (days > 0 ? messageCategoriesOf(windowed) : read.value.categories),
+          ? messageCategoriesOf(filterMessageItems(win.days > 0 || win.from !== '' ? windowed : read.value.items, '', needle))
+          : (win.days > 0 || win.from !== '' ? messageCategoriesOf(windowed) : read.value.categories),
         items: pageItems
       })
       return
@@ -3189,7 +3229,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             sendJson(res, 200, { status: read.status, total: 0, items: [], cacheDirHint: stateDir, cacheFileHint: messagesFile })
             return
           }
-          const filtered = filterMessageItems(days > 0 ? filterMessagesByDays(read.value.items, days) : read.value.items, cate, needle)
+          const windowedExport = windowMessages(read.value.items, {
+            days, fromKey: parseDayKey(params.get('from')), toKey: parseDayKey(params.get('to'))
+          }).items
+          const filtered = filterMessageItems(windowedExport, cate, needle)
           const truncated = filtered.length > EXPORT_MAX_ROWS
           const rows = (truncated ? filtered.slice(0, EXPORT_MAX_ROWS) : filtered).map(exportRowOf)
           // 截断回显（D2-S9）：列表端点有 queryUsed，导出此前没有——搜索词超过 240 字节被
@@ -3228,7 +3271,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // readTrends 对 days 无内部钳制，这里的白名单是唯一防线。
       const rawDays = Number(url.searchParams.get('days'))
       const days = TREND_DAYS_ALLOWED.includes(rawDays) ? rawDays : TREND_DAYS_DEFAULT
-      const t = readTrends(stateDir, { days })
+      // v3.326：自定义区间优先于 days（与推送记录同一口径：非法/颠倒区间静默回落）。
+      const trendFrom = parseDayKey(url.searchParams.get('from'))
+      const trendTo = parseDayKey(url.searchParams.get('to'))
+      const t = readTrends(stateDir, { days, from: trendFrom, to: trendTo })
       if (t.status !== 'ok') {
         sendJson(res, 200, { status: t.status, byDay: [], days })
         return
@@ -3236,6 +3282,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sendJson(res, 200, {
         status: 'ok',
         days: t.value.days,
+        from: t.value.from,
+        to: t.value.to,
         byDay: t.value.byDay,
         // today：Asia/Shanghai 日历日（run.log 时间戳口径），前端「今天」高亮用它；
         // truncated：run.log 超限只统计了尾部（前端副标题如实注明）
@@ -3780,6 +3828,10 @@ module.exports = {
   TOKEN_MIN_LEN,
   RUN_LOG_MAX_BYTES,
   PROC_TIMEOUT_MS,
+  // v3.326 日期区间：解析/过滤/统一时间窗入口（纯函数，非 HTTP 单测可达）
+  parseDayKey,
+  filterMessagesByRange,
+  windowMessages,
   // v3.298 只读扩展：纯函数/常量导出（非 HTTP 单测 + 变异测试可达性）
   MESSAGES_MAX_BYTES,
   statSafeMeta,

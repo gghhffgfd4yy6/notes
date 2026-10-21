@@ -427,7 +427,9 @@ function validInt (v) { return Number.isSafeInteger(v) && v >= 0 }
 
 // 近 N 日运行趋势：摘要行按本地日期（YYYY-MM-DD）聚合。文件缺失/不可读返回 { status }，
 // 与 readStatus 部件三态（missing/ok/invalid）一致，前端沿用 partTone 归类。
-function readTrends (dir, { now = Date.now(), days = 14 } = {}) {
+// v3.326：支持自定义日期区间（from/to，上海日历日）。区间优先于 days；跨度上限 92 天
+// （一年四分之一的图表已是横向滚动的极限，再长既画不出也没数据）。
+function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = {}) {
   // [7] 日志超限读尾部时如实标注：readSafeTextResult 对 tail 读不报截断，这里以「文件实际大于
   // 读取上限」判定。窗口内的更早摘要若被截掉，趋势只反映尾部日志——前端副标题会注明。
   let truncated = false
@@ -437,7 +439,16 @@ function readTrends (dir, { now = Date.now(), days = 14 } = {}) {
   } catch (e) { /* stat 失败按未截断处理：readText 随后会给出真实状态 */ }
   const read = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
   if (read.status !== 'ok') return { status: read.status }
-  const horizonKey = shanghaiDayKey(now - (days - 1) * 86400000)
+  const todayKey = shanghaiDayKey(now)
+  const dayRe = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
+  const rangeMode = typeof from === 'string' && typeof to === 'string' && dayRe.test(from) && dayRe.test(to) && from <= to
+  // 区间模式：to 超过今天按今天截；跨度上限 92 天（超出时保留靠近 to 的一端）。
+  const endKey = rangeMode ? (to > todayKey ? todayKey : to) : todayKey
+  const rawStart = rangeMode ? from : shanghaiDayKey(now - (days - 1) * 86400000)
+  const endMs = Date.parse(endKey + 'T00:00:00Z')
+  const startMs = Date.parse(rawStart + 'T00:00:00Z')
+  const spanDays = Math.min(92, Math.max(1, Math.round((endMs - startMs) / 86400000) + 1))
+  const startKey = new Date(endMs - (spanDays - 1) * 86400000).toISOString().slice(0, 10)
   const byDay = new Map()
   const lines = read.value.split('\n')
   for (const line of lines) {
@@ -448,8 +459,8 @@ function readTrends (dir, { now = Date.now(), days = 14 } = {}) {
     // 无时间戳的历史行（极旧格式）没有日期键，归不进任何一天——跳过（诚实于「不知道」）。
     const day = m[1]
     if (!day) continue
-    // 只聚合近 N 天：旧日志行不进窗口（避免「总计」被陈旧数据污染）。
-    if (day < horizonKey) continue
+    // 只聚合窗口内：旧日志行不进窗口（避免「总计」被陈旧数据污染）。
+    if (day < startKey || day > endKey) continue
     const agg = byDay.get(day) || { date: day, rounds: 0, total: 0, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 0 }
     agg.rounds += 1
     agg.total += counters[0]
@@ -462,11 +473,11 @@ function readTrends (dir, { now = Date.now(), days = 14 } = {}) {
   }
   // 输出按日期升序补零：没有记录的日期也给全 0 行，前端画图不用补洞。
   const out = []
-  for (let i = 0; i < days; i++) {
-    const key = shanghaiDayKey(now - (days - 1 - i) * 86400000)
+  for (let i = 0; i < spanDays; i++) {
+    const key = new Date(startMs + i * 86400000).toISOString().slice(0, 10)
     out.push(byDay.get(key) || { date: key, rounds: 0, total: 0, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 0 })
   }
-  return result('ok', { days, byDay: out, truncated, today: shanghaiDayKey(now) })
+  return result('ok', { days: spanDays, from: rangeMode ? startKey : '', to: rangeMode ? endKey : '', byDay: out, truncated, today: todayKey })
 }
 
 // ── 逐轮运行历史（v3.299 批次②）：run.log 摘要行 → 时间倒序逐轮条目 ─────────────

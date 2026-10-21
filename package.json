@@ -84,7 +84,8 @@
   },
   "standard": {
     "ignore": [
-      "scripts/console-assets/htm-preact.module.js"
+      "scripts/console-assets/htm-preact.module.js",
+      "scripts/console-assets/flatpickr.module.js"
     ]
   }
 }

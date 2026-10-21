@@ -1039,3 +1039,151 @@
     .tab-btn { padding: 7px 5px; font-size: var(--fs-sm); }
   }
 }
+
+/* ── 自定义日期区间（v3.326）─────────────────────────────────────────────────
+   触发器与 flatpickr 弹层。flatpickr.css 先于 app.css 加载，这里的规则不加 @layer，
+   按层叠顺序天然覆盖官方样式；颜色一律走 token，四套主题自动跟随。 */
+.date-range { position: relative; display: inline-flex; align-items: center; gap: 4px; }
+.date-btn {
+  min-height: 34px; padding: 0 10px; font: inherit; font-size: var(--fs-xs);
+  color: var(--text-dim); background: transparent; border: 1px solid var(--border);
+  border-radius: var(--r-sm); cursor: pointer; white-space: nowrap;
+}
+.date-btn:hover { color: var(--text); border-color: var(--accent-line); }
+.date-btn.on { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+.date-clear {
+  width: 26px; height: 26px; line-height: 1; padding: 0; border: 0; border-radius: 50%;
+  color: var(--text-dim); background: var(--accent-soft); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 15px;
+}
+.date-clear:hover { color: var(--text); background: var(--accent-line); }
+.date-clear:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.fp-anchor {
+  position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0;
+  border: 0; padding: 0; pointer-events: none;
+}
+
+.flatpickr-calendar {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  /* 浮层压在列表上：阴影要足够重，否则和底下的卡片粘成一片（vision 复核结论）。 */
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .62), 0 0 0 1px var(--border-soft);
+  font-size: var(--fs-xs); z-index: 70;
+}
+.flatpickr-calendar.arrowTop::before, .flatpickr-calendar.arrowTop::after { border-bottom-color: var(--panel); }
+.flatpickr-calendar.arrowBottom::before, .flatpickr-calendar.arrowBottom::after { border-top-color: var(--panel); }
+.flatpickr-months .flatpickr-month, .flatpickr-months .flatpickr-prev-month,
+.flatpickr-months .flatpickr-next-month { color: var(--text); fill: var(--text); }
+.flatpickr-months .flatpickr-prev-month:hover svg, .flatpickr-months .flatpickr-next-month:hover svg { fill: var(--accent); }
+/* 月份下拉 / 年份输入是 flatpickr 的原生 <select>/<input>：不覆盖就是白底黑字，
+   在深色日历里像开了个系统弹窗（用户截图实拍）。color-scheme 还能让移动端的
+   系统选择器跟着变深色（CSS 管不到 OS 弹层，只能靠它）。 */
+.flatpickr-current-month .flatpickr-monthDropdown-months,
+.flatpickr-current-month input.cur-year {
+  background: transparent; color: var(--text); border: 1px solid transparent;
+  border-radius: 6px; font: inherit; font-size: inherit; font-weight: 600;
+  color-scheme: dark; -webkit-appearance: none; appearance: none;
+}
+.flatpickr-current-month .flatpickr-monthDropdown-months:hover,
+.flatpickr-current-month .flatpickr-monthDropdown-months:focus,
+.flatpickr-current-month input.cur-year:hover,
+.flatpickr-current-month input.cur-year:focus {
+  background: var(--accent-soft); border-color: var(--accent-line); outline: none;
+}
+.flatpickr-current-month .flatpickr-monthDropdown-months option {
+  background: var(--panel); color: var(--text);
+}
+/* maxDate 落在本月时 flatpickr 会把「下一月」箭头 display:none，标题区就只剩左边一个箭头，
+   看着像坏了。改成保留但压暗（不可点），左右对称。 */
+.flatpickr-months .flatpickr-prev-month.flatpickr-disabled,
+.flatpickr-months .flatpickr-next-month.flatpickr-disabled {
+  display: block; opacity: .28; cursor: default;
+}
+/* 月份箭头支持长按连翻：禁掉长按选字/系统菜单，否则按住会弹"复制"气泡（手机上还会叮一声）。 */
+.flatpickr-months .flatpickr-prev-month, .flatpickr-months .flatpickr-next-month,
+.flatpickr-months .flatpickr-prev-month *, .flatpickr-months .flatpickr-next-month * {
+  touch-action: none; -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+}
+.flatpickr-current-month { font-weight: 600; color: var(--text); }
+.flatpickr-current-month .cur-month { font-weight: 600; }
+.flatpickr-current-month input.cur-year { width: 56px; text-align: center; }
+.flatpickr-current-month .numInputWrapper span.arrowUp::after { border-bottom-color: var(--text-dim); }
+.flatpickr-current-month .numInputWrapper span.arrowDown::after { border-top-color: var(--text-dim); }
+.flatpickr-current-month input.cur-year { color: var(--text); }
+span.flatpickr-weekday { color: color-mix(in srgb, var(--text) 80%, transparent); font-size: 11.5px; font-weight: 500; }
+.flatpickr-day { color: var(--text); border-radius: 8px; }
+/* 「今天」原来是个 52x44 的描边方块，和圆点选中态放在一起像两套语言；
+   改成数字下面一个小圆点，形状统一。 */
+.flatpickr-calendar .flatpickr-day.today { border-color: transparent; }
+.flatpickr-calendar .flatpickr-day.today:not(.selected)::after {
+  content: ''; position: absolute; left: 50%; bottom: 5px; transform: translateX(-50%);
+  width: 4px; height: 4px; border-radius: 50%; background: var(--accent);
+}
+.flatpickr-day:hover, .flatpickr-day:focus {
+  background: var(--accent-soft); border-color: transparent; color: var(--text);
+}
+/* 区间高亮改成"每天一个独立圆点"（M3 风格）。flatpickr 默认把首尾用 box-shadow 连成
+   一条蓝条，只选两天时会变成一根横杠（用户实测截图）。圆点天然有缝，两天也分得清。 */
+.flatpickr-day { position: relative; z-index: 0; }
+/* 选择器前面必须带 .flatpickr-calendar：flatpickr 自带那条用的是 :hover/:focus 复合选择器
+   （0,3,0），只写 .flatpickr-day.selected 压不住，会露出一块 52x44 的蓝色方块。 */
+.flatpickr-calendar .flatpickr-day.selected, .flatpickr-calendar .flatpickr-day.startRange,
+.flatpickr-calendar .flatpickr-day.endRange,
+.flatpickr-calendar .flatpickr-day.selected:hover, .flatpickr-calendar .flatpickr-day.startRange:hover,
+.flatpickr-calendar .flatpickr-day.endRange:hover,
+.flatpickr-calendar .flatpickr-day.selected:focus, .flatpickr-calendar .flatpickr-day.startRange:focus,
+.flatpickr-calendar .flatpickr-day.endRange:focus {
+  background: transparent; border-color: transparent; color: var(--on-accent);
+}
+.flatpickr-day.selected::before, .flatpickr-day.startRange::before, .flatpickr-day.endRange::before {
+  content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 34px; height: 34px; border-radius: 50%; background: var(--accent-solid); z-index: -1;
+}
+.flatpickr-calendar .flatpickr-day.inRange, .flatpickr-calendar .flatpickr-day.prevMonthDay.inRange,
+.flatpickr-calendar .flatpickr-day.nextMonthDay.inRange {
+  background: transparent; border-color: transparent; box-shadow: none;
+}
+.flatpickr-day.inRange::before {
+  content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 34px; height: 34px; border-radius: 50%; background: var(--accent-sel); z-index: -1;
+}
+/* 区间首尾统一成独立圆角块：flatpickr 默认把首尾切半圆（50px 0 0 50px / 0 50px 50px 0）
+   再用 box-shadow 连成一条"蓝条"——只选两天时会变成一根横杠（用户实测）。 */
+.flatpickr-day.selected.startRange, .flatpickr-day.startRange.startRange,
+.flatpickr-day.endRange.startRange, .flatpickr-day.selected.endRange,
+.flatpickr-day.startRange.endRange, .flatpickr-day.endRange.endRange {
+  border-radius: 8px; box-shadow: none;
+}
+/* 真正连出"蓝条"的是这条：相邻的 start 给 end 涂了一层 -10px 的实心阴影，
+   两天相连时看着像一根横杠。整条规则按原选择器覆盖成 none。 */
+.flatpickr-day.selected.startRange + .endRange:not(:nth-child(7n+1)),
+.flatpickr-day.startRange.startRange + .endRange:not(:nth-child(7n+1)),
+.flatpickr-day.endRange.startRange + .endRange:not(:nth-child(7n+1)) {
+  box-shadow: none;
+}
+.flatpickr-day.prevMonthDay, .flatpickr-day.nextMonthDay { color: var(--text-dim); opacity: .62; }
+.flatpickr-day.flatpickr-disabled, .flatpickr-day.flatpickr-disabled:hover { color: var(--text-dim); opacity: .3; }
+.numInputWrapper:hover { background: var(--accent-soft); }
+.flatpickr-calendar.hasTime .flatpickr-time { border-top-color: var(--border); }
+
+/* 年份原生输入框整体禁用指针（含上下小箭头）：手机上下滑动时最容易误触它弹键盘，
+   桌面也一样（有 « » 步进按钮，不需要再手打年份）。 */
+.flatpickr-current-month .numInputWrapper { pointer-events: none; }
+.flatpickr-current-month .numInputWrapper .arrowUp,
+.flatpickr-current-month .numInputWrapper .arrowDown { display: none; }
+.flatpickr-current-month input.cur-year { cursor: default; }
+
+@media (max-width: 640px) {
+  .date-btn { min-height: 44px; }
+  /* 手机：日历铺满可用宽度，日格 44×44（项目触控红线）；切月箭头也补足 44 热区。 */
+  .flatpickr-calendar { width: calc(100vw - 24px); max-width: calc(100vw - 24px); }
+  .flatpickr-calendar .flatpickr-day { height: 44px; line-height: 44px; max-width: none; }
+  .flatpickr-day.selected::before, .flatpickr-day.startRange::before,
+  .flatpickr-day.endRange::before, .flatpickr-day.inRange::before { width: 40px; height: 40px; }
+  .flatpickr-calendar .flatpickr-days, .flatpickr-calendar .dayContainer { width: 100%; min-width: 0; max-width: none; }
+  .flatpickr-months .flatpickr-prev-month, .flatpickr-months .flatpickr-next-month {
+    min-width: 44px; height: 44px; padding: 14px 16px; top: 0;
+  }
+  .flatpickr-months .flatpickr-month { height: 44px; }
+}
