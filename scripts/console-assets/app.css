@@ -288,6 +288,15 @@
     flex-wrap: nowrap; min-width: 0; min-height: 24px; overflow: hidden; }
   .sync > .badge { flex: 0 0 auto; white-space: nowrap; }
   .sync-meta { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* v3.341：顶栏状态行窄屏只显示半截时间——点一下弹出完整文本。弹层用 fixed 定位，避开
+     .sync 的 overflow:hidden 裁剪；点页面其它任意地方或按 Esc 收回（见 TapTip）。 */
+  .tap-tip { display: block; max-width: 100%; min-width: 0; padding: 2px 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; cursor: pointer; border-bottom: 1px dotted var(--border); }
+  .tap-tip:focus-visible { outline: var(--ring); outline-offset: 2px; border-radius: 4px; }
+  .tap-tip-pop { position: fixed; z-index: 68; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--r-md); padding: 8px 10px;
+    font-size: var(--fs-sm); line-height: 1.5; white-space: normal; overflow-wrap: anywhere;
+    box-shadow: var(--shadow-card); }
   /* 刷新失败的整句（含原因）单独一行：挤在一行里会被省略号吃掉，反而是最该看的字没了。 */
   .sync-fail { color: var(--warn-fg); font-size: var(--fs-xs); line-height: 1.5; overflow-wrap: anywhere; }
   /* 按钮永不被压缩/换行：窄屏时该让位的是中间那段文本（省略号），不是「暂停」。 */
@@ -461,6 +470,11 @@
   }
   .auto-step:hover { filter: brightness(1.2); }
   .auto-step:active { transform: translateY(1px); }
+  /* 读面失败/保存中时按钮被禁用，但 :hover/:active 仍会亮——禁用态必须看得出来，
+     否则手机上点了没反应还以为是卡住。 */
+  .auto-step:disabled { opacity: .45; cursor: not-allowed; }
+  .auto-step:disabled:hover { filter: none; }
+  .auto-step:disabled:active { transform: none; }
   .auto-input {
     width: 64px; height: 40px; padding: 0 var(--sp-2); flex: 0 0 auto;
     border: 1px solid var(--border); border-radius: var(--r-sm);
@@ -831,6 +845,13 @@
   .tpl-row > span { color: var(--text-dim); font-size: var(--fs-xs); flex: 0 0 32px; line-height: 1.7; }
   .tpl-row code { font-family: var(--mono); font-size: var(--fs-xs); line-height: 1.6; overflow-wrap: anywhere; word-break: normal; min-width: 0; }
   .cfg-text { color: var(--text); font-size: var(--fs-sm); line-height: 1.6; overflow-wrap: anywhere; word-break: normal; }
+  /* v3.342：系统页「设置」块 —— 顶栏时间的「显示年月日」开关（勾选即保存）。 */
+  .set-title { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 18px 0 0;
+    font-size: var(--fs-md); font-weight: 600; }
+  .set-head { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-soft); }
+  .set-toggle { display: flex; align-items: center; gap: 8px; min-height: 32px; cursor: pointer; font-size: var(--fs-sm); }
+  .set-toggle input[type="checkbox"] { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); flex: 0 0 auto; }
+  .set-toggle input[type="checkbox"]:disabled { cursor: not-allowed; }
   .rule-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0 14px; max-height: 420px; overflow-y: auto; }
   .rule-row { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; padding: 7px 2px; border-bottom: 1px solid var(--border-soft); min-width: 0; }
   .rule-key { color: var(--text-dim); font-family: var(--mono); font-size: var(--fs-xs); flex: 0 1 auto; overflow-wrap: anywhere; word-break: normal; }
@@ -1043,6 +1064,8 @@
     /* v3.317：输入框字号 <16px 时 iOS 聚焦会整页放大（Android 也会缩放），手机端统一
        16px 且高度 ≥40px；桌面维持原字阶，不放大页面观感。 */
     .msg-search, .log-search { font-size: 16px; min-height: 40px; }
+    /* v3.340：拦截窗输入框复用 .auto-input（桌面 14px），手机同样受上面那条规则约束。 */
+    .auto-input { font-size: 16px; }
     /* 日志页日志框：手机按视口高度的 62%（上限 520px），362×795 下首屏可见 20+ 行。
        v3.320：min-height 与 max-height 同值（先 vh 兜底、再 dvh），空态/读取中同高。 */
     .logpre-main { max-height: 62vh; max-height: min(62dvh, 520px); min-height: 62vh; min-height: min(62dvh, 520px); }

@@ -52,6 +52,11 @@ const BUSY_FALLBACK_MS = 11 * 60 * 1000
 // fetch 请求期限（Sourcery G_n6）：挂起连接不得阻塞刷新链路；超时由 AbortController 取消，
 // 走正常 reject 路径（「刷新失败」可见），不会堆积请求。
 const FETCH_TIMEOUT_MS = 8000
+// 通知自检重复提交拦截窗的客户端边界（与 console.js NOTIFY_REPLAY_MIN_S/MAX_S 同口径）：
+// 这层只负责「非法值不发请求」，服务端仍是唯一权威（越界/类型错一律 400）。
+const NOTIFY_WINDOW_MIN_S = 0
+const NOTIFY_WINDOW_MAX_S = 3600
+const NOTIFY_WINDOW_DEFAULT_S = 60
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
 // 服务端时间戳统一按 Asia/Shanghai（UTC+8）渲染，不跟浏览器时区走。
@@ -452,6 +457,24 @@ function apiPostFilterRestore (body) {
   return consumeJsonResult(fetch('/api/config/filter/restore', merged), done)
 }
 
+// 控制台设置（v3.340）：通知自检拦截窗的读/写面。GET 与其它读面同款（Bearer + Accept）；
+// 写面复用 filterWriteHeaders（Bearer + application/json，服务端 415 闸要求后者）。
+function apiGetConsoleSettings () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/config/console', merged), done)
+}
+
+function apiPostConsoleSettings (body) {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify(body)
+  })
+  return consumeJsonResult(fetch('/api/config/console', merged), done)
+}
+
 // 触发类请求公共体（SonarCloud new_duplicated_lines_density：trigger 与 triggerNotifyTest
 // 两段同构模板抽公共，消除新增代码重复率超标）。fetch 字面量由调用侧闭包注入——
 // 第一参数仍是纯字面量（§0 静态红线形态保持），公共体只管 timedRequest/重放拦截语义。
@@ -478,7 +501,10 @@ async function triggerVia (timedOpts, doFetch, dupMsg, failMsgOf) {
     // 服务端幂等重放窗（与 console.js REPLAY_WINDOW_MS 配套）：同动作重试被拦时
     // 返回首轮 runId——提示用户「那一轮已经在跑/已完成」，前端顺手刷新历史。
     if (data && data.replayBlocked && data.runId) {
-      const err = new Error(dupMsg)
+      // dupMsg 允许传函数（v3.340）：拦截窗已可配置，文案里的秒数必须取服务端响应的
+      // data.replayWindowS（该动作实际生效窗），不能在客户端写死 60。
+      const msg = typeof dupMsg === 'function' ? dupMsg(data) : dupMsg
+      const err = new Error(msg)
       err.replayRunId = data.runId
       throw err
     }
@@ -513,7 +539,16 @@ async function triggerNotifyTest () {
       headers: { Authorization: `Bearer ${BOOT.token}` }
     },
     (merged) => fetch('/api/notify-test', merged),
-    '刚才那次通知自检已受理（正在运行或已完成），60 秒内无需重复',
+    (data) => {
+      // 窗长由服务端下发（配置页可改）；缺失才回退默认 60（老服务端/异常响应）。
+      const winS = data && Number.isInteger(data.replayWindowS) ? data.replayWindowS : NOTIFY_WINDOW_DEFAULT_S
+      // 窗长不等于「还要等多久」：第 57 秒重试时窗还是 60，说「60 秒内无需重复」就是谎话。
+      // 服务端同时给了 retryAfterS，剩余时间更短时补上真实还剩多久。
+      const retryS = data && Number.isInteger(data.retryAfterS) ? data.retryAfterS : null
+      return retryS !== null && retryS < winS
+        ? `刚才那次通知自检已受理（正在运行或已完成），拦截窗 ${winS} 秒，还需等 ${retryS} 秒`
+        : `刚才那次通知自检已受理（正在运行或已完成），${winS} 秒内无需重复`
+    },
     (data, status) => (data && data.error) || `通知自检失败（HTTP ${status}）`
   )
 }
@@ -528,16 +563,85 @@ function Badge ({ tone, children }) {
   return html`<span class="badge ${cls}">${children}</span>`
 }
 
-// 顶栏倒计时独立持有 1s 时钟：避免 App 每秒重渲染整页（安卓原生 select 会闪）。
-function AutoRefreshText ({ nextAt, pollMs, lastSync }) {
+// 顶栏用的时间：v3.342 起「是否带年月日」可设置（默认带）。只影响显示，tip 里永远是完整时间。
+function fmtBarTime (ts, withDate) {
+  const s = fmtLocalTime(ts)
+  if (s === '—' || withDate !== false) return s
+  return s.slice(11)
+}
+
+// 顶栏状态行：所有页共用这一个组件、这一套词（v3.346）。
+//  - 轮询中的页（概览/日志）秒数倒数；不轮询的页给配置的间隔，不假装在倒数。
+//  - 暂停时只换开头两个字，后半句「数据截至 · 时间」保持同一形态。
+// 独立持有 1s 时钟：避免 App 每秒重渲染整页（安卓原生 select 会闪）。
+function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = false, live = true }) {
   const [nowMs, setNowMs] = useState(Date.now())
   useEffect(() => {
-    // 每秒只重渲染这个文本节点；App 不再持有该时钟。
-    const t = setInterval(() => setNowMs(() => Date.now()), 1000)
+    // 不轮询的页不需要秒级时钟，别白建定时器。
+    if (!live) return undefined
+    // v3.347：500ms 而不是 1000ms。1s 的时钟和 mark() 不同相，最多落后近 1s，
+    // 实测倒数会「5 4 3 2 → 5」直接跳过 1s（用户真机录屏反馈的顿挫感就来自这里）。
+    const t = setInterval(() => setNowMs(() => Date.now()), 500)
     return () => clearInterval(t)
-  }, [])
-  const remain = Math.max(0, Math.min(Math.ceil(pollMs / 1000), Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000)))
-  return html`${`自动刷新 · ${remain}s`}${lastSync ? ` · ${fmtLocalTime(lastSync)}` : ''}`
+  }, [live])
+  const at = lastSync ? fmtBarTime(lastSync, showDate) : '—'
+  if (paused) return html`已暂停 · 数据截至 · ${at}`
+  const sec = Math.max(1, Math.round(pollMs / 1000))
+  const remain = live ? Math.max(0, Math.min(sec, Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000))) : sec
+  return html`自动刷新 ${remain}s · 数据截至 · ${at}`
+}
+
+function fmtWeekday (ts) {
+  if (!ts) return ''
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts)).getDay()]
+}
+
+// v3.341：窄屏下顶栏状态行会被省略号截断（时间只剩半截）。点一下就地弹出完整文本，点页面
+// 其它任意地方/按 Esc 收回。弹层用 position: fixed：祖先 .sync 是 overflow:hidden，绝对定位
+// 会被裁掉；fixed 也不受滚动容器影响（滚动时直接收回，避免跟着飘）。
+function TapTip ({ tip, children }) {
+  const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState(null)
+  const boxRef = useRef(null)
+  const popRef = useRef(null)
+  useEffect(() => {
+    if (!open) return undefined
+    const onDown = (e) => {
+      if (boxRef.current && boxRef.current.contains(e.target)) return
+      if (popRef.current && popRef.current.contains(e.target)) return
+      setOpen(false)
+    }
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false) }
+    const onScroll = () => setOpen(false)
+    document.addEventListener('pointerdown', onDown, true)
+    document.addEventListener('keydown', onKey, true)
+    window.addEventListener('scroll', onScroll, true)
+    return () => {
+      document.removeEventListener('pointerdown', onDown, true)
+      document.removeEventListener('keydown', onKey, true)
+      window.removeEventListener('scroll', onScroll, true)
+    }
+  }, [open])
+  if (!tip) return html`${children}`
+  const toggle = () => {
+    if (open) { setOpen(false); return }
+    const box = boxRef.current
+    if (box) {
+      const r = box.getBoundingClientRect()
+      const width = Math.min(360, Math.max(200, window.innerWidth - 24))
+      const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8))
+      setPos({ top: Math.round(r.bottom + 6), left: Math.round(left), width: Math.round(width) })
+    }
+    setOpen(true)
+  }
+  return html`<span class="tap-tip" ref=${boxRef} role="button" tabindex="0"
+      aria-expanded=${open ? 'true' : 'false'}
+      onClick=${(e) => { e.stopPropagation(); toggle() }}
+      onKeyDown=${(e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); toggle() }
+      }}>${children}</span>
+    ${open && html`<span class="tap-tip-pop" ref=${popRef} role="tooltip"
+      style=${pos ? `top:${pos.top}px;left:${pos.left}px;width:${pos.width}px` : ''}>${tip}</span>`}`
 }
 
 // 提示行：tone='error' 时红色。页面不再拼 'hint hint-err' 字符串。
@@ -2877,7 +2981,7 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
 // <mark> 会把「展开」卡住几秒；日志页超过 3000 行直接关高亮是同一思路（渲染上限，不改搜索口径）。
 const MSG_HIT_MAX = 200
 
-function MessagesPanel ({ onSync, active = true }) {
+function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   const [page, setPage] = useState(1)
   const [size, setSize] = useState(20)
   const [cate, setCate] = useState('')
@@ -2962,6 +3066,8 @@ function MessagesPanel ({ onSync, active = true }) {
   // 只更新内容，不出现「加载中…」占位。离开本页时不拉。
   usePanelAutoLoad(active, load)
   usePullRefresh(active, load)
+  // v3.348：App 的统一轮询节拍（后台/暂停时不涨），本页在前台就跟着重拉。
+  useEffect(() => { if (active && pollTick > 0) load() }, [pollTick, active, load])
   // 结果集缩小后旧页码可能超过新页数（服务端按请求页切片，回空 items）。收到响应后把
   // 页码钳到最后一页并重拉，避免「在后面的页点刷新，整页空白」。
   useEffect(() => {
@@ -3440,8 +3546,182 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   </div>`
 }
 
-// 系统信息：版本 / 运行环境 / 进程 / 缓存目录。全部只读，无操作按钮。
-function SysPanel ({ onReady, active = true }) {
+// v3.342：控制台设置块（v3.340 在配置页，v3.342 搬到系统页「设置」）。
+// 一条读面 + 两个写面：通知自检拦截窗、顶栏时间是否显示年月日。读面失败只影响本块。
+function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved }) {
+  // 拦截窗草稿：输入框可自由键入，保存前统一校验（整数 0–3600）；用户正在改（dirty）时
+  // 刷新回来的生效值不覆盖输入框，避免「改到一半被定时重拉吃掉」。
+  const [winDraft, setWinDraft] = useState('')
+  const [winDirty, setWinDirty] = useState(false)
+  const [winErr, setWinErr] = useState('')
+  const [winSaved, setWinSaved] = useState(false)
+  const [winSaving, setWinSaving] = useState(false)
+  const winSavingRef = useRef(false)
+  const winSavedTimerRef = useRef(0)
+  const [dateErr, setDateErr] = useState('')
+  const [dateSaved, setDateSaved] = useState(false)
+  const [dateSaving, setDateSaving] = useState(false)
+  const dateSavingRef = useRef(false)
+  const dateSavedTimerRef = useRef(0)
+  useEffect(() => () => {
+    clearTimeout(winSavedTimerRef.current)
+    clearTimeout(dateSavedTimerRef.current)
+  }, [])
+  // 读面失败时显式丢弃旧值：绝不让「读取失败」的页面继续显示一个可能已经过期的生效值。
+  const settingsLive = settingsErr ? null : settings
+  // 「还没读到」与「读失败」在数据上都是 null，但含义相反：把首帧的加载中渲染成
+  // 「读取失败 + 全部禁用」，设置块一打开就在报一个不存在的错误（网络慢时持续到超时）。
+  const settingsPending = settingsLive === null && !settingsErr
+  const winCurrent = settingsLive && settingsLive.settings && Number.isInteger(settingsLive.settings.notifyTestReplayWindowS)
+    ? settingsLive.settings.notifyTestReplayWindowS
+    : null
+  const winSourceLabel = settingsPending
+    ? '读取中…'
+    : (settingsLive === null ? '读取失败' : (settingsLive.source === 'file' ? '来自设置文件' : '默认值'))
+  const showDate = settingsLive && settingsLive.settings && typeof settingsLive.settings.syncShowDate === 'boolean'
+    ? settingsLive.settings.syncShowDate
+    : null
+  // 只在生效值真的变了时回写草稿：保存成功会把 winDirty 由 true 拨回 false，也会触发本 effect，
+  // 而那一刻 settings 还是旧值——无条件回写会把刚写入的新值改回旧值（重读失败时长期停在旧值）。
+  const winSyncedRef = useRef(null)
+  useEffect(() => {
+    if (winDirty || winCurrent === null) return
+    if (winSyncedRef.current === winCurrent) return
+    winSyncedRef.current = winCurrent
+    setWinDraft(String(winCurrent))
+  }, [winCurrent, winDirty])
+  const adjustWin = (delta) => {
+    if (winCurrent === null || winSavingRef.current) return
+    const typed = winDraft.trim() === '' ? NaN : Number(winDraft)
+    const base = Number.isInteger(typed) ? typed : winCurrent
+    const next = Math.min(NOTIFY_WINDOW_MAX_S, Math.max(NOTIFY_WINDOW_MIN_S, base + delta))
+    setWinDraft(String(next))
+    setWinDirty(true)
+    setWinSaved(false)
+    setWinErr('')
+  }
+  // 保存：客户端只做「整数 0–3600」这一层拦截（非法值不发请求）；带 baseRevision 做乐观锁，
+  // 别处改过就 409，这里重读让用户看清当前值再决定。
+  const saveWin = async () => {
+    setWinErr('')
+    // 连点两次会各带同一个 baseRevision 发两次 POST，第二次必然 409——那是自己造的冲突，
+    // 页面却会同时出现「已保存」和「设置已被别处改过」。入口与按钮双守卫。
+    if (winSavingRef.current) return
+    if (!settingsLive || winCurrent === null) { setWinErr('当前生效值未读到，先刷新再改'); return }
+    // 空串必须按非法处理：Number('') === 0，若直接转数字会把「清空输入框再点保存」
+    // 静默解释成 0（关闭拦截）——那是最不该靠猜的语义。
+    const typed = winDraft.trim() === '' ? NaN : Number(winDraft)
+    if (!Number.isInteger(typed) || typed < NOTIFY_WINDOW_MIN_S || typed > NOTIFY_WINDOW_MAX_S) {
+      setWinErr(`拦截窗必须是 ${NOTIFY_WINDOW_MIN_S}–${NOTIFY_WINDOW_MAX_S} 的整数（秒）`)
+      return
+    }
+    winSavingRef.current = true
+    setWinSaving(true)
+    try {
+      const res = await apiPostConsoleSettings({ notifyTestReplayWindowS: typed, baseRevision: settingsLive.revision })
+      const payload = res.data && typeof res.data === 'object' ? res.data : {}
+      if (!res.ok) {
+        if (payload.error === 'revision_mismatch') {
+          setWinErr('设置已被别处改过（revision 不一致），已重新读取，请确认后再保存')
+          // 必须复位 dirty：否则本页草稿再也不会跟随刷新，只能整页重载才能回到可保存状态。
+          setWinDirty(false)
+          await loadSettings()
+          return
+        }
+        setWinErr(`保存失败：${payload.error || `HTTP ${res.status}`}`)
+        return
+      }
+      const saved = payload.settings && Number.isInteger(payload.settings.notifyTestReplayWindowS)
+        ? payload.settings.notifyTestReplayWindowS
+        : typed
+      setWinDraft(String(saved))
+      setWinDirty(false)
+      setWinSaved(true)
+      clearTimeout(winSavedTimerRef.current)
+      winSavedTimerRef.current = setTimeout(() => setWinSaved(false), 1500)
+      await loadSettings()
+      if (typeof onSaved === 'function') onSaved()
+    } catch (e) {
+      setWinErr(`保存失败：${e && e.message ? e.message : e}`)
+    } finally {
+      winSavingRef.current = false
+      setWinSaving(false)
+    }
+  }
+  // 显示开关：勾一下就保存（不再要一次「保存」）；失败重读并报错，勾选状态跟随服务端。
+  const toggleShowDate = async (next) => {
+    setDateErr('')
+    if (dateSavingRef.current) return
+    if (!settingsLive || showDate === null) { setDateErr('当前设置未读到，先刷新再改'); return }
+    if (next === showDate) return
+    dateSavingRef.current = true
+    setDateSaving(true)
+    try {
+      const res = await apiPostConsoleSettings({ syncShowDate: next, baseRevision: settingsLive.revision })
+      const payload = res.data && typeof res.data === 'object' ? res.data : {}
+      if (!res.ok) {
+        setDateErr(payload.error === 'revision_mismatch'
+          ? '设置已被别处改过（revision 不一致），已重新读取'
+          : `保存失败：${payload.error || `HTTP ${res.status}`}`)
+        await loadSettings()
+        return
+      }
+      await loadSettings()
+      if (typeof onSaved === 'function') onSaved()
+      setDateSaved(true)
+      clearTimeout(dateSavedTimerRef.current)
+      dateSavedTimerRef.current = setTimeout(() => setDateSaved(false), 1500)
+    } catch (e) {
+      setDateErr(`保存失败：${e && e.message ? e.message : e}`)
+    } finally {
+      dateSavingRef.current = false
+      setDateSaving(false)
+    }
+  }
+  return html`<div class="cfg-block">
+    <div class="cfg-block-head">
+      <span class="cfg-block-title">通知自检</span>
+      <span class="cfg-block-sub">重复提交拦截窗 · ${winSourceLabel}</span>
+    </div>
+    <div class="auto-run-row">
+      <button type="button" class="auto-step" aria-label="减少" disabled=${winCurrent === null || winSaving} onClick=${() => adjustWin(-1)}>−</button>
+      <input class="auto-input" type="number" inputmode="numeric"
+        min=${NOTIFY_WINDOW_MIN_S} max=${NOTIFY_WINDOW_MAX_S} step="1"
+        aria-label="通知自检拦截窗（秒）" value=${winCurrent === null ? '' : winDraft} disabled=${winCurrent === null || winSaving}
+        onInput=${(e) => { setWinDraft(e.target.value); setWinDirty(true); setWinSaved(false); setWinErr('') }} />
+      <span class="auto-unit">秒</span>
+      <button type="button" class="auto-step" aria-label="增加" disabled=${winCurrent === null || winSaving} onClick=${() => adjustWin(1)}>+</button>
+      <${Button} variant="secondary" disabled=${winCurrent === null || winSaving} onClick=${saveWin}>保存<//>
+      ${winSaved && html`<span class="cfg-block-sub" role="status" aria-live="polite">已保存 · 立即生效</span>`}
+    </div>
+    <div class="cfg-text">${settingsPending
+      ? '正在读取当前生效值…'
+      : winCurrent === null
+        ? `当前生效值读取失败，暂不可修改（点右上「刷新」重试）：${settingsErr || '未知错误'}`
+        : `当前生效 ${winCurrent} 秒 · 0 = 关闭拦截（连点会重复真实发送）· 保存后下一次触发立即生效`}</div>
+    ${winErr && html`<${Hint} tone="error">${winErr}<//>`}
+    <div class="cfg-block-head set-head">
+      <span class="cfg-block-title">顶栏时间</span>
+      <span class="cfg-block-sub">「数据截至 / 自动刷新」后面那个时间</span>
+    </div>
+    <label class="set-toggle">
+      <input type="checkbox" checked=${showDate === true} disabled=${showDate === null || dateSaving}
+        onChange=${(e) => toggleShowDate(e.target.checked)} />
+      <span>显示年月日</span>
+      <span class="cfg-block-sub" role=${dateSaved ? 'status' : undefined} aria-live=${dateSaved ? 'polite' : undefined}>${dateSaving
+        ? '保存中…'
+        : dateSaved
+          ? '已保存 · 立即生效'
+          : showDate === null
+            ? (settingsPending ? '读取中…' : '读取失败')
+            : (showDate ? '关掉后只显示 时:分:秒（点一下仍可看完整日期）' : '当前只显示 时:分:秒（点一下可看完整日期）')}</span>
+    </label>
+    ${dateErr && html`<${Hint} tone="error">${dateErr}<//>`}
+  </div>`
+}
+
+// 系统信息：版本 / 运行环境 / 进程 / 缓存目录。只读；下面另挂「设置」块（可写）。
+function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0 }) {
   // 访问日志（v3.300 §3.3）：第二个 loader 并列拉取；「刷新」按钮同日 load 两个。
   // 近窗未授权尝试数 = 服务端独立 401 计数（进程启动以来、不随环形窗截断）。
   // 两个请求可能一成一败：本页不认「数据截至」，避免半套数据被标成完整刷新（Sourcery PR#253）。
@@ -3483,6 +3763,9 @@ function SysPanel ({ onReady, active = true }) {
     })
   }
   const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog)
+  // v3.342：设置块（拦截窗 + 顶栏时间）的读面由本页统一持有——下拉/刷新必须等它一起落定，
+  // 否则指示条会在设置块还在读的时候就收起（v3.330 的「所有 loader 落定」同一条规矩）。
+  const { data: settings, err: settingsErr, load: loadSettings } = usePanelLoader(apiGetConsoleSettings)
   const [readyTick, setReadyTick] = useState(0)
   const seenRef = useRef(null)
   const pendingRef = useRef(false)
@@ -3496,12 +3779,12 @@ function SysPanel ({ onReady, active = true }) {
     if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))) return
     if (pendingRef.current) return
     pendingRef.current = true
-    Promise.allSettled([load(), loadAccess()]).then(() => {
+    Promise.allSettled([load(), loadAccess(), loadSettings()]).then(() => {
       pendingRef.current = false
       loadedAtRef.current = Date.now()
       setReadyTick((v) => v + 1)
     }).catch(() => {})
-  }, [active, load, loadAccess])
+  }, [active, load, loadAccess, loadSettings])
   // 两个 loader 都落定才通知滚动层收口；只报第一个会在下半页还空着时提前释放垫高。
   const sysReady = !!(sys || err)
   const accessReady = !!(access || accessErr)
@@ -3509,13 +3792,15 @@ function SysPanel ({ onReady, active = true }) {
     if (sysReady && accessReady && typeof onReady === 'function') onReady()
   }, [sysReady, accessReady, readyTick, onReady])
   const refreshAll = () => {
-    return Promise.allSettled([load(), loadAccess()]).then(() => {
+    return Promise.allSettled([load(), loadAccess(), loadSettings()]).then(() => {
       loadedAtRef.current = Date.now()
       setReadyTick((v) => v + 1)
     }).catch(() => {})
   }
   // 下拉刷新与「刷新」按钮同一条路径（两表 + 就绪 tick）。
   usePullRefresh(active, refreshAll)
+  // v3.348：统一轮询节拍——本页在前台时每拍重拉（含访问日志与设置）。
+  useEffect(() => { if (active && pollTick > 0) refreshAll() }, [pollTick, active])
   const fmtUptime = (s) => {
     if (!(typeof s === 'number' && s >= 0)) return '—'
     const d = Math.floor(s / 86400)
@@ -3550,6 +3835,8 @@ function SysPanel ({ onReady, active = true }) {
         <tr><td>缓存目录</td><td>${info.cacheDir || '—'}</td></tr>
       </tbody></table>
     </div>
+    <div class="set-title">设置<span class="cfg-block-sub">改动立即生效 · 落盘 console-settings.json</span></div>
+    <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} />
     <${Hint} style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。<//>
     ${accessErr && html`<${Hint} tone="error">访问日志加载失败：${accessErr.message || accessErr}<//>`}
     <details class="access-log">
@@ -3568,13 +3855,15 @@ function SysPanel ({ onReady, active = true }) {
 
 // 状态目录文件清单（v3.298）：启动预加载 + 切回系统页刷新 + 手动刷新。符号链接/目录作为异常条目显性
 // 展示（bytes 为 ——— 意为「不适用」，服务端不跟随符号链接、不泄露目标元数据）。
-function FilesPanel ({ onReady, active = true }) {
+function FilesPanel ({ onReady, active = true, pollTick = 0 }) {
   const [loadTick, setLoadTick] = useState(0)
   const bumpTick = useCallback(() => setLoadTick((v) => v + 1), [])
   const { data, err, load } = usePanelLoader(apiGetFiles, bumpTick)
   // 保活后系统页切回来时补拉一次；离开不拉。data 保留，不出现加载占位。
   usePanelAutoLoad(active, load)
   usePullRefresh(active, load)
+  // v3.348：统一轮询节拍——文件清单也跟着刷新。
+  useEffect(() => { if (active && pollTick > 0) load() }, [pollTick, active, load])
   // 文件清单是系统页的下半截；它落定前不能释放切页垫高。loadTick 让切回重拉完成
   // 后也再报一次，否则 ready 首访后就一直为 true，头部「数据截至」不会更新。
   const ready = !!(data || err)
@@ -3659,7 +3948,7 @@ function ChannelList ({ pc }) {
 // v3.312：过滤规则块改为「实际生效值」——另拉 GET /api/config/filter（覆盖文件结果），
 // 与代码默认按字段合并并给覆盖文件提供的字段打「覆盖」徽章。此前只读 Config.filter，保存
 // 覆盖文件后两页对不上（用户看到「已保存」但配置页仍然全空）。
-function ConfigPanel ({ onSync, active = true }) {
+function ConfigPanel ({ onSync, active = true, pollTick = 0 }) {
   const [configAt, setConfigAt] = useState(0)
   const [filterAt, setFilterAt] = useState(0)
   const { data, err, load } = usePanelLoader(apiGetConfig, setConfigAt)
@@ -3667,12 +3956,14 @@ function ConfigPanel ({ onSync, active = true }) {
   // 两个 loader 都回过一次才算「配置页加载完成」；只报第一个会让滚动垫高
   // 在第二块还没渲染时就收口（Sourcery #263）。
   useEffect(() => {
-    if (configAt && filterAt && typeof onSync === 'function') onSync(Math.max(configAt, filterAt))
+    if (typeof onSync === 'function' && configAt && filterAt) onSync(Math.max(configAt, filterAt))
   }, [configAt, filterAt, onSync])
   const refresh = useCallback(() => Promise.allSettled([load(), loadEff()]), [load, loadEff])
   // 启动预加载；保活后每次切回本页静默重拉（旧值留在原地），离开本页不拉。
   usePanelAutoLoad(active, refresh)
   usePullRefresh(active, refresh)
+  // v3.348：统一轮询节拍——配置页每拍重拉（只读视图，不会覆盖任何草稿）。
+  useEffect(() => { if (active && pollTick > 0) refresh() }, [pollTick, active, refresh])
   const r = data && data.runtime ? data.runtime : null
   const pc = data && data.pushChannels ? data.pushChannels : null
   // 读面失败时 usePanelLoader 仍保留上一次的 data（不清空），这里必须显式丢弃，
@@ -3878,7 +4169,7 @@ function FilterField ({ def, value, saved, error, onChange }) {
   </div>`
 }
 
-function FilterRulesPanel ({ onSync, active = true }) {
+function FilterRulesPanel ({ onSync, active = true, pollTick = 0 }) {
   const [data, setData] = useState(null)
   const [draft, setDraft] = useState(null)
   const [base, setBase] = useState(null)
@@ -3955,6 +4246,9 @@ function FilterRulesPanel ({ onSync, active = true }) {
   dirtyRef.current = dirtyFields.length > 0
   // 下拉刷新不碰有未保存改动的草稿：一次下拉不能静默丢掉用户刚改的规则。
   usePullRefresh(active && dirtyFields.length === 0, load)
+  // v3.348：统一轮询节拍。load 自己会在 dirtyRef 为真时丢弃响应，
+  // 所以有未保存改动时自动刷新不会覆盖草稿（下拉刷新之外的第二道保险）。
+  useEffect(() => { if (active && pollTick > 0) load() }, [pollTick, active, load])
 
   const setFieldValue = useCallback((name, value) => {
     setDraft((cur) => (cur ? { ...cur, [name]: value } : cur))
@@ -4511,9 +4805,22 @@ function App () {
   const [logJump, setLogJump] = useState(null)
   // 自动刷新开关（v3.307）：默认开；暂停后顶部倒计时停住，手动「继续」恢复。
   const [autoRefresh, setAutoRefresh] = useState(true)
+  // v3.342：顶栏时间是否带年月日。值存在服务端 console-settings.json（系统页「设置」里改），
+  // 这里只缓存一份给顶栏渲染；保存后由 onSettingsSaved 重拉。
+  const [showDate, setShowDate] = useState(true)
+  const reloadUiSettings = useCallback(() => {
+    // consumeJson 直接回 body（不是 { ok, data }），别按写面 consumeJsonResult 的形状取。
+    apiGetConsoleSettings().then((body) => {
+      const v = body && body.settings ? body.settings.syncShowDate : undefined
+      if (typeof v === 'boolean') setShowDate(v)
+    }).catch(() => {})
+  }, [])
+  useEffect(() => { reloadUiSettings() }, [reloadUiSettings])
   // 凭证失效（审查 #224）：任一 API 401 ⇒ 停轮询并显示自助恢复提示，不再每 5s 空打。
   const [authExpired, setAuthExpired] = useState(false)
   const [nextAt, setNextAt] = useState(0)
+  // v3.348：共享轮询节拍。非概览/日志页的数据在各面板里，App 每拍 +1，当前面板据此重拉。
+  const [pollTick, setPollTick] = useState(0)
   // v3.332：部署后旧标签页仍在跑旧脚本，数据轮询却照常更新 ⇒ 用户以为「改了没生效」。
   // boot 里带页面启动版本；每 60s 与 /api/sys 对一次，不一致就提示刷新。
   const [newVersion, setNewVersion] = useState('')
@@ -4937,10 +5244,8 @@ function App () {
     if (authExpired) return undefined
     refreshSplit()
     clearInterval(timerRef.current)
-    // 概览与运行日志需要状态新鲜（日志的 pollMs 取决于 task 是否在跑）；
-    // 推送记录/配置/系统不轮询，避免每 5s 的 App 重渲染让页面闪一下。
-    // 切回需要的页时会立即补一次 refreshSplit。
-    if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)
+    // v3.348：所有页都轮询（用户要求：推送记录/配置/过滤规则/系统 的「自动刷新」必须真的在跑）。
+    // 概览/日志拉状态与历史；其余页由统一 tick 让当前面板重拉自己的数据。
     // 页面在后台时不轮询（切回前台立即补一次）：控制台标签页常驻也不该整夜打接口。
     // 暂停（autoRefresh=false）同样不建定时器；恢复时本 effect 重跑并立即补一次。
     if (!autoRefresh) return () => clearInterval(timerRef.current)
@@ -4953,6 +5258,7 @@ function App () {
         // 截止时间到后自动恢复，不会因为焦点一直停在 select 上而永久停轮。
         if (Date.now() < formPauseUntilRef.current) return
         refreshSplit()
+        if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)
         mark()
       }
     }
@@ -5212,10 +5518,14 @@ function App () {
   const pollMs = locking ? POLL_BUSY_MS : POLL_MS
   // 顶栏徽章只在「概览/日志 + 自动刷新开」时是活状态；其它情况（暂停、推送记录/配置/系统）
   // 主轮询已停，徽章显示的是离开时的快照——必须注明，不能永久挂着「任务运行中」（审查 #246）。
-  const livePolling = !authExpired && autoRefresh && (tab === 'overview' || tab === 'logs')
+  // 顶栏徽章只在「自动刷新开 + 未失效」时是活状态；所有页都轮询（v3.348），
+  // 不再有「（快照）」后缀——数据新旧看后面的时间。
+  const livePolling = !authExpired && autoRefresh
   const badgeText = authExpired
     ? '凭证失效'
-    : `${locking ? '任务运行中' : '空闲'}${livePolling ? '' : '（快照）'}`
+    : locking ? '任务运行中' : '空闲'
+  // 顶栏状态行：所有页同一套词，只有时间来源不同（概览看最近刷新，其它页看本页拉到数据的时间）。
+  const syncAt = tab === 'overview' ? lastSync : panelSync
   return html`<div class="wrap">
     <header class="topbar">
       <div class="sync" ref=${syncRef} tabindex="0" aria-label="状态与刷新">
@@ -5223,12 +5533,10 @@ function App () {
         <span class="sync-meta">
           ${pull.state !== 'idle'
             ? html`<${PullRefreshStatus} state=${pull.state} />`
-            : tab === 'overview'
-              ? (autoRefresh ? html`<${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${lastSync} />` : '自动刷新已暂停')
-              : panelSync ? `数据截至 · ${fmtLocalTime(panelSync)}` : '数据截至 · —'}
+            : html`<${TapTip} tip=${showDate && syncAt ? `数据截至：${fmtLocalTime(syncAt)} ${fmtWeekday(syncAt)}` : ''}><${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${syncAt} showDate=${showDate} paused=${!autoRefresh} live=${livePolling} /><//>`}
         </span>
-        ${tab === 'overview' && html`<button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
-          onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`}
+        <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
+          onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>
         <button type="button" class="sync-toggle theme-btn" onClick=${cycleTheme}
           aria-label=${'切换主题（当前 ' + themeLabel + '，下一套 ' + nextThemeLabel + '）'}
           title=${'主题：' + themeLabel + ' → ' + nextThemeLabel}>◐ ${themeLabel}</button>
@@ -5270,7 +5578,7 @@ function App () {
       </div>
     </section>`}
     ${!authExpired && visited.has('messages') && html`<section class="page" hidden=${tab !== 'messages'}>
-      <${MessagesPanel} active=${tab === 'messages'} onSync=${syncFor.messages} />
+      <${MessagesPanel} active=${tab === 'messages'} onSync=${syncFor.messages} pollTick=${pollTick} />
     </section>`}
     ${!authExpired && visited.has('logs') && html`<section class="page" hidden=${tab !== 'logs'}>
       <div>
@@ -5286,15 +5594,15 @@ function App () {
       </div>
     </section>`}
     ${!authExpired && visited.has('config') && html`<section class="page" hidden=${tab !== 'config'}>
-      <${ConfigPanel} active=${tab === 'config'} onSync=${syncFor.config} />
+      <${ConfigPanel} active=${tab === 'config'} onSync=${syncFor.config} pollTick=${pollTick} />
     </section>`}
     ${!authExpired && visited.has('filter') && html`<section class="page" hidden=${tab !== 'filter'}>
-      <${FilterRulesPanel} onSync=${syncFor.filter} active=${tab === 'filter'} />
+      <${FilterRulesPanel} onSync=${syncFor.filter} active=${tab === 'filter'} pollTick=${pollTick} />
     </section>`}
     ${!authExpired && visited.has('sys') && html`<section class="page" hidden=${tab !== 'sys'}>
       <div>
-      <${SysPanel} onReady=${onSysReady} active=${tab === 'sys'} />
-      <${FilesPanel} onReady=${onFilesReady} active=${tab === 'sys'} />
+      <${SysPanel} onReady=${onSysReady} active=${tab === 'sys'} onSettingsSaved=${reloadUiSettings} pollTick=${pollTick} />
+      <${FilesPanel} onReady=${onFilesReady} active=${tab === 'sys'} pollTick=${pollTick} />
       </div>
     </section>`}
 

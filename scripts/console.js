@@ -163,6 +163,18 @@ const CACHE_HEALTH_NEAR_RATIO = 0.8
 // 独立：语义不同（自检每次都真实推送），将来若要再区分，不必重拆通用窗。
 // lastAccept 本就按 action 键控（per-action Map + 持久化 JSON 的 key），无需改持久化结构。
 const REPLAY_WINDOW_NOTIFY_TEST_MS = 60 * 1000
+
+// ── v3.340：通知自检的重复提交拦截窗可在线改（配置页 → 保存即生效）────────────
+// REPLAY_WINDOW_NOTIFY_TEST_MS 仍是「默认值」锚点（沿用既有常量，语义不变）；运行期生效值
+// 存在 runtimeSettings 里，由 <stateDir>/console-settings.json 恢复、由配置页写回。
+// 0 = 关闭拦截：判定式 `now - prev.at < 0` 天然为假，不需要特殊分支（连点会重复真实发送）。
+const NOTIFY_REPLAY_MIN_S = 0
+const NOTIFY_REPLAY_MAX_S = 3600
+const CONSOLE_SETTINGS_FILE = 'console-settings.json'
+const CONSOLE_SETTINGS_DEFAULT_S = 60
+// 设置文件读取上限：正常只有几十字节；超限按损坏处理（防误放的巨文件把控制台读卡死）。
+const CONSOLE_SETTINGS_MAX_BYTES = 64 * 1024
+
 // 自动正式运行：HTTP 不接受该动作，只由服务器调度器内部触发。
 // 服务器端自动正式运行：调度在控制台进程内，不依赖浏览器页面。
 const AUTO_MIN_S = 3
@@ -1859,6 +1871,7 @@ function classifyStateFile (name, messagesFile) {
   // ——这是**合法缓存文件**，绝不能因为名字含 .lock 被归进 lock（暗示异常）。
   if (name.endsWith('.seen.cleanup.lock.json')) return 'cache'
   if (name === 'console-lastaccept.json') return 'console'
+  if (name === CONSOLE_SETTINGS_FILE) return 'console'
   if (name === 'console-trigger.lock' || name === '.seen.cleanup.lock' ||
     name.endsWith('.lock') || name.endsWith('.takeover') || name.endsWith('.reclaim')) return 'lock'
   if (name.endsWith('.bak')) return 'backup'
@@ -2033,6 +2046,55 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 防的是「202 响应丢失后的自动重试」，60s 足够覆盖；超窗即视为新的手动触发。
   const REPLAY_WINDOW_MS = 60 * 1000
   const lastAccept = new Map()
+  // ── v3.340 通知自检拦截窗：运行期设置（配置页在线改，保存后下一次判定就生效）──────
+  // 落盘 <stateDir>/console-settings.json（writeAtomic，0600 原子写）。读盘语义：
+  //   缺文件 = 默认 60；损坏 / 字段非法 = 默认 60 + console.error 告警（不阻断启动）。
+  // settingsSource 只进读面，让前端如实区分「值来自文件」与「还在用默认值」。
+  const settingsPath = path.join(stateDir, CONSOLE_SETTINGS_FILE)
+  const runtimeSettings = {
+    revision: 0,
+    updatedAt: 0,
+    notifyTestReplayWindowS: CONSOLE_SETTINGS_DEFAULT_S,
+    // v3.342：顶栏「数据截至」是否带年月日（只影响显示，不影响任何判定）。
+    syncShowDate: true
+  }
+  let settingsSource = 'default'
+  const loadStoredSettings = () => {
+    // openNonBlocking：设置文件被换成 FIFO 时裸 O_RDONLY 会永久阻塞（createConsole 卡在 listen
+    // 之前，整个控制台起不来）。与 audit/tombstone 两条读面同口径：非普通文件按 unsafe 回默认。
+    const read = readSafeTextResult(settingsPath, CONSOLE_SETTINGS_MAX_BYTES, { openNonBlocking: true })
+    if (read.status === 'missing') return
+    if (read.status !== 'ok') {
+      console.error(`⚠️ 控制台设置读取失败（${read.status}），按默认值运行：notifyTestReplayWindowS=${CONSOLE_SETTINGS_DEFAULT_S}`)
+      return
+    }
+    let raw
+    try {
+      raw = JSON.parse(read.text)
+    } catch (e) {
+      console.error(`⚠️ 控制台设置不是合法 JSON，按默认值运行：${e && e.message ? e.message : e}`)
+      return
+    }
+    const valid = raw && typeof raw === 'object' && !Array.isArray(raw) &&
+      Number.isInteger(raw.notifyTestReplayWindowS) &&
+      raw.notifyTestReplayWindowS >= NOTIFY_REPLAY_MIN_S && raw.notifyTestReplayWindowS <= NOTIFY_REPLAY_MAX_S &&
+      // v3.340 的旧文件没有这个字段：允许缺省（按默认 true），但写了就必须是布尔。
+      (raw.syncShowDate === undefined || typeof raw.syncShowDate === 'boolean') &&
+      Number.isInteger(raw.revision) && raw.revision >= 0 &&
+      typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)
+    if (!valid) {
+      console.error(`⚠️ 控制台设置字段非法，按默认值运行：notifyTestReplayWindowS=${CONSOLE_SETTINGS_DEFAULT_S}、syncShowDate=true（${CONSOLE_SETTINGS_FILE}）`)
+      return
+    }
+    runtimeSettings.revision = raw.revision
+    runtimeSettings.updatedAt = raw.updatedAt
+    runtimeSettings.notifyTestReplayWindowS = raw.notifyTestReplayWindowS
+    if (typeof raw.syncShowDate === 'boolean') runtimeSettings.syncShowDate = raw.syncShowDate
+    settingsSource = 'file'
+  }
+  loadStoredSettings()
+  // 生效窗（毫秒）：每次判定现取 —— 保存后无需重启，下一次触发就用新值。
+  const notifyReplayWindowMs = () => runtimeSettings.notifyTestReplayWindowS * 1000
   // 进程启动时刻（/api/sys 展示「已运行」用）：createConsole 被调用的瞬间。
   const startedAtMs = Date.now()
 
@@ -2334,16 +2396,22 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 例外：锁被其他动作占着时（acquireLock 失败）先做一次锁外只读判窗——窗口内重试
         // 即使撞上他动作运行中也按「重放拦截」回（带首轮 runId），不降级成裸锁冲突
         // （G_4Kf 用例语义；竞态由锁内二次判窗兜底，锁外这层只是报错形态优化）。
-        const winMsPre = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : REPLAY_WINDOW_MS
+        // v3.340：窗长只算一次——自检取运行期设置（配置页可改，0 = 关闭拦截），
+        // 其余动作仍用 REPLAY_WINDOW_MS。replayWindowS 是同一口径的秒数，进 409 响应体
+        // 让前端提示「N 秒内无需重复」时不必再写死 60。
+        const windowMs = action === 'notify-test' ? notifyReplayWindowMs() : REPLAY_WINDOW_MS
+        // 必须从 windowMs 派生（而不是再读一次设置）：否则窗长算错时 409 仍会回带一个
+        // 「看起来对」的秒数，把矛盾藏起来（retryAfterS 与 replayWindowS 会自相矛盾）。
+        const replayWindowS = Math.round(windowMs / 1000)
         if (!acquireLock(stateDir, now, runToken)) {
           // readLastAccept 返回 [key, value] 数组（非 Map），用 find 取当前动作记录。
           const persistedPre = readLastAccept(lastAcceptPath)
           const prevPrePair = persistedPre.find(([k]) => k === action)
           const prevPre = prevPrePair ? prevPrePair[1] : lastAccept.get(action)
-          if (prevPre && now - prevPre.at < winMsPre) {
+          if (prevPre && now - prevPre.at < windowMs) {
             const rid = prevPre.runId
-            const remainS = Math.max(1, Math.ceil((winMsPre - (now - prevPre.at)) / 1000))
-            sendJson(res, 409, { error: `重复提交已拦截（该动作刚受理过，${remainS} 秒后可重试）`, runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true, retryAfterS: remainS })
+            const remainS = Math.max(1, Math.ceil((windowMs - (now - prevPre.at)) / 1000))
+            sendJson(res, 409, { error: `重复提交已拦截（该动作刚受理过，${remainS} 秒后可重试）`, runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true, retryAfterS: remainS, replayWindowS })
             return
           }
           sendJson(res, 409, { error: '已有触发任务在运行（或锁未过期），请稍后再试' })
@@ -2354,10 +2422,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
         }
         const prev = lastAccept.get(action)
-        // notify-test 60s、其余动作 60s（D2-S16：普通动作不再用 12min——那只拦得到人工重跑，拦不到
+        // notify-test 窗取自运行期设置（默认 60s，配置页可改 0–3600s）、其余动作 60s
+        // （D2-S16：普通动作不再用 12min——那只拦得到人工重跑，拦不到
         // 真正的重复提交；运行中互斥由单飞锁负责）。/trigger 的 action=notify-test 与独立
         // 端点共享同一 lastAccept 键与窗长（有意行为）。run-auto 不接受 HTTP 触发。
-        const winMs = action === 'notify-test' ? REPLAY_WINDOW_NOTIFY_TEST_MS : REPLAY_WINDOW_MS
+        const winMs = windowMs
         if (prev && now - prev.at < winMs) {
           // runId = epoch.seq 字符串（v3.299 评审）：0 是 pending 帧哨兵（数字），
           // 真实 runId 只在 startAction 之后落盘——用「数字 0」判 pending，其余原样下发。
@@ -2367,7 +2436,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           const replayReleasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
           if (!replayReleasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}，重放拦截分支）：锁将保留到陈旧接管（约 10 分钟），期间触发 409 属预期。`)
           const remainS = Math.max(1, Math.ceil((winMs - (now - prev.at)) / 1000))
-          sendJson(res, 409, { error: `重复提交已拦截（该动作刚受理过，${remainS} 秒后可重试）`, runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true, retryAfterS: remainS })
+          sendJson(res, 409, { error: `重复提交已拦截（该动作刚受理过，${remainS} 秒后可重试）`, runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true, retryAfterS: remainS, replayWindowS })
           return
         }
         lastAccept.set(action, { at: now, runId: 0 })
@@ -3478,6 +3547,112 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
       return
     }
+    // ── v3.340 控制台设置：通知自检的重复提交拦截窗（配置页可读写）──────────────
+    // GET 走全局鉴权（Cookie/Bearer/?token= 均可读）；POST 只认 Bearer + JSON（写面防 CSRF）。
+    // 落盘 <stateDir>/console-settings.json（0600 原子写），内存即时更新 ⇒ 下一次触发判定就生效。
+    if (req.method === 'GET' && url.pathname === '/api/config/console') {
+      // 可变设置不许被任何中间层/浏览器启发式缓存：保存后刷新必须拿到刚写入的值。
+      res.setHeader('Cache-Control', 'no-store')
+      sendJson(res, 200, {
+        schema: 1,
+        revision: runtimeSettings.revision,
+        updatedAt: runtimeSettings.updatedAt,
+        source: settingsSource,
+        settings: { notifyTestReplayWindowS: runtimeSettings.notifyTestReplayWindowS, syncShowDate: runtimeSettings.syncShowDate },
+        defaults: { notifyTestReplayWindowS: CONSOLE_SETTINGS_DEFAULT_S, syncShowDate: true },
+        min: NOTIFY_REPLAY_MIN_S,
+        max: NOTIFY_REPLAY_MAX_S
+      })
+      return
+    }
+    if (req.method === 'POST' && url.pathname === '/api/config/console') {
+      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
+      const verdict = writeAuthVerdict(req, url.searchParams, token)
+      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
+      if (!filterMediaAllowed(req)) {
+        sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' })
+        return
+      }
+      readBody(req)
+        .then(({ body, aborted, over }) => {
+          if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
+          if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
+          if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
+          let payload
+          try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
+          if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            sendJson(res, 400, { error: 'body 必须是对象' })
+            return
+          }
+          // v3.342：两字段都是可选的「部分更新」，但至少要给一个；给了就必须严格合法——
+          // 字符串 '60' / 1.5 / null / 越界 / 非布尔的显示开关全部拒绝，含糊接受会让
+          // 「保存成功但生效值不是用户以为的那个」变成静默事故。
+          const hasWin = Object.prototype.hasOwnProperty.call(payload, 'notifyTestReplayWindowS')
+          const hasDate = Object.prototype.hasOwnProperty.call(payload, 'syncShowDate')
+          if (!hasWin && !hasDate) {
+            sendJson(res, 400, { error: '至少要提供 notifyTestReplayWindowS 或 syncShowDate 之一' })
+            return
+          }
+          if (hasWin && (typeof payload.notifyTestReplayWindowS !== 'number' ||
+            !Number.isInteger(payload.notifyTestReplayWindowS) ||
+            payload.notifyTestReplayWindowS < NOTIFY_REPLAY_MIN_S ||
+            payload.notifyTestReplayWindowS > NOTIFY_REPLAY_MAX_S)) {
+            sendJson(res, 400, { error: `notifyTestReplayWindowS 必须是 ${NOTIFY_REPLAY_MIN_S}–${NOTIFY_REPLAY_MAX_S} 的整数` })
+            return
+          }
+          if (hasDate && typeof payload.syncShowDate !== 'boolean') {
+            sendJson(res, 400, { error: 'syncShowDate 必须是布尔值' })
+            return
+          }
+          // 可选乐观锁：带了就必须是当前 revision，防两个标签页/两个人在设置页互相覆盖。
+          if (Object.prototype.hasOwnProperty.call(payload, 'baseRevision') &&
+            (typeof payload.baseRevision !== 'number' || !Number.isInteger(payload.baseRevision) ||
+              payload.baseRevision < 0 || payload.baseRevision !== runtimeSettings.revision)) {
+            sendJson(res, 409, { error: 'revision_mismatch', revision: runtimeSettings.revision })
+            return
+          }
+          const nextWin = hasWin ? payload.notifyTestReplayWindowS : runtimeSettings.notifyTestReplayWindowS
+          const nextDate = hasDate ? payload.syncShowDate : runtimeSettings.syncShowDate
+          // 同值保存不推进 revision、不重写文件：否则每点一次「保存」都会把别的标签页/手机上的
+          // baseRevision 作废，它们下一次保存只能吃 409（页面还会显示「已被别处改过」）。
+          if (nextWin === runtimeSettings.notifyTestReplayWindowS && nextDate === runtimeSettings.syncShowDate) {
+            sendJson(res, 200, {
+              ok: true,
+              unchanged: true,
+              revision: runtimeSettings.revision,
+              updatedAt: runtimeSettings.updatedAt,
+              settings: { notifyTestReplayWindowS: runtimeSettings.notifyTestReplayWindowS, syncShowDate: runtimeSettings.syncShowDate }
+            })
+            return
+          }
+          // 落盘成功才改内存：写失败（磁盘/权限）时内存保持旧值，页面不会显示一个
+          // 重启后就消失的「已保存」。
+          const next = {
+            schema: 1,
+            revision: runtimeSettings.revision + 1,
+            updatedAt: Date.now(),
+            notifyTestReplayWindowS: nextWin,
+            syncShowDate: nextDate
+          }
+          if (!writeAtomic(settingsPath, JSON.stringify(next), '控制台设置')) {
+            sendJson(res, 500, { error: '设置保存失败（磁盘/权限）' })
+            return
+          }
+          runtimeSettings.revision = next.revision
+          runtimeSettings.updatedAt = next.updatedAt
+          runtimeSettings.notifyTestReplayWindowS = next.notifyTestReplayWindowS
+          runtimeSettings.syncShowDate = next.syncShowDate
+          settingsSource = 'file'
+          sendJson(res, 200, {
+            ok: true,
+            revision: next.revision,
+            updatedAt: next.updatedAt,
+            settings: { notifyTestReplayWindowS: next.notifyTestReplayWindowS, syncShowDate: next.syncShowDate }
+          })
+        })
+        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+      return
+    }
     if (req.method === 'POST' && url.pathname === '/trigger') {
       acceptAction(req, res, {})
       return
@@ -3898,6 +4073,11 @@ module.exports = {
   // v3.301 批次④ 4.1 通知自检：常量/入口导出（spawn entry 映射断言 + 重放窗断言）
   REPLAY_WINDOW_NOTIFY_TEST_MS,
   ENTRY_SINGLE,
+  // v3.340 控制台设置：常量导出（HTTP 用例用同一真源对账，避免测试自己写死 0/3600）
+  CONSOLE_SETTINGS_FILE,
+  CONSOLE_SETTINGS_DEFAULT_S,
+  NOTIFY_REPLAY_MIN_S,
+  NOTIFY_REPLAY_MAX_S,
   // 过滤规则控制面：常量/写鉴权/测试注入口（HTTP 用例 + 非 HTTP 断言）
   FILTER_BODY_MAX_BYTES,
   FILTER_PREVIEW_SCAN_MAX,
