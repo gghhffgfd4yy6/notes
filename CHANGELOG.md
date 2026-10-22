@@ -705,3 +705,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **现象**：v3.333 之后「匹配 582 条」这行不动了，但按钮还在闪：`disabled=${loading}` 会在缓存命中时把「刷新」压到 **0.45 透明度**再弹回来，实测 9ms 变灰 → 24ms 复原（15ms），正好在计数行上方。
 - **修复**：按钮不再跟 `loading` 变灰，只在 `slowLoading`（>600ms）时禁用；连点用 `busyRef` 挡（`Promise.resolve(load()).finally(...)` 复位），语义不变。
 - **门禁**：`test_console.js` 增加红线——刷新按钮不得 `disabled=${loading}`、必须 `disabled=${slowLoading}` 且有 `busyRef` 连点闸；旧的「纯刷新不得搬滚动位置」断言跟着改成 `Promise.resolve(load()).catch`。
+
+## v3.335 — 系统页加「检查更新」（页内下拉换不了脚本）
+
+- **背景**：v3.330 起页面内下拉只刷数据、不重载文档，所以「下拉」永远换不到新前端；旧标签页要么等 60s 的版本横幅（v3.332），要么自己按浏览器刷新。
+- **新增**：系统信息「脚本版本」那一行加「检查更新」按钮。点一下走 `GET /api/sys?probe=version`（no-store），把服务端版本和页面启动版本 `BOOT.version` 对比：不一致就显示「发现 vX，正在刷新…」并在 600ms 后整页刷新；一致显示「已是最新」，2.5s 后收起；请求失败显示「检查失败」。
+- **不动宽度**：按钮文案恒为「检查更新」，状态另起一个 `.ver-state` 文本，不重演「刷新 → 刷新中…」的宽度跳动。
+- **门禁**：`test_console.js` 锁定探针参数、`BOOT.version` 比对、`location.reload()`、按钮固定文案与样式存在。

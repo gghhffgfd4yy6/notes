@@ -5555,9 +5555,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.334：注释里的版本号不得写下一版 v3.335。
-    assert.ok(!/v3\.335/.test(src), 'app.js 注释不得写 v3.335（版本未 bump）')
-    assert.ok(!/v3\.335/.test(css), 'app.css 注释不得写 v3.335（版本未 bump）')
+    // 版本已 bump 到 3.335：注释里的版本号不得写下一版 v3.336。
+    assert.ok(!/v3\.336/.test(src), 'app.js 注释不得写 v3.336（版本未 bump）')
+    assert.ok(!/v3\.336/.test(css), 'app.css 注释不得写 v3.336（版本未 bump）')
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
@@ -5658,6 +5658,16 @@ async function main () {
     // 前端：读出 boot 版本，60s 对一次 /api/sys，只有不一致才提示。
     assert.ok(src.includes("version: typeof data.version === 'string' ? data.version : ''"), 'readBoot 必须解析 version')
     assert.ok(src.includes('const VERSION_CHECK_MS = 60000'), '对账间隔必须是 60s')
+    // v3.335：系统页「检查更新」——页内下拉只换数据，旧页需要一个就地换脚本的入口。
+    const sysPanel = src.slice(src.indexOf('function SysPanel'), src.indexOf('function SysPanel') + 20000)
+    assert.ok(sysPanel.includes('apiGetSys({ probeVersion: true })'), '检查更新必须走 no-store 版本探针')
+    assert.ok(sysPanel.includes("v !== '' && v !== BOOT.version"), '检查更新必须比页面启动版本，不能比服务端自报')
+    assert.ok(/if \(v !== '' && v !== BOOT\.version\) \{[\s\S]{0,500}window\.location\.reload\(\)/.test(sysPanel),
+      'reload 必须落在「版本不同」这个分支里，不能无条件刷新')
+    assert.ok(sysPanel.includes('if (verBusyRef.current || verState === \'stale\') return'),
+      '同一 tick 连点只能发一次探针，且已排期刷新时再点不得取消那次 reload')
+    assert.ok(sysPanel.includes('>检查更新<'), '按钮文案固定为「检查更新」，不随状态改宽度')
+    assert.ok(css.includes('.ver-check {') && css.includes('.ver-state.ok {'), '检查更新的按钮/状态样式必须真的在 css 里')
     assert.ok(src.includes("if (stopped || document.visibilityState === 'hidden') return"), '页面隐藏时不得持续打接口')
     assert.ok(src.includes('const bootVersion = BOOT.version'), '对账基准必须是页面启动版本')
     assert.ok(src.includes('if (!bootVersion || authExpired) return undefined'), '凭证失效后必须停表（401 会刷日志）')
