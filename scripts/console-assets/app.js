@@ -5001,6 +5001,12 @@ function App () {
     return true
   }, [refreshSplit, refreshAuto])
   const pull = usePullToRefresh(pullRefresh, !authExpired)
+  // 手机窄屏 .sync 是横向可滚动的：用户把它滑到右边时，行内状态会被裁在视口外。
+  // 下拉一开始就把它滚回最左（状态就在第一个位置），保证反馈看得见。
+  const syncRef = useRef(null)
+  useEffect(() => {
+    if (pull.state !== 'idle' && syncRef.current) syncRef.current.scrollLeft = 0
+  }, [pull.state])
 
   // 概览页才轮询状态，避免非概览页每 2s 重渲染（与主轮询同纪律）。
   useEffect(() => {
@@ -5129,7 +5135,7 @@ function App () {
         <span class="name">xbk-push 控制台</span>
         <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
       </div>
-      <div class="sync" tabindex="0" aria-label="刷新状态">
+      <div class="sync" ref=${syncRef} tabindex="0" aria-label="刷新状态">
         ${pull.state !== 'idle'
           ? html`<${PullRefreshStatus} state=${pull.state} />`
           : tab === 'overview'

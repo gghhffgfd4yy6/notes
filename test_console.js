@@ -4557,7 +4557,7 @@ async function main () {
       '手机端 brand 必须单行，徽章变长不能换行顶动页签')
     assert.ok(/white-space:\s*nowrap/.test(syncPhone) && /min-height:\s*24px/.test(syncPhone),
       '手机端 sync 必须单行 + 固定行高，文字长短不能改高度')
-    assert.ok(src.includes('class="sync" tabindex="0"'),
+    assert.ok(/class="sync"[^>]*tabindex="0"/.test(src),
       '手机端 sync 必须可聚焦，长错误才能用键盘横向滚动查看')
     assert.ok(src.includes('tabsRef') && src.includes("querySelector('.tab-btn.active')"),
       '切页后必须把当前页签滚进可视区（横滚后靠右页签不能停在视野外）')
@@ -5556,7 +5556,8 @@ async function main () {
     assert.ok(!src.includes('PullRefreshBar') && !src.includes('class="ptr '), '不得再用浮层指示条')
     assert.ok(!/\.ptr\s*\{[^}]*position:\s*fixed/.test(cssLive), '指示条不得 fixed 浮在标题上')
     const syncRow = src.slice(src.indexOf('class="sync"'), src.indexOf('class="sync"') + 700)
-    assert.ok(syncRow.includes('pull.state') && syncRow.includes('PullRefreshStatus'), '刷新状态必须渲染在顶栏 .sync 行内')
+    assert.ok(/<\$\{PullRefreshStatus\} state=\$\{pull\.state\} \/>/.test(syncRow), '刷新状态必须渲染在 .sync 行内，且 state 必须来自 pull.state')
+    assert.ok(src.includes('syncRef.current.scrollLeft = 0'), '窄屏 .sync 被横向滑走时，下拉必须把它滚回最左，否则状态看不见')
     // ⑤ 每个页签面板都要接到同一次下拉刷新（数量不够或张冠李戴都要拦住）。
     for (const name of ['RunHistoryPanel', 'TrendsPanel', 'CacheHealthPanel', 'MessagesPanel', 'LogsPanel', 'ConfigPanel', 'FilesPanel', 'SysPanel', 'FilterRulesPanel']) {
       const at = src.indexOf('function ' + name + ' (')
