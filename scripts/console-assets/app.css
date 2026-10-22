@@ -268,23 +268,15 @@
   .page { flex: 1 0 auto; }
   .page[hidden] { display: none; }
 
-  /* ── 下拉刷新指示条（v3.330）── */
-  /* 固定层、不参与布局：下拉立即出现，数据回来才收起；不重建页面、不改滚动位置。 */
-  .ptr {
-    position: fixed; z-index: 70; left: 50%; transform: translateX(-50%);
-    top: calc(env(safe-area-inset-top, 0px) + 8px);
-    display: flex; align-items: center; gap: 8px;
-    padding: 7px 14px; border-radius: 999px;
-    background: var(--panel); color: var(--text); border: 1px solid var(--border);
-    box-shadow: var(--shadow-card); font-size: var(--fs-sm);
-    pointer-events: none; white-space: nowrap;
-  }
+  /* ── 下拉刷新状态（v3.331）── */
+  /* 写在顶栏「数据截至」这一行里：不浮层、不遮标题，文字原地换成刷新状态。 */
+  .ptr-text { display: inline-flex; align-items: center; gap: 6px; color: var(--text); }
   .ptr-ring {
-    width: 14px; height: 14px; border-radius: 50%;
+    flex: 0 0 auto; width: 13px; height: 13px; border-radius: 50%;
     border: 2px solid var(--accent); border-right-color: transparent;
   }
-  .ptr.ready .ptr-ring { border-right-color: var(--accent); border-top-color: transparent; }
-  .ptr.busy .ptr-ring { animation: ptr-spin .7s linear infinite; }
+  .ptr-text.ready .ptr-ring { border-right-color: var(--accent); border-top-color: transparent; }
+  .ptr-text.busy .ptr-ring { animation: ptr-spin .7s linear infinite; }
   @keyframes ptr-spin { to { transform: rotate(360deg); } }
 
   /* ── 顶栏 ── */
