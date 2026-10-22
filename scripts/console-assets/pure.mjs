@@ -126,23 +126,52 @@ export function logLineTone (line) {
   return ''
 }
 
-// 把一行按关键字切成 [文本, 是否命中] 片段，交给 <mark> 渲染（v3.317）。
+// 把一段文本按关键字切成 [文本, 是否命中] 片段，交给 <mark> 渲染（v3.317 日志行、v3.328 推送记录标题/正文共用）。
 // 大小写不敏感，但绝不拼 innerHTML——用户输入只作为文本节点插入（XSS 面为零）。
-// 少数 Unicode（如 'İ'）小写后长度会变、索引与原文对不上，此时整行不切（不猜位置）。
-export function splitLogHits (line, kw) {
+// v3.328 两处边界：
+// ① maxHits：超长正文里同一个词可能出现上千次，每个命中一个 <mark> 会把「展开」卡住几秒；
+//    只切前 maxHits 处，之后的文本整段按普通片段返回（渲染上限，不影响命中总数）。
+// ② 小写后长度会变（如 'İ' → 'i̇'）时不再整段放弃高亮：服务端是按小写文本筛的，
+//    放弃会让卡片「匹配却没有一个黄块」。改为给小写码元记原文下标，命中区间映射回原文。
+export function splitHits (line, kw, maxHits = Infinity) {
   if (typeof line !== 'string' || line.length === 0 || kw === '') return [[line, false]]
-  const lower = line.toLowerCase()
-  if (lower.length !== line.length) return [[line, false]]
-  const out = []
+  let lower = line.toLowerCase()
+  let map = null
+  if (lower.length !== line.length) {
+    map = []
+    let rebuilt = ''
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i].toLowerCase()
+      for (let k = 0; k < ch.length; k++) map.push(i)
+      rebuilt += ch
+    }
+    lower = rebuilt
+  }
+  // 先收命中区间（原文下标），相邻/重叠的合并：一个原文字符可能摊成多个小写码元。
+  // maxHits 按「命中次数」计，不按合并后的区间数——否则连续命中会并成一段、永远到不了上限。
+  const ranges = []
   let from = 0
+  let hits = 0
   let at = lower.indexOf(kw, from)
-  while (at !== -1) {
-    if (at > from) out.push([line.slice(from, at), false])
-    out.push([line.slice(at, at + kw.length), true])
+  while (at !== -1 && hits < maxHits) {
+    const start = map ? map[at] : at
+    const end = map ? map[at + kw.length - 1] + 1 : at + kw.length
+    const last = ranges[ranges.length - 1]
+    if (last && start <= last[1]) last[1] = Math.max(last[1], end)
+    else ranges.push([start, end])
+    hits += 1
     from = at + kw.length
     at = lower.indexOf(kw, from)
   }
-  if (from < line.length) out.push([line.slice(from), false])
+  if (ranges.length === 0) return [[line, false]]
+  const out = []
+  let pos = 0
+  for (const [start, end] of ranges) {
+    if (start > pos) out.push([line.slice(pos, start), false])
+    out.push([line.slice(start, end), true])
+    pos = end
+  }
+  if (pos < line.length) out.push([line.slice(pos), false])
   return out
 }
 

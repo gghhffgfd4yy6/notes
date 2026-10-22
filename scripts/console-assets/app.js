@@ -9,7 +9,7 @@
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
-import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitLogHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior, dateRangeLabel } from './pure.mjs'
+import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior, dateRangeLabel } from './pure.mjs'
 // 日期区间（v3.326）：flatpickr 4.6.13 的 ESM 单文件 bundle（含 zh 语言包，vendored 入库，
 // 与 htm-preact 同口径——不引 CDN，CSP script-src 'self' 覆盖）。样式在 flatpickr.css，
 // 主题化覆盖写在 app.css 的 .flatpickr-calendar 段（跟四套 token 走）。
@@ -2710,6 +2710,10 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
   </div>`
 }
 
+// v3.328：单条记录最多标 200 处命中。超长正文里同一关键词可能重复上千次，每个命中一个
+// <mark> 会把「展开」卡住几秒；日志页超过 3000 行直接关高亮是同一思路（渲染上限，不改搜索口径）。
+const MSG_HIT_MAX = 200
+
 function MessagesPanel ({ onSync, active = true }) {
   const [page, setPage] = useState(1)
   const [size, setSize] = useState(20)
@@ -2906,6 +2910,14 @@ function MessagesPanel ({ onSync, active = true }) {
   const cateTotal = data && Array.isArray(data.categories)
     ? data.categories.reduce((sum, c) => sum + (typeof c.count === 'number' ? c.count : 0), 0)
     : null
+  // v3.328：搜索结果高亮——标题与正文里的命中片段套 <mark>。
+  // 高亮词必须与「当前显示的这一页数据」同源：data.queryUsed 是服务端为这批结果实际生效的词。
+  // 防抖提交新词后、新响应回来前 data 仍是上一轮的，用 query 会拿新词去标旧卡片
+  // （PR #291 Sourcery：Old results get wrong highlights）。
+  const hitKw = (data && typeof data.queryUsed === 'string' ? data.queryUsed : '').trim().toLowerCase()
+  const hit = (text) => (typeof text === 'string'
+    ? splitHits(text, hitKw, MSG_HIT_MAX).map(([part, on], i) => on ? html`<mark key=${i}>${part}</mark>` : part)
+    : text)
   // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，
   // 但只在「响应确实属于当前查询、且用户没有继续输入」时回写；
   // 否则旧响应会把刚打的新词覆盖回旧值（搜索像没生效）。
@@ -2968,7 +2980,7 @@ function MessagesPanel ({ onSync, active = true }) {
                 title=${expanded === m.rowKey ? '收起正文' : '点击展开正文'}
                 onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}
                 onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(expanded === m.rowKey ? null : m.rowKey) } }}>
-                <span class="msg-caret" aria-hidden="true">${expanded === m.rowKey ? '▾' : '▸'}</span>${m.title || '（无标题）'}
+                <span class="msg-caret" aria-hidden="true">${expanded === m.rowKey ? '▾' : '▸'}</span>${m.title ? hit(m.title) : '（无标题）'}
               </span>
               ${m.price !== null ? html`<span class="msg-price">¥${m.price}</span>` : ''}
             </div>
@@ -2977,7 +2989,7 @@ function MessagesPanel ({ onSync, active = true }) {
               <span class="mono">${m.datetime} ${m.shorttime}</span>
               ${msgLink(m, data.baseUrl)}
             </div>
-            ${expanded === m.rowKey && html`<div class="msg-content">${m.content || '（无正文）'}</div>`}
+            ${expanded === m.rowKey && html`<div class="msg-content">${m.content ? hit(m.content) : '（无正文）'}</div>`}
           </div>`)}
         </div>`}
       <div class="pager">
@@ -3198,7 +3210,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
       const isFocus = focusAt !== '' && line.startsWith(focusAt)
       return html`<span class=${'logline' + (tone ? ' logline-' + tone : '') + (isFocus ? ' logline-focus' : '')}
         key=${i} ref=${isFocus ? focusRef : null}>${
-        splitLogHits(line, kwNow).map(([text, hit], j) => hit ? html`<mark key=${j}>${text}</mark>` : text)
+        splitHits(line, kwNow).map(([text, hit], j) => hit ? html`<mark key=${j}>${text}</mark>` : text)
       }${i === last ? '' : '\n'}</span>`
     })
   }, [ranged, q, focusAt])

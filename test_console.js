@@ -4897,21 +4897,60 @@ async function main () {
 
   // ── v3.317 手机端可用性（日志顺序/行级渲染/页签/表格动作列/触发结果）──────────
   await aok('行为: v3.317 日志行着色与命中切分（纯函数）', async () => {
-    const { logLineTone, splitLogHits } = await import('./scripts/console-assets/pure.mjs')
+    const { logLineTone, splitHits } = await import('./scripts/console-assets/pure.mjs')
     assert.strictEqual(logLineTone('2026-10-20 16:00:00 ERROR 推送全部失败 3 条'), 'bad', 'ERROR 行必须标红')
     assert.strictEqual(logLineTone('2026-10-20 16:00:00 ALERT [v3.0] 运行异常'), 'warn', 'ALERT 行必须标琥珀')
     assert.strictEqual(logLineTone('2026-10-20 16:00:00 WARN 通道慢'), 'warn')
     assert.strictEqual(logLineTone('2026-10-20 16:00:00 total=20 dedup=0 pushed=20'), '', '普通摘要行不着色')
     assert.strictEqual(logLineTone('2026-10-20 16:00:00 ERROR 控制台停止：任务 #12 于运行中被停止'), '',
       '控制台生命周期行不着色（否则每次重启满屏红，白做 v3.307 降噪）')
-    assert.deepStrictEqual(splitLogHits('推送 2 条，推送成功', '推送'),
+    assert.deepStrictEqual(splitHits('推送 2 条，推送成功', '推送'),
       [['推送', true], [' 2 条，', false], ['推送', true], ['成功', false]], '同一行多处命中都要切出来')
-    assert.deepStrictEqual(splitLogHits('PUSH ok', 'push'), [['PUSH', true], [' ok', false]],
+    assert.deepStrictEqual(splitHits('PUSH ok', 'push'), [['PUSH', true], [' ok', false]],
       '大小写不敏感，但片段必须是原文（不能输出小写副本）')
-    assert.deepStrictEqual(splitLogHits('abc', ''), [['abc', false]], '空关键词不切')
-    assert.deepStrictEqual(splitLogHits('', 'x'), [['', false]], '空行原样返回（行不能被吞掉）')
-    assert.deepStrictEqual(splitLogHits('İstanbul', 'i'), [['İstanbul', false]],
-      '小写后长度会变的字符不切（索引与原文对不上就不猜，宁可不高亮）')
+    assert.deepStrictEqual(splitHits('abc', ''), [['abc', false]], '空关键词不切')
+    assert.deepStrictEqual(splitHits('', 'x'), [['', false]], '空行原样返回（行不能被吞掉）')
+    // v3.328 起：小写变长的字符不再整段放弃（服务端按小写命中，放弃会让卡片「匹配却无高亮」）。
+    assert.deepStrictEqual(splitHits('İstanbul', 'i'), [['İ', true], ['stanbul', false]],
+      '小写后长度会变时用下标映射回原文，命中字符仍要标出来')
+  })
+
+  // ── v3.328 推送记录搜索高亮 ─────────────────────────────────────────────
+  await aok('行为: v3.328 推送记录标题/正文按搜索词切分（与日志页共用 splitHits）', async () => {
+    const { splitHits } = await import('./scripts/console-assets/pure.mjs')
+    const title = '可口可乐芬达500mL*24瓶 41.9元'
+    assert.deepStrictEqual(splitHits(title, '可乐'),
+      [['可口', false], ['可乐', true], ['芬达500mL*24瓶 41.9元', false]],
+      '标题里命中「可乐」必须只切出命中的两个字（不能把整段「可口可乐」标黄）')
+    assert.deepStrictEqual(splitHits('可乐', '可乐'), [['可乐', true]], '整段就是关键词时只留一个命中片段')
+    assert.deepStrictEqual(splitHits(title, ''), [[title, false]], '没输入关键词时原样返回（不得出现空 <mark>）')
+    assert.deepStrictEqual(splitHits('', '可乐'), [['', false]], '无标题/无正文的空串不能吞掉卡片')
+    // 长正文护栏：只标前 N 处，剩余文本整段按普通片段返回（颜色不再逐个建 <mark> 节点）。
+    assert.deepStrictEqual(splitHits('aaaaaa', 'a', 2), [['aa', true], ['aaaa', false]],
+      '超过命中上限后剩余文本必须整段返回（连续命中并成一段，上限按命中次数计）')
+    assert.deepStrictEqual(splitHits('İİ', 'i', 1), [['İ', true], ['İ', false]],
+      '一字符摊成多个小写码元时，上限也要按命中次数收敛')
+  })
+
+  await aok('结构红线: v3.328 推送记录高亮（标题 / 正文 / 生效词 / 主题变量）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
+    const ph = (name) => '$' + '{' + name + '}'
+    const msg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('// 运行日志：'))
+    // 高亮词必须跟「当前显示的这一页数据」同源（queryUsed），不是最新 query、更不是输入框：
+    // 防抖提交新词后新响应还没回来时，旧卡片会被新词标错（Sourcery PR #291 的 stale 窗口）。
+    assert.ok(msg.includes("const hitKw = (data && typeof data.queryUsed === 'string' ? data.queryUsed : '').trim().toLowerCase()"),
+      '高亮词必须取服务端为这批结果回显的 queryUsed')
+    assert.ok(!msg.includes('const hitKw = query'), '高亮词不得取最新 query（旧卡片会被新词标错）')
+    assert.ok(!msg.includes('input.trim().toLowerCase()'), '高亮不得直接取输入框')
+    assert.ok(src.includes('const MSG_HIT_MAX = 200'), '单条记录命中上限必须登记（超长正文不卡展开）')
+    assert.ok(msg.includes('splitHits(text, hitKw, MSG_HIT_MAX).map(([part, on], i) => on ? html`<mark key=' +
+      ph('i') + '>' + ph('part') + '</mark>` : part)'), '命中片段必须用 <mark> 包文本节点（不拼 innerHTML），并带上命中上限')
+    assert.ok(msg.includes('$' + '{m.title ? hit(m.title) :'), '标题必须走命中高亮')
+    assert.ok(msg.includes('$' + '{m.content ? hit(m.content) :'), '展开后的正文也必须走同一高亮（服务端也按正文搜）')
+    assert.ok(!/innerHTML\s*=/.test(msg), '高亮不得拼 innerHTML（用户输入只能是文本节点）')
+    assert.ok(/\.msg-item mark\s*\{[^}]*var\(--warn-soft\)/.test(css), '卡片高亮底色必须走主题变量')
+    assert.ok(/\.msg-item mark\s*\{[^}]*color:\s*inherit/.test(css), '<mark> 不得把标题原色盖成浏览器默认黑字')
   })
 
   await aok('结构红线: v3.317 日志页（顺序 / 行级渲染 / <mark> / 护栏 / 空态出口 / 高度）', () => {
@@ -4930,7 +4969,7 @@ async function main () {
     // B. 行级渲染 + 高亮：一行一个节点、换行仍是真实 "\n"（复制/空行都不变）。
     assert.ok(src.includes('class=' + ph("'logline' + (tone ? ' logline-' + tone : '') + (isFocus ? ' logline-focus' : '')")), '日志必须逐行渲染并按级别着色')
     assert.ok(src.includes('}' + ph("i === last ? '' : '\\n'") + '</span>'), '行间必须仍是真实换行（只加 display:block 会丢换行）')
-    assert.ok(src.includes('splitLogHits(line, kwNow)') &&
+    assert.ok(src.includes('splitHits(line, kwNow)') &&
       src.includes('html`<mark key=' + ph('j') + '>' + ph('text') + '</mark>`'), '命中片段必须用 <mark> 包起来')
     assert.ok(!/innerHTML\s*=/.test(src), '高亮不得拼 innerHTML（用户输入只能是文本节点）')
     assert.ok(/\.logline-bad\s*\{[^}]*var\(--bad-fg\)/.test(css) && /\.logline-warn\s*\{[^}]*var\(--warn-fg\)/.test(css),
@@ -5460,9 +5499,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.327：注释里的版本号不得写下一版 v3.328。
-    assert.ok(!/v3\.328/.test(src), 'app.js 注释不得写 v3.328（版本未 bump）')
-    assert.ok(!/v3\.328/.test(css), 'app.css 注释不得写 v3.328（版本未 bump）')
+    // 版本已 bump 到 3.328：注释里的版本号不得写下一版 v3.329。
+    assert.ok(!/v3\.329/.test(src), 'app.js 注释不得写 v3.329（版本未 bump）')
+    assert.ok(!/v3\.329/.test(css), 'app.css 注释不得写 v3.329（版本未 bump）')
   })
 
   await aok('结构红线: v3.326 逐轮历史切档不闪（两档快照预取 / 无快照等数据回来再换）', () => {

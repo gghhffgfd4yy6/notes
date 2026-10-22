@@ -740,6 +740,9 @@
   .msg-item-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-2); }
   .msg-title { font-weight: 500; font-size: var(--fs-md); cursor: pointer; overflow-wrap: anywhere; word-break: normal; }
   .msg-title:hover { color: var(--accent); }
+  /* v3.328：搜索命中高亮（标题 / 正文）。与日志页同口径：--warn-soft 底 + --warn-line 内描边；
+     color: inherit 保证深色主题下标题原色不被浏览器默认的「黄底黑字」盖掉。 */
+  .msg-item mark { background: var(--warn-soft); color: inherit; border-radius: 2px; box-shadow: inset 0 0 0 1px var(--warn-line); }
   .msg-caret { color: var(--text-dim); margin-right: 6px; font-size: var(--fs-xs); }
   .msg-price { color: var(--ok-fg); font-weight: 600; font-family: var(--mono); font-size: var(--fs-sm); white-space: nowrap; }
   /* v3.317：原文链接是卡片里唯一的跳转入口，旧版点击区只有字高 ≈15px。视觉字号不变，
