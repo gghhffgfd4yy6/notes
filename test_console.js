@@ -4479,8 +4479,8 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
     assert.ok(logs.includes('if (pollMs) {'), '轮询间隔必须由 pollMs 控制')
-    assert.ok(logs.includes("const onVis = () => { if (document.visibilityState === 'visible') load()"),
-      '即使 pollMs=0 也要挂 visibilitychange 补拉')
+    assert.ok(logs.includes('usePullRefresh(active'),
+      '日志页必须接入全局补拉路径（回前台由 App 统一触发），不再自带 visibilitychange')
     const runs = src.slice(src.indexOf('function RunsPanel'), src.indexOf('// ── 组件：逐轮运行历史'))
     assert.ok(runs.includes("if (document.visibilityState === 'hidden') return"), '触发详情在后台必须跳过请求')
     assert.ok(runs.includes("document.addEventListener('visibilitychange', onVisibility)"), '切回前台必须补一拍')
@@ -4592,7 +4592,7 @@ async function main () {
       '窗口/标签栏尺寸变化后必须重新把当前页签滚进可视区（旋转屏不能停在裁剪边外）')
     const cache = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('// 推送记录：'))
     assert.ok(cache.includes('60000'), '缓存健康必须每分钟刷新')
-    assert.ok(cache.includes("document.addEventListener('visibilitychange', onVis)"), '切回前台要补拉缓存快照')
+    assert.ok(!cache.includes("addEventListener('visibilitychange'"), '切回前台补拉交给 App 统一路径，面板不得再自己挂（会重复请求）')
   })
 
   await aok('结构红线: 页签保活（切回已访问页签不重挂载、不塌陷、不重新占位）', () => {
@@ -5602,8 +5602,24 @@ async function main () {
     assert.ok(src.includes('window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail }))'), 'App 必须广播下拉刷新事件')
     assert.ok(src.includes('if (detail.waits.length === 0) return false'), '当前页没有面板接手时不得发全局请求，也不假装刷新')
     assert.ok(src.includes('Promise.resolve().then(onRefresh).then(settle'), '无面板接手时要立刻收起指示条（did === false）')
-    assert.ok(src.includes('refreshSplit({ force: true })'), '下拉必须绕过表单交互暂停')
-    assert.ok(src.includes('Promise.allSettled([refreshSplit({ force: true }), refreshAuto(), ...detail.waits])'), '必须等主轮询与所有面板一起落定')
+    assert.ok(src.includes('refreshSplit(force ? { force: true } : undefined)') && src.includes('refreshActive({ force: true })'), '下拉必须绕过表单交互暂停（回前台补拉不绕）')
+    assert.ok(src.includes('Promise.allSettled([refreshSplit(force ? { force: true } : undefined), refreshAuto(), ...detail.waits])'), '必须等主轮询与所有面板一起落定')
+    // ⑦ 长时间切后台再回来要静默补拉（不是每次切回来都拉，也不整页重载）。
+    assert.ok(src.includes('const VISIBLE_STALE_MS = 30000'), '回前台补拉必须有「离开多久才算过期」的阈值')
+    const recovery = src.slice(src.indexOf('// 回到前台：离开超过 VISIBLE_STALE_MS'), src.indexOf('const pull = usePullToRefresh'))
+    assert.ok(recovery.includes("document.addEventListener('visibilitychange', onVis)"), '回前台补拉必须真的挂上 visibilitychange 监听（只有回调函数不算）')
+    assert.ok(recovery.includes('if (Date.now() - lastRefreshRef.current < VISIBLE_STALE_MS) return'), '回前台补拉必须按距上次刷新判断，不能每次切回都发请求')
+    assert.ok(recovery.includes('refreshActive({ respectFormPause: true })'), '回前台补拉要走统一路径，且避开表单交互')
+    const refreshActiveBody = src.slice(src.indexOf('const refreshActive = useCallback'), src.indexOf('const pullRefresh = useCallback'))
+    assert.ok(refreshActiveBody.includes('lastRefreshRef.current = Date.now()'), '刷新成功必须推进时间戳（写在 refreshActive 内，别处的不算）')
+    assert.ok(refreshActiveBody.includes('if (ok) lastRefreshRef.current'), '失败的刷新不得推进时间戳，否则 30s 内不会再补')
+    assert.ok(refreshActiveBody.includes('formPauseUntilRef.current'), '回前台补拉必须在表单交互期间直接放弃')
+    assert.ok(src.includes('if (seq === autoSeqRef.current'), '自动运行状态响应要带序号守卫，旧响应不得覆盖新状态')
+    // 面板不得再自带 visibilitychange 补拉：会和 App 的回前台补拉重复请求。
+    const logsPanel = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function ConfigPanel'))
+    assert.ok(!/addEventListener\('visibilitychange'/.test(logsPanel), '日志页不得再自己挂 visibilitychange（会与回前台补拉重复请求）')
+    const cachePanel = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('function FilesPanel'))
+    assert.ok(!/addEventListener\('visibilitychange'/.test(cachePanel), '缓存健康不得再自己挂 visibilitychange（会与回前台补拉重复请求）')
     // ⑧ 整条下拉路径（手势 + App 回调）都不得整页重载。
     const gesture = src.slice(src.indexOf('function usePullToRefresh'), src.indexOf('function PullRefreshStatus'))
     const appPull = src.slice(src.indexOf('const pullRefresh = useCallback'), src.indexOf('const pull = usePullToRefresh'))

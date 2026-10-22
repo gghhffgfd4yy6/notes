@@ -2207,6 +2207,9 @@ const PULL_EVENT = 'xbk-pull-refresh'
 const PULL_TRIGGER = 56 // 松手阈值（CSS px，手指位移按 0.5 倍阻尼折算）
 const PULL_MAX = 84
 const PULL_MIN_BUSY_MS = 450 // 再快也让「正在刷新…」停留一下，避免又变成一闪
+// 切后台/锁屏/切走 App 很久再回来：页面里的数据已经过期了，但浏览器不会替我们重拉。
+// 回到前台时若距上次刷新超过这个间隔，就静默补一轮（不显示「正在刷新…」，不重建页面）。
+const VISIBLE_STALE_MS = 30000
 
 // 面板侧：当前页签激活时订阅全局下拉刷新，把自己的 loader 交给 App 一起等。
 // 用 ref 存 loader，避免每次渲染换函数导致反复重订阅。
@@ -2471,9 +2474,9 @@ function CacheHealthPanel ({ paused = false, active = true }) {
       filesLoader.load().catch(() => {})
     }
     const t = setInterval(() => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }, 60000)
-    const onVis = () => { if (document.visibilityState === 'visible') load().catch(() => {}) }
-    document.addEventListener('visibilitychange', onVis)
-    return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVis) }
+    // 切回前台不再自己补拉：App 的「回前台补拉」（VISIBLE_STALE_MS）会经下拉事件
+    // 通知当前页签的面板，这里再挂一个就会被拉两次（Sourcery PR #300）。
+    return () => clearInterval(t)
   }, [load, paused, filesLoader.load])
   // 下拉刷新：健康面板与右列文件清单一起重拉（两者都返回 promise）。
   // 认 active 不认 paused：暂停自动刷新时手动下拉照样要能刷。
@@ -3258,21 +3261,14 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
       load(true).catch(() => {})
     }
     if (!active) return undefined
-    // 页面在后台时不轮询（切回前台立即补一次）：控制台常驻标签页也不该整夜每 5s 读盘。
-    // 即使 pollMs=0（空闲时不自动轮询），也要挂 visibilitychange——后台期间跑完的任务
-    // 会在切回时补一次，不会停留在旧快照。
-    // 保活后离开本页即清掉监听与定时器：隐藏的日志页不跟着刷。
+    // 页面在后台时不轮询（切回前台由 App 统一补拉）：控制台常驻标签页也不该整夜每 5s 读盘。
+    // 保活后离开本页即清掉定时器：隐藏的日志页不跟着刷。
     let t = null
     if (pollMs) {
       const tick = () => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }
       t = setInterval(tick, pollMs)
     }
-    const onVis = () => { if (document.visibilityState === 'visible') load().catch(() => {}) }
-    document.addEventListener('visibilitychange', onVis)
-    return () => {
-      if (t !== null) clearInterval(t)
-      document.removeEventListener('visibilitychange', onVis)
-    }
+    return () => { if (t !== null) clearInterval(t) }
   }, [load, pollMs, active])
   const rawText = data && data.status === 'ok' && typeof data.text === 'string' ? data.text : ''
   // 1 MiB 文本的 split/lowercase 只在输入变化时做一次（审查 #248 可选：此前每次渲染
@@ -4555,6 +4551,8 @@ function App () {
   // activeElement：用户选完下拉后焦点仍停在 select 上，会永久冻住自动刷新。
   const formPauseUntilRef = useRef(0)
   const timerRef = useRef(null)
+  // 最近一次「数据真的刷新过」的时间：回前台补拉、轮询、下拉都更新它。
+  const lastRefreshRef = useRef(Date.now())
   const tabsRef = useRef(null)
   // 标签栏边缘渐隐状态（v3.317）：'' | 'left' | 'right' | 'both'。只在真的溢出时挂
   // data-edge，362 宽（6 个页签全部放得下）保持零遮罩——否则最后一格会被误读成被裁掉。
@@ -4846,11 +4844,11 @@ function App () {
   const refreshSplit = useCallback(async (opts = {}) => {
     // 表单交互暂停期间不发起刷新；已在途的响应也会在下方 apply 前被丢弃。
     // 下拉刷新是明确的手势意图，传 { force: true } 跨过这段暂停。
-    if (!(opts && opts.force) && Date.now() < formPauseUntilRef.current) return
+    if (!(opts && opts.force) && Date.now() < formPauseUntilRef.current) return false
     if (inFlightRef.current) {
       // 切回概览时若上一轮还在路上，标记一次补刷，等 finally 再跑。
       pendingRefreshRef.current = true
-      return
+      return false
     }
     inFlightRef.current = true
     const seq = ++seqRef.current
@@ -4882,10 +4880,12 @@ function App () {
         errs.push(`历史 ${rRes.reason && rRes.reason.message ? rRes.reason.message : rRes.reason}`)
         if (seq === seqRef.current) setRunsState((s) => (s === 'ok' ? 'ok' : 'error'))
       }
-      if (seq !== seqRef.current || paused()) return
+      if (seq !== seqRef.current || paused()) return false
       refreshedOnceRef.current = true
       if (errs.length > 0) setSyncErr(`刷新失败：${errs.join('；')}（自动重试中）`)
       else setSyncErr('')
+      // 只有两边都落定才算「刷新成功」：调用方（回前台补拉）据此决定要不要推进时间戳。
+      return errs.length === 0
     } finally {
       inFlightRef.current = false
       if (pendingRefreshRef.current) {
@@ -4958,11 +4958,10 @@ function App () {
     }
     timerRef.current = setInterval(tick, interval)
     mark()
+    // 回前台一律交给「回前台补拉」统一判断（>VISIBLE_STALE_MS 才拉）：
+    // 这里只把下一拍的时间重排，避免刚回来就立刻又打一发。
     const onVis = () => {
-      if (document.visibilityState !== 'visible') return
-      if (Date.now() < formPauseUntilRef.current) return
-      refreshSplit()
-      mark()
+      if (document.visibilityState === 'visible') mark()
     }
     document.addEventListener('visibilitychange', onVis)
     return () => {
@@ -5047,23 +5046,48 @@ function App () {
     refreshSplit()
   }, [refreshSplit])
 
+  const autoSeqRef = useRef(0)
   const refreshAuto = useCallback(async () => {
+    const seq = ++autoSeqRef.current
     try {
       const data = await apiGetAuto()
-      if (data && data.auto) setAutoState(data.auto)
+      // 乱序响应：回前台补拉比先前的轮询更晚发出时，旧响应不得覆盖新状态。
+      if (seq === autoSeqRef.current && data && data.auto) setAutoState(data.auto)
     } catch (e) { /* 轮询失败保留上次状态；401 由全局事件处理 */ }
   }, [])
 
   // 下拉刷新（v3.330）：不出页面、不重建 DOM。先广播给当前页签的面板收集各自 loader，
   // 再等主轮询（状态+轮次）、自动运行状态与所有面板一起落定，指示条才收起。
-  const pullRefresh = useCallback(async () => {
+  const refreshActive = useCallback(async (opts = {}) => {
+    const force = opts.force === true
+    // 回前台补拉要避开表单交互（原生下拉展开时整页重渲染会卡住选择器）；
+    // 下拉手势是明确意图，传 force 跨过这段暂停。
+    if (opts.respectFormPause && Date.now() < formPauseUntilRef.current) return false
     const detail = { waits: [] }
     window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail }))
     // 没有任何面板接手（如过滤规则页有未保存改动）：连全局请求也不发，下拉就当无事。
     if (detail.waits.length === 0) return false
-    await Promise.allSettled([refreshSplit({ force: true }), refreshAuto(), ...detail.waits])
-    return true
+    const [sRes] = await Promise.allSettled([refreshSplit(force ? { force: true } : undefined), refreshAuto(), ...detail.waits])
+    const ok = sRes.status === 'fulfilled' && sRes.value === true
+    // 失败不推进时间戳：否则接下来 30s 内都不会再补，数据一直停在旧值。
+    if (ok) lastRefreshRef.current = Date.now()
+    return ok
   }, [refreshSplit, refreshAuto])
+  const pullRefresh = useCallback(() => refreshActive({ force: true }), [refreshActive])
+  // 回到前台：离开超过 VISIBLE_STALE_MS 就静默补一次（走和下拉完全相同的刷新路径，
+  // 当前页签的面板自己决定拉什么；有未保存草稿时它们不接，这里也就什么都不发）。
+  useEffect(() => {
+    // 注意：暂停自动刷新只是停轮询。这里是一次性的「回来补一刀」，不受暂停影响——
+    // 用户切回来最想看到的就是最新数据，而不是「已暂停」四个字。
+    if (authExpired) return undefined
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return
+      if (Date.now() - lastRefreshRef.current < VISIBLE_STALE_MS) return
+      refreshActive({ respectFormPause: true }).catch(() => {})
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => document.removeEventListener('visibilitychange', onVis)
+  }, [refreshActive, authExpired])
   const pull = usePullToRefresh(pullRefresh, !authExpired)
   // 手机窄屏 .sync 是横向可滚动的：用户把它滑到右边时，行内状态会被裁在视口外。
   // 下拉一开始就把它滚回最左（状态就在第一个位置），保证反馈看得见。
