@@ -126,10 +126,10 @@ export function logLineTone (line) {
   return ''
 }
 
-// 把一行按关键字切成 [文本, 是否命中] 片段，交给 <mark> 渲染（v3.317）。
+// 把一段文本按关键字切成 [文本, 是否命中] 片段，交给 <mark> 渲染（v3.317 日志行、v3.328 推送记录标题/正文共用）。
 // 大小写不敏感，但绝不拼 innerHTML——用户输入只作为文本节点插入（XSS 面为零）。
-// 少数 Unicode（如 'İ'）小写后长度会变、索引与原文对不上，此时整行不切（不猜位置）。
-export function splitLogHits (line, kw) {
+// 少数 Unicode（如 'İ'）小写后长度会变、索引与原文对不上，此时整段不切（不猜位置）。
+export function splitHits (line, kw) {
   if (typeof line !== 'string' || line.length === 0 || kw === '') return [[line, false]]
   const lower = line.toLowerCase()
   if (lower.length !== line.length) return [[line, false]]
