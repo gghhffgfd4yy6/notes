@@ -787,6 +787,11 @@
   .msg-link:hover { text-decoration: underline; }
   .pager { display: flex; align-items: center; gap: 10px; justify-content: center; margin-top: 14px; flex-wrap: wrap; }
   .pager-info { color: var(--text-dim); font-size: 12.5px; }
+  /* 分页禁用态保留整块轮廓（v3.339）：全局 .45 在浅色主题下会把整个按钮洗成
+     白底，第 1 页只有右两个按钮可见，翻到第 2 页时左两个像凭空出现（手机截图
+     实测）。只轻压透明度：底色/边框/尺寸不变，翻页时这一行不跳。
+     四个按钮仍带 || loading（防连点），加载中同样只是轻微变淡。 */
+  .pager .btn:disabled { opacity: .7; }
 
   /* ── 逐轮历史筛选（v3.307）── */
   .run-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: var(--sp-2); }
