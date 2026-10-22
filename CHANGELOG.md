@@ -712,3 +712,9 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **新增**：系统信息「脚本版本」那一行加「检查更新」按钮。点一下走 `GET /api/sys?probe=version`（no-store），把服务端版本和页面启动版本 `BOOT.version` 对比：不一致就显示「发现 vX，正在刷新…」并在 600ms 后整页刷新；一致显示「已是最新」，2.5s 后收起；请求失败显示「检查失败」。
 - **不动宽度**：按钮文案恒为「检查更新」，状态另起一个 `.ver-state` 文本，不重演「刷新 → 刷新中…」的宽度跳动。
 - **门禁**：`test_console.js` 锁定探针参数、`BOOT.version` 比对、`location.reload()`、按钮固定文案与样式存在。
+
+## v3.336 — 系统信息「版本行」不再挤成一团
+
+- **现象**：360 宽真机上「已是最新」被按字拆成「已是 / 最新」，后半截掉到下一行最左，和版本的按钮挤在一起，很难看。原因是 `td:last-child` 带 `overflow-wrap: anywhere`，中文可以逐字断行，而按钮和状态又是行内元素。
+- **修复**：版本号 / 按钮 / 状态包进 `.ver-line`（`display:flex; flex-wrap:wrap; gap:6px 8px`），状态加 `white-space: nowrap` 并做成小胶囊（`.ver-state` 带底色）。窄屏放不下时整块换行，不再断字。
+- **门禁**：`test_console.js` 锁定 `.ver-line` 容器与 `.ver-state` 的 `white-space: nowrap`。

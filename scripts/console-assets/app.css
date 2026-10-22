@@ -842,12 +842,15 @@
   .sys-table td:first-child { color: var(--text-dim); width: 38%; }
   .sys-table td:last-child { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; word-break: normal; }
   /* v3.335：脚本版本旁的就地检查更新（页内下拉只换数据，换脚本必须整页刷新）。 */
-  .ver-check { margin-left: 8px; font-family: inherit; font-size: 12px; padding: 4px 10px; min-height: 36px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2); color: var(--text); cursor: pointer; }
+  /* v3.336：版本行固定一行——版本号 + 一个按钮。状态写在按钮自己身上
+     （检查更新 → ✓ 已是最新），不再多一个悬空的小胶囊，也不会把行撑高。 */
+  .ver-line { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12.5px; }
+  .ver-num { white-space: nowrap; }
+  .ver-check { font-family: inherit; font-size: 12px; padding: 4px 10px; min-height: 36px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2); color: var(--text); cursor: pointer; white-space: nowrap; }
   .ver-check:disabled { opacity: .6; cursor: default; }
-  .ver-state { margin-left: 8px; font-family: inherit; font-size: 12px; }
-  .ver-state.ok { color: var(--ok-fg); }
-  .ver-state.warn { color: var(--accent); }
-  .ver-state.bad { color: var(--bad-fg); }
+  .ver-check.ok { color: var(--ok-fg); border-color: var(--ok-line); background: var(--ok-soft); }
+  .ver-check.warn { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+  .ver-check.bad { color: var(--bad-fg); border-color: var(--bad-line); background: var(--bad-soft); }
   .sys-table.compact td { padding: 4px var(--sp-1); font-size: var(--fs-xs); }
   /* 系统页“最近访问记录”是 details/summary：默认 summary 只有 21px 高、无点击感，
      手机触控高度补到 44px，展开后与表格留出间距（审查 #254 复核）。 */
@@ -1026,6 +1029,7 @@
     /* 触控尺寸只抬高度；整行宽度只给手动触发的竖排按钮，别把表头/分页里的按钮也拉满 */
     .btn { min-height: 44px; }
     .ver-check { min-height: 44px; }
+    .ver-line { gap: 8px; }
     .btn-item .btn { width: 100%; }
     .auto-run-row { gap: 8px; }
     .auto-step { width: 44px; height: 44px; }
