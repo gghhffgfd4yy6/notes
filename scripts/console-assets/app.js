@@ -2998,11 +2998,13 @@ function MessagesPanel ({ onSync, active = true }) {
   // disabled 会把按钮压到 0.45 透明度再弹回来，这就是那下闪。改成只在慢加载时禁用。
   const busyRef = useRef(false)
   const refreshNow = () => {
-    if (busyRef.current) return
+    // 搜索词先落地：请求在飞时改词 + 回车不能被节流到 300ms 后再发。
     const q = input.trim()
     if (q !== query) { armLand(); setQuery(q); setPage(1); return }
+    // loading 覆盖自动刷新/下拉刷新发起的请求，busyRef 挡同一 tick 的连点。
+    if (loading || busyRef.current) return
     busyRef.current = true
-    Promise.resolve(load()).catch(() => {}).finally(() => { busyRef.current = false })
+    load().catch(() => {}).finally(() => { busyRef.current = false })
   }
   const [exporting, setExporting] = useState('') // '' | 'csv' | 'json'：加载态防连点（两按钮共用一闸）
   const [exportErr, setExportErr] = useState('')
