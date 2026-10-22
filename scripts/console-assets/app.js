@@ -3452,6 +3452,31 @@ function SysPanel ({ onReady, active = true }) {
   // 保活后 data 不会清空，ready 也一直为真：必须等同一次刷新里的两个请求都结算，
   // 才能报「数据截至」；只跟其中一个会在访问日志还是旧快照时提前更新时间（Sourcery #272）。
   const { data: sys, err, load } = usePanelLoader(apiGetSys)
+  // v3.335：系统页「检查更新」——页内下拉只刷数据、不换脚本，旧标签页得有个就地入口。
+  // 比对的是页面启动版本（BOOT.version）与服务端当前版本；不一致就刷新整页。
+  const [verState, setVerState] = useState('') // '' | 'checking' | 'latest' | 'stale' | 'error'
+  const [staleVer, setStaleVer] = useState('')
+  const verTimerRef = useRef(0)
+  useEffect(() => () => clearTimeout(verTimerRef.current), [])
+  const checkVersion = () => {
+    if (verState === 'checking') return
+    clearTimeout(verTimerRef.current)
+    setVerState('checking')
+    apiGetSys({ probeVersion: true }).then((s) => {
+      const v = s && typeof s.version === 'string' ? s.version : ''
+      if (v !== '' && v !== BOOT.version) {
+        setStaleVer(v)
+        setVerState('stale')
+        verTimerRef.current = setTimeout(() => window.location.reload(), 600)
+        return
+      }
+      setVerState('latest')
+      verTimerRef.current = setTimeout(() => setVerState(''), 2500)
+    }).catch(() => {
+      setVerState('error')
+      verTimerRef.current = setTimeout(() => setVerState(''), 2500)
+    })
+  }
   const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog)
   const [readyTick, setReadyTick] = useState(0)
   const seenRef = useRef(null)
@@ -3509,7 +3534,7 @@ function SysPanel ({ onReady, active = true }) {
     ${err && html`<${Hint} tone="error">${err}<//>`}
     <div class="sys-grid">
       <table class="sys-table"><tbody>
-        <tr><td>脚本版本</td><td>${info.version ? `v${info.version}` : '—'}</td></tr>
+        <tr><td>脚本版本</td><td>${info.version ? `v${info.version}` : '—'}<button type="button" class="ver-check" disabled=${verState === 'checking'} onClick=${checkVersion}>检查更新</button>${verState === 'latest' ? html`<span class="ver-state ok">已是最新</span>` : ''}${verState === 'stale' ? html`<span class="ver-state warn">发现 v${staleVer}，正在刷新…</span>` : ''}${verState === 'error' ? html`<span class="ver-state bad">检查失败</span>` : ''}</td></tr>
         <tr><td>Node.js</td><td>${info.node || '—'}</td></tr>
         <tr><td>平台</td><td>${info.platform || '—'}</td></tr>
       </tbody></table>
