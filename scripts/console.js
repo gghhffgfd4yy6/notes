@@ -2923,10 +2923,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       try {
         const status = res.statusCode
         if (status === 401) unauthorizedCount++ // 环形外的独立计数器（蓝图：401 全记且单独计数）
-        // v3.330：每 60s 一次的版本探针（?probe=version）200 不入环形——否则一个前台标签页
+        // v3.332：每 60s 一次的版本探针（?probe=version）200 不入环形——否则一个前台标签页
         // 一分钟一条，三小时就把 200 条真实请求历史挤干净（Sourcery #294）。401 等异常照记。
-        const versionProbe = url !== undefined && url !== null &&
-          url.pathname === '/api/sys' && url.searchParams.get('probe') === 'version' && status === 200
+        const versionProbe = url && url.pathname === '/api/sys' &&
+          url.searchParams.get('probe') === 'version' && status === 200
         if (!versionProbe && (url ? shouldLogAccess(req.method, url.pathname, status) : true)) {
           accessLog.push({
             at: accessStamp(),
@@ -3406,7 +3406,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 系统信息：版本四方来源 package.json（与 check-version.js 的唯一真源一致）+
       // 进程/宿主只读信息。不暴露路径之外的任何环境变量（token 等凭证绝不入响应）。
       const version = APP_VERSION
-      // v3.330：显式禁缓存。版本对账拿不到「现在的」版本就永远提示不了刷新，
+      // v3.331：显式禁缓存。版本对账拿不到「现在的」版本就永远提示不了刷新，
       // 不能被浏览器/代理的启发式缓存喂旧值（Sourcery #294）。
       res.setHeader('Cache-Control', 'no-store')
       let rss = 0

@@ -323,7 +323,7 @@ function apiGetLogs () {
   return consumeJson(fetch('/api/logs', merged), done)
 }
 
-// v3.330：版本探针走 ?probe=version——服务端据此不把它记进访问日志（60s 一条会挤掉真实历史）；
+// v3.332：版本探针走 ?probe=version——服务端据此不把它记进访问日志（60s 一条会挤掉真实历史）；
 // 同时 no-store，防代理/浏览器启发式缓存把旧版本喂回来，让「有新版本」永远判不出来。
 function apiGetSys ({ probeVersion = false } = {}) {
   const { merged, done } = timedRequest({
