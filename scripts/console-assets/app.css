@@ -842,7 +842,7 @@
   .sys-table td:first-child { color: var(--text-dim); width: 38%; }
   .sys-table td:last-child { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; word-break: normal; }
   /* v3.335：脚本版本旁的就地检查更新（页内下拉只换数据，换脚本必须整页刷新）。 */
-  .ver-check { margin-left: 8px; font-family: inherit; font-size: 12px; padding: 3px 9px; min-height: 30px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2); color: var(--text); cursor: pointer; }
+  .ver-check { margin-left: 8px; font-family: inherit; font-size: 12px; padding: 4px 10px; min-height: 36px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2); color: var(--text); cursor: pointer; }
   .ver-check:disabled { opacity: .6; cursor: default; }
   .ver-state { margin-left: 8px; font-family: inherit; font-size: 12px; }
   .ver-state.ok { color: var(--ok-fg); }
@@ -1025,6 +1025,7 @@
     .tabs::-webkit-scrollbar { display: none; }
     /* 触控尺寸只抬高度；整行宽度只给手动触发的竖排按钮，别把表头/分页里的按钮也拉满 */
     .btn { min-height: 44px; }
+    .ver-check { min-height: 44px; }
     .btn-item .btn { width: 100%; }
     .auto-run-row { gap: 8px; }
     .auto-step { width: 44px; height: 44px; }
