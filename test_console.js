@@ -4583,10 +4583,24 @@ async function main () {
     assert.ok(!src.includes('<span class="name">') && !/\.brand\s*\{/.test(css),
       '页面里不得再渲染控制台名字（品牌行已去掉）')
     const metaRule = (css.match(/\.sync-meta\s*\{[^}]*\}/) || [''])[0]
-    assert.ok(src.includes('<span class="sync-meta">') && /text-overflow:\s*ellipsis/.test(metaRule),
-      '刷新/数据截止文案必须包在可省略的 sync-meta 里，长文案不能把按钮挤走')
-    assert.ok(css.includes('.sync-fail {') && src.includes('class="sync-fail"'),
-      '刷新失败必须单独成行（挤在一行里会被省略号吃掉）')
+    // 省略号三件套缺一不可：只写 text-overflow 而没有 overflow:hidden/nowrap 时，
+    // 文本会换行或被裁掉而不是出省略号（Sourcery #301）。
+    const metaOk = /text-overflow:\s*ellipsis/.test(metaRule) && /overflow:\s*hidden/.test(metaRule) &&
+      /white-space:\s*nowrap/.test(metaRule)
+    assert.ok(src.includes('<span class="sync-meta">') && metaOk,
+      'sync-meta 必须 ellipsis + overflow:hidden + nowrap，长文案才真的收省略号')
+    // 失败整句必须在 .sync 之外（同步容器里的第一个 </div> 之后、</header> 之前）：
+    // 只看 class 是否存在的话，挪回行内照样绿（Sourcery #301）。
+    const syncOpen = src.indexOf('class="sync"')
+    const syncClose = src.indexOf('</div>', syncOpen)
+    const failAt = src.indexOf('class="sync-fail"')
+    const headerEnd = src.indexOf('</header>', syncOpen)
+    assert.ok(css.includes('.sync-fail {') && failAt > syncClose && failAt < headerEnd,
+      '刷新失败必须渲染在 .sync 之外、header 之内（挤在行内会被省略号吃掉）')
+    // 按钮不能被压缩或换行：窄屏时让位的是中间文本，不是「暂停」。
+    const toggleRule = (css.match(/\.sync-toggle\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/flex:\s*0 0 auto/.test(toggleRule) && /white-space:\s*nowrap/.test(toggleRule),
+      'sync-toggle 必须 flex:0 0 auto + nowrap，否则窄屏会被压缩换行')
     assert.ok(/white-space:\s*nowrap/.test(syncPhone) && /min-height:\s*24px/.test(syncPhone),
       '手机端 sync 必须单行 + 固定行高，文字长短不能改高度')
     assert.ok(/class="sync"[^>]*tabindex="0"/.test(src),

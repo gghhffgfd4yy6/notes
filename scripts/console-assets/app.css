@@ -285,14 +285,16 @@
      收成省略号，两侧按钮永不换行、也不会被挤出屏幕。 */
   .topbar { display: flex; flex-direction: column; gap: 4px; margin-bottom: var(--sp-4); }
   .sync { color: var(--text-dim); font-size: var(--fs-xs); display: flex; align-items: center; gap: 8px;
-    flex-wrap: nowrap; min-width: 0; min-height: 24px; }
+    flex-wrap: nowrap; min-width: 0; min-height: 24px; overflow: hidden; }
   .sync > .badge { flex: 0 0 auto; white-space: nowrap; }
   .sync-meta { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* 刷新失败的整句（含原因）单独一行：挤在一行里会被省略号吃掉，反而是最该看的字没了。 */
   .sync-fail { color: var(--warn-fg); font-size: var(--fs-xs); line-height: 1.5; overflow-wrap: anywhere; }
+  /* 按钮永不被压缩/换行：窄屏时该让位的是中间那段文本（省略号），不是「暂停」。 */
   .sync-toggle {
     border: 1px solid var(--border); background: var(--panel-2); color: var(--text-dim);
     border-radius: var(--r-pill); padding: 1px 8px; font-size: var(--fs-2xs); cursor: pointer; min-height: 24px;
+    flex: 0 0 auto; white-space: nowrap;
   }
   .sync-toggle:hover { color: var(--text); border-color: var(--accent-line); }
   /* 主题键（v3.323）：跟「数据截至」同一行，窄屏不换行、不把行撑高（与「暂停」同尺寸）。 */
