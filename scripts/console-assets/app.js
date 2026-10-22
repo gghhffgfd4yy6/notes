@@ -2474,9 +2474,9 @@ function CacheHealthPanel ({ paused = false, active = true }) {
       filesLoader.load().catch(() => {})
     }
     const t = setInterval(() => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }, 60000)
-    const onVis = () => { if (document.visibilityState === 'visible') load().catch(() => {}) }
-    document.addEventListener('visibilitychange', onVis)
-    return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVis) }
+    // 切回前台不再自己补拉：App 的「回前台补拉」（VISIBLE_STALE_MS）会经下拉事件
+    // 通知当前页签的面板，这里再挂一个就会被拉两次（Sourcery PR #300）。
+    return () => clearInterval(t)
   }, [load, paused, filesLoader.load])
   // 下拉刷新：健康面板与右列文件清单一起重拉（两者都返回 promise）。
   // 认 active 不认 paused：暂停自动刷新时手动下拉照样要能刷。
@@ -3261,21 +3261,14 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
       load(true).catch(() => {})
     }
     if (!active) return undefined
-    // 页面在后台时不轮询（切回前台立即补一次）：控制台常驻标签页也不该整夜每 5s 读盘。
-    // 即使 pollMs=0（空闲时不自动轮询），也要挂 visibilitychange——后台期间跑完的任务
-    // 会在切回时补一次，不会停留在旧快照。
-    // 保活后离开本页即清掉监听与定时器：隐藏的日志页不跟着刷。
+    // 页面在后台时不轮询（切回前台由 App 统一补拉）：控制台常驻标签页也不该整夜每 5s 读盘。
+    // 保活后离开本页即清掉定时器：隐藏的日志页不跟着刷。
     let t = null
     if (pollMs) {
       const tick = () => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }
       t = setInterval(tick, pollMs)
     }
-    const onVis = () => { if (document.visibilityState === 'visible') load().catch(() => {}) }
-    document.addEventListener('visibilitychange', onVis)
-    return () => {
-      if (t !== null) clearInterval(t)
-      document.removeEventListener('visibilitychange', onVis)
-    }
+    return () => { if (t !== null) clearInterval(t) }
   }, [load, pollMs, active])
   const rawText = data && data.status === 'ok' && typeof data.text === 'string' ? data.text : ''
   // 1 MiB 文本的 split/lowercase 只在输入变化时做一次（审查 #248 可选：此前每次渲染
@@ -4851,11 +4844,11 @@ function App () {
   const refreshSplit = useCallback(async (opts = {}) => {
     // 表单交互暂停期间不发起刷新；已在途的响应也会在下方 apply 前被丢弃。
     // 下拉刷新是明确的手势意图，传 { force: true } 跨过这段暂停。
-    if (!(opts && opts.force) && Date.now() < formPauseUntilRef.current) return
+    if (!(opts && opts.force) && Date.now() < formPauseUntilRef.current) return false
     if (inFlightRef.current) {
       // 切回概览时若上一轮还在路上，标记一次补刷，等 finally 再跑。
       pendingRefreshRef.current = true
-      return
+      return false
     }
     inFlightRef.current = true
     const seq = ++seqRef.current
@@ -4887,10 +4880,12 @@ function App () {
         errs.push(`历史 ${rRes.reason && rRes.reason.message ? rRes.reason.message : rRes.reason}`)
         if (seq === seqRef.current) setRunsState((s) => (s === 'ok' ? 'ok' : 'error'))
       }
-      if (seq !== seqRef.current || paused()) return
+      if (seq !== seqRef.current || paused()) return false
       refreshedOnceRef.current = true
       if (errs.length > 0) setSyncErr(`刷新失败：${errs.join('；')}（自动重试中）`)
       else setSyncErr('')
+      // 只有两边都落定才算「刷新成功」：调用方（回前台补拉）据此决定要不要推进时间戳。
+      return errs.length === 0
     } finally {
       inFlightRef.current = false
       if (pendingRefreshRef.current) {
@@ -4957,21 +4952,16 @@ function App () {
         // （mark 会 setNextAt 触发 App 重渲染，安卓原生 select 仍可能被重建）。
         // 截止时间到后自动恢复，不会因为焦点一直停在 select 上而永久停轮。
         if (Date.now() < formPauseUntilRef.current) return
-        lastRefreshRef.current = Date.now()
         refreshSplit()
         mark()
       }
     }
     timerRef.current = setInterval(tick, interval)
     mark()
+    // 回前台一律交给「回前台补拉」统一判断（>VISIBLE_STALE_MS 才拉）：
+    // 这里只把下一拍的时间重排，避免刚回来就立刻又打一发。
     const onVis = () => {
-      if (document.visibilityState !== 'visible') return
-      if (Date.now() < formPauseUntilRef.current) return
-      // 离开很久（超过 VISIBLE_STALE_MS）：交给统一的「回前台补拉」，
-      // 那边会把当前页签的面板一起拉了，这里不重复发。
-      if (Date.now() - lastRefreshRef.current >= VISIBLE_STALE_MS) return
-      refreshSplit()
-      mark()
+      if (document.visibilityState === 'visible') mark()
     }
     document.addEventListener('visibilitychange', onVis)
     return () => {
@@ -5056,25 +5046,34 @@ function App () {
     refreshSplit()
   }, [refreshSplit])
 
+  const autoSeqRef = useRef(0)
   const refreshAuto = useCallback(async () => {
+    const seq = ++autoSeqRef.current
     try {
       const data = await apiGetAuto()
-      if (data && data.auto) setAutoState(data.auto)
+      // 乱序响应：回前台补拉比先前的轮询更晚发出时，旧响应不得覆盖新状态。
+      if (seq === autoSeqRef.current && data && data.auto) setAutoState(data.auto)
     } catch (e) { /* 轮询失败保留上次状态；401 由全局事件处理 */ }
   }, [])
 
   // 下拉刷新（v3.330）：不出页面、不重建 DOM。先广播给当前页签的面板收集各自 loader，
   // 再等主轮询（状态+轮次）、自动运行状态与所有面板一起落定，指示条才收起。
-  const refreshActive = useCallback(async () => {
+  const refreshActive = useCallback(async (opts = {}) => {
+    const force = opts.force === true
+    // 回前台补拉要避开表单交互（原生下拉展开时整页重渲染会卡住选择器）；
+    // 下拉手势是明确意图，传 force 跨过这段暂停。
+    if (opts.respectFormPause && Date.now() < formPauseUntilRef.current) return false
     const detail = { waits: [] }
     window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail }))
     // 没有任何面板接手（如过滤规则页有未保存改动）：连全局请求也不发，下拉就当无事。
     if (detail.waits.length === 0) return false
-    await Promise.allSettled([refreshSplit({ force: true }), refreshAuto(), ...detail.waits])
-    lastRefreshRef.current = Date.now()
-    return true
+    const [sRes] = await Promise.allSettled([refreshSplit(force ? { force: true } : undefined), refreshAuto(), ...detail.waits])
+    const ok = sRes.status === 'fulfilled' && sRes.value === true
+    // 失败不推进时间戳：否则接下来 30s 内都不会再补，数据一直停在旧值。
+    if (ok) lastRefreshRef.current = Date.now()
+    return ok
   }, [refreshSplit, refreshAuto])
-  const pullRefresh = useCallback(() => refreshActive(), [refreshActive])
+  const pullRefresh = useCallback(() => refreshActive({ force: true }), [refreshActive])
   // 回到前台：离开超过 VISIBLE_STALE_MS 就静默补一次（走和下拉完全相同的刷新路径，
   // 当前页签的面板自己决定拉什么；有未保存草稿时它们不接，这里也就什么都不发）。
   useEffect(() => {
@@ -5084,7 +5083,7 @@ function App () {
     const onVis = () => {
       if (document.visibilityState !== 'visible') return
       if (Date.now() - lastRefreshRef.current < VISIBLE_STALE_MS) return
-      refreshActive().catch(() => {})
+      refreshActive({ respectFormPause: true }).catch(() => {})
     }
     document.addEventListener('visibilitychange', onVis)
     return () => document.removeEventListener('visibilitychange', onVis)
