@@ -43,6 +43,8 @@ const POLL_MS = 5000
 const POLL_BUSY_MS = 2000
 // 部署后旧标签页仍跑旧脚本（数据照常轮询，看起来「在线」却看不到新 UI）。每 60s 对一次
 // /api/sys 的版本，不一致就挂一条「刷新后生效」的提示——不自动 reload，避免打断正在填的表单。
+// 边界（Sourcery #294）：只覆盖本版之后打开的页面。部署那一刻已经开着的旧页拿不到这段代码，
+// 服务端也无法给旧页注入逻辑——那些页仍需手动刷一次；此后每次部署都有提示。
 const VERSION_CHECK_MS = 60000
 // 提交成功后按钮锁定的最长兜底时长（Sourcery vwU/vv2：轮询竞态/请求挂起时不能永久锁死；
 // 上限 = 服务端 PROC_TIMEOUT_MS(10min) + 提交往返余量，取 11 分钟）。
@@ -321,11 +323,14 @@ function apiGetLogs () {
   return consumeJson(fetch('/api/logs', merged), done)
 }
 
-function apiGetSys () {
+// v3.332：版本探针走 ?probe=version——服务端据此不把它记进访问日志（60s 一条会挤掉真实历史）；
+// 同时 no-store，防代理/浏览器启发式缓存把旧版本喂回来，让「有新版本」永远判不出来。
+function apiGetSys ({ probeVersion = false } = {}) {
   const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` },
+    ...(probeVersion ? { cache: 'no-store' } : {})
   })
-  return consumeJson(fetch('/api/sys', merged), done)
+  return consumeJson(fetch(probeVersion ? '/api/sys?probe=version' : '/api/sys', merged), done)
 }
 
 // 服务器端自动运行：GET 读状态；POST 开关/改间隔（写面只认 Bearer）。
@@ -4457,29 +4462,32 @@ function App () {
   // 凭证失效（审查 #224）：任一 API 401 ⇒ 停轮询并显示自助恢复提示，不再每 5s 空打。
   const [authExpired, setAuthExpired] = useState(false)
   const [nextAt, setNextAt] = useState(0)
-  // v3.329：部署后旧标签页仍在跑旧脚本，数据轮询却照常更新 ⇒ 用户以为「改了没生效」。
+  // v3.332：部署后旧标签页仍在跑旧脚本，数据轮询却照常更新 ⇒ 用户以为「改了没生效」。
   // boot 里带页面启动版本；每 60s 与 /api/sys 对一次，不一致就提示刷新。
   const [newVersion, setNewVersion] = useState('')
   useEffect(() => {
     const bootVersion = BOOT.version
-    if (bootVersion === '') return undefined
+    // 凭证失效后不再探针：每次 401 都会派发 auth-expired 事件并多记一条未授权访问日志。
+    if (!bootVersion || authExpired) return undefined
     let stopped = false
+    let seq = 0
+    let done = 0
     const check = () => {
       if (stopped || document.visibilityState === 'hidden') return
-      apiGetSys().then((sys) => {
-        const v = sys && typeof sys.version === 'string' ? sys.version : ''
-        if (!stopped && v !== '' && v !== bootVersion) setNewVersion(v)
+      const mine = ++seq
+      apiGetSys({ probeVersion: true }).then((s) => {
+        if (stopped || mine < done) return // 乱序响应：旧请求不得覆盖新判定
+        done = mine
+        const v = s && typeof s.version === 'string' ? s.version : ''
+        // 与启动版本重新对齐（回滚也算）就收起提示，别留一条过期横幅。
+        setNewVersion(v !== '' && v !== bootVersion ? v : '')
       }).catch(() => {})
     }
     check()
     const timer = setInterval(check, VERSION_CHECK_MS)
     document.addEventListener('visibilitychange', check)
-    return () => {
-      stopped = true
-      clearInterval(timer)
-      document.removeEventListener('visibilitychange', check)
-    }
-  }, [])
+    return () => { stopped = true; clearInterval(timer); document.removeEventListener('visibilitychange', check) }
+  }, [authExpired])
   // 首屏渲染完就把六个页签全部挂上（隐藏），让它们的数据先加载。这样刷新网页后
   // 第一次点某个页签也只是切 hidden，而不是「现挂载 + 现请求」闪一下加载占位。
   // 各面板的 active 门控保证隐藏期间不轮询；这里只承担一次首载。

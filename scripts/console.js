@@ -31,6 +31,12 @@ const { readSafeTextResult, writeAtomic } = require('../xbk_storage')
 const FilterStore = require('../xbk_filter_store')
 const { statusCacheDir } = require('../qinglong/xbk_push')
 
+// 控制台版本（package.json 是唯一真源）：/api/sys 与页面 boot JSON 共用一份，别两处各 require——
+// 前端靠「boot 里的版本 ≠ /api/sys 的版本」判断部署后旧标签页需要刷新（v3.332）。
+const APP_VERSION = (() => {
+  try { return String(require('../package.json').version || '') } catch (e) { return '' }
+})()
+
 // 推送缓存文件名：与生产 MessageStore.getFileName(Config.api.pushUrl) 同口径——pushUrl 末段
 // 去查询串/hash 后清洗保留字符，非 http(s) 前缀的 url 走 bad_/default 特例（这里只关心正常形态）。
 // 惰性 require 运行配置（与 qinglong/xbk_push.loadApp 同款 try/catch）：加载失败/未配置 → 'push.json'
@@ -870,7 +876,7 @@ function renderPage (state, runsList, query, sessionToken, theme) {
   // escapeHtml 的 &quot; 会原样留在 JSON 里被前端 parse 成错误 token（Sourcery vwK）。
   // 只需防 </script> 逃逸与注释/CDATA 攻击：把 < 和控制字符转成 \uXXXX JSON 转义
   // （JSON.parse 会还原成原字符；/ 也转义防 </script> 序列被拼出）。
-  const bootJson = JSON.stringify({ token: bootToken })
+  const bootJson = JSON.stringify({ token: bootToken, version: APP_VERSION })
     .replace(/</g, '\\u003c')
     .replace(/>/g, '\\u003e')
     .replace(/\u2028/g, '\\u2028')
@@ -2917,7 +2923,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       try {
         const status = res.statusCode
         if (status === 401) unauthorizedCount++ // 环形外的独立计数器（蓝图：401 全记且单独计数）
-        if (url ? shouldLogAccess(req.method, url.pathname, status) : true) {
+        // v3.332：每 60s 一次的版本探针（?probe=version）200 不入环形——否则一个前台标签页
+        // 一分钟一条，三小时就把 200 条真实请求历史挤干净（Sourcery #294）。401 等异常照记。
+        const versionProbe = url && url.pathname === '/api/sys' &&
+          url.searchParams.get('probe') === 'version' && status === 200
+        if (!versionProbe && (url ? shouldLogAccess(req.method, url.pathname, status) : true)) {
           accessLog.push({
             at: accessStamp(),
             method: String(req.method || ''),
@@ -3395,8 +3405,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     if (req.method === 'GET' && url.pathname === '/api/sys') {
       // 系统信息：版本四方来源 package.json（与 check-version.js 的唯一真源一致）+
       // 进程/宿主只读信息。不暴露路径之外的任何环境变量（token 等凭证绝不入响应）。
-      let version = ''
-      try { version = String(require('../package.json').version || '') } catch (e) { version = '' }
+      const version = APP_VERSION
+      // v3.331：显式禁缓存。版本对账拿不到「现在的」版本就永远提示不了刷新，
+      // 不能被浏览器/代理的启发式缓存喂旧值（Sourcery #294）。
+      res.setHeader('Cache-Control', 'no-store')
       let rss = 0
       try { rss = process.memoryUsage().rss } catch (e) { rss = 0 }
       sendJson(res, 200, {
