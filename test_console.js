@@ -1707,6 +1707,11 @@ async function main () {
     const sessPage = await request(port, 'GET', '/', { headers: { cookie: `xbk_session=${TOKEN}` } })
     assert.strictEqual(sessPage.status, 200, 'Cookie 会话可开页面')
     assert.ok(sessPage.text.includes(`"token":"${TOKEN}"`), '会话页 boot JSON 含已验证 token')
+    // v3.330：boot JSON 还要带构建版本——前端拿它和 /api/sys 比对，发现部署后没刷新的旧标签页。
+    const bootMatch = /<script type="application\/json" id="xbk-boot">([\s\S]*?)<\/script>/.exec(sessPage.text)
+    const bootData = bootMatch ? JSON.parse(bootMatch[1]) : {}
+    assert.strictEqual(bootData.version, require('./package.json').version,
+      'boot JSON 必须带当前 package 版本（前端据此判断是否需要提示刷新）')
     // Sourcery G_4Kb：POST 不接受 Cookie 凭证（写动作须显式 Bearer/?token=）。
     const csrf = await request(port, 'POST', '/trigger', { headers: { cookie: `xbk_session=${TOKEN}` }, body: 'action=check' })
     assert.strictEqual(csrf.status, 401, 'POST 仅凭 Cookie 必须 401（CSRF 面）')
@@ -5528,9 +5533,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.331：注释里的版本号不得写下一版 v3.332。
-    assert.ok(!/v3\.332/.test(src), 'app.js 注释不得写 v3.332（版本未 bump）')
-    assert.ok(!/v3\.332/.test(css), 'app.css 注释不得写 v3.332（版本未 bump）')
+    // 版本已 bump 到 3.332：注释里的版本号不得写下一版 v3.333。
+    assert.ok(!/v3\.333/.test(src), 'app.js 注释不得写 v3.333（版本未 bump）')
+    assert.ok(!/v3\.333/.test(css), 'app.css 注释不得写 v3.333（版本未 bump）')
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
@@ -5581,6 +5586,36 @@ async function main () {
     const gesture = src.slice(src.indexOf('function usePullToRefresh'), src.indexOf('function PullRefreshStatus'))
     const appPull = src.slice(src.indexOf('const pullRefresh = useCallback'), src.indexOf('const pull = usePullToRefresh'))
     assert.ok(!/location\.reload|location\.href\s*=/.test(gesture + appPull), '下拉刷新不得整页重载')
+  })
+
+  // ── v3.332 部署后旧标签页提示 ─────────────────────────────────────────
+  await aok('结构红线: v3.332 新版本提示（boot 版本 / 60s 对账 / 只提示不自动刷新）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
+    const server = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
+    const ph = (name) => '$' + '{' + name + '}'
+    // 版本只有一份来源：boot JSON 与 /api/sys 共用 APP_VERSION，别再各自 require package.json。
+    assert.ok(server.includes('const APP_VERSION = (() => {'), '版本必须抽成单一 APP_VERSION')
+    assert.ok(server.includes('JSON.stringify({ token: bootToken, version: APP_VERSION })'),
+      'boot JSON 必须注入版本（前端据此判断自己是不是旧页面）')
+    assert.ok(server.includes('const version = APP_VERSION'), '/api/sys 必须复用同一版本来源')
+    // 前端：读出 boot 版本，60s 对一次 /api/sys，只有不一致才提示。
+    assert.ok(src.includes("version: typeof data.version === 'string' ? data.version : ''"), 'readBoot 必须解析 version')
+    assert.ok(src.includes('const VERSION_CHECK_MS = 60000'), '对账间隔必须是 60s')
+    assert.ok(src.includes("if (stopped || document.visibilityState === 'hidden') return"), '页面隐藏时不得持续打接口')
+    assert.ok(src.includes('const bootVersion = BOOT.version'), '对账基准必须是页面启动版本')
+    assert.ok(src.includes('if (!stopped && v !== \'\' && v !== bootVersion) setNewVersion(v)'),
+      '只有「版本非空且与启动版本不同」才提示（同版本不得误报）')
+    // 只提示、不自动 reload：刷新必须由用户点，避免打断正在填的表单。
+    assert.ok(src.includes('$' + '{newVersion !== \'\' && html`<div class="alert-banner nudge" role="status">'),
+      '提示条只在发现新版本时渲染，且是 status 不是 alert')
+    assert.ok(src.includes('控制台已更新到 ' + ph('newVersion')), '提示条必须点名新版本号')
+    assert.ok(src.includes('onClick=' + ph('() => window.location.reload()')), '刷新按钮必须由用户点击触发 reload')
+    const effect = src.slice(src.indexOf('const bootVersion = BOOT.version'), src.indexOf('}, [])', src.indexOf('const bootVersion = BOOT.version')))
+    assert.ok(!effect.includes('location.reload'), '对账 effect 里不得自动 reload（会打断输入）')
+    // 样式走主题变量，且用强调色而不是报错色。
+    assert.ok(/\.alert-banner\.nudge\s*\{[^}]*var\(--accent-soft\)/.test(css) && /\.alert-banner\.nudge\s*\{[^}]*var\(--info-fg\)/.test(css),
+      '提示条必须走强调色变量（不与「凭证失效」红条混淆）')
   })
 
   await aok('结构红线: v3.326 逐轮历史切档不闪（两档快照预取 / 无快照等数据回来再换）', () => {

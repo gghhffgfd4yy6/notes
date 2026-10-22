@@ -4457,7 +4457,7 @@ function App () {
   // 凭证失效（审查 #224）：任一 API 401 ⇒ 停轮询并显示自助恢复提示，不再每 5s 空打。
   const [authExpired, setAuthExpired] = useState(false)
   const [nextAt, setNextAt] = useState(0)
-  // v3.329：部署后旧标签页仍在跑旧脚本，数据轮询却照常更新 ⇒ 用户以为「改了没生效」。
+  // v3.332：部署后旧标签页仍在跑旧脚本，数据轮询却照常更新 ⇒ 用户以为「改了没生效」。
   // boot 里带页面启动版本；每 60s 与 /api/sys 对一次，不一致就提示刷新。
   const [newVersion, setNewVersion] = useState('')
   useEffect(() => {

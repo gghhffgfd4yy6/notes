@@ -328,6 +328,10 @@
     border: 1px solid var(--bad-line); color: var(--bad-fg); text-decoration: none;
     font-size: var(--fs-sm); font-weight: 600; background: transparent;
   }
+  /* v3.330：部署后旧标签页提示。用强调色而不是报错色——「有新版本」不是故障，
+     别和下面「凭证失效」的红条混成同一类。 */
+  .alert-banner.nudge { background: var(--accent-soft); border-color: var(--accent-line); color: var(--info-fg); }
+  .alert-banner.nudge .alert-action { border-color: var(--accent-line); color: var(--info-fg); background: transparent; cursor: pointer; font: inherit; font-size: var(--fs-sm); font-weight: 600; }
   .alert-text { flex: 1 1 220px; min-width: 0; }
   .alert-link { background: none; border: 0; color: var(--bad-fg); font-size: var(--fs-sm); text-decoration: underline; cursor: pointer; min-height: 32px; padding: 0 2px; }
 
