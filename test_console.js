@@ -5446,7 +5446,7 @@ async function main () {
       '逐轮历史消费即清旗：返回 null 不重试')
     // 旗只由主动路径置：纯 load()/自动刷新不搬滚动位置。
     const msgRefresh = msg.slice(msg.indexOf('const refreshNow = () => {'), msg.indexOf('const [exporting'))
-    assert.ok(msgRefresh.includes('load().catch') && !msgRefresh.includes('landRef'), '推送记录纯刷新不得搬滚动位置')
+    assert.ok(msgRefresh.includes('Promise.resolve(load()).catch') && !msgRefresh.includes('landRef'), '推送记录纯刷新不得搬滚动位置')
     const histRefresh = hist.slice(hist.indexOf('const refresh = () =>'), hist.indexOf('const changeDay'))
     assert.ok(histRefresh.includes('load().catch') && !histRefresh.includes('landRef'), '逐轮历史刷新不得搬滚动位置')
     // 主动路径逐个点名：改每页 / 改分类 / 改时间都走同一个带门的 armLand。
@@ -5555,9 +5555,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.333：注释里的版本号不得写下一版 v3.334。
-    assert.ok(!/v3\.334/.test(src), 'app.js 注释不得写 v3.334（版本未 bump）')
-    assert.ok(!/v3\.334/.test(css), 'app.css 注释不得写 v3.334（版本未 bump）')
+    // 版本已 bump 到 3.334：注释里的版本号不得写下一版 v3.335。
+    assert.ok(!/v3\.335/.test(src), 'app.js 注释不得写 v3.335（版本未 bump）')
+    assert.ok(!/v3\.335/.test(css), 'app.css 注释不得写 v3.335（版本未 bump）')
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
@@ -5617,9 +5617,12 @@ async function main () {
     const slowHook = src.slice(src.indexOf('function useSlowFlag'), src.indexOf('// 趋势天数选择器固定选项'))
     assert.ok(slowHook.includes('if (!on) { setSlow(false); return undefined }'), 'useSlowFlag 关闭时必须立刻复位')
     assert.ok(slowHook.includes('return slow && on'), 'useSlowFlag 必须在 on=false 的当帧就返回 false（完成后不得多渲染一帧提示）')
-    assert.ok(/ariaBusy=\$\{loading \? 'true' : 'false'\}/.test(src), '刷新按钮的 busy 必须真的传到 <button>（Button 转发 ariaBusy）')
-    assert.ok(/aria-busy=\$\{ariaBusy\}/.test(src), 'Button 必须把 ariaBusy 渲染成原生 aria-busy')
     const msgPanel = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel'))
+    assert.ok(/ariaBusy=\$\{loading \? 'true' : 'false'\}/.test(src), '刷新按钮的 busy 必须真的传到 <button>（Button 转发 ariaBusy）')
+    assert.ok(!/disabled=\$\{loading\}[^>]*>刷新/.test(msgPanel), '刷新按钮不得因 loading 变灰：15ms 的 0.45 透明度就是一帧闪')
+    assert.ok(/disabled=\$\{slowLoading\}/.test(msgPanel), '只在慢加载时禁用刷新按钮')
+    assert.ok(msgPanel.includes('if (busyRef.current) return'), '去掉 disabled 后必须用 ref 挡连点')
+    assert.ok(/aria-busy=\$\{ariaBusy\}/.test(src), 'Button 必须把 ariaBusy 渲染成原生 aria-busy')
     assert.ok(msgPanel.includes('const slowLoading = useSlowFlag(loading)'),
       '推送记录必须用 slowLoading 决定「更新中…」')
     assert.ok(msgPanel.includes('slowLoading ? html`<span class="msg-loading"> · 更新中…</span>`'),

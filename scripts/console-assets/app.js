@@ -2994,10 +2994,15 @@ function MessagesPanel ({ onSync, active = true }) {
   }
   // 搜索框回车 / 刷新前先把未落地的输入立刻生效，避免「刚打完字点刷新，还是旧结果」。
   // 只有搜索词变了才回第 1 页；没改词时刷新当前页，不应把用户踢回首页（审查 #246 可选）。
+  // v3.334：按钮不再因为 loading 变灰——缓存命中时 loading 只有 15ms，
+  // disabled 会把按钮压到 0.45 透明度再弹回来，这就是那下闪。改成只在慢加载时禁用。
+  const busyRef = useRef(false)
   const refreshNow = () => {
+    if (busyRef.current) return
     const q = input.trim()
     if (q !== query) { armLand(); setQuery(q); setPage(1); return }
-    load().catch(() => {})
+    busyRef.current = true
+    Promise.resolve(load()).catch(() => {}).finally(() => { busyRef.current = false })
   }
   const [exporting, setExporting] = useState('') // '' | 'csv' | 'json'：加载态防连点（两按钮共用一闸）
   const [exportErr, setExportErr] = useState('')
@@ -3121,7 +3126,7 @@ function MessagesPanel ({ onSync, active = true }) {
       <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
         options=${[10, 20, 50, 100].map((n) => ({ value: String(n), label: `每页 ${n} 条` }))}
         onChange=${(v) => { armLand(); setSize(Number(v)); setPage(1) }} />
-      <${Button} variant="ghost" disabled=${loading} ariaBusy=${loading ? 'true' : 'false'} onClick=${refreshNow}>刷新<//>
+      <${Button} variant="ghost" disabled=${slowLoading} ariaBusy=${loading ? 'true' : 'false'} onClick=${refreshNow}>刷新<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
     </div>
