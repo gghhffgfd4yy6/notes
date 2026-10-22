@@ -3592,7 +3592,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
   }, [winCurrent, winDirty])
   const adjustWin = (delta) => {
     if (winCurrent === null || winSavingRef.current) return
-    const typed = winDraft.trim() === '' ? NaN : Number(winDraft)
+    const typed = winDraft.trim() === '' ? Number.NaN : Number(winDraft)
     const base = Number.isInteger(typed) ? typed : winCurrent
     const next = Math.min(NOTIFY_WINDOW_MAX_S, Math.max(NOTIFY_WINDOW_MIN_S, base + delta))
     setWinDraft(String(next))
@@ -3610,7 +3610,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
     if (!settingsLive || winCurrent === null) { setWinErr('当前生效值未读到，先刷新再改'); return }
     // 空串必须按非法处理：Number('') === 0，若直接转数字会把「清空输入框再点保存」
     // 静默解释成 0（关闭拦截）——那是最不该靠猜的语义。
-    const typed = winDraft.trim() === '' ? NaN : Number(winDraft)
+    const typed = winDraft.trim() === '' ? Number.NaN : Number(winDraft)
     if (!Number.isInteger(typed) || typed < NOTIFY_WINDOW_MIN_S || typed > NOTIFY_WINDOW_MAX_S) {
       setWinErr(`拦截窗必须是 ${NOTIFY_WINDOW_MIN_S}–${NOTIFY_WINDOW_MAX_S} 的整数（秒）`)
       return
@@ -3800,7 +3800,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0 }) {
   // 下拉刷新与「刷新」按钮同一条路径（两表 + 就绪 tick）。
   usePullRefresh(active, refreshAll)
   // v3.348：统一轮询节拍——本页在前台时每拍重拉（含访问日志与设置）。
-  useEffect(() => { if (active && pollTick > 0) refreshAll() }, [pollTick, active])
+  useEffect(() => { if (active && pollTick > 0) refreshAll().catch(() => {}) }, [pollTick, active])
   const fmtUptime = (s) => {
     if (!(typeof s === 'number' && s >= 0)) return '—'
     const d = Math.floor(s / 86400)

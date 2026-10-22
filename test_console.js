@@ -4577,7 +4577,7 @@ async function main () {
       ['ConfigPanel', 'useEffect(() => { if (active && pollTick > 0) refresh() }'],
       ['FilterRulesPanel', 'useEffect(() => { if (active && pollTick > 0) load() }'],
       ['FilesPanel', 'useEffect(() => { if (active && pollTick > 0) load() }'],
-      ['SysPanel', 'useEffect(() => { if (active && pollTick > 0) refreshAll() }']
+      ['SysPanel', 'useEffect(() => { if (active && pollTick > 0) refreshAll().catch(() => {}) }']
     ]) {
       const at = src.indexOf('function ' + fn + ' (')
       const end = src.indexOf('\nfunction ', at + 10)
@@ -6085,7 +6085,7 @@ async function main () {
     // 必须剥注释再匹配：原先直接 includes 时，把客户端改成写死 60、只在注释里留一句
     // 「应取 data.replayWindowS」也能全绿（回潮实验 A6 实测）。
     const notifySegRaw = src.slice(src.indexOf('async function triggerNotifyTest'), src.indexOf('function Badge ('))
-    const notifySeg = notifySegRaw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    const notifySeg = notifySegRaw.replace(/\/\*[^*]*\*+(?:[^/*][^*]*\*+)*\//g, '').replace(/^\s*\/\/.*$/gm, '')
     assert.ok(notifySeg.includes('data.replayWindowS'), 'triggerNotifyTest 必须用响应里的 replayWindowS')
     assert.ok(notifySeg.includes('Number.isInteger(data.replayWindowS)') &&
       notifySeg.includes(': NOTIFY_WINDOW_DEFAULT_S'), '缺失时才回退默认值（三元两支都必须在）')
