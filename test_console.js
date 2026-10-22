@@ -5536,25 +5536,46 @@ async function main () {
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    // 只看真正的规则：注释里提到 overscroll-behavior-y 不算（否则删了声明测试照样绿）。
+    const cssLive = css.replace(/\/\*[\s\S]*?\*\//g, '')
     // ① 必须关掉内核原生下拉刷新：它就是「整页重载」的入口，不关掉后面做多少都是白搭。
-    assert.ok(/overscroll-behavior-y:\s*contain/.test(css), '必须用 overscroll-behavior-y: contain 关掉 Chrome 原生下拉刷新')
-    // ② 手势：被动监听 + touchcancel（中断手势不能卡在刷新态）；阈值与阻尼固定。
+    assert.ok(/html,\s*body\s*\{[^}]*overscroll-behavior-y:\s*contain/.test(cssLive), '必须用 overscroll-behavior-y: contain 关掉 Chrome 原生下拉刷新')
+    // ② 手势：被动监听；多指中断与 touchcancel 只复位不刷新。
     assert.ok(src.includes('function usePullToRefresh'), '缺少下拉手势 hook')
     assert.ok(src.includes("window.addEventListener('touchstart', onStart, { passive: true })"), 'touchstart 必须 passive')
-    assert.ok(src.includes("window.addEventListener('touchcancel', onEnd"), '必须处理 touchcancel，否则中断手势会卡死在刷新态')
+    assert.ok(src.includes("window.addEventListener('touchcancel', onCancel"), 'touchcancel 必须走 onCancel，不能当松手')
+    assert.ok(src.includes('const onCancel = () => { stop(); idle() }'), 'touchcancel 必须只停跟踪并复位，不触发刷新')
+    assert.ok(src.includes('if (!t || t.length !== 1) { r.lock = true; stop(); idle(); return }'), '多指按下必须作废本次手势')
     assert.ok(src.includes('const PULL_TRIGGER = 56') && src.includes('dy * 0.5'), '阈值/阻尼必须固定（56px、0.5 倍）')
-    assert.ok(src.includes('const inScrolled = (touch)'), '必须跳过内部已滚动的容器（日志框/列表），否则回看日志会被当成下拉')
-    // ③ 指示条三态，且固定定位——不能把内容顶下去（那就又变成跳了）。
+    // ③ 内部已滚动的容器不算下拉：判定体必须真的看 scrollTop 与 overflowY。
+    const inScrolled = src.slice(src.indexOf('const inScrolled = (touch)'), src.indexOf('const onStart = (e)'))
+    assert.ok(inScrolled.includes('scrollTop > 0') && inScrolled.includes('overflowY'), 'inScrolled 必须检查 scrollTop 与 overflowY，不能空转 return false')
+    // ④ 指示条三态，且固定定位——不能把内容顶下去（那就又变成跳了）。
     assert.ok(src.includes("'下拉刷新'") && src.includes("'松开刷新'") && src.includes("'正在刷新…'"), '指示条必须有三态文案')
-    assert.ok(/\.ptr\s*\{[^}]*position:\s*fixed/.test(css), '指示条必须 fixed，不能参与布局')
-    // ④ 每个页签面板都要把自己的 loader 交给同一次下拉刷新（缺一个就是「这页拉了没反应」）。
-    const calls = (src.match(/usePullRefresh\(/g) || []).length
-    assert.ok(calls >= 9, `至少 9 个面板接入下拉刷新，实际 ${calls}`)
-    // ⑤ App 侧广播 + 等所有 loader 落定才收指示条；下拉路径不得整页重载。
+    assert.ok(/\.ptr\s*\{[^}]*position:\s*fixed/.test(cssLive), '指示条必须 fixed，不能参与布局')
+    // ⑤ 每个页签面板都要接到同一次下拉刷新（数量不够或张冠李戴都要拦住）。
+    for (const name of ['RunHistoryPanel', 'TrendsPanel', 'CacheHealthPanel', 'MessagesPanel', 'LogsPanel', 'ConfigPanel', 'FilesPanel', 'SysPanel', 'FilterRulesPanel']) {
+      const at = src.indexOf('function ' + name + ' (')
+      const body = src.slice(at, src.indexOf('\nfunction ', at + 10))
+      assert.ok(at > 0 && body.includes('usePullRefresh('), `${name} 必须注册下拉刷新`)
+    }
+    // ⑥ 过滤规则：有未保存改动时不注册，且请求在飞期间变脏要丢弃响应。
+    const filter = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('\nfunction ', src.indexOf('function FilterRulesPanel') + 10))
+    assert.ok(filter.includes('usePullRefresh(active && dirtyFields.length === 0, load)'), '过滤规则页有未保存改动时不得刷新')
+    assert.ok(filter.includes('dirtyRef.current = dirtyFields.length > 0'), 'dirtyRef 必须随草稿状态更新')
+    assert.ok(filter.includes('if (dirtyRef.current) return'), '响应回来时草稿已变脏必须丢弃，不能覆盖用户改动')
+    // ⑦ 指示条要等所有 loader 落定；排队/在飞的请求不能被提前结算。
+    assert.ok(src.includes('Promise.allSettled([load(), loadEff()])'), 'ConfigPanel.refresh 必须交出两个 loader 的 promise')
+    assert.ok(src.includes('idleWaitersRef'), 'LogsPanel 排队路径必须等「在飞 + 补跑」结束再 resolve')
     assert.ok(src.includes('window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail }))'), 'App 必须广播下拉刷新事件')
-    assert.ok(src.includes('Promise.allSettled([refreshSplit(), refreshAuto(), ...detail.waits])'), '必须等主轮询与所有面板一起落定')
-    const pullBody = src.slice(src.indexOf('function usePullToRefresh'), src.indexOf('function PullRefreshBar'))
-    assert.ok(!/location\.reload|location\.href\s*=/.test(pullBody), '下拉刷新不得整页重载')
+    assert.ok(src.includes('if (detail.waits.length === 0) return false'), '当前页没有面板接手时不得发全局请求，也不假装刷新')
+    assert.ok(src.includes('Promise.resolve().then(onRefresh).then(settle'), '无面板接手时要立刻收起指示条（did === false）')
+    assert.ok(src.includes('refreshSplit({ force: true })'), '下拉必须绕过表单交互暂停')
+    assert.ok(src.includes('Promise.allSettled([refreshSplit({ force: true }), refreshAuto(), ...detail.waits])'), '必须等主轮询与所有面板一起落定')
+    // ⑧ 整条下拉路径（手势 + App 回调）都不得整页重载。
+    const gesture = src.slice(src.indexOf('function usePullToRefresh'), src.indexOf('function PullRefreshBar'))
+    const appPull = src.slice(src.indexOf('const pullRefresh = useCallback'), src.indexOf('const pull = usePullToRefresh'))
+    assert.ok(!/location\.reload|location\.href\s*=/.test(gesture + appPull), '下拉刷新不得整页重载')
   })
 
   await aok('结构红线: v3.326 逐轮历史切档不闪（两档快照预取 / 无快照等数据回来再换）', () => {

@@ -2224,12 +2224,11 @@ function usePullRefresh (active, fn) {
 // App 侧：手势状态机。只在页面顶部（scrollY<=0）开始跟踪；竖直位移压 0.5 倍做阻尼。
 function usePullToRefresh (onRefresh, enabled = true) {
   const [state, setState] = useState('idle') // idle | pull | ready | busy
-  const [dist, setDist] = useState(0)
   const ref = useRef({ y0: 0, x0: 0, dy: 0, tracking: false, busy: false, lock: false })
   useEffect(() => {
     if (!enabled) return undefined
     const stop = () => { ref.current.tracking = false; ref.current.dy = 0 }
-    const idle = () => { setDist(0); setState((s) => (s === 'busy' ? s : 'idle')) }
+    const idle = () => setState((s) => (s === 'busy' ? s : 'idle'))
     // 手指落在自己滚动的容器里（日志框、列表）时，先让它按原生滚动走；
     // 只有当那个容器已经在顶部，才算「整页下拉」。
     const inScrolled = (touch) => {
@@ -2253,15 +2252,14 @@ function usePullToRefresh (onRefresh, enabled = true) {
       const r = ref.current
       if (!r.tracking || r.busy || r.lock) return
       const t = e.touches
-      if (!t || t.length !== 1) return
+      // 多指按下（缩放/误触）：本次手势作废，松手也不刷新。
+      if (!t || t.length !== 1) { r.lock = true; stop(); idle(); return }
       const dy = t[0].clientY - r.y0
       const dx = t[0].clientX - r.x0
       // 横滑、上滑、或已经离开顶部：本次手势不再当下拉，等下一次触摸。
       if (dy <= 0 || Math.abs(dx) > Math.abs(dy) || window.scrollY > 0) { r.lock = true; stop(); idle(); return }
       r.dy = dy
-      const d = Math.min(PULL_MAX, dy * 0.5)
-      setDist(d)
-      setState(d >= PULL_TRIGGER ? 'ready' : 'pull')
+      setState(Math.min(PULL_MAX, dy * 0.5) >= PULL_TRIGGER ? 'ready' : 'pull')
     }
     const onEnd = () => {
       const r = ref.current
@@ -2270,33 +2268,36 @@ function usePullToRefresh (onRefresh, enabled = true) {
       stop()
       if (!armed) { idle(); return }
       r.busy = true
-      setDist(PULL_TRIGGER)
       setState('busy')
       const t0 = Date.now()
+      const settle = (did) => {
+        // 当前页没有可刷新的面板（返回 false）：立刻收起，别假装刷了一下。
+        const hold = did === false ? 0 : Math.max(0, PULL_MIN_BUSY_MS - (Date.now() - t0))
+        setTimeout(() => { r.busy = false; setState('idle') }, hold)
+      }
       // 微任务里再开跑：先让 busy 这一帧画出来，再发请求（不然快速响应会直接跳回 idle）。
-      Promise.resolve().then(onRefresh).catch(() => {}).finally(() => {
-        const wait = Math.max(0, PULL_MIN_BUSY_MS - (Date.now() - t0))
-        setTimeout(() => { r.busy = false; setDist(0); setState('idle') }, wait)
-      })
+      Promise.resolve().then(onRefresh).then(settle, () => settle(true))
     }
     window.addEventListener('touchstart', onStart, { passive: true })
     window.addEventListener('touchmove', onMove, { passive: true })
+    // touchcancel = 手势被打断（来电、系统手势），不是「松手」：只复位，不刷新。
+    const onCancel = () => { stop(); idle() }
     window.addEventListener('touchend', onEnd, { passive: true })
-    window.addEventListener('touchcancel', onEnd, { passive: true })
+    window.addEventListener('touchcancel', onCancel, { passive: true })
     return () => {
       window.removeEventListener('touchstart', onStart)
       window.removeEventListener('touchmove', onMove)
       window.removeEventListener('touchend', onEnd)
-      window.removeEventListener('touchcancel', onEnd)
+      window.removeEventListener('touchcancel', onCancel)
     }
   }, [enabled, onRefresh])
-  return { state, dist }
+  return { state }
 }
 
-function PullRefreshBar ({ state, dist }) {
+function PullRefreshBar ({ state }) {
   if (state === 'idle') return null
   const label = state === 'busy' ? '正在刷新…' : state === 'ready' ? '松开刷新' : '下拉刷新'
-  return html`<div class=${'ptr ' + state} data-dist=${Math.round(dist)} role="status" aria-live="polite">
+  return html`<div class=${'ptr ' + state} role="status" aria-live="polite">
     <span class="ptr-ring" aria-hidden="true"></span>${label}
   </div>`
 }
@@ -3168,11 +3169,16 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   // 只会让服务端并发读盘、后到的响应还可能盖掉新结果。手动刷新同样走这把闸。
   const busyRef = useRef(false)
   const pendingRef = useRef(false)
+  // 排队等待者：下拉指示条要等「在飞那一轮 + 它触发的补跑」都结束才收。
+  const idleWaitersRef = useRef([])
   const load = useCallback(async (queue = false) => {
     // 手动刷新撞上在飞请求时不丢这次意图：记 pending，当前请求结束后再补一轮。
     // 轮询/可见性补拉不排队（queue=false），避免慢请求把轮询变成背靠背重试。
     if (busyRef.current) {
-      if (queue) pendingRef.current = true
+      if (queue) {
+        pendingRef.current = true
+        await new Promise((resolve) => { idleWaitersRef.current.push(resolve) })
+      }
       return
     }
     busyRef.current = true
@@ -3184,6 +3190,9 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     } finally {
       busyRef.current = false
       pendingRef.current = false
+      const waiters = idleWaitersRef.current
+      idleWaitersRef.current = []
+      for (const done of waiters) done()
     }
   }, [loadRaw])
   // 下拉刷新走排队路径：在飞的手动刷新结束后再补一轮，不丢这次意图。
@@ -3603,10 +3612,7 @@ function ConfigPanel ({ onSync, active = true }) {
   useEffect(() => {
     if (configAt && filterAt && typeof onSync === 'function') onSync(Math.max(configAt, filterAt))
   }, [configAt, filterAt, onSync])
-  const refresh = useCallback(() => {
-    load().catch(() => {})
-    loadEff().catch(() => {})
-  }, [load, loadEff])
+  const refresh = useCallback(() => Promise.allSettled([load(), loadEff()]), [load, loadEff])
   // 启动预加载；保活后每次切回本页静默重拉（旧值留在原地），离开本页不拉。
   usePanelAutoLoad(active, refresh)
   usePullRefresh(active, refresh)
@@ -3851,6 +3857,8 @@ function FilterRulesPanel ({ onSync, active = true }) {
     setRestoreTo(list.length > 0 ? String(list[0]) : 'default')
   }, [])
 
+  // 渲染期同步的「有未保存改动」标记：load 的回调闭包里读它，避免拿到旧值。
+  const dirtyRef = useRef(false)
   const load = useCallback(async () => {
     const seq = ++loadSeqRef.current
     setLoading(true)
@@ -3859,6 +3867,8 @@ function FilterRulesPanel ({ onSync, active = true }) {
       // 备份清单与规则读取并行：/api/files 只是下拉数据，读不到不阻断规则编辑。
       const [d, files] = await Promise.all([apiGetFilter(), apiGetFiles().catch(() => null)])
       if (seq !== loadSeqRef.current || !mountedRef.current) return
+      // 响应在飞期间用户改了草稿：这次结果不能覆盖（下拉刷新也不例外）。
+      if (dirtyRef.current) return
       applyLoaded(d, files)
       if (typeof onSync === 'function') onSync(Date.now())
     } catch (e) {
@@ -3884,6 +3894,7 @@ function FilterRulesPanel ({ onSync, active = true }) {
     return FILTER_FIELD_NAMES.filter((n) => String(draft[n]) !== String(base[n]))
   }, [draft, base])
   const draftWide = useMemo(() => wideFieldsOf(draft), [draft])
+  dirtyRef.current = dirtyFields.length > 0
   // 下拉刷新不碰有未保存改动的草稿：一次下拉不能静默丢掉用户刚改的规则。
   usePullRefresh(active && dirtyFields.length === 0, load)
 
@@ -4767,9 +4778,10 @@ function App () {
   // 并行发出（Sourcery G_n6）：串行 await 会让慢端点拖住另一端点的更新。
   // 乱序防护（Sourcery vwE）：每次 refresh 领号，落后响应直接丢弃（落后 ≠ 失败，
   // 落后者静默丢弃不报错——Sourcery vwB：报「刷新失败」是误导）。
-  const refreshSplit = useCallback(async () => {
+  const refreshSplit = useCallback(async (opts = {}) => {
     // 表单交互暂停期间不发起刷新；已在途的响应也会在下方 apply 前被丢弃。
-    if (Date.now() < formPauseUntilRef.current) return
+    // 下拉刷新是明确的手势意图，传 { force: true } 跨过这段暂停。
+    if (!(opts && opts.force) && Date.now() < formPauseUntilRef.current) return
     if (inFlightRef.current) {
       // 切回概览时若上一轮还在路上，标记一次补刷，等 finally 再跑。
       pendingRefreshRef.current = true
@@ -4778,7 +4790,7 @@ function App () {
     inFlightRef.current = true
     const seq = ++seqRef.current
     const errs = []
-    const paused = () => Date.now() < formPauseUntilRef.current
+    const paused = () => !(opts && opts.force) && Date.now() < formPauseUntilRef.current
     const applyStatus = (s) => { if (seq === seqRef.current && !paused()) { setState(s); setSyncErr(''); setStatusFailed(false) } }
     const applyRuns = (r) => {
       if (seq === seqRef.current && !paused()) {
@@ -4982,7 +4994,10 @@ function App () {
   const pullRefresh = useCallback(async () => {
     const detail = { waits: [] }
     window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail }))
-    await Promise.allSettled([refreshSplit(), refreshAuto(), ...detail.waits])
+    // 没有任何面板接手（如过滤规则页有未保存改动）：连全局请求也不发，下拉就当无事。
+    if (detail.waits.length === 0) return false
+    await Promise.allSettled([refreshSplit({ force: true }), refreshAuto(), ...detail.waits])
+    return true
   }, [refreshSplit, refreshAuto])
   const pull = usePullToRefresh(pullRefresh, !authExpired)
 
@@ -5107,7 +5122,7 @@ function App () {
     ? '凭证失效'
     : `${locking ? '任务运行中' : '空闲'}${livePolling ? '' : '（快照）'}`
   return html`<div class="wrap">
-    <${PullRefreshBar} state=${pull.state} dist=${pull.dist} />
+    <${PullRefreshBar} state=${pull.state} />
     <header class="topbar">
       <div class="brand">
         <span class="logo">⚡</span>
