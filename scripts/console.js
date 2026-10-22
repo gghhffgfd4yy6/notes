@@ -2080,7 +2080,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       raw.notifyTestReplayWindowS >= NOTIFY_REPLAY_MIN_S && raw.notifyTestReplayWindowS <= NOTIFY_REPLAY_MAX_S &&
       // v3.340 的旧文件没有这个字段：允许缺省（按默认 true），但写了就必须是布尔。
       (raw.syncShowDate === undefined || typeof raw.syncShowDate === 'boolean') &&
-      Number.isInteger(raw.revision) && raw.revision >= 0 &&
+      // 必须是「安全整数」且留出 +1 余量：超过 MAX_SAFE_INTEGER 时 +1 不再改变数值，
+      // 乐观锁会永远放行同一份 revision（Sourcery #303 M2）。
+      Number.isSafeInteger(raw.revision) && raw.revision >= 0 && raw.revision < Number.MAX_SAFE_INTEGER &&
       typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)
     if (!valid) {
       console.error(`⚠️ 控制台设置字段非法，按默认值运行：notifyTestReplayWindowS=${CONSOLE_SETTINGS_DEFAULT_S}、syncShowDate=true（${CONSOLE_SETTINGS_FILE}）`)
@@ -2408,7 +2410,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           const persistedPre = readLastAccept(lastAcceptPath)
           const prevPrePair = persistedPre.find(([k]) => k === action)
           const prevPre = prevPrePair ? prevPrePair[1] : lastAccept.get(action)
-          if (prevPre && now - prevPre.at < windowMs) {
+          // 窗口为 0 = 明确关闭拦截；时钟回拨（now < prev.at）时差值变成负数，若照常比较会
+          // 把小负数也判成「还在窗内」，用户要等时钟追上来才能再触发——所以两个条件都要显式排除。
+          if (prevPre && windowMs > 0 && now >= prevPre.at && now - prevPre.at < windowMs) {
             const rid = prevPre.runId
             const remainS = Math.max(1, Math.ceil((windowMs - (now - prevPre.at)) / 1000))
             sendJson(res, 409, { error: `重复提交已拦截（该动作刚受理过，${remainS} 秒后可重试）`, runId: (typeof rid === 'string' && rid.includes('.')) ? rid : undefined, replayBlocked: true, retryAfterS: remainS, replayWindowS })
@@ -2427,7 +2431,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 真正的重复提交；运行中互斥由单飞锁负责）。/trigger 的 action=notify-test 与独立
         // 端点共享同一 lastAccept 键与窗长（有意行为）。run-auto 不接受 HTTP 触发。
         const winMs = windowMs
-        if (prev && now - prev.at < winMs) {
+        if (prev && winMs > 0 && now >= prev.at && now - prev.at < winMs) {
           // runId = epoch.seq 字符串（v3.299 评审）：0 是 pending 帧哨兵（数字），
           // 真实 runId 只在 startAction 之后落盘——用「数字 0」判 pending，其余原样下发。
           const rid = prev.runId
@@ -3606,7 +3610,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           }
           // 可选乐观锁：带了就必须是当前 revision，防两个标签页/两个人在设置页互相覆盖。
           if (Object.prototype.hasOwnProperty.call(payload, 'baseRevision') &&
-            (typeof payload.baseRevision !== 'number' || !Number.isInteger(payload.baseRevision) ||
+            (typeof payload.baseRevision !== 'number' || !Number.isSafeInteger(payload.baseRevision) ||
               payload.baseRevision < 0 || payload.baseRevision !== runtimeSettings.revision)) {
             sendJson(res, 409, { error: 'revision_mismatch', revision: runtimeSettings.revision })
             return

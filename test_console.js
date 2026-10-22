@@ -4570,14 +4570,17 @@ async function main () {
       '不得再按页停掉轮询定时器')
     assert.ok(src.includes("if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)"),
       '非概览/日志页必须每拍推进共享 tick')
+    assert.ok(src.includes('if (!active || !(pollTick > 0) || busyRef.current) return'),
+      '轮询重拉必须单飞：上一拍还没回来时跳过，否则慢接口会互相作废响应')
     assert.ok(/\[refreshSplit, locking, tab, autoRefresh, authExpired\]/.test(src), '轮询 effect 必须随 tab / 暂停开关 / 凭证失效状态变化重跑')
     // 四个页面的面板都要消费这个 tick，否则只是数字在动、数据不动。
+    // v3.349：重拉统一走 usePollReload（单飞：上一拍没回来就跳过，慢接口不会互相作废）。
     for (const [fn, call] of [
-      ['MessagesPanel', 'useEffect(() => { if (active && pollTick > 0) load() }'],
-      ['ConfigPanel', 'useEffect(() => { if (active && pollTick > 0) refresh() }'],
-      ['FilterRulesPanel', 'useEffect(() => { if (active && pollTick > 0) load() }'],
-      ['FilesPanel', 'useEffect(() => { if (active && pollTick > 0) load() }'],
-      ['SysPanel', 'useEffect(() => { if (active && pollTick > 0) refreshAll().catch(() => {}) }']
+      ['MessagesPanel', 'usePollReload(active, pollTick, load)'],
+      ['ConfigPanel', 'usePollReload(active, pollTick, refresh)'],
+      ['FilterRulesPanel', 'usePollReload(active, pollTick, load)'],
+      ['FilesPanel', 'usePollReload(active, pollTick, () => load().then((ok) => {'],
+      ['SysPanel', 'usePollReload(active, pollTick, () => refreshAll().then((rs) => {']
     ]) {
       const at = src.indexOf('function ' + fn + ' (')
       const end = src.indexOf('\nfunction ', at + 10)
@@ -4587,6 +4590,15 @@ async function main () {
     }
     // 过滤规则是编辑面：tick 触发的 load 仍必须被 dirtyRef 挡住（草稿不能被自动刷新覆盖）。
     assert.ok(src.includes('if (dirtyRef.current) return'), '有未保存改动时自动刷新不得覆盖草稿')
+    // 光有 tick 还不够：传给 usePollReload 的必须是真 loader（空壳函数也能让上一条断言通过）。
+    for (const bound of ['usePanelLoader(fetchMessages', 'usePanelLoader(apiGetConfig', 'Promise.all([apiGetFilter()', 'usePanelLoader(apiGetSys', 'usePanelLoader(apiGetFiles']) {
+      assert.ok(src.includes(bound), `面板 loader 必须真的打接口：缺 ${bound}`)
+    }
+    // 单飞闸必须真的调用传进来的 loader，否则只是把 tick 吃掉了。
+    const pollStart = src.indexOf('function usePollReload')
+    const pollEnd = src.indexOf('// 面板侧：当前页签激活时订阅全局下拉刷新', pollStart)
+    assert.ok(pollStart >= 0 && pollEnd > pollStart, 'usePollReload 切片锚点必须存在且有序')
+    assert.ok(src.slice(pollStart, pollEnd).includes('fnRef.current()'), '单飞闸必须调用传进来的 loader')
   })
 
   await aok('结构红线: 配置页过滤规则/渠道不拼成一条长串', () => {
@@ -5986,11 +5998,11 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.348：注释里不得提前写下一版 v3.349。
+    // 版本已 bump 到 3.349：注释里不得提前写下一版 v3.350。
     // 注意这条只拦「资源注释里提前写下个版本」；四处版本号（主文件头/CHANGELOG/package.json/
     // package-lock 两处）的一致性由 check-version.js 负责（CI 与 pre-commit 都跑，npm test 不含）。
-    assert.ok(!/v3\.349/.test(src), 'app.js 注释不得写 v3.349（版本未 bump）')
-    assert.ok(!/v3\.349/.test(css), 'app.css 注释不得写 v3.349（版本未 bump）')
+    assert.ok(!/v3\.350/.test(src), 'app.js 注释不得写 v3.350（版本未 bump）')
+    assert.ok(!/v3\.350/.test(css), 'app.css 注释不得写 v3.350（版本未 bump）')
   })
 
   await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
@@ -6007,7 +6019,7 @@ async function main () {
     // ② v3.346：状态行只有一个来源——AutoRefreshText 统一输出「自动刷新 Ns · 数据截至 · 时间」，
     //    App 只负责汇总时间来源（syncAt）和 live/paused，不再每页各写一套。
     assert.ok(src.includes("const syncAt = tab === 'overview' ? lastSync : panelSync"), '时间来源必须在一处汇总')
-    assert.ok(/lastSync=\$\{syncAt\} showDate=\$\{showDate\} paused=\$\{!autoRefresh\} live=\$\{livePolling\}/.test(src), '状态行必须统一传参（时间/年月日/暂停/是否轮询）')
+    assert.ok(/lastSync=\$\{syncAt\} showDate=\$\{showDate\} paused=\$\{!autoRefresh \|\| authExpired\} live=\$\{livePolling\}/.test(src), '状态行必须统一传参（时间/年月日/暂停或凭证失效/是否轮询）')
     assert.ok(src.includes('fmtBarTime(lastSync, showDate)'), '组件内必须走 fmtBarTime')
     // v3.343：气泡和年月日同步——关掉年月日时 tip 必须为空（TapTip 退化成纯文本）。
     assert.ok(/tip=\$\{showDate && syncAt \?/.test(src), '气泡必须跟着 showDate 一起关')
@@ -6023,7 +6035,9 @@ async function main () {
 
     // ③ App 启动时读设置（顶栏在面板之外，必须自己拿一份；保存后靠 onSaved 重拉）。
     assert.ok(src.includes('body.settings.syncShowDate'), 'App 必须从设置读面取 syncShowDate（读面直接回 body，不是 {data}）')
-    assert.ok(src.includes('if (typeof v === \'boolean\') setShowDate(v)'), '只认布尔，读失败保持默认')
+    // v3.349：解析搬进 applyUiSettings（读面按 revision 丢弃乱序响应），只认布尔这条语义不变。
+    assert.ok(src.includes('typeof body.settings.syncShowDate !== \'boolean\''), '只认布尔，读失败保持默认')
+    assert.ok(src.includes('if (rev < uiSettingsRevRef.current) return'), '旧读响应不得覆盖新值（按 revision 判序）')
     assert.ok(/onSettingsSaved=\$\{reloadUiSettings\}/.test(src), '系统页必须把「保存后重拉」接上')
 
     // ④ 设置块：勾选即保存、非布尔不发、失败重读；读面由系统页统一持有。
@@ -6092,6 +6106,9 @@ async function main () {
     assert.ok(!/60 秒内无需重复/.test(notifySeg), '不得再写死「60 秒内无需重复」')
     assert.ok(src.includes('typeof dupMsg === \'function\' ? dupMsg(data) : dupMsg'),
       'triggerVia 必须支持函数式 dupMsg（保留字符串形态给 /trigger）')
+    // 只留着表达式不算修好：拦截文案必须真的由 dupMsg(data) 构造（Sourcery #303 M11）。
+    assert.ok(/const msg = typeof dupMsg === 'function' \? dupMsg\(data\) : dupMsg[\s\S]{0,160}new Error\(msg\)/.test(src),
+      '拦截提示必须用 dupMsg(data) 的结果构造 Error，不能留一段不参与构造的死代码')
 
     // ③ 设置块（v3.342 从配置页搬到系统页）：保存带乐观锁、成功文案不吹「已生效」。
     // 切片锚点必须真存在：锚点丢了 indexOf 返回 -1，slice 会退化成「文件余下全部」，
