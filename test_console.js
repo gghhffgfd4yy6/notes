@@ -5555,9 +5555,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.332：注释里的版本号不得写下一版 v3.333。
-    assert.ok(!/v3\.333/.test(src), 'app.js 注释不得写 v3.333（版本未 bump）')
-    assert.ok(!/v3\.333/.test(css), 'app.css 注释不得写 v3.333（版本未 bump）')
+    // 版本已 bump 到 3.333：注释里的版本号不得写下一版 v3.334。
+    assert.ok(!/v3\.334/.test(src), 'app.js 注释不得写 v3.334（版本未 bump）')
+    assert.ok(!/v3\.334/.test(css), 'app.css 注释不得写 v3.334（版本未 bump）')
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
@@ -5608,6 +5608,20 @@ async function main () {
     const gesture = src.slice(src.indexOf('function usePullToRefresh'), src.indexOf('function PullRefreshStatus'))
     const appPull = src.slice(src.indexOf('const pullRefresh = useCallback'), src.indexOf('const pull = usePullToRefresh'))
     assert.ok(!/location\.reload|location\.href\s*=/.test(gesture + appPull), '下拉刷新不得整页重载')
+
+    // 结构红线: 快速刷新不得闪文案（v3.333）
+    // 本地缓存命中时 loading 只存在 17ms（实测 512→529），「· 更新中…」和「刷新中…」
+    // 跟着出现又消失就是一闪；只允许慢加载（>600ms）才显示。
+    assert.ok(src.includes('function useSlowFlag (on, delay = 600)'),
+      '必须有 useSlowFlag：loading 只闪十几毫秒时不得切文案')
+    assert.ok(src.includes('const slowLoading = useSlowFlag(loading)'),
+      '推送记录必须用 slowLoading 决定「更新中…」')
+    assert.ok(src.includes('slowLoading ? html`<span class="msg-loading"> · 更新中…</span>`'),
+      '「匹配 N 条」的后缀只能由 slowLoading 控制，不能用 loading')
+    assert.ok(!src.includes("刷新中…' : '刷新'"),
+      '刷新按钮不得改文案：宽度变化会把导出按钮挤一下')
+    assert.ok(src.includes('slowLoading && html`<span class="fr-status-muted">刷新中…</span>`'),
+      '过滤规则的「刷新中…」同样只能慢加载才显示')
   })
 
   // ── v3.332 部署后旧标签页提示 ─────────────────────────────────────────

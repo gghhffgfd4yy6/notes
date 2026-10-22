@@ -1,5 +1,4 @@
-//* ******* 线报酷推送脚本 v3.332 — 部署后旧标签页提示刷新 *********
-
+//* ******* 线报酷推送脚本 v3.333 — 快速刷新不再闪「更新中…」 *********
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
 /* eslint no-control-regex: off, no-new: off */ // 控制字符正则用于脱敏、new RegExp 用于配置正则合法性验证（均有意）

@@ -2308,6 +2308,18 @@ function PullRefreshStatus ({ state }) {
   </span>`
 }
 
+// 慢加载才亮「更新中…」：本地缓存命中时 loading 只存在十几毫秒（实测 512ms→529ms），
+// 文案跟着切两次就是一闪。超过 600ms 还没回来才算真的慢，这时提示才有意义。
+function useSlowFlag (on, delay = 600) {
+  const [slow, setSlow] = useState(false)
+  useEffect(() => {
+    if (!on) { setSlow(false); return undefined }
+    const t = setTimeout(() => setSlow(true), delay)
+    return () => clearTimeout(t)
+  }, [on, delay])
+  return slow
+}
+
 // 趋势天数选择器固定选项（与服务端白名单 TREND_DAYS_ALLOWED 对齐；14 为默认省略参数）
 const TREND_DAYS = [14, 30, 60]
 
@@ -2939,6 +2951,7 @@ function MessagesPanel ({ onSync, active = true }) {
     },
     [page, size, cate, query, days, rangeActive, range.from, range.to])
   const { data, err, load, loading, settleTick } = usePanelLoader(fetchMessages, onSync)
+  const slowLoading = useSlowFlag(loading)
   // armLand 需要「点击那一刻的 data」做前后对比；渲染期同步，避免闭包拿到旧值。
   dataRef.current = data
   // 保活后每次切回本页都静默拉一次新数据：旧列表留在原地（loading 不会清 data），
@@ -3107,7 +3120,7 @@ function MessagesPanel ({ onSync, active = true }) {
       <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
         options=${[10, 20, 50, 100].map((n) => ({ value: String(n), label: `每页 ${n} 条` }))}
         onChange=${(v) => { armLand(); setSize(Number(v)); setPage(1) }} />
-      <${Button} variant="ghost" disabled=${loading} onClick=${refreshNow}>${loading ? '刷新中…' : '刷新'}<//>
+      <${Button} variant="ghost" disabled=${loading} aria-busy=${loading ? 'true' : 'false'} onClick=${refreshNow}>刷新<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
     </div>
@@ -3117,7 +3130,7 @@ function MessagesPanel ({ onSync, active = true }) {
     ${loading && !data && html`<div class="empty">加载中…</div>`}
     ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<${Hint}>正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）<//>` : ''}</div>`}
     ${data && data.status === 'ok' && html`<div ref=${listRef}>
-      <div class="msg-count" aria-live="polite">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}${loading ? html`<span class="msg-loading"> · 更新中…</span>` : ''}</div>
+      <div class="msg-count" aria-live="polite">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}${slowLoading ? html`<span class="msg-loading"> · 更新中…</span>` : ''}</div>
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
         : html`<div class="msg-list">
@@ -3835,6 +3848,7 @@ function FilterRulesPanel ({ onSync, active = true }) {
   const [backupListKnown, setBackupListKnown] = useState(false)
   const [restoreTo, setRestoreTo] = useState('default')
   const [loading, setLoading] = useState(false)
+  const slowLoading = useSlowFlag(loading)
   const [busy, setBusy] = useState('') // '' | validate | preview | save | copy | restore
   const [err, setErr] = useState('')
   const [fieldErrors, setFieldErrors] = useState({})
@@ -4241,7 +4255,7 @@ function FilterRulesPanel ({ onSync, active = true }) {
           : html`<span class="fr-status-v">r${appliedRev}${appliedAt ? ` · ${appliedAt}` : ''}</span>`}</span>
         ${pendingNext && html`<span class="fr-status-item"><${Badge} tone="warn">r${revision} 待下一轮<//></span>`}
         ${dirtyFields.length > 0 && html`<span class="fr-status-item"><${Badge} tone="warn">有未保存修改<//></span>`}
-        ${loading && html`<span class="fr-status-muted">刷新中…</span>`}
+        ${slowLoading && html`<span class="fr-status-muted">刷新中…</span>`}
       </div>
 
       ${(corrupt || auditBroken) && html`<div class="alert-banner" role="alert">
