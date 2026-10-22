@@ -3455,7 +3455,6 @@ function SysPanel ({ onReady, active = true }) {
   // v3.335：系统页「检查更新」——页内下拉只刷数据、不换脚本，旧标签页得有个就地入口。
   // 比对的是页面启动版本（BOOT.version）与服务端当前版本；不一致就刷新整页。
   const [verState, setVerState] = useState('') // '' | 'checking' | 'latest' | 'stale' | 'error'
-  const [staleVer, setStaleVer] = useState('')
   const verTimerRef = useRef(0)
   const verSeqRef = useRef(0)
   const verBusyRef = useRef(false) // 同步闸：同一 tick 连点只发一次探针（state 要等重渲染）
@@ -3472,7 +3471,6 @@ function SysPanel ({ onReady, active = true }) {
       const v = s && typeof s.version === 'string' ? s.version : ''
       clearTimeout(verTimerRef.current)
       if (v !== '' && v !== BOOT.version) {
-        setStaleVer(v)
         setVerState('stale')
         verTimerRef.current = setTimeout(() => window.location.reload(), 600)
         return // stale 不放开闸：刷新已排期，等 reload
@@ -3545,7 +3543,7 @@ function SysPanel ({ onReady, active = true }) {
     ${err && html`<${Hint} tone="error">${err}<//>`}
     <div class="sys-grid">
       <table class="sys-table"><tbody>
-        <tr><td>脚本版本</td><td>${info.version ? `v${info.version}` : '—'}<button type="button" class="ver-check" disabled=${verState === 'checking'} onClick=${checkVersion}>检查更新</button>${verState === 'latest' ? html`<span class="ver-state ok">已是最新</span>` : ''}${verState === 'stale' ? html`<span class="ver-state warn">发现 v${staleVer}，正在刷新…</span>` : ''}${verState === 'error' ? html`<span class="ver-state bad">检查失败</span>` : ''}</td></tr>
+        <tr><td>脚本版本</td><td><span class="ver-line"><span class="ver-num">${info.version ? `v${info.version}` : '—'}</span><button type="button" class=${'ver-check ' + (verState === 'latest' ? 'ok' : verState === 'stale' ? 'warn' : verState === 'error' ? 'bad' : '')} disabled=${verState === 'checking'} onClick=${checkVersion}>${verState === 'checking' ? '检查中…' : verState === 'latest' ? '✓ 已是最新' : verState === 'stale' ? '正在刷新…' : verState === 'error' ? '检查失败' : '检查更新'}</button></span></td></tr>
         <tr><td>Node.js</td><td>${info.node || '—'}</td></tr>
         <tr><td>平台</td><td>${info.platform || '—'}</td></tr>
       </tbody></table>
