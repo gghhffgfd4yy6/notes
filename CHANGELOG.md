@@ -716,5 +716,5 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 ## v3.336 — 系统信息「版本行」不再挤成一团
 
 - **现象**：360 宽真机上「已是最新」被按字拆成「已是 / 最新」，后半截掉到下一行最左，和版本的按钮挤在一起，很难看。原因是 `td:last-child` 带 `overflow-wrap: anywhere`，中文可以逐字断行，而按钮和状态又是行内元素。
-- **修复**：版本号 / 按钮 / 状态包进 `.ver-line`（`display:flex; flex-wrap:wrap; gap:6px 8px`），状态加 `white-space: nowrap` 并做成小胶囊（`.ver-state` 带底色）。窄屏放不下时整块换行，不再断字。
-- **门禁**：`test_console.js` 锁定 `.ver-line` 容器与 `.ver-state` 的 `white-space: nowrap`。
+- **修复**：版本行固定一行——版本号 + 一个按钮，状态写在按钮自己身上（`检查更新 → ✓ 已是最新 / 正在刷新… / 检查失败`，成功后 2.5s 复原），不再额外挂一枚会悬空的小胶囊，行高与上下行一致。`.ver-line` 保留 `flex-wrap: wrap` 作兜底，比 320px 更窄时整块换行而不是溢出。
+- **门禁**：`test_console.js` 锁定 `.ver-line` 容器、按钮 `white-space: nowrap`，以及 latest/stale/error 与文案的映射顺序。

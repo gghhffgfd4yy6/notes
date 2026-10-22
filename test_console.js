@@ -5667,7 +5667,7 @@ async function main () {
     assert.ok(sysPanel.includes('if (verBusyRef.current || verState === \'stale\') return'),
       '同一 tick 连点只能发一次探针，且已排期刷新时再点不得取消那次 reload')
     assert.ok(sysPanel.includes(": '检查更新'"), '空闲态按钮文案必须是「检查更新」')
-    assert.ok(sysPanel.includes("'✓ 已是最新'"), '成功后状态写在按钮上（不另挂一枚胶囊）')
+    assert.ok(sysPanel.includes("verState === 'latest' ? '✓ 已是最新' : verState === 'stale' ? '正在刷新…' : verState === 'error' ? '检查失败'"), '按钮文案必须按 latest/stale/error 正确映射（顺序写错不得通过）')
     assert.ok(css.includes('.ver-check {') && css.includes('.ver-check.ok {'), '检查更新的按钮/成功态样式必须真的在 css 里')
     assert.ok(sysPanel.includes('<span class="ver-line">'), '版本行必须用 .ver-line 容器排布')
     assert.ok(/\.ver-check \{[^}]*white-space: nowrap/.test(css), '按钮文案不得按字换行')

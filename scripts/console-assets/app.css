@@ -844,7 +844,7 @@
   /* v3.335：脚本版本旁的就地检查更新（页内下拉只换数据，换脚本必须整页刷新）。 */
   /* v3.336：版本行固定一行——版本号 + 一个按钮。状态写在按钮自己身上
      （检查更新 → ✓ 已是最新），不再多一个悬空的小胶囊，也不会把行撑高。 */
-  .ver-line { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12.5px; }
+  .ver-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; font-family: var(--mono); font-size: 12.5px; }
   .ver-num { white-space: nowrap; }
   .ver-check { font-family: inherit; font-size: 12px; padding: 4px 10px; min-height: 36px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2); color: var(--text); cursor: pointer; white-space: nowrap; }
   .ver-check:disabled { opacity: .6; cursor: default; }
