@@ -5528,9 +5528,33 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.329：注释里的版本号不得写下一版 v3.330。
-    assert.ok(!/v3\.330/.test(src), 'app.js 注释不得写 v3.330（版本未 bump）')
-    assert.ok(!/v3\.330/.test(css), 'app.css 注释不得写 v3.330（版本未 bump）')
+    // 版本已 bump 到 3.330：注释里的版本号不得写下一版 v3.331。
+    assert.ok(!/v3\.331/.test(src), 'app.js 注释不得写 v3.331（版本未 bump）')
+    assert.ok(!/v3\.331/.test(css), 'app.css 注释不得写 v3.331（版本未 bump）')
+  })
+
+  await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    // ① 必须关掉内核原生下拉刷新：它就是「整页重载」的入口，不关掉后面做多少都是白搭。
+    assert.ok(/overscroll-behavior-y:\s*contain/.test(css), '必须用 overscroll-behavior-y: contain 关掉 Chrome 原生下拉刷新')
+    // ② 手势：被动监听 + touchcancel（中断手势不能卡在刷新态）；阈值与阻尼固定。
+    assert.ok(src.includes('function usePullToRefresh'), '缺少下拉手势 hook')
+    assert.ok(src.includes("window.addEventListener('touchstart', onStart, { passive: true })"), 'touchstart 必须 passive')
+    assert.ok(src.includes("window.addEventListener('touchcancel', onEnd"), '必须处理 touchcancel，否则中断手势会卡死在刷新态')
+    assert.ok(src.includes('const PULL_TRIGGER = 56') && src.includes('dy * 0.5'), '阈值/阻尼必须固定（56px、0.5 倍）')
+    assert.ok(src.includes('const inScrolled = (touch)'), '必须跳过内部已滚动的容器（日志框/列表），否则回看日志会被当成下拉')
+    // ③ 指示条三态，且固定定位——不能把内容顶下去（那就又变成跳了）。
+    assert.ok(src.includes("'下拉刷新'") && src.includes("'松开刷新'") && src.includes("'正在刷新…'"), '指示条必须有三态文案')
+    assert.ok(/\.ptr\s*\{[^}]*position:\s*fixed/.test(css), '指示条必须 fixed，不能参与布局')
+    // ④ 每个页签面板都要把自己的 loader 交给同一次下拉刷新（缺一个就是「这页拉了没反应」）。
+    const calls = (src.match(/usePullRefresh\(/g) || []).length
+    assert.ok(calls >= 9, `至少 9 个面板接入下拉刷新，实际 ${calls}`)
+    // ⑤ App 侧广播 + 等所有 loader 落定才收指示条；下拉路径不得整页重载。
+    assert.ok(src.includes('window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail }))'), 'App 必须广播下拉刷新事件')
+    assert.ok(src.includes('Promise.allSettled([refreshSplit(), refreshAuto(), ...detail.waits])'), '必须等主轮询与所有面板一起落定')
+    const pullBody = src.slice(src.indexOf('function usePullToRefresh'), src.indexOf('function PullRefreshBar'))
+    assert.ok(!/location\.reload|location\.href\s*=/.test(pullBody), '下拉刷新不得整页重载')
   })
 
   await aok('结构红线: v3.326 逐轮历史切档不闪（两档快照预取 / 无快照等数据回来再换）', () => {

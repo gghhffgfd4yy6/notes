@@ -233,6 +233,9 @@
 @layer base {
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
+  /* v3.330：下拉刷新由页面内接管（Chrome 原生下拉会整页重载，文档重建后首帧必然重画，
+     数据回得越快越像「闪一下」）。contain 关掉内核手势，页面滚动本身不受影响。 */
+  html, body { overscroll-behavior-y: contain; }
   body {
     background: var(--bg);
     color: var(--text);
@@ -264,6 +267,25 @@
      只减顶部、不减页脚和 padding 的固定常量（短页会多出一段无意义滚动）。 */
   .page { flex: 1 0 auto; }
   .page[hidden] { display: none; }
+
+  /* ── 下拉刷新指示条（v3.330）── */
+  /* 固定层、不参与布局：下拉立即出现，数据回来才收起；不重建页面、不改滚动位置。 */
+  .ptr {
+    position: fixed; z-index: 70; left: 50%; transform: translateX(-50%);
+    top: calc(env(safe-area-inset-top, 0px) + 8px);
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 14px; border-radius: 999px;
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    box-shadow: var(--shadow-card); font-size: var(--fs-sm);
+    pointer-events: none; white-space: nowrap;
+  }
+  .ptr-ring {
+    width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid var(--accent); border-right-color: transparent;
+  }
+  .ptr.ready .ptr-ring { border-right-color: var(--accent); border-top-color: transparent; }
+  .ptr.busy .ptr-ring { animation: ptr-spin .7s linear infinite; }
+  @keyframes ptr-spin { to { transform: rotate(360deg); } }
 
   /* ── 顶栏 ── */
   .topbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-4); }
