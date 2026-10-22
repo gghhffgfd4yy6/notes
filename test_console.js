@@ -5540,6 +5540,14 @@ async function main () {
       assert.strictEqual((pager.match(/\|\| loading/g) || []).length, 4, name + '四个分页按钮都必须 || loading（防连点）')
     }
 
+    // ④b 分页禁用态只轻压透明度：全局 .45 在浅色主题下会把整块洗白，翻页时
+    // 左两个按钮像凭空出现（v3.339 手机截图）。只看生效的规则：注释里留着
+    // `.pager .btn:disabled{opacity:.7}` 不能让断言假绿（Sourcery PR #302）。
+    const cssLive = css.replace(/\/\*[\s\S]*?\*\//g, '')
+    const pagerDisabled = (cssLive.match(/\.pager \.btn:disabled\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/opacity:\s*0?\.70?\s*;/.test(pagerDisabled), '分页禁用态透明度必须 .7（保留底色/边框轮廓）')
+    assert.ok(!/opacity:\s*0?\.45\s*;/.test(pagerDisabled), '分页禁用态不得回退到全局 .45')
+
     // ⑤ 分类弹层选中当前值不回调（同 MiniSelect 的值守卫）。
     const cateSeg = src.slice(src.indexOf('function CategoryPicker'), src.indexOf('function MessagesPanel'))
     const chooseFn = cateSeg.slice(cateSeg.indexOf('const choose = (name) => {'), cateSeg.indexOf('const pick = (o) =>'))
@@ -5574,9 +5582,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.338：注释里不得提前写下一版 v3.339。
-    assert.ok(!/v3\.339/.test(src), 'app.js 注释不得写 v3.339（版本未 bump）')
-    assert.ok(!/v3\.339/.test(css), 'app.css 注释不得写 v3.339（版本未 bump）')
+    // 版本已 bump 到 3.339：注释里不得提前写下一版 v3.340。
+    assert.ok(!/v3\.340/.test(src), 'app.js 注释不得写 v3.340（版本未 bump）')
+    assert.ok(!/v3\.340/.test(css), 'app.css 注释不得写 v3.340（版本未 bump）')
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
