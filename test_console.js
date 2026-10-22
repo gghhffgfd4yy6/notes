@@ -5555,9 +5555,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.333：注释里的版本号不得写下一版 v3.334。
-    assert.ok(!/v3\.334/.test(src), 'app.js 注释不得写 v3.334（版本未 bump）')
-    assert.ok(!/v3\.334/.test(css), 'app.css 注释不得写 v3.334（版本未 bump）')
+    // 版本已 bump 到 3.334：注释里的版本号不得写下一版 v3.335。
+    assert.ok(!/v3\.335/.test(src), 'app.js 注释不得写 v3.335（版本未 bump）')
+    assert.ok(!/v3\.335/.test(css), 'app.css 注释不得写 v3.335（版本未 bump）')
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
@@ -5617,9 +5617,20 @@ async function main () {
     const slowHook = src.slice(src.indexOf('function useSlowFlag'), src.indexOf('// 趋势天数选择器固定选项'))
     assert.ok(slowHook.includes('if (!on) { setSlow(false); return undefined }'), 'useSlowFlag 关闭时必须立刻复位')
     assert.ok(slowHook.includes('return slow && on'), 'useSlowFlag 必须在 on=false 的当帧就返回 false（完成后不得多渲染一帧提示）')
-    assert.ok(/ariaBusy=\$\{loading \? 'true' : 'false'\}/.test(src), '刷新按钮的 busy 必须真的传到 <button>（Button 转发 ariaBusy）')
-    assert.ok(/aria-busy=\$\{ariaBusy\}/.test(src), 'Button 必须把 ariaBusy 渲染成原生 aria-busy')
     const msgPanel = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel'))
+    assert.ok(/ariaBusy=\$\{loading \? 'true' : 'false'\}/.test(src), '刷新按钮的 busy 必须真的传到 <button>（Button 转发 ariaBusy）')
+    const btnAt = msgPanel.indexOf('<$' + '{Button} variant="ghost" disabled=')
+    const msgRefreshBtn = msgPanel.slice(btnAt, msgPanel.indexOf('刷新<//>', btnAt))
+    assert.ok(msgRefreshBtn.length > 40, '必须能定位到刷新按钮的 JSX')
+    assert.ok(!msgRefreshBtn.includes('disabled=$' + '{loading}'), '刷新按钮不得因 loading 变灰：15ms 的 0.45 透明度就是一帧闪')
+    assert.ok(msgRefreshBtn.includes('disabled=$' + '{slowLoading}'), '只在慢加载时禁用刷新按钮')
+    const msgRefresh = msgPanel.slice(msgPanel.indexOf('const refreshNow = () => {'), msgPanel.indexOf('const [exporting', msgPanel.indexOf('const refreshNow = () => {')))
+    const guardAt = msgRefresh.indexOf('if (loading || busyRef.current) return')
+    const loadAt = msgRefresh.indexOf('load().catch')
+    assert.ok(guardAt > -1, '刷新必须有 in-flight 守护（覆盖自动/下拉刷新）')
+    assert.ok(loadAt > guardAt, '守护之后必须真的走到 load()，不能提前 return 成空操作')
+    assert.ok(!/return/.test(msgRefresh.slice(guardAt + 36, loadAt)), '守护之后到 load 之间不得再提前 return')
+    assert.ok(/aria-busy=\$\{ariaBusy\}/.test(src), 'Button 必须把 ariaBusy 渲染成原生 aria-busy')
     assert.ok(msgPanel.includes('const slowLoading = useSlowFlag(loading)'),
       '推送记录必须用 slowLoading 决定「更新中…」')
     assert.ok(msgPanel.includes('slowLoading ? html`<span class="msg-loading"> · 更新中…</span>`'),

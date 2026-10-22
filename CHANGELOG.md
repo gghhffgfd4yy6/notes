@@ -699,3 +699,9 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **修复**：新增 `useSlowFlag(on, 600)`——只有加载超过 600ms 才亮「更新中…」。缓存命中的快刷新完全不动文案，慢加载（真等网络/大文件）照常提示。刷新按钮文案固定为「刷新」，加载中只用 `disabled` + `aria-busy` 表示，不再改宽度。
 - **范围**：推送记录的计数后缀与刷新按钮；过滤规则的「刷新中…」同规则（同一套 hook）。
 - **门禁**：`test_console.js` 新增 v3.333 红线（必须有 `useSlowFlag`、计数后缀只能由 `slowLoading` 控制、按钮不得再出现「刷新中…」文案切换）。
+
+## v3.334 — 刷新按钮不再因 loading 变灰（15ms 的一下闪）
+
+- **现象**：v3.333 之后「匹配 582 条」这行不动了，但按钮还在闪：`disabled=${loading}` 会在缓存命中时把「刷新」压到 **0.45 透明度**再弹回来，实测 9ms 变灰 → 24ms 复原（15ms），正好在计数行上方。
+- **修复**：按钮不再跟 `loading` 变灰，只在 `slowLoading`（>600ms）时禁用；连点用 `busyRef` 挡（`Promise.resolve(load()).finally(...)` 复位），语义不变。
+- **门禁**：`test_console.js` 增加红线——刷新按钮不得 `disabled=${loading}`、必须 `disabled=${slowLoading}` 且有 `busyRef` 连点闸；旧的「纯刷新不得搬滚动位置」断言跟着改成 `Promise.resolve(load()).catch`。
