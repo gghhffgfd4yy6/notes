@@ -4576,12 +4576,31 @@ async function main () {
       return all.length ? all[all.length - 1][1] : ''
     }
     const topbarPhone = lastPhoneRule(/\.topbar\s*\{([^}]*)\}/g)
-    const brandPhone = lastPhoneRule(/\.brand\s*\{([^}]*)\}/g)
     const syncPhone = lastPhoneRule(/\.sync\s*\{([^}]*)\}/g)
     assert.ok(/flex-direction:\s*column/.test(topbarPhone),
       '最后一条手机 .topbar 规则必须是 column，后置规则不能把它改回 row')
-    assert.ok(/flex-wrap:\s*nowrap/.test(brandPhone) && /white-space:\s*nowrap/.test(brandPhone),
-      '手机端 brand 必须单行，徽章变长不能换行顶动页签')
+    // v3.338：顶栏不再有品牌行（名字只留在浏览器标签上），只剩一行状态/刷新信息。
+    assert.ok(!src.includes('<span class="name">') && !/\.brand\s*\{/.test(css),
+      '页面里不得再渲染控制台名字（品牌行已去掉）')
+    const metaRule = (css.match(/\.sync-meta\s*\{[^}]*\}/) || [''])[0]
+    // 省略号三件套缺一不可：只写 text-overflow 而没有 overflow:hidden/nowrap 时，
+    // 文本会换行或被裁掉而不是出省略号（Sourcery #301）。
+    const metaOk = /text-overflow:\s*ellipsis/.test(metaRule) && /overflow:\s*hidden/.test(metaRule) &&
+      /white-space:\s*nowrap/.test(metaRule)
+    assert.ok(src.includes('<span class="sync-meta">') && metaOk,
+      'sync-meta 必须 ellipsis + overflow:hidden + nowrap，长文案才真的收省略号')
+    // 失败整句必须在 .sync 之外（同步容器里的第一个 </div> 之后、</header> 之前）：
+    // 只看 class 是否存在的话，挪回行内照样绿（Sourcery #301）。
+    const syncOpen = src.indexOf('class="sync"')
+    const syncClose = src.indexOf('</div>', syncOpen)
+    const failAt = src.indexOf('class="sync-fail"')
+    const headerEnd = src.indexOf('</header>', syncOpen)
+    assert.ok(css.includes('.sync-fail {') && failAt > syncClose && failAt < headerEnd,
+      '刷新失败必须渲染在 .sync 之外、header 之内（挤在行内会被省略号吃掉）')
+    // 按钮不能被压缩或换行：窄屏时让位的是中间文本，不是「暂停」。
+    const toggleRule = (css.match(/\.sync-toggle\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/flex:\s*0 0 auto/.test(toggleRule) && /white-space:\s*nowrap/.test(toggleRule),
+      'sync-toggle 必须 flex:0 0 auto + nowrap，否则窄屏会被压缩换行')
     assert.ok(/white-space:\s*nowrap/.test(syncPhone) && /min-height:\s*24px/.test(syncPhone),
       '手机端 sync 必须单行 + 固定行高，文字长短不能改高度')
     assert.ok(/class="sync"[^>]*tabindex="0"/.test(src),
@@ -5555,9 +5574,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.336：注释里的版本号不得写下一版 v3.337。
-    assert.ok(!/v3\.337/.test(src), 'app.js 注释不得写 v3.337（版本未 bump）')
-    assert.ok(!/v3\.337/.test(css), 'app.css 注释不得写 v3.337（版本未 bump）')
+    // 版本已 bump 到 3.338：注释里不得提前写下一版 v3.339。
+    assert.ok(!/v3\.339/.test(src), 'app.js 注释不得写 v3.339（版本未 bump）')
+    assert.ok(!/v3\.339/.test(css), 'app.css 注释不得写 v3.339（版本未 bump）')
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
