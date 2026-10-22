@@ -5218,24 +5218,22 @@ function App () {
     : `${locking ? '任务运行中' : '空闲'}${livePolling ? '' : '（快照）'}`
   return html`<div class="wrap">
     <header class="topbar">
-      <div class="brand">
-        <span class="logo">⚡</span>
-        <span class="name">xbk-push 控制台</span>
+      <div class="sync" ref=${syncRef} tabindex="0" aria-label="状态与刷新">
         <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
-      </div>
-      <div class="sync" ref=${syncRef} tabindex="0" aria-label="刷新状态">
-        ${pull.state !== 'idle'
-          ? html`<${PullRefreshStatus} state=${pull.state} />`
-          : tab === 'overview'
-            ? (autoRefresh ? html`<${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${lastSync} />` : '自动刷新已暂停')
-            : panelSync ? `数据截至 · ${fmtLocalTime(panelSync)}` : '数据截至 · —'}
+        <span class="sync-meta">
+          ${pull.state !== 'idle'
+            ? html`<${PullRefreshStatus} state=${pull.state} />`
+            : tab === 'overview'
+              ? (autoRefresh ? html`<${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${lastSync} />` : '自动刷新已暂停')
+              : panelSync ? `数据截至 · ${fmtLocalTime(panelSync)}` : '数据截至 · —'}
+        </span>
         ${tab === 'overview' && html`<button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
           onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`}
-        ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
         <button type="button" class="sync-toggle theme-btn" onClick=${cycleTheme}
           aria-label=${'切换主题（当前 ' + themeLabel + '，下一套 ' + nextThemeLabel + '）'}
           title=${'主题：' + themeLabel + ' → ' + nextThemeLabel}>◐ ${themeLabel}</button>
       </div>
+      ${syncErr ? html`<div class="sync-fail" role="status">${syncErr}</div>` : ''}
     </header>
 
     ${newVersion !== '' && html`<div class="alert-banner nudge" role="status">

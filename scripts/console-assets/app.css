@@ -280,11 +280,16 @@
   @keyframes ptr-spin { to { transform: rotate(360deg); } }
 
   /* ── 顶栏 ── */
-  .topbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-4); }
-  .brand { display: flex; align-items: center; gap: var(--sp-3); }
-  .logo { font-size: var(--fs-2xl); }
-  .name { font-size: var(--fs-xl); font-weight: 600; letter-spacing: .3px; }
-  .sync { color: var(--text-dim); font-size: var(--fs-xs); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  /* v3.338：页面里不再有品牌行——名字只留在浏览器标签上。顶栏只有一行：
+     状态徽章 · 刷新信息 · 暂停 · 主题。行高固定 24px，中间那段文本超长时自己
+     收成省略号，两侧按钮永不换行、也不会被挤出屏幕。 */
+  .topbar { display: flex; flex-direction: column; gap: 4px; margin-bottom: var(--sp-4); }
+  .sync { color: var(--text-dim); font-size: var(--fs-xs); display: flex; align-items: center; gap: 8px;
+    flex-wrap: nowrap; min-width: 0; min-height: 24px; }
+  .sync > .badge { flex: 0 0 auto; white-space: nowrap; }
+  .sync-meta { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 刷新失败的整句（含原因）单独一行：挤在一行里会被省略号吃掉，反而是最该看的字没了。 */
+  .sync-fail { color: var(--warn-fg); font-size: var(--fs-xs); line-height: 1.5; overflow-wrap: anywhere; }
   .sync-toggle {
     border: 1px solid var(--border); background: var(--panel-2); color: var(--text-dim);
     border-radius: var(--r-pill); padding: 1px 8px; font-size: var(--fs-2xs); cursor: pointer; min-height: 24px;
@@ -979,22 +984,13 @@
 
   /* ── 手机 ── */
   @media (max-width: 640px) {
-    /* 顶栏固定两行：brand 一行、sync 一行。否则「手动刷新」→「数据截至 · …」
-       会让 sync 从 1 行变 2 行，页签栏和正文整体被顶下 ~27px——切页时看到的
-       “跳”就是这个，不是滚动位置。两行后高度恒定，内容再晚到也不挪页签。 */
+    /* 顶栏只有一行状态/刷新信息（v3.338：品牌行已去掉）。行高与换行都锁死，
+       文字从「自动刷新 · …」变成「数据截至 · …」也不会顶动下面的页签。 */
     .topbar { flex-direction: column; align-items: stretch; flex-wrap: nowrap; gap: 4px; }
-    .brand {
-      align-self: flex-start; flex-wrap: nowrap; white-space: nowrap;
-      min-height: 24px; max-width: 100%; overflow: hidden;
-    }
-    .brand .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-    .brand .badge { flex: 0 0 auto; white-space: nowrap; }
     .sync {
       flex: 0 0 auto; flex-wrap: nowrap; justify-content: flex-start; min-height: 24px;
-      white-space: nowrap; overflow-x: auto; overflow-y: hidden;
-      -webkit-overflow-scrolling: touch; scrollbar-width: none;
+      white-space: nowrap; overflow: hidden;
     }
-    .sync::-webkit-scrollbar { display: none; }
     .sync:focus-visible { outline: var(--ring); outline-offset: 2px; border-radius: 4px; }
     .sync .sync-toggle:focus-visible { outline-offset: -2px; }
     .wrap { padding: var(--sp-3) 10px calc(30px + env(safe-area-inset-bottom)); }
