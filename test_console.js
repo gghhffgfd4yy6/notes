@@ -5528,9 +5528,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.330：注释里的版本号不得写下一版 v3.331。
-    assert.ok(!/v3\.331/.test(src), 'app.js 注释不得写 v3.331（版本未 bump）')
-    assert.ok(!/v3\.331/.test(css), 'app.css 注释不得写 v3.331（版本未 bump）')
+    // 版本已 bump 到 3.331：注释里的版本号不得写下一版 v3.332。
+    assert.ok(!/v3\.332/.test(src), 'app.js 注释不得写 v3.332（版本未 bump）')
+    assert.ok(!/v3\.332/.test(css), 'app.css 注释不得写 v3.332（版本未 bump）')
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
@@ -5550,9 +5550,13 @@ async function main () {
     // ③ 内部已滚动的容器不算下拉：判定体必须真的看 scrollTop 与 overflowY。
     const inScrolled = src.slice(src.indexOf('const inScrolled = (touch)'), src.indexOf('const onStart = (e)'))
     assert.ok(inScrolled.includes('scrollTop > 0') && inScrolled.includes('overflowY'), 'inScrolled 必须检查 scrollTop 与 overflowY，不能空转 return false')
-    // ④ 指示条三态，且固定定位——不能把内容顶下去（那就又变成跳了）。
-    assert.ok(src.includes("'下拉刷新'") && src.includes("'松开刷新'") && src.includes("'正在刷新…'"), '指示条必须有三态文案')
-    assert.ok(/\.ptr\s*\{[^}]*position:\s*fixed/.test(cssLive), '指示条必须 fixed，不能参与布局')
+    // ④ 三态文案写在顶栏「数据截至」这一行；不允许再用浮层盖住标题（v3.331 真机反馈）。
+    assert.ok(src.includes("'下拉刷新'") && src.includes("'松开刷新'") && src.includes("'正在刷新…'"), '必须有三态文案')
+    assert.ok(src.includes('function PullRefreshStatus'), '缺少顶栏行内状态组件')
+    assert.ok(!src.includes('PullRefreshBar') && !src.includes('class="ptr '), '不得再用浮层指示条')
+    assert.ok(!/\.ptr\s*\{[^}]*position:\s*fixed/.test(cssLive), '指示条不得 fixed 浮在标题上')
+    const syncRow = src.slice(src.indexOf('class="sync"'), src.indexOf('class="sync"') + 700)
+    assert.ok(syncRow.includes('pull.state') && syncRow.includes('PullRefreshStatus'), '刷新状态必须渲染在顶栏 .sync 行内')
     // ⑤ 每个页签面板都要接到同一次下拉刷新（数量不够或张冠李戴都要拦住）。
     for (const name of ['RunHistoryPanel', 'TrendsPanel', 'CacheHealthPanel', 'MessagesPanel', 'LogsPanel', 'ConfigPanel', 'FilesPanel', 'SysPanel', 'FilterRulesPanel']) {
       const at = src.indexOf('function ' + name + ' (')
@@ -5573,7 +5577,7 @@ async function main () {
     assert.ok(src.includes('refreshSplit({ force: true })'), '下拉必须绕过表单交互暂停')
     assert.ok(src.includes('Promise.allSettled([refreshSplit({ force: true }), refreshAuto(), ...detail.waits])'), '必须等主轮询与所有面板一起落定')
     // ⑧ 整条下拉路径（手势 + App 回调）都不得整页重载。
-    const gesture = src.slice(src.indexOf('function usePullToRefresh'), src.indexOf('function PullRefreshBar'))
+    const gesture = src.slice(src.indexOf('function usePullToRefresh'), src.indexOf('function PullRefreshStatus'))
     const appPull = src.slice(src.indexOf('const pullRefresh = useCallback'), src.indexOf('const pull = usePullToRefresh'))
     assert.ok(!/location\.reload|location\.href\s*=/.test(gesture + appPull), '下拉刷新不得整页重载')
   })

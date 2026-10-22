@@ -2294,12 +2294,13 @@ function usePullToRefresh (onRefresh, enabled = true) {
   return { state }
 }
 
-function PullRefreshBar ({ state }) {
-  if (state === 'idle') return null
+// v3.331：状态写在顶栏「数据截至」这一行（.sync），不做浮层——浮层会盖住标题，
+// 手机上「正在刷新…」正好压在 xbk-push 控制台上。
+function PullRefreshStatus ({ state }) {
   const label = state === 'busy' ? '正在刷新…' : state === 'ready' ? '松开刷新' : '下拉刷新'
-  return html`<div class=${'ptr ' + state} role="status" aria-live="polite">
+  return html`<span class=${'ptr-text ' + state} role="status" aria-live="polite">
     <span class="ptr-ring" aria-hidden="true"></span>${label}
-  </div>`
+  </span>`
 }
 
 // 趋势天数选择器固定选项（与服务端白名单 TREND_DAYS_ALLOWED 对齐；14 为默认省略参数）
@@ -5122,7 +5123,6 @@ function App () {
     ? '凭证失效'
     : `${locking ? '任务运行中' : '空闲'}${livePolling ? '' : '（快照）'}`
   return html`<div class="wrap">
-    <${PullRefreshBar} state=${pull.state} />
     <header class="topbar">
       <div class="brand">
         <span class="logo">⚡</span>
@@ -5130,11 +5130,13 @@ function App () {
         <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
       </div>
       <div class="sync" tabindex="0" aria-label="刷新状态">
-        ${tab === 'overview'
-          ? html`${autoRefresh ? html`<${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${lastSync} />` : '自动刷新已暂停'}
-            <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
-              onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`
-          : panelSync ? `数据截至 · ${fmtLocalTime(panelSync)}` : '数据截至 · —'}
+        ${pull.state !== 'idle'
+          ? html`<${PullRefreshStatus} state=${pull.state} />`
+          : tab === 'overview'
+            ? (autoRefresh ? html`<${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${lastSync} />` : '自动刷新已暂停')
+            : panelSync ? `数据截至 · ${fmtLocalTime(panelSync)}` : '数据截至 · —'}
+        ${tab === 'overview' && html`<button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
+          onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>`}
         ${syncErr ? html`<span class="sync-err"> · ${syncErr}</span>` : ''}
         <button type="button" class="sync-toggle theme-btn" onClick=${cycleTheme}
           aria-label=${'切换主题（当前 ' + themeLabel + '，下一套 ' + nextThemeLabel + '）'}
