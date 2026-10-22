@@ -6229,16 +6229,20 @@ async function main () {
   await aok('结构红线: v3.332 新版本提示（boot 版本 / 60s 对账 / 只提示不自动刷新）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
-    const server = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
+    const server = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
     // 版本只有一份来源：boot JSON 与 /api/sys 共用 APP_VERSION，别再各自 require package.json。
-    assert.ok(server.includes('const APP_VERSION = (() => {'), '版本必须抽成单一 APP_VERSION')
-    assert.ok(server.includes('JSON.stringify({ token: bootToken, version: APP_VERSION })'),
-      'boot JSON 必须注入版本（前端据此判断自己是不是旧页面）')
-    assert.ok(server.includes('const version = APP_VERSION'), '/api/sys 必须复用同一版本来源')
-    // 探针不能被缓存、不能挤掉访问日志，异常请求照记。
-    assert.ok(server.includes("res.setHeader('Cache-Control', 'no-store')"), '/api/sys 必须显式 no-store')
-    assert.ok(server.includes("url.searchParams.get('probe') === 'version'"), '探针必须可识别（probe=version）')
-    assert.ok(server.includes('if (!versionProbe && (url ? shouldLogAccess('), '探针 200 不入访问日志，401 等照记')
+    // 变异沙箱里 console.js 会被插桩：对象字面量与实参列表都被 stryMutAct_* 包裹，整句原文不再存在
+    // ⇒ 这些「源码串」红线只在原始源文件上有意义，插桩环境必须跳过（行为断言照跑）。
+    if (process.env.XBK_MUTATION_CHILD !== '1') {
+      assert.ok(server.includes('const APP_VERSION = (() => {'), '版本必须抽成单一 APP_VERSION')
+      assert.ok(server.includes('JSON.stringify({ token: bootToken, version: APP_VERSION })'),
+        'boot JSON 必须注入版本（前端据此判断自己是不是旧页面）')
+      assert.ok(server.includes('const version = APP_VERSION'), '/api/sys 必须复用同一版本来源')
+      // 探针不能被缓存、不能挤掉访问日志，异常请求照记。
+      assert.ok(server.includes("res.setHeader('Cache-Control', 'no-store')"), '/api/sys 必须显式 no-store')
+      assert.ok(server.includes("url.searchParams.get('probe') === 'version'"), '探针必须可识别（probe=version）')
+      assert.ok(server.includes('if (!versionProbe && (url ? shouldLogAccess('), '探针 200 不入访问日志，401 等照记')
+    }
     // 前端：读出 boot 版本，60s 对一次 /api/sys，只有不一致才提示。
     assert.ok(src.includes("version: typeof data.version === 'string' ? data.version : ''"), 'readBoot 必须解析 version')
     assert.ok(src.includes('const VERSION_CHECK_MS = 60000'), '对账间隔必须是 60s')
