@@ -4910,8 +4910,9 @@ async function main () {
       '大小写不敏感，但片段必须是原文（不能输出小写副本）')
     assert.deepStrictEqual(splitHits('abc', ''), [['abc', false]], '空关键词不切')
     assert.deepStrictEqual(splitHits('', 'x'), [['', false]], '空行原样返回（行不能被吞掉）')
-    assert.deepStrictEqual(splitHits('İstanbul', 'i'), [['İstanbul', false]],
-      '小写后长度会变的字符不切（索引与原文对不上就不猜，宁可不高亮）')
+    // v3.328 起：小写变长的字符不再整段放弃（服务端按小写命中，放弃会让卡片「匹配却无高亮」）。
+    assert.deepStrictEqual(splitHits('İstanbul', 'i'), [['İ', true], ['stanbul', false]],
+      '小写后长度会变时用下标映射回原文，命中字符仍要标出来')
   })
 
   // ── v3.328 推送记录搜索高亮 ─────────────────────────────────────────────
@@ -4924,6 +4925,11 @@ async function main () {
     assert.deepStrictEqual(splitHits('可乐', '可乐'), [['可乐', true]], '整段就是关键词时只留一个命中片段')
     assert.deepStrictEqual(splitHits(title, ''), [[title, false]], '没输入关键词时原样返回（不得出现空 <mark>）')
     assert.deepStrictEqual(splitHits('', '可乐'), [['', false]], '无标题/无正文的空串不能吞掉卡片')
+    // 长正文护栏：只标前 N 处，剩余文本整段按普通片段返回（颜色不再逐个建 <mark> 节点）。
+    assert.deepStrictEqual(splitHits('aaaaaa', 'a', 2), [['aa', true], ['aaaa', false]],
+      '超过命中上限后剩余文本必须整段返回（连续命中并成一段，上限按命中次数计）')
+    assert.deepStrictEqual(splitHits('İİ', 'i', 1), [['İ', true], ['İ', false]],
+      '一字符摊成多个小写码元时，上限也要按命中次数收敛')
   })
 
   await aok('结构红线: v3.328 推送记录高亮（标题 / 正文 / 生效词 / 主题变量）', () => {
@@ -4931,11 +4937,15 @@ async function main () {
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
     const ph = (name) => '$' + '{' + name + '}'
     const msg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('// 运行日志：'))
-    // 高亮必须跟「已生效的 query」走：结果还是上一轮的时候，input 里的新词不能先标黄。
-    assert.ok(msg.includes('const hitKw = query.trim().toLowerCase()'), '高亮词必须取自已生效的 query')
-    assert.ok(!msg.includes('input.trim().toLowerCase()'), '高亮不得直接取输入框（防抖期间与结果集不同源）')
-    assert.ok(msg.includes('splitHits(text, hitKw).map(([part, on], i) => on ? html`<mark key=' +
-      ph('i') + '>' + ph('part') + '</mark>` : part)'), '命中片段必须用 <mark> 包文本节点（不拼 innerHTML）')
+    // 高亮词必须跟「当前显示的这一页数据」同源（queryUsed），不是最新 query、更不是输入框：
+    // 防抖提交新词后新响应还没回来时，旧卡片会被新词标错（Sourcery PR #291 的 stale 窗口）。
+    assert.ok(msg.includes("const hitKw = (data && typeof data.queryUsed === 'string' ? data.queryUsed : '').trim().toLowerCase()"),
+      '高亮词必须取服务端为这批结果回显的 queryUsed')
+    assert.ok(!msg.includes('const hitKw = query'), '高亮词不得取最新 query（旧卡片会被新词标错）')
+    assert.ok(!msg.includes('input.trim().toLowerCase()'), '高亮不得直接取输入框')
+    assert.ok(src.includes('const MSG_HIT_MAX = 200'), '单条记录命中上限必须登记（超长正文不卡展开）')
+    assert.ok(msg.includes('splitHits(text, hitKw, MSG_HIT_MAX).map(([part, on], i) => on ? html`<mark key=' +
+      ph('i') + '>' + ph('part') + '</mark>` : part)'), '命中片段必须用 <mark> 包文本节点（不拼 innerHTML），并带上命中上限')
     assert.ok(msg.includes('$' + '{m.title ? hit(m.title) :'), '标题必须走命中高亮')
     assert.ok(msg.includes('$' + '{m.content ? hit(m.content) :'), '展开后的正文也必须走同一高亮（服务端也按正文搜）')
     assert.ok(!/innerHTML\s*=/.test(msg), '高亮不得拼 innerHTML（用户输入只能是文本节点）')

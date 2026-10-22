@@ -2710,6 +2710,10 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
   </div>`
 }
 
+// v3.328：单条记录最多标 200 处命中。超长正文里同一关键词可能重复上千次，每个命中一个
+// <mark> 会把「展开」卡住几秒；日志页超过 3000 行直接关高亮是同一思路（渲染上限，不改搜索口径）。
+const MSG_HIT_MAX = 200
+
 function MessagesPanel ({ onSync, active = true }) {
   const [page, setPage] = useState(1)
   const [size, setSize] = useState(20)
@@ -2907,10 +2911,13 @@ function MessagesPanel ({ onSync, active = true }) {
     ? data.categories.reduce((sum, c) => sum + (typeof c.count === 'number' ? c.count : 0), 0)
     : null
   // v3.328：搜索结果高亮——标题与正文里的命中片段套 <mark>。
-  // 用已生效的 query（防抖 300ms 后才改），不用输入框里的 input：结果集还是上一轮的时候，
-  // 高亮必须与结果同源，否则会出现「卡片里一个黄块都没有、计数却说匹配 1 条」。
-  const hitKw = query.trim().toLowerCase()
-  const hit = (text) => (typeof text === 'string' ? splitHits(text, hitKw).map(([part, on], i) => on ? html`<mark key=${i}>${part}</mark>` : part) : text)
+  // 高亮词必须与「当前显示的这一页数据」同源：data.queryUsed 是服务端为这批结果实际生效的词。
+  // 防抖提交新词后、新响应回来前 data 仍是上一轮的，用 query 会拿新词去标旧卡片
+  // （PR #291 Sourcery：Old results get wrong highlights）。
+  const hitKw = (data && typeof data.queryUsed === 'string' ? data.queryUsed : '').trim().toLowerCase()
+  const hit = (text) => (typeof text === 'string'
+    ? splitHits(text, hitKw, MSG_HIT_MAX).map(([part, on], i) => on ? html`<mark key=${i}>${part}</mark>` : part)
+    : text)
   // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，
   // 但只在「响应确实属于当前查询、且用户没有继续输入」时回写；
   // 否则旧响应会把刚打的新词覆盖回旧值（搜索像没生效）。
