@@ -4419,6 +4419,35 @@ async function main () {
     assert.ok(!/locking && html`<\$\{RunsPanel\}/.test(seg), '触发历史不得回退为仅运行中渲染')
   })
 
+  await aok('结构红线: 状态卡首帧占位，下拉刷新不再整块闪（v3.329）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const ph = src.match(/const CARD_PLACEHOLDERS = \[([\s\S]*?)\n\]/)
+    assert.ok(ph, '必须有 CARD_PLACEHOLDERS 占位卡定义')
+    const entries = ph[1].split('\n').filter((l) => l.includes("title: '"))
+    assert.strictEqual(entries.length, 4, '占位卡必须恰好四张（多一张会多占一整块）')
+    const want = [['今日', 2], ['近 7 天', 2], ['最近一轮', 1], ['通道与过滤', 2]]
+    want.forEach(([title, rows], i) => {
+      assert.ok(entries[i].includes(`title: '${title}'`), `第 ${i + 1} 张占位卡必须是「${title}」`)
+      const arr = entries[i].match(/lines: \[(.*)\]/)
+      assert.ok(arr, `「${title}」占位卡必须有 lines 明细`)
+      const n = arr[1].trim() === '' ? 0 : arr[1].split("', '").length
+      assert.strictEqual(n, rows, `「${title}」占位卡必须固定 ${rows} 行明细`)
+    })
+    const seg = src.slice(src.indexOf('function StatusCards'), src.indexOf('// ── 组件：触发按钮'))
+    const head = seg.slice(0, seg.indexOf('const rep ='))
+    assert.ok(!/return null/.test(head), '占位分支之前不得有任何 return null：首帧必须画出卡片')
+    const branch = head.match(/if \(!state\) \{[\s\S]*?return html`<\$\{CardsGrid\} cards=\$\{cards\} busy=\$\{!err\} \/>`/)
+    assert.ok(branch, 'StatusCards 的第一个分支必须直接返回占位网格')
+    assert.ok(branch[0].includes("const hint = err ? '读取失败' : '正在读取…'"),
+      '占位文案必须由 err 分支决定：失败时写「读取失败」，加载中写「正在读取…」')
+    // 加载完成态的行数必须与占位一致（数据缺失时也不能删行），否则卡片块仍会变高/变矮。
+    for (const fallback of ["['失败 —', '日报 —']", "['失败 — · 成功率 —', '日均 — 轮']", "['获取 — · 失败 — · 耗时 —']", "['最近过滤 —', '原因 —']"]) {
+      assert.ok(seg.includes(fallback), `数据缺失时明细行不得为空：缺 ${fallback}`)
+    }
+    assert.ok(!/\.\.\.\(stats && stats\.truncated/.test(seg), 'run.log 超窗提示不得新增第三行（会顶高周卡）')
+    assert.ok(/<\$\{StatusCards\} state=\$\{state\} err=\$\{statusFailed\} \/>/.test(src), 'App 必须把状态接口的失败传给状态卡')
+  })
+
   await aok('结构红线: 后台标签页不轮询（概览/日志/触发详情三处）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
@@ -5499,9 +5528,9 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.328：注释里的版本号不得写下一版 v3.329。
-    assert.ok(!/v3\.329/.test(src), 'app.js 注释不得写 v3.329（版本未 bump）')
-    assert.ok(!/v3\.329/.test(css), 'app.css 注释不得写 v3.329（版本未 bump）')
+    // 版本已 bump 到 3.329：注释里的版本号不得写下一版 v3.330。
+    assert.ok(!/v3\.330/.test(src), 'app.js 注释不得写 v3.330（版本未 bump）')
+    assert.ok(!/v3\.330/.test(css), 'app.css 注释不得写 v3.330（版本未 bump）')
   })
 
   await aok('结构红线: v3.326 逐轮历史切档不闪（两档快照预取 / 无快照等数据回来再换）', () => {
