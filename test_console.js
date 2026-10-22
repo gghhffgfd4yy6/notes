@@ -2403,6 +2403,9 @@ async function main () {
     assert.strictEqual(empty.status, 'missing', 'run.log 已删除必须 missing')
     const s = JSON.parse((await request(port, 'GET', '/api/sys', { token: TOKEN })).text)
     assert.ok(/^\d+\.\d+\.\d+/.test(s.version), `版本号必须是 semver 形态（实际 ${s.version}）`)
+    // v3.330：boot JSON 的启动版本必须与 /api/sys 当前版本同源，否则「有没有新版本」永远判不准。
+    assert.strictEqual(s.version, require('./package.json').version,
+      '/api/sys 版本必须等于 package.json（与 boot JSON 同一来源）')
     assert.strictEqual(s.cacheDir, dir)
     assert.ok(typeof s.uptimeS === 'number' && s.uptimeS >= 0)
     assert.ok(s.rssBytes > 0)
@@ -3927,6 +3930,25 @@ async function main () {
     assert.ok(!log2.items.some((it) => it.path.endsWith('seq=0') || it.path.endsWith('seq=1')), 'seq=0/seq=1 必须已被挤出')
     server.close()
   })
+  // v3.330：每 60s 一条的版本探针不能把 200 条环形挤干净（Sourcery #294）。
+  await aok('访问日志: v3.330 探针 ?probe=version 200 不入环形 / 普通 /api/sys 照记 / 响应 no-store', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const sysRes = await request(port, 'GET', '/api/sys', { token: TOKEN })
+    assert.strictEqual(sysRes.headers['cache-control'], 'no-store', '/api/sys 必须显式 no-store')
+    for (let i = 0; i < 3; i++) await request(port, 'GET', '/api/sys?probe=version', { token: TOKEN })
+    const log = JSON.parse((await request(port, 'GET', '/api/access-log', { token: TOKEN })).text)
+    assert.ok(!log.items.some((it) => it.path.includes('probe=version')), '探针 200 不得占访问日志环形')
+    assert.ok(log.items.some((it) => it.path === '/api/sys'), '普通 /api/sys 必须照记（系统页仍可审计）')
+    // 探针失败（未授权）必须照记——401 是最值得留痕的流量。
+    const bad = await request(port, 'GET', '/api/sys?probe=version')
+    assert.strictEqual(bad.status, 401)
+    const log2 = JSON.parse((await request(port, 'GET', '/api/access-log', { token: TOKEN })).text)
+    assert.ok(log2.items.some((it) => it.path.includes('probe=version') && it.status === 401), '探针 401 必须入日志')
+    server.close()
+  })
+
   await aok('访问日志: 降噪白名单 2xx 不入 / 404、5xx 入（含 POST /runs/detail 与 503 出口）', async () => {
     const dir = tmpDir()
     const { server, runs, setShuttingDown } = createConsole({ token: TOKEN, stateDir: dir })
@@ -5593,25 +5615,36 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
     const server = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
-    const ph = (name) => '$' + '{' + name + '}'
     // 版本只有一份来源：boot JSON 与 /api/sys 共用 APP_VERSION，别再各自 require package.json。
     assert.ok(server.includes('const APP_VERSION = (() => {'), '版本必须抽成单一 APP_VERSION')
     assert.ok(server.includes('JSON.stringify({ token: bootToken, version: APP_VERSION })'),
       'boot JSON 必须注入版本（前端据此判断自己是不是旧页面）')
     assert.ok(server.includes('const version = APP_VERSION'), '/api/sys 必须复用同一版本来源')
+    // 探针不能被缓存、不能挤掉访问日志，异常请求照记。
+    assert.ok(server.includes("res.setHeader('Cache-Control', 'no-store')"), '/api/sys 必须显式 no-store')
+    assert.ok(server.includes("url.searchParams.get('probe') === 'version'"), '探针必须可识别（probe=version）')
+    assert.ok(server.includes('if (!versionProbe && (url ? shouldLogAccess('), '探针 200 不入访问日志，401 等照记')
     // 前端：读出 boot 版本，60s 对一次 /api/sys，只有不一致才提示。
     assert.ok(src.includes("version: typeof data.version === 'string' ? data.version : ''"), 'readBoot 必须解析 version')
     assert.ok(src.includes('const VERSION_CHECK_MS = 60000'), '对账间隔必须是 60s')
     assert.ok(src.includes("if (stopped || document.visibilityState === 'hidden') return"), '页面隐藏时不得持续打接口')
     assert.ok(src.includes('const bootVersion = BOOT.version'), '对账基准必须是页面启动版本')
-    assert.ok(src.includes('if (!stopped && v !== \'\' && v !== bootVersion) setNewVersion(v)'),
-      '只有「版本非空且与启动版本不同」才提示（同版本不得误报）')
+    assert.ok(src.includes('if (!bootVersion || authExpired) return undefined'), '凭证失效后必须停表（401 会刷日志）')
+    assert.ok(src.includes('}, [authExpired])'), 'authExpired 必须能重启/停掉对账')
+    assert.ok(src.includes('if (stopped || mine < done) return'), '乱序响应必须丢弃（旧判定不得覆盖新判定）')
+    assert.ok(src.includes("setNewVersion(v !== '' && v !== bootVersion ? v : '')"),
+      '版本重新对齐（含回滚）必须收起提示，不得留过期横幅')
+    // 探针本身：no-store + 独立 URL。
+    assert.ok(src.includes('probeVersion ? { cache: \'no-store\' } : {}'), '探针必须 no-store（防代理喂旧版本）')
+    assert.ok(src.includes("fetch(probeVersion ? '/api/sys?probe=version' : '/api/sys', merged)"),
+      '探针必须走独立 URL，正常系统页请求不受影响')
     // 只提示、不自动 reload：刷新必须由用户点，避免打断正在填的表单。
     assert.ok(src.includes('$' + '{newVersion !== \'\' && html`<div class="alert-banner nudge" role="status">'),
       '提示条只在发现新版本时渲染，且是 status 不是 alert')
-    assert.ok(src.includes('控制台已更新到 ' + ph('newVersion')), '提示条必须点名新版本号')
-    assert.ok(src.includes('onClick=' + ph('() => window.location.reload()')), '刷新按钮必须由用户点击触发 reload')
-    const effect = src.slice(src.indexOf('const bootVersion = BOOT.version'), src.indexOf('}, [])', src.indexOf('const bootVersion = BOOT.version')))
+    assert.ok(src.includes('控制台已更新到 ' + '$' + '{newVersion}'), '提示条必须点名新版本号')
+    assert.ok(src.includes('onClick=' + '$' + '{() => window.location.reload()}'), '刷新按钮必须由用户点击触发 reload')
+    const effectFrom = src.indexOf('const bootVersion = BOOT.version')
+    const effect = src.slice(effectFrom, src.indexOf('}, [authExpired]', effectFrom))
     assert.ok(!effect.includes('location.reload'), '对账 effect 里不得自动 reload（会打断输入）')
     // 样式走主题变量，且用强调色而不是报错色。
     assert.ok(/\.alert-banner\.nudge\s*\{[^}]*var\(--accent-soft\)/.test(css) && /\.alert-banner\.nudge\s*\{[^}]*var\(--info-fg\)/.test(css),
