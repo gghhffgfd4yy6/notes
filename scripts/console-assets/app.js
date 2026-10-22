@@ -3457,22 +3457,33 @@ function SysPanel ({ onReady, active = true }) {
   const [verState, setVerState] = useState('') // '' | 'checking' | 'latest' | 'stale' | 'error'
   const [staleVer, setStaleVer] = useState('')
   const verTimerRef = useRef(0)
+  const verSeqRef = useRef(0)
+  const verBusyRef = useRef(false) // 同步闸：同一 tick 连点只发一次探针（state 要等重渲染）
   useEffect(() => () => clearTimeout(verTimerRef.current), [])
   const checkVersion = () => {
-    if (verState === 'checking') return
+    // stale：已经判定有新版本、刷新已排期——这时再点不得取消那次刷新。
+    if (verBusyRef.current || verState === 'stale') return
+    verBusyRef.current = true
+    const seq = ++verSeqRef.current
     clearTimeout(verTimerRef.current)
     setVerState('checking')
     apiGetSys({ probeVersion: true }).then((s) => {
+      if (seq !== verSeqRef.current) return // 乱序响应：旧探针不得覆盖新判定
       const v = s && typeof s.version === 'string' ? s.version : ''
+      clearTimeout(verTimerRef.current)
       if (v !== '' && v !== BOOT.version) {
         setStaleVer(v)
         setVerState('stale')
         verTimerRef.current = setTimeout(() => window.location.reload(), 600)
-        return
+        return // stale 不放开闸：刷新已排期，等 reload
       }
+      verBusyRef.current = false
       setVerState('latest')
       verTimerRef.current = setTimeout(() => setVerState(''), 2500)
     }).catch(() => {
+      if (seq !== verSeqRef.current) return
+      verBusyRef.current = false
+      clearTimeout(verTimerRef.current)
       setVerState('error')
       verTimerRef.current = setTimeout(() => setVerState(''), 2500)
     })

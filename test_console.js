@@ -5662,9 +5662,12 @@ async function main () {
     const sysPanel = src.slice(src.indexOf('function SysPanel'), src.indexOf('function SysPanel') + 20000)
     assert.ok(sysPanel.includes('apiGetSys({ probeVersion: true })'), '检查更新必须走 no-store 版本探针')
     assert.ok(sysPanel.includes("v !== '' && v !== BOOT.version"), '检查更新必须比页面启动版本，不能比服务端自报')
-    assert.ok(sysPanel.includes('window.location.reload()'), '发现新版本必须真的整页刷新')
+    assert.ok(/if \(v !== '' && v !== BOOT\.version\) \{[\s\S]{0,500}window\.location\.reload\(\)/.test(sysPanel),
+      'reload 必须落在「版本不同」这个分支里，不能无条件刷新')
+    assert.ok(sysPanel.includes('if (verBusyRef.current || verState === \'stale\') return'),
+      '同一 tick 连点只能发一次探针，且已排期刷新时再点不得取消那次 reload')
     assert.ok(sysPanel.includes('>检查更新<'), '按钮文案固定为「检查更新」，不随状态改宽度')
-    assert.ok(/ver-check/.test(src) && /\.ver-state\.ok/.test(css), '检查更新的按钮/状态样式必须存在')
+    assert.ok(css.includes('.ver-check {') && css.includes('.ver-state.ok {'), '检查更新的按钮/状态样式必须真的在 css 里')
     assert.ok(src.includes("if (stopped || document.visibilityState === 'hidden') return"), '页面隐藏时不得持续打接口')
     assert.ok(src.includes('const bootVersion = BOOT.version'), '对账基准必须是页面启动版本')
     assert.ok(src.includes('if (!bootVersion || authExpired) return undefined'), '凭证失效后必须停表（401 会刷日志）')
