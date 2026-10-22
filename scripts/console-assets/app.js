@@ -2207,6 +2207,9 @@ const PULL_EVENT = 'xbk-pull-refresh'
 const PULL_TRIGGER = 56 // 松手阈值（CSS px，手指位移按 0.5 倍阻尼折算）
 const PULL_MAX = 84
 const PULL_MIN_BUSY_MS = 450 // 再快也让「正在刷新…」停留一下，避免又变成一闪
+// 切后台/锁屏/切走 App 很久再回来：页面里的数据已经过期了，但浏览器不会替我们重拉。
+// 回到前台时若距上次刷新超过这个间隔，就静默补一轮（不显示「正在刷新…」，不重建页面）。
+const VISIBLE_STALE_MS = 30000
 
 // 面板侧：当前页签激活时订阅全局下拉刷新，把自己的 loader 交给 App 一起等。
 // 用 ref 存 loader，避免每次渲染换函数导致反复重订阅。
@@ -4555,6 +4558,8 @@ function App () {
   // activeElement：用户选完下拉后焦点仍停在 select 上，会永久冻住自动刷新。
   const formPauseUntilRef = useRef(0)
   const timerRef = useRef(null)
+  // 最近一次「数据真的刷新过」的时间：回前台补拉、轮询、下拉都更新它。
+  const lastRefreshRef = useRef(Date.now())
   const tabsRef = useRef(null)
   // 标签栏边缘渐隐状态（v3.317）：'' | 'left' | 'right' | 'both'。只在真的溢出时挂
   // data-edge，362 宽（6 个页签全部放得下）保持零遮罩——否则最后一格会被误读成被裁掉。
@@ -4952,6 +4957,7 @@ function App () {
         // （mark 会 setNextAt 触发 App 重渲染，安卓原生 select 仍可能被重建）。
         // 截止时间到后自动恢复，不会因为焦点一直停在 select 上而永久停轮。
         if (Date.now() < formPauseUntilRef.current) return
+        lastRefreshRef.current = Date.now()
         refreshSplit()
         mark()
       }
@@ -4961,6 +4967,9 @@ function App () {
     const onVis = () => {
       if (document.visibilityState !== 'visible') return
       if (Date.now() < formPauseUntilRef.current) return
+      // 离开很久（超过 VISIBLE_STALE_MS）：交给统一的「回前台补拉」，
+      // 那边会把当前页签的面板一起拉了，这里不重复发。
+      if (Date.now() - lastRefreshRef.current >= VISIBLE_STALE_MS) return
       refreshSplit()
       mark()
     }
@@ -5056,14 +5065,30 @@ function App () {
 
   // 下拉刷新（v3.330）：不出页面、不重建 DOM。先广播给当前页签的面板收集各自 loader，
   // 再等主轮询（状态+轮次）、自动运行状态与所有面板一起落定，指示条才收起。
-  const pullRefresh = useCallback(async () => {
+  const refreshActive = useCallback(async () => {
     const detail = { waits: [] }
     window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail }))
     // 没有任何面板接手（如过滤规则页有未保存改动）：连全局请求也不发，下拉就当无事。
     if (detail.waits.length === 0) return false
     await Promise.allSettled([refreshSplit({ force: true }), refreshAuto(), ...detail.waits])
+    lastRefreshRef.current = Date.now()
     return true
   }, [refreshSplit, refreshAuto])
+  const pullRefresh = useCallback(() => refreshActive(), [refreshActive])
+  // 回到前台：离开超过 VISIBLE_STALE_MS 就静默补一次（走和下拉完全相同的刷新路径，
+  // 当前页签的面板自己决定拉什么；有未保存草稿时它们不接，这里也就什么都不发）。
+  useEffect(() => {
+    // 注意：暂停自动刷新只是停轮询。这里是一次性的「回来补一刀」，不受暂停影响——
+    // 用户切回来最想看到的就是最新数据，而不是「已暂停」四个字。
+    if (authExpired) return undefined
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return
+      if (Date.now() - lastRefreshRef.current < VISIBLE_STALE_MS) return
+      refreshActive().catch(() => {})
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => document.removeEventListener('visibilitychange', onVis)
+  }, [refreshActive, authExpired])
   const pull = usePullToRefresh(pullRefresh, !authExpired)
   // 手机窄屏 .sync 是横向可滚动的：用户把它滑到右边时，行内状态会被裁在视口外。
   // 下拉一开始就把它滚回最左（状态就在第一个位置），保证反馈看得见。

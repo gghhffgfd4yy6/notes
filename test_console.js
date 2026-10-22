@@ -5604,6 +5604,11 @@ async function main () {
     assert.ok(src.includes('Promise.resolve().then(onRefresh).then(settle'), '无面板接手时要立刻收起指示条（did === false）')
     assert.ok(src.includes('refreshSplit({ force: true })'), '下拉必须绕过表单交互暂停')
     assert.ok(src.includes('Promise.allSettled([refreshSplit({ force: true }), refreshAuto(), ...detail.waits])'), '必须等主轮询与所有面板一起落定')
+    // ⑦ 长时间切后台再回来要静默补拉（不是每次切回来都拉，也不整页重载）。
+    assert.ok(src.includes('const VISIBLE_STALE_MS = 30000'), '回前台补拉必须有「离开多久才算过期」的阈值')
+    assert.ok(src.includes('if (Date.now() - lastRefreshRef.current < VISIBLE_STALE_MS) return'), '回前台补拉必须按距上次刷新判断，不能每次切回都发请求')
+    assert.ok(src.includes('refreshActive().catch(() => {})'), '回前台补拉走与下拉相同的路径（无面板接手就不发请求）')
+    assert.ok(src.includes('lastRefreshRef.current = Date.now()'), '刷新成功后必须更新时间戳')
     // ⑧ 整条下拉路径（手势 + App 回调）都不得整页重载。
     const gesture = src.slice(src.indexOf('function usePullToRefresh'), src.indexOf('function PullRefreshStatus'))
     const appPull = src.slice(src.indexOf('const pullRefresh = useCallback'), src.indexOf('const pull = usePullToRefresh'))
