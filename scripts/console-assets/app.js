@@ -1069,8 +1069,33 @@ function AlertBanner ({ state, onOpenLog }) {
 // v3.307 信息层级：今日 / 近 7 天 / 最近一轮 / 通道与过滤。旧版「最近日报」与「最近一轮」
 // 两张卡都在讲最近一次，缺「今天怎么样、成功率多少」；现在日报压成今日卡的一行，
 // 过滤诊断并入通道卡，四张卡各答一个问题。
-function StatusCards ({ state }) {
-  if (!state) return null
+// v3.329：首屏（以及下拉刷新触发的整页重载）在 /api/status 回来前，四张卡必须已经按最终
+// 形态占位。此前 !state 直接 return null，卡片块整块缺席，下面的「手动触发」先顶到页签下；
+// 状态回来后再插入一块 340px 高的卡片，手机上就是整屏一闪（360×795 实测「手动触发」顶部
+// 180 → 536.5，跳 356.5px）。占位只写「—」不写 0/「正常」，不谎报数据。
+const CARD_PLACEHOLDERS = [
+  { title: '今日', tone: 'run', badge: '—', main: { num: '—', unit: '', hint: '正在读取…' }, lines: ['失败 —', '日报 —'] },
+  { title: '近 7 天', tone: 'run', badge: '—', main: { num: '—', unit: '', hint: '正在读取…' }, lines: ['失败 — · 成功率 —', '日均 — 轮'] },
+  { title: '最近一轮', tone: 'run', badge: '—', main: { num: '—', unit: '', hint: '正在读取…' }, lines: ['获取 — · 失败 — · 耗时 —'] },
+  { title: '通道与过滤', tone: 'run', badge: '—', main: { num: '—', unit: '条被过滤', hint: '正在读取…' }, lines: ['最近过滤 —', '原因 —'] }
+]
+
+function CardsGrid ({ cards, busy }) {
+  return html`<div class="cards" aria-busy=${busy ? 'true' : undefined}>
+    ${cards.map((c) => html`<${Card} key=${c.title} title=${c.title} main=${c.main}
+      badge=${html`<${Badge} tone=${c.tone}>${c.badge}<//>`}>
+      ${c.lines.map((l) => html`<div key=${l}>${l}</div>`)}
+    <//>`)}
+  </div>`
+}
+
+function StatusCards ({ state, err }) {
+  // 占位文案只区分「正在读」与「读取失败」两种，都是一行，不改变预留高度。
+  if (!state) {
+    const hint = err ? '读取失败' : '正在读取…'
+    const cards = CARD_PLACEHOLDERS.map((c) => ({ ...c, main: { ...c.main, hint } }))
+    return html`<${CardsGrid} cards=${cards} busy=${!err} />`
+  }
   const rep = state.report && state.report.value ? state.report.value : null
   const repTone = partTone(state.report, repIsOk(state))
   const run = state.run && state.run.value ? state.run.value : null
@@ -1113,22 +1138,23 @@ function StatusCards ({ state }) {
             // 「正常」不再重复写在日报行：右上角状态点已经表达，重复反而每次都要读两遍。
             `日报 ${rep ? `${rep.date || '—'}${repRel ? `（${repRel}）` : ''}${repTone === 'ok' ? '' : repTone === 'bad' ? ' · 异常' : ' · 暂无'}` : '暂无'}`
           ]
-        : []
+        // 没有 run.log 数据时也要占满两行：行数随数据增减会让卡片块在加载完成的瞬间长高/变矮，
+        // 把下面的面板整体推走（Sourcery PR #292：首帧占位必须与加载完成态同高）。
+        : ['失败 —', '日报 —']
     },
     {
       title: '近 7 天',
       tone: weekTone,
       badge: !week ? '—' : (week.failed > 0 ? '有失败' : (week.rounds > 0 ? '正常' : '—')),
       main: week
-        ? { num: fmtNum(week.pushed), unit: '条推送', hint: `轮次 ${week.rounds}` }
+        ? { num: fmtNum(week.pushed), unit: '条推送', hint: `轮次 ${week.rounds}${stats && stats.truncated ? ' · 仅统计尾部' : ''}` }
         : { num: '—', unit: '', hint: '暂无数据' },
       lines: week
         ? [
             `失败 ${fmtNum(week.failed)} · 成功率 ${rateText(week)}`,
-            `日均 ${(week.rounds / 7).toFixed(1)} 轮`,
-            ...(stats && stats.truncated ? ['⚠️ run.log 超窗，统计仅覆盖尾部'] : [])
+            `日均 ${(week.rounds / 7).toFixed(1)} 轮`
           ]
-        : []
+        : ['失败 — · 成功率 —', '日均 — 轮']
     },
     {
       title: '最近一轮',
@@ -1145,7 +1171,7 @@ function StatusCards ({ state }) {
         ? [
             `获取 ${fmtNum(run.total)} · 失败 ${fmtNum(run.failed)} · 耗时 ${fmtNum(run.elapsed)}${run.cancelled === true ? ' · ⏹ 已取消' : run.interrupted ? ' · ⚠️ 中断' : ''}`
           ]
-        : []
+        : ['获取 — · 失败 — · 耗时 —']
     },
     {
       title: '通道与过滤',
@@ -1159,15 +1185,10 @@ function StatusCards ({ state }) {
       },
       lines: diagLines.length > 0
         ? [`最近过滤 ${fmtNum(diagAt)}`, `原因 ${diagReasons || '无'}`]
-        : []
+        : ['最近过滤 —', '原因 —']
     }
   ]
-  return html`<div class="cards">
-    ${cards.map((c) => html`<${Card} key=${c.title} title=${c.title} main=${c.main}
-      badge=${html`<${Badge} tone=${c.tone}>${c.badge}<//>`}>
-      ${c.lines.map((l) => html`<div key=${l}>${l}</div>`)}
-    <//>`)}
-  </div>`
+  return html`<${CardsGrid} cards=${cards} />`
 }
 
 // ── 组件：触发按钮 ──────────────────────────────────────────────────────────
@@ -4261,6 +4282,9 @@ function App () {
   // 单调时钟：本次成功加载的时刻，只用于释放滚动垫高；不受系统时钟回拨影响。
   const [panelReadyAt, setPanelReadyAt] = useState(0)
   const [syncErr, setSyncErr] = useState('')
+  // 「状态接口本身失败」要立刻反映到状态卡的占位文案上：/api/runs 可能还在路上，
+  // 不能等 Promise.allSettled 两边都落定才把「正在读取…」改成「读取失败」。
+  const [statusFailed, setStatusFailed] = useState(false)
   // 标签页写 hash（v3.307）：刷新/后退不丢当前页；初始值从 hash 读，非法值回概览。
   // v3.310「过滤规则」新增为第六个页签。pure.mjs 的 tabFromHash 只认 v3.307 的五个键
   // （该模块本批不改），这里补一层本文件内的白名单，保持 hash 路由对新页签同样生效
@@ -4604,7 +4628,7 @@ function App () {
     const seq = ++seqRef.current
     const errs = []
     const paused = () => Date.now() < formPauseUntilRef.current
-    const applyStatus = (s) => { if (seq === seqRef.current && !paused()) { setState(s); setSyncErr('') } }
+    const applyStatus = (s) => { if (seq === seqRef.current && !paused()) { setState(s); setSyncErr(''); setStatusFailed(false) } }
     const applyRuns = (r) => {
       if (seq === seqRef.current && !paused()) {
         setRuns(r.runs || [])
@@ -4613,8 +4637,14 @@ function App () {
       }
     }
     try {
+      // 状态请求单独挂一个拒绝分支：/api/runs 还慢着的时候也要立刻把占位卡改成「读取失败」，
+      // 不能等两边都落定（Sourcery PR #292）。
+      const statusP = apiGetStatus().then(
+        (v) => { if (seq === seqRef.current && !paused()) { setStatusFailed(false) }; return v },
+        (e) => { if (seq === seqRef.current && !paused()) { setStatusFailed(true) }; throw e }
+      )
       const [sRes, rRes] = await Promise.allSettled([
-        apiGetStatus(),
+        statusP,
         apiGetRuns()
       ])
       if (sRes.status === 'fulfilled') applyStatus(sRes.value)
@@ -4952,7 +4982,7 @@ function App () {
     ${!authExpired && visited.has('overview') && html`<section class="page" hidden=${tab !== 'overview'}>
       <div>
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
-      <${StatusCards} state=${state} />
+      <${StatusCards} state=${state} err=${statusFailed} />
       <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} runs=${runs}
         auto=${{ on: autoOn, interval: autoState && Number.isInteger(autoState.interval) ? autoState.interval : AUTO_DEFAULT_S, runs: autoState && autoState.runs ? autoState.runs : 0, err: autoState && autoState.lastError ? autoState.lastError : '', nextAt: autoState && autoState.nextAt ? autoState.nextAt : 0, now: autoNow, start: startAuto, stop: stopAuto, save: saveAutoInterval }} />
       <${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'overview'} pollMs=${autoRefresh && tab === 'overview' ? pollMs : 0} onRefresh=${refreshSplit} />
