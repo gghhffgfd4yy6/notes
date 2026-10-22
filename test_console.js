@@ -5614,9 +5614,15 @@ async function main () {
     // 跟着出现又消失就是一闪；只允许慢加载（>600ms）才显示。
     assert.ok(src.includes('function useSlowFlag (on, delay = 600)'),
       '必须有 useSlowFlag：loading 只闪十几毫秒时不得切文案')
-    assert.ok(src.includes('const slowLoading = useSlowFlag(loading)'),
+    const slowHook = src.slice(src.indexOf('function useSlowFlag'), src.indexOf('// 趋势天数选择器固定选项'))
+    assert.ok(slowHook.includes('if (!on) { setSlow(false); return undefined }'), 'useSlowFlag 关闭时必须立刻复位')
+    assert.ok(slowHook.includes('return slow && on'), 'useSlowFlag 必须在 on=false 的当帧就返回 false（完成后不得多渲染一帧提示）')
+    assert.ok(/ariaBusy=\$\{loading \? 'true' : 'false'\}/.test(src), '刷新按钮的 busy 必须真的传到 <button>（Button 转发 ariaBusy）')
+    assert.ok(/aria-busy=\$\{ariaBusy\}/.test(src), 'Button 必须把 ariaBusy 渲染成原生 aria-busy')
+    const msgPanel = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel'))
+    assert.ok(msgPanel.includes('const slowLoading = useSlowFlag(loading)'),
       '推送记录必须用 slowLoading 决定「更新中…」')
-    assert.ok(src.includes('slowLoading ? html`<span class="msg-loading"> · 更新中…</span>`'),
+    assert.ok(msgPanel.includes('slowLoading ? html`<span class="msg-loading"> · 更新中…</span>`'),
       '「匹配 N 条」的后缀只能由 slowLoading 控制，不能用 loading')
     assert.ok(!src.includes("刷新中…' : '刷新'"),
       '刷新按钮不得改文案：宽度变化会把导出按钮挤一下')

@@ -556,8 +556,8 @@ function PanelHead ({ title, sub, right, afterTitle }) {
 }
 
 // 按钮：variant 生成 `btn btn-<variant>`；修饰词（btn-danger/btn-busy）可拼进 variant。
-function Button ({ variant = 'secondary', disabled, onClick, title, buttonRef, children }) {
-  return html`<button ref=${buttonRef} class=${'btn btn-' + variant} disabled=${disabled} onClick=${onClick} title=${title}>${children}</button>`
+function Button ({ variant = 'secondary', disabled, onClick, title, buttonRef, ariaBusy, children }) {
+  return html`<button ref=${buttonRef} class=${'btn btn-' + variant} disabled=${disabled} onClick=${onClick} title=${title} aria-busy=${ariaBusy}>${children}</button>`
 }
 
 // 深色小下拉：趋势窗口/每页条数/时间范围共用。
@@ -2317,7 +2317,8 @@ function useSlowFlag (on, delay = 600) {
     const t = setTimeout(() => setSlow(true), delay)
     return () => clearTimeout(t)
   }, [on, delay])
-  return slow
+  // 完成当帧 state 还没被 effect 清掉，这里用 on 兜底，否则会多渲染一帧「更新中…」。
+  return slow && on
 }
 
 // 趋势天数选择器固定选项（与服务端白名单 TREND_DAYS_ALLOWED 对齐；14 为默认省略参数）
@@ -3120,7 +3121,7 @@ function MessagesPanel ({ onSync, active = true }) {
       <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
         options=${[10, 20, 50, 100].map((n) => ({ value: String(n), label: `每页 ${n} 条` }))}
         onChange=${(v) => { armLand(); setSize(Number(v)); setPage(1) }} />
-      <${Button} variant="ghost" disabled=${loading} aria-busy=${loading ? 'true' : 'false'} onClick=${refreshNow}>刷新<//>
+      <${Button} variant="ghost" disabled=${loading} ariaBusy=${loading ? 'true' : 'false'} onClick=${refreshNow}>刷新<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
     </div>
