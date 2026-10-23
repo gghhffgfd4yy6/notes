@@ -1699,9 +1699,28 @@ async function backupApiTests () {
   })
 }
 
+async function backupUiStructureTests () {
+  await aok('结构红线: 数据备份只留导入/导出，导出类别在弹窗里选', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const at = src.indexOf('function BackupBlock')
+    const end = src.indexOf('function SysPanel', at)
+    const seg = src.slice(at, end)
+    const ph = (name) => '$' + '{' + name + '}'
+    assert.ok(at > -1 && end > at, '应能定位 BackupBlock')
+    assert.ok(seg.includes('onClick=' + ph('openExport')), '系统页入口只能打开导出弹窗')
+    assert.ok(seg.includes('onClick=' + ph('chooseFile')), '导入入口应直接选文件')
+    assert.ok(seg.includes('open=' + ph('exportOpen')) && seg.includes('title="选择要导出的数据"'),
+      '导出类别必须在弹窗里选')
+    const modalAt = seg.indexOf('open=' + ph('exportOpen'))
+    assert.ok(seg.indexOf('backup-list') > modalAt, '类别列表不得回到系统页内联显示')
+    assert.ok(seg.includes('confirmDisabled='), '一个都没选时导出确认按钮必须禁用')
+  })
+}
+
 async function main () {
   await filterRuleApiTests()
   await backupApiTests()
+  await backupUiStructureTests()
   await aok('HTTP: 无 token / 错 token → 401', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)

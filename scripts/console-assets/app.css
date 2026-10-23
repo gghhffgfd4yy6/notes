@@ -881,8 +881,9 @@
   .cfg-block-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
   .cfg-block-title { font-weight: 600; font-size: var(--fs-md); }
   .cfg-block-sub { color: var(--text-dim); font-size: var(--fs-xs); }
-  .backup-all { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 4px 0 10px; border-bottom: 1px solid var(--border); }
   .backup-check { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: var(--fs-sm); cursor: pointer; }
+  .backup-actions-main { margin-top: 4px; }
+  .backup-pick-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
   .backup-list { display: grid; gap: 6px; margin-top: 10px; }
   .backup-item { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; padding: 7px 9px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--panel); cursor: pointer; }
   .backup-item input, .backup-check input { accent-color: var(--accent); }

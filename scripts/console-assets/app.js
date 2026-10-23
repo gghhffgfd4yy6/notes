@@ -1451,7 +1451,7 @@ const ACTION_DEFS = [
 // 固定 id 会让无障碍名称重复（Sourcery #271）。
 let dialogSeq = 0
 
-function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, children }) {
+function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, onConfirm, onCancel, children }) {
   const cancelRef = useRef(null)
   const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
   useEffect(() => {
@@ -1468,7 +1468,7 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, 
       <div class="modal-body">${children}</div>
       <div class="modal-actions">
         <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${onCancel}>取消<//>
-        <${Button} variant="danger-solid" disabled=${busy} onClick=${onConfirm}>${confirmLabel}<//>
+        <${Button} variant="danger-solid" disabled=${busy || confirmDisabled} onClick=${onConfirm}>${confirmLabel}<//>
       </div>
     </div>
   </div>`
@@ -4066,6 +4066,7 @@ function BackupBlock ({ onImported }) {
   const [err, setErr] = useState('')
   const [note, setNote] = useState('')
   const [pending, setPending] = useState(null)
+  const [exportOpen, setExportOpen] = useState(false)
   const fileRef = useRef(null)
   const allSelected = BACKUP_CATEGORY_OPTIONS.every((item) => selected[item.key])
   const toggleAll = () => {
@@ -4096,6 +4097,7 @@ function BackupBlock ({ onImported }) {
       a.click()
       a.remove()
       const skipped = res && res.skipped ? res.skipped : []
+      setExportOpen(false)
       setNote(`已导出${categories.length}类数据${skipped.length > 0 ? `；另有 ${skipped.length} 类当前没有可导出的内容` : ''}`)
     } catch (e) {
       setErr(`导出失败：${e && e.message ? e.message : e}`)
@@ -4103,6 +4105,9 @@ function BackupBlock ({ onImported }) {
       if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, 60000)
       setBusy('')
     }
+  }
+  const openExport = () => {
+    setErr(''); setNote(''); setExportOpen(true)
   }
   const chooseFile = () => {
     if (busy === '') fileRef.current && fileRef.current.click()
@@ -4151,26 +4156,30 @@ function BackupBlock ({ onImported }) {
   return html`<div class="cfg-block backup-block">
     <div class="cfg-block-head">
       <span class="cfg-block-title">数据备份</span>
-      <span class="cfg-block-sub">导出时勾选；导入自动识别文件内容</span>
+      <span class="cfg-block-sub">点导出再选内容；导入自动识别文件</span>
     </div>
-    <div class="backup-all">
-      <label class="backup-check"><input type="checkbox" checked=${allSelected} onChange=${toggleAll} /> 全选</label>
-      <span class="cfg-block-sub">自动运行只备份间隔，不会把开关打开</span>
-    </div>
-    <div class="backup-list">
-      ${BACKUP_CATEGORY_OPTIONS.map((item) => html`<label class="backup-item" key=${item.key}>
-        <input type="checkbox" checked=${selected[item.key] === true} onChange=${() => toggleOne(item.key)} />
-        <span class="backup-item-main">${item.label}</span>
-        <span class="cfg-block-sub">${item.desc}</span>
-      </label>`)}
-    </div>
-    <div class="backup-actions">
-      <${Button} variant="secondary" disabled=${busy !== '' || BACKUP_CATEGORY_OPTIONS.every((item) => !selected[item.key])} onClick=${doExport}>${busy === 'export' ? '导出中…' : '导出选中'}<//>
-      <${Button} variant="ghost" disabled=${busy !== ''} onClick=${chooseFile}>${busy === 'import' ? '导入中…' : '导入备份'}<//>
+    <div class="backup-actions backup-actions-main">
+      <${Button} variant="secondary" disabled=${busy !== ''} onClick=${openExport}>导出<//>
+      <${Button} variant="ghost" disabled=${busy !== ''} onClick=${chooseFile}>导入<//>
       <input class="backup-file" ref=${fileRef} type="file" accept=".json,application/json" onChange=${onFile} />
     </div>
-    ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${!exportOpen && err && html`<${Hint} tone="error">${err}<//>`}
     ${note && html`<${Hint}>${note}<//>`}
+    <${ConfirmDialog} open=${exportOpen} title="选择要导出的数据" confirmLabel=${busy === 'export' ? '导出中…' : '导出'} busy=${busy === 'export'} confirmDisabled=${BACKUP_CATEGORY_OPTIONS.every((item) => !selected[item.key])} onCancel=${() => { if (busy !== 'export') setExportOpen(false) }} onConfirm=${doExport}>
+      <div class="backup-pick-head">
+        <label class="backup-check"><input type="checkbox" checked=${allSelected} onChange=${toggleAll} /> 全选</label>
+        <span class="cfg-block-sub">只导出勾选的类别</span>
+      </div>
+      <div class="backup-list">
+        ${BACKUP_CATEGORY_OPTIONS.map((item) => html`<label class="backup-item" key=${item.key}>
+          <input type="checkbox" checked=${selected[item.key] === true} onChange=${() => toggleOne(item.key)} />
+          <span class="backup-item-main">${item.label}</span>
+          <span class="cfg-block-sub">${item.desc}</span>
+        </label>`)}
+      </div>
+      ${err && html`<${Hint} tone="error">${err}<//>`}
+      <div class="modal-note">自动运行只备份间隔，不记录开关状态；导入时不会把自动运行打开。</div>
+    <//>
     <${ConfirmDialog} open=${!!pending} title="确认导入备份" confirmLabel=${busy === 'import' ? '导入中…' : '确认导入'} busy=${busy === 'import'} onCancel=${() => { if (busy !== 'import') setPending(null) }} onConfirm=${doImport}>
       <div>文件里检测到：${pending ? pending.summary.join('、') : ''}</div>
       <div class="modal-note">导入会覆盖当前对应的数据；导入前会先把当前数据另存一份。自动运行开关不会被打开，仍保持导入前的状态。</div>
