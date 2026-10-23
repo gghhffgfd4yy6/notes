@@ -4515,7 +4515,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     const usable = candidates.filter((x) => !Number.isSafeInteger(x.baseRevision) || x.baseRevision === revision)
     const pool = usable.length > 0 ? usable : candidates
     const saved = pool.length > 0
-      ? pool.reduce((a, b) => (Number(b.savedAt) > Number(a.savedAt) ? b : a))
+      ? pool.reduce((a, b) => (Number(b.savedAt) > Number(a.savedAt) ? b : a), pool[0])
       : null
     let restored = null
     let restoreNotice = null
@@ -4593,7 +4593,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     draftPushRef.current = p
     p.finally(() => {
       if (draftPushRef.current === p) draftPushRef.current = null
-    })
+    }).catch(() => {})
     return p
   }, [])
   // 放弃/保存/回滚时同时清服务器草稿。若此时还有一发 PUT 在飞，等它落地后再删一次，
@@ -4960,7 +4960,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     setNotice(null)
     // confirmWideMatch 先给 false：真有 .* 规则时让服务端拦下并开覆盖确认，
     // 不能静默把所有记录都命中。
-    submitSave({ filter: candidate, baseRevision: data.revision, confirmWideMatch: false })
+    submitSave({ filter: candidate, baseRevision: data.revision, confirmWideMatch: false }).catch(() => {
+      settleSaveResult(false)
+    })
     return pending
   }, [data, draft, busy, dirtyFields, submitSave, settleSaveResult])
 
@@ -5000,7 +5002,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       setDialog({ kind: 'copyDefaults' })
       return
     }
-    copyDefaults()
+    copyDefaults().catch(() => {})
   }
 
   // 用户明确选择「不保存并离开」：把草稿退回 base，并立刻关掉拦截（历史后退不会等 React 重渲染）。
@@ -5143,7 +5145,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       return html`<${ConfirmDialog} open=${true} title="复制默认规则会覆盖草稿"
         confirmLabel=${busy === 'copy' ? '复制中…' : '放弃草稿并复制'} busy=${busy === 'copy'}
         onCancel=${closeDialog}
-        onConfirm=${() => { setDialog(null); copyDefaults() }}>
+        onConfirm=${() => { setDialog(null); copyDefaults().catch(() => {}) }}>
         <div class="fr-dialog-line">当前有 ${dirtyFields.length} 个字段未保存；复制代码默认会把这些修改覆盖掉。</div>
         <div class="modal-note">复制后写入覆盖文件，下一轮生效。</div>
       <//>`
@@ -5164,7 +5166,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       return html`<${ConfirmDialog} open=${true} title="放弃未保存的修改？"
         confirmLabel="放弃并重新加载" busy=${false}
         onCancel=${closeDialog}
-        onConfirm=${() => { setDialog(null); reloadNow() }}>
+        onConfirm=${() => { setDialog(null); reloadNow().catch(() => {}) }}>
         <div class="fr-dialog-line">当前有 ${dirtyFields.length} 个字段尚未保存，重新加载会丢弃这些修改。</div>
       <//>`
     }
