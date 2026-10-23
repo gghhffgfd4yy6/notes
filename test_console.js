@@ -60,7 +60,11 @@ const {
   FILTER_AUDIT_MAX_BYTES,
   filterLockIdentity,
   claimStaleFilterLock,
-  runtimeFilterDeps
+  runtimeFilterDeps,
+  // v3.357 两步验证：TOTP/恢复码/Cookie/配置读取
+  base32Encode, base32Decode, generateTotpSecret, totpQrDataUrl, totpCodeAt, verifyTotpCode,
+  generateRecoveryCodes, recoveryRecordOf, consumeRecoveryCode,
+  makeTwoFactorCookie, verifyTwoFactorCookie, loadTwoFactorState, TWO_FACTOR_FILE
 } = require('./scripts/console')
 const { readMessages } = require('./scripts/status')
 
@@ -6863,6 +6867,192 @@ async function main () {
       '快滚条必须用 aria-controls 指向被控日志框')
     // M3：第二根手指不得顶掉正在拖的那根。
     assert.ok(/if \(dragRef\.current\) return/.test(seg), '已有指针在拖时必须忽略新的 pointerdown')
+  })
+
+  // ── v3.357 两步验证（Google Authenticator / TOTP）────────────────────────
+  await aok('两步验证: TOTP 标准向量 + Base32 + 恢复码一次性 + Cookie 签名', () => {
+    // RFC 6238 SHA-1 测试密钥（ASCII "12345678901234567890"）在 T=59s 的 8 位码为 94287082；
+    // 这里取 6 位 = 287082。用标准向量锁死 HMAC/动态截断，避免实现“看起来能跑”。
+    const rfcSecret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'
+    assert.strictEqual(base32Encode(base32Decode(rfcSecret)), rfcSecret, 'Base32 往返')
+    assert.strictEqual(totpCodeAt(rfcSecret, 59000), '287082', 'RFC 6238 向量')
+    assert.strictEqual(verifyTotpCode(rfcSecret, '287082', 59000), true, '窗口内接受')
+    assert.strictEqual(verifyTotpCode(rfcSecret, '287083', 59000), false, '错误码拒绝')
+    assert.strictEqual(verifyTotpCode(rfcSecret, '287082', 59000 + 30000, 1), true, '±1 步长容忍时钟偏差')
+    const secret = generateTotpSecret()
+    assert.match(secret, /^[A-Z2-7]{32}$/, '20 字节 → 32 字符 Base32')
+    const qr = totpQrDataUrl('otpauth://totp/xbk-push:console?secret=GEZDGNBVGY3TQOJQ')
+    assert.ok(qr.startsWith('data:image/svg+xml;base64,'), '二维码是内联 SVG，不依赖 CDN')
+    const qrSvg = Buffer.from(qr.split(',')[1], 'base64').toString('utf8')
+    assert.ok(qrSvg.startsWith('<svg') && qrSvg.includes('viewBox='), '二维码 SVG 结构有效')
+    assert.strictEqual(totpQrDataUrl(''), '', '空链接不生成二维码（页面退回手输密钥）')
+    const codes = generateRecoveryCodes()
+    assert.strictEqual(codes.length, 10, '默认 10 个恢复码')
+    const rec = recoveryRecordOf(codes)
+    const next = consumeRecoveryCode(rec, codes[0])
+    assert.ok(next && next.hashes.length === 9, '恢复码用后即扣减')
+    assert.strictEqual(consumeRecoveryCode(next, codes[0]), null, '同一恢复码不能再用')
+    assert.ok(consumeRecoveryCode(next, codes[1]), '其它恢复码仍可用')
+    const cookie = makeTwoFactorCookie(secret, 1700000000000)
+    assert.strictEqual(verifyTwoFactorCookie(cookie, secret, 1700000001000), true, '签名 Cookie 有效')
+    assert.strictEqual(verifyTwoFactorCookie(cookie + 'x', secret, 1700000001000), false, '篡改拒绝')
+    assert.strictEqual(verifyTwoFactorCookie(cookie, secret, 1700000000000 + 13 * 3600 * 1000), false, '过期拒绝')
+    const dir = tmpDir()
+    try {
+      assert.strictEqual(loadTwoFactorState(dir).enabled, false, '缺文件=未开启')
+      fs.writeFileSync(path.join(dir, TWO_FACTOR_FILE), '{"schema":1,"enabled":true}')
+      assert.throws(() => loadTwoFactorState(dir), /拒绝启动/, '配置非法必须 fail-closed')
+      const secret = generateTotpSecret()
+      const recovery = recoveryRecordOf(generateRecoveryCodes())
+      fs.writeFileSync(path.join(dir, TWO_FACTOR_FILE), JSON.stringify({ schema: 1, enabled: true, secret, recovery, createdAt: 1 }))
+      fs.chmodSync(path.join(dir, TWO_FACTOR_FILE), 0o666 & ~0o022) // 0644：故意放宽的测试夹具
+      assert.strictEqual(loadTwoFactorState(dir).enabled, true, '合法配置可读取')
+      assert.strictEqual(fs.statSync(path.join(dir, TWO_FACTOR_FILE)).mode & 0o777, 0o600, '过宽权限读后收紧为 0600')
+      const duplicate = { ...recovery, hashes: [recovery.hashes[0], recovery.hashes[0]] }
+      fs.writeFileSync(path.join(dir, TWO_FACTOR_FILE), JSON.stringify({ schema: 1, enabled: true, secret, recovery: duplicate, createdAt: 1 }))
+      assert.throws(() => loadTwoFactorState(dir), /拒绝启动/, '重复恢复码哈希必须拒绝')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('两步验证: 开启→页面第二因子→恢复码登录→关闭（HTTP）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    const form = { 'content-type': 'application/x-www-form-urlencoded' }
+    const json = { 'content-type': 'application/json' }
+    const cookiesOf = (res) => (res.headers['set-cookie'] || []).map((c) => c.split(';')[0]).join('; ')
+    try {
+      let res = await request(port, 'GET', '/api/2fa/status', { token: TOKEN })
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(JSON.parse(res.text).enabled, false, '默认未开启')
+
+      res = await request(port, 'POST', '/api/2fa/setup', { token: TOKEN, headers: json, body: '{}' })
+      assert.strictEqual(res.status, 200, '获取设置密钥')
+      const setup = JSON.parse(res.text)
+      assert.match(setup.secret, /^[A-Z2-7]{32}$/)
+      assert.match(setup.setupId, /^[0-9a-f]{24}$/, '设置流程有独立 setupId')
+      assert.ok(setup.otpauth.startsWith('otpauth://totp/'), 'otpauth 链接可用于手动添加')
+      assert.match(setup.qrDataUrl, /^data:image\/svg\+xml;base64,/, '设置接口同时返回可扫描二维码')
+
+      // 两个标签页各自点「开启」：后一个不能覆盖前一个的 pending secret。
+      res = await request(port, 'POST', '/api/2fa/setup', { token: TOKEN, headers: json, body: '{}' })
+      const setup2 = JSON.parse(res.text)
+      assert.notStrictEqual(setup2.setupId, setup.setupId, '两次 setup 的 setupId 不同')
+
+      const code = totpCodeAt(setup.secret, Date.now())
+      res = await request(port, 'POST', '/api/2fa/enable', { token: TOKEN, headers: json, body: JSON.stringify({ code, setupId: setup.setupId }) })
+      assert.strictEqual(res.status, 200, res.text)
+      const enabled = JSON.parse(res.text)
+      assert.strictEqual(enabled.enabled, true)
+      assert.strictEqual(enabled.recoveryCodes.length, 10, '开启时返回 10 个恢复码')
+      assert.ok(String(res.headers['set-cookie']).includes('xbk_2fa='), '开启后当前浏览器拿 2FA Cookie')
+
+      // 响应丢包后的重试：同一 setupId + 仍有效验证码可以再取一次恢复码。
+      res = await request(port, 'POST', '/api/2fa/enable', { token: TOKEN, headers: json, body: JSON.stringify({ code, setupId: setup.setupId }) })
+      assert.strictEqual(res.status, 200, '已开启后同一 setupId 可重取恢复码')
+      assert.deepStrictEqual(JSON.parse(res.text).recoveryCodes, enabled.recoveryCodes, '恢复码与首次响应一致')
+
+      // 已经被开启流程用掉的 TOTP 时间步不能立刻再换登录会话。
+      res = await request(port, 'POST', '/login', { body: new URLSearchParams({ token: TOKEN, code }).toString(), headers: form })
+      assert.strictEqual(res.status, 401, '同一 TOTP 码不能重放')
+      assert.ok(res.text.includes('已经用过'), '重放提示可见')
+      const twoFactorFile = path.join(dir, TWO_FACTOR_FILE)
+      const fd = fs.openSync(twoFactorFile, 'r')
+      let rawFile
+      try {
+        assert.strictEqual(fs.fstatSync(fd).mode & 0o777, 0o600, '配置文件 0600')
+        rawFile = fs.readFileSync(fd, 'utf8')
+      } finally {
+        fs.closeSync(fd)
+      }
+
+      // 只有访问令牌、没有 2FA Cookie：页面必须停在第二步，而不是直接渲染数据。
+      res = await request(port, 'GET', '/', { token: TOKEN })
+      assert.strictEqual(res.status, 401, '缺第二因子不得进页面')
+      assert.ok(res.text.includes('需要两步验证'), '显示第二因子登录页')
+      assert.ok(res.text.includes(`name="token" value="${TOKEN}"`), '访问令牌只放在 hidden 字段回传')
+      res = await request(port, 'POST', '/login', { body: new URLSearchParams({ token: TOKEN }).toString(), headers: form })
+      assert.strictEqual(res.status, 401, '只提交令牌不够')
+      assert.ok(res.text.includes('需要两步验证'), '继续要求验证码')
+      res = await request(port, 'POST', '/login', { body: new URLSearchParams({ token: TOKEN, code: '000000' }).toString(), headers: form })
+      assert.strictEqual(res.status, 401, '错误验证码拒绝')
+      assert.ok(res.text.includes('验证码不对'), '错误提示可见')
+
+      const fresh = totpCodeAt(setup.secret, Date.now() + 30 * 1000)
+      res = await request(port, 'POST', '/login', { body: new URLSearchParams({ token: TOKEN, code: fresh }).toString(), headers: form })
+      assert.strictEqual(res.status, 303, '正确验证码登录')
+      const cookies = cookiesOf(res)
+      assert.ok(cookies.includes('xbk_session=') && cookies.includes('xbk_2fa='), '同时下发会话与 2FA Cookie')
+      res = await request(port, 'GET', '/', { headers: { cookie: cookies } })
+      assert.strictEqual(res.status, 200, '带 2FA Cookie 可进页面')
+      assert.ok(res.text.includes(`"token":"${TOKEN}"`), '页面仍注入会话凭证供写请求使用')
+
+      // 分阶段边界：接口仍认原访问令牌（用户还没决定是否收紧 API）。
+      res = await request(port, 'GET', '/api/status', { token: TOKEN })
+      assert.strictEqual(res.status, 200, '接口保持原 token 鉴权（本版只保护浏览器打开）')
+
+      // 恢复码：用一次成功，再用同一串失败；服务端只存哈希，不存明文。
+      const recoveryCode = enabled.recoveryCodes[0]
+      res = await request(port, 'POST', '/login', { body: new URLSearchParams({ token: TOKEN, code: recoveryCode }).toString(), headers: form })
+      assert.strictEqual(res.status, 303, '恢复码可登录')
+      res = await request(port, 'POST', '/login', { body: new URLSearchParams({ token: TOKEN, code: recoveryCode }).toString(), headers: form })
+      assert.strictEqual(res.status, 401, '恢复码不能重复使用')
+      assert.ok(!rawFile.includes(recoveryCode), '配置文件不得存恢复码明文')
+
+      const disableCode = enabled.recoveryCodes[1]
+      res = await request(port, 'POST', '/api/2fa/disable', { token: TOKEN, headers: json, body: JSON.stringify({ code: disableCode }) })
+      assert.strictEqual(res.status, 200, res.text)
+      assert.strictEqual(JSON.parse(res.text).enabled, false)
+      assert.throws(() => fs.openSync(twoFactorFile, 'r'), /ENOENT/, '关闭后删除配置')
+      res = await request(port, 'GET', '/', { token: TOKEN })
+      assert.strictEqual(res.status, 200, '关闭后恢复单因子')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('两步验证: 第一因子错误也限速，代理后按客户端 IP 隔离', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    const form = { 'content-type': 'application/x-www-form-urlencoded' }
+    const json = { 'content-type': 'application/json' }
+    try {
+      let res = await request(port, 'POST', '/api/2fa/setup', { token: TOKEN, headers: json, body: '{}' })
+      const setup = JSON.parse(res.text)
+      const code = totpCodeAt(setup.secret, Date.now())
+      res = await request(port, 'POST', '/api/2fa/enable', { token: TOKEN, headers: json, body: JSON.stringify({ code, setupId: setup.setupId }) })
+      assert.strictEqual(res.status, 200, res.text)
+
+      const sameProxy = { ...form, 'x-forwarded-for': '203.0.113.77' }
+      for (let i = 0; i < 10; i++) {
+        res = await request(port, 'POST', '/login', {
+          body: new URLSearchParams({ token: 'wrong-token-0000000000', code: '' }).toString(),
+          headers: sameProxy
+        })
+        assert.strictEqual(res.status, 401, `第 ${i + 1} 次错误令牌仍只返回挑战页`)
+      }
+      const fresh = totpCodeAt(setup.secret, Date.now() + 30 * 1000)
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN, code: fresh }).toString(),
+        headers: sameProxy
+      })
+      assert.strictEqual(res.status, 429, '同一 IP 的错误令牌也必须计入限速')
+
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN, code: fresh }).toString(),
+        headers: { ...form, 'x-forwarded-for': '203.0.113.78' }
+      })
+      assert.strictEqual(res.status, 303, '不同客户端 IP 不应被同一把锁误伤')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 }
 

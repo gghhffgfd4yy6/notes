@@ -549,6 +549,43 @@ function apiPostConsoleSettings (body) {
   return consumeJsonResult(fetch('/api/config/console', merged), done)
 }
 
+// 两步验证（v3.357）：状态读取 + 开启/确认/关闭。写面与其它写端点同款 Bearer + JSON。
+function apiGetTwoFactorStatus () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/2fa/status', merged), done)
+}
+
+function apiPostTwoFactorSetup () {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify({})
+  })
+  return consumeJsonResult(fetch('/api/2fa/setup', merged), done)
+}
+
+function apiPostTwoFactorEnable (code, setupId) {
+  const payload = { code }
+  if (typeof setupId === 'string' && setupId !== '') payload.setupId = setupId
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify(payload)
+  })
+  return consumeJsonResult(fetch('/api/2fa/enable', merged), done)
+}
+
+function apiPostTwoFactorDisable (code) {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify({ code })
+  })
+  return consumeJsonResult(fetch('/api/2fa/disable', merged), done)
+}
+
 // 触发类请求公共体（SonarCloud new_duplicated_lines_density：trigger 与 triggerNotifyTest
 // 两段同构模板抽公共，消除新增代码重复率超标）。fetch 字面量由调用侧闭包注入——
 // 第一参数仍是纯字面量（§0 静态红线形态保持），公共体只管 timedRequest/重放拦截语义。
@@ -4301,6 +4338,141 @@ function BackupBlock ({ onImported }) {
   </div>`
 }
 
+// 两步验证（v3.357）：系统页里的可选开关。二维码由服务端 qrcode-generator 生成
+// （SVG data URI，不引 CDN/不增加前端构建），同时保留手动密钥兜底；确认后服务端只回一次
+// 恢复码，页面如实提示「只显示一次」。
+function TwoFactorBlock () {
+  const [status, setStatus] = useState(null)
+  const [setup, setSetup] = useState(null)
+  const [code, setCode] = useState('')
+  const [disableOpen, setDisableOpen] = useState(false)
+  const [disableCode, setDisableCode] = useState('')
+  const [recoveryCodes, setRecoveryCodes] = useState([])
+  const [busy, setBusy] = useState('')
+  const [err, setErr] = useState('')
+  const [note, setNote] = useState('')
+
+  const load = useCallback(() => {
+    setErr('')
+    return apiGetTwoFactorStatus().then(setStatus).catch((e) => {
+      setErr(`两步验证状态读取失败：${e && e.message ? e.message : e}`)
+    })
+  }, [])
+  useEffect(() => { load().catch(() => {}) }, [load])
+
+  const messageOf = (res) => {
+    const data = res && res.data ? res.data : {}
+    if (data.message) return data.message
+    if (data.error) return data.error
+    return `HTTP ${res && res.status ? res.status : '?'}`
+  }
+  const startSetup = async () => {
+    if (busy !== '') return
+    setBusy('setup'); setErr(''); setNote(''); setRecoveryCodes([])
+    try {
+      const res = await apiPostTwoFactorSetup()
+      if (!res.ok) throw new Error(messageOf(res))
+      setSetup(res.data || null)
+      setCode('')
+    } catch (e) {
+      setErr(`生成设置密钥失败：${e && e.message ? e.message : e}`)
+    } finally {
+      setBusy('')
+    }
+  }
+  const enable = async () => {
+    if (busy !== '' || !setup || code.trim().length < 6) return
+    setBusy('enable'); setErr(''); setNote('')
+    try {
+      const res = await apiPostTwoFactorEnable(code.trim(), setup.setupId)
+      if (!res.ok) throw new Error(messageOf(res))
+      const data = res.data || {}
+      setRecoveryCodes(Array.isArray(data.recoveryCodes) ? data.recoveryCodes : [])
+      setStatus({ enabled: true, pending: false, recoveryRemaining: data.recoveryRemaining || 0 })
+      setSetup(null)
+      setCode('')
+      setNote('两步验证已开启。下次打开控制台要再输一次手机上的 6 位数字。')
+    } catch (e) {
+      setErr(`确认开启失败：${e && e.message ? e.message : e}`)
+    } finally {
+      setBusy('')
+    }
+  }
+  const disable = async () => {
+    if (busy !== '' || disableCode.trim() === '') return
+    setBusy('disable'); setErr(''); setNote('')
+    try {
+      const res = await apiPostTwoFactorDisable(disableCode.trim())
+      if (!res.ok) throw new Error(messageOf(res))
+      setStatus({ enabled: false, pending: false, recoveryRemaining: 0 })
+      setDisableOpen(false)
+      setDisableCode('')
+      setRecoveryCodes([])
+      setNote('两步验证已关闭。')
+    } catch (e) {
+      setErr(`关闭失败：${e && e.message ? e.message : e}`)
+    } finally {
+      setBusy('')
+    }
+  }
+  const copyText = async (text) => {
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') throw new Error('浏览器不支持复制')
+      await navigator.clipboard.writeText(text)
+      setNote('已复制到剪贴板。')
+    } catch (e) {
+      setErr(`复制失败：${e && e.message ? e.message : e}；请手动选中密钥复制。`)
+    }
+  }
+  const secretGroups = setup && typeof setup.secret === 'string'
+    ? setup.secret.replace(/(.{4})/g, '$1 ').trim()
+    : ''
+  return html`<div class="cfg-block twofa-block">
+    <div class="cfg-block-head">
+      <span class="cfg-block-title">两步验证</span>
+      <span class="cfg-block-sub">Google Authenticator · 可选</span>
+    </div>
+    ${status === null && !err && html`<div class="empty" role="status">读取中…</div>`}
+    ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${note && html`<${Hint}>${note}<//>`}
+    ${status && !status.enabled && !setup && html`<div class="twofa-row">
+      <div class="cfg-block-sub">还没开启。开启后，打开控制台要先过访问令牌，再输入手机上的 6 位数字。</div>
+      <${Button} variant="secondary" disabled=${busy !== ''} onClick=${startSetup}>${busy === 'setup' ? '生成中…' : '开启两步验证'}<//>
+    </div>`}
+    ${setup && html`<div class="twofa-setup">
+      <div class="twofa-step">1. 打开 Google Authenticator，点右下角 “+”。</div>
+      ${setup.qrDataUrl && html`<div class="twofa-qr"><img src=${setup.qrDataUrl} alt="两步验证二维码，用 Google Authenticator 扫描" width="200" height="200" /></div>`}
+      <div class="twofa-step">${setup.qrDataUrl ? '2. 能扫码就选“扫描二维码”；扫不了就选“输入设置密钥”，' : '2. 选“输入设置密钥”，'}账户名填 <code>xbk-push</code>，把下面这串密钥粘进去（不区分大小写）：</div>
+      <div class="twofa-secret"><code>${secretGroups}</code><${Button} variant="ghost" disabled=${busy !== ''} onClick=${() => copyText(setup.secret)}>复制<//></div>
+      <div class="twofa-step">3. 输入 App 里显示的 6 位数字，确认开启：</div>
+      <div class="twofa-code-row">
+        <input class="fr-input" aria-label="Google Authenticator 6 位验证码" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" value=${code} onInput=${(e) => setCode(e.target.value)} placeholder="000000" />
+        <${Button} variant="primary" disabled=${busy !== '' || code.trim().length < 6} onClick=${enable}>${busy === 'enable' ? '确认中…' : '确认开启'}<//>
+        <${Button} variant="ghost" disabled=${busy !== ''} onClick=${() => { setSetup(null); setCode('') }}>取消<//>
+      </div>
+      <div class="cfg-block-sub">这串密钥等同于第二把钥匙，别发到聊天里；确认后恢复码只显示一次。</div>
+    </div>`}
+    ${status && status.enabled && html`<div class="twofa-row">
+      <div><span class="twofa-on">已开启</span> <span class="cfg-block-sub">恢复码剩余 ${status.recoveryRemaining || 0} 个</span></div>
+      <${Button} variant="danger" disabled=${busy !== ''} onClick=${() => { setDisableOpen(true); setDisableCode('') }}>关闭两步验证<//>
+    </div>`}
+    ${disableOpen && html`<div class="twofa-setup">
+      <div class="twofa-step">关闭前先输一次当前验证码（或恢复码）：</div>
+      <div class="twofa-code-row">
+        <input class="fr-input" aria-label="关闭两步验证的验证码" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="24" value=${disableCode} onInput=${(e) => setDisableCode(e.target.value)} placeholder="6 位数字或恢复码" />
+        <${Button} variant="danger" disabled=${busy !== '' || disableCode.trim() === ''} onClick=${disable}>${busy === 'disable' ? '关闭中…' : '确认关闭'}<//>
+        <${Button} variant="ghost" disabled=${busy !== ''} onClick=${() => { setDisableOpen(false); setDisableCode('') }}>取消<//>
+      </div>
+    </div>`}
+    ${recoveryCodes.length > 0 && html`<div class="twofa-recovery">
+      <div class="twofa-step">恢复码（只显示这一次，请抄到离线地方；每串只能用一次）：</div>
+      <div class="twofa-codes">${recoveryCodes.map((c) => html`<code key=${c}>${c}</code>`)}</div>
+      <${Button} variant="ghost" disabled=${busy !== ''} onClick=${() => copyText(recoveryCodes.join('\n'))}>复制全部<//>
+    </div>`}
+    <${Hint}>两步验证只保护浏览器打开控制台；接口仍使用访问令牌。手机丢了用恢复码，恢复码丢了只能让部署者删除 <code>console-2fa.json</code> 后重配。<//>
+  </div>`
+}
+
 function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFresh, onSettings }) {
   // 访问日志（v3.300 §3.3）：第二个 loader 并列拉取；「刷新」按钮同日 load 两个。
   // 近窗未授权尝试数 = 服务端独立 401 计数（进程启动以来、不随环形窗截断）。
@@ -4427,6 +4599,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
     <div class="set-title">设置<span class="cfg-block-sub">改动立即生效 · 落盘 console-settings.json</span></div>
     <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} />
     <${BackupBlock} onImported=${refreshAll} />
+    <${TwoFactorBlock} />
     <${Hint} style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。<//>
     ${accessErr && html`<${Hint} tone="error">访问日志加载失败：${accessErr.message || accessErr}<//>`}
     <details class="access-log">
