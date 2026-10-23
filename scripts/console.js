@@ -2335,8 +2335,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const clearLoginFailures = (req) => loginFailures.delete(loginAttemptKey(req))
   const twoFactorVerified = (req) => {
     if (!twoFactor.enabled) return true
-    const value = twoFactorCookieValue(req.headers && req.headers.cookie)
-    return value !== null && verifyTwoFactorCookie(value, twoFactor.secret)
+    // Cookie 是否有效由 HMAC 签名判定；不要用「值是否为空」做安全分支
+    // （CodeQL js/user-controlled-bypass：用户可控的值不能直接决定放行）。
+    return verifyTwoFactorCookie(twoFactorCookieValue(req.headers && req.headers.cookie), twoFactor.secret)
   }
   const verifySecondFactor = (code) => {
     if (verifyTotpCode(twoFactor.secret, code)) return { ok: true, recovery: false }

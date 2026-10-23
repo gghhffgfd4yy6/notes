@@ -6935,8 +6935,14 @@ async function main () {
       assert.strictEqual(enabled.recoveryCodes.length, 10, '开启时返回 10 个恢复码')
       assert.ok(String(res.headers['set-cookie']).includes('xbk_2fa='), '开启后当前浏览器拿 2FA Cookie')
       const twoFactorFile = path.join(dir, TWO_FACTOR_FILE)
-      assert.strictEqual(fs.existsSync(twoFactorFile), true, '配置落盘')
-      assert.strictEqual(fs.statSync(twoFactorFile).mode & 0o777, 0o600, '配置文件 0600')
+      const fd = fs.openSync(twoFactorFile, 'r')
+      let rawFile
+      try {
+        assert.strictEqual(fs.fstatSync(fd).mode & 0o777, 0o600, '配置文件 0600')
+        rawFile = fs.readFileSync(fd, 'utf8')
+      } finally {
+        fs.closeSync(fd)
+      }
 
       // 只有访问令牌、没有 2FA Cookie：页面必须停在第二步，而不是直接渲染数据。
       res = await request(port, 'GET', '/', { token: TOKEN })
@@ -6969,7 +6975,6 @@ async function main () {
       assert.strictEqual(res.status, 303, '恢复码可登录')
       res = await request(port, 'POST', '/login', { body: new URLSearchParams({ token: TOKEN, code: recoveryCode }).toString(), headers: form })
       assert.strictEqual(res.status, 401, '恢复码不能重复使用')
-      const rawFile = fs.readFileSync(twoFactorFile, 'utf8')
       assert.ok(!rawFile.includes(recoveryCode), '配置文件不得存恢复码明文')
 
       const disableCode = totpCodeAt(setup.secret, Date.now())

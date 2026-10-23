@@ -857,6 +857,6 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 开启后打开控制台要过两关：访问令牌 + 手机上的 6 位数字（允许 ±1 个 30 秒步长）；验证通过后签发 12 小时 HttpOnly 签名 Cookie。手机丢了可用恢复码登录，恢复码用一次即扣减。
 - 配置落盘 `<stateDir>/console-2fa.json`（0600）；文件损坏/非法时控制台拒绝启动（fail-closed），不会静默降级成没有 2FA。
 - 当前只保护浏览器打开控制台；接口仍沿用访问令牌（分阶段，是否收紧等用户决定）。登录失败按来源 IP 限速（5 分钟 10 次），错误页不泄露哪一关错了。
-- `scripts/console.js` 增至 5230 行，变异矩阵末两段拆为 `console-part8: 4371-4800` / `console-part9: 4801-5230`（各 ~430 行，避免撞 step 330min）；`EXPECTED_SEGMENTS`、行段校验夹具与 `test_check_mutation_ranges.js` 同步。
+- `scripts/console.js` 增至 5231 行，变异矩阵末两段拆为 `console-part8: 4371-4800` / `console-part9: 4801-5231`（各 ~430 行，避免撞 step 330min）；`EXPECTED_SEGMENTS`、行段校验夹具与 `test_check_mutation_ranges.js` 同步。
 - 控制台套件新增 TOTP RFC 6238 标准向量、Base32/恢复码/Cookie 签名单测，以及「开启→页面第二因子→恢复码登录→关闭」HTTP 端到端用例（239/0）。
 

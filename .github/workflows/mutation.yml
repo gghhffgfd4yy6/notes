@@ -284,10 +284,10 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 5230 行（v3.357 两步验证+二维码后；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 5860 体，变异评估
+          # console.js 5231 行（v3.357 两步验证+二维码后；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 5860 体，变异评估
           # 成本 ≈ 变异体数 × 13.3s（C=8，历史成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）
           # ⇒ 整段 ≈ 1290min、远超 step 330min 上限。按上限倒推取 9 片（末片 849 行实测 >330min 被杀，再对半：
-          # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5230，末两片各 ~430 行 ≈100-150min，仍在 330min 内）。
+          # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5231，末两片各 ~430 行 ≈100-150min，仍在 330min 内）。
           # 行段连续不重叠全覆盖（check-mutation-ranges 校验）；段名与 mutation-report EXPECTED_SEGMENTS 双向对账。
           - name: console-part1
             src: "scripts/console.js"
@@ -323,7 +323,7 @@ jobs:
             config: "stryker.tap.config.js"
           - name: console-part9
             src: "scripts/console.js"
-            mutate: "scripts/console.js:4801-5230"
+            mutate: "scripts/console.js:4801-5231"
             config: "stryker.tap.config.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
