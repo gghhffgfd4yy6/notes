@@ -837,7 +837,7 @@ const streamAppend = (record, text) => { record.output += text; record.outputTot
 
 const TOKEN = 'x'.repeat(32)
 
-// ── 过滤规则控制面（scripts/console.js 的 5 个端点）────────────────────────
+// ── 过滤规则控制面（scripts/console.js，含服务器草稿）──────────────────────
 // 全部用 mkdtemp 隔离缓存目录；写端点只认 Authorization 头，读面沿用全局鉴权。
 function filterPaths (dir) { return require('./xbk_filter_store').filterRulesPaths(dir) }
 function postFilterJson (port, urlPath, obj, { token = TOKEN, headers = {}, raw } = {}) {
@@ -915,6 +915,71 @@ async function filterRuleApiTests () {
 
       const okRes = await postFilterJson(port, '/api/config/filter', payload)
       assert.strictEqual(okRes.status, 200, '合法 Bearer 可写')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则草稿: 服务器读/写/删 + 0600 + 正式保存清草稿 + revision 冲突', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      const empty = await request(port, 'GET', '/api/config/filter/draft', { token: TOKEN })
+      assert.strictEqual(empty.status, 200)
+      const emptyBody = JSON.parse(empty.text)
+      assert.strictEqual(emptyBody.draft, null)
+      assert.strictEqual(emptyBody.revision, 0)
+      assert.strictEqual((await request(port, 'GET', '/api/config/filter/draft')).status, 401, '草稿读面也要鉴权')
+
+      const put = await postFilterJson(port, '/api/config/filter/draft', {
+        schema: 1,
+        baseRevision: 0,
+        filter: { pingbibiaoti: '半成品(', pingbitime: '6' }
+      })
+      assert.strictEqual(put.status, 200)
+      assert.strictEqual(JSON.parse(put.text).ok, true)
+      const badSchema = await postFilterJson(port, '/api/config/filter/draft', {
+        schema: 99, baseRevision: 0, filter: { pingbibiaoti: 'x' }
+      })
+      assert.strictEqual(badSchema.status, 400, '不支持的草稿 schema 必须拒绝')
+      assert.strictEqual(fs.statSync(paths.draft).mode & 0o777, 0o600, '草稿文件必须 0600')
+      const disk = JSON.parse(readSafeTextResult(paths.draft, 64 * 1024).text)
+      assert.strictEqual(disk.baseRevision, 0)
+      assert.strictEqual(disk.filter.pingbibiaoti, '半成品(', '草稿允许存未编译的半个正则')
+
+      const got = JSON.parse((await request(port, 'GET', '/api/config/filter/draft', { token: TOKEN })).text)
+      assert.strictEqual(got.draft.filter.pingbibiaoti, '半成品(')
+      assert.strictEqual(got.draft.baseRevision, 0)
+      assert.strictEqual(typeof got.draft.savedAt, 'number')
+
+      const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '正式' } })
+      assert.strictEqual(saved.status, 200)
+      assert.strictEqual(fs.existsSync(paths.draft), false, '正式保存成功必须删服务器草稿')
+      assert.strictEqual(JSON.parse((await request(port, 'GET', '/api/config/filter/draft', { token: TOKEN })).text).draft, null)
+
+      const stale = await postFilterJson(port, '/api/config/filter/draft', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '旧' } })
+      assert.strictEqual(stale.status, 409)
+      assert.strictEqual(JSON.parse(stale.text).code, 'revision_mismatch')
+      assert.strictEqual(fs.existsSync(paths.draft), false, '过期草稿不得落盘')
+
+      const anonPost = await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: {} }, { token: null })
+      assert.strictEqual(anonPost.status, 401)
+      const cookiePost = await request(port, 'POST', '/api/config/filter/draft', {
+        body: JSON.stringify({ baseRevision: 1, filter: {} }),
+        headers: { 'content-type': 'application/json', cookie: `xbk_session=${TOKEN}` }
+      })
+      assert.strictEqual(cookiePost.status, 401)
+      assert.strictEqual(JSON.parse(cookiePost.text).code, 'cookie_not_allowed', '草稿写面只认 Bearer')
+      assert.strictEqual((await request(port, 'DELETE', '/api/config/filter/draft')).status, 401, '删草稿也只认 Bearer')
+
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { pingbibiaoti: '草稿' } })).status, 200)
+      assert.strictEqual(fs.existsSync(paths.draft), true)
+      const del = await request(port, 'DELETE', '/api/config/filter/draft', { token: TOKEN })
+      assert.strictEqual(del.status, 200)
+      assert.strictEqual(fs.existsSync(paths.draft), false)
+
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { nope: 'x' } })).status, 400)
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { pingbibiaoti: 1 } })).status, 400)
+      assert.strictEqual(fs.existsSync(paths.draft), false, '非法草稿不得落盘')
     } finally { server.close() }
   })
 
@@ -4904,7 +4969,7 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(!/window\.scrollTo\(0, 0\) \}, \[tab/.test(src), '切页不得无条件强制回顶（长页深处会被整页拽回顶部）')
     const scrollBlock = src.slice(src.indexOf('const scrollMemRef = useRef({})'), src.indexOf('// 标签栏是单行横滚'))
-    const switchBlock = src.slice(src.indexOf('const switchTab = '), src.indexOf('const openLog = useCallback'))
+    const switchBlock = src.slice(src.indexOf('const doSwitchTab = '), src.indexOf('const openLog = useCallback'))
     assert.ok(scrollBlock.includes('scrollMemRef.current[from] = y'),
       '切页前必须记住出发页的滚动位置')
     assert.ok(scrollBlock.includes("const target = forceTop ? 0 : (typeof mem === 'number' ? mem : y)"),
@@ -4952,7 +5017,7 @@ async function main () {
     const sysBlock = src.slice(src.indexOf('const markSysReady'), src.indexOf('const onSysReady'))
     assert.ok(sysBlock.includes('syncMemRef.current.sys = ts') && sysBlock.includes('setPanelReadyAt(performance.now())'),
       '系统页两个面板都完成时必须缓存 sys 时间并写 ready 标记')
-    const switchSyncBlock = src.slice(src.indexOf('const switchTab ='), src.indexOf('const openLog = useCallback'))
+    const switchSyncBlock = src.slice(src.indexOf('const doSwitchTab ='), src.indexOf('const openLog = useCallback'))
     assert.ok(switchSyncBlock.includes('showSyncFor(next)'), '页签点击必须同步切到目标页缓存时间')
     const hashSyncBlock = src.slice(src.indexOf('const onHash ='), src.indexOf("window.addEventListener('hashchange'"))
     assert.ok(hashSyncBlock.includes('showSyncFor(next)'), '后退/前进必须同步切到目标页缓存时间')
@@ -5339,7 +5404,8 @@ async function main () {
       assert.ok(block.includes('--shadow-card'), `主题 ${key} 必须定义 --shadow-card`)
     }
     assert.ok(/:root \{[^}]*--shadow-card/.test(css), '默认（深夜）也要有 --shadow-card')
-    assert.ok(!/localStorage\.(get|set)Item/.test(js), '不得用 localStorage 记主题（CSP 禁内联脚本，首帧会闪）')
+    const themeBlock = js.slice(js.indexOf('const THEMES = ['), js.indexOf('function App ()'))
+    assert.ok(!/localStorage\.(get|set)Item/.test(themeBlock), '不得用 localStorage 记主题（CSP 禁内联脚本，首帧会闪）')
     // 变异沙箱里 console.js 会被插桩成 stryMutAct_… ? … : ['deep', …]，文本断言必假红；
     // 改断言运行时导出值，比文本更硬（键名/顺序/数量全覆盖）。
     assert.deepStrictEqual([...require('./scripts/console.js').THEMES], ['deep', 'material', 'nord', 'light'], '服务端必须有主题白名单')
@@ -5998,11 +6064,11 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.351：注释里不得提前写下一版 v3.352。
+    // 版本已 bump 到 3.352：注释里不得提前写下一版 v3.353。
     // 注意这条只拦「资源注释里提前写下个版本」；四处版本号（主文件头/CHANGELOG/package.json/
     // package-lock 两处）的一致性由 check-version.js 负责（CI 与 pre-commit 都跑，npm test 不含）。
-    assert.ok(!/v3\.352/.test(src), 'app.js 注释不得写 v3.352（版本未 bump）')
-    assert.ok(!/v3\.352/.test(css), 'app.css 注释不得写 v3.352（版本未 bump）')
+    assert.ok(!/v3\.353/.test(src), 'app.js 注释不得写 v3.353（版本未 bump）')
+    assert.ok(!/v3\.353/.test(css), 'app.css 注释不得写 v3.353（版本未 bump）')
   })
 
   await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
@@ -6145,6 +6211,62 @@ async function main () {
     assert.ok(/<\$\{ConsoleSettingsBlock\} settings=\$\{settings\}/.test(sysBlk), '系统页必须渲染设置块并下传读面')
   })
 
+  await aok('结构红线: 过滤草稿自动保存/恢复（关标签/杀后台也能捡回来）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes("const FILTER_DRAFT_KEY = 'xbk_filter_draft_v1'"), '必须在 localStorage 存一份过滤草稿')
+    assert.ok(src.includes('FILTER_DRAFT_SAVE_DELAY = 500'), '草稿不能等 5 分钟才存，否则杀后台会丢最后几分钟')
+    assert.ok(src.includes('FILTER_DRAFT_SERVER_DELAY = 1500'), '服务器草稿必须比本机慢一点，避免每敲一键就写盘')
+    assert.ok(src.includes('localStorage.setItem(FILTER_DRAFT_KEY'), '草稿写入必须用 localStorage（sessionStorage 关标签就没）')
+    assert.ok(src.includes('localStorage.removeItem(FILTER_DRAFT_KEY)'), '保存/放弃/回滚后必须清草稿')
+    assert.ok(src.includes("window.addEventListener('pagehide'"), '关标签/切走时必须立刻补存')
+    assert.ok(src.includes("document.addEventListener('visibilitychange'"), '切到后台时必须立刻补存')
+    assert.ok(src.includes('apiGetFilterDraft'), '打开过滤页必须同时读服务器草稿')
+    assert.ok(src.includes('apiPostFilterDraft'), '本机草稿要同步到服务器')
+    assert.ok(src.includes('apiDeleteFilterDraft'), '保存/放弃/回滚后必须删服务器草稿')
+    assert.ok(src.includes('filterDraftFromServer'), '服务器草稿响应必须校验后再恢复')
+    assert.ok(src.includes('clearServerDraft()'), '清草稿必须同时清服务器那份')
+    assert.ok(src.includes('已恢复上次未保存的草稿'), '下次打开过滤页必须自动恢复草稿并提示')
+    assert.ok(src.includes('草稿已自动保存'), '页面必须让用户看到草稿已经存了')
+    assert.ok(src.includes('setTimeout(saveDraftNow, FILTER_DRAFT_SAVE_DELAY)'), '本机草稿定时器必须真的使用 500ms 常量，不能只留常量')
+    assert.ok(src.includes('draftPushChainRef'), '草稿 PUT 必须串行，旧请求不能晚到覆盖新内容')
+    assert.ok(src.includes('await draftPushChainRef.current'), '清服务器草稿前必须等所有排队 PUT 落地')
+    assert.ok(src.includes('setInterval(() => { if (dirtyRef.current) pushDraftNow().catch(() => {}) }'), '服务器上传失败后必须定期重试')
+    assert.ok(src.includes('reloadNow'), '确认放弃并重新加载时必须先清草稿，否则会恢复回来')
+  })
+
+  await aok('结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes('function LeaveGuardDialog'), '必须有“取消/不保存/保存并继续”三选一弹窗')
+    assert.ok(src.includes('点「不保存并离开」会丢掉这些修改'), '弹窗必须说清楚只有丢弃按钮才会丢修改，不能把自动草稿说成必丢')
+    assert.ok(!src.includes('现在离开，这些修改会丢'), '有自动草稿时不得再写“现在离开就会丢”')
+    assert.ok(src.includes('保存并继续'), '离开拦截里的保存按钮要明确告诉用户保存后会继续')
+    assert.ok(src.includes('beginGuardSave'), '保存并继续必须等待真正保存成功后再继续原操作')
+    assert.ok(src.includes('const beginGuardSave') && src.includes('submitSave({ filter: candidate'), '保存并继续必须直接调用保存，不能再弹第二次确认')
+    assert.ok(src.includes('settleSaveResult(true)'), '只有保存成功才能放行原来的切页/后退')
+    assert.ok(src.includes('leaveSavingRef'), '保存并继续落盘期间必须锁住新的切页/后退请求')
+    const leaveSave = src.slice(src.indexOf('const closeLeaveRequest = '), src.indexOf('// 「查看日志」跳转'))
+    assert.ok(/await guard\.save\(\)/.test(leaveSave), '保存按钮必须等 guard.save() 的结果')
+    assert.ok(leaveSave.includes('leaveSavingRef.current = true') && leaveSave.includes('leaveSavingRef.current = false'), '保存并继续必须锁住整段落盘过程')
+    assert.ok(leaveSave.includes('doSwitchTab(req.target, true)'), '保存成功后必须继续用户原来要去的页签（并替换 sentinel）')
+    assert.ok(leaveSave.indexOf('if (!saved)') >= 0 && leaveSave.indexOf('if (!saved)') < leaveSave.indexOf('doSwitchTab(req.target, true)'),
+      '保存失败/取消必须先 return，不能先跳页')
+    assert.ok(src.includes("window.addEventListener('beforeunload'"), '刷新/关页必须走 beforeunload')
+    const unload = src.slice(src.indexOf('const onBeforeUnload = '), src.indexOf("window.addEventListener('beforeunload'"))
+    assert.ok(unload.includes('e.preventDefault()') && unload.includes("e.returnValue = ''"),
+      'beforeunload 必须真的取消卸载，不能只挂监听')
+    assert.ok(src.includes("window.addEventListener('popstate'"), '手机左滑/后退必须拦 popstate')
+    assert.ok(src.includes('__xbkFilterGuard'), '脏草稿必须在历史里压 sentinel，否则左滑直接退走')
+    assert.ok(src.includes("source: 'tab'") && src.includes("source: 'hash'") && src.includes("source: 'history'"),
+      '切页、hash 变化、浏览器后退三种来源都要能回到同一个拦截弹窗')
+    assert.ok(src.includes('onLeaveRequestRef.current'), 'popstate 回调必须用 ref 读最新值，不能被旧闭包吃掉')
+    assert.ok(src.includes('guardRef'), 'App 必须拿到过滤页的脏状态/保存/放弃动作')
+    const app = src.slice(src.indexOf('const switchTab = '), src.indexOf('const openLog = useCallback'))
+    assert.ok(app.includes('if (leaveSavingRef.current) return'), '保存并继续落盘期间 switchTab 必须直接返回，不能只挂一个变量')
+    assert.ok(/guard && guard\.dirty/.test(app), '切页前必须检查过滤页脏状态')
+    assert.ok(src.includes('放弃草稿并回滚'), '回滚会覆盖草稿时必须把按钮文案说清楚')
+    assert.ok(src.includes('复制代码默认会把这些修改覆盖掉'), '复制默认会覆盖草稿时必须先确认')
+  })
+
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
@@ -6179,7 +6301,7 @@ async function main () {
     // ⑥ 过滤规则：有未保存改动时不注册，且请求在飞期间变脏要丢弃响应。
     const filter = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('\nfunction ', src.indexOf('function FilterRulesPanel') + 10))
     assert.ok(filter.includes('usePullRefresh(active && dirtyFields.length === 0, load)'), '过滤规则页有未保存改动时不得刷新')
-    assert.ok(filter.includes('dirtyRef.current = dirtyFields.length > 0'), 'dirtyRef 必须随草稿状态更新')
+    assert.ok(filter.includes('dirtyRef.current = dirtyFields.length > 0') || filter.includes('dirtyRef.current = dirty'), 'dirtyRef 必须随草稿状态更新')
     assert.ok(filter.includes('if (dirtyRef.current) return'), '响应回来时草稿已变脏必须丢弃，不能覆盖用户改动')
     // ⑦ 指示条要等所有 loader 落定；排队/在飞的请求不能被提前结算。
     assert.ok(src.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'), 'SysPanel.refresh 必须交出三个 loader 的 promise（v3.342 设置块搬到系统页）')

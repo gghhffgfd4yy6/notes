@@ -1079,8 +1079,9 @@ function readBody (req, maxBytes = 4096) {
 }
 
 // ── 过滤规则覆盖文件控制面（规格 §3/§4；计划 §3.3）─────────────────────────
-// 5 个固定路径端点：GET 读取 / POST 保存 / POST 预检 / POST 预览 / POST 回滚。
-// 写端点在全局 authorize 之前分流，且**只认 Authorization 头**：
+// 固定路径端点：GET 读规则 / GET 读草稿 / POST 保存 / POST 预检 / POST 预览 /
+// POST 回滚 / POST 写草稿 / DELETE 删草稿。写端点在全局 authorize 之前分流，且
+// **只认 Authorization 头**（草稿 DELETE 同）：
 //   · 全局闸接受 ?token=，POST 又不收 Cookie——直接复用会让「URL 带 token」与
 //     「仅 Cookie」都落到同一条 401，无法给出规格要求的专属 code。
 // 规则正文绝不进访问日志/审计：审计只记 action/revision/changedFields 与 prevHash 链。
@@ -1093,6 +1094,20 @@ const FILTER_PREVIEW_SAMPLE_DEFAULT = 5
 const FILTER_PREVIEW_SAMPLE_MAX = 20
 const FILTER_PREVIEW_MAX_BYTES = 64 * 1024 * 1024
 const FILTER_AUDIT_GENESIS = '0'.repeat(64)
+// 草稿是「没点保存的整页规则」，与正式覆盖文件分开存；不参与备份/审计/锁。
+const FILTER_DRAFT_SCHEMA = 1
+const FILTER_DRAFT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+const FILTER_DRAFT_FIELD_MAX_LEN = 4000
+const FILTER_DRAFT_FIELD_SET = new Set(FilterStore.FILTER_RULE_FIELDS)
+// 控制字符：允许 \t(09) \n(0A) \r(0D)，其余 C0 与 DEL 一律拒绝。
+function hasFilterDraftControlChar (value) {
+  for (const ch of value) {
+    const code = ch.charCodeAt(0)
+    if (code === 9 || code === 10 || code === 13) continue
+    if (code < 32 || code === 127) return true
+  }
+  return false
+}
 // 全命中字面量（trim 后等值）：与 xbk_filter_store 的 WIDE_MATCH_VALUES 同口径。
 const FILTER_WIDE_MATCH = new Set(['.*', '^.*$'])
 // 写端点固定路径白名单（无动态后缀；非白名单路径继续走全局 404/鉴权）。
@@ -1100,7 +1115,8 @@ const FILTER_WRITE_PATHS = new Set([
   '/api/config/filter',
   '/api/config/filter/validate',
   '/api/config/filter/preview',
-  '/api/config/filter/restore'
+  '/api/config/filter/restore',
+  '/api/config/filter/draft'
 ])
 
 function sha256Hex (text) {
@@ -2567,6 +2583,153 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     sendFilterValidation(res, result.errors)
   }
 
+  // ── 过滤规则草稿（服务器侧兜底）──────────────────────────────────────────
+  // 草稿只存 11 个字段的原文，不做正则编译：用户打到一半的 `(` 也要能存下来。
+  // 与正式覆盖文件分开：不取过滤锁、不进备份/审计，正式保存成功后才删。
+  const filterDraftPaths = () => FilterStore.filterRulesPaths(stateDir)
+  const clearFilterDraftFile = () => {
+    const paths = filterDraftPaths()
+    try {
+      fs.unlinkSync(paths.draft)
+      return true
+    } catch (e) {
+      return e && e.code === 'ENOENT'
+    }
+  }
+  const currentFilterRevision = () => {
+    const loaded = loadCurrentFilter()
+    return loaded.source === 'corrupt' ? 0 : loaded.revision
+  }
+  const normalizeFilterDraft = (raw) => {
+    const errors = []
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, errors: [{ field: 'filter', code: 'invalid_filter', message: 'filter 必须是对象' }] }
+    }
+    let keys
+    try { keys = Object.keys(raw) } catch (e) { keys = null }
+    if (keys === null) {
+      return { ok: false, errors: [{ field: 'filter', code: 'invalid_filter', message: 'filter 不是可枚举对象' }] }
+    }
+    for (const field of keys) {
+      if (!FILTER_DRAFT_FIELD_SET.has(field)) {
+        errors.push({ field, code: 'unknown_field', message: `未知字段「${field}」不允许写入草稿` })
+      }
+    }
+    const filter = {}
+    for (const field of FilterStore.FILTER_RULE_FIELDS) {
+      const value = raw[field]
+      if (value === undefined) continue
+      if (typeof value !== 'string') {
+        errors.push({ field, code: 'not_string', message: `字段「${field}」必须是字符串（当前 ${typeof value}）` })
+        continue
+      }
+      if (value.length > FILTER_DRAFT_FIELD_MAX_LEN) {
+        errors.push({ field, code: 'too_long', message: `字段「${field}」长度 ${value.length} 超过上限 ${FILTER_DRAFT_FIELD_MAX_LEN}` })
+        continue
+      }
+      if (hasFilterDraftControlChar(value)) {
+        errors.push({ field, code: 'control_char', message: `字段「${field}」含控制字符（仅允许 \\n \\r \\t）` })
+        continue
+      }
+      filter[field] = value
+    }
+    return errors.length > 0 ? { ok: false, errors } : { ok: true, filter }
+  }
+  const handleFilterDraftGet = (req, res) => {
+    const revision = currentFilterRevision()
+    const paths = filterDraftPaths()
+    const read = readSafeTextResult(paths.draft, FILTER_BODY_MAX_BYTES)
+    if (read.status === 'missing') {
+      sendJson(res, 200, { ok: true, revision, draft: null })
+      return
+    }
+    if (read.status !== 'ok') {
+      // 读取窗口被替换/瞬时 IO 错误都不能当成「草稿损坏」删掉：
+      // 那会把另一台设备刚写好的有效草稿清空（Sourcery Medium）。
+      sendJson(res, 200, { ok: true, revision, draft: null })
+      return
+    }
+    let saved
+    try { saved = JSON.parse(read.text) } catch (e) { saved = null }
+    const savedAt = saved && Number(saved.savedAt)
+    const normalized = saved && normalizeFilterDraft(saved.filter)
+    if (!saved || saved.schema !== FILTER_DRAFT_SCHEMA || !Number.isFinite(savedAt) || savedAt <= 0 ||
+        !normalized.ok || !Number.isSafeInteger(saved.baseRevision) || saved.baseRevision < 0) {
+      sendJson(res, 200, { ok: true, revision, draft: null })
+      return
+    }
+    if (Date.now() - savedAt > FILTER_DRAFT_MAX_AGE_MS) {
+      sendJson(res, 200, { ok: true, revision, draft: null })
+      return
+    }
+    sendJson(res, 200, {
+      ok: true,
+      revision,
+      draft: { filter: normalized.filter, baseRevision: saved.baseRevision, savedAt }
+    })
+  }
+  const handleFilterDraftSave = (req, res) => {
+    readFilterJson(req).then((parsed) => {
+      if (parsed.error) { sendJson(res, parsed.error.status, parsed.error.body); return }
+      const body = parsed.value
+      // 未带 schema 的旧客户端按 1 处理；显式带其他版本必须拒绝（Sourcery Medium）。
+      const schema = body.schema === undefined ? FILTER_DRAFT_SCHEMA : body.schema
+      if (schema !== FILTER_DRAFT_SCHEMA) {
+        sendFilterValidation(res, [{ field: 'schema', code: 'unsupported_schema', message: `只支持草稿 schema ${FILTER_DRAFT_SCHEMA}` }])
+        return
+      }
+      const baseRevision = body.baseRevision === undefined ? 0 : body.baseRevision
+      if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+        sendFilterValidation(res, [{ field: 'baseRevision', code: 'invalid_revision', message: 'baseRevision 必须是非负整数' }])
+        return
+      }
+      const normalized = normalizeFilterDraft(body.filter)
+      if (!normalized.ok) { sendFilterValidation(res, normalized.errors); return }
+      const current = currentFilterRevision()
+      if (baseRevision !== current) {
+        sendJson(res, 409, {
+          ok: false,
+          error: 'revision_mismatch',
+          code: 'revision_mismatch',
+          revision: current
+        })
+        return
+      }
+      const paths = filterDraftPaths()
+      const payload = {
+        schema: FILTER_DRAFT_SCHEMA,
+        baseRevision,
+        savedAt: Date.now(),
+        filter: normalized.filter
+      }
+      if (!writeAtomic(paths.draft, JSON.stringify(payload), '过滤规则草稿')) {
+        sendJson(res, 500, { ok: false, error: 'write_failed', code: 'write_failed' })
+        return
+      }
+      // 写完再看一眼正式 revision：若期间正式保存已经把草稿删掉并升了版，
+      // 这次晚到的草稿不能留——但不能直接按路径删，可能删掉另一台设备刚写的新草稿。
+      // 保留文件、由读面按 baseRevision 过滤，下一次合法写入会覆盖它。
+      const after = currentFilterRevision()
+      if (after !== baseRevision) {
+        sendJson(res, 409, {
+          ok: false,
+          error: 'revision_mismatch',
+          code: 'revision_mismatch',
+          revision: after
+        })
+        return
+      }
+      sendJson(res, 200, { ok: true, revision: baseRevision, savedAt: payload.savedAt })
+    }).catch(() => sendJson(res, 500, { ok: false, error: 'write_failed', code: 'write_failed' }))
+  }
+  const handleFilterDraftDelete = (req, res) => {
+    if (!clearFilterDraftFile()) {
+      sendJson(res, 500, { ok: false, error: 'write_failed', code: 'write_failed' })
+      return
+    }
+    sendJson(res, 200, { ok: true })
+  }
+
   // GET /api/config/filter：读面，沿用全局鉴权（Cookie / Bearer / ?token= 均可）。
   // 损坏时 revision 强制 0（即便进程内有 last-known-good，那是运行侧降级，不是覆盖文件版本）。
   const handleFilterGet = (req, res) => {
@@ -2704,6 +2867,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         // 剪枝只在整个保存（含审计）成功后才执行：任何失败路径都不得剪掉最老备份。
         pruneFilterBackups(paths)
+        // 正式保存成功：没保存的草稿已经失去意义，删掉避免下次误恢复。
+        clearFilterDraftFile()
         sendJson(res, 200, {
           ok: true,
           revision: nextRevision,
@@ -2952,6 +3117,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         // 剪枝只在整个回滚（含审计）成功后才执行。
         pruneFilterBackups(paths)
+        // 回滚/恢复默认也是一次正式写入，草稿随之作废。
+        clearFilterDraftFile()
         const payload = {
           ok: true,
           revision: nextRevision,
@@ -2977,6 +3144,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     if (url.pathname === '/api/config/filter/validate') { handleFilterValidate(req, res); return }
     if (url.pathname === '/api/config/filter/preview') { handleFilterPreview(req, res); return }
     if (url.pathname === '/api/config/filter/restore') { handleFilterRestore(req, res, verdict.actorToken); return }
+    if (url.pathname === '/api/config/filter/draft') { handleFilterDraftSave(req, res); return }
     handleFilterSave(req, res, verdict.actorToken)
   }
 
@@ -3066,6 +3234,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // cookie_not_allowed 两个规格要求的 code（写面仅 Bearer）。
     if (req.method === 'POST' && FILTER_WRITE_PATHS.has(url.pathname)) {
       handleFilterWrite(req, res, url)
+      return
+    }
+    // 删除草稿也走写面鉴权（Bearer-only）：GET 读面仍可 Cookie/?token=。
+    if (req.method === 'DELETE' && url.pathname === '/api/config/filter/draft') {
+      const verdict = writeAuthVerdict(req, url.searchParams, token)
+      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
+      handleFilterDraftDelete(req, res)
       return
     }
     if (!authorize(req, token, url.searchParams)) {
@@ -3473,6 +3648,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // GET /api/config/filter：过滤规则读面（全局鉴权已通过，Cookie/Bearer/?token= 均可）。
     if (req.method === 'GET' && url.pathname === '/api/config/filter') {
       handleFilterGet(req, res)
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/config/filter/draft') {
+      handleFilterDraftGet(req, res)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/sys') {

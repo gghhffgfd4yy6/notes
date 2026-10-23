@@ -45,6 +45,7 @@ try {
     assert.strictEqual(status.run.value.pushed, 5, '应取最后一行的 pushed=5')
     assert.strictEqual(status.run.value.failed, 1, '应取最后一行的 failed=1')
     assert.strictEqual(status.run.value.elapsed, '1.2s', 'elapsed 应原样保留')
+    assert.strictEqual(status.run.value.dryRun, null, '普通摘要没有 dry-run 字段 → dryRun 必须为 null')
   })
 
   // ===== parseDiagnostics 跳过损坏行找到有效记录 =====
@@ -74,6 +75,7 @@ try {
     assert.strictEqual(status.run.value.truncated, 2, 'truncated=2 应原样解析')
     assert.strictEqual(status.run.value.pushed, 28, 'pushed=28 应原样解析')
     assert.strictEqual(status.run.value.elapsed, '3.4s', 'elapsed 应原样保留（含尾部 s）')
+    assert.strictEqual(status.run.value.dryRun, 3, 'dry-run未推送=3 必须带进最近一轮（试跑标识）')
   })
 
   // ===== 最近一条是 CANCEL：不能回退显示上一条正常摘要（Sourcery PR#252） =====
@@ -87,6 +89,7 @@ try {
     assert.strictEqual(status.run.value.cancelled, true, '最近一轮是取消，不能显示成上一轮正常')
     assert.strictEqual(status.run.value.total, null, '取消轮没有计数')
     assert.strictEqual(status.run.value.at, '2026-09-08 10:05:00')
+    assert.strictEqual(status.run.value.dryRun, null, '取消轮没有试跑计数')
 
     fs.appendFileSync(path.join(tmp, 'run.log'), '2026-09-08 10:06:00 total=7 dedup=0 filtered=1 truncated=0 pushed=6 failed=0 elapsed=1.0s\n')
     status = readStatus(tmp)

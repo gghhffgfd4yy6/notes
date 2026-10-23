@@ -39,6 +39,7 @@ function filterRulesPaths (cacheDir) {
     file: path.join(dir, 'filter-rules.json'),
     applied: path.join(dir, 'filter-rules.applied.json'),
     audit: path.join(dir, 'filter-rules.audit.ndjson'),
+    draft: path.join(dir, 'filter-rules.draft.json'),
     lock: path.join(dir, 'filter-rules.lock'),
     backupFor (rev) {
       const safeRev = Number.isSafeInteger(rev) && rev >= 0 ? rev : 0

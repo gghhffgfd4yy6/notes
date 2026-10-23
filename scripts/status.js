@@ -249,6 +249,7 @@ function parseLastRun (read) {
       pushed: null,
       failed: null,
       elapsed: '',
+      dryRun: null,
       interrupted: false,
       cancelled: true,
       isPlaceholder: true,
@@ -280,6 +281,7 @@ function parseLastRun (read) {
       const at = tsOf(lines[j])
       if (at) orphanFailureAt = at
     }
+    const extras = runParseExtras(lines[i])
     return result('ok', {
       at: match[1] ? match[1].trim() : '',
       total: counters[0],
@@ -289,6 +291,7 @@ function parseLastRun (read) {
       pushed: counters[4],
       failed: counters[5],
       elapsed: match[8],
+      dryRun: extras.dryRun,
       interrupted: classified.interruptedIdx.has(i),
       orphanFailures,
       orphanFailureAt
