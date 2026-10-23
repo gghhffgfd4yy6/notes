@@ -1216,6 +1216,8 @@ function StatusCards ({ state, err }) {
   const repTone = partTone(state.report, repIsOk(state))
   const run = state.run && state.run.value ? state.run.value : null
   const runTone = partTone(state.run, runIsOk(state))
+  const runDry = run && run.dryRun != null
+  const runBad = run && (run.interrupted === true || run.failed > 0)
   const chan = channelInfo(state)
   const stats = state.stats && state.stats.status === 'ok' ? state.stats.value : null
   const today = stats ? stats.today : null
@@ -1274,12 +1276,16 @@ function StatusCards ({ state, err }) {
     },
     {
       title: '最近一轮',
-      tone: runTone,
-      badge: !run ? '—' : (run.cancelled === true ? '已取消' : (run.interrupted || run.failed > 0 ? '异常' : '正常')),
+      tone: runDry ? (runBad ? 'bad' : 'warn') : runTone,
+      badge: !run
+        ? '—'
+        : (run.cancelled === true
+            ? '已取消'
+            : (runDry ? (runBad ? '试跑异常' : '试跑') : (runBad ? '异常' : '正常'))),
       main: run
         ? {
-            num: fmtNum(run.pushed),
-            unit: '条推送',
+            num: fmtNum(runDry ? run.dryRun : run.pushed),
+            unit: runDry ? '条未推送' : '条推送',
             hint: `${runAge || '时间未知'}${run.at ? ` · ${run.at.slice(5, 16)}` : ''}`
           }
         : { num: '—', unit: '', hint: '暂无数据' },
