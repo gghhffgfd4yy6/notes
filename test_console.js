@@ -6231,6 +6231,7 @@ async function main () {
     assert.ok(src.includes('function LeaveGuardDialog'), '必须有“取消/不保存/保存并继续”三选一弹窗')
     assert.ok(src.includes('保存并继续'), '离开拦截里的保存按钮要明确告诉用户保存后会继续')
     assert.ok(src.includes('beginGuardSave'), '保存并继续必须等待真正保存成功后再继续原操作')
+    assert.ok(src.includes('const beginGuardSave') && src.includes('submitSave({ filter: candidate'), '保存并继续必须直接调用保存，不能再弹第二次确认')
     assert.ok(src.includes('settleSaveResult(true)'), '只有保存成功才能放行原来的切页/后退')
     const leaveSave = src.slice(src.indexOf('const closeLeaveRequest = '), src.indexOf('// 「查看日志」跳转'))
     assert.ok(/await guard\.save\(\)/.test(leaveSave), '保存按钮必须等 guard.save() 的结果')

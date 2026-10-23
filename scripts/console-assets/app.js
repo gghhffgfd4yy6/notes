@@ -1409,7 +1409,7 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
       <div class="modal-title" id=${titleId}>有未保存的过滤规则</div>
       <div class="modal-body">
         <div class="fr-dialog-line">当前有 ${count} 个字段还没保存。现在离开，这些修改会丢。</div>
-        <div class="modal-note">「保存并继续」会先走正常的保存确认，保存成功后自动继续刚才的离开操作；「不保存并离开」会丢掉这些修改；「取消」继续编辑。</div>
+        <div class="modal-note">「保存并继续」会直接保存，保存成功后自动继续刚才的离开操作；「不保存并离开」会丢掉这些修改；「取消」继续编辑。</div>
       </div>
       <div class="modal-actions">
         <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${onCancel}>取消<//>
@@ -4866,16 +4866,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     }
   }
 
-  // 离开拦截里的「保存并继续」：挂一个等待保存结果的 Promise，再走正常保存确认。
+  // 离开拦截里的「保存并继续」：直接落盘，不弹第二次保存确认。
   // 只有 submitSave 真正成功才 resolve(true)；取消/失败/卸载都 resolve(false)，App 不跳页。
-  const beginGuardSave = useCallback(() => {
-    if (saveResultRef.current) saveResultRef.current.resolve(false)
-    const pending = new Promise((resolve) => { saveResultRef.current = { resolve } })
-    beginSave().then((opened) => {
-      if (!opened) settleSaveResult(false)
-    }).catch(() => settleSaveResult(false))
-    return pending
-  }, [beginSave, settleSaveResult])
+  // 实现放在 submitSave 之后，避免在初始化前引用它。
 
   const runPreview = async () => {
     if (!draft || busy) return
@@ -4916,10 +4909,13 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       const code = showFailure(res, copy ? '复制默认规则失败' : '保存失败')
       const errors = res.data && Array.isArray(res.data.errors) ? res.data.errors : []
       if (code === 'store_corrupt') {
+        // 直接保存并继续时：先不放行跳页，交给覆盖确认弹窗处理。
+        settleSaveResult(false)
         setDialog({ kind: 'corrupt', filter, baseRevision, confirmWideMatch })
         return
       }
       if (code === 'validation_failed' && errors.some((x) => x && x.code === 'wide_match_confirm_required')) {
+        settleSaveResult(false)
         setDialog({ kind: 'copyWide', filter })
         return
       }
@@ -4934,6 +4930,31 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       setBusy('')
     }
   }
+
+  // 离开拦截里的「保存并继续」：直接落盘，不再走 beginSave 的二次确认。
+  // 先挂等待者，再复用 submitSave；成功 resolve(true)，失败/需要覆盖确认时 resolve(false)。
+  // 这样点「保存并继续」只出现离开拦截自己的确认，不会再弹「确认保存过滤规则」。
+  const beginGuardSave = useCallback(() => {
+    if (saveResultRef.current) saveResultRef.current.resolve(false)
+    const pending = new Promise((resolve) => { saveResultRef.current = { resolve } })
+    if (!data || !draft || busy) {
+      settleSaveResult(false)
+      return pending
+    }
+    const candidate = {}
+    for (const name of dirtyFields) candidate[name] = draft[name]
+    if (Object.keys(candidate).length === 0) {
+      settleSaveResult(false)
+      return pending
+    }
+    setErr('')
+    setFieldErrors({})
+    setNotice(null)
+    // confirmWideMatch 先给 false：真有 .* 规则时让服务端拦下并开覆盖确认，
+    // 不能静默把所有记录都命中。
+    submitSave({ filter: candidate, baseRevision: data.revision, confirmWideMatch: false })
+    return pending
+  }, [data, draft, busy, dirtyFields, submitSave, settleSaveResult])
 
   // 首启：把 GET 到的代码默认整份写进覆盖文件（baseRevision:0）。不自动写，必须点按钮。
   const copyDefaults = async () => {
