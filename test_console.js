@@ -6060,11 +6060,11 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.351：注释里不得提前写下一版 v3.352。
+    // 版本已 bump 到 3.352：注释里不得提前写下一版 v3.353。
     // 注意这条只拦「资源注释里提前写下个版本」；四处版本号（主文件头/CHANGELOG/package.json/
     // package-lock 两处）的一致性由 check-version.js 负责（CI 与 pre-commit 都跑，npm test 不含）。
-    assert.ok(!/v3\.352/.test(src), 'app.js 注释不得写 v3.352（版本未 bump）')
-    assert.ok(!/v3\.352/.test(css), 'app.css 注释不得写 v3.352（版本未 bump）')
+    assert.ok(!/v3\.353/.test(src), 'app.js 注释不得写 v3.353（版本未 bump）')
+    assert.ok(!/v3\.353/.test(css), 'app.css 注释不得写 v3.353（版本未 bump）')
   })
 
   await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
