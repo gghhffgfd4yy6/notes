@@ -3320,6 +3320,94 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const focusDoneRef = useRef('')
   const stickRef = useRef(true)
   const prevTextRef = useRef('')
+  // v3.351：日志框右侧「快滚条」——一长条轨道，按住拖动可快速掠过整段日志。
+  // 手机浏览器不显示原生滚动条，长日志只能一屏屏甩；这里补一条可拖的条，点轨道直接跳。
+  const railRef = useRef(null)
+  const dragRef = useRef(null)
+  const [rail, setRail] = useState({ top: 0, height: 0, pct: 0, show: false })
+  const syncRail = useCallback(() => {
+    const el = preRef.current
+    const box = railRef.current
+    if (!el || !box) return
+    const track = box.clientHeight
+    const max = el.scrollHeight - el.clientHeight
+    if (track <= 0 || max <= 8) {
+      setRail((prev) => (prev.show ? { top: 0, height: 0, pct: 0, show: false } : prev))
+      return
+    }
+    const h = Math.max(28, Math.round(track * (el.clientHeight / el.scrollHeight)))
+    const top = Math.round((track - h) * (el.scrollTop / max))
+    const pct = Math.round((el.scrollTop / max) * 100)
+    setRail((prev) => (prev.show && prev.top === top && prev.height === h && prev.pct === pct
+      ? prev
+      : { top, height: h, pct, show: true }))
+  }, [])
+  // 手指落在轨道空白处：以拇指高度折半起算，落到哪跳到哪；落在拇指上：保持抓取偏移，拖动不跳。
+  const railScrollTo = useCallback((clientY, grab) => {
+    const el = preRef.current
+    const box = railRef.current
+    if (!el || !box) return
+    const track = box.clientHeight
+    const h = Math.max(28, Math.round(track * (el.clientHeight / el.scrollHeight)))
+    const usable = Math.max(1, track - h)
+    const y = clientY - box.getBoundingClientRect().top - grab
+    const ratio = Math.min(1, Math.max(0, y / usable))
+    el.scrollTop = ratio * (el.scrollHeight - el.clientHeight)
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+    syncRail()
+  }, [syncRail])
+  const onRailDown = (e) => {
+    const el = preRef.current
+    const box = railRef.current
+    if (!el || !box) return
+    // 多指并发（Sourcery #305 M3）：第二根手指按下时第一根还在拖——只认先按下的那根。
+    // 否则 dragRef 被覆盖，第一根的 move/up 全被 id 过滤掉，松手后条还粘在旧抓取点。
+    if (dragRef.current) return
+    const track = box.clientHeight
+    const h = Math.max(28, Math.round(track * (el.clientHeight / el.scrollHeight)))
+    const thumbTop = box.getBoundingClientRect().top + rail.top
+    const onThumb = e.clientY >= thumbTop - 2 && e.clientY <= thumbTop + h + 2
+    dragRef.current = { id: e.pointerId, grab: onThumb ? e.clientY - thumbTop : h / 2 }
+    // 捕获失败（合成事件 / 指针已抬起）不影响这次跳转：先记下抓取点，能捕获就捕获。
+    if (typeof box.setPointerCapture === 'function') {
+      try { box.setPointerCapture(e.pointerId) } catch (err) {}
+    }
+    e.preventDefault()
+    railScrollTo(e.clientY, dragRef.current.grab)
+  }
+  const onRailMove = (e) => {
+    const d = dragRef.current
+    if (!d || d.id !== e.pointerId) return
+    e.preventDefault()
+    railScrollTo(e.clientY, d.grab)
+  }
+  const onRailUp = (e) => {
+    const d = dragRef.current
+    if (!d || d.id !== e.pointerId) return
+    dragRef.current = null
+    const box = railRef.current
+    if (box && typeof box.releasePointerCapture === 'function') {
+      try { box.releasePointerCapture(e.pointerId) } catch (err) {}
+    }
+  }
+  // 键盘等价操作：上下 48px、翻页 0.9 屏、Home/End 到两端。
+  const onRailKey = (e) => {
+    const el = preRef.current
+    if (!el) return
+    const page = Math.max(80, el.clientHeight * 0.9)
+    const map = { ArrowDown: 48, ArrowUp: -48, PageDown: page, PageUp: -page }
+    if (e.key === 'Home' || e.key === 'End') {
+      e.preventDefault()
+      el.scrollTop = e.key === 'Home' ? 0 : el.scrollHeight
+    } else if (e.key in map) {
+      e.preventDefault()
+      el.scrollTop = Math.max(0, el.scrollTop + map[e.key])
+    } else {
+      return
+    }
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+    syncRail()
+  }
   // 轮询互斥（审查 #231 前端项）：任务运行时每 2s 拉 1 MiB，上一请求未回时再叠一发
   // 只会让服务端并发读盘、后到的响应还可能盖掉新结果。手动刷新同样走这把闸。
   const busyRef = useRef(false)
@@ -3445,7 +3533,33 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     if (data.status !== 'ok') { stickRef.current = true; prevTextRef.current = ''; return }
     if (stickRef.current || prevTextRef.current === '') el.scrollTop = el.scrollHeight
     prevTextRef.current = shownText
-  }, [data, mode, q, shownText])
+    syncRail()
+  }, [data, mode, q, shownText, syncRail])
+  // 日志/筛选变化后等一帧再量轨道（<pre> 高度落定后再算）；窗口尺寸变化同理。
+  useEffect(() => {
+    const id = window.requestAnimationFrame(syncRail)
+    return () => window.cancelAnimationFrame(id)
+  }, [data, mode, q, shownText, syncRail])
+  useEffect(() => {
+    const onResize = () => syncRail()
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [syncRail])
+  // 面板被切走时 display:none ⇒ 量到 0 高、条被隐藏；切回来不一定伴随 resize 或内容变化
+  // （Sourcery #305 M1），所以 active 变 true 时必须重量一次，否则条一直不出现。
+  useEffect(() => {
+    if (!active) return
+    const id = window.requestAnimationFrame(syncRail)
+    return () => window.cancelAnimationFrame(id)
+  }, [active, syncRail])
+  // 日志框自身高度变化（视口转屏、字号/行高变化）不触发 window resize，用 ResizeObserver 兜住。
+  useEffect(() => {
+    const el = preRef.current
+    if (!el || typeof window.ResizeObserver !== 'function') return
+    const ro = new window.ResizeObserver(() => syncRail())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [data, syncRail])
   // v3.319：行级跳转把点中的那一轮滚到日志框中部；只做一次，轮询不抢用户滚动。
   // 用 useLayoutEffect：与贴底同一帧完成，首帧就是定位后的位置，不会先闪顶部/底部。
   useLayoutEffect(() => {
@@ -3464,6 +3578,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     const el = preRef.current
     if (!el) return
     stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+    syncRail()
   }
   const refreshNow = () => {
     stickRef.current = true
@@ -3561,7 +3676,15 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
         <div class="log-empty-text">${emptyText}</div>
         ${mode !== 'all' && html`<button type="button" class="log-chip" onClick=${searchAllLogs}>在全部日志中搜索</button>`}
       </div>`
-      : html`<pre class="logpre logpre-main" ref=${preRef} onScroll=${onLogScroll}>${heavy ? shownText : lineNodes}</pre>`)}
+      : html`<div class="log-wrap">
+        <pre id="log-pre" class="logpre logpre-main" ref=${preRef} onScroll=${onLogScroll}>${heavy ? shownText : lineNodes}</pre>
+        <div class=${'log-rail' + (rail.show ? ' show' : '')} ref=${railRef} role="scrollbar"
+          aria-label="日志快速滚动条" aria-controls="log-pre" aria-orientation="vertical" aria-valuemin="0" aria-valuemax="100"
+          aria-valuenow=${rail.pct} tabindex="0" onPointerDown=${onRailDown} onPointerMove=${onRailMove}
+          onPointerUp=${onRailUp} onPointerCancel=${onRailUp} onKeyDown=${onRailKey}>
+          <span class="log-thumb" style=${{ top: rail.top + 'px', height: rail.height + 'px' }}></span>
+        </div>
+      </div>`)}
   </div>`
 }
 

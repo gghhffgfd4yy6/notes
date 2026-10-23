@@ -5998,11 +5998,11 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.350：注释里不得提前写下一版 v3.351。
+    // 版本已 bump 到 3.351：注释里不得提前写下一版 v3.352。
     // 注意这条只拦「资源注释里提前写下个版本」；四处版本号（主文件头/CHANGELOG/package.json/
     // package-lock 两处）的一致性由 check-version.js 负责（CI 与 pre-commit 都跑，npm test 不含）。
-    assert.ok(!/v3\.351/.test(src), 'app.js 注释不得写 v3.351（版本未 bump）')
-    assert.ok(!/v3\.351/.test(css), 'app.css 注释不得写 v3.351（版本未 bump）')
+    assert.ok(!/v3\.352/.test(src), 'app.js 注释不得写 v3.352（版本未 bump）')
+    assert.ok(!/v3\.352/.test(css), 'app.css 注释不得写 v3.352（版本未 bump）')
   })
 
   await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
@@ -6341,6 +6341,42 @@ async function main () {
     assert.ok(/animation:\s*chip-wait/.test(chipCss), '忙碌 chip 必须有提示动画')
     assert.ok(/prefers-reduced-motion/.test(chipCss), '减少动效时必须退回静态提示')
     assert.ok(!/chip-spin/.test(src), '忙碌提示不得插节点改 chip 宽度（会挤重排工具条）')
+  })
+
+  await aok('结构红线: 运行日志有可拖快滚条（一长条）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const ph = (name) => '$' + '{' + name + '}'
+    const at = src.indexOf('function LogsPanel')
+    const seg = src.slice(at, src.indexOf('// v3.342：控制台设置块', at))
+    assert.ok(at > -1 && seg.length > 1000, '应能定位 LogsPanel 源码段')
+    assert.ok(seg.includes('role="scrollbar"'), '快滚条必须是 scrollbar 角色')
+    assert.ok(seg.includes('aria-orientation="vertical"') && seg.includes('aria-valuenow=' + ph('rail.pct')),
+      '快滚条必须报方向与当前位置')
+    assert.ok(seg.includes('class=' + ph("'log-rail' + (rail.show ? ' show' : '')")), '快滚条必须按有无可滚内容显隐')
+    assert.ok(seg.includes('onPointerDown=' + ph('onRailDown')) && seg.includes('setPointerCapture'),
+      '按下必须捕获指针（手指移出轨道仍能拖）')
+    assert.ok(seg.includes('ratio * (el.scrollHeight - el.clientHeight)'), '拖动必须换算成 scrollTop，而不是按屏翻页')
+    assert.ok(seg.includes('dragRef.current = { id: e.pointerId, grab:'), '抓取偏移必须保留（按在拇指上不跳位）')
+    assert.ok(seg.includes('requestAnimationFrame(syncRail)'), '内容落定后要等一帧再量（否则高度是旧的）')
+    assert.ok(seg.includes("e.key === 'Home' || e.key === 'End'") && seg.includes('PageDown: page'),
+      '快滚条必须支持键盘翻页/到两端')
+    assert.ok(/\.log-rail\s*\{[^}]*width:\s*18px/.test(css) && /\.log-rail\s*\{[^}]*touch-action:\s*none/.test(css),
+      '轨道热区 18px 且 touch-action: none（拖动不吃页面滚动）')
+    assert.ok(/\.log-thumb\s*\{[^}]*width:\s*8px/.test(css), '拇指 8px')
+    assert.ok(/\.logpre-main\s*\{[^}]*padding-right:\s*16px/.test(css), '日志框右侧必须给轨道留 16px')
+    assert.ok(!/scrollIntoView/.test(seg), '快滚条只能滚日志框，不得 scrollIntoView 整页')
+    // M1：切走再切回时 display:none 量到 0 高，条被隐藏且不会因内容不变而重量。
+    assert.ok(seg.includes('if (!active) return') && /\[active, syncRail\]/.test(seg),
+      'active 变 true 必须重量一次（否则切回来条一直不出现）')
+    assert.ok(seg.includes('new window.ResizeObserver'), '日志框自身高度变化要用 ResizeObserver 兜住')
+    assert.ok(seg.includes('prev.show ? { top: 0, height: 0, pct: 0, show: false } : prev'),
+      '无溢出时必须把 show 置 false（不是只让 class 依赖 rail.show）')
+    // M2：滚动条必须与它控制的 <pre> 建立关系，否则读屏只听到一个孤立的滚动条。
+    assert.ok(seg.includes('id="log-pre"') && seg.includes('aria-controls="log-pre"'),
+      '快滚条必须用 aria-controls 指向被控日志框')
+    // M3：第二根手指不得顶掉正在拖的那根。
+    assert.ok(/if \(dragRef\.current\) return/.test(seg), '已有指针在拖时必须忽略新的 pointerdown')
   })
 }
 

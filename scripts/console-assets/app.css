@@ -538,6 +538,28 @@
      v3.320：max-height 之外再给同值的 min-height——首帧「读取中」占位、0 命中空态
      与有日志时的框同高，数据到达/筛选切换不再让文档高度突跳（旧版 90→776px）。 */
   .logpre-main { max-height: 520px; min-height: 520px; }
+  /* v3.351：日志快滚条（一长条）。手机浏览器不画原生滚动条，长日志只能一屏屏甩；
+     这里在日志框右缘给一条可拖的轨道，拖到哪滚到哪，点轨道直接跳。轨道本身 18px
+     宽做触控热区，视觉只画 4px 的槽 + 8px 的拇指；右侧留 16px 内边距避免压字。 */
+  .log-wrap { position: relative; }
+  .log-rail {
+    position: absolute; right: 2px; top: 6px; bottom: 6px; width: 18px; border-radius: 9px;
+    opacity: 0; visibility: hidden; touch-action: none; cursor: pointer;
+    transition: opacity var(--dur-fast), visibility 0s linear var(--dur-fast);
+  }
+  .log-rail.show { opacity: 1; visibility: visible; transition: opacity var(--dur-fast), visibility 0s linear 0s; }
+  .log-rail::before {
+    content: ''; position: absolute; left: 7px; top: 0; bottom: 0; width: 4px;
+    border-radius: 2px; background: var(--border); opacity: .6;
+  }
+  .log-thumb {
+    position: absolute; left: 5px; width: 8px; border-radius: 4px;
+    background: var(--text-dim); opacity: .75; pointer-events: none;
+  }
+  .log-rail:active .log-thumb { opacity: 1; }
+  .log-rail:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+  .logpre-main { padding-right: 16px; }
+  @media (prefers-reduced-motion: reduce) { .log-rail, .log-rail.show { transition: none; } }
   /* 行级着色（v3.317）：ERROR 红、ALERT/WARN 琥珀，其余继承默认前景色。
      一行一个行内 <span>、换行仍是真实 "\n" ⇒ pre-wrap 与复制出来的换行都不变。 */
   .logline-bad { color: var(--bad-fg); }

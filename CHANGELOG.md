@@ -808,3 +808,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 矩阵从 26 段（22 TAP + 4 command）变为 27 段（23 TAP + 4 command）；`mutation-report` 的 `EXPECTED_SEGMENTS`、行段校验夹具与 `SYSTEM_CONTRACT.md` 的段数同步。
 - 缓存身份加 `-rng-<mutate 范围>`（Sourcery #304）：拆段只改范围不改源码时 src 指纹不变，旧 part6 的 inc 会被新 part6 复用并把范围外变异体并进报告（`mutation-report` 求和后总数虚高）；范围进 key 与兜底前缀后，不同范围互不继承。
 - `test_check_mutation_ranges.js` 新增对**真实** `mutation.yml` 的校验（7 段连续覆盖、单片 ≤700 行、part6/part7 边界逐字），不再只测自造夹具。
+
+## v3.351 — 运行日志加「快滚条」
+
+- 日志框右缘加一长条可拖轨道（`role="scrollbar"`）：按住拇指拖动即快速掠过整段日志，点轨道空白处直接跳到对应位置；键盘 ↑↓/PgUp/PgDn/Home/End 等价。
+- 触控热区 18px、视觉槽 4px、拇指 8px；日志框右侧留 16px 内边距，不压字。原生滚动条在手机上不显示，这条替代它。
+- 只在有可滚内容时出现（内容不高于视口则隐藏），拖动不抢页面滚动（`touch-action: none`），到底后恢复自动跟随。
+- 评审补齐（Sourcery #305）：`aria-controls` 指向日志框；第二根手指不会顶掉正在拖的那根；切走再切回（display:none 量到 0 高）会重量一次，条不会一直不出现。
