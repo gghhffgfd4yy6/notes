@@ -1,7 +1,7 @@
 name: Mutation
 
 # 变异测试：全量生产代码覆盖。
-# runner（PR-1 起）：CI 走 **TAP 档** stryker.tap.config.js（22 段；`scripts/console.js` 拆 6 段、含 `filter-store`，PR-1 时 15 段，矩阵共 26 段；v3-entry / storage / qinglong-push / check-deps 四段走 command 档）（testRunner: tap + coverageAnalysis: perTest，
+# runner（PR-1 起）：CI 走 **TAP 档** stryker.tap.config.js（23 段；`scripts/console.js` 拆 7 段、含 `filter-store`，PR-1 时 15 段，矩阵共 27 段；v3-entry / storage / qinglong-push / check-deps 四段走 command 档）（testRunner: tap + coverageAnalysis: perTest，
 #   报告仍落 stryker 默认路径 reports/mutation/）；本地 `npm run test:mutation` 仍走 command 档
 #   stryker.config.js——两档测试集由 tap 配置的加载期断言强制对齐（不一致即配置加载失败）。
 # 长文件按官方行范围语法（file:start-end）拆分防超时：V3 目前 1 段全覆盖（行段以 matrix 的
@@ -13,7 +13,7 @@ name: Mutation
 # 可校验行段是否覆盖文件全量（含文件增长检测）。
 # 增量模式：每 job 独立缓存（reports/inc-*.json），首次全量、之后只跑 diff 部分（本轮原样保留，
 #   见「恢复增量缓存」step 的注释）。
-# 免费 runner 单任务上限 6h——全 19 段 TAP 基线（spike/tap-baseline，run 35607440845）墙钟 ≈71min（瓶颈=utils：**段内 step** 70.25min（仓内报告 4215s；GH API 同口径 70.28min）、**job** 70.57min；⚠️ 该 run 整体为 failure——唯一失败 job `storage` 按设计触发 fail-closed 守卫、**非 timeout**，勿读成「19 段 TAP 全绿」）；16 TAP + 3 command 矩阵实测墙钟 86.0min（run 35646992130，head ca63e71，瓶颈=command 档 qinglong-push 85.3min）；v3-entry 回退后的 15 TAP + 4 command 矩阵实测墙钟 **90.8min**（run 35827096127，head 01c0ef89，即本次变更的合并后首跑；瓶颈=command 档 qinglong-push **90.1min**），余量充足。矩阵现为 26 段（22 TAP + 4 command；`scripts/console.js` 拆 6 段），下列 19 段墙钟为拆分前实测，只作量级参考。
+# 免费 runner 单任务上限 6h——全 19 段 TAP 基线（spike/tap-baseline，run 35607440845）墙钟 ≈71min（瓶颈=utils：**段内 step** 70.25min（仓内报告 4215s；GH API 同口径 70.28min）、**job** 70.57min；⚠️ 该 run 整体为 failure——唯一失败 job `storage` 按设计触发 fail-closed 守卫、**非 timeout**，勿读成「19 段 TAP 全绿」）；16 TAP + 3 command 矩阵实测墙钟 86.0min（run 35646992130，head ca63e71，瓶颈=command 档 qinglong-push 85.3min）；v3-entry 回退后的 15 TAP + 4 command 矩阵实测墙钟 **90.8min**（run 35827096127，head 01c0ef89，即本次变更的合并后首跑；瓶颈=command 档 qinglong-push **90.1min**），余量充足。矩阵现为 27 段（23 TAP + 4 command；`scripts/console.js` 拆 7 段），下列 19 段墙钟为拆分前实测，只作量级参考。
 #   （旧 command 档在 --concurrency 8 下 app/utils/message-store 真全量仍需 ~7h/~6.5h/~4.5h，必撞 step 330min；
 #    这正是 CI 切 TAP 的原因，数据见 .local/tap-baseline-REPORT.md。）
 # 触发方式：workflow 文件变更 push、手动（Actions → Mutation → Run workflow）和每日自动。
@@ -286,8 +286,8 @@ jobs:
             config: "stryker.tap.config.js"
           # console.js 4099 行（v3.342 顶栏时间开关 + 设置块搬迁后重切；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 4300 体，变异评估
           # 成本 ≈ 变异体数 × 13.3s（C=8，历史成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）
-          # ⇒ 整段 ≈ 890min、远超 step 330min 上限。按上限倒推取 6 片（各 ≈640–810 行、~710–905 体
-          # ≈ 160min，含新测试更慢的余量）。
+          # ⇒ 整段 ≈ 890min、远超 step 330min 上限。按上限倒推取 7 片（末片 849 行实测 >330min 被杀，再对半：
+          # 3251-3675 / 3676-4099，各 ≈425 行 ≈ 95–160min，留足余量）。
           # 行段连续不重叠全覆盖（check-mutation-ranges 校验）；段名与 mutation-report EXPECTED_SEGMENTS 双向对账。
           - name: console-part1
             src: "scripts/console.js"
@@ -311,7 +311,11 @@ jobs:
             config: "stryker.tap.config.js"
           - name: console-part6
             src: "scripts/console.js"
-            mutate: "scripts/console.js:3251-4099"
+            mutate: "scripts/console.js:3251-3675"
+            config: "stryker.tap.config.js"
+          - name: console-part7
+            src: "scripts/console.js"
+            mutate: "scripts/console.js:3676-4099"
             config: "stryker.tap.config.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
