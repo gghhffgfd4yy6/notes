@@ -2644,7 +2644,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (read.status !== 'ok') {
-      clearFilterDraftFile()
+      // 读取窗口被替换/瞬时 IO 错误都不能当成「草稿损坏」删掉：
+      // 那会把另一台设备刚写好的有效草稿清空（Sourcery Medium）。
       sendJson(res, 200, { ok: true, revision, draft: null })
       return
     }
@@ -2654,12 +2655,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     const normalized = saved && normalizeFilterDraft(saved.filter)
     if (!saved || saved.schema !== FILTER_DRAFT_SCHEMA || !Number.isFinite(savedAt) || savedAt <= 0 ||
         !normalized.ok || !Number.isSafeInteger(saved.baseRevision) || saved.baseRevision < 0) {
-      clearFilterDraftFile()
       sendJson(res, 200, { ok: true, revision, draft: null })
       return
     }
     if (Date.now() - savedAt > FILTER_DRAFT_MAX_AGE_MS) {
-      clearFilterDraftFile()
       sendJson(res, 200, { ok: true, revision, draft: null })
       return
     }
@@ -2673,6 +2672,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     readFilterJson(req).then((parsed) => {
       if (parsed.error) { sendJson(res, parsed.error.status, parsed.error.body); return }
       const body = parsed.value
+      // 未带 schema 的旧客户端按 1 处理；显式带其他版本必须拒绝（Sourcery Medium）。
+      const schema = body.schema === undefined ? FILTER_DRAFT_SCHEMA : body.schema
+      if (schema !== FILTER_DRAFT_SCHEMA) {
+        sendFilterValidation(res, [{ field: 'schema', code: 'unsupported_schema', message: `只支持草稿 schema ${FILTER_DRAFT_SCHEMA}` }])
+        return
+      }
       const baseRevision = body.baseRevision === undefined ? 0 : body.baseRevision
       if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
         sendFilterValidation(res, [{ field: 'baseRevision', code: 'invalid_revision', message: 'baseRevision 必须是非负整数' }])
@@ -2702,10 +2707,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         return
       }
       // 写完再看一眼正式 revision：若期间正式保存已经把草稿删掉并升了版，
-      // 这次晚到的草稿不能留（否则下次打开会复活旧内容）。
+      // 这次晚到的草稿不能留——但不能直接按路径删，可能删掉另一台设备刚写的新草稿。
+      // 保留文件、由读面按 baseRevision 过滤，下一次合法写入会覆盖它。
       const after = currentFilterRevision()
       if (after !== baseRevision) {
-        clearFilterDraftFile()
         sendJson(res, 409, {
           ok: false,
           error: 'revision_mismatch',

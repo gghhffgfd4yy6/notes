@@ -937,6 +937,10 @@ async function filterRuleApiTests () {
       })
       assert.strictEqual(put.status, 200)
       assert.strictEqual(JSON.parse(put.text).ok, true)
+      const badSchema = await postFilterJson(port, '/api/config/filter/draft', {
+        schema: 99, baseRevision: 0, filter: { pingbibiaoti: 'x' }
+      })
+      assert.strictEqual(badSchema.status, 400, '不支持的草稿 schema 必须拒绝')
       assert.strictEqual(fs.statSync(paths.draft).mode & 0o777, 0o600, '草稿文件必须 0600')
       const disk = JSON.parse(readSafeTextResult(paths.draft, 64 * 1024).text)
       assert.strictEqual(disk.baseRevision, 0)
@@ -6223,6 +6227,10 @@ async function main () {
     assert.ok(src.includes('clearServerDraft()'), '清草稿必须同时清服务器那份')
     assert.ok(src.includes('已恢复上次未保存的草稿'), '下次打开过滤页必须自动恢复草稿并提示')
     assert.ok(src.includes('草稿已自动保存'), '页面必须让用户看到草稿已经存了')
+    assert.ok(src.includes('setTimeout(saveDraftNow, FILTER_DRAFT_SAVE_DELAY)'), '本机草稿定时器必须真的使用 500ms 常量，不能只留常量')
+    assert.ok(src.includes('draftPushChainRef'), '草稿 PUT 必须串行，旧请求不能晚到覆盖新内容')
+    assert.ok(src.includes('await draftPushChainRef.current'), '清服务器草稿前必须等所有排队 PUT 落地')
+    assert.ok(src.includes('setInterval(() => { if (dirtyRef.current) pushDraftNow().catch(() => {}) }'), '服务器上传失败后必须定期重试')
     assert.ok(src.includes('reloadNow'), '确认放弃并重新加载时必须先清草稿，否则会恢复回来')
   })
 
@@ -6239,8 +6247,13 @@ async function main () {
     const leaveSave = src.slice(src.indexOf('const closeLeaveRequest = '), src.indexOf('// 「查看日志」跳转'))
     assert.ok(/await guard\.save\(\)/.test(leaveSave), '保存按钮必须等 guard.save() 的结果')
     assert.ok(leaveSave.includes('leaveSavingRef.current = true') && leaveSave.includes('leaveSavingRef.current = false'), '保存并继续必须锁住整段落盘过程')
-    assert.ok(leaveSave.includes('doSwitchTab(req.target)'), '保存成功后必须继续用户原来要去的页签')
+    assert.ok(leaveSave.includes('doSwitchTab(req.target, true)'), '保存成功后必须继续用户原来要去的页签（并替换 sentinel）')
+    assert.ok(leaveSave.indexOf('if (!saved)') >= 0 && leaveSave.indexOf('if (!saved)') < leaveSave.indexOf('doSwitchTab(req.target, true)'),
+      '保存失败/取消必须先 return，不能先跳页')
     assert.ok(src.includes("window.addEventListener('beforeunload'"), '刷新/关页必须走 beforeunload')
+    const unload = src.slice(src.indexOf('const onBeforeUnload = '), src.indexOf("window.addEventListener('beforeunload'"))
+    assert.ok(unload.includes('e.preventDefault()') && unload.includes("e.returnValue = ''"),
+      'beforeunload 必须真的取消卸载，不能只挂监听')
     assert.ok(src.includes("window.addEventListener('popstate'"), '手机左滑/后退必须拦 popstate')
     assert.ok(src.includes('__xbkFilterGuard'), '脏草稿必须在历史里压 sentinel，否则左滑直接退走')
     assert.ok(src.includes("source: 'tab'") && src.includes("source: 'hash'") && src.includes("source: 'history'"),
@@ -6248,6 +6261,7 @@ async function main () {
     assert.ok(src.includes('onLeaveRequestRef.current'), 'popstate 回调必须用 ref 读最新值，不能被旧闭包吃掉')
     assert.ok(src.includes('guardRef'), 'App 必须拿到过滤页的脏状态/保存/放弃动作')
     const app = src.slice(src.indexOf('const switchTab = '), src.indexOf('const openLog = useCallback'))
+    assert.ok(app.includes('if (leaveSavingRef.current) return'), '保存并继续落盘期间 switchTab 必须直接返回，不能只挂一个变量')
     assert.ok(/guard && guard\.dirty/.test(app), '切页前必须检查过滤页脏状态')
     assert.ok(src.includes('放弃草稿并回滚'), '回滚会覆盖草稿时必须把按钮文案说清楚')
     assert.ok(src.includes('复制代码默认会把这些修改覆盖掉'), '复制默认会覆盖草稿时必须先确认')
