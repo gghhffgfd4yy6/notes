@@ -1408,8 +1408,9 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby=${titleId}>
       <div class="modal-title" id=${titleId}>有未保存的过滤规则</div>
       <div class="modal-body">
-        <div class="fr-dialog-line">当前有 ${count} 个字段还没保存。现在离开，这些修改会丢。</div>
-        <div class="modal-note">「保存并继续」会直接保存，保存成功后自动继续刚才的离开操作；「不保存并离开」会丢掉这些修改；「取消」继续编辑。</div>
+        <div class="fr-dialog-line">当前有 ${count} 个字段还没保存。</div>
+        <div class="fr-dialog-line">点「不保存并离开」会丢掉这些修改；直接关闭页面或切到后台，草稿会自动保留。</div>
+        <div class="modal-note">「保存并继续」会直接保存，保存成功后自动继续刚才的离开操作；「取消」继续编辑。</div>
       </div>
       <div class="modal-actions">
         <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${onCancel}>取消<//>

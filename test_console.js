@@ -6229,6 +6229,8 @@ async function main () {
   await aok('结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes('function LeaveGuardDialog'), '必须有“取消/不保存/保存并继续”三选一弹窗')
+    assert.ok(src.includes('点「不保存并离开」会丢掉这些修改'), '弹窗必须说清楚只有丢弃按钮才会丢修改，不能把自动草稿说成必丢')
+    assert.ok(!src.includes('现在离开，这些修改会丢'), '有自动草稿时不得再写“现在离开就会丢”')
     assert.ok(src.includes('保存并继续'), '离开拦截里的保存按钮要明确告诉用户保存后会继续')
     assert.ok(src.includes('beginGuardSave'), '保存并继续必须等待真正保存成功后再继续原操作')
     assert.ok(src.includes('const beginGuardSave') && src.includes('submitSave({ filter: candidate'), '保存并继续必须直接调用保存，不能再弹第二次确认')
