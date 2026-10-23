@@ -837,7 +837,7 @@ const streamAppend = (record, text) => { record.output += text; record.outputTot
 
 const TOKEN = 'x'.repeat(32)
 
-// ── 过滤规则控制面（scripts/console.js 的 5 个端点）────────────────────────
+// ── 过滤规则控制面（scripts/console.js，含服务器草稿）──────────────────────
 // 全部用 mkdtemp 隔离缓存目录；写端点只认 Authorization 头，读面沿用全局鉴权。
 function filterPaths (dir) { return require('./xbk_filter_store').filterRulesPaths(dir) }
 function postFilterJson (port, urlPath, obj, { token = TOKEN, headers = {}, raw } = {}) {
@@ -915,6 +915,67 @@ async function filterRuleApiTests () {
 
       const okRes = await postFilterJson(port, '/api/config/filter', payload)
       assert.strictEqual(okRes.status, 200, '合法 Bearer 可写')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则草稿: 服务器读/写/删 + 0600 + 正式保存清草稿 + revision 冲突', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      const empty = await request(port, 'GET', '/api/config/filter/draft', { token: TOKEN })
+      assert.strictEqual(empty.status, 200)
+      const emptyBody = JSON.parse(empty.text)
+      assert.strictEqual(emptyBody.draft, null)
+      assert.strictEqual(emptyBody.revision, 0)
+      assert.strictEqual((await request(port, 'GET', '/api/config/filter/draft')).status, 401, '草稿读面也要鉴权')
+
+      const put = await postFilterJson(port, '/api/config/filter/draft', {
+        schema: 1,
+        baseRevision: 0,
+        filter: { pingbibiaoti: '半成品(', pingbitime: '6' }
+      })
+      assert.strictEqual(put.status, 200)
+      assert.strictEqual(JSON.parse(put.text).ok, true)
+      assert.strictEqual(fs.statSync(paths.draft).mode & 0o777, 0o600, '草稿文件必须 0600')
+      const disk = JSON.parse(readSafeTextResult(paths.draft, 64 * 1024).text)
+      assert.strictEqual(disk.baseRevision, 0)
+      assert.strictEqual(disk.filter.pingbibiaoti, '半成品(', '草稿允许存未编译的半个正则')
+
+      const got = JSON.parse((await request(port, 'GET', '/api/config/filter/draft', { token: TOKEN })).text)
+      assert.strictEqual(got.draft.filter.pingbibiaoti, '半成品(')
+      assert.strictEqual(got.draft.baseRevision, 0)
+      assert.strictEqual(typeof got.draft.savedAt, 'number')
+
+      const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '正式' } })
+      assert.strictEqual(saved.status, 200)
+      assert.strictEqual(fs.existsSync(paths.draft), false, '正式保存成功必须删服务器草稿')
+      assert.strictEqual(JSON.parse((await request(port, 'GET', '/api/config/filter/draft', { token: TOKEN })).text).draft, null)
+
+      const stale = await postFilterJson(port, '/api/config/filter/draft', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '旧' } })
+      assert.strictEqual(stale.status, 409)
+      assert.strictEqual(JSON.parse(stale.text).code, 'revision_mismatch')
+      assert.strictEqual(fs.existsSync(paths.draft), false, '过期草稿不得落盘')
+
+      const anonPost = await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: {} }, { token: null })
+      assert.strictEqual(anonPost.status, 401)
+      const cookiePost = await request(port, 'POST', '/api/config/filter/draft', {
+        body: JSON.stringify({ baseRevision: 1, filter: {} }),
+        headers: { 'content-type': 'application/json', cookie: `xbk_session=${TOKEN}` }
+      })
+      assert.strictEqual(cookiePost.status, 401)
+      assert.strictEqual(JSON.parse(cookiePost.text).code, 'cookie_not_allowed', '草稿写面只认 Bearer')
+      assert.strictEqual((await request(port, 'DELETE', '/api/config/filter/draft')).status, 401, '删草稿也只认 Bearer')
+
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { pingbibiaoti: '草稿' } })).status, 200)
+      assert.strictEqual(fs.existsSync(paths.draft), true)
+      const del = await request(port, 'DELETE', '/api/config/filter/draft', { token: TOKEN })
+      assert.strictEqual(del.status, 200)
+      assert.strictEqual(fs.existsSync(paths.draft), false)
+
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { nope: 'x' } })).status, 400)
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { pingbibiaoti: 1 } })).status, 400)
+      assert.strictEqual(fs.existsSync(paths.draft), false, '非法草稿不得落盘')
     } finally { server.close() }
   })
 
@@ -6150,10 +6211,16 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(src.includes("const FILTER_DRAFT_KEY = 'xbk_filter_draft_v1'"), '必须在 localStorage 存一份过滤草稿')
     assert.ok(src.includes('FILTER_DRAFT_SAVE_DELAY = 500'), '草稿不能等 5 分钟才存，否则杀后台会丢最后几分钟')
+    assert.ok(src.includes('FILTER_DRAFT_SERVER_DELAY = 1500'), '服务器草稿必须比本机慢一点，避免每敲一键就写盘')
     assert.ok(src.includes('localStorage.setItem(FILTER_DRAFT_KEY'), '草稿写入必须用 localStorage（sessionStorage 关标签就没）')
     assert.ok(src.includes('localStorage.removeItem(FILTER_DRAFT_KEY)'), '保存/放弃/回滚后必须清草稿')
     assert.ok(src.includes("window.addEventListener('pagehide'"), '关标签/切走时必须立刻补存')
     assert.ok(src.includes("document.addEventListener('visibilitychange'"), '切到后台时必须立刻补存')
+    assert.ok(src.includes('apiGetFilterDraft'), '打开过滤页必须同时读服务器草稿')
+    assert.ok(src.includes('apiPostFilterDraft'), '本机草稿要同步到服务器')
+    assert.ok(src.includes('apiDeleteFilterDraft'), '保存/放弃/回滚后必须删服务器草稿')
+    assert.ok(src.includes('filterDraftFromServer'), '服务器草稿响应必须校验后再恢复')
+    assert.ok(src.includes('clearServerDraft()'), '清草稿必须同时清服务器那份')
     assert.ok(src.includes('已恢复上次未保存的草稿'), '下次打开过滤页必须自动恢复草稿并提示')
     assert.ok(src.includes('草稿已自动保存'), '页面必须让用户看到草稿已经存了')
     assert.ok(src.includes('reloadNow'), '确认放弃并重新加载时必须先清草稿，否则会恢复回来')

@@ -629,6 +629,7 @@ test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径�
   assert.strictEqual(paths.file, path.join(base, 'filter-rules.json'))
   assert.strictEqual(paths.applied, path.join(base, 'filter-rules.applied.json'))
   assert.strictEqual(paths.audit, path.join(base, 'filter-rules.audit.ndjson'))
+  assert.strictEqual(paths.draft, path.join(base, 'filter-rules.draft.json'))
   assert.strictEqual(paths.lock, path.join(base, 'filter-rules.lock'))
   assert.strictEqual(paths.backupFor(7), path.join(base, 'filter-rules.bak.7.json'))
   assert.strictEqual(paths.backupFor(0), path.join(base, 'filter-rules.bak.0.json'))
