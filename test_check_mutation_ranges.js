@@ -25,12 +25,12 @@ const SPECIAL_SEGMENTS = {
   'qinglong/xbk_push.js': ['qinglong-push'],
   'scripts/check-deps.js': ['check-deps'],
   'scripts/status.js': ['status'],
-  'scripts/console.js': ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5', 'console-part6'],
+  'scripts/console.js': ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5', 'console-part6', 'console-part7'],
   'xbk_filter_store.js': ['filter-store']
 }
 // 拆段边界固定（与 mutation.yml 真实矩阵一致），终点随文件增长自动跟随。
 // 值为边界数组：N 个边界 ⇒ N+1 段（单边界即两段拆法）。
-const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': [750], 'scripts/console.js': [563, 1126, 1689, 2252, 2815] }
+const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': [750], 'scripts/console.js': [563, 1126, 1689, 2252, 2815, 3675] }
 
 // 构造包含所有生产文件的 yml，行段可按文件覆盖
 function buildYml (overrides = {}) {
@@ -379,6 +379,34 @@ function run (ymlText) {
       assert.ok(globToRegExp('[a-c].js').test('b.js') && !globToRegExp('[a-c].js').test('d.js'),
         '对照：合法的 a-c 范围必须仍然生效（不得把降级分支写成默认行为）')
     }
+  }
+
+  // ===== 真实矩阵的 console 拆段必须合规（Sourcery #304：夹具自造 yml ⇒ 只测夹具等于没测真实配置）=====
+  // 反例：真实 part6 写成 3251-4098、part7 只有 4099-4099 时，夹具路径全绿——真实工作流没人看。
+  {
+    const wf = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'mutation.yml'), 'utf8')
+    const ranges = [...wf.matchAll(/name:\s*(console-part\d+)[\s\S]{0,300}?mutate:\s*"scripts\/console\.js:(\d+)-(\d+)"/g)]
+      .map(m => ({ name: m[1], start: Number(m[2]), end: Number(m[3]) }))
+    assert.strictEqual(ranges.length, 7, `真实矩阵必须拆 7 段 console，实际 ${ranges.length}`)
+    const lines = fs.readFileSync(path.join(ROOT, 'scripts', 'console.js'), 'utf8').split('\n').length - 1
+    assert.strictEqual(ranges[0].start, 1, '真实矩阵首段必须从第 1 行开始')
+    assert.strictEqual(ranges[ranges.length - 1].end, lines, '真实矩阵末段必须止于文件最后一行')
+    for (let i = 1; i < ranges.length; i++) {
+      assert.strictEqual(ranges[i].start, ranges[i - 1].end + 1,
+        `真实矩阵 ${ranges[i].name} 必须紧接上一段（不得留缝/重叠），实际 ${ranges[i].start} vs ${ranges[i - 1].end + 1}`)
+    }
+    // 单片预算：849 行（旧 part6）实测撞穿 step 330min 被杀；末两段各 ~425 行是为此对半拆的。
+    const MAX_PART_LINES = 700
+    for (const r of ranges) {
+      assert.ok(r.end - r.start + 1 <= MAX_PART_LINES,
+        `真实矩阵 ${r.name} 覆盖 ${r.end - r.start + 1} 行，超过单片预算 ${MAX_PART_LINES} 行（会撞 step 上限）`)
+    }
+    const part6 = ranges.find(r => r.name === 'console-part6')
+    const part7 = ranges.find(r => r.name === 'console-part7')
+    assert.ok(part6 && part6.start === 3251 && part6.end === 3675,
+      `真实 console-part6 必须是 3251-3675，实际 ${part6 && part6.start}-${part6 && part6.end}`)
+    assert.ok(part7 && part7.start === 3676 && part7.end === lines,
+      `真实 console-part7 必须是 3676-${lines}，实际 ${part7 && part7.start}-${part7 && part7.end}`)
   }
 
   console.log('test_check_mutation_ranges OK')

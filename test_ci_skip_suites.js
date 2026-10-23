@@ -34,7 +34,7 @@ const indentOf = line => line.length - line.trimStart().length
 const yamlOnly = text => text.split('\n').filter(l => !l.trim().startsWith('#'))
 
 // (1)「恢复增量缓存」：key 与 restore-keys 必须是**回退后 + 带档位 + 带依赖**的形态——不含测试指纹段，
-//     而是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>-deps-<依赖指纹>`，matrix.src 源指纹只进主 key。
+//     而是 `stryker-<段>-cfg-<matrix.config 档位>-<配置指纹>-deps-<依赖指纹>-rng-<mutate 范围>`，matrix.src 源指纹只进主 key。
 //     抽成函数是为了让紧随其后的反例在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本：把 key
 //     改回含测试指纹的形态 ⇒ 必须立刻红。
 const assertCacheStep = (ymlText) => {
@@ -46,7 +46,8 @@ const assertCacheStep = (ymlText) => {
   const keyLine = cacheLines.find(l => /^\s*key:\s/.test(l))
   assert.ok(keyLine, '「恢复增量缓存」必须声明 key')
   // key 必须逐字等于**档位名 + 配置指纹 + 依赖指纹 + 源指纹**形态：
-  //   stryker-<段>-cfg-<matrix.config 档位>-<两份 stryker 配置 + scripts/tap-shim.js 指纹>-deps-<package-lock.json 指纹>-src-<hashFiles(matrix.src)>。
+  //   stryker-<段>-cfg-<matrix.config 档位>-<两份 stryker 配置 + scripts/tap-shim.js 指纹>-deps-<package-lock.json 指纹>-rng-<mutate 范围>-src-<hashFiles(matrix.src)>。
+  // 范围段（rng）是 v3.350 加的：拆段只改范围不改源码时，旧范围的 inc 不能被新范围复用（否则报告总数虚高）。
   // matrix.src 是实际源文件路径；mutate 的范围字面量如 "xbk_function_v3.js:1-442" 不能作 hashFiles 参数，
   // 会得到空指纹、使 range 段缓存永不过期。run_mutation.js 仅为本地运行器，不属于 CI 执行链。
   // 配置指纹（stryker.config.js + stryker.tap.config.js + scripts/tap-shim.js）与**档位名 `matrix.config`** 都必须同时出现在
@@ -62,7 +63,7 @@ const assertCacheStep = (ymlText) => {
   // incremental-differ 只按**文件内容** diff、不认识依赖版本 ⇒ 19/19 段 100% 复用，依赖升级从未重算。
   const open = '${'
   assert.strictEqual(keyLine.trim(),
-    'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + '{ hashFiles(\'stryker.config.js\', \'stryker.tap.config.js\', \'scripts/tap-shim.js\') }}-deps-' + open + '{ hashFiles(\'package-lock.json\') }}-src-' + open + '{ hashFiles(matrix.src) }}',
+    'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + '{ hashFiles(\'stryker.config.js\', \'stryker.tap.config.js\', \'scripts/tap-shim.js\') }}-deps-' + open + '{ hashFiles(\'package-lock.json\') }}-rng-' + open + '{ matrix.mutate }}-src-' + open + '{ hashFiles(matrix.src) }}',
     '缓存 key 必须逐字等于 stryker-<段>-cfg-<档位 matrix.config>-<配置指纹 = 两份 stryker 配置 + scripts/tap-shim.js>' +
     '-deps-<依赖指纹 = package-lock.json>-src-<源指纹 = matrix.src>（不含 -tests- 或本地 run_mutation.js 指纹）' +
     '：PR #156 的「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发' +
@@ -80,7 +81,7 @@ const assertCacheStep = (ymlText) => {
     if (cacheLines[i].trim() === '' || indentOf(cacheLines[i]) <= restoreIndent) break
     restoreKeys.push(cacheLines[i].trim().replace(/^-\s*/, ''))
   }
-  assert.deepStrictEqual(restoreKeys, ['stryker-' + '${' + '{ matrix.name }}-cfg-' + '${' + '{ matrix.config }}-' + '${' + "{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-" + '${' + "{ hashFiles('package-lock.json') }}-"],
+  assert.deepStrictEqual(restoreKeys, ['stryker-' + '${' + '{ matrix.name }}-cfg-' + '${' + '{ matrix.config }}-' + '${' + "{ hashFiles('stryker.config.js', 'stryker.tap.config.js', 'scripts/tap-shim.js') }}-deps-" + '${' + "{ hashFiles('package-lock.json') }}-rng-" + '${' + '{ matrix.mutate }}-'],
     'restore-keys 必须是**带档位名 + 配置指纹 + 依赖指纹**（含 scripts/tap-shim.js 与 package-lock.json）的兜底前缀 `stryker-' + '${' + '{ matrix.name }}-cfg-<matrix.config 档位>-<配置指纹>-deps-<package-lock.json 指纹>-`：' +
     '同档配置内可跨 src 变更兜底复用；跨档（runner / tap.testFiles / coverageAnalysis 变化，或只改某段的 ' +
     'config:）不再互相继承——档位名与配置指纹都在前缀里，任一变化前缀即变；不含测试指纹（PR #156 那版已回退）。' +

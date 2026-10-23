@@ -801,3 +801,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 系统页「数据截至」只在本拍系统信息、访问日志、设置、文件清单全部成功时推进，半个失败不再冒充整页新数据。
 - 凭证失效时状态行改为「已暂停」，不再显示一个假的「自动刷新 Ns」。
 - 服务端：revision 必须是安全整数且留 +1 余量（否则乐观锁永远放行）；拦截窗为 0 或系统时钟回拨时不再误判成重放。
+
+## v3.350 — console 变异末段对半拆
+
+- `scripts/console.js` 的末段（3251–4099，849 行）实测超过 step 330min 上限被杀（v3.349 合并前的矩阵，part6 未产出报告）。按行数对半拆成 part6（3251–3675）与 part7（3676–4099），单片成本回到 ~95–160min。
+- 矩阵从 26 段（22 TAP + 4 command）变为 27 段（23 TAP + 4 command）；`mutation-report` 的 `EXPECTED_SEGMENTS`、行段校验夹具与 `SYSTEM_CONTRACT.md` 的段数同步。
+- 缓存身份加 `-rng-<mutate 范围>`（Sourcery #304）：拆段只改范围不改源码时 src 指纹不变，旧 part6 的 inc 会被新 part6 复用并把范围外变异体并进报告（`mutation-report` 求和后总数虚高）；范围进 key 与兜底前缀后，不同范围互不继承。
+- `test_check_mutation_ranges.js` 新增对**真实** `mutation.yml` 的校验（7 段连续覆盖、单片 ≤700 行、part6/part7 边界逐字），不再只测自造夹具。
