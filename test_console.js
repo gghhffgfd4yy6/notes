@@ -6153,6 +6153,7 @@ async function main () {
     const tapCss = css.slice(css.indexOf('.tap-tip {'), css.indexOf('}', css.indexOf('.tap-tip {')))
     assert.ok(!tapCss.includes('border-bottom'), '顶栏时间下方不得再画虚线（v3.353 改为文案提醒）')
     assert.ok(css.includes('.tap-tip-date .sync-sec'), '手机日期开着时收起秒，关掉时保留秒')
+    assert.ok(/@media \(max-width: 640px\) \{[\s\S]*?\.sync-label \{ display: none; \}[\s\S]*?\.tap-tip-date \.sync-sec \{ display: none; \}/.test(css), '手机断点必须真的隐藏「数据截至」和日期开时的秒')
     assert.ok(/class=\$\{showDate \? 'tap-tip tap-tip-date' : 'tap-tip'\}/.test(src), 'TapTip 必须知道日期是否开着')
 
     // ③ 状态行只有一处 TapTip：所有页共用（v3.346 收成一个组件），tip 里是完整时间 + 星期。
@@ -6162,8 +6163,11 @@ async function main () {
 
   await aok('结构红线: 屏蔽注册天数用多行输入框', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
-    assert.ok(src.includes('class="fr-input fr-textarea fr-input-days"'), '天数控件必须换成 textarea，才配得上「分类###天数」多行提示')
-    assert.ok(!src.includes('class="fr-input fr-input-days" type="text" inputmode="numeric"'), '不得退回单行数字框')
+    const daysAt = src.indexOf('def.kind === \'days\'')
+    const daysEnd = src.indexOf(': html`<textarea', daysAt)
+    const daysBlock = daysAt >= 0 && daysEnd > daysAt ? src.slice(daysAt, daysEnd) : ''
+    assert.ok(daysBlock.includes('<textarea') && daysBlock.includes('fr-input-days'), '天数分支必须渲染 textarea（不能只留 class）')
+    assert.ok(!daysBlock.includes('<input'), '天数分支不得退回单行 input')
     assert.ok(src.includes('支持「分类###天数」多行写法'), '提示必须保留多行写法')
   })
 
