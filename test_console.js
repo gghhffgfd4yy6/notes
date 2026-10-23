@@ -6366,6 +6366,17 @@ async function main () {
     assert.ok(/\.log-thumb\s*\{[^}]*width:\s*8px/.test(css), '拇指 8px')
     assert.ok(/\.logpre-main\s*\{[^}]*padding-right:\s*16px/.test(css), '日志框右侧必须给轨道留 16px')
     assert.ok(!/scrollIntoView/.test(seg), '快滚条只能滚日志框，不得 scrollIntoView 整页')
+    // M1：切走再切回时 display:none 量到 0 高，条被隐藏且不会因内容不变而重量。
+    assert.ok(seg.includes('if (!active) return') && /\[active, syncRail\]/.test(seg),
+      'active 变 true 必须重量一次（否则切回来条一直不出现）')
+    assert.ok(seg.includes('new window.ResizeObserver'), '日志框自身高度变化要用 ResizeObserver 兜住')
+    assert.ok(seg.includes('prev.show ? { top: 0, height: 0, pct: 0, show: false } : prev'),
+      '无溢出时必须把 show 置 false（不是只让 class 依赖 rail.show）')
+    // M2：滚动条必须与它控制的 <pre> 建立关系，否则读屏只听到一个孤立的滚动条。
+    assert.ok(seg.includes('id="log-pre"') && seg.includes('aria-controls="log-pre"'),
+      '快滚条必须用 aria-controls 指向被控日志框')
+    // M3：第二根手指不得顶掉正在拖的那根。
+    assert.ok(/if \(dragRef\.current\) return/.test(seg), '已有指针在拖时必须忽略新的 pointerdown')
   })
 }
 

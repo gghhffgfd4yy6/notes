@@ -3360,6 +3360,9 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     const el = preRef.current
     const box = railRef.current
     if (!el || !box) return
+    // 多指并发（Sourcery #305 M3）：第二根手指按下时第一根还在拖——只认先按下的那根。
+    // 否则 dragRef 被覆盖，第一根的 move/up 全被 id 过滤掉，松手后条还粘在旧抓取点。
+    if (dragRef.current) return
     const track = box.clientHeight
     const h = Math.max(28, Math.round(track * (el.clientHeight / el.scrollHeight)))
     const thumbTop = box.getBoundingClientRect().top + rail.top
@@ -3542,6 +3545,21 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [syncRail])
+  // 面板被切走时 display:none ⇒ 量到 0 高、条被隐藏；切回来不一定伴随 resize 或内容变化
+  // （Sourcery #305 M1），所以 active 变 true 时必须重量一次，否则条一直不出现。
+  useEffect(() => {
+    if (!active) return
+    const id = window.requestAnimationFrame(syncRail)
+    return () => window.cancelAnimationFrame(id)
+  }, [active, syncRail])
+  // 日志框自身高度变化（视口转屏、字号/行高变化）不触发 window resize，用 ResizeObserver 兜住。
+  useEffect(() => {
+    const el = preRef.current
+    if (!el || typeof window.ResizeObserver !== 'function') return
+    const ro = new window.ResizeObserver(() => syncRail())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [data, syncRail])
   // v3.319：行级跳转把点中的那一轮滚到日志框中部；只做一次，轮询不抢用户滚动。
   // 用 useLayoutEffect：与贴底同一帧完成，首帧就是定位后的位置，不会先闪顶部/底部。
   useLayoutEffect(() => {
@@ -3659,9 +3677,9 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
         ${mode !== 'all' && html`<button type="button" class="log-chip" onClick=${searchAllLogs}>在全部日志中搜索</button>`}
       </div>`
       : html`<div class="log-wrap">
-        <pre class="logpre logpre-main" ref=${preRef} onScroll=${onLogScroll}>${heavy ? shownText : lineNodes}</pre>
+        <pre id="log-pre" class="logpre logpre-main" ref=${preRef} onScroll=${onLogScroll}>${heavy ? shownText : lineNodes}</pre>
         <div class=${'log-rail' + (rail.show ? ' show' : '')} ref=${railRef} role="scrollbar"
-          aria-label="日志快速滚动条" aria-orientation="vertical" aria-valuemin="0" aria-valuemax="100"
+          aria-label="日志快速滚动条" aria-controls="log-pre" aria-orientation="vertical" aria-valuemin="0" aria-valuemax="100"
           aria-valuenow=${rail.pct} tabindex="0" onPointerDown=${onRailDown} onPointerMove=${onRailMove}
           onPointerUp=${onRailUp} onPointerCancel=${onRailUp} onKeyDown=${onRailKey}>
           <span class="log-thumb" style=${{ top: rail.top + 'px', height: rail.height + 'px' }}></span>
