@@ -894,6 +894,22 @@
   .backup-pass-box { display: grid; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--border); }
   .backup-pass-row { display: grid; gap: 4px; color: var(--text-dim); font-size: var(--fs-sm); }
   .backup-pass-row .fr-input { width: 100%; }
+  /* 两步验证（v3.357）：设置密钥、确认码、恢复码都放在同一张卡片里；恢复码用琥珀底强调
+     「只显示一次」，但不抢主操作的蓝色。 */
+  .twofa-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+  .twofa-setup { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-soft); display: grid; gap: 8px; }
+  .twofa-step { font-size: var(--fs-sm); color: var(--text-dim); }
+  .twofa-qr { display: flex; justify-content: center; padding: 10px; background: #fff; border: 1px solid var(--border); border-radius: var(--r-sm); }
+  .twofa-qr img { display: block; width: 200px; max-width: 100%; height: auto; aspect-ratio: 1 / 1; }
+  .twofa-secret { display: flex; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 8px 10px; }
+  .twofa-secret code { flex: 1 1 auto; min-width: 0; word-break: break-all; font-family: var(--mono); font-size: var(--fs-sm); }
+  .twofa-code-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .twofa-code-row .fr-input { width: 180px; max-width: 100%; }
+  .twofa-on { color: var(--ok-fg); font-weight: 600; }
+  .twofa-recovery { margin-top: 10px; padding: 10px; border: 1px solid var(--warn-line); background: var(--warn-soft); border-radius: var(--r-sm); display: grid; gap: 8px; }
+  .twofa-codes { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 6px; }
+  .twofa-codes code { font-family: var(--mono); font-size: var(--fs-sm); background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; text-align: center; }
+  .twofa-block .hint { margin-top: 8px; }
   .tpl-row { display: flex; gap: 10px; align-items: flex-start; padding: 6px 0; border-bottom: 1px dashed var(--border-soft); }
   .tpl-row:last-child { border-bottom: 0; padding-bottom: 0; }
   .tpl-row > span { color: var(--text-dim); font-size: var(--fs-xs); flex: 0 0 32px; line-height: 1.7; }
