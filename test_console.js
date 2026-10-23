@@ -1586,8 +1586,246 @@ async function filterRuleApiTests () {
   })
 }
 
+async function backupApiTests () {
+  await aok('数据备份: 导出只含勾选类别，自动运行只写间隔不写开关', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'a' }, { id: 2, title: 'b' }]))
+    fs.writeFileSync(path.join(dir, 'filter-rules.json'), JSON.stringify({ schema: 1, revision: 2, filter: { pingbifenlei: 'old' } }))
+    fs.writeFileSync(path.join(dir, 'run.log'), 'old log\n')
+    fs.writeFileSync(path.join(dir, 'console-settings.json'), JSON.stringify({ revision: 2, updatedAt: Date.now(), notifyTestReplayWindowS: 9, syncShowDate: false }))
+    fs.writeFileSync(path.join(dir, 'console-auto.json'), JSON.stringify({ on: false, interval: 7, updatedAt: Date.now() }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const all = await request(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['messages', 'filter', 'settings', 'auto', 'runLog'] }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(all.status, 200)
+      const bundle = JSON.parse(all.text)
+      assert.strictEqual(bundle.kind, 'xbk-console-backup')
+      assert.strictEqual(bundle.schema, 1)
+      assert.deepStrictEqual(Object.keys(bundle.data).sort((a, b) => a.localeCompare(b)), ['auto', 'filter', 'messages', 'runLog', 'settings'])
+      assert.strictEqual(bundle.data.messages.count, 2)
+      assert.strictEqual(bundle.data.auto.interval, 7)
+      assert.ok(!Object.prototype.hasOwnProperty.call(bundle.data.auto, 'on'), '备份文件不得记录自动运行开关')
+      assert.strictEqual(bundle.data.settings.notifyTestReplayWindowS, 9)
+      assert.ok(bundle.data.filter.text.includes('pingbifenlei'))
+      assert.strictEqual(bundle.data.runLog.text, 'old log\n')
+      const only = await request(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['settings'] }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(only.status, 200)
+      assert.deepStrictEqual(Object.keys(JSON.parse(only.text).data), ['settings'])
+      const bad = await request(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['nope'] }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(bad.status, 400)
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('数据备份: 导出校验过滤规则，坏规则跳过不拖累整包', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'a' }]))
+    fs.writeFileSync(path.join(dir, 'filter-rules.json'), JSON.stringify({ schema: 1, revision: 2, filter: { pingbifenlei: '(' } }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const res = await request(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['messages', 'filter'] }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(res.status, 200, res.text)
+      const bundle = JSON.parse(res.text)
+      assert.ok(bundle.data.messages, '推送记录仍应导出')
+      assert.ok(!bundle.data.filter, '坏过滤规则不得进入备份')
+      assert.ok(bundle.skipped.some((x) => x.key === 'filter' && x.reason === 'invalid_filter'), '必须报告过滤规则被跳过')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('数据备份: 坏消息条目拒绝导入；中途写失败整体回滚', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    const pushPath = path.join(dir, 'push.json')
+    fs.writeFileSync(pushPath, JSON.stringify([{ id: 1, title: 'old' }]))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const invalid = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: { messages: { count: 1, text: JSON.stringify([{ id: 2 }]) } }
+      }
+      const bad = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(invalid),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(bad.status, 400)
+      assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 1, title: 'old' }]))
+
+      // run.log 预置成目录：writeAtomic 必失败，前面已写成功的 push.json 必须被回滚。
+      fs.mkdirSync(path.join(dir, 'run.log'))
+      const rollback = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: {
+          messages: { count: 1, text: JSON.stringify([{ id: 2, title: 'new' }]) },
+          runLog: { text: 'new log\n' }
+        }
+      }
+      const failed = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(rollback),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(failed.status, 500, failed.text)
+      assert.strictEqual(JSON.parse(failed.text).rolledBack, true, '回滚必须成功')
+      assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 1, title: 'old' }]), '失败导入不得留下半套数据')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('数据备份: 判重历史随消息恢复，重复导入按幂等键返回原结果', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    const pushPath = path.join(dir, 'push.json')
+    const seenPath = path.join(dir, 'push.json.seen.json')
+    fs.writeFileSync(pushPath, JSON.stringify([{ id: 1, title: 'old' }]))
+    fs.writeFileSync(seenPath, JSON.stringify({ v: 1, id: ['old'] }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const bundle = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: {
+          messages: {
+            count: 1,
+            text: JSON.stringify([{ id: 9, title: 'new' }]),
+            seenText: JSON.stringify({ v: 1, id: ['new'] })
+          }
+        }
+      }
+      const headers = { 'content-type': 'application/json', 'idempotency-key': 'test-import-key-0001' }
+      const first = await request(port, 'POST', '/api/backup/import', { token: TOKEN, body: JSON.stringify(bundle), headers })
+      assert.strictEqual(first.status, 200, first.text)
+      assert.strictEqual(fs.readFileSync(seenPath, 'utf8'), JSON.stringify({ v: 1, id: ['new'] }))
+      // 模拟导入成功后又有新记录写入；同一请求重试不能把它们覆盖回旧备份。
+      fs.writeFileSync(pushPath, JSON.stringify([{ id: 10, title: 'newer' }]))
+      const again = await request(port, 'POST', '/api/backup/import', { token: TOKEN, body: JSON.stringify(bundle), headers })
+      assert.strictEqual(again.status, 200, again.text)
+      assert.deepStrictEqual(JSON.parse(again.text).imported.messages, 1)
+      assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 10, title: 'newer' }]))
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('数据备份: 导入自动识别并恢复，未含类别不动，自动运行开关保持停止', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'old' }]))
+    fs.writeFileSync(path.join(dir, 'filter-rules.json'), JSON.stringify({ schema: 1, revision: 2, filter: { pingbifenlei: 'old' } }))
+    fs.writeFileSync(path.join(dir, 'run.log'), 'old log\n')
+    fs.writeFileSync(path.join(dir, 'console-settings.json'), JSON.stringify({ revision: 2, updatedAt: Date.now(), notifyTestReplayWindowS: 9, syncShowDate: false }))
+    fs.writeFileSync(path.join(dir, 'console-auto.json'), JSON.stringify({ on: false, interval: 7, updatedAt: Date.now() }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const bundle = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: {
+          messages: { count: 1, text: JSON.stringify([{ id: 9, title: 'new' }]) },
+          filter: { text: JSON.stringify({ schema: 1, revision: 8, filter: { pingbifenlei: 'new' } }) },
+          settings: { notifyTestReplayWindowS: 5, syncShowDate: true },
+          auto: { interval: 12 },
+          runLog: { text: 'new log\n' }
+        }
+      }
+      const imp = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(bundle),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(imp.status, 200, imp.text)
+      const result = JSON.parse(imp.text)
+      assert.strictEqual(result.ok, true)
+      assert.strictEqual(result.imported.messages, 1)
+      assert.strictEqual(result.imported.autoInterval, 12)
+      assert.ok(result.backupDir)
+      assert.strictEqual(fs.readFileSync(path.join(dir, 'push.json'), 'utf8'), '[{"id":9,"title":"new"}]')
+      assert.match(fs.readFileSync(path.join(dir, 'filter-rules.json'), 'utf8'), /"pingbifenlei":"new"/)
+      const auditLines = fs.readFileSync(path.join(dir, 'filter-rules.audit.ndjson'), 'utf8').trim().split('\n')
+      assert.strictEqual(JSON.parse(auditLines[auditLines.length - 1]).action, 'import', '过滤规则导入必须留审计')
+      assert.strictEqual(fs.readFileSync(path.join(dir, 'run.log'), 'utf8'), 'new log\n')
+      const autoFile = JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8'))
+      assert.strictEqual(autoFile.interval, 12)
+      assert.strictEqual(autoFile.on, false, '导入不得把自动运行打开')
+      const settingsFile = JSON.parse(fs.readFileSync(path.join(dir, 'console-settings.json'), 'utf8'))
+      assert.strictEqual(settingsFile.notifyTestReplayWindowS, 5)
+      assert.strictEqual(settingsFile.syncShowDate, true)
+      // 只恢复文件里出现的类别：只带推送记录时，过滤规则保持导入后的值。
+      const partial = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: { messages: { count: 1, text: JSON.stringify([{ id: 10, title: 'c' }]) } }
+      }
+      const again = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(partial),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(again.status, 200, again.text)
+      assert.match(fs.readFileSync(path.join(dir, 'filter-rules.json'), 'utf8'), /"pingbifenlei":"new"/)
+      const bad = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify({ kind: 'not-a-backup', schema: 1, data: {} }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(bad.status, 400)
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+async function backupUiStructureTests () {
+  await aok('结构红线: 数据备份只留导入/导出，导出类别在弹窗里选', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const at = src.indexOf('function BackupBlock')
+    const end = src.indexOf('function SysPanel', at)
+    const seg = src.slice(at, end)
+    const ph = (name) => '$' + '{' + name + '}'
+    assert.ok(at > -1 && end > at, '应能定位 BackupBlock')
+    assert.ok(seg.includes('onClick=' + ph('openExport')), '系统页入口只能打开导出弹窗')
+    assert.ok(seg.includes('onClick=' + ph('chooseFile')), '导入入口应直接选文件')
+    assert.ok(seg.includes('open=' + ph('exportOpen')) && seg.includes('title="选择要导出的数据"'),
+      '导出类别必须在弹窗里选')
+    const modalAt = seg.indexOf('open=' + ph('exportOpen'))
+    assert.ok(seg.indexOf('backup-list') > modalAt, '类别列表不得回到系统页内联显示')
+    assert.ok(seg.includes('confirmDisabled='), '一个都没选时导出确认按钮必须禁用')
+  })
+}
+
 async function main () {
   await filterRuleApiTests()
+  await backupApiTests()
+  await backupUiStructureTests()
   await aok('HTTP: 无 token / 错 token → 401', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
@@ -5733,8 +5971,21 @@ async function main () {
     const runsPanel = src.slice(src.indexOf('function RunsPanel'), src.indexOf('function RunHistoryPanel'))
     const histPanel = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
     assert.ok(runsPanel.includes('<div class="runs-scroll"><table class="runs-table">'), '触发历史表必须在 .runs-scroll 内')
-    assert.ok(histPanel.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && histPanel.includes('$' + '{shown.length > 0') && histPanel.includes('? html`<table class="runs-table">'), '逐轮历史表必须在 .runs-scroll 内（空态也保留容器）')
+    assert.ok(histPanel.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && histPanel.includes('$' + '{shown.length > 0') && histPanel.includes('? html`<table class="runs-table run-history-table">'), '逐轮历史表必须在 .runs-scroll 内（空态也保留容器）')
     assert.ok(histPanel.includes('<td class="run-actions">'), '逐轮历史的末列必须是动作列（其 sticky 才有意义）')
+  })
+
+  await aok('结构红线: 逐轮历史列宽固定（切每页不漂移）', () => {
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.css'), 'utf8')
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.js'), 'utf8')
+    const histPanel = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
+    assert.ok(histPanel.includes('<colgroup>'), '逐轮历史表必须有 colgroup 固定列宽')
+    for (const cls of ['rh-time', 'rh-get', 'rh-dedup', 'rh-filter', 'rh-push', 'rh-fail', 'rh-elapsed', 'rh-action']) {
+      assert.ok(histPanel.includes(`<col class="${cls}"`), `逐轮历史缺少列 ${cls}`)
+    }
+    assert.ok(/\.run-history-table\s*\{[^}]*table-layout:\s*fixed/.test(css), '逐轮历史必须 table-layout: fixed')
+    assert.ok(/\.run-history-table \.rh-time\s*\{\s*width:\s*30%/.test(css), '时间列宽必须固定')
+    assert.ok(/\.run-history-table \.rh-push\s*\{\s*width:\s*16%/.test(css), '推送列宽必须固定')
   })
 
   await aok('结构红线: v3.317 触发结果行（aria-live / 用 runs 结算 / 不位移 / 失败给原因）', () => {
@@ -6169,6 +6420,29 @@ async function main () {
     assert.ok(daysBlock.includes('<textarea') && daysBlock.includes('fr-input-days'), '天数分支必须渲染 textarea（不能只留 class）')
     assert.ok(!daysBlock.includes('<input'), '天数分支不得退回单行 input')
     assert.ok(src.includes('支持「分类###天数」多行写法'), '提示必须保留多行写法')
+  })
+
+  await aok('结构红线: 数字框锁定，长按加减连续调整', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
+    const cfgStart = src.indexOf('function ConsoleSettingsBlock')
+    const cfgEnd = src.indexOf('// 系统信息：版本', cfgStart)
+    const cfgBlock = src.slice(cfgStart, cfgEnd)
+    assert.ok(/class="auto-input"[\s\S]{0,260}?disabled=\$\{true\}/.test(trigger), '自动运行间隔输入框必须锁定')
+    assert.ok(/class="auto-input"[\s\S]{0,260}?disabled=\$\{true\}/.test(cfgBlock), '通知自检拦截窗输入框必须锁定')
+    assert.ok(!/class="auto-input"[\s\S]{0,260}?onInput=/.test(trigger), '自动运行间隔不得再接受键入')
+    assert.ok(!/class="auto-input"[\s\S]{0,260}?onInput=/.test(cfgBlock), '通知自检拦截窗不得再接受键入')
+    assert.ok(src.includes('function useHoldRepeat') && src.includes('HOLD_START_MS') && src.includes('HOLD_REPEAT_MS'),
+      '必须复用长按连续调整 hook')
+    assert.ok(trigger.includes('onPointerDown=$' + '{holdAuto.start(-1)}') && trigger.includes('onPointerDown=$' + '{holdAuto.start(1)}'),
+      '自动运行加减必须接长按')
+    assert.ok(cfgBlock.includes('onPointerDown=$' + '{holdWin.start(-1)}') && cfgBlock.includes('onPointerDown=$' + '{holdWin.start(1)}'),
+      '通知自检加减必须接长按')
+    assert.ok(trigger.includes('setAutoDraft((prev) =>') && cfgBlock.includes('setWinDraft((prev) =>'),
+      '快速长按必须用函数式更新，避免连续增量丢失')
+    assert.ok(css.includes('touch-action: none') && css.includes('.auto-input:disabled'),
+      '长按按钮要禁用触摸手势，禁用输入框要保持可读')
   })
 
   await aok('结构红线: v3.340 配置页可改通知自检拦截窗（前端）', () => {

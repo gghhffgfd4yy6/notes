@@ -52,6 +52,8 @@ const BUSY_FALLBACK_MS = 11 * 60 * 1000
 // fetch 请求期限（Sourcery G_n6）：挂起连接不得阻塞刷新链路；超时由 AbortController 取消，
 // 走正常 reject 路径（「刷新失败」可见），不会堆积请求。
 const FETCH_TIMEOUT_MS = 8000
+// 备份是「整包上传/下载」，不能套 8 秒的普通 API 期限：慢网络下大文件会被误判失败。
+const BACKUP_FETCH_TIMEOUT_MS = 120000
 // 通知自检重复提交拦截窗的客户端边界（与 console.js NOTIFY_REPLAY_MIN_S/MAX_S 同口径）：
 // 这层只负责「非法值不发请求」，服务端仍是唯一权威（越界/类型错一律 400）。
 const NOTIFY_WINDOW_MIN_S = 0
@@ -135,9 +137,9 @@ function fmtIsoStamp (iso) {
 // 内联到各端点函数、第一参数为字面量；超时/中止参数由 timedRequest() 统一构造。
 // Sourcery Stalled-bodies x3：期限定时器不在 fetch resolve 时清掉，而是移交给
 // body 消费方（readBodyJson），整个「头+体」共享同一个 8s 期限。
-function timedRequest (opts) {
+function timedRequest (opts, timeoutMs = FETCH_TIMEOUT_MS) {
   const ctrl = new AbortController()
-  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS)
+  const t = setTimeout(() => ctrl.abort(), timeoutMs)
   const merged = { ...opts, signal: ctrl.signal }
   return { merged, done: () => clearTimeout(t) }
 }
@@ -473,6 +475,41 @@ function apiPostFilterPreview (body) {
     body: JSON.stringify(body)
   })
   return consumeJsonResult(fetch('/api/config/filter/preview', merged), done)
+}
+
+// 数据备份：导出返回 blob（直接下载），导入返回 {ok, imported, backupDir}。
+function apiPostBackupExport (categories) {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify({ categories })
+  }, BACKUP_FETCH_TIMEOUT_MS)
+  return fetch('/api/backup/export', merged).then(async (res) => {
+    const blob = await res.blob()
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`
+      try {
+        const data = JSON.parse(await blob.text())
+        if (data && data.error) message = data.error
+      } catch (e) { /* 非 JSON 错误体 */ }
+      throw new Error(message)
+    }
+    done()
+    const skippedHeader = res.headers && typeof res.headers.get === 'function' ? res.headers.get('X-Backup-Skipped') : ''
+    const skipped = skippedHeader ? skippedHeader.split(',') : []
+    return { blob, skipped }
+  }).catch((e) => { done(); throw e })
+}
+
+function apiPostBackupImport (bundle, idempotencyKey) {
+  const headers = filterWriteHeaders()
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers,
+    body: JSON.stringify(bundle)
+  }, BACKUP_FETCH_TIMEOUT_MS)
+  return consumeJsonResult(fetch('/api/backup/import', merged), done)
 }
 
 function apiPostFilterRestore (body) {
@@ -1353,6 +1390,52 @@ const AUTO_MAX_S = 20
 const CONFIRM_NAMES_WAIT_MS = 600
 const AUTO_DEFAULT_S = 10
 const AUTO_MAX_FAILS = 3
+// 数字输入框统一禁用，只允许用加减按钮调整；按住 450ms 后连续变化，
+// 越按越快（最多 50/次），避免从 10 调到 3600 要点几百下。
+const HOLD_START_MS = 450
+const HOLD_REPEAT_MS = 110
+const HOLD_ACCEL_MS = 1000
+const HOLD_MAX_STEP = 50
+function useHoldRepeat (onStep, disabled = false) {
+  const timerRef = useRef(0)
+  const activeRef = useRef(false)
+  const startedAtRef = useRef(0)
+  const stepRef = useRef(onStep)
+  stepRef.current = onStep
+  const stop = useCallback(() => {
+    activeRef.current = false
+    clearTimeout(timerRef.current)
+  }, [])
+  useEffect(() => {
+    if (disabled) stop()
+    return stop
+  }, [disabled, stop])
+  const start = (delta) => (e) => {
+    if (disabled || activeRef.current) return
+    if (e && e.pointerType === 'mouse' && e.button !== 0) return
+    if (e && e.cancelable) e.preventDefault()
+    activeRef.current = true
+    startedAtRef.current = Date.now()
+    try { e.currentTarget.setPointerCapture(e.pointerId) } catch (_) {}
+    stepRef.current(delta)
+    const tick = () => {
+      if (!activeRef.current) return
+      const elapsed = Date.now() - startedAtRef.current
+      const mult = elapsed < HOLD_ACCEL_MS
+        ? 1
+        : Math.min(HOLD_MAX_STEP, 1 + Math.floor((elapsed - HOLD_ACCEL_MS) / 250))
+      stepRef.current(delta * mult)
+      timerRef.current = setTimeout(tick, HOLD_REPEAT_MS)
+    }
+    timerRef.current = setTimeout(tick, HOLD_START_MS)
+  }
+  const click = (delta) => (e) => {
+    // 鼠标/触摸的第一次变化在 pointerdown 已做；键盘（detail=0）和读屏仍走 click。
+    if (!disabled && e && e.detail === 0) stepRef.current(delta)
+  }
+  const contextMenu = (e) => e.preventDefault()
+  return { start, stop, click, contextMenu }
+}
 function clampAutoSeconds (v) {
   const n = Math.round(Number(v))
   if (!Number.isFinite(n)) return AUTO_DEFAULT_S
@@ -1372,7 +1455,7 @@ const ACTION_DEFS = [
 // 固定 id 会让无障碍名称重复（Sourcery #271）。
 let dialogSeq = 0
 
-function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, children }) {
+function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, onConfirm, onCancel, children }) {
   const cancelRef = useRef(null)
   const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
   useEffect(() => {
@@ -1389,7 +1472,7 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, 
       <div class="modal-body">${children}</div>
       <div class="modal-actions">
         <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${onCancel}>取消<//>
-        <${Button} variant="danger-solid" disabled=${busy} onClick=${onConfirm}>${confirmLabel}<//>
+        <${Button} variant="danger-solid" disabled=${busy || confirmDisabled} onClick=${onConfirm}>${confirmLabel}<//>
       </div>
     </div>
   </div>`
@@ -1508,10 +1591,10 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
   useEffect(() => { setAutoDraft(String(auto.interval)) }, [auto.interval])
   useEffect(() => () => clearTimeout(autoSavedTimerRef.current), [])
   const adjustAuto = (delta) => {
-    const next = clampAutoSeconds(Number(autoDraft) + delta)
-    setAutoDraft(String(next))
+    setAutoDraft((prev) => String(clampAutoSeconds(Number(prev) + delta)))
     setAutoSaved(false)
   }
+  const holdAuto = useHoldRepeat(adjustAuto)
   const flashAutoSaved = () => {
     setAutoSaved(true)
     clearTimeout(autoSavedTimerRef.current)
@@ -1619,19 +1702,23 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
         ${auto.on && html`<span class="auto-run-live">运行中</span>`}
       </div>
       <div class="auto-run-row">
-        <button type="button" class="auto-step" aria-label="减少间隔" onClick=${() => adjustAuto(-1)}>−</button>
+        <button type="button" class="auto-step" aria-label="减少间隔"
+          onPointerDown=${holdAuto.start(-1)} onPointerUp=${holdAuto.stop} onPointerLeave=${holdAuto.stop}
+          onPointerCancel=${holdAuto.stop} onLostPointerCapture=${holdAuto.stop}
+          onContextMenu=${holdAuto.contextMenu} onClick=${holdAuto.click(-1)}>−</button>
         <input class="auto-input" type="number" inputmode="numeric" min=${AUTO_MIN_S} max=${AUTO_MAX_S} step="1"
-          aria-label="自动运行间隔（秒）" value=${autoDraft}
-          onInput=${(e) => { setAutoDraft(e.target.value); setAutoSaved(false) }}
-          onBlur=${() => setAutoDraft(String(clampAutoSeconds(autoDraft)))} />
+          aria-label="自动运行间隔（秒）" value=${autoDraft} disabled=${true} />
         <span class="auto-unit">秒</span>
-        <button type="button" class="auto-step" aria-label="增加间隔" onClick=${() => adjustAuto(1)}>+</button>
+        <button type="button" class="auto-step" aria-label="增加间隔"
+          onPointerDown=${holdAuto.start(1)} onPointerUp=${holdAuto.stop} onPointerLeave=${holdAuto.stop}
+          onPointerCancel=${holdAuto.stop} onLostPointerCapture=${holdAuto.stop}
+          onContextMenu=${holdAuto.contextMenu} onClick=${holdAuto.click(1)}>+</button>
         <${Button} variant="secondary" onClick=${saveAuto}>保存<//>
         ${auto.on
           ? html`<${Button} variant="danger" onClick=${stopAuto}>停止<//>`
           : html`<${Button} variant="danger-solid" onClick=${askAuto}>开始<//>`}
       </div>
-      <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒；由服务器常驻运行，关闭页面、切后台、锁屏都不影响，点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次会自动停止。</div>
+      <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒（输入框已锁，长按加减可快速调整）；由服务器常驻运行，关闭页面、切后台、锁屏都不影响，点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次会自动停止。</div>
       ${auto.on && html`<div class="auto-run-status">${auto.nextAt > 0 ? `下一轮 ${Math.max(0, Math.ceil((auto.nextAt - auto.now) / 1000))} 秒` : '本轮进行中'} · 已自动运行 ${auto.runs} 轮</div>`}
       ${!auto.on && html`<div class="auto-run-status">${autoSaved ? '间隔已保存' : ''}</div>`}
       ${auto.err && html`<${Hint} tone="error">${auto.err}<//>`}
@@ -2267,8 +2354,13 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     ${!data && !err && html`<div class="empty">加载中…</div>`}
     ${data && data.status === 'ok' && html`<div class="runs-scroll" ref=${listRef}>
       ${shown.length > 0
-        ? html`<table class="runs-table">
-      <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
+        ? html`<table class="runs-table run-history-table">
+      <colgroup>
+        <col class="rh-time" /><col class="rh-get" /><col class="rh-dedup" />
+        <col class="rh-filter" /><col class="rh-push" /><col class="rh-fail" />
+        <col class="rh-elapsed" /><col class="rh-action" />
+      </colgroup>
+      <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th aria-label="操作"></th></tr></thead>
       <tbody>
         ${shown.map((r, i) => html`<tr key=${`${r.at}-${r.lineNo}-${i}`}>
           <td class="mono">${r.cancelled === true ? `${r.at || '—'} ⏹已取消` : r.interrupted ? `${r.at || '—'} ⚠️中断` : (r.at || '—')}</td>
@@ -3809,14 +3901,17 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
   }, [winCurrent, winDirty])
   const adjustWin = (delta) => {
     if (winCurrent === null || winSavingRef.current) return
-    const typed = winDraft.trim() === '' ? Number.NaN : Number(winDraft)
-    const base = Number.isInteger(typed) ? typed : winCurrent
-    const next = Math.min(NOTIFY_WINDOW_MAX_S, Math.max(NOTIFY_WINDOW_MIN_S, base + delta))
-    setWinDraft(String(next))
+    setWinDraft((prev) => {
+      const typed = prev.trim() === '' ? Number.NaN : Number(prev)
+      const base = Number.isInteger(typed) ? typed : winCurrent
+      const next = Math.min(NOTIFY_WINDOW_MAX_S, Math.max(NOTIFY_WINDOW_MIN_S, base + delta))
+      return String(next)
+    })
     setWinDirty(true)
     setWinSaved(false)
     setWinErr('')
   }
+  const holdWin = useHoldRepeat(adjustWin, winCurrent === null || winSaving)
   // 保存：客户端只做「整数 0–3600」这一层拦截（非法值不发请求）；带 baseRevision 做乐观锁，
   // 别处改过就 409，这里重读让用户看清当前值再决定。
   const saveWin = async () => {
@@ -3901,13 +3996,18 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
       <span class="cfg-block-sub">重复提交拦截窗 · ${winSourceLabel}</span>
     </div>
     <div class="auto-run-row">
-      <button type="button" class="auto-step" aria-label="减少" disabled=${winCurrent === null || winSaving} onClick=${() => adjustWin(-1)}>−</button>
+      <button type="button" class="auto-step" aria-label="减少" disabled=${winCurrent === null || winSaving}
+        onPointerDown=${holdWin.start(-1)} onPointerUp=${holdWin.stop} onPointerLeave=${holdWin.stop}
+        onPointerCancel=${holdWin.stop} onLostPointerCapture=${holdWin.stop}
+        onContextMenu=${holdWin.contextMenu} onClick=${holdWin.click(-1)}>−</button>
       <input class="auto-input" type="number" inputmode="numeric"
         min=${NOTIFY_WINDOW_MIN_S} max=${NOTIFY_WINDOW_MAX_S} step="1"
-        aria-label="通知自检拦截窗（秒）" value=${winCurrent === null ? '' : winDraft} disabled=${winCurrent === null || winSaving}
-        onInput=${(e) => { setWinDraft(e.target.value); setWinDirty(true); setWinSaved(false); setWinErr('') }} />
+        aria-label="通知自检拦截窗（秒）" value=${winCurrent === null ? '' : winDraft} disabled=${true} />
       <span class="auto-unit">秒</span>
-      <button type="button" class="auto-step" aria-label="增加" disabled=${winCurrent === null || winSaving} onClick=${() => adjustWin(1)}>+</button>
+      <button type="button" class="auto-step" aria-label="增加" disabled=${winCurrent === null || winSaving}
+        onPointerDown=${holdWin.start(1)} onPointerUp=${holdWin.stop} onPointerLeave=${holdWin.stop}
+        onPointerCancel=${holdWin.stop} onLostPointerCapture=${holdWin.stop}
+        onContextMenu=${holdWin.contextMenu} onClick=${holdWin.click(1)}>+</button>
       <${Button} variant="secondary" disabled=${winCurrent === null || winSaving} onClick=${saveWin}>保存<//>
       ${winSaved && html`<span class="cfg-block-sub" role="status" aria-live="polite">已保存 · 立即生效</span>`}
     </div>
@@ -3915,7 +4015,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
       ? '正在读取当前生效值…'
       : winCurrent === null
         ? `当前生效值读取失败，暂不可修改（点右上「刷新」重试）：${settingsErr || '未知错误'}`
-        : `当前生效 ${winCurrent} 秒 · 0 = 关闭拦截（连点会重复真实发送）· 保存后下一次触发立即生效`}</div>
+        : `当前生效 ${winCurrent} 秒 · 0 = 关闭拦截（连点会重复真实发送）· 长按加减可快速调整 · 保存后下一次触发立即生效`}</div>
     ${winErr && html`<${Hint} tone="error">${winErr}<//>`}
     <div class="cfg-block-head set-head">
       <span class="cfg-block-title">顶栏时间</span>
@@ -3938,6 +4038,178 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
 }
 
 // 系统信息：版本 / 运行环境 / 进程 / 缓存目录。只读；下面另挂「设置」块（可写）。
+// 数据备份：导出时勾选类别；导入时不勾，文件里有什么就恢复什么。
+const BACKUP_CATEGORY_OPTIONS = [
+  { key: 'messages', label: '推送记录', desc: '历史消息（会覆盖当前推送记录）' },
+  { key: 'filter', label: '过滤规则', desc: '覆盖文件与过滤设置' },
+  { key: 'settings', label: '控制台设置', desc: '拦截窗、顶栏时间显示' },
+  { key: 'auto', label: '自动运行间隔', desc: '只恢复间隔，不会打开自动运行' },
+  { key: 'runLog', label: '运行日志', desc: 'run.log 运行记录' }
+]
+
+function backupFileSummary (data) {
+  const parts = []
+  if (data && data.messages) {
+    const n = Number.isInteger(data.messages.count) ? data.messages.count : null
+    parts.push(`推送记录${n === null ? '' : ` ${n} 条`}`)
+    if (data.messages.seenText) parts.push('判重历史')
+  }
+  if (data && data.filter) parts.push('过滤规则')
+  if (data && data.settings) parts.push('控制台设置')
+  if (data && data.auto) parts.push(`自动运行间隔 ${data.auto.interval} 秒`)
+  if (data && data.runLog) parts.push(`运行日志约 ${fmtBytes((data.runLog.text || '').length)}`)
+  return parts
+}
+
+// 同一次「选文件→确认导入」的重试沿用同一个幂等键；成功后弹窗关闭，下次重新生成。
+let backupImportSeq = 0
+function newBackupImportKey () {
+  try {
+    const c = globalThis.crypto
+    if (c && typeof c.getRandomValues === 'function') {
+      const b = new Uint32Array(4)
+      c.getRandomValues(b)
+      return `xbk-import-${Array.from(b, (n) => n.toString(16).padStart(8, '0')).join('')}`
+    }
+    if (c && typeof c.randomUUID === 'function') return c.randomUUID()
+  } catch (e) { /* 非安全上下文/老浏览器：退回时间戳+进程内序号 */ }
+  backupImportSeq += 1
+  return `xbk-import-${Date.now().toString(36)}-${backupImportSeq}`
+}
+
+function BackupBlock ({ onImported }) {
+  const [selected, setSelected] = useState(() => {
+    const out = {}
+    for (const item of BACKUP_CATEGORY_OPTIONS) out[item.key] = true
+    return out
+  })
+  const [busy, setBusy] = useState('')
+  const [err, setErr] = useState('')
+  const [note, setNote] = useState('')
+  const [pending, setPending] = useState(null)
+  const [exportOpen, setExportOpen] = useState(false)
+  const fileRef = useRef(null)
+  const allSelected = BACKUP_CATEGORY_OPTIONS.every((item) => selected[item.key])
+  const toggleAll = () => {
+    const next = {}
+    for (const item of BACKUP_CATEGORY_OPTIONS) next[item.key] = !allSelected
+    setSelected(next)
+  }
+  const toggleOne = (key) => {
+    setSelected((prev) => ({ ...prev, [key]: !prev[key] }))
+  }
+  const doExport = async () => {
+    if (busy !== '') return
+    const categories = BACKUP_CATEGORY_OPTIONS.filter((item) => selected[item.key]).map((item) => item.key)
+    if (categories.length === 0) { setErr('至少勾选一项再导出'); return }
+    setBusy('export'); setErr(''); setNote('')
+    let url = ''
+    try {
+      const res = await apiPostBackupExport(categories)
+      const blob = res && res.blob ? res.blob : res
+      url = URL.createObjectURL(blob)
+      const d = new Date()
+      const pad = (n) => String(n).padStart(2, '0')
+      const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `xbk-backup-${stamp}.json`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      const skipped = res && res.skipped ? res.skipped : []
+      setExportOpen(false)
+      setNote(`已导出${categories.length}类数据${skipped.length > 0 ? `；另有 ${skipped.length} 类当前没有可导出的内容` : ''}`)
+    } catch (e) {
+      setErr(`导出失败：${e && e.message ? e.message : e}`)
+    } finally {
+      if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, 60000)
+      setBusy('')
+    }
+  }
+  const openExport = () => {
+    setErr(''); setNote(''); setExportOpen(true)
+  }
+  const chooseFile = () => {
+    if (busy === '') fileRef.current && fileRef.current.click()
+  }
+  const onFile = async (e) => {
+    const file = e.target.files && e.target.files[0]
+    e.target.value = '' // 允许重复选同一个文件
+    if (!file) return
+    setErr(''); setNote('')
+    if (file.size > 256 * 1024 * 1024) { setErr('备份文件太大'); return }
+    try {
+      const text = await file.text()
+      const data = JSON.parse(text)
+      if (!data || data.kind !== 'xbk-console-backup' || data.schema !== 1 || !data.data || typeof data.data !== 'object') {
+        throw new Error('这不是控制台备份文件')
+      }
+      const parts = backupFileSummary(data.data)
+      if (parts.length === 0) throw new Error('备份文件里没有可恢复的数据')
+      setPending({ bundle: data, summary: parts, key: newBackupImportKey() })
+    } catch (e) {
+      setErr(`读取备份失败：${e && e.message ? e.message : e}`)
+    }
+  }
+  const doImport = async () => {
+    if (!pending || busy !== '') return
+    setBusy('import'); setErr('')
+    try {
+      const res = await apiPostBackupImport(pending.bundle, pending.key)
+      setPending(null)
+      const result = res && res.data ? res.data : (res || {})
+      const imported = result.imported ? result.imported : {}
+      const bits = []
+      if (Number.isInteger(imported.messages)) bits.push(`推送记录 ${imported.messages} 条`)
+      if (imported.dedup) bits.push('判重历史')
+      if (imported.filter) bits.push('过滤规则')
+      if (imported.settings) bits.push('控制台设置')
+      if (Number.isInteger(imported.autoInterval)) bits.push(`自动运行间隔 ${imported.autoInterval} 秒`)
+      if (Number.isInteger(imported.runLogBytes)) bits.push('运行日志')
+      setNote(`导入完成${bits.length > 0 ? `：${bits.join('、')}` : ''}${result.backupDir ? `。当前数据已先备份到 ${result.backupDir}` : ''}`)
+      if (typeof onImported === 'function') Promise.resolve(onImported()).catch(() => {})
+    } catch (e) {
+      setErr(`导入失败：${e && e.message ? e.message : e}`)
+    } finally {
+      setBusy('')
+    }
+  }
+  return html`<div class="cfg-block backup-block">
+    <div class="cfg-block-head">
+      <span class="cfg-block-title">数据备份</span>
+      <span class="cfg-block-sub">点导出再选内容；导入自动识别文件</span>
+    </div>
+    <div class="backup-actions backup-actions-main">
+      <${Button} variant="secondary" disabled=${busy !== ''} onClick=${openExport}>导出<//>
+      <${Button} variant="ghost" disabled=${busy !== ''} onClick=${chooseFile}>导入<//>
+      <input class="backup-file" ref=${fileRef} type="file" accept=".json,application/json" onChange=${onFile} />
+    </div>
+    ${!exportOpen && !pending && err && html`<${Hint} tone="error">${err}<//>`}
+    ${note && html`<${Hint}>${note}<//>`}
+    <${ConfirmDialog} open=${exportOpen} title="选择要导出的数据" confirmLabel=${busy === 'export' ? '导出中…' : '导出'} busy=${busy === 'export'} confirmDisabled=${BACKUP_CATEGORY_OPTIONS.every((item) => !selected[item.key])} onCancel=${() => { if (busy !== 'export') setExportOpen(false) }} onConfirm=${doExport}>
+      <div class="backup-pick-head">
+        <label class="backup-check"><input type="checkbox" checked=${allSelected} onChange=${toggleAll} /> 全选</label>
+        <span class="cfg-block-sub">只导出勾选的类别</span>
+      </div>
+      <div class="backup-list">
+        ${BACKUP_CATEGORY_OPTIONS.map((item) => html`<label class="backup-item" key=${item.key}>
+          <input type="checkbox" checked=${selected[item.key] === true} onChange=${() => toggleOne(item.key)} />
+          <span class="backup-item-main">${item.label}</span>
+          <span class="cfg-block-sub">${item.desc}</span>
+        </label>`)}
+      </div>
+      ${err && html`<${Hint} tone="error">${err}<//>`}
+      <div class="modal-note">自动运行只备份间隔，不记录开关状态；导入时不会把自动运行打开。</div>
+    <//>
+    <${ConfirmDialog} open=${!!pending} title="确认导入备份" confirmLabel=${busy === 'import' ? '导入中…' : '确认导入'} busy=${busy === 'import'} onCancel=${() => { if (busy !== 'import') setPending(null) }} onConfirm=${doImport}>
+      <div>文件里检测到：${pending ? pending.summary.join('、') : ''}</div>
+      ${err && html`<${Hint} tone="error">${err}<//>`}
+      <div class="modal-note">导入会覆盖当前对应的数据；导入前会先把当前数据另存一份。自动运行开关不会被打开，仍保持导入前的状态。导入期间请先停掉外部定时任务，避免它用旧缓存覆盖刚恢复的记录。</div>
+    <//>
+  </div>`
+}
+
 function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFresh, onSettings }) {
   // 访问日志（v3.300 §3.3）：第二个 loader 并列拉取；「刷新」按钮同日 load 两个。
   // 近窗未授权尝试数 = 服务端独立 401 计数（进程启动以来、不随环形窗截断）。
@@ -4063,6 +4335,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
     </div>
     <div class="set-title">设置<span class="cfg-block-sub">改动立即生效 · 落盘 console-settings.json</span></div>
     <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} />
+    <${BackupBlock} onImported=${refreshAll} />
     <${Hint} style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。<//>
     ${accessErr && html`<${Hint} tone="error">访问日志加载失败：${accessErr.message || accessErr}<//>`}
     <details class="access-log">
