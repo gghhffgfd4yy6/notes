@@ -948,7 +948,7 @@ function renderUnauthorizedPage (options = {}) {
   const error = typeof options.error === 'string' ? options.error : ''
   const title = requireCode ? '需要两步验证' : '需要访问令牌'
   const intro = requireCode
-    ? '访问令牌已通过。继续输入 Google Authenticator 里的 6 位数字；手机丢了可输入保存的恢复码。'
+    ? '继续输入 Google Authenticator 里的 6 位数字；手机丢了可输入保存的恢复码。'
     : '会话未携带有效凭证（链接可能来自聊天/书签，或 Cookie 已过期）。输入部署时设置的 <code>XBK_CONSOLE_TOKEN</code> 继续。'
   const tokenField = requireCode && token
     ? `<input type="hidden" name="token" value="${escapeHtml(token)}">`
@@ -1035,10 +1035,13 @@ const TWO_FACTOR_SCHEMA = 1
 const TWO_FACTOR_COOKIE = 'xbk_2fa'
 const TWO_FACTOR_COOKIE_MAX_AGE_S = 12 * 60 * 60
 const TWO_FACTOR_PENDING_TTL_MS = 10 * 60 * 1000
+const TWO_FACTOR_PENDING_MAX = 10
+const TWO_FACTOR_ENABLE_RESULT_TTL_MS = 2 * 60 * 1000
 const TWO_FACTOR_FILE_MAX_BYTES = 32 * 1024
 const TWO_FACTOR_RECOVERY_COUNT = 10
 const TWO_FACTOR_LOGIN_MAX_FAILS = 10
 const TWO_FACTOR_LOGIN_WINDOW_MS = 5 * 60 * 1000
+const LOGIN_FAILURE_MAX_KEYS = 1024
 const TWO_FACTOR_SECRET_RE = /^[A-Z2-7]{16,128}$/
 const TOTP_PERIOD_S = 30
 const TOTP_DIGITS = 6
@@ -1114,15 +1117,22 @@ function totpCodeAt (secret, atMs = Date.now()) {
   return String(value % 1000000).padStart(TOTP_DIGITS, '0')
 }
 
-function verifyTotpCode (secret, code, atMs = Date.now(), window = TOTP_WINDOW) {
+function totpStepAt (secret, code, atMs = Date.now(), window = TOTP_WINDOW) {
   const normalized = String(code || '').trim()
-  if (!/^[0-9]{6}$/.test(normalized)) return false
+  if (!/^[0-9]{6}$/.test(normalized)) return null
   const base = Number.isFinite(atMs) ? atMs : Date.now()
   for (let offset = -window; offset <= window; offset++) {
-    const candidate = totpCodeAt(secret, base + offset * TOTP_PERIOD_S * 1000)
-    if (candidate !== null && timingSafeEqualStr(candidate, normalized)) return true
+    const at = base + offset * TOTP_PERIOD_S * 1000
+    const candidate = totpCodeAt(secret, at)
+    if (candidate !== null && timingSafeEqualStr(candidate, normalized)) {
+      return Math.floor(at / 1000 / TOTP_PERIOD_S)
+    }
   }
-  return false
+  return null
+}
+
+function verifyTotpCode (secret, code, atMs = Date.now(), window = TOTP_WINDOW) {
+  return totpStepAt(secret, code, atMs, window) !== null
 }
 
 function normalizeRecoveryCode (code) {
@@ -1217,6 +1227,20 @@ function secureCookieSuffix (req) {
   return isSecureRequest(req) ? '; Secure' : ''
 }
 
+// 反向代理后的客户端地址：控制台生产部署只绑回环（Caddy 在 127.0.0.1 转发），
+// 只有回环来源的 X-Forwarded-For 才可信；直连来源一律用 socket 地址，避免伪造头
+// 把失败计数甩到别人头上（Sourcery：一个用户锁死所有代理后用户）。
+function clientAddress (req) {
+  const socketAddr = String((req && req.socket && req.socket.remoteAddress) || '')
+  const loopback = socketAddr === '127.0.0.1' || socketAddr === '::1' || socketAddr === '::ffff:127.0.0.1'
+  if (!loopback) return socketAddr
+  const raw = req && req.headers && req.headers['x-forwarded-for']
+  const first = Array.isArray(raw) ? raw[0] : raw
+  if (typeof first !== 'string') return socketAddr
+  const ip = first.split(',')[0].trim()
+  return ip.length > 0 && ip.length <= 64 ? ip : socketAddr
+}
+
 function sessionCookieHeaderFor (req, token, maxAge = 86400) {
   return `xbk_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secureCookieSuffix(req)}`
 }
@@ -1236,6 +1260,13 @@ function loadTwoFactorState (stateDir) {
   if (read.status !== 'ok') {
     throw new Error(`两步验证配置不可读（${read.status}）：${file}；拒绝启动（fail-closed）`)
   }
+  // 密钥文件必须是 0600；直接收紧（不先 stat 再 chmod，避免检查/使用之间的路径替换窗口），
+  // 收紧失败就拒启（不能默默让同机用户读走 TOTP 密钥）。
+  try {
+    fs.chmodSync(file, 0o600)
+  } catch (e) {
+    throw new Error(`两步验证配置权限无法收紧：${file}；拒绝启动（fail-closed）`)
+  }
   let raw
   try { raw = JSON.parse(read.text) } catch (e) {
     throw new Error(`两步验证配置不是合法 JSON：${file}；拒绝启动（fail-closed）`)
@@ -1243,7 +1274,8 @@ function loadTwoFactorState (stateDir) {
   const recoveryOk = raw && raw.recovery && typeof raw.recovery.salt === 'string' &&
     /^[0-9a-f]{16,64}$/.test(raw.recovery.salt) && Array.isArray(raw.recovery.hashes) &&
     raw.recovery.hashes.length <= TWO_FACTOR_RECOVERY_COUNT &&
-    raw.recovery.hashes.every((h) => typeof h === 'string' && /^[0-9a-f]{64}$/.test(h))
+    raw.recovery.hashes.every((h) => typeof h === 'string' && /^[0-9a-f]{64}$/.test(h)) &&
+    new Set(raw.recovery.hashes).size === raw.recovery.hashes.length
   if (!raw || raw.schema !== TWO_FACTOR_SCHEMA || raw.enabled !== true ||
       typeof raw.secret !== 'string' || !TWO_FACTOR_SECRET_RE.test(raw.secret) || !recoveryOk) {
     throw new Error(`两步验证配置字段非法：${file}；拒绝启动（fail-closed）`)
@@ -1290,6 +1322,16 @@ function authorize (req, token, urlQuery) {
 function sendJson (res, code, obj) {
   const body = JSON.stringify(obj)
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.end(body)
+}
+
+// 登录/挑战页统一响应头：禁止 Referer 把带 ?token= 的地址带进代理日志，也禁止缓存。
+function sendHtml (res, code, body) {
+  res.setHeader('Content-Security-Policy', CSP_HEADER)
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' })
   res.end(body)
 }
 
@@ -2165,7 +2207,7 @@ function classifyStateFile (name, messagesFile) {
   // ——这是**合法缓存文件**，绝不能因为名字含 .lock 被归进 lock（暗示异常）。
   if (name.endsWith('.seen.cleanup.lock.json')) return 'cache'
   if (name === 'console-lastaccept.json') return 'console'
-  if (name === CONSOLE_SETTINGS_FILE) return 'console'
+  if (name === CONSOLE_SETTINGS_FILE || name === TWO_FACTOR_FILE) return 'console'
   if (name === 'console-trigger.lock' || name === '.seen.cleanup.lock' ||
     name.endsWith('.lock') || name.endsWith('.takeover') || name.endsWith('.reclaim')) return 'lock'
   if (name.endsWith('.bak')) return 'backup'
@@ -2313,17 +2355,64 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   fs.mkdirSync(stateDir, { recursive: true })
   // 两步验证状态：文件缺失 = 未开启；文件损坏/非法 → 构造时抛错，服务拒启（fail-closed）。
   const twoFactor = loadTwoFactorState(stateDir)
-  let pendingTwoFactor = null
+  // 每台浏览器/每个设置流程一个 pending secret；多个标签页各自扫码不会互相顶掉。
+  // 只放内存，10 分钟过期；上限 10 个，防止反复点「开启」把进程内存撑大。
+  let pendingTwoFactors = new Map()
+  // enable 成功后的短时回执：响应丢包时，同一 setupId + 当前验证码可重取一次恢复码。
+  let lastEnableResult = null
+  // 已被接受的 TOTP 时间步（防同一 6 位码在 ±1 窗口内重复换登录 Cookie）。
+  const usedTotpSteps = new Map()
+  const prunePendingTwoFactors = (now = Date.now()) => {
+    for (const [id, pending] of pendingTwoFactors) {
+      if (now - pending.createdAt >= TWO_FACTOR_PENDING_TTL_MS) pendingTwoFactors.delete(id)
+    }
+    if (lastEnableResult && now - lastEnableResult.createdAt >= TWO_FACTOR_ENABLE_RESULT_TTL_MS) {
+      lastEnableResult = null
+    }
+  }
+  const hasPendingTwoFactor = () => {
+    prunePendingTwoFactors()
+    return pendingTwoFactors.size > 0
+  }
+  const rememberPendingTwoFactor = (secret, now = Date.now()) => {
+    prunePendingTwoFactors(now)
+    while (pendingTwoFactors.size >= TWO_FACTOR_PENDING_MAX) {
+      const oldest = pendingTwoFactors.keys().next().value
+      pendingTwoFactors.delete(oldest)
+    }
+    const id = crypto.randomBytes(12).toString('hex')
+    pendingTwoFactors.set(id, { id, secret, createdAt: now })
+    return pendingTwoFactors.get(id)
+  }
+  const findPendingTwoFactor = (setupId, code) => {
+    prunePendingTwoFactors()
+    if (setupId) return pendingTwoFactors.get(setupId) || null
+    // 兼容旧前端：没有 setupId 时按验证码匹配现有 pending（不覆盖其它标签页的密钥）。
+    for (const pending of pendingTwoFactors.values()) {
+      if (verifyTotpCode(pending.secret, code)) return pending
+    }
+    return null
+  }
   // 登录失败窗（内存、按来源 IP；进程重启清空）。只用于 2FA 验证码，避免 6 位码被在线穷举。
   const loginFailures = new Map()
-  const loginAttemptKey = (req) => String((req.socket && req.socket.remoteAddress) || '')
+  const loginAttemptKey = (req) => clientAddress(req)
+  const pruneLoginFailures = (now) => {
+    for (const [key, arr] of loginFailures) {
+      const kept = arr.filter((t) => now - t < TWO_FACTOR_LOGIN_WINDOW_MS)
+      if (kept.length === 0) loginFailures.delete(key)
+      else loginFailures.set(key, kept)
+    }
+    // 大量不同来源 IP 的失败也不能无限积累：Map 插入序即最旧，先丢最旧键。
+    while (loginFailures.size > LOGIN_FAILURE_MAX_KEYS) {
+      const oldest = loginFailures.keys().next().value
+      loginFailures.delete(oldest)
+    }
+  }
   const loginFailureTimes = (req) => {
-    const key = loginAttemptKey(req)
     const now = Date.now()
-    const arr = (loginFailures.get(key) || []).filter((t) => now - t < TWO_FACTOR_LOGIN_WINDOW_MS)
-    if (arr.length === 0) loginFailures.delete(key)
-    else loginFailures.set(key, arr)
-    return arr
+    pruneLoginFailures(now)
+    const key = loginAttemptKey(req)
+    return loginFailures.get(key) || []
   }
   const loginThrottled = (req) => loginFailureTimes(req).length >= TWO_FACTOR_LOGIN_MAX_FAILS
   const noteLoginFailure = (req) => {
@@ -2333,21 +2422,36 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     loginFailures.set(key, arr)
   }
   const clearLoginFailures = (req) => loginFailures.delete(loginAttemptKey(req))
+  const consumeTotpStep = (code, now = Date.now()) => {
+    for (const [step, expiresAt] of usedTotpSteps) {
+      if (expiresAt <= now) usedTotpSteps.delete(step)
+    }
+    const step = totpStepAt(twoFactor.secret, code, now)
+    if (step === null) return null
+    if (usedTotpSteps.has(step)) return { replay: true }
+    usedTotpSteps.set(step, (step + 2) * TOTP_PERIOD_S * 1000)
+    return { step }
+  }
   const twoFactorVerified = (req) => {
     if (!twoFactor.enabled) return true
     // Cookie 是否有效由 HMAC 签名判定；不要用「值是否为空」做安全分支
     // （CodeQL js/user-controlled-bypass：用户可控的值不能直接决定放行）。
     return verifyTwoFactorCookie(twoFactorCookieValue(req.headers && req.headers.cookie), twoFactor.secret)
   }
-  const verifySecondFactor = (code) => {
-    if (verifyTotpCode(twoFactor.secret, code)) return { ok: true, recovery: false }
+  const verifySecondFactor = (code, { persistRecovery = true } = {}) => {
+    const totp = consumeTotpStep(code)
+    if (totp && totp.replay) return { ok: false, recovery: false, error: 'replay' }
+    if (totp) return { ok: true, recovery: false }
     const next = consumeRecoveryCode(twoFactor.recovery, code)
     if (!next) return { ok: false, recovery: false }
-    if (!persistTwoFactorState(twoFactor.file, twoFactor.secret, next)) {
-      return { ok: false, recovery: true, error: 'write_failed' }
+    // 关闭 2FA 时先核验、后删文件：这里不能先把恢复码写掉，否则删文件失败会让用户白丢一个码。
+    if (persistRecovery) {
+      if (!persistTwoFactorState(twoFactor.file, twoFactor.secret, next)) {
+        return { ok: false, recovery: true, error: 'write_failed' }
+      }
+      twoFactor.recovery = next
     }
-    twoFactor.recovery = next
-    return { ok: true, recovery: true }
+    return { ok: true, recovery: true, next }
   }
   // 活跃子进程登记（Sourcery High：控制台关闭时子进程要一并终止，否则触发任务
   // 会在控制服务消失后继续抓取/推送）。close 回调里自行从集合摘除。
@@ -3978,49 +4082,42 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         const params = new URLSearchParams(body)
         const submitted = params.get('token') || ''
-        if (!timingSafeEqualStr(submitted, token)) {
-          res.setHeader('Content-Security-Policy', CSP_HEADER)
-          res.setHeader('Cache-Control', 'no-store')
-          res.setHeader('X-Content-Type-Options', 'nosniff')
-          res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' })
-          res.end(renderUnauthorizedPage())
-          return
-        }
-        let cookies = [sessionCookieHeaderFor(req, token)]
+        const code = params.get('code') || ''
         if (twoFactor.enabled) {
+          // 先限速再看令牌：否则错误令牌在比较处提前返回，第一因子可无限猜。
           if (loginThrottled(req)) {
-            res.setHeader('Content-Security-Policy', CSP_HEADER)
-            res.setHeader('Cache-Control', 'no-store')
-            res.setHeader('X-Content-Type-Options', 'nosniff')
-            res.writeHead(429, { 'Content-Type': 'text/html; charset=utf-8' })
-            res.end(renderUnauthorizedPage({ requireCode: true, token: submitted, error: '尝试次数过多，请 5 分钟后再试。' }))
+            sendHtml(res, 429, renderUnauthorizedPage({ requireCode: true, token: submitted, error: '尝试次数过多，请 5 分钟后再试。' }))
             return
           }
-          const code = params.get('code') || ''
+          if (!timingSafeEqualStr(submitted, token)) {
+            // 与「令牌通过但缺验证码」返回同一个挑战页，不暴露第一因子是否猜中；
+            // hidden 里回填的是本次提交值（无效），不会变成可用凭证。
+            noteLoginFailure(req)
+            sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: submitted }))
+            return
+          }
           if (code.trim() === '') {
-            res.setHeader('Content-Security-Policy', CSP_HEADER)
-            res.setHeader('Cache-Control', 'no-store')
-            res.setHeader('X-Content-Type-Options', 'nosniff')
-            res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' })
-            res.end(renderUnauthorizedPage({ requireCode: true, token: submitted, error: '请输入 Google Authenticator 的 6 位验证码，或使用恢复码。' }))
+            sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: submitted }))
             return
           }
           const verdict = verifySecondFactor(code)
           if (!verdict.ok) {
             noteLoginFailure(req)
-            res.setHeader('Content-Security-Policy', CSP_HEADER)
-            res.setHeader('Cache-Control', 'no-store')
-            res.setHeader('X-Content-Type-Options', 'nosniff')
-            res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' })
             const why = verdict.error === 'write_failed'
               ? '恢复码已核验，但保存状态失败；请稍后再试。'
-              : '验证码不对。请确认手机时间准确，再试一次；也可以用恢复码。'
-            res.end(renderUnauthorizedPage({ requireCode: true, token: submitted, error: why }))
+              : verdict.error === 'replay'
+                ? '这个验证码已经用过，请等手机上的数字刷新后再试；也可以用恢复码。'
+                : '验证码不对。请确认手机时间准确，再试一次；也可以用恢复码。'
+            sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: submitted, error: why }))
             return
           }
           clearLoginFailures(req)
-          cookies = cookies.concat(twoFactorCookieHeader(req, twoFactor.secret))
+        } else if (!timingSafeEqualStr(submitted, token)) {
+          sendHtml(res, 401, renderUnauthorizedPage())
+          return
         }
+        const cookies = [sessionCookieHeaderFor(req, token)]
+        if (twoFactor.enabled) cookies.push(twoFactorCookieHeader(req, twoFactor.secret))
         res.setHeader('Set-Cookie', cookies)
         res.setHeader('Cache-Control', 'no-store')
         res.writeHead(303, { Location: '/' })
@@ -4032,20 +4129,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 6 位码时，给登录页的第二步；令牌本身仍留在 hidden 字段随 POST 回传，不新增 URL 暴露。
     if (req.method === 'GET' && url.pathname === '/' && twoFactor.enabled && !twoFactorVerified(req)) {
       if (!authorize(req, token, url.searchParams)) {
-        res.setHeader('Content-Security-Policy', CSP_HEADER)
-        res.setHeader('Cache-Control', 'no-store')
-        res.setHeader('X-Content-Type-Options', 'nosniff')
-        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' })
-        res.end(renderUnauthorizedPage())
+        sendHtml(res, 401, renderUnauthorizedPage())
         return
       }
       const queryToken = url.searchParams.get('token')
       const formToken = typeof queryToken === 'string' && timingSafeEqualStr(queryToken, token) ? queryToken : token
-      res.setHeader('Content-Security-Policy', CSP_HEADER)
-      res.setHeader('Cache-Control', 'no-store')
-      res.setHeader('X-Content-Type-Options', 'nosniff')
-      res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' })
-      res.end(renderUnauthorizedPage({ requireCode: true, token: formToken }))
+      sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: formToken }))
       return
     }
     // 过滤规则写端点：必须在全局 authorize 之前分流。全局闸对 POST 接受 ?token= 且
@@ -4065,11 +4154,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     if (!authorize(req, token, url.searchParams)) {
       // 审查 #224：GET / 未授权时给可自助恢复的登录页，而不是裸 JSON；API/静态资源仍回 JSON。
       if (req.method === 'GET' && url.pathname === '/') {
-        res.setHeader('Content-Security-Policy', CSP_HEADER)
-        res.setHeader('Cache-Control', 'no-store')
-        res.setHeader('X-Content-Type-Options', 'nosniff')
-        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' })
-        res.end(renderUnauthorizedPage())
+        sendHtml(res, 401, renderUnauthorizedPage())
         return
       }
       sendJson(res, 401, { error: 'unauthorized' })
@@ -4509,7 +4594,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       res.setHeader('Cache-Control', 'no-store')
       sendJson(res, 200, {
         enabled: twoFactor.enabled,
-        pending: pendingTwoFactor !== null && Date.now() - pendingTwoFactor.createdAt < TWO_FACTOR_PENDING_TTL_MS,
+        pending: hasPendingTwoFactor(),
         recoveryRemaining: twoFactor.recovery ? twoFactor.recovery.hashes.length : 0
       })
       return
@@ -4523,19 +4608,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 被下一次请求当成请求行解析。前端仍会发一个空 JSON 对象。
       req.resume()
       const secret = generateTotpSecret()
-      pendingTwoFactor = { secret, createdAt: Date.now() }
+      const pending = rememberPendingTwoFactor(secret)
       const label = encodeURIComponent('xbk-push:console')
       const issuer = encodeURIComponent('xbk-push')
       const otpauth = `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`
       res.setHeader('Cache-Control', 'no-store')
-      sendJson(res, 200, { secret, otpauth, qrDataUrl: totpQrDataUrl(otpauth), account: 'xbk-push:console', issuer: 'xbk-push', period: TOTP_PERIOD_S, digits: TOTP_DIGITS })
+      sendJson(res, 200, { setupId: pending.id, secret, otpauth, qrDataUrl: totpQrDataUrl(otpauth), account: 'xbk-push:console', issuer: 'xbk-push', period: TOTP_PERIOD_S, digits: TOTP_DIGITS })
       return
     }
     if (req.method === 'POST' && url.pathname === '/api/2fa/enable') {
       if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
-      if (twoFactor.enabled) { sendJson(res, 409, { error: 'already_enabled', message: '两步验证已经开启' }); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
       readBody(req, 4096).then(({ body, aborted, over }) => {
         if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
@@ -4543,25 +4627,50 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         let payload
         try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
         const code = payload && typeof payload.code === 'string' ? payload.code.trim() : ''
-        if (!pendingTwoFactor || Date.now() - pendingTwoFactor.createdAt >= TWO_FACTOR_PENDING_TTL_MS) {
+        const setupId = payload && typeof payload.setupId === 'string' ? payload.setupId : ''
+        if (twoFactor.enabled) {
+          // 成功响应丢包时允许同一 setupId + 仍有效的验证码重取一次恢复码（短时、只存内存）。
+          const receipt = lastEnableResult
+          const fresh = receipt && Date.now() - receipt.createdAt < TWO_FACTOR_ENABLE_RESULT_TTL_MS
+          if (fresh && setupId !== '' && receipt.setupId === setupId && verifyTotpCode(receipt.secret, code)) {
+            res.setHeader('Set-Cookie', twoFactorCookieHeader(req, twoFactor.secret))
+            res.setHeader('Cache-Control', 'no-store')
+            sendJson(res, 200, { enabled: true, recoveryCodes: receipt.recoveryCodes, recoveryRemaining: receipt.recoveryCodes.length })
+            return
+          }
+          sendJson(res, 409, { error: 'already_enabled', message: '两步验证已经开启' })
+          return
+        }
+        if (loginThrottled(req)) {
+          sendJson(res, 429, { error: 'too_many_attempts', message: '尝试次数过多，请 5 分钟后再试' })
+          return
+        }
+        const pending = findPendingTwoFactor(setupId, code)
+        if (!pending) {
           sendJson(res, 400, { error: 'setup_required', message: '请先获取新的设置密钥（二维码/密钥）' })
           return
         }
-        if (!verifyTotpCode(pendingTwoFactor.secret, code)) {
+        if (!verifyTotpCode(pending.secret, code)) {
+          noteLoginFailure(req)
           sendJson(res, 400, { error: 'invalid_code', message: '验证码不对，请确认手机时间准确后重试' })
           return
         }
         const recoveryCodes = generateRecoveryCodes()
         const recovery = recoveryRecordOf(recoveryCodes)
-        if (!persistTwoFactorState(twoFactor.file, pendingTwoFactor.secret, recovery)) {
+        if (!persistTwoFactorState(twoFactor.file, pending.secret, recovery)) {
           sendJson(res, 500, { error: 'write_failed', message: '两步验证配置保存失败' })
           return
         }
         twoFactor.enabled = true
-        twoFactor.secret = pendingTwoFactor.secret
+        twoFactor.secret = pending.secret
         twoFactor.recovery = recovery
         twoFactor.createdAt = Date.now()
-        pendingTwoFactor = null
+        pendingTwoFactors.delete(pending.id)
+        // 开启时用的那一步也记入已用集合：同一码不能在 30 秒内再换一次登录 Cookie。
+        const setupStep = totpStepAt(pending.secret, code)
+        if (setupStep !== null) usedTotpSteps.set(setupStep, (setupStep + 2) * TOTP_PERIOD_S * 1000)
+        lastEnableResult = { setupId: pending.id, secret: pending.secret, recoveryCodes, createdAt: Date.now() }
+        clearLoginFailures(req)
         res.setHeader('Set-Cookie', twoFactorCookieHeader(req, twoFactor.secret))
         res.setHeader('Cache-Control', 'no-store')
         sendJson(res, 200, { enabled: true, recoveryCodes, recoveryRemaining: recoveryCodes.length })
@@ -4584,10 +4693,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           sendJson(res, 200, { enabled: false })
           return
         }
-        const check = verifySecondFactor(code)
+        if (loginThrottled(req)) {
+          sendJson(res, 429, { error: 'too_many_attempts', message: '尝试次数过多，请 5 分钟后再试' })
+          return
+        }
+        // 关闭时要先核验、再删文件；恢复码只在删文件成功后才算消耗（persistRecovery:false）。
+        const check = verifySecondFactor(code, { persistRecovery: false })
         if (!check.ok) {
-          const why = check.error === 'write_failed' ? '恢复码已核验，但保存状态失败；请稍后再试。' : '验证码不对，未关闭'
-          sendJson(res, 400, { error: check.error === 'write_failed' ? 'write_failed' : 'invalid_code', message: why })
+          noteLoginFailure(req)
+          const why = check.error === 'replay'
+            ? '这个验证码已经用过，请等手机上的数字刷新后再试；也可以用恢复码。'
+            : '验证码不对，未关闭'
+          sendJson(res, 400, { error: 'invalid_code', message: why })
           return
         }
         try {
@@ -4600,7 +4717,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         twoFactor.secret = ''
         twoFactor.recovery = null
         twoFactor.createdAt = 0
-        pendingTwoFactor = null
+        pendingTwoFactors = new Map()
+        lastEnableResult = null
+        usedTotpSteps.clear()
+        clearLoginFailures(req)
         res.setHeader('Set-Cookie', clearTwoFactorCookieHeader(req))
         sendJson(res, 200, { enabled: false })
       }).catch(() => sendJson(res, 500, { error: '读取请求体失败' }))

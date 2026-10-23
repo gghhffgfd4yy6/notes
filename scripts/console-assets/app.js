@@ -566,11 +566,13 @@ function apiPostTwoFactorSetup () {
   return consumeJsonResult(fetch('/api/2fa/setup', merged), done)
 }
 
-function apiPostTwoFactorEnable (code) {
+function apiPostTwoFactorEnable (code, setupId) {
+  const payload = { code }
+  if (typeof setupId === 'string' && setupId !== '') payload.setupId = setupId
   const { merged, done } = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
-    body: JSON.stringify({ code })
+    body: JSON.stringify(payload)
   })
   return consumeJsonResult(fetch('/api/2fa/enable', merged), done)
 }
@@ -4382,7 +4384,7 @@ function TwoFactorBlock () {
     if (busy !== '' || !setup || code.trim().length < 6) return
     setBusy('enable'); setErr(''); setNote('')
     try {
-      const res = await apiPostTwoFactorEnable(code.trim())
+      const res = await apiPostTwoFactorEnable(code.trim(), setup.setupId)
       if (!res.ok) throw new Error(messageOf(res))
       const data = res.data || {}
       setRecoveryCodes(Array.isArray(data.recoveryCodes) ? data.recoveryCodes : [])
