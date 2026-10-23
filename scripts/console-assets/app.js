@@ -1364,6 +1364,35 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, 
   </div>`
 }
 
+// 未保存草稿的离开拦截：三选一（取消 / 不保存并离开 / 去保存），默认焦点在取消。
+// 由 App 在“过滤页有脏草稿又要切页/后退”时挂出；保存仍走过滤页原来的确认流程。
+function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
+  const cancelRef = useRef(null)
+  const [titleId] = useState(() => `leave-title-${++dialogSeq}`)
+  useEffect(() => {
+    if (!open) return undefined
+    const onKey = (e) => { if (e.key === 'Escape') onCancel() }
+    document.addEventListener('keydown', onKey)
+    const t = setTimeout(() => { if (cancelRef.current) cancelRef.current.focus() }, 0)
+    return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
+  }, [open, onCancel])
+  if (!open) return null
+  return html`<div class="modal-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCancel() }}>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby=${titleId}>
+      <div class="modal-title" id=${titleId}>有未保存的过滤规则</div>
+      <div class="modal-body">
+        <div class="fr-dialog-line">当前有 ${count} 个字段还没保存。现在离开，这些修改会丢。</div>
+        <div class="modal-note">「去保存」会留在这里并打开保存确认；「不保存并离开」会丢掉这些修改；「取消」继续编辑。</div>
+      </div>
+      <div class="modal-actions">
+        <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${onCancel}>取消<//>
+        <${Button} variant="danger-solid" disabled=${busy} onClick=${onDiscard}>不保存并离开<//>
+        <${Button} variant="primary" disabled=${busy} onClick=${onSave}>去保存<//>
+      </div>
+    </div>
+  </div>`
+}
+
 // ── 触发结果行（v3.317）─────────────────────────────────────────────────────
 // 触发返回 202 后旧界面只把面板头徽标从「任务运行中」改回「空闲」：手机上看不出
 // 「刚才那次到底成没成」。这里用 App 已有的 runs（被触发那条 run 的结算）拼一行结果，
@@ -4336,7 +4365,7 @@ function FilterField ({ def, value, saved, error, onChange }) {
   </div>`
 }
 
-function FilterRulesPanel ({ onSync, active = true, pollTick = 0 }) {
+function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLeaveRequest }) {
   const [data, setData] = useState(null)
   const [draft, setDraft] = useState(null)
   const [base, setBase] = useState(null)
@@ -4375,6 +4404,12 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0 }) {
 
   // 渲染期同步的「有未保存改动」标记：load 的回调闭包里读它，避免拿到旧值。
   const dirtyRef = useRef(false)
+  // 离开拦截：allowLeaveRef 表示用户已经明确「不保存」，此时 beforeunload/popstate 都放行。
+  // guardPushedRef 防止每次输入都往历史里再压一条 sentinel。
+  const allowLeaveRef = useRef(false)
+  const guardPushedRef = useRef(false)
+  const onLeaveRequestRef = useRef(onLeaveRequest)
+  onLeaveRequestRef.current = onLeaveRequest
   const load = useCallback(async () => {
     const seq = ++loadSeqRef.current
     setLoading(true)
@@ -4410,12 +4445,46 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0 }) {
     return FILTER_FIELD_NAMES.filter((n) => String(draft[n]) !== String(base[n]))
   }, [draft, base])
   const draftWide = useMemo(() => wideFieldsOf(draft), [draft])
-  dirtyRef.current = dirtyFields.length > 0
+  const dirty = dirtyFields.length > 0
+  dirtyRef.current = dirty
   // 下拉刷新不碰有未保存改动的草稿：一次下拉不能静默丢掉用户刚改的规则。
   usePullRefresh(active && dirtyFields.length === 0, load)
   // v3.348：统一轮询节拍。load 自己会在 dirtyRef 为真时丢弃响应，
   // 所以有未保存改动时自动刷新不会覆盖草稿（下拉刷新之外的第二道保险）。
   usePollReload(active, pollTick, load)
+
+  // 刷新/关页：浏览器原生提示。自定义弹窗在 beforeunload 里出不来，文案由浏览器决定。
+  useEffect(() => {
+    if (!dirty) return undefined
+    const onBeforeUnload = (e) => {
+      if (allowLeaveRef.current) return
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [dirty])
+
+  // 手机左滑/浏览器后退：脏草稿时在历史里压一条同地址 sentinel。第一次后退会退到
+  // 这条 sentinel（同页、不卸载），popstate 里再问「保存 / 不保存 / 取消」。取消时
+  // App 调 restoreHistory() 重新压一条，保证下一次左滑还能拦。
+  useEffect(() => {
+    if (!dirty) {
+      guardPushedRef.current = false
+      return undefined
+    }
+    allowLeaveRef.current = false
+    if (!guardPushedRef.current) {
+      window.history.pushState({ ...(window.history.state || {}), __xbkFilterGuard: true }, '', window.location.href)
+      guardPushedRef.current = true
+    }
+    const onPop = () => {
+      if (!dirtyRef.current || allowLeaveRef.current) return
+      if (onLeaveRequestRef.current) onLeaveRequestRef.current({ source: 'history' })
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [dirty])
 
   const setFieldValue = useCallback((name, value) => {
     setDraft((cur) => (cur ? { ...cur, [name]: value } : cur))
@@ -4621,6 +4690,43 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0 }) {
     }
   }
 
+  // 复制默认会拿 base 覆盖 draft；有脏草稿时先问一句，别让一个按钮把编辑内容吃掉。
+  const askCopyDefaults = () => {
+    if (!data || !base || busy) return
+    if (dirtyFields.length > 0) {
+      setDialog({ kind: 'copyDefaults' })
+      return
+    }
+    copyDefaults()
+  }
+
+  // 用户明确选择「不保存并离开」：把草稿退回 base，并立刻关掉拦截（历史后退不会等 React 重渲染）。
+  const discardDraft = useCallback(() => {
+    allowLeaveRef.current = true
+    guardPushedRef.current = false
+    dirtyRef.current = false
+    if (guardRef && guardRef.current) {
+      guardRef.current.dirty = false
+      guardRef.current.count = 0
+    }
+    if (base) setDraft({ ...base })
+    setFieldErrors({})
+    setPreview(null)
+    setDialog(null)
+    setNotice({ tone: 'warn', text: '已放弃未保存的修改。' })
+  }, [base, guardRef])
+
+  // 取消/去保存后重新压一条 sentinel，下一次左滑仍然能拦。当前已经是 sentinel 就不重复压。
+  const restoreHistory = useCallback(() => {
+    allowLeaveRef.current = false
+    if (window.history.state && window.history.state.__xbkFilterGuard) {
+      guardPushedRef.current = true
+      return
+    }
+    guardPushedRef.current = true
+    window.history.pushState({ ...(window.history.state || {}), __xbkFilterGuard: true }, '', window.location.href)
+  }, [])
+
   const doRestore = async (to, baseRevision) => {
     setBusy('restore')
     setErr('')
@@ -4703,14 +4809,24 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0 }) {
         <div class="modal-note">确认后以 confirmWideMatch:true 写入覆盖文件；同样下一轮生效。</div>
       <//>`
     }
+    if (dialog.kind === 'copyDefaults') {
+      return html`<${ConfirmDialog} open=${true} title="复制默认规则会覆盖草稿"
+        confirmLabel=${busy === 'copy' ? '复制中…' : '放弃草稿并复制'} busy=${busy === 'copy'}
+        onCancel=${closeDialog}
+        onConfirm=${() => { setDialog(null); copyDefaults() }}>
+        <div class="fr-dialog-line">当前有 ${dirtyFields.length} 个字段未保存；复制代码默认会把这些修改覆盖掉。</div>
+        <div class="modal-note">复制后写入覆盖文件，下一轮生效。</div>
+      <//>`
+    }
     if (dialog.kind === 'restore') {
       return html`<${ConfirmDialog} open=${true} title="确认回滚过滤规则"
-        confirmLabel=${busy === 'restore' ? '回滚中…' : '确认回滚'} busy=${busy === 'restore'}
+        confirmLabel=${busy === 'restore' ? '回滚中…' : dirtyFields.length > 0 ? '放弃草稿并回滚' : '确认回滚'} busy=${busy === 'restore'}
         onCancel=${closeDialog}
         onConfirm=${() => doRestore(dialog.to, dialog.baseRevision)}>
         <div class="fr-dialog-line">${dialog.to === 'default'
           ? '写入空覆盖文件（filter:{}、revision+1）恢复代码默认，不删除文件——revision 与备份列表保持连续。'
           : `用备份 r${dialog.to} 的内容写入新 revision（revision 只增不减，线性历史）。`}</div>
+        ${dirtyFields.length > 0 && html`<div class="fr-wide-warn" role="alert">当前有 ${dirtyFields.length} 个字段未保存；回滚会用服务端版本覆盖草稿。</div>`}
         <div class="modal-note">回滚前会先备份当前配置（r${dialog.baseRevision}）；同样下一轮生效，当前正在跑的一轮不换规则。</div>
       <//>`
     }
@@ -4723,6 +4839,18 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0 }) {
       <//>`
     }
     return null
+  }
+
+  useEffect(() => () => { if (guardRef) guardRef.current = null }, [guardRef])
+  if (guardRef) {
+    guardRef.current = {
+      dirty,
+      count: dirtyFields.length,
+      busy: !!busy,
+      save: beginSave,
+      discard: discardDraft,
+      restoreHistory
+    }
   }
 
   const revision = data && Number.isSafeInteger(data.revision) ? data.revision : 0
@@ -4771,7 +4899,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0 }) {
       ${data.source === 'default' && html`<div class="fr-firstrun">
         <div class="fr-firstrun-title">当前使用代码默认</div>
         <div class="fr-firstrun-text">还没有覆盖文件。保存任意修改会自动创建；也可以先把当前代码默认整份复制成第一版，之后的修改都写覆盖文件（不自动写，避免不知情地产生第一版）。</div>
-        <${Button} variant="primary" disabled=${!!busy || loading} onClick=${copyDefaults}>把当前规则复制到覆盖文件<//>
+        <${Button} variant="primary" disabled=${!!busy || loading} onClick=${askCopyDefaults}>把当前规则复制到覆盖文件<//>
       </div>`}
 
       <div class="fr-form" role="group" aria-label="过滤规则表单">
@@ -4949,6 +5077,13 @@ function App () {
   // （刷新/后退不丢当前页；非法值仍回概览）。
   const resolveTab = (hash) => (/^#\/filter$/.test(typeof hash === 'string' ? hash : '') ? 'filter' : tabFromHash(hash))
   const [tab, setTab] = useState(() => resolveTab(window.location.hash))
+  // 过滤页草稿守卫：脏状态、保存、放弃由面板写进这个 ref，App 只在切页/后退前问一句。
+  // 不用 state 是因为每敲一个字都 dirty，App 不需要跟着重渲染。
+  const [leaveRequest, setLeaveRequest] = useState(null)
+  const filterGuardRef = useRef(null)
+  const requestFilterLeave = useCallback((req) => {
+    setLeaveRequest((cur) => cur || req)
+  }, [])
   // 页签保活：第一次进入才挂载，之后切走只加 hidden、不卸载。切回已看过的页签时
   // 面板与数据都还在，文档高度不会在「卸载→挂载」的两帧之间塌成视口高。
   // 这是网关（WorkBuddy）切换丝滑的原因：它也是所有 page 常驻、只 toggle 可见性。
@@ -5475,6 +5610,16 @@ function App () {
     const onHash = () => {
       const next = resolveTab(window.location.hash)
       if (next === tabRef.current) return
+      // 过滤页有未保存草稿：先把地址改回去，再问「保存 / 不保存 / 取消」。
+      // 手机左滑/浏览器后退通常会先撞到面板压的 sentinel，这里是第二道保险。
+      if (next !== 'filter' && tabRef.current === 'filter') {
+        const guard = filterGuardRef.current
+        if (guard && guard.dirty) {
+          window.history.replaceState(null, '', '#/filter')
+          setLeaveRequest((cur) => cur || { target: next, source: 'hash' })
+          return
+        }
+      }
       // 后退/前进也算主动切页：作废在飞的日志跳转，迟到的响应不得再改页。
       logJumpSeqRef.current++
       // 系统页每次进入都重新等两个面板，不能拿上一次的 ready 集合提前收口。
@@ -5641,8 +5786,9 @@ function App () {
   // 切页回到顶部（v3.306）：手机从概览滚到底部再点「推送记录」，此前会停在
   // 新页面的中段/底部（window.scrollY 被保留），看起来像页面缺了开头。
   // v3.307 同步写 hash：刷新/后退能回到同一页。
-  const switchTab = (next) => {
-    if (next === tab) return
+  // 真正切页：调用方已经确认没有需要拦截的过滤页草稿。
+  const doSwitchTab = (next) => {
+    if (next === tabRef.current) return
     // 任何主动切页都作废在飞的日志跳转：即使只切走再切回概览（tabRef 仍是 from），
     // 迟到的响应也不得把用户再拽去日志页。
     logJumpSeqRef.current++
@@ -5655,6 +5801,39 @@ function App () {
     setTab(next)
     tabRef.current = next
     if (window.location.hash !== `#/${next}`) window.location.hash = `#/${next}`
+  }
+  // 切页前先问过滤页：有未保存草稿就不要静默丢掉。
+  const switchTab = (next) => {
+    if (next === tab) return
+    if (next !== 'filter' && tabRef.current === 'filter') {
+      const guard = filterGuardRef.current
+      if (guard && guard.dirty) {
+        setLeaveRequest({ target: next, source: 'tab' })
+        return
+      }
+    }
+    doSwitchTab(next)
+  }
+  // 离开拦截三选一。history 来源不能直接切页：用户是在后退，放弃后要让浏览器继续走完。
+  const closeLeaveRequest = (mode) => {
+    const req = leaveRequest
+    if (!req) return
+    const guard = filterGuardRef.current
+    if (mode === 'save') {
+      setLeaveRequest(null)
+      if (guard && typeof guard.restoreHistory === 'function') guard.restoreHistory()
+      if (guard && typeof guard.save === 'function') guard.save()
+      return
+    }
+    if (mode === 'discard') {
+      setLeaveRequest(null)
+      if (guard && typeof guard.discard === 'function') guard.discard()
+      if (req.source === 'history') window.history.back()
+      else if (req.target) doSwitchTab(req.target)
+      return
+    }
+    setLeaveRequest(null)
+    if (guard && typeof guard.restoreHistory === 'function') guard.restoreHistory()
   }
   // 「查看日志」跳转（v3.318）：先在原页取日志快照，取到再切页。重挂载的 LogsPanel
   // 直接拿这份快照当首帧，不再先 paint 一个 90px 空壳（否则下面的「触发历史」会
@@ -5786,7 +5965,8 @@ function App () {
       <${ConfigPanel} active=${tab === 'config'} onSync=${syncFor.config} pollTick=${pollTick} />
     </section>`}
     ${!authExpired && visited.has('filter') && html`<section class="page" hidden=${tab !== 'filter'}>
-      <${FilterRulesPanel} onSync=${syncFor.filter} active=${tab === 'filter'} pollTick=${pollTick} />
+      <${FilterRulesPanel} onSync=${syncFor.filter} active=${tab === 'filter'} pollTick=${pollTick}
+        guardRef=${filterGuardRef} onLeaveRequest=${requestFilterLeave} />
     </section>`}
     ${!authExpired && visited.has('sys') && html`<section class="page" hidden=${tab !== 'sys'}>
       <div>
@@ -5799,6 +5979,12 @@ function App () {
       ⚠️ 「正式运行一轮」会真实推送，触发前二次确认 · 试运行只抓取不推送 · 同一时刻只能有一个触发任务
     </footer>
     ${!authExpired && html`<${BackToTop} />`}
+    ${leaveRequest && html`<${LeaveGuardDialog} open=${true}
+      count=${filterGuardRef.current && filterGuardRef.current.count ? filterGuardRef.current.count : 1}
+      busy=${!!(filterGuardRef.current && filterGuardRef.current.busy)}
+      onCancel=${() => closeLeaveRequest('cancel')}
+      onSave=${() => closeLeaveRequest('save')}
+      onDiscard=${() => closeLeaveRequest('discard')} />`}
   </div>`
 }
 

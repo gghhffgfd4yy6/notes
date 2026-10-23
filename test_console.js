@@ -4904,7 +4904,7 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     assert.ok(!/window\.scrollTo\(0, 0\) \}, \[tab/.test(src), '切页不得无条件强制回顶（长页深处会被整页拽回顶部）')
     const scrollBlock = src.slice(src.indexOf('const scrollMemRef = useRef({})'), src.indexOf('// 标签栏是单行横滚'))
-    const switchBlock = src.slice(src.indexOf('const switchTab = '), src.indexOf('const openLog = useCallback'))
+    const switchBlock = src.slice(src.indexOf('const doSwitchTab = '), src.indexOf('const openLog = useCallback'))
     assert.ok(scrollBlock.includes('scrollMemRef.current[from] = y'),
       '切页前必须记住出发页的滚动位置')
     assert.ok(scrollBlock.includes("const target = forceTop ? 0 : (typeof mem === 'number' ? mem : y)"),
@@ -4952,7 +4952,7 @@ async function main () {
     const sysBlock = src.slice(src.indexOf('const markSysReady'), src.indexOf('const onSysReady'))
     assert.ok(sysBlock.includes('syncMemRef.current.sys = ts') && sysBlock.includes('setPanelReadyAt(performance.now())'),
       '系统页两个面板都完成时必须缓存 sys 时间并写 ready 标记')
-    const switchSyncBlock = src.slice(src.indexOf('const switchTab ='), src.indexOf('const openLog = useCallback'))
+    const switchSyncBlock = src.slice(src.indexOf('const doSwitchTab ='), src.indexOf('const openLog = useCallback'))
     assert.ok(switchSyncBlock.includes('showSyncFor(next)'), '页签点击必须同步切到目标页缓存时间')
     const hashSyncBlock = src.slice(src.indexOf('const onHash ='), src.indexOf("window.addEventListener('hashchange'"))
     assert.ok(hashSyncBlock.includes('showSyncFor(next)'), '后退/前进必须同步切到目标页缓存时间')
@@ -6145,6 +6145,22 @@ async function main () {
     assert.ok(/<\$\{ConsoleSettingsBlock\} settings=\$\{settings\}/.test(sysBlk), '系统页必须渲染设置块并下传读面')
   })
 
+  await aok('结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes('function LeaveGuardDialog'), '必须有“取消/不保存/去保存”三选一弹窗')
+    assert.ok(src.includes("window.addEventListener('beforeunload'"), '刷新/关页必须走 beforeunload')
+    assert.ok(src.includes("window.addEventListener('popstate'"), '手机左滑/后退必须拦 popstate')
+    assert.ok(src.includes('__xbkFilterGuard'), '脏草稿必须在历史里压 sentinel，否则左滑直接退走')
+    assert.ok(src.includes("source: 'tab'") && src.includes("source: 'hash'") && src.includes("source: 'history'"),
+      '切页、hash 变化、浏览器后退三种来源都要能回到同一个拦截弹窗')
+    assert.ok(src.includes('onLeaveRequestRef.current'), 'popstate 回调必须用 ref 读最新值，不能被旧闭包吃掉')
+    assert.ok(src.includes('guardRef'), 'App 必须拿到过滤页的脏状态/保存/放弃动作')
+    const app = src.slice(src.indexOf('const switchTab = '), src.indexOf('const openLog = useCallback'))
+    assert.ok(/guard && guard\.dirty/.test(app), '切页前必须检查过滤页脏状态')
+    assert.ok(src.includes('放弃草稿并回滚'), '回滚会覆盖草稿时必须把按钮文案说清楚')
+    assert.ok(src.includes('复制代码默认会把这些修改覆盖掉'), '复制默认会覆盖草稿时必须先确认')
+  })
+
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
@@ -6179,7 +6195,7 @@ async function main () {
     // ⑥ 过滤规则：有未保存改动时不注册，且请求在飞期间变脏要丢弃响应。
     const filter = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('\nfunction ', src.indexOf('function FilterRulesPanel') + 10))
     assert.ok(filter.includes('usePullRefresh(active && dirtyFields.length === 0, load)'), '过滤规则页有未保存改动时不得刷新')
-    assert.ok(filter.includes('dirtyRef.current = dirtyFields.length > 0'), 'dirtyRef 必须随草稿状态更新')
+    assert.ok(filter.includes('dirtyRef.current = dirtyFields.length > 0') || filter.includes('dirtyRef.current = dirty'), 'dirtyRef 必须随草稿状态更新')
     assert.ok(filter.includes('if (dirtyRef.current) return'), '响应回来时草稿已变脏必须丢弃，不能覆盖用户改动')
     // ⑦ 指示条要等所有 loader 落定；排队/在飞的请求不能被提前结算。
     assert.ok(src.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'), 'SysPanel.refresh 必须交出三个 loader 的 promise（v3.342 设置块搬到系统页）')
