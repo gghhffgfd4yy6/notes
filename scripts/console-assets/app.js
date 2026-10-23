@@ -4275,6 +4275,56 @@ const FILTER_GROUPS = [
 
 const FILTER_FIELD_NAMES = FILTER_GROUPS.reduce((acc, g) => acc.concat(g.fields.map((f) => f.name)), [])
 
+// 过滤规则草稿：改了但没保存的内容先落在浏览器本地，关标签/杀后台/浏览器退出后
+// 下次打开还能捡回来。只存规则字段，不存 token；同一浏览器只保留最近一份。
+const FILTER_DRAFT_KEY = 'xbk_filter_draft_v1'
+const FILTER_DRAFT_SCHEMA = 1
+const FILTER_DRAFT_SAVE_DELAY = 500
+const FILTER_DRAFT_MAX_AGE = 7 * 24 * 60 * 60 * 1000
+
+function readFilterDraft () {
+  try {
+    const raw = window.localStorage.getItem(FILTER_DRAFT_KEY)
+    if (!raw) return null
+    const obj = JSON.parse(raw)
+    if (!obj || obj.schema !== FILTER_DRAFT_SCHEMA || !obj.filter || typeof obj.filter !== 'object' || !Number.isFinite(obj.savedAt)) {
+      clearFilterDraft()
+      return null
+    }
+    if (Date.now() - obj.savedAt > FILTER_DRAFT_MAX_AGE) {
+      clearFilterDraft()
+      return null
+    }
+    return obj
+  } catch (e) {
+    return null
+  }
+}
+
+function writeFilterDraft (filter, baseRevision) {
+  try {
+    window.localStorage.setItem(FILTER_DRAFT_KEY, JSON.stringify({
+      schema: FILTER_DRAFT_SCHEMA,
+      filter,
+      baseRevision: Number.isSafeInteger(baseRevision) ? baseRevision : null,
+      savedAt: Date.now()
+    }))
+  } catch (e) { /* 隐私模式/配额满：不影响编辑，只是这次无法恢复 */ }
+}
+
+function clearFilterDraft () {
+  try { window.localStorage.removeItem(FILTER_DRAFT_KEY) } catch (e) { /* 忽略 */ }
+}
+
+function filterDraftAgeText (savedAt) {
+  const minutes = Math.max(0, Math.floor((Date.now() - Number(savedAt)) / 60000))
+  if (minutes < 1) return '刚刚'
+  if (minutes < 60) return `${minutes} 分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时前`
+  return `${Math.floor(hours / 24)} 天前`
+}
+
 // 全命中判定与服务端 wideMatchFields 同口径：trim 后等于 .* 或 ^.*$。
 const FILTER_WIDE_PATTERNS = ['.*', '^.*$']
 
@@ -4380,6 +4430,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const [notice, setNotice] = useState(null)
   const [preview, setPreview] = useState(null)
   const [dialog, setDialog] = useState(null)
+  const [draftSavedAt, setDraftSavedAt] = useState(0)
   // 竞态/卸载守卫：只应用最新一次 load 的响应；旧响应不能刷新时间戳或覆盖草稿。
   const loadSeqRef = useRef(0)
   const mountedRef = useRef(true)
@@ -4392,11 +4443,33 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     const revision = d && Number.isSafeInteger(d.revision) ? d.revision : 0
     const next = filterDraftFrom(d)
     const list = backupRevisionsOf(files, revision)
+    const saved = readFilterDraft()
+    let restored = null
+    let restoreNotice = null
+    if (saved) {
+      const savedDraft = filterDraftFrom({ filter: saved.filter })
+      const changed = FILTER_FIELD_NAMES.filter((n) => String(savedDraft[n]) !== String(next[n]))
+      if (changed.length > 0) {
+        restored = savedDraft
+        const baseRev = Number.isSafeInteger(saved.baseRevision) ? saved.baseRevision : null
+        restoreNotice = {
+          tone: 'warn',
+          text: `已恢复上次未保存的草稿（${filterDraftAgeText(saved.savedAt)}，${changed.length} 个字段）${baseRev !== null && baseRev !== revision ? `；草稿基于 r${baseRev}，当前 r${revision}` : ''}。保存后才会生效。`
+        }
+        setDraftSavedAt(saved.savedAt)
+      } else {
+        clearFilterDraft()
+        setDraftSavedAt(0)
+      }
+    } else {
+      setDraftSavedAt(0)
+    }
     setData(d)
-    setDraft(next)
+    setDraft(restored || next)
     setBase(next)
     setPreview(null)
     setFieldErrors({})
+    if (restoreNotice) setNotice(restoreNotice)
     setBackups(list)
     setBackupListKnown(!!(files && Array.isArray(files.files)))
     setRestoreTo(list.length > 0 ? String(list[0]) : 'default')
@@ -4404,6 +4477,19 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
 
   // 渲染期同步的「有未保存改动」标记：load 的回调闭包里读它，避免拿到旧值。
   const dirtyRef = useRef(false)
+  // 自动草稿：ref 里永远是最新值，pagehide/visibilitychange 来不及等 React 重渲染也能写。
+  const draftRef = useRef(null)
+  const baseRef = useRef(null)
+  const dataRef = useRef(null)
+  draftRef.current = draft
+  baseRef.current = base
+  dataRef.current = data
+  const saveDraftNow = useCallback(() => {
+    if (!draftRef.current || !baseRef.current) return
+    const d = dataRef.current
+    writeFilterDraft(draftRef.current, d && Number.isSafeInteger(d.revision) ? d.revision : null)
+    setDraftSavedAt(Date.now())
+  }, [])
   // 离开拦截：allowLeaveRef 表示用户已经明确「不保存」，此时 beforeunload/popstate 都放行。
   // guardPushedRef 防止每次输入都往历史里再压一条 sentinel。
   const allowLeaveRef = useRef(false)
@@ -4453,17 +4539,49 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   // 所以有未保存改动时自动刷新不会覆盖草稿（下拉刷新之外的第二道保险）。
   usePollReload(active, pollTick, load)
 
-  // 刷新/关页：浏览器原生提示。自定义弹窗在 beforeunload 里出不来，文案由浏览器决定。
+  // 自动草稿：改完 500ms 就写 localStorage，不等 5 分钟——等 5 分钟再存的话，
+  // 改完立刻杀后台会丢掉最后 5 分钟的修改。draft 为空时不能清，否则会把上次
+  // 尚未恢复的草稿在首帧抹掉。
+  useEffect(() => {
+    if (!draft || !base) return undefined
+    if (!dirty) {
+      clearFilterDraft()
+      setDraftSavedAt(0)
+      return undefined
+    }
+    const t = window.setTimeout(saveDraftNow, FILTER_DRAFT_SAVE_DELAY)
+    return () => window.clearTimeout(t)
+  }, [dirty, draft, base, data, saveDraftNow])
+
+  // 切后台/关标签/刷新：立刻补一发，不能等 500ms 定时器。
+  useEffect(() => {
+    if (!dirty) return undefined
+    const flush = () => {
+      if (allowLeaveRef.current) return
+      saveDraftNow()
+    }
+    const onVis = () => { if (document.visibilityState === 'hidden') flush() }
+    window.addEventListener('pagehide', flush)
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      window.removeEventListener('pagehide', flush)
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [dirty, saveDraftNow])
+
+  // 刷新/关页：先把最新草稿写进 localStorage，再让浏览器弹原生提示。
+  // 自定义弹窗在 beforeunload 里出不来，文案由浏览器决定。
   useEffect(() => {
     if (!dirty) return undefined
     const onBeforeUnload = (e) => {
       if (allowLeaveRef.current) return
+      saveDraftNow()
       e.preventDefault()
       e.returnValue = ''
     }
     window.addEventListener('beforeunload', onBeforeUnload)
     return () => window.removeEventListener('beforeunload', onBeforeUnload)
-  }, [dirty])
+  }, [dirty, saveDraftNow])
 
   // 手机左滑/浏览器后退：脏草稿时在历史里压一条同地址 sentinel。第一次后退会退到
   // 这条 sentinel（同页、不卸载），popstate 里再问「保存 / 不保存 / 取消」。取消时
@@ -4499,6 +4617,8 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const applySaved = useCallback((filter, revision, copy) => {
     const rev = Number.isSafeInteger(revision) ? revision : null
     const next = filterDraftFrom({ filter })
+    clearFilterDraft()
+    setDraftSavedAt(0)
     setData((cur) => (cur
       ? { ...cur, revision: rev === null ? cur.revision : rev, source: 'override', filter: { ...filter }, wideMatch: wideFieldsOf(filter) }
       : cur))
@@ -4705,6 +4825,8 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     allowLeaveRef.current = true
     guardPushedRef.current = false
     dirtyRef.current = false
+    clearFilterDraft()
+    setDraftSavedAt(0)
     if (guardRef && guardRef.current) {
       guardRef.current.dirty = false
       guardRef.current.count = 0
@@ -4747,6 +4869,8 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       const revText = Number.isSafeInteger(payload.revision) ? ` r${payload.revision}` : ''
       setDialog(null)
       setFieldErrors({})
+      clearFilterDraft()
+      setDraftSavedAt(0)
       setNotice({
         tone: 'ok',
         text: to === 'default'
@@ -4769,6 +4893,23 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       setDialog({ kind: 'reload' })
       return
     }
+    clearFilterDraft()
+    setDraftSavedAt(0)
+    load().catch(() => {})
+  }
+
+  // 用户确认「放弃并重新加载」：先清本地草稿、把 dirtyRef 放行，再让 load 真正应用响应。
+  const reloadNow = () => {
+    if (busy) return
+    clearFilterDraft()
+    setDraftSavedAt(0)
+    dirtyRef.current = false
+    allowLeaveRef.current = true
+    if (base) setDraft({ ...base })
+    setFieldErrors({})
+    setPreview(null)
+    setDialog(null)
+    setNotice(null)
     load().catch(() => {})
   }
 
@@ -4834,7 +4975,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       return html`<${ConfirmDialog} open=${true} title="放弃未保存的修改？"
         confirmLabel="放弃并重新加载" busy=${false}
         onCancel=${closeDialog}
-        onConfirm=${() => { setDialog(null); load().catch(() => {}) }}>
+        onConfirm=${() => { setDialog(null); reloadNow() }}>
         <div class="fr-dialog-line">当前有 ${dirtyFields.length} 个字段尚未保存，重新加载会丢弃这些修改。</div>
       <//>`
     }
@@ -4882,6 +5023,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
           : html`<span class="fr-status-v">r${appliedRev}${appliedAt ? ` · ${appliedAt}` : ''}</span>`}</span>
         ${pendingNext && html`<span class="fr-status-item"><${Badge} tone="warn">r${revision} 待下一轮<//></span>`}
         ${dirtyFields.length > 0 && html`<span class="fr-status-item"><${Badge} tone="warn">有未保存修改<//></span>`}
+        ${dirty && draftSavedAt > 0 && html`<span class="fr-status-item"><span class="fr-status-muted">草稿已自动保存 · ${fmtLocalTime(draftSavedAt).slice(11)}</span></span>`}
         ${slowLoading && html`<span class="fr-status-muted">刷新中…</span>`}
       </div>
 
@@ -5814,6 +5956,19 @@ function App () {
     }
     doSwitchTab(next)
   }
+  // history 来源的「不保存并离开」：后退一次可能只退到另一条同地址过滤记录
+  // （取消时 restoreHistory 会再压 sentinel），继续退到真正离开过滤页为止；最多 5 步。
+  const leaveHistory = () => {
+    let tries = 0
+    const step = () => {
+      if (tries++ >= 5) return
+      window.history.back()
+      window.setTimeout(() => {
+        if (resolveTab(window.location.hash) === 'filter') step()
+      }, 220)
+    }
+    step()
+  }
   // 离开拦截三选一。history 来源不能直接切页：用户是在后退，放弃后要让浏览器继续走完。
   const closeLeaveRequest = (mode) => {
     const req = leaveRequest
@@ -5828,7 +5983,7 @@ function App () {
     if (mode === 'discard') {
       setLeaveRequest(null)
       if (guard && typeof guard.discard === 'function') guard.discard()
-      if (req.source === 'history') window.history.back()
+      if (req.source === 'history') leaveHistory()
       else if (req.target) doSwitchTab(req.target)
       return
     }

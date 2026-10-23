@@ -5339,7 +5339,8 @@ async function main () {
       assert.ok(block.includes('--shadow-card'), `主题 ${key} 必须定义 --shadow-card`)
     }
     assert.ok(/:root \{[^}]*--shadow-card/.test(css), '默认（深夜）也要有 --shadow-card')
-    assert.ok(!/localStorage\.(get|set)Item/.test(js), '不得用 localStorage 记主题（CSP 禁内联脚本，首帧会闪）')
+    const themeBlock = js.slice(js.indexOf('const THEMES = ['), js.indexOf('function App ()'))
+    assert.ok(!/localStorage\.(get|set)Item/.test(themeBlock), '不得用 localStorage 记主题（CSP 禁内联脚本，首帧会闪）')
     // 变异沙箱里 console.js 会被插桩成 stryMutAct_… ? … : ['deep', …]，文本断言必假红；
     // 改断言运行时导出值，比文本更硬（键名/顺序/数量全覆盖）。
     assert.deepStrictEqual([...require('./scripts/console.js').THEMES], ['deep', 'material', 'nord', 'light'], '服务端必须有主题白名单')
@@ -6143,6 +6144,19 @@ async function main () {
     assert.ok(sysBlk.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
       '系统页刷新必须等三条都落定（下拉指示条不得提前收起）')
     assert.ok(/<\$\{ConsoleSettingsBlock\} settings=\$\{settings\}/.test(sysBlk), '系统页必须渲染设置块并下传读面')
+  })
+
+  await aok('结构红线: 过滤草稿自动保存/恢复（关标签/杀后台也能捡回来）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    assert.ok(src.includes("const FILTER_DRAFT_KEY = 'xbk_filter_draft_v1'"), '必须在 localStorage 存一份过滤草稿')
+    assert.ok(src.includes('FILTER_DRAFT_SAVE_DELAY = 500'), '草稿不能等 5 分钟才存，否则杀后台会丢最后几分钟')
+    assert.ok(src.includes('localStorage.setItem(FILTER_DRAFT_KEY'), '草稿写入必须用 localStorage（sessionStorage 关标签就没）')
+    assert.ok(src.includes('localStorage.removeItem(FILTER_DRAFT_KEY)'), '保存/放弃/回滚后必须清草稿')
+    assert.ok(src.includes("window.addEventListener('pagehide'"), '关标签/切走时必须立刻补存')
+    assert.ok(src.includes("document.addEventListener('visibilitychange'"), '切到后台时必须立刻补存')
+    assert.ok(src.includes('已恢复上次未保存的草稿'), '下次打开过滤页必须自动恢复草稿并提示')
+    assert.ok(src.includes('草稿已自动保存'), '页面必须让用户看到草稿已经存了')
+    assert.ok(src.includes('reloadNow'), '确认放弃并重新加载时必须先清草稿，否则会恢复回来')
   })
 
   await aok('结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）', () => {
