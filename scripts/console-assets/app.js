@@ -4753,6 +4753,13 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const applySaved = useCallback((filter, revision, copy) => {
     const rev = Number.isSafeInteger(revision) ? revision : null
     const next = filterDraftFrom({ filter })
+    // 同步把脏标记放掉：保存成功后的 doSwitchTab 可能在 React 重渲染前就触发
+    // hashchange，不能让旧的 guard.dirty 再挂出一个离开拦截。
+    dirtyRef.current = false
+    if (guardRef && guardRef.current) {
+      guardRef.current.dirty = false
+      guardRef.current.count = 0
+    }
     clearFilterDraft()
     setDraftSavedAt(0)
     clearServerDraft()
@@ -5403,8 +5410,12 @@ function App () {
   // 过滤页草稿守卫：脏状态、保存、放弃由面板写进这个 ref，App 只在切页/后退前问一句。
   // 不用 state 是因为每敲一个字都 dirty，App 不需要跟着重渲染。
   const [leaveRequest, setLeaveRequest] = useState(null)
+  // 「保存并继续」正在落盘：期间忽略新的切页/后退请求，避免保存成功后又被
+  // 第二次点击挂出一个旧拦截弹窗（手机上会出现「目标页 + 弹窗」的错位）。
+  const leaveSavingRef = useRef(false)
   const filterGuardRef = useRef(null)
   const requestFilterLeave = useCallback((req) => {
+    if (leaveSavingRef.current) return
     setLeaveRequest((cur) => cur || req)
   }, [])
   // 页签保活：第一次进入才挂载，之后切走只加 hidden、不卸载。切回已看过的页签时
@@ -5931,6 +5942,11 @@ function App () {
     const prevRestoration = window.history.scrollRestoration
     if ('scrollRestoration' in window.history) window.history.scrollRestoration = 'manual'
     const onHash = () => {
+      // 保存并继续落盘期间：锁住页面，别在保存完成前因为第二次点击/后退切走。
+      if (leaveSavingRef.current) {
+        if (window.location.hash !== '#/filter') window.history.replaceState(null, '', '#/filter')
+        return
+      }
       const next = resolveTab(window.location.hash)
       if (next === tabRef.current) return
       // 过滤页有未保存草稿：先把地址改回去，再问「保存 / 不保存 / 取消」。
@@ -6127,6 +6143,7 @@ function App () {
   }
   // 切页前先问过滤页：有未保存草稿就不要静默丢掉。
   const switchTab = (next) => {
+    if (leaveSavingRef.current) return
     if (next === tab) return
     if (next !== 'filter' && tabRef.current === 'filter') {
       const guard = filterGuardRef.current
@@ -6157,12 +6174,17 @@ function App () {
     const guard = filterGuardRef.current
     if (mode === 'save') {
       setLeaveRequest(null)
+      leaveSavingRef.current = true
       let saved = false
       try {
         saved = guard && typeof guard.save === 'function' ? await guard.save() : false
       } catch (e) {
         saved = false
+      } finally {
+        leaveSavingRef.current = false
       }
+      // 保存期间用户可能又点过页签；成功/失败都先清掉可能挂出的第二次拦截。
+      setLeaveRequest(null)
       // 用户在保存确认里取消，或校验/保存失败：留在过滤页，草稿还在。
       // history 来源的 sentinel 已被这次后退消费掉，取消时要补压一条，下一次左滑仍能拦。
       if (!saved) {
@@ -6172,6 +6194,7 @@ function App () {
       // 只有真正保存成功，才继续点「概览」/后退之前的离开动作。
       if (req.source === 'history') leaveHistory()
       else if (req.target) doSwitchTab(req.target)
+      setLeaveRequest(null)
       return
     }
     if (mode === 'discard') {
