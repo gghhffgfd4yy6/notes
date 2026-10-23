@@ -475,6 +475,39 @@ function apiPostFilterPreview (body) {
   return consumeJsonResult(fetch('/api/config/filter/preview', merged), done)
 }
 
+// 数据备份：导出返回 blob（直接下载），导入返回 {ok, imported, backupDir}。
+function apiPostBackupExport (categories) {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify({ categories })
+  })
+  return fetch('/api/backup/export', merged).then(async (res) => {
+    const blob = await res.blob()
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`
+      try {
+        const data = JSON.parse(await blob.text())
+        if (data && data.error) message = data.error
+      } catch (e) { /* 非 JSON 错误体 */ }
+      throw new Error(message)
+    }
+    done()
+    const skippedHeader = res.headers && typeof res.headers.get === 'function' ? res.headers.get('X-Backup-Skipped') : ''
+    const skipped = skippedHeader ? skippedHeader.split(',') : []
+    return { blob, skipped }
+  }).catch((e) => { done(); throw e })
+}
+
+function apiPostBackupImport (bundle) {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify(bundle)
+  })
+  return consumeJsonResult(fetch('/api/backup/import', merged), done)
+}
+
 function apiPostFilterRestore (body) {
   const { merged, done } = timedRequest({
     method: 'POST',
@@ -4001,6 +4034,150 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
 }
 
 // 系统信息：版本 / 运行环境 / 进程 / 缓存目录。只读；下面另挂「设置」块（可写）。
+// 数据备份：导出时勾选类别；导入时不勾，文件里有什么就恢复什么。
+const BACKUP_CATEGORY_OPTIONS = [
+  { key: 'messages', label: '推送记录', desc: '历史消息（会覆盖当前推送记录）' },
+  { key: 'filter', label: '过滤规则', desc: '覆盖文件与过滤设置' },
+  { key: 'settings', label: '控制台设置', desc: '拦截窗、顶栏时间显示' },
+  { key: 'auto', label: '自动运行间隔', desc: '只恢复间隔，不会打开自动运行' },
+  { key: 'runLog', label: '运行日志', desc: 'run.log 运行记录' }
+]
+
+function backupFileSummary (data) {
+  const parts = []
+  if (data && data.messages) {
+    const n = Number.isInteger(data.messages.count) ? data.messages.count : null
+    parts.push(`推送记录${n === null ? '' : ` ${n} 条`}`)
+  }
+  if (data && data.filter) parts.push('过滤规则')
+  if (data && data.settings) parts.push('控制台设置')
+  if (data && data.auto) parts.push(`自动运行间隔 ${data.auto.interval} 秒`)
+  if (data && data.runLog) parts.push(`运行日志约 ${fmtBytes((data.runLog.text || '').length)}`)
+  return parts
+}
+
+function BackupBlock ({ onImported }) {
+  const [selected, setSelected] = useState(() => {
+    const out = {}
+    for (const item of BACKUP_CATEGORY_OPTIONS) out[item.key] = true
+    return out
+  })
+  const [busy, setBusy] = useState('')
+  const [err, setErr] = useState('')
+  const [note, setNote] = useState('')
+  const [pending, setPending] = useState(null)
+  const fileRef = useRef(null)
+  const allSelected = BACKUP_CATEGORY_OPTIONS.every((item) => selected[item.key])
+  const toggleAll = () => {
+    const next = {}
+    for (const item of BACKUP_CATEGORY_OPTIONS) next[item.key] = !allSelected
+    setSelected(next)
+  }
+  const toggleOne = (key) => {
+    setSelected((prev) => ({ ...prev, [key]: !prev[key] }))
+  }
+  const doExport = async () => {
+    if (busy !== '') return
+    const categories = BACKUP_CATEGORY_OPTIONS.filter((item) => selected[item.key]).map((item) => item.key)
+    if (categories.length === 0) { setErr('至少勾选一项再导出'); return }
+    setBusy('export'); setErr(''); setNote('')
+    let url = ''
+    try {
+      const res = await apiPostBackupExport(categories)
+      const blob = res && res.blob ? res.blob : res
+      url = URL.createObjectURL(blob)
+      const d = new Date()
+      const pad = (n) => String(n).padStart(2, '0')
+      const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `xbk-backup-${stamp}.json`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      const skipped = res && res.skipped ? res.skipped : []
+      setNote(`已导出${categories.length}类数据${skipped.length > 0 ? `；另有 ${skipped.length} 类当前没有可导出的内容` : ''}`)
+    } catch (e) {
+      setErr(`导出失败：${e && e.message ? e.message : e}`)
+    } finally {
+      if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, 60000)
+      setBusy('')
+    }
+  }
+  const chooseFile = () => {
+    if (busy === '') fileRef.current && fileRef.current.click()
+  }
+  const onFile = async (e) => {
+    const file = e.target.files && e.target.files[0]
+    e.target.value = '' // 允许重复选同一个文件
+    if (!file) return
+    setErr(''); setNote('')
+    if (file.size > 128 * 1024 * 1024) { setErr('备份文件太大'); return }
+    try {
+      const text = await file.text()
+      const data = JSON.parse(text)
+      if (!data || data.kind !== 'xbk-console-backup' || data.schema !== 1 || !data.data || typeof data.data !== 'object') {
+        throw new Error('这不是控制台备份文件')
+      }
+      const parts = backupFileSummary(data.data)
+      if (parts.length === 0) throw new Error('备份文件里没有可恢复的数据')
+      setPending({ bundle: data, summary: parts })
+    } catch (e) {
+      setErr(`读取备份失败：${e && e.message ? e.message : e}`)
+    }
+  }
+  const doImport = async () => {
+    if (!pending || busy !== '') return
+    setBusy('import'); setErr('')
+    try {
+      const res = await apiPostBackupImport(pending.bundle)
+      setPending(null)
+      const result = res && res.data ? res.data : (res || {})
+      const imported = result.imported ? result.imported : {}
+      const bits = []
+      if (Number.isInteger(imported.messages)) bits.push(`推送记录 ${imported.messages} 条`)
+      if (imported.filter) bits.push('过滤规则')
+      if (imported.settings) bits.push('控制台设置')
+      if (Number.isInteger(imported.autoInterval)) bits.push(`自动运行间隔 ${imported.autoInterval} 秒`)
+      if (Number.isInteger(imported.runLogBytes)) bits.push('运行日志')
+      setNote(`导入完成${bits.length > 0 ? `：${bits.join('、')}` : ''}${result.backupDir ? `。当前数据已先备份到 ${result.backupDir}` : ''}`)
+      if (typeof onImported === 'function') Promise.resolve(onImported()).catch(() => {})
+    } catch (e) {
+      setErr(`导入失败：${e && e.message ? e.message : e}`)
+    } finally {
+      setBusy('')
+    }
+  }
+  return html`<div class="cfg-block backup-block">
+    <div class="cfg-block-head">
+      <span class="cfg-block-title">数据备份</span>
+      <span class="cfg-block-sub">导出时勾选；导入自动识别文件内容</span>
+    </div>
+    <div class="backup-all">
+      <label class="backup-check"><input type="checkbox" checked=${allSelected} onChange=${toggleAll} /> 全选</label>
+      <span class="cfg-block-sub">自动运行只备份间隔，不会把开关打开</span>
+    </div>
+    <div class="backup-list">
+      ${BACKUP_CATEGORY_OPTIONS.map((item) => html`<label class="backup-item" key=${item.key}>
+        <input type="checkbox" checked=${selected[item.key] === true} onChange=${() => toggleOne(item.key)} />
+        <span class="backup-item-main">${item.label}</span>
+        <span class="cfg-block-sub">${item.desc}</span>
+      </label>`)}
+    </div>
+    <div class="backup-actions">
+      <${Button} variant="secondary" disabled=${busy !== '' || BACKUP_CATEGORY_OPTIONS.every((item) => !selected[item.key])} onClick=${doExport}>${busy === 'export' ? '导出中…' : '导出选中'}<//>
+      <${Button} variant="ghost" disabled=${busy !== ''} onClick=${chooseFile}>${busy === 'import' ? '导入中…' : '导入备份'}<//>
+      <input class="backup-file" ref=${fileRef} type="file" accept=".json,application/json" onChange=${onFile} />
+    </div>
+    ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${note && html`<${Hint}>${note}<//>`}
+    <${ConfirmDialog} open=${!!pending} title="确认导入备份" confirmLabel=${busy === 'import' ? '导入中…' : '确认导入'} busy=${busy === 'import'} onCancel=${() => { if (busy !== 'import') setPending(null) }} onConfirm=${doImport}>
+      <div>文件里检测到：${pending ? pending.summary.join('、') : ''}</div>
+      <div class="modal-note">导入会覆盖当前对应的数据；导入前会先把当前数据另存一份。自动运行开关不会被打开，仍保持导入前的状态。</div>
+    <//>
+  </div>`
+}
+
 function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFresh, onSettings }) {
   // 访问日志（v3.300 §3.3）：第二个 loader 并列拉取；「刷新」按钮同日 load 两个。
   // 近窗未授权尝试数 = 服务端独立 401 计数（进程启动以来、不随环形窗截断）。
@@ -4126,6 +4303,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
     </div>
     <div class="set-title">设置<span class="cfg-block-sub">改动立即生效 · 落盘 console-settings.json</span></div>
     <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} />
+    <${BackupBlock} onImported=${refreshAll} />
     <${Hint} style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。<//>
     ${accessErr && html`<${Hint} tone="error">访问日志加载失败：${accessErr.message || accessErr}<//>`}
     <details class="access-log">

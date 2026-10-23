@@ -1586,8 +1586,122 @@ async function filterRuleApiTests () {
   })
 }
 
+async function backupApiTests () {
+  await aok('数据备份: 导出只含勾选类别，自动运行只写间隔不写开关', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'a' }, { id: 2, title: 'b' }]))
+    fs.writeFileSync(path.join(dir, 'filter-rules.json'), JSON.stringify({ schema: 1, revision: 2, filter: { pingbifenlei: 'old' } }))
+    fs.writeFileSync(path.join(dir, 'run.log'), 'old log\n')
+    fs.writeFileSync(path.join(dir, 'console-settings.json'), JSON.stringify({ revision: 2, updatedAt: Date.now(), notifyTestReplayWindowS: 9, syncShowDate: false }))
+    fs.writeFileSync(path.join(dir, 'console-auto.json'), JSON.stringify({ on: false, interval: 7, updatedAt: Date.now() }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const all = await request(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['messages', 'filter', 'settings', 'auto', 'runLog'] }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(all.status, 200)
+      const bundle = JSON.parse(all.text)
+      assert.strictEqual(bundle.kind, 'xbk-console-backup')
+      assert.strictEqual(bundle.schema, 1)
+      assert.deepStrictEqual(Object.keys(bundle.data).sort(), ['auto', 'filter', 'messages', 'runLog', 'settings'])
+      assert.strictEqual(bundle.data.messages.count, 2)
+      assert.strictEqual(bundle.data.auto.interval, 7)
+      assert.ok(!Object.prototype.hasOwnProperty.call(bundle.data.auto, 'on'), '备份文件不得记录自动运行开关')
+      assert.strictEqual(bundle.data.settings.notifyTestReplayWindowS, 9)
+      assert.ok(bundle.data.filter.text.includes('pingbifenlei'))
+      assert.strictEqual(bundle.data.runLog.text, 'old log\n')
+      const only = await request(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['settings'] }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(only.status, 200)
+      assert.deepStrictEqual(Object.keys(JSON.parse(only.text).data), ['settings'])
+      const bad = await request(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['nope'] }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(bad.status, 400)
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('数据备份: 导入自动识别并恢复，未含类别不动，自动运行开关保持停止', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'old' }]))
+    fs.writeFileSync(path.join(dir, 'filter-rules.json'), JSON.stringify({ schema: 1, revision: 2, filter: { pingbifenlei: 'old' } }))
+    fs.writeFileSync(path.join(dir, 'run.log'), 'old log\n')
+    fs.writeFileSync(path.join(dir, 'console-settings.json'), JSON.stringify({ revision: 2, updatedAt: Date.now(), notifyTestReplayWindowS: 9, syncShowDate: false }))
+    fs.writeFileSync(path.join(dir, 'console-auto.json'), JSON.stringify({ on: false, interval: 7, updatedAt: Date.now() }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const bundle = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: {
+          messages: { count: 1, text: JSON.stringify([{ id: 9, title: 'new' }]) },
+          filter: { text: JSON.stringify({ schema: 1, revision: 8, filter: { pingbifenlei: 'new' } }) },
+          settings: { notifyTestReplayWindowS: 5, syncShowDate: true },
+          auto: { interval: 12 },
+          runLog: { text: 'new log\n' }
+        }
+      }
+      const imp = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(bundle),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(imp.status, 200, imp.text)
+      const result = JSON.parse(imp.text)
+      assert.strictEqual(result.ok, true)
+      assert.strictEqual(result.imported.messages, 1)
+      assert.strictEqual(result.imported.autoInterval, 12)
+      assert.ok(result.backupDir)
+      assert.strictEqual(fs.readFileSync(path.join(dir, 'push.json'), 'utf8'), '[{"id":9,"title":"new"}]')
+      assert.match(fs.readFileSync(path.join(dir, 'filter-rules.json'), 'utf8'), /"pingbifenlei":"new"/)
+      assert.strictEqual(fs.readFileSync(path.join(dir, 'run.log'), 'utf8'), 'new log\n')
+      const autoFile = JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8'))
+      assert.strictEqual(autoFile.interval, 12)
+      assert.strictEqual(autoFile.on, false, '导入不得把自动运行打开')
+      const settingsFile = JSON.parse(fs.readFileSync(path.join(dir, 'console-settings.json'), 'utf8'))
+      assert.strictEqual(settingsFile.notifyTestReplayWindowS, 5)
+      assert.strictEqual(settingsFile.syncShowDate, true)
+      // 只恢复文件里出现的类别：只带推送记录时，过滤规则保持导入后的值。
+      const partial = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: { messages: { count: 1, text: JSON.stringify([{ id: 10 }]) } }
+      }
+      const again = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(partial),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(again.status, 200, again.text)
+      assert.match(fs.readFileSync(path.join(dir, 'filter-rules.json'), 'utf8'), /"pingbifenlei":"new"/)
+      const bad = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify({ kind: 'not-a-backup', schema: 1, data: {} }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(bad.status, 400)
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
 async function main () {
   await filterRuleApiTests()
+  await backupApiTests()
   await aok('HTTP: 无 token / 错 token → 401', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)

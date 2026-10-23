@@ -98,6 +98,13 @@ const TOKEN_MIN_LEN = 16
 // 缓存会被永久判 tooLarge——缓存健康页报「不可读」，但生产侧一切正常。现与写端对齐到 64MiB；
 // 单次解析成本由 status.readMessages 的 (ino,size,mtime) 缓存摊薄（D2-S18），不再每请求整读。
 const MESSAGES_MAX_BYTES = 64 * 1024 * 1024
+// 数据备份：一个 JSON 文件包含用户勾选的类别；导入只恢复文件里实际存在的类别。
+// 自动运行只备份 interval，不备份 on/off——导入永远不会把自动运行打开。
+const BACKUP_KIND = 'xbk-console-backup'
+const BACKUP_SCHEMA = 1
+const BACKUP_MAX_BYTES = 128 * 1024 * 1024
+const BACKUP_RUN_LOG_MAX_BYTES = 16 * 1024 * 1024
+const BACKUP_CATEGORIES = ['messages', 'filter', 'settings', 'auto', 'runLog']
 // cache-health 的条数统计阈值（D2-S12）：这个端点在 HTTP 事件循环上同步整读 + parse，
 // 20MB/29704 条实测 232ms 阻塞。超过阈值就不整读——条数如实报 null + tooLarge（前端显示
 // 「当前条数不可得」），需要精确条数时去推送记录页看 grandTotal。阈值内的文件走
@@ -2730,6 +2737,272 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     sendJson(res, 200, { ok: true })
   }
 
+  // ── 数据备份 / 恢复（v3.354）──────────────────────────────────────────────
+  // 导出：用户勾选类别，打包成一个 JSON；导入：读取文件里实际存在的类别并恢复，
+  // 不再让用户二次勾选。自动运行只写 interval，绝不写 on/off。
+  const readBackupFile = (filePath, maxBytes) => readSafeTextResult(filePath, maxBytes, { openNonBlocking: true })
+  const backupStamp = () => new Date().toISOString().replace(/[:.]/g, '-')
+  const backupPathFor = (dir, name) => path.join(dir, name)
+  const copyForImportBackup = (src, dir, name) => {
+    try {
+      const st = fs.lstatSync(src)
+      if (!st.isFile()) return false
+      fs.copyFileSync(src, backupPathFor(dir, name))
+      return true
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return false
+      throw e
+    }
+  }
+  const handleBackupExport = (req, res) => {
+    readBody(req, 16 * 1024).then(({ body, over, aborted }) => {
+      if (over || aborted) { sendJson(res, over ? 413 : 400, { error: '请求体不完整或超限' }); return }
+      let selected = BACKUP_CATEGORIES.slice()
+      if (body && body.trim() !== '') {
+        let parsed
+        try { parsed = JSON.parse(body) } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
+        if (!parsed || !Array.isArray(parsed.categories)) { sendJson(res, 400, { error: 'categories 必须是数组' }); return }
+        selected = parsed.categories
+      }
+      if (!selected.every((k) => BACKUP_CATEGORIES.includes(k))) {
+        sendJson(res, 400, { error: 'unknown_category' })
+        return
+      }
+      if (selected.length === 0) { sendJson(res, 400, { error: '至少选择一项' }); return }
+      const data = {}
+      const skipped = []
+      if (selected.includes('messages')) {
+        const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES, filename: messagesFile })
+        const raw = read.status === 'ok' ? readBackupFile(path.join(stateDir, messagesFile), MESSAGES_MAX_BYTES) : null
+        if (read.status === 'ok' && raw && raw.status === 'ok') {
+          data.messages = { filename: messagesFile, count: read.value.items.length, text: raw.text }
+        } else {
+          skipped.push({ key: 'messages', reason: read.status === 'ok' ? raw.status : read.status })
+        }
+      }
+      if (selected.includes('filter')) {
+        const paths = FilterStore.filterRulesPaths(stateDir)
+        const read = readBackupFile(paths.file, FILTER_BODY_MAX_BYTES)
+        if (read.status === 'ok') {
+          let parsed
+          try { parsed = JSON.parse(read.text) } catch (e) { parsed = null }
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            data.filter = { text: read.text }
+          } else {
+            skipped.push({ key: 'filter', reason: 'invalid_json' })
+          }
+        } else {
+          skipped.push({ key: 'filter', reason: read.status })
+        }
+      }
+      if (selected.includes('settings')) {
+        data.settings = {
+          notifyTestReplayWindowS: runtimeSettings.notifyTestReplayWindowS,
+          syncShowDate: runtimeSettings.syncShowDate
+        }
+      }
+      if (selected.includes('auto')) {
+        data.auto = { interval: auto.interval }
+      }
+      if (selected.includes('runLog')) {
+        const read = readBackupFile(path.join(historyDir(), 'run.log'), BACKUP_RUN_LOG_MAX_BYTES)
+        if (read.status === 'ok') data.runLog = { text: read.text }
+        else skipped.push({ key: 'runLog', reason: read.status })
+      }
+      const bundle = {
+        kind: BACKUP_KIND,
+        schema: BACKUP_SCHEMA,
+        exportedAt: new Date().toISOString(),
+        appVersion: APP_VERSION,
+        data,
+        skipped
+      }
+      const bodyText = JSON.stringify(bundle)
+      const fileName = `xbk-backup-${backupStamp()}.json`
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${fileName}"`,
+        'X-Backup-Skipped': skipped.map((s) => s.key).join(','),
+        'Cache-Control': 'no-store'
+      })
+      res.end(bodyText)
+    }).catch(() => sendJson(res, 500, { error: '导出失败' }))
+  }
+  const handleBackupImport = (req, res) => {
+    readBody(req, BACKUP_MAX_BYTES).then(({ body, over, aborted }) => {
+      if (over) { sendJson(res, 413, { error: '备份文件太大', code: 'backup_too_large' }); return }
+      if (aborted) { sendJson(res, 400, { error: '备份文件上传不完整', code: 'invalid_body' }); return }
+      let bundle
+      try { bundle = JSON.parse(body) } catch (e) { sendJson(res, 400, { error: '备份文件不是合法 JSON', code: 'invalid_json' }); return }
+      if (!bundle || bundle.kind !== BACKUP_KIND || bundle.schema !== BACKUP_SCHEMA) {
+        sendJson(res, 400, { error: '这不是控制台备份文件', code: 'invalid_backup' })
+        return
+      }
+      const data = bundle.data && typeof bundle.data === 'object' && !Array.isArray(bundle.data) ? bundle.data : null
+      if (!data) { sendJson(res, 400, { error: '备份文件没有数据', code: 'invalid_backup' }); return }
+      const plans = {}
+      const errors = []
+      if (data.messages !== undefined) {
+        const m = data.messages
+        if (!m || typeof m.text !== 'string' || m.text.length > MESSAGES_MAX_BYTES) {
+          errors.push({ field: 'messages', code: 'invalid_messages', message: '推送记录备份格式不正确或过大' })
+        } else {
+          let items
+          try { items = JSON.parse(m.text) } catch (e) { items = null }
+          if (!Array.isArray(items) || !items.every((x) => x && typeof x === 'object' && !Array.isArray(x))) {
+            errors.push({ field: 'messages', code: 'invalid_messages', message: '推送记录必须是对象数组' })
+          } else {
+            plans.messages = { text: m.text, count: items.length }
+          }
+        }
+      }
+      if (data.filter !== undefined) {
+        const f = data.filter
+        if (!f || typeof f.text !== 'string' || f.text.length > FILTER_BODY_MAX_BYTES) {
+          errors.push({ field: 'filter', code: 'invalid_filter', message: '过滤规则备份格式不正确或过大' })
+        } else {
+          let parsed
+          try { parsed = JSON.parse(f.text) } catch (e) { parsed = null }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !parsed.filter || typeof parsed.filter !== 'object') {
+            errors.push({ field: 'filter', code: 'invalid_filter', message: '过滤规则备份格式不正确' })
+          } else {
+            const result = validateCandidate(runtimeFilterDeps(), parsed)
+            if (!result.ok) errors.push({ field: 'filter', code: 'invalid_filter', message: result.errors.map((x) => x.message).join('；') })
+            else plans.filter = { result, previousText: f.text }
+          }
+        }
+      }
+      if (data.settings !== undefined) {
+        const s = data.settings
+        const win = s && s.notifyTestReplayWindowS
+        const date = s && s.syncShowDate
+        if (!s || !Number.isInteger(win) || win < NOTIFY_REPLAY_MIN_S || win > NOTIFY_REPLAY_MAX_S ||
+            typeof date !== 'boolean') {
+          errors.push({ field: 'settings', code: 'invalid_settings', message: '控制台设置备份无效' })
+        } else {
+          plans.settings = { notifyTestReplayWindowS: win, syncShowDate: date }
+        }
+      }
+      if (data.auto !== undefined) {
+        const interval = data.auto && data.auto.interval
+        if (!Number.isInteger(interval) || interval < AUTO_MIN_S || interval > AUTO_MAX_S) {
+          errors.push({ field: 'auto', code: 'invalid_auto', message: '自动运行间隔备份无效' })
+        } else {
+          plans.auto = { interval }
+        }
+      }
+      if (data.runLog !== undefined) {
+        const text = data.runLog && data.runLog.text
+        if (typeof text !== 'string' || text.length > BACKUP_RUN_LOG_MAX_BYTES) {
+          errors.push({ field: 'runLog', code: 'invalid_run_log', message: '运行日志备份无效或过大' })
+        } else {
+          plans.runLog = { text }
+        }
+      }
+      if (Object.keys(plans).length === 0) {
+        sendJson(res, 400, { error: '备份文件里没有可恢复的数据', code: 'empty_backup', errors })
+        return
+      }
+      if (errors.length > 0) {
+        sendJson(res, 400, { error: '备份文件里有数据格式不对，未恢复', code: 'backup_validation_failed', errors })
+        return
+      }
+      const lockToken = crypto.randomBytes(12).toString('hex')
+      if (!acquireLock(stateDir, Date.now(), lockToken)) {
+        res.setHeader('Retry-After', '1')
+        sendJson(res, 409, { error: 'busy', code: 'busy', message: '有任务正在运行，等结束再导入' })
+        return
+      }
+      let filterLock = null
+      const backupDir = path.join(stateDir, 'backup', `pre-import-${backupStamp()}-${crypto.randomBytes(3).toString('hex')}`)
+      try {
+        if (plans.filter) {
+          filterLock = acquireFilterLock(stateDir)
+          if (!filterLock) {
+            res.setHeader('Retry-After', '1')
+            sendJson(res, 409, { error: 'filter_busy', code: 'filter_busy', message: '过滤规则正在保存，稍后再导入' })
+            return
+          }
+        }
+        fs.mkdirSync(backupDir, { recursive: true })
+        try {
+          copyForImportBackup(path.join(stateDir, messagesFile), backupDir, messagesFile)
+          copyForImportBackup(FilterStore.filterRulesPaths(stateDir).file, backupDir, 'filter-rules.json')
+          copyForImportBackup(settingsPath, backupDir, CONSOLE_SETTINGS_FILE)
+          copyForImportBackup(autoPath, backupDir, AUTO_STATE_FILE)
+          copyForImportBackup(path.join(historyDir(), 'run.log'), backupDir, 'run.log')
+        } catch (e) {
+          sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
+          return
+        }
+        const imported = {}
+        if (plans.messages) {
+          if (!writeAtomic(path.join(stateDir, messagesFile), plans.messages.text, '推送记录恢复')) {
+            sendJson(res, 500, { error: 'write_failed', code: 'write_failed', field: 'messages' })
+            return
+          }
+          imported.messages = plans.messages.count
+        }
+        if (plans.filter) {
+          const paths = FilterStore.filterRulesPaths(stateDir)
+          const current = currentFilterRevision()
+          const nextFile = {
+            schema: FilterStore.FILTER_RULES_SCHEMA,
+            revision: current + 1,
+            filter: plans.filter.result.value
+          }
+          if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则恢复')) {
+            sendJson(res, 500, { error: 'write_failed', code: 'write_failed', field: 'filter' })
+            return
+          }
+          clearFilterDraftFile()
+          imported.filter = true
+          imported.filterRevision = nextFile.revision
+        }
+        if (plans.settings) {
+          const next = {
+            revision: runtimeSettings.revision + 1,
+            updatedAt: Date.now(),
+            notifyTestReplayWindowS: plans.settings.notifyTestReplayWindowS,
+            syncShowDate: plans.settings.syncShowDate
+          }
+          if (!writeAtomic(settingsPath, JSON.stringify(next), '控制台设置恢复')) {
+            sendJson(res, 500, { error: 'write_failed', code: 'write_failed', field: 'settings' })
+            return
+          }
+          runtimeSettings.revision = next.revision
+          runtimeSettings.updatedAt = next.updatedAt
+          runtimeSettings.notifyTestReplayWindowS = next.notifyTestReplayWindowS
+          runtimeSettings.syncShowDate = next.syncShowDate
+          settingsSource = 'file'
+          imported.settings = true
+        }
+        if (plans.auto) {
+          auto.interval = plans.auto.interval
+          persistAuto()
+          imported.autoInterval = plans.auto.interval
+        }
+        if (plans.runLog) {
+          const dir = historyDir()
+          fs.mkdirSync(dir, { recursive: true })
+          if (!writeAtomic(path.join(dir, 'run.log'), plans.runLog.text, '运行日志恢复')) {
+            sendJson(res, 500, { error: 'write_failed', code: 'write_failed', field: 'runLog' })
+            return
+          }
+          imported.runLogBytes = Buffer.byteLength(plans.runLog.text, 'utf8')
+        }
+        sendJson(res, 200, {
+          ok: true,
+          imported,
+          backupDir: path.relative(stateDir, backupDir) || backupDir
+        })
+      } finally {
+        if (filterLock) releaseFilterLock(filterLock)
+        releaseLockFor({ _stateDir: stateDir, _lockToken: lockToken })
+      }
+    }).catch(() => sendJson(res, 500, { error: '导入失败' }))
+  }
+
   // GET /api/config/filter：读面，沿用全局鉴权（Cookie / Bearer / ?token= 均可）。
   // 损坏时 revision 强制 0（即便进程内有 last-known-good，那是运行侧降级，不是覆盖文件版本）。
   const handleFilterGet = (req, res) => {
@@ -3467,6 +3740,16 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           : (win.days > 0 || win.from !== '' ? messageCategoriesOf(windowed) : read.value.categories),
         items: pageItems
       })
+      return
+    }
+    // POST /api/backup/export：把勾选的数据类别打包成一个 JSON 下载。
+    if (req.method === 'POST' && url.pathname === '/api/backup/export') {
+      handleBackupExport(req, res)
+      return
+    }
+    // POST /api/backup/import：读取备份文件里实际存在的类别并恢复（导入不再让用户勾选）。
+    if (req.method === 'POST' && url.pathname === '/api/backup/import') {
+      handleBackupImport(req, res)
       return
     }
     // POST /api/messages/export（v3.300 批次③ 3.2）：推送记录导出下载。body:

@@ -315,7 +315,11 @@ jobs:
             config: "stryker.tap.config.js"
           - name: console-part7
             src: "scripts/console.js"
-            mutate: "scripts/console.js:3676-4278"
+            mutate: "scripts/console.js:3676-4370"
+            config: "stryker.tap.config.js"
+          - name: console-part8
+            src: "scripts/console.js"
+            mutate: "scripts/console.js:4371-4561"
             config: "stryker.tap.config.js"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

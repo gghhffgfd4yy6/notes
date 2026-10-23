@@ -25,12 +25,12 @@ const SPECIAL_SEGMENTS = {
   'qinglong/xbk_push.js': ['qinglong-push'],
   'scripts/check-deps.js': ['check-deps'],
   'scripts/status.js': ['status'],
-  'scripts/console.js': ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5', 'console-part6', 'console-part7'],
+  'scripts/console.js': ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5', 'console-part6', 'console-part7', 'console-part8'],
   'xbk_filter_store.js': ['filter-store']
 }
 // 拆段边界固定（与 mutation.yml 真实矩阵一致），终点随文件增长自动跟随。
 // 值为边界数组：N 个边界 ⇒ N+1 段（单边界即两段拆法）。
-const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': [750], 'scripts/console.js': [563, 1126, 1689, 2252, 2815, 3675] }
+const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': [750], 'scripts/console.js': [563, 1126, 1689, 2252, 2815, 3675, 4370] }
 
 // 构造包含所有生产文件的 yml，行段可按文件覆盖
 function buildYml (overrides = {}) {
@@ -387,7 +387,7 @@ function run (ymlText) {
     const wf = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'mutation.yml'), 'utf8')
     const ranges = [...wf.matchAll(/name:\s*(console-part\d+)[\s\S]{0,300}?mutate:\s*"scripts\/console\.js:(\d+)-(\d+)"/g)]
       .map(m => ({ name: m[1], start: Number(m[2]), end: Number(m[3]) }))
-    assert.strictEqual(ranges.length, 7, `真实矩阵必须拆 7 段 console，实际 ${ranges.length}`)
+    assert.strictEqual(ranges.length, 8, `真实矩阵必须拆 8 段 console，实际 ${ranges.length}`)
     const lines = fs.readFileSync(path.join(ROOT, 'scripts', 'console.js'), 'utf8').split('\n').length - 1
     assert.strictEqual(ranges[0].start, 1, '真实矩阵首段必须从第 1 行开始')
     assert.strictEqual(ranges[ranges.length - 1].end, lines, '真实矩阵末段必须止于文件最后一行')
@@ -403,10 +403,13 @@ function run (ymlText) {
     }
     const part6 = ranges.find(r => r.name === 'console-part6')
     const part7 = ranges.find(r => r.name === 'console-part7')
+    const part8 = ranges.find(r => r.name === 'console-part8')
     assert.ok(part6 && part6.start === 3251 && part6.end === 3675,
       `真实 console-part6 必须是 3251-3675，实际 ${part6 && part6.start}-${part6 && part6.end}`)
-    assert.ok(part7 && part7.start === 3676 && part7.end === lines,
-      `真实 console-part7 必须是 3676-${lines}，实际 ${part7 && part7.start}-${part7 && part7.end}`)
+    assert.ok(part7 && part7.start === 3676 && part7.end === 4370,
+      `真实 console-part7 必须是 3676-4370，实际 ${part7 && part7.start}-${part7 && part7.end}`)
+    assert.ok(part8 && part8.start === 4371 && part8.end === lines,
+      `真实 console-part8 必须是 4371-${lines}，实际 ${part8 && part8.start}-${part8 && part8.end}`)
   }
 
   console.log('test_check_mutation_ranges OK')
