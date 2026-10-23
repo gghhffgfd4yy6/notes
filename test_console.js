@@ -51,6 +51,8 @@ const {
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
   RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS,
   REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE,
+  // v3.340 控制台设置（通知自检拦截窗）：常量走导出，测试不自己写死 0/3600
+  CONSOLE_SETTINGS_FILE, CONSOLE_SETTINGS_DEFAULT_S, NOTIFY_REPLAY_MIN_S, NOTIFY_REPLAY_MAX_S,
   // 导出端点的读取上限直接取实现常量（D2-N11：修前测试自己写死 32MiB，实现改 64MiB 后
   // 用例仍在 32MiB 造夹具 → 以为测了 tooLarge，实际测的是 invalid）
   MESSAGES_MAX_BYTES,
@@ -68,10 +70,38 @@ function ok (name, fn) {
   try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; console.log(`  ❌ ${name}: ${e.message}`) }
 }
 async function aok (name, fn) {
-  try { await fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; console.log(`  ❌ ${name}: ${e.message}`) }
+  try { await fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) {
+    failed++
+    // 带自定义消息的 assert 会把 actual/expected 藏起来（只留「剩余秒数按 5s 窗算」这种描述），
+    // 排障时看不出差在哪。这里补上短摘要，超长截断。
+    let detail = ''
+    if (e && e.actual !== undefined) {
+      try { detail = ` (actual=${JSON.stringify(e.actual)} expected=${JSON.stringify(e.expected)})`.slice(0, 200) } catch (err) { detail = '' }
+    }
+    console.log(`  ❌ ${name}: ${e.message}${detail}`)
+  }
 }
 
 function tmpDir () { return fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-test-')) }
+
+// v3.340：每组设置用例自带 stateDir + server，退出时关服务并删沙箱——一段失败不影响其它段，
+// 也不会因为漏关监听句柄把整套件挂到超时（旧版 60+ 断言挤在一个 aok 里，首错就吞掉余下全部）。
+async function withSettingsConsole (fn, prepare) {
+  const dir = tmpDir()
+  try {
+    if (typeof prepare === 'function') prepare(dir)
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    try {
+      await fn({ dir, port, server })
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
 
 // ── token 校验 ──
 ok(`isValidToken: ≥${TOKEN_MIN_LEN} 字符合法`, () => {
@@ -1886,6 +1916,343 @@ async function main () {
       server.close()
     }
   })
+  // ── v3.340 控制台设置：拆成 5 组用例 ──────────────────────────────────────────
+  // 旧版把 60+ 条断言挤在一个 aok 里：首错即中止，后面的断言与清理全部跳过（回潮实验实测
+  // 只报 1 条失败、且进程被泄漏的监听句柄钉住）。现在每组自带 stateDir/server，退出时关服务
+  // 并删沙箱，一段失败不影响其它段。
+  await aok('HTTP: 控制台设置读面与写面闸门（v3.340）', async () => {
+    assert.strictEqual(CONSOLE_SETTINGS_DEFAULT_S, 60, '默认 60 秒（与 REPLAY_WINDOW_NOTIFY_TEST_MS 同值）')
+    assert.strictEqual(NOTIFY_REPLAY_MIN_S, 0)
+    assert.strictEqual(NOTIFY_REPLAY_MAX_S, 3600)
+    // 文件名是落盘契约的一部分：这里钉字面量，别用常量自证（把常量改名后自指断言仍绿）。
+    assert.strictEqual(CONSOLE_SETTINGS_FILE, 'console-settings.json', '落盘文件名是对外契约')
+    assert.strictEqual(classifyStateFile('console-settings.json', 'xbk_cache.json'), 'console', '设置文件必须归 console 类')
+    await withSettingsConsole(async ({ dir, port }) => {
+      const settingsPath = path.join(dir, CONSOLE_SETTINGS_FILE)
+      const postRaw = (body, headers = {}) => request(port, 'POST', '/api/config/console', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json', ...headers },
+        body
+      })
+
+      // ⓪ 读面同样在全局鉴权之后：无凭证 GET/POST 都必须 401。
+      // （否则把新路由挪到鉴权闸之前，本组用例仍会全绿。）
+      const anonRead = await request(port, 'GET', '/api/config/console')
+      assert.strictEqual(anonRead.status, 401, '无凭证 GET 401')
+      const anonWrite = await request(port, 'POST', '/api/config/console', {
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ notifyTestReplayWindowS: 5 })
+      })
+      assert.strictEqual(anonWrite.status, 401, '无凭证 POST 401')
+
+      // ① GET 默认面：值/来源/边界都如实下发，且默认值不落盘（读盘失败也不自己造文件）。
+      const init = await request(port, 'GET', '/api/config/console', { token: TOKEN })
+      assert.strictEqual(init.status, 200, 'GET 200')
+      assert.strictEqual(init.headers['cache-control'], 'no-store', '可变设置不得被任何缓存留住')
+      const initBody = JSON.parse(init.text)
+      assert.strictEqual(initBody.schema, 1)
+      assert.strictEqual(initBody.settings.notifyTestReplayWindowS, 60, '默认 60')
+      assert.strictEqual(initBody.revision, 0, '默认 revision 0')
+      assert.strictEqual(initBody.updatedAt, 0, '默认没有 updatedAt')
+      assert.strictEqual(initBody.source, 'default', '默认来源 default')
+      assert.strictEqual(initBody.defaults.notifyTestReplayWindowS, 60)
+      assert.strictEqual(initBody.min, 0)
+      assert.strictEqual(initBody.max, 3600)
+      assert.strictEqual(fs.existsSync(settingsPath), false, '只读不得凭空创建设置文件')
+      const cookieRead = await request(port, 'GET', '/api/config/console', { headers: { cookie: `xbk_session=${TOKEN}` } })
+      assert.strictEqual(cookieRead.status, 200, 'GET 收 Cookie（全局鉴权口径）')
+
+      // ② 写面鉴权/媒体类型：Cookie-only 与 ?token= 都进不来，非 JSON 415。
+      const csrf = await request(port, 'POST', '/api/config/console', {
+        headers: { cookie: `xbk_session=${TOKEN}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ notifyTestReplayWindowS: 5 })
+      })
+      assert.strictEqual(csrf.status, 401, 'Cookie-only 写面 401（CSRF 面）')
+      const queryToken = await request(port, 'POST', `/api/config/console?token=${TOKEN}`, {
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ notifyTestReplayWindowS: 5 })
+      })
+      assert.strictEqual(queryToken.status, 400, '?token= 写面 400')
+      assert.strictEqual(JSON.parse(queryToken.text).error, 'query_token_not_allowed')
+      const nonJson = await postRaw(JSON.stringify({ notifyTestReplayWindowS: 5 }), { 'content-type': 'text/plain' })
+      assert.strictEqual(nonJson.status, 415, '非 JSON 415')
+      assert.strictEqual(JSON.parse(nonJson.text).error, 'unsupported_media_type')
+      const badJson = await postRaw('{oops')
+      assert.strictEqual(badJson.status, 400, '坏 JSON 400')
+      assert.strictEqual(JSON.parse(badJson.text).error, 'invalid_json')
+      const notObject = await postRaw('[1,2]')
+      assert.strictEqual(notObject.status, 400, '非普通对象 400')
+      assert.strictEqual(JSON.parse(notObject.text).error, 'body 必须是对象')
+      assert.strictEqual(fs.existsSync(settingsPath), false, '被拒的写请求都不得落盘')
+    })
+  })
+
+  await aok('HTTP: 控制台设置写入校验与落盘（v3.340）', async () => {
+    await withSettingsConsole(async ({ dir, port }) => {
+      const settingsPath = path.join(dir, CONSOLE_SETTINGS_FILE)
+      const save = (payload) => request(port, 'POST', '/api/config/console', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+
+      // ③ 非法值逐个拒绝：1.5 / -1 / 3601 / '60' / null / 缺字段。
+      for (const bad of [1.5, -1, 3601, '60', null]) {
+        const res = await save({ notifyTestReplayWindowS: bad })
+        assert.strictEqual(res.status, 400, `非法值 ${JSON.stringify(bad)} 必须 400`)
+        assert.match(JSON.parse(res.text).error, /0–3600 的整数/, '错误文案要说明合法区间')
+      }
+      const missingField = await save({})
+      assert.strictEqual(missingField.status, 400, '两个字段都不给必须 400')
+      assert.strictEqual(fs.existsSync(settingsPath), false, '所有被拒的写请求都不得落盘')
+
+      // ④ 乐观锁：baseRevision 不匹配 → 409 revision_mismatch 且回带当前 revision。
+      const stale = await save({ notifyTestReplayWindowS: 5, baseRevision: 7 })
+      assert.strictEqual(stale.status, 409, 'baseRevision 不匹配 409')
+      const staleBody = JSON.parse(stale.text)
+      assert.strictEqual(staleBody.error, 'revision_mismatch')
+      assert.strictEqual(staleBody.revision, 0, '409 回带当前 revision')
+
+      // ⑤ 合法保存：200 + revision 1；GET 反映 5 且来源 file；文件 0600、内容与响应一致。
+      const savedRes = await save({ notifyTestReplayWindowS: 5, baseRevision: 0 })
+      assert.strictEqual(savedRes.status, 200, '合法保存 200')
+      const savedBody = JSON.parse(savedRes.text)
+      assert.strictEqual(savedBody.ok, true)
+      assert.strictEqual(savedBody.revision, 1, 'revision +1')
+      assert.strictEqual(savedBody.settings.notifyTestReplayWindowS, 5)
+      assert.ok(Number.isFinite(savedBody.updatedAt) && savedBody.updatedAt > 0, 'updatedAt 是毫秒时间戳')
+      const after = JSON.parse((await request(port, 'GET', '/api/config/console', { token: TOKEN })).text)
+      assert.strictEqual(after.settings.notifyTestReplayWindowS, 5, 'GET 必须反映新值')
+      assert.strictEqual(after.revision, 1)
+      assert.strictEqual(after.updatedAt, savedBody.updatedAt)
+      assert.strictEqual(after.source, 'file', '落盘后来源 file')
+      assert.strictEqual(fs.statSync(settingsPath).mode & 0o777, 0o600, '设置文件必须 0600')
+      const onDisk = JSON.parse(readSafeTextResult(settingsPath, 64 * 1024).text)
+      assert.strictEqual(onDisk.schema, 1)
+      assert.strictEqual(onDisk.revision, 1, '文件里是成功那一次的内容')
+      assert.strictEqual(onDisk.notifyTestReplayWindowS, 5)
+
+      // ⑤b 同值保存不推进 revision：否则每点一次「保存」都会作废别的标签页的 baseRevision。
+      const again = await save({ notifyTestReplayWindowS: 5, baseRevision: 1 })
+      assert.strictEqual(again.status, 200, '同值保存 200')
+      const againBody = JSON.parse(again.text)
+      assert.strictEqual(againBody.unchanged, true, '同值保存标记 unchanged')
+      assert.strictEqual(againBody.revision, 1, '同值保存不得推进 revision')
+      assert.strictEqual(JSON.parse(readSafeTextResult(settingsPath, 64 * 1024).text).revision, 1, '文件也不得被重写')
+    })
+  })
+
+  await aok('HTTP: 通知自检拦截窗生效与 409 窗长（v3.340）', async () => {
+    await withSettingsConsole(async ({ dir, port }) => {
+      const save = (payload) => request(port, 'POST', '/api/config/console', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      const laPath = path.join(dir, 'console-lastaccept.json')
+      const windowSaved = await save({ notifyTestReplayWindowS: 5, baseRevision: 0 })
+      assert.strictEqual(windowSaved.status, 200, '先把拦截窗改成 5 秒')
+      assert.strictEqual(JSON.parse(windowSaved.text).revision, 1)
+
+      // ⑥ 立即生效：1s 前的自检帧在 5s 窗内 → 409 且回带 replayWindowS=5（不是写死的 60）。
+      // 帧龄留 4s 余量：余量太小（曾用 3s）时机器一卡就过窗，请求会被当新触发受理——那会真的
+      // spawn 一次 --notify-test 推送，测试的失败形态就不只是红了。
+      fs.writeFileSync(laPath, JSON.stringify({ 'notify-test': { at: Date.now() - 1000, runId: '1750000000000.9' } }))
+      const blocked = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
+      assert.strictEqual(blocked.status, 409, '窗内（1s < 5s）必须 409')
+      const blockedBody = JSON.parse(blocked.text)
+      assert.strictEqual(blockedBody.replayBlocked, true)
+      assert.strictEqual(blockedBody.replayWindowS, 5, '409 必须回带当前生效窗（5 秒）')
+      assert.strictEqual(blockedBody.runId, '1750000000000.9', '仍回带首轮 runId')
+      assert.ok(blockedBody.retryAfterS >= 1 && blockedBody.retryAfterS <= 5, '剩余秒数按 5s 窗算')
+      assert.ok(blockedBody.retryAfterS < blockedBody.replayWindowS, '剩余秒数必须小于窗长（不得把窗长当剩余时间）')
+
+      // ⑥b 锁被别的动作占着时的「锁外只读判窗」分支：同样必须回带 replayWindowS。
+      // 这条分支原先零覆盖（删掉响应字段，215 条用例仍全绿），由本轮回潮实验发现。
+      assert.strictEqual(acquireLock(dir, Date.now(), 'lock-holder'), true, '预占锁成功')
+      try {
+        const lockBlocked = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
+        assert.strictEqual(lockBlocked.status, 409, '锁被占 + 窗内重试 409')
+        const lockBlockedBody = JSON.parse(lockBlocked.text)
+        assert.strictEqual(lockBlockedBody.replayBlocked, true, '锁冲突也必须识别为重放拦截（不降级成裸锁冲突）')
+        assert.strictEqual(lockBlockedBody.replayWindowS, 5, '锁外判窗分支同样回带 5 秒窗')
+        assert.ok(lockBlockedBody.retryAfterS >= 1 && lockBlockedBody.retryAfterS <= 5, '剩余秒数按 5s 窗算')
+      } finally {
+        releaseLockFor({ _stateDir: dir, _lockToken: 'lock-holder' })
+      }
+
+      // ⑦ 0 = 关闭拦截：同一帧刚受理过也不再按重放拦——只剩锁冲突（无 replayBlocked）。
+      // 用预占锁把请求挡在 202 之前，绝不落到真实 spawn 推送。
+      const off = await save({ notifyTestReplayWindowS: 0, baseRevision: 1 })
+      assert.strictEqual(off.status, 200, '保存 0（关闭拦截）200')
+      assert.strictEqual(JSON.parse(off.text).revision, 2)
+      fs.writeFileSync(laPath, JSON.stringify({ 'notify-test': { at: Date.now(), runId: '1750000000000.9' } }))
+      assert.strictEqual(acquireLock(dir, Date.now(), 'other-token'), true, '预占锁成功')
+      try {
+        const lockOnly = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
+        assert.strictEqual(lockOnly.status, 409, '锁冲突仍 409')
+        const lockBody = JSON.parse(lockOnly.text)
+        assert.strictEqual(lockBody.replayBlocked, undefined, '窗 0 时必须不再报 replayBlocked（0 = 关闭拦截）')
+        assert.strictEqual(lockBody.replayWindowS, undefined, '锁冲突不是重放拦截，不带 replayWindowS')
+      } finally {
+        releaseLockFor({ _stateDir: dir, _lockToken: 'other-token' })
+      }
+    })
+  })
+
+  await aok('HTTP: 通知自检拦截窗重启后仍生效（v3.340）', async () => {
+    const dir = tmpDir()
+    try {
+      const first = createConsole({ token: TOKEN, stateDir: dir })
+      const port1 = await listen(first.server)
+      first.server.unref()
+      const saved = await request(port1, 'POST', '/api/config/console', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ notifyTestReplayWindowS: 0, baseRevision: 0 })
+      })
+      assert.strictEqual(JSON.parse(saved.text).revision, 1, '保存 0 并落盘')
+      await new Promise(resolve => first.server.close(resolve))
+
+      // ⑧ 持久化：同一 stateDir 重新 createConsole，读到的是最后一次保存的值。
+      const second = createConsole({ token: TOKEN, stateDir: dir })
+      const port2 = await listen(second.server)
+      second.server.unref()
+      const resumed = JSON.parse((await request(port2, 'GET', '/api/config/console', { token: TOKEN })).text)
+      assert.strictEqual(resumed.settings.notifyTestReplayWindowS, 0, '重启后读到最后保存的 0')
+      assert.strictEqual(resumed.revision, 1)
+      assert.strictEqual(resumed.source, 'file')
+      await new Promise(resolve => second.server.close(resolve))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('HTTP: 控制台设置损坏/越界/FIFO 回默认（v3.340）', async () => {
+    const warnings = []
+    const realConsoleError = console.error
+    console.error = (...args) => {
+      const line = args.map((a) => String(a)).join(' ')
+      // 只截「控制台设置」前缀：其余告警照常打到控制台，否则窗口期内所有诊断信息都被吞掉。
+      if (line.includes('控制台设置')) warnings.push(line)
+      else realConsoleError(...args)
+    }
+    try {
+      // ⑨ 损坏 / 字段非法 → 默认 60 + console.error 告警（不崩、不阻断启动）。
+      await withSettingsConsole(async ({ port }) => {
+        const read = JSON.parse((await request(port, 'GET', '/api/config/console', { token: TOKEN })).text)
+        assert.strictEqual(read.settings.notifyTestReplayWindowS, 60, '损坏文件回默认 60')
+        assert.strictEqual(read.source, 'default', '损坏文件来源按默认')
+      }, (dir) => fs.writeFileSync(path.join(dir, CONSOLE_SETTINGS_FILE), '{not json', { mode: 0o600 }))
+
+      await withSettingsConsole(async ({ port }) => {
+        const read = JSON.parse((await request(port, 'GET', '/api/config/console', { token: TOKEN })).text)
+        assert.strictEqual(read.settings.notifyTestReplayWindowS, 60, '越界字段回默认 60')
+        assert.strictEqual(read.revision, 0, '非法文件整份不采信（revision 也不采）')
+      }, (dir) => fs.writeFileSync(path.join(dir, CONSOLE_SETTINGS_FILE),
+        JSON.stringify({ schema: 1, revision: 3, updatedAt: Date.now(), notifyTestReplayWindowS: 7200 }), { mode: 0o600 }))
+    } finally {
+      console.error = realConsoleError
+    }
+    // 两条告警必须各自存在：共用一个前缀时 some() 只要求「有一条」，删掉其中一条分支不会被发现。
+    const settingsWarnings = warnings.filter((m) => m.includes('控制台设置'))
+    assert.ok(settingsWarnings.length >= 2, `损坏与字段非法必须各有一条告警（实际 ${settingsWarnings.length} 条）`)
+    assert.ok(settingsWarnings.some((m) => m.includes('不是合法 JSON')), '损坏文件告警要写明「不是合法 JSON」')
+    assert.ok(settingsWarnings.some((m) => m.includes('字段非法')), '越界字段告警要写明「字段非法」')
+
+    // ⑩ 设置文件被换成 FIFO：启动读盘必须非阻塞（裸 O_RDONLY 会让 createConsole 卡死在 listen
+    // 之前）。用子进程 + 看门狗：真挂死也只杀子进程，不会把整套件拖成 10 分钟超时。
+    const fifoDir = tmpDir()
+    const fifoSettings = path.join(fifoDir, CONSOLE_SETTINGS_FILE)
+    fs.rmSync(fifoSettings, { force: true })
+    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifoSettings])
+    const probeSrc = 'const { createConsole } = require(' + JSON.stringify(require.resolve('./scripts/console')) + ')\n' +
+      'createConsole({ token: "x".repeat(20), stateDir: process.argv[1], log: () => {} })\n' +
+      'console.log("SETTINGS_READ_NONBLOCKING")\n' +
+      'process.exit(0)\n'
+    const probe = spawn(process.execPath, ['-e', probeSrc, fifoDir], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let probeOut = ''
+    probe.stdout.on('data', (c) => { probeOut += c })
+    probe.stderr.resume()
+    const probeDone = new Promise((resolve) => { probe.on('exit', resolve); probe.on('error', resolve) })
+    const probeTimer = setTimeout(() => { try { probe.kill('SIGKILL') } catch (e) {} }, 5000)
+    await probeDone
+    clearTimeout(probeTimer)
+    assert.ok(probeOut.includes('SETTINGS_READ_NONBLOCKING'),
+      'FIFO 设置文件必须按 unsafe 回默认（不得阻塞 createConsole 启动）')
+    fs.rmSync(fifoDir, { recursive: true, force: true })
+  })
+
+  await aok('HTTP: 顶栏时间显示年月日可设置（v3.342）', async () => {
+    await withSettingsConsole(async ({ dir, port }) => {
+      const settingsPath = path.join(dir, CONSOLE_SETTINGS_FILE)
+      const save = (payload) => request(port, 'POST', '/api/config/console', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      const get = () => request(port, 'GET', '/api/config/console', { token: TOKEN })
+
+      // ① 默认面：默认显示年月日，且默认值也如实下发（前端据此决定回退文案）。
+      const init = JSON.parse((await get()).text)
+      assert.strictEqual(init.settings.syncShowDate, true, '默认显示年月日')
+      assert.strictEqual(init.defaults.syncShowDate, true, '默认值也要下发')
+
+      // ② 非布尔一律拒绝：0/1/'true'/null/对象/数组都不是「关掉」。
+      for (const bad of [0, 1, 'true', 'false', null, {}, []]) {
+        const res = await save({ syncShowDate: bad })
+        assert.strictEqual(res.status, 400, `非法显示开关 ${JSON.stringify(bad)} 必须 400`)
+      }
+      assert.strictEqual(fs.existsSync(settingsPath), false, '被拒的写请求不得落盘')
+
+      // ③ 部分更新：只改显示开关时拦截窗保持原值，反之亦然（两边都不能把对方重置）。
+      const off = await save({ syncShowDate: false, baseRevision: 0 })
+      assert.strictEqual(off.status, 200, '合法保存 200')
+      const offBody = JSON.parse(off.text)
+      assert.strictEqual(offBody.settings.syncShowDate, false)
+      assert.strictEqual(offBody.settings.notifyTestReplayWindowS, 60, '只改显示开关时拦截窗保持默认')
+      const disk1 = JSON.parse(fs.readFileSync(settingsPath, 'utf8'))
+      assert.strictEqual(disk1.syncShowDate, false, '落盘必须带 syncShowDate')
+      assert.strictEqual(disk1.notifyTestReplayWindowS, 60, '落盘不得丢另一个字段')
+
+      const win = await save({ notifyTestReplayWindowS: 7, baseRevision: 1 })
+      assert.strictEqual(win.status, 200)
+      const winBody = JSON.parse(win.text)
+      assert.strictEqual(winBody.settings.syncShowDate, false, '只改拦截窗时显示开关不得被重置')
+      assert.strictEqual(winBody.settings.notifyTestReplayWindowS, 7)
+
+      // ④ 同值保存：unchanged + revision 不动（否则别的标签页的乐观锁被无谓作废）。
+      const same = await save({ syncShowDate: false, baseRevision: 2 })
+      assert.strictEqual(same.status, 200, '同值保存 200')
+      const sameBody = JSON.parse(same.text)
+      assert.strictEqual(sameBody.unchanged, true, '同值保存标记 unchanged')
+      assert.strictEqual(sameBody.revision, 2, '同值保存不推进 revision')
+    })
+
+    // ⑤ 启动读回：v3.340 的旧文件没有这个字段，必须按默认 true 读（不能整份判非法丢掉拦截窗）；
+    //    写了布尔就按文件值生效。
+    for (const [label, extra, want] of [['旧文件缺字段', {}, true], ['文件写了 false', { syncShowDate: false }, false]]) {
+      const legacyDir = tmpDir()
+      try {
+        fs.writeFileSync(path.join(legacyDir, CONSOLE_SETTINGS_FILE),
+          JSON.stringify({ schema: 1, revision: 4, updatedAt: Date.now(), notifyTestReplayWindowS: 9, ...extra }), { mode: 0o600 })
+        const { server } = createConsole({ token: TOKEN, stateDir: legacyDir })
+        const legacyPort = await listen(server)
+        server.unref()
+        try {
+          const read = JSON.parse((await request(legacyPort, 'GET', '/api/config/console', { token: TOKEN })).text)
+          assert.strictEqual(read.settings.syncShowDate, want, `${label} → syncShowDate=${want}`)
+          assert.strictEqual(read.settings.notifyTestReplayWindowS, 9, `${label}：拦截窗不能被一起丢掉`)
+          assert.strictEqual(read.source, 'file', `${label} 仍算来自设置文件`)
+        } finally {
+          await new Promise((resolve) => server.close(resolve))
+        }
+      } finally {
+        fs.rmSync(legacyDir, { recursive: true, force: true })
+      }
+    }
+  })
+
   await aok('HTTP: 全局重放窗 60s（D2-S16：窗内 409 带剩余秒数，文案不谎称有任务在运行）', async () => {
     const dir = tmpDir()
     fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 30000, runId: '1750000000000.3' } }))
@@ -1898,6 +2265,7 @@ async function main () {
     assert.ok(b.retryAfterS >= 1 && b.retryAfterS <= 30, `retryAfterS 应为剩余秒数（实际 ${b.retryAfterS}）`)
     assert.ok(!/已有触发任务在运行/.test(b.error), '文案不得谎称「已有任务在运行」（锁早就释放了）')
     assert.match(b.error, /重复提交/)
+    assert.strictEqual(b.replayWindowS, 60, '普通动作的 409 也必须回带生效窗（60 秒）')
     server.close()
   })
   await aok('HTTP: 全局重放窗越窗放行（61s 前受理 → 202；旧 12min 窗会拦）', async () => {
@@ -2453,35 +2821,44 @@ async function main () {
     let out = ''
     child.stdout.on('data', c => { out += c })
     child.stderr.on('data', c => { out += c })
-    // 等就绪（监听成功日志）。
-    const readyDeadline = Date.now() + 10000
-    while (!out.includes('已启动')) {
-      if (Date.now() > readyDeadline) break
-      await new Promise(resolve => setTimeout(resolve, 50))
+    // 断言失败时必须给子进程收尸：否则监听句柄把整套件钉住（实测 300s 超时）。
+    try {
+      // 等就绪（监听成功日志）。
+      const readyDeadline = Date.now() + 10000
+      while (!out.includes('已启动')) {
+        if (Date.now() > readyDeadline) break
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      assert.ok(out.includes('已启动'), `子控制台未就绪：${out.slice(0, 400)}`)
+      // 只取端口：本机环境可能导出了 XBK_CONSOLE_HOST=0.0.0.0（日志前缀随之变化），
+      // 死抠 127.0.0.1 会让这条 e2e 在那种环境里假红（实测）。
+      const m = /已启动：http:\/\/[^:]+:(\d+)/.exec(out)
+      assert.ok(m, `无法解析监听端口：${out.slice(0, 200)}`)
+      const cport = Number(m[1])
+      const trig = await request(cport, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+      assert.strictEqual(trig.status, 202, '触发必须受理')
+      assert.strictEqual(fs.existsSync(lockFile), true, '触发后锁文件必须存在')
+      await new Promise(resolve => setTimeout(resolve, 150))
+      // Sourcery #225 M6：SIGTERM 前无法直接观测孙进程（--check 在控制台进程内 spawn），
+      // 用退出延迟区分「杀掉子进程走 close 收尾」（毫秒级）与「子进程没死、3s 看门狗
+      // 强退」（≥3s）——若关停逻辑不再杀子进程，此断言必红。
+      const killAt = Date.now()
+      child.kill('SIGTERM')
+      const code = await new Promise(resolve => {
+        const to = setTimeout(() => resolve('timeout'), 8000)
+        child.on('exit', (c) => { clearTimeout(to); resolve(c) })
+      })
+      const shutdownMs = Date.now() - killAt
+      assert.ok(shutdownMs < 2800, `关停耗时 ${shutdownMs}ms ≥ 2800ms：疑似走了 3s 看门狗（子进程未被杀）\n${out.slice(-400)}`)
+      assert.strictEqual(code, 0, `SIGTERM 后必须 0 退出（实际 ${code}）\n${out.slice(-400)}`)
+      const frame = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
+      assert.strictEqual(frame.released, true, '退出后锁帧必须为 released（原地产出，不靠外部清理）')
+    } catch (e) {
+      try { child.kill('SIGKILL') } catch (err) {}
+      throw e
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
     }
-    assert.ok(out.includes('已启动'), `子控制台未就绪：${out.slice(0, 400)}`)
-    const m = /http:\/\/127\.0\.0\.1:(\d+)/.exec(out)
-    assert.ok(m, `无法解析监听端口：${out.slice(0, 200)}`)
-    const cport = Number(m[1])
-    const trig = await request(cport, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
-    assert.strictEqual(trig.status, 202, '触发必须受理')
-    assert.strictEqual(fs.existsSync(lockFile), true, '触发后锁文件必须存在')
-    await new Promise(resolve => setTimeout(resolve, 150))
-    // Sourcery #225 M6：SIGTERM 前无法直接观测孙进程（--check 在控制台进程内 spawn），
-    // 用退出延迟区分「杀掉子进程走 close 收尾」（毫秒级）与「子进程没死、3s 看门狗
-    // 强退」（≥3s）——若关停逻辑不再杀子进程，此断言必红。
-    const killAt = Date.now()
-    child.kill('SIGTERM')
-    const code = await new Promise(resolve => {
-      const to = setTimeout(() => resolve('timeout'), 8000)
-      child.on('exit', (c) => { clearTimeout(to); resolve(c) })
-    })
-    const shutdownMs = Date.now() - killAt
-    assert.ok(shutdownMs < 2800, `关停耗时 ${shutdownMs}ms ≥ 2800ms：疑似走了 3s 看门狗（子进程未被杀）\n${out.slice(-400)}`)
-    assert.strictEqual(code, 0, `SIGTERM 后必须 0 退出（实际 ${code}）\n${out.slice(-400)}`)
-    const frame = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
-    assert.strictEqual(frame.released, true, '退出后锁帧必须为 released（原地产出，不靠外部清理）')
-    fs.rmSync(dir, { recursive: true, force: true })
   })
   await aok('HTTP: /trigger 落盘失败 → 500 且可立即重试（回归 Sourcery #225 M2：pending 条目必须回滚）', async () => {
     const dir = tmpDir()
@@ -4185,10 +4562,43 @@ async function main () {
     assert.ok(src.includes('path.length === 0 ? [{ key'), '「全部分类」只应出现在一级')
   })
 
-  await aok('结构红线: 非概览/日志页停止主轮询（防 5s 闪屏）', () => {
+  await aok('结构红线: 所有页都轮询（v3.348 改口径：其它页由统一 tick 重拉自己的数据）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
-    assert.ok(src.includes("if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)"), '推送记录/配置/系统必须停止主轮询')
+    // 旧口径是「非概览/日志页停止主轮询」，用户实测反馈那几页的「自动刷新 5s」永远停在 5s、
+    // 数据也不更新。新口径：定时器不按页停，其它页每拍 +1 交给当前面板重拉。
+    assert.ok(!src.includes("if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)"),
+      '不得再按页停掉轮询定时器')
+    assert.ok(src.includes("if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)"),
+      '非概览/日志页必须每拍推进共享 tick')
+    assert.ok(src.includes('if (!active || !(pollTick > 0) || busyRef.current) return'),
+      '轮询重拉必须单飞：上一拍还没回来时跳过，否则慢接口会互相作废响应')
     assert.ok(/\[refreshSplit, locking, tab, autoRefresh, authExpired\]/.test(src), '轮询 effect 必须随 tab / 暂停开关 / 凭证失效状态变化重跑')
+    // 四个页面的面板都要消费这个 tick，否则只是数字在动、数据不动。
+    // v3.349：重拉统一走 usePollReload（单飞：上一拍没回来就跳过，慢接口不会互相作废）。
+    for (const [fn, call] of [
+      ['MessagesPanel', 'usePollReload(active, pollTick, load)'],
+      ['ConfigPanel', 'usePollReload(active, pollTick, refresh)'],
+      ['FilterRulesPanel', 'usePollReload(active, pollTick, load)'],
+      ['FilesPanel', 'usePollReload(active, pollTick, () => load().then((ok) => {'],
+      ['SysPanel', 'usePollReload(active, pollTick, () => refreshAll().then((rs) => {']
+    ]) {
+      const at = src.indexOf('function ' + fn + ' (')
+      const end = src.indexOf('\nfunction ', at + 10)
+      const seg = src.slice(at, end > at ? end : undefined)
+      assert.ok(at > 0 && seg.includes('pollTick'), `${fn} 必须接收 pollTick`)
+      assert.ok(seg.includes(call), `${fn} 必须按 tick 重拉`)
+    }
+    // 过滤规则是编辑面：tick 触发的 load 仍必须被 dirtyRef 挡住（草稿不能被自动刷新覆盖）。
+    assert.ok(src.includes('if (dirtyRef.current) return'), '有未保存改动时自动刷新不得覆盖草稿')
+    // 光有 tick 还不够：传给 usePollReload 的必须是真 loader（空壳函数也能让上一条断言通过）。
+    for (const bound of ['usePanelLoader(fetchMessages', 'usePanelLoader(apiGetConfig', 'Promise.all([apiGetFilter()', 'usePanelLoader(apiGetSys', 'usePanelLoader(apiGetFiles']) {
+      assert.ok(src.includes(bound), `面板 loader 必须真的打接口：缺 ${bound}`)
+    }
+    // 单飞闸必须真的调用传进来的 loader，否则只是把 tick 吃掉了。
+    const pollStart = src.indexOf('function usePollReload')
+    const pollEnd = src.indexOf('// 面板侧：当前页签激活时订阅全局下拉刷新', pollStart)
+    assert.ok(pollStart >= 0 && pollEnd > pollStart, 'usePollReload 切片锚点必须存在且有序')
+    assert.ok(src.slice(pollStart, pollEnd).includes('fnRef.current()'), '单飞闸必须调用传进来的 loader')
   })
 
   await aok('结构红线: 配置页过滤规则/渠道不拼成一条长串', () => {
@@ -4347,7 +4757,7 @@ async function main () {
     assert.ok(src.includes('initialMode') && src.includes('initialQuery'), '日志面板必须支持带条件跳转')
     assert.ok(src.includes("window.addEventListener('hashchange'"), '页签必须跟随 hash')
     assert.ok(src.includes('document.title ='), '标题必须带状态点')
-    assert.ok(src.includes('autoRefresh') && src.includes('自动刷新 · '), '自动刷新必须有暂停与倒计时')
+    assert.ok(src.includes('function AutoRefreshText (') && /自动刷新 \$\{remain\}s/.test(src), '状态行必须复用 AutoRefreshText（暂停 + 倒计时）')
     assert.ok(src.includes('filterRunItems'), '逐轮历史必须支持失败/日期筛选')
     assert.ok(!src.includes('首轮前正常'), '墓碑文案不得再写「首轮前正常」')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
@@ -4553,9 +4963,15 @@ async function main () {
     '过滤规则页必须做竞态/卸载守卫，旧响应不能刷新时间戳')
     assert.ok(!src.includes('useEffect(() => { setPanelSync(null) }, [tab])'),
       '换页不得清空时间，否则每次切页都会闪一下手动刷新')
-    assert.ok(src.includes("'数据截至 · —'"), '第一次进入未加载时必须用占位符，不能整行换成手动刷新')
-    assert.ok(src.includes('if (configAt && filterAt && typeof onSync'), '配置页两个 loader 都落定才算完成')
-    assert.ok(src.includes('if (sysReady && accessReady && typeof onReady'), '系统页两个 loader 都落定才算完成')
+    assert.ok(src.includes("const at = lastSync ? fmtBarTime(lastSync, showDate) : '—'"),
+      '第一次进入未加载时必须用「—」占位，不能整行换成手动刷新')
+    // v3.342：设置块搬到系统页后，配置页恢复成 config + filter 两条 loader；
+    // 设置读面在系统页，和系统信息、访问日志一起等落定。
+    assert.ok(src.includes("if (typeof onSync === 'function' && configAt && filterAt) onSync(Math.max(configAt, filterAt))"),
+      '配置页必须等 config/filter 两个 loader 落定')
+    const cfgOnly = src.slice(src.indexOf('function ConfigPanel'), src.indexOf('// ── 过滤规则（v3.310）'))
+    assert.ok(!cfgOnly.includes('apiGetConsoleSettings'), '配置页不得再挂设置读面（v3.342 已搬到系统页）')
+    assert.ok(src.includes('if (sysReady && accessReady && typeof onReady'), '系统页 loader 都落定才算完成')
     assert.ok(src.includes('onReady=$' + '{onSysReady}') && src.includes('onReady=$' + '{onFilesReady}'),
       '系统页与文件清单都要向滚动层报完成')
     assert.ok(src.includes('prepareScrollRef.current(next)'), 'hash 后退/前进必须走同一套滚动还原')
@@ -4669,8 +5085,8 @@ async function main () {
     assert.ok(seg('ConfigPanel', 'function FilterRulesPanel').includes('usePanelAutoLoad(active, refresh)'), '配置必须首访预加载 + 切回刷新')
     assert.ok(seg('TrendsPanel', 'function CacheHealthPanel').includes('usePanelAutoLoad(active, load)'), '趋势必须首访预加载 + 切回刷新')
     assert.ok(seg('RunHistoryPanel', 'function usePanelLoader').includes('usePanelAutoLoad(active, load)'), '逐轮历史必须首访预加载 + 切回刷新')
-    assert.ok(seg('SysPanel', 'function FilesPanel').includes('Promise.allSettled([load(), loadAccess()])'),
-      '系统页必须等同一次刷新的两个请求都结算后才报完成')
+    assert.ok(seg('SysPanel', 'function FilesPanel').includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
+      '系统页必须等系统信息 + 访问日志 + 设置三条都结算后才报完成')
     assert.ok(seg('FilesPanel', 'function FilterRules').includes('usePanelAutoLoad(active, load)'), '文件清单必须首访预加载 + 切回刷新')
     assert.ok(src.includes('function usePanelAutoLoad') && src.includes('if (!active && !first) return') &&
       src.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
@@ -5582,9 +5998,151 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.339：注释里不得提前写下一版 v3.340。
-    assert.ok(!/v3\.340/.test(src), 'app.js 注释不得写 v3.340（版本未 bump）')
-    assert.ok(!/v3\.340/.test(css), 'app.css 注释不得写 v3.340（版本未 bump）')
+    // 版本已 bump 到 3.349：注释里不得提前写下一版 v3.350。
+    // 注意这条只拦「资源注释里提前写下个版本」；四处版本号（主文件头/CHANGELOG/package.json/
+    // package-lock 两处）的一致性由 check-version.js 负责（CI 与 pre-commit 都跑，npm test 不含）。
+    assert.ok(!/v3\.350/.test(src), 'app.js 注释不得写 v3.350（版本未 bump）')
+    assert.ok(!/v3\.350/.test(css), 'app.css 注释不得写 v3.350（版本未 bump）')
+  })
+
+  await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+
+    // ① 格式化：关掉时只留 时:分:秒；「—」不能被切坏。
+    const barAt = src.indexOf('function fmtBarTime (ts, withDate)')
+    assert.ok(barAt > 0, '缺少 fmtBarTime')
+    const barSrc = src.slice(barAt, barAt + 400)
+    assert.ok(barSrc.includes("if (s === '—' || withDate !== false) return s"), '默认带日期，「—」原样返回')
+    assert.ok(barSrc.includes('return s.slice(11)'), '关掉年月日时必须截掉日期部分')
+
+    // ② v3.346：状态行只有一个来源——AutoRefreshText 统一输出「自动刷新 Ns · 数据截至 · 时间」，
+    //    App 只负责汇总时间来源（syncAt）和 live/paused，不再每页各写一套。
+    assert.ok(src.includes("const syncAt = tab === 'overview' ? lastSync : panelSync"), '时间来源必须在一处汇总')
+    assert.ok(/lastSync=\$\{syncAt\} showDate=\$\{showDate\} paused=\$\{!autoRefresh \|\| authExpired\} live=\$\{livePolling\}/.test(src), '状态行必须统一传参（时间/年月日/暂停或凭证失效/是否轮询）')
+    assert.ok(src.includes('fmtBarTime(lastSync, showDate)'), '组件内必须走 fmtBarTime')
+    // v3.343：气泡和年月日同步——关掉年月日时 tip 必须为空（TapTip 退化成纯文本）。
+    assert.ok(/tip=\$\{showDate && syncAt \?/.test(src), '气泡必须跟着 showDate 一起关')
+
+    // ②b v3.344：暂停不是概览专属——其它页也要能暂停/继续。
+    //     v3.346：文案收敛到组件里，暂停只换开头两个字，后半句不变。
+    assert.ok(!/\$\{tab === 'overview' && html`<button type="button" class="sync-toggle"/.test(src), '暂停按钮不得再限定在概览页')
+    assert.ok(/自动刷新 \$\{remain\}s · 数据截至 · \$\{at\}/.test(src), '运行态文案必须统一')
+    assert.ok(/已暂停 · 数据截至 · \$\{at\}/.test(src), '暂停态只换开头，后半句保持同一形态')
+    // v3.347：秒级时钟必须比 1s 快。1s 时钟与 mark() 不同相时，倒数会 5 4 3 2 → 5 跳过 1s
+    // （真机录屏实证），所以这里钉住 500ms，防止有人「优化」回 1000。
+    assert.ok(src.includes('setInterval(() => setNowMs(() => Date.now()), 500)'), '倒计时时钟必须是 500ms（1s 会跳秒）')
+
+    // ③ App 启动时读设置（顶栏在面板之外，必须自己拿一份；保存后靠 onSaved 重拉）。
+    assert.ok(src.includes('body.settings.syncShowDate'), 'App 必须从设置读面取 syncShowDate（读面直接回 body，不是 {data}）')
+    // v3.349：解析搬进 applyUiSettings（读面按 revision 丢弃乱序响应），只认布尔这条语义不变。
+    assert.ok(src.includes('typeof body.settings.syncShowDate !== \'boolean\''), '只认布尔，读失败保持默认')
+    assert.ok(src.includes('if (rev < uiSettingsRevRef.current) return'), '旧读响应不得覆盖新值（按 revision 判序）')
+    assert.ok(/onSettingsSaved=\$\{reloadUiSettings\}/.test(src), '系统页必须把「保存后重拉」接上')
+
+    // ④ 设置块：勾选即保存、非布尔不发、失败重读；读面由系统页统一持有。
+    const blkAt = src.indexOf('function ConsoleSettingsBlock')
+    const blkEnd = src.indexOf('// 系统信息：版本', blkAt)
+    assert.ok(blkAt > 0 && blkEnd > blkAt, 'ConsoleSettingsBlock 切片锚点必须存在且有序')
+    const blk = src.slice(blkAt, blkEnd)
+    assert.ok(blk.includes('apiPostConsoleSettings({ syncShowDate: next, baseRevision: settingsLive.revision })'),
+      '开关保存必须只提交 syncShowDate + baseRevision')
+    assert.ok(blk.includes("typeof settingsLive.settings.syncShowDate === 'boolean'"), '读面必须校验布尔类型')
+    assert.ok(blk.includes('type="checkbox"') && blk.includes('显示年月日'), '缺少「显示年月日」勾选框')
+    assert.ok(blk.includes('dateSavingRef.current'), '开关也必须防连点')
+    assert.ok(blk.includes("payload.error === 'revision_mismatch'"), '开关保存 409 要按冲突提示并重读')
+    assert.ok(!blk.includes('usePanelLoader(apiGetConsoleSettings'), '读面应由系统页统一持有（下拉刷新要等它落定）')
+
+    // ⑤ 样式：勾选框要跟着主题走（原生控件太大/太白会破坏深色页面）。
+    assert.ok(css.includes('.set-toggle input[type="checkbox"]'), '缺少勾选框样式')
+    assert.ok(css.includes('accent-color: var(--accent)'), '勾选框必须用主题强调色')
+  })
+
+  await aok('结构红线: v3.341 顶栏时间点按弹出完整时间（前端）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+
+    // ① 组件本身：可点、可键盘、可访问；tip 为空时退化成纯文本（「自动刷新已暂停」不该能点开）。
+    const tipAt = src.indexOf('function TapTip (')
+    const tipEnd = src.indexOf('// 提示行：', tipAt)
+    assert.ok(tipAt > 0 && tipEnd > tipAt, '缺少 TapTip 组件（或切片锚点漂移）')
+    const tipSrc = src.slice(tipAt, tipEnd)
+    assert.ok(tipSrc.includes('if (!tip) return html'), 'tip 为空时必须退化成纯文本')
+    assert.ok(tipSrc.includes('children}'), 'tip 为空时返回 children 本身')
+    assert.ok(tipSrc.includes('role="button"') && tipSrc.includes('aria-expanded='), '触发区必须有 button 语义与 aria-expanded')
+    assert.ok(/e\.key === 'Enter' \|\| e\.key === ' '/.test(tipSrc), '键盘 Enter/Space 也必须能展开')
+    assert.ok(tipSrc.includes("document.addEventListener('pointerdown', onDown, true)"),
+      '点页面任意其它地方必须收回（document 捕获 pointerdown）')
+    assert.ok(/e\.key === 'Escape'/.test(tipSrc), 'Esc 必须能收回')
+    assert.ok(tipSrc.includes('getBoundingClientRect()') && tipSrc.includes('window.innerWidth - 24'),
+      '必须按触发区位置算弹层坐标，并夹在视口内')
+
+    // ② 弹层必须 fixed：.sync 是 overflow:hidden，绝对定位会被裁掉（等于没弹）。
+    const popCss = css.slice(css.indexOf('.tap-tip-pop {'), css.indexOf('}', css.indexOf('.tap-tip-pop {')))
+    assert.ok(popCss.includes('position: fixed'), '.tap-tip-pop 必须 fixed 定位（祖先 .sync 会裁掉绝对定位）')
+    assert.ok(popCss.includes('overflow-wrap: anywhere'), '完整时间必须能换行，不能又被省略号吃掉')
+
+    // ③ 状态行只有一处 TapTip：所有页共用（v3.346 收成一个组件），tip 里是完整时间 + 星期。
+    assert.ok(src.includes('数据截至：') && src.includes('fmtWeekday(syncAt)'), '状态行没接 TapTip 的完整时间')
+    assert.ok((src.match(/<\$\{TapTip\}/g) || []).length >= 1, '状态行必须复用同一个 TapTip')
+  })
+
+  await aok('结构红线: v3.340 配置页可改通知自检拦截窗（前端）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    // ① API 层：两条读/写端点都用纯字面量 URL（Codacy SSRF 启发式的唯一全绿形态）。
+    assert.ok(src.includes('function apiGetConsoleSettings ()'), '缺少设置读面 apiGetConsoleSettings')
+    assert.ok(src.includes('function apiPostConsoleSettings (body)'), '缺少设置写面 apiPostConsoleSettings')
+    assert.strictEqual((src.match(/fetch\('\/api\/config\/console'/g) || []).length, 2,
+      'GET/POST 必须各一条字面量 fetch(/api/config/console)')
+
+    // ② 拦截提示的秒数来自服务端响应（拦截窗可配置，写死 60 会说谎）。
+    // 必须剥注释再匹配：原先直接 includes 时，把客户端改成写死 60、只在注释里留一句
+    // 「应取 data.replayWindowS」也能全绿（回潮实验 A6 实测）。
+    const notifySegRaw = src.slice(src.indexOf('async function triggerNotifyTest'), src.indexOf('function Badge ('))
+    const notifySeg = notifySegRaw.replace(/\/\*[^*]*\*+(?:[^/*][^*]*\*+)*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    assert.ok(notifySeg.includes('data.replayWindowS'), 'triggerNotifyTest 必须用响应里的 replayWindowS')
+    assert.ok(notifySeg.includes('Number.isInteger(data.replayWindowS)') &&
+      notifySeg.includes(': NOTIFY_WINDOW_DEFAULT_S'), '缺失时才回退默认值（三元两支都必须在）')
+    assert.ok(!/60 秒内无需重复/.test(notifySeg), '不得再写死「60 秒内无需重复」')
+    assert.ok(src.includes('typeof dupMsg === \'function\' ? dupMsg(data) : dupMsg'),
+      'triggerVia 必须支持函数式 dupMsg（保留字符串形态给 /trigger）')
+    // 只留着表达式不算修好：拦截文案必须真的由 dupMsg(data) 构造（Sourcery #303 M11）。
+    assert.ok(/const msg = typeof dupMsg === 'function' \? dupMsg\(data\) : dupMsg[\s\S]{0,160}new Error\(msg\)/.test(src),
+      '拦截提示必须用 dupMsg(data) 的结果构造 Error，不能留一段不参与构造的死代码')
+
+    // ③ 设置块（v3.342 从配置页搬到系统页）：保存带乐观锁、成功文案不吹「已生效」。
+    // 切片锚点必须真存在：锚点丢了 indexOf 返回 -1，slice 会退化成「文件余下全部」，
+    // 后面所有 includes 变成全文匹配、永久假绿。
+    const setStart = src.indexOf('function ConsoleSettingsBlock')
+    const setEnd = src.indexOf('// 系统信息：版本', setStart)
+    assert.ok(setStart >= 0 && setEnd > setStart, 'ConsoleSettingsBlock 切片锚点必须存在且有序')
+    const cfgBlock = src.slice(setStart, setEnd)
+    assert.ok(cfgBlock.includes('baseRevision: settingsLive.revision'), '保存必须带 baseRevision（乐观锁）')
+    assert.ok(cfgBlock.includes('notifyTestReplayWindowS'), '保存体字段名必须是 notifyTestReplayWindowS')
+    assert.ok(cfgBlock.includes('已保存 · 立即生效'), '保存成功文案为「已保存 · 立即生效」')
+    assert.ok(cfgBlock.includes('NOTIFY_WINDOW_MAX_S') && cfgBlock.includes('NOTIFY_WINDOW_MIN_S'),
+      '客户端校验边界必须走常量（与服务端 0–3600 同口径）')
+    assert.ok(/class="auto-input"[\s\S]{0,400}?disabled=\$\{winCurrent === null \|\| winSaving\}/.test(cfgBlock),
+      '读面失败/保存中时草稿框必须禁用（不得渲染旧值）')
+    assert.ok(cfgBlock.includes("'读取中…'"), '首帧必须显示「读取中」，不得把未加载伪装成读取失败')
+    assert.ok(cfgBlock.includes('winSavingRef.current'), '保存必须防连点（in-flight 守卫）')
+    assert.ok(cfgBlock.includes("payload.error === 'revision_mismatch'") && cfgBlock.includes('setWinDirty(false)'),
+      '409 后必须重读并复位脏标记（否则草稿再也不会跟随刷新）')
+    // 搬迁后的归属：配置页不再挂设置读面；系统页持有读面并在下拉/刷新里等它落定。
+    const cfgStart = src.indexOf('function ConfigPanel')
+    const cfgEnd = src.indexOf('// ── 过滤规则（v3.310）')
+    assert.ok(cfgStart >= 0 && cfgEnd > cfgStart, 'ConfigPanel 切片锚点必须存在且有序')
+    const cfg = src.slice(cfgStart, cfgEnd)
+    assert.ok(!cfg.includes('apiGetConsoleSettings'), '配置页不得再挂设置读面（v3.342 已搬到系统页）')
+    assert.ok(cfg.includes('Promise.allSettled([load(), loadEff()])'), '配置页刷新只拉自己两条')
+    const sysAt = src.indexOf('function SysPanel')
+    const sysEnd = src.indexOf('\nfunction ', sysAt + 10)
+    assert.ok(sysAt >= 0 && sysEnd > sysAt, 'SysPanel 切片锚点必须存在且有序')
+    const sysBlk = src.slice(sysAt, sysEnd)
+    assert.ok(sysBlk.includes('usePanelLoader(apiGetConsoleSettings'), '系统页必须持有设置读面')
+    assert.ok(sysBlk.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
+      '系统页刷新必须等三条都落定（下拉指示条不得提前收起）')
+    assert.ok(/<\$\{ConsoleSettingsBlock\} settings=\$\{settings\}/.test(sysBlk), '系统页必须渲染设置块并下传读面')
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
@@ -5624,7 +6182,7 @@ async function main () {
     assert.ok(filter.includes('dirtyRef.current = dirtyFields.length > 0'), 'dirtyRef 必须随草稿状态更新')
     assert.ok(filter.includes('if (dirtyRef.current) return'), '响应回来时草稿已变脏必须丢弃，不能覆盖用户改动')
     // ⑦ 指示条要等所有 loader 落定；排队/在飞的请求不能被提前结算。
-    assert.ok(src.includes('Promise.allSettled([load(), loadEff()])'), 'ConfigPanel.refresh 必须交出两个 loader 的 promise')
+    assert.ok(src.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'), 'SysPanel.refresh 必须交出三个 loader 的 promise（v3.342 设置块搬到系统页）')
     assert.ok(src.includes('idleWaitersRef'), 'LogsPanel 排队路径必须等「在飞 + 补跑」结束再 resolve')
     assert.ok(src.includes('window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail }))'), 'App 必须广播下拉刷新事件')
     assert.ok(src.includes('if (detail.waits.length === 0) return false'), '当前页没有面板接手时不得发全局请求，也不假装刷新')
@@ -5688,16 +6246,20 @@ async function main () {
   await aok('结构红线: v3.332 新版本提示（boot 版本 / 60s 对账 / 只提示不自动刷新）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
-    const server = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
+    const server = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
     // 版本只有一份来源：boot JSON 与 /api/sys 共用 APP_VERSION，别再各自 require package.json。
-    assert.ok(server.includes('const APP_VERSION = (() => {'), '版本必须抽成单一 APP_VERSION')
-    assert.ok(server.includes('JSON.stringify({ token: bootToken, version: APP_VERSION })'),
-      'boot JSON 必须注入版本（前端据此判断自己是不是旧页面）')
-    assert.ok(server.includes('const version = APP_VERSION'), '/api/sys 必须复用同一版本来源')
-    // 探针不能被缓存、不能挤掉访问日志，异常请求照记。
-    assert.ok(server.includes("res.setHeader('Cache-Control', 'no-store')"), '/api/sys 必须显式 no-store')
-    assert.ok(server.includes("url.searchParams.get('probe') === 'version'"), '探针必须可识别（probe=version）')
-    assert.ok(server.includes('if (!versionProbe && (url ? shouldLogAccess('), '探针 200 不入访问日志，401 等照记')
+    // 变异沙箱里 console.js 会被插桩：对象字面量与实参列表都被 stryMutAct_* 包裹，整句原文不再存在
+    // ⇒ 这些「源码串」红线只在原始源文件上有意义，插桩环境必须跳过（行为断言照跑）。
+    if (process.env.XBK_MUTATION_CHILD !== '1') {
+      assert.ok(server.includes('const APP_VERSION = (() => {'), '版本必须抽成单一 APP_VERSION')
+      assert.ok(server.includes('JSON.stringify({ token: bootToken, version: APP_VERSION })'),
+        'boot JSON 必须注入版本（前端据此判断自己是不是旧页面）')
+      assert.ok(server.includes('const version = APP_VERSION'), '/api/sys 必须复用同一版本来源')
+      // 探针不能被缓存、不能挤掉访问日志，异常请求照记。
+      assert.ok(server.includes("res.setHeader('Cache-Control', 'no-store')"), '/api/sys 必须显式 no-store')
+      assert.ok(server.includes("url.searchParams.get('probe') === 'version'"), '探针必须可识别（probe=version）')
+      assert.ok(server.includes('if (!versionProbe && (url ? shouldLogAccess('), '探针 200 不入访问日志，401 等照记')
+    }
     // 前端：读出 boot 版本，60s 对一次 /api/sys，只有不一致才提示。
     assert.ok(src.includes("version: typeof data.version === 'string' ? data.version : ''"), 'readBoot 必须解析 version')
     assert.ok(src.includes('const VERSION_CHECK_MS = 60000'), '对账间隔必须是 60s')
