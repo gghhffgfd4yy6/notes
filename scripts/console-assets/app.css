@@ -514,6 +514,7 @@
   /* ── 提示行 ── */
   .hint { margin-top: var(--sp-2); color: var(--text-dim); font-size: var(--fs-sm); display: flex; align-items: flex-start; gap: var(--sp-2); line-height: 1.55; flex-wrap: wrap; }
   .hint-err { color: var(--bad-fg); }
+  .hint-warn { color: var(--warn-fg); }
   .spin {
     width: 12px; height: 12px; border-radius: 50%;
     border: 2px solid var(--text-dim); border-top-color: transparent;
@@ -890,6 +891,9 @@
   .backup-item-main { font-weight: 600; font-size: var(--fs-sm); }
   .backup-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
   .backup-file { display: none; }
+  .backup-pass-box { display: grid; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--border); }
+  .backup-pass-row { display: grid; gap: 4px; color: var(--text-dim); font-size: var(--fs-sm); }
+  .backup-pass-row .fr-input { width: 100%; }
   .tpl-row { display: flex; gap: 10px; align-items: flex-start; padding: 6px 0; border-bottom: 1px dashed var(--border-soft); }
   .tpl-row:last-child { border-bottom: 0; padding-bottom: 0; }
   .tpl-row > span { color: var(--text-dim); font-size: var(--fs-xs); flex: 0 0 32px; line-height: 1.7; }
