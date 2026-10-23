@@ -706,6 +706,18 @@
   .runs-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   .runs-scroll .runs-table { min-width: 560px; }
   .runs-scroll .runs-table th, .runs-scroll .runs-table td { white-space: nowrap; }
+  /* 逐轮历史列宽固定：切「每页 10/20/50/100」时行数据变化，
+     自动布局会按内容重算列宽，导致获取/去重/过滤等列左右漂移。
+     用固定布局 + 百分比列宽，任何页大小、任何行内容都保持同一列位置。 */
+  .run-history-table { table-layout: fixed; }
+  .run-history-table .rh-time { width: 30%; }
+  .run-history-table .rh-get { width: 8%; }
+  .run-history-table .rh-dedup { width: 8%; }
+  .run-history-table .rh-filter { width: 8%; }
+  .run-history-table .rh-push { width: 16%; }
+  .run-history-table .rh-fail { width: 8%; }
+  .run-history-table .rh-elapsed { width: 10%; }
+  .run-history-table .rh-action { width: 12%; }
   /* v3.317 动作列贴右：表 597 / 可视 308 时，旧版「日志」按钮右边缘在 616——屏外 254px，
      手机上要横滑才够得着。末列固定到右缘 + 不透明行底色 + 左侧 1px 分隔线，不横滑也完整可点。
      横滑时它盖住的是「结果」列右侧的空白，不压「成功/失败」徽标。 */

@@ -2317,8 +2317,13 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     ${!data && !err && html`<div class="empty">加载中…</div>`}
     ${data && data.status === 'ok' && html`<div class="runs-scroll" ref=${listRef}>
       ${shown.length > 0
-        ? html`<table class="runs-table">
-      <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th></th></tr></thead>
+        ? html`<table class="runs-table run-history-table">
+      <colgroup>
+        <col class="rh-time" /><col class="rh-get" /><col class="rh-dedup" />
+        <col class="rh-filter" /><col class="rh-push" /><col class="rh-fail" />
+        <col class="rh-elapsed" /><col class="rh-action" />
+      </colgroup>
+      <thead><tr><th>时间</th><th>获取</th><th>去重</th><th>过滤</th><th>推送</th><th>失败</th><th>耗时</th><th aria-label="操作"></th></tr></thead>
       <tbody>
         ${shown.map((r, i) => html`<tr key=${`${r.at}-${r.lineNo}-${i}`}>
           <td class="mono">${r.cancelled === true ? `${r.at || '—'} ⏹已取消` : r.interrupted ? `${r.at || '—'} ⚠️中断` : (r.at || '—')}</td>

@@ -5733,8 +5733,21 @@ async function main () {
     const runsPanel = src.slice(src.indexOf('function RunsPanel'), src.indexOf('function RunHistoryPanel'))
     const histPanel = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
     assert.ok(runsPanel.includes('<div class="runs-scroll"><table class="runs-table">'), '触发历史表必须在 .runs-scroll 内')
-    assert.ok(histPanel.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && histPanel.includes('$' + '{shown.length > 0') && histPanel.includes('? html`<table class="runs-table">'), '逐轮历史表必须在 .runs-scroll 内（空态也保留容器）')
+    assert.ok(histPanel.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && histPanel.includes('$' + '{shown.length > 0') && histPanel.includes('? html`<table class="runs-table run-history-table">'), '逐轮历史表必须在 .runs-scroll 内（空态也保留容器）')
     assert.ok(histPanel.includes('<td class="run-actions">'), '逐轮历史的末列必须是动作列（其 sticky 才有意义）')
+  })
+
+  await aok('结构红线: 逐轮历史列宽固定（切每页不漂移）', () => {
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.css'), 'utf8')
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.js'), 'utf8')
+    const histPanel = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
+    assert.ok(histPanel.includes('<colgroup>'), '逐轮历史表必须有 colgroup 固定列宽')
+    for (const cls of ['rh-time', 'rh-get', 'rh-dedup', 'rh-filter', 'rh-push', 'rh-fail', 'rh-elapsed', 'rh-action']) {
+      assert.ok(histPanel.includes(`<col class="${cls}"`), `逐轮历史缺少列 ${cls}`)
+    }
+    assert.ok(/\.run-history-table\s*\{[^}]*table-layout:\s*fixed/.test(css), '逐轮历史必须 table-layout: fixed')
+    assert.ok(/\.run-history-table \.rh-time\s*\{\s*width:\s*30%/.test(css), '时间列宽必须固定')
+    assert.ok(/\.run-history-table \.rh-push\s*\{\s*width:\s*16%/.test(css), '推送列宽必须固定')
   })
 
   await aok('结构红线: v3.317 触发结果行（aria-live / 用 runs 结算 / 不位移 / 失败给原因）', () => {
