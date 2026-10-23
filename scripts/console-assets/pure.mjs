@@ -267,8 +267,8 @@ export function dateRangeLabel (from, to, todayKey = '') {
 // 口令派生用 PBKDF2-SHA256（迭代次数写进文件，导入时做上下限校验，防恶意文件拖死浏览器）。
 export const BACKUP_ENC_KIND = 'xbk-console-backup-encrypted'
 export const BACKUP_ENC_SCHEMA = 1
-export const BACKUP_ENC_ITERATIONS = 310000
-export const BACKUP_PASSWORD_MIN = 8
+export const BACKUP_ENC_ITERATIONS = 600000
+export const BACKUP_PASSWORD_MIN = 12
 const BACKUP_ENC_ITER_MIN = 100000
 const BACKUP_ENC_ITER_MAX = 1000000
 const BACKUP_ENC_SALT_BYTES = 16
@@ -311,12 +311,13 @@ function backupB64ToBytes (text) {
   return out
 }
 
-function backupEncHeader (iterations) {
+function backupEncHeader (iterations, createdAt) {
   return {
     kind: BACKUP_ENC_KIND,
     schema: BACKUP_ENC_SCHEMA,
     kdf: { name: 'PBKDF2', hash: 'SHA-256', iterations },
-    cipher: 'AES-GCM'
+    cipher: 'AES-GCM',
+    createdAt
   }
 }
 
@@ -332,7 +333,10 @@ function backupEnvelopeHeader (data) {
     throw new Error('备份文件的口令派生强度不合法')
   }
   if (data.cipher !== 'AES-GCM') throw new Error('备份文件的加密算法不支持')
-  return backupEncHeader(iterations)
+  if (typeof data.createdAt !== 'string' || data.createdAt.length < 10 || data.createdAt.length > 64) {
+    throw new Error('备份文件的创建时间字段不合法')
+  }
+  return backupEncHeader(iterations, data.createdAt)
 }
 
 function backupAad (header) {
@@ -376,7 +380,7 @@ export async function encryptBackup (bundle, password) {
   const c = backupCrypto()
   const salt = c.getRandomValues(new Uint8Array(BACKUP_ENC_SALT_BYTES))
   const iv = c.getRandomValues(new Uint8Array(BACKUP_ENC_IV_BYTES))
-  const header = backupEncHeader(BACKUP_ENC_ITERATIONS)
+  const header = backupEncHeader(BACKUP_ENC_ITERATIONS, new Date().toISOString())
   let plain
   try {
     plain = new TextEncoder().encode(JSON.stringify(bundle))
@@ -398,8 +402,7 @@ export async function encryptBackup (bundle, password) {
     ...header,
     salt: backupBytesToB64(salt),
     iv: backupBytesToB64(iv),
-    ciphertext: backupBytesToB64(ciphertext),
-    createdAt: new Date().toISOString()
+    ciphertext: backupBytesToB64(ciphertext)
   }
 }
 

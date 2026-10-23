@@ -486,15 +486,23 @@ function apiPostBackupExport (categories) {
     body: JSON.stringify({ categories })
   }, BACKUP_FETCH_TIMEOUT_MS)
   return fetch('/api/backup/export', merged).then(async (res) => {
-    const blob = await res.blob()
-    const text = await blob.text()
     if (!res.ok) {
+      const text = await res.text()
       let message = `HTTP ${res.status}`
       try {
         const data = JSON.parse(text)
         if (data && data.error) message = data.error
       } catch (e) { /* 非 JSON 错误体 */ }
       throw new Error(message)
+    }
+    // 先看服务端声明的长度，避免把接近 256MiB 的明文读进手机内存；没有 Content-Length 时读完再兜底。
+    const declared = Number(res.headers && typeof res.headers.get === 'function' ? res.headers.get('content-length') : '')
+    if (Number.isFinite(declared) && declared > BACKUP_BROWSER_MAX_BYTES) {
+      throw new Error('备份超过 32MB，浏览器加密会占用过多内存；请减少勾选类别')
+    }
+    const text = await res.text()
+    if (new TextEncoder().encode(text).length > BACKUP_BROWSER_MAX_BYTES) {
+      throw new Error('备份超过 32MB，浏览器加密会占用过多内存；请减少勾选类别')
     }
     done()
     const skippedHeader = res.headers && typeof res.headers.get === 'function' ? res.headers.get('X-Backup-Skipped') : ''
@@ -4051,9 +4059,11 @@ const BACKUP_CATEGORY_OPTIONS = [
   { key: 'auto', label: '自动运行间隔', desc: '只恢复间隔，不会打开自动运行' },
   { key: 'runLog', label: '运行日志', desc: 'run.log 运行记录' }
 ]
-// 服务端明文上限 256MiB；AES-GCM 密文转 base64 会膨胀约 4/3，所以浏览器选文件上限放宽到 384MiB。
+// 浏览器端加密要同时持有明文、密文和 base64 三份数据；服务端明文上限 256MiB 不代表手机扛得住。
+// 这里给浏览器导出设 32MiB 明文上限（密文约 43MiB），选文件上限 48MiB。
 // 明文备份仍会被服务端 256MiB 闸拦住，不会因为前端放宽就写坏缓存。
-const BACKUP_FILE_MAX_BYTES = 384 * 1024 * 1024
+const BACKUP_BROWSER_MAX_BYTES = 32 * 1024 * 1024
+const BACKUP_FILE_MAX_BYTES = 48 * 1024 * 1024
 
 function backupFileSummary (data) {
   const parts = []
@@ -4117,6 +4127,10 @@ function BackupBlock ({ onImported }) {
     const categories = BACKUP_CATEGORY_OPTIONS.filter((item) => selected[item.key]).map((item) => item.key)
     if (categories.length === 0) { setErr('至少勾选一项再导出'); return }
     if (passwordProblem !== '') { setErr(passwordProblem); return }
+    if (!window.isSecureContext || !window.crypto || !window.crypto.subtle) {
+      setErr('当前页面不是 HTTPS，浏览器无法加密备份；请用 https:// 打开控制台')
+      return
+    }
     setBusy('export'); setErr(''); setNote('')
     let url = ''
     try {
@@ -4164,7 +4178,7 @@ function BackupBlock ({ onImported }) {
     e.target.value = '' // 允许重复选同一个文件
     if (!file) return
     setErr(''); setNote('')
-    if (file.size > BACKUP_FILE_MAX_BYTES) { setErr('备份文件太大（上限 384MB，含加密膨胀）'); return }
+    if (file.size > BACKUP_FILE_MAX_BYTES) { setErr('备份文件太大（上限 48MB）'); return }
     try {
       const text = await file.text()
       const data = JSON.parse(text)
@@ -4263,16 +4277,16 @@ function BackupBlock ({ onImported }) {
         <label class="backup-pass-row">再输一次
           <input class="fr-input" type="password" value=${exportPassword2} autocomplete="new-password" onInput=${(e) => setExportPassword2(e.target.value)} />
         </label>
-        <div class="cfg-block-sub">至少 8 位。密码忘了，这份备份就打不开；密码只在浏览器里使用，不会发给服务器。</div>
+        <div class="cfg-block-sub">至少 12 位；建议用一句长口令或密码管理器生成的随机密码。密码忘了，这份备份就打不开；密码只在浏览器里使用，不会发给服务器。</div>
         ${exportPassword !== '' && passwordProblem !== '' && html`<${Hint} tone="error">${passwordProblem}<//>`}
       </div>
       ${err && html`<${Hint} tone="error">${err}<//>`}
-      <div class="modal-note">自动运行只备份间隔，不记录开关状态；导入时不会把自动运行打开。</div>
+      <div class="modal-note">自动运行只备份间隔，不记录开关状态；导入时不会把自动运行打开。浏览器加密导出最多 32MB；更大的备份请减少勾选类别。</div>
     <//>
     <${ConfirmDialog} open=${!!locked} title="输入备份密码" confirmLabel=${busy === 'unlock' ? '解密中…' : '解密'} busy=${busy === 'unlock'} confirmDisabled=${unlockPassword === ''} initialFocusRef=${unlockRef} onCancel=${closeUnlock} onConfirm=${doUnlock}>
       <div>这是加密备份：${locked ? locked.name : ''}</div>
       <label class="backup-pass-row">备份密码
-        <input class="fr-input" ref=${unlockRef} type="password" value=${unlockPassword} autocomplete="current-password" onInput=${(e) => setUnlockPassword(e.target.value)} onKeyDown=${(e) => { if (e.key === 'Enter' && unlockPassword !== '' && busy === '') doUnlock() }} />
+        <input class="fr-input" ref=${unlockRef} type="password" value=${unlockPassword} autocomplete="current-password" onInput=${(e) => setUnlockPassword(e.target.value)} onKeyDown=${(e) => { if (e.key === 'Enter' && unlockPassword !== '' && busy === '') doUnlock().catch(() => {}) }} />
       </label>
       ${err && html`<${Hint} tone="error">${err}<//>`}
       <div class="modal-note">密码只在这个浏览器里使用，不会发给服务器。解密后再确认导入。</div>
