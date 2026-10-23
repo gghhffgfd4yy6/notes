@@ -1391,8 +1391,8 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, onConfirm, onCancel, 
   </div>`
 }
 
-// 未保存草稿的离开拦截：三选一（取消 / 不保存并离开 / 去保存），默认焦点在取消。
-// 由 App 在“过滤页有脏草稿又要切页/后退”时挂出；保存仍走过滤页原来的确认流程。
+// 未保存草稿的离开拦截：三选一（取消 / 不保存并离开 / 保存并继续），默认焦点在取消。
+// 「保存并继续」会走正常的保存确认；只有真正保存成功，App 才继续原来的切页/后退动作。
 function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
   const cancelRef = useRef(null)
   const [titleId] = useState(() => `leave-title-${++dialogSeq}`)
@@ -1409,12 +1409,12 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
       <div class="modal-title" id=${titleId}>有未保存的过滤规则</div>
       <div class="modal-body">
         <div class="fr-dialog-line">当前有 ${count} 个字段还没保存。现在离开，这些修改会丢。</div>
-        <div class="modal-note">「去保存」会留在这里并打开保存确认；「不保存并离开」会丢掉这些修改；「取消」继续编辑。</div>
+        <div class="modal-note">「保存并继续」会先走正常的保存确认，保存成功后自动继续刚才的离开操作；「不保存并离开」会丢掉这些修改；「取消」继续编辑。</div>
       </div>
       <div class="modal-actions">
         <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${onCancel}>取消<//>
         <${Button} variant="danger-solid" disabled=${busy} onClick=${onDiscard}>不保存并离开<//>
-        <${Button} variant="primary" disabled=${busy} onClick=${onSave}>去保存<//>
+        <${Button} variant="primary" disabled=${busy} onClick=${onSave}>保存并继续<//>
       </div>
     </div>
   </div>`
@@ -4479,7 +4479,20 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   // v3.320：校验失败的定位旗（见下方 useLayoutEffect）。只有「确有字段错误」的失败
   // 提交会置它，成功路径与加载失败路径不碰。
   const revealFieldRef = useRef(false)
-  useEffect(() => () => { mountedRef.current = false }, [])
+  // 「保存并继续」的等待者：只有真正保存成功才 resolve(true)；取消/失败/卸载 resolve(false)。
+  const saveResultRef = useRef(null)
+  const settleSaveResult = useCallback((ok) => {
+    const pending = saveResultRef.current
+    saveResultRef.current = null
+    if (pending) pending.resolve(ok === true)
+  }, [])
+  useEffect(() => () => {
+    mountedRef.current = false
+    if (saveResultRef.current) {
+      saveResultRef.current.resolve(false)
+      saveResultRef.current = null
+    }
+  }, [])
 
   const applyLoaded = useCallback((d, files, serverDraft) => {
     const revision = d && Number.isSafeInteger(d.revision) ? d.revision : 0
@@ -4824,7 +4837,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
 
   // 保存前两次预检：/validate（逐字段语法）→ /preview（补推条数），再开二次确认弹窗。
   const beginSave = async () => {
-    if (!data || !draft || busy) return
+    if (!data || !draft || busy) return false
     setErr('')
     setFieldErrors({})
     setNotice(null)
@@ -4838,18 +4851,31 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       // confirmWideMatch:true 只关掉服务端的「宽匹配需确认」闸；真正的二次确认由本页弹窗
       // 负责（用户必须在弹窗里看到 .* 字段与补推条数后才会发出保存）。
       const checked = await apiPostFilterValidate({ schema: 1, filter: candidate, confirmWideMatch: true })
-      if (!checked.ok) { showFailure(checked, '校验未通过'); return }
+      if (!checked.ok) { showFailure(checked, '校验未通过'); return false }
       setBusy('preview')
       const pv = await apiPostFilterPreview({ schema: 1, filter: candidate, confirmWideMatch: true })
-      if (!pv.ok) { showFailure(pv, '补推预览失败'); return }
+      if (!pv.ok) { showFailure(pv, '补推预览失败'); return false }
       setPreview(pv.data)
       setDialog({ kind: 'save', filter: candidate, baseRevision: data.revision, preview: pv.data, wide: wideFieldsOf(candidate) })
+      return true
     } catch (e) {
       setErr(`保存前检查失败：${e.message}`)
+      return false
     } finally {
       setBusy('')
     }
   }
+
+  // 离开拦截里的「保存并继续」：挂一个等待保存结果的 Promise，再走正常保存确认。
+  // 只有 submitSave 真正成功才 resolve(true)；取消/失败/卸载都 resolve(false)，App 不跳页。
+  const beginGuardSave = useCallback(() => {
+    if (saveResultRef.current) saveResultRef.current.resolve(false)
+    const pending = new Promise((resolve) => { saveResultRef.current = { resolve } })
+    beginSave().then((opened) => {
+      if (!opened) settleSaveResult(false)
+    }).catch(() => settleSaveResult(false))
+    return pending
+  }, [beginSave, settleSaveResult])
 
   const runPreview = async () => {
     if (!draft || busy) return
@@ -4882,6 +4908,8 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       if (res.ok) {
         const payload = res.data && typeof res.data === 'object' ? res.data : {}
         applySaved(filter, payload.revision, copy === true)
+        // 保存并继续：真正落盘成功后才放行原来的切页/后退动作。
+        settleSaveResult(true)
         refreshBackups(Number.isSafeInteger(payload.revision) ? payload.revision : data.revision)
         return
       }
@@ -4897,9 +4925,11 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       }
       // 其余失败（revision_mismatch / write_busy / validation_failed / 503…）关掉确认弹窗，
       // 让顶部错误文案可见；草稿与 baseRevision 保留，用户可重新加载后再存。
+      settleSaveResult(false)
       setDialog(null)
     } catch (e) {
       setErr(`保存请求失败：${e.message}`)
+      settleSaveResult(false)
     } finally {
       setBusy('')
     }
@@ -5043,6 +5073,8 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
 
   const closeDialog = () => {
     if (busy) return
+    // 「保存并继续」后用户没确认保存：别把等待者一直挂着，也不能跳页。
+    if (dialog && (dialog.kind === 'save' || dialog.kind === 'corrupt' || dialog.kind === 'copyWide')) settleSaveResult(false)
     setDialog(null)
   }
 
@@ -5116,7 +5148,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       dirty,
       count: dirtyFields.length,
       busy: !!busy,
-      save: beginSave,
+      save: beginGuardSave,
       discard: discardDraft,
       restoreHistory
     }
@@ -6097,15 +6129,28 @@ function App () {
     }
     step()
   }
-  // 离开拦截三选一。history 来源不能直接切页：用户是在后退，放弃后要让浏览器继续走完。
-  const closeLeaveRequest = (mode) => {
+  // 离开拦截三选一。history 来源不能直接切页：用户是在后退，保存/放弃后要让浏览器继续走完。
+  const closeLeaveRequest = async (mode) => {
     const req = leaveRequest
     if (!req) return
     const guard = filterGuardRef.current
     if (mode === 'save') {
       setLeaveRequest(null)
-      if (guard && typeof guard.restoreHistory === 'function') guard.restoreHistory()
-      if (guard && typeof guard.save === 'function') guard.save()
+      let saved = false
+      try {
+        saved = guard && typeof guard.save === 'function' ? await guard.save() : false
+      } catch (e) {
+        saved = false
+      }
+      // 用户在保存确认里取消，或校验/保存失败：留在过滤页，草稿还在。
+      // history 来源的 sentinel 已被这次后退消费掉，取消时要补压一条，下一次左滑仍能拦。
+      if (!saved) {
+        if (req.source === 'history' && guard && typeof guard.restoreHistory === 'function') guard.restoreHistory()
+        return
+      }
+      // 只有真正保存成功，才继续点「概览」/后退之前的离开动作。
+      if (req.source === 'history') leaveHistory()
+      else if (req.target) doSwitchTab(req.target)
       return
     }
     if (mode === 'discard') {
