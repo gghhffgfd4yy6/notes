@@ -4062,13 +4062,19 @@ function backupFileSummary (data) {
 }
 
 // 同一次「选文件→确认导入」的重试沿用同一个幂等键；成功后弹窗关闭，下次重新生成。
+let backupImportSeq = 0
 function newBackupImportKey () {
   try {
-    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
-      return globalThis.crypto.randomUUID()
+    const c = globalThis.crypto
+    if (c && typeof c.getRandomValues === 'function') {
+      const b = new Uint32Array(4)
+      c.getRandomValues(b)
+      return `xbk-import-${Array.from(b, (n) => n.toString(16).padStart(8, '0')).join('')}`
     }
-  } catch (e) { /* 非安全上下文没有 randomUUID，退回时间戳+随机串 */ }
-  return `xbk-import-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    if (c && typeof c.randomUUID === 'function') return c.randomUUID()
+  } catch (e) { /* 非安全上下文/老浏览器：退回时间戳+进程内序号 */ }
+  backupImportSeq += 1
+  return `xbk-import-${Date.now().toString(36)}-${backupImportSeq}`
 }
 
 function BackupBlock ({ onImported }) {
