@@ -612,10 +612,14 @@ function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = 
     return () => clearInterval(t)
   }, [live])
   const at = lastSync ? fmtBarTime(lastSync, showDate) : '—'
-  if (paused) return html`已暂停 · 数据截至 · ${at}`
+  // 手机顶栏放不下「日期 + 时分秒 + 点看」：秒放进可隐藏的 span，点开仍看完整时间。
+  const colon = at.lastIndexOf(':')
+  const atMain = colon > 0 ? at.slice(0, colon) : at
+  const atSec = colon > 0 ? at.slice(colon) : ''
+  if (paused) return html`已暂停 · <span class="sync-label">数据截至 · </span>${atMain}<span class="sync-sec">${atSec}</span>`
   const sec = Math.max(1, Math.round(pollMs / 1000))
   const remain = live ? Math.max(0, Math.min(sec, Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000))) : sec
-  return html`自动刷新 ${remain}s · 数据截至 · ${at}`
+  return html`自动刷新 ${remain}s · <span class="sync-label">数据截至 · </span>${atMain}<span class="sync-sec">${atSec}</span>`
 }
 
 function fmtWeekday (ts) {
@@ -626,7 +630,7 @@ function fmtWeekday (ts) {
 // v3.341：窄屏下顶栏状态行会被省略号截断（时间只剩半截）。点一下就地弹出完整文本，点页面
 // 其它任意地方/按 Esc 收回。弹层用 position: fixed：祖先 .sync 是 overflow:hidden，绝对定位
 // 会被裁掉；fixed 也不受滚动容器影响（滚动时直接收回，避免跟着飘）。
-function TapTip ({ tip, children }) {
+function TapTip ({ tip, hint, children, showDate = true }) {
   const [open, setOpen] = useState(false)
   const [pos, setPos] = useState(null)
   const boxRef = useRef(null)
@@ -661,12 +665,12 @@ function TapTip ({ tip, children }) {
     }
     setOpen(true)
   }
-  return html`<span class="tap-tip" ref=${boxRef} role="button" tabindex="0"
+  return html`<span class=${showDate ? 'tap-tip tap-tip-date' : 'tap-tip'} ref=${boxRef} role="button" tabindex="0"
       aria-expanded=${open ? 'true' : 'false'}
       onClick=${(e) => { e.stopPropagation(); toggle() }}
       onKeyDown=${(e) => {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); toggle() }
-      }}>${children}</span>
+      }}><span class="tap-tip-text">${children}</span>${hint && html`<span class="tap-tip-hint">${hint}</span>`}</span>
     ${open && html`<span class="tap-tip-pop" ref=${popRef} role="tooltip"
       style=${pos ? `top:${pos.top}px;left:${pos.left}px;width:${pos.width}px` : ''}>${tip}</span>`}`
 }
@@ -3927,7 +3931,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
           ? '已保存 · 立即生效'
           : showDate === null
             ? (settingsPending ? '读取中…' : '读取失败')
-            : (showDate ? '关掉后只显示 时:分:秒（点一下仍可看完整日期）' : '当前只显示 时:分:秒（点一下可看完整日期）')}</span>
+            : (showDate ? '关掉后只显示 时:分:秒' : '当前只显示 时:分:秒')}</span>
     </label>
     ${dateErr && html`<${Hint} tone="error">${dateErr}<//>`}
   </div>`
@@ -4450,9 +4454,9 @@ function FilterField ({ def, value, saved, error, onChange }) {
       <code class="fr-key">${def.name}</code>
     </div>
     ${def.kind === 'days'
-      ? html`<input id=${id} class="fr-input fr-input-days" type="text" inputmode="numeric" autocomplete="off"
+      ? html`<textarea id=${id} class="fr-input fr-textarea fr-input-days" rows="2" spellcheck="false"
           value=${shown} aria-describedby=${describedBy} aria-invalid=${error ? 'true' : 'false'}
-          onInput=${(e) => onChange(def.name, e.target.value)} />`
+          onInput=${(e) => onChange(def.name, e.target.value)}></textarea>`
       : html`<textarea id=${id} class="fr-input fr-textarea" rows="2" spellcheck="false"
           value=${shown} aria-describedby=${describedBy} aria-invalid=${error ? 'true' : 'false'}
           onInput=${(e) => onChange(def.name, e.target.value)}></textarea>`}
@@ -6323,7 +6327,7 @@ function App () {
         <span class="sync-meta">
           ${pull.state !== 'idle'
             ? html`<${PullRefreshStatus} state=${pull.state} />`
-            : html`<${TapTip} tip=${showDate && syncAt ? `数据截至：${fmtLocalTime(syncAt)} ${fmtWeekday(syncAt)}` : ''}><${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${syncAt} showDate=${showDate} paused=${!autoRefresh || authExpired} live=${livePolling} /><//>`}
+            : html`<${TapTip} showDate=${showDate} tip=${showDate && syncAt ? `数据截至：${fmtLocalTime(syncAt)} ${fmtWeekday(syncAt)}` : ''} hint=${showDate && syncAt ? '点看' : ''}><${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${syncAt} showDate=${showDate} paused=${!autoRefresh || authExpired} live=${livePolling} /><//>`}
         </span>
         <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
           onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>

@@ -290,8 +290,10 @@
   .sync-meta { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* v3.341：顶栏状态行窄屏只显示半截时间——点一下弹出完整文本。弹层用 fixed 定位，避开
      .sync 的 overflow:hidden 裁剪；点页面其它任意地方或按 Esc 收回（见 TapTip）。 */
-  .tap-tip { display: block; max-width: 100%; min-width: 0; padding: 2px 0; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap; cursor: pointer; border-bottom: 1px dotted var(--border); }
+  .tap-tip { display: flex; align-items: center; gap: 4px; max-width: 100%; min-width: 0; padding: 2px 0;
+    overflow: hidden; cursor: pointer; }
+  .tap-tip-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tap-tip-hint { flex: 0 0 auto; color: var(--text-dim); font-size: var(--fs-2xs); white-space: nowrap; }
   .tap-tip:focus-visible { outline: var(--ring); outline-offset: 2px; border-radius: 4px; }
   .tap-tip-pop { position: fixed; z-index: 68; background: var(--panel-2); color: var(--text);
     border: 1px solid var(--border); border-radius: var(--r-md); padding: 8px 10px;
@@ -1043,6 +1045,10 @@
     }
     .sync:focus-visible { outline: var(--ring); outline-offset: 2px; border-radius: 4px; }
     .sync .sync-toggle:focus-visible { outline-offset: -2px; }
+    /* 顶栏空间不够：收起「数据截至」；日期开着时连秒也收起，把位置留给日期、时分和「点看」。
+       关掉日期时保留秒，和系统页「只显示 时:分:秒」一致。 */
+    .sync-label { display: none; }
+    .tap-tip-date .sync-sec { display: none; }
     .wrap { padding: var(--sp-3) 10px calc(30px + env(safe-area-inset-bottom)); }
     .cards { grid-template-columns: 1fr 1fr; gap: 10px; }
     .card { padding: 10px 12px; }

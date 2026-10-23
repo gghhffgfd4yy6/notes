@@ -6064,11 +6064,11 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.352：注释里不得提前写下一版 v3.353。
+    // 版本已 bump 到 3.353：注释里不得提前写下一版 v3.354。
     // 注意这条只拦「资源注释里提前写下个版本」；四处版本号（主文件头/CHANGELOG/package.json/
     // package-lock 两处）的一致性由 check-version.js 负责（CI 与 pre-commit 都跑，npm test 不含）。
-    assert.ok(!/v3\.353/.test(src), 'app.js 注释不得写 v3.353（版本未 bump）')
-    assert.ok(!/v3\.353/.test(css), 'app.css 注释不得写 v3.353（版本未 bump）')
+    assert.ok(!/v3\.354/.test(src), 'app.js 注释不得写 v3.354（版本未 bump）')
+    assert.ok(!/v3\.354/.test(css), 'app.css 注释不得写 v3.354（版本未 bump）')
   })
 
   await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
@@ -6089,12 +6089,15 @@ async function main () {
     assert.ok(src.includes('fmtBarTime(lastSync, showDate)'), '组件内必须走 fmtBarTime')
     // v3.343：气泡和年月日同步——关掉年月日时 tip 必须为空（TapTip 退化成纯文本）。
     assert.ok(/tip=\$\{showDate && syncAt \?/.test(src), '气泡必须跟着 showDate 一起关')
+    // v3.353：日期开着时用文字提醒可点看完整日期；关掉日期时不能承诺可点。
+    assert.ok(/hint=\$\{showDate && syncAt \? '点看' : ''\}/.test(src), '日期开着时必须有可点提醒')
+    assert.ok(!src.includes('点一下可看完整日期') && !src.includes('点一下仍可看完整日期'), '关掉日期时不得承诺点一下可看完整日期')
 
     // ②b v3.344：暂停不是概览专属——其它页也要能暂停/继续。
     //     v3.346：文案收敛到组件里，暂停只换开头两个字，后半句不变。
     assert.ok(!/\$\{tab === 'overview' && html`<button type="button" class="sync-toggle"/.test(src), '暂停按钮不得再限定在概览页')
-    assert.ok(/自动刷新 \$\{remain\}s · 数据截至 · \$\{at\}/.test(src), '运行态文案必须统一')
-    assert.ok(/已暂停 · 数据截至 · \$\{at\}/.test(src), '暂停态只换开头，后半句保持同一形态')
+    assert.ok(/自动刷新 \$\{remain\}s · <span class="sync-label">数据截至 · <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '运行态文案必须统一')
+    assert.ok(/已暂停 · <span class="sync-label">数据截至 · <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '暂停态只换开头，后半句保持同一形态')
     // v3.347：秒级时钟必须比 1s 快。1s 时钟与 mark() 不同相时，倒数会 5 4 3 2 → 5 跳过 1s
     // （真机录屏实证），所以这里钉住 500ms，防止有人「优化」回 1000。
     assert.ok(src.includes('setInterval(() => setNowMs(() => Date.now()), 500)'), '倒计时时钟必须是 500ms（1s 会跳秒）')
@@ -6147,10 +6150,25 @@ async function main () {
     const popCss = css.slice(css.indexOf('.tap-tip-pop {'), css.indexOf('}', css.indexOf('.tap-tip-pop {')))
     assert.ok(popCss.includes('position: fixed'), '.tap-tip-pop 必须 fixed 定位（祖先 .sync 会裁掉绝对定位）')
     assert.ok(popCss.includes('overflow-wrap: anywhere'), '完整时间必须能换行，不能又被省略号吃掉')
+    const tapCss = css.slice(css.indexOf('.tap-tip {'), css.indexOf('}', css.indexOf('.tap-tip {')))
+    assert.ok(!tapCss.includes('border-bottom'), '顶栏时间下方不得再画虚线（v3.353 改为文案提醒）')
+    assert.ok(css.includes('.tap-tip-date .sync-sec'), '手机日期开着时收起秒，关掉时保留秒')
+    assert.ok(/@media \(max-width: 640px\) \{[\s\S]*?\.sync-label \{ display: none; \}[\s\S]*?\.tap-tip-date \.sync-sec \{ display: none; \}/.test(css), '手机断点必须真的隐藏「数据截至」和日期开时的秒')
+    assert.ok(/class=\$\{showDate \? 'tap-tip tap-tip-date' : 'tap-tip'\}/.test(src), 'TapTip 必须知道日期是否开着')
 
     // ③ 状态行只有一处 TapTip：所有页共用（v3.346 收成一个组件），tip 里是完整时间 + 星期。
     assert.ok(src.includes('数据截至：') && src.includes('fmtWeekday(syncAt)'), '状态行没接 TapTip 的完整时间')
     assert.ok((src.match(/<\$\{TapTip\}/g) || []).length >= 1, '状态行必须复用同一个 TapTip')
+  })
+
+  await aok('结构红线: 屏蔽注册天数用多行输入框', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const daysAt = src.indexOf('def.kind === \'days\'')
+    const daysEnd = src.indexOf(': html`<textarea', daysAt)
+    const daysBlock = daysAt >= 0 && daysEnd > daysAt ? src.slice(daysAt, daysEnd) : ''
+    assert.ok(daysBlock.includes('<textarea') && daysBlock.includes('fr-input-days'), '天数分支必须渲染 textarea（不能只留 class）')
+    assert.ok(!daysBlock.includes('<input'), '天数分支不得退回单行 input')
+    assert.ok(src.includes('支持「分类###天数」多行写法'), '提示必须保留多行写法')
   })
 
   await aok('结构红线: v3.340 配置页可改通知自检拦截窗（前端）', () => {
