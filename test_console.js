@@ -1820,6 +1820,25 @@ async function backupUiStructureTests () {
     assert.ok(seg.indexOf('backup-list') > modalAt, '类别列表不得回到系统页内联显示')
     assert.ok(seg.includes('confirmDisabled='), '一个都没选时导出确认按钮必须禁用')
   })
+
+  await aok('结构红线: 备份在浏览器加密，密码不进请求', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const at = src.indexOf('function BackupBlock')
+    const end = src.indexOf('function SysPanel', at)
+    const seg = src.slice(at, end)
+    assert.ok(at > -1 && end > at, '应能定位 BackupBlock')
+    assert.match(src, /import \{[^}]*encryptBackup[^}]*decryptBackup[^}]*isEncryptedBackup[^}]*\} from '\.\/pure\.mjs'/, 'app.js 必须引用纯函数加密模块')
+    assert.ok(seg.includes('type="password"'), '导出/导入都必须有密码输入框')
+    assert.ok(seg.includes('.xbk`'), '下载扩展名必须是加密备份标识')
+    assert.ok(seg.includes('isEncryptedBackup(data)') && seg.includes('decryptBackup(locked.data'),
+      '导入必须先识别加密头，再在浏览器解密')
+    assert.ok(seg.includes('encryptBackup(bundle, exportPassword)'), '导出必须加密后才能落盘')
+    assert.ok(src.includes('const text = await blob.text()'), '导出响应必须先读 JSON 文本再加密，不能直接下载 blob')
+    assert.ok(src.includes('BACKUP_FILE_MAX_BYTES = 384 * 1024 * 1024'), '密文膨胀后的选文件上限必须放宽到 384MiB')
+    assert.ok(seg.includes('密码只在这个浏览器里使用，不会发给服务器'), '导入弹窗必须明示密码不上传')
+    assert.ok(/apiPostBackupImport\(pending\.bundle, pending\.key\)/.test(seg), '导入请求只能带解密后的 bundle 和幂等键')
+    assert.ok(!/apiPostBackupImport\([^)]*password/i.test(seg), '导入请求不得带密码')
+  })
 }
 
 async function main () {
@@ -4959,6 +4978,40 @@ async function main () {
     assert.strictEqual(cacheWriteInfo(now - (DAY + 60000), now).stale, true, '24h01m 必须告警')
     assert.strictEqual(cacheWriteInfo(now + 5000, now).ageText, '刚刚', '未来 mtime 仍显示相对时间')
     assert.strictEqual(cacheWriteInfo(null, now).ageText, '', '缺 mtime 不显示年龄')
+  })
+
+  await aok('行为: 备份加密往返（AES-GCM + PBKDF2，密码不落明文）', async () => {
+    const { encryptBackup, decryptBackup, isEncryptedBackup, backupPasswordProblem, BACKUP_ENC_KIND } =
+      await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(isEncryptedBackup({ kind: BACKUP_ENC_KIND }), true)
+    assert.strictEqual(isEncryptedBackup({ kind: 'xbk-console-backup' }), false)
+    assert.strictEqual(backupPasswordProblem('', ''), '密码至少 8 位')
+    assert.strictEqual(backupPasswordProblem('abcdefgh', 'abcdefgi'), '两次输入的密码不一致')
+    assert.strictEqual(backupPasswordProblem('abcdefgh', 'abcdefgh'), '')
+    const bundle = {
+      kind: 'xbk-console-backup',
+      schema: 1,
+      data: {
+        messages: { count: 1, text: '{"id":1,"title":"隐秘标题"}' },
+        auto: { interval: 16 }
+      }
+    }
+    const password = 'correct horse battery'
+    const enc = await encryptBackup(bundle, password)
+    assert.strictEqual(enc.kind, BACKUP_ENC_KIND)
+    assert.strictEqual(enc.cipher, 'AES-GCM')
+    assert.strictEqual(enc.kdf.name, 'PBKDF2')
+    assert.ok(enc.kdf.iterations >= 100000 && enc.kdf.iterations <= 1000000)
+    assert.ok(!JSON.stringify(enc).includes('隐秘标题'), '密文里不得出现明文内容')
+    assert.ok(!JSON.stringify(enc).includes(password), '密文里不得出现密码')
+    const dec = await decryptBackup(enc, password)
+    assert.deepStrictEqual(dec, bundle)
+    const enc2 = await encryptBackup(bundle, password)
+    assert.notStrictEqual(enc.salt, enc2.salt, '每次导出必须换新盐')
+    assert.notStrictEqual(enc.iv, enc2.iv, '每次导出必须换新 IV')
+    await assert.rejects(() => decryptBackup(enc, 'wrong password'), /密码不对/)
+    const flipped = (enc.ciphertext[0] === 'A' ? 'B' : 'A') + enc.ciphertext.slice(1)
+    await assert.rejects(() => decryptBackup({ ...enc, ciphertext: flipped }, password), /密码不对|被改过/)
   })
 
   await aok('行为: 日志异常口径与筛选（issue × 关键字交集）', async () => {

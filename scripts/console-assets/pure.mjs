@@ -260,3 +260,178 @@ export function dateRangeLabel (from, to, todayKey = '') {
   if (thisYear !== '' && fy !== thisYear) return `${from} ~ ${to.slice(5)}`
   return `${from.slice(5)} ~ ${to.slice(5)}`
 }
+
+// ── 数据备份加密（v3.356）──────────────────────────────────────────────────
+// 目的地：导出文件在浏览器里加密后再下载；导入时也在浏览器里解密后再发服务器。
+// 密码只存在于当前页面内存，不进入 URL、日志或请求体。算法固定为 AES-256-GCM，
+// 口令派生用 PBKDF2-SHA256（迭代次数写进文件，导入时做上下限校验，防恶意文件拖死浏览器）。
+export const BACKUP_ENC_KIND = 'xbk-console-backup-encrypted'
+export const BACKUP_ENC_SCHEMA = 1
+export const BACKUP_ENC_ITERATIONS = 310000
+export const BACKUP_PASSWORD_MIN = 8
+const BACKUP_ENC_ITER_MIN = 100000
+const BACKUP_ENC_ITER_MAX = 1000000
+const BACKUP_ENC_SALT_BYTES = 16
+const BACKUP_ENC_IV_BYTES = 12
+
+function backupCrypto () {
+  const c = globalThis.crypto
+  if (!c || !c.subtle || typeof c.subtle.importKey !== 'function' || typeof c.getRandomValues !== 'function') {
+    throw new Error('当前页面不是 HTTPS，浏览器不支持加密；请用 https:// 打开控制台')
+  }
+  return c
+}
+
+function backupPasswordText (password) {
+  if (typeof password !== 'string') throw new Error('请输入备份密码')
+  if (password.length < BACKUP_PASSWORD_MIN) throw new Error(`密码至少 ${BACKUP_PASSWORD_MIN} 位`)
+  if (password.length > 1024) throw new Error('密码太长')
+  return password
+}
+
+function backupBytesToB64 (bytes) {
+  let binary = ''
+  const chunk = 0x8000
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk))
+  }
+  return btoa(binary)
+}
+
+function backupB64ToBytes (text) {
+  if (typeof text !== 'string' || text === '') throw new Error('备份文件的加密字段不完整')
+  let binary
+  try {
+    binary = atob(text)
+  } catch (e) {
+    throw new Error('备份文件的加密字段损坏')
+  }
+  const out = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
+  return out
+}
+
+function backupEncHeader (iterations) {
+  return {
+    kind: BACKUP_ENC_KIND,
+    schema: BACKUP_ENC_SCHEMA,
+    kdf: { name: 'PBKDF2', hash: 'SHA-256', iterations },
+    cipher: 'AES-GCM'
+  }
+}
+
+function backupEnvelopeHeader (data) {
+  if (!data || typeof data !== 'object' || data.kind !== BACKUP_ENC_KIND) {
+    throw new Error('这不是加密的控制台备份文件')
+  }
+  if (data.schema !== BACKUP_ENC_SCHEMA) throw new Error('备份文件的加密版本不支持')
+  const kdf = data.kdf
+  if (!kdf || kdf.name !== 'PBKDF2' || kdf.hash !== 'SHA-256') throw new Error('备份文件的口令派生参数不支持')
+  const iterations = kdf.iterations
+  if (!Number.isInteger(iterations) || iterations < BACKUP_ENC_ITER_MIN || iterations > BACKUP_ENC_ITER_MAX) {
+    throw new Error('备份文件的口令派生强度不合法')
+  }
+  if (data.cipher !== 'AES-GCM') throw new Error('备份文件的加密算法不支持')
+  return backupEncHeader(iterations)
+}
+
+function backupAad (header) {
+  return new TextEncoder().encode(JSON.stringify(header))
+}
+
+async function backupDeriveKey (password, salt, iterations) {
+  const c = backupCrypto()
+  const material = await c.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(password),
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  )
+  return c.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  )
+}
+
+export function isEncryptedBackup (data) {
+  return Boolean(data) && typeof data === 'object' && data.kind === BACKUP_ENC_KIND
+}
+
+export function backupPasswordProblem (password, confirmation) {
+  if (typeof password !== 'string' || password.length < BACKUP_PASSWORD_MIN) {
+    return `密码至少 ${BACKUP_PASSWORD_MIN} 位`
+  }
+  if (password.length > 1024) return '密码太长'
+  if (typeof confirmation === 'string' && password !== confirmation) return '两次输入的密码不一致'
+  return ''
+}
+
+export async function encryptBackup (bundle, password) {
+  if (!bundle || typeof bundle !== 'object' || Array.isArray(bundle)) throw new Error('没有可加密的备份内容')
+  const pass = backupPasswordText(password)
+  const c = backupCrypto()
+  const salt = c.getRandomValues(new Uint8Array(BACKUP_ENC_SALT_BYTES))
+  const iv = c.getRandomValues(new Uint8Array(BACKUP_ENC_IV_BYTES))
+  const header = backupEncHeader(BACKUP_ENC_ITERATIONS)
+  let plain
+  try {
+    plain = new TextEncoder().encode(JSON.stringify(bundle))
+  } catch (e) {
+    throw new Error('备份内容无法序列化')
+  }
+  let ciphertext
+  try {
+    const key = await backupDeriveKey(pass, salt, BACKUP_ENC_ITERATIONS)
+    ciphertext = new Uint8Array(await c.subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: backupAad(header) },
+      key,
+      plain
+    ))
+  } catch (e) {
+    throw new Error('浏览器加密失败，请换最新版 Chrome/Safari 再试')
+  }
+  return {
+    ...header,
+    salt: backupBytesToB64(salt),
+    iv: backupBytesToB64(iv),
+    ciphertext: backupBytesToB64(ciphertext),
+    createdAt: new Date().toISOString()
+  }
+}
+
+export async function decryptBackup (data, password) {
+  const pass = backupPasswordText(password)
+  const header = backupEnvelopeHeader(data)
+  const salt = backupB64ToBytes(data.salt)
+  const iv = backupB64ToBytes(data.iv)
+  const ciphertext = backupB64ToBytes(data.ciphertext)
+  if (salt.length !== BACKUP_ENC_SALT_BYTES || iv.length !== BACKUP_ENC_IV_BYTES || ciphertext.length < 16) {
+    throw new Error('备份文件的加密字段长度不对')
+  }
+  const c = backupCrypto()
+  let plain
+  try {
+    const key = await backupDeriveKey(pass, salt, header.kdf.iterations)
+    plain = await c.subtle.decrypt(
+      { name: 'AES-GCM', iv, additionalData: backupAad(header) },
+      key,
+      ciphertext
+    )
+  } catch (e) {
+    throw new Error('密码不对，或者备份文件被改过')
+  }
+  let bundle
+  try {
+    bundle = JSON.parse(new TextDecoder().decode(plain))
+  } catch (e) {
+    throw new Error('解密后的内容不是有效备份')
+  }
+  if (!bundle || bundle.kind !== 'xbk-console-backup' || bundle.schema !== 1 || !bundle.data || typeof bundle.data !== 'object') {
+    throw new Error('解密后的内容不是控制台备份')
+  }
+  return bundle
+}

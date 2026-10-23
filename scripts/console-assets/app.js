@@ -9,7 +9,7 @@
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
-import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior, dateRangeLabel } from './pure.mjs'
+import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior, dateRangeLabel, encryptBackup, decryptBackup, isEncryptedBackup, backupPasswordProblem } from './pure.mjs'
 // 日期区间（v3.326）：flatpickr 4.6.13 的 ESM 单文件 bundle（含 zh 语言包，vendored 入库，
 // 与 htm-preact 同口径——不引 CDN，CSP script-src 'self' 覆盖）。样式在 flatpickr.css，
 // 主题化覆盖写在 app.css 的 .flatpickr-calendar 段（跟四套 token 走）。
@@ -477,7 +477,8 @@ function apiPostFilterPreview (body) {
   return consumeJsonResult(fetch('/api/config/filter/preview', merged), done)
 }
 
-// 数据备份：导出返回 blob（直接下载），导入返回 {ok, imported, backupDir}。
+// 数据备份：导出先取回 JSON 文本，浏览器加密后再下载；导入返回 {ok, imported, backupDir}。
+// 不能直接把服务器响应 blob 下载——那样落盘的是明文，浏览器端加密就失去意义。
 function apiPostBackupExport (categories) {
   const { merged, done } = timedRequest({
     method: 'POST',
@@ -486,10 +487,11 @@ function apiPostBackupExport (categories) {
   }, BACKUP_FETCH_TIMEOUT_MS)
   return fetch('/api/backup/export', merged).then(async (res) => {
     const blob = await res.blob()
+    const text = await blob.text()
     if (!res.ok) {
       let message = `HTTP ${res.status}`
       try {
-        const data = JSON.parse(await blob.text())
+        const data = JSON.parse(text)
         if (data && data.error) message = data.error
       } catch (e) { /* 非 JSON 错误体 */ }
       throw new Error(message)
@@ -497,7 +499,7 @@ function apiPostBackupExport (categories) {
     done()
     const skippedHeader = res.headers && typeof res.headers.get === 'function' ? res.headers.get('X-Backup-Skipped') : ''
     const skipped = skippedHeader ? skippedHeader.split(',') : []
-    return { blob, skipped }
+    return { text, skipped }
   }).catch((e) => { done(); throw e })
 }
 
@@ -712,9 +714,9 @@ function TapTip ({ tip, hint, children, showDate = true }) {
       style=${pos ? `top:${pos.top}px;left:${pos.left}px;width:${pos.width}px` : ''}>${tip}</span>`}`
 }
 
-// 提示行：tone='error' 时红色。页面不再拼 'hint hint-err' 字符串。
+// 提示行：tone='error' 红色、tone='warn' 琥珀色。页面不再拼 'hint hint-err' 字符串。
 function Hint ({ tone, style, children }) {
-  return html`<div class=${tone === 'error' ? 'hint hint-err' : 'hint'} style=${style}>${children}</div>`
+  return html`<div class=${tone === 'error' ? 'hint hint-err' : (tone === 'warn' ? 'hint hint-warn' : 'hint')} style=${style}>${children}</div>`
 }
 
 // 面板头：标题 + 说明 + 右侧操作（右侧自动左推）。含 select 等复杂头部仍可手写。
@@ -1455,16 +1457,19 @@ const ACTION_DEFS = [
 // 固定 id 会让无障碍名称重复（Sourcery #271）。
 let dialogSeq = 0
 
-function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, onConfirm, onCancel, children }) {
+function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, initialFocusRef = null, onConfirm, onCancel, children }) {
   const cancelRef = useRef(null)
   const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
   useEffect(() => {
     if (!open) return undefined
     const onKey = (e) => { if (e.key === 'Escape') onCancel() }
     document.addEventListener('keydown', onKey)
-    const t = setTimeout(() => { if (cancelRef.current) cancelRef.current.focus() }, 0)
+    const t = setTimeout(() => {
+      const target = initialFocusRef && initialFocusRef.current ? initialFocusRef.current : cancelRef.current
+      if (target) target.focus()
+    }, 0)
     return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
-  }, [open, onCancel])
+  }, [open, onCancel, initialFocusRef])
   if (!open) return null
   return html`<div class="modal-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCancel() }}>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby=${titleId}>
@@ -4046,6 +4051,9 @@ const BACKUP_CATEGORY_OPTIONS = [
   { key: 'auto', label: '自动运行间隔', desc: '只恢复间隔，不会打开自动运行' },
   { key: 'runLog', label: '运行日志', desc: 'run.log 运行记录' }
 ]
+// 服务端明文上限 256MiB；AES-GCM 密文转 base64 会膨胀约 4/3，所以浏览器选文件上限放宽到 384MiB。
+// 明文备份仍会被服务端 256MiB 闸拦住，不会因为前端放宽就写坏缓存。
+const BACKUP_FILE_MAX_BYTES = 384 * 1024 * 1024
 
 function backupFileSummary (data) {
   const parts = []
@@ -4088,8 +4096,14 @@ function BackupBlock ({ onImported }) {
   const [note, setNote] = useState('')
   const [pending, setPending] = useState(null)
   const [exportOpen, setExportOpen] = useState(false)
+  const [locked, setLocked] = useState(null)
+  const [exportPassword, setExportPassword] = useState('')
+  const [exportPassword2, setExportPassword2] = useState('')
+  const [unlockPassword, setUnlockPassword] = useState('')
   const fileRef = useRef(null)
+  const unlockRef = useRef(null)
   const allSelected = BACKUP_CATEGORY_OPTIONS.every((item) => selected[item.key])
+  const passwordProblem = backupPasswordProblem(exportPassword, exportPassword2)
   const toggleAll = () => {
     const next = {}
     for (const item of BACKUP_CATEGORY_OPTIONS) next[item.key] = !allSelected
@@ -4102,24 +4116,36 @@ function BackupBlock ({ onImported }) {
     if (busy !== '') return
     const categories = BACKUP_CATEGORY_OPTIONS.filter((item) => selected[item.key]).map((item) => item.key)
     if (categories.length === 0) { setErr('至少勾选一项再导出'); return }
+    if (passwordProblem !== '') { setErr(passwordProblem); return }
     setBusy('export'); setErr(''); setNote('')
     let url = ''
     try {
       const res = await apiPostBackupExport(categories)
-      const blob = res && res.blob ? res.blob : res
+      let bundle
+      try {
+        bundle = JSON.parse(res.text)
+      } catch (e) {
+        throw new Error('服务器返回的备份不是有效 JSON')
+      }
+      if (!bundle || bundle.kind !== 'xbk-console-backup' || bundle.schema !== 1 || !bundle.data) {
+        throw new Error('服务器返回的备份格式不对')
+      }
+      const packed = await encryptBackup(bundle, exportPassword)
+      const blob = new Blob([JSON.stringify(packed)], { type: 'application/json' })
       url = URL.createObjectURL(blob)
       const d = new Date()
       const pad = (n) => String(n).padStart(2, '0')
       const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
       const a = document.createElement('a')
       a.href = url
-      a.download = `xbk-backup-${stamp}.json`
+      a.download = `xbk-backup-${stamp}.xbk`
       document.body.appendChild(a)
       a.click()
       a.remove()
       const skipped = res && res.skipped ? res.skipped : []
       setExportOpen(false)
-      setNote(`已导出${categories.length}类数据${skipped.length > 0 ? `；另有 ${skipped.length} 类当前没有可导出的内容` : ''}`)
+      setExportPassword(''); setExportPassword2('')
+      setNote(`已导出${categories.length}类加密备份${skipped.length > 0 ? `；另有 ${skipped.length} 类当前没有可导出的内容` : ''}`)
     } catch (e) {
       setErr(`导出失败：${e && e.message ? e.message : e}`)
     } finally {
@@ -4128,7 +4154,7 @@ function BackupBlock ({ onImported }) {
     }
   }
   const openExport = () => {
-    setErr(''); setNote(''); setExportOpen(true)
+    setErr(''); setNote(''); setExportPassword(''); setExportPassword2(''); setExportOpen(true)
   }
   const chooseFile = () => {
     if (busy === '') fileRef.current && fileRef.current.click()
@@ -4138,19 +4164,50 @@ function BackupBlock ({ onImported }) {
     e.target.value = '' // 允许重复选同一个文件
     if (!file) return
     setErr(''); setNote('')
-    if (file.size > 256 * 1024 * 1024) { setErr('备份文件太大'); return }
+    if (file.size > BACKUP_FILE_MAX_BYTES) { setErr('备份文件太大（上限 384MB，含加密膨胀）'); return }
     try {
       const text = await file.text()
       const data = JSON.parse(text)
+      if (isEncryptedBackup(data)) {
+        if (!window.isSecureContext || !window.crypto || !window.crypto.subtle) {
+          throw new Error('加密备份需要在 HTTPS 页面打开')
+        }
+        setPending(null)
+        setLocked({ data, name: file.name })
+        setUnlockPassword('')
+        return
+      }
       if (!data || data.kind !== 'xbk-console-backup' || data.schema !== 1 || !data.data || typeof data.data !== 'object') {
         throw new Error('这不是控制台备份文件')
       }
       const parts = backupFileSummary(data.data)
       if (parts.length === 0) throw new Error('备份文件里没有可恢复的数据')
-      setPending({ bundle: data, summary: parts, key: newBackupImportKey() })
+      setLocked(null)
+      setPending({ bundle: data, summary: parts, key: newBackupImportKey(), encrypted: false })
     } catch (e) {
       setErr(`读取备份失败：${e && e.message ? e.message : e}`)
     }
+  }
+  const doUnlock = async () => {
+    if (!locked || busy !== '') return
+    if (unlockPassword === '') { setErr('请输入备份密码'); return }
+    setBusy('unlock'); setErr('')
+    try {
+      const bundle = await decryptBackup(locked.data, unlockPassword)
+      const parts = backupFileSummary(bundle.data)
+      if (parts.length === 0) throw new Error('备份文件里没有可恢复的数据')
+      setPending({ bundle, summary: parts, key: newBackupImportKey(), encrypted: true })
+      setLocked(null)
+      setUnlockPassword('')
+    } catch (e) {
+      setErr(`解密失败：${e && e.message ? e.message : e}`)
+    } finally {
+      setBusy('')
+    }
+  }
+  const closeUnlock = () => {
+    if (busy === 'unlock') return
+    setLocked(null); setUnlockPassword(''); setErr('')
   }
   const doImport = async () => {
     if (!pending || busy !== '') return
@@ -4183,11 +4240,11 @@ function BackupBlock ({ onImported }) {
     <div class="backup-actions backup-actions-main">
       <${Button} variant="secondary" disabled=${busy !== ''} onClick=${openExport}>导出<//>
       <${Button} variant="ghost" disabled=${busy !== ''} onClick=${chooseFile}>导入<//>
-      <input class="backup-file" ref=${fileRef} type="file" accept=".json,application/json" onChange=${onFile} />
+      <input class="backup-file" ref=${fileRef} type="file" accept=".xbk,.json,application/json" onChange=${onFile} />
     </div>
-    ${!exportOpen && !pending && err && html`<${Hint} tone="error">${err}<//>`}
+    ${!exportOpen && !pending && !locked && err && html`<${Hint} tone="error">${err}<//>`}
     ${note && html`<${Hint}>${note}<//>`}
-    <${ConfirmDialog} open=${exportOpen} title="选择要导出的数据" confirmLabel=${busy === 'export' ? '导出中…' : '导出'} busy=${busy === 'export'} confirmDisabled=${BACKUP_CATEGORY_OPTIONS.every((item) => !selected[item.key])} onCancel=${() => { if (busy !== 'export') setExportOpen(false) }} onConfirm=${doExport}>
+    <${ConfirmDialog} open=${exportOpen} title="选择要导出的数据" confirmLabel=${busy === 'export' ? '加密中…' : '导出'} busy=${busy === 'export'} confirmDisabled=${BACKUP_CATEGORY_OPTIONS.every((item) => !selected[item.key]) || passwordProblem !== ''} onCancel=${() => { if (busy !== 'export') setExportOpen(false) }} onConfirm=${doExport}>
       <div class="backup-pick-head">
         <label class="backup-check"><input type="checkbox" checked=${allSelected} onChange=${toggleAll} /> 全选</label>
         <span class="cfg-block-sub">只导出勾选的类别</span>
@@ -4199,11 +4256,31 @@ function BackupBlock ({ onImported }) {
           <span class="cfg-block-sub">${item.desc}</span>
         </label>`)}
       </div>
+      <div class="backup-pass-box">
+        <label class="backup-pass-row">设置备份密码
+          <input class="fr-input" type="password" value=${exportPassword} autocomplete="new-password" onInput=${(e) => setExportPassword(e.target.value)} />
+        </label>
+        <label class="backup-pass-row">再输一次
+          <input class="fr-input" type="password" value=${exportPassword2} autocomplete="new-password" onInput=${(e) => setExportPassword2(e.target.value)} />
+        </label>
+        <div class="cfg-block-sub">至少 8 位。密码忘了，这份备份就打不开；密码只在浏览器里使用，不会发给服务器。</div>
+        ${exportPassword !== '' && passwordProblem !== '' && html`<${Hint} tone="error">${passwordProblem}<//>`}
+      </div>
       ${err && html`<${Hint} tone="error">${err}<//>`}
       <div class="modal-note">自动运行只备份间隔，不记录开关状态；导入时不会把自动运行打开。</div>
     <//>
+    <${ConfirmDialog} open=${!!locked} title="输入备份密码" confirmLabel=${busy === 'unlock' ? '解密中…' : '解密'} busy=${busy === 'unlock'} confirmDisabled=${unlockPassword === ''} initialFocusRef=${unlockRef} onCancel=${closeUnlock} onConfirm=${doUnlock}>
+      <div>这是加密备份：${locked ? locked.name : ''}</div>
+      <label class="backup-pass-row">备份密码
+        <input class="fr-input" ref=${unlockRef} type="password" value=${unlockPassword} autocomplete="current-password" onInput=${(e) => setUnlockPassword(e.target.value)} onKeyDown=${(e) => { if (e.key === 'Enter' && unlockPassword !== '' && busy === '') doUnlock() }} />
+      </label>
+      ${err && html`<${Hint} tone="error">${err}<//>`}
+      <div class="modal-note">密码只在这个浏览器里使用，不会发给服务器。解密后再确认导入。</div>
+    <//>
     <${ConfirmDialog} open=${!!pending} title="确认导入备份" confirmLabel=${busy === 'import' ? '导入中…' : '确认导入'} busy=${busy === 'import'} onCancel=${() => { if (busy !== 'import') setPending(null) }} onConfirm=${doImport}>
       <div>文件里检测到：${pending ? pending.summary.join('、') : ''}</div>
+      ${pending && pending.encrypted && html`<${Hint}>已在本机解密；密码没有发给服务器。<//>`}
+      ${pending && !pending.encrypted && html`<${Hint} tone="warn">这是未加密的旧备份，文件里是明文；可以用，但建议以后导出加密备份。<//>`}
       ${err && html`<${Hint} tone="error">${err}<//>`}
       <div class="modal-note">导入会覆盖当前对应的数据；导入前会先把当前数据另存一份。自动运行开关不会被打开，仍保持导入前的状态。导入期间请先停掉外部定时任务，避免它用旧缓存覆盖刚恢复的记录。</div>
     <//>
