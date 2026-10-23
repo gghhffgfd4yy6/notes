@@ -1353,6 +1353,52 @@ const AUTO_MAX_S = 20
 const CONFIRM_NAMES_WAIT_MS = 600
 const AUTO_DEFAULT_S = 10
 const AUTO_MAX_FAILS = 3
+// 数字输入框统一禁用，只允许用加减按钮调整；按住 450ms 后连续变化，
+// 越按越快（最多 50/次），避免从 10 调到 3600 要点几百下。
+const HOLD_START_MS = 450
+const HOLD_REPEAT_MS = 110
+const HOLD_ACCEL_MS = 1000
+const HOLD_MAX_STEP = 50
+function useHoldRepeat (onStep, disabled = false) {
+  const timerRef = useRef(0)
+  const activeRef = useRef(false)
+  const startedAtRef = useRef(0)
+  const stepRef = useRef(onStep)
+  stepRef.current = onStep
+  const stop = useCallback(() => {
+    activeRef.current = false
+    clearTimeout(timerRef.current)
+  }, [])
+  useEffect(() => {
+    if (disabled) stop()
+    return stop
+  }, [disabled, stop])
+  const start = (delta) => (e) => {
+    if (disabled || activeRef.current) return
+    if (e && e.pointerType === 'mouse' && e.button !== 0) return
+    if (e && e.cancelable) e.preventDefault()
+    activeRef.current = true
+    startedAtRef.current = Date.now()
+    try { e.currentTarget.setPointerCapture(e.pointerId) } catch (_) {}
+    stepRef.current(delta)
+    const tick = () => {
+      if (!activeRef.current) return
+      const elapsed = Date.now() - startedAtRef.current
+      const mult = elapsed < HOLD_ACCEL_MS
+        ? 1
+        : Math.min(HOLD_MAX_STEP, 1 + Math.floor((elapsed - HOLD_ACCEL_MS) / 250))
+      stepRef.current(delta * mult)
+      timerRef.current = setTimeout(tick, HOLD_REPEAT_MS)
+    }
+    timerRef.current = setTimeout(tick, HOLD_START_MS)
+  }
+  const click = (delta) => (e) => {
+    // 鼠标/触摸的第一次变化在 pointerdown 已做；键盘（detail=0）和读屏仍走 click。
+    if (!disabled && e && e.detail === 0) stepRef.current(delta)
+  }
+  const contextMenu = (e) => e.preventDefault()
+  return { start, stop, click, contextMenu }
+}
 function clampAutoSeconds (v) {
   const n = Math.round(Number(v))
   if (!Number.isFinite(n)) return AUTO_DEFAULT_S
@@ -1508,10 +1554,10 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
   useEffect(() => { setAutoDraft(String(auto.interval)) }, [auto.interval])
   useEffect(() => () => clearTimeout(autoSavedTimerRef.current), [])
   const adjustAuto = (delta) => {
-    const next = clampAutoSeconds(Number(autoDraft) + delta)
-    setAutoDraft(String(next))
+    setAutoDraft((prev) => String(clampAutoSeconds(Number(prev) + delta)))
     setAutoSaved(false)
   }
+  const holdAuto = useHoldRepeat(adjustAuto)
   const flashAutoSaved = () => {
     setAutoSaved(true)
     clearTimeout(autoSavedTimerRef.current)
@@ -1619,19 +1665,23 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
         ${auto.on && html`<span class="auto-run-live">运行中</span>`}
       </div>
       <div class="auto-run-row">
-        <button type="button" class="auto-step" aria-label="减少间隔" onClick=${() => adjustAuto(-1)}>−</button>
+        <button type="button" class="auto-step" aria-label="减少间隔"
+          onPointerDown=${holdAuto.start(-1)} onPointerUp=${holdAuto.stop} onPointerLeave=${holdAuto.stop}
+          onPointerCancel=${holdAuto.stop} onLostPointerCapture=${holdAuto.stop}
+          onContextMenu=${holdAuto.contextMenu} onClick=${holdAuto.click(-1)}>−</button>
         <input class="auto-input" type="number" inputmode="numeric" min=${AUTO_MIN_S} max=${AUTO_MAX_S} step="1"
-          aria-label="自动运行间隔（秒）" value=${autoDraft}
-          onInput=${(e) => { setAutoDraft(e.target.value); setAutoSaved(false) }}
-          onBlur=${() => setAutoDraft(String(clampAutoSeconds(autoDraft)))} />
+          aria-label="自动运行间隔（秒）" value=${autoDraft} disabled=${true} />
         <span class="auto-unit">秒</span>
-        <button type="button" class="auto-step" aria-label="增加间隔" onClick=${() => adjustAuto(1)}>+</button>
+        <button type="button" class="auto-step" aria-label="增加间隔"
+          onPointerDown=${holdAuto.start(1)} onPointerUp=${holdAuto.stop} onPointerLeave=${holdAuto.stop}
+          onPointerCancel=${holdAuto.stop} onLostPointerCapture=${holdAuto.stop}
+          onContextMenu=${holdAuto.contextMenu} onClick=${holdAuto.click(1)}>+</button>
         <${Button} variant="secondary" onClick=${saveAuto}>保存<//>
         ${auto.on
           ? html`<${Button} variant="danger" onClick=${stopAuto}>停止<//>`
           : html`<${Button} variant="danger-solid" onClick=${askAuto}>开始<//>`}
       </div>
-      <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒；由服务器常驻运行，关闭页面、切后台、锁屏都不影响，点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次会自动停止。</div>
+      <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒（输入框已锁，长按加减可快速调整）；由服务器常驻运行，关闭页面、切后台、锁屏都不影响，点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次会自动停止。</div>
       ${auto.on && html`<div class="auto-run-status">${auto.nextAt > 0 ? `下一轮 ${Math.max(0, Math.ceil((auto.nextAt - auto.now) / 1000))} 秒` : '本轮进行中'} · 已自动运行 ${auto.runs} 轮</div>`}
       ${!auto.on && html`<div class="auto-run-status">${autoSaved ? '间隔已保存' : ''}</div>`}
       ${auto.err && html`<${Hint} tone="error">${auto.err}<//>`}
@@ -3809,14 +3859,17 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
   }, [winCurrent, winDirty])
   const adjustWin = (delta) => {
     if (winCurrent === null || winSavingRef.current) return
-    const typed = winDraft.trim() === '' ? Number.NaN : Number(winDraft)
-    const base = Number.isInteger(typed) ? typed : winCurrent
-    const next = Math.min(NOTIFY_WINDOW_MAX_S, Math.max(NOTIFY_WINDOW_MIN_S, base + delta))
-    setWinDraft(String(next))
+    setWinDraft((prev) => {
+      const typed = prev.trim() === '' ? Number.NaN : Number(prev)
+      const base = Number.isInteger(typed) ? typed : winCurrent
+      const next = Math.min(NOTIFY_WINDOW_MAX_S, Math.max(NOTIFY_WINDOW_MIN_S, base + delta))
+      return String(next)
+    })
     setWinDirty(true)
     setWinSaved(false)
     setWinErr('')
   }
+  const holdWin = useHoldRepeat(adjustWin, winCurrent === null || winSaving)
   // 保存：客户端只做「整数 0–3600」这一层拦截（非法值不发请求）；带 baseRevision 做乐观锁，
   // 别处改过就 409，这里重读让用户看清当前值再决定。
   const saveWin = async () => {
@@ -3901,13 +3954,18 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
       <span class="cfg-block-sub">重复提交拦截窗 · ${winSourceLabel}</span>
     </div>
     <div class="auto-run-row">
-      <button type="button" class="auto-step" aria-label="减少" disabled=${winCurrent === null || winSaving} onClick=${() => adjustWin(-1)}>−</button>
+      <button type="button" class="auto-step" aria-label="减少" disabled=${winCurrent === null || winSaving}
+        onPointerDown=${holdWin.start(-1)} onPointerUp=${holdWin.stop} onPointerLeave=${holdWin.stop}
+        onPointerCancel=${holdWin.stop} onLostPointerCapture=${holdWin.stop}
+        onContextMenu=${holdWin.contextMenu} onClick=${holdWin.click(-1)}>−</button>
       <input class="auto-input" type="number" inputmode="numeric"
         min=${NOTIFY_WINDOW_MIN_S} max=${NOTIFY_WINDOW_MAX_S} step="1"
-        aria-label="通知自检拦截窗（秒）" value=${winCurrent === null ? '' : winDraft} disabled=${winCurrent === null || winSaving}
-        onInput=${(e) => { setWinDraft(e.target.value); setWinDirty(true); setWinSaved(false); setWinErr('') }} />
+        aria-label="通知自检拦截窗（秒）" value=${winCurrent === null ? '' : winDraft} disabled=${true} />
       <span class="auto-unit">秒</span>
-      <button type="button" class="auto-step" aria-label="增加" disabled=${winCurrent === null || winSaving} onClick=${() => adjustWin(1)}>+</button>
+      <button type="button" class="auto-step" aria-label="增加" disabled=${winCurrent === null || winSaving}
+        onPointerDown=${holdWin.start(1)} onPointerUp=${holdWin.stop} onPointerLeave=${holdWin.stop}
+        onPointerCancel=${holdWin.stop} onLostPointerCapture=${holdWin.stop}
+        onContextMenu=${holdWin.contextMenu} onClick=${holdWin.click(1)}>+</button>
       <${Button} variant="secondary" disabled=${winCurrent === null || winSaving} onClick=${saveWin}>保存<//>
       ${winSaved && html`<span class="cfg-block-sub" role="status" aria-live="polite">已保存 · 立即生效</span>`}
     </div>
@@ -3915,7 +3973,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
       ? '正在读取当前生效值…'
       : winCurrent === null
         ? `当前生效值读取失败，暂不可修改（点右上「刷新」重试）：${settingsErr || '未知错误'}`
-        : `当前生效 ${winCurrent} 秒 · 0 = 关闭拦截（连点会重复真实发送）· 保存后下一次触发立即生效`}</div>
+        : `当前生效 ${winCurrent} 秒 · 0 = 关闭拦截（连点会重复真实发送）· 长按加减可快速调整 · 保存后下一次触发立即生效`}</div>
     ${winErr && html`<${Hint} tone="error">${winErr}<//>`}
     <div class="cfg-block-head set-head">
       <span class="cfg-block-title">顶栏时间</span>

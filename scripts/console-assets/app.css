@@ -469,6 +469,7 @@
     background: var(--panel-2); color: var(--text); font-size: var(--fs-lg);
     display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
     transition: filter var(--dur-fast), transform .05s;
+    touch-action: none; user-select: none; -webkit-user-select: none;
   }
   .auto-step:hover { filter: brightness(1.2); }
   .auto-step:active { transform: translateY(1px); }
@@ -484,6 +485,10 @@
     text-align: center; font-variant-numeric: tabular-nums;
   }
   .auto-input:focus { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+  .auto-input:disabled {
+    opacity: 1; color: var(--text); -webkit-text-fill-color: var(--text);
+    background: var(--panel); cursor: default;
+  }
   .auto-input::-webkit-outer-spin-button,
   .auto-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
   .auto-input { -moz-appearance: textfield; appearance: textfield; }

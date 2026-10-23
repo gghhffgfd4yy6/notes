@@ -6171,6 +6171,29 @@ async function main () {
     assert.ok(src.includes('支持「分类###天数」多行写法'), '提示必须保留多行写法')
   })
 
+  await aok('结构红线: 数字框锁定，长按加减连续调整', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
+    const cfgStart = src.indexOf('function ConsoleSettingsBlock')
+    const cfgEnd = src.indexOf('// 系统信息：版本', cfgStart)
+    const cfgBlock = src.slice(cfgStart, cfgEnd)
+    assert.ok(/class="auto-input"[\s\S]{0,260}?disabled=\$\{true\}/.test(trigger), '自动运行间隔输入框必须锁定')
+    assert.ok(/class="auto-input"[\s\S]{0,260}?disabled=\$\{true\}/.test(cfgBlock), '通知自检拦截窗输入框必须锁定')
+    assert.ok(!/class="auto-input"[\s\S]{0,260}?onInput=/.test(trigger), '自动运行间隔不得再接受键入')
+    assert.ok(!/class="auto-input"[\s\S]{0,260}?onInput=/.test(cfgBlock), '通知自检拦截窗不得再接受键入')
+    assert.ok(src.includes('function useHoldRepeat') && src.includes('HOLD_START_MS') && src.includes('HOLD_REPEAT_MS'),
+      '必须复用长按连续调整 hook')
+    assert.ok(trigger.includes('onPointerDown=$' + '{holdAuto.start(-1)}') && trigger.includes('onPointerDown=$' + '{holdAuto.start(1)}'),
+      '自动运行加减必须接长按')
+    assert.ok(cfgBlock.includes('onPointerDown=$' + '{holdWin.start(-1)}') && cfgBlock.includes('onPointerDown=$' + '{holdWin.start(1)}'),
+      '通知自检加减必须接长按')
+    assert.ok(trigger.includes('setAutoDraft((prev) =>') && cfgBlock.includes('setWinDraft((prev) =>'),
+      '快速长按必须用函数式更新，避免连续增量丢失')
+    assert.ok(css.includes('touch-action: none') && css.includes('.auto-input:disabled'),
+      '长按按钮要禁用触摸手势，禁用输入框要保持可读')
+  })
+
   await aok('结构红线: v3.340 配置页可改通知自检拦截窗（前端）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
     // ① API 层：两条读/写端点都用纯字面量 URL（Codacy SSRF 启发式的唯一全绿形态）。
