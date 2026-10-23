@@ -1632,6 +1632,109 @@ async function backupApiTests () {
     }
   })
 
+  await aok('数据备份: 导出校验过滤规则，坏规则跳过不拖累整包', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'a' }]))
+    fs.writeFileSync(path.join(dir, 'filter-rules.json'), JSON.stringify({ schema: 1, revision: 2, filter: { pingbifenlei: '(' } }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const res = await request(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['messages', 'filter'] }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(res.status, 200, res.text)
+      const bundle = JSON.parse(res.text)
+      assert.ok(bundle.data.messages, '推送记录仍应导出')
+      assert.ok(!bundle.data.filter, '坏过滤规则不得进入备份')
+      assert.ok(bundle.skipped.some((x) => x.key === 'filter' && x.reason === 'invalid_filter'), '必须报告过滤规则被跳过')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('数据备份: 坏消息条目拒绝导入；中途写失败整体回滚', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    const pushPath = path.join(dir, 'push.json')
+    fs.writeFileSync(pushPath, JSON.stringify([{ id: 1, title: 'old' }]))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const invalid = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: { messages: { count: 1, text: JSON.stringify([{ id: 2 }]) } }
+      }
+      const bad = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(invalid),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(bad.status, 400)
+      assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 1, title: 'old' }]))
+
+      // run.log 预置成目录：writeAtomic 必失败，前面已写成功的 push.json 必须被回滚。
+      fs.mkdirSync(path.join(dir, 'run.log'))
+      const rollback = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: {
+          messages: { count: 1, text: JSON.stringify([{ id: 2, title: 'new' }]) },
+          runLog: { text: 'new log\n' }
+        }
+      }
+      const failed = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(rollback),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(failed.status, 500, failed.text)
+      assert.strictEqual(JSON.parse(failed.text).rolledBack, true, '回滚必须成功')
+      assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 1, title: 'old' }]), '失败导入不得留下半套数据')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('数据备份: 判重历史随消息恢复，重复导入按幂等键返回原结果', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    const pushPath = path.join(dir, 'push.json')
+    const seenPath = path.join(dir, 'push.json.seen.json')
+    fs.writeFileSync(pushPath, JSON.stringify([{ id: 1, title: 'old' }]))
+    fs.writeFileSync(seenPath, JSON.stringify({ v: 1, id: ['old'] }))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const bundle = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: {
+          messages: {
+            count: 1,
+            text: JSON.stringify([{ id: 9, title: 'new' }]),
+            seenText: JSON.stringify({ v: 1, id: ['new'] })
+          }
+        }
+      }
+      const headers = { 'content-type': 'application/json', 'idempotency-key': 'test-import-key-0001' }
+      const first = await request(port, 'POST', '/api/backup/import', { token: TOKEN, body: JSON.stringify(bundle), headers })
+      assert.strictEqual(first.status, 200, first.text)
+      assert.strictEqual(fs.readFileSync(seenPath, 'utf8'), JSON.stringify({ v: 1, id: ['new'] }))
+      // 模拟导入成功后又有新记录写入；同一请求重试不能把它们覆盖回旧备份。
+      fs.writeFileSync(pushPath, JSON.stringify([{ id: 10, title: 'newer' }]))
+      const again = await request(port, 'POST', '/api/backup/import', { token: TOKEN, body: JSON.stringify(bundle), headers })
+      assert.strictEqual(again.status, 200, again.text)
+      assert.deepStrictEqual(JSON.parse(again.text).imported.messages, 1)
+      assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 10, title: 'newer' }]))
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   await aok('数据备份: 导入自动识别并恢复，未含类别不动，自动运行开关保持停止', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
     fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'old' }]))
@@ -1666,6 +1769,8 @@ async function backupApiTests () {
       assert.ok(result.backupDir)
       assert.strictEqual(fs.readFileSync(path.join(dir, 'push.json'), 'utf8'), '[{"id":9,"title":"new"}]')
       assert.match(fs.readFileSync(path.join(dir, 'filter-rules.json'), 'utf8'), /"pingbifenlei":"new"/)
+      const auditLines = fs.readFileSync(path.join(dir, 'filter-rules.audit.ndjson'), 'utf8').trim().split('\n')
+      assert.strictEqual(JSON.parse(auditLines[auditLines.length - 1]).action, 'import', '过滤规则导入必须留审计')
       assert.strictEqual(fs.readFileSync(path.join(dir, 'run.log'), 'utf8'), 'new log\n')
       const autoFile = JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8'))
       assert.strictEqual(autoFile.interval, 12)
@@ -1677,7 +1782,7 @@ async function backupApiTests () {
       const partial = {
         kind: 'xbk-console-backup',
         schema: 1,
-        data: { messages: { count: 1, text: JSON.stringify([{ id: 10 }]) } }
+        data: { messages: { count: 1, text: JSON.stringify([{ id: 10, title: 'c' }]) } }
       }
       const again = await request(port, 'POST', '/api/backup/import', {
         token: TOKEN,

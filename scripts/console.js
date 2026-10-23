@@ -102,7 +102,9 @@ const MESSAGES_MAX_BYTES = 64 * 1024 * 1024
 // 自动运行只备份 interval，不备份 on/off——导入永远不会把自动运行打开。
 const BACKUP_KIND = 'xbk-console-backup'
 const BACKUP_SCHEMA = 1
-const BACKUP_MAX_BYTES = 128 * 1024 * 1024
+// 导出上限必须与导入上限一致：源文件各有上限，但 JSON 字符串转义会膨胀（换行/引号至少 2×），
+// 128MiB 时「能导出却导不回来」。256MiB 覆盖 64MiB 推送记录 + 8MiB 墓碑 + 16MiB 日志的正常转义。
+const BACKUP_MAX_BYTES = 256 * 1024 * 1024
 const BACKUP_RUN_LOG_MAX_BYTES = 16 * 1024 * 1024
 const BACKUP_CATEGORIES = ['messages', 'filter', 'settings', 'auto', 'runLog']
 // cache-health 的条数统计阈值（D2-S12）：这个端点在 HTTP 事件循环上同步整读 + parse，
@@ -1052,6 +1054,7 @@ function readBody (req, maxBytes = 4096) {
   return new Promise((resolve) => {
     const decoder = new StringDecoder('utf8')
     let buf = ''
+    let bytes = 0
     let over = false
     let aborted = false
     let settled = false
@@ -1064,8 +1067,10 @@ function readBody (req, maxBytes = 4096) {
     }
     req.on('data', (c) => {
       if (over) return // 已超限：只排空，不再累积
-      buf += decoder.write(c)
-      if (buf.length > maxBytes) {
+      // 上限按收到字节数算，不能按 String.length 算：中文/emoji 每个字符占 3–4 字节，
+      // 按字符数会让「看起来没超」的多字节备份真正占用的内存/磁盘超限（Sourcery）。
+      bytes += c.length
+      if (bytes > maxBytes) {
         // 超限后**不能**先 destroy：多 chunk 客户端只会看到 ECONNRESET，413 分支永远
         // 到不了（D2-S2）。改为停止累积 + resume() 排空剩余字节，等 'end' 再回 413。
         over = true
@@ -1076,7 +1081,9 @@ function readBody (req, maxBytes = 4096) {
           finish()
         }, BODY_DRAIN_TIMEOUT_MS)
         if (drainTimer.unref) drainTimer.unref()
+        return
       }
+      buf += decoder.write(c)
     })
     req.on('end', () => { if (!over) buf += decoder.end(); finish() })
     // Sourcery Medium：error 时标记 aborted——残缺 body 不允许触发动作。
@@ -2165,8 +2172,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const persistAuto = () => {
     try {
       fs.writeFileSync(autoPath, JSON.stringify({ on: auto.on, interval: auto.interval, updatedAt: Date.now() }))
+      return true
     } catch (e) {
       console.error(`⚠️ 自动运行状态落盘失败（进程内仍生效）：${e && e.message ? e.message : e}`)
+      return false
     }
   }
   const clearAutoTimer = () => {
@@ -2743,6 +2752,33 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const readBackupFile = (filePath, maxBytes) => readSafeTextResult(filePath, maxBytes, { openNonBlocking: true })
   const backupStamp = () => new Date().toISOString().replace(/[:.]/g, '-')
   const backupPathFor = (dir, name) => path.join(dir, name)
+  // 备份里所有「大小」判断都必须按 UTF-8 字节：String.length 会把一个中文/emoji 当 1，
+  // 与 readSafeTextResult / writeAtomic 的真实字节上限不一致。
+  const backupBytes = (text) => Buffer.byteLength(String(text), 'utf8')
+  const validBackupMessage = (m) => m && typeof m === 'object' && !Array.isArray(m) &&
+    (typeof m.title === 'string' || typeof m.content === 'string')
+  const countBackupMessages = (items) => items.reduce((n, m) => n + (validBackupMessage(m) && m._f !== true ? 1 : 0), 0)
+  const importKeyOf = (req) => {
+    const raw = req && req.headers ? req.headers['idempotency-key'] : ''
+    if (typeof raw !== 'string') return ''
+    const key = raw.trim()
+    return key.length >= 8 && key.length <= 200 ? key : ''
+  }
+  const importResultPath = (key) => path.join(stateDir, 'backup', `import-${sha256Hex(key)}.json`)
+  const readImportResult = (key) => {
+    const read = readSafeTextResult(importResultPath(key), 64 * 1024)
+    if (read.status !== 'ok') return null
+    try {
+      const parsed = JSON.parse(read.text)
+      return parsed && typeof parsed === 'object' && parsed.result ? parsed : null
+    } catch (e) { return null }
+  }
+  const writeImportResult = (key, bundleHash, result) => {
+    try {
+      fs.mkdirSync(path.join(stateDir, 'backup'), { recursive: true })
+      return writeAtomic(importResultPath(key), JSON.stringify({ at: Date.now(), bundleHash, result }), '导入幂等记录')
+    } catch (e) { return false }
+  }
   const copyForImportBackup = (src, dir, name) => {
     try {
       const st = fs.lstatSync(src)
@@ -2772,12 +2808,29 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const data = {}
       const skipped = []
       if (selected.includes('messages')) {
-        const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES, filename: messagesFile })
-        const raw = read.status === 'ok' ? readBackupFile(path.join(stateDir, messagesFile), MESSAGES_MAX_BYTES) : null
-        if (read.status === 'ok' && raw && raw.status === 'ok') {
-          data.messages = { filename: messagesFile, count: read.value.items.length, text: raw.text }
+        const raw = readBackupFile(path.join(stateDir, messagesFile), MESSAGES_MAX_BYTES)
+        if (raw.status === 'ok') {
+          let items = null
+          try { items = JSON.parse(raw.text) } catch (e) { items = null }
+          if (!Array.isArray(items) || !items.every(validBackupMessage)) {
+            skipped.push({ key: 'messages', reason: 'invalid_messages' })
+          } else {
+            data.messages = { filename: messagesFile, count: countBackupMessages(items), text: raw.text }
+            // 墓碑是判重历史的一部分：不带上它，换一台机器恢复后，上游重放已淘汰的消息会被再推一次。
+            // 缺失/超限时不影响主缓存备份，只少这份补充状态。
+            const seen = readBackupFile(path.join(stateDir, messagesFile + '.seen.json'), TOMBSTONE_MAX_BYTES)
+            if (seen.status === 'ok') {
+              try {
+                const tomb = JSON.parse(seen.text)
+                if (tomb && typeof tomb === 'object' && !Array.isArray(tomb)) data.messages.seenText = seen.text
+                else skipped.push({ key: 'messages.seen', reason: 'invalid_tombstones' })
+              } catch (e) { skipped.push({ key: 'messages.seen', reason: 'invalid_json' }) }
+            } else if (seen.status !== 'missing') {
+              skipped.push({ key: 'messages.seen', reason: seen.status })
+            }
+          }
         } else {
-          skipped.push({ key: 'messages', reason: read.status === 'ok' ? raw.status : read.status })
+          skipped.push({ key: 'messages', reason: raw.status })
         }
       }
       if (selected.includes('filter')) {
@@ -2786,10 +2839,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         if (read.status === 'ok') {
           let parsed
           try { parsed = JSON.parse(read.text) } catch (e) { parsed = null }
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          // 导出时就用导入同一把尺子校验：否则一个半坏规则会跟着整包导出，
+          // 导入时又因它整包拒绝，用户看到「备份存在但恢复不了」。
+          const valid = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? validateCandidate(runtimeFilterDeps(), parsed)
+            : null
+          if (valid && valid.ok) {
             data.filter = { text: read.text }
           } else {
-            skipped.push({ key: 'filter', reason: 'invalid_json' })
+            skipped.push({ key: 'filter', reason: 'invalid_filter' })
           }
         } else {
           skipped.push({ key: 'filter', reason: read.status })
@@ -2818,6 +2876,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         skipped
       }
       const bodyText = JSON.stringify(bundle)
+      if (backupBytes(bodyText) > BACKUP_MAX_BYTES) {
+        sendJson(res, 413, { error: '导出的备份太大，请减少勾选的类别' })
+        return
+      }
       const fileName = `xbk-backup-${backupStamp()}.json`
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
@@ -2844,21 +2906,35 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const errors = []
       if (data.messages !== undefined) {
         const m = data.messages
-        if (!m || typeof m.text !== 'string' || m.text.length > MESSAGES_MAX_BYTES) {
+        if (!m || typeof m.text !== 'string' || backupBytes(m.text) > MESSAGES_MAX_BYTES) {
           errors.push({ field: 'messages', code: 'invalid_messages', message: '推送记录备份格式不正确或过大' })
         } else {
           let items
           try { items = JSON.parse(m.text) } catch (e) { items = null }
-          if (!Array.isArray(items) || !items.every((x) => x && typeof x === 'object' && !Array.isArray(x))) {
-            errors.push({ field: 'messages', code: 'invalid_messages', message: '推送记录必须是对象数组' })
+          if (!Array.isArray(items) || !items.every(validBackupMessage)) {
+            errors.push({ field: 'messages', code: 'invalid_messages', message: '推送记录里有无法显示的条目' })
           } else {
-            plans.messages = { text: m.text, count: items.length }
+            let seenText
+            if (m.seenText !== undefined) {
+              if (typeof m.seenText !== 'string' || backupBytes(m.seenText) > TOMBSTONE_MAX_BYTES) {
+                errors.push({ field: 'messages', code: 'invalid_tombstones', message: '判重历史备份格式不正确或过大' })
+              } else {
+                let tomb
+                try { tomb = JSON.parse(m.seenText) } catch (e) { tomb = null }
+                if (!tomb || typeof tomb !== 'object' || Array.isArray(tomb)) {
+                  errors.push({ field: 'messages', code: 'invalid_tombstones', message: '判重历史备份格式不正确' })
+                } else {
+                  seenText = m.seenText
+                }
+              }
+            }
+            if (errors.length === 0) plans.messages = { text: m.text, count: countBackupMessages(items), seenText }
           }
         }
       }
       if (data.filter !== undefined) {
         const f = data.filter
-        if (!f || typeof f.text !== 'string' || f.text.length > FILTER_BODY_MAX_BYTES) {
+        if (!f || typeof f.text !== 'string' || backupBytes(f.text) > FILTER_BODY_MAX_BYTES) {
           errors.push({ field: 'filter', code: 'invalid_filter', message: '过滤规则备份格式不正确或过大' })
         } else {
           let parsed
@@ -2893,7 +2969,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       if (data.runLog !== undefined) {
         const text = data.runLog && data.runLog.text
-        if (typeof text !== 'string' || text.length > BACKUP_RUN_LOG_MAX_BYTES) {
+        if (typeof text !== 'string' || backupBytes(text) > BACKUP_RUN_LOG_MAX_BYTES) {
           errors.push({ field: 'runLog', code: 'invalid_run_log', message: '运行日志备份无效或过大' })
         } else {
           plans.runLog = { text }
@@ -2907,6 +2983,20 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sendJson(res, 400, { error: '备份文件里有数据格式不对，未恢复', code: 'backup_validation_failed', errors })
         return
       }
+      // 手动重试的幂等键：响应丢失后用户再点一次，不能把期间新产生的推送记录又覆盖回旧备份。
+      const importKey = importKeyOf(req)
+      const bundleHash = sha256Hex(JSON.stringify(bundle))
+      if (importKey) {
+        const prior = readImportResult(importKey)
+        if (prior) {
+          if (prior.bundleHash !== bundleHash) {
+            sendJson(res, 409, { error: '这个导入请求已被另一份备份使用，请重新选择文件', code: 'idempotency_conflict' })
+            return
+          }
+          sendJson(res, 200, prior.result)
+          return
+        }
+      }
       const lockToken = crypto.randomBytes(12).toString('hex')
       if (!acquireLock(stateDir, Date.now(), lockToken)) {
         res.setHeader('Retry-After', '1')
@@ -2915,7 +3005,52 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       let filterLock = null
       const backupDir = path.join(stateDir, 'backup', `pre-import-${backupStamp()}-${crypto.randomBytes(3).toString('hex')}`)
+      const settingsSnapshot = {
+        revision: runtimeSettings.revision,
+        updatedAt: runtimeSettings.updatedAt,
+        notifyTestReplayWindowS: runtimeSettings.notifyTestReplayWindowS,
+        syncShowDate: runtimeSettings.syncShowDate,
+        source: settingsSource
+      }
+      const autoIntervalSnapshot = auto.interval
+      const rollbackTargets = []
+      const trackBackup = (src, name) => rollbackTargets.push({ src, name })
+      const restoreImportBackup = () => {
+        let ok = true
+        for (const target of rollbackTargets) {
+          const saved = path.join(backupDir, target.name)
+          try {
+            if (fs.existsSync(saved)) {
+              fs.copyFileSync(saved, target.src)
+            } else {
+              // 导入前文件不存在：写成功过才需要删；symlink/目录一律不碰，避免误删。
+              let st = null
+              try { st = fs.lstatSync(target.src) } catch (e) { if (e.code !== 'ENOENT') throw e }
+              if (st && st.isFile()) fs.unlinkSync(target.src)
+            }
+          } catch (e) {
+            ok = false
+            console.error(`⚠️ 导入回滚失败：${target.src}: ${e && e.message ? e.message : e}`)
+          }
+        }
+        runtimeSettings.revision = settingsSnapshot.revision
+        runtimeSettings.updatedAt = settingsSnapshot.updatedAt
+        runtimeSettings.notifyTestReplayWindowS = settingsSnapshot.notifyTestReplayWindowS
+        runtimeSettings.syncShowDate = settingsSnapshot.syncShowDate
+        settingsSource = settingsSnapshot.source
+        auto.interval = autoIntervalSnapshot
+        return ok
+      }
       try {
+        const filterPaths = FilterStore.filterRulesPaths(stateDir)
+        if (plans.filter && filterAuditAtLimit(filterPaths.audit)) {
+          sendJson(res, 507, {
+            error: 'audit_full',
+            code: 'audit_full',
+            errors: [{ field: 'audit', code: 'audit_full', message: '审计文件已达 4 MiB 上限，需人工归档后才能导入过滤规则' }]
+          })
+          return
+        }
         if (plans.filter) {
           filterLock = acquireFilterLock(stateDir)
           if (!filterLock) {
@@ -2925,39 +3060,42 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           }
         }
         fs.mkdirSync(backupDir, { recursive: true })
+        const runLogPath = path.join(historyDir(), 'run.log')
+        const seenPath = path.join(stateDir, messagesFile + '.seen.json')
+        const targets = [
+          [path.join(stateDir, messagesFile), messagesFile],
+          [seenPath, messagesFile + '.seen.json'],
+          [filterPaths.file, 'filter-rules.json'],
+          [settingsPath, CONSOLE_SETTINGS_FILE],
+          [autoPath, AUTO_STATE_FILE],
+          [runLogPath, 'run.log']
+        ]
         try {
-          copyForImportBackup(path.join(stateDir, messagesFile), backupDir, messagesFile)
-          copyForImportBackup(FilterStore.filterRulesPaths(stateDir).file, backupDir, 'filter-rules.json')
-          copyForImportBackup(settingsPath, backupDir, CONSOLE_SETTINGS_FILE)
-          copyForImportBackup(autoPath, backupDir, AUTO_STATE_FILE)
-          copyForImportBackup(path.join(historyDir(), 'run.log'), backupDir, 'run.log')
+          for (const [src, name] of targets) {
+            copyForImportBackup(src, backupDir, name)
+            trackBackup(src, name)
+          }
         } catch (e) {
           sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
           return
         }
         const imported = {}
+        const abortImport = (field, status, body) => {
+          const rolledBack = restoreImportBackup()
+          sendJson(res, status, { ...body, field, rolledBack })
+        }
         if (plans.messages) {
           if (!writeAtomic(path.join(stateDir, messagesFile), plans.messages.text, '推送记录恢复')) {
-            sendJson(res, 500, { error: 'write_failed', code: 'write_failed', field: 'messages' })
+            abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' })
+            return
+          }
+          if (plans.messages.seenText !== undefined &&
+              !writeAtomic(seenPath, plans.messages.seenText, '判重历史恢复')) {
+            abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' })
             return
           }
           imported.messages = plans.messages.count
-        }
-        if (plans.filter) {
-          const paths = FilterStore.filterRulesPaths(stateDir)
-          const current = currentFilterRevision()
-          const nextFile = {
-            schema: FilterStore.FILTER_RULES_SCHEMA,
-            revision: current + 1,
-            filter: plans.filter.result.value
-          }
-          if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则恢复')) {
-            sendJson(res, 500, { error: 'write_failed', code: 'write_failed', field: 'filter' })
-            return
-          }
-          clearFilterDraftFile()
-          imported.filter = true
-          imported.filterRevision = nextFile.revision
+          if (plans.messages.seenText !== undefined) imported.dedup = true
         }
         if (plans.settings) {
           const next = {
@@ -2967,7 +3105,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             syncShowDate: plans.settings.syncShowDate
           }
           if (!writeAtomic(settingsPath, JSON.stringify(next), '控制台设置恢复')) {
-            sendJson(res, 500, { error: 'write_failed', code: 'write_failed', field: 'settings' })
+            abortImport('settings', 500, { error: 'write_failed', code: 'write_failed' })
             return
           }
           runtimeSettings.revision = next.revision
@@ -2979,23 +3117,74 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         if (plans.auto) {
           auto.interval = plans.auto.interval
-          persistAuto()
+          if (!persistAuto()) {
+            abortImport('auto', 500, { error: 'write_failed', code: 'write_failed' })
+            return
+          }
           imported.autoInterval = plans.auto.interval
         }
         if (plans.runLog) {
-          const dir = historyDir()
-          fs.mkdirSync(dir, { recursive: true })
-          if (!writeAtomic(path.join(dir, 'run.log'), plans.runLog.text, '运行日志恢复')) {
-            sendJson(res, 500, { error: 'write_failed', code: 'write_failed', field: 'runLog' })
+          if (!writeAtomic(runLogPath, plans.runLog.text, '运行日志恢复')) {
+            abortImport('runLog', 500, { error: 'write_failed', code: 'write_failed' })
             return
           }
           imported.runLogBytes = Buffer.byteLength(plans.runLog.text, 'utf8')
         }
-        sendJson(res, 200, {
+        // 过滤规则放最后：审计是它的提交点，审计失败时前面几类统一回滚，避免
+        // 「文件恢复了一半、审计没记录」的中间态。
+        if (plans.filter) {
+          const loaded = loadCurrentFilter()
+          const current = loaded.source === 'corrupt' ? 0 : loaded.revision
+          let previousText = null
+          if (loaded.source === 'override' || loaded.source === 'corrupt') {
+            const raw = readSafeTextResult(filterPaths.file, FILTER_BODY_MAX_BYTES)
+            if (raw.status === 'ok') previousText = raw.text
+            if (loaded.source === 'override' && !backupFilterFile(filterPaths, current, previousText)) {
+              abortImport('filter', 500, { error: 'backup_failed', code: 'backup_failed' })
+              return
+            }
+          }
+          const nextFile = {
+            schema: FilterStore.FILTER_RULES_SCHEMA,
+            revision: current + 1,
+            filter: plans.filter.result.value
+          }
+          if (!writeAtomic(filterPaths.file, JSON.stringify(nextFile), '过滤规则恢复')) {
+            abortImport('filter', 500, { error: 'write_failed', code: 'write_failed' })
+            return
+          }
+          const defaults = filterDefaults()
+          const nextActive = FilterStore.mergeActiveFilter({
+            defaults: defaults.filter,
+            keyword: defaults.keyword,
+            override: plans.filter.result.value
+          })
+          const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
+          if (!appendFilterAudit({
+            auditPath: filterPaths.audit,
+            actor: actorOf(token),
+            action: 'import',
+            revision: nextFile.revision,
+            changedFields
+          })) {
+            abortImport('filter', 500, { error: 'audit_failed', code: 'audit_failed' })
+            return
+          }
+          pruneFilterBackups(filterPaths)
+          imported.filter = true
+          imported.filterRevision = nextFile.revision
+        }
+        // 所有文件都成功后才删草稿：中途失败时草稿仍是导入前那份，便于继续编辑。
+        if (plans.filter) clearFilterDraftFile()
+        // 间隔已成功落盘，再调整待执行的定时器；自动运行开关本身始终不变。
+        if (plans.auto && auto.on) scheduleAuto(auto.interval * 1000)
+        const response = {
           ok: true,
           imported,
           backupDir: path.relative(stateDir, backupDir) || backupDir
-        })
+        }
+        if (importKey) writeImportResult(importKey, bundleHash, response)
+        sendJson(res, 200, response)
       } finally {
         if (filterLock) releaseFilterLock(filterLock)
         releaseLockFor({ _stateDir: stateDir, _lockToken: lockToken })

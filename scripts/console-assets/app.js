@@ -52,6 +52,8 @@ const BUSY_FALLBACK_MS = 11 * 60 * 1000
 // fetch 请求期限（Sourcery G_n6）：挂起连接不得阻塞刷新链路；超时由 AbortController 取消，
 // 走正常 reject 路径（「刷新失败」可见），不会堆积请求。
 const FETCH_TIMEOUT_MS = 8000
+// 备份是「整包上传/下载」，不能套 8 秒的普通 API 期限：慢网络下大文件会被误判失败。
+const BACKUP_FETCH_TIMEOUT_MS = 120000
 // 通知自检重复提交拦截窗的客户端边界（与 console.js NOTIFY_REPLAY_MIN_S/MAX_S 同口径）：
 // 这层只负责「非法值不发请求」，服务端仍是唯一权威（越界/类型错一律 400）。
 const NOTIFY_WINDOW_MIN_S = 0
@@ -135,9 +137,9 @@ function fmtIsoStamp (iso) {
 // 内联到各端点函数、第一参数为字面量；超时/中止参数由 timedRequest() 统一构造。
 // Sourcery Stalled-bodies x3：期限定时器不在 fetch resolve 时清掉，而是移交给
 // body 消费方（readBodyJson），整个「头+体」共享同一个 8s 期限。
-function timedRequest (opts) {
+function timedRequest (opts, timeoutMs = FETCH_TIMEOUT_MS) {
   const ctrl = new AbortController()
-  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS)
+  const t = setTimeout(() => ctrl.abort(), timeoutMs)
   const merged = { ...opts, signal: ctrl.signal }
   return { merged, done: () => clearTimeout(t) }
 }
@@ -481,7 +483,7 @@ function apiPostBackupExport (categories) {
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify({ categories })
-  })
+  }, BACKUP_FETCH_TIMEOUT_MS)
   return fetch('/api/backup/export', merged).then(async (res) => {
     const blob = await res.blob()
     if (!res.ok) {
@@ -499,12 +501,14 @@ function apiPostBackupExport (categories) {
   }).catch((e) => { done(); throw e })
 }
 
-function apiPostBackupImport (bundle) {
+function apiPostBackupImport (bundle, idempotencyKey) {
+  const headers = filterWriteHeaders()
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
   const { merged, done } = timedRequest({
     method: 'POST',
-    headers: filterWriteHeaders(),
+    headers,
     body: JSON.stringify(bundle)
-  })
+  }, BACKUP_FETCH_TIMEOUT_MS)
   return consumeJsonResult(fetch('/api/backup/import', merged), done)
 }
 
@@ -4048,12 +4052,23 @@ function backupFileSummary (data) {
   if (data && data.messages) {
     const n = Number.isInteger(data.messages.count) ? data.messages.count : null
     parts.push(`推送记录${n === null ? '' : ` ${n} 条`}`)
+    if (data.messages.seenText) parts.push('判重历史')
   }
   if (data && data.filter) parts.push('过滤规则')
   if (data && data.settings) parts.push('控制台设置')
   if (data && data.auto) parts.push(`自动运行间隔 ${data.auto.interval} 秒`)
   if (data && data.runLog) parts.push(`运行日志约 ${fmtBytes((data.runLog.text || '').length)}`)
   return parts
+}
+
+// 同一次「选文件→确认导入」的重试沿用同一个幂等键；成功后弹窗关闭，下次重新生成。
+function newBackupImportKey () {
+  try {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+      return globalThis.crypto.randomUUID()
+    }
+  } catch (e) { /* 非安全上下文没有 randomUUID，退回时间戳+随机串 */ }
+  return `xbk-import-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
 function BackupBlock ({ onImported }) {
@@ -4117,7 +4132,7 @@ function BackupBlock ({ onImported }) {
     e.target.value = '' // 允许重复选同一个文件
     if (!file) return
     setErr(''); setNote('')
-    if (file.size > 128 * 1024 * 1024) { setErr('备份文件太大'); return }
+    if (file.size > 256 * 1024 * 1024) { setErr('备份文件太大'); return }
     try {
       const text = await file.text()
       const data = JSON.parse(text)
@@ -4126,7 +4141,7 @@ function BackupBlock ({ onImported }) {
       }
       const parts = backupFileSummary(data.data)
       if (parts.length === 0) throw new Error('备份文件里没有可恢复的数据')
-      setPending({ bundle: data, summary: parts })
+      setPending({ bundle: data, summary: parts, key: newBackupImportKey() })
     } catch (e) {
       setErr(`读取备份失败：${e && e.message ? e.message : e}`)
     }
@@ -4135,12 +4150,13 @@ function BackupBlock ({ onImported }) {
     if (!pending || busy !== '') return
     setBusy('import'); setErr('')
     try {
-      const res = await apiPostBackupImport(pending.bundle)
+      const res = await apiPostBackupImport(pending.bundle, pending.key)
       setPending(null)
       const result = res && res.data ? res.data : (res || {})
       const imported = result.imported ? result.imported : {}
       const bits = []
       if (Number.isInteger(imported.messages)) bits.push(`推送记录 ${imported.messages} 条`)
+      if (imported.dedup) bits.push('判重历史')
       if (imported.filter) bits.push('过滤规则')
       if (imported.settings) bits.push('控制台设置')
       if (Number.isInteger(imported.autoInterval)) bits.push(`自动运行间隔 ${imported.autoInterval} 秒`)
@@ -4163,7 +4179,7 @@ function BackupBlock ({ onImported }) {
       <${Button} variant="ghost" disabled=${busy !== ''} onClick=${chooseFile}>导入<//>
       <input class="backup-file" ref=${fileRef} type="file" accept=".json,application/json" onChange=${onFile} />
     </div>
-    ${!exportOpen && err && html`<${Hint} tone="error">${err}<//>`}
+    ${!exportOpen && !pending && err && html`<${Hint} tone="error">${err}<//>`}
     ${note && html`<${Hint}>${note}<//>`}
     <${ConfirmDialog} open=${exportOpen} title="选择要导出的数据" confirmLabel=${busy === 'export' ? '导出中…' : '导出'} busy=${busy === 'export'} confirmDisabled=${BACKUP_CATEGORY_OPTIONS.every((item) => !selected[item.key])} onCancel=${() => { if (busy !== 'export') setExportOpen(false) }} onConfirm=${doExport}>
       <div class="backup-pick-head">
@@ -4182,7 +4198,8 @@ function BackupBlock ({ onImported }) {
     <//>
     <${ConfirmDialog} open=${!!pending} title="确认导入备份" confirmLabel=${busy === 'import' ? '导入中…' : '确认导入'} busy=${busy === 'import'} onCancel=${() => { if (busy !== 'import') setPending(null) }} onConfirm=${doImport}>
       <div>文件里检测到：${pending ? pending.summary.join('、') : ''}</div>
-      <div class="modal-note">导入会覆盖当前对应的数据；导入前会先把当前数据另存一份。自动运行开关不会被打开，仍保持导入前的状态。</div>
+      ${err && html`<${Hint} tone="error">${err}<//>`}
+      <div class="modal-note">导入会覆盖当前对应的数据；导入前会先把当前数据另存一份。自动运行开关不会被打开，仍保持导入前的状态。导入期间请先停掉外部定时任务，避免它用旧缓存覆盖刚恢复的记录。</div>
     <//>
   </div>`
 }
