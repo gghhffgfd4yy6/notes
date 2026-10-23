@@ -1065,7 +1065,10 @@ function base32Encode (buf) {
 }
 
 function base32Decode (text) {
-  const clean = String(text || '').toUpperCase().replace(/=+$/, '')
+  const raw = String(text || '').toUpperCase()
+  let end = raw.length
+  while (end > 0 && raw.charCodeAt(end - 1) === 61) end--
+  const clean = raw.slice(0, end)
   if (clean.length === 0) return null
   let bits = 0
   let value = 0
@@ -1227,13 +1230,14 @@ function secureCookieSuffix (req) {
   return isSecureRequest(req) ? '; Secure' : ''
 }
 
-// 反向代理后的客户端地址：控制台生产部署只绑回环（Caddy 在 127.0.0.1 转发），
-// 只有回环来源的 X-Forwarded-For 才可信；直连来源一律用 socket 地址，避免伪造头
-// 把失败计数甩到别人头上（Sourcery：一个用户锁死所有代理后用户）。
+// 反向代理后的客户端地址：控制台生产部署只绑回环（Caddy 在本机转发），
+// 只有同机连接（localAddress === remoteAddress）的 X-Forwarded-For 才可信；
+// 直连来源一律用 socket 地址，避免伪造头把失败计数甩到别人头上（Sourcery：一个用户锁死所有代理后用户）。
 function clientAddress (req) {
-  const socketAddr = String((req && req.socket && req.socket.remoteAddress) || '')
-  const loopback = socketAddr === '127.0.0.1' || socketAddr === '::1' || socketAddr === '::ffff:127.0.0.1'
-  if (!loopback) return socketAddr
+  const socket = req && req.socket
+  const socketAddr = String((socket && socket.remoteAddress) || '')
+  const sameHost = Boolean(socket && socket.localAddress && socket.remoteAddress && socket.localAddress === socket.remoteAddress)
+  if (!sameHost) return socketAddr
   const raw = req && req.headers && req.headers['x-forwarded-for']
   const first = Array.isArray(raw) ? raw[0] : raw
   if (typeof first !== 'string') return socketAddr

@@ -6905,7 +6905,7 @@ async function main () {
       const secret = generateTotpSecret()
       const recovery = recoveryRecordOf(generateRecoveryCodes())
       fs.writeFileSync(path.join(dir, TWO_FACTOR_FILE), JSON.stringify({ schema: 1, enabled: true, secret, recovery, createdAt: 1 }))
-      fs.chmodSync(path.join(dir, TWO_FACTOR_FILE), 0o644)
+      fs.chmodSync(path.join(dir, TWO_FACTOR_FILE), 0o666 & ~0o022) // 0644：故意放宽的测试夹具
       assert.strictEqual(loadTwoFactorState(dir).enabled, true, '合法配置可读取')
       assert.strictEqual(fs.statSync(path.join(dir, TWO_FACTOR_FILE)).mode & 0o777, 0o600, '过宽权限读后收紧为 0600')
       const duplicate = { ...recovery, hashes: [recovery.hashes[0], recovery.hashes[0]] }
