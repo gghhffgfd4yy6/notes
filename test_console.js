@@ -1606,7 +1606,7 @@ async function backupApiTests () {
       const bundle = JSON.parse(all.text)
       assert.strictEqual(bundle.kind, 'xbk-console-backup')
       assert.strictEqual(bundle.schema, 1)
-      assert.deepStrictEqual(Object.keys(bundle.data).sort(), ['auto', 'filter', 'messages', 'runLog', 'settings'])
+      assert.deepStrictEqual(Object.keys(bundle.data).sort((a, b) => a.localeCompare(b)), ['auto', 'filter', 'messages', 'runLog', 'settings'])
       assert.strictEqual(bundle.data.messages.count, 2)
       assert.strictEqual(bundle.data.auto.interval, 7)
       assert.ok(!Object.prototype.hasOwnProperty.call(bundle.data.auto, 'on'), '备份文件不得记录自动运行开关')
