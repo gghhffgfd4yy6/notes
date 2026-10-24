@@ -1029,6 +1029,22 @@ function attachMonthHoldRepeat (inst) {
   bind(1)
 }
 
+// Esc 关闭日历（L2-5）：flatpickr 4.6 只在 _input 与 calendarContainer 上监听 keydown，
+// 从 .date-btn 打开时焦点留在按钮上，按键到不了实例 ⇒ 日历关不掉（实测 inst.isOpen 仍为
+// true）。打开期间在 document 捕获阶段补一层：命中后关闭并把焦点还给触发按钮；关闭时
+// （选完日期 / 点外面 / Esc）立刻解绑，不常驻全局监听。
+function bindEscClose (inst, restoreFocus) {
+  const onKey = (e) => {
+    if (e.key !== 'Escape' && e.key !== 'Esc') return
+    if (!inst.isOpen) return
+    e.preventDefault()
+    inst.close()
+    if (restoreFocus) restoreFocus()
+  }
+  document.addEventListener('keydown', onKey, true)
+  return () => document.removeEventListener('keydown', onKey, true)
+}
+
 function DateRange ({ value, onChange, label = '日期区间', disabled = false }) {
   const from = value && typeof value.from === 'string' ? value.from : ''
   const to = value && typeof value.to === 'string' ? value.to : ''
@@ -1041,6 +1057,9 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
   useEffect(() => {
     const el = anchorRef.current
     if (!el) return undefined
+    // Esc 监听只在「日历打开期间」挂着（见 bindEscClose），关闭/卸载都要解绑。
+    let offEsc = null
+    const dropEsc = () => { if (offEsc) { offEsc(); offEsc = null } }
     const inst = flatpickr(el, {
       mode: 'range',
       dateFormat: 'Y-m-d',
@@ -1056,7 +1075,12 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
       positionElement: btnRef.current || el,
       onReady (_sel, _str, inst) { attachMonthHoldRepeat(inst) },
       // 面板可能开着跨过上海零点：每次打开按当下上海日重设上限。
-      onOpen (_d, _s, inst) { inst.set('maxDate', todayKeyShanghai()) },
+      onOpen (_d, _s, inst) {
+        inst.set('maxDate', todayKeyShanghai())
+        dropEsc()
+        offEsc = bindEscClose(inst, () => { if (btnRef.current) btnRef.current.focus({ preventScroll: true }) })
+      },
+      onClose () { dropEsc() },
 
       onChange (dates) {
         if (!Array.isArray(dates) || dates.length !== 2) return
@@ -1068,7 +1092,7 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
       }
     })
     instRef.current = inst
-    return () => { inst.destroy(); instRef.current = null }
+    return () => { dropEsc(); inst.destroy(); instRef.current = null }
   }, [])
   // 受控值外部变化（清除 ×、切预设、跳转重置）时同步 flatpickr 的选中态：
   // 实例只在挂载时建一次，不同步的话日历仍高亮上一个区间（Sourcery #288 M7）。
