@@ -1518,27 +1518,34 @@ const ACTION_DEFS = [
 // 固定 id 会让无障碍名称重复（Sourcery #271）。
 let dialogSeq = 0
 
-function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, initialFocusRef = null, onConfirm, onCancel, children }) {
-  const cancelRef = useRef(null)
-  // 回调每次渲染都是新函数；若把它放进 focus effect 的依赖，busy 变化会重新聚焦密码框，
-  // 手机上表现为点「解密」后键盘又弹一下。用 ref 取最新回调，effect 只在打开时跑一次。
+// 两个弹窗共用的关闭/焦点骨架：onCancel 每次渲染存进 ref（busy 守卫不被旧闭包绕过），
+// Escape 与「打开时聚焦」只写一遍——两份弹窗各抄一份会被 Sonar 判重复代码。
+function useDialogChrome (open, onCancel, { initialFocusRef = null, fallbackRef = null, closeDialog }) {
   const onCancelRef = useRef(onCancel)
   onCancelRef.current = onCancel
-  const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
-  // 弹窗「从哪来回哪去」：从触发按钮的位置放大展开，取消/遮罩/Esc 时缩回按钮再卸载。
-  const backRef = useRef(null)
-  const boxRef = useRef(null)
-  const closeDialog = useMorphDialog(backRef, boxRef, open)
   useEffect(() => {
     if (!open) return undefined
     const onKey = (e) => { if (e.key === 'Escape') closeDialog(() => onCancelRef.current()) }
     document.addEventListener('keydown', onKey)
     const t = setTimeout(() => {
-      const target = initialFocusRef && initialFocusRef.current ? initialFocusRef.current : cancelRef.current
+      const target = (initialFocusRef && initialFocusRef.current) || (fallbackRef && fallbackRef.current)
       if (target) target.focus()
     }, 0)
     return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
   }, [open, initialFocusRef])
+  return onCancelRef
+}
+
+function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, initialFocusRef = null, onConfirm, onCancel, children }) {
+  const cancelRef = useRef(null)
+  const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
+  // 弹窗「从哪来回哪去」：从触发按钮的位置放大展开，取消/遮罩/Esc 时缩回按钮再卸载。
+  const backRef = useRef(null)
+  const boxRef = useRef(null)
+  const closeDialog = useMorphDialog(backRef, boxRef, open)
+  // 回调每次渲染都是新函数；若把它放进 focus effect 的依赖，busy 变化会重新聚焦密码框，
+  // 手机上表现为点「解密」后键盘又弹一下。ref 在 useDialogChrome 里更新。
+  const onCancelRef = useDialogChrome(open, onCancel, { initialFocusRef, fallbackRef: cancelRef, closeDialog })
   if (!open) return null
   return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current()) }}>
     <div class="modal" ref=${boxRef} role="dialog" aria-modal="true" aria-labelledby=${titleId}>
@@ -1556,19 +1563,11 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
 // 「保存并继续」会走正常的保存确认；只有真正保存成功，App 才继续原来的切页/后退动作。
 function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
   const cancelRef = useRef(null)
-  const onCancelRef = useRef(onCancel)
-  onCancelRef.current = onCancel
   const [titleId] = useState(() => `leave-title-${++dialogSeq}`)
   const backRef = useRef(null)
   const boxRef = useRef(null)
   const closeDialog = useMorphDialog(backRef, boxRef, open)
-  useEffect(() => {
-    if (!open) return undefined
-    const onKey = (e) => { if (e.key === 'Escape') closeDialog(() => onCancelRef.current()) }
-    document.addEventListener('keydown', onKey)
-    const t = setTimeout(() => { if (cancelRef.current) cancelRef.current.focus() }, 0)
-    return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
-  }, [open])
+  const onCancelRef = useDialogChrome(open, onCancel, { fallbackRef: cancelRef, closeDialog })
   if (!open) return null
   return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current()) }}>
     <div class="modal" ref=${boxRef} role="dialog" aria-modal="true" aria-labelledby=${titleId}>

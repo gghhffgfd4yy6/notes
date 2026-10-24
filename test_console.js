@@ -1968,17 +1968,23 @@ async function backupUiStructureTests () {
     const end = src.indexOf('function LeaveGuardDialog', at)
     assert.ok(at > -1 && end > at, '应能定位 ConfirmDialog')
     const seg = src.slice(at, end)
-    assert.ok(seg.includes('const onCancelRef = useRef(onCancel)'), 'onCancel 必须走 ref')
-    assert.ok(seg.includes('onCancelRef.current = onCancel'), '每次渲染都要把 ref 更新到最新 onCancel')
+    // v3.361：两个弹窗共用 useDialogChrome（各抄一份会被 Sonar 判重复代码），
+    // ref 初始化/更新与 Escape 绑定都收在骨架里，仍要求回调读 ref 而不是旧闭包。
+    const hAt = src.indexOf('function useDialogChrome')
+    assert.ok(hAt > -1 && hAt < at, '应能定位 useDialogChrome')
+    const hook = src.slice(hAt, src.indexOf('\n}\n', hAt))
+    assert.ok(hook.includes('const onCancelRef = useRef(onCancel)'), 'onCancel 必须走 ref')
+    assert.ok(hook.includes('onCancelRef.current = onCancel'), '每次渲染都要把 ref 更新到最新 onCancel')
+    assert.ok(seg.includes('useDialogChrome(open, onCancel'), '两个弹窗都必须走公共骨架')
 
     // 三个退出入口都必须调用 ref，而不是捕获的旧 onCancel；否则 busy 守卫可能被旧闭包绕过。
     // v3.360：三个入口都先播退场再回调，但回调本身仍走 ref（避免旧闭包绕过 busy 守卫）。
-    assert.match(seg, /Escape'\) closeDialog\(\(\) => onCancelRef\.current\(\)\)/, 'Escape 必须调用 ref')
+    assert.match(hook, /Escape'\) closeDialog\(\(\) => onCancelRef\.current\(\)\)/, 'Escape 必须调用 ref')
     assert.ok(seg.includes('if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current())'), '点遮罩必须调用 ref')
     assert.ok(seg.includes('onClick=' + '$' + '{() => closeDialog(() => onCancelRef.current())}'), '取消按钮必须调用 ref')
 
     // 依赖数组必须属于“聚焦”的那个 effect，不能靠组件里别处的同名字符串蒙混。
-    const focusEffect = seg.match(/const t = setTimeout\(\(\) => \{[\s\S]*?\n\s*\}, \[([^\]]*)\]\)/)
+    const focusEffect = hook.match(/const t = setTimeout\(\(\) => \{[\s\S]*?\n\s*\}, \[([^\]]*)\]\)/)
     assert.ok(focusEffect, '应能定位聚焦 effect')
     assert.deepStrictEqual(focusEffect[1].split(',').map((s) => s.trim()).filter(Boolean), ['open', 'initialFocusRef'],
       '聚焦 effect 只能依赖 open/initialFocusRef；依赖 onCancel 会让 busy 变化重开键盘')
@@ -5252,7 +5258,8 @@ async function main () {
       '正式运行与通知自检必须走确认；试运行/环境检查直接执行')
     assert.ok(src.includes("cls: 'btn-danger-solid'"), '正式运行必须是红色危险按钮')
     assert.ok(src.includes('role="dialog"') && src.includes('aria-modal="true"'), '弹窗必须有无障碍语义')
-    assert.ok(src.includes('defaultFocus') === false && src.includes('cancelRef.current.focus()'),
+    // v3.361：焦点 effect 收进 useDialogChrome，取消按钮通过 fallbackRef 传进去。
+    assert.ok(src.includes('defaultFocus') === false && src.includes('fallbackRef.current') && src.includes('fallbackRef: cancelRef'),
       '默认焦点必须落在取消，不能落在确认')
     assert.ok(src.includes('function AlertBanner'), '首屏必须有失败横幅')
     assert.ok(src.includes("state.stats.status === 'ok'"), '状态卡必须消费 stats')
