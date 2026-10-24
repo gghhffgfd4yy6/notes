@@ -637,7 +637,7 @@ const STATIC_ASSETS = Object.freeze({
 
 // 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，各文件 < 100KB）。
 // 版本号 = 各文件内容哈希拼接后的 sha16，renderPage 以 ?v=<sha16> 引用；带当前版本的 URL 可长缓存
-// （private + immutable），裸 URL 仍 no-cache（测试与旧页面兼容）。部署 = systemd restart。
+// （public + immutable），裸 URL 仍 no-cache（测试与旧页面兼容）。部署 = systemd restart。
 // 注：app.js 内部 `import './pure.mjs'` 不带版本号，走裸 URL 的 no-cache + ETag 协商（内容哈希仍参与
 // 全站版本号，因此任一资产变更都会让页面引用的 app.js?v= 一起失效）。
 //
@@ -749,9 +749,12 @@ function serveStatic (req, res, route, spec) {
   } catch (e) { /* 畸形 URL 交给上层校验；这里按裸 URL 处理 */ }
   const headers = {
     'Content-Type': spec.type,
-    // 资产与数据同面鉴权（无凭证 401）：只能进浏览器私有缓存，绝不能让共享缓存
-    // 把一次带凭证的响应复用给未鉴权调用方（评审 #236 · Sourcery Medium）。
-    'Cache-Control': versioned ? 'private, max-age=31536000, immutable' : 'no-cache',
+    // 内容寻址：?v=<全站版本号> 命中即同一份字节，可以 immutable 长缓存一年、期间不再回源。
+    // public 而非 private：资产是前端代码/样式，与调用方身份无关（任何人拿到的都是同一份，
+    // 不含凭证与推送数据），允许 CDN/共享缓存存一份供未鉴权请求复用，省掉回源的 401 往返；
+    // 数据面不在此列——HTML 由 applyPageHeaders 明确 no-store，API 出口按各分支自设 Cache-Control。
+    // 裸 URL（app.js 内部 `import './pure.mjs'`）不走内容寻址，仍 no-cache + ETag 协商。
+    'Cache-Control': versioned ? 'public, max-age=31536000, immutable' : 'no-cache',
     ETag: etag,
     Vary: 'Accept-Encoding'
   }

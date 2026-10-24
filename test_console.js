@@ -1952,8 +1952,9 @@ async function main () {
     assert.strictEqual(verMatch[1], expectVer, '版本号必须等于资产内容的哈希（不能是常量/陈旧值）')
     const immutable = await requestBuffer(port, 'GET', `/assets/app.css?v=${verMatch[1]}`, { token: TOKEN })
     const cc = String(immutable.headers['cache-control'] || '')
-    assert.match(cc, /immutable/, '版本化资产必须 immutable 长缓存')
-    assert.match(cc, /private/, '资产与数据同面鉴权：只能进浏览器私有缓存（shared cache 会把带凭证响应复用给未鉴权方）')
+    // 内容寻址（?v= 为内容哈希）⇒ 命中即同一份字节：public + immutable 一年，浏览器/CDN
+    // 不再回源；public 只对静态资产成立（不含凭证与推送数据），数据面仍是 no-store。
+    assert.strictEqual(cc, 'public, max-age=31536000, immutable', '版本化资产必须 public + immutable 一年长缓存')
     const staleVer = await requestBuffer(port, 'GET', '/assets/app.css?v=deadbeefdeadbeef', { token: TOKEN })
     assert.strictEqual(String(staleVer.headers['cache-control'] || ''), 'no-cache', '不匹配的版本号必须回退 no-cache')
     // gzip;q=0 表示明确拒绝：不得发压缩体
