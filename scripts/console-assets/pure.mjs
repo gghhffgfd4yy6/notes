@@ -8,6 +8,12 @@ export const DAY_MS = 1000 * 60 * 60 * 24
 
 // 回到顶部的滚动方式（v3.321）：开了「减少动效」或宿主没有 scrollBehavior（老 Safari）时
 // 返回 null，调用方走 window.scrollTo(0, 0) 瞬时回顶；否则返回 'smooth'。
+// 动效开关的纯判定（v3.360）：系统开了「减少动效」就一律不动。
+// 单独抽出来是为了能被 Node 直接测（motion.js 依赖 DOM，测不了行为）。
+export function motionAllowed (matches) {
+  return matches !== true
+}
+
 export function backToTopBehavior (reduceMotion, supportsSmooth) {
   return reduceMotion || !supportsSmooth ? null : 'smooth'
 }

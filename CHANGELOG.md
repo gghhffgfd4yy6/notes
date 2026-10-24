@@ -878,7 +878,7 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 ## v3.360 — 控制台全站动效层（过滤规则页为主）
 
 - 新增动效适配层 `scripts/console-assets/motion.js`：唯一接触动画库的文件，页面只用 `enter/reveal/flash` 与三个 hook；换库只改这一层（app.js 不得直接 import 动画库，已由套件锁定）。
-- 动画引擎：`motion/mini` 14.6.0（WAAPI，只跑 opacity/transform，跑在合成层）+ `@formkit/auto-animate` 0.10.0（列表增删/翻页的 FLIP）。两者均 MIT，esbuild 打成单文件由 `/assets` 白名单伺服（CSP `script-src 'self'` 覆盖，不走 CDN），实测 gzip 合计约 7.4KB。
+- 动画引擎：`motion/mini` 14.6.0（MIT，WAAPI，只跑 opacity/transform，跑在合成层），esbuild 打成单文件由 `/assets` 白名单伺服（CSP `script-src 'self'` 覆盖，不走 CDN），gzip 后约 5KB。列表位移的 FLIP 自己实现（只补 transform），不引第二个列表动画库——那些库会顺带做宽高过渡。
 - 覆盖：切页淡入（不动高度，不改滚动锚点）· 概览卡片 stagger · 过滤规则页分组/字段逐级入场、校验失败字段抖动+红圈脉冲、预览块入场 · 弹窗遮罩淡入 + 面板 `scale(.96)` 上浮 · 触发历史/逐轮历史行淡入 · 推送记录翻页 FLIP · 提示行/横幅入场 · 配置块 stagger · 按钮按压、卡片 hover、输入框焦点过渡 · 主题切换 280ms 颜色过渡。
 - 时机纪律：所有入场只播一次（挂载 / 首次拿到数据 / 真正切页），5s 轮询重渲染不重播；动画结束后清掉内联 `opacity/transform`，避免盖住 CSS 的 hover/按压缩放。
 - `prefers-reduced-motion: reduce` 时适配层全部 no-op（页面直接到终态，不是快放），CSS 侧全局兜底保持不变。

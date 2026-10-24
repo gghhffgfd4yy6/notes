@@ -16,7 +16,7 @@ import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, lo
 // 主题化覆盖写在 app.css 的 .flatpickr-calendar 段（跟四套 token 走）。
 import flatpickr from './flatpickr.js'
 // 动效层（v3.360）：app.js 只依赖自家适配层，换动画库只改 motion.js。
-import { MOTION, enter, flash, useEnterOnOpen, useListMotion, useMountReveal, useRevealWhen } from './motion.js'
+import { MOTION, enter, flash, useEnterOnOpen, useFlipList, useMountReveal, useRevealWhen } from './motion.js'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -1326,7 +1326,8 @@ const CARD_PLACEHOLDERS = [
 
 function CardsGrid ({ cards, busy }) {
   const ref = useRef(null)
-  useRevealWhen(ref, cards.length > 0, '.card', { y: 12, step: 0.035, cap: 5 })
+  // 占位卡也算 .card：等真实数据（busy 结束）再播，别把入场浪费在「正在读取…」上。
+  useRevealWhen(ref, !busy && cards.length > 0, '.card', { y: 12, step: 0.035, cap: 5 })
   return html`<div class="cards" ref=${ref} aria-busy=${busy ? 'true' : undefined}>
     ${cards.map((c) => html`<${Card} key=${c.title} title=${c.title} main=${c.main}
       badge=${html`<${Badge} tone=${c.tone}>${c.badge}<//>`}>
@@ -3448,7 +3449,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   // 列表 FLIP（v3.360）：翻页/增删时卡片在位置上滑过去，而不是瞬间重排。
   // 依赖「列表是否存在」：列表首次出现时挂载控制器，轮询更新不重建。
   const motionRef = useRef(null)
-  useListMotion(motionRef, [items.length > 0])
+  useFlipList(motionRef)
   const categories = data && Array.isArray(data.categories) ? data.categories : []
   // 分类弹层的「全部分类」计数必须跟时间窗走（服务端 days>0 时 categories 已按窗口重算）；
   // 直接用 grandTotal 会在「今天」里显示全量 374，看起来像筛选没生效。
@@ -3518,7 +3519,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
         : html`<div class="msg-list" ref=${motionRef}>
-          ${items.map((m) => html`<div class="msg-item" key=${m.rowKey}>
+          ${items.map((m) => html`<div class="msg-item" key=${m.rowKey} data-mk=${m.rowKey}>
             <div class="msg-item-head">
               <span class="msg-title" role="button" tabindex="0"
                 aria-expanded=${expanded === m.rowKey ? 'true' : 'false'}
@@ -6067,7 +6068,9 @@ function App () {
   useLayoutEffect(() => {
     const root = wrapRef.current
     if (!root) return
-    enter(root.querySelector('.page:not([hidden])'), { y: 8 })
+    // 只淡入、完全不加 transform：页面里可能有 position:fixed 的弹层（分类选择器/
+    // 提示气泡），祖先一旦有 transform 就会改成按它定位，弹层会跳位。
+    enter(root.querySelector('.page:not([hidden])'), { transform: false, duration: MOTION.fast })
   }, [tab])
   // 主题切换的临时过渡类：只在这 320ms 内让颜色属性走 transition，避免常驻 transition
   // 让所有 hover/选中态变慢。

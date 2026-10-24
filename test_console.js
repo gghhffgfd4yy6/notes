@@ -2047,7 +2047,7 @@ async function main () {
     assert.ok(verMatch, 'HTML 资产引用必须带内容版本号 ?v=<sha16>')
     // 版本号必须由内容派生（sha256(各文件哈希拼接) 前 16 位），常量/陈旧版本过不了这条
     const crypto = require('node:crypto')
-    const hashes = ['app.css', 'app.js', 'pure.mjs', 'htm-preact.module.js', 'flatpickr.module.js', 'flatpickr.css', 'motion.js', 'motion-lib.module.js', 'auto-animate.module.js'].map((f) => {
+    const hashes = ['app.css', 'app.js', 'pure.mjs', 'htm-preact.module.js', 'flatpickr.module.js', 'flatpickr.css', 'motion.js', 'motion-lib.module.js'].map((f) => {
       const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', f))
       return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
     })
@@ -5806,6 +5806,14 @@ async function main () {
     assert.strictEqual(backToTopBehavior(false, false), null, '宿主不支持 scrollBehavior 时必须瞬时回顶（传 options 会被老 Safari 当成 x,y）')
   })
 
+  await aok('行为: motionAllowed（减少动效时必须真的关掉，不是只在源码里写个判断）', async () => {
+    const { motionAllowed } = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(motionAllowed(true), false, '系统开了「减少动效」必须返回 false（否则页面还在动）')
+    assert.strictEqual(motionAllowed(false), true, '未开启时必须允许动效')
+    assert.strictEqual(motionAllowed(undefined), true, '取不到 media query（老浏览器/测试环境）时按允许处理')
+    assert.strictEqual(motionAllowed(null), true, 'matchMedia 缺失时不得把动效全关掉')
+  })
+
   await aok('结构红线: 主题切换（4 套 token / 首帧服务端渲染 / cookie 记忆）', () => {
     const cssRaw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     // 先把 /* */ 注释剥掉：注释里写一个示例块 / 把真块整段注释掉，都不能骗过门禁（Sourcery #286）。
@@ -6097,39 +6105,50 @@ async function main () {
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
     const srv = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
     const motion = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/motion.js'), 'utf8')
-    // 资产：三个新文件都必须进白名单（CSP 下没有 CDN/内联兜底，漏一条就是整页白屏）。
-    for (const route of ['/assets/motion.js', '/assets/motion-lib.module.js', '/assets/auto-animate.module.js']) {
+    // 资产：两个新文件都必须进白名单（CSP 下没有 CDN/内联兜底，漏一条就是整页白屏）。
+    for (const route of ['/assets/motion.js', '/assets/motion-lib.module.js']) {
       assert.ok(srv.includes(`'${route}'`), `${route} 必须在 STATIC_ASSETS 白名单里`)
     }
     // 换库只改一层：app.js 只能依赖自家适配层，不得直接 import 动画库。
     assert.ok(src.includes("from './motion.js'"), 'app.js 必须通过 motion.js 引入动效')
-    assert.ok(!src.includes("from './motion-lib.module.js'") && !src.includes("from './auto-animate.module.js'"),
-      'app.js 不得直接依赖动画库（换库只改 motion.js）')
+    assert.ok(!src.includes("from './motion-lib.module.js'"), 'app.js 不得直接依赖动画库（换库只改 motion.js）')
     // reduced-motion：所有入口都过 motionOK()，否则系统关了动效页面还在动。
     assert.ok(motion.includes('prefers-reduced-motion: reduce'), 'motion.js 必须读 prefers-reduced-motion')
     assert.ok(/export function motionOK/.test(motion), 'motion.js 必须导出 motionOK')
     assert.ok(/if \(!el \|\| !motionOK\(\)\) return null/.test(motion), 'enter 必须被 motionOK 门控（no-op 而不是快放）')
     assert.ok(/if \(!root \|\| !motionOK\(\)\) return \[\]/.test(motion), 'reveal 必须被 motionOK 门控')
-    assert.ok(/if \(!el \|\| !motionOK\(\)\) return undefined/.test(motion), 'useListMotion 必须被 motionOK 门控')
+    assert.ok(/if \(!root \|\| !motionOK\(\)\) return/.test(motion), 'useFlipList 必须被 motionOK 门控')
+    // 判定本身是纯函数（可被 Node 直接测），不是只有源码字符串。
+    assert.ok(motion.includes('motionAllowed(reduced && reduced.matches)'), 'motionOK 必须走纯判定 motionAllowed')
     // 只动合成层属性：入场帧必须只有 opacity/transform（改高度会引入布局跳动）。
-    assert.ok(/frames\.transform = \[from/.test(motion) && /frames\.opacity = \[0, 1\]/.test(motion), '入场只允许 opacity/transform')
+    assert.ok(/frames\.transform = \[/.test(motion) && /frames\.opacity = \[0, 1\]/.test(motion), '入场只允许 opacity/transform')
     assert.ok(!/height|width|maxHeight/.test(motion.slice(motion.indexOf('export function enter'), motion.indexOf('export function reveal'))),
       'enter 不得改尺寸类属性')
+    // 列表 FLIP 自己实现：只补 transform，且不引第二个库（那些库会顺带做宽高过渡）。
+    assert.ok(!motion.includes('auto-animate') && !src.includes('auto-animate'), '列表位移不得依赖第三方库')
+    assert.ok(/export function useFlipList/.test(motion) && /getBoundingClientRect\(\)/.test(motion) && /slide\(el, dx, dy, MOTION\.fast\)/.test(motion),
+      '列表必须用自家 FLIP（旧矩形 → 新矩形差补 transform）')
+    assert.ok(src.includes('data-mk=$' + '{m.rowKey}'), '列表条目必须带稳定 key 供 FLIP 对齐')
     // 动画收尾要清内联样式，否则盖住 CSS 的 hover/按压反馈。
     assert.ok(motion.includes("removeProperty('transform')") && motion.includes("removeProperty('opacity')"), '动画结束必须清内联样式')
+    // 摘类必须晚于红圈动画（1.2s），否则反馈半路消失。
+    assert.ok(/\}, 1250\)/.test(motion), 'flash 摘类必须晚于 field-ring 的 1.2s')
     // vendored bundle：非空壳且确实导出预期符号。
     const lib = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/motion-lib.module.js'), 'utf8')
     assert.ok(/export\s*\{[^}]*as animate\}/.test(lib), 'motion bundle 必须真的导出 animate（空壳会让页面零动画）')
-    const aa = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/auto-animate.module.js'), 'utf8')
-    assert.ok(/export\s*\{[^}]*as default\}/.test(aa), 'auto-animate bundle 必须真的有 default 导出')
     // CSS：motion 层必须在 utilities 之前（否则工具类改不动它），并含错误字段反馈与主题过渡。
     assert.ok(/@layer tokens, base, components, motion, utilities;/.test(css), 'motion 层必须注册在 utilities 之前')
     assert.ok(/@layer motion \{/.test(css) && /\.flash-bad\s*\{/.test(css) && /@keyframes field-shake/.test(css),
       '错误字段的抖动/红圈样式必须存在')
     assert.ok(/html\.theme-anim/.test(css), '主题切换的颜色过渡必须存在')
-    // 播放时机：轮询不得重播入场（hook 内部只播一次）。
-    assert.ok(/const fired = useRef\(false\)/.test(motion) && /if \(!ready \|\| fired\.current\) return/.test(motion),
+    // 播放时机：轮询不得重播入场（hook 内部只播一次）；隐藏页签先攒着，露出来再播。
+    assert.ok(/const fired = useRef\(false\)/.test(motion) && /if \(!ready \|\| fired\.current\) return undefined/.test(motion),
       'useRevealWhen 必须只播一次（轮询不重播）')
+    assert.ok(/IntersectionObserver/.test(motion), '隐藏页签要先攒着，等可见再播')
+    // 切页不得给 .page 加 transform（会让页面里的 fixed 弹层改按页面定位）。
+    assert.ok(src.includes('{ transform: false, duration: MOTION.fast }'), '切页必须只淡入、不加 transform')
+    // 占位卡不算「数据就绪」。
+    assert.ok(src.includes('useRevealWhen(ref, !busy && cards.length > 0'), '占位卡阶段不得触发卡片入场')
   })
 
   await aok('结构红线: v3.326 日期区间（资产白名单 / 中文分隔符 / 双月只在桌面 / 44px）', () => {

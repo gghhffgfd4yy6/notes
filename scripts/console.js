@@ -621,7 +621,8 @@ function releaseLockFor (record) {
 }
 
 // ── 静态资产（前端现代化 v3.285）────────────────────────────────────────────
-// 前端是零依赖 preact+htm standalone（scripts/console-assets/，无构建、无 CDN）。
+// 前端是 preact+htm standalone（scripts/console-assets/，无构建、无 CDN）；
+// 动效库以 vendored 单文件随白名单一起伺服（同样无 CDN）。
 // 仅伺服白名单内的静态文件：路径映射写死，不存在用户输入拼接（无路径穿越面）。
 const ASSETS_DIR = path.join(__dirname, 'console-assets')
 const STATIC_ASSETS = Object.freeze({
@@ -633,11 +634,10 @@ const STATIC_ASSETS = Object.freeze({
   // 与官方 CSS。两者都随白名单伺服，CSP script-src 'self' 覆盖，无 CDN。
   '/assets/flatpickr.js': { file: 'flatpickr.module.js', type: 'text/javascript; charset=utf-8' },
   '/assets/flatpickr.css': { file: 'flatpickr.css', type: 'text/css; charset=utf-8' },
-  // v3.360 动效层：motion.js 是自家适配层，另外两个是 esbuild 打成单文件的
-  // motion/mini 14.6.0 与 @formkit/auto-animate 0.10.0（MIT，均无 CDN 依赖）。
+  // v3.360 动效层：motion.js 是自家适配层，另一个是 esbuild 打成单文件的
+  // motion/mini 14.6.0（MIT，无 CDN 依赖）。列表 FLIP 自己实现，不引第二个库。
   '/assets/motion.js': { file: 'motion.js', type: 'text/javascript; charset=utf-8' },
-  '/assets/motion-lib.module.js': { file: 'motion-lib.module.js', type: 'text/javascript; charset=utf-8' },
-  '/assets/auto-animate.module.js': { file: 'auto-animate.module.js', type: 'text/javascript; charset=utf-8' }
+  '/assets/motion-lib.module.js': { file: 'motion-lib.module.js', type: 'text/javascript; charset=utf-8' }
 })
 
 // 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，各文件 < 100KB）。
