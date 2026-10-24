@@ -279,11 +279,43 @@
   .ptr-text.busy .ptr-ring { animation: ptr-spin .7s linear infinite; }
   @keyframes ptr-spin { to { transform: rotate(360deg); } }
 
+  /* ── 吸顶坐标系 ──
+     顶栏吸顶后，页签必须落在它下沿而不是视口顶（页签自己也是 sticky，见 .tabs），
+     否则页签会被顶栏整条盖住。两份高度都从变量来：--sync-row-h 是状态行本身的高度
+     （手机端为触控抬到 44px，见下面的 ≤640 块），--topbar-pad-b 是吸顶带的下内边距 ——
+     它原来是 .topbar 的 margin-bottom，改成 padding 才能让底色盖住这条缝，
+     否则滚过去的内容会从 16px 的缝里透出来。
+     --wrap-pad-x 跟 .wrap 的左右 padding 同值（桌面 --sp-4 / 手机 10px）：吸顶带用它
+     做负 margin + 等量 padding 铺到容器边缘，内容宽度不变。 */
+  :root {
+    --sync-row-h: 24px;
+    --topbar-pad-b: var(--sp-4);
+    --topbar-h: calc(var(--sync-row-h) + var(--topbar-pad-b));
+    --wrap-pad-x: var(--sp-4);
+  }
+  /* 滚动容器（html）留出吸顶带的高度：hash 跳转与 scrollIntoView 的落点不会被顶栏
+     咬掉一截。注意 app.js 的 listLandTarget() 用的是 scrollTo(0, y)，不吃这条，
+     分页落点已在交付说明里单列（需要那边把顶栏高度也减掉）。 */
+  html { scroll-padding-top: var(--topbar-h); }
+
   /* ── 顶栏 ── */
   /* v3.338：页面里不再有品牌行——名字只留在浏览器标签上。顶栏只有一行：
      状态徽章 · 刷新信息 · 暂停 · 主题。行高固定 24px，中间那段文本超长时自己
-     收成省略号，两侧按钮永不换行、也不会被挤出屏幕。 */
-  .topbar { display: flex; flex-direction: column; gap: 4px; margin-bottom: var(--sp-4); }
+     收成省略号，两侧按钮永不换行、也不会被挤出屏幕。
+     v3.343 吸顶：滚到列表中部时状态、暂停、主题仍然常驻（审计：手机滚动看列表时
+     这三样全滚走了，想暂停只能一路划回顶部）。sticky 而不是 fixed：不脱流，
+     页面高度、下拉刷新、回到顶部的落点全不受影响。
+     z-index 31 = 高于 .tabs(30)、低于 .to-top(35)：页签被压在下面，浮起的
+     「回到顶部」仍然可点；弹出层（.mini-pop 45 / .cate-pop 40 / flatpickr 70）
+     照旧盖在顶栏上。 */
+  .topbar {
+    display: flex; flex-direction: column; gap: 4px;
+    position: sticky; top: 0; z-index: 31;
+    margin: 0 calc(-1 * var(--wrap-pad-x));
+    padding: 0 var(--wrap-pad-x) var(--topbar-pad-b);
+    /* 半透明会让滚过的文字透上来；用页面底色实心铺满（换主题自动跟随）。 */
+    background: var(--bg);
+  }
   .sync { color: var(--text-dim); font-size: var(--fs-xs); display: flex; align-items: center; gap: 8px;
     flex-wrap: nowrap; min-width: 0; min-height: 24px; overflow: hidden; }
   .sync > .badge { flex: 0 0 auto; white-space: nowrap; }
@@ -652,10 +684,12 @@
   @media (prefers-reduced-motion: reduce) { .to-top { transition: none; } }
 
   /* ── 标签页（v3.297：概览/推送记录/运行日志/系统）── */
-  /* 吸顶（v3.306）：手机滚动看缓存/日志时仍能切页；背景用页面底色遮住穿过的内容。 */
+  /* 吸顶（v3.306）：手机滚动看缓存/日志时仍能切页；背景用页面底色遮住穿过的内容。
+     v3.343：吸顶位置从 0 改成顶栏下沿（--topbar-h）——顶栏自己吸顶后 z-index 更高，
+     页签若还贴在 0 就会被整条盖住。 */
   .tabs {
     display: flex; gap: 6px; margin-bottom: var(--sp-4); flex-wrap: wrap;
-    position: sticky; top: 0; z-index: 30; background: var(--bg);
+    position: sticky; top: var(--topbar-h); z-index: 30; background: var(--bg);
     padding: var(--sp-2) 0;
   }
   .tab-btn {
