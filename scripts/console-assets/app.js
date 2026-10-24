@@ -3469,7 +3469,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   return html`<div class="panel">
     <${PanelHead} title="推送记录" sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
-      <input class="msg-search" type="search" placeholder="搜索标题 / 内容…" value=${input}
+      <input class="msg-search" type="search" aria-label="搜索标题或内容" placeholder="搜索标题 / 内容…" value=${input}
         onInput=${(e) => setInput(e.target.value)}
         onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); refreshNow() } }} />
       <${CategoryPicker} value=${cate} categories=${categories}
