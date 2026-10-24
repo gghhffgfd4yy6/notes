@@ -774,6 +774,20 @@ function PanelHead ({ title, sub, right, afterTitle }) {
   </div>`
 }
 
+// 首屏骨架：第一份数据回来前先按最终版式占位（记数行 + 3 行列表），不再是一片空白。
+// 只在「首次加载且还没有任何数据」时用（调用方条件 loading && !data）——自动刷新、
+// 切回已看过的面板时 data 还在，条件不成立，所以不会反复闪骨架。
+// 结构在这里，样式（背景色/圆角/动画）由 app.css 的 .skeleton/.skel-* 负责。
+function PanelSkeleton ({ label = '正在加载…', rows = 3 }) {
+  return html`<div class="skeleton" role="status" aria-label=${label}>
+    <div class="skel-top" aria-hidden="true"><span class="skel-bar skel-bar-count"></span></div>
+    ${Array.from({ length: rows }, (_v, i) => html`<div class="skel-row" key=${i} aria-hidden="true">
+      <span class="skel-bar skel-bar-title"></span>
+      <span class="skel-bar skel-bar-meta"></span>
+    </div>`)}
+  </div>`
+}
+
 // 按钮：variant 生成 `btn btn-<variant>`；修饰词（btn-danger/btn-busy）可拼进 variant。
 function Button ({ variant = 'secondary', disabled, onClick, title, buttonRef, ariaBusy, children }) {
   return html`<button ref=${buttonRef} class=${'btn btn-' + variant} disabled=${disabled} onClick=${onClick} title=${title} aria-busy=${ariaBusy}>${children}</button>`
@@ -3499,7 +3513,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${exportErr && html`<${Hint} tone="error">${exportErr}<//>`}
     ${exportNote && html`<${Hint}>${exportNote}<//>`}
-    ${loading && !data && html`<div class="empty">加载中…</div>`}
+    ${loading && !data && html`<${PanelSkeleton} label="正在加载推送记录" />`}
     ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<${Hint}>正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）<//>` : ''}</div>`}
     ${data && data.status === 'ok' && html`<div ref=${listRef}>
       <div class="msg-count" aria-live="polite">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}${slowLoading ? html`<span class="msg-loading"> · 更新中…</span>` : ''}</div>

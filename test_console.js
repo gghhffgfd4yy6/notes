@@ -6749,6 +6749,11 @@ async function main () {
       '推送记录必须用 slowLoading 决定「更新中…」')
     assert.ok(msgPanel.includes('slowLoading ? html`<span class="msg-loading"> · 更新中…</span>`'),
       '「匹配 N 条」的后缀只能由 slowLoading 控制，不能用 loading')
+    // 首屏骨架（L4）：第一份数据回来前画占位；只在「还没有 data」时出现——自动刷新/切回
+    // 已有数据的面板不得反复闪骨架。
+    assert.ok(src.includes('function PanelSkeleton ('), '必须有可复用的首屏骨架组件')
+    assert.ok(msgPanel.includes('loading && !data && html`<') && msgPanel.includes('PanelSkeleton'),
+      '首屏骨架必须由 loading && !data 门控（自动刷新不闪）')
     assert.ok(!src.includes("刷新中…' : '刷新'"),
       '刷新按钮不得改文案：宽度变化会把导出按钮挤一下')
     assert.ok(src.includes('slowLoading && html`<span class="fr-status-muted">刷新中…</span>`'),
