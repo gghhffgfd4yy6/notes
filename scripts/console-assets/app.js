@@ -686,6 +686,7 @@ function fmtBarTime (ts, withDate) {
 
 // 顶栏状态行：所有页共用这一个组件、这一套词（v3.346）。
 //  - 轮询中的页（概览/日志）秒数倒数；不轮询的页给配置的间隔，不假装在倒数。
+//  - 开头写「N 秒后刷新」而不是「自动刷新 Ns」：后者会被读成刷新间隔（其实是倒计时）。
 //  - 暂停时只换开头两个字，后半句「数据截至 · 北京时间 时间」保持同一形态。
 // 独立持有 1s 时钟：避免 App 每秒重渲染整页（安卓原生 select 会闪）。
 function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = false, live = true }) {
@@ -706,7 +707,7 @@ function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = 
   if (paused) return html`已暂停 · <span class="sync-label">数据截至 · ${TZ_LABEL} </span>${atMain}<span class="sync-sec">${atSec}</span>`
   const sec = Math.max(1, Math.round(pollMs / 1000))
   const remain = live ? Math.max(0, Math.min(sec, Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000))) : sec
-  return html`自动刷新 ${remain}s · <span class="sync-label">数据截至 · ${TZ_LABEL} </span>${atMain}<span class="sync-sec">${atSec}</span>`
+  return html`${remain} 秒后刷新 · <span class="sync-label">数据截至 · ${TZ_LABEL} </span>${atMain}<span class="sync-sec">${atSec}</span>`
 }
 
 // 星期几也只按北京时间取：本地 getDay() 在北京时间跨零点时会差一天，和上面的时间对不上。
