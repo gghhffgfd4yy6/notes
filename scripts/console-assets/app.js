@@ -3215,6 +3215,16 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
 // <mark> 会把「展开」卡住几秒；日志页超过 3000 行直接关高亮是同一思路（渲染上限，不改搜索口径）。
 const MSG_HIT_MAX = 200
 
+// v3.358：标题末尾常自带价格（「… 32.3元」），右侧再画一个 .msg-price 就是同一条记录两个价。
+// 只认标题末尾的「数字 + 元」，且数值与 m.price 完全相等才隐藏；「32.3元起」「32.3元包邮」这类
+// 尾部不是纯价格的不算（不做模糊匹配，避免把两个不同的数吞掉一个）。不匹配一律照常显示。
+const TITLE_TAIL_PRICE_RE = /(\d+(?:\.\d+)?)\s*元\s*$/
+function titleTailPrice (title) {
+  if (typeof title !== 'string') return null
+  const m = TITLE_TAIL_PRICE_RE.exec(title)
+  return m ? Number(m[1]) : null
+}
+
 function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   const [page, setPage] = useState(1)
   const [size, setSize] = useState(20)
@@ -3496,7 +3506,9 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
                 onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}>
                 <span class="msg-caret" aria-hidden="true">${expanded === m.rowKey ? '▾' : '▸'}</span>${m.title ? hit(m.title) : '（无标题）'}
               </button>
-              ${m.price !== null ? html`<span class="msg-price">¥${m.price}</span>` : ''}
+              ${m.price !== null && titleTailPrice(m.title) !== m.price
+                ? html`<span class="msg-price">¥${m.price}</span>`
+                : ''}
             </div>
             <div class="msg-meta">
               <span class="msg-cate">${m.catename}</span>
