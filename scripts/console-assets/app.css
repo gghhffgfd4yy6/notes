@@ -1197,10 +1197,10 @@
 
   /* 条件渲染的整块内容：节点插入即播一次。JS 不看守，CSS 按插入触发。 */
   /* 不用 fill-mode:both——动画结束后不应留下常驻 transform（会新建包含块）。 */
-  .alert-banner { animation: banner-in .26s cubic-bezier(.22, 1, .36, 1); }
-  .log-focus { animation: banner-in .22s cubic-bezier(.22, 1, .36, 1); }
+  .alert-banner { animation: banner-in .3s cubic-bezier(.22, 1, .36, 1); }
+  .log-focus { animation: banner-in .24s cubic-bezier(.22, 1, .36, 1); }
   @keyframes banner-in {
-    from { opacity: 0; transform: translate3d(0, -8px, 0); }
+    from { opacity: 0; transform: translate3d(0, -12px, 0); }
     to { opacity: 1; transform: translate3d(0, 0, 0); }
   }
 
@@ -1213,10 +1213,10 @@
   .flash-ok { animation: field-ok .9s ease-out both; }
   @keyframes field-shake {
     0%, 100% { translate: 0 0; }
-    18% { translate: -3px 0; }
-    36% { translate: 3px 0; }
-    54% { translate: -2px 0; }
-    72% { translate: 2px 0; }
+    18% { translate: -4px 0; }
+    36% { translate: 4px 0; }
+    54% { translate: -3px 0; }
+    72% { translate: 3px 0; }
   }
   @keyframes field-ring {
     0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--bad) 45%, transparent); }

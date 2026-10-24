@@ -1972,9 +1972,10 @@ async function backupUiStructureTests () {
     assert.ok(seg.includes('onCancelRef.current = onCancel'), '每次渲染都要把 ref 更新到最新 onCancel')
 
     // 三个退出入口都必须调用 ref，而不是捕获的旧 onCancel；否则 busy 守卫可能被旧闭包绕过。
-    assert.match(seg, /Escape'\) onCancelRef\.current\(\)/, 'Escape 必须调用 ref')
-    assert.ok(seg.includes('if (e.target === e.currentTarget) onCancelRef.current()'), '点遮罩必须调用 ref')
-    assert.ok(seg.includes('onClick=' + '$' + '{() => onCancelRef.current()}'), '取消按钮必须调用 ref')
+    // v3.360：三个入口都先播退场再回调，但回调本身仍走 ref（避免旧闭包绕过 busy 守卫）。
+    assert.match(seg, /Escape'\) closeDialog\(\(\) => onCancelRef\.current\(\)\)/, 'Escape 必须调用 ref')
+    assert.ok(seg.includes('if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current())'), '点遮罩必须调用 ref')
+    assert.ok(seg.includes('onClick=' + '$' + '{() => closeDialog(() => onCancelRef.current())}'), '取消按钮必须调用 ref')
 
     // 依赖数组必须属于“聚焦”的那个 effect，不能靠组件里别处的同名字符串蒙混。
     const focusEffect = seg.match(/const t = setTimeout\(\(\) => \{[\s\S]*?\n\s*\}, \[([^\]]*)\]\)/)

@@ -10,18 +10,18 @@
 // 5) 列表位移自己做 FLIP（只补 transform），不引第三方列表动画库：那些库会顺带
 //    做宽高过渡，正好踩中第 1 条。
 /* global IntersectionObserver */
-import { useLayoutEffect, useRef } from './htm-preact.module.js'
+import { useCallback, useLayoutEffect, useRef } from './htm-preact.module.js'
 import { animate } from './motion-lib.module.js'
 import { motionAllowed } from './pure.mjs'
 
 // 时长与曲线集中在这里。曲线是 easeOutQuint 的近似：起步快、收尾软，不弹、不生硬。
 export const MOTION = Object.freeze({
   press: 0.12,
-  fast: 0.18,
-  base: 0.26,
+  fast: 0.22,
+  base: 0.30,
   slow: 0.42,
-  rise: 10,
-  step: 0.028,
+  rise: 14,
+  step: 0.036,
   cap: 6
 })
 
@@ -196,4 +196,75 @@ export function useFlipList (ref, deps) {
     }
     flipRects.set(root, next)
   }, deps)
+}
+
+// 弹窗「从哪来回哪去」：进场把面板从触发元素的位置/尺寸放大到原尺寸，退场沿同一条
+// 路径缩回去，播完再让调用方卸载。只动 transform/opacity。
+// 触发元素优先取 activeElement（键盘/桌面点击后聚焦在按钮上），否则取最后一次
+// pointerdown 的按钮——手机上点按不会给 button 聚焦，只能靠这个兜底。
+let lastTrigger = null
+if (typeof document !== 'undefined') {
+  document.addEventListener('pointerdown', (e) => {
+    const t = e.target
+    lastTrigger = t && typeof t.closest === 'function'
+      ? (t.closest('button, .btn, [role="button"], a, label, summary') || t)
+      : null
+  }, true)
+}
+
+function triggerBox () {
+  const active = typeof document === 'undefined' ? null : document.activeElement
+  const el = active && active !== document.body && active.getBoundingClientRect ? active : lastTrigger
+  if (!el || typeof el.getBoundingClientRect !== 'function') return null
+  const r = el.getBoundingClientRect()
+  return r.width > 0 && r.height > 0 ? r : null
+}
+
+// 返回一个「带动效关闭」函数：close(() => 真正卸载/清状态)。动画结束（或用户关了
+// 动效）后回调，且并发调用只生效一次。
+export function useMorphDialog (backRef, boxRef, open) {
+  const from = useRef(null)
+  const closing = useRef(false)
+  useLayoutEffect(() => {
+    if (!open) { closing.current = false; return }
+    const box = boxRef.current
+    const back = backRef.current
+    if (!box) return
+    const r = box.getBoundingClientRect()
+    const src = triggerBox()
+    if (!src || r.width === 0 || !motionOK()) {
+      enter(back, { y: 0, duration: MOTION.fast })
+      enter(box, { y: 12, scale: 0.94 })
+      return
+    }
+    // 等比缩放：按钮宽度 / 面板宽度，夹在 0.16~1。非等比会把文字压扁。
+    const s = Math.max(0.16, Math.min(1, src.width / r.width))
+    const dx = Math.round(src.left + src.width / 2 - (r.left + r.width / 2))
+    const dy = Math.round(src.top + src.height / 2 - (r.top + r.height / 2))
+    from.current = { dx, dy, s }
+    enter(back, { y: 0, duration: MOTION.fast })
+    play(box, {
+      transform: [`translate3d(${dx}px, ${dy}px, 0) scale(${s})`, 'translate3d(0px, 0px, 0px) scale(1)'],
+      opacity: [0.3, 1]
+    }, { duration: MOTION.base, ease: EASE })
+  }, [open])
+  return useCallback((done) => {
+    if (closing.current) return
+    const box = boxRef.current
+    const back = backRef.current
+    const f = from.current
+    if (!box || !f || !motionOK() || typeof animate !== 'function') { done(); return }
+    closing.current = true
+    let fired = false
+    const fire = () => { if (fired) return; fired = true; done() }
+    // 不用 play()：它会在结束时清掉内联样式，退场最后一帧会被拉回原尺寸闪一下；
+    // 这里动画一结束就卸载，没有清理的必要。fill 保持 none，父级若没真关掉，元素
+    // 会自然回到原状。
+    animate(box, {
+      transform: ['translate3d(0px, 0px, 0px) scale(1)', `translate3d(${f.dx}px, ${f.dy}px, 0) scale(${f.s})`],
+      opacity: [1, 0]
+    }, { duration: MOTION.fast, ease: EASE }).then(fire, fire)
+    if (back) animate(back, { opacity: [1, 0] }, { duration: MOTION.fast, ease: 'ease-out' })
+    setTimeout(fire, MOTION.fast * 1000 + 160)
+  }, [backRef, boxRef])
 }
