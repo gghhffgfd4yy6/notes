@@ -874,3 +874,12 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 前端把 `override` 存进状态并收敛出单一 `buildSaveCandidate()`：候选 = 覆盖文件已有字段 + 本次改动字段，普通保存与离开拦截的「保存并继续」都走它。两者都不是的字段仍然不提交，避免把代码默认整份钉死；首启「复制代码默认」按原意整份写入（`baseRevision: 0`）不变。
 - `override` 与 `filter` 出自**同一次读盘**（由 `xbk_filter_store.loadFilterRules` 一并给出，读面不再二次读文件）：避免两次读之间文件被其他进程替换/读失败时，两者描述不同快照、保存又丢字段。候选构造抽到 `scripts/console-assets/pure.mjs`（`buildSaveCandidate` / `filterOverrideFields`），由 `test_console.js` 直接 `import` 跑行为断言，而不是只靠源码字符串匹配。
 - 服务端保存语义保持「整份替换」，不在服务端做合并。`test_console.js` 新增真实回归用例（先存 A → GET 取 `override` → 以 `override` + 改动的 B 保存，断言 A、B 都在；同时断言「只提交 B 会丢 A」作为旧行为反例，断言 `override` 只含文件里实际存在的字段、且与 `filter` 同值），并新增候选构造的行为用例（覆盖项保留 / 改动项优先 / 未涉及字段不提交 / 未知键丢弃 / 坏输入不抛错）；控制台套件 243/0。
+
+## v3.360 — 控制台全站动效层（过滤规则页为主）
+
+- 新增动效适配层 `scripts/console-assets/motion.js`：唯一接触动画库的文件，页面只用 `enter/reveal/flash` 与三个 hook；换库只改这一层（app.js 不得直接 import 动画库，已由套件锁定）。
+- 动画引擎：`motion/mini` 14.6.0（MIT，WAAPI，只跑 opacity/transform，跑在合成层），esbuild 打成单文件由 `/assets` 白名单伺服（CSP `script-src 'self'` 覆盖，不走 CDN），gzip 后约 5KB。列表位移的 FLIP 自己实现（只补 transform），不引第二个列表动画库——那些库会顺带做宽高过渡。
+- 覆盖：切页淡入（不动高度，不改滚动锚点）· 概览卡片 stagger · 过滤规则页分组/字段逐级入场、校验失败字段抖动+红圈脉冲、预览块入场 · 弹窗遮罩淡入 + 面板 `scale(.96)` 上浮 · 触发历史/逐轮历史行淡入 · 推送记录翻页 FLIP · 提示行/横幅入场 · 配置块 stagger · 按钮按压、卡片 hover、输入框焦点过渡 · 主题切换 280ms 颜色过渡。
+- 时机纪律：所有入场只播一次（挂载 / 首次拿到数据 / 真正切页），5s 轮询重渲染不重播；动画结束后清掉内联 `opacity/transform`，避免盖住 CSS 的 hover/按压缩放。
+- `prefers-reduced-motion: reduce` 时适配层全部 no-op（页面直接到终态，不是快放），CSS 侧全局兜底保持不变。
+- 资产与门禁：`STATIC_ASSETS` 新增 3 个路由；`test_console.js` 的内容哈希清单同步；vendored bundle 进 `standard.ignore`；新增「动效层」结构红线（白名单 / 适配层隔离 / reduced-motion 门控 / 只动合成层属性 / 只播一次 / bundle 非空壳）。

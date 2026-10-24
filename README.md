@@ -203,6 +203,7 @@ XBK_CONSOLE_TOKEN=请换成至少16位的随机字符串 npm run console
 
 - 默认地址 `http://127.0.0.1:7777`。两种鉴权方式：命令行/API 用请求头 `Authorization: Bearer <XBK_CONSOLE_TOKEN>`；浏览器直接打开 `http://127.0.0.1:7777/?token=<XBK_CONSOLE_TOKEN>`（页面内的 fetch 请求通过 Authorization: Bearer 请求头携带 token，URL 不再复述凭证；看板每 5 秒自动刷新，任务运行期间加密到 2 秒）。token 未设置或短于 16 字符时服务直接拒绝启动。
 - 前端资产按内容哈希做版本号（`?v=<sha8>`）：带版本的 URL 走 `immutable` 长缓存，裸 URL 仍 `no-cache` + ETag（命中 `If-None-Match` 返回 304）；并按 `Accept-Encoding` 提供 gzip（首屏 JS 77KB → 约 26KB）。页面 HTML 始终 `no-store`（含会话凭证）。
+- 动效层（v3.360）：切页淡入、卡片/表格行/表单分组依次入场、弹窗淡入上浮、校验失败字段抖动+红圈、推送记录翻页/增删的位置补间（FLIP）、主题切换颜色过渡。只动 `opacity`/`transform`（合成层，不触发重排），动画结束即清内联样式；入场只在挂载/首次拿到数据/真正切页时播一次，5 秒轮询不重播。系统开了「减少动效」（`prefers-reduced-motion: reduce`）时全部关闭、直接到终态。动画库是 vendored 单文件（motion/mini，MIT），走 `/assets` 白名单，无 CDN。
 - ⚠️ `?token=` 会留在浏览器历史与访问日志里；`XBK_CONSOLE_HOST` 绑定非回环地址时 token 以明文过网（HTTP 无加密），请仅在受信内网使用，跨网访问务必前置 TLS 反代（nginx/caddy 终止 TLS 后转发本端口）。
 - 「试运行」抓取但不推送、不写去重记录（等价 `--dry-run`）；「正式运行一轮」会**真实推送通知**；「通知自检」向全部已配置渠道各发一条固定测试消息（真实推送，`POST /api/notify-test`，无 body）。同一时刻只允许一个触发任务，重复触发返回 409；锁残留（进程被 kill -9 等留下损坏锁文件）时人工删除缓存目录下的 `console-trigger.lock` 即可恢复。
 - 「自动正式运行」：在手动触发区把间隔调到 3–20 秒（数字框 + 加减 + 保存），点「开始」并二次确认后按「上一轮结束后等待 N 秒」循环正式运行。调度在**控制台服务器进程内**，关闭页面、切后台、锁屏都不影响，只有点「停止」或连续失败 3 次才停；控制台重启后若仍处于开启状态会恢复。独立动作 `run-auto` 共用同一把单飞锁，不会与手动/自动轮次叠跑；间隔与开关落盘到缓存目录 `console-auto.json`，运行轮数/错误只存内存。

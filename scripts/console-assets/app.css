@@ -4,7 +4,7 @@
  * 换主题 = 改 token 块，换组件库 = 改 ui/ 原语（app.js 里的 Button/Panel/Badge 等）。
  * 兼容：旧变量名（--bg/--panel/...）保留为语义 token 的别名，外部断言与内联样式不受影响。
  */
-@layer tokens, base, components, utilities;
+@layer tokens, base, components, motion, utilities;
 
 @layer tokens {
   :root {
@@ -1170,6 +1170,79 @@
   @media (max-width: 420px) {
     .tabs { gap: 2px; }
     .tab-btn { padding: 7px 5px; font-size: var(--fs-sm); }
+  }
+}
+
+/* ── 动效层（v3.360）───────────────────────────────────────────────────────
+   只做「过渡与微交互」；入场/列表 FLIP 由 motion.js 用 WAAPI 驱动（见该文件）。
+   规则只碰 opacity / transform / 颜色，不改尺寸 ⇒ 不会引入布局跳动。 */
+@layer motion {
+  .btn, .tab-btn, .log-chip, .cfg-toggle, .sync-toggle, .alert-action, .alert-link,
+  .date-btn, .date-clear, .pager .btn {
+    transition: transform .12s ease, background-color .16s ease,
+      border-color .16s ease, color .16s ease, opacity .16s ease, box-shadow .16s ease;
+  }
+  .btn:active:not(:disabled), .tab-btn:active, .log-chip:active, .sync-toggle:active,
+  .cfg-toggle:active, .date-btn:active, .date-clear:active { transform: scale(.97); }
+
+  .card { transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
+  .msg-item { transition: border-color .18s ease, background-color .18s ease; }
+
+  @media (hover: hover) and (pointer: fine) {
+    .card:hover { transform: translateY(-1px); }
+    .msg-item:hover { border-color: var(--border); }
+  }
+
+  input, select, textarea { transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease; }
+
+  /* 条件渲染的整块内容：节点插入即播一次。JS 不看守，CSS 按插入触发。 */
+  /* 不用 fill-mode:both——动画结束后不应留下常驻 transform（会新建包含块）。 */
+  .alert-banner { animation: banner-in .26s cubic-bezier(.22, 1, .36, 1); }
+  .log-focus { animation: banner-in .22s cubic-bezier(.22, 1, .36, 1); }
+  @keyframes banner-in {
+    from { opacity: 0; transform: translate3d(0, -8px, 0); }
+    to { opacity: 1; transform: translate3d(0, 0, 0); }
+  }
+
+  /* 校验失败的字段：抖动 + 红圈脉冲（motion.js 的 flash() 加类，820ms 后摘掉）。
+     用 translate 而非 transform，避免盖掉元素自身的内联 transform。 */
+  .flash-bad {
+    animation: field-shake .5s cubic-bezier(.36, .07, .19, .97) both,
+      field-ring 1.2s ease-out both;
+  }
+  .flash-ok { animation: field-ok .9s ease-out both; }
+  @keyframes field-shake {
+    0%, 100% { translate: 0 0; }
+    18% { translate: -3px 0; }
+    36% { translate: 3px 0; }
+    54% { translate: -2px 0; }
+    72% { translate: 2px 0; }
+  }
+  @keyframes field-ring {
+    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--bad) 45%, transparent); }
+    30% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 45%, transparent); }
+    100% { box-shadow: 0 0 0 3px transparent; }
+  }
+  @keyframes field-ok {
+    0% { box-shadow: 0 0 0 0 var(--ok-line); }
+    40% { box-shadow: 0 0 0 3px var(--ok-line); }
+    100% { box-shadow: 0 0 0 3px transparent; }
+  }
+
+  /* 主题切换：只在这 320ms 内让颜色走过渡（常驻 transition 会拖慢所有 hover）。 */
+  @media (prefers-reduced-motion: no-preference) {
+    html.theme-anim, html.theme-anim *, html.theme-anim *::before, html.theme-anim *::after {
+      transition: background-color .28s ease, color .28s ease, border-color .28s ease,
+        box-shadow .28s ease, fill .28s ease, stroke .28s ease !important;
+    }
+  }
+
+  /* 下拉/分类/提示弹层：只淡入，不做位移/缩放——它们的位置是按打开瞬间的
+     getBoundingClientRect 算的，几何一变就会算偏。 */
+  .mini-pop, .cate-pop, .tap-tip-pop { animation: pop-fade .16s ease-out both; }
+  @keyframes pop-fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
 }
 

@@ -1,4 +1,5 @@
-// scripts/console-assets/app.js —— 控制台前端（preact + htm standalone，无构建、零 npm 依赖）。
+// scripts/console-assets/app.js —— 控制台前端（preact + htm standalone）。
+// 构建：无构建步骤，静态资产由 /assets 白名单伺服；动效库是 vendored bundle（见 motion.js 头注释）。
 // vendor 锚点（v3.296 补）：./htm-preact.module.js = preact 10.24.3 + hooks + htm 3.1.1
 // standalone 内联版（npmmirror 文件直链入库，sha256 =
 // 2aeaa3232ca84a7ad7ac0bef39bad3223dbd2173bee6ce4554b77be2f7f271b3）。重取/升级必须核对该值；
@@ -14,6 +15,8 @@ import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, lo
 // 与 htm-preact 同口径——不引 CDN，CSP script-src 'self' 覆盖）。样式在 flatpickr.css，
 // 主题化覆盖写在 app.css 的 .flatpickr-calendar 段（跟四套 token 走）。
 import flatpickr from './flatpickr.js'
+// 动效层（v3.360）：app.js 只依赖自家适配层，换动画库只改 motion.js。
+import { MOTION, enter, flash, useEnterOnOpen, useFlipList, useMountReveal, useRevealWhen } from './motion.js'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -761,7 +764,17 @@ function TapTip ({ tip, hint, children, showDate = true }) {
 
 // 提示行：tone='error' 红色、tone='warn' 琥珀色。页面不再拼 'hint hint-err' 字符串。
 function Hint ({ tone, style, children }) {
-  return html`<div class=${tone === 'error' ? 'hint hint-err' : (tone === 'warn' ? 'hint hint-warn' : 'hint')} style=${style}>${children}</div>`
+  // 提示行随错误/成功信息出现：轻量入场，扫一眼就知道「下面多了一行」。
+  const ref = useRef(null)
+  useMountReveal(ref, { y: 6, duration: MOTION.fast })
+  return html`<div ref=${ref} class=${tone === 'error' ? 'hint hint-err' : (tone === 'warn' ? 'hint hint-warn' : 'hint')} style=${style}>${children}</div>`
+}
+
+// 入场包装：给「条件渲染的整块内容」补一次性淡入（预览块、提示横幅）。
+function Reveal ({ cls, y = 10, duration, role, ariaLive, children }) {
+  const ref = useRef(null)
+  useMountReveal(ref, { y, duration })
+  return html`<div class=${cls} role=${role} aria-live=${ariaLive} ref=${ref}>${children}</div>`
 }
 
 // 面板头：标题 + 说明 + 右侧操作（右侧自动左推）。含 select 等复杂头部仍可手写。
@@ -1312,7 +1325,10 @@ const CARD_PLACEHOLDERS = [
 ]
 
 function CardsGrid ({ cards, busy }) {
-  return html`<div class="cards" aria-busy=${busy ? 'true' : undefined}>
+  const ref = useRef(null)
+  // 占位卡也算 .card：等真实数据（busy 结束）再播，别把入场浪费在「正在读取…」上。
+  useRevealWhen(ref, !busy && cards.length > 0, '.card', { y: 12, step: 0.035, cap: 5 })
+  return html`<div class="cards" ref=${ref} aria-busy=${busy ? 'true' : undefined}>
     ${cards.map((c) => html`<${Card} key=${c.title} title=${c.title} main=${c.main}
       badge=${html`<${Badge} tone=${c.tone}>${c.badge}<//>`}>
       ${c.lines.map((l) => html`<div key=${l}>${l}</div>`)}
@@ -1509,6 +1525,11 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
   const onCancelRef = useRef(onCancel)
   onCancelRef.current = onCancel
   const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
+  // 弹窗入场（v3.360）：遮罩淡入、面板轻微上浮 + 缩放；关闭仍立即卸载，不做退场排队。
+  const backRef = useRef(null)
+  const boxRef = useRef(null)
+  useEnterOnOpen(backRef, open, { y: 0, duration: MOTION.fast })
+  useEnterOnOpen(boxRef, open, { y: 10, scale: 0.96 })
   useEffect(() => {
     if (!open) return undefined
     const onKey = (e) => { if (e.key === 'Escape') onCancelRef.current() }
@@ -1520,8 +1541,8 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
     return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
   }, [open, initialFocusRef])
   if (!open) return null
-  return html`<div class="modal-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCancelRef.current() }}>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby=${titleId}>
+  return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) onCancelRef.current() }}>
+    <div class="modal" ref=${boxRef} role="dialog" aria-modal="true" aria-labelledby=${titleId}>
       <div class="modal-title" id=${titleId}>${title}</div>
       <div class="modal-body">${children}</div>
       <div class="modal-actions">
@@ -1539,6 +1560,10 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
   const onCancelRef = useRef(onCancel)
   onCancelRef.current = onCancel
   const [titleId] = useState(() => `leave-title-${++dialogSeq}`)
+  const backRef = useRef(null)
+  const boxRef = useRef(null)
+  useEnterOnOpen(backRef, open, { y: 0, duration: MOTION.fast })
+  useEnterOnOpen(boxRef, open, { y: 10, scale: 0.96 })
   useEffect(() => {
     if (!open) return undefined
     const onKey = (e) => { if (e.key === 'Escape') onCancelRef.current() }
@@ -1547,8 +1572,8 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
     return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
   }, [open])
   if (!open) return null
-  return html`<div class="modal-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCancelRef.current() }}>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby=${titleId}>
+  return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) onCancelRef.current() }}>
+    <div class="modal" ref=${boxRef} role="dialog" aria-modal="true" aria-labelledby=${titleId}>
       <div class="modal-title" id=${titleId}>有未保存的过滤规则</div>
       <div class="modal-body">
         <div class="fr-dialog-line">当前有 ${count} 个字段还没保存。</div>
@@ -2036,6 +2061,9 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
   // 结果徽章由下一轮轮询的 cancelled/finishedAt 驱动。
   const [cancelPending, setCancelPending] = useState(null)
   const [cancelErr, setCancelErr] = useState('')
+  // 首屏行入场（只播一次；后续轮询只更新文字，不再闪）。
+  const listRef = useRef(null)
+  useRevealWhen(listRef, runs.length > 0, 'tbody tr', { transform: false, duration: MOTION.fast, step: 0.02, cap: 6 })
   const doCancel = async (id) => {
     setCancelPending(id)
     setCancelErr('')
@@ -2060,7 +2088,7 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
         ? html`<div class="empty">触发历史暂不可用，请稍后刷新</div>`
         : runs.length === 0
           ? html`<div class="empty">暂无触发记录</div>`
-          : html`<div class="runs-scroll"><table class="runs-table">
+          : html`<div class="runs-scroll" ref=${listRef}><table class="runs-table">
         <thead><tr><th>#</th><th>动作</th><th>开始时间</th><th>结果</th><th></th></tr></thead>
         <tbody>
           ${runs.map((r) => html`<tr key=${r.id} class=${openId === r.id ? 'row-open' : ''}>
@@ -2176,6 +2204,8 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   // 只有用户主动改页/改每页/改分类/改时间时置位；纯 load() 与自动刷新不置。
   const listRef = useRef(null)
   const landRef = useRef(false)
+  // 首屏行入场：只播一次，翻页/轮询不再重播。
+  useRevealWhen(listRef, !!(data && data.status === 'ok'), 'tbody tr', { transform: false, duration: MOTION.fast, step: 0.02, cap: 8 })
   // 置旗那一刻的位置与数据：模式切换要等自动加载的响应落地才落点；
   // 请求飞行期间用户自己滚走（非浏览器夹取）则撤销这次落点。
   const armedDataRef = useRef(undefined)
@@ -3416,6 +3446,10 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     }
   }, [exporting, cate, query, days, rangeActive, range.from, range.to])
   const items = data && Array.isArray(data.items) ? data.items : []
+  // 列表 FLIP（v3.360）：翻页/增删时卡片在位置上滑过去，而不是瞬间重排。
+  // 依赖「列表是否存在」：列表首次出现时挂载控制器，轮询更新不重建。
+  const motionRef = useRef(null)
+  useFlipList(motionRef)
   const categories = data && Array.isArray(data.categories) ? data.categories : []
   // 分类弹层的「全部分类」计数必须跟时间窗走（服务端 days>0 时 categories 已按窗口重算）；
   // 直接用 grandTotal 会在「今天」里显示全量 374，看起来像筛选没生效。
@@ -3484,8 +3518,8 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       <div class="msg-count" aria-live="polite">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}${slowLoading ? html`<span class="msg-loading"> · 更新中…</span>` : ''}</div>
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
-        : html`<div class="msg-list">
-          ${items.map((m) => html`<div class="msg-item" key=${m.rowKey}>
+        : html`<div class="msg-list" ref=${motionRef}>
+          ${items.map((m) => html`<div class="msg-item" key=${m.rowKey} data-mk=${m.rowKey}>
             <div class="msg-item-head">
               <span class="msg-title" role="button" tabindex="0"
                 aria-expanded=${expanded === m.rowKey ? 'true' : 'false'}
@@ -4736,6 +4770,9 @@ function ConfigPanel ({ onSync, active = true, pollTick = 0 }) {
   // v3.348：统一轮询节拍——配置页每拍重拉（只读视图，不会覆盖任何草稿）。
   usePollReload(active, pollTick, refresh)
   const r = data && data.runtime ? data.runtime : null
+  // 配置块入场：首次读到数据时轻推一次，之后每 5s 的轮询重渲染不再动。
+  const panelRef = useRef(null)
+  useRevealWhen(panelRef, !!r, '.cfg-block', { y: 8, duration: MOTION.fast, step: 0.03, cap: 4 })
   const pc = data && data.pushChannels ? data.pushChannels : null
   // 读面失败时 usePanelLoader 仍保留上一次的 data（不清空），这里必须显式丢弃，
   // 否则页面会一边报「读取失败、显示代码默认值」一边渲染旧的覆盖值（Sourcery #257）。
@@ -4745,7 +4782,7 @@ function ConfigPanel ({ onSync, active = true, pollTick = 0 }) {
   const filterRows = r ? effectiveFilterRows(r.filter, effFilter) : []
   const changedCount = filterRows.filter((row) => row.differs).length
   const filterSub = filterSourceNote(effLive, filterRows.length, changedCount)
-  return html`<div class="panel">
+  return html`<div class="panel" ref=${panelRef}>
     <${PanelHead} title="运行配置" sub="脱敏视图 · 推送密钥只显示是否已配置"
       right=${html`<${Button} variant="ghost" onClick=${refresh}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
@@ -5024,6 +5061,10 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const [backups, setBackups] = useState([])
   const [backupListKnown, setBackupListKnown] = useState(false)
   const [restoreTo, setRestoreTo] = useState('default')
+  // 表单入场（v3.360）：分组先到、字段随后到，只播一次（轮询重拉不重播）。
+  const formRef = useRef(null)
+  useRevealWhen(formRef, !!draft, '.fr-group', { y: 12, step: 0.045, cap: 4 })
+  useRevealWhen(formRef, !!draft, '.fr-field', { y: 8, duration: MOTION.fast, step: 0.018, cap: 8 })
   const [loading, setLoading] = useState(false)
   const slowLoading = useSlowFlag(loading)
   const [busy, setBusy] = useState('') // '' | validate | preview | save | copy | restore
@@ -5437,6 +5478,8 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     // 面板被 section[hidden] 隐藏时 rect 全为 0：不在这里拽页面。
     if (!el.getBoundingClientRect().height) return
     el.focus({ preventScroll: true })
+    // 视口里「哪一行错了」要一眼看见：聚焦后补一次抖动 + 红圈脉冲。
+    flash(el, 'bad')
     const tabs = document.querySelector('.tabs')
     const pad = (tabs ? tabs.getBoundingClientRect().height : 0) + 8
     const top = el.getBoundingClientRect().top + window.scrollY - pad
@@ -5844,7 +5887,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         <${Button} variant="primary" disabled=${!!busy || loading} onClick=${askCopyDefaults}>把当前规则复制到覆盖文件<//>
       </div>`}
 
-      <div class="fr-form" role="group" aria-label="过滤规则表单">
+      <div class="fr-form" role="group" aria-label="过滤规则表单" ref=${formRef}>
         ${FILTER_GROUPS.map((g) => html`<fieldset class="fr-group" key=${g.key}>
           <legend class="fr-group-title">${g.title}</legend>
           <div class="fr-group-note">${g.note}</div>
@@ -5863,7 +5906,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         <div class="fr-field-hint">值来自代码配置 Config.keyword.zkt_gjc；v1 只读，不接受写入。修改需改代码并重启。</div>
       </div>
 
-      ${preview && html`<div class="fr-preview" aria-live="polite">
+      ${preview && html`<${Reveal} cls="fr-preview" ariaLive="polite" y=${8}>
         <div class="fr-preview-head">补推影响预览</div>
         <div class="fr-preview-main">${reEvalText(preview)}</div>
         ${preview.available === false
@@ -5876,7 +5919,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
           </li>`)}
         </ul>`}
         <div class="fr-field-hint">预览只在内存试算，不落盘、不推进过滤 hash、不触发推送。</div>
-      </div>`}
+      <//>`}
 
       <div class="fr-actions">
         <${Button} variant="primary" disabled=${dirtyFields.length === 0 || !!busy || loading} onClick=${beginSave}>
@@ -6019,6 +6062,20 @@ function App () {
   // （刷新/后退不丢当前页；非法值仍回概览）。
   const resolveTab = (hash) => (/^#\/filter$/.test(typeof hash === 'string' ? hash : '') ? 'filter' : tabFromHash(hash))
   const [tab, setTab] = useState(() => resolveTab(window.location.hash))
+  // 切页入场（v3.360）：只动新页的 opacity/transform，不动高度 ⇒ 不改变滚动锚点、
+  // 不会把首屏内容顶走。tab 变化只在真正切页时发生，轮询不触发。
+  const wrapRef = useRef(null)
+  useLayoutEffect(() => {
+    const root = wrapRef.current
+    if (!root) return
+    // 只淡入、完全不加 transform：页面里可能有 position:fixed 的弹层（分类选择器/
+    // 提示气泡），祖先一旦有 transform 就会改成按它定位，弹层会跳位。
+    enter(root.querySelector('.page:not([hidden])'), { transform: false, duration: MOTION.fast })
+  }, [tab])
+  // 主题切换的临时过渡类：只在这 320ms 内让颜色属性走 transition，避免常驻 transition
+  // 让所有 hover/选中态变慢。
+  const themeTimerRef = useRef(0)
+  useEffect(() => () => clearTimeout(themeTimerRef.current), [])
   // 过滤页草稿守卫：脏状态、保存、放弃由面板写进这个 ref，App 只在切页/后退前问一句。
   // 不用 state 是因为每敲一个字都 dirty，App 不需要跟着重渲染。
   const [leaveRequest, setLeaveRequest] = useState(null)
@@ -6867,6 +6924,11 @@ function App () {
     const shared = readThemeCookie() || currentThemeKey()
     const at = THEMES.findIndex((t) => t.key === shared)
     const next = THEMES[(at + 1) % THEMES.length]
+    // 颜色过渡只在切换窗口内生效（v3.360）：常驻 transition 会让所有 hover/选中变慢。
+    const root = document.documentElement
+    root.classList.add('theme-anim')
+    clearTimeout(themeTimerRef.current)
+    themeTimerRef.current = window.setTimeout(() => root.classList.remove('theme-anim'), 320)
     // 先落 React 状态再写 cookie：写 cookie 抛异常时不会出现「CSS 变了、按钮还是旧名」。
     setTheme(next.key)
     applyThemeKey(next.key)
@@ -6884,7 +6946,7 @@ function App () {
     : locking ? '任务运行中' : '空闲'
   // 顶栏状态行：所有页同一套词，只有时间来源不同（概览看最近刷新，其它页看本页拉到数据的时间）。
   const syncAt = tab === 'overview' ? lastSync : panelSync
-  return html`<div class="wrap">
+  return html`<div class="wrap" ref=${wrapRef}>
     <header class="topbar">
       <div class="sync" ref=${syncRef} tabindex="0" aria-label="状态与刷新">
         <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
