@@ -45,24 +45,25 @@ export function enter (el, opts = {}) {
   const frames = {}
   if (opts.transform !== false) frames.transform = [from, 'translate3d(0px, 0px, 0px) scale(1)']
   if (opts.fade !== false) frames.opacity = [0, 1]
+  let ctl = null
   try {
-    const ctl = animate(el, frames, { duration, delay, ease: EASE })
-    // 动画结束后清掉内联 opacity/transform：否则 WAAPI 留下的 `transform: none`
-    // 会盖住 CSS 的 hover 抬升/按压反馈（内联样式优先于样式表）。
-    // 用序号防止上一段动画的收尾回调清掉后来者的内联值。
-    if (ctl && typeof ctl.then === 'function') {
-      const seq = (el.__xbkMotionSeq || 0) + 1
-      el.__xbkMotionSeq = seq
-      ctl.then(() => {
-        if (el.__xbkMotionSeq !== seq) return
-        el.style.removeProperty('transform')
-        el.style.removeProperty('opacity')
-      }).catch(() => {})
-    }
-    return ctl
+    ctl = animate(el, frames, { duration, delay, ease: EASE })
   } catch (e) {
     return null
   }
+  // 动画结束后清掉内联 opacity/transform：否则 WAAPI 留下的 `transform: none`
+  // 会盖住 CSS 的 hover 抬升/按压反馈（内联样式优先于样式表）。
+  // 用序号防止上一段动画的收尾回调清掉后来者的内联值。
+  if (ctl && typeof ctl.then === 'function') {
+    const seq = (el.__xbkMotionSeq || 0) + 1
+    el.__xbkMotionSeq = seq
+    ctl.then(() => {
+      if (el.__xbkMotionSeq !== seq) return
+      el.style.removeProperty('transform')
+      el.style.removeProperty('opacity')
+    }).catch(() => {})
+  }
+  return ctl
 }
 
 // 一组子元素依次入场。延迟按 index 递增并在 cap 处封顶：
