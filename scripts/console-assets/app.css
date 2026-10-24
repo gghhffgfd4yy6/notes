@@ -267,6 +267,9 @@
      只减顶部、不减页脚和 padding 的固定常量（短页会多出一段无意义滚动）。 */
   .page { flex: 1 0 auto; }
   .page[hidden] { display: none; }
+  /* 语义化外壳（v3.xxx）：内容区包了 <main> 之后，剩余高度要由 main 转交给 .page，
+     否则 .wrap 的 flex 链断在这里，短页页脚不再贴底。 */
+  .main { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
 
   /* ── 下拉刷新状态（v3.331）── */
   /* 写在顶栏「数据截至」这一行里：不浮层、不遮标题，文字原地换成刷新状态。 */

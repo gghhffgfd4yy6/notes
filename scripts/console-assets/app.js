@@ -6869,7 +6869,7 @@ function App () {
   const syncAt = tab === 'overview' ? lastSync : panelSync
   return html`<div class="wrap">
     <header class="topbar">
-      <div class="sync" ref=${syncRef} tabindex="0" aria-label="状态与刷新">
+      <div class="sync" ref=${syncRef} role="group" aria-label="状态与刷新">
         <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
         <span class="sync-meta">
           ${pull.state !== 'idle'
@@ -6903,8 +6903,11 @@ function App () {
 
     <nav class="tabs" ref=${tabsRef} data-edge=${tabEdge || undefined} onScroll=${syncTabEdge}>
       ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')}
+        aria-current=${tab === t.key ? 'page' : undefined}
         onClick=${() => switchTab(t.key)}>${t.label}</button>`)}
     </nav>
+
+    <main class="main" id="main">
 
     ${!authExpired && visited.has('overview') && html`<section class="page" hidden=${tab !== 'overview'}>
       <div>
@@ -6947,6 +6950,8 @@ function App () {
       <${FilesPanel} onReady=${onFilesReady} active=${tab === 'sys'} pollTick=${pollTick} onFresh=${onFresh} />
       </div>
     </section>`}
+
+    </main>
 
     <footer class="foot">
       ⚠️ 「正式运行一轮」会真实推送，触发前二次确认 · 试运行只抓取不推送 · 同一时刻只能有一个触发任务
