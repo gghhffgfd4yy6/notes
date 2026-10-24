@@ -1741,7 +1741,7 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
     if (action) doTrigger(action)
   }
   return html`<div class="panel trigger-panel">
-    <${PanelHead} title="手动触发"
+    <${PanelHead} title="手动触发" level=${1}
       right=${locking && html`<span class="trigger-busy" role="status" aria-live="polite"
         aria-label="任务进行中，完成后自动解锁" title="任务进行中，完成后自动解锁"><span class="spin"></span><span class="trigger-busy-text">任务进行中…</span></span>`} />
     <div class="btn-row">
@@ -3447,7 +3447,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     }
   }, [data, input, query])
   return html`<div class="panel">
-    <${PanelHead} title="推送记录" sub="判重缓存 push.json（已抓取并推送的消息）" />
+    <${PanelHead} title="推送记录" level=${1} sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
       <input class="msg-search" type="search" placeholder="搜索标题 / 内容…" value=${input}
         onInput=${(e) => setInput(e.target.value)}
@@ -3854,7 +3854,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const logReady = !!(data && data.status === 'ok')
   const countText = logReady ? countLine : ((data || err) ? '—' : '读取中…')
   return html`<div class="panel">
-    <${PanelHead} title="运行日志" sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
+    <${PanelHead} title="运行日志" level=${1} sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
       right=${html`<${Button} variant="ghost" onClick=${refreshNow}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${/* v3.320：首帧就按最终高度占位（.log-empty 与 .logpre-main 同高）。旧版首帧只有
@@ -4591,7 +4591,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
   // 不占高度，展开才长，首帧与加载后同形。
   const info = sys || {}
   return html`<div class="panel">
-    <${PanelHead} title="系统信息" right=${html`<${Button} variant="ghost" onClick=${refreshAll}>刷新<//>`} />
+    <${PanelHead} title="系统信息" level=${1} right=${html`<${Button} variant="ghost" onClick=${refreshAll}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     <div class="sys-grid">
       <table class="sys-table"><tbody>
@@ -4750,7 +4750,7 @@ function ConfigPanel ({ onSync, active = true, pollTick = 0 }) {
   const changedCount = filterRows.filter((row) => row.differs).length
   const filterSub = filterSourceNote(effLive, filterRows.length, changedCount)
   return html`<div class="panel">
-    <${PanelHead} title="运行配置" sub="脱敏视图 · 推送密钥只显示是否已配置"
+    <${PanelHead} title="运行配置" level=${1} sub="脱敏视图 · 推送密钥只显示是否已配置"
       right=${html`<${Button} variant="ghost" onClick=${refresh}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && !r && html`<div class="empty">运行配置不可读（模块加载失败——检查部署完整性）</div>`}
@@ -5791,7 +5791,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         : html`<${Badge} tone="warn">代码默认<//>`
 
   return html`<div class="panel">
-    <${PanelHead} title="过滤规则" sub="覆盖文件编辑 · 保存后在下一轮生效，当前轮不换规则" />
+    <${PanelHead} title="过滤规则" level=${1} sub="覆盖文件编辑 · 保存后在下一轮生效，当前轮不换规则" />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${notice && html`<${Hint}>${notice.text}<//>`}
     ${loading && !data && html`<div class="empty">加载中…</div>`}

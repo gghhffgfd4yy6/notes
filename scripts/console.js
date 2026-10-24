@@ -912,7 +912,7 @@ function renderPage (state, runsList, query, sessionToken, theme) {
 </head><body>
 <div id="app"><noscript>
 <section style="max-width:60rem;margin:2rem auto;font-family:system-ui,sans-serif">
-<h2>xbk-push 控制台（无脚本降级）</h2>
+<h1>xbk-push 控制台（无脚本降级）</h1>
 <pre>${statusLines.join('\n')}</pre>
 <p>前端需要启用 JavaScript 才能使用触发与实时刷新。可用动作：试运行（抓取但不推送）、正式运行一轮（真实推送）、环境检查（不抓取不推送）、通知自检（真实推送一条测试消息）。</p>
 </section>
