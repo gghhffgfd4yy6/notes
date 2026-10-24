@@ -1245,10 +1245,80 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
-  await aok('过滤规则页: 只提交用户改过的字段（未改的代码默认不得钉死）', () => {
+  await aok('过滤规则页: 保存候选 = 覆盖文件已有字段 + 本次改动字段（未改的代码默认不得钉死）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
-    assert.ok(src.includes('for (const name of dirtyFields) candidate[name] = draft[name]'),
-      '保存候选必须只含 dirtyFields（整份 draft 会把代码默认钉死）')
+    // 唯一构造保存候选的地方：先铺覆盖文件里已落盘的字段，再盖本次改动字段。
+    const start = src.indexOf('const buildSaveCandidate = useCallback(')
+    assert.ok(start > 0, '必须抽成单一 buildSaveCandidate()（所有保存入口共用）')
+    const end = src.indexOf('}, [override, dirtyFields, draft])', start)
+    assert.ok(end > start, 'buildSaveCandidate 的依赖数组锚点必须存在（切片不能退化）')
+    const body = src.slice(start, end)
+    const overrideAt = body.indexOf('candidate[name] = override[name]')
+    const dirtyAt = body.indexOf('candidate[name] = draft[name]')
+    assert.ok(overrideAt > 0, '候选必须带上覆盖文件里已存在的字段（否则整份替换会删掉它们）')
+    assert.ok(dirtyAt > overrideAt, '本次改动字段必须最后覆盖 override（同名字段以用户本次输入为准）')
+    // 普通保存与离开拦截的「保存并继续」都必须走同一个函数；只改一处就会留下删字段的入口。
+    assert.strictEqual((src.match(/const candidate = buildSaveCandidate\(\)/g) || []).length, 2,
+      'beginSave 与 beginGuardSave 都必须走 buildSaveCandidate()')
+    // 「只提交 dirtyFields」的旧写法只能作为 buildSaveCandidate 内部的那一步存在；
+    // 一旦在某个保存入口里重新出现，就多出一处会删掉覆盖项的地方。
+    assert.strictEqual((src.match(/for \(const name of dirtyFields\) candidate\[name\] = draft\[name\]/g) || []).length, 1,
+      '「只提交 dirtyFields」的写法只允许出现在 buildSaveCandidate 内部')
+    assert.ok(body.includes('for (const name of dirtyFields) candidate[name] = draft[name]'),
+      'buildSaveCandidate 内部必须含 dirtyFields 覆盖这一步')
+    // 保存成功后同步 override：否则下一次保存会把这次刚写进去的字段再删一遍。
+    assert.ok(src.includes('setOverride(filterOverrideFrom(filter))'), 'applySaved 必须同步 override')
+    // 首启「把代码默认整份写进覆盖文件」保持原样（有意为之，不是本 bug）。
+    assert.ok(src.includes('apiPostFilterSave({ schema: 1, baseRevision: 0, filter: { ...base } })'),
+      '首启复制默认仍应整份写入（baseRevision:0）')
+  })
+
+  await aok('过滤规则保存: GET 的 override 只含文件中实际字段；带上它保存不会删掉其他覆盖项', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      // 无覆盖文件（代码默认）时 override 必须是空对象：空对象+空改动 = 不写任何字段。
+      const def = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.strictEqual(def.source, 'default')
+      assert.deepStrictEqual(def.override, {}, '无覆盖文件时 override 必须是 {}')
+
+      // 第一步：只保存 A 字段（pingbilouzhu）→ 覆盖文件里只有 A。
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
+        schema: 1, baseRevision: 0, filter: { pingbilouzhu: '屏蔽楼主规则' }
+      })).status, 200)
+      const first = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.deepStrictEqual(first.override, { pingbilouzhu: '屏蔽楼主规则' },
+        'override 只能含覆盖文件里实际存在的字段（不得把代码默认整份回流）')
+      assert.strictEqual(first.filter.pingbilouzhu, '屏蔽楼主规则')
+      assert.strictEqual(first.filter.pingbitime, '5', 'filter 仍是「代码默认 + 覆盖」的合并值')
+
+      // 第二步：前端新逻辑 = override + 本次改动的 B 字段（pingbitime 5→6）。
+      const candidate = { ...first.override, pingbitime: '6' }
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
+        schema: 1, baseRevision: first.revision, filter: candidate
+      })).status, 200)
+      const kept = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
+      assert.deepStrictEqual(kept.filter, { pingbilouzhu: '屏蔽楼主规则', pingbitime: '6' },
+        'A 与改动后的 B 必须同时留在覆盖文件里（这正是本次修复的不变式）')
+
+      // 第三步：旧行为反例——只提交 B，A 会被整份替换静默删掉（说明本用例确实覆盖此 bug）。
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
+        schema: 1, baseRevision: kept.revision, filter: { pingbitime: '7' }
+      })).status, 200)
+      const dropped = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
+      assert.deepStrictEqual(Object.keys(dropped.filter), ['pingbitime'], '服务端仍是整份替换：只提交 B 会丢掉 A')
+      assert.strictEqual(dropped.filter.pingbilouzhu, undefined, '旧行为反例：A 不得残留')
+      const after = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.deepStrictEqual(after.override, { pingbitime: '7' }, 'override 跟随覆盖文件当前内容')
+      assert.strictEqual(after.filter.pingbilouzhu, '', 'A 被删后 filter 回退到代码默认值')
+
+      // 覆盖文件损坏：override 必须回到 {}（不得拿 last-known-good 冒充文件内容）。
+      fs.writeFileSync(paths.file, '{ not json', { mode: 0o600 })
+      const bad = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.strictEqual(bad.source, 'corrupt')
+      assert.deepStrictEqual(bad.override, {}, '损坏时 override 必须是 {}')
+    } finally { server.close() }
   })
 
   await aok('过滤规则审计: 0600 / 不含规则正文与路径 / prevHash 链可复算 / 手改一行后 GET 报断链', async () => {
@@ -6412,11 +6482,11 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.353：注释里不得提前写下一版 v3.354。
+    // 版本已 bump 到 3.359：注释里不得提前写下一版 v3.360。
     // 注意这条只拦「资源注释里提前写下个版本」；四处版本号（主文件头/CHANGELOG/package.json/
     // package-lock 两处）的一致性由 check-version.js 负责（CI 与 pre-commit 都跑，npm test 不含）。
-    assert.ok(!/v3\.354/.test(src), 'app.js 注释不得写 v3.354（版本未 bump）')
-    assert.ok(!/v3\.354/.test(css), 'app.css 注释不得写 v3.354（版本未 bump）')
+    assert.ok(!/v3\.360/.test(src), 'app.js 注释不得写 v3.360（版本未 bump）')
+    assert.ok(!/v3\.360/.test(css), 'app.css 注释不得写 v3.360（版本未 bump）')
   })
 
   await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
