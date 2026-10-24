@@ -3487,8 +3487,8 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       <div class="msg-count" aria-live="polite">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}${slowLoading ? html`<span class="msg-loading"> · 更新中…</span>` : ''}</div>
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
-        : html`<div class="msg-list">
-          ${items.map((m) => html`<div class="msg-item" key=${m.rowKey}>
+        : html`<div class="msg-list" role="list">
+          ${items.map((m) => html`<div class="msg-item" role="listitem" key=${m.rowKey}>
             <div class="msg-item-head">
               <button type="button" class="msg-title"
                 aria-expanded=${expanded === m.rowKey ? 'true' : 'false'}
