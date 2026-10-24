@@ -64,9 +64,11 @@ const NOTIFY_WINDOW_MAX_S = 3600
 const NOTIFY_WINDOW_DEFAULT_S = 60
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
-// 服务端时间戳统一按 Asia/Shanghai（UTC+8）渲染，不跟浏览器时区走。
-// 服务器时区是 UTC，若用本地 getHours()，「自动刷新 14:xx」会和 run.log 的 22:xx 混显，
-// 看起来像日志停在 8 小时前（实测）。上海无夏令时，固定 +8 即可。
+// 控制台里所有时间都按北京时间（Asia/Shanghai，固定 UTC+8）显示，不跟浏览器时区走。
+// 服务器时区是 UTC，推送列表里的时间也是 CST 文本；顶栏「数据截至」此前用浏览器本地时区，
+// UTC 客户端会在同一屏上看到两个钟（列表 22:41 / 顶栏 14:41），像数据停在 8 小时前。
+// 上海无夏令时，固定 +8 即可。时区只在顶栏标一次（TZ_LABEL）：全屏同钟，标一处就够。
+const TZ_LABEL = '北京时间'
 function fmtTime (ts) {
   if (!ts) return '—'
   const d = new Date(Number(ts) + 8 * 3600 * 1000)
@@ -78,13 +80,11 @@ function fmtNum (n) {
   return (n === undefined || n === null) ? '—' : String(n)
 }
 
-// 本机时钟（lastSync = 浏览器 Date.now()）用本地时间渲染：套 fmtTime 的 +8 会让
-// 非 UTC+8 用户看到「未来时间」（审查 #244 可选）。服务器时间戳仍走 fmtTime。
+// 浏览器侧时间戳（lastSync = Date.now()）同样按北京时间渲染：顶栏与列表必须同屏同钟。
+// 保留这个名字是因为它的语义是「客户端时钟」而不是「本地时区」——改用 fmtTime 之后，
+// UTC 客户端看到的时间与列表、与 run.log 一致（此前差 8 小时）。
 function fmtLocalTime (ts) {
-  if (!ts) return '—'
-  const d = new Date(Number(ts))
-  const p = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  return fmtTime(ts)
 }
 
 // 只取时分秒（Asia/Shanghai）：触发结果行要与 run.log 的时间对照，口径必须与 fmtTime 一致。
@@ -686,7 +686,7 @@ function fmtBarTime (ts, withDate) {
 
 // 顶栏状态行：所有页共用这一个组件、这一套词（v3.346）。
 //  - 轮询中的页（概览/日志）秒数倒数；不轮询的页给配置的间隔，不假装在倒数。
-//  - 暂停时只换开头两个字，后半句「数据截至 · 时间」保持同一形态。
+//  - 暂停时只换开头两个字，后半句「数据截至 · 北京时间 时间」保持同一形态。
 // 独立持有 1s 时钟：避免 App 每秒重渲染整页（安卓原生 select 会闪）。
 function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = false, live = true }) {
   const [nowMs, setNowMs] = useState(Date.now())
@@ -703,15 +703,16 @@ function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = 
   const colon = at.lastIndexOf(':')
   const atMain = colon > 0 ? at.slice(0, colon) : at
   const atSec = colon > 0 ? at.slice(colon) : ''
-  if (paused) return html`已暂停 · <span class="sync-label">数据截至 · </span>${atMain}<span class="sync-sec">${atSec}</span>`
+  if (paused) return html`已暂停 · <span class="sync-label">数据截至 · ${TZ_LABEL} </span>${atMain}<span class="sync-sec">${atSec}</span>`
   const sec = Math.max(1, Math.round(pollMs / 1000))
   const remain = live ? Math.max(0, Math.min(sec, Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000))) : sec
-  return html`自动刷新 ${remain}s · <span class="sync-label">数据截至 · </span>${atMain}<span class="sync-sec">${atSec}</span>`
+  return html`自动刷新 ${remain}s · <span class="sync-label">数据截至 · ${TZ_LABEL} </span>${atMain}<span class="sync-sec">${atSec}</span>`
 }
 
+// 星期几也只按北京时间取：本地 getDay() 在北京时间跨零点时会差一天，和上面的时间对不上。
 function fmtWeekday (ts) {
   if (!ts) return ''
-  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts)).getDay()]
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts) + 8 * 3600 * 1000).getUTCDay()]
 }
 
 // v3.341：窄屏下顶栏状态行会被省略号截断（时间只剩半截）。点一下就地弹出完整文本，点页面
@@ -6890,7 +6891,7 @@ function App () {
         <span class="sync-meta">
           ${pull.state !== 'idle'
             ? html`<${PullRefreshStatus} state=${pull.state} />`
-            : html`<${TapTip} showDate=${showDate} tip=${showDate && syncAt ? `数据截至：${fmtLocalTime(syncAt)} ${fmtWeekday(syncAt)}` : ''} hint=${showDate && syncAt ? '点看' : ''}><${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${syncAt} showDate=${showDate} paused=${!autoRefresh || authExpired} live=${livePolling} /><//>`}
+            : html`<${TapTip} showDate=${showDate} tip=${showDate && syncAt ? `数据截至：${fmtLocalTime(syncAt)} ${fmtWeekday(syncAt)}（${TZ_LABEL}）` : ''} hint=${showDate && syncAt ? '点看' : ''}><${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${syncAt} showDate=${showDate} paused=${!autoRefresh || authExpired} live=${livePolling} /><//>`}
         </span>
         <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
           onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>
