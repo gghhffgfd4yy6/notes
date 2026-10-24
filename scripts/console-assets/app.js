@@ -2295,17 +2295,28 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   const snapsRef = useRef({ runs: null, all: null })
   const preSeqRef = useRef({ runs: 0, all: 0 })
   const quietNextRef = useRef(false)
+  // 快照写入按「发起顺序」判新旧：两个档位的请求重叠时，先发的那发即使后到也不能盖掉
+  // 后发的响应（Sourcery #315-4）。在飞请求也复用，切档不再多发一条（Sourcery #315-5）。
+  const snapWriteRef = useRef(0)
+  const snapInflightRef = useRef(null)
   const fetchSnap = useCallback((k) => {
     const seq = ++preSeqRef.current[k]
-    return apiGetRunHistory({ limit: RUN_FETCH_LIMIT })
+    const now = Date.now()
+    if (snapInflightRef.current && now - snapInflightRef.current.at < 3000) return snapInflightRef.current.p
+    const write = ++snapWriteRef.current
+    const p = apiGetRunHistory({ limit: RUN_FETCH_LIMIT })
       .then((d) => {
-        if (seq === preSeqRef.current[k]) {
+        if (write === snapWriteRef.current && seq === preSeqRef.current[k]) {
           snapsRef.current[k] = d
           // 同一份全量窗口也满足另一档：切过去直接命中快照，不再补发请求。
           snapsRef.current[k === 'runs' ? 'all' : 'runs'] = d
         }
         return d
       })
+    snapInflightRef.current = { at: now, p }
+    p.then(() => { if (snapInflightRef.current && snapInflightRef.current.p === p) snapInflightRef.current = null },
+      () => { if (snapInflightRef.current && snapInflightRef.current.p === p) snapInflightRef.current = null })
+    return p
   }, [])
   const load = useCallback(async () => {
     const seq = ++seqRef.current
@@ -2921,9 +2932,11 @@ function CacheHealthPanel ({ paused = false, active = true }) {
   // 懒加载：概览页没点开过就不打 /api/cache-health 与 /api/files（首屏在别的页签时
   // 这两条纯属浪费；60s 定时器与切回补拉仍在 active 后继续工作）。
   const seededRef = useRef(false)
+  const justSeededRef = useRef(false)
   useEffect(() => {
     if (!active || seededRef.current) return
     seededRef.current = true
+    justSeededRef.current = true
     load().catch(() => {})
     filesLoader.load().catch(() => {})
   }, [active, load, filesLoader.load])
@@ -2937,8 +2950,12 @@ function CacheHealthPanel ({ paused = false, active = true }) {
     // 从暂停/隐藏状态回到概览时先补一拍（首帧由上面的 mount effect 拉，不重复）。
     // 右列文件清单也要一起补，否则左列新鲜、右列还是几小时前的快照。
     if (wasPaused) {
-      load().catch(() => {})
-      filesLoader.load().catch(() => {})
+      // 首访这一拍 mount effect 刚拉过（active false→true 同一次提交里），别再补一发（Sourcery #315-10）。
+      if (justSeededRef.current) justSeededRef.current = false
+      else {
+        load().catch(() => {})
+        filesLoader.load().catch(() => {})
+      }
     }
     const t = setInterval(() => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }, 60000)
     // 切回前台不再自己补拉：App 的「回前台补拉」（VISIBLE_STALE_MS）会经下拉事件
@@ -3368,6 +3385,18 @@ function cateParts (name) {
 const MSG_SIZES = [10, 20, 50, 100]
 const MSG_DAYS = [0, 1, 3, 7, 30]
 
+// 服务端页码上限（MESSAGES_PAGE_MAX=10000）：超出的页码服务端会静默钳到 10000，前端若不钳，
+// 地址栏/跳页停在 12000 时会一直显示第 10000 页却自称 12000（Sourcery #315-1）。
+const MSG_PAGE_MAX = 10000
+
+// 形状对 ≠ 是真日期：2026-02-31 / 2026-13-01 都能过 DAY_KEY_RE，而服务端会判非法区间并返回
+// 未过滤结果——URL 就成了「看起来筛了、其实没筛」（Sourcery #315-2）。按 Date 回读校验。
+function isValidDayKey (s) {
+  if (typeof s !== 'string' || !DAY_KEY_RE.test(s)) return false
+  const d = new Date(`${s}T00:00:00Z`)
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s
+}
+
 function parseMessagesHash (hash) {
   const out = { q: '', cate: '', page: 1, size: 20, days: 0, from: '', to: '' }
   const raw = typeof hash === 'string' ? hash : ''
@@ -3379,12 +3408,12 @@ function parseMessagesHash (hash) {
   const cate = params.get('cate')
   if (typeof cate === 'string' && cate !== '') out.cate = cate
   const page = Number(params.get('page'))
-  if (Number.isSafeInteger(page) && page >= 1) out.page = page
+  if (Number.isSafeInteger(page) && page >= 1) out.page = Math.min(page, MSG_PAGE_MAX)
   const size = Number(params.get('size'))
   if (MSG_SIZES.includes(size)) out.size = size
   const from = params.get('from')
   const to = params.get('to')
-  if (DAY_KEY_RE.test(from) && DAY_KEY_RE.test(to) && from <= to) {
+  if (isValidDayKey(from) && isValidDayKey(to) && from <= to) {
     // 自定义区间优先于「近 N 天」：两者同时出现时以区间为准（与工具栏语义一致）。
     out.from = from
     out.to = to
@@ -3512,6 +3541,18 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     const onHash = () => {
       if (!/^#\/messages(\?|$)/.test(window.location.hash)) return
       if (hashMatches()) return
+      // 带参数的 hash = 浏览器后退/前进到了另一组筛选：跟地址栏走，别把用户拽回当前筛选
+      // （Sourcery #315-3）。裸 #/messages（App 切页签时写的）才是要补回参数的场景。
+      if (window.location.hash.includes('?')) {
+        const h = parseMessagesHash(window.location.hash)
+        setQuery(h.q)
+        setCate(h.cate)
+        setPage(h.page)
+        setSize(h.size)
+        setDays(h.days)
+        setRange({ from: h.from, to: h.to })
+        return
+      }
       window.history.replaceState(window.history.state, '', urlHash)
     }
     window.addEventListener('hashchange', onHash)
@@ -3646,7 +3687,11 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       }
       const a = document.createElement('a')
       a.href = url
-      a.download = format === 'csv' ? 'messages-export.csv' : 'messages-export.json'
+      // 文件名以服务端 Content-Disposition 为准（v3.360 起带北京时间戳）：blob URL 下载时
+      // 浏览器只看 a.download，固定名会把服务端的带戳名覆盖掉（Sourcery #315-6）。
+      const cd = String(res.headers.get('content-disposition') || '')
+      const cdName = /filename="?([^";]+)"?/.exec(cd)
+      a.download = cdName ? cdName[1] : (format === 'csv' ? 'messages-export.csv' : 'messages-export.json')
       document.body.appendChild(a)
       a.click()
       a.remove()
@@ -4615,7 +4660,7 @@ function BackupBlock ({ onImported }) {
 // 两步验证（v3.357）：系统页里的可选开关。二维码由服务端 qrcode-generator 生成
 // （SVG data URI，不引 CDN/不增加前端构建），同时保留手动密钥兜底；确认后服务端只回一次
 // 恢复码，页面如实提示「只显示一次」。
-function TwoFactorBlock () {
+function TwoFactorBlock ({ active = true }) {
   const [status, setStatus] = useState(null)
   const [setup, setSetup] = useState(null)
   const [code, setCode] = useState('')
@@ -4632,7 +4677,11 @@ function TwoFactorBlock () {
       setErr(`两步验证状态读取失败：${e && e.message ? e.message : e}`)
     })
   }, [])
-  useEffect(() => { load().catch(() => {}) }, [load])
+  // 系统页没显示时不拉：面板挂在页签容器里，未激活时打 /api/two-factor/status 纯属浪费（Sourcery #315-9）。
+  useEffect(() => {
+    if (!active) return
+    load().catch(() => {})
+  }, [active, load])
 
   const messageOf = (res) => {
     const data = res && res.data ? res.data : {}
@@ -4874,7 +4923,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
     <div class="set-title">设置<span class="cfg-block-sub">改动立即生效 · 落盘 console-settings.json</span></div>
     <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} active=${active} />
     <${BackupBlock} onImported=${refreshAll} />
-    <${TwoFactorBlock} />
+    <${TwoFactorBlock} active=${active} />
     <${Hint} style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。<//>
     ${accessErr && html`<${Hint} tone="error">访问日志加载失败：${accessErr.message || accessErr}<//>`}
     <details class="access-log">
@@ -6762,6 +6811,8 @@ function App () {
       if (errs.length > 0) setSyncErr(`刷新失败：${errs.join('；')}（自动重试中）`)
       else setSyncErr('')
       // 只有两边都落定才算「刷新成功」：调用方（回前台补拉）据此决定要不要推进时间戳。
+      // 轮询成功也记一笔：否则「刚轮询完就切回前台」会被当成很久没刷新而多发一轮（Sourcery #315-11）。
+      if (errs.length === 0) lastRefreshRef.current = Date.now()
       return errs.length === 0
     } finally {
       inFlightRef.current = false

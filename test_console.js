@@ -3096,13 +3096,13 @@ async function main () {
     assert.strictEqual(res.status, 200)
     // 响应头（Node 出站头小写化）
     assert.strictEqual(res.headers['content-type'], 'text/csv; charset=utf-8')
-    // 文件名 = messages-<YYYYMMDD-HHmm>.csv：纯 ASCII + 北京时间戳（本地时间，非 UTC），
-    // 同一分钟内多次导出会重名——判据是「时间戳存在且指向当下」，不是唯一性。
+    // 文件名 = messages-<YYYYMMDD-HHmmss>.csv：纯 ASCII + 北京时间戳（本地时间，非 UTC），
+    // 精确到秒（同秒内连导两次才会重名）——判据是「时间戳存在且指向当下」。
     const cd = String(res.headers['content-disposition'])
-    const cdMatch = /^attachment; filename="messages-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})\.csv"$/.exec(cd)
-    assert.ok(cdMatch, `Content-Disposition 必须是 messages-<YYYYMMDD-HHmm>.csv（实际：${cd}）`)
+    const cdMatch = /^attachment; filename="messages-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.csv"$/.exec(cd)
+    assert.ok(cdMatch, `Content-Disposition 必须是 messages-<YYYYMMDD-HHmmss>.csv（实际：${cd}）`)
     assert.ok(!/[^\x20-\x7e]/.test(cd), 'Content-Disposition 必须是纯 ASCII（中文环境兼容，不依赖 filename*）')
-    const stampMs = Date.UTC(+cdMatch[1], +cdMatch[2] - 1, +cdMatch[3], +cdMatch[4], +cdMatch[5])
+    const stampMs = Date.UTC(+cdMatch[1], +cdMatch[2] - 1, +cdMatch[3], +cdMatch[4], +cdMatch[5], +cdMatch[6])
     // 北京时间 = UTC+8：把文件名里的「本地时刻」当 UTC 解读，应比 Date.now() 正好大 8 小时；
     // 差 5 分钟容差只吸收「请求跨分钟边界」。
     assert.ok(Math.abs(Date.now() + 8 * 3600 * 1000 - stampMs) < 5 * 60 * 1000, `时间戳必须是当前北京时间（实际 ${cdMatch[0]}）`)
@@ -3142,7 +3142,7 @@ async function main () {
     assert.strictEqual(j.length, EXPORT_MAX_ROWS, '恰 5000 行（截断）')
     assert.strictEqual(typeof j[0].title, 'string', '元素=行对象')
     const jr = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
-    assert.match(String(jr.headers['content-disposition']), /^attachment; filename="messages-\d{8}-\d{4}\.json"$/, 'JSON 导出同样带时间戳文件名')
+    assert.match(String(jr.headers['content-disposition']), /^attachment; filename="messages-\d{8}-\d{6}\.json"$/, 'JSON 导出同样带时间戳文件名')
     assert.strictEqual(jr.headers['x-export-truncated'], 'true', 'JSON 分支同样下发截断头')
     // D2-S9：导出口径必须回显「实际生效的搜索词」（列表端点早有 queryUsed）
     assert.strictEqual(jr.headers['x-export-query-used'], '', '无搜索词时头为空串而非缺席')

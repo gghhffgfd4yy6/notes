@@ -801,14 +801,17 @@ function accessStamp (now = new Date()) {
   try { return accessStampFmt.format(now) } catch (e) { return now.toISOString() }
 }
 
-// 导出文件名的时间戳：YYYYMMDD-HHmm（Asia/Shanghai，与 accessStamp / run.log 同口径，
-// 用户看到的就是北京时间）。纯 ASCII：Content-Disposition 的 filename= 放非 ASCII 时各
-// 浏览器落盘名不一致，中文兼容靠「文件名只用 ASCII」，不是靠 RFC 5987 的 filename*。
+// 导出文件名的时间戳：YYYYMMDD-HHmmss（Asia/Shanghai，与 run.log 同口径，用户看到的就是北京时间）。
+// 纯 ASCII：Content-Disposition 的 filename= 放非 ASCII 时各浏览器落盘名不一致，
+// 中文兼容靠「文件名只用 ASCII」，不是靠 RFC 5987 的 filename*。
 function exportStamp (now = new Date()) {
-  // accessStamp 输出 YYYY-MM-DD HH:mm:ss（ICU 异常时兜底 ISO）——两种形态都取前 12 位数字
-  // 即年月日时分，无需再引第二个时区格式化器。
-  const digits = accessStamp(now).replace(/\D/g, '')
-  return `${digits.slice(0, 8)}-${digits.slice(8, 12)}`
+  // 不再切 accessStamp 的字符串：它 ICU 异常时兜底 ISO（UTC），照切会把 UTC 时分标成北京时间
+  // （Sourcery #315-8）。中国无夏令时，直接 +8 与 Asia/Shanghai 等价。
+  // 精确到秒：同一分钟内连导两次不会撞名、后一次不会覆盖前一次（Sourcery #315-7）。
+  const t = (now instanceof Date ? now.getTime() : Date.now()) + 8 * 3600 * 1000
+  const d = new Date(t)
+  const p2 = (n) => String(n).padStart(2, '0')
+  return `${d.getUTCFullYear()}${p2(d.getUTCMonth() + 1)}${p2(d.getUTCDate())}-${p2(d.getUTCHours())}${p2(d.getUTCMinutes())}${p2(d.getUTCSeconds())}`
 }
 
 // 敏感键名判定：把键名里的 %XX 逐层解到不动点再小写（堵 %74oken= / %2574oken= 等

@@ -951,19 +951,24 @@
   /* L1 的「跳到第 N 页」输入框：宽度只放 3 位数，描边/底色跟同排按钮同族。
      justify-self:center 是给 ≤430px 的 grid 用的——整行跨列时不会被拉成一条 370px 的长条。 */
   .pager-jump {
+    display: inline-flex; align-items: center; gap: 4px;
+    justify-self: center; color-scheme: inherit;
+  }
+  /* 真正要吃描边/底色的是里面那个 input（.pager-jump 只是行内包装，Sourcery #315-12）；
+     旧写法把 input 样式挂在包装上，输入框一直用浏览器默认外观。 */
+  .pager-jump-input {
     width: 56px; min-height: 32px; margin: 0 2px; padding: 0 6px;
-    justify-self: center;
     background: var(--panel-2); color: var(--text);
     border: 1px solid var(--border); border-radius: var(--r-sm);
     font: inherit; font-size: var(--fs-sm); text-align: center;
-    font-variant-numeric: tabular-nums; color-scheme: inherit;
+    font-variant-numeric: tabular-nums;
   }
-  .pager-jump:hover { border-color: var(--accent-line); }
-  .pager-jump:focus-visible { outline: var(--ring); outline-offset: 1px; }
+  .pager-jump-input:hover { border-color: var(--accent-line); }
+  .pager-jump-input:focus-visible { outline: var(--ring); outline-offset: 1px; }
   /* 原生数字框的上下箭头在 56px 宽里只占地方还容易误触；键盘上下键照旧可用。 */
-  .pager-jump::-webkit-outer-spin-button,
-  .pager-jump::-webkit-inner-spin-button { appearance: none; -webkit-appearance: none; margin: 0; }
-  .pager-jump[type="number"] { appearance: textfield; -moz-appearance: textfield; }
+  .pager-jump-input::-webkit-outer-spin-button,
+  .pager-jump-input::-webkit-inner-spin-button { appearance: none; -webkit-appearance: none; margin: 0; }
+  .pager-jump-input[type="number"] { appearance: textfield; -moz-appearance: textfield; }
 
   /* ── 逐轮历史筛选（v3.307）── */
   .run-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: var(--sp-2); }
@@ -1286,7 +1291,7 @@
     .mini-btn, .mini-opt { min-height: 44px; }
     /* 跳页输入框：同样 16px 起（iOS 聚焦不整页放大），高度对齐同排 44px 按钮；
        L4 的重试按钮在手机上也是拇指目标，不是桌面 32px 的小控件。 */
-    .pager-jump { font-size: 16px; min-height: 44px; width: 64px; }
+    .pager-jump-input { font-size: 16px; min-height: 44px; width: 64px; }
     .retry-btn { min-height: 44px; }
     /* 分类筛选：手机端贴底弹层 + 遮罩，避免原生 select 的全屏白底列表 */
     .cate-picker { flex: 1 1 100%; }
