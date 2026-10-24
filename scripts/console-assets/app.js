@@ -9,7 +9,7 @@
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
-import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior, dateRangeLabel, encryptBackup, decryptBackup, isEncryptedBackup, backupPasswordProblem } from './pure.mjs'
+import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior, dateRangeLabel, encryptBackup, decryptBackup, isEncryptedBackup, backupPasswordProblem, filterOverrideFields, buildSaveCandidate as buildSaveCandidateOf } from './pure.mjs'
 // 日期区间（v3.326）：flatpickr 4.6.13 的 ESM 单文件 bundle（含 zh 语言包，vendored 入库，
 // 与 htm-preact 同口径——不引 CDN，CSP script-src 'self' 覆盖）。样式在 flatpickr.css，
 // 主题化覆盖写在 app.css 的 .flatpickr-calendar 段（跟四套 token 走）。
@@ -4928,6 +4928,12 @@ function filterDraftFrom (data) {
   return out
 }
 
+// GET 返回的 override：覆盖文件里实际存在的字段（服务端已按白名单裁剪）。
+// 保存是整份替换 ⇒ 本次没改但已落盘的字段必须原样带回，否则会被静默删掉退回代码默认。
+function filterOverrideFrom (data) {
+  return filterOverrideFields(data, FILTER_FIELD_NAMES)
+}
+
 // 服务器草稿响应 → 与本地草稿同形；坏的/缺字段的响应当没有，不能让他覆盖页面。
 function filterDraftFromServer (data) {
   if (!data || data.ok !== true || !data.draft || typeof data.draft !== 'object') return null
@@ -5012,6 +5018,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const [data, setData] = useState(null)
   const [draft, setDraft] = useState(null)
   const [base, setBase] = useState(null)
+  // 覆盖文件里已落盘的字段（GET 的 override）。保存是整份替换 ⇒ 本次没改的这些字段
+  // 必须一起提交，否则会被静默删掉、回退到代码默认。
+  const [override, setOverride] = useState({})
   const [backups, setBackups] = useState([])
   const [backupListKnown, setBackupListKnown] = useState(false)
   const [restoreTo, setRestoreTo] = useState('default')
@@ -5101,6 +5110,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     setData(d)
     setDraft(restored || next)
     setBase(next)
+    setOverride(filterOverrideFrom(d && d.override))
     setPreview(null)
     setFieldErrors({})
     if (restoreNotice) setNotice(restoreNotice)
@@ -5215,6 +5225,15 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   }, [draft, base])
   const draftWide = useMemo(() => wideFieldsOf(draft), [draft])
   const dirty = dirtyFields.length > 0
+  // 保存候选 = 覆盖文件里已存在的字段 + 本次改动的字段。
+  // 两者都不是的字段仍然不提交：缺字段的语义是「回代码默认」，把当前生效值整份写进
+  // 覆盖文件会把代码默认永久钉死（后续版本改默认时这台实例收不到）。
+  // 只提交 dirtyFields 也不行：保存是整份替换，覆盖文件里原有的其他字段会被静默删掉。
+  // 所有保存入口（普通保存 / 离开拦截的「保存并继续」）都必须走这个函数。
+  const buildSaveCandidate = useCallback(
+    () => buildSaveCandidateOf(override, dirtyFields, draft, FILTER_FIELD_NAMES),
+    [override, dirtyFields, draft]
+  )
   dirtyRef.current = dirty
   // 下拉刷新不碰有未保存改动的草稿：一次下拉不能静默丢掉用户刚改的规则。
   usePullRefresh(active && dirtyFields.length === 0, load)
@@ -5348,6 +5367,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       : cur))
     setDraft(next)
     setBase(next)
+    // 覆盖文件现在就是这份 filter（整份替换）：同步 override，否则下一次保存会把
+    // 这次刚写进去的字段当成「没改过」再删一遍。
+    setOverride(filterOverrideFrom(filter))
     setFieldErrors({})
     setPreview(null)
     setDialog(null)
@@ -5428,11 +5450,11 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     setErr('')
     setFieldErrors({})
     setNotice(null)
-    // 只提交用户真正改过的字段：把没动过的「当前生效值」也整份写进覆盖文件，等于把
-    // 代码默认永久钉死——后续版本改默认时这台实例收不到（评审 Medium）。
-    // 缺字段的语义本来就是「回代码默认」，所以省略未改字段不改变本次保存的结果。
-    const candidate = {}
-    for (const name of dirtyFields) candidate[name] = draft[name]
+    // 只提交「覆盖文件已有字段 + 本次改动字段」：把没动过的「当前生效值」也整份写进
+    // 覆盖文件，等于把代码默认永久钉死——后续版本改默认时这台实例收不到（评审 Medium）。
+    // 但也不能只提交 dirtyFields：保存是整份替换，覆盖文件里原有的其他字段会被静默删掉
+    // （v3.359 修）。缺字段的语义本来就是「回代码默认」，所以两者都不是的字段仍然省略。
+    const candidate = buildSaveCandidate()
     setBusy('validate')
     try {
       // confirmWideMatch:true 只关掉服务端的「宽匹配需确认」闸；真正的二次确认由本页弹窗
@@ -5528,8 +5550,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       settleSaveResult(false)
       return pending
     }
-    const candidate = {}
-    for (const name of dirtyFields) candidate[name] = draft[name]
+    const candidate = buildSaveCandidate()
     if (Object.keys(candidate).length === 0) {
       settleSaveResult(false)
       return pending
@@ -5543,7 +5564,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       settleSaveResult(false)
     })
     return pending
-  }, [data, draft, busy, dirtyFields, submitSave, settleSaveResult])
+  }, [data, draft, busy, dirtyFields, buildSaveCandidate, submitSave, settleSaveResult])
 
   // 首启：把 GET 到的代码默认整份写进覆盖文件（baseRevision:0）。不自动写，必须点按钮。
   const copyDefaults = async () => {

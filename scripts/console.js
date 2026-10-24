@@ -3617,6 +3617,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       revision: corrupt ? 0 : loaded.revision,
       source: loaded.source,
       filter: loaded.filter,
+      // 与 filter 同源（FilterStore 同一次读盘给出）：不得在这里再读一遍文件，否则两次读之间
+      // 文件被别的进程替换/读失败时，filter 与 override 会描述两个不同快照，保存会丢字段。
+      override: loaded.override || {},
       keyword: {
         zkt_gjc: loaded.keyword && loaded.keyword.zkt_gjc !== undefined ? loaded.keyword.zkt_gjc : '',
         writable: false

@@ -127,6 +127,22 @@ function mergeActiveFilter ({ defaults, keyword, override } = {}) {
   return { filter, keyword: normalizeKeyword(keyword) }
 }
 
+/**
+ * 覆盖文件里「实际存在」的字段（只含白名单内的字符串值）。
+ * 与 mergeActiveFilter 的区别：这里**不补代码默认**，只回原文——读面据此告诉前端
+ * 「本次没改、但已落盘」的字段，避免整份替换的保存把它们静默删掉。
+ * 与 filter 同源（同一次读盘的结果），不得各自再读一遍文件。
+ */
+function overrideFieldsOf (override) {
+  const over = override && typeof override === 'object' ? override : {}
+  const out = {}
+  for (const field of FILTER_RULE_FIELDS) {
+    const value = safeGet(over, field)
+    if (hasOwn(over, field) && typeof value === 'string') out[field] = value
+  }
+  return out
+}
+
 function addError (errors, field, code, message) {
   errors.push({ field, code, message })
 }
@@ -455,6 +471,8 @@ function corruptResult (defaults, keyword, message, key) {
     const merged = mergeActiveFilter({ defaults, keyword, override: lastGood.filter })
     return {
       ...merged,
+      // 文件本身不可用：读面不得拿 last-known-good 冒充「文件里有的字段」。
+      override: {},
       source: 'corrupt',
       revision: lastGood.revision,
       degraded: true,
@@ -465,6 +483,7 @@ function corruptResult (defaults, keyword, message, key) {
   const merged = mergeActiveFilter({ defaults, keyword })
   return {
     ...merged,
+    override: {},
     source: 'corrupt',
     revision: 0,
     degraded: true,
@@ -483,7 +502,7 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
     // 否则「删文件 → 之后又出现畸形文件」会把早已废弃的旧规则复活成生效规则（A4）。
     lastGoodByDir.delete(key)
     const merged = mergeActiveFilter({ defaults, keyword })
-    return { ...merged, source: 'default', revision: 0, degraded: false, lastGoodUsed: false }
+    return { ...merged, override: {}, source: 'default', revision: 0, degraded: false, lastGoodUsed: false }
   }
   if (read.status !== 'ok') {
     // unsafe / replaced / tooLarge / ioError：全部按损坏处理（安全读已保证不泄露非普通文件内容）。
@@ -501,6 +520,8 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
   const merged = mergeActiveFilter({ defaults, keyword, override: parsed.filter })
   return {
     ...merged,
+    // 与 filter 同源（同一份 parsed.filter）：读面两者必须描述同一次读盘的快照。
+    override: overrideFieldsOf(parsed.filter),
     source: 'override',
     revision: parsed.revision,
     degraded: false,
@@ -515,8 +536,10 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
  *   deps?:{RuleEngine:Object, compileUserRegex:Function, re2Available?:boolean, isRe2Available?:Function}}} options
  *   deps 可选：提供且引擎可用时，读路径在结构校验之后再跑 validateFilterRules 的四道闸（A1）；
  *   不提供时保持「只做结构校验」的既有契约（console/qinglong 等调用方无需改造）。
- * @returns {{filter:Object, keyword:{zkt_gjc:string}, source:'override'|'default'|'corrupt',
+ * @returns {{filter:Object, override:Object, keyword:{zkt_gjc:string}, source:'override'|'default'|'corrupt',
  *   revision:number, degraded:boolean, lastGoodUsed:boolean, error?:{code:string,message:string}}}
+ *   filter = 代码默认 + 覆盖的合并值；override = 覆盖文件里**实际存在**的字段（不补默认，
+ *   无文件/损坏时为 {}），读面用它避免「整份替换保存」删掉未改动字段。
  */
 function loadFilterRules (options) {
   const opts = options && typeof options === 'object' ? options : {}

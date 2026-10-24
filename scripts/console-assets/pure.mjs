@@ -18,6 +18,29 @@ export function backToTopBehavior (reduceMotion, supportsSmooth) {
 // 口径与 FilterStore.mergeActiveFilter 一致：覆盖文件优先、缺字段回代码默认（不是置空）。
 // overridden 的语义是「该字段由覆盖文件显式提供」——即便值与代码默认相同也算（覆盖文件把它
 // 钉住了，后续版本改默认时该实例不会跟随）；只有「文件里没这个键」才回落到默认且不挂徽章。
+// 过滤规则保存候选（v3.359）：服务端保存是「整份替换」，所以候选 = 覆盖文件里**已有**的
+// 字段 + 本次**改动**的字段（同名字段以本次输入为准）；两者都不是的字段仍不提交——缺字段的
+// 语义是「回代码默认」，把当前生效值整份写进去会把代码默认钉死，后续版本改默认时收不到。
+// 只提交改动字段则会删掉覆盖文件里原有的其他字段（这就是被修掉的 bug），故两段都不能省。
+export function filterOverrideFields (override, fieldNames) {
+  const src = override && typeof override === 'object' && !Array.isArray(override) ? override : {}
+  const out = {}
+  for (const name of Array.isArray(fieldNames) ? fieldNames : []) {
+    if (typeof src[name] === 'string') out[name] = src[name]
+  }
+  return out
+}
+
+export function buildSaveCandidate (override, dirtyFields, draft, fieldNames) {
+  const candidate = filterOverrideFields(override, fieldNames)
+  const src = draft && typeof draft === 'object' && !Array.isArray(draft) ? draft : {}
+  for (const name of Array.isArray(dirtyFields) ? dirtyFields : []) {
+    if (src[name] === undefined) continue
+    candidate[name] = String(src[name])
+  }
+  return candidate
+}
+
 export function effectiveFilterRows (configFilter, activeFilter) {
   const isPlain = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v)
   const base = isPlain(configFilter) ? configFilter : {}
