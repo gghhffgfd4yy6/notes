@@ -784,16 +784,26 @@ function formatMs (ms) {
 
 // ── 访问日志（v3.300）──────────────────────────────────────────────────────
 let accessStampFmt = null
-function accessStamp () {
+function accessStamp (now = new Date()) {
   // 惰性单例 + 兜底（D7）：sv-SE + Asia/Shanghai 与 run.log 留痕戳同参同输出；
   // 顶层惰性而非 require 期构造——防 ICU 异常炸 import。at 是展示字段
   // （数组下标即权威时序），格式 YYYY-MM-DD HH:mm:ss。
   if (!accessStampFmt) {
     try {
       accessStampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
-    } catch (e) { return new Date().toISOString() }
+    } catch (e) { return now.toISOString() }
   }
-  try { return accessStampFmt.format(new Date()) } catch (e) { return new Date().toISOString() }
+  try { return accessStampFmt.format(now) } catch (e) { return now.toISOString() }
+}
+
+// 导出文件名的时间戳：YYYYMMDD-HHmm（Asia/Shanghai，与 accessStamp / run.log 同口径，
+// 用户看到的就是北京时间）。纯 ASCII：Content-Disposition 的 filename= 放非 ASCII 时各
+// 浏览器落盘名不一致，中文兼容靠「文件名只用 ASCII」，不是靠 RFC 5987 的 filename*。
+function exportStamp (now = new Date()) {
+  // accessStamp 输出 YYYY-MM-DD HH:mm:ss（ICU 异常时兜底 ISO）——两种形态都取前 12 位数字
+  // 即年月日时分，无需再引第二个时区格式化器。
+  const digits = accessStamp(now).replace(/\D/g, '')
+  return `${digits.slice(0, 8)}-${digits.slice(8, 12)}`
 }
 
 // 敏感键名判定：把键名里的 %XX 逐层解到不动点再小写（堵 %74oken= / %2574oken= 等
@@ -4435,6 +4445,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // （不改成 {items,...} 对象），CSV 也不插注释行，统一走响应头：percent-encoded
           // UTF-8，非 ASCII 安全；未截断也下发，消费方可据此判断词是否被接受。
           const exportMeta = { 'X-Export-Query-Used': encodeURIComponent(query) }
+          // 文件名 = messages-<YYYYMMDD-HHmm>.<ext>（北京时间）：同一目录里多次导出不再互相
+          // 覆盖，打开就知道是哪一批。名字里只有时间戳，不含查询词/分类——它们可能含 token
+          // 形态字符串，绝不回显进头（蓝图防线）；纯 ASCII 见 exportStamp 注释。
+          const stamp = exportStamp()
           if (format === 'json') {
             // 仅截断时下发该头；未截断不下发（缺席=完整，测试断言 undefined）。
             if (truncated) res.setHeader('X-Export-Truncated', 'true')
@@ -4443,14 +4457,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             // 不进响应体（形态纯度优先；三态响应才是 {status,...} 对象，前端按
             // Array.isArray 区分成功/三态——评审 231-H1）。
             const body = JSON.stringify(rows)
-            res.writeHead(200, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="messages-export.json"' }, exportMeta))
+            res.writeHead(200, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="messages-${stamp}.json"` }, exportMeta))
             res.end(body)
             return
           }
           const head = Object.assign({
             'Content-Type': 'text/csv; charset=utf-8',
-            // 文件名硬编码字面量：查询词可能含 token 形态字符串，绝不回显进头（蓝图防线）。
-            'Content-Disposition': 'attachment; filename="messages-export.csv"'
+            // 只拼本地生成的时间戳：查询词可能含 token 形态字符串，绝不回显进头（蓝图防线）。
+            'Content-Disposition': `attachment; filename="messages-${stamp}.csv"`
           }, exportMeta)
           if (truncated) head['X-Export-Truncated'] = 'true'
           // BOM EF BB BF：Excel 无 BOM 按本地代码页解析会乱码中文（蓝图硬性要求）。
