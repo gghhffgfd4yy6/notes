@@ -2102,7 +2102,8 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
 // 尾窗指纹/stale 语义仍由服务端保留（本组件只发一次 limit=200，不翻游标）。
 const RUN_PAGE_SIZES = [10, 20, 50, 100]
 const RUN_FETCH_LIMIT = 200
-// 逐轮历史的两份服务端快照：仅运行（excludeCancelled）与全量（全部/只看异常共用）。
+// 逐轮历史的两份服务端快照：仅运行（前端剔除取消留痕）与全量（全部/只看异常共用）。
+// 两份由同一次 /api/run-history 请求填充，切档不再发第二次请求。
 const RUN_SNAP_KEY = (m) => (m === 'runs' ? 'runs' : 'all')
 
 // ── 列表落点（v3.320）──────────────────────────────────────────────────────
@@ -2200,19 +2201,23 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   }
   useLandScrollCancel(landRef, userMovedRef)
 
-  // 两种筛选各留一份快照：服务端口径不同（仅运行 = excludeCancelled，最近 200 个真轮次）。
-  // 切「只看异常」若拿「仅运行」的快照按异常过滤，会先算成「只看异常 2 / 共 2 条」，
-  // 等请求回来再跳成 48 条——手机上就是约 130ms 的闪跳（v3.326 录屏实测 4 帧）。
-  // 所以另一档在后台预取，切过去首帧直接用目标快照；目标快照还没到就保持旧列表，
-  // 绝不用另一档的数据重算。「全部」与「只看异常」共用同一份全量快照。
+  // 两档视图共用一次请求：服务端不再按 excludeCancelled 预过滤，「仅运行」由前端剔除
+  // 取消留痕（filterRunItems 与渲染同口径）——旧版首屏为此多发一次 200 行的
+  // /api/run-history?excludeCancelled=1（与全量一份合计 71KB）。
+  // 口径差异如实记下：窗口是「最近 200 行」（含取消记录），取消很多时可见轮次会少于 200 行；
+  // 换来切档零请求、零等待（同一份数据原地过滤，取代旧版「后台预取另一档」）。
   const snapsRef = useRef({ runs: null, all: null })
   const preSeqRef = useRef({ runs: 0, all: 0 })
   const quietNextRef = useRef(false)
   const fetchSnap = useCallback((k) => {
     const seq = ++preSeqRef.current[k]
-    return apiGetRunHistory({ limit: RUN_FETCH_LIMIT, excludeCancelled: k === 'runs' })
+    return apiGetRunHistory({ limit: RUN_FETCH_LIMIT })
       .then((d) => {
-        if (seq === preSeqRef.current[k]) snapsRef.current[k] = d
+        if (seq === preSeqRef.current[k]) {
+          snapsRef.current[k] = d
+          // 同一份全量窗口也满足另一档：切过去直接命中快照，不再补发请求。
+          snapsRef.current[k === 'runs' ? 'all' : 'runs'] = d
+        }
         return d
       })
   }, [])
@@ -2224,8 +2229,8 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     // 首帧已由 changeMode 用快照画好。
     const quiet = quietNextRef.current
     quietNextRef.current = false
-    // 另一档同时预取：每次刷新都补一次，切过去看到的是新快照而不是陈的。
-    fetchSnap(k === 'runs' ? 'all' : 'runs').catch(() => {})
+    // 不再预取另一档：一份全量快照同时喂两档（fetchSnap 里同步写两个 key），
+    // 切档命中快照即可，首屏也只剩一次 /api/run-history。
     // 静默刷新要顺手清掉可能还挂着的 loading（切档会顶掉上一发非静默请求，
     // 那发的 finally 因请求号过期不会再来清，否则分页按钮会一直禁用）。
     setLoading(!quiet)
@@ -2493,9 +2498,11 @@ function usePanelLoader (apiFn, onLoaded, initialData = null) {
   return { data, err, load, loading, settleTick }
 }
 
-// 页签保活 + 首屏预加载：面板即使还没被点开（active=false）也先拉一次，
-// 刷新网页后第一次点页签时数据已经在手里，不会闪「加载中…」；之后离开不拉，
-// 再切回才补一次（active 由 false 变 true）。
+// 页签保活 + 首访懒加载：隐藏的页签只挂 DOM、不拉数据——第一次真正点开（active=true）
+// 才发第一份请求，之后离开不拉，再切回才补一次（active 由 false 变 true）。
+// 首屏停在推送记录页时，不再替概览/系统页预取 /api/trends、/api/run-history、
+// /api/access-log、/api/cache-health（旧版「先拉一遍，点开就有」要 17 个请求、71KB）。
+// 首帧空白由面板自己的骨架补（见 PanelSkeleton）。
 // queue=true 用于日志这种自带互斥的 loader（在飞时排队，而不是丢掉这次刷新）。
 function usePanelAutoLoad (active, load, { queue = false } = {}) {
   const seenRef = useRef(null)
@@ -2508,7 +2515,8 @@ function usePanelAutoLoad (active, load, { queue = false } = {}) {
     const loadChanged = loadRef.current !== load
     seenRef.current = active
     loadRef.current = load
-    if (!active && !first) return
+    // 懒加载：没进过这个页签就不发请求。
+    if (!active) return
     if (!first && !becameActive && !loadChanged) return
     // 首次点开时若预加载还在飞、或刚回来不到 3s，直接用手里的/路上的数据，
     // 不再发第二发把预加载响应顶掉（Sourcery #272）。更久才点开则补一次新鲜的。
@@ -2539,8 +2547,13 @@ function usePollReload (active, pollTick, fn) {
   const fnRef = useRef(fn)
   fnRef.current = fn
   const busyRef = useRef(false)
+  // 首访懒加载后，激活本页的第一份数据由 usePanelAutoLoad 负责；这里跳过「active 由
+  // false 变 true」那一拍，否则首访会同时打两个请求（面板 load + 轮询拍）。
+  const seenActiveRef = useRef(false)
   useEffect(() => {
-    if (!active || !(pollTick > 0) || busyRef.current) return
+    const justActivated = active && !seenActiveRef.current
+    seenActiveRef.current = active
+    if (!active || justActivated || !(pollTick > 0) || busyRef.current) return
     busyRef.current = true
     Promise.resolve()
       .then(() => fnRef.current())
@@ -2797,7 +2810,15 @@ function CacheHealthPanel ({ paused = false, active = true }) {
   // 右列状态文件（v3.307）：缓存健康面板原来只占左半 451px，右边 460px 空白；
   // 系统页的「缓存目录文件」在这里给一份紧凑版（前 8 项），整页仍保留全量清单。
   const filesLoader = usePanelLoader(apiGetFiles)
-  useEffect(() => { load().catch(() => {}); filesLoader.load().catch(() => {}) }, [load, filesLoader.load])
+  // 懒加载：概览页没点开过就不打 /api/cache-health 与 /api/files（首屏在别的页签时
+  // 这两条纯属浪费；60s 定时器与切回补拉仍在 active 后继续工作）。
+  const seededRef = useRef(false)
+  useEffect(() => {
+    if (!active || seededRef.current) return
+    seededRef.current = true
+    load().catch(() => {})
+    filesLoader.load().catch(() => {})
+  }, [active, load, filesLoader.load])
   // 缓存健康随概览常开：每分钟（且切回前台时）重拉一次，避免「页面开着过夜、mtime 早已更新
   // 但面板还拿着旧快照」；1 分钟一次只读小 JSON，不与 5s 主轮询抢盘。
   const wasPausedRef = useRef(paused)
@@ -4529,11 +4550,12 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
   const pendingRef = useRef(false)
   const loadedAtRef = useRef(0)
   useEffect(() => {
-    const first = seenRef.current === null
     const becameActive = active && seenRef.current === false
     seenRef.current = active
-    if (!active && !first) return
-    // 首次点开时预加载还在飞/刚回来不到 3s，直接用预加载结果；更久才点开则补一次。
+    // 懒加载（同 usePanelAutoLoad）：系统页没点开过就不发这三条请求
+    // （/api/sys + /api/access-log + /api/config/console），首次进入才算首访。
+    if (!active) return
+    // 首次点开时上一发还在飞/刚回来不到 3s，直接用手里的数据；更久才点开则补一次。
     if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))) return
     if (pendingRef.current) return
     pendingRef.current = true
@@ -6083,9 +6105,10 @@ function App () {
     document.addEventListener('visibilitychange', check)
     return () => { stopped = true; clearInterval(timer); document.removeEventListener('visibilitychange', check) }
   }, [authExpired])
-  // 首屏渲染完就把六个页签全部挂上（隐藏），让它们的数据先加载。这样刷新网页后
-  // 第一次点某个页签也只是切 hidden，而不是「现挂载 + 现请求」闪一下加载占位。
-  // 各面板的 active 门控保证隐藏期间不轮询；这里只承担一次首载。
+  // 首屏渲染完就把六个页签全部挂上（隐藏），但**不替它们拉数据**：各面板的
+  // usePanelAutoLoad / 自己的 active 门控负责「第一次点开才发第一份请求」。
+  // 只挂 DOM 的好处是切页只是 toggle hidden，不会「现挂载 + 现请求」闪一下；
+  // 数据请求数则从 17 个降到当前页 + 顶栏那几条（见 L4 首屏去重）。
   useEffect(() => {
     if (authExpired) return
     for (const t of TABS) markVisited(t.key)

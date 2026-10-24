@@ -5488,9 +5488,11 @@ async function main () {
     assert.ok(seg('SysPanel', 'function FilesPanel').includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
       '系统页必须等系统信息 + 访问日志 + 设置三条都结算后才报完成')
     assert.ok(seg('FilesPanel', 'function FilterRules').includes('usePanelAutoLoad(active, load)'), '文件清单必须首访预加载 + 切回刷新')
-    assert.ok(src.includes('function usePanelAutoLoad') && src.includes('if (!active && !first) return') &&
-      src.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
-    '必须有首访预加载 hook：未点开的页签也先拉一次，离开后不拉')
+    const autoLoad = src.slice(src.indexOf('function usePanelAutoLoad'), src.indexOf('// ── 下拉刷新'))
+    assert.ok(autoLoad.includes('if (!active) return') && !autoLoad.includes('!active && !first'),
+      '首访懒加载：未点开的页签不得发请求（旧版 !active && !first 会在挂载时预取）')
+    assert.ok(autoLoad.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
+      '切回仍在 3s 内 / 上一发在飞时不得重复发（Sourcery #272 同口径）')
     assert.ok(seg('LogsPanel', 'function SysPanel').includes('const firstReveal = preloadedRef.current && active && !revealedRef.current'),
       '日志首访也要预加载，离开后不拉')
     assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('filesLoader.load().catch'),
@@ -6817,7 +6819,10 @@ async function main () {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
     assert.ok(hist.includes('snapsRef = useRef({ runs: null, all: null })'), '必须留 runs/all 两份服务端快照')
-    assert.ok(hist.includes("fetchSnap(k === 'runs' ? 'all' : 'runs')"), '当前档加载时必须预取另一档（切过去才不用等）')
+    assert.ok(hist.includes("fetchSnap(k === 'runs' ? 'all' : 'runs')") === false,
+      '首屏只允许一次 /api/run-history：不得再预取另一档（旧版 excludeCancelled=1 的第二发）')
+    assert.ok(hist.includes('apiGetRunHistory({ limit: RUN_FETCH_LIMIT })') && !hist.includes('excludeCancelled: k ==='),
+      '一份全量窗口必须同时喂 runs/all 两档（前端剔除取消留痕，不再发 excludeCancelled 请求）')
     const change = hist.slice(hist.indexOf('const changeMode = (m) => {'), hist.indexOf('const goPage = (n) => {'))
     // 有快照：数据先于选中态落地（同一批渲染），首帧就是目标档。
     const cachedAt = change.indexOf('if (cached !== null) {')
