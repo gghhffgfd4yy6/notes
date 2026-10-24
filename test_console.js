@@ -6754,6 +6754,14 @@ async function main () {
     assert.ok(src.includes('function PanelSkeleton ('), '必须有可复用的首屏骨架组件')
     assert.ok(msgPanel.includes('loading && !data && html`<') && msgPanel.includes('PanelSkeleton'),
       '首屏骨架必须由 loading && !data 门控（自动刷新不闪）')
+    // 加载失败（L4）：英文异常映射成中文原因，并给重试按钮（class retry-btn）。
+    const errMap = src.slice(src.indexOf('function loadErrorText'), src.indexOf('function usePanelLoader'))
+    assert.ok(errMap.includes('网络请求失败') && errMap.includes('服务器错误'),
+      'Failed to fetch 要映射成「网络请求失败」，5xx 映射成「服务器错误」')
+    const loadErrLine = 'setErr(`加载失败：' + '$' + '{loadErrorText(e)}`)'
+    assert.ok(src.includes(loadErrLine), 'loader 的 err 必须经 loadErrorText 映射，不得直接甩 e.message')
+    assert.ok(msgPanel.includes('<$' + '{LoadError}') && src.includes('class="retry-btn"'),
+      '推送记录加载失败必须给重试按钮（class retry-btn），且复用面板自己的 load()')
     assert.ok(!src.includes("刷新中…' : '刷新'"),
       '刷新按钮不得改文案：宽度变化会把导出按钮挤一下')
     assert.ok(src.includes('slowLoading && html`<span class="fr-status-muted">刷新中…</span>`'),

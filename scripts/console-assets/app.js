@@ -788,6 +788,15 @@ function PanelSkeleton ({ label = '正在加载…', rows = 3 }) {
   </div>`
 }
 
+// 加载失败条：一句中文原因 + 重试按钮（.retry-btn）。重试动作由面板传进来（同一条 load()），
+// 不另建请求路径；busy 时禁用，避免连点叠加。
+function LoadError ({ text, onRetry, busy = false }) {
+  return html`<div class="load-error" role="alert">
+    <span class="load-error-text">${text}</span>
+    <button type="button" class="retry-btn" disabled=${busy} onClick=${onRetry}>重试</button>
+  </div>`
+}
+
 // 按钮：variant 生成 `btn btn-<variant>`；修饰词（btn-danger/btn-busy）可拼进 variant。
 function Button ({ variant = 'secondary', disabled, onClick, title, buttonRef, ariaBusy, children }) {
   return html`<button ref=${buttonRef} class=${'btn btn-' + variant} disabled=${disabled} onClick=${onClick} title=${title} aria-busy=${ariaBusy}>${children}</button>`
@@ -2472,8 +2481,26 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
 // 轮询只挂在概览（状态+历史要跟任务跑）；其余标签页进页时拉取 + 手动刷新，
 // 不自动轮询——消息/日志读的是磁盘文件，5s 轮询只会白耗磁盘与带宽。
 
-// 近 14 日趋势（纯 CSS 条形图，零依赖）：一格=一天，高度按当日推送条数归一。
-// failed>0 的日子用红色渐变提示；0 推送的日子画灰色基线（看得见「没有数据」≠ 没画）。
+// 加载失败文案：fetch 抛的是英文（Failed to fetch / AbortError），直接甩给用户等于没说。
+// 这里只做形态映射，不改错误语义（401 仍由全局事件让 App 停轮询）：
+//   5xx → 服务器错误；4xx → 请求被拒绝；网络断/服务没起 → 网络请求失败；abort → 超时。
+// 认不出的原样返回——后端自定义错误本来就是中文，不要二次包装。
+function loadErrorText (e) {
+  const raw = e && typeof e.message === 'string' ? e.message : String(e === undefined || e === null ? '' : e)
+  const http = /^HTTP (\d{3})$/.exec(raw)
+  if (http) {
+    const code = Number(http[1])
+    if (code >= 500) return `服务器错误（HTTP ${code}）`
+    if (code >= 400) return `请求被拒绝（HTTP ${code}）`
+    return `请求失败（HTTP ${code}）`
+  }
+  if (/Failed to fetch|NetworkError|Load failed|ERR_NETWORK|ERR_INTERNET_DISCONNECTED/i.test(raw)) {
+    return '网络请求失败（检查网络，或控制台服务是否在运行）'
+  }
+  if (/abort|响应体读取超时/i.test(raw)) return '请求超时（服务器 8 秒内没有响应）'
+  return raw === '' ? '未知错误' : raw
+}
+
 // 面板加载器公共骨架：data/err 状态 + load()（成功清错、失败写横幅）。
 // apiFn 由调用方用 useCallback/useMemo 固定引用，避免 effect 风暴。
 function usePanelLoader (apiFn, onLoaded, initialData = null) {
@@ -2500,7 +2527,7 @@ function usePanelLoader (apiFn, onLoaded, initialData = null) {
       return true
     } catch (e) {
       if (seq !== seqRef.current || !mountedRef.current) return false
-      setErr(`加载失败：${e.message}`)
+      setErr(`加载失败：${loadErrorText(e)}`)
       return false
     } finally {
       if (seq === seqRef.current && mountedRef.current) {
@@ -2692,6 +2719,8 @@ function useSlowFlag (on, delay = 600) {
 // 趋势天数选择器固定选项（与服务端白名单 TREND_DAYS_ALLOWED 对齐；14 为默认省略参数）
 const TREND_DAYS = [14, 30, 60]
 
+// 近 14 日趋势（纯 CSS 条形图，零依赖）：一格=一天，高度按当日推送条数归一。
+// failed>0 的日子用红色渐变提示；0 推送的日子画灰色基线（看得见「没有数据」≠ 没画）。
 function TrendsPanel ({ active = true }) {
   const [days, setDays] = useState(TREND_DAYS[0])
   const [range, setRange] = useState(EMPTY_RANGE)
@@ -3510,7 +3539,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
     </div>
-    ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${err && html`<${LoadError} text=${err} busy=${loading} onRetry=${() => { load().catch(() => {}) }} />`}
     ${exportErr && html`<${Hint} tone="error">${exportErr}<//>`}
     ${exportNote && html`<${Hint}>${exportNote}<//>`}
     ${loading && !data && html`<${PanelSkeleton} label="正在加载推送记录" />`}
