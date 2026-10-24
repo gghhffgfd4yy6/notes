@@ -1542,7 +1542,7 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
   // 弹窗「从哪来回哪去」：从触发按钮的位置放大展开，取消/遮罩/Esc 时缩回按钮再卸载。
   const backRef = useRef(null)
   const boxRef = useRef(null)
-  const closeDialog = useMorphDialog(backRef, boxRef, open)
+  const [closeDialog, dialogClosing] = useMorphDialog(backRef, boxRef, open)
   // 回调每次渲染都是新函数；若把它放进 focus effect 的依赖，busy 变化会重新聚焦密码框，
   // 手机上表现为点「解密」后键盘又弹一下。ref 在 useDialogChrome 里更新。
   const onCancelRef = useDialogChrome(open, onCancel, { initialFocusRef, fallbackRef: cancelRef, closeDialog })
@@ -1552,8 +1552,8 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
       <div class="modal-title" id=${titleId}>${title}</div>
       <div class="modal-body">${children}</div>
       <div class="modal-actions">
-        <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${() => closeDialog(() => onCancelRef.current())}>取消<//>
-        <${Button} variant="danger-solid" disabled=${busy || confirmDisabled} onClick=${onConfirm}>${confirmLabel}<//>
+        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => closeDialog(() => onCancelRef.current())}>取消<//>
+        <${Button} variant="danger-solid" disabled=${busy || confirmDisabled || dialogClosing} onClick=${onConfirm}>${confirmLabel}<//>
       </div>
     </div>
   </div>`
@@ -1566,7 +1566,7 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
   const [titleId] = useState(() => `leave-title-${++dialogSeq}`)
   const backRef = useRef(null)
   const boxRef = useRef(null)
-  const closeDialog = useMorphDialog(backRef, boxRef, open)
+  const [closeDialog, dialogClosing] = useMorphDialog(backRef, boxRef, open)
   const onCancelRef = useDialogChrome(open, onCancel, { fallbackRef: cancelRef, closeDialog })
   if (!open) return null
   return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current()) }}>
@@ -1578,9 +1578,9 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
         <div class="modal-note">「保存并继续」会直接保存，保存成功后自动继续刚才的离开操作；「取消」继续编辑。</div>
       </div>
       <div class="modal-actions">
-        <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${() => closeDialog(() => onCancelRef.current())}>取消<//>
-        <${Button} variant="danger-solid" disabled=${busy} onClick=${onDiscard}>不保存并离开<//>
-        <${Button} variant="primary" disabled=${busy} onClick=${onSave}>保存并继续<//>
+        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => closeDialog(() => onCancelRef.current())}>取消<//>
+        <${Button} variant="danger-solid" disabled=${busy || dialogClosing} onClick=${onDiscard}>不保存并离开<//>
+        <${Button} variant="primary" disabled=${busy || dialogClosing} onClick=${onSave}>保存并继续<//>
       </div>
     </div>
   </div>`

@@ -467,3 +467,17 @@ export async function decryptBackup (data, password) {
   }
   return bundle
 }
+
+// 弹窗从触发点长出来时用的几何：把面板矩形映射到触发元素中心。
+// 等比缩放（宽度比，夹在 0.16~1）——非等比会把文字压扁；面板量不到尺寸时返回 null，
+// 调用方退回中心缩放。纯函数，便于直接断言。
+export function morphFrom (src, box) {
+  if (!src || !box) return null
+  if (!(box.width > 0) || !(box.height > 0) || !(src.width > 0) || !(src.height > 0)) return null
+  const s = Math.max(0.16, Math.min(1, src.width / box.width))
+  return {
+    dx: Math.round(src.left + src.width / 2 - (box.left + box.width / 2)),
+    dy: Math.round(src.top + src.height / 2 - (box.top + box.height / 2)),
+    s
+  }
+}
