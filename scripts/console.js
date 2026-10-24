@@ -637,7 +637,7 @@ const STATIC_ASSETS = Object.freeze({
 
 // 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，各文件 < 100KB）。
 // 版本号 = 各文件内容哈希拼接后的 sha16，renderPage 以 ?v=<sha16> 引用；带当前版本的 URL 可长缓存
-// （private + immutable），裸 URL 仍 no-cache（测试与旧页面兼容）。部署 = systemd restart。
+// （public + immutable），裸 URL 仍 no-cache（测试与旧页面兼容）。部署 = systemd restart。
 // 注：app.js 内部 `import './pure.mjs'` 不带版本号，走裸 URL 的 no-cache + ETag 协商（内容哈希仍参与
 // 全站版本号，因此任一资产变更都会让页面引用的 app.js?v= 一起失效）。
 //
@@ -749,9 +749,12 @@ function serveStatic (req, res, route, spec) {
   } catch (e) { /* 畸形 URL 交给上层校验；这里按裸 URL 处理 */ }
   const headers = {
     'Content-Type': spec.type,
-    // 资产与数据同面鉴权（无凭证 401）：只能进浏览器私有缓存，绝不能让共享缓存
-    // 把一次带凭证的响应复用给未鉴权调用方（评审 #236 · Sourcery Medium）。
-    'Cache-Control': versioned ? 'private, max-age=31536000, immutable' : 'no-cache',
+    // 内容寻址：?v=<全站版本号> 命中即同一份字节，可以 immutable 长缓存一年、期间不再回源。
+    // public 而非 private：资产是前端代码/样式，与调用方身份无关（任何人拿到的都是同一份，
+    // 不含凭证与推送数据），允许 CDN/共享缓存存一份供未鉴权请求复用，省掉回源的 401 往返；
+    // 数据面不在此列——HTML 由 applyPageHeaders 明确 no-store，API 出口按各分支自设 Cache-Control。
+    // 裸 URL（app.js 内部 `import './pure.mjs'`）不走内容寻址，仍 no-cache + ETag 协商。
+    'Cache-Control': versioned ? 'public, max-age=31536000, immutable' : 'no-cache',
     ETag: etag,
     Vary: 'Accept-Encoding'
   }
@@ -781,16 +784,26 @@ function formatMs (ms) {
 
 // ── 访问日志（v3.300）──────────────────────────────────────────────────────
 let accessStampFmt = null
-function accessStamp () {
+function accessStamp (now = new Date()) {
   // 惰性单例 + 兜底（D7）：sv-SE + Asia/Shanghai 与 run.log 留痕戳同参同输出；
   // 顶层惰性而非 require 期构造——防 ICU 异常炸 import。at 是展示字段
   // （数组下标即权威时序），格式 YYYY-MM-DD HH:mm:ss。
   if (!accessStampFmt) {
     try {
       accessStampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
-    } catch (e) { return new Date().toISOString() }
+    } catch (e) { return now.toISOString() }
   }
-  try { return accessStampFmt.format(new Date()) } catch (e) { return new Date().toISOString() }
+  try { return accessStampFmt.format(now) } catch (e) { return now.toISOString() }
+}
+
+// 导出文件名的时间戳：YYYYMMDD-HHmm（Asia/Shanghai，与 accessStamp / run.log 同口径，
+// 用户看到的就是北京时间）。纯 ASCII：Content-Disposition 的 filename= 放非 ASCII 时各
+// 浏览器落盘名不一致，中文兼容靠「文件名只用 ASCII」，不是靠 RFC 5987 的 filename*。
+function exportStamp (now = new Date()) {
+  // accessStamp 输出 YYYY-MM-DD HH:mm:ss（ICU 异常时兜底 ISO）——两种形态都取前 12 位数字
+  // 即年月日时分，无需再引第二个时区格式化器。
+  const digits = accessStamp(now).replace(/\D/g, '')
+  return `${digits.slice(0, 8)}-${digits.slice(8, 12)}`
 }
 
 // 敏感键名判定：把键名里的 %XX 逐层解到不动点再小写（堵 %74oken= / %2574oken= 等
@@ -1329,12 +1342,21 @@ function sendJson (res, code, obj) {
   res.end(body)
 }
 
-// 登录/挑战页统一响应头：禁止 Referer 把带 ?token= 的地址带进代理日志，也禁止缓存。
-function sendHtml (res, code, body) {
+// 页面类响应（登录/挑战页与 SPA 壳）的统一安全头：Referrer-Policy 只在这里写一次。
+// 同一条头被两处 setHeader 各写一遍时，响应里会出现两个同名字段（浏览器 devtools 显示两行）；
+// 浏览器语义上取最后一条、功能不变，但重复头属协议噪音，也让「这条头由谁设的」不可判定。
+// 反代侧若也设同名字段需自己收敛（Caddy 的 header 默认是「追加」不是覆盖，要用 ? / > 前缀），
+// 本函数只保证 app 侧恰好一条。
+function applyPageHeaders (res) {
   res.setHeader('Content-Security-Policy', CSP_HEADER)
   res.setHeader('Cache-Control', 'no-store')
-  res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('Referrer-Policy', 'no-referrer')
+}
+
+// 登录/挑战页统一响应头：禁止 Referer 把带 ?token= 的地址带进代理日志，也禁止缓存。
+function sendHtml (res, code, body) {
+  applyPageHeaders(res)
+  res.setHeader('X-Content-Type-Options', 'nosniff')
   res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' })
   res.end(body)
 }
@@ -4168,17 +4190,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (req.method === 'GET' && url.pathname === '/') {
-      // Sourcery referrer x2：?token= 打开的页面在发起同源子请求时默认把完整 URL
-      // （含 query 里的 token）作为 Referer 发出，反向代理/访问日志可能落盘。no-referrer
-      // 从根上掐断（该页所有子请求一律不带 Referer）；启动页本身在浏览器地址栏的历史
-      // 记录仍含 token，这是 raw-URL 方案的已知暴露面（README 已提醒可重置）。
-      res.setHeader('Referrer-Policy', 'no-referrer')
-      res.setHeader('Content-Security-Policy', CSP_HEADER)
-      // HTML 里含本次会话凭证（boot JSON 的 token），绝不能被浏览器缓存：无 Cache-Control
-      // 时浏览器启发式缓存会留下旧页面（旧 boot token 为空/过期）——页面照常渲染、GET 靠
-      // Cookie 正常，但点按钮 POST 报 unauthorized（真实故障：2026-10-17 通知自检 401）。
-      // no-store 同时禁掉 bfcache 与磁盘缓存，保证每次打开都拿到当前凭证。
-      res.setHeader('Cache-Control', 'no-store')
+      // SPA 壳与登录页共用一套页面响应头（applyPageHeaders 单点写入，避免 Referrer-Policy
+      // 被两处各写一遍形成重复头）：
+      // · ?token= 打开的页面在发起同源子请求时默认把完整 URL（含 query 里的 token）作为
+      //   Referer 发出，反向代理/访问日志可能落盘；no-referrer 从根上掐断（该页所有子请求
+      //   一律不带 Referer）。启动页本身在浏览器地址栏的历史记录仍含 token，这是 raw-URL
+      //   方案的已知暴露面（README 已提醒可重置）。
+      // · HTML 里含本次会话凭证（boot JSON 的 token），绝不能被浏览器缓存：无 Cache-Control
+      //   时浏览器启发式缓存会留下旧页面（旧 boot token 为空/过期）——页面照常渲染、GET 靠
+      //   Cookie 正常，但点按钮 POST 报 unauthorized（真实故障：2026-10-17 通知自检 401）。
+      //   no-store 同时禁掉 bfcache 与磁盘缓存，保证每次打开都拿到当前凭证。
+      applyPageHeaders(res)
       const state = readStatus(stateDir)
       const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
       // 鉴权通过后下发会话 Cookie（Sourcery G_oJ）：HttpOnly（JS 不可读，XSS 拿不走）、
@@ -4426,6 +4448,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // （不改成 {items,...} 对象），CSV 也不插注释行，统一走响应头：percent-encoded
           // UTF-8，非 ASCII 安全；未截断也下发，消费方可据此判断词是否被接受。
           const exportMeta = { 'X-Export-Query-Used': encodeURIComponent(query) }
+          // 文件名 = messages-<YYYYMMDD-HHmm>.<ext>（北京时间）：同一目录里多次导出不再互相
+          // 覆盖，打开就知道是哪一批。名字里只有时间戳，不含查询词/分类——它们可能含 token
+          // 形态字符串，绝不回显进头（蓝图防线）；纯 ASCII 见 exportStamp 注释。
+          const stamp = exportStamp()
           if (format === 'json') {
             // 仅截断时下发该头；未截断不下发（缺席=完整，测试断言 undefined）。
             if (truncated) res.setHeader('X-Export-Truncated', 'true')
@@ -4434,14 +4460,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             // 不进响应体（形态纯度优先；三态响应才是 {status,...} 对象，前端按
             // Array.isArray 区分成功/三态——评审 231-H1）。
             const body = JSON.stringify(rows)
-            res.writeHead(200, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="messages-export.json"' }, exportMeta))
+            res.writeHead(200, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="messages-${stamp}.json"` }, exportMeta))
             res.end(body)
             return
           }
           const head = Object.assign({
             'Content-Type': 'text/csv; charset=utf-8',
-            // 文件名硬编码字面量：查询词可能含 token 形态字符串，绝不回显进头（蓝图防线）。
-            'Content-Disposition': 'attachment; filename="messages-export.csv"'
+            // 只拼本地生成的时间戳：查询词可能含 token 形态字符串，绝不回显进头（蓝图防线）。
+            'Content-Disposition': `attachment; filename="messages-${stamp}.csv"`
           }, exportMeta)
           if (truncated) head['X-Export-Truncated'] = 'true'
           // BOM EF BB BF：Excel 无 BOM 按本地代码页解析会乱码中文（蓝图硬性要求）。

@@ -729,7 +729,7 @@ function request (port, method, urlPath, { token, body, headers } = {}) {
     const req = http.request({ host: '127.0.0.1', port, method, path: urlPath, headers: { ...base, ...(headers || {}) } }, (res) => {
       let buf = ''
       res.on('data', c => { buf += c })
-      res.on('end', () => resolve({ status: res.statusCode, text: buf, headers: res.headers }))
+      res.on('end', () => resolve({ status: res.statusCode, text: buf, headers: res.headers, rawHeaders: res.rawHeaders }))
     })
     req.on('error', reject)
     if (body !== undefined) req.write(body)
@@ -749,6 +749,12 @@ function requestBuffer (port, method, urlPath, { token, body, headers } = {}) {
     if (body !== undefined) req.write(body)
     req.end()
   })
+}
+// 同名响应头出现次数：Node 在 res.headers 里把重复头用 ", " 合并成一个值，只有 rawHeaders
+// 能数清「写了几条」——用于锁死 Referrer-Policy 这类必须唯一的页面安全头。
+function headerCount (res, name) {
+  const want = String(name).toLowerCase()
+  return res.rawHeaders.filter((v, i) => i % 2 === 0 && String(v).toLowerCase() === want).length
 }
 // 绕过 http.request 的 URL 合法性校验，直接写原始请求行（畸形 request-target 回归用：
 // `//@:99999/` 会让裸 new URL 抛 TypeError——修复前一条无凭证请求即崩整个控制台）。
@@ -2014,6 +2020,9 @@ async function main () {
     // 页面含会话凭证（boot JSON token）⇒ 不得被缓存：缺 Cache-Control 时浏览器启发式缓存
     // 会留下旧页面的空/过期 boot token，表现为「页面正常、点按钮 POST 400/401 unauthorized」。
     assert.strictEqual(res.headers['cache-control'], 'no-store', 'HTML 必须 no-store（凭证不落缓存）')
+    // 重复头回归：页面安全头由 applyPageHeaders 单点写，app 侧只允许出现一条 Referrer-Policy
+    // （反代若也设同名字段，浏览器里会看到两行——那属反代配置，不在本仓）。
+    assert.strictEqual(headerCount(res, 'referrer-policy'), 1, 'SPA 壳页只能有一条 Referrer-Policy')
     // Sourcery #37：缺文件夹具必须断言「缺失」分支文案，不许「正常」蒙混——
     // 两种文案都接受的断言抓不住缺失降级走错分支的回归。
     assert.ok(res.text.includes('缺失'), `空缓存目录必须渲染「缺失」分支，实际片段：${res.text.slice(0, 400)}`)
@@ -2055,8 +2064,9 @@ async function main () {
     assert.strictEqual(verMatch[1], expectVer, '版本号必须等于资产内容的哈希（不能是常量/陈旧值）')
     const immutable = await requestBuffer(port, 'GET', `/assets/app.css?v=${verMatch[1]}`, { token: TOKEN })
     const cc = String(immutable.headers['cache-control'] || '')
-    assert.match(cc, /immutable/, '版本化资产必须 immutable 长缓存')
-    assert.match(cc, /private/, '资产与数据同面鉴权：只能进浏览器私有缓存（shared cache 会把带凭证响应复用给未鉴权方）')
+    // 内容寻址（?v= 为内容哈希）⇒ 命中即同一份字节：public + immutable 一年，浏览器/CDN
+    // 不再回源；public 只对静态资产成立（不含凭证与推送数据），数据面仍是 no-store。
+    assert.strictEqual(cc, 'public, max-age=31536000, immutable', '版本化资产必须 public + immutable 一年长缓存')
     const staleVer = await requestBuffer(port, 'GET', '/assets/app.css?v=deadbeefdeadbeef', { token: TOKEN })
     assert.strictEqual(String(staleVer.headers['cache-control'] || ''), 'no-cache', '不匹配的版本号必须回退 no-cache')
     // gzip;q=0 表示明确拒绝：不得发压缩体
@@ -2083,6 +2093,7 @@ async function main () {
     assert.strictEqual(unauth.status, 401, '未授权 GET / 回 401')
     assert.match(unauth.headers['content-type'], /text\/html/, '未授权首屏必须是 HTML')
     assert.ok(unauth.text.includes('需要访问令牌'), '登录页含标题')
+    assert.strictEqual(headerCount(unauth, 'referrer-policy'), 1, '登录/挑战页只能有一条 Referrer-Policy')
     assert.ok(unauth.text.includes('<form method="post" action="/login">'), '登录页必须用 POST 表单（token 不进地址栏）')
     // POST /login：正确 token → 303 到干净 `/` + Cookie；错误 token → 401 仍是登录页。
     const loginOk = await request(port, 'POST', '/login', {
@@ -2926,7 +2937,16 @@ async function main () {
     assert.strictEqual(res.status, 200)
     // 响应头（Node 出站头小写化）
     assert.strictEqual(res.headers['content-type'], 'text/csv; charset=utf-8')
-    assert.strictEqual(res.headers['content-disposition'], 'attachment; filename="messages-export.csv"', '文件名固定字面量')
+    // 文件名 = messages-<YYYYMMDD-HHmm>.csv：纯 ASCII + 北京时间戳（本地时间，非 UTC），
+    // 同一分钟内多次导出会重名——判据是「时间戳存在且指向当下」，不是唯一性。
+    const cd = String(res.headers['content-disposition'])
+    const cdMatch = /^attachment; filename="messages-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})\.csv"$/.exec(cd)
+    assert.ok(cdMatch, `Content-Disposition 必须是 messages-<YYYYMMDD-HHmm>.csv（实际：${cd}）`)
+    assert.ok(!/[^\x20-\x7e]/.test(cd), 'Content-Disposition 必须是纯 ASCII（中文环境兼容，不依赖 filename*）')
+    const stampMs = Date.UTC(+cdMatch[1], +cdMatch[2] - 1, +cdMatch[3], +cdMatch[4], +cdMatch[5])
+    // 北京时间 = UTC+8：把文件名里的「本地时刻」当 UTC 解读，应比 Date.now() 正好大 8 小时；
+    // 差 5 分钟容差只吸收「请求跨分钟边界」。
+    assert.ok(Math.abs(Date.now() + 8 * 3600 * 1000 - stampMs) < 5 * 60 * 1000, `时间戳必须是当前北京时间（实际 ${cdMatch[0]}）`)
     assert.strictEqual(res.headers['x-export-truncated'], undefined, '未截断不下发该头')
     // BOM（request() 收 utf8 字符串，BOM 呈 U+FEFF）
     assert.strictEqual(res.text.charCodeAt(0), 0xFEFF, 'CSV 必须以 UTF-8 BOM 开头')
@@ -2963,6 +2983,7 @@ async function main () {
     assert.strictEqual(j.length, EXPORT_MAX_ROWS, '恰 5000 行（截断）')
     assert.strictEqual(typeof j[0].title, 'string', '元素=行对象')
     const jr = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    assert.match(String(jr.headers['content-disposition']), /^attachment; filename="messages-\d{8}-\d{4}\.json"$/, 'JSON 导出同样带时间戳文件名')
     assert.strictEqual(jr.headers['x-export-truncated'], 'true', 'JSON 分支同样下发截断头')
     // D2-S9：导出口径必须回显「实际生效的搜索词」（列表端点早有 queryUsed）
     assert.strictEqual(jr.headers['x-export-query-used'], '', '无搜索词时头为空串而非缺席')
