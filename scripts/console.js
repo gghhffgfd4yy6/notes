@@ -1332,12 +1332,21 @@ function sendJson (res, code, obj) {
   res.end(body)
 }
 
-// 登录/挑战页统一响应头：禁止 Referer 把带 ?token= 的地址带进代理日志，也禁止缓存。
-function sendHtml (res, code, body) {
+// 页面类响应（登录/挑战页与 SPA 壳）的统一安全头：Referrer-Policy 只在这里写一次。
+// 同一条头被两处 setHeader 各写一遍时，响应里会出现两个同名字段（浏览器 devtools 显示两行）；
+// 浏览器语义上取最后一条、功能不变，但重复头属协议噪音，也让「这条头由谁设的」不可判定。
+// 反代侧若也设同名字段需自己收敛（Caddy 的 header 默认是「追加」不是覆盖，要用 ? / > 前缀），
+// 本函数只保证 app 侧恰好一条。
+function applyPageHeaders (res) {
   res.setHeader('Content-Security-Policy', CSP_HEADER)
   res.setHeader('Cache-Control', 'no-store')
-  res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('Referrer-Policy', 'no-referrer')
+}
+
+// 登录/挑战页统一响应头：禁止 Referer 把带 ?token= 的地址带进代理日志，也禁止缓存。
+function sendHtml (res, code, body) {
+  applyPageHeaders(res)
+  res.setHeader('X-Content-Type-Options', 'nosniff')
   res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' })
   res.end(body)
 }
@@ -4168,17 +4177,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (req.method === 'GET' && url.pathname === '/') {
-      // Sourcery referrer x2：?token= 打开的页面在发起同源子请求时默认把完整 URL
-      // （含 query 里的 token）作为 Referer 发出，反向代理/访问日志可能落盘。no-referrer
-      // 从根上掐断（该页所有子请求一律不带 Referer）；启动页本身在浏览器地址栏的历史
-      // 记录仍含 token，这是 raw-URL 方案的已知暴露面（README 已提醒可重置）。
-      res.setHeader('Referrer-Policy', 'no-referrer')
-      res.setHeader('Content-Security-Policy', CSP_HEADER)
-      // HTML 里含本次会话凭证（boot JSON 的 token），绝不能被浏览器缓存：无 Cache-Control
-      // 时浏览器启发式缓存会留下旧页面（旧 boot token 为空/过期）——页面照常渲染、GET 靠
-      // Cookie 正常，但点按钮 POST 报 unauthorized（真实故障：2026-10-17 通知自检 401）。
-      // no-store 同时禁掉 bfcache 与磁盘缓存，保证每次打开都拿到当前凭证。
-      res.setHeader('Cache-Control', 'no-store')
+      // SPA 壳与登录页共用一套页面响应头（applyPageHeaders 单点写入，避免 Referrer-Policy
+      // 被两处各写一遍形成重复头）：
+      // · ?token= 打开的页面在发起同源子请求时默认把完整 URL（含 query 里的 token）作为
+      //   Referer 发出，反向代理/访问日志可能落盘；no-referrer 从根上掐断（该页所有子请求
+      //   一律不带 Referer）。启动页本身在浏览器地址栏的历史记录仍含 token，这是 raw-URL
+      //   方案的已知暴露面（README 已提醒可重置）。
+      // · HTML 里含本次会话凭证（boot JSON 的 token），绝不能被浏览器缓存：无 Cache-Control
+      //   时浏览器启发式缓存会留下旧页面（旧 boot token 为空/过期）——页面照常渲染、GET 靠
+      //   Cookie 正常，但点按钮 POST 报 unauthorized（真实故障：2026-10-17 通知自检 401）。
+      //   no-store 同时禁掉 bfcache 与磁盘缓存，保证每次打开都拿到当前凭证。
+      applyPageHeaders(res)
       const state = readStatus(stateDir)
       const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
       // 鉴权通过后下发会话 Cookie（Sourcery G_oJ）：HttpOnly（JS 不可读，XSS 拿不走）、

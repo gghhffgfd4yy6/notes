@@ -729,7 +729,7 @@ function request (port, method, urlPath, { token, body, headers } = {}) {
     const req = http.request({ host: '127.0.0.1', port, method, path: urlPath, headers: { ...base, ...(headers || {}) } }, (res) => {
       let buf = ''
       res.on('data', c => { buf += c })
-      res.on('end', () => resolve({ status: res.statusCode, text: buf, headers: res.headers }))
+      res.on('end', () => resolve({ status: res.statusCode, text: buf, headers: res.headers, rawHeaders: res.rawHeaders }))
     })
     req.on('error', reject)
     if (body !== undefined) req.write(body)
@@ -749,6 +749,12 @@ function requestBuffer (port, method, urlPath, { token, body, headers } = {}) {
     if (body !== undefined) req.write(body)
     req.end()
   })
+}
+// 同名响应头出现次数：Node 在 res.headers 里把重复头用 ", " 合并成一个值，只有 rawHeaders
+// 能数清「写了几条」——用于锁死 Referrer-Policy 这类必须唯一的页面安全头。
+function headerCount (res, name) {
+  const want = String(name).toLowerCase()
+  return res.rawHeaders.filter((v, i) => i % 2 === 0 && String(v).toLowerCase() === want).length
 }
 // 绕过 http.request 的 URL 合法性校验，直接写原始请求行（畸形 request-target 回归用：
 // `//@:99999/` 会让裸 new URL 抛 TypeError——修复前一条无凭证请求即崩整个控制台）。
@@ -1911,6 +1917,9 @@ async function main () {
     // 页面含会话凭证（boot JSON token）⇒ 不得被缓存：缺 Cache-Control 时浏览器启发式缓存
     // 会留下旧页面的空/过期 boot token，表现为「页面正常、点按钮 POST 400/401 unauthorized」。
     assert.strictEqual(res.headers['cache-control'], 'no-store', 'HTML 必须 no-store（凭证不落缓存）')
+    // 重复头回归：页面安全头由 applyPageHeaders 单点写，app 侧只允许出现一条 Referrer-Policy
+    // （反代若也设同名字段，浏览器里会看到两行——那属反代配置，不在本仓）。
+    assert.strictEqual(headerCount(res, 'referrer-policy'), 1, 'SPA 壳页只能有一条 Referrer-Policy')
     // Sourcery #37：缺文件夹具必须断言「缺失」分支文案，不许「正常」蒙混——
     // 两种文案都接受的断言抓不住缺失降级走错分支的回归。
     assert.ok(res.text.includes('缺失'), `空缓存目录必须渲染「缺失」分支，实际片段：${res.text.slice(0, 400)}`)
@@ -1981,6 +1990,7 @@ async function main () {
     assert.strictEqual(unauth.status, 401, '未授权 GET / 回 401')
     assert.match(unauth.headers['content-type'], /text\/html/, '未授权首屏必须是 HTML')
     assert.ok(unauth.text.includes('需要访问令牌'), '登录页含标题')
+    assert.strictEqual(headerCount(unauth, 'referrer-policy'), 1, '登录/挑战页只能有一条 Referrer-Policy')
     assert.ok(unauth.text.includes('<form method="post" action="/login">'), '登录页必须用 POST 表单（token 不进地址栏）')
     // POST /login：正确 token → 303 到干净 `/` + Cookie；错误 token → 401 仍是登录页。
     const loginOk = await request(port, 'POST', '/login', {
