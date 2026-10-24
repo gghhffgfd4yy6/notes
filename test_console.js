@@ -5591,6 +5591,12 @@ async function main () {
     assert.ok(src.includes("if (!autoOn || tab !== 'overview') return undefined"), '概览隐藏后倒计时时钟必须停')
     assert.ok(src.includes('paused=$' + "{!autoRefresh || tab !== 'overview'}"), '概览隐藏后缓存健康分钟轮询必须停')
     assert.ok(src.includes('if (openId === null || !active) return undefined'), '隐藏页的运行详情必须断开 SSE/轮询')
+    // 隐藏页不只不轮询，也不该生成工具条 DOM（L4）：保活面板切走后，
+    // date-btn / auto-run-row 会以 hidden 副本留在别的页面里，点击区与可检索文本都被污染。
+    assert.strictEqual((src.match(/active && html`<\$\{DateRange\}/g) || []).length, 4,
+      '四处 DateRange 都必须按 active 条件渲染（非活动面板不生成 date-btn）')
+    assert.strictEqual((src.match(/active && html`<div class="auto-run-row">/g) || []).length, 2,
+      '两处 auto-run-row（概览自动运行 / 系统页拦截窗）都必须按 active 条件渲染')
     // 只读页切回静默刷新；带草稿的过滤规则页不得重拉覆盖。
     assert.ok(src.includes('<$' + '{MessagesPanel} active=$' + "{tab === 'messages'}"), '推送记录页切回时必须静默刷新')
     assert.ok(src.includes('active=$' + "{tab === 'logs'}"), '日志页切回时必须静默刷新')
@@ -5612,9 +5618,11 @@ async function main () {
     assert.ok(seg('SysPanel', 'function FilesPanel').includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
       '系统页必须等系统信息 + 访问日志 + 设置三条都结算后才报完成')
     assert.ok(seg('FilesPanel', 'function FilterRules').includes('usePanelAutoLoad(active, load)'), '文件清单必须首访预加载 + 切回刷新')
-    assert.ok(src.includes('function usePanelAutoLoad') && src.includes('if (!active && !first) return') &&
-      src.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
-    '必须有首访预加载 hook：未点开的页签也先拉一次，离开后不拉')
+    const autoLoad = src.slice(src.indexOf('function usePanelAutoLoad'), src.indexOf('// ── 下拉刷新'))
+    assert.ok(autoLoad.includes('if (!active) return') && !autoLoad.includes('!active && !first'),
+      '首访懒加载：未点开的页签不得发请求（旧版 !active && !first 会在挂载时预取）')
+    assert.ok(autoLoad.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
+      '切回仍在 3s 内 / 上一发在飞时不得重复发（Sourcery #272 同口径）')
     assert.ok(seg('LogsPanel', 'function SysPanel').includes('const firstReveal = preloadedRef.current && active && !revealedRef.current'),
       '日志首访也要预加载，离开后不拉')
     assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('filesLoader.load().catch'),
@@ -6871,6 +6879,19 @@ async function main () {
       '推送记录必须用 slowLoading 决定「更新中…」')
     assert.ok(msgPanel.includes('slowLoading ? html`<span class="msg-loading"> · 更新中…</span>`'),
       '「匹配 N 条」的后缀只能由 slowLoading 控制，不能用 loading')
+    // 首屏骨架（L4）：第一份数据回来前画占位；只在「还没有 data」时出现——自动刷新/切回
+    // 已有数据的面板不得反复闪骨架。
+    assert.ok(src.includes('function PanelSkeleton ('), '必须有可复用的首屏骨架组件')
+    assert.ok(msgPanel.includes('loading && !data && html`<') && msgPanel.includes('PanelSkeleton'),
+      '首屏骨架必须由 loading && !data 门控（自动刷新不闪）')
+    // 加载失败（L4）：英文异常映射成中文原因，并给重试按钮（class retry-btn）。
+    const errMap = src.slice(src.indexOf('function loadErrorText'), src.indexOf('function usePanelLoader'))
+    assert.ok(errMap.includes('网络请求失败') && errMap.includes('服务器错误'),
+      'Failed to fetch 要映射成「网络请求失败」，5xx 映射成「服务器错误」')
+    const loadErrLine = 'setErr(`加载失败：' + '$' + '{loadErrorText(e)}`)'
+    assert.ok(src.includes(loadErrLine), 'loader 的 err 必须经 loadErrorText 映射，不得直接甩 e.message')
+    assert.ok(msgPanel.includes('<$' + '{LoadError}') && src.includes('class="retry-btn"'),
+      '推送记录加载失败必须给重试按钮（class retry-btn），且复用面板自己的 load()')
     assert.ok(!src.includes("刷新中…' : '刷新'"),
       '刷新按钮不得改文案：宽度变化会把导出按钮挤一下')
     assert.ok(src.includes('slowLoading && html`<span class="fr-status-muted">刷新中…</span>`'),
@@ -6941,7 +6962,10 @@ async function main () {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
     assert.ok(hist.includes('snapsRef = useRef({ runs: null, all: null })'), '必须留 runs/all 两份服务端快照')
-    assert.ok(hist.includes("fetchSnap(k === 'runs' ? 'all' : 'runs')"), '当前档加载时必须预取另一档（切过去才不用等）')
+    assert.ok(hist.includes("fetchSnap(k === 'runs' ? 'all' : 'runs')") === false,
+      '首屏只允许一次 /api/run-history：不得再预取另一档（旧版 excludeCancelled=1 的第二发）')
+    assert.ok(hist.includes('apiGetRunHistory({ limit: RUN_FETCH_LIMIT })') && !hist.includes('excludeCancelled: k ==='),
+      '一份全量窗口必须同时喂 runs/all 两档（前端剔除取消留痕，不再发 excludeCancelled 请求）')
     const change = hist.slice(hist.indexOf('const changeMode = (m) => {'), hist.indexOf('const goPage = (n) => {'))
     // 有快照：数据先于选中态落地（同一批渲染），首帧就是目标档。
     const cachedAt = change.indexOf('if (cached !== null) {')

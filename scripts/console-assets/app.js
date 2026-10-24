@@ -783,6 +783,29 @@ function PanelHead ({ title, sub, right, afterTitle, level = 2 }) {
   </div>`
 }
 
+// 首屏骨架：第一份数据回来前先按最终版式占位（记数行 + 3 行列表），不再是一片空白。
+// 只在「首次加载且还没有任何数据」时用（调用方条件 loading && !data）——自动刷新、
+// 切回已看过的面板时 data 还在，条件不成立，所以不会反复闪骨架。
+// 结构在这里，样式（背景色/圆角/动画）由 app.css 的 .skeleton/.skel-* 负责。
+function PanelSkeleton ({ label = '正在加载…', rows = 3 }) {
+  return html`<div class="skeleton" role="status" aria-label=${label}>
+    <div class="skel-top" aria-hidden="true"><span class="skel-bar skel-bar-count"></span></div>
+    ${Array.from({ length: rows }, (_v, i) => html`<div class="skel-row" key=${i} aria-hidden="true">
+      <span class="skel-bar skel-bar-title"></span>
+      <span class="skel-bar skel-bar-meta"></span>
+    </div>`)}
+  </div>`
+}
+
+// 加载失败条：一句中文原因 + 重试按钮（.retry-btn）。重试动作由面板传进来（同一条 load()），
+// 不另建请求路径；busy 时禁用，避免连点叠加。
+function LoadError ({ text, onRetry, busy = false }) {
+  return html`<div class="load-error" role="alert">
+    <span class="load-error-text">${text}</span>
+    <button type="button" class="retry-btn" disabled=${busy} onClick=${onRetry}>重试</button>
+  </div>`
+}
+
 // 按钮：variant 生成 `btn btn-<variant>`；修饰词（btn-danger/btn-busy）可拼进 variant。
 function Button ({ variant = 'secondary', disabled, onClick, title, buttonRef, ariaBusy, children }) {
   return html`<button ref=${buttonRef} class=${'btn btn-' + variant} disabled=${disabled} onClick=${onClick} title=${title} aria-busy=${ariaBusy}>${children}</button>`
@@ -1623,7 +1646,7 @@ function triggerResultLine (trig, run) {
   }
 }
 
-function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
+function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = true }) {
   const [err, setErr] = useState('')
   // 最近一次「提交成功」的触发（202 那一刻记下 id/label/at）；结果由 runs 结算。
   const [lastTrigger, setLastTrigger] = useState(null)
@@ -1790,7 +1813,10 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
         <span class="auto-run-tag">服务器调度</span>
         ${auto.on && html`<span class="auto-run-live">运行中</span>`}
       </div>
-      <div class="auto-run-row">
+      ${/* 隐藏页签不生成工具条 DOM（L4）：概览保活挂载时，这一排 date-btn/auto-run-row
+           会以 hidden 副本留在其它页的 DOM 里；只在 active 时渲染，切走即移除，
+           草稿/按住加减等状态都由组件 state 保留，切回不会丢。 */ ''}
+      ${active && html`<div class="auto-run-row">
         <button type="button" class="auto-step" aria-label="减少间隔"
           onPointerDown=${holdAuto.start(-1)} onPointerUp=${holdAuto.stop} onPointerLeave=${holdAuto.stop}
           onPointerCancel=${holdAuto.stop} onLostPointerCapture=${holdAuto.stop}
@@ -1806,7 +1832,7 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
         ${auto.on
           ? html`<${Button} variant="danger" onClick=${stopAuto}>停止<//>`
           : html`<${Button} variant="danger-solid" onClick=${askAuto}>开始<//>`}
-      </div>
+      </div>`}
       <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒（输入框已锁，长按加减可快速调整）；由服务器常驻运行，关闭页面、切后台、锁屏都不影响，点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次会自动停止。</div>
       ${auto.on && html`<div class="auto-run-status">${auto.nextAt > 0 ? `下一轮 ${Math.max(0, Math.ceil((auto.nextAt - auto.now) / 1000))} 秒` : '本轮进行中'} · 已自动运行 ${auto.runs} 轮</div>`}
       ${!auto.on && html`<div class="auto-run-status">${autoSaved ? '间隔已保存' : ''}</div>`}
@@ -2135,7 +2161,8 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
 // 尾窗指纹/stale 语义仍由服务端保留（本组件只发一次 limit=200，不翻游标）。
 const RUN_PAGE_SIZES = [10, 20, 50, 100]
 const RUN_FETCH_LIMIT = 200
-// 逐轮历史的两份服务端快照：仅运行（excludeCancelled）与全量（全部/只看异常共用）。
+// 逐轮历史的两份服务端快照：仅运行（前端剔除取消留痕）与全量（全部/只看异常共用）。
+// 两份由同一次 /api/run-history 请求填充，切档不再发第二次请求。
 const RUN_SNAP_KEY = (m) => (m === 'runs' ? 'runs' : 'all')
 
 // ── 列表落点（v3.320）──────────────────────────────────────────────────────
@@ -2233,19 +2260,23 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   }
   useLandScrollCancel(landRef, userMovedRef)
 
-  // 两种筛选各留一份快照：服务端口径不同（仅运行 = excludeCancelled，最近 200 个真轮次）。
-  // 切「只看异常」若拿「仅运行」的快照按异常过滤，会先算成「只看异常 2 / 共 2 条」，
-  // 等请求回来再跳成 48 条——手机上就是约 130ms 的闪跳（v3.326 录屏实测 4 帧）。
-  // 所以另一档在后台预取，切过去首帧直接用目标快照；目标快照还没到就保持旧列表，
-  // 绝不用另一档的数据重算。「全部」与「只看异常」共用同一份全量快照。
+  // 两档视图共用一次请求：服务端不再按 excludeCancelled 预过滤，「仅运行」由前端剔除
+  // 取消留痕（filterRunItems 与渲染同口径）——旧版首屏为此多发一次 200 行的
+  // /api/run-history?excludeCancelled=1（与全量一份合计 71KB）。
+  // 口径差异如实记下：窗口是「最近 200 行」（含取消记录），取消很多时可见轮次会少于 200 行；
+  // 换来切档零请求、零等待（同一份数据原地过滤，取代旧版「后台预取另一档」）。
   const snapsRef = useRef({ runs: null, all: null })
   const preSeqRef = useRef({ runs: 0, all: 0 })
   const quietNextRef = useRef(false)
   const fetchSnap = useCallback((k) => {
     const seq = ++preSeqRef.current[k]
-    return apiGetRunHistory({ limit: RUN_FETCH_LIMIT, excludeCancelled: k === 'runs' })
+    return apiGetRunHistory({ limit: RUN_FETCH_LIMIT })
       .then((d) => {
-        if (seq === preSeqRef.current[k]) snapsRef.current[k] = d
+        if (seq === preSeqRef.current[k]) {
+          snapsRef.current[k] = d
+          // 同一份全量窗口也满足另一档：切过去直接命中快照，不再补发请求。
+          snapsRef.current[k === 'runs' ? 'all' : 'runs'] = d
+        }
         return d
       })
   }, [])
@@ -2257,8 +2288,8 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     // 首帧已由 changeMode 用快照画好。
     const quiet = quietNextRef.current
     quietNextRef.current = false
-    // 另一档同时预取：每次刷新都补一次，切过去看到的是新快照而不是陈的。
-    fetchSnap(k === 'runs' ? 'all' : 'runs').catch(() => {})
+    // 不再预取另一档：一份全量快照同时喂两档（fetchSnap 里同步写两个 key），
+    // 切档命中快照即可，首屏也只剩一次 /api/run-history。
     // 静默刷新要顺手清掉可能还挂着的 loading（切档会顶掉上一发非静默请求，
     // 那发的 finally 因请求号过期不会再来清，否则分页按钮会一直禁用）。
     setLoading(!quiet)
@@ -2436,7 +2467,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
           aria-busy=${pendingMode === 'issue' && pendingBusy ? 'true' : 'false'}
           aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => changeMode('issue')}>${mode === 'runs' || issueCount === null ? '只看异常' : `只看异常 ${issueCount}`}</button>
       </div>
-      <${DateRange} value=${runRange} onChange=${changeDay} label="按日期筛选轮次" />
+      ${active && html`<${DateRange} value=${runRange} onChange=${changeDay} label="按日期筛选轮次" />`}
       <span class="run-tools-note">${mode === 'issue' ? '只显示失败、中断或取消的轮次' : (mode === 'runs' ? '不显示取消留痕；切「全部」可查' : '点行尾「日志」跳到该日日志')}</span>
     </div>`}
     ${data && data.status && data.status !== 'ok' && html`<div class="empty">run.log${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
@@ -2486,8 +2517,26 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
 // 轮询只挂在概览（状态+历史要跟任务跑）；其余标签页进页时拉取 + 手动刷新，
 // 不自动轮询——消息/日志读的是磁盘文件，5s 轮询只会白耗磁盘与带宽。
 
-// 近 14 日趋势（纯 CSS 条形图，零依赖）：一格=一天，高度按当日推送条数归一。
-// failed>0 的日子用红色渐变提示；0 推送的日子画灰色基线（看得见「没有数据」≠ 没画）。
+// 加载失败文案：fetch 抛的是英文（Failed to fetch / AbortError），直接甩给用户等于没说。
+// 这里只做形态映射，不改错误语义（401 仍由全局事件让 App 停轮询）：
+//   5xx → 服务器错误；4xx → 请求被拒绝；网络断/服务没起 → 网络请求失败；abort → 超时。
+// 认不出的原样返回——后端自定义错误本来就是中文，不要二次包装。
+function loadErrorText (e) {
+  const raw = e && typeof e.message === 'string' ? e.message : String(e === undefined || e === null ? '' : e)
+  const http = /^HTTP (\d{3})$/.exec(raw)
+  if (http) {
+    const code = Number(http[1])
+    if (code >= 500) return `服务器错误（HTTP ${code}）`
+    if (code >= 400) return `请求被拒绝（HTTP ${code}）`
+    return `请求失败（HTTP ${code}）`
+  }
+  if (/Failed to fetch|NetworkError|Load failed|ERR_NETWORK|ERR_INTERNET_DISCONNECTED/i.test(raw)) {
+    return '网络请求失败（检查网络，或控制台服务是否在运行）'
+  }
+  if (/abort|响应体读取超时/i.test(raw)) return '请求超时（服务器 8 秒内没有响应）'
+  return raw === '' ? '未知错误' : raw
+}
+
 // 面板加载器公共骨架：data/err 状态 + load()（成功清错、失败写横幅）。
 // apiFn 由调用方用 useCallback/useMemo 固定引用，避免 effect 风暴。
 function usePanelLoader (apiFn, onLoaded, initialData = null) {
@@ -2514,7 +2563,7 @@ function usePanelLoader (apiFn, onLoaded, initialData = null) {
       return true
     } catch (e) {
       if (seq !== seqRef.current || !mountedRef.current) return false
-      setErr(`加载失败：${e.message}`)
+      setErr(`加载失败：${loadErrorText(e)}`)
       return false
     } finally {
       if (seq === seqRef.current && mountedRef.current) {
@@ -2526,9 +2575,11 @@ function usePanelLoader (apiFn, onLoaded, initialData = null) {
   return { data, err, load, loading, settleTick }
 }
 
-// 页签保活 + 首屏预加载：面板即使还没被点开（active=false）也先拉一次，
-// 刷新网页后第一次点页签时数据已经在手里，不会闪「加载中…」；之后离开不拉，
-// 再切回才补一次（active 由 false 变 true）。
+// 页签保活 + 首访懒加载：隐藏的页签只挂 DOM、不拉数据——第一次真正点开（active=true）
+// 才发第一份请求，之后离开不拉，再切回才补一次（active 由 false 变 true）。
+// 首屏停在推送记录页时，不再替概览/系统页预取 /api/trends、/api/run-history、
+// /api/access-log、/api/cache-health（旧版「先拉一遍，点开就有」要 17 个请求、71KB）。
+// 首帧空白由面板自己的骨架补（见 PanelSkeleton）。
 // queue=true 用于日志这种自带互斥的 loader（在飞时排队，而不是丢掉这次刷新）。
 function usePanelAutoLoad (active, load, { queue = false } = {}) {
   const seenRef = useRef(null)
@@ -2541,7 +2592,8 @@ function usePanelAutoLoad (active, load, { queue = false } = {}) {
     const loadChanged = loadRef.current !== load
     seenRef.current = active
     loadRef.current = load
-    if (!active && !first) return
+    // 懒加载：没进过这个页签就不发请求。
+    if (!active) return
     if (!first && !becameActive && !loadChanged) return
     // 首次点开时若预加载还在飞、或刚回来不到 3s，直接用手里的/路上的数据，
     // 不再发第二发把预加载响应顶掉（Sourcery #272）。更久才点开则补一次新鲜的。
@@ -2574,8 +2626,13 @@ function usePollReload (active, pollTick, fn) {
   const fnRef = useRef(fn)
   fnRef.current = fn
   const busyRef = useRef(false)
+  // 首访懒加载后，激活本页的第一份数据由 usePanelAutoLoad 负责；这里跳过「active 由
+  // false 变 true」那一拍，否则首访会同时打两个请求（面板 load + 轮询拍）。
+  const seenActiveRef = useRef(false)
   useEffect(() => {
-    if (!active || !(pollTick > 0) || busyRef.current) return
+    const justActivated = active && !seenActiveRef.current
+    seenActiveRef.current = active
+    if (!active || justActivated || !(pollTick > 0) || busyRef.current) return
     busyRef.current = true
     Promise.resolve()
       .then(() => fnRef.current())
@@ -2700,6 +2757,8 @@ function useSlowFlag (on, delay = 600) {
 // 趋势天数选择器固定选项（与服务端白名单 TREND_DAYS_ALLOWED 对齐；14 为默认省略参数）
 const TREND_DAYS = [14, 30, 60]
 
+// 近 14 日趋势（纯 CSS 条形图，零依赖）：一格=一天，高度按当日推送条数归一。
+// failed>0 的日子用红色渐变提示；0 推送的日子画灰色基线（看得见「没有数据」≠ 没画）。
 function TrendsPanel ({ active = true }) {
   const [days, setDays] = useState(TREND_DAYS[0])
   const [range, setRange] = useState(EMPTY_RANGE)
@@ -2793,8 +2852,8 @@ function TrendsPanel ({ active = true }) {
             ...TREND_DAYS.map((d) => ({ value: String(d), label: `${d} 日` }))
           ]}
           onChange=${(v) => { if (v === '__range') return; setRange(EMPTY_RANGE); setDays(Number(v)) }} />
-        <${DateRange} value=${range} label="趋势日期区间"
-          onChange=${(r) => setRange(r)} />
+        ${active && html`<${DateRange} value=${range} label="趋势日期区间"
+          onChange=${(r) => setRange(r)} />`}
       </div>`}
       sub=${'run.log 摘要按日聚合' + (trends && trends.truncated ? '（日志超限，仅统计尾部 1 MiB）' : '')}
       right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
@@ -2832,7 +2891,15 @@ function CacheHealthPanel ({ paused = false, active = true }) {
   // 右列状态文件（v3.307）：缓存健康面板原来只占左半 451px，右边 460px 空白；
   // 系统页的「缓存目录文件」在这里给一份紧凑版（前 8 项），整页仍保留全量清单。
   const filesLoader = usePanelLoader(apiGetFiles)
-  useEffect(() => { load().catch(() => {}); filesLoader.load().catch(() => {}) }, [load, filesLoader.load])
+  // 懒加载：概览页没点开过就不打 /api/cache-health 与 /api/files（首屏在别的页签时
+  // 这两条纯属浪费；60s 定时器与切回补拉仍在 active 后继续工作）。
+  const seededRef = useRef(false)
+  useEffect(() => {
+    if (!active || seededRef.current) return
+    seededRef.current = true
+    load().catch(() => {})
+    filesLoader.load().catch(() => {})
+  }, [active, load, filesLoader.load])
   // 缓存健康随概览常开：每分钟（且切回前台时）重拉一次，避免「页面开着过夜、mtime 早已更新
   // 但面板还拿着旧快照」；1 分钟一次只读小 JSON，不与 5s 主轮询抢盘。
   const wasPausedRef = useRef(paused)
@@ -3622,7 +3689,9 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
           setDays(Number(v))
           setPage(1)
         }} />
-      <${DateRange} value=${range} onChange=${(r) => { armLand(); setRange(r); setDays(0); setPage(1) }} />
+      ${/* 推送记录页未激活时不生成日期按钮（L4）：保活挂载的面板会在别的页留下
+           hidden 的 .date-btn 副本；range 由本组件 state 持有，切回照旧。 */ ''}
+      ${active && html`<${DateRange} value=${range} onChange=${(r) => { armLand(); setRange(r); setDays(0); setPage(1) }} />`}
       <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
         options=${[10, 20, 50, 100].map((n) => ({ value: String(n), label: `每页 ${n} 条` }))}
         onChange=${(v) => { armLand(); setSize(Number(v)); setPage(1) }} />
@@ -3630,10 +3699,10 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
     </div>
-    ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${err && html`<${LoadError} text=${err} busy=${loading} onRetry=${() => { load().catch(() => {}) }} />`}
     ${exportErr && html`<${Hint} tone="error">${exportErr}<//>`}
     ${exportNote && html`<${Hint}>${exportNote}<//>`}
-    ${loading && !data && html`<div class="empty">加载中…</div>`}
+    ${loading && !data && html`<${PanelSkeleton} label="正在加载推送记录" />`}
     ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<${Hint}>正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）<//>` : ''}</div>`}
     ${data && data.status === 'ok' && html`<div ref=${listRef}>
       <div class="msg-count" aria-live="polite">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}${slowLoading ? html`<span class="msg-loading"> · 更新中…</span>` : ''}</div>
@@ -4041,7 +4110,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
           <button type="button" key=${key} class=${'log-chip' + (mode === key ? ' on' : '')}
             aria-pressed=${mode === key ? 'true' : 'false'} onClick=${() => pickMode(key)}>${label} <span class="log-chip-n">${logReady ? n : '—'}</span></button>`)}
       </div>
-      <${DateRange} value=${logRange} onChange=${(r) => { stickRef.current = true; setFocusDismissed(true); setLogRange(r) }} />
+      ${active && html`<${DateRange} value=${logRange} onChange=${(r) => { stickRef.current = true; setFocusDismissed(true); setLogRange(r) }} />`}
       <input class="msg-search log-search" type="search" placeholder="搜索日志…" aria-label="搜索日志"
         value=${q} onInput=${(e) => { stickRef.current = true; setFocusDismissed(true); setQ(e.target.value) }} />
     </div>
@@ -4070,7 +4139,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
 
 // v3.342：控制台设置块（v3.340 在配置页，v3.342 搬到系统页「设置」）。
 // 一条读面 + 两个写面：通知自检拦截窗、顶栏时间是否显示年月日。读面失败只影响本块。
-function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved }) {
+function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, active = true }) {
   // 拦截窗草稿：输入框可自由键入，保存前统一校验（整数 0–3600）；用户正在改（dirty）时
   // 刷新回来的生效值不覆盖输入框，避免「改到一半被定时重拉吃掉」。
   const [winDraft, setWinDraft] = useState('')
@@ -4216,7 +4285,10 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
       <span class="cfg-block-title">通知自检</span>
       <span class="cfg-block-sub">重复提交拦截窗 · ${winSourceLabel}</span>
     </div>
-    <div class="auto-run-row">
+    ${/* 系统页未激活时不生成这一排工具条（L4 同 TriggerBar）：保活挂载的面板
+         不应在别的页留下 hidden 的 auto-run-row 副本；winDraft 等草稿由本组件
+         state 持有，切走再回来不会丢。 */ ''}
+    ${active && html`<div class="auto-run-row">
       <button type="button" class="auto-step" aria-label="减少" disabled=${winCurrent === null || winSaving}
         onPointerDown=${holdWin.start(-1)} onPointerUp=${holdWin.stop} onPointerLeave=${holdWin.stop}
         onPointerCancel=${holdWin.stop} onLostPointerCapture=${holdWin.stop}
@@ -4231,7 +4303,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
         onContextMenu=${holdWin.contextMenu} onClick=${holdWin.click(1)}>+</button>
       <${Button} variant="secondary" disabled=${winCurrent === null || winSaving} onClick=${saveWin}>保存<//>
       ${winSaved && html`<span class="cfg-block-sub" role="status" aria-live="polite">已保存 · 立即生效</span>`}
-    </div>
+    </div>`}
     <div class="cfg-text">${settingsPending
       ? '正在读取当前生效值…'
       : winCurrent === null
@@ -4694,11 +4766,12 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
   const pendingRef = useRef(false)
   const loadedAtRef = useRef(0)
   useEffect(() => {
-    const first = seenRef.current === null
     const becameActive = active && seenRef.current === false
     seenRef.current = active
-    if (!active && !first) return
-    // 首次点开时预加载还在飞/刚回来不到 3s，直接用预加载结果；更久才点开则补一次。
+    // 懒加载（同 usePanelAutoLoad）：系统页没点开过就不发这三条请求
+    // （/api/sys + /api/access-log + /api/config/console），首次进入才算首访。
+    if (!active) return
+    // 首次点开时上一发还在飞/刚回来不到 3s，直接用手里的数据；更久才点开则补一次。
     if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))) return
     if (pendingRef.current) return
     pendingRef.current = true
@@ -4768,7 +4841,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
       </tbody></table>
     </div>
     <div class="set-title">设置<span class="cfg-block-sub">改动立即生效 · 落盘 console-settings.json</span></div>
-    <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} />
+    <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} active=${active} />
     <${BackupBlock} onImported=${refreshAll} />
     <${TwoFactorBlock} />
     <${Hint} style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。<//>
@@ -6274,9 +6347,10 @@ function App () {
     document.addEventListener('visibilitychange', check)
     return () => { stopped = true; clearInterval(timer); document.removeEventListener('visibilitychange', check) }
   }, [authExpired])
-  // 首屏渲染完就把六个页签全部挂上（隐藏），让它们的数据先加载。这样刷新网页后
-  // 第一次点某个页签也只是切 hidden，而不是「现挂载 + 现请求」闪一下加载占位。
-  // 各面板的 active 门控保证隐藏期间不轮询；这里只承担一次首载。
+  // 首屏渲染完就把六个页签全部挂上（隐藏），但**不替它们拉数据**：各面板的
+  // usePanelAutoLoad / 自己的 active 门控负责「第一次点开才发第一份请求」。
+  // 只挂 DOM 的好处是切页只是 toggle hidden，不会「现挂载 + 现请求」闪一下；
+  // 数据请求数则从 17 个降到当前页 + 顶栏那几条（见 L4 首屏去重）。
   useEffect(() => {
     if (authExpired) return
     for (const t of TABS) markVisited(t.key)
@@ -7115,7 +7189,7 @@ function App () {
       <div>
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} err=${statusFailed} />
-      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} runs=${runs}
+      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} runs=${runs} active=${tab === 'overview'}
         auto=${{ on: autoOn, interval: autoState && Number.isInteger(autoState.interval) ? autoState.interval : AUTO_DEFAULT_S, runs: autoState && autoState.runs ? autoState.runs : 0, err: autoState && autoState.lastError ? autoState.lastError : '', nextAt: autoState && autoState.nextAt ? autoState.nextAt : 0, now: autoNow, start: startAuto, stop: stopAuto, save: saveAutoInterval }} />
       <${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'overview'} pollMs=${autoRefresh && tab === 'overview' ? pollMs : 0} onRefresh=${refreshSplit} />
       <${TrendsPanel} active=${tab === 'overview'} />
