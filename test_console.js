@@ -5467,6 +5467,12 @@ async function main () {
     assert.ok(src.includes("if (!autoOn || tab !== 'overview') return undefined"), '概览隐藏后倒计时时钟必须停')
     assert.ok(src.includes('paused=$' + "{!autoRefresh || tab !== 'overview'}"), '概览隐藏后缓存健康分钟轮询必须停')
     assert.ok(src.includes('if (openId === null || !active) return undefined'), '隐藏页的运行详情必须断开 SSE/轮询')
+    // 隐藏页不只不轮询，也不该生成工具条 DOM（L4）：保活面板切走后，
+    // date-btn / auto-run-row 会以 hidden 副本留在别的页面里，点击区与可检索文本都被污染。
+    assert.strictEqual((src.match(/active && html`<\$\{DateRange\}/g) || []).length, 4,
+      '四处 DateRange 都必须按 active 条件渲染（非活动面板不生成 date-btn）')
+    assert.strictEqual((src.match(/active && html`<div class="auto-run-row">/g) || []).length, 2,
+      '两处 auto-run-row（概览自动运行 / 系统页拦截窗）都必须按 active 条件渲染')
     // 只读页切回静默刷新；带草稿的过滤规则页不得重拉覆盖。
     assert.ok(src.includes('<$' + '{MessagesPanel} active=$' + "{tab === 'messages'}"), '推送记录页切回时必须静默刷新')
     assert.ok(src.includes('active=$' + "{tab === 'logs'}"), '日志页切回时必须静默刷新')

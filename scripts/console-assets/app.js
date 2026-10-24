@@ -1613,7 +1613,7 @@ function triggerResultLine (trig, run) {
   }
 }
 
-function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
+function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = true }) {
   const [err, setErr] = useState('')
   // 最近一次「提交成功」的触发（202 那一刻记下 id/label/at）；结果由 runs 结算。
   const [lastTrigger, setLastTrigger] = useState(null)
@@ -1780,7 +1780,10 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
         <span class="auto-run-tag">服务器调度</span>
         ${auto.on && html`<span class="auto-run-live">运行中</span>`}
       </div>
-      <div class="auto-run-row">
+      ${/* 隐藏页签不生成工具条 DOM（L4）：概览保活挂载时，这一排 date-btn/auto-run-row
+           会以 hidden 副本留在其它页的 DOM 里；只在 active 时渲染，切走即移除，
+           草稿/按住加减等状态都由组件 state 保留，切回不会丢。 */ ''}
+      ${active && html`<div class="auto-run-row">
         <button type="button" class="auto-step" aria-label="减少间隔"
           onPointerDown=${holdAuto.start(-1)} onPointerUp=${holdAuto.stop} onPointerLeave=${holdAuto.stop}
           onPointerCancel=${holdAuto.stop} onLostPointerCapture=${holdAuto.stop}
@@ -1796,7 +1799,7 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
         ${auto.on
           ? html`<${Button} variant="danger" onClick=${stopAuto}>停止<//>`
           : html`<${Button} variant="danger-solid" onClick=${askAuto}>开始<//>`}
-      </div>
+      </div>`}
       <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒（输入框已锁，长按加减可快速调整）；由服务器常驻运行，关闭页面、切后台、锁屏都不影响，点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次会自动停止。</div>
       ${auto.on && html`<div class="auto-run-status">${auto.nextAt > 0 ? `下一轮 ${Math.max(0, Math.ceil((auto.nextAt - auto.now) / 1000))} 秒` : '本轮进行中'} · 已自动运行 ${auto.runs} 轮</div>`}
       ${!auto.on && html`<div class="auto-run-status">${autoSaved ? '间隔已保存' : ''}</div>`}
@@ -2431,7 +2434,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
           aria-busy=${pendingMode === 'issue' && pendingBusy ? 'true' : 'false'}
           aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => changeMode('issue')}>${mode === 'runs' || issueCount === null ? '只看异常' : `只看异常 ${issueCount}`}</button>
       </div>
-      <${DateRange} value=${runRange} onChange=${changeDay} label="按日期筛选轮次" />
+      ${active && html`<${DateRange} value=${runRange} onChange=${changeDay} label="按日期筛选轮次" />`}
       <span class="run-tools-note">${mode === 'issue' ? '只显示失败、中断或取消的轮次' : (mode === 'runs' ? '不显示取消留痕；切「全部」可查' : '点行尾「日志」跳到该日日志')}</span>
     </div>`}
     ${data && data.status && data.status !== 'ok' && html`<div class="empty">run.log${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
@@ -2814,8 +2817,8 @@ function TrendsPanel ({ active = true }) {
             ...TREND_DAYS.map((d) => ({ value: String(d), label: `${d} 日` }))
           ]}
           onChange=${(v) => { if (v === '__range') return; setRange(EMPTY_RANGE); setDays(Number(v)) }} />
-        <${DateRange} value=${range} label="趋势日期区间"
-          onChange=${(r) => setRange(r)} />
+        ${active && html`<${DateRange} value=${range} label="趋势日期区间"
+          onChange=${(r) => setRange(r)} />`}
       </div>`}
       sub=${'run.log 摘要按日聚合' + (trends && trends.truncated ? '（日志超限，仅统计尾部 1 MiB）' : '')}
       right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
@@ -3531,7 +3534,9 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
           setDays(Number(v))
           setPage(1)
         }} />
-      <${DateRange} value=${range} onChange=${(r) => { armLand(); setRange(r); setDays(0); setPage(1) }} />
+      ${/* 推送记录页未激活时不生成日期按钮（L4）：保活挂载的面板会在别的页留下
+           hidden 的 .date-btn 副本；range 由本组件 state 持有，切回照旧。 */ ''}
+      ${active && html`<${DateRange} value=${range} onChange=${(r) => { armLand(); setRange(r); setDays(0); setPage(1) }} />`}
       <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
         options=${[10, 20, 50, 100].map((n) => ({ value: String(n), label: `每页 ${n} 条` }))}
         onChange=${(v) => { armLand(); setSize(Number(v)); setPage(1) }} />
@@ -3940,7 +3945,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
           <button type="button" key=${key} class=${'log-chip' + (mode === key ? ' on' : '')}
             aria-pressed=${mode === key ? 'true' : 'false'} onClick=${() => pickMode(key)}>${label} <span class="log-chip-n">${logReady ? n : '—'}</span></button>`)}
       </div>
-      <${DateRange} value=${logRange} onChange=${(r) => { stickRef.current = true; setFocusDismissed(true); setLogRange(r) }} />
+      ${active && html`<${DateRange} value=${logRange} onChange=${(r) => { stickRef.current = true; setFocusDismissed(true); setLogRange(r) }} />`}
       <input class="msg-search log-search" type="search" placeholder="搜索日志…" aria-label="搜索日志"
         value=${q} onInput=${(e) => { stickRef.current = true; setFocusDismissed(true); setQ(e.target.value) }} />
     </div>
@@ -3969,7 +3974,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
 
 // v3.342：控制台设置块（v3.340 在配置页，v3.342 搬到系统页「设置」）。
 // 一条读面 + 两个写面：通知自检拦截窗、顶栏时间是否显示年月日。读面失败只影响本块。
-function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved }) {
+function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, active = true }) {
   // 拦截窗草稿：输入框可自由键入，保存前统一校验（整数 0–3600）；用户正在改（dirty）时
   // 刷新回来的生效值不覆盖输入框，避免「改到一半被定时重拉吃掉」。
   const [winDraft, setWinDraft] = useState('')
@@ -4115,7 +4120,10 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
       <span class="cfg-block-title">通知自检</span>
       <span class="cfg-block-sub">重复提交拦截窗 · ${winSourceLabel}</span>
     </div>
-    <div class="auto-run-row">
+    ${/* 系统页未激活时不生成这一排工具条（L4 同 TriggerBar）：保活挂载的面板
+         不应在别的页留下 hidden 的 auto-run-row 副本；winDraft 等草稿由本组件
+         state 持有，切走再回来不会丢。 */ ''}
+    ${active && html`<div class="auto-run-row">
       <button type="button" class="auto-step" aria-label="减少" disabled=${winCurrent === null || winSaving}
         onPointerDown=${holdWin.start(-1)} onPointerUp=${holdWin.stop} onPointerLeave=${holdWin.stop}
         onPointerCancel=${holdWin.stop} onLostPointerCapture=${holdWin.stop}
@@ -4130,7 +4138,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
         onContextMenu=${holdWin.contextMenu} onClick=${holdWin.click(1)}>+</button>
       <${Button} variant="secondary" disabled=${winCurrent === null || winSaving} onClick=${saveWin}>保存<//>
       ${winSaved && html`<span class="cfg-block-sub" role="status" aria-live="polite">已保存 · 立即生效</span>`}
-    </div>
+    </div>`}
     <div class="cfg-text">${settingsPending
       ? '正在读取当前生效值…'
       : winCurrent === null
@@ -4668,7 +4676,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
       </tbody></table>
     </div>
     <div class="set-title">设置<span class="cfg-block-sub">改动立即生效 · 落盘 console-settings.json</span></div>
-    <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} />
+    <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} active=${active} />
     <${BackupBlock} onImported=${refreshAll} />
     <${TwoFactorBlock} />
     <${Hint} style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。<//>
@@ -6972,7 +6980,7 @@ function App () {
       <div>
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} err=${statusFailed} />
-      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} runs=${runs}
+      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} runs=${runs} active=${tab === 'overview'}
         auto=${{ on: autoOn, interval: autoState && Number.isInteger(autoState.interval) ? autoState.interval : AUTO_DEFAULT_S, runs: autoState && autoState.runs ? autoState.runs : 0, err: autoState && autoState.lastError ? autoState.lastError : '', nextAt: autoState && autoState.nextAt ? autoState.nextAt : 0, now: autoNow, start: startAuto, stop: stopAuto, save: saveAutoInterval }} />
       <${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'overview'} pollMs=${autoRefresh && tab === 'overview' ? pollMs : 0} onRefresh=${refreshSplit} />
       <${TrendsPanel} active=${tab === 'overview'} />
