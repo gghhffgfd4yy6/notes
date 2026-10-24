@@ -289,42 +289,55 @@ jobs:
           # ⇒ 整段 ≈ 1290min、远超 step 330min 上限。按上限倒推取 9 片（末片 849 行实测 >330min 被杀，再对半：
           # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5363，末两片约 430 / 563 行 ≈100-170min，仍在 330min 内）。
           # 行段连续不重叠全覆盖（check-mutation-ranges 校验）；段名与 mutation-report EXPECTED_SEGMENTS 双向对账。
+          # `timeout_ms: 60000`（仅这 9 段）：单次变异体运行的等待上限从配置文件的 300000ms 降到 60000ms。
+          #   60s 的依据：test_console.js 全量 ≈21s ⇒ 上限 ≈1.5×21+60 = 91s（原 ≈331s），而 313 个 Timeout
+          #   累计 235min 正是「挂死等满 300s 偏移」造成的。它只经 CLI `--timeoutMS` 生效（见「变异测试」
+          #   step 的注释：不进缓存身份、不改判据），其余段不设此字段 ⇒ 表达式回落 300000。
           - name: console-part1
             src: "scripts/console.js"
             mutate: "scripts/console.js:1-650"
             config: "stryker.tap.config.js"
+            timeout_ms: 60000
           - name: console-part2
             src: "scripts/console.js"
             mutate: "scripts/console.js:651-1300"
             config: "stryker.tap.config.js"
+            timeout_ms: 60000
           - name: console-part3
             src: "scripts/console.js"
             mutate: "scripts/console.js:1301-1950"
             config: "stryker.tap.config.js"
+            timeout_ms: 60000
           - name: console-part4
             src: "scripts/console.js"
             mutate: "scripts/console.js:1951-2600"
             config: "stryker.tap.config.js"
+            timeout_ms: 60000
           - name: console-part5
             src: "scripts/console.js"
             mutate: "scripts/console.js:2601-3250"
             config: "stryker.tap.config.js"
+            timeout_ms: 60000
           - name: console-part6
             src: "scripts/console.js"
             mutate: "scripts/console.js:3251-3675"
             config: "stryker.tap.config.js"
+            timeout_ms: 60000
           - name: console-part7
             src: "scripts/console.js"
             mutate: "scripts/console.js:3676-4370"
             config: "stryker.tap.config.js"
+            timeout_ms: 60000
           - name: console-part8
             src: "scripts/console.js"
             mutate: "scripts/console.js:4371-4800"
             config: "stryker.tap.config.js"
+            timeout_ms: 60000
           - name: console-part9
             src: "scripts/console.js"
             mutate: "scripts/console.js:4801-5363"
             config: "stryker.tap.config.js"
+            timeout_ms: 60000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -528,7 +541,7 @@ jobs:
       # Stryker 10 的 configFile 是**位置参数**（没有 --configFile 选项），故它写在 npx stryker run 之后。
       - name: 变异测试（${{ matrix.name }}）
         timeout-minutes: 330
-        run: npx stryker run ${{ matrix.config }} --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 8 --fileLogLevel info
+        run: npx stryker run ${{ matrix.config }} --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 8 --fileLogLevel info --timeoutMS ${{ matrix.timeout_ms || 300000 }}
         env:
           PERF_MS: 3000   # 宽松性能阈值（插桩开销）
           # TAP 档下由 tap-runner 逐文件 spawn 测试进程、**不再**由 commandRunner 反复 spawn
@@ -538,6 +551,17 @@ jobs:
           # 约 656 次即被截断）。该变量的语义即「已在变异运行内」，同时被 run_mutation.js 与
           # test_run_mutation_cli.js 复用。
           XBK_MUTATION_CHILD: '1'
+
+      # --timeoutMS（逐段覆盖单次等待上限）：取矩阵的 `timeout_ms`，缺省 300000（= stryker.config.js 的值）。
+      #   为什么走 CLI 而不是改配置文件：stryker core 的 config-reader 是 deepMerge(options, cliOptions)
+      #   ⇒ CLI 覆盖配置文件；而「恢复增量缓存」的 key 只 hash 配置文件（stryker.config.js /
+      #   stryker.tap.config.js / scripts/tap-shim.js）⇒ 走 CLI**不进缓存身份**、不需要一次性全量重跑。
+      #   目前只有 console-part1..9 设了 `timeout_ms: 60000`：单个变异体的等待上限 =
+      #   netTimeMs × timeoutFactor + timeoutMS + overhead ⇒ 实测 test_console.js 全量 ≈21s，
+      #   60s 给出的上限 ≈ 1.5×21 + 60 = 91s（原 300000ms 时 ≈331s，313 个超时累计吃掉了 235min）。
+      #   判据不变：Timeout 仍计入 detected（日报口径 (killed+timeout)/total 一字不改），
+      #   故「上限调低 ⇒ 慢而通过的变异体可能被记成 Timeout ⇒ 分数虚高」这条风险由日报的
+      #   `真挂死` / `上限触发` 两列 + `超时上限` 列盯住（取证见守卫 step 的 timeout-stats.json）。
 
       # 诊断（仅失败时）：tap 档 dry run 的测试输出只写进 stryker.log，job 日志里只有
       # 「test_console.js # exit code 1」——没有这段就无法定位是哪条断言红了（2026-10-17 实测）。
@@ -567,6 +591,9 @@ jobs:
       #   本守卫的判据、位置、fail-closed 语义一字未改。
       # 放在 stryker 之后、上传 artifact 之前，且带 if: always()：stryker 失败/超时时也要判一遍；
       # 它红不会吞掉报告留档（「上传变异报告」仍是 if: always()），与「门禁红而日报照发」同一考虑。
+      # 附带产出（不影响退出码）：守卫会在 reports/mutation/timeout-stats.json 落盘本段 Timeout 的
+      #   hang / hitLimit / other 分类——**必须在剥离 statusReason 之前**取（剥离后 reason 全是空串，
+      #   两类再也分不开）。该文件随 artifact 到汇总 job，日报的 `真挂死` / `上限触发` 两列据此渲染。
       - name: 变异报告 fail-closed 守卫（${{ matrix.name }}）
         if: always()
         run: node scripts/mutation-guard.js --segment "${{ matrix.name }}" reports/mutation/mutation.json

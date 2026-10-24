@@ -890,3 +890,9 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 退场统一走 `closeDialog()`：动画播完才回调卸载；回调仍读 `onCancelRef` 最新值（busy 守卫不被旧闭包绕过），结构红线同步改成新写法。
 - 幅度上调一档：切页 220ms、卡片位移 18px / 步进 48ms、弹窗兜底 `scale(.9)`、校验抖动 ±4px。上一版 6–12px 的位移在手机上几乎看不出来。
 - 控制台套件 245/0。
+## v3.362 — 变异超时治理
+
+- 控制台变异段不再「跑完了不退出」：`test_console.js` 在 `listen()` 单点登记 server/socket、`ok()/aok()` 在 finally 统一收尾，并给每条用例 15s 看门狗（超时记失败、继续下一条）。此前断言提前失败会跳过用例最后一行 `server.close()`，监听句柄钉住事件循环、进程打印完汇总仍不退出，被 Stryker 判 Timeout（part8 单段 313 个，console 9 段合计约 18h 空等）。
+- console 9 段单次等待上限 300s → 60s：矩阵加 `timeout_ms` 字段、由 `--timeoutMS` CLI 覆盖配置文件（不改配置指纹、不需要一次性全量重跑），其余 20 段仍 300s。
+- 日报新增 `真挂死` / `上限触发` / `超时上限` 三列：段 job 的 fail-closed 守卫在剥离 statusReason 之前落盘 `timeout-stats.json`，把 Timeout 分成「无 reason 的真挂死」与「tap-runner 的 `Hit limit reached` 上限触发」；缺失或与报告对不上显示 `—`，不得读作 0。分数口径不变（Timeout 仍计入 detected）。
+- 测试：`test_mutation_report.js` 94/94、`test_mutation_json.js` 24 项、`test_mutation_report_cli.js`、`test_mutation_ranges.js` 通过；`test_ci_skip_suites.js` 新增矩阵/run 行门禁（该套件本机的既有环境性失败与本次改动无关）；控制台套件 241/0。
