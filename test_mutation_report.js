@@ -15,7 +15,9 @@ const {
   REUSE_MODE_FULL, REUSE_MODE_PARTIAL, REUSE_MODE_UNKNOWN, HIGH_REUSE_RATIO,
   CACHE_HIT_PRIMARY, CACHE_HIT_FALLBACK, CACHE_HIT_NONE, mapCacheHitArg, normalizeCacheHitField,
   coveredScore, coveredDenominator, formatCovered, NO_COVERAGE_PLACEHOLDER,
-  parseMatrixRunnerConfigs, readMatrixRunnerConfigs, formatSegmentLabel, scoreOf, COMMAND_RUNNER_CONFIG, COMMAND_SEGMENT_MARK
+  parseMatrixRunnerConfigs, readMatrixRunnerConfigs, formatSegmentLabel, scoreOf, COMMAND_RUNNER_CONFIG, COMMAND_SEGMENT_MARK,
+  parseMatrixTimeouts, readMatrixTimeouts, readTimeoutStats, formatTimeoutLimit, timeoutKindCell, formatTimeoutCell,
+  DEFAULT_SEGMENT_TIMEOUT_MS, TIMEOUT_STATS_FILENAME, EXPECTED_SEGMENTS
 } = require('./scripts/mutation-report.js')
 
 // CodeQL js/file-system-race（本仓库必需检查）：同一路径「先 statSync 检查、再 readFileSync 使用」是
@@ -57,6 +59,9 @@ const FIXTURE = [
     noCoverage: 2,
     timeout: 6,
     score: 70,
+    // 本 PR 新增列：生效上限（矩阵 timeout_ms）+ Timeout 两类取证（守卫落盘的 timeout-stats.json）
+    timeoutMs: 300000,
+    timeoutStats: { total: 6, hang: 2, hitLimit: 4, other: 0 },
     survivedMutants: [
       { file: 'src/a.js', line: 10, mutator: 'BinaryExpression', replacement: 'a + b' },
       { file: 'src/a.js', line: 20, mutator: 'Block', replacement: 'foo()' },
@@ -73,6 +78,7 @@ const FIXTURE = [
     noCoverage: 0,
     timeout: 0,
     score: 100,
+    timeoutMs: 60000,
     survivedMutants: []
   }
 ]
@@ -86,6 +92,7 @@ const EMPTY_CASE = [
     noCoverage: 0,
     timeout: 0,
     score: 100,
+    timeoutMs: 300000,
     survivedMutants: []
   }
 ]
@@ -104,18 +111,23 @@ function check (name, fn) {
 check('render 输出快照（含 error 段 + 正常段 + 全被杀段）', () => {
   const expected = '## 🧬 变异测试日报\n' +
 '\n' +
-'| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | covered 口径 | 复用 |\n' +
-'|---|---|---|---|---|---|---|---|---|\n' +
-'| part2 | 20 | 8 | 6 | 4 | 2 | 70% | 77.78% | 未记录 |\n' +
-'| part3-broken | ❌ 缺 mutation-report.json | - | - | - | - | - | - | - |\n' +
-'| part4-all-killed | 5 | 5 | 0 | 0 | 0 | 100% | 100% | 未记录 |\n' +
-'| **合计** | **25** | **13** | **6** | **4** | **2** | **76%** | **82.61%** | **0 段复用** |\n' +
+'| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | covered 口径 | 复用 | 真挂死 | 上限触发 | 超时上限 |\n' +
+'|---|---|---|---|---|---|---|---|---|---|---|---|\n' +
+'| part2 | 20 | 8 | 6 | 4 | 2 | 70% | 77.78% | 未记录 | 2 | 4 | 300s |\n' +
+'| part3-broken | ❌ 缺 mutation-report.json | - | - | - | - | - | - | - | - | - | - |\n' +
+'| part4-all-killed | 5 | 5 | 0 | 0 | 0 | 100% | 100% | 未记录 | 0 | 0 | 60s |\n' +
+'| **合计** | **25** | **13** | **6** | **4** | **2** | **76%** | **82.61%** | **0 段复用** | **2** | **4** | **—** |\n' +
 '\n' +
 // PR-1 双口径：表下必须给出「两列为何不同」的口径说明（NoCoverage > 0 ⇒ covered 剔除该段 NoCoverage）。
 '> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 **且存活 > 0** 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
+// 本 PR：Timeout 计入 detected 这句必须留在分数口径说明里（改的是等待上限，不是判据）。
+'> **`Timeout` 计入 detected**（`分数` 分子含 timeout）：本改只降低 console 段的**单次等待上限**（见 `超时上限` 列），**不改判据**——上限调低后，「慢但通过」的变异体可能被记为 Timeout 而算作已检出，故 `真挂死` / `上限触发` 两列必须与 `分数` 一起读。\n' +
 // 审查 A2 · F-2：夹具没带 runnerConfig ⇒ 走**通用**的 command 档说明（不带段名/计数），
 // 但这句话本身不得省略——「runner 看不见覆盖」必须在表下显式声明，否则新列会被读成「不存在未覆盖」。
 '> ⚠️ **command 档段（`coverageAnalysis:\'off\'`）的 `无覆盖` 恒为 0 是 runner 语义，不代表已全部覆盖**：这类段的 `covered 口径` 必然等于 `分数`，与 TAP 档段**不同口径**，**跨段比较必须排除**。\n' +
+'\n' +
+'> **超时三类**：`真挂死` = Timeout 且 statusReason 为空（TimeoutDecorator 杀掉，变异体跑不动）；`上限触发` = Timeout 且 statusReason 以 `Hit limit reached` 开头（tap-runner 的命中上限 `(n/m)`）；其余非空 reason 归第三类 `其他超时`（不在两列里，只在 `超时` 格括号内注明）。取证 = 段 job 的 fail-closed 守卫在**剥离 statusReason 之前**落盘的 `timeout-stats.json`（随 artifact 到汇总 job）；`—` = 该段**有 Timeout 但没有可用取证**（文件缺失/非法/与报告计数不符），**不得读作 0**。\n' +
+'> **本段生效 timeoutMS**（`超时上限` 列）= `mutation.yml` 矩阵的 `timeout_ms`，经 CLI `--timeoutMS` 覆盖配置文件的 300000ms；它只改单次等待上限，**不进缓存身份**、**不改分数口径**。本次矩阵取值：`300s`、`60s`（缺省 `300s`）。\n' +
 '\n' +
 // PR #158 Qodo Medium / Correctness：夹具没带 reuse 元信息 ⇒ 必须走「没有任何段的复用状态记录」分支。
 // 这一段不能省：省掉之后「没记录」与「没复用」在日报里长得完全一样，正是 Qodo 指出的缺陷本身。
@@ -156,15 +168,20 @@ check('render 输出快照（含 error 段 + 正常段 + 全被杀段）', () =>
 check('render 输出快照（全被杀 → 🎉 无存活变异体分支）', () => {
   const expected = '## 🧬 变异测试日报\n' +
 '\n' +
-'| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | covered 口径 | 复用 |\n' +
-'|---|---|---|---|---|---|---|---|---|\n' +
-'| clean | 3 | 3 | 0 | 0 | 0 | 100% | 100% | 未记录 |\n' +
-'| **合计** | **3** | **3** | **0** | **0** | **0** | **100%** | **100%** | **0 段复用** |\n' +
+'| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | covered 口径 | 复用 | 真挂死 | 上限触发 | 超时上限 |\n' +
+'|---|---|---|---|---|---|---|---|---|---|---|---|\n' +
+'| clean | 3 | 3 | 0 | 0 | 0 | 100% | 100% | 未记录 | 0 | 0 | 300s |\n' +
+'| **合计** | **3** | **3** | **0** | **0** | **0** | **100%** | **100%** | **0 段复用** | **0** | **0** | **—** |\n' +
 '\n' +
 '> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 **且存活 > 0** 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
+// 本 PR：Timeout 计入 detected 这句必须留在分数口径说明里（改的是等待上限，不是判据）。
+'> **`Timeout` 计入 detected**（`分数` 分子含 timeout）：本改只降低 console 段的**单次等待上限**（见 `超时上限` 列），**不改判据**——上限调低后，「慢但通过」的变异体可能被记为 Timeout 而算作已检出，故 `真挂死` / `上限触发` 两列必须与 `分数` 一起读。\n' +
 // 审查 A2 · F-2：夹具没带 runnerConfig ⇒ 走**通用**的 command 档说明（不带段名/计数），
 // 但这句话本身不得省略——「runner 看不见覆盖」必须在表下显式声明，否则新列会被读成「不存在未覆盖」。
 '> ⚠️ **command 档段（`coverageAnalysis:\'off\'`）的 `无覆盖` 恒为 0 是 runner 语义，不代表已全部覆盖**：这类段的 `covered 口径` 必然等于 `分数`，与 TAP 档段**不同口径**，**跨段比较必须排除**。\n' +
+'\n' +
+'> **超时三类**：`真挂死` = Timeout 且 statusReason 为空（TimeoutDecorator 杀掉，变异体跑不动）；`上限触发` = Timeout 且 statusReason 以 `Hit limit reached` 开头（tap-runner 的命中上限 `(n/m)`）；其余非空 reason 归第三类 `其他超时`（不在两列里，只在 `超时` 格括号内注明）。取证 = 段 job 的 fail-closed 守卫在**剥离 statusReason 之前**落盘的 `timeout-stats.json`（随 artifact 到汇总 job）；`—` = 该段**有 Timeout 但没有可用取证**（文件缺失/非法/与报告计数不符），**不得读作 0**。\n' +
+'> **本段生效 timeoutMS**（`超时上限` 列）= `mutation.yml` 矩阵的 `timeout_ms`，经 CLI `--timeoutMS` 覆盖配置文件的 300000ms；它只改单次等待上限，**不进缓存身份**、**不改分数口径**。本次矩阵取值：`300s`（缺省 `300s`）。\n' +
 '\n' +
 '## ♻️ 复用状态（结果是否对应当前测试状态）\n' +
 '\n' +
@@ -489,7 +506,9 @@ check('render：口径不符**不改变**任何分数/统计口径（与只加�
     { seg: 'utils', total: 2, killed: 2, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [] }
   ]
   const withMismatch = base.map((r, i) => ({ ...r, reuse: i === 0 ? { mode: REUSE_MODE_PARTIAL, reused: 6, total: 6, ratio: 1, high: true } : { mode: REUSE_MODE_FULL } }))
-  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+|全量(?:\(口径不符\))?) \|$/, ' |')
+  // 只摘掉 `复用` 单元格（按内容锚定），不摘后面的新增列：`$` 行尾锚点已去掉——
+  // `真挂死/上限触发/超时上限` 三列追加在 `复用` 之后，行尾不再是复用列。
+  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|/, ' |')
   const a = render(base)
   const b = render(withMismatch)
   assert.strictEqual(rowOf(a, 'app'), rowOf(b, 'app'), '分数行不得因口径不符而变化')
@@ -504,7 +523,9 @@ check('render：复用元信息**不改变**任何分数/统计口径（只多�
   ]
   const withReuse = base.map((r, i) => ({ ...r, reuse: i === 0 ? { mode: REUSE_MODE_PARTIAL, reused: 100, total: 100, ratio: 1, high: true } : { mode: REUSE_MODE_FULL } }))
   // 分数行与合计行必须逐字相同（本 PR 明确不改 (killed+timeout)/total 口径）
-  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+|全量(?:\(口径不符\))?) \|$/, ' |')
+  // 只摘掉 `复用` 单元格（按内容锚定），不摘后面的新增列：`$` 行尾锚点已去掉——
+  // `真挂死/上限触发/超时上限` 三列追加在 `复用` 之后，行尾不再是复用列。
+  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|/, ' |')
   const a = render(base)
   const b = render(withReuse)
   assert.strictEqual(rowOf(a, 'app'), rowOf(b, 'app'), '同一统计下分数行必须一致（复用只增加标注）')
@@ -708,7 +729,7 @@ check('render 溯源三态 · cacheHit 不改变任何分数/统计口径（只�
   })
   const base = [seg('app'), seg('utils', CACHE_HIT_PRIMARY)]
   const withFallback = [seg('app', CACHE_HIT_FALLBACK), seg('utils', CACHE_HIT_PRIMARY)]
-  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|$/, ' |')
+  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|/, ' |')
   const a = render(base)
   const b = render(withFallback)
   // 方向一：数字列/合计行逐字相同（cacheHit **泄漏进统计** ⇒ 这里红）
@@ -1918,6 +1939,283 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     assert.ok(listRes.capturedOpts.signal instanceof AbortSignal,
       '列表查询必须带 AbortSignal 超时（无超时会让日报 job 无限等待）')
     assert.strictEqual(createRes.capturedOpts.signal, undefined, '发 Issue 请求不应被列表查询的超时信号绑住')
+  })
+
+  // ===== 本段生效 timeoutMS + Timeout 两类（console 段 60s）====================================
+  // 背景：console 9 段在 mutation.yml 矩阵里带 `timeout_ms: 60000`，由「变异测试」step 经 CLI
+  // `--timeoutMS` 覆盖配置（缓存 key 不含该值 ⇒ 不需要一次性全量重跑）。日报必须同时展示：
+  //   ① 该段**生效**的等待上限（缺省 300000）；② Timeout 的成因两类（真挂死 / 上限触发）——
+  //   后者来自段 job 守卫在剥离 statusReason 之前落盘的 timeout-stats.json。
+  // 判据不变：分数仍是 (killed+timeout)/total（Timeout 计入 detected）⇒ 下列用例锁死「只加可见性、不改数值」。
+  check('parseMatrixTimeouts：真实矩阵 ⇒ console 9 段 60000、其余缺省 300000（不新增第二份硬编码清单）', () => {
+    const text = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'mutation.yml'), 'utf8')
+    const map = parseMatrixTimeouts(text)
+    for (let i = 1; i <= 9; i++) {
+      assert.strictEqual(map.get(`console-part${i}`), 60000, `console-part${i} 必须显式 60000（否则又等满 300s 偏移）`)
+    }
+    assert.strictEqual(map.get('v3-entry'), DEFAULT_SEGMENT_TIMEOUT_MS,
+      '未声明 timeout_ms 的段必须回落 300000（与 GitHub 表达式 matrix.timeout_ms || 300000 同口径）')
+    assert.strictEqual(map.get('sendnotify-part2'), DEFAULT_SEGMENT_TIMEOUT_MS, '其余段一律缺省 300000')
+    assert.strictEqual(map.size, EXPECTED_SEGMENTS.length,
+      '矩阵每段都必须解析出 timeoutMS（段数须与 EXPECTED_SEGMENTS 一致，否则有段不被覆盖）')
+    assert.strictEqual(readMatrixTimeouts().get('console-part1'), 60000, 'readMatrixTimeouts 默认读仓库内 mutation.yml')
+    assert.strictEqual(readMatrixTimeouts('/no/such/mutation.yml').size, 0, '矩阵不可读 ⇒ 空 Map（日报显示 —，不猜）')
+  })
+
+  check('parseMatrixTimeouts：缺字段/非法值/注释/引号/无 include 的边界（永不抛）', () => {
+    const ymlText = [
+      'jobs:',
+      '  m:',
+      '    strategy:',
+      '      matrix:',
+      '        include:',
+      '          # timeout_ms: 1  ← 注释不是证据',
+      '          - name: a',
+      '            config: "stryker.config.js"',
+      '          - name: b',
+      '            config: "stryker.tap.config.js"',
+      '            timeout_ms: "60000"',
+      '          - name: c',
+      '            config: "stryker.tap.config.js"',
+      '            timeout_ms: 0',
+      '          - name: d',
+      '            config: "stryker.tap.config.js"',
+      '            timeout_ms: abc',
+      '    steps:',
+      '      - run: echo hi'
+    ].join('\n')
+    const map = parseMatrixTimeouts(ymlText)
+    assert.strictEqual(map.get('a'), DEFAULT_SEGMENT_TIMEOUT_MS, '缺 timeout_ms ⇒ 300000')
+    assert.strictEqual(map.get('b'), 60000, '引号包裹的数字同样解析')
+    assert.strictEqual(map.get('c'), DEFAULT_SEGMENT_TIMEOUT_MS, '0 不是有效上限 ⇒ 回落 300000（不把 0 当有效值）')
+    assert.strictEqual(map.get('d'), DEFAULT_SEGMENT_TIMEOUT_MS, '非数字 ⇒ 回落 300000，不产出 NaN')
+    assert.strictEqual(map.size, 4, '注释里的 timeout_ms 不得凭空造出条目')
+    assert.strictEqual(parseMatrixTimeouts('').size, 0, '空文本 ⇒ 空 Map')
+    assert.strictEqual(parseMatrixTimeouts('jobs:\n  m:\n    timeout_ms: 60000').size, 0, '没有 include 块 ⇒ 空 Map（不误读别的 timeout_ms）')
+  })
+
+  check('formatTimeoutLimit / timeoutKindCell / formatTimeoutCell：毫秒→秒；缺数据一律占位符（不静默当 0）', () => {
+    assert.strictEqual(formatTimeoutLimit(300000), '300s', '缺省 300000ms ⇒ 300s')
+    assert.strictEqual(formatTimeoutLimit(60000), '60s', 'console 段 ⇒ 60s')
+    assert.strictEqual(formatTimeoutLimit(undefined), NO_COVERAGE_PLACEHOLDER, '矩阵读不到 ⇒ —')
+    assert.strictEqual(formatTimeoutLimit(0), NO_COVERAGE_PLACEHOLDER, '非法上限 ⇒ —（不显示 0s）')
+    assert.strictEqual(timeoutKindCell({ timeout: 0 }, 'hang'), '0', 'timeout=0 ⇒ 0（报告本身即可证明，不需要取证）')
+    assert.strictEqual(timeoutKindCell({ timeout: 3 }, 'hang'), NO_COVERAGE_PLACEHOLDER, '有 Timeout 无取证 ⇒ —（不得读成 0 个真挂死）')
+    assert.strictEqual(timeoutKindCell({ timeout: 3, timeoutStats: { total: 3, hang: 1, hitLimit: 2, other: 0 } }, 'hitLimit'), '2', '有取证 ⇒ 实数')
+    // `超时` 格：默认纯数字（既有文本一字不改），只有第三类 other > 0 时才追加注明
+    assert.strictEqual(formatTimeoutCell({ timeout: 6, timeoutStats: { total: 6, hang: 2, hitLimit: 4, other: 0 } }), '6',
+      'other = 0 ⇒ 纯数字（现有日报格文本不得漂移）')
+    assert.strictEqual(formatTimeoutCell({ timeout: 6, timeoutStats: { total: 6, hang: 2, hitLimit: 2, other: 2 } }), '6（其他超时 2）',
+      'other > 0 ⇒ 注明第三类数量（否则 hang + hitLimit 与总数对不上账）')
+    assert.strictEqual(formatTimeoutCell({ timeout: 3 }), '3', '无取证 ⇒ 只报总数（不猜 other）')
+    assert.strictEqual(formatTimeoutCell({}), '0', '缺字段按 0（不产出 undefined / NaN）')
+  })
+
+  check('readTimeoutStats：缺失/非法/自相矛盾/与报告计数不符 ⇒ null（宁可占位符，不可错标）', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-tstats-'))
+    try {
+      const statsPath = path.join(dir, TIMEOUT_STATS_FILENAME)
+      assert.strictEqual(readTimeoutStats(dir, 5), null, '文件缺失 ⇒ null')
+      fs.writeFileSync(statsPath, '{not json')
+      assert.strictEqual(readTimeoutStats(dir, 5), null, '不可解析 ⇒ null')
+      fs.writeFileSync(statsPath, JSON.stringify({ segment: 'x', total: 5, hang: 2, hitLimit: 2, other: 0 }))
+      assert.strictEqual(readTimeoutStats(dir, 5), null, '三类之和 ≠ total ⇒ null（内部自相矛盾）')
+      fs.writeFileSync(statsPath, JSON.stringify({ segment: 'x', total: 4, hang: 2, hitLimit: 2, other: 0 }))
+      assert.deepStrictEqual(readTimeoutStats(dir, 4), { total: 4, hang: 2, hitLimit: 2, other: 0 }, '合法取证 ⇒ 读出')
+      assert.strictEqual(readTimeoutStats(dir, 7), null, '与报告里的 Timeout 数不符 ⇒ null（取证不属于这份报告）')
+      fs.writeFileSync(statsPath, JSON.stringify({ segment: 'x', total: 2, hang: 1.5, hitLimit: 0, other: 0.5 }))
+      assert.strictEqual(readTimeoutStats(dir, 2), null, '非整数计数 ⇒ null')
+      fs.writeFileSync(statsPath, JSON.stringify({ segment: 'x', total: 2, hang: -1, hitLimit: 3, other: 0 }))
+      assert.strictEqual(readTimeoutStats(dir, 2), null, '负数计数 ⇒ null')
+      fs.writeFileSync(statsPath, JSON.stringify([]))
+      assert.strictEqual(readTimeoutStats(dir, 2), null, '顶层数组 ⇒ null')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // Sourcery：writeTimeoutStats 按固定文件名调 fs.writeFileSync，而 writeFileSync 会**跟随**已存在的
+  // 符号链接写到链接目标（SymbolicLink overwrite）——同目录里预置一个 `timeout-stats.json -> 别处的文件`
+  // 就能让取证把那个文件改写掉。修法是先 rmSync(target) 断链（只删链接本身）再写，落盘的是普通文件。
+  // 反例钉子：删掉那行 rmSync，下面「链接目标未被改写」与「must be 普通文件」两条会同时红。
+  check('writeTimeoutStats：预置 `timeout-stats.json` 为符号链接 ⇒ 先断链再写，不改写链接目标', () => {
+    const { run: runGuard, TIMEOUT_STATS_FILENAME: GUARD_STATS_FILENAME } = require('./scripts/mutation-guard.js')
+    assert.strictEqual(GUARD_STATS_FILENAME, TIMEOUT_STATS_FILENAME,
+      '守卫与日报必须用同一个取证文件名（否则守卫写了、日报读不到）')
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-tstats-link-'))
+    try {
+      const loc = { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } }
+      const reportPath = path.join(dir, 'mutation.json')
+      fs.writeFileSync(reportPath, JSON.stringify({
+        files: { 'x.js': { mutants: [{ id: '1', mutatorName: 'Block', status: 'Killed', location: loc }] } }
+      }))
+      // 同目录里「别处的文件」——只有被链接跟随改写才会变
+      const victim = path.join(dir, 'victim.json')
+      const victimBody = '{"别动我":true}\n'
+      fs.writeFileSync(victim, victimBody)
+      const statsPath = path.join(dir, GUARD_STATS_FILENAME)
+      fs.symlinkSync(victim, statsPath)
+      // 用 readlink 而不是 lstat 做对照：既证明是符号链接、还钉住指向，也避开 CodeQL
+      // js/file-system-race 对「先 stat 后 read 同一路径」的告警。
+      assert.strictEqual(fs.readlinkSync(statsPath), victim, '对照前提：夹具确实是符号链接且指向别处的文件')
+      const outw = []
+      const code = runGuard(['--segment', 'console-part1', reportPath],
+        { stdout: { write: s => outw.push(String(s)) }, stderr: { write: () => {} }, env: {} })
+      assert.strictEqual(code, 0, '正常报告仍必须 exit 0（取证落盘不参与判据）')
+      assert.strictEqual(fs.readFileSync(victim, 'utf8'), victimBody,
+        '链接目标文件不得被改写：说明写之前没有断链（正是 Sourcery 指出的 SymbolicLink overwrite）')
+      // 先读内容、再查类型：CodeQL js/file-system-race 对「先 stat 后 read」的 check-then-use 报警，
+      // 这里反序（use-then-check）即可，断言强度不变。
+      const statsBody = fs.readFileSync(statsPath, 'utf8')
+      assert.strictEqual(fs.lstatSync(statsPath).isSymbolicLink(), false, '取证路径不得再是符号链接（先断链再写）')
+      assert.strictEqual(fs.lstatSync(statsPath).isFile(), true, '取证文件必须是普通文件')
+      assert.strictEqual(JSON.parse(statsBody).segment, 'console-part1',
+        '断链后照常写入本次取证内容（文件名固定、内容不变）')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  check('render：两列取自有取证；缺取证/为 0 的段显式占位或 0（合计带「N 段无取证」告警）', () => {
+    const results = [
+      // 有取证：6 个 Timeout = 2 真挂死 + 4 上限触发，上限 60s（console 段形态）
+      {
+        seg: 'console-part1',
+        total: 20,
+        killed: 8,
+        survived: 4,
+        noCoverage: 2,
+        timeout: 6,
+        score: 70,
+        timeoutMs: 60000,
+        timeoutStats: { total: 6, hang: 2, hitLimit: 4, other: 0 },
+        survivedMutants: [],
+        reuse: { mode: REUSE_MODE_FULL }
+      },
+      // 有 Timeout 但没取证 ⇒ —（绝不 0）
+      {
+        seg: 'app',
+        total: 10,
+        killed: 5,
+        survived: 3,
+        noCoverage: 0,
+        timeout: 2,
+        score: 70,
+        timeoutMs: 300000,
+        survivedMutants: [],
+        reuse: { mode: REUSE_MODE_FULL }
+      },
+      // 没有 Timeout ⇒ 0/0（不需要取证文件），上限未知 ⇒ —
+      {
+        seg: 'utils',
+        total: 4,
+        killed: 4,
+        survived: 0,
+        noCoverage: 0,
+        timeout: 0,
+        score: 100,
+        survivedMutants: [],
+        reuse: { mode: REUSE_MODE_FULL }
+      }
+    ]
+    const out = render(results)
+    assert.ok(out.includes('| 真挂死 | 上限触发 | 超时上限 |'), '表头必须新增三列（真挂死 / 上限触发 / 超时上限）')
+    const c1 = cellsOf(out, '| console-part1 |')
+    assert.strictEqual(c1[3], '6', '既有 `超时` 列语义不得改变（仍是 Timeout 总数）')
+    assert.strictEqual(c1[8], '全量', '复用列仍在第 9 格（新增列只追加，不插队）')
+    assert.deepStrictEqual([c1[9], c1[10], c1[11]], ['2', '4', '60s'], 'console-part1：2 真挂死 / 4 上限触发 / 60s')
+    const ca = cellsOf(out, '| app |')
+    assert.deepStrictEqual([ca[9], ca[10], ca[11]], ['—', '—', '300s'], '有 Timeout 无取证 ⇒ 两列都是 —；上限照常标 300s')
+    const cu = cellsOf(out, '| utils |')
+    assert.deepStrictEqual([cu[9], cu[10], cu[11]], ['0', '0', '—'], 'timeout=0 ⇒ 0/0；矩阵无该段 ⇒ 上限 —')
+    const total = cellsOf(out, '| **合计** |')
+    assert.strictEqual(total[9], '**2（1 段无取证）**', '合计必须把「无取证段」写在格子里，不得只报已取证的 2')
+    assert.strictEqual(total[10], '**4（1 段无取证）**', 'hitLimit 合计同理')
+    assert.strictEqual(total[11], '**—**', '合计行不给单一上限（各段可能不同）')
+    assert.ok(out.includes('本次缺取证：`app`'), '缺取证的段必须被点名（否则读者不知道 — 指的是谁）')
+    assert.ok(out.includes('`真挂死` = Timeout 且 statusReason 为空'), '表下必须解释两类的判据')
+    assert.ok(out.includes('本次矩阵取值：`60s`、`300s`（缺省 `300s`）'), '表下必须列出本次生效的上限取值')
+  })
+
+  // Sourcery：collectTimeoutStats 分三类（hang / hitLimit / other），表里只有前两列 ⇒ other > 0 时
+  // 「真挂死 + 上限触发」小于 `超时`，读者按列对账必然对不上，会以为列漏统计。
+  // 修法是最小的：不新增列（保持 12 列与既有单元格下标），在该段 `超时` 格里注明「其他超时 N」，
+  // 并在表下点名是哪个段。本用例按「三列之和 = 总数」的口径锁死，并给 other=0 的反例钉子。
+  check('render：other>0 的段在 `超时` 格注明「其他超时 N」，三列与总数可对账', () => {
+    const out = render([{
+      seg: 'console-part2',
+      total: 10,
+      killed: 4,
+      survived: 1,
+      noCoverage: 0,
+      timeout: 5,
+      score: 90,
+      timeoutMs: 60000,
+      timeoutStats: { total: 5, hang: 1, hitLimit: 2, other: 2 },
+      survivedMutants: [],
+      reuse: { mode: REUSE_MODE_FULL }
+    }])
+    const cells = cellsOf(out, '| console-part2 |')
+    assert.strictEqual(cells[3], '5（其他超时 2）',
+      '`超时` 列仍是总数，但必须注明第三类 other 的数量（否则两列之和 3 ≠ 5）')
+    assert.deepStrictEqual([cells[9], cells[10], cells[11]], ['1', '2', '60s'],
+      '前两列仍只给 hang / hitLimit（不因新增注明而改变取值或列序）')
+    assert.strictEqual(numOf(cells[9]) + numOf(cells[10]) + 2, numOf(cells[3]),
+      '对账口径：真挂死 + 上限触发 + 其他超时 = 超时总数（1+2+2=5）')
+    const total = cellsOf(out, '| **合计** |')
+    assert.strictEqual(total[3], '**5（其他超时 2）**', '合计行同样要注明，否则全批层面依然对不上账')
+    assert.ok(out.includes('本次另有 2 个 Timeout 属第三类 `其他超时`（`console-part2`=2）'),
+      '表下必须点名哪个段有第三类（读者据此定位成因）：\n' + out)
+    // 反例钉子：other = 0 时既不得在格子里注明，也不得出现「本次另有 …」的备注
+    const plain = render(FIXTURE)
+    assert.strictEqual(cellsOf(plain, '| part2 |')[3], '6',
+      'other = 0 的段 `超时` 格必须是纯数字（既有快照的语义不能漂移）')
+    assert.ok(!plain.includes('本次另有'),
+      'other = 0 时不得出现「本次另有 N 个 Timeout 属第三类」的备注（否则注明与备注都成了噪声）')
+  })
+
+  check('render：Timeout 计入 detected 的说明必须留在表下（本改只降上限、不改判据）', () => {
+    const out = render([{ seg: 'app', total: 4, killed: 2, survived: 0, noCoverage: 0, timeout: 2, score: 100, survivedMutants: [] }])
+    assert.ok(out.includes('**`Timeout` 计入 detected**（`分数` 分子含 timeout）'), '必须显式声明 Timeout 计入 detected')
+    assert.ok(out.includes('只降低 console 段的**单次等待上限**'), '必须声明本改只改上限')
+    assert.ok(out.includes('**不改判据**'), '必须声明判据不变')
+  })
+
+  check('analyzeSegment/analyze：矩阵 timeout_ms 与本目录 timeout-stats.json 都被接上（端到端）', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-seg-tstats-'))
+    try {
+      const reportDir = path.join(dir, 'mutation-report-console-part1')
+      fs.mkdirSync(reportDir)
+      const loc = { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } }
+      const mutants = [
+        { id: '1', mutatorName: 'Block', location: loc, status: 'Killed' },
+        { id: '2', mutatorName: 'Block', location: loc, status: 'Timeout' }
+      ]
+      fs.writeFileSync(path.join(reportDir, 'mutation.json'), JSON.stringify({ files: { 'scripts/console.js': { mutants } } }))
+      fs.writeFileSync(path.join(reportDir, TIMEOUT_STATS_FILENAME),
+        JSON.stringify({ segment: 'console-part1', total: 1, hang: 0, hitLimit: 1, other: 0, mutants: 2 }))
+      const matrixPath = path.join(dir, 'mutation.yml')
+      fs.writeFileSync(matrixPath, [
+        '    strategy:',
+        '      matrix:',
+        '        include:',
+        '          - name: console-part1',
+        '            src: "scripts/console.js"',
+        '            mutate: "scripts/console.js:1-650"',
+        '            config: "stryker.tap.config.js"',
+        '            timeout_ms: 60000'
+      ].join('\n'))
+      const seg = analyzeSegment(dir, { name: 'mutation-report-console-part1' },
+        readMatrixRunnerConfigs(matrixPath), readMatrixTimeouts(matrixPath))
+      assert.strictEqual(seg.error, undefined, '报告合法时必须解析成功：' + seg.error)
+      assert.strictEqual(seg.timeoutMs, 60000, 'timeoutMs 必须来自矩阵的 timeout_ms')
+      assert.deepStrictEqual(seg.timeoutStats, { total: 1, hang: 0, hitLimit: 1, other: 0 }, 'timeoutStats 必须从报告同目录的取证文件读出')
+      const out = render(analyze(dir, { matrixPath }))
+      const cells = cellsOf(out, '| console-part1 |')
+      assert.deepStrictEqual([cells[9], cells[10], cells[11]], ['0', '1', '60s'], '端到端渲染：0 真挂死 / 1 上限触发 / 60s')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   // 恢复原始环境变量和 fetch

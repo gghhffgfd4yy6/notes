@@ -581,6 +581,131 @@ function formatSegmentLabel (seg, runnerConfig) {
   return runnerConfig === COMMAND_RUNNER_CONFIG ? `${seg}${COMMAND_SEGMENT_MARK}` : String(seg)
 }
 
+// ── 本段生效 timeoutMS + Timeout 取证（可观测性，不改任何数值口径）──────────────────────────────
+// 背景：console 9 段在 mutation.yml 的矩阵里带 `timeout_ms: 60000`，由「变异测试」step 经 **CLI**
+//   `--timeoutMS` 覆盖配置文件（缓存 key 不含该值 ⇒ 不会让 inc 失效）。日报必须让读者看见「这一段的
+//   单次等待上限到底是 60s 还是 300s」，否则「Timeout 变多/变少」无法归因。
+// 数据源仍是 mutation.yml（矩阵是唯一权威，不新增第二份硬编码清单）；解析失败一律降级为「不标注」，绝不 throw。
+const DEFAULT_SEGMENT_TIMEOUT_MS = 300000
+const TIMEOUT_STATS_FILENAME = 'timeout-stats.json'
+
+/**
+ * 从 mutation.yml 文本解析 matrix 每段的 `timeout_ms`。纯函数、**绝不抛**。
+ *
+ * 语义：**缺省 300000**（= 配置文件里的值；GitHub 表达式 `matrix.timeout_ms || 300000` 同口径）。
+ * 非法值（非正整数 / 非数字）同样回落 300000——CI 侧另有门禁拒绝非法值（test_ci_skip_suites.js），
+ * 这里只负责「日报不因矩阵写坏而崩」。
+ *
+ * @param {string} ymlText mutation.yml 文本
+ * @returns {Map<string, number>} 段名 → 生效 timeoutMS（解析不出任何条目时返回空 Map）
+ */
+function parseMatrixTimeouts (ymlText) {
+  const map = new Map()
+  if (typeof ymlText !== 'string' || ymlText === '') return map
+  const lines = ymlText.split(/\r?\n/)
+  const includeIdx = lines.findIndex(line => /^\s*include:\s*$/.test(line))
+  if (includeIdx === -1) return map
+  const includeIndent = lines[includeIdx].match(/^\s*/)[0].length
+  let current = null
+  const flush = () => {
+    if (!current || !current.name) return
+    map.set(current.name, current.timeoutMs === null ? DEFAULT_SEGMENT_TIMEOUT_MS : current.timeoutMs)
+  }
+  for (const line of lines.slice(includeIdx + 1)) {
+    const indent = line.match(/^\s*/)[0].length
+    if (/^\s*[A-Za-z_][\w-]*:/.test(line) && indent <= includeIndent) break // include 块结束
+    const trimmed = line.trim()
+    if (trimmed === '' || trimmed.startsWith('#')) continue
+    let body = trimmed
+    if (trimmed.startsWith('-')) {
+      flush()
+      current = null
+      const rest = trimmed.slice(1).trim()
+      if (rest === '' || rest.startsWith('#')) continue // `- # 注释` 不算新条目
+      current = { name: null, timeoutMs: null }
+      body = rest
+    }
+    if (!current) continue
+    const colon = body.indexOf(':')
+    if (colon <= 0) continue
+    const key = body.slice(0, colon)
+    if (key !== 'name' && key !== 'timeout_ms') continue
+    const value = ymlScalar(body.slice(colon + 1).trim())
+    if (key === 'name') {
+      if (value) current.name = value
+    } else {
+      const n = Number(value)
+      current.timeoutMs = Number.isInteger(n) && n > 0 ? n : null
+    }
+  }
+  flush()
+  return map
+}
+
+/**
+ * 读取仓库内的 mutation.yml 并解析每段生效 timeoutMS；**任何失败都降级为空 Map**（不抛、不退出）。
+ * @param {string} [matrixPath] 显式矩阵路径（测试注入用）；缺省为 `<repo>/.github/workflows/mutation.yml`
+ * @returns {Map<string, number>} 段名 → timeoutMS（读不到时为空 Map ⇒ 调用侧显示 `—`）
+ */
+function readMatrixTimeouts (matrixPath) {
+  const resolved = matrixPath || path.join(__dirname, '..', '.github', 'workflows', 'mutation.yml')
+  let text
+  try {
+    text = fs.readFileSync(resolved, 'utf8') // nosemgrep（路径来自 __dirname 常量或测试注入，非不可信输入）
+  } catch (e) {
+    return new Map()
+  }
+  try {
+    return parseMatrixTimeouts(text)
+  } catch (e) {
+    return new Map()
+  }
+}
+
+/**
+ * 读取该段的 Timeout 取证（段 job 的守卫在本目录落盘的 timeout-stats.json）。
+ *
+ * 返回 null 表示「没有可用取证」——缺失、不可解析、字段非法、三类之和与 total 不符，或与报告里的
+ * Timeout 数**对不上**，一律视为无取证。日报据此显示 `—`：**绝不**把缺数据静默当 0（那会把
+ * 「不知道」伪装成「没有真挂死」，正是本列要防止的误读）。
+ *
+ * @param {string} dir 报告所在目录
+ * @param {number} expectedTimeout 报告里的 Timeout 计数（交叉校验用）
+ * @returns {{total: number, hang: number, hitLimit: number, other: number}|null}
+ */
+function readTimeoutStats (dir, expectedTimeout) {
+  let raw
+  try {
+    raw = fs.readFileSync(path.join(dir, TIMEOUT_STATS_FILENAME), 'utf8') // nosemgrep（同 readMtimeMs：路径来自 CLI 目录的枚举）
+  } catch (e) {
+    return null
+  }
+  let obj
+  try {
+    obj = JSON.parse(raw)
+  } catch (e) {
+    return null
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null
+  for (const k of ['total', 'hang', 'hitLimit', 'other']) {
+    if (!Number.isInteger(obj[k]) || obj[k] < 0) return null
+  }
+  if (obj.hang + obj.hitLimit + obj.other !== obj.total) return null
+  // 与报告交叉校验：取证是另一个进程的另一份文件，对不上就说明它不属于这份报告（或已过期）
+  if (Number.isInteger(expectedTimeout) && expectedTimeout !== obj.total) return null
+  return { total: obj.total, hang: obj.hang, hitLimit: obj.hitLimit, other: obj.other }
+}
+
+/**
+ * `超时上限` 单元格：毫秒 → `Ns`；未知/非法显示 `—`（不猜、不显示 0）。
+ * @param {number|undefined} ms 生效 timeoutMS
+ * @returns {string} 单元格文本
+ */
+function formatTimeoutLimit (ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return NO_COVERAGE_PLACEHOLDER
+  return `${Math.round(ms / 1000)}s`
+}
+
 /**
  * 既有 `分数` 列的四舍五入（段行与合计行**共用同一函数**，防止只改一处静默漂移）。
  * 与 covered 口径不同，分数的分母含 NoCoverage；`total <= 0` 时返回 0（无数据不报 100%，机器人审查）。
@@ -610,6 +735,8 @@ function analyze (dir, options = {}) {
   const results = []
   // runner 档位只读一次（每段共用一个解析结果）；读不到 ⇒ 空 Map ⇒ 全表不标注（见上方 F-2 说明）。
   const runnerConfigs = readMatrixRunnerConfigs(options.matrixPath)
+  // 每段生效 timeoutMS（矩阵的 timeout_ms，缺省 300000）；同样读一次、读不到 ⇒ 空 Map ⇒ 该列显示 `—`。
+  const timeoutConfigs = readMatrixTimeouts(options.matrixPath)
   let entries
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true }) // NOSONAR:S8707 报告目录处理（根目录已校验，工具合法用途）
@@ -620,7 +747,7 @@ function analyze (dir, options = {}) {
   }
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith('mutation-report-')) continue
-    results.push(analyzeSegment(dir, entry, runnerConfigs))
+    results.push(analyzeSegment(dir, entry, runnerConfigs, timeoutConfigs))
   }
   return results
 }
@@ -683,12 +810,15 @@ function findReportJson (dir) {
 }
 
 // 解析单个段的 mutation-report.json（复杂度拆分：analyze 保持线性遍历）
-function analyzeSegment (dir, entry, runnerConfigs) {
+function analyzeSegment (dir, entry, runnerConfigs, timeoutConfigs) {
   const seg = entry.name.replace('mutation-report-', '')
   // runner 档位（F-2）：该段在 mutation.yml 矩阵里的 `config`；读不到矩阵时为 undefined（不标注）。
   const runnerConfig = runnerConfigs && typeof runnerConfigs.get === 'function' ? runnerConfigs.get(seg) : undefined
+  // 本段生效 timeoutMS（矩阵 timeout_ms，缺省 300000）；矩阵读不到 / 段不在矩阵里时为 undefined
+  // ⇒ 日报该格显示 `—`，不假装知道。
+  const timeoutMs = timeoutConfigs && typeof timeoutConfigs.get === 'function' ? timeoutConfigs.get(seg) : undefined
   const reportPath = findReportJson(path.join(dir, entry.name))
-  if (!reportPath) return { seg, runnerConfig, error: '缺 mutation-report.json' }
+  if (!reportPath) return { seg, runnerConfig, timeoutMs, error: '缺 mutation-report.json' }
   const stats = { total: 0, killed: 0, survived: 0, noCoverage: 0, timeout: 0, survivedMutants: [] }
   // F4：解析与聚合同处 try 内——报告顶层为 null（JSON 字面量 null）/原始值时显式失败并走段级隔离，
   // 不抛 TypeError 逃出本函数（与上方注释「单段失败不中断整体」一致），也不把损坏报告伪装成
@@ -738,11 +868,12 @@ function analyzeSegment (dir, entry, runnerConfigs) {
       throw new Error('报告不含任何变异体（files 为空映射或各文件 mutants 均为空）')
     }
   } catch (e) {
-    return { seg, runnerConfig, error: `${String(e.message || e)}（报告：${reportPath}）` }
+    return { seg, runnerConfig, timeoutMs, error: `${String(e.message || e)}（报告：${reportPath}）` }
   }
   return {
     seg,
     runnerConfig,
+    timeoutMs,
     total: stats.total,
     killed: stats.killed,
     survived: stats.survived,
@@ -760,7 +891,11 @@ function analyzeSegment (dir, entry, runnerConfigs) {
     // 复用状态（PR #158 Qodo Medium / Correctness）：段 job 落盘的 reports/mutation/reuse.json 随 artifact
     // 到达这里。读不到/形状非法一律降级为「未记录 + 原因」——它是可观测性，不是门禁，故既不 throw 也不猜；
     // 「未记录」在日报里必须与「全量」区分显示（读者不得把「没记录」读成「没复用」）。
-    reuse: readReuseMeta(path.dirname(reportPath), seg)
+    reuse: readReuseMeta(path.dirname(reportPath), seg),
+    // Timeout 取证（本 PR）：段 job 的守卫在**剥离 statusReason 之前**落盘的 timeout-stats.json 随 artifact
+    // 到达这里。为什么必须另存一份：剥离后报告里的 reason 全是空串，hang / hitLimit 不可再分。
+    // 缺失或与报告的 Timeout 数对不上 ⇒ null ⇒ 日报显示 `—`（不静默当 0）。
+    timeoutStats: readTimeoutStats(path.dirname(reportPath), stats.timeout)
   }
 }
 
@@ -868,7 +1003,42 @@ function formatCovered (r) {
 }
 
 /**
- * 表下口径说明（双口径 + runner 档位）。
+ * `真挂死` / `上限触发` 单元格（Timeout 按 statusReason 分类，取证来自 timeout-stats.json）。
+ *
+ * 三态，刻意不合并：
+ *   * 该段 `超时` = 0 ⇒ `0`（报告本身就证明没有 Timeout，不需要取证文件）；
+ *   * 有 Timeout 且有取证 ⇒ 对应计数；
+ *   * 有 Timeout 但**没有**取证（文件缺失/非法/与报告对不上）⇒ `—`，**绝不显示 0**：
+ *     0 会把「不知道」伪装成「没有真挂死」，而这正是本列要消除的误读。
+ *
+ * @param {object} r analyzeSegment 的产物
+ * @param {'hang'|'hitLimit'} key 分类
+ * @returns {string} 单元格文本
+ */
+function timeoutKindCell (r, key) {
+  if (!(r.timeout > 0)) return '0'
+  if (!r.timeoutStats) return NO_COVERAGE_PLACEHOLDER
+  return String(r.timeoutStats[key])
+}
+
+/**
+ * `超时` 单元格：仍是 Timeout 总数（既有语义一字不改），只在该段有第三类 `other` 时于括号里注明。
+ *
+ * 为什么要注明：`真挂死` / `上限触发` 两列只覆盖 hang / hitLimit 两类，而 collectTimeoutStats 分三类
+ * （reason 非空、也不以 `Hit limit reached` 开头的一律算 `other`）。不注明时「真挂死 + 上限触发」
+ * 会小于 `超时`，读者按两列对账必然对不上，会误以为列漏统计（Sourcery 评审）。
+ *
+ * @param {{timeout?: number, timeoutStats?: {other?: number}}} r 段统计（或计数求和后的合计对象）
+ * @returns {string} 单元格文本
+ */
+function formatTimeoutCell (r) {
+  const total = r && Number.isFinite(r.timeout) ? r.timeout : 0
+  const other = r && r.timeoutStats && Number.isInteger(r.timeoutStats.other) ? r.timeoutStats.other : 0
+  return other > 0 ? `${total}（其他超时 ${other}）` : String(total)
+}
+
+/**
+ * 表下口径说明（双口径 + `Timeout` 计入 detected + runner 档位）。
  *
  * 为什么必须写在表下、而不只是靠表头两个字：两列只在一部分段上取值不同，读者看到
  * `分数 7.58%` / `covered 口径 35.58%` 时必须能立刻知道差在哪——差就是同一行里被 covered 口径
@@ -899,6 +1069,9 @@ function _renderCoveredScopeNote (results) {
     '`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 **且存活 > 0** 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；' +
     'NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；' +
     '整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。',
+    // 本 PR 必须写明的一句：Timeout 计入 detected 这一点没变，变的是 console 段的单次等待上限。
+    '> **`Timeout` 计入 detected**（`分数` 分子含 timeout）：本改只降低 console 段的**单次等待上限**（见 `超时上限` 列），**不改判据**——' +
+    '上限调低后，「慢但通过」的变异体可能被记为 Timeout 而算作已检出，故 `真挂死` / `上限触发` 两列必须与 `分数` 一起读。',
     '> ' + runnerNote
   ]
 }
@@ -906,18 +1079,24 @@ function _renderCoveredScopeNote (results) {
 function _renderSegmentTable (results) {
   // 段汇总表（含合计行）：正常段 + error 段分支
   // 双口径：`分数`（既有语义一字不改）与 `covered 口径`（新增列，见上方 coveredScore 注释）并列。
+  // Timeout 两类 + 生效上限（本 PR）：**追加在末尾**，既有列的单元格下标不变（多处断言按 cells[i] 取值）。
   const lines = []
-  lines.push('| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | covered 口径 | 复用 |')
-  lines.push('|---|---|---|---|---|---|---|---|---|')
+  lines.push('| 段 | 变异体 | 被杀 | 超时 | 存活 | 无覆盖 | 分数 | covered 口径 | 复用 | 真挂死 | 上限触发 | 超时上限 |')
+  lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|')
   let tTotal = 0
   let tKilled = 0
   let tTimeout = 0
   let tSurvived = 0
   let tNoCoverage = 0
   let reusedSegs = 0
+  let tHang = 0
+  let tHitLimit = 0
+  let tOther = 0
+  let noStatsSegs = 0
   for (const r of results) {
     if (r.error) {
-      lines.push(`| ${formatSegmentLabel(r.seg, r.runnerConfig)} | ❌ ${r.error} | - | - | - | - | - | - | - |`) // 9 列对齐表头（含 covered 口径/复用列）；段名带 command 档标注
+      // 12 列对齐表头（含 covered 口径/复用/Timeout 两类/上限）；段名带 command 档标注
+      lines.push(`| ${formatSegmentLabel(r.seg, r.runnerConfig)} | ❌ ${r.error} | - | - | - | - | - | - | - | - | - | - |`)
       continue
     }
     tTotal += r.total
@@ -926,7 +1105,16 @@ function _renderSegmentTable (results) {
     tTimeout += r.timeout || 0
     tNoCoverage += r.noCoverage || 0
     if (r.reuse && r.reuse.mode === REUSE_MODE_PARTIAL) reusedSegs++
-    lines.push(`| ${formatSegmentLabel(r.seg, r.runnerConfig)} | ${r.total} | ${r.killed} | ${r.timeout} | ${r.survived} | ${r.noCoverage} | ${r.score}% | ${formatCovered(r)} | ${formatReuseCell(r.reuse, r.total)} |`)
+    // 有 Timeout 却没有取证 ⇒ 该段两列显示 `—`，并计入合计的「无取证段数」（绝不静默当 0）
+    if (r.timeout > 0 && !r.timeoutStats) noStatsSegs++
+    if (r.timeoutStats) {
+      tHang += r.timeoutStats.hang
+      tHitLimit += r.timeoutStats.hitLimit
+      tOther += r.timeoutStats.other
+    }
+    lines.push(`| ${formatSegmentLabel(r.seg, r.runnerConfig)} | ${r.total} | ${r.killed} | ${formatTimeoutCell(r)} | ${r.survived} | ` +
+      `${r.noCoverage} | ${r.score}% | ${formatCovered(r)} | ${formatReuseCell(r.reuse, r.total)} | ` +
+      `${timeoutKindCell(r, 'hang')} | ${timeoutKindCell(r, 'hitLimit')} | ${formatTimeoutLimit(r.timeoutMs)} |`)
   }
   // 口径与段分一致（超时计入已处理）；无数据报 0 而非 100（机器人审查）
   // F6：本脚本只汇总，**不设分数门禁**——分数门禁在 stryker 侧（stryker.config.js 的 thresholds，
@@ -943,9 +1131,55 @@ function _renderSegmentTable (results) {
   // 例如 100 变异体 50% 与 10 变异体 100% ⇒ 按计数 54.55%，按平均 75%）。covered 口径同理；
   // 整批 NoCoverage（分母为 0）时合计的 covered 同样显示 `—`。`无覆盖` 合计列由空白改为给出
   // NoCoverage 计数汇总——这正是「两列差异」在全批层面的量级。
-  lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | **${tTimeout}** | **${tSurvived}** | **${tNoCoverage}** | **${overall}%** | **${formatCovered({ killed: tKilled, timeout: tTimeout, survived: tSurvived })}** | **${reusedSegs} 段复用** |`)
+  // Timeout 两类合计：只累加**有取证**的段，并把「无取证段数」直接写在格子里——否则一个缺文件
+  // 的段会让合计看起来像「全批没有真挂死」。
+  const hangTotal = noStatsSegs > 0 ? `**${tHang}（${noStatsSegs} 段无取证）**` : `**${tHang}**`
+  const hitLimitTotal = noStatsSegs > 0 ? `**${tHitLimit}（${noStatsSegs} 段无取证）**` : `**${tHitLimit}**`
+  // 合计的 `超时` 格同样带「其他超时 N」注明（与段行同一函数，防两处对账口径漂移）
+  const timeoutTotal = `**${formatTimeoutCell({ timeout: tTimeout, timeoutStats: { other: tOther } })}**`
+  lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | ${timeoutTotal} | **${tSurvived}** | **${tNoCoverage}** | **${overall}%** | **${formatCovered({ killed: tKilled, timeout: tTimeout, survived: tSurvived })}** | **${reusedSegs} 段复用** | ${hangTotal} | ${hitLimitTotal} | **${NO_COVERAGE_PLACEHOLDER}** |`)
   lines.push(..._renderCoveredScopeNote(results))
+  lines.push(..._renderTimeoutScopeNote(results))
   return lines
+}
+
+/**
+ * 表下说明（Timeout 两类 + 本段生效 timeoutMS）。
+ *
+ * 为什么必须写：`超时` 一列把两种完全不同的成因混在一起，而 `分数` 又把 Timeout 计入 detected ⇒
+ * 读者看到「超时 47」时无法判断是「变异体真的跑不动」还是「tap-runner 的命中上限」。这里只解释列的
+ * 含义与取证来源，**不重算任何数值、不 throw**（日报必须在最需要的时刻照常发出）。
+ *
+ * @param {Array<object>} [results] analyzeSegment 的产物
+ * @returns {string[]} markdown 行
+ */
+function _renderTimeoutScopeNote (results) {
+  const usable = (Array.isArray(results) ? results : []).filter(r => r && !r.error)
+  const missing = usable.filter(r => r.timeout > 0 && !r.timeoutStats).map(r => `\`${r.seg}\``)
+  // 第三类（other）：`真挂死` / `上限触发` 两列都不含它，必须在表下点名——否则「两列之和」与 `超时` 对不上。
+  const otherSegs = usable.filter(r => r.timeoutStats && r.timeoutStats.other > 0)
+  const otherTotal = otherSegs.reduce((sum, r) => sum + r.timeoutStats.other, 0)
+  const otherNote = otherSegs.length > 0
+    ? `本次另有 ${otherTotal} 个 Timeout 属第三类 \`其他超时\`（${otherSegs.map(r => `\`${r.seg}\`=${r.timeoutStats.other}`).join('、')}）：` +
+      'statusReason 既非空、也不以 `Hit limit reached` 开头，**只计入 `超时` 列**（已在该格括号里注明）；' +
+      '故 `真挂死` + `上限触发` + `其他超时` = `超时` 才对得上。'
+    : ''
+  const limits = [...new Set(usable.map(r => r.timeoutMs).filter(ms => Number.isFinite(ms)))]
+  const limitText = limits.length > 0
+    ? `本次矩阵取值：${limits.map(ms => `\`${Math.round(ms / 1000)}s\``).join('、')}（缺省 \`300s\`）。`
+    : '本机读不到 mutation.yml 矩阵 ⇒ 该列显示 `—`（不猜取值）。'
+  return [
+    '',
+    '> **超时三类**：`真挂死` = Timeout 且 statusReason 为空（TimeoutDecorator 杀掉，变异体跑不动）；' +
+    '`上限触发` = Timeout 且 statusReason 以 `Hit limit reached` 开头（tap-runner 的命中上限 `(n/m)`）；' +
+    '其余非空 reason 归第三类 `其他超时`（不在两列里，只在 `超时` 格括号内注明）。' +
+    '取证 = 段 job 的 fail-closed 守卫在**剥离 statusReason 之前**落盘的 `timeout-stats.json`（随 artifact 到汇总 job）；' +
+    '`—` = 该段**有 Timeout 但没有可用取证**（文件缺失/非法/与报告计数不符），**不得读作 0**。' +
+    (missing.length > 0 ? `本次缺取证：${missing.join('、')}。` : '') +
+    otherNote,
+    '> **本段生效 timeoutMS**（`超时上限` 列）= `mutation.yml` 矩阵的 `timeout_ms`，经 CLI `--timeoutMS` 覆盖配置文件的 300000ms；' +
+    '它只改单次等待上限，**不进缓存身份**、**不改分数口径**。' + limitText
+  ]
 }
 
 /**
@@ -1440,6 +1674,15 @@ module.exports = {
   readMatrixRunnerConfigs,
   formatSegmentLabel,
   scoreOf,
+  // 本段生效 timeoutMS + Timeout 两类取证（console 段 60s）
+  DEFAULT_SEGMENT_TIMEOUT_MS,
+  TIMEOUT_STATS_FILENAME,
+  parseMatrixTimeouts,
+  readMatrixTimeouts,
+  readTimeoutStats,
+  formatTimeoutLimit,
+  timeoutKindCell,
+  formatTimeoutCell,
   COMMAND_RUNNER_CONFIG,
   COMMAND_SEGMENT_MARK,
   REUSE_MODE_FULL,

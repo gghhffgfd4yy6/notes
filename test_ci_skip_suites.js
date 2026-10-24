@@ -1799,6 +1799,114 @@ console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（
 }
 console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner 契约（testRunner=tap / coverageAnalysis=perTest / tap.testFiles 非空）均已锁（靶向反例已锁）；mutation.yml 矩阵逐段 config 齐备、文件真实存在、恰 v3-entry/storage/qinglong-push/check-deps 四段 command 档，且消费点逐字用 $' + '{' + '{ matrix.config }}（靶向反例已锁）')
 
+// ── 3j 逐段 timeoutMS（console 9 段 60s）的接线契约 ────────────────────────────────────────────
+// 为什么必须锁：`timeoutMS` 只允许经 **CLI** 覆盖（`--timeoutMS ${{ matrix.timeout_ms || 300000 }}`），
+//   理由是 stryker core 的 config-reader 是 deepMerge(options, cliOptions)、而「恢复增量缓存」的 key 只
+//   hash 三份配置文件 ⇒ 走 CLI 不进缓存身份、不需要一次性全量重跑；反过来，谁把 timeout 值写进
+//   stryker.config.js / stryker.tap.config.js 或写进缓存 key，都会让 29 段再全量一次（或让日报失去
+//   「本段生效上限」的判据）。这里把三条接线一起锁死，并各配一条靶向反例（改回旧形态立刻红）。
+{
+  // 矩阵条目解析（与本文件 parseMatrixConfigs 同口径：只认活动行、剥注释/引号）
+  const parseMatrixTimeouts = (ymlText) => {
+    const ls = ymlText.split('\n')
+    const includeAt = ls.findIndex(l => /^\s*include:\s*$/.test(l))
+    assert.ok(includeAt >= 0, 'mutation.yml 的 matrix 必须有 include 块（逐段 timeout 无从核对即视为回归）')
+    const includeIndent = ls[includeAt].match(/^\s*/)[0].length
+    const entries = []
+    let cur = null
+    for (let j = includeAt + 1; j < ls.length; j++) {
+      const raw = ls[j]
+      if (raw.trim() === '') continue
+      const indent = raw.match(/^\s*/)[0].length
+      if (/^\s*[A-Za-z_][\w-]*:/.test(raw) && indent <= includeIndent) break
+      if (raw.trim().startsWith('#')) continue
+      let body = raw.trim()
+      if (body.startsWith('-')) {
+        const rest = body.slice(1).trim()
+        if (rest === '' || rest.startsWith('#')) continue
+        cur = { name: null, timeoutMs: null }
+        entries.push(cur)
+        body = rest
+      }
+      if (!cur) continue
+      const colon = body.indexOf(':')
+      if (colon <= 0) continue
+      const key = body.slice(0, colon).trim()
+      if (key !== 'name' && key !== 'timeout_ms') continue
+      let value = body.slice(colon + 1).trim()
+      if (value.startsWith('"') || value.startsWith("'")) value = value.slice(1, -1)
+      const hash = value.indexOf('#')
+      if (hash !== -1) value = value.slice(0, hash).trim()
+      cur[key === 'name' ? 'name' : 'timeoutMs'] = value
+    }
+    return entries
+  }
+
+  const CONSOLE_SEGS = ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5',
+    'console-part6', 'console-part7', 'console-part8', 'console-part9']
+  const RUN_LINE_RE = /--timeoutMS \$\{\{ matrix\.timeout_ms \|\| 300000 \}\}[ \t]*$/
+
+  const assertTimeoutWiring = (ymlText) => {
+    // (1) run 行必须以该表达式结尾：形态与既有参数一致（裸 CLI 数字，不加引号）。
+    const active = ymlText.split('\n').filter(l => /^[ \t]*run:\s*npx stryker run\b/.test(l))
+    assert.strictEqual(active.length, 1, 'mutation.yml 必须有且仅有一行活动 `run: npx stryker run …`')
+    assert.match(active[0], RUN_LINE_RE,
+      '变异测试 step 的 run 行必须以 `--timeoutMS $' + '{' + '{ matrix.timeout_ms || 300000 }}` 结尾：' +
+      'timeoutMS 只允许经 CLI 覆盖（配置文件的 hashFiles 在缓存 key 里，改配置会让 29 段全部失效）')
+    // (2) 矩阵：**恰** console-part1..9 带 timeout_ms: 60000，其余条目一个都不许有（含 4 段 command 档）。
+    const entries = parseMatrixTimeouts(ymlText)
+    const withTimeout = entries.filter(e => e.timeoutMs !== null)
+    assert.deepStrictEqual(withTimeout.map(e => e.name), CONSOLE_SEGS,
+      '必须**恰有** console-part1..9（按矩阵顺序）声明 timeout_ms：console 段每个变异体的等待上限从 300s 降到 60s' +
+      '（test_console.js 全量 ≈21s ⇒ 上限 ≈91s）；别的段加了这个字段就等于在没人评估的情况下改它的判据')
+    assert.deepStrictEqual([...new Set(withTimeout.map(e => e.timeoutMs))], ['60000'],
+      'console 段的 timeout_ms 必须是 60000（裸整数）；写成 "60" / 0 / 300000 都会让上限与评估依据脱节')
+    // (3) 缓存身份不得出现 timeout 维度：key / restore-keys 一行都不许带（否则合并后又要全量一次）。
+    for (const line of ymlText.split('\n')) {
+      // 按「是否携带缓存身份」筛选，而不是按行首：污染可能被插到 key:/兜底前缀的任意位置
+      if (!line.includes('stryker-$' + '{' + '{ matrix.name }}')) continue
+      assert.ok(!/timeout/i.test(line), '缓存 key / 兜底前缀不得包含 timeout 维度：' + line.trim())
+    }
+    // (4) 两份配置文件必须保持 300000（CLI 是唯一覆盖点；改配置 = 动缓存指纹 + 影响全部段）。
+    assert.match(fs.readFileSync(path.join(__dirname, 'stryker.config.js'), 'utf8'), /timeoutMS:\s*300000/,
+      'stryker.config.js 的 timeoutMS 必须保持 300000：per-段覆盖只走 CLI（改它会换掉缓存配置指纹 ⇒ 全量）')
+    assert.strictEqual(require('./stryker.tap.config.js').timeoutMS, 300000,
+      'stryker.tap.config.js 继承的 timeoutMS 必须仍是 300000（同上：不得在配置里逐段写死）')
+  }
+  assertTimeoutWiring(mutationYml)
+
+  // 反例 ①：把 run 行的 --timeoutMS 删掉 ⇒ 必须红（否则 console 段又等满 300s 偏移）
+  {
+    const removed = mutationYml.replace(/[ \t]*--timeoutMS \$\{\{ matrix\.timeout_ms \|\| 300000 \}\}/, '')
+    assert.notStrictEqual(removed, mutationYml, '反例夹具必须真的删掉了 --timeoutMS（没改成本回归形同虚设）')
+    assert.throws(() => assertTimeoutWiring(removed), /--timeoutMS/,
+      '删掉 run 行的 --timeoutMS 后必须红：否则「只降 console 段上限」的整条链静默失效，超时又回到 300s 偏移')
+  }
+  // 反例 ②：给非 console 段（app）也加 timeout_ms: 60000 ⇒ 必须红（不许顺手扩大影响面）
+  {
+    const widened = mutationYml.replace(/^([ \t]*)- name: app$/m, '$1- name: app\n$1  timeout_ms: 60000')
+    assert.notStrictEqual(widened, mutationYml, '反例夹具必须真的给 app 段加了 timeout_ms')
+    assert.throws(() => assertTimeoutWiring(widened), /console-part1\.\.9/,
+      '把 timeout_ms 扩到非 console 段后必须红：改别的段的等待上限会改变它的判据，必须单独评估')
+  }
+  // 反例 ③：把某段 console 的 60000 改回 300000（「反正默认就是 300s」）⇒ 必须红
+  {
+    const reverted = mutationYml.replace(/(^[ \t]*timeout_ms: )60000$/m, '$1300000')
+    assert.notStrictEqual(reverted, mutationYml, '反例夹具必须真的改掉了某个 60000')
+    assert.throws(() => assertTimeoutWiring(reverted), /60000/,
+      '把 console 段的 timeout_ms 改回 300000 后必须红：该段会重新等满 300s 偏移，超时成本回归原样')
+  }
+  // 反例 ④：把 timeout 维度写进缓存 key ⇒ 必须红（那是「一次性全量重跑」的入口）
+  {
+    const timeoutSeg = 'timeout-$' + '{' + '{ matrix.timeout_ms }}-'
+    const polluted = mutationYml.replace(/^([ \t]*)(stryker-\$\{\{ matrix\.name \}\}-cfg-)/m, '$1' + timeoutSeg + '$2')
+    assert.notStrictEqual(polluted, mutationYml, '反例夹具必须真的往兜底前缀里塞了 timeout 维度')
+    assert.throws(() => assertTimeoutWiring(polluted), /timeout/,
+      '缓存身份里出现 timeout 维度后必须红：那会让所有段在每次改上限时全部失效（一次真全量）')
+  }
+  console.log('✅ 逐段 timeoutMS：只经 CLI --timeoutMS 覆盖（非 console 段缺省 300000）、恰 console 9 段 60000、缓存身份与两份配置零改动（4 条靶向反例已锁）')
+}
+
 // ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────
 // 背景：test_app.js 的 `--only=<子串>` 曾**静默失效**——旧实现用 process.argv.indexOf('--only')
 // 定位，等号写法下没有独立的 '--only' 元素 → 返回 -1 → 不过滤、照跑全部用例；而 test_app_p.js

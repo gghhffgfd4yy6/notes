@@ -31,6 +31,14 @@ assert.ok(COMMAND_SEGS.length < REQUIRED_SEGS.length, 'command 档不得覆盖�
 // 期望行的段名单元格按矩阵档位推导（规则与生产 formatSegmentLabel 相同，但**刻意不复用它**：若标注函数
 // 被改成恒等，复用会让期望与实现在同一处同时退化、断言恒真）。改成本函数恒等 ⇒ 场景 6c 必红（反例已实跑）。
 const labelOf = (seg) => (RUNNER_CONFIGS.get(seg) === COMMAND_RUNNER_CONFIG ? `${seg}${COMMAND_SEGMENT_MARK}` : seg)
+// 本段生效的等待上限（`超时上限` 列）：来自 mutation.yml 矩阵的 timeout_ms，缺省 300s。
+// 夹具没有 timeout-stats.json ⇒ 两列分类必须是 `0`（无 Timeout）或 `—`（有 Timeout 无取证）；
+// 夹具里的变异体全是 Killed/Survived/NoCoverage/RuntimeError ⇒ 恒为 `0`。
+const SEG_TIMEOUT_MS = require('./scripts/mutation-report.js').readMatrixTimeouts()
+const limitOf = (seg) => {
+  const ms = SEG_TIMEOUT_MS.get(seg)
+  return ms === undefined ? '—' : `${Math.round(ms / 1000)}s`
+}
 
 function runCli (args, opts = {}) {
   try {
@@ -260,10 +268,10 @@ function schemaReport (seg, mutants) {
     // 换档时失配（实测：`v3-entry` 回退 command 后本行 received undefined）。
     const lineOf = (seg) => r.stdout.split('\n').find(l => l.startsWith(`| ${labelOf(seg)} |`))
     // ncSeg 行（末尾复用列为「未记录」：夹具没有 reuse.json）
-    assert.strictEqual(lineOf(ncSeg), `| ${labelOf(ncSeg)} | 5 | 1 | 0 | 2 | 2 | 20% | 33.33% | 未记录 |`,
+    assert.strictEqual(lineOf(ncSeg), `| ${labelOf(ncSeg)} | 5 | 1 | 0 | 2 | 2 | 20% | 33.33% | 未记录 | 0 | 0 | ${limitOf(ncSeg)} |`,
       `NoCoverage>0 的段必须同排给出两个口径与 NoCoverage 计数：\n${r.stdout}`)
     // 整段 NoCoverage 行：covered 列是占位符（分数列仍是既有的 0%，语义不改）
-    assert.strictEqual(lineOf(allNcSeg), `| ${labelOf(allNcSeg)} | 1 | 0 | 0 | 0 | 1 | 0% | — | 未记录 |`,
+    assert.strictEqual(lineOf(allNcSeg), `| ${labelOf(allNcSeg)} | 1 | 0 | 0 | 0 | 1 | 0% | — | 未记录 | 0 | 0 | ${limitOf(allNcSeg)} |`,
       `分母为 0 时 covered 列必须是占位符：\n${r.stdout}`)
     const table = r.stdout.split('\n').filter(l => l.startsWith('|')).join('\n')
     assert.ok(!/NaN|Infinity/.test(table), `表格里不得出现 NaN / Infinity：\n${table}`)
@@ -993,9 +1001,12 @@ function schemaReport (seg, mutants) {
   // `replace(/ --fileLogLevel info/m)`，被删掉的是注释里那处（活动行仍在）⇒ 反例根本不成立。
   {
     const real = fs.readFileSync(ymlPath, 'utf8')
-    const stripped = real.replace(/^( *run: npx stryker run .*?) --fileLogLevel info$/m, '$1')
+    // 注意：run 行尾可能还有别的 flag（如 `--timeoutMS ${{ matrix.timeout_ms || 300000 }}`），
+    // 故这里只锚 `--fileLogLevel info` 这个 token 本身、不锚行尾——反例要证的是「该 flag 被摘掉」，
+    // 而不是它在行尾。行尾锚定会让新增 flag 把反例夹具变成空操作（实测：夹具没改动却 red）。
+    const stripped = real.replace(/^( *run: npx stryker run .*?) --fileLogLevel info(?=\s|$)/m, '$1')
     assert.notStrictEqual(stripped, real, '反例夹具必须真的从活动 run 行删掉了 --fileLogLevel info（没改成本回归形同虚设）')
-    assert.ok(!/^ *run: npx stryker run .*--fileLogLevel info$/m.test(stripped), '夹具中活动 run 行应已不含该 flag')
+    assert.ok(!/^ *run: npx stryker run .*--fileLogLevel info(?=\s|$)/m.test(stripped), '夹具中活动 run 行应已不含该 flag')
     assert.throws(() => assertReuseContract(stripped), /--fileLogLevel info/,
       '去掉活动 run 行的 --fileLogLevel info 后必须红：否则「日志判定源」被静默切断而套件仍全绿')
   }
