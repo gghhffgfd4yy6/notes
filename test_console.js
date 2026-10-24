@@ -1865,9 +1865,19 @@ async function backupUiStructureTests () {
     const end = src.indexOf('function LeaveGuardDialog', at)
     assert.ok(at > -1 && end > at, '应能定位 ConfirmDialog')
     const seg = src.slice(at, end)
-    assert.ok(seg.includes('const onCancelRef = useRef(onCancel)'), 'onCancel 必须走 ref，避免每次渲染换身份')
-    assert.ok(seg.includes('}, [open, initialFocusRef])'), '焦点 effect 只能依赖 open/initialFocusRef')
-    assert.ok(!seg.includes('}, [open, onCancel, initialFocusRef])'), 'onCancel 不得回到焦点 effect 依赖（点解密会重开键盘）')
+    assert.ok(seg.includes('const onCancelRef = useRef(onCancel)'), 'onCancel 必须走 ref')
+    assert.ok(seg.includes('onCancelRef.current = onCancel'), '每次渲染都要把 ref 更新到最新 onCancel')
+
+    // 三个退出入口都必须调用 ref，而不是捕获的旧 onCancel；否则 busy 守卫可能被旧闭包绕过。
+    assert.match(seg, /Escape'\) onCancelRef\.current\(\)/, 'Escape 必须调用 ref')
+    assert.ok(seg.includes('if (e.target === e.currentTarget) onCancelRef.current()'), '点遮罩必须调用 ref')
+    assert.ok(seg.includes('onClick=' + '$' + '{() => onCancelRef.current()}'), '取消按钮必须调用 ref')
+
+    // 依赖数组必须属于“聚焦”的那个 effect，不能靠组件里别处的同名字符串蒙混。
+    const focusEffect = seg.match(/const t = setTimeout\(\(\) => \{[\s\S]*?\n\s*\}, \[([^\]]*)\]\)/)
+    assert.ok(focusEffect, '应能定位聚焦 effect')
+    assert.deepStrictEqual(focusEffect[1].split(',').map((s) => s.trim()).filter(Boolean), ['open', 'initialFocusRef'],
+      '聚焦 effect 只能依赖 open/initialFocusRef；依赖 onCancel 会让 busy 变化重开键盘')
   })
 }
 
