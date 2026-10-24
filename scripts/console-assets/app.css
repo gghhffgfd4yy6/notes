@@ -579,6 +579,32 @@
   .retry-btn:active { transform: translateY(1px); }
   .retry-btn:focus-visible { outline: var(--ring); outline-offset: 1px; }
 
+  /* L4 首屏骨架（app.js 的 PanelSkeleton）：结构在组件里，外观在这里——数据回来前先按
+     最终版式占位，别让面板空白。占位块 aria-hidden、不吃点击；呼吸动画在
+     prefers-reduced-motion 下关掉。 */
+  .skeleton { padding: var(--sp-3) 0; }
+  .skel-top { padding-bottom: var(--sp-3); }
+  .skel-row {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--border-soft);
+  }
+  .skel-bar {
+    display: block; height: 12px; border-radius: 6px;
+    background: var(--panel-2); animation: skel-pulse 1.2s ease-in-out infinite;
+  }
+  .skel-bar-count { width: 42%; height: 13px; }
+  .skel-bar-title { width: 72%; }
+  .skel-bar-meta { width: 46%; height: 10px; }
+  @keyframes skel-pulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .skel-bar { animation: none; } }
+
+  /* L4 加载失败条：一行灰字 + 重试按钮（按钮样式见上面的 .retry-btn）。 */
+  .load-error {
+    display: flex; align-items: center; justify-content: center; flex-wrap: wrap;
+    gap: var(--sp-2); padding: var(--sp-3) var(--sp-2);
+    color: var(--text-dim); font-size: var(--fs-sm); text-align: center;
+  }
+
   /* ── 日志框 ── */
   .logbox { margin-top: var(--sp-3); border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
   .logbox-head { display: flex; justify-content: space-between; align-items: center; padding: var(--sp-2) var(--sp-3); background: var(--panel-2); font-size: var(--fs-sm); color: var(--text-dim); }

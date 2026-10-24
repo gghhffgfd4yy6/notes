@@ -7145,7 +7145,7 @@ function App () {
   const syncAt = tab === 'overview' ? lastSync : panelSync
   return html`<div class="wrap">
     <header class="topbar">
-      <div class="sync" ref=${syncRef} role="group" aria-label="状态与刷新">
+      <div class="sync" ref=${syncRef} role="group" aria-label="状态与刷新" tabindex="0">
         <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
         <span class="sync-meta">
           ${pull.state !== 'idle'

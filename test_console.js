@@ -5056,7 +5056,7 @@ async function main () {
       '不得再按页停掉轮询定时器')
     assert.ok(src.includes("if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)"),
       '非概览/日志页必须每拍推进共享 tick')
-    assert.ok(src.includes('if (!active || !(pollTick > 0) || busyRef.current) return'),
+    assert.ok(src.includes('if (!active || justActivated || !(pollTick > 0) || busyRef.current) return'),
       '轮询重拉必须单飞：上一拍还没回来时跳过，否则慢接口会互相作废响应')
     assert.ok(/\[refreshSplit, locking, tab, autoRefresh, authExpired\]/.test(src), '轮询 effect 必须随 tab / 暂停开关 / 凭证失效状态变化重跑')
     // 四个页面的面板都要消费这个 tick，否则只是数字在动、数据不动。
@@ -5281,7 +5281,8 @@ async function main () {
     assert.ok(src.includes('initialMode') && src.includes('initialQuery'), '日志面板必须支持带条件跳转')
     assert.ok(src.includes("window.addEventListener('hashchange'"), '页签必须跟随 hash')
     assert.ok(src.includes('document.title ='), '标题必须带状态点')
-    assert.ok(src.includes('function AutoRefreshText (') && /自动刷新 \$\{remain\}s/.test(src), '状态行必须复用 AutoRefreshText（暂停 + 倒计时）')
+    assert.ok(src.includes('function AutoRefreshText (') && /\$\{remain\} 秒后刷新/.test(src) &&
+      /数据截至 \$\{TZ_LABEL\} /.test(src), '状态行必须复用 AutoRefreshText（暂停 + 倒计时；L3 起文案为「N 秒后刷新 · 数据截至 北京时间」）')
     assert.ok(src.includes('filterRunItems'), '逐轮历史必须支持失败/日期筛选')
     assert.ok(!src.includes('首轮前正常'), '墓碑文案不得再写「首轮前正常」')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
@@ -5418,8 +5419,9 @@ async function main () {
     const runs = src.slice(src.indexOf('function RunsPanel'), src.indexOf('// ── 组件：逐轮运行历史'))
     assert.ok(runs.includes("if (document.visibilityState === 'hidden') return"), '触发详情在后台必须跳过请求')
     assert.ok(runs.includes("document.addEventListener('visibilitychange', onVisibility)"), '切回前台必须补一拍')
-    const app = src.slice(src.indexOf('const active = runs.some'), src.indexOf('// vwU/vv2'))
-    assert.ok(app.includes("document.visibilityState !== 'hidden'"), '概览主轮询在后台必须跳过')
+    const pollBlock = src.slice(src.indexOf('const interval = locking ? POLL_BUSY_MS : POLL_MS'),
+      src.indexOf('}, [refreshSplit, locking, tab, autoRefresh, authExpired])'))
+    assert.ok(pollBlock.includes('if (document.hidden) return'), '概览主轮询在后台必须跳过（tick 整拍不发）')
   })
 
   await aok('结构红线: 标签页吸顶、切页回顶、缓存每分钟刷新', () => {
@@ -5478,7 +5480,8 @@ async function main () {
       '系统页两个面板都完成时必须缓存 sys 时间并写 ready 标记')
     const switchSyncBlock = src.slice(src.indexOf('const doSwitchTab ='), src.indexOf('const openLog = useCallback'))
     assert.ok(switchSyncBlock.includes('showSyncFor(next)'), '页签点击必须同步切到目标页缓存时间')
-    const hashSyncBlock = src.slice(src.indexOf('const onHash ='), src.indexOf("window.addEventListener('hashchange'"))
+    const hashStart = src.lastIndexOf('const onHash =')
+    const hashSyncBlock = src.slice(hashStart, src.indexOf("window.addEventListener('hashchange'", hashStart))
     assert.ok(hashSyncBlock.includes('showSyncFor(next)'), '后退/前进必须同步切到目标页缓存时间')
     const openLogSyncBlock = src.slice(src.indexOf('const openLog ='), src.indexOf('const pollMs ='))
     assert.ok(openLogSyncBlock.includes("showSyncFor('logs')"), '查看日志必须切到 logs 的缓存时间')
@@ -6103,7 +6106,8 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
     const ph = (name) => '$' + '{' + name + '}'
     // C. 362 宽必须命中紧凑规则（旧断点 360 差 1px，实测内容 404 宽、末两格被切/出屏）。
-    assert.ok(!/@media \(max-width: 360px\)/.test(css), '旧的 360 断点必须移除，否则 362 仍差 1px 不命中')
+    const media360 = [...css.matchAll(/@media \(max-width: 360px\) \{([\s\S]*?)\n {2}\}/g)].map((m) => m[1]).join('\n')
+    assert.ok(!/\.tabs/.test(media360), '页签不得再用 360 断点（362 会差 1px 不命中）；360 现仅分页网格使用')
     const compact = (css.match(/@media \(max-width: 420px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
     assert.ok(/\.tabs\s*\{[^}]*gap:\s*2px/.test(compact), '≤420 必须收紧 gap 且真的落到 .tabs')
     assert.ok(/\.tab-btn\s*\{[^}]*padding:\s*7px 5px/.test(compact) && /font-size:\s*var\(--fs-sm\)/.test(compact),
@@ -6576,8 +6580,8 @@ async function main () {
     // ②b v3.344：暂停不是概览专属——其它页也要能暂停/继续。
     //     v3.346：文案收敛到组件里，暂停只换开头两个字，后半句不变。
     assert.ok(!/\$\{tab === 'overview' && html`<button type="button" class="sync-toggle"/.test(src), '暂停按钮不得再限定在概览页')
-    assert.ok(/自动刷新 \$\{remain\}s · <span class="sync-label">数据截至 · <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '运行态文案必须统一')
-    assert.ok(/已暂停 · <span class="sync-label">数据截至 · <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '暂停态只换开头，后半句保持同一形态')
+    assert.ok(/\$\{remain\} 秒后刷新 · <span class="sync-label">数据截至 \$\{TZ_LABEL\} <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '运行态文案必须统一')
+    assert.ok(/已暂停 · <span class="sync-label">数据截至 \$\{TZ_LABEL\} <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '暂停态只换开头，后半句保持同一形态')
     // v3.347：秒级时钟必须比 1s 快。1s 时钟与 mark() 不同相时，倒数会 5 4 3 2 → 5 跳过 1s
     // （真机录屏实证），所以这里钉住 500ms，防止有人「优化」回 1000。
     assert.ok(src.includes('setInterval(() => setNowMs(() => Date.now()), 500)'), '倒计时时钟必须是 500ms（1s 会跳秒）')
@@ -6833,10 +6837,10 @@ async function main () {
     assert.ok(src.includes('refreshSplit(force ? { force: true } : undefined)') && src.includes('refreshActive({ force: true })'), '下拉必须绕过表单交互暂停（回前台补拉不绕）')
     assert.ok(src.includes('Promise.allSettled([refreshSplit(force ? { force: true } : undefined), refreshAuto(), ...detail.waits])'), '必须等主轮询与所有面板一起落定')
     // ⑦ 长时间切后台再回来要静默补拉（不是每次切回来都拉，也不整页重载）。
-    assert.ok(src.includes('const VISIBLE_STALE_MS = 30000'), '回前台补拉必须有「离开多久才算过期」的阈值')
-    const recovery = src.slice(src.indexOf('// 回到前台：离开超过 VISIBLE_STALE_MS'), src.indexOf('const pull = usePullToRefresh'))
+    assert.ok(src.includes('const VISIBLE_REFRESH_GAP_MS = 2000'), '回前台补拉必须有「刚刷完就切回来就跳过」的阈值')
+    const recovery = src.slice(src.indexOf('// 回到前台：隐藏期间所有轮询都停了'), src.indexOf('const pull = usePullToRefresh'))
     assert.ok(recovery.includes("document.addEventListener('visibilitychange', onVis)"), '回前台补拉必须真的挂上 visibilitychange 监听（只有回调函数不算）')
-    assert.ok(recovery.includes('if (Date.now() - lastRefreshRef.current < VISIBLE_STALE_MS) return'), '回前台补拉必须按距上次刷新判断，不能每次切回都发请求')
+    assert.ok(recovery.includes('if (Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS) return'), '回前台补拉必须按距上次刷新判断，不能每次切回都发请求')
     assert.ok(recovery.includes('refreshActive({ respectFormPause: true })'), '回前台补拉要走统一路径，且避开表单交互')
     const refreshActiveBody = src.slice(src.indexOf('const refreshActive = useCallback'), src.indexOf('const pullRefresh = useCallback'))
     assert.ok(refreshActiveBody.includes('lastRefreshRef.current = Date.now()'), '刷新成功必须推进时间戳（写在 refreshActive 内，别处的不算）')
