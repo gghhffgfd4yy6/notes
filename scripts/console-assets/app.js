@@ -3228,6 +3228,8 @@ function titleTailPrice (title) {
 function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   const [page, setPage] = useState(1)
   const [size, setSize] = useState(20)
+  // v3.358：跳页输入（受控，'' = 没输入）。只在 Enter/失焦时生效，不随每次按键换页。
+  const [jump, setJump] = useState('')
   const [cate, setCate] = useState('')
   const [days, setDays] = useState(0)
   // 自定义日期区间（v3.326）：两项都非空才生效，否则退回「近 N 天」。
@@ -3344,6 +3346,17 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     if (n === page) return
     armLand()
     setPage(n)
+  }
+  // 跳页（v3.358）：只认数字，越界夹到 [1, pages]。换页仍走 goPage（统一的落点旗 + 同页守卫），
+  // 所以这里不直接 setPage；先清空输入，避免下一次失焦拿旧值再跳一遍。
+  const jumpTo = (raw) => {
+    const text = String(raw == null ? '' : raw).trim()
+    setJump('')
+    if (text === '') return
+    const n = Math.trunc(Number(text))
+    if (!Number.isFinite(n)) return
+    const pages = data && Number.isSafeInteger(data.pages) && data.pages > 0 ? data.pages : 1
+    goPage(Math.min(Math.max(n, 1), pages))
   }
   // 搜索框回车 / 刷新前先把未落地的输入立刻生效，避免「刚打完字点刷新，还是旧结果」。
   // 只有搜索词变了才回第 1 页；没改词时刷新当前页，不应把用户踢回首页（审查 #246 可选）。
@@ -3522,6 +3535,15 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
         <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(1)}>« 首页<//>
         <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(page - 1)}>上一页<//>
         <span class="pager-info">第 ${data.page} / ${data.pages} 页</span>
+        <span class="pager-jump">
+          <span class="pager-jump-label" aria-hidden="true">跳至</span>
+          <input class="pager-jump-input" type="number" inputmode="numeric" min="1" max=${data.pages}
+            value=${jump} aria-label="跳到第几页"
+            onInput=${(e) => setJump(e.target.value)}
+            onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); jumpTo(jump) } }}
+            onBlur=${() => jumpTo(jump)} />
+          <span class="pager-jump-label" aria-hidden="true">页</span>
+        </span>
         <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(page + 1)}>下一页<//>
         <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(data.pages)}>末页 »<//>
       </div>
