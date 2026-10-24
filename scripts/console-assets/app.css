@@ -562,6 +562,19 @@
   .row-open td { background: var(--accent-sel); }
   .mono { font-family: var(--mono); font-size: 12.5px; }
   .empty { color: var(--text-dim); padding: 14px 0; text-align: center; }
+  /* L4 的错误态重试按钮（只挂 retry-btn，不依赖 .btn）：尺寸描边与 .btn 同族，
+     用强调色让它在「加载失败：网络请求失败」这一行灰字里能被一眼找到。 */
+  .retry-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 32px; margin-left: 6px; padding: 0 12px;
+    background: var(--panel-2); color: var(--accent);
+    border: 1px solid var(--accent-line); border-radius: var(--r-sm);
+    font: inherit; font-size: var(--fs-sm); font-weight: 500;
+    white-space: nowrap; cursor: pointer;
+  }
+  .retry-btn:hover { background: var(--accent-soft); }
+  .retry-btn:active { transform: translateY(1px); }
+  .retry-btn:focus-visible { outline: var(--ring); outline-offset: 1px; }
 
   /* ── 日志框 ── */
   .logbox { margin-top: var(--sp-3); border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
@@ -850,11 +863,26 @@
   .cate-foot { color: var(--text-dim); font-size: var(--fs-2xs); text-align: center; padding-top: var(--sp-2); margin-top: var(--sp-2); border-top: 1px solid var(--border-soft); }
   .msg-count { color: var(--text-dim); font-size: var(--fs-xs); margin-bottom: var(--sp-2); }
   .msg-loading { color: var(--accent); }
-  .msg-list { display: flex; flex-direction: column; gap: var(--sp-2); }
-  .msg-item { border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px var(--sp-3); background: var(--panel-2); }
+  .msg-list { display: flex; flex-direction: column; gap: var(--sp-2); list-style: none; margin: 0; padding: 0; }
+  .msg-item { border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px var(--sp-3); background: var(--panel-2); list-style: none; }
   .msg-item-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-2); }
   .msg-title { font-weight: 500; font-size: var(--fs-md); cursor: pointer; overflow-wrap: anywhere; word-break: normal; }
   .msg-title:hover { color: var(--accent); }
+  /* L1：标题从 span[role=button] 换成真 <button>（原生 Enter/空格，手写的 onKeyDown 退场）。
+     UA 给 button 的边框/底色/居中/字体全部清掉，视觉与旧版一致：字号字重沿用 .msg-title
+     那一行；换成 button 后整块标题都是命中区，不再只点得中文字本身。
+     .msg-item-head 是 flex + baseline：flex:1 1 auto 让它吃满剩余宽度，右侧价格（只剩与
+     标题不重复时才渲染）不被挤走。 */
+  button.msg-title {
+    appearance: none; -webkit-appearance: none;
+    display: block; flex: 1 1 auto; width: 100%; min-width: 0;
+    margin: 0; padding: 0;
+    border: 0; border-radius: 4px; background: none;
+    color: inherit; font: inherit; font-size: var(--fs-md); font-weight: 500;
+    line-height: inherit; text-align: left; text-decoration: none;
+    cursor: pointer;
+  }
+  button.msg-title:focus-visible { outline: var(--ring); outline-offset: 2px; }
   /* v3.328：搜索命中高亮（标题 / 正文）。与日志页同口径：--warn-soft 底 + --warn-line 内描边；
      color: inherit 保证深色主题下标题原色不被浏览器默认的「黄底黑字」盖掉。 */
   .msg-item mark { background: var(--warn-soft); color: inherit; border-radius: 2px; box-shadow: inset 0 0 0 1px var(--warn-line); }
@@ -867,6 +895,15 @@
      文字贴顶。故 meta 行显式居中，pill/时间保持自身高度。 */
   .msg-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--text-dim); font-size: var(--fs-xs); margin-top: var(--sp-1); min-width: 0; }
   .msg-cate { background: var(--accent-soft); border: 1px solid var(--accent-line); color: var(--info-fg); border-radius: var(--r-pill); padding: 0 var(--sp-2); font-size: var(--fs-2xs); max-width: 100%; overflow-wrap: anywhere; }
+  /* L2 把「好单线报-娱乐-淘宝」按 - 拆成三段 span.msg-cate-part：段内不折行、段间用淡
+     圆点分隔，长分类在分隔处换行。旧版整串 + overflow-wrap:anywhere 会把一个词按字符劈开
+     （「好单线报-娱」/「乐-淘宝」两行）；aria-label 仍带原始整串，读屏不受影响。 */
+  .msg-cate {
+    display: inline-flex; align-items: center; flex-wrap: wrap;
+    max-width: 100%; overflow: hidden; overflow-wrap: normal;
+  }
+  .msg-cate-part { white-space: nowrap; }
+  .msg-cate-part + .msg-cate-part::before { content: '·'; margin: 0 4px; opacity: .55; }
   .msg-content { margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px dashed var(--border); color: var(--text); font-size: var(--fs-sm); white-space: pre-wrap; word-break: break-all; }
   /* v3.317：原文链接是卡片里唯一的跳转入口，旧版点击区只有字高 ≈15px。视觉字号不变，
      只把行盒抬到 44px（inline-flex 居中），命中区不再考验拇指。 */
@@ -882,6 +919,22 @@
      实测）。只轻压透明度：底色/边框/尺寸不变，翻页时这一行不跳。
      四个按钮仍带 || loading（防连点），加载中同样只是轻微变淡。 */
   .pager .btn:disabled { opacity: .7; }
+  /* L1 的「跳到第 N 页」输入框：宽度只放 3 位数，描边/底色跟同排按钮同族。
+     justify-self:center 是给 ≤430px 的 grid 用的——整行跨列时不会被拉成一条 370px 的长条。 */
+  .pager-jump {
+    width: 56px; min-height: 32px; margin: 0 2px; padding: 0 6px;
+    justify-self: center;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    font: inherit; font-size: var(--fs-sm); text-align: center;
+    font-variant-numeric: tabular-nums; color-scheme: inherit;
+  }
+  .pager-jump:hover { border-color: var(--accent-line); }
+  .pager-jump:focus-visible { outline: var(--ring); outline-offset: 1px; }
+  /* 原生数字框的上下箭头在 56px 宽里只占地方还容易误触；键盘上下键照旧可用。 */
+  .pager-jump::-webkit-outer-spin-button,
+  .pager-jump::-webkit-inner-spin-button { appearance: none; -webkit-appearance: none; margin: 0; }
+  .pager-jump[type="number"] { appearance: textfield; -moz-appearance: textfield; }
 
   /* ── 逐轮历史筛选（v3.307）── */
   .run-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: var(--sp-2); }
@@ -1202,6 +1255,10 @@
     .logpre-main { max-height: 62vh; max-height: min(62dvh, 520px); min-height: 62vh; min-height: min(62dvh, 520px); }
     .log-empty { min-height: 62vh; min-height: min(62dvh, 520px); }
     .mini-btn, .mini-opt { min-height: 44px; }
+    /* 跳页输入框：同样 16px 起（iOS 聚焦不整页放大），高度对齐同排 44px 按钮；
+       L4 的重试按钮在手机上也是拇指目标，不是桌面 32px 的小控件。 */
+    .pager-jump { font-size: 16px; min-height: 44px; width: 64px; }
+    .retry-btn { min-height: 44px; }
     /* 分类筛选：手机端贴底弹层 + 遮罩，避免原生 select 的全屏白底列表 */
     .cate-picker { flex: 1 1 100%; }
     .cate-btn { min-height: 44px; }
@@ -1237,7 +1294,13 @@
   @media (max-width: 430px) {
     .pager { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 6px; }
     .pager > .btn { width: 100%; min-width: 0; padding: 0 4px; white-space: nowrap; }
-    .pager > :not(.btn) { grid-column: 1 / -1; order: -1; text-align: center; }
+    /* 页码与跳页各占半行（2 格）排在第一行，四个按钮占满第二行：总高 2 行，
+       比各占整行少一次滚动；min-width:0 让超长的跳页文案在自己的格子里换行，不撑破网格。 */
+    .pager > :not(.btn) { grid-column: span 2; min-width: 0; order: -1; text-align: center; }
+  }
+  /* 320 一级：半行（≈130px）放不下「跳到第 [ ] 页」，标签会从中间折行；退回整行更整齐。 */
+  @media (max-width: 360px) {
+    .pager > :not(.btn) { grid-column: 1 / -1; }
   }
 }
 
