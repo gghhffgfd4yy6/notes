@@ -39,7 +39,10 @@ const BOOT = readBoot()
 // persisted=true 即非首次加载，强制重载拿当前凭证（no-store 不保证 BFCache 驱逐）。
 window.addEventListener('pageshow', (ev) => { if (ev.persisted) window.location.reload() })
 
-const POLL_MS = 5000
+// 轮询间隔：5s → 15s。三个接口每拍约 16KB（/api/messages 14.4KB + 状态 + 历史），
+// 5s 一轮就是 ~11MB/小时——控制台常驻开着也看不完这么新的数据。手动刷新、下拉刷新、
+// 切回前台都不受这个间隔约束（走一次性补拉）；任务在跑时仍用 POLL_BUSY_MS 快轮询。
+const POLL_MS = 15000
 const POLL_BUSY_MS = 2000
 // 部署后旧标签页仍跑旧脚本（数据照常轮询，看起来「在线」却看不到新 UI）。每 60s 对一次
 // /api/sys 的版本，不一致就挂一条「刷新后生效」的提示——不自动 reload，避免打断正在填的表单。
@@ -61,9 +64,11 @@ const NOTIFY_WINDOW_MAX_S = 3600
 const NOTIFY_WINDOW_DEFAULT_S = 60
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
-// 服务端时间戳统一按 Asia/Shanghai（UTC+8）渲染，不跟浏览器时区走。
-// 服务器时区是 UTC，若用本地 getHours()，「自动刷新 14:xx」会和 run.log 的 22:xx 混显，
-// 看起来像日志停在 8 小时前（实测）。上海无夏令时，固定 +8 即可。
+// 控制台里所有时间都按北京时间（Asia/Shanghai，固定 UTC+8）显示，不跟浏览器时区走。
+// 服务器时区是 UTC，推送列表里的时间也是 CST 文本；顶栏「数据截至」此前用浏览器本地时区，
+// UTC 客户端会在同一屏上看到两个钟（列表 22:41 / 顶栏 14:41），像数据停在 8 小时前。
+// 上海无夏令时，固定 +8 即可。时区只在顶栏标一次（TZ_LABEL）：全屏同钟，标一处就够。
+const TZ_LABEL = '北京时间'
 function fmtTime (ts) {
   if (!ts) return '—'
   const d = new Date(Number(ts) + 8 * 3600 * 1000)
@@ -75,13 +80,11 @@ function fmtNum (n) {
   return (n === undefined || n === null) ? '—' : String(n)
 }
 
-// 本机时钟（lastSync = 浏览器 Date.now()）用本地时间渲染：套 fmtTime 的 +8 会让
-// 非 UTC+8 用户看到「未来时间」（审查 #244 可选）。服务器时间戳仍走 fmtTime。
+// 浏览器侧时间戳（lastSync = Date.now()）同样按北京时间渲染：顶栏与列表必须同屏同钟。
+// 保留这个名字是因为它的语义是「客户端时钟」而不是「本地时区」——改用 fmtTime 之后，
+// UTC 客户端看到的时间与列表、与 run.log 一致（此前差 8 小时）。
 function fmtLocalTime (ts) {
-  if (!ts) return '—'
-  const d = new Date(Number(ts))
-  const p = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  return fmtTime(ts)
 }
 
 // 只取时分秒（Asia/Shanghai）：触发结果行要与 run.log 的时间对照，口径必须与 fmtTime 一致。
@@ -683,7 +686,8 @@ function fmtBarTime (ts, withDate) {
 
 // 顶栏状态行：所有页共用这一个组件、这一套词（v3.346）。
 //  - 轮询中的页（概览/日志）秒数倒数；不轮询的页给配置的间隔，不假装在倒数。
-//  - 暂停时只换开头两个字，后半句「数据截至 · 时间」保持同一形态。
+//  - 开头写「N 秒后刷新」而不是「自动刷新 Ns」：后者会被读成刷新间隔（其实是倒计时）。
+//  - 暂停时只换开头两个字，后半句「数据截至 北京时间 时间」保持同一形态。
 // 独立持有 1s 时钟：避免 App 每秒重渲染整页（安卓原生 select 会闪）。
 function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = false, live = true }) {
   const [nowMs, setNowMs] = useState(Date.now())
@@ -700,15 +704,16 @@ function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = 
   const colon = at.lastIndexOf(':')
   const atMain = colon > 0 ? at.slice(0, colon) : at
   const atSec = colon > 0 ? at.slice(colon) : ''
-  if (paused) return html`已暂停 · <span class="sync-label">数据截至 · </span>${atMain}<span class="sync-sec">${atSec}</span>`
+  if (paused) return html`已暂停 · <span class="sync-label">数据截至 ${TZ_LABEL} </span>${atMain}<span class="sync-sec">${atSec}</span>`
   const sec = Math.max(1, Math.round(pollMs / 1000))
   const remain = live ? Math.max(0, Math.min(sec, Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000))) : sec
-  return html`自动刷新 ${remain}s · <span class="sync-label">数据截至 · </span>${atMain}<span class="sync-sec">${atSec}</span>`
+  return html`${remain} 秒后刷新 · <span class="sync-label">数据截至 ${TZ_LABEL} </span>${atMain}<span class="sync-sec">${atSec}</span>`
 }
 
+// 星期几也只按北京时间取：本地 getDay() 在北京时间跨零点时会差一天，和上面的时间对不上。
 function fmtWeekday (ts) {
   if (!ts) return ''
-  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts)).getDay()]
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts) + 8 * 3600 * 1000).getUTCDay()]
 }
 
 // v3.341：窄屏下顶栏状态行会被省略号截断（时间只剩半截）。点一下就地弹出完整文本，点页面
@@ -2556,9 +2561,11 @@ const PULL_EVENT = 'xbk-pull-refresh'
 const PULL_TRIGGER = 56 // 松手阈值（CSS px，手指位移按 0.5 倍阻尼折算）
 const PULL_MAX = 84
 const PULL_MIN_BUSY_MS = 450 // 再快也让「正在刷新…」停留一下，避免又变成一闪
-// 切后台/锁屏/切走 App 很久再回来：页面里的数据已经过期了，但浏览器不会替我们重拉。
-// 回到前台时若距上次刷新超过这个间隔，就静默补一轮（不显示「正在刷新…」，不重建页面）。
-const VISIBLE_STALE_MS = 30000
+// 切后台/锁屏/切走 App 时轮询全停（App 的 visibilitychange 处理）：回来时页面里的数据
+// 必然是离开那一刻的，而浏览器不会替我们重拉。回前台一律静默补一轮（不显示「正在刷新…」、
+// 不重建页面）；只有距上次成功刷新不足这个间隔（刚刷完就切回来）才跳过——来回切窗口
+// 不该每次都打一遍接口。
+const VISIBLE_REFRESH_GAP_MS = 2000
 
 function usePollReload (active, pollTick, fn) {
   // v3.349：轮询重拉的单飞闸——上一拍还没回来就跳过这一拍。慢接口下每个新请求都会把
@@ -6280,6 +6287,8 @@ function App () {
   const timerRef = useRef(null)
   // 最近一次「数据真的刷新过」的时间：回前台补拉、轮询、下拉都更新它。
   const lastRefreshRef = useRef(Date.now())
+  // 回前台后的静默窗（时间戳）：补拉已经覆盖了这一拍，定时器若正好到期不该再叠一发。
+  const resumeQuietUntilRef = useRef(0)
   const tabsRef = useRef(null)
   // 标签栏边缘渐隐状态（v3.317）：'' | 'left' | 'right' | 'both'。只在真的溢出时挂
   // data-edge，362 宽（6 个页签全部放得下）保持零遮罩——否则最后一格会被误读成被裁掉。
@@ -6685,22 +6694,29 @@ function App () {
     const interval = locking ? POLL_BUSY_MS : POLL_MS
     const mark = () => setNextAt(Date.now() + interval)
     const tick = () => {
-      if (document.visibilityState !== 'hidden') {
-        // 用户正在操作表单（下拉/输入框）时跳过整拍：不 refresh、也不 mark
-        // （mark 会 setNextAt 触发 App 重渲染，安卓原生 select 仍可能被重建）。
-        // 截止时间到后自动恢复，不会因为焦点一直停在 select 上而永久停轮。
-        if (Date.now() < formPauseUntilRef.current) return
-        refreshSplit()
-        if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)
-        mark()
-      }
+      // 隐藏标签页一次请求都不发：主轮询此前只在「发不发这一拍」上有判断，
+      // 但概览的 /api/auto（2s 轮询）不在这个 effect 里、没跟着停，实测隐藏 15s 仍有请求。
+      // 定时器本身照跳（浏览器把后台定时器压到 1 分钟一次，空转无成本），
+      // 但请求、倒计时推进、面板 tick 三样全停。
+      if (document.hidden) return
+      // 刚从后台回来：这一拍由「回到前台」的补拉负责，定时器若正好到期不再叠加。
+      if (Date.now() < resumeQuietUntilRef.current) return
+      // 用户正在操作表单（下拉/输入框）时跳过整拍：不 refresh、也不 mark
+      // （mark 会 setNextAt 触发 App 重渲染，安卓原生 select 仍可能被重建）。
+      // 截止时间到后自动恢复，不会因为焦点一直停在 select 上而永久停轮。
+      if (Date.now() < formPauseUntilRef.current) return
+      refreshSplit()
+      if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)
+      mark()
     }
     timerRef.current = setInterval(tick, interval)
     mark()
-    // 回前台一律交给「回前台补拉」统一判断（>VISIBLE_STALE_MS 才拉）：
-    // 这里只把下一拍的时间重排，避免刚回来就立刻又打一发。
+    // 回前台只重排下一拍（别刚回来就补一发，补拉由下面的「回到前台」effect 统一发：
+    // 那里还会通知当前面板一起刷新，重复请求会翻倍）。
     const onVis = () => {
-      if (document.visibilityState === 'visible') mark()
+      if (document.hidden) return
+      resumeQuietUntilRef.current = Date.now() + interval
+      mark()
     }
     document.addEventListener('visibilitychange', onVis)
     return () => {
@@ -6828,15 +6844,19 @@ function App () {
     return ok
   }, [refreshSplit, refreshAuto])
   const pullRefresh = useCallback(() => refreshActive({ force: true }), [refreshActive])
-  // 回到前台：离开超过 VISIBLE_STALE_MS 就静默补一次（走和下拉完全相同的刷新路径，
-  // 当前页签的面板自己决定拉什么；有未保存草稿时它们不接，这里也就什么都不发）。
+  // 回到前台：隐藏期间所有轮询都停了（主轮询 tick、面板自己的 interval、/api/auto），
+  // 数据必然停在离开那一刻，浏览器不会替我们重拉。回来立刻静默补一轮（不显示
+  // 「正在刷新…」、不重建页面）：走和下拉完全相同的刷新路径，当前页签的面板自己决定
+  // 拉什么（有未保存草稿时它们不接，这里也就什么都不发）。
+  // 只有「刚刷完就切回来」（距上次成功刷新 < VISIBLE_REFRESH_GAP_MS）才跳过——
+  // 来回切窗口不该每次都打一遍接口。
   useEffect(() => {
     // 注意：暂停自动刷新只是停轮询。这里是一次性的「回来补一刀」，不受暂停影响——
     // 用户切回来最想看到的就是最新数据，而不是「已暂停」四个字。
     if (authExpired) return undefined
     const onVis = () => {
-      if (document.visibilityState !== 'visible') return
-      if (Date.now() - lastRefreshRef.current < VISIBLE_STALE_MS) return
+      if (document.hidden) return
+      if (Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS) return
       refreshActive({ respectFormPause: true }).catch(() => {})
     }
     document.addEventListener('visibilitychange', onVis)
@@ -6854,7 +6874,9 @@ function App () {
   useEffect(() => {
     if (tab !== 'overview') return undefined
     let alive = true
-    const load = () => { if (alive) refreshAuto() }
+    // 后台标签页同样不轮询：这条 2s 轮询不在主轮询 effect 里，此前一直照跑，
+    // 是「隐藏 15s 仍有请求」的主因。切回前台由「回到前台」effect 统一补拉（连带 refreshAuto）。
+    const load = () => { if (alive && !document.hidden) refreshAuto() }
     load()
     const t = setInterval(load, 2000)
     return () => { alive = false; clearInterval(t) }
@@ -7054,7 +7076,7 @@ function App () {
         <span class="sync-meta">
           ${pull.state !== 'idle'
             ? html`<${PullRefreshStatus} state=${pull.state} />`
-            : html`<${TapTip} showDate=${showDate} tip=${showDate && syncAt ? `数据截至：${fmtLocalTime(syncAt)} ${fmtWeekday(syncAt)}` : ''} hint=${showDate && syncAt ? '点看' : ''}><${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${syncAt} showDate=${showDate} paused=${!autoRefresh || authExpired} live=${livePolling} /><//>`}
+            : html`<${TapTip} showDate=${showDate} tip=${showDate && syncAt ? `数据截至：${fmtLocalTime(syncAt)} ${fmtWeekday(syncAt)}（${TZ_LABEL}）` : ''} hint=${showDate && syncAt ? '点看' : ''}><${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${syncAt} showDate=${showDate} paused=${!autoRefresh || authExpired} live=${livePolling} /><//>`}
         </span>
         <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
           onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>
