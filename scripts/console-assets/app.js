@@ -765,9 +765,13 @@ function Hint ({ tone, style, children }) {
 }
 
 // 面板头：标题 + 说明 + 右侧操作（右侧自动左推）。含 select 等复杂头部仍可手写。
-function PanelHead ({ title, sub, right, afterTitle }) {
+// 标题用真 heading 元素（读屏可按标题层级跳转）：默认 h2，页面主面板传 level=${1} 变成 h1。
+// 换成 h1/h2 后浏览器默认外边距会把面板头顶高，行内 margin:0 抵掉——视觉密度与旧的 span 完全一致
+// （字号/字重/单行/不伸缩都由 .panel-title 既有规则决定，不在这里写样式）。
+function PanelHead ({ title, sub, right, afterTitle, level = 2 }) {
+  const titleTag = level === 1 ? 'h1' : 'h2'
   return html`<div class="panel-head">
-    <span class="panel-title">${title}</span>
+    <${titleTag} class="panel-title" style="margin:0">${title}</${titleTag}>
     ${afterTitle}
     ${sub && html`<span class="panel-sub">${sub}</span>`}
     ${right && html`<span class="panel-right">${right}</span>`}
