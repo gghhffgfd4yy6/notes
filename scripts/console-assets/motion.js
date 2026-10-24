@@ -45,12 +45,10 @@ export function enter (el, opts = {}) {
   const frames = {}
   if (opts.transform !== false) frames.transform = [from, 'translate3d(0px, 0px, 0px) scale(1)']
   if (opts.fade !== false) frames.opacity = [0, 1]
-  let ctl = null
-  try {
-    ctl = animate(el, frames, { duration, delay, ease: EASE })
-  } catch (e) {
-    return null
-  }
+  // 不套 try/catch：frames 是常量、元素已确认可见，唯一现实失败是 UA 不支持
+  // WAAPI——先探一下能力直接返回，避免把 Promise 放进 try（Sonar S4822）。
+  if (typeof el.animate !== 'function') return null
+  const ctl = animate(el, frames, { duration, delay, ease: EASE })
   // 动画结束后清掉内联 opacity/transform：否则 WAAPI 留下的 `transform: none`
   // 会盖住 CSS 的 hover 抬升/按压反馈（内联样式优先于样式表）。
   // 用序号防止上一段动画的收尾回调清掉后来者的内联值。
