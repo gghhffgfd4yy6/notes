@@ -883,3 +883,16 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 时机纪律：所有入场只播一次（挂载 / 首次拿到数据 / 真正切页），5s 轮询重渲染不重播；动画结束后清掉内联 `opacity/transform`，避免盖住 CSS 的 hover/按压缩放。
 - `prefers-reduced-motion: reduce` 时适配层全部 no-op（页面直接到终态，不是快放），CSS 侧全局兜底保持不变。
 - 资产与门禁：`STATIC_ASSETS` 新增 3 个路由；`test_console.js` 的内容哈希清单同步；vendored bundle 进 `standard.ignore`；新增「动效层」结构红线（白名单 / 适配层隔离 / reduced-motion 门控 / 只动合成层属性 / 只播一次 / bundle 非空壳）。
+
+## v3.361 — 弹窗「从哪来回哪去」+ 动效幅度上调
+
+- 弹窗改成从触发点长出来：打开时按触发按钮的位置与宽度算位移与等比缩放，面板从按钮处放大到原位；取消 / 点遮罩 / Esc 时沿同一条路径缩回按钮再卸载（220ms，只动 transform/opacity）。触发元素优先取 `activeElement`，取不到时用最后一次 `pointerdown` 的按钮兜底——手机上点按钮不会聚焦，只看 activeElement 会退回中心缩放。
+- 退场统一走 `closeDialog()`：动画播完才回调卸载；回调仍读 `onCancelRef` 最新值（busy 守卫不被旧闭包绕过），结构红线同步改成新写法。
+- 幅度上调一档：切页 220ms、卡片位移 18px / 步进 48ms、弹窗兜底 `scale(.9)`、校验抖动 ±4px。上一版 6–12px 的位移在手机上几乎看不出来。
+- 控制台套件 245/0。
+## v3.362 — 变异超时治理
+
+- 控制台变异段不再「跑完了不退出」：`test_console.js` 在 `listen()` 单点登记 server/socket、`ok()/aok()` 在 finally 统一收尾，并给每条用例 15s 看门狗（超时记失败、继续下一条）。此前断言提前失败会跳过用例最后一行 `server.close()`，监听句柄钉住事件循环、进程打印完汇总仍不退出，被 Stryker 判 Timeout（part8 单段 313 个，console 9 段合计约 18h 空等）。
+- console 9 段单次等待上限 300s → 60s：矩阵加 `timeout_ms` 字段、由 `--timeoutMS` CLI 覆盖配置文件（不改配置指纹、不需要一次性全量重跑），其余 20 段仍 300s。
+- 日报新增 `真挂死` / `上限触发` / `超时上限` 三列：段 job 的 fail-closed 守卫在剥离 statusReason 之前落盘 `timeout-stats.json`，把 Timeout 分成「无 reason 的真挂死」与「tap-runner 的 `Hit limit reached` 上限触发」；缺失或与报告对不上显示 `—`，不得读作 0。分数口径不变（Timeout 仍计入 detected）。
+- 测试：`test_mutation_report.js` 94/94、`test_mutation_json.js` 24 项、`test_mutation_report_cli.js`、`test_mutation_ranges.js` 通过；`test_ci_skip_suites.js` 新增矩阵/run 行门禁（该套件本机的既有环境性失败与本次改动无关）；控制台套件 241/0。

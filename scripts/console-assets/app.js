@@ -16,7 +16,7 @@ import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, lo
 // 主题化覆盖写在 app.css 的 .flatpickr-calendar 段（跟四套 token 走）。
 import flatpickr from './flatpickr.js'
 // 动效层（v3.360）：app.js 只依赖自家适配层，换动画库只改 motion.js。
-import { MOTION, enter, flash, useEnterOnOpen, useFlipList, useMountReveal, useRevealWhen } from './motion.js'
+import { MOTION, enter, flash, useFlipList, useMorphDialog, useMountReveal, useRevealWhen } from './motion.js'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -771,7 +771,7 @@ function TapTip ({ tip, hint, children, showDate = true }) {
 function Hint ({ tone, style, children }) {
   // 提示行随错误/成功信息出现：轻量入场，扫一眼就知道「下面多了一行」。
   const ref = useRef(null)
-  useMountReveal(ref, { y: 6, duration: MOTION.fast })
+  useMountReveal(ref, { y: 8, duration: MOTION.fast })
   return html`<div ref=${ref} class=${tone === 'error' ? 'hint hint-err' : (tone === 'warn' ? 'hint hint-warn' : 'hint')} style=${style}>${children}</div>`
 }
 
@@ -1383,7 +1383,7 @@ const CARD_PLACEHOLDERS = [
 function CardsGrid ({ cards, busy }) {
   const ref = useRef(null)
   // 占位卡也算 .card：等真实数据（busy 结束）再播，别把入场浪费在「正在读取…」上。
-  useRevealWhen(ref, !busy && cards.length > 0, '.card', { y: 12, step: 0.035, cap: 5 })
+  useRevealWhen(ref, !busy && cards.length > 0, '.card', { y: 18, step: 0.05, cap: 5 })
   return html`<div class="cards" ref=${ref} aria-busy=${busy ? 'true' : undefined}>
     ${cards.map((c) => html`<${Card} key=${c.title} title=${c.title} main=${c.main}
       badge=${html`<${Badge} tone=${c.tone}>${c.badge}<//>`}>
@@ -1574,36 +1574,42 @@ const ACTION_DEFS = [
 // 固定 id 会让无障碍名称重复（Sourcery #271）。
 let dialogSeq = 0
 
-function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, initialFocusRef = null, onConfirm, onCancel, children }) {
-  const cancelRef = useRef(null)
-  // 回调每次渲染都是新函数；若把它放进 focus effect 的依赖，busy 变化会重新聚焦密码框，
-  // 手机上表现为点「解密」后键盘又弹一下。用 ref 取最新回调，effect 只在打开时跑一次。
+// 两个弹窗共用的关闭/焦点骨架：onCancel 每次渲染存进 ref（busy 守卫不被旧闭包绕过），
+// Escape 与「打开时聚焦」只写一遍——两份弹窗各抄一份会被 Sonar 判重复代码。
+function useDialogChrome (open, onCancel, { initialFocusRef = null, fallbackRef = null, closeDialog }) {
   const onCancelRef = useRef(onCancel)
   onCancelRef.current = onCancel
-  const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
-  // 弹窗入场（v3.360）：遮罩淡入、面板轻微上浮 + 缩放；关闭仍立即卸载，不做退场排队。
-  const backRef = useRef(null)
-  const boxRef = useRef(null)
-  useEnterOnOpen(backRef, open, { y: 0, duration: MOTION.fast })
-  useEnterOnOpen(boxRef, open, { y: 10, scale: 0.96 })
   useEffect(() => {
     if (!open) return undefined
-    const onKey = (e) => { if (e.key === 'Escape') onCancelRef.current() }
+    const onKey = (e) => { if (e.key === 'Escape') closeDialog(() => onCancelRef.current()) }
     document.addEventListener('keydown', onKey)
     const t = setTimeout(() => {
-      const target = initialFocusRef && initialFocusRef.current ? initialFocusRef.current : cancelRef.current
+      const target = (initialFocusRef && initialFocusRef.current) || (fallbackRef && fallbackRef.current)
       if (target) target.focus()
     }, 0)
     return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
   }, [open, initialFocusRef])
+  return onCancelRef
+}
+
+function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, initialFocusRef = null, onConfirm, onCancel, children }) {
+  const cancelRef = useRef(null)
+  const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
+  // 弹窗「从哪来回哪去」：从触发按钮的位置放大展开，取消/遮罩/Esc 时缩回按钮再卸载。
+  const backRef = useRef(null)
+  const boxRef = useRef(null)
+  const [closeDialog, dialogClosing] = useMorphDialog(backRef, boxRef, open)
+  // 回调每次渲染都是新函数；若把它放进 focus effect 的依赖，busy 变化会重新聚焦密码框，
+  // 手机上表现为点「解密」后键盘又弹一下。ref 在 useDialogChrome 里更新。
+  const onCancelRef = useDialogChrome(open, onCancel, { initialFocusRef, fallbackRef: cancelRef, closeDialog })
   if (!open) return null
-  return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) onCancelRef.current() }}>
+  return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current()) }}>
     <div class="modal" ref=${boxRef} role="dialog" aria-modal="true" aria-labelledby=${titleId}>
       <div class="modal-title" id=${titleId}>${title}</div>
       <div class="modal-body">${children}</div>
       <div class="modal-actions">
-        <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${() => onCancelRef.current()}>取消<//>
-        <${Button} variant="danger-solid" disabled=${busy || confirmDisabled} onClick=${onConfirm}>${confirmLabel}<//>
+        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => closeDialog(() => onCancelRef.current())}>取消<//>
+        <${Button} variant="danger-solid" disabled=${busy || confirmDisabled || dialogClosing} onClick=${onConfirm}>${confirmLabel}<//>
       </div>
     </div>
   </div>`
@@ -1613,22 +1619,13 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
 // 「保存并继续」会走正常的保存确认；只有真正保存成功，App 才继续原来的切页/后退动作。
 function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
   const cancelRef = useRef(null)
-  const onCancelRef = useRef(onCancel)
-  onCancelRef.current = onCancel
   const [titleId] = useState(() => `leave-title-${++dialogSeq}`)
   const backRef = useRef(null)
   const boxRef = useRef(null)
-  useEnterOnOpen(backRef, open, { y: 0, duration: MOTION.fast })
-  useEnterOnOpen(boxRef, open, { y: 10, scale: 0.96 })
-  useEffect(() => {
-    if (!open) return undefined
-    const onKey = (e) => { if (e.key === 'Escape') onCancelRef.current() }
-    document.addEventListener('keydown', onKey)
-    const t = setTimeout(() => { if (cancelRef.current) cancelRef.current.focus() }, 0)
-    return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
-  }, [open])
+  const [closeDialog, dialogClosing] = useMorphDialog(backRef, boxRef, open)
+  const onCancelRef = useDialogChrome(open, onCancel, { fallbackRef: cancelRef, closeDialog })
   if (!open) return null
-  return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) onCancelRef.current() }}>
+  return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current()) }}>
     <div class="modal" ref=${boxRef} role="dialog" aria-modal="true" aria-labelledby=${titleId}>
       <div class="modal-title" id=${titleId}>有未保存的过滤规则</div>
       <div class="modal-body">
@@ -1637,9 +1634,9 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
         <div class="modal-note">「保存并继续」会直接保存，保存成功后自动继续刚才的离开操作；「取消」继续编辑。</div>
       </div>
       <div class="modal-actions">
-        <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${() => onCancelRef.current()}>取消<//>
-        <${Button} variant="danger-solid" disabled=${busy} onClick=${onDiscard}>不保存并离开<//>
-        <${Button} variant="primary" disabled=${busy} onClick=${onSave}>保存并继续<//>
+        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => closeDialog(() => onCancelRef.current())}>取消<//>
+        <${Button} variant="danger-solid" disabled=${busy || dialogClosing} onClick=${onDiscard}>不保存并离开<//>
+        <${Button} variant="primary" disabled=${busy || dialogClosing} onClick=${onSave}>保存并继续<//>
       </div>
     </div>
   </div>`
@@ -5010,7 +5007,7 @@ function ConfigPanel ({ onSync, active = true, pollTick = 0 }) {
   const r = data && data.runtime ? data.runtime : null
   // 配置块入场：首次读到数据时轻推一次，之后每 5s 的轮询重渲染不再动。
   const panelRef = useRef(null)
-  useRevealWhen(panelRef, !!r, '.cfg-block', { y: 8, duration: MOTION.fast, step: 0.03, cap: 4 })
+  useRevealWhen(panelRef, !!r, '.cfg-block', { y: 12, duration: MOTION.fast, step: 0.035, cap: 4 })
   const pc = data && data.pushChannels ? data.pushChannels : null
   // 读面失败时 usePanelLoader 仍保留上一次的 data（不清空），这里必须显式丢弃，
   // 否则页面会一边报「读取失败、显示代码默认值」一边渲染旧的覆盖值（Sourcery #257）。
@@ -5301,8 +5298,8 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const [restoreTo, setRestoreTo] = useState('default')
   // 表单入场（v3.360）：分组先到、字段随后到，只播一次（轮询重拉不重播）。
   const formRef = useRef(null)
-  useRevealWhen(formRef, !!draft, '.fr-group', { y: 12, step: 0.045, cap: 4 })
-  useRevealWhen(formRef, !!draft, '.fr-field', { y: 8, duration: MOTION.fast, step: 0.018, cap: 8 })
+  useRevealWhen(formRef, !!draft, '.fr-group', { y: 16, step: 0.055, cap: 4 })
+  useRevealWhen(formRef, !!draft, '.fr-field', { y: 10, duration: MOTION.fast, step: 0.022, cap: 8 })
   const [loading, setLoading] = useState(false)
   const slowLoading = useSlowFlag(loading)
   const [busy, setBusy] = useState('') // '' | validate | preview | save | copy | restore

@@ -12,7 +12,9 @@ const path = require('node:path')
 const { constants: bufferConstants } = require('node:buffer')
 
 const KEY = Buffer.from('"statusReason"')
-const PLACEHOLDER = Buffer.from(':""')
+const PLACEHOLDER = Buffer.from(':""') // 空串占位（冒号 + 一对引号）
+const KEY_COLON_QUOTE = Buffer.from(':"')
+const CLOSE_QUOTE = Buffer.from('"')
 const MAX_STRING_LENGTH = 512 * 1024 * 1024 - 24 // V8 单字符串最大字符数（0x1fffffe8 ≈ 512MiB；表达式写法规避 Codacy PMD InnaccurateNumericLiteral 误报）
 // F1（返工）：读取前的**策略**上限。上一版默认取 buffer.constants.MAX_LENGTH（≈8 PiB）——那不是策略，
 // 只是把 readFileSync 自己的 ERR_OUT_OF_RANGE 换了个带路径/尺寸的文案，而两个生产调用方
@@ -56,45 +58,78 @@ function stringEnd (buf, i) {
   return -1
 }
 
-// 定位 idx 处 statusReason 字段的字符串值：返回值结束位置；非该字段/值非字符串时返回 -1
+// 定位 idx 处 statusReason 字段的字符串值范围 {start, end}：start = 开引号位置，end = 闭引号之后的位置。
+// 非该字段 / 值非字符串时返回 null。
 // （indexOf 命中的未必是字段名：某字符串值的引号+内容也可能构成同一字节序列——
 //   如 {"replacement":"statusReason"} 命中于值位置；故须再校验紧随 KEY 的冒号
 //   才能确认是字段，冒号检查才是剥离正确性的依据，而非引号位置）
-function statusReasonValueEnd (buf, idx) {
+function statusReasonValueRange (buf, idx) {
   const afterKey = skipWhitespace(buf, idx + KEY.length)
-  if (buf[afterKey] !== 0x3a /* : */) return -1
-  return stringEnd(buf, skipWhitespace(buf, afterKey + 1))
+  if (buf[afterKey] !== 0x3a /* : */) return null
+  const start = skipWhitespace(buf, afterKey + 1)
+  const end = stringEnd(buf, start)
+  return end === -1 ? null : { start, end }
 }
 
-// 追加 [pos, idx) 原文 + KEY + 空串占位（单次变参 push，S7778）
-function appendWithPlaceholder (chunks, buf, pos, idx) {
-  chunks.push(buf.subarray(pos, idx), KEY, PLACEHOLDER)
+// 取字符串字面量内容的**前 maxChars 个字符**（不含两侧引号），只按完整转义序列切分：
+// 落单的反斜杠或半条 \uXXXX 会让整份报告 JSON 解析失败，故遇到转义必须整段吞掉。
+// 末尾若停在 UTF-8 多字节序列中间，回退到非续字节边界（否则 toString('utf8') 会出现替换字符）。
+function stringContentPrefix (buf, start, end, maxChars) {
+  const contentStart = start + 1
+  const contentEnd = end - 1
+  let i = contentStart
+  let chars = 0
+  while (i < contentEnd && chars < maxChars) {
+    if (buf[i] === 0x5c /* \ */) {
+      const escapeLen = buf[i + 1] === 0x75 /* u */ ? 6 : 2 // \uXXXX 六字节，其余转义两字节
+      i = Math.min(i + escapeLen, contentEnd)
+    } else {
+      i += 1
+    }
+    chars++
+  }
+  while (i > contentStart && i < contentEnd && (buf[i] & 0xc0) === 0x80) i--
+  return buf.subarray(contentStart, i)
 }
 
-// 全 buffer 扫描：任意嵌套层级的字符串型 statusReason 一律改写为空串，返回替换后的字节块与剥离后总长。
+// 追加 [pos, idx) 原文 + KEY + 值占位（单次变参 push，S7778）。
+// replacement 自带冒号：默认是空串占位 `:""`；保留前缀时是 `:"<前 N 字符>"`。
+function appendWithPlaceholder (chunks, buf, pos, idx, replacement) {
+  chunks.push(buf.subarray(pos, idx), KEY, replacement)
+}
+
+// 全 buffer 扫描：任意嵌套层级的字符串型 statusReason 一律改写为空串（keepChars = 0，默认），返回替换后
+// 的字节块与剥离后总长。
+// keepChars > 0 时改为**保留前 keepChars 个字符**再截断（只给 mutation-guard 的 Timeout 取证用：它要按
+// statusReason 前缀区分「真挂死」与「命中上限」，而落盘剥离发生在守卫之后——见 mutation.yml 的步骤顺序）。
 // 返回**块**而不是 Buffer 是刻意的：调用方必须在 Buffer.concat（一次整份分配）**之前**用 strippedLength
 // 判 V8 上限（本文件 F1 修复），先比后分配的顺序不能被封装掉——读/写两条路径共用同一份实现与同一顺序。
 // 剥离是无条件的；返回值不携带「已改写」标记，调用方无法区分「被改写为空串」与「本来就是空串」。
-function stripStatusReason (buf) {
+function stripStatusReason (buf, keepChars = 0) {
   const chunks = []
   let pos = 0
+  // 前 N 字符保留只在显式要求且为正整数时生效；任何非法值都退回「整段置空串」的既有行为。
+  const keep = Number.isInteger(keepChars) && keepChars > 0 ? keepChars : 0
   // F1：边扫边累计剥离后的字节数。原先只在 Buffer.concat **之后**才比 MAX_STRING_LENGTH，
   // 那时整份报告已被复制一遍（分配峰值）；累计长度让上限判定落在 concat 之前，
   // 超限输入在读完之后、分配峰值之前就带路径快速失败。
   let strippedLength = buf.length
   let idx = buf.indexOf(KEY, pos)
   while (idx !== -1) {
-    const valueEnd = statusReasonValueEnd(buf, idx)
-    if (valueEnd === -1) {
+    const range = statusReasonValueRange(buf, idx)
+    if (range === null) {
       // 非字段命中一律原文保留：值非字符串（null/数字/对象/数组），或命中恰是内容为
       // statusReason 的字符串值本身（相似键名 statusReason2 不含带引号的 KEY，不会命中）
       chunks.push(buf.subarray(pos, idx + KEY.length))
       pos = idx + KEY.length
     } else {
-      // 丢弃 [idx+KEY.length, valueEnd) 共 (valueEnd-idx)-KEY.length 字节，改写为 2 字节占位
-      strippedLength -= (valueEnd - idx) - KEY.length - PLACEHOLDER.length
-      appendWithPlaceholder(chunks, buf, pos, idx)
-      pos = valueEnd
+      // 丢弃 [idx+KEY.length, range.end) 的原文，改写为空串占位或「前 N 字符」占位
+      const replacement = keep === 0
+        ? PLACEHOLDER
+        : Buffer.concat([KEY_COLON_QUOTE, stringContentPrefix(buf, range.start, range.end, keep), CLOSE_QUOTE])
+      strippedLength -= (range.end - idx) - KEY.length - replacement.length
+      appendWithPlaceholder(chunks, buf, pos, idx, replacement)
+      pos = range.end
     }
     idx = buf.indexOf(KEY, pos)
   }
@@ -159,6 +194,11 @@ function readReportJson (reportPath, options = {}) {
   // F1（返工）：预读大小上限默认取**生产策略值**（2 GiB，见 DEFAULT_MAX_FILE_BYTES）；生产调用方
   // 经 XBK_MUTATION_REPORT_MAX_BYTES 注入，测试注入小夹具值。
   const maxFileBytes = Number.isFinite(options && options.maxFileBytes) ? options.maxFileBytes : DEFAULT_MAX_FILE_BYTES
+  // 保留 statusReason 前 N 个字符而不是整段剥掉：只给 fail-closed 守卫的 Timeout 取证用
+  // （按前缀区分「真挂死」与 tap-runner 的「命中上限」）。默认 0 = 既有行为（整段置空串）。
+  const statusReasonPrefix = Number.isInteger(options && options.statusReasonPrefix) && options.statusReasonPrefix > 0
+    ? options.statusReasonPrefix
+    : 0
   // nosemgrep: 工具脚本按 CLI 传入路径读取报告，路径非用户净输入
   // Trust Model（v3.266 强化）：readReportJson 是内部 API，期望 reportPath
   //   来自已校验目录——scripts/mutation-report.js 链中 fs.statSync(dir)
@@ -173,7 +213,7 @@ function readReportJson (reportPath, options = {}) {
   // F1：读取前的护栏（拿到真实大小与文件类型后才决定是否整文件读入）与整文件读入都在
   // readGuardedBytes 里——写侧（writeStrippedReport）共用同一份实现，两条防线不会在读/写之间漂移。
   const { buf } = readGuardedBytes(abs, maxFileBytes)
-  const { chunks, strippedLength } = stripStatusReason(buf)
+  const { chunks, strippedLength } = stripStatusReason(buf, statusReasonPrefix)
   // 剥离后仍超上限：快速失败并给出可行动报错（V8 原生异常不含文件上下文）
   if (strippedLength > maxStringLength) {
     throw new Error(`JSON 剥离 statusReason 后仍为 ${strippedLength} 字节，超过 V8 字符串上限 ${maxStringLength}：${abs}`)

@@ -70,12 +70,150 @@ const { readMessages } = require('./scripts/status')
 
 let passed = 0
 let failed = 0
-function ok (name, fn) {
-  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; console.log(`  ❌ ${name}: ${e.message}`) }
+
+// ── 用例级收尾保障（变异测试 Timeout 的根因修复）──
+// 旧写法把 server.close() 放在用例最后一行：变异体让断言提前抛错 → 最后一行不执行 →
+// 监听句柄把事件循环钉住 → 进程打印完汇总也不退出 → Stryker 只能等满 timeoutMS 判 Timeout
+// （part8: 313/769 条 Timeout 里绝大多数是这种「跑完了但不退出」，不是用例真的跑不完）。
+// 收尾不能靠 241 条用例各自的自觉，必须由 harness 结构性保证：
+//   · listen() 是全文件唯一开监听的口子 → 在这里登记 server，并在 connection 上登记 socket；
+//   · SSE 用例的 waitConn/kick 是 setInterval 循环，同样在「最后一行」clear，同样会漏，
+//     所以在模块加载期登记 setInterval 句柄；
+//   · ok/aok 在每条用例结束（成功 / 断言失败 / 任意抛错）时统一收割，一步都不依赖用例代码。
+// 只包 setInterval，不包 setTimeout：setTimeout 的返回值被约定俗成当成可 unref/ref 的句柄，
+// 还支持额外传参、字符串回调，以及 util.promisify(setTimeout) 依赖的 [util.promisify.custom]
+// 自定义实现——全局换成包装函数会静默改掉这些语义（promisify 的 custom 会丢、字符串回调退化成
+// 空操作），而漏掉一个 setTimeout 最坏只是等它自然到期（最长 60s 的假 timer 由套件末那道
+// force-exit 闸兜住），代价远小于把全局 setTimeout 换掉。实测也确认：基线里唯一滞留在表里的
+// 是生产侧 SSE 每连接 heartbeat（自带 unref、不钉事件循环），setTimeout 从不滞留。
+// 真实泄漏不会被吞掉：兜底回收了东西就打印一行 ♻️，并把这一笔记进 leakedScopes；套件末的
+// 兜底闸据此把退出码置 1（评审 1：旧版「有泄漏但仍 exit 0」等于把泄漏吞掉）。正常路径下
+// server 已被用例自己关掉，收割是 no-op，不会产生噪音。
+const liveServers = new Set()
+const liveIntervals = new Set()
+// 全轮的真实泄漏记录：任一次收割（用例级 / 套件末 / 异常路径）收到真家伙就记一笔。
+// 套件末的兜底闸据此把退出码置 1——单看「最后一次收割」会漏掉用例级已经收掉的那笔。
+const leakedScopes = []
+const realSetInterval = global.setInterval
+const realSetTimeout = global.setTimeout
+const realClearInterval = global.clearInterval
+const realClearTimeout = global.clearTimeout
+global.setInterval = function (...args) {
+  const h = realSetInterval(...args)
+  liveIntervals.add(h)
+  return h
 }
+global.clearInterval = function (h) { liveIntervals.delete(h); return realClearInterval(h) }
+
+function trackSockets (server) {
+  if (server._testSockets) return
+  server._testSockets = new Set()
+  server.on('connection', (socket) => {
+    server._testSockets.add(socket)
+    socket.on('close', () => server._testSockets.delete(socket))
+  })
+}
+
+// 同步收割即可：socket.destroy() 让长连接/keep-alive 立刻终结，server.close() 同步摘掉
+// 监听句柄；close 回调在下一 tick 自行跑完，不需要 await 也能排空事件循环。
+//
+// 返回值是本轮收割到的「真实泄漏」：closed = 还开着的监听 server，cleared = 还在跑的 ref
+// interval。unref 过的 interval（生产 SSE 每连接 heartbeat、用例自己 unref 的）不钉事件循环，
+// 因此不算泄漏、不入 ♻️、不计失败——但**仍然 clearInterval**：测试结束就不该留后台定时器，
+// 否则它自己的 teardown 失败时会一直空跑到进程退出（评审 3）。
+function reapTestScope (label) {
+  let closed = 0
+  let cleared = 0
+  for (const t of liveIntervals) {
+    // hasRef 探测本身可能抛（已被 clear 的句柄），抛了按「有引用」处理，宁可多报不漏报。
+    let refd
+    try { refd = !(typeof t.hasRef === 'function' && !t.hasRef()) } catch (e) { refd = true }
+    try { realClearInterval(t) } catch (e) {}
+    if (refd) cleared++
+  }
+  liveIntervals.clear()
+  for (const server of liveServers) {
+    for (const socket of server._testSockets || []) { try { socket.destroy() } catch (e) {} }
+    if (server.listening) { try { server.close() } catch (e) {} closed++ }
+  }
+  liveServers.clear()
+  if (closed || cleared) {
+    console.log(`  ♻️ ${label} 收尾兜底：关闭残留 server ${closed} 个 / 清理残留 interval ${cleared} 个`)
+    leakedScopes.push(`${label}（server ${closed} / interval ${cleared}）`)
+  }
+  return { closed, cleared }
+}
+
+// 上一个 aok 超时未收尾的标记：aok 用 Promise.race 定局后原 work 仍在跑，Promise 没有取消
+// 语义（原理上做不到把它掐掉），它迟到的回调可能新建 server/socket/interval 或改共享状态。
+// 这里不做取消，只做最小防护：下一条 ok/aok 开始时先补一次收割，把僵尸刚造出来的句柄收掉；
+// 真正的兜底是套件末那道非零退出闸——迟到回调不可取消，只能靠后续收割 + 非零退出兜底。
+let timedOutStale = null
+function reapStaleTimeout (next) {
+  if (!timedOutStale) return
+  const prev = timedOutStale
+  timedOutStale = null
+  console.log(`  ⏱️ ${prev} 已超时，迟到回调不可取消——先补一次收割再跑 ${next}`)
+  reapTestScope(`${prev} 超时补收割`)
+}
+
+function refdHandleNames (ignore) {
+  // 过滤「不钉事件循环」的句柄：unref 过的 timer/server/socket 不算泄漏；stdio 也不算
+  // （管道形态下 process.stdout/stderr 常驻 _getActiveHandles）。剩下的才是真泄漏。
+  const skip = new Set([ignore, process.stdout, process.stderr, process.stdin])
+  const names = []
+  for (const h of process._getActiveHandles()) {
+    if (!h || skip.has(h)) continue
+    let refd
+    try { refd = !(typeof h.hasRef === 'function' && !h.hasRef()) } catch (e) { refd = true }
+    if (!refd) continue
+    names.push((h.constructor && h.constructor.name) || typeof h)
+  }
+  return names
+}
+
+function ok (name, fn) {
+  reapStaleTimeout(name)
+  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; console.log(`  ❌ ${name}: ${e.message}`) } finally { reapTestScope(name) }
+}
+// 变异体还有第二类 Timeout：不是「跑完不退出」，而是用例内部 await 永不返回（例如变异体
+// 删掉 res.end 后 request() 永远等不到响应）。收尾收割只能在用例结束后跑，因此必须给每条
+// 用例一个上界：超时记失败、继续下一条。
+// 取值 25s 的依据（评审 4 校准，旧注释 15s 的口径是错的）：
+//   · 基线最慢单条 5.3–5.5s（readRunHistory 尾窗），25s ≈ 4.5x，慢机器/抖动仍有富余；
+//   · 必须严格大于 SSE 用例的最长内层等待 20s（untilTornDown(20000)：超限硬断要等满 20s
+//     才能判负），否则合法慢用例会先被看门狗判红——15s 时这条用例本来就在赌，机器一慢就假红。
+// 已知边界：同步死循环（while (true) {}）用同线程定时器打断不了——看门狗自己也是这个线程上的
+// 回调，永远轮不到它执行。那种形态只能靠上层兜住（Stryker 的 timeoutMS、CI 的 step 超时）。
+const TEST_TIMEOUT_MS = 25000
 async function aok (name, fn) {
-  try { await fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) {
+  reapStaleTimeout(name)
+  let watchdog = null
+  let timedOut = false
+  try {
+    const work = Promise.resolve().then(fn)
+    // 看门狗判定超时后 work 仍可能稍后 reject（例如用例内部自己的 8s 等待又失败）；
+    // race 已定局，这里显式吞掉，避免 unhandledRejection 把整个套件带崩、把失败数算错。
+    work.catch(() => {})
+    await Promise.race([
+      work,
+      new Promise((_resolve, reject) => {
+        watchdog = realSetTimeout(() => {
+          timedOut = true
+          reject(new Error(`用例超时 ${TEST_TIMEOUT_MS}ms（内部 await 未返回）`))
+        }, TEST_TIMEOUT_MS)
+        // 这里绝不能 unref()：unref 的 timer 不撑事件循环，而「纯 await 永不返回、手上又没有
+        // 其它 ref 句柄」的用例正是要看门狗救的形态——unref 后进程会在到点前直接空转退出，
+        // 打印半套汇总、exit 0，Stryker 反而当成通过（比判 Timeout 更糟）。timer 在 finally 里
+        // 清掉，跑完的用例不会因为它在收尾多等 25s。
+      })
+    ])
+    passed++
+    console.log(`  ✅ ${name}`)
+  } catch (e) {
     failed++
+    // 超时是真超时（不是用例自己抛的错）才记僵尸标记：后续用例开始前会因此补收割一次。
+    if (timedOut) timedOutStale = name
     // 带自定义消息的 assert 会把 actual/expected 藏起来（只留「剩余秒数按 5s 窗算」这种描述），
     // 排障时看不出差在哪。这里补上短摘要，超长截断。
     let detail = ''
@@ -83,6 +221,9 @@ async function aok (name, fn) {
       try { detail = ` (actual=${JSON.stringify(e.actual)} expected=${JSON.stringify(e.expected)})`.slice(0, 200) } catch (err) { detail = '' }
     }
     console.log(`  ❌ ${name}: ${e.message}${detail}`)
+  } finally {
+    if (watchdog) realClearTimeout(watchdog)
+    reapTestScope(name)
   }
 }
 
@@ -721,6 +862,8 @@ ok('T-P3 exportRowOf: 五字段白名单 / 缺省回退 / 200 码元截断 / tim
 
 // ── HTTP 端到端 ──
 function listen (server) {
+  trackSockets(server)
+  liveServers.add(server)
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)))
 }
 function request (port, method, urlPath, { token, body, headers } = {}) {
@@ -1974,18 +2117,34 @@ async function backupUiStructureTests () {
     const end = src.indexOf('function LeaveGuardDialog', at)
     assert.ok(at > -1 && end > at, '应能定位 ConfirmDialog')
     const seg = src.slice(at, end)
-    assert.ok(seg.includes('const onCancelRef = useRef(onCancel)'), 'onCancel 必须走 ref')
-    assert.ok(seg.includes('onCancelRef.current = onCancel'), '每次渲染都要把 ref 更新到最新 onCancel')
+    // v3.361：两个弹窗共用 useDialogChrome（各抄一份会被 Sonar 判重复代码），
+    // ref 初始化/更新与 Escape 绑定都收在骨架里，仍要求回调读 ref 而不是旧闭包。
+    const hAt = src.indexOf('function useDialogChrome')
+    assert.ok(hAt > -1 && hAt < at, '应能定位 useDialogChrome')
+    const hook = src.slice(hAt, src.indexOf('\n}\n', hAt))
+    assert.ok(hook.includes('const onCancelRef = useRef(onCancel)'), 'onCancel 必须走 ref')
+    assert.ok(hook.includes('onCancelRef.current = onCancel'), '每次渲染都要把 ref 更新到最新 onCancel')
+    assert.ok(seg.includes('useDialogChrome(open, onCancel'), '两个弹窗都必须走公共骨架')
+    // v3.361：退场动画那 220ms 里确认/保存按钮必须禁用——否则按了取消、动作照跑。
+    assert.ok(seg.includes('const [closeDialog, dialogClosing] = useMorphDialog'), '必须拿到 closing 状态')
+    const attr = (js) => 'disabled=' + '$' + '{' + js + '}'
+    const leaveSeg = src.slice(end, src.indexOf('\n}\n', end))
+    assert.ok(seg.includes(attr('dialogClosing')), '确认弹窗的取消按钮在退场期间要禁用')
+    assert.ok(seg.includes(attr('busy || confirmDisabled || dialogClosing')), '确认按钮在退场期间要禁用')
+    assert.ok(leaveSeg.includes(attr('dialogClosing')), '离开弹窗的取消按钮在退场期间要禁用')
+    assert.ok(leaveSeg.includes(attr('busy || dialogClosing')), '离开弹窗的保存/丢弃按钮在退场期间要禁用')
 
     // 三个退出入口都必须调用 ref，而不是捕获的旧 onCancel；否则 busy 守卫可能被旧闭包绕过。
-    assert.match(seg, /Escape'\) onCancelRef\.current\(\)/, 'Escape 必须调用 ref')
-    assert.ok(seg.includes('if (e.target === e.currentTarget) onCancelRef.current()'), '点遮罩必须调用 ref')
-    assert.ok(seg.includes('onClick=' + '$' + '{() => onCancelRef.current()}'), '取消按钮必须调用 ref')
+    // v3.360：三个入口都先播退场再回调，但回调本身仍走 ref（避免旧闭包绕过 busy 守卫）。
+    assert.match(hook, /if \(e\.key === 'Escape'\) closeDialog\(\(\) => onCancelRef\.current\(\)\)/,
+      'Escape 必须判断 ===（反向/不等号写法不能过），并调用 ref')
+    assert.ok(seg.includes('if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current())'), '点遮罩必须调用 ref')
+    assert.ok(seg.includes('onClick=' + '$' + '{() => closeDialog(() => onCancelRef.current())}'), '取消按钮必须调用 ref')
 
     // 依赖数组必须属于“聚焦”的那个 effect，不能靠组件里别处的同名字符串蒙混。
-    const focusEffect = seg.match(/const t = setTimeout\(\(\) => \{[\s\S]*?\n\s*\}, \[([^\]]*)\]\)/)
-    assert.ok(focusEffect, '应能定位聚焦 effect')
-    assert.deepStrictEqual(focusEffect[1].split(',').map((s) => s.trim()).filter(Boolean), ['open', 'initialFocusRef'],
+    // 不用正则：嵌套量词会被 Sonar 判「回溯性能」。
+    assert.ok(hook.includes('setTimeout(() => {'), '应能定位聚焦的 setTimeout')
+    assert.ok(hook.includes('}, [open, initialFocusRef])'),
       '聚焦 effect 只能依赖 open/initialFocusRef；依赖 onCancel 会让 busy 变化重开键盘')
   })
 }
@@ -5272,7 +5431,8 @@ async function main () {
       '正式运行与通知自检必须走确认；试运行/环境检查直接执行')
     assert.ok(src.includes("cls: 'btn-danger-solid'"), '正式运行必须是红色危险按钮')
     assert.ok(src.includes('role="dialog"') && src.includes('aria-modal="true"'), '弹窗必须有无障碍语义')
-    assert.ok(src.includes('defaultFocus') === false && src.includes('cancelRef.current.focus()'),
+    // v3.361：焦点 effect 收进 useDialogChrome，取消按钮通过 fallbackRef 传进去。
+    assert.ok(src.includes('defaultFocus') === false && src.includes('fallbackRef.current') && src.includes('fallbackRef: cancelRef'),
       '默认焦点必须落在取消，不能落在确认')
     assert.ok(src.includes('function AlertBanner'), '首屏必须有失败横幅')
     assert.ok(src.includes("state.stats.status === 'ok'"), '状态卡必须消费 stats')
@@ -5844,6 +6004,24 @@ async function main () {
     assert.strictEqual(motionAllowed(false), true, '未开启时必须允许动效')
     assert.strictEqual(motionAllowed(undefined), true, '取不到 media query（老浏览器/测试环境）时按允许处理')
     assert.strictEqual(motionAllowed(null), true, 'matchMedia 缺失时不得把动效全关掉')
+  })
+
+  await aok('行为: morphFrom（弹窗从触发点长出来的几何：等比缩放 / 夹下限 / 量不到尺寸退回 null）', async () => {
+    const { morphFrom } = await import('./scripts/console-assets/pure.mjs')
+    // 62px 按钮 → 342px 面板：缩放 = 62/342，位移把面板中心对到按钮中心。
+    const f = morphFrom({ left: 10, top: 100, width: 62, height: 44 }, { left: 24, top: 300, width: 342, height: 200 })
+    assert.ok(Math.abs(f.s - 62 / 342) < 1e-9, '缩放必须是「按钮宽 / 面板宽」，等比')
+    assert.strictEqual(f.dx, Math.round(10 + 31 - (24 + 171)), '水平位移要把中心对齐')
+    assert.strictEqual(f.dy, Math.round(100 + 22 - (300 + 100)), '垂直位移要把中心对齐')
+    // 按钮比面板还宽：夹到 1，不能放大过头。
+    const big = morphFrom({ left: 0, top: 0, width: 900, height: 80 }, { left: 0, top: 0, width: 300, height: 200 })
+    assert.ok(big.s <= 1 && big.s > 0.99, '按钮比面板宽时夹到 1，不能放大过头')
+    // 极窄按钮：不低于 0.16，避免缩成一个点。
+    assert.ok(Math.abs(morphFrom({ left: 0, top: 0, width: 8, height: 8 }, { left: 0, top: 0, width: 342, height: 200 }).s - 0.16) < 1e-9)
+    assert.strictEqual(morphFrom(null, { left: 0, top: 0, width: 300, height: 200 }), null, '没有触发元素时返回 null')
+    assert.strictEqual(morphFrom({ left: 0, top: 0, width: 62, height: 44 }, { left: 0, top: 0, width: 0, height: 200 }), null, '面板隐藏/量不到尺寸时返回 null')
+    const js = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'motion.js'), 'utf8')
+    assert.ok(js.includes('morphFrom(src, r)'), 'motion.js 必须用 pure.mjs 的几何函数，别在 hook 里另写一份')
   })
 
   await aok('结构红线: 主题切换（4 套 token / 首帧服务端渲染 / cookie 记忆）', () => {
@@ -7292,5 +7470,27 @@ main()
   .then(() => {
     console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}`)
     if (failed > 0) process.exitCode = 1
+    const lastReap = reapTestScope('套件末')
+    // 兜底闸（评审 1）：最后一次收割仍收到 server / ref interval，或本轮任何一次收割收到过
+    // 真家伙，都必须让退出码非 0——旧版这里是「有泄漏但仍 exit 0」，泄漏被静默吞掉。
+    // unref interval 只 clear 不计（见 reapTestScope），不参与本判定，所以不会误伤基线。
+    if (leakedScopes.length > 0 || lastReap.closed > 0 || lastReap.cleared > 0) {
+      process.exitCode = 1
+      console.error(`[console-suite] 检测到测试资源泄漏：${leakedScopes.length} 次收尾兜底（${leakedScopes.join('；')}）——退出码置 1`)
+    }
+    // 最后一道闸：万一还有用例之外的东西攥着事件循环（孙进程 / 未走 listen 的句柄 / 超时
+    // 用例的迟到回调刚造出来的资源），也不让 CI 白等满 timeoutMS。unref() 保证没有泄漏时它
+    // 根本不触发。强退前必须再判一次：真发现 ref 句柄就把退出码置 1 并说明原因（评审 1）。
+    const guard = realSetTimeout(() => {
+      const handles = refdHandleNames(guard)
+      if (handles.length > 0) {
+        process.exitCode = 1
+        console.error(`[console-suite] 汇总后仍有活跃句柄（${handles.join(',')}），判定泄漏：退出码置 1 后强制退出`)
+      } else {
+        console.error('[console-suite] 汇总后事件循环仍未排空，但未发现 ref 句柄（unref 句柄不钉循环），强制退出')
+      }
+      process.exit(process.exitCode || 0)
+    }, 3000)
+    guard.unref()
   })
-  .catch(e => { console.error('套件执行异常:', e.message); process.exitCode = 1 })
+  .catch(e => { console.error('套件执行异常:', e.message); process.exitCode = 1; reapTestScope('套件异常') })

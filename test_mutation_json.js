@@ -390,6 +390,138 @@ try {
 } finally {
   fs.rmSync(tmpdir, { recursive: true, force: true })
 }
+// ===== Timeout 取证（mutation-guard 落盘的 timeout-stats.json）=================================
+// 为什么必须单独锁：`Timeout` 在日报口径里算「已检出」（(killed+timeout)/total），但它的成因有两类——
+//   ① 真挂死（TimeoutDecorator 杀掉，报告**不带** statusReason）；
+//   ② tap-runner 的命中上限（determineHitLimitReached，statusReason 以 `Hit limit reached (n/m)` 开头）。
+// 落盘剥离步（mutation.yml 的「剥离报告中的 statusReason」）把 reason 置空串 ⇒ artifact 里再也分不开这两类。
+// 故守卫必须在剥离**之前**按前缀分类，落盘 timeout-stats.json 供日报分列；且**退出码语义一字不改**
+// （这是可观测性，不是门禁——写失败只告警）。
+{
+  const {
+    classifyTimeoutReason, collectTimeoutStats, evaluateReports, run, TIMEOUT_STATS_FILENAME
+  } = require('./scripts/mutation-guard.js')
+  const loc = { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } }
+  const mutant = (id, status, reason) => {
+    const m = { id, mutatorName: 'BlockStatement', location: loc, status }
+    if (reason !== undefined) m.statusReason = reason
+    return m
+  }
+
+  // ① 分类口径：正例 / 反例 / 缺键 / 非字符串。反例（前缀不完整、其它 reason）必须**不**被算成 hitLimit：
+  //    放宽成 startsWith('Hit') 或 /Hit limit/ 会把「真挂死」洗成「上限触发」，正好掩盖本 PR 要盯的风险。
+  assert.strictEqual(classifyTimeoutReason(undefined), 'hang', '缺 statusReason 键 ⇒ 真挂死（TimeoutDecorator 不带 reason）')
+  assert.strictEqual(classifyTimeoutReason(null), 'hang', 'null ⇒ 真挂死')
+  assert.strictEqual(classifyTimeoutReason(''), 'hang', '空串 ⇒ 真挂死')
+  assert.strictEqual(classifyTimeoutReason('  \n\t'), 'hang', '纯空白 ⇒ 真挂死')
+  assert.strictEqual(classifyTimeoutReason('Hit limit reached (8/8)'), 'hitLimit', 'tap-runner 命中上限 ⇒ hitLimit')
+  assert.strictEqual(classifyTimeoutReason('  Hit limit reached (3/5)'), 'hitLimit', '前导空白同样识别（日志常带缩进）')
+  assert.strictEqual(classifyTimeoutReason('Hit limit reached'), 'hitLimit', '不带 (n/m) 也按前缀识别')
+  assert.strictEqual(classifyTimeoutReason('Hit limit'), 'other', '前缀不完整不得算 hitLimit（防放宽判据）')
+  assert.strictEqual(classifyTimeoutReason('TimeoutDecorator: test run took 120000ms'), 'other', '其它 reason ⇒ other，不冒充前两类')
+  assert.strictEqual(classifyTimeoutReason(42), 'hang', '非字符串（schema 外）按「无可用 reason」处理，不 throw')
+
+  // ② 结构异常不 throw（取证不是门禁：一份坏报告不该让守卫多一条失败路径）
+  assert.deepStrictEqual(collectTimeoutStats(null, 'x'),
+    { segment: 'x', total: 0, hang: 0, hitLimit: 0, other: 0, otherReasons: [], mutants: 0 },
+    'null 报告必须退化为全 0 且不抛')
+  assert.strictEqual(collectTimeoutStats({ files: { 'a.js': null } }, 'x').mutants, 0, 'files 条目非法只跳过，不抛')
+
+  // ③ 端到端：evaluateReports 读到的是**带前缀的 statusReason**（readReportJson 的 statusReasonPrefix），
+  //    故 hang / hitLimit 能分开；同时覆盖「缺 statusReason 键」的兼容与「转义/多字节不破坏 JSON」。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-timeout-stats-'))
+  try {
+    const reportPath = path.join(dir, 'mutation.json')
+    const report = {
+      schemaVersion: '2',
+      files: {
+        'scripts/console.js': {
+          language: 'javascript',
+          source: 'x',
+          mutants: [
+            mutant('1', 'Killed'),
+            mutant('2', 'Timeout', 'Hit limit reached (8/8)'),
+            mutant('3', 'Timeout'), // 缺键 ⇒ hang
+            mutant('4', 'Timeout', ''),
+            mutant('5', 'Timeout', 'TimeoutDecorator: test run took 120000ms'),
+            mutant('6', 'Timeout', '引号" 与 \\u00e9 与 😀 tail'), // 转义 + 多字节 ⇒ other，截断后仍是合法 JSON
+            mutant('7', 'Survived')
+          ]
+        }
+      }
+    }
+    fs.writeFileSync(reportPath, JSON.stringify(report))
+    const evaluated = evaluateReports([reportPath], { segment: 'console-part1', env: {} })
+    assert.strictEqual(evaluated.ok, true, '正常报告仍应通过（取证不得引入新失败）')
+    const stats = evaluated.reports[0].timeoutStats
+    assert.deepStrictEqual(
+      { total: stats.total, hang: stats.hang, hitLimit: stats.hitLimit, other: stats.other, mutants: stats.mutants, segment: stats.segment },
+      { total: 5, hang: 2, hitLimit: 1, other: 2, mutants: 7, segment: 'console-part1' },
+      '五个 Timeout 必须按 statusReason 分成 2 hang / 1 hitLimit / 2 other，且 mutants 计全部变异体'
+    )
+    assert.ok(stats.otherReasons.some(r => r.startsWith('TimeoutDecorator')), 'other 必须留诊断样本')
+    assert.ok(stats.otherReasons.every(r => r.length <= 120), 'other 样本必须截断，避免把整段测试输出塞进取证文件')
+
+    // ④ run() 落盘：文件就在报告同目录（CI = reports/mutation/，随 artifact 上传），且不改变退出码
+    const out = []
+    const errw = []
+    const io = { stdout: { write: s => out.push(String(s)) }, stderr: { write: s => errw.push(String(s)) }, env: {} }
+    assert.strictEqual(run(['--segment', 'console-part1', reportPath], io), 0, '正常报告 exit 0 不变')
+    const statsPath = path.join(dir, TIMEOUT_STATS_FILENAME)
+    assert.ok(fs.existsSync(statsPath), '守卫必须在报告同目录落盘 ' + TIMEOUT_STATS_FILENAME + '（否则 artifact 里没有取证）')
+    const saved = JSON.parse(fs.readFileSync(statsPath, 'utf8'))
+    assert.strictEqual(saved.segment, 'console-part1', '取证必须带段名')
+    assert.strictEqual(saved.hang, 2, '落盘的 hang 必须与内存统计一致')
+    assert.strictEqual(saved.hitLimit, 1, '落盘的 hitLimit 必须与内存统计一致')
+    assert.ok(out.join('').includes('Timeout 取证'), 'stdout 必须给出取证摘要（CI 日志可读）')
+    assert.strictEqual(errw.join(''), '', '绿报告不得有 stderr 输出（取证不是失败）')
+
+    // ⑤ 红报告（RuntimeError）同样留证：Timeout 的成因在「本段要红」时更值得看，且退出码仍为 1
+    const redDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-timeout-stats-red-'))
+    try {
+      const redReport = path.join(redDir, 'mutation.json')
+      fs.writeFileSync(redReport, JSON.stringify({
+        files: { 'x.js': { mutants: [mutant('1', 'RuntimeError'), mutant('2', 'Timeout', 'Hit limit reached (1/1)')] } }
+      }))
+      assert.strictEqual(run(['--segment', 'storage', redReport], io), 1, 'RuntimeError 仍必须 exit 1（判据不变）')
+      assert.ok(fs.existsSync(path.join(redDir, TIMEOUT_STATS_FILENAME)), '红报告也必须留证')
+    } finally {
+      fs.rmSync(redDir, { recursive: true, force: true })
+    }
+
+    // ⑥ 超长多字节 reason 的前缀截断：③ 里的 reason 都短于 64 的保留上限，截断逻辑整段退化也不会被发现
+    //    （无论截不截都完整命中 other）。这里用 80 个汉字（240 字节，> 64）逼出真实截断路径：
+    //    实现按**字节**推进（每个字 3 字节），到第 64 字节落在第 22 个汉字中间，再回退到 UTF-8 边界，
+    //    故结果是 21 个汉字 / 63 字节——不是 64 个字符。口径若被改成 String#slice(0, 64)（字符计数、
+    //    或按字节切但忘了回退），长度与结尾都会变（后者还会切出半个字符 ⇒ U+FFFD），下面逐条断言。
+    const longReason = '汉'.repeat(80)
+    const longPath = path.join(dir, 'mutation-long.json')
+    fs.writeFileSync(longPath, JSON.stringify({
+      files: { 'scripts/console.js': { mutants: [mutant('1', 'Timeout', longReason)] } }
+    }))
+    const longPrefix = readReportJson(longPath, { statusReasonPrefix: 64 }).files['scripts/console.js'].mutants[0].statusReason
+    assert.strictEqual(longReason.length, 80, '对照前提：夹具 reason 必须长于 64 的保留上限')
+    assert.ok(Buffer.byteLength(longReason) > 64, '对照前提：多字节 reason 的字节数也远超 64')
+    assert.strictEqual(longPrefix, '汉'.repeat(21),
+      `前缀必须是 21 个汉字（64 字节处回退到 UTF-8 边界），实际 ${longPrefix.length} 字 / ${Buffer.byteLength(longPrefix)} 字节`)
+    assert.strictEqual(longPrefix.length, 21, '字符数必须是 21（不是 64：保留口径按字节推进）')
+    assert.strictEqual(Buffer.byteLength(longPrefix), 63, '字节数必须是 63（不得留下半个汉字）')
+    assert.ok(!longPrefix.includes('\ufffd'),
+      '前缀结尾不得出现 U+FFFD：出现即说明按字节切完没回退到 UTF-8 边界（解码时被替换成三字节 EF BF BD）')
+    assert.notStrictEqual(longPrefix, longReason, '超长 reason 必须被截断（不得整段保留，那会撑大取证与内存）')
+    assert.strictEqual(readReportJson(longPath, {}).files['scripts/console.js'].mutants[0].statusReason, '',
+      '不传 statusReasonPrefix 时仍是既有行为：整段置空串')
+    assert.strictEqual(classifyTimeoutReason(longPrefix), 'other', '截断后仍应归 other 类（前缀不冒充前两类）')
+    const longStats = collectTimeoutStats(readReportJson(longPath, { statusReasonPrefix: 64 }), 'console-part1')
+    assert.strictEqual(longStats.other, 1, '端到端：超长 reason 计入 other')
+    assert.strictEqual(longStats.otherReasons[0], '汉'.repeat(21), '诊断样本取的也是截断后的前缀（不把整段攒进取证）')
+
+    console.log('✅ Timeout 取证：hang/hitLimit/other 分类（含缺键/空白/前缀不完整/转义/多字节/超长截断）+ timeout-stats.json 落盘 + 退出码不变')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
 // ===== G11-MG：mutation-guard 的形态守卫与参数解析（c8 实测本文件 15 条分支未达）=====
 // 这些是「报告坏了必须炸、参数不明必须拒」的 fail-closed 出口。既有 guard 用例只喂合法报告，
 // 结构非法的四条 throw 路径、未知/缺失 status、以及 parseArgs 的 --segment / -- / 笔误分支
