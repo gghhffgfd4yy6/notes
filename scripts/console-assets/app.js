@@ -42,7 +42,10 @@ const BOOT = readBoot()
 // persisted=true 即非首次加载，强制重载拿当前凭证（no-store 不保证 BFCache 驱逐）。
 window.addEventListener('pageshow', (ev) => { if (ev.persisted) window.location.reload() })
 
-const POLL_MS = 5000
+// 轮询间隔：5s → 15s。三个接口每拍约 16KB（/api/messages 14.4KB + 状态 + 历史），
+// 5s 一轮就是 ~11MB/小时——控制台常驻开着也看不完这么新的数据。手动刷新、下拉刷新、
+// 切回前台都不受这个间隔约束（走一次性补拉）；任务在跑时仍用 POLL_BUSY_MS 快轮询。
+const POLL_MS = 15000
 const POLL_BUSY_MS = 2000
 // 部署后旧标签页仍跑旧脚本（数据照常轮询，看起来「在线」却看不到新 UI）。每 60s 对一次
 // /api/sys 的版本，不一致就挂一条「刷新后生效」的提示——不自动 reload，避免打断正在填的表单。
@@ -64,9 +67,11 @@ const NOTIFY_WINDOW_MAX_S = 3600
 const NOTIFY_WINDOW_DEFAULT_S = 60
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
-// 服务端时间戳统一按 Asia/Shanghai（UTC+8）渲染，不跟浏览器时区走。
-// 服务器时区是 UTC，若用本地 getHours()，「自动刷新 14:xx」会和 run.log 的 22:xx 混显，
-// 看起来像日志停在 8 小时前（实测）。上海无夏令时，固定 +8 即可。
+// 控制台里所有时间都按北京时间（Asia/Shanghai，固定 UTC+8）显示，不跟浏览器时区走。
+// 服务器时区是 UTC，推送列表里的时间也是 CST 文本；顶栏「数据截至」此前用浏览器本地时区，
+// UTC 客户端会在同一屏上看到两个钟（列表 22:41 / 顶栏 14:41），像数据停在 8 小时前。
+// 上海无夏令时，固定 +8 即可。时区只在顶栏标一次（TZ_LABEL）：全屏同钟，标一处就够。
+const TZ_LABEL = '北京时间'
 function fmtTime (ts) {
   if (!ts) return '—'
   const d = new Date(Number(ts) + 8 * 3600 * 1000)
@@ -78,13 +83,11 @@ function fmtNum (n) {
   return (n === undefined || n === null) ? '—' : String(n)
 }
 
-// 本机时钟（lastSync = 浏览器 Date.now()）用本地时间渲染：套 fmtTime 的 +8 会让
-// 非 UTC+8 用户看到「未来时间」（审查 #244 可选）。服务器时间戳仍走 fmtTime。
+// 浏览器侧时间戳（lastSync = Date.now()）同样按北京时间渲染：顶栏与列表必须同屏同钟。
+// 保留这个名字是因为它的语义是「客户端时钟」而不是「本地时区」——改用 fmtTime 之后，
+// UTC 客户端看到的时间与列表、与 run.log 一致（此前差 8 小时）。
 function fmtLocalTime (ts) {
-  if (!ts) return '—'
-  const d = new Date(Number(ts))
-  const p = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  return fmtTime(ts)
 }
 
 // 只取时分秒（Asia/Shanghai）：触发结果行要与 run.log 的时间对照，口径必须与 fmtTime 一致。
@@ -686,7 +689,8 @@ function fmtBarTime (ts, withDate) {
 
 // 顶栏状态行：所有页共用这一个组件、这一套词（v3.346）。
 //  - 轮询中的页（概览/日志）秒数倒数；不轮询的页给配置的间隔，不假装在倒数。
-//  - 暂停时只换开头两个字，后半句「数据截至 · 时间」保持同一形态。
+//  - 开头写「N 秒后刷新」而不是「自动刷新 Ns」：后者会被读成刷新间隔（其实是倒计时）。
+//  - 暂停时只换开头两个字，后半句「数据截至 北京时间 时间」保持同一形态。
 // 独立持有 1s 时钟：避免 App 每秒重渲染整页（安卓原生 select 会闪）。
 function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = false, live = true }) {
   const [nowMs, setNowMs] = useState(Date.now())
@@ -703,15 +707,16 @@ function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = 
   const colon = at.lastIndexOf(':')
   const atMain = colon > 0 ? at.slice(0, colon) : at
   const atSec = colon > 0 ? at.slice(colon) : ''
-  if (paused) return html`已暂停 · <span class="sync-label">数据截至 · </span>${atMain}<span class="sync-sec">${atSec}</span>`
+  if (paused) return html`已暂停 · <span class="sync-label">数据截至 ${TZ_LABEL} </span>${atMain}<span class="sync-sec">${atSec}</span>`
   const sec = Math.max(1, Math.round(pollMs / 1000))
   const remain = live ? Math.max(0, Math.min(sec, Math.ceil(((nextAt || (Date.now() + pollMs)) - nowMs) / 1000))) : sec
-  return html`自动刷新 ${remain}s · <span class="sync-label">数据截至 · </span>${atMain}<span class="sync-sec">${atSec}</span>`
+  return html`${remain} 秒后刷新 · <span class="sync-label">数据截至 ${TZ_LABEL} </span>${atMain}<span class="sync-sec">${atSec}</span>`
 }
 
+// 星期几也只按北京时间取：本地 getDay() 在北京时间跨零点时会差一天，和上面的时间对不上。
 function fmtWeekday (ts) {
   if (!ts) return ''
-  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts)).getDay()]
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts) + 8 * 3600 * 1000).getUTCDay()]
 }
 
 // v3.341：窄屏下顶栏状态行会被省略号截断（时间只剩半截）。点一下就地弹出完整文本，点页面
@@ -778,12 +783,39 @@ function Reveal ({ cls, y = 10, duration, role, ariaLive, children }) {
 }
 
 // 面板头：标题 + 说明 + 右侧操作（右侧自动左推）。含 select 等复杂头部仍可手写。
-function PanelHead ({ title, sub, right, afterTitle }) {
+// 标题用真 heading 元素（读屏可按标题层级跳转）：默认 h2，页面主面板传 level=${1} 变成 h1。
+// 换成 h1/h2 后浏览器默认外边距会把面板头顶高，行内 margin:0 抵掉——视觉密度与旧的 span 完全一致
+// （字号/字重/单行/不伸缩都由 .panel-title 既有规则决定，不在这里写样式）。
+function PanelHead ({ title, sub, right, afterTitle, level = 2 }) {
+  const titleTag = level === 1 ? 'h1' : 'h2'
   return html`<div class="panel-head">
-    <span class="panel-title">${title}</span>
+    <${titleTag} class="panel-title" style="margin:0">${title}</${titleTag}>
     ${afterTitle}
     ${sub && html`<span class="panel-sub">${sub}</span>`}
     ${right && html`<span class="panel-right">${right}</span>`}
+  </div>`
+}
+
+// 首屏骨架：第一份数据回来前先按最终版式占位（记数行 + 3 行列表），不再是一片空白。
+// 只在「首次加载且还没有任何数据」时用（调用方条件 loading && !data）——自动刷新、
+// 切回已看过的面板时 data 还在，条件不成立，所以不会反复闪骨架。
+// 结构在这里，样式（背景色/圆角/动画）由 app.css 的 .skeleton/.skel-* 负责。
+function PanelSkeleton ({ label = '正在加载…', rows = 3 }) {
+  return html`<div class="skeleton" role="status" aria-label=${label}>
+    <div class="skel-top" aria-hidden="true"><span class="skel-bar skel-bar-count"></span></div>
+    ${Array.from({ length: rows }, (_v, i) => html`<div class="skel-row" key=${i} aria-hidden="true">
+      <span class="skel-bar skel-bar-title"></span>
+      <span class="skel-bar skel-bar-meta"></span>
+    </div>`)}
+  </div>`
+}
+
+// 加载失败条：一句中文原因 + 重试按钮（.retry-btn）。重试动作由面板传进来（同一条 load()），
+// 不另建请求路径；busy 时禁用，避免连点叠加。
+function LoadError ({ text, onRetry, busy = false }) {
+  return html`<div class="load-error" role="alert">
+    <span class="load-error-text">${text}</span>
+    <button type="button" class="retry-btn" disabled=${busy} onClick=${onRetry}>重试</button>
   </div>`
 }
 
@@ -1042,6 +1074,22 @@ function attachMonthHoldRepeat (inst) {
   bind(1)
 }
 
+// Esc 关闭日历（L2-5）：flatpickr 4.6 只在 _input 与 calendarContainer 上监听 keydown，
+// 从 .date-btn 打开时焦点留在按钮上，按键到不了实例 ⇒ 日历关不掉（实测 inst.isOpen 仍为
+// true）。打开期间在 document 捕获阶段补一层：命中后关闭并把焦点还给触发按钮；关闭时
+// （选完日期 / 点外面 / Esc）立刻解绑，不常驻全局监听。
+function bindEscClose (inst, restoreFocus) {
+  const onKey = (e) => {
+    if (e.key !== 'Escape' && e.key !== 'Esc') return
+    if (!inst.isOpen) return
+    e.preventDefault()
+    inst.close()
+    if (restoreFocus) restoreFocus()
+  }
+  document.addEventListener('keydown', onKey, true)
+  return () => document.removeEventListener('keydown', onKey, true)
+}
+
 function DateRange ({ value, onChange, label = '日期区间', disabled = false }) {
   const from = value && typeof value.from === 'string' ? value.from : ''
   const to = value && typeof value.to === 'string' ? value.to : ''
@@ -1054,6 +1102,9 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
   useEffect(() => {
     const el = anchorRef.current
     if (!el) return undefined
+    // Esc 监听只在「日历打开期间」挂着（见 bindEscClose），关闭/卸载都要解绑。
+    let offEsc = null
+    const dropEsc = () => { if (offEsc) { offEsc(); offEsc = null } }
     const inst = flatpickr(el, {
       mode: 'range',
       dateFormat: 'Y-m-d',
@@ -1069,7 +1120,12 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
       positionElement: btnRef.current || el,
       onReady (_sel, _str, inst) { attachMonthHoldRepeat(inst) },
       // 面板可能开着跨过上海零点：每次打开按当下上海日重设上限。
-      onOpen (_d, _s, inst) { inst.set('maxDate', todayKeyShanghai()) },
+      onOpen (_d, _s, inst) {
+        inst.set('maxDate', todayKeyShanghai())
+        dropEsc()
+        offEsc = bindEscClose(inst, () => { if (btnRef.current) btnRef.current.focus({ preventScroll: true }) })
+      },
+      onClose () { dropEsc() },
 
       onChange (dates) {
         if (!Array.isArray(dates) || dates.length !== 2) return
@@ -1081,7 +1137,7 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
       }
     })
     instRef.current = inst
-    return () => { inst.destroy(); instRef.current = null }
+    return () => { dropEsc(); inst.destroy(); instRef.current = null }
   }, [])
   // 受控值外部变化（清除 ×、切预设、跳转重置）时同步 flatpickr 的选中态：
   // 实例只在挂载时建一次，不同步的话日历仍高亮上一个区间（Sourcery #288 M7）。
@@ -1612,7 +1668,7 @@ function triggerResultLine (trig, run) {
   }
 }
 
-function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
+function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = true }) {
   const [err, setErr] = useState('')
   // 最近一次「提交成功」的触发（202 那一刻记下 id/label/at）；结果由 runs 结算。
   const [lastTrigger, setLastTrigger] = useState(null)
@@ -1759,7 +1815,7 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
     if (action) doTrigger(action)
   }
   return html`<div class="panel trigger-panel">
-    <${PanelHead} title="手动触发"
+    <${PanelHead} title="手动触发" level=${1}
       right=${locking && html`<span class="trigger-busy" role="status" aria-live="polite"
         aria-label="任务进行中，完成后自动解锁" title="任务进行中，完成后自动解锁"><span class="spin"></span><span class="trigger-busy-text">任务进行中…</span></span>`} />
     <div class="btn-row">
@@ -1779,7 +1835,10 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
         <span class="auto-run-tag">服务器调度</span>
         ${auto.on && html`<span class="auto-run-live">运行中</span>`}
       </div>
-      <div class="auto-run-row">
+      ${/* 隐藏页签不生成工具条 DOM（L4）：概览保活挂载时，这一排 date-btn/auto-run-row
+           会以 hidden 副本留在其它页的 DOM 里；只在 active 时渲染，切走即移除，
+           草稿/按住加减等状态都由组件 state 保留，切回不会丢。 */ ''}
+      ${active && html`<div class="auto-run-row">
         <button type="button" class="auto-step" aria-label="减少间隔"
           onPointerDown=${holdAuto.start(-1)} onPointerUp=${holdAuto.stop} onPointerLeave=${holdAuto.stop}
           onPointerCancel=${holdAuto.stop} onLostPointerCapture=${holdAuto.stop}
@@ -1795,7 +1854,7 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [] }) {
         ${auto.on
           ? html`<${Button} variant="danger" onClick=${stopAuto}>停止<//>`
           : html`<${Button} variant="danger-solid" onClick=${askAuto}>开始<//>`}
-      </div>
+      </div>`}
       <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒（输入框已锁，长按加减可快速调整）；由服务器常驻运行，关闭页面、切后台、锁屏都不影响，点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次会自动停止。</div>
       ${auto.on && html`<div class="auto-run-status">${auto.nextAt > 0 ? `下一轮 ${Math.max(0, Math.ceil((auto.nextAt - auto.now) / 1000))} 秒` : '本轮进行中'} · 已自动运行 ${auto.runs} 轮</div>`}
       ${!auto.on && html`<div class="auto-run-status">${autoSaved ? '间隔已保存' : ''}</div>`}
@@ -2127,7 +2186,8 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
 // 尾窗指纹/stale 语义仍由服务端保留（本组件只发一次 limit=200，不翻游标）。
 const RUN_PAGE_SIZES = [10, 20, 50, 100]
 const RUN_FETCH_LIMIT = 200
-// 逐轮历史的两份服务端快照：仅运行（excludeCancelled）与全量（全部/只看异常共用）。
+// 逐轮历史的两份服务端快照：仅运行（前端剔除取消留痕）与全量（全部/只看异常共用）。
+// 两份由同一次 /api/run-history 请求填充，切档不再发第二次请求。
 const RUN_SNAP_KEY = (m) => (m === 'runs' ? 'runs' : 'all')
 
 // ── 列表落点（v3.320）──────────────────────────────────────────────────────
@@ -2227,19 +2287,23 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   }
   useLandScrollCancel(landRef, userMovedRef)
 
-  // 两种筛选各留一份快照：服务端口径不同（仅运行 = excludeCancelled，最近 200 个真轮次）。
-  // 切「只看异常」若拿「仅运行」的快照按异常过滤，会先算成「只看异常 2 / 共 2 条」，
-  // 等请求回来再跳成 48 条——手机上就是约 130ms 的闪跳（v3.326 录屏实测 4 帧）。
-  // 所以另一档在后台预取，切过去首帧直接用目标快照；目标快照还没到就保持旧列表，
-  // 绝不用另一档的数据重算。「全部」与「只看异常」共用同一份全量快照。
+  // 两档视图共用一次请求：服务端不再按 excludeCancelled 预过滤，「仅运行」由前端剔除
+  // 取消留痕（filterRunItems 与渲染同口径）——旧版首屏为此多发一次 200 行的
+  // /api/run-history?excludeCancelled=1（与全量一份合计 71KB）。
+  // 口径差异如实记下：窗口是「最近 200 行」（含取消记录），取消很多时可见轮次会少于 200 行；
+  // 换来切档零请求、零等待（同一份数据原地过滤，取代旧版「后台预取另一档」）。
   const snapsRef = useRef({ runs: null, all: null })
   const preSeqRef = useRef({ runs: 0, all: 0 })
   const quietNextRef = useRef(false)
   const fetchSnap = useCallback((k) => {
     const seq = ++preSeqRef.current[k]
-    return apiGetRunHistory({ limit: RUN_FETCH_LIMIT, excludeCancelled: k === 'runs' })
+    return apiGetRunHistory({ limit: RUN_FETCH_LIMIT })
       .then((d) => {
-        if (seq === preSeqRef.current[k]) snapsRef.current[k] = d
+        if (seq === preSeqRef.current[k]) {
+          snapsRef.current[k] = d
+          // 同一份全量窗口也满足另一档：切过去直接命中快照，不再补发请求。
+          snapsRef.current[k === 'runs' ? 'all' : 'runs'] = d
+        }
         return d
       })
   }, [])
@@ -2251,8 +2315,8 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     // 首帧已由 changeMode 用快照画好。
     const quiet = quietNextRef.current
     quietNextRef.current = false
-    // 另一档同时预取：每次刷新都补一次，切过去看到的是新快照而不是陈的。
-    fetchSnap(k === 'runs' ? 'all' : 'runs').catch(() => {})
+    // 不再预取另一档：一份全量快照同时喂两档（fetchSnap 里同步写两个 key），
+    // 切档命中快照即可，首屏也只剩一次 /api/run-history。
     // 静默刷新要顺手清掉可能还挂着的 loading（切档会顶掉上一发非静默请求，
     // 那发的 finally 因请求号过期不会再来清，否则分页按钮会一直禁用）。
     setLoading(!quiet)
@@ -2430,7 +2494,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
           aria-busy=${pendingMode === 'issue' && pendingBusy ? 'true' : 'false'}
           aria-pressed=${mode === 'issue' ? 'true' : 'false'} onClick=${() => changeMode('issue')}>${mode === 'runs' || issueCount === null ? '只看异常' : `只看异常 ${issueCount}`}</button>
       </div>
-      <${DateRange} value=${runRange} onChange=${changeDay} label="按日期筛选轮次" />
+      ${active && html`<${DateRange} value=${runRange} onChange=${changeDay} label="按日期筛选轮次" />`}
       <span class="run-tools-note">${mode === 'issue' ? '只显示失败、中断或取消的轮次' : (mode === 'runs' ? '不显示取消留痕；切「全部」可查' : '点行尾「日志」跳到该日日志')}</span>
     </div>`}
     ${data && data.status && data.status !== 'ok' && html`<div class="empty">run.log${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
@@ -2480,8 +2544,26 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
 // 轮询只挂在概览（状态+历史要跟任务跑）；其余标签页进页时拉取 + 手动刷新，
 // 不自动轮询——消息/日志读的是磁盘文件，5s 轮询只会白耗磁盘与带宽。
 
-// 近 14 日趋势（纯 CSS 条形图，零依赖）：一格=一天，高度按当日推送条数归一。
-// failed>0 的日子用红色渐变提示；0 推送的日子画灰色基线（看得见「没有数据」≠ 没画）。
+// 加载失败文案：fetch 抛的是英文（Failed to fetch / AbortError），直接甩给用户等于没说。
+// 这里只做形态映射，不改错误语义（401 仍由全局事件让 App 停轮询）：
+//   5xx → 服务器错误；4xx → 请求被拒绝；网络断/服务没起 → 网络请求失败；abort → 超时。
+// 认不出的原样返回——后端自定义错误本来就是中文，不要二次包装。
+function loadErrorText (e) {
+  const raw = e && typeof e.message === 'string' ? e.message : String(e === undefined || e === null ? '' : e)
+  const http = /^HTTP (\d{3})$/.exec(raw)
+  if (http) {
+    const code = Number(http[1])
+    if (code >= 500) return `服务器错误（HTTP ${code}）`
+    if (code >= 400) return `请求被拒绝（HTTP ${code}）`
+    return `请求失败（HTTP ${code}）`
+  }
+  if (/Failed to fetch|NetworkError|Load failed|ERR_NETWORK|ERR_INTERNET_DISCONNECTED/i.test(raw)) {
+    return '网络请求失败（检查网络，或控制台服务是否在运行）'
+  }
+  if (/abort|响应体读取超时/i.test(raw)) return '请求超时（服务器 8 秒内没有响应）'
+  return raw === '' ? '未知错误' : raw
+}
+
 // 面板加载器公共骨架：data/err 状态 + load()（成功清错、失败写横幅）。
 // apiFn 由调用方用 useCallback/useMemo 固定引用，避免 effect 风暴。
 function usePanelLoader (apiFn, onLoaded, initialData = null) {
@@ -2508,7 +2590,7 @@ function usePanelLoader (apiFn, onLoaded, initialData = null) {
       return true
     } catch (e) {
       if (seq !== seqRef.current || !mountedRef.current) return false
-      setErr(`加载失败：${e.message}`)
+      setErr(`加载失败：${loadErrorText(e)}`)
       return false
     } finally {
       if (seq === seqRef.current && mountedRef.current) {
@@ -2520,9 +2602,11 @@ function usePanelLoader (apiFn, onLoaded, initialData = null) {
   return { data, err, load, loading, settleTick }
 }
 
-// 页签保活 + 首屏预加载：面板即使还没被点开（active=false）也先拉一次，
-// 刷新网页后第一次点页签时数据已经在手里，不会闪「加载中…」；之后离开不拉，
-// 再切回才补一次（active 由 false 变 true）。
+// 页签保活 + 首访懒加载：隐藏的页签只挂 DOM、不拉数据——第一次真正点开（active=true）
+// 才发第一份请求，之后离开不拉，再切回才补一次（active 由 false 变 true）。
+// 首屏停在推送记录页时，不再替概览/系统页预取 /api/trends、/api/run-history、
+// /api/access-log、/api/cache-health（旧版「先拉一遍，点开就有」要 17 个请求、71KB）。
+// 首帧空白由面板自己的骨架补（见 PanelSkeleton）。
 // queue=true 用于日志这种自带互斥的 loader（在飞时排队，而不是丢掉这次刷新）。
 function usePanelAutoLoad (active, load, { queue = false } = {}) {
   const seenRef = useRef(null)
@@ -2535,7 +2619,8 @@ function usePanelAutoLoad (active, load, { queue = false } = {}) {
     const loadChanged = loadRef.current !== load
     seenRef.current = active
     loadRef.current = load
-    if (!active && !first) return
+    // 懒加载：没进过这个页签就不发请求。
+    if (!active) return
     if (!first && !becameActive && !loadChanged) return
     // 首次点开时若预加载还在飞、或刚回来不到 3s，直接用手里的/路上的数据，
     // 不再发第二发把预加载响应顶掉（Sourcery #272）。更久才点开则补一次新鲜的。
@@ -2555,9 +2640,11 @@ const PULL_EVENT = 'xbk-pull-refresh'
 const PULL_TRIGGER = 56 // 松手阈值（CSS px，手指位移按 0.5 倍阻尼折算）
 const PULL_MAX = 84
 const PULL_MIN_BUSY_MS = 450 // 再快也让「正在刷新…」停留一下，避免又变成一闪
-// 切后台/锁屏/切走 App 很久再回来：页面里的数据已经过期了，但浏览器不会替我们重拉。
-// 回到前台时若距上次刷新超过这个间隔，就静默补一轮（不显示「正在刷新…」，不重建页面）。
-const VISIBLE_STALE_MS = 30000
+// 切后台/锁屏/切走 App 时轮询全停（App 的 visibilitychange 处理）：回来时页面里的数据
+// 必然是离开那一刻的，而浏览器不会替我们重拉。回前台一律静默补一轮（不显示「正在刷新…」、
+// 不重建页面）；只有距上次成功刷新不足这个间隔（刚刷完就切回来）才跳过——来回切窗口
+// 不该每次都打一遍接口。
+const VISIBLE_REFRESH_GAP_MS = 2000
 
 function usePollReload (active, pollTick, fn) {
   // v3.349：轮询重拉的单飞闸——上一拍还没回来就跳过这一拍。慢接口下每个新请求都会把
@@ -2566,8 +2653,13 @@ function usePollReload (active, pollTick, fn) {
   const fnRef = useRef(fn)
   fnRef.current = fn
   const busyRef = useRef(false)
+  // 首访懒加载后，激活本页的第一份数据由 usePanelAutoLoad 负责；这里跳过「active 由
+  // false 变 true」那一拍，否则首访会同时打两个请求（面板 load + 轮询拍）。
+  const seenActiveRef = useRef(false)
   useEffect(() => {
-    if (!active || !(pollTick > 0) || busyRef.current) return
+    const justActivated = active && !seenActiveRef.current
+    seenActiveRef.current = active
+    if (!active || justActivated || !(pollTick > 0) || busyRef.current) return
     busyRef.current = true
     Promise.resolve()
       .then(() => fnRef.current())
@@ -2692,6 +2784,8 @@ function useSlowFlag (on, delay = 600) {
 // 趋势天数选择器固定选项（与服务端白名单 TREND_DAYS_ALLOWED 对齐；14 为默认省略参数）
 const TREND_DAYS = [14, 30, 60]
 
+// 近 14 日趋势（纯 CSS 条形图，零依赖）：一格=一天，高度按当日推送条数归一。
+// failed>0 的日子用红色渐变提示；0 推送的日子画灰色基线（看得见「没有数据」≠ 没画）。
 function TrendsPanel ({ active = true }) {
   const [days, setDays] = useState(TREND_DAYS[0])
   const [range, setRange] = useState(EMPTY_RANGE)
@@ -2785,8 +2879,8 @@ function TrendsPanel ({ active = true }) {
             ...TREND_DAYS.map((d) => ({ value: String(d), label: `${d} 日` }))
           ]}
           onChange=${(v) => { if (v === '__range') return; setRange(EMPTY_RANGE); setDays(Number(v)) }} />
-        <${DateRange} value=${range} label="趋势日期区间"
-          onChange=${(r) => setRange(r)} />
+        ${active && html`<${DateRange} value=${range} label="趋势日期区间"
+          onChange=${(r) => setRange(r)} />`}
       </div>`}
       sub=${'run.log 摘要按日聚合' + (trends && trends.truncated ? '（日志超限，仅统计尾部 1 MiB）' : '')}
       right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
@@ -2824,7 +2918,15 @@ function CacheHealthPanel ({ paused = false, active = true }) {
   // 右列状态文件（v3.307）：缓存健康面板原来只占左半 451px，右边 460px 空白；
   // 系统页的「缓存目录文件」在这里给一份紧凑版（前 8 项），整页仍保留全量清单。
   const filesLoader = usePanelLoader(apiGetFiles)
-  useEffect(() => { load().catch(() => {}); filesLoader.load().catch(() => {}) }, [load, filesLoader.load])
+  // 懒加载：概览页没点开过就不打 /api/cache-health 与 /api/files（首屏在别的页签时
+  // 这两条纯属浪费；60s 定时器与切回补拉仍在 active 后继续工作）。
+  const seededRef = useRef(false)
+  useEffect(() => {
+    if (!active || seededRef.current) return
+    seededRef.current = true
+    load().catch(() => {})
+    filesLoader.load().catch(() => {})
+  }, [active, load, filesLoader.load])
   // 缓存健康随概览常开：每分钟（且切回前台时）重拉一次，避免「页面开着过夜、mtime 早已更新
   // 但面板还拿着旧快照」；1 分钟一次只读小 JSON，不与 5s 主轮询抢盘。
   const wasPausedRef = useRef(paused)
@@ -3242,16 +3344,93 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
 // <mark> 会把「展开」卡住几秒；日志页超过 3000 行直接关高亮是同一思路（渲染上限，不改搜索口径）。
 const MSG_HIT_MAX = 200
 
+// v3.358：标题末尾常自带价格（「… 32.3元」），右侧再画一个 .msg-price 就是同一条记录两个价。
+// 只认标题末尾的「数字 + 元」，且数值与 m.price 完全相等才隐藏；「32.3元起」「32.3元包邮」这类
+// 尾部不是纯价格的不算（不做模糊匹配，避免把两个不同的数吞掉一个）。不匹配一律照常显示。
+const TITLE_TAIL_PRICE_RE = /(\d+(?:\.\d+)?)\s*元\s*$/
+function titleTailPrice (title) {
+  if (typeof title !== 'string') return null
+  const m = TITLE_TAIL_PRICE_RE.exec(title)
+  return m ? Number(m[1]) : null
+}
+
+// 分类三段显示（L2-7）：服务端 catename 是「一级-二级-三级」整串（例：好单线报-娱乐-淘宝），
+// 整串一字排开看不出层级。按 '-' 拆成每段一个 span.msg-cate-part（段间分隔/间距由 CSS 负责，
+// 见 L5），可访问名保留原始整串，读屏不会只听到三段碎片。
+function cateParts (name) {
+  if (typeof name !== 'string' || name === '') return []
+  return name.split('-').filter((part) => part !== '')
+}
+
+// 筛选状态 ↔ URL（L2-8）：刷新、收藏、分享都要带着条件回来，所以 q/cate/page/size/days/from/to
+// 同步进 hash query（例：#/messages?q=耳机&page=3）。只写 hash、只认白名单值：非法/越界参数
+// 一律退回默认，不在 URL 里留脏值。默认值（page=1 / size=20 / days=0）不写，链接保持短。
+const MSG_SIZES = [10, 20, 50, 100]
+const MSG_DAYS = [0, 1, 3, 7, 30]
+
+function parseMessagesHash (hash) {
+  const out = { q: '', cate: '', page: 1, size: 20, days: 0, from: '', to: '' }
+  const raw = typeof hash === 'string' ? hash : ''
+  const at = raw.indexOf('?')
+  if (at < 0 || !/^#\/messages\b/.test(raw.slice(0, at))) return out
+  const params = new URLSearchParams(raw.slice(at + 1))
+  const q = params.get('q')
+  if (typeof q === 'string' && q.trim() !== '') out.q = q.trim()
+  const cate = params.get('cate')
+  if (typeof cate === 'string' && cate !== '') out.cate = cate
+  const page = Number(params.get('page'))
+  if (Number.isSafeInteger(page) && page >= 1) out.page = page
+  const size = Number(params.get('size'))
+  if (MSG_SIZES.includes(size)) out.size = size
+  const from = params.get('from')
+  const to = params.get('to')
+  if (DAY_KEY_RE.test(from) && DAY_KEY_RE.test(to) && from <= to) {
+    // 自定义区间优先于「近 N 天」：两者同时出现时以区间为准（与工具栏语义一致）。
+    out.from = from
+    out.to = to
+    out.days = 0
+  } else {
+    const days = Number(params.get('days'))
+    if (MSG_DAYS.includes(days)) out.days = days
+  }
+  return out
+}
+
+function sameMsgFilters (a, b) {
+  return a.q === b.q && a.cate === b.cate && a.page === b.page && a.size === b.size &&
+    a.days === b.days && a.from === b.from && a.to === b.to
+}
+
+function buildMessagesHash (state) {
+  const p = new URLSearchParams()
+  if (state.q) p.set('q', state.q)
+  if (state.cate) p.set('cate', state.cate)
+  if (Number.isSafeInteger(state.page) && state.page > 1) p.set('page', String(state.page))
+  if (MSG_SIZES.includes(state.size) && state.size !== 20) p.set('size', String(state.size))
+  if (state.from && state.to) {
+    p.set('from', state.from)
+    p.set('to', state.to)
+  } else if (MSG_DAYS.includes(state.days) && state.days !== 0) {
+    p.set('days', String(state.days))
+  }
+  const qs = p.toString()
+  return qs === '' ? '#/messages' : `#/messages?${qs}`
+}
+
 function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
-  const [page, setPage] = useState(1)
-  const [size, setSize] = useState(20)
-  const [cate, setCate] = useState('')
-  const [days, setDays] = useState(0)
+  // 首帧从 hash query 还原筛选（L2-8）：只解析一次，之后 state 是唯一真相。
+  const [boot] = useState(() => parseMessagesHash(window.location.hash))
+  const [page, setPage] = useState(boot.page)
+  const [size, setSize] = useState(boot.size)
+  // v3.358：跳页输入（受控，'' = 没输入）。只在 Enter/失焦时生效，不随每次按键换页。
+  const [jump, setJump] = useState('')
+  const [cate, setCate] = useState(boot.cate)
+  const [days, setDays] = useState(boot.days)
   // 自定义日期区间（v3.326）：两项都非空才生效，否则退回「近 N 天」。
-  const [range, setRange] = useState({ from: '', to: '' })
+  const [range, setRange] = useState({ from: boot.from, to: boot.to })
   const rangeActive = range.from !== '' && range.to !== ''
-  const [input, setInput] = useState('')
-  const [query, setQuery] = useState('')
+  const [input, setInput] = useState(boot.q)
+  const [query, setQuery] = useState(boot.q)
   const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
   // 响应归属（问题5）：请求发出时记下的 query 会在 in-flight 期间过期——旧响应的
   // queryUsed 会把刚打的新词清空（搜索吞字）。改为：loadSeqRef 给每次请求领号，
@@ -3308,7 +3487,36 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     return () => clearTimeout(t)
   }, [input])
   // 只有 query 真的变了才回第 1 页；只加/减空白时 query 不变，刷新不应把用户踢回首页。
-  useEffect(() => { setPage(1) }, [query])
+  // 首帧例外：page 可能是 URL 恢复来的（#/messages?page=3），不能在挂载时打回第 1 页。
+  const firstQueryRef = useRef(true)
+  useEffect(() => {
+    if (firstQueryRef.current) { firstQueryRef.current = false; return }
+    setPage(1)
+  }, [query])
+  // 筛选状态写回地址栏（L2-8）：只 replaceState，绝不 pushState——改一次筛选多一条
+  // 历史记录的体验（手机左滑要滑十几下才退出）不能接受。非本页签时不写，切走时
+  // 由 App 的 hash 路由接管。
+  const urlHash = buildMessagesHash({ q: query, cate, page, size, days, from: range.from, to: range.to })
+  // 只在「语义真的不一样」时改写：参数顺序不同、或显式写了默认值（?size=20）都不重写，
+  // 避免刷新一次就凭空多一条 replaceState。
+  const hashMatches = () => sameMsgFilters(parseMessagesHash(window.location.hash), parseMessagesHash(urlHash))
+  useEffect(() => {
+    if (!active) return
+    if (hashMatches()) return
+    window.history.replaceState(window.history.state, '', urlHash)
+  }, [active, urlHash])
+  // 点「推送记录」当前页签时 App 会把 hash 直接赋成裸 #/messages（switchTab），筛选
+  // 参数会掉；只要地址仍指向本页，就补回参数——同样 replaceState，不新增历史条目。
+  useEffect(() => {
+    if (!active) return undefined
+    const onHash = () => {
+      if (!/^#\/messages(\?|$)/.test(window.location.hash)) return
+      if (hashMatches()) return
+      window.history.replaceState(window.history.state, '', urlHash)
+    }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [active, urlHash])
   const fetchMessages = useCallback(
     () => {
       const requested = query
@@ -3361,6 +3569,17 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     if (n === page) return
     armLand()
     setPage(n)
+  }
+  // 跳页（v3.358）：只认数字，越界夹到 [1, pages]。换页仍走 goPage（统一的落点旗 + 同页守卫），
+  // 所以这里不直接 setPage；先清空输入，避免下一次失焦拿旧值再跳一遍。
+  const jumpTo = (raw) => {
+    const text = String(raw == null ? '' : raw).trim()
+    setJump('')
+    if (text === '') return
+    const n = Math.trunc(Number(text))
+    if (!Number.isFinite(n)) return
+    const pages = data && Number.isSafeInteger(data.pages) && data.pages > 0 ? data.pages : 1
+    goPage(Math.min(Math.max(n, 1), pages))
   }
   // 搜索框回车 / 刷新前先把未落地的输入立刻生效，避免「刚打完字点刷新，还是旧结果」。
   // 只有搜索词变了才回第 1 页；没改词时刷新当前页，不应把用户踢回首页（审查 #246 可选）。
@@ -3473,10 +3692,13 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       setQuery(data.queryUsed)
     }
   }, [data, input, query])
+  // v3.358：列表标题是真 <button>（原 span[role=button][tabindex=0]）。原生 button 自带
+  // Enter/空格 ⇒ 合成 click，再手写 onKeyDown 会双触发（keydown 展开 + click 收起 = 看起来没反应），
+  // 故删掉手写键盘处理；caret / aria-expanded / title 全部保留。
   return html`<div class="panel">
-    <${PanelHead} title="推送记录" sub="判重缓存 push.json（已抓取并推送的消息）" />
+    <${PanelHead} title="推送记录" level=${1} sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
-      <input class="msg-search" type="search" placeholder="搜索标题 / 内容…" value=${input}
+      <input class="msg-search" type="search" aria-label="搜索标题或内容" placeholder="搜索标题 / 内容…" value=${input}
         onInput=${(e) => setInput(e.target.value)}
         onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); refreshNow() } }} />
       <${CategoryPicker} value=${cate} categories=${categories}
@@ -3498,7 +3720,9 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
           setDays(Number(v))
           setPage(1)
         }} />
-      <${DateRange} value=${range} onChange=${(r) => { armLand(); setRange(r); setDays(0); setPage(1) }} />
+      ${/* 推送记录页未激活时不生成日期按钮（L4）：保活挂载的面板会在别的页留下
+           hidden 的 .date-btn 副本；range 由本组件 state 持有，切回照旧。 */ ''}
+      ${active && html`<${DateRange} value=${range} onChange=${(r) => { armLand(); setRange(r); setDays(0); setPage(1) }} />`}
       <${MiniSelect} value=${String(size)} ariaLabel="每页显示条数"
         options=${[10, 20, 50, 100].map((n) => ({ value: String(n), label: `每页 ${n} 条` }))}
         onChange=${(v) => { armLand(); setSize(Number(v)); setPage(1) }} />
@@ -3506,29 +3730,30 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('csv')}>${exporting === 'csv' ? '导出中…' : '导出 CSV'}<//>
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
     </div>
-    ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${err && html`<${LoadError} text=${err} busy=${loading} onRetry=${() => { load().catch(() => {}) }} />`}
     ${exportErr && html`<${Hint} tone="error">${exportErr}<//>`}
     ${exportNote && html`<${Hint}>${exportNote}<//>`}
-    ${loading && !data && html`<div class="empty">加载中…</div>`}
+    ${loading && !data && html`<${PanelSkeleton} label="正在加载推送记录" />`}
     ${data && data.status !== 'ok' && html`<div class="empty">记录${data.status === 'missing' ? '尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}${data.cacheDirHint ? html`<${Hint}>正在读取目录：${data.cacheDirHint}（若运行缓存在别处，请让 XBK_CACHE_DIR 与运行侧 Config.cache.dir 一致）<//>` : ''}</div>`}
     ${data && data.status === 'ok' && html`<div ref=${listRef}>
       <div class="msg-count" aria-live="polite">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}${slowLoading ? html`<span class="msg-loading"> · 更新中…</span>` : ''}</div>
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
-        : html`<div class="msg-list" ref=${motionRef}>
-          ${items.map((m) => html`<div class="msg-item" key=${m.rowKey} data-mk=${m.rowKey}>
+        : html`<div class="msg-list" role="list" ref=${motionRef}>
+          ${items.map((m) => html`<div class="msg-item" role="listitem" key=${m.rowKey} data-mk=${m.rowKey}>
             <div class="msg-item-head">
-              <span class="msg-title" role="button" tabindex="0"
+              <button type="button" class="msg-title"
                 aria-expanded=${expanded === m.rowKey ? 'true' : 'false'}
                 title=${expanded === m.rowKey ? '收起正文' : '点击展开正文'}
-                onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}
-                onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(expanded === m.rowKey ? null : m.rowKey) } }}>
+                onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}>
                 <span class="msg-caret" aria-hidden="true">${expanded === m.rowKey ? '▾' : '▸'}</span>${m.title ? hit(m.title) : '（无标题）'}
-              </span>
-              ${m.price !== null ? html`<span class="msg-price">¥${m.price}</span>` : ''}
+              </button>
+              ${m.price !== null && titleTailPrice(m.title) !== m.price
+                ? html`<span class="msg-price">¥${m.price}</span>`
+                : ''}
             </div>
             <div class="msg-meta">
-              <span class="msg-cate">${m.catename}</span>
+              <span class="msg-cate" aria-label=${m.catename || undefined}>${cateParts(m.catename).map((part, i) => html`<span class="msg-cate-part" key=${i}>${part}</span>`)}</span>
               <span class="mono">${m.datetime} ${m.shorttime}</span>
               ${msgLink(m, data.baseUrl)}
             </div>
@@ -3539,6 +3764,15 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
         <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(1)}>« 首页<//>
         <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(page - 1)}>上一页<//>
         <span class="pager-info">第 ${data.page} / ${data.pages} 页</span>
+        <span class="pager-jump">
+          <span class="pager-jump-label" aria-hidden="true">跳至</span>
+          <input class="pager-jump-input" type="number" inputmode="numeric" min="1" max=${data.pages}
+            value=${jump} aria-label="跳到第几页"
+            onInput=${(e) => setJump(e.target.value)}
+            onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); jumpTo(jump) } }}
+            onBlur=${() => jumpTo(jump)} />
+          <span class="pager-jump-label" aria-hidden="true">页</span>
+        </span>
         <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(page + 1)}>下一页<//>
         <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(data.pages)}>末页 »<//>
       </div>
@@ -3881,7 +4115,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const logReady = !!(data && data.status === 'ok')
   const countText = logReady ? countLine : ((data || err) ? '—' : '读取中…')
   return html`<div class="panel">
-    <${PanelHead} title="运行日志" sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
+    <${PanelHead} title="运行日志" level=${1} sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
       right=${html`<${Button} variant="ghost" onClick=${refreshNow}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${/* v3.320：首帧就按最终高度占位（.log-empty 与 .logpre-main 同高）。旧版首帧只有
@@ -3907,7 +4141,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
           <button type="button" key=${key} class=${'log-chip' + (mode === key ? ' on' : '')}
             aria-pressed=${mode === key ? 'true' : 'false'} onClick=${() => pickMode(key)}>${label} <span class="log-chip-n">${logReady ? n : '—'}</span></button>`)}
       </div>
-      <${DateRange} value=${logRange} onChange=${(r) => { stickRef.current = true; setFocusDismissed(true); setLogRange(r) }} />
+      ${active && html`<${DateRange} value=${logRange} onChange=${(r) => { stickRef.current = true; setFocusDismissed(true); setLogRange(r) }} />`}
       <input class="msg-search log-search" type="search" placeholder="搜索日志…" aria-label="搜索日志"
         value=${q} onInput=${(e) => { stickRef.current = true; setFocusDismissed(true); setQ(e.target.value) }} />
     </div>
@@ -3936,7 +4170,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
 
 // v3.342：控制台设置块（v3.340 在配置页，v3.342 搬到系统页「设置」）。
 // 一条读面 + 两个写面：通知自检拦截窗、顶栏时间是否显示年月日。读面失败只影响本块。
-function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved }) {
+function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, active = true }) {
   // 拦截窗草稿：输入框可自由键入，保存前统一校验（整数 0–3600）；用户正在改（dirty）时
   // 刷新回来的生效值不覆盖输入框，避免「改到一半被定时重拉吃掉」。
   const [winDraft, setWinDraft] = useState('')
@@ -4082,7 +4316,10 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
       <span class="cfg-block-title">通知自检</span>
       <span class="cfg-block-sub">重复提交拦截窗 · ${winSourceLabel}</span>
     </div>
-    <div class="auto-run-row">
+    ${/* 系统页未激活时不生成这一排工具条（L4 同 TriggerBar）：保活挂载的面板
+         不应在别的页留下 hidden 的 auto-run-row 副本；winDraft 等草稿由本组件
+         state 持有，切走再回来不会丢。 */ ''}
+    ${active && html`<div class="auto-run-row">
       <button type="button" class="auto-step" aria-label="减少" disabled=${winCurrent === null || winSaving}
         onPointerDown=${holdWin.start(-1)} onPointerUp=${holdWin.stop} onPointerLeave=${holdWin.stop}
         onPointerCancel=${holdWin.stop} onLostPointerCapture=${holdWin.stop}
@@ -4097,7 +4334,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved })
         onContextMenu=${holdWin.contextMenu} onClick=${holdWin.click(1)}>+</button>
       <${Button} variant="secondary" disabled=${winCurrent === null || winSaving} onClick=${saveWin}>保存<//>
       ${winSaved && html`<span class="cfg-block-sub" role="status" aria-live="polite">已保存 · 立即生效</span>`}
-    </div>
+    </div>`}
     <div class="cfg-text">${settingsPending
       ? '正在读取当前生效值…'
       : winCurrent === null
@@ -4560,11 +4797,12 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
   const pendingRef = useRef(false)
   const loadedAtRef = useRef(0)
   useEffect(() => {
-    const first = seenRef.current === null
     const becameActive = active && seenRef.current === false
     seenRef.current = active
-    if (!active && !first) return
-    // 首次点开时预加载还在飞/刚回来不到 3s，直接用预加载结果；更久才点开则补一次。
+    // 懒加载（同 usePanelAutoLoad）：系统页没点开过就不发这三条请求
+    // （/api/sys + /api/access-log + /api/config/console），首次进入才算首访。
+    if (!active) return
+    // 首次点开时上一发还在飞/刚回来不到 3s，直接用手里的数据；更久才点开则补一次。
     if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))) return
     if (pendingRef.current) return
     pendingRef.current = true
@@ -4618,7 +4856,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
   // 不占高度，展开才长，首帧与加载后同形。
   const info = sys || {}
   return html`<div class="panel">
-    <${PanelHead} title="系统信息" right=${html`<${Button} variant="ghost" onClick=${refreshAll}>刷新<//>`} />
+    <${PanelHead} title="系统信息" level=${1} right=${html`<${Button} variant="ghost" onClick=${refreshAll}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     <div class="sys-grid">
       <table class="sys-table"><tbody>
@@ -4634,7 +4872,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
       </tbody></table>
     </div>
     <div class="set-title">设置<span class="cfg-block-sub">改动立即生效 · 落盘 console-settings.json</span></div>
-    <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} />
+    <${ConsoleSettingsBlock} settings=${settings} settingsErr=${settingsErr} loadSettings=${loadSettings} onSaved=${onSettingsSaved} active=${active} />
     <${BackupBlock} onImported=${refreshAll} />
     <${TwoFactorBlock} />
     <${Hint} style="margin-top:12px">近窗未授权尝试（401）：${access && Number.isSafeInteger(access.unauthorizedCount) ? access.unauthorizedCount : '—'} 次（服务启动以来累计；下方环形日志最多 200 条、重启即清空、不写盘；路径中 token 已由服务端脱敏）。<//>
@@ -4780,7 +5018,7 @@ function ConfigPanel ({ onSync, active = true, pollTick = 0 }) {
   const changedCount = filterRows.filter((row) => row.differs).length
   const filterSub = filterSourceNote(effLive, filterRows.length, changedCount)
   return html`<div class="panel" ref=${panelRef}>
-    <${PanelHead} title="运行配置" sub="脱敏视图 · 推送密钥只显示是否已配置"
+    <${PanelHead} title="运行配置" level=${1} sub="脱敏视图 · 推送密钥只显示是否已配置"
       right=${html`<${Button} variant="ghost" onClick=${refresh}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && !r && html`<div class="empty">运行配置不可读（模块加载失败——检查部署完整性）</div>`}
@@ -5848,7 +6086,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         : html`<${Badge} tone="warn">代码默认<//>`
 
   return html`<div class="panel">
-    <${PanelHead} title="过滤规则" sub="覆盖文件编辑 · 保存后在下一轮生效，当前轮不换规则" />
+    <${PanelHead} title="过滤规则" level=${1} sub="覆盖文件编辑 · 保存后在下一轮生效，当前轮不换规则" />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${notice && html`<${Hint}>${notice.text}<//>`}
     ${loading && !data && html`<div class="empty">加载中…</div>`}
@@ -6057,7 +6295,12 @@ function App () {
   // v3.310「过滤规则」新增为第六个页签。pure.mjs 的 tabFromHash 只认 v3.307 的五个键
   // （该模块本批不改），这里补一层本文件内的白名单，保持 hash 路由对新页签同样生效
   // （刷新/后退不丢当前页；非法值仍回概览）。
-  const resolveTab = (hash) => (/^#\/filter$/.test(typeof hash === 'string' ? hash : '') ? 'filter' : tabFromHash(hash))
+  // 推送记录页会把筛选条件写进 hash query（#/messages?q=…&page=3，见 buildMessagesHash）：
+  // 解析页签前先剥掉 query，否则带参数的地址会被判成非法值、刷新后掉回概览。
+  const resolveTab = (hash) => {
+    const raw = typeof hash === 'string' ? hash.split('?')[0] : ''
+    return /^#\/filter$/.test(raw) ? 'filter' : tabFromHash(raw)
+  }
   const [tab, setTab] = useState(() => resolveTab(window.location.hash))
   // 切页入场（v3.360）：只动新页的 opacity/transform，不动高度 ⇒ 不改变滚动锚点、
   // 不会把首屏内容顶走。tab 变化只在真正切页时发生，轮询不触发。
@@ -6158,9 +6401,10 @@ function App () {
     document.addEventListener('visibilitychange', check)
     return () => { stopped = true; clearInterval(timer); document.removeEventListener('visibilitychange', check) }
   }, [authExpired])
-  // 首屏渲染完就把六个页签全部挂上（隐藏），让它们的数据先加载。这样刷新网页后
-  // 第一次点某个页签也只是切 hidden，而不是「现挂载 + 现请求」闪一下加载占位。
-  // 各面板的 active 门控保证隐藏期间不轮询；这里只承担一次首载。
+  // 首屏渲染完就把六个页签全部挂上（隐藏），但**不替它们拉数据**：各面板的
+  // usePanelAutoLoad / 自己的 active 门控负责「第一次点开才发第一份请求」。
+  // 只挂 DOM 的好处是切页只是 toggle hidden，不会「现挂载 + 现请求」闪一下；
+  // 数据请求数则从 17 个降到当前页 + 顶栏那几条（见 L4 首屏去重）。
   useEffect(() => {
     if (authExpired) return
     for (const t of TABS) markVisited(t.key)
@@ -6171,6 +6415,8 @@ function App () {
   const timerRef = useRef(null)
   // 最近一次「数据真的刷新过」的时间：回前台补拉、轮询、下拉都更新它。
   const lastRefreshRef = useRef(Date.now())
+  // 回前台后的静默窗（时间戳）：补拉已经覆盖了这一拍，定时器若正好到期不该再叠一发。
+  const resumeQuietUntilRef = useRef(0)
   const tabsRef = useRef(null)
   // 标签栏边缘渐隐状态（v3.317）：'' | 'left' | 'right' | 'both'。只在真的溢出时挂
   // data-edge，362 宽（6 个页签全部放得下）保持零遮罩——否则最后一格会被误读成被裁掉。
@@ -6576,22 +6822,29 @@ function App () {
     const interval = locking ? POLL_BUSY_MS : POLL_MS
     const mark = () => setNextAt(Date.now() + interval)
     const tick = () => {
-      if (document.visibilityState !== 'hidden') {
-        // 用户正在操作表单（下拉/输入框）时跳过整拍：不 refresh、也不 mark
-        // （mark 会 setNextAt 触发 App 重渲染，安卓原生 select 仍可能被重建）。
-        // 截止时间到后自动恢复，不会因为焦点一直停在 select 上而永久停轮。
-        if (Date.now() < formPauseUntilRef.current) return
-        refreshSplit()
-        if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)
-        mark()
-      }
+      // 隐藏标签页一次请求都不发：主轮询此前只在「发不发这一拍」上有判断，
+      // 但概览的 /api/auto（2s 轮询）不在这个 effect 里、没跟着停，实测隐藏 15s 仍有请求。
+      // 定时器本身照跳（浏览器把后台定时器压到 1 分钟一次，空转无成本），
+      // 但请求、倒计时推进、面板 tick 三样全停。
+      if (document.hidden) return
+      // 刚从后台回来：这一拍由「回到前台」的补拉负责，定时器若正好到期不再叠加。
+      if (Date.now() < resumeQuietUntilRef.current) return
+      // 用户正在操作表单（下拉/输入框）时跳过整拍：不 refresh、也不 mark
+      // （mark 会 setNextAt 触发 App 重渲染，安卓原生 select 仍可能被重建）。
+      // 截止时间到后自动恢复，不会因为焦点一直停在 select 上而永久停轮。
+      if (Date.now() < formPauseUntilRef.current) return
+      refreshSplit()
+      if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)
+      mark()
     }
     timerRef.current = setInterval(tick, interval)
     mark()
-    // 回前台一律交给「回前台补拉」统一判断（>VISIBLE_STALE_MS 才拉）：
-    // 这里只把下一拍的时间重排，避免刚回来就立刻又打一发。
+    // 回前台只重排下一拍（别刚回来就补一发，补拉由下面的「回到前台」effect 统一发：
+    // 那里还会通知当前面板一起刷新，重复请求会翻倍）。
     const onVis = () => {
-      if (document.visibilityState === 'visible') mark()
+      if (document.hidden) return
+      resumeQuietUntilRef.current = Date.now() + interval
+      mark()
     }
     document.addEventListener('visibilitychange', onVis)
     return () => {
@@ -6719,15 +6972,19 @@ function App () {
     return ok
   }, [refreshSplit, refreshAuto])
   const pullRefresh = useCallback(() => refreshActive({ force: true }), [refreshActive])
-  // 回到前台：离开超过 VISIBLE_STALE_MS 就静默补一次（走和下拉完全相同的刷新路径，
-  // 当前页签的面板自己决定拉什么；有未保存草稿时它们不接，这里也就什么都不发）。
+  // 回到前台：隐藏期间所有轮询都停了（主轮询 tick、面板自己的 interval、/api/auto），
+  // 数据必然停在离开那一刻，浏览器不会替我们重拉。回来立刻静默补一轮（不显示
+  // 「正在刷新…」、不重建页面）：走和下拉完全相同的刷新路径，当前页签的面板自己决定
+  // 拉什么（有未保存草稿时它们不接，这里也就什么都不发）。
+  // 只有「刚刷完就切回来」（距上次成功刷新 < VISIBLE_REFRESH_GAP_MS）才跳过——
+  // 来回切窗口不该每次都打一遍接口。
   useEffect(() => {
     // 注意：暂停自动刷新只是停轮询。这里是一次性的「回来补一刀」，不受暂停影响——
     // 用户切回来最想看到的就是最新数据，而不是「已暂停」四个字。
     if (authExpired) return undefined
     const onVis = () => {
-      if (document.visibilityState !== 'visible') return
-      if (Date.now() - lastRefreshRef.current < VISIBLE_STALE_MS) return
+      if (document.hidden) return
+      if (Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS) return
       refreshActive({ respectFormPause: true }).catch(() => {})
     }
     document.addEventListener('visibilitychange', onVis)
@@ -6745,7 +7002,9 @@ function App () {
   useEffect(() => {
     if (tab !== 'overview') return undefined
     let alive = true
-    const load = () => { if (alive) refreshAuto() }
+    // 后台标签页同样不轮询：这条 2s 轮询不在主轮询 effect 里，此前一直照跑，
+    // 是「隐藏 15s 仍有请求」的主因。切回前台由「回到前台」effect 统一补拉（连带 refreshAuto）。
+    const load = () => { if (alive && !document.hidden) refreshAuto() }
     load()
     const t = setInterval(load, 2000)
     return () => { alive = false; clearInterval(t) }
@@ -6945,12 +7204,12 @@ function App () {
   const syncAt = tab === 'overview' ? lastSync : panelSync
   return html`<div class="wrap" ref=${wrapRef}>
     <header class="topbar">
-      <div class="sync" ref=${syncRef} tabindex="0" aria-label="状态与刷新">
+      <div class="sync" ref=${syncRef} role="group" aria-label="状态与刷新" tabindex="0">
         <${Badge} tone=${authExpired ? 'bad' : locking ? 'run' : 'ok'}>${badgeText}<//>
         <span class="sync-meta">
           ${pull.state !== 'idle'
             ? html`<${PullRefreshStatus} state=${pull.state} />`
-            : html`<${TapTip} showDate=${showDate} tip=${showDate && syncAt ? `数据截至：${fmtLocalTime(syncAt)} ${fmtWeekday(syncAt)}` : ''} hint=${showDate && syncAt ? '点看' : ''}><${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${syncAt} showDate=${showDate} paused=${!autoRefresh || authExpired} live=${livePolling} /><//>`}
+            : html`<${TapTip} showDate=${showDate} tip=${showDate && syncAt ? `数据截至：${fmtLocalTime(syncAt)} ${fmtWeekday(syncAt)}（${TZ_LABEL}）` : ''} hint=${showDate && syncAt ? '点看' : ''}><${AutoRefreshText} nextAt=${nextAt} pollMs=${pollMs} lastSync=${syncAt} showDate=${showDate} paused=${!autoRefresh || authExpired} live=${livePolling} /><//>`}
         </span>
         <button type="button" class="sync-toggle" aria-pressed=${autoRefresh ? 'true' : 'false'}
           onClick=${() => { setAutoRefresh((v) => !v) }}>${autoRefresh ? '暂停' : '继续'}</button>
@@ -6979,14 +7238,17 @@ function App () {
 
     <nav class="tabs" ref=${tabsRef} data-edge=${tabEdge || undefined} onScroll=${syncTabEdge}>
       ${TABS.map((t) => html`<button key=${t.key} class=${'tab-btn' + (tab === t.key ? ' active' : '')}
+        aria-current=${tab === t.key ? 'page' : undefined}
         onClick=${() => switchTab(t.key)}>${t.label}</button>`)}
     </nav>
+
+    <main class="main" id="main">
 
     ${!authExpired && visited.has('overview') && html`<section class="page" hidden=${tab !== 'overview'}>
       <div>
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} err=${statusFailed} />
-      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} runs=${runs}
+      <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} runs=${runs} active=${tab === 'overview'}
         auto=${{ on: autoOn, interval: autoState && Number.isInteger(autoState.interval) ? autoState.interval : AUTO_DEFAULT_S, runs: autoState && autoState.runs ? autoState.runs : 0, err: autoState && autoState.lastError ? autoState.lastError : '', nextAt: autoState && autoState.nextAt ? autoState.nextAt : 0, now: autoNow, start: startAuto, stop: stopAuto, save: saveAutoInterval }} />
       <${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'overview'} pollMs=${autoRefresh && tab === 'overview' ? pollMs : 0} onRefresh=${refreshSplit} />
       <${TrendsPanel} active=${tab === 'overview'} />
@@ -7023,6 +7285,8 @@ function App () {
       <${FilesPanel} onReady=${onFilesReady} active=${tab === 'sys'} pollTick=${pollTick} onFresh=${onFresh} />
       </div>
     </section>`}
+
+    </main>
 
     <footer class="foot">
       ⚠️ 「正式运行一轮」会真实推送，触发前二次确认 · 试运行只抓取不推送 · 同一时刻只能有一个触发任务

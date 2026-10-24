@@ -872,7 +872,7 @@ function request (port, method, urlPath, { token, body, headers } = {}) {
     const req = http.request({ host: '127.0.0.1', port, method, path: urlPath, headers: { ...base, ...(headers || {}) } }, (res) => {
       let buf = ''
       res.on('data', c => { buf += c })
-      res.on('end', () => resolve({ status: res.statusCode, text: buf, headers: res.headers }))
+      res.on('end', () => resolve({ status: res.statusCode, text: buf, headers: res.headers, rawHeaders: res.rawHeaders }))
     })
     req.on('error', reject)
     if (body !== undefined) req.write(body)
@@ -892,6 +892,12 @@ function requestBuffer (port, method, urlPath, { token, body, headers } = {}) {
     if (body !== undefined) req.write(body)
     req.end()
   })
+}
+// 同名响应头出现次数：Node 在 res.headers 里把重复头用 ", " 合并成一个值，只有 rawHeaders
+// 能数清「写了几条」——用于锁死 Referrer-Policy 这类必须唯一的页面安全头。
+function headerCount (res, name) {
+  const want = String(name).toLowerCase()
+  return res.rawHeaders.filter((v, i) => i % 2 === 0 && String(v).toLowerCase() === want).length
 }
 // 绕过 http.request 的 URL 合法性校验，直接写原始请求行（畸形 request-target 回归用：
 // `//@:99999/` 会让裸 new URL 抛 TypeError——修复前一条无凭证请求即崩整个控制台）。
@@ -2173,6 +2179,9 @@ async function main () {
     // 页面含会话凭证（boot JSON token）⇒ 不得被缓存：缺 Cache-Control 时浏览器启发式缓存
     // 会留下旧页面的空/过期 boot token，表现为「页面正常、点按钮 POST 400/401 unauthorized」。
     assert.strictEqual(res.headers['cache-control'], 'no-store', 'HTML 必须 no-store（凭证不落缓存）')
+    // 重复头回归：页面安全头由 applyPageHeaders 单点写，app 侧只允许出现一条 Referrer-Policy
+    // （反代若也设同名字段，浏览器里会看到两行——那属反代配置，不在本仓）。
+    assert.strictEqual(headerCount(res, 'referrer-policy'), 1, 'SPA 壳页只能有一条 Referrer-Policy')
     // Sourcery #37：缺文件夹具必须断言「缺失」分支文案，不许「正常」蒙混——
     // 两种文案都接受的断言抓不住缺失降级走错分支的回归。
     assert.ok(res.text.includes('缺失'), `空缓存目录必须渲染「缺失」分支，实际片段：${res.text.slice(0, 400)}`)
@@ -2214,8 +2223,9 @@ async function main () {
     assert.strictEqual(verMatch[1], expectVer, '版本号必须等于资产内容的哈希（不能是常量/陈旧值）')
     const immutable = await requestBuffer(port, 'GET', `/assets/app.css?v=${verMatch[1]}`, { token: TOKEN })
     const cc = String(immutable.headers['cache-control'] || '')
-    assert.match(cc, /immutable/, '版本化资产必须 immutable 长缓存')
-    assert.match(cc, /private/, '资产与数据同面鉴权：只能进浏览器私有缓存（shared cache 会把带凭证响应复用给未鉴权方）')
+    // 内容寻址（?v= 为内容哈希）⇒ 命中即同一份字节：public + immutable 一年，浏览器/CDN
+    // 不再回源；public 只对静态资产成立（不含凭证与推送数据），数据面仍是 no-store。
+    assert.strictEqual(cc, 'public, max-age=31536000, immutable', '版本化资产必须 public + immutable 一年长缓存')
     const staleVer = await requestBuffer(port, 'GET', '/assets/app.css?v=deadbeefdeadbeef', { token: TOKEN })
     assert.strictEqual(String(staleVer.headers['cache-control'] || ''), 'no-cache', '不匹配的版本号必须回退 no-cache')
     // gzip;q=0 表示明确拒绝：不得发压缩体
@@ -2242,6 +2252,7 @@ async function main () {
     assert.strictEqual(unauth.status, 401, '未授权 GET / 回 401')
     assert.match(unauth.headers['content-type'], /text\/html/, '未授权首屏必须是 HTML')
     assert.ok(unauth.text.includes('需要访问令牌'), '登录页含标题')
+    assert.strictEqual(headerCount(unauth, 'referrer-policy'), 1, '登录/挑战页只能有一条 Referrer-Policy')
     assert.ok(unauth.text.includes('<form method="post" action="/login">'), '登录页必须用 POST 表单（token 不进地址栏）')
     // POST /login：正确 token → 303 到干净 `/` + Cookie；错误 token → 401 仍是登录页。
     const loginOk = await request(port, 'POST', '/login', {
@@ -3085,7 +3096,16 @@ async function main () {
     assert.strictEqual(res.status, 200)
     // 响应头（Node 出站头小写化）
     assert.strictEqual(res.headers['content-type'], 'text/csv; charset=utf-8')
-    assert.strictEqual(res.headers['content-disposition'], 'attachment; filename="messages-export.csv"', '文件名固定字面量')
+    // 文件名 = messages-<YYYYMMDD-HHmm>.csv：纯 ASCII + 北京时间戳（本地时间，非 UTC），
+    // 同一分钟内多次导出会重名——判据是「时间戳存在且指向当下」，不是唯一性。
+    const cd = String(res.headers['content-disposition'])
+    const cdMatch = /^attachment; filename="messages-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})\.csv"$/.exec(cd)
+    assert.ok(cdMatch, `Content-Disposition 必须是 messages-<YYYYMMDD-HHmm>.csv（实际：${cd}）`)
+    assert.ok(!/[^\x20-\x7e]/.test(cd), 'Content-Disposition 必须是纯 ASCII（中文环境兼容，不依赖 filename*）')
+    const stampMs = Date.UTC(+cdMatch[1], +cdMatch[2] - 1, +cdMatch[3], +cdMatch[4], +cdMatch[5])
+    // 北京时间 = UTC+8：把文件名里的「本地时刻」当 UTC 解读，应比 Date.now() 正好大 8 小时；
+    // 差 5 分钟容差只吸收「请求跨分钟边界」。
+    assert.ok(Math.abs(Date.now() + 8 * 3600 * 1000 - stampMs) < 5 * 60 * 1000, `时间戳必须是当前北京时间（实际 ${cdMatch[0]}）`)
     assert.strictEqual(res.headers['x-export-truncated'], undefined, '未截断不下发该头')
     // BOM（request() 收 utf8 字符串，BOM 呈 U+FEFF）
     assert.strictEqual(res.text.charCodeAt(0), 0xFEFF, 'CSV 必须以 UTF-8 BOM 开头')
@@ -3122,6 +3142,7 @@ async function main () {
     assert.strictEqual(j.length, EXPORT_MAX_ROWS, '恰 5000 行（截断）')
     assert.strictEqual(typeof j[0].title, 'string', '元素=行对象')
     const jr = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json' })
+    assert.match(String(jr.headers['content-disposition']), /^attachment; filename="messages-\d{8}-\d{4}\.json"$/, 'JSON 导出同样带时间戳文件名')
     assert.strictEqual(jr.headers['x-export-truncated'], 'true', 'JSON 分支同样下发截断头')
     // D2-S9：导出口径必须回显「实际生效的搜索词」（列表端点早有 queryUsed）
     assert.strictEqual(jr.headers['x-export-query-used'], '', '无搜索词时头为空串而非缺席')
@@ -5194,7 +5215,7 @@ async function main () {
       '不得再按页停掉轮询定时器')
     assert.ok(src.includes("if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)"),
       '非概览/日志页必须每拍推进共享 tick')
-    assert.ok(src.includes('if (!active || !(pollTick > 0) || busyRef.current) return'),
+    assert.ok(src.includes('if (!active || justActivated || !(pollTick > 0) || busyRef.current) return'),
       '轮询重拉必须单飞：上一拍还没回来时跳过，否则慢接口会互相作废响应')
     assert.ok(/\[refreshSplit, locking, tab, autoRefresh, authExpired\]/.test(src), '轮询 effect 必须随 tab / 暂停开关 / 凭证失效状态变化重跑')
     // 四个页面的面板都要消费这个 tick，否则只是数字在动、数据不动。
@@ -5420,7 +5441,8 @@ async function main () {
     assert.ok(src.includes('initialMode') && src.includes('initialQuery'), '日志面板必须支持带条件跳转')
     assert.ok(src.includes("window.addEventListener('hashchange'"), '页签必须跟随 hash')
     assert.ok(src.includes('document.title ='), '标题必须带状态点')
-    assert.ok(src.includes('function AutoRefreshText (') && /自动刷新 \$\{remain\}s/.test(src), '状态行必须复用 AutoRefreshText（暂停 + 倒计时）')
+    assert.ok(src.includes('function AutoRefreshText (') && /\$\{remain\} 秒后刷新/.test(src) &&
+      /数据截至 \$\{TZ_LABEL\} /.test(src), '状态行必须复用 AutoRefreshText（暂停 + 倒计时；L3 起文案为「N 秒后刷新 · 数据截至 北京时间」）')
     assert.ok(src.includes('filterRunItems'), '逐轮历史必须支持失败/日期筛选')
     assert.ok(!src.includes('首轮前正常'), '墓碑文案不得再写「首轮前正常」')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
@@ -5557,8 +5579,9 @@ async function main () {
     const runs = src.slice(src.indexOf('function RunsPanel'), src.indexOf('// ── 组件：逐轮运行历史'))
     assert.ok(runs.includes("if (document.visibilityState === 'hidden') return"), '触发详情在后台必须跳过请求')
     assert.ok(runs.includes("document.addEventListener('visibilitychange', onVisibility)"), '切回前台必须补一拍')
-    const app = src.slice(src.indexOf('const active = runs.some'), src.indexOf('// vwU/vv2'))
-    assert.ok(app.includes("document.visibilityState !== 'hidden'"), '概览主轮询在后台必须跳过')
+    const pollBlock = src.slice(src.indexOf('const interval = locking ? POLL_BUSY_MS : POLL_MS'),
+      src.indexOf('}, [refreshSplit, locking, tab, autoRefresh, authExpired])'))
+    assert.ok(pollBlock.includes('if (document.hidden) return'), '概览主轮询在后台必须跳过（tick 整拍不发）')
   })
 
   await aok('结构红线: 标签页吸顶、切页回顶、缓存每分钟刷新', () => {
@@ -5617,7 +5640,8 @@ async function main () {
       '系统页两个面板都完成时必须缓存 sys 时间并写 ready 标记')
     const switchSyncBlock = src.slice(src.indexOf('const doSwitchTab ='), src.indexOf('const openLog = useCallback'))
     assert.ok(switchSyncBlock.includes('showSyncFor(next)'), '页签点击必须同步切到目标页缓存时间')
-    const hashSyncBlock = src.slice(src.indexOf('const onHash ='), src.indexOf("window.addEventListener('hashchange'"))
+    const hashStart = src.lastIndexOf('const onHash =')
+    const hashSyncBlock = src.slice(hashStart, src.indexOf("window.addEventListener('hashchange'", hashStart))
     assert.ok(hashSyncBlock.includes('showSyncFor(next)'), '后退/前进必须同步切到目标页缓存时间')
     const openLogSyncBlock = src.slice(src.indexOf('const openLog ='), src.indexOf('const pollMs ='))
     assert.ok(openLogSyncBlock.includes("showSyncFor('logs')"), '查看日志必须切到 logs 的缓存时间')
@@ -5730,6 +5754,12 @@ async function main () {
     assert.ok(src.includes("if (!autoOn || tab !== 'overview') return undefined"), '概览隐藏后倒计时时钟必须停')
     assert.ok(src.includes('paused=$' + "{!autoRefresh || tab !== 'overview'}"), '概览隐藏后缓存健康分钟轮询必须停')
     assert.ok(src.includes('if (openId === null || !active) return undefined'), '隐藏页的运行详情必须断开 SSE/轮询')
+    // 隐藏页不只不轮询，也不该生成工具条 DOM（L4）：保活面板切走后，
+    // date-btn / auto-run-row 会以 hidden 副本留在别的页面里，点击区与可检索文本都被污染。
+    assert.strictEqual((src.match(/active && html`<\$\{DateRange\}/g) || []).length, 4,
+      '四处 DateRange 都必须按 active 条件渲染（非活动面板不生成 date-btn）')
+    assert.strictEqual((src.match(/active && html`<div class="auto-run-row">/g) || []).length, 2,
+      '两处 auto-run-row（概览自动运行 / 系统页拦截窗）都必须按 active 条件渲染')
     // 只读页切回静默刷新；带草稿的过滤规则页不得重拉覆盖。
     assert.ok(src.includes('<$' + '{MessagesPanel} active=$' + "{tab === 'messages'}"), '推送记录页切回时必须静默刷新')
     assert.ok(src.includes('active=$' + "{tab === 'logs'}"), '日志页切回时必须静默刷新')
@@ -5751,9 +5781,11 @@ async function main () {
     assert.ok(seg('SysPanel', 'function FilesPanel').includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
       '系统页必须等系统信息 + 访问日志 + 设置三条都结算后才报完成')
     assert.ok(seg('FilesPanel', 'function FilterRules').includes('usePanelAutoLoad(active, load)'), '文件清单必须首访预加载 + 切回刷新')
-    assert.ok(src.includes('function usePanelAutoLoad') && src.includes('if (!active && !first) return') &&
-      src.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
-    '必须有首访预加载 hook：未点开的页签也先拉一次，离开后不拉')
+    const autoLoad = src.slice(src.indexOf('function usePanelAutoLoad'), src.indexOf('// ── 下拉刷新'))
+    assert.ok(autoLoad.includes('if (!active) return') && !autoLoad.includes('!active && !first'),
+      '首访懒加载：未点开的页签不得发请求（旧版 !active && !first 会在挂载时预取）')
+    assert.ok(autoLoad.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
+      '切回仍在 3s 内 / 上一发在飞时不得重复发（Sourcery #272 同口径）')
     assert.ok(seg('LogsPanel', 'function SysPanel').includes('const firstReveal = preloadedRef.current && active && !revealedRef.current'),
       '日志首访也要预加载，离开后不拉')
     assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('filesLoader.load().catch'),
@@ -6260,7 +6292,8 @@ async function main () {
     const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
     const ph = (name) => '$' + '{' + name + '}'
     // C. 362 宽必须命中紧凑规则（旧断点 360 差 1px，实测内容 404 宽、末两格被切/出屏）。
-    assert.ok(!/@media \(max-width: 360px\)/.test(css), '旧的 360 断点必须移除，否则 362 仍差 1px 不命中')
+    const media360 = [...css.matchAll(/@media \(max-width: 360px\) \{([\s\S]*?)\n {2}\}/g)].map((m) => m[1]).join('\n')
+    assert.ok(!/\.tabs/.test(media360), '页签不得再用 360 断点（362 会差 1px 不命中）；360 现仅分页网格使用')
     const compact = (css.match(/@media \(max-width: 420px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
     assert.ok(/\.tabs\s*\{[^}]*gap:\s*2px/.test(compact), '≤420 必须收紧 gap 且真的落到 .tabs')
     assert.ok(/\.tab-btn\s*\{[^}]*padding:\s*7px 5px/.test(compact) && /font-size:\s*var\(--fs-sm\)/.test(compact),
@@ -6784,8 +6817,8 @@ async function main () {
     // ②b v3.344：暂停不是概览专属——其它页也要能暂停/继续。
     //     v3.346：文案收敛到组件里，暂停只换开头两个字，后半句不变。
     assert.ok(!/\$\{tab === 'overview' && html`<button type="button" class="sync-toggle"/.test(src), '暂停按钮不得再限定在概览页')
-    assert.ok(/自动刷新 \$\{remain\}s · <span class="sync-label">数据截至 · <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '运行态文案必须统一')
-    assert.ok(/已暂停 · <span class="sync-label">数据截至 · <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '暂停态只换开头，后半句保持同一形态')
+    assert.ok(/\$\{remain\} 秒后刷新 · <span class="sync-label">数据截至 \$\{TZ_LABEL\} <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '运行态文案必须统一')
+    assert.ok(/已暂停 · <span class="sync-label">数据截至 \$\{TZ_LABEL\} <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '暂停态只换开头，后半句保持同一形态')
     // v3.347：秒级时钟必须比 1s 快。1s 时钟与 mark() 不同相时，倒数会 5 4 3 2 → 5 跳过 1s
     // （真机录屏实证），所以这里钉住 500ms，防止有人「优化」回 1000。
     assert.ok(src.includes('setInterval(() => setNowMs(() => Date.now()), 500)'), '倒计时时钟必须是 500ms（1s 会跳秒）')
@@ -7041,10 +7074,10 @@ async function main () {
     assert.ok(src.includes('refreshSplit(force ? { force: true } : undefined)') && src.includes('refreshActive({ force: true })'), '下拉必须绕过表单交互暂停（回前台补拉不绕）')
     assert.ok(src.includes('Promise.allSettled([refreshSplit(force ? { force: true } : undefined), refreshAuto(), ...detail.waits])'), '必须等主轮询与所有面板一起落定')
     // ⑦ 长时间切后台再回来要静默补拉（不是每次切回来都拉，也不整页重载）。
-    assert.ok(src.includes('const VISIBLE_STALE_MS = 30000'), '回前台补拉必须有「离开多久才算过期」的阈值')
-    const recovery = src.slice(src.indexOf('// 回到前台：离开超过 VISIBLE_STALE_MS'), src.indexOf('const pull = usePullToRefresh'))
+    assert.ok(src.includes('const VISIBLE_REFRESH_GAP_MS = 2000'), '回前台补拉必须有「刚刷完就切回来就跳过」的阈值')
+    const recovery = src.slice(src.indexOf('// 回到前台：隐藏期间所有轮询都停了'), src.indexOf('const pull = usePullToRefresh'))
     assert.ok(recovery.includes("document.addEventListener('visibilitychange', onVis)"), '回前台补拉必须真的挂上 visibilitychange 监听（只有回调函数不算）')
-    assert.ok(recovery.includes('if (Date.now() - lastRefreshRef.current < VISIBLE_STALE_MS) return'), '回前台补拉必须按距上次刷新判断，不能每次切回都发请求')
+    assert.ok(recovery.includes('if (Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS) return'), '回前台补拉必须按距上次刷新判断，不能每次切回都发请求')
     assert.ok(recovery.includes('refreshActive({ respectFormPause: true })'), '回前台补拉要走统一路径，且避开表单交互')
     const refreshActiveBody = src.slice(src.indexOf('const refreshActive = useCallback'), src.indexOf('const pullRefresh = useCallback'))
     assert.ok(refreshActiveBody.includes('lastRefreshRef.current = Date.now()'), '刷新成功必须推进时间戳（写在 refreshActive 内，别处的不算）')
@@ -7087,6 +7120,19 @@ async function main () {
       '推送记录必须用 slowLoading 决定「更新中…」')
     assert.ok(msgPanel.includes('slowLoading ? html`<span class="msg-loading"> · 更新中…</span>`'),
       '「匹配 N 条」的后缀只能由 slowLoading 控制，不能用 loading')
+    // 首屏骨架（L4）：第一份数据回来前画占位；只在「还没有 data」时出现——自动刷新/切回
+    // 已有数据的面板不得反复闪骨架。
+    assert.ok(src.includes('function PanelSkeleton ('), '必须有可复用的首屏骨架组件')
+    assert.ok(msgPanel.includes('loading && !data && html`<') && msgPanel.includes('PanelSkeleton'),
+      '首屏骨架必须由 loading && !data 门控（自动刷新不闪）')
+    // 加载失败（L4）：英文异常映射成中文原因，并给重试按钮（class retry-btn）。
+    const errMap = src.slice(src.indexOf('function loadErrorText'), src.indexOf('function usePanelLoader'))
+    assert.ok(errMap.includes('网络请求失败') && errMap.includes('服务器错误'),
+      'Failed to fetch 要映射成「网络请求失败」，5xx 映射成「服务器错误」')
+    const loadErrLine = 'setErr(`加载失败：' + '$' + '{loadErrorText(e)}`)'
+    assert.ok(src.includes(loadErrLine), 'loader 的 err 必须经 loadErrorText 映射，不得直接甩 e.message')
+    assert.ok(msgPanel.includes('<$' + '{LoadError}') && src.includes('class="retry-btn"'),
+      '推送记录加载失败必须给重试按钮（class retry-btn），且复用面板自己的 load()')
     assert.ok(!src.includes("刷新中…' : '刷新'"),
       '刷新按钮不得改文案：宽度变化会把导出按钮挤一下')
     assert.ok(src.includes('slowLoading && html`<span class="fr-status-muted">刷新中…</span>`'),
@@ -7157,7 +7203,10 @@ async function main () {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
     assert.ok(hist.includes('snapsRef = useRef({ runs: null, all: null })'), '必须留 runs/all 两份服务端快照')
-    assert.ok(hist.includes("fetchSnap(k === 'runs' ? 'all' : 'runs')"), '当前档加载时必须预取另一档（切过去才不用等）')
+    assert.ok(hist.includes("fetchSnap(k === 'runs' ? 'all' : 'runs')") === false,
+      '首屏只允许一次 /api/run-history：不得再预取另一档（旧版 excludeCancelled=1 的第二发）')
+    assert.ok(hist.includes('apiGetRunHistory({ limit: RUN_FETCH_LIMIT })') && !hist.includes('excludeCancelled: k ==='),
+      '一份全量窗口必须同时喂 runs/all 两档（前端剔除取消留痕，不再发 excludeCancelled 请求）')
     const change = hist.slice(hist.indexOf('const changeMode = (m) => {'), hist.indexOf('const goPage = (n) => {'))
     // 有快照：数据先于选中态落地（同一批渲染），首帧就是目标档。
     const cachedAt = change.indexOf('if (cached !== null) {')
