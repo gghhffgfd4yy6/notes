@@ -861,3 +861,8 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - `scripts/console.js` 增至 5355 行，变异矩阵末两段拆为 `console-part8: 4371-4800` / `console-part9: 4801-5355`（末段约 555 行，避免撞 step 330min）；`EXPECTED_SEGMENTS`、行段校验夹具与 `test_check_mutation_ranges.js` 同步。
 - 控制台套件新增 TOTP RFC 6238 标准向量、Base32/恢复码/Cookie 签名单测，以及「开启→页面第二因子→恢复码登录→关闭」HTTP 端到端用例（240/0）。
 
+## v3.358 — 导入解密不再闪键盘
+
+- 修复导入加密备份时点「解密」后虚拟键盘又弹一下：确认弹窗的焦点 effect 不再依赖每次渲染都会换身份的 `onCancel`，`busy` 从「解密」变「解密中…」时不会把焦点抢回密码框。
+- 同一处焦点管理同步到「有未保存的过滤规则」弹窗；控制台套件 241/0。
+

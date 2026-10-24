@@ -1504,24 +1504,28 @@ let dialogSeq = 0
 
 function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, initialFocusRef = null, onConfirm, onCancel, children }) {
   const cancelRef = useRef(null)
+  // 回调每次渲染都是新函数；若把它放进 focus effect 的依赖，busy 变化会重新聚焦密码框，
+  // 手机上表现为点「解密」后键盘又弹一下。用 ref 取最新回调，effect 只在打开时跑一次。
+  const onCancelRef = useRef(onCancel)
+  onCancelRef.current = onCancel
   const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
   useEffect(() => {
     if (!open) return undefined
-    const onKey = (e) => { if (e.key === 'Escape') onCancel() }
+    const onKey = (e) => { if (e.key === 'Escape') onCancelRef.current() }
     document.addEventListener('keydown', onKey)
     const t = setTimeout(() => {
       const target = initialFocusRef && initialFocusRef.current ? initialFocusRef.current : cancelRef.current
       if (target) target.focus()
     }, 0)
     return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
-  }, [open, onCancel, initialFocusRef])
+  }, [open, initialFocusRef])
   if (!open) return null
-  return html`<div class="modal-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCancel() }}>
+  return html`<div class="modal-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCancelRef.current() }}>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby=${titleId}>
       <div class="modal-title" id=${titleId}>${title}</div>
       <div class="modal-body">${children}</div>
       <div class="modal-actions">
-        <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${onCancel}>取消<//>
+        <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${() => onCancelRef.current()}>取消<//>
         <${Button} variant="danger-solid" disabled=${busy || confirmDisabled} onClick=${onConfirm}>${confirmLabel}<//>
       </div>
     </div>
@@ -1532,16 +1536,18 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
 // 「保存并继续」会走正常的保存确认；只有真正保存成功，App 才继续原来的切页/后退动作。
 function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
   const cancelRef = useRef(null)
+  const onCancelRef = useRef(onCancel)
+  onCancelRef.current = onCancel
   const [titleId] = useState(() => `leave-title-${++dialogSeq}`)
   useEffect(() => {
     if (!open) return undefined
-    const onKey = (e) => { if (e.key === 'Escape') onCancel() }
+    const onKey = (e) => { if (e.key === 'Escape') onCancelRef.current() }
     document.addEventListener('keydown', onKey)
     const t = setTimeout(() => { if (cancelRef.current) cancelRef.current.focus() }, 0)
     return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
-  }, [open, onCancel])
+  }, [open])
   if (!open) return null
-  return html`<div class="modal-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCancel() }}>
+  return html`<div class="modal-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCancelRef.current() }}>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby=${titleId}>
       <div class="modal-title" id=${titleId}>有未保存的过滤规则</div>
       <div class="modal-body">
@@ -1550,7 +1556,7 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
         <div class="modal-note">「保存并继续」会直接保存，保存成功后自动继续刚才的离开操作；「取消」继续编辑。</div>
       </div>
       <div class="modal-actions">
-        <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${onCancel}>取消<//>
+        <${Button} variant="secondary" buttonRef=${cancelRef} onClick=${() => onCancelRef.current()}>取消<//>
         <${Button} variant="danger-solid" disabled=${busy} onClick=${onDiscard}>不保存并离开<//>
         <${Button} variant="primary" disabled=${busy} onClick=${onSave}>保存并继续<//>
       </div>

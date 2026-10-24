@@ -1858,6 +1858,17 @@ async function backupUiStructureTests () {
     assert.ok(/apiPostBackupImport\(pending\.bundle, pending\.key\)/.test(seg), '导入请求只能带解密后的 bundle 和幂等键')
     assert.ok(!/apiPostBackupImport\([^)]*password/i.test(seg), '导入请求不得带密码')
   })
+
+  await aok('结构红线: 弹窗 busy 变化不得把焦点抢回密码框', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const at = src.indexOf('function ConfirmDialog')
+    const end = src.indexOf('function LeaveGuardDialog', at)
+    assert.ok(at > -1 && end > at, '应能定位 ConfirmDialog')
+    const seg = src.slice(at, end)
+    assert.ok(seg.includes('const onCancelRef = useRef(onCancel)'), 'onCancel 必须走 ref，避免每次渲染换身份')
+    assert.ok(seg.includes('}, [open, initialFocusRef])'), '焦点 effect 只能依赖 open/initialFocusRef')
+    assert.ok(!seg.includes('}, [open, onCancel, initialFocusRef])'), 'onCancel 不得回到焦点 effect 依赖（点解密会重开键盘）')
+  })
 }
 
 async function main () {
