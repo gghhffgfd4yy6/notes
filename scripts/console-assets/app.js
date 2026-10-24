@@ -3239,6 +3239,14 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
 // <mark> 会把「展开」卡住几秒；日志页超过 3000 行直接关高亮是同一思路（渲染上限，不改搜索口径）。
 const MSG_HIT_MAX = 200
 
+// 分类三段显示（L2-7）：服务端 catename 是「一级-二级-三级」整串（例：好单线报-娱乐-淘宝），
+// 整串一字排开看不出层级。按 '-' 拆成每段一个 span.msg-cate-part（段间分隔/间距由 CSS 负责，
+// 见 L5），可访问名保留原始整串，读屏不会只听到三段碎片。
+function cateParts (name) {
+  if (typeof name !== 'string' || name === '') return []
+  return name.split('-').filter((part) => part !== '')
+}
+
 function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   const [page, setPage] = useState(1)
   const [size, setSize] = useState(20)
@@ -3521,7 +3529,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
               ${m.price !== null ? html`<span class="msg-price">¥${m.price}</span>` : ''}
             </div>
             <div class="msg-meta">
-              <span class="msg-cate">${m.catename}</span>
+              <span class="msg-cate" aria-label=${m.catename || undefined}>${cateParts(m.catename).map((part, i) => html`<span class="msg-cate-part" key=${i}>${part}</span>`)}</span>
               <span class="mono">${m.datetime} ${m.shorttime}</span>
               ${msgLink(m, data.baseUrl)}
             </div>
