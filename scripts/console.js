@@ -632,7 +632,12 @@ const STATIC_ASSETS = Object.freeze({
   // v3.326 日期区间：flatpickr 4.6.13 的 ESM 单文件 bundle（esbuild 打包，含 zh 语言包）
   // 与官方 CSS。两者都随白名单伺服，CSP script-src 'self' 覆盖，无 CDN。
   '/assets/flatpickr.js': { file: 'flatpickr.module.js', type: 'text/javascript; charset=utf-8' },
-  '/assets/flatpickr.css': { file: 'flatpickr.css', type: 'text/css; charset=utf-8' }
+  '/assets/flatpickr.css': { file: 'flatpickr.css', type: 'text/css; charset=utf-8' },
+  // v3.360 动效层：motion.js 是自家适配层，另外两个是 esbuild 打成单文件的
+  // motion/mini 14.6.0 与 @formkit/auto-animate 0.10.0（MIT，均无 CDN 依赖）。
+  '/assets/motion.js': { file: 'motion.js', type: 'text/javascript; charset=utf-8' },
+  '/assets/motion-lib.module.js': { file: 'motion-lib.module.js', type: 'text/javascript; charset=utf-8' },
+  '/assets/auto-animate.module.js': { file: 'auto-animate.module.js', type: 'text/javascript; charset=utf-8' }
 })
 
 // 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，各文件 < 100KB）。

@@ -2047,7 +2047,7 @@ async function main () {
     assert.ok(verMatch, 'HTML 资产引用必须带内容版本号 ?v=<sha16>')
     // 版本号必须由内容派生（sha256(各文件哈希拼接) 前 16 位），常量/陈旧版本过不了这条
     const crypto = require('node:crypto')
-    const hashes = ['app.css', 'app.js', 'pure.mjs', 'htm-preact.module.js', 'flatpickr.module.js', 'flatpickr.css'].map((f) => {
+    const hashes = ['app.css', 'app.js', 'pure.mjs', 'htm-preact.module.js', 'flatpickr.module.js', 'flatpickr.css', 'motion.js', 'motion-lib.module.js', 'auto-animate.module.js'].map((f) => {
       const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', f))
       return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
     })
@@ -5707,7 +5707,7 @@ async function main () {
     assert.ok(!/\.focus\(\)/.test(cateSeg), '分类弹层聚焦必须 preventScroll，禁止把页面滚回顶部')
     // 触发历史表在 320 宽会撑出面板：必须和逐轮历史一样放进横向滚动容器。
     const runsSeg = src.slice(src.indexOf('function RunsPanel'), src.indexOf('function RunHistoryPanel', src.indexOf('function RunsPanel')))
-    assert.ok(runsSeg.includes('<div class="runs-scroll"><table class="runs-table">'), '触发历史表必须包 .runs-scroll，窄屏不得撑破面板')
+    assert.ok(runsSeg.includes('<div class="runs-scroll" ref=$' + '{listRef}><table class="runs-table">'), '触发历史表必须包 .runs-scroll（带 ref 供行入场），窄屏不得撑破面板')
     // preventScroll 不能把键盘焦点留在 .cate-list 的可视区外：必须显式滚列表。
     assert.ok(cateSeg.includes('focusInList') && cateSeg.includes('list.scrollTop'), '分类列表键盘焦点必须滚进可视区')
     // 趋势图自动停靠最右时，最左列可能只露半截日期：须把下一个完整列对齐到容器左缘。
@@ -6092,6 +6092,46 @@ async function main () {
       '当前页签必须自动滚入视野且不带动整页滚动')
   })
 
+  await aok('结构红线: v3.360 动效层（资产白名单 / 适配层隔离 / reduced-motion 门控）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
+    const srv = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
+    const motion = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/motion.js'), 'utf8')
+    // 资产：三个新文件都必须进白名单（CSP 下没有 CDN/内联兜底，漏一条就是整页白屏）。
+    for (const route of ['/assets/motion.js', '/assets/motion-lib.module.js', '/assets/auto-animate.module.js']) {
+      assert.ok(srv.includes(`'${route}'`), `${route} 必须在 STATIC_ASSETS 白名单里`)
+    }
+    // 换库只改一层：app.js 只能依赖自家适配层，不得直接 import 动画库。
+    assert.ok(src.includes("from './motion.js'"), 'app.js 必须通过 motion.js 引入动效')
+    assert.ok(!src.includes("from './motion-lib.module.js'") && !src.includes("from './auto-animate.module.js'"),
+      'app.js 不得直接依赖动画库（换库只改 motion.js）')
+    // reduced-motion：所有入口都过 motionOK()，否则系统关了动效页面还在动。
+    assert.ok(motion.includes('prefers-reduced-motion: reduce'), 'motion.js 必须读 prefers-reduced-motion')
+    assert.ok(/export function motionOK/.test(motion), 'motion.js 必须导出 motionOK')
+    assert.ok(/if \(!el \|\| !motionOK\(\)\) return null/.test(motion), 'enter 必须被 motionOK 门控（no-op 而不是快放）')
+    assert.ok(/if \(!root \|\| !motionOK\(\)\) return \[\]/.test(motion), 'reveal 必须被 motionOK 门控')
+    assert.ok(/if \(!el \|\| !motionOK\(\)\) return undefined/.test(motion), 'useListMotion 必须被 motionOK 门控')
+    // 只动合成层属性：入场帧必须只有 opacity/transform（改高度会引入布局跳动）。
+    assert.ok(/frames\.transform = \[from/.test(motion) && /frames\.opacity = \[0, 1\]/.test(motion), '入场只允许 opacity/transform')
+    assert.ok(!/height|width|maxHeight/.test(motion.slice(motion.indexOf('export function enter'), motion.indexOf('export function reveal'))),
+      'enter 不得改尺寸类属性')
+    // 动画收尾要清内联样式，否则盖住 CSS 的 hover/按压反馈。
+    assert.ok(motion.includes("removeProperty('transform')") && motion.includes("removeProperty('opacity')"), '动画结束必须清内联样式')
+    // vendored bundle：非空壳且确实导出预期符号。
+    const lib = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/motion-lib.module.js'), 'utf8')
+    assert.ok(/export\s*\{[^}]*as animate\}/.test(lib), 'motion bundle 必须真的导出 animate（空壳会让页面零动画）')
+    const aa = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/auto-animate.module.js'), 'utf8')
+    assert.ok(/export\s*\{[^}]*as default\}/.test(aa), 'auto-animate bundle 必须真的有 default 导出')
+    // CSS：motion 层必须在 utilities 之前（否则工具类改不动它），并含错误字段反馈与主题过渡。
+    assert.ok(/@layer tokens, base, components, motion, utilities;/.test(css), 'motion 层必须注册在 utilities 之前')
+    assert.ok(/@layer motion \{/.test(css) && /\.flash-bad\s*\{/.test(css) && /@keyframes field-shake/.test(css),
+      '错误字段的抖动/红圈样式必须存在')
+    assert.ok(/html\.theme-anim/.test(css), '主题切换的颜色过渡必须存在')
+    // 播放时机：轮询不得重播入场（hook 内部只播一次）。
+    assert.ok(/const fired = useRef\(false\)/.test(motion) && /if \(!ready \|\| fired\.current\) return/.test(motion),
+      'useRevealWhen 必须只播一次（轮询不重播）')
+  })
+
   await aok('结构红线: v3.326 日期区间（资产白名单 / 中文分隔符 / 双月只在桌面 / 44px）', () => {
     const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
@@ -6170,7 +6210,7 @@ async function main () {
     // 两个表都得落在 .runs-scroll 里才有粘边效果。
     const runsPanel = src.slice(src.indexOf('function RunsPanel'), src.indexOf('function RunHistoryPanel'))
     const histPanel = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
-    assert.ok(runsPanel.includes('<div class="runs-scroll"><table class="runs-table">'), '触发历史表必须在 .runs-scroll 内')
+    assert.ok(runsPanel.includes('<div class="runs-scroll" ref=$' + '{listRef}><table class="runs-table">'), '触发历史表必须在 .runs-scroll 内')
     assert.ok(histPanel.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && histPanel.includes('$' + '{shown.length > 0') && histPanel.includes('? html`<table class="runs-table run-history-table">'), '逐轮历史表必须在 .runs-scroll 内（空态也保留容器）')
     assert.ok(histPanel.includes('<td class="run-actions">'), '逐轮历史的末列必须是动作列（其 sticky 才有意义）')
   })
@@ -6515,11 +6555,11 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.359：注释里不得提前写下一版 v3.360。
+    // 版本已 bump 到 3.360：注释里不得提前写下一版 v3.361。
     // 注意这条只拦「资源注释里提前写下个版本」；四处版本号（主文件头/CHANGELOG/package.json/
     // package-lock 两处）的一致性由 check-version.js 负责（CI 与 pre-commit 都跑，npm test 不含）。
-    assert.ok(!/v3\.360/.test(src), 'app.js 注释不得写 v3.360（版本未 bump）')
-    assert.ok(!/v3\.360/.test(css), 'app.css 注释不得写 v3.360（版本未 bump）')
+    assert.ok(!/v3\.361/.test(src), 'app.js 注释不得写 v3.361（版本未 bump）')
+    assert.ok(!/v3\.361/.test(css), 'app.css 注释不得写 v3.361（版本未 bump）')
   })
 
   await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
