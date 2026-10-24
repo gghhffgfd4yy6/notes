@@ -3602,26 +3602,6 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }).catch(() => sendJson(res, 500, { error: '导入失败' }))
   }
 
-  // 覆盖文件里实际存在的字段（只含白名单内的字符串字段；无覆盖文件/损坏时为 {}）。
-  // 保存端点按设计是「整份替换」：前端必须把本次没改、但已落盘的字段原样带回来，
-  // 否则那些字段会被静默删掉、回退到代码默认（v3.359 修：只提交 dirtyFields 导致
-  // 「改 A 保存 → 覆盖文件里原有的 B 消失」）。这里只回读原文，不改变 filter 的
-  // 「代码默认 + 覆盖」合并语义。
-  const readFilterOverrideFields = (source) => {
-    if (source !== 'override') return {}
-    const raw = readSafeTextResult(FilterStore.filterRulesPaths(stateDir).file, FILTER_BODY_MAX_BYTES)
-    if (raw.status !== 'ok') return {}
-    let parsed = null
-    try { parsed = JSON.parse(raw.text) } catch (e) { return {} }
-    const stored = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed.filter : null
-    if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return {}
-    const fields = {}
-    for (const field of FilterStore.FILTER_RULE_FIELDS) {
-      const value = stored[field]
-      if (typeof value === 'string') fields[field] = value
-    }
-    return fields
-  }
   // GET /api/config/filter：读面，沿用全局鉴权（Cookie / Bearer / ?token= 均可）。
   // 损坏时 revision 强制 0（即便进程内有 last-known-good，那是运行侧降级，不是覆盖文件版本）。
   const handleFilterGet = (req, res) => {
@@ -3637,7 +3617,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       revision: corrupt ? 0 : loaded.revision,
       source: loaded.source,
       filter: loaded.filter,
-      override: readFilterOverrideFields(loaded.source),
+      // 与 filter 同源（FilterStore 同一次读盘给出）：不得在这里再读一遍文件，否则两次读之间
+      // 文件被别的进程替换/读失败时，filter 与 override 会描述两个不同快照，保存会丢字段。
+      override: loaded.override || {},
       keyword: {
         zkt_gjc: loaded.keyword && loaded.keyword.zkt_gjc !== undefined ? loaded.keyword.zkt_gjc : '',
         writable: false

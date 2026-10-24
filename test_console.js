@@ -1245,35 +1245,58 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
-  await aok('过滤规则页: 保存候选 = 覆盖文件已有字段 + 本次改动字段（未改的代码默认不得钉死）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
-    // 唯一构造保存候选的地方：先铺覆盖文件里已落盘的字段，再盖本次改动字段。
+  await aok('过滤规则保存: 保存候选行为（pure.mjs）——覆盖项保留、改动项优先、未涉及的字段不提交', async () => {
+    const { buildSaveCandidate, filterOverrideFields } = await import('./scripts/console-assets/pure.mjs')
+    const FIELDS = ['pingbilouzhu', 'zhanxianlouzhu', 'pingbitime']
+    assert.deepStrictEqual(
+      buildSaveCandidate({ pingbilouzhu: 'A' }, ['pingbitime'], { pingbilouzhu: 'A', zhanxianlouzhu: '默认', pingbitime: 'B' }, FIELDS),
+      { pingbilouzhu: 'A', pingbitime: 'B' },
+      '已落盘字段 + 本次改动字段必须同时在候选里（漏了前者=删字段的旧 bug），未改的代码默认不得钉死'
+    )
+    assert.deepStrictEqual(
+      buildSaveCandidate({ pingbilouzhu: 'old' }, ['pingbilouzhu'], { pingbilouzhu: 'new' }, FIELDS),
+      { pingbilouzhu: 'new' },
+      '同名字段必须由本次输入覆盖 override'
+    )
+    assert.deepStrictEqual(
+      buildSaveCandidate({}, ['pingbitime'], { pingbilouzhu: '默认', pingbitime: 'B' }, FIELDS),
+      { pingbitime: 'B' },
+      '既没落盘也没改动的字段不得写进覆盖文件（否则把代码默认永久钉死）'
+    )
+    assert.deepStrictEqual(buildSaveCandidate({}, [], { pingbitime: 'B' }, FIELDS), {}, '空改动 = 空候选（保存不得凭空造字段）')
+    assert.deepStrictEqual(
+      buildSaveCandidate({ pingbilouzhu: 'A', 未知键: 'x', zhanxianlouzhu: 3 }, [], {}, FIELDS),
+      { pingbilouzhu: 'A' },
+      '未知键与非字符串值必须丢弃（服务端白名单之外的字段不得被前端带出去）'
+    )
+    assert.deepStrictEqual(filterOverrideFields({ pingbilouzhu: '', pingbitime: 2 }, FIELDS), { pingbilouzhu: '' },
+      '空串也算「文件里已存在」，非字符串不算')
+    assert.deepStrictEqual(buildSaveCandidate(null, null, null, FIELDS), {}, '坏输入不得抛错，退化为空候选')
+  })
+
+  await aok('过滤规则页: 两处保存入口都走 pure.mjs 的候选构造，没有第二条提交路径', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    // 逻辑在 pure.mjs 且被 Node 直接执行测试；这里只锁「接线」：
+    assert.ok(/import \{[^}]*buildSaveCandidate as buildSaveCandidateOf[^}]*\} from '\.\/pure\.mjs'/.test(src),
+      'app.js 必须从 pure.mjs 引入候选构造函数（别在组件里另写一份）')
     const start = src.indexOf('const buildSaveCandidate = useCallback(')
     assert.ok(start > 0, '必须抽成单一 buildSaveCandidate()（所有保存入口共用）')
-    const end = src.indexOf('}, [override, dirtyFields, draft])', start)
-    assert.ok(end > start, 'buildSaveCandidate 的依赖数组锚点必须存在（切片不能退化）')
+    const end = src.indexOf('\n  )', start)
+    assert.ok(end > start, 'buildSaveCandidate 的 useCallback 切片锚点必须存在（不能退化成空切片）')
     const body = src.slice(start, end)
-    const overrideAt = body.indexOf('candidate[name] = override[name]')
-    const dirtyAt = body.indexOf('candidate[name] = draft[name]')
-    assert.ok(overrideAt > 0, '候选必须带上覆盖文件里已存在的字段（否则整份替换会删掉它们）')
-    assert.ok(dirtyAt > overrideAt, '本次改动字段必须最后覆盖 override（同名字段以用户本次输入为准）')
-    // 普通保存与离开拦截的「保存并继续」都必须走同一个函数；只改一处就会留下删字段的入口。
+    assert.ok(body.includes('buildSaveCandidateOf(override, dirtyFields, draft, FILTER_FIELD_NAMES)'),
+      '组件内必须委托 pure.mjs 的实现，不得再复制一份逻辑')
     assert.strictEqual((src.match(/const candidate = buildSaveCandidate\(\)/g) || []).length, 2,
       'beginSave 与 beginGuardSave 都必须走 buildSaveCandidate()')
-    // 「只提交 dirtyFields」的旧写法只能作为 buildSaveCandidate 内部的那一步存在；
-    // 一旦在某个保存入口里重新出现，就多出一处会删掉覆盖项的地方。
-    assert.strictEqual((src.match(/for \(const name of dirtyFields\) candidate\[name\] = draft\[name\]/g) || []).length, 1,
-      '「只提交 dirtyFields」的写法只允许出现在 buildSaveCandidate 内部')
-    assert.ok(body.includes('for (const name of dirtyFields) candidate[name] = draft[name]'),
-      'buildSaveCandidate 内部必须含 dirtyFields 覆盖这一步')
-    // 保存成功后同步 override：否则下一次保存会把这次刚写进去的字段再删一遍。
+    // 任何新增保存路径都必须经由候选构造：直接调 API 的地方只允许「保存」与首启复制默认两处。
+    assert.strictEqual((src.match(/apiPostFilterSave\(/g) || []).length, 2,
+      'apiPostFilterSave 只允许 submitSave 与首启复制默认两处调用（多一处就可能绕过候选构造）')
     assert.ok(src.includes('setOverride(filterOverrideFrom(filter))'), 'applySaved 必须同步 override')
-    // 首启「把代码默认整份写进覆盖文件」保持原样（有意为之，不是本 bug）。
     assert.ok(src.includes('apiPostFilterSave({ schema: 1, baseRevision: 0, filter: { ...base } })'),
       '首启复制默认仍应整份写入（baseRevision:0）')
   })
 
-  await aok('过滤规则保存: GET 的 override 只含文件中实际字段；带上它保存不会删掉其他覆盖项', async () => {
+  await aok('过滤规则保存: GET 的 override 只含文件中实际字段；用真实前端候选保存不会删掉其他覆盖项', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
@@ -1282,6 +1305,10 @@ async function filterRuleApiTests () {
       const def = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
       assert.strictEqual(def.source, 'default')
       assert.deepStrictEqual(def.override, {}, '无覆盖文件时 override 必须是 {}')
+      // filter 与 override 必须来自同一次读盘：override 里的每个字段都要与合并值一致。
+      for (const [name, value] of Object.entries(def.override)) {
+        assert.strictEqual(def.filter[name], value, `override.${name} 必须等于 filter.${name}（同一快照）`)
+      }
 
       // 第一步：只保存 A 字段（pingbilouzhu）→ 覆盖文件里只有 A。
       assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
@@ -1294,7 +1321,13 @@ async function filterRuleApiTests () {
       assert.strictEqual(first.filter.pingbitime, '5', 'filter 仍是「代码默认 + 覆盖」的合并值')
 
       // 第二步：前端新逻辑 = override + 本次改动的 B 字段（pingbitime 5→6）。
-      const candidate = { ...first.override, pingbitime: '6' }
+      // 这里跑 pure.mjs 里的**真实**候选构造（app.js 引用的同一函数），不是本用例自己拼 payload：
+      // 否则 helper 写坏了、用例照旧绿（评审指出的「regression goes undetected」）。
+      const { buildSaveCandidate } = await import('./scripts/console-assets/pure.mjs')
+      const draft = { ...first.filter, pingbitime: '6' } // 草稿=服务端生效值，用户只改了 pingbitime
+      const candidate = buildSaveCandidate(first.override, ['pingbitime'], draft, ['pingbilouzhu', 'zhanxianlouzhu', 'pingbitime'])
+      assert.deepStrictEqual(candidate, { pingbilouzhu: '屏蔽楼主规则', pingbitime: '6' },
+        '候选必须是「覆盖文件已有字段 + 本次改动字段」，且不得把未改动的代码默认带出去')
       assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
         schema: 1, baseRevision: first.revision, filter: candidate
       })).status, 200)

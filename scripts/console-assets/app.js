@@ -9,7 +9,7 @@
 // 页面本体仍以 ?token= 打开（浏览器导航无法带头），fetch 层换头后 URL 零凭证。
 import { html, render, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from './htm-preact.module.js'
 // 纯函数单独成 ESM 模块（Node 测试可直接 import 做行为断言，不在测试里 eval 源码）。
-import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior, dateRangeLabel, encryptBackup, decryptBackup, isEncryptedBackup, backupPasswordProblem } from './pure.mjs'
+import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, logLineTone, splitHits, filterRunItems, tabFromHash, effectiveFilterRows, filterSourceNote, backToTopBehavior, dateRangeLabel, encryptBackup, decryptBackup, isEncryptedBackup, backupPasswordProblem, filterOverrideFields, buildSaveCandidate as buildSaveCandidateOf } from './pure.mjs'
 // 日期区间（v3.326）：flatpickr 4.6.13 的 ESM 单文件 bundle（含 zh 语言包，vendored 入库，
 // 与 htm-preact 同口径——不引 CDN，CSP script-src 'self' 覆盖）。样式在 flatpickr.css，
 // 主题化覆盖写在 app.css 的 .flatpickr-calendar 段（跟四套 token 走）。
@@ -4931,12 +4931,7 @@ function filterDraftFrom (data) {
 // GET 返回的 override：覆盖文件里实际存在的字段（服务端已按白名单裁剪）。
 // 保存是整份替换 ⇒ 本次没改但已落盘的字段必须原样带回，否则会被静默删掉退回代码默认。
 function filterOverrideFrom (data) {
-  const src = data && typeof data === 'object' ? data : {}
-  const out = {}
-  for (const name of FILTER_FIELD_NAMES) {
-    if (typeof src[name] === 'string') out[name] = src[name]
-  }
-  return out
+  return filterOverrideFields(data, FILTER_FIELD_NAMES)
 }
 
 // 服务器草稿响应 → 与本地草稿同形；坏的/缺字段的响应当没有，不能让他覆盖页面。
@@ -5235,14 +5230,10 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   // 覆盖文件会把代码默认永久钉死（后续版本改默认时这台实例收不到）。
   // 只提交 dirtyFields 也不行：保存是整份替换，覆盖文件里原有的其他字段会被静默删掉。
   // 所有保存入口（普通保存 / 离开拦截的「保存并继续」）都必须走这个函数。
-  const buildSaveCandidate = useCallback(() => {
-    const candidate = {}
-    for (const name of FILTER_FIELD_NAMES) {
-      if (typeof override[name] === 'string') candidate[name] = override[name]
-    }
-    for (const name of dirtyFields) candidate[name] = draft[name]
-    return candidate
-  }, [override, dirtyFields, draft])
+  const buildSaveCandidate = useCallback(
+    () => buildSaveCandidateOf(override, dirtyFields, draft, FILTER_FIELD_NAMES),
+    [override, dirtyFields, draft]
+  )
   dirtyRef.current = dirty
   // 下拉刷新不碰有未保存改动的草稿：一次下拉不能静默丢掉用户刚改的规则。
   usePullRefresh(active && dirtyFields.length === 0, load)
