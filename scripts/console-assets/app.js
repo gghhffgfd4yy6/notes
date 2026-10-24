@@ -1033,6 +1033,22 @@ function attachMonthHoldRepeat (inst) {
   bind(1)
 }
 
+// Esc 关闭日历（L2-5）：flatpickr 4.6 只在 _input 与 calendarContainer 上监听 keydown，
+// 从 .date-btn 打开时焦点留在按钮上，按键到不了实例 ⇒ 日历关不掉（实测 inst.isOpen 仍为
+// true）。打开期间在 document 捕获阶段补一层：命中后关闭并把焦点还给触发按钮；关闭时
+// （选完日期 / 点外面 / Esc）立刻解绑，不常驻全局监听。
+function bindEscClose (inst, restoreFocus) {
+  const onKey = (e) => {
+    if (e.key !== 'Escape' && e.key !== 'Esc') return
+    if (!inst.isOpen) return
+    e.preventDefault()
+    inst.close()
+    if (restoreFocus) restoreFocus()
+  }
+  document.addEventListener('keydown', onKey, true)
+  return () => document.removeEventListener('keydown', onKey, true)
+}
+
 function DateRange ({ value, onChange, label = '日期区间', disabled = false }) {
   const from = value && typeof value.from === 'string' ? value.from : ''
   const to = value && typeof value.to === 'string' ? value.to : ''
@@ -1045,6 +1061,9 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
   useEffect(() => {
     const el = anchorRef.current
     if (!el) return undefined
+    // Esc 监听只在「日历打开期间」挂着（见 bindEscClose），关闭/卸载都要解绑。
+    let offEsc = null
+    const dropEsc = () => { if (offEsc) { offEsc(); offEsc = null } }
     const inst = flatpickr(el, {
       mode: 'range',
       dateFormat: 'Y-m-d',
@@ -1060,7 +1079,12 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
       positionElement: btnRef.current || el,
       onReady (_sel, _str, inst) { attachMonthHoldRepeat(inst) },
       // 面板可能开着跨过上海零点：每次打开按当下上海日重设上限。
-      onOpen (_d, _s, inst) { inst.set('maxDate', todayKeyShanghai()) },
+      onOpen (_d, _s, inst) {
+        inst.set('maxDate', todayKeyShanghai())
+        dropEsc()
+        offEsc = bindEscClose(inst, () => { if (btnRef.current) btnRef.current.focus({ preventScroll: true }) })
+      },
+      onClose () { dropEsc() },
 
       onChange (dates) {
         if (!Array.isArray(dates) || dates.length !== 2) return
@@ -1072,7 +1096,7 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
       }
     })
     instRef.current = inst
-    return () => { inst.destroy(); instRef.current = null }
+    return () => { dropEsc(); inst.destroy(); instRef.current = null }
   }, [])
   // 受控值外部变化（清除 ×、切预设、跳转重置）时同步 flatpickr 的选中态：
   // 实例只在挂载时建一次，不同步的话日历仍高亮上一个区间（Sourcery #288 M7）。
@@ -3229,18 +3253,83 @@ function titleTailPrice (title) {
   return m ? Number(m[1]) : null
 }
 
+// 分类三段显示（L2-7）：服务端 catename 是「一级-二级-三级」整串（例：好单线报-娱乐-淘宝），
+// 整串一字排开看不出层级。按 '-' 拆成每段一个 span.msg-cate-part（段间分隔/间距由 CSS 负责，
+// 见 L5），可访问名保留原始整串，读屏不会只听到三段碎片。
+function cateParts (name) {
+  if (typeof name !== 'string' || name === '') return []
+  return name.split('-').filter((part) => part !== '')
+}
+
+// 筛选状态 ↔ URL（L2-8）：刷新、收藏、分享都要带着条件回来，所以 q/cate/page/size/days/from/to
+// 同步进 hash query（例：#/messages?q=耳机&page=3）。只写 hash、只认白名单值：非法/越界参数
+// 一律退回默认，不在 URL 里留脏值。默认值（page=1 / size=20 / days=0）不写，链接保持短。
+const MSG_SIZES = [10, 20, 50, 100]
+const MSG_DAYS = [0, 1, 3, 7, 30]
+
+function parseMessagesHash (hash) {
+  const out = { q: '', cate: '', page: 1, size: 20, days: 0, from: '', to: '' }
+  const raw = typeof hash === 'string' ? hash : ''
+  const at = raw.indexOf('?')
+  if (at < 0 || !/^#\/messages\b/.test(raw.slice(0, at))) return out
+  const params = new URLSearchParams(raw.slice(at + 1))
+  const q = params.get('q')
+  if (typeof q === 'string' && q.trim() !== '') out.q = q.trim()
+  const cate = params.get('cate')
+  if (typeof cate === 'string' && cate !== '') out.cate = cate
+  const page = Number(params.get('page'))
+  if (Number.isSafeInteger(page) && page >= 1) out.page = page
+  const size = Number(params.get('size'))
+  if (MSG_SIZES.includes(size)) out.size = size
+  const from = params.get('from')
+  const to = params.get('to')
+  if (DAY_KEY_RE.test(from) && DAY_KEY_RE.test(to) && from <= to) {
+    // 自定义区间优先于「近 N 天」：两者同时出现时以区间为准（与工具栏语义一致）。
+    out.from = from
+    out.to = to
+    out.days = 0
+  } else {
+    const days = Number(params.get('days'))
+    if (MSG_DAYS.includes(days)) out.days = days
+  }
+  return out
+}
+
+function sameMsgFilters (a, b) {
+  return a.q === b.q && a.cate === b.cate && a.page === b.page && a.size === b.size &&
+    a.days === b.days && a.from === b.from && a.to === b.to
+}
+
+function buildMessagesHash (state) {
+  const p = new URLSearchParams()
+  if (state.q) p.set('q', state.q)
+  if (state.cate) p.set('cate', state.cate)
+  if (Number.isSafeInteger(state.page) && state.page > 1) p.set('page', String(state.page))
+  if (MSG_SIZES.includes(state.size) && state.size !== 20) p.set('size', String(state.size))
+  if (state.from && state.to) {
+    p.set('from', state.from)
+    p.set('to', state.to)
+  } else if (MSG_DAYS.includes(state.days) && state.days !== 0) {
+    p.set('days', String(state.days))
+  }
+  const qs = p.toString()
+  return qs === '' ? '#/messages' : `#/messages?${qs}`
+}
+
 function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
-  const [page, setPage] = useState(1)
-  const [size, setSize] = useState(20)
+  // 首帧从 hash query 还原筛选（L2-8）：只解析一次，之后 state 是唯一真相。
+  const [boot] = useState(() => parseMessagesHash(window.location.hash))
+  const [page, setPage] = useState(boot.page)
+  const [size, setSize] = useState(boot.size)
   // v3.358：跳页输入（受控，'' = 没输入）。只在 Enter/失焦时生效，不随每次按键换页。
   const [jump, setJump] = useState('')
-  const [cate, setCate] = useState('')
-  const [days, setDays] = useState(0)
+  const [cate, setCate] = useState(boot.cate)
+  const [days, setDays] = useState(boot.days)
   // 自定义日期区间（v3.326）：两项都非空才生效，否则退回「近 N 天」。
-  const [range, setRange] = useState({ from: '', to: '' })
+  const [range, setRange] = useState({ from: boot.from, to: boot.to })
   const rangeActive = range.from !== '' && range.to !== ''
-  const [input, setInput] = useState('')
-  const [query, setQuery] = useState('')
+  const [input, setInput] = useState(boot.q)
+  const [query, setQuery] = useState(boot.q)
   const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
   // 响应归属（问题5）：请求发出时记下的 query 会在 in-flight 期间过期——旧响应的
   // queryUsed 会把刚打的新词清空（搜索吞字）。改为：loadSeqRef 给每次请求领号，
@@ -3297,7 +3386,36 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     return () => clearTimeout(t)
   }, [input])
   // 只有 query 真的变了才回第 1 页；只加/减空白时 query 不变，刷新不应把用户踢回首页。
-  useEffect(() => { setPage(1) }, [query])
+  // 首帧例外：page 可能是 URL 恢复来的（#/messages?page=3），不能在挂载时打回第 1 页。
+  const firstQueryRef = useRef(true)
+  useEffect(() => {
+    if (firstQueryRef.current) { firstQueryRef.current = false; return }
+    setPage(1)
+  }, [query])
+  // 筛选状态写回地址栏（L2-8）：只 replaceState，绝不 pushState——改一次筛选多一条
+  // 历史记录的体验（手机左滑要滑十几下才退出）不能接受。非本页签时不写，切走时
+  // 由 App 的 hash 路由接管。
+  const urlHash = buildMessagesHash({ q: query, cate, page, size, days, from: range.from, to: range.to })
+  // 只在「语义真的不一样」时改写：参数顺序不同、或显式写了默认值（?size=20）都不重写，
+  // 避免刷新一次就凭空多一条 replaceState。
+  const hashMatches = () => sameMsgFilters(parseMessagesHash(window.location.hash), parseMessagesHash(urlHash))
+  useEffect(() => {
+    if (!active) return
+    if (hashMatches()) return
+    window.history.replaceState(window.history.state, '', urlHash)
+  }, [active, urlHash])
+  // 点「推送记录」当前页签时 App 会把 hash 直接赋成裸 #/messages（switchTab），筛选
+  // 参数会掉；只要地址仍指向本页，就补回参数——同样 replaceState，不新增历史条目。
+  useEffect(() => {
+    if (!active) return undefined
+    const onHash = () => {
+      if (!/^#\/messages(\?|$)/.test(window.location.hash)) return
+      if (hashMatches()) return
+      window.history.replaceState(window.history.state, '', urlHash)
+    }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [active, urlHash])
   const fetchMessages = useCallback(
     () => {
       const requested = query
@@ -3475,7 +3593,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   return html`<div class="panel">
     <${PanelHead} title="推送记录" level=${1} sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
-      <input class="msg-search" type="search" placeholder="搜索标题 / 内容…" value=${input}
+      <input class="msg-search" type="search" aria-label="搜索标题或内容" placeholder="搜索标题 / 内容…" value=${input}
         onInput=${(e) => setInput(e.target.value)}
         onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); refreshNow() } }} />
       <${CategoryPicker} value=${cate} categories=${categories}
@@ -3528,7 +3646,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
                 : ''}
             </div>
             <div class="msg-meta">
-              <span class="msg-cate">${m.catename}</span>
+              <span class="msg-cate" aria-label=${m.catename || undefined}>${cateParts(m.catename).map((part, i) => html`<span class="msg-cate-part" key=${i}>${part}</span>`)}</span>
               <span class="mono">${m.datetime} ${m.shorttime}</span>
               ${msgLink(m, data.baseUrl)}
             </div>
@@ -6057,7 +6175,12 @@ function App () {
   // v3.310「过滤规则」新增为第六个页签。pure.mjs 的 tabFromHash 只认 v3.307 的五个键
   // （该模块本批不改），这里补一层本文件内的白名单，保持 hash 路由对新页签同样生效
   // （刷新/后退不丢当前页；非法值仍回概览）。
-  const resolveTab = (hash) => (/^#\/filter$/.test(typeof hash === 'string' ? hash : '') ? 'filter' : tabFromHash(hash))
+  // 推送记录页会把筛选条件写进 hash query（#/messages?q=…&page=3，见 buildMessagesHash）：
+  // 解析页签前先剥掉 query，否则带参数的地址会被判成非法值、刷新后掉回概览。
+  const resolveTab = (hash) => {
+    const raw = typeof hash === 'string' ? hash.split('?')[0] : ''
+    return /^#\/filter$/.test(raw) ? 'filter' : tabFromHash(raw)
+  }
   const [tab, setTab] = useState(() => resolveTab(window.location.hash))
   // 过滤页草稿守卫：脏状态、保存、放弃由面板写进这个 ref，App 只在切页/后退前问一句。
   // 不用 state 是因为每敲一个字都 dirty，App 不需要跟着重渲染。
