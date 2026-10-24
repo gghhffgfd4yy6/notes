@@ -3442,6 +3442,9 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       setQuery(data.queryUsed)
     }
   }, [data, input, query])
+  // v3.358：列表标题是真 <button>（原 span[role=button][tabindex=0]）。原生 button 自带
+  // Enter/空格 ⇒ 合成 click，再手写 onKeyDown 会双触发（keydown 展开 + click 收起 = 看起来没反应），
+  // 故删掉手写键盘处理；caret / aria-expanded / title 全部保留。
   return html`<div class="panel">
     <${PanelHead} title="推送记录" sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
@@ -3487,13 +3490,12 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
         : html`<div class="msg-list">
           ${items.map((m) => html`<div class="msg-item" key=${m.rowKey}>
             <div class="msg-item-head">
-              <span class="msg-title" role="button" tabindex="0"
+              <button type="button" class="msg-title"
                 aria-expanded=${expanded === m.rowKey ? 'true' : 'false'}
                 title=${expanded === m.rowKey ? '收起正文' : '点击展开正文'}
-                onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}
-                onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(expanded === m.rowKey ? null : m.rowKey) } }}>
+                onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}>
                 <span class="msg-caret" aria-hidden="true">${expanded === m.rowKey ? '▾' : '▸'}</span>${m.title ? hit(m.title) : '（无标题）'}
-              </span>
+              </button>
               ${m.price !== null ? html`<span class="msg-price">¥${m.price}</span>` : ''}
             </div>
             <div class="msg-meta">
