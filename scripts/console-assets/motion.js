@@ -10,18 +10,18 @@
 // 5) 列表位移自己做 FLIP（只补 transform），不引第三方列表动画库：那些库会顺带
 //    做宽高过渡，正好踩中第 1 条。
 /* global IntersectionObserver */
-import { useLayoutEffect, useRef } from './htm-preact.module.js'
+import { useCallback, useLayoutEffect, useRef, useState } from './htm-preact.module.js'
 import { animate } from './motion-lib.module.js'
-import { motionAllowed } from './pure.mjs'
+import { morphFrom, motionAllowed } from './pure.mjs'
 
 // 时长与曲线集中在这里。曲线是 easeOutQuint 的近似：起步快、收尾软，不弹、不生硬。
 export const MOTION = Object.freeze({
   press: 0.12,
-  fast: 0.18,
-  base: 0.26,
+  fast: 0.22,
+  base: 0.30,
   slow: 0.42,
-  rise: 10,
-  step: 0.028,
+  rise: 14,
+  step: 0.036,
   cap: 6
 })
 
@@ -196,4 +196,90 @@ export function useFlipList (ref, deps) {
     }
     flipRects.set(root, next)
   }, deps)
+}
+
+// 弹窗「从哪来回哪去」：进场把面板从触发元素的位置/尺寸放大到原尺寸，退场沿同一条
+// 路径缩回去，播完再让调用方卸载。只动 transform/opacity。
+// 触发元素：最近 800ms 内 pointerdown 过的那颗按钮优先——手指落在哪就从哪长出来；
+// 否则退回 activeElement（键盘回车打开时焦点在按钮上）。手机上点按钮不聚焦，
+// 只看 activeElement 会从上一次聚焦的输入框里长出来。
+const FALLBACK_FROM = { dx: 0, dy: 12, s: 0.9 }
+let lastTrigger = null
+let lastTriggerAt = 0
+if (typeof document !== 'undefined') {
+  document.addEventListener('pointerdown', (e) => {
+    const t = e.target
+    lastTrigger = t && typeof t.closest === 'function'
+      ? (t.closest('button, .btn, [role="button"], a, label, summary') || t)
+      : null
+    lastTriggerAt = Date.now()
+  }, true)
+}
+
+function rectOf (el) {
+  if (!el || typeof el.getBoundingClientRect !== 'function') return null
+  const r = el.getBoundingClientRect()
+  return r.width > 0 && r.height > 0 ? r : null
+}
+
+function triggerBox () {
+  if (lastTrigger && Date.now() - lastTriggerAt < 800) {
+    const recent = rectOf(lastTrigger)
+    if (recent) return recent
+  }
+  const active = typeof document === 'undefined' ? null : document.activeElement
+  return active && active !== document.body ? rectOf(active) : null
+}
+
+// 返回 [带动效关闭函数, 是否正在关]。close(() => 真正卸载/清状态)：动画播完才回调；
+// 关闭期间第二个参数为 true，调用方据此禁用其它按钮——否则退场那 220ms 里还能点到
+// 「确认/保存」，用户明明按了取消，动作却照跑。
+export function useMorphDialog (backRef, boxRef, open) {
+  const from = useRef(null)
+  const closing = useRef(false)
+  const [isClosing, setClosing] = useState(false)
+  useLayoutEffect(() => {
+    if (!open) { closing.current = false; setClosing(false); return }
+    const box = boxRef.current
+    if (!box) return
+    enter(backRef.current, { y: 0, duration: MOTION.fast })
+    const r = box.getBoundingClientRect()
+    const src = triggerBox()
+    // 兜底也记参数：退场同样缩回中心，不然取消时是「啪」地消失。
+    const f = src ? morphFrom(src, r) : FALLBACK_FROM
+    from.current = f || FALLBACK_FROM
+    if (!motionOK() || !f) return
+    play(box, {
+      transform: [`translate3d(${f.dx}px, ${f.dy}px, 0) scale(${f.s})`, 'translate3d(0px, 0px, 0px) scale(1)'],
+      opacity: [0.3, 1]
+    }, { duration: MOTION.base, ease: EASE })
+  }, [open])
+  const close = useCallback((done) => {
+    if (closing.current) return
+    const box = boxRef.current
+    const back = backRef.current
+    if (!box || !motionOK() || typeof animate !== 'function') { done(); return }
+    const f = from.current || FALLBACK_FROM
+    closing.current = true
+    setClosing(true)
+    let fired = false
+    const fire = () => {
+      if (fired) return
+      fired = true
+      done()
+      // 父级可能因 busy 守卫拒绝关闭：下一帧面板还在就解锁，否则用户再也关不掉。
+      window.requestAnimationFrame(() => {
+        if (box.isConnected) { closing.current = false; setClosing(false) }
+      })
+    }
+    // 不用 play()：它结束时清掉内联样式，退场最后一帧会被拉回原尺寸闪一下；
+    // 这里动画一结束就卸载，没必要清理。fill 保持 none。
+    animate(box, {
+      transform: ['translate3d(0px, 0px, 0px) scale(1)', `translate3d(${f.dx}px, ${f.dy}px, 0) scale(${f.s})`],
+      opacity: [1, 0]
+    }, { duration: MOTION.fast, ease: EASE }).then(fire, fire)
+    if (back) animate(back, { opacity: [1, 0] }, { duration: MOTION.fast, ease: 'ease-out' })
+    setTimeout(fire, MOTION.fast * 1000 + 160)
+  }, [])
+  return [close, isClosing]
 }

@@ -883,3 +883,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 时机纪律：所有入场只播一次（挂载 / 首次拿到数据 / 真正切页），5s 轮询重渲染不重播；动画结束后清掉内联 `opacity/transform`，避免盖住 CSS 的 hover/按压缩放。
 - `prefers-reduced-motion: reduce` 时适配层全部 no-op（页面直接到终态，不是快放），CSS 侧全局兜底保持不变。
 - 资产与门禁：`STATIC_ASSETS` 新增 3 个路由；`test_console.js` 的内容哈希清单同步；vendored bundle 进 `standard.ignore`；新增「动效层」结构红线（白名单 / 适配层隔离 / reduced-motion 门控 / 只动合成层属性 / 只播一次 / bundle 非空壳）。
+
+## v3.361 — 弹窗「从哪来回哪去」+ 动效幅度上调
+
+- 弹窗改成从触发点长出来：打开时按触发按钮的位置与宽度算位移与等比缩放，面板从按钮处放大到原位；取消 / 点遮罩 / Esc 时沿同一条路径缩回按钮再卸载（220ms，只动 transform/opacity）。触发元素优先取 `activeElement`，取不到时用最后一次 `pointerdown` 的按钮兜底——手机上点按钮不会聚焦，只看 activeElement 会退回中心缩放。
+- 退场统一走 `closeDialog()`：动画播完才回调卸载；回调仍读 `onCancelRef` 最新值（busy 守卫不被旧闭包绕过），结构红线同步改成新写法。
+- 幅度上调一档：切页 220ms、卡片位移 18px / 步进 48ms、弹窗兜底 `scale(.9)`、校验抖动 ±4px。上一版 6–12px 的位移在手机上几乎看不出来。
+- 控制台套件 245/0。

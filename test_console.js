@@ -1968,18 +1968,34 @@ async function backupUiStructureTests () {
     const end = src.indexOf('function LeaveGuardDialog', at)
     assert.ok(at > -1 && end > at, '应能定位 ConfirmDialog')
     const seg = src.slice(at, end)
-    assert.ok(seg.includes('const onCancelRef = useRef(onCancel)'), 'onCancel 必须走 ref')
-    assert.ok(seg.includes('onCancelRef.current = onCancel'), '每次渲染都要把 ref 更新到最新 onCancel')
+    // v3.361：两个弹窗共用 useDialogChrome（各抄一份会被 Sonar 判重复代码），
+    // ref 初始化/更新与 Escape 绑定都收在骨架里，仍要求回调读 ref 而不是旧闭包。
+    const hAt = src.indexOf('function useDialogChrome')
+    assert.ok(hAt > -1 && hAt < at, '应能定位 useDialogChrome')
+    const hook = src.slice(hAt, src.indexOf('\n}\n', hAt))
+    assert.ok(hook.includes('const onCancelRef = useRef(onCancel)'), 'onCancel 必须走 ref')
+    assert.ok(hook.includes('onCancelRef.current = onCancel'), '每次渲染都要把 ref 更新到最新 onCancel')
+    assert.ok(seg.includes('useDialogChrome(open, onCancel'), '两个弹窗都必须走公共骨架')
+    // v3.361：退场动画那 220ms 里确认/保存按钮必须禁用——否则按了取消、动作照跑。
+    assert.ok(seg.includes('const [closeDialog, dialogClosing] = useMorphDialog'), '必须拿到 closing 状态')
+    const attr = (js) => 'disabled=' + '$' + '{' + js + '}'
+    const leaveSeg = src.slice(end, src.indexOf('\n}\n', end))
+    assert.ok(seg.includes(attr('dialogClosing')), '确认弹窗的取消按钮在退场期间要禁用')
+    assert.ok(seg.includes(attr('busy || confirmDisabled || dialogClosing')), '确认按钮在退场期间要禁用')
+    assert.ok(leaveSeg.includes(attr('dialogClosing')), '离开弹窗的取消按钮在退场期间要禁用')
+    assert.ok(leaveSeg.includes(attr('busy || dialogClosing')), '离开弹窗的保存/丢弃按钮在退场期间要禁用')
 
     // 三个退出入口都必须调用 ref，而不是捕获的旧 onCancel；否则 busy 守卫可能被旧闭包绕过。
-    assert.match(seg, /Escape'\) onCancelRef\.current\(\)/, 'Escape 必须调用 ref')
-    assert.ok(seg.includes('if (e.target === e.currentTarget) onCancelRef.current()'), '点遮罩必须调用 ref')
-    assert.ok(seg.includes('onClick=' + '$' + '{() => onCancelRef.current()}'), '取消按钮必须调用 ref')
+    // v3.360：三个入口都先播退场再回调，但回调本身仍走 ref（避免旧闭包绕过 busy 守卫）。
+    assert.match(hook, /if \(e\.key === 'Escape'\) closeDialog\(\(\) => onCancelRef\.current\(\)\)/,
+      'Escape 必须判断 ===（反向/不等号写法不能过），并调用 ref')
+    assert.ok(seg.includes('if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current())'), '点遮罩必须调用 ref')
+    assert.ok(seg.includes('onClick=' + '$' + '{() => closeDialog(() => onCancelRef.current())}'), '取消按钮必须调用 ref')
 
     // 依赖数组必须属于“聚焦”的那个 effect，不能靠组件里别处的同名字符串蒙混。
-    const focusEffect = seg.match(/const t = setTimeout\(\(\) => \{[\s\S]*?\n\s*\}, \[([^\]]*)\]\)/)
-    assert.ok(focusEffect, '应能定位聚焦 effect')
-    assert.deepStrictEqual(focusEffect[1].split(',').map((s) => s.trim()).filter(Boolean), ['open', 'initialFocusRef'],
+    // 不用正则：嵌套量词会被 Sonar 判「回溯性能」。
+    assert.ok(hook.includes('setTimeout(() => {'), '应能定位聚焦的 setTimeout')
+    assert.ok(hook.includes('}, [open, initialFocusRef])'),
       '聚焦 effect 只能依赖 open/initialFocusRef；依赖 onCancel 会让 busy 变化重开键盘')
   })
 }
@@ -5251,7 +5267,8 @@ async function main () {
       '正式运行与通知自检必须走确认；试运行/环境检查直接执行')
     assert.ok(src.includes("cls: 'btn-danger-solid'"), '正式运行必须是红色危险按钮')
     assert.ok(src.includes('role="dialog"') && src.includes('aria-modal="true"'), '弹窗必须有无障碍语义')
-    assert.ok(src.includes('defaultFocus') === false && src.includes('cancelRef.current.focus()'),
+    // v3.361：焦点 effect 收进 useDialogChrome，取消按钮通过 fallbackRef 传进去。
+    assert.ok(src.includes('defaultFocus') === false && src.includes('fallbackRef.current') && src.includes('fallbackRef: cancelRef'),
       '默认焦点必须落在取消，不能落在确认')
     assert.ok(src.includes('function AlertBanner'), '首屏必须有失败横幅')
     assert.ok(src.includes("state.stats.status === 'ok'"), '状态卡必须消费 stats')
@@ -5812,6 +5829,24 @@ async function main () {
     assert.strictEqual(motionAllowed(false), true, '未开启时必须允许动效')
     assert.strictEqual(motionAllowed(undefined), true, '取不到 media query（老浏览器/测试环境）时按允许处理')
     assert.strictEqual(motionAllowed(null), true, 'matchMedia 缺失时不得把动效全关掉')
+  })
+
+  await aok('行为: morphFrom（弹窗从触发点长出来的几何：等比缩放 / 夹下限 / 量不到尺寸退回 null）', async () => {
+    const { morphFrom } = await import('./scripts/console-assets/pure.mjs')
+    // 62px 按钮 → 342px 面板：缩放 = 62/342，位移把面板中心对到按钮中心。
+    const f = morphFrom({ left: 10, top: 100, width: 62, height: 44 }, { left: 24, top: 300, width: 342, height: 200 })
+    assert.ok(Math.abs(f.s - 62 / 342) < 1e-9, '缩放必须是「按钮宽 / 面板宽」，等比')
+    assert.strictEqual(f.dx, Math.round(10 + 31 - (24 + 171)), '水平位移要把中心对齐')
+    assert.strictEqual(f.dy, Math.round(100 + 22 - (300 + 100)), '垂直位移要把中心对齐')
+    // 按钮比面板还宽：夹到 1，不能放大过头。
+    const big = morphFrom({ left: 0, top: 0, width: 900, height: 80 }, { left: 0, top: 0, width: 300, height: 200 })
+    assert.ok(big.s <= 1 && big.s > 0.99, '按钮比面板宽时夹到 1，不能放大过头')
+    // 极窄按钮：不低于 0.16，避免缩成一个点。
+    assert.ok(Math.abs(morphFrom({ left: 0, top: 0, width: 8, height: 8 }, { left: 0, top: 0, width: 342, height: 200 }).s - 0.16) < 1e-9)
+    assert.strictEqual(morphFrom(null, { left: 0, top: 0, width: 300, height: 200 }), null, '没有触发元素时返回 null')
+    assert.strictEqual(morphFrom({ left: 0, top: 0, width: 62, height: 44 }, { left: 0, top: 0, width: 0, height: 200 }), null, '面板隐藏/量不到尺寸时返回 null')
+    const js = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'motion.js'), 'utf8')
+    assert.ok(js.includes('morphFrom(src, r)'), 'motion.js 必须用 pure.mjs 的几何函数，别在 hook 里另写一份')
   })
 
   await aok('结构红线: 主题切换（4 套 token / 首帧服务端渲染 / cookie 记忆）', () => {
