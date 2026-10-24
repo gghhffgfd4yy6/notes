@@ -193,6 +193,9 @@ exclude_paths:
   # v3.326：flatpickr 4.6.13 的上游 ESM 单文件（vendored，不引 CDN）。内部
   # new RegExp / innerHTML / 动态属性访问都是库实现，页面不向它传用户数据。
   - "scripts/console-assets/flatpickr.module.js"
+  # v3.360：motion/mini 14.6.0 的 esbuild 单文件 bundle（vendored，无 CDN）。
+  # 压缩产物里的 1e3 字面量是库实现细节，同 .sourcery.yaml 的 ignore 口径。
+  - "scripts/console-assets/motion-lib.module.js"
   - "scripts/check-doc-lines.js"
   - "scripts/check-host-clean.js"
   - "test_doc_line_gates.js"
