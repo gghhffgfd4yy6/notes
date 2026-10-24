@@ -1228,6 +1228,17 @@
     .tabs { gap: 2px; }
     .tab-btn { padding: 7px 5px; font-size: var(--fs-sm); }
   }
+
+  /* ── ≤430px 分页重排（审计：390 下「末页 »」被挤到第二行独占一行）──
+     4 个翻页按钮固定按 4 列排（一行 4 格，不折行）；页码、跳页这类非按钮项排到
+     按钮上方同一行里（各占 2 格）—— 这样 L1 把「跳到第 N 页」插在 DOM 哪一段，
+     都不会挤进按钮行把第四个按钮顶下去。2×2 也不会掉行，但一行 4 列更矮：分页在
+     列表底部，多出来的那一行就是多一次滚动。 */
+  @media (max-width: 430px) {
+    .pager { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 6px; }
+    .pager > .btn { width: 100%; min-width: 0; padding: 0 4px; white-space: nowrap; }
+    .pager > :not(.btn) { grid-column: 1 / -1; order: -1; text-align: center; }
+  }
 }
 
 /* ── 自定义日期区间（v3.326）─────────────────────────────────────────────────
