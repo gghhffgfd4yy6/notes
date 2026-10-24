@@ -1125,6 +1125,29 @@
     }
     .sync:focus-visible { outline: var(--ring); outline-offset: 2px; border-radius: 4px; }
     .sync .sync-toggle:focus-visible { outline-offset: -2px; }
+
+    /* ── 顶栏按钮的触控尺寸 ──
+       审计实测「暂停」42×24、「主题」53×24：拇指点不准（WCAG 2.5.5 要 44×44）。
+       按钮盒直接抬到 44px 高，命中区就是盒子的真实尺寸；视觉胶囊仍按 24px 高画在
+       ::before 上，所以顶栏看起来还是原来那条细线。行高统一由 --sync-row-h 给，
+       吸顶带高度（--topbar-h）跟着它算，不用改别处。 */
+    :root { --sync-row-h: 44px; --wrap-pad-x: 10px; }
+    /* 不另写 .sync 的高度：.sync 是 flex 行，44px 的按钮自己就把这一行撑到 44px
+       （min-height:24px 只是下限，不会把行压回去）。 */
+    .sync-toggle {
+      position: relative;
+      display: inline-flex; align-items: center; justify-content: center;
+      min-height: var(--sync-row-h); padding: 0 10px; /* 0 10px ⇒「暂停」正好 44px 宽 */
+      border: 0; background: transparent; border-radius: var(--r-sm);
+      isolation: isolate; /* 让 ::before 的 z-index:-1 只退到按钮自身背景之后，不会掉到吸顶带底下 */
+    }
+    /* 视觉胶囊（24px 高）：边框与底色都画在这一层，hover 换色也换在这里。 */
+    .sync-toggle::before {
+      content: ''; position: absolute; z-index: -1; left: 0; right: 0; top: 50%;
+      height: 24px; margin-top: -12px;
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--r-pill);
+    }
+    .sync-toggle:hover::before { border-color: var(--accent-line); }
     /* 顶栏空间不够：收起「数据截至」；日期开着时连秒也收起，把位置留给日期、时分和「点看」。
        关掉日期时保留秒，和系统页「只显示 时:分:秒」一致。 */
     .sync-label { display: none; }
