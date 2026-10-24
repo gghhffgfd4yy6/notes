@@ -3219,9 +3219,21 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
 // <mark> 会把「展开」卡住几秒；日志页超过 3000 行直接关高亮是同一思路（渲染上限，不改搜索口径）。
 const MSG_HIT_MAX = 200
 
+// v3.358：标题末尾常自带价格（「… 32.3元」），右侧再画一个 .msg-price 就是同一条记录两个价。
+// 只认标题末尾的「数字 + 元」，且数值与 m.price 完全相等才隐藏；「32.3元起」「32.3元包邮」这类
+// 尾部不是纯价格的不算（不做模糊匹配，避免把两个不同的数吞掉一个）。不匹配一律照常显示。
+const TITLE_TAIL_PRICE_RE = /(\d+(?:\.\d+)?)\s*元\s*$/
+function titleTailPrice (title) {
+  if (typeof title !== 'string') return null
+  const m = TITLE_TAIL_PRICE_RE.exec(title)
+  return m ? Number(m[1]) : null
+}
+
 function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   const [page, setPage] = useState(1)
   const [size, setSize] = useState(20)
+  // v3.358：跳页输入（受控，'' = 没输入）。只在 Enter/失焦时生效，不随每次按键换页。
+  const [jump, setJump] = useState('')
   const [cate, setCate] = useState('')
   const [days, setDays] = useState(0)
   // 自定义日期区间（v3.326）：两项都非空才生效，否则退回「近 N 天」。
@@ -3339,6 +3351,17 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     armLand()
     setPage(n)
   }
+  // 跳页（v3.358）：只认数字，越界夹到 [1, pages]。换页仍走 goPage（统一的落点旗 + 同页守卫），
+  // 所以这里不直接 setPage；先清空输入，避免下一次失焦拿旧值再跳一遍。
+  const jumpTo = (raw) => {
+    const text = String(raw == null ? '' : raw).trim()
+    setJump('')
+    if (text === '') return
+    const n = Math.trunc(Number(text))
+    if (!Number.isFinite(n)) return
+    const pages = data && Number.isSafeInteger(data.pages) && data.pages > 0 ? data.pages : 1
+    goPage(Math.min(Math.max(n, 1), pages))
+  }
   // 搜索框回车 / 刷新前先把未落地的输入立刻生效，避免「刚打完字点刷新，还是旧结果」。
   // 只有搜索词变了才回第 1 页；没改词时刷新当前页，不应把用户踢回首页（审查 #246 可选）。
   // v3.334：按钮不再因为 loading 变灰——缓存命中时 loading 只有 15ms，
@@ -3446,6 +3469,9 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       setQuery(data.queryUsed)
     }
   }, [data, input, query])
+  // v3.358：列表标题是真 <button>（原 span[role=button][tabindex=0]）。原生 button 自带
+  // Enter/空格 ⇒ 合成 click，再手写 onKeyDown 会双触发（keydown 展开 + click 收起 = 看起来没反应），
+  // 故删掉手写键盘处理；caret / aria-expanded / title 全部保留。
   return html`<div class="panel">
     <${PanelHead} title="推送记录" level=${1} sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
@@ -3488,17 +3514,18 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       <div class="msg-count" aria-live="polite">匹配 ${data.total} 条${(query.length > 0 || cate.length > 0) && data.grandTotal !== data.total ? ` / 共 ${data.grandTotal} 条` : ''}${slowLoading ? html`<span class="msg-loading"> · 更新中…</span>` : ''}</div>
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
-        : html`<div class="msg-list">
-          ${items.map((m) => html`<div class="msg-item" key=${m.rowKey}>
+        : html`<div class="msg-list" role="list">
+          ${items.map((m) => html`<div class="msg-item" role="listitem" key=${m.rowKey}>
             <div class="msg-item-head">
-              <span class="msg-title" role="button" tabindex="0"
+              <button type="button" class="msg-title"
                 aria-expanded=${expanded === m.rowKey ? 'true' : 'false'}
                 title=${expanded === m.rowKey ? '收起正文' : '点击展开正文'}
-                onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}
-                onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(expanded === m.rowKey ? null : m.rowKey) } }}>
+                onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}>
                 <span class="msg-caret" aria-hidden="true">${expanded === m.rowKey ? '▾' : '▸'}</span>${m.title ? hit(m.title) : '（无标题）'}
-              </span>
-              ${m.price !== null ? html`<span class="msg-price">¥${m.price}</span>` : ''}
+              </button>
+              ${m.price !== null && titleTailPrice(m.title) !== m.price
+                ? html`<span class="msg-price">¥${m.price}</span>`
+                : ''}
             </div>
             <div class="msg-meta">
               <span class="msg-cate">${m.catename}</span>
@@ -3512,6 +3539,15 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
         <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(1)}>« 首页<//>
         <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(page - 1)}>上一页<//>
         <span class="pager-info">第 ${data.page} / ${data.pages} 页</span>
+        <span class="pager-jump">
+          <span class="pager-jump-label" aria-hidden="true">跳至</span>
+          <input class="pager-jump-input" type="number" inputmode="numeric" min="1" max=${data.pages}
+            value=${jump} aria-label="跳到第几页"
+            onInput=${(e) => setJump(e.target.value)}
+            onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); jumpTo(jump) } }}
+            onBlur=${() => jumpTo(jump)} />
+          <span class="pager-jump-label" aria-hidden="true">页</span>
+        </span>
         <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(page + 1)}>下一页<//>
         <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(data.pages)}>末页 »<//>
       </div>
