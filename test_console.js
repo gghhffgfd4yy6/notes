@@ -1858,6 +1858,27 @@ async function backupUiStructureTests () {
     assert.ok(/apiPostBackupImport\(pending\.bundle, pending\.key\)/.test(seg), '导入请求只能带解密后的 bundle 和幂等键')
     assert.ok(!/apiPostBackupImport\([^)]*password/i.test(seg), '导入请求不得带密码')
   })
+
+  await aok('结构红线: 弹窗 busy 变化不得把焦点抢回密码框', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const at = src.indexOf('function ConfirmDialog')
+    const end = src.indexOf('function LeaveGuardDialog', at)
+    assert.ok(at > -1 && end > at, '应能定位 ConfirmDialog')
+    const seg = src.slice(at, end)
+    assert.ok(seg.includes('const onCancelRef = useRef(onCancel)'), 'onCancel 必须走 ref')
+    assert.ok(seg.includes('onCancelRef.current = onCancel'), '每次渲染都要把 ref 更新到最新 onCancel')
+
+    // 三个退出入口都必须调用 ref，而不是捕获的旧 onCancel；否则 busy 守卫可能被旧闭包绕过。
+    assert.match(seg, /Escape'\) onCancelRef\.current\(\)/, 'Escape 必须调用 ref')
+    assert.ok(seg.includes('if (e.target === e.currentTarget) onCancelRef.current()'), '点遮罩必须调用 ref')
+    assert.ok(seg.includes('onClick=' + '$' + '{() => onCancelRef.current()}'), '取消按钮必须调用 ref')
+
+    // 依赖数组必须属于“聚焦”的那个 effect，不能靠组件里别处的同名字符串蒙混。
+    const focusEffect = seg.match(/const t = setTimeout\(\(\) => \{[\s\S]*?\n\s*\}, \[([^\]]*)\]\)/)
+    assert.ok(focusEffect, '应能定位聚焦 effect')
+    assert.deepStrictEqual(focusEffect[1].split(',').map((s) => s.trim()).filter(Boolean), ['open', 'initialFocusRef'],
+      '聚焦 effect 只能依赖 open/initialFocusRef；依赖 onCancel 会让 busy 变化重开键盘')
+  })
 }
 
 async function main () {
