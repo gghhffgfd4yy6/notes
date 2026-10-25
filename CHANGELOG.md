@@ -896,3 +896,4 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - console 9 段单次等待上限 300s → 60s：矩阵加 `timeout_ms` 字段、由 `--timeoutMS` CLI 覆盖配置文件（不改配置指纹、不需要一次性全量重跑），其余 20 段仍 300s。
 - 日报新增 `真挂死` / `上限触发` / `超时上限` 三列：段 job 的 fail-closed 守卫在剥离 statusReason 之前落盘 `timeout-stats.json`，把 Timeout 分成「无 reason 的真挂死」与「tap-runner 的 `Hit limit reached` 上限触发」；缺失或与报告对不上显示 `—`，不得读作 0。分数口径不变（Timeout 仍计入 detected）。
 - 测试：`test_mutation_report.js` 94/94、`test_mutation_json.js` 24 项、`test_mutation_report_cli.js`、`test_mutation_ranges.js` 通过；`test_ci_skip_suites.js` 新增矩阵/run 行门禁（该套件本机的既有环境性失败与本次改动无关）；控制台套件 241/0。
+- 触发面收窄：`mutation.yml` 的 `push` 限定 `branches: [main]`，并明确不接 `pull_request`——PR 分支照常跑 test.yml 的完整门禁（单元/控制台套件 + 静态校验），但不再有机会把 28 段变异挂到评审分支上；`workflow_dispatch` 保留，用于改动 workflow 本身时的合并前预验证。README 与 SYSTEM_CONTRACT 同步写明触发面。

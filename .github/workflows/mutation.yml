@@ -16,10 +16,13 @@ name: Mutation
 # 免费 runner 单任务上限 6h——全 19 段 TAP 基线（spike/tap-baseline，run 35607440845）墙钟 ≈71min（瓶颈=utils：**段内 step** 70.25min（仓内报告 4215s；GH API 同口径 70.28min）、**job** 70.57min；⚠️ 该 run 整体为 failure——唯一失败 job `storage` 按设计触发 fail-closed 守卫、**非 timeout**，勿读成「19 段 TAP 全绿」）；16 TAP + 3 command 矩阵实测墙钟 86.0min（run 35646992130，head ca63e71，瓶颈=command 档 qinglong-push 85.3min）；v3-entry 回退后的 15 TAP + 4 command 矩阵实测墙钟 **90.8min**（run 35827096127，head 01c0ef89，即本次变更的合并后首跑；瓶颈=command 档 qinglong-push **90.1min**），余量充足。矩阵现为 28 段（24 TAP + 4 command；`scripts/console.js` 拆 9 段），下列 19 段墙钟为拆分前实测，只作量级参考。
 #   （旧 command 档在 --concurrency 8 下 app/utils/message-store 真全量仍需 ~7h/~6.5h/~4.5h，必撞 step 330min；
 #    这正是 CI 切 TAP 的原因，数据见 .local/tap-baseline-REPORT.md。）
-# 触发方式：workflow 文件变更 push、手动（Actions → Mutation → Run workflow）和每日自动。
+# 触发方式：**仅 main 分支**上 workflow 文件变更 push、手动（Actions → Mutation → Run workflow）和每日自动。
+# 明确不接 pull_request：PR 分支照常跑 test.yml 的**完整门禁**（单元/控制台套件 + 静态校验，数分钟），
+# 但变异本体只随 main 与定时任务跑——PR 上多跑一轮 28 段既拖慢评审也白烧 runner。
 # 主任务避开 UTC 整点：北京时间 00:17 = UTC 16:17；北京时间 12:17 仅在当天无成功或进行中主任务时补跑。
 on:
   push:
+    branches: [main]
     paths:
       - '.github/workflows/mutation.yml'
   workflow_dispatch:
