@@ -2939,6 +2939,151 @@ async function main () {
     assert.strictEqual(volatile.headers.etag, undefined, '/api/status 不得下发 ETag（响应本身是易变的）')
     server.close()
   })
+  await aok('gzipJsonBody: 512B 阈值 / >256KB 用 level 1 / 未协商时不压', () => {
+    const { GZIP_MIN_BYTES, GZIP_LARGE_BYTES, gzipJsonBody, gzipVariantTag, conditionalVariant } = require('./scripts/console.js')
+    assert.strictEqual(GZIP_MIN_BYTES, 512, '阈值必须恰为 512B（用例与实现同源对账）')
+    assert.strictEqual(GZIP_LARGE_BYTES, 256 * 1024, '大响应分界必须恰为 256KB')
+    assert.strictEqual(gzipJsonBody({ xbkGzip: true }, 'x'.repeat(GZIP_MIN_BYTES - 1)), null,
+      '低于阈值必须不压（压了更大）')
+    assert.ok(Buffer.isBuffer(gzipJsonBody({ xbkGzip: true }, 'x'.repeat(GZIP_MIN_BYTES))),
+      '恰好达到阈值必须压（>= 512）')
+    assert.strictEqual(gzipJsonBody({ xbkGzip: false }, 'x'.repeat(1000)), null, '未协商 gzip 必须不压')
+    assert.strictEqual(gzipJsonBody({}, 'x'.repeat(1000)), null, '没有协商标记（非 HTTP 调用点）必须不压')
+    assert.strictEqual(gzipJsonBody(null, 'x'.repeat(1000)), null, 'res 缺失时不得抛')
+    // level 选择：小响应 6，大响应 1——按 zlib 输出逐字节对账（不只是「有压缩」）。
+    const small = 'y'.repeat(1000)
+    assert.deepStrictEqual(gzipJsonBody({ xbkGzip: true }, small), zlib.gzipSync(Buffer.from(small, 'utf8'), { level: 6 }),
+      '≤256KB 必须用 level 6')
+    const big = 'z'.repeat(GZIP_LARGE_BYTES + 1)
+    assert.deepStrictEqual(gzipJsonBody({ xbkGzip: true }, big), zlib.gzipSync(Buffer.from(big, 'utf8'), { level: 1 }),
+      '>256KB 必须降级到 level 1（省 CPU）')
+    // Buffer 入参按字节长度判定（不是字符串长度）：多字节字符必须算对。
+    const cjk = '中'.repeat(200) // 600 字节，200 个字符
+    assert.ok(Buffer.isBuffer(gzipJsonBody({ xbkGzip: true }, cjk)), 'Buffer.byteLength 口径：200 个汉字 = 600B 必须压')
+    assert.strictEqual(gzipJsonBody({ xbkGzip: true }, '中'.repeat(170)), null, '170 个汉字 = 510B 必须不压')
+    // gzip 变体 tag 的拼法（静态资产同约定）；identity tag 末尾没有引号时也必须有确定行为。
+    assert.strictEqual(gzipVariantTag('"abc"'), '"abc-gz"')
+    assert.strictEqual(gzipVariantTag('abc'), 'abc-gz')
+    // 条件 tag 的变体因子：去掉 ?token=（凭证不参与 ETag），其余查询串保留且排序。
+    assert.strictEqual(conditionalVariant({ url: '/api/config' }), '/api/config')
+    assert.strictEqual(conditionalVariant({ url: '/api/trends?token=abc&days=30' }), '/api/trends?days=30')
+    assert.strictEqual(conditionalVariant({ url: '/api/run-history?limit=10&b=2&a=1' }), '/api/run-history?a=1&b=2&limit=10')
+    assert.notStrictEqual(conditionalVariant({ url: '/api/run-history?limit=10' }), conditionalVariant({ url: '/api/run-history?limit=200' }),
+      '不同查询串必须是不同变体（否则 10 条的 304 会冒充 200 条）')
+  })
+  await aok('HTTP: API JSON 协商式 gzip（变体 ETag / 阈值反例 / HTML-SSE-导出不压）', async () => {
+    const dir = tmpDir()
+    const { gzipVariantTag, GZIP_MIN_BYTES } = require('./scripts/console.js')
+    // >512B 的推送记录夹具：/api/messages 是条件请求端点，正好同时验证「压缩 + 变体 tag」。
+    const msgs = []
+    for (let i = 1; i <= 12; i++) {
+      msgs.push({
+        id: i,
+        title: `特价标题${i}`,
+        content: `第${i}条内容`.repeat(30),
+        catename: '好单-日用',
+        shijianchuo: i * 1000,
+        datetime: '2026-10-15',
+        shorttime: '10:00',
+        price: i,
+        url: `/a/${i}.html`
+      })
+    }
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(msgs))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const gz = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'gzip' } })
+      const id = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'identity' } })
+      assert.strictEqual(gz.status, 200)
+      assert.ok(id.body.length > 512, `夹具必须越过 gzip 阈值（实际 ${id.body.length}B，否则断言恒真）`)
+      assert.strictEqual(gz.headers['content-encoding'], 'gzip', '声明 gzip 时必须压缩')
+      assert.match(String(gz.headers.vary || ''), /Accept-Encoding/, '压缩响应必须带 Vary: Accept-Encoding')
+      assert.strictEqual(id.headers['content-encoding'], undefined, '不声明 gzip 时必须回 identity')
+      assert.strictEqual(id.headers.vary, undefined, 'identity 响应不压 → 不新增 Vary（不压保持不变）')
+      assert.deepStrictEqual(zlib.gunzipSync(gz.body), id.body, 'gzip 解压后必须与 identity 逐字相等')
+      assert.ok(gz.body.length < id.body.length, '压缩体必须更小')
+      // 变体 tag：identity tag 由未压缩 body 算，gzip 只是加 -gz 后缀（静态资产同约定）。
+      assert.match(String(id.headers.etag), /^"[^"]+"$/, 'ETag 必须是强 tag（引号形态）')
+      assert.strictEqual(gz.headers.etag, gzipVariantTag(id.headers.etag), 'gzip tag 必须是 identity tag 的 -gz 变体')
+      assert.notStrictEqual(gz.headers.etag, id.headers.etag, 'gzip 变体 tag 不得等于 identity tag')
+      // 带 gzip tag → 304：空体、不带 Content-Encoding、Vary 仍在（同一 URL 两个表示）。
+      const hit = await requestBuffer(port, 'GET', '/api/messages', {
+        token: TOKEN,
+        headers: { 'accept-encoding': 'gzip', 'if-none-match': gz.headers.etag }
+      })
+      assert.strictEqual(hit.status, 304, 'gzip 变体 tag 命中必须 304')
+      assert.strictEqual(hit.body.length, 0, '304 不得带 body')
+      assert.strictEqual(hit.headers['content-encoding'], undefined, '304 不得带 Content-Encoding（没有可解码的 body）')
+      assert.match(String(hit.headers.vary || ''), /Accept-Encoding/, '304 仍须 Vary（表示随 Accept-Encoding 变）')
+      assert.strictEqual(hit.headers.etag, gz.headers.etag, '304 必须回显所选变体的 tag')
+      // 交叉：identity tag 不得命中 gzip 变体（否则客户端把压缩字节当 JSON 解析）。
+      const cross = await requestBuffer(port, 'GET', '/api/messages', {
+        token: TOKEN,
+        headers: { 'accept-encoding': 'gzip', 'if-none-match': id.headers.etag }
+      })
+      assert.strictEqual(cross.status, 200, 'identity tag 不得命中 gzip 变体')
+      // 阈值反例：/api/auto 的 JSON 只有几十字节，声明 gzip 也不得压。
+      const small = await requestBuffer(port, 'GET', '/api/auto', { token: TOKEN, headers: { 'accept-encoding': 'gzip' } })
+      assert.ok(small.body.length < GZIP_MIN_BYTES, `反例必须真的低于阈值（实际 ${small.body.length}B）`)
+      assert.strictEqual(small.headers['content-encoding'], undefined, '低于 512B 的响应不得压缩')
+      assert.ok(Object.prototype.hasOwnProperty.call(JSON.parse(small.body.toString('utf8')), 'auto'), '小响应仍是完整 JSON')
+      // HTML 反向断言：含 boot token 且只有 ~1.9KB，压了只多一次解压。
+      const page = await requestBuffer(port, 'GET', '/', { token: TOKEN, headers: { 'accept-encoding': 'gzip' } })
+      assert.strictEqual(page.status, 200)
+      assert.strictEqual(page.headers['content-encoding'], undefined, 'HTML 不得压缩（含 boot token）')
+      assert.ok(page.body.toString('utf8').includes('xbk-boot'), 'HTML 仍是可读原文')
+      // 导出附件：浏览器直接落盘，压了会破坏「另存为」的体积口径。
+      const expHeaders = { 'content-type': 'application/x-www-form-urlencoded', 'accept-encoding': 'gzip' }
+      const expJson = await requestBuffer(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json', headers: expHeaders })
+      assert.strictEqual(expJson.status, 200)
+      assert.ok(expJson.body.length > 512, '导出夹具必须越过 gzip 阈值（否则断言恒真）')
+      assert.strictEqual(expJson.headers['content-encoding'], undefined, 'JSON 导出附件不得压缩')
+      assert.match(String(expJson.headers['content-type'] || ''), /application\/json/)
+      const expCsv = await requestBuffer(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=csv', headers: expHeaders })
+      assert.strictEqual(expCsv.status, 200)
+      assert.strictEqual(expCsv.headers['content-encoding'], undefined, 'CSV 导出附件不得压缩')
+      assert.strictEqual(expCsv.body.slice(0, 3).toString('hex'), 'efbbbf', 'CSV 仍是带 BOM 的原文')
+      // 备份导出是另一个直接 writeHead 的 attachment 出口（3614 一带），同样不压。
+      const backup = await requestBuffer(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['messages'] }),
+        headers: { 'content-type': 'application/json', 'accept-encoding': 'gzip' }
+      })
+      assert.strictEqual(backup.status, 200)
+      assert.ok(backup.body.length > 512, '备份夹具必须越过 gzip 阈值')
+      assert.strictEqual(backup.headers['content-encoding'], undefined, '备份导出附件不得压缩')
+      assert.strictEqual(JSON.parse(backup.body.toString('utf8')).kind, 'xbk-console-backup')
+      // 默认（不带 Accept-Encoding）仍走 identity：Node 客户端与 curl 不受影响。
+      const plain = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN })
+      assert.strictEqual(plain.headers['content-encoding'], undefined, '不带 Accept-Encoding 必须回 identity')
+    } finally { server.close() }
+  })
+  await aok('HTTP: SSE 响应头不带 Content-Encoding（流式增量不压缩）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    runs.set('1750000000000.9', makeStreamRecord('1750000000000.9'))
+    try {
+      const sseHeaders = await new Promise((resolve, reject) => {
+        const req = http.request({
+          host: '127.0.0.1',
+          port,
+          path: '/api/runs/stream?id=1750000000000.9&since=0',
+          headers: { authorization: `Bearer ${TOKEN}`, 'accept-encoding': 'gzip' }
+        }, (res) => {
+          const snapshot = { ...res.headers }
+          res.destroy() // 只取响应头：这是长连接，读完头就断，由服务端 teardown 收尾
+          resolve(snapshot)
+        })
+        req.on('error', reject)
+        req.end()
+      })
+      assert.match(String(sseHeaders['content-type'] || ''), /text\/event-stream/, 'SSE Content-Type 不变')
+      assert.strictEqual(sseHeaders['content-encoding'], undefined, 'SSE 不得压缩（流式帧压缩要攒帧）')
+      assert.strictEqual(sseHeaders.vary, undefined, 'SSE 不压 → 不新增 Vary')
+    } finally { server.close() }
+  })
   await aok('HTTP: POST /trigger 非法 action → 400', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)

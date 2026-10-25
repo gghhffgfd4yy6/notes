@@ -1408,8 +1408,60 @@ function authorize (req, token, urlQuery) {
   return false
 }
 
+// ── API JSON 协商式 gzip（v3.373）───────────────────────────────────────────
+// 只压 JSON 响应体。三类明确不压：
+//   · HTML（首屏/登录页）：含 boot token 且只有 ~1.9KB，压了反而多一次解压；
+//   · SSE（/api/runs/stream）：流式增量帧，压缩要攒帧，等于把实时性换流量；
+//   · 导出附件（备份 / 推送记录 JSON/CSV）：浏览器直接落盘，压了会打乱「另存为」的体积
+//     口径与 Content-Length 语义，也让中间产物不再可 grep。
+// 阈值 512B：更小的 JSON（如 {"runs":[]}）gzip 后常常更大，白付 CPU 还多一个头。
+const GZIP_MIN_BYTES = 512
+// >256KB 的响应（推送记录整页）换 level 1：压缩率损失远小于省下的 CPU 时间。
+const GZIP_LARGE_BYTES = 256 * 1024
+
+// 压缩决策的唯一入口：res.xbkGzip 由 createServer 回调入口按 Accept-Encoding 置位
+// （每个请求算一次，不在每个端点里重复解析头）。返回 null 表示「按原样发」。
+function gzipJsonBody (res, body) {
+  if (!res || res.xbkGzip !== true) return null
+  const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8')
+  if (buf.length < GZIP_MIN_BYTES) return null
+  return zlib.gzipSync(buf, { level: buf.length > GZIP_LARGE_BYTES ? 1 : 6 })
+}
+
+// gzip 变体的 tag：`"<hash>"` → `"<hash>-gz"`（与静态资产 buildAssetStore 的 gzipEtag 同约定）。
+// identity tag 始终由**未压缩**的 body 算——压缩字节随 zlib 版本/level 变化，用它算 tag 会让
+// 客户端手里的旧 tag 在升级后永远失配（每个请求都 200 全量）。
+function gzipVariantTag (identityTag) {
+  const s = String(identityTag || '')
+  return s.endsWith('"') ? `${s.slice(0, -1)}-gz"` : `${s}-gz`
+}
+
+// 条件 tag 的变体因子：请求路径 + 查询串（去掉 ?token=，其余按字典序）。
+// 为什么必须进 tag：/api/run-history?limit=10 与 ?limit=200 在数据不足时 body 可能逐字相同，
+// 共用 tag 会让「10 条的 304」冒充「200 条的响应」。token 不进哈希——它是浏览器兼容路径的
+// 凭证，同一份内容按不同凭证访问不该拿到不同 tag（否则条件缓存全失效）。
+function conditionalVariant (req) {
+  const raw = String((req && req.url) || '')
+  const qAt = raw.indexOf('?')
+  if (qAt < 0) return raw
+  const params = raw.slice(qAt + 1).split('&')
+    .filter((part) => part !== '' && part !== 'token' && !part.startsWith('token='))
+  params.sort()
+  return raw.slice(0, qAt) + '?' + params.join('&')
+}
+
 function sendJson (res, code, obj) {
   const body = JSON.stringify(obj)
+  const gz = gzipJsonBody(res, body)
+  if (gz) {
+    res.writeHead(code, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Encoding': 'gzip',
+      Vary: 'Accept-Encoding'
+    })
+    res.end(gz)
+    return
+  }
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
   res.end(body)
 }
@@ -1423,15 +1475,25 @@ function sendJson (res, code, obj) {
 // 给它发 ETag 只会永远不命中（且 304 会把「现在几点」冻住）——按语义就不该缓存。
 function sendJsonConditional (req, res, obj) {
   const body = JSON.stringify(obj)
-  const tag = etag(body)
+  // tag 由**未压缩** body + 请求变体算：Accept-Encoding 只决定「同一份内容取哪个 tag 变体」，
+  // 不参与 identity 哈希（否则 zlib 升级会让所有客户端缓存一次性失配）。
+  const identityTag = etag(conditionalVariant(req) + '\n' + body)
+  const gz = gzipJsonBody(res, body)
+  const tag = gz ? gzipVariantTag(identityTag) : identityTag
   const headers = { ETag: tag, 'Cache-Control': 'no-store' }
+  // 同一 URL 有两个表示（identity / gzip）：哪一份回 304 都必须带 Vary，否则中间缓存会把
+  // 「压缩体的 304」套到不接受 gzip 的客户端上。identity 无第二个表示，不加（不压保持不变）。
+  if (gz) headers.Vary = 'Accept-Encoding'
   if (etagMatches(req.headers['if-none-match'], tag)) {
+    // 304 只回 tag/缓存指令/Vary：不带 Content-Encoding（没有 body 可解码），也不带 body。
     res.writeHead(304, headers)
     res.end()
     return
   }
-  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...headers })
-  res.end(body)
+  const out = { 'Content-Type': 'application/json; charset=utf-8', ...headers }
+  if (gz) out['Content-Encoding'] = 'gzip'
+  res.writeHead(200, out)
+  res.end(gz || body)
 }
 
 // 页面类响应（登录/挑战页与 SPA 壳）的统一安全头：Referrer-Policy 只在这里写一次。
@@ -4787,6 +4849,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   }
 
   const server = http.createServer((req, res) => {
+    // 协商式 gzip 的每请求决策（v3.373）：只有 JSON 出口（sendJson / sendJsonConditional）
+    // 读这个标记——HTML、SSE、导出附件各自直接 writeHead，按语义不压缩（见 gzipJsonBody 注释）。
+    res.xbkGzip = acceptsGzip(req.headers['accept-encoding'])
     // ── v3.300 访问日志装配：单点 res.on('finish')，覆盖 sendJson/静态/页面全部响应出口
     // （全文件原本无任何 res.on 监听）。挂回调第一行 ⇒ 畸形 request-target 的 400
     // （下方 sendJson(…,400) 也在覆盖内；malformed 是最值得记录的可疑流量，D3 定夺）。
@@ -6128,6 +6193,12 @@ module.exports = {
   shouldLogAccess,
   acceptsGzip,
   ACCESS_LOG_MAX,
+  // v3.373 协商式 gzip：阈值与决策函数导出（阈值反例与 level 选择必须可被非 HTTP 单测执行）
+  GZIP_MIN_BYTES,
+  GZIP_LARGE_BYTES,
+  gzipJsonBody,
+  gzipVariantTag,
+  conditionalVariant,
   // D2-S13：最终保险丝（必须可被单测执行，否则又是一段不可达的死代码）
   findSecretLikeField,
   // D2-S12：cache-health 条数阈值（用例按同一常量构造夹具）
