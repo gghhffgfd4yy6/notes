@@ -2303,15 +2303,14 @@ async function main () {
     // token 绝不进资产响应（资产不含用户数据的安全边界）。
     assert.ok(!js.text.includes(TOKEN), 'app.js 内容不含 token')
     assert.ok(!lib.text.includes(TOKEN), 'vendor 内容不含 token')
-    // v3.364 加载失败兜底：普通脚本（非 module）、排在入口之前、能被独立伺服。
-    const guard = await request(port, 'GET', '/assets/boot-guard.js', { token: TOKEN })
-    assert.strictEqual(guard.status, 200, 'boot-guard 必须在白名单里（否则兜底本身 404）')
-    assert.match(guard.headers['content-type'], /text\/javascript/)
-    assert.ok(guard.text.includes('__XBK_BOOTED') && guard.text.includes('5000'), 'boot-guard 必须等 booted 信号并有超时兜底')
-    assert.ok(!/^\s*import\s/m.test(guard.text), 'boot-guard 不得 import 任何东西（否则它自己也会挂）')
-    assert.ok(page.text.indexOf('/assets/boot-guard.js') > 0 &&
-      page.text.indexOf('/assets/boot-guard.js') < page.text.indexOf('/assets/app.js?v='),
-    'boot-guard 必须排在入口 module 之前（模块图崩了才有人兜）')
+    // v3.364 加载失败兜底：内容由服务端直接渲染在 #app 里（不依赖任何资产），
+    // 正常加载时 CSS 让它 5s 内一直透明，挂载成功后由 app.js 删除。
+    assert.ok(page.text.includes('class="boot-fallback"'), '首屏必须内联服务端兜底（资产全挂也看得见）')
+    assert.ok(page.text.includes('页面没加载出来'), '兜底必须有可读文案')
+    const cssText = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.boot-fallback[^}]*animation:\s*boot-reveal 0s linear 5s forwards/.test(cssText),
+      '兜底必须延迟 5 秒显形（正常加载看不到）')
+    assert.ok(readConsoleSource().includes("querySelector('#app .boot-fallback')"), '挂载成功后必须移除兜底')
     const nope = await request(port, 'GET', '/assets/nope.js', { token: TOKEN })
     assert.strictEqual(nope.status, 404, '白名单外 404')
     const traversal = await request(port, 'GET', '/assets/..%2F..%2Fconsole.js', { token: TOKEN })
@@ -2319,26 +2318,43 @@ async function main () {
     server.close()
   })
   await aok('资产: 每个模块 import 的文件都在白名单里（漏登记 = 整页白屏且测试全绿）', () => {
+    const acorn = require('acorn')
     const { STATIC_ASSETS } = require('./scripts/console.js')
     const dir = path.join(__dirname, 'scripts', 'console-assets')
     const routes = new Set(Object.keys(STATIC_ASSETS))
     const missing = []
     const dynamic = []
+    const bare = []
+    const walk = (node, fn) => {
+      if (!node || typeof node !== 'object') return
+      if (typeof node.type === 'string') fn(node)
+      for (const key of Object.keys(node)) {
+        if (key === 'type' || key === 'start' || key === 'end') continue
+        const value = node[key]
+        if (Array.isArray(value)) value.forEach((child) => walk(child, fn))
+        else if (value && typeof value === 'object') walk(value, fn)
+      }
+    }
     for (const file of fs.readdirSync(dir)) {
       if (!/\.(js|mjs)$/.test(file)) continue
-      if (file === 'boot-guard.js') continue // 兜底脚本按设计零 import（它要在模块图崩后照跑）
-      const text = fs.readFileSync(path.join(dir, file), 'utf8')
-      const re = /(?:from|import)\s*['"](\.[^'"]+)['"]/g
-      let m
-      while ((m = re.exec(text)) !== null) {
-        const route = '/assets/' + m[1].replace(/^\.\//, '')
-        if (!routes.has(route)) missing.push(`${file} → ${m[1]}`)
+      const ast = acorn.parse(fs.readFileSync(path.join(dir, file), 'utf8'),
+        { ecmaVersion: 'latest', sourceType: 'module' })
+      const specs = []
+      walk(ast, (node) => {
+        if (node.type === 'ImportExpression') dynamic.push(file)
+        const hasSource = node.type === 'ImportDeclaration' || node.type === 'ExportAllDeclaration' ||
+          (node.type === 'ExportNamedDeclaration' && node.source)
+        if (hasSource && node.source) specs.push(node.source.value)
+      })
+      for (const spec of specs) {
+        if (!spec.startsWith('.')) { bare.push(`${file} → ${spec}`); continue }
+        const route = '/assets/' + spec.replace(/^\.\//, '')
+        if (!routes.has(route)) missing.push(`${file} → ${spec}`)
       }
-      // 自家模块禁止动态 import：会多一次瀑布、首帧闪、且失败点更晚更难兜。
-      if (/(^|[^.\w])import\s*\(/.test(text)) dynamic.push(file)
     }
+    assert.deepStrictEqual(bare, [], '模块只能 import 同目录相对路径（裸说明符没有 importmap，必然 404）')
     assert.deepStrictEqual(missing, [], 'import 的文件必须已登记 STATIC_ASSETS（否则 404 → 模块图崩 → 白屏）')
-    assert.deepStrictEqual(dynamic, [], '自家模块不得用动态 import')
+    assert.deepStrictEqual(dynamic, [], '自家模块不得用动态 import()')
     for (const spec of Object.values(STATIC_ASSETS)) {
       assert.ok(fs.existsSync(path.join(dir, spec.file)), `白名单文件缺失：${spec.file}`)
     }
@@ -6813,7 +6829,10 @@ async function main () {
 
   // ── v3.320 终评 must-fix：失败路径的落点旗清不掉（settle 代数）+ 5 个便宜修复 ──────
   await aok('结构红线: v3.320 落点失败清旗（结算代数 / 失败不滚）与分页/占位细节', () => {
-    const read = (f) => fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', f), 'utf8')
+    // v3.364：app.js 拆分后源码会分散到多个模块，结构断言统一读拼接并集。
+    const read = (f) => f === 'app.js'
+      ? readConsoleSource()
+      : fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', f), 'utf8')
     const src = read('app.js')
     const css = read('app.css')
     const loader = src.slice(src.indexOf('function usePanelLoader'), src.indexOf('function usePanelAutoLoad'))

@@ -631,9 +631,6 @@ const ASSETS_DIR = path.join(__dirname, 'console-assets')
 const STATIC_ASSETS = Object.freeze({
   '/assets/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
   '/assets/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
-  // v3.364：加载失败兜底。必须是普通（非 module）脚本且不 import 任何东西——它要在
-  // 模块图已经崩掉之后还能跑；CSP script-src 'self' 禁止内联，所以只能外链。
-  '/assets/boot-guard.js': { file: 'boot-guard.js', type: 'text/javascript; charset=utf-8' },
   '/assets/pure.mjs': { file: 'pure.mjs', type: 'text/javascript; charset=utf-8' },
   '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' },
   // v3.326 日期区间：flatpickr 4.6.13 的 ESM 单文件 bundle（esbuild 打包，含 zh 语言包）
@@ -940,7 +937,10 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
 <link rel="stylesheet" href="/assets/flatpickr.css${assetQuery()}">
 <link rel="stylesheet" href="/assets/app.css${assetQuery()}">
 </head><body>
-<div id="app"><noscript>
+<div id="app"><div class="boot-fallback" role="alert">
+<p class="boot-fail-title">页面没加载出来</p>
+<p class="boot-fail-hint">多半是网络断了一下，或者刚更新过页面。刷新一下（下拉刷新，或重新点开链接）通常就好。</p>
+</div><noscript>
 <section style="max-width:60rem;margin:2rem auto;font-family:system-ui,sans-serif">
 <h1>xbk-push 控制台（无脚本降级）</h1>
 <pre>${statusLines.join('\n')}</pre>
@@ -948,7 +948,6 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
 </section>
 </noscript></div>
 <script type="application/json" id="xbk-boot">${bootJson}</script>
-<script src="/assets/boot-guard.js${assetQuery()}"></script>
 <script type="module" src="/assets/app.js${assetQuery()}"></script>
 </body></html>`
 }

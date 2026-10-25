@@ -7442,5 +7442,6 @@ function App () {
 }
 
 render(html`<${App} />`, document.getElementById('app'))
-// v3.364：告诉 boot-guard 已经正常挂载（它 5s 没收到这个信号就显示加载失败提示）。
-window.__XBK_BOOTED = true
+// v3.364：挂载成功就移除服务端渲染的失败兜底（CSS 让它 5s 后才显形，正常路径永远看不到）。
+const bootFallback = document.querySelector('#app .boot-fallback')
+if (bootFallback) bootFallback.remove()
