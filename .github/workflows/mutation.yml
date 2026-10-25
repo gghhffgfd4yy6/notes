@@ -17,8 +17,8 @@ name: Mutation
 #   （旧 command 档在 --concurrency 8 下 app/utils/message-store 真全量仍需 ~7h/~6.5h/~4.5h，必撞 step 330min；
 #    这正是 CI 切 TAP 的原因，数据见 .local/tap-baseline-REPORT.md。）
 # 触发方式：**仅 main 分支**上 workflow 文件变更 push、手动（Actions → Mutation → Run workflow）和每日自动。
-# 明确不接 pull_request：PR 分支只跑 test.yml 的秒级静态校验（test:mutation-ranges 等），
-# 变异本体只随 main 与定时任务跑——PR 上多跑一轮 28 段既拖慢评审也白烧 runner。
+# 明确不接 pull_request：PR 分支照常跑 test.yml 的**完整门禁**（单元/控制台套件 + 静态校验，数分钟），
+# 但变异本体只随 main 与定时任务跑——PR 上多跑一轮 28 段既拖慢评审也白烧 runner。
 # 主任务避开 UTC 整点：北京时间 00:17 = UTC 16:17；北京时间 12:17 仅在当天无成功或进行中主任务时补跑。
 on:
   push:
