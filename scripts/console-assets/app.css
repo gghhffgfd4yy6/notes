@@ -942,6 +942,27 @@
   }
   .msg-link:hover { text-decoration: underline; }
   /* ── 线报全站搜索（v3.370）── */
+  .ls-config {
+    border: 1px solid var(--border); border-radius: var(--r-md); background: var(--panel-2);
+    margin-bottom: var(--sp-3);
+  }
+  .ls-config > summary {
+    cursor: pointer; padding: var(--sp-2) var(--sp-3); min-height: 44px;
+    display: flex; align-items: center; color: var(--text-dim); font-size: var(--fs-sm);
+  }
+  .ls-config-body {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    padding: 0 var(--sp-3) var(--sp-2);
+  }
+  .ls-cfg-field { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); }
+  .ls-cfg-field input {
+    width: 64px; min-height: 38px; padding: 6px 8px;
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    background: var(--bg); color: var(--text); font: inherit;
+  }
+  .ls-cfg-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); min-height: 38px; }
+  .ls-cfg-msg { font-size: var(--fs-xs); color: var(--ok-fg); }
+  .ls-cfg-help { padding: 0 var(--sp-3) var(--sp-2); color: var(--text-dim); font-size: var(--fs-xs); line-height: 1.6; }
   .ls-watch {
     border: 1px solid var(--border); border-radius: var(--r-md); background: var(--panel-2);
     padding: var(--sp-2) var(--sp-3); margin-bottom: var(--sp-3);

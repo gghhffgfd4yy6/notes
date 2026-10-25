@@ -131,7 +131,10 @@ const MESSAGE_DAYS_ALLOWED = Object.freeze([0, 1, 3, 7, 30])
 // ── v3.370 线报全站搜索（只读代理线报酷 /search.php）───────────────────────
 // 上游单页固定 100 条、最多约 5 页；页码与查询词都钳制后再拼 URL（上游是外部输入）。
 const LINE_SEARCH_QUERY_MAX_BYTES = 120
-const LINE_SEARCH_PAGE_MAX = 20
+// 搜索页按「每页 N 条」切片，N 与监控共用（v3.371）。
+const LINE_SEARCH_PAGE_SIZE = 100
+const LINE_SEARCH_UPSTREAM_PAGE_MAX = 5
+const LINE_SEARCH_UI_PAGE_MAX = 1000
 const LINE_SEARCH_MAX_BYTES = 4 * 1024 * 1024
 const LINE_SEARCH_TIMEOUT_MS = 8000
 // 上游是第三方站点：同一个词 60s 内复用结果，避免反复点刷新打爆对方。
@@ -141,6 +144,15 @@ const LINE_SEARCH_CACHE_MAX = 24
 const LINE_WATCH_FILE = 'console-watch.json'
 const LINE_WATCH_MAX_WORDS = 12
 const LINE_WATCH_WORD_MAX_BYTES = 120
+// 每次检查取最新 N 条（搜索页与监控共用），默认 20；间隔默认 10 分钟。
+const LINE_WATCH_DEFAULT_LIMIT = 20
+const LINE_WATCH_LIMIT_MAX = 100
+const LINE_WATCH_DEFAULT_INTERVAL_MIN = 10
+const LINE_WATCH_INTERVAL_MAX_MIN = 1440
+// 已推条目 id 的滚动窗口：条目只会从「最新 N 条」里消失，留 200 个足够防重。
+const LINE_WATCH_SENT_MAX = 200
+// 调度器每 30s 看一次是否到点；实际间隔由配置决定（默认 10 分钟）。
+const LINE_WATCH_TICK_MS = 30 * 1000
 
 // ── v3.300 批次③ 3.2 消息导出常量 ───────────────────────────────────────────
 // 单次导出行数上限：超出即截断 + 响应头 X-Export-Truncated: true 如实披露。
@@ -2115,25 +2127,91 @@ function parseLineSearchHtml (html, baseUrl) {
   return out
 }
 
-// 关注词读盘：文件缺失=空；损坏/非法=invalid（UI 明说，不把它当「没有关注词」静默吞掉）。
-function readLineWatchWords (stateDir) {
+// 关注词状态读盘：文件缺失=空 + 默认配置；损坏/非法=invalid（UI 明说，不静默吞掉）。
+// schema 1 兼容旧文件（只有 words），新字段缺失时按默认值补。
+function clampWatchInt (v, min, max, fallback) {
+  const n = typeof v === 'number' ? v : Number(v)
+  return Number.isSafeInteger(n) && n >= min && n <= max ? n : fallback
+}
+
+function readWatchState (stateDir) {
+  const defaults = {
+    limit: LINE_WATCH_DEFAULT_LIMIT,
+    intervalMin: LINE_WATCH_DEFAULT_INTERVAL_MIN,
+    enabled: false,
+    lastCheckAt: 0
+  }
   const p = path.join(stateDir, LINE_WATCH_FILE)
   const read = readSafeTextResult(p, 256 * 1024, { openNonBlocking: true })
-  if (read.status === 'missing') return { status: 'ok', words: [] }
-  if (read.status !== 'ok') return { status: 'invalid', words: [] }
+  if (read.status === 'missing') return { status: 'ok', words: [], ...defaults }
+  if (read.status !== 'ok') return { status: read.status, words: [], ...defaults }
   let raw
-  try { raw = JSON.parse(read.text) } catch (e) { return { status: 'invalid', words: [] } }
-  if (!raw || raw.schema !== 1 || !Array.isArray(raw.words)) return { status: 'invalid', words: [] }
+  try { raw = JSON.parse(read.text) } catch (e) { return { status: 'invalid', words: [], ...defaults } }
+  if (!raw || raw.schema !== 1 || !Array.isArray(raw.words)) return { status: 'invalid', words: [], ...defaults }
   const words = []
   for (const item of raw.words) {
     const q = normalizeWatchWord(item && item.q)
     if (q === '' || words.some((w) => w.q === q)) continue
     const lastReadAt = item && Number.isSafeInteger(item.lastReadAt) && item.lastReadAt > 0 ? item.lastReadAt : 0
     const lastReadId = item && typeof item.lastReadId === 'string' && /^[A-Za-z0-9._:/-]{1,80}$/.test(item.lastReadId) ? item.lastReadId : ''
-    words.push({ q, lastReadAt, lastReadId })
+    const sentIds = []
+    if (item && Array.isArray(item.sentIds)) {
+      for (const id of item.sentIds) {
+        if (typeof id === 'string' && /^[A-Za-z0-9._:/-]{1,80}$/.test(id) && !sentIds.includes(id)) sentIds.push(id)
+      }
+    }
+    words.push({ q, lastReadAt, lastReadId, sentIds: sentIds.slice(-LINE_WATCH_SENT_MAX) })
     if (words.length >= LINE_WATCH_MAX_WORDS) break
   }
-  return { status: 'ok', words }
+  return {
+    status: 'ok',
+    words,
+    limit: clampWatchInt(raw.limit, 1, LINE_WATCH_LIMIT_MAX, LINE_WATCH_DEFAULT_LIMIT),
+    intervalMin: clampWatchInt(raw.intervalMin, 1, LINE_WATCH_INTERVAL_MAX_MIN, LINE_WATCH_DEFAULT_INTERVAL_MIN),
+    enabled: raw.enabled === true,
+    lastCheckAt: Number.isSafeInteger(raw.lastCheckAt) && raw.lastCheckAt > 0 ? raw.lastCheckAt : 0
+  }
+}
+
+// 兼容旧调用点：只关心关注词的地方仍拿 { status, words }。
+function readLineWatchWords (stateDir) {
+  const s = readWatchState(stateDir)
+  return { status: s.status, words: s.words }
+}
+
+// 关注词状态写盘：配置 + 每个词的已读锚点 + 已推 id，全部落盘（重启不丢）。
+function saveWatchState (stateDir, state) {
+  const file = path.join(stateDir, LINE_WATCH_FILE)
+  const payload = {
+    schema: 1,
+    limit: clampWatchInt(state.limit, 1, LINE_WATCH_LIMIT_MAX, LINE_WATCH_DEFAULT_LIMIT),
+    intervalMin: clampWatchInt(state.intervalMin, 1, LINE_WATCH_INTERVAL_MAX_MIN, LINE_WATCH_DEFAULT_INTERVAL_MIN),
+    enabled: state.enabled === true,
+    lastCheckAt: Number.isSafeInteger(state.lastCheckAt) && state.lastCheckAt > 0 ? state.lastCheckAt : 0,
+    words: (Array.isArray(state.words) ? state.words : []).slice(0, LINE_WATCH_MAX_WORDS).map((w) => ({
+      q: w.q,
+      lastReadAt: Number.isSafeInteger(w.lastReadAt) && w.lastReadAt > 0 ? w.lastReadAt : 0,
+      lastReadId: typeof w.lastReadId === 'string' ? w.lastReadId : '',
+      sentIds: Array.isArray(w.sentIds) ? w.sentIds.slice(-LINE_WATCH_SENT_MAX) : []
+    }))
+  }
+  if (!writeAtomic(file, JSON.stringify(payload), '关注词')) return false
+  try { fs.chmodSync(file, 0o600) } catch (e) {}
+  return true
+}
+
+// 逐条推送的正文：标题、价格、时间、摘要、原文链接。不汇总，一条线报一条消息。
+function formatWatchPush (item) {
+  const lines = []
+  const title = item && typeof item.title === 'string' && item.title.trim() !== '' ? item.title.trim() : '(无标题线报)'
+  lines.push(title)
+  if (item && item.price !== null && item.price !== undefined && String(item.price).trim() !== '') {
+    lines.push(`价格：¥${String(item.price).trim()}`)
+  }
+  if (item && typeof item.datetime === 'string' && item.datetime !== '') lines.push(item.datetime)
+  if (item && typeof item.content === 'string' && item.content.trim() !== '') lines.push(item.content.trim().slice(0, 200))
+  if (item && typeof item.url === 'string' && item.url !== '') lines.push(item.url)
+  return lines.join('\n')
 }
 
 // 消息过滤谓词（v3.300 3.2 从 /api/messages 抽出，两处复用——变异测试只打一处）。
@@ -2578,7 +2656,7 @@ function buildPushChannelsView () {
   return view
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, lineSearchFetch } = {}) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, lineSearchFetch, watchNotifier } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   // 启动即做一次一致快照：既校验资产可读（缺失即拒启），也把版本号钉死在进程生命周期内
@@ -4271,118 +4349,201 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 解析失败不抛错（返回 0 条），网络失败按 upstream_error 如实下发（不伪装成「没有结果」）。
   const lineSearchCache = new Map()
   const searchFetch = typeof lineSearchFetch === 'function' ? lineSearchFetch : globalThis.fetch
-  const handleLineSearch = async (req, res, url) => {
-    const q = clampLineQuery(url.searchParams.get('q'))
-    if (q === '') { sendJson(res, 400, { status: 'error', error: '搜索词不能为空' }); return }
-    let page = Number(url.searchParams.get('page'))
-    if (!Number.isSafeInteger(page) || page < 1) page = 1
-    if (page > LINE_SEARCH_PAGE_MAX) page = LINE_SEARCH_PAGE_MAX
-    const key = `${q}\n${page}`
+
+  // 取上游某一页（1..5），解析成 { status, items, pages, ... }；同词同页 60s 缓存。
+  // 失败返回 { ok:false, error }，由调用方决定怎么下发——不在这里写 res（定时监控也要复用）。
+  // 同一 key 的并发请求合并成一次上游请求：避免慢请求晚到后把新结果盖回旧数据。
+  const lineSearchInflight = new Map()
+  const fetchLineSearchPage = async (q, upPage) => {
+    const key = `${q}\n${upPage}`
     const now = Date.now()
     const hit = lineSearchCache.get(key)
-    res.setHeader('Cache-Control', 'no-store')
     if (hit && now - hit.at < LINE_SEARCH_CACHE_TTL_MS) {
-      sendJson(res, 200, { ...hit.value, cached: true })
-      return
+      return { ok: true, value: { ...hit.value, cached: true } }
     }
-    const baseUrl = sourceDomain()
-    if (typeof searchFetch !== 'function') {
-      sendJson(res, 200, { status: 'upstream_error', q, page, error: '当前 Node 不支持 fetch，无法访问线报酷' })
-      return
-    }
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), LINE_SEARCH_TIMEOUT_MS)
-    let upstream
-    try {
-      upstream = await searchFetch(`${baseUrl}/search.php?q=${encodeURIComponent(q)}&page=${page}`, {
-        signal: controller.signal,
-        redirect: 'manual', // 固定 host：上游 3xx 一律中止，避免被重定向到内网/其它站点
-        headers: { accept: 'text/html,application/xhtml+xml', 'user-agent': 'xbk-console/1' }
-      })
-    } catch (e) {
-      clearTimeout(timer)
-      sendJson(res, 200, {
-        status: 'upstream_error',
-        q,
-        page,
-        error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷连接失败，稍后再试'
-      })
-      return
-    }
-    if (upstream && upstream.status >= 300 && upstream.status < 400) {
-      clearTimeout(timer)
-      sendJson(res, 200, { status: 'upstream_error', q, page, error: '线报酷返回重定向，已中止' })
-      return
-    }
-    if (!upstream || !upstream.ok) {
-      clearTimeout(timer)
-      sendJson(res, 200, { status: 'upstream_error', q, page, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` })
-      return
-    }
-    // 8s 计时器读到响应体结束才停：上游先回头再慢慢吐 body 也不能拖住控制台。
-    // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存。
-    let text = ''
-    try {
-      const stream = upstream.body
-      if (stream && typeof stream.getReader === 'function') {
-        const reader = stream.getReader()
-        const chunks = []
-        let total = 0
-        for (;;) {
-          const step = await reader.read()
-          if (step.done) break
-          const chunk = Buffer.from(step.value)
-          total += chunk.length
-          if (total > LINE_SEARCH_MAX_BYTES) {
-            try { await reader.cancel() } catch (e) {}
-            sendJson(res, 200, { status: 'upstream_error', q, page, error: '线报酷返回内容过大，已放弃解析' })
-            return
-          }
-          chunks.push(chunk)
-        }
-        text = Buffer.concat(chunks).toString('utf8')
-      } else {
-        text = await upstream.text()
-        if (Buffer.byteLength(text, 'utf8') > LINE_SEARCH_MAX_BYTES) {
-          sendJson(res, 200, { status: 'upstream_error', q, page, error: '线报酷返回内容过大，已放弃解析' })
-          return
+    const running = lineSearchInflight.get(key)
+    if (running) return running
+    const task = (async () => {
+      const baseUrl = sourceDomain()
+      if (typeof searchFetch !== 'function') {
+        return { ok: false, error: '当前 Node 不支持 fetch，无法访问线报酷' }
+      }
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), LINE_SEARCH_TIMEOUT_MS)
+      let upstream
+      try {
+        upstream = await searchFetch(`${baseUrl}/search.php?q=${encodeURIComponent(q)}&page=${upPage}`, {
+          signal: controller.signal,
+          redirect: 'manual', // 固定 host：上游 3xx 一律中止，避免被重定向到内网/其它站点
+          headers: { accept: 'text/html,application/xhtml+xml', 'user-agent': 'xbk-console/1' }
+        })
+      } catch (e) {
+        clearTimeout(timer)
+        return {
+          ok: false,
+          error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷连接失败，稍后再试'
         }
       }
-    } catch (e) {
-      sendJson(res, 200, {
-        status: 'upstream_error',
+      if (upstream && upstream.status >= 300 && upstream.status < 400) {
+        clearTimeout(timer)
+        return { ok: false, error: '线报酷返回重定向，已中止' }
+      }
+      if (!upstream || !upstream.ok) {
+        clearTimeout(timer)
+        return { ok: false, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` }
+      }
+      // 8s 计时器读到响应体结束才停：上游先回头再慢慢吐 body 也不能拖住控制台。
+      // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存。
+      let text = ''
+      try {
+        const stream = upstream.body
+        if (stream && typeof stream.getReader === 'function') {
+          const reader = stream.getReader()
+          const chunks = []
+          let total = 0
+          for (;;) {
+            const step = await reader.read()
+            if (step.done) break
+            const chunk = Buffer.from(step.value)
+            total += chunk.length
+            if (total > LINE_SEARCH_MAX_BYTES) {
+              try { await reader.cancel() } catch (e) {}
+              return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
+            }
+            chunks.push(chunk)
+          }
+          text = Buffer.concat(chunks).toString('utf8')
+        } else {
+          text = await upstream.text()
+          if (Buffer.byteLength(text, 'utf8') > LINE_SEARCH_MAX_BYTES) {
+            return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
+          }
+        }
+      } catch (e) {
+        return {
+          ok: false,
+          error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试'
+        }
+      } finally {
+        clearTimeout(timer)
+      }
+      const parsed = parseLineSearchHtml(text, baseUrl)
+      if (!parsed.matched) {
+        // 结构对不上 ≠ 没有结果：如实报错，别让调用方以为这个搜索词真的 0 条。
+        return { ok: false, error: '线报酷页面结构变了，暂时无法解析（不是没有结果）' }
+      }
+      const value = {
+        status: 'ok',
         q,
-        page,
-        error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试'
-      })
-      return
-    } finally {
-      clearTimeout(timer)
-    }
-    const parsed = parseLineSearchHtml(text, baseUrl)
-    if (!parsed.matched) {
-      // 结构对不上 ≠ 没有结果：如实报错，别让用户以为这个搜索词真的 0 条。
-      sendJson(res, 200, { status: 'upstream_error', q, page, error: '线报酷页面结构变了，暂时无法解析（不是没有结果）' })
-      return
-    }
-    const value = {
-      status: 'ok',
-      q,
-      page,
-      pages: parsed.pages,
-      count: parsed.items.length,
-      items: parsed.items,
-      baseUrl
-    }
-    const prev = lineSearchCache.get(key)
-    if (!prev || prev.at <= now) {
+        upstreamPage: upPage,
+        pages: parsed.pages,
+        count: parsed.items.length,
+        items: parsed.items,
+        baseUrl
+      }
       if (lineSearchCache.size >= LINE_SEARCH_CACHE_MAX) {
         const oldest = lineSearchCache.keys().next().value
         lineSearchCache.delete(oldest)
       }
       lineSearchCache.set(key, { at: now, value })
+      return { ok: true, value }
+    })()
+    lineSearchInflight.set(key, task)
+    try {
+      return await task
+    } finally {
+      lineSearchInflight.delete(key)
     }
-    sendJson(res, 200, value)
+  }
+
+  // 搜索页：page 是「第几页（每页 limit 条）」，不是上游页码；跨 100 条边界时取两页拼。
+  const handleLineSearch = async (req, res, url) => {
+    const q = clampLineQuery(url.searchParams.get('q'))
+    res.setHeader('Cache-Control', 'no-store')
+    if (q === '') { sendJson(res, 400, { status: 'error', error: '搜索词不能为空' }); return }
+    let limit = Number(url.searchParams.get('limit'))
+    if (!Number.isSafeInteger(limit) || limit < 1) limit = LINE_WATCH_DEFAULT_LIMIT
+    if (limit > LINE_WATCH_LIMIT_MAX) limit = LINE_WATCH_LIMIT_MAX
+    let page = Number(url.searchParams.get('page'))
+    if (!Number.isSafeInteger(page) || page < 1) page = 1
+    if (page > LINE_SEARCH_UI_PAGE_MAX) page = LINE_SEARCH_UI_PAGE_MAX
+    const offset = (page - 1) * limit
+    const upstreamMax = LINE_SEARCH_PAGE_SIZE * LINE_SEARCH_UPSTREAM_PAGE_MAX
+    const empty = (pages, estimated = false) => sendJson(res, 200, {
+      status: 'ok', q, page, limit, pages, count: 0, items: [], cached: false, pagesEstimated: estimated
+    })
+    if (offset >= upstreamMax) { empty(Math.ceil(upstreamMax / limit), true); return }
+
+    const startUp = Math.floor(offset / LINE_SEARCH_PAGE_SIZE) + 1
+    const first = await fetchLineSearchPage(q, startUp)
+    if (!first.ok) {
+      sendJson(res, 200, { status: 'upstream_error', q, page, limit, error: first.error })
+      return
+    }
+    const upstreamPages = first.value.pages
+    const sliceStart = offset - (startUp - 1) * LINE_SEARCH_PAGE_SIZE
+
+    // 请求页超出上游总页数：取末页真实条数算出总条数，返回空页（不再请求不存在的页）。
+    if (startUp > upstreamPages) {
+      let total = upstreamPages === 1 ? first.value.items.length : upstreamPages * LINE_SEARCH_PAGE_SIZE
+      let estimated = upstreamPages > 1
+      if (upstreamPages > 1) {
+        const last = await fetchLineSearchPage(q, upstreamPages)
+        if (last.ok) {
+          total = (upstreamPages - 1) * LINE_SEARCH_PAGE_SIZE + last.value.items.length
+          estimated = false
+        }
+      }
+      empty(Math.max(1, Math.ceil(total / limit)), estimated)
+      return
+    }
+
+    // endUp 以「本次展示页真正需要的条数」为准，再被上游总页数封顶：
+    // limit 很大时不会去请求不存在的下一页，已取到的有效结果也不会因越界请求失败而丢掉。
+    const endUp = Math.min(
+      upstreamPages,
+      startUp + Math.floor((sliceStart + limit - 1) / LINE_SEARCH_PAGE_SIZE)
+    )
+    const fetched = [first.value]
+    for (let upPage = startUp + 1; upPage <= endUp; upPage += 1) {
+      const r = await fetchLineSearchPage(q, upPage)
+      if (!r.ok) {
+        sendJson(res, 200, { status: 'upstream_error', q, page, limit, error: r.error })
+        return
+      }
+      fetched.push(r.value)
+    }
+
+    // 上游最后一页通常不满 100 条：取它的条数才能算出准确总页数；
+    // 取不到时按满页估算，但用 pagesEstimated 明确告诉前端「页数是估的」。
+    let total = upstreamPages * LINE_SEARCH_PAGE_SIZE
+    let pagesEstimated = false
+    if (upstreamPages === 1) {
+      total = first.value.items.length
+    } else {
+      let last = fetched.find((v) => v.upstreamPage === upstreamPages)
+      if (!last) {
+        const r = await fetchLineSearchPage(q, upstreamPages)
+        if (r.ok) last = r.value
+        else pagesEstimated = true
+      }
+      if (last) total = (upstreamPages - 1) * LINE_SEARCH_PAGE_SIZE + last.items.length
+    }
+    const pages = Math.max(1, Math.ceil(total / limit))
+    if (offset >= total) { empty(pages, pagesEstimated); return }
+    const all = fetched.flatMap((v) => v.items)
+    const items = all.slice(sliceStart, sliceStart + limit)
+    sendJson(res, 200, {
+      status: 'ok',
+      q,
+      page,
+      limit,
+      pages,
+      count: items.length,
+      items,
+      cached: fetched.every((v) => v.cached === true),
+      pagesEstimated
+    })
   }
 
   // 关注词：GET 读（缺文件=空）；POST 增/删/标记已读（Bearer-only，与其它写面同规）。
@@ -4404,8 +4565,24 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         const action = payload.action
-        const stored = readLineWatchWords(stateDir)
-        let words = stored.words
+        let state = readWatchState(stateDir)
+        if (state.status === 'invalid') {
+          // 内容确定损坏（JSON/schema 读不出）：用户的显式写操作按空状态重建，
+          // 否则 UI 会永远卡在「损坏」且无法通过「关注」恢复。
+          state = {
+            status: 'ok',
+            words: [],
+            limit: LINE_WATCH_DEFAULT_LIMIT,
+            intervalMin: LINE_WATCH_DEFAULT_INTERVAL_MIN,
+            enabled: false,
+            lastCheckAt: 0
+          }
+        } else if (state.status !== 'ok') {
+          // 权限/IO/文件被替换等暂时性读失败：fail-closed，绝不用空状态覆盖原文件。
+          sendJson(res, 503, { error: `关注词文件暂时读不了（${state.status}），本次未写入，稍后再试` })
+          return
+        }
+        let words = state.words
         if (action === 'add') {
           const q = normalizeWatchWord(payload.q)
           if (q === '') { sendJson(res, 400, { error: '关注词不能为空' }); return }
@@ -4414,8 +4591,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
               sendJson(res, 409, { error: '关注词最多 12 个，先删掉不用的再添加' })
               return
             }
-            // 新词以「添加时刻」为基线：第一次检查只算之后的新线报，不把历史 100 条全标成新。
-            words = words.concat([{ q, lastReadAt: Date.now(), lastReadId: '' }])
+            // 新词以「当前分钟起点 - 1ms」为基线：上游时间只有分钟精度，
+            // 用精确 now 会漏掉同一分钟里随后发布的线报（整分钟的 ts 小于 now）。
+            words = words.concat([{ q, lastReadAt: Math.floor(Date.now() / 60000) * 60000 - 1, lastReadId: '', sentIds: [] }])
           }
         } else if (action === 'remove') {
           const q = normalizeWatchWord(payload.q)
@@ -4430,20 +4608,133 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             : Date.now()
           const lastReadId = typeof payload.lastReadId === 'string' && /^[A-Za-z0-9._:/-]{1,80}$/.test(payload.lastReadId) ? payload.lastReadId : ''
           words = words.map((w) => (w.q === q ? { ...w, lastReadAt: at, lastReadId } : w))
+        } else if (action === 'config') {
+          const limit = clampWatchInt(payload.limit, 1, LINE_WATCH_LIMIT_MAX, 0)
+          const intervalMin = clampWatchInt(payload.intervalMin, 1, LINE_WATCH_INTERVAL_MAX_MIN, 0)
+          if (limit === 0 || intervalMin === 0) {
+            sendJson(res, 400, { error: `条数范围 1–${LINE_WATCH_LIMIT_MAX}，间隔范围 1–${LINE_WATCH_INTERVAL_MAX_MIN} 分钟` })
+            return
+          }
+          const wasEnabled = state.enabled
+          const enabled = typeof payload.enabled === 'boolean' ? payload.enabled : state.enabled
+          state.limit = limit
+          state.intervalMin = intervalMin
+          state.enabled = enabled
+          // 从关到开：清掉上次检查时间，30s 内立刻跑第一轮（新词基线是添加时刻，不会补推历史）。
+          if (enabled && !wasEnabled) state.lastCheckAt = 0
         } else {
-          sendJson(res, 400, { error: 'action 必须是 add / remove / read' })
+          sendJson(res, 400, { error: 'action 必须是 add / remove / read / config' })
           return
         }
-        const file = path.join(stateDir, LINE_WATCH_FILE)
-        if (!writeAtomic(file, JSON.stringify({ schema: 1, words }), '关注词')) {
+        if (!saveWatchState(stateDir, { ...state, words })) {
           sendJson(res, 500, { error: '关注词保存失败（磁盘/权限）' })
           return
         }
-        try { fs.chmodSync(file, 0o600) } catch (e) {}
         res.setHeader('Cache-Control', 'no-store')
-        sendJson(res, 200, { status: 'ok', words })
+        sendJson(res, 200, {
+          status: 'ok',
+          words,
+          limit: state.limit,
+          intervalMin: state.intervalMin,
+          enabled: state.enabled,
+          lastCheckAt: state.lastCheckAt,
+          max: LINE_WATCH_MAX_WORDS
+        })
       })
       .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+  }
+
+  // ── v3.371 关注词定时监控 ────────────────────────────────────────────────
+  // 到点逐词拉第 1 页、取最新 limit 条，与上次已读锚点比：有新的就一条一条推，
+  // 没有就完全不推。推一条落一次盘（sentIds + lastReadId），重启不会从头再推。
+  const notifyWatch = typeof watchNotifier === 'function'
+    ? watchNotifier
+    : async (title, body) => {
+      // 延迟加载：只有真的开启监控，才把推送配置/通道模块拉进控制台进程。
+      const { sendNotify } = require('../xbk_sendNotify_slim')
+      return sendNotify(title, body)
+    }
+  let watchBusy = false
+  const runWatchOnce = async () => {
+    if (watchBusy) return { status: 'busy', pushed: 0, results: [] }
+    watchBusy = true
+    try {
+      const state = readWatchState(stateDir)
+      if (state.status !== 'ok') return { status: 'invalid', pushed: 0, results: [] }
+      if (!state.enabled || state.words.length === 0) return { status: 'idle', pushed: 0, results: [] }
+      // 先记检查时间：本轮即使中途失败，也等下个间隔再重试，不空转打上游。
+      state.lastCheckAt = Date.now()
+      if (!saveWatchState(stateDir, state)) return { status: 'save_failed', pushed: 0, results: [] }
+      let pushed = 0
+      const results = []
+      for (const word of state.words) {
+        const r = await fetchLineSearchPage(word.q, 1)
+        if (!r.ok) { results.push({ q: word.q, pushed: 0, error: r.error }); continue }
+        const items = r.value.items.slice(0, state.limit)
+        const sent = new Set(Array.isArray(word.sentIds) ? word.sentIds : [])
+        const idx = word.lastReadId ? items.findIndex((it) => it.id === word.lastReadId) : -1
+        let candidates
+        if (idx >= 0) {
+          candidates = items.slice(0, idx) // 锚点之前的才是新的
+        } else {
+          // 锚点被挤出最新 limit 条（或旧数据没有锚点）：退回时间比较。
+          // lastReadAt=0 视为「从现在开始」，不把历史条目当新线报补推。
+          const since = word.lastReadAt > 0 ? word.lastReadAt : Date.now()
+          candidates = items.filter((it) => typeof it.ts === 'number' && it.ts > since)
+        }
+        candidates = candidates.filter((it) => typeof it.id === 'string' && it.id !== '' && !sent.has(it.id))
+        candidates.reverse() // 旧→新：中途推送失败时锚点停在已推的最后一条，下轮接着推
+        let count = 0
+        let stopped = false
+        for (const item of candidates) {
+          // 每条发送前重读状态：用户中途停用/删词/标已读或已推过，都不能再发。
+          const live = readWatchState(stateDir)
+          if (live.status !== 'ok' || !live.enabled) { stopped = true; break }
+          const lw = live.words.find((x) => x.q === word.q)
+          if (!lw) { stopped = true; break }
+          if ((Array.isArray(lw.sentIds) ? lw.sentIds : []).includes(item.id)) continue
+          const liveAnchor = lw.lastReadId ? items.findIndex((it) => it.id === lw.lastReadId) : -1
+          const itemAt = items.indexOf(item)
+          const stillNew = liveAnchor >= 0
+            ? itemAt >= 0 && itemAt < liveAnchor
+            : typeof item.ts === 'number' && item.ts > (lw.lastReadAt || 0)
+          if (!stillNew) continue
+          try {
+            const title = `新线报 · ${word.q}`.slice(0, 32)
+            await notifyWatch(title, formatWatchPush(item))
+          } catch (e) {
+            results.push({ q: word.q, pushed: count, error: 'push_failed' })
+            break
+          }
+          count += 1
+          pushed += 1
+          // 推一条记一条：重新读盘再改，避免覆盖期间 UI 的增删/配置。
+          const fresh = readWatchState(stateDir)
+          if (fresh.status !== 'ok') {
+            results.push({ q: word.q, pushed: count, error: 'state_read_failed' })
+            break
+          }
+          const w = fresh.words.find((x) => x.q === word.q)
+          if (!w) { results.push({ q: word.q, pushed: count, error: 'removed' }); break }
+          w.sentIds = (Array.isArray(w.sentIds) ? w.sentIds : []).concat([item.id]).slice(-LINE_WATCH_SENT_MAX)
+          // 不倒退锚点：用户可能已经读到更靠前的位置（lastReadAt 更大）。
+          if (typeof item.ts === 'number' && item.ts > w.lastReadAt) {
+            w.lastReadAt = item.ts
+            if (/^[A-Za-z0-9._:/-]{1,80}$/.test(item.id)) w.lastReadId = item.id
+          } else if (!w.lastReadId && /^[A-Za-z0-9._:/-]{1,80}$/.test(item.id)) {
+            w.lastReadId = item.id
+          }
+          if (!saveWatchState(stateDir, fresh)) {
+            results.push({ q: word.q, pushed: count, error: 'save_failed' })
+            break
+          }
+        }
+        results.push({ q: word.q, pushed: count, ...(stopped ? { stopped: true } : {}) })
+      }
+      return { status: 'ok', pushed, results }
+    } finally {
+      watchBusy = false
+    }
   }
 
   const server = http.createServer((req, res) => {
@@ -4810,9 +5101,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/line-watch') {
-      const stored = readLineWatchWords(stateDir)
+      const stored = readWatchState(stateDir)
       res.setHeader('Cache-Control', 'no-store')
-      sendJson(res, 200, { status: stored.status, words: stored.words, max: LINE_WATCH_MAX_WORDS })
+      sendJson(res, 200, {
+        status: stored.status,
+        words: stored.words,
+        limit: stored.limit,
+        intervalMin: stored.intervalMin,
+        enabled: stored.enabled,
+        lastCheckAt: stored.lastCheckAt,
+        max: LINE_WATCH_MAX_WORDS
+      })
       return
     }
     if (req.method === 'POST' && url.pathname === '/api/line-watch') {
@@ -5645,7 +5944,22 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     return { shutdown }
   }
-  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections }
+  // 30s 看一次是否到点；enabled/间隔都从文件读，UI 保存后无需重启。
+  const watchTimer = setInterval(() => {
+    const st = readWatchState(stateDir)
+    if (st.status !== 'ok' || !st.enabled || st.words.length === 0) return
+    if (Date.now() - st.lastCheckAt < st.intervalMin * 60 * 1000) return
+    runWatchOnce().then((r) => {
+      if (r.status !== 'ok') log(`⚠️ 关注词监控：${r.status}`)
+      for (const x of r.results) {
+        if (x.error) log(`⚠️ 关注词「${x.q}」：${x.error}`)
+      }
+    }).catch((e) => log(`⚠️ 关注词监控异常：${e && e.message ? e.message : 'unknown'}`))
+  }, LINE_WATCH_TICK_MS)
+  if (typeof watchTimer.unref === 'function') watchTimer.unref()
+  server.on('close', () => clearInterval(watchTimer))
+
+  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections, runWatchOnce }
 }
 
 // ── 启动入口 ───────────────────────────────────────────────────────────────
@@ -5817,7 +6131,17 @@ module.exports = {
   normalizeWatchWord,
   parseLineSearchHtml,
   readLineWatchWords,
+  readWatchState,
+  saveWatchState,
+  formatWatchPush,
+  clampWatchInt,
   LINE_WATCH_FILE,
   LINE_WATCH_MAX_WORDS,
+  LINE_WATCH_DEFAULT_LIMIT,
+  LINE_WATCH_LIMIT_MAX,
+  LINE_WATCH_DEFAULT_INTERVAL_MIN,
+  LINE_WATCH_INTERVAL_MAX_MIN,
+  LINE_WATCH_SENT_MAX,
+  LINE_SEARCH_PAGE_SIZE,
   LINE_SEARCH_QUERY_MAX_BYTES
 }
