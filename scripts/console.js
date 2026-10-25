@@ -636,6 +636,8 @@ const STATIC_ASSETS = Object.freeze({
   '/assets/format.js': { file: 'format.js', type: 'text/javascript; charset=utf-8' },
   // v3.366：API 层（端点函数 + 凭证）独立成模块，与 constants/format 同一条加载链。
   '/assets/api.js': { file: 'api.js', type: 'text/javascript; charset=utf-8' },
+  // v3.367：视图层（组件 + 页面 + 主题/快照）拆出，app.js 只剩挂载与 BFCache。
+  '/assets/ui.js': { file: 'ui.js', type: 'text/javascript; charset=utf-8' },
   '/assets/pure.mjs': { file: 'pure.mjs', type: 'text/javascript; charset=utf-8' },
   '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' },
   // v3.326 日期区间：flatpickr 4.6.13 的 ESM 单文件 bundle（esbuild 打包，含 zh 语言包）
