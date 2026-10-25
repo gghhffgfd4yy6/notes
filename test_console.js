@@ -20,7 +20,8 @@ const CONSOLE_MODULE_FILES = [
   'format.js', // 时间/字节格式化（v3.365 拆出）
   'api.js', // 数据层：端点函数 + 凭证（v3.366 拆出；顺序与拆前源码一致，API 段在 UI 段之前）
   'components.js', // 公用零件：状态徽章/卡片/按钮/日期区间/触发条/确认弹窗（v3.368 拆出）
-  'ui.js', // 页面层：各面板 + App + 主题/快照（v3.367 拆出；正文顺序原文不变）
+  'pages.js', // 页面面板：运行历史/趋势/推送记录/日志/配置/系统/过滤规则（v3.369 拆出）
+  'ui.js', // 外壳：App + 主题/快照/回顶（v3.367 拆出；正文顺序原文不变）
   'app.js' // 入口：只做挂载、BFCache 与失败兜底清理（App 在 ui.js）
 ]
 function readConsoleSource () {

@@ -638,8 +638,10 @@ const STATIC_ASSETS = Object.freeze({
   '/assets/api.js': { file: 'api.js', type: 'text/javascript; charset=utf-8' },
   // v3.367：视图层（组件 + 页面 + 主题/快照）拆出，app.js 只剩挂载与 BFCache。
   '/assets/ui.js': { file: 'ui.js', type: 'text/javascript; charset=utf-8' },
-  // v3.368：再拆一刀——公用零件独立成 components.js（ui.js = 页面 + App）。
+  // v3.368：再拆一刀——公用零件独立成 components.js（页面面板后来进 pages.js，外壳留 ui.js）。
   '/assets/components.js': { file: 'components.js', type: 'text/javascript; charset=utf-8' },
+  // v3.369：页面面板独立成 pages.js（ui.js = 外壳：App + 主题/快照/回顶）。
+  '/assets/pages.js': { file: 'pages.js', type: 'text/javascript; charset=utf-8' },
   '/assets/pure.mjs': { file: 'pure.mjs', type: 'text/javascript; charset=utf-8' },
   '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' },
   // v3.326 日期区间：flatpickr 4.6.13 的 ESM 单文件 bundle（esbuild 打包，含 zh 语言包）
