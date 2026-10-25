@@ -1968,7 +1968,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
 // 搜的是线报酷全站（含没推给你的线报），服务端代理 /search.php 并解析成 JSON。
 // 关注词存在缓存目录：点某个词 = 搜它；「检查更新」逐词拉第 1 页，与 lastReadAt
 // 比出「N 条新」；打开某个关注词后把它标为已读（新条目仍带「新」角标到本次离开）。
-const LS_PAGE_MAX = 20
+const LS_PAGE_MAX = 1000
 const LS_QUERY_MAX_BYTES = 120 // 与服务端 LINE_SEARCH_QUERY_MAX_BYTES 同口径，避免回显 q 被截断后对不上
 function clampSearchText (raw) {
   const s = typeof raw === 'string' ? raw.trim() : ''
@@ -2002,6 +2002,10 @@ function buildSearchHash ({ q, page }) {
   return qs === '' ? '#/search' : `#/search?${qs}`
 }
 
+function watchAtText (ts) {
+  return new Date(ts + 8 * 3600 * 1000).toISOString().slice(5, 16).replace('T', ' ')
+}
+
 function SearchPanel ({ onSync, active = true }) {
   const [boot] = useState(() => parseSearchHash(window.location.hash))
   const [input, setInput] = useState(boot.q)
@@ -2011,6 +2015,11 @@ function SearchPanel ({ onSync, active = true }) {
   const [watch, setWatch] = useState([])
   const [watchStatus, setWatchStatus] = useState('')
   const [watchErr, setWatchErr] = useState('')
+  const [cfg, setCfg] = useState({ limit: 20, intervalMin: 10, enabled: false, lastCheckAt: 0 })
+  const [cfgReady, setCfgReady] = useState(false)
+  const [cfgDraft, setCfgDraft] = useState({ limit: 20, intervalMin: 10, enabled: false })
+  const [cfgMsg, setCfgMsg] = useState('')
+  const cfgDirty = useRef(false)
   const [checking, setChecking] = useState(false)
   const [newCounts, setNewCounts] = useState({})
   const markedRef = useRef('')
@@ -2019,11 +2028,24 @@ function SearchPanel ({ onSync, active = true }) {
 
   const fetchSearch = useCallback(() => {
     if (req.q === '') return Promise.resolve({ status: 'empty', q: '', page: 1, pages: 1, count: 0, items: [] })
-    return apiSearchLines({ q: req.q, page: req.page })
-  }, [req])
+    return apiSearchLines({ q: req.q, page: req.page, limit: cfg.limit })
+  }, [req, cfg.limit])
   const { data, err, load, loading } = usePanelLoader(fetchSearch, onSync)
   usePanelAutoLoad(active, load)
   usePullRefresh(active, load)
+  // 条数改了：回到第 1 页重拉（旧页码是按旧条数算的，不能沿用）。
+  // 首次拿到配置（默认 20 → 用户设的 50）不算「用户改条数」，否则刷新后 page 参数会被吃掉。
+  const prevLimit = useRef(null)
+  useEffect(() => {
+    if (!cfgReady) return
+    if (prevLimit.current === null) {
+      prevLimit.current = cfg.limit
+      return
+    }
+    if (prevLimit.current === cfg.limit) return
+    prevLimit.current = cfg.limit
+    if (req.q !== '') setReq((r) => ({ ...r, page: 1, n: r.n + 1 }))
+  }, [cfgReady, cfg.limit, req.q])
 
   const loadWatch = useCallback(() => {
     const seq = watchEpoch.current
@@ -2031,6 +2053,17 @@ function SearchPanel ({ onSync, active = true }) {
       if (watchEpoch.current !== seq) return // 期间有增删/已读：这份旧快照作废
       setWatch(Array.isArray(d.words) ? d.words : [])
       setWatchStatus(typeof d.status === 'string' ? d.status : 'ok')
+      const nextCfg = {
+        limit: Number.isSafeInteger(d.limit) && d.limit > 0 ? d.limit : 20,
+        intervalMin: Number.isSafeInteger(d.intervalMin) && d.intervalMin > 0 ? d.intervalMin : 10,
+        enabled: d.enabled === true,
+        lastCheckAt: Number.isSafeInteger(d.lastCheckAt) && d.lastCheckAt > 0 ? d.lastCheckAt : 0
+      }
+      setCfg(nextCfg)
+      setCfgReady(true)
+      if (!cfgDirty.current) {
+        setCfgDraft({ limit: nextCfg.limit, intervalMin: nextCfg.intervalMin, enabled: nextCfg.enabled })
+      }
       setWatchErr('')
     }).catch((e) => setWatchErr(`关注词读取失败：${loadErrorText(e)}`))
   }, [])
@@ -2074,6 +2107,33 @@ function SearchPanel ({ onSync, active = true }) {
       })
     }).catch((e) => setWatchErr(e.message))
   }
+  const editCfg = (patch) => {
+    cfgDirty.current = true
+    setCfgMsg('')
+    setCfgDraft((d) => ({ ...d, ...patch }))
+  }
+  const saveCfg = () => {
+    const limit = Number(cfgDraft.limit)
+    const intervalMin = Number(cfgDraft.intervalMin)
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) { setCfgMsg('条数要 1–100'); return }
+    if (!Number.isSafeInteger(intervalMin) || intervalMin < 1 || intervalMin > 1440) { setCfgMsg('间隔要 1–1440 分钟'); return }
+    setCfgMsg('保存中…')
+    watchEpoch.current += 1
+    apiPostLineWatch({ action: 'config', limit, intervalMin, enabled: cfgDraft.enabled === true }).then((d) => {
+      watchEpoch.current += 1
+      const next = {
+        limit: Number.isSafeInteger(d.limit) ? d.limit : limit,
+        intervalMin: Number.isSafeInteger(d.intervalMin) ? d.intervalMin : intervalMin,
+        enabled: d.enabled === true,
+        lastCheckAt: Number.isSafeInteger(d.lastCheckAt) ? d.lastCheckAt : 0
+      }
+      cfgDirty.current = false
+      setCfg(next)
+      setCfgDraft({ limit: next.limit, intervalMin: next.intervalMin, enabled: next.enabled })
+      setCfgMsg('已保存')
+      if (Array.isArray(d.words)) setWatch(d.words)
+    }).catch((e) => setCfgMsg(`保存失败：${e.message}`))
+  }
   const checkWatch = async () => {
     if (checking || watch.length === 0) return
     setChecking(true)
@@ -2084,7 +2144,7 @@ function SearchPanel ({ onSync, active = true }) {
     try {
       for (const w of watch) {
         try {
-          const d = await apiSearchLines({ q: w.q, page: 1 })
+          const d = await apiSearchLines({ q: w.q, page: 1, limit: cfg.limit })
           if (!d || d.status !== 'ok' || !Array.isArray(d.items)) { failed += 1; continue }
           // 优先用「上次读到的最新条目标识」做锚点：上游时间只有分钟精度，仅靠 ts 会漏掉
           // 同一分钟内发布的新线报。锚点不在第 1 页（被新条目挤走）时退回 ts 比较。
@@ -2161,6 +2221,13 @@ function SearchPanel ({ onSync, active = true }) {
     : text)
   const items = live && Array.isArray(live.items) ? live.items : []
   const pages = live && Number.isSafeInteger(live.pages) && live.pages >= 1 ? Math.min(live.pages, LS_PAGE_MAX) : 1
+  // 页码超出总数（比如改了每页条数后旧链接 page=19）：自动回最后一页。
+  useEffect(() => {
+    if (!live || live.status !== 'ok') return
+    if (live.count === 0 && live.page > pages && typeof live.q === 'string' && live.q !== '') {
+      submit(live.q, pages)
+    }
+  }, [live, pages])
   let body
   if (req.q === '') {
     body = html`<div class="empty">输入关键词搜线报酷全站（含没推给你的线报）。试试「十月稻田」。</div>`
@@ -2208,6 +2275,27 @@ function SearchPanel ({ onSync, active = true }) {
         onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); submit(input, 1) } }} />
       <${Button} disabled=${loading || input.trim() === ''} ariaBusy=${loading ? 'true' : 'false'} onClick=${() => submit(input, 1)}>搜索<//>
     </div>
+    <details class="ls-config">
+      <summary>监控设置：每页 ${cfg.limit} 条 · 每 ${cfg.intervalMin} 分钟检查 · ${cfg.enabled ? '已开启' : '已关闭'}</summary>
+      <div class="ls-config-body">
+        <label class="ls-cfg-field">每页
+          <input type="number" min="1" max="100" inputmode="numeric" value=${cfgDraft.limit}
+            onInput=${(e) => editCfg({ limit: Number(e.target.value) })} /> 条
+        </label>
+        <label class="ls-cfg-field">每
+          <input type="number" min="1" max="1440" inputmode="numeric" value=${cfgDraft.intervalMin}
+            onInput=${(e) => editCfg({ intervalMin: Number(e.target.value) })} /> 分钟检查
+        </label>
+        <label class="ls-cfg-toggle">
+          <input type="checkbox" checked=${cfgDraft.enabled}
+            onChange=${(e) => editCfg({ enabled: e.target.checked })} /> 自动监控并推送
+        </label>
+        <${Button} variant="ghost" onClick=${saveCfg}>保存设置<//>
+        ${cfgMsg && html`<span class="ls-cfg-msg">${cfgMsg}</span>`}
+      </div>
+      <div class="ls-cfg-help">开启后每 ${cfgDraft.intervalMin} 分钟检查一次关注词：有新的就逐条推送，没有就不推；检查只看最新 ${cfgDraft.limit} 条。推过的会记在文件里，重启不重推。</div>
+      ${cfg.enabled && cfg.lastCheckAt > 0 && html`<div class="ls-cfg-help">上次检查：${watchAtText(cfg.lastCheckAt)}（北京时间）</div>`}
+    </details>
     <div class="ls-watch">
       <div class="ls-watch-head">
         <span class="ls-watch-title">关注词</span>

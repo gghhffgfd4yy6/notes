@@ -84,7 +84,9 @@ const {
   makeTwoFactorCookie, verifyTwoFactorCookie, loadTwoFactorState, TWO_FACTOR_FILE,
   // v3.370 线报全站搜索：解析/归一纯函数 + 关注词文件常量
   decodeLineHtml, parseLineStamp, clampLineQuery, normalizeWatchWord, parseLineSearchHtml,
-  readLineWatchWords, LINE_WATCH_FILE, LINE_WATCH_MAX_WORDS, LINE_SEARCH_QUERY_MAX_BYTES
+  readLineWatchWords, readWatchState, saveWatchState, formatWatchPush,
+  LINE_WATCH_FILE, LINE_WATCH_MAX_WORDS, LINE_SEARCH_QUERY_MAX_BYTES,
+  LINE_WATCH_DEFAULT_LIMIT, LINE_WATCH_DEFAULT_INTERVAL_MIN
 } = require('./scripts/console')
 const { readMessages } = require('./scripts/status')
 
@@ -2234,6 +2236,8 @@ async function lineSearchTests () {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-line-'))
     const fetched = []
     let mode = 'ok'
+    // 第 2 页夹具：用于验证「每页 N 条」跨 100 条边界时会去取上游第 2 页。
+    const pageTwo = '<html><body><ul class="new-post"><li class="article-list"><p class="title"><time title="2026-10-23 09:00">09:00</time><a href="/haodan/7300002.html" title="第二页线报" data-price="9.9">第二页线报</a></p></li></ul><div class="pagebar"><a href="/search.php?q=x&amp;page=3">3</a></div></body></html>'
     const { server } = createConsole({
       token: TOKEN,
       stateDir: dir,
@@ -2242,27 +2246,37 @@ async function lineSearchTests () {
         if (mode === 'fail') throw new Error('upstream down')
         if (mode === 'redirect') return { ok: false, status: 302, text: async () => '' }
         if (mode === 'changed') return { ok: true, status: 200, text: async () => '<html>changed</html>' }
+        if (String(target).includes('&page=2')) return { ok: true, status: 200, text: async () => pageTwo }
         return { ok: true, status: 200, text: async () => LINE_SEARCH_FIXTURE }
       }
     })
     const port = await listen(server)
     try {
       const q = encodeURIComponent('十月稻田')
-      const first = await request(port, 'GET', `/api/line-search?q=${q}&page=2`, { token: TOKEN })
-      assert.strictEqual(first.status, 200)
-      const firstJson = JSON.parse(first.text)
-      assert.strictEqual(firstJson.status, 'ok')
-      assert.strictEqual(firstJson.q, '十月稻田')
-      assert.strictEqual(firstJson.page, 2)
-      assert.strictEqual(firstJson.count, 2)
-      assert.strictEqual(firstJson.pages, 3)
-      assert.strictEqual(firstJson.items[0].title, '十月稻田五常香米5kg 20.85元')
-      assert.strictEqual(fetched.length, 1)
-      assert.ok(fetched[0].includes('/search.php?q=' + q) && fetched[0].includes('&page=2'), '代理必须把 q/page 原样带给线报酷')
+      const first = JSON.parse((await request(port, 'GET', `/api/line-search?q=${q}&page=1&limit=100`, { token: TOKEN })).text)
+      assert.strictEqual(first.status, 'ok')
+      assert.strictEqual(first.q, '十月稻田')
+      assert.strictEqual(first.page, 1)
+      assert.strictEqual(first.limit, 100)
+      assert.strictEqual(first.count, 2)
+      assert.strictEqual(first.pages, 3)
+      assert.strictEqual(first.items[0].title, '十月稻田五常香米5kg 20.85元')
+      assert.strictEqual(fetched.length, 2, '第 1 页 + 末页条数（算准确总页数）')
+      assert.ok(fetched[0].includes('/search.php?q=' + q) && fetched[0].includes('&page=1'), '代理只带 q/page 两个参数')
       // 同词同页第二次走 60s 缓存，不再打上游。
-      const second = JSON.parse((await request(port, 'GET', `/api/line-search?q=${q}&page=2`, { token: TOKEN })).text)
+      const second = JSON.parse((await request(port, 'GET', `/api/line-search?q=${q}&page=1&limit=100`, { token: TOKEN })).text)
       assert.strictEqual(second.cached, true)
-      assert.strictEqual(fetched.length, 1, '缓存命中不得再请求上游')
+      assert.strictEqual(fetched.length, 2, '缓存命中不得再请求上游')
+      // page=2/limit=100：跳过第 1 页的 100 条 → 取上游 page 2（page 是展示页，不是上游页码）。
+      const secondUp = JSON.parse((await request(port, 'GET', `/api/line-search?q=${q}&page=2&limit=100`, { token: TOKEN })).text)
+      assert.strictEqual(secondUp.count, 1)
+      assert.strictEqual(secondUp.items[0].id, 'haodan-7300002')
+      assert.ok(fetched.some((u) => u.includes('&page=2')), '跨页时必须请求上游第 2 页')
+      // 每页 N 条：limit=1 时第 2 页就是第 2 条，不再请求上游新页。
+      const sliced = JSON.parse((await request(port, 'GET', `/api/line-search?q=${q}&page=2&limit=1`, { token: TOKEN })).text)
+      assert.strictEqual(sliced.count, 1)
+      assert.strictEqual(sliced.items[0].id, 'haodan-7303544')
+      assert.strictEqual(sliced.pages, 202, '3 个上游页（末页 2 条）× 100 + 2 ÷ 每页 1 条')
       // 空词 400（不拿空 query 去扫上游）。
       assert.strictEqual((await request(port, 'GET', '/api/line-search?q=', { token: TOKEN })).status, 400)
       // 上游失败如实回 upstream_error，不伪装成「0 条结果」。
@@ -2282,14 +2296,30 @@ async function lineSearchTests () {
       assert.ok(changed.error.includes('结构'), '解析失败不得伪装成没有结果')
       mode = 'ok'
 
-      // 关注词：初始为空；写面只认 Bearer；增/读/删都落盘。
-      const empty = JSON.parse((await request(port, 'GET', '/api/line-watch', { token: TOKEN })).text)
-      assert.deepStrictEqual(empty.words, [])
       const postWatch = (body, opts = {}) => request(port, 'POST', '/api/line-watch', {
         token: opts.token === undefined ? TOKEN : opts.token,
         body: JSON.stringify(body),
         headers: { 'content-type': 'application/json', ...(opts.headers || {}) }
       })
+      // 配置：默认 20 条 / 10 分钟 / 关闭；可改，越界 400；写盘后 GET 一致。
+      const cfg0 = JSON.parse((await request(port, 'GET', '/api/line-watch', { token: TOKEN })).text)
+      assert.strictEqual(cfg0.limit, LINE_WATCH_DEFAULT_LIMIT)
+      assert.strictEqual(cfg0.intervalMin, LINE_WATCH_DEFAULT_INTERVAL_MIN)
+      assert.strictEqual(cfg0.enabled, false)
+      const cfgOn = JSON.parse((await postWatch({ action: 'config', limit: 50, intervalMin: 5, enabled: true })).text)
+      assert.strictEqual(cfgOn.limit, 50)
+      assert.strictEqual(cfgOn.intervalMin, 5)
+      assert.strictEqual(cfgOn.enabled, true)
+      assert.strictEqual(cfgOn.lastCheckAt, 0, '从关到开必须清掉上次检查时间，尽快跑第一轮')
+      const cfgBad = await postWatch({ action: 'config', limit: 0, intervalMin: 5, enabled: true })
+      assert.strictEqual(cfgBad.status, 400)
+      assert.strictEqual((await postWatch({ action: 'config', limit: 50, intervalMin: 0, enabled: true })).status, 400)
+      // 关掉，避免测试进程的定时器真的去推送。
+      await postWatch({ action: 'config', limit: 50, intervalMin: 5, enabled: false })
+      // 关注词：初始为空；写面只认 Bearer；增/读/删都落盘。
+      const empty = JSON.parse((await request(port, 'GET', '/api/line-watch', { token: TOKEN })).text)
+      assert.deepStrictEqual(empty.words, [])
+      assert.strictEqual(empty.limit, 50, '配置必须随文件持久化')
       const added = await postWatch({ action: 'add', q: '  十月   稻田 ' })
       assert.strictEqual(added.status, 200)
       const addedWords = JSON.parse(added.text).words
@@ -2329,8 +2359,90 @@ async function lineSearchTests () {
   })
 }
 
+async function watchMonitorTests () {
+  await aok('关注词监控: 有新的逐条推/没新的不推/推过的落盘重启不重推/失败重试', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-watch-'))
+    const pageOne = LINE_SEARCH_FIXTURE
+    const anchorSecond = {
+      q: '十月稻田', lastReadAt: Date.UTC(2026, 9, 24, 8, 55), lastReadId: 'haodan-7303544', sentIds: []
+    }
+    const base = { limit: 20, intervalMin: 10, enabled: true, lastCheckAt: 0, words: [anchorSecond] }
+    const makeState = (over = {}) => saveWatchState(dir, { ...base, ...over })
+    const mkConsole = (notifier) => createConsole({
+      token: TOKEN,
+      stateDir: dir,
+      lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => pageOne }),
+      watchNotifier: notifier
+    })
+
+    makeState()
+    const pushes = []
+    const { server, runWatchOnce } = mkConsole(async (title, body) => { pushes.push({ title, body }) })
+    try {
+      const first = await runWatchOnce()
+      assert.strictEqual(first.status, 'ok')
+      assert.strictEqual(first.pushed, 1, '锚点之上只有 1 条新线报')
+      assert.strictEqual(pushes.length, 1)
+      assert.ok(pushes[0].title.includes('十月稻田'))
+      assert.ok(pushes[0].body.includes('十月稻田五常香米5kg 20.85元'))
+      assert.ok(pushes[0].body.includes('/haodan/7305598.html'), '推送正文必须带原文链接')
+      const saved = readWatchState(dir)
+      assert.deepStrictEqual(saved.words[0].sentIds, ['haodan-7305598'], '推过的 id 必须落盘')
+      assert.strictEqual(saved.words[0].lastReadId, 'haodan-7305598', '锚点前进到已推的最新一条')
+      assert.ok(saved.lastCheckAt > 0)
+
+      // 再跑一轮：锚点就在最新一条上，0 条新，不推。
+      const again = await runWatchOnce()
+      assert.strictEqual(again.pushed, 0)
+      assert.strictEqual(pushes.length, 1, '没有新线报绝不能重复推')
+
+      // 「重启」：同一目录新建实例，仍然不重推。
+      const restarted = mkConsole(async () => { throw new Error('must not push') })
+      const afterRestart = await restarted.runWatchOnce()
+      assert.strictEqual(afterRestart.pushed, 0, '重启后必须靠文件里的 sentIds/锚点判重')
+      restarted.server.close()
+
+      // 推送失败：不记账、锚点不动，下一轮重试。
+      makeState()
+      const failing = mkConsole(async () => { throw new Error('channel down') })
+      const failed = await failing.runWatchOnce()
+      assert.strictEqual(failed.pushed, 0)
+      assert.strictEqual(failed.results[0].error, 'push_failed')
+      const kept = readWatchState(dir)
+      assert.deepStrictEqual(kept.words[0].sentIds, [])
+      assert.strictEqual(kept.words[0].lastReadId, 'haodan-7303544', '失败不得推进锚点')
+      failing.server.close()
+
+      const retryPushes = []
+      const retry = mkConsole(async (title, body) => { retryPushes.push(title) })
+      const retried = await retry.runWatchOnce()
+      assert.strictEqual(retried.pushed, 1, '下一轮必须补推失败的那条')
+      assert.strictEqual(retryPushes.length, 1)
+      retry.server.close()
+
+      // 关闭时完全不碰上游/推送。
+      makeState({ enabled: false })
+      let called = 0
+      const off = mkConsole(async () => { called += 1 })
+      const idle = await off.runWatchOnce()
+      assert.strictEqual(idle.status, 'idle')
+      assert.strictEqual(called, 0)
+      off.server.close()
+
+      // 正文包含价格与摘要。
+      const body = formatWatchPush({ title: '测试线报', price: 15, datetime: '2026-10-24 16:55', content: '少部分地区有货', url: 'https://x/1' })
+      assert.ok(body.includes('价格：¥15'))
+      assert.ok(body.includes('少部分地区有货'))
+    } finally {
+      server.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
 async function main () {
   await lineSearchTests()
+  await watchMonitorTests()
   await filterRuleApiTests()
   await backupApiTests()
   await backupUiStructureTests()

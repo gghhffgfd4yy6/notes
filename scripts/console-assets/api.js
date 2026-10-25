@@ -615,10 +615,11 @@ async function triggerNotifyTest () {
 // ── v3.370 线报全站搜索 / 关注词 ─────────────────────────────────────────────
 // 搜索走服务端代理（线报酷是第三方站点，浏览器直连会被 CORS 挡）。查询词只进
 // URLSearchParams，authority 恒为字面量；期限比普通端点长（服务端上游超时 8s）。
-function apiSearchLines ({ q, page } = {}) {
+function apiSearchLines ({ q, page, limit } = {}) {
   const params = new URLSearchParams()
   if (typeof q === 'string' && q.length > 0) params.set('q', q)
   if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
+  if (Number.isSafeInteger(limit) && limit > 0) params.set('limit', String(limit))
   const qs = params.toString()
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
