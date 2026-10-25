@@ -631,6 +631,9 @@ const ASSETS_DIR = path.join(__dirname, 'console-assets')
 const STATIC_ASSETS = Object.freeze({
   '/assets/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
   '/assets/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+  // v3.365：拆出去的前端模块——顺序与 app.js 的 import 无关，但必须全部登记（缺一个 = 白屏）。
+  '/assets/constants.js': { file: 'constants.js', type: 'text/javascript; charset=utf-8' },
+  '/assets/format.js': { file: 'format.js', type: 'text/javascript; charset=utf-8' },
   '/assets/pure.mjs': { file: 'pure.mjs', type: 'text/javascript; charset=utf-8' },
   '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' },
   // v3.326 日期区间：flatpickr 4.6.13 的 ESM 单文件 bundle（esbuild 打包，含 zh 语言包）

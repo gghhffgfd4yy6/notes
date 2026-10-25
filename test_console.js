@@ -15,7 +15,11 @@ const { spawn, spawnSync } = require('node:child_process')
 
 // 前端模块清单（v3.364）：拆 app.js 时，测试按固定顺序把自家模块拼回一份源码——
 // 653 条源码文本断言因此不必随搬家逐条改锚点。新增模块时把文件追加到入口之前。
-const CONSOLE_MODULE_FILES = ['app.js']
+const CONSOLE_MODULE_FILES = [
+  'constants.js', // 页面级常量（v3.365 拆出）
+  'format.js', // 时间/字节格式化（v3.365 拆出）
+  'app.js' // 入口：App 组件 + 页面
+]
 function readConsoleSource () {
   return CONSOLE_MODULE_FILES
     .map((file) => fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', file), 'utf8'))
