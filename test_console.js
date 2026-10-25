@@ -12,6 +12,15 @@ const http = require('node:http')
 const zlib = require('node:zlib')
 const net = require('node:net')
 const { spawn, spawnSync } = require('node:child_process')
+
+// 前端模块清单（v3.364）：拆 app.js 时，测试按固定顺序把自家模块拼回一份源码——
+// 653 条源码文本断言因此不必随搬家逐条改锚点。新增模块时把文件追加到入口之前。
+const CONSOLE_MODULE_FILES = ['app.js']
+function readConsoleSource () {
+  return CONSOLE_MODULE_FILES
+    .map((file) => fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', file), 'utf8'))
+    .join('\n')
+}
 // 竞态安全读取器（生产 xbk_storage）：测试里对「刚写完/刚 rename 过的路径」的断言读取
 // 统一走它（O_NOFOLLOW + fstat 复检 + 读后复检），规避 CodeQL js/file-system-race 对
 // 「写路径 → 按路径 open」的 check-then-use 判红。
@@ -1426,7 +1435,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则页: 两处保存入口都走 pure.mjs 的候选构造，没有第二条提交路径', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     // 逻辑在 pure.mjs 且被 Node 直接执行测试；这里只锁「接线」：
     assert.ok(/import \{[^}]*buildSaveCandidate as buildSaveCandidateOf[^}]*\} from '\.\/pure\.mjs'/.test(src),
       'app.js 必须从 pure.mjs 引入候选构造函数（别在组件里另写一份）')
@@ -1823,7 +1832,7 @@ async function filterRuleApiTests () {
 
   // 前端对接的结构红线（HTTP 用例测不到 app.js 的渲染分支，只能断言源码契约）。
   await aok('过滤规则页对接: 预览不可读文案 + 回滚带 baseRevision（结构红线）', () => {
-    const js = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const js = readConsoleSource()
     assert.ok(js.includes('无法读取推送历史，本次不显示补推估算'), 'available===false 时必须显示「无法读取推送历史」而不是 0 条')
     assert.ok(js.includes('preview.available === false'), 'reEvalText / 预览面板必须先判 available===false')
     assert.ok(js.includes('confirm: true,\n        baseRevision'), 'doRestore 必须把 baseRevision 与 confirm 一起提交')
@@ -2064,7 +2073,7 @@ async function backupApiTests () {
 
 async function backupUiStructureTests () {
   await aok('结构红线: 数据备份只留导入/导出，导出类别在弹窗里选', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const at = src.indexOf('function BackupBlock')
     const end = src.indexOf('function SysPanel', at)
     const seg = src.slice(at, end)
@@ -2080,7 +2089,7 @@ async function backupUiStructureTests () {
   })
 
   await aok('结构红线: 备份在浏览器加密，密码不进请求', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const at = src.indexOf('function BackupBlock')
     const end = src.indexOf('function SysPanel', at)
     const seg = src.slice(at, end)
@@ -2114,7 +2123,7 @@ async function backupUiStructureTests () {
   })
 
   await aok('结构红线: 弹窗 busy 变化不得把焦点抢回密码框', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const at = src.indexOf('function ConfirmDialog')
     const end = src.indexOf('function LeaveGuardDialog', at)
     assert.ok(at > -1 && end > at, '应能定位 ConfirmDialog')
@@ -2217,8 +2226,11 @@ async function main () {
     assert.ok(verMatch, 'HTML 资产引用必须带内容版本号 ?v=<sha16>')
     // 版本号必须由内容派生（sha256(各文件哈希拼接) 前 16 位），常量/陈旧版本过不了这条
     const crypto = require('node:crypto')
-    const hashes = ['app.css', 'app.js', 'pure.mjs', 'htm-preact.module.js', 'flatpickr.module.js', 'flatpickr.css', 'motion.js', 'motion-lib.module.js'].map((f) => {
-      const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', f))
+    // v3.364：不再硬编码文件名清单——直接按 STATIC_ASSETS 的插入顺序取（服务端算版本号
+    // 用的是同一个对象），新增分片时这条断言自动跟随，不会出现「清单漏一个、版本号对不上」。
+    const { STATIC_ASSETS } = require('./scripts/console.js')
+    const hashes = Object.values(STATIC_ASSETS).map((spec) => {
+      const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', spec.file))
       return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
     })
     const expectVer = crypto.createHash('sha256').update(hashes.join('|')).digest('hex').slice(0, 16)
@@ -2291,11 +2303,45 @@ async function main () {
     // token 绝不进资产响应（资产不含用户数据的安全边界）。
     assert.ok(!js.text.includes(TOKEN), 'app.js 内容不含 token')
     assert.ok(!lib.text.includes(TOKEN), 'vendor 内容不含 token')
+    // v3.364 加载失败兜底：普通脚本（非 module）、排在入口之前、能被独立伺服。
+    const guard = await request(port, 'GET', '/assets/boot-guard.js', { token: TOKEN })
+    assert.strictEqual(guard.status, 200, 'boot-guard 必须在白名单里（否则兜底本身 404）')
+    assert.match(guard.headers['content-type'], /text\/javascript/)
+    assert.ok(guard.text.includes('__XBK_BOOTED') && guard.text.includes('5000'), 'boot-guard 必须等 booted 信号并有超时兜底')
+    assert.ok(!/^\s*import\s/m.test(guard.text), 'boot-guard 不得 import 任何东西（否则它自己也会挂）')
+    assert.ok(page.text.indexOf('/assets/boot-guard.js') > 0 &&
+      page.text.indexOf('/assets/boot-guard.js') < page.text.indexOf('/assets/app.js?v='),
+    'boot-guard 必须排在入口 module 之前（模块图崩了才有人兜）')
     const nope = await request(port, 'GET', '/assets/nope.js', { token: TOKEN })
     assert.strictEqual(nope.status, 404, '白名单外 404')
     const traversal = await request(port, 'GET', '/assets/..%2F..%2Fconsole.js', { token: TOKEN })
     assert.strictEqual(traversal.status, 404, '路径穿越形态 404（白名单精确匹配，不解码拼接）')
     server.close()
+  })
+  await aok('资产: 每个模块 import 的文件都在白名单里（漏登记 = 整页白屏且测试全绿）', () => {
+    const { STATIC_ASSETS } = require('./scripts/console.js')
+    const dir = path.join(__dirname, 'scripts', 'console-assets')
+    const routes = new Set(Object.keys(STATIC_ASSETS))
+    const missing = []
+    const dynamic = []
+    for (const file of fs.readdirSync(dir)) {
+      if (!/\.(js|mjs)$/.test(file)) continue
+      if (file === 'boot-guard.js') continue // 兜底脚本按设计零 import（它要在模块图崩后照跑）
+      const text = fs.readFileSync(path.join(dir, file), 'utf8')
+      const re = /(?:from|import)\s*['"](\.[^'"]+)['"]/g
+      let m
+      while ((m = re.exec(text)) !== null) {
+        const route = '/assets/' + m[1].replace(/^\.\//, '')
+        if (!routes.has(route)) missing.push(`${file} → ${m[1]}`)
+      }
+      // 自家模块禁止动态 import：会多一次瀑布、首帧闪、且失败点更晚更难兜。
+      if (/(^|[^.\w])import\s*\(/.test(text)) dynamic.push(file)
+    }
+    assert.deepStrictEqual(missing, [], 'import 的文件必须已登记 STATIC_ASSETS（否则 404 → 模块图崩 → 白屏）')
+    assert.deepStrictEqual(dynamic, [], '自家模块不得用动态 import')
+    for (const spec of Object.values(STATIC_ASSETS)) {
+      assert.ok(fs.existsSync(path.join(dir, spec.file)), `白名单文件缺失：${spec.file}`)
+    }
   })
   await aok('HTTP: ?token= 查询参数放行（浏览器流：看板、API、表单触发）', async () => {
     const dir = tmpDir()
@@ -4219,7 +4265,7 @@ async function main () {
   })
 
   await aok('分页/横滑控件: 运行历史与推送记录都有每页条数，趋势与历史表可横向滑动', () => {
-    const js = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const js = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/const RUN_PAGE_SIZES = \[10, 20, 50, 100\]/.test(js), '运行历史每页条数须为 10/20/50/100')
     assert.ok(js.includes('function MiniSelect ('), '必须有 MiniSelect 深色下拉组件')
@@ -5115,7 +5161,7 @@ async function main () {
   })
 
   await aok('静态红线: app.js 所有 fetch/EventSource 第一参数均为字面量或字面量起点三元', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     // Codacy SSRF 全绿形态：第一参数是 '/api/...' 字面量，或以字面量起点的三元
     // （`qs.length > 0 ? `/api/messages?${qs}` : '/api/messages'` —— authority 恒字面量，
     // PR#227 实测通过形态）。抓的是「第一参数为裸变量/函数调用」的形态。
@@ -5140,7 +5186,7 @@ async function main () {
   // `Authorization: `*** ${BOOT.token}`` —— GET 走 Cookie 照常工作、页面全绿，只有写动作
   // 恒 401「触发失败：unauthorized」。运行期无浏览器测试可抓，只能靠源码形态断言。
   await aok('静态红线: app.js 的 Authorization 头一律 Bearer 形态（防 *** 占位符回潮）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const authLines = src.split('\n').filter(l => l.includes('Authorization:') && !l.trim().startsWith('//'))
     assert.ok(authLines.length > 0, '应存在 Authorization 头')
     const bad = authLines.filter(l => !/Authorization:\s*`Bearer \$\{BOOT\.token\}`/.test(l))
@@ -5153,7 +5199,7 @@ async function main () {
   })
 
   await aok('静态红线: 运行 id 是 string，禁 typeof / Number.is* 的 number 判定（v3.299 回归）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     // v3.299 事故形态：服务端把 run id 从 number 改成 'epoch.seq' 字符串后，前端仍有
     // `typeof id === 'number'` 守卫 → 按钮永久禁用、请求永不发出，且页面无任何报错。
     // 不用单条正则：别名（runId）、括号（(id)）、下标（rows[i].id）、!== 都要覆盖。
@@ -5188,7 +5234,7 @@ async function main () {
   })
 
   await aok('结构红线: RunsPanel 模板的 <div> 必须成对闭合（漏根 </div> 回归）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     // 事故形态：RunsPanel 根 `<div class="panel">` 漏了 `</div>`，htm 把根标签解析成
     // 文本节点 "div" → 页面出现裸字 "div"、面板丢边框，运行期零报错。
     const start = src.indexOf('function RunsPanel')
@@ -5207,7 +5253,7 @@ async function main () {
   })
 
   await aok('结构红线: 日志框首帧即最终日志（点「日志」不得先画「加载中…」再撑开）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const start = src.indexOf('function RunsPanel')
     const end = src.indexOf('// ── 组件：逐轮运行历史', start)
     assert.ok(start > -1 && end > start, '应能定位 RunsPanel 源码段')
@@ -5247,7 +5293,7 @@ async function main () {
   })
 
   await aok('静态红线: fmtTime 固定按 Asia/Shanghai（UTC+8）渲染', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     // 服务器时区为 UTC：用本地 getHours() 会让「自动刷新 14:xx」与 run.log 的 22:xx 混显。
     const start = src.indexOf('function fmtTime')
     const end = src.indexOf('function fmtNum', start)
@@ -5258,7 +5304,7 @@ async function main () {
   })
 
   await aok('结构红线: 分类筛选走自定义 CategoryPicker（手机端不弹原生 select）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     assert.ok(src.includes('function CategoryPicker ('), '必须有 CategoryPicker 组件')
     const start = src.indexOf('function MessagesPanel')
     const end = src.indexOf('function LogsPanel', start)
@@ -5268,7 +5314,7 @@ async function main () {
   })
 
   await aok('结构红线: 分类筛选按「来源-品类-平台」逐级下钻', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const start = src.indexOf('function buildCateTree')
     const end = src.indexOf('function flatCateLeaves', start)
     assert.ok(start > -1 && end > start, '必须有 buildCateTree')
@@ -5278,7 +5324,7 @@ async function main () {
   })
 
   await aok('结构红线: 所有页都轮询（v3.348 改口径：其它页由统一 tick 重拉自己的数据）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     // 旧口径是「非概览/日志页停止主轮询」，用户实测反馈那几页的「自动刷新 5s」永远停在 5s、
     // 数据也不更新。新口径：定时器不按页停，其它页每拍 +1 交给当前面板重拉。
     assert.ok(!src.includes("if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)"),
@@ -5317,7 +5363,7 @@ async function main () {
   })
 
   await aok('结构红线: 配置页过滤规则/渠道不拼成一条长串', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     assert.ok(src.includes('function FilterRules ('), '必须有 FilterRules 组件（一条规则一行）')
     assert.ok(src.includes('function ChannelList ('), '必须有 ChannelList 组件（渠道 chip）')
     // 切片边界必须是 ConfigPanel 之后真实存在的下一个顶层组件：SysPanel 定义在
@@ -5495,7 +5541,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.307 确认弹窗 / 今日统计 / 时间窗 / 日志级别 / hash 路由', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     assert.ok(src.includes('function ConfirmDialog'), '危险动作必须有确认弹窗')
     assert.ok(src.includes("if (action === 'run' || action === 'notify-test') askConfirm(action)"),
       '正式运行与通知自检必须走确认；试运行/环境检查直接执行')
@@ -5524,7 +5570,7 @@ async function main () {
   })
 
   await aok('弹窗文案: 渠道名必须在弹窗画出来前定稿（打开后不得再改行数）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const from = src.indexOf('const askConfirm = useCallback')
     const openPath = src.slice(from, src.indexOf('const channelText', from))
     // 手机录屏实测：打开确认弹窗时先画「所有已配置渠道（以「配置」页为准）」占 3 行，
@@ -5573,7 +5619,7 @@ async function main () {
   })
 
   await aok('手动触发: 忙碌/错误提示都不许插行顶动布局', () => {
-    const js = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const js = readConsoleSource()
     const start = js.indexOf('function TriggerBar')
     const end = js.indexOf('// ── 组件：运行历史', start)
     assert.ok(start > -1 && end > start, '应能定位 TriggerBar 组件')
@@ -5599,7 +5645,7 @@ async function main () {
   })
 
   await aok('结构红线: 概览先状态与操作，触发历史常驻（空态显示暂无记录）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const start = src.indexOf("${!authExpired && visited.has('overview') && html`<section class=\"page\"")
     const end = src.indexOf("${!authExpired && visited.has('messages')", start)
     assert.ok(start > -1 && end > start, '应能定位概览区块')
@@ -5612,7 +5658,7 @@ async function main () {
   })
 
   await aok('结构红线: 状态卡首帧占位，下拉刷新不再整块闪（v3.329）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const ph = src.match(/const CARD_PLACEHOLDERS = \[([\s\S]*?)\n\]/)
     assert.ok(ph, '必须有 CARD_PLACEHOLDERS 占位卡定义')
     const entries = ph[1].split('\n').filter((l) => l.includes("title: '"))
@@ -5641,7 +5687,7 @@ async function main () {
   })
 
   await aok('结构红线: 后台标签页不轮询（概览/日志/触发详情三处）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
     assert.ok(logs.includes('if (pollMs) {'), '轮询间隔必须由 pollMs 控制')
     assert.ok(logs.includes('usePullRefresh(active'),
@@ -5657,7 +5703,7 @@ async function main () {
   await aok('结构红线: 标签页吸顶、切页回顶、缓存每分钟刷新', () => {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/\.tabs\s*\{[^}]*position:\s*sticky/.test(css), '标签页必须吸顶')
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     assert.ok(!/window\.scrollTo\(0, 0\) \}, \[tab/.test(src), '切页不得无条件强制回顶（长页深处会被整页拽回顶部）')
     const scrollBlock = src.slice(src.indexOf('const scrollMemRef = useRef({})'), src.indexOf('// 标签栏是单行横滚'))
     const switchBlock = src.slice(src.indexOf('const doSwitchTab = '), src.indexOf('const openLog = useCallback'))
@@ -5788,7 +5834,7 @@ async function main () {
   })
 
   await aok('结构红线: 页签保活（切回已访问页签不重挂载、不塌陷、不重新占位）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     // 六个页签都按 visited 保活：第一次进入才挂载，之后只切 hidden。
     for (const key of ['overview', 'messages', 'logs', 'config', 'filter', 'sys']) {
@@ -5880,7 +5926,7 @@ async function main () {
   })
 
   await aok('结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(src.includes('const AUTO_MIN_S = 3') && src.includes('const AUTO_MAX_S = 20'),
       '自动间隔必须夹在 3–20 秒')
@@ -5956,7 +6002,7 @@ async function main () {
   })
 
   await aok('结构红线: 控制台 UX 稳定性（搜索归属 / 弹层聚焦 / 趋势对齐）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const msgSeg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel', src.indexOf('function MessagesPanel')))
     // 旧响应（in-flight 期间用户又改了词）不得把新词回写成旧 queryUsed。
     assert.ok(msgSeg.includes('loadedQueryRef.current !== query'), 'queryUsed 回写必须有响应归属守卫')
@@ -6011,7 +6057,7 @@ async function main () {
   })
 
   await aok('结构红线: MiniSelect（滚动重量 / 视口夹取 / Tab 焦点 / 可访问名 / 回滚目标）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const start = src.indexOf('function MiniSelect (')
     const end = src.indexOf('// 指标卡', start)
     assert.ok(start > -1 && end > start, '必须能定位 MiniSelect')
@@ -6036,7 +6082,7 @@ async function main () {
   })
 
   await aok('结构红线: 回到顶部（固定层 / 触控尺寸 / 可访问名 / 平滑滚动）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const start = src.indexOf('function BackToTop ()')
     const end = src.indexOf('function App () {', start)
     assert.ok(start > -1 && end > start, '必须有 BackToTop 组件（长列表滚到深处没有回顶入口）')
@@ -6099,7 +6145,7 @@ async function main () {
     // 先把 /* */ 注释剥掉：注释里写一个示例块 / 把真块整段注释掉，都不能骗过门禁（Sourcery #286）。
     const css = cssRaw.replace(/\/\*[\s\S]*?\*\//g, '')
     assert.ok(css.length < cssRaw.length, 'CSS 注释剥离必须真的生效（否则本断言恒真）')
-    const js = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const js = readConsoleSource()
     const srv = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
     for (const key of ['material', 'nord', 'light']) {
       const block = (css.match(new RegExp(':root\\[data-theme="' + key + '"\\]\\s*\\{[^}]*\\}')) || [''])[0]
@@ -6150,7 +6196,7 @@ async function main () {
   })
 
   await aok('结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     assert.ok(src.includes('function Hint ('), '必须有 Hint 原语')
     assert.ok(src.includes('function Card ('), '必须有 Card 原语')
     assert.ok(!src.includes('class="hint'), '提示行不得再手写 class="hint"')
@@ -6216,7 +6262,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.328 推送记录高亮（标题 / 正文 / 生效词 / 主题变量）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
     const ph = (name) => '$' + '{' + name + '}'
     const msg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('// 运行日志：'))
@@ -6237,7 +6283,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.317 日志页（顺序 / 行级渲染 / <mark> / 护栏 / 空态出口 / 高度）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
     // 模板占位符拼出来再比对（直接写 ${...} 会触发 no-template-curly-in-string）
     const ph = (name) => '$' + '{' + name + '}'
@@ -6278,7 +6324,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.318 日志跳转先取后切（首帧定稿 / 转圈反馈 / 可取消）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const openAt = src.indexOf('const openLog = useCallback((jump) => {')
     const open = src.slice(openAt, src.indexOf('}, [markVisited])', openAt))
@@ -6320,7 +6366,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.319 日志跳转定位到具体轮次（横幅 / 整行高亮 / 只看这一轮）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
     assert.ok(hist.includes("onOpenLog({ q: r.at.slice(0, 10), mode: 'all', focus: r.at })"),
@@ -6359,7 +6405,7 @@ async function main () {
 
   await aok('结构红线: v3.317 页签（420 断点 / 边缘渐隐 / 当前页签滚入视野）', () => {
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
-    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const src = readConsoleSource()
     const ph = (name) => '$' + '{' + name + '}'
     // C. 362 宽必须命中紧凑规则（旧断点 360 差 1px，实测内容 404 宽、末两格被切/出屏）。
     const media360 = [...css.matchAll(/@media \(max-width: 360px\) \{([\s\S]*?)\n {2}\}/g)].map((m) => m[1]).join('\n')
@@ -6382,7 +6428,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.360 动效层（资产白名单 / 适配层隔离 / reduced-motion 门控）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
     const srv = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
     const motion = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/motion.js'), 'utf8')
@@ -6433,7 +6479,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.326 日期区间（资产白名单 / 中文分隔符 / 双月只在桌面 / 44px）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
     const srv = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
     // 资产：新增两个文件必须进白名单（CSP script-src 'self' 下没有 CDN 兜底，漏一条就整页白屏）
@@ -6496,7 +6542,7 @@ async function main () {
 
   await aok('结构红线: v3.317 表格动作列贴右（两个表 / 不透明底色 / 分隔线）', () => {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.css'), 'utf8')
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.js'), 'utf8')
+    const src = readConsoleSource()
     // D. 362 下「日志」按钮右边缘旧版在 616（屏外 254px）：末列贴右。
     const stickyRule = /\.runs-scroll \.runs-table th:last-child,\s*\.runs-scroll \.runs-table td:last-child\s*\{[^}]*position:\s*sticky;\s*right:\s*0/
     assert.ok(stickyRule.test(css), '两个表的末列都必须 position:sticky; right:0（含 th）')
@@ -6517,7 +6563,7 @@ async function main () {
 
   await aok('结构红线: 逐轮历史列宽固定（切每页不漂移）', () => {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.css'), 'utf8')
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.js'), 'utf8')
+    const src = readConsoleSource()
     const histPanel = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
     assert.ok(histPanel.includes('<colgroup>'), '逐轮历史表必须有 colgroup 固定列宽')
     for (const cls of ['rh-time', 'rh-get', 'rh-dedup', 'rh-filter', 'rh-push', 'rh-fail', 'rh-elapsed', 'rh-action']) {
@@ -6529,7 +6575,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.317 触发结果行（aria-live / 用 runs 结算 / 不位移 / 失败给原因）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.css'), 'utf8')
     // runOutcome / triggerResultLine 是模块级纯函数（定义在 TriggerBar 之前），
     // 所以从「触发结果行」注释起切，别只切组件体。
@@ -6565,7 +6611,7 @@ async function main () {
 
   // ── v3.320 首帧形状与落点（sys 同形占位 / 日志定高 / 校验失败定位 / 分页落点）──────
   await aok('结构红线: v3.320 系统信息首帧同形占位（7 行无条件渲染）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const sys = src.slice(src.indexOf('function SysPanel'), src.indexOf('function FilesPanel'))
     const ref = (name) => '$' + '{' + name // 只取到 `${` 前缀（补上 } 就匹配不到源码里的换行/后续表达式）
     // 旧版整块挂在 `${sys && …}` 后面：冷启动首帧只有面板头 + 提示（223px），数据到达后
@@ -6587,7 +6633,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.320 日志框定高（读取中/空态与日志框同高）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const px = (s, prop) => { const m = new RegExp(prop + ':\\s*(\\d+)px').exec(s); return m ? m[1] : '' }
     // 既有契约（v3.317）照旧逐字成立：max-height 字面量不得改。
@@ -6611,7 +6657,7 @@ async function main () {
 
   // ── v3.321 首屏剩余 pop：系统页 access-log 的 44px、日志页工具条的 153px ──────────
   await aok('结构红线: v3.321 系统页 access-log 无条件占位（+44px 不再由加载引入）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const sys = src.slice(src.indexOf('function SysPanel'), src.indexOf('function FilesPanel'))
     assert.ok(sys.length > 0, '必须能定位 SysPanel')
     // 旧版：${logTail.length > 0 && html`<details class="access-log">…} 与 ${access && …暂无访问记录…}
@@ -6632,7 +6678,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.321 日志页工具条/计数行在加载态就渲染（+153px 不再由加载引入）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
     assert.ok(logs.length > 0, '必须能定位 LogsPanel')
@@ -6654,7 +6700,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.320 过滤规则校验失败定位（只失败且有字段错误时滚到首个错误行）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const fr = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('function App ()'))
     const effects = [...fr.matchAll(/useLayoutEffect\(\(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\)/g)].map((m) => m[0])
     const reveal = effects.find((e) => e.includes('[aria-invalid="true"]'))
@@ -6679,7 +6725,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.320 分页/搜索落点（共用助手 / 只主动路径 / 分页统一 goPage）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     // 助手：读 .tabs 下沿 + 8，目标夹进 document.scrollHeight - innerHeight，面板隐藏时不滚。
     const helperAt = src.indexOf('function listLandTarget')
     assert.ok(helperAt > 0, '必须有一个共用的落点助手（两个面板同一口径）')
@@ -6863,7 +6909,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
 
     // ① 格式化：关掉时只留 时:分:秒；「—」不能被切坏。
@@ -6919,7 +6965,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.341 顶栏时间点按弹出完整时间（前端）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
 
     // ① 组件本身：可点、可键盘、可访问；tip 为空时退化成纯文本（「自动刷新已暂停」不该能点开）。
@@ -6953,7 +6999,7 @@ async function main () {
   })
 
   await aok('结构红线: 屏蔽注册天数用多行输入框', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const daysAt = src.indexOf('def.kind === \'days\'')
     const daysEnd = src.indexOf(': html`<textarea', daysAt)
     const daysBlock = daysAt >= 0 && daysEnd > daysAt ? src.slice(daysAt, daysEnd) : ''
@@ -6963,7 +7009,7 @@ async function main () {
   })
 
   await aok('结构红线: 数字框锁定，长按加减连续调整', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
     const cfgStart = src.indexOf('function ConsoleSettingsBlock')
@@ -6986,7 +7032,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.340 配置页可改通知自检拦截窗（前端）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     // ① API 层：两条读/写端点都用纯字面量 URL（Codacy SSRF 启发式的唯一全绿形态）。
     assert.ok(src.includes('function apiGetConsoleSettings ()'), '缺少设置读面 apiGetConsoleSettings')
     assert.ok(src.includes('function apiPostConsoleSettings (body)'), '缺少设置写面 apiPostConsoleSettings')
@@ -7044,7 +7090,7 @@ async function main () {
   })
 
   await aok('结构红线: 过滤草稿自动保存/恢复（关标签/杀后台也能捡回来）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     assert.ok(src.includes("const FILTER_DRAFT_KEY = 'xbk_filter_draft_v1'"), '必须在 localStorage 存一份过滤草稿')
     assert.ok(src.includes('FILTER_DRAFT_SAVE_DELAY = 500'), '草稿不能等 5 分钟才存，否则杀后台会丢最后几分钟')
     assert.ok(src.includes('FILTER_DRAFT_SERVER_DELAY = 1500'), '服务器草稿必须比本机慢一点，避免每敲一键就写盘')
@@ -7067,7 +7113,7 @@ async function main () {
   })
 
   await aok('结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     assert.ok(src.includes('function LeaveGuardDialog'), '必须有“取消/不保存/保存并继续”三选一弹窗')
     assert.ok(src.includes('点「不保存并离开」会丢掉这些修改'), '弹窗必须说清楚只有丢弃按钮才会丢修改，不能把自动草稿说成必丢')
     assert.ok(!src.includes('现在离开，这些修改会丢'), '有自动草稿时不得再写“现在离开就会丢”')
@@ -7100,7 +7146,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     // 只看真正的规则：注释里提到 overscroll-behavior-y 不算（否则删了声明测试照样绿）。
     const cssLive = css.replace(/\/\*[\s\S]*?\*\//g, '')
@@ -7211,7 +7257,7 @@ async function main () {
 
   // ── v3.332 部署后旧标签页提示 ─────────────────────────────────────────
   await aok('结构红线: v3.332 新版本提示（boot 版本 / 60s 对账 / 只提示不自动刷新）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
     const server = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
     // 版本只有一份来源：boot JSON 与 /api/sys 共用 APP_VERSION，别再各自 require package.json。
@@ -7269,7 +7315,7 @@ async function main () {
   })
 
   await aok('结构红线: v3.326 逐轮历史切档不闪（两档快照预取 / 无快照等数据回来再换）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
     assert.ok(hist.includes('snapsRef = useRef({ runs: null, all: null })'), '必须留 runs/all 两份服务端快照')
@@ -7314,7 +7360,7 @@ async function main () {
   })
 
   await aok('结构红线: 运行日志有可拖快滚条（一长条）', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const ph = (name) => '$' + '{' + name + '}'
     const at = src.indexOf('function LogsPanel')
@@ -7535,7 +7581,7 @@ async function main () {
     }
   })
   await aok('结构红线: v3.363 数据面（条件请求 / SSE 续传 / 首屏快照）', async () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    const src = readConsoleSource()
     assert.ok(src.includes('res.status === 304'), 'consumeJson 必须处理 304（复用条件缓存）')
     // 断言真实调用点，而不是「文件里出现过某个字符串」——删掉接入也能过就失去意义（Sourcery PR #321）。
     assert.ok(src.includes('addConditional(merged, \'runs\')'), '/api/runs 必须接入条件请求')

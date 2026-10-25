@@ -7442,3 +7442,5 @@ function App () {
 }
 
 render(html`<${App} />`, document.getElementById('app'))
+// v3.364：告诉 boot-guard 已经正常挂载（它 5s 没收到这个信号就显示加载失败提示）。
+window.__XBK_BOOTED = true

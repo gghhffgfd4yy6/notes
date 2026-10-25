@@ -1558,3 +1558,10 @@ span.flatpickr-weekday { color: color-mix(in srgb, var(--text) 80%, transparent)
   }
   .flatpickr-months .flatpickr-month { height: 44px; }
 }
+
+/* v3.364 加载失败兜底（boot-guard.js）：模块图崩掉时页面里唯一能看见的内容。
+   只用主题 token，深浅色都跟着走；不依赖任何 JS 生成的结构。 */
+.boot-fail { max-width: 34rem; margin: 18vh auto 0; padding: 0 1.25rem; font-family: inherit; color: var(--text); }
+.boot-fail-title { margin: 0 0 10px; font-size: 18px; font-weight: 600; }
+.boot-fail-hint { margin: 0 0 12px; line-height: 1.65; color: var(--text-dim); }
+.boot-fail-code { margin: 0; font-size: 12px; color: var(--text-dim); opacity: .7; }

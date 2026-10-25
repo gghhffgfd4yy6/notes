@@ -904,3 +904,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **SSE 断点续传（⑥）**：数据帧带 `id: <绝对偏移>`，浏览器断线重连自动回传 `Last-Event-ID`，服务端据此只补缺口；游标只认十进制数字串（`1e3`/`0x10` 按非法处理），不可用时回 `event: reset` 整段替换（避免客户端追加重复）。前端 `onerror` 不再立刻关流，先让原生重连 3 次，仍失败才 close + 回退轮询。
 - **首屏快照（⑦）**：最近一次成功的 `status`/`runs` 存 `localStorage`（实例 id + 版本守卫、最多 12 条历史、多标签页不让旧响应覆盖新快照），冷启动/弱网先渲染旧快照再被真实轮询覆盖；不含 token，隐私模式/超限静默降级。
 - 测试：`test_console.js` 新增 ETag/304（含内容变化必换 tag）、Last-Event-ID 续传（含帧 id）、非法游标 reset（含 `1e3`）与数据面结构红线，共 250/0。
+
+## v3.364 — 前端拆分地基：源码聚合器 + 加载失败兜底
+
+- **测试侧聚合器（P0，零运行时改动）**：`test_console.js` 新增 `CONSOLE_MODULE_FILES` / `readConsoleSource()`，把 58 处直接读 `app.js` 的位置改成读「按序拼接的并集」——后续拆分时 653 条源码文本断言与 117 处 `indexOf` 定位不必逐条改锚点，并集 = 当前单文件，改动前后同为 250/0。
+- **资产闭包红线**：新增用例遍历 `console-assets/*.{js,mjs}` 的 import，断言每个 specifier 都在 `STATIC_ASSETS` 里（漏登记 = 404 → 模块图 instantiate 失败 → 整页白屏，而原测试全绿）；同时禁止自家模块使用动态 `import()`。
+- **`STATIC_ASSETS` 导出**：版本号哈希断言不再硬编码 8 个文件名，改为按 `STATIC_ASSETS` 插入顺序派生，新增分片自动跟随。
+- **加载失败兜底 `boot-guard.js`**：普通脚本、零 import、排在入口 module 之前；资源 404/401、未捕获 rejection、5s 未 boot 三种情况都显示「页面没加载出来 + 刷新提示」，不再是一片白。`app.js` 挂载后置 `window.__XBK_BOOTED`。
+- mutation 行段随 console.js 5448 行同步（末段 4801-5448）。

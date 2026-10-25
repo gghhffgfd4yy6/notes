@@ -631,6 +631,9 @@ const ASSETS_DIR = path.join(__dirname, 'console-assets')
 const STATIC_ASSETS = Object.freeze({
   '/assets/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
   '/assets/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+  // v3.364：加载失败兜底。必须是普通（非 module）脚本且不 import 任何东西——它要在
+  // 模块图已经崩掉之后还能跑；CSP script-src 'self' 禁止内联，所以只能外链。
+  '/assets/boot-guard.js': { file: 'boot-guard.js', type: 'text/javascript; charset=utf-8' },
   '/assets/pure.mjs': { file: 'pure.mjs', type: 'text/javascript; charset=utf-8' },
   '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' },
   // v3.326 日期区间：flatpickr 4.6.13 的 ESM 单文件 bundle（esbuild 打包，含 zh 语言包）
@@ -945,6 +948,7 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
 </section>
 </noscript></div>
 <script type="application/json" id="xbk-boot">${bootJson}</script>
+<script src="/assets/boot-guard.js${assetQuery()}"></script>
 <script type="module" src="/assets/app.js${assetQuery()}"></script>
 </body></html>`
 }
@@ -5329,6 +5333,7 @@ if (require.main === module) main()
 module.exports = {
   createConsole,
   consoleStateDir,
+  STATIC_ASSETS,
   finishRun,
   renderUnauthorizedPage,
   isValidToken,
