@@ -947,3 +947,12 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 顺带补上 PR #324 评审承诺：资产闭包断言增加「route 必须等于 `/assets/` + 文件名」（例外只有 `flatpickr.js → flatpickr.module.js`），防「映射写反也能过」；套件用例数不变。
 - 验证：`test_console.js` 252/0、`standard` exit 0、`check-mutation-ranges` exit 0、真浏览器冒烟六页正常。
 - 版本 3.368.0。
+
+## v3.369 — 前端拆分第五刀：页面面板
+
+- 新增 `pages.js`（4403 行）：`ui.js` 里的页面面板全部迁出——运行历史 / 逐轮历史 / 趋势 / 缓存健康 / 推送记录 / 运行日志 / 控制台设置 / 备份 / 两步验证 / 系统 / 文件 / 配置 / 过滤规则，连带它们共用的加载器、下拉刷新、消息筛选等 helper。正文 4371 行与原 `ui.js` **逐行一致**。
+- `ui.js` 5559 → 1160 行：只剩外壳——`App`、主题切换、首屏快照、回到顶部。
+- 依赖方向仍单向：`ui.js` → `pages.js` → `components.js` → 基础模块；`pages.js` 不认识 `App`，切点用 eslint-scope 验过「前段对后段零回引」。
+- 配套：`STATIC_ASSETS` 登记 `/assets/pages.js`；`CONSOLE_MODULE_FILES` 在 `components.js` 与 `ui.js` 之间插入 `pages.js`（正文顺序与拆前一致）；`console.js` 5456 → 5458，mutation 末段与注释同步（三处）；README 模块清单更新。
+- 验证：`test_console.js` 252/0、`standard` exit 0、`check-mutation-ranges` exit 0、真浏览器冒烟六页正常。
+- 版本 3.369.0。

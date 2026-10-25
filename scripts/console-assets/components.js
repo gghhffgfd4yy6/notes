@@ -1,7 +1,7 @@
 // scripts/console-assets/components.js —— 控制台公用零件（v3.368 从 ui.js 拆出）。
 // 状态徽章 / 提示 / 折叠 / 面板头 / 骨架 / 按钮 / 下拉 / 日期区间 / 卡片 / 状态卡 / 触发条 / 二次确认弹窗。
 // 只依赖 htm-preact、pure.mjs、format.js、constants.js、api.js 与 flatpickr；不认识任何页面，也没有顶层副作用。
-// 页面层在 ui.js（顺序：本文件在前），文本断言按 CONSOLE_MODULE_FILES 聚合读源码。
+// 页面面板在 pages.js、外壳在 ui.js（顺序：本文件 → pages.js → ui.js），文本断言按 CONSOLE_MODULE_FILES 聚合读源码。
 import { html, useCallback, useEffect, useLayoutEffect, useRef, useState } from './htm-preact.module.js'
 import { ageFromStamp, dateRangeLabel, relDay } from './pure.mjs'
 import flatpickr from './flatpickr.js'
