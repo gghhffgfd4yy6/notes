@@ -944,12 +944,14 @@ function sseCollect (port, urlPath, { headers } = {}) {
         raw = raw.slice(idx + 2)
         if (frame.startsWith(':')) continue // 心跳注释帧
         let event = 'message'
+        let id = null
         const datas = []
         for (const line of frame.split('\n')) {
           if (line.startsWith('event:')) event = line.slice(6).trim()
+          else if (line.startsWith('id:')) id = line.slice(3).trim()
           else if (line.startsWith('data:')) datas.push(line.slice(5).trim())
         }
-        events.push({ event, data: datas.join('\n') })
+        events.push({ event, id, data: datas.join('\n') })
       }
     })
     res.on('end', () => { ended = true })
@@ -2318,6 +2320,31 @@ async function main () {
     for (const key of ['generatedAt', 'report', 'channels', 'run', 'diagnostics']) {
       assert.ok(Object.prototype.hasOwnProperty.call(data, key), `缺 ${key}`)
     }
+    server.close()
+  })
+  await aok('HTTP: 只读快照端点 ETag/304（命中回空体、不匹配照常 200、不退化成可缓存）', async () => {
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const first = await request(port, 'GET', '/api/runs', { token: TOKEN })
+    assert.strictEqual(first.status, 200)
+    const tag = first.headers.etag
+    assert.ok(typeof tag === 'string' && tag.length >= 2, '必须下发 ETag')
+    assert.strictEqual(first.headers['cache-control'], 'no-store', '条件请求也不得允许缓存存储（no-store，no-cache 仍允许存）')
+    const hit = await request(port, 'GET', '/api/runs', { token: TOKEN, headers: { 'if-none-match': tag } })
+    assert.strictEqual(hit.status, 304, 'If-None-Match 命中必须 304')
+    assert.strictEqual(hit.text, '', '304 不得带 body')
+    const miss = await request(port, 'GET', '/api/runs', { token: TOKEN, headers: { 'if-none-match': '"nope"' } })
+    assert.strictEqual(miss.status, 200, 'ETag 不匹配照常 200 全量')
+    assert.strictEqual(Array.isArray(JSON.parse(miss.text).runs), true, '200 分支仍是完整 JSON')
+    // 内容真变了必须换 tag（否则客户端会永远吃 304 的旧数据）：Sourcery PR #321。
+    runs.set('1750000000001.1', { id: '1750000000001.1', action: 'check', startedAt: 1750000000001, finishedAt: null })
+    const changed = await request(port, 'GET', '/api/runs', { token: TOKEN, headers: { 'if-none-match': tag } })
+    assert.strictEqual(changed.status, 200, '数据变了必须忽略旧 If-None-Match')
+    assert.notStrictEqual(changed.headers.etag, tag, '内容变化必须换 ETag')
+    assert.strictEqual(JSON.parse(changed.text).runs.length, 1, '变化后 200 带新内容')
+    // /api/status 每次请求都生成新时间戳/锁龄：不得发 ETag（发了也永远不命中）。
+    const volatile = await request(port, 'GET', '/api/status', { token: TOKEN })
+    assert.strictEqual(volatile.headers.etag, undefined, '/api/status 不得下发 ETag（响应本身是易变的）')
     server.close()
   })
   await aok('HTTP: POST /trigger 非法 action → 400', async () => {
@@ -3781,6 +3808,49 @@ async function main () {
     assert.strictEqual(frames.length, 1, '恰一帧')
     assert.strictEqual(JSON.parse(frames[0].data), '文🐮')
     sse.close()
+    server.close()
+  })
+  await aok('SSE L1 Last-Event-ID 续传：header 优先于 since，只补缺口不重发', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, 'ABCDEF')
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=0', {
+      headers: { authorization: `Bearer ${TOKEN}`, 'last-event-id': '4' }
+    })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, '续传帧到达')
+    const frames = sse.events.filter((e) => e.event === 'message')
+    assert.strictEqual(frames.length, 1, '只补缺口：恰一帧')
+    assert.strictEqual(JSON.parse(frames[0].data), 'EF', '从 Last-Event-ID=4 续传')
+    assert.strictEqual(frames[0].id, '6', '数据帧必须带绝对游标 id（浏览器据此回传 Last-Event-ID）')
+    assert.strictEqual(sse.events.some((e) => e.event === 'reset'), false, '游标可用时不得整段重发')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE L2 非法 Last-Event-ID：回落整段并标 reset（客户端替换而非追加）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, '整段输出')
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9', {
+      headers: { authorization: `Bearer ${TOKEN}`, 'last-event-id': 'not-a-number' }
+    })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'reset'), true, '非法游标必须以 reset 整段重发')
+    const reset = sse.events.find((e) => e.event === 'reset')
+    assert.strictEqual(JSON.parse(reset.data).full, '整段输出')
+    assert.strictEqual(sse.events.some((e) => e.event === 'message'), false, 'reset 已覆盖全量，不得再追加 data 帧')
+    sse.close()
+    // 科学计数法不是十进制游标：Number('1e3')=1000 会被静默钳到尾部 → 一帧不发（丢输出）。
+    // 必须按形态拒绝并走 reset（Sourcery PR #321）。
+    const sseSci = sseCollect(port, '/api/runs/stream?id=1750000000000.9', {
+      headers: { authorization: `Bearer ${TOKEN}`, 'last-event-id': '1e3' }
+    })
+    assert.strictEqual(await sseSci.waitFor((e) => e.event === 'reset'), true, '1e3/0x10 一类非十进制游标必须 reset 而非静默钳位')
+    sseSci.close()
     server.close()
   })
   await aok('SSE M3 超前 since 钳制：since=99999 → 钳到尾部，追加照常收增量（不吞输出）', async () => {
@@ -7149,8 +7219,8 @@ async function main () {
     // ⇒ 这些「源码串」红线只在原始源文件上有意义，插桩环境必须跳过（行为断言照跑）。
     if (process.env.XBK_MUTATION_CHILD !== '1') {
       assert.ok(server.includes('const APP_VERSION = (() => {'), '版本必须抽成单一 APP_VERSION')
-      assert.ok(server.includes('JSON.stringify({ token: bootToken, version: APP_VERSION })'),
-        'boot JSON 必须注入版本（前端据此判断自己是不是旧页面）')
+      assert.ok(server.includes('JSON.stringify({ token: bootToken, version: APP_VERSION, instance: instanceId })'),
+        'boot JSON 必须注入版本（前端据此判断自己是不是旧页面）与实例 id（快照命名空间）')
       assert.ok(server.includes('const version = APP_VERSION'), '/api/sys 必须复用同一版本来源')
       // 探针不能被缓存、不能挤掉访问日志，异常请求照记。
       assert.ok(server.includes("res.setHeader('Cache-Control', 'no-store')"), '/api/sys 必须显式 no-store')
@@ -7463,6 +7533,30 @@ async function main () {
       await new Promise((resolve) => server.close(resolve))
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+  await aok('结构红线: v3.363 数据面（条件请求 / SSE 续传 / 首屏快照）', async () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    assert.ok(src.includes('res.status === 304'), 'consumeJson 必须处理 304（复用条件缓存）')
+    // 断言真实调用点，而不是「文件里出现过某个字符串」——删掉接入也能过就失去意义（Sourcery PR #321）。
+    assert.ok(src.includes('addConditional(merged, \'runs\')'), '/api/runs 必须接入条件请求')
+    assert.ok(src.includes('addConditional(merged, \'auto\')'), '/api/auto 必须接入条件请求')
+    assert.ok(src.includes('addConditional(merged, condKey)'), '/api/messages 必须接入条件请求')
+    assert.ok(!/addConditional\(merged, 'status'\)/.test(src), '/api/status 不得走条件请求（generatedAt/锁龄每拍在变）')
+    assert.ok(src.includes('COND_CACHE_MAX = 8') && src.includes('rememberConditional('), '条件缓存必须有界（messages 键含筛选/分页，无上限会无限增长）')
+    // fetch 在调用时快照 headers：messages 的 addConditional 必须排在 fetch 之前。
+    const msgFn = src.slice(src.indexOf('function apiGetMessages'), src.indexOf('function apiGetTrends'))
+    assert.ok(msgFn.indexOf('addConditional(merged, condKey)') < msgFn.indexOf('fetch('), 'messages 必须先注入 If-None-Match 再 fetch')
+    assert.ok(src.includes('streamErrors <= 3'), 'SSE onerror 必须先让原生 EventSource 有限次重连（带 Last-Event-ID 续传）')
+    const snapStart = src.indexOf('const SNAP_KEY')
+    const snapEnd = src.indexOf('const THEMES = [')
+    assert.ok(snapStart >= 0 && snapEnd > snapStart, '首屏快照块必须在主题块之前（主题红线只允许服务端首帧渲染）')
+    const snapBlock = src.slice(snapStart, snapEnd)
+    assert.ok(snapBlock.includes('BOOT.instance'), '快照命名空间必须带实例 id（换实例不串旧数据）')
+    assert.ok(src.includes("instance: typeof data.instance === 'string'"), 'readBoot 必须解析 instance（否则命名空间永远回落 default）')
+    assert.ok(snapBlock.includes('v.v !== BOOT.version'), '快照必须有版本守卫（旧结构不渲染）')
+    assert.ok(snapBlock.includes('runs.slice(0, 12)'), '快照最多存 12 条历史（localStorage 有 5MB 上限）')
+    assert.ok(snapBlock.includes('prev.at > startedAt'), '多标签页：旧响应不得覆盖更新快照')
+    assert.ok(!snapBlock.includes('BOOT.token'), '快照不得包含 token')
   })
 }
 

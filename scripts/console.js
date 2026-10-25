@@ -2,7 +2,7 @@
 // xbk-push 网页控制台（v3.298）：只读看板 + 手动触发。
 //
 // 设计约束（与仓库契约对齐，勿破坏）：
-//   · 只依赖 node 内置模块 + scripts/status.js + 零传递依赖的 qrcode-generator（青龙 --omit=dev 环境可用）；
+//   · 只依赖 node 内置模块 + scripts/status.js + 零传递依赖的 qrcode-generator 与 etag（青龙 --omit=dev 环境可用）；
 //   · 状态展示与 --status 完全同源（readStatus/formatStatus），不另造解析口径；
 //   · 手动触发用 spawnSync 拉起 qinglong/xbk_push.js 子进程（--dry-run / 单轮 / --check），
 //     与命令行入口共享同一套门禁（ensureDependencies / nodeVersionWarning），不内嵌业务逻辑；
@@ -22,6 +22,9 @@ const zlib = require('node:zlib')
 const { spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
 const qrcode = require('qrcode-generator')
+// v3.363：只读快照端点的条件请求（ETag/304）。零传递依赖（etag 自身无依赖），
+// 与「青龙 --omit=dev 只装 dependencies」的部署约束兼容。
+const etag = require('etag')
 const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory } = require('./status')
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
@@ -899,7 +902,7 @@ function shouldLogAccess (method, pathname, statusCode) {
   return true
 }
 
-function renderPage (state, runsList, query, sessionToken, theme) {
+function renderPage (state, runsList, query, sessionToken, theme, instanceId = '') {
   const statusText = formatStatus(state)
   const statusLines = statusText.split('\n').map(escapeHtml)
   // 浏览器流（Sourcery High）：fetch/ESM 也带不了页内凭证之外的上下文，token 经
@@ -919,7 +922,10 @@ function renderPage (state, runsList, query, sessionToken, theme) {
   // escapeHtml 的 &quot; 会原样留在 JSON 里被前端 parse 成错误 token（Sourcery vwK）。
   // 只需防 </script> 逃逸与注释/CDATA 攻击：把 < 和控制字符转成 \uXXXX JSON 转义
   // （JSON.parse 会还原成原字符；/ 也转义防 </script> 序列被拼出）。
-  const bootJson = JSON.stringify({ token: bootToken, version: APP_VERSION })
+  // instance：本实例（按 stateDir 派生）的稳定短 id，随 boot 下发。前端用它给「首屏快照」
+  // 做命名空间——同一浏览器 origin 先后服务过不同实例时，旧快照不会串到新实例页面上。
+  // 只是 stateDir 的截断哈希（8 hex），不含 token，也不可反推路径。
+  const bootJson = JSON.stringify({ token: bootToken, version: APP_VERSION, instance: instanceId })
     .replace(/</g, '\\u003c')
     .replace(/>/g, '\\u003e')
     .replace(/\u2028/g, '\\u2028')
@@ -1350,6 +1356,26 @@ function sendJson (res, code, obj) {
   res.end(body)
 }
 
+// 只读快照端点的条件 GET（v3.363）：同一份 body 发 ETag，客户端带 If-None-Match
+// 命中时回 304 空体。**Cache-Control 用 no-store**：即便客户端自己发条件请求，也不允许
+// 浏览器/中间代理把带鉴权的响应体留在任何 HTTP 缓存里（no-cache 只是「每次复用前先问」，
+// 仍然允许存储——Sourcery PR #321）。条件缓存由前端自己的内存 Map 承担。
+// 与静态资产的强缓存（`immutable`）是两套语义，别合并。
+// **不用于 /api/status**：它的 generatedAt / lock.ageMs / stats 每次请求都在变，
+// 给它发 ETag 只会永远不命中（且 304 会把「现在几点」冻住）——按语义就不该缓存。
+function sendJsonConditional (req, res, obj) {
+  const body = JSON.stringify(obj)
+  const tag = etag(body)
+  const headers = { ETag: tag, 'Cache-Control': 'no-store' }
+  if (etagMatches(req.headers['if-none-match'], tag)) {
+    res.writeHead(304, headers)
+    res.end()
+    return
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...headers })
+  res.end(body)
+}
+
 // 页面类响应（登录/挑战页与 SPA 壳）的统一安全头：Referrer-Policy 只在这里写一次。
 // 同一条头被两处 setHeader 各写一遍时，响应里会出现两个同名字段（浏览器 devtools 显示两行）；
 // 浏览器语义上取最后一条、功能不变，但重复头属协议噪音，也让「这条头由谁设的」不可判定。
@@ -1386,6 +1412,15 @@ function ssePlanChunk (cursor, output, outputTotalLength) {
   if (cursor < lost) return { reset: true, text: output, cursor: outputTotalLength }
   if (cursor < outputTotalLength) return { reset: false, text: output.slice(cursor - lost), cursor: outputTotalLength }
   return null
+}
+
+// SSE 游标解析（v3.363）：只认十进制数字串。`Number('1e3')`=1000、`Number('0x10')`=16
+// 会被静默当成合法偏移（Sourcery PR #321），先按形态挡掉，再判安全整数。
+const SSE_CURSOR_RE = /^\d{1,16}$/
+function parseSseCursor (raw) {
+  if (typeof raw !== 'string' || !SSE_CURSOR_RE.test(raw)) return null
+  const n = Number(raw)
+  return Number.isSafeInteger(n) && n >= 0 ? n : null
 }
 
 // 超限后的排空上限（D2-S2）：客户端若只发一半就挂住，不能让连接无限期占着事件循环。
@@ -2386,6 +2421,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   if (!isValidToken(token)) {
     throw new Error(`XBK_CONSOLE_TOKEN 未设置、短于 ${TOKEN_MIN_LEN} 字符，或含浏览器无法传输的字符（仅允许可见 ASCII，禁 ; , " \\ 与空白），控制台拒绝启动（fail-closed）`)
   }
+  // 实例短 id（stateDir 派生）：只用于前端「首屏快照」的 localStorage 命名空间。
+  // 不含 token、不可反推路径；同一目录换 token 仍沿用同一命名空间（数据本就同源）。
+  const instanceId = crypto.createHash('sha256').update(String(stateDir)).digest('hex').slice(0, 8)
   fs.mkdirSync(stateDir, { recursive: true })
   // 两步验证状态：文件缺失 = 未开启；文件损坏/非法 → 构造时抛错，服务拒启（fail-closed）。
   const twoFactor = loadTwoFactorState(stateDir)
@@ -2802,11 +2840,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     const plan = ssePlanChunk(conn.cursor, record.output, record.outputTotalLength)
     if (plan) {
+      // 重连但游标不可用：即使有增量也必须发整段替换（reset），否则客户端会追加重复。
+      const asReset = plan.reset || conn.forceReset === true
+      conn.forceReset = false
       // 帧格式：data 单行（JSON.stringify 转义换行/引号，多字节经转义无损传输）；
       // named event reset/done 前端必须 addEventListener（onmessage 不收 named——蓝图红线）。
-      const frame = plan.reset
-        ? `event: reset\ndata: ${JSON.stringify({ full: plan.text })}\n\n`
-        : `data: ${JSON.stringify(plan.text)}\n\n`
+      // id = 绝对偏移，浏览器断线重连时原样回传（Last-Event-ID），服务端据此只补缺口。
+      const frame = asReset
+        ? `id: ${plan.cursor}\nevent: reset\ndata: ${JSON.stringify({ full: plan.text })}\n\n`
+        : `id: ${plan.cursor}\ndata: ${JSON.stringify(plan.text)}\n\n`
       sseWriteFrame(conn, frame)
       conn.cursor = plan.cursor
     } else if (record.closedAt && !conn.paused) {
@@ -4227,7 +4269,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
       // 使用的凭证（authorize 已通过的 token 值）交给 renderPage 注入 boot，会话用户
       // 无需再拼 ?token= 即可触发。
-      res.end(renderPage(state, runsList, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie)))
+      res.end(renderPage(state, runsList, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie), instanceId))
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/status') {
@@ -4384,7 +4426,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         price: typeof m.price === 'number' ? m.price : null,
         url: typeof m.url === 'string' ? m.url : ''
       }))
-      sendJson(res, 200, {
+      sendJsonConditional(req, res, {
         status: 'ok',
         total,
         page,
@@ -4769,7 +4811,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     // 服务器端自动正式运行：状态/开关/间隔。GET 走全局鉴权；POST 只认 Bearer（写面防 CSRF）。
     if (req.method === 'GET' && url.pathname === '/api/auto') {
-      sendJson(res, 200, { auto: autoSnapshot(), min: AUTO_MIN_S, max: AUTO_MAX_S, maxFails: AUTO_MAX_FAILS })
+      sendJsonConditional(req, res, { auto: autoSnapshot(), min: AUTO_MIN_S, max: AUTO_MAX_S, maxFails: AUTO_MAX_FAILS })
       return
     }
     if (req.method === 'POST' && url.pathname === '/api/auto') {
@@ -4950,7 +4992,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         timedOut: r.timedOut,
         cancelled: r.cancelled === true
       }))
-      sendJson(res, 200, { runs: list })
+      sendJsonConditional(req, res, { runs: list })
       return
     }
     // GET /api/runs/stream（v3.300 批次③ 3.1）：运行中任务输出的 SSE 实时流。
@@ -4973,9 +5015,16 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // ssePlanChunk 恒 null，后续真实输出被吞到游标追上为止——客户端错过内容。
       // 缺省 = 从当前快照尾部开始（绝对偏移 = outputTotalLength，增量只发新数据）。
       let cursor
-      if (url.searchParams.has('since')) {
-        const n = Number(url.searchParams.get('since'))
-        cursor = Number.isSafeInteger(n) && n >= 0 ? Math.min(n, record.outputTotalLength) : 0
+      // Last-Event-ID 优先（v3.363）：EventSource 断线重连会自动带上「最后收到的 id」，
+      // 服务端据此只补缺口；since 只在首次建连/手工探测时使用。两者共用同一套钳制。
+      const lastEventId = req.headers['last-event-id']
+      const resumedByHeader = typeof lastEventId === 'string' && lastEventId.length > 0
+      if (resumedByHeader) {
+        const n = parseSseCursor(lastEventId)
+        cursor = n === null ? 0 : Math.min(n, record.outputTotalLength)
+      } else if (url.searchParams.has('since')) {
+        const n = parseSseCursor(url.searchParams.get('since'))
+        cursor = n === null ? 0 : Math.min(n, record.outputTotalLength)
       } else {
         cursor = record.outputTotalLength
       }
@@ -4990,6 +5039,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         id,
         res,
         cursor, // 绝对偏移（UTF-16 code units），与 ssePlanChunk 同单位
+        // 重连但游标不可用（非法/0）：客户端手里已有旧内容，只能整段替换——否则会追加重复。
+        forceReset: resumedByHeader && cursor === 0,
         pending: '', // 背压期间的应用层待发帧串（有序）
         pendingBytes: 0, // 待发积压（UTF-8 字节），超 ssePendingLimit 硬断
         paused: false,

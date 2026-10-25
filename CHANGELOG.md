@@ -897,3 +897,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 日报新增 `真挂死` / `上限触发` / `超时上限` 三列：段 job 的 fail-closed 守卫在剥离 statusReason 之前落盘 `timeout-stats.json`，把 Timeout 分成「无 reason 的真挂死」与「tap-runner 的 `Hit limit reached` 上限触发」；缺失或与报告对不上显示 `—`，不得读作 0。分数口径不变（Timeout 仍计入 detected）。
 - 测试：`test_mutation_report.js` 94/94、`test_mutation_json.js` 24 项、`test_mutation_report_cli.js`、`test_mutation_ranges.js` 通过；`test_ci_skip_suites.js` 新增矩阵/run 行门禁（该套件本机的既有环境性失败与本次改动无关）；控制台套件 241/0。
 - 触发面收窄：`mutation.yml` 的 `push` 限定 `branches: [main]`，并明确不接 `pull_request`——PR 分支照常跑 test.yml 的完整门禁（单元/控制台套件 + 静态校验），但不再有机会把 28 段变异挂到评审分支上；`workflow_dispatch` 保留，用于改动 workflow 本身时的合并前预验证。README 与 SYSTEM_CONTRACT 同步写明触发面。
+
+## v3.363 — 控制台条件请求 / 断点续传 / 首屏快照
+
+- **ETag/304（①）**：`/api/runs`、`/api/messages`、`/api/auto` 三个只读快照端点发 `ETag`（`etag` 包，零传递依赖），前端带 `If-None-Match`，内容未变时拿 304 空体并复用上一份数据。`Cache-Control` 用 `no-store`（连存储都不允许；`no-cache` 仍是「可存、复用前先问」，带鉴权的响应不该留在任何缓存里）——条件缓存只在前端内存里。`/api/status` 明确不发 ETag：`generatedAt` / `lock.ageMs` 每拍都在变，发了永远不命中。
+- **SSE 断点续传（⑥）**：数据帧带 `id: <绝对偏移>`，浏览器断线重连自动回传 `Last-Event-ID`，服务端据此只补缺口；游标只认十进制数字串（`1e3`/`0x10` 按非法处理），不可用时回 `event: reset` 整段替换（避免客户端追加重复）。前端 `onerror` 不再立刻关流，先让原生重连 3 次，仍失败才 close + 回退轮询。
+- **首屏快照（⑦）**：最近一次成功的 `status`/`runs` 存 `localStorage`（实例 id + 版本守卫、最多 12 条历史、多标签页不让旧响应覆盖新快照），冷启动/弱网先渲染旧快照再被真实轮询覆盖；不含 token，隐私模式/超限静默降级。
+- 测试：`test_console.js` 新增 ETag/304（含内容变化必换 tag）、Last-Event-ID 续传（含帧 id）、非法游标 reset（含 `1e3`）与数据面结构红线，共 250/0。
