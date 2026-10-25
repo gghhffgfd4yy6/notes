@@ -6342,7 +6342,7 @@ function BackToTop () {
 // （旧结构渲染会崩，宁可退回骨架屏）。
 // 与主题区分：主题必须服务端首帧渲染（否则闪色），数据快照允许首帧先用旧值——这是
 // 「旧数字」而不是「错误主题」，且卡片上本来就标着「数据截至」时间。
-const SNAP_KEY = `xbk-console:snapshot:v1:${(BOOT && BOOT.instance) || 'default'}`
+const SNAP_KEY = `xbk-console:snapshot:v1:${BOOT.instance || 'default'}`
 function readSnapshot () {
   try {
     const raw = window.localStorage.getItem(SNAP_KEY)
