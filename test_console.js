@@ -2830,7 +2830,8 @@ async function main () {
     assert.strictEqual(hrefs.length, closure.length,
       `预加载条数必须等于 import 闭包大小（闭包 ${closure.length}，实际 ${hrefs.length}）`)
     assert.strictEqual(new Set(hrefs).size, hrefs.length, '同一模块不得重复预加载')
-    assert.deepStrictEqual([...hrefs].sort(), [...closure].sort(), '预加载清单必须与 app.js 的 import 闭包逐字一致')
+    const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0) // 显式比较函数（Sonar S2871）
+    assert.deepStrictEqual([...hrefs].sort(byCodeUnit), [...closure].sort(byCodeUnit), '预加载清单必须与 app.js 的 import 闭包逐字一致')
     for (const href of hrefs) {
       assert.ok(Object.prototype.hasOwnProperty.call(STATIC_ASSETS, href), `${href} 必须是 STATIC_ASSETS 的 key（否则 404）`)
       assert.ok(!href.includes('?') && !href.includes('#') && !href.includes('token'),

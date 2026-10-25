@@ -1446,7 +1446,9 @@ function conditionalVariant (req) {
   if (qAt < 0) return raw
   const params = raw.slice(qAt + 1).split('&')
     .filter((part) => part !== '' && part !== 'token' && !part.startsWith('token='))
-  params.sort()
+  // 显式按码点比较：默认 sort() 会先转字符串再按 UTF-16 码元排，语义虽相同，但 Sonar
+  // S2871 要求给出比较函数；同时避免依赖实现默认行为。
+  params.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
   // 参数全被滤掉（只有 ?token=）时必须回落到「无查询串」形态，否则 '/api/config?token=x'
   // 会算出 '/api/config?'，与裸 URL 的 tag 分裂成两份。
   return raw.slice(0, qAt) + (params.length > 0 ? '?' + params.join('&') : '')
