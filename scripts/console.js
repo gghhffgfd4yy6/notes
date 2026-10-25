@@ -634,6 +634,8 @@ const STATIC_ASSETS = Object.freeze({
   // v3.365：拆出去的前端模块——顺序与 app.js 的 import 无关，但必须全部登记（缺一个 = 白屏）。
   '/assets/constants.js': { file: 'constants.js', type: 'text/javascript; charset=utf-8' },
   '/assets/format.js': { file: 'format.js', type: 'text/javascript; charset=utf-8' },
+  // v3.366：API 层（端点函数 + 凭证）独立成模块，与 constants/format 同一条加载链。
+  '/assets/api.js': { file: 'api.js', type: 'text/javascript; charset=utf-8' },
   '/assets/pure.mjs': { file: 'pure.mjs', type: 'text/javascript; charset=utf-8' },
   '/assets/htm-preact.module.js': { file: 'htm-preact.module.js', type: 'text/javascript; charset=utf-8' },
   // v3.326 日期区间：flatpickr 4.6.13 的 ESM 单文件 bundle（esbuild 打包，含 zh 语言包）
