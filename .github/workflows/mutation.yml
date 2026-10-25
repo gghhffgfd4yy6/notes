@@ -338,7 +338,7 @@ jobs:
             timeout_ms: 60000
           - name: console-part9
             src: "scripts/console.js"
-            mutate: "scripts/console.js:4801-5392"
+            mutate: "scripts/console.js:4801-5428"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:

@@ -166,10 +166,19 @@ async function readBodyJson (res) {
   }
 }
 
+// 条件请求缓存（v3.363）：键 → { tag, data }。服务端对只读快照端点发 ETag，
+// 命中 If-None-Match 时回 304 空体——前端复用上一份 data，省掉重复 body。
+// 只存内存（刷新即空），不落 localStorage；凭证不进这个 Map。
+const COND_CACHE = new Map()
+function addConditional (merged, key) {
+  const hit = COND_CACHE.get(key)
+  if (hit && hit.tag) merged.headers = { ...merged.headers, 'If-None-Match': hit.tag }
+}
+
 // 响应消费公共骨架：fetch promise 进来后统一「非 2xx 抛错 + body 消费完才清期限」。
 // 注意 fetch 本身不收进这里——各端点保持字面量 URL（Codacy SSRF 启发式：第一参数
 // 任何变量形态都会红，包括白名单查表后的常量；字面量是唯一全绿形态，PR #227 实测）。
-async function consumeJson (p, done) {
+async function consumeJson (p, done, condKey) {
   p.then(() => {}, () => {}) // fetch reject（网络错）时由下方 done 兜底；正常路径在 body 消费后清
   try {
     const res = await p
@@ -181,9 +190,21 @@ async function consumeJson (p, done) {
       }
       throw new Error('凭证已失效（401）')
     }
+    if (res.status === 304) {
+      // 304 无 body：直接复用条件缓存里的上一份（服务端已确认内容未变）。
+      done()
+      const hit = condKey ? COND_CACHE.get(condKey) : null
+      if (hit) return hit.data
+      throw new Error('HTTP 304（无本地副本）')
+    }
     if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
     try {
-      return await readBodyJson(res)
+      const data = await readBodyJson(res)
+      if (condKey) {
+        const tag = res.headers.get('ETag')
+        if (tag) COND_CACHE.set(condKey, { tag, data })
+      }
+      return data
     } finally {
       done() // body 消费完才清期限（Sourcery Stalled-bodies-outlive：done 提前会让挂起 body 绕过 abort）
     }
@@ -197,6 +218,8 @@ function apiGetStatus () {
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
+  // /api/status 含 generatedAt / lock.ageMs（每拍都在变），不做条件请求——给它发 ETag
+  // 永远不会命中（服务端 sendJsonConditional 注释同口径）。
   return consumeJson(fetch('/api/status', merged), done)
 }
 
@@ -204,7 +227,8 @@ function apiGetRuns () {
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/runs', merged), done)
+  addConditional(merged, 'runs')
+  return consumeJson(fetch('/api/runs', merged), done, 'runs')
 }
 
 async function apiGetRunDetail (id) {
@@ -280,7 +304,10 @@ function apiGetMessages ({ page, size, cate, q, days, from, to }) {
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   const p = fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged)
-  return consumeJson(p, done)
+  // 分页/筛选不同的请求各算一份缓存（同一 URL 语义才可复用 304 结果）。
+  const condKey = `messages?${qs}`
+  addConditional(merged, condKey)
+  return consumeJson(p, done, condKey)
 }
 
 function apiGetTrends ({ days, from, to } = {}) {
@@ -2080,8 +2107,14 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
         fetchOnce().catch(() => {}) // 最终快照补 finishedAt/exitCode
         onRefreshRef.current() // 立即刷新 runs 列表徽章（ref 解引用，防 effect 重连，§2 D7）
       })
+      let streamErrors = 0
+      es.onopen = () => { streamErrors = 0 }
       es.onerror = () => {
-        // 显式 close 后整段重拉一次后退回轮询；不带过期游标复连（蓝图重连语义）。
+        // v3.363：先让原生 EventSource 自动重连——服务端发了 `retry: 2000`，且浏览器重连
+        // 会自动带 Last-Event-ID，服务端据此只补缺口（不再是整段重拉）。连续 3 次仍连不上
+        // 才 close 并回退轮询，由 fetchOnce 拿最终快照兜底。
+        streamErrors += 1
+        if (es !== null && es.readyState === window.EventSource.CONNECTING && streamErrors <= 3) return
         if (es !== null) { es.close(); es = null }
         fetchOnce().catch(() => {})
         startPolling()
@@ -6288,6 +6321,36 @@ function BackToTop () {
     aria-hidden=${show ? 'false' : 'true'} onClick=${toTop}>↑</button>`
 }
 
+// ── 首屏快照（v3.363）────────────────────────────────────────────────────────
+// 上次成功轮询的 status/runs 落在 localStorage：冷启动与弱网时先用它渲染（不再白屏等
+// 网络），随后被真实轮询覆盖。只存展示字段、不含 token；版本不符或结构异常直接丢弃
+// （旧结构渲染会崩，宁可退回骨架屏）。
+// 与主题区分：主题必须服务端首帧渲染（否则闪色），数据快照允许首帧先用旧值——这是
+// 「旧数字」而不是「错误主题」，且卡片上本来就标着「数据截至」时间。
+const SNAP_KEY = 'xbk-console:snapshot:v1'
+function readSnapshot () {
+  try {
+    const raw = window.localStorage.getItem(SNAP_KEY)
+    if (!raw) return null
+    const v = JSON.parse(raw)
+    if (!v || v.v !== BOOT.version || typeof v.at !== 'number') return null
+    if (!v.status || typeof v.status !== 'object' || Array.isArray(v.status)) return null
+    if (!Array.isArray(v.runs)) return null
+    return v
+  } catch (e) { return null }
+}
+function writeSnapshot (status, runs) {
+  try {
+    window.localStorage.setItem(SNAP_KEY, JSON.stringify({
+      v: BOOT.version,
+      at: Date.now(),
+      status,
+      runs: Array.isArray(runs) ? runs.slice(0, 12) : []
+    }))
+  } catch (e) { /* 隐私模式 / 超限：静默降级，数据面不受影响 */ }
+}
+const SNAPSHOT = readSnapshot()
+
 // ── 主题（v3.323）──────────────────────────────────────────────────────────
 // 4 套配色只换 token（见 app.css 的 data-theme 块），不动布局。首帧由服务端把
 // cookie 里的选择写进 <html data-theme>——CSP 是 script-src 'self'，不能在 head
@@ -6319,18 +6382,18 @@ function applyThemeKey (key) {
 }
 
 function App () {
-  const [state, setState] = useState(null)
-  const [runs, setRuns] = useState([])
+  const [state, setState] = useState(SNAPSHOT ? SNAPSHOT.status : null)
+  const [runs, setRuns] = useState(SNAPSHOT ? SNAPSHOT.runs : [])
   // 主题：初值取服务端写进 <html data-theme> 的键（非法值回落 deep）。
   const [theme, setTheme] = useState(currentThemeKey)
   // 触发历史是否已经成功加载过：首次请求未回/失败时不能显示「暂无触发记录」，
   // 否则会把「还不知道」谎报成「确实没有」（Sourcery #254）。
-  const [runsState, setRunsState] = useState('loading') // loading | ok | error
+  const [runsState, setRunsState] = useState(SNAPSHOT ? 'ok' : 'loading') // loading | ok | error
   const [busy, setBusy] = useState(false)
   // 服务器端自动运行状态：调度/持久化都在控制台进程，页面只读展示。
   const [autoState, setAutoState] = useState(null)
   const [autoNow, setAutoNow] = useState(Date.now())
-  const [lastSync, setLastSync] = useState(null)
+  const [lastSync, setLastSync] = useState(SNAPSHOT ? SNAPSHOT.at : null)
   // 非概览页的「数据截至」按页签缓存：每个页签只认自己的成功加载时间，
   // 切回已来过的页签先显示上次时间，首次进入/加载失败显示「数据截至 · —」。
   const [panelSync, setPanelSync] = useState(null)
@@ -6805,6 +6868,10 @@ function App () {
       else {
         errs.push(`历史 ${rRes.reason && rRes.reason.message ? rRes.reason.message : rRes.reason}`)
         if (seq === seqRef.current) setRunsState((s) => (s === 'ok' ? 'ok' : 'error'))
+      }
+      // 首屏快照（v3.363）：两边都拿到才写——缺一半的旧数据没有展示价值。
+      if (sRes.status === 'fulfilled' && rRes.status === 'fulfilled' && seq === seqRef.current) {
+        writeSnapshot(sRes.value, rRes.value && rRes.value.runs)
       }
       if (seq !== seqRef.current || paused()) return false
       refreshedOnceRef.current = true

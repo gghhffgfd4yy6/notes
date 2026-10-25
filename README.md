@@ -211,6 +211,7 @@ XBK_CONSOLE_TOKEN=请换成至少16位的随机字符串 npm run console
 
 - 默认地址 `http://127.0.0.1:7777`。两种鉴权方式：命令行/API 用请求头 `Authorization: Bearer <XBK_CONSOLE_TOKEN>`；浏览器直接打开 `http://127.0.0.1:7777/?token=<XBK_CONSOLE_TOKEN>`（页面内的 fetch 请求通过 Authorization: Bearer 请求头携带 token，URL 不再复述凭证；看板每 5 秒自动刷新，任务运行期间加密到 2 秒）。token 未设置或短于 16 字符时服务直接拒绝启动。
 - 前端资产按内容哈希做版本号（`?v=<sha8>`）：带版本的 URL 走 `immutable` 长缓存，裸 URL 仍 `no-cache` + ETag（命中 `If-None-Match` 返回 304）；并按 `Accept-Encoding` 提供 gzip（首屏 JS 77KB → 约 26KB）。页面 HTML 始终 `no-store`（含会话凭证）。
+- 数据面（v3.363）：主通道仍是轮询（15s / 任务运行 2s），但 `GET /api/runs`、`/api/messages`、`/api/auto` 支持 `ETag` + `If-None-Match`——内容没变回 304 空体，前端复用上一份数据（`/api/status` 含 `generatedAt` 与锁龄，每拍都在变，明确不发 ETag）。运行中日志的 SSE 帧带 `id:`（绝对偏移），断线重连由浏览器回传 `Last-Event-ID`，服务端只补缺口；游标不可用（非法/0）时回 `event: reset` 整段替换，避免客户端追加重复。最近一次成功的状态与历史另存 `localStorage`（带版本守卫、最多 12 条历史、不含 token），冷启动/弱网先用它渲染首屏，再被真实轮询覆盖。
 - 动效层（v3.360，v3.361 起弹窗从触发点展开/缩回）：切页淡入、卡片/表格行/表单分组依次入场、弹窗从触发按钮的位置等比放大到原位（取消/点遮罩/Esc 沿原路缩回按钮后再卸载，退场期间按钮禁用）、校验失败字段抖动+红圈、推送记录翻页/增删的位置补间（FLIP）、主题切换颜色过渡。只动 `opacity`/`transform`（合成层，不触发重排），动画结束即清内联样式；入场只在挂载/首次拿到数据/真正切页时播一次，5 秒轮询不重播。系统开了「减少动效」（`prefers-reduced-motion: reduce`）时全部关闭、直接到终态。动画库是 vendored 单文件（motion/mini，MIT），走 `/assets` 白名单，无 CDN。
 - ⚠️ `?token=` 会留在浏览器历史与访问日志里；`XBK_CONSOLE_HOST` 绑定非回环地址时 token 以明文过网（HTTP 无加密），请仅在受信内网使用，跨网访问务必前置 TLS 反代（nginx/caddy 终止 TLS 后转发本端口）。
 - 「试运行」抓取但不推送、不写去重记录（等价 `--dry-run`）；「正式运行一轮」会**真实推送通知**；「通知自检」向全部已配置渠道各发一条固定测试消息（真实推送，`POST /api/notify-test`，无 body）。同一时刻只允许一个触发任务，重复触发返回 409；锁残留（进程被 kill -9 等留下损坏锁文件）时人工删除缓存目录下的 `console-trigger.lock` 即可恢复。

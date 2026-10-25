@@ -2320,6 +2320,25 @@ async function main () {
     }
     server.close()
   })
+  await aok('HTTP: 只读快照端点 ETag/304（命中回空体、不匹配照常 200、不退化成可缓存）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const first = await request(port, 'GET', '/api/runs', { token: TOKEN })
+    assert.strictEqual(first.status, 200)
+    const tag = first.headers.etag
+    assert.ok(typeof tag === 'string' && tag.length >= 2, '必须下发 ETag')
+    assert.strictEqual(first.headers['cache-control'], 'no-cache', '条件请求不得写成可缓存（max-age 会把带鉴权的响应留在本地）')
+    const hit = await request(port, 'GET', '/api/runs', { token: TOKEN, headers: { 'if-none-match': tag } })
+    assert.strictEqual(hit.status, 304, 'If-None-Match 命中必须 304')
+    assert.strictEqual(hit.text, '', '304 不得带 body')
+    const miss = await request(port, 'GET', '/api/runs', { token: TOKEN, headers: { 'if-none-match': '"nope"' } })
+    assert.strictEqual(miss.status, 200, 'ETag 不匹配照常 200 全量')
+    assert.strictEqual(Array.isArray(JSON.parse(miss.text).runs), true, '200 分支仍是完整 JSON')
+    // /api/status 每次请求都生成新时间戳/锁龄：不得发 ETag（发了也永远不命中）。
+    const volatile = await request(port, 'GET', '/api/status', { token: TOKEN })
+    assert.strictEqual(volatile.headers.etag, undefined, '/api/status 不得下发 ETag（响应本身是易变的）')
+    server.close()
+  })
   await aok('HTTP: POST /trigger 非法 action → 400', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
@@ -3780,6 +3799,41 @@ async function main () {
     const frames = sse.events.filter((e) => e.event === 'message')
     assert.strictEqual(frames.length, 1, '恰一帧')
     assert.strictEqual(JSON.parse(frames[0].data), '文🐮')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE L1 Last-Event-ID 续传：header 优先于 since，只补缺口不重发', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, 'ABCDEF')
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9&since=0', {
+      headers: { authorization: `Bearer ${TOKEN}`, 'last-event-id': '4' }
+    })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'message'), true, '续传帧到达')
+    const frames = sse.events.filter((e) => e.event === 'message')
+    assert.strictEqual(frames.length, 1, '只补缺口：恰一帧')
+    assert.strictEqual(JSON.parse(frames[0].data), 'EF', '从 Last-Event-ID=4 续传')
+    assert.strictEqual(sse.events.some((e) => e.event === 'reset'), false, '游标可用时不得整段重发')
+    sse.close()
+    server.close()
+  })
+  await aok('SSE L2 非法 Last-Event-ID：回落整段并标 reset（客户端替换而非追加）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const rec = makeStreamRecord('1750000000000.9')
+    streamAppend(rec, '整段输出')
+    runs.set('1750000000000.9', rec)
+    const sse = sseCollect(port, '/api/runs/stream?id=1750000000000.9', {
+      headers: { authorization: `Bearer ${TOKEN}`, 'last-event-id': 'not-a-number' }
+    })
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'reset'), true, '非法游标必须以 reset 整段重发')
+    const reset = sse.events.find((e) => e.event === 'reset')
+    assert.strictEqual(JSON.parse(reset.data).full, '整段输出')
+    assert.strictEqual(sse.events.some((e) => e.event === 'message'), false, 'reset 已覆盖全量，不得再追加 data 帧')
     sse.close()
     server.close()
   })
@@ -7463,6 +7517,20 @@ async function main () {
       await new Promise((resolve) => server.close(resolve))
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+  await aok('结构红线: v3.363 数据面（条件请求 / SSE 续传 / 首屏快照）', async () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.js'), 'utf8')
+    assert.ok(src.includes('res.status === 304'), 'consumeJson 必须处理 304（复用条件缓存）')
+    assert.ok(src.includes('COND_CACHE') && src.includes("'If-None-Match'"), '条件请求必须带 If-None-Match 与本地缓存')
+    assert.ok(!/addConditional\(merged, 'status'\)/.test(src), '/api/status 不得走条件请求（generatedAt/锁龄每拍在变）')
+    assert.ok(src.includes('streamErrors <= 3'), 'SSE onerror 必须先让原生 EventSource 有限次重连（带 Last-Event-ID 续传）')
+    const snapStart = src.indexOf('const SNAP_KEY')
+    const snapEnd = src.indexOf('const THEMES = [')
+    assert.ok(snapStart >= 0 && snapEnd > snapStart, '首屏快照块必须在主题块之前（主题红线只允许服务端首帧渲染）')
+    const snapBlock = src.slice(snapStart, snapEnd)
+    assert.ok(snapBlock.includes('v.v !== BOOT.version'), '快照必须有版本守卫（旧结构不渲染）')
+    assert.ok(snapBlock.includes('runs.slice(0, 12)'), '快照最多存 12 条历史（localStorage 有 5MB 上限）')
+    assert.ok(!snapBlock.includes('BOOT.token'), '快照不得包含 token')
   })
 }
 
