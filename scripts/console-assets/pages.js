@@ -2154,13 +2154,24 @@ function SearchPanel ({ onSync, active = true }) {
       } catch (e) {}
       for (const w of current) {
         try {
-          const d = await apiSearchLines({ q: w.q, page: 1, limit: cfg.limit })
-          if (!d || d.status !== 'ok' || !Array.isArray(d.items)) { failed += 1; continue }
-          // 优先用「上次读到的最新条目标识」做锚点：上游时间只有分钟精度，仅靠 ts 会漏掉
-          // 同一分钟内发布的新线报。锚点不在第 1 页（被新条目挤走）时退回 ts 比较。
-          const idx = w.lastReadId ? d.items.findIndex((it) => it.id === w.lastReadId) : -1
-          if (idx >= 0) next[w.q] = idx
-          else next[w.q] = d.items.filter((it) => typeof it.ts === 'number' && it.ts > (w.lastReadAt || 0)).length
+          // 和监控用同一套范围：从第 1 页往回翻到锚点所在页（最多 5 页），
+          // 不能只数第 1 页——新增超过一页时角标会少报。
+          const since = w.lastReadAt > 0 ? w.lastReadAt : Date.now()
+          let count = 0
+          for (let page = 1; page <= 5; page += 1) {
+            const d = await apiSearchLines({ q: w.q, page, limit: 100 })
+            if (!d || d.status !== 'ok' || !Array.isArray(d.items)) throw new Error('check failed')
+            if (d.items.length === 0) break
+            // 优先用「上次读到的最新条目标识」做锚点：上游时间只有分钟精度，仅靠 ts 会漏掉
+            // 同一分钟内发布的新线报。锚点不在当前页时按 ts 比较，并继续往前翻。
+            const idx = w.lastReadId ? d.items.findIndex((it) => it.id === w.lastReadId) : -1
+            if (idx >= 0) { count += idx; break }
+            const allNew = d.items.every((it) => typeof it.ts === 'number' && it.ts > since)
+            count += d.items.filter((it) => typeof it.ts === 'number' && it.ts > since).length
+            if (!allNew) break
+            if (page >= Math.min(Number(d.pages) || 1, 5)) break
+          }
+          next[w.q] = count
         } catch (e) {
           failed += 1 // 单个词失败不拖累其它词，保留它上次的角标
         }
@@ -2286,9 +2297,9 @@ function SearchPanel ({ onSync, active = true }) {
       <${Button} disabled=${loading || input.trim() === ''} ariaBusy=${loading ? 'true' : 'false'} onClick=${() => submit(input, 1)}>搜索<//>
     </div>
     <details class="ls-config">
-      <summary>监控设置：每页 ${cfg.limit} 条 · 每 ${cfg.intervalMin} 分钟检查 · ${cfg.enabled ? '已开启' : '已关闭'}</summary>
+      <summary>监控设置：搜索页每页 ${cfg.limit} 条 · 每 ${cfg.intervalMin} 分钟检查 · ${cfg.enabled ? '已开启' : '已关闭'}</summary>
       <div class="ls-config-body">
-        <label class="ls-cfg-field">每页
+        <label class="ls-cfg-field">搜索页每页
           <input type="number" min="1" max="100" inputmode="numeric" value=${cfgDraft.limit}
             onInput=${(e) => editCfg({ limit: Number(e.target.value) })} /> 条
         </label>
@@ -2298,13 +2309,13 @@ function SearchPanel ({ onSync, active = true }) {
         </label>
         <label class="ls-cfg-toggle">
           <input type="checkbox" checked=${cfgDraft.enabled}
-            onChange=${(e) => editCfg({ enabled: e.target.checked })} /> 自动监控并推送
+            onChange=${(e) => editCfg({ enabled: e.target.checked })} /> 自动检查并推送新线报
         </label>
         <${Button} variant="ghost" onClick=${saveCfg}>保存设置<//>
         ${cfgMsg && html`<span class="ls-cfg-msg">${cfgMsg}</span>`}
       </div>
-      <div class="ls-cfg-help">开启后每 ${cfgDraft.intervalMin} 分钟检查一次关注词：有新的就逐条推送，没有就不推；检查只看最新 ${cfgDraft.limit} 条。推过的会记在文件里，重启不重推。</div>
-      ${cfg.enabled && cfg.lastCheckAt > 0 && html`<div class="ls-cfg-help">上次检查：${watchAtText(cfg.lastCheckAt)}（北京时间）</div>`}
+      <div class="ls-cfg-help">「搜索页每页」只管搜索页翻页，不影响监控。开启监控后，每 ${cfgDraft.intervalMin} 分钟看一次关注词：上次检查之后多出来的线报，每条单独推送；没有新的就不推。监控会从最新往回翻到上次检查的位置（最多 5 页），不会因为超过一页的条数就漏推。推过的会记在文件里，重启不重推。</div>
+      ${cfg.enabled && cfg.lastCheckAt > 0 && html`<div class="ls-cfg-help">上次检查时间：${watchAtText(cfg.lastCheckAt)}（北京时间）</div>`}
     </details>
     <div class="ls-watch">
       <div class="ls-watch-head">
