@@ -19,7 +19,8 @@ const CONSOLE_MODULE_FILES = [
   'constants.js', // 页面级常量（v3.365 拆出）
   'format.js', // 时间/字节格式化（v3.365 拆出）
   'api.js', // 数据层：端点函数 + 凭证（v3.366 拆出；顺序与拆前源码一致，API 段在 UI 段之前）
-  'ui.js', // 视图层：组件 + 页面 + 主题/快照（v3.367 拆出；正文紧接 API 段之后，原文顺序不变）
+  'components.js', // 公用零件：状态徽章/卡片/按钮/日期区间/触发条/确认弹窗（v3.368 拆出）
+  'ui.js', // 页面层：各面板 + App + 主题/快照（v3.367 拆出；正文顺序原文不变）
   'app.js' // 入口：只做挂载、BFCache 与失败兜底清理（App 在 ui.js）
 ]
 function readConsoleSource () {
@@ -2363,6 +2364,14 @@ async function main () {
     assert.deepStrictEqual(dynamic, [], '自家模块不得用动态 import()')
     for (const spec of Object.values(STATIC_ASSETS)) {
       assert.ok(fs.existsSync(path.join(dir, spec.file)), `白名单文件缺失：${spec.file}`)
+    }
+    // route 与文件名必须对得上（route = '/assets/' + 文件名）：上面两条各自为政——route 存在、
+    // file 存在——把 '/assets/api.js' 映射到别的已存在文件照样全绿，浏览器却拿到错模块。
+    // 历史例外只有 flatpickr（bundle 文件名带 .module，route 沿用短名）。
+    const ROUTE_FILE_EXCEPTIONS = { '/assets/flatpickr.js': 'flatpickr.module.js' }
+    for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
+      const want = ROUTE_FILE_EXCEPTIONS[route] || route.slice('/assets/'.length)
+      assert.strictEqual(spec.file, want, `route 与文件名必须一致：${route} → ${spec.file}（期望 ${want}）`)
     }
   })
   await aok('资产: 入口 import 覆盖它实际用到的拆出导出（漏写 = 运行时 ReferenceError）', () => {
