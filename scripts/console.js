@@ -967,12 +967,30 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
     .replace(/>/g, '\\u003e')
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029')
+  // 首屏模块预加载（v3.373）：app.js 是唯一入口，浏览器必须先拿到并解析它才知道有 11 个
+  // 依赖模块——「取 app.js → 解析 → 再并发取模块」是一段可见的瀑布。这里按体积从大到小
+  // 预声明整张静态 import 闭包（test_console.js 用 acorn 算闭包逐字对账，漏一个/多一个都红）。
+  // **必须裸 URL**：模块说明符就是 './xxx.js'，裸 URL 才命中预加载条目；带 ?v= 会按另一个
+  // 请求算（同一文件下两次），带 crossorigin 会换缓存键——两者都让预加载白做。
+  // flatpickr 写路由名 /assets/flatpickr.js（真实文件名 flatpickr.module.js，写后者 404）。
+  // app.js 自己不加 preload：<script type="module" src> 就是它的取用点。
   return `<!doctype html>
 <html lang="zh-CN" data-theme="${THEMES.includes(theme) ? theme : THEMES[0]}"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="${CSP_HEADER}">
 <link rel="stylesheet" href="/assets/flatpickr.css${assetQuery()}">
 <link rel="stylesheet" href="/assets/app.css${assetQuery()}">
+<link rel="modulepreload" href="/assets/pages.js">
+<link rel="modulepreload" href="/assets/flatpickr.js">
+<link rel="modulepreload" href="/assets/components.js">
+<link rel="modulepreload" href="/assets/ui.js">
+<link rel="modulepreload" href="/assets/htm-preact.module.js">
+<link rel="modulepreload" href="/assets/pure.mjs">
+<link rel="modulepreload" href="/assets/motion.js">
+<link rel="modulepreload" href="/assets/motion-lib.module.js">
+<link rel="modulepreload" href="/assets/api.js">
+<link rel="modulepreload" href="/assets/constants.js">
+<link rel="modulepreload" href="/assets/format.js">
 </head><body>
 <div id="app"><div class="boot-fallback" role="alert">
 <p class="boot-fail-title">页面没加载出来</p>

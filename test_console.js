@@ -2777,6 +2777,77 @@ async function main () {
       assert.strictEqual(spec.file, want, `route 与文件名必须一致：${route} → ${spec.file}（期望 ${want}）`)
     }
   })
+  await aok('资产: 首屏 modulepreload 覆盖 app.js 的 import 闭包（裸 URL、排在入口之前）', () => {
+    // 预加载是手工维护的 11 行，两种错都不会被别的用例抓住：① 漏一个模块（瀑布还在，只是
+    // 短了点）；② 把 flatpickr 写成 flatpickr.module.js（404，白下一次）。这里用 acorn 从
+    // app.js 出发算**真实**静态 import 闭包，与 HTML 里的 href 逐字对账。
+    const acorn = require('acorn')
+    const { STATIC_ASSETS } = require('./scripts/console.js')
+    const dir = path.join(__dirname, 'scripts', 'console-assets')
+    const walk = (node, fn) => {
+      if (!node || typeof node !== 'object') return
+      if (typeof node.type === 'string') fn(node)
+      for (const key of Object.keys(node)) {
+        if (key === 'type' || key === 'start' || key === 'end') continue
+        const value = node[key]
+        if (Array.isArray(value)) value.forEach((child) => walk(child, fn))
+        else if (value && typeof value === 'object') walk(value, fn)
+      }
+    }
+    const specsOf = (file) => {
+      const ast = acorn.parse(fs.readFileSync(path.join(dir, file), 'utf8'),
+        { ecmaVersion: 'latest', sourceType: 'module' })
+      const out = []
+      walk(ast, (node) => {
+        const hasSource = node.type === 'ImportDeclaration' || node.type === 'ExportAllDeclaration' ||
+          (node.type === 'ExportNamedDeclaration' && node.source)
+        if (hasSource && node.source) out.push(node.source.value)
+      })
+      return out
+    }
+    // 说明符 → 白名单 route（flatpickr 的 route 与文件名不同，按名字拼会算错闭包）。
+    const closure = []
+    const seen = new Set(['/assets/app.js'])
+    const queue = ['/assets/app.js']
+    while (queue.length > 0) {
+      const route = queue.shift()
+      for (const spec of specsOf(STATIC_ASSETS[route].file)) {
+        const child = '/assets/' + spec.replace(/^\.\//, '')
+        if (!Object.prototype.hasOwnProperty.call(STATIC_ASSETS, child)) {
+          throw new Error(`${route} 的 import 目标未登记白名单：${spec}`)
+        }
+        if (seen.has(child)) continue
+        seen.add(child)
+        closure.push(child)
+        queue.push(child)
+      }
+    }
+    assert.ok(closure.length > 0, '闭包不得为空（否则下面的对账恒真）')
+    const { readStatus } = require('./scripts/status')
+    const html = renderPage(readStatus(tmpDir()), [], new URLSearchParams(`token=${TOKEN}`))
+    // 逐字锁形态：rel/href 之外不得有第二个属性（crossorigin 会换缓存键，预加载就白做了）。
+    const hrefs = [...html.matchAll(/<link rel="modulepreload" href="([^"]+)">/g)].map((m) => m[1])
+    assert.strictEqual(hrefs.length, closure.length,
+      `预加载条数必须等于 import 闭包大小（闭包 ${closure.length}，实际 ${hrefs.length}）`)
+    assert.strictEqual(new Set(hrefs).size, hrefs.length, '同一模块不得重复预加载')
+    assert.deepStrictEqual([...hrefs].sort(), [...closure].sort(), '预加载清单必须与 app.js 的 import 闭包逐字一致')
+    for (const href of hrefs) {
+      assert.ok(Object.prototype.hasOwnProperty.call(STATIC_ASSETS, href), `${href} 必须是 STATIC_ASSETS 的 key（否则 404）`)
+      assert.ok(!href.includes('?') && !href.includes('#') && !href.includes('token'),
+        `${href} 必须裸 URL（带查询串会二次下载，带凭证会多一处暴露面）`)
+    }
+    assert.ok(!html.includes('crossorigin'), '预加载不得带 crossorigin（换缓存键 = 预加载失效）')
+    // 大文件优先：第一条必须是闭包里最大的那份（省下的正是最关键的几毫秒）。
+    const sizeOf = (route) => fs.statSync(path.join(dir, STATIC_ASSETS[route].file)).size
+    const biggest = [...closure].sort((a, b) => sizeOf(b) - sizeOf(a))[0]
+    assert.strictEqual(hrefs[0], biggest, '首条预加载必须是闭包内最大的模块（大文件优先）')
+    // 必须排在入口脚本之前：浏览器按文档序发现 preload，排在入口之后等于没提前。
+    assert.ok(html.indexOf('rel="modulepreload"') < html.indexOf('<script type="module" src="/assets/app.js'),
+      'modulepreload 必须出现在入口 <script type="module"> 之前')
+    // 入口脚本是带版本号的（?v= = 资产内容哈希），预加载则必须是裸 URL——两者并存才对。
+    assert.match(html, /<script type="module" src="\/assets\/app\.js\?v=[0-9a-f]{16}"><\/script>/,
+      '入口脚本引用必须原样保留（带内容版本号）')
+  })
   await aok('资产: 入口 import 覆盖它实际用到的拆出导出（漏写 = 运行时 ReferenceError）', () => {
     // 聚合器保证「文本断言」在拆分后仍然成立，但这也会掩盖一件事：app.js 如果漏写/写错
     // 某个具名 import，格式化和常量函数在并集里照样存在，文本断言照样绿，浏览器却整页崩。
