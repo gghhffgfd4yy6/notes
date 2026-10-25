@@ -920,3 +920,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 测试侧聚合器随之登记两个新模块（`CONSOLE_MODULE_FILES`），653 条源码文本断言与切片定位零改动、251/0 通过——这一步验证了拆分路径本身可用。
 - `STATIC_ASSETS` 登记两个新路由（缺一个 = 模块图 404 = 白屏，闭包用例会当场红）。
 - 版本 3.365.0。
+
+## v3.366 — 前端拆分第二刀：API 层
+
+- 新增 `api.js`（625 行）：`app.js` 的 API 段（`timedRequest` / `readBodyJson` / 条件请求缓存 / 全部端点函数 / `trigger` 与 `triggerNotifyTest`）逐字搬出，末尾统一 `export { ... }`（36 个导出），`app.js` 改为顶部 import。函数体、注释、字面量一字未改，仍写 `function foo`（源码文本断言依赖原文）。
+- 凭证与日期键随数据层迁出：`readBoot()` / `BOOT`、`DAY_KEY_RE` 移入 `api.js` 并由 `app.js` 反向 import（否则只能与 `app.js` 循环引用）；两个备份体积上限（32MiB / 48MiB）移入 `constants.js`（本就是页面级数字常量）。
+- 配套：`STATIC_ASSETS` 登记 `/assets/api.js`；测试侧 `CONSOLE_MODULE_FILES` 按拆前源码顺序插入 `api.js`（API 段在 UI 段之前）；`console.js` 行数 5450 → 5452，mutation 末段与注释同步（三处）；README 的前端模块清单补 `api.js`。
+- 验证：`test_console.js` 252/0（断言一条未改）、`standard` exit 0、`check-mutation-ranges` exit 0、`npm run check` 54 套件全绿（246.2s）；真浏览器冒烟确认 `api.js` 在模块图内、六页渲染无 JS 错误。
+- 版本 3.366.0。
