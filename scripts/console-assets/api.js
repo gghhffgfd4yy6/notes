@@ -86,13 +86,18 @@ function rememberConditional (key, entry) {
 }
 function addConditional (merged, key) {
   const hit = COND_CACHE.get(key)
-  if (hit && hit.tag) merged.headers = { ...merged.headers, 'If-None-Match': hit.tag }
+  if (!hit || !hit.tag) return null
+  merged.headers = { ...merged.headers, 'If-None-Match': hit.tag }
+  // 把「这次请求发出去的是哪个 tag」交回调用方：304 到达时要用它核对缓存条还是不是
+  // 同一份快照。两个并发请求之间缓存可能被另一个 tag 覆盖，只按 key 取会把 T2 的数据
+  // 冒充成 T1 的 304 结果（Sourcery Medium）。
+  return hit.tag
 }
 
 // 响应消费公共骨架：fetch promise 进来后统一「非 2xx 抛错 + body 消费完才清期限」。
 // 注意 fetch 本身不收进这里——各端点保持字面量 URL（Codacy SSRF 启发式：第一参数
 // 任何变量形态都会红，包括白名单查表后的常量；字面量是唯一全绿形态，PR #227 实测）。
-async function consumeJson (p, done, condKey, retry) {
+async function consumeJson (p, done, condKey, retry, sentTag) {
   p.then(() => {}, () => {}) // fetch reject（网络错）时由下方 done 兜底；正常路径在 body 消费后清
   try {
     const res = await p
@@ -108,7 +113,9 @@ async function consumeJson (p, done, condKey, retry) {
       // 304 无 body：直接复用条件缓存里的上一份（服务端已确认内容未变）。
       done()
       const hit = condKey ? COND_CACHE.get(condKey) : null
-      if (hit) return hit.data
+      // 只有缓存条仍是我们发出去的那个 tag 才复用它；被别的并发响应换掉时必须重取，
+      // 否则会把 T2 的快照当成 T1 的 304 结果（配置/趋势/历史短暂显示错数据）。
+      if (hit && (!sentTag || hit.tag === sentTag)) return hit.data
       // 本地没有对应副本（换了标签页 / 前端刚更新过 / 缓存条目被淘汰 / 服务端 tag 与本地
       // 记录不一致）时**必须重取**：去掉 If-None-Match 再发一次，拿完整的 200。
       // 绝不能把 304 当失败——配置页会直接显示「加载失败」，而且用户无处可点。
@@ -142,15 +149,15 @@ function conditionalRequest (condKey, build) {
       headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
     })
     // 必须在 fetch 之前注入：fetch 调用时就快照 headers（Sourcery PR #321）。
-    if (conditional) addConditional(merged, condKey)
-    return { p: build(merged), done }
+    const sentTag = conditional ? addConditional(merged, condKey) : null
+    return { p: build(merged), done, sentTag }
   }
   const first = once(true)
   return consumeJson(first.p, first.done, condKey, () => {
     // 只重试一次：重试不带条件头，再拿到 304 就是服务端异常，按「无本地副本」抛错。
     const again = once(false)
     return consumeJson(again.p, again.done, condKey)
-  })
+  }, first.sentTag)
 }
 
 function apiGetStatus () {
@@ -166,8 +173,8 @@ function apiGetRuns () {
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  addConditional(merged, 'runs')
-  return consumeJson(fetch('/api/runs', merged), done, 'runs')
+  const sentTag = addConditional(merged, 'runs')
+  return consumeJson(fetch('/api/runs', merged), done, 'runs', undefined, sentTag)
 }
 
 async function apiGetRunDetail (id) {
@@ -244,8 +251,8 @@ function apiGetMessages ({ page, size, cate, q, days, from, to }) {
   // 必须在 fetch 之前注入 If-None-Match（Sourcery PR #321）：fetch 在调用时就快照
   // headers，先 fetch 后 addConditional 等于永远不发条件头。
   const condKey = `messages?${qs}`
-  addConditional(merged, condKey)
-  return consumeJson(fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged), done, condKey)
+  const sentTag = addConditional(merged, condKey)
+  return consumeJson(fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged), done, condKey, undefined, sentTag)
 }
 
 function apiGetTrends ({ days, from, to } = {}) {
@@ -310,8 +317,8 @@ function apiGetAuto () {
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  addConditional(merged, 'auto')
-  return consumeJson(fetch('/api/auto', merged), done, 'auto')
+  const sentTag = addConditional(merged, 'auto')
+  return consumeJson(fetch('/api/auto', merged), done, 'auto', undefined, sentTag)
 }
 
 function apiSetAuto (payload) {

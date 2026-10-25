@@ -2941,7 +2941,7 @@ async function main () {
     server.close()
   })
   await aok('gzipJsonBody: 512B 阈值 / >256KB 用 level 1 / 未协商时不压', () => {
-    const { GZIP_MIN_BYTES, GZIP_LARGE_BYTES, gzipJsonBody, gzipVariantTag, conditionalVariant } = require('./scripts/console.js')
+    const { GZIP_MIN_BYTES, GZIP_LARGE_BYTES, GZIP_MAX_BYTES, gzipJsonBody, gzipVariantTag, conditionalVariant } = require('./scripts/console.js')
     assert.strictEqual(GZIP_MIN_BYTES, 512, '阈值必须恰为 512B（用例与实现同源对账）')
     assert.strictEqual(GZIP_LARGE_BYTES, 256 * 1024, '大响应分界必须恰为 256KB')
     assert.strictEqual(gzipJsonBody({ xbkGzip: true }, 'x'.repeat(GZIP_MIN_BYTES - 1)), null,
@@ -2949,6 +2949,8 @@ async function main () {
     assert.ok(Buffer.isBuffer(gzipJsonBody({ xbkGzip: true }, 'x'.repeat(GZIP_MIN_BYTES))),
       '恰好达到阈值必须压（>= 512）')
     assert.strictEqual(gzipJsonBody({ xbkGzip: false }, 'x'.repeat(1000)), null, '未协商 gzip 必须不压')
+    assert.strictEqual(gzipJsonBody({ xbkGzip: true }, 'x'.repeat(GZIP_MAX_BYTES + 1)), null,
+      '超过上限必须回 identity（gzipSync 会按住事件循环，宁可少省一次流量）')
     assert.strictEqual(gzipJsonBody({}, 'x'.repeat(1000)), null, '没有协商标记（非 HTTP 调用点）必须不压')
     assert.strictEqual(gzipJsonBody(null, 'x'.repeat(1000)), null, 'res 缺失时不得抛')
     // level 选择：小响应 6，大响应 1——按 zlib 输出逐字节对账（不只是「有压缩」）。
@@ -3001,7 +3003,7 @@ async function main () {
       assert.strictEqual(gz.headers['content-encoding'], 'gzip', '声明 gzip 时必须压缩')
       assert.match(String(gz.headers.vary || ''), /Accept-Encoding/, '压缩响应必须带 Vary: Accept-Encoding')
       assert.strictEqual(id.headers['content-encoding'], undefined, '不声明 gzip 时必须回 identity')
-      assert.strictEqual(id.headers.vary, undefined, 'identity 响应不压 → 不新增 Vary（不压保持不变）')
+      assert.match(String(id.headers.vary || ''), /Accept-Encoding/, 'identity 响应也必须带 Vary（同一 URL 的表示随 Accept-Encoding 变，否则缓存会把 identity 复用给能收 gzip 的客户端）')
       assert.deepStrictEqual(zlib.gunzipSync(gz.body), id.body, 'gzip 解压后必须与 identity 逐字相等')
       assert.ok(gz.body.length < id.body.length, '压缩体必须更小')
       // 变体 tag：identity tag 由未压缩 body 算，gzip 只是加 -gz 后缀（静态资产同约定）。
@@ -3058,6 +3060,12 @@ async function main () {
       // 默认（不带 Accept-Encoding）仍走 identity：Node 客户端与 curl 不受影响。
       const plain = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN })
       assert.strictEqual(plain.headers['content-encoding'], undefined, '不带 Accept-Encoding 必须回 identity')
+      // 两种表示都不可接受：不得硬塞 identity（Sourcery Medium），回 406 空体。
+      const refuse = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'gzip;q=0, identity;q=0' } })
+      assert.strictEqual(refuse.status, 406, 'gzip 与 identity 都被拒绝时必须 406')
+      assert.strictEqual(refuse.body.length, 0, '406 不带 body')
+      const smallRefuse = await requestBuffer(port, 'GET', '/api/auto', { token: TOKEN, headers: { 'accept-encoding': 'gzip, identity;q=0' } })
+      assert.strictEqual(smallRefuse.status, 406, '小响应压不了且 identity 被拒 → 406')
     } finally { server.close() }
   })
   await aok('HTTP: SSE 响应头不带 Content-Encoding（流式增量不压缩）', async () => {
@@ -3087,7 +3095,9 @@ async function main () {
   })
   await aok('HTTP: 条件请求扩面（trends / run-history / cache-health / config 的 ETag 与 304）', async () => {
     const dir = tmpDir()
-    const summary = (n) => `2026-10-15 12:16:0${n} total=${n} dedup=0 filtered=0 truncated=0 pushed=${n} failed=0 elapsed=10.1s cachesaved=1`
+    // 固定日期会在 14 天窗滑走后让「追加一行 → tag 变」永久红：按上海当日生成。
+    const dayKey = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10)
+    const summary = (n) => `${dayKey} 12:16:0${n} total=${n} dedup=0 filtered=0 truncated=0 pushed=${n} failed=0 elapsed=10.1s cachesaved=1`
     fs.writeFileSync(path.join(dir, 'run.log'), [summary(1), summary(2), summary(3)].join('\n') + '\n')
     const pushFixture = (extra) => JSON.stringify([...Array(1 + extra).keys()].map((i) => ({
       id: i + 1, title: `t${i}`, content: 'c', catename: '好单-日用', shijianchuo: 1000 + i
@@ -3204,6 +3214,31 @@ async function main () {
       assert.strictEqual(hasCond(2), false, '无副本的键本来就不带条件头')
       assert.strictEqual(hasCond(3), false, '重试必须去掉 If-None-Match（否则还是 304，陷入死循环）')
       assert.match(calls[3].url, /\/api\/cache-health$/, '重试打的必须是同一个端点')
+      // 并发覆盖：A 带着 t-3 发出 → B 先写入 t-4 → A 的 304 到达时不得复用 t-4 的数据。
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, headers: { ...((opts && opts.headers) || {}) } })
+        return res200('"t-3"', { marker: 'base' })
+      }
+      assert.strictEqual((await mod.apiGetConfig()).marker, 'base', '基线：缓存条换成 t-3')
+      let release
+      const gate = new Promise((resolve) => { release = resolve })
+      let n = 0
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, headers: { ...((opts && opts.headers) || {}) } })
+        n += 1
+        if (n === 1) { await gate; return res304() }
+        if (n === 2) return res200('"t-4"', { marker: 'other-tab' })
+        if (n === 3) return res200('"t-5"', { marker: 'refetched' })
+        throw new Error('fetch 调用次数超出剧本')
+      }
+      const baseIdx = calls.length
+      const pA = mod.apiGetConfig()
+      const pB = mod.apiGetConfig()
+      assert.strictEqual((await pB).marker, 'other-tab', '并发请求 B 写入 t-4')
+      release()
+      assert.strictEqual((await pA).marker, 'refetched', '304 的 tag 与缓存条不一致时必须重取')
+      assert.strictEqual(hasCond(baseIdx), true, 'A 必须带 If-None-Match')
+      assert.strictEqual(hasCond(baseIdx + 2), false, '重取必须去掉条件头')
     } finally {
       globalThis.fetch = realFetch
       globalThis.document = realDocument

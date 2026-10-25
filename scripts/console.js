@@ -767,6 +767,30 @@ function acceptsGzip (header) {
   return false
 }
 
+// Accept-Encoding 里的 identity：**默认接受**，只有显式 `identity;q=0`（或 `*;q=0` 且
+// 没有 identity 例外）才算拒绝。gzip 与 identity 都不可接受时不能再硬塞 identity——
+// 那是一个客户端明确拒绝的表示（Sourcery Medium）；JSON 出口改回 406。
+function acceptsIdentity (header) {
+  let explicit = null
+  let wildcard = null
+  for (const part of String(header || '').split(',')) {
+    const segs = part.trim().toLowerCase().split(';')
+    const token = segs[0].trim()
+    if (token !== 'identity' && token !== '*') continue
+    const qseg = segs.slice(1).map((x) => x.trim()).find((x) => x.startsWith('q='))
+    let q = 1
+    if (qseg) {
+      const val = Number(qseg.slice(2))
+      q = Number.isFinite(val) ? val : 0
+    }
+    if (token === 'identity') explicit = q
+    else wildcard = q
+  }
+  if (explicit !== null) return explicit > 0
+  if (wildcard !== null) return wildcard > 0
+  return true
+}
+
 // If-None-Match：支持 *、逗号列表与弱比较（GET 语义）。
 function etagMatches (header, etag) {
   const raw = String(header || '').trim()
@@ -1418,14 +1442,24 @@ function authorize (req, token, urlQuery) {
 const GZIP_MIN_BYTES = 512
 // >256KB 的响应（推送记录整页）换 level 1：压缩率损失远小于省下的 CPU 时间。
 const GZIP_LARGE_BYTES = 256 * 1024
+// 上限 8MiB：gzipSync 是同步压缩，超大响应会把事件循环按住（Sourcery Medium）。
+// 超过上限直接回 identity——宁可少省一次流量，也不让状态/触发/SSE 排在压缩后面。
+const GZIP_MAX_BYTES = 8 * 1024 * 1024
+
+// 是否值得压：只看请求头与长度，不做压缩（条件请求先用它选 tag，304 别再白压一遍）。
+function gzipEligible (res, buf) {
+  return !!(res && res.xbkGzip === true && buf.length >= GZIP_MIN_BYTES && buf.length <= GZIP_MAX_BYTES)
+}
+
+function compressJsonBody (buf) {
+  return zlib.gzipSync(buf, { level: buf.length > GZIP_LARGE_BYTES ? 1 : 6 })
+}
 
 // 压缩决策的唯一入口：res.xbkGzip 由 createServer 回调入口按 Accept-Encoding 置位
 // （每个请求算一次，不在每个端点里重复解析头）。返回 null 表示「按原样发」。
 function gzipJsonBody (res, body) {
-  if (!res || res.xbkGzip !== true) return null
   const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8')
-  if (buf.length < GZIP_MIN_BYTES) return null
-  return zlib.gzipSync(buf, { level: buf.length > GZIP_LARGE_BYTES ? 1 : 6 })
+  return gzipEligible(res, buf) ? compressJsonBody(buf) : null
 }
 
 // gzip 变体的 tag：`"<hash>"` → `"<hash>-gz"`（与静态资产 buildAssetStore 的 gzipEtag 同约定）。
@@ -1457,17 +1491,23 @@ function conditionalVariant (req) {
 function sendJson (res, code, obj) {
   const body = JSON.stringify(obj)
   const gz = gzipJsonBody(res, body)
-  if (gz) {
-    res.writeHead(code, {
+  // 客户端明确拒绝 identity、body 又没到压缩阈值 ⇒ 没有可接受的表示。
+  // 只对成功响应回 406：401/404 这类错误仍原样发出，不能拿编码协商把错误盖掉。
+  if (!gz && code >= 200 && code < 300 && res && res.xbkIdentity === false) {
+    res.writeHead(406, {
       'Content-Type': 'application/json; charset=utf-8',
-      'Content-Encoding': 'gzip',
-      Vary: 'Accept-Encoding'
+      Vary: 'Accept-Encoding',
+      'Content-Length': '0'
     })
-    res.end(gz)
+    res.end()
     return
   }
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
-  res.end(body)
+  // Vary 无条件带：同一 URL 的表示随 Accept-Encoding 变，identity 也要让缓存分键，
+  // 否则缓存里的 identity 副本会被复用给能收 gzip 的客户端（Sourcery Low）。
+  const headers = { 'Content-Type': 'application/json; charset=utf-8', Vary: 'Accept-Encoding' }
+  if (gz) headers['Content-Encoding'] = 'gzip'
+  res.writeHead(code, headers)
+  res.end(gz || body)
 }
 
 // 只读快照端点的条件 GET（v3.363，v3.373 扩到 /api/trends、/api/run-history、
@@ -1483,21 +1523,28 @@ function sendJson (res, code, obj) {
 // 而是「这次读不到」，给它们发稳定 tag 会让客户端把降级态缓存成正常态。
 function sendJsonConditional (req, res, obj) {
   const body = JSON.stringify(obj)
+  const buf = Buffer.from(body, 'utf8')
+  // 先只判断「要不要压」（不压缩）：304 是常态，命中时不该白压一遍（Sourcery Medium）。
+  const willGzip = gzipEligible(res, buf)
   // tag 由**未压缩** body + 请求变体算：Accept-Encoding 只决定「同一份内容取哪个 tag 变体」，
   // 不参与 identity 哈希（否则 zlib 升级会让所有客户端缓存一次性失配）。
   const identityTag = etag(conditionalVariant(req) + '\n' + body)
-  const gz = gzipJsonBody(res, body)
-  const tag = gz ? gzipVariantTag(identityTag) : identityTag
-  const headers = { ETag: tag, 'Cache-Control': 'no-store' }
-  // 同一 URL 有两个表示（identity / gzip）：哪一份回 304 都必须带 Vary，否则中间缓存会把
-  // 「压缩体的 304」套到不接受 gzip 的客户端上。identity 无第二个表示，不加（不压保持不变）。
-  if (gz) headers.Vary = 'Accept-Encoding'
+  const tag = willGzip ? gzipVariantTag(identityTag) : identityTag
+  // Vary 无条件带（identity 也有第二个表示；同一 URL 按 Accept-Encoding 分键）。
+  const headers = { ETag: tag, 'Cache-Control': 'no-store', Vary: 'Accept-Encoding' }
+  // 两个表示都不可接受 ⇒ 406。放在 304 之前：validation 只对「可接受的表示」有意义。
+  if (!willGzip && res && res.xbkIdentity === false) {
+    res.writeHead(406, { ...headers, 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': '0' })
+    res.end()
+    return
+  }
   if (etagMatches(req.headers['if-none-match'], tag)) {
     // 304 只回 tag/缓存指令/Vary：不带 Content-Encoding（没有 body 可解码），也不带 body。
     res.writeHead(304, headers)
     res.end()
     return
   }
+  const gz = willGzip ? compressJsonBody(buf) : null
   const out = { 'Content-Type': 'application/json; charset=utf-8', ...headers }
   if (gz) out['Content-Encoding'] = 'gzip'
   res.writeHead(200, out)
@@ -4860,6 +4907,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 协商式 gzip 的每请求决策（v3.373）：只有 JSON 出口（sendJson / sendJsonConditional）
     // 读这个标记——HTML、SSE、导出附件各自直接 writeHead，按语义不压缩（见 gzipJsonBody 注释）。
     res.xbkGzip = acceptsGzip(req.headers['accept-encoding'])
+    res.xbkIdentity = acceptsIdentity(req.headers['accept-encoding'])
     // ── v3.300 访问日志装配：单点 res.on('finish')，覆盖 sendJson/静态/页面全部响应出口
     // （全文件原本无任何 res.on 监听）。挂回调第一行 ⇒ 畸形 request-target 的 400
     // （下方 sendJson(…,400) 也在覆盖内；malformed 是最值得记录的可疑流量，D3 定夺）。
@@ -6200,10 +6248,12 @@ module.exports = {
   sanitizeAccessPath,
   shouldLogAccess,
   acceptsGzip,
+  acceptsIdentity,
   ACCESS_LOG_MAX,
   // v3.373 协商式 gzip：阈值与决策函数导出（阈值反例与 level 选择必须可被非 HTTP 单测执行）
   GZIP_MIN_BYTES,
   GZIP_LARGE_BYTES,
+  GZIP_MAX_BYTES,
   gzipJsonBody,
   gzipVariantTag,
   conditionalVariant,
