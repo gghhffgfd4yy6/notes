@@ -937,7 +937,10 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
 <link rel="stylesheet" href="/assets/flatpickr.css${assetQuery()}">
 <link rel="stylesheet" href="/assets/app.css${assetQuery()}">
 </head><body>
-<div id="app"><noscript>
+<div id="app"><div class="boot-fallback" role="alert">
+<p class="boot-fail-title">页面没加载出来</p>
+<p class="boot-fail-hint">多半是网络断了一下，或者刚更新过页面。刷新一下（下拉刷新，或重新点开链接）通常就好。</p>
+</div><noscript>
 <section style="max-width:60rem;margin:2rem auto;font-family:system-ui,sans-serif">
 <h1>xbk-push 控制台（无脚本降级）</h1>
 <pre>${statusLines.join('\n')}</pre>
@@ -5329,6 +5332,7 @@ if (require.main === module) main()
 module.exports = {
   createConsole,
   consoleStateDir,
+  STATIC_ASSETS,
   finishRun,
   renderUnauthorizedPage,
   isValidToken,

@@ -7442,3 +7442,6 @@ function App () {
 }
 
 render(html`<${App} />`, document.getElementById('app'))
+// v3.364：挂载成功就移除服务端渲染的失败兜底（CSS 让它 5s 后才显形，正常路径永远看不到）。
+const bootFallback = document.querySelector('#app .boot-fallback')
+if (bootFallback) bootFallback.remove()

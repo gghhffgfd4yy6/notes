@@ -1,6 +1,6 @@
 {
   "name": "xbk-push",
-  "version": "3.363.0",
+  "version": "3.364.0",
   "description": "线报酷推送脚本——规则过滤 + 多通道推送 + 去重缓存 + 运行日志 + 完整测试体系",
   "main": "xbk_function_v3.js",
   "scripts": {
@@ -74,6 +74,7 @@
   "devDependencies": {
     "@stryker-mutator/core": "^10.0.0",
     "@stryker-mutator/tap-runner": "^10.0.0",
+    "acorn": "^8.19.0",
     "c8": "^12.0.0",
     "fast-check": "^4.10.2",
     "standard": "^17.1.2"
