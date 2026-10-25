@@ -980,3 +980,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 测试：监控配置 `limit=1` 且有 2 条新线报时仍逐条推 2 条；同一分钟多条按顺序推进锚点；258 通过。
 - 控制台变异矩阵 part11 随文件增长改为 5801-6179。
 - 版本 3.372.0。
+
+## v3.373 — 控制台传输优化（API gzip / 首屏预加载 / 条件请求扩面）
+
+- API JSON 协商式 gzip：`sendJson` / `sendJsonConditional` 按 `Accept-Encoding` 压缩（≥512B 才压，>256KB 降 level 1）；gzip 变体 ETag（`<hash>-gz`）与 `Vary`，304 仍空体；HTML、SSE、导出附件按语义不压。实测推送记录 49.8KB→14.5KB、运行历史 12.8KB→1.2KB、状态 1KB→438B。
+- 首屏 11 条 `modulepreload`（裸 URL，与 import 说明符逐字一致），把 app.js→ui.js→components.js→flatpickr.js 的串行取模块压成一批；测试用 acorn 对账 app.js 的 import 闭包，多一条/少一条/带 ?v= 都红。
+- 条件请求从 3 个端点扩到 7 个：`/api/trends`、`/api/run-history`、`/api/cache-health`、`/api/config` 也发 ETag/304（`Cache-Control: no-store` 不变）；前端 `COND_CACHE` 8→16，304 但本地无副本时自动去掉 `If-None-Match` 重取一次，不再显示「加载失败」。`/api/status` 与 `/api/sys` 仍不发 ETag。
+- 测试：控制台套件 264 通过；变异矩阵 part11 随文件增长改为 5801-6274。
+- 版本 3.373.0。
