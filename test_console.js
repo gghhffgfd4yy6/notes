@@ -2777,6 +2777,78 @@ async function main () {
       assert.strictEqual(spec.file, want, `route 与文件名必须一致：${route} → ${spec.file}（期望 ${want}）`)
     }
   })
+  await aok('资产: 首屏 modulepreload 覆盖 app.js 的 import 闭包（裸 URL、排在入口之前）', () => {
+    // 预加载是手工维护的 11 行，两种错都不会被别的用例抓住：① 漏一个模块（瀑布还在，只是
+    // 短了点）；② 把 flatpickr 写成 flatpickr.module.js（404，白下一次）。这里用 acorn 从
+    // app.js 出发算**真实**静态 import 闭包，与 HTML 里的 href 逐字对账。
+    const acorn = require('acorn')
+    const { STATIC_ASSETS } = require('./scripts/console.js')
+    const dir = path.join(__dirname, 'scripts', 'console-assets')
+    const walk = (node, fn) => {
+      if (!node || typeof node !== 'object') return
+      if (typeof node.type === 'string') fn(node)
+      for (const key of Object.keys(node)) {
+        if (key === 'type' || key === 'start' || key === 'end') continue
+        const value = node[key]
+        if (Array.isArray(value)) value.forEach((child) => walk(child, fn))
+        else if (value && typeof value === 'object') walk(value, fn)
+      }
+    }
+    const specsOf = (file) => {
+      const ast = acorn.parse(fs.readFileSync(path.join(dir, file), 'utf8'),
+        { ecmaVersion: 'latest', sourceType: 'module' })
+      const out = []
+      walk(ast, (node) => {
+        const hasSource = node.type === 'ImportDeclaration' || node.type === 'ExportAllDeclaration' ||
+          (node.type === 'ExportNamedDeclaration' && node.source)
+        if (hasSource && node.source) out.push(node.source.value)
+      })
+      return out
+    }
+    // 说明符 → 白名单 route（flatpickr 的 route 与文件名不同，按名字拼会算错闭包）。
+    const closure = []
+    const seen = new Set(['/assets/app.js'])
+    const queue = ['/assets/app.js']
+    while (queue.length > 0) {
+      const route = queue.shift()
+      for (const spec of specsOf(STATIC_ASSETS[route].file)) {
+        const child = '/assets/' + spec.replace(/^\.\//, '')
+        if (!Object.prototype.hasOwnProperty.call(STATIC_ASSETS, child)) {
+          throw new Error(`${route} 的 import 目标未登记白名单：${spec}`)
+        }
+        if (seen.has(child)) continue
+        seen.add(child)
+        closure.push(child)
+        queue.push(child)
+      }
+    }
+    assert.ok(closure.length > 0, '闭包不得为空（否则下面的对账恒真）')
+    const { readStatus } = require('./scripts/status')
+    const html = renderPage(readStatus(tmpDir()), [], new URLSearchParams(`token=${TOKEN}`))
+    // 逐字锁形态：rel/href 之外不得有第二个属性（crossorigin 会换缓存键，预加载就白做了）。
+    const hrefs = [...html.matchAll(/<link rel="modulepreload" href="([^"]+)">/g)].map((m) => m[1])
+    assert.strictEqual(hrefs.length, closure.length,
+      `预加载条数必须等于 import 闭包大小（闭包 ${closure.length}，实际 ${hrefs.length}）`)
+    assert.strictEqual(new Set(hrefs).size, hrefs.length, '同一模块不得重复预加载')
+    const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0) // 显式比较函数（Sonar S2871）
+    assert.deepStrictEqual([...hrefs].sort(byCodeUnit), [...closure].sort(byCodeUnit), '预加载清单必须与 app.js 的 import 闭包逐字一致')
+    for (const href of hrefs) {
+      assert.ok(Object.prototype.hasOwnProperty.call(STATIC_ASSETS, href), `${href} 必须是 STATIC_ASSETS 的 key（否则 404）`)
+      assert.ok(!href.includes('?') && !href.includes('#') && !href.includes('token'),
+        `${href} 必须裸 URL（带查询串会二次下载，带凭证会多一处暴露面）`)
+    }
+    assert.ok(!html.includes('crossorigin'), '预加载不得带 crossorigin（换缓存键 = 预加载失效）')
+    // 大文件优先：第一条必须是闭包里最大的那份（省下的正是最关键的几毫秒）。
+    const sizeOf = (route) => fs.statSync(path.join(dir, STATIC_ASSETS[route].file)).size
+    const biggest = [...closure].sort((a, b) => sizeOf(b) - sizeOf(a))[0]
+    assert.strictEqual(hrefs[0], biggest, '首条预加载必须是闭包内最大的模块（大文件优先）')
+    // 必须排在入口脚本之前：浏览器按文档序发现 preload，排在入口之后等于没提前。
+    assert.ok(html.indexOf('rel="modulepreload"') < html.indexOf('<script type="module" src="/assets/app.js'),
+      'modulepreload 必须出现在入口 <script type="module"> 之前')
+    // 入口脚本是带版本号的（?v= = 资产内容哈希），预加载则必须是裸 URL——两者并存才对。
+    assert.match(html, /<script type="module" src="\/assets\/app\.js\?v=[0-9a-f]{16}"><\/script>/,
+      '入口脚本引用必须原样保留（带内容版本号）')
+  })
   await aok('资产: 入口 import 覆盖它实际用到的拆出导出（漏写 = 运行时 ReferenceError）', () => {
     // 聚合器保证「文本断言」在拆分后仍然成立，但这也会掩盖一件事：app.js 如果漏写/写错
     // 某个具名 import，格式化和常量函数在并集里照样存在，文本断言照样绿，浏览器却整页崩。
@@ -2867,6 +2939,312 @@ async function main () {
     const volatile = await request(port, 'GET', '/api/status', { token: TOKEN })
     assert.strictEqual(volatile.headers.etag, undefined, '/api/status 不得下发 ETag（响应本身是易变的）')
     server.close()
+  })
+  await aok('gzipJsonBody: 512B 阈值 / >256KB 用 level 1 / 未协商时不压', () => {
+    const { GZIP_MIN_BYTES, GZIP_LARGE_BYTES, GZIP_MAX_BYTES, gzipJsonBody, gzipVariantTag, conditionalVariant } = require('./scripts/console.js')
+    assert.strictEqual(GZIP_MIN_BYTES, 512, '阈值必须恰为 512B（用例与实现同源对账）')
+    assert.strictEqual(GZIP_LARGE_BYTES, 256 * 1024, '大响应分界必须恰为 256KB')
+    assert.strictEqual(gzipJsonBody({ xbkGzip: true }, 'x'.repeat(GZIP_MIN_BYTES - 1)), null,
+      '低于阈值必须不压（压了更大）')
+    assert.ok(Buffer.isBuffer(gzipJsonBody({ xbkGzip: true }, 'x'.repeat(GZIP_MIN_BYTES))),
+      '恰好达到阈值必须压（>= 512）')
+    assert.strictEqual(gzipJsonBody({ xbkGzip: false }, 'x'.repeat(1000)), null, '未协商 gzip 必须不压')
+    assert.strictEqual(gzipJsonBody({ xbkGzip: true }, 'x'.repeat(GZIP_MAX_BYTES + 1)), null,
+      '超过上限必须回 identity（gzipSync 会按住事件循环，宁可少省一次流量）')
+    assert.strictEqual(gzipJsonBody({}, 'x'.repeat(1000)), null, '没有协商标记（非 HTTP 调用点）必须不压')
+    assert.strictEqual(gzipJsonBody(null, 'x'.repeat(1000)), null, 'res 缺失时不得抛')
+    // level 选择：小响应 6，大响应 1——按 zlib 输出逐字节对账（不只是「有压缩」）。
+    const small = 'y'.repeat(1000)
+    assert.deepStrictEqual(gzipJsonBody({ xbkGzip: true }, small), zlib.gzipSync(Buffer.from(small, 'utf8'), { level: 6 }),
+      '≤256KB 必须用 level 6')
+    const big = 'z'.repeat(GZIP_LARGE_BYTES + 1)
+    assert.deepStrictEqual(gzipJsonBody({ xbkGzip: true }, big), zlib.gzipSync(Buffer.from(big, 'utf8'), { level: 1 }),
+      '>256KB 必须降级到 level 1（省 CPU）')
+    // Buffer 入参按字节长度判定（不是字符串长度）：多字节字符必须算对。
+    const cjk = '中'.repeat(200) // 600 字节，200 个字符
+    assert.ok(Buffer.isBuffer(gzipJsonBody({ xbkGzip: true }, cjk)), 'Buffer.byteLength 口径：200 个汉字 = 600B 必须压')
+    assert.strictEqual(gzipJsonBody({ xbkGzip: true }, '中'.repeat(170)), null, '170 个汉字 = 510B 必须不压')
+    // gzip 变体 tag 的拼法（静态资产同约定）；identity tag 末尾没有引号时也必须有确定行为。
+    assert.strictEqual(gzipVariantTag('"abc"'), '"abc-gz"')
+    assert.strictEqual(gzipVariantTag('abc'), 'abc-gz')
+    // 条件 tag 的变体因子：去掉 ?token=（凭证不参与 ETag），其余查询串保留且排序。
+    assert.strictEqual(conditionalVariant({ url: '/api/config' }), '/api/config')
+    assert.strictEqual(conditionalVariant({ url: '/api/trends?token=abc&days=30' }), '/api/trends?days=30')
+    assert.strictEqual(conditionalVariant({ url: '/api/run-history?limit=10&b=2&a=1' }), '/api/run-history?a=1&b=2&limit=10')
+    assert.notStrictEqual(conditionalVariant({ url: '/api/run-history?limit=10' }), conditionalVariant({ url: '/api/run-history?limit=200' }),
+      '不同查询串必须是不同变体（否则 10 条的 304 会冒充 200 条）')
+  })
+  await aok('HTTP: API JSON 协商式 gzip（变体 ETag / 阈值反例 / HTML-SSE-导出不压）', async () => {
+    const dir = tmpDir()
+    const { gzipVariantTag, GZIP_MIN_BYTES } = require('./scripts/console.js')
+    // >512B 的推送记录夹具：/api/messages 是条件请求端点，正好同时验证「压缩 + 变体 tag」。
+    const msgs = []
+    for (let i = 1; i <= 12; i++) {
+      msgs.push({
+        id: i,
+        title: `特价标题${i}`,
+        content: `第${i}条内容`.repeat(30),
+        catename: '好单-日用',
+        shijianchuo: i * 1000,
+        datetime: '2026-10-15',
+        shorttime: '10:00',
+        price: i,
+        url: `/a/${i}.html`
+      })
+    }
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(msgs))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const gz = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'gzip' } })
+      const id = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'identity' } })
+      assert.strictEqual(gz.status, 200)
+      assert.ok(id.body.length > 512, `夹具必须越过 gzip 阈值（实际 ${id.body.length}B，否则断言恒真）`)
+      assert.strictEqual(gz.headers['content-encoding'], 'gzip', '声明 gzip 时必须压缩')
+      assert.match(String(gz.headers.vary || ''), /Accept-Encoding/, '压缩响应必须带 Vary: Accept-Encoding')
+      assert.strictEqual(id.headers['content-encoding'], undefined, '不声明 gzip 时必须回 identity')
+      assert.match(String(id.headers.vary || ''), /Accept-Encoding/, 'identity 响应也必须带 Vary（同一 URL 的表示随 Accept-Encoding 变，否则缓存会把 identity 复用给能收 gzip 的客户端）')
+      assert.deepStrictEqual(zlib.gunzipSync(gz.body), id.body, 'gzip 解压后必须与 identity 逐字相等')
+      assert.ok(gz.body.length < id.body.length, '压缩体必须更小')
+      // 变体 tag：identity tag 由未压缩 body 算，gzip 只是加 -gz 后缀（静态资产同约定）。
+      assert.match(String(id.headers.etag), /^"[^"]+"$/, 'ETag 必须是强 tag（引号形态）')
+      assert.strictEqual(gz.headers.etag, gzipVariantTag(id.headers.etag), 'gzip tag 必须是 identity tag 的 -gz 变体')
+      assert.notStrictEqual(gz.headers.etag, id.headers.etag, 'gzip 变体 tag 不得等于 identity tag')
+      // 带 gzip tag → 304：空体、不带 Content-Encoding、Vary 仍在（同一 URL 两个表示）。
+      const hit = await requestBuffer(port, 'GET', '/api/messages', {
+        token: TOKEN,
+        headers: { 'accept-encoding': 'gzip', 'if-none-match': gz.headers.etag }
+      })
+      assert.strictEqual(hit.status, 304, 'gzip 变体 tag 命中必须 304')
+      assert.strictEqual(hit.body.length, 0, '304 不得带 body')
+      assert.strictEqual(hit.headers['content-encoding'], undefined, '304 不得带 Content-Encoding（没有可解码的 body）')
+      assert.match(String(hit.headers.vary || ''), /Accept-Encoding/, '304 仍须 Vary（表示随 Accept-Encoding 变）')
+      assert.strictEqual(hit.headers.etag, gz.headers.etag, '304 必须回显所选变体的 tag')
+      // 交叉：identity tag 不得命中 gzip 变体（否则客户端把压缩字节当 JSON 解析）。
+      const cross = await requestBuffer(port, 'GET', '/api/messages', {
+        token: TOKEN,
+        headers: { 'accept-encoding': 'gzip', 'if-none-match': id.headers.etag }
+      })
+      assert.strictEqual(cross.status, 200, 'identity tag 不得命中 gzip 变体')
+      // 阈值反例：/api/auto 的 JSON 只有几十字节，声明 gzip 也不得压。
+      const small = await requestBuffer(port, 'GET', '/api/auto', { token: TOKEN, headers: { 'accept-encoding': 'gzip' } })
+      assert.ok(small.body.length < GZIP_MIN_BYTES, `反例必须真的低于阈值（实际 ${small.body.length}B）`)
+      assert.strictEqual(small.headers['content-encoding'], undefined, '低于 512B 的响应不得压缩')
+      assert.ok(Object.prototype.hasOwnProperty.call(JSON.parse(small.body.toString('utf8')), 'auto'), '小响应仍是完整 JSON')
+      // HTML 反向断言：含 boot token 且只有 ~1.9KB，压了只多一次解压。
+      const page = await requestBuffer(port, 'GET', '/', { token: TOKEN, headers: { 'accept-encoding': 'gzip' } })
+      assert.strictEqual(page.status, 200)
+      assert.strictEqual(page.headers['content-encoding'], undefined, 'HTML 不得压缩（含 boot token）')
+      assert.ok(page.body.toString('utf8').includes('xbk-boot'), 'HTML 仍是可读原文')
+      // 导出附件：浏览器直接落盘，压了会破坏「另存为」的体积口径。
+      const expHeaders = { 'content-type': 'application/x-www-form-urlencoded', 'accept-encoding': 'gzip' }
+      const expJson = await requestBuffer(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json', headers: expHeaders })
+      assert.strictEqual(expJson.status, 200)
+      assert.ok(expJson.body.length > 512, '导出夹具必须越过 gzip 阈值（否则断言恒真）')
+      assert.strictEqual(expJson.headers['content-encoding'], undefined, 'JSON 导出附件不得压缩')
+      assert.match(String(expJson.headers['content-type'] || ''), /application\/json/)
+      const expCsv = await requestBuffer(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=csv', headers: expHeaders })
+      assert.strictEqual(expCsv.status, 200)
+      assert.strictEqual(expCsv.headers['content-encoding'], undefined, 'CSV 导出附件不得压缩')
+      assert.strictEqual(expCsv.body.slice(0, 3).toString('hex'), 'efbbbf', 'CSV 仍是带 BOM 的原文')
+      // 备份导出是另一个直接 writeHead 的 attachment 出口（3614 一带），同样不压。
+      const backup = await requestBuffer(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['messages'] }),
+        headers: { 'content-type': 'application/json', 'accept-encoding': 'gzip' }
+      })
+      assert.strictEqual(backup.status, 200)
+      assert.ok(backup.body.length > 512, '备份夹具必须越过 gzip 阈值')
+      assert.strictEqual(backup.headers['content-encoding'], undefined, '备份导出附件不得压缩')
+      assert.strictEqual(JSON.parse(backup.body.toString('utf8')).kind, 'xbk-console-backup')
+      // 默认（不带 Accept-Encoding）仍走 identity：Node 客户端与 curl 不受影响。
+      const plain = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN })
+      assert.strictEqual(plain.headers['content-encoding'], undefined, '不带 Accept-Encoding 必须回 identity')
+      // 两种表示都不可接受：不得硬塞 identity（Sourcery Medium），回 406 空体。
+      const refuse = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'gzip;q=0, identity;q=0' } })
+      assert.strictEqual(refuse.status, 406, 'gzip 与 identity 都被拒绝时必须 406')
+      assert.strictEqual(refuse.body.length, 0, '406 不带 body')
+      const smallRefuse = await requestBuffer(port, 'GET', '/api/auto', { token: TOKEN, headers: { 'accept-encoding': 'gzip, identity;q=0' } })
+      assert.strictEqual(smallRefuse.status, 406, '小响应压不了且 identity 被拒 → 406')
+    } finally { server.close() }
+  })
+  await aok('HTTP: SSE 响应头不带 Content-Encoding（流式增量不压缩）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    runs.set('1750000000000.9', makeStreamRecord('1750000000000.9'))
+    try {
+      const sseHeaders = await new Promise((resolve, reject) => {
+        const req = http.request({
+          host: '127.0.0.1',
+          port,
+          path: '/api/runs/stream?id=1750000000000.9&since=0',
+          headers: { authorization: `Bearer ${TOKEN}`, 'accept-encoding': 'gzip' }
+        }, (res) => {
+          const snapshot = { ...res.headers }
+          res.destroy() // 只取响应头：这是长连接，读完头就断，由服务端 teardown 收尾
+          resolve(snapshot)
+        })
+        req.on('error', reject)
+        req.end()
+      })
+      assert.match(String(sseHeaders['content-type'] || ''), /text\/event-stream/, 'SSE Content-Type 不变')
+      assert.strictEqual(sseHeaders['content-encoding'], undefined, 'SSE 不得压缩（流式帧压缩要攒帧）')
+      assert.strictEqual(sseHeaders.vary, undefined, 'SSE 不压 → 不新增 Vary')
+    } finally { server.close() }
+  })
+  await aok('HTTP: 条件请求扩面（trends / run-history / cache-health / config 的 ETag 与 304）', async () => {
+    const dir = tmpDir()
+    // 固定日期会在 14 天窗滑走后让「追加一行 → tag 变」永久红：按上海当日生成。
+    const dayKey = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10)
+    const summary = (n) => `${dayKey} 12:16:0${n} total=${n} dedup=0 filtered=0 truncated=0 pushed=${n} failed=0 elapsed=10.1s cachesaved=1`
+    fs.writeFileSync(path.join(dir, 'run.log'), [summary(1), summary(2), summary(3)].join('\n') + '\n')
+    const pushFixture = (extra) => JSON.stringify([...Array(1 + extra).keys()].map((i) => ({
+      id: i + 1, title: `t${i}`, content: 'c', catename: '好单-日用', shijianchuo: 1000 + i
+    })))
+    fs.writeFileSync(path.join(dir, 'push.json'), pushFixture(0))
+    // /api/config 的 body 只随部署/环境变量变：先显式清空，再在「内容变化」一步里改值——
+    // 不依赖宿主环境里是否已经设了 XBK_INTERVAL_MS。
+    const envBackup = process.env.XBK_INTERVAL_MS
+    process.env.XBK_INTERVAL_MS = ''
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const cases = [
+        { name: 'trends', path: '/api/trends', mutate: () => fs.appendFileSync(path.join(dir, 'run.log'), summary(4) + '\n') },
+        { name: 'run-history', path: '/api/run-history', mutate: () => fs.appendFileSync(path.join(dir, 'run.log'), summary(5) + '\n') },
+        { name: 'cache-health', path: '/api/cache-health', mutate: () => fs.writeFileSync(path.join(dir, 'push.json'), pushFixture(2)) },
+        { name: 'config', path: '/api/config', mutate: () => { process.env.XBK_INTERVAL_MS = '424242' } }
+      ]
+      for (const c of cases) {
+        const first = await request(port, 'GET', c.path, { token: TOKEN })
+        assert.strictEqual(first.status, 200, `${c.name} 首包必须 200`)
+        const tag = first.headers.etag
+        assert.ok(typeof tag === 'string' && tag.length >= 2, `${c.name} 必须下发 ETag`)
+        assert.strictEqual(first.headers['cache-control'], 'no-store', `${c.name} 必须 no-store（带鉴权的响应不得被任何缓存留存）`)
+        const hit = await request(port, 'GET', c.path, { token: TOKEN, headers: { 'if-none-match': tag } })
+        assert.strictEqual(hit.status, 304, `${c.name} 命中 If-None-Match 必须 304`)
+        assert.strictEqual(hit.text, '', `${c.name} 304 不得带 body`)
+        assert.strictEqual(hit.headers.etag, tag, `${c.name} 304 必须回显 ETag`)
+        assert.strictEqual(hit.headers['cache-control'], 'no-store', `${c.name} 304 仍须 no-store`)
+        c.mutate()
+        const changed = await request(port, 'GET', c.path, { token: TOKEN, headers: { 'if-none-match': tag } })
+        assert.strictEqual(changed.status, 200, `${c.name} 内容变了必须忽略旧 tag（回 200 全量）`)
+        assert.notStrictEqual(changed.headers.etag, tag, `${c.name} 内容变化必须换 tag`)
+      }
+      // 查询串不同 ⇒ tag 必须不同，且不能互相 304（数据不足时 limit=10/200 的 body 可能逐字相同）。
+      for (const [a, b] of [
+        ['/api/trends?days=14', '/api/trends?days=30'],
+        ['/api/run-history?limit=10', '/api/run-history?limit=200']
+      ]) {
+        const ra = await request(port, 'GET', a, { token: TOKEN })
+        const rb = await request(port, 'GET', b, { token: TOKEN })
+        assert.strictEqual(ra.status, 200)
+        assert.strictEqual(rb.status, 200)
+        assert.notStrictEqual(ra.headers.etag, rb.headers.etag, `${a} 与 ${b} 的 tag 必须不同`)
+        const cross = await request(port, 'GET', b, { token: TOKEN, headers: { 'if-none-match': ra.headers.etag } })
+        assert.strictEqual(cross.status, 200, `${a} 的 tag 不得让 ${b} 回 304`)
+      }
+      // ?token= 是浏览器兼容路径的凭证，不得参与 ETag（同一内容按不同凭证访问必须同一 tag）。
+      const withTok = await request(port, 'GET', `/api/config?token=${TOKEN}`, { token: TOKEN })
+      const noTok = await request(port, 'GET', '/api/config', { token: TOKEN })
+      assert.strictEqual(withTok.headers.etag, noTok.headers.etag, '?token= 不得进 ETag（否则条件缓存按凭证分裂）')
+    } finally {
+      if (envBackup === undefined) delete process.env.XBK_INTERVAL_MS
+      else process.env.XBK_INTERVAL_MS = envBackup
+      server.close()
+    }
+    // 降级/错误分支与易变端点：一律不发 ETag。
+    const second = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port2 = await listen(second.server)
+    try {
+      const degraded = await request(port2, 'GET', '/api/trends', { token: TOKEN })
+      assert.strictEqual(degraded.status, 200)
+      assert.strictEqual(JSON.parse(degraded.text).status, 'missing', '空目录 → trends 走降级分支')
+      assert.strictEqual(degraded.headers.etag, undefined, '降级分支不得下发 ETag（否则降级态会被 304 冻住）')
+      for (const p of ['/api/status', '/api/sys', '/api/sys?probe=version']) {
+        const r = await request(port2, 'GET', p, { token: TOKEN })
+        assert.strictEqual(r.status, 200, `${p} 必须 200`)
+        assert.strictEqual(r.headers.etag, undefined, `${p} 不得下发 ETag（每拍都在变，契约也不允许）`)
+      }
+    } finally { second.server.close() }
+  })
+  await aok('前端数据层: 304 但本地无副本时去掉 If-None-Match 重取一次（可执行断言）', async () => {
+    // api.js 是浏览器 ESM（import constants + 模块级 readBoot）。这里把它复制成 .mjs 用
+    // Node 原生 ESM 加载，换掉 fetch/document/window 三个外部面，真实跑 consumeJson 的分支。
+    const { pathToFileURL } = require('node:url')
+    const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
+    const modDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-api-mod-'))
+    const realFetch = globalThis.fetch
+    const realDocument = globalThis.document
+    const realWindow = globalThis.window
+    const calls = []
+    try {
+      fs.writeFileSync(path.join(modDir, 'api.mjs'), apiSrc.replace("from './constants.js'", "from './constants.mjs'"))
+      fs.writeFileSync(path.join(modDir, 'constants.mjs'), constSrc)
+      // 四拍的剧本：200（首次）→ 304（命中缓存）→ 304（本地没有这个 key）→ 200（重取成功）
+      const res200 = (tag, data) => ({
+        status: 200,
+        ok: true,
+        headers: { get: (n) => (String(n).toLowerCase() === 'etag' ? tag : null) },
+        json: async () => data
+      })
+      const res304 = () => ({ status: 304, ok: false, headers: { get: () => null }, json: async () => { throw new Error('304 不得读 body') } })
+      const script = [res200('"t-1"', { marker: 'first' }), res304(), res304(), res200('"t-2"', { marker: 'retried' })]
+      globalThis.document = { getElementById: () => null }
+      globalThis.window = { dispatchEvent: () => {} }
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, headers: { ...((opts && opts.headers) || {}) } })
+        if (script.length === 0) throw new Error('fetch 调用次数超出剧本（304 分支可能重复重试）')
+        return script.shift()
+      }
+      const mod = await import(pathToFileURL(path.join(modDir, 'api.mjs')).href)
+      const hasCond = (i) => Object.keys(calls[i].headers).some((k) => k.toLowerCase() === 'if-none-match')
+      assert.strictEqual((await mod.apiGetConfig()).marker, 'first', '首包 200 正常返回')
+      assert.strictEqual(hasCond(0), false, '首次无本地副本 → 不带 If-None-Match')
+      // 第二次：服务端 304，本地有副本 → 复用，不得再发请求。
+      assert.strictEqual((await mod.apiGetConfig()).marker, 'first', '304 命中必须复用本地副本')
+      assert.strictEqual(calls.length, 2, '304 命中不得额外发请求')
+      assert.strictEqual(hasCond(1), true, '第二次必须带 If-None-Match（说明条件请求真的发出去了）')
+      // 第三次：换一个没有本地副本的键 → 服务端仍回 304（边缘缓存/陈旧代理）→ 必须重取。
+      const retried = await mod.apiGetCacheHealth()
+      assert.strictEqual(retried.marker, 'retried', '304 无本地副本必须重取并返回 200 的真实数据')
+      assert.strictEqual(calls.length, 4, '重试恰好一次（总共 4 次 fetch）')
+      assert.strictEqual(hasCond(2), false, '无副本的键本来就不带条件头')
+      assert.strictEqual(hasCond(3), false, '重试必须去掉 If-None-Match（否则还是 304，陷入死循环）')
+      assert.match(calls[3].url, /\/api\/cache-health$/, '重试打的必须是同一个端点')
+      // 并发覆盖：A 带着 t-3 发出 → B 先写入 t-4 → A 的 304 到达时不得复用 t-4 的数据。
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, headers: { ...((opts && opts.headers) || {}) } })
+        return res200('"t-3"', { marker: 'base' })
+      }
+      assert.strictEqual((await mod.apiGetConfig()).marker, 'base', '基线：缓存条换成 t-3')
+      let release
+      const gate = new Promise((resolve) => { release = resolve })
+      let n = 0
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, headers: { ...((opts && opts.headers) || {}) } })
+        n += 1
+        if (n === 1) { await gate; return res304() }
+        if (n === 2) return res200('"t-4"', { marker: 'other-tab' })
+        if (n === 3) return res200('"t-5"', { marker: 'refetched' })
+        throw new Error('fetch 调用次数超出剧本')
+      }
+      const baseIdx = calls.length
+      const pA = mod.apiGetConfig()
+      const pB = mod.apiGetConfig()
+      assert.strictEqual((await pB).marker, 'other-tab', '并发请求 B 写入 t-4')
+      release()
+      assert.strictEqual((await pA).marker, 'refetched', '304 的 tag 与缓存条不一致时必须重取')
+      assert.strictEqual(hasCond(baseIdx), true, 'A 必须带 If-None-Match')
+      assert.strictEqual(hasCond(baseIdx + 2), false, '重取必须去掉条件头')
+    } finally {
+      globalThis.fetch = realFetch
+      globalThis.document = realDocument
+      globalThis.window = realWindow
+      fs.rmSync(modDir, { recursive: true, force: true })
+    }
   })
   await aok('HTTP: POST /trigger 非法 action → 400', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -8066,7 +8444,14 @@ async function main () {
     assert.ok(src.includes('addConditional(merged, \'auto\')'), '/api/auto 必须接入条件请求')
     assert.ok(src.includes('addConditional(merged, condKey)'), '/api/messages 必须接入条件请求')
     assert.ok(!/addConditional\(merged, 'status'\)/.test(src), '/api/status 不得走条件请求（generatedAt/锁龄每拍在变）')
-    assert.ok(src.includes('COND_CACHE_MAX = 8') && src.includes('rememberConditional('), '条件缓存必须有界（messages 键含筛选/分页，无上限会无限增长）')
+    assert.ok(src.includes('COND_CACHE_MAX = 16') && src.includes('rememberConditional('), '条件缓存必须有界（messages 键含筛选/分页，无上限会无限增长）；v3.373 扩到 7 个端点 ⇒ 16')
+    // v3.373：四个新端点必须真的接上条件请求（断言调用点，不是「文件里出现过某字符串」）。
+    for (const key of ["'config'", "'cache-health'", '`trends?' + '$' + '{qs}`', '`run-history?' + '$' + '{qs}`']) {
+      assert.ok(src.includes('conditionalRequest(' + key), `${key} 必须接入条件请求（否则每次都整包重传）`)
+    }
+    // 304 但本地无副本必须自动重试一次，不能把 304 当错误（配置页会显示「加载失败」）。
+    assert.ok(src.includes('typeof retry === \'function\''), 'consumeJson 的 304 分支必须有重试通道')
+    assert.ok(src.includes('const again = once(false)'), '重试必须去掉 If-None-Match（once(false) 不再注入条件头）')
     // fetch 在调用时快照 headers：messages 的 addConditional 必须排在 fetch 之前。
     const msgFn = src.slice(src.indexOf('function apiGetMessages'), src.indexOf('function apiGetTrends'))
     assert.ok(msgFn.indexOf('addConditional(merged, condKey)') < msgFn.indexOf('fetch('), 'messages 必须先注入 If-None-Match 再 fetch')

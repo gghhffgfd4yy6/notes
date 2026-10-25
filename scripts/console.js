@@ -767,6 +767,30 @@ function acceptsGzip (header) {
   return false
 }
 
+// Accept-Encoding 里的 identity：**默认接受**，只有显式 `identity;q=0`（或 `*;q=0` 且
+// 没有 identity 例外）才算拒绝。gzip 与 identity 都不可接受时不能再硬塞 identity——
+// 那是一个客户端明确拒绝的表示（Sourcery Medium）；JSON 出口改回 406。
+function acceptsIdentity (header) {
+  let explicit = null
+  let wildcard = null
+  for (const part of String(header || '').split(',')) {
+    const segs = part.trim().toLowerCase().split(';')
+    const token = segs[0].trim()
+    if (token !== 'identity' && token !== '*') continue
+    const qseg = segs.slice(1).map((x) => x.trim()).find((x) => x.startsWith('q='))
+    let q = 1
+    if (qseg) {
+      const val = Number(qseg.slice(2))
+      q = Number.isFinite(val) ? val : 0
+    }
+    if (token === 'identity') explicit = q
+    else wildcard = q
+  }
+  if (explicit !== null) return explicit > 0
+  if (wildcard !== null) return wildcard > 0
+  return true
+}
+
 // If-None-Match：支持 *、逗号列表与弱比较（GET 语义）。
 function etagMatches (header, etag) {
   const raw = String(header || '').trim()
@@ -967,12 +991,30 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
     .replace(/>/g, '\\u003e')
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029')
+  // 首屏模块预加载（v3.373）：app.js 是唯一入口，浏览器必须先拿到并解析它才知道有 11 个
+  // 依赖模块——「取 app.js → 解析 → 再并发取模块」是一段可见的瀑布。这里按体积从大到小
+  // 预声明整张静态 import 闭包（test_console.js 用 acorn 算闭包逐字对账，漏一个/多一个都红）。
+  // **必须裸 URL**：模块说明符就是 './xxx.js'，裸 URL 才命中预加载条目；带 ?v= 会按另一个
+  // 请求算（同一文件下两次），带 crossorigin 会换缓存键——两者都让预加载白做。
+  // flatpickr 写路由名 /assets/flatpickr.js（真实文件名 flatpickr.module.js，写后者 404）。
+  // app.js 自己不加 preload：<script type="module" src> 就是它的取用点。
   return `<!doctype html>
 <html lang="zh-CN" data-theme="${THEMES.includes(theme) ? theme : THEMES[0]}"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="${CSP_HEADER}">
 <link rel="stylesheet" href="/assets/flatpickr.css${assetQuery()}">
 <link rel="stylesheet" href="/assets/app.css${assetQuery()}">
+<link rel="modulepreload" href="/assets/pages.js">
+<link rel="modulepreload" href="/assets/flatpickr.js">
+<link rel="modulepreload" href="/assets/components.js">
+<link rel="modulepreload" href="/assets/ui.js">
+<link rel="modulepreload" href="/assets/htm-preact.module.js">
+<link rel="modulepreload" href="/assets/pure.mjs">
+<link rel="modulepreload" href="/assets/motion.js">
+<link rel="modulepreload" href="/assets/motion-lib.module.js">
+<link rel="modulepreload" href="/assets/api.js">
+<link rel="modulepreload" href="/assets/constants.js">
+<link rel="modulepreload" href="/assets/format.js">
 </head><body>
 <div id="app"><div class="boot-fallback" role="alert">
 <p class="boot-fail-title">页面没加载出来</p>
@@ -1390,30 +1432,123 @@ function authorize (req, token, urlQuery) {
   return false
 }
 
-function sendJson (res, code, obj) {
-  const body = JSON.stringify(obj)
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
-  res.end(body)
+// ── API JSON 协商式 gzip（v3.373）───────────────────────────────────────────
+// 只压 JSON 响应体。三类明确不压：
+//   · HTML（首屏/登录页）：含 boot token 且只有 ~1.9KB，压了反而多一次解压；
+//   · SSE（/api/runs/stream）：流式增量帧，压缩要攒帧，等于把实时性换流量；
+//   · 导出附件（备份 / 推送记录 JSON/CSV）：浏览器直接落盘，压了会打乱「另存为」的体积
+//     口径与 Content-Length 语义，也让中间产物不再可 grep。
+// 阈值 512B：更小的 JSON（如 {"runs":[]}）gzip 后常常更大，白付 CPU 还多一个头。
+const GZIP_MIN_BYTES = 512
+// >256KB 的响应（推送记录整页）换 level 1：压缩率损失远小于省下的 CPU 时间。
+const GZIP_LARGE_BYTES = 256 * 1024
+// 上限 8MiB：gzipSync 是同步压缩，超大响应会把事件循环按住（Sourcery Medium）。
+// 超过上限直接回 identity——宁可少省一次流量，也不让状态/触发/SSE 排在压缩后面。
+const GZIP_MAX_BYTES = 8 * 1024 * 1024
+
+// 是否值得压：只看请求头与长度，不做压缩（条件请求先用它选 tag，304 别再白压一遍）。
+function gzipEligible (res, buf) {
+  return !!(res && res.xbkGzip === true && buf.length >= GZIP_MIN_BYTES && buf.length <= GZIP_MAX_BYTES)
 }
 
-// 只读快照端点的条件 GET（v3.363）：同一份 body 发 ETag，客户端带 If-None-Match
-// 命中时回 304 空体。**Cache-Control 用 no-store**：即便客户端自己发条件请求，也不允许
-// 浏览器/中间代理把带鉴权的响应体留在任何 HTTP 缓存里（no-cache 只是「每次复用前先问」，
+function compressJsonBody (buf) {
+  return zlib.gzipSync(buf, { level: buf.length > GZIP_LARGE_BYTES ? 1 : 6 })
+}
+
+// 压缩决策的唯一入口：res.xbkGzip 由 createServer 回调入口按 Accept-Encoding 置位
+// （每个请求算一次，不在每个端点里重复解析头）。返回 null 表示「按原样发」。
+function gzipJsonBody (res, body) {
+  const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8')
+  return gzipEligible(res, buf) ? compressJsonBody(buf) : null
+}
+
+// gzip 变体的 tag：`"<hash>"` → `"<hash>-gz"`（与静态资产 buildAssetStore 的 gzipEtag 同约定）。
+// identity tag 始终由**未压缩**的 body 算——压缩字节随 zlib 版本/level 变化，用它算 tag 会让
+// 客户端手里的旧 tag 在升级后永远失配（每个请求都 200 全量）。
+function gzipVariantTag (identityTag) {
+  const s = String(identityTag || '')
+  return s.endsWith('"') ? `${s.slice(0, -1)}-gz"` : `${s}-gz`
+}
+
+// 条件 tag 的变体因子：请求路径 + 查询串（去掉 ?token=，其余按字典序）。
+// 为什么必须进 tag：/api/run-history?limit=10 与 ?limit=200 在数据不足时 body 可能逐字相同，
+// 共用 tag 会让「10 条的 304」冒充「200 条的响应」。token 不进哈希——它是浏览器兼容路径的
+// 凭证，同一份内容按不同凭证访问不该拿到不同 tag（否则条件缓存全失效）。
+function conditionalVariant (req) {
+  const raw = String((req && req.url) || '')
+  const qAt = raw.indexOf('?')
+  if (qAt < 0) return raw
+  const params = raw.slice(qAt + 1).split('&')
+    .filter((part) => part !== '' && part !== 'token' && !part.startsWith('token='))
+  // 显式按码点比较：默认 sort() 会先转字符串再按 UTF-16 码元排，语义虽相同，但 Sonar
+  // S2871 要求给出比较函数；同时避免依赖实现默认行为。
+  params.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  // 参数全被滤掉（只有 ?token=）时必须回落到「无查询串」形态，否则 '/api/config?token=x'
+  // 会算出 '/api/config?'，与裸 URL 的 tag 分裂成两份。
+  return raw.slice(0, qAt) + (params.length > 0 ? '?' + params.join('&') : '')
+}
+
+function sendJson (res, code, obj) {
+  const body = JSON.stringify(obj)
+  const gz = gzipJsonBody(res, body)
+  // 客户端明确拒绝 identity、body 又没到压缩阈值 ⇒ 没有可接受的表示。
+  // 只对成功响应回 406：401/404 这类错误仍原样发出，不能拿编码协商把错误盖掉。
+  if (!gz && code >= 200 && code < 300 && res && res.xbkIdentity === false) {
+    res.writeHead(406, {
+      'Content-Type': 'application/json; charset=utf-8',
+      Vary: 'Accept-Encoding',
+      'Content-Length': '0'
+    })
+    res.end()
+    return
+  }
+  // Vary 无条件带：同一 URL 的表示随 Accept-Encoding 变，identity 也要让缓存分键，
+  // 否则缓存里的 identity 副本会被复用给能收 gzip 的客户端（Sourcery Low）。
+  const headers = { 'Content-Type': 'application/json; charset=utf-8', Vary: 'Accept-Encoding' }
+  if (gz) headers['Content-Encoding'] = 'gzip'
+  res.writeHead(code, headers)
+  res.end(gz || body)
+}
+
+// 只读快照端点的条件 GET（v3.363，v3.373 扩到 /api/trends、/api/run-history、
+// /api/cache-health、/api/config 的**成功**分支）：同一份 body 发 ETag，客户端带
+// If-None-Match 命中时回 304 空体。**Cache-Control 用 no-store**：即便客户端自己发条件请求，
+// 也不允许浏览器/中间代理把带鉴权的响应体留在任何 HTTP 缓存里（no-cache 只是「每次复用前先问」，
 // 仍然允许存储——Sourcery PR #321）。条件缓存由前端自己的内存 Map 承担。
 // 与静态资产的强缓存（`immutable`）是两套语义，别合并。
 // **不用于 /api/status**：它的 generatedAt / lock.ageMs / stats 每次请求都在变，
 // 给它发 ETag 只会永远不命中（且 304 会把「现在几点」冻住）——按语义就不该缓存。
+// **也不用于 /api/sys（含 ?probe=version）**：uptimeS/rssBytes 每拍都变，命中率是 0。
+// 降级/错误分支（trends 读不到、config 保险丝降级等）保持 sendJson：那不是「内容未变」，
+// 而是「这次读不到」，给它们发稳定 tag 会让客户端把降级态缓存成正常态。
 function sendJsonConditional (req, res, obj) {
   const body = JSON.stringify(obj)
-  const tag = etag(body)
-  const headers = { ETag: tag, 'Cache-Control': 'no-store' }
+  const buf = Buffer.from(body, 'utf8')
+  // 先只判断「要不要压」（不压缩）：304 是常态，命中时不该白压一遍（Sourcery Medium）。
+  const willGzip = gzipEligible(res, buf)
+  // tag 由**未压缩** body + 请求变体算：Accept-Encoding 只决定「同一份内容取哪个 tag 变体」，
+  // 不参与 identity 哈希（否则 zlib 升级会让所有客户端缓存一次性失配）。
+  const identityTag = etag(conditionalVariant(req) + '\n' + body)
+  const tag = willGzip ? gzipVariantTag(identityTag) : identityTag
+  // Vary 无条件带（identity 也有第二个表示；同一 URL 按 Accept-Encoding 分键）。
+  const headers = { ETag: tag, 'Cache-Control': 'no-store', Vary: 'Accept-Encoding' }
+  // 两个表示都不可接受 ⇒ 406。放在 304 之前：validation 只对「可接受的表示」有意义。
+  if (!willGzip && res && res.xbkIdentity === false) {
+    res.writeHead(406, { ...headers, 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': '0' })
+    res.end()
+    return
+  }
   if (etagMatches(req.headers['if-none-match'], tag)) {
+    // 304 只回 tag/缓存指令/Vary：不带 Content-Encoding（没有 body 可解码），也不带 body。
     res.writeHead(304, headers)
     res.end()
     return
   }
-  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...headers })
-  res.end(body)
+  const gz = willGzip ? compressJsonBody(buf) : null
+  const out = { 'Content-Type': 'application/json; charset=utf-8', ...headers }
+  if (gz) out['Content-Encoding'] = 'gzip'
+  res.writeHead(200, out)
+  res.end(gz || body)
 }
 
 // 页面类响应（登录/挑战页与 SPA 壳）的统一安全头：Referrer-Policy 只在这里写一次。
@@ -4769,6 +4904,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   }
 
   const server = http.createServer((req, res) => {
+    // 协商式 gzip 的每请求决策（v3.373）：只有 JSON 出口（sendJson / sendJsonConditional）
+    // 读这个标记——HTML、SSE、导出附件各自直接 writeHead，按语义不压缩（见 gzipJsonBody 注释）。
+    res.xbkGzip = acceptsGzip(req.headers['accept-encoding'])
+    res.xbkIdentity = acceptsIdentity(req.headers['accept-encoding'])
     // ── v3.300 访问日志装配：单点 res.on('finish')，覆盖 sendJson/静态/页面全部响应出口
     // （全文件原本无任何 res.on 监听）。挂回调第一行 ⇒ 畸形 request-target 的 400
     // （下方 sendJson(…,400) 也在覆盖内；malformed 是最值得记录的可疑流量，D3 定夺）。
@@ -5240,7 +5379,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sendJson(res, 200, { status: t.status, byDay: [], days })
         return
       }
-      sendJson(res, 200, {
+      sendJsonConditional(req, res, {
         status: 'ok',
         days: t.value.days,
         from: t.value.from,
@@ -5276,7 +5415,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // （xbk_app _writeRunLog → MessageStore.cacheDir），不是控制台 stateDir——Config.cache.dir
       // 指向别处时两个目录分居。读取源与 spawn/停止留痕同走 historyDir()（运行侧真实目录优先）。
       const h = readRunHistory(historyDir(), { limit, before, windowKey, excludeCancelled })
-      sendJson(res, 200, h)
+      sendJsonConditional(req, res, h)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/logs') {
@@ -5310,7 +5449,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       snap.entryCountStatus = cnt.status
       snap.entryCountFiltered = cnt.status === 'ok' ? cnt.filteredCount : null
       if (cnt.status === 'tooLarge') snap.entryCountHint = `缓存超过 ${Math.round(CACHE_HEALTH_COUNT_MAX_BYTES / (1024 * 1024))}MiB，不在请求路径上整读计数（推送记录页的 grandTotal 仍可查）`
-      sendJson(res, 200, snap)
+      sendJsonConditional(req, res, snap)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/files') {
@@ -5337,7 +5476,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         })
         return
       }
-      sendJson(res, 200, view)
+      sendJsonConditional(req, res, view)
       return
     }
     // GET /api/config/filter：过滤规则读面（全局鉴权已通过，Cookie/Bearer/?token= 均可）。
@@ -6109,7 +6248,15 @@ module.exports = {
   sanitizeAccessPath,
   shouldLogAccess,
   acceptsGzip,
+  acceptsIdentity,
   ACCESS_LOG_MAX,
+  // v3.373 协商式 gzip：阈值与决策函数导出（阈值反例与 level 选择必须可被非 HTTP 单测执行）
+  GZIP_MIN_BYTES,
+  GZIP_LARGE_BYTES,
+  GZIP_MAX_BYTES,
+  gzipJsonBody,
+  gzipVariantTag,
+  conditionalVariant,
   // D2-S13：最终保险丝（必须可被单测执行，否则又是一段不可达的死代码）
   findSecretLikeField,
   // D2-S12：cache-health 条数阈值（用例按同一常量构造夹具）
