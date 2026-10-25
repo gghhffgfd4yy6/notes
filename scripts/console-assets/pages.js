@@ -2154,13 +2154,24 @@ function SearchPanel ({ onSync, active = true }) {
       } catch (e) {}
       for (const w of current) {
         try {
-          const d = await apiSearchLines({ q: w.q, page: 1, limit: cfg.limit })
-          if (!d || d.status !== 'ok' || !Array.isArray(d.items)) { failed += 1; continue }
-          // 优先用「上次读到的最新条目标识」做锚点：上游时间只有分钟精度，仅靠 ts 会漏掉
-          // 同一分钟内发布的新线报。锚点不在第 1 页（被新条目挤走）时退回 ts 比较。
-          const idx = w.lastReadId ? d.items.findIndex((it) => it.id === w.lastReadId) : -1
-          if (idx >= 0) next[w.q] = idx
-          else next[w.q] = d.items.filter((it) => typeof it.ts === 'number' && it.ts > (w.lastReadAt || 0)).length
+          // 和监控用同一套范围：从第 1 页往回翻到锚点所在页（最多 5 页），
+          // 不能只数第 1 页——新增超过一页时角标会少报。
+          const since = w.lastReadAt > 0 ? w.lastReadAt : Date.now()
+          let count = 0
+          for (let page = 1; page <= 5; page += 1) {
+            const d = await apiSearchLines({ q: w.q, page, limit: 100 })
+            if (!d || d.status !== 'ok' || !Array.isArray(d.items)) throw new Error('check failed')
+            if (d.items.length === 0) break
+            // 优先用「上次读到的最新条目标识」做锚点：上游时间只有分钟精度，仅靠 ts 会漏掉
+            // 同一分钟内发布的新线报。锚点不在当前页时按 ts 比较，并继续往前翻。
+            const idx = w.lastReadId ? d.items.findIndex((it) => it.id === w.lastReadId) : -1
+            if (idx >= 0) { count += idx; break }
+            const allNew = d.items.every((it) => typeof it.ts === 'number' && it.ts > since)
+            count += d.items.filter((it) => typeof it.ts === 'number' && it.ts > since).length
+            if (!allNew) break
+            if (page >= Math.min(Number(d.pages) || 1, 5)) break
+          }
+          next[w.q] = count
         } catch (e) {
           failed += 1 // 单个词失败不拖累其它词，保留它上次的角标
         }

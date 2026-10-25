@@ -2529,6 +2529,43 @@ async function watchMonitorTests () {
       fs.rmSync(dir2, { recursive: true, force: true })
     }
   })
+
+  await aok('关注词监控: 同一分钟多条按顺序推进锚点，下一轮不重复', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-watch3-'))
+    const ts = Date.UTC(2026, 9, 25, 10, 0)
+    const html = `<html><body><ul class="new-post">
+<li class="article-list"><p class="title"><time title="2026-10-25 18:00">18:00</time><a href="/haodan/9000001.html" title="同分钟 A" data-price="">同分钟 A</a></p></li>
+<li class="article-list"><p class="title"><time title="2026-10-25 18:00">18:00</time><a href="/haodan/9000002.html" title="同分钟 B" data-price="">同分钟 B</a></p></li>
+<li class="article-list"><p class="title"><time title="2026-10-25 18:00">18:00</time><a href="/haodan/9000003.html" title="同分钟 C" data-price="">同分钟 C</a></p></li>
+</ul><div class="pagebar"><a href="/search.php?q=x&amp;page=1">1</a></div></body></html>`
+    saveWatchState(dir, {
+      limit: 20,
+      intervalMin: 10,
+      enabled: true,
+      lastCheckAt: 0,
+      words: [{ q: '同一分钟', lastReadAt: ts, lastReadId: 'haodan-9000003', sentIds: [] }]
+    })
+    const pushes = []
+    const c = createConsole({
+      token: TOKEN,
+      stateDir: dir,
+      lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => html }),
+      watchNotifier: async (title, body) => { pushes.push(body) }
+    })
+    try {
+      const r = await c.runWatchOnce()
+      assert.strictEqual(r.pushed, 2, '两条同一分钟的新线报都要推')
+      assert.strictEqual(pushes.length, 2)
+      const st = readWatchState(dir)
+      assert.strictEqual(st.words[0].lastReadAt, ts, '同一分钟不推进毫秒时间')
+      assert.strictEqual(st.words[0].lastReadId, 'haodan-9000001', '锚点必须按列表顺序推进到最新')
+      const again = await c.runWatchOnce()
+      assert.strictEqual(again.pushed, 0, '下一轮不得重复推同一分钟的两条')
+    } finally {
+      c.server.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
 }
 
 async function main () {

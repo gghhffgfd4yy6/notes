@@ -4669,22 +4669,30 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const results = []
       for (const word of state.words) {
         const since = word.lastReadAt > 0 ? word.lastReadAt : Date.now()
-        let items = []
+        const items = []
+        const seenIds = new Set()
         let anchorAt = -1
         let fetchError = ''
         // 从最新往回翻，直到找到上次已读的那条（或时间已经比 lastReadAt 旧），
         // 最多 5 个上游页（500 条）；不再只取最新 N 条，避免「20 条以后的新线报漏推」。
+        // 跨页按 id 去重：上游翻页期间有新条目插入时，相邻页会重叠，不能把同一条算两次。
         for (let up = 1; up <= LINE_SEARCH_UPSTREAM_PAGE_MAX; up += 1) {
           const r = await fetchLineSearchPage(word.q, up)
           if (!r.ok) { fetchError = r.error; break }
-          items = items.concat(r.value.items)
+          for (const it of r.value.items) {
+            if (typeof it.id === 'string' && it.id !== '' && seenIds.has(it.id)) continue
+            if (typeof it.id === 'string' && it.id !== '') seenIds.add(it.id)
+            items.push(it)
+          }
+          const chunk = r.value.items
+          const oldest = chunk[chunk.length - 1]
+          const passed = oldest && typeof oldest.ts === 'number' && oldest.ts <= since
           if (word.lastReadId) {
             const at = items.findIndex((it) => it.id === word.lastReadId)
             if (at >= 0) { anchorAt = at; break }
-          } else {
-            const oldest = r.value.items[r.value.items.length - 1]
-            if (!oldest || typeof oldest.ts !== 'number' || oldest.ts <= since) break
           }
+          if (passed) break
+          if (!oldest) break
           if (up >= r.value.pages) break
         }
         if (fetchError && anchorAt < 0) {
@@ -4736,12 +4744,16 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           const w = fresh.words.find((x) => x.q === word.q)
           if (!w) { results.push({ q: word.q, pushed: count, error: 'removed' }); break }
           w.sentIds = (Array.isArray(w.sentIds) ? w.sentIds : []).concat([item.id]).slice(-LINE_WATCH_SENT_MAX)
-          // 不倒退锚点：用户可能已经读到更靠前的位置（lastReadAt 更大）。
-          if (typeof item.ts === 'number' && item.ts > w.lastReadAt) {
-            w.lastReadAt = item.ts
+          // 锚点按「在列表里的先后」前进，而不是只按时间：上游时间只有分钟精度，
+          // 同一分钟的多条线报 ts 相等，只用 > 会让锚点停在原地、下一轮重复判新。
+          const posAt = items.findIndex((it) => it.id === item.id)
+          const prevAt = w.lastReadId ? items.findIndex((it) => it.id === w.lastReadId) : -1
+          const newer = prevAt >= 0
+            ? posAt >= 0 && posAt < prevAt
+            : typeof item.ts === 'number' && item.ts >= w.lastReadAt
+          if (newer) {
+            if (typeof item.ts === 'number' && item.ts > w.lastReadAt) w.lastReadAt = item.ts
             if (/^[A-Za-z0-9._:/-]{1,80}$/.test(item.id)) w.lastReadId = item.id
-          } else if (!w.lastReadId && /^[A-Za-z0-9._:/-]{1,80}$/.test(item.id)) {
-            w.lastReadId = item.id
           }
           if (!saveWatchState(stateDir, fresh)) {
             results.push({ q: word.q, pushed: count, error: 'save_failed' })
@@ -5972,6 +5984,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       if (r.status !== 'ok') log(`⚠️ 关注词监控：${r.status}`)
       for (const x of r.results) {
         if (x.error) log(`⚠️ 关注词「${x.q}」：${x.error}`)
+        else if (x.truncated) log(`⚠️ 关注词「${x.q}」：新增超过 ${LINE_SEARCH_UPSTREAM_PAGE_MAX * LINE_SEARCH_PAGE_SIZE} 条，只处理了能翻到的最新部分`)
       }
     }).catch((e) => log(`⚠️ 关注词监控异常：${e && e.message ? e.message : 'unknown'}`))
   }, LINE_WATCH_TICK_MS)
