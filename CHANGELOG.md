@@ -956,3 +956,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 配套：`STATIC_ASSETS` 登记 `/assets/pages.js`；`CONSOLE_MODULE_FILES` 在 `components.js` 与 `ui.js` 之间插入 `pages.js`（正文顺序与拆前一致）；`console.js` 5456 → 5458，mutation 末段与注释同步（三处）；README 模块清单更新。
 - 验证：`test_console.js` 252/0、`standard` exit 0、`check-mutation-ranges` exit 0、真浏览器冒烟六页正常。
 - 版本 3.369.0。
+
+## v3.370 — 控制台线报全站搜索
+
+- 控制台新增「线报搜索」页：服务端代理线报酷 `/search.php`，搜全站线报（含没有推给你的条目），「十月稻田」实测 4 页 400 条。固定上游 host、只透传 `q`/`page`（查询词 120 字节、页码 1–20 钳制）、8 秒超时、4 MiB 响应上限、同词同页 60 秒缓存。
+- 搜索页支持关注词：存 `<stateDir>/console-watch.json`（0600，最多 12 个），「检查更新」逐词拉第 1 页并按 `lastReadAt` 标出「N 条新」，点开关注词后标为已读；关注词与 `push.json` 完全分离。
+- 控制台变异矩阵随 `scripts/console.js` 增长拆到 10 段（part9 4801-5200、part10 5201-5823），每片 ≤700 行。
+- 版本 3.370.0。

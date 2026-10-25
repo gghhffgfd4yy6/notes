@@ -3,7 +3,7 @@
 // 系统 / 文件 / 配置 / 过滤规则。只依赖 components.js 与基础模块，不认识 App，也没有顶层副作用。
 // 顺序在 ui.js 之前（App 在 ui.js 里 import 这些面板）。
 import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from './constants.js'
-import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, timedRequest } from './api.js'
+import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
 import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, isEncryptedBackup, logLineCounts, logLineTone, splitHits } from './pure.mjs'
@@ -1961,6 +1961,270 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
         <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(data.pages)}>末页 »<//>
       </div>
     </div>`}
+  </div>`
+}
+
+// ── 线报全站搜索（v3.370）────────────────────────────────────────────────
+// 搜的是线报酷全站（含没推给你的线报），服务端代理 /search.php 并解析成 JSON。
+// 关注词存在缓存目录：点某个词 = 搜它；「检查更新」逐词拉第 1 页，与 lastReadAt
+// 比出「N 条新」；打开某个关注词后把它标为已读（新条目仍带「新」角标到本次离开）。
+const LS_PAGE_MAX = 20
+const LS_QUERY_MAX_BYTES = 120 // 与服务端 LINE_SEARCH_QUERY_MAX_BYTES 同口径，避免回显 q 被截断后对不上
+function clampSearchText (raw) {
+  const s = typeof raw === 'string' ? raw.trim() : ''
+  let out = ''
+  let used = 0
+  for (const ch of s) {
+    const n = new TextEncoder().encode(ch).length
+    if (used + n > LS_QUERY_MAX_BYTES) break
+    out += ch
+    used += n
+  }
+  return out
+}
+function parseSearchHash (hash) {
+  const out = { q: '', page: 1 }
+  const raw = typeof hash === 'string' ? hash : ''
+  const at = raw.indexOf('?')
+  if (at < 0 || !/^#\/search\b/.test(raw.slice(0, at))) return out
+  const params = new URLSearchParams(raw.slice(at + 1))
+  const q = params.get('q')
+  if (typeof q === 'string' && q.trim() !== '') out.q = clampSearchText(q)
+  const page = Number(params.get('page'))
+  if (Number.isSafeInteger(page) && page >= 1) out.page = Math.min(page, LS_PAGE_MAX)
+  return out
+}
+function buildSearchHash ({ q, page }) {
+  const p = new URLSearchParams()
+  if (typeof q === 'string' && q !== '') p.set('q', q)
+  if (Number.isSafeInteger(page) && page > 1) p.set('page', String(page))
+  const qs = p.toString()
+  return qs === '' ? '#/search' : `#/search?${qs}`
+}
+
+function SearchPanel ({ onSync, active = true }) {
+  const [boot] = useState(() => parseSearchHash(window.location.hash))
+  const [input, setInput] = useState(boot.q)
+  // req 是唯一真源：n 让「同一个词再按一次搜索」也能强制重拉；mark 只在「点关注词」时为真
+  // ——普通搜索/刷新页面不把关注词标成已读，否则一进页面「新」角标就被自己吃掉了。
+  const [req, setReq] = useState({ q: boot.q, page: boot.page, n: 0, since: null, mark: false })
+  const [watch, setWatch] = useState([])
+  const [watchStatus, setWatchStatus] = useState('')
+  const [watchErr, setWatchErr] = useState('')
+  const [checking, setChecking] = useState(false)
+  const [newCounts, setNewCounts] = useState({})
+  const markedRef = useRef('')
+  // 关注词列表的版本号：读写并发时，旧 GET/旧检查结果不得覆盖新状态（Sourcery #328）。
+  const watchEpoch = useRef(0)
+
+  const fetchSearch = useCallback(() => {
+    if (req.q === '') return Promise.resolve({ status: 'empty', q: '', page: 1, pages: 1, count: 0, items: [] })
+    return apiSearchLines({ q: req.q, page: req.page })
+  }, [req])
+  const { data, err, load, loading } = usePanelLoader(fetchSearch, onSync)
+  usePanelAutoLoad(active, load)
+  usePullRefresh(active, load)
+
+  const loadWatch = useCallback(() => {
+    const seq = watchEpoch.current
+    return apiGetLineWatch().then((d) => {
+      if (watchEpoch.current !== seq) return // 期间有增删/已读：这份旧快照作废
+      setWatch(Array.isArray(d.words) ? d.words : [])
+      setWatchStatus(typeof d.status === 'string' ? d.status : 'ok')
+      setWatchErr('')
+    }).catch((e) => setWatchErr(`关注词读取失败：${loadErrorText(e)}`))
+  }, [])
+  useEffect(() => { if (active) loadWatch().catch(() => {}) }, [active, loadWatch])
+
+  const submit = (q, page, since = null, mark = false) => {
+    const next = typeof q === 'string' ? clampSearchText(q) : input.trim()
+    if (next === '') return
+    setInput(next)
+    setReq({
+      q: next,
+      page: Number.isSafeInteger(page) && page >= 1 ? page : 1,
+      n: req.n + 1,
+      since: Number.isFinite(since) ? since : null,
+      mark: mark === true
+    })
+  }
+  const searchWatch = (w) => {
+    // lastReadAt=0 表示从未读过：保留 0 作基线，本次结果全部带「新」（与检查更新的口径一致）。
+    submit(w.q, 1, w.lastReadAt > 0 ? w.lastReadAt : 0, true)
+  }
+  const addWatch = () => {
+    const q = req.q
+    if (q === '') return
+    watchEpoch.current += 1
+    apiPostLineWatch({ action: 'add', q }).then((d) => {
+      watchEpoch.current += 1
+      setWatch(Array.isArray(d.words) ? d.words : [])
+      setWatchErr('')
+    }).catch((e) => setWatchErr(e.message))
+  }
+  const removeWatch = (q) => {
+    watchEpoch.current += 1
+    apiPostLineWatch({ action: 'remove', q }).then((d) => {
+      watchEpoch.current += 1
+      setWatch(Array.isArray(d.words) ? d.words : [])
+      setNewCounts((prev) => {
+        const next = { ...prev }
+        delete next[q]
+        return next
+      })
+    }).catch((e) => setWatchErr(e.message))
+  }
+  const checkWatch = async () => {
+    if (checking || watch.length === 0) return
+    setChecking(true)
+    setWatchErr('')
+    const epoch = watchEpoch.current
+    const next = { ...newCounts }
+    let failed = 0
+    try {
+      for (const w of watch) {
+        try {
+          const d = await apiSearchLines({ q: w.q, page: 1 })
+          if (!d || d.status !== 'ok' || !Array.isArray(d.items)) { failed += 1; continue }
+          // 优先用「上次读到的最新条目标识」做锚点：上游时间只有分钟精度，仅靠 ts 会漏掉
+          // 同一分钟内发布的新线报。锚点不在第 1 页（被新条目挤走）时退回 ts 比较。
+          const idx = w.lastReadId ? d.items.findIndex((it) => it.id === w.lastReadId) : -1
+          if (idx >= 0) next[w.q] = idx
+          else next[w.q] = d.items.filter((it) => typeof it.ts === 'number' && it.ts > (w.lastReadAt || 0)).length
+        } catch (e) {
+          failed += 1 // 单个词失败不拖累其它词，保留它上次的角标
+        }
+      }
+      if (watchEpoch.current !== epoch) return // 期间已读/增删：旧检查结果作废
+      setNewCounts(next)
+      if (failed > 0) setWatchErr(`有 ${failed} 个关注词检查失败，保留上次角标，稍后再试`)
+    } finally {
+      setChecking(false)
+    }
+  }
+  // 打开关注词后标为已读：只在「这次响应属于本次关注词点击」时写一次；
+  // 普通搜索/刷新页面（mark=false）不写，否则新角标还没来得及看就被清掉。
+  useEffect(() => {
+    if (!data || data.status !== 'ok' || req.q === '' || req.mark !== true) return
+    if (data.q !== req.q) return // 旧结果还没换掉：不能用 A 的结果把 B 标成已读
+    const key = `${req.q}\n${req.n}`
+    if (markedRef.current === key) return
+    if (!watch.some((w) => w.q === req.q)) return
+    markedRef.current = key
+    const newest = (Array.isArray(data.items) ? data.items : []).reduce((max, it) => (
+      typeof it.ts === 'number' && it.ts > max ? it.ts : max
+    ), 0)
+    watchEpoch.current += 1
+    apiPostLineWatch({
+      action: 'read',
+      q: req.q,
+      lastReadAt: newest > 0 ? newest : Date.now(),
+      lastReadId: data.items && data.items[0] ? data.items[0].id : ''
+    }).then((d) => {
+      watchEpoch.current += 1
+      if (Array.isArray(d.words)) setWatch(d.words)
+      setNewCounts((prev) => {
+        if (!Object.prototype.hasOwnProperty.call(prev, req.q)) return prev
+        const next = { ...prev }
+        delete next[req.q]
+        return next
+      })
+    }).catch(() => {})
+  }, [data, req, watch])
+
+  // 地址栏跟随筛选（只 replaceState，不新增历史记录）；刷新/后退能回到同一页。
+  useEffect(() => {
+    if (!active) return
+    const hash = buildSearchHash({ q: req.q, page: req.page })
+    if (window.location.hash !== hash) window.history.replaceState(window.history.state, '', hash)
+  }, [active, req.q, req.page])
+  useEffect(() => {
+    if (!active) return undefined
+    const onHash = () => {
+      if (!/^#\/search(\?|$)/.test(window.location.hash)) return
+      const h = parseSearchHash(window.location.hash)
+      if (h.q === req.q && h.page === req.page) return
+      setInput(h.q)
+      setReq({ q: h.q, page: h.page, n: req.n + 1, since: null, mark: false })
+    }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [active, req.q, req.page, req.n])
+
+  const watched = watch.some((w) => w.q === req.q)
+  // 只认「本次请求」的结果：切关注词时 usePanelLoader 会暂留上一份 data，
+  // 不校验 q 就会把 A 的条目挂在 B 下面，甚至用 A 的结果把 B 标成已读。
+  const live = data && (data.status !== 'ok' || data.q === req.q) ? data : null
+  const kw = live && typeof live.q === 'string' ? live.q.trim().toLowerCase() : ''
+  const hit = (text) => (typeof text === 'string' && kw.length > 0
+    ? splitHits(text, kw, 8).map(([part, on], i) => on ? html`<mark key=${i}>${part}</mark>` : part)
+    : text)
+  const items = live && Array.isArray(live.items) ? live.items : []
+  const pages = live && Number.isSafeInteger(live.pages) && live.pages >= 1 ? Math.min(live.pages, LS_PAGE_MAX) : 1
+  let body
+  if (req.q === '') {
+    body = html`<div class="empty">输入关键词搜线报酷全站（含没推给你的线报）。试试「十月稻田」。</div>`
+  } else if (loading && !live) {
+    body = html`<${PanelSkeleton} label="正在搜索线报" />`
+  } else if (err) {
+    body = html`<${LoadError} text=${err} busy=${loading} onRetry=${() => { load().catch(() => {}) }} />`
+  } else if (live && live.status === 'upstream_error') {
+    body = html`<${Hint} tone="error">${live.error || '线报酷搜索暂不可用，稍后再试'}<//>`
+  } else if (live && live.status === 'ok') {
+    body = html`<div>
+      <div class="msg-count" aria-live="polite">本页 ${live.count} 条 · 第 ${live.page} / ${pages} 页${live.cached ? ' · 60s 内缓存' : ''}${!watched ? html` <button type="button" class="ls-follow" onClick=${addWatch}>关注「${req.q}」</button>` : ''}</div>
+      ${items.length === 0
+        ? html`<div class="empty">没有匹配的线报</div>`
+        : html`<div class="msg-list" role="list">
+          ${items.map((it, i) => html`<div class="msg-item" role="listitem" key=${it.id || i}>
+            <div class="msg-item-head">
+              <a class="msg-title ls-title" href=${it.url} target="_blank" rel="noopener noreferrer" title=${`打开线报酷原文：${it.title}`}>${hit(it.title)}</a>
+              ${typeof it.price === 'number' ? html`<span class="msg-price">¥${it.price}</span>` : ''}
+              ${req.since !== null && typeof it.ts === 'number' && it.ts > req.since ? html`<span class="ls-new">新</span>` : ''}
+            </div>
+            <div class="msg-meta">
+              ${it.catename ? html`<span class="msg-cate" aria-label=${it.catename}>${cateParts(it.catename).map((part, j) => html`<span class="msg-cate-part" key=${j}>${part}</span>`)}</span>` : ''}
+              <span class="mono">${it.datetime || '—'}</span>
+              ${it.author ? html`<span>${it.author}</span>` : ''}
+              <a class="msg-link" href=${it.url} target="_blank" rel="noopener noreferrer">原文链接 ↗</a>
+            </div>
+            ${it.content ? html`<div class="ls-excerpt">${hit(it.content)}</div>` : ''}
+          </div>`)}
+        </div>`}
+      <div class="pager">
+        <${Button} disabled=${req.page <= 1 || loading} onClick=${() => submit(req.q, 1, req.since)}>« 首页<//>
+        <${Button} disabled=${req.page <= 1 || loading} onClick=${() => submit(req.q, req.page - 1, req.since)}>上一页<//>
+        <span class="pager-info">第 ${live.page} / ${pages} 页</span>
+        <${Button} disabled=${req.page >= pages || loading} onClick=${() => submit(req.q, req.page + 1, req.since)}>下一页<//>
+        <${Button} disabled=${req.page >= pages || loading} onClick=${() => submit(req.q, pages, req.since)}>末页 »<//>
+      </div>
+    </div>`
+  }
+  return html`<div class="panel">
+    <${PanelHead} title="线报搜索" level=${1} sub="搜线报酷全站 · 关注词有新线报会标出来" />
+    <div class="msg-toolbar">
+      <input class="msg-search" type="search" aria-label="搜索全站线报" placeholder="搜线报，如：十月稻田" value=${input}
+        onInput=${(e) => setInput(e.target.value)}
+        onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); submit(input, 1) } }} />
+      <${Button} disabled=${loading || input.trim() === ''} ariaBusy=${loading ? 'true' : 'false'} onClick=${() => submit(input, 1)}>搜索<//>
+    </div>
+    <div class="ls-watch">
+      <div class="ls-watch-head">
+        <span class="ls-watch-title">关注词</span>
+        ${watch.length > 0 && html`<${Button} variant="ghost" disabled=${checking} onClick=${checkWatch}>${checking ? '检查中…' : '检查更新'}<//>`}
+        ${watchStatus === 'invalid' && html`<span class="ls-watch-warn">关注词文件损坏，按空列表处理</span>`}
+      </div>
+      ${watch.length === 0
+        ? html`<div class="ls-watch-empty">还没有关注词。搜到想要的词后点「关注」，下次进来点「检查更新」看有没有新线报。</div>`
+        : html`<div class="ls-chips">
+          ${watch.map((w) => html`<span class="ls-chip-wrap" key=${w.q}>
+            <button type="button" class="ls-chip${w.q === req.q ? ' on' : ''}" onClick=${() => searchWatch(w)}>${w.q}${newCounts[w.q] > 0 ? html`<span class="ls-chip-n">${newCounts[w.q]} 条新</span>` : ''}</button>
+            <button type="button" class="ls-chip-x" aria-label=${`取消关注 ${w.q}`} title="取消关注" onClick=${() => removeWatch(w.q)}>×</button>
+          </span>`)}
+        </div>`}
+      ${watchErr && html`<${Hint} tone="error">${watchErr}<//>`}
+    </div>
+    ${body}
   </div>`
 }
 
@@ -4394,6 +4658,7 @@ export {
   PullRefreshStatus,
   RunHistoryPanel,
   RunsPanel,
+  SearchPanel,
   SysPanel,
   TOP_SHOW_INNER,
   TOP_SHOW_Y,

@@ -254,7 +254,8 @@ export function ageFromStamp (stamp, nowMs = Date.now()) {
 }
 
 // 标签页哈希（v3.307）：刷新/后退不丢当前页。只认白名单，非法 hash 回概览。
-export const TAB_KEYS = ['overview', 'messages', 'logs', 'config', 'sys']
+// v3.370 加 search（线报搜索）；filter 仍由 ui.js 的 resolveTab 单独认（历史原因）。
+export const TAB_KEYS = ['overview', 'messages', 'search', 'logs', 'config', 'sys']
 export function tabFromHash (hash) {
   const m = /^#\/([a-z]+)$/.exec(typeof hash === 'string' ? hash : '')
   return m && TAB_KEYS.includes(m[1]) ? m[1] : 'overview'

@@ -612,6 +612,39 @@ async function triggerNotifyTest () {
   )
 }
 
+// ── v3.370 线报全站搜索 / 关注词 ─────────────────────────────────────────────
+// 搜索走服务端代理（线报酷是第三方站点，浏览器直连会被 CORS 挡）。查询词只进
+// URLSearchParams，authority 恒为字面量；期限比普通端点长（服务端上游超时 8s）。
+function apiSearchLines ({ q, page } = {}) {
+  const params = new URLSearchParams()
+  if (typeof q === 'string' && q.length > 0) params.set('q', q)
+  if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
+  const qs = params.toString()
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  }, 12000)
+  return consumeJson(fetch(qs.length > 0 ? `/api/line-search?${qs}` : '/api/line-search', merged), done)
+}
+
+function apiGetLineWatch () {
+  const { merged, done } = timedRequest({
+    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+  })
+  return consumeJson(fetch('/api/line-watch', merged), done)
+}
+
+function apiPostLineWatch (payload = {}) {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify(payload)
+  })
+  return consumeJsonResult(fetch('/api/line-watch', merged), done).then((r) => {
+    if (!r.ok) throw new Error((r.data && r.data.error) || `HTTP ${r.status}`)
+    return r.data
+  })
+}
+
 export {
   BOOT, DAY_KEY_RE, timedRequest, trigger,
   triggerNotifyTest, apiGetStatus, apiGetRuns, apiGetRunDetail,
@@ -621,5 +654,6 @@ export {
   apiGetFilter, apiGetFilterDraft, apiPostFilterDraft, apiDeleteFilterDraft,
   apiPostFilterSave, apiPostFilterValidate, apiPostFilterPreview, apiPostBackupExport,
   apiPostBackupImport, apiPostFilterRestore, apiGetConsoleSettings, apiPostConsoleSettings,
-  apiGetTwoFactorStatus, apiPostTwoFactorSetup, apiPostTwoFactorEnable, apiPostTwoFactorDisable
+  apiGetTwoFactorStatus, apiPostTwoFactorSetup, apiPostTwoFactorEnable, apiPostTwoFactorDisable,
+  apiSearchLines, apiGetLineWatch, apiPostLineWatch
 }

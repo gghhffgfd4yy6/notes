@@ -128,6 +128,20 @@ const MESSAGES_QUERY_MAX_BYTES = 240
 // 与 run.log 同口径用 Asia/Shanghai 日历日，避免宿主 UTC 时 00:00–08:00 归错天。
 const MESSAGE_DAYS_ALLOWED = Object.freeze([0, 1, 3, 7, 30])
 
+// ── v3.370 线报全站搜索（只读代理线报酷 /search.php）───────────────────────
+// 上游单页固定 100 条、最多约 5 页；页码与查询词都钳制后再拼 URL（上游是外部输入）。
+const LINE_SEARCH_QUERY_MAX_BYTES = 120
+const LINE_SEARCH_PAGE_MAX = 20
+const LINE_SEARCH_MAX_BYTES = 4 * 1024 * 1024
+const LINE_SEARCH_TIMEOUT_MS = 8000
+// 上游是第三方站点：同一个词 60s 内复用结果，避免反复点刷新打爆对方。
+const LINE_SEARCH_CACHE_TTL_MS = 60 * 1000
+const LINE_SEARCH_CACHE_MAX = 24
+// 关注词落盘文件（与推送缓存同目录，0600）：跨设备/刷新后仍在。
+const LINE_WATCH_FILE = 'console-watch.json'
+const LINE_WATCH_MAX_WORDS = 12
+const LINE_WATCH_WORD_MAX_BYTES = 120
+
 // ── v3.300 批次③ 3.2 消息导出常量 ───────────────────────────────────────────
 // 单次导出行数上限：超出即截断 + 响应头 X-Export-Truncated: true 如实披露。
 const EXPORT_MAX_ROWS = 5000
@@ -1980,6 +1994,148 @@ function clampQueryBytes (query) {
   return query
 }
 
+// ── v3.370 线报全站搜索：上游 HTML 解析与关注词归一（纯函数，非 HTTP 单测可达）──
+// 只解码一次实体：先处理具名/数字实体，最后 &amp; ——否则 &amp;lt; 会被解成 <（双重解码）。
+// 剥标签不用单次正则 /<[^>]*>/（嵌套/畸形标签会漏，CodeQL js/incomplete-multi-character-sanitization）：
+// 先解实体，再线性扫描丢弃标签；最后把残留尖括号换成全角，返回值保证不含 < >。
+function decodeLineHtml (raw) {
+  if (typeof raw !== 'string' || raw.length === 0) return ''
+  const decoded = raw
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&#(\d{1,7});/g, (m, n) => {
+      const code = Number(n)
+      return code > 0 && code <= 0x10FFFF ? String.fromCodePoint(code) : m
+    })
+    .replace(/&#x([0-9a-fA-F]{1,6});/g, (m, n) => {
+      const code = parseInt(n, 16)
+      return code > 0 && code <= 0x10FFFF ? String.fromCodePoint(code) : m
+    })
+    .replace(/&amp;/g, '&')
+  let out = ''
+  let i = 0
+  while (i < decoded.length) {
+    const lt = decoded.indexOf('<', i)
+    if (lt === -1) { out += decoded.slice(i); break }
+    // 「<」后面不像标签开头（如价格 <10）就当普通字符保留。
+    if (!/[a-zA-Z!/?]/.test(decoded[lt + 1] || '')) { out += decoded.slice(i, lt + 1); i = lt + 1; continue }
+    const gt = decoded.indexOf('>', lt + 1)
+    if (gt === -1) { out += decoded.slice(i); break }
+    out += decoded.slice(i, lt)
+    i = gt + 1
+  }
+  return out.replace(/[<>]/g, (ch) => (ch === '<' ? '‹' : '›')).trim()
+}
+
+// 线报酷的时间是北京时间（无时区后缀）：按 +08:00 转 epoch，宿主是 UTC 也不会错。
+function parseLineStamp (stamp) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(typeof stamp === 'string' ? stamp : '')
+  if (!m) return null
+  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])) - 8 * 60 * 60 * 1000
+  return Number.isFinite(ms) ? ms : null
+}
+
+// 按 UTF-8 字节截断，但只切完整码点——slice(0,-1) 可能留下孤立代理项，
+// 后续 encodeURIComponent 会直接抛错。上限 120 字节，逐字节循环成本可忽略。
+function sliceUtf8Bytes (input, maxBytes) {
+  let out = ''
+  let used = 0
+  for (const ch of input) {
+    const n = Buffer.byteLength(ch, 'utf8')
+    if (used + n > maxBytes) break
+    out += ch
+    used += n
+  }
+  return out
+}
+
+function clampLineQuery (raw) {
+  const q = typeof raw === 'string' ? raw.trim() : ''
+  return sliceUtf8Bytes(q, LINE_SEARCH_QUERY_MAX_BYTES)
+}
+
+function normalizeWatchWord (raw) {
+  const q = typeof raw === 'string' ? raw.trim().replace(/\s+/g, ' ') : ''
+  return sliceUtf8Bytes(q, LINE_WATCH_WORD_MAX_BYTES)
+}
+
+// 解析线报酷 /search.php 的结果列表。选择器只认服务端真实结构：
+// <ul class="new-post"> 下每个 <li class="article-list">，标题/正文/时间/分类都在属性里。
+// matched=false 表示结构对不上（上层报「无法解析」，不伪装成 0 条）。
+function parseLineSearchHtml (html, baseUrl) {
+  const out = { items: [], pages: 1, matched: false }
+  if (typeof html !== 'string' || html.length === 0) return out
+  const listStart = html.indexOf('<ul class="new-post">')
+  const listEnd = listStart >= 0 ? html.indexOf('</ul>', listStart) : -1
+  if (listStart < 0 || listEnd <= listStart) return out
+  out.matched = true
+  const base = typeof baseUrl === 'string' ? baseUrl.replace(/\/+$/, '') : ''
+  const blocks = html.slice(listStart, listEnd).split('<li class="article-list')
+  for (let i = 1; i < blocks.length && out.items.length < 200; i++) {
+    const block = blocks[i]
+    const link = /<a href="([^"]+)" title="([^"]*)"/.exec(block)
+    if (!link) continue
+    const href = link[1]
+    const title = decodeLineHtml(link[2])
+    if (title === '') continue
+    const time = /<time[^>]*datetime="([^"]*)"[^>]*title="([^"]*)"[^>]*>([^<]*)<\/time>/.exec(block)
+    const stamp = time ? time[2] : ''
+    const datetime = stamp !== '' ? stamp : (time ? `${time[1]} 00:00` : '')
+    const cate = /data-catename="([^"]*)"/.exec(block)
+    const badgeCate = /<span class="badge-cat">([^<]*)<\/span>/.exec(block)
+    const cateName = cate ? decodeLineHtml(cate[1]) : (badgeCate ? decodeLineHtml(badgeCate[1]) : '')
+    const content = /data-content="([^"]*)"/.exec(block)
+    const priceRaw = /data-price="([^"]*)"/.exec(block)
+    const author = /data-louzhu="([^"]*)"/.exec(block)
+    const price = priceRaw && priceRaw[1].trim() !== '' && Number.isFinite(Number(priceRaw[1])) ? Number(priceRaw[1]) : null
+    const idMatch = /\/haodan\/(\d+)\.html/.exec(href)
+    out.items.push({
+      id: idMatch ? `haodan-${idMatch[1]}` : href,
+      url: href.startsWith('http') ? href : `${base}${href.startsWith('/') ? href : `/${href}`}`,
+      title,
+      content: content ? decodeLineHtml(content[1]) : '',
+      catename: cateName,
+      price,
+      author: author ? decodeLineHtml(author[1]) : '',
+      datetime,
+      ts: parseLineStamp(stamp)
+    })
+  }
+  // 页码只从列表之后的 pagebar 里取；上游把查询分隔符写成 &amp;，这里两种形态都认。
+  const tail = html.slice(listEnd)
+  const pageRe = /(?:&amp;|[?&])page=(\d+)/g
+  let m
+  while ((m = pageRe.exec(tail)) !== null) {
+    const n = Number(m[1])
+    if (Number.isSafeInteger(n) && n > out.pages && n <= 100) out.pages = n
+  }
+  return out
+}
+
+// 关注词读盘：文件缺失=空；损坏/非法=invalid（UI 明说，不把它当「没有关注词」静默吞掉）。
+function readLineWatchWords (stateDir) {
+  const p = path.join(stateDir, LINE_WATCH_FILE)
+  const read = readSafeTextResult(p, 256 * 1024, { openNonBlocking: true })
+  if (read.status === 'missing') return { status: 'ok', words: [] }
+  if (read.status !== 'ok') return { status: 'invalid', words: [] }
+  let raw
+  try { raw = JSON.parse(read.text) } catch (e) { return { status: 'invalid', words: [] } }
+  if (!raw || raw.schema !== 1 || !Array.isArray(raw.words)) return { status: 'invalid', words: [] }
+  const words = []
+  for (const item of raw.words) {
+    const q = normalizeWatchWord(item && item.q)
+    if (q === '' || words.some((w) => w.q === q)) continue
+    const lastReadAt = item && Number.isSafeInteger(item.lastReadAt) && item.lastReadAt > 0 ? item.lastReadAt : 0
+    const lastReadId = item && typeof item.lastReadId === 'string' && /^[A-Za-z0-9._:/-]{1,80}$/.test(item.lastReadId) ? item.lastReadId : ''
+    words.push({ q, lastReadAt, lastReadId })
+    if (words.length >= LINE_WATCH_MAX_WORDS) break
+  }
+  return { status: 'ok', words }
+}
+
 // 消息过滤谓词（v3.300 3.2 从 /api/messages 抽出，两处复用——变异测试只打一处）。
 // cate 精确等值（'(未分类)' 归一，与列表端点两处口径一致）；needle 为已 trim+toLowerCase 的
 // 子串（title/content 双字段）。q/cate 全程不进正则（ReDoS 红线）：只用 includes 与 String 等值。
@@ -2422,7 +2578,7 @@ function buildPushChannelsView () {
   return view
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending } = {}) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, lineSearchFetch } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   // 启动即做一次一致快照：既校验资产可读（缺失即拒启），也把版本号钉死在进程生命周期内
@@ -4109,6 +4265,187 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     handleFilterSave(req, res, verdict.actorToken)
   }
 
+  // ── v3.370 线报全站搜索（只读代理 + 关注词）──────────────────────────────
+  // 上游是第三方站点（线报酷 /search.php）：固定 host、只带 q/page 两个参数，
+  // 超时 8s、响应 4MiB 封顶；同词同页 60s 内复用结果，避免反复刷新打爆对方。
+  // 解析失败不抛错（返回 0 条），网络失败按 upstream_error 如实下发（不伪装成「没有结果」）。
+  const lineSearchCache = new Map()
+  const searchFetch = typeof lineSearchFetch === 'function' ? lineSearchFetch : globalThis.fetch
+  const handleLineSearch = async (req, res, url) => {
+    const q = clampLineQuery(url.searchParams.get('q'))
+    if (q === '') { sendJson(res, 400, { status: 'error', error: '搜索词不能为空' }); return }
+    let page = Number(url.searchParams.get('page'))
+    if (!Number.isSafeInteger(page) || page < 1) page = 1
+    if (page > LINE_SEARCH_PAGE_MAX) page = LINE_SEARCH_PAGE_MAX
+    const key = `${q}\n${page}`
+    const now = Date.now()
+    const hit = lineSearchCache.get(key)
+    res.setHeader('Cache-Control', 'no-store')
+    if (hit && now - hit.at < LINE_SEARCH_CACHE_TTL_MS) {
+      sendJson(res, 200, { ...hit.value, cached: true })
+      return
+    }
+    const baseUrl = sourceDomain()
+    if (typeof searchFetch !== 'function') {
+      sendJson(res, 200, { status: 'upstream_error', q, page, error: '当前 Node 不支持 fetch，无法访问线报酷' })
+      return
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), LINE_SEARCH_TIMEOUT_MS)
+    let upstream
+    try {
+      upstream = await searchFetch(`${baseUrl}/search.php?q=${encodeURIComponent(q)}&page=${page}`, {
+        signal: controller.signal,
+        redirect: 'manual', // 固定 host：上游 3xx 一律中止，避免被重定向到内网/其它站点
+        headers: { accept: 'text/html,application/xhtml+xml', 'user-agent': 'xbk-console/1' }
+      })
+    } catch (e) {
+      clearTimeout(timer)
+      sendJson(res, 200, {
+        status: 'upstream_error',
+        q,
+        page,
+        error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷连接失败，稍后再试'
+      })
+      return
+    }
+    if (upstream && upstream.status >= 300 && upstream.status < 400) {
+      clearTimeout(timer)
+      sendJson(res, 200, { status: 'upstream_error', q, page, error: '线报酷返回重定向，已中止' })
+      return
+    }
+    if (!upstream || !upstream.ok) {
+      clearTimeout(timer)
+      sendJson(res, 200, { status: 'upstream_error', q, page, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` })
+      return
+    }
+    // 8s 计时器读到响应体结束才停：上游先回头再慢慢吐 body 也不能拖住控制台。
+    // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存。
+    let text = ''
+    try {
+      const stream = upstream.body
+      if (stream && typeof stream.getReader === 'function') {
+        const reader = stream.getReader()
+        const chunks = []
+        let total = 0
+        for (;;) {
+          const step = await reader.read()
+          if (step.done) break
+          const chunk = Buffer.from(step.value)
+          total += chunk.length
+          if (total > LINE_SEARCH_MAX_BYTES) {
+            try { await reader.cancel() } catch (e) {}
+            sendJson(res, 200, { status: 'upstream_error', q, page, error: '线报酷返回内容过大，已放弃解析' })
+            return
+          }
+          chunks.push(chunk)
+        }
+        text = Buffer.concat(chunks).toString('utf8')
+      } else {
+        text = await upstream.text()
+        if (Buffer.byteLength(text, 'utf8') > LINE_SEARCH_MAX_BYTES) {
+          sendJson(res, 200, { status: 'upstream_error', q, page, error: '线报酷返回内容过大，已放弃解析' })
+          return
+        }
+      }
+    } catch (e) {
+      sendJson(res, 200, {
+        status: 'upstream_error',
+        q,
+        page,
+        error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试'
+      })
+      return
+    } finally {
+      clearTimeout(timer)
+    }
+    const parsed = parseLineSearchHtml(text, baseUrl)
+    if (!parsed.matched) {
+      // 结构对不上 ≠ 没有结果：如实报错，别让用户以为这个搜索词真的 0 条。
+      sendJson(res, 200, { status: 'upstream_error', q, page, error: '线报酷页面结构变了，暂时无法解析（不是没有结果）' })
+      return
+    }
+    const value = {
+      status: 'ok',
+      q,
+      page,
+      pages: parsed.pages,
+      count: parsed.items.length,
+      items: parsed.items,
+      baseUrl
+    }
+    const prev = lineSearchCache.get(key)
+    if (!prev || prev.at <= now) {
+      if (lineSearchCache.size >= LINE_SEARCH_CACHE_MAX) {
+        const oldest = lineSearchCache.keys().next().value
+        lineSearchCache.delete(oldest)
+      }
+      lineSearchCache.set(key, { at: now, value })
+    }
+    sendJson(res, 200, value)
+  }
+
+  // 关注词：GET 读（缺文件=空）；POST 增/删/标记已读（Bearer-only，与其它写面同规）。
+  const handleLineWatchWrite = (req, res, url) => {
+    const verdict = writeAuthVerdict(req, url.searchParams, token)
+    if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
+    if (!filterMediaAllowed(req)) {
+      sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' })
+      return
+    }
+    readBody(req)
+      .then(({ body, aborted, over }) => {
+        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
+        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
+        let payload
+        try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+          sendJson(res, 400, { error: 'body 必须是对象' })
+          return
+        }
+        const action = payload.action
+        const stored = readLineWatchWords(stateDir)
+        let words = stored.words
+        if (action === 'add') {
+          const q = normalizeWatchWord(payload.q)
+          if (q === '') { sendJson(res, 400, { error: '关注词不能为空' }); return }
+          if (!words.some((w) => w.q === q)) {
+            if (words.length >= LINE_WATCH_MAX_WORDS) {
+              sendJson(res, 409, { error: '关注词最多 12 个，先删掉不用的再添加' })
+              return
+            }
+            // 新词以「添加时刻」为基线：第一次检查只算之后的新线报，不把历史 100 条全标成新。
+            words = words.concat([{ q, lastReadAt: Date.now(), lastReadId: '' }])
+          }
+        } else if (action === 'remove') {
+          const q = normalizeWatchWord(payload.q)
+          words = words.filter((w) => w.q !== q)
+        } else if (action === 'read') {
+          const q = normalizeWatchWord(payload.q)
+          if (q === '') { sendJson(res, 400, { error: '关注词不能为空' }); return }
+          // 已读水位取「实际展示的最新条目时间」，不是服务端 now：缓存结果可能已过去 60s，
+          // 用 now 会把这段时间里没看到的新线报永久跳过。lastReadId 用于分钟精度下的锚点。
+          const at = Number.isSafeInteger(payload.lastReadAt) && payload.lastReadAt > 0 && payload.lastReadAt <= Date.now() + 60 * 1000
+            ? payload.lastReadAt
+            : Date.now()
+          const lastReadId = typeof payload.lastReadId === 'string' && /^[A-Za-z0-9._:/-]{1,80}$/.test(payload.lastReadId) ? payload.lastReadId : ''
+          words = words.map((w) => (w.q === q ? { ...w, lastReadAt: at, lastReadId } : w))
+        } else {
+          sendJson(res, 400, { error: 'action 必须是 add / remove / read' })
+          return
+        }
+        const file = path.join(stateDir, LINE_WATCH_FILE)
+        if (!writeAtomic(file, JSON.stringify({ schema: 1, words }), '关注词')) {
+          sendJson(res, 500, { error: '关注词保存失败（磁盘/权限）' })
+          return
+        }
+        try { fs.chmodSync(file, 0o600) } catch (e) {}
+        res.setHeader('Cache-Control', 'no-store')
+        sendJson(res, 200, { status: 'ok', words })
+      })
+      .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+  }
+
   const server = http.createServer((req, res) => {
     // ── v3.300 访问日志装配：单点 res.on('finish')，覆盖 sendJson/静态/页面全部响应出口
     // （全文件原本无任何 res.on 监听）。挂回调第一行 ⇒ 畸形 request-target 的 400
@@ -4463,6 +4800,24 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           : (win.days > 0 || win.from !== '' ? messageCategoriesOf(windowed) : read.value.categories),
         items: pageItems
       })
+      return
+    }
+    // ── v3.370 线报全站搜索 / 关注词（只读代理 + 本机关注词文件）─────────────
+    if (req.method === 'GET' && url.pathname === '/api/line-search') {
+      handleLineSearch(req, res, url).catch(() => {
+        if (!res.headersSent) sendJson(res, 200, { status: 'upstream_error', error: '线报酷搜索暂不可用，稍后再试' })
+      })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/line-watch') {
+      const stored = readLineWatchWords(stateDir)
+      res.setHeader('Cache-Control', 'no-store')
+      sendJson(res, 200, { status: stored.status, words: stored.words, max: LINE_WATCH_MAX_WORDS })
+      return
+    }
+    if (req.method === 'POST' && url.pathname === '/api/line-watch') {
+      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
+      handleLineWatchWrite(req, res, url)
       return
     }
     // POST /api/backup/export：把勾选的数据类别打包成一个 JSON 下载。
@@ -5454,5 +5809,15 @@ module.exports = {
   filterLockIdentity,
   claimStaleFilterLock,
   previewWhitelistRegex,
-  previewWhitelistKeeps
+  previewWhitelistKeeps,
+  // v3.370 线报全站搜索：上游 HTML 解析 / 时间戳 / 关注词归一（非 HTTP 单测可达）
+  decodeLineHtml,
+  parseLineStamp,
+  clampLineQuery,
+  normalizeWatchWord,
+  parseLineSearchHtml,
+  readLineWatchWords,
+  LINE_WATCH_FILE,
+  LINE_WATCH_MAX_WORDS,
+  LINE_SEARCH_QUERY_MAX_BYTES
 }
