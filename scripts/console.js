@@ -1447,7 +1447,9 @@ function conditionalVariant (req) {
   const params = raw.slice(qAt + 1).split('&')
     .filter((part) => part !== '' && part !== 'token' && !part.startsWith('token='))
   params.sort()
-  return raw.slice(0, qAt) + '?' + params.join('&')
+  // 参数全被滤掉（只有 ?token=）时必须回落到「无查询串」形态，否则 '/api/config?token=x'
+  // 会算出 '/api/config?'，与裸 URL 的 tag 分裂成两份。
+  return raw.slice(0, qAt) + (params.length > 0 ? '?' + params.join('&') : '')
 }
 
 function sendJson (res, code, obj) {
@@ -1466,13 +1468,17 @@ function sendJson (res, code, obj) {
   res.end(body)
 }
 
-// 只读快照端点的条件 GET（v3.363）：同一份 body 发 ETag，客户端带 If-None-Match
-// 命中时回 304 空体。**Cache-Control 用 no-store**：即便客户端自己发条件请求，也不允许
-// 浏览器/中间代理把带鉴权的响应体留在任何 HTTP 缓存里（no-cache 只是「每次复用前先问」，
+// 只读快照端点的条件 GET（v3.363，v3.373 扩到 /api/trends、/api/run-history、
+// /api/cache-health、/api/config 的**成功**分支）：同一份 body 发 ETag，客户端带
+// If-None-Match 命中时回 304 空体。**Cache-Control 用 no-store**：即便客户端自己发条件请求，
+// 也不允许浏览器/中间代理把带鉴权的响应体留在任何 HTTP 缓存里（no-cache 只是「每次复用前先问」，
 // 仍然允许存储——Sourcery PR #321）。条件缓存由前端自己的内存 Map 承担。
 // 与静态资产的强缓存（`immutable`）是两套语义，别合并。
 // **不用于 /api/status**：它的 generatedAt / lock.ageMs / stats 每次请求都在变，
 // 给它发 ETag 只会永远不命中（且 304 会把「现在几点」冻住）——按语义就不该缓存。
+// **也不用于 /api/sys（含 ?probe=version）**：uptimeS/rssBytes 每拍都变，命中率是 0。
+// 降级/错误分支（trends 读不到、config 保险丝降级等）保持 sendJson：那不是「内容未变」，
+// 而是「这次读不到」，给它们发稳定 tag 会让客户端把降级态缓存成正常态。
 function sendJsonConditional (req, res, obj) {
   const body = JSON.stringify(obj)
   // tag 由**未压缩** body + 请求变体算：Accept-Encoding 只决定「同一份内容取哪个 tag 变体」，
@@ -5323,7 +5329,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sendJson(res, 200, { status: t.status, byDay: [], days })
         return
       }
-      sendJson(res, 200, {
+      sendJsonConditional(req, res, {
         status: 'ok',
         days: t.value.days,
         from: t.value.from,
@@ -5359,7 +5365,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // （xbk_app _writeRunLog → MessageStore.cacheDir），不是控制台 stateDir——Config.cache.dir
       // 指向别处时两个目录分居。读取源与 spawn/停止留痕同走 historyDir()（运行侧真实目录优先）。
       const h = readRunHistory(historyDir(), { limit, before, windowKey, excludeCancelled })
-      sendJson(res, 200, h)
+      sendJsonConditional(req, res, h)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/logs') {
@@ -5393,7 +5399,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       snap.entryCountStatus = cnt.status
       snap.entryCountFiltered = cnt.status === 'ok' ? cnt.filteredCount : null
       if (cnt.status === 'tooLarge') snap.entryCountHint = `缓存超过 ${Math.round(CACHE_HEALTH_COUNT_MAX_BYTES / (1024 * 1024))}MiB，不在请求路径上整读计数（推送记录页的 grandTotal 仍可查）`
-      sendJson(res, 200, snap)
+      sendJsonConditional(req, res, snap)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/files') {
@@ -5420,7 +5426,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         })
         return
       }
-      sendJson(res, 200, view)
+      sendJsonConditional(req, res, view)
       return
     }
     // GET /api/config/filter：过滤规则读面（全局鉴权已通过，Cookie/Bearer/?token= 均可）。

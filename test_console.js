@@ -3084,6 +3084,132 @@ async function main () {
       assert.strictEqual(sseHeaders.vary, undefined, 'SSE 不压 → 不新增 Vary')
     } finally { server.close() }
   })
+  await aok('HTTP: 条件请求扩面（trends / run-history / cache-health / config 的 ETag 与 304）', async () => {
+    const dir = tmpDir()
+    const summary = (n) => `2026-10-15 12:16:0${n} total=${n} dedup=0 filtered=0 truncated=0 pushed=${n} failed=0 elapsed=10.1s cachesaved=1`
+    fs.writeFileSync(path.join(dir, 'run.log'), [summary(1), summary(2), summary(3)].join('\n') + '\n')
+    const pushFixture = (extra) => JSON.stringify([...Array(1 + extra).keys()].map((i) => ({
+      id: i + 1, title: `t${i}`, content: 'c', catename: '好单-日用', shijianchuo: 1000 + i
+    })))
+    fs.writeFileSync(path.join(dir, 'push.json'), pushFixture(0))
+    // /api/config 的 body 只随部署/环境变量变：先显式清空，再在「内容变化」一步里改值——
+    // 不依赖宿主环境里是否已经设了 XBK_INTERVAL_MS。
+    const envBackup = process.env.XBK_INTERVAL_MS
+    process.env.XBK_INTERVAL_MS = ''
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const cases = [
+        { name: 'trends', path: '/api/trends', mutate: () => fs.appendFileSync(path.join(dir, 'run.log'), summary(4) + '\n') },
+        { name: 'run-history', path: '/api/run-history', mutate: () => fs.appendFileSync(path.join(dir, 'run.log'), summary(5) + '\n') },
+        { name: 'cache-health', path: '/api/cache-health', mutate: () => fs.writeFileSync(path.join(dir, 'push.json'), pushFixture(2)) },
+        { name: 'config', path: '/api/config', mutate: () => { process.env.XBK_INTERVAL_MS = '424242' } }
+      ]
+      for (const c of cases) {
+        const first = await request(port, 'GET', c.path, { token: TOKEN })
+        assert.strictEqual(first.status, 200, `${c.name} 首包必须 200`)
+        const tag = first.headers.etag
+        assert.ok(typeof tag === 'string' && tag.length >= 2, `${c.name} 必须下发 ETag`)
+        assert.strictEqual(first.headers['cache-control'], 'no-store', `${c.name} 必须 no-store（带鉴权的响应不得被任何缓存留存）`)
+        const hit = await request(port, 'GET', c.path, { token: TOKEN, headers: { 'if-none-match': tag } })
+        assert.strictEqual(hit.status, 304, `${c.name} 命中 If-None-Match 必须 304`)
+        assert.strictEqual(hit.text, '', `${c.name} 304 不得带 body`)
+        assert.strictEqual(hit.headers.etag, tag, `${c.name} 304 必须回显 ETag`)
+        assert.strictEqual(hit.headers['cache-control'], 'no-store', `${c.name} 304 仍须 no-store`)
+        c.mutate()
+        const changed = await request(port, 'GET', c.path, { token: TOKEN, headers: { 'if-none-match': tag } })
+        assert.strictEqual(changed.status, 200, `${c.name} 内容变了必须忽略旧 tag（回 200 全量）`)
+        assert.notStrictEqual(changed.headers.etag, tag, `${c.name} 内容变化必须换 tag`)
+      }
+      // 查询串不同 ⇒ tag 必须不同，且不能互相 304（数据不足时 limit=10/200 的 body 可能逐字相同）。
+      for (const [a, b] of [
+        ['/api/trends?days=14', '/api/trends?days=30'],
+        ['/api/run-history?limit=10', '/api/run-history?limit=200']
+      ]) {
+        const ra = await request(port, 'GET', a, { token: TOKEN })
+        const rb = await request(port, 'GET', b, { token: TOKEN })
+        assert.strictEqual(ra.status, 200)
+        assert.strictEqual(rb.status, 200)
+        assert.notStrictEqual(ra.headers.etag, rb.headers.etag, `${a} 与 ${b} 的 tag 必须不同`)
+        const cross = await request(port, 'GET', b, { token: TOKEN, headers: { 'if-none-match': ra.headers.etag } })
+        assert.strictEqual(cross.status, 200, `${a} 的 tag 不得让 ${b} 回 304`)
+      }
+      // ?token= 是浏览器兼容路径的凭证，不得参与 ETag（同一内容按不同凭证访问必须同一 tag）。
+      const withTok = await request(port, 'GET', `/api/config?token=${TOKEN}`, { token: TOKEN })
+      const noTok = await request(port, 'GET', '/api/config', { token: TOKEN })
+      assert.strictEqual(withTok.headers.etag, noTok.headers.etag, '?token= 不得进 ETag（否则条件缓存按凭证分裂）')
+    } finally {
+      if (envBackup === undefined) delete process.env.XBK_INTERVAL_MS
+      else process.env.XBK_INTERVAL_MS = envBackup
+      server.close()
+    }
+    // 降级/错误分支与易变端点：一律不发 ETag。
+    const second = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port2 = await listen(second.server)
+    try {
+      const degraded = await request(port2, 'GET', '/api/trends', { token: TOKEN })
+      assert.strictEqual(degraded.status, 200)
+      assert.strictEqual(JSON.parse(degraded.text).status, 'missing', '空目录 → trends 走降级分支')
+      assert.strictEqual(degraded.headers.etag, undefined, '降级分支不得下发 ETag（否则降级态会被 304 冻住）')
+      for (const p of ['/api/status', '/api/sys', '/api/sys?probe=version']) {
+        const r = await request(port2, 'GET', p, { token: TOKEN })
+        assert.strictEqual(r.status, 200, `${p} 必须 200`)
+        assert.strictEqual(r.headers.etag, undefined, `${p} 不得下发 ETag（每拍都在变，契约也不允许）`)
+      }
+    } finally { second.server.close() }
+  })
+  await aok('前端数据层: 304 但本地无副本时去掉 If-None-Match 重取一次（可执行断言）', async () => {
+    // api.js 是浏览器 ESM（import constants + 模块级 readBoot）。这里把它复制成 .mjs 用
+    // Node 原生 ESM 加载，换掉 fetch/document/window 三个外部面，真实跑 consumeJson 的分支。
+    const { pathToFileURL } = require('node:url')
+    const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
+    const modDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-api-mod-'))
+    const realFetch = globalThis.fetch
+    const realDocument = globalThis.document
+    const realWindow = globalThis.window
+    const calls = []
+    try {
+      fs.writeFileSync(path.join(modDir, 'api.mjs'), apiSrc.replace("from './constants.js'", "from './constants.mjs'"))
+      fs.writeFileSync(path.join(modDir, 'constants.mjs'), constSrc)
+      // 四拍的剧本：200（首次）→ 304（命中缓存）→ 304（本地没有这个 key）→ 200（重取成功）
+      const res200 = (tag, data) => ({
+        status: 200,
+        ok: true,
+        headers: { get: (n) => (String(n).toLowerCase() === 'etag' ? tag : null) },
+        json: async () => data
+      })
+      const res304 = () => ({ status: 304, ok: false, headers: { get: () => null }, json: async () => { throw new Error('304 不得读 body') } })
+      const script = [res200('"t-1"', { marker: 'first' }), res304(), res304(), res200('"t-2"', { marker: 'retried' })]
+      globalThis.document = { getElementById: () => null }
+      globalThis.window = { dispatchEvent: () => {} }
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, headers: { ...((opts && opts.headers) || {}) } })
+        if (script.length === 0) throw new Error('fetch 调用次数超出剧本（304 分支可能重复重试）')
+        return script.shift()
+      }
+      const mod = await import(pathToFileURL(path.join(modDir, 'api.mjs')).href)
+      const hasCond = (i) => Object.keys(calls[i].headers).some((k) => k.toLowerCase() === 'if-none-match')
+      assert.strictEqual((await mod.apiGetConfig()).marker, 'first', '首包 200 正常返回')
+      assert.strictEqual(hasCond(0), false, '首次无本地副本 → 不带 If-None-Match')
+      // 第二次：服务端 304，本地有副本 → 复用，不得再发请求。
+      assert.strictEqual((await mod.apiGetConfig()).marker, 'first', '304 命中必须复用本地副本')
+      assert.strictEqual(calls.length, 2, '304 命中不得额外发请求')
+      assert.strictEqual(hasCond(1), true, '第二次必须带 If-None-Match（说明条件请求真的发出去了）')
+      // 第三次：换一个没有本地副本的键 → 服务端仍回 304（边缘缓存/陈旧代理）→ 必须重取。
+      const retried = await mod.apiGetCacheHealth()
+      assert.strictEqual(retried.marker, 'retried', '304 无本地副本必须重取并返回 200 的真实数据')
+      assert.strictEqual(calls.length, 4, '重试恰好一次（总共 4 次 fetch）')
+      assert.strictEqual(hasCond(2), false, '无副本的键本来就不带条件头')
+      assert.strictEqual(hasCond(3), false, '重试必须去掉 If-None-Match（否则还是 304，陷入死循环）')
+      assert.match(calls[3].url, /\/api\/cache-health$/, '重试打的必须是同一个端点')
+    } finally {
+      globalThis.fetch = realFetch
+      globalThis.document = realDocument
+      globalThis.window = realWindow
+      fs.rmSync(modDir, { recursive: true, force: true })
+    }
+  })
   await aok('HTTP: POST /trigger 非法 action → 400', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
@@ -8282,7 +8408,14 @@ async function main () {
     assert.ok(src.includes('addConditional(merged, \'auto\')'), '/api/auto 必须接入条件请求')
     assert.ok(src.includes('addConditional(merged, condKey)'), '/api/messages 必须接入条件请求')
     assert.ok(!/addConditional\(merged, 'status'\)/.test(src), '/api/status 不得走条件请求（generatedAt/锁龄每拍在变）')
-    assert.ok(src.includes('COND_CACHE_MAX = 8') && src.includes('rememberConditional('), '条件缓存必须有界（messages 键含筛选/分页，无上限会无限增长）')
+    assert.ok(src.includes('COND_CACHE_MAX = 16') && src.includes('rememberConditional('), '条件缓存必须有界（messages 键含筛选/分页，无上限会无限增长）；v3.373 扩到 7 个端点 ⇒ 16')
+    // v3.373：四个新端点必须真的接上条件请求（断言调用点，不是「文件里出现过某字符串」）。
+    for (const key of ["'config'", "'cache-health'", '`trends?' + '$' + '{qs}`', '`run-history?' + '$' + '{qs}`']) {
+      assert.ok(src.includes('conditionalRequest(' + key), `${key} 必须接入条件请求（否则每次都整包重传）`)
+    }
+    // 304 但本地无副本必须自动重试一次，不能把 304 当错误（配置页会显示「加载失败」）。
+    assert.ok(src.includes('typeof retry === \'function\''), 'consumeJson 的 304 分支必须有重试通道')
+    assert.ok(src.includes('const again = once(false)'), '重试必须去掉 If-None-Match（once(false) 不再注入条件头）')
     // fetch 在调用时快照 headers：messages 的 addConditional 必须排在 fetch 之前。
     const msgFn = src.slice(src.indexOf('function apiGetMessages'), src.indexOf('function apiGetTrends'))
     assert.ok(msgFn.indexOf('addConditional(merged, condKey)') < msgFn.indexOf('fetch('), 'messages 必须先注入 If-None-Match 再 fetch')

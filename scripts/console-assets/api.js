@@ -72,10 +72,11 @@ async function readBodyJson (res) {
 // 条件请求缓存（v3.363）：键 → { tag, data }。服务端对只读快照端点发 ETag，
 // 命中 If-None-Match 时回 304 空体——前端复用上一份 data，省掉重复 body。
 // 只存内存（刷新即空），不落 localStorage；凭证不进这个 Map。
-// 有界（Sourcery PR #321）：messages 的缓存键含筛选/分页，键空间无上限——留 8 条
-// 足够覆盖「当前视图 + 来回切几个筛选」，超出按插入序淘汰（Map 保序，最老的先走）。
+// 有界（Sourcery PR #321）：messages 的缓存键含筛选/分页，键空间无上限——留 16 条
+// 覆盖「当前视图 + 来回切几个筛选 + 趋势/历史/配置/缓存健康各一份」，超出按插入序
+// 淘汰（Map 保序，最老的先走）。v3.373：8→16，因为条件请求从 3 个端点扩到 7 个。
 const COND_CACHE = new Map()
-const COND_CACHE_MAX = 8
+const COND_CACHE_MAX = 16
 function rememberConditional (key, entry) {
   if (COND_CACHE.size >= COND_CACHE_MAX && !COND_CACHE.has(key)) {
     const oldest = COND_CACHE.keys().next()
@@ -91,7 +92,7 @@ function addConditional (merged, key) {
 // 响应消费公共骨架：fetch promise 进来后统一「非 2xx 抛错 + body 消费完才清期限」。
 // 注意 fetch 本身不收进这里——各端点保持字面量 URL（Codacy SSRF 启发式：第一参数
 // 任何变量形态都会红，包括白名单查表后的常量；字面量是唯一全绿形态，PR #227 实测）。
-async function consumeJson (p, done, condKey) {
+async function consumeJson (p, done, condKey, retry) {
   p.then(() => {}, () => {}) // fetch reject（网络错）时由下方 done 兜底；正常路径在 body 消费后清
   try {
     const res = await p
@@ -108,6 +109,10 @@ async function consumeJson (p, done, condKey) {
       done()
       const hit = condKey ? COND_CACHE.get(condKey) : null
       if (hit) return hit.data
+      // 本地没有对应副本（换了标签页 / 前端刚更新过 / 缓存条目被淘汰 / 服务端 tag 与本地
+      // 记录不一致）时**必须重取**：去掉 If-None-Match 再发一次，拿完整的 200。
+      // 绝不能把 304 当失败——配置页会直接显示「加载失败」，而且用户无处可点。
+      if (typeof retry === 'function') return retry()
       throw new Error('HTTP 304（无本地副本）')
     }
     if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
@@ -125,6 +130,27 @@ async function consumeJson (p, done, condKey) {
     done()
     throw e
   }
+}
+
+// 条件请求端点的统一骨架（v3.373）：注入 If-None-Match → fetch → consumeJson。
+// config / cache-health / trends / run-history 四个端点共用它；「304 但本地无副本」的
+// 重试也在这里（见 consumeJson 的 retry 参数）。fetch 的 URL 仍留在各端点里保持字面量
+// （Codacy SSRF 口径）——这里收的是「怎么发」，不是 URL。
+function conditionalRequest (condKey, build) {
+  const once = (conditional) => {
+    const { merged, done } = timedRequest({
+      headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    })
+    // 必须在 fetch 之前注入：fetch 调用时就快照 headers（Sourcery PR #321）。
+    if (conditional) addConditional(merged, condKey)
+    return { p: build(merged), done }
+  }
+  const first = once(true)
+  return consumeJson(first.p, first.done, condKey, () => {
+    // 只重试一次：重试不带条件头，再拿到 304 就是服务端异常，按「无本地副本」抛错。
+    const again = once(false)
+    return consumeJson(again.p, again.done, condKey)
+  })
 }
 
 function apiGetStatus () {
@@ -191,11 +217,9 @@ function apiGetRunHistory ({ limit, before, windowKey, excludeCancelled = false 
   if (typeof windowKey === 'string' && /^[0-9a-f]{8}$/.test(windowKey)) params.set('win', windowKey)
   if (excludeCancelled === true) params.set('excludeCancelled', '1')
   const qs = params.toString()
-  const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  const p = fetch(qs.length > 0 ? `/api/run-history?${qs}` : '/api/run-history', merged)
-  return consumeJson(p, done)
+  // 条件请求（v3.373）：键含查询串——limit/before/win 不同的请求各算一份缓存。
+  return conditionalRequest(`run-history?${qs}`,
+    (merged) => fetch(qs.length > 0 ? `/api/run-history?${qs}` : '/api/run-history', merged))
 }
 
 // ── v3.297 扩展 API：推送记录 / 趋势 / 日志 / 系统 ────────────────────────────
@@ -233,20 +257,16 @@ function apiGetTrends ({ days, from, to } = {}) {
   if (typeof from === 'string' && DAY_KEY_RE.test(from)) params.set('from', from)
   if (typeof to === 'string' && DAY_KEY_RE.test(to)) params.set('to', to)
   const qs = params.toString()
-  const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  const p = fetch(qs.length > 0 ? `/api/trends?${qs}` : '/api/trends', merged)
-  return consumeJson(p, done)
+  // 条件请求（v3.373）：键含查询串（days/from/to 不同的请求各算一份缓存）。
+  return conditionalRequest(`trends?${qs}`,
+    (merged) => fetch(qs.length > 0 ? `/api/trends?${qs}` : '/api/trends', merged))
 }
 
 // v3.298 只读扩展 API：缓存健康 / 文件清单 / 配置视图。与上方端点同纪律——
 // fetch 第一参数是纯字面量（无查询参数，字面量是唯一形态）。
 function apiGetCacheHealth () {
-  const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  return consumeJson(fetch('/api/cache-health', merged), done)
+  // 条件请求（v3.373）：缓存文件的 size/mtime/条目数都在 body 里，内容未变时 304 即可。
+  return conditionalRequest('cache-health', (merged) => fetch('/api/cache-health', merged))
 }
 
 let filesInFlight = null
@@ -264,10 +284,8 @@ function apiGetFiles () {
 }
 
 function apiGetConfig () {
-  const { merged, done } = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  return consumeJson(fetch('/api/config', merged), done)
+  // 条件请求（v3.373）：配置视图在运行期基本不变（只随部署/环境变量变），命中率最高的一支。
+  return conditionalRequest('config', (merged) => fetch('/api/config', merged))
 }
 
 function apiGetLogs () {
