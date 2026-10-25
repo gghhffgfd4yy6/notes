@@ -2286,9 +2286,9 @@ function SearchPanel ({ onSync, active = true }) {
       <${Button} disabled=${loading || input.trim() === ''} ariaBusy=${loading ? 'true' : 'false'} onClick=${() => submit(input, 1)}>搜索<//>
     </div>
     <details class="ls-config">
-      <summary>监控设置：每页 ${cfg.limit} 条 · 每 ${cfg.intervalMin} 分钟检查 · ${cfg.enabled ? '已开启' : '已关闭'}</summary>
+      <summary>监控设置：搜索页每页 ${cfg.limit} 条 · 每 ${cfg.intervalMin} 分钟检查 · ${cfg.enabled ? '已开启' : '已关闭'}</summary>
       <div class="ls-config-body">
-        <label class="ls-cfg-field">每页
+        <label class="ls-cfg-field">搜索页每页
           <input type="number" min="1" max="100" inputmode="numeric" value=${cfgDraft.limit}
             onInput=${(e) => editCfg({ limit: Number(e.target.value) })} /> 条
         </label>
@@ -2298,13 +2298,13 @@ function SearchPanel ({ onSync, active = true }) {
         </label>
         <label class="ls-cfg-toggle">
           <input type="checkbox" checked=${cfgDraft.enabled}
-            onChange=${(e) => editCfg({ enabled: e.target.checked })} /> 自动监控并推送
+            onChange=${(e) => editCfg({ enabled: e.target.checked })} /> 自动检查并推送新线报
         </label>
         <${Button} variant="ghost" onClick=${saveCfg}>保存设置<//>
         ${cfgMsg && html`<span class="ls-cfg-msg">${cfgMsg}</span>`}
       </div>
-      <div class="ls-cfg-help">开启后每 ${cfgDraft.intervalMin} 分钟检查一次关注词：有新的就逐条推送，没有就不推；检查只看最新 ${cfgDraft.limit} 条。推过的会记在文件里，重启不重推。</div>
-      ${cfg.enabled && cfg.lastCheckAt > 0 && html`<div class="ls-cfg-help">上次检查：${watchAtText(cfg.lastCheckAt)}（北京时间）</div>`}
+      <div class="ls-cfg-help">「搜索页每页」只管搜索页翻页，不影响监控。开启监控后，每 ${cfgDraft.intervalMin} 分钟看一次关注词：上次检查之后多出来的线报，每条单独推送；没有新的就不推。监控会从最新往回翻到上次检查的位置（最多 5 页），不会因为超过一页的条数就漏推。推过的会记在文件里，重启不重推。</div>
+      ${cfg.enabled && cfg.lastCheckAt > 0 && html`<div class="ls-cfg-help">上次检查时间：${watchAtText(cfg.lastCheckAt)}（北京时间）</div>`}
     </details>
     <div class="ls-watch">
       <div class="ls-watch-head">

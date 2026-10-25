@@ -2479,7 +2479,7 @@ async function watchMonitorTests () {
     const mk = () => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-watch2-'))
       saveWatchState(dir, {
-        limit: 20,
+        limit: 1, // 故意设 1：监控必须翻到上次位置，不能只推最新 limit 条
         intervalMin: 10,
         enabled: true,
         lastCheckAt: 0,

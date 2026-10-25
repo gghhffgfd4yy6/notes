@@ -4668,20 +4668,39 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       let pushed = 0
       const results = []
       for (const word of state.words) {
-        const r = await fetchLineSearchPage(word.q, 1)
-        if (!r.ok) { results.push({ q: word.q, pushed: 0, error: r.error }); continue }
-        const items = r.value.items.slice(0, state.limit)
+        const since = word.lastReadAt > 0 ? word.lastReadAt : Date.now()
+        let items = []
+        let anchorAt = -1
+        let fetchError = ''
+        // 从最新往回翻，直到找到上次已读的那条（或时间已经比 lastReadAt 旧），
+        // 最多 5 个上游页（500 条）；不再只取最新 N 条，避免「20 条以后的新线报漏推」。
+        for (let up = 1; up <= LINE_SEARCH_UPSTREAM_PAGE_MAX; up += 1) {
+          const r = await fetchLineSearchPage(word.q, up)
+          if (!r.ok) { fetchError = r.error; break }
+          items = items.concat(r.value.items)
+          if (word.lastReadId) {
+            const at = items.findIndex((it) => it.id === word.lastReadId)
+            if (at >= 0) { anchorAt = at; break }
+          } else {
+            const oldest = r.value.items[r.value.items.length - 1]
+            if (!oldest || typeof oldest.ts !== 'number' || oldest.ts <= since) break
+          }
+          if (up >= r.value.pages) break
+        }
+        if (fetchError && anchorAt < 0) {
+          results.push({ q: word.q, pushed: 0, error: fetchError })
+          continue
+        }
         const sent = new Set(Array.isArray(word.sentIds) ? word.sentIds : [])
-        const idx = word.lastReadId ? items.findIndex((it) => it.id === word.lastReadId) : -1
         let candidates
-        if (idx >= 0) {
-          candidates = items.slice(0, idx) // 锚点之前的才是新的
+        if (anchorAt >= 0) {
+          candidates = items.slice(0, anchorAt) // 锚点之前的才是新的
         } else {
-          // 锚点被挤出最新 limit 条（或旧数据没有锚点）：退回时间比较。
+          // 锚点不在已翻到的范围（或旧数据没有锚点）：退回时间比较。
           // lastReadAt=0 视为「从现在开始」，不把历史条目当新线报补推。
-          const since = word.lastReadAt > 0 ? word.lastReadAt : Date.now()
           candidates = items.filter((it) => typeof it.ts === 'number' && it.ts > since)
         }
+        const truncated = word.lastReadId !== '' && anchorAt < 0 && items.length >= LINE_SEARCH_UPSTREAM_PAGE_MAX * LINE_SEARCH_PAGE_SIZE
         candidates = candidates.filter((it) => typeof it.id === 'string' && it.id !== '' && !sent.has(it.id))
         candidates.reverse() // 旧→新：中途推送失败时锚点停在已推的最后一条，下轮接着推
         let count = 0
@@ -4729,7 +4748,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             break
           }
         }
-        results.push({ q: word.q, pushed: count, ...(stopped ? { stopped: true } : {}) })
+        results.push({ q: word.q, pushed: count, ...(stopped ? { stopped: true } : {}), ...(truncated ? { truncated: true } : {}) })
       }
       return { status: 'ok', pushed, results }
     } finally {
