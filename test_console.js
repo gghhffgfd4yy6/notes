@@ -85,8 +85,7 @@ const {
   // v3.370 线报全站搜索：解析/归一纯函数 + 关注词文件常量
   decodeLineHtml, parseLineStamp, clampLineQuery, normalizeWatchWord, parseLineSearchHtml,
   readLineWatchWords, readWatchState, saveWatchState, formatWatchPush,
-  LINE_WATCH_FILE, LINE_WATCH_MAX_WORDS, LINE_SEARCH_QUERY_MAX_BYTES,
-  LINE_WATCH_DEFAULT_LIMIT, LINE_WATCH_DEFAULT_INTERVAL_MIN
+  LINE_WATCH_FILE, LINE_WATCH_MAX_WORDS, LINE_SEARCH_QUERY_MAX_BYTES
 } = require('./scripts/console')
 const { readMessages } = require('./scripts/status')
 
@@ -2192,6 +2191,17 @@ const LINE_SEARCH_FIXTURE = `<html><body>
 <div class="pagebar"><a href="/search.php?q=x&amp;page=2">2</a><a href="/search.php?q=x&amp;page=3">3</a></div>
 </body></html>`
 
+// 满页夹具：上游单页固定 100 条，用来验证 limit<100 但跨到下一页时的偏移映射。
+const LINE_SEARCH_FULL_PAGE = (() => {
+  const rows = []
+  for (let i = 0; i < 100; i += 1) {
+    const id = String(8000000 + i)
+    const mm = String(i % 60).padStart(2, '0')
+    rows.push(`<li class="article-list"><p class="title"><time title="2026-10-25 10:${mm}">${mm}</time><a href="/haodan/${id}.html" title="满页${i}" data-catename="好单线报" data-price="" data-content="满页内容${i}" data-louzhu="t">满页${i}</a></p></li>`)
+  }
+  return `<html><body><ul class="new-post">${rows.join('')}</ul><div class="pagebar"><a href="/search.php?q=x&amp;page=2">2</a></div></body></html>`
+})()
+
 async function lineSearchTests () {
   await aok('线报搜索: 解析上游 HTML（标题/正文/价格/北京时间/分页）', () => {
     const parsed = parseLineSearchHtml(LINE_SEARCH_FIXTURE, 'https://new.ixbk.net/')
@@ -2246,6 +2256,7 @@ async function lineSearchTests () {
         if (mode === 'fail') throw new Error('upstream down')
         if (mode === 'redirect') return { ok: false, status: 302, text: async () => '' }
         if (mode === 'changed') return { ok: true, status: 200, text: async () => '<html>changed</html>' }
+        if (mode === 'full' && String(target).includes('&page=1')) return { ok: true, status: 200, text: async () => LINE_SEARCH_FULL_PAGE }
         if (String(target).includes('&page=2')) return { ok: true, status: 200, text: async () => pageTwo }
         return { ok: true, status: 200, text: async () => LINE_SEARCH_FIXTURE }
       }
@@ -2277,6 +2288,15 @@ async function lineSearchTests () {
       assert.strictEqual(sliced.count, 1)
       assert.strictEqual(sliced.items[0].id, 'haodan-7303544')
       assert.strictEqual(sliced.pages, 202, '3 个上游页（末页 2 条）× 100 + 2 ÷ 每页 1 条')
+      // 满页 100 条 + limit=30 第 4 页：offset=90，应从第 91 条开始，跨到上游第 2 页补 20 条。
+      mode = 'full'
+      const fullPageRes = JSON.parse((await request(port, 'GET', '/api/line-search?q=' + encodeURIComponent('满页词') + '&page=4&limit=30', { token: TOKEN })).text)
+      assert.strictEqual(fullPageRes.status, 'ok')
+      assert.strictEqual(fullPageRes.count, 11, '第 91-100 条 + 上游第 2 页 1 条')
+      assert.strictEqual(fullPageRes.items[0].id, 'haodan-8000090', 'offset=90 必须映射到第 91 条')
+      assert.strictEqual(fullPageRes.items[10].id, 'haodan-7300002')
+      assert.strictEqual(fullPageRes.pages, 4, '(100 + 1) 条 ÷ 每页 30 条 = 4 页')
+      mode = 'ok'
       // 空词 400（不拿空 query 去扫上游）。
       assert.strictEqual((await request(port, 'GET', '/api/line-search?q=', { token: TOKEN })).status, 400)
       // 上游失败如实回 upstream_error，不伪装成「0 条结果」。
@@ -2303,8 +2323,8 @@ async function lineSearchTests () {
       })
       // 配置：默认 20 条 / 10 分钟 / 关闭；可改，越界 400；写盘后 GET 一致。
       const cfg0 = JSON.parse((await request(port, 'GET', '/api/line-watch', { token: TOKEN })).text)
-      assert.strictEqual(cfg0.limit, LINE_WATCH_DEFAULT_LIMIT)
-      assert.strictEqual(cfg0.intervalMin, LINE_WATCH_DEFAULT_INTERVAL_MIN)
+      assert.strictEqual(cfg0.limit, 20, '文档默认 20 条/页')
+      assert.strictEqual(cfg0.intervalMin, 10, '文档默认 10 分钟')
       assert.strictEqual(cfg0.enabled, false)
       const cfgOn = JSON.parse((await postWatch({ action: 'config', limit: 50, intervalMin: 5, enabled: true })).text)
       assert.strictEqual(cfgOn.limit, 50)
@@ -2325,6 +2345,7 @@ async function lineSearchTests () {
       const addedWords = JSON.parse(added.text).words
       assert.deepStrictEqual(addedWords.map((w) => w.q), ['十月 稻田'])
       assert.ok(addedWords[0].lastReadAt > 0, '新词必须以添加时刻为基线，首次检查不把历史条目全算新')
+      assert.strictEqual(addedWords[0].lastReadAt % 60000, 59999, '基线取当前分钟起点 -1ms，避免漏掉同分钟线报')
       // Cookie-only 写请求必须 401（写面不收会话 Cookie）。
       const cookieOnly = await postWatch({ action: 'add', q: '另一词' }, { token: '', headers: { cookie: `xbk_session=${TOKEN}` } })
       assert.strictEqual(cookieOnly.status, 401)
@@ -2352,6 +2373,14 @@ async function lineSearchTests () {
       fs.writeFileSync(path.join(dir, LINE_WATCH_FILE), JSON.stringify({ schema: 1, words: many }))
       const full = await postWatch({ action: 'add', q: '第十三个' })
       assert.strictEqual(full.status, 409)
+      // IO/权限类读失败必须 fail-closed：临时把文件换成目录，写操作 503 且不覆盖任何东西。
+      fs.rmSync(path.join(dir, LINE_WATCH_FILE), { force: true })
+      fs.mkdirSync(path.join(dir, LINE_WATCH_FILE))
+      const blocked = await postWatch({ action: 'add', q: '读不了' })
+      assert.strictEqual(blocked.status, 503)
+      assert.ok(blocked.text.includes('暂时读不了'))
+      assert.ok(fs.statSync(path.join(dir, LINE_WATCH_FILE)).isDirectory(), '失败时不得改动原路径')
+      fs.rmdirSync(path.join(dir, LINE_WATCH_FILE))
     } finally {
       server.close()
       fs.rmSync(dir, { recursive: true, force: true })
@@ -2436,6 +2465,61 @@ async function watchMonitorTests () {
     } finally {
       server.close()
       fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('关注词监控: 两条新线报逐条推送（不汇总），中途停用立即停止', async () => {
+    const mk = () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-watch2-'))
+      saveWatchState(dir, {
+        limit: 20,
+        intervalMin: 10,
+        enabled: true,
+        lastCheckAt: 0,
+        words: [{ q: '十月稻田', lastReadAt: Date.UTC(2026, 9, 24, 8, 55) - 1, lastReadId: '', sentIds: [] }]
+      })
+      return dir
+    }
+    const dir = mk()
+    const pushes = []
+    const one = createConsole({
+      token: TOKEN,
+      stateDir: dir,
+      lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => LINE_SEARCH_FIXTURE }),
+      watchNotifier: async (title, body) => { pushes.push({ title, body }) }
+    })
+    try {
+      const r = await one.runWatchOnce()
+      assert.strictEqual(r.pushed, 2, '两条新线报必须各推一条')
+      assert.strictEqual(pushes.length, 2, '不得合并成一条')
+      assert.ok(pushes[0].body.includes('/haodan/7303544.html'), '先推旧的')
+      assert.ok(pushes[1].body.includes('/haodan/7305598.html'), '再推新的')
+    } finally {
+      one.server.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+
+    const dir2 = mk()
+    const sent = []
+    const two = createConsole({
+      token: TOKEN,
+      stateDir: dir2,
+      lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => LINE_SEARCH_FIXTURE }),
+      watchNotifier: async () => {
+        sent.push(1)
+        // 第一条发出后用户关掉监控：内存里的 state 仍是 enabled，必须靠每条重读文件才发现。
+        const st = readWatchState(dir2)
+        st.enabled = false
+        saveWatchState(dir2, st)
+      }
+    })
+    try {
+      const r = await two.runWatchOnce()
+      assert.strictEqual(r.pushed, 1, '停用后不得再发第二条')
+      assert.strictEqual(sent.length, 1)
+    } finally {
+      two.server.close()
+      fs.rmSync(dir2, { recursive: true, force: true })
     }
   })
 }

@@ -2142,7 +2142,17 @@ function SearchPanel ({ onSync, active = true }) {
     const next = { ...newCounts }
     let failed = 0
     try {
-      for (const w of watch) {
+      // 先拉一次最新关注词状态：监控可能在页面开着时已经推进过锚点，
+      // 用旧快照算「N 条新」会把已推过的条目又标成新。
+      let current = watch
+      try {
+        const fresh = await apiGetLineWatch()
+        if (fresh && Array.isArray(fresh.words)) {
+          current = fresh.words
+          if (watchEpoch.current === epoch) setWatch(fresh.words)
+        }
+      } catch (e) {}
+      for (const w of current) {
         try {
           const d = await apiSearchLines({ q: w.q, page: 1, limit: cfg.limit })
           if (!d || d.status !== 'ok' || !Array.isArray(d.items)) { failed += 1; continue }
@@ -2239,7 +2249,7 @@ function SearchPanel ({ onSync, active = true }) {
     body = html`<${Hint} tone="error">${live.error || '线报酷搜索暂不可用，稍后再试'}<//>`
   } else if (live && live.status === 'ok') {
     body = html`<div>
-      <div class="msg-count" aria-live="polite">本页 ${live.count} 条 · 第 ${live.page} / ${pages} 页${live.cached ? ' · 60s 内缓存' : ''}${!watched ? html` <button type="button" class="ls-follow" onClick=${addWatch}>关注「${req.q}」</button>` : ''}</div>
+      <div class="msg-count" aria-live="polite">本页 ${live.count} 条 · 第 ${live.page} / ${pages} 页${live.pagesEstimated ? ' · 页数为估算' : ''}${live.cached ? ' · 60s 内缓存' : ''}${!watched ? html` <button type="button" class="ls-follow" onClick=${addWatch}>关注「${req.q}」</button>` : ''}</div>
       ${items.length === 0
         ? html`<div class="empty">没有匹配的线报</div>`
         : html`<div class="msg-list" role="list">
@@ -2300,7 +2310,7 @@ function SearchPanel ({ onSync, active = true }) {
       <div class="ls-watch-head">
         <span class="ls-watch-title">关注词</span>
         ${watch.length > 0 && html`<${Button} variant="ghost" disabled=${checking} onClick=${checkWatch}>${checking ? '检查中…' : '检查更新'}<//>`}
-        ${watchStatus === 'invalid' && html`<span class="ls-watch-warn">关注词文件损坏，按空列表处理</span>`}
+        ${watchStatus !== '' && watchStatus !== 'ok' && html`<span class="ls-watch-warn">关注词文件读取失败（${watchStatus}），暂时不能保存</span>`}
       </div>
       ${watch.length === 0
         ? html`<div class="ls-watch-empty">还没有关注词。搜到想要的词后点「关注」，下次进来点「检查更新」看有没有新线报。</div>`

@@ -2144,7 +2144,7 @@ function readWatchState (stateDir) {
   const p = path.join(stateDir, LINE_WATCH_FILE)
   const read = readSafeTextResult(p, 256 * 1024, { openNonBlocking: true })
   if (read.status === 'missing') return { status: 'ok', words: [], ...defaults }
-  if (read.status !== 'ok') return { status: 'invalid', words: [], ...defaults }
+  if (read.status !== 'ok') return { status: read.status, words: [], ...defaults }
   let raw
   try { raw = JSON.parse(read.text) } catch (e) { return { status: 'invalid', words: [], ...defaults } }
   if (!raw || raw.schema !== 1 || !Array.isArray(raw.words)) return { status: 'invalid', words: [], ...defaults }
@@ -4352,6 +4352,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
 
   // 取上游某一页（1..5），解析成 { status, items, pages, ... }；同词同页 60s 缓存。
   // 失败返回 { ok:false, error }，由调用方决定怎么下发——不在这里写 res（定时监控也要复用）。
+  // 同一 key 的并发请求合并成一次上游请求：避免慢请求晚到后把新结果盖回旧数据。
+  const lineSearchInflight = new Map()
   const fetchLineSearchPage = async (q, upPage) => {
     const key = `${q}\n${upPage}`
     const now = Date.now()
@@ -4359,89 +4361,99 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     if (hit && now - hit.at < LINE_SEARCH_CACHE_TTL_MS) {
       return { ok: true, value: { ...hit.value, cached: true } }
     }
-    const baseUrl = sourceDomain()
-    if (typeof searchFetch !== 'function') {
-      return { ok: false, error: '当前 Node 不支持 fetch，无法访问线报酷' }
-    }
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), LINE_SEARCH_TIMEOUT_MS)
-    let upstream
-    try {
-      upstream = await searchFetch(`${baseUrl}/search.php?q=${encodeURIComponent(q)}&page=${upPage}`, {
-        signal: controller.signal,
-        redirect: 'manual', // 固定 host：上游 3xx 一律中止，避免被重定向到内网/其它站点
-        headers: { accept: 'text/html,application/xhtml+xml', 'user-agent': 'xbk-console/1' }
-      })
-    } catch (e) {
-      clearTimeout(timer)
-      return {
-        ok: false,
-        error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷连接失败，稍后再试'
+    const running = lineSearchInflight.get(key)
+    if (running) return running
+    const task = (async () => {
+      const baseUrl = sourceDomain()
+      if (typeof searchFetch !== 'function') {
+        return { ok: false, error: '当前 Node 不支持 fetch，无法访问线报酷' }
       }
-    }
-    if (upstream && upstream.status >= 300 && upstream.status < 400) {
-      clearTimeout(timer)
-      return { ok: false, error: '线报酷返回重定向，已中止' }
-    }
-    if (!upstream || !upstream.ok) {
-      clearTimeout(timer)
-      return { ok: false, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` }
-    }
-    // 8s 计时器读到响应体结束才停：上游先回头再慢慢吐 body 也不能拖住控制台。
-    // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存。
-    let text = ''
-    try {
-      const stream = upstream.body
-      if (stream && typeof stream.getReader === 'function') {
-        const reader = stream.getReader()
-        const chunks = []
-        let total = 0
-        for (;;) {
-          const step = await reader.read()
-          if (step.done) break
-          const chunk = Buffer.from(step.value)
-          total += chunk.length
-          if (total > LINE_SEARCH_MAX_BYTES) {
-            try { await reader.cancel() } catch (e) {}
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), LINE_SEARCH_TIMEOUT_MS)
+      let upstream
+      try {
+        upstream = await searchFetch(`${baseUrl}/search.php?q=${encodeURIComponent(q)}&page=${upPage}`, {
+          signal: controller.signal,
+          redirect: 'manual', // 固定 host：上游 3xx 一律中止，避免被重定向到内网/其它站点
+          headers: { accept: 'text/html,application/xhtml+xml', 'user-agent': 'xbk-console/1' }
+        })
+      } catch (e) {
+        clearTimeout(timer)
+        return {
+          ok: false,
+          error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷连接失败，稍后再试'
+        }
+      }
+      if (upstream && upstream.status >= 300 && upstream.status < 400) {
+        clearTimeout(timer)
+        return { ok: false, error: '线报酷返回重定向，已中止' }
+      }
+      if (!upstream || !upstream.ok) {
+        clearTimeout(timer)
+        return { ok: false, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` }
+      }
+      // 8s 计时器读到响应体结束才停：上游先回头再慢慢吐 body 也不能拖住控制台。
+      // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存。
+      let text = ''
+      try {
+        const stream = upstream.body
+        if (stream && typeof stream.getReader === 'function') {
+          const reader = stream.getReader()
+          const chunks = []
+          let total = 0
+          for (;;) {
+            const step = await reader.read()
+            if (step.done) break
+            const chunk = Buffer.from(step.value)
+            total += chunk.length
+            if (total > LINE_SEARCH_MAX_BYTES) {
+              try { await reader.cancel() } catch (e) {}
+              return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
+            }
+            chunks.push(chunk)
+          }
+          text = Buffer.concat(chunks).toString('utf8')
+        } else {
+          text = await upstream.text()
+          if (Buffer.byteLength(text, 'utf8') > LINE_SEARCH_MAX_BYTES) {
             return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
           }
-          chunks.push(chunk)
         }
-        text = Buffer.concat(chunks).toString('utf8')
-      } else {
-        text = await upstream.text()
-        if (Buffer.byteLength(text, 'utf8') > LINE_SEARCH_MAX_BYTES) {
-          return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
+      } catch (e) {
+        return {
+          ok: false,
+          error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试'
         }
+      } finally {
+        clearTimeout(timer)
       }
-    } catch (e) {
-      return {
-        ok: false,
-        error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试'
+      const parsed = parseLineSearchHtml(text, baseUrl)
+      if (!parsed.matched) {
+        // 结构对不上 ≠ 没有结果：如实报错，别让调用方以为这个搜索词真的 0 条。
+        return { ok: false, error: '线报酷页面结构变了，暂时无法解析（不是没有结果）' }
       }
+      const value = {
+        status: 'ok',
+        q,
+        upstreamPage: upPage,
+        pages: parsed.pages,
+        count: parsed.items.length,
+        items: parsed.items,
+        baseUrl
+      }
+      if (lineSearchCache.size >= LINE_SEARCH_CACHE_MAX) {
+        const oldest = lineSearchCache.keys().next().value
+        lineSearchCache.delete(oldest)
+      }
+      lineSearchCache.set(key, { at: now, value })
+      return { ok: true, value }
+    })()
+    lineSearchInflight.set(key, task)
+    try {
+      return await task
     } finally {
-      clearTimeout(timer)
+      lineSearchInflight.delete(key)
     }
-    const parsed = parseLineSearchHtml(text, baseUrl)
-    if (!parsed.matched) {
-      // 结构对不上 ≠ 没有结果：如实报错，别让调用方以为这个搜索词真的 0 条。
-      return { ok: false, error: '线报酷页面结构变了，暂时无法解析（不是没有结果）' }
-    }
-    const value = {
-      status: 'ok',
-      q,
-      upstreamPage: upPage,
-      pages: parsed.pages,
-      count: parsed.items.length,
-      items: parsed.items,
-      baseUrl
-    }
-    if (lineSearchCache.size >= LINE_SEARCH_CACHE_MAX) {
-      const oldest = lineSearchCache.keys().next().value
-      lineSearchCache.delete(oldest)
-    }
-    lineSearchCache.set(key, { at: now, value })
-    return { ok: true, value }
   }
 
   // 搜索页：page 是「第几页（每页 limit 条）」，不是上游页码；跨 100 条边界时取两页拼。
@@ -4457,34 +4469,43 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     if (page > LINE_SEARCH_UI_PAGE_MAX) page = LINE_SEARCH_UI_PAGE_MAX
     const offset = (page - 1) * limit
     const upstreamMax = LINE_SEARCH_PAGE_SIZE * LINE_SEARCH_UPSTREAM_PAGE_MAX
-    const empty = (pages) => sendJson(res, 200, {
-      status: 'ok', q, page, limit, pages, count: 0, items: [], cached: false
+    const empty = (pages, estimated = false) => sendJson(res, 200, {
+      status: 'ok', q, page, limit, pages, count: 0, items: [], cached: false, pagesEstimated: estimated
     })
-    if (offset >= upstreamMax) { empty(Math.ceil(upstreamMax / limit)); return }
-
-    // 只有翻到第 2 页以后才先探一次第 1 页：拿到上游总页数，越界的页直接回空，
-    // 不去请求不存在的上游页（那会解析失败，被误报成「页面结构变了」）。
-    let upstreamPages = 0
-    if (page > 1) {
-      const head = await fetchLineSearchPage(q, 1)
-      if (!head.ok) {
-        sendJson(res, 200, { status: 'upstream_error', q, page, limit, error: head.error })
-        return
-      }
-      upstreamPages = head.value.pages
-      if (Math.floor(offset / LINE_SEARCH_PAGE_SIZE) + 1 > upstreamPages) {
-        empty(Math.max(1, Math.ceil((upstreamPages * LINE_SEARCH_PAGE_SIZE) / limit)))
-        return
-      }
-    }
+    if (offset >= upstreamMax) { empty(Math.ceil(upstreamMax / limit), true); return }
 
     const startUp = Math.floor(offset / LINE_SEARCH_PAGE_SIZE) + 1
+    const first = await fetchLineSearchPage(q, startUp)
+    if (!first.ok) {
+      sendJson(res, 200, { status: 'upstream_error', q, page, limit, error: first.error })
+      return
+    }
+    const upstreamPages = first.value.pages
+    const sliceStart = offset - (startUp - 1) * LINE_SEARCH_PAGE_SIZE
+
+    // 请求页超出上游总页数：取末页真实条数算出总条数，返回空页（不再请求不存在的页）。
+    if (startUp > upstreamPages) {
+      let total = upstreamPages === 1 ? first.value.items.length : upstreamPages * LINE_SEARCH_PAGE_SIZE
+      let estimated = upstreamPages > 1
+      if (upstreamPages > 1) {
+        const last = await fetchLineSearchPage(q, upstreamPages)
+        if (last.ok) {
+          total = (upstreamPages - 1) * LINE_SEARCH_PAGE_SIZE + last.value.items.length
+          estimated = false
+        }
+      }
+      empty(Math.max(1, Math.ceil(total / limit)), estimated)
+      return
+    }
+
+    // endUp 以「本次展示页真正需要的条数」为准，再被上游总页数封顶：
+    // limit 很大时不会去请求不存在的下一页，已取到的有效结果也不会因越界请求失败而丢掉。
     const endUp = Math.min(
-      LINE_SEARCH_UPSTREAM_PAGE_MAX,
-      Math.floor((offset + limit - 1) / LINE_SEARCH_PAGE_SIZE) + 1
+      upstreamPages,
+      startUp + Math.floor((sliceStart + limit - 1) / LINE_SEARCH_PAGE_SIZE)
     )
-    const fetched = []
-    for (let upPage = startUp; upPage <= endUp; upPage += 1) {
+    const fetched = [first.value]
+    for (let upPage = startUp + 1; upPage <= endUp; upPage += 1) {
       const r = await fetchLineSearchPage(q, upPage)
       if (!r.ok) {
         sendJson(res, 200, { status: 'upstream_error', q, page, limit, error: r.error })
@@ -4492,25 +4513,25 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       fetched.push(r.value)
     }
-    if (upstreamPages === 0) upstreamPages = Math.max(...fetched.map((v) => v.pages))
-    // 上游最后一页通常不满 100 条：取它的条数才能算出准确总页数，
-    // 否则「4 页 × 100 ÷ 20 = 20 页」会把最后两页算成空页。
+
+    // 上游最后一页通常不满 100 条：取它的条数才能算出准确总页数；
+    // 取不到时按满页估算，但用 pagesEstimated 明确告诉前端「页数是估的」。
     let total = upstreamPages * LINE_SEARCH_PAGE_SIZE
+    let pagesEstimated = false
     if (upstreamPages === 1) {
-      const only = fetched.find((v) => v.upstreamPage === 1)
-      if (only) total = only.items.length
+      total = first.value.items.length
     } else {
       let last = fetched.find((v) => v.upstreamPage === upstreamPages)
       if (!last) {
         const r = await fetchLineSearchPage(q, upstreamPages)
         if (r.ok) last = r.value
+        else pagesEstimated = true
       }
       if (last) total = (upstreamPages - 1) * LINE_SEARCH_PAGE_SIZE + last.items.length
     }
     const pages = Math.max(1, Math.ceil(total / limit))
-    if (offset >= total) { empty(pages); return }
+    if (offset >= total) { empty(pages, pagesEstimated); return }
     const all = fetched.flatMap((v) => v.items)
-    const sliceStart = offset - (startUp - 1) * LINE_SEARCH_PAGE_SIZE
     const items = all.slice(sliceStart, sliceStart + limit)
     sendJson(res, 200, {
       status: 'ok',
@@ -4520,7 +4541,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       pages,
       count: items.length,
       items,
-      cached: fetched.every((v) => v.cached === true)
+      cached: fetched.every((v) => v.cached === true),
+      pagesEstimated
     })
   }
 
@@ -4544,8 +4566,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         const action = payload.action
         let state = readWatchState(stateDir)
-        if (state.status !== 'ok') {
-          // 文件已损坏（读不出任何关注词）：用户的显式写操作按空状态重建，
+        if (state.status === 'invalid') {
+          // 内容确定损坏（JSON/schema 读不出）：用户的显式写操作按空状态重建，
           // 否则 UI 会永远卡在「损坏」且无法通过「关注」恢复。
           state = {
             status: 'ok',
@@ -4555,6 +4577,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             enabled: false,
             lastCheckAt: 0
           }
+        } else if (state.status !== 'ok') {
+          // 权限/IO/文件被替换等暂时性读失败：fail-closed，绝不用空状态覆盖原文件。
+          sendJson(res, 503, { error: `关注词文件暂时读不了（${state.status}），本次未写入，稍后再试` })
+          return
         }
         let words = state.words
         if (action === 'add') {
@@ -4565,8 +4591,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
               sendJson(res, 409, { error: '关注词最多 12 个，先删掉不用的再添加' })
               return
             }
-            // 新词以「添加时刻」为基线：第一次检查只算之后的新线报，不把历史 100 条全标成新。
-            words = words.concat([{ q, lastReadAt: Date.now(), lastReadId: '', sentIds: [] }])
+            // 新词以「当前分钟起点 - 1ms」为基线：上游时间只有分钟精度，
+            // 用精确 now 会漏掉同一分钟里随后发布的线报（整分钟的 ts 小于 now）。
+            words = words.concat([{ q, lastReadAt: Math.floor(Date.now() / 60000) * 60000 - 1, lastReadId: '', sentIds: [] }])
           }
         } else if (action === 'remove') {
           const q = normalizeWatchWord(payload.q)
@@ -4658,7 +4685,20 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         candidates = candidates.filter((it) => typeof it.id === 'string' && it.id !== '' && !sent.has(it.id))
         candidates.reverse() // 旧→新：中途推送失败时锚点停在已推的最后一条，下轮接着推
         let count = 0
+        let stopped = false
         for (const item of candidates) {
+          // 每条发送前重读状态：用户中途停用/删词/标已读或已推过，都不能再发。
+          const live = readWatchState(stateDir)
+          if (live.status !== 'ok' || !live.enabled) { stopped = true; break }
+          const lw = live.words.find((x) => x.q === word.q)
+          if (!lw) { stopped = true; break }
+          if ((Array.isArray(lw.sentIds) ? lw.sentIds : []).includes(item.id)) continue
+          const liveAnchor = lw.lastReadId ? items.findIndex((it) => it.id === lw.lastReadId) : -1
+          const itemAt = items.indexOf(item)
+          const stillNew = liveAnchor >= 0
+            ? itemAt >= 0 && itemAt < liveAnchor
+            : typeof item.ts === 'number' && item.ts > (lw.lastReadAt || 0)
+          if (!stillNew) continue
           try {
             const title = `新线报 · ${word.q}`.slice(0, 32)
             await notifyWatch(title, formatWatchPush(item))
@@ -4670,15 +4710,26 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           pushed += 1
           // 推一条记一条：重新读盘再改，避免覆盖期间 UI 的增删/配置。
           const fresh = readWatchState(stateDir)
-          if (fresh.status !== 'ok') break
+          if (fresh.status !== 'ok') {
+            results.push({ q: word.q, pushed: count, error: 'state_read_failed' })
+            break
+          }
           const w = fresh.words.find((x) => x.q === word.q)
-          if (!w) break
+          if (!w) { results.push({ q: word.q, pushed: count, error: 'removed' }); break }
           w.sentIds = (Array.isArray(w.sentIds) ? w.sentIds : []).concat([item.id]).slice(-LINE_WATCH_SENT_MAX)
-          if (/^[A-Za-z0-9._:/-]{1,80}$/.test(item.id)) w.lastReadId = item.id
-          if (typeof item.ts === 'number' && item.ts > w.lastReadAt) w.lastReadAt = item.ts
-          if (!saveWatchState(stateDir, fresh)) break
+          // 不倒退锚点：用户可能已经读到更靠前的位置（lastReadAt 更大）。
+          if (typeof item.ts === 'number' && item.ts > w.lastReadAt) {
+            w.lastReadAt = item.ts
+            if (/^[A-Za-z0-9._:/-]{1,80}$/.test(item.id)) w.lastReadId = item.id
+          } else if (!w.lastReadId && /^[A-Za-z0-9._:/-]{1,80}$/.test(item.id)) {
+            w.lastReadId = item.id
+          }
+          if (!saveWatchState(stateDir, fresh)) {
+            results.push({ q: word.q, pushed: count, error: 'save_failed' })
+            break
+          }
         }
-        results.push({ q: word.q, pushed: count })
+        results.push({ q: word.q, pushed: count, ...(stopped ? { stopped: true } : {}) })
       }
       return { status: 'ok', pushed, results }
     } finally {
@@ -5898,7 +5949,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     const st = readWatchState(stateDir)
     if (st.status !== 'ok' || !st.enabled || st.words.length === 0) return
     if (Date.now() - st.lastCheckAt < st.intervalMin * 60 * 1000) return
-    runWatchOnce().catch(() => {})
+    runWatchOnce().then((r) => {
+      if (r.status !== 'ok') log(`⚠️ 关注词监控：${r.status}`)
+      for (const x of r.results) {
+        if (x.error) log(`⚠️ 关注词「${x.q}」：${x.error}`)
+      }
+    }).catch((e) => log(`⚠️ 关注词监控异常：${e && e.message ? e.message : 'unknown'}`))
   }, LINE_WATCH_TICK_MS)
   if (typeof watchTimer.unref === 'function') watchTimer.unref()
   server.on('close', () => clearInterval(watchTimer))
