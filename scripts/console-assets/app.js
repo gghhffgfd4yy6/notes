@@ -17,6 +17,8 @@ import { relDay, cacheWriteInfo, filterLogLines, ageFromStamp, logLineCounts, lo
 import flatpickr from './flatpickr.js'
 // 动效层（v3.360）：app.js 只依赖自家适配层，换动画库只改 motion.js。
 import { MOTION, enter, flash, useFlipList, useMorphDialog, useMountReveal, useRevealWhen } from './motion.js'
+import { POLL_MS, POLL_BUSY_MS, VERSION_CHECK_MS, BUSY_FALLBACK_MS, FETCH_TIMEOUT_MS, BACKUP_FETCH_TIMEOUT_MS, NOTIFY_WINDOW_MIN_S, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_DEFAULT_S, TZ_LABEL } from './constants.js'
+import { fmtTime, fmtNum, fmtLocalTime, fmtClock, fmtDuration, fmtBytes, fmtIsoStamp } from './format.js'
 
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
@@ -44,90 +46,6 @@ const BOOT = readBoot()
 // BOOT.token 可能已随服务重启/轮换而过期——GET 靠 Cookie 仍正常，但写动作会 401。
 // persisted=true 即非首次加载，强制重载拿当前凭证（no-store 不保证 BFCache 驱逐）。
 window.addEventListener('pageshow', (ev) => { if (ev.persisted) window.location.reload() })
-
-// 轮询间隔：5s → 15s。三个接口每拍约 16KB（/api/messages 14.4KB + 状态 + 历史），
-// 5s 一轮就是 ~11MB/小时——控制台常驻开着也看不完这么新的数据。手动刷新、下拉刷新、
-// 切回前台都不受这个间隔约束（走一次性补拉）；任务在跑时仍用 POLL_BUSY_MS 快轮询。
-const POLL_MS = 15000
-const POLL_BUSY_MS = 2000
-// 部署后旧标签页仍跑旧脚本（数据照常轮询，看起来「在线」却看不到新 UI）。每 60s 对一次
-// /api/sys 的版本，不一致就挂一条「刷新后生效」的提示——不自动 reload，避免打断正在填的表单。
-// 边界（Sourcery #294）：只覆盖本版之后打开的页面。部署那一刻已经开着的旧页拿不到这段代码，
-// 服务端也无法给旧页注入逻辑——那些页仍需手动刷一次；此后每次部署都有提示。
-const VERSION_CHECK_MS = 60000
-// 提交成功后按钮锁定的最长兜底时长（Sourcery vwU/vv2：轮询竞态/请求挂起时不能永久锁死；
-// 上限 = 服务端 PROC_TIMEOUT_MS(10min) + 提交往返余量，取 11 分钟）。
-const BUSY_FALLBACK_MS = 11 * 60 * 1000
-// fetch 请求期限（Sourcery G_n6）：挂起连接不得阻塞刷新链路；超时由 AbortController 取消，
-// 走正常 reject 路径（「刷新失败」可见），不会堆积请求。
-const FETCH_TIMEOUT_MS = 8000
-// 备份是「整包上传/下载」，不能套 8 秒的普通 API 期限：慢网络下大文件会被误判失败。
-const BACKUP_FETCH_TIMEOUT_MS = 120000
-// 通知自检重复提交拦截窗的客户端边界（与 console.js NOTIFY_REPLAY_MIN_S/MAX_S 同口径）：
-// 这层只负责「非法值不发请求」，服务端仍是唯一权威（越界/类型错一律 400）。
-const NOTIFY_WINDOW_MIN_S = 0
-const NOTIFY_WINDOW_MAX_S = 3600
-const NOTIFY_WINDOW_DEFAULT_S = 60
-
-// ── 工具 ────────────────────────────────────────────────────────────────────
-// 控制台里所有时间都按北京时间（Asia/Shanghai，固定 UTC+8）显示，不跟浏览器时区走。
-// 服务器时区是 UTC，推送列表里的时间也是 CST 文本；顶栏「数据截至」此前用浏览器本地时区，
-// UTC 客户端会在同一屏上看到两个钟（列表 22:41 / 顶栏 14:41），像数据停在 8 小时前。
-// 上海无夏令时，固定 +8 即可。时区只在顶栏标一次（TZ_LABEL）：全屏同钟，标一处就够。
-const TZ_LABEL = '北京时间'
-function fmtTime (ts) {
-  if (!ts) return '—'
-  const d = new Date(Number(ts) + 8 * 3600 * 1000)
-  const p = (n) => String(n).padStart(2, '0')
-  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`
-}
-
-function fmtNum (n) {
-  return (n === undefined || n === null) ? '—' : String(n)
-}
-
-// 浏览器侧时间戳（lastSync = Date.now()）同样按北京时间渲染：顶栏与列表必须同屏同钟。
-// 保留这个名字是因为它的语义是「客户端时钟」而不是「本地时区」——改用 fmtTime 之后，
-// UTC 客户端看到的时间与列表、与 run.log 一致（此前差 8 小时）。
-function fmtLocalTime (ts) {
-  return fmtTime(ts)
-}
-
-// 只取时分秒（Asia/Shanghai）：触发结果行要与 run.log 的时间对照，口径必须与 fmtTime 一致。
-function fmtClock (ts) {
-  const s = fmtTime(ts)
-  return s === '—' ? '—' : s.slice(11)
-}
-
-// 轮次用时：<1s 用 ms（避免「0.0s」），其余一位小数秒。未知返回 '—'（不编 0）。
-function fmtDuration (startedAt, finishedAt) {
-  const a = Number(startedAt)
-  const b = Number(finishedAt)
-  if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return '—'
-  const ms = b - a
-  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
-}
-
-// 「多久以前」（缓存写入停滞判断）与日报相对日期见 pure.mjs——纯函数便于行为测试。
-
-// 字节人性化（v3.298 上提为模块级：系统信息与缓存健康面板共用）；0 字节是真实大小，
-// 显式显示「0 B」而不是「—」（— 意为未知/不适用，会掩盖 0 字节文件的异常）。
-function fmtBytes (b) {
-  if (typeof b !== 'number' || !Number.isFinite(b) || b < 0) return '—'
-  if (b === 0) return '0 B'
-  if (b < 1024) return `${b} B`
-  if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`
-  return `${(b / 1048576).toFixed(1)} MB`
-}
-
-// 生效快照的 appliedAt 是服务端 ISO 串（writeAppliedSnapshot 写 toISOString），
-// 与 run.log 时间戳同口径按 Asia/Shanghai 展示；解析失败原样显示，不吞成「—」。
-function fmtIsoStamp (iso) {
-  if (!iso) return '—'
-  if (typeof iso === 'number') return fmtTime(iso)
-  const t = Date.parse(String(iso))
-  return Number.isFinite(t) ? fmtTime(t) : String(iso)
-}
 
 // ── API ─────────────────────────────────────────────────────────────────────
 // token 只走 Authorization: Bearer 头（URL 不带任何凭证；console.js 服务端不打访问日志，
