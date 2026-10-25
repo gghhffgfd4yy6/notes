@@ -19,7 +19,8 @@ const CONSOLE_MODULE_FILES = [
   'constants.js', // 页面级常量（v3.365 拆出）
   'format.js', // 时间/字节格式化（v3.365 拆出）
   'api.js', // 数据层：端点函数 + 凭证（v3.366 拆出；顺序与拆前源码一致，API 段在 UI 段之前）
-  'app.js' // 入口：App 组件 + 页面
+  'ui.js', // 视图层：组件 + 页面 + 主题/快照（v3.367 拆出；正文紧接 API 段之后，原文顺序不变）
+  'app.js' // 入口：只做挂载、BFCache 与失败兜底清理（App 在 ui.js）
 ]
 function readConsoleSource () {
   return CONSOLE_MODULE_FILES

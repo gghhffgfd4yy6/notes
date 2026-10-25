@@ -928,3 +928,12 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 配套：`STATIC_ASSETS` 登记 `/assets/api.js`；测试侧 `CONSOLE_MODULE_FILES` 按拆前源码顺序插入 `api.js`（API 段在 UI 段之前）；`console.js` 行数 5450 → 5452，mutation 末段与注释同步（三处）；README 的前端模块清单补 `api.js`。
 - 验证：`test_console.js` 252/0（断言一条未改）、`standard` exit 0、`check-mutation-ranges` exit 0、`npm run check` 54 套件全绿（246.2s）；真浏览器冒烟确认 `api.js` 在模块图内、六页渲染无 JS 错误。
 - 版本 3.366.0。
+
+## v3.367 — 前端拆分第三刀：视图层
+
+- 新增 `ui.js`（6746 行）：`app.js` 第 30 行起的全部视图代码（组件、页面、主题、首屏快照、回到顶部）逐字搬出，正文 6722 行与原文件**逐行一致**；`App` 也随视图层迁入并在末尾 `export { App }`（仍写 `function App`，源码文本断言依赖原文）。
+- `app.js` 6756 → 18 行：只剩入口职责——`import { App }`、`render()`、BFCache 恢复、失败兜底清理；不再持有任何组件或页面。
+- 依赖方向单向：`ui.js` → htm-preact / `pure.mjs` / flatpickr / `motion.js` / `constants.js` / `format.js` / `api.js`；`app.js` 只 import `App`，无循环引用。
+- 配套：`STATIC_ASSETS` 登记 `/assets/ui.js`；`CONSOLE_MODULE_FILES` 在 `api.js` 与 `app.js` 之间插入 `ui.js`（正文顺序与拆前一致）；`console.js` 5452 → 5454，mutation 末段与注释同步（三处）；README 的模块清单改写。
+- 验证：`test_console.js` 252/0（断言一条未改）、`standard` exit 0、`check-mutation-ranges` exit 0、`npm run check` 54 套件全绿；真浏览器冒烟确认 `/assets/ui.js` 在模块图内、六页渲染无 JS 错误。
+- 版本 3.367.0。
