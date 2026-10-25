@@ -9,7 +9,7 @@ import { backToTopBehavior, tabFromHash } from './pure.mjs'
 import { fmtLocalTime } from './format.js'
 import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 // 页面面板（pages.js）
-import { CacheHealthPanel, ConfigPanel, FilesPanel, FilterRulesPanel, LOG_SCROLLER, LogsPanel, MessagesPanel, PULL_EVENT, PullRefreshStatus, RunHistoryPanel, RunsPanel, SysPanel, TOP_SHOW_INNER, TOP_SHOW_Y, TrendsPanel, VISIBLE_REFRESH_GAP_MS, usePullToRefresh } from './pages.js'
+import { CacheHealthPanel, ConfigPanel, FilesPanel, FilterRulesPanel, LOG_SCROLLER, LogsPanel, MessagesPanel, PULL_EVENT, PullRefreshStatus, RunHistoryPanel, RunsPanel, SearchPanel, SysPanel, TOP_SHOW_INNER, TOP_SHOW_Y, TrendsPanel, VISIBLE_REFRESH_GAP_MS, usePullToRefresh } from './pages.js'
 
 function BackToTop () {
   const [show, setShow] = useState(false)
@@ -141,7 +141,7 @@ function App () {
   // 标签页写 hash（v3.307）：刷新/后退不丢当前页；初始值从 hash 读，非法值回概览。
   // v3.310「过滤规则」新增为第六个页签。pure.mjs 的 tabFromHash 只认 v3.307 的五个键
   // （该模块本批不改），这里补一层本文件内的白名单，保持 hash 路由对新页签同样生效
-  // （刷新/后退不丢当前页；非法值仍回概览）。
+  // （刷新/后退不丢当前页；非法值仍回概览）。v3.370 的 search 已进 TAB_KEYS。
   // 推送记录页会把筛选条件写进 hash query（#/messages?q=…&page=3，见 buildMessagesHash）：
   // 解析页签前先剥掉 query，否则带参数的地址会被判成非法值、刷新后掉回概览。
   const resolveTab = (hash) => {
@@ -313,7 +313,7 @@ function App () {
         setPanelReadyAt(performance.now())
       }
     }
-    return { messages: make('messages'), logs: make('logs'), config: make('config'), filter: make('filter') }
+    return { messages: make('messages'), search: make('search'), logs: make('logs'), config: make('config'), filter: make('filter') }
   }, [])
   // 切页时同步换成目标页签自己的时间（没有就占位），同一帧内完成，不闪上一页/手动刷新。
   const showSyncFor = useCallback((next) => {
@@ -898,6 +898,7 @@ function App () {
   const TABS = [
     { key: 'overview', label: '概览' },
     { key: 'messages', label: '推送记录' },
+    { key: 'search', label: '线报搜索' },
     { key: 'logs', label: '运行日志' },
     { key: 'config', label: '配置' },
     { key: 'filter', label: '过滤规则' },
@@ -1114,6 +1115,9 @@ function App () {
     </section>`}
     ${!authExpired && visited.has('messages') && html`<section class="page" hidden=${tab !== 'messages'}>
       <${MessagesPanel} active=${tab === 'messages'} onSync=${syncFor.messages} pollTick=${pollTick} />
+    </section>`}
+    ${!authExpired && visited.has('search') && html`<section class="page" hidden=${tab !== 'search'}>
+      <${SearchPanel} active=${tab === 'search'} onSync=${syncFor.search} />
     </section>`}
     ${!authExpired && visited.has('logs') && html`<section class="page" hidden=${tab !== 'logs'}>
       <div>

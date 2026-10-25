@@ -81,7 +81,10 @@ const {
   // v3.357 两步验证：TOTP/恢复码/Cookie/配置读取
   base32Encode, base32Decode, generateTotpSecret, totpQrDataUrl, totpCodeAt, verifyTotpCode,
   generateRecoveryCodes, recoveryRecordOf, consumeRecoveryCode,
-  makeTwoFactorCookie, verifyTwoFactorCookie, loadTwoFactorState, TWO_FACTOR_FILE
+  makeTwoFactorCookie, verifyTwoFactorCookie, loadTwoFactorState, TWO_FACTOR_FILE,
+  // v3.370 线报全站搜索：解析/归一纯函数 + 关注词文件常量
+  decodeLineHtml, parseLineStamp, clampLineQuery, normalizeWatchWord, parseLineSearchHtml,
+  readLineWatchWords, LINE_WATCH_FILE, LINE_WATCH_MAX_WORDS, LINE_SEARCH_QUERY_MAX_BYTES
 } = require('./scripts/console')
 const { readMessages } = require('./scripts/status')
 
@@ -2168,7 +2171,166 @@ async function backupUiStructureTests () {
   })
 }
 
+// ── v3.370 线报全站搜索 / 关注词 ───────────────────────────────────────────
+// 上游返回结构按线报酷 /search.php 的真实片段裁剪：标题在 a[title]，时间在 time[title]，
+// 正文/分类/作者都在 data-* 属性里。结构断言只认这些字段，不依赖外层 class 的其它修饰。
+const LINE_SEARCH_FIXTURE = `<html><body>
+<div class="listbox"><ul class="new-post">
+<li class="article-list xb-st-chk">
+  <p class="title"><time class="badge red" datetime="2026-10-25" title="2026-10-25 21:23">21:23</time>
+  <span class="badge-cat">好单线报</span>
+  <a href="/haodan/7305598.html" title="十月<em>稻田</em>五常香米5kg 20.85元" data-catename="好单线报-粮油-淘宝" data-price="" data-content="十月稻田 五常香米 &amp; 新米" data-louzhu="发报员T">十月<em>稻田</em>五常香米5kg 20.85元</a></p>
+</li>
+<li class="article-list xb-st-chk">
+  <p class="title"><time class="badge red" datetime="2026-10-24" title="2026-10-24 16:55">16:55</time>
+  <span class="badge-cat">好单线报</span>
+  <a href="/haodan/7303544.html" title="五稻田东北大米10斤 15元" data-catename="好单线报-粮油-淘宝" data-price="15" data-content="少部分地区有货" data-louzhu="发报员Y">五稻田东北大米10斤 15元</a></p>
+</li>
+</ul></div>
+<div class="pagebar"><a href="/search.php?q=x&amp;page=2">2</a><a href="/search.php?q=x&amp;page=3">3</a></div>
+</body></html>`
+
+async function lineSearchTests () {
+  await aok('线报搜索: 解析上游 HTML（标题/正文/价格/北京时间/分页）', () => {
+    const parsed = parseLineSearchHtml(LINE_SEARCH_FIXTURE, 'https://new.ixbk.net/')
+    assert.strictEqual(parsed.items.length, 2)
+    assert.strictEqual(parsed.pages, 3, '分页取 pagebar 的最大页码')
+    assert.strictEqual(parsed.matched, true)
+    const first = parsed.items[0]
+    assert.strictEqual(first.id, 'haodan-7305598')
+    assert.strictEqual(first.url, 'https://new.ixbk.net/haodan/7305598.html', '相对链接必须补成绝对地址')
+    assert.strictEqual(first.title, '十月稻田五常香米5kg 20.85元', '标题里的 <em> 必须剥掉')
+    assert.strictEqual(first.content, '十月稻田 五常香米 & 新米', '正文实体只解码一次')
+    assert.strictEqual(first.catename, '好单线报-粮油-淘宝')
+    assert.strictEqual(first.price, null, '空 data-price 必须是 null，不是 0')
+    assert.strictEqual(first.author, '发报员T')
+    assert.strictEqual(first.ts, Date.UTC(2026, 9, 25, 13, 23), '北京时间 21:23 = UTC 13:23')
+    assert.strictEqual(parsed.items[1].price, 15)
+    // 结构不对（没有 new-post）不得抛错：matched=false，由上层报「无法解析」。
+    assert.deepStrictEqual(parseLineSearchHtml('<html>changed</html>', 'https://x'), { items: [], pages: 1, matched: false })
+    assert.deepStrictEqual(parseLineSearchHtml(null, 'https://x'), { items: [], pages: 1, matched: false })
+  })
+
+  await aok('线报搜索: 实体解码/时间戳/查询词与关注词归一', () => {
+    // 双重解码是这里的核心边界：&amp;lt; 只能解成 &lt; 文本，不能变成标签。
+    assert.strictEqual(decodeLineHtml('&amp;lt;b&amp;gt;'), '&lt;b&gt;')
+    assert.strictEqual(decodeLineHtml('<b>粗</b>&nbsp;体&#39;&#x4e2d;'), '粗 体\'中')
+    assert.strictEqual(parseLineStamp('2026-10-25 21:23'), Date.UTC(2026, 9, 25, 13, 23))
+    assert.strictEqual(parseLineStamp('not-a-time'), null)
+    const long = '稻'.repeat(100)
+    const clamped = clampLineQuery(long)
+    assert.ok(Buffer.byteLength(clamped, 'utf8') <= LINE_SEARCH_QUERY_MAX_BYTES, '查询词必须按 UTF-8 字节截断')
+    assert.ok(clamped.length > 0 && long.startsWith(clamped), '截断必须是前缀，不能整词清空')
+    assert.strictEqual(normalizeWatchWord('  十月   稻田  '), '十月 稻田', '连续空白归一成一个空格')
+    assert.ok(Buffer.byteLength(normalizeWatchWord(long), 'utf8') <= 120, '关注词同样封顶 120 字节')
+    // 代理对（emoji）不能被切成孤立代理项——否则 encodeURIComponent 直接抛错。
+    const emoji = '😀'.repeat(40)
+    const cut = clampLineQuery(emoji)
+    assert.ok(Buffer.byteLength(cut, 'utf8') <= LINE_SEARCH_QUERY_MAX_BYTES)
+    assert.doesNotThrow(() => encodeURIComponent(cut), '截断后不得留下孤立代理项')
+  })
+
+  await aok('线报搜索 HTTP: 代理参数/60s 缓存/上游失败三态 + 关注词增删读', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-line-'))
+    const fetched = []
+    let mode = 'ok'
+    const { server } = createConsole({
+      token: TOKEN,
+      stateDir: dir,
+      lineSearchFetch: async (target) => {
+        fetched.push(String(target))
+        if (mode === 'fail') throw new Error('upstream down')
+        if (mode === 'redirect') return { ok: false, status: 302, text: async () => '' }
+        if (mode === 'changed') return { ok: true, status: 200, text: async () => '<html>changed</html>' }
+        return { ok: true, status: 200, text: async () => LINE_SEARCH_FIXTURE }
+      }
+    })
+    const port = await listen(server)
+    try {
+      const q = encodeURIComponent('十月稻田')
+      const first = await request(port, 'GET', `/api/line-search?q=${q}&page=2`, { token: TOKEN })
+      assert.strictEqual(first.status, 200)
+      const firstJson = JSON.parse(first.text)
+      assert.strictEqual(firstJson.status, 'ok')
+      assert.strictEqual(firstJson.q, '十月稻田')
+      assert.strictEqual(firstJson.page, 2)
+      assert.strictEqual(firstJson.count, 2)
+      assert.strictEqual(firstJson.pages, 3)
+      assert.strictEqual(firstJson.items[0].title, '十月稻田五常香米5kg 20.85元')
+      assert.strictEqual(fetched.length, 1)
+      assert.ok(fetched[0].includes('/search.php?q=' + q) && fetched[0].includes('&page=2'), '代理必须把 q/page 原样带给线报酷')
+      // 同词同页第二次走 60s 缓存，不再打上游。
+      const second = JSON.parse((await request(port, 'GET', `/api/line-search?q=${q}&page=2`, { token: TOKEN })).text)
+      assert.strictEqual(second.cached, true)
+      assert.strictEqual(fetched.length, 1, '缓存命中不得再请求上游')
+      // 空词 400（不拿空 query 去扫上游）。
+      assert.strictEqual((await request(port, 'GET', '/api/line-search?q=', { token: TOKEN })).status, 400)
+      // 上游失败如实回 upstream_error，不伪装成「0 条结果」。
+      mode = 'fail'
+      const failed = JSON.parse((await request(port, 'GET', '/api/line-search?q=' + encodeURIComponent('别的词'), { token: TOKEN })).text)
+      assert.strictEqual(failed.status, 'upstream_error')
+      assert.ok(typeof failed.error === 'string' && failed.error.length > 0)
+      // 3xx：不跟随重定向（固定 host，不允许被带去内网/其它站点）。
+      mode = 'redirect'
+      const redirected = JSON.parse((await request(port, 'GET', '/api/line-search?q=' + encodeURIComponent('重定向词'), { token: TOKEN })).text)
+      assert.strictEqual(redirected.status, 'upstream_error')
+      assert.ok(redirected.error.includes('重定向'), '必须明说重定向已中止')
+      // 结构变了 ≠ 0 条：必须报「无法解析」。
+      mode = 'changed'
+      const changed = JSON.parse((await request(port, 'GET', '/api/line-search?q=' + encodeURIComponent('改版词'), { token: TOKEN })).text)
+      assert.strictEqual(changed.status, 'upstream_error')
+      assert.ok(changed.error.includes('结构'), '解析失败不得伪装成没有结果')
+      mode = 'ok'
+
+      // 关注词：初始为空；写面只认 Bearer；增/读/删都落盘。
+      const empty = JSON.parse((await request(port, 'GET', '/api/line-watch', { token: TOKEN })).text)
+      assert.deepStrictEqual(empty.words, [])
+      const postWatch = (body, opts = {}) => request(port, 'POST', '/api/line-watch', {
+        token: opts.token === undefined ? TOKEN : opts.token,
+        body: JSON.stringify(body),
+        headers: { 'content-type': 'application/json', ...(opts.headers || {}) }
+      })
+      const added = await postWatch({ action: 'add', q: '  十月   稻田 ' })
+      assert.strictEqual(added.status, 200)
+      const addedWords = JSON.parse(added.text).words
+      assert.deepStrictEqual(addedWords.map((w) => w.q), ['十月 稻田'])
+      assert.ok(addedWords[0].lastReadAt > 0, '新词必须以添加时刻为基线，首次检查不把历史条目全算新')
+      // Cookie-only 写请求必须 401（写面不收会话 Cookie）。
+      const cookieOnly = await postWatch({ action: 'add', q: '另一词' }, { token: '', headers: { cookie: `xbk_session=${TOKEN}` } })
+      assert.strictEqual(cookieOnly.status, 401)
+      // 重复添加不产生第二份。
+      await postWatch({ action: 'add', q: '十月 稻田' })
+      assert.strictEqual(JSON.parse((await request(port, 'GET', '/api/line-watch', { token: TOKEN })).text).words.length, 1)
+      // 标为已读：lastReadAt 取实际展示的最新条目时间，lastReadId 作为分钟精度锚点。
+      const read = await postWatch({ action: 'read', q: '十月 稻田', lastReadAt: 1792918500000, lastReadId: 'haodan-7305598' })
+      const readWord = JSON.parse(read.text).words[0]
+      assert.strictEqual(readWord.lastReadAt, 1792918500000)
+      assert.strictEqual(readWord.lastReadId, 'haodan-7305598')
+      assert.strictEqual((fs.statSync(path.join(dir, LINE_WATCH_FILE)).mode & 0o777), 0o600, '关注词文件必须 0600')
+      // 文件损坏按 invalid 如实上报，不静默当空。
+      fs.writeFileSync(path.join(dir, LINE_WATCH_FILE), '{broken')
+      assert.strictEqual(readLineWatchWords(dir).status, 'invalid')
+      const corrupt = JSON.parse((await request(port, 'GET', '/api/line-watch', { token: TOKEN })).text)
+      assert.strictEqual(corrupt.status, 'invalid')
+      // 重写一份合法文件给删除用例（损坏文件不应阻塞用户重新添加）。
+      await postWatch({ action: 'add', q: '新词' })
+      const removed = await postWatch({ action: 'remove', q: '新词' })
+      assert.deepStrictEqual(JSON.parse(removed.text).words.map((w) => w.q), [])
+      assert.strictEqual((await postWatch({ action: 'oops', q: 'x' })).status, 400)
+      // 上限：文件里塞满 12 个后再 add 必须 409，不能无限长。
+      const many = Array.from({ length: LINE_WATCH_MAX_WORDS }, (_, i) => ({ q: `词${i}`, lastReadAt: 0 }))
+      fs.writeFileSync(path.join(dir, LINE_WATCH_FILE), JSON.stringify({ schema: 1, words: many }))
+      const full = await postWatch({ action: 'add', q: '第十三个' })
+      assert.strictEqual(full.status, 409)
+    } finally {
+      server.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
 async function main () {
+  await lineSearchTests()
   await filterRuleApiTests()
   await backupApiTests()
   await backupUiStructureTests()
