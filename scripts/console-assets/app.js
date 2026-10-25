@@ -31,9 +31,12 @@ function readBoot () {
     // version：页面启动时的构建版本（服务端注入），用来发现「部署后还开着旧标签页」。
     return {
       token: typeof data.token === 'string' ? data.token : '',
-      version: typeof data.version === 'string' ? data.version : ''
+      version: typeof data.version === 'string' ? data.version : '',
+      // instance：本实例的短 id（服务端按 stateDir 派生）。只用于给 localStorage 里的
+      // 首屏快照做命名空间，防止同一 origin 换实例后渲染上一个实例的数据。
+      instance: typeof data.instance === 'string' ? data.instance : ''
     }
-  } catch (e) { return { token: '', version: '' } }
+  } catch (e) { return { token: '', version: '', instance: '' } }
 }
 const BOOT = readBoot()
 
@@ -169,7 +172,17 @@ async function readBodyJson (res) {
 // 条件请求缓存（v3.363）：键 → { tag, data }。服务端对只读快照端点发 ETag，
 // 命中 If-None-Match 时回 304 空体——前端复用上一份 data，省掉重复 body。
 // 只存内存（刷新即空），不落 localStorage；凭证不进这个 Map。
+// 有界（Sourcery PR #321）：messages 的缓存键含筛选/分页，键空间无上限——留 8 条
+// 足够覆盖「当前视图 + 来回切几个筛选」，超出按插入序淘汰（Map 保序，最老的先走）。
 const COND_CACHE = new Map()
+const COND_CACHE_MAX = 8
+function rememberConditional (key, entry) {
+  if (COND_CACHE.size >= COND_CACHE_MAX && !COND_CACHE.has(key)) {
+    const oldest = COND_CACHE.keys().next()
+    if (!oldest.done) COND_CACHE.delete(oldest.value)
+  }
+  COND_CACHE.set(key, entry)
+}
 function addConditional (merged, key) {
   const hit = COND_CACHE.get(key)
   if (hit && hit.tag) merged.headers = { ...merged.headers, 'If-None-Match': hit.tag }
@@ -202,7 +215,7 @@ async function consumeJson (p, done, condKey) {
       const data = await readBodyJson(res)
       if (condKey) {
         const tag = res.headers.get('ETag')
-        if (tag) COND_CACHE.set(condKey, { tag, data })
+        if (tag) rememberConditional(condKey, { tag, data })
       }
       return data
     } finally {
@@ -303,11 +316,12 @@ function apiGetMessages ({ page, size, cate, q, days, from, to }) {
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  const p = fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged)
   // 分页/筛选不同的请求各算一份缓存（同一 URL 语义才可复用 304 结果）。
+  // 必须在 fetch 之前注入 If-None-Match（Sourcery PR #321）：fetch 在调用时就快照
+  // headers，先 fetch 后 addConditional 等于永远不发条件头。
   const condKey = `messages?${qs}`
   addConditional(merged, condKey)
-  return consumeJson(p, done, condKey)
+  return consumeJson(fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged), done, condKey)
 }
 
 function apiGetTrends ({ days, from, to } = {}) {
@@ -378,7 +392,8 @@ function apiGetAuto () {
   const { merged, done } = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/auto', merged), done)
+  addConditional(merged, 'auto')
+  return consumeJson(fetch('/api/auto', merged), done, 'auto')
 }
 
 function apiSetAuto (payload) {
@@ -6327,7 +6342,7 @@ function BackToTop () {
 // （旧结构渲染会崩，宁可退回骨架屏）。
 // 与主题区分：主题必须服务端首帧渲染（否则闪色），数据快照允许首帧先用旧值——这是
 // 「旧数字」而不是「错误主题」，且卡片上本来就标着「数据截至」时间。
-const SNAP_KEY = 'xbk-console:snapshot:v1'
+const SNAP_KEY = `xbk-console:snapshot:v1:${(BOOT && BOOT.instance) || 'default'}`
 function readSnapshot () {
   try {
     const raw = window.localStorage.getItem(SNAP_KEY)
@@ -6339,8 +6354,12 @@ function readSnapshot () {
     return v
   } catch (e) { return null }
 }
-function writeSnapshot (status, runs) {
+function writeSnapshot (status, runs, startedAt) {
   try {
+    // 多标签页（Sourcery PR #321）：若别的标签页在本请求发出之后写过更新的快照，
+    // 本次响应即便后落地也更旧——跳过，避免把新数据顶回旧值。
+    const prev = readSnapshot()
+    if (prev && typeof startedAt === 'number' && prev.at > startedAt) return
     window.localStorage.setItem(SNAP_KEY, JSON.stringify({
       v: BOOT.version,
       at: Date.now(),
@@ -6841,6 +6860,9 @@ function App () {
     }
     inFlightRef.current = true
     const seq = ++seqRef.current
+    // 快照写入的「新鲜度截点」（Sourcery PR #321）：本请求发出时刻。多标签页并发时，
+    // 后落地的旧响应不得覆盖别的标签页在它之后写下的更新快照。
+    const startedAt = Date.now()
     const errs = []
     const paused = () => !(opts && opts.force) && Date.now() < formPauseUntilRef.current
     const applyStatus = (s) => { if (seq === seqRef.current && !paused()) { setState(s); setSyncErr(''); setStatusFailed(false) } }
@@ -6871,7 +6893,7 @@ function App () {
       }
       // 首屏快照（v3.363）：两边都拿到才写——缺一半的旧数据没有展示价值。
       if (sRes.status === 'fulfilled' && rRes.status === 'fulfilled' && seq === seqRef.current) {
-        writeSnapshot(sRes.value, rRes.value && rRes.value.runs)
+        writeSnapshot(sRes.value, rRes.value && rRes.value.runs, startedAt)
       }
       if (seq !== seqRef.current || paused()) return false
       refreshedOnceRef.current = true

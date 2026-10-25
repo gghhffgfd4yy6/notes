@@ -900,7 +900,7 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 
 ## v3.363 — 控制台条件请求 / 断点续传 / 首屏快照
 
-- **ETag/304（①）**：`/api/runs`、`/api/messages`、`/api/auto` 三个只读快照端点发 `ETag`（`etag` 包，零传递依赖），前端带 `If-None-Match`，内容未变时拿 304 空体并复用上一份数据。`Cache-Control` 保持 `no-cache`（不是可缓存）——每次都来问、只是不再重传 body。`/api/status` 明确不发 ETag：`generatedAt` / `lock.ageMs` 每拍都在变，发了永远不命中。
-- **SSE 断点续传（⑥）**：数据帧带 `id: <绝对偏移>`，浏览器断线重连自动回传 `Last-Event-ID`，服务端据此只补缺口；游标不可用（非法/0）时回 `event: reset` 整段替换（避免客户端追加重复）。前端 `onerror` 不再立刻关流，先让原生重连 3 次，仍失败才 close + 回退轮询。
-- **首屏快照（⑦）**：最近一次成功的 `status`/`runs` 存 `localStorage`（带版本守卫，最多 12 条历史），冷启动/弱网先渲染旧快照再被真实轮询覆盖；不含 token，隐私模式/超限静默降级。
-- 测试：`test_console.js` 新增 ETag/304、Last-Event-ID 续传、非法游标 reset 三组用例（249/0）。
+- **ETag/304（①）**：`/api/runs`、`/api/messages`、`/api/auto` 三个只读快照端点发 `ETag`（`etag` 包，零传递依赖），前端带 `If-None-Match`，内容未变时拿 304 空体并复用上一份数据。`Cache-Control` 用 `no-store`（连存储都不允许；`no-cache` 仍是「可存、复用前先问」，带鉴权的响应不该留在任何缓存里）——条件缓存只在前端内存里。`/api/status` 明确不发 ETag：`generatedAt` / `lock.ageMs` 每拍都在变，发了永远不命中。
+- **SSE 断点续传（⑥）**：数据帧带 `id: <绝对偏移>`，浏览器断线重连自动回传 `Last-Event-ID`，服务端据此只补缺口；游标只认十进制数字串（`1e3`/`0x10` 按非法处理），不可用时回 `event: reset` 整段替换（避免客户端追加重复）。前端 `onerror` 不再立刻关流，先让原生重连 3 次，仍失败才 close + 回退轮询。
+- **首屏快照（⑦）**：最近一次成功的 `status`/`runs` 存 `localStorage`（实例 id + 版本守卫、最多 12 条历史、多标签页不让旧响应覆盖新快照），冷启动/弱网先渲染旧快照再被真实轮询覆盖；不含 token，隐私模式/超限静默降级。
+- 测试：`test_console.js` 新增 ETag/304（含内容变化必换 tag）、Last-Event-ID 续传（含帧 id）、非法游标 reset（含 `1e3`）与数据面结构红线，共 250/0。

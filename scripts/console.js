@@ -902,7 +902,7 @@ function shouldLogAccess (method, pathname, statusCode) {
   return true
 }
 
-function renderPage (state, runsList, query, sessionToken, theme) {
+function renderPage (state, runsList, query, sessionToken, theme, instanceId = '') {
   const statusText = formatStatus(state)
   const statusLines = statusText.split('\n').map(escapeHtml)
   // 浏览器流（Sourcery High）：fetch/ESM 也带不了页内凭证之外的上下文，token 经
@@ -922,7 +922,10 @@ function renderPage (state, runsList, query, sessionToken, theme) {
   // escapeHtml 的 &quot; 会原样留在 JSON 里被前端 parse 成错误 token（Sourcery vwK）。
   // 只需防 </script> 逃逸与注释/CDATA 攻击：把 < 和控制字符转成 \uXXXX JSON 转义
   // （JSON.parse 会还原成原字符；/ 也转义防 </script> 序列被拼出）。
-  const bootJson = JSON.stringify({ token: bootToken, version: APP_VERSION })
+  // instance：本实例（按 stateDir 派生）的稳定短 id，随 boot 下发。前端用它给「首屏快照」
+  // 做命名空间——同一浏览器 origin 先后服务过不同实例时，旧快照不会串到新实例页面上。
+  // 只是 stateDir 的截断哈希（8 hex），不含 token，也不可反推路径。
+  const bootJson = JSON.stringify({ token: bootToken, version: APP_VERSION, instance: instanceId })
     .replace(/</g, '\\u003c')
     .replace(/>/g, '\\u003e')
     .replace(/\u2028/g, '\\u2028')
@@ -1354,16 +1357,16 @@ function sendJson (res, code, obj) {
 }
 
 // 只读快照端点的条件 GET（v3.363）：同一份 body 发 ETag，客户端带 If-None-Match
-// 命中时回 304 空体。**Cache-Control 仍是 no-cache 而不是可缓存**：让浏览器每次都
-// 来问一句（凭证/状态随时变），只是「没变就别重传 body」——因此这里不做 max-age，
-// 也不会把带鉴权的响应写进任何共享缓存。
+// 命中时回 304 空体。**Cache-Control 用 no-store**：即便客户端自己发条件请求，也不允许
+// 浏览器/中间代理把带鉴权的响应体留在任何 HTTP 缓存里（no-cache 只是「每次复用前先问」，
+// 仍然允许存储——Sourcery PR #321）。条件缓存由前端自己的内存 Map 承担。
 // 与静态资产的强缓存（`immutable`）是两套语义，别合并。
 // **不用于 /api/status**：它的 generatedAt / lock.ageMs / stats 每次请求都在变，
 // 给它发 ETag 只会永远不命中（且 304 会把「现在几点」冻住）——按语义就不该缓存。
 function sendJsonConditional (req, res, obj) {
   const body = JSON.stringify(obj)
   const tag = etag(body)
-  const headers = { ETag: tag, 'Cache-Control': 'no-cache' }
+  const headers = { ETag: tag, 'Cache-Control': 'no-store' }
   if (etagMatches(req.headers['if-none-match'], tag)) {
     res.writeHead(304, headers)
     res.end()
@@ -1409,6 +1412,15 @@ function ssePlanChunk (cursor, output, outputTotalLength) {
   if (cursor < lost) return { reset: true, text: output, cursor: outputTotalLength }
   if (cursor < outputTotalLength) return { reset: false, text: output.slice(cursor - lost), cursor: outputTotalLength }
   return null
+}
+
+// SSE 游标解析（v3.363）：只认十进制数字串。`Number('1e3')`=1000、`Number('0x10')`=16
+// 会被静默当成合法偏移（Sourcery PR #321），先按形态挡掉，再判安全整数。
+const SSE_CURSOR_RE = /^\d{1,16}$/
+function parseSseCursor (raw) {
+  if (typeof raw !== 'string' || !SSE_CURSOR_RE.test(raw)) return null
+  const n = Number(raw)
+  return Number.isSafeInteger(n) && n >= 0 ? n : null
 }
 
 // 超限后的排空上限（D2-S2）：客户端若只发一半就挂住，不能让连接无限期占着事件循环。
@@ -2409,6 +2421,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   if (!isValidToken(token)) {
     throw new Error(`XBK_CONSOLE_TOKEN 未设置、短于 ${TOKEN_MIN_LEN} 字符，或含浏览器无法传输的字符（仅允许可见 ASCII，禁 ; , " \\ 与空白），控制台拒绝启动（fail-closed）`)
   }
+  // 实例短 id（stateDir 派生）：只用于前端「首屏快照」的 localStorage 命名空间。
+  // 不含 token、不可反推路径；同一目录换 token 仍沿用同一命名空间（数据本就同源）。
+  const instanceId = crypto.createHash('sha256').update(String(stateDir)).digest('hex').slice(0, 8)
   fs.mkdirSync(stateDir, { recursive: true })
   // 两步验证状态：文件缺失 = 未开启；文件损坏/非法 → 构造时抛错，服务拒启（fail-closed）。
   const twoFactor = loadTwoFactorState(stateDir)
@@ -4254,7 +4269,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
       // 使用的凭证（authorize 已通过的 token 值）交给 renderPage 注入 boot，会话用户
       // 无需再拼 ?token= 即可触发。
-      res.end(renderPage(state, runsList, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie)))
+      res.end(renderPage(state, runsList, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie), instanceId))
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/status') {
@@ -5005,11 +5020,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const lastEventId = req.headers['last-event-id']
       const resumedByHeader = typeof lastEventId === 'string' && lastEventId.length > 0
       if (resumedByHeader) {
-        const n = Number(lastEventId)
-        cursor = Number.isSafeInteger(n) && n >= 0 ? Math.min(n, record.outputTotalLength) : 0
+        const n = parseSseCursor(lastEventId)
+        cursor = n === null ? 0 : Math.min(n, record.outputTotalLength)
       } else if (url.searchParams.has('since')) {
-        const n = Number(url.searchParams.get('since'))
-        cursor = Number.isSafeInteger(n) && n >= 0 ? Math.min(n, record.outputTotalLength) : 0
+        const n = parseSseCursor(url.searchParams.get('since'))
+        cursor = n === null ? 0 : Math.min(n, record.outputTotalLength)
       } else {
         cursor = record.outputTotalLength
       }
