@@ -2257,6 +2257,7 @@ async function lineSearchTests () {
         if (mode === 'redirect') return { ok: false, status: 302, text: async () => '' }
         if (mode === 'changed') return { ok: true, status: 200, text: async () => '<html>changed</html>' }
         if (mode === 'full' && String(target).includes('&page=1')) return { ok: true, status: 200, text: async () => LINE_SEARCH_FULL_PAGE }
+        if (mode === 'lastfail' && String(target).includes('&page=3')) throw new Error('last page down')
         if (String(target).includes('&page=2')) return { ok: true, status: 200, text: async () => pageTwo }
         return { ok: true, status: 200, text: async () => LINE_SEARCH_FIXTURE }
       }
@@ -2296,6 +2297,12 @@ async function lineSearchTests () {
       assert.strictEqual(fullPageRes.items[0].id, 'haodan-8000090', 'offset=90 必须映射到第 91 条')
       assert.strictEqual(fullPageRes.items[10].id, 'haodan-7300002')
       assert.strictEqual(fullPageRes.pages, 4, '(100 + 1) 条 ÷ 每页 30 条 = 4 页')
+      // 末页取不到：总页数只能按满页估算，必须明确标 pagesEstimated，不能冒充精确值。
+      mode = 'lastfail'
+      const estimated = JSON.parse((await request(port, 'GET', '/api/line-search?q=' + encodeURIComponent('估页词') + '&page=1&limit=20', { token: TOKEN })).text)
+      assert.strictEqual(estimated.status, 'ok')
+      assert.strictEqual(estimated.pagesEstimated, true)
+      assert.strictEqual(estimated.pages, 15)
       mode = 'ok'
       // 空词 400（不拿空 query 去扫上游）。
       assert.strictEqual((await request(port, 'GET', '/api/line-search?q=', { token: TOKEN })).status, 400)
