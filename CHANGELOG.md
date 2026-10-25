@@ -937,3 +937,13 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 配套：`STATIC_ASSETS` 登记 `/assets/ui.js`；`CONSOLE_MODULE_FILES` 在 `api.js` 与 `app.js` 之间插入 `ui.js`（正文顺序与拆前一致）；`console.js` 5452 → 5454，mutation 末段与注释同步（三处）；README 的模块清单改写。
 - 验证：`test_console.js` 252/0（断言一条未改）、`standard` exit 0、`check-mutation-ranges` exit 0、`npm run check` 54 套件全绿；真浏览器冒烟确认 `/assets/ui.js` 在模块图内、六页渲染无 JS 错误。
 - 版本 3.367.0。
+
+## v3.368 — 前端拆分第四刀：公用零件
+
+- 新增 `components.js`（1245 行）：公用零件从 `ui.js` 拆出——状态徽章 / 提示 / 折叠动画 / 面板头 / 骨架屏 / 错误行 / 按钮 / 下拉 / 日期区间（含 flatpickr 交互）/ 卡片 / 状态卡 / 触发条 / 二次确认与离开保护弹窗。正文 1206 行与原 `ui.js` **逐行一致**。
+- `ui.js` 6746 → 5559 行：只剩页面层（运行历史 / 趋势 / 推送记录 / 运行日志 / 配置 / 系统 / 过滤规则）+ `App` + 主题与首屏快照。
+- 依赖方向仍单向：`ui.js` → `components.js` → 各基础模块；`components.js` 不认识任何页面，零顶层副作用；`app.js` 仍只 import `App`。
+- 配套：`STATIC_ASSETS` 登记 `/assets/components.js`；`CONSOLE_MODULE_FILES` 在 `api.js` 与 `ui.js` 之间插入 `components.js`（正文顺序与拆前一致）；`console.js` 5454 → 5456，mutation 末段与注释同步（三处）；README 模块清单补 `components.js`。
+- 顺带补上 PR #324 评审承诺：资产闭包断言增加「route 必须等于 `/assets/` + 文件名」（例外只有 `flatpickr.js → flatpickr.module.js`），防「映射写反也能过」；套件用例数不变。
+- 验证：`test_console.js` 252/0、`standard` exit 0、`check-mutation-ranges` exit 0、真浏览器冒烟六页正常。
+- 版本 3.368.0。
