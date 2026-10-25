@@ -2363,6 +2363,47 @@ async function main () {
       assert.ok(fs.existsSync(path.join(dir, spec.file)), `白名单文件缺失：${spec.file}`)
     }
   })
+  await aok('资产: 入口 import 覆盖它实际用到的拆出导出（漏写 = 运行时 ReferenceError）', () => {
+    // 聚合器保证「文本断言」在拆分后仍然成立，但这也会掩盖一件事：app.js 如果漏写/写错
+    // 某个具名 import，格式化和常量函数在并集里照样存在，文本断言照样绿，浏览器却整页崩。
+    // 这里做静态对账：拆出模块导出的名字，只要在 app.js 正文里被用到，就必须在 import 里。
+    const acorn = require('acorn')
+    const dir = path.join(__dirname, 'scripts', 'console-assets')
+    const parse = (file) => acorn.parse(fs.readFileSync(path.join(dir, file), 'utf8'),
+      { ecmaVersion: 'latest', sourceType: 'module' })
+    const walk = (node, fn) => {
+      if (!node || typeof node !== 'object') return
+      if (typeof node.type === 'string') fn(node)
+      for (const key of Object.keys(node)) {
+        if (key === 'type' || key === 'start' || key === 'end') continue
+        const value = node[key]
+        if (Array.isArray(value)) value.forEach((child) => walk(child, fn))
+        else if (value && typeof value === 'object') walk(value, fn)
+      }
+    }
+    const exported = new Set()
+    for (const file of ['constants.js', 'format.js']) {
+      for (const node of parse(file).body) {
+        if (node.type === 'ExportNamedDeclaration' && !node.source) {
+          node.specifiers.forEach((spec) => exported.add(spec.exported.name))
+        }
+      }
+    }
+    const ast = parse('app.js')
+    const imported = new Set()
+    for (const node of ast.body) {
+      if (node.type !== 'ImportDeclaration') continue
+      node.specifiers.forEach((spec) => imported.add(spec.local.name))
+    }
+    const used = new Set()
+    for (const node of ast.body) {
+      if (node.type === 'ImportDeclaration') continue
+      walk(node, (child) => { if (child.type === 'Identifier') used.add(child.name) })
+    }
+    const missing = [...exported].filter((name) => used.has(name) && !imported.has(name))
+    assert.deepStrictEqual(missing, [], `这些拆出的函数/常量在 app.js 正文里被用了却没 import：${missing.join(', ')}`)
+    assert.ok(imported.has('fmtTime') && imported.has('POLL_MS'), '基础导入必须存在（防止整条 import 被删）')
+  })
   await aok('HTTP: ?token= 查询参数放行（浏览器流：看板、API、表单触发）', async () => {
     const dir = tmpDir()
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
