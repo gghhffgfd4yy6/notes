@@ -47,9 +47,26 @@ export function canViewTransition (doc, motionOK) {
 // - 更新回调里的异常不吞：updateCallbackDone 不做任何 catch，让它照常冒到
 //   console / 错误上报；startViewTransition 自己同步抛错时才补一次普通渲染（切页不能因为
 //   过渡起不来而停在旧页）。
+// 触摸设备上不用 View Transitions（v3.377）：Android Chrome 的快照管线在切页时会偶发
+// 整屏白帧（真机录屏实测 2 帧 ≈66ms，白到连标签栏都没有；根元素补底色后依旧复现）。
+// 这里按 `(pointer: fine)` 判定：桌面留着原生交叉淡入，手机/平板退回页面级 CSS 淡入
+// （enter()，只动 opacity，不经过快照，不会再白）。判定注不进去时按「不支持」保守处理。
+function finePointer (doc) {
+  try {
+    const view = doc && doc.defaultView
+    if (!view || typeof view.matchMedia !== 'function') return false
+    // 主指针是精确指针、且设备上**没有任何**触摸指针：触屏笔记本（pointer: fine + any-pointer: coarse）
+    // 一样会用手点，快照白帧照样出现，所以必须两个条件同时成立。
+    return view.matchMedia('(pointer: fine)').matches === true &&
+      view.matchMedia('(any-pointer: coarse)').matches === false
+  } catch (e) {
+    return false
+  }
+}
+
 export function runViewTransition (doc, motionOK, apply) {
   if (typeof apply !== 'function') return null
-  if (!canViewTransition(doc, motionOK)) {
+  if (!canViewTransition(doc, motionOK) || !finePointer(doc)) {
     apply(false)
     return null
   }
