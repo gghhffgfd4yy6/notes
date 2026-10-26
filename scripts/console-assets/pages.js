@@ -4,7 +4,7 @@
 // 顺序在 ui.js 之前（App 在 ui.js 里 import 这些面板）。
 import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from './constants.js'
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
-import { Badge, Button, ConfirmDialog, DateRange, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, useHoldRepeat } from './components.js'
+import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
 import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, isEncryptedBackup, logLineCounts, logLineTone, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
@@ -1158,7 +1158,7 @@ function CacheHealthPanel ({ paused = false, active = true }) {
   </div>`
 }
 
-// 推送记录：搜索（300ms 防抖）+ 分类筛选 + 服务端分页；点标题展开 content 全文。
+// 推送记录：搜索（300ms 防抖）+ 分类筛选 + 服务端分页；点标题在右侧抽屉看全文（v3.379）。
 // URL 不含 content_html（服务端已裁剪）——CSP 禁外链图，贴文本才是控制台能诚实渲染的形态。
 // 原文链接：相对路径拼服务端下发的 baseUrl（= 生产 Config.domain，与推送侧 resolve 同口径），
 // 绝对 URL 原样；只放行 http/https（其他 scheme 不渲染链接）。
@@ -1585,6 +1585,30 @@ function buildMessagesHash (state) {
   return qs === '' ? '#/messages' : `#/messages?${qs}`
 }
 
+// ── 推送记录：条目详情抽屉（v3.379）────────────────────────────────────────
+// 行内展开会把下面的条目顶走：读一条正文，列表就换了位置，想接着看下一条还得重新找。
+// 改成右侧抽屉后列表原地不动（滚动位置不跳），抽屉宽度 520 与列表并排做对照。
+// 抽屉里只有「标签 + 值」的行，布局走最小内联样式——键值表只在抽屉里出现一次，
+// 故不复用列表卡片的 .msg-meta（那是横向 pill 行，不是键值表）。
+function DetailRow ({ label, children }) {
+  return html`<div style=${{ display: 'flex', gap: '10px', alignItems: 'baseline', marginTop: '8px' }}>
+    <span style=${{ flex: 'none', width: '4.5em', color: 'var(--text-dim)', fontSize: 'var(--fs-xs)' }}>${label}</span>
+    <span style=${{ flex: '1 1 auto', minWidth: '0', overflowWrap: 'anywhere', fontSize: 'var(--fs-sm)' }}>${children}</span>
+  </div>`
+}
+
+// 详情里的时间：datetime + shorttime 拼接（与列表同口径），空值不占位。
+function msgTimeText (m) {
+  const parts = [m.datetime, m.shorttime].filter((s) => typeof s === 'string' && s !== '')
+  return parts.length > 0 ? parts.join(' ') : '（无时间）'
+}
+
+// 来源渠道 = 分类三段式（来源-品类-平台）的第一段；单段分类时整串就是来源。
+function msgSourceOf (name) {
+  const parts = cateParts(name)
+  return parts.length > 0 ? parts[0] : ''
+}
+
 function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   // 首帧从 hash query 还原筛选（L2-8）：只解析一次，之后 state 是唯一真相。
   const [boot] = useState(() => parseMessagesHash(window.location.hash))
@@ -1599,7 +1623,11 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   const rangeActive = range.from !== '' && range.to !== ''
   const [input, setInput] = useState(boot.q)
   const [query, setQuery] = useState(boot.q)
-  const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
+  // v3.379：详情改右侧抽屉。detail 存「打开那一刻的条目快照」而不是 rowKey——
+  // 抽屉开着时轮询/换页会换掉整页 items，按 rowKey 反查会让正在读的正文当场消失。
+  const [detail, setDetail] = useState(null)
+  // 关闭后把焦点还给触发的按钮（列表重渲染后旧节点可能已卸载，isConnected 兜底）。
+  const detailBtnRef = useRef(null)
   // 响应归属（问题5）：请求发出时记下的 query 会在 in-flight 期间过期——旧响应的
   // queryUsed 会把刚打的新词清空（搜索吞字）。改为：loadSeqRef 给每次请求领号，
   // loadedQueryRef 只在「最新一次请求」回包时记录它对应的 query。
@@ -1861,8 +1889,11 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   // 防抖提交新词后、新响应回来前 data 仍是上一轮的，用 query 会拿新词去标旧卡片
   // （PR #291 Sourcery：Old results get wrong highlights）。
   const hitKw = (data && typeof data.queryUsed === 'string' ? data.queryUsed : '').trim().toLowerCase()
-  const hit = (text) => (typeof text === 'string'
-    ? splitHits(text, hitKw, MSG_HIT_MAX).map(([part, on], i) => on ? html`<mark key=${i}>${part}</mark>` : part)
+  // 列表里的 <mark> 由 .msg-item mark 上色（app.css）；详情抽屉不在 .msg-item 里，
+  // 同一组主题变量改由行内样式带进去——否则深色主题下退化成浏览器默认的黄底黑字。
+  const hitMarkStyle = { background: 'var(--warn-soft)', color: 'inherit', borderRadius: '2px', boxShadow: 'inset 0 0 0 1px var(--warn-line)' }
+  const hit = (text, markStyle) => (typeof text === 'string'
+    ? splitHits(text, hitKw, MSG_HIT_MAX).map(([part, on], i) => on ? html`<mark key=${i} style=${markStyle}>${part}</mark>` : part)
     : text)
   // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，
   // 但只在「响应确实属于当前查询、且用户没有继续输入」时回写；
@@ -1876,9 +1907,34 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       setQuery(data.queryUsed)
     }
   }, [data, input, query])
+  // 抽屉开关：打开时记住触发的按钮，关闭后把焦点还给它（键盘用户接着往下看）。
+  // preventScroll：焦点还给列表里的按钮时不得把页面滚一下（背后列表的位置要原地不动）。
+  const openDetail = (m, btn) => {
+    detailBtnRef.current = btn || null
+    setDetail(m)
+  }
+  const closeDetail = () => {
+    const btn = detailBtnRef.current
+    detailBtnRef.current = null
+    setDetail(null)
+    if (btn && typeof btn.focus === 'function' && btn.isConnected) btn.focus({ preventScroll: true })
+  }
+  // 切到别的页签就收起抽屉：面板是保活挂载的，抽屉是 fixed 层、背景滚动也还锁着，
+  // 留着会漏到别页（与 CategoryPicker 的「非本页即关」同口径）。这里不走 closeDetail——
+  // 焦点不该被拽回一个已经隐藏的面板里。
+  useEffect(() => {
+    if (active) return
+    detailBtnRef.current = null
+    setDetail(null)
+  }, [active])
+  // 抽屉「分类」只画细分路径（来源之后那几段）：来源已经在上一行，整串再画一遍等于
+  // 同一句话写两次。aria-label 仍带完整分类名（读屏与筛选口径都不受裁剪影响）。
+  const detailCate = detail ? cateParts(detail.catename) : []
+  const detailCateSub = detailCate.slice(1)
   // v3.358：列表标题是真 <button>（原 span[role=button][tabindex=0]）。原生 button 自带
   // Enter/空格 ⇒ 合成 click，再手写 onKeyDown 会双触发（keydown 展开 + click 收起 = 看起来没反应），
-  // 故删掉手写键盘处理；caret / aria-expanded / title 全部保留。
+  // 故删掉手写键盘处理。v3.379 起它打开的是右侧抽屉：aria-haspopup 声明弹出的是对话框，
+  // 行内展开的 aria-expanded / caret 一起退场（展开态不再是行内状态）。
   return html`<div class="panel">
     <${PanelHead} title="推送记录" level=${1} sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
@@ -1924,24 +1980,30 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
         : html`<div class="msg-list" role="list" ref=${motionRef}>
-          ${items.map((m) => html`<div class="msg-item" role="listitem" key=${m.rowKey} data-mk=${m.rowKey}>
+          ${items.map((m) => html`<div class="msg-item" role="listitem" key=${m.rowKey} data-mk=${m.rowKey}
+            onClick=${(e) => {
+              // 手机上拇指落点是整张卡片，不是标题那 22px 一行：卡片空白处也要能开详情。
+              // 原文链接是卡片里唯一的跳转入口，点它必须是跳转（e.target.closest('a') 提前放行）。
+              if (e.target.closest('a')) return
+              openDetail(m, e.currentTarget.querySelector('.msg-title'))
+            }}>
             <div class="msg-item-head">
               <button type="button" class="msg-title"
-                aria-expanded=${expanded === m.rowKey ? 'true' : 'false'}
-                title=${expanded === m.rowKey ? '收起正文' : '点击展开正文'}
-                onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}>
-                <span class="msg-caret" aria-hidden="true">${expanded === m.rowKey ? '▾' : '▸'}</span>${m.title ? hit(m.title) : '（无标题）'}
+                aria-haspopup="dialog"
+                title="查看详情"
+                onClick=${(e) => { e.stopPropagation(); openDetail(m, e.currentTarget) }}>
+                ${m.title ? hit(m.title) : '（无标题）'}
               </button>
               ${m.price !== null && titleTailPrice(m.title) !== m.price
                 ? html`<span class="msg-price">¥${m.price}</span>`
                 : ''}
+              <span class="msg-chev" aria-hidden="true">›</span>
             </div>
             <div class="msg-meta">
               <span class="msg-cate" aria-label=${m.catename || undefined}>${cateParts(m.catename).map((part, i) => html`<span class="msg-cate-part" key=${i}>${part}</span>`)}</span>
               <span class="mono">${m.datetime} ${m.shorttime}</span>
               ${msgLink(m, data.baseUrl)}
             </div>
-            ${expanded === m.rowKey && html`<div class="msg-content">${m.content ? hit(m.content) : '（无正文）'}</div>`}
           </div>`)}
         </div>`}
       <div class="pager">
@@ -1961,6 +2023,24 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
         <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(data.pages)}>末页 »<//>
       </div>
     </div>`}
+    ${/* v3.379：条目详情抽屉。列表留在背后做对照（滚动位置不动），宽度 520 与抽屉默认值一致，
+         手机上由 Drawer 自己铺满整屏。detail 是打开那一刻的快照，轮询换掉 items 也不影响阅读。 */ ''}
+    ${detail && html`<${Drawer} open=${true} width=${520}
+      title=${detail.title ? hit(detail.title, hitMarkStyle) : '（无标题）'}
+      sub=${msgTimeText(detail)}
+      onClose=${closeDetail}>
+      <${DetailRow} label="来源渠道">${msgSourceOf(detail.catename) || '（未分类）'}<//>
+      <${DetailRow} label="分类">${detailCateSub.length > 0
+        ? html`<span class="msg-cate" aria-label=${detail.catename}>${detailCateSub.map((part, i) => html`<span class="msg-cate-part" key=${i}>${part}</span>`)}</span>`
+        : (detailCate.length === 0 ? '（未分类）' : '（无细分分类）')}<//>
+      <${DetailRow} label="链接">${detail.url ? msgLink(detail, data && data.baseUrl) : '（无原文链接）'}<//>
+      <div style=${{ marginTop: '14px', paddingTop: '12px', borderTop: '1px dashed var(--border)' }}>
+        <div style=${{ color: 'var(--text-dim)', fontSize: 'var(--fs-xs)', marginBottom: '6px' }}>正文</div>
+        <div style=${{ fontSize: 'var(--fs-sm)', lineHeight: '1.7', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+          ${detail.content ? hit(detail.content, hitMarkStyle) : '（无正文）'}
+        </div>
+      </div>
+    </${Drawer}>`}
   </div>`
 }
 
@@ -2958,6 +3038,18 @@ function newBackupImportKey () {
   return `xbk-import-${Date.now().toString(36)}-${backupImportSeq}`
 }
 
+// 数据备份 / 恢复整块流程收在右侧抽屉里：系统页只留一个入口按钮 + 一行摘要（上次导出/导入）。
+// 导出类别、密码、导入选文件与解密都在抽屉内完成；导入的最终确认仍是短弹窗（ConfirmDialog）。
+// 安全边界不变：导出必须在 HTTPS 下、在浏览器内加密（window.isSecureContext 检查排在调用导出接口之前），
+// 密码只留在页面内存；导入沿用同一次「选文件 → 确认」的幂等键，重复提交由服务端按 key 返回原结果。
+function backupEntrySummary (last) {
+  if (!last || !Number.isFinite(last.at)) return '加密导出（需 HTTPS）· 导入前自动备份当前数据'
+  const d = new Date(last.at)
+  const pad = (n) => String(n).padStart(2, '0')
+  const stamp = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return `${last.kind === 'import' ? '上次导入' : '上次导出'} ${stamp}${last.detail ? ` · ${last.detail}` : ''}`
+}
+
 function BackupBlock ({ onImported }) {
   const [selected, setSelected] = useState(() => {
     const out = {}
@@ -2968,7 +3060,8 @@ function BackupBlock ({ onImported }) {
   const [err, setErr] = useState('')
   const [note, setNote] = useState('')
   const [pending, setPending] = useState(null)
-  const [exportOpen, setExportOpen] = useState(false)
+  const [open, setOpen] = useState(false)
+  const [last, setLast] = useState(null)
   const [locked, setLocked] = useState(null)
   const [exportPassword, setExportPassword] = useState('')
   const [exportPassword2, setExportPassword2] = useState('')
@@ -2976,7 +3069,10 @@ function BackupBlock ({ onImported }) {
   const fileRef = useRef(null)
   const unlockRef = useRef(null)
   const allSelected = BACKUP_CATEGORY_OPTIONS.every((item) => selected[item.key])
+  const hasSelected = BACKUP_CATEGORY_OPTIONS.some((item) => selected[item.key])
   const passwordProblem = backupPasswordProblem(exportPassword, exportPassword2)
+  // 只用于提示；真正的硬校验仍在 doExport 里、且在调用导出接口之前。
+  const canEncrypt = !!(window.isSecureContext && window.crypto && window.crypto.subtle)
   const toggleAll = () => {
     const next = {}
     for (const item of BACKUP_CATEGORY_OPTIONS) next[item.key] = !allSelected
@@ -2985,6 +3081,10 @@ function BackupBlock ({ onImported }) {
   const toggleOne = (key) => {
     setSelected((prev) => ({ ...prev, [key]: !prev[key] }))
   }
+  // 加密备份需要用户输入口令：抽屉里出现密码框时把焦点放进去（只依赖 open/locked，busy 变化不抢焦点）。
+  useEffect(() => {
+    if (open && locked && unlockRef.current) unlockRef.current.focus({ preventScroll: true })
+  }, [open, locked])
   const doExport = async () => {
     if (busy !== '') return
     const categories = BACKUP_CATEGORY_OPTIONS.filter((item) => selected[item.key]).map((item) => item.key)
@@ -3020,8 +3120,8 @@ function BackupBlock ({ onImported }) {
       a.click()
       a.remove()
       const skipped = res && res.skipped ? res.skipped : []
-      setExportOpen(false)
       setExportPassword(''); setExportPassword2('')
+      setLast({ kind: 'export', at: Date.now(), detail: fmtBytes(blob.size) })
       setNote(`已导出${categories.length}类加密备份${skipped.length > 0 ? `；另有 ${skipped.length} 类当前没有可导出的内容` : ''}`)
     } catch (e) {
       setErr(`导出失败：${e && e.message ? e.message : e}`)
@@ -3030,8 +3130,20 @@ function BackupBlock ({ onImported }) {
       setBusy('')
     }
   }
-  const openExport = () => {
-    setErr(''); setNote(''); setExportPassword(''); setExportPassword2(''); setExportOpen(true)
+  const openDrawer = () => {
+    setErr(''); setOpen(true)
+  }
+  // 抽屉关闭统一走这里：导入/导出/解密进行中（busy）一律不关；关掉时清掉只属于本次的密码与提示。
+  const closeDrawer = () => {
+    if (busy !== '') return
+    setOpen(false)
+    setPending(null)
+    setLocked(null)
+    setUnlockPassword('')
+    setExportPassword('')
+    setExportPassword2('')
+    setErr('')
+    setNote('')
   }
   const chooseFile = () => {
     if (busy === '') fileRef.current && fileRef.current.click()
@@ -3101,6 +3213,7 @@ function BackupBlock ({ onImported }) {
       if (imported.settings) bits.push('控制台设置')
       if (Number.isInteger(imported.autoInterval)) bits.push(`自动运行间隔 ${imported.autoInterval} 秒`)
       if (Number.isInteger(imported.runLogBytes)) bits.push('运行日志')
+      setLast({ kind: 'import', at: Date.now(), detail: bits.length > 0 ? `${bits.length} 类数据` : '' })
       setNote(`导入完成${bits.length > 0 ? `：${bits.join('、')}` : ''}${result.backupDir ? `。当前数据已先备份到 ${result.backupDir}` : ''}`)
       if (typeof onImported === 'function') Promise.resolve(onImported()).catch(() => {})
     } catch (e) {
@@ -3110,18 +3223,15 @@ function BackupBlock ({ onImported }) {
     }
   }
   return html`<div class="cfg-block backup-block">
-    <div class="cfg-block-head">
-      <span class="cfg-block-title">数据备份</span>
-      <span class="cfg-block-sub">点导出再选内容；导入自动识别文件</span>
-    </div>
     <div class="backup-actions backup-actions-main">
-      <${Button} variant="secondary" disabled=${busy !== ''} onClick=${openExport}>导出<//>
-      <${Button} variant="ghost" disabled=${busy !== ''} onClick=${chooseFile}>导入<//>
-      <input class="backup-file" ref=${fileRef} type="file" accept=".xbk,.json,application/json" onChange=${onFile} />
+      <${Button} variant="secondary" onClick=${openDrawer}>数据备份与恢复<//>
+      <span class="cfg-block-sub">${backupEntrySummary(last)}</span>
     </div>
-    ${!exportOpen && !pending && !locked && err && html`<${Hint} tone="error">${err}<//>`}
-    ${note && html`<${Hint}>${note}<//>`}
-    <${ConfirmDialog} open=${exportOpen} title="选择要导出的数据" confirmLabel=${busy === 'export' ? '加密中…' : '导出'} busy=${busy === 'export'} confirmDisabled=${BACKUP_CATEGORY_OPTIONS.every((item) => !selected[item.key]) || passwordProblem !== ''} onCancel=${() => { if (busy !== 'export') setExportOpen(false) }} onConfirm=${doExport}>
+    <${Drawer} open=${open} title="数据备份与恢复" sub="加密导出 · 导入前自动备份当前数据" width=${520} busy=${busy !== '' || !!pending} onClose=${closeDrawer}>
+      <div class="cfg-block-head">
+        <span class="cfg-block-title">导出</span>
+        <span class="cfg-block-sub">勾选类别，在本机加密后下载</span>
+      </div>
       <div class="backup-pick-head">
         <label class="backup-check"><input type="checkbox" checked=${allSelected} onChange=${toggleAll} /> 全选</label>
         <span class="cfg-block-sub">只导出勾选的类别</span>
@@ -3143,23 +3253,41 @@ function BackupBlock ({ onImported }) {
         <div class="cfg-block-sub">至少 12 位；建议用一句长口令或密码管理器生成的随机密码。密码忘了，这份备份就打不开；密码只在浏览器里使用，不会发给服务器。</div>
         ${exportPassword !== '' && passwordProblem !== '' && html`<${Hint} tone="error">${passwordProblem}<//>`}
       </div>
-      ${err && html`<${Hint} tone="error">${err}<//>`}
+      <div class="backup-actions">
+        <${Button} variant="primary" disabled=${busy !== '' || !hasSelected} onClick=${doExport}>${busy === 'export' ? '加密中…' : '加密并下载'}<//>
+      </div>
+      ${canEncrypt ? null : html`<${Hint} tone="warn">当前页面不是 HTTPS，浏览器无法加密备份；请用 https:// 打开控制台。<//>`}
       <div class="modal-note">自动运行只备份间隔，不记录开关状态；导入时不会把自动运行打开。浏览器加密导出最多 32MB；更大的备份请减少勾选类别。</div>
-    <//>
-    <${ConfirmDialog} open=${!!locked} title="输入备份密码" confirmLabel=${busy === 'unlock' ? '解密中…' : '解密'} busy=${busy === 'unlock'} confirmDisabled=${unlockPassword === ''} initialFocusRef=${unlockRef} onCancel=${closeUnlock} onConfirm=${doUnlock}>
-      <div>这是加密备份：${locked ? locked.name : ''}</div>
-      <label class="backup-pass-row">备份密码
-        <input class="fr-input" ref=${unlockRef} type="password" value=${unlockPassword} autocomplete="current-password" onInput=${(e) => setUnlockPassword(e.target.value)} onKeyDown=${(e) => { if (e.key === 'Enter' && unlockPassword !== '' && busy === '') doUnlock().catch(() => {}) }} />
-      </label>
-      ${err && html`<${Hint} tone="error">${err}<//>`}
-      <div class="modal-note">密码只在这个浏览器里使用，不会发给服务器。解密后再确认导入。</div>
-    <//>
-    <${ConfirmDialog} open=${!!pending} title="确认导入备份" confirmLabel=${busy === 'import' ? '导入中…' : '确认导入'} busy=${busy === 'import'} onCancel=${() => { if (busy !== 'import') setPending(null) }} onConfirm=${doImport}>
-      <div>文件里检测到：${pending ? pending.summary.join('、') : ''}</div>
-      ${pending && pending.encrypted && html`<${Hint}>已在本机解密；密码没有发给服务器。<//>`}
-      ${pending && !pending.encrypted && html`<${Hint} tone="warn">这是未加密的旧备份，文件里是明文；可以用，但建议以后导出加密备份。<//>`}
-      ${err && html`<${Hint} tone="error">${err}<//>`}
+      ${!pending && err && html`<${Hint} tone="error">${err}<//>`}
+      ${note && html`<${Hint}>${note}<//>`}
+      <div class="cfg-block-head set-head">
+        <span class="cfg-block-title">导入</span>
+        <span class="cfg-block-sub">选择 .xbk 加密备份或旧的明文 .json；导入前自动备份当前数据</span>
+      </div>
+      <div class="backup-actions backup-actions-main">
+        <${Button} variant="secondary" disabled=${busy !== ''} onClick=${chooseFile}>选择备份文件<//>
+        <input class="backup-file" ref=${fileRef} type="file" accept=".xbk,.json,application/json" onChange=${onFile} />
+      </div>
+      ${locked && html`<div class="backup-pass-box">
+        <div>这是加密备份：${locked.name}</div>
+        <label class="backup-pass-row">备份密码
+          <input class="fr-input" ref=${unlockRef} type="password" value=${unlockPassword} autocomplete="current-password" onInput=${(e) => setUnlockPassword(e.target.value)} onKeyDown=${(e) => { if (e.key === 'Enter' && unlockPassword !== '' && busy === '') doUnlock().catch(() => {}) }} />
+        </label>
+        ${err && html`<${Hint} tone="error">${err}<//>`}
+        <div class="backup-actions">
+          <${Button} variant="primary" disabled=${busy !== '' || unlockPassword === ''} onClick=${doUnlock}>${busy === 'unlock' ? '解密中…' : '解密'}<//>
+          <${Button} variant="ghost" disabled=${busy !== ''} onClick=${closeUnlock}>取消<//>
+        </div>
+        <div class="modal-note">密码只在这个浏览器里使用，不会发给服务器。解密后再确认导入。</div>
+      </div>`}
       <div class="modal-note">导入会覆盖当前对应的数据；导入前会先把当前数据另存一份。自动运行开关不会被打开，仍保持导入前的状态。导入期间请先停掉外部定时任务，避免它用旧缓存覆盖刚恢复的记录。</div>
+      <${ConfirmDialog} open=${!!pending} title="确认导入备份" confirmLabel=${busy === 'import' ? '导入中…' : '确认导入'} busy=${busy === 'import'} onCancel=${() => { if (busy !== 'import') setPending(null) }} onConfirm=${doImport}>
+        <div>文件里检测到：${pending ? pending.summary.join('、') : ''}</div>
+        ${pending && pending.encrypted && html`<${Hint}>已在本机解密；密码没有发给服务器。<//>`}
+        ${pending && !pending.encrypted && html`<${Hint} tone="warn">这是未加密的旧备份，文件里是明文；可以用，但建议以后导出加密备份。<//>`}
+        <div class="modal-note">导入会覆盖当前对应的数据；自动运行开关保持导入前的状态。导入期间请先停掉外部定时任务。</div>
+        ${pending && err && html`<${Hint} tone="error">${err}<//>`}
+      <//>
     <//>
   </div>`
 }
@@ -3697,6 +3825,12 @@ const FILTER_GROUPS = [
 ]
 
 const FILTER_FIELD_NAMES = FILTER_GROUPS.reduce((acc, g) => acc.concat(g.fields.map((f) => f.name)), [])
+
+// 保存复核抽屉里的「改动字段」用中文标签：给用户看的是「屏蔽楼主」，不是 pingbilouzhu。
+const FILTER_FIELD_LABELS = FILTER_GROUPS.reduce((acc, g) => {
+  for (const f of g.fields) acc[f.name] = f.label
+  return acc
+}, {})
 
 // 过滤规则草稿：改了但没保存的内容先落在浏览器本地，关标签/杀后台/浏览器退出后
 // 下次打开还能捡回来。只存规则字段，不存 token；同一浏览器只保留最近一份。
@@ -4319,7 +4453,14 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       const pv = await apiPostFilterPreview({ schema: 1, filter: candidate, confirmWideMatch: true })
       if (!pv.ok) { showFailure(pv, '补推预览失败'); return false }
       setPreview(pv.data)
-      setDialog({ kind: 'save', filter: candidate, baseRevision: data.revision, preview: pv.data, wide: wideFieldsOf(candidate) })
+      // 抽屉里要列出「这次到底改了哪些字段」：draft 与 base 逐字段比对（与表单上的
+      // 「未保存」徽标同源），标签转中文，值取即将落盘的候选值。
+      const changed = dirtyFields.map((name) => ({
+        name,
+        label: FILTER_FIELD_LABELS[name] || name,
+        value: candidate[name] !== undefined && candidate[name] !== null ? String(candidate[name]) : ''
+      }))
+      setDialog({ kind: 'save', filter: candidate, baseRevision: data.revision, preview: pv.data, wide: wideFieldsOf(candidate), changed })
       return true
     } catch (e) {
       setErr(`保存前检查失败：${e.message}`)
@@ -4573,14 +4714,52 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const dialogNode = () => {
     if (!dialog) return null
     if (dialog.kind === 'save') {
-      return html`<${ConfirmDialog} open=${true} title="确认保存过滤规则"
-        confirmLabel=${busy === 'save' ? '保存中…' : '确认保存'} busy=${busy === 'save'}
-        onCancel=${closeDialog}
-        onConfirm=${() => submitSave({ filter: dialog.filter, baseRevision: dialog.baseRevision, confirmWideMatch: dialog.wide.length > 0 })}>
-        <div class="fr-dialog-line">${reEvalText(dialog.preview)}</div>
-        ${dialog.wide.length > 0 && html`<div class="fr-wide-warn" role="alert">
-          含 .* 全命中规则：${dialog.wide.join('、')}。保存后几乎所有记录都会被命中，因此需要二次确认（confirmWideMatch:true）。
+      // 保存前复核是「核对」不是「确认」：改动字段 + 补推影响 + 命中样本都可能很长，
+      // 弹窗会把背后的表单挡死、用户没法对照着看哪个字段写成了什么。改成右侧抽屉
+      // （宽 560，含 .* 全命中规则时 640），表单留在背后做对照。
+      // 短确认（未保存离开的三选一）仍走居中弹窗：那类内容一屏就够，弹窗更省视线移动。
+      const wide = Array.isArray(dialog.wide) ? dialog.wide : []
+      const changed = Array.isArray(dialog.changed) ? dialog.changed : []
+      const preview = dialog.preview && typeof dialog.preview === 'object' ? dialog.preview : {}
+      const samples = Array.isArray(preview.samples) ? preview.samples : []
+      const saving = busy === 'save'
+      return html`<${Drawer} open=${true} title="确认保存过滤规则"
+        sub=${`${changed.length} 个字段有改动 · 保存后写入覆盖文件，下一轮生效`}
+        width=${wide.length > 0 ? 640 : 560}
+        busy=${saving}
+        onClose=${closeDialog}
+        footer=${html`<${Button} variant="secondary" disabled=${saving} onClick=${closeDialog}>取消<//>
+          <${Button} variant="primary" disabled=${saving}
+            onClick=${() => submitSave({ filter: dialog.filter, baseRevision: dialog.baseRevision, confirmWideMatch: wide.length > 0 })}>${saving ? '保存中…' : '保存'}<//>`}>
+        <div class="fr-preview">
+          <div class="fr-preview-head">补推影响</div>
+          <div class="fr-preview-main">${reEvalText(preview)}</div>
+          ${preview.available === false
+            ? html`<div class="fr-preview-meta">缓存读取 ${preview.cacheStatus || '—'}（${preview.code || 'cache_unavailable'}）</div>`
+            : html`<div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（超过 5000 条，实际可能更多）' : ''}</div>`}
+        </div>
+        ${wide.length > 0 && html`<div class="fr-wide-warn" role="alert">
+          含 .* 全命中规则：${wide.join('、')}。保存后几乎所有记录都会被命中，因此需要二次确认（confirmWideMatch:true）。
         </div>`}
+        <div class="fr-restore">
+          <div class="fr-restore-head">改动字段（${changed.length}）</div>
+          <ul class="fr-samples">
+            ${changed.map((f) => html`<li key=${f.name}><span class="fr-sample-title">${f.label}</span><span class="fr-sample-id">${f.value === '' ? '（留空）' : f.value}</span></li>`)}
+          </ul>
+          <div class="fr-field-hint">表单仍在背后，逐条对一遍再保存；取消或关闭不写盘，草稿仍保留。</div>
+        </div>
+        <div class="fr-restore">
+          <div class="fr-restore-head">命中样本（${samples.length}）</div>
+          ${samples.length > 0
+            ? html`<ul class="fr-samples">
+              ${samples.map((s, i) => html`<li key=${s && s.id !== null && s.id !== undefined ? String(s.id) : `review-sample-${i}`}>
+                <span class="fr-sample-title">${s && s.title ? s.title : '（无标题）'}</span>
+                ${s && s.id !== null && s.id !== undefined && html`<span class="fr-sample-id">${String(s.id)}</span>`}
+              </li>`)}
+            </ul>`
+            : html`<div class="fr-field-hint">本次预览没有命中样本。</div>`}
+          <div class="fr-field-hint">预览只在内存试算，不落盘、不推进过滤 hash、不触发推送。</div>
+        </div>
         <div class="modal-note">保存后写入覆盖文件，<strong>下一轮生效</strong>；当前正在跑的一轮不换规则。</div>
       <//>`
     }

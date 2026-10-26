@@ -2107,37 +2107,40 @@ async function backupApiTests () {
 }
 
 async function backupUiStructureTests () {
-  await aok('结构红线: 数据备份只留导入/导出，导出类别在弹窗里选', () => {
+  await aok('结构红线: 数据备份整块收进右侧抽屉，页面只留入口与摘要', () => {
     const src = readConsoleSource()
     const at = src.indexOf('function BackupBlock')
-    const end = src.indexOf('function SysPanel', at)
+    const end = src.indexOf('function TwoFactorBlock', at)
     const seg = src.slice(at, end)
     const ph = (name) => '$' + '{' + name + '}'
     assert.ok(at > -1 && end > at, '应能定位 BackupBlock')
-    assert.ok(seg.includes('onClick=' + ph('openExport')), '系统页入口只能打开导出弹窗')
-    assert.ok(seg.includes('onClick=' + ph('chooseFile')), '导入入口应直接选文件')
-    assert.ok(seg.includes('open=' + ph('exportOpen')) && seg.includes('title="选择要导出的数据"'),
-      '导出类别必须在弹窗里选')
-    const modalAt = seg.indexOf('open=' + ph('exportOpen'))
-    assert.ok(seg.indexOf('backup-list') > modalAt, '类别列表不得回到系统页内联显示')
-    assert.ok(seg.includes('confirmDisabled='), '一个都没选时导出确认按钮必须禁用')
+    assert.ok(seg.includes('backupEntrySummary('), '入口旁要有一行摘要（上次导出/导入）')
+    assert.ok(seg.includes('onClick=' + ph('openDrawer')) && seg.includes('数据备份与恢复'), '系统页只留一个入口按钮')
+    const drawerAt = seg.indexOf('<' + ph('Drawer') + ' open=' + ph('open'))
+    assert.ok(drawerAt > -1, '备份块必须用 Drawer 承载')
+    assert.ok(seg.includes('title="数据备份与恢复"'), '抽屉标题必须是「数据备份与恢复」')
+    assert.ok(seg.includes('width=' + ph('520')), '抽屉宽必须钉在 520')
+    assert.ok(seg.includes('busy=' + ph('busy !== \'\' || !!pending')) && seg.includes('onClose=' + ph('closeDrawer')),
+      '导入/导出进行中必须 busy（含等待最终确认时，禁止关闭抽屉）')
+    assert.ok(seg.indexOf('backup-list') > drawerAt, '类别列表必须在抽屉内，不得回到系统页')
+    assert.ok(!seg.includes('title="选择要导出的数据"'), '导出类别不再走弹窗（抽屉本身就是选择面）')
+    assert.ok(seg.includes('title="确认导入备份"'), '导入的最终确认仍是短弹窗')
   })
 
   await aok('结构红线: 备份在浏览器加密，密码不进请求', () => {
     const src = readConsoleSource()
     const at = src.indexOf('function BackupBlock')
-    const end = src.indexOf('function SysPanel', at)
+    const end = src.indexOf('function TwoFactorBlock', at)
     const seg = src.slice(at, end)
     assert.ok(at > -1 && end > at, '应能定位 BackupBlock')
     assert.match(src, /import \{[^}]*encryptBackup[^}]*decryptBackup[^}]*isEncryptedBackup[^}]*\} from '\.\/pure\.mjs'/, 'app.js 必须引用纯函数加密模块')
-    const exportAt = seg.indexOf('title="选择要导出的数据"')
-    const unlockAt = seg.indexOf('title="输入备份密码"')
-    const importAt = seg.indexOf('title="确认导入备份"')
-    assert.ok(exportAt > -1 && unlockAt > exportAt && importAt > unlockAt, '三个弹窗必须可分别定位')
-    const exportDialog = seg.slice(exportAt, unlockAt)
-    const unlockDialog = seg.slice(unlockAt, importAt)
-    assert.strictEqual((exportDialog.match(/type="password"/g) || []).length, 2, '导出弹窗必须有两个密码框（设置 + 确认）')
-    assert.strictEqual((unlockDialog.match(/type="password"/g) || []).length, 1, '导入弹窗必须有自己的密码框')
+    const passAt = seg.indexOf('backup-pass-box')
+    const unlockAt = seg.indexOf('backup-pass-box', passAt + 1)
+    assert.ok(passAt > -1 && unlockAt > passAt, '导出密码区与导入解密区必须可分别定位')
+    const exportBox = seg.slice(passAt, unlockAt)
+    const unlockBox = seg.slice(unlockAt, seg.indexOf('modal-note', unlockAt))
+    assert.strictEqual((exportBox.match(/type="password"/g) || []).length, 2, '导出区必须有两个密码框（设置 + 确认）')
+    assert.strictEqual((unlockBox.match(/type="password"/g) || []).length, 1, '解密区必须有自己的密码框')
     assert.ok(seg.includes('.xbk`'), '下载扩展名必须是加密备份标识')
     assert.ok(seg.includes('isEncryptedBackup(data)') && seg.includes('decryptBackup(locked.data'),
       '导入必须先识别加密头，再在浏览器解密')
@@ -2149,7 +2152,7 @@ async function backupUiStructureTests () {
     assert.ok(src.includes('const text = await res.text()'), '导出响应必须先读 JSON 文本再加密，不能直接下载 blob')
     assert.ok(src.includes('BACKUP_BROWSER_MAX_BYTES = 32 * 1024 * 1024'), '浏览器加密导出上限必须钉在 32MiB')
     assert.ok(src.includes('BACKUP_FILE_MAX_BYTES = 48 * 1024 * 1024'), '密文选文件上限必须钉在 48MiB')
-    assert.ok(seg.includes('密码只在这个浏览器里使用，不会发给服务器'), '导入弹窗必须明示密码不上传')
+    assert.ok(seg.includes('密码只在这个浏览器里使用，不会发给服务器'), '解密区必须明示密码不上传')
     const exportApi = src.slice(src.indexOf('function apiPostBackupExport'), src.indexOf('function apiPostBackupImport'))
     assert.ok(/JSON\.stringify\(\{ categories \}\)/.test(exportApi), '导出请求体只能有 categories')
     assert.ok(!/password/i.test(exportApi), '导出请求不得带密码')
@@ -6674,6 +6677,71 @@ async function main () {
     assert.strictEqual(filterSourceNote(null, 11, 0), '')
   })
 
+  await aok('组件: 右侧抽屉（v3.378，列表对照场景的容器）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function Drawer (')
+    assert.ok(at > -1, '必须提供 Drawer 组件（推送记录详情/备份/规则预览共用）')
+    const seg = src.slice(at, src.indexOf('\n}\n', at))
+    assert.ok(/\n[ ]{2}Drawer,/.test(src), 'Drawer 必须从 components.js 导出')
+    assert.ok(seg.includes('role="dialog"') && seg.includes('aria-modal="true"') && seg.includes('aria-labelledby'),
+      '抽屉必须有无障碍语义：dialog + aria-modal + 标题 id')
+    assert.ok(seg.includes('Escape'), 'Escape 必须能关闭')
+    assert.ok(seg.includes('prev.focus()') && seg.includes('prev.isConnected'), '关闭后焦点必须回到触发元素（节点已卸载则跳过）')
+    assert.ok(seg.includes('root.style.overflow') && seg.includes('prevOverflow'),
+      '打开时锁背景滚动，关闭时还原（否则背后列表跟着滚）')
+    assert.ok(seg.includes('if (busy) return'), '父级 busy 时必须拒绝关闭（保存中不能半截关掉）')
+    assert.ok(seg.includes('drawer-closing') && seg.includes('setTimeout'), '退场要先播动画再卸载')
+    assert.ok(seg.includes('e.target === e.currentTarget'), '点遮罩关闭必须限定事件源（点内容不关）')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.drawer\s*\{[^}]*width:\s*min\(var\(--drawer-w,\s*520px\),\s*100%\)/.test(css),
+      '抽屉默认宽 520、窄屏不越界（左侧留列表做对照）')
+    assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.drawer\s*\{\s*width:\s*100%/.test(css), '手机端抽屉必须铺满')
+    assert.ok(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.drawer[\s\S]*?animation:\s*none/.test(css),
+      '减少动效时必须关掉滑入动画')
+  })
+
+  await aok('结构红线: v3.379 推送记录详情走右侧抽屉（520 / 无行内展开 / 焦点归还）', () => {
+    const src = readConsoleSource()
+    const ph = (name) => '$' + '{' + name + '}'
+    const msg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('// 运行日志：'))
+    assert.ok(msg.length > 2000, '必须能定位到 MessagesPanel')
+    // 详情必须是抽屉：行内展开会把下面的条目顶走（读完一条，列表位置就变了，还得重新找）。
+    assert.ok(msg.includes('<' + ph('Drawer') + ' open=' + ph('true') + ' width=' + ph('520')),
+      '条目详情必须渲染在 Drawer 里，宽度 520（与列表并排做对照）')
+    assert.ok(msg.includes('onClose=' + ph('closeDetail')), '抽屉必须能关（Escape / 遮罩 / 关闭按钮都走 onClose）')
+    // 行内展开的旧实现整体退场：展开态 state、caret、行内正文块全删（不留死代码）。
+    assert.ok(!msg.includes('msg-content'), '不得再渲染行内展开的 .msg-content 块')
+    assert.ok(!msg.includes('msg-caret'), '行内展开的 caret 必须删掉')
+    // 样式也得跟着走：DOM 删了、规则留着，下一个人会以为还有别处在用这两条。
+    const cssSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(!cssSrc.includes('.msg-content'), '行内正文的 .msg-content 样式必须一起删掉')
+    assert.ok(!cssSrc.includes('.msg-caret'), '行内展开的 .msg-caret 样式必须一起删掉')
+    assert.ok(!msg.includes('aria-expanded=$' + '{expanded'), '行内展开的 aria-expanded 必须退场（弹出的是对话框，不是展开行）')
+    assert.ok(msg.includes('aria-haspopup="dialog"'), '行标题按钮必须声明弹出的是对话框')
+    assert.ok(msg.includes('title="查看详情"'), '行标题的 title 必须是「查看详情」语义')
+    // 手机上拇指落点不在标题那一行：整张卡片可点，且右侧有 › 提示「这里能进去」。
+    assert.ok(/onClick=\$\{\(e\) => \{[^}]*e\.target\.closest\('a'\)/.test(msg),
+      '卡片本身必须能点开详情（只让标题那一行能点，手机很难命中）')
+    assert.ok(msg.includes("e.currentTarget.querySelector('.msg-title')"), '卡片点击要把标题按钮作为焦点归还目标')
+    assert.ok(msg.includes('class="msg-chev"'), '行尾要有 › 提示可进入详情')
+    // 焦点归还：关闭后回到触发行，且不得滚动页面（背后列表要原地不动）。
+    assert.ok(msg.includes('btn.focus({ preventScroll: true })'), '关闭抽屉后焦点必须还给触发行（且不滚动）')
+    assert.ok(msg.includes('btn.isConnected'), '触发行已随列表刷新卸载时必须跳过聚焦')
+    assert.ok(msg.includes('const [detail, setDetail] = useState(null)'), '详情状态必须保存条目快照')
+    assert.ok(!/items\.find\(\(m\) => m\.rowKey === detail/.test(msg),
+      '不得按 rowKey 反查（轮询换页会把正在读的正文抽走）')
+    // 抽屉内容：时间（副标题）+ 来源渠道 / 分类 / 链接 + 正文全文。
+    assert.ok(msg.includes('sub=' + ph('msgTimeText(detail)')), '抽屉副标题必须是时间')
+    for (const label of ['来源渠道', '分类', '链接']) {
+      assert.ok(msg.includes('label="' + label + '"'), '抽屉缺少「' + label + '」行')
+    }
+    assert.ok(msg.includes('$' + '{detail.content ? hit(detail.content, hitMarkStyle) :'), '抽屉必须显示正文全文')
+    assert.ok(msg.includes("whiteSpace: 'pre-wrap'"), '正文必须保留换行（pre-wrap）')
+    // 切页签要收起抽屉：面板是保活挂载的，fixed 层与背景滚动锁会漏到别页。
+    assert.ok(/useEffect\(\(\) => \{ if \(active\) return detailBtnRef\.current = null setDetail\(null\) \}, \[active\]\)/
+      .test(msg.replace(/\s+/g, ' ')), '切到别的页签必须收起抽屉（否则 fixed 层与滚动锁漏到别页）')
+  })
+
   await aok('结构红线: v3.307 确认弹窗 / 今日统计 / 时间窗 / 日志级别 / hash 路由', () => {
     const src = readConsoleSource()
     assert.ok(src.includes('function ConfirmDialog'), '危险动作必须有确认弹窗')
@@ -7614,12 +7682,77 @@ async function main () {
     assert.ok(!msg.includes('input.trim().toLowerCase()'), '高亮不得直接取输入框')
     assert.ok(src.includes('const MSG_HIT_MAX = 200'), '单条记录命中上限必须登记（超长正文不卡展开）')
     assert.ok(msg.includes('splitHits(text, hitKw, MSG_HIT_MAX).map(([part, on], i) => on ? html`<mark key=' +
-      ph('i') + '>' + ph('part') + '</mark>` : part)'), '命中片段必须用 <mark> 包文本节点（不拼 innerHTML），并带上命中上限')
+      ph('i') + ' style=' + ph('markStyle') + '>' + ph('part') + '</mark>` : part)'), '命中片段必须用 <mark> 包文本节点（不拼 innerHTML），并带上命中上限')
     assert.ok(msg.includes('$' + '{m.title ? hit(m.title) :'), '标题必须走命中高亮')
-    assert.ok(msg.includes('$' + '{m.content ? hit(m.content) :'), '展开后的正文也必须走同一高亮（服务端也按正文搜）')
+    // v3.379：正文从行内展开搬进抽屉，命中高亮必须跟着搬——且抽屉不在 .msg-item 里，
+    // 必须把同一组主题变量以行内样式带进去（否则深色主题退化成浏览器默认黄底黑字）。
+    assert.ok(msg.includes('$' + '{detail.content ? hit(detail.content, hitMarkStyle) :'),
+      '抽屉里的正文也必须走同一高亮（服务端也按正文搜）')
+    assert.ok(/const hitMarkStyle = \{[^}]*background: 'var\(--warn-soft\)'[^}]*color: 'inherit'/.test(msg),
+      '抽屉里的 <mark> 必须自带主题底色（不能靠 .msg-item mark 那条规则）')
     assert.ok(!/innerHTML\s*=/.test(msg), '高亮不得拼 innerHTML（用户输入只能是文本节点）')
     assert.ok(/\.msg-item mark\s*\{[^}]*var\(--warn-soft\)/.test(css), '卡片高亮底色必须走主题变量')
     assert.ok(/\.msg-item mark\s*\{[^}]*color:\s*inherit/.test(css), '<mark> 不得把标题原色盖成浏览器默认黑字')
+  })
+
+  await aok('结构红线: 过滤规则保存复核走右侧抽屉（表单留在背后对照），离开拦截仍是短弹窗', () => {
+    const src = readConsoleSource()
+    const pages = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
+    const ph = (name) => '$' + '{' + name + '}'
+    // pages.js 必须真的引入 Drawer：只断言模板里出现 <${Drawer} 时，漏 import 仍会绿，
+    // 而运行时是整页 ReferenceError。
+    assert.ok(/import \{[^}]*\bDrawer\b[^}]*\} from '\.\/components\.js'/.test(pages),
+      'pages.js 必须从 components.js 引入 Drawer')
+    // ① 保存复核分支（save → corrupt 之间）只允许抽屉，不许再回居中弹窗。
+    const saveAt = src.indexOf("if (dialog.kind === 'save')")
+    const corruptAt = src.indexOf("if (dialog.kind === 'corrupt')", saveAt)
+    assert.ok(saveAt > -1 && corruptAt > saveAt, '保存复核分支必须可定位，且排在 corrupt 分支之前')
+    const save = src.slice(saveAt, corruptAt)
+    assert.ok(save.includes('<' + ph('Drawer')), '保存前复核必须用右侧抽屉（居中弹窗会挡死背后表单，没法对照）')
+    assert.ok(!save.includes('ConfirmDialog'), '保存复核分支不得再出现 ConfirmDialog')
+    assert.ok(!save.includes('onConfirm='), '抽屉不用弹窗的 onConfirm 形态（否则两套确认语义并存）')
+    assert.ok(save.includes('title="确认保存过滤规则"'), '抽屉标题保持「确认保存过滤规则」')
+    assert.ok(save.includes('width=' + ph('wide.length > 0 ? 640 : 560')),
+      '抽屉宽 560，含 .* 全命中规则时 640')
+    assert.ok(save.includes('busy=' + ph('saving')), '保存中必须把 busy 交给抽屉（busy 时关闭被拒）')
+    assert.ok(save.includes('onClose=' + ph('closeDialog')), '关闭/取消必须走 closeDialog（不保存）')
+    // ② 三块内容一块都不能少：补推影响 → 改动字段 → 命中样本。
+    assert.ok(save.includes('reEvalText(preview)'), '抽屉必须保留补推影响（reEvalText）')
+    assert.ok(save.includes('改动字段（' + ph('changed.length') + '）') && save.includes('changed.map('),
+      '抽屉必须列出改动字段清单')
+    assert.ok(save.includes('命中样本（' + ph('samples.length') + '）') && save.includes('samples.map('),
+      '抽屉必须保留样本列表')
+    assert.ok(save.includes('fr-wide-warn') && save.includes('含 .* 全命中规则'),
+      '.* 全命中的红色告警必须留在抽屉里（不能因为换容器就丢）')
+    const iPreview = save.indexOf('补推影响')
+    const iChanged = save.indexOf('改动字段（')
+    const iSamples = save.indexOf('命中样本（')
+    assert.ok(iPreview > -1 && iPreview < iChanged && iChanged < iSamples,
+      '抽屉内容顺序：补推影响 → 改动字段 → 命中样本')
+    // ③ 底部按钮：取消不写盘，保存仍走原来的 submitSave（接口/参数一字不改）。
+    assert.ok(save.includes('variant="secondary" disabled=' + ph('saving') + ' onClick=' + ph('closeDialog') + '>取消'),
+      '底部必须有「取消」且保存中禁用')
+    assert.ok(save.includes('confirmWideMatch: wide.length > 0') && save.includes('baseRevision: dialog.baseRevision'),
+      '保存按钮仍走 submitSave({ filter, baseRevision, confirmWideMatch })')
+    // ④ 保存中关闭被拒的两道锁：Drawer 自己（busy 直接 return）+ 这里的 closeDialog。
+    const closeAt = src.indexOf('const closeDialog = () => {')
+    assert.ok(closeAt > -1, 'closeDialog 必须可定位')
+    const closeEnd = src.indexOf('\n  }', closeAt)
+    assert.ok(closeEnd > closeAt, 'closeDialog 切片锚点必须存在（不能退化成空切片）')
+    const closeSeg = src.slice(closeAt, closeEnd)
+    assert.ok(closeSeg.includes('if (busy) return'), '保存中关闭必须直接返回（第二道锁）')
+    assert.ok(closeSeg.includes("dialog.kind === 'save'") && closeSeg.includes('settleSaveResult(false)'),
+      '取消/关闭必须按「不保存」结算等待者（离开拦截不能被挂死）')
+    // ⑤ 未保存离开的三选一仍是居中弹窗：短确认不该用抽屉。
+    const leaveAt = src.indexOf('function LeaveGuardDialog')
+    const leaveEnd = src.indexOf('// ── 组件：右侧抽屉', leaveAt)
+    assert.ok(leaveAt > -1 && leaveEnd > leaveAt, 'LeaveGuardDialog 与 Drawer 的切片边界必须可定位')
+    const leave = src.slice(leaveAt, leaveEnd)
+    assert.ok(leave.includes('class="modal-backdrop"') && leave.includes('class="modal"'),
+      '未保存离开仍是居中弹窗')
+    assert.ok(!leave.includes('Drawer'), '短确认（未保存离开）不得改成抽屉')
+    assert.ok(leave.includes('不保存并离开') && leave.includes('保存并继续') && leave.includes('>取消<'),
+      '未保存离开必须保留三选一')
   })
 
   await aok('结构红线: v3.317 日志页（顺序 / 行级渲染 / <mark> / 护栏 / 空态出口 / 高度）', () => {
@@ -7937,6 +8070,30 @@ async function main () {
     assert.ok(bar.includes('lastTrigger.settled') && bar.includes('live.final ||'), 'run 消失时必须回落到快照而不是「已提交」')
     assert.ok(src.includes('setLastTrigger({ id: String(e.replayRunId)'), '重放命中必须登记 run id（否则结果行停在旧文案）')
     assert.ok(/\.trigger-result\s*\{[^}]*min-height:\s*18px/.test(css), '结果行必须预留行高（出现时按钮不位移）')
+  })
+
+  await aok('结构红线: 备份块用 Drawer 承载 + HTTPS 校验 + 导入幂等键', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function BackupBlock')
+    const end = src.indexOf('function TwoFactorBlock', at)
+    const seg = src.slice(at, end)
+    const ph = (name) => '$' + '{' + name + '}'
+    assert.ok(at > -1 && end > at, '应能定位 BackupBlock')
+    const drawerAt = seg.indexOf('<' + ph('Drawer') + ' open=' + ph('open'))
+    assert.ok(drawerAt > -1, '备份块必须用 Drawer 承载（不再自绘 modal 层）')
+    assert.ok(seg.includes('width=' + ph('520')), '抽屉宽必须是 520')
+    assert.ok(seg.includes('busy=' + ph("busy !== '' || !!pending")) && seg.includes('onClose=' + ph('closeDrawer')),
+      '导入进行中必须 busy（抽屉关不掉）')
+    // HTTPS 校验仍在，且排在请求导出接口之前：HTTP 下不得先向服务器要明文。
+    const doExportAt = seg.indexOf('const doExport =')
+    const secureAt = seg.indexOf('window.isSecureContext', doExportAt)
+    const apiAt = seg.indexOf('apiPostBackupExport(categories)', doExportAt)
+    assert.ok(doExportAt > -1 && secureAt > doExportAt && apiAt > secureAt,
+      '导出必须先检查 isSecureContext/WebCrypto，再请求明文')
+    // 导入幂等键：明文与加密两条路径各生成一次，确认时把同一个 key 原样传给服务端。
+    assert.strictEqual((seg.match(/key: newBackupImportKey\(\)/g) || []).length, 2,
+      '明文与加密两条路径都要为这次导入生成幂等键')
+    assert.ok(seg.includes('apiPostBackupImport(pending.bundle, pending.key)'), '导入必须带上同一个幂等键')
   })
 
   await aok('结构红线: v3.317 小项（msg-link 44px / 手机输入 16px）', () => {

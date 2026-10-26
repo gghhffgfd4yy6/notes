@@ -551,6 +551,45 @@
   .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: var(--sp-4); flex-wrap: wrap; }
   .modal-actions .btn { min-width: 108px; }
 
+  /* ── 右侧抽屉（v3.378）──
+     列表点开一条、改完接着看下一条用它：背后列表不动、滚动位置不跳。
+     手机上铺满整屏（没有并排对照的余地），桌面 520 起步。 */
+  .drawer-backdrop {
+    position: fixed; inset: 0; z-index: 90; background: rgba(0, 0, 0, .55);
+    display: flex; justify-content: flex-end;
+  }
+  .drawer {
+    width: min(var(--drawer-w, 520px), 100%); height: 100%; max-height: 100dvh;
+    background: var(--panel); border-left: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    box-shadow: -18px 0 60px rgba(0, 0, 0, .45);
+    animation: drawer-in .22s cubic-bezier(.22, .61, .36, 1);
+  }
+  .drawer-closing { animation: drawer-out .17s ease-in forwards; }
+  @keyframes drawer-in { from { transform: translate3d(28px, 0, 0); opacity: .55 } to { transform: none; opacity: 1 } }
+  @keyframes drawer-out { to { transform: translate3d(28px, 0, 0); opacity: 0 } }
+  .drawer-head {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: max(14px, env(safe-area-inset-top)) 16px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .drawer-head-text { flex: 1; min-width: 0; }
+  .drawer-title { margin: 0; font-size: var(--fs-lg); font-weight: 600; line-height: 1.3; }
+  .drawer-sub { margin-top: 4px; color: var(--text-dim); font-size: var(--fs-xs); line-height: 1.5; }
+  .drawer-x {
+    flex: none; width: 32px; height: 32px; border-radius: 50%;
+    border: 1px solid transparent; background: transparent; color: var(--text-dim);
+    font-size: 20px; line-height: 1; cursor: pointer;
+  }
+  .drawer-x:hover { border-color: var(--border); color: var(--text); }
+  .drawer-body { flex: 1; overflow: auto; -webkit-overflow-scrolling: touch; padding: 16px; }
+  .drawer-foot {
+    border-top: 1px solid var(--border);
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap;
+  }
+  @media (prefers-reduced-motion: reduce) { .drawer, .drawer-closing { animation: none; } }
+
   /* ── 提示行 ── */
   .hint { margin-top: var(--sp-2); color: var(--text-dim); font-size: var(--fs-sm); display: flex; align-items: flex-start; gap: var(--sp-2); line-height: 1.55; flex-wrap: wrap; }
   .hint-err { color: var(--bad-fg); }
@@ -898,7 +937,11 @@
   .msg-count { color: var(--text-dim); font-size: var(--fs-xs); margin-bottom: var(--sp-2); }
   .msg-loading { color: var(--accent); }
   .msg-list { display: flex; flex-direction: column; gap: var(--sp-2); list-style: none; margin: 0; padding: 0; }
-  .msg-item { border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px var(--sp-3); background: var(--panel-2); list-style: none; }
+  .msg-item { border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px var(--sp-3); background: var(--panel-2); list-style: none; cursor: pointer; }
+  /* v3.379：整张卡片可点开详情（手机拇指落点不在标题那一行），右侧给个 › 说明「这里能进去」。
+     箭头只是提示，语义上仍是标题按钮 aria-haspopup="dialog"，读屏不会念到它。 */
+  .msg-item:active { background: var(--panel); }
+  .msg-chev { color: var(--text-dim); font-size: var(--fs-md); line-height: 1; flex: none; }
   .msg-item-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-2); }
   .msg-title { font-weight: 500; font-size: var(--fs-md); cursor: pointer; overflow-wrap: anywhere; word-break: normal; }
   .msg-title:hover { color: var(--accent); }
@@ -920,7 +963,6 @@
   /* v3.328：搜索命中高亮（标题 / 正文）。与日志页同口径：--warn-soft 底 + --warn-line 内描边；
      color: inherit 保证深色主题下标题原色不被浏览器默认的「黄底黑字」盖掉。 */
   .msg-item mark { background: var(--warn-soft); color: inherit; border-radius: 2px; box-shadow: inset 0 0 0 1px var(--warn-line); }
-  .msg-caret { color: var(--text-dim); margin-right: 6px; font-size: var(--fs-xs); }
   .msg-price { color: var(--ok-fg); font-weight: 600; font-family: var(--mono); font-size: var(--fs-sm); white-space: nowrap; }
   /* v3.317：原文链接是卡片里唯一的跳转入口，旧版点击区只有字高 ≈15px。视觉字号不变，
      只把行盒抬到 44px（inline-flex 居中），命中区不再考验拇指。
@@ -938,7 +980,6 @@
   }
   .msg-cate-part { white-space: nowrap; }
   .msg-cate-part + .msg-cate-part::before { content: '·'; margin: 0 4px; opacity: .55; }
-  .msg-content { margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px dashed var(--border); color: var(--text); font-size: var(--fs-sm); white-space: pre-wrap; word-break: break-all; }
   /* v3.317：原文链接是卡片里唯一的跳转入口，旧版点击区只有字高 ≈15px。视觉字号不变，
      只把行盒抬到 44px（inline-flex 居中），命中区不再考验拇指。 */
   .msg-link {
@@ -1377,6 +1418,7 @@
     .fr-actions .btn { flex: 1 1 calc(50% - 5px); }
     .fr-actions-note { flex: 1 1 100%; }
     .fr-restore-row .mini-select { flex: 1 1 100%; }
+    .drawer { width: 100%; border-left: 0; }
   }
 
   /* ≤420px 窄屏（v3.317 由 360 上移）：6 个页签在 362 宽只能占 342（.wrap 左右各 10px），
