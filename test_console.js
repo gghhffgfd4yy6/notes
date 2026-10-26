@@ -6697,6 +6697,39 @@ async function main () {
       '减少动效时必须关掉滑入动画')
   })
 
+  await aok('结构红线: v3.379 推送记录详情走右侧抽屉（520 / 无行内展开 / 焦点归还）', () => {
+    const src = readConsoleSource()
+    const ph = (name) => '$' + '{' + name + '}'
+    const msg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('// 运行日志：'))
+    assert.ok(msg.length > 2000, '必须能定位到 MessagesPanel')
+    // 详情必须是抽屉：行内展开会把下面的条目顶走（读完一条，列表位置就变了，还得重新找）。
+    assert.ok(msg.includes('<' + ph('Drawer') + ' open=' + ph('true') + ' width=' + ph('520')),
+      '条目详情必须渲染在 Drawer 里，宽度 520（与列表并排做对照）')
+    assert.ok(msg.includes('onClose=' + ph('closeDetail')), '抽屉必须能关（Escape / 遮罩 / 关闭按钮都走 onClose）')
+    // 行内展开的旧实现整体退场：展开态 state、caret、行内正文块全删（不留死代码）。
+    assert.ok(!msg.includes('msg-content'), '不得再渲染行内展开的 .msg-content 块')
+    assert.ok(!msg.includes('msg-caret'), '行内展开的 caret 必须删掉')
+    assert.ok(!msg.includes('aria-expanded=$' + '{expanded'), '行内展开的 aria-expanded 必须退场（弹出的是对话框，不是展开行）')
+    assert.ok(msg.includes('aria-haspopup="dialog"'), '行标题按钮必须声明弹出的是对话框')
+    assert.ok(msg.includes('title="查看详情"'), '行标题的 title 必须是「查看详情」语义')
+    // 焦点归还：关闭后回到触发行，且不得滚动页面（背后列表要原地不动）。
+    assert.ok(msg.includes('btn.focus({ preventScroll: true })'), '关闭抽屉后焦点必须还给触发行（且不滚动）')
+    assert.ok(msg.includes('btn.isConnected'), '触发行已随列表刷新卸载时必须跳过聚焦')
+    assert.ok(msg.includes('const [detail, setDetail] = useState(null)'), '详情状态必须保存条目快照')
+    assert.ok(!/items\.find\(\(m\) => m\.rowKey === detail/.test(msg),
+      '不得按 rowKey 反查（轮询换页会把正在读的正文抽走）')
+    // 抽屉内容：时间（副标题）+ 来源渠道 / 分类 / 链接 + 正文全文。
+    assert.ok(msg.includes('sub=' + ph('msgTimeText(detail)')), '抽屉副标题必须是时间')
+    for (const label of ['来源渠道', '分类', '链接']) {
+      assert.ok(msg.includes('label="' + label + '"'), '抽屉缺少「' + label + '」行')
+    }
+    assert.ok(msg.includes('$' + '{detail.content ? hit(detail.content, hitMarkStyle) :'), '抽屉必须显示正文全文')
+    assert.ok(msg.includes("whiteSpace: 'pre-wrap'"), '正文必须保留换行（pre-wrap）')
+    // 切页签要收起抽屉：面板是保活挂载的，fixed 层与背景滚动锁会漏到别页。
+    assert.ok(/useEffect\(\(\) => \{ if \(active\) return detailBtnRef\.current = null setDetail\(null\) \}, \[active\]\)/
+      .test(msg.replace(/\s+/g, ' ')), '切到别的页签必须收起抽屉（否则 fixed 层与滚动锁漏到别页）')
+  })
+
   await aok('结构红线: v3.307 确认弹窗 / 今日统计 / 时间窗 / 日志级别 / hash 路由', () => {
     const src = readConsoleSource()
     assert.ok(src.includes('function ConfirmDialog'), '危险动作必须有确认弹窗')
@@ -7637,9 +7670,14 @@ async function main () {
     assert.ok(!msg.includes('input.trim().toLowerCase()'), '高亮不得直接取输入框')
     assert.ok(src.includes('const MSG_HIT_MAX = 200'), '单条记录命中上限必须登记（超长正文不卡展开）')
     assert.ok(msg.includes('splitHits(text, hitKw, MSG_HIT_MAX).map(([part, on], i) => on ? html`<mark key=' +
-      ph('i') + '>' + ph('part') + '</mark>` : part)'), '命中片段必须用 <mark> 包文本节点（不拼 innerHTML），并带上命中上限')
+      ph('i') + ' style=' + ph('markStyle') + '>' + ph('part') + '</mark>` : part)'), '命中片段必须用 <mark> 包文本节点（不拼 innerHTML），并带上命中上限')
     assert.ok(msg.includes('$' + '{m.title ? hit(m.title) :'), '标题必须走命中高亮')
-    assert.ok(msg.includes('$' + '{m.content ? hit(m.content) :'), '展开后的正文也必须走同一高亮（服务端也按正文搜）')
+    // v3.379：正文从行内展开搬进抽屉，命中高亮必须跟着搬——且抽屉不在 .msg-item 里，
+    // 必须把同一组主题变量以行内样式带进去（否则深色主题退化成浏览器默认黄底黑字）。
+    assert.ok(msg.includes('$' + '{detail.content ? hit(detail.content, hitMarkStyle) :'),
+      '抽屉里的正文也必须走同一高亮（服务端也按正文搜）')
+    assert.ok(/const hitMarkStyle = \{[^}]*background: 'var\(--warn-soft\)'[^}]*color: 'inherit'/.test(msg),
+      '抽屉里的 <mark> 必须自带主题底色（不能靠 .msg-item mark 那条规则）')
     assert.ok(!/innerHTML\s*=/.test(msg), '高亮不得拼 innerHTML（用户输入只能是文本节点）')
     assert.ok(/\.msg-item mark\s*\{[^}]*var\(--warn-soft\)/.test(css), '卡片高亮底色必须走主题变量')
     assert.ok(/\.msg-item mark\s*\{[^}]*color:\s*inherit/.test(css), '<mark> 不得把标题原色盖成浏览器默认黑字')

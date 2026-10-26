@@ -4,7 +4,7 @@
 // 顺序在 ui.js 之前（App 在 ui.js 里 import 这些面板）。
 import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from './constants.js'
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
-import { Badge, Button, ConfirmDialog, DateRange, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, useHoldRepeat } from './components.js'
+import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
 import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, isEncryptedBackup, logLineCounts, logLineTone, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
@@ -1585,6 +1585,30 @@ function buildMessagesHash (state) {
   return qs === '' ? '#/messages' : `#/messages?${qs}`
 }
 
+// ── 推送记录：条目详情抽屉（v3.379）────────────────────────────────────────
+// 行内展开会把下面的条目顶走：读一条正文，列表就换了位置，想接着看下一条还得重新找。
+// 改成右侧抽屉后列表原地不动（滚动位置不跳），抽屉宽度 520 与列表并排做对照。
+// 抽屉里只有「标签 + 值」的行，布局走最小内联样式——本次改动只碰页面层，app.css 不动，
+// 故不复用列表卡片的 .msg-meta（那是横向 pill 行，不是键值表）。
+function DetailRow ({ label, children }) {
+  return html`<div style=${{ display: 'flex', gap: '10px', alignItems: 'baseline', marginTop: '8px' }}>
+    <span style=${{ flex: 'none', width: '4.5em', color: 'var(--text-dim)', fontSize: 'var(--fs-xs)' }}>${label}</span>
+    <span style=${{ flex: '1 1 auto', minWidth: '0', overflowWrap: 'anywhere', fontSize: 'var(--fs-sm)' }}>${children}</span>
+  </div>`
+}
+
+// 详情里的时间：datetime + shorttime 拼接（与列表同口径），空值不占位。
+function msgTimeText (m) {
+  const parts = [m.datetime, m.shorttime].filter((s) => typeof s === 'string' && s !== '')
+  return parts.length > 0 ? parts.join(' ') : '（无时间）'
+}
+
+// 来源渠道 = 分类三段式（来源-品类-平台）的第一段；单段分类时整串就是来源。
+function msgSourceOf (name) {
+  const parts = cateParts(name)
+  return parts.length > 0 ? parts[0] : ''
+}
+
 function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   // 首帧从 hash query 还原筛选（L2-8）：只解析一次，之后 state 是唯一真相。
   const [boot] = useState(() => parseMessagesHash(window.location.hash))
@@ -1599,7 +1623,11 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   const rangeActive = range.from !== '' && range.to !== ''
   const [input, setInput] = useState(boot.q)
   const [query, setQuery] = useState(boot.q)
-  const [expanded, setExpanded] = useState(null) // 展开的条目 rowKey（无 id 条目是 idx-N 合成键）
+  // v3.379：详情改右侧抽屉。detail 存「打开那一刻的条目快照」而不是 rowKey——
+  // 抽屉开着时轮询/换页会换掉整页 items，按 rowKey 反查会让正在读的正文当场消失。
+  const [detail, setDetail] = useState(null)
+  // 关闭后把焦点还给触发的按钮（列表重渲染后旧节点可能已卸载，isConnected 兜底）。
+  const detailBtnRef = useRef(null)
   // 响应归属（问题5）：请求发出时记下的 query 会在 in-flight 期间过期——旧响应的
   // queryUsed 会把刚打的新词清空（搜索吞字）。改为：loadSeqRef 给每次请求领号，
   // loadedQueryRef 只在「最新一次请求」回包时记录它对应的 query。
@@ -1861,8 +1889,11 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   // 防抖提交新词后、新响应回来前 data 仍是上一轮的，用 query 会拿新词去标旧卡片
   // （PR #291 Sourcery：Old results get wrong highlights）。
   const hitKw = (data && typeof data.queryUsed === 'string' ? data.queryUsed : '').trim().toLowerCase()
-  const hit = (text) => (typeof text === 'string'
-    ? splitHits(text, hitKw, MSG_HIT_MAX).map(([part, on], i) => on ? html`<mark key=${i}>${part}</mark>` : part)
+  // 列表里的 <mark> 由 .msg-item mark 上色（app.css）；详情抽屉不在 .msg-item 里，
+  // 同一组主题变量改由行内样式带进去——否则深色主题下退化成浏览器默认的黄底黑字。
+  const hitMarkStyle = { background: 'var(--warn-soft)', color: 'inherit', borderRadius: '2px', boxShadow: 'inset 0 0 0 1px var(--warn-line)' }
+  const hit = (text, markStyle) => (typeof text === 'string'
+    ? splitHits(text, hitKw, MSG_HIT_MAX).map(([part, on], i) => on ? html`<mark key=${i} style=${markStyle}>${part}</mark>` : part)
     : text)
   // 服务端对超长搜索词按字节截断——回显以 queryUsed（实际生效值）为准，
   // 但只在「响应确实属于当前查询、且用户没有继续输入」时回写；
@@ -1876,9 +1907,34 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       setQuery(data.queryUsed)
     }
   }, [data, input, query])
+  // 抽屉开关：打开时记住触发的按钮，关闭后把焦点还给它（键盘用户接着往下看）。
+  // preventScroll：焦点还给列表里的按钮时不得把页面滚一下（背后列表的位置要原地不动）。
+  const openDetail = (m, btn) => {
+    detailBtnRef.current = btn || null
+    setDetail(m)
+  }
+  const closeDetail = () => {
+    const btn = detailBtnRef.current
+    detailBtnRef.current = null
+    setDetail(null)
+    if (btn && typeof btn.focus === 'function' && btn.isConnected) btn.focus({ preventScroll: true })
+  }
+  // 切到别的页签就收起抽屉：面板是保活挂载的，抽屉是 fixed 层、背景滚动也还锁着，
+  // 留着会漏到别页（与 CategoryPicker 的「非本页即关」同口径）。这里不走 closeDetail——
+  // 焦点不该被拽回一个已经隐藏的面板里。
+  useEffect(() => {
+    if (active) return
+    detailBtnRef.current = null
+    setDetail(null)
+  }, [active])
+  // 抽屉「分类」只画细分路径（来源之后那几段）：来源已经在上一行，整串再画一遍等于
+  // 同一句话写两次。aria-label 仍带完整分类名（读屏与筛选口径都不受裁剪影响）。
+  const detailCate = detail ? cateParts(detail.catename) : []
+  const detailCateSub = detailCate.slice(1)
   // v3.358：列表标题是真 <button>（原 span[role=button][tabindex=0]）。原生 button 自带
   // Enter/空格 ⇒ 合成 click，再手写 onKeyDown 会双触发（keydown 展开 + click 收起 = 看起来没反应），
-  // 故删掉手写键盘处理；caret / aria-expanded / title 全部保留。
+  // 故删掉手写键盘处理。v3.379 起它打开的是右侧抽屉：aria-haspopup 声明弹出的是对话框，
+  // 行内展开的 aria-expanded / caret 一起退场（展开态不再是行内状态）。
   return html`<div class="panel">
     <${PanelHead} title="推送记录" level=${1} sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
@@ -1927,10 +1983,10 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
           ${items.map((m) => html`<div class="msg-item" role="listitem" key=${m.rowKey} data-mk=${m.rowKey}>
             <div class="msg-item-head">
               <button type="button" class="msg-title"
-                aria-expanded=${expanded === m.rowKey ? 'true' : 'false'}
-                title=${expanded === m.rowKey ? '收起正文' : '点击展开正文'}
-                onClick=${() => setExpanded(expanded === m.rowKey ? null : m.rowKey)}>
-                <span class="msg-caret" aria-hidden="true">${expanded === m.rowKey ? '▾' : '▸'}</span>${m.title ? hit(m.title) : '（无标题）'}
+                aria-haspopup="dialog"
+                title="查看详情"
+                onClick=${(e) => openDetail(m, e.currentTarget)}>
+                ${m.title ? hit(m.title) : '（无标题）'}
               </button>
               ${m.price !== null && titleTailPrice(m.title) !== m.price
                 ? html`<span class="msg-price">¥${m.price}</span>`
@@ -1941,7 +1997,6 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
               <span class="mono">${m.datetime} ${m.shorttime}</span>
               ${msgLink(m, data.baseUrl)}
             </div>
-            ${expanded === m.rowKey && html`<div class="msg-content">${m.content ? hit(m.content) : '（无正文）'}</div>`}
           </div>`)}
         </div>`}
       <div class="pager">
@@ -1961,6 +2016,24 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
         <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(data.pages)}>末页 »<//>
       </div>
     </div>`}
+    ${/* v3.379：条目详情抽屉。列表留在背后做对照（滚动位置不动），宽度 520 与抽屉默认值一致，
+         手机上由 Drawer 自己铺满整屏。detail 是打开那一刻的快照，轮询换掉 items 也不影响阅读。 */ ''}
+    ${detail && html`<${Drawer} open=${true} width=${520}
+      title=${detail.title ? hit(detail.title, hitMarkStyle) : '（无标题）'}
+      sub=${msgTimeText(detail)}
+      onClose=${closeDetail}>
+      <${DetailRow} label="来源渠道">${msgSourceOf(detail.catename) || '（未分类）'}<//>
+      <${DetailRow} label="分类">${detailCateSub.length > 0
+        ? html`<span class="msg-cate" aria-label=${detail.catename}>${detailCateSub.map((part, i) => html`<span class="msg-cate-part" key=${i}>${part}</span>`)}</span>`
+        : (detailCate.length === 0 ? '（未分类）' : '（无细分分类）')}<//>
+      <${DetailRow} label="链接">${detail.url ? msgLink(detail, data && data.baseUrl) : '（无原文链接）'}<//>
+      <div style=${{ marginTop: '14px', paddingTop: '12px', borderTop: '1px dashed var(--border)' }}>
+        <div style=${{ color: 'var(--text-dim)', fontSize: 'var(--fs-xs)', marginBottom: '6px' }}>正文</div>
+        <div style=${{ fontSize: 'var(--fs-sm)', lineHeight: '1.7', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+          ${detail.content ? hit(detail.content, hitMarkStyle) : '（无正文）'}
+        </div>
+      </div>
+    </${Drawer}>`}
   </div>`
 }
 
