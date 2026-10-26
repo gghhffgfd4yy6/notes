@@ -1037,3 +1037,12 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 清掉行内展开留下的 `.msg-content` / `.msg-caret` 死样式——DOM 删了、规则还留着，下次改主题会以为还有别处在用。
 - 测试：控制台套件 282 通过（新增 4 条抽屉用例；结构红线补 DOM 与 app.css 两侧断言）。`scripts/console.js` 未改（6769 行，变异行段无需重拆）。
 - 版本 3.379.0。
+
+## v3.380 — 控制台：抽屉进场不再淡入（修「打开时闪一下」）
+
+- 现象：真机上点开推送记录详情，抽屉滑出的瞬间像「闪了一下」。
+- 原因：进场关键帧 `drawer-in` 从 `opacity: .55` 起手，前 ~100ms 面板是半透明的——背后的列表会从抽屉里透出来；同时遮罩 `.drawer-backdrop` 没有任何过渡，一挂载就是 55% 黑，两件事叠在一起就成了「闪一下」。
+- 改法：`drawer-in` 只保留 28px 位移（0.22s → 0.18s），面板从第一帧就是不透明的；遮罩的 0.12s 淡入挂到 `.drawer-backdrop::before`——直接给 `.drawer-backdrop` 做 opacity 动画会把子元素（面板）一起压成半透明，等于没修（评审 High）；`prefers-reduced-motion` 下抽屉与遮罩都关动画。
+- 文档：`README.md` 控制台小节补「抽屉」一条；`SYSTEM_CONTRACT.md` 补抽屉容器契约（语义/三路关闭/滚动锁/焦点归还/只准动 transform/遮罩必须走 ::before），并把动效层那条的 `motionOK()` 口径写明是「JS 驱动」，纯 CSS 动画由同一份 `prefers-reduced-motion` 关闭。
+- 测试：抽屉组件用例补四条断言（`.drawer` 必须真的引用 `drawer-in`、`drawer-in` 不得含 opacity、`.drawer-backdrop` 本身不得有动画、`::before` 的关键帧必须 0→1）；控制台套件 282 通过。
+- 版本 3.380.0。

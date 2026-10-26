@@ -555,18 +555,28 @@
      列表点开一条、改完接着看下一条用它：背后列表不动、滚动位置不跳。
      手机上铺满整屏（没有并排对照的余地），桌面 520 起步。 */
   .drawer-backdrop {
-    position: fixed; inset: 0; z-index: 90; background: rgba(0, 0, 0, .55);
+    position: fixed; inset: 0; z-index: 90;
     display: flex; justify-content: flex-end;
   }
+  /* 遮罩的变暗走 ::before，不能直接给 .drawer-backdrop 加 opacity 动画：
+     抽屉是它的子元素，父级 opacity < 1 会把整棵子树（含面板）一起压成半透明，
+     面板又变成「透出背后列表」——那正是要修的「闪一下」。 */
+  .drawer-backdrop::before {
+    content: ''; position: absolute; inset: 0; background: rgba(0, 0, 0, .55);
+    animation: drawer-backdrop-in .12s ease-out;
+  }
   .drawer {
+    position: relative; /* 压在 ::before 之上（两者同为定位元素，按源序后绘） */
     width: min(var(--drawer-w, 520px), 100%); height: 100%; max-height: 100dvh;
     background: var(--panel); border-left: 1px solid var(--border);
     display: flex; flex-direction: column;
     box-shadow: -18px 0 60px rgba(0, 0, 0, .45);
-    animation: drawer-in .22s cubic-bezier(.22, .61, .36, 1);
+    /* v3.380：进场只做位移、不淡入。面板从第一帧就要不透明，否则背后的列表会透出来。 */
+    animation: drawer-in .18s cubic-bezier(.22, .61, .36, 1);
   }
   .drawer-closing { animation: drawer-out .17s ease-in forwards; }
-  @keyframes drawer-in { from { transform: translate3d(28px, 0, 0); opacity: .55 } to { transform: none; opacity: 1 } }
+  @keyframes drawer-backdrop-in { from { opacity: 0 } to { opacity: 1 } }
+  @keyframes drawer-in { from { transform: translate3d(28px, 0, 0) } to { transform: none } }
   @keyframes drawer-out { to { transform: translate3d(28px, 0, 0); opacity: 0 } }
   .drawer-head {
     display: flex; align-items: flex-start; gap: 12px;
@@ -588,7 +598,7 @@
     padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
     display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap;
   }
-  @media (prefers-reduced-motion: reduce) { .drawer, .drawer-closing { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .drawer, .drawer-backdrop, .drawer-closing { animation: none; } }
 
   /* ── 提示行 ── */
   .hint { margin-top: var(--sp-2); color: var(--text-dim); font-size: var(--fs-sm); display: flex; align-items: flex-start; gap: var(--sp-2); line-height: 1.55; flex-wrap: wrap; }
