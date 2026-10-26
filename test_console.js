@@ -6699,10 +6699,18 @@ async function main () {
     assert.ok(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.drawer[\s\S]*?animation:\s*none/.test(css),
       '减少动效时必须关掉滑入动画')
     // v3.380：进场只位移、不淡入——旧版 from{opacity:.55} 会让背后列表从抽屉里透出来，像闪了一下。
+    const drawerRule = (css.match(/\n\s*\.drawer\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/animation:\s*drawer-in/.test(drawerRule), '.drawer 必须用 drawer-in（关键帧写了却没人引用等于没有）')
     const drawerIn = (css.match(/@keyframes drawer-in \{[^}]*\}[^}]*\}/) || [''])[0]
     assert.ok(drawerIn.includes('transform'), '进场必须有位移（否则是硬切）')
     assert.ok(!drawerIn.includes('opacity'), '进场不得淡入：面板从第一帧就要不透明，否则背后列表会透出来')
-    assert.ok(/\.drawer-backdrop\s*\{[^}]*animation:\s*drawer-backdrop-in/.test(css), '遮罩要自己淡入，不然底色是硬跳')
+    // 遮罩的淡入必须挂在 ::before 上：直接给 .drawer-backdrop 做 opacity 动画，
+    // 会把子元素（面板）一起压成半透明，闪一下又回来了。
+    const backdropRule = (css.match(/\n\s*\.drawer-backdrop\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(!/animation:/.test(backdropRule), '.drawer-backdrop 本身不得有 opacity 动画（会连带把抽屉一起透明化）')
+    assert.ok(/\.drawer-backdrop::before\s*\{[^}]*animation:\s*drawer-backdrop-in/.test(css), '遮罩要由 ::before 自己淡入，不然底色是硬跳')
+    const backdropIn = (css.match(/@keyframes drawer-backdrop-in \{[^}]*\}[^}]*\}/) || [''])[0]
+    assert.ok(/opacity:\s*0/.test(backdropIn) && /opacity:\s*1/.test(backdropIn), '遮罩关键帧必须真的从 0 到 1')
   })
 
   await aok('结构红线: v3.379 推送记录详情走右侧抽屉（520 / 无行内展开 / 焦点归还）', () => {
