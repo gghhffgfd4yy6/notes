@@ -3498,7 +3498,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     return `${meta.status}:${meta.size === null ? '' : meta.size}:${meta.mtimeMs === null ? '' : meta.mtimeMs}`
   }
   const streamFingerprint = () => {
-    const runningIds = [...runs.values()].filter((r) => !r.finishedAt).map((r) => r.id).sort()
+    const runningIds = [...runs.values()].filter((r) => !r.finishedAt).map((r) => r.id)
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
     return [
       streamFileStamp(path.join(historyDir(), 'run.log')),
       streamFileStamp(path.join(stateDir, messagesFile)),
