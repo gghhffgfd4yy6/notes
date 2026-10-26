@@ -2822,7 +2822,7 @@ async function main () {
     }
   })
   await aok('资产: 首屏 modulepreload 覆盖 app.js 的 import 闭包（版本路径、排在入口之前）', () => {
-    // 预加载是手工维护的 11 行，两种错都不会被别的用例抓住：① 漏一个模块（瀑布还在，只是
+    // 预加载是手工维护的一行一模块（v3.384 起 12 行），两种错都不会被别的用例抓住：① 漏一个模块（瀑布还在，只是
     // 短了点）；② 把 flatpickr 写成 flatpickr.module.js（404，白下一次）。这里用 acorn 从
     // app.js 出发算**真实**静态 import 闭包，与 HTML 里的 href 逐字对账。
     const acorn = require('acorn')
