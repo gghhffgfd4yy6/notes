@@ -1158,7 +1158,7 @@ function CacheHealthPanel ({ paused = false, active = true }) {
   </div>`
 }
 
-// 推送记录：搜索（300ms 防抖）+ 分类筛选 + 服务端分页；点标题展开 content 全文。
+// 推送记录：搜索（300ms 防抖）+ 分类筛选 + 服务端分页；点标题在右侧抽屉看全文（v3.379）。
 // URL 不含 content_html（服务端已裁剪）——CSP 禁外链图，贴文本才是控制台能诚实渲染的形态。
 // 原文链接：相对路径拼服务端下发的 baseUrl（= 生产 Config.domain，与推送侧 resolve 同口径），
 // 绝对 URL 原样；只放行 http/https（其他 scheme 不渲染链接）。
@@ -1588,7 +1588,7 @@ function buildMessagesHash (state) {
 // ── 推送记录：条目详情抽屉（v3.379）────────────────────────────────────────
 // 行内展开会把下面的条目顶走：读一条正文，列表就换了位置，想接着看下一条还得重新找。
 // 改成右侧抽屉后列表原地不动（滚动位置不跳），抽屉宽度 520 与列表并排做对照。
-// 抽屉里只有「标签 + 值」的行，布局走最小内联样式——本次改动只碰页面层，app.css 不动，
+// 抽屉里只有「标签 + 值」的行，布局走最小内联样式——键值表只在抽屉里出现一次，
 // 故不复用列表卡片的 .msg-meta（那是横向 pill 行，不是键值表）。
 function DetailRow ({ label, children }) {
   return html`<div style=${{ display: 'flex', gap: '10px', alignItems: 'baseline', marginTop: '8px' }}>
