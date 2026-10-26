@@ -1,0 +1,16 @@
+[Unit]
+Description=每 2 分钟检查一次 xbk-push 是否有新提交待部署
+Documentation=file:/home/ubuntu/notes-live/README.md
+
+[Timer]
+# 开机 2 分钟后先跑一次，之后按「上一次结束」起算 2 分钟。
+OnBootSec=2min
+OnUnitActiveSec=2min
+# 关机/断电期间错过的触发，开机后补一次（不是补 N 次，Persistent 只记最后一次）。
+Persistent=true
+# 默认 1min 的随机精度会让「2 分钟」实际抖动到 3 分钟，收紧一点。
+AccuracySec=10s
+Unit=xbk-deploy.service
+
+[Install]
+WantedBy=timers.target

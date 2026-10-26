@@ -186,6 +186,19 @@ const SSE_MAX_PENDING = 1024 * 1024
 // 每进程并发 SSE 连接上限：第 9 个 503（防 token 泄露后被刷连接拖垮控制台）。
 const SSE_MAX_CONNECTIONS = 8
 
+// ── v3.374 全站 SSE 通知（/api/stream）──────────────────────────────────────
+// 列表页不再靠 15s 轮询发现变化：服务端每 2s 采一次「轻量指纹」，变了就广播 tick，
+// 前端收到 tick 走既有条件请求（ETag/304 命中，不重传正文）。断线时前端自动退回 15s
+// 轮询——两条通道互不依赖，谁断了都不影响数据新鲜度。
+// 采样是**单实例**的（闭包内一个定时器）：所有连接共享同一份结果，不为每个连接各读一次盘。
+const SSE_STREAM_TICK_MS = 2000
+// 心跳注释帧：防代理/防火墙按 idle 断链。这里平时可能长时间没有 tick（数据没变），
+// 全靠心跳证明连接活着；20s 比 /api/runs/stream 的 15s 更宽，因为它只承载「变了」信号。
+const SSE_STREAM_HEARTBEAT_MS = 20000
+// 每进程并发上限：第 21 个立刻 503。与 /api/runs/stream 的 8 分开计：那条是逐帧增量流
+// （一个人只看一个运行的日志），这条是每个打开的标签页一条，上限要按「标签页数」留余量。
+const SSE_STREAM_MAX_CONNECTIONS = 20
+
 // /api/trends 的 days 白名单：URL 是未验证输入，只放行这三个值（非法/越界一律回默认 14，
 // 向后兼容）。用固定数组 includes 而非正则（用户输入不进正则是本仓红线）。
 const TREND_DAYS_ALLOWED = Object.freeze([14, 30, 60])
@@ -957,6 +970,7 @@ function shouldLogAccess (method, pathname, statusCode) {
   const m = method === 'GET'
   const p = String(pathname || '')
   if (m && (p === '/' || p === '/api/status' || p === '/api/runs' || p === '/api/runs/stream' ||
+    p === '/api/stream' ||
     Object.prototype.hasOwnProperty.call(STATIC_ASSETS, p))) return false
   if (m && RUN_DETAIL_PATH_RE.test(p)) return false // D4：GET 详情轮询
   if (method === 'POST' && p === '/api/runs/detail') return false // D4：POST 详情轮询（前端实际形态）
@@ -1068,6 +1082,11 @@ function renderUnauthorizedPage (options = {}) {
     <input id="code" name="code" type="text" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="24" inputmode="text" required${token ? ' autofocus' : ''}>
     <p class="hint">验证码 30 秒变一次；恢复码在开启两步验证时只显示一次。</p>`
     : ''
+  // 「记住这台设备」（v3.374）：默认勾选——自用工具 + 纯 IP 部署用不了 Passkey，
+  // 90 天免验证码是这套方案唯一的使用体验来源；不勾就还是每次都要输码。
+  const rememberField = requireCode
+    ? '<label class="remember"><input type="checkbox" name="remember" value="1" checked> 记住这台设备（90 天内在这台浏览器上不用再输验证码）</label>'
+    : ''
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title} · xbk-push 控制台</title>
@@ -1080,6 +1099,8 @@ function renderUnauthorizedPage (options = {}) {
   label { display: block; font-size: 13px; color: #9aa8c0; margin-bottom: 6px; }
   input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #33405f; background: #0f1420; color: #e6edf7; font: inherit; }
   button { margin-top: 12px; width: 100%; padding: 10px 12px; border: 0; border-radius: 8px; background: #356fd6; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  .remember { display: flex; align-items: center; gap: 8px; margin: 12px 0 0; font-size: 13px; color: #9aa8c0; }
+  .remember input { width: auto; margin: 0; }
   .hint { font-size: 12px; margin: 14px 0 0; }
   .error { font-size: 13px; color: #ffb4b4; margin: 0 0 12px; }
 </style></head>
@@ -1090,6 +1111,7 @@ function renderUnauthorizedPage (options = {}) {
   <form method="post" action="/login">
     ${tokenField}
     ${codeField}
+    ${rememberField}
     <button type="submit">${requireCode ? '验证并打开' : '打开控制台'}</button>
   </form>
   <p class="hint">${requireCode
@@ -1410,6 +1432,185 @@ function persistTwoFactorState (file, secret, recovery) {
     recovery,
     createdAt: Date.now()
   }), '控制台两步验证')
+}
+
+// ── 信任设备（「记住这台设备」，v3.374）─────────────────────────────────────
+// 为什么不直接上 Passkey：WebAuthn 的 RP ID 不允许是 IP 地址，而控制台当前部署在
+// https://43.143.246.62（纯 IP、无域名）⇒ 在这个部署上 Passkey 根本注册不了。等价目标是
+// 「同一台已经验过 token + 6 位码的浏览器，90 天内不用再输验证码」，用设备 Cookie 达成：
+//   · cookie 值 = <id>.<32 字节随机 hex>，HttpOnly + Secure + SameSite=Lax + Path=/；
+//   · 服务端只存 secret 的 sha256 —— console-devices.json 被读走也换不出可用 cookie；
+//   · 比较走 timingSafeEqual（定长 hex 转 Buffer，长度不等直接判不匹配）；
+//   · 文件损坏/字段非法一律按空列表处理（fail-safe：退回 2FA），覆盖前先留一份 .bak，
+//     不静默把损坏证据冲掉；
+//   · 关闭或重配 2FA 时清空列表：旧信任不得绕过新密钥。
+const DEVICE_FILE = 'console-devices.json'
+const DEVICE_SCHEMA = 1
+const DEVICE_COOKIE = 'xbk_device'
+// 90 天：cookie Max-Age 与记录 TTL 用同一个数，避免「cookie 还在、服务端已判过期」的错位。
+const DEVICE_COOKIE_MAX_AGE_S = 90 * 24 * 60 * 60 // 7776000 秒
+const DEVICE_TTL_MS = DEVICE_COOKIE_MAX_AGE_S * 1000
+const DEVICE_MAX = 20
+const DEVICE_UA_MAX = 120
+const DEVICE_FILE_MAX_BYTES = 64 * 1024
+// 同一台设备每分钟最多写一次 lastUsedAt：GET / 是高频动作，逐次落盘只会白磨磁盘。
+const DEVICE_TOUCH_MIN_MS = 60 * 1000
+const DEVICE_ID_HEX = 24 // 12 字节随机
+const DEVICE_HASH_HEX = 64 // sha256
+const DEVICE_SECRET_HEX = 64 // 32 字节随机
+
+// 定长小写 hex 判定（字符串比较，不构建正则——用户可控输入不进正则）。
+function isLowerHex (text, length) {
+  if (typeof text !== 'string' || text.length !== length) return false
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code >= 48 && code <= 57) continue // 0-9
+    if (code >= 97 && code <= 102) continue // a-f
+    return false
+  }
+  return true
+}
+
+function hashDeviceSecret (secret) {
+  return crypto.createHash('sha256').update(String(secret)).digest('hex')
+}
+
+// UA 只作「哪台设备」的辨识线索，不参与安全判定；截 120 字并抹掉控制字符，
+// 避免把换行/终端转义序列塞进状态文件后被别的读取方当成多行内容。
+function trimDeviceUa (ua) {
+  if (typeof ua !== 'string' || ua.length === 0) return ''
+  let out = ''
+  for (const ch of ua) {
+    const code = ch.charCodeAt(0)
+    out += (code < 32 || code === 127) ? ' ' : ch
+  }
+  return out.replace(/\s+/g, ' ').trim().slice(0, DEVICE_UA_MAX)
+}
+
+function parseDeviceCookie (value) {
+  if (typeof value !== 'string') return null
+  const dot = value.indexOf('.')
+  if (dot <= 0 || dot === value.length - 1) return null
+  const id = value.slice(0, dot)
+  const secret = value.slice(dot + 1)
+  if (!isLowerHex(id, DEVICE_ID_HEX) || !isLowerHex(secret, DEVICE_SECRET_HEX)) return null
+  return { id, secret }
+}
+
+// 签发：返回 { record, secret }。secret 只在本次响应的 Set-Cookie 里出现一次，
+// 服务端只留 hash——与恢复码同一口径（明文不落盘、不进日志）。
+function makeDeviceRecord (ua, now = Date.now()) {
+  const secret = crypto.randomBytes(32).toString('hex')
+  const record = {
+    id: crypto.randomBytes(12).toString('hex'),
+    hash: hashDeviceSecret(secret),
+    createdAt: now,
+    lastUsedAt: now,
+    ua: trimDeviceUa(ua)
+  }
+  return { record, secret }
+}
+
+function isValidDeviceRecord (record) {
+  return !!record && typeof record === 'object' && !Array.isArray(record) &&
+    isLowerHex(record.id, DEVICE_ID_HEX) &&
+    isLowerHex(record.hash, DEVICE_HASH_HEX) &&
+    Number.isFinite(record.createdAt) && record.createdAt > 0 &&
+    Number.isFinite(record.lastUsedAt) && record.lastUsedAt > 0 &&
+    typeof record.ua === 'string' && record.ua.length <= DEVICE_UA_MAX
+}
+
+// 过期清理 + 同 id 去重（留 lastUsedAt 更新的那条）。只放行字段完整的记录：
+// 手改出来的 {id} 这种残记录不能因为「id 对上了」就免除第二因子。
+function pruneDeviceRecords (records, now = Date.now()) {
+  const byId = new Map()
+  const at = Number.isFinite(now) ? now : Date.now()
+  for (const record of Array.isArray(records) ? records : []) {
+    if (!isValidDeviceRecord(record)) continue
+    if (at - record.createdAt >= DEVICE_TTL_MS) continue
+    const prev = byId.get(record.id)
+    if (!prev || record.lastUsedAt > prev.lastUsedAt) {
+      byId.set(record.id, { ...record, ua: trimDeviceUa(record.ua) })
+    }
+  }
+  return [...byId.values()]
+}
+
+// 追加一台设备：最多 20 台，超限淘汰「最久未用」（lastUsedAt 最小）的那台——
+// 用户换手机/换浏览器时不需要先去旧设备上「退出」，列表自己会滚。
+function appendDeviceRecord (records, record, now = Date.now()) {
+  const kept = pruneDeviceRecords(records, now).filter((item) => item.id !== record.id)
+  kept.push(record)
+  if (kept.length <= DEVICE_MAX) return kept
+  kept.sort((a, b) => a.lastUsedAt - b.lastUsedAt)
+  return kept.slice(kept.length - DEVICE_MAX)
+}
+
+// 设备 cookie → 命中的记录。2FA 未开启时一律不认：否则「关掉 2FA 再开」或
+// 「重配密钥」之后，旧设备 cookie 就成了绕过新密钥的后门。
+function trustedDeviceOf (records, cookieValue, now = Date.now(), enabled = true) {
+  if (enabled !== true) return null
+  const parsed = parseDeviceCookie(cookieValue)
+  if (!parsed) return null
+  const candidate = Buffer.from(hashDeviceSecret(parsed.secret), 'hex')
+  for (const record of pruneDeviceRecords(records, now)) {
+    if (record.id !== parsed.id) continue
+    const saved = Buffer.from(record.hash, 'hex')
+    if (saved.length === candidate.length && crypto.timingSafeEqual(saved, candidate)) return record
+  }
+  return null
+}
+
+function deviceCookieValue (cookieHeader) {
+  return cookieValue(cookieHeader, DEVICE_COOKIE)
+}
+
+function deviceCookieHeader (id, secret, maxAge = DEVICE_COOKIE_MAX_AGE_S) {
+  // Secure 无条件加：本功能只在 HTTPS 部署（纯 IP + TLS 终结）上有意义，
+  // 明文 HTTP 上浏览器会直接拒存——那正是我们想要的降级（退回 2FA，而不是悄悄削弱）。
+  return `${DEVICE_COOKIE}=${id}.${secret}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}; Secure`
+}
+
+function clearDeviceCookieHeader () {
+  return `${DEVICE_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure`
+}
+
+function deviceStorePath (stateDir) {
+  return path.join(stateDir, DEVICE_FILE)
+}
+
+// 读设备列表。文件缺失 = 空列表（正常）；JSON 坏了/字段非法 = 空列表 + 原始文本
+// （corruptText 交给写路径先备份 .bak，不在这里写盘：GET / 只读，不该产生副作用）。
+function readDeviceStore (stateDir, now = Date.now()) {
+  const file = deviceStorePath(stateDir)
+  const read = readSafeTextResult(file, DEVICE_FILE_MAX_BYTES, { openNonBlocking: true })
+  if (read.status === 'missing') return { file, devices: [], corruptText: null, readFailed: false }
+  const text = typeof read.text === 'string' ? read.text : ''
+  // 读失败（ioError / tooLarge / unsafe / replaced）与「文件不存在」必须分开：前者说明
+  // 盘上还有一份读不懂的列表，此时按空列表写回等于把已登记的设备全删了（Sourcery High）。
+  if (read.status !== 'ok') return { file, devices: [], corruptText: null, readFailed: true }
+  if (text.trim() === '') return { file, devices: [], corruptText: null, readFailed: false }
+  let raw
+  try { raw = JSON.parse(text) } catch (e) { return { file, devices: [], corruptText: text, readFailed: false } }
+  if (!raw || raw.version !== DEVICE_SCHEMA || !Array.isArray(raw.devices)) {
+    return { file, devices: [], corruptText: text, readFailed: false }
+  }
+  return { file, devices: pruneDeviceRecords(raw.devices, now), corruptText: null, readFailed: false }
+}
+
+// 只留一份 .bak：反复损坏时保留最早那份原始证据，不被后续覆盖。
+function backupDeviceStore (file, text) {
+  const backup = file + '.bak'
+  if (readSafeTextResult(backup, 1, { openNonBlocking: true }).status !== 'missing') return true
+  return writeAtomic(backup, String(text), '控制台信任设备备份') === true
+}
+
+function writeDeviceStore (stateDir, devices, { corruptText = null, readFailed = false } = {}) {
+  const file = deviceStorePath(stateDir)
+  // 盘上那份读不出来时不覆盖：宁可这次记不住/撤不掉，也不能把已有登记抹成空列表。
+  if (readFailed) return false
+  if (typeof corruptText === 'string' && !backupDeviceStore(file, corruptText)) return false
+  return writeAtomic(file, JSON.stringify({ version: DEVICE_SCHEMA, devices }), '控制台信任设备') === true
 }
 
 function authorize (req, token, urlQuery) {
@@ -2791,7 +2992,7 @@ function buildPushChannelsView () {
   return view
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, lineSearchFetch, watchNotifier } = {}) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, sseStreamTickMs, lineSearchFetch, watchNotifier } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   // 启动即做一次一致快照：既校验资产可读（缺失即拒启），也把版本号钉死在进程生命周期内
@@ -2893,6 +3094,33 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // （CodeQL js/user-controlled-bypass：用户可控的值不能直接决定放行）。
     return verifyTwoFactorCookie(twoFactorCookieValue(req.headers && req.headers.cookie), twoFactor.secret)
   }
+  // 信任设备（v3.374）：判定直接读盘——文件只有几百字节，换来「手改/换进程后立刻生效」；
+  // lastUsedAt 的写盘按设备 60s 节流，节流基准就是盘上的 lastUsedAt（进程重启后照样有效，
+  // 不需要额外的内存表）。
+  const trustedDeviceForRequest = (req, now = Date.now()) => {
+    const cookie = deviceCookieValue(req.headers && req.headers.cookie)
+    if (cookie === null) return null
+    const store = readDeviceStore(stateDir, now)
+    const record = trustedDeviceOf(store.devices, cookie, now, twoFactor.enabled)
+    if (!record) return null
+    if (now - record.lastUsedAt >= DEVICE_TOUCH_MIN_MS) {
+      const devices = store.devices.map((item) => (item.id === record.id ? { ...item, lastUsedAt: now } : item))
+      writeDeviceStore(stateDir, devices, { corruptText: store.corruptText })
+    }
+    return record
+  }
+  const rememberDevice = (req, now = Date.now()) => {
+    const store = readDeviceStore(stateDir, now)
+    const issued = makeDeviceRecord(req.headers && req.headers['user-agent'], now)
+    const devices = appendDeviceRecord(store.devices, issued.record, now)
+    if (!writeDeviceStore(stateDir, devices, { corruptText: store.corruptText, readFailed: store.readFailed })) return null
+    return issued
+  }
+  const revokeTrustedDevices = () => {
+    const store = readDeviceStore(stateDir)
+    return writeDeviceStore(stateDir, [], { corruptText: store.corruptText, readFailed: store.readFailed })
+  }
+  const trustedDeviceCount = () => readDeviceStore(stateDir).devices.length
   const verifySecondFactor = (code, { persistRecovery = true } = {}) => {
     const totp = consumeTotpStep(code)
     if (totp && totp.replay) return { ok: false, recovery: false, error: 'replay' }
@@ -3157,6 +3385,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 未注入/非法值回退默认。命名用 ssePendingLimit 避免与解构参数同名（同名 const 会
   // SyntaxError: Identifier has already been declared）。
   const ssePendingLimit = typeof sseMaxPending === 'number' && sseMaxPending > 0 ? sseMaxPending : SSE_MAX_PENDING
+  // 通知流采样间隔：createConsole 可注入（测试用小值把「变化才推」的用例压到毫秒级，
+  // 不必每条都等满 2s），未注入/非法值回退生产默认。与 sseMaxPending 同一注入先例。
+  const streamTickMs = typeof sseStreamTickMs === 'number' && sseStreamTickMs > 0 ? sseStreamTickMs : SSE_STREAM_TICK_MS
 
   // 幂等清理：clearInterval + 摘除登记 + res.end()。res 'close'/'error'/积压超限/关停
   // 广播/完结收尾全走这里（蓝图防线 5：close 必清理，防 Set 泄漏）。
@@ -3248,6 +3479,77 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sseWriteFrame(conn, ': ping\n\n')
       conn.lastPingAt = Date.now()
     }
+  }
+
+  // ── v3.374 全站 SSE 通知（/api/stream）───────────────────────────────────
+  // 与上面 /api/runs/stream 的逐帧增量流是两件事：那条推正文，这条只推「变了」这一个
+  // 信号。正文仍由前端走既有条件请求拉（ETag/304 命中，响应体为 0 字节），所以这条流
+  // 不需要游标、不需要 Last-Event-ID 续传——漏一帧最多让数据晚 60s（安全轮询兜底）。
+  // 按实例隔离（createConsole 闭包内，非模块级）：测试会建多个实例，模块级 Set 会跨实例
+  // 泄漏连接数（第 21 个 503 误伤）。
+  const streamClients = new Set()
+  // 共享采样器状态：一个定时器 + 一份上次指纹（不为每个连接各读一次盘）。
+  let streamSampler = null
+  let streamFingerprintValue = ''
+  // 指纹只取四项「便宜且能代表变化」的东西，全程不解析文件内容：
+  //   · run.log 的 size+mtimeMs（毫秒级 mtime 覆盖「同长度原地覆盖写」）；
+  //   · push.json（判重缓存主存，新推送落盘就是这里变）；
+  //   · auto 状态文件（开了/停了自动运行）；
+  //   · 运行中 id 集合（子进程起停，runs 是进程内存，不落盘）。
+  // 用 statSafeMeta（O_NOFOLLOW + fstat）与其它读面同口径：符号链接/读失败不回落到
+  // 「看起来没变」，而是带上 status，状态切换本身也算一次变化。
+  const streamFileStamp = (p) => {
+    const meta = statSafeMeta(p)
+    return `${meta.status}:${meta.size === null ? '' : meta.size}:${meta.mtimeMs === null ? '' : meta.mtimeMs}`
+  }
+  const streamFingerprint = () => {
+    const runningIds = [...runs.values()].filter((r) => !r.finishedAt).map((r) => r.id)
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    return [
+      streamFileStamp(path.join(historyDir(), 'run.log')),
+      streamFileStamp(path.join(stateDir, messagesFile)),
+      streamFileStamp(autoPath),
+      runningIds.join(',')
+    ].join('|')
+  }
+  // 单帧写出：tick 帧与心跳都只有几十字节，不需要 /api/runs/stream 那套应用层积压队列
+  // （慢客户端最多让 Node 缓冲这点小帧，真要堵死也是内核缓冲区的问题，不是本流的问题）。
+  const streamTeardown = (client) => {
+    if (client.closed) return
+    client.closed = true
+    clearInterval(client.timer)
+    streamClients.delete(client)
+    try { client.res.end() } catch (e) { /* 已断开 */ }
+    // 最后一个连接走掉就停采样：没人听的时候不该继续每 2s 读一次盘。
+    if (streamClients.size === 0) stopStreamSampler()
+  }
+  const streamWrite = (client, frame) => {
+    if (client.closed) return false
+    try { client.res.write(frame); return true } catch (e) { streamTeardown(client); return false }
+  }
+  function streamSamplerTick () {
+    const next = streamFingerprint()
+    if (next === streamFingerprintValue) return // 没变化不刷帧（代理空闲期只留心跳注释）
+    streamFingerprintValue = next
+    const frame = `event: tick\ndata: ${JSON.stringify({ at: Date.now() })}\n\n`
+    for (const client of [...streamClients]) streamWrite(client, frame)
+  }
+  function startStreamSampler () {
+    if (streamSampler !== null) return
+    // 建连那一刻的当前值作基线：把「已有状态」当变化会让每次打开页面都白刷一帧。
+    streamFingerprintValue = streamFingerprint()
+    streamSampler = setInterval(streamSamplerTick, streamTickMs)
+    if (typeof streamSampler.unref === 'function') streamSampler.unref() // 不钉事件循环（测试可退出）
+  }
+  function stopStreamSampler () {
+    if (streamSampler === null) return
+    clearInterval(streamSampler)
+    streamSampler = null
+    streamFingerprintValue = ''
+  }
+  const closeAllStreamClients = () => {
+    for (const client of [...streamClients]) streamTeardown(client)
+    stopStreamSampler()
   }
 
   // ── 批次④ 4.1：触发受理序列共享（/trigger 与 POST /api/notify-test）─────────
@@ -5009,6 +5311,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         const cookies = [sessionCookieHeaderFor(req, token)]
         if (twoFactor.enabled) cookies.push(twoFactorCookieHeader(req, twoFactor.secret))
+        // 「记住这台设备」（默认勾选）：签 90 天设备 cookie。只有真正过了第二因子才会走到这里，
+        // 写盘失败就静默降级成「这次登录有效、下次还要输码」——不能因为记不住设备就拒绝登录。
+        const remember = params.get('remember')
+        if (twoFactor.enabled && typeof remember === 'string' && remember !== '') {
+          const issued = rememberDevice(req)
+          if (issued) cookies.push(deviceCookieHeader(issued.record.id, issued.secret))
+        }
         res.setHeader('Set-Cookie', cookies)
         res.setHeader('Cache-Control', 'no-store')
         res.writeHead(303, { Location: '/' })
@@ -5018,15 +5327,25 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     // 两步验证闸（v3.357）：只拦浏览器页面，不拦 API/静态资产。访问令牌正确但还没过
     // 6 位码时，给登录页的第二步；令牌本身仍留在 hidden 字段随 POST 回传，不新增 URL 暴露。
+    // v3.374：先看「信任设备」——命中即视为第二因子已过，并补发 2FA 会话 Cookie；
+    // 会话 Cookie 过期时也一并续期（设备信任本身就是这台浏览器 90 天的登录凭证）。
+    let deviceTrusted = false
+    const pageCookies = []
     if (req.method === 'GET' && url.pathname === '/' && twoFactor.enabled && !twoFactorVerified(req)) {
-      if (!authorize(req, token, url.searchParams)) {
-        sendHtml(res, 401, renderUnauthorizedPage())
+      const device = trustedDeviceForRequest(req)
+      if (device) {
+        deviceTrusted = true
+        pageCookies.push(twoFactorCookieHeader(req, twoFactor.secret), sessionCookieHeaderFor(req, token))
+      } else {
+        if (!authorize(req, token, url.searchParams)) {
+          sendHtml(res, 401, renderUnauthorizedPage())
+          return
+        }
+        const queryToken = url.searchParams.get('token')
+        const formToken = typeof queryToken === 'string' && timingSafeEqualStr(queryToken, token) ? queryToken : token
+        sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: formToken }))
         return
       }
-      const queryToken = url.searchParams.get('token')
-      const formToken = typeof queryToken === 'string' && timingSafeEqualStr(queryToken, token) ? queryToken : token
-      sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: formToken }))
-      return
     }
     // 过滤规则写端点：必须在全局 authorize 之前分流。全局闸对 POST 接受 ?token= 且
     // 对 Cookie 统一回 unauthorized——只有专属入口才能给出 query_token_not_allowed /
@@ -5042,7 +5361,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       handleFilterDraftDelete(req, res)
       return
     }
-    if (!authorize(req, token, url.searchParams)) {
+    if (!deviceTrusted && !authorize(req, token, url.searchParams)) {
       // 审查 #224：GET / 未授权时给可自助恢复的登录页，而不是裸 JSON；API/静态资源仍回 JSON。
       if (req.method === 'GET' && url.pathname === '/') {
         sendHtml(res, 401, renderUnauthorizedPage())
@@ -5075,7 +5394,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 这是部署形态的固有权衡，不是代码缺陷可修；上 HTTPS（反代/自签）后应第一时间
       // 补 Secure + __Host- 前缀。缓解：HttpOnly（XSS 拿不走）+ SameSite=Lax（跨站顶层
       // 导航可带，但 POST 不收 Cookie）+ Max-Age 从 30 天收窄到 1 天 + Referrer-Policy（见下）。
-      res.setHeader('Set-Cookie', sessionCookieHeaderFor(req, token))
+      // 走「信任设备」进来时上面已经排好两条 Cookie（2FA 会话 + 会话 token），别在这里覆盖掉。
+      res.setHeader('Set-Cookie', pageCookies.length > 0 ? pageCookies : sessionCookieHeaderFor(req, token))
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       // Sourcery Session-users-cannot-trigger x2：用户经 Cookie 会话（无 ?token=）打开页面时，
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
@@ -5516,8 +5836,26 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sendJson(res, 200, {
         enabled: twoFactor.enabled,
         pending: hasPendingTwoFactor(),
-        recoveryRemaining: twoFactor.recovery ? twoFactor.recovery.hashes.length : 0
+        recoveryRemaining: twoFactor.recovery ? twoFactor.recovery.hashes.length : 0,
+        // 信任设备数（v3.374）：系统页的「退出所有信任设备」按钮靠它显示「现在记住了几台」。
+        trustedDevices: twoFactor.enabled ? trustedDeviceCount() : 0
       })
+      return
+    }
+    // 退出所有信任设备（v3.374）：写面只认 Bearer（与其它写端点同口径，Cookie-only 401）。
+    // 同时清掉当前浏览器的设备 Cookie——否则页面上「已退出」，这台机器下次仍能免验证进来。
+    if (req.method === 'POST' && url.pathname === '/api/devices/revoke') {
+      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
+      const verdict = writeAuthVerdict(req, url.searchParams, token)
+      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
+      req.resume() // 不需要 body；显式排空，避免 keep-alive 连接里残留字节污染下一个请求
+      if (!revokeTrustedDevices()) {
+        sendJson(res, 500, { error: 'write_failed', message: '设备列表清空失败，请稍后再试' })
+        return
+      }
+      res.setHeader('Set-Cookie', clearDeviceCookieHeader())
+      res.setHeader('Cache-Control', 'no-store')
+      sendJson(res, 200, { revoked: true, devices: 0 })
       return
     }
     if (req.method === 'POST' && url.pathname === '/api/2fa/setup') {
@@ -5578,6 +5916,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         const recoveryCodes = generateRecoveryCodes()
         const recovery = recoveryRecordOf(recoveryCodes)
+        // 重配 2FA = 换了一把新钥匙：先作废旧设备信任，清不掉就整体失败（否则旧 cookie
+        // 仍能绕过新密钥；Sourcery High「Old trusted devices bypass new 2FA」）。
+        if (!revokeTrustedDevices()) {
+          sendJson(res, 500, { error: 'revoke_failed', message: '旧设备信任清理失败，未开启两步验证' })
+          return
+        }
         if (!persistTwoFactorState(twoFactor.file, pending.secret, recovery)) {
           sendJson(res, 500, { error: 'write_failed', message: '两步验证配置保存失败' })
           return
@@ -5628,6 +5972,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           sendJson(res, 400, { error: 'invalid_code', message: why })
           return
         }
+        // 先清设备信任、再删配置：清不掉就保持 2FA 开启，避免留下「已关 2FA 但旧设备还能进」的状态。
+        if (!revokeTrustedDevices()) {
+          sendJson(res, 500, { error: 'revoke_failed', message: '信任设备清理失败，未关闭两步验证' })
+          return
+        }
         try {
           fs.rmSync(twoFactor.file, { force: true })
         } catch (e) {
@@ -5642,7 +5991,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         lastEnableResult = null
         usedTotpSteps.clear()
         clearLoginFailures(req)
-        res.setHeader('Set-Cookie', clearTwoFactorCookieHeader(req))
+        res.setHeader('Set-Cookie', [clearTwoFactorCookieHeader(req), clearDeviceCookieHeader()])
         sendJson(res, 200, { enabled: false })
       }).catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
       return
@@ -5831,6 +6180,32 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         cancelled: r.cancelled === true
       }))
       sendJsonConditional(req, res, { runs: list })
+      return
+    }
+    // GET /api/stream（v3.374）：全站数据变化通知流。只发「变了」这一个信号
+    // （event: tick + {"at":<ms>}），正文由前端用既有条件请求拉（ETag/304）——一条长连接
+    // 不承载数据，重连也就不需要补帧。鉴权零代码：继承上方全局闸（原生 EventSource 带不了
+    // 自定义头 → Bearer 不可用；GET 收会话 Cookie，?token= 供 API/测试用，与 runs/stream 同口径）。
+    if (req.method === 'GET' && url.pathname === '/api/stream') {
+      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭' }); return }
+      // 连接数闸：第 21 个立刻 503（不排队、不先建流再断）。
+      if (streamClients.size >= SSE_STREAM_MAX_CONNECTIONS) { sendJson(res, 503, { error: 'SSE 连接数已达上限' }); return }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        // no-store 而不是 no-cache：这条流带鉴权语义，浏览器不得把任何一帧存下来复用。
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no', // 禁 nginx 类反向代理按块缓冲（否则 tick 要等代理攒满）
+        Connection: 'keep-alive'
+      })
+      res.flushHeaders()
+      const client = { res, closed: false, timer: null }
+      // 每连接只挂一个心跳定时器（20s 注释帧）；指纹采样是共享的，连接再多也只读一次盘。
+      client.timer = setInterval(() => { streamWrite(client, ': ping\n\n') }, SSE_STREAM_HEARTBEAT_MS)
+      if (typeof client.timer.unref === 'function') client.timer.unref()
+      streamClients.add(client)
+      res.on('close', () => streamTeardown(client))
+      res.on('error', () => streamTeardown(client))
+      startStreamSampler()
       return
     }
     // GET /api/runs/stream（v3.300 批次③ 3.1）：运行中任务输出的 SSE 实时流。
@@ -6033,9 +6408,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const origClose = server.close.bind(server)
   server.close = (cb) => {
     killAll()
+    // 全站 SSE 连接不随 close 自动结束（server.close 只挡新连接，在途请求照旧），
+    // 不主动 end 的话 close 回调会一直等这些长连接——测试里就是「跑完了不退出」。
+    closeAllStreamClients()
     return origClose(cb)
   }
   server.on('close', () => { disposeAuto(); killAll() })
+  // 全站 SSE 连接要单独收：server.close() 只挡新连接，在途的 /api/stream 不会自己结束；
+  // 不显式清理的话采样定时器与 socket 会留到进程退出（测试里表现为「跑完了不退出」）。
+  server.on('close', () => closeAllStreamClients())
   // ── 优雅关闭装配（v3.297 自 main 抽出，Sourcery #225 M6：原实现不可测——测试无法
   // 确认「关停真的 SIGKILL 了子进程、并等 close 后才退出」）。依赖注入 onExit/registerSignal：
   // 测试传假子进程 + 假 exit 即可确定性断言序列；生产 main 无参调用即等价旧行为。
@@ -6058,6 +6439,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sseWriteFrame(conn, 'event: done\ndata: {}\n\n')
         sseTeardown(conn)
       }
+      // 全站通知流没有「done」语义（它只发变化信号），直接 end + 清采样器：
+      // 客户端 onerror 后按纪律退回 15s 轮询，页面照旧可用。
+      closeAllStreamClients()
       console.log(`收到 ${signal}，关闭控制台：终止触发子进程并释放锁…`)
       for (const child of activeChildren) {
         try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
@@ -6130,7 +6514,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   if (typeof watchTimer.unref === 'function') watchTimer.unref()
   server.on('close', () => clearInterval(watchTimer))
 
-  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections, runWatchOnce }
+  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections, streamClients, streamSamplerActive: () => streamSampler !== null, runWatchOnce }
 }
 
 // ── 启动入口 ───────────────────────────────────────────────────────────────
@@ -6208,6 +6592,24 @@ module.exports = {
   TWO_FACTOR_PENDING_TTL_MS,
   TWO_FACTOR_RECOVERY_COUNT,
   TWO_FACTOR_LOGIN_MAX_FAILS,
+  // v3.374 信任设备：签发/校验纯函数 + 落盘读写（非 HTTP 单测直接可达）
+  DEVICE_FILE,
+  DEVICE_COOKIE,
+  DEVICE_COOKIE_MAX_AGE_S,
+  DEVICE_MAX,
+  DEVICE_TTL_MS,
+  DEVICE_TOUCH_MIN_MS,
+  hashDeviceSecret,
+  makeDeviceRecord,
+  parseDeviceCookie,
+  pruneDeviceRecords,
+  appendDeviceRecord,
+  trustedDeviceOf,
+  readDeviceStore,
+  writeDeviceStore,
+  deviceCookieValue,
+  deviceCookieHeader,
+  clearDeviceCookieHeader,
   TOTP_PERIOD_S,
   TOTP_DIGITS,
   acquireLock,
@@ -6281,6 +6683,10 @@ module.exports = {
   SSE_HEARTBEAT_MS,
   SSE_MAX_PENDING,
   SSE_MAX_CONNECTIONS,
+  // v3.374 全站 SSE 通知：常量导出（非 HTTP 单测 + 前端安全轮询间隔对账）
+  SSE_STREAM_TICK_MS,
+  SSE_STREAM_HEARTBEAT_MS,
+  SSE_STREAM_MAX_CONNECTIONS,
   // v3.301 批次④ 4.1 通知自检：常量/入口导出（spawn entry 映射断言 + 重放窗断言）
   REPLAY_WINDOW_NOTIFY_TEST_MS,
   ENTRY_SINGLE,

@@ -18,6 +18,72 @@ export function backToTopBehavior (reduceMotion, supportsSmooth) {
   return reduceMotion || !supportsSmooth ? null : 'smooth'
 }
 
+// 切页用浏览器原生 View Transitions 的能力判定（淡入淡出，零依赖）。
+// 三个条件缺一不可：宿主真的实现了 startViewTransition、动效开关为真、根元素在
+// （root 快照要挂到 documentElement 上，没有它调用会直接抛）。同名的非函数值也算没有：
+// 有些 polyfill/壳浏览器会塞个占位属性，`in` 判断会被骗过去。
+// 判定收在这一个出口，调用方只有「原生过渡 / 直接换页」两条路，不必到处 try/catch 或嗅探 UA。
+export function canViewTransition (doc, motionOK) {
+  return Boolean(doc) && typeof doc.startViewTransition === 'function' &&
+    motionOK === true && Boolean(doc.documentElement)
+}
+
+// 用一次原生 View Transition 包住「引起主内容重渲染」的那一下（同步触发渲染在回调里跑）。
+// 拿不到能力（或用户关了动效）就直接 apply(false) 同步渲染：同一条出口，调用方不必分支。
+//
+// 为什么回调是 async + 微任务，而不是 rAF：preact 的 setState 在**微任务**里 flush
+// （standalone 包的 defer = Promise.prototype.then.bind(Promise.resolve())），所以
+// setState 之后 await 一次微任务，续体一定排在这次 flush 后面，DOM 已是新页；浏览器随后
+// 抓「新页」快照才对。千万别换成 `await new Promise(r => requestAnimationFrame(r))`：
+// 过渡的 DOM update 阶段渲染管线在等这个回调，rAF 被饿死、永远不来，Chrome 4s 后直接
+// 「Transition was aborted because of timeout in DOM update」——过渡整段没了，页面还卡 4s
+// （已在真实 Chrome 里实测复现）。等待里不碰帧、不碰定时器，就不会有这种死锁。
+//
+// 约定：
+// - apply 只会被调用一次（浏览器中途 abort 或回调被重复触发都不补渲染），入参 true 表示
+//   这次渲染由过渡驱动（页面级入场动画据此让位，避免两套淡入叠在一起）。
+// - transition.finished 只挂一个吞掉的 catch，**不 await**：连点会 abort 上一段过渡，
+//   那是预期路径，等它会把点击卡住，也不该在控制台刷「未处理拒绝」。
+// - 更新回调里的异常不吞：updateCallbackDone 不做任何 catch，让它照常冒到
+//   console / 错误上报；startViewTransition 自己同步抛错时才补一次普通渲染（切页不能因为
+//   过渡起不来而停在旧页）。
+export function runViewTransition (doc, motionOK, apply) {
+  if (typeof apply !== 'function') return null
+  if (!canViewTransition(doc, motionOK)) {
+    apply(false)
+    return null
+  }
+  let rendered = false
+  const renderOnce = (viaTransition) => {
+    if (rendered) return
+    rendered = true
+    apply(viaTransition)
+  }
+  let transition = null
+  try {
+    transition = doc.startViewTransition(async () => {
+      renderOnce(true)
+      // 两次微任务：第一个让 preact 的 flush 先跑；第二个兜住「渲染里又 setState
+      // 再排一次 flush」（切页后 layout effect 补状态就是这种形态）。
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+  } catch (e) {
+    renderOnce(false)
+    return null
+  }
+  if (transition) {
+    // 不阻塞：连点时旧的那段会被 skip / abort，ready 与 finished 都会拒绝——都属预期路径，
+    // 只挂空 catch。绝不能 await（会把点击卡住），也不能让它们变成未处理拒绝刷满控制台。
+    // 更新回调自己抛的异常走 updateCallbackDone，这里刻意不碰，照常冒到 console / 错误上报。
+    for (const key of ['ready', 'finished']) {
+      const p = transition[key]
+      if (p && typeof p.catch === 'function') p.catch(() => {})
+    }
+  }
+  return transition || null
+}
+
 // 配置页「过滤规则」块的数据口径（v3.312）：显示**实际生效值**，而不是只读代码默认。
 // 背景：过滤规则页写的是覆盖文件 filter-rules.json，配置页原先只读 Config.filter ⇒
 // 保存成功后两页对不上（用户看到「已保存」，配置页仍全空）。
@@ -481,4 +547,86 @@ export function morphFrom (src, box) {
     dy: Math.round(src.top + src.height / 2 - (box.top + box.height / 2)),
     s
   }
+}
+
+// ── 全站 SSE 通知（v3.374）───────────────────────────────────────────────────
+// 轮询间隔的纯判定：SSE 连上（sseUp）时 15s 轮询没有意义，降成 60s 安全轮询——它只兜
+// 「漏帧 / 长时间无变化」，实时性由 tick 承担；任务在跑仍按 POLL_BUSY_MS 快轮询（日志要跟手）。
+export function pollIntervalFor ({ sseUp, busy, pollMs, busyMs, safetyMs }) {
+  if (busy) return busyMs
+  return sseUp ? safetyMs : pollMs
+}
+
+// 通知流的状态机：连流 / 收 tick / 断线降级 / 隐藏断开 / 可见重连。DOM 与构造器全部注入，
+// 所以本模块仍然是「无 DOM、无 fetch」——Node 测试塞假 EventSource + 假 document 就能
+// 跑真实行为断言（不必 eval 源码，S1523）。
+// 纪律（与 /api/runs/stream 的详情流同口径）：
+//   · 同一时刻只有一个 EventSource——open() 幂等，重复调用不会再建一条；
+//   · onerror 不立刻 close：原生 EventSource 正在自动重连（readyState=CONNECTING）且未超
+//     次数时先交给浏览器（它有退避与续传），超过 maxRetry 才降级；
+//   · 降级/隐藏/卸载都必经 close()：清引用 + 关闭连接 + 通知调用方（轮询回到 15s）。
+export function createLiveChannel (options = {}) {
+  const {
+    EventSourceCtor,
+    doc,
+    url = '/api/stream',
+    maxRetry = 3,
+    onTick = () => {},
+    onChange = () => {}
+  } = options
+  let es = null
+  let retries = 0
+  let up = false
+  let disposed = false
+  const set = (next) => {
+    if (next === up) return
+    up = next
+    onChange(up)
+  }
+  const visible = () => !doc || doc.visibilityState !== 'hidden'
+  // EventSource.CONNECTING === 0（规范常量）。宿主没给构造器常量时按 0 兜底——它与
+  // 「正在自动重连」同义，宁可多给浏览器一次机会，也不在重连窗口里提前降级。
+  const connectingState = () => {
+    const c = EventSourceCtor && EventSourceCtor.CONNECTING
+    return typeof c === 'number' ? c : 0
+  }
+  const close = () => {
+    const cur = es
+    es = null
+    retries = 0
+    if (cur !== null) {
+      try { cur.close() } catch (e) { /* 已断开 */ }
+    }
+    set(false)
+  }
+  const open = () => {
+    if (disposed || es !== null) return false
+    if (typeof EventSourceCtor !== 'function' || !visible()) return false
+    let src
+    try { src = new EventSourceCtor(url) } catch (e) { return false }
+    es = src
+    src.onopen = () => { retries = 0; set(true) }
+    // 服务端 tick 是具名事件（event: tick），onmessage 收不到——与详情流 reset/done 同一条纪律。
+    src.addEventListener('tick', () => { retries = 0; set(true); onTick() })
+    src.onerror = () => {
+      if (src !== es) return // 已被关闭/替换的旧连接：迟到的 error 不得影响当前状态
+      retries += 1
+      if (retries <= maxRetry && src.readyState === connectingState()) return
+      close()
+    }
+    return true
+  }
+  const onVisibility = () => {
+    if (disposed) return
+    if (!visible()) { close(); return }
+    // 回到前台立刻重连并补拉一次：隐藏期间漏的帧不会补发（这条流不带游标）。
+    if (open()) onTick()
+  }
+  if (doc && typeof doc.addEventListener === 'function') doc.addEventListener('visibilitychange', onVisibility)
+  const dispose = () => {
+    disposed = true
+    if (doc && typeof doc.removeEventListener === 'function') doc.removeEventListener('visibilitychange', onVisibility)
+    close()
+  }
+  return { open, close, dispose, isOpen: () => es !== null, isUp: () => up }
 }

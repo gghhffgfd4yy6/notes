@@ -988,3 +988,12 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 条件请求从 3 个端点扩到 7 个：`/api/trends`、`/api/run-history`、`/api/cache-health`、`/api/config` 也发 ETag/304（`Cache-Control: no-store` 不变）；前端 `COND_CACHE` 8→16，304 但本地无副本时自动去掉 `If-None-Match` 重取一次，不再显示「加载失败」。`/api/status` 与 `/api/sys` 仍不发 ETag。
 - 测试：控制台套件 264 通过；变异矩阵 part11 随文件增长改为 5801-6326。
 - 版本 3.373.0。
+
+## v3.374 — 控制台：列表页 SSE / 切页动效 / 信任设备 / 自动部署
+
+- 列表页从 15s 轮询改成 SSE 通知 + 条件拉取：新增 `GET /api/stream`（鉴权与其它 `/api` 同口径、`text/event-stream` + `no-store`、20s 心跳、最多 20 条连接）；服务端每 2s 读一次轻量指纹（run.log / push.json 的 size+mtime、auto 状态、运行中 id），变了才广播 `tick`，没变化零帧。前端一条 `EventSource`，收到 `tick` 走既有条件请求（304 零正文）；在线期间 15s 轮询降为 60s 兜底，断线 3 次降级回 15s，页面隐藏时断开、可见立刻重连并补拉。手机不再每 15s 醒一次，变化秒级到达。
+- 切页接入 View Transitions：支持 `document.startViewTransition` 且未开「减少动效」时，页签切换走浏览器原生过渡（CSS 淡入 + 位移），否则同步换页；preact 的 flush 在微任务里，所以更新回调用两次 `await` 微任务而不是 `requestAnimationFrame`（后者会饿死过渡、Chrome 4s 后 abort）。不引框架、不加依赖。
+- 信任设备（「记住这台设备」）：纯 IP 部署下 WebAuthn 的 RP ID 不合法、Passkey 注册不了，改用 90 天设备 Cookie 达到同样体验。登录页默认勾选，2FA 通过后签发 `xbk_device`（HttpOnly / Secure / SameSite=Lax）；服务端只存 secret 的 sha256，最多 20 台、淘汰最久未用，命中即视为已过第二因子并补发会话 Cookie；新增 `POST /api/devices/revoke` 与系统页「退出所有信任设备」；关闭 / 重配 2FA 清空设备列表；损坏 JSON 按空列表处理并留 `.bak`。
+- 拉取式自动部署：`scripts/auto-deploy.sh` + `deploy/xbk-deploy.{service,timer}`，每 2 分钟 `fetch origin main`，有更新且无任务在跑时 `checkout -f` → 重启 → 轮询 `/api/sys` 直到版本等于 `package.json`（30s）；失败回滚旧 sha、重启、复验后退出 1。`flock` 单飞，`--check` / `--dry-run` 只读；SSH 私钥不进 GitHub Actions。
+- 测试与门禁：控制台套件 277 通过；`console.js` 涨到 6732 行，变异矩阵按 700 行硬上限新开 `console-part12`（5801-6500 / 6501-6732），矩阵共 32 段（28 TAP + 4 command）。
+- 版本 3.374.0。

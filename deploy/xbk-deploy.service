@@ -1,0 +1,21 @@
+[Unit]
+Description=xbk-push 拉取式自动部署（fetch → 无任务在跑时 checkout + restart）
+Documentation=file:/home/ubuntu/notes-live/README.md
+After=network-online.target xbk-console.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/notes-live
+# 部署脚本从 DEPLOY_ENV_FILE 自己取 token 探活（/api/status、/api/sys）。
+# 这里刻意不用 EnvironmentFile：.console.env 里还有推送渠道等与部署无关的凭证，没必要进部署环境。
+Environment=DEPLOY_DIR=/home/ubuntu/notes-live
+Environment=SERVICE=xbk-console
+Environment=HEALTH_URL=http://127.0.0.1:7777/api/sys
+Environment=DEPLOY_ENV_FILE=/home/ubuntu/notes/.console.env
+# 健康检查 30s + 重启 + 回滚复验，正常路径 10s 内结束，给足余量后由 systemd 兜底。
+TimeoutStartSec=180
+Nice=10
+ExecStart=/bin/bash /home/ubuntu/notes-live/scripts/auto-deploy.sh

@@ -3,7 +3,7 @@
 // 系统 / 文件 / 配置 / 过滤规则。只依赖 components.js 与基础模块，不认识 App，也没有顶层副作用。
 // 顺序在 ui.js 之前（App 在 ui.js 里 import 这些面板）。
 import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from './constants.js'
-import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
+import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
 import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, isEncryptedBackup, logLineCounts, logLineTone, splitHits } from './pure.mjs'
@@ -3245,6 +3245,22 @@ function TwoFactorBlock ({ active = true }) {
       setBusy('')
     }
   }
+  // 「退出所有信任设备」（v3.374）：清空服务端列表并让这台浏览器的设备 Cookie 失效，
+  // 之后每台设备（包括当前这台）下次打开都要重新输验证码。
+  const revokeDevices = async () => {
+    if (busy !== '') return
+    setBusy('revoke'); setErr(''); setNote('')
+    try {
+      const res = await apiPostDevicesRevoke()
+      if (!res.ok) throw new Error(messageOf(res))
+      setStatus((prev) => ({ ...(prev || {}), trustedDevices: 0 }))
+      setNote('所有信任设备都已退出。下次在任何设备上打开控制台，都要重新输验证码。')
+    } catch (e) {
+      setErr(`退出信任设备失败：${e && e.message ? e.message : e}`)
+    } finally {
+      setBusy('')
+    }
+  }
   const copyText = async (text) => {
     try {
       if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') throw new Error('浏览器不支持复制')
@@ -3285,6 +3301,10 @@ function TwoFactorBlock ({ active = true }) {
     ${status && status.enabled && html`<div class="twofa-row">
       <div><span class="twofa-on">已开启</span> <span class="cfg-block-sub">恢复码剩余 ${status.recoveryRemaining || 0} 个</span></div>
       <${Button} variant="danger" disabled=${busy !== ''} onClick=${() => { setDisableOpen(true); setDisableCode('') }}>关闭两步验证<//>
+    </div>`}
+    ${status && status.enabled && html`<div class="twofa-row">
+      <div class="cfg-block-sub">已记住 ${status.trustedDevices || 0} 台设备。勾了「记住这台设备」的浏览器，90 天内打开控制台不用再输验证码；最多记 20 台，满了自动把最久没用的挤掉。</div>
+      <${Button} variant="secondary" disabled=${busy !== '' || !(status.trustedDevices > 0)} onClick=${revokeDevices}>${busy === 'revoke' ? '退出中…' : '退出所有信任设备'}<//>
     </div>`}
     ${disableOpen && html`<div class="twofa-setup">
       <div class="twofa-step">关闭前先输一次当前验证码（或恢复码）：</div>

@@ -67,6 +67,8 @@ const {
   clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
   RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS,
+  // v3.374 全站 SSE 通知（/api/stream）：常量走导出，用例不自己写死 2s/20s/20
+  SSE_STREAM_TICK_MS, SSE_STREAM_HEARTBEAT_MS, SSE_STREAM_MAX_CONNECTIONS,
   REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE,
   // v3.340 控制台设置（通知自检拦截窗）：常量走导出，测试不自己写死 0/3600
   CONSOLE_SETTINGS_FILE, CONSOLE_SETTINGS_DEFAULT_S, NOTIFY_REPLAY_MIN_S, NOTIFY_REPLAY_MAX_S,
@@ -82,6 +84,10 @@ const {
   base32Encode, base32Decode, generateTotpSecret, totpQrDataUrl, totpCodeAt, verifyTotpCode,
   generateRecoveryCodes, recoveryRecordOf, consumeRecoveryCode,
   makeTwoFactorCookie, verifyTwoFactorCookie, loadTwoFactorState, TWO_FACTOR_FILE,
+  // v3.374 信任设备：签发/校验纯函数 + 落盘读写
+  DEVICE_FILE, DEVICE_COOKIE, DEVICE_TTL_MS, DEVICE_MAX,
+  makeDeviceRecord, parseDeviceCookie, trustedDeviceOf, appendDeviceRecord,
+  readDeviceStore, writeDeviceStore, hashDeviceSecret,
   // v3.370 线报全站搜索：解析/归一纯函数 + 关注词文件常量
   decodeLineHtml, parseLineStamp, clampLineQuery, normalizeWatchWord, parseLineSearchHtml,
   readLineWatchWords, readWatchState, saveWatchState, formatWatchPush,
@@ -672,6 +678,9 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
     [['GET', '/api/status', 200], false],
     [['GET', '/api/status', 500], true],
     [['GET', '/api/runs', 200], false],
+    // v3.374：全站通知流是长连接，finish 时 ms=整段连接时长——照记会污染「慢请求」读数
+    [['GET', '/api/stream', 200], false],
+    [['GET', '/api/stream', 401], true],
     [['GET', '/api/runs/1750000000000.9', 200], false],
     [['GET', '/api/runs/1750000000000.9', 404], true],
     [['POST', '/api/runs/detail', 200], false],
@@ -757,6 +766,10 @@ ok('T-P2 SSE 常量与 RUN_ID_RE 形态', () => {
   assert.strictEqual(SSE_MAX_PENDING, 1048576)
   assert.strictEqual(SSE_TICK_MS, 500)
   assert.strictEqual(SSE_HEARTBEAT_MS, 15000)
+  // v3.374 全站通知流：2s 采样 / 20s 心跳 / 20 条上限（字面量锁死文档承诺，不引用常量自证）
+  assert.strictEqual(SSE_STREAM_TICK_MS, 2000)
+  assert.strictEqual(SSE_STREAM_HEARTBEAT_MS, 20000)
+  assert.strictEqual(SSE_STREAM_MAX_CONNECTIONS, 20)
   assert.strictEqual(RUN_ID_RE.test('1750000000000.1'), true)
   assert.strictEqual(RUN_ID_RE.test('abc'), false)
   assert.strictEqual(RUN_ID_RE.test('1750.1'), false)
@@ -954,8 +967,10 @@ function sseCollect (port, urlPath, { headers } = {}) {
   let raw = ''
   let ended = false
   let resRef = null
+  let resHeaders = null
   const req = http.request({ host: '127.0.0.1', port, path: urlPath, headers: headers || {} }, (res) => {
     resRef = res
+    resHeaders = res.headers
     res.setEncoding('utf8')
     res.on('data', (c) => {
       raw += c
@@ -1004,7 +1019,7 @@ function sseCollect (port, urlPath, { headers } = {}) {
     }
     return resRef !== null
   }
-  return { events, waitFor, close, pause, resume, ready, isEnded: () => ended }
+  return { events, waitFor, close, pause, resume, ready, isEnded: () => ended, headers: () => resHeaders }
 }
 // 注入式 fake record（cancel 用例同先例）+ 与生产 append 同语义的测试追加器
 // （output 与 outputTotalLength 必须同步——镜像生产约束）。
@@ -5062,6 +5077,245 @@ async function main () {
     assert.strictEqual(get.outputTotalLength, detail.outputTotalLength, 'GET 详情响应体等价')
     server.close()
   })
+  // ── v3.374 全站 SSE 通知（/api/stream）：变化才推、连接上限、收尾不挂 ──
+  // 只读响应头就返回的建连器：这条流永不 end（靠心跳与 tick），request() 会一直等下去。
+  const openLiveStream = (port) => new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path: '/api/stream',
+      headers: { authorization: 'Bearer ' + TOKEN }
+    }, (res) => {
+      res.on('data', () => {}) // 保持流动，别让内核缓冲把服务端 write 卡成 false
+      resolve({ status: res.statusCode, headers: res.headers, destroy: () => { try { req.destroy() } catch (e) { /* 已断 */ } } })
+    })
+    req.on('error', reject)
+    req.end()
+  })
+  const until = async (fn, ms = 3000) => {
+    const to = Date.now() + ms
+    while (Date.now() < to) {
+      if (fn()) return true
+      await new Promise((_resolve) => setTimeout(_resolve, 20))
+    }
+    return fn()
+  }
+  await aok('全站 SSE S1 鉴权与响应头：无/错凭证 401；会话 Cookie 放行；event-stream + no-store + x-accel-buffering', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const noAuth = await request(port, 'GET', '/api/stream')
+    assert.strictEqual(noAuth.status, 401, '无凭证必须 401（不升级连接）')
+    const badAuth = await request(port, 'GET', '/api/stream?token=' + 'y'.repeat(32))
+    assert.strictEqual(badAuth.status, 401, '错凭证必须 401')
+    const sse = sseCollect(port, '/api/stream', { headers: { cookie: `xbk_session=${TOKEN}` } })
+    assert.strictEqual(await sse.ready(), true, '会话 Cookie 必须放行（原生 EventSource 带不了 Bearer）')
+    const h = sse.headers()
+    assert.ok(String(h['content-type']).startsWith('text/event-stream'), 'content-type 前缀 event-stream')
+    assert.strictEqual(h['cache-control'], 'no-store', '带鉴权的流不得允许缓存存储（no-store 而非 no-cache）')
+    assert.strictEqual(h['x-accel-buffering'], 'no', '必须禁反向代理缓冲，否则 tick 要等代理攒满')
+    sse.close()
+    server.close()
+  })
+  await aok('全站 SSE S2 变化才推：写 run.log ≤3s 收到 tick（具名事件 + 毫秒时间戳）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const sse = sseCollect(port, '/api/stream', { headers: { authorization: 'Bearer ' + TOKEN } })
+    assert.strictEqual(await sse.ready(), true, '建连成功')
+    fs.appendFileSync(path.join(dir, 'run.log'), '2026-10-26 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1.0s cachesaved=1\n')
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'tick', 3000), true, '写 run.log 后 ≤3s 必须收到 tick')
+    const frame = sse.events.find((e) => e.event === 'tick')
+    const payload = JSON.parse(frame.data)
+    assert.strictEqual(typeof payload.at, 'number', 'tick 载荷必须带毫秒时间戳')
+    assert.ok(Math.abs(Date.now() - payload.at) < 60000, '时间戳必须是当前时刻（不是恒定的假值）')
+    sse.close()
+    server.close()
+  })
+  await aok('全站 SSE S3 无变化不刷帧；三类指纹各自触发 tick（注入 60ms 采样）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir, sseStreamTickMs: 60 })
+    const port = await listen(server)
+    const sse = sseCollect(port, '/api/stream', { headers: { authorization: 'Bearer ' + TOKEN } })
+    assert.strictEqual(await sse.ready(), true, '建连成功')
+    const tickCount = () => sse.events.filter((e) => e.event === 'tick').length
+    // 空转：注入 60ms 采样，500ms 里已跑了十几轮，但四项指纹都没变 ⇒ 一帧 tick 都不该发
+    // （心跳注释帧不算事件）。反例：把判据写成「每拍都发」这条会立刻红。
+    await new Promise((_resolve) => setTimeout(_resolve, 500))
+    assert.strictEqual(tickCount(), 0, '无变化不得刷 tick（否则只是把 15s 轮询换成 2s 轮询）')
+    // 逐个指纹源都得能独立触发：漏一项就等于「那类变化永远要等 60s 安全轮询」。
+    for (const [label, mutate] of [
+      ['push.json', () => fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: '新推送' }]))],
+      // runs 是模块级 Map（跨实例共享，历史用例也往里塞同 id 记录）——这里必须用独占 id，
+      // 否则「运行中 id 集合」本来就有它，加了等于没加，指纹不变。
+      ['运行中 id', () => runs.set('1750000999999.7', makeStreamRecord('1750000999999.7'))],
+      ['auto 状态文件', () => fs.writeFileSync(path.join(dir, 'console-auto.json'), JSON.stringify({ on: true, interval: 5, updatedAt: Date.now() }))]
+    ]) {
+      const before = tickCount()
+      mutate()
+      assert.strictEqual(await sse.waitFor(() => tickCount() > before, 2000), true, `${label} 变化必须推 tick`)
+    }
+    sse.close()
+    server.close()
+  })
+  await aok('全站 SSE S4 共享采样 + 连接上限：一条写两个连接各收一帧；第 21 条 503；全关后采样器停', async () => {
+    const dir = tmpDir()
+    // 注入 60ms 采样：两个连接必须收到「同一拍」的一帧，共享的意思是只读一次盘而不是各推一份。
+    const { server, streamClients, streamSamplerActive } = createConsole({ token: TOKEN, stateDir: dir, sseStreamTickMs: 60 })
+    const port = await listen(server)
+    const a = sseCollect(port, '/api/stream', { headers: { authorization: 'Bearer ' + TOKEN } })
+    const b = sseCollect(port, '/api/stream', { headers: { authorization: 'Bearer ' + TOKEN } })
+    assert.strictEqual(await a.ready(), true)
+    assert.strictEqual(await b.ready(), true)
+    assert.strictEqual(streamSamplerActive(), true, '有连接时必须起共享采样器')
+    fs.appendFileSync(path.join(dir, 'run.log'), 'x=1\n')
+    assert.strictEqual(await a.waitFor((e) => e.event === 'tick', 3000), true, '连接 A 收到 tick')
+    assert.strictEqual(await b.waitFor((e) => e.event === 'tick', 3000), true, '连接 B 收到同一帧（共享采样）')
+    assert.strictEqual(a.events.filter((e) => e.event === 'tick').length, 1, '一次变化只推一帧（A）')
+    assert.strictEqual(b.events.filter((e) => e.event === 'tick').length, 1, '一次变化只推一帧（B）')
+    // 补到 20 条再试第 21 条：上限值取实现常量，改小/改大都得同步这里的语义。
+    const extra = []
+    while (streamClients.size < SSE_STREAM_MAX_CONNECTIONS) {
+      const c = await openLiveStream(port)
+      assert.strictEqual(c.status, 200, '上限内必须 200')
+      extra.push(c)
+    }
+    assert.strictEqual(streamClients.size, 20, '满员 20 条')
+    // 超限探测必须只读响应头：万一把闸写错成放行，request() 会一直等这条永不完结的流，
+    // 用例只能等满 25s 超时才报错（红线退化时会变成「超时」而不是清晰的 503 断言）。
+    const over = await openLiveStream(port)
+    assert.strictEqual(over.status, 503, '第 21 条必须立刻 503')
+    over.destroy() // 200 也照断：断言已失败，别把连接留到用例超时
+    // 关 1 条腾出位置：仍可再开（上限是动态计数，不是「一辈子 20 条」）
+    extra[0].destroy()
+    assert.strictEqual(await until(() => streamClients.size < SSE_STREAM_MAX_CONNECTIONS), true, '关连接后 Set 摘除')
+    const reopen = await openLiveStream(port)
+    assert.strictEqual(reopen.status, 200, '腾出位置后可再开')
+    reopen.destroy()
+    for (const c of extra) c.destroy()
+    a.close()
+    b.close()
+    assert.strictEqual(await until(() => streamClients.size === 0), true, '全部断开后 Set 归零')
+    assert.strictEqual(await until(() => streamSamplerActive() === false), true, '最后一个连接走掉必须停采样定时器')
+    server.close()
+  })
+  await aok('全站 SSE S5 收尾：server.close() 主动断开在途流（客户端收到 end，不留悬挂句柄）', async () => {
+    const dir = tmpDir()
+    const { server, streamClients, streamSamplerActive } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const sse = sseCollect(port, '/api/stream', { headers: { authorization: 'Bearer ' + TOKEN } })
+    assert.strictEqual(await sse.ready(), true, '建连成功')
+    assert.strictEqual(streamClients.size, 1)
+    server.close()
+    assert.strictEqual(streamClients.size, 0, 'close() 必须同步摘掉所有通知流连接')
+    assert.strictEqual(streamSamplerActive(), false, 'close() 必须停采样器（否则测试进程挂住）')
+    assert.strictEqual(await until(() => sse.isEnded()), true, '客户端必须收到流结束（res.end）')
+  })
+  await aok('全站 SSE 前端: pollIntervalFor 降频 + createLiveChannel 连流/重连/降级/可见性（假 EventSource 运行时断言）', async () => {
+    const { createLiveChannel, pollIntervalFor } = await import('./scripts/console-assets/pure.mjs')
+    // 间隔口径用字面量锁死：SSE 在线 60s 安全轮询、断线 15s、任务在跑 2s。
+    const base = { pollMs: 15000, busyMs: 2000, safetyMs: 60000 }
+    assert.strictEqual(pollIntervalFor({ ...base, sseUp: false, busy: false }), 15000, '断线走 15s 轮询')
+    assert.strictEqual(pollIntervalFor({ ...base, sseUp: true, busy: false }), 60000, 'SSE 在线降为 60s 安全轮询')
+    assert.strictEqual(pollIntervalFor({ ...base, sseUp: true, busy: true }), 2000, '任务在跑仍用快轮询（SSE 是补充不是替代）')
+    assert.strictEqual(pollIntervalFor({ ...base, sseUp: false, busy: true }), 2000)
+    // 假 EventSource：记录 url / close / 事件分发；假 document：可控可见性 + 事件派发。
+    const made = []
+    class FakeEventSource {
+      constructor (url) {
+        this.url = url
+        this.readyState = 0 // CONNECTING
+        this.closed = false
+        this.listeners = {}
+        made.push(this)
+      }
+
+      addEventListener (name, fn) { (this.listeners[name] = this.listeners[name] || []).push(fn) }
+      close () { this.closed = true; this.readyState = 2 }
+      emit (name) { for (const fn of [...(this.listeners[name] || [])]) fn({}) }
+    }
+    FakeEventSource.CONNECTING = 0
+    FakeEventSource.OPEN = 1
+    const doc = {
+      visibilityState: 'visible',
+      listeners: [],
+      addEventListener (name, fn) { if (name === 'visibilitychange') this.listeners.push(fn) },
+      removeEventListener (name, fn) { this.listeners = this.listeners.filter((x) => x !== fn) },
+      flip (state) { this.visibilityState = state; for (const fn of [...this.listeners]) fn() }
+    }
+    const ticks = []
+    const states = []
+    const ch = createLiveChannel({
+      EventSourceCtor: FakeEventSource,
+      doc,
+      onTick: () => ticks.push(Date.now()),
+      onChange: (up) => states.push(up)
+    })
+    assert.strictEqual(ch.open(), true, '可见时建流')
+    assert.strictEqual(made.length, 1, '只建一条 EventSource')
+    assert.strictEqual(made[0].url, '/api/stream', 'URL 是相对字面量且不带 token（凭证走会话 Cookie）')
+    assert.ok(!made[0].url.includes('token'), 'URL 不得携带凭证（会进浏览器历史/代理日志）')
+    assert.strictEqual(ch.open(), false, 'open 幂等：重复调用不得叠第二条流')
+    assert.strictEqual(made.length, 1)
+    // onopen → 在线态（60s 降频的依据）；tick 帧是具名事件，必须真的触发一次拉取。
+    const es = made[0]
+    es.readyState = FakeEventSource.OPEN
+    es.onopen()
+    assert.deepStrictEqual(states, [true], 'open 后进入在线态')
+    es.emit('tick')
+    assert.strictEqual(ticks.length, 1, 'tick 帧触发一次 refresh')
+    // 断线：仍在 CONNECTING 且未超 3 次 → 交给浏览器自带重连（立刻 close 会丢掉退避/续传）。
+    es.readyState = FakeEventSource.CONNECTING
+    es.onerror(); es.onerror(); es.onerror()
+    assert.strictEqual(es.closed, false, '重连窗口内不得 close')
+    assert.strictEqual(ch.isUp(), true, '仍按在线处理（轮询保持降频）')
+    es.onerror() // 第 4 次
+    assert.strictEqual(es.closed, true, '超过 3 次才降级关闭')
+    assert.deepStrictEqual(states, [true, false], '降级 → 通知调用方恢复 15s 轮询')
+    assert.strictEqual(ch.isOpen(), false)
+    // 可见性：隐藏断开（不发请求）、可见立刻重连并补拉一次。
+    doc.flip('hidden')
+    assert.strictEqual(made.length, 1, '隐藏时只是断开，不新建流')
+    doc.flip('visible')
+    assert.strictEqual(made.length, 2, '回到可见立刻重连')
+    assert.strictEqual(ticks.length, 2, '重连后补拉一次（隐藏期间漏的帧不补发）')
+    assert.strictEqual(ch.isOpen(), true)
+    // 新连接 open 之后才算「在线」——降频的前提是通道真的通了，不是「我刚发起了连接」。
+    made[1].readyState = FakeEventSource.OPEN
+    made[1].onopen()
+    doc.flip('hidden')
+    assert.strictEqual(made[1].closed, true, '隐藏必须断开（后台标签页不留长连接）')
+    assert.deepStrictEqual(states, [true, false, true, false], '状态序列：在线→降级→重连在线→隐藏离线')
+    // 卸载：摘掉可见性监听 + 关闭连接；之后任何可见性事件都不得再建流。
+    ch.dispose()
+    assert.strictEqual(doc.listeners.length, 0, 'dispose 必须摘掉 visibilitychange 监听')
+    doc.flip('visible')
+    assert.strictEqual(made.length, 2, 'dispose 之后不得再建流')
+    // 迟到事件（旧连接）不得影响当前状态
+    const before = made.length
+    made[0].onerror()
+    assert.strictEqual(made.length, before, '旧连接的迟到 error 不得触发新连接')
+  })
+  await aok('全站 SSE 前端接线: ui.js 单一 effect 管流 + 清理断开 + 间隔走 pollIntervalFor', async () => {
+    const uiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const sseSeg = uiSrc.slice(uiSrc.indexOf('  // 全站 SSE 通知（v3.374）'), uiSrc.indexOf('  // 轮询节奏（Sourcery vvJ）'))
+    assert.ok(sseSeg.length > 0, '必须存在全站 SSE 的独立 effect 段')
+    assert.ok(sseSeg.includes('createLiveChannel({'), '必须复用纯函数里的状态机（不在 App 里手写 EventSource）')
+    assert.ok(sseSeg.includes('onTick: () => { runTickRef.current() }'), 'tick 必须走共享的一拍（条件请求拉取）')
+    assert.ok(sseSeg.includes('return () => channel.dispose()'), 'effect 清理必须断开并摘监听（切页/暂停/卸载都不漏）')
+    assert.ok(sseSeg.includes('if (authExpired || !autoRefresh)'), '暂停与凭证失效都必须停止长连接')
+    assert.ok(sseSeg.includes("document.visibilityState !== 'hidden'"), '隐藏的标签页不建流')
+    const pollSeg = uiSrc.slice(uiSrc.indexOf('  // 轮询节奏（Sourcery vvJ）'), uiSrc.indexOf('  // hash 路由'))
+    assert.ok(pollSeg.includes('pollIntervalFor({ sseUp, busy: locking, pollMs: POLL_MS, busyMs: POLL_BUSY_MS, safetyMs: SSE_HEARTBEAT_MS })'),
+      '轮询间隔必须由 pollIntervalFor 判定（SSE 在线 → 安全轮询）')
+    assert.ok(pollSeg.includes('timerRef.current = setInterval(() => { runTick() }, interval)'),
+      '全页只有一个定时器，且复用同一拍')
+    assert.ok(!pollSeg.includes('new window.EventSource'), '轮询 effect 内不得再建第二条流')
+    // 安全轮询间隔 60s：字面量锁死（不引用常量自证），且必须与「断线 15s」区分开。
+    const consts = await import('./scripts/console-assets/constants.js')
+    assert.strictEqual(consts.SSE_HEARTBEAT_MS, 60000, 'SSE 在线时的安全轮询间隔必须是 60s')
+    assert.strictEqual(consts.POLL_MS, 15000, '断线退回的轮询间隔仍是 15s')
+  })
   await aok('HTTP: GET /api/run-history（轮界模型 / 行号游标 / limit 钳制 / 鉴权）', async () => {
     const dir = tmpDir()
     // 轮界模型（v3.299 评审 #3/#12）：失败行在**同轮**摘要行之前紧邻出现（生产写序
@@ -6186,7 +6440,7 @@ async function main () {
       '非概览/日志页必须每拍推进共享 tick')
     assert.ok(src.includes('if (!active || justActivated || !(pollTick > 0) || busyRef.current) return'),
       '轮询重拉必须单飞：上一拍还没回来时跳过，否则慢接口会互相作废响应')
-    assert.ok(/\[refreshSplit, locking, tab, autoRefresh, authExpired\]/.test(src), '轮询 effect 必须随 tab / 暂停开关 / 凭证失效状态变化重跑')
+    assert.ok(/\[refreshSplit, locking, tab, autoRefresh, authExpired, sseUp, runTick\]/.test(src), '轮询 effect 必须随 tab / 暂停开关 / 凭证失效 / SSE 在线态变化重跑')
     // 四个页面的面板都要消费这个 tick，否则只是数字在动、数据不动。
     // v3.349：重拉统一走 usePollReload（单飞：上一拍没回来就跳过，慢接口不会互相作废）。
     for (const [fn, call] of [
@@ -6548,9 +6802,15 @@ async function main () {
     const runs = src.slice(src.indexOf('function RunsPanel'), src.indexOf('// ── 组件：逐轮运行历史'))
     assert.ok(runs.includes("if (document.visibilityState === 'hidden') return"), '触发详情在后台必须跳过请求')
     assert.ok(runs.includes("document.addEventListener('visibilitychange', onVisibility)"), '切回前台必须补一拍')
-    const pollBlock = src.slice(src.indexOf('const interval = locking ? POLL_BUSY_MS : POLL_MS'),
-      src.indexOf('}, [refreshSplit, locking, tab, autoRefresh, authExpired])'))
-    assert.ok(pollBlock.includes('if (document.hidden) return'), '概览主轮询在后台必须跳过（tick 整拍不发）')
+    // v3.374：后台跳过判断随「共享一拍」搬到 runTick（SSE tick 与定时器走同一份逻辑），
+    // 定时器只剩一个，且必须复用 runTick——两套节流各自为政就是「后台还在发请求」。
+    const tickBlock = src.slice(src.indexOf('const runTick = useCallback('),
+      src.indexOf('const runTickRef = useRef(runTick)'))
+    assert.ok(tickBlock.includes('if (document.hidden) return'), '概览主轮询在后台必须跳过（tick 整拍不发）')
+    const pollBlock = src.slice(src.indexOf('const interval = pollIntervalFor({ sseUp'),
+      src.indexOf('}, [refreshSplit, locking, tab, autoRefresh, authExpired, sseUp, runTick])'))
+    assert.ok(pollBlock.includes('setInterval(() => { runTick() }, interval)'),
+      '全页只此一个定时器：SSE tick 复用 runTick，不得另建 interval')
   })
 
   await aok('结构红线: 标签页吸顶、切页回顶、缓存每分钟刷新', () => {
@@ -6572,8 +6832,12 @@ async function main () {
     assert.ok(prepBlock.includes('const firstVisit = !enteredRef.current.has(next)'),
       '必须先判断目标页是否真正点开过（预挂载不算），再决定是否垫高')
     const prepPos = switchBlock.indexOf('prepareScroll(next)')
-    const tabPos = switchBlock.indexOf('setTab(next)')
-    assert.ok(prepPos > -1 && prepPos < tabPos, '必须先 prepareScroll 再 setTab')
+    const renderPos = switchBlock.indexOf('renderTab(next)')
+    assert.ok(prepPos > -1 && renderPos > -1 && prepPos < renderPos,
+      '必须先 prepareScroll 再触发重渲染（重渲染收口在 renderTab，setTab 在它内部）')
+    const renderBlock = src.slice(src.indexOf('const renderTab = (next) =>'), src.indexOf('renderTabRef.current = renderTab'))
+    assert.ok(renderBlock.includes('setTab(next)') && !renderBlock.includes('prepareScroll'),
+      '切页渲染出口只负责换页（滚动记忆/垫高必须留在包外，先记位置再换）')
     const syncPos = scrollBlock.indexOf('window.scrollTo(0, y)')
     const rafPos = scrollBlock.indexOf('requestAnimationFrame')
     assert.ok(syncPos > -1 && (rafPos === -1 || syncPos < rafPos),
@@ -6607,11 +6871,13 @@ async function main () {
     const sysBlock = src.slice(src.indexOf('const markSysReady'), src.indexOf('const onSysReady'))
     assert.ok(sysBlock.includes('syncMemRef.current.sys = ts') && sysBlock.includes('setPanelReadyAt(performance.now())'),
       '系统页两个面板都完成时必须缓存 sys 时间并写 ready 标记')
-    const switchSyncBlock = src.slice(src.indexOf('const doSwitchTab ='), src.indexOf('const openLog = useCallback'))
-    assert.ok(switchSyncBlock.includes('showSyncFor(next)'), '页签点击必须同步切到目标页缓存时间')
+    assert.ok(renderBlock.includes('showSyncFor(next)') &&
+      renderBlock.indexOf('showSyncFor(next)') < renderBlock.indexOf('setTab(next)'),
+    '页签点击必须同步切到目标页缓存时间（重渲染出口里先换「数据截至」再换页）')
     const hashStart = src.lastIndexOf('const onHash =')
     const hashSyncBlock = src.slice(hashStart, src.indexOf("window.addEventListener('hashchange'", hashStart))
-    assert.ok(hashSyncBlock.includes('showSyncFor(next)'), '后退/前进必须同步切到目标页缓存时间')
+    assert.ok(hashSyncBlock.includes('renderTabRef.current(next)'),
+      '后退/前进必须走同一个渲染出口（showSyncFor / markVisited / setTab 收口在 renderTab，不得各写一份）')
     const openLogSyncBlock = src.slice(src.indexOf('const openLog ='), src.indexOf('const pollMs ='))
     assert.ok(openLogSyncBlock.includes("showSyncFor('logs')"), '查看日志必须切到 logs 的缓存时间')
     assert.ok(src.includes('const loadSeqRef = useRef(0)') &&
@@ -6973,6 +7239,142 @@ async function main () {
     assert.strictEqual(motionAllowed(false), true, '未开启时必须允许动效')
     assert.strictEqual(motionAllowed(undefined), true, '取不到 media query（老浏览器/测试环境）时按允许处理')
     assert.strictEqual(motionAllowed(null), true, 'matchMedia 缺失时不得把动效全关掉')
+  })
+
+  await aok('行为: canViewTransition（有/无 startViewTransition × 动效开/关，四种输入都要判对）', async () => {
+    const { canViewTransition } = await import('./scripts/console-assets/pure.mjs')
+    const doc = { startViewTransition: () => ({}), documentElement: {} }
+    assert.strictEqual(canViewTransition(doc, true), true, '宿主有 startViewTransition + 动效开 + 有根元素 ⇒ 才允许')
+    assert.strictEqual(canViewTransition({ documentElement: {} }, true), false, '没有这个 API（旧 Safari / 老 WebView）必须降级')
+    assert.strictEqual(canViewTransition({ startViewTransition: 'placeholder', documentElement: {} }, true), false,
+      '同名但不是函数也必须降级（壳浏览器塞的占位属性不能靠 in 判断骗过去）')
+    assert.strictEqual(canViewTransition(doc, false), false, '系统开了「减少动效」必须降级（页面不许再淡）')
+    assert.strictEqual(canViewTransition(doc, undefined), false, '动效开关取不到时按「不动」处理（fail-safe）')
+    assert.strictEqual(canViewTransition({ startViewTransition: () => ({}), documentElement: null }, true), false,
+      '没有 documentElement 就无法命名 root 快照，必须降级')
+    assert.strictEqual(canViewTransition(null, true), false, '拿不到 document 时返回 false，不能抛')
+  })
+
+  await aok('行为: runViewTransition（先起过渡、再渲染、再等微任务；拿不到能力就同步渲染且只渲染一次）', async () => {
+    const { runViewTransition } = await import('./scripts/console-assets/pure.mjs')
+    // 假 document：只记顺序，不碰真 DOM（纯函数模块不该要求 DOM 存在）。
+    const order = []
+    let pending = null
+    let renders = 0
+    const doc = {
+      documentElement: {},
+      startViewTransition (cb) {
+        order.push('startViewTransition')
+        pending = cb
+        return { finished: Promise.resolve(), updateCallbackDone: Promise.resolve() }
+      }
+    }
+    const t = runViewTransition(doc, true, (via) => {
+      renders++
+      order.push(via === true ? 'render:vt' : 'render:plain')
+    })
+    assert.ok(t, '有能力时必须返回 transition 句柄（调用方据此判断有没有降级）')
+    assert.deepStrictEqual(order, ['startViewTransition'], '必须先起过渡；渲染只能发生在它的回调里')
+    assert.strictEqual(renders, 0, '回调还没跑，此时不得渲染（否则浏览器抓到的「旧页」快照已经变了）')
+    await pending()
+    assert.deepStrictEqual(order, ['startViewTransition', 'render:vt'],
+      '顺序必须是：起过渡 → 同步渲染（之后的微任务等待在纯函数内部，不排帧）')
+    assert.strictEqual(renders, 1, '一次切页只渲染一次')
+    // 回调被重复触发（浏览器 abort 后重放）也不得补渲染。
+    let pending2 = null
+    let renders2 = 0
+    runViewTransition({ documentElement: {}, startViewTransition (cb) { pending2 = cb; return { finished: Promise.resolve() } } },
+      true, () => { renders2++ })
+    await pending2()
+    await pending2()
+    assert.strictEqual(renders2, 1, '更新回调被调两次也不得重复渲染')
+    // 降级：没有 API ⇒ 同步渲染，不起过渡（页面要立刻换，不能等任何异步）。
+    const plainLog = []
+    const degraded = runViewTransition({ documentElement: {} }, true,
+      (via) => { plainLog.push('render:' + String(via)) })
+    assert.strictEqual(degraded, null, '降级时必须返回 null（不能假装起过过渡）')
+    assert.deepStrictEqual(plainLog, ['render:false'], '降级路径同步渲染，且不让页面级入场让位')
+    // 动效关：连 startViewTransition 都不许调。
+    let called = 0
+    const reducedLog = []
+    const reduced = runViewTransition(
+      { documentElement: {}, startViewTransition () { called++; return { finished: Promise.resolve() } } }, false,
+      () => { reducedLog.push('render') })
+    assert.strictEqual(reduced, null, '关动效时必须返回 null')
+    assert.strictEqual(called, 0, 'prefers-reduced-motion 下不得起过渡')
+    assert.deepStrictEqual(reducedLog, ['render'], '关动效时直接换页')
+    // 过渡起不来（浏览器同步抛错）：补一次普通渲染，切页不能停在旧页。
+    let fallback = 0
+    const threw = runViewTransition(
+      { documentElement: {}, startViewTransition () { throw new Error('InvalidStateError') } }, true,
+      () => { fallback++ })
+    assert.strictEqual(threw, null, '起过渡失败必须走降级路径')
+    assert.strictEqual(fallback, 1, '失败后必须补一次渲染（否则点了没反应）')
+    // 连点：上一段过渡被 skip/abort ⇒ ready 与 finished 都拒绝。只挂吞掉的 catch，
+    // 绝不 await（await 会把点击卡住）。updateCallbackDone 被访问就 throw：
+    // 证明我们没有给它挂 catch（更新回调里的异常不许被吞）。
+    let catchCalls = 0
+    const promiseLike = () => ({
+      then () {},
+      catch (fn) {
+        catchCalls++
+        assert.strictEqual(typeof fn, 'function', 'ready/finished 的 catch 要收一个函数')
+        return promiseLike()
+      }
+    })
+    const returned = runViewTransition({
+      documentElement: {},
+      startViewTransition () {
+        return { ready: promiseLike(), finished: promiseLike(), get updateCallbackDone () { throw new Error('不得给 updateCallbackDone 挂 catch：更新回调里的异常必须露出来') } }
+      }
+    }, true, () => {})
+    assert.ok(returned, 'abort 场景下照样返回句柄（调用方只看有没有过渡）')
+    assert.strictEqual(catchCalls, 2, 'ready 与 finished 各挂一个 catch：连点 skip/abort 属预期路径，不能刷未处理拒绝')
+  })
+
+  await aok('结构红线: 切页接入原生 View Transitions（接线 + 只用 opacity + reduced-motion 全关）', () => {
+    // CSS：剥掉注释再断言，注释里写示例块 / 把真块整段注释掉都不能骗过门禁。
+    const cssRaw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const css = cssRaw.replace(/\/\*[\s\S]*?\*\//g, '')
+    assert.ok(css.length < cssRaw.length, 'CSS 注释剥离必须真的生效（否则本断言恒真）')
+    assert.ok(css.includes('::view-transition-old(root)') && css.includes('::view-transition-new(root)'),
+      '必须有 root 新旧快照的伪元素规则，否则时长/曲线全由浏览器默认决定')
+    const pair = (css.match(/::view-transition-old\(root\),\s*::view-transition-new\(root\)\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/animation-duration:\s*220ms/.test(pair), '淡出淡入必须 220ms（与 motion.js 的 MOTION.fast 同档）')
+    assert.ok(/animation-timing-function:\s*ease-out/.test(pair), '曲线必须是 ease-out')
+    assert.ok(!/::view-transition[^{]*\{[^}]*\btransform\s*:/.test(css),
+      '快照过渡里不得出现 transform —— 页面里有 position:fixed 的弹层，祖先一有 transform 就按它定位')
+    const page = (css.match(/\.page\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(page && !/transform\s*:/.test(page), '.page 不得有 transform / transform 过渡')
+    const reduceIdx = css.indexOf('@media (prefers-reduced-motion: reduce)', css.indexOf('::view-transition-old(root)'))
+    assert.ok(reduceIdx > 0, '必须有一段 prefers-reduced-motion: reduce 把过渡直接关掉')
+    const reduceBody = css.slice(reduceIdx, reduceIdx + 400)
+    assert.ok(reduceBody.includes('::view-transition-old(root)') && /animation:\s*none\s*!important/.test(reduceBody),
+      'reduced-motion 块里必须 animation: none !important（伪元素的默认淡入也要关）')
+    if (process.env.XBK_MUTATION_CHILD !== '1') {
+      // 约定：app.js 只是入口（v3.367 起页面切换在 ui.js），readConsoleSource 拼的就是这份入口源码。
+      const src = readConsoleSource()
+      assert.ok(src.includes('runViewTransition('), '切页必须真的调 runViewTransition——只写 CSS 伪元素不会有任何过渡')
+      assert.ok(/import \{[^}]*\brunViewTransition\b[^}]*\} from '\.\/pure\.mjs'/.test(src),
+        '过渡的判定/收口必须来自 pure.mjs（Node 侧直接测同一份实现）')
+      assert.ok(/runViewTransition\(document, motionOK\(\)/.test(src),
+        '能力判定必须带上 motionOK()：用户关了动效就别起过渡')
+      assert.ok(src.includes('renderTab(next)') && src.includes('renderTabRef.current(next)'),
+        '点击切页与 hash 前进后退必须走同一个渲染出口（两处都包过渡，路由不另开一条路）')
+      assert.ok(/vtDrivenRef\.current = viaTransition/.test(src) && src.includes('if (!root || viaTransition) return'),
+        '过渡驱动的那一帧要跳过页面级入场，否则两套淡入叠加会先淡到发白再回来')
+      assert.ok(!/await\s+[\w.]*finished/.test(src), 'transition.finished 不得 await：连点会 abort，等待会把点击卡住')
+      const pureSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pure.mjs'), 'utf8')
+      const runner = pureSrc.slice(pureSrc.indexOf('export function runViewTransition'),
+        pureSrc.indexOf('// 配置页「过滤规则」块的数据口径'))
+      assert.ok(runner.length > 200, 'runViewTransition 源码切片必须真的取到（否则下面两条恒真）')
+      assert.ok(!/requestAnimationFrame|setTimeout|setInterval/.test(runner),
+        '更新回调里不得等帧/定时器：过渡的 DOM update 阶段 rAF 会被饿死，Chrome 4s 后 abort 整段过渡')
+      assert.ok((runner.match(/await Promise\.resolve\(\)/g) || []).length >= 2,
+        '必须用微任务等 preact 的 flush（setState 就是微任务里刷的），两次兜住连环 setState')
+      const appSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+      assert.ok(!appSrc.includes('startViewTransition'), '首屏挂载不得包过渡：第一帧要立刻出来，不能等快照')
+    }
   })
 
   await aok('行为: morphFrom（弹窗从触发点长出来的几何：等比缩放 / 夹下限 / 量不到尺寸退回 null）', async () => {
@@ -8436,6 +8838,196 @@ async function main () {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  // ── v3.374 信任设备（「记住这台设备」）──────────────────────────────────────
+  await aok('信任设备: 签发→验证、篡改/过期/revoke 后失败、21 台淘汰最旧、2FA 关闭不认', () => {
+    const dir = tmpDir()
+    const now = 1700000000000
+    try {
+      const issued = makeDeviceRecord('Mozilla/5.0 (iPhone)\nX-Evil: 1', now)
+      const cookie = `${issued.record.id}.${issued.secret}`
+      assert.strictEqual(parseDeviceCookie(cookie).id, issued.record.id, 'cookie 值形如 <id>.<secret>')
+      assert.strictEqual(parseDeviceCookie('garbage'), null, '畸形 cookie 直接判无效')
+      assert.strictEqual(parseDeviceCookie(`${issued.record.id}.zzzz`), null, '非 hex secret 判无效')
+      assert.strictEqual(JSON.stringify(issued.record).includes(issued.secret), false, '记录里不得出现 secret 明文')
+      assert.strictEqual(issued.record.ua.includes('\n'), false, 'UA 控制字符被抹掉')
+
+      assert.strictEqual(writeDeviceStore(dir, [issued.record]), true, '设备列表落盘成功')
+      const deviceFile = path.join(dir, DEVICE_FILE)
+      const fd = fs.openSync(deviceFile, 'r')
+      try {
+        assert.strictEqual(fs.fstatSync(fd).mode & 0o777, 0o600, '设备文件 0600')
+        const text = fs.readFileSync(fd, 'utf8')
+        assert.strictEqual(text.includes(issued.secret), false, '磁盘上只有哈希，没有 secret')
+        assert.strictEqual(JSON.parse(text).version, 1, '落盘结构带 version')
+      } finally {
+        fs.closeSync(fd)
+      }
+
+      let store = readDeviceStore(dir, now)
+      assert.strictEqual(store.devices.length, 1, '读回一条设备')
+      assert.strictEqual(store.devices[0].hash, hashDeviceSecret(issued.secret), '存的是 sha256(secret)')
+      assert.strictEqual(trustedDeviceOf(store.devices, cookie, now + 1000).id, issued.record.id, '签发后可验证通过')
+      assert.strictEqual(trustedDeviceOf(store.devices, `${issued.record.id}.${'0'.repeat(64)}`, now + 1000), null, '篡改 secret 失败')
+      assert.strictEqual(trustedDeviceOf(store.devices, `${'a'.repeat(24)}.${issued.secret}`, now + 1000), null, '换 id 失败')
+      assert.strictEqual(trustedDeviceOf(store.devices, cookie, now + DEVICE_TTL_MS - 1).id, issued.record.id, '过期前一毫秒仍有效')
+      assert.strictEqual(trustedDeviceOf(store.devices, cookie, now + DEVICE_TTL_MS), null, '过期后失败')
+      assert.strictEqual(trustedDeviceOf(store.devices, cookie, now + 1000, false), null, '2FA 关闭时设备 cookie 不授予访问')
+
+      // 21 台：淘汰「最久未用」的那台（lastUsedAt 最小），数量永远是 20。
+      let list = []
+      let oldest = null
+      for (let i = 0; i < DEVICE_MAX; i++) {
+        const made = makeDeviceRecord('ua-' + i, now + i * 1000)
+        if (i === 0) oldest = made.record.id
+        list = appendDeviceRecord(list, made.record, now + i * 1000)
+      }
+      assert.strictEqual(list.length, DEVICE_MAX, '满 20 台')
+      const newcomer = makeDeviceRecord('ua-new', now + 60 * 1000)
+      list = appendDeviceRecord(list, newcomer.record, now + 60 * 1000)
+      assert.strictEqual(list.length, DEVICE_MAX, '第 21 台后仍是 20 台')
+      assert.strictEqual(list.some((item) => item.id === oldest), false, '最久未用的那台被淘汰')
+      assert.strictEqual(list.some((item) => item.id === newcomer.record.id), true, '新设备在列表里')
+
+      // revoke：清空后同一 cookie 立刻失效。
+      assert.strictEqual(writeDeviceStore(dir, []), true, '清空设备列表')
+      store = readDeviceStore(dir, now)
+      assert.strictEqual(store.devices.length, 0, '列表已空')
+      assert.strictEqual(trustedDeviceOf(store.devices, cookie, now + 1000), null, 'revoke 后验证失败')
+
+      // 损坏文件：按空列表处理，写前留 .bak，不静默覆盖。
+      fs.writeFileSync(deviceFile, '{broken json')
+      const broken = readDeviceStore(dir, now)
+      assert.strictEqual(broken.devices.length, 0, '损坏文件按空列表处理')
+      assert.strictEqual(broken.corruptText, '{broken json', '损坏内容原样带回，供写前备份')
+      assert.strictEqual(trustedDeviceOf(broken.devices, cookie, now), null, '损坏文件不得放行')
+      assert.strictEqual(writeDeviceStore(dir, [issued.record], { corruptText: broken.corruptText }), true, '损坏后仍可重写')
+      const backup = readSafeTextResult(deviceFile + '.bak', 4096, { openNonBlocking: true })
+      assert.strictEqual(backup.status, 'ok', '覆盖前留了一份 .bak')
+      assert.strictEqual(backup.text, '{broken json', '.bak 保存的是原始损坏内容')
+      assert.strictEqual(readDeviceStore(dir, now).devices.length, 1, '重写后列表恢复')
+
+      // 盘上文件读不出来（超大 ⇒ tooLarge）：必须标记 readFailed，且任何写入都拒绝，
+      // 否则一次「读失败」就被当成空列表，把已登记的 20 台设备整批抹掉。
+      fs.writeFileSync(deviceFile, 'x'.repeat(64 * 1024 + 1))
+      const blocked = readDeviceStore(dir, now)
+      assert.strictEqual(blocked.readFailed, true, '读失败要标记 readFailed')
+      assert.strictEqual(writeDeviceStore(dir, [], { readFailed: blocked.readFailed }), false, '读失败时 revoke 不得覆盖')
+      assert.strictEqual(writeDeviceStore(dir, [issued.record], { corruptText: blocked.corruptText, readFailed: blocked.readFailed }), false, '读失败时新增设备不得覆盖')
+      assert.strictEqual(fs.readFileSync(deviceFile).length, 64 * 1024 + 1, '原文件原样保留')
+      fs.rmSync(deviceFile)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('信任设备: 记住这台设备免二次验证（HTTP）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    const form = { 'content-type': 'application/x-www-form-urlencoded' }
+    const json = { 'content-type': 'application/json' }
+    const cookiePairs = (res) => res.headers['set-cookie'] || []
+    const cookieOf = (res, name) => cookiePairs(res)
+      .map((c) => c.split(';')[0])
+      .find((c) => c.startsWith(name + '='))
+    try {
+      let res = await request(port, 'POST', '/api/2fa/setup', { token: TOKEN, headers: json, body: '{}' })
+      const setup = JSON.parse(res.text)
+      const code = totpCodeAt(setup.secret, Date.now())
+      res = await request(port, 'POST', '/api/2fa/enable', { token: TOKEN, headers: json, body: JSON.stringify({ code, setupId: setup.setupId }) })
+      assert.strictEqual(res.status, 200, res.text)
+      const enabled = JSON.parse(res.text)
+
+      // 挑战页上「记住这台设备」默认勾选。
+      res = await request(port, 'GET', '/', { token: TOKEN })
+      assert.strictEqual(res.status, 401, '开启 2FA 后先要第二因子')
+      assert.ok(res.text.includes('name="remember" value="1" checked'), '登录页默认勾选「记住这台设备」')
+
+      const fresh = totpCodeAt(setup.secret, Date.now() + 30 * 1000)
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN, code: fresh, remember: '1' }).toString(),
+        headers: form
+      })
+      assert.strictEqual(res.status, 303, '验证码正确即登录')
+      const deviceCookie = cookieOf(res, DEVICE_COOKIE)
+      assert.ok(deviceCookie && deviceCookie.split('=')[1].includes('.'), '勾选后下发设备 Cookie')
+      const rawDevice = cookiePairs(res).find((c) => c.startsWith(DEVICE_COOKIE + '='))
+      for (const attr of ['HttpOnly', 'Secure', 'SameSite=Lax', 'Path=/', 'Max-Age=7776000']) {
+        assert.ok(rawDevice.includes(attr), `设备 Cookie 必须带 ${attr}`)
+      }
+
+      // 只带设备 cookie（没有 xbk_session / xbk_2fa）也能进页面——这正是「免二次验证」。
+      const seeded = readDeviceStore(dir)
+      assert.strictEqual(seeded.devices.length, 1, '设备记录已落盘')
+      // 把 lastUsedAt 拨到 2 分钟前：超过 60s 节流窗，下一次命中必须重新写盘。
+      writeDeviceStore(dir, seeded.devices.map((d) => ({ ...d, lastUsedAt: d.createdAt - 120 * 1000 })))
+      res = await request(port, 'GET', '/', { headers: { cookie: deviceCookie } })
+      assert.strictEqual(res.status, 200, '仅凭设备 cookie 直接进页面')
+      assert.ok(res.text.includes('xbk-boot'), '返回的是控制台页面')
+      const touched = readDeviceStore(dir)
+      assert.ok(touched.devices[0].lastUsedAt > seeded.devices[0].createdAt - 120 * 1000, '命中后更新 lastUsedAt')
+      res = await request(port, 'GET', '/', { headers: { cookie: deviceCookie } })
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(readDeviceStore(dir).devices[0].lastUsedAt, touched.devices[0].lastUsedAt,
+        '同一分钟内的重复请求不再写盘（lastUsedAt 不变）')
+
+      res = await request(port, 'GET', '/api/2fa/status', { token: TOKEN })
+      assert.strictEqual(JSON.parse(res.text).trustedDevices, 1, '状态接口报当前设备数')
+
+      // 写面（revoke）只认 Bearer：会话 Cookie 走不通。
+      res = await request(port, 'POST', '/api/devices/revoke', {
+        headers: { ...json, cookie: `xbk_session=${encodeURIComponent(TOKEN)}` },
+        body: '{}'
+      })
+      assert.strictEqual(res.status, 401, 'Cookie-only 不能退出信任设备')
+
+      res = await request(port, 'POST', '/api/devices/revoke', { token: TOKEN, headers: json, body: '{}' })
+      assert.strictEqual(res.status, 200, res.text)
+      assert.strictEqual(JSON.parse(res.text).devices, 0)
+      assert.strictEqual(readDeviceStore(dir).devices.length, 0, '服务端设备列表已清空')
+      assert.strictEqual(cookieOf(res, DEVICE_COOKIE), `${DEVICE_COOKIE}=`, '同时让当前浏览器的设备 Cookie 失效')
+
+      res = await request(port, 'GET', '/', { headers: { cookie: deviceCookie } })
+      assert.strictEqual(res.status, 401, 'revoke 后旧设备 cookie 失效')
+      assert.ok(res.text.includes('需要访问令牌'), '回到登录页')
+
+      // 关闭 2FA 也必须清空设备列表：旧信任不能绕过「下次开启的新密钥」。
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN, code: enabled.recoveryCodes[0], remember: '1' }).toString(),
+        headers: form
+      })
+      assert.strictEqual(res.status, 303, '恢复码也能记住设备')
+      assert.strictEqual(readDeviceStore(dir).devices.length, 1, '设备重新入库')
+      res = await request(port, 'POST', '/api/2fa/disable', { token: TOKEN, headers: json, body: JSON.stringify({ code: enabled.recoveryCodes[1] }) })
+      assert.strictEqual(res.status, 200, res.text)
+      assert.strictEqual(readDeviceStore(dir).devices.length, 0, '关闭 2FA 时清空信任设备')
+      assert.ok(String(res.headers['set-cookie']).includes(`${DEVICE_COOKIE}=;`), '同时清掉浏览器的设备 Cookie')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('信任设备: 2FA 关闭时设备 cookie 不授予访问（HTTP）', async () => {
+    const dir = tmpDir()
+    const issued = makeDeviceRecord('Mozilla/5.0', Date.now())
+    assert.strictEqual(writeDeviceStore(dir, [issued.record]), true, '预置一条合法设备记录')
+    // 没有 console-2fa.json ⇒ 2FA 未开启；设备 cookie 此时不得当会话用。
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    try {
+      const res = await request(port, 'GET', '/', { headers: { cookie: `${DEVICE_COOKIE}=${issued.record.id}.${issued.secret}` } })
+      assert.strictEqual(res.status, 401, '2FA 关闭时设备 cookie 什么都不授予')
+      assert.ok(res.text.includes('需要访问令牌'), '按未登录处理')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   await aok('结构红线: v3.363 数据面（条件请求 / SSE 续传 / 首屏快照）', async () => {
     const src = readConsoleSource()
     assert.ok(src.includes('res.status === 304'), 'consumeJson 必须处理 304（复用条件缓存）')

@@ -3,9 +3,9 @@
 // 入口 app.js 只 import App。依赖方向单向，无循环引用。
 import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, LeaveGuardDialog, StatusCards, TapTip, TriggerBar, clampAutoSeconds, fmtWeekday } from './components.js'
 import { BOOT, apiGetAuto, apiGetConsoleSettings, apiGetLogs, apiGetRuns, apiGetStatus, apiGetSys, apiSetAuto } from './api.js'
-import { BUSY_FALLBACK_MS, POLL_BUSY_MS, POLL_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
-import { MOTION, enter } from './motion.js'
-import { backToTopBehavior, tabFromHash } from './pure.mjs'
+import { BUSY_FALLBACK_MS, POLL_BUSY_MS, POLL_MS, SSE_HEARTBEAT_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
+import { MOTION, enter, motionOK } from './motion.js'
+import { backToTopBehavior, createLiveChannel, pollIntervalFor, runViewTransition, tabFromHash } from './pure.mjs'
 import { fmtLocalTime } from './format.js'
 import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 // 页面面板（pages.js）
@@ -151,10 +151,19 @@ function App () {
   const [tab, setTab] = useState(() => resolveTab(window.location.hash))
   // 切页入场（v3.360）：只动新页的 opacity/transform，不动高度 ⇒ 不改变滚动锚点、
   // 不会把首屏内容顶走。tab 变化只在真正切页时发生，轮询不触发。
+  // v3.374：能上原生 View Transitions 时由浏览器做整页交叉淡入淡出，这一帧的页面级
+  // 入场要让位（vtDrivenRef），否则两套淡入叠加会先淡到发白再回来。
   const wrapRef = useRef(null)
+  const vtDrivenRef = useRef(false)
+  // 切页渲染出口（renderTab）定义在下方，hash 监听是挂载期注册的一次性 effect，
+  // 走 ref 取最新闭包（与 prepareScrollRef 同一套办法）。
+  const renderTabRef = useRef(null)
   useLayoutEffect(() => {
     const root = wrapRef.current
-    if (!root) return
+    // 先取值再清零：本次渲染是否由过渡驱动，只对这一帧有效。
+    const viaTransition = vtDrivenRef.current
+    vtDrivenRef.current = false
+    if (!root || viaTransition) return
     // 只淡入、完全不加 transform：页面里可能有 position:fixed 的弹层（分类选择器/
     // 提示气泡），祖先一旦有 transform 就会改成按它定位，弹层会跳位。
     enter(root.querySelector('.page:not([hidden])'), { transform: false, duration: MOTION.fast })
@@ -222,6 +231,10 @@ function App () {
   const [nextAt, setNextAt] = useState(0)
   // v3.348：共享轮询节拍。非概览/日志页的数据在各面板里，App 每拍 +1，当前面板据此重拉。
   const [pollTick, setPollTick] = useState(0)
+  // 全站 SSE 通知（v3.374）：服务端推 tick，收到就走 refreshSplit（有条件请求，命中 304 时
+  // 零正文）。sseUp 只表示「通知流真的连上了」——它决定下面的轮询间隔（15s → 60s 安全轮询）；
+  // 断线/隐藏/暂停都会让它回到 false，轮询随即恢复 15s。两条通道互不依赖。
+  const [sseUp, setSseUp] = useState(false)
   // v3.332：部署后旧标签页仍在跑旧脚本，数据轮询却照常更新 ⇒ 用户以为「改了没生效」。
   // boot 里带页面启动版本；每 60s 与 /api/sys 对一次，不一致就提示刷新。
   const [newVersion, setNewVersion] = useState('')
@@ -628,6 +641,40 @@ function App () {
     }
   }, [])
 
+  // 共享一拍（v3.374）：15s/60s 定时器与 SSE tick 走同一份逻辑，避免两套节流各自为政
+  // （一套跳过隐藏页、一套不跳，就是「明明在后台却一直发请求」）。隐藏页不发请求、
+  // 表单交互与回前台静默窗内跳过——这些判断只写这一遍。
+  const markRef = useRef(null)
+  const runTick = useCallback(() => {
+    if (document.hidden) return
+    if (Date.now() < resumeQuietUntilRef.current) return
+    if (Date.now() < formPauseUntilRef.current) return
+    refreshSplit()
+    if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)
+    if (markRef.current) markRef.current()
+  }, [refreshSplit, tab])
+  // SSE 回调挂在 effect 上，不能随每次渲染换身份——否则连一次 tick 就要重建连接。用 ref 解引用。
+  const runTickRef = useRef(runTick)
+  useEffect(() => { runTickRef.current = runTick }, [runTick])
+
+  // 全站 SSE 通知（v3.374）：可见且宿主支持 EventSource 时连 /api/stream。隐藏断开、可见
+  // 立刻重连并补拉一次（隐藏期间漏的帧不补发）；暂停/凭证失效同样断开。整个生命周期只有
+  // 这一个 EventSource——open() 幂等，清理走 dispose（摘监听 + close），不会叠出第二条流。
+  useEffect(() => {
+    if (authExpired || !autoRefresh) { setSseUp(false); return undefined }
+    const Ctor = typeof window === 'undefined' ? undefined : window.EventSource
+    if (typeof Ctor !== 'function') return undefined // 老浏览器：老实走 15s 轮询
+    const channel = createLiveChannel({
+      EventSourceCtor: Ctor,
+      doc: document,
+      onChange: (up) => setSseUp(up),
+      onTick: () => { runTickRef.current() }
+    })
+    // 首帧：隐藏的标签页不建流（SSE 也是一条长连接，后台常驻没有意义）。
+    if (document.visibilityState !== 'hidden') channel.open()
+    return () => channel.dispose()
+  }, [authExpired, autoRefresh])
+
   // 轮询节奏（Sourcery vvJ）：任务在跑时必须用快轮询——以 locking（而非 busy）为节奏源，
   // 避免「busy 在 active 确认后被清 → 退回慢轮询」的窗口。
   // Sourcery Other-instance-idle：另一实例持锁时本进程 runs 历史是空的，此前显示「空闲」
@@ -675,25 +722,13 @@ function App () {
     // 页面在后台时不轮询（切回前台立即补一次）：控制台标签页常驻也不该整夜打接口。
     // 暂停（autoRefresh=false）同样不建定时器；恢复时本 effect 重跑并立即补一次。
     if (!autoRefresh) return () => clearInterval(timerRef.current)
-    const interval = locking ? POLL_BUSY_MS : POLL_MS
+    // v3.374：SSE 在线 → 60s 安全轮询（tick 才是主通道）；断线自动回到 15s；任务在跑仍按
+    // POLL_BUSY_MS 快轮询。判定在 pure.mjs 里（pollIntervalFor），Node 侧可直接断言。
+    const interval = pollIntervalFor({ sseUp, busy: locking, pollMs: POLL_MS, busyMs: POLL_BUSY_MS, safetyMs: SSE_HEARTBEAT_MS })
     const mark = () => setNextAt(Date.now() + interval)
-    const tick = () => {
-      // 隐藏标签页一次请求都不发：主轮询此前只在「发不发这一拍」上有判断，
-      // 但概览的 /api/auto（2s 轮询）不在这个 effect 里、没跟着停，实测隐藏 15s 仍有请求。
-      // 定时器本身照跳（浏览器把后台定时器压到 1 分钟一次，空转无成本），
-      // 但请求、倒计时推进、面板 tick 三样全停。
-      if (document.hidden) return
-      // 刚从后台回来：这一拍由「回到前台」的补拉负责，定时器若正好到期不再叠加。
-      if (Date.now() < resumeQuietUntilRef.current) return
-      // 用户正在操作表单（下拉/输入框）时跳过整拍：不 refresh、也不 mark
-      // （mark 会 setNextAt 触发 App 重渲染，安卓原生 select 仍可能被重建）。
-      // 截止时间到后自动恢复，不会因为焦点一直停在 select 上而永久停轮。
-      if (Date.now() < formPauseUntilRef.current) return
-      refreshSplit()
-      if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)
-      mark()
-    }
-    timerRef.current = setInterval(tick, interval)
+    // 只在这一个地方持定时器：SSE tick 不另建 interval，它复用 runTick（顺带复位倒计时）。
+    markRef.current = mark
+    timerRef.current = setInterval(() => { runTick() }, interval)
     mark()
     // 回前台只重排下一拍（别刚回来就补一发，补拉由下面的「回到前台」effect 统一发：
     // 那里还会通知当前面板一起刷新，重复请求会翻倍）。
@@ -705,9 +740,10 @@ function App () {
     document.addEventListener('visibilitychange', onVis)
     return () => {
       clearInterval(timerRef.current)
+      markRef.current = null
       document.removeEventListener('visibilitychange', onVis)
     }
-  }, [refreshSplit, locking, tab, autoRefresh, authExpired])
+  }, [refreshSplit, locking, tab, autoRefresh, authExpired, sseUp, runTick])
 
   // hash 路由（v3.307）：首次进入补 #/overview；前进/后退跟着切页。
   useEffect(() => {
@@ -740,10 +776,7 @@ function App () {
       if (next === 'sys') sysReadyRef.current = null
       // 后退/前进也走同一套记忆与垫高，不再绕过 switchTab 丢失还原。
       prepareScrollRef.current(next)
-      markVisited(next)
-      showSyncFor(next)
-      setTab(next)
-      tabRef.current = next
+      renderTabRef.current(next)
     }
     if (!window.location.hash) window.history.replaceState(null, '', '#/overview')
     window.addEventListener('hashchange', onHash)
@@ -907,6 +940,20 @@ function App () {
   // 切页回到顶部（v3.306）：手机从概览滚到底部再点「推送记录」，此前会停在
   // 新页面的中段/底部（window.scrollY 被保留），看起来像页面缺了开头。
   // v3.307 同步写 hash：刷新/后退能回到同一页。
+  // 切页的统一渲染出口（v3.374）：能上原生 View Transitions 就让浏览器包住这次重渲染做
+  // 整页淡入淡出，不支持（或用户关了动效）就静默降级成直接换页——没有 polyfill、没有新依赖。
+  // 只包「引起主内容重渲染」的那一下；prepareScroll / 写 hash 都留在包外：它们要读出发页的
+  // scrollY，也不能因为过渡回调是异步的而晚一拍。hash 前进后退走同一个出口。
+  const renderTab = (next) => {
+    runViewTransition(document, motionOK(), (viaTransition) => {
+      vtDrivenRef.current = viaTransition
+      markVisited(next)
+      showSyncFor(next)
+      setTab(next)
+      tabRef.current = next
+    })
+  }
+  renderTabRef.current = renderTab
   // 真正切页：调用方已经确认没有需要拦截的过滤页草稿。
   const doSwitchTab = (next, replace = false) => {
     if (next === tabRef.current) return
@@ -917,10 +964,7 @@ function App () {
     // 统一走 prepareScroll：保存出发页位置、决定目标页位置、首访时先垫高。
     // 第一次进入沿用当前视口，不把整页拽回顶部；只有「查看日志」走 forceTop。
     prepareScroll(next)
-    markVisited(next)
-    showSyncFor(next)
-    setTab(next)
-    tabRef.current = next
+    renderTab(next)
     if (replace) {
       // 过滤页的 sentinel 是压进来的同地址记录；离开时直接替换成目标页，
       // 否则从目标页按后退会回到一个「已经没有草稿」的过滤页旧记录。
@@ -1048,7 +1092,9 @@ function App () {
   }
   const themeLabel = (THEMES.find((t) => t.key === theme) || THEMES[0]).label
   const nextThemeLabel = (THEMES[(THEMES.findIndex((t) => t.key === theme) + 1) % THEMES.length] || THEMES[0]).label
-  const pollMs = locking ? POLL_BUSY_MS : POLL_MS
+  // 顶栏倒计时与面板自轮询都用这个值，必须与真实定时器同源（v3.374）：SSE 在线时是 60s，
+  // 写死 15s 就会出现「4 秒后刷新」却 60 秒才动一次的假信息。
+  const pollMs = pollIntervalFor({ sseUp, busy: locking, pollMs: POLL_MS, busyMs: POLL_BUSY_MS, safetyMs: SSE_HEARTBEAT_MS })
   // 顶栏徽章只在「概览/日志 + 自动刷新开」时是活状态；其它情况（暂停、推送记录/配置/系统）
   // 主轮询已停，徽章显示的是离开时的快照——必须注明，不能永久挂着「任务运行中」（审查 #246）。
   // 顶栏徽章只在「自动刷新开 + 未失效」时是活状态；所有页都轮询（v3.348），
