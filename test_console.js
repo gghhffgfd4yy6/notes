@@ -9442,6 +9442,33 @@ async function main () {
     }
   })
 
+  await aok('结构红线: v3.385 渲染错误边界（class + componentDidCatch / 入口包裹 / 错误面板）', () => {
+    const uiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const appSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const ph = (name) => '$' + '{' + name + '}'
+    // 边界只能是 class 组件（hooks 兜不住渲染期异常），且 preact 10 的边界走 componentDidCatch。
+    const at = uiSrc.indexOf('class ErrorBoundary extends Component')
+    assert.ok(at > 0, 'ui.js 必须有 class ErrorBoundary extends Component')
+    const seg = uiSrc.slice(at, uiSrc.indexOf('function App ()', at))
+    assert.ok(seg.includes('componentDidCatch (e)'), '必须实现 componentDidCatch')
+    assert.ok(seg.includes('this.setState({ failed: true, detail })'),
+      '捕获后必须把 failed 置真（只打 console 不 setState，preact 会继续渲染抛错子树）')
+    assert.ok(seg.includes("console.error('[xbk-console] 页面渲染失败：', e)"),
+      '错误摘要必须打到 console（手机上打不开 devtools）')
+    assert.ok(seg.includes('页面出错了') && seg.includes('重新加载'), '失败面板必须有「页面出错了 + 重新加载」')
+    assert.ok(seg.includes('window.location.reload()'), '「重新加载」必须真的 reload')
+    assert.ok(uiSrc.includes('export { App, ErrorBoundary }'), 'ErrorBoundary 必须导出（入口要用）')
+    // 包裹点必须在入口：挂在 App 内部就只能兜子面板，App 自己抛错仍整页白屏。
+    assert.ok(appSrc.includes("import { App, ErrorBoundary } from './ui.js'"), '入口必须同时引入 App 与 ErrorBoundary')
+    assert.ok(appSrc.includes('render(html`<' + ph('ErrorBoundary') + '><' + ph('App') + ' /><//>'),
+      'ErrorBoundary 必须包在 App 外层（render 的第一层就是边界）')
+    assert.ok(!uiSrc.includes('getDerivedStateFromError'), '不混用 getDerivedStateFromError（preact 10 边界走 componentDidCatch）')
+    // 未失败时必须是透明包装：返回 children 而不是自造容器（否则整页结构被多包一层）。
+    assert.ok(seg.includes('if (!this.state.failed) return this.props.children'), '未失败时必须原样返回 children')
+    assert.ok(/\.err-boundary\s*\{[^}]*max-width/.test(css) && css.includes('.err-boundary-detail'),
+      '错误面板必须有样式（裸文本会顶在左上角）')
+  })
   await aok('结构红线: v3.363 数据面（条件请求 / SSE 续传 / 首屏快照）', async () => {
     const src = readConsoleSource()
     assert.ok(src.includes('res.status === 304'), 'consumeJson 必须处理 304（复用条件缓存）')

@@ -1719,6 +1719,14 @@ span.flatpickr-weekday { color: color-mix(in srgb, var(--text) 80%, transparent)
 @keyframes boot-reveal { to { opacity: 1; } }
 .boot-fail-title { margin: 0 0 10px; font-size: 18px; font-weight: 600; }
 .boot-fail-hint { margin: 0 0 12px; line-height: 1.65; color: var(--text-dim); }
+/* v3.385 渲染错误边界（ui.js 的 ErrorBoundary）：面板 render 抛错时保住外壳，给
+   「页面出错了 + 重新加载」而不是白屏。排版沿用首屏失败兜底（.boot-fallback），
+   但常驻可见——不挂延迟动画（那套 5s 显形只服务于「资产还没跑起来」那一刻）。 */
+.err-boundary { max-width: 34rem; margin: 18vh auto 0; padding: 0 1.25rem; }
+.err-boundary-detail {
+  margin: 0 0 10px; font-family: var(--mono); font-size: var(--fs-xs);
+  color: var(--bad-fg); word-break: break-all;
+}
 
 /* ── 切页过渡：原生 View Transitions ────────────────────────────────────────
    切页（tab 变化引起的主内容重渲染）由 ui.js 用 document.startViewTransition 包住那次
