@@ -195,7 +195,7 @@ npm run console                   # 启动网页控制台（需先设置 XBK_CON
 
 ### 变异测试（超时治理）
 
-变异测试只在 CI 跑（`.github/workflows/mutation.yml`，本机入口 fail-closed）。触发面只有三种：**main 上改动本工作流的 push、手动 dispatch、每日两次定时（UTC 16:17 主跑 / 04:17 补偿）**；不接 `pull_request`——PR 分支照常跑 `test.yml` 的完整门禁，变异本体不占评审时间。单次等待上限按段下发：`console-part1..11` 是 **60s**，其余 19 段 **300s**——取值写进矩阵的 `timeout_ms`，再由「变异测试」步骤用 CLI `--timeoutMS` 覆盖配置文件的 300000ms（只改等待上限，不进缓存身份，合并后不需要一次性全量重跑）。
+变异测试只在 CI 跑（`.github/workflows/mutation.yml`，本机入口 fail-closed）。触发面只有三种：**main 上改动本工作流的 push、手动 dispatch、每日两次定时（UTC 16:17 主跑 / 04:17 补偿）**；不接 `pull_request`——PR 分支照常跑 `test.yml` 的完整门禁，变异本体不占评审时间。单次等待上限按段下发：`console-part1..12` 是 **60s**，其余 20 段 **300s**——取值写进矩阵的 `timeout_ms`，再由「变异测试」步骤用 CLI `--timeoutMS` 覆盖配置文件的 300000ms（只改等待上限，不进缓存身份，合并后不需要一次性全量重跑）。
 
 - 段耗时的头号来源不是「变异体真的跑不动」，而是**测试进程收尾泄漏**：`test_console.js` 的 server 在 `listen` 时登记、`finally` 里统一收割，每条用例再挂一层看门狗——断言提前失败也不会留下监听句柄把事件循环钉住。否则进程打印完汇总照样不退出，tap-runner 只能等满上限才杀，一段白等几小时。
 - `Timeout` 仍计入 detected（`分数` = (被杀 + 超时) / 全部变异体），**分数口径不变**；变的是「慢但通过」的变异体被判成超时的那部分，所以读分要与日报的 `真挂死` / `上限触发` 两列一起看。

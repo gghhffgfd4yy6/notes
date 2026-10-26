@@ -8906,6 +8906,16 @@ async function main () {
       assert.strictEqual(backup.status, 'ok', '覆盖前留了一份 .bak')
       assert.strictEqual(backup.text, '{broken json', '.bak 保存的是原始损坏内容')
       assert.strictEqual(readDeviceStore(dir, now).devices.length, 1, '重写后列表恢复')
+
+      // 盘上文件读不出来（超大 ⇒ tooLarge）：必须标记 readFailed，且任何写入都拒绝，
+      // 否则一次「读失败」就被当成空列表，把已登记的 20 台设备整批抹掉。
+      fs.writeFileSync(deviceFile, 'x'.repeat(64 * 1024 + 1))
+      const blocked = readDeviceStore(dir, now)
+      assert.strictEqual(blocked.readFailed, true, '读失败要标记 readFailed')
+      assert.strictEqual(writeDeviceStore(dir, [], { readFailed: blocked.readFailed }), false, '读失败时 revoke 不得覆盖')
+      assert.strictEqual(writeDeviceStore(dir, [issued.record], { corruptText: blocked.corruptText, readFailed: blocked.readFailed }), false, '读失败时新增设备不得覆盖')
+      assert.strictEqual(fs.statSync(deviceFile).size, 64 * 1024 + 1, '原文件原样保留')
+      fs.rmSync(deviceFile)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

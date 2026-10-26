@@ -1584,15 +1584,18 @@ function deviceStorePath (stateDir) {
 function readDeviceStore (stateDir, now = Date.now()) {
   const file = deviceStorePath(stateDir)
   const read = readSafeTextResult(file, DEVICE_FILE_MAX_BYTES, { openNonBlocking: true })
-  if (read.status === 'missing') return { file, devices: [], corruptText: null }
+  if (read.status === 'missing') return { file, devices: [], corruptText: null, readFailed: false }
   const text = typeof read.text === 'string' ? read.text : ''
-  if (read.status !== 'ok' || text.trim() === '') return { file, devices: [], corruptText: null }
+  // 读失败（ioError / tooLarge / unsafe / replaced）与「文件不存在」必须分开：前者说明
+  // 盘上还有一份读不懂的列表，此时按空列表写回等于把已登记的设备全删了（Sourcery High）。
+  if (read.status !== 'ok') return { file, devices: [], corruptText: null, readFailed: true }
+  if (text.trim() === '') return { file, devices: [], corruptText: null, readFailed: false }
   let raw
-  try { raw = JSON.parse(text) } catch (e) { return { file, devices: [], corruptText: text } }
+  try { raw = JSON.parse(text) } catch (e) { return { file, devices: [], corruptText: text, readFailed: false } }
   if (!raw || raw.version !== DEVICE_SCHEMA || !Array.isArray(raw.devices)) {
-    return { file, devices: [], corruptText: text }
+    return { file, devices: [], corruptText: text, readFailed: false }
   }
-  return { file, devices: pruneDeviceRecords(raw.devices, now), corruptText: null }
+  return { file, devices: pruneDeviceRecords(raw.devices, now), corruptText: null, readFailed: false }
 }
 
 // 只留一份 .bak：反复损坏时保留最早那份原始证据，不被后续覆盖。
@@ -1602,9 +1605,11 @@ function backupDeviceStore (file, text) {
   return writeAtomic(backup, String(text), '控制台信任设备备份') === true
 }
 
-function writeDeviceStore (stateDir, devices, { corruptText = null } = {}) {
+function writeDeviceStore (stateDir, devices, { corruptText = null, readFailed = false } = {}) {
   const file = deviceStorePath(stateDir)
-  if (typeof corruptText === 'string') backupDeviceStore(file, corruptText)
+  // 盘上那份读不出来时不覆盖：宁可这次记不住/撤不掉，也不能把已有登记抹成空列表。
+  if (readFailed) return false
+  if (typeof corruptText === 'string' && !backupDeviceStore(file, corruptText)) return false
   return writeAtomic(file, JSON.stringify({ version: DEVICE_SCHEMA, devices }), '控制台信任设备') === true
 }
 
@@ -3108,12 +3113,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     const store = readDeviceStore(stateDir, now)
     const issued = makeDeviceRecord(req.headers && req.headers['user-agent'], now)
     const devices = appendDeviceRecord(store.devices, issued.record, now)
-    if (!writeDeviceStore(stateDir, devices, { corruptText: store.corruptText })) return null
+    if (!writeDeviceStore(stateDir, devices, { corruptText: store.corruptText, readFailed: store.readFailed })) return null
     return issued
   }
   const revokeTrustedDevices = () => {
     const store = readDeviceStore(stateDir)
-    return writeDeviceStore(stateDir, [], { corruptText: store.corruptText })
+    return writeDeviceStore(stateDir, [], { corruptText: store.corruptText, readFailed: store.readFailed })
   }
   const trustedDeviceCount = () => readDeviceStore(stateDir).devices.length
   const verifySecondFactor = (code, { persistRecovery = true } = {}) => {
@@ -5911,6 +5916,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         const recoveryCodes = generateRecoveryCodes()
         const recovery = recoveryRecordOf(recoveryCodes)
+        // 重配 2FA = 换了一把新钥匙：先作废旧设备信任，清不掉就整体失败（否则旧 cookie
+        // 仍能绕过新密钥；Sourcery High「Old trusted devices bypass new 2FA」）。
+        if (!revokeTrustedDevices()) {
+          sendJson(res, 500, { error: 'revoke_failed', message: '旧设备信任清理失败，未开启两步验证' })
+          return
+        }
         if (!persistTwoFactorState(twoFactor.file, pending.secret, recovery)) {
           sendJson(res, 500, { error: 'write_failed', message: '两步验证配置保存失败' })
           return
@@ -5925,8 +5936,6 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         if (setupStep !== null) usedTotpSteps.set(setupStep, (setupStep + 2) * TOTP_PERIOD_S * 1000)
         lastEnableResult = { setupId: pending.id, secret: pending.secret, recoveryCodes, createdAt: Date.now() }
         clearLoginFailures(req)
-        // 重配 2FA = 换了一把新钥匙：旧设备信任必须一起作废，否则旧 cookie 仍能绕过新密钥。
-        revokeTrustedDevices()
         res.setHeader('Set-Cookie', twoFactorCookieHeader(req, twoFactor.secret))
         res.setHeader('Cache-Control', 'no-store')
         sendJson(res, 200, { enabled: true, recoveryCodes, recoveryRemaining: recoveryCodes.length })
@@ -5963,6 +5972,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           sendJson(res, 400, { error: 'invalid_code', message: why })
           return
         }
+        // 先清设备信任、再删配置：清不掉就保持 2FA 开启，避免留下「已关 2FA 但旧设备还能进」的状态。
+        if (!revokeTrustedDevices()) {
+          sendJson(res, 500, { error: 'revoke_failed', message: '信任设备清理失败，未关闭两步验证' })
+          return
+        }
         try {
           fs.rmSync(twoFactor.file, { force: true })
         } catch (e) {
@@ -5977,8 +5991,6 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         lastEnableResult = null
         usedTotpSteps.clear()
         clearLoginFailures(req)
-        // 关闭 2FA 后设备列表没有意义；下次开启是新密钥，不能继承旧信任。
-        revokeTrustedDevices()
         res.setHeader('Set-Cookie', [clearTwoFactorCookieHeader(req), clearDeviceCookieHeader()])
         sendJson(res, 200, { enabled: false })
       }).catch(() => sendJson(res, 500, { error: '读取请求体失败' }))

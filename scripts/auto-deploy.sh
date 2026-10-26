@@ -57,7 +57,9 @@ if [ -n "${SYSTEMCTL:-}" ]; then
   SYSTEMCTL_CMD=(${SYSTEMCTL})
 elif [ "$(id -u)" -eq 0 ]; then
   SYSTEMCTL_CMD=(systemctl)
-elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+elif command -v sudo >/dev/null 2>&1 && sudo -n -l systemctl >/dev/null 2>&1; then
+  # 用 `sudo -l <cmd>` 而不是 `sudo -n true`：限制型 sudoers 只放行 systemctl 时，
+  # 后者必然失败、脚本会误回落到裸 systemctl（Sourcery Medium）。
   SYSTEMCTL_CMD=(sudo -n systemctl)
 else
   SYSTEMCTL_CMD=(systemctl)
@@ -96,15 +98,23 @@ show_cmd () {
 }
 
 # 从 DEPLOY_ENV_FILE 读取 XBK_CONSOLE_TOKEN（与 systemd EnvironmentFile 同语义：后出现的赋值覆盖先前的）。
-# 在子 shell 里 source，避免污染本进程环境；文件里有语法错误则得到空串并报错退出。
+# 按 KEY=VALUE 逐行解析而不是 source：环境文件里的字面量不该被 shell 展开改写（Sourcery Medium）。
 read_token () {
   [ -r "$DEPLOY_ENV_FILE" ] || return 1
-  (
-    set -a
-    # shellcheck source=/dev/null # 路径由 DEPLOY_ENV_FILE 决定，静态分析无从跟进（文件里只有 XBK_CONSOLE_* 变量）
-    . "$DEPLOY_ENV_FILE" >/dev/null 2>&1 || exit 1
-    printf '%s' "${XBK_CONSOLE_TOKEN:-}"
-  )
+  node - "$DEPLOY_ENV_FILE" <<'NODE'
+const fs = require('fs')
+const lines = fs.readFileSync(process.argv[2], 'utf8').split('\n')
+let value = ''
+for (const line of lines) {
+  const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
+  if (!m || m[1] !== 'XBK_CONSOLE_TOKEN') continue
+  let v = m[2].trim()
+  const quoted = (v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))
+  if (quoted) v = v.slice(1, -1)
+  value = v
+}
+process.stdout.write(value)
+NODE
 }
 
 # 从 stdin 的 JSON 里取 version 字段；解析失败返回非零（调用方据此判定「服务没起来/返回了非 JSON」）。
@@ -120,9 +130,21 @@ package_version () {
 # 忙碌判定：/api/status 里 running / activeRun / inFlight 非空，或触发锁被持有（lock.held）。
 # 输出 busy / idle / unknown（unknown = 探测失败，不阻塞部署：服务已经挂了的时候更应该部署）。
 probe_busy () {
-  local body=""
-  if ! body=$(curl -sS -m 5 -H "Authorization: Bearer ${TOKEN}" "$STATUS_URL" 2>/dev/null); then
+  local out="" body="" code=""
+  if ! out=$(curl -sS -m 5 -w '\n%{http_code}' -H "Authorization: Bearer ${TOKEN}" "$STATUS_URL" 2>/dev/null); then
     printf 'unknown'
+    return 0
+  fi
+  code=${out##*$'\n'}
+  body=${out%$'\n'*}
+  # 401/5xx 的 JSON 里没有 running 字段，直接解析会被当成 idle 并在任务运行中重启（Sourcery High）。
+  # 拿不到可信状态时：服务还活着就按 busy 处理，服务已停才允许继续（那正是该部署的时候）。
+  if [ "$code" != "200" ]; then
+    if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+      printf 'busy'
+    else
+      printf 'idle'
+    fi
     return 0
   fi
   printf '%s' "$body" | node -e '
@@ -217,7 +239,8 @@ if [ "$MODE" = deploy ]; then
   if ! git_in fetch --prune "$REMOTE" "$BRANCH" >/dev/null 2>&1; then
     die "git fetch ${REMOTE} ${BRANCH} 失败（网络或凭证问题，本轮不部署）"
   fi
-  TARGET_SHA=$(git_in rev-parse --verify "${REMOTE}/${BRANCH}^{commit}") || die "解析 ${REMOTE}/${BRANCH} 失败"
+  TARGET_SHA=$(git_in rev-parse --verify "FETCH_HEAD^{commit}") || die "解析 FETCH_HEAD 失败"
+  git_in update-ref "refs/remotes/${REMOTE}/${BRANCH}" "$TARGET_SHA" 2>/dev/null || true
 else
   TARGET_SHA=$(git_in ls-remote --exit-code "$REMOTE" "refs/heads/${BRANCH}" 2>/dev/null | awk 'NR==1{print $1}') || \
     die "git ls-remote ${REMOTE} ${BRANCH} 失败"
@@ -286,6 +309,13 @@ NEW_VERSION=$(package_version) || rollback_and_exit "读取 ${DEPLOY_DIR}/packag
 [ -n "$NEW_VERSION" ] || rollback_and_exit "package.json 里没有 version 字段"
 
 log "restart: ${SERVICE}"
+# 复探一次：从上面的 probe 到 restart 之间可能刚好有触发拿到锁，此时重启会杀掉真实推送
+# （Sourcery High）。窗口只剩毫秒级，再探一次把「探测后才开跑」压到最小。
+if [ "$(probe_busy)" = busy ]; then
+  git_in checkout -f "$OLD_SHA" >/dev/null 2>&1 || log "WARN: 回退工作树到 ${OLD_SHA:0:8} 失败（需人工检查）"
+  log "busy: restart 前复探发现任务已开始运行，已回退工作树，本轮不部署"
+  exit 0
+fi
 if ! "${SYSTEMCTL_CMD[@]}" restart "$SERVICE"; then
   rollback_and_exit "${SERVICE} 重启失败"
 fi
