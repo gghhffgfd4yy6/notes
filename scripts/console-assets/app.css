@@ -1633,3 +1633,29 @@ span.flatpickr-weekday { color: color-mix(in srgb, var(--text) 80%, transparent)
 @keyframes boot-reveal { to { opacity: 1; } }
 .boot-fail-title { margin: 0 0 10px; font-size: 18px; font-weight: 600; }
 .boot-fail-hint { margin: 0 0 12px; line-height: 1.65; color: var(--text-dim); }
+
+/* ── 切页过渡：原生 View Transitions ────────────────────────────────────────
+   切页（tab 变化引起的主内容重渲染）由 ui.js 用 document.startViewTransition 包住那次
+   渲染，这里只管「怎么淡」。不支持 ::view-transition-* 的浏览器整块规则被忽略，切页照常
+   瞬时完成——零依赖、无 polyfill、无需 UA 嗅探。
+   红线：只动 opacity，绝不给 .page / :root 加 transform。页面里有 position:fixed 的弹层
+   （分类选择器、提示气泡、回顶按钮），祖先一旦有 transform 就会改成按它定位，弹层会跳位；
+   快照也不做缩放/位移，避免整页文字发虚。 */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 220ms;
+  animation-timing-function: ease-out;
+  animation-fill-mode: both;
+}
+::view-transition-old(root) { animation-name: xbk-vt-fade-out; }
+::view-transition-new(root) { animation-name: xbk-vt-fade-in; }
+@keyframes xbk-vt-fade-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes xbk-vt-fade-in { from { opacity: 0; } to { opacity: 1; } }
+
+/* 用户关了动效：连伪元素的默认淡入一起关掉（此时 ui.js 也不会起过渡，双保险）。 */
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none !important;
+  }
+}

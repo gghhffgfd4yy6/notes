@@ -4,8 +4,8 @@
 import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, LeaveGuardDialog, StatusCards, TapTip, TriggerBar, clampAutoSeconds, fmtWeekday } from './components.js'
 import { BOOT, apiGetAuto, apiGetConsoleSettings, apiGetLogs, apiGetRuns, apiGetStatus, apiGetSys, apiSetAuto } from './api.js'
 import { BUSY_FALLBACK_MS, POLL_BUSY_MS, POLL_MS, SSE_HEARTBEAT_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
-import { MOTION, enter } from './motion.js'
-import { backToTopBehavior, createLiveChannel, pollIntervalFor, tabFromHash } from './pure.mjs'
+import { MOTION, enter, motionOK } from './motion.js'
+import { backToTopBehavior, createLiveChannel, pollIntervalFor, runViewTransition, tabFromHash } from './pure.mjs'
 import { fmtLocalTime } from './format.js'
 import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 // 页面面板（pages.js）
@@ -151,10 +151,19 @@ function App () {
   const [tab, setTab] = useState(() => resolveTab(window.location.hash))
   // 切页入场（v3.360）：只动新页的 opacity/transform，不动高度 ⇒ 不改变滚动锚点、
   // 不会把首屏内容顶走。tab 变化只在真正切页时发生，轮询不触发。
+  // v3.374：能上原生 View Transitions 时由浏览器做整页交叉淡入淡出，这一帧的页面级
+  // 入场要让位（vtDrivenRef），否则两套淡入叠加会先淡到发白再回来。
   const wrapRef = useRef(null)
+  const vtDrivenRef = useRef(false)
+  // 切页渲染出口（renderTab）定义在下方，hash 监听是挂载期注册的一次性 effect，
+  // 走 ref 取最新闭包（与 prepareScrollRef 同一套办法）。
+  const renderTabRef = useRef(null)
   useLayoutEffect(() => {
     const root = wrapRef.current
-    if (!root) return
+    // 先取值再清零：本次渲染是否由过渡驱动，只对这一帧有效。
+    const viaTransition = vtDrivenRef.current
+    vtDrivenRef.current = false
+    if (!root || viaTransition) return
     // 只淡入、完全不加 transform：页面里可能有 position:fixed 的弹层（分类选择器/
     // 提示气泡），祖先一旦有 transform 就会改成按它定位，弹层会跳位。
     enter(root.querySelector('.page:not([hidden])'), { transform: false, duration: MOTION.fast })
@@ -767,10 +776,7 @@ function App () {
       if (next === 'sys') sysReadyRef.current = null
       // 后退/前进也走同一套记忆与垫高，不再绕过 switchTab 丢失还原。
       prepareScrollRef.current(next)
-      markVisited(next)
-      showSyncFor(next)
-      setTab(next)
-      tabRef.current = next
+      renderTabRef.current(next)
     }
     if (!window.location.hash) window.history.replaceState(null, '', '#/overview')
     window.addEventListener('hashchange', onHash)
@@ -934,6 +940,20 @@ function App () {
   // 切页回到顶部（v3.306）：手机从概览滚到底部再点「推送记录」，此前会停在
   // 新页面的中段/底部（window.scrollY 被保留），看起来像页面缺了开头。
   // v3.307 同步写 hash：刷新/后退能回到同一页。
+  // 切页的统一渲染出口（v3.374）：能上原生 View Transitions 就让浏览器包住这次重渲染做
+  // 整页淡入淡出，不支持（或用户关了动效）就静默降级成直接换页——没有 polyfill、没有新依赖。
+  // 只包「引起主内容重渲染」的那一下；prepareScroll / 写 hash 都留在包外：它们要读出发页的
+  // scrollY，也不能因为过渡回调是异步的而晚一拍。hash 前进后退走同一个出口。
+  const renderTab = (next) => {
+    runViewTransition(document, motionOK(), (viaTransition) => {
+      vtDrivenRef.current = viaTransition
+      markVisited(next)
+      showSyncFor(next)
+      setTab(next)
+      tabRef.current = next
+    })
+  }
+  renderTabRef.current = renderTab
   // 真正切页：调用方已经确认没有需要拦截的过滤页草稿。
   const doSwitchTab = (next, replace = false) => {
     if (next === tabRef.current) return
@@ -944,10 +964,7 @@ function App () {
     // 统一走 prepareScroll：保存出发页位置、决定目标页位置、首访时先垫高。
     // 第一次进入沿用当前视口，不把整页拽回顶部；只有「查看日志」走 forceTop。
     prepareScroll(next)
-    markVisited(next)
-    showSyncFor(next)
-    setTab(next)
-    tabRef.current = next
+    renderTab(next)
     if (replace) {
       // 过滤页的 sentinel 是压进来的同地址记录；离开时直接替换成目标页，
       // 否则从目标页按后退会回到一个「已经没有草稿」的过滤页旧记录。

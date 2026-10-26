@@ -18,6 +18,72 @@ export function backToTopBehavior (reduceMotion, supportsSmooth) {
   return reduceMotion || !supportsSmooth ? null : 'smooth'
 }
 
+// 切页用浏览器原生 View Transitions 的能力判定（淡入淡出，零依赖）。
+// 三个条件缺一不可：宿主真的实现了 startViewTransition、动效开关为真、根元素在
+// （root 快照要挂到 documentElement 上，没有它调用会直接抛）。同名的非函数值也算没有：
+// 有些 polyfill/壳浏览器会塞个占位属性，`in` 判断会被骗过去。
+// 判定收在这一个出口，调用方只有「原生过渡 / 直接换页」两条路，不必到处 try/catch 或嗅探 UA。
+export function canViewTransition (doc, motionOK) {
+  return Boolean(doc) && typeof doc.startViewTransition === 'function' &&
+    motionOK === true && Boolean(doc.documentElement)
+}
+
+// 用一次原生 View Transition 包住「引起主内容重渲染」的那一下（同步触发渲染在回调里跑）。
+// 拿不到能力（或用户关了动效）就直接 apply(false) 同步渲染：同一条出口，调用方不必分支。
+//
+// 为什么回调是 async + 微任务，而不是 rAF：preact 的 setState 在**微任务**里 flush
+// （standalone 包的 defer = Promise.prototype.then.bind(Promise.resolve())），所以
+// setState 之后 await 一次微任务，续体一定排在这次 flush 后面，DOM 已是新页；浏览器随后
+// 抓「新页」快照才对。千万别换成 `await new Promise(r => requestAnimationFrame(r))`：
+// 过渡的 DOM update 阶段渲染管线在等这个回调，rAF 被饿死、永远不来，Chrome 4s 后直接
+// 「Transition was aborted because of timeout in DOM update」——过渡整段没了，页面还卡 4s
+// （已在真实 Chrome 里实测复现）。等待里不碰帧、不碰定时器，就不会有这种死锁。
+//
+// 约定：
+// - apply 只会被调用一次（浏览器中途 abort 或回调被重复触发都不补渲染），入参 true 表示
+//   这次渲染由过渡驱动（页面级入场动画据此让位，避免两套淡入叠在一起）。
+// - transition.finished 只挂一个吞掉的 catch，**不 await**：连点会 abort 上一段过渡，
+//   那是预期路径，等它会把点击卡住，也不该在控制台刷「未处理拒绝」。
+// - 更新回调里的异常不吞：updateCallbackDone 不做任何 catch，让它照常冒到
+//   console / 错误上报；startViewTransition 自己同步抛错时才补一次普通渲染（切页不能因为
+//   过渡起不来而停在旧页）。
+export function runViewTransition (doc, motionOK, apply) {
+  if (typeof apply !== 'function') return null
+  if (!canViewTransition(doc, motionOK)) {
+    apply(false)
+    return null
+  }
+  let rendered = false
+  const renderOnce = (viaTransition) => {
+    if (rendered) return
+    rendered = true
+    apply(viaTransition)
+  }
+  let transition = null
+  try {
+    transition = doc.startViewTransition(async () => {
+      renderOnce(true)
+      // 两次微任务：第一个让 preact 的 flush 先跑；第二个兜住「渲染里又 setState
+      // 再排一次 flush」（切页后 layout effect 补状态就是这种形态）。
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+  } catch (e) {
+    renderOnce(false)
+    return null
+  }
+  if (transition) {
+    // 不阻塞：连点时旧的那段会被 skip / abort，ready 与 finished 都会拒绝——都属预期路径，
+    // 只挂空 catch。绝不能 await（会把点击卡住），也不能让它们变成未处理拒绝刷满控制台。
+    // 更新回调自己抛的异常走 updateCallbackDone，这里刻意不碰，照常冒到 console / 错误上报。
+    for (const key of ['ready', 'finished']) {
+      const p = transition[key]
+      if (p && typeof p.catch === 'function') p.catch(() => {})
+    }
+  }
+  return transition || null
+}
+
 // 配置页「过滤规则」块的数据口径（v3.312）：显示**实际生效值**，而不是只读代码默认。
 // 背景：过滤规则页写的是覆盖文件 filter-rules.json，配置页原先只读 Config.filter ⇒
 // 保存成功后两页对不上（用户看到「已保存」，配置页仍全空）。

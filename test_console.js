@@ -6828,8 +6828,12 @@ async function main () {
     assert.ok(prepBlock.includes('const firstVisit = !enteredRef.current.has(next)'),
       '必须先判断目标页是否真正点开过（预挂载不算），再决定是否垫高')
     const prepPos = switchBlock.indexOf('prepareScroll(next)')
-    const tabPos = switchBlock.indexOf('setTab(next)')
-    assert.ok(prepPos > -1 && prepPos < tabPos, '必须先 prepareScroll 再 setTab')
+    const renderPos = switchBlock.indexOf('renderTab(next)')
+    assert.ok(prepPos > -1 && renderPos > -1 && prepPos < renderPos,
+      '必须先 prepareScroll 再触发重渲染（重渲染收口在 renderTab，setTab 在它内部）')
+    const renderBlock = src.slice(src.indexOf('const renderTab = (next) =>'), src.indexOf('renderTabRef.current = renderTab'))
+    assert.ok(renderBlock.includes('setTab(next)') && !renderBlock.includes('prepareScroll'),
+      '切页渲染出口只负责换页（滚动记忆/垫高必须留在包外，先记位置再换）')
     const syncPos = scrollBlock.indexOf('window.scrollTo(0, y)')
     const rafPos = scrollBlock.indexOf('requestAnimationFrame')
     assert.ok(syncPos > -1 && (rafPos === -1 || syncPos < rafPos),
@@ -6863,11 +6867,13 @@ async function main () {
     const sysBlock = src.slice(src.indexOf('const markSysReady'), src.indexOf('const onSysReady'))
     assert.ok(sysBlock.includes('syncMemRef.current.sys = ts') && sysBlock.includes('setPanelReadyAt(performance.now())'),
       '系统页两个面板都完成时必须缓存 sys 时间并写 ready 标记')
-    const switchSyncBlock = src.slice(src.indexOf('const doSwitchTab ='), src.indexOf('const openLog = useCallback'))
-    assert.ok(switchSyncBlock.includes('showSyncFor(next)'), '页签点击必须同步切到目标页缓存时间')
+    assert.ok(renderBlock.includes('showSyncFor(next)') &&
+      renderBlock.indexOf('showSyncFor(next)') < renderBlock.indexOf('setTab(next)'),
+    '页签点击必须同步切到目标页缓存时间（重渲染出口里先换「数据截至」再换页）')
     const hashStart = src.lastIndexOf('const onHash =')
     const hashSyncBlock = src.slice(hashStart, src.indexOf("window.addEventListener('hashchange'", hashStart))
-    assert.ok(hashSyncBlock.includes('showSyncFor(next)'), '后退/前进必须同步切到目标页缓存时间')
+    assert.ok(hashSyncBlock.includes('renderTabRef.current(next)'),
+      '后退/前进必须走同一个渲染出口（showSyncFor / markVisited / setTab 收口在 renderTab，不得各写一份）')
     const openLogSyncBlock = src.slice(src.indexOf('const openLog ='), src.indexOf('const pollMs ='))
     assert.ok(openLogSyncBlock.includes("showSyncFor('logs')"), '查看日志必须切到 logs 的缓存时间')
     assert.ok(src.includes('const loadSeqRef = useRef(0)') &&
@@ -7229,6 +7235,142 @@ async function main () {
     assert.strictEqual(motionAllowed(false), true, '未开启时必须允许动效')
     assert.strictEqual(motionAllowed(undefined), true, '取不到 media query（老浏览器/测试环境）时按允许处理')
     assert.strictEqual(motionAllowed(null), true, 'matchMedia 缺失时不得把动效全关掉')
+  })
+
+  await aok('行为: canViewTransition（有/无 startViewTransition × 动效开/关，四种输入都要判对）', async () => {
+    const { canViewTransition } = await import('./scripts/console-assets/pure.mjs')
+    const doc = { startViewTransition: () => ({}), documentElement: {} }
+    assert.strictEqual(canViewTransition(doc, true), true, '宿主有 startViewTransition + 动效开 + 有根元素 ⇒ 才允许')
+    assert.strictEqual(canViewTransition({ documentElement: {} }, true), false, '没有这个 API（旧 Safari / 老 WebView）必须降级')
+    assert.strictEqual(canViewTransition({ startViewTransition: 'placeholder', documentElement: {} }, true), false,
+      '同名但不是函数也必须降级（壳浏览器塞的占位属性不能靠 in 判断骗过去）')
+    assert.strictEqual(canViewTransition(doc, false), false, '系统开了「减少动效」必须降级（页面不许再淡）')
+    assert.strictEqual(canViewTransition(doc, undefined), false, '动效开关取不到时按「不动」处理（fail-safe）')
+    assert.strictEqual(canViewTransition({ startViewTransition: () => ({}), documentElement: null }, true), false,
+      '没有 documentElement 就无法命名 root 快照，必须降级')
+    assert.strictEqual(canViewTransition(null, true), false, '拿不到 document 时返回 false，不能抛')
+  })
+
+  await aok('行为: runViewTransition（先起过渡、再渲染、再等微任务；拿不到能力就同步渲染且只渲染一次）', async () => {
+    const { runViewTransition } = await import('./scripts/console-assets/pure.mjs')
+    // 假 document：只记顺序，不碰真 DOM（纯函数模块不该要求 DOM 存在）。
+    const order = []
+    let pending = null
+    let renders = 0
+    const doc = {
+      documentElement: {},
+      startViewTransition (cb) {
+        order.push('startViewTransition')
+        pending = cb
+        return { finished: Promise.resolve(), updateCallbackDone: Promise.resolve() }
+      }
+    }
+    const t = runViewTransition(doc, true, (via) => {
+      renders++
+      order.push(via === true ? 'render:vt' : 'render:plain')
+    })
+    assert.ok(t, '有能力时必须返回 transition 句柄（调用方据此判断有没有降级）')
+    assert.deepStrictEqual(order, ['startViewTransition'], '必须先起过渡；渲染只能发生在它的回调里')
+    assert.strictEqual(renders, 0, '回调还没跑，此时不得渲染（否则浏览器抓到的「旧页」快照已经变了）')
+    await pending()
+    assert.deepStrictEqual(order, ['startViewTransition', 'render:vt'],
+      '顺序必须是：起过渡 → 同步渲染（之后的微任务等待在纯函数内部，不排帧）')
+    assert.strictEqual(renders, 1, '一次切页只渲染一次')
+    // 回调被重复触发（浏览器 abort 后重放）也不得补渲染。
+    let pending2 = null
+    let renders2 = 0
+    runViewTransition({ documentElement: {}, startViewTransition (cb) { pending2 = cb; return { finished: Promise.resolve() } } },
+      true, () => { renders2++ })
+    await pending2()
+    await pending2()
+    assert.strictEqual(renders2, 1, '更新回调被调两次也不得重复渲染')
+    // 降级：没有 API ⇒ 同步渲染，不起过渡（页面要立刻换，不能等任何异步）。
+    const plainLog = []
+    const degraded = runViewTransition({ documentElement: {} }, true,
+      (via) => { plainLog.push('render:' + String(via)) })
+    assert.strictEqual(degraded, null, '降级时必须返回 null（不能假装起过过渡）')
+    assert.deepStrictEqual(plainLog, ['render:false'], '降级路径同步渲染，且不让页面级入场让位')
+    // 动效关：连 startViewTransition 都不许调。
+    let called = 0
+    const reducedLog = []
+    const reduced = runViewTransition(
+      { documentElement: {}, startViewTransition () { called++; return { finished: Promise.resolve() } } }, false,
+      () => { reducedLog.push('render') })
+    assert.strictEqual(reduced, null, '关动效时必须返回 null')
+    assert.strictEqual(called, 0, 'prefers-reduced-motion 下不得起过渡')
+    assert.deepStrictEqual(reducedLog, ['render'], '关动效时直接换页')
+    // 过渡起不来（浏览器同步抛错）：补一次普通渲染，切页不能停在旧页。
+    let fallback = 0
+    const threw = runViewTransition(
+      { documentElement: {}, startViewTransition () { throw new Error('InvalidStateError') } }, true,
+      () => { fallback++ })
+    assert.strictEqual(threw, null, '起过渡失败必须走降级路径')
+    assert.strictEqual(fallback, 1, '失败后必须补一次渲染（否则点了没反应）')
+    // 连点：上一段过渡被 skip/abort ⇒ ready 与 finished 都拒绝。只挂吞掉的 catch，
+    // 绝不 await（await 会把点击卡住）。updateCallbackDone 被访问就 throw：
+    // 证明我们没有给它挂 catch（更新回调里的异常不许被吞）。
+    let catchCalls = 0
+    const promiseLike = () => ({
+      then () {},
+      catch (fn) {
+        catchCalls++
+        assert.strictEqual(typeof fn, 'function', 'ready/finished 的 catch 要收一个函数')
+        return promiseLike()
+      }
+    })
+    const returned = runViewTransition({
+      documentElement: {},
+      startViewTransition () {
+        return { ready: promiseLike(), finished: promiseLike(), get updateCallbackDone () { throw new Error('不得给 updateCallbackDone 挂 catch：更新回调里的异常必须露出来') } }
+      }
+    }, true, () => {})
+    assert.ok(returned, 'abort 场景下照样返回句柄（调用方只看有没有过渡）')
+    assert.strictEqual(catchCalls, 2, 'ready 与 finished 各挂一个 catch：连点 skip/abort 属预期路径，不能刷未处理拒绝')
+  })
+
+  await aok('结构红线: 切页接入原生 View Transitions（接线 + 只用 opacity + reduced-motion 全关）', () => {
+    // CSS：剥掉注释再断言，注释里写示例块 / 把真块整段注释掉都不能骗过门禁。
+    const cssRaw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const css = cssRaw.replace(/\/\*[\s\S]*?\*\//g, '')
+    assert.ok(css.length < cssRaw.length, 'CSS 注释剥离必须真的生效（否则本断言恒真）')
+    assert.ok(css.includes('::view-transition-old(root)') && css.includes('::view-transition-new(root)'),
+      '必须有 root 新旧快照的伪元素规则，否则时长/曲线全由浏览器默认决定')
+    const pair = (css.match(/::view-transition-old\(root\),\s*::view-transition-new\(root\)\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(/animation-duration:\s*220ms/.test(pair), '淡出淡入必须 220ms（与 motion.js 的 MOTION.fast 同档）')
+    assert.ok(/animation-timing-function:\s*ease-out/.test(pair), '曲线必须是 ease-out')
+    assert.ok(!/::view-transition[^{]*\{[^}]*\btransform\s*:/.test(css),
+      '快照过渡里不得出现 transform —— 页面里有 position:fixed 的弹层，祖先一有 transform 就按它定位')
+    const page = (css.match(/\.page\s*\{[^}]*\}/) || [''])[0]
+    assert.ok(page && !/transform\s*:/.test(page), '.page 不得有 transform / transform 过渡')
+    const reduceIdx = css.indexOf('@media (prefers-reduced-motion: reduce)', css.indexOf('::view-transition-old(root)'))
+    assert.ok(reduceIdx > 0, '必须有一段 prefers-reduced-motion: reduce 把过渡直接关掉')
+    const reduceBody = css.slice(reduceIdx, reduceIdx + 400)
+    assert.ok(reduceBody.includes('::view-transition-old(root)') && /animation:\s*none\s*!important/.test(reduceBody),
+      'reduced-motion 块里必须 animation: none !important（伪元素的默认淡入也要关）')
+    if (process.env.XBK_MUTATION_CHILD !== '1') {
+      // 约定：app.js 只是入口（v3.367 起页面切换在 ui.js），readConsoleSource 拼的就是这份入口源码。
+      const src = readConsoleSource()
+      assert.ok(src.includes('runViewTransition('), '切页必须真的调 runViewTransition——只写 CSS 伪元素不会有任何过渡')
+      assert.ok(/import \{[^}]*\brunViewTransition\b[^}]*\} from '\.\/pure\.mjs'/.test(src),
+        '过渡的判定/收口必须来自 pure.mjs（Node 侧直接测同一份实现）')
+      assert.ok(/runViewTransition\(document, motionOK\(\)/.test(src),
+        '能力判定必须带上 motionOK()：用户关了动效就别起过渡')
+      assert.ok(src.includes('renderTab(next)') && src.includes('renderTabRef.current(next)'),
+        '点击切页与 hash 前进后退必须走同一个渲染出口（两处都包过渡，路由不另开一条路）')
+      assert.ok(/vtDrivenRef\.current = viaTransition/.test(src) && src.includes('if (!root || viaTransition) return'),
+        '过渡驱动的那一帧要跳过页面级入场，否则两套淡入叠加会先淡到发白再回来')
+      assert.ok(!/await\s+[\w.]*finished/.test(src), 'transition.finished 不得 await：连点会 abort，等待会把点击卡住')
+      const pureSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pure.mjs'), 'utf8')
+      const runner = pureSrc.slice(pureSrc.indexOf('export function runViewTransition'),
+        pureSrc.indexOf('// 配置页「过滤规则」块的数据口径'))
+      assert.ok(runner.length > 200, 'runViewTransition 源码切片必须真的取到（否则下面两条恒真）')
+      assert.ok(!/requestAnimationFrame|setTimeout|setInterval/.test(runner),
+        '更新回调里不得等帧/定时器：过渡的 DOM update 阶段 rAF 会被饿死，Chrome 4s 后 abort 整段过渡')
+      assert.ok((runner.match(/await Promise\.resolve\(\)/g) || []).length >= 2,
+        '必须用微任务等 preact 的 flush（setState 就是微任务里刷的），两次兜住连环 setState')
+      const appSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+      assert.ok(!appSrc.includes('startViewTransition'), '首屏挂载不得包过渡：第一帧要立刻出来，不能等快照')
+    }
   })
 
   await aok('行为: morphFrom（弹窗从触发点长出来的几何：等比缩放 / 夹下限 / 量不到尺寸退回 null）', async () => {
