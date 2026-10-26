@@ -729,6 +729,11 @@
     margin-left: -9px;
     border-radius: 2px;
   }
+  /* v3.385 日志虚拟滚动：只挂可视窗口的行，外层高度 = 全部行总高（滚动条长度仍是真实行数）。
+     行是块级 + 绝对定位，纵向位置用 transform 给（不触发布局）；pre-wrap 的折行照旧，
+     块级行复制出来天然一行一条，不再依赖 "\n" 文本节点。 */
+  .log-virt { display: block; position: relative; }
+  .log-virt .logline { display: block; position: absolute; top: 0; left: 0; right: 0; }
   /* 搜索命中：<mark> 默认黄底黑字会把 ERROR 行的红字盖成黑色，这里只加底色、
      文字色继承所在行（深浅主题都成立）。 */
   .logpre mark { background: var(--warn-soft); color: inherit; border-radius: 2px; box-shadow: inset 0 0 0 1px var(--warn-line); }

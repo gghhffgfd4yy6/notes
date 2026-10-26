@@ -692,7 +692,10 @@ const STATIC_ASSETS = Object.freeze({
   '/assets/motion.js': { file: 'motion.js', type: 'text/javascript; charset=utf-8' },
   '/assets/motion-lib.module.js': { file: 'motion-lib.module.js', type: 'text/javascript; charset=utf-8' },
   // 定位引擎：@floating-ui/dom 1.8.0（MIT）单文件 bundle，只含 computePosition/offset/flip/shift/size。
-  '/assets/floating-ui.module.js': { file: 'floating-ui.module.js', type: 'text/javascript; charset=utf-8' }
+  '/assets/floating-ui.module.js': { file: 'floating-ui.module.js', type: 'text/javascript; charset=utf-8' },
+  // 虚拟滚动：@tanstack/virtual-core 3.13.12（MIT）单文件 bundle，只含 Virtualizer。
+  // 日志页用它算「只挂可视窗口的行」的窗口与总高度（1 MiB 尾部可达数千行）。
+  '/assets/virtual-core.module.js': { file: 'virtual-core.module.js', type: 'text/javascript; charset=utf-8' }
 })
 
 // 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，各文件 < 100KB）。
@@ -1045,6 +1048,7 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
 <link rel="modulepreload" href="${assetBaseUrl}/motion.js">
 <link rel="modulepreload" href="${assetBaseUrl}/motion-lib.module.js">
 <link rel="modulepreload" href="${assetBaseUrl}/floating-ui.module.js">
+<link rel="modulepreload" href="${assetBaseUrl}/virtual-core.module.js">
 <link rel="modulepreload" href="${assetBaseUrl}/api.js">
 <link rel="modulepreload" href="${assetBaseUrl}/constants.js">
 <link rel="modulepreload" href="${assetBaseUrl}/format.js">

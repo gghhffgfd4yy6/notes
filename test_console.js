@@ -7937,10 +7937,14 @@ async function main () {
     assert.ok(/\.logpre-main\s*\{[^}]*max-height:\s*520px/.test(css), '桌面日志框 520px')
     const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
     assert.ok(/\.logpre-main\s*\{[^}]*min\(62dvh, 520px\)/.test(phone), '手机日志框必须 min(62dvh, 520px)')
-    // B. 行级渲染 + 高亮：一行一个节点、换行仍是真实 "\n"（复制/空行都不变）。
+    // B. 行级渲染 + 高亮：一行一个节点（只挂可视窗口内的），块级行不靠 "\n" 文本节点断行。
     assert.ok(src.includes('class=' + ph("'logline' + (tone ? ' logline-' + tone : '') + (isFocus ? ' logline-focus' : '')")), '日志必须逐行渲染并按级别着色')
-    assert.ok(src.includes('}' + ph("i === last ? '' : '\\n'") + '</span>'), '行间必须仍是真实换行（只加 display:block 会丢换行）')
-    assert.ok(src.includes('splitHits(line, kwNow)') &&
+    assert.ok(src.includes('class="log-virt"') && src.includes('style=' + ph("{ height: virtTotal + 'px' }")),
+      '日志行必须挂在虚拟容器里（外层高度 = 全部行总高，滚动条长度仍是真实行数）')
+    assert.ok(/\.log-virt\s+\.logline\s*\{[^}]*display:\s*block/.test(css) &&
+      /\.log-virt\s+\.logline\s*\{[^}]*position:\s*absolute/.test(css),
+    '虚拟行必须块级 + 绝对定位（复制时每行一条，不靠换行文本节点；折行高度由库量）')
+    assert.ok(src.includes('splitHits(line, kw)') &&
       src.includes('html`<mark key=' + ph('j') + '>' + ph('text') + '</mark>`'), '命中片段必须用 <mark> 包起来')
     assert.ok(!/innerHTML\s*=/.test(src), '高亮不得拼 innerHTML（用户输入只能是文本节点）')
     assert.ok(/\.logline-bad\s*\{[^}]*var\(--bad-fg\)/.test(css) && /\.logline-warn\s*\{[^}]*var\(--warn-fg\)/.test(css),
@@ -7949,18 +7953,29 @@ async function main () {
     // 性能护栏：>3000 行退回纯文本，且计数行明说。
     assert.ok(src.includes('const LOG_HIGHLIGHT_MAX = 3000'), '高亮护栏阈值必须是 3000 行')
     assert.ok(src.includes('const heavy = ranged.length > LOG_HIGHLIGHT_MAX'), '超过阈值必须走纯文本分支（v3.326 起按区间过滤后的行数算）')
-    const guardAt = src.indexOf('if (ranged.length > LOG_HIGHLIGHT_MAX) return null')
-    assert.ok(guardAt > 0, '超阈值必须在 useMemo 里短路（不能先 map 一遍再二选一）')
-    assert.ok(src.indexOf('return ranged.map((line, i) =>', guardAt - 200) > guardAt, '护栏必须早于 map（顺序反了等于没省）')
+    // 虚拟滚动只省「挂多少个节点」，不省 filterLogLines 的整串扫描：阈值与降级行为保持不变。
+    assert.ok(src.includes('count: heavy ? 0 : ranged.length'), '超阈值必须把虚拟器关掉（count 归零）')
+    assert.ok(src.includes('enabled: !heavy'), '纯文本分支不得继续挂滚动监听 / 算窗口')
+    assert.ok(src.includes('if (!heavy) {') && src.includes('virtItems.map((it) =>'),
+      '虚拟模式只遍历可视窗口（vItems），不再整表 map')
+    assert.ok(!src.includes('ranged.map((line, i) =>'), '不得再整表 map 出节点（那正是要省的部分）')
     assert.ok(src.includes('已关闭高亮'), '关掉高亮必须在计数行写明（不能让人以为搜不到）')
     assert.ok(/heavy \? shownText : lineNodes/.test(src), '超阈值必须退回纯文本渲染')
+    // 窗口驱动：滚动/量高/区间都交给 vendor 的 virtual-core，preact 只负责重渲染。
+    assert.ok(src.includes('useLayoutEffect(() => virt._didMount(), [])') && src.includes('virt._willUpdate()'),
+      'virtual-core 必须按官方 adapter 两步驱动（_didMount 挂载 / _willUpdate 每帧）')
+    assert.ok(src.includes('ref=' + ph('virt.measureElement')), '行高必须交给库量（长行折行后估算值不准）')
+    assert.ok(src.includes("import { Virtualizer, elementScroll, observeElementOffset, observeElementRect } from './virtual-core.module.js'"),
+      'Virtualizer 必须是本地 vendored 资产（不引 CDN）')
+    assert.ok(src.includes('const VIRT_ADAPTER = { observeElementRect, observeElementOffset, scrollToFn: elementScroll }'),
+      'DOM 适配四件套必须显式给（库不自带；缺 scrollToFn 会让 scrollToIndex 抛错）')
     // 计数行点名筛选 + 空态出口（0 命中先点名筛选，再给「在全部日志中搜索」）。
     assert.ok(src.includes('筛选下 · 显示 ' + ph('ranged.length') + ' / ' + ph('lines.length') + ' 行'),
       '筛选非 all 时计数行必须点名筛选（v3.326 起按含日期区间的 ranged 计数）')
     assert.ok(src.includes('在全部日志中搜索') && src.includes('onClick=' + ph('searchAllLogs')),
       '空态必须给「在全部日志中搜索」按钮')
     assert.ok(src.includes('在「' + ph('modeLabel') + '」筛选下没有匹配的日志行'), '空态文案必须点名当前筛选')
-    const searchAll = src.slice(src.indexOf('const searchAllLogs = () => {'), src.indexOf('// 一行一个 <span>'))
+    const searchAll = src.slice(src.indexOf('const searchAllLogs = () => {'), src.indexOf('// 只渲染可视窗口'))
     assert.ok(searchAll.includes("setMode('all')") && !searchAll.includes('setQ('), '出口只放开筛选、必须保留关键词')
     assert.ok(src.includes('分类可重叠'), '计数行必须注明分类可重叠（269 ≠ 100+165 的自洽提示）')
   })
@@ -8030,7 +8045,8 @@ async function main () {
     assert.ok(logs.includes("const isFocus = focusAt !== '' && line.startsWith(focusAt)") &&
       logs.includes("(isFocus ? ' logline-focus' : '')"), '高亮类必须由 isFocus 条件真实驱动')
     assert.ok(logs.includes('focusDoneRef.current = focusAt'), '滚动完成后必须记下 focusAt（否则轮询会反复拽回）')
-    assert.ok(logs.includes('pre.scrollTop = Math.max(0'), '定位滚动必须落在日志框内')
+    assert.ok(logs.includes("virt.scrollToIndex(idx, { align: 'center' })"),
+      '定位必须按索引交给虚拟器居中（那一行未必在当前窗口里，量不到矩形）')
     assert.ok(src.includes('const bottomAfter = line.getBoundingClientRect().bottom - (y - startY)') &&
       src.includes('y += bottomAfter - (vh - 12)'), '小屏必须把页面多滚一点，保证高亮行完整可见')
     assert.ok(logs.includes('focusOnly ? base.filter((l) => l.startsWith(focusAt)) : base'),
