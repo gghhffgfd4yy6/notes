@@ -1056,3 +1056,13 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 文档：`README.md` 抽屉条目补退场行为；`SYSTEM_CONTRACT.md` 抽屉契约补「退场同样不得淡出、遮罩静态值必须是 0」。
 - 测试：抽屉组件用例补 6 条断言（遮罩静态 0 / forwards / 退场无 opacity / 整块滑出 / `:has` 淡出 / reduce 下实心）；控制台套件 282 通过。
 - 版本 3.381.0。
+
+## v3.382 — 控制台：API/HTML 支持 brotli 协商压缩
+
+- 现象：手机弱网打开控制台，首屏最大的一块是 HTML（未压缩），API JSON 也只有 gzip；同样内容用 brotli 通常还能再小 15%–20%。
+- 改法：`sendJson` / `sendJsonConditional` / 页面出口统一按 `Accept-Encoding` 协商，`br` 与 `gzip` 按 q 值择优（相等时 br 优先，`br;q=0` 回落 gzip），同一份内容取实际更小的表示；阈值、8MiB 上限、>256KB 低 quality、`Vary`、`-br`/`-gz` 变体 ETag 与 406 语义沿用 gzip 那套。
+- 边界：SSE、JSON/CSV 导出、备份导出仍不压；HTML 参与压缩但不参与 ETag/304（正文含 boot token 且 `no-store`）。
+- 文档：`README.md` 资产段补 brotli 与 HTML 压缩；`SYSTEM_CONTRACT.md` 压缩契约改为 br 优先并说明 HTML 也压。
+- 测试：brotli 往返解压字节相等、q 值择优、`br;q=0` 回落、两种表示都不可接受时 406、HTML br/明文两条路径；控制台套件 286 通过。
+- 版本 3.382.0。
+

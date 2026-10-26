@@ -3019,7 +3019,7 @@ async function main () {
     assert.notStrictEqual(conditionalVariant({ url: '/api/run-history?limit=10' }), conditionalVariant({ url: '/api/run-history?limit=200' }),
       '不同查询串必须是不同变体（否则 10 条的 304 会冒充 200 条）')
   })
-  await aok('HTTP: API JSON 协商式 gzip（变体 ETag / 阈值反例 / HTML-SSE-导出不压）', async () => {
+  await aok('HTTP: API JSON 协商式 gzip（变体 ETag / 阈值反例 / HTML 也压 / SSE-导出不压）', async () => {
     const dir = tmpDir()
     const { gzipVariantTag, GZIP_MIN_BYTES } = require('./scripts/console.js')
     // >512B 的推送记录夹具：/api/messages 是条件请求端点，正好同时验证「压缩 + 变体 tag」。
@@ -3076,11 +3076,11 @@ async function main () {
       assert.ok(small.body.length < GZIP_MIN_BYTES, `反例必须真的低于阈值（实际 ${small.body.length}B）`)
       assert.strictEqual(small.headers['content-encoding'], undefined, '低于 512B 的响应不得压缩')
       assert.ok(Object.prototype.hasOwnProperty.call(JSON.parse(small.body.toString('utf8')), 'auto'), '小响应仍是完整 JSON')
-      // HTML 反向断言：含 boot token 且只有 ~1.9KB，压了只多一次解压。
+      // HTML（v3.374 起反转）：首屏壳 ~200KB，是首屏最大的一块单响应，gzip-only 客户端拿 gzip。
       const page = await requestBuffer(port, 'GET', '/', { token: TOKEN, headers: { 'accept-encoding': 'gzip' } })
       assert.strictEqual(page.status, 200)
-      assert.strictEqual(page.headers['content-encoding'], undefined, 'HTML 不得压缩（含 boot token）')
-      assert.ok(page.body.toString('utf8').includes('xbk-boot'), 'HTML 仍是可读原文')
+      assert.strictEqual(page.headers['content-encoding'], 'gzip', 'HTML 自 v3.374 起也压（gzip-only 客户端拿 gzip）')
+      assert.ok(zlib.gunzipSync(page.body).toString('utf8').includes('xbk-boot'), 'gzip 解压后仍是完整页面')
       // 导出附件：浏览器直接落盘，压了会破坏「另存为」的体积口径。
       const expHeaders = { 'content-type': 'application/x-www-form-urlencoded', 'accept-encoding': 'gzip' }
       const expJson = await requestBuffer(port, 'POST', '/api/messages/export', { token: TOKEN, body: 'format=json', headers: expHeaders })
@@ -3111,6 +3111,187 @@ async function main () {
       assert.strictEqual(refuse.body.length, 0, '406 不带 body')
       const smallRefuse = await requestBuffer(port, 'GET', '/api/auto', { token: TOKEN, headers: { 'accept-encoding': 'gzip, identity;q=0' } })
       assert.strictEqual(smallRefuse.status, 406, '小响应压不了且 identity 被拒 → 406')
+    } finally { server.close() }
+  })
+  await aok('negotiateEncodings: q 值定序 / 相等取 br / 显式 q=0 回落 / 通配不翻盘', () => {
+    const { negotiateEncodings } = require('./scripts/console.js')
+    assert.deepStrictEqual(negotiateEncodings('br'), ['br'], '只声明 br 就只有 br 可用')
+    assert.deepStrictEqual(negotiateEncodings('gzip'), ['gzip'], 'gzip-only 客户端不得被塞 br')
+    assert.deepStrictEqual(negotiateEncodings('gzip, deflate, br'), ['br', 'gzip'],
+      '相等 q 时 br 在前（浏览器实发就是 gzip, deflate, br）')
+    assert.deepStrictEqual(negotiateEncodings('gzip;q=1, br;q=0.9'), ['gzip'], 'gzip 的 q 更高就只给 gzip')
+    assert.deepStrictEqual(negotiateEncodings('br;q=0.5, gzip'), ['gzip'], 'br q 更低同样让位')
+    assert.deepStrictEqual(negotiateEncodings('br;q=0, gzip'), ['gzip'], '显式拒绝 br 必须回落 gzip')
+    assert.deepStrictEqual(negotiateEncodings('br;q=0'), [], 'br 被拒且没有 gzip ⇒ 只剩 identity')
+    assert.deepStrictEqual(negotiateEncodings('gzip;q=0, br'), ['br'], '显式拒绝 gzip 仍可用 br')
+    assert.deepStrictEqual(negotiateEncodings('br;q=0, *'), ['gzip'],
+      'br 被显式拒绝、gzip 由 * 覆盖 ⇒ 回落 gzip（拒绝的是 br，不是所有压缩）')
+    assert.deepStrictEqual(negotiateEncodings('gzip;q=0, *'), ['br'], 'gzip 被显式拒绝时 * 只补上 br')
+    assert.deepStrictEqual(negotiateEncodings('*'), ['br', 'gzip'], '通配 = 两种都收，br 优先')
+    assert.deepStrictEqual(negotiateEncodings('gzip;q=abc'), [], '非法 q 按拒绝')
+    assert.deepStrictEqual(negotiateEncodings(''), [], '空头 = 不压缩')
+    assert.deepStrictEqual(negotiateEncodings(undefined), [], '缺头 = 不压缩')
+  })
+  await aok('compressBody/encodeContent: br 档位 / 阈值与上限反例 / 双候选取更小', () => {
+    const {
+      BROTLI_QUALITY, BROTLI_LARGE_QUALITY, GZIP_MIN_BYTES, GZIP_LARGE_BYTES, GZIP_MAX_BYTES,
+      compressBody, encodeContent
+    } = require('./scripts/console.js')
+    assert.strictEqual(BROTLI_QUALITY, 6, '默认档位恰为 6（用例与实现同源对账）')
+    assert.strictEqual(BROTLI_LARGE_QUALITY, 4, '大响应档位恰为 4')
+    // 档位按 zlib 输出逐字节对账（不只是「有压缩」）：≤256KB 用 6、>256KB 用 4。
+    const small = Buffer.from('y'.repeat(1000), 'utf8')
+    assert.deepStrictEqual(encodeContent('br', small),
+      zlib.brotliCompressSync(small, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 6 } }),
+      '≤256KB 必须用 brotli quality 6')
+    const big = Buffer.from('z'.repeat(GZIP_LARGE_BYTES + 1), 'utf8')
+    assert.deepStrictEqual(encodeContent('br', big),
+      zlib.brotliCompressSync(big, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 } }),
+      '>256KB 必须降 quality 4（同步压缩要省 CPU）')
+    assert.deepStrictEqual(encodeContent('gzip', big), zlib.gzipSync(big, { level: 1 }),
+      'gzip 档位不因引入 br 而变（>256KB 仍是 level 1）')
+    assert.deepStrictEqual(encodeContent('gzip', small), zlib.gzipSync(small, { level: 6 }),
+      'gzip ≤256KB 仍是 level 6')
+    // 阈值/上限：br 与 gzip 同一套门槛，越界一律回 identity。
+    assert.strictEqual(compressBody({ xbkEnc: ['br'] }, 'x'.repeat(GZIP_MIN_BYTES - 1)), null,
+      '低于 512B 不得压（压了更大）')
+    assert.ok(compressBody({ xbkEnc: ['br'] }, 'x'.repeat(GZIP_MIN_BYTES)), '恰好 512B 必须压')
+    assert.strictEqual(compressBody({ xbkEnc: ['br'] }, 'x'.repeat(GZIP_MAX_BYTES + 1)), null,
+      '超过 8MiB 必须回 identity（同步压缩会按住事件循环）')
+    assert.strictEqual(compressBody({ xbkEnc: [] }, 'x'.repeat(1000)), null, '不接受压缩必须不压')
+    assert.strictEqual(compressBody({}, 'x'.repeat(1000)), null, '没有协商标记（非 HTTP 调用点）必须不压')
+    assert.strictEqual(compressBody(null, 'x'.repeat(1000)), null, 'res 缺失时不得抛')
+    // 双候选：同一段文本 br 更小 ⇒ 选 br，且解压后必须与原文逐字相同。
+    const body = Buffer.from(JSON.stringify({ rows: Array.from({ length: 40 }, (_, i) => ({ i, t: `条目${i}`, u: `/a/${i}.html` })) }), 'utf8')
+    const picked = compressBody({ xbkEnc: ['br', 'gzip'] }, body)
+    assert.strictEqual(picked.encoding, 'br', '这段 JSON br 更小 ⇒ 选 br（不得为「优先」多花字节）')
+    assert.deepStrictEqual(zlib.brotliDecompressSync(picked.body), body, 'br 解压后必须与原文逐字相等')
+    // gzip 更小的分支：把 br 输出撑大（同一 zlib 模块对象，console.js 与测试共享引用），
+    // 必须回落 gzip——否则「br 结果小于 gzip 才用 br」这条规则没有可证伪的用例。
+    const realBrotli = zlib.brotliCompressSync
+    try {
+      zlib.brotliCompressSync = () => Buffer.alloc(body.length + 100)
+      const fallback = compressBody({ xbkEnc: ['br', 'gzip'] }, body)
+      assert.strictEqual(fallback.encoding, 'gzip', 'br 反而更大时必须回 gzip')
+      assert.deepStrictEqual(zlib.gunzipSync(fallback.body), body, '回落后的 gzip 解压必须逐字相等')
+      // 只有 br 可接受时不能因为「br 更大」就改发客户端没收下的 gzip。
+      assert.strictEqual(compressBody({ xbkEnc: ['br'] }, body).encoding, 'br', '单候选必须尊重客户端声明')
+    } finally { zlib.brotliCompressSync = realBrotli }
+    // 变体 tag：gzip 仍是 -gz（v3.373 兼容），br 是 -br。
+    const { encodingVariantTag, gzipVariantTag } = require('./scripts/console.js')
+    assert.strictEqual(encodingVariantTag('"abc"', 'br'), '"abc-br"')
+    assert.strictEqual(encodingVariantTag('"abc"', 'gzip'), '"abc-gz"')
+    assert.strictEqual(gzipVariantTag('"abc"'), '"abc-gz"', 'gzip tag 拼法不得变（已有缓存不能一次性失配）')
+  })
+  await aok('HTTP: API JSON brotli 协商（br 优先 / gzip 回退 / 变体 tag / 406 / Vary）', async () => {
+    const dir = tmpDir()
+    const { encodingVariantTag, GZIP_MIN_BYTES } = require('./scripts/console.js')
+    const msgs = []
+    for (let i = 1; i <= 12; i++) {
+      msgs.push({
+        id: i,
+        title: `特价标题${i}`,
+        content: `第${i}条内容`.repeat(30),
+        catename: '好单-日用',
+        shijianchuo: i * 1000,
+        datetime: '2026-10-15',
+        shorttime: '10:00',
+        price: i,
+        url: `/a/${i}.html`
+      })
+    }
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify(msgs))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const plain = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'identity' } })
+      assert.ok(plain.body.length > GZIP_MIN_BYTES, `夹具必须越过压缩阈值（实际 ${plain.body.length}B，否则断言恒真）`)
+      const identityTag = plain.headers.etag
+      // 1) 只声明 br ⇒ Content-Encoding: br，解压后与 identity 逐字相同。
+      const br = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'br' } })
+      assert.strictEqual(br.status, 200)
+      assert.strictEqual(br.headers['content-encoding'], 'br', '声明 br 时必须回 br')
+      assert.deepStrictEqual(zlib.brotliDecompressSync(br.body), plain.body, 'br 解压后必须与 identity 逐字相等')
+      assert.ok(br.body.length < plain.body.length, 'br 体必须更小')
+      assert.match(String(br.headers.vary || ''), /Accept-Encoding/, 'br 响应必须带 Vary: Accept-Encoding')
+      assert.strictEqual(br.headers.etag, encodingVariantTag(identityTag, 'br'), 'br tag 必须是 identity tag 的 -br 变体')
+      // 2) 两种都收（浏览器形态）⇒ br（同一份内容 br 更小）。
+      const both = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'gzip, deflate, br' } })
+      assert.strictEqual(both.headers['content-encoding'], 'br', 'br 与 gzip 都可用时取 br')
+      assert.deepStrictEqual(zlib.brotliDecompressSync(both.body), plain.body, '协商出的 br 必须解压回原文')
+      assert.strictEqual(both.headers.etag, br.headers.etag, '同一份内容同一协商结果 ⇒ 同一个 tag')
+      // 3) 显式拒绝 br ⇒ gzip（不能因为「br 更好」硬塞）。
+      const noBr = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'br;q=0, gzip' } })
+      assert.strictEqual(noBr.headers['content-encoding'], 'gzip', 'br;q=0 时必须回落 gzip')
+      assert.deepStrictEqual(zlib.gunzipSync(noBr.body), plain.body, 'gzip 解压后必须与 identity 逐字相等')
+      assert.strictEqual(noBr.headers.etag, encodingVariantTag(identityTag, 'gzip'), 'gzip tag 仍是 -gz 变体')
+      assert.notStrictEqual(noBr.headers.etag, br.headers.etag, '两个表示必须是不同 tag')
+      // 4) 304 按请求协商出的表示比对：br tag 只命中 br 请求。
+      const hit = await requestBuffer(port, 'GET', '/api/messages', {
+        token: TOKEN,
+        headers: { 'accept-encoding': 'br', 'if-none-match': br.headers.etag }
+      })
+      assert.strictEqual(hit.status, 304, 'br 变体 tag 命中必须 304')
+      assert.strictEqual(hit.body.length, 0, '304 不得带 body')
+      assert.strictEqual(hit.headers['content-encoding'], undefined, '304 不得带 Content-Encoding')
+      assert.strictEqual(hit.headers.etag, br.headers.etag, '304 必须回显所选变体的 tag')
+      assert.match(String(hit.headers.vary || ''), /Accept-Encoding/, '304 仍须 Vary')
+      assert.strictEqual(hit.headers['cache-control'], 'no-store', '304 仍须 no-store')
+      const cross = await requestBuffer(port, 'GET', '/api/messages', {
+        token: TOKEN,
+        headers: { 'accept-encoding': 'br', 'if-none-match': noBr.headers.etag }
+      })
+      assert.strictEqual(cross.status, 200, 'gzip 变体的 tag 不得命中 br 请求（否则客户端把 gzip 字节当 br 解）')
+      const gzipHit = await requestBuffer(port, 'GET', '/api/messages', {
+        token: TOKEN,
+        headers: { 'accept-encoding': 'br;q=0, gzip', 'if-none-match': noBr.headers.etag }
+      })
+      assert.strictEqual(gzipHit.status, 304, 'gzip 变体 tag 在自己的协商路径上仍是 304')
+      // 5) 406：br 与 gzip 都被 q=0 拒绝、identity 也被拒 —— 大响应（可压）与小响应（低于阈值）都要 406。
+      const refuse = await requestBuffer(port, 'GET', '/api/messages', { token: TOKEN, headers: { 'accept-encoding': 'br;q=0, gzip;q=0, identity;q=0' } })
+      assert.strictEqual(refuse.status, 406, 'br 与 gzip 都被拒且 identity 被拒 ⇒ 406（不得硬塞 identity）')
+      assert.strictEqual(refuse.body.length, 0, '406 不带 body')
+      const small = await requestBuffer(port, 'GET', '/api/auto', { token: TOKEN, headers: { 'accept-encoding': 'identity' } })
+      assert.ok(small.body.length < GZIP_MIN_BYTES, `反例必须真的低于阈值（实际 ${small.body.length}B）`)
+      const smallRefuse = await requestBuffer(port, 'GET', '/api/auto', { token: TOKEN, headers: { 'accept-encoding': 'br;q=0, gzip;q=0, identity;q=0' } })
+      assert.strictEqual(smallRefuse.status, 406, '小响应压不了且没有可接受表示 ⇒ 406')
+    } finally { server.close() }
+  })
+  await aok('HTTP: SPA 页面按协商压缩（br 优先 / 无头明文 / 保留 no-store 与 CSP）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    try {
+      const br = await requestBuffer(port, 'GET', '/', { token: TOKEN, headers: { 'accept-encoding': 'br' } })
+      assert.strictEqual(br.status, 200)
+      assert.strictEqual(br.headers['content-encoding'], 'br', '声明 br 的页面请求必须回 br')
+      const html = zlib.brotliDecompressSync(br.body).toString('utf8')
+      assert.ok(html.includes('<!doctype html>'), 'br 解压后必须是完整页面（首行 <!doctype html>）')
+      assert.ok(html.includes('id="xbk-boot"'), 'br 解压后仍含 boot JSON 岛')
+      assert.ok(br.body.length < Buffer.byteLength(html), '压完必须比原文小')
+      // 压缩不改安全头：凭证页仍 no-store，CSP 仍由 applyPageHeaders 单点写。
+      assert.strictEqual(br.headers['cache-control'], 'no-store', 'HTML 压缩后仍必须 no-store')
+      const csp = String(br.headers['content-security-policy'] || '')
+      assert.ok(csp.includes("default-src 'none'"), '压缩后 CSP 头必须仍在')
+      assert.strictEqual(br.headers['referrer-policy'], 'no-referrer', '压缩不得吃掉 Referrer-Policy')
+      assert.match(String(br.headers.vary || ''), /Accept-Encoding/, '协商过的页面必须带 Vary')
+      // 双候选 ⇒ 仍 br（同一份内容 br 更小）。
+      const both = await requestBuffer(port, 'GET', '/', { token: TOKEN, headers: { 'accept-encoding': 'gzip, deflate, br' } })
+      assert.strictEqual(both.headers['content-encoding'], 'br', '页面同样 br 优先')
+      const gz = await requestBuffer(port, 'GET', '/', { token: TOKEN, headers: { 'accept-encoding': 'br;q=0, gzip' } })
+      assert.strictEqual(gz.headers['content-encoding'], 'gzip', 'br 被拒时页面回落 gzip')
+      assert.ok(zlib.gunzipSync(gz.body).toString('utf8').includes('<!doctype html>'), 'gzip 解压后同样是完整页面')
+      // 不带 Accept-Encoding（Node/curl 默认）⇒ 明文，且 HTML 不参与 ETag/304。
+      const plain = await requestBuffer(port, 'GET', '/', { token: TOKEN })
+      assert.strictEqual(plain.headers['content-encoding'], undefined, '不带 Accept-Encoding 必须回明文')
+      assert.ok(plain.body.toString('utf8').startsWith('<!doctype html>'), '明文页面原样可读')
+      assert.strictEqual(plain.headers.etag, undefined, 'HTML 不参与 ETag/304（正文含 boot token）')
+      // 结构红线（无运行时对应物，只在原始源码上成立；插桩沙箱里整段跳过）。
+      if (process.env.XBK_MUTATION_CHILD !== '1') {
+        const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+        assert.ok(src.includes('const pageEncoded = compressBody(res, html)'), '页面出口必须经 compressBody（绕开协商就等于 HTML 不压）')
+        assert.strictEqual((src.match(/res\.xbkEnc = negotiateEncodings/g) || []).length, 1,
+          '协商结果只能由请求入口算一次（端点里重复解析会让 tag 与内容分叉）')
+      }
     } finally { server.close() }
   })
   await aok('HTTP: SSE 响应头不带 Content-Encoding（流式增量不压缩）', async () => {
