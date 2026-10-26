@@ -761,7 +761,7 @@ function assetBase () {
 
 // Accept-Encoding 里某个 token 的 q 值：显式项优先，缺失时才落 `*` 通配；两者都没有返回 null。
 // 非法 q 值按 0（拒绝）——与 RFC 9110「不可解析即不可接受」同向。三个协商入口
-// （acceptsGzip / acceptsIdentity / negotiateEncodings）共用这一份解析，避免三份同构循环各自漂移。
+// （acceptsGzip）与静态资产的 gzip 变体共用这一份解析，避免多处同构循环各自漂移。
 function acceptQuality (header, token) {
   let explicit = null
   let wildcard = null
@@ -792,11 +792,6 @@ function acceptsGzip (header) {
 // Accept-Encoding 里的 identity：**默认接受**，只有显式 `identity;q=0`（或 `*;q=0` 且
 // 没有 identity 例外）才算拒绝。压缩与 identity 都不可接受时不能再硬塞 identity——
 // 那是一个客户端明确拒绝的表示（Sourcery Medium）；JSON 出口改回 406。
-function acceptsIdentity (header) {
-  const q = acceptQuality(header, 'identity')
-  return q === null ? true : q > 0
-}
-
 // If-None-Match：支持 *、逗号列表与弱比较（GET 语义）。
 function etagMatches (header, etag) {
   const raw = String(header || '').trim()
@@ -1658,112 +1653,6 @@ function authorize (req, token, urlQuery) {
   return false
 }
 
-// ── API JSON / HTML 协商式压缩（v3.373 gzip；v3.382 起 br 优先）───────────────
-// 压缩面 = API JSON + SPA 页面（HTML 自 v3.382 起也压，见页面出口）。四类明确不压：
-//   · 登录/挑战页（sendHtml）：~1.9KB 的静态小页，压了只多一次解压；
-//   · SSE（/api/runs/stream）：流式增量帧，压缩要攒帧，等于把实时性换流量；
-//   · 导出附件（备份 / 推送记录 JSON/CSV）：浏览器直接落盘，压了会打乱「另存为」的体积
-//     口径与 Content-Length 语义，也让中间产物不再可 grep。
-// 编码按 Accept-Encoding 协商：br 优先、gzip 回退（q 值定序，相等时 br 在前）；两者都收时
-// 压两份取**更小**的那份——「优先」不该让同一份内容多花字节。
-// 阈值 512B：更小的 JSON（如 {"runs":[]}）压完常常更大，白付 CPU 还多一个头。
-const GZIP_MIN_BYTES = 512
-// >256KB 的响应（推送记录整页）降档：压缩率损失远小于省下的 CPU 时间。
-const GZIP_LARGE_BYTES = 256 * 1024
-// 上限 8MiB：gzipSync / brotliCompressSync 都是同步压缩，超大响应会把事件循环按住
-// （Sourcery Medium）。超过上限直接回 identity——宁可少省一次流量，也不让状态/触发/SSE
-// 排在压缩后面。
-const GZIP_MAX_BYTES = 8 * 1024 * 1024
-// brotli 档位：≤256KB 用 6（默认窗口下压缩率/耗时的拐点），更大用 4（同 gzip level 1 的理由：
-// 同步压缩在大响应上必须让路给事件循环）。
-const BROTLI_QUALITY = 6
-const BROTLI_LARGE_QUALITY = 4
-
-// Accept-Encoding → 可接受的压缩编码，**顺序即优先级**（只有首位是 br 时才谈「br 优先」）。
-// 与 acceptsGzip 同口径：显式项压过 *，非法 q 按 0（拒绝），两者都没有 = 不接受任何压缩。
-// `br;q=0, gzip` 这种「明确拒绝 br、仍收 gzip」必须落到 ['gzip']——不能因为知道 br 更好就
-// 硬塞一个客户端声明不收的表示。
-function negotiateEncodings (header) {
-  const qBr = acceptQuality(header, 'br') ?? 0
-  const qGz = acceptQuality(header, 'gzip') ?? 0
-  if (qBr <= 0 && qGz <= 0) return []
-  if (qGz <= 0) return ['br']
-  if (qBr <= 0) return ['gzip']
-  // 两个都收：q 更高的优先；相等（浏览器实际发的 `gzip, deflate, br` 就是这种）取 br。
-  if (qGz > qBr) return ['gzip']
-  return ['br', 'gzip']
-}
-
-// 单编码压缩。gzip 沿用 v3.373 的档位（≤256KB level 6、更大 level 1），br 用 brotli 档位。
-function encodeContent (encoding, buf) {
-  if (encoding === 'br') {
-    const quality = buf.length > GZIP_LARGE_BYTES ? BROTLI_LARGE_QUALITY : BROTLI_QUALITY
-    return zlib.brotliCompressSync(buf, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: quality } })
-  }
-  return zlib.gzipSync(buf, { level: buf.length > GZIP_LARGE_BYTES ? 1 : 6 })
-}
-
-// 是否值得压：只看协商结果与长度，不做压缩（条件请求先用它选 tag，304 别再白压一遍）。
-function gzipEligible (res, buf) {
-  return !!(res && res.xbkGzip === true && buf.length >= GZIP_MIN_BYTES && buf.length <= GZIP_MAX_BYTES)
-}
-
-function compressJsonBody (buf) {
-  return encodeContent('gzip', buf)
-}
-
-// gzip 单编码入口（v3.373 原样保留）：非 HTTP 单测靠它锁死阈值与档位。
-function gzipJsonBody (res, body) {
-  const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8')
-  return gzipEligible(res, buf) ? compressJsonBody(buf) : null
-}
-
-// 压缩决策的唯一入口：res.xbkEnc 由 createServer 回调入口按 Accept-Encoding 置位
-// （每个请求算一次，不在每个端点里重复解析头）。
-// 返回 { encoding, body }（要发的字节 + 对应 Content-Encoding），null = 按原样发。
-function compressBody (res, body) {
-  const encs = (res && Array.isArray(res.xbkEnc)) ? res.xbkEnc : []
-  const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8')
-  if (encs.length === 0) return null
-  if (buf.length < GZIP_MIN_BYTES || buf.length > GZIP_MAX_BYTES) return null
-  if (encs[0] === 'gzip') return { encoding: 'gzip', body: compressJsonBody(buf) }
-  const br = encodeContent('br', buf)
-  // 只有 br 可接受：不必再压一份 gzip 来比（那只是白烧 CPU）。
-  if (encs.length === 1) return { encoding: 'br', body: br }
-  // 两种表示客户端都收：br 只是优先，br 反而更大时回 gzip。
-  const gzip = encodeContent('gzip', buf)
-  return br.length < gzip.length ? { encoding: 'br', body: br } : { encoding: 'gzip', body: gzip }
-}
-
-// 变体 tag：gzip 沿用 v3.373 的 `-gz`（与静态资产 buildAssetStore 的 gzipEtag 同约定），br 用 `-br`。
-// identity tag 始终由**未压缩**的 body 算——压缩字节随 zlib/brotli 版本与档位变化，用它算 tag
-// 会让客户端手里的旧 tag 在升级后永远失配（每个请求都 200 全量）。
-function encodingVariantTag (identityTag, encoding) {
-  const suffix = encoding === 'br' ? '-br' : '-gz'
-  const s = String(identityTag || '')
-  return s.endsWith('"') ? `${s.slice(0, -1)}${suffix}"` : `${s}${suffix}`
-}
-
-function gzipVariantTag (identityTag) {
-  return encodingVariantTag(identityTag, 'gzip')
-}
-
-// 双候选（浏览器通常同时收 br+gzip）时「谁更小」取决于实际字节，而条件端点在 304 往返里
-// 也必须先定 tag。结论只由内容（identity tag 已含内容哈希）与候选集合决定 ⇒ 记忆它，
-// 让轮询在命中记忆时完全不压缩。条数封顶，满了整表丢弃（只是性能优化，丢了不影响正确性）。
-const ENCODE_PICK_MAX = 32
-const encodePickMemo = new Map()
-
-function pickKey (encs, identityTag) {
-  return `${encs.join('+')}|${identityTag}`
-}
-
-function rememberPick (encs, identityTag, encoding) {
-  if (!encoding) return
-  if (encodePickMemo.size >= ENCODE_PICK_MAX) encodePickMemo.clear()
-  encodePickMemo.set(pickKey(encs, identityTag), encoding)
-}
-
 // 条件 tag 的变体因子：请求路径 + 查询串（去掉 ?token=，其余按字典序）。
 // 为什么必须进 tag：/api/run-history?limit=10 与 ?limit=200 在数据不足时 body 可能逐字相同，
 // 共用 tag 会让「10 条的 304」冒充「200 条的响应」。token 不进哈希——它是浏览器兼容路径的
@@ -1783,25 +1672,11 @@ function conditionalVariant (req) {
 }
 
 function sendJson (res, code, obj) {
-  const body = JSON.stringify(obj)
-  const picked = compressBody(res, body)
-  // 客户端明确拒绝 identity、body 又没到压缩阈值 ⇒ 没有可接受的表示。
-  // 只对成功响应回 406：401/404 这类错误仍原样发出，不能拿编码协商把错误盖掉。
-  if (!picked && code >= 200 && code < 300 && res && res.xbkIdentity === false) {
-    res.writeHead(406, {
-      'Content-Type': 'application/json; charset=utf-8',
-      Vary: 'Accept-Encoding',
-      'Content-Length': '0'
-    })
-    res.end()
-    return
-  }
-  // Vary 无条件带：同一 URL 的表示随 Accept-Encoding 变，identity 也要让缓存分键，
-  // 否则缓存里的 identity 副本会被复用给能收压缩的客户端（Sourcery Low）。
-  const headers = { 'Content-Type': 'application/json; charset=utf-8', Vary: 'Accept-Encoding' }
-  if (picked) headers['Content-Encoding'] = picked.encoding
-  res.writeHead(code, headers)
-  res.end(picked ? picked.body : body)
+  // 压缩统一在边缘（Caddy 的 encode 片段）完成：本进程只发 identity，不再自带协商/压缩。
+  // 反代已经把 Accept-Encoding 摘掉（header_up -Accept-Encoding），Node 侧压缩在现网
+  // 永远不会触发；两套并存只会让后来人以为线上跑的是 Node 压缩。
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(obj))
 }
 
 // 只读快照端点的条件 GET（v3.363，v3.373 扩到 /api/trends、/api/run-history、
@@ -1818,45 +1693,17 @@ function sendJson (res, code, obj) {
 // 条件端点用 `sendJsonConditional`（只有内容稳定的端点，见下）。
 function sendJsonConditional (req, res, obj) {
   const body = JSON.stringify(obj)
-  const buf = Buffer.from(body, 'utf8')
-  const encs = (res && Array.isArray(res.xbkEnc)) ? res.xbkEnc : []
-  const eligible = buf.length >= GZIP_MIN_BYTES && buf.length <= GZIP_MAX_BYTES
-  // tag 由**未压缩** body + 请求变体算：Accept-Encoding 只决定「同一份内容取哪个 tag 变体」，
-  // 不参与 identity 哈希（否则 zlib/brotli 升级会让所有客户端缓存一次性失配）。
-  const identityTag = etag(conditionalVariant(req) + '\n' + body)
-  // 先只判断「要不要压」（单候选时不必压缩）：304 是常态，命中时不该白压一遍（Sourcery Medium）。
-  let encoding = (eligible && encs.length === 1) ? encs[0] : null
-  let picked = null
-  if (eligible && encs.length > 1) {
-    // 双候选时「谁更小」要看字节数，而 304 往返也得先定 tag。结论只由内容与候选集合决定 ⇒
-    // 按 identity tag 记忆，轮询命中记忆时同样不必压。
-    encoding = encodePickMemo.get(pickKey(encs, identityTag)) || null
-    if (!encoding) {
-      picked = compressBody(res, buf)
-      encoding = picked ? picked.encoding : null
-      rememberPick(encs, identityTag, encoding)
-    }
-  }
-  const tag = encoding ? encodingVariantTag(identityTag, encoding) : identityTag
-  // Vary 无条件带（identity 也是另一份表示；同一 URL 按 Accept-Encoding 分键）。
-  const headers = { ETag: tag, 'Cache-Control': 'no-store', Vary: 'Accept-Encoding' }
-  // 没有可接受的表示 ⇒ 406。放在 304 之前：validation 只对「可接受的表示」有意义。
-  if (!encoding && res && res.xbkIdentity === false) {
-    res.writeHead(406, { ...headers, 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': '0' })
-    res.end()
-    return
-  }
+  // tag 仍由未压缩 body + 请求变体算（见 conditionalVariant）。压缩由边缘完成，
+  // Node 不再产出 -gz/-br 变体，也就不存在「304 把另一种表示判为有效」的问题。
+  const tag = etag(conditionalVariant(req) + '\n' + body)
+  const headers = { ETag: tag, 'Cache-Control': 'no-store' }
   if (etagMatches(req.headers['if-none-match'], tag)) {
-    // 304 只回 tag/缓存指令/Vary：不带 Content-Encoding（没有 body 可解码），也不带 body。
     res.writeHead(304, headers)
     res.end()
     return
   }
-  const payload = picked ? picked.body : (encoding ? encodeContent(encoding, buf) : null)
-  const out = { 'Content-Type': 'application/json; charset=utf-8', ...headers }
-  if (payload) out['Content-Encoding'] = encoding
-  res.writeHead(200, out)
-  res.end(payload || body)
+  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...headers })
+  res.end(body)
 }
 
 // 页面类响应（登录/挑战页与 SPA 壳）的统一安全头：Referrer-Policy 只在这里写一次。
@@ -5315,9 +5162,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const server = http.createServer((req, res) => {
     // 协商式压缩的每请求决策（v3.373 gzip，v3.382 起 br 优先）：JSON 出口（sendJson /
     // sendJsonConditional）与 SPA 页面出口读这个标记——SSE、导出附件、登录页各自直接 writeHead，
-    // 按语义不压缩（见 compressBody 注释）。
-    res.xbkEnc = negotiateEncodings(req.headers['accept-encoding'])
-    res.xbkIdentity = acceptsIdentity(req.headers['accept-encoding'])
+    // 按语义不压缩（压缩在边缘完成，见 sendJson 注释）。
     // ── v3.300 访问日志装配：单点 res.on('finish')，覆盖 sendJson/静态/页面全部响应出口
     // （全文件原本无任何 res.on 监听）。挂回调第一行 ⇒ 畸形 request-target 的 400
     // （下方 sendJson(…,400) 也在覆盖内；malformed 是最值得记录的可疑流量，D3 定夺）。
@@ -5504,19 +5349,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 补 Secure + __Host- 前缀。缓解：HttpOnly（XSS 拿不走）+ SameSite=Lax（跨站顶层
       // 导航可带，但 POST 不收 Cookie）+ Max-Age 从 30 天收窄到 1 天 + Referrer-Policy（见下）。
       res.setHeader('Set-Cookie', pageCookies.length > 0 ? pageCookies : sessionCookieHeaderFor(req, token))
-      // SPA 壳也走同一套协商压缩：未压的壳是首屏最大的一块单响应。只改 Content-Encoding
-      // 与字节；no-store / CSP / Referrer-Policy 由 applyPageHeaders 单点写入，压缩不动它们。
-      // HTML 不参与 ETag/304（正文含 boot token，且 no-store 本就不缓存）。
+      // HTML 只发 identity：压缩统一由边缘 Caddy 完成（见 sendJson 注释）。
+      // no-store / CSP / Referrer-Policy 由 applyPageHeaders 单点写入。
       const html = renderPage(state, runsList, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie), instanceId)
-      const pageEncoded = compressBody(res, html)
-      const pageHeaders = { 'Content-Type': 'text/html; charset=utf-8', Vary: 'Accept-Encoding' }
-      if (pageEncoded) pageHeaders['Content-Encoding'] = pageEncoded.encoding
-      res.writeHead(200, pageHeaders)
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       // Sourcery Session-users-cannot-trigger x2：用户经 Cookie 会话（无 ?token=）打开页面时，
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
       // 使用的凭证（authorize 已通过的 token 值）交给 renderPage 注入 boot，会话用户
       // 无需再拼 ?token= 即可触发。
-      res.end(pageEncoded ? pageEncoded.body : html)
+      res.end(html)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/status') {
@@ -6765,23 +6606,9 @@ module.exports = {
   sanitizeAccessPath,
   shouldLogAccess,
   acceptsGzip,
-  acceptsIdentity,
   ACCESS_LOG_MAX,
-  // v3.373 协商式 gzip：阈值与决策函数导出（阈值反例与 level 选择必须可被非 HTTP 单测执行）
-  GZIP_MIN_BYTES,
-  GZIP_LARGE_BYTES,
-  GZIP_MAX_BYTES,
-  gzipJsonBody,
-  gzipVariantTag,
+  // 条件请求的 tag 变体因子（纯函数，供非 HTTP 单测直接断言）
   conditionalVariant,
-  // v3.374 brotli 协商：编码协商 / 单编码压缩 / 决策入口 / 变体 tag 全部导出（档位与阈值反例
-  // 只能用非 HTTP 单测执行，否则这段就是不可达的死代码）
-  BROTLI_QUALITY,
-  BROTLI_LARGE_QUALITY,
-  negotiateEncodings,
-  encodeContent,
-  compressBody,
-  encodingVariantTag,
   // D2-S13：最终保险丝（必须可被单测执行，否则又是一段不可达的死代码）
   findSecretLikeField,
   // D2-S12：cache-health 条数阈值（用例按同一常量构造夹具）
