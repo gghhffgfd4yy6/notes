@@ -599,6 +599,10 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.ok(withToken.includes('id="xbk-boot"'), 'JSON 岛节点存在')
   assert.match(withToken, /\/assets\/[0-9a-f]{16}\/app\.js/, '引用前端 ESM（带内容版本路径）')
   assert.match(withToken, /\/assets\/[0-9a-f]{16}\/app\.css/, '引用样式（带内容版本路径）')
+  // v3.376：theme-color 跟主题底色一致，Android 系统栏/地址栏才不会在切页时漏白。
+  assert.ok(withToken.includes('<meta name="theme-color" content="#0b0f17">'), 'theme-color 必须是默认主题底色')
+  const lightPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), undefined, 'light')
+  assert.ok(lightPage.includes('<meta name="theme-color" content="#f3f5f9">'), 'theme-color 必须跟随主题')
   assert.ok(withToken.includes('Content-Security-Policy'), '带 CSP')
   // Sourcery vww：CSP 不能只断言 meta 名——被削弱的策略（如 default-src *）也含这个字符串。
   // 必须锁死关键指令本体。
@@ -7365,6 +7369,25 @@ async function main () {
     const pair = (css.match(/::view-transition-old\(root\),\s*::view-transition-new\(root\)\s*\{[^}]*\}/) || [''])[0]
     assert.ok(/animation-duration:\s*220ms/.test(pair), '淡出淡入必须 220ms（与 motion.js 的 MOTION.fast 同档）')
     assert.ok(/animation-timing-function:\s*ease-out/.test(pair), '曲线必须是 ease-out')
+    // v3.376：根元素与过渡覆盖层都要有底色——缺一个就会在 Android 的合成器时序里漏白。
+    // 只看「文本里有没有」不够：把规则塞进 @media print 同样命中正则，但屏幕上根本不生效。
+    const enclosingAtRule = (text, idx) => {
+      let depth = 0
+      for (let i = idx - 1; i >= 0; i--) {
+        if (text[i] === '}') depth++
+        else if (text[i] === '{') {
+          if (depth === 0) return text.slice(text.lastIndexOf('\n', i) + 1, i).trim()
+          depth--
+        }
+      }
+      return ''
+    }
+    const htmlIdx = css.search(/html\s*\{[^}]*background:\s*var\(--bg\)/)
+    assert.ok(htmlIdx >= 0, 'html 必须自己带底色（只给 body 上色时根快照是透明的，切页会漏出白画布）')
+    assert.ok(!/@media/.test(enclosingAtRule(css, htmlIdx)), 'html 底色必须在无条件区块里（@media 里的规则屏幕不生效）')
+    const vtIdx = css.search(/::view-transition\s*\{[^}]*background-color:\s*var\(--bg\)/)
+    assert.ok(vtIdx >= 0, '过渡覆盖层必须有底色（快照淡出到一半时不得漏出 UA 默认白底）')
+    assert.ok(!/@media/.test(enclosingAtRule(css, vtIdx)), '覆盖层底色必须在无条件区块里')
     assert.ok(!/::view-transition[^{]*\{[^}]*\btransform\s*:/.test(css),
       '快照过渡里不得出现 transform —— 页面里有 position:fixed 的弹层，祖先一有 transform 就按它定位')
     const page = (css.match(/\.page\s*\{[^}]*\}/) || [''])[0]
