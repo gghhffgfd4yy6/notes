@@ -232,6 +232,59 @@ XBK_CONSOLE_TOKEN=请换成至少16位的随机字符串 npm run console
 - 触发历史里运行中的任务可点**「停止」**：控制台对子进程先 SIGTERM、3 秒宽限后 SIGKILL。两个如实披露：①被停止的任务若已推送部分通知但尚未写缓存，这些条目**下轮会重推**（与任务超时被杀的语义一致）；②取消后同一动作的重放冷却窗照常生效（普通动作 60 秒）——这是防止「手滑停止后误触重推」的保护，确需立即重跑请等窗口过后再触发。自动运行不接受 HTTP 触发，没有外部冷却窗。
 - 相关变量：`XBK_CONSOLE_PORT`（默认 `7777`）、`XBK_CONSOLE_HOST`（默认 `127.0.0.1`，对外暴露需显式修改并自行做好访问控制）。
 
+## 自动部署（拉取式）
+
+线上目录 `~/notes-live` 是 git worktree（detached HEAD），由 systemd 服务 `xbk-console`（`127.0.0.1:7777`）跑着。`scripts/auto-deploy.sh` 让这台机器**自己拉取**：定时 `git fetch origin main`，有更新且没有任务在跑时 `checkout -f` 到新提交、重启服务、按 `/api/sys` 的 `version` 与 `package.json` 对账；30 秒内对不上就自动回滚到旧提交再验一次。仓库侧不需要任何私钥，也不需要 GitHub Actions。
+
+脚本行为（环境变量全部有默认值，见脚本头部注释）：
+
+- 已是最新 ⇒ 打印 `unchanged`，退出 0。
+- `/api/status` 显示有任务在跑（`running` / `lock.held` 非空）⇒ 打印 `busy`，退出 0，等下一轮——**不会打断正在进行的真实推送**。
+- 部署失败（`restart` 失败，或 30s 内 `/api/sys` 的版本对不上）⇒ 回滚到旧 sha、`restart`、复验，退出 1，原因逐行进 journal。
+- `--check` 只比对（用 `ls-remote`，不 fetch、不写本地 ref、不重启）；`--dry-run` 打印将要执行的命令，不做任何变更。
+- 单飞用 `flock`：上一轮还没结束时，新的一轮直接退出 0。
+
+安装（一次性，装到 `/etc/systemd/system` 需要 root）：
+
+```bash
+sudo install -m 0644 deploy/xbk-deploy.service deploy/xbk-deploy.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now xbk-deploy.timer
+systemctl list-timers xbk-deploy.timer        # 看下一次触发时间
+```
+
+触发节奏是「上一次结束之后 2 分钟」（`OnUnitActiveSec=2min`），`Persistent=true` 补上关机期间错过的那次。先干跑看计划、再手动跑一轮看真实输出：
+
+```bash
+cd ~/notes-live && bash scripts/auto-deploy.sh --check
+cd ~/notes-live && bash scripts/auto-deploy.sh --dry-run
+sudo systemctl start xbk-deploy.service && journalctl -u xbk-deploy -n 50 --no-pager
+```
+
+看日志（脚本所有输出都进 journal，stdout 即失败原因）：
+
+```bash
+journalctl -u xbk-deploy -n 100 --no-pager              # 最近一次
+journalctl -u xbk-deploy -f                             # 实时跟
+journalctl -u xbk-deploy --since '1 hour ago' | grep -E 'unchanged|busy|deployed OK|DEPLOY FAILED|rollback'
+```
+
+暂停 / 恢复自动部署（只停部署，控制台本身不受影响）：
+
+```bash
+sudo systemctl stop xbk-deploy.timer          # 停定时器；正在跑的那一轮不受影响
+sudo systemctl disable xbk-deploy.timer       # 开机也不再启动
+sudo systemctl start xbk-deploy.timer         # 恢复
+```
+
+重启权限：服务以 `User=ubuntu` 运行，重启 `xbk-console` 需要 root——脚本检测到非 root 且 `sudo -n true` 可用时，会自动给 `systemctl` 加 `sudo -n` 前缀。本机 ubuntu 已有 `NOPASSWD: ALL`；换到不免密 sudo 的机器时加一条（`visudo -f /etc/sudoers.d/xbk-deploy`）：
+
+```
+ubuntu ALL=(root) NOPASSWD: /bin/systemctl restart xbk-console
+```
+
+依赖：`git`、`curl`、`flock`（util-linux）、`node`（读 JSON，与控制台同一套运行时）。手动等价操作仍是 `git -C ~/notes-live checkout -f <sha>` + `sudo systemctl restart xbk-console`，脚本只是给这两步加上「单飞 + 忙碌保护 + 版本对账 + 自动回滚」。
+
 ## 常见问题
 
 ### 提示 `Cannot find module 're2'` 或原生模块加载失败
