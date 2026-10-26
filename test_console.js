@@ -6699,17 +6699,31 @@ async function main () {
     assert.ok(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.drawer[\s\S]*?animation:\s*none/.test(css),
       '减少动效时必须关掉滑入动画')
     // v3.380：进场只位移、不淡入——旧版 from{opacity:.55} 会让背后列表从抽屉里透出来，像闪了一下。
-    const drawerRule = (css.match(/\n\s*\.drawer\s*\{[^}]*\}/) || [''])[0]
+    // 不用正则抠规则块：`[^}]*}[^}]*}` 会被分析器判成回溯风险，改成按花括号配平切。
+    const cssBlock = (src, head) => {
+      const i = src.indexOf(head)
+      if (i < 0) return ''
+      const start = src.indexOf('{', i)
+      if (start < 0) return ''
+      let depth = 0
+      for (let k = start; k < src.length; k++) {
+        if (src[k] === '{') depth++
+        else if (src[k] === '}' && --depth === 0) return src.slice(i, k + 1)
+      }
+      return ''
+    }
+    const drawerRule = cssBlock(css, '\n  .drawer {')
     assert.ok(/animation:\s*drawer-in/.test(drawerRule), '.drawer 必须用 drawer-in（关键帧写了却没人引用等于没有）')
-    const drawerIn = (css.match(/@keyframes drawer-in \{[^}]*\}[^}]*\}/) || [''])[0]
+    const drawerIn = cssBlock(css, '@keyframes drawer-in {')
     assert.ok(drawerIn.includes('transform'), '进场必须有位移（否则是硬切）')
     assert.ok(!drawerIn.includes('opacity'), '进场不得淡入：面板从第一帧就要不透明，否则背后列表会透出来')
     // 遮罩的淡入必须挂在 ::before 上：直接给 .drawer-backdrop 做 opacity 动画，
     // 会把子元素（面板）一起压成半透明，闪一下又回来了。
-    const backdropRule = (css.match(/\n\s*\.drawer-backdrop\s*\{[^}]*\}/) || [''])[0]
+    const backdropRule = cssBlock(css, '\n  .drawer-backdrop {')
+    assert.ok(backdropRule.length > 20, '必须能定位到 .drawer-backdrop 规则')
     assert.ok(!/animation:/.test(backdropRule), '.drawer-backdrop 本身不得有 opacity 动画（会连带把抽屉一起透明化）')
-    assert.ok(/\.drawer-backdrop::before\s*\{[^}]*animation:\s*drawer-backdrop-in/.test(css), '遮罩要由 ::before 自己淡入，不然底色是硬跳')
-    const backdropIn = (css.match(/@keyframes drawer-backdrop-in \{[^}]*\}[^}]*\}/) || [''])[0]
+    assert.ok(/animation:\s*drawer-backdrop-in/.test(cssBlock(css, '.drawer-backdrop::before {')), '遮罩要由 ::before 自己淡入，不然底色是硬跳')
+    const backdropIn = cssBlock(css, '@keyframes drawer-backdrop-in {')
     assert.ok(/opacity:\s*0/.test(backdropIn) && /opacity:\s*1/.test(backdropIn), '遮罩关键帧必须真的从 0 到 1')
   })
 
