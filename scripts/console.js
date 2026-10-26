@@ -823,16 +823,16 @@ function etagMatches (header, etag) {
 const VERSIONED_ASSET_RE = /^\/assets\/([0-9a-f]{16})\/([A-Za-z0-9._-]+)$/
 function resolveAssetRoute (pathname) {
   if (Object.prototype.hasOwnProperty.call(STATIC_ASSETS, pathname)) {
-    return { route: pathname, spec: STATIC_ASSETS[pathname], versioned: false }
+    return { route: pathname, spec: STATIC_ASSETS[pathname], version: null }
   }
   const m = VERSIONED_ASSET_RE.exec(pathname)
   if (m === null) return null
   const route = `/assets/${m[2]}`
   if (!Object.prototype.hasOwnProperty.call(STATIC_ASSETS, route)) return null
-  return { route, spec: STATIC_ASSETS[route], versioned: true }
+  return { route, spec: STATIC_ASSETS[route], version: m[1] }
 }
 
-function serveStatic (req, res, route, spec, contentAddressed = false) {
+function serveStatic (req, res, route, spec, assetVersion = null) {
   let store
   try {
     store = loadAssets()
@@ -844,13 +844,19 @@ function serveStatic (req, res, route, spec, contentAddressed = false) {
   const useGzip = acceptsGzip(req.headers['accept-encoding'])
   const etag = useGzip ? entry.gzipEtag : entry.etag
   // 内容寻址有两种写法：旧页面的 ?v=<version>，和新页面把版本写进路径（/assets/<version>/file）。
-  // 路径写法不校验版本是否等于当前值：部署瞬间的旧页面仍能取到文件（宁可给它当前字节，
-  // 也不要 404 白屏）；缓存键里带版本，旧页面自己那份不会被新版本污染。
-  let versioned = contentAddressed
-  if (!versioned) {
+  // 路径写法只在**版本等于当前资产哈希**时发 immutable；部署前打开的旧页面仍能取到文件
+  // （宁可给它当前字节，也不要 404 白屏），但只能 no-store——否则会把新字节写进旧版本的
+  // 缓存键里，同一页面上「旧模块 + 新模块」混跑，而浏览器还以为拿到的是那个版本。
+  let versioned = false
+  let cacheControl
+  if (assetVersion !== null) {
+    versioned = assetVersion === store.version
+    cacheControl = versioned ? 'public, max-age=31536000, immutable' : 'no-store'
+  } else {
     try {
       versioned = new URL(req.url, 'http://localhost').searchParams.get('v') === store.version
     } catch (e) { /* 畸形 URL 交给上层校验；这里按裸 URL 处理 */ }
+    cacheControl = versioned ? 'public, max-age=31536000, immutable' : 'no-cache'
   }
   const headers = {
     'Content-Type': spec.type,
@@ -859,7 +865,7 @@ function serveStatic (req, res, route, spec, contentAddressed = false) {
     // 不含凭证与推送数据），允许 CDN/共享缓存存一份供未鉴权请求复用，省掉回源的 401 往返；
     // 数据面不在此列——HTML 由 applyPageHeaders 明确 no-store，API 出口按各分支自设 Cache-Control。
     // 裸 URL（app.js 内部 `import './pure.mjs'`）不走内容寻址，仍 no-cache + ETag 协商。
-    'Cache-Control': versioned ? 'public, max-age=31536000, immutable' : 'no-cache',
+    'Cache-Control': cacheControl,
     ETag: etag,
     Vary: 'Accept-Encoding'
   }
@@ -994,7 +1000,7 @@ function shouldLogAccess (method, pathname, statusCode) {
   const p = String(pathname || '')
   if (m && (p === '/' || p === '/api/status' || p === '/api/runs' || p === '/api/runs/stream' ||
     p === '/api/stream' ||
-    Object.prototype.hasOwnProperty.call(STATIC_ASSETS, p))) return false
+    resolveAssetRoute(p) !== null)) return false
   if (m && RUN_DETAIL_PATH_RE.test(p)) return false // D4：GET 详情轮询
   if (method === 'POST' && p === '/api/runs/detail') return false // D4：POST 详情轮询（前端实际形态）
   return true
@@ -5287,7 +5293,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sendJson(res, 401, { error: 'unauthorized' })
         return
       }
-      serveStatic(req, res, asset.route, asset.spec, asset.versioned)
+      serveStatic(req, res, asset.route, asset.spec, asset.version)
       return
     }
     // 登录表单只收 POST body（审查 #224 / Sourcery High）：GET 表单会把 token 带进

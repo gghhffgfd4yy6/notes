@@ -687,6 +687,10 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
     [['POST', '/api/runs/detail', 401], true],
     [['GET', '/assets/app.css', 200], false],
     [['GET', '/assets/app.css', 304], false],
+    // v3.375：版本路径同样是静态资产——每次打开 11 条不该挤进 200 条环形日志
+    [['GET', '/assets/a506737fe81d5acc/app.js', 200], false],
+    [['GET', '/assets/a506737fe81d5acc/app.js', 401], true],
+    [['GET', '/assets/v1/app.js', 200], true],
     [['GET', '/api/status', 304], false],
     [['GET', '/api/access-log', 304], true],
     [['GET', '/', 200], false],
@@ -2676,6 +2680,8 @@ async function main () {
     assert.strictEqual((await request(port, 'GET', `/assets/${verMatch[1]}/app.css`)).status, 401, '版本路径同样要鉴权')
     const oldPath = await requestBuffer(port, 'GET', '/assets/deadbeefdeadbeef/app.css', { token: TOKEN })
     assert.strictEqual(oldPath.status, 200, '旧版本路径必须仍可取（部署瞬间的旧页面不能白屏）')
+    assert.strictEqual(String(oldPath.headers['cache-control'] || ''), 'no-store',
+      '旧版本路径不得 immutable：否则新字节被写进旧版本的缓存键，同一页面新旧模块混跑')
     assert.strictEqual((await request(port, 'GET', '/assets/v1/app.css', { token: TOKEN })).status, 404, '非法版本段必须 404')
     assert.strictEqual((await request(port, 'GET', `/assets/${verMatch[1]}/nope.js`, { token: TOKEN })).status, 404, '白名单外文件必须 404')
     // gzip;q=0 表示明确拒绝：不得发压缩体
