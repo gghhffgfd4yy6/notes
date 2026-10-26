@@ -6719,6 +6719,11 @@ async function main () {
     assert.ok(!msg.includes('aria-expanded=$' + '{expanded'), '行内展开的 aria-expanded 必须退场（弹出的是对话框，不是展开行）')
     assert.ok(msg.includes('aria-haspopup="dialog"'), '行标题按钮必须声明弹出的是对话框')
     assert.ok(msg.includes('title="查看详情"'), '行标题的 title 必须是「查看详情」语义')
+    // 手机上拇指落点不在标题那一行：整张卡片可点，且右侧有 › 提示「这里能进去」。
+    assert.ok(/onClick=\$\{\(e\) => \{[^}]*e\.target\.closest\('a'\)/.test(msg),
+      '卡片本身必须能点开详情（只让标题那一行能点，手机很难命中）')
+    assert.ok(msg.includes("e.currentTarget.querySelector('.msg-title')"), '卡片点击要把标题按钮作为焦点归还目标')
+    assert.ok(msg.includes('class="msg-chev"'), '行尾要有 › 提示可进入详情')
     // 焦点归还：关闭后回到触发行，且不得滚动页面（背后列表要原地不动）。
     assert.ok(msg.includes('btn.focus({ preventScroll: true })'), '关闭抽屉后焦点必须还给触发行（且不滚动）')
     assert.ok(msg.includes('btn.isConnected'), '触发行已随列表刷新卸载时必须跳过聚焦')

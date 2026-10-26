@@ -1980,17 +1980,24 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       ${items.length === 0
         ? html`<div class="empty">没有匹配的记录</div>`
         : html`<div class="msg-list" role="list" ref=${motionRef}>
-          ${items.map((m) => html`<div class="msg-item" role="listitem" key=${m.rowKey} data-mk=${m.rowKey}>
+          ${items.map((m) => html`<div class="msg-item" role="listitem" key=${m.rowKey} data-mk=${m.rowKey}
+            onClick=${(e) => {
+              // 手机上拇指落点是整张卡片，不是标题那 22px 一行：卡片空白处也要能开详情。
+              // 原文链接是卡片里唯一的跳转入口，点它必须是跳转（e.target.closest('a') 提前放行）。
+              if (e.target.closest('a')) return
+              openDetail(m, e.currentTarget.querySelector('.msg-title'))
+            }}>
             <div class="msg-item-head">
               <button type="button" class="msg-title"
                 aria-haspopup="dialog"
                 title="查看详情"
-                onClick=${(e) => openDetail(m, e.currentTarget)}>
+                onClick=${(e) => { e.stopPropagation(); openDetail(m, e.currentTarget) }}>
                 ${m.title ? hit(m.title) : '（无标题）'}
               </button>
               ${m.price !== null && titleTailPrice(m.title) !== m.price
                 ? html`<span class="msg-price">¥${m.price}</span>`
                 : ''}
+              <span class="msg-chev" aria-hidden="true">›</span>
             </div>
             <div class="msg-meta">
               <span class="msg-cate" aria-label=${m.catename || undefined}>${cateParts(m.catename).map((part, i) => html`<span class="msg-cate-part" key=${i}>${part}</span>`)}</span>

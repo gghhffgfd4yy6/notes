@@ -937,7 +937,11 @@
   .msg-count { color: var(--text-dim); font-size: var(--fs-xs); margin-bottom: var(--sp-2); }
   .msg-loading { color: var(--accent); }
   .msg-list { display: flex; flex-direction: column; gap: var(--sp-2); list-style: none; margin: 0; padding: 0; }
-  .msg-item { border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px var(--sp-3); background: var(--panel-2); list-style: none; }
+  .msg-item { border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px var(--sp-3); background: var(--panel-2); list-style: none; cursor: pointer; }
+  /* v3.379：整张卡片可点开详情（手机拇指落点不在标题那一行），右侧给个 › 说明「这里能进去」。
+     箭头只是提示，语义上仍是标题按钮 aria-haspopup="dialog"，读屏不会念到它。 */
+  .msg-item:active { background: var(--panel); }
+  .msg-chev { color: var(--text-dim); font-size: var(--fs-md); line-height: 1; flex: none; }
   .msg-item-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-2); }
   .msg-title { font-weight: 500; font-size: var(--fs-md); cursor: pointer; overflow-wrap: anywhere; word-break: normal; }
   .msg-title:hover { color: var(--accent); }
