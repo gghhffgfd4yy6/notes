@@ -7690,6 +7690,66 @@ async function main () {
     assert.ok(/\.msg-item mark\s*\{[^}]*color:\s*inherit/.test(css), '<mark> 不得把标题原色盖成浏览器默认黑字')
   })
 
+  await aok('结构红线: 过滤规则保存复核走右侧抽屉（表单留在背后对照），离开拦截仍是短弹窗', () => {
+    const src = readConsoleSource()
+    const pages = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
+    const ph = (name) => '$' + '{' + name + '}'
+    // pages.js 必须真的引入 Drawer：只断言模板里出现 <${Drawer} 时，漏 import 仍会绿，
+    // 而运行时是整页 ReferenceError。
+    assert.ok(/import \{[^}]*\bDrawer\b[^}]*\} from '\.\/components\.js'/.test(pages),
+      'pages.js 必须从 components.js 引入 Drawer')
+    // ① 保存复核分支（save → corrupt 之间）只允许抽屉，不许再回居中弹窗。
+    const saveAt = src.indexOf("if (dialog.kind === 'save')")
+    const corruptAt = src.indexOf("if (dialog.kind === 'corrupt')", saveAt)
+    assert.ok(saveAt > -1 && corruptAt > saveAt, '保存复核分支必须可定位，且排在 corrupt 分支之前')
+    const save = src.slice(saveAt, corruptAt)
+    assert.ok(save.includes('<' + ph('Drawer')), '保存前复核必须用右侧抽屉（居中弹窗会挡死背后表单，没法对照）')
+    assert.ok(!save.includes('ConfirmDialog'), '保存复核分支不得再出现 ConfirmDialog')
+    assert.ok(!save.includes('onConfirm='), '抽屉不用弹窗的 onConfirm 形态（否则两套确认语义并存）')
+    assert.ok(save.includes('title="确认保存过滤规则"'), '抽屉标题保持「确认保存过滤规则」')
+    assert.ok(save.includes('width=' + ph('wide.length > 0 ? 640 : 560')),
+      '抽屉宽 560，含 .* 全命中规则时 640')
+    assert.ok(save.includes('busy=' + ph('saving')), '保存中必须把 busy 交给抽屉（busy 时关闭被拒）')
+    assert.ok(save.includes('onClose=' + ph('closeDialog')), '关闭/取消必须走 closeDialog（不保存）')
+    // ② 三块内容一块都不能少：补推影响 → 改动字段 → 命中样本。
+    assert.ok(save.includes('reEvalText(preview)'), '抽屉必须保留补推影响（reEvalText）')
+    assert.ok(save.includes('改动字段（' + ph('changed.length') + '）') && save.includes('changed.map('),
+      '抽屉必须列出改动字段清单')
+    assert.ok(save.includes('命中样本（' + ph('samples.length') + '）') && save.includes('samples.map('),
+      '抽屉必须保留样本列表')
+    assert.ok(save.includes('fr-wide-warn') && save.includes('含 .* 全命中规则'),
+      '.* 全命中的红色告警必须留在抽屉里（不能因为换容器就丢）')
+    const iPreview = save.indexOf('补推影响')
+    const iChanged = save.indexOf('改动字段（')
+    const iSamples = save.indexOf('命中样本（')
+    assert.ok(iPreview > -1 && iPreview < iChanged && iChanged < iSamples,
+      '抽屉内容顺序：补推影响 → 改动字段 → 命中样本')
+    // ③ 底部按钮：取消不写盘，保存仍走原来的 submitSave（接口/参数一字不改）。
+    assert.ok(save.includes('variant="secondary" disabled=' + ph('saving') + ' onClick=' + ph('closeDialog') + '>取消'),
+      '底部必须有「取消」且保存中禁用')
+    assert.ok(save.includes('confirmWideMatch: wide.length > 0') && save.includes('baseRevision: dialog.baseRevision'),
+      '保存按钮仍走 submitSave({ filter, baseRevision, confirmWideMatch })')
+    // ④ 保存中关闭被拒的两道锁：Drawer 自己（busy 直接 return）+ 这里的 closeDialog。
+    const closeAt = src.indexOf('const closeDialog = () => {')
+    assert.ok(closeAt > -1, 'closeDialog 必须可定位')
+    const closeEnd = src.indexOf('\n  }', closeAt)
+    assert.ok(closeEnd > closeAt, 'closeDialog 切片锚点必须存在（不能退化成空切片）')
+    const closeSeg = src.slice(closeAt, closeEnd)
+    assert.ok(closeSeg.includes('if (busy) return'), '保存中关闭必须直接返回（第二道锁）')
+    assert.ok(closeSeg.includes("dialog.kind === 'save'") && closeSeg.includes('settleSaveResult(false)'),
+      '取消/关闭必须按「不保存」结算等待者（离开拦截不能被挂死）')
+    // ⑤ 未保存离开的三选一仍是居中弹窗：短确认不该用抽屉。
+    const leaveAt = src.indexOf('function LeaveGuardDialog')
+    const leaveEnd = src.indexOf('// ── 组件：右侧抽屉', leaveAt)
+    assert.ok(leaveAt > -1 && leaveEnd > leaveAt, 'LeaveGuardDialog 与 Drawer 的切片边界必须可定位')
+    const leave = src.slice(leaveAt, leaveEnd)
+    assert.ok(leave.includes('class="modal-backdrop"') && leave.includes('class="modal"'),
+      '未保存离开仍是居中弹窗')
+    assert.ok(!leave.includes('Drawer'), '短确认（未保存离开）不得改成抽屉')
+    assert.ok(leave.includes('不保存并离开') && leave.includes('保存并继续') && leave.includes('>取消<'),
+      '未保存离开必须保留三选一')
+  })
+
   await aok('结构红线: v3.317 日志页（顺序 / 行级渲染 / <mark> / 护栏 / 空态出口 / 高度）', () => {
     const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
