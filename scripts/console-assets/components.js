@@ -913,22 +913,52 @@ const ACTION_DEFS = [
 // 固定 id 会让无障碍名称重复（Sourcery #271）。
 let dialogSeq = 0
 
+// 原生 <dialog> 接管这层遮罩：顶层（top layer）、焦点陷阱、背景 inert、关闭后把焦点还给
+// 触发元素都由浏览器实现，组件不再手写。只留两件浏览器不管的事：
+//   ① showModal() 必须早于量尺寸——未打开的 dialog 是 display:none，量出来全是 0；
+//   ② 退场动画播完才 close()——close() 会立刻把面板抽出顶层，先调就没有缩回/滑出的动画。
+// open 由父级持有（关闭即卸载），所以打开与兜底关闭落在同一个 layout effect 里。
+function useNativeDialog (ref, open) {
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!open || !el) return undefined
+    if (!el.open) {
+      // 老浏览器（iOS < 15.4）没有 showModal：退回 open 属性，视觉仍是原来那层 fixed
+      // 遮罩（.modal-backdrop/.drawer-backdrop 自带定位），只是没有顶层与焦点陷阱。
+      if (typeof el.showModal === 'function') el.showModal()
+      else el.setAttribute('open', '')
+    }
+    // 父级直接切走（不走关闭动画）时补一次 close()：否则顶层与焦点链留在原地。
+    return () => { if (el.open) el.close() }
+  }, [open])
+  // 退场动画结束时调用；close() 顺带把焦点还给打开前的元素（原生 focus restoration）。
+  return useCallback(() => {
+    const el = ref.current
+    if (el && el.open) el.close()
+  }, [])
+}
+
 // 两个弹窗共用的关闭/焦点骨架：onCancel 每次渲染存进 ref（busy 守卫不被旧闭包绕过），
-// Escape 与「打开时聚焦」只写一遍——两份弹窗各抄一份会被 Sonar 判重复代码。
+// Esc 与「打开时聚焦」只写一遍——两份弹窗各抄一份会被 Sonar 判重复代码。
+// 焦点陷阱与背景 inert 已交给原生 dialog，这里不再挂 document 级 keydown。
 function useDialogChrome (open, onCancel, { initialFocusRef = null, fallbackRef = null, closeDialog }) {
   const onCancelRef = useRef(onCancel)
   onCancelRef.current = onCancel
   useEffect(() => {
     if (!open) return undefined
-    const onKey = (e) => { if (e.key === 'Escape') closeDialog(() => onCancelRef.current()) }
-    document.addEventListener('keydown', onKey)
     const t = setTimeout(() => {
       const target = (initialFocusRef && initialFocusRef.current) || (fallbackRef && fallbackRef.current)
       if (target) target.focus()
     }, 0)
-    return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
+    return () => { clearTimeout(t) }
   }, [open, initialFocusRef])
-  return onCancelRef
+  // Escape：浏览器先派发 cancel 再决定要不要自己关。preventDefault 拦住默认关闭，改走与
+  // 「取消」按钮同一条退场路径（动画结束才 close()），否则面板会「啪」一下消失。
+  const onCancelEvent = (e) => {
+    e.preventDefault()
+    closeDialog(() => onCancelRef.current())
+  }
+  return [onCancelRef, onCancelEvent]
 }
 
 function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, initialFocusRef = null, onConfirm, onCancel, children }) {
@@ -937,21 +967,28 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
   // 弹窗「从哪来回哪去」：从触发按钮的位置放大展开，取消/遮罩/Esc 时缩回按钮再卸载。
   const backRef = useRef(null)
   const boxRef = useRef(null)
+  const closeNative = useNativeDialog(backRef, open)
   const [closeDialog, dialogClosing] = useMorphDialog(backRef, boxRef, open)
+  // 退场动画播完才 close()：先关就没有缩回动画，焦点也来不及回到触发按钮。
+  const dismiss = (done) => closeDialog(() => { closeNative(); done() })
   // 回调每次渲染都是新函数；若把它放进 focus effect 的依赖，busy 变化会重新聚焦密码框，
   // 手机上表现为点「解密」后键盘又弹一下。ref 在 useDialogChrome 里更新。
-  const onCancelRef = useDialogChrome(open, onCancel, { initialFocusRef, fallbackRef: cancelRef, closeDialog })
+  const [onCancelRef, onCancelEvent] = useDialogChrome(open, onCancel, { initialFocusRef, fallbackRef: cancelRef, closeDialog: dismiss })
   if (!open) return null
-  return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current()) }}>
-    <div class="modal" ref=${boxRef} role="dialog" aria-modal="true" aria-labelledby=${titleId}>
+  // 遮罩与面板合成一个 <dialog>：浏览器负责顶层、焦点陷阱与背景 inert，视觉仍由
+  // .modal-backdrop / .modal 两条规则决定（class 名与选择器不变）。
+  return html`<dialog class="modal-backdrop" ref=${backRef} role="dialog" aria-modal="true"
+    aria-labelledby=${titleId} oncancel=${onCancelEvent}
+    onClick=${(e) => { if (e.target === e.currentTarget) dismiss(() => onCancelRef.current()) }}>
+    <div class="modal" ref=${boxRef}>
       <div class="modal-title" id=${titleId}>${title}</div>
       <div class="modal-body">${children}</div>
       <div class="modal-actions">
-        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => closeDialog(() => onCancelRef.current())}>取消<//>
+        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => dismiss(() => onCancelRef.current())}>取消<//>
         <${Button} variant="danger-solid" disabled=${busy || confirmDisabled || dialogClosing} onClick=${onConfirm}>${confirmLabel}<//>
       </div>
     </div>
-  </div>`
+  </dialog>`
 }
 
 // 未保存草稿的离开拦截：三选一（取消 / 不保存并离开 / 保存并继续），默认焦点在取消。
@@ -961,11 +998,15 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
   const [titleId] = useState(() => `leave-title-${++dialogSeq}`)
   const backRef = useRef(null)
   const boxRef = useRef(null)
+  const closeNative = useNativeDialog(backRef, open)
   const [closeDialog, dialogClosing] = useMorphDialog(backRef, boxRef, open)
-  const onCancelRef = useDialogChrome(open, onCancel, { fallbackRef: cancelRef, closeDialog })
+  const dismiss = (done) => closeDialog(() => { closeNative(); done() })
+  const [onCancelRef, onCancelEvent] = useDialogChrome(open, onCancel, { fallbackRef: cancelRef, closeDialog: dismiss })
   if (!open) return null
-  return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current()) }}>
-    <div class="modal" ref=${boxRef} role="dialog" aria-modal="true" aria-labelledby=${titleId}>
+  return html`<dialog class="modal-backdrop" ref=${backRef} role="dialog" aria-modal="true"
+    aria-labelledby=${titleId} oncancel=${onCancelEvent}
+    onClick=${(e) => { if (e.target === e.currentTarget) dismiss(() => onCancelRef.current()) }}>
+    <div class="modal" ref=${boxRef}>
       <div class="modal-title" id=${titleId}>有未保存的过滤规则</div>
       <div class="modal-body">
         <div class="fr-dialog-line">当前有 ${count} 个字段还没保存。</div>
@@ -973,12 +1014,12 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
         <div class="modal-note">「保存并继续」会直接保存，保存成功后自动继续刚才的离开操作；「取消」继续编辑。</div>
       </div>
       <div class="modal-actions">
-        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => closeDialog(() => onCancelRef.current())}>取消<//>
+        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => dismiss(() => onCancelRef.current())}>取消<//>
         <${Button} variant="danger-solid" disabled=${busy || dialogClosing} onClick=${onDiscard}>不保存并离开<//>
         <${Button} variant="primary" disabled=${busy || dialogClosing} onClick=${onSave}>保存并继续<//>
       </div>
     </div>
-  </div>`
+  </dialog>`
 }
 
 // ── 组件：右侧抽屉（v3.378）──────────────────────────────────────────────
@@ -986,43 +1027,47 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
 //   列表点开一条、改完还要接着看下一条 ⇒ 抽屉（背后列表保持不动，滚动位置不跳）；
 //   短确认、二选一 ⇒ ConfirmDialog；长表单、深流程 ⇒ 整页。
 // 宽度 520 起步：桌面留出左侧列表做对照；≤640px 铺满（手机上没有并排对照的余地）。
-// 与弹窗共用 useDialogChrome：Escape 关闭、打开时焦点落在关闭按钮、关闭后焦点回到触发元素。
+// 与弹窗共用 useDialogChrome：打开时焦点落在关闭按钮；Esc、点遮罩、关闭按钮三条路径都走
+// requestClose。焦点陷阱与「关闭后焦点回到触发元素」由原生 <dialog> 负责。
 function Drawer ({ open, title, sub = '', width = 520, busy = false, onClose, children, footer = null }) {
+  const backRef = useRef(null)
   const closeRef = useRef(null)
   const [titleId] = useState(() => `drawer-title-${++dialogSeq}`)
   const [closing, setClosing] = useState(false)
   const closeTimer = useRef(null)
+  const closeNative = useNativeDialog(backRef, open)
   // 关闭动画期间禁止重复触发；父级 busy（例如保存中）时直接忽略关闭请求，避免半截状态。
+  // 滑出动画（.drawer-closing）播完才 close()：close 会立刻把面板抽出顶层，先关就没有滑出。
   const requestClose = useCallback(() => {
     if (busy) return
     setClosing(true)
     if (closeTimer.current) clearTimeout(closeTimer.current)
-    closeTimer.current = setTimeout(() => { setClosing(false); if (typeof onClose === 'function') onClose() }, 170)
-  }, [busy, onClose])
+    closeTimer.current = setTimeout(() => { closeNative(); setClosing(false); if (typeof onClose === 'function') onClose() }, 170)
+  }, [busy, onClose, closeNative])
   const onCloseRef = useRef(requestClose)
   onCloseRef.current = requestClose
   useEffect(() => () => { if (closeTimer.current) clearTimeout(closeTimer.current) }, [])
   useEffect(() => {
     if (!open) return undefined
-    const onKey = (e) => { if (e.key === 'Escape') onCloseRef.current() }
-    document.addEventListener('keydown', onKey)
-    const prev = document.activeElement
+    // Escape 走原生 dialog 的 cancel 事件（见模板里的 oncancel），不再手写 document keydown。
     const t = setTimeout(() => { if (closeRef.current) closeRef.current.focus() }, 0)
-    // 抽屉打开时锁住页面滚动：背后列表还在，滚动会带着抽屉一起动。
+    // 抽屉打开时锁住页面滚动：背后列表还在，滚动会带着抽屉一起动。原生 dialog 只管顶层与
+    // 背景 inert，不负责锁滚动（iOS Safari 尤其不锁），所以这一层必须留。
     const root = document.documentElement
     const prevOverflow = root.style.overflow
     root.style.overflow = 'hidden'
     return () => {
-      document.removeEventListener('keydown', onKey)
       clearTimeout(t)
       root.style.overflow = prevOverflow
-      if (prev && typeof prev.focus === 'function' && prev.isConnected) prev.focus()
     }
   }, [open])
   if (!open) return null
-  return html`<div class="drawer-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCloseRef.current() }}>
-    <section class=${'drawer' + (closing ? ' drawer-closing' : '')} role="dialog" aria-modal="true"
-      aria-labelledby=${titleId} style=${{ '--drawer-w': `${width}px` }}>
+  // 遮罩与面板合成一个 <dialog>：顶层、焦点陷阱、背景 inert、关闭后还焦点都由浏览器做，
+  // 视觉仍由 .drawer-backdrop / .drawer 决定（class 名与选择器不变）。
+  return html`<dialog class="drawer-backdrop" ref=${backRef} role="dialog" aria-modal="true"
+      aria-labelledby=${titleId} oncancel=${(e) => { e.preventDefault(); onCloseRef.current() }}
+      onClick=${(e) => { if (e.target === e.currentTarget) onCloseRef.current() }}>
+    <section class=${'drawer' + (closing ? ' drawer-closing' : '')} style=${{ '--drawer-w': `${width}px` }}>
       <header class="drawer-head">
         <div class="drawer-head-text">
           <h2 class="drawer-title" id=${titleId}>${title}</h2>
@@ -1033,7 +1078,7 @@ function Drawer ({ open, title, sub = '', width = 520, busy = false, onClose, ch
       <div class="drawer-body">${children}</div>
       ${footer ? html`<footer class="drawer-foot">${footer}</footer>` : null}
     </section>
-  </div>`
+  </dialog>`
 }
 
 // ── 触发结果行（v3.317）─────────────────────────────────────────────────────

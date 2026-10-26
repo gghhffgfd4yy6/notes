@@ -2185,10 +2185,15 @@ async function backupUiStructureTests () {
 
     // 三个退出入口都必须调用 ref，而不是捕获的旧 onCancel；否则 busy 守卫可能被旧闭包绕过。
     // v3.360：三个入口都先播退场再回调，但回调本身仍走 ref（避免旧闭包绕过 busy 守卫）。
-    assert.match(hook, /if \(e\.key === 'Escape'\) closeDialog\(\(\) => onCancelRef\.current\(\)\)/,
-      'Escape 必须判断 ===（反向/不等号写法不能过），并调用 ref')
-    assert.ok(seg.includes('if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current())'), '点遮罩必须调用 ref')
-    assert.ok(seg.includes('onClick=' + '$' + '{() => closeDialog(() => onCancelRef.current())}'), '取消按钮必须调用 ref')
+    // v3.384：Esc 不再自己挂 document keydown——原生 <dialog> 会先派发 cancel，拦住默认
+    // 关闭（preventDefault）才走得到退场动画；断言改成锁这个替代入口。
+    const cancelAt = hook.indexOf('const onCancelEvent')
+    const cancelSeg = cancelAt > -1 ? hook.slice(cancelAt) : ''
+    assert.ok(cancelSeg.includes('e.preventDefault()'), 'Esc 必须先 preventDefault，否则浏览器直接关掉、退场动画丢失')
+    assert.ok(cancelSeg.includes('closeDialog(() => onCancelRef.current())'), 'cancel（Esc）必须调用 ref')
+    assert.ok(!hook.includes("addEventListener('keydown'"), '不得再手写 Esc 监听：原生 cancel 已覆盖')
+    assert.ok(seg.includes('if (e.target === e.currentTarget) dismiss(() => onCancelRef.current())'), '点遮罩必须调用 ref')
+    assert.ok(seg.includes('onClick=' + '$' + '{() => dismiss(() => onCancelRef.current())}'), '取消按钮必须调用 ref')
 
     // 依赖数组必须属于“聚焦”的那个 effect，不能靠组件里别处的同名字符串蒙混。
     // 不用正则：嵌套量词会被 Sonar 判「回溯性能」。
@@ -6557,8 +6562,13 @@ async function main () {
     assert.ok(/\n[ ]{2}Drawer,/.test(src), 'Drawer 必须从 components.js 导出')
     assert.ok(seg.includes('role="dialog"') && seg.includes('aria-modal="true"') && seg.includes('aria-labelledby'),
       '抽屉必须有无障碍语义：dialog + aria-modal + 标题 id')
-    assert.ok(seg.includes('Escape'), 'Escape 必须能关闭')
-    assert.ok(seg.includes('prev.focus()') && seg.includes('prev.isConnected'), '关闭后焦点必须回到触发元素（节点已卸载则跳过）')
+    // v3.384：Esc 与「关闭后焦点回到触发元素」都交给原生 <dialog>——cancel 事件接管 Esc，
+    // close() 自带 focus restoration；手写的 document keydown 与 prev.focus() 已删，
+    // 这两条改成锁替代实现（否则删回手写版也不会红）。
+    assert.ok(seg.includes('oncancel=') && seg.includes('Escape'), 'Escape 必须能关闭（走原生 cancel 事件）')
+    assert.ok(seg.includes('closeNative()') && !seg.includes('prev.focus()'),
+      '关闭后焦点必须回到触发元素：交给原生 close()，不得再手写 prev.focus()')
+    assert.ok(!seg.includes("addEventListener('keydown'"), 'Esc 不得再自己挂 document keydown（原生 cancel 已覆盖）')
     assert.ok(seg.includes('root.style.overflow') && seg.includes('prevOverflow'),
       '打开时锁背景滚动，关闭时还原（否则背后列表跟着滚）')
     assert.ok(seg.includes('if (busy) return'), '父级 busy 时必须拒绝关闭（保存中不能半截关掉）')
@@ -6659,6 +6669,10 @@ async function main () {
       '正式运行与通知自检必须走确认；试运行/环境检查直接执行')
     assert.ok(src.includes("cls: 'btn-danger-solid'"), '正式运行必须是红色危险按钮')
     assert.ok(src.includes('role="dialog"') && src.includes('aria-modal="true"'), '弹窗必须有无障碍语义')
+    // v3.384：顶层/焦点陷阱/背景 inert 交给原生 <dialog>——必须真的用 showModal() 打开，
+    // 并且动画结束才 close()（先 close 会立刻抽走顶层，退场动画就没了）。
+    assert.ok(src.includes('el.showModal()') && src.includes('if (el.open) el.close()'),
+      '弹窗必须用原生 dialog.showModal() 打开、close() 关闭')
     // v3.361：焦点 effect 收进 useDialogChrome，取消按钮通过 fallbackRef 传进去。
     assert.ok(src.includes('defaultFocus') === false && src.includes('fallbackRef.current') && src.includes('fallbackRef: cancelRef'),
       '默认焦点必须落在取消，不能落在确认')
@@ -6675,6 +6689,11 @@ async function main () {
     assert.ok(!src.includes('首轮前正常'), '墓碑文案不得再写「首轮前正常」')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/\.alert-banner\s*\{/.test(css) && /\.modal-backdrop\s*\{/.test(css), '横幅/弹窗样式必须存在')
+    // v3.384：原生 <dialog> 的 UA 默认值必须重置，否则 fit-content + max-height 会把面板
+    // 挤窄、抽屉压短；::backdrop 不置透明会和组件自绘的遮罩叠成两层黑。
+    assert.ok(/\.modal-backdrop,\s*\.drawer-backdrop\s*\{[^}]*max-height:\s*none/.test(css),
+      'dialog 必须重置 UA 的 fit-content / max-height（否则面板被挤窄、抽屉短一截）')
+    assert.ok(/\.modal-backdrop::backdrop[^{]*\{[^}]*transparent/.test(css), '::backdrop 必须显式透明（不与自绘遮罩叠加）')
     assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.cards\s*\{\s*grid-template-columns:\s*1fr 1fr/.test(css),
       '手机端状态卡必须 2×2，不能四张单列')
     assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.btn-item\s*\{\s*flex:\s*1 1 calc\(50% - 5px\)/.test(css),
