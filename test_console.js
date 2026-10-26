@@ -6674,6 +6674,29 @@ async function main () {
     assert.strictEqual(filterSourceNote(null, 11, 0), '')
   })
 
+  await aok('组件: 右侧抽屉（v3.378，列表对照场景的容器）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function Drawer (')
+    assert.ok(at > -1, '必须提供 Drawer 组件（推送记录详情/备份/规则预览共用）')
+    const seg = src.slice(at, src.indexOf('\n}\n', at))
+    assert.ok(/\n[ ]{2}Drawer,/.test(src), 'Drawer 必须从 components.js 导出')
+    assert.ok(seg.includes('role="dialog"') && seg.includes('aria-modal="true"') && seg.includes('aria-labelledby'),
+      '抽屉必须有无障碍语义：dialog + aria-modal + 标题 id')
+    assert.ok(seg.includes('Escape'), 'Escape 必须能关闭')
+    assert.ok(seg.includes('prev.focus()') && seg.includes('prev.isConnected'), '关闭后焦点必须回到触发元素（节点已卸载则跳过）')
+    assert.ok(seg.includes('root.style.overflow') && seg.includes('prevOverflow'),
+      '打开时锁背景滚动，关闭时还原（否则背后列表跟着滚）')
+    assert.ok(seg.includes('if (busy) return'), '父级 busy 时必须拒绝关闭（保存中不能半截关掉）')
+    assert.ok(seg.includes('drawer-closing') && seg.includes('setTimeout'), '退场要先播动画再卸载')
+    assert.ok(seg.includes('e.target === e.currentTarget'), '点遮罩关闭必须限定事件源（点内容不关）')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.drawer\s*\{[^}]*width:\s*min\(var\(--drawer-w,\s*520px\),\s*100%\)/.test(css),
+      '抽屉默认宽 520、窄屏不越界（左侧留列表做对照）')
+    assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.drawer\s*\{\s*width:\s*100%/.test(css), '手机端抽屉必须铺满')
+    assert.ok(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.drawer[\s\S]*?animation:\s*none/.test(css),
+      '减少动效时必须关掉滑入动画')
+  })
+
   await aok('结构红线: v3.307 确认弹窗 / 今日统计 / 时间窗 / 日志级别 / hash 路由', () => {
     const src = readConsoleSource()
     assert.ok(src.includes('function ConfirmDialog'), '危险动作必须有确认弹窗')

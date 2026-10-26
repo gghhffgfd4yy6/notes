@@ -981,6 +981,61 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
   </div>`
 }
 
+// ── 组件：右侧抽屉（v3.378）──────────────────────────────────────────────
+// 用法边界（按「内容少用弹窗 / 要对照用抽屉 / 彻底换流程用整页」）：
+//   列表点开一条、改完还要接着看下一条 ⇒ 抽屉（背后列表保持不动，滚动位置不跳）；
+//   短确认、二选一 ⇒ ConfirmDialog；长表单、深流程 ⇒ 整页。
+// 宽度 520 起步：桌面留出左侧列表做对照；≤640px 铺满（手机上没有并排对照的余地）。
+// 与弹窗共用 useDialogChrome：Escape 关闭、打开时焦点落在关闭按钮、关闭后焦点回到触发元素。
+function Drawer ({ open, title, sub = '', width = 520, busy = false, onClose, children, footer = null }) {
+  const closeRef = useRef(null)
+  const [titleId] = useState(() => `drawer-title-${++dialogSeq}`)
+  const [closing, setClosing] = useState(false)
+  const closeTimer = useRef(null)
+  // 关闭动画期间禁止重复触发；父级 busy（例如保存中）时直接忽略关闭请求，避免半截状态。
+  const requestClose = useCallback(() => {
+    if (busy) return
+    setClosing(true)
+    if (closeTimer.current) clearTimeout(closeTimer.current)
+    closeTimer.current = setTimeout(() => { setClosing(false); if (typeof onClose === 'function') onClose() }, 170)
+  }, [busy, onClose])
+  const onCloseRef = useRef(requestClose)
+  onCloseRef.current = requestClose
+  useEffect(() => () => { if (closeTimer.current) clearTimeout(closeTimer.current) }, [])
+  useEffect(() => {
+    if (!open) return undefined
+    const onKey = (e) => { if (e.key === 'Escape') onCloseRef.current() }
+    document.addEventListener('keydown', onKey)
+    const prev = document.activeElement
+    const t = setTimeout(() => { if (closeRef.current) closeRef.current.focus() }, 0)
+    // 抽屉打开时锁住页面滚动：背后列表还在，滚动会带着抽屉一起动。
+    const root = document.documentElement
+    const prevOverflow = root.style.overflow
+    root.style.overflow = 'hidden'
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      clearTimeout(t)
+      root.style.overflow = prevOverflow
+      if (prev && typeof prev.focus === 'function' && prev.isConnected) prev.focus()
+    }
+  }, [open])
+  if (!open) return null
+  return html`<div class="drawer-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCloseRef.current() }}>
+    <section class=${'drawer' + (closing ? ' drawer-closing' : '')} role="dialog" aria-modal="true"
+      aria-labelledby=${titleId} style=${{ '--drawer-w': `${width}px` }}>
+      <header class="drawer-head">
+        <div class="drawer-head-text">
+          <h2 class="drawer-title" id=${titleId}>${title}</h2>
+          ${sub ? html`<div class="drawer-sub">${sub}</div>` : null}
+        </div>
+        <button type="button" class="drawer-x" ref=${closeRef} aria-label="关闭" onClick=${() => onCloseRef.current()}>×</button>
+      </header>
+      <div class="drawer-body">${children}</div>
+      ${footer ? html`<footer class="drawer-foot">${footer}</footer>` : null}
+    </section>
+  </div>`
+}
+
 // ── 触发结果行（v3.317）─────────────────────────────────────────────────────
 // 触发返回 202 后旧界面只把面板头徽标从「任务运行中」改回「空闲」：手机上看不出
 // 「刚才那次到底成没成」。这里用 App 已有的 runs（被触发那条 run 的结算）拼一行结果，
@@ -1224,6 +1279,7 @@ export {
   Badge,
   Button,
   ConfirmDialog,
+  Drawer,
   DateRange,
   EMPTY_RANGE,
   Hint,
