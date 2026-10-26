@@ -108,6 +108,12 @@ function readThemeCookie () {
 }
 function applyThemeKey (key) {
   document.documentElement.setAttribute('data-theme', key)
+  // theme-color 跟着切：Android 的系统栏不跟着变的话，切到亮色主题后顶部还是旧色。
+  const meta = document.querySelector('meta[name="theme-color"]')
+  if (meta) {
+    const bg = window.getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()
+    if (bg) meta.setAttribute('content', bg)
+  }
   try {
     document.cookie = THEME_COOKIE + '=' + key + '; Path=/; Max-Age=31536000; SameSite=Lax'
   } catch (e) {

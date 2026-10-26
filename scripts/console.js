@@ -1046,6 +1046,7 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
   return `<!doctype html>
 <html lang="zh-CN" data-theme="${THEMES.includes(theme) ? theme : THEMES[0]}"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="${THEME_BG[theme] || THEME_BG.deep}">
 <meta http-equiv="Content-Security-Policy" content="${CSP_HEADER}">
 <link rel="stylesheet" href="${assetBaseUrl}/flatpickr.css">
 <link rel="stylesheet" href="${assetBaseUrl}/app.css">
@@ -1176,6 +1177,10 @@ function sessionCookieValue (cookieHeader) {
 // 只改属性 + 写 cookie，下次打开首帧就是对的（浅色不会先闪一帧深色）。
 const THEME_COOKIE = 'xbk_theme'
 const THEMES = ['deep', 'material', 'nord', 'light']
+// 主题底色（与 app.css 里各 data-theme 的 --bg 一一对应）：写进 <meta name="theme-color">，
+// 让 Android Chrome 的地址栏/状态栏跟着页面底色走。缺了它，系统栏是浅色的，切页或重绘时
+// 顶部会先闪一下白——和根快照透明是同一类「漏白」，只是漏在浏览器 UI 上。
+const THEME_BG = Object.freeze({ deep: '#0b0f17', material: '#100e14', nord: '#1a1f27', light: '#f3f5f9' })
 function themeCookieValue (cookieHeader) {
   if (typeof cookieHeader !== 'string' || cookieHeader.length === 0) return THEMES[0]
   for (const part of cookieHeader.split(';')) {

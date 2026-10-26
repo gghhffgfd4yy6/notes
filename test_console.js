@@ -599,6 +599,10 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.ok(withToken.includes('id="xbk-boot"'), 'JSON 岛节点存在')
   assert.match(withToken, /\/assets\/[0-9a-f]{16}\/app\.js/, '引用前端 ESM（带内容版本路径）')
   assert.match(withToken, /\/assets\/[0-9a-f]{16}\/app\.css/, '引用样式（带内容版本路径）')
+  // v3.376：theme-color 跟主题底色一致，Android 系统栏/地址栏才不会在切页时漏白。
+  assert.ok(withToken.includes('<meta name="theme-color" content="#0b0f17">'), 'theme-color 必须是默认主题底色')
+  const lightPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), undefined, 'light')
+  assert.ok(lightPage.includes('<meta name="theme-color" content="#f3f5f9">'), 'theme-color 必须跟随主题')
   assert.ok(withToken.includes('Content-Security-Policy'), '带 CSP')
   // Sourcery vww：CSP 不能只断言 meta 名——被削弱的策略（如 default-src *）也含这个字符串。
   // 必须锁死关键指令本体。
