@@ -4,7 +4,7 @@
 // 顺序在 ui.js 之前（App 在 ui.js 里 import 这些面板）。
 import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from './constants.js'
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
-import { Badge, Button, ConfirmDialog, DateRange, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, useHoldRepeat } from './components.js'
+import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
 import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, isEncryptedBackup, logLineCounts, logLineTone, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
@@ -3698,6 +3698,12 @@ const FILTER_GROUPS = [
 
 const FILTER_FIELD_NAMES = FILTER_GROUPS.reduce((acc, g) => acc.concat(g.fields.map((f) => f.name)), [])
 
+// 保存复核抽屉里的「改动字段」用中文标签：给用户看的是「屏蔽楼主」，不是 pingbilouzhu。
+const FILTER_FIELD_LABELS = FILTER_GROUPS.reduce((acc, g) => {
+  for (const f of g.fields) acc[f.name] = f.label
+  return acc
+}, {})
+
 // 过滤规则草稿：改了但没保存的内容先落在浏览器本地，关标签/杀后台/浏览器退出后
 // 下次打开还能捡回来。只存规则字段，不存 token；同一浏览器只保留最近一份。
 const FILTER_DRAFT_KEY = 'xbk_filter_draft_v1'
@@ -4319,7 +4325,14 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       const pv = await apiPostFilterPreview({ schema: 1, filter: candidate, confirmWideMatch: true })
       if (!pv.ok) { showFailure(pv, '补推预览失败'); return false }
       setPreview(pv.data)
-      setDialog({ kind: 'save', filter: candidate, baseRevision: data.revision, preview: pv.data, wide: wideFieldsOf(candidate) })
+      // 抽屉里要列出「这次到底改了哪些字段」：draft 与 base 逐字段比对（与表单上的
+      // 「未保存」徽标同源），标签转中文，值取即将落盘的候选值。
+      const changed = dirtyFields.map((name) => ({
+        name,
+        label: FILTER_FIELD_LABELS[name] || name,
+        value: candidate[name] !== undefined && candidate[name] !== null ? String(candidate[name]) : ''
+      }))
+      setDialog({ kind: 'save', filter: candidate, baseRevision: data.revision, preview: pv.data, wide: wideFieldsOf(candidate), changed })
       return true
     } catch (e) {
       setErr(`保存前检查失败：${e.message}`)
@@ -4573,14 +4586,52 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const dialogNode = () => {
     if (!dialog) return null
     if (dialog.kind === 'save') {
-      return html`<${ConfirmDialog} open=${true} title="确认保存过滤规则"
-        confirmLabel=${busy === 'save' ? '保存中…' : '确认保存'} busy=${busy === 'save'}
-        onCancel=${closeDialog}
-        onConfirm=${() => submitSave({ filter: dialog.filter, baseRevision: dialog.baseRevision, confirmWideMatch: dialog.wide.length > 0 })}>
-        <div class="fr-dialog-line">${reEvalText(dialog.preview)}</div>
-        ${dialog.wide.length > 0 && html`<div class="fr-wide-warn" role="alert">
-          含 .* 全命中规则：${dialog.wide.join('、')}。保存后几乎所有记录都会被命中，因此需要二次确认（confirmWideMatch:true）。
+      // 保存前复核是「核对」不是「确认」：改动字段 + 补推影响 + 命中样本都可能很长，
+      // 弹窗会把背后的表单挡死、用户没法对照着看哪个字段写成了什么。改成右侧抽屉
+      // （宽 560，含 .* 全命中规则时 640），表单留在背后做对照。
+      // 短确认（未保存离开的三选一）仍走居中弹窗：那类内容一屏就够，弹窗更省视线移动。
+      const wide = Array.isArray(dialog.wide) ? dialog.wide : []
+      const changed = Array.isArray(dialog.changed) ? dialog.changed : []
+      const preview = dialog.preview && typeof dialog.preview === 'object' ? dialog.preview : {}
+      const samples = Array.isArray(preview.samples) ? preview.samples : []
+      const saving = busy === 'save'
+      return html`<${Drawer} open=${true} title="确认保存过滤规则"
+        sub=${`${changed.length} 个字段有改动 · 保存后写入覆盖文件，下一轮生效`}
+        width=${wide.length > 0 ? 640 : 560}
+        busy=${saving}
+        onClose=${closeDialog}
+        footer=${html`<${Button} variant="secondary" disabled=${saving} onClick=${closeDialog}>取消<//>
+          <${Button} variant="primary" disabled=${saving}
+            onClick=${() => submitSave({ filter: dialog.filter, baseRevision: dialog.baseRevision, confirmWideMatch: wide.length > 0 })}>${saving ? '保存中…' : '保存'}<//>`}>
+        <div class="fr-preview">
+          <div class="fr-preview-head">补推影响</div>
+          <div class="fr-preview-main">${reEvalText(preview)}</div>
+          ${preview.available === false
+            ? html`<div class="fr-preview-meta">缓存读取 ${preview.cacheStatus || '—'}（${preview.code || 'cache_unavailable'}）</div>`
+            : html`<div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（超过 5000 条，实际可能更多）' : ''}</div>`}
+        </div>
+        ${wide.length > 0 && html`<div class="fr-wide-warn" role="alert">
+          含 .* 全命中规则：${wide.join('、')}。保存后几乎所有记录都会被命中，因此需要二次确认（confirmWideMatch:true）。
         </div>`}
+        <div class="fr-restore">
+          <div class="fr-restore-head">改动字段（${changed.length}）</div>
+          <ul class="fr-samples">
+            ${changed.map((f) => html`<li key=${f.name}><span class="fr-sample-title">${f.label}</span><span class="fr-sample-id">${f.value === '' ? '（留空）' : f.value}</span></li>`)}
+          </ul>
+          <div class="fr-field-hint">表单仍在背后，逐条对一遍再保存；取消或关闭不写盘，草稿仍保留。</div>
+        </div>
+        <div class="fr-restore">
+          <div class="fr-restore-head">命中样本（${samples.length}）</div>
+          ${samples.length > 0
+            ? html`<ul class="fr-samples">
+              ${samples.map((s, i) => html`<li key=${s && s.id !== null && s.id !== undefined ? String(s.id) : `review-sample-${i}`}>
+                <span class="fr-sample-title">${s && s.title ? s.title : '（无标题）'}</span>
+                ${s && s.id !== null && s.id !== undefined && html`<span class="fr-sample-id">${String(s.id)}</span>`}
+              </li>`)}
+            </ul>`
+            : html`<div class="fr-field-hint">本次预览没有命中样本。</div>`}
+          <div class="fr-field-hint">预览只在内存试算，不落盘、不推进过滤 hash、不触发推送。</div>
+        </div>
         <div class="modal-note">保存后写入覆盖文件，<strong>下一轮生效</strong>；当前正在跑的一轮不换规则。</div>
       <//>`
     }
