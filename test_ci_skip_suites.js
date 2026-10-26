@@ -1886,7 +1886,7 @@ console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner
   {
     const widened = mutationYml.replace(/^([ \t]*)- name: app$/m, '$1- name: app\n$1  timeout_ms: 60000')
     assert.notStrictEqual(widened, mutationYml, '反例夹具必须真的给 app 段加了 timeout_ms')
-    assert.throws(() => assertTimeoutWiring(widened), /console-part1\.\.11/,
+    assert.throws(() => assertTimeoutWiring(widened), /console-part1\.\.12/,
       '把 timeout_ms 扩到非 console 段后必须红：改别的段的等待上限会改变它的判据，必须单独评估')
   }
   // 反例 ③：把某段 console 的 60000 改回 300000（「反正默认就是 300s」）⇒ 必须红
