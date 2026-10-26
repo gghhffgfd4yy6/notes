@@ -7370,10 +7370,24 @@ async function main () {
     assert.ok(/animation-duration:\s*220ms/.test(pair), '淡出淡入必须 220ms（与 motion.js 的 MOTION.fast 同档）')
     assert.ok(/animation-timing-function:\s*ease-out/.test(pair), '曲线必须是 ease-out')
     // v3.376：根元素与过渡覆盖层都要有底色——缺一个就会在 Android 的合成器时序里漏白。
-    assert.ok(/html\s*\{[^}]*background:\s*var\(--bg\)/.test(css),
-      'html 必须自己带底色（只给 body 上色时根快照是透明的，切页会漏出白画布）')
-    assert.ok(/::view-transition\s*\{[^}]*background-color:\s*var\(--bg\)/.test(css),
-      '过渡覆盖层必须有底色（快照淡出到一半时不得漏出 UA 默认白底）')
+    // 只看「文本里有没有」不够：把规则塞进 @media print 同样命中正则，但屏幕上根本不生效。
+    const enclosingAtRule = (text, idx) => {
+      let depth = 0
+      for (let i = idx - 1; i >= 0; i--) {
+        if (text[i] === '}') depth++
+        else if (text[i] === '{') {
+          if (depth === 0) return text.slice(text.lastIndexOf('\n', i) + 1, i).trim()
+          depth--
+        }
+      }
+      return ''
+    }
+    const htmlIdx = css.search(/html\s*\{[^}]*background:\s*var\(--bg\)/)
+    assert.ok(htmlIdx >= 0, 'html 必须自己带底色（只给 body 上色时根快照是透明的，切页会漏出白画布）')
+    assert.ok(!/@media/.test(enclosingAtRule(css, htmlIdx)), 'html 底色必须在无条件区块里（@media 里的规则屏幕不生效）')
+    const vtIdx = css.search(/::view-transition\s*\{[^}]*background-color:\s*var\(--bg\)/)
+    assert.ok(vtIdx >= 0, '过渡覆盖层必须有底色（快照淡出到一半时不得漏出 UA 默认白底）')
+    assert.ok(!/@media/.test(enclosingAtRule(css, vtIdx)), '覆盖层底色必须在无条件区块里')
     assert.ok(!/::view-transition[^{]*\{[^}]*\btransform\s*:/.test(css),
       '快照过渡里不得出现 transform —— 页面里有 position:fixed 的弹层，祖先一有 transform 就按它定位')
     const page = (css.match(/\.page\s*\{[^}]*\}/) || [''])[0]
