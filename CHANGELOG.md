@@ -1046,3 +1046,13 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 文档：`README.md` 控制台小节补「抽屉」一条；`SYSTEM_CONTRACT.md` 补抽屉容器契约（语义/三路关闭/滚动锁/焦点归还/只准动 transform/遮罩必须走 ::before），并把动效层那条的 `motionOK()` 口径写明是「JS 驱动」，纯 CSS 动画由同一份 `prefers-reduced-motion` 关闭。
 - 测试：抽屉组件用例补四条断言（`.drawer` 必须真的引用 `drawer-in`、`drawer-in` 不得含 opacity、`.drawer-backdrop` 本身不得有动画、`::before` 的关键帧必须 0→1）；控制台套件 282 通过。
 - 版本 3.380.0。
+
+## v3.381 — 控制台：抽屉退场不再淡出、遮罩首帧不再黑一帧
+
+- 现象：关抽屉时面板先「透一下」——背后的列表从白色面板里浮上来；开抽屉偶尔有一帧发暗。
+- 原因一：退场关键帧 `drawer-out` 的 `to { opacity: 0 }` 让面板最后 170ms 变成半透明白片。手机上面板铺满整屏、位移只有 28px，看上去就是原地闪一下。
+- 原因二：`.drawer-backdrop::before` 只写了 `animation`，静态 `opacity` 是默认值 1——动画起手前那一帧会先画出全黑遮罩，再跳回 0 淡入。
+- 改法：退场整块滑出屏幕（`translate3d(100%)`，0.17s），面板全程不透明；遮罩静态 `opacity: 0` + `forwards`，退场交给 `.drawer-backdrop:has(.drawer-closing)::before` 做 1→0；`prefers-reduced-motion` 下遮罩直接实心（否则静态 0 + 关动画 = 遮罩消失）。
+- 文档：`README.md` 抽屉条目补退场行为；`SYSTEM_CONTRACT.md` 抽屉契约补「退场同样不得淡出、遮罩静态值必须是 0」。
+- 测试：抽屉组件用例补 6 条断言（遮罩静态 0 / forwards / 退场无 opacity / 整块滑出 / `:has` 淡出 / reduce 下实心）；控制台套件 282 通过。
+- 版本 3.381.0。
