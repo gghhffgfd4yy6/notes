@@ -6698,6 +6698,11 @@ async function main () {
     assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.drawer\s*\{\s*width:\s*100%/.test(css), '手机端抽屉必须铺满')
     assert.ok(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.drawer[\s\S]*?animation:\s*none/.test(css),
       '减少动效时必须关掉滑入动画')
+    // v3.380：进场只位移、不淡入——旧版 from{opacity:.55} 会让背后列表从抽屉里透出来，像闪了一下。
+    const drawerIn = (css.match(/@keyframes drawer-in \{[^}]*\}[^}]*\}/) || [''])[0]
+    assert.ok(drawerIn.includes('transform'), '进场必须有位移（否则是硬切）')
+    assert.ok(!drawerIn.includes('opacity'), '进场不得淡入：面板从第一帧就要不透明，否则背后列表会透出来')
+    assert.ok(/\.drawer-backdrop\s*\{[^}]*animation:\s*drawer-backdrop-in/.test(css), '遮罩要自己淡入，不然底色是硬跳')
   })
 
   await aok('结构红线: v3.379 推送记录详情走右侧抽屉（520 / 无行内展开 / 焦点归还）', () => {
