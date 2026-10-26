@@ -8914,7 +8914,7 @@ async function main () {
       assert.strictEqual(blocked.readFailed, true, '读失败要标记 readFailed')
       assert.strictEqual(writeDeviceStore(dir, [], { readFailed: blocked.readFailed }), false, '读失败时 revoke 不得覆盖')
       assert.strictEqual(writeDeviceStore(dir, [issued.record], { corruptText: blocked.corruptText, readFailed: blocked.readFailed }), false, '读失败时新增设备不得覆盖')
-      assert.strictEqual(fs.statSync(deviceFile).size, 64 * 1024 + 1, '原文件原样保留')
+      assert.strictEqual(fs.readFileSync(deviceFile).length, 64 * 1024 + 1, '原文件原样保留')
       fs.rmSync(deviceFile)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
