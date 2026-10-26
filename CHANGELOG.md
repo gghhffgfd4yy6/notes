@@ -997,3 +997,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 拉取式自动部署：`scripts/auto-deploy.sh` + `deploy/xbk-deploy.{service,timer}`，每 2 分钟 `fetch origin main`，有更新且无任务在跑时 `checkout -f` → 重启 → 轮询 `/api/sys` 直到版本等于 `package.json`（30s）；失败回滚旧 sha、重启、复验后退出 1。`flock` 单飞，`--check` / `--dry-run` 只读；SSH 私钥不进 GitHub Actions。
 - 测试与门禁：控制台套件 277 通过；`console.js` 涨到 6732 行，变异矩阵按 700 行硬上限新开 `console-part12`（5801-6500 / 6501-6732），矩阵共 32 段（28 TAP + 4 command）。
 - 版本 3.374.0。
+
+## v3.375 — 控制台：静态资产按版本路径长缓存
+
+- 资产版本号从查询串挪进路径：页面引用 `/assets/<sha16>/app.js`，模块内部的 `import './pages.js'` 按相对路径解析后自动继承同一前缀，整张 ESM 图共享一个版本。此前只有入口 `app.js` 和 CSS 带 `?v=`，11 个模块走裸 URL，每次打开都要发一轮条件请求（304 也要一来一回，手机上约 1 个 RTT + 8KB 上行）。
+- 版本等于当前资产哈希才发 `Cache-Control: public, max-age=31536000, immutable`；部署瞬间打开的旧页面仍能取到文件（不 404 白屏），但只给 `no-store`——否则新字节会被写进旧版本的缓存键，同一页面新旧模块混跑。裸路径与旧 `?v=` 写法继续可用（未带版本时仍 no-cache）。
+- 访问日志降噪白名单同步识别版本路径（否则每次打开 11 条资产请求会挤掉 200 条环形里的真实记录）。
+- 测试：控制台套件 277 通过（新增版本路径 200/immutable/鉴权/旧版本可取/非法段 404 断言）；`console.js` 6764 行，变异矩阵末段 6501-6764。
+- 版本 3.375.0。

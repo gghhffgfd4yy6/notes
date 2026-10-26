@@ -746,12 +746,16 @@ function loadAssets () {
   throw new Error('控制台前端资产在读取期间被替换（部署进行中？），拒绝以混合版本继续')
 }
 
-function assetQuery () {
+// 资产基址（v3.375）：版本号放进**路径**而不是查询串。
+// 原因：模块内部的 `import './pages.js'` 会按相对路径解析，查询串不会跟着走——只有把版本
+// 放进目录，整张 ESM 图才共享同一个版本前缀，所有文件都能 immutable 长缓存；页面每次打开
+// 也就不再对 11 个模块发条件请求（304 也要一来一回）。
+function assetBase () {
   try {
-    return `?v=${loadAssets().version}`
+    return `/assets/${loadAssets().version}`
   } catch (e) {
     // createConsole 的启动闸已保证资产可读；这里兜底成裸 URL，页面仍可用（只是没有长缓存）。
-    return ''
+    return '/assets'
   }
 }
 
@@ -814,7 +818,21 @@ function etagMatches (header, etag) {
   return raw.split(',').some(candidate => strip(candidate) === mine)
 }
 
-function serveStatic (req, res, route, spec) {
+// 资产路由解析（v3.375）：裸路径照旧，另外接受 /assets/<16 位内容版本>/<文件>。
+// 版本段只做格式校验、不比对当前值——部署前打开的旧页面仍能取到文件，不会白屏。
+const VERSIONED_ASSET_RE = /^\/assets\/([0-9a-f]{16})\/([A-Za-z0-9._-]+)$/
+function resolveAssetRoute (pathname) {
+  if (Object.prototype.hasOwnProperty.call(STATIC_ASSETS, pathname)) {
+    return { route: pathname, spec: STATIC_ASSETS[pathname], version: null }
+  }
+  const m = VERSIONED_ASSET_RE.exec(pathname)
+  if (m === null) return null
+  const route = `/assets/${m[2]}`
+  if (!Object.prototype.hasOwnProperty.call(STATIC_ASSETS, route)) return null
+  return { route, spec: STATIC_ASSETS[route], version: m[1] }
+}
+
+function serveStatic (req, res, route, spec, assetVersion = null) {
   let store
   try {
     store = loadAssets()
@@ -825,18 +843,29 @@ function serveStatic (req, res, route, spec) {
   const entry = store.table.get(route)
   const useGzip = acceptsGzip(req.headers['accept-encoding'])
   const etag = useGzip ? entry.gzipEtag : entry.etag
+  // 内容寻址有两种写法：旧页面的 ?v=<version>，和新页面把版本写进路径（/assets/<version>/file）。
+  // 路径写法只在**版本等于当前资产哈希**时发 immutable；部署前打开的旧页面仍能取到文件
+  // （宁可给它当前字节，也不要 404 白屏），但只能 no-store——否则会把新字节写进旧版本的
+  // 缓存键里，同一页面上「旧模块 + 新模块」混跑，而浏览器还以为拿到的是那个版本。
   let versioned = false
-  try {
-    versioned = new URL(req.url, 'http://localhost').searchParams.get('v') === store.version
-  } catch (e) { /* 畸形 URL 交给上层校验；这里按裸 URL 处理 */ }
+  let cacheControl
+  if (assetVersion !== null) {
+    versioned = assetVersion === store.version
+    cacheControl = versioned ? 'public, max-age=31536000, immutable' : 'no-store'
+  } else {
+    try {
+      versioned = new URL(req.url, 'http://localhost').searchParams.get('v') === store.version
+    } catch (e) { /* 畸形 URL 交给上层校验；这里按裸 URL 处理 */ }
+    cacheControl = versioned ? 'public, max-age=31536000, immutable' : 'no-cache'
+  }
   const headers = {
     'Content-Type': spec.type,
-    // 内容寻址：?v=<全站版本号> 命中即同一份字节，可以 immutable 长缓存一年、期间不再回源。
+    // 内容寻址：?v=<全站版本号> 或 /assets/<版本>/file 命中即同一份字节，可 immutable 长缓存一年。
     // public 而非 private：资产是前端代码/样式，与调用方身份无关（任何人拿到的都是同一份，
     // 不含凭证与推送数据），允许 CDN/共享缓存存一份供未鉴权请求复用，省掉回源的 401 往返；
     // 数据面不在此列——HTML 由 applyPageHeaders 明确 no-store，API 出口按各分支自设 Cache-Control。
     // 裸 URL（app.js 内部 `import './pure.mjs'`）不走内容寻址，仍 no-cache + ETag 协商。
-    'Cache-Control': versioned ? 'public, max-age=31536000, immutable' : 'no-cache',
+    'Cache-Control': cacheControl,
     ETag: etag,
     Vary: 'Accept-Encoding'
   }
@@ -971,7 +1000,7 @@ function shouldLogAccess (method, pathname, statusCode) {
   const p = String(pathname || '')
   if (m && (p === '/' || p === '/api/status' || p === '/api/runs' || p === '/api/runs/stream' ||
     p === '/api/stream' ||
-    Object.prototype.hasOwnProperty.call(STATIC_ASSETS, p))) return false
+    resolveAssetRoute(p) !== null)) return false
   if (m && RUN_DETAIL_PATH_RE.test(p)) return false // D4：GET 详情轮询
   if (method === 'POST' && p === '/api/runs/detail') return false // D4：POST 详情轮询（前端实际形态）
   return true
@@ -1000,6 +1029,7 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
   // instance：本实例（按 stateDir 派生）的稳定短 id，随 boot 下发。前端用它给「首屏快照」
   // 做命名空间——同一浏览器 origin 先后服务过不同实例时，旧快照不会串到新实例页面上。
   // 只是 stateDir 的截断哈希（8 hex），不含 token，也不可反推路径。
+  const assetBaseUrl = assetBase()
   const bootJson = JSON.stringify({ token: bootToken, version: APP_VERSION, instance: instanceId })
     .replace(/</g, '\\u003c')
     .replace(/>/g, '\\u003e')
@@ -1008,27 +1038,28 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
   // 首屏模块预加载（v3.373）：app.js 是唯一入口，浏览器必须先拿到并解析它才知道有 11 个
   // 依赖模块——「取 app.js → 解析 → 再并发取模块」是一段可见的瀑布。这里按体积从大到小
   // 预声明整张静态 import 闭包（test_console.js 用 acorn 算闭包逐字对账，漏一个/多一个都红）。
-  // **必须裸 URL**：模块说明符就是 './xxx.js'，裸 URL 才命中预加载条目；带 ?v= 会按另一个
-  // 请求算（同一文件下两次），带 crossorigin 会换缓存键——两者都让预加载白做。
+  // 预加载与入口共用同一个**版本路径**（v3.375）：模块说明符是 './xxx.js'，从
+  // /assets/<version>/app.js 解析出来就是 /assets/<version>/xxx.js，和预加载逐字相同；
+  // 带查询串会换缓存键（同一文件下两次），带 crossorigin 也会换——两者都让预加载白做。
   // flatpickr 写路由名 /assets/flatpickr.js（真实文件名 flatpickr.module.js，写后者 404）。
   // app.js 自己不加 preload：<script type="module" src> 就是它的取用点。
   return `<!doctype html>
 <html lang="zh-CN" data-theme="${THEMES.includes(theme) ? theme : THEMES[0]}"><head><meta charset="utf-8"><title>xbk-push 控制台</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="${CSP_HEADER}">
-<link rel="stylesheet" href="/assets/flatpickr.css${assetQuery()}">
-<link rel="stylesheet" href="/assets/app.css${assetQuery()}">
-<link rel="modulepreload" href="/assets/pages.js">
-<link rel="modulepreload" href="/assets/flatpickr.js">
-<link rel="modulepreload" href="/assets/components.js">
-<link rel="modulepreload" href="/assets/ui.js">
-<link rel="modulepreload" href="/assets/htm-preact.module.js">
-<link rel="modulepreload" href="/assets/pure.mjs">
-<link rel="modulepreload" href="/assets/motion.js">
-<link rel="modulepreload" href="/assets/motion-lib.module.js">
-<link rel="modulepreload" href="/assets/api.js">
-<link rel="modulepreload" href="/assets/constants.js">
-<link rel="modulepreload" href="/assets/format.js">
+<link rel="stylesheet" href="${assetBaseUrl}/flatpickr.css">
+<link rel="stylesheet" href="${assetBaseUrl}/app.css">
+<link rel="modulepreload" href="${assetBaseUrl}/pages.js">
+<link rel="modulepreload" href="${assetBaseUrl}/flatpickr.js">
+<link rel="modulepreload" href="${assetBaseUrl}/components.js">
+<link rel="modulepreload" href="${assetBaseUrl}/ui.js">
+<link rel="modulepreload" href="${assetBaseUrl}/htm-preact.module.js">
+<link rel="modulepreload" href="${assetBaseUrl}/pure.mjs">
+<link rel="modulepreload" href="${assetBaseUrl}/motion.js">
+<link rel="modulepreload" href="${assetBaseUrl}/motion-lib.module.js">
+<link rel="modulepreload" href="${assetBaseUrl}/api.js">
+<link rel="modulepreload" href="${assetBaseUrl}/constants.js">
+<link rel="modulepreload" href="${assetBaseUrl}/format.js">
 </head><body>
 <div id="app"><div class="boot-fallback" role="alert">
 <p class="boot-fail-title">页面没加载出来</p>
@@ -1041,7 +1072,7 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
 </section>
 </noscript></div>
 <script type="application/json" id="xbk-boot">${bootJson}</script>
-<script type="module" src="/assets/app.js${assetQuery()}"></script>
+<script type="module" src="${assetBaseUrl}/app.js"></script>
 </body></html>`
 }
 
@@ -5256,12 +5287,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 已被 Cookie 方案解决：页面通过鉴权后下发 HttpOnly 会话 Cookie，浏览器对同源
     // ESM import/静态请求自动带 Cookie。无凭证请求一律 401，与文档口径一致。
     // 白名单精确匹配（STATIC_ASSETS）保留：无路径穿越面。
-    if (req.method === 'GET' && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
+    const asset = req.method === 'GET' ? resolveAssetRoute(url.pathname) : null
+    if (asset !== null) {
       if (!authorize(req, token, url.searchParams)) {
         sendJson(res, 401, { error: 'unauthorized' })
         return
       }
-      serveStatic(req, res, url.pathname, STATIC_ASSETS[url.pathname])
+      serveStatic(req, res, asset.route, asset.spec, asset.version)
       return
     }
     // 登录表单只收 POST body（审查 #224 / Sourcery High）：GET 表单会把 token 带进

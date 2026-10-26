@@ -597,8 +597,8 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   // JSON 岛注入（v3.285：SPA 壳；fetch 由前端发起，不再有原生表单/meta refresh）
   assert.ok(withToken.includes(`"token":"${TOKEN2}"`), 'JSON 岛带 token')
   assert.ok(withToken.includes('id="xbk-boot"'), 'JSON 岛节点存在')
-  assert.ok(withToken.includes('/assets/app.js'), '引用前端 ESM')
-  assert.ok(withToken.includes('/assets/app.css'), '引用样式')
+  assert.match(withToken, /\/assets\/[0-9a-f]{16}\/app\.js/, '引用前端 ESM（带内容版本路径）')
+  assert.match(withToken, /\/assets\/[0-9a-f]{16}\/app\.css/, '引用样式（带内容版本路径）')
   assert.ok(withToken.includes('Content-Security-Policy'), '带 CSP')
   // Sourcery vww：CSP 不能只断言 meta 名——被削弱的策略（如 default-src *）也含这个字符串。
   // 必须锁死关键指令本体。
@@ -687,6 +687,10 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
     [['POST', '/api/runs/detail', 401], true],
     [['GET', '/assets/app.css', 200], false],
     [['GET', '/assets/app.css', 304], false],
+    // v3.375：版本路径同样是静态资产——每次打开 11 条不该挤进 200 条环形日志
+    [['GET', '/assets/a506737fe81d5acc/app.js', 200], false],
+    [['GET', '/assets/a506737fe81d5acc/app.js', 401], true],
+    [['GET', '/assets/v1/app.js', 200], true],
     [['GET', '/api/status', 304], false],
     [['GET', '/api/access-log', 304], true],
     [['GET', '/', 200], false],
@@ -2608,7 +2612,7 @@ async function main () {
     assert.ok(res.text.includes('xbk-push 控制台'))
     assert.ok(res.text.includes('id="app"'), 'SPA 挂载点')
     assert.ok(res.text.includes('id="xbk-boot"'), 'JSON 岛')
-    assert.ok(res.text.includes('/assets/app.js'), '前端 ESM 引用')
+    assert.match(res.text, /\/assets\/[0-9a-f]{16}\/app\.js/, '前端 ESM 引用（带内容版本路径）')
     assert.ok(res.text.includes('试运行'), 'noscript 降级文案（触发动作说明）')
     assert.ok(res.text.includes('环境检查'))
     assert.ok(res.text.includes('正式运行一轮'))
@@ -2647,8 +2651,8 @@ async function main () {
     const cond = await requestBuffer(port, 'GET', '/assets/app.css', { token: TOKEN, headers: { 'if-none-match': cssPlain.headers.etag } })
     assert.strictEqual(cond.status, 304, 'If-None-Match 命中必须 304（不再重传正文）')
     assert.strictEqual(cond.body.length, 0, '304 不得带正文')
-    const verMatch = (await request(port, 'GET', '/', { token: TOKEN })).text.match(/\/assets\/app\.js\?v=([0-9a-f]{16})/)
-    assert.ok(verMatch, 'HTML 资产引用必须带内容版本号 ?v=<sha16>')
+    const verMatch = (await request(port, 'GET', '/', { token: TOKEN })).text.match(/\/assets\/([0-9a-f]{16})\/app\.js/)
+    assert.ok(verMatch, 'HTML 资产引用必须带内容版本路径 /assets/<sha16>/app.js')
     // 版本号必须由内容派生（sha256(各文件哈希拼接) 前 16 位），常量/陈旧版本过不了这条
     const crypto = require('node:crypto')
     // v3.364：不再硬编码文件名清单——直接按 STATIC_ASSETS 的插入顺序取（服务端算版本号
@@ -2667,6 +2671,19 @@ async function main () {
     assert.strictEqual(cc, 'public, max-age=31536000, immutable', '版本化资产必须 public + immutable 一年长缓存')
     const staleVer = await requestBuffer(port, 'GET', '/assets/app.css?v=deadbeefdeadbeef', { token: TOKEN })
     assert.strictEqual(String(staleVer.headers['cache-control'] || ''), 'no-cache', '不匹配的版本号必须回退 no-cache')
+    // v3.375：版本写进路径（/assets/<16hex>/file）——模块图里每个相对 import 都继承同一前缀，
+    // 整张图都能 immutable；旧版本的路径不 404（部署瞬间的页面不能白屏）。
+    const pathVer = await requestBuffer(port, 'GET', `/assets/${verMatch[1]}/app.css`, { token: TOKEN })
+    assert.strictEqual(pathVer.status, 200, '版本路径必须可取')
+    assert.strictEqual(String(pathVer.headers['cache-control'] || ''), 'public, max-age=31536000, immutable', '版本路径必须 public + immutable')
+    assert.strictEqual(pathVer.body.toString('utf8'), cssPlain.body.toString('utf8'), '版本路径与裸路径必须是同一份字节')
+    assert.strictEqual((await request(port, 'GET', `/assets/${verMatch[1]}/app.css`)).status, 401, '版本路径同样要鉴权')
+    const oldPath = await requestBuffer(port, 'GET', '/assets/deadbeefdeadbeef/app.css', { token: TOKEN })
+    assert.strictEqual(oldPath.status, 200, '旧版本路径必须仍可取（部署瞬间的旧页面不能白屏）')
+    assert.strictEqual(String(oldPath.headers['cache-control'] || ''), 'no-store',
+      '旧版本路径不得 immutable：否则新字节被写进旧版本的缓存键，同一页面新旧模块混跑')
+    assert.strictEqual((await request(port, 'GET', '/assets/v1/app.css', { token: TOKEN })).status, 404, '非法版本段必须 404')
+    assert.strictEqual((await request(port, 'GET', `/assets/${verMatch[1]}/nope.js`, { token: TOKEN })).status, 404, '白名单外文件必须 404')
     // gzip;q=0 表示明确拒绝：不得发压缩体
     const refused = await requestBuffer(port, 'GET', '/assets/app.css', { token: TOKEN, headers: { 'accept-encoding': 'gzip;q=0' } })
     assert.strictEqual(refused.headers['content-encoding'], undefined, 'gzip;q=0 时不得压缩')
@@ -2792,7 +2809,7 @@ async function main () {
       assert.strictEqual(spec.file, want, `route 与文件名必须一致：${route} → ${spec.file}（期望 ${want}）`)
     }
   })
-  await aok('资产: 首屏 modulepreload 覆盖 app.js 的 import 闭包（裸 URL、排在入口之前）', () => {
+  await aok('资产: 首屏 modulepreload 覆盖 app.js 的 import 闭包（版本路径、排在入口之前）', () => {
     // 预加载是手工维护的 11 行，两种错都不会被别的用例抓住：① 漏一个模块（瀑布还在，只是
     // 短了点）；② 把 flatpickr 写成 flatpickr.module.js（404，白下一次）。这里用 acorn 从
     // app.js 出发算**真实**静态 import 闭包，与 HTML 里的 href 逐字对账。
@@ -2841,7 +2858,13 @@ async function main () {
     const { readStatus } = require('./scripts/status')
     const html = renderPage(readStatus(tmpDir()), [], new URLSearchParams(`token=${TOKEN}`))
     // 逐字锁形态：rel/href 之外不得有第二个属性（crossorigin 会换缓存键，预加载就白做了）。
-    const hrefs = [...html.matchAll(/<link rel="modulepreload" href="([^"]+)">/g)].map((m) => m[1])
+    const hrefsRaw = [...html.matchAll(/<link rel="modulepreload" href="([^"]+)">/g)].map((m) => m[1])
+    // v3.375：版本号在路径里（/assets/<16hex>/x.js），模块间的相对 import 才会共享同一前缀。
+    const baseMatch = /<link rel="stylesheet" href="(\/assets\/[0-9a-f]{16})\/app\.css">/.exec(html)
+    assert.ok(baseMatch !== null, '页面必须用带内容版本前缀的资产基址')
+    const assetBase = baseMatch[1]
+    assert.ok(hrefsRaw.every((h) => h.startsWith(assetBase + '/')), '每条预加载都必须指向同一个版本前缀')
+    const hrefs = hrefsRaw.map((h) => '/assets' + h.slice(assetBase.length))
     assert.strictEqual(hrefs.length, closure.length,
       `预加载条数必须等于 import 闭包大小（闭包 ${closure.length}，实际 ${hrefs.length}）`)
     assert.strictEqual(new Set(hrefs).size, hrefs.length, '同一模块不得重复预加载')
@@ -2850,7 +2873,7 @@ async function main () {
     for (const href of hrefs) {
       assert.ok(Object.prototype.hasOwnProperty.call(STATIC_ASSETS, href), `${href} 必须是 STATIC_ASSETS 的 key（否则 404）`)
       assert.ok(!href.includes('?') && !href.includes('#') && !href.includes('token'),
-        `${href} 必须裸 URL（带查询串会二次下载，带凭证会多一处暴露面）`)
+        `${href} 不得带查询串/凭证（带查询串会换缓存键，带凭证会多一处暴露面）`)
     }
     assert.ok(!html.includes('crossorigin'), '预加载不得带 crossorigin（换缓存键 = 预加载失效）')
     // 大文件优先：第一条必须是闭包里最大的那份（省下的正是最关键的几毫秒）。
@@ -2858,10 +2881,10 @@ async function main () {
     const biggest = [...closure].sort((a, b) => sizeOf(b) - sizeOf(a))[0]
     assert.strictEqual(hrefs[0], biggest, '首条预加载必须是闭包内最大的模块（大文件优先）')
     // 必须排在入口脚本之前：浏览器按文档序发现 preload，排在入口之后等于没提前。
-    assert.ok(html.indexOf('rel="modulepreload"') < html.indexOf('<script type="module" src="/assets/app.js'),
+    assert.ok(html.indexOf('rel="modulepreload"') < html.indexOf(`<script type="module" src="${assetBase}/app.js`),
       'modulepreload 必须出现在入口 <script type="module"> 之前')
-    // 入口脚本是带版本号的（?v= = 资产内容哈希），预加载则必须是裸 URL——两者并存才对。
-    assert.match(html, /<script type="module" src="\/assets\/app\.js\?v=[0-9a-f]{16}"><\/script>/,
+    // 入口脚本与预加载共用同一个版本前缀；入口不能带查询串（模块图按 URL 精确匹配）。
+    assert.ok(html.includes(`<script type="module" src="${assetBase}/app.js"></script>`),
       '入口脚本引用必须原样保留（带内容版本号）')
   })
   await aok('资产: 入口 import 覆盖它实际用到的拆出导出（漏写 = 运行时 ReferenceError）', () => {
@@ -7740,7 +7763,7 @@ async function main () {
     // 资产：新增两个文件必须进白名单（CSP script-src 'self' 下没有 CDN 兜底，漏一条就整页白屏）
     assert.ok(srv.includes("'/assets/flatpickr.js'") && srv.includes("'/assets/flatpickr.css'"), 'flatpickr 的 JS/CSS 都必须在 STATIC_ASSETS 白名单里')
     const ph = (name) => '$' + '{' + name + '}'
-    assert.ok(srv.includes('<link rel="stylesheet" href="/assets/flatpickr.css' + ph('assetQuery()') + '">'), 'CSS 必须在页面 head 引入且带内容版本号')
+    assert.ok(srv.includes('<link rel="stylesheet" href="' + ph('assetBaseUrl') + '/flatpickr.css">'), 'CSS 必须在页面 head 引入且带内容版本路径')
     assert.ok(src.includes("import flatpickr from './flatpickr.js'"), '前端按白名单路由名导入（写成 flatpickr.module.js 会 404 整页白屏）')
     // 交互：range 模式 + 统一日历；中文语言包的区间分隔符是「 至 」——按 " to " 切会永远匹配不上
     assert.ok(src.includes("mode: 'range'") && src.includes('disableMobile: true'), '区间模式且禁用原生手机弹层（原生 date 不支持区间）')
