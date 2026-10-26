@@ -3168,6 +3168,71 @@ async function main () {
       fs.rmSync(modDir, { recursive: true, force: true })
     }
   })
+  await aok('前端数据层: AbortSignal.timeout 覆盖「头到了、body 挂起」，无该 API 时 fallback 同样中止', async () => {
+    // 旧实现用 Promise.race 手写第二层期限（readBodyJson）兜「头已到、体挂起」；
+    // v3.385 改成一个 AbortSignal.timeout 同时管 fetch 与 body 读取。这里用真 HTTP
+    // + 真 fetch 复现那个窗口：头 200 立刻回、body 永不结束。
+    const { pathToFileURL } = require('node:url')
+    const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
+    const modDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-api-timeout-'))
+    const stalled = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.write('{"partial":')
+    })
+    const port = await listen(stalled)
+    const realFetch = globalThis.fetch
+    const realDocument = globalThis.document
+    const realWindow = globalThis.window
+    const realTimeoutApi = AbortSignal.timeout
+    globalThis.document = { getElementById: () => null }
+    globalThis.window = { dispatchEvent: () => {} }
+    let mod = null
+    // 取头 + 读体一整趟；timeoutMs 由调用方给（走被测模块的 timedRequest 构造 signal）
+    const readStalledBody = async (timeoutMs) => {
+      const t0 = Date.now()
+      const res = await realFetch(`http://127.0.0.1:${port}/stall`,
+        mod.timedRequest({ headers: { Accept: 'application/json' } }, timeoutMs))
+      assert.strictEqual(res.status, 200, '响应头必须先到（否则测的不是「体挂起」窗口）')
+      let err = null
+      try { await res.json() } catch (e) { err = e }
+      return { elapsed: Date.now() - t0, err }
+    }
+    try {
+      fs.writeFileSync(path.join(modDir, 'api.mjs'), apiSrc.replace("from './constants.js'", "from './constants.mjs'"))
+      fs.writeFileSync(path.join(modDir, 'constants.mjs'), constSrc)
+      mod = await import(pathToFileURL(path.join(modDir, 'api.mjs')).href)
+      assert.ok(mod.timedRequest({}, 50).signal instanceof AbortSignal,
+        'timedRequest 必须交出真 AbortSignal（fetch 与 body 读取共用同一个期限）')
+      const native = await readStalledBody(120)
+      assert.ok(native.err, 'body 挂起时必须在期限内 reject，不能永久等待')
+      assert.strictEqual(native.err.name, 'TimeoutError', `原生路径必须抛 TimeoutError（实际 ${native.err && native.err.name}）`)
+      assert.ok(native.elapsed < 5000, `必须在期限内中止（实测 ${native.elapsed}ms）`)
+      // 回退路径（Safari < 16 / Android WebView < 103）：删掉该 API 后同一路径仍要中止。
+      delete AbortSignal.timeout
+      assert.strictEqual(typeof AbortSignal.timeout, 'undefined', '删除后必须真的走 fallback 分支')
+      const fallback = await readStalledBody(120)
+      assert.ok(fallback.err, 'fallback（AbortController + setTimeout）同样必须中止挂起的 body')
+      assert.ok(fallback.elapsed < 5000, `fallback 也必须在期限内中止（实测 ${fallback.elapsed}ms）`)
+      // 文案映射：两种引擎文案与旧竞速文案都要落到同一句「请求超时」。
+      const { isTimeoutError } = await import('./scripts/console-assets/pure.mjs')
+      assert.strictEqual(isTimeoutError(native.err), true, 'TimeoutError 必须判为超时')
+      assert.strictEqual(isTimeoutError(fallback.err), true, 'AbortError 必须判为超时')
+      assert.strictEqual(isTimeoutError({ name: 'Error', message: 'signal timed out' }), true,
+        'Chrome 的「signal timed out」不含 abort 字样，只认 /abort/ 会漏')
+      assert.strictEqual(isTimeoutError(new Error('响应体读取超时')), true, '旧竞速文案保持可识别')
+      assert.strictEqual(isTimeoutError(new Error('HTTP 500')), false, '普通 HTTP 错误不得被当成超时')
+      assert.strictEqual(isTimeoutError(null), false, '空错误不得判超时')
+    } finally {
+      AbortSignal.timeout = realTimeoutApi
+      globalThis.fetch = realFetch
+      globalThis.document = realDocument
+      globalThis.window = realWindow
+      if (typeof stalled.closeAllConnections === 'function') stalled.closeAllConnections()
+      await new Promise((resolve) => stalled.close(resolve))
+      fs.rmSync(modDir, { recursive: true, force: true })
+    }
+  })
   await aok('HTTP: POST /trigger 非法 action → 400', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)

@@ -37,36 +37,21 @@ const DAY_KEY_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
 // Codacy Critical（SSRF 启发式：fetch 收到「用户可控 URL」）：每个端点独立函数、
 // URL 全部为字面量——fetch 的第一个参数在数据流上只有字面量一种来源，不存在
 // 「变量 URL」路径。run id 是服务端生成的 `epoch.seq` 字符串（不是数字），详情端点以独立函数封装。
-// Sourcery Stalled-bodies x3：fetch() 在收到响应头时就 resolve，此前 clearTimeout 让
-// 「头到了、body 挂起」的响应绕过超时——轮询消费 res.json() 时永久等待，刷新链路卡死。
-// 修复：期限定时器不在 fetch resolve 时清掉，而是移交给 body 消费方（readBodyJson），
-// 整个「头+体」共享同一个 8s 期限；消费完成后才真正 clearTimeout。
+// Sourcery Stalled-bodies x3：fetch() 在收到响应头时就 resolve，「fetch resolve 即清期限」
+// 会让「头到了、body 挂起」的响应绕过超时——轮询消费 res.json() 时永久等待，刷新链路卡死。
+// v3.385：期限改由 AbortSignal.timeout() 承担——同一个 signal 同时管 fetch 与 body 读取，
+// 到期时 res.json()/text() 一并 reject，手写的 Promise.race 与 done() 握手全部删除。
 // Codacy/Opengrep node-ssrf（Codacy Critical）：该规则将「fetch 第一参数为任何变量」
 // 判为 SSRF（不追数据流来源，即使字面量经辅助函数传入也算）。因此 fetch 调用必须
 // 内联到各端点函数、第一参数为字面量；超时/中止参数由 timedRequest() 统一构造。
-// Sourcery Stalled-bodies x3：期限定时器不在 fetch resolve 时清掉，而是移交给
-// body 消费方（readBodyJson），整个「头+体」共享同一个 8s 期限。
+// 兼容（Safari < 16 / Android WebView < 103 没有 AbortSignal.timeout）：退回
+// AbortController + setTimeout，信号语义一致——到期 abort 在飞请求，含仍在读 body 的那一步。
+// 这一路不持有可清的定时器句柄：请求提前结束时它只是对已 settled 的请求 abort 一次（空操作）。
 function timedRequest (opts, timeoutMs = FETCH_TIMEOUT_MS) {
+  if (typeof AbortSignal.timeout === 'function') return { ...opts, signal: AbortSignal.timeout(timeoutMs) }
   const ctrl = new AbortController()
-  const t = setTimeout(() => ctrl.abort(), timeoutMs)
-  const merged = { ...opts, signal: ctrl.signal }
-  return { merged, done: () => clearTimeout(t) }
-}
-
-// 与 fetchWithTimeout 配套：res.json() 的读取也受同一期限约束（由 fetch 的 AbortController
-// 触发——body 挂起到期时 abort 会 reject json() 解析）。这里再兜一层竞速，防止个别环境
-// abort 不中断进行中的 body 读取。
-async function readBodyJson (res) {
-  let timer
-  // 标准 lint（promise/param-names）要求 promise 构造第二参数名匹配 ^_?reject$。
-  const bodyTimeout = new Promise((_resolve, _reject) => {
-    timer = setTimeout(() => _reject(new Error('响应体读取超时')), FETCH_TIMEOUT_MS)
-  })
-  try {
-    return await Promise.race([res.json(), bodyTimeout])
-  } finally {
-    clearTimeout(timer)
-  }
+  setTimeout(() => ctrl.abort(), timeoutMs)
+  return { ...opts, signal: ctrl.signal }
 }
 
 // 条件请求缓存（v3.363）：键 → { tag, data }。服务端对只读快照端点发 ETag，
@@ -94,49 +79,40 @@ function addConditional (merged, key) {
   return hit.tag
 }
 
-// 响应消费公共骨架：fetch promise 进来后统一「非 2xx 抛错 + body 消费完才清期限」。
+// 响应消费公共骨架：fetch promise 进来后统一「非 2xx 抛错 + 304 复用条件缓存」。
 // 注意 fetch 本身不收进这里——各端点保持字面量 URL（Codacy SSRF 启发式：第一参数
 // 任何变量形态都会红，包括白名单查表后的常量；字面量是唯一全绿形态，PR #227 实测）。
-async function consumeJson (p, done, condKey, retry, sentTag) {
-  p.then(() => {}, () => {}) // fetch reject（网络错）时由下方 done 兜底；正常路径在 body 消费后清
-  try {
-    const res = await p
-    if (res.status === 401) {
-      // 审查 #224：凭证失效必须让页面进入明确的「重新打开带 token 链接」状态，
-      // 否则轮询每 5s 继续打 401，页面只剩空壳。事件由 App 监听并停轮询。
-      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-        window.dispatchEvent(new Event('xbk-auth-expired'))
-      }
-      throw new Error('凭证已失效（401）')
+async function consumeJson (p, condKey, retry, sentTag) {
+  p.then(() => {}, () => {}) // fetch reject（网络错）由下方 await 抛出；这里只防提前未处理拒绝
+  const res = await p
+  if (res.status === 401) {
+    // 审查 #224：凭证失效必须让页面进入明确的「重新打开带 token 链接」状态，
+    // 否则轮询每 5s 继续打 401，页面只剩空壳。事件由 App 监听并停轮询。
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(new Event('xbk-auth-expired'))
     }
-    if (res.status === 304) {
-      // 304 无 body：直接复用条件缓存里的上一份（服务端已确认内容未变）。
-      done()
-      const hit = condKey ? COND_CACHE.get(condKey) : null
-      // 只有缓存条仍是我们发出去的那个 tag 才复用它；被别的并发响应换掉时必须重取，
-      // 否则会把 T2 的快照当成 T1 的 304 结果（配置/趋势/历史短暂显示错数据）。
-      if (hit && (!sentTag || hit.tag === sentTag)) return hit.data
-      // 本地没有对应副本（换了标签页 / 前端刚更新过 / 缓存条目被淘汰 / 服务端 tag 与本地
-      // 记录不一致）时**必须重取**：去掉 If-None-Match 再发一次，拿完整的 200。
-      // 绝不能把 304 当失败——配置页会直接显示「加载失败」，而且用户无处可点。
-      if (typeof retry === 'function') return retry()
-      throw new Error('HTTP 304（无本地副本）')
-    }
-    if (!res.ok) { done(); throw new Error(`HTTP ${res.status}`) }
-    try {
-      const data = await readBodyJson(res)
-      if (condKey) {
-        const tag = res.headers.get('ETag')
-        if (tag) rememberConditional(condKey, { tag, data })
-      }
-      return data
-    } finally {
-      done() // body 消费完才清期限（Sourcery Stalled-bodies-outlive：done 提前会让挂起 body 绕过 abort）
-    }
-  } catch (e) {
-    done()
-    throw e
+    throw new Error('凭证已失效（401）')
   }
+  if (res.status === 304) {
+    // 304 无 body：直接复用条件缓存里的上一份（服务端已确认内容未变）。
+    const hit = condKey ? COND_CACHE.get(condKey) : null
+    // 只有缓存条仍是我们发出去的那个 tag 才复用它；被别的并发响应换掉时必须重取，
+    // 否则会把 T2 的快照当成 T1 的 304 结果（配置/趋势/历史短暂显示错数据）。
+    if (hit && (!sentTag || hit.tag === sentTag)) return hit.data
+    // 本地没有对应副本（换了标签页 / 前端刚更新过 / 缓存条目被淘汰 / 服务端 tag 与本地
+    // 记录不一致）时**必须重取**：去掉 If-None-Match 再发一次，拿完整的 200。
+    // 绝不能把 304 当失败——配置页会直接显示「加载失败」，而且用户无处可点。
+    if (typeof retry === 'function') return retry()
+    throw new Error('HTTP 304（无本地副本）')
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  // body 读取仍受同一个 AbortSignal.timeout 约束：头到了体挂起时 res.json() 到期即 reject。
+  const data = await res.json()
+  if (condKey) {
+    const tag = res.headers.get('ETag')
+    if (tag) rememberConditional(condKey, { tag, data })
+  }
+  return data
 }
 
 // 条件请求端点的统一骨架（v3.373）：注入 If-None-Match → fetch → consumeJson。
@@ -145,36 +121,36 @@ async function consumeJson (p, done, condKey, retry, sentTag) {
 // （Codacy SSRF 口径）——这里收的是「怎么发」，不是 URL。
 function conditionalRequest (condKey, build) {
   const once = (conditional) => {
-    const { merged, done } = timedRequest({
+    const merged = timedRequest({
       headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
     })
     // 必须在 fetch 之前注入：fetch 调用时就快照 headers（Sourcery PR #321）。
     const sentTag = conditional ? addConditional(merged, condKey) : null
-    return { p: build(merged), done, sentTag }
+    return { p: build(merged), sentTag }
   }
   const first = once(true)
-  return consumeJson(first.p, first.done, condKey, () => {
+  return consumeJson(first.p, condKey, () => {
     // 只重试一次：重试不带条件头，再拿到 304 就是服务端异常，按「无本地副本」抛错。
     const again = once(false)
-    return consumeJson(again.p, again.done, condKey)
+    return consumeJson(again.p, condKey)
   }, first.sentTag)
 }
 
 function apiGetStatus () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   // /api/status 含 generatedAt / lock.ageMs（每拍都在变），不做条件请求——给它发 ETag
   // 永远不会命中（服务端 sendJsonConditional 注释同口径）。
-  return consumeJson(fetch('/api/status', merged), done)
+  return consumeJson(fetch('/api/status', merged))
 }
 
 function apiGetRuns () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   const sentTag = addConditional(merged, 'runs')
-  return consumeJson(fetch('/api/runs', merged), done, 'runs', undefined, sentTag)
+  return consumeJson(fetch('/api/runs', merged), 'runs', undefined, sentTag)
 }
 
 async function apiGetRunDetail (id) {
@@ -183,7 +159,7 @@ async function apiGetRunDetail (id) {
   // GET /api/runs/:id 服务端仍保留（API 兼容），前端不再拼变量 URL——
   // Codacy SSRF 规则不接受任何含变量的 fetch 第一参数，字面量 + body 是唯一全绿形态。
   const body = new URLSearchParams({ id: String(id) })
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -193,7 +169,7 @@ async function apiGetRunDetail (id) {
     body
   })
   const p = fetch('/api/runs/detail', merged)
-  return consumeJson(p, done)
+  return consumeJson(p)
 }
 
 // 取消运行中的触发任务（v3.299 批次②）：POST 字面量 URL + id 走请求体
@@ -202,7 +178,7 @@ async function apiGetRunDetail (id) {
 function apiCancelRun (id) {
   // id = 「epoch.seq」字符串原样传（v3.299 评审：进程 epoch 形态），不做 Number 归一。
   const body = new URLSearchParams({ id: String(id) })
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -212,7 +188,7 @@ function apiCancelRun (id) {
     body
   })
   const p = fetch('/api/runs/cancel', merged)
-  return consumeJson(p, done)
+  return consumeJson(p)
 }
 
 // 逐轮运行历史（v3.299 批次②）：run.log 摘要行解析（服务端），分页游标 before=已看轮数。
@@ -244,7 +220,7 @@ function apiGetMessages ({ page, size, cate, q, days, from, to }) {
   if (typeof from === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(from)) params.set('from', from)
   if (typeof to === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(to)) params.set('to', to)
   const qs = params.toString()
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   // 分页/筛选不同的请求各算一份缓存（同一 URL 语义才可复用 304 结果）。
@@ -252,7 +228,7 @@ function apiGetMessages ({ page, size, cate, q, days, from, to }) {
   // headers，先 fetch 后 addConditional 等于永远不发条件头。
   const condKey = `messages?${qs}`
   const sentTag = addConditional(merged, condKey)
-  return consumeJson(fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged), done, condKey, undefined, sentTag)
+  return consumeJson(fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged), condKey, undefined, sentTag)
 }
 
 function apiGetTrends ({ days, from, to } = {}) {
@@ -281,10 +257,10 @@ function apiGetFiles () {
   // 启动预加载会同时命中缓存健康右列、系统页文件清单、过滤规则备份下拉；
   // 共享同一个在飞 Promise，避免对大目录做三次同步扫描（Sourcery #272）。
   if (filesInFlight) return filesInFlight
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  filesInFlight = consumeJson(fetch('/api/files', merged), done)
+  filesInFlight = consumeJson(fetch('/api/files', merged))
   const clear = () => { filesInFlight = null }
   filesInFlight.then(clear, clear)
   return filesInFlight
@@ -296,33 +272,33 @@ function apiGetConfig () {
 }
 
 function apiGetLogs () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/logs', merged), done)
+  return consumeJson(fetch('/api/logs', merged))
 }
 
 // v3.332：版本探针走 ?probe=version——服务端据此不把它记进访问日志（60s 一条会挤掉真实历史）；
 // 同时 no-store，防代理/浏览器启发式缓存把旧版本喂回来，让「有新版本」永远判不出来。
 function apiGetSys ({ probeVersion = false } = {}) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` },
     ...(probeVersion ? { cache: 'no-store' } : {})
   })
-  return consumeJson(fetch(probeVersion ? '/api/sys?probe=version' : '/api/sys', merged), done)
+  return consumeJson(fetch(probeVersion ? '/api/sys?probe=version' : '/api/sys', merged))
 }
 
 // 服务器端自动运行：GET 读状态；POST 开关/改间隔（写面只认 Bearer）。
 function apiGetAuto () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
   const sentTag = addConditional(merged, 'auto')
-  return consumeJson(fetch('/api/auto', merged), done, 'auto', undefined, sentTag)
+  return consumeJson(fetch('/api/auto', merged), 'auto', undefined, sentTag)
 }
 
 function apiSetAuto (payload) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -331,16 +307,16 @@ function apiSetAuto (payload) {
     },
     body: JSON.stringify(payload)
   })
-  return consumeJson(fetch('/api/auto', merged), done)
+  return consumeJson(fetch('/api/auto', merged))
 }
 
 // 访问日志（v3.300 §3.3）：系统页可查的内存环形访问日志。与上方端点同纪律——
 // fetch 第一参数纯字面量（Codacy SSRF 全绿形态，静态红线测试自动覆盖）。
 function apiGetAccessLog () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/access-log', merged), done)
+  return consumeJson(fetch('/api/access-log', merged))
 }
 
 // ── v3.310 过滤规则控制面：读面 GET + 四个写面 POST ─────────────────────────
@@ -349,29 +325,25 @@ function apiGetAccessLog () {
 // URL 里带 token 会直接 400 query_token_not_allowed）。
 // 写请求的错误体必须读出来：409 要区分 revision_mismatch / write_busy / store_corrupt，
 // 400 要逐字段 errors。consumeJson 把非 2xx 收敛成「HTTP 4xx」会丢掉 code，所以这里用
-// consumeJsonResult 保留状态码与响应体；超时/中止仍由同一个 timedRequest + readBodyJson 期限覆盖。
-async function consumeJsonResult (p, done) {
+// consumeJsonResult 保留状态码与响应体；超时/中止仍由同一个 AbortSignal.timeout 期限覆盖。
+async function consumeJsonResult (p) {
   p.then(() => {}, () => {}) // fetch reject 由 await 抛出；这里只防提前未处理拒绝
+  const res = await p
+  let data = null
   try {
-    const res = await p
-    let data = null
-    try {
-      data = await readBodyJson(res)
-    } catch (e) {
-      data = null
-    }
-    // 与 consumeJson 同口径：401 让 App 停轮询并显示「重新打开带 token 链接」。
-    if (res.status === 401 && typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-      window.dispatchEvent(new Event('xbk-auth-expired'))
-    }
-    return {
-      status: res.status,
-      ok: res.ok,
-      data,
-      retryAfter: res.headers && typeof res.headers.get === 'function' ? res.headers.get('Retry-After') : null
-    }
-  } finally {
-    done()
+    data = await res.json()
+  } catch (e) {
+    data = null
+  }
+  // 与 consumeJson 同口径：401 让 App 停轮询并显示「重新打开带 token 链接」。
+  if (res.status === 401 && typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(new Event('xbk-auth-expired'))
+  }
+  return {
+    status: res.status,
+    ok: res.ok,
+    data,
+    retryAfter: res.headers && typeof res.headers.get === 'function' ? res.headers.get('Retry-After') : null
   }
 }
 
@@ -387,10 +359,10 @@ let filterInFlight = null
 function apiGetFilter () {
   // 配置页和过滤规则页启动预加载时都会要同一份过滤规则快照，共享在飞 Promise。
   if (filterInFlight) return filterInFlight
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  filterInFlight = consumeJson(fetch('/api/config/filter', merged), done)
+  filterInFlight = consumeJson(fetch('/api/config/filter', merged))
   const clear = () => { filterInFlight = null }
   filterInFlight.then(clear, clear)
   return filterInFlight
@@ -398,62 +370,62 @@ function apiGetFilter () {
 
 // 服务器草稿：读面沿用 Cookie/?token= 均可的全局鉴权；写/删只认 Bearer。
 function apiGetFilterDraft () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/config/filter/draft', merged), done)
+  return consumeJson(fetch('/api/config/filter/draft', merged))
 }
 
 function apiPostFilterDraft (filter, baseRevision, { keepalive = false } = {}) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify({ schema: 1, baseRevision, filter }),
     keepalive
   })
-  return consumeJsonResult(fetch('/api/config/filter/draft', merged), done)
+  return consumeJsonResult(fetch('/api/config/filter/draft', merged))
 }
 
 function apiDeleteFilterDraft () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'DELETE',
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` },
     keepalive: true
   })
-  return consumeJsonResult(fetch('/api/config/filter/draft', merged), done)
+  return consumeJsonResult(fetch('/api/config/filter/draft', merged))
 }
 
 function apiPostFilterSave (body) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify(body)
   })
-  return consumeJsonResult(fetch('/api/config/filter', merged), done)
+  return consumeJsonResult(fetch('/api/config/filter', merged))
 }
 
 function apiPostFilterValidate (body) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify(body)
   })
-  return consumeJsonResult(fetch('/api/config/filter/validate', merged), done)
+  return consumeJsonResult(fetch('/api/config/filter/validate', merged))
 }
 
 function apiPostFilterPreview (body) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify(body)
   })
-  return consumeJsonResult(fetch('/api/config/filter/preview', merged), done)
+  return consumeJsonResult(fetch('/api/config/filter/preview', merged))
 }
 
 // 数据备份：导出先取回 JSON 文本，浏览器加密后再下载；导入返回 {ok, imported, backupDir}。
 // 不能直接把服务器响应 blob 下载——那样落盘的是明文，浏览器端加密就失去意义。
 function apiPostBackupExport (categories) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify({ categories })
@@ -477,120 +449,110 @@ function apiPostBackupExport (categories) {
     if (new TextEncoder().encode(text).length > BACKUP_BROWSER_MAX_BYTES) {
       throw new Error('备份超过 32MB，浏览器加密会占用过多内存；请减少勾选类别')
     }
-    done()
     const skippedHeader = res.headers && typeof res.headers.get === 'function' ? res.headers.get('X-Backup-Skipped') : ''
     const skipped = skippedHeader ? skippedHeader.split(',') : []
     return { text, skipped }
-  }).catch((e) => { done(); throw e })
+  })
 }
 
 function apiPostBackupImport (bundle, idempotencyKey) {
   const headers = filterWriteHeaders()
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers,
     body: JSON.stringify(bundle)
   }, BACKUP_FETCH_TIMEOUT_MS)
-  return consumeJsonResult(fetch('/api/backup/import', merged), done)
+  return consumeJsonResult(fetch('/api/backup/import', merged))
 }
 
 function apiPostFilterRestore (body) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify(body)
   })
-  return consumeJsonResult(fetch('/api/config/filter/restore', merged), done)
+  return consumeJsonResult(fetch('/api/config/filter/restore', merged))
 }
 
 // 控制台设置（v3.340）：通知自检拦截窗的读/写面。GET 与其它读面同款（Bearer + Accept）；
 // 写面复用 filterWriteHeaders（Bearer + application/json，服务端 415 闸要求后者）。
 function apiGetConsoleSettings () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/config/console', merged), done)
+  return consumeJson(fetch('/api/config/console', merged))
 }
 
 function apiPostConsoleSettings (body) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify(body)
   })
-  return consumeJsonResult(fetch('/api/config/console', merged), done)
+  return consumeJsonResult(fetch('/api/config/console', merged))
 }
 
 // 两步验证（v3.357）：状态读取 + 开启/确认/关闭。写面与其它写端点同款 Bearer + JSON。
 function apiGetTwoFactorStatus () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/2fa/status', merged), done)
+  return consumeJson(fetch('/api/2fa/status', merged))
 }
 
 function apiPostTwoFactorSetup () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify({})
   })
-  return consumeJsonResult(fetch('/api/2fa/setup', merged), done)
+  return consumeJsonResult(fetch('/api/2fa/setup', merged))
 }
 
 function apiPostTwoFactorEnable (code, setupId) {
   const payload = { code }
   if (typeof setupId === 'string' && setupId !== '') payload.setupId = setupId
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify(payload)
   })
-  return consumeJsonResult(fetch('/api/2fa/enable', merged), done)
+  return consumeJsonResult(fetch('/api/2fa/enable', merged))
 }
 
 function apiPostTwoFactorDisable (code) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify({ code })
   })
-  return consumeJsonResult(fetch('/api/2fa/disable', merged), done)
+  return consumeJsonResult(fetch('/api/2fa/disable', merged))
 }
 
 // 信任设备（v3.374）：「退出所有信任设备」——清空服务端设备列表 + 让当前浏览器的设备 Cookie 失效。
 // 写面与其它写端点同款 Bearer + JSON（Cookie-only 服务端回 401）。
 function apiPostDevicesRevoke () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify({})
   })
-  return consumeJsonResult(fetch('/api/devices/revoke', merged), done)
+  return consumeJsonResult(fetch('/api/devices/revoke', merged))
 }
 
 // 触发类请求公共体（SonarCloud new_duplicated_lines_density：trigger 与 triggerNotifyTest
 // 两段同构模板抽公共，消除新增代码重复率超标）。fetch 字面量由调用侧闭包注入——
 // 第一参数仍是纯字面量（§0 静态红线形态保持），公共体只管 timedRequest/重放拦截语义。
 async function triggerVia (timedOpts, doFetch, dupMsg, failMsgOf) {
-  const { merged, done } = timedRequest(timedOpts)
-  const p = doFetch(merged)
-  p.then(() => {}, () => {})
-  let res
-  try {
-    res = await p
-  } catch (e) {
-    done()
-    throw e
-  }
+  const p = doFetch(timedRequest(timedOpts))
+  p.then(() => {}, () => {}) // 网络错由下面的 await 抛出；这里只防提前未处理拒绝
+  const res = await p
   let data
   try {
-    data = await readBodyJson(res)
+    data = await res.json()
   } catch (e) {
     data = {}
-  } finally {
-    done()
   }
   if (!res.ok) {
     // 服务端幂等重放窗（与 console.js REPLAY_WINDOW_MS 配套）：同动作重试被拦时
@@ -657,26 +619,26 @@ function apiSearchLines ({ q, page, limit } = {}) {
   if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
   if (Number.isSafeInteger(limit) && limit > 0) params.set('limit', String(limit))
   const qs = params.toString()
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   }, 12000)
-  return consumeJson(fetch(qs.length > 0 ? `/api/line-search?${qs}` : '/api/line-search', merged), done)
+  return consumeJson(fetch(qs.length > 0 ? `/api/line-search?${qs}` : '/api/line-search', merged))
 }
 
 function apiGetLineWatch () {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
   })
-  return consumeJson(fetch('/api/line-watch', merged), done)
+  return consumeJson(fetch('/api/line-watch', merged))
 }
 
 function apiPostLineWatch (payload = {}) {
-  const { merged, done } = timedRequest({
+  const merged = timedRequest({
     method: 'POST',
     headers: filterWriteHeaders(),
     body: JSON.stringify(payload)
   })
-  return consumeJsonResult(fetch('/api/line-watch', merged), done).then((r) => {
+  return consumeJsonResult(fetch('/api/line-watch', merged)).then((r) => {
     if (!r.ok) throw new Error((r.data && r.data.error) || `HTTP ${r.status}`)
     return r.data
   })

@@ -6,7 +6,7 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from 
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, isEncryptedBackup, logLineCounts, logLineTone, splitHits } from './pure.mjs'
+import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -695,7 +695,8 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
 
 // 加载失败文案：fetch 抛的是英文（Failed to fetch / AbortError），直接甩给用户等于没说。
 // 这里只做形态映射，不改错误语义（401 仍由全局事件让 App 停轮询）：
-//   5xx → 服务器错误；4xx → 请求被拒绝；网络断/服务没起 → 网络请求失败；abort → 超时。
+//   5xx → 服务器错误；4xx → 请求被拒绝；网络断/服务没起 → 网络请求失败；超时 → 超时。
+// 超时判定在 pure.mjs 的 isTimeoutError（Chrome 的 TimeoutError 文案不含 abort，只认 /abort/ 会漏）。
 // 认不出的原样返回——后端自定义错误本来就是中文，不要二次包装。
 function loadErrorText (e) {
   const raw = e && typeof e.message === 'string' ? e.message : String(e === undefined || e === null ? '' : e)
@@ -709,7 +710,7 @@ function loadErrorText (e) {
   if (/Failed to fetch|NetworkError|Load failed|ERR_NETWORK|ERR_INTERNET_DISCONNECTED/i.test(raw)) {
     return '网络请求失败（检查网络，或控制台服务是否在运行）'
   }
-  if (/abort|响应体读取超时/i.test(raw)) return '请求超时（服务器 8 秒内没有响应）'
+  if (isTimeoutError(e)) return '请求超时（服务器 8 秒内没有响应）'
   return raw === '' ? '未知错误' : raw
 }
 
@@ -1823,7 +1824,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     if (Number.isSafeInteger(days) && days > 0) body.set('days', String(days))
     if (rangeActive) { body.set('from', range.from); body.set('to', range.to) }
     // page/size 不发送：导出=筛选结果全量（服务端亦不读取）。
-    const { merged, done } = timedRequest({
+    const merged = timedRequest({
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -1867,7 +1868,6 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     } catch (e) {
       setExportErr(`导出失败：${e && e.message ? e.message : e}`)
     } finally {
-      done() // body（blob/text）消费完才清 8s 期限（Sourcery Stalled-bodies 同口径）
       // revoke 延迟到 click 之后一拍（评审 231-M5）：浏览器解析下载是异步的，同步
       // revoke 会让 deferred download 拿不到 blob。1 分钟后回收（URL 规范建议的
       // 「延迟 revoke」口径，内存占用一次性、不累积）。

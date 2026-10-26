@@ -346,6 +346,16 @@ export function ageFromStamp (stamp, nowMs = Date.now()) {
   return fmtAge(Number(nowMs) - ms)
 }
 
+// 超时判定（v3.385）：AbortSignal.timeout() 到期抛 DOMException，各引擎文案不一致——
+// Chrome 是「signal timed out」（**不含** abort 字样），Firefox 是「…aborted due to timeout」，
+// 旧实现手写的第二层竞速抛「响应体读取超时」。三者都要映射成同一句「请求超时」。
+export function isTimeoutError (err) {
+  if (!err) return false
+  if (err.name === 'TimeoutError') return true
+  const raw = typeof err.message === 'string' ? err.message : String(err)
+  return /abort|timed ?out|timeout|响应体读取超时/i.test(raw)
+}
+
 // 标签页哈希（v3.307）：刷新/后退不丢当前页。只认白名单，非法 hash 回概览。
 // v3.370 加 search（线报搜索）；filter 仍由 ui.js 的 resolveTab 单独认（历史原因）。
 export const TAB_KEYS = ['overview', 'messages', 'search', 'logs', 'config', 'sys']
