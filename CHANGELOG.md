@@ -1075,3 +1075,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 测试：删除 6 组针对 Node 侧压缩的用例（含 `xbkGzip` 死入口），保留静态资产 gzip 与条件请求用例；控制台套件 280 通过。
 - 版本 3.383.0。
 
+## v3.384 — 控制台：弹层改原生 dialog，弹层定位改 floating-ui
+
+- 弹层：`ConfirmDialog`/`LeaveGuardDialog`/`Drawer` 的遮罩层从 `div` 换成原生 `<dialog>` + `showModal()`，焦点陷阱、顶层（top layer）、背景 inert 交给浏览器；Esc 走原生 `cancel` 事件后仍走原有退场动画；点遮罩、关闭后焦点归还、滚动锁、safe-area 行为不变。旧浏览器（iOS < 15.4）无 `showModal` 时退回 `open` 属性，视觉同改前。
+- 定位：`MiniSelect`、`TapTip`、`CategoryPicker` 的手写「翻转/贴边/滚动跟随」换成 vendored `@floating-ui/dom` 1.8.0（`scripts/console-assets/floating-ui.module.js`，15.3KB / 6.4KB gzip，MIT，只保留 computePosition/offset/flip/shift/size）；窄屏贴底模态仍是纯 CSS，未改。
+- 去重：`scrollIntoBox`（焦点项滚进弹层，配纯函数 `scrollDeltaInto`）与 `stickyPad`（吸顶页签高度补偿）各收成一份，替换 2 处与 5 处重复实现。
+- 代价（如实）：源码净增约 145 行、首屏 +6.4KB gzip；换来的是弹窗焦点不再跑出遮罩、下拉/气泡在贴边与滚动时位置正确。
+- 副作用：`scripts/console.js` 的静态资产白名单与 `modulepreload` 各加 1 条（新 vendor 文件必须登记，否则整页白屏）；`.codacy.yml`/`.sourcery.yaml` 对 vendor 产物加排除；版本 3.384.0。
+

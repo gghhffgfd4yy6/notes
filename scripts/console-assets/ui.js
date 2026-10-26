@@ -1,7 +1,7 @@
 // scripts/console-assets/ui.js —— 控制台外壳层（v3.367 从 app.js 拆出，v3.369 再拆出 pages.js）。
 // 这里只剩：App 组件、主题切换、首屏快照、回到顶部；各页面面板在 pages.js（顺序在前）。
 // 入口 app.js 只 import App。依赖方向单向，无循环引用。
-import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, LeaveGuardDialog, StatusCards, TapTip, TriggerBar, clampAutoSeconds, fmtWeekday } from './components.js'
+import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, LeaveGuardDialog, StatusCards, TapTip, TriggerBar, clampAutoSeconds, fmtWeekday, stickyPad } from './components.js'
 import { BOOT, apiGetAuto, apiGetConsoleSettings, apiGetLogs, apiGetRuns, apiGetStatus, apiGetSys, apiSetAuto } from './api.js'
 import { BUSY_FALLBACK_MS, POLL_BUSY_MS, POLL_MS, SSE_HEARTBEAT_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
 import { MOTION, enter, motionOK } from './motion.js'
@@ -440,8 +440,7 @@ function App () {
       if (logJump && logJump.focus) {
         const banner = document.querySelector('.log-focus')
         if (banner) {
-          const tabs = document.querySelector('.tabs')
-          const pad = (tabs ? tabs.getBoundingClientRect().height : 0) + 8
+          const pad = stickyPad()
           const startY = window.scrollY
           y = Math.max(0, banner.getBoundingClientRect().top + startY - pad)
           // 末尾几轮贴在日志框底部：只把定位条顶到 tabs 下，高亮行仍可能露在屏幕外。

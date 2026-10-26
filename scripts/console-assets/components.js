@@ -1,10 +1,12 @@
 // scripts/console-assets/components.js —— 控制台公用零件（v3.368 从 ui.js 拆出）。
 // 状态徽章 / 提示 / 折叠 / 面板头 / 骨架 / 按钮 / 下拉 / 日期区间 / 卡片 / 状态卡 / 触发条 / 二次确认弹窗。
-// 只依赖 htm-preact、pure.mjs、format.js、constants.js、api.js 与 flatpickr；不认识任何页面，也没有顶层副作用。
+// 只依赖 htm-preact、pure.mjs、format.js、constants.js、api.js、flatpickr 与 floating-ui；不认识任何页面，也没有顶层副作用。
 // 页面面板在 pages.js、外壳在 ui.js（顺序：本文件 → pages.js → ui.js），文本断言按 CONSOLE_MODULE_FILES 聚合读源码。
 import { html, useCallback, useEffect, useLayoutEffect, useRef, useState } from './htm-preact.module.js'
-import { ageFromStamp, dateRangeLabel, relDay } from './pure.mjs'
+import { ageFromStamp, dateRangeLabel, relDay, scrollDeltaInto } from './pure.mjs'
 import flatpickr from './flatpickr.js'
+// 定位引擎（vendored 单文件 ESM，MIT）：只导出 computePosition/offset/flip/shift/size。
+import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
 import { MOTION, useMorphDialog, useMountReveal, useRevealWhen } from './motion.js'
 import { TZ_LABEL } from './constants.js'
 import { fmtClock, fmtDuration, fmtLocalTime, fmtNum } from './format.js'
@@ -59,12 +61,39 @@ function fmtWeekday (ts) {
   return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts) + 8 * 3600 * 1000).getUTCDay()]
 }
 
+// 两个弹层共用：computePosition 的结果直写 DOM。不走 vdom 的 style 属性——控制台每 500ms
+// 重渲染一次，字符串 style 会把这里刚写好的定位值整条覆盖（旧实现为此每次滚动 setState）。
+function placeAt (pop, x, y) {
+  pop.style.left = `${Math.round(x)}px`
+  pop.style.top = `${Math.round(y)}px`
+}
+
+// 键盘导航把列表项滚进内层滚动框（MiniSelect 与 CategoryPicker 共用，原来两处各写一遍）。
+// 只调 focus({preventScroll:true}) 会把获得焦点的项停在框外（Sourcery #254）；让浏览器默认
+// focus 滚动又会把整页猛地带下去。矩形比较与差值收在 pure.mjs 的 scrollDeltaInto（Node 可测），
+// 这里只负责 focus 与把增量写回 scrollTop。
+function scrollIntoBox (el, box) {
+  if (!el) return
+  el.focus({ preventScroll: true })
+  if (!box || !box.contains(el)) return
+  const d = scrollDeltaInto(el.getBoundingClientRect(), box.getBoundingClientRect())
+  if (d !== 0) box.scrollTop += d
+}
+
+// 吸顶页签下方的落点留白 = .tabs 实测高度 + 8。列表落点、落点门（推送记录/逐轮历史）、
+// 过滤规则首个错误行、日志行定位五处同口径；散着写时漏一处 +8 就整体偏 8px。
+// 用 height 而不是 bottom：页签还没吸顶时 bottom 会多算它自己的页面偏移。
+function stickyPad () {
+  const tabs = document.querySelector('.tabs')
+  return (tabs ? tabs.getBoundingClientRect().height : 0) + 8
+}
+
 // v3.341：窄屏下顶栏状态行会被省略号截断（时间只剩半截）。点一下就地弹出完整文本，点页面
 // 其它任意地方/按 Esc 收回。弹层用 position: fixed：祖先 .sync 是 overflow:hidden，绝对定位
-// 会被裁掉；fixed 也不受滚动容器影响（滚动时直接收回，避免跟着飘）。
+// 会被裁掉；fixed 也不受滚动容器影响（滚动时直接收回，避免跟着飘）。定位算给 @floating-ui/dom。
 function TapTip ({ tip, hint, children, showDate = true }) {
   const [open, setOpen] = useState(false)
-  const [pos, setPos] = useState(null)
+  const [ready, setReady] = useState(false)
   const boxRef = useRef(null)
   const popRef = useRef(null)
   useEffect(() => {
@@ -85,16 +114,30 @@ function TapTip ({ tip, hint, children, showDate = true }) {
       window.removeEventListener('scroll', onScroll, true)
     }
   }, [open])
+  // 定位：宽度口径不变（200～360，且不超视口 24px），方向/夹取交给 computePosition。
+  // 直接写 left/top 而不是走 style 属性——顶栏每秒重渲染，字符串 style 会把这里刚写好的
+  // 定位值整条覆盖（首帧先由 CSS 的 visibility:hidden 兜住，量完再显形）。
+  useLayoutEffect(() => {
+    if (!open) return undefined
+    const box = boxRef.current
+    const pop = popRef.current
+    if (!box || !pop) return undefined
+    pop.style.width = `${Math.min(360, Math.max(200, window.innerWidth - 24))}px`
+    computePosition(box, pop, {
+      strategy: 'fixed',
+      placement: 'bottom-start',
+      middleware: [offset(8), flip(), shift({ padding: 8 })]
+    }).then(({ x, y }) => {
+      if (!popRef.current) return
+      placeAt(popRef.current, x, y)
+      setReady(true)
+    }).catch(() => {}) // 定位失败就保持原位，不打断交互（computePosition 不会 reject，兜底而已）
+    return undefined
+  }, [open])
   if (!tip) return html`${children}`
   const toggle = () => {
     if (open) { setOpen(false); return }
-    const box = boxRef.current
-    if (box) {
-      const r = box.getBoundingClientRect()
-      const width = Math.min(360, Math.max(200, window.innerWidth - 24))
-      const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8))
-      setPos({ top: Math.round(r.bottom + 6), left: Math.round(left), width: Math.round(width) })
-    }
+    setReady(false)
     setOpen(true)
   }
   return html`<span class=${showDate ? 'tap-tip tap-tip-date' : 'tap-tip'} ref=${boxRef} role="button" tabindex="0"
@@ -103,8 +146,7 @@ function TapTip ({ tip, hint, children, showDate = true }) {
       onKeyDown=${(e) => {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); toggle() }
       }}><span class="tap-tip-text">${children}</span>${hint && html`<span class="tap-tip-hint">${hint}</span>`}</span>
-    ${open && html`<span class="tap-tip-pop" ref=${popRef} role="tooltip"
-      style=${pos ? `top:${pos.top}px;left:${pos.left}px;width:${pos.width}px` : ''}>${tip}</span>`}`
+    ${open && html`<span class=${ready ? 'tap-tip-pop' : 'tap-tip-pop tap-tip-pop-wait'} ref=${popRef} role="tooltip">${tip}</span>`}`
 }
 
 // 提示行：tone='error' 红色、tone='warn' 琥珀色。页面不再拼 'hint hint-err' 字符串。
@@ -168,11 +210,15 @@ function Button ({ variant = 'secondary', disabled, onClick, title, buttonRef, a
 // 不用原生 <select>：Android Chrome 会弹全屏白底系统列表，和暗色控制台完全割裂
 // （分类筛选已因此改 CategoryPicker）。这里保留锚定弹层：选项少时不铺满屏幕，
 // 空间不足向上翻，键盘/触屏同一套交互。
+// 定位交给 @floating-ui/dom（floating-ui.module.js）：strategy 固定 + offset/flip/shift/size，
+// 自家只留「什么时候重量」与键盘/焦点。SELECT_MAX_H 是弹层上限（旧实现写死 320）。
+const SELECT_MAX_H = 320
+
 function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) {
   const list = Array.isArray(options) ? options : []
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(0)
-  const [place, setPlace] = useState({ up: false, max: 240, dx: 0, ready: false })
+  const [ready, setReady] = useState(false)
   const rootRef = useRef(null)
   const btnRef = useRef(null)
   const popRef = useRef(null)
@@ -186,45 +232,51 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
     if (!pop) return
     const el = pop.querySelector(`[data-idx="${i}"]`)
     if (!el) return
-    // preventScroll：弹层在页面下部时，浏览器默认 focus 会把整页猛地滚下去。
-    el.focus({ preventScroll: true })
-    const r = el.getBoundingClientRect()
-    const pr = pop.getBoundingClientRect()
-    if (r.top < pr.top) pop.scrollTop -= (pr.top - r.top)
-    else if (r.bottom > pr.bottom) pop.scrollTop += (r.bottom - pr.bottom)
+    // preventScroll + 手工把项滚进弹层可视区（共用 scrollIntoBox）：弹层在页面下部时，
+    // 浏览器默认 focus 会把整页猛地滚下去。
+    scrollIntoBox(el, pop)
   }
 
-  // 先量再显示：首帧用 visibility:hidden，避免先按「向下」铺一帧再跳到上方。
-  // 打开期间滚动/缩放也要重量：否则页面滚走后方向与高度还是旧值，选项会被裁掉。
+  // 位置只由 computePosition 算：left/top 直写 DOM，size 阶段写 max-height/min-width。
+  // 不走 vdom 的 style 属性——预加载轮询每 500ms 重渲染一次，字符串 style 会把这里刚写好的
+  // 定位值整条覆盖；直写也就不需要为「滚一下」而 setState。
+  const position = useCallback(() => {
+    const btn = btnRef.current
+    const pop = popRef.current
+    if (!btn || !pop) return
+    computePosition(btn, pop, {
+      strategy: 'fixed',
+      // 右缘对齐按钮（旧实现 right:0 的等价形）；flip 翻上去时仍是右缘对齐。
+      placement: 'bottom-end',
+      middleware: [
+        offset(6),
+        flip(),
+        shift({ padding: 8 }),
+        size({
+          apply ({ availableHeight, rects, elements }) {
+            const max = Math.max(48, Math.min(SELECT_MAX_H, Math.round(availableHeight)))
+            elements.floating.style.maxHeight = `${max}px`
+            elements.floating.style.minWidth = `${Math.round(rects.reference.width)}px`
+          }
+        })
+      ]
+    }).then(({ x, y }) => {
+      if (!popRef.current) return
+      placeAt(popRef.current, x, y)
+      setReady(true)
+    }).catch(() => {}) // 定位失败就保持原位，不打断交互（computePosition 不会 reject，兜底而已）
+  }, [])
+
+  // 先量再显示：首帧 visibility:hidden，避免先按「向下」铺一帧再翻到上方。
+  // 打开期间滚动/缩放要重量（否则页面滚走后弹层停在旧位置的空白处）：rAF 合并同帧事件。
   useLayoutEffect(() => {
     if (!open) return undefined
     let raf = 0
-    const measure = () => {
-      const btn = btnRef.current
-      const pop = popRef.current
-      if (!btn || !pop) return
-      const b = btn.getBoundingClientRect()
-      const vw = window.innerWidth
-      const vh = window.innerHeight
-      const below = vh - b.bottom - 10
-      const above = b.top - 10
-      const natural = Math.min(pop.scrollHeight + 2, 320)
-      const up = below < Math.min(natural, 200) && above > below
-      const max = Math.max(48, Math.min(natural, up ? above : below))
-      // 水平也做视口夹取：默认右对齐，靠左的按钮 + 更长选项时不能越出左边界。
-      const w = pop.getBoundingClientRect().width
-      const pad = 8
-      const left = Math.min(Math.max(pad, b.right - w), Math.max(pad, vw - w - pad))
-      const dx = Math.round(left - b.left)
-      setPlace((prev) => (prev.ready && prev.up === up && prev.max === max && prev.dx === dx
-        ? prev
-        : { up, max, dx, ready: true }))
-    }
     const schedule = () => {
       if (raf) return
-      raf = window.requestAnimationFrame(() => { raf = 0; measure() })
+      raf = window.requestAnimationFrame(() => { raf = 0; position() })
     }
-    measure()
+    position()
     window.addEventListener('resize', schedule)
     window.addEventListener('scroll', schedule, { passive: true })
     return () => {
@@ -232,16 +284,16 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
       window.removeEventListener('resize', schedule)
       window.removeEventListener('scroll', schedule)
     }
-  }, [open])
+  }, [open, position])
 
   useEffect(() => {
     if (!open) { focusedRef.current = false; return undefined }
-    if (!place.ready || focusedRef.current) return undefined
+    if (!ready || focusedRef.current) return undefined
     focusedRef.current = true
     setActive(selIdx)
     focusOpt(selIdx)
     return undefined
-  }, [open, place.ready, selIdx])
+  }, [open, ready, selIdx])
 
   useEffect(() => {
     if (!open) return undefined
@@ -257,7 +309,7 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
 
   const openMenu = () => {
     if (disabled) return
-    setPlace({ up: false, max: 240, dx: 0, ready: false })
+    setReady(false)
     setActive(Math.max(0, list.findIndex((o) => o.value === value)))
     setOpen(true)
   }
@@ -331,8 +383,7 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
       <span class="mini-label">${buttonLabel}</span>
       <span class="mini-caret" aria-hidden="true">▾</span>
     </button>
-    ${open && html`<div class="mini-pop" ref=${popRef} role="listbox" aria-label=${ariaLabel}
-      style=${`left:${place.dx}px;right:auto;max-height:${place.max}px;visibility:${place.ready ? 'visible' : 'hidden'};${place.up ? 'top:auto;bottom:calc(100% + 6px);' : ''}`}>
+    ${open && html`<div class=${ready ? 'mini-pop' : 'mini-pop mini-pop-wait'} ref=${popRef} role="listbox" aria-label=${ariaLabel}>
       ${list.map((o, i) => html`<button type="button" key=${o.value} data-idx=${i}
         class=${'mini-opt' + (o.value === value ? ' on' : '')}
         role="option" aria-selected=${o.value === value ? 'true' : 'false'}
@@ -913,22 +964,52 @@ const ACTION_DEFS = [
 // 固定 id 会让无障碍名称重复（Sourcery #271）。
 let dialogSeq = 0
 
+// 原生 <dialog> 接管这层遮罩：顶层（top layer）、焦点陷阱、背景 inert、关闭后把焦点还给
+// 触发元素都由浏览器实现，组件不再手写。只留两件浏览器不管的事：
+//   ① showModal() 必须早于量尺寸——未打开的 dialog 是 display:none，量出来全是 0；
+//   ② 退场动画播完才 close()——close() 会立刻把面板抽出顶层，先调就没有缩回/滑出的动画。
+// open 由父级持有（关闭即卸载），所以打开与兜底关闭落在同一个 layout effect 里。
+function useNativeDialog (ref, open) {
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!open || !el) return undefined
+    if (!el.open) {
+      // 老浏览器（iOS < 15.4）没有 showModal：退回 open 属性，视觉仍是原来那层 fixed
+      // 遮罩（.modal-backdrop/.drawer-backdrop 自带定位），只是没有顶层与焦点陷阱。
+      if (typeof el.showModal === 'function') el.showModal()
+      else el.setAttribute('open', '')
+    }
+    // 父级直接切走（不走关闭动画）时补一次 close()：否则顶层与焦点链留在原地。
+    return () => { if (el.open) el.close() }
+  }, [open])
+  // 退场动画结束时调用；close() 顺带把焦点还给打开前的元素（原生 focus restoration）。
+  return useCallback(() => {
+    const el = ref.current
+    if (el && el.open) el.close()
+  }, [])
+}
+
 // 两个弹窗共用的关闭/焦点骨架：onCancel 每次渲染存进 ref（busy 守卫不被旧闭包绕过），
-// Escape 与「打开时聚焦」只写一遍——两份弹窗各抄一份会被 Sonar 判重复代码。
+// Esc 与「打开时聚焦」只写一遍——两份弹窗各抄一份会被 Sonar 判重复代码。
+// 焦点陷阱与背景 inert 已交给原生 dialog，这里不再挂 document 级 keydown。
 function useDialogChrome (open, onCancel, { initialFocusRef = null, fallbackRef = null, closeDialog }) {
   const onCancelRef = useRef(onCancel)
   onCancelRef.current = onCancel
   useEffect(() => {
     if (!open) return undefined
-    const onKey = (e) => { if (e.key === 'Escape') closeDialog(() => onCancelRef.current()) }
-    document.addEventListener('keydown', onKey)
     const t = setTimeout(() => {
       const target = (initialFocusRef && initialFocusRef.current) || (fallbackRef && fallbackRef.current)
       if (target) target.focus()
     }, 0)
-    return () => { document.removeEventListener('keydown', onKey); clearTimeout(t) }
+    return () => { clearTimeout(t) }
   }, [open, initialFocusRef])
-  return onCancelRef
+  // Escape：浏览器先派发 cancel 再决定要不要自己关。preventDefault 拦住默认关闭，改走与
+  // 「取消」按钮同一条退场路径（动画结束才 close()），否则面板会「啪」一下消失。
+  const onCancelEvent = (e) => {
+    e.preventDefault()
+    closeDialog(() => onCancelRef.current())
+  }
+  return [onCancelRef, onCancelEvent]
 }
 
 function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, initialFocusRef = null, onConfirm, onCancel, children }) {
@@ -937,21 +1018,28 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
   // 弹窗「从哪来回哪去」：从触发按钮的位置放大展开，取消/遮罩/Esc 时缩回按钮再卸载。
   const backRef = useRef(null)
   const boxRef = useRef(null)
+  const closeNative = useNativeDialog(backRef, open)
   const [closeDialog, dialogClosing] = useMorphDialog(backRef, boxRef, open)
+  // 退场动画播完才 close()：先关就没有缩回动画，焦点也来不及回到触发按钮。
+  const dismiss = (done) => closeDialog(() => { closeNative(); done() })
   // 回调每次渲染都是新函数；若把它放进 focus effect 的依赖，busy 变化会重新聚焦密码框，
   // 手机上表现为点「解密」后键盘又弹一下。ref 在 useDialogChrome 里更新。
-  const onCancelRef = useDialogChrome(open, onCancel, { initialFocusRef, fallbackRef: cancelRef, closeDialog })
+  const [onCancelRef, onCancelEvent] = useDialogChrome(open, onCancel, { initialFocusRef, fallbackRef: cancelRef, closeDialog: dismiss })
   if (!open) return null
-  return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current()) }}>
-    <div class="modal" ref=${boxRef} role="dialog" aria-modal="true" aria-labelledby=${titleId}>
+  // 遮罩与面板合成一个 <dialog>：浏览器负责顶层、焦点陷阱与背景 inert，视觉仍由
+  // .modal-backdrop / .modal 两条规则决定（class 名与选择器不变）。
+  return html`<dialog class="modal-backdrop" ref=${backRef} role="dialog" aria-modal="true"
+    aria-labelledby=${titleId} oncancel=${onCancelEvent}
+    onClick=${(e) => { if (e.target === e.currentTarget) dismiss(() => onCancelRef.current()) }}>
+    <div class="modal" ref=${boxRef}>
       <div class="modal-title" id=${titleId}>${title}</div>
       <div class="modal-body">${children}</div>
       <div class="modal-actions">
-        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => closeDialog(() => onCancelRef.current())}>取消<//>
+        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => dismiss(() => onCancelRef.current())}>取消<//>
         <${Button} variant="danger-solid" disabled=${busy || confirmDisabled || dialogClosing} onClick=${onConfirm}>${confirmLabel}<//>
       </div>
     </div>
-  </div>`
+  </dialog>`
 }
 
 // 未保存草稿的离开拦截：三选一（取消 / 不保存并离开 / 保存并继续），默认焦点在取消。
@@ -961,11 +1049,15 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
   const [titleId] = useState(() => `leave-title-${++dialogSeq}`)
   const backRef = useRef(null)
   const boxRef = useRef(null)
+  const closeNative = useNativeDialog(backRef, open)
   const [closeDialog, dialogClosing] = useMorphDialog(backRef, boxRef, open)
-  const onCancelRef = useDialogChrome(open, onCancel, { fallbackRef: cancelRef, closeDialog })
+  const dismiss = (done) => closeDialog(() => { closeNative(); done() })
+  const [onCancelRef, onCancelEvent] = useDialogChrome(open, onCancel, { fallbackRef: cancelRef, closeDialog: dismiss })
   if (!open) return null
-  return html`<div class="modal-backdrop" ref=${backRef} onClick=${(e) => { if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current()) }}>
-    <div class="modal" ref=${boxRef} role="dialog" aria-modal="true" aria-labelledby=${titleId}>
+  return html`<dialog class="modal-backdrop" ref=${backRef} role="dialog" aria-modal="true"
+    aria-labelledby=${titleId} oncancel=${onCancelEvent}
+    onClick=${(e) => { if (e.target === e.currentTarget) dismiss(() => onCancelRef.current()) }}>
+    <div class="modal" ref=${boxRef}>
       <div class="modal-title" id=${titleId}>有未保存的过滤规则</div>
       <div class="modal-body">
         <div class="fr-dialog-line">当前有 ${count} 个字段还没保存。</div>
@@ -973,12 +1065,12 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
         <div class="modal-note">「保存并继续」会直接保存，保存成功后自动继续刚才的离开操作；「取消」继续编辑。</div>
       </div>
       <div class="modal-actions">
-        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => closeDialog(() => onCancelRef.current())}>取消<//>
+        <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => dismiss(() => onCancelRef.current())}>取消<//>
         <${Button} variant="danger-solid" disabled=${busy || dialogClosing} onClick=${onDiscard}>不保存并离开<//>
         <${Button} variant="primary" disabled=${busy || dialogClosing} onClick=${onSave}>保存并继续<//>
       </div>
     </div>
-  </div>`
+  </dialog>`
 }
 
 // ── 组件：右侧抽屉（v3.378）──────────────────────────────────────────────
@@ -986,43 +1078,47 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
 //   列表点开一条、改完还要接着看下一条 ⇒ 抽屉（背后列表保持不动，滚动位置不跳）；
 //   短确认、二选一 ⇒ ConfirmDialog；长表单、深流程 ⇒ 整页。
 // 宽度 520 起步：桌面留出左侧列表做对照；≤640px 铺满（手机上没有并排对照的余地）。
-// 与弹窗共用 useDialogChrome：Escape 关闭、打开时焦点落在关闭按钮、关闭后焦点回到触发元素。
+// 与弹窗共用 useDialogChrome：打开时焦点落在关闭按钮；Esc、点遮罩、关闭按钮三条路径都走
+// requestClose。焦点陷阱与「关闭后焦点回到触发元素」由原生 <dialog> 负责。
 function Drawer ({ open, title, sub = '', width = 520, busy = false, onClose, children, footer = null }) {
+  const backRef = useRef(null)
   const closeRef = useRef(null)
   const [titleId] = useState(() => `drawer-title-${++dialogSeq}`)
   const [closing, setClosing] = useState(false)
   const closeTimer = useRef(null)
+  const closeNative = useNativeDialog(backRef, open)
   // 关闭动画期间禁止重复触发；父级 busy（例如保存中）时直接忽略关闭请求，避免半截状态。
+  // 滑出动画（.drawer-closing）播完才 close()：close 会立刻把面板抽出顶层，先关就没有滑出。
   const requestClose = useCallback(() => {
     if (busy) return
     setClosing(true)
     if (closeTimer.current) clearTimeout(closeTimer.current)
-    closeTimer.current = setTimeout(() => { setClosing(false); if (typeof onClose === 'function') onClose() }, 170)
-  }, [busy, onClose])
+    closeTimer.current = setTimeout(() => { closeNative(); setClosing(false); if (typeof onClose === 'function') onClose() }, 170)
+  }, [busy, onClose, closeNative])
   const onCloseRef = useRef(requestClose)
   onCloseRef.current = requestClose
   useEffect(() => () => { if (closeTimer.current) clearTimeout(closeTimer.current) }, [])
   useEffect(() => {
     if (!open) return undefined
-    const onKey = (e) => { if (e.key === 'Escape') onCloseRef.current() }
-    document.addEventListener('keydown', onKey)
-    const prev = document.activeElement
+    // Escape 走原生 dialog 的 cancel 事件（见模板里的 oncancel），不再手写 document keydown。
     const t = setTimeout(() => { if (closeRef.current) closeRef.current.focus() }, 0)
-    // 抽屉打开时锁住页面滚动：背后列表还在，滚动会带着抽屉一起动。
+    // 抽屉打开时锁住页面滚动：背后列表还在，滚动会带着抽屉一起动。原生 dialog 只管顶层与
+    // 背景 inert，不负责锁滚动（iOS Safari 尤其不锁），所以这一层必须留。
     const root = document.documentElement
     const prevOverflow = root.style.overflow
     root.style.overflow = 'hidden'
     return () => {
-      document.removeEventListener('keydown', onKey)
       clearTimeout(t)
       root.style.overflow = prevOverflow
-      if (prev && typeof prev.focus === 'function' && prev.isConnected) prev.focus()
     }
   }, [open])
   if (!open) return null
-  return html`<div class="drawer-backdrop" onClick=${(e) => { if (e.target === e.currentTarget) onCloseRef.current() }}>
-    <section class=${'drawer' + (closing ? ' drawer-closing' : '')} role="dialog" aria-modal="true"
-      aria-labelledby=${titleId} style=${{ '--drawer-w': `${width}px` }}>
+  // 遮罩与面板合成一个 <dialog>：顶层、焦点陷阱、背景 inert、关闭后还焦点都由浏览器做，
+  // 视觉仍由 .drawer-backdrop / .drawer 决定（class 名与选择器不变）。
+  return html`<dialog class="drawer-backdrop" ref=${backRef} role="dialog" aria-modal="true"
+      aria-labelledby=${titleId} oncancel=${(e) => { e.preventDefault(); onCloseRef.current() }}
+      onClick=${(e) => { if (e.target === e.currentTarget) onCloseRef.current() }}>
+    <section class=${'drawer' + (closing ? ' drawer-closing' : '')} style=${{ '--drawer-w': `${width}px` }}>
       <header class="drawer-head">
         <div class="drawer-head-text">
           <h2 class="drawer-title" id=${titleId}>${title}</h2>
@@ -1033,7 +1129,7 @@ function Drawer ({ open, title, sub = '', width = 520, busy = false, onClose, ch
       <div class="drawer-body">${children}</div>
       ${footer ? html`<footer class="drawer-foot">${footer}</footer>` : null}
     </section>
-  </div>`
+  </dialog>`
 }
 
 // ── 触发结果行（v3.317）─────────────────────────────────────────────────────
@@ -1297,5 +1393,8 @@ export {
   clampAutoSeconds,
   fmtWeekday,
   inDayRange,
+  placeAt,
+  scrollIntoBox,
+  stickyPad,
   useHoldRepeat
 }

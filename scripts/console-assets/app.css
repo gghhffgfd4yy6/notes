@@ -335,10 +335,12 @@
   .tap-tip-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tap-tip-hint { flex: 0 0 auto; color: var(--text-dim); font-size: var(--fs-2xs); white-space: nowrap; }
   .tap-tip:focus-visible { outline: var(--ring); outline-offset: 2px; border-radius: 4px; }
-  .tap-tip-pop { position: fixed; z-index: 68; background: var(--panel-2); color: var(--text);
+  .tap-tip-pop { position: fixed; z-index: 68; top: 0; left: 0; background: var(--panel-2); color: var(--text);
     border: 1px solid var(--border); border-radius: var(--r-md); padding: 8px 10px;
     font-size: var(--fs-sm); line-height: 1.5; white-space: normal; overflow-wrap: anywhere;
     box-shadow: var(--shadow-card); }
+  /* 首帧：computePosition 还没回值，先隐身（宽度在 effect 里按视口定，量完再显形）。 */
+  .tap-tip-pop-wait { visibility: hidden; }
   /* 刷新失败的整句（含原因）单独一行：挤在一行里会被省略号吃掉，反而是最该看的字没了。 */
   .sync-fail { color: var(--warn-fg); font-size: var(--fs-xs); line-height: 1.5; overflow-wrap: anywhere; }
   /* 按钮永不被压缩/换行：窄屏时该让位的是中间那段文本（省略号），不是「暂停」。 */
@@ -536,7 +538,18 @@
   .auto-run-note { margin-top: var(--sp-2); color: var(--text-dim); font-size: var(--fs-2xs); line-height: 1.55; }
   .auto-run-status { min-height: 17px; margin-top: var(--sp-1); color: var(--accent); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
 
-  /* ── 确认弹窗（v3.307）── */
+  /* ── 确认弹窗（v3.307）──
+     v3.384：遮罩层换成原生 <dialog>（顶层 + 焦点陷阱 + 背景 inert 由浏览器负责）。
+     下面两条只清浏览器默认值，不重做视觉：内边距/背景仍由 .modal-backdrop /
+     .drawer-backdrop 自己的规则决定（同类选择器、靠源序在后胜出）。
+     width/height 必须写成 100%：UA 给 dialog 的是 fit-content + max-height:
+     calc(100% - 6px - 2em)，不覆盖的话面板会被挤窄、抽屉还会短一截。
+     ::backdrop 一律透明：变暗是组件自己画的，留着 UA 的 0.1 黑会叠成两层更黑。 */
+  .modal-backdrop, .drawer-backdrop {
+    border: 0; margin: 0; padding: 0; background: transparent; color: inherit;
+    width: 100%; height: 100%; max-width: none; max-height: none;
+  }
+  .modal-backdrop::backdrop, .drawer-backdrop::backdrop { background: transparent; }
   .modal-backdrop {
     position: fixed; inset: 0; z-index: 80; background: rgba(0, 0, 0, .62);
     display: flex; align-items: center; justify-content: center; padding: 16px;
@@ -888,12 +901,16 @@
   .mini-label { overflow: hidden; text-overflow: ellipsis; }
   .mini-caret { color: var(--text-dim); font-size: 10px; line-height: 1; }
   .mini-pop {
-    position: absolute; z-index: 45; top: calc(100% + 6px); right: 0;
-    min-width: 100%; width: max-content; max-width: min(260px, calc(100vw - 24px));
+    /* 定位由 floating-ui 直写 left/top（strategy:fixed）：视口坐标系，不受 .mini-select
+       祖先的 overflow/定位影响；max-height 由 size() 按可用高度覆写（上限 320）。 */
+    position: fixed; z-index: 45; top: 0; left: 0;
+    width: max-content; max-width: min(260px, calc(100vw - 24px)); max-height: 320px;
     padding: 4px; display: flex; flex-direction: column; gap: 1px;
     background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md);
     box-shadow: 0 12px 32px rgba(0, 0, 0, .45); overflow-y: auto; overscroll-behavior: contain;
   }
+  /* 首帧：computePosition 还没回值，先隐身（占位仍在，量得到宽高），避免先按「向下」铺一帧再翻上去。 */
+  .mini-pop-wait { visibility: hidden; }
   .mini-opt {
     display: flex; align-items: center; justify-content: space-between; gap: 12px;
     width: 100%; min-height: 38px; padding: 6px 10px; text-align: left; white-space: nowrap;
@@ -916,13 +933,18 @@
   .cate-caret { color: var(--text-dim); flex: 0 0 auto; }
   .cate-backdrop { display: none; }
   .cate-pop {
-    position: absolute; z-index: 40; top: calc(100% + 6px); left: 0;
+    /* 定位由 floating-ui 直写 left/top（strategy: fixed）：视口坐标系，不受 .cate-picker
+       祖先的 overflow/定位影响；max-height 由 size() 按可用高度覆写（上限 380）。
+       手机端由下面 ≤640 的媒体查询整条改成贴底模态，坐标交给 CSS。 */
+    position: fixed; z-index: 40; top: 0; left: 0;
     width: min(360px, calc(100vw - 48px)); padding: var(--sp-2);
     padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom));
     background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md);
     box-shadow: 0 12px 32px rgba(0, 0, 0, .45); display: flex; flex-direction: column;
     overscroll-behavior: contain;
   }
+  /* 首帧：computePosition 还没回值，先隐身（占位仍在，量得到宽高），避免先按「向下」铺一帧。 */
+  .cate-pop-wait { visibility: hidden; }
   .cate-search {
     width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
     border-radius: var(--r-sm); padding: 8px 10px; font-size: var(--fs-sm);

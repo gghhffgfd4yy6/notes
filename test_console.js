@@ -2185,10 +2185,15 @@ async function backupUiStructureTests () {
 
     // 三个退出入口都必须调用 ref，而不是捕获的旧 onCancel；否则 busy 守卫可能被旧闭包绕过。
     // v3.360：三个入口都先播退场再回调，但回调本身仍走 ref（避免旧闭包绕过 busy 守卫）。
-    assert.match(hook, /if \(e\.key === 'Escape'\) closeDialog\(\(\) => onCancelRef\.current\(\)\)/,
-      'Escape 必须判断 ===（反向/不等号写法不能过），并调用 ref')
-    assert.ok(seg.includes('if (e.target === e.currentTarget) closeDialog(() => onCancelRef.current())'), '点遮罩必须调用 ref')
-    assert.ok(seg.includes('onClick=' + '$' + '{() => closeDialog(() => onCancelRef.current())}'), '取消按钮必须调用 ref')
+    // v3.384：Esc 不再自己挂 document keydown——原生 <dialog> 会先派发 cancel，拦住默认
+    // 关闭（preventDefault）才走得到退场动画；断言改成锁这个替代入口。
+    const cancelAt = hook.indexOf('const onCancelEvent')
+    const cancelSeg = cancelAt > -1 ? hook.slice(cancelAt) : ''
+    assert.ok(cancelSeg.includes('e.preventDefault()'), 'Esc 必须先 preventDefault，否则浏览器直接关掉、退场动画丢失')
+    assert.ok(cancelSeg.includes('closeDialog(() => onCancelRef.current())'), 'cancel（Esc）必须调用 ref')
+    assert.ok(!hook.includes("addEventListener('keydown'"), '不得再手写 Esc 监听：原生 cancel 已覆盖')
+    assert.ok(seg.includes('if (e.target === e.currentTarget) dismiss(() => onCancelRef.current())'), '点遮罩必须调用 ref')
+    assert.ok(seg.includes('onClick=' + '$' + '{() => dismiss(() => onCancelRef.current())}'), '取消按钮必须调用 ref')
 
     // 依赖数组必须属于“聚焦”的那个 effect，不能靠组件里别处的同名字符串蒙混。
     // 不用正则：嵌套量词会被 Sonar 判「回溯性能」。
@@ -2817,7 +2822,7 @@ async function main () {
     }
   })
   await aok('资产: 首屏 modulepreload 覆盖 app.js 的 import 闭包（版本路径、排在入口之前）', () => {
-    // 预加载是手工维护的 11 行，两种错都不会被别的用例抓住：① 漏一个模块（瀑布还在，只是
+    // 预加载是手工维护的一行一模块（v3.384 起 12 行），两种错都不会被别的用例抓住：① 漏一个模块（瀑布还在，只是
     // 短了点）；② 把 flatpickr 写成 flatpickr.module.js（404，白下一次）。这里用 acorn 从
     // app.js 出发算**真实**静态 import 闭包，与 HTML 里的 href 逐字对账。
     const acorn = require('acorn')
@@ -6557,8 +6562,13 @@ async function main () {
     assert.ok(/\n[ ]{2}Drawer,/.test(src), 'Drawer 必须从 components.js 导出')
     assert.ok(seg.includes('role="dialog"') && seg.includes('aria-modal="true"') && seg.includes('aria-labelledby'),
       '抽屉必须有无障碍语义：dialog + aria-modal + 标题 id')
-    assert.ok(seg.includes('Escape'), 'Escape 必须能关闭')
-    assert.ok(seg.includes('prev.focus()') && seg.includes('prev.isConnected'), '关闭后焦点必须回到触发元素（节点已卸载则跳过）')
+    // v3.384：Esc 与「关闭后焦点回到触发元素」都交给原生 <dialog>——cancel 事件接管 Esc，
+    // close() 自带 focus restoration；手写的 document keydown 与 prev.focus() 已删，
+    // 这两条改成锁替代实现（否则删回手写版也不会红）。
+    assert.ok(seg.includes('oncancel=') && seg.includes('Escape'), 'Escape 必须能关闭（走原生 cancel 事件）')
+    assert.ok(seg.includes('closeNative()') && !seg.includes('prev.focus()'),
+      '关闭后焦点必须回到触发元素：交给原生 close()，不得再手写 prev.focus()')
+    assert.ok(!seg.includes("addEventListener('keydown'"), 'Esc 不得再自己挂 document keydown（原生 cancel 已覆盖）')
     assert.ok(seg.includes('root.style.overflow') && seg.includes('prevOverflow'),
       '打开时锁背景滚动，关闭时还原（否则背后列表跟着滚）')
     assert.ok(seg.includes('if (busy) return'), '父级 busy 时必须拒绝关闭（保存中不能半截关掉）')
@@ -6659,6 +6669,10 @@ async function main () {
       '正式运行与通知自检必须走确认；试运行/环境检查直接执行')
     assert.ok(src.includes("cls: 'btn-danger-solid'"), '正式运行必须是红色危险按钮')
     assert.ok(src.includes('role="dialog"') && src.includes('aria-modal="true"'), '弹窗必须有无障碍语义')
+    // v3.384：顶层/焦点陷阱/背景 inert 交给原生 <dialog>——必须真的用 showModal() 打开，
+    // 并且动画结束才 close()（先 close 会立刻抽走顶层，退场动画就没了）。
+    assert.ok(src.includes('el.showModal()') && src.includes('if (el.open) el.close()'),
+      '弹窗必须用原生 dialog.showModal() 打开、close() 关闭')
     // v3.361：焦点 effect 收进 useDialogChrome，取消按钮通过 fallbackRef 传进去。
     assert.ok(src.includes('defaultFocus') === false && src.includes('fallbackRef.current') && src.includes('fallbackRef: cancelRef'),
       '默认焦点必须落在取消，不能落在确认')
@@ -6675,6 +6689,11 @@ async function main () {
     assert.ok(!src.includes('首轮前正常'), '墓碑文案不得再写「首轮前正常」')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/\.alert-banner\s*\{/.test(css) && /\.modal-backdrop\s*\{/.test(css), '横幅/弹窗样式必须存在')
+    // v3.384：原生 <dialog> 的 UA 默认值必须重置，否则 fit-content + max-height 会把面板
+    // 挤窄、抽屉压短；::backdrop 不置透明会和组件自绘的遮罩叠成两层黑。
+    assert.ok(/\.modal-backdrop,\s*\.drawer-backdrop\s*\{[^}]*max-height:\s*none/.test(css),
+      'dialog 必须重置 UA 的 fit-content / max-height（否则面板被挤窄、抽屉短一截）')
+    assert.ok(/\.modal-backdrop::backdrop[^{]*\{[^}]*transparent/.test(css), '::backdrop 必须显式透明（不与自绘遮罩叠加）')
     assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.cards\s*\{\s*grid-template-columns:\s*1fr 1fr/.test(css),
       '手机端状态卡必须 2×2，不能四张单列')
     assert.ok(/@media \(max-width: 640px\)[\s\S]*?\.btn-item\s*\{\s*flex:\s*1 1 calc\(50% - 5px\)/.test(css),
@@ -7141,7 +7160,12 @@ async function main () {
     const runsSeg = src.slice(src.indexOf('function RunsPanel'), src.indexOf('function RunHistoryPanel', src.indexOf('function RunsPanel')))
     assert.ok(runsSeg.includes('<div class="runs-scroll" ref=$' + '{listRef}><table class="runs-table">'), '触发历史表必须包 .runs-scroll（带 ref 供行入场），窄屏不得撑破面板')
     // preventScroll 不能把键盘焦点留在 .cate-list 的可视区外：必须显式滚列表。
-    assert.ok(cateSeg.includes('focusInList') && cateSeg.includes('list.scrollTop'), '分类列表键盘焦点必须滚进可视区')
+    // 矩形比较 + scrollTop 修正已抽成共用 scrollIntoBox（MiniSelect 与分类弹层同一份）：
+    // 这里锁「分类弹层确实调它、且把 .cate-list 的 ref 当滚动框传进去」——只出现函数名不够，
+    // 滚动框传成 rootRef 照样会把项留在框外；同时组件里不得再自己量矩形（重复算术即回退）。
+    assert.ok(/scrollIntoBox\((?:el|last|first|opts\[next\]), (?:listRef|popRef)\.current\)/.test(cateSeg),
+      '分类列表键盘焦点必须滚进可视区（scrollIntoBox + .cate-list 的 ref）')
+    assert.ok(!cateSeg.includes('getBoundingClientRect'), '分类弹层不得再自己量矩形（滚动修正收给共用 scrollIntoBox）')
     // 趋势图自动停靠最右时，最左列可能只露半截日期：须把下一个完整列对齐到容器左缘。
     assert.ok(src.includes('const partial'), '趋势图须对最左半截列做对齐')
     assert.ok(src.includes('r.left < base && r.right > base'), '趋势对齐基准必须是滚动容器左缘，不是视口 x=0')
@@ -7186,12 +7210,20 @@ async function main () {
     const end = src.indexOf('// 指标卡', start)
     assert.ok(start > -1 && end > start, '必须能定位 MiniSelect')
     const seg = src.slice(start, end)
-    // Sourcery #270：打开期间滚动/缩放不重量，弹层会按旧方向/高度被裁掉。
+    // 定位算给 computePosition（floating-ui）：strategy 固定 + offset/flip/shift/size 四件套。
+    assert.ok(seg.includes('computePosition(btn, pop, {') && seg.includes("strategy: 'fixed'"),
+      'MiniSelect 弹层必须走 computePosition（strategy: fixed）')
+    assert.ok(/middleware: \[\s*offset\(6\),\s*flip\(\),\s*shift\(\{ padding: 8 \}\),\s*size\(/.test(seg),
+      '中间件必须依次是 offset(6) → flip → shift(8) → size（顺序即语义：先翻再夹再压高）')
+    assert.ok(seg.includes('availableHeight') && seg.includes('style.maxHeight') && seg.includes('SELECT_MAX_H'),
+      '高度必须由 size() 按可用高度压 max-height（上限 320）')
+    assert.ok(seg.includes('minWidth') && seg.includes('rects.reference.width'),
+      '弹层最小宽度须跟随按钮宽度（fixed 下 min-width:100% 会变成整屏宽）')
+    assert.ok(!/place\.(up|dx|max)/.test(seg), '不得再自己算 up/dx/max（方向与夹取已收给库）')
+    // Sourcery #270：打开期间滚动/缩放不重量，弹层会停在旧位置的空白处。库不自带监听
+    // （autoUpdate 没进 bundle），这一对监听必须留在组件里。
     assert.ok(seg.includes("window.addEventListener('scroll', schedule"), '打开期间页面滚动须重新量测')
     assert.ok(seg.includes("window.addEventListener('resize', schedule"), '打开期间视口缩放须重新量测')
-    // 靠左的按钮 + 更宽选项：right:0 会把弹层推出左边界。
-    assert.ok(seg.includes('const left = Math.min(Math.max(pad, b.right - w)'), '弹层须做水平视口夹取')
-    assert.ok(/left:\$\{place\.dx\}px;right:auto/.test(seg), '弹层水平位置须由量测结果决定')
     // Tab 不能落回即将卸载的选项，否则焦点掉 body。
     assert.ok(seg.includes('focusOutside') && seg.includes('DOCUMENT_POSITION_FOLLOWING'), 'Tab 须显式把焦点送出组件')
     // aria-label 覆盖可见文字时必须带回当前值。
@@ -7199,10 +7231,97 @@ async function main () {
     assert.ok(seg.includes('disabled = false') && /disabled=\$\{disabled\}/.test(seg), 'MiniSelect 须支持 disabled')
     // 过滤规则页的回滚目标也不能漏（Sourcery #270）。
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(src.includes("from './floating-ui.module.js'"), '定位库必须按白名单路由名导入（漏登记 = 404 整页白屏）')
+    assert.ok(/\.mini-pop\s*\{[^}]*position:\s*fixed/.test(css), '.mini-pop 必须 fixed 定位（与 strategy:fixed 对应）')
     assert.ok(src.includes('ariaLabel="回滚目标"'), '回滚目标必须改用 MiniSelect')
     assert.ok(!src.includes('fr-select'), '原生 fr-select 样式与用法必须移除')
     assert.ok(!/<select\s+(?:id|class)=/.test(src), '控制台不得再有原生 select')
     assert.ok(/\.fr-restore-row \.mini-select\s*\{[^}]*min-width:\s*0/.test(css), '回滚目标在窄屏必须可收缩')
+  })
+
+  await aok('结构红线: CategoryPicker 定位交给 floating-ui（翻上/夹取/压高；窄屏仍是 CSS 贴底模态）', () => {
+    const src = readConsoleSource()
+    const start = src.indexOf('function CategoryPicker (')
+    const end = src.indexOf('function MessagesPanel', start)
+    assert.ok(start > 0 && end > start, '必须能定位 CategoryPicker')
+    const cate = src.slice(start, end)
+    // 位置只由 computePosition 算：strategy 固定 + offset/flip/shift/size 四件套（与 MiniSelect 同口径）。
+    assert.ok(cate.includes('computePosition(btn, pop, {') && cate.includes("strategy: 'fixed'"),
+      '分类弹层必须走 computePosition（strategy: fixed）')
+    assert.ok(cate.includes("placement: 'bottom-start'"), '左缘对齐按钮（旧 left:0 的等价形），翻上去也左缘对齐')
+    assert.ok(/middleware: \[\s*offset\(8\),\s*flip\(\),\s*shift\(\{ padding: 8 \}\),\s*size\(/.test(cate),
+      '中间件必须依次是 offset(8) → flip → shift(8) → size（顺序即语义：先翻再夹再压高）')
+    assert.ok(cate.includes('availableHeight') && cate.includes('style.maxHeight') && cate.includes('CATE_MAX_H'),
+      '高度必须由 size() 按可用高度压 max-height（上限 380）')
+    // 自算方向与迟滞整体删除：place{up,max,ready} 与 below/above 阈值都不许回来。
+    assert.ok(!/setPlace\(|place\.(up|max|ready)|const \[place/.test(cate), '不得再自算方向/高度（up/max/迟滞已收给库）')
+    assert.ok(!cate.includes('getBoundingClientRect'), '不得再自己量按钮矩形（方向与夹取交给中间件）')
+    assert.ok(!cate.includes('style=$' + '{narrow'), '坐标/可见性不得写在 vdom 的 style 字符串里（轮询重渲染会整条覆盖）')
+    // 首帧隐身、坐标回来才显示；重开要归零，否则会先按上一轮坐标可见一帧。
+    assert.ok(cate.includes("'cate-pop' + (ready ? '' : ' cate-pop-wait')"), '首帧必须先隐身（cate-pop-wait）')
+    assert.ok(/setReady\(false\)\s*\n\s*setOpen\(true\)/.test(cate),
+      '每次打开都要先把 ready 归零再开（否则先按上一轮坐标可见一帧）')
+    // 窄屏：CSS 贴底模态，不量测；并把桌面写下的内联定位清掉（内联会压过媒体查询）。
+    const narrowAt = cate.indexOf('if (narrow) {')
+    assert.ok(narrowAt > 0, '窄屏分支必须存在')
+    const narrowSeg = cate.slice(narrowAt, narrowAt + 400)
+    assert.ok(narrowSeg.includes('setReady(true)') && narrowSeg.includes('return undefined'),
+      '窄屏不得跑 computePosition（坐标交给 CSS 贴底模态）')
+    assert.ok(cate.includes("pop.style.left = ''") && cate.includes("pop.style.top = ''") && cate.includes("pop.style.maxHeight = ''"),
+      '切到窄屏必须清掉上一轮的内联 left/top/max-height')
+    assert.ok(cate.includes("window.addEventListener('scroll', schedule") && cate.includes("window.addEventListener('resize', schedule"),
+      '打开期间滚动/缩放须重量（库不自带 autoUpdate，监听必须留在组件里）')
+    // body 滚动锁只归窄屏模态（桌面弹层不该锁页面）。
+    assert.ok(cate.includes('if (!open || !narrow) return undefined') && cate.includes("document.body.style.overflow = 'hidden'"),
+      '背景滚动锁必须只窄屏生效')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.cate-pop\s*\{[^}]*position:\s*fixed/.test(css), '.cate-pop 必须 fixed 定位（与 strategy:fixed 对应）')
+    assert.ok(/\.cate-pop-wait\s*\{[^}]*visibility:\s*hidden/.test(css), '首帧隐身样式必须存在')
+    // 窄屏贴底模态（≤640 媒体查询）必须仍在，且坐标由 CSS 给（top:auto + 四边定位）。
+    const mqAt = css.indexOf('/* 分类筛选：手机端贴底弹层')
+    assert.ok(mqAt > 0, '窄屏贴底模态的媒体查询必须保留')
+    const mq = css.slice(mqAt, mqAt + 800).replace(/\s+/g, ' ')
+    assert.ok(/\.cate-pop \{ position: fixed; top: auto; left: 10px; right: 10px; bottom: calc\(10px/.test(mq),
+      '窄屏必须仍是四边定位的贴底模态（top:auto / left+right 10px / bottom 安全区）')
+    assert.ok(/max-height: 70vh/.test(mq) && /z-index: 56/.test(mq), '窄屏模态的高度上限与压层级必须保留')
+  })
+
+  await aok('结构红线: 共用助手（scrollIntoBox 矩形修正唯一实现 / stickyPad 五处同口径）', async () => {
+    const components = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const pages = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    // ── stickyPad：一份实现，五处调用（列表落点 / 两个落点门 / 错误行定位 / 日志行定位）──
+    assert.strictEqual(((components + pages + ui).match(/function stickyPad \(\)/g) || []).length, 1,
+      'stickyPad 只能有一份实现')
+    assert.strictEqual(((pages + ui).match(/stickyPad\(\)/g) || []).length, 5, '五处吸顶留白必须全部改调 stickyPad()')
+    assert.ok(!/document\.querySelector\('\.tabs'\)/.test(pages + ui), '调用方不得再各写一遍 .tabs 实测高度')
+    const padAt = components.indexOf('function stickyPad ()')
+    const padSeg = components.slice(padAt, components.indexOf('\n}', padAt))
+    assert.ok(padSeg.includes("document.querySelector('.tabs')") && padSeg.includes('getBoundingClientRect().height') &&
+      padSeg.includes('+ 8'), 'stickyPad = .tabs 实测高度 + 8')
+    assert.ok(!padSeg.includes('getBoundingClientRect().bottom'), 'pad 不得用 .tabs 的 bottom（未吸顶时会多算一截偏移）')
+    // ── scrollIntoBox：focus 不带滚动 + 只在框内时修 scrollTop；矩形差值来自 pure.mjs ──
+    const boxAt = components.indexOf('function scrollIntoBox (el, box)')
+    assert.ok(boxAt > 0, '必须有共用 scrollIntoBox（MiniSelect 与 CategoryPicker 同一份）')
+    const boxSeg = components.slice(boxAt, components.indexOf('\n}', boxAt))
+    assert.ok(boxSeg.includes('focus({ preventScroll: true })'), '滚进可视区不得带动整页滚动')
+    assert.ok(boxSeg.includes('if (!box || !box.contains(el)) return'), '焦点不在框内时不得改 scrollTop')
+    assert.ok(boxSeg.includes('box.scrollTop += d'), '修正必须写回滚动框的 scrollTop')
+    assert.ok(/el\.getBoundingClientRect\(\), box\.getBoundingClientRect\(\)/.test(boxSeg), '矩形必须来自项与框两侧')
+    assert.ok(components.includes("scrollDeltaInto } from './pure.mjs'"), '矩形差值必须来自 pure.mjs（Node 可直接跑）')
+    // 两处调用点都只调它：组件里不得再各写一份 rect 比较。
+    const miniAt = components.indexOf('function MiniSelect (')
+    const mini = components.slice(miniAt, components.indexOf('// 指标卡', miniAt))
+    assert.ok(mini.includes('scrollIntoBox(el, pop)'), 'MiniSelect 的键盘焦点也必须走共用 scrollIntoBox')
+    assert.ok(!mini.includes('.scrollTop -=') && !mini.includes('.scrollTop +='), 'MiniSelect 不得再自算滚动修正')
+    // 行为：完全可见不动、越上负、越下正、比框高时以顶边为准。
+    const { scrollDeltaInto } = await import('./scripts/console-assets/pure.mjs')
+    const box = { top: 100, bottom: 300 }
+    assert.strictEqual(scrollDeltaInto({ top: 120, bottom: 160 }, box), 0, '已可见时不得蹭动列表')
+    assert.strictEqual(scrollDeltaInto({ top: 80, bottom: 120 }, box), -20, '顶边越界要向上滚回 20')
+    assert.strictEqual(scrollDeltaInto({ top: 260, bottom: 320 }, box), 20, '底边越界要向下滚 20')
+    assert.strictEqual(scrollDeltaInto({ top: 60, bottom: 400 }, box), -40, '项比框高时以顶边为准（不得来回弹）')
+    assert.strictEqual(scrollDeltaInto({ top: 100, bottom: 300 }, box), 0, '贴着两边也不算越界')
   })
 
   await aok('结构红线: 回到顶部（固定层 / 触控尺寸 / 可访问名 / 平滑滚动）', () => {
@@ -8114,9 +8233,9 @@ async function main () {
     assert.ok(reveal, '失败路径必须有 [aria-invalid="true"] 定位')
     assert.ok(reveal.includes('focus({ preventScroll: true })'),
       '必须先聚焦且 preventScroll（否则浏览器自己先滚一次，位置和手工算的打架）')
-    assert.ok(reveal.includes("document.querySelector('.tabs')") && reveal.includes('getBoundingClientRect().height'),
-      '落点必须按 .tabs 实测高度算（吸顶页签会盖住错误行）')
-    assert.ok(reveal.includes('+ 8'), '页签下沿要留 8px')
+    assert.ok(reveal.includes('const pad = stickyPad()'),
+      '落点必须按 .tabs 实测高度算（吸顶页签会盖住错误行；口径收在共用 stickyPad）')
+    assert.ok(reveal.includes('- pad'), '页签下沿要留出 stickyPad 的 8px')
     assert.ok(/window\.scrollTo\(0, Math\.max\(0, Math\.min\(top, max\)\)\)/.test(reveal), '落点必须夹进可滚动范围')
     assert.ok(fr.includes('revealFieldRef.current = errors.length > 0'), '只有确有字段错误的失败才置旗')
     // 成功路径：res.ok 分支里既不得置旗，也不得出现 aria-invalid 定位。
@@ -8137,9 +8256,8 @@ async function main () {
     const helperAt = src.indexOf('function listLandTarget')
     assert.ok(helperAt > 0, '必须有一个共用的落点助手（两个面板同一口径）')
     const helper = src.slice(helperAt, src.indexOf('function RunHistoryPanel', helperAt))
-    assert.ok(helper.includes("document.querySelector('.tabs')"), '落点必须读吸顶页签')
-    assert.ok(helper.includes('getBoundingClientRect().height') && helper.includes('+ 8'), '落点 = .tabs 高度 + 8')
-    assert.ok(!helper.includes('getBoundingClientRect().bottom'), 'pad 不得再用 .tabs 的 bottom（未吸顶时会多算一截偏移）')
+    assert.ok(helper.includes('const pad = stickyPad()'), '落点 = .tabs 高度 + 8（口径收在共用 stickyPad）')
+    assert.ok(helper.includes('rect.top + window.scrollY - pad'), '落点必须减掉页签留白（吸顶页签会盖住首行）')
     assert.ok(helper.includes('Math.min(top, max)'), '助手内必须有 Math.min 收口（不能算出文档外的目标）')
     assert.ok(helper.includes('document.documentElement.scrollHeight - window.innerHeight'), '上限必须按可滚动高度算')
     assert.ok(helper.includes('if (!(rect.height > 0)) return null'), '面板 hidden/rect 为 0 时不得执行')
@@ -8168,8 +8286,8 @@ async function main () {
         name + '置旗必须只在 armLand 内（其余路径一律调用 armLand）')
       const arm = fnOf(seg, 'armLand')
       assert.ok(/window\.scrollY > listTop/.test(arm), name + '必须有「已滚进列表」门（停在顶部改筛选不得拽列表）')
-      assert.ok(arm.includes("document.querySelector('.tabs')") && arm.includes('getBoundingClientRect().height'),
-        name + '门必须按 .tabs 实测高度算（与 listLandTarget 同口径）')
+      assert.ok(arm.includes('window.scrollY - stickyPad()'),
+        name + '门必须按 .tabs 实测高度算（与 listLandTarget 同口径，共用 stickyPad）')
       assert.ok(arm.includes('if (!(rect.height > 0)) return'), name + '面板隐藏/rect 为 0 时不得置旗')
     }
     // ① 依赖必须同时含 days 与 loading：漏 days ⇒ 第 1 页改时间范围不落（page 不变、effect 不跑）；
@@ -8390,8 +8508,12 @@ async function main () {
     assert.ok(tipSrc.includes("document.addEventListener('pointerdown', onDown, true)"),
       '点页面任意其它地方必须收回（document 捕获 pointerdown）')
     assert.ok(/e\.key === 'Escape'/.test(tipSrc), 'Esc 必须能收回')
-    assert.ok(tipSrc.includes('getBoundingClientRect()') && tipSrc.includes('window.innerWidth - 24'),
-      '必须按触发区位置算弹层坐标，并夹在视口内')
+    assert.ok(tipSrc.includes('computePosition(box, pop, {') && tipSrc.includes("strategy: 'fixed'"),
+      '弹层坐标必须交给 computePosition（strategy: fixed）')
+    assert.ok(tipSrc.includes('middleware: [offset(8), flip(), shift({ padding: 8 })]'),
+      '弹层方向/夹取必须走 offset(8) + flip + shift(padding 8)')
+    assert.ok(tipSrc.includes('window.innerWidth - 24'), '宽度仍须按视口收窄（200～360，不超视口 24px）')
+    assert.ok(!tipSrc.includes('getBoundingClientRect()'), '不得再自己量触发区算 top/left（定位已收给库）')
 
     // ② 弹层必须 fixed：.sync 是 overflow:hidden，绝对定位会被裁掉（等于没弹）。
     const popCss = css.slice(css.indexOf('.tap-tip-pop {'), css.indexOf('}', css.indexOf('.tap-tip-pop {')))
