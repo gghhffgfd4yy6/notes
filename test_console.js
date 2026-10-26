@@ -6725,6 +6725,17 @@ async function main () {
     assert.ok(/animation:\s*drawer-backdrop-in/.test(cssBlock(css, '.drawer-backdrop::before {')), '遮罩要由 ::before 自己淡入，不然底色是硬跳')
     const backdropIn = cssBlock(css, '@keyframes drawer-backdrop-in {')
     assert.ok(/opacity:\s*0/.test(backdropIn) && /opacity:\s*1/.test(backdropIn), '遮罩关键帧必须真的从 0 到 1')
+    // v3.381：退场也不许淡出——旧版 to{opacity:0} 让面板最后 170ms 变成半透明白片，背后的列表透上来。
+    const beforeRule = cssBlock(css, '.drawer-backdrop::before {')
+    assert.ok(/opacity:\s*0/.test(beforeRule), '遮罩静态 opacity 必须是 0（否则动画起手前会先黑一帧，看着像闪）')
+    assert.ok(/forwards/.test(beforeRule), '遮罩淡入必须 forwards，否则动画结束会跳回静态值 0')
+    const drawerOut = cssBlock(css, '@keyframes drawer-out {')
+    assert.ok(!/opacity/.test(drawerOut), '退场不得淡出：面板整块滑走，半透明会透出背后列表')
+    assert.ok(/translate3d\(100%/.test(drawerOut), '退场要整块滑出屏幕（只挪 28px 等于原地消失）')
+    assert.ok(/\.drawer-backdrop:has\(\.drawer-closing\)::before\s*\{[^}]*drawer-backdrop-out/.test(css), '遮罩要跟着退场一起淡出')
+    assert.ok(/@keyframes drawer-backdrop-out \{[^}]*from \{ opacity: 1 \}[^}]*to \{ opacity: 0 \}/.test(css), '遮罩退场必须 1→0（只写 to 会从静态 0 起跳，等于瞬间消失）')
+    const reduceLine = css.split('\n').find((l) => l.includes('prefers-reduced-motion: reduce') && l.includes('.drawer-closing')) || ''
+    assert.ok(/\.drawer-backdrop::before\s*\{\s*opacity:\s*1/.test(reduceLine), '减少动效时遮罩必须直接实心（静态 0 + 关动画 = 遮罩消失）')
   })
 
   await aok('结构红线: v3.379 推送记录详情走右侧抽屉（520 / 无行内展开 / 焦点归还）', () => {
